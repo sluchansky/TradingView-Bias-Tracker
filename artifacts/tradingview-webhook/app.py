@@ -1278,35 +1278,41 @@ def send_trade_event_message(event_type, trade, current_price):
 
 
 def active_trade_field(trade, current_price):
-    """Return a single Discord embed field dict showing live trade status."""
+    """Return a single Discord embed field dict showing live trade status (v11)."""
     dollar_pnl, pts_pnl   = compute_pnl(trade, current_price)
     to_t1, to_t2, to_stop = compute_distances(trade, current_price)
 
     pnl_emoji = "🟢" if dollar_pnl >= 0 else "🔴"
     pnl_str   = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
 
-    state_map = {
-        "active": "🟢  OPEN",
-        "t1_hit": "🟡  OPEN — T1 Hit",
-        "t2_hit": "🎯  OPEN — T2 Hit",
-    }
-    state_str = state_map.get(trade.get("status", "active"), "🟢  OPEN")
+    status = trade.get("status", "active")
+    state_str = {
+        "active":    "🟢  OPEN",
+        "breakeven": "🟡  BREAKEVEN ACTIVE",
+    }.get(status, "🟢  OPEN")
+
+    if status == "active":
+        next_action = f"Wait for T1 at `{trade['target1']:.1f}`"
+    elif status == "breakeven":
+        next_action = (f"Wait for T2 at `{trade['target2']:.1f}`  ·  "
+                       f"Stop at breakeven `{trade['entry_price']:.1f}`")
+    else:
+        next_action = "—"
 
     value = (
+        f"**State:** {state_str}\n"
         f"**Entry:** `{trade['entry_price']:.1f}`  ·  "
         f"**Current Price:** `{current_price:.1f}`\n"
         f"**PnL:** {pnl_emoji} {pnl_str} ({pts_pnl:+.1f} pts)\n"
-        f"**Contracts:** `{trade['contracts']}`  ·  "
-        f"**Profile:** `{trade['profile']}`\n"
         f"\n"
-        f"**Distance to Stop:** `{to_stop:.1f} pts`\n"
         f"**Distance to T1:** `{to_t1:.1f} pts`\n"
         f"**Distance to T2:** `{to_t2:.1f} pts`\n"
+        f"**Distance to Stop:** `{to_stop:.1f} pts`\n"
         f"\n"
-        f"**Trade State:** {state_str}"
+        f"**Next Action:** {next_action}"
     )
 
-    return {"name": "📊  ACTIVE TRADE", "value": value, "inline": False}
+    return {"name": "📊  ACTIVE TRADE MANAGEMENT", "value": value, "inline": False}
 
 
 # ---------------------------------------------------------------------------
@@ -1380,11 +1386,9 @@ def webhook():
             send_trade_event_message(event, ACTIVE_TRADE, parsed_price)
             if event == "T1_HIT":
                 ACTIVE_TRADE["t1_hit"] = True
-                ACTIVE_TRADE["status"] = "t1_hit"
-            elif event == "T2_HIT":
-                ACTIVE_TRADE["t2_hit"] = True
-                ACTIVE_TRADE["status"] = "t2_hit"
-            elif event == "STOP_HIT":
+                ACTIVE_TRADE["status"] = "breakeven"
+                ACTIVE_TRADE["suggested_stop"] = ACTIVE_TRADE["entry_price"]
+            elif event in ("T2_HIT", "STOP_HIT"):
                 ACTIVE_TRADE = None
                 break
         if ACTIVE_TRADE:
@@ -1500,7 +1504,7 @@ def status():
                           "bullish_score": w_bull, "bearish_score": w_bear}
     return jsonify({
         "status":              "running",
-        "version":             "10.0",
+        "version":             "11.0",
         "verdict":             a["verdict"],
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
@@ -1691,7 +1695,7 @@ def get_trade():
 def index():
     return jsonify({
         "service":     "TradingView Webhook Server",
-        "version":     "12.0",
+        "version":     "11.0",
         "alert_types": list(ALERT_TYPES.keys()),
         "endpoints":   {
             "POST /webhook":   "Receive TradingView alerts",
