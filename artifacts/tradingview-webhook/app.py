@@ -357,9 +357,19 @@ def get_trade_opportunity(market_direction, structure_label, risk_label,
                           overextended, bullish, bearish, nearest_supply, nearest_demand,
                           last_price_by_type):
     """
-    Determine the current trade opportunity.
+    Determine the current trade opportunity (v9).
     Returns (opportunity, reason, entry_trigger, invalidation).
-    opportunity values: "Long Setup" | "Short Setup" | "Breakout Setup" | "Reversal Setup" | "None"
+    opportunity values: "Short Setup" | "Long Setup" | "Breakout Setup" |
+                        "Watch Supply" | "Watch Demand" | "None"
+
+    Priority order:
+      1. Overextended / Neutral            → None
+      2. Bullish Breakout / Breakdown      → Breakout Setup
+      3. Testing Supply + Bearish structure → Short Setup
+      4. Testing Demand + Bullish structure → Long Setup
+      5. Within 1% of supply               → Watch Supply
+      6. Within 1% of demand               → Watch Demand
+      7. Everything else                   → None (mid-range)
     """
     sup_str   = f"${nearest_supply:.2f}" if nearest_supply is not None else "—"
     dem_str   = f"${nearest_demand:.2f}" if nearest_demand is not None else "—"
@@ -369,20 +379,19 @@ def get_trade_opportunity(market_direction, structure_label, risk_label,
     def none_opp(reason):
         return ("None", reason, None, None)
 
+    # ── 1. Gate: overextended / no structure ──
     if overextended:
         return none_opp("Price overextended from level. Wait for retracement.")
-
     if market_direction == "Neutral":
         return none_opp("No market structure defined yet.")
 
-    # ── Breakout: price burst through a CHOCH level ──
+    # ── 2. Breakout: price burst through a CHOCH level ──
     if structure_label == "Bullish Breakout":
         cs = f"${choch_sup:.2f}" if choch_sup else "—"
         return ("Breakout Setup",
                 f"Price broke above CHOCH Supply ({cs}). Bullish breakout in progress.",
                 f"5m bullish candle closing above {cs}",
                 f"Close back below {cs}")
-
     if structure_label == "Bearish Breakdown":
         cd = f"${choch_dem:.2f}" if choch_dem else "—"
         return ("Breakout Setup",
@@ -390,59 +399,34 @@ def get_trade_opportunity(market_direction, structure_label, risk_label,
                 f"5m bearish candle closing below {cd}",
                 f"Close back above {cd}")
 
-    # ── Range edge setups ──
-    if market_direction == "Range":
-        if risk_label == "Testing Supply":
-            if bearish - bullish >= BIAS_THRESHOLD:
-                return ("Short Setup",
-                        f"Price at range top ({sup_str}) with bearish score dominance.",
-                        "5m bearish confirmation candle",
-                        f"Close above supply zone ({sup_str})")
-            return ("Reversal Setup",
-                    f"Price at range top ({sup_str}). Watch for rejection or bullish breakout.",
-                    "5m confirmation candle — direction TBD on close",
-                    f"Depends on candle direction")
-        if risk_label == "Testing Demand":
-            if bullish - bearish >= BIAS_THRESHOLD:
-                return ("Long Setup",
-                        f"Price at range bottom ({dem_str}) with bullish score dominance.",
-                        "5m bullish confirmation candle",
-                        f"Close below demand zone ({dem_str})")
-            return ("Reversal Setup",
-                    f"Price at range bottom ({dem_str}). Watch for demand hold or bearish breakdown.",
-                    "5m confirmation candle — direction TBD on close",
-                    "Depends on candle direction")
-        return none_opp("Price inside range — not interacting with supply or demand.")
+    # ── 3. Short Setup: price TESTING supply + bearish structure confirmed ──
+    if risk_label == "Testing Supply" and market_direction == "Bearish":
+        return ("Short Setup",
+                f"Bearish structure confirmed — price testing supply ({sup_str}). Short opportunity.",
+                "5m bearish confirmation candle",
+                f"Close above supply zone ({sup_str})")
 
-    # ── Bearish Trend ──
-    if market_direction == "Bearish":
-        if risk_label == "Testing Supply":
-            return ("Short Setup",
-                    f"Bearish trend — price testing supply ({sup_str}). High-probability short.",
-                    "5m bearish confirmation candle",
-                    f"Close above supply zone ({sup_str})")
-        if risk_label == "Approaching Supply":
-            return ("Short Setup",
-                    f"Bearish trend — price approaching supply ({sup_str}). Prepare for short.",
-                    "5m bearish candle on touch of supply",
-                    f"Close above supply zone ({sup_str})")
-        return none_opp("Bearish trend — price not yet at a key supply level.")
+    # ── 4. Long Setup: price TESTING demand + bullish structure confirmed ──
+    if risk_label == "Testing Demand" and market_direction == "Bullish":
+        return ("Long Setup",
+                f"Bullish structure confirmed — price testing demand ({dem_str}). Long opportunity.",
+                "5m bullish confirmation candle",
+                f"Close below demand zone ({dem_str})")
 
-    # ── Bullish Trend ──
-    if market_direction == "Bullish":
-        if risk_label == "Testing Demand":
-            return ("Long Setup",
-                    f"Bullish trend — price testing demand ({dem_str}). High-probability long.",
-                    "5m bullish confirmation candle",
-                    f"Close below demand zone ({dem_str})")
-        if risk_label == "Approaching Demand":
-            return ("Long Setup",
-                    f"Bullish trend — price approaching demand ({dem_str}). Prepare for long.",
-                    "5m bullish candle on touch of demand",
-                    f"Close below demand zone ({dem_str})")
-        return none_opp("Bullish trend — price not yet at a key demand level.")
+    # ── 5. Watch Supply: price within 1% of supply (any structure) ──
+    if risk_label in ("Testing Supply", "Approaching Supply"):
+        return ("Watch Supply",
+                f"Price within 1% of supply ({sup_str}). Monitor for rejection or breakout.",
+                None, None)
 
-    return none_opp("No actionable trade opportunity detected.")
+    # ── 6. Watch Demand: price within 1% of demand (any structure) ──
+    if risk_label in ("Testing Demand", "Approaching Demand"):
+        return ("Watch Demand",
+                f"Price within 1% of demand ({dem_str}). Monitor for bounce or breakdown.",
+                None, None)
+
+    # ── 7. None: mid-range ──
+    return none_opp("Price mid-range — not interacting with supply or demand.")
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +446,11 @@ def generate_trade_plan(trade_opportunity, structure_label, risk_label,
                 "entry_zone": None, "stop_loss": None,
                 "target1": None, "target2": None, "rr": None, "direction": None}
 
-    if trade_opportunity == "None":
-        return no_plan("No trade opportunity detected.")
+    if trade_opportunity in ("None", "Watch Supply", "Watch Demand"):
+        return no_plan(
+            "Monitoring only — no trade plan until setup confirms."
+            if trade_opportunity != "None" else "No trade opportunity detected."
+        )
 
     if current_price is None:
         return no_plan("No price data available.")
@@ -742,23 +729,29 @@ def _setup_fields(setup):
 
 
 _DIR_EMOJI = {"Bullish": "🟢", "Bearish": "🔴", "Range": "🟡", "Neutral": "⚪"}
-_OPP_EMOJI = {"Long Setup": "🟢", "Short Setup": "🔴",
-               "Breakout Setup": "⚡", "Reversal Setup": "🔄", "None": "⏸️"}
+_OPP_EMOJI = {
+    "Long Setup":     "🟢",
+    "Short Setup":    "🔴",
+    "Breakout Setup": "⚡",
+    "Watch Supply":   "👀",
+    "Watch Demand":   "👀",
+    "None":           "⏸️",
+}
+
+_WATCH_STATES = ("Watch Supply", "Watch Demand")
 
 
 def _direction_opportunity_fields(market_direction, trade_opportunity,
                                    opportunity_reason, entry_trigger, invalidation):
-    """Return Discord embed fields for Market Direction + Trade Opportunity (v8)."""
+    """Return Discord embed fields for Market Direction + Trade Opportunity (v9)."""
     d_emoji = _DIR_EMOJI.get(market_direction, "⚪")
     o_emoji = _OPP_EMOJI.get(trade_opportunity, "")
     fields = [
-        {"name": "📊  Market Direction",  "value": f"{d_emoji} **{market_direction}**",           "inline": True},
-        {"name": "🔍  Trade Opportunity", "value": f"{o_emoji} **{trade_opportunity}**",           "inline": True},
+        {"name": "📊  Market Direction",  "value": f"{d_emoji} **{market_direction}**",  "inline": True},
+        {"name": "🔍  Trade Opportunity", "value": f"{o_emoji} **{trade_opportunity}**", "inline": True},
+        {"name": "💬  Reason",            "value": opportunity_reason,                   "inline": False},
     ]
-    if trade_opportunity == "None":
-        fields.append({"name": "💬  Reason", "value": opportunity_reason, "inline": False})
-    else:
-        fields.append({"name": "💬  Reason", "value": opportunity_reason, "inline": False})
+    if trade_opportunity not in _WATCH_STATES and trade_opportunity != "None":
         if entry_trigger:
             fields.append({"name": "📍  Entry Trigger", "value": entry_trigger, "inline": True})
         if invalidation:
@@ -927,7 +920,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         fields.append({"name": "⚠️  Warning", "value": plan["warning"], "inline": False})
 
     embed = {
-        "title":       "MGC Agent v8",
+        "title":       "MGC Agent v9",
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
         "fields":      fields,
@@ -1104,6 +1097,15 @@ def get_alerts():
     return jsonify({"alerts": list(ALERT_HISTORY), "count": len(ALERT_HISTORY)}), 200
 
 
+@app.route("/clear", methods=["POST"])
+def clear_alerts():
+    global CURRENT_PRICE
+    ALERT_HISTORY.clear()
+    CURRENT_PRICE = None
+    logger.info("Alert history cleared.")
+    return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
+
+
 @app.route("/price", methods=["GET"])
 def price_context():
     last_price_by_type, all_supply, all_demand = get_price_context()
@@ -1142,7 +1144,7 @@ def status():
                           "bullish_score": w_bull, "bearish_score": w_bear}
     return jsonify({
         "status":              "running",
-        "version":             "8.0",
+        "version":             "9.0",
         "verdict":             a["verdict"],
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
@@ -1183,7 +1185,7 @@ def status():
 def index():
     return jsonify({
         "service":     "TradingView Webhook Server",
-        "version":     "8.0",
+        "version":     "9.0",
         "alert_types": list(ALERT_TYPES.keys()),
         "endpoints":   {
             "POST /webhook": "Receive TradingView alerts",
