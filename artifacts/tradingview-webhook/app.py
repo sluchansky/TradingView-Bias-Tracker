@@ -27,15 +27,11 @@ ALERT_TYPES = {
 BIAS_THRESHOLD = 3
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-TIME_WINDOWS = {
-    "15m":  15,
-    "60m":  60,
-    "120m": 120,
-}
+TIME_WINDOWS = {"15m": 15, "60m": 60, "120m": 120}
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Time helpers
 # ---------------------------------------------------------------------------
 
 def now_utc():
@@ -44,16 +40,14 @@ def now_utc():
 
 def alerts_in_window(minutes):
     cutoff = now_utc() - timedelta(minutes=minutes)
-    result = []
+    out = []
     for alert in ALERT_HISTORY:
-        ts = alert.get("timestamp", "")
         try:
-            parsed = datetime.fromisoformat(ts)
-            if parsed >= cutoff:
-                result.append(alert)
-        except (ValueError, TypeError):
+            if datetime.fromisoformat(alert["timestamp"]) >= cutoff:
+                out.append(alert)
+        except (KeyError, ValueError):
             pass
-    return result
+    return out
 
 
 def window_summary(minutes):
@@ -63,13 +57,15 @@ def window_summary(minutes):
         t = a.get("alert_type", "")
         if t in counts:
             counts[t] += 1
-    total = sum(counts.values())
-    return counts, total
+    return counts, len(alerts)
 
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
 
 def score_alerts(alerts):
-    bullish = 0
-    bearish = 0
+    bullish = bearish = 0
     counts = {k: 0 for k in ALERT_TYPES}
     for alert in alerts:
         t = alert.get("alert_type", "")
@@ -93,21 +89,18 @@ def calculate_bias(bullish, bearish):
         return "Bearish", strength
     elif bullish - bearish >= BIAS_THRESHOLD:
         return "Bullish", strength
-    else:
-        return "Choppy", strength
+    return "Choppy", strength
 
 
 def calculate_confidence(bullish, bearish):
     total = bullish + bearish
     if total == 0:
         return 0
-    dominant = max(bullish, bearish)
-    return round((dominant / total) * 100)
+    return round(max(bullish, bearish) / total * 100)
 
 
 def calculate_trade_quality(bias, confidence, bullish, bearish):
-    total = bullish + bearish
-    if total == 0:
+    if bullish + bearish == 0:
         return "D"
     if bias == "Choppy":
         return "C"
@@ -120,13 +113,111 @@ def calculate_trade_quality(bias, confidence, bullish, bearish):
     return "C"
 
 
-QUALITY_LABELS = {
-    "A+": "Strong trend",
-    "A":  "Trend",
-    "B":  "Tradable",
-    "C":  "Choppy",
-    "D":  "Avoid",
-}
+QUALITY_LABELS = {"A+": "Strong trend", "A": "Trend", "B": "Tradable", "C": "Choppy", "D": "Avoid"}
+
+
+# ---------------------------------------------------------------------------
+# Edge Score (0-100)
+# Weighted blend of confidence (70%) and bias strength (30%)
+# ---------------------------------------------------------------------------
+
+def calculate_edge_score(bias, confidence, strength):
+    if bias == "Choppy":
+        # Penalise choppy — cap the strength contribution
+        return round(confidence * 0.5 + (strength / 10) * 10)
+    return min(100, round(confidence * 0.7 + (strength / 10) * 30))
+
+
+# ---------------------------------------------------------------------------
+# Trade Eligibility (Recommendation + Why)
+# ---------------------------------------------------------------------------
+
+def calculate_recommendation(bias, confidence):
+    if bias == "Choppy":
+        return "WAIT"
+    if confidence >= 90:
+        return "HIGH CONVICTION TRADE"
+    if confidence >= 80:
+        return "TRADE"
+    if confidence >= 70:
+        return "WATCH"
+    return "WAIT"
+
+
+def build_why(bias, confidence, strength, bullish, bearish, counts, recommendation):
+    """
+    Generate a plain-language explanation for the recommendation.
+    """
+    # Identify the dominant structural signals
+    bear_struct = []
+    bull_struct = []
+    if counts.get("CHOCH SUPPLY", 0):
+        bear_struct.append(f"CHOCH Supply ×{counts['CHOCH SUPPLY']}")
+    if counts.get("BOS SUPPLY", 0):
+        bear_struct.append(f"BOS Supply ×{counts['BOS SUPPLY']}")
+    if counts.get("MGC SUPPLY ZONE CONFIRMED", 0):
+        bear_struct.append(f"supply confirmed ×{counts['MGC SUPPLY ZONE CONFIRMED']}")
+    if counts.get("MGC NEW SUPPLY ZONE", 0):
+        bear_struct.append(f"new supply ×{counts['MGC NEW SUPPLY ZONE']}")
+
+    if counts.get("CHOCH DEMAND", 0):
+        bull_struct.append(f"CHOCH Demand ×{counts['CHOCH DEMAND']}")
+    if counts.get("BOS DEMAND", 0):
+        bull_struct.append(f"BOS Demand ×{counts['BOS DEMAND']}")
+    if counts.get("MGC DEMAND ZONE CONFIRMED", 0):
+        bull_struct.append(f"demand confirmed ×{counts['MGC DEMAND ZONE CONFIRMED']}")
+    if counts.get("MGC NEW DEMAND ZONE", 0):
+        bull_struct.append(f"new demand ×{counts['MGC NEW DEMAND ZONE']}")
+
+    # No signals at all
+    if bullish == 0 and bearish == 0:
+        return "No alerts received yet. No edge to evaluate."
+
+    # Choppy
+    if bias == "Choppy":
+        dominant_side = "supply" if bearish >= bullish else "demand"
+        weaker_side   = "demand" if dominant_side == "supply" else "supply"
+        return (
+            f"Confidence only {confidence}%. "
+            f"Supply and demand are mixed ({dominant_side} {max(bullish, bearish)}, "
+            f"{weaker_side} {min(bullish, bearish)}). No edge."
+        )
+
+    # Biased — build a narrative from signals
+    if bias == "Bearish":
+        signal_list = bear_struct
+        direction   = "bearish"
+        score_str   = f"Bearish score {bearish}, bullish {bullish}"
+    else:
+        signal_list = bull_struct
+        direction   = "bullish"
+        score_str   = f"Bullish score {bullish}, bearish {bearish}"
+
+    signal_text = ", ".join(signal_list) if signal_list else f"{direction} score {max(bullish, bearish)}"
+
+    if recommendation == "HIGH CONVICTION TRADE":
+        return (
+            f"Confidence {confidence}%. {signal_text}. "
+            f"Strong {direction} structure with minimal opposition. "
+            f"Trend continuation likely. {score_str}."
+        )
+    if recommendation == "TRADE":
+        return (
+            f"Confidence {confidence}%. {signal_text}. "
+            f"Clear {direction} edge with sufficient signal weight. {score_str}."
+        )
+    if recommendation == "WATCH":
+        return (
+            f"Confidence {confidence}%. {signal_text}. "
+            f"Bias is {direction} but not strong enough to commit. "
+            f"Wait for additional confirmation. {score_str}."
+        )
+    # WAIT
+    return (
+        f"Confidence only {confidence}%. "
+        f"Signals present ({signal_text}) but opposing pressure is too close. "
+        f"No reliable edge. {score_str}."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,70 +228,60 @@ def build_trade_plan(bias, strength, bullish, bearish, counts):
     if bias == "Bearish":
         parts = []
         if counts.get("CHOCH SUPPLY", 0):
-            parts.append(f"CHoCH supply break ({counts['CHOCH SUPPLY']}×)")
+            parts.append(f"CHoCH supply ({counts['CHOCH SUPPLY']}×)")
         if counts.get("BOS SUPPLY", 0):
             parts.append(f"BOS supply ({counts['BOS SUPPLY']}×)")
         if counts.get("MGC SUPPLY ZONE CONFIRMED", 0):
-            parts.append(f"supply zone confirmed ({counts['MGC SUPPLY ZONE CONFIRMED']}×)")
+            parts.append(f"supply confirmed ({counts['MGC SUPPLY ZONE CONFIRMED']}×)")
         if counts.get("MGC NEW SUPPLY ZONE", 0):
-            parts.append(f"new supply zone ({counts['MGC NEW SUPPLY ZONE']}×)")
+            parts.append(f"new supply ({counts['MGC NEW SUPPLY ZONE']}×)")
         reason = (
-            (", ".join(parts) + f". Bearish {bearish} vs bullish {bullish}.")
+            ", ".join(parts) + f". Bearish {bearish} vs bullish {bullish}."
             if parts else
             f"Bearish score ({bearish}) exceeds bullish ({bullish}) by {bearish - bullish}."
         )
         return {
-            "reason":         reason,
-            "action":         "Wait for retest short. Do not chase lows.",
-            "longs_allowed":  "No",
-            "shorts_allowed": "Yes",
-            "warning":        None,
+            "reason": reason,
+            "action": "Wait for retest short. Do not chase lows.",
+            "longs_allowed": "No", "shorts_allowed": "Yes", "warning": None,
         }
-
     elif bias == "Bullish":
         parts = []
         if counts.get("CHOCH DEMAND", 0):
-            parts.append(f"CHoCH demand break ({counts['CHOCH DEMAND']}×)")
+            parts.append(f"CHoCH demand ({counts['CHOCH DEMAND']}×)")
         if counts.get("BOS DEMAND", 0):
             parts.append(f"BOS demand ({counts['BOS DEMAND']}×)")
         if counts.get("MGC DEMAND ZONE CONFIRMED", 0):
-            parts.append(f"demand zone confirmed ({counts['MGC DEMAND ZONE CONFIRMED']}×)")
+            parts.append(f"demand confirmed ({counts['MGC DEMAND ZONE CONFIRMED']}×)")
         if counts.get("MGC NEW DEMAND ZONE", 0):
-            parts.append(f"new demand zone ({counts['MGC NEW DEMAND ZONE']}×)")
+            parts.append(f"new demand ({counts['MGC NEW DEMAND ZONE']}×)")
         reason = (
-            (", ".join(parts) + f". Bullish {bullish} vs bearish {bearish}.")
+            ", ".join(parts) + f". Bullish {bullish} vs bearish {bearish}."
             if parts else
             f"Bullish score ({bullish}) exceeds bearish ({bearish}) by {bullish - bearish}."
         )
         return {
-            "reason":         reason,
-            "action":         "Wait for demand hold. Do not chase highs.",
-            "longs_allowed":  "Yes",
-            "shorts_allowed": "No",
-            "warning":        None,
+            "reason": reason,
+            "action": "Wait for demand hold. Do not chase highs.",
+            "longs_allowed": "Yes", "shorts_allowed": "No", "warning": None,
         }
-
     else:
         return {
-            "reason":         f"Supply and demand scores are close (Bull: {bullish}, Bear: {bearish}). No clear edge.",
-            "action":         "No trade. Wait for clearer supply or demand control.",
-            "longs_allowed":  "No",
-            "shorts_allowed": "No",
-            "warning":        "Market is choppy. Standing aside is a valid position.",
+            "reason": f"Supply and demand scores are close (Bull: {bullish}, Bear: {bearish}). No clear edge.",
+            "action": "No trade. Wait for clearer supply or demand control.",
+            "longs_allowed": "No", "shorts_allowed": "No",
+            "warning": "Market is choppy. Standing aside is a valid position.",
         }
 
 
 # ---------------------------------------------------------------------------
-# Window summary string (for Discord)
+# Discord helpers
 # ---------------------------------------------------------------------------
 
 def fmt_window_counts(counts, total):
     if total == 0:
         return "No alerts"
-    parts = []
-    # Group by side
-    bear_parts = []
-    bull_parts = []
+    bear_parts, bull_parts = [], []
     for k, v in counts.items():
         if v == 0:
             continue
@@ -211,10 +292,8 @@ def fmt_window_counts(counts, total):
              .replace("NEW SUPPLY", "NEW SUP")
              .replace("NEW DEMAND", "NEW DEM")
         )
-        if ALERT_TYPES[k]["side"] == "bearish":
-            bear_parts.append(f"{short} ×{v}")
-        else:
-            bull_parts.append(f"{short} ×{v}")
+        (bear_parts if ALERT_TYPES[k]["side"] == "bearish" else bull_parts).append(f"{short} ×{v}")
+    parts = []
     if bear_parts:
         parts.append("🔴 " + ", ".join(bear_parts))
     if bull_parts:
@@ -222,41 +301,45 @@ def fmt_window_counts(counts, total):
     return "\n".join(parts) if parts else "No alerts"
 
 
-# ---------------------------------------------------------------------------
-# Discord
-# ---------------------------------------------------------------------------
-
 def bias_color(bias):
     return {"Bearish": 0xFF3333, "Bullish": 0x33CC66, "Choppy": 0xFFCC00}.get(bias, 0x888888)
 
 
+RECOMMENDATION_EMOJI = {
+    "HIGH CONVICTION TRADE": "🔥",
+    "TRADE":                 "✅",
+    "WATCH":                 "👀",
+    "WAIT":                  "⏸️",
+}
+
+
 def send_discord_message(alert_data, bias, strength, bullish, bearish,
-                         confidence, quality, plan, color):
+                         confidence, quality, edge_score,
+                         recommendation, why, plan, color):
     if not DISCORD_WEBHOOK_URL:
-        logger.warning("DISCORD_WEBHOOK_URL not set — skipping Discord notification")
+        logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
         return
 
     bias_emoji = {"Bullish": "🟢", "Bearish": "🔴", "Choppy": "🟡"}.get(bias, "⚪")
-    ticker    = alert_data.get("ticker") or "MGC"
-    price     = alert_data.get("price")
-    price_str = f"${price}" if price is not None else "—"
-    quality_label = QUALITY_LABELS.get(quality, "")
+    rec_emoji  = RECOMMENDATION_EMOJI.get(recommendation, "")
+    ticker     = alert_data.get("ticker") or "MGC"
+    price      = alert_data.get("price")
+    price_str  = f"${price}" if price is not None else "—"
 
-    # Build time-window summary fields
     window_fields = []
     for label, minutes in TIME_WINDOWS.items():
         w_counts, w_total = window_summary(minutes)
         window_fields.append({
-            "name":   f"🕐  {label} Window",
-            "value":  fmt_window_counts(w_counts, w_total),
+            "name": f"🕐  {label}",
+            "value": fmt_window_counts(w_counts, w_total),
             "inline": True,
         })
 
     fields = [
-        # ── Header row ──
+        # ── Top metrics ──
         {
             "name":   "📊  Bias",
-            "value":  f"{bias_emoji} **{bias}**   (Strength {strength}/10)",
+            "value":  f"{bias_emoji} **{bias}**   Strength {strength}/10",
             "inline": True,
         },
         {
@@ -265,36 +348,45 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "inline": True,
         },
         {
-            "name":   "🏆  Trade Quality",
-            "value":  f"**{quality}** — {quality_label}",
+            "name":   "⚡  Edge Score",
+            "value":  f"**{edge_score} / 100**",
             "inline": True,
         },
-        # ── Score ──
+        # ── Recommendation ──
+        {
+            "name":   "📣  Recommendation",
+            "value":  f"{rec_emoji} **{recommendation}**",
+            "inline": True,
+        },
+        {
+            "name":   "🏆  Trade Quality",
+            "value":  f"**{quality}** — {QUALITY_LABELS.get(quality, '')}",
+            "inline": True,
+        },
         {
             "name":   "🔢  Score",
-            "value":  f"Bullish `{bullish}` · Bearish `{bearish}` · Gap `{abs(bullish - bearish)}`",
+            "value":  f"Bull `{bullish}` · Bear `{bearish}` · Gap `{abs(bullish - bearish)}`",
+            "inline": True,
+        },
+        # ── Why ──
+        {
+            "name":   "💬  Why",
+            "value":  why,
             "inline": False,
         },
         # ── Recent Alert Summary ──
         {
             "name":   "📋  Recent Alert Summary",
-            "value":  "━━━━━━━━━━━━━━━━━━━━━",
+            "value":  "━━━━━━━━━━━━━━━━━━━━━━━━━━",
             "inline": False,
         },
         *window_fields,
-        # ── Reason ──
-        {
-            "name":   "🧠  Reason",
-            "value":  plan["reason"],
-            "inline": False,
-        },
         # ── Action ──
         {
-            "name":   "⚡  Action",
+            "name":   "🗺️  Action",
             "value":  plan["action"],
             "inline": False,
         },
-        # ── Longs / Shorts ──
         {
             "name":   "🟩  Longs Allowed",
             "value":  plan["longs_allowed"],
@@ -309,14 +401,12 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
 
     if plan["warning"]:
         fields.append({
-            "name":   "⚠️  Warning",
-            "value":  plan["warning"],
-            "inline": False,
+            "name": "⚠️  Warning", "value": plan["warning"], "inline": False,
         })
 
     embed = {
-        "title":       "MGC Agent v3",
-        "description": f"**Ticker:** {ticker}   **Price:** {price_str}\n**Alert:** {alert_data.get('alert_type', '—')}",
+        "title":       "MGC Agent v4",
+        "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type', '—')}`",
         "color":       color,
         "fields":      fields,
         "footer":      {"text": f"Received {alert_data.get('timestamp', '')}"},
@@ -335,6 +425,20 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
 # Routes
 # ---------------------------------------------------------------------------
 
+def full_analysis():
+    bullish, bearish, counts = calculate_scores()
+    bias, strength           = calculate_bias(bullish, bearish)
+    confidence               = calculate_confidence(bullish, bearish)
+    quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
+    edge_score               = calculate_edge_score(bias, confidence, strength)
+    recommendation           = calculate_recommendation(bias, confidence)
+    why                      = build_why(bias, confidence, strength, bullish, bearish, counts, recommendation)
+    plan                     = build_trade_plan(bias, strength, bullish, bearish, counts)
+    color                    = bias_color(bias)
+    return (bullish, bearish, counts, bias, strength, confidence,
+            quality, edge_score, recommendation, why, plan, color)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -346,18 +450,12 @@ def webhook():
     if not data and raw_body:
         data = {"alert_type": raw_body.strip()}
 
-    alert_type = (
-        data.get("alert_type") or data.get("message") or data.get("text") or ""
-    )
+    alert_type = (data.get("alert_type") or data.get("message") or data.get("text") or "")
     normalized = alert_type.strip().upper()
 
     if normalized not in ALERT_TYPES:
         logger.warning("Unrecognized alert type: %r", alert_type)
-        return jsonify({
-            "status":   "ignored",
-            "reason":   "unrecognized alert type",
-            "received": alert_type,
-        }), 200
+        return jsonify({"status": "ignored", "reason": "unrecognized alert type", "received": alert_type}), 200
 
     record = {
         "alert_type": normalized,
@@ -368,19 +466,16 @@ def webhook():
     }
     ALERT_HISTORY.append(record)
 
-    bullish, bearish, counts = calculate_scores()
-    bias, strength           = calculate_bias(bullish, bearish)
-    confidence               = calculate_confidence(bullish, bearish)
-    quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
-    plan                     = build_trade_plan(bias, strength, bullish, bearish, counts)
-    color                    = bias_color(bias)
+    (bullish, bearish, counts, bias, strength, confidence,
+     quality, edge_score, recommendation, why, plan, color) = full_analysis()
 
     send_discord_message(record, bias, strength, bullish, bearish,
-                         confidence, quality, plan, color)
+                         confidence, quality, edge_score,
+                         recommendation, why, plan, color)
 
     logger.info(
-        "Alert: %s | %s (%d/10) | %d%% conf | Quality: %s | Bull: %d Bear: %d",
-        normalized, bias, strength, confidence, quality, bullish, bearish,
+        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s | Quality %s",
+        normalized, bias, strength, confidence, edge_score, recommendation, quality,
     )
 
     return jsonify({
@@ -389,6 +484,9 @@ def webhook():
         "bias":           bias,
         "strength":       strength,
         "confidence":     f"{confidence}%",
+        "edge_score":     edge_score,
+        "recommendation": recommendation,
+        "why":            why,
         "trade_quality":  quality,
         "bullish_score":  bullish,
         "bearish_score":  bearish,
@@ -406,29 +504,29 @@ def get_alerts():
 
 @app.route("/status", methods=["GET"])
 def status():
-    bullish, bearish, counts = calculate_scores()
-    bias, strength           = calculate_bias(bullish, bearish)
-    confidence               = calculate_confidence(bullish, bearish)
-    quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
-    plan                     = build_trade_plan(bias, strength, bullish, bearish, counts)
+    (bullish, bearish, counts, bias, strength, confidence,
+     quality, edge_score, recommendation, why, plan, _) = full_analysis()
 
     windows = {}
     for label, minutes in TIME_WINDOWS.items():
         w_counts, w_total = window_summary(minutes)
         w_bull, w_bear, _ = score_alerts(alerts_in_window(minutes))
         windows[label] = {
-            "alert_counts": w_counts,
-            "total":        w_total,
+            "alert_counts":  w_counts,
+            "total":         w_total,
             "bullish_score": w_bull,
             "bearish_score": w_bear,
         }
 
     return jsonify({
         "status":              "running",
-        "version":             "3.0",
+        "version":             "4.0",
         "bias":                bias,
         "strength":            f"{strength}/10",
         "confidence":          f"{confidence}%",
+        "edge_score":          edge_score,
+        "recommendation":      recommendation,
+        "why":                 why,
         "trade_quality":       quality,
         "trade_quality_label": QUALITY_LABELS.get(quality, ""),
         "bullish_score":       bullish,
@@ -447,13 +545,13 @@ def status():
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "service": "TradingView Webhook Server",
-        "version": "3.0",
+        "service":     "TradingView Webhook Server",
+        "version":     "4.0",
         "alert_types": list(ALERT_TYPES.keys()),
-        "endpoints": {
+        "endpoints":   {
             "POST /webhook": "Receive TradingView alerts",
             "GET /alerts":   "View last 100 stored alerts",
-            "GET /status":   "Full bias, confidence, quality, and window breakdown",
+            "GET /status":   "Full analysis: bias, confidence, edge score, recommendation",
         },
     }), 200
 
