@@ -339,6 +339,97 @@ def decision_engine(structure_label, risk_label, overextended,
 
 
 # ---------------------------------------------------------------------------
+# Setup Detection v7
+# ---------------------------------------------------------------------------
+
+def detect_setup(structure_class, structure_label, risk_label, overextended,
+                 current_price, nearest_supply, nearest_demand, last_price_by_type):
+    """
+    Detects the current trading setup.
+    Returns dict: {setup, entry_trigger, invalidation, target, reason}
+    Valid setups have reason=None. NONE setup has entry_trigger/invalidation/target=None.
+    """
+    sup_str   = f"${nearest_supply:.2f}" if nearest_supply is not None else "—"
+    dem_str   = f"${nearest_demand:.2f}" if nearest_demand is not None else "—"
+    choch_sup = last_price_by_type.get("CHOCH SUPPLY")
+    choch_dem = last_price_by_type.get("CHOCH DEMAND")
+
+    def no_setup(reason):
+        return {"setup": "NONE", "entry_trigger": None,
+                "invalidation": None, "target": None, "reason": reason}
+
+    # ── Gate: overextended ──
+    if overextended:
+        return no_setup("Price is overextended from level. Wait for retracement.")
+
+    # ── Undefined ──
+    if structure_class == "Undefined":
+        return no_setup("No actionable setup detected.")
+
+    # ── Range ──
+    if structure_class == "Range":
+        if risk_label == "Testing Supply":
+            return {"setup": "Supply Rejection",
+                    "entry_trigger": "5m bearish confirmation candle",
+                    "invalidation":  f"Close above supply zone ({sup_str})",
+                    "target":        f"Nearest demand ({dem_str})",
+                    "reason":        None}
+        if risk_label == "Testing Demand":
+            return {"setup": "Demand Bounce",
+                    "entry_trigger": "5m bullish confirmation candle",
+                    "invalidation":  f"Close below demand zone ({dem_str})",
+                    "target":        f"Nearest supply ({sup_str})",
+                    "reason":        None}
+        return {"setup": "Range Chop",
+                "entry_trigger": "Wait for breakout above supply or below demand",
+                "invalidation":  "N/A",
+                "target":        "N/A",
+                "reason":        None}
+
+    # ── Reversal: Bullish Breakout ──
+    if structure_class == "Reversal" and structure_label == "Bullish Breakout":
+        choch_str = f"${choch_sup:.2f}" if choch_sup else "—"
+        tgt = sup_str if (nearest_supply and choch_sup and nearest_supply != choch_sup) else "Next resistance"
+        return {"setup": "Bullish Breakout Setup",
+                "entry_trigger": f"5m bullish candle closing above {choch_str}",
+                "invalidation":  f"Close back below {choch_str}",
+                "target":        tgt,
+                "reason":        None}
+
+    # ── Reversal: Bearish Breakdown ──
+    if structure_class == "Reversal" and structure_label == "Bearish Breakdown":
+        choch_str = f"${choch_dem:.2f}" if choch_dem else "—"
+        tgt = dem_str if (nearest_demand and choch_dem and nearest_demand != choch_dem) else "Next support"
+        return {"setup": "Bearish Breakdown Setup",
+                "entry_trigger": f"5m bearish candle closing below {choch_str}",
+                "invalidation":  f"Close back above {choch_str}",
+                "target":        tgt,
+                "reason":        None}
+
+    # ── Bearish Trend ──
+    if structure_class == "Bearish Trend":
+        if risk_label in ("Testing Supply", "Approaching Supply"):
+            return {"setup": "Supply Rejection",
+                    "entry_trigger": "5m bearish confirmation candle",
+                    "invalidation":  f"Close above supply zone ({sup_str})",
+                    "target":        f"Nearest demand ({dem_str})",
+                    "reason":        None}
+        return no_setup("Bearish trend active — price not yet at a key supply level.")
+
+    # ── Bullish Trend ──
+    if structure_class == "Bullish Trend":
+        if risk_label in ("Testing Demand", "Approaching Demand"):
+            return {"setup": "Demand Bounce",
+                    "entry_trigger": "5m bullish confirmation candle",
+                    "invalidation":  f"Close below demand zone ({dem_str})",
+                    "target":        f"Nearest supply ({sup_str})",
+                    "reason":        None}
+        return no_setup("Bullish trend active — price not yet at a key demand level.")
+
+    return no_setup("No actionable setup detected.")
+
+
+# ---------------------------------------------------------------------------
 # Trade plan + Why
 # ---------------------------------------------------------------------------
 
@@ -455,9 +546,31 @@ RECOMMENDATION_EMOJI = {
 }
 
 
+def _setup_fields(setup):
+    """Return a list of Discord embed field dicts for the current setup."""
+    s = setup["setup"]
+    if s == "NONE":
+        return [
+            {"name": "📐  Current Setup", "value": "**NONE**",         "inline": True},
+            {"name": "💬  Reason",        "value": setup["reason"],     "inline": False},
+        ]
+    if s == "Range Chop":
+        return [
+            {"name": "📐  Current Setup", "value": "**Range Chop**",              "inline": True},
+            {"name": "⏳  Wait For",      "value": setup["entry_trigger"],         "inline": False},
+        ]
+    return [
+        {"name": "📐  Current Setup", "value": f"**{s}**",             "inline": True},
+        {"name": "📍  Entry Trigger",  "value": setup["entry_trigger"], "inline": False},
+        {"name": "❌  Invalidation",   "value": setup["invalidation"],  "inline": True},
+        {"name": "🎯  Target",         "value": setup["target"],        "inline": True},
+    ]
+
+
 def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          confidence, quality, edge_score,
                          recommendation, verdict, reasoning_chain, why, plan,
+                         setup,
                          structure_label, structure_class, structure_detail,
                          nearest_supply, nearest_demand,
                          risk_label, risk_detail,
@@ -525,6 +638,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  f"```\n{chain_text}\n```",
             "inline": False,
         },
+        # ── Setup Detection ──
+        *_setup_fields(setup),
         # ── Why ──
         {
             "name":   "💬  Why",
@@ -650,6 +765,11 @@ def full_analysis(current_price_override=None):
         bias, bullish, bearish, confidence
     )
 
+    setup = detect_setup(
+        structure_class, structure_label, risk_label, overextended,
+        current_price, nearest_supply, nearest_demand, last_price_by_type
+    )
+
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
     plan = build_trade_plan(bias, strength, bullish, bearish, counts)
@@ -660,6 +780,7 @@ def full_analysis(current_price_override=None):
         quality=quality, edge_score=edge_score,
         recommendation=recommendation, verdict=verdict,
         reasoning_chain=reasoning_chain, why=why, plan=plan,
+        setup=setup,
         current_price=current_price,
         last_price_by_type=last_price_by_type,
         nearest_supply=nearest_supply, nearest_demand=nearest_demand,
@@ -718,6 +839,7 @@ def webhook():
         a["bias"], a["strength"], a["bullish"], a["bearish"],
         a["confidence"], a["quality"], a["edge_score"],
         a["recommendation"], a["verdict"], a["reasoning_chain"], a["why"], a["plan"],
+        a["setup"],
         a["structure_label"], a["structure_class"], a["structure_detail"],
         a["nearest_supply"], a["nearest_demand"],
         a["risk_label"], a["risk_detail"],
@@ -736,6 +858,7 @@ def webhook():
         "verdict":          a["verdict"],
         "recommendation":   a["recommendation"],
         "reasoning_chain":  a["reasoning_chain"],
+        "setup":            a["setup"],
         "why":              a["why"],
         "bias":             a["bias"],
         "strength":         a["strength"],
@@ -801,10 +924,11 @@ def status():
                           "bullish_score": w_bull, "bearish_score": w_bear}
     return jsonify({
         "status":              "running",
-        "version":             "6.0",
+        "version":             "7.0",
         "verdict":             a["verdict"],
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
+        "setup":               a["setup"],
         "why":                 a["why"],
         "bias":                a["bias"],
         "strength":            f"{a['strength']}/10",
@@ -838,7 +962,7 @@ def status():
 def index():
     return jsonify({
         "service":     "TradingView Webhook Server",
-        "version":     "6.0",
+        "version":     "7.0",
         "alert_types": list(ALERT_TYPES.keys()),
         "endpoints":   {
             "POST /webhook": "Receive TradingView alerts",
