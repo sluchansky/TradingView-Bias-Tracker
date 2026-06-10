@@ -1265,9 +1265,9 @@ def send_trade_event_message(event_type, trade, current_price):
         "T2_HIT":   (f"🎯🎯 **T2 HIT**\n"
                      f"Trade Closed\n"
                      f"{pnl_str}"),
-        "STOP_HIT": (f"🛑 **TRADE CLOSED — STOP HIT**\n"
-                     f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
-                     f"Stopped @ `{current_price:.1f}` | PnL **{pnl_str}**"),
+        "STOP_HIT": (f"❌ **STOP HIT**\n"
+                     f"Trade Closed\n"
+                     f"{pnl_str}"),
     }
     content = msgs.get(event_type, f"Trade event: {event_type}")
     try:
