@@ -31,6 +31,10 @@ NEAR_PCT       = 0.005   # 0.5%  — Testing zone
 EXTENDED_PCT   = 0.010   # 1.0%  — Approaching zone
 WATCH_PCT      = 0.0075  # 0.75% — Watch zone (v10)
 
+DEFAULT_ACCOUNT_SIZE = 10_000   # $10,000 — override per-alert via "account_size" field
+DEFAULT_RISK_PCT     = 0.01     # 1% risk per trade — override via "risk_pct" field
+MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 10 oz)
+
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TIME_WINDOWS        = {"15m": 15, "60m": 60, "120m": 120}
 
