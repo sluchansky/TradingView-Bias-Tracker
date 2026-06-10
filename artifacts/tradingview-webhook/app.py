@@ -31,7 +31,7 @@ NEAR_PCT       = 0.005   # 0.5%  — Testing zone
 EXTENDED_PCT   = 0.010   # 1.0%  — Approaching zone
 WATCH_PCT      = 0.0075  # 0.75% — Watch zone (v10)
 
-DEFAULT_ACCOUNT_SIZE = 10_000   # $10,000 — override per-alert via "account_size" field
+DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — override per-alert via "account_size" field
 DEFAULT_RISK_PCT     = 0.01     # 1% risk per trade — override via "risk_pct" field
 MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 10 oz)
 
@@ -569,6 +569,52 @@ def generate_trade_plan(trade_opportunity, structure_label, risk_label,
     return no_plan("No trade plan available for this opportunity.")
 
 
+def calculate_position_sizing(trade_plan, account_size, risk_pct):
+    """
+    Compute MGC position sizing from a generated trade plan.
+
+    MGC (Micro Gold) = 10 troy oz. Point value = $10 per contract per point.
+
+    Returns a dict of display strings, or {} if no trade plan exists.
+    """
+    if not trade_plan.get("trade_plan"):
+        return {}
+    try:
+        # Parse entry midpoint from "lo–hi" zone string
+        lo_s, hi_s    = trade_plan["entry_zone"].split("–")
+        entry_mid      = (float(lo_s) + float(hi_s)) / 2
+        stop           = float(trade_plan["stop_loss"])
+        t1             = float(trade_plan["target1"])
+        t2             = float(trade_plan["target2"])
+
+        stop_dist      = abs(entry_mid - stop)
+        t1_dist        = abs(t1 - entry_mid)
+        t2_dist        = abs(t2 - entry_mid)
+
+        if stop_dist == 0:
+            return {}
+
+        dollar_risk         = account_size * risk_pct
+        risk_per_contract   = stop_dist * MGC_POINT_VALUE
+        contracts           = max(1, int(dollar_risk / risk_per_contract))
+        max_loss            = contracts * risk_per_contract
+        profit_t1           = contracts * t1_dist * MGC_POINT_VALUE
+        profit_t2           = contracts * t2_dist * MGC_POINT_VALUE
+
+        return {
+            "account_size":       f"${account_size:,.0f}",
+            "risk_per_trade":     f"{risk_pct * 100:.2f}%",
+            "dollar_risk":        f"${dollar_risk:,.0f}",
+            "risk_per_contract":  f"${risk_per_contract:,.0f}",
+            "contracts":          str(contracts),
+            "max_loss":           f"${max_loss:,.0f}",
+            "profit_t1":          f"${profit_t1:,.0f}",
+            "profit_t2":          f"${profit_t2:,.0f}",
+        }
+    except (ValueError, TypeError, ZeroDivisionError):
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Trade plan + Why
 # ---------------------------------------------------------------------------
@@ -686,8 +732,8 @@ RECOMMENDATION_EMOJI = {
 }
 
 
-def _trade_plan_fields(tp):
-    """Return Discord embed field dicts for the trade plan."""
+def _trade_plan_fields(tp, sizing=None):
+    """Return Discord embed field dicts for the trade plan + position sizing."""
     if not tp["trade_plan"]:
         return [
             {
@@ -697,7 +743,7 @@ def _trade_plan_fields(tp):
             }
         ]
     direction_emoji = "🟢" if tp["direction"] == "Long" else "🔴"
-    return [
+    fields = [
         {
             "name":   f"📋  Trade Plan  {direction_emoji} {tp['direction']}",
             "value":  (
@@ -710,6 +756,22 @@ def _trade_plan_fields(tp):
             "inline": False,
         }
     ]
+    if sizing:
+        fields.append({
+            "name": "💰  Position Sizing",
+            "value": (
+                f"**Account:** {sizing['account_size']}  ·  "
+                f"**Risk:** {sizing['risk_per_trade']}  ·  "
+                f"**Dollar Risk:** {sizing['dollar_risk']}\n"
+                f"**Risk/MGC:** {sizing['risk_per_contract']}  ·  "
+                f"**Contracts:** {sizing['contracts']}  ·  "
+                f"**Max Loss:** {sizing['max_loss']}\n"
+                f"**T1 Profit:** {sizing['profit_t1']}  ·  "
+                f"**T2 Profit:** {sizing['profit_t2']}"
+            ),
+            "inline": False,
+        })
+    return fields
 
 
 def _setup_fields(setup):
@@ -783,7 +845,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          recommendation, verdict, reasoning_chain, why, plan,
                          setup_stage, stage_next_step, stage_entry_rule, stage_invalidation,
                          market_direction, trade_opportunity, opportunity_reason,
-                         entry_trigger, invalidation, trade_plan,
+                         entry_trigger, invalidation, trade_plan, sizing,
                          structure_label, structure_class, structure_detail,
                          nearest_supply, nearest_demand,
                          risk_label, risk_detail,
@@ -856,8 +918,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         # ── Market Direction + Trade Opportunity ──
         *_direction_opportunity_fields(market_direction, trade_opportunity,
                                        opportunity_reason, entry_trigger, invalidation),
-        # ── Trade Plan ──
-        *_trade_plan_fields(trade_plan),
+        # ── Trade Plan + Position Sizing ──
+        *_trade_plan_fields(trade_plan, sizing),
         # ── Why ──
         {
             "name":   "💬  Why",
@@ -1164,7 +1226,19 @@ def webhook():
     }
     ALERT_HISTORY.append(record)
 
+    # ── Position sizing — read from payload or use defaults ──
+    try:
+        account_size = float(data.get("account_size") or DEFAULT_ACCOUNT_SIZE)
+    except (ValueError, TypeError):
+        account_size = DEFAULT_ACCOUNT_SIZE
+    try:
+        risk_pct = float(data.get("risk_pct") or DEFAULT_RISK_PCT)
+    except (ValueError, TypeError):
+        risk_pct = DEFAULT_RISK_PCT
+
     a = full_analysis(current_price_override=parsed_price)
+
+    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct)
 
     send_discord_message(
         record,
@@ -1173,7 +1247,7 @@ def webhook():
         a["recommendation"], a["verdict"], a["reasoning_chain"], a["why"], a["plan"],
         a["setup_stage"], a["stage_next_step"], a["stage_entry_rule"], a["stage_invalidation"],
         a["market_direction"], a["trade_opportunity"], a["opportunity_reason"],
-        a["entry_trigger"], a["invalidation"], a["trade_plan"],
+        a["entry_trigger"], a["invalidation"], a["trade_plan"], sizing,
         a["structure_label"], a["structure_class"], a["structure_detail"],
         a["nearest_supply"], a["nearest_demand"],
         a["risk_label"], a["risk_detail"],
@@ -1200,6 +1274,7 @@ def webhook():
         "trade_opportunity":  a["trade_opportunity"],
         "opportunity_reason": a["opportunity_reason"],
         "trade_plan":         a["trade_plan"],
+        "sizing":             sizing,
         "why":                a["why"],
         "bias":             a["bias"],
         "strength":         a["strength"],
