@@ -1259,9 +1259,9 @@ def send_trade_event_message(event_type, trade, current_price):
     dollar_pnl, pts_pnl = compute_pnl(trade, current_price)
     pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
     msgs = {
-        "T1_HIT":   (f"⚠️ **MOVE STOP TO BREAKEVEN**\n"
-                     f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
-                     f"T1 hit @ `{current_price:.1f}` | PnL **{pnl_str}**"),
+        "T1_HIT":   (f"🎯 **T1 HIT**\n"
+                     f"{pnl_str}\n"
+                     f"Move Stop to Break Even"),
         "T2_HIT":   (f"🎯 **TARGET REACHED — T2 HIT**\n"
                      f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
                      f"T2 hit @ `{current_price:.1f}` | PnL **{pnl_str}**"),
