@@ -31,9 +31,17 @@ NEAR_PCT       = 0.005   # 0.5%  — Testing zone
 EXTENDED_PCT   = 0.010   # 1.0%  — Approaching zone
 WATCH_PCT      = 0.0075  # 0.75% — Watch zone (v10)
 
-DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — override per-alert via "account_size" field
-DEFAULT_RISK_PCT     = 0.01     # 1% risk per trade — override via "risk_pct" field
+DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — fallback when no profile/account_size given
+DEFAULT_RISK_PCT     = 0.01     # 1% — fallback when no profile/risk_pct given
 MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 10 oz)
+
+ACCOUNT_PROFILES = {
+    "MGC Conservative": {"account_size": 50_000,  "risk_pct": 0.005},
+    "MGC Standard":     {"account_size": 50_000,  "risk_pct": 0.010},
+    "MNQ Conservative": {"account_size": 100_000, "risk_pct": 0.005},
+    "MNQ Standard":     {"account_size": 100_000, "risk_pct": 0.010},
+}
+DEFAULT_PROFILE = "MGC Standard"
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TIME_WINDOWS        = {"15m": 15, "60m": 60, "120m": 120}
@@ -569,7 +577,7 @@ def generate_trade_plan(trade_opportunity, structure_label, risk_label,
     return no_plan("No trade plan available for this opportunity.")
 
 
-def calculate_position_sizing(trade_plan, account_size, risk_pct):
+def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name=""):
     """
     Compute MGC position sizing from a generated trade plan.
 
@@ -602,6 +610,7 @@ def calculate_position_sizing(trade_plan, account_size, risk_pct):
         profit_t2           = contracts * t2_dist * MGC_POINT_VALUE
 
         return {
+            "profile":            profile_name or "Custom",
             "account_size":       f"${account_size:,.0f}",
             "risk_per_trade":     f"{risk_pct * 100:.2f}%",
             "dollar_risk":        f"${dollar_risk:,.0f}",
@@ -760,10 +769,11 @@ def _trade_plan_fields(tp, sizing=None):
         fields.append({
             "name": "💰  Position Sizing",
             "value": (
+                f"**Profile:** {sizing['profile']}  ·  "
                 f"**Account:** {sizing['account_size']}  ·  "
                 f"**Risk:** {sizing['risk_per_trade']}  ·  "
                 f"**Dollar Risk:** {sizing['dollar_risk']}\n"
-                f"**Risk/MGC:** {sizing['risk_per_contract']}  ·  "
+                f"**Risk/Contract:** {sizing['risk_per_contract']}  ·  "
                 f"**Contracts:** {sizing['contracts']}  ·  "
                 f"**Max Loss:** {sizing['max_loss']}\n"
                 f"**T1 Profit:** {sizing['profit_t1']}  ·  "
@@ -1226,19 +1236,26 @@ def webhook():
     }
     ALERT_HISTORY.append(record)
 
-    # ── Position sizing — read from payload or use defaults ──
-    try:
-        account_size = float(data.get("account_size") or DEFAULT_ACCOUNT_SIZE)
-    except (ValueError, TypeError):
-        account_size = DEFAULT_ACCOUNT_SIZE
-    try:
-        risk_pct = float(data.get("risk_pct") or DEFAULT_RISK_PCT)
-    except (ValueError, TypeError):
-        risk_pct = DEFAULT_RISK_PCT
+    # ── Account Profile selection ──
+    profile_name = str(data.get("profile") or DEFAULT_PROFILE).strip()
+    if profile_name in ACCOUNT_PROFILES:
+        prof         = ACCOUNT_PROFILES[profile_name]
+        account_size = prof["account_size"]
+        risk_pct     = prof["risk_pct"]
+    else:
+        profile_name = "Custom"
+        try:
+            account_size = float(data.get("account_size") or DEFAULT_ACCOUNT_SIZE)
+        except (ValueError, TypeError):
+            account_size = DEFAULT_ACCOUNT_SIZE
+        try:
+            risk_pct = float(data.get("risk_pct") or DEFAULT_RISK_PCT)
+        except (ValueError, TypeError):
+            risk_pct = DEFAULT_RISK_PCT
 
     a = full_analysis(current_price_override=parsed_price)
 
-    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct)
+    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct, profile_name)
 
     send_discord_message(
         record,
