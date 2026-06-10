@@ -903,32 +903,35 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         })
 
     fields = [
-        # ── Final Verdict (lead) ──
-        {
-            "name":   "🎯  Final Verdict",
-            "value":  f"{vrd_emoji} **{verdict}**",
-            "inline": True,
-        },
-        {
-            "name":   "📣  Recommendation",
-            "value":  f"{rec_emoji} **{recommendation}**",
-            "inline": True,
-        },
-        {
-            "name":   "⚡  Edge Score",
-            "value":  f"**{edge_score} / 100**",
-            "inline": True,
-        },
+        # ── Active Trade (v12) — top of embed when trade is running ──
+        *([active_trade_info] if active_trade_info else []),
+        # ── Final Verdict / Recommendation / Edge — hidden during active trade ──
+        *([
+            {
+                "name":   "🎯  Final Verdict",
+                "value":  f"{vrd_emoji} **{verdict}**",
+                "inline": True,
+            },
+            {
+                "name":   "📣  Recommendation",
+                "value":  f"{rec_emoji} **{recommendation}**",
+                "inline": True,
+            },
+            {
+                "name":   "⚡  Edge Score",
+                "value":  f"**{edge_score} / 100**",
+                "inline": True,
+            },
+        ] if not active_trade_info else []),
         # ── Reasoning Chain ──
         {
             "name":   "🔗  Reasoning Chain",
             "value":  f"```\n{chain_text}\n```",
             "inline": False,
         },
-        # ── Active Trade (v12) ──
-        *([active_trade_info] if active_trade_info else []),
-        # ── Setup Stage (v10) ──
-        *_setup_stage_fields(setup_stage, stage_next_step, stage_entry_rule, stage_invalidation),
+        # ── Setup Stage (v10) — hidden during active trade ──
+        *(_setup_stage_fields(setup_stage, stage_next_step, stage_entry_rule, stage_invalidation)
+          if not active_trade_info else []),
         # ── Market Direction + Trade Opportunity ──
         *_direction_opportunity_fields(market_direction, trade_opportunity,
                                        opportunity_reason, entry_trigger, invalidation),
@@ -1280,26 +1283,30 @@ def active_trade_field(trade, current_price):
     to_t1, to_t2, to_stop = compute_distances(trade, current_price)
 
     pnl_emoji = "🟢" if dollar_pnl >= 0 else "🔴"
-    dir_emoji = "🔴" if trade["direction"] == "Short" else "🟢"
     pnl_str   = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
 
-    value = (
-        f"{dir_emoji} **{trade['direction']}**  ·  "
-        f"Entry `{trade['entry_price']:.1f}`  ·  "
-        f"Current `{current_price:.1f}`  ·  "
-        f"Contracts `{trade['contracts']}`\n"
-        f"{pnl_emoji} **PnL:** {pnl_str} ({pts_pnl:+.1f} pts)  ·  "
-        f"Stop `{trade['stop_loss']:.1f}` ({to_stop:+.1f} pts away)\n"
-        f"T1 `{trade['target1']:.1f}` ({to_t1:.1f} pts)  ·  "
-        f"T2 `{trade['target2']:.1f}` ({to_t2:.1f} pts)"
-    )
-    label = {
-        "active": "📊  ACTIVE TRADE",
-        "t1_hit": "📊  ACTIVE TRADE — ✅ T1 Hit",
-        "t2_hit": "🎯  ACTIVE TRADE — ✅ T2 Hit",
-    }.get(trade.get("status", "active"), "📊  ACTIVE TRADE")
+    state_map = {
+        "active": "🟢  OPEN",
+        "t1_hit": "🟡  OPEN — T1 Hit",
+        "t2_hit": "🎯  OPEN — T2 Hit",
+    }
+    state_str = state_map.get(trade.get("status", "active"), "🟢  OPEN")
 
-    return {"name": label, "value": value, "inline": False}
+    value = (
+        f"**Entry:** `{trade['entry_price']:.1f}`  ·  "
+        f"**Current Price:** `{current_price:.1f}`\n"
+        f"**PnL:** {pnl_emoji} {pnl_str} ({pts_pnl:+.1f} pts)\n"
+        f"**Contracts:** `{trade['contracts']}`  ·  "
+        f"**Profile:** `{trade['profile']}`\n"
+        f"\n"
+        f"**Distance to Stop:** `{to_stop:.1f} pts`\n"
+        f"**Distance to T1:** `{to_t1:.1f} pts`\n"
+        f"**Distance to T2:** `{to_t2:.1f} pts`\n"
+        f"\n"
+        f"**Trade State:** {state_str}"
+    )
+
+    return {"name": "📊  ACTIVE TRADE", "value": value, "inline": False}
 
 
 # ---------------------------------------------------------------------------
