@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ALERT_HISTORY = deque(maxlen=100)
-CURRENT_PRICE = None          # updated on every inbound alert
+CURRENT_PRICE = None
 
 ALERT_TYPES = {
     "MGC NEW SUPPLY ZONE":       {"side": "bearish", "score": 1},
@@ -26,9 +26,9 @@ ALERT_TYPES = {
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
 
-BIAS_THRESHOLD  = 3
-NEAR_PCT        = 0.005   # 0.5% — price "testing" a level
-EXTENDED_PCT    = 0.010   # 1.0% — price "too extended"
+BIAS_THRESHOLD = 3
+NEAR_PCT       = 0.005   # 0.5%
+EXTENDED_PCT   = 0.010   # 1.0%
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TIME_WINDOWS        = {"15m": 15, "60m": 60, "120m": 120}
@@ -41,7 +41,6 @@ TIME_WINDOWS        = {"15m": 15, "60m": 60, "120m": 120}
 def now_utc():
     return datetime.now(timezone.utc)
 
-
 def alerts_in_window(minutes):
     cutoff = now_utc() - timedelta(minutes=minutes)
     out = []
@@ -52,7 +51,6 @@ def alerts_in_window(minutes):
         except (KeyError, ValueError):
             pass
     return out
-
 
 def window_summary(minutes):
     alerts = alerts_in_window(minutes)
@@ -81,13 +79,11 @@ def score_alerts(alerts):
                 bearish += ALERT_TYPES[t]["score"]
     return bullish, bearish, counts
 
-
 def calculate_scores():
     return score_alerts(ALERT_HISTORY)
 
-
 def calculate_bias(bullish, bearish):
-    gap      = abs(bullish - bearish)
+    gap = abs(bullish - bearish)
     strength = min(gap + 1, 10)
     if bearish - bullish >= BIAS_THRESHOLD:
         return "Bearish", strength
@@ -95,13 +91,11 @@ def calculate_bias(bullish, bearish):
         return "Bullish", strength
     return "Choppy", strength
 
-
 def calculate_confidence(bullish, bearish):
     total = bullish + bearish
     if total == 0:
         return 0
     return round(max(bullish, bearish) / total * 100)
-
 
 def calculate_trade_quality(bias, confidence, bullish, bearish):
     if bullish + bearish == 0:
@@ -116,13 +110,7 @@ def calculate_trade_quality(bias, confidence, bullish, bearish):
         return "B"
     return "C"
 
-
 QUALITY_LABELS = {"A+": "Strong trend", "A": "Trend", "B": "Tradable", "C": "Choppy", "D": "Avoid"}
-
-
-# ---------------------------------------------------------------------------
-# Edge Score
-# ---------------------------------------------------------------------------
 
 def calculate_edge_score(bias, confidence, strength):
     if bias == "Choppy":
@@ -135,16 +123,9 @@ def calculate_edge_score(bias, confidence, strength):
 # ---------------------------------------------------------------------------
 
 def get_price_context():
-    """
-    Scan ALERT_HISTORY and return:
-      - last_price_by_type: dict[alert_type -> float]
-      - all_supply_prices:  list[float]  (all historical bearish alert prices)
-      - all_demand_prices:  list[float]  (all historical bullish alert prices)
-    """
     last_price_by_type = {}
     all_supply_prices  = []
     all_demand_prices  = []
-
     for alert in ALERT_HISTORY:
         t = alert.get("alert_type", "")
         p = alert.get("price")
@@ -154,63 +135,34 @@ def get_price_context():
             price = float(p)
         except (ValueError, TypeError):
             continue
-
         last_price_by_type[t] = price
-
-        if t in SUPPLY_TYPES:
-            all_supply_prices.append(price)
-        else:
-            all_demand_prices.append(price)
-
+        (all_supply_prices if t in SUPPLY_TYPES else all_demand_prices).append(price)
     return last_price_by_type, all_supply_prices, all_demand_prices
 
-
 def get_nearest_levels(current_price, all_supply_prices, all_demand_prices):
-    """
-    Returns (nearest_supply, nearest_demand):
-    - nearest_supply: closest supply price AT or ABOVE current price,
-      falling back to highest known supply if none above.
-    - nearest_demand: closest demand price AT or BELOW current price,
-      falling back to lowest known demand if none below.
-    """
     nearest_supply = nearest_demand = None
-
     if all_supply_prices:
         if current_price is not None:
-            # strictly above so that a supply alert at current price doesn't
-            # collapse the distance to zero; fall back to highest known supply
             above = [p for p in all_supply_prices if p > current_price]
             nearest_supply = min(above) if above else max(all_supply_prices)
         else:
             nearest_supply = max(all_supply_prices)
-
     if all_demand_prices:
         if current_price is not None:
-            # strictly below for the same reason
             below = [p for p in all_demand_prices if p < current_price]
             nearest_demand = max(below) if below else min(all_demand_prices)
         else:
             nearest_demand = min(all_demand_prices)
-
     return nearest_supply, nearest_demand
 
-
 def get_market_structure(current_price, last_price_by_type):
-    """
-    Determine market structure from CHOCH / BOS levels relative to current price.
-    Returns (structure_label, structure_detail).
-    """
     if current_price is None:
-        return "Unknown", "No price data received yet."
-
+        return "Undefined", "No price data received yet."
     choch_sup = last_price_by_type.get("CHOCH SUPPLY")
     choch_dem = last_price_by_type.get("CHOCH DEMAND")
     bos_sup   = last_price_by_type.get("BOS SUPPLY")
     bos_dem   = last_price_by_type.get("BOS DEMAND")
-
     parts = []
-
-    # Primary structure from CHOCH
     if choch_sup and choch_dem:
         if current_price < choch_dem:
             structure = "Bearish Structure"
@@ -222,7 +174,6 @@ def get_market_structure(current_price, last_price_by_type):
             structure = "Range Structure"
             parts.append(f"Price between CHOCH Supply ({choch_sup:.2f}) and CHOCH Demand ({choch_dem:.2f})")
     elif choch_sup:
-        # price <= choch_sup means at or below the supply level → bearish
         if current_price <= choch_sup:
             structure = "Bearish Structure"
             parts.append(f"Price at/below CHOCH Supply ({choch_sup:.2f})")
@@ -239,144 +190,208 @@ def get_market_structure(current_price, last_price_by_type):
     else:
         structure = "Undefined"
         parts.append("No CHOCH levels tracked yet")
-
-    # Augment with BOS confirmation
     if bos_sup and current_price < bos_sup:
         parts.append(f"below BOS Supply ({bos_sup:.2f})")
     if bos_dem and current_price > bos_dem:
         parts.append(f"above BOS Demand ({bos_dem:.2f})")
-
-    detail = ". ".join(parts) + "."
-    return structure, detail
-
+    return structure, ". ".join(parts) + "."
 
 def get_risk_zone(bias, current_price, nearest_supply, nearest_demand):
-    """
-    Returns (risk_label, risk_detail, overextended: bool).
-    overextended=True blocks TRADE / HIGH CONVICTION recommendations.
-    """
     if current_price is None:
         return "Unknown", "No price data available.", False
-
     def pct(a, b):
         return abs(a - b) / b if b else 0
-
     if bias == "Bearish":
         if nearest_supply is not None:
             dist = pct(nearest_supply, current_price)
             if dist <= NEAR_PCT:
-                return (
-                    "Testing Supply",
-                    f"Price is testing supply at {nearest_supply:.2f} "
-                    f"({dist:.2%} away). Favor shorts.",
-                    False,
-                )
+                return "Testing Supply", f"Price testing supply at {nearest_supply:.2f} ({dist:.2%} away). Favor shorts.", False
             elif dist >= EXTENDED_PCT:
-                return (
-                    "Overextended",
-                    f"Price is too extended from supply ({nearest_supply:.2f}, "
-                    f"{dist:.2%} away). Wait for retracement.",
-                    True,
-                )
+                return "Overextended", f"Price too extended from supply ({nearest_supply:.2f}, {dist:.2%} away). Wait for retracement.", True
             else:
-                return (
-                    "Approaching Supply",
-                    f"Price approaching supply at {nearest_supply:.2f} "
-                    f"({dist:.2%} away). Watch for rejection.",
-                    False,
-                )
+                return "Approaching Supply", f"Price approaching supply at {nearest_supply:.2f} ({dist:.2%} away). Watch for rejection.", False
         return "No Supply Level", "No supply level tracked yet. Use caution.", False
-
     elif bias == "Bullish":
         if nearest_demand is not None:
             dist = pct(current_price, nearest_demand)
             if dist <= NEAR_PCT:
-                return (
-                    "Testing Demand",
-                    f"Price is testing demand at {nearest_demand:.2f} "
-                    f"({dist:.2%} away). Favor longs.",
-                    False,
-                )
+                return "Testing Demand", f"Price testing demand at {nearest_demand:.2f} ({dist:.2%} away). Favor longs.", False
             elif dist >= EXTENDED_PCT:
-                return (
-                    "Overextended",
-                    f"Price is too extended from demand ({nearest_demand:.2f}, "
-                    f"{dist:.2%} away). Wait for retracement.",
-                    True,
-                )
+                return "Overextended", f"Price too extended from demand ({nearest_demand:.2f}, {dist:.2%} away). Wait for retracement.", True
             else:
-                return (
-                    "Approaching Demand",
-                    f"Price pulling back toward demand at {nearest_demand:.2f} "
-                    f"({dist:.2%} away). Watch for hold.",
-                    False,
-                )
+                return "Approaching Demand", f"Price pulling back toward demand at {nearest_demand:.2f} ({dist:.2%} away). Watch for hold.", False
         return "No Demand Level", "No demand level tracked yet. Use caution.", False
-
-    else:  # Choppy
+    else:
         msgs = []
         if nearest_supply:
             msgs.append(f"Supply {nearest_supply:.2f} ({pct(nearest_supply, current_price):.2%} away)")
         if nearest_demand:
             msgs.append(f"Demand {nearest_demand:.2f} ({pct(current_price, nearest_demand):.2%} away)")
-        detail = "Choppy market. " + " · ".join(msgs) + ". No directional edge." if msgs \
-            else "Choppy market. No levels tracked."
+        detail = "Choppy. " + " · ".join(msgs) + ". No directional edge." if msgs else "Choppy. No levels tracked."
         return "Choppy", detail, False
 
 
 # ---------------------------------------------------------------------------
-# Trade eligibility
+# Decision Engine v6
 # ---------------------------------------------------------------------------
 
-def calculate_recommendation(bias, confidence, overextended):
-    if bias == "Choppy" or overextended:
-        return "WAIT"
+def classify_structure(structure_label):
+    """Map raw structure label → decision engine class."""
+    return {
+        "Bearish Structure": "Bearish Trend",
+        "Bullish Structure": "Bullish Trend",
+        "Range Structure":   "Range",
+        "Bearish Breakdown": "Reversal",
+        "Bullish Breakout":  "Reversal",
+        "Undefined":         "Undefined",
+    }.get(structure_label, "Undefined")
+
+
+def decision_engine(structure_label, risk_label, overextended,
+                    bias, bullish, bearish, confidence):
+    """
+    Priority: Market Structure → Risk Zone → Alert Score → Confidence
+    Returns (recommendation, final_verdict, structure_class, reasoning_chain)
+    """
+    structure_class = classify_structure(structure_label)
+    chain = [structure_class]
+
+    # ── Gate: no data ──
+    if structure_class == "Undefined" or (bullish == 0 and bearish == 0):
+        if bullish == 0 and bearish == 0:
+            chain += ["No Alerts", "No Edge", "WAIT"]
+        else:
+            chain += ["No Structure Defined", "WAIT"]
+        return "WAIT", "WAIT", structure_class, chain
+
+    # ── Gate: overextended price ──
+    if overextended:
+        chain += [f"Overextended — {risk_label}", "Entry Blocked", "WAIT"]
+        return "WAIT", "WAIT", structure_class, chain
+
+    # ── Risk Zone ──
+    chain.append(risk_label)
+
+    # ── Alert Score ──
+    gap = abs(bullish - bearish)
+    if bias == "Bearish" and gap >= BIAS_THRESHOLD:
+        score_desc  = f"Bearish Score Dominant ({bearish} vs {bullish})"
+        score_side  = "bearish"
+    elif bias == "Bullish" and gap >= BIAS_THRESHOLD:
+        score_desc  = f"Bullish Score Dominant ({bullish} vs {bearish})"
+        score_side  = "bullish"
+    else:
+        score_desc  = f"Mixed Alerts (bull {bullish} / bear {bearish})"
+        score_side  = "mixed"
+
+    chain.append(score_desc)
+
+    # ── Structure cap: Range or Reversal ──
+    if structure_class in ("Range", "Reversal"):
+        cap_note = f"Structure Cap ({structure_class} → max WATCH)"
+        chain.append(cap_note)
+        if score_side == "mixed" or confidence < 70:
+            chain += ["No Edge", "WAIT"]
+            return "WAIT", "WAIT", structure_class, chain
+        chain.append("WATCH")
+        return "WATCH", "WAIT", structure_class, chain
+
+    # ── Confidence tier (Bearish Trend / Bullish Trend only) ──
+    if score_side == "mixed":
+        chain += [f"Confidence {confidence}% — Mixed Score", "WAIT"]
+        return "WAIT", "WAIT", structure_class, chain
+
     if confidence >= 90:
-        return "HIGH CONVICTION TRADE"
-    if confidence >= 80:
-        return "TRADE"
-    if confidence >= 70:
-        return "WATCH"
-    return "WAIT"
+        rec        = "HIGH CONVICTION TRADE"
+        conf_step  = f"Confidence {confidence}% — High Conviction"
+    elif confidence >= 80:
+        rec        = "TRADE"
+        conf_step  = f"Confidence {confidence}% — Trade"
+    elif confidence >= 70:
+        rec        = "WATCH"
+        conf_step  = f"Confidence {confidence}% — Watch"
+    else:
+        rec        = "WAIT"
+        conf_step  = f"Confidence {confidence}% — Low"
+
+    chain.append(conf_step)
+
+    # ── Final Verdict ──
+    if structure_class == "Bearish Trend":
+        if rec == "HIGH CONVICTION TRADE":
+            verdict = "STRONG SHORT"
+        elif rec in ("TRADE", "WATCH"):
+            verdict = "SHORT BIAS"
+        else:
+            verdict = "WAIT"
+    elif structure_class == "Bullish Trend":
+        if rec == "HIGH CONVICTION TRADE":
+            verdict = "STRONG LONG"
+        elif rec in ("TRADE", "WATCH"):
+            verdict = "LONG BIAS"
+        else:
+            verdict = "WAIT"
+    else:
+        verdict = "WAIT"
+
+    chain.append(verdict)
+    return rec, verdict, structure_class, chain
 
 
-def build_why(bias, confidence, strength, bullish, bearish, counts,
-              recommendation, overextended, risk_label):
+# ---------------------------------------------------------------------------
+# Trade plan + Why
+# ---------------------------------------------------------------------------
+
+def build_trade_plan(bias, strength, bullish, bearish, counts):
+    if bias == "Bearish":
+        parts = []
+        for k, label in [("CHOCH SUPPLY","CHoCH supply"), ("BOS SUPPLY","BOS supply"),
+                         ("MGC SUPPLY ZONE CONFIRMED","supply confirmed"), ("MGC NEW SUPPLY ZONE","new supply")]:
+            if counts.get(k):
+                parts.append(f"{label} ({counts[k]}×)")
+        reason = ", ".join(parts) + f". Bearish {bearish} vs bullish {bullish}." if parts else \
+            f"Bearish score ({bearish}) exceeds bullish ({bullish}) by {bearish - bullish}."
+        return {"reason": reason, "action": "Wait for retest short. Do not chase lows.",
+                "longs_allowed": "No", "shorts_allowed": "Yes", "warning": None}
+    elif bias == "Bullish":
+        parts = []
+        for k, label in [("CHOCH DEMAND","CHoCH demand"), ("BOS DEMAND","BOS demand"),
+                         ("MGC DEMAND ZONE CONFIRMED","demand confirmed"), ("MGC NEW DEMAND ZONE","new demand")]:
+            if counts.get(k):
+                parts.append(f"{label} ({counts[k]}×)")
+        reason = ", ".join(parts) + f". Bullish {bullish} vs bearish {bearish}." if parts else \
+            f"Bullish score ({bullish}) exceeds bearish ({bearish}) by {bullish - bearish}."
+        return {"reason": reason, "action": "Wait for demand hold. Do not chase highs.",
+                "longs_allowed": "Yes", "shorts_allowed": "No", "warning": None}
+    else:
+        return {"reason": f"Supply and demand scores are close (Bull: {bullish}, Bear: {bearish}). No clear edge.",
+                "action": "No trade. Wait for clearer supply or demand control.",
+                "longs_allowed": "No", "shorts_allowed": "No",
+                "warning": "Market is choppy. Standing aside is a valid position."}
+
+
+def build_why(bias, confidence, bullish, bearish, counts,
+              verdict, overextended, risk_label):
     bear_struct, bull_struct = [], []
-    if counts.get("CHOCH SUPPLY"):
-        bear_struct.append(f"CHOCH Supply ×{counts['CHOCH SUPPLY']}")
-    if counts.get("BOS SUPPLY"):
-        bear_struct.append(f"BOS Supply ×{counts['BOS SUPPLY']}")
-    if counts.get("MGC SUPPLY ZONE CONFIRMED"):
-        bear_struct.append(f"supply confirmed ×{counts['MGC SUPPLY ZONE CONFIRMED']}")
-    if counts.get("MGC NEW SUPPLY ZONE"):
-        bear_struct.append(f"new supply ×{counts['MGC NEW SUPPLY ZONE']}")
-    if counts.get("CHOCH DEMAND"):
-        bull_struct.append(f"CHOCH Demand ×{counts['CHOCH DEMAND']}")
-    if counts.get("BOS DEMAND"):
-        bull_struct.append(f"BOS Demand ×{counts['BOS DEMAND']}")
-    if counts.get("MGC DEMAND ZONE CONFIRMED"):
-        bull_struct.append(f"demand confirmed ×{counts['MGC DEMAND ZONE CONFIRMED']}")
-    if counts.get("MGC NEW DEMAND ZONE"):
-        bull_struct.append(f"new demand ×{counts['MGC NEW DEMAND ZONE']}")
+    for k, lbl in [("CHOCH SUPPLY","CHOCH Supply"), ("BOS SUPPLY","BOS Supply"),
+                   ("MGC SUPPLY ZONE CONFIRMED","supply confirmed"), ("MGC NEW SUPPLY ZONE","new supply")]:
+        if counts.get(k):
+            bear_struct.append(f"{lbl} ×{counts[k]}")
+    for k, lbl in [("CHOCH DEMAND","CHOCH Demand"), ("BOS DEMAND","BOS Demand"),
+                   ("MGC DEMAND ZONE CONFIRMED","demand confirmed"), ("MGC NEW DEMAND ZONE","new demand")]:
+        if counts.get(k):
+            bull_struct.append(f"{lbl} ×{counts[k]}")
 
     if bullish == 0 and bearish == 0:
         return "No alerts received yet. No edge to evaluate."
-
     if overextended:
-        return (
-            f"Confidence {confidence}% but price is overextended ({risk_label}). "
-            "Entry not recommended until price retraces to a level."
-        )
-
+        return (f"Confidence {confidence}% but price is overextended ({risk_label}). "
+                "Entry not recommended until price retraces to a level.")
     if bias == "Choppy":
-        dom_side = "supply" if bearish >= bullish else "demand"
+        dom_side  = "supply" if bearish >= bullish else "demand"
         weak_side = "demand" if dom_side == "supply" else "supply"
-        return (
-            f"Confidence only {confidence}%. "
-            f"Supply and demand are mixed ({dom_side} {max(bullish, bearish)}, "
-            f"{weak_side} {min(bullish, bearish)}). No edge."
-        )
+        return (f"Confidence only {confidence}%. Supply and demand are mixed "
+                f"({dom_side} {max(bullish, bearish)}, {weak_side} {min(bullish, bearish)}). No edge.")
 
     signal_list = bear_struct if bias == "Bearish" else bull_struct
     direction   = bias.lower()
@@ -384,73 +399,13 @@ def build_why(bias, confidence, strength, bullish, bearish, counts,
     score_opp   = bullish if bias == "Bearish" else bearish
     signal_text = ", ".join(signal_list) if signal_list else f"{direction} score {score_dom}"
 
-    if recommendation == "HIGH CONVICTION TRADE":
-        return (
-            f"Confidence {confidence}%. {signal_text}. "
-            f"Strong {direction} structure with minimal opposition. "
-            f"Trend continuation likely. Score {score_dom} vs {score_opp}."
-        )
-    if recommendation == "TRADE":
-        return (
-            f"Confidence {confidence}%. {signal_text}. "
-            f"Clear {direction} edge with sufficient signal weight. "
-            f"Score {score_dom} vs {score_opp}."
-        )
-    if recommendation == "WATCH":
-        return (
-            f"Confidence {confidence}%. {signal_text}. "
-            f"Bias is {direction} but not strong enough to commit. "
-            f"Wait for additional confirmation. Score {score_dom} vs {score_opp}."
-        )
-    return (
-        f"Confidence only {confidence}%. Signals present ({signal_text}) "
-        f"but opposing pressure is too close. No reliable edge. "
-        f"Score {score_dom} vs {score_opp}."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Trade plan
-# ---------------------------------------------------------------------------
-
-def build_trade_plan(bias, strength, bullish, bearish, counts):
-    if bias == "Bearish":
-        parts = []
-        for k, label in [("CHOCH SUPPLY","CHoCH supply"), ("BOS SUPPLY","BOS supply"),
-                         ("MGC SUPPLY ZONE CONFIRMED","supply confirmed"),
-                         ("MGC NEW SUPPLY ZONE","new supply")]:
-            if counts.get(k):
-                parts.append(f"{label} ({counts[k]}×)")
-        reason = (
-            ", ".join(parts) + f". Bearish {bearish} vs bullish {bullish}."
-            if parts else
-            f"Bearish score ({bearish}) exceeds bullish ({bullish}) by {bearish - bullish}."
-        )
-        return {"reason": reason, "action": "Wait for retest short. Do not chase lows.",
-                "longs_allowed": "No", "shorts_allowed": "Yes", "warning": None}
-
-    elif bias == "Bullish":
-        parts = []
-        for k, label in [("CHOCH DEMAND","CHoCH demand"), ("BOS DEMAND","BOS demand"),
-                         ("MGC DEMAND ZONE CONFIRMED","demand confirmed"),
-                         ("MGC NEW DEMAND ZONE","new demand")]:
-            if counts.get(k):
-                parts.append(f"{label} ({counts[k]}×)")
-        reason = (
-            ", ".join(parts) + f". Bullish {bullish} vs bearish {bearish}."
-            if parts else
-            f"Bullish score ({bullish}) exceeds bearish ({bearish}) by {bullish - bearish}."
-        )
-        return {"reason": reason, "action": "Wait for demand hold. Do not chase highs.",
-                "longs_allowed": "Yes", "shorts_allowed": "No", "warning": None}
-
-    else:
-        return {
-            "reason": f"Supply and demand scores are close (Bull: {bullish}, Bear: {bearish}). No clear edge.",
-            "action": "No trade. Wait for clearer supply or demand control.",
-            "longs_allowed": "No", "shorts_allowed": "No",
-            "warning": "Market is choppy. Standing aside is a valid position.",
-        }
+    if verdict in ("STRONG SHORT", "STRONG LONG"):
+        return (f"Confidence {confidence}%. {signal_text}. Strong {direction} structure "
+                f"with minimal opposition. Trend continuation likely. Score {score_dom} vs {score_opp}.")
+    if verdict in ("SHORT BIAS", "LONG BIAS"):
+        return (f"Confidence {confidence}%. {signal_text}. Clear {direction} edge. Score {score_dom} vs {score_opp}.")
+    return (f"Confidence only {confidence}%. Signals present ({signal_text}) "
+            f"but opposing pressure is too close. No reliable edge. Score {score_dom} vs {score_opp}.")
 
 
 # ---------------------------------------------------------------------------
@@ -475,10 +430,22 @@ def fmt_window_counts(counts, total):
         parts.append("🟢 " + ", ".join(bull_parts))
     return "\n".join(parts) if parts else "No alerts"
 
+def bias_color(verdict):
+    return {
+        "STRONG SHORT": 0xCC0000,
+        "SHORT BIAS":   0xFF5555,
+        "WAIT":         0xFFCC00,
+        "LONG BIAS":    0x55CC55,
+        "STRONG LONG":  0x00AA00,
+    }.get(verdict, 0x888888)
 
-def bias_color(bias):
-    return {"Bearish": 0xFF3333, "Bullish": 0x33CC66, "Choppy": 0xFFCC00}.get(bias, 0x888888)
-
+VERDICT_EMOJI = {
+    "STRONG SHORT": "🔴🔴",
+    "SHORT BIAS":   "🔴",
+    "WAIT":         "⏸️",
+    "LONG BIAS":    "🟢",
+    "STRONG LONG":  "🟢🟢",
+}
 
 RECOMMENDATION_EMOJI = {
     "HIGH CONVICTION TRADE": "🔥",
@@ -490,42 +457,44 @@ RECOMMENDATION_EMOJI = {
 
 def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          confidence, quality, edge_score,
-                         recommendation, why, plan,
-                         structure_label, structure_detail,
+                         recommendation, verdict, reasoning_chain, why, plan,
+                         structure_label, structure_class, structure_detail,
                          nearest_supply, nearest_demand,
                          risk_label, risk_detail,
-                         last_price_by_type, color):
+                         last_price_by_type):
     if not DISCORD_WEBHOOK_URL:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
         return
 
+    color      = bias_color(verdict)
     bias_emoji = {"Bullish": "🟢", "Bearish": "🔴", "Choppy": "🟡"}.get(bias, "⚪")
     rec_emoji  = RECOMMENDATION_EMOJI.get(recommendation, "")
+    vrd_emoji  = VERDICT_EMOJI.get(verdict, "")
     ticker     = alert_data.get("ticker") or "MGC"
     price      = alert_data.get("price")
     price_str  = f"${float(price):.2f}" if price is not None else "—"
 
-    # ── Price context lines ──
+    # Reasoning chain — arrow-linked
+    chain_text = "\n↓\n".join(reasoning_chain)
+
+    # Price levels
     tracked_labels = [
         ("CHOCH SUPPLY",              "Last CHOCH Supply"),
         ("BOS SUPPLY",                "Last BOS Supply"),
-        ("MGC SUPPLY ZONE CONFIRMED", "Last Supply Confirmed"),
+        ("MGC SUPPLY ZONE CONFIRMED", "Last Supply Conf"),
         ("CHOCH DEMAND",              "Last CHOCH Demand"),
         ("BOS DEMAND",                "Last BOS Demand"),
-        ("MGC DEMAND ZONE CONFIRMED", "Last Demand Confirmed"),
+        ("MGC DEMAND ZONE CONFIRMED", "Last Demand Conf"),
     ]
-    price_lines = []
-    for key, label in tracked_labels:
-        p = last_price_by_type.get(key)
-        if p is not None:
-            price_lines.append(f"`{label}`: **${p:.2f}**")
-
-    price_context_value = "\n".join(price_lines) if price_lines else "No levels tracked yet"
+    price_lines = [f"`{lbl}`: **${last_price_by_type[k]:.2f}**"
+                   for k, lbl in tracked_labels if k in last_price_by_type]
 
     sup_str = f"${nearest_supply:.2f}" if nearest_supply is not None else "—"
     dem_str = f"${nearest_demand:.2f}" if nearest_demand is not None else "—"
 
-    # ── Window fields ──
+    risk_emoji = {"Testing Supply": "⚠️", "Testing Demand": "⚠️",
+                  "Overextended": "🚫", "Choppy": "🟡"}.get(risk_label, "📍")
+
     window_fields = []
     for label, minutes in TIME_WINDOWS.items():
         w_counts, w_total = window_summary(minutes)
@@ -533,41 +502,114 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "name": f"🕐  {label}", "value": fmt_window_counts(w_counts, w_total), "inline": True,
         })
 
-    risk_emoji = {"Testing Supply": "⚠️", "Testing Demand": "⚠️",
-                  "Overextended": "🚫", "Choppy": "🟡"}.get(risk_label, "📍")
-
     fields = [
-        # ── Top metrics ──
-        {"name": "📊  Bias",           "value": f"{bias_emoji} **{bias}**   Strength {strength}/10", "inline": True},
-        {"name": "🎯  Confidence",      "value": f"**{confidence}%**",                                "inline": True},
-        {"name": "⚡  Edge Score",      "value": f"**{edge_score} / 100**",                           "inline": True},
-        {"name": "📣  Recommendation",  "value": f"{rec_emoji} **{recommendation}**",                 "inline": True},
-        {"name": "🏆  Trade Quality",   "value": f"**{quality}** — {QUALITY_LABELS.get(quality,'')}",  "inline": True},
-        {"name": "🔢  Score",           "value": f"Bull `{bullish}` · Bear `{bearish}` · Gap `{abs(bullish-bearish)}`", "inline": True},
+        # ── Final Verdict (lead) ──
+        {
+            "name":   "🎯  Final Verdict",
+            "value":  f"{vrd_emoji} **{verdict}**",
+            "inline": True,
+        },
+        {
+            "name":   "📣  Recommendation",
+            "value":  f"{rec_emoji} **{recommendation}**",
+            "inline": True,
+        },
+        {
+            "name":   "⚡  Edge Score",
+            "value":  f"**{edge_score} / 100**",
+            "inline": True,
+        },
+        # ── Reasoning Chain ──
+        {
+            "name":   "🔗  Reasoning Chain",
+            "value":  f"```\n{chain_text}\n```",
+            "inline": False,
+        },
         # ── Why ──
-        {"name": "💬  Why",             "value": why,                                                  "inline": False},
+        {
+            "name":   "💬  Why",
+            "value":  why,
+            "inline": False,
+        },
+        # ── Bias / Score / Confidence ──
+        {
+            "name":   "📊  Bias",
+            "value":  f"{bias_emoji} **{bias}**  Strength {strength}/10",
+            "inline": True,
+        },
+        {
+            "name":   "🎯  Confidence",
+            "value":  f"**{confidence}%**",
+            "inline": True,
+        },
+        {
+            "name":   "🏆  Quality",
+            "value":  f"**{quality}** — {QUALITY_LABELS.get(quality,'')}",
+            "inline": True,
+        },
+        {
+            "name":   "🔢  Score",
+            "value":  f"Bull `{bullish}` · Bear `{bearish}` · Gap `{abs(bullish-bearish)}`",
+            "inline": False,
+        },
         # ── Market Structure ──
-        {"name": "🏗️  Market Structure","value": f"**{structure_label}**\n{structure_detail}",         "inline": False},
-        # ── Price Context ──
-        {"name": "💲  Price Levels",    "value": price_context_value,                                  "inline": False},
-        {"name": "📈  Nearest Supply",  "value": sup_str,                                              "inline": True},
-        {"name": "📉  Nearest Demand",  "value": dem_str,                                              "inline": True},
+        {
+            "name":   "🏗️  Market Structure",
+            "value":  f"**{structure_label}** → `{structure_class}`\n{structure_detail}",
+            "inline": False,
+        },
+        # ── Price context ──
+        {
+            "name":   "💲  Price Levels",
+            "value":  "\n".join(price_lines) if price_lines else "No levels tracked yet",
+            "inline": False,
+        },
+        {
+            "name":   "📈  Nearest Supply",
+            "value":  sup_str,
+            "inline": True,
+        },
+        {
+            "name":   "📉  Nearest Demand",
+            "value":  dem_str,
+            "inline": True,
+        },
         # ── Risk Zone ──
-        {"name": f"{risk_emoji}  Risk Zone", "value": f"**{risk_label}**\n{risk_detail}",             "inline": False},
-        # ── Recent Alert Summary ──
-        {"name": "📋  Recent Alert Summary", "value": "━━━━━━━━━━━━━━━━━━━━━━━━━━",                   "inline": False},
+        {
+            "name":   f"{risk_emoji}  Risk Zone",
+            "value":  f"**{risk_label}**\n{risk_detail}",
+            "inline": False,
+        },
+        # ── Windows ──
+        {
+            "name":   "📋  Recent Alert Summary",
+            "value":  "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "inline": False,
+        },
         *window_fields,
         # ── Action ──
-        {"name": "🗺️  Action",          "value": plan["action"],                                       "inline": False},
-        {"name": "🟩  Longs Allowed",   "value": plan["longs_allowed"],                               "inline": True},
-        {"name": "🟥  Shorts Allowed",  "value": plan["shorts_allowed"],                              "inline": True},
+        {
+            "name":   "🗺️  Action",
+            "value":  plan["action"],
+            "inline": False,
+        },
+        {
+            "name":   "🟩  Longs Allowed",
+            "value":  plan["longs_allowed"],
+            "inline": True,
+        },
+        {
+            "name":   "🟥  Shorts Allowed",
+            "value":  plan["shorts_allowed"],
+            "inline": True,
+        },
     ]
 
     if plan["warning"]:
         fields.append({"name": "⚠️  Warning", "value": plan["warning"], "inline": False})
 
     embed = {
-        "title":       "MGC Agent v5",
+        "title":       "MGC Agent v6",
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
         "fields":      fields,
@@ -594,9 +636,8 @@ def full_analysis(current_price_override=None):
     quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
     edge_score               = calculate_edge_score(bias, confidence, strength)
 
-    # Price context
     last_price_by_type, all_supply, all_demand = get_price_context()
-    current_price = current_price_override or CURRENT_PRICE
+    current_price = current_price_override if current_price_override is not None else CURRENT_PRICE
     nearest_supply, nearest_demand = get_nearest_levels(current_price, all_supply, all_demand)
 
     structure_label, structure_detail = get_market_structure(current_price, last_price_by_type)
@@ -604,21 +645,26 @@ def full_analysis(current_price_override=None):
         bias, current_price, nearest_supply, nearest_demand
     )
 
-    recommendation = calculate_recommendation(bias, confidence, overextended)
-    why            = build_why(bias, confidence, strength, bullish, bearish, counts,
-                               recommendation, overextended, risk_label)
-    plan           = build_trade_plan(bias, strength, bullish, bearish, counts)
-    color          = bias_color(bias)
+    recommendation, verdict, structure_class, reasoning_chain = decision_engine(
+        structure_label, risk_label, overextended,
+        bias, bullish, bearish, confidence
+    )
+
+    why  = build_why(bias, confidence, bullish, bearish, counts,
+                     verdict, overextended, risk_label)
+    plan = build_trade_plan(bias, strength, bullish, bearish, counts)
 
     return dict(
         bullish=bullish, bearish=bearish, counts=counts,
         bias=bias, strength=strength, confidence=confidence,
         quality=quality, edge_score=edge_score,
-        recommendation=recommendation, why=why, plan=plan, color=color,
+        recommendation=recommendation, verdict=verdict,
+        reasoning_chain=reasoning_chain, why=why, plan=plan,
         current_price=current_price,
         last_price_by_type=last_price_by_type,
         nearest_supply=nearest_supply, nearest_demand=nearest_demand,
-        structure_label=structure_label, structure_detail=structure_detail,
+        structure_label=structure_label, structure_class=structure_class,
+        structure_detail=structure_detail,
         risk_label=risk_label, risk_detail=risk_detail, overextended=overextended,
     )
 
@@ -647,7 +693,6 @@ def webhook():
         logger.warning("Unrecognized alert type: %r", alert_type)
         return jsonify({"status": "ignored", "reason": "unrecognized alert type", "received": alert_type}), 200
 
-    # Parse and store price
     raw_price = data.get("price")
     try:
         parsed_price = float(raw_price) if raw_price is not None else None
@@ -672,37 +717,40 @@ def webhook():
         record,
         a["bias"], a["strength"], a["bullish"], a["bearish"],
         a["confidence"], a["quality"], a["edge_score"],
-        a["recommendation"], a["why"], a["plan"],
-        a["structure_label"], a["structure_detail"],
+        a["recommendation"], a["verdict"], a["reasoning_chain"], a["why"], a["plan"],
+        a["structure_label"], a["structure_class"], a["structure_detail"],
         a["nearest_supply"], a["nearest_demand"],
         a["risk_label"], a["risk_detail"],
-        a["last_price_by_type"], a["color"],
+        a["last_price_by_type"],
     )
 
     logger.info(
-        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s | %s | Risk: %s",
-        normalized, a["bias"], a["strength"], a["confidence"],
-        a["edge_score"], a["recommendation"], a["structure_label"], a["risk_label"],
+        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
+        normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
+        a["recommendation"], a["verdict"], a["structure_class"], a["risk_label"],
     )
 
     return jsonify({
         "status":           "ok",
         "alert_type":       normalized,
+        "verdict":          a["verdict"],
+        "recommendation":   a["recommendation"],
+        "reasoning_chain":  a["reasoning_chain"],
+        "why":              a["why"],
         "bias":             a["bias"],
         "strength":         a["strength"],
         "confidence":       f"{a['confidence']}%",
         "edge_score":       a["edge_score"],
-        "recommendation":   a["recommendation"],
-        "why":              a["why"],
         "trade_quality":    a["quality"],
         "bullish_score":    a["bullish"],
         "bearish_score":    a["bearish"],
+        "market_structure": a["structure_label"],
+        "structure_class":  a["structure_class"],
+        "risk_zone":        a["risk_label"],
+        "risk_detail":      a["risk_detail"],
         "current_price":    a["current_price"],
         "nearest_supply":   a["nearest_supply"],
         "nearest_demand":   a["nearest_demand"],
-        "market_structure": a["structure_label"],
-        "risk_zone":        a["risk_label"],
-        "risk_detail":      a["risk_detail"],
         "longs_allowed":    a["plan"]["longs_allowed"],
         "shorts_allowed":   a["plan"]["shorts_allowed"],
         "action":           a["plan"]["action"],
@@ -720,6 +768,7 @@ def price_context():
     last_price_by_type, all_supply, all_demand = get_price_context()
     nearest_supply, nearest_demand = get_nearest_levels(CURRENT_PRICE, all_supply, all_demand)
     structure_label, structure_detail = get_market_structure(CURRENT_PRICE, last_price_by_type)
+    structure_class = classify_structure(structure_label)
     bullish, bearish, counts = calculate_scores()
     bias, _ = calculate_bias(bullish, bearish)
     risk_label, risk_detail, overextended = get_risk_zone(
@@ -730,6 +779,7 @@ def price_context():
         "nearest_supply":     nearest_supply,
         "nearest_demand":     nearest_demand,
         "market_structure":   structure_label,
+        "structure_class":    structure_class,
         "structure_detail":   structure_detail,
         "risk_zone":          risk_label,
         "risk_detail":        risk_detail,
@@ -743,35 +793,36 @@ def price_context():
 @app.route("/status", methods=["GET"])
 def status():
     a = full_analysis()
-
     windows = {}
     for label, minutes in TIME_WINDOWS.items():
         w_counts, w_total = window_summary(minutes)
         w_bull, w_bear, _ = score_alerts(alerts_in_window(minutes))
         windows[label] = {"alert_counts": w_counts, "total": w_total,
                           "bullish_score": w_bull, "bearish_score": w_bear}
-
     return jsonify({
         "status":              "running",
-        "version":             "5.0",
+        "version":             "6.0",
+        "verdict":             a["verdict"],
+        "recommendation":      a["recommendation"],
+        "reasoning_chain":     a["reasoning_chain"],
+        "why":                 a["why"],
         "bias":                a["bias"],
         "strength":            f"{a['strength']}/10",
         "confidence":          f"{a['confidence']}%",
         "edge_score":          a["edge_score"],
-        "recommendation":      a["recommendation"],
-        "why":                 a["why"],
         "trade_quality":       a["quality"],
         "trade_quality_label": QUALITY_LABELS.get(a["quality"], ""),
         "bullish_score":       a["bullish"],
         "bearish_score":       a["bearish"],
-        "current_price":       a["current_price"],
-        "nearest_supply":      a["nearest_supply"],
-        "nearest_demand":      a["nearest_demand"],
         "market_structure":    a["structure_label"],
+        "structure_class":     a["structure_class"],
         "structure_detail":    a["structure_detail"],
         "risk_zone":           a["risk_label"],
         "risk_detail":         a["risk_detail"],
         "overextended":        a["overextended"],
+        "current_price":       a["current_price"],
+        "nearest_supply":      a["nearest_supply"],
+        "nearest_demand":      a["nearest_demand"],
         "longs_allowed":       a["plan"]["longs_allowed"],
         "shorts_allowed":      a["plan"]["shorts_allowed"],
         "action":              a["plan"]["action"],
@@ -787,13 +838,13 @@ def status():
 def index():
     return jsonify({
         "service":     "TradingView Webhook Server",
-        "version":     "5.0",
+        "version":     "6.0",
         "alert_types": list(ALERT_TYPES.keys()),
         "endpoints":   {
             "POST /webhook": "Receive TradingView alerts",
             "GET /alerts":   "View last 100 stored alerts",
-            "GET /price":    "Current price context, levels, structure, and risk zone",
-            "GET /status":   "Full analysis",
+            "GET /price":    "Price context, levels, structure, and risk zone",
+            "GET /status":   "Full analysis with verdict and reasoning chain",
         },
     }), 200
 
