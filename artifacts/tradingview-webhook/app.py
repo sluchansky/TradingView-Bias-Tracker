@@ -1262,9 +1262,9 @@ def send_trade_event_message(event_type, trade, current_price):
         "T1_HIT":   (f"🎯 **T1 HIT**\n"
                      f"{pnl_str}\n"
                      f"Move Stop to Break Even"),
-        "T2_HIT":   (f"🎯 **TARGET REACHED — T2 HIT**\n"
-                     f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
-                     f"T2 hit @ `{current_price:.1f}` | PnL **{pnl_str}**"),
+        "T2_HIT":   (f"🎯🎯 **T2 HIT**\n"
+                     f"Trade Closed\n"
+                     f"{pnl_str}"),
         "STOP_HIT": (f"🛑 **TRADE CLOSED — STOP HIT**\n"
                      f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
                      f"Stopped @ `{current_price:.1f}` | PnL **{pnl_str}**"),
