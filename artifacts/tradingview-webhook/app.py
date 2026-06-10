@@ -27,8 +27,9 @@ SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
 
 BIAS_THRESHOLD = 3
-NEAR_PCT       = 0.005   # 0.5%
-EXTENDED_PCT   = 0.010   # 1.0%
+NEAR_PCT       = 0.005   # 0.5%  — Testing zone
+EXTENDED_PCT   = 0.010   # 1.0%  — Approaching zone
+WATCH_PCT      = 0.0075  # 0.75% — Watch zone (v10)
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TIME_WINDOWS        = {"15m": 15, "60m": 60, "120m": 120}
@@ -759,9 +760,21 @@ def _direction_opportunity_fields(market_direction, trade_opportunity,
     return fields
 
 
+def _setup_stage_fields(setup_stage, next_step, entry_rule, stage_invalidation):
+    """Return Discord embed fields for Setup Stage section (v10)."""
+    emoji = _STAGE_EMOJI.get(setup_stage, "⭕")
+    return [
+        {"name": "🎯  Setup Stage",   "value": f"{emoji} **{setup_stage}**", "inline": True},
+        {"name": "➡️  Next Step",     "value": next_step,                    "inline": False},
+        {"name": "📋  Entry Rule",    "value": entry_rule,                   "inline": True},
+        {"name": "🚫  Invalidation",  "value": stage_invalidation,           "inline": True},
+    ]
+
+
 def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          confidence, quality, edge_score,
                          recommendation, verdict, reasoning_chain, why, plan,
+                         setup_stage, stage_next_step, stage_entry_rule, stage_invalidation,
                          market_direction, trade_opportunity, opportunity_reason,
                          entry_trigger, invalidation, trade_plan,
                          structure_label, structure_class, structure_detail,
@@ -831,7 +844,9 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  f"```\n{chain_text}\n```",
             "inline": False,
         },
-        # ── Market Direction + Trade Opportunity (v8) ──
+        # ── Setup Stage (v10) ──
+        *_setup_stage_fields(setup_stage, stage_next_step, stage_entry_rule, stage_invalidation),
+        # ── Market Direction + Trade Opportunity ──
         *_direction_opportunity_fields(market_direction, trade_opportunity,
                                        opportunity_reason, entry_trigger, invalidation),
         # ── Trade Plan ──
@@ -920,7 +935,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         fields.append({"name": "⚠️  Warning", "value": plan["warning"], "inline": False})
 
     embed = {
-        "title":       "MGC Agent v9",
+        "title":       "MGC Agent v10",
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
         "fields":      fields,
@@ -934,6 +949,124 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         logger.info("Discord sent (status %s)", resp.status_code)
     except requests.RequestException as exc:
         logger.error("Discord send failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Setup Stage Detection v10
+# ---------------------------------------------------------------------------
+
+_STAGE_EMOJI = {
+    "No Setup":            "⭕",
+    "Watch Supply":        "👁️",
+    "Watch Demand":        "👁️",
+    "Short Setup Forming": "⚠️",
+    "Long Setup Forming":  "⚠️",
+    "Short Ready":         "🔴",
+    "Long Ready":          "🟢",
+}
+
+READY_STAGES = ("Short Ready", "Long Ready")
+
+
+def get_setup_stage(current_price, nearest_supply, nearest_demand,
+                    bullish, bearish, alert_history):
+    """
+    Determine the current setup stage (v10).
+    Returns (stage, next_step, entry_rule, invalidation_note).
+
+    Stages (in priority order):
+      Short Ready        — supply confirmed + all forming conditions met
+      Long Ready         — demand confirmed + all forming conditions met
+      Short Setup Forming— at supply + bearish dominant + CHOCH/BOS Supply recent
+      Long Setup Forming — at demand + bullish dominant + CHOCH/BOS Demand recent
+      Watch Supply       — price within 0.75% of supply
+      Watch Demand       — price within 0.75% of demand
+      No Setup           — mid-range / no proximity
+    """
+    if current_price is None:
+        return ("No Setup", "Waiting for price data.", "No entry.", "N/A")
+
+    # ── Recent alert window: last 5 alerts ──
+    recent = [a["alert_type"] for a in list(alert_history)[-5:]]
+    has_choch_bos_supply = any(t in ("CHOCH SUPPLY", "BOS SUPPLY")          for t in recent)
+    has_choch_bos_demand = any(t in ("CHOCH DEMAND", "BOS DEMAND")          for t in recent)
+    has_supply_confirmed = "MGC SUPPLY ZONE CONFIRMED"                       in recent
+    has_demand_confirmed = "MGC DEMAND ZONE CONFIRMED"                       in recent
+
+    # ── Proximity (0.75%) ──
+    def dist(a, b):
+        return abs(a - b) / b if b else float("inf")
+
+    at_supply = nearest_supply is not None and dist(nearest_supply, current_price) <= WATCH_PCT
+    at_demand = nearest_demand is not None and dist(current_price, nearest_demand) <= WATCH_PCT
+
+    bearish_dominant = (bearish - bullish) >= BIAS_THRESHOLD
+    bullish_dominant = (bullish - bearish) >= BIAS_THRESHOLD
+
+    sup_str = f"${nearest_supply:.2f}" if nearest_supply else "—"
+    dem_str = f"${nearest_demand:.2f}" if nearest_demand else "—"
+
+    # ── SHORT READY ──
+    if at_supply and bearish_dominant and has_choch_bos_supply and has_supply_confirmed:
+        return (
+            "Short Ready",
+            "Supply confirmed. Enter short on next 5m bearish close.",
+            "5m bearish candle closes below entry zone. Enter on close.",
+            f"Close above nearest supply ({sup_str}).",
+        )
+
+    # ── LONG READY ──
+    if at_demand and bullish_dominant and has_choch_bos_demand and has_demand_confirmed:
+        return (
+            "Long Ready",
+            "Demand confirmed. Enter long on next 5m bullish close.",
+            "5m bullish candle closes above entry zone. Enter on close.",
+            f"Close below nearest demand ({dem_str}).",
+        )
+
+    # ── SHORT SETUP FORMING ──
+    if at_supply and bearish_dominant and has_choch_bos_supply:
+        return (
+            "Short Setup Forming",
+            "Wait for 5m rejection candle from supply.",
+            "Do not enter until confirmation candle closes.",
+            f"Close above nearest supply ({sup_str}).",
+        )
+
+    # ── LONG SETUP FORMING ──
+    if at_demand and bullish_dominant and has_choch_bos_demand:
+        return (
+            "Long Setup Forming",
+            "Wait for 5m bounce candle from demand.",
+            "Do not enter until confirmation candle closes.",
+            f"Close below nearest demand ({dem_str}).",
+        )
+
+    # ── WATCH SUPPLY ──
+    if at_supply:
+        return (
+            "Watch Supply",
+            "Monitor price action at supply. Watch for bearish structure to form.",
+            "No entry — observation only.",
+            "N/A",
+        )
+
+    # ── WATCH DEMAND ──
+    if at_demand:
+        return (
+            "Watch Demand",
+            "Monitor price action at demand. Watch for bullish structure to form.",
+            "No entry — observation only.",
+            "N/A",
+        )
+
+    # ── NO SETUP ──
+    return (
+        "No Setup",
+        "Price mid-range. Wait for proximity to a key level.",
+        "No entry.",
+        "N/A",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +1105,14 @@ def full_analysis(current_price_override=None):
         current_price, nearest_supply, nearest_demand, last_price_by_type
     )
 
+    setup_stage, stage_next_step, stage_entry_rule, stage_invalidation = get_setup_stage(
+        current_price, nearest_supply, nearest_demand, bullish, bearish, ALERT_HISTORY
+    )
+
+    # Override verdict: only TRADE when stage is READY
+    if setup_stage not in READY_STAGES:
+        verdict = "WAIT"
+
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
     plan = build_trade_plan(bias, strength, bullish, bearish, counts)
@@ -982,6 +1123,8 @@ def full_analysis(current_price_override=None):
         quality=quality, edge_score=edge_score,
         recommendation=recommendation, verdict=verdict,
         reasoning_chain=reasoning_chain, why=why, plan=plan,
+        setup_stage=setup_stage, stage_next_step=stage_next_step,
+        stage_entry_rule=stage_entry_rule, stage_invalidation=stage_invalidation,
         market_direction=market_direction,
         trade_opportunity=trade_opportunity,
         opportunity_reason=opportunity_reason,
@@ -1046,6 +1189,7 @@ def webhook():
         a["bias"], a["strength"], a["bullish"], a["bearish"],
         a["confidence"], a["quality"], a["edge_score"],
         a["recommendation"], a["verdict"], a["reasoning_chain"], a["why"], a["plan"],
+        a["setup_stage"], a["stage_next_step"], a["stage_entry_rule"], a["stage_invalidation"],
         a["market_direction"], a["trade_opportunity"], a["opportunity_reason"],
         a["entry_trigger"], a["invalidation"], a["trade_plan"],
         a["structure_label"], a["structure_class"], a["structure_detail"],
@@ -1066,6 +1210,10 @@ def webhook():
         "verdict":          a["verdict"],
         "recommendation":   a["recommendation"],
         "reasoning_chain":    a["reasoning_chain"],
+        "setup_stage":        a["setup_stage"],
+        "stage_next_step":    a["stage_next_step"],
+        "stage_entry_rule":   a["stage_entry_rule"],
+        "stage_invalidation": a["stage_invalidation"],
         "market_direction":   a["market_direction"],
         "trade_opportunity":  a["trade_opportunity"],
         "opportunity_reason": a["opportunity_reason"],
@@ -1144,10 +1292,14 @@ def status():
                           "bullish_score": w_bull, "bearish_score": w_bear}
     return jsonify({
         "status":              "running",
-        "version":             "9.0",
+        "version":             "10.0",
         "verdict":             a["verdict"],
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
+        "setup_stage":         a["setup_stage"],
+        "stage_next_step":     a["stage_next_step"],
+        "stage_entry_rule":    a["stage_entry_rule"],
+        "stage_invalidation":  a["stage_invalidation"],
         "market_direction":    a["market_direction"],
         "trade_opportunity":   a["trade_opportunity"],
         "opportunity_reason":  a["opportunity_reason"],
@@ -1185,7 +1337,7 @@ def status():
 def index():
     return jsonify({
         "service":     "TradingView Webhook Server",
-        "version":     "9.0",
+        "version":     "10.0",
         "alert_types": list(ALERT_TYPES.keys()),
         "endpoints":   {
             "POST /webhook": "Receive TradingView alerts",
