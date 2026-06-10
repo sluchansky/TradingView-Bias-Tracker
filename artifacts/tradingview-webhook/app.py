@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 ALERT_HISTORY = deque(maxlen=100)
 CURRENT_PRICE = None
+ACTIVE_TRADE  = None  # v12: active trade tracking
 
 ALERT_TYPES = {
     "MGC NEW SUPPLY ZONE":       {"side": "bearish", "score": 1},
@@ -859,7 +860,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          structure_label, structure_class, structure_detail,
                          nearest_supply, nearest_demand,
                          risk_label, risk_detail,
-                         last_price_by_type):
+                         last_price_by_type,
+                         active_trade_info=None):
     if not DISCORD_WEBHOOK_URL:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
         return
@@ -923,6 +925,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  f"```\n{chain_text}\n```",
             "inline": False,
         },
+        # ── Active Trade (v12) ──
+        *([active_trade_info] if active_trade_info else []),
         # ── Setup Stage (v10) ──
         *_setup_stage_fields(setup_stage, stage_next_step, stage_entry_rule, stage_invalidation),
         # ── Market Direction + Trade Opportunity ──
@@ -1195,12 +1199,116 @@ def full_analysis(current_price_override=None):
 
 
 # ---------------------------------------------------------------------------
+# Trade Management v12
+# ---------------------------------------------------------------------------
+
+def compute_pnl(trade, current_price):
+    """Returns (dollar_pnl, points_pnl) for the active trade."""
+    direction = trade["direction"]
+    entry     = trade["entry_price"]
+    contracts = trade["contracts"]
+    pts = (entry - current_price) if direction == "Short" else (current_price - entry)
+    dollars = pts * MGC_POINT_VALUE * contracts
+    return dollars, pts
+
+
+def compute_distances(trade, current_price):
+    """Returns (to_t1, to_t2, to_stop) as positive point distances remaining."""
+    direction = trade["direction"]
+    if direction == "Short":
+        to_t1   = current_price - trade["target1"]
+        to_t2   = current_price - trade["target2"]
+        to_stop = trade["stop_loss"] - current_price
+    else:
+        to_t1   = trade["target1"] - current_price
+        to_t2   = trade["target2"] - current_price
+        to_stop = current_price - trade["stop_loss"]
+    return to_t1, to_t2, to_stop
+
+
+def check_trade_events(trade, current_price):
+    """Returns list of new events: 'T1_HIT', 'T2_HIT', 'STOP_HIT'. Fires each once."""
+    direction = trade["direction"]
+    if direction == "Short":
+        t1_hit   = current_price <= trade["target1"]
+        t2_hit   = current_price <= trade["target2"]
+        stop_hit = current_price >= trade["stop_loss"]
+    else:
+        t1_hit   = current_price >= trade["target1"]
+        t2_hit   = current_price >= trade["target2"]
+        stop_hit = current_price <= trade["stop_loss"]
+
+    events = []
+    if stop_hit:
+        events.append("STOP_HIT")
+    else:
+        if t2_hit and not trade.get("t2_hit"):
+            events.append("T2_HIT")
+        if t1_hit and not trade.get("t1_hit"):
+            events.append("T1_HIT")
+    return events
+
+
+def send_trade_event_message(event_type, trade, current_price):
+    """Send a standalone Discord plain-text alert for a trade event."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    dollar_pnl, pts_pnl = compute_pnl(trade, current_price)
+    pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
+    msgs = {
+        "T1_HIT":   (f"⚠️ **MOVE STOP TO BREAKEVEN**\n"
+                     f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
+                     f"T1 hit @ `{current_price:.1f}` | PnL **{pnl_str}**"),
+        "T2_HIT":   (f"🎯 **TARGET REACHED — T2 HIT**\n"
+                     f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
+                     f"T2 hit @ `{current_price:.1f}` | PnL **{pnl_str}**"),
+        "STOP_HIT": (f"🛑 **TRADE CLOSED — STOP HIT**\n"
+                     f"{trade['direction']} @ `{trade['entry_price']:.1f}` | "
+                     f"Stopped @ `{current_price:.1f}` | PnL **{pnl_str}**"),
+    }
+    content = msgs.get(event_type, f"Trade event: {event_type}")
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+        logger.info("Trade event sent: %s", event_type)
+    except requests.RequestException as exc:
+        logger.error("Trade event Discord send failed: %s", exc)
+
+
+def active_trade_field(trade, current_price):
+    """Return a single Discord embed field dict showing live trade status."""
+    dollar_pnl, pts_pnl   = compute_pnl(trade, current_price)
+    to_t1, to_t2, to_stop = compute_distances(trade, current_price)
+
+    pnl_emoji = "🟢" if dollar_pnl >= 0 else "🔴"
+    dir_emoji = "🔴" if trade["direction"] == "Short" else "🟢"
+    pnl_str   = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
+
+    value = (
+        f"{dir_emoji} **{trade['direction']}**  ·  "
+        f"Entry `{trade['entry_price']:.1f}`  ·  "
+        f"Current `{current_price:.1f}`  ·  "
+        f"Contracts `{trade['contracts']}`\n"
+        f"{pnl_emoji} **PnL:** {pnl_str} ({pts_pnl:+.1f} pts)  ·  "
+        f"Stop `{trade['stop_loss']:.1f}` ({to_stop:+.1f} pts away)\n"
+        f"T1 `{trade['target1']:.1f}` ({to_t1:.1f} pts)  ·  "
+        f"T2 `{trade['target2']:.1f}` ({to_t2:.1f} pts)"
+    )
+    label = {
+        "active": "📊  ACTIVE TRADE",
+        "t1_hit": "📊  ACTIVE TRADE — ✅ T1 Hit",
+        "t2_hit": "🎯  ACTIVE TRADE — ✅ T2 Hit",
+    }.get(trade.get("status", "active"), "📊  ACTIVE TRADE")
+
+    return {"name": label, "value": value, "inline": False}
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE
+    global CURRENT_PRICE, ACTIVE_TRADE
 
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -1257,6 +1365,24 @@ def webhook():
 
     sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct, profile_name)
 
+    # ── Active trade: check events, build embed field ──
+    ati = None
+    if ACTIVE_TRADE and parsed_price is not None:
+        events = check_trade_events(ACTIVE_TRADE, parsed_price)
+        for event in events:
+            send_trade_event_message(event, ACTIVE_TRADE, parsed_price)
+            if event == "T1_HIT":
+                ACTIVE_TRADE["t1_hit"] = True
+                ACTIVE_TRADE["status"] = "t1_hit"
+            elif event == "T2_HIT":
+                ACTIVE_TRADE["t2_hit"] = True
+                ACTIVE_TRADE["status"] = "t2_hit"
+            elif event == "STOP_HIT":
+                ACTIVE_TRADE = None
+                break
+        if ACTIVE_TRADE:
+            ati = active_trade_field(ACTIVE_TRADE, parsed_price)
+
     send_discord_message(
         record,
         a["bias"], a["strength"], a["bullish"], a["bearish"],
@@ -1269,6 +1395,7 @@ def webhook():
         a["nearest_supply"], a["nearest_demand"],
         a["risk_label"], a["risk_detail"],
         a["last_price_by_type"],
+        ati,
     )
 
     logger.info(
@@ -1407,17 +1534,167 @@ def status():
     }), 200
 
 
+@app.route("/enter", methods=["POST"])
+def enter_trade():
+    global ACTIVE_TRADE
+    data = request.get_json(force=True, silent=True) or {}
+
+    if data.get("entry"):
+        try:
+            direction = str(data.get("direction", "Long"))
+            entry     = float(data["entry"])
+            stop      = float(data["stop"])
+            t1        = float(data["t1"])
+            t2        = float(data["t2"])
+            contracts = int(data.get("contracts", 1))
+            profile   = str(data.get("profile", DEFAULT_PROFILE))
+        except (KeyError, ValueError, TypeError) as exc:
+            return jsonify({"status": "error", "reason": str(exc)}), 400
+    else:
+        a  = full_analysis()
+        tp = a["trade_plan"]
+        if not tp.get("trade_plan"):
+            return jsonify({"status": "error", "reason": "No active trade plan. Send entry/stop/t1/t2 or trigger a Short Ready / Long Ready setup first."}), 400
+        try:
+            lo_s, hi_s = str(tp["entry_zone"]).split("–")
+            entry     = (float(lo_s) + float(hi_s)) / 2
+            stop      = float(tp["stop_loss"])
+            t1        = float(tp["target1"])
+            t2        = float(tp["target2"])
+            direction = str(tp["direction"])
+        except (ValueError, TypeError, KeyError) as exc:
+            return jsonify({"status": "error", "reason": str(exc)}), 400
+        profile   = str(data.get("profile", DEFAULT_PROFILE))
+        acct_size = ACCOUNT_PROFILES.get(profile, {}).get("account_size", DEFAULT_ACCOUNT_SIZE)
+        risk_pct  = ACCOUNT_PROFILES.get(profile, {}).get("risk_pct", DEFAULT_RISK_PCT)
+        sz        = calculate_position_sizing(tp, acct_size, risk_pct, profile)
+        contracts = int(sz.get("contracts", 1)) if sz else 1
+
+    ACTIVE_TRADE = {
+        "direction":   direction,
+        "entry_price": entry,
+        "stop_loss":   stop,
+        "target1":     t1,
+        "target2":     t2,
+        "contracts":   contracts,
+        "profile":     profile,
+        "opened_at":   now_utc().isoformat(),
+        "t1_hit":      False,
+        "t2_hit":      False,
+        "status":      "active",
+    }
+
+    content = (
+        f"✅ **TRADE ENTERED — {direction.upper()}**\n"
+        f"Entry `{entry:.1f}`  ·  Stop `{stop:.1f}`  ·  "
+        f"T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`  ·  "
+        f"Contracts `{contracts}`  ·  Profile `{profile}`"
+    )
+    try:
+        if DISCORD_WEBHOOK_URL:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+    except requests.RequestException:
+        pass
+
+    logger.info("Trade entered: %s @ %.1f", direction, entry)
+    return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+
+
+@app.route("/breakeven", methods=["POST"])
+def set_breakeven():
+    global ACTIVE_TRADE
+    if not ACTIVE_TRADE:
+        return jsonify({"status": "error", "reason": "No active trade."}), 400
+    old_stop = ACTIVE_TRADE["stop_loss"]
+    ACTIVE_TRADE["stop_loss"] = ACTIVE_TRADE["entry_price"]
+    content = (
+        f"🔒 **STOP MOVED TO BREAKEVEN**\n"
+        f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
+        f"Stop `{old_stop:.1f}` → `{ACTIVE_TRADE['entry_price']:.1f}`"
+    )
+    try:
+        if DISCORD_WEBHOOK_URL:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+    except requests.RequestException:
+        pass
+    logger.info("Breakeven set: stop moved to %.1f", ACTIVE_TRADE["entry_price"])
+    return jsonify({"status": "breakeven_set", "stop_loss": ACTIVE_TRADE["stop_loss"]}), 200
+
+
+@app.route("/close", methods=["POST"])
+def close_trade():
+    global ACTIVE_TRADE
+    if not ACTIVE_TRADE:
+        return jsonify({"status": "error", "reason": "No active trade."}), 400
+    data       = request.get_json(force=True, silent=True) or {}
+    exit_price = CURRENT_PRICE
+    try:
+        if data.get("price"):
+            exit_price = float(data["price"])
+    except (ValueError, TypeError):
+        pass
+
+    closed = dict(ACTIVE_TRADE)
+    if exit_price is not None:
+        dollar_pnl, pts_pnl = compute_pnl(ACTIVE_TRADE, exit_price)
+        pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
+        content = (
+            f"🏁 **TRADE CLOSED MANUALLY**\n"
+            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
+            f"Exit `{exit_price:.1f}`  ·  PnL **{pnl_str}**"
+        )
+    else:
+        content = (
+            f"🏁 **TRADE CLOSED MANUALLY**\n"
+            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`"
+        )
+
+    ACTIVE_TRADE = None
+
+    try:
+        if DISCORD_WEBHOOK_URL:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+    except requests.RequestException:
+        pass
+    logger.info("Trade closed manually.")
+    return jsonify({"status": "closed", "trade": closed}), 200
+
+
+@app.route("/trade", methods=["GET"])
+def get_trade():
+    if not ACTIVE_TRADE:
+        return jsonify({"status": "no_active_trade"}), 200
+    result = dict(ACTIVE_TRADE)
+    cp = CURRENT_PRICE
+    if cp is not None:
+        dollar_pnl, pts_pnl   = compute_pnl(ACTIVE_TRADE, cp)
+        to_t1, to_t2, to_stop = compute_distances(ACTIVE_TRADE, cp)
+        result.update({
+            "current_price": cp,
+            "pnl_dollars":   round(dollar_pnl, 2),
+            "pnl_points":    round(pts_pnl, 2),
+            "to_t1_pts":     round(to_t1, 2),
+            "to_t2_pts":     round(to_t2, 2),
+            "to_stop_pts":   round(to_stop, 2),
+        })
+    return jsonify(result), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "service":     "TradingView Webhook Server",
-        "version":     "10.0",
+        "version":     "12.0",
         "alert_types": list(ALERT_TYPES.keys()),
         "endpoints":   {
-            "POST /webhook": "Receive TradingView alerts",
-            "GET /alerts":   "View last 100 stored alerts",
-            "GET /price":    "Price context, levels, structure, and risk zone",
-            "GET /status":   "Full analysis with verdict and reasoning chain",
+            "POST /webhook":   "Receive TradingView alerts",
+            "GET /alerts":     "View last 100 stored alerts",
+            "GET /price":      "Price context, levels, structure, and risk zone",
+            "GET /status":     "Full analysis with verdict and reasoning chain",
+            "POST /enter":     "Open an active trade (uses current trade plan or explicit params)",
+            "POST /breakeven": "Move stop loss to entry price",
+            "POST /close":     "Close the active trade manually",
+            "GET /trade":      "Show active trade status and live PnL",
         },
     }), 200
 
