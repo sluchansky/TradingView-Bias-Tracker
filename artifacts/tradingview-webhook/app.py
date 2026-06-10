@@ -744,30 +744,33 @@ _WATCH_STATES = ("Watch Supply", "Watch Demand")
 
 def _direction_opportunity_fields(market_direction, trade_opportunity,
                                    opportunity_reason, entry_trigger, invalidation):
-    """Return Discord embed fields for Market Direction + Trade Opportunity (v9)."""
+    """Return Discord embed fields for Market Direction + Trade Opportunity. Max 3 fields."""
     d_emoji = _DIR_EMOJI.get(market_direction, "⚪")
     o_emoji = _OPP_EMOJI.get(trade_opportunity, "")
+    opp_value = f"{o_emoji} **{trade_opportunity}**\n{opportunity_reason}"
     fields = [
-        {"name": "📊  Market Direction",  "value": f"{d_emoji} **{market_direction}**",  "inline": True},
-        {"name": "🔍  Trade Opportunity", "value": f"{o_emoji} **{trade_opportunity}**", "inline": True},
-        {"name": "💬  Reason",            "value": opportunity_reason,                   "inline": False},
+        {"name": "📊  Market Direction",  "value": f"{d_emoji} **{market_direction}**", "inline": True},
+        {"name": "🔍  Trade Opportunity", "value": opp_value,                           "inline": False},
     ]
     if trade_opportunity not in _WATCH_STATES and trade_opportunity != "None":
+        parts = []
         if entry_trigger:
-            fields.append({"name": "📍  Entry Trigger", "value": entry_trigger, "inline": True})
+            parts.append(f"**Entry:** {entry_trigger}")
         if invalidation:
-            fields.append({"name": "❌  Invalidation",  "value": invalidation,  "inline": True})
+            parts.append(f"**Invalidation:** {invalidation}")
+        if parts:
+            fields.append({"name": "📍  Trade Rules", "value": "\n".join(parts), "inline": False})
     return fields
 
 
 def _setup_stage_fields(setup_stage, next_step, entry_rule, stage_invalidation):
-    """Return Discord embed fields for Setup Stage section (v10)."""
+    """Return Discord embed fields for Setup Stage section (v10). Max 3 fields."""
     emoji = _STAGE_EMOJI.get(setup_stage, "⭕")
+    rules = f"**Entry:** {entry_rule}\n**Invalidation:** {stage_invalidation}"
     return [
-        {"name": "🎯  Setup Stage",   "value": f"{emoji} **{setup_stage}**", "inline": True},
-        {"name": "➡️  Next Step",     "value": next_step,                    "inline": False},
-        {"name": "📋  Entry Rule",    "value": entry_rule,                   "inline": True},
-        {"name": "🚫  Invalidation",  "value": stage_invalidation,           "inline": True},
+        {"name": "🎯  Setup Stage", "value": f"{emoji} **{setup_stage}**", "inline": True},
+        {"name": "➡️  Next Step",   "value": next_step,                    "inline": False},
+        {"name": "📋  Rules",       "value": rules,                        "inline": False},
     ]
 
 
@@ -857,25 +860,15 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  why,
             "inline": False,
         },
-        # ── Bias / Score / Confidence ──
+        # ── Bias / Confidence / Quality (combined) ──
         {
-            "name":   "📊  Bias",
-            "value":  f"{bias_emoji} **{bias}**  Strength {strength}/10",
-            "inline": True,
-        },
-        {
-            "name":   "🎯  Confidence",
-            "value":  f"**{confidence}%**",
-            "inline": True,
-        },
-        {
-            "name":   "🏆  Quality",
-            "value":  f"**{quality}** — {QUALITY_LABELS.get(quality,'')}",
-            "inline": True,
-        },
-        {
-            "name":   "🔢  Score",
-            "value":  f"Bull `{bullish}` · Bear `{bearish}` · Gap `{abs(bullish-bearish)}`",
+            "name":  "📊  Bias · Confidence · Quality",
+            "value": (
+                f"{bias_emoji} **{bias}** Strength {strength}/10 · "
+                f"**{confidence}%** · "
+                f"**{quality}** {QUALITY_LABELS.get(quality,'')}\n"
+                f"Bull `{bullish}` · Bear `{bearish}` · Gap `{abs(bullish-bearish)}`"
+            ),
             "inline": False,
         },
         # ── Market Structure ──
@@ -891,13 +884,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "inline": False,
         },
         {
-            "name":   "📈  Nearest Supply",
-            "value":  sup_str,
-            "inline": True,
-        },
-        {
-            "name":   "📉  Nearest Demand",
-            "value":  dem_str,
+            "name":   "📈 Supply · 📉 Demand",
+            "value":  f"{sup_str}  ·  {dem_str}",
             "inline": True,
         },
         # ── Risk Zone ──
@@ -907,27 +895,17 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "inline": False,
         },
         # ── Windows ──
-        {
-            "name":   "📋  Recent Alert Summary",
-            "value":  "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "inline": False,
-        },
         *window_fields,
-        # ── Action ──
+        # ── Action / Permissions ──
         {
             "name":   "🗺️  Action",
             "value":  plan["action"],
             "inline": False,
         },
         {
-            "name":   "🟩  Longs Allowed",
-            "value":  plan["longs_allowed"],
-            "inline": True,
-        },
-        {
-            "name":   "🟥  Shorts Allowed",
-            "value":  plan["shorts_allowed"],
-            "inline": True,
+            "name":   "🟩 Longs · 🟥 Shorts",
+            "value":  f"Longs: {plan['longs_allowed']}  ·  Shorts: {plan['shorts_allowed']}",
+            "inline": False,
         },
     ]
 
