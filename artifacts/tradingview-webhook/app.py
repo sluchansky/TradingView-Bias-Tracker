@@ -96,7 +96,7 @@ def calculate_confidence(bullish, bearish):
     total = bullish + bearish
     if total == 0:
         return 0
-    return round(max(bullish, bearish) / total * 100)
+    return min(95, round(max(bullish, bearish) / total * 100))
 
 def calculate_trade_quality(bias, confidence, bullish, bearish):
     if bullish + bearish == 0:
