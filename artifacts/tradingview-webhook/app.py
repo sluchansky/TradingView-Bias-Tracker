@@ -430,6 +430,162 @@ def detect_setup(structure_class, structure_label, risk_label, overextended,
 
 
 # ---------------------------------------------------------------------------
+# Trade Plan Generator v7
+# ---------------------------------------------------------------------------
+
+def generate_trade_plan(setup, current_price, nearest_supply, nearest_demand,
+                        last_price_by_type):
+    """
+    Generate specific entry / stop / target levels for actionable setups.
+    Returns dict with trade_plan=True|False and level fields.
+    """
+    s = setup["setup"]
+
+    def no_plan(reason):
+        return {"trade_plan": False, "reason": reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1": None, "target2": None, "rr": None, "direction": None}
+
+    if s in ("NONE", "Range Chop"):
+        return no_plan("Insufficient edge.")
+
+    if current_price is None:
+        return no_plan("No price data available.")
+
+    ENTRY_BUF = 0.001   # 0.1% — entry zone half-width
+
+    def buf(level):
+        return max(1, round(level * ENTRY_BUF))
+
+    def rr(reward, risk):
+        if risk <= 0:
+            return "—"
+        ratio = round(reward / risk, 1)
+        return f"{ratio}:1"
+
+    def fmt(v):
+        return f"{v:.1f}"
+
+    # ── Demand Bounce (Long) ──
+    if s == "Demand Bounce":
+        dem   = nearest_demand if nearest_demand is not None else float(current_price)
+        b     = buf(dem)
+        lo    = dem
+        hi    = dem + b
+        stop  = dem - b - 1          # one extra pt beyond zone
+        mid   = (lo + hi) / 2
+        risk  = mid - stop
+
+        if nearest_supply and nearest_supply > hi:
+            t2 = nearest_supply
+            t1 = round((hi + t2) / 2, 1)
+        else:
+            t2 = round(mid + risk * 3.0, 1)
+            t1 = round(mid + risk * 1.5, 1)
+
+        rr1 = rr(t1 - mid, risk)
+        rr2 = rr(t2 - mid, risk)
+        return {
+            "trade_plan": True,
+            "direction":  "Long",
+            "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
+            "stop_loss":  fmt(stop),
+            "target1":    fmt(t1),
+            "target2":    fmt(t2),
+            "rr":         f"T1 {rr1} / T2 {rr2}",
+        }
+
+    # ── Supply Rejection (Short) ──
+    if s == "Supply Rejection":
+        sup   = nearest_supply if nearest_supply is not None else float(current_price)
+        b     = buf(sup)
+        hi    = sup
+        lo    = sup - b
+        stop  = sup + b              # one zone-width beyond top
+        mid   = (lo + hi) / 2
+        risk  = stop - mid
+
+        if nearest_demand and nearest_demand < lo:
+            t2 = nearest_demand
+            t1 = round((lo + t2) / 2, 1)
+        else:
+            t2 = round(mid - risk * 3.0, 1)
+            t1 = round(mid - risk * 1.5, 1)
+
+        rr1 = rr(mid - t1, risk)
+        rr2 = rr(mid - t2, risk)
+        return {
+            "trade_plan": True,
+            "direction":  "Short",
+            "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
+            "stop_loss":  fmt(stop),
+            "target1":    fmt(t1),
+            "target2":    fmt(t2),
+            "rr":         f"T1 {rr1} / T2 {rr2}",
+        }
+
+    # ── Bullish Breakout Setup (Long) ──
+    if s == "Bullish Breakout Setup":
+        choch_sup = last_price_by_type.get("CHOCH SUPPLY", float(current_price))
+        b     = buf(choch_sup)
+        lo    = choch_sup + 1        # just above breakout level
+        hi    = choch_sup + b
+        stop  = choch_sup - b        # back below breakout
+        mid   = (lo + hi) / 2
+        risk  = mid - stop
+
+        if nearest_supply and nearest_supply > hi:
+            t2 = nearest_supply
+            t1 = round((hi + t2) / 2, 1)
+        else:
+            t2 = round(mid + risk * 3.0, 1)
+            t1 = round(mid + risk * 1.5, 1)
+
+        rr1 = rr(t1 - mid, risk)
+        rr2 = rr(t2 - mid, risk)
+        return {
+            "trade_plan": True,
+            "direction":  "Long",
+            "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
+            "stop_loss":  fmt(stop),
+            "target1":    fmt(t1),
+            "target2":    fmt(t2),
+            "rr":         f"T1 {rr1} / T2 {rr2}",
+        }
+
+    # ── Bearish Breakdown Setup (Short) ──
+    if s == "Bearish Breakdown Setup":
+        choch_dem = last_price_by_type.get("CHOCH DEMAND", float(current_price))
+        b     = buf(choch_dem)
+        hi    = choch_dem - 1        # just below breakdown level
+        lo    = choch_dem - b
+        stop  = choch_dem + b        # back above breakdown
+        mid   = (lo + hi) / 2
+        risk  = stop - mid
+
+        if nearest_demand and nearest_demand < lo:
+            t2 = nearest_demand
+            t1 = round((lo + t2) / 2, 1)
+        else:
+            t2 = round(mid - risk * 3.0, 1)
+            t1 = round(mid - risk * 1.5, 1)
+
+        rr1 = rr(mid - t1, risk)
+        rr2 = rr(mid - t2, risk)
+        return {
+            "trade_plan": True,
+            "direction":  "Short",
+            "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
+            "stop_loss":  fmt(stop),
+            "target1":    fmt(t1),
+            "target2":    fmt(t2),
+            "rr":         f"T1 {rr1} / T2 {rr2}",
+        }
+
+    return no_plan("No trade plan available for this setup.")
+
+
+# ---------------------------------------------------------------------------
 # Trade plan + Why
 # ---------------------------------------------------------------------------
 
@@ -546,6 +702,32 @@ RECOMMENDATION_EMOJI = {
 }
 
 
+def _trade_plan_fields(tp):
+    """Return Discord embed field dicts for the trade plan."""
+    if not tp["trade_plan"]:
+        return [
+            {
+                "name":   "📋  Trade Plan",
+                "value":  f"**No trade plan generated.**\nReason: {tp['reason']}",
+                "inline": False,
+            }
+        ]
+    direction_emoji = "🟢" if tp["direction"] == "Long" else "🔴"
+    return [
+        {
+            "name":   f"📋  Trade Plan  {direction_emoji} {tp['direction']}",
+            "value":  (
+                f"**Entry Zone:** {tp['entry_zone']}\n"
+                f"**Stop Loss:** {tp['stop_loss']}\n"
+                f"**Target 1:** {tp['target1']}\n"
+                f"**Target 2:** {tp['target2']}\n"
+                f"**R:R** {tp['rr']}"
+            ),
+            "inline": False,
+        }
+    ]
+
+
 def _setup_fields(setup):
     """Return a list of Discord embed field dicts for the current setup."""
     s = setup["setup"]
@@ -570,7 +752,7 @@ def _setup_fields(setup):
 def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          confidence, quality, edge_score,
                          recommendation, verdict, reasoning_chain, why, plan,
-                         setup,
+                         setup, trade_plan,
                          structure_label, structure_class, structure_detail,
                          nearest_supply, nearest_demand,
                          risk_label, risk_detail,
@@ -640,6 +822,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         },
         # ── Setup Detection ──
         *_setup_fields(setup),
+        # ── Trade Plan ──
+        *_trade_plan_fields(trade_plan),
         # ── Why ──
         {
             "name":   "💬  Why",
@@ -724,7 +908,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         fields.append({"name": "⚠️  Warning", "value": plan["warning"], "inline": False})
 
     embed = {
-        "title":       "MGC Agent v6",
+        "title":       "MGC Agent v7",
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
         "fields":      fields,
@@ -770,6 +954,10 @@ def full_analysis(current_price_override=None):
         current_price, nearest_supply, nearest_demand, last_price_by_type
     )
 
+    trade_plan = generate_trade_plan(
+        setup, current_price, nearest_supply, nearest_demand, last_price_by_type
+    )
+
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
     plan = build_trade_plan(bias, strength, bullish, bearish, counts)
@@ -780,7 +968,7 @@ def full_analysis(current_price_override=None):
         quality=quality, edge_score=edge_score,
         recommendation=recommendation, verdict=verdict,
         reasoning_chain=reasoning_chain, why=why, plan=plan,
-        setup=setup,
+        setup=setup, trade_plan=trade_plan,
         current_price=current_price,
         last_price_by_type=last_price_by_type,
         nearest_supply=nearest_supply, nearest_demand=nearest_demand,
@@ -839,7 +1027,7 @@ def webhook():
         a["bias"], a["strength"], a["bullish"], a["bearish"],
         a["confidence"], a["quality"], a["edge_score"],
         a["recommendation"], a["verdict"], a["reasoning_chain"], a["why"], a["plan"],
-        a["setup"],
+        a["setup"], a["trade_plan"],
         a["structure_label"], a["structure_class"], a["structure_detail"],
         a["nearest_supply"], a["nearest_demand"],
         a["risk_label"], a["risk_detail"],
@@ -859,6 +1047,7 @@ def webhook():
         "recommendation":   a["recommendation"],
         "reasoning_chain":  a["reasoning_chain"],
         "setup":            a["setup"],
+        "trade_plan":       a["trade_plan"],
         "why":              a["why"],
         "bias":             a["bias"],
         "strength":         a["strength"],
@@ -929,6 +1118,7 @@ def status():
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
         "setup":               a["setup"],
+        "trade_plan":          a["trade_plan"],
         "why":                 a["why"],
         "bias":                a["bias"],
         "strength":            f"{a['strength']}/10",
