@@ -1951,6 +1951,72 @@ def get_journal():
     return jsonify({"entries": JOURNAL, "count": len(JOURNAL)}), 200
 
 
+@app.route("/journal", methods=["POST"])
+def add_journal_entry():
+    """Manually create a journal entry and post it to the Discord journal channel."""
+    global JOURNAL
+    data = request.get_json(force=True, silent=True) or {}
+
+    # Normalise confidence: accept "71%" or 71
+    raw_conf = data.get("confidence", "—")
+    if isinstance(raw_conf, (int, float)):
+        conf_str = f"{int(raw_conf)}%"
+    else:
+        conf_str = str(raw_conf).strip()
+        if conf_str.isdigit():
+            conf_str = conf_str + "%"
+
+    # Normalise reasoning_chain: accept list or newline-delimited string
+    raw_chain = data.get("reasoning_chain") or data.get("reason") or []
+    if isinstance(raw_chain, str):
+        reasoning_chain = [r.strip() for r in raw_chain.splitlines() if r.strip()]
+    else:
+        reasoning_chain = list(raw_chain)
+
+    # Normalise setup_stage: map short aliases
+    _stage_map = {
+        "FORMING":     "Long Setup Forming",
+        "LONG READY":  "Long Ready",
+        "SHORT READY": "Short Ready",
+        "SHORT FORMING": "Short Setup Forming",
+    }
+    raw_stage = str(data.get("setup_stage") or data.get("status") or "—").upper()
+    setup_stage = _stage_map.get(raw_stage, data.get("setup_stage") or data.get("status") or "—")
+
+    direction = str(data.get("direction", "—")).capitalize()
+
+    entry = {
+        "id":               len(JOURNAL) + 1,
+        "datetime":         data.get("datetime", datetime.now(timezone.utc).isoformat()),
+        "symbol":           str(data.get("symbol", "MGC")).upper(),
+        "direction":        direction,
+        "setup_stage":      setup_stage,
+        "verdict":          str(data.get("verdict") or ("WATCH" if "Forming" in setup_stage else setup_stage.upper())),
+        "entry_zone":       data.get("entry_zone"),
+        "stop_loss":        data.get("stop") or data.get("stop_loss"),
+        "target1":          data.get("target1"),
+        "target2":          data.get("target2"),
+        "bias":             str(data.get("bias") or ("Bullish" if direction == "Long" else "Bearish")),
+        "confidence":       conf_str,
+        "edge_score":       data.get("edge_score", 0),
+        "market_structure": str(data.get("market_structure") or data.get("structure") or "—"),
+        "risk_zone":        str(data.get("risk_zone") or data.get("risk") or "—"),
+        "reasoning_chain":  reasoning_chain,
+        "why":              str(data.get("why") or data.get("next_step") or "—"),
+        "screenshot":       str(data.get("screenshot") or "[ Screenshot placeholder — add URL or image link ]"),
+        "outcome":          str(data.get("outcome") or "Pending"),
+        "manual":           True,
+    }
+
+    JOURNAL.insert(0, entry)
+    if len(JOURNAL) > 500:
+        JOURNAL.pop()
+
+    send_journal_discord_embed(entry)
+    logger.info("Manual journal entry #%d created: %s %s", entry["id"], entry["symbol"], entry["direction"])
+    return jsonify({"status": "created", "entry": entry}), 201
+
+
 @app.route("/clear", methods=["POST"])
 def clear_alerts():
     global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES, ZONE_MITIGATED_FLAG, JOURNAL_KEYS
