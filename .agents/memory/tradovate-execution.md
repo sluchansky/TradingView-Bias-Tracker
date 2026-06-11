@@ -70,3 +70,12 @@ Inert until the 6 Tradovate secrets AND the execution secret exist. Without the
 execution secret nothing can be enabled or fired (fail-closed). Keep env on DEMO and
 do one full demo round-trip (enter → breakeven → close, verifying the OCO orders
 appear and are cancelled) before considering the real-money env.
+
+**Go-live is blocked by the broker, not the app.** The account in use is an Apex
+(prop-firm) account, and the user confirmed prop firms do not permit API trading —
+so no Tradovate API Key (cid/sec) can be created for it and the live path cannot be
+turned on. The auth payload requires username/password PLUS an API Key (cid + sec),
+appId, deviceId; a login alone is not enough. Do not re-attempt go-live until the
+user supplies a non-prop, API-capable Tradovate account.
+**Why:** avoid re-requesting credentials that this account type structurally cannot
+provide.
