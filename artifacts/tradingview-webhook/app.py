@@ -2013,6 +2013,7 @@ def full_analysis(current_price_override=None):
             why="Zone mitigated — all scoring skipped.",
             plan={"action": "Wait for fresh zone.", "longs_allowed": "No", "shorts_allowed": "No", "warning": ""},
             setup_stage="No Setup",
+            stage_direction=None,
             stage_next_step="Zone consumed — wait for fresh supply or demand zone.",
             stage_entry_rule="No entry from consumed zone.",
             stage_invalidation="Zone previously mitigated — invalid entry.",
