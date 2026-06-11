@@ -1752,7 +1752,10 @@ def create_journal_entry(record, a, sizing):
     if setup_stage not in JOURNAL_STAGES:
         return None
 
-    ticker     = record.get("ticker") or "MGC"
+    _raw_ticker    = record.get("ticker") or record.get("alert_type", "")
+    ticker         = "MNQ" if "MNQ" in str(_raw_ticker).upper() else "MGC"
+    if record.get("ticker"):
+        ticker = record["ticker"]   # preserve exact ticker (e.g. "MNQ1!") when supplied
     tp         = a.get("trade_plan") or {}
     entry_zone = tp.get("entry_zone")
     direction  = (a.get("stage_direction")
@@ -2102,7 +2105,9 @@ def add_journal_entry():
     entry = {
         "id":               len(JOURNAL) + 1,
         "datetime":         data.get("datetime", datetime.now(timezone.utc).isoformat()),
-        "symbol":           str(data.get("symbol", "MGC")).upper(),
+        "symbol":           str(data.get("symbol") or (
+                                "MNQ" if "MNQ" in str(data.get("profile", "")).upper() else "MGC"
+                            )).upper(),
         "direction":        direction,
         "setup_stage":      setup_stage,
         "verdict":          str(data.get("verdict") or auto_verdict),
