@@ -195,6 +195,15 @@ def _discord_url(hint: str = "") -> str:
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (default 5 min)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 
+# ── Automatic VWAP fetch ──────────────────────────────────────────────────────
+# Session VWAP is pulled from a public market-data feed so the operator never has
+# to type it. A VWAP pushed from a TradingView chart (source "chart") is exact and
+# wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that the auto value resumes.
+VWAP_FETCH_INTERVAL    = int(os.environ.get("VWAP_FETCH_INTERVAL", 60))   # seconds
+VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # minutes
+# MGC (micro gold) ≈ GC=F, MNQ (micro Nasdaq) ≈ NQ=F — same price, so same VWAP.
+VWAP_FEED_SYMBOL = {"MGC": "GC=F", "MNQ": "NQ=F"}
+
 
 def _send_heartbeat():
     """Post an hourly status embed to all configured trade-alert channels."""
@@ -1796,6 +1805,87 @@ def get_vwap(ticker, max_age_min=None):
     return float(rec["value"]), "ok"
 
 
+def _fetch_vwap_from_market(instrument):
+    """Compute today's session VWAP for an instrument from a public market feed.
+
+    Returns (value, error). VWAP = Σ(typical_price × volume) / Σ(volume) over the
+    1-minute bars of the current trading day, where typical_price = (H+L+C)/3.
+    MGC/MNQ track GC=F/NQ=F (same price level), so the VWAP is interchangeable.
+    """
+    symbol = VWAP_FEED_SYMBOL.get(instrument)
+    if not symbol:
+        return None, f"no feed symbol for {instrument}"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        resp = requests.get(
+            url,
+            params={"interval": "1m", "range": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        result = resp.json()["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+        highs, lows, closes = quote["high"], quote["low"], quote["close"]
+        volumes = quote["volume"]
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        return None, f"fetch error: {exc}"
+
+    num = den = 0.0
+    for high, low, close, vol in zip(highs, lows, closes, volumes):
+        if high is None or low is None or close is None or not vol:
+            continue
+        num += ((high + low + close) / 3.0) * vol
+        den += vol
+    if den <= 0:
+        return None, "no volume data"
+    return round(num / den, 4), None
+
+
+def _chart_override_active(instrument):
+    """True if a chart/manual VWAP push for this instrument is still within its
+    grace window — the background fetch must not overwrite it while it is."""
+    rec = VWAP_BY_TICKER.get(instrument)
+    if not rec or rec.get("value") is None or rec.get("source") not in ("chart", "manual"):
+        return False
+    try:
+        age_min = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
+    except (KeyError, ValueError, TypeError):
+        return False
+    return age_min <= VWAP_OVERRIDE_GRACE_MIN
+
+
+def _update_vwap_auto(instrument):
+    """Refresh VWAP for one instrument from the market feed, unless a recent
+    chart/manual push (the exact value) is still within its grace window."""
+    if _chart_override_active(instrument):
+        return  # keep the exact, operator-supplied value
+    value, err = _fetch_vwap_from_market(instrument)
+    if value is None:
+        logger.warning("VWAP auto-fetch failed for %s: %s", instrument, err)
+        return
+    # Re-check after the (slow) HTTP fetch: a chart/manual push may have landed
+    # while it was in flight — never clobber a fresh operator value.
+    if _chart_override_active(instrument):
+        return
+    VWAP_BY_TICKER[instrument] = {
+        "value": value, "ts": now_utc().isoformat(), "source": "auto",
+    }
+    logger.info("VWAP auto-fetch: %s = %s", instrument, value)
+
+
+def _vwap_autofetch_loop():
+    """Refresh VWAP for all tracked instruments, then reschedule."""
+    try:
+        for instrument in VWAP_FEED_SYMBOL:
+            _update_vwap_auto(instrument)
+    except Exception as exc:  # never let the loop die
+        logger.warning("VWAP auto-fetch loop error: %s", exc)
+    finally:
+        threading.Timer(VWAP_FETCH_INTERVAL, _vwap_autofetch_loop).start()
+
+
 def _active_ticker():
     """Best-effort active instrument from the most recent ticker-bearing alert."""
     for rec in reversed(ALERT_HISTORY):
@@ -2749,7 +2839,8 @@ def webhook():
             vwap_val = None
         if vwap_val is not None:
             vwap_key = instrument_of(data.get("ticker") or normalized)
-            VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": now_utc().isoformat()}
+            VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": now_utc().isoformat(),
+                                        "source": "chart"}
 
     # ── Data-only VWAP push — store already updated above; ack without scoring ──
     if normalized in _DATA_ONLY_TYPES:
@@ -3110,6 +3201,7 @@ def status():
         "confluences":         a.get("confluences"),
         "vwap_value":          a.get("vwap_value"),
         "vwap_status":         a.get("vwap_status"),
+        "vwap_source":         (VWAP_BY_TICKER.get(a.get("active_ticker")) or {}).get("source"),
         "active_ticker":       a.get("active_ticker"),
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
@@ -3515,14 +3607,15 @@ def dashboard():
   <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
 </div>
 
-<!-- Manual VWAP — feeds the strict price-vs-VWAP gate -->
+<!-- VWAP is fetched automatically; manual entry just overrides it temporarily -->
 <details class="vwap-set">
-  <summary>📌 Set VWAP for <span id="vwap-sym">MGC</span> — required for a READY signal</summary>
+  <summary>📌 VWAP for <span id="vwap-sym">MGC</span> updates automatically — tap to override</summary>
   <div class="fields">
-    <div class="field"><label>VWAP value</label><input id="f-vwap" type="number" step="0.01" placeholder="read from your chart"></div>
+    <div class="field"><label>VWAP value</label><input id="f-vwap" type="number" step="0.01" placeholder="auto — type to override"></div>
     <div class="field"><label>Current price (optional)</label><input id="f-vwap-price" type="number" step="0.1" placeholder="optional"></div>
   </div>
-  <button class="btn" style="background:#16203a;color:#9ec5ff;border:1px solid #2a3a5a" onclick="setVwap()">Set VWAP</button>
+  <button class="btn" style="background:#16203a;color:#9ec5ff;border:1px solid #2a3a5a" onclick="setVwap()">Override VWAP</button>
+  <div style="font-size:11px;color:#6b7280;margin-top:6px">A manual value holds for ~10 min, then auto resumes.</div>
 </details>
 
 <!-- Direction -->
@@ -3774,8 +3867,10 @@ async function refreshRec() {
 
     const inst  = d.active_ticker ? String(d.active_ticker).replace('1!','') : '—';
     const price = d.current_price!=null ? d.current_price : '—';
+    const vsrc  = d.vwap_source==='chart' ? ' <span style="color:#6b7280;font-size:11px">(manual)</span>'
+                : d.vwap_source==='auto'  ? ' <span style="color:#6b7280;font-size:11px">(auto)</span>' : '';
     const vwap  = (d.vwap_status==='ok' && d.vwap_value!=null)
-      ? Number(d.vwap_value).toFixed(1)
+      ? Number(d.vwap_value).toFixed(1) + vsrc
       : 'n/a ('+(d.vwap_status||'—')+')';
     meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b>';
 
@@ -3942,5 +4037,6 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
+    threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL
     _schedule_eod()                               # schedule daily EOD summary
     app.run(host="0.0.0.0", port=port, debug=False)
