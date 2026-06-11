@@ -44,6 +44,11 @@ ALERT_TYPES = {
     "MGC BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
     "MNQ BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
     "MNQ BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
+    # ── Trade lifecycle commands (sent directly from TradingView strategy) ───────
+    "MGC ENTER":  {"side": "command", "score": 0},
+    "MNQ ENTER":  {"side": "command", "score": 0},
+    "MGC CLOSE":  {"side": "command", "score": 0},
+    "MNQ CLOSE":  {"side": "command", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -2021,6 +2026,116 @@ def active_trade_field(trade, current_price):
     return {"name": "📊  ACTIVE TRADE MANAGEMENT", "value": value, "inline": False}
 
 
+_COMMAND_TYPES = {"MGC ENTER", "MNQ ENTER", "MGC CLOSE", "MNQ CLOSE"}
+
+
+def _handle_command_alert(normalized, data, parsed_price):
+    """Execute ENTER / CLOSE trade commands sent via TradingView webhook.
+
+    Returns a Flask Response to short-circuit the webhook handler, or None
+    to fall through to normal alert scoring.
+    """
+    global ACTIVE_TRADE
+    profile   = str(data.get("profile", DEFAULT_PROFILE))
+    is_enter  = normalized.endswith("ENTER")
+
+    # ── ENTER ─────────────────────────────────────────────────────────────
+    if is_enter:
+        try:
+            entry = float(data["entry"]) if data.get("entry") else None
+            stop  = float(data["stop"])  if data.get("stop")  else None
+            t1    = float(data["t1"])    if data.get("t1")    else None
+            t2    = float(data["t2"])    if data.get("t2")    else None
+        except (ValueError, TypeError) as exc:
+            return jsonify({"status": "error", "reason": str(exc)}), 400
+
+        # Fall back to current trade plan for any missing values
+        if None in (entry, stop, t1, t2):
+            a  = full_analysis(current_price_override=parsed_price)
+            tp = a["trade_plan"]
+            try:
+                if entry is None:
+                    lo_s, hi_s = str(tp["entry_zone"]).split("–")
+                    entry = (float(lo_s) + float(hi_s)) / 2
+                if stop is None:
+                    stop = float(tp["stop_loss"])
+                if t1   is None:
+                    t1   = float(tp["target1"])
+                if t2   is None:
+                    t2   = float(tp["target2"])
+            except (ValueError, TypeError, KeyError) as exc:
+                return jsonify({"status": "error", "reason": f"Missing trade plan params: {exc}"}), 400
+
+        direction = str(data.get("direction", "Long"))
+        contracts = int(data.get("contracts", 1))
+
+        ACTIVE_TRADE = {
+            "direction":   direction,
+            "entry_price": entry,
+            "stop_loss":   stop,
+            "target1":     t1,
+            "target2":     t2,
+            "contracts":   contracts,
+            "profile":     profile,
+            "opened_at":   now_utc().isoformat(),
+            "t1_hit":      False,
+            "t2_hit":      False,
+            "status":      "active",
+        }
+        content = (
+            f"✅ **TRADE ENTERED — {direction.upper()}**\n"
+            f"Entry `{entry:.1f}`  ·  Stop `{stop:.1f}`  ·  "
+            f"T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`  ·  Contracts `{contracts}`"
+        )
+        _url = _discord_url(normalized)
+        if _url:
+            try:
+                requests.post(_url, json={"content": content}, timeout=5)
+            except Exception:
+                pass
+        logger.info("ENTER command: %s %s @ %.1f", direction, profile, entry)
+        return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+
+    # ── CLOSE ─────────────────────────────────────────────────────────────
+    if not ACTIVE_TRADE:
+        return jsonify({"status": "error", "reason": "No active trade to close."}), 400
+
+    exit_price = parsed_price
+    closed     = dict(ACTIVE_TRADE)
+
+    if exit_price is not None:
+        dollar_pnl, _ = compute_pnl(ACTIVE_TRADE, exit_price)
+        pnl_str    = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
+        content    = (
+            f"🏁 **TRADE CLOSED**\n"
+            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
+            f"Exit `{exit_price:.1f}`  ·  PnL **{pnl_str}**"
+        )
+        outcome_str = (
+            f"Win — Closed {pnl_str} ✅" if dollar_pnl >= 0
+            else f"Loss — Closed {pnl_str} ❌"
+        )
+    else:
+        dollar_pnl  = None
+        content     = (
+            f"🏁 **TRADE CLOSED**\n"
+            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`"
+        )
+        outcome_str = "Closed Manually"
+
+    ACTIVE_TRADE = None
+    _update_journal_outcome(outcome_str, pnl_dollars=dollar_pnl)
+
+    _url = _discord_url(normalized)
+    if _url:
+        try:
+            requests.post(_url, json={"content": content}, timeout=5)
+        except Exception:
+            pass
+    logger.info("CLOSE command: %s", outcome_str)
+    return jsonify({"status": "closed", "trade": closed}), 200
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -2053,6 +2168,12 @@ def webhook():
 
     if parsed_price is not None:
         CURRENT_PRICE = parsed_price
+
+    # ── Command types: ENTER / CLOSE — short-circuit before scoring ──────────
+    if normalized in _COMMAND_TYPES:
+        resp = _handle_command_alert(normalized, data, parsed_price)
+        if resp is not None:
+            return resp
 
     record = {
         "alert_type": normalized,
