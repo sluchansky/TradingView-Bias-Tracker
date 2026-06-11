@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 ALERT_HISTORY    = deque(maxlen=100)
 CURRENT_PRICE    = None
 ACTIVE_TRADE     = None   # v12: active trade tracking
-ZONE_BROKEN_AT   = None   # {"price": float, "alerts_since": int}
-MITIGATED_PRICES = []     # [{"price": float, "ts": str}]
+ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
+MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
+ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
 
 ALERT_TYPES = {
     "MGC NEW SUPPLY ZONE":       {"side": "bearish", "score": 1},
@@ -1297,11 +1298,12 @@ def _handle_zone_broken(price):
 
 
 def _handle_zone_mitigated(price):
-    """Record the consumed zone level to prevent duplicate entries."""
-    global MITIGATED_PRICES
+    """Record the consumed zone level and arm the mitigation flag."""
+    global MITIGATED_PRICES, ZONE_MITIGATED_FLAG
     MITIGATED_PRICES.append({"price": price, "ts": datetime.now(timezone.utc).isoformat()})
-    MITIGATED_PRICES = MITIGATED_PRICES[-10:]   # keep last 10
-    logger.info("Zone mitigated at %.1f — %d levels tracked", price, len(MITIGATED_PRICES))
+    MITIGATED_PRICES    = MITIGATED_PRICES[-10:]
+    ZONE_MITIGATED_FLAG = True
+    logger.info("Zone mitigated at %.1f — flag armed, %d levels tracked", price, len(MITIGATED_PRICES))
 
 
 def is_near_mitigated_zone(price):
@@ -1320,6 +1322,46 @@ def is_near_mitigated_zone(price):
 # ---------------------------------------------------------------------------
 
 def full_analysis(current_price_override=None):
+    # ── ZONE MITIGATION HARD GATE — skip ALL computation ──────────────────────
+    if ZONE_MITIGATED_FLAG and ZONE_BROKEN_AT is None:
+        _mz_price = MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None
+        _cp       = current_price_override if current_price_override is not None else CURRENT_PRICE
+        return dict(
+            bullish=0, bearish=0, counts={},
+            bias="Choppy", strength=1, confidence=0,
+            quality="D", edge_score=0,
+            recommendation="WAIT", verdict="WAIT",
+            reasoning_chain=["Zone Consumed", "Scoring Skipped", "WAIT"],
+            why="Zone mitigated — all scoring skipped.",
+            plan={"action": "Wait for fresh zone.", "longs_allowed": "No", "shorts_allowed": "No", "warning": ""},
+            setup_stage="No Setup",
+            stage_next_step="Zone consumed — wait for fresh supply or demand zone.",
+            stage_entry_rule="No entry from consumed zone.",
+            stage_invalidation="Zone previously mitigated — invalid entry.",
+            market_direction="Neutral",
+            trade_opportunity="None",
+            opportunity_reason="Zone already reacted and is no longer valid for entry.",
+            entry_trigger=None, invalidation=None,
+            trade_plan={
+                "trade_plan": False,
+                "reason":     "Zone consumed — wait for fresh supply or demand zone.",
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": None,
+            },
+            current_price=_cp,
+            last_price_by_type={},
+            nearest_supply=None, nearest_demand=None,
+            structure_label="Zone Mitigated",
+            structure_class="Undefined",
+            structure_detail="Zone consumed — wait for fresh supply or demand zone.",
+            risk_label="Choppy", risk_detail="Zone consumed.", overextended=False,
+            zone_broken_active=False,
+            zone_mitigated_near=True,
+            mitigated_zone_price=_mz_price,
+        )
+    # ──────────────────────────────────────────────────────────────────────────
+
     bullish, bearish, counts = calculate_scores()
     bias, strength           = calculate_bias(bullish, bearish)
     confidence               = calculate_confidence(bullish, bearish)
@@ -1547,7 +1589,7 @@ def active_trade_field(trade, current_price):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT
+    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, ZONE_MITIGATED_FLAG
 
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -1599,27 +1641,32 @@ def webhook():
             ZONE_BROKEN_AT = None
             logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
 
-    # ── Zone Mitigation: early exit — skip entire engine ──
-    _chk_price = parsed_price if parsed_price is not None else CURRENT_PRICE
-    if ZONE_BROKEN_AT is None and _chk_price is not None:
-        _mz_near, _mz_price = is_near_mitigated_zone(_chk_price)
-        if _mz_near:
-            send_zone_mitigated_message(record, _mz_price)
-            logger.info(
-                "Zone mitigated early exit — price %.1f near consumed zone %.1f",
-                _chk_price, _mz_price or 0,
-            )
-            return jsonify({
-                "status":       "zone_mitigated",
-                "alert_type":   normalized,
-                "ticker":       record.get("ticker"),
-                "price":        _chk_price,
-                "mitigated_at": _mz_price,
-                "verdict":      "WAIT",
-                "zone_status":  "Consumed / Mitigated",
-                "action":       "Wait for fresh supply or demand zone.",
-                "reason":       "Zone already reacted and is no longer valid for entry.",
-            }), 200
+    # ── Zone Mitigation: clear flag when fresh structure forms ──────────────────
+    _STRUCTURE_RESET = frozenset((
+        "CHOCH SUPPLY", "CHOCH DEMAND", "BOS SUPPLY", "BOS DEMAND",
+        "MGC NEW SUPPLY ZONE", "MGC NEW DEMAND ZONE",
+        "MNQ NEW SUPPLY ZONE", "MNQ NEW DEMAND ZONE",
+    ))
+    if normalized in _STRUCTURE_RESET and ZONE_MITIGATED_FLAG:
+        ZONE_MITIGATED_FLAG = False
+        logger.info("Zone mitigation cleared — new structure alert: %s", normalized)
+
+    # ── Zone Mitigation: early exit — entire engine skipped ─────────────────
+    if ZONE_MITIGATED_FLAG and ZONE_BROKEN_AT is None:
+        _mz_price = MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None
+        send_zone_mitigated_message(record, _mz_price)
+        logger.info("Zone mitigated early exit — %s — scoring skipped", normalized)
+        return jsonify({
+            "status":       "zone_mitigated",
+            "alert_type":   normalized,
+            "ticker":       record.get("ticker"),
+            "price":        parsed_price or CURRENT_PRICE,
+            "mitigated_at": _mz_price,
+            "verdict":      "WAIT",
+            "zone_status":  "Consumed / Mitigated",
+            "action":       "Wait for fresh supply or demand zone.",
+            "reason":       "Zone already reacted and is no longer valid for entry.",
+        }), 200
 
     # ── Account Profile selection ──
     profile_name = str(data.get("profile") or DEFAULT_PROFILE).strip()
@@ -1729,11 +1776,12 @@ def get_alerts():
 
 @app.route("/clear", methods=["POST"])
 def clear_alerts():
-    global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES
+    global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES, ZONE_MITIGATED_FLAG
     ALERT_HISTORY.clear()
-    CURRENT_PRICE    = None
-    ZONE_BROKEN_AT   = None
-    MITIGATED_PRICES = []
+    CURRENT_PRICE       = None
+    ZONE_BROKEN_AT      = None
+    MITIGATED_PRICES    = []
+    ZONE_MITIGATED_FLAG = False
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
 
