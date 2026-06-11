@@ -48,6 +48,9 @@ def _log_incoming_request():
 ALERT_HISTORY    = deque(maxlen=100)
 CURRENT_PRICE    = None
 ACTIVE_TRADE     = None
+# Serialises the ENTER critical section (duplicate-check → place → record) so two
+# concurrent ENTER requests can never both open a live broker position.
+_ENTER_LOCK      = threading.Lock()
 LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
@@ -2595,47 +2598,50 @@ def _handle_command_alert(normalized, data, parsed_price):
         symbol    = instrument_of(normalized)
 
         # ── Live broker execution (gated; OFF by default) ──────────────────
+        # Hold _ENTER_LOCK across duplicate-check → place → record so two
+        # concurrent ENTERs can never both open a position.
         broker = None
-        if _broker_should_open(data):
-            if ACTIVE_TRADE:
-                return jsonify({"status": "error",
-                                "reason": "A trade is already active — close it before entering a new one."}), 409
-            broker = tv.place_bracket(direction, symbol, entry, stop, t1, t2, contracts)
-            if not broker.get("ok"):
-                # Keep tracking only if part of the order actually filled, so the
-                # operator can flatten it; a full rejection is never a success.
-                if broker.get("orders"):
-                    contracts = broker.get("contracts", contracts)
-                    ACTIVE_TRADE = {
-                        "direction": direction, "entry_price": entry,
-                        "stop_loss": stop, "target1": t1, "target2": t2,
-                        "contracts": contracts, "profile": profile,
-                        "symbol": symbol, "opened_at": now_utc().isoformat(),
-                        "t1_hit": False, "t2_hit": False, "status": "active",
-                        "broker": broker,
-                    }
-                return jsonify({"status": "error",
-                                "reason": ("Broker rejected the order — no live position opened."
-                                           if not broker.get("orders")
-                                           else "Broker order only partially filled — review the position."),
-                                "broker": broker}), 502
-            contracts = broker.get("contracts", contracts)
+        with _ENTER_LOCK:
+            if _broker_should_open(data):
+                if ACTIVE_TRADE:
+                    return jsonify({"status": "error",
+                                    "reason": "A trade is already active — close it before entering a new one."}), 409
+                broker = tv.place_bracket(direction, symbol, entry, stop, t1, t2, contracts)
+                if not broker.get("ok"):
+                    # Keep tracking only if part of the order actually filled, so the
+                    # operator can flatten it; a full rejection is never a success.
+                    if broker.get("orders"):
+                        contracts = broker.get("contracts", contracts)
+                        ACTIVE_TRADE = {
+                            "direction": direction, "entry_price": entry,
+                            "stop_loss": stop, "target1": t1, "target2": t2,
+                            "contracts": contracts, "profile": profile,
+                            "symbol": symbol, "opened_at": now_utc().isoformat(),
+                            "t1_hit": False, "t2_hit": False, "status": "active",
+                            "broker": broker,
+                        }
+                    return jsonify({"status": "error",
+                                    "reason": ("Broker rejected the order — no live position opened."
+                                               if not broker.get("orders")
+                                               else "Broker order only partially filled — review the position."),
+                                    "broker": broker}), 502
+                contracts = broker.get("contracts", contracts)
 
-        ACTIVE_TRADE = {
-            "direction":   direction,
-            "entry_price": entry,
-            "stop_loss":   stop,
-            "target1":     t1,
-            "target2":     t2,
-            "contracts":   contracts,
-            "profile":     profile,
-            "symbol":      symbol,
-            "opened_at":   now_utc().isoformat(),
-            "t1_hit":      False,
-            "t2_hit":      False,
-            "status":      "active",
-            "broker":      broker,
-        }
+            ACTIVE_TRADE = {
+                "direction":   direction,
+                "entry_price": entry,
+                "stop_loss":   stop,
+                "target1":     t1,
+                "target2":     t2,
+                "contracts":   contracts,
+                "profile":     profile,
+                "symbol":      symbol,
+                "opened_at":   now_utc().isoformat(),
+                "t1_hit":      False,
+                "t2_hit":      False,
+                "status":      "active",
+                "broker":      broker,
+            }
         content = (
             f"✅ **TRADE ENTERED — {direction.upper()}**\n"
             f"Entry `{entry:.1f}`  ·  Stop `{stop:.1f}`  ·  "
@@ -3189,45 +3195,48 @@ def enter_trade():
     symbol = instrument_of(profile)
 
     # ── Live broker execution (gated; OFF by default) ──────────────────────
+    # Hold _ENTER_LOCK across duplicate-check → place → record so two concurrent
+    # ENTERs can never both open a position.
     broker = None
-    if _broker_should_open(data):
-        if ACTIVE_TRADE:
-            return jsonify({"status": "error",
-                            "reason": "A trade is already active — close it before entering a new one."}), 409
-        broker = tv.place_bracket(direction, symbol, entry, stop, t1, t2, contracts)
-        if not broker.get("ok"):
-            if broker.get("orders"):
-                contracts = broker.get("contracts", contracts)
-                ACTIVE_TRADE = {
-                    "direction": direction, "entry_price": entry,
-                    "stop_loss": stop, "target1": t1, "target2": t2,
-                    "contracts": contracts, "profile": profile,
-                    "symbol": symbol, "opened_at": now_utc().isoformat(),
-                    "t1_hit": False, "t2_hit": False, "status": "active",
-                    "broker": broker,
-                }
-            return jsonify({"status": "error",
-                            "reason": ("Broker rejected the order — no live position opened."
-                                       if not broker.get("orders")
-                                       else "Broker order only partially filled — review the position."),
-                            "broker": broker}), 502
-        contracts = broker.get("contracts", contracts)
+    with _ENTER_LOCK:
+        if _broker_should_open(data):
+            if ACTIVE_TRADE:
+                return jsonify({"status": "error",
+                                "reason": "A trade is already active — close it before entering a new one."}), 409
+            broker = tv.place_bracket(direction, symbol, entry, stop, t1, t2, contracts)
+            if not broker.get("ok"):
+                if broker.get("orders"):
+                    contracts = broker.get("contracts", contracts)
+                    ACTIVE_TRADE = {
+                        "direction": direction, "entry_price": entry,
+                        "stop_loss": stop, "target1": t1, "target2": t2,
+                        "contracts": contracts, "profile": profile,
+                        "symbol": symbol, "opened_at": now_utc().isoformat(),
+                        "t1_hit": False, "t2_hit": False, "status": "active",
+                        "broker": broker,
+                    }
+                return jsonify({"status": "error",
+                                "reason": ("Broker rejected the order — no live position opened."
+                                           if not broker.get("orders")
+                                           else "Broker order only partially filled — review the position."),
+                                "broker": broker}), 502
+            contracts = broker.get("contracts", contracts)
 
-    ACTIVE_TRADE = {
-        "direction":   direction,
-        "entry_price": entry,
-        "stop_loss":   stop,
-        "target1":     t1,
-        "target2":     t2,
-        "contracts":   contracts,
-        "profile":     profile,
-        "symbol":      symbol,
-        "opened_at":   now_utc().isoformat(),
-        "t1_hit":      False,
-        "t2_hit":      False,
-        "status":      "active",
-        "broker":      broker,
-    }
+        ACTIVE_TRADE = {
+            "direction":   direction,
+            "entry_price": entry,
+            "stop_loss":   stop,
+            "target1":     t1,
+            "target2":     t2,
+            "contracts":   contracts,
+            "profile":     profile,
+            "symbol":      symbol,
+            "opened_at":   now_utc().isoformat(),
+            "t1_hit":      False,
+            "t2_hit":      False,
+            "status":      "active",
+            "broker":      broker,
+        }
 
     content = (
         f"✅ **TRADE ENTERED — {direction.upper()}**\n"

@@ -44,6 +44,18 @@ remains a tracking-only journal unless execution is explicitly turned on.
   **Why:** a surviving working stop/limit on a now-flat position can trigger and
   open a brand-new unintended position — counting either a list failure or a
   failed cancel as success is a real money-losing bug.
+- **Position checks must fail closed.** `_position_qty` returns `(qty, err)`;
+  on any `/position/list` error it returns `(None, err)` and `flatten` returns
+  `ok:False`. **Why:** coercing an API error to qty 0 made a transient failure
+  look like a flat account, so CLOSE skipped liquidation and reported success
+  while a real position stayed open.
+- **ENTER is a process-level critical section.** A module-level
+  `_ENTER_LOCK` (threading.Lock) is held across duplicate-check → `place_bracket`
+  → `ACTIVE_TRADE` set, in BOTH ENTER paths (command handler + `/enter`). The
+  `if ACTIVE_TRADE: 409` check inside the lock is the dedup. **Why:** the bare
+  check was outside any lock, so two concurrent ENTERs could both place orders
+  before either set ACTIVE_TRADE. (Distinct from tradovate's `_order_lock`; no
+  deadlock since they never nest the same lock.)
 - **Never log secrets.** `_redact()` masks exec_secret/password/sec/cid/token/
   accessToken/deviceId in the before_request body log; tradovate.py never logs
   the auth request body.

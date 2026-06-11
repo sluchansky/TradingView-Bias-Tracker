@@ -442,13 +442,19 @@ def _cancel_working(account_id, contract_id):
 
 
 def _position_qty(account_id, contract_id):
+    """Return ``(net_position_qty, err)``. On any list/API error returns
+    ``(None, err)`` so the caller can fail closed — an API failure must never be
+    mistaken for a flat position (that would skip liquidation on a CLOSE and
+    falsely report success while a real position is still open)."""
     d, err = _api("GET", "/position/list")
-    if err or not isinstance(d, list):
-        return 0
+    if err:
+        return None, err
+    if not isinstance(d, list):
+        return None, "unexpected /position/list response"
     for p in d:
         if p.get("accountId") == account_id and p.get("contractId") == contract_id:
-            return p.get("netPos", 0) or 0
-    return 0
+            return (p.get("netPos", 0) or 0), None
+    return 0, None
 
 
 # ── Public execution API ────────────────────────────────────────────────────
@@ -526,7 +532,12 @@ def flatten(sym):
                              "position NOT flattened; review the account manually",
                     "cancelled": cancelled, "cancel_failed": cancel_failed,
                     "contract": con["name"], "env": env_name()}
-        pos = _position_qty(acct["id"], con["id"])
+        pos, pos_err = _position_qty(acct["id"], con["id"])
+        if pos_err:
+            return {"ok": False,
+                    "error": f"could not verify open position ({pos_err}) — "
+                             "position may still be open; review the account manually",
+                    "cancelled": cancelled, "contract": con["name"], "env": env_name()}
         liquidated = False
         if pos:
             _, err = _api("POST", "/order/liquidateposition",
