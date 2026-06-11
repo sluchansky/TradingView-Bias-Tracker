@@ -2310,38 +2310,36 @@ def send_journal_discord_embed(entry):
         except (TypeError, ValueError):
             return "—"
 
-    chain_text = "\n↓\n".join(entry["reasoning_chain"]) if entry["reasoning_chain"] else "—"
-    if len(chain_text) > 900:
-        chain_text = chain_text[:900] + "…"
+    def _typed(t, lvl):
+        lvl_str = _lvl(lvl)
+        if t and lvl_str != "—":
+            return f"{t} @ {lvl_str}"
+        return _val(t) if t else lvl_str
+
+    score = entry.get("strict_score")
+    conf_score = f"{score}/100" if score not in (None, "") else _val(entry.get("confidence"))
+    why_text = entry.get("why_qualifies") or entry.get("why") or "—"
+    if len(why_text) > 1000:
+        why_text = why_text[:1000] + "…"
 
     embed = {
         "author":      {"name": f"{BOT_NAME} · {label} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
-        "description": f"**{label}**  ·  Score: **{entry.get('strict_score', 0)}/100**  ·  Verdict: **{entry['verdict']}**",
+        "description": f"**{label}**  ·  Verdict: **{entry['verdict']}**",
         "color":       color,
         "timestamp":   entry["datetime"],
         "fields": [
-            {"name": "📅 Date/Time",          "value": entry["datetime"][:19].replace("T", " ") + " UTC", "inline": True},
-            {"name": "📊 Symbol",              "value": entry["symbol"],              "inline": True},
+            {"name": "📊 Instrument",          "value": entry["symbol"],              "inline": True},
+            {"name": "🕐 Time",                "value": entry["datetime"][:19].replace("T", " ") + " UTC", "inline": True},
             {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
-            {"name": "📐 Entry Zone",          "value": _val(entry["entry_zone"]),    "inline": True},
-            {"name": "🛑 Stop Loss",           "value": _val(entry["stop_loss"]),     "inline": True},
-            {"name": "⚖️ R:R",                 "value": _val(entry.get("rr")),        "inline": True},
-            {"name": "🎯 Target 1",            "value": _val(entry["target1"]),       "inline": True},
-            {"name": "🎯 Target 2",            "value": _val(entry["target2"]),       "inline": True},
-            {"name": "💯 Score",               "value": f"{entry.get('strict_score', 0)}/100", "inline": True},
-            {"name": "🏗️ BOS",                 "value": _lvl(entry.get("bos_level")), "inline": True},
-            {"name": "🔀 CHOCH",               "value": _lvl(entry.get("choch_level")), "inline": True},
-            {"name": "🔥 Bias",                "value": entry["bias"],                "inline": True},
-            {"name": "🎯 Setup Stage",         "value": entry["setup_stage"],         "inline": True},
-            {"name": "💡 Confidence",          "value": entry["confidence"],          "inline": True},
-            {"name": "⚡ Edge Score",           "value": str(entry["edge_score"]),     "inline": True},
-            {"name": "🏗️ Market Structure",    "value": entry["market_structure"],    "inline": True},
-            {"name": "⚠️ Risk Zone",            "value": entry["risk_zone"],           "inline": True},
-            {"name": "📖 Reasoning Chain",     "value": f"```\n{chain_text}\n```",    "inline": False},
-            {"name": "💬 Why",                 "value": entry["why"] or "—",          "inline": False},
-            {"name": "📷 Screenshot",          "value": entry["screenshot"],          "inline": False},
-            {"name": "📋 Outcome",             "value": f"🟡 {entry['outcome']}",     "inline": True},
+            {"name": "🏗️ BOS Type",            "value": _typed(entry.get("bos_type"), entry.get("bos_level")), "inline": True},
+            {"name": "🔀 CHOCH Type",          "value": _typed(entry.get("choch_type"), entry.get("choch_level")), "inline": True},
+            {"name": "📐 Entry",               "value": _val(entry["entry_zone"]),    "inline": True},
+            {"name": "🛑 Stop",                "value": _val(entry["stop_loss"]),     "inline": True},
+            {"name": "🎯 TP1",                 "value": _val(entry["target1"]),       "inline": True},
+            {"name": "🎯 TP2",                 "value": _val(entry["target2"]),       "inline": True},
+            {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
+            {"name": "💬 Why the Trade Qualifies", "value": why_text,                 "inline": False},
         ],
         "footer": {"text": f"Journal Entry #{entry['id']}"},
     }
@@ -2412,8 +2410,10 @@ def create_journal_entry(record, a, sizing):
     lpt = a.get("last_price_by_type") or {}
     if direction == "Long":
         bos_level, choch_level = lpt.get("BOS DEMAND"), lpt.get("CHOCH DEMAND")
+        bos_type,  choch_type  = "Demand", "Bullish"
     else:
         bos_level, choch_level = lpt.get("BOS SUPPLY"), lpt.get("CHOCH SUPPLY")
+        bos_type,  choch_type  = "Supply", "Bearish"
 
     # Dedup key: instrument + direction + entry-zone low rounded to nearest integer.
     try:
@@ -2443,8 +2443,11 @@ def create_journal_entry(record, a, sizing):
         "target1":          tp.get("target1"),
         "target2":          tp.get("target2"),
         "rr":               tp.get("rr"),
+        "bos_type":         bos_type,
+        "choch_type":       choch_type,
         "bos_level":        bos_level,
         "choch_level":      choch_level,
+        "why_qualifies":    a.get("strict_reason") or a.get("why", "—"),
         "bias":             a.get("bias", "—"),
         "confidence":       f"{a.get('confidence', 0)}%",
         "edge_score":       a.get("edge_score", 0),
@@ -2914,6 +2917,12 @@ def add_journal_entry():
         "stop_loss":        data.get("stop") or data.get("stop_loss"),
         "target1":          data.get("target1"),
         "target2":          data.get("target2"),
+        "bos_type":         str(data.get("bos_type") or ("Demand" if direction == "Long" else "Supply")),
+        "choch_type":       str(data.get("choch_type") or ("Bullish" if direction == "Long" else "Bearish")),
+        "bos_level":        data.get("bos_level") or data.get("bos"),
+        "choch_level":      data.get("choch_level") or data.get("choch"),
+        "strict_score":     data.get("strict_score") or data.get("score"),
+        "why_qualifies":    str(data.get("why_qualifies") or data.get("why") or data.get("next_step") or "—"),
         "bias":             str(data.get("bias") or ("Bullish" if direction == "Long" else "Bearish")),
         "confidence":       conf_str,
         "edge_score":       data.get("edge_score", 0),
