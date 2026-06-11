@@ -209,8 +209,21 @@ def get_market_structure(current_price, last_price_by_type):
             structure = "Bearish Breakdown"
             parts.append(f"Price below CHOCH Demand ({choch_dem:.2f})")
     else:
-        structure = "Undefined"
-        parts.append("No CHOCH levels tracked yet")
+        # No CHOCH at all — check BOS levels for Attempt classification
+        if bos_dem and bos_sup:
+            structure = "Bullish Attempt" if current_price >= bos_dem else "Bearish Attempt"
+            parts.append(
+                f"BOS Demand ({bos_dem:.2f}) & Supply ({bos_sup:.2f}) detected — no CHOCH yet"
+            )
+        elif bos_dem:
+            structure = "Bullish Attempt"
+            parts.append(f"BOS Demand at {bos_dem:.2f} — no CHOCH yet. Monitoring for bullish confirmation.")
+        elif bos_sup:
+            structure = "Bearish Attempt"
+            parts.append(f"BOS Supply at {bos_sup:.2f} — no CHOCH yet. Monitoring for bearish confirmation.")
+        else:
+            structure = "Undefined"
+            parts.append("No CHOCH or BOS levels tracked yet")
     if bos_sup and current_price < bos_sup:
         parts.append(f"below BOS Supply ({bos_sup:.2f})")
     if bos_dem and current_price > bos_dem:
@@ -264,6 +277,8 @@ def classify_structure(structure_label):
         "Range Structure":   "Range",
         "Bearish Breakdown": "Reversal",
         "Bullish Breakout":  "Reversal",
+        "Bullish Attempt":   "Bullish Attempt",
+        "Bearish Attempt":   "Bearish Attempt",
         "Undefined":         "Undefined",
     }.get(structure_label, "Undefined")
 
@@ -283,6 +298,11 @@ def decision_engine(structure_label, risk_label, overextended,
             chain += ["No Alerts", "No Edge", "WAIT"]
         else:
             chain += ["No Structure Defined", "WAIT"]
+        return "WAIT", "WAIT", structure_class, chain
+
+    # ── Gate: Attempt structures (BOS fired, no CHOCH yet) → always WAIT ──
+    if structure_class in ("Bullish Attempt", "Bearish Attempt"):
+        chain += ["No CHOCH — Attempt Only", "Waiting for Confirmation", "WAIT"]
         return "WAIT", "WAIT", structure_class, chain
 
     # ── Gate: overextended price ──
@@ -365,9 +385,9 @@ def decision_engine(structure_label, risk_label, overextended,
 
 def get_market_direction(structure_label):
     """Map raw structure label → user-facing market direction."""
-    if structure_label in ("Bearish Structure", "Bearish Breakdown"):
+    if structure_label in ("Bearish Structure", "Bearish Breakdown", "Bearish Attempt"):
         return "Bearish"
-    if structure_label in ("Bullish Structure", "Bullish Breakout"):
+    if structure_label in ("Bullish Structure", "Bullish Breakout", "Bullish Attempt"):
         return "Bullish"
     if structure_label == "Range Structure":
         return "Range"
@@ -405,6 +425,22 @@ def get_trade_opportunity(market_direction, structure_label, risk_label,
         return none_opp("Price overextended from level. Wait for retracement.")
     if market_direction == "Neutral":
         return none_opp("No market structure defined yet.")
+
+    # ── 1b. Attempt structures: BOS confirmed but no CHOCH yet ──
+    if structure_label == "Bullish Attempt":
+        bos_dem = last_price_by_type.get("BOS DEMAND")
+        bos_str = f"${bos_dem:.2f}" if bos_dem else "—"
+        return ("Watch Demand",
+                f"BOS Demand ({bos_str}) confirmed — no CHOCH yet. Watch demand zone for hold.",
+                "Wait for CHOCH Demand + Zone Confirmed to trigger Long Ready.",
+                f"Price closes below BOS Demand level ({bos_str})")
+    if structure_label == "Bearish Attempt":
+        bos_sup = last_price_by_type.get("BOS SUPPLY")
+        bos_str = f"${bos_sup:.2f}" if bos_sup else "—"
+        return ("Watch Supply",
+                f"BOS Supply ({bos_str}) confirmed — no CHOCH yet. Watch supply zone for rejection.",
+                "Wait for CHOCH Supply + Zone Confirmed to trigger Short Ready.",
+                f"Price closes above BOS Supply level ({bos_str})")
 
     # ── 2. Breakout: price burst through a CHOCH level ──
     if structure_label == "Bullish Breakout":
@@ -1268,6 +1304,19 @@ def full_analysis(current_price_override=None):
     mitigated_zone_price = mz_sup_price or mz_dem_price
     if zone_mitigated_near:
         confidence = max(0, confidence - 15)
+        # Block READY signals — demote to Watch with consumed-zone message
+        if setup_stage in READY_STAGES:
+            if "Long" in setup_stage:
+                setup_stage        = "Watch Demand"
+                stage_next_step    = "Zone consumed — wait for fresh demand."
+                stage_entry_rule   = "No entry from consumed zone."
+                stage_invalidation = f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
+            else:
+                setup_stage        = "Watch Supply"
+                stage_next_step    = "Zone consumed — wait for fresh supply."
+                stage_entry_rule   = "No entry from consumed zone."
+                stage_invalidation = f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
+            verdict = "WAIT"
 
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
