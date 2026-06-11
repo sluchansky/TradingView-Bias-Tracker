@@ -30,6 +30,11 @@ ALERT_TYPES = {
     "MGC ZONE MITIGATED":        {"side": "neutral", "score": 0},
     "MNQ ZONE BROKEN":           {"side": "neutral", "score": 0},
     "MNQ ZONE MITIGATED":        {"side": "neutral", "score": 0},
+    # Stage 4 triggers — 5m confirmation candle closed (neutral, no score)
+    "MGC BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
+    "MGC BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
+    "MNQ BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
+    "MNQ BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -59,10 +64,7 @@ TIME_WINDOWS                = {"15m": 15, "60m": 60, "120m": 120}
 # ── Trading Journal ───────────────────────────────────────────────────────────
 JOURNAL        = []          # list of journal dicts, newest-first, max 500
 JOURNAL_KEYS   = set()       # dedup: (ticker, setup_stage, entry_zone_rounded)
-JOURNAL_STAGES = frozenset((
-    "Long Setup Forming", "Short Setup Forming",
-    "Long Ready",          "Short Ready",
-))
+JOURNAL_STAGES = frozenset(("Setup Forming", "Confirmation Candle", "Trade Ready"))
 
 
 # ---------------------------------------------------------------------------
@@ -907,13 +909,15 @@ def _direction_opportunity_fields(market_direction, trade_opportunity,
 
 
 def _setup_stage_fields(setup_stage, next_step, entry_rule, stage_invalidation):
-    """Return Discord embed fields for Setup Stage section (v10). Max 3 fields."""
-    emoji = _STAGE_EMOJI.get(setup_stage, "⭕")
-    rules = f"**Entry:** {entry_rule}\n**Invalidation:** {stage_invalidation}"
+    """Return Discord embed fields for Setup Stage section. Max 3 fields."""
+    emoji  = _STAGE_EMOJI.get(setup_stage, "⭕")
+    number = _STAGE_NUMBER.get(setup_stage)
+    label  = f"Stage {number} — {setup_stage}" if number else setup_stage
+    rules  = f"**Entry:** {entry_rule}\n**Invalidation:** {stage_invalidation}"
     return [
-        {"name": "🎯  Setup Stage", "value": f"{emoji} **{setup_stage}**", "inline": True},
-        {"name": "➡️  Next Step",   "value": next_step,                    "inline": False},
-        {"name": "📋  Rules",       "value": rules,                        "inline": False},
+        {"name": "🎯  Setup Stage", "value": f"{emoji} **{label}**", "inline": True},
+        {"name": "➡️  Next Step",   "value": next_step,              "inline": False},
+        {"name": "📋  Rules",       "value": rules,                  "inline": False},
     ]
 
 
@@ -1175,42 +1179,48 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
 # ---------------------------------------------------------------------------
 
 _STAGE_EMOJI = {
-    "No Setup":            "⭕",
-    "Watch Supply":        "👁️",
-    "Watch Demand":        "👁️",
-    "Short Setup Forming": "⚠️",
-    "Long Setup Forming":  "⚠️",
-    "Short Ready":         "🔴",
-    "Long Ready":          "🟢",
+    "Watching":            "👁️",
+    "Setup Forming":       "⚠️",
+    "Confirmation Candle": "🕯️",
+    "Trade Ready":         "✅",
 }
 
-READY_STAGES = ("Short Ready", "Long Ready")
+_STAGE_NUMBER = {
+    "Watching":            1,
+    "Setup Forming":       2,
+    "Confirmation Candle": 3,
+    "Trade Ready":         4,
+}
+
+READY_STAGES = ("Confirmation Candle", "Trade Ready")
 
 
 def get_setup_stage(current_price, nearest_supply, nearest_demand,
                     bullish, bearish, alert_history):
     """
-    Determine the current setup stage (v10).
-    Returns (stage, next_step, entry_rule, invalidation_note).
+    Determine the current setup stage (8-stage system).
+    Returns (stage, next_step, entry_rule, invalidation, direction).
 
-    Stages (in priority order):
-      Short Ready        — supply confirmed + all forming conditions met
-      Long Ready         — demand confirmed + all forming conditions met
-      Short Setup Forming— at supply + bearish dominant + CHOCH/BOS Supply recent
-      Long Setup Forming — at demand + bullish dominant + CHOCH/BOS Demand recent
-      Watch Supply       — price within 0.75% of supply
-      Watch Demand       — price within 0.75% of demand
-      No Setup           — mid-range / no proximity
+    Stage progression:
+      4 — Trade Ready         — 5m confirmation candle closed, enter now
+      3 — Confirmation Candle — zone confirmed, watching for 5m candle close
+      2 — Setup Forming       — at zone + CHOCH/BOS, waiting for zone confirmation
+      1 — Watching            — monitoring; price mid-range or near zone only
+    direction: "Long", "Short", or None
     """
     if current_price is None:
-        return ("No Setup", "Waiting for price data.", "No entry.", "N/A")
+        return ("Watching", "Waiting for price data.", "No entry.", "N/A", None)
 
     # ── Recent alert window: last 5 alerts ──
     recent = [a["alert_type"] for a in list(alert_history)[-5:]]
-    has_choch_bos_supply = any(t in ("CHOCH SUPPLY", "BOS SUPPLY")          for t in recent)
-    has_choch_bos_demand = any(t in ("CHOCH DEMAND", "BOS DEMAND")          for t in recent)
-    has_supply_confirmed = "MGC SUPPLY ZONE CONFIRMED"                       in recent
-    has_demand_confirmed = "MGC DEMAND ZONE CONFIRMED"                       in recent
+    has_choch_bos_supply     = any(t in ("CHOCH SUPPLY", "BOS SUPPLY") for t in recent)
+    has_choch_bos_demand     = any(t in ("CHOCH DEMAND", "BOS DEMAND") for t in recent)
+    has_supply_confirmed     = "MGC SUPPLY ZONE CONFIRMED"              in recent
+    has_demand_confirmed     = "MGC DEMAND ZONE CONFIRMED"              in recent
+    has_bullish_confirmation = any(t in ("MGC BULLISH CONFIRMATION", "MNQ BULLISH CONFIRMATION")
+                                   for t in recent)
+    has_bearish_confirmation = any(t in ("MGC BEARISH CONFIRMATION", "MNQ BEARISH CONFIRMATION")
+                                   for t in recent)
 
     # ── Proximity (0.75%) ──
     def dist(a, b):
@@ -1225,66 +1235,75 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
     sup_str = f"${nearest_supply:.2f}" if nearest_supply else "—"
     dem_str = f"${nearest_demand:.2f}" if nearest_demand else "—"
 
-    # ── SHORT READY ──
+    # ── STAGE 4: TRADE READY (Short) — bearish confirmation candle closed ──
+    if (at_supply and bearish_dominant and has_choch_bos_supply
+            and has_supply_confirmed and has_bearish_confirmation):
+        return (
+            "Trade Ready",
+            "5m bearish candle confirmed. Enter short now.",
+            "Enter short on close of 5m bearish confirmation candle.",
+            f"Close above nearest supply ({sup_str}).",
+            "Short",
+        )
+
+    # ── STAGE 4: TRADE READY (Long) — bullish confirmation candle closed ──
+    if (at_demand and bullish_dominant and has_choch_bos_demand
+            and has_demand_confirmed and has_bullish_confirmation):
+        return (
+            "Trade Ready",
+            "5m bullish candle confirmed. Enter long now.",
+            "Enter long on close of 5m bullish confirmation candle.",
+            f"Close below nearest demand ({dem_str}).",
+            "Long",
+        )
+
+    # ── STAGE 3: CONFIRMATION CANDLE (Short) — supply confirmed, watching for 5m close ──
     if at_supply and bearish_dominant and has_choch_bos_supply and has_supply_confirmed:
         return (
-            "Short Ready",
-            "Supply confirmed. Enter short on next 5m bearish close.",
+            "Confirmation Candle",
+            "Supply confirmed. Wait for 5m bearish close below entry zone.",
             "5m bearish candle closes below entry zone. Enter on close.",
             f"Close above nearest supply ({sup_str}).",
+            "Short",
         )
 
-    # ── LONG READY ──
+    # ── STAGE 3: CONFIRMATION CANDLE (Long) — demand confirmed, watching for 5m close ──
     if at_demand and bullish_dominant and has_choch_bos_demand and has_demand_confirmed:
         return (
-            "Long Ready",
-            "Demand confirmed. Enter long on next 5m bullish close.",
+            "Confirmation Candle",
+            "Demand confirmed. Wait for 5m bullish close above entry zone.",
             "5m bullish candle closes above entry zone. Enter on close.",
             f"Close below nearest demand ({dem_str}).",
+            "Long",
         )
 
-    # ── SHORT SETUP FORMING ──
+    # ── STAGE 2: SETUP FORMING (Short) — at supply, structure building ──
     if at_supply and bearish_dominant and has_choch_bos_supply:
         return (
-            "Short Setup Forming",
-            "Wait for 5m rejection candle from supply.",
-            "Do not enter until confirmation candle closes.",
+            "Setup Forming",
+            "Wait for MGC Supply Zone Confirmed alert.",
+            "Do not enter until zone is confirmed.",
             f"Close above nearest supply ({sup_str}).",
+            "Short",
         )
 
-    # ── LONG SETUP FORMING ──
+    # ── STAGE 2: SETUP FORMING (Long) — at demand, structure building ──
     if at_demand and bullish_dominant and has_choch_bos_demand:
         return (
-            "Long Setup Forming",
-            "Wait for 5m bounce candle from demand.",
-            "Do not enter until confirmation candle closes.",
+            "Setup Forming",
+            "Wait for MGC Demand Zone Confirmed alert.",
+            "Do not enter until zone is confirmed.",
             f"Close below nearest demand ({dem_str}).",
+            "Long",
         )
 
-    # ── WATCH SUPPLY ──
-    if at_supply:
-        return (
-            "Watch Supply",
-            "Monitor price action at supply. Watch for bearish structure to form.",
-            "No entry — observation only.",
-            "N/A",
-        )
-
-    # ── WATCH DEMAND ──
-    if at_demand:
-        return (
-            "Watch Demand",
-            "Monitor price action at demand. Watch for bullish structure to form.",
-            "No entry — observation only.",
-            "N/A",
-        )
-
-    # ── NO SETUP ──
+    # ── STAGE 1: WATCHING ──
     return (
-        "No Setup",
-        "Price mid-range. Wait for proximity to a key level.",
-        "No entry.",
+        "Watching",
+        "Monitoring price action. Wait for proximity to a key level.",
+        "No entry — observation only.",
         "N/A",
+        None,
     )
 
 
@@ -1428,20 +1447,18 @@ def full_analysis(current_price_override=None):
             "rr":         None, "direction": None,
         }
 
-    setup_stage, stage_next_step, stage_entry_rule, stage_invalidation = get_setup_stage(
+    setup_stage, stage_next_step, stage_entry_rule, stage_invalidation, stage_direction = get_setup_stage(
         current_price, nearest_supply, nearest_demand, bullish, bearish, ALERT_HISTORY
     )
 
     # ── Map final verdict: WATCH / LONG READY / SHORT READY / WAIT ──────────
     if trade_plan["trade_plan"]:
-        if setup_stage == "Long Ready":
-            verdict = "LONG READY"
-        elif setup_stage == "Short Ready":
-            verdict = "SHORT READY"
-        elif setup_stage in ("Long Setup Forming", "Short Setup Forming"):
+        if setup_stage == "Trade Ready":
+            verdict = "LONG READY" if stage_direction == "Long" else "SHORT READY"
+        elif setup_stage in ("Setup Forming", "Confirmation Candle"):
             verdict = "WATCH"
         else:
-            # Plan generated but no matching stage — suppress the plan
+            # Plan generated but no active setup stage — suppress the plan
             verdict = "WAIT"
             trade_plan = {
                 "trade_plan": False,
@@ -1457,7 +1474,8 @@ def full_analysis(current_price_override=None):
     zone_broken_active = ZONE_BROKEN_AT is not None
     if zone_broken_active:
         confidence         = max(0, confidence - 30)
-        setup_stage        = "No Setup"
+        setup_stage        = "Watching"
+        stage_direction    = None
         stage_next_step    = "Wait for structure to rebuild after zone break"
         stage_entry_rule   = "—"
         stage_invalidation = "Structure invalidated — zone broken"
@@ -1484,7 +1502,8 @@ def full_analysis(current_price_override=None):
             "target1":    None, "target2": None,
             "rr":         None, "direction": None,
         }
-        setup_stage        = "No Setup"
+        setup_stage        = "Watching"
+        stage_direction    = None
         stage_next_step    = "Zone consumed — wait for fresh supply or demand zone."
         stage_entry_rule   = "No entry from consumed zone."
         stage_invalidation = (
@@ -1503,6 +1522,7 @@ def full_analysis(current_price_override=None):
         reasoning_chain=reasoning_chain, why=why, plan=plan,
         setup_stage=setup_stage, stage_next_step=stage_next_step,
         stage_entry_rule=stage_entry_rule, stage_invalidation=stage_invalidation,
+        stage_direction=stage_direction,
         market_direction=market_direction,
         trade_opportunity=trade_opportunity,
         opportunity_reason=opportunity_reason,
@@ -1667,7 +1687,9 @@ def create_journal_entry(record, a, sizing):
     ticker     = record.get("ticker") or "MGC"
     tp         = a.get("trade_plan") or {}
     entry_zone = tp.get("entry_zone")
-    direction  = "Long" if "Long" in setup_stage else "Short"
+    direction  = (a.get("stage_direction")
+                  or tp.get("direction")
+                  or a.get("market_direction", "Long"))
 
     # Dedup key: ticker + stage + entry zone rounded to nearest integer
     try:
@@ -1724,9 +1746,9 @@ def active_trade_field(trade, current_price):
 
     status = trade.get("status", "active")
     state_str = {
-        "active":    "🟢  OPEN",
-        "breakeven": "🟡  BREAKEVEN ACTIVE",
-    }.get(status, "🟢  OPEN")
+        "active":    "🟢  Stage 5 — Entered",
+        "breakeven": "🟡  Stage 6 — T1 Hit (Breakeven Active)",
+    }.get(status, "🟢  Stage 5 — Entered")
 
     if status == "active":
         next_action = f"Wait for T1 at `{trade['target1']:.1f}`"
@@ -2073,6 +2095,7 @@ def status():
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
         "setup_stage":         a["setup_stage"],
+        "stage_direction":     a["stage_direction"],
         "stage_next_step":     a["stage_next_step"],
         "stage_entry_rule":    a["stage_entry_rule"],
         "stage_invalidation":  a["stage_invalidation"],
