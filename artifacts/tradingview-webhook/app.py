@@ -148,7 +148,7 @@ def _discord_url(hint: str = "") -> str:
     return DISCORD_WEBHOOK_URL
 
 
-HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 900))  # seconds (default 15 min)
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (default 5 min)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 
 
