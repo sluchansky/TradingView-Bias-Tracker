@@ -85,6 +85,7 @@ def _discord_url(hint: str = "") -> str:
 
 
 HEARTBEAT_INTERVAL = 3600  # seconds
+EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 
 
 def _send_heartbeat():
@@ -139,6 +140,120 @@ def _heartbeat_loop():
     """Send heartbeat now then reschedule every HEARTBEAT_INTERVAL seconds."""
     _send_heartbeat()
     threading.Timer(HEARTBEAT_INTERVAL, _heartbeat_loop).start()
+
+
+# ── End-of-day summary ────────────────────────────────────────────────────────
+
+import re as _re
+
+def _compute_eod_stats():
+    """Derive today's trading stats entirely from JOURNAL."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    entries = [e for e in JOURNAL if e.get("datetime", "")[:10] == today]
+
+    wins   = [e for e in entries if e.get("outcome", "").startswith("Win")]
+    losses = [e for e in entries if e.get("outcome", "").startswith("Loss")]
+    trades_entered = len(wins) + len(losses)
+
+    # Net P&L — prefer stored pnl_dollars, else parse from outcome string
+    pnl_total, has_pnl = 0.0, False
+    for e in entries:
+        if "pnl_dollars" in e:
+            pnl_total += e["pnl_dollars"]
+            has_pnl = True
+        else:
+            outcome = e.get("outcome", "")
+            m = _re.search(r'\+\$?([\d,]+)|-\$?([\d,]+)', outcome)
+            if m:
+                if m.group(1):
+                    pnl_total += float(m.group(1).replace(",", ""))
+                    has_pnl = True
+                elif m.group(2):
+                    pnl_total -= float(m.group(2).replace(",", ""))
+                    has_pnl = True
+
+    # Best = highest edge_score win; fallback any entry
+    best  = max(wins,    key=lambda e: e.get("edge_score", 0), default=None) or \
+            max(entries, key=lambda e: e.get("edge_score", 0), default=None)
+    # Worst = most recent loss; fallback lowest edge_score closed entry
+    closed = [e for e in entries if not e.get("outcome","").startswith("Pending")]
+    worst = losses[0] if losses else \
+            (min(closed, key=lambda e: e.get("edge_score", 99), default=None))
+
+    return {
+        "date":           today,
+        "trades_flagged": len(entries),
+        "trades_entered": trades_entered,
+        "wins":           len(wins),
+        "losses":         len(losses),
+        "net_pnl":        round(pnl_total, 2) if has_pnl else None,
+        "best":           best,
+        "worst":          worst,
+    }
+
+
+def _fmt_setup(entry):
+    if not entry:
+        return "—"
+    return (
+        f"{entry.get('symbol','—')} {entry.get('direction','—')}  ·  "
+        f"Edge {entry.get('edge_score','—')}  ·  {entry.get('outcome','—')}"
+    )
+
+
+def _send_eod_summary():
+    """Post the end-of-day summary embed to all configured Discord channels."""
+    stats = _compute_eod_stats()
+    now   = datetime.now(timezone.utc)
+
+    pnl_val = stats["net_pnl"]
+    if pnl_val is None:
+        pnl_str, color = "—", 0x95A5A6
+    elif pnl_val >= 0:
+        pnl_str, color = f"+${pnl_val:,.0f}", 0x2ECC71
+    else:
+        pnl_str, color = f"-${abs(pnl_val):,.0f}", 0xE74C3C
+
+    embed = {
+        "color":       color,
+        "author":      {"name": BOT_NAME},
+        "title":       "📊 End of Day Summary",
+        "description": now.strftime("%A, %B %-d, %Y"),
+        "fields": [
+            {"name": "Trades flagged",  "value": str(stats["trades_flagged"]), "inline": True},
+            {"name": "Trades entered",  "value": str(stats["trades_entered"]), "inline": True},
+            {"name": "\u200b",          "value": "\u200b",                     "inline": True},
+            {"name": "Wins ✅",         "value": str(stats["wins"]),           "inline": True},
+            {"name": "Losses ❌",       "value": str(stats["losses"]),         "inline": True},
+            {"name": "Net P&L",         "value": f"**{pnl_str}**",            "inline": True},
+            {"name": "Best setup",      "value": _fmt_setup(stats["best"]),    "inline": False},
+            {"name": "Worst setup",     "value": _fmt_setup(stats["worst"]),   "inline": False},
+        ],
+        "footer": {"text": now.strftime("EOD  ·  %Y-%m-%d %H:%M UTC")},
+    }
+
+    for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL, DISCORD_JOURNAL_WEBHOOK_URL]):
+        try:
+            requests.post(url, json={"embeds": [embed]}, timeout=5)
+        except Exception:
+            pass
+    logger.info("EOD summary sent.")
+
+
+def _schedule_eod():
+    """Schedule the EOD summary to fire daily at EOD_HOUR_UTC:00 UTC."""
+    now  = datetime.now(timezone.utc)
+    fire = now.replace(hour=EOD_HOUR_UTC, minute=0, second=0, microsecond=0)
+    if fire <= now:
+        fire += timedelta(days=1)
+    delay = (fire - now).total_seconds()
+    logger.info("EOD summary scheduled for %s UTC (in %.0fs).", fire.strftime("%H:%M"), delay)
+
+    def _run():
+        _send_eod_summary()
+        _schedule_eod()
+
+    threading.Timer(delay, _run).start()
 
 
 TIME_WINDOWS                = {"15m": 15, "60m": 60, "120m": 120}
@@ -1771,7 +1886,7 @@ def send_journal_discord_embed(entry):
         logger.error("Journal Discord post error: %s", exc)
 
 
-def _update_journal_outcome(new_outcome):
+def _update_journal_outcome(new_outcome, pnl_dollars=None):
     """Update the most recent journal entry that is still Pending or at T1.
 
     Matches the first entry whose outcome is 'Pending' or starts with 'T1 Hit'.
@@ -1782,6 +1897,8 @@ def _update_journal_outcome(new_outcome):
         o = entry.get("outcome", "")
         if o == "Pending" or o.startswith("T1 Hit"):
             entry["outcome"] = new_outcome
+            if pnl_dollars is not None:
+                entry["pnl_dollars"] = round(pnl_dollars, 2)
             logger.info("Journal #%d outcome → %s", entry["id"], new_outcome)
             # Post a short update line to the journal channel
             if DISCORD_JOURNAL_WEBHOOK_URL:
@@ -2027,11 +2144,13 @@ def webhook():
                 ACTIVE_TRADE["suggested_stop"] = ACTIVE_TRADE["entry_price"]
                 _update_journal_outcome("T1 Hit — Partial ⚠️")
             elif event == "T2_HIT":
-                _update_journal_outcome("Win — T2 Hit ✅")
+                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
+                _update_journal_outcome("Win — T2 Hit ✅", pnl_dollars=d_pnl)
                 ACTIVE_TRADE = None
                 break
             elif event == "STOP_HIT":
-                _update_journal_outcome("Loss — Stop Hit ❌")
+                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
+                _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
                 ACTIVE_TRADE = None
                 break
         if ACTIVE_TRADE:
@@ -2414,7 +2533,10 @@ def close_trade():
         outcome_str = "Closed Manually"
 
     ACTIVE_TRADE = None
-    _update_journal_outcome(outcome_str)
+    _update_journal_outcome(
+        outcome_str,
+        pnl_dollars=dollar_pnl if exit_price is not None else None,
+    )
 
     try:
         _url = _discord_url(closed.get("profile", ""))
@@ -2446,6 +2568,13 @@ def get_trade():
     return jsonify(result), 200
 
 
+@app.route("/eod", methods=["POST"])
+def eod_trigger():
+    """Manually trigger the end-of-day summary."""
+    _send_eod_summary()
+    return jsonify({"status": "sent"}), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
@@ -2468,4 +2597,5 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every hour
+    _schedule_eod()                               # schedule daily EOD summary
     app.run(host="0.0.0.0", port=port, debug=False)
