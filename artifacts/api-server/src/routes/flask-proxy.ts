@@ -60,6 +60,7 @@ router.all(
     "/journal",
     "/journal/",
     "/eod",
+    "/dashboard",
   ],
   proxyToFlask,
 );

@@ -2696,6 +2696,236 @@ def eod_trigger():
     return jsonify({"status": "sent"}), 200
 
 
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>AI Trading Partner</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0a0f;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;padding:16px}
+  h1{font-size:18px;font-weight:700;text-align:center;padding:12px 0 18px;color:#a0a8ff;letter-spacing:.5px}
+  /* Status card */
+  #status-card{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:18px;margin-bottom:18px;min-height:100px}
+  #status-label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:8px}
+  #trade-info{font-size:22px;font-weight:700}
+  #trade-detail{font-size:13px;color:#888;margin-top:6px;line-height:1.6}
+  #pnl{font-size:26px;font-weight:800;margin-top:8px}
+  .pnl-pos{color:#22c55e} .pnl-neg{color:#ef4444} .pnl-flat{color:#888}
+  /* Tabs */
+  .tabs{display:flex;gap:8px;margin-bottom:14px}
+  .tab{flex:1;padding:12px;border-radius:12px;border:2px solid #1e1e32;background:#12121e;color:#888;font-size:15px;font-weight:600;cursor:pointer;text-align:center;transition:all .15s}
+  .tab.active{border-color:#a0a8ff;color:#a0a8ff;background:#16162a}
+  /* Direction toggle */
+  .dir-row{display:flex;gap:8px;margin-bottom:16px}
+  .dir-btn{flex:1;padding:14px;border-radius:12px;border:2px solid #1e1e32;background:#12121e;font-size:16px;font-weight:700;cursor:pointer;transition:all .15s;color:#888}
+  .dir-btn.long.active{border-color:#22c55e;color:#22c55e;background:#0d1f14}
+  .dir-btn.short.active{border-color:#ef4444;color:#ef4444;background:#1f0d0d}
+  /* Overrides */
+  details{margin-bottom:16px}
+  summary{font-size:13px;color:#555;cursor:pointer;padding:6px 0;user-select:none;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:'▶ ';font-size:10px}
+  details[open] summary::before{content:'▼ '}
+  .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+  .field{display:flex;flex-direction:column;gap:4px}
+  .field label{font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.5px}
+  .field input{background:#0d0d18;border:1px solid #1e1e32;border-radius:8px;color:#e8e8f0;font-size:15px;padding:10px 12px;width:100%;outline:none}
+  .field input:focus{border-color:#a0a8ff}
+  /* Buttons */
+  .btn{width:100%;padding:18px;border-radius:14px;border:none;font-size:18px;font-weight:800;cursor:pointer;margin-bottom:10px;transition:all .1s;letter-spacing:.3px}
+  .btn:active{transform:scale(.97)}
+  .btn-enter{background:#22c55e;color:#fff}
+  .btn-enter.short{background:#ef4444}
+  .btn-close{background:#f59e0b;color:#000}
+  .btn-be{background:#1e1e32;color:#a0a8ff;border:2px solid #a0a8ff;font-size:15px;padding:14px}
+  .btn-eod{background:#1e1e32;color:#888;border:1px solid #2a2a40;font-size:13px;padding:12px;margin-top:6px}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  /* Toast */
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1e1e32;color:#e8e8f0;padding:12px 24px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap}
+  #toast.show{opacity:1}
+  #refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-right:6px;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
+</head>
+<body>
+<h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
+
+<!-- Status card -->
+<div id="status-card">
+  <div id="status-label">Current Status</div>
+  <div id="trade-info">Loading…</div>
+  <div id="trade-detail"></div>
+  <div id="pnl"></div>
+</div>
+
+<!-- Symbol tabs -->
+<div class="tabs">
+  <div class="tab active" onclick="setSymbol('MGC')">MGC (Gold)</div>
+  <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
+</div>
+
+<!-- Direction -->
+<div class="dir-row">
+  <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG</div>
+  <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT</div>
+</div>
+
+<!-- Optional overrides -->
+<details>
+  <summary>Override entry levels (optional)</summary>
+  <div class="fields">
+    <div class="field"><label>Entry Price</label><input id="f-entry" type="number" step="0.1" placeholder="auto"></div>
+    <div class="field"><label>Stop Loss</label><input id="f-stop" type="number" step="0.1" placeholder="auto"></div>
+    <div class="field"><label>Target 1</label><input id="f-t1" type="number" step="0.1" placeholder="auto"></div>
+    <div class="field"><label>Target 2</label><input id="f-t2" type="number" step="0.1" placeholder="auto"></div>
+    <div class="field"><label>Contracts</label><input id="f-contracts" type="number" min="1" placeholder="1"></div>
+  </div>
+</details>
+
+<!-- Action buttons -->
+<button class="btn btn-enter" id="btn-enter" onclick="enterTrade()">📈 ENTER LONG</button>
+<button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
+<button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
+<button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
+
+<div id="toast"></div>
+
+<script>
+const BASE = '/api';
+let sym = 'MGC', dir = 'Long', activeTrade = null;
+
+function setSymbol(s) {
+  sym = s;
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', (i===0&&s==='MGC')||(i===1&&s==='MNQ')));
+  updateEnterBtn();
+}
+function setDir(d) {
+  dir = d;
+  document.querySelectorAll('.dir-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelector('.dir-btn.'+(d==='Long'?'long':'short')).classList.add('active');
+  updateEnterBtn();
+}
+function updateEnterBtn() {
+  const b = document.getElementById('btn-enter');
+  b.textContent = dir==='Long' ? '📈 ENTER LONG' : '📉 ENTER SHORT';
+  b.className = 'btn btn-enter' + (dir==='Short'?' short':'');
+}
+function toast(msg, ok=true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = ok ? '#0d1f14' : '#1f0d0d';
+  t.style.borderLeft = '3px solid ' + (ok ? '#22c55e' : '#ef4444');
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2800);
+}
+
+async function api(path, body=null) {
+  const opts = { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'} };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(BASE+path, opts);
+  return r.json();
+}
+
+async function enterTrade() {
+  const body = {
+    alert_type: sym+' ENTER',
+    ticker: sym+'1!',
+    direction: dir,
+    profile: sym+' Standard',
+  };
+  const e = document.getElementById('f-entry').value;
+  const s = document.getElementById('f-stop').value;
+  const t1 = document.getElementById('f-t1').value;
+  const t2 = document.getElementById('f-t2').value;
+  const c  = document.getElementById('f-contracts').value;
+  if (e)  body.entry     = parseFloat(e);
+  if (s)  body.stop      = parseFloat(s);
+  if (t1) body.t1        = parseFloat(t1);
+  if (t2) body.t2        = parseFloat(t2);
+  if (c)  body.contracts = parseInt(c);
+  try {
+    const d = await api('/webhook', body);
+    if (d.status === 'entered') { toast('✅ Trade entered!'); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function closeTrade() {
+  try {
+    const d = await api('/close');
+    if (d.status === 'closed') { toast('🏁 Trade closed'); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function breakeven() {
+  try {
+    const d = await api('/breakeven', {});
+    toast('⚖️ Stop moved to breakeven');
+    refresh();
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function sendEod() {
+  try {
+    await api('/eod', {});
+    toast('📊 EOD summary sent to Discord');
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function refresh() {
+  try {
+    const d = await api('/trade');
+    const card = document.getElementById('status-card');
+    const info = document.getElementById('trade-info');
+    const detail = document.getElementById('trade-detail');
+    const pnl = document.getElementById('pnl');
+    const btnClose = document.getElementById('btn-close');
+    const btnBe = document.getElementById('btn-be');
+
+    if (d.status === 'no_active_trade') {
+      activeTrade = null;
+      card.style.borderColor = '#1e1e32';
+      info.textContent = 'No Active Trade';
+      info.style.color = '#555';
+      detail.textContent = '';
+      pnl.textContent = '';
+      btnClose.style.display = 'none';
+      btnBe.style.display = 'none';
+    } else {
+      activeTrade = d;
+      const isLong = d.direction === 'Long';
+      card.style.borderColor = isLong ? '#22c55e' : '#ef4444';
+      info.style.color = isLong ? '#22c55e' : '#ef4444';
+      info.textContent = (isLong?'📈':'📉') + ' ' + d.direction + ' — ' + (d.profile||'').split(' ')[0];
+      detail.innerHTML =
+        'Entry <b>'+d.entry_price+'</b> &nbsp;·&nbsp; Stop <b>'+d.stop_loss+'</b><br>' +
+        'T1 <b>'+d.target1+'</b> &nbsp;·&nbsp; T2 <b>'+d.target2+'</b> &nbsp;·&nbsp; '+d.contracts+'x';
+      if (d.pnl_dollars !== undefined) {
+        const v = d.pnl_dollars;
+        const s = v >= 0 ? '+$'+Math.abs(v).toFixed(0) : '-$'+Math.abs(v).toFixed(0);
+        pnl.textContent = s;
+        pnl.className = 'pnl ' + (v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : 'pnl-flat');
+      }
+      btnClose.style.display = 'block';
+      btnBe.style.display = d.t1_hit ? 'block' : 'none';
+    }
+  } catch(e) {}
+}
+
+// Poll every 3 seconds
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
