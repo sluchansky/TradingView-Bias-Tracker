@@ -744,8 +744,15 @@ def build_why(bias, confidence, bullish, bearish, counts,
                 f"with minimal opposition. Trend continuation likely. Score {score_dom} vs {score_opp}.")
     if verdict in ("SHORT BIAS", "LONG BIAS"):
         return (f"Confidence {confidence}%. {signal_text}. Clear {direction} edge. Score {score_dom} vs {score_opp}.")
-    return (f"Confidence only {confidence}%. Signals present ({signal_text}) "
-            f"but opposing pressure is too close. No reliable edge. Score {score_dom} vs {score_opp}.")
+    if verdict in ("LONG READY", "SHORT READY"):
+        zone_side = "demand zone" if verdict == "LONG READY" else "supply zone"
+        return (f"Confidence {confidence}%. {signal_text}. Price at {zone_side} — "
+                f"entry setup ready. Score {score_dom} vs {score_opp}.")
+    if verdict == "WATCH":
+        return (f"Confidence {confidence}%. {signal_text}. Setup forming — "
+                f"wait for entry confirmation. Score {score_dom} vs {score_opp}.")
+    return (f"Confidence {confidence}%. Signals present ({signal_text}) — "
+            f"insufficient edge for entry. Score {score_dom} vs {score_opp}.")
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +781,10 @@ def bias_color(verdict):
     return {
         "STRONG SHORT": 0xCC0000,
         "SHORT BIAS":   0xFF5555,
-        "WAIT":         0xFFCC00,
+        "SHORT READY":  0xDD2222,
+        "WATCH":        0xFFAA00,
+        "WAIT":         0x888888,
+        "LONG READY":   0x00CC44,
         "LONG BIAS":    0x55CC55,
         "STRONG LONG":  0x00AA00,
     }.get(verdict, 0x888888)
@@ -782,7 +792,10 @@ def bias_color(verdict):
 VERDICT_EMOJI = {
     "STRONG SHORT": "🔴🔴",
     "SHORT BIAS":   "🔴",
+    "SHORT READY":  "🔴✅",
+    "WATCH":        "👁️",
     "WAIT":         "⏸️",
+    "LONG READY":   "🟢✅",
     "LONG BIAS":    "🟢",
     "STRONG LONG":  "🟢🟢",
 }
@@ -1402,12 +1415,42 @@ def full_analysis(current_price_override=None):
         current_price, nearest_supply, nearest_demand, last_price_by_type
     )
 
+    # ── Confidence gate: suppress plan below 70 % or when structure is undefined ──
+    _plan_eligible = (confidence >= 70 and structure_class not in ("Undefined", "Bullish Attempt", "Bearish Attempt"))
+    if not _plan_eligible:
+        trade_plan = {
+            "trade_plan": False,
+            "reason":     (f"Confidence {confidence}% — below 70 % threshold. No trade plan."
+                           if confidence < 70 else
+                           "Structure not yet confirmed. No trade plan."),
+            "entry_zone": None, "stop_loss": None,
+            "target1":    None, "target2":   None,
+            "rr":         None, "direction": None,
+        }
+
     setup_stage, stage_next_step, stage_entry_rule, stage_invalidation = get_setup_stage(
         current_price, nearest_supply, nearest_demand, bullish, bearish, ALERT_HISTORY
     )
 
-    # Override verdict: only TRADE when stage is READY
-    if setup_stage not in READY_STAGES:
+    # ── Map final verdict: WATCH / LONG READY / SHORT READY / WAIT ──────────
+    if trade_plan["trade_plan"]:
+        if setup_stage == "Long Ready":
+            verdict = "LONG READY"
+        elif setup_stage == "Short Ready":
+            verdict = "SHORT READY"
+        elif setup_stage in ("Long Setup Forming", "Short Setup Forming"):
+            verdict = "WATCH"
+        else:
+            # Plan generated but no matching stage — suppress the plan
+            verdict = "WAIT"
+            trade_plan = {
+                "trade_plan": False,
+                "reason":     "No active setup stage — plan withheld.",
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": None,
+            }
+    else:
         verdict = "WAIT"
 
     # ── Zone Broken: cancel setup, reduce confidence, mark structure invalidated ──
