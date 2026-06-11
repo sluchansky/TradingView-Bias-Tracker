@@ -3698,7 +3698,14 @@ async function enterTrade() {
   withAuth(body);
   try {
     const d = await api('/webhook', body);
-    if (d.status === 'entered') { toast('✅ Trade entered!'); refresh(); refreshBroker(); }
+    if (d.status === 'entered') {
+      let msg = '✅ Trade entered!';
+      if (d.broker && d.broker.orders) {
+        const ids = d.broker.orders.reduce((a,o)=>a.concat(o.ids||[]), []);
+        if (ids.length) msg += ' Orders: ' + ids.join(', ');
+      }
+      toast(msg); refresh(); refreshBroker();
+    }
     else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }
 }
@@ -3850,9 +3857,20 @@ async function refresh() {
       card.style.borderColor = isLong ? '#22c55e' : '#ef4444';
       info.style.color = isLong ? '#22c55e' : '#ef4444';
       info.textContent = (isLong?'📈':'📉') + ' ' + d.direction + ' — ' + (d.profile||'').split(' ')[0];
+      let brokerLine = '';
+      if (d.broker && d.broker.orders) {
+        const ids = d.broker.orders.reduce((a,o)=>a.concat(o.ids||[]), []);
+        brokerLine =
+          '<br><span style="color:#a0a8ff">⚡ Broker</span> ' +
+          (d.broker.contract||'') + ' · ' + (d.broker.env||'').toUpperCase() +
+          (d.broker.account ? ' · '+d.broker.account : '') +
+          (ids.length ? '<br>Order IDs <b style="color:#a0a8ff">'+ids.join(', ')+'</b>'
+                      : '<br><span style="color:#f59e0b">partial — review the position</span>');
+      }
       detail.innerHTML =
         'Entry <b>'+d.entry_price+'</b> &nbsp;·&nbsp; Stop <b>'+d.stop_loss+'</b><br>' +
-        'T1 <b>'+d.target1+'</b> &nbsp;·&nbsp; T2 <b>'+d.target2+'</b> &nbsp;·&nbsp; '+d.contracts+'x';
+        'T1 <b>'+d.target1+'</b> &nbsp;·&nbsp; T2 <b>'+d.target2+'</b> &nbsp;·&nbsp; '+d.contracts+'x' +
+        brokerLine;
       if (d.pnl_dollars !== undefined) {
         const v = d.pnl_dollars;
         const s = v >= 0 ? '+$'+Math.abs(v).toFixed(0) : '-$'+Math.abs(v).toFixed(0);
