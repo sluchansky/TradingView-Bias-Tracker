@@ -1,5 +1,6 @@
 import os
 import re
+import hmac
 import logging
 import threading
 from collections import deque
@@ -2532,21 +2533,24 @@ _COMMAND_TYPES = {"MGC ENTER", "MNQ ENTER", "MGC CLOSE", "MNQ CLOSE"}
 _DATA_ONLY_TYPES = {"MGC VWAP", "MNQ VWAP"}
 
 
-def _broker_should_execute(data):
-    """True only when live execution is ON *and* the request is an authorised
-    manual action. Raw TradingView alerts omit these fields, so the public
-    webhook can never auto-fire a real order.
-
-    Gate: if TRADOVATE_EXEC_SECRET is set, the request must carry a matching
-    ``exec_secret``; otherwise the request must carry ``manual: true`` (which
-    only the dashboard sends).
-    """
-    if not tv.execution_on():
-        return False
+def _exec_authorized(data):
+    """True only when the request carries a valid execution secret. This is the
+    authorisation key for *any* broker-affecting action (open or close). A
+    server-side TRADOVATE_EXEC_SECRET must be configured; without it nothing is
+    authorised, so a raw/public webhook POST can never trigger a broker order.
+    Constant-time compare to avoid leaking the secret via timing."""
     secret = os.environ.get("TRADOVATE_EXEC_SECRET", "")
-    if secret:
-        return str(data.get("exec_secret", "")) == secret
-    return bool(data.get("manual"))
+    if not secret:
+        return False
+    return hmac.compare_digest(str(data.get("exec_secret", "")), secret)
+
+
+def _broker_should_open(data):
+    """Gate for OPENING a live position: the runtime toggle must be ON *and* the
+    request must be authorised. Closing/flattening an existing broker-backed
+    trade is gated separately (by _exec_authorized) so a real position can
+    always be closed even if the toggle was later switched off."""
+    return tv.execution_on() and _exec_authorized(data)
 
 
 def _handle_command_alert(normalized, data, parsed_price):
@@ -2592,7 +2596,7 @@ def _handle_command_alert(normalized, data, parsed_price):
 
         # ── Live broker execution (gated; OFF by default) ──────────────────
         broker = None
-        if _broker_should_execute(data):
+        if _broker_should_open(data):
             if ACTIVE_TRADE:
                 return jsonify({"status": "error",
                                 "reason": "A trade is already active — close it before entering a new one."}), 409
@@ -2651,7 +2655,10 @@ def _handle_command_alert(normalized, data, parsed_price):
         return jsonify({"status": "error", "reason": "No active trade to close."}), 400
 
     flat = None
-    if _broker_should_execute(data):
+    if ACTIVE_TRADE.get("broker"):
+        if not _exec_authorized(data):
+            return jsonify({"status": "error",
+                            "reason": "This trade holds a live broker position — a valid execution secret is required to close it."}), 403
         flat = tv.flatten(ACTIVE_TRADE.get("symbol") or instrument_of(profile))
         if not flat.get("ok"):
             return jsonify({"status": "error",
@@ -3183,7 +3190,7 @@ def enter_trade():
 
     # ── Live broker execution (gated; OFF by default) ──────────────────────
     broker = None
-    if _broker_should_execute(data):
+    if _broker_should_open(data):
         if ACTIVE_TRADE:
             return jsonify({"status": "error",
                             "reason": "A trade is already active — close it before entering a new one."}), 409
@@ -3247,7 +3254,10 @@ def set_breakeven():
     data = request.get_json(force=True, silent=True) or {}
 
     broker = None
-    if _broker_should_execute(data):
+    if ACTIVE_TRADE.get("broker"):
+        if not _exec_authorized(data):
+            return jsonify({"status": "error",
+                            "reason": "This trade holds a live broker position — a valid execution secret is required to modify the stop."}), 403
         broker = tv.move_stop_to_breakeven(
             ACTIVE_TRADE.get("symbol") or instrument_of(ACTIVE_TRADE.get("profile", "")),
             ACTIVE_TRADE["entry_price"],
@@ -3282,7 +3292,10 @@ def close_trade():
     data       = request.get_json(force=True, silent=True) or {}
 
     flat = None
-    if _broker_should_execute(data):
+    if ACTIVE_TRADE.get("broker"):
+        if not _exec_authorized(data):
+            return jsonify({"status": "error",
+                            "reason": "This trade holds a live broker position — a valid execution secret is required to close it."}), 403
         flat = tv.flatten(ACTIVE_TRADE.get("symbol") or instrument_of(ACTIVE_TRADE.get("profile", "")))
         if not flat.get("ok"):
             return jsonify({"status": "error",
@@ -3373,9 +3386,16 @@ def broker_test():
 
 @app.route("/broker/toggle", methods=["POST"])
 def broker_toggle():
-    """Flip the runtime live-execution toggle (refuses to enable without creds)."""
+    """Flip the runtime live-execution toggle. Enabling requires a valid
+    execution secret; disabling is always allowed (the fail-safe direction)."""
     data = request.get_json(force=True, silent=True) or {}
-    res = tv.set_execution(bool(data.get("on")))
+    on = bool(data.get("on"))
+    if on and not _exec_authorized(data):
+        return jsonify({"ok": False,
+                        "error": ("Invalid or missing execution secret."
+                                  if os.environ.get("TRADOVATE_EXEC_SECRET")
+                                  else "TRADOVATE_EXEC_SECRET is not set — configure it before enabling live execution.")}), 403
+    res = tv.set_execution(on)
     return jsonify(res), (200 if res.get("ok") else 400)
 
 
@@ -3578,11 +3598,10 @@ function execSecret() {
   const el = document.getElementById('f-exec-secret');
   return el ? el.value.trim() : '';
 }
-// Stamp the manual-action markers so the gated broker logic will fire. Raw
-// TradingView alerts never carry these, so the public webhook cannot auto-trade.
-function withManual(body) {
+// Attach the execution secret so a broker action is authorised. Raw TradingView
+// alerts never carry it, so the public webhook can never trigger a live order.
+function withAuth(body) {
   body = body || {};
-  body.manual = true;
   const xs = execSecret();
   if (xs) body.exec_secret = xs;
   return body;
@@ -3610,6 +3629,8 @@ async function refreshBroker() {
     mode.style.color = mc;
     if (!d.creds_present) {
       detail.textContent = 'Credentials not configured — execution disabled. Missing: ' + (d.missing_secrets||[]).join(', ');
+    } else if (!d.exec_secret_configured) {
+      detail.textContent = 'Set TRADOVATE_EXEC_SECRET on the server to enable live execution — it authorises every order.';
     } else if (d.connection && d.connection.ok) {
       const cs = d.connection.contracts || {};
       detail.textContent = 'Account ' + (d.connection.account||'—') + ' · ' +
@@ -3624,7 +3645,7 @@ async function refreshBroker() {
 async function toggleBroker() {
   const on = document.getElementById('brk-toggle').checked;
   try {
-    const d = await api('/broker/toggle', { on: on });
+    const d = await api('/broker/toggle', withAuth({ on: on }));
     if (d.ok) toast(on ? '🔴 Live execution ON' : '⚪ Live execution OFF');
     else toast(d.error || 'Could not enable live execution', false);
   } catch(e) { toast('Request failed', false); }
@@ -3665,7 +3686,7 @@ async function enterTrade() {
   if (t1) body.t1        = parseFloat(t1);
   if (t2) body.t2        = parseFloat(t2);
   if (c)  body.contracts = parseInt(c);
-  withManual(body);
+  withAuth(body);
   try {
     const d = await api('/webhook', body);
     if (d.status === 'entered') { toast('✅ Trade entered!'); refresh(); refreshBroker(); }
@@ -3688,7 +3709,7 @@ async function setVwap() {
 
 async function closeTrade() {
   try {
-    const d = await api('/close', withManual({}));
+    const d = await api('/close', withAuth({}));
     if (d.status === 'closed') { toast('🏁 Trade closed'); refresh(); refreshBroker(); }
     else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }
@@ -3696,7 +3717,7 @@ async function closeTrade() {
 
 async function breakeven() {
   try {
-    const d = await api('/breakeven', withManual({}));
+    const d = await api('/breakeven', withAuth({}));
     if (d.status === 'breakeven_set') { toast('⚖️ Stop moved to breakeven'); refresh(); }
     else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }

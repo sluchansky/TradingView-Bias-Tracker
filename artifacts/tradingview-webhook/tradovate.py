@@ -108,14 +108,25 @@ def mode_label():
     return "LIVE · Real" if is_live_env() else "LIVE · Demo"
 
 
+def exec_secret_configured():
+    """A server-side TRADOVATE_EXEC_SECRET is required to authorise any broker
+    action — without it live execution cannot be enabled or fire."""
+    return bool(_env("TRADOVATE_EXEC_SECRET"))
+
+
 def set_execution(on):
-    """Flip the runtime execution toggle. Cannot enable without credentials."""
+    """Flip the runtime execution toggle. Enabling requires both credentials and
+    a configured TRADOVATE_EXEC_SECRET (the per-request authorisation key)."""
     global _exec_state
     on = bool(on)
     if on and not creds_present():
         return {"ok": False,
                 "error": "Cannot enable live execution — Tradovate credentials are not configured.",
                 "missing": missing_secrets()}
+    if on and not exec_secret_configured():
+        return {"ok": False,
+                "error": "Cannot enable live execution — TRADOVATE_EXEC_SECRET is not set. "
+                         "Set it first so broker actions require an authorisation key."}
     _exec_state = on
     if on:
         _conn_cache["result"] = None  # force a fresh self-test on next status
@@ -411,12 +422,14 @@ def _list_working(account_id, contract_id):
 
 
 def _cancel_working(account_id, contract_id):
-    """Cancel every working order for the contract. Returns (cancelled, failed)
-    so the caller never treats a failed cancel as success — a surviving working
-    stop/limit on a flat position could open a new unintended position."""
+    """Cancel every working order for the contract. Returns
+    ``(cancelled, failed, list_err)``. The caller must fail hard if it cannot
+    even *list* working orders (``list_err``) or if any cancel failed —
+    treating either as success could leave a working stop/limit on a flat
+    position that later triggers and opens a new unintended position."""
     working, err = _list_working(account_id, contract_id)
     if err:
-        return 0, 0
+        return 0, 0, err
     cancelled = 0
     failed = 0
     for o in working:
@@ -425,7 +438,7 @@ def _cancel_working(account_id, contract_id):
             failed += 1
         else:
             cancelled += 1
-    return cancelled, failed
+    return cancelled, failed, None
 
 
 def _position_qty(account_id, contract_id):
@@ -501,7 +514,12 @@ def flatten(sym):
         con, err = _resolve_contract(sym)
         if err:
             return {"ok": False, "error": f"contract: {err}"}
-        cancelled, cancel_failed = _cancel_working(acct["id"], con["id"])
+        cancelled, cancel_failed, list_err = _cancel_working(acct["id"], con["id"])
+        if list_err:
+            return {"ok": False,
+                    "error": f"could not list working orders ({list_err}) — "
+                             "position NOT flattened; review the account manually",
+                    "contract": con["name"], "env": env_name()}
         if cancel_failed:
             return {"ok": False,
                     "error": f"could not cancel {cancel_failed} working order(s) — "
@@ -589,9 +607,10 @@ def status_snapshot(force=False):
         "creds_present": creds_present(),
         "missing_secrets": missing_secrets(),
         "max_contracts": max_contracts(),
-        "can_enable": creds_present(),
+        "can_enable": creds_present() and exec_secret_configured(),
         "mode_label": mode_label(),
-        "exec_secret_required": bool(_env("TRADOVATE_EXEC_SECRET")),
+        "exec_secret_required": True,
+        "exec_secret_configured": exec_secret_configured(),
     }
     if force or (creds_present() and _conn_cache["result"] is None):
         _conn_cache["result"] = self_test()

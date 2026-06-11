@@ -11,28 +11,39 @@ remains a tracking-only journal unless execution is explicitly turned on.
 
 ## Non-negotiable safety invariants (any change must preserve these)
 
-- **The public `/webhook` must never auto-fire a real order.** Broker calls are
-  gated behind `_broker_should_execute(data)` in app.py: fires only when
-  `tv.execution_on()` AND (matching `exec_secret` when `TRADOVATE_EXEC_SECRET`
-  is set, else `data.get("manual")` truthy). Raw TradingView alerts carry
-  neither field, so they can reach scoring/journaling but never `place_bracket`
-  / `flatten` / `move_stop_to_breakeven`.
+- **A configured `TRADOVATE_EXEC_SECRET` is MANDATORY for every broker action;
+  there is no `manual:true` fallback.** Two gates in app.py:
+  `_exec_authorized(data)` = secret configured AND `hmac.compare_digest` match
+  (constant-time); `_broker_should_open(data)` = `tv.execution_on()` AND
+  `_exec_authorized`. **OPEN** (ENTER, both sites) uses `_broker_should_open`.
   **Why:** the webhook URL is public; auto-trading from an unauthenticated POST
-  is the worst-case failure for this app.
+  is the worst-case failure. A raw TradingView alert carries no `exec_secret`,
+  so it can reach scoring/journaling but never `place_bracket`.
+- **CLOSE / breakeven on a broker-backed trade must actually execute at the
+  broker before any local mutation.** Gate is `ACTIVE_TRADE.get("broker")`
+  truthy → require `_exec_authorized` (NOT the toggle — a real position must
+  always be closeable even after execution is toggled off) → call
+  `tv.flatten` / `move_stop_to_breakeven` → 502 on failure → only then mutate
+  local state. Non-broker-backed (tracking-only) trades stay local-only.
+  **Why:** the old code mutated local state first, so a missing/wrong secret
+  made the UI say "closed/BE" while the real position stayed live.
 - **Execution is OFF by default and env defaults to DEMO.** The runtime toggle
   (`set_execution`) is in-memory only and reverts to the env default on restart;
-  it refuses to enable without credentials.
+  it refuses to enable without credentials AND without `TRADOVATE_EXEC_SECRET`
+  configured. `/broker/toggle` requires a valid `exec_secret` to enable;
+  disabling is always allowed (fail-safe direction).
 - **A broker rejection must never read as success.** Order-placing call sites
   return HTTP 502 on failure. `tv.*` functions return `{"ok": False, ...}`
   structurally; `ok:True` is only returned after the broker confirms.
 - **Partial fills keep ACTIVE_TRADE** (so the operator can flatten) but still
   return 502. The kept quantity must be the *actually placed* qty — `place_bracket`'s
   error return includes `contracts = sum of placed leg qtys`, not the requested count.
-- **flatten must verify cancel responses.** `_cancel_working` returns
-  `(cancelled, failed)`; `flatten` returns `ok:False` if any working-order cancel
-  failed. **Why:** a surviving working stop/limit on a now-flat position can
-  trigger and open a brand-new unintended position — silently counting a failed
-  cancel as success is a real money-losing bug.
+- **flatten must verify it can list AND cancel working orders.** `_cancel_working`
+  returns `(cancelled, failed, list_err)`; `flatten` returns `ok:False` if it
+  cannot even *list* working orders (`list_err`) OR if any cancel failed.
+  **Why:** a surviving working stop/limit on a now-flat position can trigger and
+  open a brand-new unintended position — counting either a list failure or a
+  failed cancel as success is a real money-losing bug.
 - **Never log secrets.** `_redact()` masks exec_secret/password/sec/cid/token/
   accessToken/deviceId in the before_request body log; tradovate.py never logs
   the auth request body.
@@ -50,8 +61,8 @@ remains a tracking-only journal unless execution is explicitly turned on.
 
 ## Go-live caveat (surface to user before enabling)
 
-When `TRADOVATE_EXEC_SECRET` is unset, the gate is just `manual:true`, which
-anyone who knows the public `/api/webhook` URL could spoof; `/broker/toggle` is
-also unauthenticated. Inert until the 6 Tradovate secrets exist, but
-`TRADOVATE_EXEC_SECRET` should be treated as effectively required before turning
-live execution on. (Secret comparison is also non-constant-time — minor.)
+Inert until the 6 Tradovate secrets exist AND `TRADOVATE_EXEC_SECRET` is set.
+Without the exec secret nothing can be enabled or fired (the gate is fail-closed:
+no secret → `_exec_authorized` always False → toggle 403, broker never runs).
+The dashboard always shows the exec-secret field and warns when the server has
+no `TRADOVATE_EXEC_SECRET` configured (`status_snapshot.exec_secret_configured`).
