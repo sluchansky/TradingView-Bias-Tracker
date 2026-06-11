@@ -17,19 +17,26 @@ MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
 ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
 
 ALERT_TYPES = {
-    "MGC NEW SUPPLY ZONE":       {"side": "bearish", "score": 1},
-    "MGC SUPPLY ZONE CONFIRMED": {"side": "bearish", "score": 2},
-    "MGC NEW DEMAND ZONE":       {"side": "bullish", "score": 1},
-    "MGC DEMAND ZONE CONFIRMED": {"side": "bullish", "score": 2},
-    "CHOCH SUPPLY":              {"side": "bearish", "score": 3},
-    "BOS SUPPLY":                {"side": "bearish", "score": 2},
-    "CHOCH DEMAND":              {"side": "bullish", "score": 3},
-    "BOS DEMAND":                {"side": "bullish", "score": 2},
-    # Zone state alerts (neutral — side effects only, no score contribution)
-    "MGC ZONE BROKEN":           {"side": "neutral", "score": 0},
-    "MGC ZONE MITIGATED":        {"side": "neutral", "score": 0},
-    "MNQ ZONE BROKEN":           {"side": "neutral", "score": 0},
-    "MNQ ZONE MITIGATED":        {"side": "neutral", "score": 0},
+    # ── MGC alert types ────────────────────────────────────────────────────────
+    "MGC NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
+    "MGC SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
+    "MGC NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
+    "MGC DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
+    # ── MNQ alert types ────────────────────────────────────────────────────────
+    "MNQ NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
+    "MNQ SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
+    "MNQ NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
+    "MNQ DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
+    # ── Shared structure alerts (apply to whichever symbol is active) ──────────
+    "CHOCH SUPPLY":               {"side": "bearish", "score": 3},
+    "BOS SUPPLY":                 {"side": "bearish", "score": 2},
+    "CHOCH DEMAND":               {"side": "bullish", "score": 3},
+    "BOS DEMAND":                 {"side": "bullish", "score": 2},
+    # ── Zone state alerts (neutral — side effects only, no score contribution) ─
+    "MGC ZONE BROKEN":            {"side": "neutral", "score": 0},
+    "MGC ZONE MITIGATED":         {"side": "neutral", "score": 0},
+    "MNQ ZONE BROKEN":            {"side": "neutral", "score": 0},
+    "MNQ ZONE MITIGATED":         {"side": "neutral", "score": 0},
     # Stage 4 triggers — 5m confirmation candle closed (neutral, no score)
     "MGC BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
     "MGC BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
@@ -58,7 +65,21 @@ ACCOUNT_PROFILES = {
 DEFAULT_PROFILE = "MGC Standard"
 
 DISCORD_WEBHOOK_URL         = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_MNQ_WEBHOOK_URL     = os.environ.get("DISCORD_MNQ_WEBHOOK_URL", "")
 DISCORD_JOURNAL_WEBHOOK_URL = os.environ.get("DISCORD_JOURNAL_WEBHOOK_URL", "")
+
+
+def _discord_url(hint: str = "") -> str:
+    """Return the correct trade-alert webhook URL based on symbol hint.
+
+    If the hint contains 'MNQ' (case-insensitive) and a dedicated MNQ URL is
+    configured, returns that; otherwise falls back to the MGC/default URL.
+    """
+    if "MNQ" in str(hint).upper() and DISCORD_MNQ_WEBHOOK_URL:
+        return DISCORD_MNQ_WEBHOOK_URL
+    return DISCORD_WEBHOOK_URL
+
+
 TIME_WINDOWS                = {"15m": 15, "60m": 60, "120m": 120}
 
 # ── Trading Journal ───────────────────────────────────────────────────────────
@@ -923,11 +944,12 @@ def _setup_stage_fields(setup_stage, next_step, entry_rule, stage_invalidation):
 
 def send_zone_mitigated_message(alert_data, mitigated_price):
     """Minimal Discord embed for zone-consumed state — no scoring performed."""
-    if not DISCORD_WEBHOOK_URL:
+    ticker    = alert_data.get("ticker") or "MGC"
+    _url      = _discord_url(ticker)
+    if not _url:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
         return
 
-    ticker    = alert_data.get("ticker") or "MGC"
     price     = alert_data.get("price")
     price_str = f"${float(price):.2f}"  if price           is not None else "—"
     mz_str    = f"${float(mitigated_price):.2f}" if mitigated_price is not None else "—"
@@ -965,7 +987,7 @@ def send_zone_mitigated_message(alert_data, mitigated_price):
         "footer": {"text": f"Zone consumed at {mz_str} · Scoring skipped"},
     }
     try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        resp = requests.post(_url, json={"embeds": [embed]}, timeout=10)
         if resp.status_code not in (200, 204):
             logger.error("Discord zone-mitigated post failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
@@ -986,7 +1008,8 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          zone_broken_active=False,
                          zone_mitigated_near=False,
                          mitigated_zone_price=None):
-    if not DISCORD_WEBHOOK_URL:
+    _url = _discord_url(alert_data.get("ticker", ""))
+    if not _url:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
         return
 
@@ -1167,7 +1190,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
     }
 
     try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        resp = requests.post(_url, json={"embeds": [embed]}, timeout=10)
         resp.raise_for_status()
         logger.info("Discord sent (status %s)", resp.status_code)
     except requests.RequestException as exc:
@@ -1594,7 +1617,8 @@ def check_trade_events(trade, current_price):
 
 def send_trade_event_message(event_type, trade, current_price):
     """Send a standalone Discord plain-text alert for a trade event."""
-    if not DISCORD_WEBHOOK_URL:
+    _url = _discord_url(trade.get("profile", ""))
+    if not _url:
         return
     dollar_pnl, pts_pnl = compute_pnl(trade, current_price)
     pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
@@ -1611,7 +1635,7 @@ def send_trade_event_message(event_type, trade, current_price):
     }
     content = msgs.get(event_type, f"Trade event: {event_type}")
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+        requests.post(_url, json={"content": content}, timeout=5)
         logger.info("Trade event sent: %s", event_type)
     except requests.RequestException as exc:
         logger.error("Trade event Discord send failed: %s", exc)
@@ -2146,7 +2170,8 @@ def status():
         "alert_counts":        a["counts"],
         "windows":             windows,
         "total_alerts_stored": len(ALERT_HISTORY),
-        "discord_configured":  bool(DISCORD_WEBHOOK_URL),
+        "discord_configured":      bool(DISCORD_WEBHOOK_URL),
+        "mnq_discord_configured":  bool(DISCORD_MNQ_WEBHOOK_URL),
     }), 200
 
 
@@ -2207,8 +2232,9 @@ def enter_trade():
         f"Contracts `{contracts}`  ·  Profile `{profile}`"
     )
     try:
-        if DISCORD_WEBHOOK_URL:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+        _url = _discord_url(profile)
+        if _url:
+            requests.post(_url, json={"content": content}, timeout=5)
     except requests.RequestException:
         pass
 
@@ -2229,8 +2255,9 @@ def set_breakeven():
         f"Stop `{old_stop:.1f}` → `{ACTIVE_TRADE['entry_price']:.1f}`"
     )
     try:
-        if DISCORD_WEBHOOK_URL:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+        _url = _discord_url(ACTIVE_TRADE.get("profile", ""))
+        if _url:
+            requests.post(_url, json={"content": content}, timeout=5)
     except requests.RequestException:
         pass
     logger.info("Breakeven set: stop moved to %.1f", ACTIVE_TRADE["entry_price"])
@@ -2268,8 +2295,9 @@ def close_trade():
     ACTIVE_TRADE = None
 
     try:
-        if DISCORD_WEBHOOK_URL:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=5)
+        _url = _discord_url(closed.get("profile", ""))
+        if _url:
+            requests.post(_url, json={"content": content}, timeout=5)
     except requests.RequestException:
         pass
     logger.info("Trade closed manually.")
