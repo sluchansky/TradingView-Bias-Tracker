@@ -52,8 +52,17 @@ ACCOUNT_PROFILES = {
 }
 DEFAULT_PROFILE = "MGC Standard"
 
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-TIME_WINDOWS        = {"15m": 15, "60m": 60, "120m": 120}
+DISCORD_WEBHOOK_URL         = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_JOURNAL_WEBHOOK_URL = os.environ.get("DISCORD_JOURNAL_WEBHOOK_URL", "")
+TIME_WINDOWS                = {"15m": 15, "60m": 60, "120m": 120}
+
+# ── Trading Journal ───────────────────────────────────────────────────────────
+JOURNAL        = []          # list of journal dicts, newest-first, max 500
+JOURNAL_KEYS   = set()       # dedup: (ticker, setup_stage, entry_zone_rounded)
+JOURNAL_STAGES = frozenset((
+    "Long Setup Forming", "Short Setup Forming",
+    "Long Ready",          "Short Ready",
+))
 
 
 # ---------------------------------------------------------------------------
@@ -1545,6 +1554,123 @@ def send_trade_event_message(event_type, trade, current_price):
         logger.error("Trade event Discord send failed: %s", exc)
 
 
+def send_journal_discord_embed(entry):
+    """Post a journal entry to the dedicated trading-journal Discord channel."""
+    if not DISCORD_JOURNAL_WEBHOOK_URL:
+        logger.warning("DISCORD_JOURNAL_WEBHOOK_URL not set — journal Discord post skipped")
+        return
+
+    direction_emoji = "📈" if entry["direction"] == "Long" else "📉"
+    color           = 0x00B0FF if entry["direction"] == "Long" else 0xFF5252
+
+    def _fp(v):
+        try:
+            return f"${float(v):.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    chain_text = "\n↓\n".join(entry["reasoning_chain"]) if entry["reasoning_chain"] else "—"
+    if len(chain_text) > 900:
+        chain_text = chain_text[:900] + "…"
+
+    embed = {
+        "title":       f"📓 Journal — {entry['symbol']} {direction_emoji} {entry['direction']}",
+        "description": f"**{entry['setup_stage']}**  ·  Verdict: **{entry['verdict']}**",
+        "color":       color,
+        "timestamp":   entry["datetime"],
+        "fields": [
+            {"name": "📅 Date/Time",          "value": entry["datetime"][:19].replace("T", " ") + " UTC", "inline": True},
+            {"name": "📊 Symbol",              "value": entry["symbol"],              "inline": True},
+            {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
+            {"name": "🎯 Setup Stage",         "value": entry["setup_stage"],         "inline": True},
+            {"name": "⚖️ Final Verdict",       "value": entry["verdict"],             "inline": True},
+            {"name": "🔥 Bias",                "value": entry["bias"],                "inline": True},
+            {"name": "📐 Entry Zone",          "value": _fp(entry["entry_zone"]),     "inline": True},
+            {"name": "🛑 Stop Loss",           "value": _fp(entry["stop_loss"]),      "inline": True},
+            {"name": "🎯 Target 1",            "value": _fp(entry["target1"]),        "inline": True},
+            {"name": "🎯 Target 2",            "value": _fp(entry["target2"]),        "inline": True},
+            {"name": "💡 Confidence",          "value": entry["confidence"],          "inline": True},
+            {"name": "⚡ Edge Score",           "value": str(entry["edge_score"]),     "inline": True},
+            {"name": "🏗️ Market Structure",    "value": entry["market_structure"],    "inline": True},
+            {"name": "⚠️ Risk Zone",            "value": entry["risk_zone"],           "inline": True},
+            {"name": "📖 Reasoning Chain",     "value": f"```\n{chain_text}\n```",    "inline": False},
+            {"name": "💬 Why",                 "value": entry["why"] or "—",          "inline": False},
+            {"name": "📷 Screenshot",          "value": entry["screenshot"],          "inline": False},
+            {"name": "📋 Outcome",             "value": f"🟡 {entry['outcome']}",     "inline": True},
+        ],
+        "footer": {"text": f"Journal Entry #{entry['id']} · MGC Agent"},
+    }
+
+    try:
+        resp = requests.post(
+            DISCORD_JOURNAL_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code not in (200, 204):
+            logger.warning("Journal Discord post failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("Journal Discord post error: %s", exc)
+
+
+def create_journal_entry(record, a, sizing):
+    """Create a journal entry when setup_stage warrants one, skipping duplicates."""
+    global JOURNAL, JOURNAL_KEYS
+
+    setup_stage = a.get("setup_stage", "")
+    if setup_stage not in JOURNAL_STAGES:
+        return None
+
+    ticker     = record.get("ticker") or "MGC"
+    tp         = a.get("trade_plan") or {}
+    entry_zone = tp.get("entry_zone")
+    direction  = "Long" if "Long" in setup_stage else "Short"
+
+    # Dedup key: ticker + stage + entry zone rounded to nearest integer
+    try:
+        zone_key = round(float(entry_zone), 0) if entry_zone is not None else 0.0
+    except (TypeError, ValueError):
+        zone_key = 0.0
+    dedup_key = (ticker, setup_stage, zone_key)
+
+    if dedup_key in JOURNAL_KEYS:
+        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, setup_stage, zone_key)
+        return None
+
+    JOURNAL_KEYS.add(dedup_key)
+
+    rc = a.get("reasoning_chain") or []
+    entry = {
+        "id":               len(JOURNAL) + 1,
+        "datetime":         datetime.now(timezone.utc).isoformat(),
+        "symbol":           ticker,
+        "direction":        direction,
+        "setup_stage":      setup_stage,
+        "verdict":          a.get("verdict", "WAIT"),
+        "entry_zone":       entry_zone,
+        "stop_loss":        tp.get("stop_loss"),
+        "target1":          tp.get("target1"),
+        "target2":          tp.get("target2"),
+        "bias":             a.get("bias", "—"),
+        "confidence":       f"{a.get('confidence', 0)}%",
+        "edge_score":       a.get("edge_score", 0),
+        "market_structure": a.get("structure_label", "—"),
+        "risk_zone":        a.get("risk_label", "—"),
+        "reasoning_chain":  rc,
+        "why":              a.get("why", "—"),
+        "screenshot":       "[ Screenshot placeholder — add URL or image link ]",
+        "outcome":          "Pending",
+    }
+
+    JOURNAL.insert(0, entry)
+    if len(JOURNAL) > 500:
+        JOURNAL.pop()
+
+    send_journal_discord_embed(entry)
+    logger.info("Journal entry #%d created: %s %s @ %s", entry["id"], ticker, setup_stage, entry_zone)
+    return entry
+
+
 def active_trade_field(trade, current_price):
     """Return a single Discord embed field dict showing live trade status (v11)."""
     dollar_pnl, pts_pnl   = compute_pnl(trade, current_price)
@@ -1726,6 +1852,9 @@ def webhook():
         mitigated_zone_price=a.get("mitigated_zone_price"),
     )
 
+    # ── Trading Journal ───────────────────────────────────────────────────────
+    create_journal_entry(record, a, sizing)
+
     logger.info(
         "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
         normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
@@ -1774,14 +1903,20 @@ def get_alerts():
     return jsonify({"alerts": list(ALERT_HISTORY), "count": len(ALERT_HISTORY)}), 200
 
 
+@app.route("/journal", methods=["GET"])
+def get_journal():
+    return jsonify({"entries": JOURNAL, "count": len(JOURNAL)}), 200
+
+
 @app.route("/clear", methods=["POST"])
 def clear_alerts():
-    global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES, ZONE_MITIGATED_FLAG
+    global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES, ZONE_MITIGATED_FLAG, JOURNAL_KEYS
     ALERT_HISTORY.clear()
     CURRENT_PRICE       = None
     ZONE_BROKEN_AT      = None
     MITIGATED_PRICES    = []
     ZONE_MITIGATED_FLAG = False
+    JOURNAL_KEYS.clear()
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
 

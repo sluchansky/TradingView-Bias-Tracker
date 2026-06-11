@@ -57,6 +57,7 @@ router.all(
     "/price",
     "/alerts",
     "/status",
+    "/journal",
   ],
   proxyToFlask,
 );
