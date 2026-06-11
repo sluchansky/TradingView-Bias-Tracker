@@ -71,10 +71,52 @@ ALERT_TYPES = {
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
 
-BIAS_THRESHOLD = 3
-NEAR_PCT       = 0.005   # 0.5%  — Testing zone
-EXTENDED_PCT   = 0.010   # 1.0%  — Approaching zone
-WATCH_PCT      = 0.0075  # 0.75% — Watch zone (v10)
+# ---------------------------------------------------------------------------
+# Trading mode profiles — SCALP (fast, sensitive) vs SWING (slower, stricter)
+# ---------------------------------------------------------------------------
+# SCALP fires earlier and on smaller moves: lower bias gap, lower confidence
+# tiers, wider "at-zone" windows, more room before "overextended", recent-window
+# scoring, and BOS-only ("Attempt") structures become tradable at reduced size.
+# SWING preserves the original, stricter swing-trade behaviour.
+MODES = {
+    "SCALP": {
+        "BIAS_THRESHOLD":    2,
+        "NEAR_PCT":          0.006,   # 0.6%  — Testing zone
+        "EXTENDED_PCT":      0.016,   # 1.6%  — Overextended ceiling (more room to run)
+        "WATCH_PCT":         0.010,   # 1.0%  — "at zone" proximity window
+        "CONF_HIGH":         85,      # high-conviction tier
+        "CONF_TRADE":        68,      # trade tier
+        "CONF_WATCH":        58,      # watch/plan-eligible tier
+        "MIN_TOTAL_SCORE":   4,       # require real confluence before TRADE/HIGH tiers
+        "SCORE_WINDOW_MIN":  45,      # score only the last 45 min of alerts
+        "STAGE_WINDOW_MIN":  30,      # setup-stage looks back 30 min, not last 5 alerts
+        "ATTEMPT_TRADABLE":  True,    # BOS-only structures can trade (capped at BIAS)
+        "RISK_MULT_ATTEMPT": 0.5,     # half size on BOS-only entries
+    },
+    "SWING": {
+        "BIAS_THRESHOLD":    3,
+        "NEAR_PCT":          0.005,   # 0.5%
+        "EXTENDED_PCT":      0.010,   # 1.0%
+        "WATCH_PCT":         0.0075,  # 0.75%
+        "CONF_HIGH":         90,
+        "CONF_TRADE":        80,
+        "CONF_WATCH":        70,
+        "MIN_TOTAL_SCORE":   0,
+        "SCORE_WINDOW_MIN":  None,    # score full history
+        "STAGE_WINDOW_MIN":  None,    # last 5 alerts
+        "ATTEMPT_TRADABLE":  False,
+        "RISK_MULT_ATTEMPT": 1.0,
+    },
+}
+
+TRADING_MODE = os.environ.get("TRADING_MODE", "SCALP").upper()
+if TRADING_MODE not in MODES:
+    TRADING_MODE = "SCALP"
+
+
+def cfg(key):
+    """Read a threshold for the currently active trading mode."""
+    return MODES.get(TRADING_MODE, MODES["SCALP"])[key]
 
 DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — fallback when no profile/account_size given
 DEFAULT_RISK_PCT     = 0.01     # 1% — fallback when no profile/risk_pct given
@@ -337,9 +379,10 @@ def calculate_scores():
 def calculate_bias(bullish, bearish):
     gap = abs(bullish - bearish)
     strength = min(gap + 1, 10)
-    if bearish - bullish >= BIAS_THRESHOLD:
+    bt = cfg("BIAS_THRESHOLD")
+    if bearish - bullish >= bt:
         return "Bearish", strength
-    elif bullish - bearish >= BIAS_THRESHOLD:
+    elif bullish - bearish >= bt:
         return "Bullish", strength
     return "Choppy", strength
 
@@ -464,14 +507,16 @@ def get_market_structure(current_price, last_price_by_type):
 def get_risk_zone(bias, current_price, nearest_supply, nearest_demand):
     if current_price is None:
         return "Unknown", "No price data available.", False
+    near_pct = cfg("NEAR_PCT")
+    ext_pct  = cfg("EXTENDED_PCT")
     def pct(a, b):
         return abs(a - b) / b if b else 0
     if bias == "Bearish":
         if nearest_supply is not None:
             dist = pct(nearest_supply, current_price)
-            if dist <= NEAR_PCT:
+            if dist <= near_pct:
                 return "Testing Supply", f"Price testing supply at {nearest_supply:.2f} ({dist:.2%} away). Favor shorts.", False
-            elif dist >= EXTENDED_PCT:
+            elif dist >= ext_pct:
                 return "Overextended", f"Price too extended from supply ({nearest_supply:.2f}, {dist:.2%} away). Wait for retracement.", True
             else:
                 return "Approaching Supply", f"Price approaching supply at {nearest_supply:.2f} ({dist:.2%} away). Watch for rejection.", False
@@ -479,9 +524,9 @@ def get_risk_zone(bias, current_price, nearest_supply, nearest_demand):
     elif bias == "Bullish":
         if nearest_demand is not None:
             dist = pct(current_price, nearest_demand)
-            if dist <= NEAR_PCT:
+            if dist <= near_pct:
                 return "Testing Demand", f"Price testing demand at {nearest_demand:.2f} ({dist:.2%} away). Favor longs.", False
-            elif dist >= EXTENDED_PCT:
+            elif dist >= ext_pct:
                 return "Overextended", f"Price too extended from demand ({nearest_demand:.2f}, {dist:.2%} away). Wait for retracement.", True
             else:
                 return "Approaching Demand", f"Price pulling back toward demand at {nearest_demand:.2f} ({dist:.2%} away). Watch for hold.", False
@@ -531,8 +576,10 @@ def decision_engine(structure_label, risk_label, overextended,
             chain += ["No Structure Defined", "WAIT"]
         return "WAIT", "WAIT", structure_class, chain
 
-    # ── Gate: Attempt structures (BOS fired, no CHOCH yet) → always WAIT ──
-    if structure_class in ("Bullish Attempt", "Bearish Attempt"):
+    # ── Gate: Attempt structures (BOS fired, no CHOCH yet) ──
+    # SWING: always WAIT. SCALP: tradable as reduced-conviction trend (capped below).
+    is_attempt = structure_class in ("Bullish Attempt", "Bearish Attempt")
+    if is_attempt and not cfg("ATTEMPT_TRADABLE"):
         chain += ["No CHOCH — Attempt Only", "Waiting for Confirmation", "WAIT"]
         return "WAIT", "WAIT", structure_class, chain
 
@@ -545,11 +592,12 @@ def decision_engine(structure_label, risk_label, overextended,
     chain.append(risk_label)
 
     # ── Alert Score ──
+    bt  = cfg("BIAS_THRESHOLD")
     gap = abs(bullish - bearish)
-    if bias == "Bearish" and gap >= BIAS_THRESHOLD:
+    if bias == "Bearish" and gap >= bt:
         score_desc  = f"Bearish Score Dominant ({bearish} vs {bullish})"
         score_side  = "bearish"
-    elif bias == "Bullish" and gap >= BIAS_THRESHOLD:
+    elif bias == "Bullish" and gap >= bt:
         score_desc  = f"Bullish Score Dominant ({bullish} vs {bearish})"
         score_side  = "bullish"
     else:
@@ -558,45 +606,67 @@ def decision_engine(structure_label, risk_label, overextended,
 
     chain.append(score_desc)
 
+    # ── Map Attempt structures onto their trend direction (capped at BIAS below) ──
+    if structure_class == "Bullish Attempt":
+        trend_class = "Bullish Trend"
+        chain.append("Attempt → reduced-conviction Bullish")
+    elif structure_class == "Bearish Attempt":
+        trend_class = "Bearish Trend"
+        chain.append("Attempt → reduced-conviction Bearish")
+    else:
+        trend_class = structure_class
+
     # ── Structure cap: Range or Reversal ──
-    if structure_class in ("Range", "Reversal"):
-        cap_note = f"Structure Cap ({structure_class} → max WATCH)"
+    if trend_class in ("Range", "Reversal"):
+        cap_note = f"Structure Cap ({trend_class} → max WATCH)"
         chain.append(cap_note)
-        if score_side == "mixed" or confidence < 70:
+        if score_side == "mixed" or confidence < cfg("CONF_WATCH"):
             chain += ["No Edge", "WAIT"]
             return "WAIT", "WAIT", structure_class, chain
         chain.append("WATCH")
         return "WATCH", "WAIT", structure_class, chain
 
-    # ── Confidence tier (Bearish Trend / Bullish Trend only) ──
+    # ── Confidence tier (Bearish Trend / Bullish Trend / tradable Attempt only) ──
     if score_side == "mixed":
         chain += [f"Confidence {confidence}% — Mixed Score", "WAIT"]
         return "WAIT", "WAIT", structure_class, chain
 
-    if confidence >= 90:
+    conf_high      = cfg("CONF_HIGH")
+    conf_trade     = cfg("CONF_TRADE")
+    conf_watch     = cfg("CONF_WATCH")
+    has_confluence = (bullish + bearish) >= cfg("MIN_TOTAL_SCORE")
+
+    if confidence >= conf_high and has_confluence and not is_attempt:
         rec        = "HIGH CONVICTION TRADE"
         conf_step  = f"Confidence {confidence}% — High Conviction"
-    elif confidence >= 80:
+    elif confidence >= conf_trade and has_confluence:
         rec        = "TRADE"
         conf_step  = f"Confidence {confidence}% — Trade"
-    elif confidence >= 70:
+    elif confidence >= conf_watch:
         rec        = "WATCH"
         conf_step  = f"Confidence {confidence}% — Watch"
     else:
         rec        = "WAIT"
         conf_step  = f"Confidence {confidence}% — Low"
 
+    # BOS-only entries never reach high conviction without a CHOCH.
+    if is_attempt and rec == "HIGH CONVICTION TRADE":
+        rec = "TRADE"
+
+    if not has_confluence and rec in ("TRADE", "HIGH CONVICTION TRADE"):
+        conf_step += f" (low confluence {bullish + bearish})"
+
     chain.append(conf_step)
 
     # ── Final Verdict ──
-    if structure_class == "Bearish Trend":
+    if trend_class == "Bearish Trend":
         if rec == "HIGH CONVICTION TRADE":
             verdict = "STRONG SHORT"
         elif rec in ("TRADE", "WATCH"):
             verdict = "SHORT BIAS"
         else:
             verdict = "WAIT"
-    elif structure_class == "Bullish Trend":
+    elif trend_class == "Bullish Trend":
         if rec == "HIGH CONVICTION TRADE":
             verdict = "STRONG LONG"
         elif rec in ("TRADE", "WATCH"):
@@ -658,9 +728,16 @@ def get_trade_opportunity(market_direction, structure_label, risk_label,
         return none_opp("No market structure defined yet.")
 
     # ── 1b. Attempt structures: BOS confirmed but no CHOCH yet ──
+    # SCALP: tradable as a reduced-size setup anchored at the BOS level.
+    # SWING: watch-only until a CHOCH confirms.
     if structure_label == "Bullish Attempt":
         bos_dem = last_price_by_type.get("BOS DEMAND")
         bos_str = f"${bos_dem:.2f}" if bos_dem else "—"
+        if cfg("ATTEMPT_TRADABLE") and risk_label in ("Testing Demand", "Approaching Demand"):
+            return ("Long Setup",
+                    f"BOS Demand ({bos_str}) — scalp long at demand (no CHOCH; reduced size).",
+                    "5m bullish confirmation candle holds above BOS Demand.",
+                    f"Price closes below BOS Demand level ({bos_str})")
         return ("Watch Demand",
                 f"BOS Demand ({bos_str}) confirmed — no CHOCH yet. Watch demand zone for hold.",
                 "Wait for CHOCH Demand + Zone Confirmed to trigger Long Ready.",
@@ -668,6 +745,11 @@ def get_trade_opportunity(market_direction, structure_label, risk_label,
     if structure_label == "Bearish Attempt":
         bos_sup = last_price_by_type.get("BOS SUPPLY")
         bos_str = f"${bos_sup:.2f}" if bos_sup else "—"
+        if cfg("ATTEMPT_TRADABLE") and risk_label in ("Testing Supply", "Approaching Supply"):
+            return ("Short Setup",
+                    f"BOS Supply ({bos_str}) — scalp short at supply (no CHOCH; reduced size).",
+                    "5m bearish confirmation candle holds below BOS Supply.",
+                    f"Price closes above BOS Supply level ({bos_str})")
         return ("Watch Supply",
                 f"BOS Supply ({bos_str}) confirmed — no CHOCH yet. Watch supply zone for rejection.",
                 "Wait for CHOCH Supply + Zone Confirmed to trigger Short Ready.",
@@ -1441,26 +1523,41 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
     if current_price is None:
         return ("Watching", "Waiting for price data.", "No entry.", "N/A", None)
 
-    # ── Recent alert window: last 5 alerts ──
-    recent = [a["alert_type"] for a in list(alert_history)[-5:]]
+    # ── Recent alerts: a time window in SCALP mode, else the last 5 alerts ──
+    stage_window = cfg("STAGE_WINDOW_MIN")
+    if stage_window:
+        _cutoff = now_utc() - timedelta(minutes=stage_window)
+        recent = []
+        for a in alert_history:
+            try:
+                if datetime.fromisoformat(a["timestamp"]) >= _cutoff:
+                    recent.append(a["alert_type"])
+            except (KeyError, ValueError):
+                pass
+    else:
+        recent = [a["alert_type"] for a in list(alert_history)[-5:]]
     has_choch_bos_supply     = any(t in ("CHOCH SUPPLY", "BOS SUPPLY") for t in recent)
     has_choch_bos_demand     = any(t in ("CHOCH DEMAND", "BOS DEMAND") for t in recent)
-    has_supply_confirmed     = "MGC SUPPLY ZONE CONFIRMED"              in recent
-    has_demand_confirmed     = "MGC DEMAND ZONE CONFIRMED"              in recent
+    has_supply_confirmed     = any(t in ("MGC SUPPLY ZONE CONFIRMED", "MNQ SUPPLY ZONE CONFIRMED")
+                                   for t in recent)
+    has_demand_confirmed     = any(t in ("MGC DEMAND ZONE CONFIRMED", "MNQ DEMAND ZONE CONFIRMED")
+                                   for t in recent)
     has_bullish_confirmation = any(t in ("MGC BULLISH CONFIRMATION", "MNQ BULLISH CONFIRMATION")
                                    for t in recent)
     has_bearish_confirmation = any(t in ("MGC BEARISH CONFIRMATION", "MNQ BEARISH CONFIRMATION")
                                    for t in recent)
 
-    # ── Proximity (0.75%) ──
+    # ── Proximity ("at zone" window, mode-dependent) ──
     def dist(a, b):
         return abs(a - b) / b if b else float("inf")
 
-    at_supply = nearest_supply is not None and dist(nearest_supply, current_price) <= WATCH_PCT
-    at_demand = nearest_demand is not None and dist(current_price, nearest_demand) <= WATCH_PCT
+    watch_pct = cfg("WATCH_PCT")
+    at_supply = nearest_supply is not None and dist(nearest_supply, current_price) <= watch_pct
+    at_demand = nearest_demand is not None and dist(current_price, nearest_demand) <= watch_pct
 
-    bearish_dominant = (bearish - bullish) >= BIAS_THRESHOLD
-    bullish_dominant = (bullish - bearish) >= BIAS_THRESHOLD
+    bt = cfg("BIAS_THRESHOLD")
+    bearish_dominant = (bearish - bullish) >= bt
+    bullish_dominant = (bullish - bearish) >= bt
 
     sup_str = f"${nearest_supply:.2f}" if nearest_supply else "—"
     dem_str = f"${nearest_demand:.2f}" if nearest_demand else "—"
@@ -1633,7 +1730,11 @@ def full_analysis(current_price_override=None):
         )
     # ──────────────────────────────────────────────────────────────────────────
 
-    bullish, bearish, counts = calculate_scores()
+    score_window = cfg("SCORE_WINDOW_MIN")
+    if score_window:
+        bullish, bearish, counts = score_alerts(alerts_in_window(score_window))
+    else:
+        bullish, bearish, counts = calculate_scores()
     bias, strength           = calculate_bias(bullish, bearish)
     confidence               = calculate_confidence(bullish, bearish)
     quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
@@ -1664,13 +1765,18 @@ def full_analysis(current_price_override=None):
         current_price, nearest_supply, nearest_demand, last_price_by_type
     )
 
-    # ── Confidence gate: suppress plan below 70 % or when structure is undefined ──
-    _plan_eligible = (confidence >= 70 and structure_class not in ("Undefined", "Bullish Attempt", "Bearish Attempt"))
+    # ── Confidence gate: suppress plan below the watch tier or when structure is undefined ──
+    # SCALP allows BOS-only ("Attempt") structures; SWING blocks them until a CHOCH confirms.
+    _conf_watch = cfg("CONF_WATCH")
+    _blocked_classes = ("Undefined",)
+    if not cfg("ATTEMPT_TRADABLE"):
+        _blocked_classes += ("Bullish Attempt", "Bearish Attempt")
+    _plan_eligible = (confidence >= _conf_watch and structure_class not in _blocked_classes)
     if not _plan_eligible:
         trade_plan = {
             "trade_plan": False,
-            "reason":     (f"Confidence {confidence}% — below 70 % threshold. No trade plan."
-                           if confidence < 70 else
+            "reason":     (f"Confidence {confidence}% — below {_conf_watch}% threshold. No trade plan."
+                           if confidence < _conf_watch else
                            "Structure not yet confirmed. No trade plan."),
             "entry_zone": None, "stop_loss": None,
             "target1":    None, "target2":   None,
@@ -2268,7 +2374,11 @@ def webhook():
     if a.get("zone_mitigated_near"):
         sizing = {}
     else:
-        sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct, profile_name)
+        # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
+        _risk_mult = (cfg("RISK_MULT_ATTEMPT")
+                      if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
+                      else 1.0)
+        sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
 
     # ── Active trade: check events, build embed field ──
     ati = None
@@ -2473,7 +2583,8 @@ def price_context():
     nearest_supply, nearest_demand = get_nearest_levels(CURRENT_PRICE, all_supply, all_demand)
     structure_label, structure_detail = get_market_structure(CURRENT_PRICE, last_price_by_type)
     structure_class = classify_structure(structure_label)
-    bullish, bearish, counts = calculate_scores()
+    _sw = cfg("SCORE_WINDOW_MIN")
+    bullish, bearish, counts = score_alerts(alerts_in_window(_sw)) if _sw else calculate_scores()
     bias, _ = calculate_bias(bullish, bearish)
     risk_label, risk_detail, overextended = get_risk_zone(
         bias, CURRENT_PRICE, nearest_supply, nearest_demand
@@ -2506,6 +2617,7 @@ def status():
     return jsonify({
         "status":              "running",
         "version":             "11.0",
+        "trading_mode":        TRADING_MODE,
         "verdict":             a["verdict"],
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
@@ -2581,7 +2693,11 @@ def enter_trade():
         profile   = str(data.get("profile", DEFAULT_PROFILE))
         acct_size = ACCOUNT_PROFILES.get(profile, {}).get("account_size", DEFAULT_ACCOUNT_SIZE)
         risk_pct  = ACCOUNT_PROFILES.get(profile, {}).get("risk_pct", DEFAULT_RISK_PCT)
-        sz        = calculate_position_sizing(tp, acct_size, risk_pct, profile)
+        # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
+        _risk_mult = (cfg("RISK_MULT_ATTEMPT")
+                      if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
+                      else 1.0)
+        sz        = calculate_position_sizing(tp, acct_size, risk_pct * _risk_mult, profile)
         contracts = int(sz.get("contracts", 1)) if sz else 1
 
     ACTIVE_TRADE = {
@@ -2946,20 +3062,42 @@ setInterval(refresh, 3000);
 @app.route("/ping", methods=["GET", "POST", "HEAD"])
 def ping():
     # Simple health/test endpoint — no alert logic. Used by UptimeRobot and for testing.
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "trading_mode": TRADING_MODE}), 200
+
+
+@app.route("/mode", methods=["GET", "POST"])
+def mode():
+    """Read or switch the active trading mode (SCALP / SWING) at runtime."""
+    global TRADING_MODE
+    if request.method == "POST":
+        data      = request.get_json(silent=True) or {}
+        requested = str(data.get("mode", "")).upper()
+        if requested not in MODES:
+            return jsonify({"status": "error",
+                            "reason": f"Unknown mode {requested!r}. Use one of {list(MODES)}."}), 400
+        TRADING_MODE = requested
+        logger.info("Trading mode switched to %s", TRADING_MODE)
+    return jsonify({
+        "status":          "ok",
+        "trading_mode":    TRADING_MODE,
+        "available_modes": list(MODES),
+        "thresholds":      MODES[TRADING_MODE],
+    }), 200
 
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "service":     "TradingView Webhook Server",
-        "version":     "11.0",
-        "alert_types": list(ALERT_TYPES.keys()),
+        "service":      "TradingView Webhook Server",
+        "version":      "11.0",
+        "trading_mode": TRADING_MODE,
+        "alert_types":  list(ALERT_TYPES.keys()),
         "endpoints":   {
             "POST /webhook":   "Receive TradingView alerts",
             "GET /alerts":     "View last 100 stored alerts",
             "GET /price":      "Price context, levels, structure, and risk zone",
             "GET /status":     "Full analysis with verdict and reasoning chain",
+            "GET|POST /mode":  "Read or switch trading mode (SCALP / SWING)",
             "POST /enter":     "Open an active trade (uses current trade plan or explicit params)",
             "POST /breakeven": "Move stop loss to entry price",
             "POST /close":     "Close the active trade manually",

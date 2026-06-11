@@ -59,6 +59,7 @@ router.all(
     "/price",
     "/alerts",
     "/status",
+    "/mode",
     "/journal",
     "/journal/",
     "/eod",
