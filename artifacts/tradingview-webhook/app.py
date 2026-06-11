@@ -67,6 +67,9 @@ ALERT_TYPES = {
     "MNQ ENTER":  {"side": "command", "score": 0},
     "MGC CLOSE":  {"side": "command", "score": 0},
     "MNQ CLOSE":  {"side": "command", "score": 0},
+    # ── Data-only VWAP push (updates the VWAP store; no scoring) ─────────────────
+    "MGC VWAP":   {"side": "data", "score": 0},
+    "MNQ VWAP":   {"side": "data", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -2509,6 +2512,7 @@ def active_trade_field(trade, current_price):
 
 
 _COMMAND_TYPES = {"MGC ENTER", "MNQ ENTER", "MGC CLOSE", "MNQ CLOSE"}
+_DATA_ONLY_TYPES = {"MGC VWAP", "MNQ VWAP"}
 
 
 def _handle_command_alert(normalized, data, parsed_price):
@@ -2661,6 +2665,19 @@ def webhook():
         if vwap_val is not None:
             vwap_key = instrument_of(data.get("ticker") or normalized)
             VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": now_utc().isoformat()}
+
+    # ── Data-only VWAP push — store already updated above; ack without scoring ──
+    if normalized in _DATA_ONLY_TYPES:
+        _vk = instrument_of(data.get("ticker") or normalized)
+        _vv, _vs = get_vwap(_vk)
+        logger.info("VWAP update: %s = %s (%s)", _vk, _vv, _vs)
+        return jsonify({
+            "status":      "vwap_updated",
+            "ticker":      _vk,
+            "vwap":        _vv,
+            "vwap_status": _vs,
+            "price":       parsed_price if parsed_price is not None else CURRENT_PRICE,
+        }), 200
 
     # ── Command types: ENTER / CLOSE — short-circuit before scoring ──────────
     if normalized in _COMMAND_TYPES:
@@ -3326,6 +3343,16 @@ def dashboard():
   <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
 </div>
 
+<!-- Manual VWAP — feeds the strict price-vs-VWAP gate -->
+<details class="vwap-set">
+  <summary>📌 Set VWAP for <span id="vwap-sym">MGC</span> — required for a READY signal</summary>
+  <div class="fields">
+    <div class="field"><label>VWAP value</label><input id="f-vwap" type="number" step="0.01" placeholder="read from your chart"></div>
+    <div class="field"><label>Current price (optional)</label><input id="f-vwap-price" type="number" step="0.1" placeholder="optional"></div>
+  </div>
+  <button class="btn" style="background:#16203a;color:#9ec5ff;border:1px solid #2a3a5a" onclick="setVwap()">Set VWAP</button>
+</details>
+
 <!-- Direction -->
 <div class="dir-row">
   <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG</div>
@@ -3359,6 +3386,8 @@ let sym = 'MGC', dir = 'Long', activeTrade = null;
 function setSymbol(s) {
   sym = s;
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', (i===0&&s==='MGC')||(i===1&&s==='MNQ')));
+  const vs = document.getElementById('vwap-sym');
+  if (vs) vs.textContent = s;
   updateEnterBtn();
 }
 function setDir(d) {
@@ -3408,6 +3437,19 @@ async function enterTrade() {
   try {
     const d = await api('/webhook', body);
     if (d.status === 'entered') { toast('✅ Trade entered!'); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function setVwap() {
+  const v = document.getElementById('f-vwap').value;
+  const p = document.getElementById('f-vwap-price').value;
+  if (!v) { toast('Enter a VWAP value first', false); return; }
+  const body = { alert_type: sym+' VWAP', ticker: sym+'1!', vwap: parseFloat(v) };
+  if (p) body.price = parseFloat(p);
+  try {
+    const d = await api('/webhook', body);
+    if (d.status === 'vwap_updated') { toast('✅ VWAP set for '+sym); refresh(); }
     else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }
 }

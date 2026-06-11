@@ -32,3 +32,17 @@ workflow (it rebuilds on start).
   is always a routing/URL/proxy problem, never alert-processing logic.
 - When external alerts (TradingView) 404 but local `curl` to `/api/webhook` returns 200,
   the failing alerts are pointing at a wrong/old URL on the sender side, not a server bug.
+
+## Feeding new data inputs without touching the whitelist
+To push a NEW kind of data (e.g. VWAP) from TradingView or the dashboard without adding a
+Flask route + proxy-whitelist entry, reuse the already-whitelisted `/webhook` via a
+**data-only alert type**: register it in `ALERT_TYPES` with `side:"data"`, add it to the
+`_DATA_ONLY_TYPES` set, and short-circuit in `webhook()` AFTER price/VWAP ingestion but
+BEFORE the `_COMMAND_TYPES` check / `ALERT_HISTORY` append — returning a small ack.
+**Why:** keeps the change to one file (no proxy edit, no restart of api-server) and the
+early return keeps the data push out of scoring, zone logic, history, and `_active_ticker`.
+**How to apply:** `side:"data"` is inert — SUPPLY/DEMAND_TYPES only match bullish/bearish,
+score_alerts only sees ALERT_HISTORY (which data-only pushes never enter). Send the
+instrument either in `ticker` (`MGC1!`) or the alert-name prefix; `instrument_of()` resolves
+both. Note `CURRENT_PRICE` is a single global shared by both instruments — an optional price
+on a VWAP push for the non-active instrument will shift the active one's analysis price.
