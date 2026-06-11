@@ -47,6 +47,7 @@ def _log_incoming_request():
 
 ALERT_HISTORY    = deque(maxlen=100)
 CURRENT_PRICE    = None
+CURRENT_PRICE_BY_TICKER = {}   # {"MNQ": float, "MGC": float} — latest price per instrument (alert-driven)
 ACTIVE_TRADE     = None
 # Serialises the ENTER critical section (duplicate-check → place → record) so two
 # concurrent ENTER requests can never both open a live broker position.
@@ -165,6 +166,12 @@ def spec_for(ticker):
 
 def point_value_for(ticker):
     return INSTRUMENT_SPECS[instrument_of(ticker)]["point_value"]
+
+def current_price_for(ticker):
+    """Latest alert-driven price for a specific instrument (None if none seen).
+    Strictly per-instrument — never falls back across instruments, so an MNQ view
+    cannot show MGC's price against MNQ's VWAP."""
+    return CURRENT_PRICE_BY_TICKER.get(instrument_of(ticker))
 
 ACCOUNT_PROFILES = {
     "MGC Conservative": {"account_size": 50_000,  "risk_pct": 0.005},
@@ -2113,11 +2120,14 @@ def build_strict_trade_plan(direction, ticker, current_price,
 # Full analysis
 # ---------------------------------------------------------------------------
 
-def full_analysis(current_price_override=None):
+def full_analysis(current_price_override=None, ticker_override=None):
+    # Which instrument this analysis is for: an explicit override (dashboard tab)
+    # wins; otherwise fall back to the most-recently-alerted instrument.
+    active_ticker = instrument_of(ticker_override) if ticker_override else _active_ticker()
     # ── ZONE MITIGATION HARD GATE — skip ALL computation ──────────────────────
     if ZONE_MITIGATED_FLAG and ZONE_BROKEN_AT is None:
         _mz_price = MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None
-        _cp       = current_price_override if current_price_override is not None else CURRENT_PRICE
+        _cp       = current_price_override if current_price_override is not None else current_price_for(active_ticker)
         return dict(
             bullish=0, bearish=0, counts={},
             bias="Choppy", strength=1, confidence=0,
@@ -2157,7 +2167,7 @@ def full_analysis(current_price_override=None):
             strict_reason="Zone consumed — wait for fresh supply or demand zone.",
             strict_missing=[], confluences={},
             vwap_value=None, vwap_status="n/a",
-            active_ticker=_active_ticker(),
+            active_ticker=active_ticker,
         )
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -2172,7 +2182,7 @@ def full_analysis(current_price_override=None):
     edge_score               = calculate_edge_score(bias, confidence, strength)
 
     last_price_by_type, all_supply, all_demand = get_price_context()
-    current_price = current_price_override if current_price_override is not None else CURRENT_PRICE
+    current_price = current_price_override if current_price_override is not None else current_price_for(active_ticker)
     nearest_supply, nearest_demand = get_nearest_levels(current_price, all_supply, all_demand)
 
     structure_label, structure_detail = get_market_structure(current_price, last_price_by_type)
@@ -2194,7 +2204,7 @@ def full_analysis(current_price_override=None):
     # ── Strict recommendation ruleset — AUTHORITATIVE verdict ────────────────
     # A trade is recommended ONLY when BOS + CHOCH + 5m confirmation candle + the
     # price-vs-VWAP filter all align on one side. Score 0-100 → Strong/Possible/WAIT.
-    active_ticker           = _active_ticker()
+    # active_ticker resolved at the top (honours the dashboard's instrument tab).
     vwap_value, vwap_status = get_vwap(active_ticker)
     strict = evaluate_strict_setup(
         current_price, active_ticker, vwap_value, vwap_status,
@@ -2829,6 +2839,7 @@ def webhook():
 
     if parsed_price is not None:
         CURRENT_PRICE = parsed_price
+        CURRENT_PRICE_BY_TICKER[instrument_of(data.get("ticker") or normalized)] = parsed_price
 
     # ── VWAP ingestion (required input for the strict price-vs-VWAP filter) ──
     raw_vwap = data.get("vwap")
@@ -3181,7 +3192,11 @@ def price_context():
 
 @app.route("/status", methods=["GET"])
 def status():
-    a = full_analysis()
+    # The dashboard's MGC/MNQ tab passes ?ticker= so the view follows the selected
+    # instrument; ignore junk values and fall back to the active instrument.
+    _raw = (request.args.get("ticker") or "").upper()
+    _tk  = instrument_of(_raw) if ("MGC" in _raw or "MNQ" in _raw) else None
+    a = full_analysis(ticker_override=_tk)
     windows = {}
     for label, minutes in TIME_WINDOWS.items():
         w_counts, w_total = window_summary(minutes)
@@ -3675,6 +3690,7 @@ function setSymbol(s) {
   const vs = document.getElementById('vwap-sym');
   if (vs) vs.textContent = s;
   updateEnterBtn();
+  refreshRec();   // switch the displayed analysis to the selected instrument now
 }
 function setDir(d) {
   dir = d;
@@ -3845,7 +3861,7 @@ function ckItem(label, ok) {
 }
 async function refreshRec() {
   try {
-    const d = await api('/status');
+    const d = await api('/status?ticker='+encodeURIComponent(sym));
     lastRec = d;
     const badge  = document.getElementById('rec-badge');
     const meta   = document.getElementById('rec-meta');
