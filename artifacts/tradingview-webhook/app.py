@@ -64,6 +64,8 @@ ACCOUNT_PROFILES = {
 }
 DEFAULT_PROFILE = "MGC Standard"
 
+BOT_NAME = "🤖 AI Trading Partner"
+
 DISCORD_WEBHOOK_URL         = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_MNQ_WEBHOOK_URL     = os.environ.get("DISCORD_MNQ_WEBHOOK_URL", "")
 DISCORD_JOURNAL_WEBHOOK_URL = os.environ.get("DISCORD_JOURNAL_WEBHOOK_URL", "")
@@ -956,7 +958,7 @@ def send_zone_mitigated_message(alert_data, mitigated_price):
 
     embed = {
         "type":        "rich",
-        "author":      {"name": "🤖 AI Trading Partner"},
+        "author":      {"name": BOT_NAME},
         "title":       "⏸ ZONE MITIGATED",
         "description": f"**{ticker}** · {price_str} · Zone consumed — no trade setup available",
         "color":       0xFFAA00,
@@ -1189,7 +1191,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         _context_title = "👀 WATCHLIST SETUP"
 
     embed = {
-        "author":      {"name": "🤖 AI Trading Partner"},
+        "author":      {"name": BOT_NAME},
         "title":       _context_title,
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
@@ -1670,7 +1672,7 @@ def send_journal_discord_embed(entry):
         chain_text = chain_text[:900] + "…"
 
     embed = {
-        "author":      {"name": "🤖 AI Trading Partner Journal"},
+        "author":      {"name": f"{BOT_NAME} Journal"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
         "description": f"**{entry['setup_stage']}**  ·  Verdict: **{entry['verdict']}**",
         "color":       color,
