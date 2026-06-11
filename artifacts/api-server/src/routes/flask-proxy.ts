@@ -48,6 +48,8 @@ function proxyToFlask(req: any, res: any) {
 
 router.all(
   [
+    "/",
+    "/ping",
     "/webhook",
     "/enter",
     "/breakeven",

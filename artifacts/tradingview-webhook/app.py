@@ -10,6 +10,23 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+@app.before_request
+def _log_incoming_request():
+    # Skip the dashboard's 3-second polling so the log stays readable.
+    if request.path == "/trade" and request.method == "GET":
+        return
+    try:
+        body = request.get_data(as_text=True)
+    except Exception:
+        body = "<unreadable>"
+    logger.info(
+        "INCOMING %s %s | BODY: %s",
+        request.method,
+        request.path,
+        (body[:500] if body else "<empty>"),
+    )
+
 ALERT_HISTORY    = deque(maxlen=100)
 CURRENT_PRICE    = None
 ACTIVE_TRADE     = None
@@ -2924,6 +2941,12 @@ setInterval(refresh, 3000);
 </body>
 </html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/ping", methods=["GET", "POST", "HEAD"])
+def ping():
+    # Simple health/test endpoint — no alert logic. Used by UptimeRobot and for testing.
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/", methods=["GET"])
