@@ -9,9 +9,11 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ALERT_HISTORY = deque(maxlen=100)
-CURRENT_PRICE = None
-ACTIVE_TRADE  = None  # v12: active trade tracking
+ALERT_HISTORY    = deque(maxlen=100)
+CURRENT_PRICE    = None
+ACTIVE_TRADE     = None   # v12: active trade tracking
+ZONE_BROKEN_AT   = None   # {"price": float, "alerts_since": int}
+MITIGATED_PRICES = []     # [{"price": float, "ts": str}]
 
 ALERT_TYPES = {
     "MGC NEW SUPPLY ZONE":       {"side": "bearish", "score": 1},
@@ -22,6 +24,11 @@ ALERT_TYPES = {
     "BOS SUPPLY":                {"side": "bearish", "score": 2},
     "CHOCH DEMAND":              {"side": "bullish", "score": 3},
     "BOS DEMAND":                {"side": "bullish", "score": 2},
+    # Zone state alerts (neutral — side effects only, no score contribution)
+    "MGC ZONE BROKEN":           {"side": "neutral", "score": 0},
+    "MGC ZONE MITIGATED":        {"side": "neutral", "score": 0},
+    "MNQ ZONE BROKEN":           {"side": "neutral", "score": 0},
+    "MNQ ZONE MITIGATED":        {"side": "neutral", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -861,7 +868,10 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          nearest_supply, nearest_demand,
                          risk_label, risk_detail,
                          last_price_by_type,
-                         active_trade_info=None):
+                         active_trade_info=None,
+                         zone_broken_active=False,
+                         zone_mitigated_near=False,
+                         mitigated_zone_price=None):
     if not DISCORD_WEBHOOK_URL:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
         return
@@ -977,6 +987,23 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  f"**{risk_label}**\n{risk_detail}",
             "inline": False,
         },
+        # ── Zone Status (conditional) ──
+        *([{
+            "name":   "🚫  Structure Invalidated",
+            "value":  (
+                f"Zone broken at `{float(ZONE_BROKEN_AT['price']):.1f}` — setup cancelled. "
+                f"Confidence reduced. Wait for structure to rebuild."
+            ),
+            "inline": False,
+        }] if zone_broken_active and ZONE_BROKEN_AT else
+        [{
+            "name":   "⚠️  Zone Consumed",
+            "value":  (
+                f"Nearest zone was previously mitigated at `{float(mitigated_zone_price):.1f}`. "
+                f"Confidence reduced. Avoid entry from this level."
+            ),
+            "inline": False,
+        }] if zone_mitigated_near and mitigated_zone_price is not None else []),
         # ── Windows ──
         *window_fields,
         # ── Action / Permissions ──
@@ -1131,6 +1158,56 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
 
 
 # ---------------------------------------------------------------------------
+# Zone Broken / Mitigated helpers
+# ---------------------------------------------------------------------------
+
+ZONE_BROKEN_EXPIRY       = 5      # Expire ZONE_BROKEN_AT after N subsequent non-zone alerts
+MITIGATED_TOLERANCE_PCT  = 0.003  # 0.3% proximity check for consumed zone warning
+
+
+def _handle_zone_broken(price):
+    """Cancel pending directional setup and record the broken zone event."""
+    global ZONE_BROKEN_AT, ALERT_HISTORY
+    ZONE_BROKEN_AT = {"price": price, "alerts_since": 0}
+    directional = SUPPLY_TYPES | DEMAND_TYPES
+    # Remove last 5 directional setup alerts from history to cancel pending setup
+    history_list = list(ALERT_HISTORY)
+    # Exclude the ZONE BROKEN record itself (last item); reverse scan to cancel most recent first
+    kept      = []
+    cancelled = 0
+    for rec in reversed(history_list[:-1]):
+        if cancelled < 5 and rec.get("alert_type") in directional:
+            cancelled += 1
+            continue
+        kept.append(rec)
+    kept.reverse()
+    # Also re-add the ZONE BROKEN record at the end
+    kept.append(history_list[-1])
+    ALERT_HISTORY.clear()
+    ALERT_HISTORY.extend(kept)
+    logger.info("Zone broken at %.1f — cancelled %d directional alerts", price, cancelled)
+
+
+def _handle_zone_mitigated(price):
+    """Record the consumed zone level to prevent duplicate entries."""
+    global MITIGATED_PRICES
+    MITIGATED_PRICES.append({"price": price, "ts": datetime.now(timezone.utc).isoformat()})
+    MITIGATED_PRICES = MITIGATED_PRICES[-10:]   # keep last 10
+    logger.info("Zone mitigated at %.1f — %d levels tracked", price, len(MITIGATED_PRICES))
+
+
+def is_near_mitigated_zone(price):
+    """Return (True, consumed_price) if price is within MITIGATED_TOLERANCE_PCT of any mitigated zone."""
+    if price is None or not MITIGATED_PRICES:
+        return False, None
+    for mz in MITIGATED_PRICES:
+        ref = mz["price"]
+        if ref and abs(price - ref) / ref <= MITIGATED_TOLERANCE_PCT:
+            return True, ref
+    return False, None
+
+
+# ---------------------------------------------------------------------------
 # Full analysis
 # ---------------------------------------------------------------------------
 
@@ -1174,6 +1251,24 @@ def full_analysis(current_price_override=None):
     if setup_stage not in READY_STAGES:
         verdict = "WAIT"
 
+    # ── Zone Broken: cancel setup, reduce confidence, mark structure invalidated ──
+    zone_broken_active = ZONE_BROKEN_AT is not None
+    if zone_broken_active:
+        confidence         = max(0, confidence - 30)
+        setup_stage        = "No Setup"
+        stage_next_step    = "Wait for structure to rebuild after zone break"
+        stage_entry_rule   = "—"
+        stage_invalidation = "Structure invalidated — zone broken"
+        verdict            = "WAIT"
+
+    # ── Zone Mitigated: warn if nearest levels are near a consumed zone ──
+    near_sup_mz, mz_sup_price = is_near_mitigated_zone(nearest_supply)
+    near_dem_mz, mz_dem_price = is_near_mitigated_zone(nearest_demand)
+    zone_mitigated_near  = (near_sup_mz or near_dem_mz) and not zone_broken_active
+    mitigated_zone_price = mz_sup_price or mz_dem_price
+    if zone_mitigated_near:
+        confidence = max(0, confidence - 15)
+
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
     plan = build_trade_plan(bias, strength, bullish, bearish, counts)
@@ -1198,6 +1293,9 @@ def full_analysis(current_price_override=None):
         structure_label=structure_label, structure_class=structure_class,
         structure_detail=structure_detail,
         risk_label=risk_label, risk_detail=risk_detail, overextended=overextended,
+        zone_broken_active=zone_broken_active,
+        zone_mitigated_near=zone_mitigated_near,
+        mitigated_zone_price=mitigated_zone_price,
     )
 
 
@@ -1321,7 +1419,7 @@ def active_trade_field(trade, current_price):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE, ACTIVE_TRADE
+    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT
 
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -1356,6 +1454,22 @@ def webhook():
         "raw":        data,
     }
     ALERT_HISTORY.append(record)
+
+    # ── Zone event side-effects ──
+    _zone_neutral = ("MGC ZONE BROKEN", "MNQ ZONE BROKEN", "MGC ZONE MITIGATED", "MNQ ZONE MITIGATED")
+    if normalized in ("MGC ZONE BROKEN", "MNQ ZONE BROKEN"):
+        if parsed_price is not None:
+            _handle_zone_broken(parsed_price)
+        else:
+            ZONE_BROKEN_AT = {"price": None, "alerts_since": 0}
+    elif normalized in ("MGC ZONE MITIGATED", "MNQ ZONE MITIGATED"):
+        if parsed_price is not None:
+            _handle_zone_mitigated(parsed_price)
+    elif ZONE_BROKEN_AT is not None and normalized not in _zone_neutral:
+        ZONE_BROKEN_AT["alerts_since"] = ZONE_BROKEN_AT.get("alerts_since", 0) + 1
+        if ZONE_BROKEN_AT["alerts_since"] >= ZONE_BROKEN_EXPIRY:
+            ZONE_BROKEN_AT = None
+            logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
 
     # ── Account Profile selection ──
     profile_name = str(data.get("profile") or DEFAULT_PROFILE).strip()
@@ -1407,6 +1521,9 @@ def webhook():
         a["risk_label"], a["risk_detail"],
         a["last_price_by_type"],
         ati,
+        zone_broken_active=a.get("zone_broken_active", False),
+        zone_mitigated_near=a.get("zone_mitigated_near", False),
+        mitigated_zone_price=a.get("mitigated_zone_price"),
     )
 
     logger.info(
@@ -1459,9 +1576,11 @@ def get_alerts():
 
 @app.route("/clear", methods=["POST"])
 def clear_alerts():
-    global CURRENT_PRICE
+    global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES
     ALERT_HISTORY.clear()
-    CURRENT_PRICE = None
+    CURRENT_PRICE    = None
+    ZONE_BROKEN_AT   = None
+    MITIGATED_PRICES = []
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
 
