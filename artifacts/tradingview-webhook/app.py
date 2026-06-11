@@ -148,7 +148,7 @@ def _discord_url(hint: str = "") -> str:
     return DISCORD_WEBHOOK_URL
 
 
-HEARTBEAT_INTERVAL = 3600  # seconds
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 900))  # seconds (default 15 min)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 
 
@@ -189,7 +189,7 @@ def _send_heartbeat():
             {"name": "Active trade",        "value": trade_str,  "inline": True},
             {"name": "Status",              "value": status_str, "inline": True},
         ],
-        "footer": {"text": now.strftime("Hourly check-in  ·  %Y-%m-%d %H:%M UTC")},
+        "footer": {"text": now.strftime("Check-in  ·  %Y-%m-%d %H:%M UTC")},
     }
 
     for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL]):
@@ -197,7 +197,7 @@ def _send_heartbeat():
             requests.post(url, json={"embeds": [embed]}, timeout=5)
         except Exception:
             pass
-    logger.info("Hourly heartbeat sent.")
+    logger.info("Heartbeat sent.")
 
 
 def _heartbeat_loop():
@@ -3108,6 +3108,6 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every hour
+    threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
     _schedule_eod()                               # schedule daily EOD summary
     app.run(host="0.0.0.0", port=port, debug=False)
