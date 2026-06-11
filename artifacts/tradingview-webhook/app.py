@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import threading
 from collections import deque
@@ -6,9 +7,25 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 import requests
 
+import tradovate as tv
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+_REDACT_RE = re.compile(
+    r'("(?:exec_secret|password|sec|cid|token|accessToken|deviceId)"\s*:\s*")[^"]*(")',
+    re.IGNORECASE,
+)
+
+
+def _redact(text: str) -> str:
+    """Mask sensitive values before they reach the request log."""
+    try:
+        return _REDACT_RE.sub(r"\1***\2", text)
+    except Exception:
+        return text
 
 
 @app.before_request
@@ -24,7 +41,7 @@ def _log_incoming_request():
         "INCOMING %s %s | BODY: %s",
         request.method,
         request.path,
-        (body[:500] if body else "<empty>"),
+        (_redact(body)[:500] if body else "<empty>"),
     )
 
 ALERT_HISTORY    = deque(maxlen=100)
@@ -2515,6 +2532,23 @@ _COMMAND_TYPES = {"MGC ENTER", "MNQ ENTER", "MGC CLOSE", "MNQ CLOSE"}
 _DATA_ONLY_TYPES = {"MGC VWAP", "MNQ VWAP"}
 
 
+def _broker_should_execute(data):
+    """True only when live execution is ON *and* the request is an authorised
+    manual action. Raw TradingView alerts omit these fields, so the public
+    webhook can never auto-fire a real order.
+
+    Gate: if TRADOVATE_EXEC_SECRET is set, the request must carry a matching
+    ``exec_secret``; otherwise the request must carry ``manual: true`` (which
+    only the dashboard sends).
+    """
+    if not tv.execution_on():
+        return False
+    secret = os.environ.get("TRADOVATE_EXEC_SECRET", "")
+    if secret:
+        return str(data.get("exec_secret", "")) == secret
+    return bool(data.get("manual"))
+
+
 def _handle_command_alert(normalized, data, parsed_price):
     """Execute ENTER / CLOSE trade commands sent via TradingView webhook.
 
@@ -2554,6 +2588,34 @@ def _handle_command_alert(normalized, data, parsed_price):
 
         direction = str(data.get("direction", "Long"))
         contracts = int(data.get("contracts", 1))
+        symbol    = instrument_of(normalized)
+
+        # ── Live broker execution (gated; OFF by default) ──────────────────
+        broker = None
+        if _broker_should_execute(data):
+            if ACTIVE_TRADE:
+                return jsonify({"status": "error",
+                                "reason": "A trade is already active — close it before entering a new one."}), 409
+            broker = tv.place_bracket(direction, symbol, entry, stop, t1, t2, contracts)
+            if not broker.get("ok"):
+                # Keep tracking only if part of the order actually filled, so the
+                # operator can flatten it; a full rejection is never a success.
+                if broker.get("orders"):
+                    contracts = broker.get("contracts", contracts)
+                    ACTIVE_TRADE = {
+                        "direction": direction, "entry_price": entry,
+                        "stop_loss": stop, "target1": t1, "target2": t2,
+                        "contracts": contracts, "profile": profile,
+                        "symbol": symbol, "opened_at": now_utc().isoformat(),
+                        "t1_hit": False, "t2_hit": False, "status": "active",
+                        "broker": broker,
+                    }
+                return jsonify({"status": "error",
+                                "reason": ("Broker rejected the order — no live position opened."
+                                           if not broker.get("orders")
+                                           else "Broker order only partially filled — review the position."),
+                                "broker": broker}), 502
+            contracts = broker.get("contracts", contracts)
 
         ACTIVE_TRADE = {
             "direction":   direction,
@@ -2563,10 +2625,12 @@ def _handle_command_alert(normalized, data, parsed_price):
             "target2":     t2,
             "contracts":   contracts,
             "profile":     profile,
+            "symbol":      symbol,
             "opened_at":   now_utc().isoformat(),
             "t1_hit":      False,
             "t2_hit":      False,
             "status":      "active",
+            "broker":      broker,
         }
         content = (
             f"✅ **TRADE ENTERED — {direction.upper()}**\n"
@@ -2580,11 +2644,19 @@ def _handle_command_alert(normalized, data, parsed_price):
             except Exception:
                 pass
         logger.info("ENTER command: %s %s @ %.1f", direction, profile, entry)
-        return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+        return jsonify({"status": "entered", "trade": ACTIVE_TRADE, "broker": broker}), 200
 
     # ── CLOSE ─────────────────────────────────────────────────────────────
     if not ACTIVE_TRADE:
         return jsonify({"status": "error", "reason": "No active trade to close."}), 400
+
+    flat = None
+    if _broker_should_execute(data):
+        flat = tv.flatten(ACTIVE_TRADE.get("symbol") or instrument_of(profile))
+        if not flat.get("ok"):
+            return jsonify({"status": "error",
+                            "reason": "Broker flatten failed — the position may still be open.",
+                            "broker": flat}), 502
 
     exit_price = parsed_price
     closed     = dict(ACTIVE_TRADE)
@@ -2619,7 +2691,7 @@ def _handle_command_alert(normalized, data, parsed_price):
         except Exception:
             pass
     logger.info("CLOSE command: %s", outcome_str)
-    return jsonify({"status": "closed", "trade": closed}), 200
+    return jsonify({"status": "closed", "trade": closed, "broker": flat}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -3107,6 +3179,33 @@ def enter_trade():
         sz        = calculate_position_sizing(tp, acct_size, risk_pct * _risk_mult, profile)
         contracts = int(sz.get("contracts", 1)) if sz else 1
 
+    symbol = instrument_of(profile)
+
+    # ── Live broker execution (gated; OFF by default) ──────────────────────
+    broker = None
+    if _broker_should_execute(data):
+        if ACTIVE_TRADE:
+            return jsonify({"status": "error",
+                            "reason": "A trade is already active — close it before entering a new one."}), 409
+        broker = tv.place_bracket(direction, symbol, entry, stop, t1, t2, contracts)
+        if not broker.get("ok"):
+            if broker.get("orders"):
+                contracts = broker.get("contracts", contracts)
+                ACTIVE_TRADE = {
+                    "direction": direction, "entry_price": entry,
+                    "stop_loss": stop, "target1": t1, "target2": t2,
+                    "contracts": contracts, "profile": profile,
+                    "symbol": symbol, "opened_at": now_utc().isoformat(),
+                    "t1_hit": False, "t2_hit": False, "status": "active",
+                    "broker": broker,
+                }
+            return jsonify({"status": "error",
+                            "reason": ("Broker rejected the order — no live position opened."
+                                       if not broker.get("orders")
+                                       else "Broker order only partially filled — review the position."),
+                            "broker": broker}), 502
+        contracts = broker.get("contracts", contracts)
+
     ACTIVE_TRADE = {
         "direction":   direction,
         "entry_price": entry,
@@ -3115,10 +3214,12 @@ def enter_trade():
         "target2":     t2,
         "contracts":   contracts,
         "profile":     profile,
+        "symbol":      symbol,
         "opened_at":   now_utc().isoformat(),
         "t1_hit":      False,
         "t2_hit":      False,
         "status":      "active",
+        "broker":      broker,
     }
 
     content = (
@@ -3135,7 +3236,7 @@ def enter_trade():
         pass
 
     logger.info("Trade entered: %s @ %.1f", direction, entry)
-    return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+    return jsonify({"status": "entered", "trade": ACTIVE_TRADE, "broker": broker}), 200
 
 
 @app.route("/breakeven", methods=["POST"])
@@ -3143,6 +3244,19 @@ def set_breakeven():
     global ACTIVE_TRADE
     if not ACTIVE_TRADE:
         return jsonify({"status": "error", "reason": "No active trade."}), 400
+    data = request.get_json(force=True, silent=True) or {}
+
+    broker = None
+    if _broker_should_execute(data):
+        broker = tv.move_stop_to_breakeven(
+            ACTIVE_TRADE.get("symbol") or instrument_of(ACTIVE_TRADE.get("profile", "")),
+            ACTIVE_TRADE["entry_price"],
+        )
+        if not broker.get("ok"):
+            return jsonify({"status": "error",
+                            "reason": "Broker stop modify failed — stop unchanged.",
+                            "broker": broker}), 502
+
     old_stop = ACTIVE_TRADE["stop_loss"]
     ACTIVE_TRADE["stop_loss"] = ACTIVE_TRADE["entry_price"]
     content = (
@@ -3157,7 +3271,7 @@ def set_breakeven():
     except requests.RequestException:
         pass
     logger.info("Breakeven set: stop moved to %.1f", ACTIVE_TRADE["entry_price"])
-    return jsonify({"status": "breakeven_set", "stop_loss": ACTIVE_TRADE["stop_loss"]}), 200
+    return jsonify({"status": "breakeven_set", "stop_loss": ACTIVE_TRADE["stop_loss"], "broker": broker}), 200
 
 
 @app.route("/close", methods=["POST"])
@@ -3166,6 +3280,15 @@ def close_trade():
     if not ACTIVE_TRADE:
         return jsonify({"status": "error", "reason": "No active trade."}), 400
     data       = request.get_json(force=True, silent=True) or {}
+
+    flat = None
+    if _broker_should_execute(data):
+        flat = tv.flatten(ACTIVE_TRADE.get("symbol") or instrument_of(ACTIVE_TRADE.get("profile", "")))
+        if not flat.get("ok"):
+            return jsonify({"status": "error",
+                            "reason": "Broker flatten failed — the position may still be open.",
+                            "broker": flat}), 502
+
     exit_price = CURRENT_PRICE
     try:
         if data.get("price"):
@@ -3206,7 +3329,7 @@ def close_trade():
     except requests.RequestException:
         pass
     logger.info("Trade closed manually.")
-    return jsonify({"status": "closed", "trade": closed}), 200
+    return jsonify({"status": "closed", "trade": closed, "broker": flat}), 200
 
 
 @app.route("/trade", methods=["GET"])
@@ -3234,6 +3357,26 @@ def eod_trigger():
     """Manually trigger the end-of-day summary."""
     _send_eod_summary()
     return jsonify({"status": "sent"}), 200
+
+
+@app.route("/broker/status", methods=["GET"])
+def broker_status():
+    """Execution-mode + cached connection state for the dashboard badge."""
+    return jsonify(tv.status_snapshot()), 200
+
+
+@app.route("/broker/test", methods=["POST"])
+def broker_test():
+    """Force a live Tradovate self-test (auth + account + contract). No orders."""
+    return jsonify(tv.status_snapshot(force=True)), 200
+
+
+@app.route("/broker/toggle", methods=["POST"])
+def broker_toggle():
+    """Flip the runtime live-execution toggle (refuses to enable without creds)."""
+    data = request.get_json(force=True, silent=True) or {}
+    res = tv.set_execution(bool(data.get("on")))
+    return jsonify(res), (200 if res.get("ok") else 400)
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -3371,6 +3514,27 @@ def dashboard():
   </div>
 </details>
 
+<!-- Live execution panel -->
+<div id="broker-panel" style="margin:14px 0;padding:12px 14px;border:1px solid #1e1e32;border-radius:10px;background:#0c0c18">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span id="brk-dot" style="width:10px;height:10px;border-radius:50%;background:#555;display:inline-block"></span>
+      <span id="brk-mode" style="font-weight:700;font-size:13px;color:#888">Tracking-only</span>
+      <span id="brk-env" style="font-size:11px;color:#666;padding:2px 6px;border:1px solid #2a2a40;border-radius:5px"></span>
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#999;cursor:pointer">
+      <input type="checkbox" id="brk-toggle" onchange="toggleBroker()"> Live execution
+    </label>
+  </div>
+  <div id="brk-detail" style="margin-top:8px;font-size:11px;color:#777">Loading broker status…</div>
+  <div id="brk-secret-row" style="margin-top:8px;display:none">
+    <input id="f-exec-secret" type="password" placeholder="Execution secret" autocomplete="off"
+           style="width:100%;box-sizing:border-box;padding:6px 8px;background:#06060f;border:1px solid #2a2a40;border-radius:6px;color:#ddd;font-size:12px">
+  </div>
+  <button onclick="testBroker()"
+          style="margin-top:8px;padding:6px 10px;background:#14142a;border:1px solid #2a2a40;border-radius:6px;color:#aaa;font-size:11px;cursor:pointer">🔌 Test connection</button>
+</div>
+
 <!-- Action buttons -->
 <button class="btn btn-enter" id="btn-enter" onclick="enterTrade()">📈 ENTER LONG</button>
 <button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
@@ -3410,6 +3574,73 @@ function toast(msg, ok=true) {
   setTimeout(()=>t.classList.remove('show'), 2800);
 }
 
+function execSecret() {
+  const el = document.getElementById('f-exec-secret');
+  return el ? el.value.trim() : '';
+}
+// Stamp the manual-action markers so the gated broker logic will fire. Raw
+// TradingView alerts never carry these, so the public webhook cannot auto-trade.
+function withManual(body) {
+  body = body || {};
+  body.manual = true;
+  const xs = execSecret();
+  if (xs) body.exec_secret = xs;
+  return body;
+}
+async function refreshBroker() {
+  try {
+    const d = await api('/broker/status');
+    const dot = document.getElementById('brk-dot');
+    const mode = document.getElementById('brk-mode');
+    const envEl = document.getElementById('brk-env');
+    const detail = document.getElementById('brk-detail');
+    const toggle = document.getElementById('brk-toggle');
+    const secretRow = document.getElementById('brk-secret-row');
+    mode.textContent = d.mode_label || 'Tracking-only';
+    envEl.textContent = (d.env || '').toUpperCase();
+    toggle.checked = !!d.execution_on;
+    secretRow.style.display = d.exec_secret_required ? 'block' : 'none';
+    let color = '#555', mc = '#888';
+    if (d.execution_on) {
+      const connOk = d.connection && d.connection.ok;
+      color = connOk ? (d.live_env ? '#ef4444' : '#22c55e') : '#f59e0b';
+      mc = color;
+    }
+    dot.style.background = color;
+    mode.style.color = mc;
+    if (!d.creds_present) {
+      detail.textContent = 'Credentials not configured — execution disabled. Missing: ' + (d.missing_secrets||[]).join(', ');
+    } else if (d.connection && d.connection.ok) {
+      const cs = d.connection.contracts || {};
+      detail.textContent = 'Account ' + (d.connection.account||'—') + ' · ' +
+        Object.keys(cs).map(k=>k+' '+cs[k]).join(' · ') + ' · max ' + d.max_contracts + 'x';
+    } else if (d.connection && !d.connection.ok) {
+      detail.textContent = 'Connection error (' + (d.connection.stage||'?') + '): ' + (d.connection.error||'');
+    } else {
+      detail.textContent = 'Ready · ' + d.max_contracts + 'x max · click Test to verify connection';
+    }
+  } catch(e) {}
+}
+async function toggleBroker() {
+  const on = document.getElementById('brk-toggle').checked;
+  try {
+    const d = await api('/broker/toggle', { on: on });
+    if (d.ok) toast(on ? '🔴 Live execution ON' : '⚪ Live execution OFF');
+    else toast(d.error || 'Could not enable live execution', false);
+  } catch(e) { toast('Request failed', false); }
+  refreshBroker();
+}
+async function testBroker() {
+  toast('🔌 Testing connection…');
+  try {
+    const d = await api('/broker/test', {});
+    const c = d.connection;
+    if (c && c.ok) toast('✅ Connected · account ' + (c.account||''));
+    else toast('Test failed: ' + ((c&&(c.error||c.stage))||'unknown'), false);
+  } catch(e) { toast('Request failed', false); }
+  refreshBroker();
+}
+
 async function api(path, body=null) {
   const opts = { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'} };
   if (body) opts.body = JSON.stringify(body);
@@ -3434,9 +3665,10 @@ async function enterTrade() {
   if (t1) body.t1        = parseFloat(t1);
   if (t2) body.t2        = parseFloat(t2);
   if (c)  body.contracts = parseInt(c);
+  withManual(body);
   try {
     const d = await api('/webhook', body);
-    if (d.status === 'entered') { toast('✅ Trade entered!'); refresh(); }
+    if (d.status === 'entered') { toast('✅ Trade entered!'); refresh(); refreshBroker(); }
     else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }
 }
@@ -3456,17 +3688,17 @@ async function setVwap() {
 
 async function closeTrade() {
   try {
-    const d = await api('/close');
-    if (d.status === 'closed') { toast('🏁 Trade closed'); refresh(); }
+    const d = await api('/close', withManual({}));
+    if (d.status === 'closed') { toast('🏁 Trade closed'); refresh(); refreshBroker(); }
     else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }
 }
 
 async function breakeven() {
   try {
-    const d = await api('/breakeven', {});
-    toast('⚖️ Stop moved to breakeven');
-    refresh();
+    const d = await api('/breakeven', withManual({}));
+    if (d.status === 'breakeven_set') { toast('⚖️ Stop moved to breakeven'); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
   } catch(err) { toast('Request failed', false); }
 }
 
@@ -3604,8 +3836,8 @@ async function refresh() {
 }
 
 // Poll every 3 seconds
-refresh(); refreshRec();
-setInterval(() => { refresh(); refreshRec(); }, 3000);
+refresh(); refreshRec(); refreshBroker();
+setInterval(() => { refresh(); refreshRec(); refreshBroker(); }, 3000);
 </script>
 </body>
 </html>"""

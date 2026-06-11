@@ -4,3 +4,4 @@
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); invariants (SWING unchanged, Attempts reduced-size at every sizing site, MGC/MNQ string symmetry) any scoring change must keep.
 - [Strict trade ruleset](strict-trade-ruleset.md) — strict 4-condition checklist is the authoritative full_analysis verdict; conflict check must stay VWAP-independent, score base 75, WAIT never journals, alert templates must include `ticker`.
 - [full_analysis return-path key parity](full-analysis-return-parity.md) — full_analysis() has 2 return dicts (main + zone-mitigated early return) that must keep identical keys; a missing key is a state-dependent 500 invisible to fresh tests.
+- [Tradovate live execution](tradovate-execution.md) — broker order path is gated so the public webhook can never auto-trade; OFF/DEMO defaults, rejection≠success, partial-fill & flatten-cancel safety invariants, never-log-secrets.
