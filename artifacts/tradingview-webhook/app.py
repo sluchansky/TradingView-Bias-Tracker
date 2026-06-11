@@ -894,6 +894,57 @@ def _setup_stage_fields(setup_stage, next_step, entry_rule, stage_invalidation):
     ]
 
 
+def send_zone_mitigated_message(alert_data, mitigated_price):
+    """Minimal Discord embed for zone-consumed state — no scoring performed."""
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
+        return
+
+    ticker    = alert_data.get("ticker") or "MGC"
+    price     = alert_data.get("price")
+    price_str = f"${float(price):.2f}"  if price           is not None else "—"
+    mz_str    = f"${float(mitigated_price):.2f}" if mitigated_price is not None else "—"
+
+    embed = {
+        "type":        "rich",
+        "title":       "MGC Agent v10.1",
+        "description": f"**{ticker}** · {price_str} · ZONE MITIGATED",
+        "color":       0xFFAA00,
+        "fields": [
+            {
+                "name":   "🎯  Final Verdict",
+                "value":  "⏸ **WAIT**",
+                "inline": True,
+            },
+            {
+                "name":   "🚫  Zone Status",
+                "value":  f"**Consumed / Mitigated**\nMitigated at `{mz_str}`",
+                "inline": True,
+            },
+            {
+                "name":   "🗺️  Action",
+                "value":  "Wait for fresh supply or demand zone.",
+                "inline": False,
+            },
+            {
+                "name":   "💬  Reason",
+                "value":  (
+                    "Zone already reacted and is no longer valid for entry.\n\n"
+                    "No trade setup available."
+                ),
+                "inline": False,
+            },
+        ],
+        "footer": {"text": f"Zone consumed at {mz_str} · Scoring skipped"},
+    }
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.error("Discord zone-mitigated post failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("Discord zone-mitigated post exception: %s", exc)
+
+
 def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          confidence, quality, edge_score,
                          recommendation, verdict, reasoning_chain, why, plan,
@@ -1547,6 +1598,28 @@ def webhook():
         if ZONE_BROKEN_AT["alerts_since"] >= ZONE_BROKEN_EXPIRY:
             ZONE_BROKEN_AT = None
             logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
+
+    # ── Zone Mitigation: early exit — skip entire engine ──
+    _chk_price = parsed_price if parsed_price is not None else CURRENT_PRICE
+    if ZONE_BROKEN_AT is None and _chk_price is not None:
+        _mz_near, _mz_price = is_near_mitigated_zone(_chk_price)
+        if _mz_near:
+            send_zone_mitigated_message(record, _mz_price)
+            logger.info(
+                "Zone mitigated early exit — price %.1f near consumed zone %.1f",
+                _chk_price, _mz_price or 0,
+            )
+            return jsonify({
+                "status":       "zone_mitigated",
+                "alert_type":   normalized,
+                "ticker":       record.get("ticker"),
+                "price":        _chk_price,
+                "mitigated_at": _mz_price,
+                "verdict":      "WAIT",
+                "zone_status":  "Consumed / Mitigated",
+                "action":       "Wait for fresh supply or demand zone.",
+                "reason":       "Zone already reacted and is no longer valid for entry.",
+            }), 200
 
     # ── Account Profile selection ──
     profile_name = str(data.get("profile") or DEFAULT_PROFILE).strip()
