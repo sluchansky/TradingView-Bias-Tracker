@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 @app.before_request
 def _log_incoming_request():
     # Skip the dashboard's 3-second polling so the log stays readable.
-    if request.path == "/trade" and request.method == "GET":
+    if request.path in ("/trade", "/status") and request.method == "GET":
         return
     try:
         body = request.get_data(as_text=True)
@@ -3008,6 +3008,7 @@ def status():
         "confluences":         a.get("confluences"),
         "vwap_value":          a.get("vwap_value"),
         "vwap_status":         a.get("vwap_status"),
+        "active_ticker":       a.get("active_ticker"),
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
         "setup_stage":         a["setup_stage"],
@@ -3266,6 +3267,26 @@ def dashboard():
   .btn-be{background:#1e1e32;color:#a0a8ff;border:2px solid #a0a8ff;font-size:15px;padding:14px}
   .btn-eod{background:#1e1e32;color:#888;border:1px solid #2a2a40;font-size:13px;padding:12px;margin-top:6px}
   .btn:disabled{opacity:.4;cursor:not-allowed}
+  /* Recommendation card */
+  #rec-card{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:18px;margin-bottom:18px;transition:border-color .3s}
+  .rec-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  #rec-label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#555}
+  .rec-badge{font-size:13px;font-weight:800;padding:5px 12px;border-radius:20px;background:#1e1e32;color:#888;letter-spacing:.5px}
+  .rec-badge.ready-long{background:#0d1f14;color:#22c55e;border:1px solid #22c55e}
+  .rec-badge.ready-short{background:#1f0d0d;color:#ef4444;border:1px solid #ef4444}
+  .rec-badge.wait{background:#1f1a0d;color:#f59e0b;border:1px solid #5a4a1a}
+  #rec-meta{font-size:12px;color:#888;margin-bottom:12px;line-height:1.6}
+  .rec-score-wrap{height:8px;background:#0d0d18;border-radius:6px;overflow:hidden;margin-bottom:4px}
+  #rec-score-bar{height:100%;width:0;background:#f59e0b;border-radius:6px;transition:width .4s,background .4s}
+  #rec-score-num{font-size:11px;color:#666;text-align:right;margin-bottom:12px}
+  .rec-checklist{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .rec-item{display:flex;align-items:center;gap:8px;font-size:13px;padding:8px 10px;border-radius:8px;background:#0d0d18}
+  .rec-item .ck{font-size:13px;width:16px;text-align:center}
+  .rec-item.ok{color:#cfe9d6} .rec-item.no{color:#6a6a7a}
+  .rec-plan{font-size:13px;color:#bbb;line-height:1.8;background:#0d0d18;border-radius:10px;padding:12px;margin-bottom:10px;display:none}
+  .rec-plan b{color:#e8e8f0}
+  .rec-reason{font-size:12px;color:#888;line-height:1.5;font-style:italic}
+  .btn-apply{background:#16162a;color:#a0a8ff;border:2px solid #a0a8ff;font-size:14px;padding:13px;margin-top:12px;margin-bottom:0}
   /* Toast */
   #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1e1e32;color:#e8e8f0;padding:12px 24px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap}
   #toast.show{opacity:1}
@@ -3282,6 +3303,21 @@ def dashboard():
   <div id="trade-info">Loading…</div>
   <div id="trade-detail"></div>
   <div id="pnl"></div>
+</div>
+
+<!-- Live recommendation -->
+<div id="rec-card">
+  <div class="rec-head">
+    <span id="rec-label">Live Recommendation</span>
+    <span id="rec-badge" class="rec-badge wait">…</span>
+  </div>
+  <div id="rec-meta"></div>
+  <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
+  <div id="rec-score-num"></div>
+  <div id="rec-checklist" class="rec-checklist"></div>
+  <div id="rec-plan" class="rec-plan"></div>
+  <div id="rec-reason" class="rec-reason"></div>
+  <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
 </div>
 
 <!-- Symbol tabs -->
@@ -3399,6 +3435,92 @@ async function sendEod() {
   } catch(err) { toast('Request failed', false); }
 }
 
+let lastRec = null;
+function ckItem(label, ok) {
+  return '<div class="rec-item '+(ok?'ok':'no')+'"><span class="ck">'+(ok?'✅':'⬜')+'</span>'+label+'</div>';
+}
+async function refreshRec() {
+  try {
+    const d = await api('/status');
+    lastRec = d;
+    const badge  = document.getElementById('rec-badge');
+    const meta   = document.getElementById('rec-meta');
+    const bar    = document.getElementById('rec-score-bar');
+    const num    = document.getElementById('rec-score-num');
+    const list   = document.getElementById('rec-checklist');
+    const planEl = document.getElementById('rec-plan');
+    const reason = document.getElementById('rec-reason');
+    const apply  = document.getElementById('btn-apply');
+    const card   = document.getElementById('rec-card');
+
+    const v = d.verdict || 'WAIT';
+    const ready = v === 'LONG READY' || v === 'SHORT READY';
+    const dirReady = v === 'LONG READY' ? 'Long' : v === 'SHORT READY' ? 'Short' : null;
+
+    badge.textContent = v;
+    badge.className = 'rec-badge ' + (v==='LONG READY'?'ready-long':v==='SHORT READY'?'ready-short':'wait');
+    card.style.borderColor = v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b':'#1e1e32';
+
+    const inst  = d.active_ticker ? String(d.active_ticker).replace('1!','') : '—';
+    const price = d.current_price!=null ? d.current_price : '—';
+    const vwap  = (d.vwap_status==='ok' && d.vwap_value!=null)
+      ? Number(d.vwap_value).toFixed(1)
+      : 'n/a ('+(d.vwap_status||'—')+')';
+    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b>';
+
+    const score = d.strict_score!=null ? d.strict_score : 0;
+    bar.style.width = score + '%';
+    bar.style.background = score>=90 ? '#22c55e' : score>=75 ? '#a0a8ff' : '#f59e0b';
+    num.textContent = (d.strict_label||'WAIT') + ' · ' + score + '/100';
+
+    const c = d.confluences || {};
+    const ld = (d.strict_direction || c.direction || dirReady || '').toString();
+    const isShort = ld === 'Short';
+    list.innerHTML =
+      ckItem('BOS '+(isShort?'Supply':'Demand'), !!c.bos) +
+      ckItem((isShort?'Bearish':'Bullish')+' CHOCH', !!c.choch) +
+      ckItem('5m '+(isShort?'Bearish':'Bullish')+' Candle', !!c.confirmation) +
+      ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!c.vwap);
+
+    const tp = d.trade_plan || {};
+    if (ready && tp.trade_plan) {
+      planEl.style.display = 'block';
+      planEl.innerHTML =
+        'Entry <b>'+tp.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_loss+'</b><br>' +
+        'T1 <b>'+tp.target1+'</b> &nbsp;·&nbsp; T2 <b>'+tp.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(tp.rr!=null?tp.rr:'—')+'</b>';
+      apply.style.display = 'block';
+    } else {
+      planEl.style.display = 'none';
+      apply.style.display = 'none';
+    }
+
+    reason.textContent = d.strict_reason || '';
+  } catch(e) {}
+}
+
+function applyRec() {
+  if (!lastRec) return;
+  const tp = lastRec.trade_plan || {};
+  const dirReady = lastRec.verdict==='LONG READY' ? 'Long'
+                 : lastRec.verdict==='SHORT READY' ? 'Short' : null;
+  if (!dirReady || !tp.trade_plan) { toast('No ready setup to apply', false); return; }
+  const inst = (lastRec.active_ticker||'').toString().replace('1!','');
+  if (inst==='MGC' || inst==='MNQ') setSymbol(inst);
+  setDir(dirReady);
+  if (tp.entry_zone) {
+    const parts = String(tp.entry_zone).split('–');
+    if (parts.length===2) {
+      const mid = (parseFloat(parts[0]) + parseFloat(parts[1])) / 2;
+      if (!isNaN(mid)) document.getElementById('f-entry').value = mid.toFixed(1);
+    }
+  }
+  if (tp.stop_loss!=null) document.getElementById('f-stop').value = tp.stop_loss;
+  if (tp.target1!=null)   document.getElementById('f-t1').value   = tp.target1;
+  if (tp.target2!=null)   document.getElementById('f-t2').value   = tp.target2;
+  document.querySelector('details').open = true;
+  toast('⬇️ Setup applied — review & ENTER');
+}
+
 async function refresh() {
   try {
     const d = await api('/trade');
@@ -3440,8 +3562,8 @@ async function refresh() {
 }
 
 // Poll every 3 seconds
-refresh();
-setInterval(refresh, 3000);
+refresh(); refreshRec();
+setInterval(() => { refresh(); refreshRec(); }, 3000);
 </script>
 </body>
 </html>"""
