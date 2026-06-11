@@ -956,8 +956,9 @@ def send_zone_mitigated_message(alert_data, mitigated_price):
 
     embed = {
         "type":        "rich",
-        "title":       "MGC Agent v10.1",
-        "description": f"**{ticker}** · {price_str} · ZONE MITIGATED",
+        "author":      {"name": "🤖 AI Trading Partner"},
+        "title":       "⏸ ZONE MITIGATED",
+        "description": f"**{ticker}** · {price_str} · Zone consumed — no trade setup available",
         "color":       0xFFAA00,
         "fields": [
             {
@@ -1180,8 +1181,16 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
     if plan["warning"]:
         fields.append({"name": "⚠️  Warning", "value": plan["warning"], "inline": False})
 
+    if active_trade_info:
+        _context_title = "📈 ACTIVE TRADE"
+    elif verdict in ("LONG READY", "SHORT READY"):
+        _context_title = "🔥 HIGH CONVICTION TRADE"
+    else:
+        _context_title = "👀 WATCHLIST SETUP"
+
     embed = {
-        "title":       "MGC Agent v10",
+        "author":      {"name": "🤖 AI Trading Partner"},
+        "title":       _context_title,
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
         "fields":      fields,
@@ -1661,7 +1670,8 @@ def send_journal_discord_embed(entry):
         chain_text = chain_text[:900] + "…"
 
     embed = {
-        "title":       f"📓 Journal — {entry['symbol']} {direction_emoji} {entry['direction']}",
+        "author":      {"name": "🤖 AI Trading Partner Journal"},
+        "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
         "description": f"**{entry['setup_stage']}**  ·  Verdict: **{entry['verdict']}**",
         "color":       color,
         "timestamp":   entry["datetime"],
@@ -1685,7 +1695,7 @@ def send_journal_discord_embed(entry):
             {"name": "📷 Screenshot",          "value": entry["screenshot"],          "inline": False},
             {"name": "📋 Outcome",             "value": f"🟡 {entry['outcome']}",     "inline": True},
         ],
-        "footer": {"text": f"Journal Entry #{entry['id']} · MGC Agent"},
+        "footer": {"text": f"Journal Entry #{entry['id']}"},
     }
 
     try:
