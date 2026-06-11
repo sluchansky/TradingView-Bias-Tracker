@@ -1997,15 +1997,33 @@ def add_journal_entry():
 
     # Normalise setup_stage: map short aliases
     _stage_map = {
-        "FORMING":     "Long Setup Forming",
-        "LONG READY":  "Long Ready",
-        "SHORT READY": "Short Ready",
-        "SHORT FORMING": "Short Setup Forming",
+        "WATCHING":              "Watching",
+        "SETUP FORMING":         "Setup Forming",
+        "FORMING":               "Setup Forming",
+        "CONFIRMATION CANDLE":   "Confirmation Candle",
+        "TRADE READY":           "Trade Ready",
+        "LONG READY":            "Trade Ready",
+        "SHORT READY":           "Trade Ready",
+        "SHORT FORMING":         "Setup Forming",
+        "ENTERED":               "Entered",
+        "T1 HIT":                "T1 Hit",
+        "T2 HIT":                "T2 Hit",
+        "CLOSED":                "Closed",
     }
     raw_stage = str(data.get("setup_stage") or data.get("status") or "—").upper()
     setup_stage = _stage_map.get(raw_stage, data.get("setup_stage") or data.get("status") or "—")
 
     direction = str(data.get("direction", "—")).capitalize()
+
+    # Derive verdict from stage if not supplied
+    _stage_verdict = {
+        "Watching":            "WAIT",
+        "Setup Forming":       "WATCH",
+        "Confirmation Candle": "WATCH",
+        "Trade Ready":         "LONG READY" if direction == "Long" else "SHORT READY",
+        "Entered":             "ENTERED",
+    }
+    auto_verdict = _stage_verdict.get(setup_stage, "WATCH")
 
     entry = {
         "id":               len(JOURNAL) + 1,
@@ -2013,7 +2031,7 @@ def add_journal_entry():
         "symbol":           str(data.get("symbol", "MGC")).upper(),
         "direction":        direction,
         "setup_stage":      setup_stage,
-        "verdict":          str(data.get("verdict") or ("WATCH" if "Forming" in setup_stage else setup_stage.upper())),
+        "verdict":          str(data.get("verdict") or auto_verdict),
         "entry_zone":       data.get("entry_zone"),
         "stop_loss":        data.get("stop") or data.get("stop_loss"),
         "target1":          data.get("target1"),
