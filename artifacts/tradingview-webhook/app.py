@@ -1,5 +1,6 @@
 import os
 import logging
+import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
@@ -11,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 ALERT_HISTORY    = deque(maxlen=100)
 CURRENT_PRICE    = None
-ACTIVE_TRADE     = None   # v12: active trade tracking
+ACTIVE_TRADE     = None
+LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
 ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
@@ -80,6 +82,63 @@ def _discord_url(hint: str = "") -> str:
     if "MNQ" in str(hint).upper() and DISCORD_MNQ_WEBHOOK_URL:
         return DISCORD_MNQ_WEBHOOK_URL
     return DISCORD_WEBHOOK_URL
+
+
+HEARTBEAT_INTERVAL = 3600  # seconds
+
+
+def _send_heartbeat():
+    """Post an hourly status embed to all configured trade-alert channels."""
+    now = datetime.now(timezone.utc)
+
+    # ── Last alert time ────────────────────────────────────────────────────
+    if LAST_ALERT_AT:
+        delta   = now - LAST_ALERT_AT
+        minutes = int(delta.total_seconds() / 60)
+        if minutes < 60:
+            age = f"{minutes}m ago"
+        else:
+            age = f"{minutes // 60}h {minutes % 60}m ago"
+        last_str = f"{LAST_ALERT_AT.strftime('%H:%M UTC')}  ({age})"
+    else:
+        last_str = "No alerts received yet"
+
+    # ── Active trade ───────────────────────────────────────────────────────
+    if ACTIVE_TRADE:
+        at         = ACTIVE_TRADE
+        sym        = (at.get("profile") or "").split()[0] or "—"
+        direction  = at.get("direction", "—")
+        entry      = at.get("entry_price", "—")
+        trade_str  = f"{direction} {sym}  |  Entry `{entry}`"
+        status_str = "🟢 Active Trade in Progress"
+    else:
+        trade_str  = "None"
+        status_str = "🔵 Watching — No Active Trade"
+
+    embed = {
+        "color":       0x00BFFF,
+        "author":      {"name": BOT_NAME},
+        "description": "**System heartbeat — all systems operational**",
+        "fields": [
+            {"name": "Last alert received", "value": last_str,   "inline": False},
+            {"name": "Active trade",        "value": trade_str,  "inline": True},
+            {"name": "Status",              "value": status_str, "inline": True},
+        ],
+        "footer": {"text": now.strftime("Hourly check-in  ·  %Y-%m-%d %H:%M UTC")},
+    }
+
+    for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL]):
+        try:
+            requests.post(url, json={"embeds": [embed]}, timeout=5)
+        except Exception:
+            pass
+    logger.info("Hourly heartbeat sent.")
+
+
+def _heartbeat_loop():
+    """Send heartbeat now then reschedule every HEARTBEAT_INTERVAL seconds."""
+    _send_heartbeat()
+    threading.Timer(HEARTBEAT_INTERVAL, _heartbeat_loop).start()
 
 
 TIME_WINDOWS                = {"15m": 15, "60m": 60, "120m": 120}
@@ -1885,6 +1944,8 @@ def webhook():
         "timestamp":  now_utc().isoformat(),
         "raw":        data,
     }
+    global LAST_ALERT_AT
+    LAST_ALERT_AT = datetime.now(timezone.utc)
     ALERT_HISTORY.append(record)
 
     # ── Zone event side-effects ──
@@ -2406,4 +2467,5 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every hour
     app.run(host="0.0.0.0", port=port, debug=False)
