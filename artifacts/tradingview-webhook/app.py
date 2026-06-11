@@ -1700,6 +1700,38 @@ def send_journal_discord_embed(entry):
         logger.error("Journal Discord post error: %s", exc)
 
 
+def _update_journal_outcome(new_outcome):
+    """Update the most recent journal entry that is still Pending or at T1.
+
+    Matches the first entry whose outcome is 'Pending' or starts with 'T1 Hit'.
+    Posts a brief update line to the journal Discord channel.
+    Returns the updated entry or None if nothing matched.
+    """
+    for entry in JOURNAL:
+        o = entry.get("outcome", "")
+        if o == "Pending" or o.startswith("T1 Hit"):
+            entry["outcome"] = new_outcome
+            logger.info("Journal #%d outcome → %s", entry["id"], new_outcome)
+            # Post a short update line to the journal channel
+            if DISCORD_JOURNAL_WEBHOOK_URL:
+                _outcome_emoji = "✅" if "Win" in new_outcome else ("⚠️" if "T1" in new_outcome else "❌")
+                content = (
+                    f"{_outcome_emoji} **Journal #{entry['id']} updated**\n"
+                    f"{entry.get('symbol','—')} {entry.get('direction','—')}  ·  "
+                    f"Outcome: **{new_outcome}**"
+                )
+                try:
+                    requests.post(
+                        DISCORD_JOURNAL_WEBHOOK_URL,
+                        json={"content": content},
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
+            return entry
+    return None
+
+
 def create_journal_entry(record, a, sizing):
     """Create a journal entry when setup_stage warrants one, skipping duplicates."""
     global JOURNAL, JOURNAL_KEYS
@@ -1917,7 +1949,13 @@ def webhook():
                 ACTIVE_TRADE["t1_hit"] = True
                 ACTIVE_TRADE["status"] = "breakeven"
                 ACTIVE_TRADE["suggested_stop"] = ACTIVE_TRADE["entry_price"]
-            elif event in ("T2_HIT", "STOP_HIT"):
+                _update_journal_outcome("T1 Hit — Partial ⚠️")
+            elif event == "T2_HIT":
+                _update_journal_outcome("Win — T2 Hit ✅")
+                ACTIVE_TRADE = None
+                break
+            elif event == "STOP_HIT":
+                _update_journal_outcome("Loss — Stop Hit ❌")
                 ACTIVE_TRADE = None
                 break
         if ACTIVE_TRADE:
@@ -2286,13 +2324,19 @@ def close_trade():
             f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
             f"Exit `{exit_price:.1f}`  ·  PnL **{pnl_str}**"
         )
+        outcome_str = (
+            f"Win — Closed {pnl_str} ✅" if dollar_pnl >= 0
+            else f"Loss — Closed {pnl_str} ❌"
+        )
     else:
         content = (
             f"🏁 **TRADE CLOSED MANUALLY**\n"
             f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`"
         )
+        outcome_str = "Closed Manually"
 
     ACTIVE_TRADE = None
+    _update_journal_outcome(outcome_str)
 
     try:
         _url = _discord_url(closed.get("profile", ""))
