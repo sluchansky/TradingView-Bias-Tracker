@@ -975,14 +975,35 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  f"```\n{chain_text}\n```",
             "inline": False,
         },
+        # ── Zone Mitigated: replace all trade sections with consumed-zone notice ──
+        *([
+            {
+                "name":   "🚫  Zone Status",
+                "value":  "**Consumed / Mitigated**",
+                "inline": True,
+            },
+            {
+                "name":   "🗺️  Action",
+                "value":  "Wait for fresh supply or demand zone.",
+                "inline": False,
+            },
+            {
+                "name":   "💬  Reason",
+                "value":  (
+                    "Zone already reacted and is no longer valid for entry.\n"
+                    "Zone mitigation overrides all bullish/bearish scores."
+                ),
+                "inline": False,
+            },
+        ] if zone_mitigated_near else
         # ── Setup Stage (v10) — hidden during active trade ──
-        *(_setup_stage_fields(setup_stage, stage_next_step, stage_entry_rule, stage_invalidation)
-          if not active_trade_info else []),
+        (_setup_stage_fields(setup_stage, stage_next_step, stage_entry_rule, stage_invalidation)
+         if not active_trade_info else []) +
         # ── Market Direction + Trade Opportunity ──
-        *_direction_opportunity_fields(market_direction, trade_opportunity,
-                                       opportunity_reason, entry_trigger, invalidation),
+        _direction_opportunity_fields(market_direction, trade_opportunity,
+                                      opportunity_reason, entry_trigger, invalidation) +
         # ── Trade Plan + Position Sizing ──
-        *_trade_plan_fields(trade_plan, sizing),
+        _trade_plan_fields(trade_plan, sizing)),
         # ── Why ──
         {
             "name":   "💬  Why",
@@ -1303,20 +1324,27 @@ def full_analysis(current_price_override=None):
     zone_mitigated_near  = (near_sup_mz or near_dem_mz) and not zone_broken_active
     mitigated_zone_price = mz_sup_price or mz_dem_price
     if zone_mitigated_near:
-        confidence = max(0, confidence - 15)
-        # Block READY signals — demote to Watch with consumed-zone message
-        if setup_stage in READY_STAGES:
-            if "Long" in setup_stage:
-                setup_stage        = "Watch Demand"
-                stage_next_step    = "Zone consumed — wait for fresh demand."
-                stage_entry_rule   = "No entry from consumed zone."
-                stage_invalidation = f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
-            else:
-                setup_stage        = "Watch Supply"
-                stage_next_step    = "Zone consumed — wait for fresh supply."
-                stage_entry_rule   = "No entry from consumed zone."
-                stage_invalidation = f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
-            verdict = "WAIT"
+        # Full override — zone mitigation supersedes ALL scores, setups, and plans
+        confidence         = max(0, confidence - 15)
+        verdict            = "WAIT"
+        recommendation     = "WAIT"
+        trade_opportunity  = "None"
+        opportunity_reason = "Zone already reacted and is no longer valid for entry."
+        entry_trigger      = None
+        invalidation       = None
+        trade_plan         = {
+            "trade_plan": False,
+            "reason":     "Zone consumed — wait for fresh supply or demand zone.",
+            "entry_zone": None, "stop_loss": None,
+            "target1":    None, "target2": None,
+            "rr":         None, "direction": None,
+        }
+        setup_stage        = "No Setup"
+        stage_next_step    = "Zone consumed — wait for fresh supply or demand zone."
+        stage_entry_rule   = "No entry from consumed zone."
+        stage_invalidation = (
+            f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
+        )
 
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
@@ -1539,7 +1567,10 @@ def webhook():
 
     a = full_analysis(current_price_override=parsed_price)
 
-    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct, profile_name)
+    if a.get("zone_mitigated_near"):
+        sizing = {}
+    else:
+        sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct, profile_name)
 
     # ── Active trade: check events, build embed field ──
     ati = None
