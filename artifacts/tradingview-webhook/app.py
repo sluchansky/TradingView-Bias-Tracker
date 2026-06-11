@@ -34,6 +34,7 @@ LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
 ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
+VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso}, "MGC": {...}} — latest VWAP per instrument
 
 ALERT_TYPES = {
     # ── MGC alert types ────────────────────────────────────────────────────────
@@ -121,6 +122,25 @@ def cfg(key):
 DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — fallback when no profile/account_size given
 DEFAULT_RISK_PCT     = 0.01     # 1% — fallback when no profile/risk_pct given
 MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 10 oz)
+
+# ── Per-instrument trade specs (strict-recommendation ruleset) ──────────────
+#   tp1 / tp2   = fixed target distances in price points from the entry zone
+#   stop_buf    = stop distance beyond the demand/supply zone (price points)
+#   point_value = $ per point per contract  (MNQ Micro Nasdaq = $2, MGC Micro Gold = $10)
+INSTRUMENT_SPECS = {
+    "MNQ": {"tp1": 20.0, "tp2": 40.0, "stop_buf": 5.0, "point_value": 2.0},
+    "MGC": {"tp1": 5.0,  "tp2": 10.0, "stop_buf": 1.0, "point_value": 10.0},
+}
+
+def instrument_of(ticker):
+    """Normalize any raw ticker (e.g. 'MNQ1!', 'MGC') to 'MNQ' or 'MGC'."""
+    return "MNQ" if "MNQ" in str(ticker or "").upper() else "MGC"
+
+def spec_for(ticker):
+    return INSTRUMENT_SPECS[instrument_of(ticker)]
+
+def point_value_for(ticker):
+    return INSTRUMENT_SPECS[instrument_of(ticker)]["point_value"]
 
 ACCOUNT_PROFILES = {
     "MGC Conservative": {"account_size": 50_000,  "risk_pct": 0.005},
@@ -936,15 +956,17 @@ def generate_trade_plan(trade_opportunity, structure_label, risk_label,
 
 def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name=""):
     """
-    Compute MGC position sizing from a generated trade plan.
+    Compute position sizing from a generated trade plan.
 
-    MGC (Micro Gold) = 10 troy oz. Point value = $10 per contract per point.
+    Point value is read from the plan (per-instrument: MNQ = $2/pt, MGC = $10/pt),
+    falling back to MGC's $10/pt for legacy plans.
 
     Returns a dict of display strings, or {} if no trade plan exists.
     """
     if not trade_plan.get("trade_plan"):
         return {}
     try:
+        point_value    = float(trade_plan.get("point_value", MGC_POINT_VALUE))
         # Parse entry midpoint from "lo–hi" zone string
         lo_s, hi_s    = trade_plan["entry_zone"].split("–")
         entry_mid      = (float(lo_s) + float(hi_s)) / 2
@@ -960,11 +982,11 @@ def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name="
             return {}
 
         dollar_risk         = account_size * risk_pct
-        risk_per_contract   = stop_dist * MGC_POINT_VALUE
+        risk_per_contract   = stop_dist * point_value
         contracts           = max(1, int(dollar_risk / risk_per_contract))
         max_loss            = contracts * risk_per_contract
-        profit_t1           = contracts * t1_dist * MGC_POINT_VALUE
-        profit_t2           = contracts * t2_dist * MGC_POINT_VALUE
+        profit_t1           = contracts * t1_dist * point_value
+        profit_t2           = contracts * t2_dist * point_value
 
         return {
             "profile":            profile_name or "Custom",
@@ -1222,6 +1244,39 @@ def _setup_stage_fields(setup_stage, next_step, entry_rule, stage_invalidation):
     ]
 
 
+def _strict_checklist_field(strict_label, strict_score, confluences,
+                            vwap_value, vwap_status):
+    """Return a single embed field rendering the strict 4-point checklist + score."""
+    c = confluences or {}
+    direction = c.get("direction")
+    is_short  = direction == "Short"
+
+    def _mark(ok):
+        return "✅" if ok else "❌"
+
+    if vwap_value is not None:
+        vwap_txt = f"{float(vwap_value):.2f} ({vwap_status})"
+    else:
+        vwap_txt = f"— ({vwap_status})"
+
+    side_word = "below" if is_short else "above"
+    lines = [
+        f"{_mark(c.get('bos'))} BOS {'Supply' if is_short else 'Demand'}",
+        f"{_mark(c.get('choch'))} {'Bearish' if is_short else 'Bullish'} CHOCH",
+        f"{_mark(c.get('confirmation'))} 5m {'bearish' if is_short else 'bullish'} confirmation candle",
+        f"{_mark(c.get('vwap'))} Price {side_word} VWAP  ·  VWAP {vwap_txt}",
+    ]
+    label_emoji = {"Strong Trade": "🟢", "Possible Trade": "🔵"}.get(strict_label, "⏸")
+    header = f"{label_emoji} **{strict_label}** · Score **{strict_score}/100**"
+    if direction:
+        header += f" · {direction}"
+    return {
+        "name":   "✅  Trade Checklist",
+        "value":  header + "\n" + "\n".join(lines),
+        "inline": False,
+    }
+
+
 def send_zone_mitigated_message(alert_data, mitigated_price):
     """Minimal Discord embed for zone-consumed state — no scoring performed."""
     ticker    = alert_data.get("ticker") or "MGC"
@@ -1288,7 +1343,9 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
                          active_trade_info=None,
                          zone_broken_active=False,
                          zone_mitigated_near=False,
-                         mitigated_zone_price=None):
+                         mitigated_zone_price=None,
+                         strict_label="WAIT", strict_score=0,
+                         confluences=None, vwap_value=None, vwap_status="n/a"):
     _url = _discord_url(alert_data.get("ticker", ""))
     if not _url:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
@@ -1357,6 +1414,10 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
             "value":  f"```\n{chain_text}\n```",
             "inline": False,
         },
+        # ── Strict Trade Checklist (hidden during active trade / consumed zone) ──
+        *([_strict_checklist_field(strict_label, strict_score, confluences,
+                                   vwap_value, vwap_status)]
+          if not active_trade_info and not zone_mitigated_near else []),
         # ── Zone Mitigated: replace all trade sections with consumed-zone notice ──
         *([
             {
@@ -1686,6 +1747,255 @@ def is_near_mitigated_zone(price):
 
 
 # ---------------------------------------------------------------------------
+# Strict recommendation ruleset (checklist + 0-100 score)
+# ---------------------------------------------------------------------------
+
+def get_vwap(ticker, max_age_min=None):
+    """Return (vwap_value, status) for an instrument.
+
+    status: 'ok' | 'missing' | 'stale'. A VWAP older than max_age_min (default the
+    active mode's STAGE_WINDOW_MIN, falling back to 30 min) is treated as stale and
+    therefore unusable — the strict gate must not trade on a price-vs-VWAP check it
+    cannot trust.
+    """
+    rec = VWAP_BY_TICKER.get(instrument_of(ticker))
+    if not rec or rec.get("value") is None:
+        return None, "missing"
+    if max_age_min is None:
+        max_age_min = cfg("STAGE_WINDOW_MIN") or 30
+    try:
+        age_min = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
+        if age_min > max_age_min:
+            return None, "stale"
+    except (KeyError, ValueError, TypeError):
+        return None, "missing"
+    return float(rec["value"]), "ok"
+
+
+def _active_ticker():
+    """Best-effort active instrument from the most recent ticker-bearing alert."""
+    for rec in reversed(ALERT_HISTORY):
+        if rec.get("ticker"):
+            return instrument_of(rec["ticker"])
+        t = str(rec.get("alert_type", ""))
+        if t.startswith("MNQ"):
+            return "MNQ"
+        if t.startswith("MGC"):
+            return "MGC"
+    return "MGC"
+
+
+def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
+                          nearest_supply, nearest_demand,
+                          bullish, bearish, confidence, alert_history):
+    """Strict checklist recommendation.
+
+    A trade is recommended ONLY when ALL of:
+        LONG : BOS Demand + Bullish CHOCH + 5m bullish confirmation + price > VWAP
+        SHORT: BOS Supply + Bearish CHOCH + 5m bearish confirmation + price < VWAP
+    (IDM "taken" is treated as satisfied by CHOCH.)
+
+    Returns dict: label ("Strong Trade"|"Possible Trade"|"WAIT"), direction
+    ("Long"|"Short"|None), score (0-100), confluences (per-condition detail for
+    journal/embed), reason (human-readable), and missing (list of unmet conditions).
+    """
+    inst = instrument_of(ticker)
+
+    # ── Recent alerts within the active window (mode-dependent), ticker-aware ──
+    stage_window = cfg("STAGE_WINDOW_MIN")
+    if stage_window:
+        cutoff = now_utc() - timedelta(minutes=stage_window)
+        recent = []
+        for a in alert_history:
+            try:
+                if datetime.fromisoformat(a["timestamp"]) >= cutoff:
+                    recent.append(a)
+            except (KeyError, ValueError):
+                pass
+    else:
+        recent = list(alert_history)[-8:]
+
+    def _has(alert_type, ticker_scoped=False):
+        for a in recent:
+            if a.get("alert_type") != alert_type:
+                continue
+            if ticker_scoped:
+                # CONFIRMATION/CONFIRMED types already embed the instrument in their
+                # name, so a plain type match is already instrument-scoped.
+                return True
+            # CHOCH/BOS carry no symbol prefix — respect record ticker when present.
+            rt = a.get("ticker")
+            if rt and instrument_of(rt) != inst:
+                continue
+            return True
+        return False
+
+    has_bos_demand   = _has("BOS DEMAND")
+    has_bos_supply   = _has("BOS SUPPLY")
+    has_choch_demand = _has("CHOCH DEMAND")
+    has_choch_supply = _has("CHOCH SUPPLY")
+    has_bull_confirm = _has(f"{inst} BULLISH CONFIRMATION", ticker_scoped=True)
+    has_bear_confirm = _has(f"{inst} BEARISH CONFIRMATION", ticker_scoped=True)
+    has_dem_confirm  = _has(f"{inst} DEMAND ZONE CONFIRMED", ticker_scoped=True)
+    has_sup_confirm  = _has(f"{inst} SUPPLY ZONE CONFIRMED", ticker_scoped=True)
+
+    # ── VWAP condition (required) ──
+    vwap_ok     = vwap_status == "ok" and vwap is not None and current_price is not None
+    price_above = bool(vwap_ok and current_price > vwap)
+    price_below = bool(vwap_ok and current_price < vwap)
+
+    long_struct  = has_bos_demand and has_choch_demand and has_bull_confirm
+    short_struct = has_bos_supply and has_choch_supply and has_bear_confirm
+    long_gate    = long_struct and price_above
+    short_gate   = short_struct and price_below
+
+    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf):
+        return {
+            "direction":     direction,
+            "bos":           bool(has_bos),
+            "choch":         bool(has_choch),
+            "confirmation":  bool(has_confirm),
+            "vwap":          bool(vwap_side),
+            "vwap_status":   vwap_status,
+            "vwap_value":    vwap,
+            "zone_confirmed": bool(zone_conf),
+        }
+
+    # ── Conflict: full bullish AND bearish structure present → stand aside ──
+    if long_struct and short_struct:
+        return {
+            "label": "WAIT", "direction": None, "score": 0,
+            "confluences": _confluences(None, True, True, True, False, False),
+            "reason": "Conflicting structure — both long and short fully confirmed. Stand aside.",
+            "missing": [],
+        }
+
+    bt = cfg("BIAS_THRESHOLD")
+
+    def _score(direction, zone_conf, anchor):
+        s = 75  # all four required conditions met
+        if zone_conf:
+            s += 8
+        if anchor and current_price is not None and abs(current_price - anchor) / anchor <= cfg("NEAR_PCT"):
+            s += 6
+        if confidence >= cfg("CONF_TRADE"):
+            s += 6
+            if confidence >= cfg("CONF_HIGH"):
+                s += 3
+        gap = (bullish - bearish) if direction == "Long" else (bearish - bullish)
+        if gap >= bt:
+            s += 5
+        return min(100, s)
+
+    if long_gate:
+        score = _score("Long", has_dem_confirm, nearest_demand)
+        return {
+            "label": "Strong Trade" if score >= 90 else "Possible Trade",
+            "direction": "Long", "score": score,
+            "confluences": _confluences("Long", True, True, True, True, has_dem_confirm),
+            "reason": "Long confirmed — BOS demand, bullish CHOCH, 5m bullish candle, price above VWAP.",
+            "missing": [],
+        }
+
+    if short_gate:
+        score = _score("Short", has_sup_confirm, nearest_supply)
+        return {
+            "label": "Strong Trade" if score >= 90 else "Possible Trade",
+            "direction": "Short", "score": score,
+            "confluences": _confluences("Short", True, True, True, True, has_sup_confirm),
+            "reason": "Short confirmed — BOS supply, bearish CHOCH, 5m bearish candle, price below VWAP.",
+            "missing": [],
+        }
+
+    # ── Gate failed → WAIT. Report progress for the leading direction. ──
+    long_present  = [has_bos_demand, has_choch_demand, has_bull_confirm, price_above]
+    short_present = [has_bos_supply, has_choch_supply, has_bear_confirm, price_below]
+    if sum(short_present) > sum(long_present):
+        lead, present, zone_conf, anchor = "Short", short_present, has_sup_confirm, nearest_supply
+        has_bos, has_choch, has_confirm, vwap_side = short_present
+    else:
+        lead, present, zone_conf, anchor = "Long", long_present, has_dem_confirm, nearest_demand
+        has_bos, has_choch, has_confirm, vwap_side = long_present
+
+    missing = []
+    if not has_bos:
+        missing.append(f"BOS {'Demand' if lead == 'Long' else 'Supply'}")
+    if not has_choch:
+        missing.append(f"{'Bullish' if lead == 'Long' else 'Bearish'} CHOCH")
+    if not has_confirm:
+        missing.append(f"5m {'bullish' if lead == 'Long' else 'bearish'} confirmation candle")
+    if not vwap_side:
+        if vwap_status != "ok":
+            missing.append(f"price vs VWAP (VWAP {vwap_status})")
+        else:
+            missing.append(f"price {'above' if lead == 'Long' else 'below'} VWAP")
+
+    score = round(sum(present) / 4 * 70)  # informational progress, always < 75 (WAIT)
+    return {
+        "label": "WAIT", "direction": None, "score": score,
+        "confluences": _confluences(lead, has_bos, has_choch, has_confirm, vwap_side, zone_conf),
+        "reason": f"{lead} setup incomplete — missing: {', '.join(missing) if missing else 'confluence'}.",
+        "missing": missing,
+    }
+
+
+def build_strict_trade_plan(direction, ticker, current_price,
+                            nearest_supply, nearest_demand):
+    """Fixed-target plan per instrument. Stop sits beyond the demand/supply zone.
+
+    MNQ TP1/TP2 = 20/40 pts, MGC = 5/10 pts. Enforces a minimum 1:2 R:R on TP2;
+    returns a no-plan dict if R:R can't be met or the anchoring zone is missing.
+    """
+    spec = spec_for(ticker)
+    inst = instrument_of(ticker)
+    tp1d, tp2d, buf, pv = spec["tp1"], spec["tp2"], spec["stop_buf"], spec["point_value"]
+
+    def no_plan(reason):
+        return {"trade_plan": False, "reason": reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1": None, "target2": None,
+                "rr": None, "direction": direction,
+                "instrument": inst, "point_value": pv}
+
+    if direction == "Long":
+        anchor = nearest_demand
+        if anchor is None:
+            return no_plan("No demand zone to anchor the entry.")
+        lo, hi = anchor, anchor + buf
+        stop   = anchor - buf
+        t1, t2 = anchor + tp1d, anchor + tp2d
+    else:  # Short
+        anchor = nearest_supply
+        if anchor is None:
+            return no_plan("No supply zone to anchor the entry.")
+        lo, hi = anchor - buf, anchor
+        stop   = anchor + buf
+        t1, t2 = anchor - tp1d, anchor - tp2d
+
+    entry  = (lo + hi) / 2
+    risk   = abs(entry - stop)
+    if risk <= 0:
+        return no_plan("Invalid stop distance.")
+    r1, r2 = abs(t1 - entry) / risk, abs(t2 - entry) / risk
+    if r2 < 2.0:
+        return no_plan(f"Stop distance {risk:.1f} pts makes fixed TP2 only {r2:.1f}R (min 1:2).")
+
+    fmt = (lambda v: f"{v:.1f}") if inst == "MNQ" else (lambda v: f"{v:.2f}")
+    return {
+        "trade_plan": True,
+        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} pts), stop beyond zone.",
+        "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
+        "stop_loss":  fmt(stop),
+        "target1":    fmt(t1),
+        "target2":    fmt(t2),
+        "rr":         f"T1 1:{r1:.1f} / T2 1:{r2:.1f}",
+        "direction":  direction,
+        "instrument": inst,
+        "point_value": pv,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Full analysis
 # ---------------------------------------------------------------------------
 
@@ -1727,6 +2037,12 @@ def full_analysis(current_price_override=None):
             zone_broken_active=False,
             zone_mitigated_near=True,
             mitigated_zone_price=_mz_price,
+            strict_label="WAIT", strict_score=0,
+            strict_direction=None,
+            strict_reason="Zone consumed — wait for fresh supply or demand zone.",
+            strict_missing=[], confluences={},
+            vwap_value=None, vwap_status="n/a",
+            active_ticker=_active_ticker(),
         )
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -1760,51 +2076,55 @@ def full_analysis(current_price_override=None):
         overextended, bullish, bearish, nearest_supply, nearest_demand, last_price_by_type
     )
 
-    trade_plan = generate_trade_plan(
-        trade_opportunity, structure_label, risk_label,
-        current_price, nearest_supply, nearest_demand, last_price_by_type
+    # ── Strict recommendation ruleset — AUTHORITATIVE verdict ────────────────
+    # A trade is recommended ONLY when BOS + CHOCH + 5m confirmation candle + the
+    # price-vs-VWAP filter all align on one side. Score 0-100 → Strong/Possible/WAIT.
+    active_ticker           = _active_ticker()
+    vwap_value, vwap_status = get_vwap(active_ticker)
+    strict = evaluate_strict_setup(
+        current_price, active_ticker, vwap_value, vwap_status,
+        nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY
     )
+    strict_label     = strict["label"]
+    strict_score     = strict["score"]
+    strict_direction = strict["direction"]
+    confluences      = strict["confluences"]
+    strict_reason    = strict.get("reason", "")
+    strict_missing   = strict.get("missing", [])
 
-    # ── Confidence gate: suppress plan below the watch tier or when structure is undefined ──
-    # SCALP allows BOS-only ("Attempt") structures; SWING blocks them until a CHOCH confirms.
-    _conf_watch = cfg("CONF_WATCH")
-    _blocked_classes = ("Undefined",)
-    if not cfg("ATTEMPT_TRADABLE"):
-        _blocked_classes += ("Bullish Attempt", "Bearish Attempt")
-    _plan_eligible = (confidence >= _conf_watch and structure_class not in _blocked_classes)
-    if not _plan_eligible:
+    if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
+        trade_plan = build_strict_trade_plan(
+            strict_direction, active_ticker, current_price, nearest_supply, nearest_demand
+        )
+        if trade_plan["trade_plan"]:
+            verdict = "LONG READY" if strict_direction == "Long" else "SHORT READY"
+        else:
+            # Fixed targets can't meet the 1:2 R:R (or no anchor zone) → no trade.
+            verdict        = "WAIT"
+            strict_label   = "WAIT"
+            strict_reason  = trade_plan.get("reason", strict_reason)
+    else:
+        verdict    = "WAIT"
         trade_plan = {
             "trade_plan": False,
-            "reason":     (f"Confidence {confidence}% — below {_conf_watch}% threshold. No trade plan."
-                           if confidence < _conf_watch else
-                           "Structure not yet confirmed. No trade plan."),
+            "reason":     strict_reason or "Strict conditions not met.",
             "entry_zone": None, "stop_loss": None,
             "target1":    None, "target2":   None,
-            "rr":         None, "direction": None,
+            "rr":         None, "direction": strict_direction,
+            "instrument": active_ticker, "point_value": point_value_for(active_ticker),
         }
 
+    # get_setup_stage retained for lifecycle display context in the embed.
     setup_stage, stage_next_step, stage_entry_rule, stage_invalidation, stage_direction = get_setup_stage(
         current_price, nearest_supply, nearest_demand, bullish, bearish, ALERT_HISTORY
     )
 
-    # ── Map final verdict: WATCH / LONG READY / SHORT READY / WAIT ──────────
-    if trade_plan["trade_plan"]:
-        if setup_stage == "Trade Ready":
-            verdict = "LONG READY" if stage_direction == "Long" else "SHORT READY"
-        elif setup_stage in ("Setup Forming", "Confirmation Candle"):
-            verdict = "WATCH"
-        else:
-            # Plan generated but no active setup stage — suppress the plan
-            verdict = "WAIT"
-            trade_plan = {
-                "trade_plan": False,
-                "reason":     "No active setup stage — plan withheld.",
-                "entry_zone": None, "stop_loss": None,
-                "target1":    None, "target2":   None,
-                "rr":         None, "direction": None,
-            }
-    else:
-        verdict = "WAIT"
+    # Align the displayed lifecycle stage with the authoritative strict verdict.
+    if verdict in ("LONG READY", "SHORT READY"):
+        setup_stage      = "Trade Ready"
+        stage_direction  = strict_direction
+        stage_next_step  = strict_reason or "All strict conditions met — enter now."
+        stage_entry_rule = f"Enter {strict_direction.lower()} per strict checklist."
 
     # ── Zone Broken: cancel setup, reduce confidence, mark structure invalidated ──
     zone_broken_active = ZONE_BROKEN_AT is not None
@@ -1816,6 +2136,16 @@ def full_analysis(current_price_override=None):
         stage_entry_rule   = "—"
         stage_invalidation = "Structure invalidated — zone broken"
         verdict            = "WAIT"
+        strict_label       = "WAIT"
+        strict_score       = 0
+        strict_reason      = "Structure invalidated — zone broken."
+        trade_plan         = {
+            "trade_plan": False,
+            "reason":     "Structure invalidated — zone broken.",
+            "entry_zone": None, "stop_loss": None,
+            "target1":    None, "target2": None,
+            "rr":         None, "direction": None,
+        }
 
     # ── Zone Mitigated: warn if nearest levels are near a consumed zone ──
     near_sup_mz, mz_sup_price = is_near_mitigated_zone(nearest_supply)
@@ -1845,6 +2175,8 @@ def full_analysis(current_price_override=None):
         stage_invalidation = (
             f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
         )
+        strict_label       = "WAIT"
+        strict_reason      = "Zone consumed — wait for fresh supply or demand zone."
 
     why  = build_why(bias, confidence, bullish, bearish, counts,
                      verdict, overextended, risk_label)
@@ -1874,6 +2206,11 @@ def full_analysis(current_price_override=None):
         zone_broken_active=zone_broken_active,
         zone_mitigated_near=zone_mitigated_near,
         mitigated_zone_price=mitigated_zone_price,
+        strict_label=strict_label, strict_score=strict_score,
+        strict_direction=strict_direction, strict_reason=strict_reason,
+        strict_missing=strict_missing, confluences=confluences,
+        vwap_value=vwap_value, vwap_status=vwap_status,
+        active_ticker=active_ticker,
     )
 
 
@@ -1961,11 +2298,15 @@ def send_journal_discord_embed(entry):
         return
 
     direction_emoji = "📈" if entry["direction"] == "Long" else "📉"
-    color           = 0x00B0FF if entry["direction"] == "Long" else 0xFF5252
+    label           = entry.get("strict_label", "Possible Trade")
+    color           = 0x2ECC71 if label == "Strong Trade" else 0x00B0FF
 
-    def _fp(v):
+    def _val(v):
+        return str(v) if v not in (None, "") else "—"
+
+    def _lvl(v):
         try:
-            return f"${float(v):.2f}"
+            return f"{float(v):.2f}"
         except (TypeError, ValueError):
             return "—"
 
@@ -1974,22 +2315,25 @@ def send_journal_discord_embed(entry):
         chain_text = chain_text[:900] + "…"
 
     embed = {
-        "author":      {"name": f"{BOT_NAME} Journal"},
+        "author":      {"name": f"{BOT_NAME} · {label} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
-        "description": f"**{entry['setup_stage']}**  ·  Verdict: **{entry['verdict']}**",
+        "description": f"**{label}**  ·  Score: **{entry.get('strict_score', 0)}/100**  ·  Verdict: **{entry['verdict']}**",
         "color":       color,
         "timestamp":   entry["datetime"],
         "fields": [
             {"name": "📅 Date/Time",          "value": entry["datetime"][:19].replace("T", " ") + " UTC", "inline": True},
             {"name": "📊 Symbol",              "value": entry["symbol"],              "inline": True},
             {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
-            {"name": "🎯 Setup Stage",         "value": entry["setup_stage"],         "inline": True},
-            {"name": "⚖️ Final Verdict",       "value": entry["verdict"],             "inline": True},
+            {"name": "📐 Entry Zone",          "value": _val(entry["entry_zone"]),    "inline": True},
+            {"name": "🛑 Stop Loss",           "value": _val(entry["stop_loss"]),     "inline": True},
+            {"name": "⚖️ R:R",                 "value": _val(entry.get("rr")),        "inline": True},
+            {"name": "🎯 Target 1",            "value": _val(entry["target1"]),       "inline": True},
+            {"name": "🎯 Target 2",            "value": _val(entry["target2"]),       "inline": True},
+            {"name": "💯 Score",               "value": f"{entry.get('strict_score', 0)}/100", "inline": True},
+            {"name": "🏗️ BOS",                 "value": _lvl(entry.get("bos_level")), "inline": True},
+            {"name": "🔀 CHOCH",               "value": _lvl(entry.get("choch_level")), "inline": True},
             {"name": "🔥 Bias",                "value": entry["bias"],                "inline": True},
-            {"name": "📐 Entry Zone",          "value": _fp(entry["entry_zone"]),     "inline": True},
-            {"name": "🛑 Stop Loss",           "value": _fp(entry["stop_loss"]),      "inline": True},
-            {"name": "🎯 Target 1",            "value": _fp(entry["target1"]),        "inline": True},
-            {"name": "🎯 Target 2",            "value": _fp(entry["target2"]),        "inline": True},
+            {"name": "🎯 Setup Stage",         "value": entry["setup_stage"],         "inline": True},
             {"name": "💡 Confidence",          "value": entry["confidence"],          "inline": True},
             {"name": "⚡ Edge Score",           "value": str(entry["edge_score"]),     "inline": True},
             {"name": "🏗️ Market Structure",    "value": entry["market_structure"],    "inline": True},
@@ -2049,32 +2393,37 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None):
 
 
 def create_journal_entry(record, a, sizing):
-    """Create a journal entry when setup_stage warrants one, skipping duplicates."""
+    """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates."""
     global JOURNAL, JOURNAL_KEYS
 
-    setup_stage = a.get("setup_stage", "")
-    if setup_stage not in JOURNAL_STAGES:
+    strict_label = a.get("strict_label", "WAIT")
+    if strict_label not in ("Strong Trade", "Possible Trade"):
         return None
 
-    _raw_ticker    = record.get("ticker") or record.get("alert_type", "")
-    ticker         = "MNQ" if "MNQ" in str(_raw_ticker).upper() else "MGC"
-    if record.get("ticker"):
-        ticker = record["ticker"]   # preserve exact ticker (e.g. "MNQ1!") when supplied
     tp         = a.get("trade_plan") or {}
+    direction  = a.get("strict_direction") or tp.get("direction") or "Long"
+    inst       = (tp.get("instrument") or a.get("active_ticker")
+                  or instrument_of(record.get("ticker") or record.get("alert_type", "")))
+    # Preserve exact ticker (e.g. "MNQ1!") when supplied, else the normalized symbol.
+    ticker     = record.get("ticker") or inst
     entry_zone = tp.get("entry_zone")
-    direction  = (a.get("stage_direction")
-                  or tp.get("direction")
-                  or a.get("market_direction", "Long"))
 
-    # Dedup key: ticker + stage + entry zone rounded to nearest integer
+    # BOS / CHOCH levels from the most recent same-side structure alerts.
+    lpt = a.get("last_price_by_type") or {}
+    if direction == "Long":
+        bos_level, choch_level = lpt.get("BOS DEMAND"), lpt.get("CHOCH DEMAND")
+    else:
+        bos_level, choch_level = lpt.get("BOS SUPPLY"), lpt.get("CHOCH SUPPLY")
+
+    # Dedup key: instrument + direction + entry-zone low rounded to nearest integer.
     try:
-        zone_key = round(float(entry_zone), 0) if entry_zone is not None else 0.0
+        zone_key = round(float(str(entry_zone).split("–")[0]), 0) if entry_zone else 0.0
     except (TypeError, ValueError):
         zone_key = 0.0
-    dedup_key = (ticker, setup_stage, zone_key)
+    dedup_key = (instrument_of(ticker), direction, zone_key)
 
     if dedup_key in JOURNAL_KEYS:
-        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, setup_stage, zone_key)
+        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, direction, zone_key)
         return None
 
     JOURNAL_KEYS.add(dedup_key)
@@ -2085,12 +2434,17 @@ def create_journal_entry(record, a, sizing):
         "datetime":         datetime.now(timezone.utc).isoformat(),
         "symbol":           ticker,
         "direction":        direction,
-        "setup_stage":      setup_stage,
+        "setup_stage":      a.get("setup_stage", "Trade Ready"),
+        "strict_label":     strict_label,
+        "strict_score":     a.get("strict_score", 0),
         "verdict":          a.get("verdict", "WAIT"),
         "entry_zone":       entry_zone,
         "stop_loss":        tp.get("stop_loss"),
         "target1":          tp.get("target1"),
         "target2":          tp.get("target2"),
+        "rr":               tp.get("rr"),
+        "bos_level":        bos_level,
+        "choch_level":      choch_level,
         "bias":             a.get("bias", "—"),
         "confidence":       f"{a.get('confidence', 0)}%",
         "edge_score":       a.get("edge_score", 0),
@@ -2107,7 +2461,8 @@ def create_journal_entry(record, a, sizing):
         JOURNAL.pop()
 
     send_journal_discord_embed(entry)
-    logger.info("Journal entry #%d created: %s %s @ %s", entry["id"], ticker, setup_stage, entry_zone)
+    logger.info("Journal entry #%d created: %s %s %s @ %s",
+                entry["id"], ticker, strict_label, direction, entry_zone)
     return entry
 
 
@@ -2292,6 +2647,17 @@ def webhook():
     if parsed_price is not None:
         CURRENT_PRICE = parsed_price
 
+    # ── VWAP ingestion (required input for the strict price-vs-VWAP filter) ──
+    raw_vwap = data.get("vwap")
+    if raw_vwap is not None:
+        try:
+            vwap_val = float(raw_vwap)
+        except (ValueError, TypeError):
+            vwap_val = None
+        if vwap_val is not None:
+            vwap_key = instrument_of(data.get("ticker") or normalized)
+            VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": now_utc().isoformat()}
+
     # ── Command types: ENTER / CLOSE — short-circuit before scoring ──────────
     if normalized in _COMMAND_TYPES:
         resp = _handle_command_alert(normalized, data, parsed_price)
@@ -2420,6 +2786,11 @@ def webhook():
         zone_broken_active=a.get("zone_broken_active", False),
         zone_mitigated_near=a.get("zone_mitigated_near", False),
         mitigated_zone_price=a.get("mitigated_zone_price"),
+        strict_label=a.get("strict_label", "WAIT"),
+        strict_score=a.get("strict_score", 0),
+        confluences=a.get("confluences"),
+        vwap_value=a.get("vwap_value"),
+        vwap_status=a.get("vwap_status", "n/a"),
     )
 
     # ── Trading Journal ───────────────────────────────────────────────────────
@@ -2619,6 +2990,14 @@ def status():
         "version":             "11.0",
         "trading_mode":        TRADING_MODE,
         "verdict":             a["verdict"],
+        "strict_label":        a.get("strict_label"),
+        "strict_score":        a.get("strict_score"),
+        "strict_direction":    a.get("strict_direction"),
+        "strict_reason":       a.get("strict_reason"),
+        "strict_missing":      a.get("strict_missing"),
+        "confluences":         a.get("confluences"),
+        "vwap_value":          a.get("vwap_value"),
+        "vwap_status":         a.get("vwap_status"),
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
         "setup_stage":         a["setup_stage"],
