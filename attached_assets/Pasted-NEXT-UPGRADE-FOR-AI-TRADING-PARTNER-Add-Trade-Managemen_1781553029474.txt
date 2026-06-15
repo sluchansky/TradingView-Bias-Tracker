@@ -1,0 +1,269 @@
+NEXT UPGRADE FOR AI TRADING PARTNER
+
+Add Trade Management Engine, Trade Outcome Tracking, Weekly Report, A+ Setup Routing, and Explain Why command.
+
+IMPORTANT:
+Do not change existing webhook parsing.
+Do not change TradingView alert messages.
+Do not remove throttling.
+Do not remove 5-minute repost logic.
+Do not break current READY alerts.
+Do not remove existing Discord cards.
+This upgrade must be additive only.
+
+1. TRADE MANAGEMENT ENGINE
+
+When a READY trade is detected, generate a full trade management plan.
+
+Include:
+
+* Entry
+* Stop
+* TP1
+* TP2
+* TP3
+* Move Stop to Breakeven level
+* Partial profit level
+* Runner target
+* Risk in points
+* Reward-to-risk estimate
+* Max invalidation condition
+
+Example:
+
+LONG READY
+
+Entry: 2958.4
+Stop: 2955.8
+
+TP1: 2960.0
+TP2: 2962.5
+TP3: 2966.0
+
+Move Stop to BE: 2960.2
+Partial: 2961.5
+Runner Target: 2966.0
+
+Risk: 2.6 points
+Reward: 7.6 points
+R:R: 2.9R
+
+2. TRADE MANAGEMENT DISCORD UPDATES
+
+After a READY alert posts, track the trade levels.
+
+Send Discord updates when:
+
+* TP1 is reached
+* TP2 is reached
+* TP3 is reached
+* Stop is hit
+* Breakeven level is reached
+* Trade invalidation condition occurs
+
+Example updates:
+
+Trade Management Update
+
+MGC LONG
+TP1 Hit
+Move stop to breakeven.
+
+Trade Management Update
+
+MGC LONG
+TP2 Hit
+Consider taking partial profit.
+
+Trade Management Update
+
+MGC LONG
+Stop Hit
+Trade closed as loss.
+
+3. TRADE OUTCOME TRACKING
+
+When a trade closes, generate a trade outcome message.
+
+Track:
+
+* Result: Win, Loss, or Breakeven
+* R Multiple
+* Entry
+* Stop
+* Final Exit
+* Max favorable move
+* Max adverse move
+* Setup type
+* Trade strength: Possible, Strong, or A+
+* Edge Score
+* Instrument
+* Direction
+* Reason trade closed
+
+Example:
+
+Trade Closed
+
+Result: WIN
+R Multiple: +3.2R
+
+Setup:
+Liquidity Sweep + Zone Mitigation + VWAP Reclaim + Bullish CHOCH
+
+Instrument: MGC
+Direction: LONG
+Edge Score: 94
+Trade Strength: Strong
+
+Reason:
+TP2 reached after VWAP reclaim continuation.
+
+4. WEEKLY PERFORMANCE REPORT
+
+Create a weekly report every Friday after market close.
+
+Include:
+
+* Total trades
+* Wins
+* Losses
+* Breakevens
+* Win Rate
+* Profit Factor
+* Average R
+* Net R
+* Best setup
+* Worst setup
+* Best instrument
+* Worst instrument
+* Best direction: Long or Short
+* Worst direction: Long or Short
+* Average Edge Score
+* Strong Trade performance
+* Possible Trade performance
+* A+ Trade performance
+
+Example:
+
+AI Trading Partner Weekly Report
+
+Trades: 24
+Win Rate: 67%
+Net R: +14.8R
+Average R: +0.62R
+Profit Factor: 2.1
+
+Best Setup:
+Liquidity Sweep + CHOCH + VWAP Reclaim
+
+Worst Setup:
+CHOCH Only
+
+Best Instrument:
+MGC
+
+Worst Instrument:
+MNQ
+
+5. A+ SETUP ROUTING
+
+Add an A+ setup category.
+
+Classification:
+
+* Possible Trade: Edge Score 75–89
+* Strong Trade: Edge Score 90–94
+* A+ Setup: Edge Score 95–100
+
+For A+ setups, add a stronger Discord label:
+
+🔥 A+ SETUP
+
+If Discord channel routing is already supported, allow A+ setups to be sent to a separate channel.
+
+If separate channel routing is not configured, keep the alert in the existing channel and simply label it clearly.
+
+Do not block Possible or Strong alerts.
+
+6. EXPLAIN WHY COMMAND
+
+Add a command or endpoint that explains why the latest trade is READY.
+
+Command examples:
+
+/why
+/why MGC
+/why MNQ
+
+Response should include:
+
+* Direction
+* Edge Score
+* Trade Strength
+* Required READY conditions that passed
+* Confluences present
+* Risk factors
+* What would invalidate the setup
+* What would improve the setup
+
+Example:
+
+Why is MGC LONG READY?
+
+READY Gate Passed:
+✓ BOS Demand
+✓ Bullish CHOCH
+✓ Confirmation candle
+✓ VWAP Reclaim
+✓ Active timing window
+✓ No opposing full setup
+
+Confluences:
+✓ Liquidity Sweep
+✓ Demand Zone Mitigated
+✓ Price near demand zone
+
+Risk:
+⚠ Nearby resistance
+
+Invalidation:
+Close below demand zone or VWAP failure.
+
+Would improve if:
+Price holds above VWAP and TP1 is reached.
+
+7. JOURNAL EXTENSIONS
+
+Store with each trade:
+
+* Trade management plan
+* TP1/TP2/TP3 levels
+* Breakeven level
+* Partial level
+* Runner target
+* Final outcome
+* R multiple
+* Max favorable move
+* Max adverse move
+* Trade strength
+* A+ flag
+* Management updates
+* Why explanation snapshot
+
+Do not change existing journal format except to extend it.
+
+8. SAFETY RULES
+
+This upgrade must be additive only.
+
+Do not change webhook parsing.
+Do not change TradingView alert messages.
+Do not modify existing READY gate logic.
+Do not remove existing alerts.
+Do not remove throttling.
+Do not remove 5-minute repost logic.
+Do not break current Discord cards.
+Do not require new TradingView alerts.
+Do not require screenshots to work.
+If any new feature fails, existing alerts must still send normally.

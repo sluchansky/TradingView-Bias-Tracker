@@ -63,6 +63,8 @@ router.all(
     "/journal",
     "/journal/",
     "/eod",
+    "/weekly",
+    "/why",
     "/broker/status",
     "/broker/toggle",
     "/broker/test",

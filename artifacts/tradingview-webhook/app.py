@@ -56,6 +56,9 @@ ACTIVE_TRADE     = None
 _ENTER_LOCK      = threading.Lock()
 LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
 LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live card sent (UTC)
+# ── Trade-management watcher state (additive; separate from manual ACTIVE_TRADE) ──
+MANAGED_TRADES_BY_KEY = {}  # (instrument,direction,entry_lo,date) -> managed-trade dict
+LAST_READY_BY_TICKER  = {}  # instrument -> last READY card entry snapshot (for /why)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
 ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
@@ -158,12 +161,12 @@ DEFAULT_RISK_PCT     = 0.01     # 1% — fallback when no profile/risk_pct given
 MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 10 oz)
 
 # ── Per-instrument trade specs (strict-recommendation ruleset) ──────────────
-#   tp1 / tp2   = fixed target distances in price points from the entry zone
+#   tp1 / tp2 / tp3 = fixed target distances in price points from the entry zone
 #   stop_buf    = stop distance beyond the demand/supply zone (price points)
 #   point_value = $ per point per contract  (MNQ Micro Nasdaq = $2, MGC Micro Gold = $10)
 INSTRUMENT_SPECS = {
-    "MNQ": {"tp1": 20.0, "tp2": 40.0, "stop_buf": 5.0, "point_value": 2.0},
-    "MGC": {"tp1": 5.0,  "tp2": 10.0, "stop_buf": 1.0, "point_value": 10.0},
+    "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0},
+    "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0},
 }
 
 def instrument_of(ticker):
@@ -259,6 +262,9 @@ BOT_NAME = "🤖 AI Trading Partner"
 DISCORD_WEBHOOK_URL         = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_MNQ_WEBHOOK_URL     = os.environ.get("DISCORD_MNQ_WEBHOOK_URL", "")
 DISCORD_JOURNAL_WEBHOOK_URL = os.environ.get("DISCORD_JOURNAL_WEBHOOK_URL", "")
+# Optional dedicated channel for 🔥 A+ setups. When unset, A+ alerts stay in the
+# normal per-instrument channel and are simply labelled — never a required secret.
+DISCORD_APLUS_WEBHOOK_URL   = os.environ.get("DISCORD_APLUS_WEBHOOK_URL", "")
 
 
 def _discord_url(hint: str = "") -> str:
@@ -277,6 +283,14 @@ HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (
 # is READY (in addition to the instant alert on the triggering webhook).
 TRADE_READY_INTERVAL = int(os.environ.get("TRADE_READY_INTERVAL", 300))  # seconds (default 5 min)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
+# ── Weekly performance report (additive) ──────────────────────────────────────
+# Posts a week-in-review embed once a week, just after the close. Default is
+# Friday (weekday()==4) at 21:15 UTC — 15 min after the daily EOD so the two
+# never collide. All knobs are optional env overrides.
+WEEKLY_REPORT_DOW       = int(os.environ.get("WEEKLY_REPORT_DOW", 4))   # Mon=0 … Sun=6, default Fri
+WEEKLY_REPORT_HOUR_UTC  = int(os.environ.get("WEEKLY_REPORT_HOUR_UTC", EOD_HOUR_UTC))
+WEEKLY_REPORT_MINUTE    = int(os.environ.get("WEEKLY_REPORT_MINUTE", 15))
+WEEKLY_REPORT_DAYS      = int(os.environ.get("WEEKLY_REPORT_DAYS", 7))  # lookback window in days
 
 # ── Automatic VWAP fetch ──────────────────────────────────────────────────────
 # Session VWAP is pulled from a public market-data feed so the operator never has
@@ -396,7 +410,8 @@ def _compute_eod_stats():
     # ── Trade-strength split + Edge Score stats (READY journal entries) ──
     possible = [e for e in entries if _entry_trade_strength(e) == "Possible Trade"]
     strong   = [e for e in entries if _entry_trade_strength(e) == "Strong Trade"]
-    ready_entries = possible + strong
+    aplus    = [e for e in entries if _entry_trade_strength(e) == "A+ Setup"]
+    ready_entries = possible + strong + aplus
     edge_vals = [_edge_score_for_entry(e) for e in ready_entries]
     avg_edge  = round(sum(edge_vals) / len(edge_vals), 1) if edge_vals else None
     highest_edge = max(ready_entries, key=_edge_score_for_entry, default=None)
@@ -433,6 +448,7 @@ def _compute_eod_stats():
         # ── Trade-strength + Edge Score (additive) ──
         "possible_count":   len(possible),
         "strong_count":     len(strong),
+        "aplus_count":      len(aplus),
         "avg_edge_score":   avg_edge,
         "highest_edge":     highest_edge,
         "lowest_edge":      lowest_edge,
@@ -492,6 +508,7 @@ def _send_eod_summary():
             {"name": "\u200b",          "value": "\u200b",                     "inline": True},
             {"name": "🟡 Possible trades", "value": str(stats.get("possible_count", 0)), "inline": True},
             {"name": "🟢 Strong trades",   "value": str(stats.get("strong_count", 0)),   "inline": True},
+            {"name": "🔥 A+ setups",       "value": str(stats.get("aplus_count", 0)),    "inline": True},
             {"name": "⚡ Avg Edge Score",  "value": (f"{stats['avg_edge_score']:.1f}" if stats.get("avg_edge_score") is not None else "—"), "inline": True},
             {"name": "🔼 Highest Edge Score", "value": _fmt_setup(stats.get("highest_edge")), "inline": False},
             {"name": "🔽 Lowest Edge Score",  "value": _fmt_setup(stats.get("lowest_edge")),  "inline": False},
@@ -522,6 +539,233 @@ def _schedule_eod():
     def _run():
         _send_eod_summary()
         _schedule_eod()
+
+    threading.Timer(delay, _run).start()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Weekly performance report (Feature 4, additive). Mirrors the EOD scheduler but
+# fires once a week, just after the close. Reuses compute_performance_stats for
+# the core W/L/BE/PF/Avg-R numbers, then layers week-specific extras (net P&L,
+# net R, best/worst setup/instrument/direction, A+ split). Fully fail-open.
+# ───────────────────────────────────────────────────────────────────────────
+
+def _weekly_entries(days=None):
+    """Journal entries whose timestamp falls within the lookback window."""
+    days   = WEEKLY_REPORT_DAYS if days is None else days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out = []
+    for e in JOURNAL:
+        ts = e.get("datetime", "")
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt >= cutoff:
+            out.append(e)
+    return out
+
+
+def _entry_realized_r(entry, state):
+    """Prefer the watcher's exact R (r_multiple) when present, else the proxy."""
+    r = entry.get("r_multiple")
+    try:
+        if r is not None:
+            return float(r)
+    except (TypeError, ValueError):
+        pass
+    return _realized_r(entry, state)
+
+
+def _compute_weekly_stats(days=None):
+    """Derive week-in-review analytics from JOURNAL over the lookback window."""
+    week = _weekly_entries(days)
+    perf = compute_performance_stats(week)
+
+    net_pnl, has_pnl, r_total = 0.0, False, 0.0
+    inst_pnl, dir_pnl = {}, {}
+    wins_list, losses_list = [], []
+
+    for e in week:
+        pnl   = e.get("pnl_dollars")
+        state = _outcome_state(e.get("outcome"), pnl)
+        if state is None:
+            continue  # still open — not part of realized weekly stats
+        r_total += _entry_realized_r(e, state)
+        if state == "win":
+            wins_list.append(e)
+        elif state == "loss":
+            losses_list.append(e)
+        if pnl is not None:
+            try:
+                pnl_f = float(pnl)
+            except (TypeError, ValueError):
+                continue
+            net_pnl += pnl_f
+            has_pnl = True
+            inst = instrument_of(e.get("symbol", ""))
+            inst_pnl[inst] = inst_pnl.get(inst, 0.0) + pnl_f
+            d = e.get("direction") or "—"
+            dir_pnl[d] = dir_pnl.get(d, 0.0) + pnl_f
+
+    best  = max(wins_list,   key=_edge_score_for_entry, default=None)
+    worst = (losses_list[0] if losses_list
+             else min(wins_list, key=_edge_score_for_entry, default=None))
+
+    best_instrument  = max(inst_pnl, key=inst_pnl.get) if inst_pnl else None
+    worst_instrument = min(inst_pnl, key=inst_pnl.get) if inst_pnl else None
+    best_direction   = max(dir_pnl, key=dir_pnl.get) if dir_pnl else None
+    worst_direction  = min(dir_pnl, key=dir_pnl.get) if dir_pnl else None
+
+    ready = [e for e in week if _entry_trade_strength(e) in
+             ("Possible Trade", "Strong Trade", "A+ Setup")]
+    edge_vals = [_edge_score_for_entry(e) for e in ready]
+    avg_edge  = round(sum(edge_vals) / len(edge_vals), 1) if edge_vals else None
+
+    possible = sum(1 for e in week if _entry_trade_strength(e) == "Possible Trade")
+    strong   = sum(1 for e in week if _entry_trade_strength(e) == "Strong Trade")
+    aplus    = sum(1 for e in week if _entry_trade_strength(e) == "A+ Setup")
+
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=(WEEKLY_REPORT_DAYS if days is None else days))
+    return {
+        "start":            cutoff.date().isoformat(),
+        "end":              now.date().isoformat(),
+        "total_setups":     len(week),
+        "wins":             perf["wins"],
+        "losses":           perf["losses"],
+        "breakevens":       perf["breakevens"],
+        "decided":          perf["decided"],
+        "closed":           perf["closed"],
+        "win_rate":         perf["win_rate"],
+        "profit_factor":    perf["profit_factor"],
+        "gross_win":        perf["gross_win"],
+        "gross_loss":       perf["gross_loss"],
+        "avg_r":            perf["avg_r"],
+        "net_r":            round(r_total, 2),
+        "net_pnl":          round(net_pnl, 2) if has_pnl else None,
+        "best":             best,
+        "worst":            worst,
+        "best_instrument":  best_instrument,
+        "worst_instrument": worst_instrument,
+        "inst_pnl":         inst_pnl,
+        "best_direction":   best_direction,
+        "worst_direction":  worst_direction,
+        "dir_pnl":          dir_pnl,
+        "avg_edge_score":   avg_edge,
+        "possible_count":   possible,
+        "strong_count":     strong,
+        "aplus_count":      aplus,
+        "by_strength":      perf["by_strength"],
+    }
+
+
+def _send_weekly_report(days=None):
+    """Build and post the weekly performance embed to all configured channels."""
+    s   = _compute_weekly_stats(days)
+    now = datetime.now(timezone.utc)
+
+    pnl_val = s["net_pnl"]
+    if pnl_val is None:
+        pnl_str, color = "—", 0x5865F2
+    elif pnl_val >= 0:
+        pnl_str, color = f"+${pnl_val:,.0f}", 0x2ECC71
+    else:
+        pnl_str, color = f"-${abs(pnl_val):,.0f}", 0xE74C3C
+
+    wr   = f"{s['win_rate']:.0f}%" if s.get("win_rate") is not None else "—"
+    if s["profit_factor"] is not None:
+        pf = f"{s['profit_factor']:.2f}"
+    else:
+        pf = "∞" if s.get("gross_win", 0) > 0 else "—"
+    avgr = f"{s['avg_r']:+.2f}R" if s.get("avg_r") is not None else "—"
+    netr = f"{s['net_r']:+.2f}R"
+
+    def _fmt_inst(inst, pool):
+        if not inst:
+            return "—"
+        pnl = pool.get(inst)
+        if pnl is None:
+            return str(inst)
+        sign = f"+${pnl:,.0f}" if pnl >= 0 else f"-${abs(pnl):,.0f}"
+        return f"{inst}  ·  {sign}"
+
+    def _fmt_strength(k):
+        b = s.get("by_strength", {}).get(k)
+        if not b or b.get("closed", 0) == 0:
+            return f"{k}: —"
+        wr_b = f"{b['win_rate']:.0f}%" if b.get("win_rate") is not None else "—"
+        ar_b = f"{b['avg_r']:+.2f}R" if b.get("avg_r") is not None else "—"
+        return (f"**{k}**: {b['wins']}W / {b['losses']}L / {b['breakevens']}BE  ·  "
+                f"WR {wr_b} · Avg {ar_b}")
+    strength_text = "\n".join(_fmt_strength(k) for k in
+                              ("Possible Trade", "Strong Trade", "A+ Setup"))
+
+    embed = {
+        "color":       color,
+        "author":      {"name": f"{BOT_NAME} · Weekly"},
+        "title":       "🗓️ Weekly Performance Report",
+        "description": f"{s['start']} → {s['end']}",
+        "fields": [
+            {"name": "Total setups",   "value": str(s["total_setups"]),  "inline": True},
+            {"name": "Trades decided", "value": str(s["decided"]),       "inline": True},
+            {"name": "Win rate",       "value": wr,                      "inline": True},
+            {"name": "Wins ✅",        "value": str(s["wins"]),          "inline": True},
+            {"name": "Losses ❌",      "value": str(s["losses"]),        "inline": True},
+            {"name": "Breakeven ⚖️",   "value": str(s["breakevens"]),    "inline": True},
+            {"name": "Profit Factor",  "value": pf,                      "inline": True},
+            {"name": "Avg R",          "value": avgr,                    "inline": True},
+            {"name": "Net R",          "value": netr,                    "inline": True},
+            {"name": "Net P&L",        "value": f"**{pnl_str}**",        "inline": True},
+            {"name": "⚡ Avg Edge",    "value": (f"{s['avg_edge_score']:.1f}"
+                                                 if s.get("avg_edge_score") is not None else "—"),
+                                                                          "inline": True},
+            {"name": "\u200b",         "value": "\u200b",                "inline": True},
+            {"name": "Best instrument",  "value": _fmt_inst(s.get("best_instrument"),  s.get("inst_pnl", {})), "inline": True},
+            {"name": "Worst instrument", "value": _fmt_inst(s.get("worst_instrument"), s.get("inst_pnl", {})), "inline": True},
+            {"name": "\u200b",           "value": "\u200b",              "inline": True},
+            {"name": "Best direction",   "value": _fmt_inst(s.get("best_direction"),  s.get("dir_pnl", {})),  "inline": True},
+            {"name": "Worst direction",  "value": _fmt_inst(s.get("worst_direction"), s.get("dir_pnl", {})),  "inline": True},
+            {"name": "\u200b",           "value": "\u200b",              "inline": True},
+            {"name": "🟡 Possible",  "value": str(s.get("possible_count", 0)), "inline": True},
+            {"name": "🟢 Strong",    "value": str(s.get("strong_count", 0)),   "inline": True},
+            {"name": "🔥 A+ setups", "value": str(s.get("aplus_count", 0)),    "inline": True},
+            {"name": "🎯 By Trade Strength", "value": strength_text[:1024], "inline": False},
+            {"name": "🔼 Best setup",  "value": _fmt_setup(s.get("best")),  "inline": False},
+            {"name": "🔽 Worst setup", "value": _fmt_setup(s.get("worst")), "inline": False},
+        ],
+        "footer": {"text": "Weekly  ·  " + fmt_et(now, "%Y-%m-%d %H:%M ET")},
+    }
+
+    for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL, DISCORD_JOURNAL_WEBHOOK_URL]):
+        try:
+            requests.post(url, json={"embeds": [embed]}, timeout=5)
+        except Exception:
+            pass
+    logger.info("Weekly report sent (%s → %s).", s["start"], s["end"])
+    return s
+
+
+def _schedule_weekly_report():
+    """Schedule the weekly report for the next configured weekday + time (UTC)."""
+    now = datetime.now(timezone.utc)
+    days_ahead = (WEEKLY_REPORT_DOW - now.weekday()) % 7
+    fire = now.replace(hour=WEEKLY_REPORT_HOUR_UTC, minute=WEEKLY_REPORT_MINUTE,
+                       second=0, microsecond=0) + timedelta(days=days_ahead)
+    if fire <= now:
+        fire += timedelta(days=7)
+    delay = (fire - now).total_seconds()
+    logger.info("Weekly report scheduled for %s UTC (in %.0fs).",
+                fire.strftime("%a %H:%M"), delay)
+
+    def _run():
+        try:
+            _send_weekly_report()
+        except Exception as exc:
+            logger.error("Weekly report error: %s", exc)
+        _schedule_weekly_report()
 
     threading.Timer(delay, _run).start()
 
@@ -1498,7 +1742,7 @@ def _strict_checklist_field(strict_label, strict_score, confluences,
         f"{_mark(c.get('confirmation'))} 5m {'bearish' if is_short else 'bullish'} confirmation candle",
         f"{_mark(c.get('vwap'))} Price {side_word} VWAP  ·  VWAP {vwap_txt}",
     ]
-    label_emoji = {"Strong Trade": "🟢", "Possible Trade": "🟡"}.get(strict_label, "⏸")
+    label_emoji = {"A+ Setup": "🔥", "Strong Trade": "🟢", "Possible Trade": "🟡"}.get(strict_label, "⏸")
     header = f"{label_emoji} **{strict_label}** · Score **{strict_score}/100**"
     if direction:
         header += f" · {direction}"
@@ -2075,12 +2319,18 @@ def _update_vwap_auto(instrument):
 
 
 def _vwap_autofetch_loop():
-    """Refresh VWAP for all tracked instruments, then reschedule."""
+    """Refresh VWAP for all tracked instruments, evaluate managed trades, then
+    reschedule. The managed-trade watch is additive and fail-open so it can
+    never disrupt the VWAP refresh or kill the loop."""
     try:
         for instrument in VWAP_FEED_SYMBOL:
             _update_vwap_auto(instrument)
     except Exception as exc:  # never let the loop die
         logger.warning("VWAP auto-fetch loop error: %s", exc)
+    try:
+        _watch_managed_trades()
+    except Exception as exc:
+        logger.warning("Managed-trade watch error: %s", exc)
     finally:
         threading.Timer(VWAP_FETCH_INTERVAL, _vwap_autofetch_loop).start()
 
@@ -2291,13 +2541,18 @@ def build_strict_trade_plan(direction, ticker, current_price,
     spec = spec_for(ticker)
     inst = instrument_of(ticker)
     tp1d, tp2d, buf, pv = spec["tp1"], spec["tp2"], spec["stop_buf"], spec["point_value"]
+    tp3d = spec.get("tp3", tp2d * 1.5)
 
     def no_plan(reason):
         return {"trade_plan": False, "reason": reason,
                 "entry_zone": None, "stop_loss": None,
                 "target1": None, "target2": None,
                 "rr": None, "direction": direction,
-                "instrument": inst, "point_value": pv}
+                "instrument": inst, "point_value": pv,
+                # Additive management keys kept present (None) for reader parity.
+                "target3": None, "be_level": None, "partial_level": None,
+                "runner_target": None, "risk_points": None, "reward_points": None,
+                "rr_num": None, "max_invalidation": None, "management": None}
 
     if direction == "Long":
         anchor = nearest_demand
@@ -2305,14 +2560,14 @@ def build_strict_trade_plan(direction, ticker, current_price,
             return no_plan("No demand zone to anchor the entry.")
         lo, hi = anchor, anchor + buf
         stop   = anchor - buf
-        t1, t2 = anchor + tp1d, anchor + tp2d
+        t1, t2, t3 = anchor + tp1d, anchor + tp2d, anchor + tp3d
     else:  # Short
         anchor = nearest_supply
         if anchor is None:
             return no_plan("No supply zone to anchor the entry.")
         lo, hi = anchor - buf, anchor
         stop   = anchor + buf
-        t1, t2 = anchor - tp1d, anchor - tp2d
+        t1, t2, t3 = anchor - tp1d, anchor - tp2d, anchor - tp3d
 
     entry  = (lo + hi) / 2
     risk   = abs(entry - stop)
@@ -2322,10 +2577,21 @@ def build_strict_trade_plan(direction, ticker, current_price,
     if r2 < 2.0:
         return no_plan(f"Stop distance {risk:.1f} pts makes fixed TP2 only {r2:.1f}R (min 1:2).")
 
+    # ── Additive trade-management plan (does NOT alter the existing fields) ──
+    be_level  = t1                 # move stop to breakeven once TP1 prints
+    partial   = (t1 + t2) / 2      # scale out a partial between TP1 and TP2
+    runner    = t3                 # let the runner ride to TP3
+    reward    = abs(t3 - entry)    # reward measured to the runner target
+    rr_runner = reward / risk
+    zone_word = "demand" if direction == "Long" else "supply"
+    side_word = "below" if direction == "Long" else "above"
+
     fmt = (lambda v: f"{v:.1f}") if inst == "MNQ" else (lambda v: f"{v:.2f}")
+    invalidation = (f"Price closing {side_word} the stop ({fmt(stop)}) or losing the "
+                    f"{zone_word} zone invalidates the setup.")
     return {
         "trade_plan": True,
-        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} pts), stop beyond zone.",
+        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} / TP3 {tp3d:g} pts), stop beyond zone.",
         "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
         "stop_loss":  fmt(stop),
         "target1":    fmt(t1),
@@ -2334,6 +2600,24 @@ def build_strict_trade_plan(direction, ticker, current_price,
         "direction":  direction,
         "instrument": inst,
         "point_value": pv,
+        # ── Additive management fields ──
+        "target3":          fmt(t3),
+        "be_level":         fmt(be_level),
+        "partial_level":    fmt(partial),
+        "runner_target":    fmt(runner),
+        "risk_points":      round(risk, 2),
+        "reward_points":    round(reward, 2),
+        "rr_num":           round(rr_runner, 2),
+        "max_invalidation": invalidation,
+        # Numeric snapshot consumed by the trade-management watcher.
+        "management": {
+            "direction": direction, "instrument": inst, "point_value": pv,
+            "entry": round(entry, 4), "entry_lo": round(lo, 4), "entry_hi": round(hi, 4),
+            "stop": round(stop, 4),
+            "tp1": round(t1, 4), "tp2": round(t2, 4), "tp3": round(t3, 4),
+            "be_level": round(be_level, 4), "partial": round(partial, 4),
+            "runner": round(runner, 4), "risk_points": round(risk, 4),
+        },
     }
 
 
@@ -2628,11 +2912,16 @@ def _build_trade_card_embed(entry, footer_text):
     """Build the clean trade-card embed shared by the journal channel and the
     live alert channel. `entry` is the dict produced by _build_card_entry()."""
     direction_emoji = "📈" if entry["direction"] == "Long" else "📉"
-    # Strength label is driven by the Edge Score (Possible 75-89 / Strong 90-100),
+    # Strength label is driven by the Edge Score (Possible 75-89 / Strong 90-94 / A+ 95-100),
     # falling back to the strict gate label for legacy entries without one.
     strength        = entry.get("trade_strength") or entry.get("strict_label", "Possible Trade")
     strength_disp   = _strength_display(strength)
-    color           = 0x2ECC71 if strength == "Strong Trade" else 0xF1C40F
+    if strength == "A+ Setup":
+        color = 0xFF4500
+    elif strength == "Strong Trade":
+        color = 0x2ECC71
+    else:
+        color = 0xF1C40F
 
     def _val(v):
         return str(v) if v not in (None, "") else "—"
@@ -2692,6 +2981,31 @@ def _build_trade_card_embed(entry, footer_text):
         "footer": {"text": footer_text},
     }
 
+    # ── Additive: 📋 Trade Management block (Feature 1). Built defensively so a
+    # missing plan simply omits the field and never breaks the existing card. ──
+    try:
+        mgmt_lines = []
+        if entry.get("target3") not in (None, ""):
+            mgmt_lines.append(f"🎯 TP3: {entry['target3']}")
+        if entry.get("be_level") not in (None, ""):
+            mgmt_lines.append(f"🟰 Move stop to BE: {entry['be_level']}")
+        if entry.get("partial_level") not in (None, ""):
+            mgmt_lines.append(f"💰 Partial: {entry['partial_level']}")
+        if entry.get("runner_target") not in (None, ""):
+            mgmt_lines.append(f"🏃 Runner: {entry['runner_target']}")
+        rp, rwp, rrn = entry.get("risk_points"), entry.get("reward_points"), entry.get("rr_num")
+        if rp is not None and rwp is not None:
+            rr_txt = f" · R:R {rrn}R" if rrn is not None else ""
+            mgmt_lines.append(f"⚖️ Risk: {rp} pts · Reward: {rwp} pts{rr_txt}")
+        if entry.get("max_invalidation"):
+            mgmt_lines.append(f"🚫 Invalidation: {entry['max_invalidation']}")
+        if mgmt_lines:
+            embed["fields"].append({"name": "📋 Trade Management",
+                                    "value": "\n".join(mgmt_lines)[:1024],
+                                    "inline": False})
+    except Exception as exc:
+        logger.error("Trade-management card block error: %s", exc)
+
     # Attach the chart screenshot when a validated public URL is present.
     shot = entry.get("screenshot_url")
     if shot:
@@ -2718,6 +3032,26 @@ def send_live_ready_card(entry, ticker=""):
             logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
         logger.error("Live ready card post error: %s", exc)
+    # Optionally mirror 🔥 A+ setups to a dedicated channel (additive — the card
+    # already posted to the normal channel above, so this never blocks/relocates
+    # Possible/Strong/A+ alerts). Skipped entirely when no A+ channel is set.
+    try:
+        if (entry.get("trade_strength") == "A+ Setup"
+                and DISCORD_APLUS_WEBHOOK_URL and DISCORD_APLUS_WEBHOOK_URL != url):
+            requests.post(DISCORD_APLUS_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+    except Exception as exc:
+        logger.error("A+ channel mirror error: %s", exc)
+    # ── Additive: register the setup with the trade-management watcher and store
+    # the latest READY snapshot (for /why). Both fail-open so a hiccup here can
+    # never block the alert that already posted above. ──
+    try:
+        _register_managed_trade(entry, ticker)
+    except Exception as exc:
+        logger.error("Managed-trade register error: %s", exc)
+    try:
+        LAST_READY_BY_TICKER[instrument_of(ticker or entry.get("symbol", ""))] = entry
+    except Exception as exc:
+        logger.error("LAST_READY snapshot error: %s", exc)
 
 
 def _trade_ready_loop():
@@ -2795,6 +3129,305 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None):
                 )
             return entry
     return None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Trade-management watcher (Features 1-3, fully additive).
+#
+# When a setup goes READY and its clean card posts, the setup is registered as a
+# *managed trade* keyed by (instrument, direction, entry-zone low, UTC date). A
+# background pass — piggybacking the VWAP auto-fetch loop — pulls the latest
+# 1-minute bar (high/low/close) from the same public feed and walks the trade
+# through its plan: TP1 → breakeven → partial → TP2 → TP3, or stop/invalidation.
+# Each level fires a Discord update exactly once; the terminal exit posts an
+# outcome card and writes Result / R / MFE / MAE back to the journal entry.
+#
+# This NEVER touches the manual ACTIVE_TRADE flow, the READY gate, throttling,
+# or the existing cards. Every entry point is wrapped in try/except so a feed
+# hiccup can never block an alert.
+# ───────────────────────────────────────────────────────────────────────────
+
+def _managed_trade_key(instrument, direction, entry_lo):
+    """Dedup key — same setup on the same UTC day maps to one managed trade."""
+    try:
+        lo_key = round(float(entry_lo), 0)
+    except (TypeError, ValueError):
+        lo_key = 0.0
+    return (instrument, direction, lo_key,
+            datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+
+def _register_managed_trade(entry, ticker=""):
+    """Register (or refresh) a READY setup with the trade-management watcher.
+
+    Idempotent: a repost of the same setup refreshes the plan levels but keeps
+    any events already sent and the running MFE/MAE. A closed trade is never
+    re-opened by a later repost on the same key/day.
+    """
+    mp = entry.get("management_plan")
+    if not mp:
+        return None  # no numeric plan (e.g. legacy/no-plan entry) — nothing to track
+
+    instrument = entry.get("instrument") or instrument_of(ticker or entry.get("symbol", ""))
+    direction  = entry.get("direction") or mp.get("direction") or "Long"
+    key = _managed_trade_key(instrument, direction, mp.get("entry_lo"))
+
+    # Light housekeeping: drop closed trades from previous UTC days.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for k in [k for k, v in MANAGED_TRADES_BY_KEY.items()
+              if v.get("closed") and k[3] != today]:
+        MANAGED_TRADES_BY_KEY.pop(k, None)
+
+    existing = MANAGED_TRADES_BY_KEY.get(key)
+    if existing is not None:
+        if not existing.get("closed"):
+            # Refresh plan numbers, preserve progress (events/MFE/MAE/be_active).
+            existing.update({k: mp.get(k) for k in
+                             ("entry", "entry_lo", "entry_hi", "stop", "tp1", "tp2",
+                              "tp3", "be_level", "partial", "runner", "risk_points",
+                              "point_value")})
+        return existing
+
+    mt = {
+        "key": key, "instrument": instrument, "direction": direction,
+        "symbol": entry.get("symbol") or instrument,
+        "entry": mp.get("entry"), "entry_lo": mp.get("entry_lo"), "entry_hi": mp.get("entry_hi"),
+        "stop": mp.get("stop"), "tp1": mp.get("tp1"), "tp2": mp.get("tp2"), "tp3": mp.get("tp3"),
+        "be_level": mp.get("be_level"), "partial": mp.get("partial"), "runner": mp.get("runner"),
+        "risk_points": mp.get("risk_points"), "point_value": mp.get("point_value"),
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "events_sent": set(), "updates": [],
+        "mfe": 0.0, "mae": 0.0, "be_active": False, "closed": False,
+        "trade_strength": entry.get("trade_strength"),
+        "edge_score": entry.get("edge_score"),
+        "journal_id": entry.get("id"),
+    }
+    MANAGED_TRADES_BY_KEY[key] = mt
+    logger.info("Managed trade registered: %s %s entry≈%s", instrument, direction, mp.get("entry"))
+    return mt
+
+
+def _fetch_latest_bar(instrument):
+    """Return {'high','low','close'} of the most recent 1-minute bar, or None.
+
+    Uses the same public feed as the VWAP fetch (MGC≈GC=F, MNQ≈NQ=F). Best-effort
+    — any error returns None so the watcher simply skips this cycle.
+    """
+    symbol = VWAP_FEED_SYMBOL.get(instrument)
+    if not symbol:
+        return None
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        resp = requests.get(url, params={"interval": "1m", "range": "1d"},
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if resp.status_code != 200:
+            return None
+        result = resp.json()["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+        highs, lows, closes = quote["high"], quote["low"], quote["close"]
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        logger.warning("Latest-bar fetch failed for %s: %s", instrument, exc)
+        return None
+    for i in range(len(closes) - 1, -1, -1):
+        if highs[i] is not None and lows[i] is not None and closes[i] is not None:
+            return {"high": float(highs[i]), "low": float(lows[i]), "close": float(closes[i])}
+    return None
+
+
+def _watch_managed_trades():
+    """Evaluate every open managed trade against the latest bar (one fetch per
+    instrument per cycle). Called from the VWAP auto-fetch loop."""
+    active = [mt for mt in MANAGED_TRADES_BY_KEY.values() if not mt.get("closed")]
+    if not active:
+        return
+    bars = {}
+    for inst in {mt["instrument"] for mt in active}:
+        bars[inst] = _fetch_latest_bar(inst)
+    for mt in active:
+        bar = bars.get(mt["instrument"])
+        if not bar:
+            continue
+        try:
+            _evaluate_managed_trade_levels(mt, bar)
+        except Exception as exc:
+            logger.error("Managed-trade eval error (%s): %s", mt.get("key"), exc)
+
+
+def _evaluate_managed_trade_levels(mt, bar):
+    """Walk one managed trade through its plan using a single OHLC bar.
+
+    Terminal precedence is conservative: the stop / breakeven exit is checked
+    *before* targets so an ambiguous bar resolves against the trade. Each level
+    fires its Discord update once (deduped via mt['events_sent'])."""
+    if mt.get("closed"):
+        return
+    high, low = bar["high"], bar["low"]
+    entry   = mt.get("entry")
+    is_long = mt["direction"] == "Long"
+    sent    = mt["events_sent"]
+
+    # ── Running MFE / MAE (price points, never negative) ──
+    if entry is not None:
+        if is_long:
+            fav, adv = high - entry, entry - low
+        else:
+            fav, adv = entry - low, high - entry
+        mt["mfe"] = round(max(mt["mfe"], fav, 0.0), 4)
+        mt["mae"] = round(max(mt["mae"], adv, 0.0), 4)
+
+    # Effective stop: original until TP1, then breakeven (entry) afterwards.
+    eff_stop = entry if (mt.get("be_active") and entry is not None) else mt.get("stop")
+
+    # ── 1) Terminal stop / breakeven exit (checked first; conservative) ──
+    if eff_stop is not None:
+        stop_breached = (low <= eff_stop) if is_long else (high >= eff_stop)
+        if stop_breached:
+            if mt.get("be_active"):
+                _close_managed_trade(mt, "Breakeven",
+                                     "Breakeven (stop moved to BE after TP1)", eff_stop)
+            else:
+                _close_managed_trade(mt, "Loss", "Loss (stop hit)", eff_stop)
+            return
+
+    # ── 2) Targets in plan order ──
+    def _reached(level):
+        if level is None:
+            return False
+        return (high >= level) if is_long else (low <= level)
+
+    if "TP1" not in sent and _reached(mt.get("tp1")):
+        sent.add("TP1")
+        mt["be_active"] = True
+        _send_management_update(mt, "🎯 TP1 hit",
+                                f"Target 1 reached at `{mt.get('tp1')}`. Stop moves to breakeven.")
+
+    if "PARTIAL" not in sent and _reached(mt.get("partial")):
+        sent.add("PARTIAL")
+        _send_management_update(mt, "💰 Partial zone",
+                                f"Partial profit zone reached at `{mt.get('partial')}`.")
+
+    if "TP2" not in sent and _reached(mt.get("tp2")):
+        sent.add("TP2")
+        _send_management_update(mt, "🎯 TP2 hit",
+                                f"Target 2 reached at `{mt.get('tp2')}`. Trail the runner toward TP3.")
+
+    if "TP3" not in sent and _reached(mt.get("tp3")):
+        sent.add("TP3")
+        _close_managed_trade(mt, "Win", "Win (TP3 / runner target)", mt.get("tp3"))
+        return
+
+
+def _close_managed_trade(mt, outcome, result_label, exit_price):
+    """Finalise a managed trade: compute R / MFE / MAE / PnL, post the outcome
+    card, and write the result back to the linked journal entry."""
+    if mt.get("closed"):
+        return
+    mt["closed"]       = True
+    mt["outcome"]      = outcome
+    mt["result_label"] = result_label
+    mt["exit_price"]   = exit_price
+    mt["closed_at"]    = datetime.now(timezone.utc).isoformat()
+
+    entry   = mt.get("entry")
+    risk    = mt.get("risk_points") or 0.0
+    pv      = mt.get("point_value") or 0.0
+    is_long = mt["direction"] == "Long"
+
+    if entry is not None and exit_price is not None:
+        pnl_points = (exit_price - entry) if is_long else (entry - exit_price)
+    else:
+        pnl_points = 0.0
+    mt["pnl_points"]  = round(pnl_points, 4)
+    mt["pnl_dollars"] = round(pnl_points * pv, 2)
+    mt["r_multiple"]  = round(pnl_points / risk, 2) if risk else 0.0
+    mt["mfe_r"]       = round(mt["mfe"] / risk, 2) if risk else 0.0
+    mt["mae_r"]       = round(mt["mae"] / risk, 2) if risk else 0.0
+
+    _send_outcome_update(mt)
+    _apply_outcome_to_journal(mt)
+
+
+def _send_management_update(mt, title, detail):
+    """Record + post a single trade-management update to the instrument channel."""
+    mt.setdefault("updates", []).append(f"{title} — {detail}")
+    url = _discord_url(mt.get("symbol") or mt.get("instrument"))
+    if not url:
+        return
+    content = (f"**{mt.get('instrument')} {mt.get('direction')} — Trade Management**\n"
+               f"{title}\n{detail}")
+    try:
+        requests.post(url, json={"content": content[:1900]}, timeout=5)
+    except Exception as exc:
+        logger.error("Management update post error: %s", exc)
+
+
+def _send_outcome_update(mt):
+    """Post the terminal-outcome card to the instrument channel and journal."""
+    o     = mt.get("outcome", "—")
+    emoji = {"Win": "✅", "Loss": "❌", "Breakeven": "➖"}.get(o, "•")
+    color = {"Win": 0x2ECC71, "Loss": 0xE74C3C, "Breakeven": 0xF1C40F}.get(o, 0x95A5A6)
+    embed = {
+        "title": f"{emoji} Trade Closed — {mt.get('result_label', o)}",
+        "color": color,
+        "fields": [
+            {"name": "Instrument", "value": str(mt.get("instrument", "—")), "inline": True},
+            {"name": "Direction",  "value": str(mt.get("direction", "—")),  "inline": True},
+            {"name": "Result",     "value": str(o),                          "inline": True},
+            {"name": "Entry",      "value": str(mt.get("entry", "—")),       "inline": True},
+            {"name": "Exit",       "value": str(mt.get("exit_price", "—")),  "inline": True},
+            {"name": "R Multiple", "value": f"{mt.get('r_multiple', 0)}R",   "inline": True},
+            {"name": "MFE",        "value": f"{mt.get('mfe_r', 0)}R",        "inline": True},
+            {"name": "MAE",        "value": f"{mt.get('mae_r', 0)}R",        "inline": True},
+            {"name": "PnL (1 contract)", "value": f"${mt.get('pnl_dollars', 0):,.2f}", "inline": True},
+        ],
+        "footer": {"text": "Trade-management outcome · auto-tracked"},
+    }
+    updates = mt.get("updates") or []
+    if updates:
+        embed["fields"].append({"name": "Management Path",
+                                "value": "\n".join(f"• {u}" for u in updates)[:1024],
+                                "inline": False})
+    for url in {_discord_url(mt.get("symbol") or mt.get("instrument")), DISCORD_JOURNAL_WEBHOOK_URL}:
+        if not url:
+            continue
+        try:
+            requests.post(url, json={"embeds": [embed]}, timeout=10)
+        except Exception as exc:
+            logger.error("Outcome update post error: %s", exc)
+
+
+def _apply_outcome_to_journal(mt):
+    """Write the management outcome onto its linked journal entry (additive keys),
+    and set the entry's outcome/pnl so analytics + reports can count it. Never
+    overwrites an outcome already decided by the manual flow."""
+    jid    = mt.get("journal_id")
+    target = None
+    if jid is not None:
+        for e in JOURNAL:
+            if e.get("id") == jid:
+                target = e
+                break
+    if target is None:  # fall back to the most-recent dedup match
+        for e in JOURNAL:
+            if (instrument_of(e.get("symbol", "")) == mt.get("instrument")
+                    and e.get("direction") == mt.get("direction")):
+                target = e
+                break
+    if target is None:
+        return
+    target["mgmt_outcome"]       = mt.get("outcome")
+    target["mgmt_result_label"]  = mt.get("result_label")
+    target["r_multiple"]         = mt.get("r_multiple")
+    target["mfe_r"]              = mt.get("mfe_r")
+    target["mae_r"]              = mt.get("mae_r")
+    target["management_updates"] = list(mt.get("updates") or [])
+    target["mgmt_closed_at"]     = mt.get("closed_at")
+    # Only set the canonical outcome if the manual flow hasn't already decided it.
+    if _outcome_state(target.get("outcome"), target.get("pnl_dollars")) is None:
+        target["outcome"]     = mt.get("outcome")
+        target["pnl_dollars"] = mt.get("pnl_dollars")
+    logger.info("Journal #%s management outcome → %s (%sR)",
+                target.get("id"), mt.get("outcome"), mt.get("r_multiple"))
 
 
 # ---------------------------------------------------------------------------
@@ -2977,7 +3610,7 @@ def _grade_for_score(score):
 
 # ── Trade-strength classification (display / journal / analytics) ──────────────
 # A READY setup (the strict gate passed) is sub-classified PURELY by its Edge
-# Score: 75-89 → Possible Trade, 90-100 → Strong Trade. This never affects the
+# Score: 75-89 → Possible Trade, 90-94 → Strong Trade, 95-100 → A+ Setup. This never affects the
 # READY gate itself (evaluate_strict_setup); it only labels an already-READY
 # trade. A score below 75 is not a READY strength and returns None.
 def _trade_strength_from_score(score):
@@ -2985,6 +3618,8 @@ def _trade_strength_from_score(score):
         s = float(score)
     except (TypeError, ValueError):
         return None
+    if s >= 95:
+        return "A+ Setup"
     if s >= 90:
         return "Strong Trade"
     if s >= 75:
@@ -2994,7 +3629,8 @@ def _trade_strength_from_score(score):
 
 def _strength_display(strength):
     """Bold, color-coded Discord label for a trade strength."""
-    return {"Strong Trade": "🟢 STRONG TRADE",
+    return {"A+ Setup":       "🔥 A+ SETUP",
+            "Strong Trade":   "🟢 STRONG TRADE",
             "Possible Trade": "🟡 POSSIBLE TRADE"}.get(strength, "🟡 POSSIBLE TRADE")
 
 
@@ -3018,7 +3654,7 @@ def _entry_trade_strength(entry):
     """Trade strength for a stored entry: the explicit field if present, else
     derived from its Edge Score (only when ≥75, i.e. an actual READY trade)."""
     st = entry.get("trade_strength")
-    if st in ("Possible Trade", "Strong Trade"):
+    if st in ("Possible Trade", "Strong Trade", "A+ Setup"):
         return st
     return _trade_strength_from_score(_edge_score_for_entry(entry))
 
@@ -3239,7 +3875,7 @@ def compute_performance_stats(entries=None):
     gross_win = gross_loss = 0.0
     r_values = []
     cat = {c: {"win": 0, "loss": 0} for c in PERF_CATEGORIES}
-    strength_keys = ("Possible Trade", "Strong Trade")
+    strength_keys = ("Possible Trade", "Strong Trade", "A+ Setup")
     strength = {k: {"win": 0, "loss": 0, "breakeven": 0,
                     "gross_win": 0.0, "gross_loss": 0.0, "r": []}
                 for k in strength_keys}
@@ -3344,7 +3980,7 @@ def post_performance_stats(reason=""):
             pf_b = "∞" if b.get("gross_win", 0) > 0 else "—"
         return (f"**{k}**: {b['wins']}W / {b['losses']}L / {b['breakevens']}BE\n"
                 f"WR {wr_b} · Avg {ar_b} · PF {pf_b}")
-    strength_text = "\n".join(_fmt_strength(k) for k in ("Possible Trade", "Strong Trade"))
+    strength_text = "\n".join(_fmt_strength(k) for k in ("Possible Trade", "Strong Trade", "A+ Setup"))
 
     embed = {
         "color":  0x5865F2,
@@ -3415,6 +4051,16 @@ def _build_card_entry(a, ticker=None, record=None):
         "target1":          tp.get("target1"),
         "target2":          tp.get("target2"),
         "rr":               tp.get("rr"),
+        # ── Additive trade-management plan (Feature 1) ──
+        "target3":          tp.get("target3"),
+        "be_level":         tp.get("be_level"),
+        "partial_level":    tp.get("partial_level"),
+        "runner_target":    tp.get("runner_target"),
+        "risk_points":      tp.get("risk_points"),
+        "reward_points":    tp.get("reward_points"),
+        "rr_num":           tp.get("rr_num"),
+        "max_invalidation": tp.get("max_invalidation"),
+        "management_plan":  tp.get("management"),
         "bos_type":         bos_type,
         "choch_type":       choch_type,
         "bos_level":        bos_level,
@@ -3448,7 +4094,72 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["score_breakdown"]   = eb.get("score_breakdown", [])
     entry["risk_adjustments"]  = eb.get("risk_adjustments", [])
     entry["trade_strength"]    = _trade_strength_from_score(entry["edge_score"]) or entry.get("strict_label")
+    entry["a_plus"]            = (entry["trade_strength"] == "A+ Setup")
     return entry
+
+
+def _build_why_explanation(entry):
+    """Render a plain-language explanation of WHY a setup qualifies (Feature 6).
+
+    Works off a card-entry dict (the same shape stored in LAST_READY_BY_TICKER
+    and built by _build_card_entry), so it has one consistent input shape. Reads
+    everything with .get so a partial/legacy entry can never crash the endpoint.
+    Surfaces: direction, edge, strength, the 4 passed gate conditions, bonus
+    confluences, risks, invalidation, and concrete improvements toward A+."""
+    direction = entry.get("direction", "—")
+    edge      = entry.get("edge_score", 0)
+    strength  = (entry.get("trade_strength")
+                 or _trade_strength_from_score(edge)
+                 or entry.get("strict_label", "—"))
+    grade     = entry.get("edge_grade", "—")
+    is_long   = direction == "Long"
+
+    breakdown   = entry.get("score_breakdown") or []
+    risks       = entry.get("risk_adjustments") or []
+    passed      = [it.get("label") for it in breakdown if it.get("label")]
+    risk_labels = [it.get("label") for it in risks if it.get("label")]
+
+    gate_set = {
+        "BOS Demand" if is_long else "BOS Supply",
+        "Bullish CHOCH" if is_long else "Bearish CHOCH",
+        "Confirmation Candle",
+        "VWAP Reclaim" if is_long else "VWAP Rejection",
+    }
+    gate_passed = [p for p in passed if p in gate_set]
+    confluences = [p for p in passed if p not in gate_set]
+
+    # Concrete paths toward an A+ (95+) score: missing bonus confluences and any
+    # active risk adjustments to resolve. Only shown when not already A+.
+    improvements = []
+    if edge < 95:
+        possible_bonus = [
+            "Liquidity Sweep",
+            "Confirmed Zone Reaction",
+            "Demand Zone Active" if is_long else "Supply Zone Active",
+            "Bullish Trend" if is_long else "Bearish Trend",
+            "High Confidence",
+        ]
+        improvements += [f"Add confluence: {b}" for b in possible_bonus if b not in passed]
+        improvements += [f"Resolve risk: {r}" for r in risk_labels]
+
+    return {
+        "direction":        direction,
+        "edge_score":       edge,
+        "edge_grade":       grade,
+        "trade_strength":   strength,
+        "verdict":          entry.get("verdict", entry.get("strict_label", "—")),
+        "thesis":           entry.get("trade_thesis", "—"),
+        "why_qualifies":    entry.get("why_qualifies", entry.get("why", "—")),
+        "setup_notes":      entry.get("setup_notes", "—"),
+        "passed_conditions": gate_passed,
+        "confluences":      confluences,
+        "risks":            risk_labels,
+        "entry_zone":       entry.get("entry_zone"),
+        "stop_loss":        entry.get("stop_loss"),
+        "targets":          [entry.get("target1"), entry.get("target2"), entry.get("target3")],
+        "invalidation":     entry.get("max_invalidation") or entry.get("invalidation") or "—",
+        "improvements":     improvements,
+    }
 
 
 def create_journal_entry(record, a, sizing):
@@ -4412,6 +5123,62 @@ def eod_trigger():
     return jsonify({"status": "sent"}), 200
 
 
+@app.route("/weekly", methods=["GET", "POST"])
+def weekly_trigger():
+    """Manually trigger / preview the weekly performance report.
+
+    POST posts the embed to Discord and returns the computed stats. GET only
+    computes and returns the stats (no Discord post) so the report can be
+    previewed without spamming channels. Optional ?days=N overrides the window.
+    """
+    try:
+        days = int(request.args.get("days", WEEKLY_REPORT_DAYS))
+    except (TypeError, ValueError):
+        days = WEEKLY_REPORT_DAYS
+    if request.method == "POST":
+        stats = _send_weekly_report(days)
+        return jsonify({"status": "sent", "stats": stats}), 200
+    return jsonify({"status": "preview", "stats": _compute_weekly_stats(days)}), 200
+
+
+@app.route("/why", methods=["GET"])
+@app.route("/why/<ticker>", methods=["GET"])
+def why_endpoint(ticker=None):
+    """Explain WHY the current/last READY setup qualifies (Feature 6).
+
+    Prefers the stored READY snapshot (LAST_READY_BY_TICKER); if none exists yet,
+    falls back to a fresh full_analysis() for the instrument, read defensively.
+    Optional ?ticker=MGC|MNQ or /why/<ticker>; defaults to the active instrument.
+    """
+    raw        = ticker or request.args.get("ticker") or _active_ticker() or "MGC"
+    instrument = instrument_of(raw)
+    snapshot   = LAST_READY_BY_TICKER.get(instrument)
+    source     = "snapshot"
+    entry      = snapshot
+
+    if entry is None:
+        source = "live"
+        try:
+            a = full_analysis(ticker_override=instrument)
+            entry = _build_card_entry(a, ticker=instrument)
+        except Exception as exc:
+            logger.error("/why fallback analysis error: %s", exc)
+            return jsonify({"ticker": instrument, "instrument": instrument,
+                            "source": "live", "error": "analysis unavailable"}), 200
+
+    try:
+        explanation = _build_why_explanation(entry)
+    except Exception as exc:
+        logger.error("/why render error: %s", exc)
+        return jsonify({"ticker": instrument, "instrument": instrument,
+                        "source": source, "error": "explanation unavailable"}), 200
+
+    explanation["ticker"]     = entry.get("symbol", instrument)
+    explanation["instrument"] = instrument
+    explanation["source"]     = source
+    return jsonify(explanation), 200
+
+
 @app.route("/broker/status", methods=["GET"])
 def broker_status():
     """Execution-mode + cached connection state for the dashboard badge."""
@@ -4980,4 +5747,5 @@ if __name__ == "__main__":
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL
     threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()  # re-post READY card every 5 min
     _schedule_eod()                               # schedule daily EOD summary
+    _schedule_weekly_report()                     # schedule weekly report (Fri after close)
     app.run(host="0.0.0.0", port=port, debug=False)
