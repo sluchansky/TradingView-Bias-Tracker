@@ -86,6 +86,11 @@ ALERT_TYPES = {
     "MGC BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
     "MNQ BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
     "MNQ BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
+    # ── Liquidity sweep alerts (stop-hunt then reversal; display/edge only, no score) ─
+    "MGC BULLISH SWEEP":  {"side": "sweep", "score": 0},
+    "MGC BEARISH SWEEP":  {"side": "sweep", "score": 0},
+    "MNQ BULLISH SWEEP":  {"side": "sweep", "score": 0},
+    "MNQ BEARISH SWEEP":  {"side": "sweep", "score": 0},
     # ── Trade lifecycle commands (sent directly from TradingView strategy) ───────
     "MGC ENTER":  {"side": "command", "score": 0},
     "MNQ ENTER":  {"side": "command", "score": 0},
@@ -98,6 +103,7 @@ ALERT_TYPES = {
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
+SWEEP_TYPES  = {k for k, v in ALERT_TYPES.items() if v["side"] == "sweep"}
 
 # ---------------------------------------------------------------------------
 # Trading mode profiles — SCALP (fast, sensitive) vs SWING (slower, stricter)
@@ -484,7 +490,7 @@ def score_alerts(alerts):
             counts[t] += 1
             if ALERT_TYPES[t]["side"] == "bullish":
                 bullish += ALERT_TYPES[t]["score"]
-            else:
+            elif ALERT_TYPES[t]["side"] == "bearish":
                 bearish += ALERT_TYPES[t]["score"]
     return bullish, bearish, counts
 
@@ -561,7 +567,13 @@ def get_price_context(inst=None):
         except (ValueError, TypeError):
             continue
         last_price_by_type[t] = price
-        (all_supply_prices if t in SUPPLY_TYPES else all_demand_prices).append(price)
+        # Sweep alerts are stop-hunt markers, not zone levels — track their last
+        # price but never let them define supply/demand. Every other type keeps its
+        # existing supply-vs-demand classification.
+        if t in SUPPLY_TYPES:
+            all_supply_prices.append(price)
+        elif t not in SWEEP_TYPES:
+            all_demand_prices.append(price)
     return last_price_by_type, all_supply_prices, all_demand_prices
 
 def get_nearest_levels(current_price, all_supply_prices, all_demand_prices):
@@ -1204,7 +1216,9 @@ def fmt_window_counts(counts, total):
         short = (k.replace("MGC ", "").replace(" ZONE", "")
                   .replace("CONFIRMED", "CONF").replace("NEW SUPPLY", "NEW SUP")
                   .replace("NEW DEMAND", "NEW DEM"))
-        (bear_parts if ALERT_TYPES[k]["side"] == "bearish" else bull_parts).append(f"{short} ×{v}")
+        _side = ALERT_TYPES[k]["side"]
+        _is_bear = _side == "bearish" or (_side == "sweep" and "BEARISH" in k)
+        (bear_parts if _is_bear else bull_parts).append(f"{short} ×{v}")
     parts = []
     if bear_parts:
         parts.append("🔴 " + ", ".join(bear_parts))
@@ -2029,6 +2043,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     has_bear_confirm = _has(f"{inst} BEARISH CONFIRMATION", ticker_scoped=True)
     has_dem_confirm  = _has(f"{inst} DEMAND ZONE CONFIRMED", ticker_scoped=True)
     has_sup_confirm  = _has(f"{inst} SUPPLY ZONE CONFIRMED", ticker_scoped=True)
+    has_bull_sweep   = _has(f"{inst} BULLISH SWEEP", ticker_scoped=True)
+    has_bear_sweep   = _has(f"{inst} BEARISH SWEEP", ticker_scoped=True)
 
     # ── VWAP condition (required) ──
     vwap_ok     = vwap_status == "ok" and vwap is not None and current_price is not None
@@ -2040,7 +2056,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     long_gate    = long_struct and price_above
     short_gate   = short_struct and price_below
 
-    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf):
+    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf, liq_sweep=False):
         return {
             "direction":     direction,
             "bos":           bool(has_bos),
@@ -2050,6 +2066,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "vwap_status":   vwap_status,
             "vwap_value":    vwap,
             "zone_confirmed": bool(zone_conf),
+            "liquidity_sweep": bool(liq_sweep),
         }
 
     # ── Conflict: full bullish AND bearish structure present → stand aside ──
@@ -2083,7 +2100,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         return {
             "label": "Strong Trade" if score >= 90 else "Possible Trade",
             "direction": "Long", "score": score,
-            "confluences": _confluences("Long", True, True, True, True, has_dem_confirm),
+            "confluences": _confluences("Long", True, True, True, True, has_dem_confirm, has_bull_sweep),
             "reason": "Long confirmed — BOS demand, bullish CHOCH, 5m bullish candle, price above VWAP.",
             "missing": [],
         }
@@ -2093,7 +2110,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         return {
             "label": "Strong Trade" if score >= 90 else "Possible Trade",
             "direction": "Short", "score": score,
-            "confluences": _confluences("Short", True, True, True, True, has_sup_confirm),
+            "confluences": _confluences("Short", True, True, True, True, has_sup_confirm, has_bear_sweep),
             "reason": "Short confirmed — BOS supply, bearish CHOCH, 5m bearish candle, price below VWAP.",
             "missing": [],
         }
@@ -2873,9 +2890,10 @@ def compute_edge_breakdown(a, entry):
     vwap_pos    = str(entry.get("vwap_position") or "").lower()
     vwap_ok     = vwap_pos.startswith("above") if is_long else vwap_pos.startswith("below")
     zone_active = "intact" in str(entry.get("supply_demand_zone") or "").lower()
-    # Only label a real liquidity-sweep signal as such — the app has no dedicated
-    # sweep detector today, so unless one is present we report the genuine signal we
-    # DO have (a confirmed zone reaction). Never fabricate a "Liquidity Sweep".
+    # "Liquidity Sweep" shows only when a real sweep alert was received from
+    # TradingView (confluences.liquidity_sweep, set in evaluate_strict_setup from a
+    # BULLISH/BEARISH SWEEP alert). With no sweep alert we fall back to the genuine
+    # signal we do have — a confirmed zone reaction. Never fabricate a sweep.
     has_sweep     = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
     zone_reaction = bool(conf.get("zone_confirmed"))
     mkt_dir     = str(a.get("market_direction") or a.get("bias") or "")
