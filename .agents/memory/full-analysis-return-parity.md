@@ -1,28 +1,24 @@
 ---
-name: full_analysis return-path key parity
-description: full_analysis() has two return dicts that must keep identical keys; a missing key is a state-dependent 500 invisible to fresh tests.
+name: full_analysis single return path
+description: full_analysis() now returns from ONE dict; hard-indexed consumers make any missing key a state-dependent 500. Mirror keys if an early return is ever re-added.
 ---
 
-# full_analysis() return-path key parity
+# full_analysis() return path
 
-`full_analysis()` in `artifacts/tradingview-webhook/app.py` has exactly two
-`return dict(...)` statements:
-1. the **main path** (normal scoring), and
-2. a **zone-mitigated early return** gated on `ZONE_MITIGATED_FLAG and ZONE_BROKEN_AT is None`.
+`full_analysis()` in `artifacts/tradingview-webhook/app.py` has exactly **one**
+`return dict(...)`. The old **zone-mitigated early return** (gated on the
+in-memory mitigation flag) was removed — the zone-mitigated case is now folded
+into the single main dict, so there is no longer a second return to keep in sync.
 
-Both must produce the **same set of keys**. Consumers do hard `a["key"]` reads
-(notably the `/status` route and the webhook handler), so any key present in the
-main path but absent from the early-return path is a latent `KeyError` → HTTP 500.
+**Why this still matters:** consumers do hard `a["key"]` reads (notably the
+`/status` route and the webhook handler), so any key they expect but the dict
+omits is a `KeyError` → HTTP 500. Historically the second (zone-mitigated) return
+omitted `stage_direction` and `/status` 500'd only *after* a `… ZONE MITIGATED`
+alert armed the flag — a freshly-imported / in-process call hit the main path and
+looked fine, and a restart cleared the flag and hid it again. State-dependent,
+invisible to fresh tests.
 
-**Why:** the zone-mitigated branch is reached only after a `… ZONE MITIGATED`
-alert arms an **in-memory** flag. A freshly-imported / in-process call hits the
-main path and looks fine, so the bug only surfaces on the live server after that
-alert — and a workflow restart clears the flag, hiding it again. (`/status` 500'd
-on `KeyError: 'stage_direction'`; the webhook never 500'd only because it doesn't
-read that key.)
-
-**How to apply:** whenever you add/rename a key in either return dict of
-`full_analysis()`, mirror it in the other. To verify parity, AST-diff the keyword
-sets of the two `return dict(...)` calls (`early - main` and `main - early` must
-both be empty) rather than eyeballing. Consumers using `a.get(...)` (e.g. the
+**How to apply:** if you ever re-introduce an early return inside
+`full_analysis()`, mirror the full key set of the main dict (AST-diff the keyword
+sets both ways rather than eyeballing). Consumers using `a.get(...)` (e.g. the
 journal builder) are immune; the risk is the hard-indexed readers.

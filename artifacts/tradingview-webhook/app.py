@@ -5,6 +5,7 @@ import logging
 import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 import requests
@@ -235,7 +236,7 @@ def _send_heartbeat():
             age = f"{minutes}m ago"
         else:
             age = f"{minutes // 60}h {minutes % 60}m ago"
-        last_str = f"{LAST_ALERT_AT.strftime('%H:%M UTC')}  ({age})"
+        last_str = f"{fmt_et(LAST_ALERT_AT, '%H:%M ET')}  ({age})"
     else:
         last_str = "No alerts received yet"
 
@@ -260,7 +261,7 @@ def _send_heartbeat():
             {"name": "Active trade",        "value": trade_str,  "inline": True},
             {"name": "Status",              "value": status_str, "inline": True},
         ],
-        "footer": {"text": now.strftime("Check-in  ·  %Y-%m-%d %H:%M UTC")},
+        "footer": {"text": "Check-in  ·  " + fmt_et(now, "%Y-%m-%d %H:%M ET")},
     }
 
     for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL]):
@@ -396,7 +397,7 @@ def _send_eod_summary():
         "color":       color,
         "author":      {"name": BOT_NAME},
         "title":       "📊 End of Day Summary",
-        "description": now.strftime("%A, %B %-d, %Y"),
+        "description": fmt_et(now, "%A, %B %-d, %Y"),
         "fields": [
             {"name": "Total setups",    "value": str(stats["total_setups"]),   "inline": True},
             {"name": "Long setups",     "value": str(stats["long_setups"]),    "inline": True},
@@ -414,7 +415,7 @@ def _send_eod_summary():
             {"name": "Best setup",      "value": _fmt_setup(stats["best"]),    "inline": False},
             {"name": "Worst setup",     "value": _fmt_setup(stats["worst"]),   "inline": False},
         ],
-        "footer": {"text": now.strftime("EOD  ·  %Y-%m-%d %H:%M UTC")},
+        "footer": {"text": "EOD  ·  " + fmt_et(now, "%Y-%m-%d %H:%M ET")},
     }
 
     for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL, DISCORD_JOURNAL_WEBHOOK_URL]):
@@ -455,6 +456,29 @@ JOURNAL_STAGES = frozenset(("Setup Forming", "Confirmation Candle", "Trade Ready
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+
+# US Eastern time for DISPLAY only — storage stays UTC. ZoneInfo handles the
+# EST/EDT daylight-saving switch automatically (e.g. EDT in summer, EST in winter).
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def fmt_et(value, fmt="%Y-%m-%d %H:%M ET"):
+    """Format a UTC datetime or ISO-8601 string in US Eastern time for display.
+
+    Accepts an aware/naive datetime (naive is treated as UTC) or an ISO string.
+    Returns "" for None and echoes back an unparseable string unchanged.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(ET_TZ).strftime(fmt)
 
 def alerts_in_window(minutes):
     cutoff = now_utc() - timedelta(minutes=minutes)
@@ -1659,7 +1683,7 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
         "description": f"**{ticker}** · {price_str} · `{alert_data.get('alert_type','—')}`",
         "color":       color,
         "fields":      fields,
-        "footer":      {"text": f"Received {alert_data.get('timestamp','')}"},
+        "footer":      {"text": f"Received {fmt_et(alert_data.get('timestamp',''))}"},
         "timestamp":   now_utc().isoformat(),
     }
 
@@ -2053,10 +2077,22 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     long_struct  = has_bos_demand and has_choch_demand and has_bull_confirm
     short_struct = has_bos_supply and has_choch_supply and has_bear_confirm
-    long_gate    = long_struct and price_above
+
+    # ── Zone Mitigated (bullish): a previously-mitigated demand zone that is
+    # retested and reacts is a valid LONG even without a fresh BOS. Requires:
+    # demand zone retested (mitigation flag armed + nearest demand sits on a
+    # mitigated level) + reaction confirmed (5m bullish or demand-zone
+    # confirmation) + price holding above VWAP + bullish CHOCH.
+    has_mitigated_demand      = bool(ZONE_MITIGATED_FLAG and is_near_mitigated_zone(nearest_demand)[0])
+    reaction_confirmed        = has_bull_confirm or has_dem_confirm
+    mitigation_long_confirmed = bool(
+        has_mitigated_demand and reaction_confirmed and price_above and has_choch_demand
+    )
+
+    long_gate    = (long_struct or mitigation_long_confirmed) and price_above
     short_gate   = short_struct and price_below
 
-    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf, liq_sweep=False):
+    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf, liq_sweep=False, zone_mitigated=False):
         return {
             "direction":     direction,
             "bos":           bool(has_bos),
@@ -2067,6 +2103,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "vwap_value":    vwap,
             "zone_confirmed": bool(zone_conf),
             "liquidity_sweep": bool(liq_sweep),
+            "zone_mitigated": bool(zone_mitigated),
         }
 
     # ── Conflict: full bullish AND bearish structure present → stand aside ──
@@ -2097,11 +2134,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     if long_gate:
         score = _score("Long", has_dem_confirm, nearest_demand)
+        reason = (
+            "Long confirmed — BOS demand, bullish CHOCH, 5m bullish candle, price above VWAP."
+            if long_struct else
+            "Long confirmed — demand zone mitigated & retested, bullish reaction, CHOCH demand, price above VWAP."
+        )
         return {
             "label": "Strong Trade" if score >= 90 else "Possible Trade",
             "direction": "Long", "score": score,
-            "confluences": _confluences("Long", True, True, True, True, has_dem_confirm, has_bull_sweep),
-            "reason": "Long confirmed — BOS demand, bullish CHOCH, 5m bullish candle, price above VWAP.",
+            "confluences": _confluences("Long", has_bos_demand, has_choch_demand,
+                                        has_bull_confirm or mitigation_long_confirmed, True, has_dem_confirm,
+                                        has_bull_sweep, zone_mitigated=mitigation_long_confirmed),
+            "reason": reason,
             "missing": [],
         }
 
@@ -2211,52 +2255,6 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
     active_ticker = instrument_of(ticker_override) if ticker_override else _active_ticker()
-    # ── ZONE MITIGATION HARD GATE — skip ALL computation ──────────────────────
-    if ZONE_MITIGATED_FLAG and ZONE_BROKEN_AT is None:
-        _mz_price = MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None
-        _cp       = current_price_override if current_price_override is not None else current_price_for(active_ticker)
-        return dict(
-            bullish=0, bearish=0, counts={},
-            bias="Choppy", strength=1, confidence=0,
-            quality="D", edge_score=0,
-            recommendation="WAIT", verdict="WAIT",
-            reasoning_chain=["Zone Consumed", "Scoring Skipped", "WAIT"],
-            why="Zone mitigated — all scoring skipped.",
-            plan={"action": "Wait for fresh zone.", "longs_allowed": "No", "shorts_allowed": "No", "warning": ""},
-            setup_stage="No Setup",
-            stage_direction=None,
-            stage_next_step="Zone consumed — wait for fresh supply or demand zone.",
-            stage_entry_rule="No entry from consumed zone.",
-            stage_invalidation="Zone previously mitigated — invalid entry.",
-            market_direction="Neutral",
-            trade_opportunity="None",
-            opportunity_reason="Zone already reacted and is no longer valid for entry.",
-            entry_trigger=None, invalidation=None,
-            trade_plan={
-                "trade_plan": False,
-                "reason":     "Zone consumed — wait for fresh supply or demand zone.",
-                "entry_zone": None, "stop_loss": None,
-                "target1":    None, "target2":   None,
-                "rr":         None, "direction": None,
-            },
-            current_price=_cp,
-            last_price_by_type={},
-            nearest_supply=None, nearest_demand=None,
-            structure_label="Zone Mitigated",
-            structure_class="Undefined",
-            structure_detail="Zone consumed — wait for fresh supply or demand zone.",
-            risk_label="Choppy", risk_detail="Zone consumed.", overextended=False,
-            zone_broken_active=False,
-            zone_mitigated_near=True,
-            mitigated_zone_price=_mz_price,
-            strict_label="WAIT", strict_score=0,
-            strict_direction=None,
-            strict_reason="Zone consumed — wait for fresh supply or demand zone.",
-            strict_missing=[], confluences={},
-            vwap_value=None, vwap_status="n/a",
-            active_ticker=active_ticker,
-        )
-    # ──────────────────────────────────────────────────────────────────────────
 
     score_window = cfg("SCORE_WINDOW_MIN")
     if score_window:
@@ -2359,11 +2357,24 @@ def full_analysis(current_price_override=None, ticker_override=None):
             "rr":         None, "direction": None,
         }
 
-    # ── Zone Mitigated: warn if nearest levels are near a consumed zone ──
+    # ── Zone Mitigated: a consumed zone blocks entries UNLESS the mitigation is
+    # a confirmed bullish reaction (handled as a LONG via the strict gate). ──
+    mitig_confirmed = bool(confluences.get("zone_mitigated"))
     near_sup_mz, mz_sup_price = is_near_mitigated_zone(nearest_supply)
     near_dem_mz, mz_dem_price = is_near_mitigated_zone(nearest_demand)
-    zone_mitigated_near  = (near_sup_mz or near_dem_mz) and not zone_broken_active
-    mitigated_zone_price = mz_sup_price or mz_dem_price
+    # Block only when mitigation is active (flag not yet cleared by a structure
+    # reset) AND the ACTIVE instrument's nearest zone actually sits on a mitigated
+    # price. The flag alone is global, so requiring proximity keeps a mitigated
+    # MGC zone from WAIT-blocking an unrelated MNQ alert (and vice-versa).
+    zone_mitigated_near = (
+        ZONE_MITIGATED_FLAG and (near_sup_mz or near_dem_mz)
+        and not zone_broken_active
+        and not mitig_confirmed
+    )
+    mitigated_zone_price = (
+        mz_sup_price or mz_dem_price
+        or (MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None)
+    )
     if zone_mitigated_near:
         # Full override — zone mitigation supersedes ALL scores, setups, and plans
         confidence         = max(0, confidence - 15)
@@ -2571,7 +2582,7 @@ def _build_trade_card_embed(entry, footer_text):
         "timestamp":   entry["datetime"],
         "fields": [
             {"name": "📊 Instrument",          "value": _val(entry.get("symbol")),    "inline": True},
-            {"name": "🕐 Time",                "value": entry["datetime"][:19].replace("T", " ") + " UTC", "inline": True},
+            {"name": "🕐 Time",                "value": fmt_et(entry["datetime"], "%Y-%m-%d %H:%M:%S ET"), "inline": True},
             {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
             {"name": "🏗️ BOS Type",            "value": _typed(entry.get("bos_type"), entry.get("bos_level")), "inline": True},
             {"name": "🔀 CHOCH Type",          "value": _typed(entry.get("choch_type"), entry.get("choch_level")), "inline": True},
@@ -2896,6 +2907,7 @@ def compute_edge_breakdown(a, entry):
     # signal we do have — a confirmed zone reaction. Never fabricate a sweep.
     has_sweep     = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
     zone_reaction = bool(conf.get("zone_confirmed"))
+    zone_mitig    = bool(conf.get("zone_mitigated"))
     mkt_dir     = str(a.get("market_direction") or a.get("bias") or "")
     trend_ok    = (mkt_dir == "Bullish") if is_long else (mkt_dir == "Bearish")
     try:
@@ -2916,8 +2928,10 @@ def compute_edge_breakdown(a, entry):
         reasons.append("Bullish Trend" if is_long else "Bearish Trend");           score += 12
     if has_sweep:
         reasons.append("Liquidity Sweep");                                         score += 12
-    elif zone_reaction:
+    elif zone_reaction and not zone_mitig:
         reasons.append("Confirmed Zone Reaction");                                 score += 12
+    if zone_mitig:
+        reasons.append("Zone Mitigated");                                          score += 8
     score = max(0, min(100, score + round(confidence / 100.0 * 12)))
 
     risks = []
@@ -3529,23 +3543,6 @@ def webhook():
         ZONE_MITIGATED_FLAG = False
         logger.info("Zone mitigation cleared — new structure alert: %s", normalized)
 
-    # ── Zone Mitigation: early exit — entire engine skipped ─────────────────
-    if ZONE_MITIGATED_FLAG and ZONE_BROKEN_AT is None:
-        _mz_price = MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None
-        send_zone_mitigated_message(record, _mz_price)
-        logger.info("Zone mitigated early exit — %s — scoring skipped", normalized)
-        return jsonify({
-            "status":       "zone_mitigated",
-            "alert_type":   normalized,
-            "ticker":       record.get("ticker"),
-            "price":        parsed_price or CURRENT_PRICE,
-            "mitigated_at": _mz_price,
-            "verdict":      "WAIT",
-            "zone_status":  "Consumed / Mitigated",
-            "action":       "Wait for fresh supply or demand zone.",
-            "reason":       "Zone already reacted and is no longer valid for entry.",
-        }), 200
-
     # ── Account Profile selection ──
     profile_name = str(data.get("profile") or DEFAULT_PROFILE).strip()
     if profile_name in ACCOUNT_PROFILES:
@@ -3565,14 +3562,30 @@ def webhook():
 
     a = full_analysis(current_price_override=parsed_price)
 
+    # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
+    # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
+    # False (handled as a LONG above) and falls through to the READY-card path. ──
     if a.get("zone_mitigated_near"):
-        sizing = {}
-    else:
-        # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
-        _risk_mult = (cfg("RISK_MULT_ATTEMPT")
-                      if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
-                      else 1.0)
-        sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
+        _mz_price = a.get("mitigated_zone_price")
+        send_zone_mitigated_message(record, _mz_price)
+        logger.info("Zone mitigated (unconfirmed) — %s — scoring skipped", normalized)
+        return jsonify({
+            "status":       "zone_mitigated",
+            "alert_type":   normalized,
+            "ticker":       record.get("ticker"),
+            "price":        parsed_price or CURRENT_PRICE,
+            "mitigated_at": _mz_price,
+            "verdict":      "WAIT",
+            "zone_status":  "Consumed / Mitigated",
+            "action":       "Wait for fresh supply or demand zone.",
+            "reason":       "Zone already reacted and is no longer valid for entry.",
+        }), 200
+
+    # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
+    _risk_mult = (cfg("RISK_MULT_ATTEMPT")
+                  if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
+                  else 1.0)
+    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
 
     # ── Active trade: check events (T1 / T2 / Stop lifecycle alerts) ──
     if ACTIVE_TRADE and parsed_price is not None:
