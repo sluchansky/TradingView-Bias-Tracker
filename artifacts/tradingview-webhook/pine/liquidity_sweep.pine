@@ -1,0 +1,69 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// Liquidity Sweep -> Webhook  (MGC / MNQ)
+//
+// Detects a liquidity sweep (a.k.a. swing-failure / stop-hunt): price pierces a
+// recent swing high/low to grab the stops resting there, then closes back inside.
+//   • Bullish sweep  = sell-side liquidity grabbed below a swing low,
+//                      bar closes back ABOVE that low  -> reversal up.
+//   • Bearish sweep  = buy-side liquidity grabbed above a swing high,
+//                      bar closes back BELOW that high -> reversal down.
+//
+// On a confirmed sweep it fires an alert() call whose message is the exact JSON
+// the webhook app expects, e.g.  {"alert_type":"MGC BULLISH SWEEP", ...}.
+//
+// SETUP (one alert per chart):
+//   1. Add this script to your MGC1! chart (and again to your MNQ1! chart).
+//   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
+//   3. Paste your webhook URL under Notifications -> Webhook URL.
+//   4. Leave the message box as-is (the script supplies the JSON). Save.
+//   Auto-detect sets MGC/MNQ from the symbol, so the same script works on both.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("Liquidity Sweep -> Webhook (MGC/MNQ)", overlay=true)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ"])
+leftBars     = input.int(10, "Swing left bars",  minval=1, tooltip="Bars to the left that define a swing pivot.")
+rightBars    = input.int(3,  "Swing right bars", minval=1, tooltip="Bars to the right that confirm a swing pivot. Higher = fewer, stronger sweeps.")
+showMarks    = input.bool(true, "Show sweep markers on chart")
+
+prefix = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : "MGC") : manualPrefix
+
+// ── Track the most-recent confirmed swing high / low ───────────────────────
+var float swingHigh = na
+var float swingLow  = na
+
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low,  leftBars, rightBars)
+if not na(ph)
+    swingHigh := ph
+if not na(pl)
+    swingLow := pl
+
+// ── Sweep detection ────────────────────────────────────────────────────────
+bearSweep = not na(swingHigh) and high > swingHigh and close < swingHigh
+bullSweep = not na(swingLow)  and low  < swingLow  and close > swingLow
+
+// Fire only once per swing level so the same high/low isn't alerted repeatedly.
+var float lastSweptHigh = na
+var float lastSweptLow  = na
+bearFire = bearSweep and (na(lastSweptHigh) or swingHigh != lastSweptHigh)
+bullFire = bullSweep and (na(lastSweptLow)  or swingLow  != lastSweptLow)
+if bearFire
+    lastSweptHigh := swingHigh
+if bullFire
+    lastSweptLow := swingLow
+
+// ── Webhook payloads (exact alert_type strings the app recognises) ─────────
+bullMsg = '{"alert_type": "' + prefix + ' BULLISH SWEEP", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+bearMsg = '{"alert_type": "' + prefix + ' BEARISH SWEEP", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+
+if bullFire
+    alert(bullMsg, alert.freq_once_per_bar_close)
+if bearFire
+    alert(bearMsg, alert.freq_once_per_bar_close)
+
+// ── Visuals ────────────────────────────────────────────────────────────────
+plotshape(showMarks and bullFire, title="Bullish Sweep", style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0), size=size.small, text="Sweep")
+plotshape(showMarks and bearFire, title="Bearish Sweep", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,  0), size=size.small, text="Sweep")
