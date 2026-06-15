@@ -386,13 +386,15 @@ def _compute_eod_stats():
                     pnl_total -= float(m.group(2).replace(",", ""))
                     has_pnl = True
 
-    # Best = highest edge_score win; fallback any entry
-    best  = max(wins,    key=lambda e: e.get("edge_score", 0), default=None) or \
-            max(entries, key=lambda e: e.get("edge_score", 0), default=None)
-    # Worst = most recent loss; fallback lowest edge_score closed entry
+    # Best = highest-Edge win; fallback any entry. Ranking uses the internal
+    # _edge_score_for_entry (legacy fallback ok to order old entries); the figure
+    # shown for the chosen setup is sanitized to transparent-only by _fmt_setup.
+    best  = max(wins,    key=_edge_score_for_entry, default=None) or \
+            max(entries, key=_edge_score_for_entry, default=None)
+    # Worst = most recent loss; fallback lowest-Edge closed entry
     closed = [e for e in entries if not e.get("outcome","").startswith("Pending")]
     worst = losses[0] if losses else \
-            (min(closed, key=lambda e: e.get("edge_score", 99), default=None))
+            (min(closed, key=_edge_score_for_entry, default=None))
 
     # ── Additive recap metrics ──
     longs  = [e for e in entries if e.get("direction") == "Long"]
@@ -404,7 +406,7 @@ def _compute_eod_stats():
         try:
             return float(sc)
         except (TypeError, ValueError):
-            return e.get("edge_score", 0)
+            return _edge_score_for_entry(e)
     highest_conf = max(entries, key=_conf_key, default=None)
 
     # ── Trade-strength split + Edge Score stats (READY journal entries) ──
@@ -412,7 +414,10 @@ def _compute_eod_stats():
     strong   = [e for e in entries if _entry_trade_strength(e) == "Strong Trade"]
     aplus    = [e for e in entries if _entry_trade_strength(e) == "A+ Setup"]
     ready_entries = possible + strong + aplus
-    edge_vals = [_edge_score_for_entry(e) for e in ready_entries]
+    # Average Edge is a DISPLAYED figure → transparent scores only ("—" entries
+    # are excluded so a legacy bias-derived number can never skew the average).
+    edge_vals = [v for e in ready_entries
+                 if isinstance((v := _display_edge_score(e)), (int, float))]
     avg_edge  = round(sum(edge_vals) / len(edge_vals), 1) if edge_vals else None
     highest_edge = max(ready_entries, key=_edge_score_for_entry, default=None)
     lowest_edge  = min(ready_entries, key=_edge_score_for_entry, default=None)
@@ -460,7 +465,7 @@ def _fmt_setup(entry):
         return "—"
     return (
         f"{entry.get('symbol','—')} {entry.get('direction','—')}  ·  "
-        f"Edge {entry.get('edge_score','—')}  ·  {entry.get('outcome','—')}"
+        f"Edge {_display_edge_score(entry)}  ·  {entry.get('outcome','—')}"
     )
 
 
@@ -621,7 +626,9 @@ def _compute_weekly_stats(days=None):
 
     ready = [e for e in week if _entry_trade_strength(e) in
              ("Possible Trade", "Strong Trade", "A+ Setup")]
-    edge_vals = [_edge_score_for_entry(e) for e in ready]
+    # Displayed average → transparent scores only (see _compute_eod_stats).
+    edge_vals = [v for e in ready
+                 if isinstance((v := _display_edge_score(e)), (int, float))]
     avg_edge  = round(sum(edge_vals) / len(edge_vals), 1) if edge_vals else None
 
     possible = sum(1 for e in week if _entry_trade_strength(e) == "Possible Trade")
@@ -1878,11 +1885,6 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
                 "value":  f"{rec_emoji} **{recommendation}**",
                 "inline": True,
             },
-            {
-                "name":   "⚡  Edge Score",
-                "value":  f"**{edge_score} / 100**",
-                "inline": True,
-            },
         ] if not active_trade_info else []),
         # ── Reasoning Chain ──
         {
@@ -2179,10 +2181,10 @@ ZONE_BROKEN_EXPIRY       = 5      # Expire ZONE_BROKEN_AT after N subsequent non
 MITIGATED_TOLERANCE_PCT  = 0.003  # 0.3% proximity check for consumed zone warning
 
 
-def _handle_zone_broken(price):
+def _handle_zone_broken(price, instrument=None):
     """Cancel pending directional setup and record the broken zone event."""
     global ZONE_BROKEN_AT, ALERT_HISTORY
-    ZONE_BROKEN_AT = {"price": price, "alerts_since": 0}
+    ZONE_BROKEN_AT = {"price": price, "alerts_since": 0, "instrument": instrument}
     directional = SUPPLY_TYPES | DEMAND_TYPES
     # Remove last 5 directional setup alerts from history to cancel pending setup
     history_list = list(ALERT_HISTORY)
@@ -2190,7 +2192,11 @@ def _handle_zone_broken(price):
     kept      = []
     cancelled = 0
     for rec in reversed(history_list[:-1]):
-        if cancelled < 5 and rec.get("alert_type") in directional:
+        # Cancel only the broken instrument's directional alerts — a broken MGC
+        # zone must not delete MNQ's setup records (and vice versa). An untagged
+        # (legacy) break falls back to cancelling any instrument's setup.
+        same_inst = (instrument is None or rec.get("instrument") == instrument)
+        if cancelled < 5 and same_inst and rec.get("alert_type") in directional:
             cancelled += 1
             continue
         kept.append(rec)
@@ -2711,7 +2717,12 @@ def full_analysis(current_price_override=None, ticker_override=None):
         stage_entry_rule = f"Enter {strict_direction.lower()} per strict checklist."
 
     # ── Zone Broken: cancel setup, reduce confidence, mark structure invalidated ──
-    zone_broken_active = ZONE_BROKEN_AT is not None
+    # Scoped to the analyzed instrument: a broken MGC zone must not invalidate a
+    # valid MNQ setup (and vice versa). Untagged (legacy) breaks apply globally.
+    zone_broken_active = (
+        ZONE_BROKEN_AT is not None
+        and ZONE_BROKEN_AT.get("instrument") in (None, instrument_of(active_ticker))
+    )
     if zone_broken_active:
         confidence         = max(0, confidence - 30)
         setup_stage        = "Watching"
@@ -2779,7 +2790,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
                      verdict, overextended, risk_label)
     plan = build_trade_plan(bias, strength, bullish, bearish, counts)
 
-    return dict(
+    result = dict(
         bullish=bullish, bearish=bearish, counts=counts,
         bias=bias, strength=strength, confidence=confidence,
         quality=quality, edge_score=edge_score,
@@ -2809,6 +2820,18 @@ def full_analysis(current_price_override=None, ticker_override=None):
         vwap_value=vwap_value, vwap_status=vwap_status,
         active_ticker=active_ticker,
     )
+
+    # ── Unified Edge Score (single source of truth) ──────────────────────────
+    # The transparent, confluence-based Edge Score replaces the legacy bias-derived
+    # score on EVERY user-facing surface (status, why, alerts, journal, recaps,
+    # dashboard, trade management). The legacy value is kept internal-only as a
+    # last-resort ranking fallback for old/manual journal entries; never displayed.
+    eb = _analysis_edge_breakdown(result)
+    result["legacy_edge_score"] = edge_score
+    result["edge_breakdown"]    = eb
+    result["edge_score"]        = eb["score"]
+    result["edge_grade"]        = eb["grade"]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3653,6 +3676,21 @@ def _edge_score_for_entry(entry):
     return 0.0
 
 
+def _display_edge_score(entry):
+    """Edge Score for DISPLAY ONLY (recaps / weekly reports). Returns the
+    transparent score — the breakdown score, or a stored edge_score that is
+    known-transparent (new-format entries also carry edge_grade/edge_breakdown).
+    Legacy/manual entries that only have a bias-derived edge_score return "—" so
+    the legacy number is never surfaced. Use _edge_score_for_entry (not this) for
+    internal ranking, where a legacy fallback is acceptable to order old entries."""
+    eb = entry.get("edge_breakdown") or {}
+    if eb.get("score") is not None:
+        return eb["score"]
+    if entry.get("edge_grade") is not None and entry.get("edge_score") is not None:
+        return entry["edge_score"]
+    return "—"
+
+
 def _entry_trade_strength(entry):
     """Trade strength for a stored entry: the explicit field if present, else
     derived from its Edge Score (only when ≥75, i.e. an actual READY trade)."""
@@ -3679,11 +3717,22 @@ def compute_edge_breakdown(a, entry):
     direction = entry.get("direction", "Long")
     is_long   = direction != "Short"
     conf      = a.get("confluences") or {}
+    has_conf  = bool(conf)
 
-    has_bos     = bool(conf.get("bos"))   or str(entry.get("bos_status")   or "None") != "None"
-    has_choch   = bool(conf.get("choch")) or str(entry.get("choch_status") or "None") != "None"
-    vwap_pos    = str(entry.get("vwap_position") or "").lower()
-    vwap_ok     = vwap_pos.startswith("above") if is_long else vwap_pos.startswith("below")
+    # Confluences (from evaluate_strict_setup) are the authoritative signal source.
+    # Fall back to the entry's display strings ONLY for legacy/manual entries that
+    # carry no confluences — otherwise a stale BOS/CHOCH level string (or a price
+    # that merely sits the right side of VWAP) could inflate a WAIT or
+    # mitigation-only setup that the strict gate never actually credited.
+    if has_conf:
+        has_bos   = bool(conf.get("bos"))
+        has_choch = bool(conf.get("choch"))
+        vwap_ok   = bool(conf.get("vwap"))
+    else:
+        has_bos   = str(entry.get("bos_status")   or "None") != "None"
+        has_choch = str(entry.get("choch_status") or "None") != "None"
+        vwap_pos  = str(entry.get("vwap_position") or "").lower()
+        vwap_ok   = vwap_pos.startswith("above") if is_long else vwap_pos.startswith("below")
     zone_active = "intact" in str(entry.get("supply_demand_zone") or "").lower()
     # "Liquidity Sweep" shows only when a real sweep alert was received from
     # TradingView (confluences.liquidity_sweep, set in evaluate_strict_setup from a
@@ -3795,6 +3844,17 @@ def compute_edge_breakdown(a, entry):
     floor = 75 if (gate_pass or is_ready) else 0
     score = max(floor, min(100, raw))
 
+    # Hard blockers override everything: a broken structure or a consumed
+    # (mitigated-near) zone is not tradeable, so its Edge Score is 0 regardless of
+    # any residual confluences still present in `a`. A single decisive risk line
+    # explains the zero so the breakdown stays self-consistent.
+    if a.get("zone_broken_active") or a.get("zone_mitigated_near"):
+        blocker = ("Structure invalidated — zone broken"
+                   if a.get("zone_broken_active") else "Zone consumed — invalid entry")
+        breakdown = []
+        risk_adj  = [{"label": blocker, "points": None}]
+        score     = 0
+
     return {
         "score": score,
         "grade": _grade_for_score(score),
@@ -3804,6 +3864,32 @@ def compute_edge_breakdown(a, entry):
         "reasons": [it["label"] for it in breakdown],
         "risks":   [it["label"] for it in risk_adj],
     }
+
+
+def _analysis_edge_breakdown(a):
+    """THE single Edge Score computation for a full_analysis() result `a`.
+
+    Used by full_analysis (to attach the unified score) and reused by
+    _build_card_entry, so the card, journal, /why, recaps and dashboard can never
+    diverge. Direction follows the strict gate (or, for WAIT, the leading
+    confluence direction) so the confluence-based signals line up with is_long
+    inside compute_edge_breakdown."""
+    conf = a.get("confluences") or {}
+    tp   = a.get("trade_plan") or {}
+    bias = a.get("bias")
+    direction = (a.get("strict_direction") or conf.get("direction") or tp.get("direction")
+                 or ("Long" if bias == "Bullish" else "Short" if bias == "Bearish" else "Long"))
+    bos_s, choch_s, vwap_pos, sd_zone = build_structure_fields(a, direction)
+    edge_entry = {
+        "direction":          direction,
+        "bos_status":         bos_s,
+        "choch_status":       choch_s,
+        "vwap_position":      vwap_pos,
+        "supply_demand_zone": sd_zone,
+        "strict_label":       a.get("strict_label"),
+        "verdict":            a.get("verdict"),
+    }
+    return compute_edge_breakdown(a, edge_entry)
 
 
 def _render_edge_block_field(eb):
@@ -4089,9 +4175,12 @@ def _build_card_entry(a, ticker=None, record=None):
     # Transparent Edge Score is the authoritative READY-trade score: it drives the
     # Possible/Strong strength label, the card/journal display, recap and analytics.
     # The legacy bias-derived edge score is preserved for backward compatibility.
-    eb = compute_edge_breakdown(a, entry)
+    # Reuse the unified Edge Score computed once in full_analysis so the card,
+    # journal, /why, recap and dashboard can never diverge; only recompute for a
+    # bare/legacy `a` that never passed through full_analysis.
+    eb = a.get("edge_breakdown") or compute_edge_breakdown(a, entry)
     entry["edge_breakdown"]    = eb
-    entry["legacy_edge_score"] = entry.get("edge_score", 0)
+    entry["legacy_edge_score"] = a.get("legacy_edge_score", entry.get("edge_score", 0))
     entry["edge_score"]        = eb.get("score", entry.get("edge_score", 0))
     entry["edge_grade"]        = eb.get("grade")
     entry["score_breakdown"]   = eb.get("score_breakdown", [])
@@ -4526,18 +4615,24 @@ def webhook():
     # ── Zone event side-effects ──
     _zone_neutral = ("MGC ZONE BROKEN", "MNQ ZONE BROKEN", "MGC ZONE MITIGATED", "MNQ ZONE MITIGATED")
     if normalized in ("MGC ZONE BROKEN", "MNQ ZONE BROKEN"):
+        _zb_instrument = _instrument_from_text(normalized)
         if parsed_price is not None:
-            _handle_zone_broken(parsed_price)
+            _handle_zone_broken(parsed_price, _zb_instrument)
         else:
-            ZONE_BROKEN_AT = {"price": None, "alerts_since": 0}
+            ZONE_BROKEN_AT = {"price": None, "alerts_since": 0, "instrument": _zb_instrument}
     elif normalized in ("MGC ZONE MITIGATED", "MNQ ZONE MITIGATED"):
         if parsed_price is not None:
             _handle_zone_mitigated(parsed_price)
     elif ZONE_BROKEN_AT is not None and normalized not in _zone_neutral:
-        ZONE_BROKEN_AT["alerts_since"] = ZONE_BROKEN_AT.get("alerts_since", 0) + 1
-        if ZONE_BROKEN_AT["alerts_since"] >= ZONE_BROKEN_EXPIRY:
-            ZONE_BROKEN_AT = None
-            logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
+        # Count expiry only on same-instrument alerts so the other instrument's
+        # activity can't prematurely clear this instrument's broken-zone blocker.
+        # Untagged (legacy) breaks expire on any alert (global fallback).
+        _zb_inst = ZONE_BROKEN_AT.get("instrument")
+        if _zb_inst is None or _zb_inst == resolved_inst:
+            ZONE_BROKEN_AT["alerts_since"] = ZONE_BROKEN_AT.get("alerts_since", 0) + 1
+            if ZONE_BROKEN_AT["alerts_since"] >= ZONE_BROKEN_EXPIRY:
+                ZONE_BROKEN_AT = None
+                logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
 
     # ── Zone Mitigation: clear flag when fresh structure forms ──────────────────
     _STRUCTURE_RESET = frozenset((
@@ -4878,6 +4973,8 @@ def status():
         "strength":            f"{a['strength']}/10",
         "confidence":          f"{a['confidence']}%",
         "edge_score":          a["edge_score"],
+        "edge_grade":          a.get("edge_grade"),
+        "edge_breakdown":      a.get("edge_breakdown"),
         "trade_quality":       a["quality"],
         "trade_quality_label": QUALITY_LABELS.get(a["quality"], ""),
         "bullish_score":       a["bullish"],
@@ -5590,10 +5687,11 @@ async function refreshRec() {
       : 'n/a ('+(d.vwap_status||'—')+')';
     meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b>';
 
-    const score = d.strict_score!=null ? d.strict_score : 0;
+    const score = d.edge_score!=null ? d.edge_score : 0;
+    const grade = d.edge_grade ? ' · ' + d.edge_grade : '';
     bar.style.width = score + '%';
     bar.style.background = score>=90 ? '#22c55e' : score>=75 ? '#a0a8ff' : '#f59e0b';
-    num.textContent = (d.strict_label||'WAIT') + ' · ' + score + '/100';
+    num.textContent = 'Edge ' + score + '/100' + grade + ' · ' + (d.strict_label||'WAIT');
 
     const c = d.confluences || {};
     const ld = (d.strict_direction || c.direction || dirReady || '').toString();

@@ -11,4 +11,5 @@
 - [Per-instrument dashboard view](per-instrument-dashboard-view.md) — MGC/MNQ tabs switch displayed analysis via /status?ticker → full_analysis(ticker_override); per-instrument price/VWAP/price-context invariants.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
 - [Live alert trade-card](live-alert-card.md) — clean card is the single alert format for journal + main channel; fires once per READY setup + re-posts every TRADE_READY_INTERVAL; per-instrument throttle prevents instant+periodic double-post.
+- [Unified Edge Score](unified-edge-score.md) — transparent score is the only user-visible Edge Score; legacy is ranking-only; zone-broken blocker must be instrument-scoped or it zeros the other instrument.
 - [Edge Score & trade strength](edge-score-card-block.md) — Edge Score (gate base 75 + bonuses − risks) floored to 75 on the READY *verdict* (not a re-derived gate, since mitigation can pass without BOS) sub-classifies READY → 🟡Possible/🟢Strong; never fabricate a label; alert-driven (sweeps = new alert types).

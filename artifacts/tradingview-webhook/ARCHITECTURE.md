@@ -225,6 +225,29 @@ nothing persists across a restart.**
 
 `compute_edge_breakdown()` (~L3662) produces a transparent 0–100 score.
 
+**Single source of truth.** The transparent breakdown score is the **one** Edge
+Score shown everywhere a user can see it — `/status`, `/why`, the dashboard
+headline bar, Discord alert cards, the journal, daily recaps, and weekly reports
+all read the same `edge_score`/`edge_grade`. `full_analysis` computes it once via
+`_analysis_edge_breakdown(a)` and attaches `edge_score` (transparent),
+`edge_grade`, and `edge_breakdown` to its result; `_build_card_entry` reuses that
+same breakdown so the card/journal can never diverge from `/status`.
+
+- **Legacy score is internal-only.** The old bias-derived `calculate_edge_score()`
+  is retained solely as `legacy_edge_score` for **ranking fallback** on historical
+  entries (`_edge_score_for_entry`). It is **never displayed**. Display paths use
+  `_display_edge_score(entry)`, which returns the transparent score or `"—"` when
+  only a legacy value exists, so daily/weekly averages count transparent scores only.
+- **Confluence-authoritative.** When `confluences` are present, BOS/CHOCH/VWAP
+  credit is driven by the confluence flags (`conf.bos`/`conf.choch`/`conf.vwap`),
+  not by stale entry display-strings; the display-strings are used only as a
+  fallback when no confluences exist (legacy/manual entries).
+- **Hard blocker → Edge 0 (instrument-scoped).** If the analyzed instrument's zone
+  is broken (`zone_broken_active`) or the entry sits on a consumed level
+  (`zone_mitigated_near`), the breakdown is cleared, a single risk line is shown,
+  and `score = 0`. `zone_broken_active` is gated by the analyzed instrument
+  (`ZONE_BROKEN_AT["instrument"]`) so a broken **MGC** zone never zeros a valid
+  **MNQ** setup, and vice versa; untagged (legacy) breaks still apply globally.
 - **Floor (READY only):** `floor = 75 if (gate_pass or is_ready) else 0`, then
   `score = max(floor, min(100, raw))` (~L3792). Only a READY setup is floored at **75** (the
   "Possible" threshold). A **non-READY** setup is *not* floored — its score is just the raw sum
