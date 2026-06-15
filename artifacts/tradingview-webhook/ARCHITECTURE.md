@@ -248,12 +248,23 @@ same breakdown so the card/journal can never diverge from `/status`.
   and `score = 0`. `zone_broken_active` is gated by the analyzed instrument
   (`ZONE_BROKEN_AT["instrument"]`) so a broken **MGC** zone never zeros a valid
   **MNQ** setup, and vice versa; untagged (legacy) breaks still apply globally.
-- **Floor (READY only):** `floor = 75 if (gate_pass or is_ready) else 0`, then
-  `score = max(floor, min(100, raw))` (~L3792). Only a READY setup is floored at **75** (the
-  "Possible" threshold). A **non-READY** setup is *not* floored — its score is just the raw sum
-  of whatever confluences/penalties are present, often a small value (e.g. `5` for a lone
-  "Demand Zone Active" bonus), **not necessarily 0**. This is the value `/why` shows for a
-  current WAIT.
+- **Floor (READY only):** `floor = 75 if ready_state else 0`, then
+  `score = max(floor, min(100, raw))`. `ready_state = gate_pass or is_ready` is computed once
+  (keyed off the actual READY verdict) and is **shared** by both the floor and the Session
+  Bonus gate. Only a READY setup is floored at **75** (the "Possible" threshold). A
+  **non-READY** setup is *not* floored — its score is just the raw sum of whatever
+  confluences/penalties are present, often a small value (e.g. `5` for a lone "Demand Zone
+  Active" bonus), **not necessarily 0**. This is the value `/why` shows for a current WAIT.
+- **Session Focus windows.** `get_session_state(now)` maps the current ET time
+  (`America/New_York`, DST-correct via `ZoneInfo`) to a preferred trading window. Windows are
+  **half-open** `[start, end)`: `05:00–08:00`, `08:00–11:00`, `20:00–23:00` ET — so `05:00` is
+  in, `08:00` switches to the second window, and `11:00`/`23:00` are out. `full_analysis`
+  attaches `result["session"] = {preferred, bonus, window}` once; `compute_edge_breakdown`
+  falls back to a live `get_session_state()` if absent, so every consumer agrees.
+- **Session Bonus is READY-gated.** The `+10` Session Bonus is added **only** when
+  `ready_state and sess.preferred` — a non-READY/WAIT analysis is never inflated even inside a
+  window. The Session block still *displays* the window/bonus everywhere (it describes the
+  hour), but the score reflects it only for a tradeable READY setup.
 - **Gate foundation (the 4 required conditions = 75 pts):**
   | Condition | Points |
   | --- | --- |
@@ -271,6 +282,7 @@ same breakdown so the card/journal can never diverge from `/status`.
   | Zone Mitigated (confirmed retest) | +3 |
   | High Confidence (≥ `CONF_HIGH`) | +6 |
   | Elevated Confidence (≥ `CONF_TRADE`) | +3 |
+  | Session Bonus (READY inside a preferred window) | +10 |
 - **Risk adjustments (penalties):** Nearby Resistance/Support −4, Overextended −3, Choppy −3
   (~L3763–3769).
 - **Clamp:** `score = max(floor, min(100, raw))` (~L3793).
@@ -286,8 +298,12 @@ same breakdown so the card/journal can never diverge from `/status`.
     **< 75 → None** (not READY).
 - **Display labels** (`_strength_display`, ~L3630): 🔥 **A+ SETUP** / 🟢 **STRONG TRADE** /
   🟡 **POSSIBLE TRADE**.
-- **Letter grades** (`_grade_for_score`, ~L3597): A+ ≥90, A ≥85, A- ≥80, B+ ≥75, B ≥70, B-
-  ≥65, C+ ≥60, C ≥55, else D.
+- **Letter grades** (`_grade_for_score`, ~L3597): **95–100 → A+**, **90–94 → A**,
+  **85–89 → B**, **80–84 → C**, **below 80 → WAIT**. The grade is a **quality label only** —
+  it does not change the READY/WAIT *verdict* (which is gate-driven, see below) or journaling.
+  A thin READY setup floored to 75 therefore *displays* Grade **WAIT** (75 < 80) while still
+  being a valid READY trade; the Session Bonus (+10) is what lifts an in-window READY into
+  C/B/A territory.
 - **READY verdict pipeline:**
   1. `evaluate_strict_setup()` (~L2353) must return "Strong Trade" or "Possible Trade" from the
      4-condition checklist (BOS, CHOCH, 5m confirmation, VWAP side).
@@ -314,7 +330,10 @@ same breakdown so the card/journal can never diverge from `/status`.
   - **Scores:** `strict_score`, `edge_score` (authoritative), `legacy_edge_score`,
     `confidence`, `edge_grade`.
   - **Reasoning:** `why_qualifies`, `bias`, `market_structure`, `risk_zone`,
-    `reasoning_chain`, `setup_notes`, `trade_thesis`.
+    `reasoning_chain`, `setup_notes`, `trade_thesis`, `next_step`.
+  - **Session (new):** `session_preferred` (bool), `session_bonus` (int),
+    `session_window` (str) — the preferred-window state at alert time, copied from the
+    shared `edge_breakdown` path so card/journal/status agree.
   - **Structure detail:** `bos_type`, `choch_type`, `bos_level`, `choch_level`, `bos_status`,
     `choch_status`, `vwap_position`, `supply_demand_zone`.
   - **Trade-management plan (new):** `target3`, `be_level`, `partial_level`, `runner_target`,

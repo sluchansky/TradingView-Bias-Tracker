@@ -815,6 +815,38 @@ def fmt_et(value, fmt="%Y-%m-%d %H:%M ET"):
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(ET_TZ).strftime(fmt)
 
+
+# ── Preferred trading-session windows (Eastern Time) ─────────────────────────
+# A READY setup inside one of these windows earns a +10 Edge Score "Session
+# Bonus" so the bot prioritizes the most active hours. The windows + bonus are
+# display/score only — they NEVER change the READY/WAIT gate. ET handles the
+# EST/EDT daylight-saving switch automatically.
+SESSION_WINDOWS = (
+    ("05:00–08:00 ET", 5.0, 8.0),
+    ("08:00–11:00 ET", 8.0, 11.0),
+    ("20:00–23:00 ET", 20.0, 23.0),
+)
+SESSION_BONUS_POINTS = 10
+
+
+def get_session_state(now=None):
+    """Preferred-trading-window state for a UTC instant (now defaults to UTC now).
+
+    Returns {"preferred": bool, "bonus": int, "window": str}. `bonus` is +10
+    inside a preferred window, else 0. Pure function of the clock — safe to call
+    from scoring, status, why, and the card without side effects.
+    """
+    base = now or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    et   = base.astimezone(ET_TZ)
+    hour = et.hour + et.minute / 60.0
+    for label, start, end in SESSION_WINDOWS:
+        if start <= hour < end:
+            return {"preferred": True, "bonus": SESSION_BONUS_POINTS, "window": label}
+    return {"preferred": False, "bonus": 0, "window": "Outside preferred window"}
+
+
 def alerts_in_window(minutes):
     cutoff = now_utc() - timedelta(minutes=minutes)
     out = []
@@ -2839,6 +2871,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
         active_ticker=active_ticker,
     )
 
+    # Preferred-session state (Eastern Time) — drives the +10 Session Bonus in the
+    # Edge Score and the Session block on /status, /why and the trade card. Set
+    # BEFORE the Edge Score is derived so the bonus is included consistently.
+    result["session"] = get_session_state()
+
     # ── Unified Edge Score (single source of truth) ──────────────────────────
     # The transparent, confluence-based Edge Score replaces the legacy bias-derived
     # score on EVERY user-facing surface (status, why, alerts, journal, recaps,
@@ -2989,6 +3026,15 @@ def _build_trade_card_embed(entry, footer_text):
     if len(notes_text) > 1000:
         notes_text = notes_text[:1000] + "…"
 
+    # Session focus + next-step lines for the card (Feature: Session Focus).
+    if entry.get("session_preferred"):
+        session_line = (f"✅ Preferred Trading Window: YES "
+                        f"({entry.get('session_window', '—')})\n"
+                        f"Session Bonus: +{entry.get('session_bonus', SESSION_BONUS_POINTS)}")
+    else:
+        session_line = "❌ Preferred Trading Window: NO\nSession Bonus: 0"
+    next_step = entry.get("next_step") or entry.get("stage_next_step") or "—"
+
     # Display-only Edge Score / Grade / Reasons / Risk block replaces the free-text
     # AI Analysis field on READY cards; fall back to notes when no breakdown exists.
     eb = entry.get("edge_breakdown")
@@ -3016,8 +3062,11 @@ def _build_trade_card_embed(entry, footer_text):
             {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
             {"name": "📈 VWAP",                "value": _val(entry.get("vwap_position")), "inline": True},
             {"name": "🧱 Zone",                "value": _val(entry.get("supply_demand_zone")), "inline": True},
+            {"name": "🗓️ Session",            "value": session_line,                "inline": False},
             analysis_field,
+            {"name": "📝 Setup Notes",         "value": notes_text,                  "inline": False},
             {"name": "💬 Why the Trade Qualifies", "value": why_text,                 "inline": False},
+            {"name": "➡️ Next Step",           "value": next_step,                   "inline": False},
         ],
         "footer": {"text": footer_text},
     }
@@ -3573,37 +3622,54 @@ def build_setup_notes(a, entry):
     from the real confluences in `a`/`entry`, so it can never hallucinate. Kept in
     one place so it can be swapped for an LLM later without touching callers."""
     direction = entry.get("direction", "Long")
+    conf         = a.get("confluences") or {}
     bos_status   = entry.get("bos_status")   or "None"
     choch_status = entry.get("choch_status") or "None"
     vwap_pos     = str(entry.get("vwap_position") or "").lower()
     t1           = entry.get("target1")
+    # Each note line is gated on a REAL confluence so the notes can never invent a
+    # signal the setup didn't actually have.
+    has_sweep    = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
+    zone_mitig   = bool(conf.get("zone_mitigated"))
+    zone_intact  = not (a.get("zone_broken_active") or a.get("zone_mitigated_near"))
+    has_struct   = (choch_status != "None") or (bos_status != "None")
     lines = []
     if direction == "Long":
-        zone_lvl = _fmt_lvl(a.get("nearest_demand"))
-        if zone_lvl:
-            lines.append(f"Price reacted at demand near {zone_lvl} and is holding bid.")
+        if has_sweep:
+            lines.append("Price swept liquidity below recent lows.")
+        if zone_mitig:
+            lines.append("Demand zone was mitigated and respected.")
+        else:
+            zone_lvl = _fmt_lvl(a.get("nearest_demand"))
+            if zone_lvl:
+                lines.append(f"Price reacted at demand near {zone_lvl} and is holding bid.")
+        if has_struct:
+            lines.append("Bullish CHOCH/BOS supports upside structure.")
         if vwap_pos.startswith("above"):
-            lines.append("Price reclaimed VWAP, confirming bullish intent.")
-        if choch_status != "None":
-            lines.append("Bullish CHOCH confirmed a market-structure shift.")
-        if bos_status != "None":
-            lines.append("BOS Demand confirms bullish order flow.")
-        if not (a.get("zone_broken_active") or a.get("zone_mitigated_near")):
+            lines.append("VWAP confluence supports continuation.")
+        if zone_intact and not zone_mitig:
             lines.append("Demand zone remains intact.")
+        lines.append(f"Looking for continuation toward {t1}."
+                     if t1 not in (None, "") else
+                     "Looking for continuation toward next resistance.")
     else:
-        zone_lvl = _fmt_lvl(a.get("nearest_supply"))
-        if zone_lvl:
-            lines.append(f"Price rejected supply near {zone_lvl}.")
+        if has_sweep:
+            lines.append("Price swept liquidity above recent highs.")
+        if zone_mitig:
+            lines.append("Supply zone was mitigated and respected.")
+        else:
+            zone_lvl = _fmt_lvl(a.get("nearest_supply"))
+            if zone_lvl:
+                lines.append(f"Price rejected supply near {zone_lvl}.")
+        if has_struct:
+            lines.append("Bearish CHOCH/BOS supports downside structure.")
         if vwap_pos.startswith("below"):
-            lines.append("Price is trading below VWAP, confirming bearish intent.")
-        if choch_status != "None":
-            lines.append("Bearish CHOCH confirmed a market-structure shift.")
-        if bos_status != "None":
-            lines.append("BOS Supply confirms bearish order flow.")
-        if not (a.get("zone_broken_active") or a.get("zone_mitigated_near")):
+            lines.append("VWAP confluence supports continuation.")
+        if zone_intact and not zone_mitig:
             lines.append("Supply zone remains respected.")
-    if t1 not in (None, ""):
-        lines.append(f"Looking for continuation toward {t1}.")
+        lines.append(f"Looking for continuation toward {t1}."
+                     if t1 not in (None, "") else
+                     "Looking for continuation toward next support.")
     if not lines:
         lines.append(entry.get("why_qualifies") or "Setup conditions met.")
     return "\n".join(lines)[:1000]
@@ -3639,17 +3705,18 @@ def classify_setup_categories(entry):
 
 
 def _grade_for_score(score):
-    """Map a 0-100 edge score to a letter grade (A+ at 90+, matching the card)."""
+    """Map a 0-100 Edge Score to a Trade Grade band.
+
+    Bands (Edge Score → Grade): 95-100 A+, 90-94 A, 85-89 B, 80-84 C, below 80
+    WAIT. The grade is a quality label only — it is independent of the READY/WAIT
+    gate, so a thin READY (floored at 75) can read "WAIT" until extra confluences
+    or the +10 Session Bonus lift it to 80+."""
     s = score or 0
-    if s >= 90: return "A+"
-    if s >= 85: return "A"
-    if s >= 80: return "A-"
-    if s >= 75: return "B+"
-    if s >= 70: return "B"
-    if s >= 65: return "B-"
-    if s >= 60: return "C+"
-    if s >= 55: return "C"
-    return "D"
+    if s >= 95: return "A+"
+    if s >= 90: return "A"
+    if s >= 85: return "B"
+    if s >= 80: return "C"
+    return "WAIT"
 
 
 # ── Trade-strength classification (display / journal / analytics) ──────────────
@@ -3793,6 +3860,14 @@ def compute_edge_breakdown(a, entry):
 
     gate_pass = has_bos and has_choch and has_confirm and vwap_ok
 
+    # Readiness — keyed off the actual READY verdict (not a re-derived gate) so the
+    # zone-mitigation path, which can pass the gate without a fresh BOS, still counts
+    # as READY. Computed here so the Session Bonus and the score floor share it.
+    strict_label = str(entry.get("strict_label") or a.get("strict_label") or "")
+    is_ready = (strict_label in ("Strong Trade", "Possible Trade")
+                or str(entry.get("verdict") or a.get("verdict") or "").upper() == "READY")
+    ready_state = gate_pass or is_ready
+
     # Bonus confluences (additive). A liquidity sweep and a confirmed zone reaction are
     # distinct events, so each is credited independently. The zone-confirmed reaction is
     # ALWAYS credited when present — including on a mitigated zone, where it is exactly
@@ -3816,6 +3891,15 @@ def compute_edge_breakdown(a, entry):
             _add("Elevated Confidence", 3)
     except (TypeError, ValueError):
         pass
+
+    # Session Bonus (+10) when a READY setup falls inside a preferred trading
+    # window. Gated on `ready_state` so a non-READY/WAIT analysis is never inflated
+    # — the bonus rewards taking the BEST setups during the BEST hours, not merely
+    # being awake at the right time. Time-based (not payload-based), so it stays in
+    # lockstep with the Session block shown on the card / status / why.
+    sess = a.get("session") or get_session_state()
+    if ready_state and sess.get("preferred"):
+        _add("Session Bonus", int(sess.get("bonus", SESSION_BONUS_POINTS)))
 
     # ── Risk adjustments (subtract) ──────────────────────────────────────────
     risk_adj = []
@@ -3863,14 +3947,11 @@ def compute_edge_breakdown(a, entry):
     risk_adj  = _dedup(risk_adj)
 
     raw   = sum(it["points"] for it in breakdown) + sum(it["points"] for it in risk_adj)
-    # compute_edge_breakdown only runs on READY setups. Floor any READY trade at 75
-    # so its Edge Score is always 75-100 and classifiable as Possible/Strong. We key
-    # off the actual READY verdict (not a re-derived gate) so the zone-mitigation path
-    # — which can pass the gate without a fresh BOS — is still floored correctly.
-    strict_label = str(entry.get("strict_label") or a.get("strict_label") or "")
-    is_ready = (strict_label in ("Strong Trade", "Possible Trade")
-                or str(entry.get("verdict") or a.get("verdict") or "").upper() == "READY")
-    floor = 75 if (gate_pass or is_ready) else 0
+    # Floor any READY trade at 75 so its Edge Score is always 75-100 and classifiable
+    # as Possible/Strong. `ready_state` (computed above) keys off the actual READY
+    # verdict, so the zone-mitigation path — which can pass the gate without a fresh
+    # BOS — is still floored correctly.
+    floor = 75 if ready_state else 0
     score = max(floor, min(100, raw))
 
     # Hard blockers override everything: a broken structure or a consumed
@@ -4201,6 +4282,13 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["setup_categories"] = classify_setup_categories(entry)
     entry["setup_notes"]      = build_setup_notes(a, entry)
     entry["trade_thesis"]     = build_trade_thesis(a, entry)
+    # Session focus + next step, carried onto the card, /why and the journal so a
+    # READY is always tagged with the window it fired in and what to do next.
+    sess = a.get("session") or get_session_state()
+    entry["session_preferred"] = bool(sess.get("preferred"))
+    entry["session_bonus"]     = int(sess.get("bonus", 0))
+    entry["session_window"]    = sess.get("window", "—")
+    entry["next_step"]         = a.get("stage_next_step") or entry.get("why_qualifies") or "—"
     # Transparent Edge Score is the authoritative READY-trade score: it drives the
     # Possible/Strong strength label, the card/journal display, recap and analytics.
     # The legacy bias-derived edge score is preserved for backward compatibility.
@@ -4272,6 +4360,10 @@ def _build_why_explanation(entry):
         "thesis":           entry.get("trade_thesis", "—"),
         "why_qualifies":    entry.get("why_qualifies", entry.get("why", "—")),
         "setup_notes":      entry.get("setup_notes", "—"),
+        "session_preferred": entry.get("session_preferred"),
+        "session_bonus":     entry.get("session_bonus"),
+        "session_window":    entry.get("session_window"),
+        "next_step":         entry.get("next_step", entry.get("stage_next_step", "—")),
         "passed_conditions": gate_passed,
         "confluences":      confluences,
         "risks":            risk_labels,
@@ -5004,6 +5096,9 @@ def status():
         "edge_score":          a["edge_score"],
         "edge_grade":          a.get("edge_grade"),
         "edge_breakdown":      a.get("edge_breakdown"),
+        "session_preferred":   (a.get("session") or {}).get("preferred"),
+        "session_bonus":       (a.get("session") or {}).get("bonus"),
+        "session_window":      (a.get("session") or {}).get("window"),
         "trade_quality":       a["quality"],
         "trade_quality_label": QUALITY_LABELS.get(a["quality"], ""),
         "bullish_score":       a["bullish"],
@@ -5714,7 +5809,10 @@ async function refreshRec() {
     const vwap  = (d.vwap_status==='ok' && d.vwap_value!=null)
       ? Number(d.vwap_value).toFixed(1) + vsrc
       : 'n/a ('+(d.vwap_status||'—')+')';
-    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b>';
+    const sess = d.session_preferred
+      ? '<span style="color:#22c55e">● Preferred Session (+'+(d.session_bonus!=null?d.session_bonus:10)+')</span>'
+      : '<span style="color:#6b7280">○ Off-session</span>';
+    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess;
 
     const score = d.edge_score!=null ? d.edge_score : 0;
     const grade = d.edge_grade ? ' · ' + d.edge_grade : '';

@@ -28,6 +28,21 @@ gate, alerts, throttling, or the 5-min repost loop.
   by a zone-confirmed gets no +15 but is floored to 75 (see reaction rule below).
 - Trade strength is a pure sub-classification of the Edge Score: Possible = 75–89,
   Strong = 90–100. The gate still decides READY/WAIT; strength only ranks a READY trade.
+- **Session Bonus +10 is its own breakdown item, READY-gated.** A preferred ET window
+  (`get_session_state`: half-open `[05:00,08:00)`, `[08:00,11:00)`, `[20:00,23:00)`) adds a
+  "Session Bonus" +10 item, but ONLY when `ready_state` (`gate_pass or is_ready`, computed
+  once and shared with the floor) is true — so a WAIT/non-READY analysis inside a window is
+  NEVER inflated. Because the bonus flows through `compute_edge_breakdown` (the single
+  source), the +10 propagates identically to /status, /why, card, and journal.
+
+## Letter-grade bands (display-only, quality NOT verdict)
+
+`_grade_for_score`: **95–100 A+ · 90–94 A · 85–89 B · 80–84 C · below 80 WAIT**. The grade
+is a quality label only; it does NOT change the READY/WAIT verdict or journaling.
+**Intentional tension:** a thin READY floored to 75 *displays* Grade "WAIT" (75 < 80) yet is
+a valid READY trade — the +10 Session Bonus is what lifts an in-window READY into C/B/A.
+Do not "fix" this by coupling grade to verdict; they are deliberately separate axes.
+Note: `QUALITY_LABELS` (A+/A/B/C/D market-quality) is a DIFFERENT scale — do not conflate.
 
 ## The durable rules
 
