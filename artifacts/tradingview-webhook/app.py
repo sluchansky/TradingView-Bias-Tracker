@@ -5,6 +5,7 @@ import logging
 import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 import requests
 
@@ -308,15 +309,47 @@ def _compute_eod_stats():
     worst = losses[0] if losses else \
             (min(closed, key=lambda e: e.get("edge_score", 99), default=None))
 
+    # ── Additive recap metrics ──
+    longs  = [e for e in entries if e.get("direction") == "Long"]
+    shorts = [e for e in entries if e.get("direction") == "Short"]
+    win_rate = (len(wins) / trades_entered * 100.0) if trades_entered else None
+
+    def _conf_key(e):
+        sc = e.get("strict_score")
+        try:
+            return float(sc)
+        except (TypeError, ValueError):
+            return e.get("edge_score", 0)
+    highest_conf = max(entries, key=_conf_key, default=None)
+
+    # Per-instrument net P&L (only over entries with a known P&L).
+    inst_pnl = {}
+    for e in entries:
+        if "pnl_dollars" not in e:
+            continue
+        inst = instrument_of(e.get("symbol", ""))
+        inst_pnl[inst] = inst_pnl.get(inst, 0.0) + e["pnl_dollars"]
+    best_instrument  = max(inst_pnl, key=inst_pnl.get) if inst_pnl else None
+    worst_instrument = min(inst_pnl, key=inst_pnl.get) if inst_pnl else None
+
     return {
-        "date":           today,
-        "trades_flagged": len(entries),
-        "trades_entered": trades_entered,
-        "wins":           len(wins),
-        "losses":         len(losses),
-        "net_pnl":        round(pnl_total, 2) if has_pnl else None,
-        "best":           best,
-        "worst":          worst,
+        "date":             today,
+        "trades_flagged":   len(entries),
+        "trades_entered":   trades_entered,
+        "wins":             len(wins),
+        "losses":           len(losses),
+        "net_pnl":          round(pnl_total, 2) if has_pnl else None,
+        "best":             best,
+        "worst":            worst,
+        # ── Additive ──
+        "total_setups":     len(entries),
+        "long_setups":      len(longs),
+        "short_setups":     len(shorts),
+        "win_rate":         win_rate,
+        "highest_conf":     highest_conf,
+        "best_instrument":  best_instrument,
+        "worst_instrument": worst_instrument,
+        "inst_pnl":         inst_pnl,
     }
 
 
@@ -342,18 +375,36 @@ def _send_eod_summary():
     else:
         pnl_str, color = f"-${abs(pnl_val):,.0f}", 0xE74C3C
 
+    win_rate_str = f"{stats['win_rate']:.0f}%" if stats.get("win_rate") is not None else "—"
+
+    def _fmt_inst(inst):
+        if not inst:
+            return "—"
+        pnl = stats.get("inst_pnl", {}).get(inst)
+        if pnl is None:
+            return inst
+        sign = f"+${pnl:,.0f}" if pnl >= 0 else f"-${abs(pnl):,.0f}"
+        return f"{inst}  ·  {sign}"
+
     embed = {
         "color":       color,
         "author":      {"name": BOT_NAME},
         "title":       "📊 End of Day Summary",
         "description": now.strftime("%A, %B %-d, %Y"),
         "fields": [
-            {"name": "Trades flagged",  "value": str(stats["trades_flagged"]), "inline": True},
-            {"name": "Trades entered",  "value": str(stats["trades_entered"]), "inline": True},
-            {"name": "\u200b",          "value": "\u200b",                     "inline": True},
+            {"name": "Total setups",    "value": str(stats["total_setups"]),   "inline": True},
+            {"name": "Long setups",     "value": str(stats["long_setups"]),    "inline": True},
+            {"name": "Short setups",    "value": str(stats["short_setups"]),   "inline": True},
+            {"name": "Trades taken",    "value": str(stats["trades_entered"]), "inline": True},
+            {"name": "Win rate",        "value": win_rate_str,                 "inline": True},
+            {"name": "Net P&L",         "value": f"**{pnl_str}**",            "inline": True},
             {"name": "Wins ✅",         "value": str(stats["wins"]),           "inline": True},
             {"name": "Losses ❌",       "value": str(stats["losses"]),         "inline": True},
-            {"name": "Net P&L",         "value": f"**{pnl_str}**",            "inline": True},
+            {"name": "\u200b",          "value": "\u200b",                     "inline": True},
+            {"name": "Best instrument",  "value": _fmt_inst(stats.get("best_instrument")),  "inline": True},
+            {"name": "Worst instrument", "value": _fmt_inst(stats.get("worst_instrument")), "inline": True},
+            {"name": "\u200b",          "value": "\u200b",                     "inline": True},
+            {"name": "🔥 Highest-confidence setup", "value": _fmt_setup(stats.get("highest_conf")), "inline": False},
             {"name": "Best setup",      "value": _fmt_setup(stats["best"]),    "inline": False},
             {"name": "Worst setup",     "value": _fmt_setup(stats["worst"]),   "inline": False},
         ],
@@ -2483,7 +2534,11 @@ def _build_trade_card_embed(entry, footer_text):
     if len(why_text) > 1000:
         why_text = why_text[:1000] + "…"
 
-    return {
+    notes_text = entry.get("setup_notes") or "—"
+    if len(notes_text) > 1000:
+        notes_text = notes_text[:1000] + "…"
+
+    embed = {
         "author":      {"name": f"{BOT_NAME} · {label} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
         "description": f"**{label}**  ·  Verdict: **{entry['verdict']}**",
@@ -2500,10 +2555,20 @@ def _build_trade_card_embed(entry, footer_text):
             {"name": "🎯 TP1",                 "value": _val(entry.get("target1")),    "inline": True},
             {"name": "🎯 TP2",                 "value": _val(entry.get("target2")),    "inline": True},
             {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
+            {"name": "📈 VWAP",                "value": _val(entry.get("vwap_position")), "inline": True},
+            {"name": "🧱 Zone",                "value": _val(entry.get("supply_demand_zone")), "inline": True},
+            {"name": "🤖 AI Analysis",         "value": notes_text,                   "inline": False},
             {"name": "💬 Why the Trade Qualifies", "value": why_text,                 "inline": False},
         ],
         "footer": {"text": footer_text},
     }
+
+    # Attach the chart screenshot when a validated public URL is present.
+    shot = entry.get("screenshot_url")
+    if shot:
+        embed["image"] = {"url": shot}
+
+    return embed
 
 
 def send_live_ready_card(entry, ticker=""):
@@ -2589,8 +2654,312 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None):
                     )
                 except Exception:
                     pass
+            # Performance analytics: fire once per entry on a terminal outcome
+            # (Win / Loss / Breakeven). Intermediate states (Pending / T1 Hit)
+            # do not trigger. Deduped via entry["analytics_posted"].
+            state = _outcome_state(new_outcome, entry.get("pnl_dollars"))
+            if state in ("win", "loss", "breakeven") and not entry.get("analytics_posted"):
+                entry["analytics_posted"] = True
+                post_performance_stats(
+                    reason=f"After {entry.get('symbol','—')} "
+                           f"{entry.get('direction','—')} closed: {new_outcome}"
+                )
             return entry
     return None
+
+
+# ---------------------------------------------------------------------------
+# Additive upgrade helpers — AI notes, structure block, screenshot, analytics.
+# All grounded in real full_analysis() data; none alter scoring or the webhook
+# path. build_setup_notes/build_trade_thesis are isolated so they can later be
+# swapped for an LLM without touching callers.
+# ---------------------------------------------------------------------------
+
+# Private/loopback host prefixes rejected for screenshot URLs (SSRF-safe; the
+# URL is only ever handed to Discord, never fetched server-side).
+_PRIVATE_HOST_RE = re.compile(
+    r'^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|169\.254\.|'
+    r'172\.(1[6-9]|2[0-9]|3[0-1])\.)', re.I,
+)
+
+PERF_CATEGORIES = ("BOS Demand", "BOS Supply", "CHOCH Bullish", "CHOCH Bearish",
+                   "VWAP Reclaim", "VWAP Rejection")
+
+
+def extract_screenshot_url(record):
+    """Return a public http(s) chart/screenshot URL from a webhook payload, or None.
+
+    Accepts several common field names. Rejects non-http(s) schemes and
+    private/loopback hosts. Never fetches the URL — only a validated public URL
+    is passed through to Discord's embed image.
+    """
+    if not isinstance(record, dict):
+        return None
+    raw = (record.get("screenshot") or record.get("screenshot_url")
+           or record.get("chart_url") or record.get("chart_image")
+           or record.get("chart") or record.get("image"))
+    if not raw:
+        return None
+    url = str(raw).strip()
+    # Ignore the legacy placeholder string; cap length (Discord image URL limit).
+    if not url or url.startswith("[") or len(url) > 2048:
+        return None
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return None
+    if _PRIVATE_HOST_RE.match(p.hostname):
+        return None
+    return url
+
+
+def _fmt_lvl(v):
+    """Format a numeric price level as a 2-dp string, or None if not numeric."""
+    try:
+        return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def build_structure_fields(a, direction):
+    """Return (bos_status, choch_status, vwap_position, supply_demand_zone) strings
+    grounded in the full_analysis() result `a`. VWAP side is derived by comparing
+    current price to the VWAP value (vwap_status is freshness, not direction)."""
+    lpt = a.get("last_price_by_type") or {}
+    if direction == "Long":
+        bos_lvl   = _fmt_lvl(lpt.get("BOS DEMAND"))
+        choch_lvl = _fmt_lvl(lpt.get("CHOCH DEMAND"))
+        zone_lvl  = _fmt_lvl(a.get("nearest_demand"))
+        bos_status   = f"BOS Demand @ {bos_lvl}" if bos_lvl else "None"
+        choch_status = f"Bullish CHOCH @ {choch_lvl}" if choch_lvl else "None"
+        zone_word    = "Demand"
+    else:
+        bos_lvl   = _fmt_lvl(lpt.get("BOS SUPPLY"))
+        choch_lvl = _fmt_lvl(lpt.get("CHOCH SUPPLY"))
+        zone_lvl  = _fmt_lvl(a.get("nearest_supply"))
+        bos_status   = f"BOS Supply @ {bos_lvl}" if bos_lvl else "None"
+        choch_status = f"Bearish CHOCH @ {choch_lvl}" if choch_lvl else "None"
+        zone_word    = "Supply"
+
+    # _fmt_lvl validates numerics; float() on its output is then always safe.
+    vval_f  = _fmt_lvl(a.get("vwap_value"))
+    price_f = _fmt_lvl(a.get("current_price"))
+    if vval_f and price_f:
+        side = "Above" if float(price_f) >= float(vval_f) else "Below"
+        vwap_position = f"{side} VWAP ({vval_f})"
+    else:
+        vwap_position = "—"
+
+    if a.get("zone_broken_active"):
+        sd_zone = f"{zone_word} zone broken"
+    elif a.get("zone_mitigated_near"):
+        sd_zone = f"{zone_word} zone consumed"
+    else:
+        sd_zone = f"{zone_word} intact" + (f" @ {zone_lvl}" if zone_lvl else "")
+
+    return bos_status, choch_status, vwap_position, sd_zone
+
+
+def build_setup_notes(a, entry):
+    """Deterministic, fact-grounded "AI Analysis" for a setup. Every line is built
+    from the real confluences in `a`/`entry`, so it can never hallucinate. Kept in
+    one place so it can be swapped for an LLM later without touching callers."""
+    direction = entry.get("direction", "Long")
+    bos_status   = entry.get("bos_status")   or "None"
+    choch_status = entry.get("choch_status") or "None"
+    vwap_pos     = str(entry.get("vwap_position") or "").lower()
+    t1           = entry.get("target1")
+    lines = []
+    if direction == "Long":
+        zone_lvl = _fmt_lvl(a.get("nearest_demand"))
+        if zone_lvl:
+            lines.append(f"Price reacted at demand near {zone_lvl} and is holding bid.")
+        if vwap_pos.startswith("above"):
+            lines.append("Price reclaimed VWAP, confirming bullish intent.")
+        if choch_status != "None":
+            lines.append("Bullish CHOCH confirmed a market-structure shift.")
+        if bos_status != "None":
+            lines.append("BOS Demand confirms bullish order flow.")
+        if not (a.get("zone_broken_active") or a.get("zone_mitigated_near")):
+            lines.append("Demand zone remains intact.")
+    else:
+        zone_lvl = _fmt_lvl(a.get("nearest_supply"))
+        if zone_lvl:
+            lines.append(f"Price rejected supply near {zone_lvl}.")
+        if vwap_pos.startswith("below"):
+            lines.append("Price is trading below VWAP, confirming bearish intent.")
+        if choch_status != "None":
+            lines.append("Bearish CHOCH confirmed a market-structure shift.")
+        if bos_status != "None":
+            lines.append("BOS Supply confirms bearish order flow.")
+        if not (a.get("zone_broken_active") or a.get("zone_mitigated_near")):
+            lines.append("Supply zone remains respected.")
+    if t1 not in (None, ""):
+        lines.append(f"Looking for continuation toward {t1}.")
+    if not lines:
+        lines.append(entry.get("why_qualifies") or "Setup conditions met.")
+    return "\n".join(lines)[:1000]
+
+
+def build_trade_thesis(a, entry):
+    """One-line trade thesis grounded in the setup direction and target."""
+    direction = entry.get("direction", "Long")
+    sym       = entry.get("symbol", "—")
+    t1        = entry.get("target1")
+    tgt       = f", targeting {t1}" if t1 not in (None, "") else ""
+    if direction == "Long":
+        return f"Long {sym}: demand reclaim with bullish CHOCH above VWAP{tgt}."[:240]
+    return f"Short {sym}: supply rejection with bearish CHOCH below VWAP{tgt}."[:240]
+
+
+def classify_setup_categories(entry):
+    """Tag a setup with performance categories from its structure + VWAP position."""
+    cats = []
+    direction    = entry.get("direction", "Long")
+    bos_status   = str(entry.get("bos_status") or "")
+    choch_status = str(entry.get("choch_status") or "")
+    vwap_pos     = str(entry.get("vwap_position") or "").lower()
+    if direction == "Long":
+        if bos_status not in ("", "None"):   cats.append("BOS Demand")
+        if choch_status not in ("", "None"): cats.append("CHOCH Bullish")
+        if vwap_pos.startswith("above"):     cats.append("VWAP Reclaim")
+    else:
+        if bos_status not in ("", "None"):   cats.append("BOS Supply")
+        if choch_status not in ("", "None"): cats.append("CHOCH Bearish")
+        if vwap_pos.startswith("below"):     cats.append("VWAP Rejection")
+    return cats
+
+
+def _outcome_state(outcome, pnl=None):
+    """Map a journal outcome string (+optional pnl) to 'win'/'loss'/'breakeven'/None.
+
+    'None' means still open (Pending / T1 Hit). A Win or Loss with ~zero realized
+    P&L is reclassified as a breakeven (e.g. stop hit at break-even after T1)."""
+    o  = str(outcome or "")
+    ol = o.lower()
+    if "breakeven" in ol or ol.strip() == "be" or ol.strip().startswith("be "):
+        return "breakeven"
+    if o.startswith("Win") or "win" in ol:
+        st = "win"
+    elif o.startswith("Loss") or "loss" in ol:
+        st = "loss"
+    else:
+        return None
+    try:
+        if pnl is not None and abs(float(pnl)) < 1e-6:
+            return "breakeven"
+    except (TypeError, ValueError):
+        pass
+    return st
+
+
+def _realized_r(entry, state):
+    """Conservative realized-R proxy from the outcome (inferred, not exact)."""
+    if state == "breakeven":
+        return 0.0
+    if state == "loss":
+        return -1.0
+    o = str(entry.get("outcome", "")).lower()
+    try:
+        rr = float(entry.get("rr"))
+    except (TypeError, ValueError):
+        rr = 2.0
+    if "t1" in o and "t2" not in o:
+        return 1.0
+    return rr
+
+
+def compute_performance_stats(entries=None):
+    """Derive performance analytics from closed JOURNAL entries (in-memory only)."""
+    entries = JOURNAL if entries is None else entries
+    wins = losses = breakevens = 0
+    gross_win = gross_loss = 0.0
+    r_values = []
+    cat = {c: {"win": 0, "loss": 0} for c in PERF_CATEGORIES}
+
+    for e in entries:
+        pnl   = e.get("pnl_dollars")
+        state = _outcome_state(e.get("outcome"), pnl)
+        if state is None:
+            continue
+        if state == "win":
+            wins += 1
+            if pnl is not None:
+                gross_win += max(0.0, float(pnl))
+        elif state == "loss":
+            losses += 1
+            if pnl is not None:
+                gross_loss += abs(min(0.0, float(pnl)))
+        else:
+            breakevens += 1
+
+        r_values.append(_realized_r(e, state))
+
+        if state in ("win", "loss"):
+            for c in (e.get("setup_categories") or classify_setup_categories(e)):
+                if c in cat:
+                    cat[c][state] += 1
+
+    decided = wins + losses
+    win_rate = (wins / decided * 100.0) if decided else None
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
+    avg_r = (sum(r_values) / len(r_values)) if r_values else None
+
+    return {
+        "wins": wins, "losses": losses, "breakevens": breakevens,
+        "decided": decided, "closed": wins + losses + breakevens,
+        "win_rate": win_rate,
+        "gross_win": round(gross_win, 2), "gross_loss": round(gross_loss, 2),
+        "profit_factor": profit_factor, "avg_r": avg_r,
+        "categories": cat,
+    }
+
+
+def post_performance_stats(reason=""):
+    """Compute and post the performance-analytics embed to the journal channel."""
+    if not DISCORD_JOURNAL_WEBHOOK_URL:
+        return
+    s = compute_performance_stats()
+    if s["closed"] == 0:
+        return
+    wr   = f"{s['win_rate']:.0f}%" if s["win_rate"] is not None else "—"
+    if s["profit_factor"] is not None:
+        pf = f"{s['profit_factor']:.2f}"
+    else:
+        pf = "∞" if s["gross_win"] > 0 else "—"
+    avgr = f"{s['avg_r']:+.2f}R" if s["avg_r"] is not None else "—"
+
+    cat_lines = []
+    for c in PERF_CATEGORIES:
+        w, l = s["categories"][c]["win"], s["categories"][c]["loss"]
+        if w + l > 0:
+            cat_lines.append(f"{c}: {w}W / {l}L ({w / (w + l) * 100:.0f}%)")
+    cat_text = "\n".join(cat_lines) or "No categorized results yet."
+
+    embed = {
+        "color":  0x5865F2,
+        "author": {"name": f"{BOT_NAME} · Performance"},
+        "title":  "📈 Performance Analytics",
+        "description": reason or "Updated after a closed trade.",
+        "fields": [
+            {"name": "Wins ✅",        "value": str(s["wins"]),       "inline": True},
+            {"name": "Losses ❌",      "value": str(s["losses"]),     "inline": True},
+            {"name": "Breakeven ⚖️",   "value": str(s["breakevens"]), "inline": True},
+            {"name": "Win Rate",       "value": wr,                   "inline": True},
+            {"name": "Profit Factor",  "value": pf,                   "inline": True},
+            {"name": "Avg R",          "value": avgr,                 "inline": True},
+            {"name": "📊 By Setup Type", "value": cat_text[:1024],    "inline": False},
+        ],
+        "footer": {"text": "Session stats · in-memory, resets on restart"},
+    }
+    try:
+        requests.post(DISCORD_JOURNAL_WEBHOOK_URL, json={"embeds": [embed]}, timeout=5)
+        logger.info("Performance stats posted: %dW/%dL/%dBE",
+                    s["wins"], s["losses"], s["breakevens"])
+    except Exception as exc:
+        logger.warning("Performance stats post failed: %s", exc)
 
 
 def _build_card_entry(a, ticker=None, record=None):
@@ -2618,7 +2987,11 @@ def _build_card_entry(a, ticker=None, record=None):
         bos_level, choch_level = lpt.get("BOS SUPPLY"), lpt.get("CHOCH SUPPLY")
         bos_type,  choch_type  = "Supply", "Bearish"
 
-    return {
+    # Additive structure block + screenshot (grounded in `a` / webhook record).
+    bos_status, choch_status, vwap_position, sd_zone = build_structure_fields(a, direction)
+    screenshot_url = extract_screenshot_url(record)
+
+    entry = {
         "datetime":         datetime.now(timezone.utc).isoformat(),
         "symbol":           symbol,
         "instrument":       inst,
@@ -2644,7 +3017,17 @@ def _build_card_entry(a, ticker=None, record=None):
         "risk_zone":        a.get("risk_label", "—"),
         "reasoning_chain":  a.get("reasoning_chain") or [],
         "why":              a.get("why", "—"),
+        # ── Additive fields (do not remove; consumers use .get() defaults) ──
+        "bos_status":         bos_status,
+        "choch_status":       choch_status,
+        "vwap_position":      vwap_position,
+        "supply_demand_zone": sd_zone,
+        "screenshot_url":     screenshot_url,
     }
+    entry["setup_categories"] = classify_setup_categories(entry)
+    entry["setup_notes"]      = build_setup_notes(a, entry)
+    entry["trade_thesis"]     = build_trade_thesis(a, entry)
+    return entry
 
 
 def create_journal_entry(record, a, sizing):
@@ -2673,9 +3056,15 @@ def create_journal_entry(record, a, sizing):
 
     JOURNAL_KEYS.add(dedup_key)
 
-    entry["id"]         = len(JOURNAL) + 1
-    entry["screenshot"] = "[ Screenshot placeholder — add URL or image link ]"
-    entry["outcome"]    = "Pending"
+    entry["id"]      = len(JOURNAL) + 1
+    entry["outcome"] = "Pending"
+    # Chart screenshot: use a validated public URL when the alert carried one,
+    # else keep the legacy placeholder string and continue (no failure).
+    if entry.get("screenshot_url"):
+        entry["screenshot"] = entry["screenshot_url"]
+    else:
+        entry["screenshot"] = "[ Screenshot placeholder — add URL or image link ]"
+        logger.info("Screenshot unavailable for journal #%d — continuing", entry["id"])
 
     JOURNAL.insert(0, entry)
     if len(JOURNAL) > 500:
@@ -3215,6 +3604,20 @@ def add_journal_entry():
         "outcome":          str(data.get("outcome") or "Pending"),
         "manual":           True,
     }
+
+    # ── Additive fields (parity with auto-journal entries) ──
+    entry["screenshot_url"] = extract_screenshot_url(data)
+    if entry["screenshot_url"]:
+        entry["screenshot"] = entry["screenshot_url"]
+    entry["vwap_position"]      = str(data.get("vwap_position") or data.get("vwap") or "—")
+    entry["supply_demand_zone"] = str(data.get("supply_demand_zone") or data.get("zone") or "—")
+    entry["bos_status"] = str(data.get("bos_status") or (
+        f"BOS {entry['bos_type']} @ {entry['bos_level']}" if entry.get("bos_level") else "None"))
+    entry["choch_status"] = str(data.get("choch_status") or (
+        f"{entry['choch_type']} CHOCH @ {entry['choch_level']}" if entry.get("choch_level") else "None"))
+    entry["setup_categories"] = classify_setup_categories(entry)
+    entry["setup_notes"]  = str(data.get("setup_notes") or entry["why_qualifies"] or "—")
+    entry["trade_thesis"] = str(data.get("trade_thesis") or build_trade_thesis({}, entry))
 
     JOURNAL.insert(0, entry)
     if len(JOURNAL) > 500:
