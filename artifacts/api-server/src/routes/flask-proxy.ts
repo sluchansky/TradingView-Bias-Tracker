@@ -65,6 +65,7 @@ router.all(
     "/eod",
     "/weekly",
     "/why",
+    "/why/:ticker",
     "/broker/status",
     "/broker/toggle",
     "/broker/test",

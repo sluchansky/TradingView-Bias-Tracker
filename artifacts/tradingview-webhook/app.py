@@ -3022,21 +3022,24 @@ def send_live_ready_card(entry, ticker=""):
         logger.warning("DISCORD_WEBHOOK_URL not set — live ready card skipped")
         return
     footer = f"Live Signal · {entry.get('symbol') or ticker or '—'}"
-    embed  = _build_trade_card_embed(entry, footer)
     # Record the send time per-instrument so the periodic loop throttles against it
     # (prevents an instant card and a periodic card landing seconds apart).
     LAST_LIVE_CARD_AT[instrument_of(ticker or entry.get("symbol", ""))] = datetime.now(timezone.utc)
+    # Build + post inside the guard so a render failure (e.g. an unforeseen new
+    # card field) can never raise into the caller — the alert path stays fail-open.
+    embed = None
     try:
+        embed = _build_trade_card_embed(entry, footer)
         resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
         if resp.status_code not in (200, 204):
             logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        logger.error("Live ready card post error: %s", exc)
+        logger.error("Live ready card build/post error: %s", exc)
     # Optionally mirror 🔥 A+ setups to a dedicated channel (additive — the card
     # already posted to the normal channel above, so this never blocks/relocates
     # Possible/Strong/A+ alerts). Skipped entirely when no A+ channel is set.
     try:
-        if (entry.get("trade_strength") == "A+ Setup"
+        if (embed is not None and entry.get("trade_strength") == "A+ Setup"
                 and DISCORD_APLUS_WEBHOOK_URL and DISCORD_APLUS_WEBHOOK_URL != url):
             requests.post(DISCORD_APLUS_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
     except Exception as exc:
@@ -4617,12 +4620,18 @@ def webhook():
     # returns the entry just once per setup (deduped), so this fires the instant
     # alert exactly once on the triggering webhook; _trade_ready_loop() then
     # re-posts the card every 5 min while the setup stays READY.
-    journal_entry = create_journal_entry(record, a, sizing)
-    if (journal_entry and not ACTIVE_TRADE
-            and a.get("verdict") in ("LONG READY", "SHORT READY")):
-        send_live_ready_card(journal_entry,
-                             record.get("ticker") or record.get("instrument")
-                             or journal_entry.get("instrument"))
+    # Fail-open: journaling/enrichment + the live card must never crash the webhook
+    # or block the alert from being recorded. The alert is already in ALERT_HISTORY
+    # above, so a failure here is logged and the webhook still returns OK.
+    try:
+        journal_entry = create_journal_entry(record, a, sizing)
+        if (journal_entry and not ACTIVE_TRADE
+                and a.get("verdict") in ("LONG READY", "SHORT READY")):
+            send_live_ready_card(journal_entry,
+                                 record.get("ticker") or record.get("instrument")
+                                 or journal_entry.get("instrument"))
+    except Exception as exc:
+        logger.error("Journal/live-card path error (alert still recorded): %s", exc)
 
     logger.info(
         "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
