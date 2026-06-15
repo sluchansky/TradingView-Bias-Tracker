@@ -2538,6 +2538,14 @@ def _build_trade_card_embed(entry, footer_text):
     if len(notes_text) > 1000:
         notes_text = notes_text[:1000] + "…"
 
+    # Display-only Edge Score / Grade / Reasons / Risk block replaces the free-text
+    # AI Analysis field on READY cards; fall back to notes when no breakdown exists.
+    eb = entry.get("edge_breakdown")
+    if eb and (eb.get("reasons") or eb.get("risks") or eb.get("score")):
+        analysis_field = _render_edge_block_field(eb)
+    else:
+        analysis_field = {"name": "🤖 AI Analysis", "value": notes_text, "inline": False}
+
     embed = {
         "author":      {"name": f"{BOT_NAME} · {label} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
@@ -2557,7 +2565,7 @@ def _build_trade_card_embed(entry, footer_text):
             {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
             {"name": "📈 VWAP",                "value": _val(entry.get("vwap_position")), "inline": True},
             {"name": "🧱 Zone",                "value": _val(entry.get("supply_demand_zone")), "inline": True},
-            {"name": "🤖 AI Analysis",         "value": notes_text,                   "inline": False},
+            analysis_field,
             {"name": "💬 Why the Trade Qualifies", "value": why_text,                 "inline": False},
         ],
         "footer": {"text": footer_text},
@@ -2832,6 +2840,117 @@ def classify_setup_categories(entry):
     return cats
 
 
+def _grade_for_score(score):
+    """Map a 0-100 edge score to a letter grade (A+ at 90+, matching the card)."""
+    s = score or 0
+    if s >= 90: return "A+"
+    if s >= 85: return "A"
+    if s >= 80: return "A-"
+    if s >= 75: return "B+"
+    if s >= 70: return "B"
+    if s >= 65: return "B-"
+    if s >= 60: return "C+"
+    if s >= 55: return "C"
+    return "D"
+
+
+def compute_edge_breakdown(a, entry):
+    """Display-only Edge Score / Grade / Reasons / Risk for a READY setup.
+
+    Grounded entirely in data full_analysis() already produced (BOS, CHOCH,
+    VWAP, supply/demand zone + confirmed reaction, trend, confidence). Nothing
+    is read from the webhook payload — this is purely a Discord display layer and
+    does not affect scoring, journaling, throttling, or the 5-min repost loop.
+
+    Returns {"score": int, "grade": str, "reasons": [str], "risks": [str]}.
+    """
+    direction = entry.get("direction", "Long")
+    is_long   = direction != "Short"
+    conf      = a.get("confluences") or {}
+
+    has_bos     = bool(conf.get("bos"))   or str(entry.get("bos_status")   or "None") != "None"
+    has_choch   = bool(conf.get("choch")) or str(entry.get("choch_status") or "None") != "None"
+    vwap_pos    = str(entry.get("vwap_position") or "").lower()
+    vwap_ok     = vwap_pos.startswith("above") if is_long else vwap_pos.startswith("below")
+    zone_active = "intact" in str(entry.get("supply_demand_zone") or "").lower()
+    # Only label a real liquidity-sweep signal as such — the app has no dedicated
+    # sweep detector today, so unless one is present we report the genuine signal we
+    # DO have (a confirmed zone reaction). Never fabricate a "Liquidity Sweep".
+    has_sweep     = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
+    zone_reaction = bool(conf.get("zone_confirmed"))
+    mkt_dir     = str(a.get("market_direction") or a.get("bias") or "")
+    trend_ok    = (mkt_dir == "Bullish") if is_long else (mkt_dir == "Bearish")
+    try:
+        confidence = max(0.0, min(float(a.get("confidence") or 0), 100.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    reasons, score = [], 0
+    if has_bos:
+        reasons.append("BOS Demand" if is_long else "BOS Supply");                 score += 18
+    if has_choch:
+        reasons.append("Bullish CHOCH" if is_long else "Bearish CHOCH");           score += 18
+    if vwap_ok:
+        reasons.append("VWAP Reclaim" if is_long else "VWAP Rejection");           score += 14
+    if zone_active:
+        reasons.append("Demand Zone Active" if is_long else "Supply Zone Active");  score += 14
+    if trend_ok:
+        reasons.append("Bullish Trend" if is_long else "Bearish Trend");           score += 12
+    if has_sweep:
+        reasons.append("Liquidity Sweep");                                         score += 12
+    elif zone_reaction:
+        reasons.append("Confirmed Zone Reaction");                                 score += 12
+    score = max(0, min(100, score + round(confidence / 100.0 * 12)))
+
+    risks = []
+    risk_label = str(a.get("risk_label") or "")
+    price = a.get("current_price")
+    try:
+        near_pct = float(cfg("NEAR_PCT"))
+    except Exception:
+        near_pct = 0.004
+    near_opposite = False
+    try:
+        if price is not None:
+            price = float(price)
+            if is_long:
+                sup = a.get("nearest_supply")
+                near_opposite = sup is not None and 0 <= (float(sup) - price) <= price * near_pct * 1.5
+            else:
+                dem = a.get("nearest_demand")
+                near_opposite = dem is not None and 0 <= (price - float(dem)) <= price * near_pct * 1.5
+    except (TypeError, ValueError):
+        near_opposite = False
+
+    if is_long and (near_opposite or risk_label in ("Testing Supply", "Approaching Supply")):
+        risks.append("Nearby Resistance")
+    if not is_long and (near_opposite or risk_label in ("Testing Demand", "Approaching Demand")):
+        risks.append("Nearby Support")
+    if a.get("overextended") or risk_label == "Overextended":
+        risks.append("Overextended from level")
+    if risk_label == "Choppy":
+        risks.append("Choppy conditions")
+
+    seen = set()
+    risks = [r for r in risks if not (r in seen or seen.add(r))]
+
+    return {"score": score, "grade": _grade_for_score(score),
+            "reasons": reasons, "risks": risks}
+
+
+def _render_edge_block_field(eb):
+    """Render the Edge Score / Grade / Reasons / Risk breakdown as one embed field."""
+    score   = eb.get("score", 0)
+    grade   = eb.get("grade", "—")
+    reasons = eb.get("reasons") or []
+    risks   = eb.get("risks") or []
+    lines  = [f"**Edge Score: {score} / 100**", f"**Grade: {grade}**", "", "**Reasons:**"]
+    lines += [f"✓ {r}" for r in reasons] if reasons else ["—"]
+    lines += ["", "**Risk:**"]
+    lines += [f"⚠️ {r}" for r in risks] if risks else ["✓ None detected"]
+    return {"name": "⚡ Edge Score", "value": "\n".join(lines)[:1024], "inline": False}
+
+
 def _outcome_state(outcome, pnl=None):
     """Map a journal outcome string (+optional pnl) to 'win'/'loss'/'breakeven'/None.
 
@@ -3027,6 +3146,7 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["setup_categories"] = classify_setup_categories(entry)
     entry["setup_notes"]      = build_setup_notes(a, entry)
     entry["trade_thesis"]     = build_trade_thesis(a, entry)
+    entry["edge_breakdown"]   = compute_edge_breakdown(a, entry)
     return entry
 
 
