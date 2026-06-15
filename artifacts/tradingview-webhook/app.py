@@ -393,6 +393,15 @@ def _compute_eod_stats():
             return e.get("edge_score", 0)
     highest_conf = max(entries, key=_conf_key, default=None)
 
+    # ── Trade-strength split + Edge Score stats (READY journal entries) ──
+    possible = [e for e in entries if _entry_trade_strength(e) == "Possible Trade"]
+    strong   = [e for e in entries if _entry_trade_strength(e) == "Strong Trade"]
+    ready_entries = possible + strong
+    edge_vals = [_edge_score_for_entry(e) for e in ready_entries]
+    avg_edge  = round(sum(edge_vals) / len(edge_vals), 1) if edge_vals else None
+    highest_edge = max(ready_entries, key=_edge_score_for_entry, default=None)
+    lowest_edge  = min(ready_entries, key=_edge_score_for_entry, default=None)
+
     # Per-instrument net P&L (only over entries with a known P&L).
     inst_pnl = {}
     for e in entries:
@@ -421,6 +430,12 @@ def _compute_eod_stats():
         "best_instrument":  best_instrument,
         "worst_instrument": worst_instrument,
         "inst_pnl":         inst_pnl,
+        # ── Trade-strength + Edge Score (additive) ──
+        "possible_count":   len(possible),
+        "strong_count":     len(strong),
+        "avg_edge_score":   avg_edge,
+        "highest_edge":     highest_edge,
+        "lowest_edge":      lowest_edge,
     }
 
 
@@ -475,6 +490,11 @@ def _send_eod_summary():
             {"name": "Best instrument",  "value": _fmt_inst(stats.get("best_instrument")),  "inline": True},
             {"name": "Worst instrument", "value": _fmt_inst(stats.get("worst_instrument")), "inline": True},
             {"name": "\u200b",          "value": "\u200b",                     "inline": True},
+            {"name": "🟡 Possible trades", "value": str(stats.get("possible_count", 0)), "inline": True},
+            {"name": "🟢 Strong trades",   "value": str(stats.get("strong_count", 0)),   "inline": True},
+            {"name": "⚡ Avg Edge Score",  "value": (f"{stats['avg_edge_score']:.1f}" if stats.get("avg_edge_score") is not None else "—"), "inline": True},
+            {"name": "🔼 Highest Edge Score", "value": _fmt_setup(stats.get("highest_edge")), "inline": False},
+            {"name": "🔽 Lowest Edge Score",  "value": _fmt_setup(stats.get("lowest_edge")),  "inline": False},
             {"name": "🔥 Highest-confidence setup", "value": _fmt_setup(stats.get("highest_conf")), "inline": False},
             {"name": "Best setup",      "value": _fmt_setup(stats["best"]),    "inline": False},
             {"name": "Worst setup",     "value": _fmt_setup(stats["worst"]),   "inline": False},
@@ -1478,7 +1498,7 @@ def _strict_checklist_field(strict_label, strict_score, confluences,
         f"{_mark(c.get('confirmation'))} 5m {'bearish' if is_short else 'bullish'} confirmation candle",
         f"{_mark(c.get('vwap'))} Price {side_word} VWAP  ·  VWAP {vwap_txt}",
     ]
-    label_emoji = {"Strong Trade": "🟢", "Possible Trade": "🔵"}.get(strict_label, "⏸")
+    label_emoji = {"Strong Trade": "🟢", "Possible Trade": "🟡"}.get(strict_label, "⏸")
     header = f"{label_emoji} **{strict_label}** · Score **{strict_score}/100**"
     if direction:
         header += f" · {direction}"
@@ -2608,8 +2628,11 @@ def _build_trade_card_embed(entry, footer_text):
     """Build the clean trade-card embed shared by the journal channel and the
     live alert channel. `entry` is the dict produced by _build_card_entry()."""
     direction_emoji = "📈" if entry["direction"] == "Long" else "📉"
-    label           = entry.get("strict_label", "Possible Trade")
-    color           = 0x2ECC71 if label == "Strong Trade" else 0x00B0FF
+    # Strength label is driven by the Edge Score (Possible 75-89 / Strong 90-100),
+    # falling back to the strict gate label for legacy entries without one.
+    strength        = entry.get("trade_strength") or entry.get("strict_label", "Possible Trade")
+    strength_disp   = _strength_display(strength)
+    color           = 0x2ECC71 if strength == "Strong Trade" else 0xF1C40F
 
     def _val(v):
         return str(v) if v not in (None, "") else "—"
@@ -2645,9 +2668,9 @@ def _build_trade_card_embed(entry, footer_text):
         analysis_field = {"name": "🤖 AI Analysis", "value": notes_text, "inline": False}
 
     embed = {
-        "author":      {"name": f"{BOT_NAME} · {label} Detected"},
+        "author":      {"name": f"{BOT_NAME} · {strength_disp} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
-        "description": f"**{label}**  ·  Verdict: **{entry['verdict']}**",
+        "description": f"**{strength_disp}**  ·  Verdict: **{entry['verdict']}**",
         "color":       color,
         "timestamp":   entry["datetime"],
         "fields": [
@@ -2952,6 +2975,54 @@ def _grade_for_score(score):
     return "D"
 
 
+# ── Trade-strength classification (display / journal / analytics) ──────────────
+# A READY setup (the strict gate passed) is sub-classified PURELY by its Edge
+# Score: 75-89 → Possible Trade, 90-100 → Strong Trade. This never affects the
+# READY gate itself (evaluate_strict_setup); it only labels an already-READY
+# trade. A score below 75 is not a READY strength and returns None.
+def _trade_strength_from_score(score):
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return None
+    if s >= 90:
+        return "Strong Trade"
+    if s >= 75:
+        return "Possible Trade"
+    return None
+
+
+def _strength_display(strength):
+    """Bold, color-coded Discord label for a trade strength."""
+    return {"Strong Trade": "🟢 STRONG TRADE",
+            "Possible Trade": "🟡 POSSIBLE TRADE"}.get(strength, "🟡 POSSIBLE TRADE")
+
+
+def _edge_score_for_entry(entry):
+    """Authoritative Edge Score for a stored journal entry. Prefers the
+    transparent breakdown score, then the stored edge_score, then the strict
+    gate score, then the legacy edge score — so manual/legacy entries still
+    rank in recap and analytics."""
+    eb = entry.get("edge_breakdown") or {}
+    for v in (eb.get("score"), entry.get("edge_score"),
+              entry.get("strict_score"), entry.get("legacy_edge_score")):
+        try:
+            if v is not None:
+                return float(v)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _entry_trade_strength(entry):
+    """Trade strength for a stored entry: the explicit field if present, else
+    derived from its Edge Score (only when ≥75, i.e. an actual READY trade)."""
+    st = entry.get("trade_strength")
+    if st in ("Possible Trade", "Strong Trade"):
+        return st
+    return _trade_strength_from_score(_edge_score_for_entry(entry))
+
+
 def compute_edge_breakdown(a, entry):
     """Display-only Edge Score / Grade / Reasons / Risk for a READY setup.
 
@@ -2960,7 +3031,11 @@ def compute_edge_breakdown(a, entry):
     is read from the webhook payload — this is purely a Discord display layer and
     does not affect scoring, journaling, throttling, or the 5-min repost loop.
 
-    Returns {"score": int, "grade": str, "reasons": [str], "risks": [str]}.
+    Returns {"score": int, "grade": str,
+             "score_breakdown": [{"label": str, "points": int}],
+             "risk_adjustments": [{"label": str, "points": int}],
+             "reasons": [str], "risks": [str]}.  (reasons/risks kept for
+    backward compatibility — they mirror the breakdown/risk labels.)
     """
     direction = entry.get("direction", "Long")
     is_long   = direction != "Short"
@@ -2985,26 +3060,51 @@ def compute_edge_breakdown(a, entry):
     except (TypeError, ValueError):
         confidence = 0.0
 
-    reasons, score = [], 0
-    if has_bos:
-        reasons.append("BOS Demand" if is_long else "BOS Supply");                 score += 18
-    if has_choch:
-        reasons.append("Bullish CHOCH" if is_long else "Bearish CHOCH");           score += 18
-    if vwap_ok:
-        reasons.append("VWAP Reclaim" if is_long else "VWAP Rejection");           score += 14
-    if zone_active:
-        reasons.append("Demand Zone Active" if is_long else "Supply Zone Active");  score += 14
-    if trend_ok:
-        reasons.append("Bullish Trend" if is_long else "Bearish Trend");           score += 12
-    if has_sweep:
-        reasons.append("Liquidity Sweep");                                         score += 12
-    elif zone_reaction and not zone_mitig:
-        reasons.append("Confirmed Zone Reaction");                                 score += 12
-    if zone_mitig:
-        reasons.append("Zone Mitigated");                                          score += 8
-    score = max(0, min(100, score + round(confidence / 100.0 * 12)))
+    has_confirm = bool(conf.get("confirmation"))
 
-    risks = []
+    # ── Score breakdown ──────────────────────────────────────────────────────
+    # The 4 required gate conditions form the 75-point foundation — a READY trade
+    # has all four, so every READY trade is at least a 75 "Possible Trade". Bonus
+    # confluences push toward 100; risk adjustments pull back down.
+    breakdown = []
+    def _add(label, pts):
+        breakdown.append({"label": label, "points": pts})
+
+    if has_bos:
+        _add("BOS Demand" if is_long else "BOS Supply", 25)
+    if has_choch:
+        _add("Bullish CHOCH" if is_long else "Bearish CHOCH", 25)
+    if has_confirm:
+        _add("Confirmation Candle", 15)
+    if vwap_ok:
+        _add("VWAP Reclaim" if is_long else "VWAP Rejection", 10)
+
+    gate_pass = has_bos and has_choch and has_confirm and vwap_ok
+
+    # Bonus confluences (additive).
+    if has_sweep:
+        _add("Liquidity Sweep", 8)
+    elif zone_reaction and not zone_mitig:
+        _add("Confirmed Zone Reaction", 5)
+    if zone_active:
+        _add("Demand Zone Active" if is_long else "Supply Zone Active", 5)
+    if trend_ok:
+        _add("Bullish Trend" if is_long else "Bearish Trend", 4)
+    if zone_mitig:
+        _add("Zone Mitigated", 3)
+    try:
+        if confidence >= float(cfg("CONF_HIGH")):
+            _add("High Confidence", 6)
+        elif confidence >= float(cfg("CONF_TRADE")):
+            _add("Elevated Confidence", 3)
+    except (TypeError, ValueError):
+        pass
+
+    # ── Risk adjustments (subtract) ──────────────────────────────────────────
+    risk_adj = []
+    def _risk(label, pts):
+        risk_adj.append({"label": label, "points": -abs(pts)})
+
     risk_label = str(a.get("risk_label") or "")
     price = a.get("current_price")
     try:
@@ -3025,31 +3125,71 @@ def compute_edge_breakdown(a, entry):
         near_opposite = False
 
     if is_long and (near_opposite or risk_label in ("Testing Supply", "Approaching Supply")):
-        risks.append("Nearby Resistance")
+        _risk("Nearby Resistance", 4)
     if not is_long and (near_opposite or risk_label in ("Testing Demand", "Approaching Demand")):
-        risks.append("Nearby Support")
+        _risk("Nearby Support", 4)
     if a.get("overextended") or risk_label == "Overextended":
-        risks.append("Overextended from level")
+        _risk("Overextended from level", 3)
     if risk_label == "Choppy":
-        risks.append("Choppy conditions")
+        _risk("Choppy conditions", 3)
 
-    seen = set()
-    risks = [r for r in risks if not (r in seen or seen.add(r))]
+    # Dedup by label, preserving first occurrence.
+    def _dedup(items):
+        seen, out = set(), []
+        for it in items:
+            if it["label"] in seen:
+                continue
+            seen.add(it["label"])
+            out.append(it)
+        return out
+    breakdown = _dedup(breakdown)
+    risk_adj  = _dedup(risk_adj)
 
-    return {"score": score, "grade": _grade_for_score(score),
-            "reasons": reasons, "risks": risks}
+    raw   = sum(it["points"] for it in breakdown) + sum(it["points"] for it in risk_adj)
+    # compute_edge_breakdown only runs on READY setups. Floor any READY trade at 75
+    # so its Edge Score is always 75-100 and classifiable as Possible/Strong. We key
+    # off the actual READY verdict (not a re-derived gate) so the zone-mitigation path
+    # — which can pass the gate without a fresh BOS — is still floored correctly.
+    strict_label = str(entry.get("strict_label") or a.get("strict_label") or "")
+    is_ready = (strict_label in ("Strong Trade", "Possible Trade")
+                or str(entry.get("verdict") or a.get("verdict") or "").upper() == "READY")
+    floor = 75 if (gate_pass or is_ready) else 0
+    score = max(floor, min(100, raw))
+
+    return {
+        "score": score,
+        "grade": _grade_for_score(score),
+        "score_breakdown": breakdown,
+        "risk_adjustments": risk_adj,
+        # Backward-compatible plain-label lists (mirror the structured items).
+        "reasons": [it["label"] for it in breakdown],
+        "risks":   [it["label"] for it in risk_adj],
+    }
 
 
 def _render_edge_block_field(eb):
-    """Render the Edge Score / Grade / Reasons / Risk breakdown as one embed field."""
-    score   = eb.get("score", 0)
-    grade   = eb.get("grade", "—")
-    reasons = eb.get("reasons") or []
-    risks   = eb.get("risks") or []
-    lines  = [f"**Edge Score: {score} / 100**", f"**Grade: {grade}**", "", "**Reasons:**"]
-    lines += [f"✓ {r}" for r in reasons] if reasons else ["—"]
-    lines += ["", "**Risk:**"]
-    lines += [f"⚠️ {r}" for r in risks] if risks else ["✓ None detected"]
+    """Render the transparent Edge Score / Grade / Score Breakdown / Risk
+    Adjustments block as one embed field, with per-item point values."""
+    score     = eb.get("score", 0)
+    grade     = eb.get("grade", "—")
+    breakdown = eb.get("score_breakdown")
+    risk_adj  = eb.get("risk_adjustments")
+    # Fallback for legacy/plain-label breakdowns that carry no points.
+    if breakdown is None:
+        breakdown = [{"label": r, "points": None} for r in (eb.get("reasons") or [])]
+    if risk_adj is None:
+        risk_adj = [{"label": r, "points": None} for r in (eb.get("risks") or [])]
+
+    def _line(it):
+        pts = it.get("points")
+        if pts is None:
+            return f"• {it['label']}"
+        return f"{'+' if pts >= 0 else ''}{pts} {it['label']}"
+
+    lines  = [f"**Edge Score: {score} / 100**", f"**Grade: {grade}**", "", "**Score Breakdown:**"]
+    lines += [_line(it) for it in breakdown] if breakdown else ["—"]
+    lines += ["", "**Risk Adjustments:**"]
+    lines += [_line(it) for it in risk_adj] if risk_adj else ["None"]
     return {"name": "⚡ Edge Score", "value": "\n".join(lines)[:1024], "inline": False}
 
 
@@ -3099,6 +3239,10 @@ def compute_performance_stats(entries=None):
     gross_win = gross_loss = 0.0
     r_values = []
     cat = {c: {"win": 0, "loss": 0} for c in PERF_CATEGORIES}
+    strength_keys = ("Possible Trade", "Strong Trade")
+    strength = {k: {"win": 0, "loss": 0, "breakeven": 0,
+                    "gross_win": 0.0, "gross_loss": 0.0, "r": []}
+                for k in strength_keys}
 
     for e in entries:
         pnl   = e.get("pnl_dollars")
@@ -3118,6 +3262,22 @@ def compute_performance_stats(entries=None):
 
         r_values.append(_realized_r(e, state))
 
+        # Split by trade strength (Possible vs Strong).
+        st = _entry_trade_strength(e)
+        if st in strength:
+            b = strength[st]
+            if state == "win":
+                b["win"] += 1
+                if pnl is not None:
+                    b["gross_win"] += max(0.0, float(pnl))
+            elif state == "loss":
+                b["loss"] += 1
+                if pnl is not None:
+                    b["gross_loss"] += abs(min(0.0, float(pnl)))
+            else:
+                b["breakeven"] += 1
+            b["r"].append(_realized_r(e, state))
+
         if state in ("win", "loss"):
             for c in (e.get("setup_categories") or classify_setup_categories(e)):
                 if c in cat:
@@ -3128,6 +3288,18 @@ def compute_performance_stats(entries=None):
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
     avg_r = (sum(r_values) / len(r_values)) if r_values else None
 
+    by_strength = {}
+    for k, b in strength.items():
+        dec = b["win"] + b["loss"]
+        by_strength[k] = {
+            "wins": b["win"], "losses": b["loss"], "breakevens": b["breakeven"],
+            "decided": dec, "closed": dec + b["breakeven"],
+            "win_rate": (b["win"] / dec * 100.0) if dec else None,
+            "avg_r": (sum(b["r"]) / len(b["r"])) if b["r"] else None,
+            "gross_win": round(b["gross_win"], 2), "gross_loss": round(b["gross_loss"], 2),
+            "profit_factor": (b["gross_win"] / b["gross_loss"]) if b["gross_loss"] > 0 else None,
+        }
+
     return {
         "wins": wins, "losses": losses, "breakevens": breakevens,
         "decided": decided, "closed": wins + losses + breakevens,
@@ -3135,6 +3307,7 @@ def compute_performance_stats(entries=None):
         "gross_win": round(gross_win, 2), "gross_loss": round(gross_loss, 2),
         "profit_factor": profit_factor, "avg_r": avg_r,
         "categories": cat,
+        "by_strength": by_strength,
     }
 
 
@@ -3159,6 +3332,20 @@ def post_performance_stats(reason=""):
             cat_lines.append(f"{c}: {w}W / {l}L ({w / (w + l) * 100:.0f}%)")
     cat_text = "\n".join(cat_lines) or "No categorized results yet."
 
+    def _fmt_strength(k):
+        b = s.get("by_strength", {}).get(k)
+        if not b or b.get("closed", 0) == 0:
+            return f"{k}: —"
+        wr_b = f"{b['win_rate']:.0f}%" if b.get("win_rate") is not None else "—"
+        ar_b = f"{b['avg_r']:+.2f}R" if b.get("avg_r") is not None else "—"
+        if b.get("profit_factor") is not None:
+            pf_b = f"{b['profit_factor']:.2f}"
+        else:
+            pf_b = "∞" if b.get("gross_win", 0) > 0 else "—"
+        return (f"**{k}**: {b['wins']}W / {b['losses']}L / {b['breakevens']}BE\n"
+                f"WR {wr_b} · Avg {ar_b} · PF {pf_b}")
+    strength_text = "\n".join(_fmt_strength(k) for k in ("Possible Trade", "Strong Trade"))
+
     embed = {
         "color":  0x5865F2,
         "author": {"name": f"{BOT_NAME} · Performance"},
@@ -3171,6 +3358,7 @@ def post_performance_stats(reason=""):
             {"name": "Win Rate",       "value": wr,                   "inline": True},
             {"name": "Profit Factor",  "value": pf,                   "inline": True},
             {"name": "Avg R",          "value": avgr,                 "inline": True},
+            {"name": "🎯 By Trade Strength", "value": strength_text[:1024], "inline": False},
             {"name": "📊 By Setup Type", "value": cat_text[:1024],    "inline": False},
         ],
         "footer": {"text": "Session stats · in-memory, resets on restart"},
@@ -3249,7 +3437,17 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["setup_categories"] = classify_setup_categories(entry)
     entry["setup_notes"]      = build_setup_notes(a, entry)
     entry["trade_thesis"]     = build_trade_thesis(a, entry)
-    entry["edge_breakdown"]   = compute_edge_breakdown(a, entry)
+    # Transparent Edge Score is the authoritative READY-trade score: it drives the
+    # Possible/Strong strength label, the card/journal display, recap and analytics.
+    # The legacy bias-derived edge score is preserved for backward compatibility.
+    eb = compute_edge_breakdown(a, entry)
+    entry["edge_breakdown"]    = eb
+    entry["legacy_edge_score"] = entry.get("edge_score", 0)
+    entry["edge_score"]        = eb.get("score", entry.get("edge_score", 0))
+    entry["edge_grade"]        = eb.get("grade")
+    entry["score_breakdown"]   = eb.get("score_breakdown", [])
+    entry["risk_adjustments"]  = eb.get("risk_adjustments", [])
+    entry["trade_strength"]    = _trade_strength_from_score(entry["edge_score"]) or entry.get("strict_label")
     return entry
 
 
