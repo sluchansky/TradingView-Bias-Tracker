@@ -5,4 +5,5 @@
 - [Strict trade ruleset](strict-trade-ruleset.md) — strict 4-condition checklist is the authoritative full_analysis verdict; conflict check must stay VWAP-independent, score base 75, WAIT never journals, alert templates must include `ticker`.
 - [full_analysis return-path key parity](full-analysis-return-parity.md) — full_analysis() has 2 return dicts (main + zone-mitigated early return) that must keep identical keys; a missing key is a state-dependent 500 invisible to fresh tests.
 - [Tradovate live execution](tradovate-execution.md) — broker order path is gated so the public webhook can never auto-trade; OFF/DEMO defaults, rejection≠success, partial-fill & flatten-cancel safety invariants, never-log-secrets.
+- [Per-instrument dashboard view](per-instrument-dashboard-view.md) — MGC/MNQ tabs switch displayed analysis via /status?ticker → full_analysis(ticker_override); per-instrument price/VWAP/price-context invariants.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.

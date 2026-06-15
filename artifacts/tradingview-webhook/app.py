@@ -477,7 +477,13 @@ def calculate_edge_score(bias, confidence, strength):
 # Price context
 # ---------------------------------------------------------------------------
 
-def get_price_context():
+def get_price_context(inst=None):
+    """Build supply/demand levels and last-price-by-type from alert history.
+
+    When `inst` ("MGC"/"MNQ") is given, only that instrument's alerts contribute,
+    so nearest levels / structure / trade-plan anchors stay instrument-coherent.
+    Zone types are instrument-prefixed; BOS/CHOCH carry no prefix so the record
+    ticker decides, and unprefixed/untickered alerts are treated as shared."""
     last_price_by_type = {}
     all_supply_prices  = []
     all_demand_prices  = []
@@ -486,6 +492,15 @@ def get_price_context():
         p = alert.get("price")
         if t not in ALERT_TYPES or p is None:
             continue
+        if inst is not None:
+            if "MNQ" in t or "MGC" in t:
+                a_inst = "MNQ" if "MNQ" in t else "MGC"
+            elif alert.get("ticker"):
+                a_inst = instrument_of(alert.get("ticker"))
+            else:
+                a_inst = None  # shared (no prefix, no ticker) — count for either
+            if a_inst is not None and a_inst != inst:
+                continue
         try:
             price = float(p)
         except (ValueError, TypeError):
@@ -2181,7 +2196,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
     quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
     edge_score               = calculate_edge_score(bias, confidence, strength)
 
-    last_price_by_type, all_supply, all_demand = get_price_context()
+    last_price_by_type, all_supply, all_demand = get_price_context(active_ticker)
     current_price = current_price_override if current_price_override is not None else current_price_for(active_ticker)
     nearest_supply, nearest_demand = get_nearest_levels(current_price, all_supply, all_demand)
 
@@ -3154,6 +3169,7 @@ def clear_alerts():
     global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES, ZONE_MITIGATED_FLAG, JOURNAL_KEYS
     ALERT_HISTORY.clear()
     CURRENT_PRICE       = None
+    CURRENT_PRICE_BY_TICKER.clear()
     ZONE_BROKEN_AT      = None
     MITIGATED_PRICES    = []
     ZONE_MITIGATED_FLAG = False
