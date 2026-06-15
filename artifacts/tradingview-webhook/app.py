@@ -53,6 +53,7 @@ ACTIVE_TRADE     = None
 # concurrent ENTER requests can never both open a live broker position.
 _ENTER_LOCK      = threading.Lock()
 LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
+LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live card sent (UTC)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
 ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
@@ -200,6 +201,9 @@ def _discord_url(hint: str = "") -> str:
 
 
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (default 5 min)
+# Recurring "trade ready" alert: re-post the clean card every 5 min while a setup
+# is READY (in addition to the instant alert on the triggering webhook).
+TRADE_READY_INTERVAL = int(os.environ.get("TRADE_READY_INTERVAL", 300))  # seconds (default 5 min)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 
 # ── Automatic VWAP fetch ──────────────────────────────────────────────────────
@@ -2437,6 +2441,23 @@ def send_journal_discord_embed(entry):
         logger.warning("DISCORD_JOURNAL_WEBHOOK_URL not set — journal Discord post skipped")
         return
 
+    embed = _build_trade_card_embed(entry, f"Journal Entry #{entry['id']}")
+
+    try:
+        resp = requests.post(
+            DISCORD_JOURNAL_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code not in (200, 204):
+            logger.warning("Journal Discord post failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("Journal Discord post error: %s", exc)
+
+
+def _build_trade_card_embed(entry, footer_text):
+    """Build the clean trade-card embed shared by the journal channel and the
+    live alert channel. `entry` is the dict produced by _build_card_entry()."""
     direction_emoji = "📈" if entry["direction"] == "Long" else "📉"
     label           = entry.get("strict_label", "Possible Trade")
     color           = 0x2ECC71 if label == "Strong Trade" else 0x00B0FF
@@ -2462,38 +2483,80 @@ def send_journal_discord_embed(entry):
     if len(why_text) > 1000:
         why_text = why_text[:1000] + "…"
 
-    embed = {
+    return {
         "author":      {"name": f"{BOT_NAME} · {label} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
         "description": f"**{label}**  ·  Verdict: **{entry['verdict']}**",
         "color":       color,
         "timestamp":   entry["datetime"],
         "fields": [
-            {"name": "📊 Instrument",          "value": entry["symbol"],              "inline": True},
+            {"name": "📊 Instrument",          "value": _val(entry.get("symbol")),    "inline": True},
             {"name": "🕐 Time",                "value": entry["datetime"][:19].replace("T", " ") + " UTC", "inline": True},
             {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
             {"name": "🏗️ BOS Type",            "value": _typed(entry.get("bos_type"), entry.get("bos_level")), "inline": True},
             {"name": "🔀 CHOCH Type",          "value": _typed(entry.get("choch_type"), entry.get("choch_level")), "inline": True},
-            {"name": "📐 Entry",               "value": _val(entry["entry_zone"]),    "inline": True},
-            {"name": "🛑 Stop",                "value": _val(entry["stop_loss"]),     "inline": True},
-            {"name": "🎯 TP1",                 "value": _val(entry["target1"]),       "inline": True},
-            {"name": "🎯 TP2",                 "value": _val(entry["target2"]),       "inline": True},
+            {"name": "📐 Entry",               "value": _val(entry.get("entry_zone")), "inline": True},
+            {"name": "🛑 Stop",                "value": _val(entry.get("stop_loss")),  "inline": True},
+            {"name": "🎯 TP1",                 "value": _val(entry.get("target1")),    "inline": True},
+            {"name": "🎯 TP2",                 "value": _val(entry.get("target2")),    "inline": True},
             {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
             {"name": "💬 Why the Trade Qualifies", "value": why_text,                 "inline": False},
         ],
-        "footer": {"text": f"Journal Entry #{entry['id']}"},
+        "footer": {"text": footer_text},
     }
 
+
+def send_live_ready_card(entry, ticker=""):
+    """Post the clean trade-card to the LIVE alert channel when a setup is READY.
+    Routed per-instrument via _discord_url() (MNQ → MNQ channel, else default)."""
+    url = _discord_url(ticker or entry.get("symbol", ""))
+    if not url:
+        logger.warning("DISCORD_WEBHOOK_URL not set — live ready card skipped")
+        return
+    footer = f"Live Signal · {entry.get('symbol') or ticker or '—'}"
+    embed  = _build_trade_card_embed(entry, footer)
+    # Record the send time per-instrument so the periodic loop throttles against it
+    # (prevents an instant card and a periodic card landing seconds apart).
+    LAST_LIVE_CARD_AT[instrument_of(ticker or entry.get("symbol", ""))] = datetime.now(timezone.utc)
     try:
-        resp = requests.post(
-            DISCORD_JOURNAL_WEBHOOK_URL,
-            json={"embeds": [embed]},
-            timeout=10,
-        )
+        resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
         if resp.status_code not in (200, 204):
-            logger.warning("Journal Discord post failed: %s %s", resp.status_code, resp.text[:200])
+            logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        logger.error("Journal Discord post error: %s", exc)
+        logger.error("Live ready card post error: %s", exc)
+
+
+def _trade_ready_loop():
+    """Every TRADE_READY_INTERVAL seconds, re-evaluate each instrument and re-post
+    the clean trade-card to the live alert channel while a setup stays READY.
+
+    This is the recurring "update every 5 min" companion to the instant alert
+    fired from the webhook. It posts only on READY verdicts and stays silent
+    while a trade is already active (lifecycle alerts cover that case).
+    """
+    try:
+        if not ACTIVE_TRADE:
+            now = datetime.now(timezone.utc)
+            for inst in ("MGC", "MNQ"):
+                # Throttle: skip if a card (instant or periodic) was sent for this
+                # instrument within the last TRADE_READY_INTERVAL seconds.
+                last = LAST_LIVE_CARD_AT.get(inst)
+                if last and (now - last).total_seconds() < TRADE_READY_INTERVAL:
+                    continue
+                try:
+                    a = full_analysis(ticker_override=inst)
+                except Exception as exc:
+                    logger.error("trade-ready loop analysis error (%s): %s", inst, exc)
+                    continue
+                # Re-check ACTIVE_TRADE just before sending (it may have changed
+                # while full_analysis ran).
+                if not ACTIVE_TRADE and a.get("verdict") in ("LONG READY", "SHORT READY"):
+                    entry = _build_card_entry(a, ticker=f"{inst}1!")
+                    send_live_ready_card(entry, inst)
+    except Exception as exc:  # never let the loop die
+        logger.warning("trade-ready loop error: %s", exc)
+    finally:
+        threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()
 
 
 def _update_journal_outcome(new_outcome, pnl_dollars=None):
@@ -2530,20 +2593,20 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None):
     return None
 
 
-def create_journal_entry(record, a, sizing):
-    """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates."""
-    global JOURNAL, JOURNAL_KEYS
+def _build_card_entry(a, ticker=None, record=None):
+    """Build the trade-card dict (single source of truth for both the journal
+    entry and the live alert card) from a full_analysis() result `a`.
 
-    strict_label = a.get("strict_label", "WAIT")
-    if strict_label not in ("Strong Trade", "Possible Trade"):
-        return None
-
+    `record` (incoming webhook) preserves the exact ticker (e.g. "MNQ1!");
+    `ticker` is used by the periodic loop where no webhook record exists.
+    """
+    record     = record or {}
     tp         = a.get("trade_plan") or {}
     direction  = a.get("strict_direction") or tp.get("direction") or "Long"
     inst       = (tp.get("instrument") or a.get("active_ticker")
-                  or instrument_of(record.get("ticker") or record.get("alert_type", "")))
+                  or instrument_of(record.get("ticker") or ticker or record.get("alert_type", "")))
     # Preserve exact ticker (e.g. "MNQ1!") when supplied, else the normalized symbol.
-    ticker     = record.get("ticker") or inst
+    symbol     = record.get("ticker") or ticker or inst
     entry_zone = tp.get("entry_zone")
 
     # BOS / CHOCH levels from the most recent same-side structure alerts.
@@ -2555,27 +2618,13 @@ def create_journal_entry(record, a, sizing):
         bos_level, choch_level = lpt.get("BOS SUPPLY"), lpt.get("CHOCH SUPPLY")
         bos_type,  choch_type  = "Supply", "Bearish"
 
-    # Dedup key: instrument + direction + entry-zone low rounded to nearest integer.
-    try:
-        zone_key = round(float(str(entry_zone).split("–")[0]), 0) if entry_zone else 0.0
-    except (TypeError, ValueError):
-        zone_key = 0.0
-    dedup_key = (instrument_of(ticker), direction, zone_key)
-
-    if dedup_key in JOURNAL_KEYS:
-        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, direction, zone_key)
-        return None
-
-    JOURNAL_KEYS.add(dedup_key)
-
-    rc = a.get("reasoning_chain") or []
-    entry = {
-        "id":               len(JOURNAL) + 1,
+    return {
         "datetime":         datetime.now(timezone.utc).isoformat(),
-        "symbol":           ticker,
+        "symbol":           symbol,
+        "instrument":       inst,
         "direction":        direction,
         "setup_stage":      a.get("setup_stage", "Trade Ready"),
-        "strict_label":     strict_label,
+        "strict_label":     a.get("strict_label", "WAIT"),
         "strict_score":     a.get("strict_score", 0),
         "verdict":          a.get("verdict", "WAIT"),
         "entry_zone":       entry_zone,
@@ -2593,11 +2642,40 @@ def create_journal_entry(record, a, sizing):
         "edge_score":       a.get("edge_score", 0),
         "market_structure": a.get("structure_label", "—"),
         "risk_zone":        a.get("risk_label", "—"),
-        "reasoning_chain":  rc,
+        "reasoning_chain":  a.get("reasoning_chain") or [],
         "why":              a.get("why", "—"),
-        "screenshot":       "[ Screenshot placeholder — add URL or image link ]",
-        "outcome":          "Pending",
     }
+
+
+def create_journal_entry(record, a, sizing):
+    """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates."""
+    global JOURNAL, JOURNAL_KEYS
+
+    strict_label = a.get("strict_label", "WAIT")
+    if strict_label not in ("Strong Trade", "Possible Trade"):
+        return None
+
+    entry      = _build_card_entry(a, record=record)
+    ticker     = entry["symbol"]
+    direction  = entry["direction"]
+    entry_zone = entry["entry_zone"]
+
+    # Dedup key: instrument + direction + entry-zone low rounded to nearest integer.
+    try:
+        zone_key = round(float(str(entry_zone).split("–")[0]), 0) if entry_zone else 0.0
+    except (TypeError, ValueError):
+        zone_key = 0.0
+    dedup_key = (instrument_of(ticker), direction, zone_key)
+
+    if dedup_key in JOURNAL_KEYS:
+        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, direction, zone_key)
+        return None
+
+    JOURNAL_KEYS.add(dedup_key)
+
+    entry["id"]         = len(JOURNAL) + 1
+    entry["screenshot"] = "[ Screenshot placeholder — add URL or image link ]"
+    entry["outcome"]    = "Pending"
 
     JOURNAL.insert(0, entry)
     if len(JOURNAL) > 500:
@@ -2969,8 +3047,7 @@ def webhook():
                       else 1.0)
         sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
 
-    # ── Active trade: check events, build embed field ──
-    ati = None
+    # ── Active trade: check events (T1 / T2 / Stop lifecycle alerts) ──
     if ACTIVE_TRADE and parsed_price is not None:
         events = check_trade_events(ACTIVE_TRADE, parsed_price)
         for event in events:
@@ -2990,34 +3067,18 @@ def webhook():
                 _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
                 ACTIVE_TRADE = None
                 break
-        if ACTIVE_TRADE:
-            ati = active_trade_field(ACTIVE_TRADE, parsed_price)
 
-    send_discord_message(
-        record,
-        a["bias"], a["strength"], a["bullish"], a["bearish"],
-        a["confidence"], a["quality"], a["edge_score"],
-        a["recommendation"], a["verdict"], a["reasoning_chain"], a["why"], a["plan"],
-        a["setup_stage"], a["stage_next_step"], a["stage_entry_rule"], a["stage_invalidation"],
-        a["market_direction"], a["trade_opportunity"], a["opportunity_reason"],
-        a["entry_trigger"], a["invalidation"], a["trade_plan"], sizing,
-        a["structure_label"], a["structure_class"], a["structure_detail"],
-        a["nearest_supply"], a["nearest_demand"],
-        a["risk_label"], a["risk_detail"],
-        a["last_price_by_type"],
-        ati,
-        zone_broken_active=a.get("zone_broken_active", False),
-        zone_mitigated_near=a.get("zone_mitigated_near", False),
-        mitigated_zone_price=a.get("mitigated_zone_price"),
-        strict_label=a.get("strict_label", "WAIT"),
-        strict_score=a.get("strict_score", 0),
-        confluences=a.get("confluences"),
-        vwap_value=a.get("vwap_value"),
-        vwap_status=a.get("vwap_status", "n/a"),
-    )
-
-    # ── Trading Journal ───────────────────────────────────────────────────────
-    create_journal_entry(record, a, sizing)
+    # ── Trading Journal + live alert ───────────────────────────────────────────
+    # The main alert channel now receives the same clean trade-card as the
+    # journal, but ONLY when a brand-new setup is READY. create_journal_entry()
+    # returns the entry just once per setup (deduped), so this fires the instant
+    # alert exactly once on the triggering webhook; _trade_ready_loop() then
+    # re-posts the card every 5 min while the setup stays READY.
+    journal_entry = create_journal_entry(record, a, sizing)
+    if (journal_entry and not ACTIVE_TRADE
+            and a.get("verdict") in ("LONG READY", "SHORT READY")):
+        send_live_ready_card(journal_entry,
+                             record.get("ticker") or journal_entry.get("instrument"))
 
     logger.info(
         "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
@@ -4070,5 +4131,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL
+    threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()  # re-post READY card every 5 min
     _schedule_eod()                               # schedule daily EOD summary
     app.run(host="0.0.0.0", port=port, debug=False)
