@@ -19,13 +19,17 @@ gate, alerts, throttling, or the 5-min repost loop.
   absent (legacy/manual entries).
 - Score = gate base + bonuses − risks, then floored/clamped to 75–100 on READY.
   Gate base (the 4 required conditions): BOS +25, CHOCH +25, Confirmation +15,
-  VWAP +10 = 75. Bonuses (additive): Sweep +8 OR Confirmed-Zone-Reaction +5 (mutually
-  exclusive), Zone Active +5, Trend +4, Zone Mitigated +3, High/Elevated Confidence
-  +6/+3. Risks SUBTRACT: Nearby Resistance/Support −4, Overextended −3, Choppy −3.
+  VWAP +10 = 75. Bonuses (additive): Sweep +8 AND/OR Confirmed-Zone-Reaction +5
+  (INDEPENDENT — a sweep and a zone-confirmed are distinct alerts and both may credit;
+  earlier code wrongly treated them as mutually exclusive), Zone Active +5, Trend +4,
+  Zone Mitigated +3, High/Elevated Confidence +6/+3. Risks SUBTRACT: Nearby
+  Resistance/Support −4, Overextended −3, Choppy −3. NOTE: the +15 "Confirmation Candle"
+  is credited only for a real 5m candle (`confirmation_candle`); a mitigation READY met
+  by a zone-confirmed gets no +15 but is floored to 75 (see reaction rule below).
 - Trade strength is a pure sub-classification of the Edge Score: Possible = 75–89,
   Strong = 90–100. The gate still decides READY/WAIT; strength only ranks a READY trade.
 
-## The three durable rules
+## The durable rules
 
 **Floor off the actual READY verdict, NOT a re-derived gate.** `compute_edge_breakdown`
 runs ONLY on READY setups, so any READY trade must be floored to 75 (→ always 75–100,
@@ -41,10 +45,25 @@ Score." Caught in review on this exact path.
 path should read the stored verdict, not recompute the gate conditions.
 
 **Never fabricate a signal label.** A reason label must map to something the app actually
-produces. The zone/sweep bonus shows "Liquidity Sweep" ONLY when a real sweep flag is set
-(`confluences.liquidity_sweep` / `confluences.sweep` / `a["liquidity_sweep"]`); otherwise
-it shows "Confirmed Zone Reaction" from `zone_confirmed`. The two are mutually exclusive.
-An earlier version mislabeled `zone_confirmed` itself as "Liquidity Sweep" and was rejected.
+produces. The bonus shows "Liquidity Sweep" ONLY when a real sweep flag is set
+(`confluences.liquidity_sweep` / `confluences.sweep` / `a["liquidity_sweep"]`), and shows
+"Confirmed Zone Reaction" from `zone_confirmed`. These are INDEPENDENT — both can appear on
+one card — NOT mutually exclusive. An earlier version mislabeled `zone_confirmed` itself as
+"Liquidity Sweep" and was rejected.
+
+**Reaction-satisfied (`confirmation`) ≠ real 5m candle (`confirmation_candle`).** The READY
+gate's reaction requirement is met by a genuine 5m confirmation candle OR — on the mitigation
+path — by a DEMAND/SUPPLY ZONE CONFIRMED alert. `_confluences()` emits BOTH `confirmation`
+(reaction satisfied; drives the gate) and `confirmation_candle` (a real candle only; defaults
+to `confirmation` for legacy dicts). The Edge Score credits "Confirmation Candle" +15 ONLY
+from `confirmation_candle`, and "Confirmed Zone Reaction" +5 from `zone_confirmed`, so a
+zone-confirmed reaction is counted ONCE as a zone reaction and never as a phantom candle;
+READY + Edge Score + the strict checklist all name the same event.
+**Why:** the mitigation path once set `confirmation = has_bull_confirm OR mitigation_long_confirmed`,
+so a zone-confirmed READY scored a phantom +15 candle AND suppressed the real zone-reaction
+credit (and `/why` even told the user to "Add confluence: Confirmed Zone Reaction" while it
+was present). **How to apply:** keep gate-satisfaction flags separate from "what literally
+fired" flags whenever one requirement can be met by multiple distinct events; credit each once.
 
 **This app is alert-driven — it has NO OHLC/candle history.** All structure (BOS, CHOCH,
 zone confirmed, confirmations, liquidity sweeps) arrives as TradingView webhook alerts in

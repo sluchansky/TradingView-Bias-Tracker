@@ -265,7 +265,7 @@ same breakdown so the card/journal can never diverge from `/status`.
   | Confluence | Points |
   | --- | --- |
   | Liquidity Sweep | +8 |
-  | Confirmed Zone Reaction (no sweep, not mitigated) | +5 |
+  | Confirmed Zone Reaction | +5 |
   | Demand/Supply Zone Active | +5 |
   | Trend Alignment | +4 |
   | Zone Mitigated (confirmed retest) | +3 |

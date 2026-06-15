@@ -1,0 +1,115 @@
+NEXT UPGRADE FOR AI TRADING PARTNER
+
+Add priority trading session focus windows in Eastern Time.
+
+Trading focus windows:
+
+1. Morning NY Session:
+    8:00 AM – 11:00 AM Eastern
+2. Evening Session:
+    8:00 PM – 11:00 PM Eastern
+3. Early Morning / London-to-NY Prep:
+    5:00 AM – 8:00 AM Eastern
+
+Requirements:
+
+1. SESSION AWARENESS
+
+The bot should know whether the current time is inside or outside one of the focus windows.
+
+Use Eastern Time for all session logic.
+
+2. SESSION LABELS
+
+Add a session label to READY alerts, journal entries, /status, /why, daily recap, and weekly report.
+
+Labels:
+
+* Early Morning Session: 5:00 AM – 8:00 AM ET
+* NY Morning Session: 8:00 AM – 11:00 AM ET
+* Evening Session: 8:00 PM – 11:00 PM ET
+* Outside Focus Window
+
+3. EDGE SCORE SESSION BONUS
+
+If a READY setup occurs inside one of the focus windows, add a small session bonus to the Edge Score.
+
+Suggested:
+
++5 Inside Focus Window
+
+Do not allow this to push a bad setup through the READY gate. The setup must still pass all normal READY requirements first.
+
+4. OUTSIDE WINDOW HANDLING
+
+Outside the focus windows, do not break alerts.
+
+Instead, label the trade clearly:
+
+Outside Focus Window
+
+Optional:
+Reduce Edge Score by -5 outside focus windows.
+
+Do not fully block alerts unless I choose to enable strict mode later.
+
+5. DISCORD DISPLAY
+
+Add this to the Discord card:
+
+Session:
+NY Morning Session / Early Morning Session / Evening Session / Outside Focus Window
+
+Session Score:
++5 Inside Focus Window
+or
+-5 Outside Focus Window
+
+6. ANALYTICS
+
+Track performance by session:
+
+* Early Morning Session
+* NY Morning Session
+* Evening Session
+* Outside Focus Window
+
+For each session track:
+
+* Total trades
+* Wins
+* Losses
+* Breakevens
+* Win Rate
+* Average R
+* Profit Factor
+* Best setup
+* Worst setup
+
+7. RECAPS
+
+Daily recap should include:
+
+* Trades by session
+* Best session
+* Worst session
+* Highest Edge Score by session
+
+Weekly report should include:
+
+* Session performance breakdown
+* Best trading window
+* Worst trading window
+* Recommendation on which session to focus on based on actual performance
+
+8. SAFETY RULES
+
+Do not change webhook parsing.
+Do not change TradingView alert messages.
+Do not change existing READY gate logic.
+Do not remove existing alerts.
+Do not remove throttling.
+Do not remove 5-minute repost logic.
+Do not block outside-window trades yet.
+Do not require new TradingView alerts.
+This is an additive session-awareness upgrade only.

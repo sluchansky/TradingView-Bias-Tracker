@@ -1743,10 +1743,19 @@ def _strict_checklist_field(strict_label, strict_score, confluences,
         vwap_txt = f"— ({vwap_status})"
 
     side_word = "below" if is_short else "above"
+    # The reaction requirement is satisfied by a genuine 5m candle OR — on the
+    # mitigation path — by a zone-confirmed alert. Name the SAME confirmation
+    # event the Edge Score credits, so READY and Edge Score never disagree.
+    reaction_ok     = bool(c.get("confirmation"))
+    has_real_candle = bool(c.get("confirmation_candle", c.get("confirmation")))
+    if reaction_ok and not has_real_candle:
+        reaction_line = f"{_mark(True)} Confirmed zone reaction"
+    else:
+        reaction_line = f"{_mark(reaction_ok)} 5m {'bearish' if is_short else 'bullish'} confirmation candle"
     lines = [
         f"{_mark(c.get('bos'))} BOS {'Supply' if is_short else 'Demand'}",
         f"{_mark(c.get('choch'))} {'Bearish' if is_short else 'Bullish'} CHOCH",
-        f"{_mark(c.get('confirmation'))} 5m {'bearish' if is_short else 'bullish'} confirmation candle",
+        reaction_line,
         f"{_mark(c.get('vwap'))} Price {side_word} VWAP  ·  VWAP {vwap_txt}",
     ]
     label_emoji = {"A+ Setup": "🔥", "Strong Trade": "🟢", "Possible Trade": "🟡"}.get(strict_label, "⏸")
@@ -2438,12 +2447,19 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     long_gate    = (long_struct or mitigation_long_confirmed) and price_above
     short_gate   = short_struct and price_below
 
-    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf, liq_sweep=False, zone_mitigated=False):
+    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf,
+                     liq_sweep=False, zone_mitigated=False, confirmation_candle=None):
+        # `confirmation` = reaction requirement satisfied — which the mitigation path
+        # lets a zone-confirmed alert meet WITHOUT a 5m candle. `confirmation_candle`
+        # = a GENUINE 5m candle only, so the Edge Score never credits a phantom candle
+        # for a zone-confirmed reaction. Defaults to `confirmation` for callers that
+        # do not distinguish the two (legacy parity).
         return {
             "direction":     direction,
             "bos":           bool(has_bos),
             "choch":         bool(has_choch),
             "confirmation":  bool(has_confirm),
+            "confirmation_candle": bool(has_confirm if confirmation_candle is None else confirmation_candle),
             "vwap":          bool(vwap_side),
             "vwap_status":   vwap_status,
             "vwap_value":    vwap,
@@ -2490,7 +2506,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "direction": "Long", "score": score,
             "confluences": _confluences("Long", has_bos_demand, has_choch_demand,
                                         has_bull_confirm or mitigation_long_confirmed, True, has_dem_confirm,
-                                        has_bull_sweep, zone_mitigated=mitigation_long_confirmed),
+                                        has_bull_sweep, zone_mitigated=mitigation_long_confirmed,
+                                        confirmation_candle=has_bull_confirm),
             "reason": reason,
             "missing": [],
         }
@@ -2500,7 +2517,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         return {
             "label": "Strong Trade" if score >= 90 else "Possible Trade",
             "direction": "Short", "score": score,
-            "confluences": _confluences("Short", True, True, True, True, has_sup_confirm, has_bear_sweep),
+            "confluences": _confluences("Short", True, True, True, True, has_sup_confirm, has_bear_sweep,
+                                        confirmation_candle=has_bear_confirm),
             "reason": "Short confirmed — BOS supply, bearish CHOCH, 5m bearish candle, price below VWAP.",
             "missing": [],
         }
@@ -3736,8 +3754,10 @@ def compute_edge_breakdown(a, entry):
     zone_active = "intact" in str(entry.get("supply_demand_zone") or "").lower()
     # "Liquidity Sweep" shows only when a real sweep alert was received from
     # TradingView (confluences.liquidity_sweep, set in evaluate_strict_setup from a
-    # BULLISH/BEARISH SWEEP alert). With no sweep alert we fall back to the genuine
-    # signal we do have — a confirmed zone reaction. Never fabricate a sweep.
+    # BULLISH/BEARISH SWEEP alert). "Confirmed Zone Reaction" reflects a
+    # demand/supply-zone-confirmed alert — the SAME event the READY gate accepts as its
+    # reaction requirement. They are distinct TradingView events, so each is credited on
+    # its own; neither is ever fabricated.
     has_sweep     = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
     zone_reaction = bool(conf.get("zone_confirmed"))
     zone_mitig    = bool(conf.get("zone_mitigated"))
@@ -3749,6 +3769,10 @@ def compute_edge_breakdown(a, entry):
         confidence = 0.0
 
     has_confirm = bool(conf.get("confirmation"))
+    # A GENUINE 5m confirmation candle only — NOT the mitigation path's zone-confirmed
+    # substitute (which sets `confirmation` true without a candle). Falls back to
+    # `confirmation` for legacy entries that carry no explicit candle flag.
+    has_real_candle = bool(conf.get("confirmation_candle", conf.get("confirmation")))
 
     # ── Score breakdown ──────────────────────────────────────────────────────
     # The 4 required gate conditions form the 75-point foundation — a READY trade
@@ -3762,17 +3786,22 @@ def compute_edge_breakdown(a, entry):
         _add("BOS Demand" if is_long else "BOS Supply", 25)
     if has_choch:
         _add("Bullish CHOCH" if is_long else "Bearish CHOCH", 25)
-    if has_confirm:
+    if has_real_candle:
         _add("Confirmation Candle", 15)
     if vwap_ok:
         _add("VWAP Reclaim" if is_long else "VWAP Rejection", 10)
 
     gate_pass = has_bos and has_choch and has_confirm and vwap_ok
 
-    # Bonus confluences (additive).
+    # Bonus confluences (additive). A liquidity sweep and a confirmed zone reaction are
+    # distinct events, so each is credited independently. The zone-confirmed reaction is
+    # ALWAYS credited when present — including on a mitigated zone, where it is exactly
+    # what satisfied the READY gate's reaction requirement — and ONLY here, never as a
+    # phantom Confirmation Candle, so READY and the Edge Score agree on the same
+    # confirmation event and count it once.
     if has_sweep:
         _add("Liquidity Sweep", 8)
-    elif zone_reaction and not zone_mitig:
+    if zone_reaction:
         _add("Confirmed Zone Reaction", 5)
     if zone_active:
         _add("Demand Zone Active" if is_long else "Supply Zone Active", 5)
