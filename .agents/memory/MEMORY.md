@@ -2,7 +2,7 @@
 
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404 before reaching Flask; how to debug 404s on this stack.
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); invariants (SWING unchanged, Attempts reduced-size at every sizing site, MGC/MNQ string symmetry) any scoring change must keep.
-- [Strict trade ruleset](strict-trade-ruleset.md) — strict 4-condition checklist is the authoritative full_analysis verdict; conflict check must stay VWAP-independent, score base 75, WAIT never journals, alert templates must include `ticker`.
+- [Strict trade ruleset](strict-trade-ruleset.md) — strict 4-condition checklist is the authoritative full_analysis verdict; conflict check stays VWAP-independent, score base 75, WAIT never journals; webhook instrument resolution is ticker-authoritative and rejects unresolvable/contradictory alerts (never silent-MGC).
 - [full_analysis single return path](full-analysis-return-parity.md) — one return dict now; hard-indexed consumers make a missing key a state-dependent 500; mirror keys if an early return is re-added.
 - [Zone Mitigated detection](zone-mitigated-detection.md) — ZONE_MITIGATED_FLAG is GLOBAL & cleared by any structure-reset; gate derived signals on per-instrument proximity AND the flag or MGC/MNQ analysis bleeds.
 - [ET display vs UTC storage](timezone-display-et.md) — timestamps stored UTC, displayed in America/New_York via fmt_et(); Discord embeds' native `timestamp` field must stay ISO-UTC (Discord localizes per viewer).

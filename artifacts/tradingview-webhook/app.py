@@ -167,8 +167,72 @@ INSTRUMENT_SPECS = {
 }
 
 def instrument_of(ticker):
-    """Normalize any raw ticker (e.g. 'MNQ1!', 'MGC') to 'MNQ' or 'MGC'."""
+    """Normalize any raw ticker (e.g. 'MNQ1!', 'MGC') to 'MNQ' or 'MGC'.
+
+    NOTE: this is the *lenient* legacy normalizer — anything that does not
+    contain 'MNQ' (including None/empty/unknown) silently becomes 'MGC'. It is
+    safe only for display/legacy fallbacks. For ingesting a TradingView alert
+    use resolve_instrument(), which is ticker-first and never silently defaults.
+    """
     return "MNQ" if "MNQ" in str(ticker or "").upper() else "MGC"
+
+def _instrument_from_text(value):
+    """Return 'MNQ'/'MGC' iff `value` unambiguously names exactly one of them,
+    else None (neither present, or — defensively — both present)."""
+    s = str(value or "").upper()
+    has_mnq, has_mgc = "MNQ" in s, "MGC" in s
+    if has_mnq and not has_mgc:
+        return "MNQ"
+    if has_mgc and not has_mnq:
+        return "MGC"
+    return None
+
+def resolve_instrument(ticker_field, alert_type):
+    """Authoritative instrument resolution for an incoming TradingView alert.
+
+    The payload `ticker` field is the source of truth; the alert title is
+    consulted ONLY when the ticker field is absent. Guarantees:
+      • MGC tickers always resolve to MGC, MNQ tickers always resolve to MNQ.
+      • Title parsing is never used when a usable ticker field is present.
+      • Nothing silently defaults to MGC — unresolvable alerts are rejected.
+
+    Returns a dict:
+      instrument     : 'MGC' | 'MNQ' | None   (None ⇒ caller must reject)
+      source         : 'ticker' | 'title' | None
+      ticker_present : bool
+      ok             : bool                    (False ⇒ reject the alert)
+      error          : str | None              (human-readable reject reason)
+    """
+    ticker_present = bool(str(ticker_field or "").strip())
+    from_ticker    = _instrument_from_text(ticker_field)
+    from_title     = _instrument_from_text(alert_type)
+
+    # 1) Ticker field present and recognized → authoritative.
+    if from_ticker is not None:
+        if from_title is not None and from_title != from_ticker:
+            return {"instrument": None, "source": "ticker", "ticker_present": True,
+                    "ok": False,
+                    "error": (f"ticker '{ticker_field}' ({from_ticker}) contradicts "
+                              f"alert title '{alert_type}' ({from_title})")}
+        return {"instrument": from_ticker, "source": "ticker",
+                "ticker_present": True, "ok": True, "error": None}
+
+    # 2) Ticker field present but unrecognized (neither MGC nor MNQ) → reject.
+    if ticker_present:
+        return {"instrument": None, "source": "ticker", "ticker_present": True,
+                "ok": False, "error": f"unrecognized ticker '{ticker_field}'"}
+
+    # 3) No ticker field → fall back to the title prefix (allowed only when the
+    #    ticker is unavailable). Instrument-prefixed alert types resolve here.
+    if from_title is not None:
+        return {"instrument": from_title, "source": "title",
+                "ticker_present": False, "ok": True, "error": None}
+
+    # 4) Shared alert (BOS/CHOCH) with no ticker → genuinely unresolvable.
+    return {"instrument": None, "source": None, "ticker_present": False,
+            "ok": False,
+            "error": ("missing ticker field on a shared alert — BOS/CHOCH carry "
+                      "no instrument in the title and cannot be attributed")}
 
 def spec_for(ticker):
     return INSTRUMENT_SPECS[instrument_of(ticker)]
@@ -578,13 +642,13 @@ def get_price_context(inst=None):
         if t not in ALERT_TYPES or p is None:
             continue
         if inst is not None:
-            if "MNQ" in t or "MGC" in t:
-                a_inst = "MNQ" if "MNQ" in t else "MGC"
-            elif alert.get("ticker"):
-                a_inst = instrument_of(alert.get("ticker"))
-            else:
-                a_inst = None  # shared (no prefix, no ticker) — count for either
-            if a_inst is not None and a_inst != inst:
+            # Prefer the instrument resolved at ingestion; fall back to title/ticker
+            # parsing only for legacy records. Shared alerts that can't be attributed
+            # are excluded rather than counted for both instruments.
+            a_inst = (alert.get("instrument")
+                      or _instrument_from_text(t)
+                      or _instrument_from_text(alert.get("ticker")))
+            if a_inst != inst:
                 continue
         try:
             price = float(p)
@@ -2002,8 +2066,10 @@ def _vwap_autofetch_loop():
 
 
 def _active_ticker():
-    """Best-effort active instrument from the most recent ticker-bearing alert."""
+    """Best-effort active instrument from the most recent resolved alert."""
     for rec in reversed(ALERT_HISTORY):
+        if rec.get("instrument"):
+            return rec["instrument"]
         if rec.get("ticker"):
             return instrument_of(rec["ticker"])
         t = str(rec.get("alert_type", ""))
@@ -2052,9 +2118,13 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 # CONFIRMATION/CONFIRMED types already embed the instrument in their
                 # name, so a plain type match is already instrument-scoped.
                 return True
-            # CHOCH/BOS carry no symbol prefix — respect record ticker when present.
-            rt = a.get("ticker")
-            if rt and instrument_of(rt) != inst:
+            # CHOCH/BOS carry no symbol prefix — use the resolved instrument stored
+            # at ingestion. An untickered shared alert no longer matches either
+            # instrument; old in-memory records fall back to ticker/title parsing.
+            a_inst = (a.get("instrument")
+                      or _instrument_from_text(a.get("ticker"))
+                      or _instrument_from_text(a.get("alert_type")))
+            if a_inst != inst:
                 continue
             return True
         return False
@@ -3124,6 +3194,7 @@ def _build_card_entry(a, ticker=None, record=None):
     tp         = a.get("trade_plan") or {}
     direction  = a.get("strict_direction") or tp.get("direction") or "Long"
     inst       = (tp.get("instrument") or a.get("active_ticker")
+                  or record.get("instrument")
                   or instrument_of(record.get("ticker") or ticker or record.get("alert_type", "")))
     # Preserve exact ticker (e.g. "MNQ1!") when supplied, else the normalized symbol.
     symbol     = record.get("ticker") or ticker or inst
@@ -3290,7 +3361,7 @@ def _broker_should_open(data):
     return tv.execution_on() and _exec_authorized(data)
 
 
-def _handle_command_alert(normalized, data, parsed_price):
+def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
     """Execute ENTER / CLOSE trade commands sent via TradingView webhook.
 
     Returns a Flask Response to short-circuit the webhook handler, or None
@@ -3312,7 +3383,7 @@ def _handle_command_alert(normalized, data, parsed_price):
 
         # Fall back to current trade plan for any missing values
         if None in (entry, stop, t1, t2):
-            a  = full_analysis(current_price_override=parsed_price)
+            a  = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst)
             tp = a["trade_plan"]
             try:
                 if entry is None:
@@ -3329,7 +3400,7 @@ def _handle_command_alert(normalized, data, parsed_price):
 
         direction = str(data.get("direction", "Long"))
         contracts = int(data.get("contracts", 1))
-        symbol    = instrument_of(normalized)
+        symbol    = resolved_inst
 
         # ── Live broker execution (gated; OFF by default) ──────────────────
         # Hold _ENTER_LOCK across duplicate-check → place → record so two
@@ -3465,6 +3536,27 @@ def webhook():
         logger.warning("Unrecognized alert type: %r", alert_type)
         return jsonify({"status": "ignored", "reason": "unrecognized alert type", "received": alert_type}), 200
 
+    # ── Authoritative instrument resolution (ticker-first; never silently MGC) ──
+    # The payload `ticker` field decides the instrument. The alert title is used
+    # only when no ticker is present, and unresolvable/contradictory alerts are
+    # rejected rather than misattributed (default-MGC) to the wrong instrument.
+    res = resolve_instrument(data.get("ticker"), normalized)
+    if not res["ok"]:
+        logger.warning("Ticker resolution rejected %r (ticker=%r): %s",
+                       normalized, data.get("ticker"), res["error"])
+        return jsonify({
+            "status":     "error",
+            "reason":     "ticker resolution failed",
+            "detail":     res["error"],
+            "alert_type": normalized,
+            "ticker":     data.get("ticker"),
+        }), 400
+    resolved_inst = res["instrument"]
+    if res["source"] == "title":
+        logger.warning("Alert %r has no ticker field — resolved %s from the title; "
+                       "add a `ticker` field to this TradingView alert.",
+                       normalized, resolved_inst)
+
     raw_price = data.get("price")
     try:
         parsed_price = float(raw_price) if raw_price is not None else None
@@ -3473,7 +3565,7 @@ def webhook():
 
     if parsed_price is not None:
         CURRENT_PRICE = parsed_price
-        CURRENT_PRICE_BY_TICKER[instrument_of(data.get("ticker") or normalized)] = parsed_price
+        CURRENT_PRICE_BY_TICKER[resolved_inst] = parsed_price
 
     # ── VWAP ingestion (required input for the strict price-vs-VWAP filter) ──
     raw_vwap = data.get("vwap")
@@ -3483,13 +3575,13 @@ def webhook():
         except (ValueError, TypeError):
             vwap_val = None
         if vwap_val is not None:
-            vwap_key = instrument_of(data.get("ticker") or normalized)
+            vwap_key = resolved_inst
             VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": now_utc().isoformat(),
                                         "source": "chart"}
 
     # ── Data-only VWAP push — store already updated above; ack without scoring ──
     if normalized in _DATA_ONLY_TYPES:
-        _vk = instrument_of(data.get("ticker") or normalized)
+        _vk = resolved_inst
         _vv, _vs = get_vwap(_vk)
         logger.info("VWAP update: %s = %s (%s)", _vk, _vv, _vs)
         return jsonify({
@@ -3502,16 +3594,18 @@ def webhook():
 
     # ── Command types: ENTER / CLOSE — short-circuit before scoring ──────────
     if normalized in _COMMAND_TYPES:
-        resp = _handle_command_alert(normalized, data, parsed_price)
+        resp = _handle_command_alert(normalized, data, parsed_price, resolved_inst)
         if resp is not None:
             return resp
 
     record = {
-        "alert_type": normalized,
-        "ticker":     data.get("ticker"),
-        "price":      parsed_price,
-        "timestamp":  now_utc().isoformat(),
-        "raw":        data,
+        "alert_type":        normalized,
+        "ticker":            data.get("ticker"),
+        "instrument":        resolved_inst,
+        "instrument_source": res["source"],
+        "price":             parsed_price,
+        "timestamp":         now_utc().isoformat(),
+        "raw":               data,
     }
     global LAST_ALERT_AT
     LAST_ALERT_AT = datetime.now(timezone.utc)
@@ -3560,7 +3654,7 @@ def webhook():
         except (ValueError, TypeError):
             risk_pct = DEFAULT_RISK_PCT
 
-    a = full_analysis(current_price_override=parsed_price)
+    a = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst)
 
     # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
     # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
@@ -3618,7 +3712,8 @@ def webhook():
     if (journal_entry and not ACTIVE_TRADE
             and a.get("verdict") in ("LONG READY", "SHORT READY")):
         send_live_ready_card(journal_entry,
-                             record.get("ticker") or journal_entry.get("instrument"))
+                             record.get("ticker") or record.get("instrument")
+                             or journal_entry.get("instrument"))
 
     logger.info(
         "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",

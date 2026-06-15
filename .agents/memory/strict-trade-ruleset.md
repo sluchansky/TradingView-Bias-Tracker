@@ -23,9 +23,19 @@ the strict path, not by re-adding a parallel confidence gate.
 - **Zone-broken and zone-mitigated branches must reset the full strict payload** (strict_label=WAIT,
   strict_score=0, no-plan trade_plan), or `/status` shows "WAIT" alongside a stale score/plan.
 
-## VWAP misattribution gotcha (external constraint)
-`webhook()` keys VWAP per instrument via `instrument_of(ticker or alert_type)`. Shared BOS/CHOCH
-alerts carry **no** instrument prefix in their name, so they rely on the payload's `ticker` field.
-**TradingView alert templates must always include `ticker`** — an MNQ alert that sends `vwap` but
-omits `ticker` will store its VWAP under MGC (instrument_of default). This is a data-source contract,
-not a code bug.
+## Instrument resolution contract (ticker is authoritative)
+`webhook()` resolves the instrument once via `resolve_instrument(ticker, alert_type)` and stores it on
+the alert record (`record["instrument"]`). The payload `ticker` field is the source of truth; the alert
+title is consulted **only** when no ticker is present. Unresolvable/contradictory alerts are **rejected
+with HTTP 400, never silently defaulted to MGC**:
+- shared BOS/CHOCH with no ticker (instrument named nowhere) → reject
+- unrecognized ticker (neither MGC nor MNQ) → reject
+- ticker vs title-prefix mismatch (e.g. `MGC VWAP` + `ticker: MNQ1!`) → reject
+
+Instrument-prefixed alerts that omit the ticker still resolve from the title (logged WARNING) — this is
+the lenient choice; a stricter "every alert must carry a ticker" policy would reject those too.
+`instrument_of()` is the **lenient legacy** normalizer (empty/unknown → MGC) — display/fallback only,
+never for webhook attribution. All instrument-scoped consumers (`_has`, `_active_ticker`,
+`get_price_context`, card build, live-card routing) prefer `record["instrument"]`.
+**Why:** an MNQ alert that omitted `ticker` previously stored VWAP / counted structure under MGC, and a
+shared BOS/CHOCH with a falsy ticker used to match BOTH instruments.
