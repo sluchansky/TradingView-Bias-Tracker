@@ -1,35 +1,37 @@
 ---
-name: No-signals = upstream alert-config gap
-description: Diagnosing a live "0 signals / nothing to trade" symptom on the TradingView webhook app when alerts ARE arriving but none are tradeable.
+name: No-signals = the structure (CHOCH/BOS) gate
+description: The #1 reason a fully-working TradingView webhook deployment still produces 0 tradeable signals — and how to diagnose it from the scored "Alert:" log line.
 ---
 
-# "No signals" on the live webhook is usually an upstream alert-config gap, not a deploy bug
+# "0 signals" on a working deployment is almost always the CHOCH/BOS structure gate
 
-When the user reports "0 signals / still nothing" on the deployed webhook app, the deployment
-is usually fine. The dominant root cause is that TradingView is only sending **neutral /
-structure** alert types, which by design never produce a trade card.
+When everything is deployed and alerts ARE arriving and being scored, but the user still
+sees "0 signals to trade", the cause is usually the **market-structure gate**, not the
+deployment and not a missing zone alert.
 
-**How to diagnose (do this FIRST, before touching code):**
-Pull prod logs for `INCOMING POST /webhook` and read the `alert_type` in each BODY.
-If you only see ZONE MITIGATED / ZONE BROKEN / VWAP (+ the junk `{{strategy.order.comment}}`),
-the engine has nothing to score → correct silence, not a bug.
+`decision_engine()` hard-returns WAIT at its very first gate when
+`structure_class == "Undefined"` (or no directional alert score). Market structure is built
+**only** from CHOCH/BOS alerts; with none tracked, `get_market_structure()` returns
+"Undefined" → every zone setup, no matter how clean, is force-WAITed before it can score.
 
-**Which alert types score vs. skip (ALERT_RULES + webhook flow in app.py):**
-- Score-eligible *setup* alerts (engine builds a trade from these): `NEW SUPPLY ZONE`,
-  `NEW DEMAND ZONE`, `SUPPLY ZONE CONFIRMED`, `DEMAND ZONE CONFIRMED`,
-  `BULLISH CONFIRMATION`, `BEARISH CONFIRMATION`, plus `CHOCH`/`BOS` structure events.
-- `ZONE MITIGATED` → sets `zone_mitigated_near` → logs "scoring skipped", returns WAIT
-  ("zone consumed / no longer valid"). By design, NOT a bug.
-- `ZONE BROKEN` → structure reset (neutral, score 0).
-- `MGC VWAP` / `MNQ VWAP` → in `_DATA_ONLY_TYPES`, price refresh only, no scoring.
+**Diagnose from the scored log line** — `Alert: <type> | <bias> | Edge N | WAIT → WAIT |
+Struct: Undefined | Risk: ...`. `Struct: Undefined` is conclusive proof the engine has
+received zero CHOCH/BOS alerts. (Contrast the simpler variant: if you only ever see ZONE
+MITIGATED / ZONE BROKEN / VWAP arriving, the user isn't sending directional alerts at all.)
 
-**Why:** the engine only posts an Edge Score / trade-card when `full_analysis` yields an
-actual setup, which requires the directional building blocks above. A stream of neutral
-events alone can never form a setup, so the dashboard/Discord stay empty.
+**Recognized structure alert types (ALERT_RULES):** `CHOCH SUPPLY`, `CHOCH DEMAND`,
+`BOS SUPPLY`, `BOS DEMAND`. CRITICAL: these are **shared / un-prefixed** (no MGC/MNQ in the
+name) and therefore **REQUIRE a `ticker` field** to resolve the instrument — without ticker
+they're rejected as unresolvable. Zone alerts, by contrast, embed the instrument in the name
+(e.g. `MNQ NEW SUPPLY ZONE`) and don't strictly need ticker.
 
-**How to apply:** confirm via prod logs which `alert_type`s are actually arriving before
-assuming a code/deploy fault. If setup alerts are absent, the fix is on the user's
-TradingView side (create the missing alerts), NOT in app.py. Also set expectation: even
-once setup alerts flow, a choppy market correctly scores WAIT (e.g. a real NEW SUPPLY ZONE
-test scored "Choppy, Edge 14, WAIT") — signals are intentionally sparse, fired only on a
-real edge.
+**Full READY recipe (per side):** BOS + CHOCH (structure) + Zone Confirmed + 5m confirmation
+candle (`<INST> BULLISH/BEARISH CONFIRMATION`) + price on the correct side of VWAP. The
+CHOCH/BOS structure is the gate that must open first; zones + VWAP alone can never reach READY.
+
+**The fix is on the user's TradingView side**, not in app.py: create CHOCH/BOS (and
+confirmation) alerts with the exact alert_type strings + a `ticker` field. Do NOT loosen the
+gate in code unless the user explicitly asks — the strict structure-first ruleset is
+intentional. Also note: a junk `{{strategy.order.comment}}` alert (Pine strategy placeholder
+fired from an indicator) and empty-body alerts are harmless (rejected/200) but are noise; fix
+or delete them on the TradingView side.
