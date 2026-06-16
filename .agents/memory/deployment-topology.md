@@ -19,6 +19,8 @@ Express `/api` proxy as the public entry and Flask reached internally on `localh
 
 **How to apply / gotchas:**
 - The `deploymentTarget` (Reserved VM) is **chosen by the user in the Publish dialog** — the agent cannot set it (root `.replit` still says autoscale and can't be edited). Always tell the user to pick Reserved VM.
+- **Deployment visibility must be Public.** A private deployment answers anonymous external requests with a 307 redirect to `replit.com/__replshield` (login wall); TradingView can't authenticate, so webhooks never reach Flask → silent "0 signals". Verify with an unauthenticated curl to `/api/healthz` (expect 200 `{"status":"ok"}`, not a 307 or the "This app isn't live yet" 404 placeholder).
+- **Switching deployment type (autoscale→vm) in the Publish UI creates a fresh deployment and detaches any custom domain** (the domain then serves Replit's "This app isn't live yet" 404) and makes the generated `*.replit.app` subdomain the primary URL again. Re-link the custom domain on the new deployment afterward; the `*.replit.app` URL is the stable fallback to point webhooks at. Always read the live `primaryUrl`/`deploymentType`/`visibility` from `getDeploymentInfo()` — never guess the prod URL (dev `REPLIT_DOMAINS` is the `.replit.dev` dev domain).
 - The flask-proxy hardcodes `localhost:8000`, so Flask must bind 8000 in prod (supervisor sets `PORT=8000` inline for the python process; Express uses the `run.env` `PORT=8080`).
 - Production needs the Discord webhook secrets present in the deployment environment (same names as dev).
 - `wait -n` needs bash ≥4.3 (env has 5.2).
