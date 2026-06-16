@@ -5607,6 +5607,8 @@ def dashboard():
   #toast.show{opacity:1}
   #refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-right:6px;animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  #last-updated{font-size:12px;color:#6b7280;margin:-6px 0 16px 14px}
+  #last-updated.stale{color:#f59e0b}
   /* Sensitivity (trading mode) toggle */
   #mode-row{display:flex;align-items:center;gap:10px;margin-bottom:18px}
   #mode-cap{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#555;white-space:nowrap}
@@ -5618,6 +5620,7 @@ def dashboard():
 </head>
 <body>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
+<div id="last-updated">Last updated —</div>
 
 <!-- Sensitivity (trading mode) -->
 <div id="mode-row">
@@ -5890,6 +5893,7 @@ async function refreshRec() {
     }
 
     reason.textContent = d.strict_reason || '';
+    markUpdated();
   } catch(e) {}
 }
 
@@ -5914,6 +5918,26 @@ function applyRec() {
   if (tp.target2!=null)   document.getElementById('f-t2').value   = tp.target2;
   document.querySelector('details').open = true;
   toast('⬇️ Setup applied — review & ENTER');
+}
+
+let lastUpdateTs = 0;
+function markUpdated() {
+  lastUpdateTs = Date.now();
+  const el = document.getElementById('last-updated');
+  if (!el) return;
+  const t = new Date();
+  const p = n => String(n).padStart(2,'0');
+  el.textContent = 'Last updated ' + p(t.getHours()) + ':' + p(t.getMinutes()) + ':' + p(t.getSeconds());
+  el.classList.remove('stale');
+}
+function checkStale() {
+  const el = document.getElementById('last-updated');
+  if (!el || !lastUpdateTs) return;
+  const secs = Math.floor((Date.now() - lastUpdateTs) / 1000);
+  if (secs > 12) {
+    el.classList.add('stale');
+    el.textContent = '⚠ Not responding — last update ' + secs + 's ago';
+  }
 }
 
 async function refresh() {
@@ -5953,12 +5977,14 @@ async function refresh() {
       btnClose.style.display = 'block';
       btnBe.style.display = d.t1_hit ? 'block' : 'none';
     }
+    markUpdated();
   } catch(e) {}
 }
 
 // Poll every 3 seconds
 refresh(); refreshRec(); loadMode();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
+setInterval(checkStale, 2000);
 </script>
 </body>
 </html>"""
