@@ -35,3 +35,9 @@ gate in code unless the user explicitly asks — the strict structure-first rule
 intentional. Also note: a junk `{{strategy.order.comment}}` alert (Pine strategy placeholder
 fired from an indicator) and empty-body alerts are harmless (rejected/200) but are noise; fix
 or delete them on the TradingView side.
+
+**TradingView message gotchas:** one JSON object per alert — pasting several objects into one
+Message box gives "JSON Parse error". Quote the price placeholder as `"price":"{{close}}"` so
+TradingView's editor validates it as JSON; the webhook does `float(price)` so a quoted string
+parses fine. Direction→alert_type mapping: bullish CHOCH/BOS → `CHOCH DEMAND` / `BOS DEMAND`;
+bearish → `CHOCH SUPPLY` / `BOS SUPPLY`.
