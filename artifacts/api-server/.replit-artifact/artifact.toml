@@ -15,14 +15,17 @@ run = "pnpm --filter @workspace/api-server run dev"
 [services.production]
 
 [services.production.build]
-args = ["pnpm", "--filter", "@workspace/api-server", "run", "build"]
+# Builds both the Express bundle AND installs Flask's Python deps (uv sync),
+# since the Flask webhook server runs inside this same production VM.
+args = ["bash", "scripts/prod-build.sh"]
 
 [services.production.build.env]
 NODE_ENV = "production"
 
 [services.production.run]
-# we don't run through pnpm to make startup faster in production
-args = ["node", "--enable-source-maps", "artifacts/api-server/dist/index.mjs"]
+# Supervisor that runs the Flask webhook server (:8000) + Express proxy (:8080)
+# together and restarts the VM if either dies. See scripts/prod-start.sh.
+args = ["bash", "scripts/prod-start.sh"]
 
 [services.production.run.env]
 PORT = "8080"

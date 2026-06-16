@@ -10,5 +10,6 @@
 - [Per-instrument dashboard view](per-instrument-dashboard-view.md) — MGC/MNQ tabs switch displayed analysis via /status?ticker → full_analysis(ticker_override); per-instrument price/VWAP/price-context invariants.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
 - [Live alert trade-card](live-alert-card.md) — clean card is the single alert format for journal + main channel; fires once per READY setup + re-posts every TRADE_READY_INTERVAL; per-instrument throttle prevents instant+periodic double-post.
+- [Production deployment topology](deployment-topology.md) — deploy as single Reserved VM; api-server prod build/run install Flask deps (uv sync) + supervise Flask(:8000)+Express(:8080); target chosen in Publish UI (.replit not editable).
 - [Unified Edge Score](unified-edge-score.md) — transparent score is the only user-visible Edge Score; legacy is ranking-only; zone-broken blocker must be instrument-scoped or it zeros the other instrument.
 - [Edge Score, grades & session bonus](edge-score-card-block.md) — transparent score (gate 75 + bonuses − risks) floored on the READY *verdict*; +10 Session Bonus is READY-gated; grade bands 95A+/90A/85B/80C/<80 WAIT are quality-only (not verdict); never fabricate a label.
