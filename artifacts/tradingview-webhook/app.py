@@ -262,6 +262,13 @@ DISCORD_JOURNAL_WEBHOOK_URL = os.environ.get("DISCORD_JOURNAL_WEBHOOK_URL", "")
 # Optional dedicated channel for 🔥 A+ setups. When unset, A+ alerts stay in the
 # normal per-instrument channel and are simply labelled — never a required secret.
 DISCORD_APLUS_WEBHOOK_URL   = os.environ.get("DISCORD_APLUS_WEBHOOK_URL", "")
+# Optional mobile-ping mention prepended to the LIVE trade card the instant a new
+# setup goes READY (and ONLY then — never on heartbeats, re-posts, zone notices,
+# or journal updates). Set Discord notifications to "Only @mentions" and this is
+# the single message that buzzes your phone. Defaults to @everyone so a personal
+# trading server works with zero setup; override with a user/role mention
+# (e.g. "<@123456789012345678>") to ping just yourself. Blank = no ping at all.
+DISCORD_ALERT_MENTION       = os.environ.get("DISCORD_ALERT_MENTION", "@everyone").strip()
 
 
 def _discord_url(hint: str = "") -> str:
@@ -3101,9 +3108,14 @@ def _build_trade_card_embed(entry, footer_text):
     return embed
 
 
-def send_live_ready_card(entry, ticker=""):
+def send_live_ready_card(entry, ticker="", notify=False):
     """Post the clean trade-card to the LIVE alert channel when a setup is READY.
-    Routed per-instrument via _discord_url() (MNQ → MNQ channel, else default)."""
+    Routed per-instrument via _discord_url() (MNQ → MNQ channel, else default).
+
+    notify=True prepends DISCORD_ALERT_MENTION (e.g. @everyone) so the message
+    pings phones set to "Only @mentions". Used ONLY for the instant first post of
+    a fresh setup; the 5-min re-post loop calls with notify=False so a standing
+    READY setup buzzes the phone once, not every interval."""
     url = _discord_url(ticker or entry.get("symbol", ""))
     if not url:
         logger.warning("DISCORD_WEBHOOK_URL not set — live ready card skipped")
@@ -3117,7 +3129,13 @@ def send_live_ready_card(entry, ticker=""):
     embed = None
     try:
         embed = _build_trade_card_embed(entry, footer)
-        resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
+        payload = {"embeds": [embed]}
+        if notify and DISCORD_ALERT_MENTION:
+            # The single phone-pinging message: prepend the mention and allow it
+            # so a "Only @mentions" device buzzes exactly on a fresh READY setup.
+            payload["content"] = DISCORD_ALERT_MENTION
+            payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
+        resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code not in (200, 204):
             logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
     except Exception as exc:
@@ -4817,7 +4835,8 @@ def webhook():
                 and a.get("verdict") in ("LONG READY", "SHORT READY")):
             send_live_ready_card(journal_entry,
                                  record.get("ticker") or record.get("instrument")
-                                 or journal_entry.get("instrument"))
+                                 or journal_entry.get("instrument"),
+                                 notify=True)
     except Exception as exc:
         logger.error("Journal/live-card path error (alert still recorded): %s", exc)
 
