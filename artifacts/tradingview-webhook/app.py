@@ -5745,7 +5745,7 @@ async function enterTrade() {
   if (t2) body.t2        = parseFloat(t2);
   if (c)  body.contracts = parseInt(c);
   try {
-    const d = await api('/webhook', body);
+    const d = await api('/enter', body);
     if (d.status === 'entered') {
       toast('✅ Trade entered!'); refresh();
     }

@@ -1,6 +1,6 @@
 ---
 name: Dashboard auth edge & open paths
-description: Where dashboard/trade auth must live and which paths must never be locked.
+description: Where dashboard/trade auth must live, which paths must never be locked, and the CSRF/host-trust model.
 ---
 
 # Dashboard auth edge & open paths
@@ -21,14 +21,30 @@ there as middleware inserted between the health router and the Flask proxy.
 - `/webhook` — TradingView alert delivery.
 - `/healthz` — Express health (stays open because it's mounted before auth).
 
-**How to apply:** when adding any new endpoint or changing auth, keep these four
-paths open and put auth before the Flask proxy. Password comes from the
-`DASHBOARD_PASSWORD` secret; username is ignored; compared with
-`crypto.timingSafeEqual`; fails OPEN with a warning when the secret is unset so the
-owner is never locked out.
+**How to apply:** when adding any new endpoint or changing auth, keep these paths
+open and put auth before the Flask proxy. Password comes from `DASHBOARD_PASSWORD`;
+username is ignored; compared with `crypto.timingSafeEqual`. Fails OPEN only when
+`NODE_ENV==='development'`; in production/deployment a missing secret fails CLOSED
+(503) — a live trading dashboard must lock, not expose, when unconfigured.
 
-**Known gap:** Basic Auth has no CSRF protection on mutating endpoints
-(`/mode`, `/enter`, `/close`, etc.). Browsers can attach cached Basic credentials
-to cross-site requests. This becomes financially material once live broker order
-execution exists — add Origin/Referer (vs `x-forwarded-host`) validation or a CSRF
-token for non-GET protected requests before that point.
+**CSRF / host trust model:** mutating (non GET/HEAD/OPTIONS) protected requests must
+be same-origin — the request `Origin`/`Referer` host must match a proxy-supplied
+host. Verified empirically through the public proxy: Replit OVERWRITES any
+client-supplied `X-Forwarded-Host` with the real public host, and a forged `Host`
+is rejected upstream (502). So BOTH `x-forwarded-host` and `Host` are
+proxy-controlled and unspoofable by a page; the check accepts a match against either
+(robust to whichever carries the public host in dev vs prod, custom domain included,
+with no hardcoding). The dashboard's own `fetch()` POSTs send `Origin` and pass.
+
+**Manual ENTER must use the protected `/enter`, not `/webhook`:** the dashboard ENTER
+button historically POSTed to the OPEN `/webhook` (so manual entry was unauthenticated).
+It now posts to the protected `/enter` route, which is behaviorally equivalent to the
+`/webhook` ENTER command path for manual entry. VWAP-set still posts to open `/webhook`
+(reference value, intentionally out of the enter/close/mode scope).
+
+**Residual gap (by design, pending product decision):** the open `/webhook` still
+accepts `MGC/MNQ ENTER` and `MGC/MNQ CLOSE` command alert types, so the trade
+lifecycle is forgeable by anyone who knows the webhook URL + payload. Closing this
+either breaks TradingView auto-entry/close or requires a shared-secret token added to
+every TradingView alert — a tradeoff the OWNER must choose, so do not silently close
+it.
