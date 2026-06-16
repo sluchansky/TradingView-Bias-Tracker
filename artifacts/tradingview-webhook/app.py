@@ -4879,11 +4879,21 @@ def webhook():
             "price":       parsed_price if parsed_price is not None else CURRENT_PRICE,
         }), 200
 
-    # ── Command types: ENTER / CLOSE — short-circuit before scoring ──────────
+    # ── Command types: ENTER / CLOSE are owner-only and NOT accepted here ─────
+    #    Trade entry/exit happens exclusively via the password-protected
+    #    dashboard (/enter, /close). Rejecting them on the open webhook means an
+    #    exposed webhook URL can never open or close a trade. (_handle_command_alert
+    #    is retained but intentionally no longer wired to the public webhook.)
     if normalized in _COMMAND_TYPES:
-        resp = _handle_command_alert(normalized, data, parsed_price, resolved_inst)
-        if resp is not None:
-            return resp
+        logger.warning(
+            "Rejected %s on open /webhook — trade commands are dashboard-only",
+            normalized,
+        )
+        return jsonify({
+            "status": "rejected",
+            "reason": "Trade commands (ENTER/CLOSE) are not accepted via the webhook; "
+                      "use the password-protected dashboard.",
+        }), 403
 
     record = {
         "alert_type":        normalized,

@@ -42,9 +42,10 @@ It now posts to the protected `/enter` route, which is behaviorally equivalent t
 `/webhook` ENTER command path for manual entry. VWAP-set still posts to open `/webhook`
 (reference value, intentionally out of the enter/close/mode scope).
 
-**Residual gap (by design, pending product decision):** the open `/webhook` still
-accepts `MGC/MNQ ENTER` and `MGC/MNQ CLOSE` command alert types, so the trade
-lifecycle is forgeable by anyone who knows the webhook URL + payload. Closing this
-either breaks TradingView auto-entry/close or requires a shared-secret token added to
-every TradingView alert — a tradeoff the OWNER must choose, so do not silently close
-it.
+**Webhook trade commands are CLOSED:** the owner confirmed entries/closes are always
+manual from the dashboard (no TradingView auto-trading). So the open `/webhook` now
+REJECTS `MGC/MNQ ENTER` and `MGC/MNQ CLOSE` (`_COMMAND_TYPES`) with HTTP 403 before
+any execution — an exposed webhook URL can no longer open/close a trade. The helper
+`_handle_command_alert` is retained but no longer wired to the webhook. Analysis/VWAP
+alert types are unaffected. If TradingView auto-trading is ever wanted, re-enable via
+a shared-secret token on the webhook (do NOT just re-wire the open path).
