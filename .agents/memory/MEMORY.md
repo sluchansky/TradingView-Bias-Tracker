@@ -6,7 +6,6 @@
 - [full_analysis single return path](full-analysis-return-parity.md) — one return dict now; hard-indexed consumers make a missing key a state-dependent 500; mirror keys if an early return is re-added.
 - [Zone Mitigated detection](zone-mitigated-detection.md) — ZONE_MITIGATED_FLAG is GLOBAL & cleared by any structure-reset; gate derived signals on per-instrument proximity AND the flag or MGC/MNQ analysis bleeds.
 - [ET display vs UTC storage](timezone-display-et.md) — timestamps stored UTC, displayed in America/New_York via fmt_et(); Discord embeds' native `timestamp` field must stay ISO-UTC (Discord localizes per viewer).
-- [Tradovate live execution](tradovate-execution.md) — broker order path is gated so the public webhook can never auto-trade; OFF/DEMO defaults, rejection≠success, partial-fill & flatten-cancel safety invariants, never-log-secrets.
 - [full_analysis data quirks & card seam](analysis-data-quirks.md) — vwap_status is freshness NOT direction (derive above/below from price vs vwap_value); _build_card_entry is the single source for journal+card; screenshots are passed to Discord never fetched; analytics terminal-only+deduped.
 - [Per-instrument dashboard view](per-instrument-dashboard-view.md) — MGC/MNQ tabs switch displayed analysis via /status?ticker → full_analysis(ticker_override); per-instrument price/VWAP/price-context invariants.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
