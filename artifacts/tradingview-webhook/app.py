@@ -60,6 +60,7 @@ ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
 ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
 VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso}, "MGC": {...}} — latest VWAP per instrument
+VOLATILITY_BY_TICKER = {}     # {"MNQ": {"atr_pts","ratio","ts"}, "MGC": {...}} — latest volatility per instrument
 
 ALERT_TYPES = {
     # ── MGC alert types ────────────────────────────────────────────────────────
@@ -127,6 +128,12 @@ MODES = {
         "STAGE_WINDOW_MIN":  30,      # setup-stage looks back 30 min, not last 5 alerts
         "ATTEMPT_TRADABLE":  True,    # BOS-only structures can trade (capped at BIAS)
         "RISK_MULT_ATTEMPT": 0.5,     # half size on BOS-only entries
+        # Volatility regime thresholds — ratio of recent 1m ATR to the session-
+        # typical range. CAUTION flags + dents the Edge Score; BLOCK holds the setup.
+        "VOL_QUIET_CAUTION": 0.55,    # <= this = quiet (flag)
+        "VOL_QUIET_BLOCK":   0.35,    # <= this = dead (hold)
+        "VOL_HIGH_CAUTION":  1.6,     # >= this = elevated (flag)
+        "VOL_HIGH_BLOCK":    2.5,     # >= this = wild (hold)
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -141,6 +148,11 @@ MODES = {
         "STAGE_WINDOW_MIN":  None,    # last 5 alerts
         "ATTEMPT_TRADABLE":  False,
         "RISK_MULT_ATTEMPT": 1.0,
+        # Volatility thresholds — swing tolerates a bit more before holding.
+        "VOL_QUIET_CAUTION": 0.50,
+        "VOL_QUIET_BLOCK":   0.30,
+        "VOL_HIGH_CAUTION":  1.8,
+        "VOL_HIGH_BLOCK":    3.0,
     },
 }
 
@@ -2369,6 +2381,130 @@ def _update_vwap_auto(instrument):
     logger.info("VWAP auto-fetch: %s = %s", instrument, value)
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Volatility monitor (additive, FAIL-OPEN). A per-instrument 1-minute ATR is
+# compared to the session-typical range to classify the current volatility
+# regime. It surfaces as context on the card + dashboard AND gates the strict
+# setup: a CAUTION regime dents the Edge Score and flags the card, while a BLOCK
+# regime (market too dead or too wild) holds an otherwise-READY setup. Missing
+# or stale data NEVER blocks a trade — it only shows as "unavailable".
+# ───────────────────────────────────────────────────────────────────────────
+VOL_ATR_BARS           = 14   # recent window (1-min bars) for the current ATR
+VOL_MIN_BARS           = 30   # session bars required before a baseline is trusted
+VOLATILITY_MAX_AGE_MIN = 10   # a reading older than this is stale -> unavailable
+
+
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _fetch_volatility_from_market(instrument):
+    """Return (recent_atr_pts, ratio) for an instrument from the public 1-min feed.
+
+    recent_atr = mean true-range of the last VOL_ATR_BARS bars; baseline = median
+    true-range across all valid session bars; ratio = recent_atr / baseline. The
+    ratio is self-normalising, so one set of thresholds works for both MGC and
+    MNQ despite very different absolute point sizes. (None, None) on any error.
+    """
+    symbol = VWAP_FEED_SYMBOL.get(instrument)
+    if not symbol:
+        return None, None
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        resp = requests.get(url, params={"interval": "1m", "range": "1d"},
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if resp.status_code != 200:
+            return None, None
+        result = resp.json()["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+        highs, lows, closes = quote["high"], quote["low"], quote["close"]
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        logger.warning("Volatility fetch failed for %s: %s", instrument, exc)
+        return None, None
+
+    trs, prev_close = [], None
+    for high, low, close in zip(highs, lows, closes):
+        if high is None or low is None or close is None:
+            continue
+        tr = (high - low) if prev_close is None else max(
+            high - low, abs(high - prev_close), abs(low - prev_close))
+        if tr >= 0:
+            trs.append(tr)
+        prev_close = close
+
+    if len(trs) < VOL_MIN_BARS:
+        return None, None
+    recent     = trs[-VOL_ATR_BARS:]
+    recent_atr = sum(recent) / len(recent)
+    baseline   = _median(trs)
+    if baseline <= 0:
+        return None, None
+    return round(recent_atr, 4), round(recent_atr / baseline, 3)
+
+
+def _update_volatility_auto(instrument):
+    """Refresh the stored volatility reading for one instrument (best-effort)."""
+    atr_pts, ratio = _fetch_volatility_from_market(instrument)
+    if atr_pts is None or ratio is None:
+        return
+    VOLATILITY_BY_TICKER[instrument] = {
+        "atr_pts": atr_pts, "ratio": ratio, "ts": now_utc().isoformat(),
+    }
+    logger.info("Volatility auto-fetch: %s ATR=%.4f ratio=%.2f", instrument, atr_pts, ratio)
+
+
+def get_volatility(ticker):
+    """Return the current volatility reading + regime for an instrument.
+
+    STRICTLY per-instrument (no global fallback) so MGC volatility can never
+    bleed into MNQ analysis and vice-versa. FAIL-OPEN: when the reading is
+    missing or stale, status != 'ok' and BOTH `blocked` and `caution` are False,
+    so the strict gate never holds a trade on data it does not have.
+    """
+    inst = instrument_of(ticker)
+    base = {"atr_pts": None, "ratio": None, "regime": "NA", "status": "missing",
+            "blocked": False, "caution": False, "label": "Unavailable", "display": "—"}
+    rec = VOLATILITY_BY_TICKER.get(inst)
+    if not rec or rec.get("ratio") is None:
+        return base
+    try:
+        age_min = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
+    except (KeyError, ValueError, TypeError):
+        return base
+    if age_min > VOLATILITY_MAX_AGE_MIN:
+        base["status"] = "stale"
+        return base
+
+    try:
+        ratio = float(rec["ratio"])
+    except (TypeError, ValueError):
+        return base
+    atr_pts = rec.get("atr_pts")
+    if ratio <= cfg("VOL_QUIET_BLOCK"):
+        regime, label, blocked, caution = "QUIET_BLOCK", "Dead / too quiet", True, False
+    elif ratio >= cfg("VOL_HIGH_BLOCK"):
+        regime, label, blocked, caution = "HIGH_BLOCK", "Wild / too volatile", True, False
+    elif ratio <= cfg("VOL_QUIET_CAUTION"):
+        regime, label, blocked, caution = "QUIET_CAUTION", "Quiet", False, True
+    elif ratio >= cfg("VOL_HIGH_CAUTION"):
+        regime, label, blocked, caution = "HIGH_CAUTION", "Elevated", False, True
+    else:
+        regime, label, blocked, caution = "NORMAL", "Normal", False, False
+
+    try:
+        atr_disp = f"{float(atr_pts):.2f}" if atr_pts is not None else "—"
+    except (TypeError, ValueError):
+        atr_disp = "—"
+    return {"atr_pts": atr_pts, "ratio": ratio, "regime": regime, "status": "ok",
+            "blocked": blocked, "caution": caution, "label": label,
+            "display": f"ATR {atr_disp} pts · {ratio:.2f}× normal · {label}"}
+
+
 def _vwap_autofetch_loop():
     """Refresh VWAP for all tracked instruments, evaluate managed trades, then
     reschedule. The managed-trade watch is additive and fail-open so it can
@@ -2378,6 +2514,11 @@ def _vwap_autofetch_loop():
             _update_vwap_auto(instrument)
     except Exception as exc:  # never let the loop die
         logger.warning("VWAP auto-fetch loop error: %s", exc)
+    try:
+        for instrument in VWAP_FEED_SYMBOL:
+            _update_volatility_auto(instrument)
+    except Exception as exc:  # volatility is best-effort — never disrupt VWAP/watcher
+        logger.warning("Volatility auto-fetch loop error: %s", exc)
     try:
         _watch_managed_trades()
     except Exception as exc:
@@ -2403,7 +2544,8 @@ def _active_ticker():
 
 def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                           nearest_supply, nearest_demand,
-                          bullish, bearish, confidence, alert_history):
+                          bullish, bearish, confidence, alert_history,
+                          volatility=None):
     """Strict checklist recommendation.
 
     A trade is recommended ONLY when ALL of:
@@ -2482,6 +2624,15 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     long_gate    = (long_struct or mitigation_long_confirmed) and price_above
     short_gate   = short_struct and price_below
+
+    # ── Volatility gate (additive, FAIL-OPEN) ───────────────────────────────
+    # A BLOCK regime (market too dead or too wild) holds an otherwise-READY
+    # setup. Unavailable volatility (vol['blocked'] is False) NEVER blocks — the
+    # gate must never hold a trade on data it does not have.
+    vol = volatility or {}
+    vol_block = bool(vol.get("blocked"))
+    if vol_block:
+        long_gate = short_gate = False
 
     def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf,
                      liq_sweep=False, zone_mitigated=False, confirmation_candle=None):
@@ -2582,11 +2733,19 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         else:
             missing.append(f"price {'above' if lead == 'Long' else 'below'} VWAP")
 
+    if vol_block:
+        held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
+        missing.insert(0, f"volatility {held} — holding ({vol.get('display', '—')})")
+        reason = f"{lead} setup on hold — market {held}: {vol.get('display', 'volatility out of range')}."
+    else:
+        reason = (f"{lead} setup incomplete — missing: "
+                  f"{', '.join(missing) if missing else 'confluence'}.")
+
     score = round(sum(present) / 4 * 70)  # informational progress, always < 75 (WAIT)
     return {
         "label": "WAIT", "direction": None, "score": score,
         "confluences": _confluences(lead, has_bos, has_choch, has_confirm, vwap_side, zone_conf),
-        "reason": f"{lead} setup incomplete — missing: {', '.join(missing) if missing else 'confluence'}.",
+        "reason": reason,
         "missing": missing,
     }
 
@@ -2725,9 +2884,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # price-vs-VWAP filter all align on one side. Score 0-100 → Strong/Possible/WAIT.
     # active_ticker resolved at the top (honours the dashboard's instrument tab).
     vwap_value, vwap_status = get_vwap(active_ticker)
+    volatility = get_volatility(active_ticker)
     strict = evaluate_strict_setup(
         current_price, active_ticker, vwap_value, vwap_status,
-        nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY
+        nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
+        volatility=volatility,
     )
     strict_label     = strict["label"]
     strict_score     = strict["score"]
@@ -2872,6 +3033,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
         strict_direction=strict_direction, strict_reason=strict_reason,
         strict_missing=strict_missing, confluences=confluences,
         vwap_value=vwap_value, vwap_status=vwap_status,
+        volatility=volatility,
         active_ticker=active_ticker,
     )
 
@@ -3039,6 +3201,9 @@ def _build_trade_card_embed(entry, footer_text):
         session_line = "❌ Preferred Trading Window: NO\nSession Bonus: 0"
     next_step = entry.get("next_step") or entry.get("stage_next_step") or "—"
 
+    vol      = entry.get("volatility") or {}
+    vol_disp = vol.get("display") if vol.get("status") == "ok" else "—"
+
     # Display-only Edge Score / Grade / Reasons / Risk block replaces the free-text
     # AI Analysis field on READY cards; fall back to notes when no breakdown exists.
     eb = entry.get("edge_breakdown")
@@ -3066,6 +3231,7 @@ def _build_trade_card_embed(entry, footer_text):
             {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
             {"name": "📈 VWAP",                "value": _val(entry.get("vwap_position")), "inline": True},
             {"name": "🧱 Zone",                "value": _val(entry.get("supply_demand_zone")), "inline": True},
+            {"name": "📉 Volatility",          "value": _val(vol_disp),              "inline": True},
             {"name": "🗓️ Session",            "value": session_line,                "inline": False},
             analysis_field,
             {"name": "📝 Setup Notes",         "value": notes_text,                  "inline": False},
@@ -3948,6 +4114,14 @@ def compute_edge_breakdown(a, entry):
         _risk("Overextended from level", 3)
     if risk_label == "Choppy":
         _risk("Choppy conditions", 3)
+    # Volatility CAUTION (tradable-but-risky) dents the score and flags the card.
+    # A BLOCK regime never reaches here — it holds the setup at the gate (WAIT).
+    vol = a.get("volatility") or {}
+    if vol.get("status") == "ok" and vol.get("caution"):
+        if vol.get("regime") == "HIGH_CAUTION":
+            _risk("Elevated volatility", 5)
+        elif vol.get("regime") == "QUIET_CAUTION":
+            _risk("Thin / quiet volatility", 5)
 
     # Dedup by label, preserving first occurrence.
     def _dedup(items):
@@ -4293,6 +4467,7 @@ def _build_card_entry(a, ticker=None, record=None):
         "vwap_position":      vwap_position,
         "supply_demand_zone": sd_zone,
         "screenshot_url":     screenshot_url,
+        "volatility":         a.get("volatility"),
     }
     entry["setup_categories"] = classify_setup_categories(entry)
     entry["setup_notes"]      = build_setup_notes(a, entry)
@@ -5069,6 +5244,7 @@ def status():
         "vwap_status":         a.get("vwap_status"),
         "vwap_source":         (VWAP_BY_TICKER.get(a.get("active_ticker")) or {}).get("source"),
         "active_ticker":       a.get("active_ticker"),
+        "volatility":          a.get("volatility"),
         "recommendation":      a["recommendation"],
         "reasoning_chain":     a["reasoning_chain"],
         "setup_stage":         a["setup_stage"],
@@ -5633,7 +5809,14 @@ async function refreshRec() {
     const sess = d.session_preferred
       ? '<span style="color:#22c55e">● Preferred Session (+'+(d.session_bonus!=null?d.session_bonus:10)+')</span>'
       : '<span style="color:#6b7280">○ Off-session</span>';
-    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess;
+    const vol = d.volatility || {};
+    let volTxt = '';
+    if (vol.status === 'ok') {
+      const vc = vol.blocked ? '#ef4444' : vol.caution ? '#f59e0b' : '#22c55e';
+      const vr = vol.ratio!=null ? ' <span style="color:#6b7280;font-size:11px">'+Number(vol.ratio).toFixed(2)+'×</span>' : '';
+      volTxt = ' &nbsp;·&nbsp; Vol <b style="color:'+vc+'">'+(vol.label||'—')+'</b>'+vr;
+    }
+    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt;
 
     const score = d.edge_score!=null ? d.edge_score : 0;
     const grade = d.edge_grade ? ' · ' + d.edge_grade : '';
