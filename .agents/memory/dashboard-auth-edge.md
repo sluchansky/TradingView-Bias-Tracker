@@ -42,10 +42,16 @@ It now posts to the protected `/enter` route, which is behaviorally equivalent t
 `/webhook` ENTER command path for manual entry. VWAP-set still posts to open `/webhook`
 (reference value, intentionally out of the enter/close/mode scope).
 
-**Webhook trade commands are CLOSED:** the owner confirmed entries/closes are always
-manual from the dashboard (no TradingView auto-trading). So the open `/webhook` now
-REJECTS `MGC/MNQ ENTER` and `MGC/MNQ CLOSE` (`_COMMAND_TYPES`) with HTTP 403 before
-any execution — an exposed webhook URL can no longer open/close a trade. The helper
-`_handle_command_alert` is retained but no longer wired to the webhook. Analysis/VWAP
-alert types are unaffected. If TradingView auto-trading is ever wanted, re-enable via
-a shared-secret token on the webhook (do NOT just re-wire the open path).
+**Webhook trade commands are OPEN (by explicit user choice):** the owner DOES use
+TradingView to send `MGC/MNQ ENTER` and `MGC/MNQ CLOSE`, so the open `/webhook` wires
+`_COMMAND_TYPES` straight to `_handle_command_alert` (no auth). This path is
+intentionally unauthenticated — anyone who knows the webhook URL can trigger
+ENTER/CLOSE. The user was shown the shared-secret-token alternative and declined it
+in favour of keeping existing TradingView alerts working unmodified. **Why it can't be
+password-protected:** TradingView alerts can only set URL + message body — no custom
+HTTP header — so HTTP Basic Auth is impossible on this path; the only real lock is a
+shared secret embedded in the alert JSON body. The dashboard ENTER button still posts
+to the protected `/enter` (human path stays locked); only the machine/TradingView path
+is open. **Reminder:** "entering a trade" only records ACTIVE_TRADE in-memory + posts
+Discord — there is NO real broker/order execution anywhere (every `requests.post` in
+app.py targets Discord). Live order execution would be a separate broker integration.

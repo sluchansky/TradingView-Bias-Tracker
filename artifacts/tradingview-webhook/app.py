@@ -4879,21 +4879,17 @@ def webhook():
             "price":       parsed_price if parsed_price is not None else CURRENT_PRICE,
         }), 200
 
-    # ── Command types: ENTER / CLOSE are owner-only and NOT accepted here ─────
-    #    Trade entry/exit happens exclusively via the password-protected
-    #    dashboard (/enter, /close). Rejecting them on the open webhook means an
-    #    exposed webhook URL can never open or close a trade. (_handle_command_alert
-    #    is retained but intentionally no longer wired to the public webhook.)
+    # ── Command types: ENTER / CLOSE sent via TradingView webhook ─────────────
+    #    Per user choice, the webhook stays OPEN (no shared-secret) so existing
+    #    TradingView ENTER/CLOSE alerts work unmodified. Trade entry/exit is also
+    #    available via the password-protected dashboard (/enter, /close).
+    #    NOTE: this path is intentionally unauthenticated — anyone who knows the
+    #    webhook URL can trigger ENTER/CLOSE here. The user accepted this tradeoff
+    #    in favour of keeping their TradingView automation working as-is.
     if normalized in _COMMAND_TYPES:
-        logger.warning(
-            "Rejected %s on open /webhook — trade commands are dashboard-only",
-            normalized,
-        )
-        return jsonify({
-            "status": "rejected",
-            "reason": "Trade commands (ENTER/CLOSE) are not accepted via the webhook; "
-                      "use the password-protected dashboard.",
-        }), 403
+        _resp = _handle_command_alert(normalized, data, parsed_price, resolved_inst)
+        if _resp is not None:
+            return _resp
 
     record = {
         "alert_type":        normalized,
