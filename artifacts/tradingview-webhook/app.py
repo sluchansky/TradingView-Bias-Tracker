@@ -5601,10 +5601,26 @@ def dashboard():
   #toast.show{opacity:1}
   #refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-right:6px;animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  /* Sensitivity (trading mode) toggle */
+  #mode-row{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+  #mode-cap{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#555;white-space:nowrap}
+  .mode-seg{display:flex;flex:1;background:#0d0d18;border:1px solid #1e1e32;border-radius:12px;padding:4px;gap:4px}
+  .mode-btn{flex:1;text-align:center;font-size:12px;font-weight:700;padding:9px 6px;border-radius:9px;color:#6a6a7a;cursor:pointer;transition:all .15s;letter-spacing:.3px}
+  #mode-scalp.active{background:#3a2a0d;color:#f5b342;box-shadow:inset 0 0 0 1px #5a4a1a}
+  #mode-swing.active{background:#16203a;color:#9ec5ff;box-shadow:inset 0 0 0 1px #2a3a5a}
 </style>
 </head>
 <body>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
+
+<!-- Sensitivity (trading mode) -->
+<div id="mode-row">
+  <span id="mode-cap">Sensitivity</span>
+  <div class="mode-seg">
+    <div class="mode-btn" id="mode-scalp" onclick="setMode('SCALP')">SCALP · Sensitive</div>
+    <div class="mode-btn" id="mode-swing" onclick="setMode('SWING')">SWING · Strict</div>
+  </div>
+</div>
 
 <!-- Status card -->
 <div id="status-card">
@@ -5773,6 +5789,27 @@ async function sendEod() {
   } catch(err) { toast('Request failed', false); }
 }
 
+function paintMode(m) {
+  const sc = document.getElementById('mode-scalp');
+  const sw = document.getElementById('mode-swing');
+  if (!sc || !sw) return;
+  sc.classList.toggle('active', m === 'SCALP');
+  sw.classList.toggle('active', m === 'SWING');
+}
+async function loadMode() {
+  try { const d = await api('/mode'); if (d.trading_mode) paintMode(d.trading_mode); } catch(e) {}
+}
+async function setMode(m) {
+  try {
+    const d = await api('/mode', { mode: m });
+    if (d.trading_mode) {
+      paintMode(d.trading_mode);
+      toast(m === 'SCALP' ? '⚡ SCALP — more sensitive' : '🎯 SWING — stricter');
+      refreshRec();
+    } else toast('Error: '+(d.reason||d.status), false);
+  } catch(e) { toast('Request failed', false); }
+}
+
 let lastRec = null;
 function ckItem(label, ok) {
   return '<div class="rec-item '+(ok?'ok':'no')+'"><span class="ck">'+(ok?'✅':'⬜')+'</span>'+label+'</div>';
@@ -5781,6 +5818,7 @@ async function refreshRec() {
   try {
     const d = await api('/status?ticker='+encodeURIComponent(sym));
     lastRec = d;
+    if (d.trading_mode) paintMode(d.trading_mode);
     const badge  = document.getElementById('rec-badge');
     const meta   = document.getElementById('rec-meta');
     const bar    = document.getElementById('rec-score-bar');
@@ -5913,7 +5951,7 @@ async function refresh() {
 }
 
 // Poll every 3 seconds
-refresh(); refreshRec();
+refresh(); refreshRec(); loadMode();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 </script>
 </body>
