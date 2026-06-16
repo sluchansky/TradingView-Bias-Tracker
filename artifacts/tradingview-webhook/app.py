@@ -4596,6 +4596,33 @@ def webhook():
     if not data and raw_body:
         data = {"alert_type": raw_body.strip()}
 
+    # ── Compatibility shim: alternate VWAP alert schema ──────────────────────
+    # Some TradingView VWAP alerts post {"signal":"VWAP_BULLISH","symbol":"MNQ1!",
+    # "instrument":"MGC",...} instead of the canonical
+    # {"alert_type":"MNQ VWAP","ticker":"MNQ1!",...}. Map them onto the existing
+    # data-only VWAP type so they are ingested (price refresh + ack) instead of
+    # dropped as "unrecognized". The chart `symbol` is the authoritative
+    # instrument (it is the literal {{ticker}} and matches the price level); the
+    # free-text `instrument` field is only a fallback and is ignored when it
+    # disagrees. No `vwap` value is invented, so the auto-fetched VWAP is never
+    # corrupted — these alerts simply refresh the per-instrument price.
+    if not (data.get("alert_type") or data.get("message") or data.get("text")):
+        _sig = str(data.get("signal") or "").strip().upper()
+        if _sig.startswith("VWAP"):
+            _vw_inst = (_instrument_from_text(data.get("symbol"))
+                        or _instrument_from_text(data.get("ticker"))
+                        or _instrument_from_text(data.get("instrument")))
+            if _vw_inst:
+                _inst_field = _instrument_from_text(data.get("instrument"))
+                if _inst_field is not None and _inst_field != _vw_inst:
+                    logger.warning("VWAP alert symbol=%r disagrees with instrument=%r; "
+                                   "using %s (chart symbol is authoritative)",
+                                   data.get("symbol"), data.get("instrument"), _vw_inst)
+                data["alert_type"] = f"{_vw_inst} VWAP"
+                data.setdefault("ticker", data.get("symbol") or _vw_inst)
+                logger.info("Normalized alternate VWAP alert (signal=%r) → %s",
+                            _sig, data["alert_type"])
+
     alert_type = (data.get("alert_type") or data.get("message") or data.get("text") or "")
     normalized = alert_type.strip().upper()
 
