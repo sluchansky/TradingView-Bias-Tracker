@@ -393,6 +393,25 @@ HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (
 # Recurring "trade ready" alert: re-post the clean card every 5 min while a setup
 # is READY (in addition to the instant alert on the triggering webhook).
 TRADE_READY_INTERVAL = int(os.environ.get("TRADE_READY_INTERVAL", 300))  # seconds (default 5 min)
+
+# ── EARLY intrabar pre-READY alert config (additive, DISPLAY-ONLY) ────────────
+# An ⚡ EARLY LONG/SHORT fires the instant a liquidity sweep + a structure shift
+# (CHOCH / BOS / HH-HL-LH-LL "displacement") appear together in the window —
+# BEFORE the 5m candle-close confirmation that the strict READY card waits for.
+# It is PURELY ADDITIVE: it never touches evaluate_strict_setup, the READY
+# verdict/score/SWING parity, the journal, or managed trades. READY remains the
+# single confirmed signal; EARLY is an unconfirmed heads-up that precedes it.
+EARLY_ALERTS_ENABLED = os.environ.get("ENABLE_EARLY_ALERTS", "true").strip().lower() in ("1", "true", "yes", "on")
+# Where EARLY posts: "main" (default, the live signal channel) | "journal" | "none".
+EARLY_ALERT_CHANNEL  = os.environ.get("EARLY_ALERT_CHANNEL", "main").strip().lower()
+# Phone ping (@mention) on EARLY — OFF by default so a speculative early signal
+# doesn't buzz; the confirmed READY card keeps its own ping. Flip on to ping EARLY.
+EARLY_ALERT_PING     = os.environ.get("EARLY_ALERT_PING", "false").strip().lower() in ("1", "true", "yes", "on")
+# How recent (minutes) the sweep AND structure must both be to form an EARLY setup.
+EARLY_WINDOW_MIN     = float(os.environ.get("EARLY_WINDOW_MIN", 10))
+# Secondary guard against re-firing the same setup within this many seconds (the
+# per-setup dedupe is primary; this just bounds edge cases).
+EARLY_ALERT_COOLDOWN_SEC = int(os.environ.get("EARLY_ALERT_COOLDOWN_SEC", 180))
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 # ── Weekly performance report (additive) ──────────────────────────────────────
 # Posts a week-in-review embed once a week, just after the close. Default is
@@ -3863,6 +3882,9 @@ def send_live_ready_card(entry, ticker="", notify=False):
     # Record the send time per-instrument so the periodic loop throttles against it
     # (prevents an instant card and a periodic card landing seconds apart).
     LAST_LIVE_CARD_AT[instrument_of(ticker or entry.get("symbol", ""))] = datetime.now(timezone.utc)
+    # Additive: record the READY send time per-instrument for the Diagnostics
+    # readyAlertTime / waitedForCandleClose fields (display-only; never gates).
+    LAST_READY_SENT_AT[instrument_of(ticker or entry.get("symbol", ""))] = datetime.now(timezone.utc)
     # Build + post inside the guard so a render failure (e.g. an unforeseen new
     # card field) can never raise into the caller — the alert path stays fail-open.
     embed = None
@@ -3908,6 +3930,12 @@ def send_live_ready_card(entry, ticker="", notify=False):
 # persists, so a standing WATCH/ARMED never spams on every webhook.
 LAST_TIER_LEVEL = {}   # instrument -> last alert_level seen ("WATCH"/"ARMED"/"READY")
 LAST_TIER_AT    = {}   # instrument -> datetime (UTC) of last WATCH/ARMED post attempt
+
+# ── EARLY pre-READY alert runtime state (additive, display-only) ──────────────
+LAST_EARLY_ANCHOR  = {}  # (instrument, direction) -> structure-anchor ISO already EARLY-alerted (per-setup dedupe)
+LAST_EARLY_AT      = {}  # (instrument, direction) -> datetime (UTC) of last EARLY post (cooldown guard)
+EARLY_EVENT_TIMES  = {}  # instrument -> latest event/alert timestamps (ISO) for the Diagnostics page
+LAST_READY_SENT_AT = {}  # instrument -> datetime (UTC) the READY card last fired (Diagnostics readyAlertTime)
 
 
 def _tiered_alert_url(inst):
@@ -4031,6 +4059,215 @@ def _maybe_send_tiered_alert(a, record):
         logger.error("Tiered alert build error (%s/%s): %s", inst, level, exc)
         return False
     _enqueue_slow(lambda u=url, e=embed, i=inst, lv=level: _post_tiered_embed(u, e, i, lv))
+    return True
+
+
+# ── EARLY intrabar pre-READY alerts (additive, DISPLAY-ONLY) ──────────────────
+def _early_latest_ts(alert_history, alert_type, inst, ticker_scoped, cutoff):
+    """Most recent UTC timestamp of `alert_type` for `inst` at/after `cutoff`, using
+    the SAME instrument-scoping as evaluate_strict_setup._latest_ts (un-prefixed
+    CHOCH/BOS/HH.. are scoped by the instrument resolved at ingestion; sweep types
+    embed the instrument in their name). None if absent. Read-only."""
+    latest = None
+    for a in alert_history:
+        if a.get("alert_type") != alert_type:
+            continue
+        if not ticker_scoped:
+            a_inst = (a.get("instrument")
+                      or _instrument_from_text(a.get("ticker"))
+                      or _instrument_from_text(a.get("alert_type")))
+            if a_inst != inst:
+                continue
+        try:
+            ts = datetime.fromisoformat(a["timestamp"])
+        except (KeyError, ValueError):
+            continue
+        if ts < cutoff:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _early_event_times(inst, alert_history):
+    """Scan ALERT_HISTORY (within EARLY_WINDOW_MIN) for the EARLY building blocks of
+    each direction: a liquidity sweep + a structure shift. 'displacement' maps to
+    impulsive structure (BOS / HH-HL-LH-LL) and 'choch' to CHOCH; 'structure' is
+    the latest of the two. event_start is the first of (sweep, structure). All
+    times are server-ingestion timestamps (no bar time is in the payload). Pure /
+    read-only — never feeds the gate."""
+    cutoff = now_utc() - timedelta(minutes=EARLY_WINDOW_MIN)
+    def lt(t, scoped=False):
+        return _early_latest_ts(alert_history, t, inst, scoped, cutoff)
+    def _max(*xs):
+        xs = [x for x in xs if x]
+        return max(xs) if xs else None
+    def _min(*xs):
+        xs = [x for x in xs if x]
+        return min(xs) if xs else None
+    bear_sweep   = lt(f"{inst} BEARISH SWEEP", True)
+    choch_sup    = lt("CHOCH SUPPLY")
+    short_disp   = _max(lt("BOS SUPPLY"), lt("LH"), lt("LL"))
+    short_struct = _max(choch_sup, short_disp)
+    bull_sweep   = lt(f"{inst} BULLISH SWEEP", True)
+    choch_dem    = lt("CHOCH DEMAND")
+    long_disp    = _max(lt("BOS DEMAND"), lt("HH"), lt("HL"))
+    long_struct  = _max(choch_dem, long_disp)
+    return {
+        "Short": {"sweep": bear_sweep, "choch": choch_sup, "displacement": short_disp,
+                  "structure": short_struct, "event_start": _min(bear_sweep, short_struct)},
+        "Long":  {"sweep": bull_sweep, "choch": choch_dem, "displacement": long_disp,
+                  "structure": long_struct, "event_start": _min(bull_sweep, long_struct)},
+    }
+
+
+def _early_alert_url(inst):
+    """Resolve the Discord channel for EARLY alerts. EARLY_ALERT_CHANNEL =
+    main (default, the live signal channel) | journal | none (disables)."""
+    if EARLY_ALERT_CHANNEL == "none":
+        return None
+    if EARLY_ALERT_CHANNEL == "journal":
+        return DISCORD_JOURNAL_WEBHOOK_URL or _discord_url(inst)
+    return _discord_url(inst)
+
+
+def _build_early_embed(a, inst, direction, t):
+    """Compact ⚡ EARLY LONG/SHORT embed. DISPLAY-ONLY — announces an early,
+    UNCONFIRMED entry (sweep + structure shift) that fired before the candle close,
+    with the confirmed READY card still to follow. Everything is read from the
+    analysis `a` / event times `t`, never fabricated."""
+    price     = a.get("current_price")
+    side_word = "supply" if direction == "Short" else "demand"
+    zone      = a.get("nearest_supply") if direction == "Short" else a.get("nearest_demand")
+    bias_word = "bearish" if direction == "Short" else "bullish"
+    title, color = (("⚡ EARLY SHORT", 0xE74C3C) if direction == "Short"
+                    else ("⚡ EARLY LONG", 0x2ECC71))
+    def et(ts):
+        return fmt_et(ts, "%H:%M:%S ET") if ts else "—"
+    fields = [
+        {"name": "Trigger", "value": f"Liquidity sweep + {bias_word} structure (CHOCH/displacement)", "inline": False},
+    ]
+    if price is not None:
+        fields.append({"name": "Price", "value": f"{price:,.2f}", "inline": True})
+    if zone:
+        fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
+    fields.append({"name": "Sweep",     "value": et(t.get("sweep")),     "inline": True})
+    fields.append({"name": "Structure", "value": et(t.get("structure")), "inline": True})
+    return {
+        "title":       f"{title} · {inst}",
+        "description": "Early, *unconfirmed* entry — fired before the candle close. "
+                       "The confirmed READY card follows if it holds.",
+        "color":       color,
+        "fields":      fields,
+        "footer":      {"text": f"Early Signal · {inst} · not a confirmed READY"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _post_early_embed(url, embed, inst, direction, ping):
+    """Slow-task worker body: POST a prebuilt EARLY embed to Discord, OFF the
+    webhook worker (via _enqueue_slow) so a slow/timing-out call can never delay the
+    decision, the READY card, or the next webhook. Best-effort — swallows failures."""
+    try:
+        payload = {"embeds": [embed]}
+        if ping and DISCORD_ALERT_MENTION:
+            payload["content"] = DISCORD_ALERT_MENTION
+            payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.warning("EARLY %s alert post failed (%s): %s %s",
+                           direction, inst, resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("EARLY %s alert post error (%s): %s", direction, inst, exc)
+
+
+def _store_early_times(inst, direction, times):
+    """Persist the latest EARLY event timestamps (ISO) per instrument for the
+    Diagnostics page. Preserves earlyAlertTime (set only when EARLY actually fires)."""
+    if not inst:
+        return
+    slot = EARLY_EVENT_TIMES.setdefault(inst, {})
+    if direction is None:
+        slot["direction"]        = None
+        slot["eventStartTime"]   = None
+        slot["sweepTime"]        = None
+        slot["chochTime"]        = None
+        slot["displacementTime"] = None
+        return
+    t = times[direction]
+    def iso(x):
+        return x.isoformat() if x else None
+    slot["direction"]        = direction
+    slot["eventStartTime"]   = iso(t.get("event_start"))
+    slot["sweepTime"]        = iso(t.get("sweep"))
+    slot["chochTime"]        = iso(t.get("choch"))
+    slot["displacementTime"] = iso(t.get("displacement"))
+
+
+def _maybe_dispatch_early_alert(a, record):
+    """Fire an ⚡ EARLY LONG/SHORT the instant a sweep + structure shift appear
+    together, BEFORE the strict candle-close confirmation. PURELY ADDITIVE and
+    fail-open: never touches evaluate_strict_setup, the READY verdict/score, SWING
+    parity, the journal, or managed trades. Fires ONCE per active setup (per-
+    direction dedupe that resets when the setup goes inactive). Skipped when the
+    verdict is already READY (the confirmed card owns it), the zone is broken, or a
+    trade is active. Returns True iff an EARLY embed was enqueued. Refreshes
+    EARLY_EVENT_TIMES (for the Diagnostics page) on every call."""
+    if not EARLY_ALERTS_ENABLED:
+        return False
+    inst = instrument_of(record.get("ticker") or record.get("instrument")
+                         or a.get("active_ticker") or "")
+    if not inst:
+        return False
+    times = _early_event_times(inst, ALERT_HISTORY)
+    active = [d for d in ("Short", "Long")
+              if times[d]["sweep"] and times[d]["structure"]]
+    chosen = active[0] if len(active) == 1 else None  # ambiguous (both) → stand aside
+    _store_early_times(inst, chosen, times)
+    if not active:
+        # Setup fully inactive → reset per-setup dedupe so the next clean setup
+        # re-fires, and clear the stale early-alert stamp for the Diagnostics row.
+        LAST_EARLY_ANCHOR.pop((inst, "Short"), None)
+        LAST_EARLY_ANCHOR.pop((inst, "Long"), None)
+        EARLY_EVENT_TIMES.get(inst, {}).pop("earlyAlertTime", None)
+        return False
+    if chosen is None:
+        # Ambiguous (both sides active) → stand aside, but PRESERVE the dedupe
+        # anchors: a side that already EARLY-fired must not be re-armed and re-fire
+        # when the ambiguity later resolves back to that same side in-window.
+        return False
+    key = (inst, chosen)
+    # READY already owns the signal — never post EARLY at/after the confirmation;
+    # mark dedupe so a late EARLY can't fire after READY for this setup.
+    if a.get("verdict") in ("LONG READY", "SHORT READY"):
+        LAST_EARLY_ANCHOR[key] = "ready"
+        return False
+    # Honour the same hard invalidations the gate uses (display-side only).
+    if a.get("zone_broken_active") or ACTIVE_TRADE:
+        return False
+    if LAST_EARLY_ANCHOR.get(key):     # already EARLY-alerted this active setup
+        return False
+    now = datetime.now(timezone.utc)
+    last_at = LAST_EARLY_AT.get(key)
+    if last_at and (now - last_at).total_seconds() < EARLY_ALERT_COOLDOWN_SEC:
+        return False
+    url = _early_alert_url(inst)
+    if not url:
+        return False
+    # Build the embed BEFORE committing any dedupe / diagnostics state, so a build
+    # failure can't leave the setup stuck-deduped or falsely stamp earlyAlertTime.
+    try:
+        embed = _build_early_embed(a, inst, chosen, times[chosen])
+    except Exception as exc:
+        logger.error("EARLY alert build error (%s/%s): %s", inst, chosen, exc)
+        return False
+    anchor = times[chosen]["structure"]
+    LAST_EARLY_ANCHOR[key] = anchor.isoformat() if anchor else now.isoformat()
+    LAST_EARLY_AT[key]     = now
+    EARLY_EVENT_TIMES.setdefault(inst, {})["earlyAlertTime"] = now.isoformat()
+    _enqueue_slow(lambda u=url, e=embed, i=inst, d=chosen, p=EARLY_ALERT_PING:
+                  _post_early_embed(u, e, i, d, p))
+    logger.info("EARLY %s alert enqueued (%s) — sweep+structure before confirmation", chosen, inst)
     return True
 
 
@@ -5594,6 +5831,45 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     if not blockers:
         blockers = "READY" if verdict.endswith("READY") else "-"
 
+    # ── EARLY pre-READY timing (additive diagnostics; never affects the gate) ────
+    et_slot         = dict(EARLY_EVENT_TIMES.get(inst_key) or {}) if inst_key else {}
+    early_at_iso    = et_slot.get("earlyAlertTime")
+    event_start_iso = et_slot.get("eventStartTime")
+    event_start_dt  = None
+    if event_start_iso:
+        try:
+            event_start_dt = datetime.fromisoformat(event_start_iso)
+        except (ValueError, TypeError):
+            event_start_dt = None
+    # LAST_READY_SENT_AT is per-instrument and persists across setups. Attribute a
+    # READY send to THIS event row ONLY when the current verdict is READY, or the
+    # recorded READY happened at/after this event's start — otherwise it's a stale
+    # READY from an earlier setup and must not pair with a fresh event.
+    ready_dt         = LAST_READY_SENT_AT.get(inst_key) if inst_key else None
+    ready_is_current = bool(ready_dt) and (
+        verdict.endswith("READY")
+        or (event_start_dt is not None and ready_dt >= event_start_dt))
+    ready_at_iso    = ready_dt.isoformat() if ready_is_current else None
+    first_alert_iso = early_at_iso or ready_at_iso   # EARLY if it fired, else READY
+    alert_delay_seconds = None
+    try:
+        if event_start_iso and first_alert_iso:
+            delay = (datetime.fromisoformat(first_alert_iso)
+                     - datetime.fromisoformat(event_start_iso)).total_seconds()
+            if delay >= 0:                       # guard against stale/negative pairs
+                alert_delay_seconds = round(delay, 1)
+    except (ValueError, TypeError):
+        alert_delay_seconds = None
+    # False when EARLY caught it first; True when the current verdict is the
+    # candle-close READY with no EARLY preceding it; None otherwise (incl. later
+    # WAIT re-evaluations after a prior READY, so a stale READY can't read as True).
+    if early_at_iso:
+        waited_for_candle_close = False
+    elif verdict.endswith("READY"):
+        waited_for_candle_close = True
+    else:
+        waited_for_candle_close = None
+
     record = {
         "webhookReceivedAt":    webhook_received_at.isoformat() if webhook_received_at else None,
         "evaluationStartedAt":  eval_started_at.isoformat() if eval_started_at else None,
@@ -5633,6 +5909,15 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         "cooldownMs":           cooldown_ms,
         "cooldownRemainingMs":  cooldown_remaining_ms,
         "suppressedByCooldown": suppressed,
+        # ── EARLY pre-READY timing (additive) ──
+        "eventStartTime":       event_start_iso,
+        "sweepTime":            et_slot.get("sweepTime"),
+        "chochTime":            et_slot.get("chochTime"),
+        "displacementTime":     et_slot.get("displacementTime"),
+        "earlyAlertTime":       early_at_iso,
+        "readyAlertTime":       ready_at_iso,
+        "alertDelaySeconds":    alert_delay_seconds,
+        "waitedForCandleClose": waited_for_candle_close,
     }
     with EVAL_METRICS_LOCK:
         EVAL_METRICS.append(record)
@@ -5678,6 +5963,15 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                              eval_finished_at, eval_duration_ms, alert_sent_at,
                              resolved_inst, tiered_sent=tiered_sent)
         return
+
+    # ── EARLY intrabar pre-READY alert (additive, fail-open). Fired HERE — before
+    # the journal/READY-card path below — so an early, unconfirmed sweep+structure
+    # heads-up precedes the confirmed READY in time. It never alters the verdict,
+    # the journal, or managed trades. ──
+    try:
+        _maybe_dispatch_early_alert(a, record)
+    except Exception as exc:
+        logger.error("EARLY alert dispatch error: %s", exc)
 
     # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
     _risk_mult = (cfg("RISK_MULT_ATTEMPT")
@@ -6165,8 +6459,10 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <th>ATR</th><th>Base ATR</th><th>Mult</th><th>Threshold</th><th>Vol Decision</th>
 <th>Alert Level</th><th>Edge</th><th>Confirms</th><th>Gate Blockers</th>
 <th>Sent?</th><th>Cooldown Left ms</th><th>Suppressed</th>
+<th>Event Start</th><th>Sweep</th><th>CHOCH</th><th>Displacement</th>
+<th>Early Alert</th><th>Ready Alert</th><th>Delay s</th><th>Waited Close</th>
 </tr></thead>
-<tbody id="rows"><tr><td class="empty" colspan="26">Loading...</td></tr></tbody>
+<tbody id="rows"><tr><td class="empty" colspan="34">Loading...</td></tr></tbody>
 </table>
 </div>
 <script>
@@ -6198,7 +6494,7 @@ function showError(msg){
   if(u){ u.className='bad'; u.textContent='\u26a0 '+msg+' \u2014 retrying every second'; }
   var rows=document.getElementById('rows');
   if(rows && rows.querySelector('.empty')){
-    rows.innerHTML='<tr><td class="empty" colspan="26">'+msg+' \u2014 retrying every second.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="34">'+msg+' \u2014 retrying every second.</td></tr>';
   }
 }
 async function refresh(){
@@ -6222,13 +6518,14 @@ async function refresh(){
       card('Eval duration', ms(e.evaluationDurationMs)+' ms', (e.evaluationDurationMs!==null&&e.evaluationDurationMs<1000)?'good':'warn')+
       card('Alert delay', ms(e.totalAlertDelayMs)+' ms', delayClass(e.totalAlertDelayMs))+
       card('Scoring', ms(e.scoringMs)+' ms', 'muted')+
+      card('Caught early', e.earlyAlertTime?'yes':(e.waitedForCandleClose?'no — waited close':'-'), e.earlyAlertTime?'good':(e.waitedForCandleClose?'bad':'muted'))+
       card('Evaluations', evals.length, 'muted');
   }else{
     sum.innerHTML=card('Evaluations','0','muted');
   }
   var rows=document.getElementById('rows');
   if(!evals.length){
-    rows.innerHTML='<tr><td class="empty" colspan="26">No evaluations yet - waiting for the next webhook.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="34">No evaluations yet - waiting for the next webhook.</td></tr>';
     return;
   }
   rows.innerHTML=evals.map(function(e){
@@ -6260,6 +6557,14 @@ async function refresh(){
       '<td class="'+(e.alertSent?'good':'muted')+'">'+(e.alertSent?'yes':'no')+'</td>'+
       '<td>'+ms(e.cooldownRemainingMs)+'</td>'+
       '<td class="'+(e.suppressedByCooldown?'warn':'muted')+'">'+(e.suppressedByCooldown?'yes':'-')+'</td>'+
+      '<td>'+etTime(e.eventStartTime)+'</td>'+
+      '<td>'+etTime(e.sweepTime)+'</td>'+
+      '<td>'+etTime(e.chochTime)+'</td>'+
+      '<td>'+etTime(e.displacementTime)+'</td>'+
+      '<td>'+etTime(e.earlyAlertTime)+'</td>'+
+      '<td>'+etTime(e.readyAlertTime)+'</td>'+
+      '<td>'+(e.alertDelaySeconds==null?'-':Number(e.alertDelaySeconds).toFixed(1))+'</td>'+
+      '<td class="'+(e.waitedForCandleClose===true?'bad':(e.waitedForCandleClose===false?'good':'muted'))+'">'+(e.waitedForCandleClose===true?'yes':(e.waitedForCandleClose===false?'no':'-'))+'</td>'+
     '</tr>';
   }).join('');
 }
