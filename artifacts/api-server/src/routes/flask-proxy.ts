@@ -9,16 +9,20 @@ function proxyToFlask(req: any, res: any) {
     ? "?" + new URLSearchParams(req.query as Record<string, string>).toString()
     : "";
 
-  const bodyStr =
-    req.body && Object.keys(req.body).length > 0
-      ? JSON.stringify(req.body)
-      : "";
+  // req.body is a Buffer (see express.raw in app.ts) holding the exact bytes the
+  // client sent. Forward it verbatim with its original content-type so Flask
+  // receives webhook payloads intact regardless of how TradingView labels them
+  // (text/plain, application/json, …). Flask parses with get_json(force=True)
+  // and falls back to the raw text, so the content-type only needs to be honest.
+  const bodyBuf: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-  };
-  if (bodyStr) {
-    headers["content-length"] = Buffer.byteLength(bodyStr).toString();
+  const headers: Record<string, string> = {};
+  if (bodyBuf.length > 0) {
+    const incomingCt = req.headers["content-type"];
+    headers["content-type"] =
+      (Array.isArray(incomingCt) ? incomingCt[0] : incomingCt) ||
+      "application/json";
+    headers["content-length"] = bodyBuf.length.toString();
   }
 
   const options: http.RequestOptions = {
@@ -40,8 +44,8 @@ function proxyToFlask(req: any, res: any) {
     res.status(502).json({ error: "Webhook server unreachable" });
   });
 
-  if (bodyStr) {
-    proxyReq.write(bodyStr);
+  if (bodyBuf.length > 0) {
+    proxyReq.write(bodyBuf);
   }
   proxyReq.end();
 }
