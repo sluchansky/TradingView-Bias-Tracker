@@ -58,6 +58,7 @@ router.all(
     "/clear",
     "/price",
     "/alerts",
+    "/diagnostics",
     "/status",
     "/mode",
     "/journal",

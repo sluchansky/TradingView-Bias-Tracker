@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import requests
 
 app = Flask(__name__)
@@ -2772,8 +2772,30 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     def _gate_debug(direction):
         sig = _signals(direction)
         score, _bd = _edge_for(direction)
+        # Granular per-gate signals (for the /diagnostics breakdown). Structure is
+        # ANY ONE of BOS/CHOCH/swing — these individual flags are shown for
+        # visibility; "structure_confirmed" is the actual gate.
+        if direction == "Long":
+            _bos, _choch = has_bos_demand, has_choch_demand
+            _swing       = bool(hh_ts or hl_ts)
+            _zone_pres   = nearest_demand is not None
+            _zone_mit    = has_mitigated_demand
+            _reaction    = reaction_long
+        else:
+            _bos, _choch = has_bos_supply, has_choch_supply
+            _swing       = bool(lh_ts or ll_ts)
+            _zone_pres   = nearest_supply is not None
+            _zone_mit    = has_mitigated_supply
+            _reaction    = reaction_short
         return {
             "direction":             direction,
+            "bos":                   bool(_bos),
+            "choch":                 bool(_choch),
+            "swing":                 bool(_swing),
+            "zone_present":          bool(_zone_pres),
+            "zone_mitigated":        bool(_zone_mit),
+            "reaction":              bool(_reaction),
+            "session_pref":          bool(session_pref),
             "zone_valid":            bool(sig["zone_valid"]),
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
             "structure_confirmed":   bool(sig["structure_confirmed"]),
@@ -2902,6 +2924,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "direction":  None,
             "score":      0,
             "confluences": _confluences(None),
+            "candidate":  None,
             "reason":     ("Conflicting structure — opposing structure on both sides "
                            f"within {CONFLICT_WINDOW_MIN} min. Stand aside."),
             "missing":    ["conflicting_structure"],
@@ -2926,6 +2949,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         return _ret({
             "label":      "Strong Trade" if score >= 90 else "Possible Trade",
             "direction":  candidate,
+            "candidate":  candidate,
             "score":      score,
             "confluences": blk["confluences"],
             "reason":     blk["reason"],
@@ -2945,6 +2969,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     return _ret({
         "label":      "WAIT",
         "direction":  None,
+        "candidate":  candidate,
         "score":      blk["score"],
         "confluences": blk["confluences"],
         "reason":     reason,
@@ -3250,6 +3275,8 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["session"] = session_state
     # Per-gate WAIT debug (which READY gate failed) — surfaced on /status + logs.
     result["gate_debug"] = strict.get("gate_debug")
+    # Candidate direction the gate evaluated (Long/Short/None) — for /diagnostics.
+    result["gate_candidate"] = strict.get("candidate")
 
     # ── Unified Edge Score (single source of truth) ──────────────────────────
     # The transparent, confluence-based Edge Score replaces the legacy bias-derived
@@ -4960,6 +4987,92 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
 # Routes
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-webhook gate diagnostics
+# ---------------------------------------------------------------------------
+# Every scored webhook produces a full PASS/FAIL breakdown of each READY gate so
+# the operator can see EXACTLY why a setup is WAIT. Entries are kept in a ring
+# buffer (viewable, owner-only, at /diagnostics) and mirrored best-effort to an
+# on-disk log. Recording is fail-open — diagnostics must never crash the worker.
+GATE_DIAGNOSTICS = deque(maxlen=400)
+_DIAG_LOCK       = threading.Lock()
+DIAG_LOG_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "gate_diagnostics.log")
+# Cap the on-disk mirror so a write-on-every-webhook file can never grow without
+# bound on a long-running VM. When the live file exceeds the cap it is rotated to
+# a single ".1" backup, bounding total disk use to ~2× the cap. The /diagnostics
+# ring buffer above is the owner-facing surface; the file is a best-effort mirror.
+DIAG_LOG_MAX_BYTES = 2 * 1024 * 1024   # 2 MB per file (≈ a few thousand entries)
+
+
+def _record_diagnostic(text):
+    try:
+        GATE_DIAGNOSTICS.append(text)
+    except Exception:
+        pass
+    try:
+        with _DIAG_LOCK:
+            try:
+                if os.path.getsize(DIAG_LOG_PATH) >= DIAG_LOG_MAX_BYTES:
+                    os.replace(DIAG_LOG_PATH, DIAG_LOG_PATH + ".1")
+            except FileNotFoundError:
+                pass
+            with open(DIAG_LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(text.rstrip("\n") + "\n\n")
+    except Exception:
+        pass
+
+
+def _pf(flag):
+    return "PASS" if flag else "FAIL"
+
+
+def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
+                           extra_blockers=None):
+    """Human-readable per-gate PASS/FAIL block for one scored webhook. `gd` is the
+    candidate direction's gate_debug from evaluate_strict_setup (expanded above).
+    Structure passes on ANY ONE of BOS/CHOCH/swing; the individual rows are shown
+    for visibility while "Structure (any one)" + "Blocked by" reflect the real
+    gate, so the breakdown never misreports the cause of a WAIT."""
+    gd    = gd or {}
+    side  = "Supply" if candidate == "Short" else "Demand"
+    ready = verdict in ("LONG READY", "SHORT READY")
+    cmp_  = "<" if candidate == "Short" else ">"
+    fails = list(gd.get("failed_conditions") or [])
+    for b in (extra_blockers or []):
+        if b and b not in fails:
+            fails.append(b)
+    lines = [
+        "──────── GATE DIAGNOSTIC ────────",
+        "%s | %s | Trigger: %s" % (
+            symbol, fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), trigger),
+        "Candidate direction: %s" % (candidate.upper() if candidate else "NONE"),
+        "",
+        "  BOS (%s) .............. %s" % (side, _pf(gd.get("bos"))),
+        "  CHOCH (%s) ............ %s" % (side, _pf(gd.get("choch"))),
+        "  Swing (HH/HL or LH/LL)  %s" % _pf(gd.get("swing")),
+        "  Structure (any one) ... %s" % _pf(gd.get("structure_confirmed")),
+        "  VWAP (price %s VWAP) ... %s" % (cmp_, _pf(gd.get("vwap_confirmed"))),
+        "  %s zone present ...... %s" % (side, _pf(gd.get("zone_present"))),
+        "  Zone Mitigated ........ %s" % _pf(gd.get("zone_mitigated")),
+        "  Reaction (candle/sweep) %s" % _pf(gd.get("reaction")),
+        "  Zone valid (mit+react)  %s" % _pf(gd.get("zone_valid")),
+        "  Trading Session (bonus) %s" % _pf(gd.get("session_pref")),
+        "  Conflict .............. %s" % ("YES" if gd.get("conflicting_structure") else "no"),
+        "  Volatility ............ %s" % ("BLOCK" if gd.get("volatility_block") else "ok"),
+        "  Edge Score ............ %d / %d" % (gd.get("edge_score", 0), EDGE_READY_THRESHOLD),
+        "",
+        "  FINAL READY DECISION: %s" % ("PASS" if ready else "FAIL"),
+    ]
+    if ready:
+        lines.append("  Result: %s" % verdict)
+    else:
+        lines.append("  Result: WAIT")
+        lines.append("  Blocked by: %s" % (", ".join(fails) if fails else "confluence"))
+    lines.append("──────── END DIAGNOSTIC ─────────")
+    return "\n".join(lines)
+
+
 def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                            account_size, risk_pct, profile_name):
     """Heavy webhook tail (analysis + journaling + Discord) run OFF the request
@@ -4978,6 +5091,10 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         _mz_price = a.get("mitigated_zone_price")
         send_zone_mitigated_message(record, _mz_price)
         logger.info("Zone mitigated (unconfirmed) — %s — scoring skipped", normalized)
+        _record_diagnostic(
+            "%s | %s | Trigger: %s\nResult: WAIT\nBlocked by: zone_consumed "
+            "(zone already reacted — scoring skipped)" % (
+                resolved_inst, fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), normalized))
         return
 
     # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
@@ -5045,6 +5162,24 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
         a["recommendation"], a["verdict"], a["structure_class"], a["risk_label"], _gate_str,
     )
+
+    # ── Full per-gate diagnostic — logged AND persisted to the owner-viewable
+    # /diagnostics buffer so it's clear EXACTLY which gate holds a setup at WAIT.
+    # Hard blockers applied after the gate (zone broken) are surfaced explicitly
+    # since gate_debug itself is not recomputed by those overrides. ──
+    _extra = []
+    if a.get("zone_broken_active"):
+        _extra.append("zone_broken")
+    _candidate = a.get("gate_candidate") or (
+        "Short" if a.get("verdict") == "SHORT READY"
+        else "Long" if a.get("verdict") == "LONG READY" else None)
+    try:
+        _diag = format_gate_diagnostic(resolved_inst, normalized, _candidate, _gd,
+                                       a["verdict"], extra_blockers=_extra)
+        logger.info("Gate diagnostic —\n%s", _diag)
+        _record_diagnostic(_diag)
+    except Exception as exc:
+        logger.error("Gate diagnostic formatting failed (alert still recorded): %s", exc)
 
 
 # ── Asynchronous webhook processing ──────────────────────────────────────────
@@ -5133,6 +5268,8 @@ def webhook():
 
     if normalized not in ALERT_TYPES:
         logger.warning("Unrecognized alert type: %r", alert_type)
+        _record_diagnostic("%s | IGNORED — unrecognized/empty alert: %r" % (
+            fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), alert_type))
         return jsonify({"status": "ignored", "reason": "unrecognized alert type", "received": alert_type}), 200
 
     # ── Authoritative instrument resolution (ticker-first; never silently MGC) ──
@@ -5143,6 +5280,8 @@ def webhook():
     if not res["ok"]:
         logger.warning("Ticker resolution rejected %r (ticker=%r): %s",
                        normalized, data.get("ticker"), res["error"])
+        _record_diagnostic("%s | REJECTED — %s — ticker resolution failed: %s" % (
+            fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), normalized, res["error"]))
         return jsonify({
             "status":     "error",
             "reason":     "ticker resolution failed",
@@ -5183,6 +5322,8 @@ def webhook():
         _vk = resolved_inst
         _vv, _vs = get_vwap(_vk)
         logger.info("VWAP update: %s = %s (%s)", _vk, _vv, _vs)
+        _record_diagnostic("%s | %s — VWAP update = %s (%s) — data only, no scoring" % (
+            fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), _vk, _vv, _vs))
         return jsonify({
             "status":      "vwap_updated",
             "ticker":      _vk,
@@ -5293,6 +5434,25 @@ def webhook():
 @app.route("/alerts", methods=["GET"])
 def get_alerts():
     return jsonify({"alerts": list(ALERT_HISTORY), "count": len(ALERT_HISTORY)}), 200
+
+
+@app.route("/diagnostics", methods=["GET"])
+def get_diagnostics():
+    """Owner-only (dashboard password, enforced by the Express proxy) plain-text
+    view of the most recent per-webhook gate diagnostics — newest first. `?n=`
+    limits the count (default 60). Shows EXACTLY why each alert was WAIT/READY."""
+    try:
+        n = int(request.args.get("n", 60))
+    except (ValueError, TypeError):
+        n = 60
+    n = max(1, min(n, GATE_DIAGNOSTICS.maxlen))
+    entries = list(GATE_DIAGNOSTICS)[-n:][::-1]
+    header = ("Gate diagnostics — %d shown of %d buffered (newest first).\n"
+              "Add ?n=N to show more (max %d). Each webhook the bot scores appears "
+              "here with a per-gate PASS/FAIL breakdown.\n" % (
+                  len(entries), len(GATE_DIAGNOSTICS), GATE_DIAGNOSTICS.maxlen))
+    body = "\n\n".join(entries) if entries else "No webhooks received yet."
+    return Response(header + "\n" + body + "\n", mimetype="text/plain")
 
 
 @app.route("/journal", methods=["GET"])
