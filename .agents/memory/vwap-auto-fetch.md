@@ -34,9 +34,14 @@ chart VWAP" over a one-time TradingView alert setup.
   `stale`/`missing` past its age window regardless of source; the background loop's
   job is to keep the value fresh, not to bypass the staleness check.
 
-- **Only VWAP is auto-sourced, not current price.** Current price stays driven by the
-  live TradingView alerts (more real-time than the public quote). Do not auto-fill
-  CURRENT_PRICE from the same feed — it would fight the alert-driven price.
+- **The GATE's current price is never auto-sourced; only the dashboard display is.**
+  The price that feeds the gate/scoring (`current_price_for`) stays driven by live
+  TradingView alerts (more real-time than the public quote) — never auto-fill it or it
+  would fight the alert-driven price. Separately, a DISPLAY-ONLY fallback
+  (`AUTO_PRICE_BY_TICKER` via `display_price_for`) auto-sources the dashboard price
+  from the same feed so a quiet/just-restarted market isn't blank. Precedence:
+  fresh alert → auto → stale alert → None; it is computed after all decision paths and
+  must never reach the gate.
 
 - **The fetch loop must never die or block requests.** It runs on a rescheduling
   timer (mirrors the heartbeat loop), swallows all errors, and a failed fetch leaves
