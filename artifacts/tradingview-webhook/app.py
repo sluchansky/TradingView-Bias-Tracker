@@ -8303,7 +8303,9 @@ function setDir(d) {
   document.querySelectorAll('.dir-btn').forEach(b=>b.classList.remove('active'));
   document.querySelector('.dir-btn.'+(d==='Long'?'long':'short')).classList.add('active');
   updateEnterBtn();
-  renderDirView();   // instant: re-render the analysis panel for the selected side (no refetch)
+  // instant: re-render the meter AND the analysis panel for the selected side (no refetch)
+  if (lastRec) renderGauge(lastRec);
+  renderDirView();
 }
 function updateEnterBtn() {
   const b = document.getElementById('btn-enter');
@@ -8423,6 +8425,18 @@ function jsReadyDir(v){
   if(!jsIsActionable(v)) return null;
   return /LONG/.test(v) ? 'Long' : (/SHORT/.test(v) ? 'Short' : null);
 }
+// Score → quality band, mirroring the Python _score_tier + _decision_support quality
+// mapping so a per-side gauge reads the same wording as the authoritative header.
+function jsTierForScore(s){
+  s = Number(s)||0;
+  if(s>=70) return 'HIGH CONVICTION';
+  if(s>=50) return 'READY';
+  if(s>=35) return 'EARLY READY';
+  return null;
+}
+function jsQualityForScore(s){
+  return ({'HIGH CONVICTION':'HIGH','READY':'MODERATE','EARLY READY':'SPECULATIVE'})[jsTierForScore(s)] || 'LOW';
+}
 
 // ── Trade Probability Gauge (speedometer) ────────────────────────────────────
 // Semi-circle 0-100 with a needle, red 0-40 / yellow 41-69 / green 70-100 bands,
@@ -8452,7 +8466,14 @@ function renderGauge(d){
   if(!wrap) return;
   drawGaugeBands();
   var ds=d.decision_support||{};
-  var prob = ds.probability!=null ? ds.probability : (d.edge_score!=null ? d.edge_score : 0);
+  // Direction-aware: the meter reflects the SELECTED side (the Long/Short toggle).
+  // The favored side's per-side Edge equals the authoritative Edge (parity), so the
+  // dominant side reads exactly like the system header; the other side shows its OWN
+  // (typically lower) Edge instead of mirroring it. Falls back to the authoritative
+  // probability when per-side data is absent (older server / market closed).
+  var blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
+  var prob = (blk && blk.edge_score!=null) ? blk.edge_score
+           : (ds.probability!=null ? ds.probability : (d.edge_score!=null ? d.edge_score : 0));
   prob = Math.max(0, Math.min(100, Number(prob)||0));
   // Needle: value 0 -> -90deg (left), 50 -> 0deg (up), 100 -> +90deg (right).
   var needle=document.getElementById('g-needle');
@@ -8461,27 +8482,31 @@ function renderGauge(d){
   var col = prob>=70?'#22c55e':(prob>=41?'#eab308':'#ef4444');
   var probEl=document.getElementById('g-prob');
   if(probEl){ probEl.textContent=Math.round(prob)+'%'; probEl.style.color=col; }
-  // Confidence label = decision-support Quality (falls back to conviction tier).
-  var quality = ds.quality || d.conviction_tier || '—';
+  // Confidence label = the SELECTED side's quality band (derived from its Edge so it
+  // can't contradict the needle); favored side matches the header by parity. Falls
+  // back to authoritative quality / conviction tier when per-side data is absent.
+  var quality = (blk && blk.edge_score!=null) ? jsQualityForScore(blk.edge_score)
+              : (ds.quality || d.conviction_tier || '—');
   var confEl=document.getElementById('g-conf');
   if(confEl) confEl.textContent = quality;
-  // Dominant direction.
-  var dom = d.dominant_direction || jsReadyDir(d.verdict);
+  // Direction indicator = the side you're viewing (the meter is per-side now).
   var dirTxt='—', dirCol='#9aa0b5';
-  if(dom==='Long'){ dirTxt='📈 LONG'; dirCol='#22c55e'; }
-  else if(dom==='Short'){ dirTxt='📉 SHORT'; dirCol='#ef4444'; }
+  if(dir==='Long'){ dirTxt='📈 LONG'; dirCol='#22c55e'; }
+  else if(dir==='Short'){ dirTxt='📉 SHORT'; dirCol='#ef4444'; }
   var dirEl=document.getElementById('g-dir');
   if(dirEl){ dirEl.textContent=dirTxt; dirEl.style.color=dirCol; }
-  // Long / Short / Edge-difference / Dominant row.
+  // Long / Short / Edge-difference / Dominant row — system context (both sides at
+  // once), independent of the selected toggle.
   var ls=d.long_score, ss=d.short_score;
   var diff=(ls!=null&&ss!=null)?Math.abs(ls-ss):(d.conflict_gap!=null?d.conflict_gap:null);
   var _n=function(x){ return x!=null?x:'—'; };
   var sc=document.getElementById('g-scores');
   if(sc) sc.innerHTML='Long <b style="color:#e8e8f0">'+_n(ls)+'</b> · Short <b style="color:#e8e8f0">'+_n(ss)
     +'</b><br>Δ Edge <b style="color:#e8e8f0">'+_n(diff)+'</b> · Dom <b style="color:#e8e8f0">'+_n(d.dominant_direction)+'</b>';
-  // Deep-green glow only for a HIGH-QUALITY full READY (high conviction + green band).
-  var hi = (quality==='HIGH') || (d.conviction_tier==='HIGH CONVICTION');
-  wrap.classList.toggle('glow', !!(hi && jsIsFullReady(d.verdict) && prob>=70));
+  // Deep-green glow only when VIEWING the actionable side at high conviction (full
+  // READY + the ready direction + green band) — never on the non-favored side.
+  var hi = (quality==='HIGH');
+  wrap.classList.toggle('glow', !!(hi && jsIsFullReady(d.verdict) && jsReadyDir(d.verdict)===dir && prob>=70));
 }
 async function refreshRec() {
   try {

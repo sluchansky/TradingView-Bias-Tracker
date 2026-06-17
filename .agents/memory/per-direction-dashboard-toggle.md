@@ -12,6 +12,19 @@ return path via a `_ret()` helper; `full_analysis` layers the per-direction edge
 top; `/status` exposes `directions`; the frontend `renderDirView()` renders the
 SELECTED toggle side while the badge/meta header stays authoritative.
 
+**The probability gauge (speedometer) is ALSO per-side.** `renderGauge(d)` reads
+`d.directions[dir].edge_score` for the needle/percentage and derives its quality label
+from that same per-side score (via `jsQualityForScore`, which mirrors the Python
+`_score_tier`+`_decision_support` bands: 70 HIGH / 50 MODERATE / 35 SPECULATIVE / else
+LOW) — so the meter can't contradict the header on the favored side (parity) yet shows
+the other side's lower reading. `setDir()` must call `renderGauge(lastRec)` (not just
+`renderDirView()`) or toggling won't move the needle — that omission was the original
+"Long and Short show the same meter" bug. The Long/Short/ΔEdge/Dom row + badge/meta
+header stay system-wide/toggle-independent; the gauge's direction label shows the
+SELECTED side and the deep-green glow requires viewing the actual full-READY side.
+In a quiet/balanced market both per-side edges are equal, so an equal meter is CORRECT,
+not a regression.
+
 **Invariants any change here must preserve:**
 - `directions` is ADDITIVE / display-only. It must NEVER feed back into the
   authoritative `verdict`, `strict_*`, `trade_plan`, journaling, or alert-card state —
