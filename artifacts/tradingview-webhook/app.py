@@ -3849,8 +3849,13 @@ def build_structure_fields(a, direction):
         sd_zone = f"{zone_word} zone broken"
     elif a.get("zone_mitigated_near"):
         sd_zone = f"{zone_word} zone consumed"
+    elif zone_lvl:
+        sd_zone = f"{zone_word} intact @ {zone_lvl}"
     else:
-        sd_zone = f"{zone_word} intact" + (f" @ {zone_lvl}" if zone_lvl else "")
+        # No nearest zone level on this side — do NOT claim "intact". That string
+        # both mislabels the Zone display and trips the Edge Score's zone_active
+        # check, fabricating a "Demand/Supply Zone Active" credit with no zone.
+        sd_zone = "—"
 
     return bos_status, choch_status, vwap_position, sd_zone
 
@@ -3885,7 +3890,7 @@ def build_setup_notes(a, entry):
             lines.append("Bullish CHOCH/BOS supports upside structure.")
         if vwap_pos.startswith("above"):
             lines.append("VWAP confluence supports continuation.")
-        if zone_intact and not zone_mitig:
+        if zone_intact and not zone_mitig and zone_lvl:
             lines.append("Demand zone remains intact.")
         lines.append(f"Looking for continuation toward {t1}."
                      if t1 not in (None, "") else
@@ -3903,7 +3908,7 @@ def build_setup_notes(a, entry):
             lines.append("Bearish CHOCH/BOS supports downside structure.")
         if vwap_pos.startswith("below"):
             lines.append("VWAP confluence supports continuation.")
-        if zone_intact and not zone_mitig:
+        if zone_intact and not zone_mitig and zone_lvl:
             lines.append("Supply zone remains respected.")
         lines.append(f"Looking for continuation toward {t1}."
                      if t1 not in (None, "") else
@@ -4056,7 +4061,11 @@ def compute_edge_breakdown(a, entry):
         has_choch = str(entry.get("choch_status") or "None") != "None"
         vwap_pos  = str(entry.get("vwap_position") or "").lower()
         vwap_ok   = vwap_pos.startswith("above") if is_long else vwap_pos.startswith("below")
-    zone_active = "intact" in str(entry.get("supply_demand_zone") or "").lower()
+    # A zone only counts as "active" when a real nearest zone level exists on the
+    # trade side AND it is intact. Defends the Edge Score against a phantom
+    # "Demand/Supply Zone Active" credit before any zone has been established.
+    zone_present = bool(a.get("nearest_demand") if is_long else a.get("nearest_supply"))
+    zone_active  = zone_present and "intact" in str(entry.get("supply_demand_zone") or "").lower()
     # "Liquidity Sweep" shows only when a real sweep alert was received from
     # TradingView (confluences.liquidity_sweep, set in evaluate_strict_setup from a
     # BULLISH/BEARISH SWEEP alert). "Confirmed Zone Reaction" reflects a
