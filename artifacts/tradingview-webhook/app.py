@@ -50,6 +50,12 @@ def _log_incoming_request():
 ALERT_HISTORY    = deque(maxlen=100)
 CURRENT_PRICE    = None
 CURRENT_PRICE_BY_TICKER = {}   # {"MNQ": float, "MGC": float} — latest price per instrument (alert-driven)
+CURRENT_PRICE_TS_BY_TICKER = {}  # {"MNQ": iso8601} — UTC time the alert price above was last set
+# Yahoo-sourced fallback price per instrument, refreshed by the VWAP auto-fetch
+# loop. DISPLAY-ONLY: it keeps the dashboard price readout live after a restart or
+# during quiet markets, and is NEVER read by the gate / scoring (which stay on the
+# authoritative alert-driven price above).
+AUTO_PRICE_BY_TICKER = {}      # {"MNQ": {"value": float, "ts": iso8601}}
 ACTIVE_TRADE     = None
 # Serialises the ENTER critical section so two concurrent ENTER requests can
 # never race on the ACTIVE_TRADE record.
@@ -301,6 +307,35 @@ def current_price_for(ticker):
     cannot show MGC's price against MNQ's VWAP."""
     return CURRENT_PRICE_BY_TICKER.get(instrument_of(ticker))
 
+
+def display_price_for(ticker):
+    """Best price to SHOW on the dashboard — returns (value, source). DISPLAY-ONLY:
+    never read by the gate / scoring, which always use the authoritative
+    alert-driven current_price_for().
+
+    The alert/chart price is authoritative while fresh (within PRICE_FRESH_MIN);
+    once it goes stale — or was never received, e.g. right after a deploy/restart —
+    we fall back to the auto-fetched market price so the readout always shows a live
+    number instead of a blank. source is "alert", "auto", "stale" or None."""
+    inst = instrument_of(ticker)
+    alert_p = CURRENT_PRICE_BY_TICKER.get(inst)
+    ts = CURRENT_PRICE_TS_BY_TICKER.get(inst)
+    fresh = False
+    if alert_p is not None and ts:
+        try:
+            age_min = (now_utc() - datetime.fromisoformat(ts)).total_seconds() / 60.0
+            fresh = age_min <= PRICE_FRESH_MIN
+        except (ValueError, TypeError):
+            fresh = True  # unparseable ts → treat the alert price as current
+    if alert_p is not None and fresh:
+        return alert_p, "alert"
+    auto = AUTO_PRICE_BY_TICKER.get(inst)
+    if auto and auto.get("value") is not None:
+        return auto["value"], "auto"
+    if alert_p is not None:
+        return alert_p, "stale"  # last resort: a stale price beats nothing
+    return None, None
+
 ACCOUNT_PROFILES = {
     "MGC Conservative": {"account_size": 50_000,  "risk_pct": 0.005},
     "MGC Standard":     {"account_size": 50_000,  "risk_pct": 0.010},
@@ -374,6 +409,11 @@ WEEKLY_REPORT_DAYS      = int(os.environ.get("WEEKLY_REPORT_DAYS", 7))  # lookba
 # wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that the auto value resumes.
 VWAP_FETCH_INTERVAL    = int(os.environ.get("VWAP_FETCH_INTERVAL", 60))   # seconds
 VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # minutes
+# How long an alert/chart price stays the AUTHORITATIVE dashboard readout after it
+# arrives. While fresh, the dashboard shows the exact chart price; once it goes
+# stale (no alerts) the readout falls back to the auto-fetched market price so it
+# keeps moving. Display-only — never affects the gate.
+PRICE_FRESH_MIN = float(os.environ.get("PRICE_FRESH_MIN", 5))  # minutes
 # MGC (micro gold) ≈ GC=F, MNQ (micro Nasdaq) ≈ NQ=F — same price, so same VWAP.
 VWAP_FEED_SYMBOL = {"MGC": "GC=F", "MNQ": "NQ=F"}
 
@@ -2460,6 +2500,17 @@ def _update_vwap_auto(instrument):
     logger.info("VWAP auto-fetch: %s = %s", instrument, value)
 
 
+def _update_price_auto(instrument):
+    """Refresh the DISPLAY-ONLY fallback price for one instrument from the market
+    feed (same source as VWAP: MGC≈GC=F, MNQ≈NQ=F). Best-effort — any failure just
+    leaves the previous value in place. Never feeds the gate / scoring."""
+    bar = _fetch_latest_bar(instrument)
+    if bar and bar.get("close") is not None:
+        AUTO_PRICE_BY_TICKER[instrument] = {
+            "value": round(float(bar["close"]), 4), "ts": now_utc().isoformat(),
+        }
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Volatility monitor (additive, FAIL-OPEN). A per-instrument 1-minute ATR is
 # compared to the session-typical range to classify the current volatility
@@ -2641,6 +2692,11 @@ def _vwap_autofetch_loop():
             _update_vwap_auto(instrument)
     except Exception as exc:  # never let the loop die
         logger.warning("VWAP auto-fetch loop error: %s", exc)
+    try:
+        for instrument in VWAP_FEED_SYMBOL:
+            _update_price_auto(instrument)
+    except Exception as exc:  # display fallback only — never disrupt the loop
+        logger.warning("Price auto-fetch loop error: %s", exc)
     try:
         for instrument in VWAP_FEED_SYMBOL:
             _update_volatility_auto(instrument)
@@ -3427,6 +3483,15 @@ def full_analysis(current_price_override=None, ticker_override=None):
                      verdict, overextended, risk_label)
     plan = build_trade_plan(bias, strength, bullish, bearish, counts)
 
+    # Dashboard price readout (DISPLAY-ONLY; the gate above uses `current_price`).
+    # An explicit price override is echoed as-is; otherwise show the fresh alert
+    # price, falling back to the auto-fetched market price so the readout never
+    # goes blank after a restart / quiet market.
+    if current_price_override is not None:
+        display_price, price_source = current_price, "alert"
+    else:
+        display_price, price_source = display_price_for(active_ticker)
+
     result = dict(
         bullish=bullish, bearish=bearish, counts=counts,
         bias=bias, strength=strength, confidence=confidence,
@@ -3443,6 +3508,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
         invalidation=invalidation,
         trade_plan=trade_plan,
         current_price=current_price,
+        display_price=display_price, price_source=price_source,
         last_price_by_type=last_price_by_type,
         nearest_supply=nearest_supply, nearest_demand=nearest_demand,
         structure_label=structure_label, structure_class=structure_class,
@@ -5890,6 +5956,7 @@ def webhook():
     if parsed_price is not None:
         CURRENT_PRICE = parsed_price
         CURRENT_PRICE_BY_TICKER[resolved_inst] = parsed_price
+        CURRENT_PRICE_TS_BY_TICKER[resolved_inst] = now_utc().isoformat()
 
     # ── VWAP ingestion (required input for the strict price-vs-VWAP filter) ──
     raw_vwap = data.get("vwap")
@@ -6332,6 +6399,7 @@ def clear_alerts():
     ALERT_HISTORY.clear()
     CURRENT_PRICE       = None
     CURRENT_PRICE_BY_TICKER.clear()
+    CURRENT_PRICE_TS_BY_TICKER.clear()
     ZONE_BROKEN_AT      = None
     MITIGATED_PRICES    = []
     ZONE_MITIGATED_FLAG = False
@@ -6431,6 +6499,8 @@ def status():
         "risk_detail":         a["risk_detail"],
         "overextended":        a["overextended"],
         "current_price":       a["current_price"],
+        "display_price":       a.get("display_price"),
+        "price_source":        a.get("price_source"),
         "nearest_supply":      a["nearest_supply"],
         "nearest_demand":      a["nearest_demand"],
         "longs_allowed":       a["plan"]["longs_allowed"],
@@ -6993,7 +7063,11 @@ async function refreshRec() {
     card.style.borderColor = v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b':'#1e1e32';
 
     const inst  = d.active_ticker ? String(d.active_ticker).replace('1!','') : '—';
-    const price = d.current_price!=null ? d.current_price : '—';
+    const _pval = d.display_price!=null ? d.display_price
+                : (d.current_price!=null ? d.current_price : null);
+    const price = _pval!=null ? _pval : '—';
+    const psrc  = d.price_source==='auto'  ? ' <span style="color:#6b7280;font-size:11px">(auto)</span>'
+                : d.price_source==='stale' ? ' <span style="color:#6b7280;font-size:11px">(stale)</span>' : '';
     const vsrc  = d.vwap_source==='chart' ? ' <span style="color:#6b7280;font-size:11px">(manual)</span>'
                 : d.vwap_source==='auto'  ? ' <span style="color:#6b7280;font-size:11px">(auto)</span>' : '';
     const vwap  = (d.vwap_status==='ok' && d.vwap_value!=null)
@@ -7009,7 +7083,7 @@ async function refreshRec() {
       const vr = vol.ratio!=null ? ' <span style="color:#6b7280;font-size:11px">'+Number(vol.ratio).toFixed(2)+'×</span>' : '';
       volTxt = ' &nbsp;·&nbsp; Vol <b style="color:'+vc+'">'+(vol.label||'—')+'</b>'+vr;
     }
-    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt;
+    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt;
 
     // Mark the recommended toggle button (the system's READY side) — no auto-switch.
     const readyDir = v==='LONG READY' ? 'Long' : v==='SHORT READY' ? 'Short' : null;
