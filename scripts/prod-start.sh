@@ -15,7 +15,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 echo "[prod-start] launching Flask webhook server on :8000"
-PORT=8000 PYTHONUNBUFFERED=1 .pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py &
+# DISCORD_LIVE=1 marks this as the single live sender so the time-based Discord
+# schedulers (heartbeat / EOD / weekly / trade-ready) run here and NOT in the dev
+# workspace, which shares the same Discord webhook secrets (avoids double alerts).
+PORT=8000 DISCORD_LIVE=1 PYTHONUNBUFFERED=1 .pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py &
 FLASK_PID=$!
 
 echo "[prod-start] launching Express /api proxy on :8080"

@@ -291,6 +291,23 @@ DISCORD_APLUS_WEBHOOK_URL   = os.environ.get("DISCORD_APLUS_WEBHOOK_URL", "")
 # (e.g. "<@123456789012345678>") to ping just yourself. Blank = no ping at all.
 DISCORD_ALERT_MENTION       = os.environ.get("DISCORD_ALERT_MENTION", "@everyone").strip()
 
+# ── Live-instance gate ────────────────────────────────────────────────────────
+# The Discord webhook secrets are shared between the Replit workspace (dev) and
+# the published deployment (prod). Both run this exact file, so without a gate the
+# dev instance and the prod instance BOTH post the time-based check-ins (heartbeat,
+# EOD, weekly, trade-ready re-post) to the SAME live channel — the user sees every
+# scheduled alert twice. Only the production instance is the "live" sender.
+#   • REPLIT_DEPLOYMENT == "1"  → set by Replit inside deployments, unset in the
+#     workspace, so it cleanly distinguishes prod from dev.
+#   • DISCORD_LIVE == "1"       → explicit override exported by scripts/prod-start.sh
+#     (belt-and-suspenders in case the deployment entrypoint changes).
+# Webhook-driven alerts are unaffected: TradingView only POSTs to the production
+# URL, so the dev instance never receives a real alert to forward.
+DISCORD_LIVE_ENABLED = (
+    os.environ.get("REPLIT_DEPLOYMENT") == "1"
+    or os.environ.get("DISCORD_LIVE") == "1"
+)
+
 
 def _discord_url(hint: str = "") -> str:
     """Return the correct trade-alert webhook URL based on symbol hint.
@@ -6302,9 +6319,18 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
-    threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
-    threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL
-    threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()  # re-post READY card every 5 min
-    _schedule_eod()                               # schedule daily EOD summary
-    _schedule_weekly_report()                     # schedule weekly report (Fri after close)
+    threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
+    # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
+    # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
+    if DISCORD_LIVE_ENABLED:
+        threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
+        threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()  # re-post READY card every 5 min
+        _schedule_eod()                               # schedule daily EOD summary
+        _schedule_weekly_report()                     # schedule weekly report (Fri after close)
+    else:
+        logger.info(
+            "DISCORD_LIVE_ENABLED=False (dev instance) — heartbeat / trade-ready / EOD / "
+            "weekly Discord schedulers disabled so this instance can't double-post to the "
+            "live channel. Set DISCORD_LIVE=1 to enable."
+        )
     app.run(host="0.0.0.0", port=port, debug=False)
