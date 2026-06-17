@@ -391,6 +391,23 @@ def display_price_for(ticker):
         return alert_p, "stale"  # last resort: a stale price beats nothing
     return None, None
 
+
+def last_valid_data_for(ticker):
+    """(price, iso_ts, source) of the last KNOWN market price for an instrument —
+    used for the 'last valid data' readout while the market is CLOSED. Prefers the
+    last alert/chart price AND its timestamp (the last real tape the bot saw, which
+    is what 'last valid' should reflect); falls back to the auto-fetched value only
+    when no alert has ever been received. DISPLAY-ONLY — never read by the gate."""
+    inst    = instrument_of(ticker)
+    alert_p = CURRENT_PRICE_BY_TICKER.get(inst)
+    if alert_p is not None:
+        return alert_p, CURRENT_PRICE_TS_BY_TICKER.get(inst), "alert"
+    auto = AUTO_PRICE_BY_TICKER.get(inst) or {}
+    if auto.get("value") is not None:
+        return auto.get("value"), auto.get("ts"), "auto"
+    return None, None, None
+
+
 ACCOUNT_PROFILES = {
     "MGC Conservative": {"account_size": 50_000,  "risk_pct": 0.005},
     "MGC Standard":     {"account_size": 50_000,  "risk_pct": 0.010},
@@ -1054,6 +1071,74 @@ def get_session_state(now=None):
         if start <= hour < end:
             return {"preferred": True, "bonus": SESSION_BONUS_POINTS, "window": label}
     return {"preferred": False, "bonus": 0, "window": "Outside preferred window"}
+
+
+# ── Market session (CME/COMEX futures hours) ─────────────────────────────────
+# MNQ (CME Globex) and MGC (COMEX) share the same electronic schedule: the week
+# opens Sunday 18:00 ET and runs continuously to Friday 17:00 ET, with a daily
+# maintenance halt 17:00–18:00 ET (Mon–Thu). While the market is CLOSED there is
+# no live tape, so we PAUSE the READY/ARMED gate and the diagnostic eval counters
+# rather than report a quiet market as a stream of "failed" setups. Hours are in
+# ET so the EST/EDT switch is automatic. Set MARKET_HOURS_ENABLED=0 to disable the
+# pause entirely (e.g. replaying weekend test data) — every downstream consumer
+# then behaves exactly as it did before this feature.
+MARKET_HOURS_ENABLED = os.environ.get("MARKET_HOURS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+MARKET_OPEN_HOUR_ET  = 18   # weekly open (Sun) + daily reopen after maintenance
+MARKET_CLOSE_HOUR_ET = 17   # daily maintenance start (Mon–Thu) + Friday weekly close
+
+
+def market_session_status(now=None):
+    """CME/COMEX futures session state for MNQ & MGC (shared schedule).
+
+    Pure function of the clock (no side effects) — safe to call from the gate,
+    status, heartbeat and dashboard. `now` defaults to UTC now. Returns:
+      {"open": bool, "status": "OPEN"|"CLOSED",
+       "next_open": datetime|None (UTC, aware), "next_open_et": str,
+       "reason": str}
+    When MARKET_HOURS_ENABLED is False it always reports OPEN, so every downstream
+    consumer behaves exactly as it did before this feature was added."""
+    base = now or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    if not MARKET_HOURS_ENABLED:
+        return {"open": True, "status": "OPEN", "next_open": None,
+                "next_open_et": "", "reason": ""}
+
+    et   = base.astimezone(ET_TZ)
+    wd   = et.weekday()                  # Mon=0 … Sun=6
+    hour = et.hour + et.minute / 60.0
+
+    if wd == 5:                                       # Saturday — closed all day
+        is_open = False
+    elif wd == 6:                                     # Sunday — opens 18:00 ET
+        is_open = hour >= MARKET_OPEN_HOUR_ET
+    elif wd == 4:                                     # Friday — closes 17:00 ET
+        is_open = hour < MARKET_CLOSE_HOUR_ET
+    else:                                             # Mon–Thu — 17:00–18:00 halt
+        is_open = not (MARKET_CLOSE_HOUR_ET <= hour < MARKET_OPEN_HOUR_ET)
+
+    if is_open:
+        return {"open": True, "status": "OPEN", "next_open": None,
+                "next_open_et": "", "reason": ""}
+
+    # ── Closed: compute the next reopen instant (ET → UTC) ───────────────────
+    in_daily_halt = (wd in (0, 1, 2, 3)
+                     and MARKET_CLOSE_HOUR_ET <= hour < MARKET_OPEN_HOUR_ET)
+    if in_daily_halt:
+        no_et  = et.replace(hour=MARKET_OPEN_HOUR_ET, minute=0, second=0, microsecond=0)
+        reason = "Daily maintenance break"
+    else:
+        # Weekend (Fri ≥17:00, Sat, or Sun <18:00) → upcoming Sunday 18:00 ET.
+        days_until_sun = (6 - wd) % 7                 # Fri→2, Sat→1, Sun→0
+        no_et  = (et + timedelta(days=days_until_sun)).replace(
+                     hour=MARKET_OPEN_HOUR_ET, minute=0, second=0, microsecond=0)
+        reason = "Weekend close"
+    next_open = no_et.astimezone(timezone.utc)
+    return {
+        "open": False, "status": "CLOSED", "next_open": next_open,
+        "next_open_et": fmt_et(next_open, "%a %b %-d, %-I:%M %p ET"),
+        "reason": reason,
+    }
 
 
 def alerts_in_window(minutes):
@@ -3471,6 +3556,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # AND stored on the result, so the +10 Session Bonus the gate credits and the
     # Session block on the card/status are derived from the same instant.
     session_state = get_session_state()
+    # Market-session state (CME/COMEX hours, shared by MNQ & MGC). Computed once
+    # here and applied as a single neutralising override right before `return`, so
+    # all result keys still exist (single-return-path invariant) and the gate is
+    # paused — not deleted — while the market is closed.
+    market = market_session_status()
     with _timed("scoringMs"):
         strict = evaluate_strict_setup(
             current_price, active_ticker, vwap_value, vwap_status,
@@ -3738,6 +3828,38 @@ def full_analysis(current_price_override=None, ticker_override=None):
                 block.update(ready=False, label="WAIT", score=0)
         out_dirs[_d] = block
     result["directions"] = out_dirs
+
+    # ── Market-session awareness (additive; single neutralising override) ────
+    # MNQ/MGC share the CME/COMEX schedule. While the market is CLOSED there is no
+    # live tape, so reporting WAIT (or counting "failed" evals) is misleading. We
+    # always surface the closed state, the next open, and the last valid price/time;
+    # and when closed we PAUSE the trade decision (no READY/ARMED, no edge/confirm/
+    # session scoring presented as a live read). All keys still exist, so every
+    # hard-indexed consumer is safe (single-return-path invariant).
+    result["market_open"]   = market["open"]
+    result["market_status"] = market["status"]
+    result["next_open"]     = market["next_open_et"]
+    result["next_open_utc"] = market["next_open"].isoformat() if market["next_open"] else None
+    result["market_reason"] = market["reason"]
+    _lv_price, _lv_ts, _lv_src = last_valid_data_for(active_ticker)
+    result["last_valid_price"]  = _lv_price
+    result["last_valid_time"]   = fmt_et(_lv_ts, "%b %-d, %-I:%M %p ET") if _lv_ts else None
+    result["last_valid_source"] = _lv_src
+    if not market["open"]:
+        result["verdict"]         = "MARKET CLOSED"
+        result["strict_label"]    = "MARKET CLOSED"
+        result["strict_reason"]   = (
+            "Market closed — live alerts paused"
+            + (f". Next open: {market['next_open_et']}." if market["next_open_et"] else ".")
+        )
+        result["alert_level"]     = None
+        result["conviction_tier"] = None
+        result["edge_score"]      = 0
+        result["edge_grade"]      = None
+        for _d in ("Long", "Short"):
+            _blk = result["directions"].get(_d)
+            if _blk:
+                _blk.update(ready=False, label="WAIT")
     return result
 
 
@@ -4315,6 +4437,8 @@ def _maybe_dispatch_early_alert(a, record):
     EARLY_EVENT_TIMES (for the Diagnostics page) on every call."""
     if not EARLY_ALERTS_ENABLED:
         return False
+    if (a or {}).get("market_open") is False:
+        return False   # market closed — EARLY heads-up is paused with the gate
     inst = instrument_of(record.get("ticker") or record.get("instrument")
                          or a.get("active_ticker") or "")
     if not inst:
@@ -6094,6 +6218,11 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     try:
         verdict_str = (a or {}).get("verdict") or ""
         is_ready    = verdict_str.endswith("READY")
+        if (a or {}).get("market_open") is False:
+            # Market closed — evaluations are paused. Never tally a quiet tape as
+            # an evaluation or a failed/rejected signal (the row is still recorded
+            # above for diagnostics; only the counters are skipped).
+            return
         with COUNTERS_LOCK:
             COUNTERS["evaluations_run"] += 1
             if alert_sent:
@@ -6533,6 +6662,11 @@ _HEARTBEAT_INSTRUMENTS = ("MGC", "MNQ")
 
 
 def _run_heartbeat_evaluations():
+    # Market closed → pause the diagnostic re-eval entirely: no full_analysis, no
+    # eval metrics, no setup-state churn. A quiet (closed) tape must never be
+    # re-scored into a stream of "failed" WAITs the counters then tally.
+    if not market_session_status()["open"]:
+        return
     for inst in _HEARTBEAT_INSTRUMENTS:
         try:
             _eval_timing_begin()          # per-instrument so phase timings don't bleed
@@ -7378,6 +7512,12 @@ def status():
         "alert_counts":        a["counts"],
         "windows":             windows,
         "total_alerts_stored": len(ALERT_HISTORY),
+        "market_open":         a.get("market_open"),
+        "market_status":       a.get("market_status"),
+        "next_open":           a.get("next_open"),
+        "market_reason":       a.get("market_reason"),
+        "last_valid_price":    a.get("last_valid_price"),
+        "last_valid_time":     a.get("last_valid_time"),
         "discord_configured":      bool(DISCORD_WEBHOOK_URL),
         "mnq_discord_configured":  bool(DISCORD_MNQ_WEBHOOK_URL),
     }), 200
@@ -7926,6 +8066,30 @@ async function refreshRec() {
 
     // ── Authoritative header (the system's single call) — toggle-independent ──
     const v = d.verdict || 'WAIT';
+
+    // Market closed (CME/COMEX hours) — show a paused banner instead of WAIT, and
+    // skip the live-setup rendering below. Live alerts resume on the next open.
+    if (d.market_open === false) {
+      badge.textContent = 'MARKET CLOSED';
+      badge.className = 'rec-badge wait';
+      card.style.borderColor = '#3a3a52';
+      const inst = d.active_ticker ? String(d.active_ticker).replace('1!','') : 'MNQ/MGC';
+      const no = d.next_open ? ' &nbsp;·&nbsp; Next open: <b style="color:#e8e8f0">'+d.next_open+'</b>' : '';
+      const lv = (d.last_valid_price!=null)
+        ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
+          + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
+        : '';
+      meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; '
+        + '<b style="color:#f59e0b">🌙 Live alerts paused</b>' + no + lv;
+      const lb = document.querySelector('.dir-btn.long');
+      const sb = document.querySelector('.dir-btn.short');
+      if (lb) lb.classList.remove('rec');
+      if (sb) sb.classList.remove('rec');
+      renderDirView();
+      markUpdated();
+      return;
+    }
+
     badge.textContent = v;
     badge.className = 'rec-badge ' + (v==='LONG READY'?'ready-long':v==='SHORT READY'?'ready-short':'wait');
     card.style.borderColor = v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b':'#1e1e32';
@@ -7993,6 +8157,24 @@ function renderDirView() {
   const reason = document.getElementById('rec-reason');
   const apply  = document.getElementById('btn-apply');
   if (!bar) return;
+
+  // Market closed — paused, neutral body (no checklist / score / plan / apply).
+  if (d.market_open === false) {
+    const no = d.next_open ? '<br>Next open: <b style="color:#e8e8f0">'+d.next_open+'</b>' : '';
+    const lv = (d.last_valid_price!=null)
+      ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
+        + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
+      : '';
+    if (list) list.innerHTML = '<div style="color:#6b7280;font-size:13px;line-height:1.6">'
+      + '🌙 <b style="color:#f59e0b">MARKET CLOSED</b> — MNQ/MGC live alerts paused.'
+      + no + lv + '</div>';
+    bar.style.width = '0%';
+    if (num) num.textContent = 'Paused';
+    if (planEl) planEl.style.display = 'none';
+    if (apply)  apply.style.display = 'none';
+    if (reason) reason.textContent = d.strict_reason || 'Market closed — live alerts paused.';
+    return;
+  }
 
   const isShort = dir === 'Short';
   const blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
