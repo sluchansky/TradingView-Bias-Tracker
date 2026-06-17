@@ -5802,15 +5802,26 @@ function delayClass(v){
   return 'bad';
 }
 function card(k,v,cls){return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';}
+function showError(msg){
+  var u=document.getElementById('updated');
+  if(u){ u.className='bad'; u.textContent='\u26a0 '+msg+' \u2014 retrying every second'; }
+  var rows=document.getElementById('rows');
+  if(rows && rows.querySelector('.empty')){
+    rows.innerHTML='<tr><td class="empty" colspan="19">'+msg+' \u2014 retrying every second.</td></tr>';
+  }
+}
 async function refresh(){
   var data;
   try{
-    var r=await fetch(BASE+'/eval-metrics',{headers:{'Content-Type':'application/json'}});
+    var r=await fetch(BASE+'/eval-metrics',{headers:{'Content-Type':'application/json'},cache:'no-store'});
+    if(!r.ok){ showError('Server returned HTTP '+r.status); return; }
     data=await r.json();
-  }catch(e){ return; }
+  }catch(e){ showError('Cannot reach the metrics endpoint ('+((e&&e.message)||'network error')+')'); return; }
   var evals=data.evaluations||[];
   document.getElementById('cap').textContent=data.max||100;
-  document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString('en-US',{hour12:false});
+  var u=document.getElementById('updated');
+  u.className='muted';
+  u.textContent='updated '+new Date().toLocaleTimeString('en-US',{hour12:false});
   var sum=document.getElementById('summary');
   if(evals.length){
     var e=evals[0];
@@ -6514,7 +6525,7 @@ def dashboard():
 <button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
 <button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
-<a class="btn btn-eod" href="/api/diagnostics-live" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
+<a class="btn btn-eod" href="/api/diagnostics-live" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
 
 <div id="toast"></div>
 
