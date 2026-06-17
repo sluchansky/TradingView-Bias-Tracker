@@ -78,12 +78,36 @@ COUNTERS = {
     "evaluations_run":        0,   # every recorded evaluation (webhook + heartbeat)
     "ready_setups_detected":  0,   # deduped: non-READY -> READY transitions only
     "alerts_sent":            0,   # live-card / tiered alerts actually dispatched
-    "wait_reasons_breakdown": {},  # failed-gate name -> count (WAIT verdicts)
+    "duplicates_ignored":     0,   # inbound POSTs flagged duplicate within cooldown
+    "signals_passed_filters": 0,   # webhook (non-duplicate) evals with a READY verdict
+    "signals_rejected":       0,   # webhook (non-duplicate) evals with a WAIT verdict
+    "wait_reasons_breakdown": {},  # failed-gate name -> count (WAIT verdicts + duplicates)
 }
 COUNTERS_LOCK = threading.Lock()
 # Per-instrument last verdict (was it READY?) so ready_setups_detected counts a
 # fresh setup once per non-READY -> READY transition, not on every heartbeat re-eval.
 _READY_STATE_BY_INST = {}
+# ── Inbound signal de-duplication (additive, DIAGNOSTIC) ──────────────────────
+# TradingView now fires the SAME alert every minute while a condition holds. We
+# key the last-seen time on (instrument, alert_type) — the alert_type string
+# already encodes direction + setup (e.g. "MGC BULLISH CONFIRMATION"), so a
+# direction flip or a different setup is a DIFFERENT key and is never treated as a
+# duplicate. This layer ONLY counts duplicates + annotates the eval record; it
+# NEVER skips full_analysis and NEVER suppresses a dispatch (the authoritative,
+# zone-aware non-duplication already lives downstream in create_journal_entry /
+# the EARLY anchor dedupe / the tiered + READY re-post throttles).
+SIGNAL_DEDUP      = {}              # (instrument, alert_type) -> last-seen datetime (UTC)
+DEDUP_LOCK        = threading.Lock()
+# ── Persistent per-instrument setup-state machine (additive, DISPLAY-ONLY) ────
+# Derived AFTER each evaluation (never inside full_analysis) so it can never alter
+# the gate/verdict. States: FORMING / READY / ACTIVE / INVALIDATED / EXPIRED.
+SETUP_STATE       = {}              # instrument ("MGC"/"MNQ") -> state dict
+STATE_LOCK        = threading.Lock()
+# Lightweight rolling-window timestamp logs (last hour) for diagnostics that the
+# capped EVAL_METRICS deque can't answer once the heartbeat floods it. Guarded by
+# COUNTERS_LOCK (appended in webhook(), read+trimmed in /eval-metrics).
+_WEBHOOK_TS       = deque(maxlen=5000)   # inbound POST /webhook timestamps (UTC)
+_DUP_TS           = deque(maxlen=5000)   # duplicate-signal timestamps (UTC)
 # ── Trade-management watcher state (additive; separate from manual ACTIVE_TRADE) ──
 MANAGED_TRADES_BY_KEY = {}  # (instrument,direction,entry_lo,date) -> managed-trade dict
 LAST_READY_BY_TICKER  = {}  # instrument -> last READY card entry snapshot (for /why)
@@ -438,6 +462,13 @@ EARLY_ALERT_COOLDOWN_SEC = int(os.environ.get("EARLY_ALERT_COOLDOWN_SEC", 180))
 # check-in HEARTBEAT_INTERVAL above.
 EVAL_HEARTBEAT_ENABLED  = os.environ.get("EVAL_HEARTBEAT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 EVAL_HEARTBEAT_INTERVAL = int(os.environ.get("EVAL_HEARTBEAT_INTERVAL", 15))  # seconds (default 15s)
+# ── Inbound signal de-dup + setup-state lifecycle (additive, DIAGNOSTIC) ──────
+# How long the SAME (instrument, alert_type) is treated as a repeat of the same
+# signal (TradingView now repeats alerts every minute while the condition holds).
+SIGNAL_DEDUP_COOLDOWN_SEC = int(os.environ.get("SIGNAL_DEDUP_COOLDOWN_SEC", 240))  # default 4 min
+# How long a non-ACTIVE setup (FORMING/READY) or an ACTIVE setup may persist before
+# the per-instrument lifecycle marks it EXPIRED (display-only; never gates).
+SETUP_STATE_TTL_SEC       = int(os.environ.get("SETUP_STATE_TTL_SEC", 1800))  # default 30 min
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 # ── Weekly performance report (additive) ──────────────────────────────────────
 # Posts a week-in-review embed once a week, just after the close. Default is
@@ -5817,7 +5848,8 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
 
 def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_at,
                          eval_duration_ms, alert_sent_at, instrument, tiered_sent=False,
-                         trigger="webhook"):
+                         trigger="webhook", signal_type=None, is_duplicate=False,
+                         signal_cooldown_remaining_ms=None):
     """Append one per-evaluation timing + volatility record to EVAL_METRICS (the
     live Diagnostics page / /eval-metrics read this). Best-effort — it must never
     raise into the worker. Phase timings come from the thread-local accumulator
@@ -5897,6 +5929,26 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     else:
         waited_for_candle_close = None
 
+    # ── Direction / setup-type / decision + processing-latency aliases (additive,
+    # for the per-row latency view). direction prefers the verdict side, then the
+    # gate candidate; setupType is the inbound alert_type when known, else the
+    # structural stage; totalLatencyMs is webhook->finished (full processing
+    # latency) and falls back to the in-eval duration for heartbeat rows. ──
+    _candidate = gd.get("candidate") or (a or {}).get("gate_candidate")
+    if verdict.startswith("LONG"):
+        direction = "Long"
+    elif verdict.startswith("SHORT"):
+        direction = "Short"
+    elif _candidate in ("Long", "Short"):
+        direction = _candidate
+    else:
+        direction = None
+    setup_type = signal_type or (a or {}).get("setup_stage") or (a or {}).get("structure_class")
+    if webhook_received_at is not None and eval_finished_at is not None:
+        total_latency_ms = round((eval_finished_at - webhook_received_at).total_seconds() * 1000.0, 3)
+    else:
+        total_latency_ms = eval_duration_ms
+
     record = {
         "webhookReceivedAt":    webhook_received_at.isoformat() if webhook_received_at else None,
         "evaluationStartedAt":  eval_started_at.isoformat() if eval_started_at else None,
@@ -5919,6 +5971,15 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         # ── Context ──
         "instrument":           instrument,
         "verdict":              (a or {}).get("verdict"),
+        # ── Per-signal latency view (additive aliases) ──
+        "direction":            direction,
+        "setupType":            setup_type,
+        "decision":             (a or {}).get("verdict"),
+        "processingStartTime":  eval_started_at.isoformat() if eval_started_at else None,
+        "processingEndTime":    eval_finished_at.isoformat() if eval_finished_at else None,
+        "totalLatencyMs":       total_latency_ms,
+        "isDuplicate":          bool(is_duplicate),
+        "signalCooldownRemainingMs": signal_cooldown_remaining_ms,
         # ── Gate / decision breakdown ──
         "alertLevel":           alert_level,
         "edgeScore":            gd.get("edge_score"),
@@ -5969,6 +6030,15 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
             COUNTERS["evaluations_run"] += 1
             if alert_sent:
                 COUNTERS["alerts_sent"] += 1
+            # Webhook (non-duplicate) signal funnel: how many inbound signals
+            # passed every filter (READY) vs were rejected (WAIT). Heartbeat
+            # re-evals and duplicate repeats are excluded so this tracks real
+            # inbound TradingView signals only.
+            if trigger == "webhook" and not is_duplicate:
+                if is_ready:
+                    COUNTERS["signals_passed_filters"] += 1
+                else:
+                    COUNTERS["signals_rejected"] += 1
             # Count a fresh setup once per non-READY -> READY transition per
             # instrument (NOT on every heartbeat re-eval of a still-READY setup).
             prev_ready = _READY_STATE_BY_INST.get(inst_key, False)
@@ -5986,9 +6056,88 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         logger.error("Counter update failed (eval still recorded): %s", exc)
 
 
+def _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False):
+    """Derive a per-instrument setup lifecycle state AFTER an evaluation. Pure
+    display/diagnostics — it is NEVER read by full_analysis or the gate, so it can
+    never alter a READY/WAIT verdict. States: FORMING -> READY -> ACTIVE, plus
+    INVALIDATED / EXPIRED. A READY->ACTIVE move requires a live READY card actually
+    dispatched on THIS eval (dispatched_ready), not merely a READY verdict (so a
+    heartbeat re-eval never promotes to ACTIVE). Live states are STICKY: a transient
+    heartbeat/duplicate re-eval never downgrades them, so the 1-min TradingView
+    repeats can't flap READY<->FORMING. A live state leaves only via an upgrade,
+    INVALIDATED (zone broken/mitigated or an opposite-direction READY), or EXPIRED
+    (held longer than SETUP_STATE_TTL_SEC)."""
+    inst_key = instrument_of(inst) if inst else None
+    if not inst_key:
+        return
+    a         = a or {}
+    verdict   = a.get("verdict") or ""
+    ready     = verdict.endswith("READY")
+    invalid   = bool(a.get("zone_broken_active") or a.get("zone_mitigated_near"))
+    candidate = a.get("gate_candidate")
+    if verdict.startswith("LONG"):
+        cur_dir = "Long"
+    elif verdict.startswith("SHORT"):
+        cur_dir = "Short"
+    elif candidate in ("Long", "Short"):
+        cur_dir = candidate
+    else:
+        cur_dir = None
+    now = now_utc()
+
+    with STATE_LOCK:
+        prev       = SETUP_STATE.get(inst_key) or {}
+        prev_state = prev.get("state")
+        prev_dir   = prev.get("direction")
+        prev_since = prev.get("since_dt") or now
+        live_prev  = prev_state in ("FORMING", "READY", "ACTIVE")
+        opposite_ready = bool(ready and cur_dir and prev_dir and cur_dir != prev_dir)
+
+        # A duplicate repeat of the SAME signal must never downgrade a live state —
+        # it only refreshes liveness (it can still invalidate/expire below).
+        if is_duplicate and live_prev and not invalid and not opposite_ready:
+            base, base_dir = prev_state, prev_dir
+        elif invalid or opposite_ready:
+            base, base_dir = "INVALIDATED", (cur_dir if opposite_ready else prev_dir)
+        elif ready:
+            base     = "ACTIVE" if (dispatched_ready or prev_state == "ACTIVE") else "READY"
+            base_dir = cur_dir or prev_dir
+        elif cur_dir in ("Long", "Short"):
+            base, base_dir = "FORMING", cur_dir
+        else:
+            base, base_dir = None, None
+
+        # Stickiness: a live state is never downgraded by a transient re-eval. Only
+        # an upgrade (higher rank), INVALIDATED, or EXPIRED can move it; a lower or
+        # empty base is ignored while the prior live state still stands.
+        _RANK = {"FORMING": 1, "READY": 2, "ACTIVE": 3}
+        if live_prev and base != "INVALIDATED":
+            if base in _RANK and prev_state in _RANK and _RANK[base] < _RANK[prev_state]:
+                base, base_dir = prev_state, prev_dir
+            elif base is None:
+                base, base_dir = prev_state, prev_dir
+
+        # since: reset when the state label changes; otherwise carry it forward.
+        since_dt = now if base != prev_state else prev_since
+        # Expiry: a live state held longer than the TTL ages out to EXPIRED.
+        if (base in ("FORMING", "READY", "ACTIVE")
+                and (now - since_dt).total_seconds() > SETUP_STATE_TTL_SEC):
+            base, since_dt = "EXPIRED", now
+
+        SETUP_STATE[inst_key] = {
+            "state":          base,
+            "direction":      base_dir,
+            "since_dt":       since_dt,
+            "since":          since_dt.isoformat(),
+            "last_update_dt": now,
+            "last_update":    now.isoformat(),
+        }
+
+
 def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                            account_size, risk_pct, profile_name,
-                           webhook_received_at=None):
+                           webhook_received_at=None, is_duplicate=False,
+                           cooldown_remaining_ms=None):
     """Heavy webhook tail (analysis + journaling + Discord) run OFF the request
     thread so TradingView gets a fast ack and never times out. All state this job
     reads (ALERT_HISTORY, zone flags, CURRENT_PRICE/VWAP) is committed
@@ -6024,7 +6173,14 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                 resolved_inst, fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), normalized))
         _record_eval_metrics(a, webhook_received_at, eval_started_at,
                              eval_finished_at, eval_duration_ms, alert_sent_at,
-                             resolved_inst, tiered_sent=tiered_sent)
+                             resolved_inst, tiered_sent=tiered_sent,
+                             signal_type=normalized, is_duplicate=is_duplicate,
+                             signal_cooldown_remaining_ms=cooldown_remaining_ms)
+        try:
+            _update_setup_state(resolved_inst, a, dispatched_ready=False,
+                                is_duplicate=is_duplicate)
+        except Exception as exc:
+            logger.error("Setup-state update failed (zone-mitigated path): %s", exc)
         return
 
     # ── EARLY intrabar pre-READY alert (additive, fail-open). Fired HERE — before
@@ -6153,7 +6309,32 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
 
     _record_eval_metrics(a, webhook_received_at, eval_started_at,
                          eval_finished_at, eval_duration_ms, alert_sent_at,
-                         resolved_inst, tiered_sent=tiered_sent)
+                         resolved_inst, tiered_sent=tiered_sent,
+                         signal_type=normalized, is_duplicate=is_duplicate,
+                         signal_cooldown_remaining_ms=cooldown_remaining_ms)
+
+    # ── Structured per-webhook latency line (additive diagnostics) ──────────────
+    try:
+        logger.info(
+            "Webhook latency | sym=%s dir=%s setup=%s decision=%s dup=%s "
+            "evalMs=%s totalMs=%s",
+            resolved_inst, (a.get("gate_candidate") or "-"), normalized,
+            a.get("verdict"), is_duplicate, eval_duration_ms,
+            (round((eval_finished_at - webhook_received_at).total_seconds() * 1000.0, 1)
+             if webhook_received_at else eval_duration_ms))
+    except Exception as exc:
+        logger.error("Latency log formatting failed: %s", exc)
+
+    # ── Persistent setup-state lifecycle (additive, DISPLAY-ONLY) ───────────────
+    # Derived AFTER the verdict + dispatch so it never feeds back into the gate. A
+    # READY->ACTIVE transition requires that a live READY card was actually sent on
+    # THIS evaluation (alert_sent_at), not merely a READY verdict.
+    try:
+        _update_setup_state(resolved_inst, a,
+                            dispatched_ready=bool(alert_sent_at),
+                            is_duplicate=is_duplicate)
+    except Exception as exc:
+        logger.error("Setup-state update failed: %s", exc)
 
 
 # ── Asynchronous webhook processing ──────────────────────────────────────────
@@ -6262,6 +6443,10 @@ def _run_heartbeat_evaluations():
             dur_ms  = round((time.perf_counter() - _t0) * 1000.0, 3)
             _record_eval_metrics(a, None, started, finished, dur_ms, None, inst,
                                  tiered_sent=False, trigger="heartbeat")
+            try:                       # display-only lifecycle refresh (never dispatches)
+                _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False)
+            except Exception as exc:
+                logger.error("Heartbeat setup-state update failed for %s: %s", inst, exc)
         except Exception as exc:
             logger.error("Heartbeat evaluation failed for %s: %s", inst, exc)
 
@@ -6286,6 +6471,7 @@ def webhook():
     LAST_WEBHOOK_AT = webhook_received_at   # any inbound POST, before any early return
     with COUNTERS_LOCK:
         COUNTERS["webhooks_received"] += 1
+        _WEBHOOK_TS.append(webhook_received_at)   # rolling last-hour window
 
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -6467,6 +6653,34 @@ def webhook():
         except (ValueError, TypeError):
             risk_pct = DEFAULT_RISK_PCT
 
+    # ── Inbound signal de-dup (additive, DIAGNOSTIC only) ────────────────────────
+    # Flag a repeat of the SAME (instrument, alert_type) seen within the cooldown so
+    # the operator can SEE how many duplicates the 1-min TradingView repeats produce.
+    # This NEVER skips the enqueue or full_analysis, and NEVER suppresses a dispatch
+    # — the authoritative, zone-aware non-duplication already lives downstream. A
+    # direction flip or different setup is a different key, so it's never a duplicate.
+    is_duplicate          = False
+    cooldown_remaining_ms = None
+    try:
+        sig_key = (instrument_of(resolved_inst), normalized)
+        with DEDUP_LOCK:
+            _prev_seen = SIGNAL_DEDUP.get(sig_key)
+            if _prev_seen is not None:
+                _elapsed = (webhook_received_at - _prev_seen).total_seconds()
+                if 0 <= _elapsed < SIGNAL_DEDUP_COOLDOWN_SEC:
+                    is_duplicate          = True
+                    cooldown_remaining_ms = round(
+                        (SIGNAL_DEDUP_COOLDOWN_SEC - _elapsed) * 1000.0, 1)
+            SIGNAL_DEDUP[sig_key] = webhook_received_at
+        if is_duplicate:
+            with COUNTERS_LOCK:
+                COUNTERS["duplicates_ignored"] += 1
+                COUNTERS["wait_reasons_breakdown"]["cooldown_duplicate"] = \
+                    COUNTERS["wait_reasons_breakdown"].get("cooldown_duplicate", 0) + 1
+                _DUP_TS.append(webhook_received_at)
+    except Exception as exc:
+        logger.error("Signal dedup check failed (alert still processed): %s", exc)
+
     # ── Hand the heavy tail (analysis + journaling + Discord) to the background
     # worker and ack immediately so TradingView never times out. Every piece of
     # state the job needs has been committed synchronously above (ALERT_HISTORY,
@@ -6481,6 +6695,8 @@ def webhook():
         "risk_pct":            risk_pct,
         "profile_name":        profile_name,
         "webhook_received_at": webhook_received_at,
+        "is_duplicate":        is_duplicate,
+        "cooldown_remaining_ms": cooldown_remaining_ms,
     })
 
     return jsonify({
@@ -6557,8 +6773,9 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <table>
 <thead><tr>
 <th>Webhook Recv (ET)</th><th>Instr</th><th>Verdict</th>
+<th>Dir</th><th>Setup</th><th>Dup</th>
 <th>Eval Start</th><th>Eval Finish</th>
-<th>Eval ms</th><th>Indicator ms</th><th>Volatility ms</th><th>Scoring ms</th>
+<th>Eval ms</th><th>Total ms</th><th>Indicator ms</th><th>Volatility ms</th><th>Scoring ms</th>
 <th>AI Notes ms</th><th>Screenshot ms</th><th>Journal ms</th>
 <th>Alert Sent</th><th>Alert Delay ms</th>
 <th>ATR</th><th>Base ATR</th><th>Mult</th><th>Threshold</th><th>Vol Decision</th>
@@ -6568,7 +6785,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <th>Early Alert</th><th>Ready Alert</th><th>Delay s</th><th>Waited Close</th>
 <th>Trigger</th><th>Zone</th><th>VWAP</th><th>Struct</th><th>Candle</th><th>Liq</th><th>Vol</th><th>Conf</th><th>Wait Reason</th>
 </tr></thead>
-<tbody id="rows"><tr><td class="empty" colspan="43">Loading...</td></tr></tbody>
+<tbody id="rows"><tr><td class="empty" colspan="47">Loading...</td></tr></tbody>
 </table>
 </div>
 <script>
@@ -6595,6 +6812,22 @@ function delayClass(v){
   return 'bad';
 }
 function card(k,v,cls){return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';}
+function setupStateTxt(s){
+  if(!s) return '-';
+  var ks=Object.keys(s); if(!ks.length) return '-';
+  return ks.map(function(k){
+    var v=s[k]||{}; var st=v.state||'-'; var d=v.direction?(' '+v.direction):'';
+    return k+': '+st+d;
+  }).join(' \u00b7 ');
+}
+function setupStateCls(s){
+  if(!s) return 'muted';
+  var vals=Object.keys(s).map(function(k){return (s[k]||{}).state;});
+  if(vals.indexOf('ACTIVE')>=0||vals.indexOf('READY')>=0) return 'good';
+  if(vals.indexOf('INVALIDATED')>=0) return 'warn';
+  if(vals.indexOf('FORMING')>=0) return '';
+  return 'muted';
+}
 function yn(v){return (v===true)?'<span class="good">Y</span>':((v===false)?'<span class="bad">N</span>':'<span class="muted">-</span>');}
 function pct(v){return (v===null||v===undefined)?'-':Number(v).toFixed(0)+'%';}
 function fmtAgo(sec){
@@ -6608,7 +6841,7 @@ function showError(msg){
   if(u){ u.className='bad'; u.textContent='\u26a0 '+msg+' \u2014 retrying every second'; }
   var rows=document.getElementById('rows');
   if(rows && rows.querySelector('.empty')){
-    rows.innerHTML='<tr><td class="empty" colspan="43">'+msg+' \u2014 retrying every second.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="47">'+msg+' \u2014 retrying every second.</td></tr>';
   }
 }
 async function refresh(){
@@ -6643,11 +6876,19 @@ async function refresh(){
     card('Alerts sent', (c.alerts_sent!=null?c.alerts_sent:'-'), (c.alerts_sent>0?'good':'muted'))+
     card('Last webhook', sinceTxt, (staleWh?'warn':'good'))+
     card('Eval frequency', (st.evaluationFrequencySeconds!=null?('every '+st.evaluationFrequencySeconds+'s'):'-'), (st.evalHeartbeatEnabled?'good':'bad'))+
+    card('Signals passed', (st.signalsPassedFilters!=null?st.signalsPassedFilters:'-'), (st.signalsPassedFilters>0?'good':'muted'))+
+    card('Signals rejected', (st.signalsRejected!=null?st.signalsRejected:'-'), 'muted')+
+    card('Duplicates ignored', (st.duplicatesIgnored!=null?st.duplicatesIgnored:'-')+(st.duplicatesIgnoredLastHour!=null?(' ('+st.duplicatesIgnoredLastHour+'/hr)'):''), (st.duplicatesIgnored>0?'warn':'muted'))+
+    card('Alerts last hour', (st.alertsReceivedLastHour!=null?st.alertsReceivedLastHour:'-'), 'muted')+
+    card('Avg processing', (st.averageProcessingTimeMs!=null?(Number(st.averageProcessingTimeMs).toFixed(1)+' ms'):'-'), 'muted')+
+    card('Queue length', (st.currentQueueLength!=null?st.currentQueueLength:'-'), (st.currentQueueLength>5?'warn':'muted'))+
+    card('Setup states', setupStateTxt(st.setupStates), 'sm '+(setupStateCls(st.setupStates)))+
+    card('Dedup cooldown', (st.signalDedupCooldownSec!=null?(st.signalDedupCooldownSec+'s'):'-'), 'sm muted')+
     card('Session', (sess.window||'-'), 'sm '+(sess.preferred?'good':'muted'))+
     card('Top WAIT reasons', wrbTop, 'sm muted');
   var rows=document.getElementById('rows');
   if(!evals.length){
-    rows.innerHTML='<tr><td class="empty" colspan="43">No evaluations yet - waiting for the next webhook.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="47">No evaluations yet - waiting for the next webhook.</td></tr>';
     return;
   }
   rows.innerHTML=evals.map(function(e){
@@ -6656,9 +6897,13 @@ async function refresh(){
       '<td>'+etTime(e.webhookReceivedAt)+'</td>'+
       '<td>'+(e.instrument||'-')+'</td>'+
       '<td class="'+vc+'">'+(e.verdict||'-')+'</td>'+
+      '<td>'+(e.direction||'-')+'</td>'+
+      '<td style="text-align:left">'+(e.setupType||'-')+'</td>'+
+      '<td class="'+(e.isDuplicate?'warn':'muted')+'">'+(e.isDuplicate?'dup':'-')+'</td>'+
       '<td>'+etTime(e.evaluationStartedAt)+'</td>'+
       '<td>'+etTime(e.evaluationFinishedAt)+'</td>'+
       '<td>'+ms(e.evaluationDurationMs)+'</td>'+
+      '<td>'+ms(e.totalLatencyMs)+'</td>'+
       '<td>'+ms(e.indicatorCalcMs)+'</td>'+
       '<td>'+ms(e.volatilityCalcMs)+'</td>'+
       '<td>'+ms(e.scoringMs)+'</td>'+
@@ -6713,6 +6958,8 @@ def get_eval_metrics():
     delay and the volatility reading. Powers the live Diagnostics page. The "stats"
     block carries the cumulative counters, current session, last-webhook timing and
     the heartbeat evaluation cadence."""
+    _now = now_utc()
+    _hour_ago = _now - timedelta(hours=1)
     with EVAL_METRICS_LOCK:
         snapshot = list(EVAL_METRICS)
     with COUNTERS_LOCK:
@@ -6721,10 +6968,32 @@ def get_eval_metrics():
             "evaluations_run":        COUNTERS["evaluations_run"],
             "ready_setups_detected":  COUNTERS["ready_setups_detected"],
             "alerts_sent":            COUNTERS["alerts_sent"],
+            "duplicates_ignored":     COUNTERS["duplicates_ignored"],
+            "signals_passed_filters": COUNTERS["signals_passed_filters"],
+            "signals_rejected":       COUNTERS["signals_rejected"],
             "wait_reasons_breakdown": dict(COUNTERS["wait_reasons_breakdown"]),
         }
+        # Trim + count the rolling last-hour timestamp windows under the same lock.
+        while _WEBHOOK_TS and _WEBHOOK_TS[0] < _hour_ago:
+            _WEBHOOK_TS.popleft()
+        while _DUP_TS and _DUP_TS[0] < _hour_ago:
+            _DUP_TS.popleft()
+        alerts_received_last_hour    = len(_WEBHOOK_TS)
+        duplicates_ignored_last_hour = len(_DUP_TS)
+    # Average processing latency over the recorded window (durations are stationary,
+    # so the capped EVAL_METRICS window is representative even when heartbeat-heavy).
+    _durs = [r.get("evaluationDurationMs") for r in snapshot
+             if isinstance(r.get("evaluationDurationMs"), (int, float))]
+    avg_processing_ms = round(sum(_durs) / len(_durs), 3) if _durs else None
+    # Per-instrument setup-state snapshot (display-only; strip internal datetimes).
+    with STATE_LOCK:
+        setup_states = {
+            k: {"state": v.get("state"), "direction": v.get("direction"),
+                "since": v.get("since"), "lastUpdate": v.get("last_update")}
+            for k, v in SETUP_STATE.items()
+        }
     last_wh   = LAST_WEBHOOK_AT
-    since_sec = round((now_utc() - last_wh).total_seconds(), 1) if last_wh else None
+    since_sec = round((_now - last_wh).total_seconds(), 1) if last_wh else None
     stats = {
         "counters":                   counters,
         "session":                    get_session_state(),
@@ -6732,6 +7001,18 @@ def get_eval_metrics():
         "timeSinceLastWebhookSec":    since_sec,
         "evaluationFrequencySeconds": EVAL_HEARTBEAT_INTERVAL,
         "evalHeartbeatEnabled":       EVAL_HEARTBEAT_ENABLED,
+        # ── 1-min-repeat handling diagnostics (additive) ──
+        "signalsReceived":            counters["webhooks_received"],
+        "signalsPassedFilters":       counters["signals_passed_filters"],
+        "signalsRejected":            counters["signals_rejected"],
+        "duplicatesIgnored":          counters["duplicates_ignored"],
+        "alertsReceivedLastHour":     alerts_received_last_hour,
+        "duplicatesIgnoredLastHour":  duplicates_ignored_last_hour,
+        "averageProcessingTimeMs":    avg_processing_ms,
+        "currentQueueLength":         _WEBHOOK_JOBS.qsize(),
+        "signalDedupCooldownSec":     SIGNAL_DEDUP_COOLDOWN_SEC,
+        "setupStateTtlSec":           SETUP_STATE_TTL_SEC,
+        "setupStates":                setup_states,
     }
     return jsonify({
         "evaluations": snapshot[::-1],
