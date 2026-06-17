@@ -155,6 +155,17 @@ MODES = {
         # SCALP: volatility is NOT a hard gate. It folds into the Edge Score as a
         # modifier (Normal +10 / Elevated 0 / Extreme -10) instead of forcing WAIT.
         "VOL_HARD_GATE":     False,
+        # ── READY gate (mode-tunable). SCALP loosens the gate so it fires earlier:
+        #    VWAP & structure are DEMOTED from hard gates to confirmations, the Edge
+        #    threshold drops to 65, and >=2 confirmations are required. SWING keeps
+        #    the strict zone AND vwap AND structure AND edge>=80 behaviour exactly. ──
+        "EDGE_READY_THRESHOLD":   65,
+        "GATE_REQUIRE_VWAP":      False,
+        "GATE_REQUIRE_STRUCTURE": False,
+        "MIN_CONFIRMATIONS":      2,
+        # Tiered WATCH/ARMED early alerts (SCALP only — fire before a full READY).
+        "ENABLE_TIERED_ALERTS":     True,
+        "WATCH_ARMED_COOLDOWN_SEC": 900,
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -176,6 +187,15 @@ MODES = {
         "VOL_HIGH_BLOCK":    3.0,
         # SWING keeps volatility as a hard gate - a BLOCK regime holds READY->WAIT.
         "VOL_HARD_GATE":     True,
+        # SWING keeps the original strict gate: zone AND vwap AND structure AND
+        # edge>=80, with no tiered early alerts. Expressed via the same cfg keys so
+        # the READY boolean reduces to the historical behaviour exactly.
+        "EDGE_READY_THRESHOLD":   80,
+        "GATE_REQUIRE_VWAP":      True,
+        "GATE_REQUIRE_STRUCTURE": True,
+        "MIN_CONFIRMATIONS":      0,
+        "ENABLE_TIERED_ALERTS":     False,
+        "WATCH_ARMED_COOLDOWN_SEC": 900,
     },
 }
 
@@ -1840,7 +1860,7 @@ def _strict_checklist_field(strict_label, strict_score, confluences,
         f"{_mark(c.get('zone_mitigated'))} {'Supply' if is_short else 'Demand'} zone mitigated + reaction",
         f"{_mark(c.get('structure_confirmed'))} Structure {struct_hint}",
         f"{_mark(c.get('vwap'))} Price {side_word} VWAP  ·  VWAP {vwap_txt}",
-        f"{_mark(c.get('edge_ok'))} Edge Score ≥ {EDGE_READY_THRESHOLD}",
+        f"{_mark(c.get('edge_ok'))} Edge Score ≥ {cfg('EDGE_READY_THRESHOLD')}",
     ]
     label_emoji = {"A+ Setup": "🔥", "Strong Trade": "🟢", "Possible Trade": "🟡"}.get(strict_label, "⏸")
     header = f"{label_emoji} **{strict_label}** · Score **{strict_score}/100**"
@@ -2824,6 +2844,20 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     vol_block = bool(vol.get("blocked")) and bool(cfg("VOL_HARD_GATE"))
     vol_adj   = int(vol.get("score_adj") or 0)
 
+    # ── READY-gate configuration (mode-tunable). SWING keeps VWAP & structure as
+    #    hard gates with edge>=80; SCALP demotes them to confirmations, drops the
+    #    edge threshold to 65, and requires MIN_CONFIRMATIONS confluences instead. ──
+    ready_threshold   = cfg("EDGE_READY_THRESHOLD")
+    require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
+    require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
+    min_confirmations = int(cfg("MIN_CONFIRMATIONS"))
+
+    # ── Trend alignment (real, derived — never fabricated): the candidate side
+    #    agrees with the live bias score (bullish vs bearish). Counts as one
+    #    confirmation; purely additive, so it never blocks a setup on its own. ──
+    trend_long  = bool(bullish > bearish)
+    trend_short = bool(bearish > bullish)
+
     # ── Unified additive Edge Score per direction (single source of truth shared
     #    with the display layer via compute_trade_edge_components). ──
     def _signals(direction):
@@ -2837,6 +2871,20 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     def _edge_for(direction):
         return compute_trade_edge_components(_signals(direction), vol_adj)
+
+    def _confirmations(direction):
+        """Count the REAL confirmations present for `direction`. SCALP READY needs
+        >= MIN_CONFIRMATIONS of them; VWAP and structure are confirmations here, not
+        hard gates. Structure contributes per-signal (BOS / CHOCH / swing) so a
+        richer structure picture counts for more. 'volume' has no alert source in
+        this system, so it is never counted or fabricated."""
+        if direction == "Long":
+            flags = [price_above, has_bos_demand, has_choch_demand,
+                     bool(hh_ts or hl_ts), has_bull_sweep, has_bull_confirm, trend_long]
+        else:
+            flags = [price_below, has_bos_supply, has_choch_supply,
+                     bool(lh_ts or ll_ts), has_bear_sweep, has_bear_confirm, trend_short]
+        return sum(1 for f in flags if f)
 
     def _gate_debug(direction):
         sig = _signals(direction)
@@ -2869,10 +2917,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
             "structure_confirmed":   bool(sig["structure_confirmed"]),
             "candle_confirmed":      bool(sig["confirmation_candle"]),
+            "liquidity_sweep":       bool(sig["liquidity_sweep"]),
+            "trend_aligned":         bool(trend_long if direction == "Long" else trend_short),
+            "volume_confirmed":      None,
+            "confirmations_passed":  _confirmations(direction),
+            "confirmations_needed":  min_confirmations,
+            "require_vwap":          require_vwap,
+            "require_structure":     require_structure,
+            "ready_threshold":       ready_threshold,
             "conflicting_structure": is_conflict,
             "volatility_block":      vol_block,
             "edge_score":            score,
-            "edge_ok":               bool(score >= EDGE_READY_THRESHOLD),
+            "edge_ok":               bool(score >= ready_threshold),
             "failed_conditions":     [],
         }
 
@@ -2883,23 +2939,36 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             fails.append("conflicting_structure")
         if not gd["zone_valid"]:
             fails.append("zone_valid")
-        if not gd["vwap_confirmed"]:
+        # VWAP & structure are hard gates only when the mode requires them (SWING);
+        # in SCALP they are confirmations, surfaced via confirmations_passed below.
+        if require_vwap and not gd["vwap_confirmed"]:
             fails.append("vwap_confirmed")
-        if not gd["structure_confirmed"]:
+        if require_structure and not gd["structure_confirmed"]:
             fails.append("structure_confirmed")
+        if gd["confirmations_passed"] < min_confirmations:
+            fails.append("confirmations(%d<%d)"
+                         % (gd["confirmations_passed"], min_confirmations))
         if gd["volatility_block"]:
             fails.append("volatility_block")
         if not gd["edge_ok"]:
-            fails.append("edge_score(%d<%d)" % (gd["edge_score"], EDGE_READY_THRESHOLD))
+            fails.append("edge_score(%d<%d)" % (gd["edge_score"], ready_threshold))
         gd["failed_conditions"] = fails
         return gd, fails
 
     def _is_ready(direction):
         sig = _signals(direction)
         score, _bd = _edge_for(direction)
-        return bool(sig["zone_valid"] and sig["vwap_confirmed"]
-                    and sig["structure_confirmed"] and not is_conflict
-                    and not vol_block and score >= EDGE_READY_THRESHOLD)
+        # cfg-expressed READY. SWING (require_vwap/structure=True, min_conf=0,
+        # thresh=80) reduces to the historical zone AND vwap AND structure AND
+        # edge>=80 gate exactly; SCALP swaps the vwap/structure ANDs for a
+        # confirmations-count gate at edge>=65.
+        return bool(
+            sig["zone_valid"] and not is_conflict and not vol_block
+            and score >= ready_threshold
+            and (not require_vwap or sig["vwap_confirmed"])
+            and (not require_structure or sig["structure_confirmed"])
+            and _confirmations(direction) >= min_confirmations
+        )
 
     def _confluences(direction):
         """Per-condition detail for journal/embed/edge-display. `zone_mitigated`
@@ -2921,7 +2990,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "zone_confirmed":      bool(has_sup_confirm),
                 "liquidity_sweep":     bool(has_bear_sweep),
                 "zone_mitigated":      zone_valid_short,
-                "edge_ok":             bool(_edge_for("Short")[0] >= EDGE_READY_THRESHOLD),
+                "edge_ok":             bool(_edge_for("Short")[0] >= ready_threshold),
             }
         return {
             "direction":           "Long" if direction == "Long" else None,
@@ -2936,7 +3005,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "zone_confirmed":      bool(has_dem_confirm),
             "liquidity_sweep":     bool(has_bull_sweep),
             "zone_mitigated":      zone_valid_long,
-            "edge_ok":             bool(_edge_for("Long")[0] >= EDGE_READY_THRESHOLD),
+            "edge_ok":             bool(_edge_for("Long")[0] >= ready_threshold),
         }
 
     def _dir_block(direction):
@@ -2954,8 +3023,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             reason = ("Conflicting structure — opposing structure on both sides within "
                       f"{CONFLICT_WINDOW_MIN} min. Stand aside.")
         elif ready:
-            reason = (f"{direction} READY — zone reaction, structure, VWAP and "
-                      f"Edge {score} aligned.")
+            if require_vwap and require_structure:
+                reason = (f"{direction} READY — zone reaction, structure, VWAP and "
+                          f"Edge {score} aligned.")
+            else:
+                reason = (f"{direction} READY — zone reaction + "
+                          f"{gd['confirmations_passed']} confirmations, Edge {score}.")
         elif vol_block:
             held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
             reason = (f"{direction} on hold — market {held}: "
@@ -3000,17 +3073,32 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "gate_debug": gd,
         })
 
-    # ── Candidate direction = the side price sits on vs VWAP (only one side can
-    #    gate — price cannot be both above and below). With no usable VWAP side,
-    #    lead by whichever side has structure so the WAIT reason is meaningful. ──
-    if price_above:
-        candidate = "Long"
-    elif price_below:
-        candidate = "Short"
-    elif structure_short and not structure_long:
-        candidate = "Short"
+    # ── Candidate direction. SWING is VWAP-led: the side price sits on vs VWAP
+    #    (only one side can gate — price cannot be both above and below), falling
+    #    back to the side with structure when VWAP is unusable. SCALP no longer
+    #    requires VWAP, so it ranks both sides by readiness, zone validity,
+    #    confirmation count and Edge, using the VWAP side only as a tie-break
+    #    (Long wins an exact tie, preserving the legacy default). ──
+    if require_vwap:
+        if price_above:
+            candidate = "Long"
+        elif price_below:
+            candidate = "Short"
+        elif structure_short and not structure_long:
+            candidate = "Short"
+        else:
+            candidate = "Long"
     else:
-        candidate = "Long"
+        def _cand_key(d):
+            return (
+                1 if directions[d]["ready"] else 0,
+                1 if directions[d]["gate_debug"]["zone_valid"] else 0,
+                _confirmations(d),
+                directions[d]["score"],
+                1 if ((d == "Long" and price_above)
+                      or (d == "Short" and price_below)) else 0,
+            )
+        candidate = "Long" if _cand_key("Long") >= _cand_key("Short") else "Short"
 
     blk = directions[candidate]
     if blk["ready"]:
@@ -3380,6 +3468,29 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # Candidate direction the gate evaluated (Long/Short/None) — for /diagnostics.
     result["gate_candidate"] = strict.get("candidate")
 
+    # ── Tiered alert level (SCALP early-warning ladder) — additive, DISPLAY-ONLY.
+    #    Computed independently of the verdict; it NEVER alters verdict / score /
+    #    direction / trade plan, so SWING decisions stay byte-for-byte identical.
+    #      WATCH = price is at a fresh trade-side zone (within WATCH_PCT)
+    #      ARMED = at the zone AND >= 1 real confirmation present
+    #      READY = the full READY gate passed (verdict LONG/SHORT READY)
+    #      None  = no candidate side, zone consumed/broken, or price away from zone
+    #    The trade-side zone is demand for Long / supply for Short. A consumed
+    #    (mitigated-near) or broken zone yields None — we never WATCH a dead zone. ──
+    alert_level = None
+    _cand   = result.get("gate_candidate")
+    _gd_lvl = result.get("gate_debug") or {}
+    if result["verdict"] in ("LONG READY", "SHORT READY"):
+        alert_level = "READY"
+    elif (_cand in ("Long", "Short")
+          and not zone_broken_active and not zone_mitigated_near):
+        _zone = nearest_demand if _cand == "Long" else nearest_supply
+        if (_zone and current_price
+                and abs(current_price - _zone) / _zone <= cfg("WATCH_PCT")):
+            _confs = int(_gd_lvl.get("confirmations_passed") or 0)
+            alert_level = "ARMED" if _confs >= 1 else "WATCH"
+    result["alert_level"] = alert_level
+
     # ── Unified Edge Score (single source of truth) ──────────────────────────
     # The transparent, confluence-based Edge Score replaces the legacy bias-derived
     # score on EVERY user-facing surface (status, why, alerts, journal, recaps,
@@ -3712,6 +3823,139 @@ def send_live_ready_card(entry, ticker="", notify=False):
         LAST_READY_BY_TICKER[instrument_of(ticker or entry.get("symbol", ""))] = entry
     except Exception as exc:
         logger.error("LAST_READY snapshot error: %s", exc)
+
+
+# ── Tiered WATCH/ARMED early alerts (SCALP) ───────────────────────────────────
+# Per-instrument throttle state: the last tier level we dispatched/observed and
+# when the last WATCH/ARMED post went out. A level fires once on TRANSITION (the
+# level changed) and then at most once per WATCH_ARMED_COOLDOWN_SEC while it
+# persists, so a standing WATCH/ARMED never spams on every webhook.
+LAST_TIER_LEVEL = {}   # instrument -> last alert_level seen ("WATCH"/"ARMED"/"READY")
+LAST_TIER_AT    = {}   # instrument -> datetime (UTC) of last WATCH/ARMED post attempt
+
+
+def _tiered_alert_url(inst):
+    """Resolve the Discord channel for WATCH/ARMED early alerts. DEFAULT routes to
+    the journal channel so the main signal channel stays READY-only; switchable via
+    TIERED_ALERT_CHANNEL = journal (default) | main | none (none disables posting).
+    Falls back to the instrument's main channel if the journal URL is unset."""
+    channel = os.environ.get("TIERED_ALERT_CHANNEL", "journal").strip().lower()
+    if channel == "none":
+        return None
+    if channel == "main":
+        return _discord_url(inst)
+    return DISCORD_JOURNAL_WEBHOOK_URL or _discord_url(inst)
+
+
+def _build_tiered_embed(a, inst, level):
+    """Compact WATCH/ARMED early-alert embed. DISPLAY-ONLY — it announces that price
+    has reached a fresh trade-side zone (WATCH) and is gathering confirmations
+    (ARMED) BEFORE a full READY, so the strict trade card stays the single READY
+    signal. Everything shown is read from the analysis `a` (never fabricated)."""
+    cand   = a.get("gate_candidate") or "—"
+    gd     = a.get("gate_debug") or {}
+    price  = a.get("current_price")
+    zone   = a.get("nearest_demand") if cand == "Long" else a.get("nearest_supply")
+    confs  = int(gd.get("confirmations_passed") or 0)
+    needed = int(gd.get("confirmations_needed") or 0)
+    edge   = a.get("edge_score", 0)
+    grade  = a.get("edge_grade", "")
+    side_word = "demand" if cand == "Long" else "supply"
+    title_emoji, color = {
+        "WATCH": ("👀 WATCH", 0xF1C40F),
+        "ARMED": ("🎯 ARMED", 0xE67E22),
+    }.get(level, ("👀 WATCH", 0xF1C40F))
+    # What still blocks READY (the gate's own failed conditions), conflict aside.
+    missing = [m for m in (a.get("strict_missing") or []) if m != "conflicting_structure"]
+    fields = [
+        {"name": "Setup",         "value": f"{cand} · at {side_word} zone", "inline": True},
+        {"name": "Edge",          "value": f"{edge}/100{(' · ' + grade) if grade else ''}", "inline": True},
+        {"name": "Confirmations", "value": f"{confs}/{needed}", "inline": True},
+    ]
+    if price is not None:
+        fields.append({"name": "Price", "value": f"{price:,.2f}", "inline": True})
+    if zone:
+        fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
+    if missing:
+        fields.append({"name": "Still needs", "value": ", ".join(missing[:4]), "inline": False})
+    tail = "gathering confirmations." if level == "ARMED" else "watching for confirmation."
+    return {
+        "title":       f"{title_emoji} · {inst}",
+        "description": f"Price is at a fresh {side_word} zone — {tail}",
+        "color":       color,
+        "fields":      fields,
+        "footer":      {"text": f"Early Signal · {inst}"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _post_tiered_embed(url, embed, inst, level):
+    """Slow-task worker body: POST a prebuilt WATCH/ARMED embed to Discord. Runs OFF
+    the webhook worker (via _enqueue_slow) so a slow or timing-out Discord call can
+    never delay the decision, the READY card, the journal enqueue, or the next
+    webhook evaluation. Best-effort — logs and swallows any failure."""
+    try:
+        resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
+        if resp.status_code not in (200, 204):
+            logger.warning("Tiered %s alert post failed (%s): %s %s",
+                           level, inst, resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.error("Tiered %s alert post error (%s): %s", level, inst, exc)
+
+
+def _maybe_send_tiered_alert(a, record):
+    """Fire a WATCH/ARMED early alert (SCALP only, ENABLE_TIERED_ALERTS) for the
+    analysis `a`. Throttled per instrument: a level posts on transition (changed
+    from the last level) OR after WATCH_ARMED_COOLDOWN_SEC while it persists.
+    READY is NOT posted here (the live card owns it) but is recorded so a later
+    retreat to ARMED/WATCH counts as a fresh transition.
+
+    The throttle state and embed are computed synchronously, but the Discord POST
+    is OFFLOADED to the slow-task worker, so this never blocks the webhook worker.
+    Returns True iff a WATCH/ARMED embed was enqueued for posting. Fail-open: never
+    raises into the webhook tail."""
+    if not cfg("ENABLE_TIERED_ALERTS"):
+        return False
+    level = a.get("alert_level")
+    inst  = instrument_of(record.get("ticker") or record.get("instrument")
+                          or a.get("active_ticker") or "")
+    if not inst:
+        return False
+
+    # READY: record (so a later ARMED/WATCH is a transition) but let the live card post it.
+    if level == "READY":
+        LAST_TIER_LEVEL[inst] = "READY"
+        return False
+    # No tier: forget the standing level so the next WATCH/ARMED fires immediately.
+    if level not in ("WATCH", "ARMED"):
+        LAST_TIER_LEVEL.pop(inst, None)
+        LAST_TIER_AT.pop(inst, None)
+        return False
+
+    now           = datetime.now(timezone.utc)
+    last_at       = LAST_TIER_AT.get(inst)
+    cooldown      = int(cfg("WATCH_ARMED_COOLDOWN_SEC"))
+    is_transition = (level != LAST_TIER_LEVEL.get(inst))
+    cooled_down   = (last_at is None or (now - last_at).total_seconds() >= cooldown)
+    if not (is_transition or cooled_down):
+        return False
+
+    # Record the attempt up-front (level + time) so a transient post failure can't
+    # turn into a per-webhook retry storm; the next attempt waits for the cooldown.
+    LAST_TIER_LEVEL[inst] = level
+    LAST_TIER_AT[inst]    = now
+    url = _tiered_alert_url(inst)
+    if not url:
+        return False
+    # Build the embed synchronously (fast, in-memory) but hand the Discord POST to
+    # the slow-task worker so a slow/timing-out call can't block this worker.
+    try:
+        embed = _build_tiered_embed(a, inst, level)
+    except Exception as exc:
+        logger.error("Tiered alert build error (%s/%s): %s", inst, level, exc)
+        return False
+    _enqueue_slow(lambda u=url, e=embed, i=inst, lv=level: _post_tiered_embed(u, e, i, lv))
+    return True
 
 
 def _trade_ready_loop():
@@ -4287,6 +4531,10 @@ def _grade_for_score(score):
     if s >= 90: return "A"
     if s >= 85: return "B"
     if s >= 80: return "C"
+    # A valid READY in a looser mode (SCALP, threshold 65) is still a real trade —
+    # grade it C rather than the "WAIT" floor so the card's grade never contradicts
+    # its READY verdict. SWING (threshold 80) is unaffected: s>=80 already returned.
+    if s >= cfg("EDGE_READY_THRESHOLD"): return "C"
     return "WAIT"
 
 
@@ -5215,7 +5463,7 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
     ]
     lines.extend(_vol_diag_detail(vol))
     lines.extend([
-        "  Edge Score ............ %d / %d" % (gd.get("edge_score", 0), EDGE_READY_THRESHOLD),
+        "  Edge Score ............ %d / %d" % (gd.get("edge_score", 0), gd.get("ready_threshold", EDGE_READY_THRESHOLD)),
         "",
         "  FINAL READY DECISION: %s" % ("PASS" if ready else "FAIL"),
     ])
@@ -5229,17 +5477,47 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
 
 
 def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_at,
-                         eval_duration_ms, alert_sent_at, instrument):
+                         eval_duration_ms, alert_sent_at, instrument, tiered_sent=False):
     """Append one per-evaluation timing + volatility record to EVAL_METRICS (the
     live Diagnostics page / /eval-metrics read this). Best-effort — it must never
     raise into the worker. Phase timings come from the thread-local accumulator
     populated by the _timed() blocks during this evaluation; a phase that did not
-    run for this alert (e.g. no journal write on a WAIT) is left None."""
+    run for this alert (e.g. no journal write on a WAIT) is left None.
+
+    Also records the gate breakdown (edge / zone / confirmations / blockers), the
+    tiered alert_level, and the alert-dispatch + cooldown context so the live
+    Diagnostics page can show exactly why a setup did or did not alert."""
     t   = _eval_timing_get() or {}
     vol = (a or {}).get("volatility") or {}
+    gd  = (a or {}).get("gate_debug") or {}
     total_delay = None
     if webhook_received_at is not None and alert_sent_at is not None:
         total_delay = round((alert_sent_at - webhook_received_at).total_seconds() * 1000.0, 3)
+
+    # ── Alert dispatch + cooldown context (best-effort, for diagnostics) ─────────
+    alert_level = (a or {}).get("alert_level")
+    verdict     = (a or {}).get("verdict") or ""
+    inst_key    = instrument_of(instrument) if instrument else None
+    alert_sent  = bool(alert_sent_at) or bool(tiered_sent)
+    # Which throttle governs this level: READY re-posts on TRADE_READY_INTERVAL vs
+    # LAST_LIVE_CARD_AT; WATCH/ARMED on WATCH_ARMED_COOLDOWN_SEC vs LAST_TIER_AT.
+    last_alert_at, cooldown_ms = None, None
+    if alert_level == "READY":
+        last_alert_at = LAST_LIVE_CARD_AT.get(inst_key) if inst_key else None
+        cooldown_ms   = TRADE_READY_INTERVAL * 1000
+    elif alert_level in ("WATCH", "ARMED"):
+        last_alert_at = LAST_TIER_AT.get(inst_key) if inst_key else None
+        cooldown_ms   = int(cfg("WATCH_ARMED_COOLDOWN_SEC")) * 1000
+    cooldown_remaining_ms = None
+    if last_alert_at is not None and cooldown_ms is not None:
+        elapsed_ms = (datetime.now(timezone.utc) - last_alert_at).total_seconds() * 1000.0
+        cooldown_remaining_ms = round(max(0.0, cooldown_ms - elapsed_ms), 1)
+    suppressed = bool(alert_level and not alert_sent
+                      and cooldown_remaining_ms is not None and cooldown_remaining_ms > 0)
+    blockers = ", ".join(gd.get("failed_conditions") or [])
+    if not blockers:
+        blockers = "READY" if verdict.endswith("READY") else "-"
+
     record = {
         "webhookReceivedAt":    webhook_received_at.isoformat() if webhook_received_at else None,
         "evaluationStartedAt":  eval_started_at.isoformat() if eval_started_at else None,
@@ -5262,6 +5540,23 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         # ── Context ──
         "instrument":           instrument,
         "verdict":              (a or {}).get("verdict"),
+        # ── Gate / decision breakdown ──
+        "alertLevel":           alert_level,
+        "edgeScore":            gd.get("edge_score"),
+        "edgeOk":               gd.get("edge_ok"),
+        "zoneValid":            gd.get("zone_valid"),
+        "confirmationsPassed":  gd.get("confirmations_passed"),
+        "confirmationsNeeded":  gd.get("confirmations_needed"),
+        "readyThreshold":       gd.get("ready_threshold"),
+        "gateBlockers":         blockers,
+        # ── Alert dispatch + cooldown ──
+        "alertSent":            alert_sent,
+        "webhookSent":          bool(alert_sent_at),
+        "tieredSent":           bool(tiered_sent),
+        "lastAlertAt":          last_alert_at.isoformat() if last_alert_at else None,
+        "cooldownMs":           cooldown_ms,
+        "cooldownRemainingMs":  cooldown_remaining_ms,
+        "suppressedByCooldown": suppressed,
     }
     with EVAL_METRICS_LOCK:
         EVAL_METRICS.append(record)
@@ -5290,6 +5585,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     eval_finished_at = now_utc()
     eval_duration_ms = round((time.perf_counter() - _eval_t0) * 1000.0, 3)
     alert_sent_at = None
+    tiered_sent   = False
 
     # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
     # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
@@ -5304,7 +5600,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                 resolved_inst, fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), normalized))
         _record_eval_metrics(a, webhook_received_at, eval_started_at,
                              eval_finished_at, eval_duration_ms, alert_sent_at,
-                             resolved_inst)
+                             resolved_inst, tiered_sent=tiered_sent)
         return
 
     # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
@@ -5364,6 +5660,16 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         except Exception as exc:
             logger.error("Live-card send error (alert path): %s", exc)
 
+    # Tiered WATCH/ARMED early alert (SCALP only). Mutually exclusive with the READY
+    # card above (alert_level is READY vs WATCH/ARMED) and throttled per instrument.
+    # The throttle state is recorded synchronously but the Discord POST is offloaded
+    # to the slow-task worker, so it can never delay the READY card, the journal
+    # enqueue below, or the next webhook evaluation. Fail-open.
+    try:
+        tiered_sent = _maybe_send_tiered_alert(a, record)
+    except Exception as exc:
+        logger.error("Tiered alert dispatch error: %s", exc)
+
     # Offload the journal-channel embed (the only slow piece left here), regardless
     # of the live-card outcome, so the decision worker is free immediately.
     if journal_entry:
@@ -5380,7 +5686,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             "Y" if _gd.get("vwap_confirmed") else "N",
             "Y" if _gd.get("structure_confirmed") else "N",
             _gd.get("edge_score", 0),
-            "" if _gd.get("edge_ok") else ("<%d" % EDGE_READY_THRESHOLD),
+            "" if _gd.get("edge_ok") else ("<%d" % _gd.get("ready_threshold", EDGE_READY_THRESHOLD)),
         )
         _vol = a.get("volatility") or {}
         if _gd.get("volatility_block"):
@@ -5414,7 +5720,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
 
     _record_eval_metrics(a, webhook_received_at, eval_started_at,
                          eval_finished_at, eval_duration_ms, alert_sent_at,
-                         resolved_inst)
+                         resolved_inst, tiered_sent=tiered_sent)
 
 
 # ── Asynchronous webhook processing ──────────────────────────────────────────
@@ -5780,14 +6086,22 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <th>AI Notes ms</th><th>Screenshot ms</th><th>Journal ms</th>
 <th>Alert Sent</th><th>Alert Delay ms</th>
 <th>ATR</th><th>Base ATR</th><th>Mult</th><th>Threshold</th><th>Vol Decision</th>
+<th>Alert Level</th><th>Edge</th><th>Confirms</th><th>Gate Blockers</th>
+<th>Sent?</th><th>Cooldown Left ms</th><th>Suppressed</th>
 </tr></thead>
-<tbody id="rows"><tr><td class="empty" colspan="19">Loading...</td></tr></tbody>
+<tbody id="rows"><tr><td class="empty" colspan="26">Loading...</td></tr></tbody>
 </table>
 </div>
 <script>
 var BASE='/api';
 function ms(v){return (v===null||v===undefined)?'-':Number(v).toFixed(1);}
 function num(v){return (v===null||v===undefined)?'-':Number(v).toFixed(2);}
+function intOrDash(v){return (v===null||v===undefined)?'-':Number(v).toFixed(0);}
+function confs(e){
+  var p=e.confirmationsPassed,n=e.confirmationsNeeded;
+  if(p===null||p===undefined) return '-';
+  return p+'/'+((n===null||n===undefined)?'-':n);
+}
 function etTime(iso){
   if(!iso) return '-';
   var dt=new Date(iso);
@@ -5807,7 +6121,7 @@ function showError(msg){
   if(u){ u.className='bad'; u.textContent='\u26a0 '+msg+' \u2014 retrying every second'; }
   var rows=document.getElementById('rows');
   if(rows && rows.querySelector('.empty')){
-    rows.innerHTML='<tr><td class="empty" colspan="19">'+msg+' \u2014 retrying every second.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="26">'+msg+' \u2014 retrying every second.</td></tr>';
   }
 }
 async function refresh(){
@@ -5837,7 +6151,7 @@ async function refresh(){
   }
   var rows=document.getElementById('rows');
   if(!evals.length){
-    rows.innerHTML='<tr><td class="empty" colspan="19">No evaluations yet - waiting for the next webhook.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="26">No evaluations yet - waiting for the next webhook.</td></tr>';
     return;
   }
   rows.innerHTML=evals.map(function(e){
@@ -5862,6 +6176,13 @@ async function refresh(){
       '<td>'+num(e.volatilityMultiplier)+'</td>'+
       '<td>'+num(e.volatilityThreshold)+'</td>'+
       '<td style="text-align:left">'+(e.volatilityDecision||'-')+'</td>'+
+      '<td class="'+(e.alertLevel==='READY'?'v-ready':(e.alertLevel?'warn':'muted'))+'">'+(e.alertLevel||'-')+'</td>'+
+      '<td>'+intOrDash(e.edgeScore)+'</td>'+
+      '<td>'+confs(e)+'</td>'+
+      '<td style="text-align:left">'+(e.gateBlockers||'-')+'</td>'+
+      '<td class="'+(e.alertSent?'good':'muted')+'">'+(e.alertSent?'yes':'no')+'</td>'+
+      '<td>'+ms(e.cooldownRemainingMs)+'</td>'+
+      '<td class="'+(e.suppressedByCooldown?'warn':'muted')+'">'+(e.suppressedByCooldown?'yes':'-')+'</td>'+
     '</tr>';
   }).join('');
 }

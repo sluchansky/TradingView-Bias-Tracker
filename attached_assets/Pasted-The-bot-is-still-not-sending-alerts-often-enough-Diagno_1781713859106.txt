@@ -1,0 +1,137 @@
+The bot is still not sending alerts often enough. Diagnostics show the latest verdict is still WAIT and Alert Sent is blank, even though volatility does not appear to be blocking.
+
+Current diagnostics example:
+ATR: 1.84
+Base ATR: 1.60
+Multiplier: 1.15x
+Threshold: 2.50x
+
+Since 1.15x is below the 2.50x threshold, volatility should not be blocking alerts.
+
+Please audit why the bot is still staying in WAIT and not sending alerts.
+
+Main concerns:
+
+1. Evaluations are too low
+    Diagnostics only showed 4 evaluations.
+
+Please check:
+
+* How often evaluateSetup() is running
+* Whether it only runs on bar close
+* Whether it runs every time a TradingView webhook is received
+* Whether it has a backup timer evaluation every 1 second
+* How many TradingView webhooks are actually received per minute
+
+For scalping, the bot should evaluate:
+
+* every webhook received
+* every market/update event
+* every 1 second as a backup timer
+
+2. Add full failed-filter diagnostics
+
+Every evaluation should display:
+
+zoneValid: true/false
+vwapConfirmed: true/false
+structureConfirmed: true/false
+candleConfirmed: true/false
+liquiditySweepConfirmed: true/false
+volumeConfirmed: true/false
+trendAligned: true/false
+edgeScore: number
+requiredScore: number
+confirmationsPassed: number
+confirmationsNeeded: number
+failedFilters: []
+readyBlockedReason: text
+latestVerdict: WATCH / ARMED / READY / WAIT
+alertSent: true/false
+webhookSent: true/false
+
+3. Check cooldown suppression
+
+Please display:
+
+lastAlertTime
+cooldownMs
+cooldownRemainingMs
+suppressedByCooldown: true/false
+
+Make sure the bot is not accidentally stuck in cooldown and suppressing alerts.
+
+4. Reduce READY strictness in SCALP mode
+
+Do not require every confirmation to pass.
+
+Change READY logic to:
+
+READY if:
+
+* edgeScore >= 65
+* zoneValid = true
+* confirmationsPassed >= 2
+
+Confirmations can include:
+
+* BOS
+* CHOCH
+* VWAP reclaim/rejection
+* liquidity sweep
+* candle confirmation
+* volume confirmation
+* trend alignment
+
+Important:
+Do not require BOS and CHOCH at the same time.
+Use BOS OR CHOCH OR liquidity sweep/reclaim as valid structure confirmation.
+
+5. Add alert levels so the bot fires earlier
+
+The bot should not only alert when a perfect READY trade appears.
+
+Add:
+
+WATCH:
+Fire when price touches or enters a valid demand/supply zone, VWAP area, or important level.
+
+ARMED:
+Fire when price is near a zone and at least 1 confirmation appears.
+
+READY:
+Fire when price is near a zone, edgeScore >= 65, and at least 2 confirmations appear.
+
+6. Volatility should not hard-block alerts
+
+Volatility should only modify the score.
+
+Example:
+Normal volatility: +10
+Elevated volatility: 0
+Extreme volatility: -10
+
+Do not force WAIT only because ATR is elevated.
+
+7. Add these diagnostics to the dashboard table:
+
+currentATR
+baselineATR
+volatilityMultiplier
+volatilityThreshold
+volatilityDecision
+alertLevel
+edgeScore
+requiredScore
+confirmationsPassed
+confirmationsNeeded
+failedFilters
+readyBlockedReason
+lastAlertTime
+cooldownRemainingMs
+suppressedByCooldown
+alertSent
+webhookSent
+
+Goal:
+The bot should fire more often by sending WATCH and ARMED alerts before a perfect READY trade. READY should still require quality, but it should not require every single filter to pass.
