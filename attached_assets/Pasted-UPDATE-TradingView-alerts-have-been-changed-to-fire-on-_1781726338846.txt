@@ -1,0 +1,69 @@
+UPDATE: TradingView alerts have been changed to fire on 1-minute intervals and repeat every minute while the condition is met.
+
+Please update the bot to handle this correctly.
+
+Requirements:
+
+1. Signal deduplication
+- Ignore duplicate signals for the same symbol/direction/setup within a configurable cooldown.
+- Default cooldown: 3–5 minutes.
+- Do not create multiple duplicate READY alerts from the same repeated TradingView condition.
+
+2. Persistent setup tracking
+- If a setup is already ACTIVE, update the existing setup state instead of creating a new setup.
+- Track setup status as:
+  - FORMING
+  - READY
+  - ACTIVE
+  - INVALIDATED
+  - EXPIRED
+
+3. Fast webhook processing
+- Process incoming webhooks immediately.
+- Do not delay processing until candle close if the webhook already contains valid condition data.
+- Webhook handling should be asynchronous/non-blocking if possible.
+
+4. Latency logging
+Log the following for every webhook:
+- alertReceivedTime
+- processingStartTime
+- processingEndTime
+- totalLatencyMs
+- symbol
+- direction
+- setupType
+- decision
+
+5. Diagnostics dashboard
+Add/display:
+- lastWebhookReceived
+- alertsReceivedLastHour
+- duplicatesIgnoredLastHour
+- averageProcessingTimeMs
+- currentQueueLength
+- signalsReceived
+- signalsPassedFilters
+- signalsRejected
+
+6. Rejection reason counters
+Track and display top rejection reasons:
+- zone_valid failed
+- vwap_confirmed failed
+- structure_confirmed failed
+- candle_confirmed failed
+- volatility_block
+- edge_score too low
+- session filter failed
+- cooldown duplicate
+
+7. Important note
+Changing TradingView alerts to fire every minute helps the bot receive more chances to process setups, but it will not increase READY alerts if the bot’s internal filters are still too strict.
+
+Please verify whether alerts are being received but rejected internally.
+
+Expected behavior:
+- Bot receives repeated 1-minute webhook updates.
+- Bot ignores duplicates within cooldown.
+- Bot updates active setups instead of spamming.
+- Bot shows exactly why signals are rejected.
+- Elevated volatility should not automatically force WAIT in SCALP mode.
