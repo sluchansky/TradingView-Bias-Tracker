@@ -408,6 +408,7 @@ WEEKLY_REPORT_DAYS      = int(os.environ.get("WEEKLY_REPORT_DAYS", 7))  # lookba
 # to type it. A VWAP pushed from a TradingView chart (source "chart") is exact and
 # wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that the auto value resumes.
 VWAP_FETCH_INTERVAL    = int(os.environ.get("VWAP_FETCH_INTERVAL", 60))   # seconds
+PRICE_FETCH_INTERVAL   = int(os.environ.get("PRICE_FETCH_INTERVAL", 10))  # seconds — DISPLAY-ONLY price refresh (faster than VWAP so the dashboard price stays near-live)
 VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # minutes
 # How long an alert/chart price stays the AUTHORITATIVE dashboard readout after it
 # arrives. While fresh, the dashboard shows the exact chart price; once it goes
@@ -2694,11 +2695,6 @@ def _vwap_autofetch_loop():
         logger.warning("VWAP auto-fetch loop error: %s", exc)
     try:
         for instrument in VWAP_FEED_SYMBOL:
-            _update_price_auto(instrument)
-    except Exception as exc:  # display fallback only — never disrupt the loop
-        logger.warning("Price auto-fetch loop error: %s", exc)
-    try:
-        for instrument in VWAP_FEED_SYMBOL:
             _update_volatility_auto(instrument)
     except Exception as exc:  # volatility is best-effort — never disrupt VWAP/watcher
         logger.warning("Volatility auto-fetch loop error: %s", exc)
@@ -2708,6 +2704,20 @@ def _vwap_autofetch_loop():
         logger.warning("Managed-trade watch error: %s", exc)
     finally:
         threading.Timer(VWAP_FETCH_INTERVAL, _vwap_autofetch_loop).start()
+
+
+def _price_autofetch_loop():
+    """Refresh the DISPLAY-ONLY dashboard price for all instruments on a fast cadence
+    (PRICE_FETCH_INTERVAL), independent of the slower VWAP/volatility loop, so the
+    dashboard price stays near-live even on a quiet market. Best-effort: any failure
+    leaves the previous value in place and it never feeds the gate / scoring."""
+    try:
+        for instrument in VWAP_FEED_SYMBOL:
+            _update_price_auto(instrument)
+    except Exception as exc:  # display fallback only — never let the loop die
+        logger.warning("Price auto-fetch loop error: %s", exc)
+    finally:
+        threading.Timer(PRICE_FETCH_INTERVAL, _price_autofetch_loop).start()
 
 
 def _active_ticker():
@@ -7315,6 +7325,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
+    threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:

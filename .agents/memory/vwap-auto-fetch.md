@@ -41,7 +41,11 @@ chart VWAP" over a one-time TradingView alert setup.
   (`AUTO_PRICE_BY_TICKER` via `display_price_for`) auto-sources the dashboard price
   from the same feed so a quiet/just-restarted market isn't blank. Precedence:
   fresh alert → auto → stale alert → None; it is computed after all decision paths and
-  must never reach the gate.
+  must never reach the gate. **The display price runs on its OWN fast loop**
+  (`_price_autofetch_loop`, `PRICE_FETCH_INTERVAL`≈10s) decoupled from the 60s VWAP
+  loop, because the operator wanted a near-live readout. Keep the cadences separate —
+  do not re-bundle price into the slow VWAP loop, and don't speed up VWAP/volatility
+  to match (more Yahoo calls for no gate benefit).
 
 - **The fetch loop must never die or block requests.** It runs on a rescheduling
   timer (mirrors the heartbeat loop), swallows all errors, and a failed fetch leaves
