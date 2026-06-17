@@ -81,8 +81,20 @@ COUNTERS = {
     "duplicates_ignored":     0,   # inbound POSTs flagged duplicate within cooldown
     "signals_passed_filters": 0,   # webhook (non-duplicate) evals with a READY verdict
     "signals_rejected":       0,   # webhook (non-duplicate) evals with a WAIT verdict
-    "wait_reasons_breakdown": {},  # failed-gate name -> count (WAIT verdicts + duplicates)
+    "wait_reasons_breakdown": {},  # raw failed-gate name -> count (WAIT verdicts + duplicates)
+    "rejection_reasons":      {},  # canonical reason -> count (req 6; condition-level on WAIT)
 }
+# Canonical rejection-reason keys (req 6). Counted per WAIT eval from gate_debug so
+# the operator sees, broken out, which individual conditions are holding setups back
+# (the raw wait_reasons_breakdown lumps the SCALP confirmations into one bucket).
+# NOTE: "session_filter" is intentionally never incremented — the trading session is
+# a +10 BONUS, never a hard gate, so it can never reject a setup; it is shown at 0 so
+# the operator can SEE that session is not the bottleneck (it is not a filter).
+REJECTION_REASON_KEYS = (
+    "zone_valid", "vwap_confirmed", "structure_confirmed", "candle_confirmed",
+    "volatility_block", "edge_score_low", "conflicting_structure",
+    "session_filter", "cooldown_duplicate",
+)
 COUNTERS_LOCK = threading.Lock()
 # Per-instrument last verdict (was it READY?) so ready_setups_detected counts a
 # fresh setup once per non-READY -> READY transition, not on every heartbeat re-eval.
@@ -5975,6 +5987,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         "direction":            direction,
         "setupType":            setup_type,
         "decision":             (a or {}).get("verdict"),
+        "alertReceivedTime":    webhook_received_at.isoformat() if webhook_received_at else None,
         "processingStartTime":  eval_started_at.isoformat() if eval_started_at else None,
         "processingEndTime":    eval_finished_at.isoformat() if eval_finished_at else None,
         "totalLatencyMs":       total_latency_ms,
@@ -6052,6 +6065,33 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
                 for _fc in (gd.get("failed_conditions") or []):
                     COUNTERS["wait_reasons_breakdown"][_fc] = \
                         COUNTERS["wait_reasons_breakdown"].get(_fc, 0) + 1
+                # Canonical, broken-out rejection reasons (req 6). Scoped to genuine
+                # inbound signals (webhook, non-duplicate) so this cleanly decomposes
+                # the signals_rejected funnel bucket; duplicates are tallied as
+                # cooldown_duplicate in the webhook() dedup path instead. Counted at
+                # the CONDITION level (not just the active hard gate) so SCALP
+                # confirmation gaps (vwap/structure/candle) are visible even when the
+                # raw wait_reasons_breakdown lumps them into "confirmations(N<M)".
+                # session_filter is deliberately NEVER bumped: the trading session is
+                # a +10 bonus, never a gate, so it can never reject a setup.
+                if trigger == "webhook" and not is_duplicate:
+                    _rr = COUNTERS["rejection_reasons"]
+                    def _bump_rr(_k):
+                        _rr[_k] = _rr.get(_k, 0) + 1
+                    if not gd.get("zone_valid"):
+                        _bump_rr("zone_valid")
+                    if gd.get("vwap_confirmed") is False:
+                        _bump_rr("vwap_confirmed")
+                    if gd.get("structure_confirmed") is False:
+                        _bump_rr("structure_confirmed")
+                    if gd.get("candle_confirmed") is False:
+                        _bump_rr("candle_confirmed")
+                    if gd.get("volatility_block"):
+                        _bump_rr("volatility_block")
+                    if not gd.get("edge_ok"):
+                        _bump_rr("edge_score_low")
+                    if gd.get("conflicting_structure"):
+                        _bump_rr("conflicting_structure")
     except Exception as exc:
         logger.error("Counter update failed (eval still recorded): %s", exc)
 
@@ -6317,9 +6357,14 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     try:
         logger.info(
             "Webhook latency | sym=%s dir=%s setup=%s decision=%s dup=%s "
+            "alertReceivedTime=%s processingStartTime=%s processingEndTime=%s "
             "evalMs=%s totalMs=%s",
             resolved_inst, (a.get("gate_candidate") or "-"), normalized,
-            a.get("verdict"), is_duplicate, eval_duration_ms,
+            a.get("verdict"), is_duplicate,
+            (webhook_received_at.isoformat() if webhook_received_at else "-"),
+            (eval_started_at.isoformat() if eval_started_at else "-"),
+            (eval_finished_at.isoformat() if eval_finished_at else "-"),
+            eval_duration_ms,
             (round((eval_finished_at - webhook_received_at).total_seconds() * 1000.0, 1)
              if webhook_received_at else eval_duration_ms))
     except Exception as exc:
@@ -6677,6 +6722,8 @@ def webhook():
                 COUNTERS["duplicates_ignored"] += 1
                 COUNTERS["wait_reasons_breakdown"]["cooldown_duplicate"] = \
                     COUNTERS["wait_reasons_breakdown"].get("cooldown_duplicate", 0) + 1
+                COUNTERS["rejection_reasons"]["cooldown_duplicate"] = \
+                    COUNTERS["rejection_reasons"].get("cooldown_duplicate", 0) + 1
                 _DUP_TS.append(webhook_received_at)
     except Exception as exc:
         logger.error("Signal dedup check failed (alert still processed): %s", exc)
@@ -6862,6 +6909,14 @@ async function refresh(){
   var wrb=c.wait_reasons_breakdown||{};
   var wrbTop=Object.keys(wrb).sort(function(a,b){return wrb[b]-wrb[a];}).slice(0,5)
               .map(function(k){return k+' ('+wrb[k]+')';}).join(', ')||'-';
+  var rr=c.rejection_reasons||{};
+  var rrLabel={zone_valid:'zone_valid',vwap_confirmed:'vwap_confirmed',
+    structure_confirmed:'structure_confirmed',candle_confirmed:'candle_confirmed',
+    volatility_block:'volatility_block',edge_score_low:'edge_score',
+    conflicting_structure:'conflict',cooldown_duplicate:'cooldown_dup',
+    session_filter:'session(bonus,n/a)'};
+  var rrKeys=Object.keys(rrLabel).sort(function(a,b){return (rr[b]||0)-(rr[a]||0);});
+  var rrTxt=rrKeys.map(function(k){return rrLabel[k]+' ('+(rr[k]||0)+')';}).join(', ');
   var sum=document.getElementById('summary');
   var e=evals.length?evals[0]:null;
   var ready=!!(e&&(e.verdict||'').indexOf('READY')>=0);
@@ -6885,7 +6940,8 @@ async function refresh(){
     card('Setup states', setupStateTxt(st.setupStates), 'sm '+(setupStateCls(st.setupStates)))+
     card('Dedup cooldown', (st.signalDedupCooldownSec!=null?(st.signalDedupCooldownSec+'s'):'-'), 'sm muted')+
     card('Session', (sess.window||'-'), 'sm '+(sess.preferred?'good':'muted'))+
-    card('Top WAIT reasons', wrbTop, 'sm muted');
+    card('Top WAIT reasons', wrbTop, 'sm muted')+
+    card('Rejection reasons (condition gaps)', rrTxt, 'sm muted');
   var rows=document.getElementById('rows');
   if(!evals.length){
     rows.innerHTML='<tr><td class="empty" colspan="47">No evaluations yet - waiting for the next webhook.</td></tr>';
@@ -6972,6 +7028,13 @@ def get_eval_metrics():
             "signals_passed_filters": COUNTERS["signals_passed_filters"],
             "signals_rejected":       COUNTERS["signals_rejected"],
             "wait_reasons_breakdown": dict(COUNTERS["wait_reasons_breakdown"]),
+            # Canonical rejection reasons (req 6): always expose all keys (0 default)
+            # so the operator sees the full checklist, incl. session_filter pinned at
+            # 0 (bonus, never a gate). conflicting_structure is surfaced too.
+            "rejection_reasons":      {
+                _k: COUNTERS["rejection_reasons"].get(_k, 0)
+                for _k in REJECTION_REASON_KEYS
+            },
         }
         # Trim + count the rolling last-hour timestamp windows under the same lock.
         while _WEBHOOK_TS and _WEBHOOK_TS[0] < _hour_ago:

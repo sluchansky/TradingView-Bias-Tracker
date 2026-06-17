@@ -48,6 +48,27 @@ DEDUP_LOCK -> STATE_LOCK -> EVAL_METRICS_LOCK -> COUNTERS_LOCK (COUNTERS last;
 never acquire COUNTERS_LOCK inside EVAL_METRICS_LOCK). In practice each critical
 section is tiny and released before taking the next, so no nesting today.
 
+## Canonical rejection_reasons counter (req 6) is condition-level, not exclusive
+`COUNTERS["rejection_reasons"]` (keys in `REJECTION_REASON_KEYS`) is a SECOND,
+canonical counter alongside the raw `wait_reasons_breakdown`. It is tallied in
+`_record_eval_metrics` on a non-READY eval scoped to `trigger=="webhook" and not
+is_duplicate` (so it decomposes the `signals_rejected` funnel bucket), bumping each
+FAILED condition from `gate_debug` individually (zone_valid / vwap_confirmed /
+structure_confirmed / candle_confirmed / volatility_block / edge_score_low /
+conflicting_structure). `cooldown_duplicate` is bumped in the webhook() dedup path,
+not here. Counts are CONDITION-LEVEL, NOT a mutually-exclusive decomposition of the
+hard-gate cause: in SCALP a missing vwap/structure/candle confirmation is counted
+even if the confirmations-count gate was satisfied by the others. The dashboard card
+is therefore labelled "Rejection reasons (condition gaps)" so the sum-across-reasons
+can exceed signals_rejected without being a bug.
+**session_filter is pinned at 0 forever** — the trading session is a +10 BONUS, never
+a hard gate (absent from `_failed_gates`/`_is_ready`), so it can NEVER reject a setup.
+It is displayed at 0 (labelled "session(bonus,n/a)") precisely to prove session is not
+the bottleneck. NEVER increment it; doing so fabricates a rejection cause that the gate
+does not have.
+**Why:** the user's spec listed "session filter failed" as a reason, but in this bot
+session is bonus-only; showing it at 0 honours the request without lying about the gate.
+
 ## Last-hour stats
 `alertsReceivedLastHour` / `duplicatesIgnoredLastHour` come from two small deques
 (`_WEBHOOK_TS`, `_DUP_TS`) trimmed to a 1-hour window under COUNTERS_LOCK.
