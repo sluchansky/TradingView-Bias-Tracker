@@ -60,7 +60,8 @@ ACTIVE_TRADE     = None
 # Serialises the ENTER critical section so two concurrent ENTER requests can
 # never race on the ACTIVE_TRADE record.
 _ENTER_LOCK      = threading.Lock()
-LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
+LAST_ALERT_AT    = None   # datetime of most recent recognized/scored webhook alert (UTC)
+LAST_WEBHOOK_AT  = None   # datetime of most recent inbound POST /webhook (UTC), ANY type
 LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live card sent (UTC)
 # Per-evaluation performance diagnostics: the last EVAL_METRICS_MAX scored alerts,
 # each with phase timings (indicator/volatility/scoring/notes/screenshot/journal),
@@ -69,6 +70,20 @@ LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live ca
 EVAL_METRICS_MAX  = 100
 EVAL_METRICS      = deque(maxlen=EVAL_METRICS_MAX)
 EVAL_METRICS_LOCK = threading.Lock()   # guards append (worker) vs snapshot (/eval-metrics)
+# ── Cumulative observability counters (since process start; reset on restart) ──
+# Surfaced as the "stats" block on /eval-metrics and the Diagnostics summary cards.
+# Guarded by COUNTERS_LOCK, which is NEVER nested inside EVAL_METRICS_LOCK.
+COUNTERS = {
+    "webhooks_received":      0,   # every inbound POST /webhook (any type)
+    "evaluations_run":        0,   # every recorded evaluation (webhook + heartbeat)
+    "ready_setups_detected":  0,   # deduped: non-READY -> READY transitions only
+    "alerts_sent":            0,   # live-card / tiered alerts actually dispatched
+    "wait_reasons_breakdown": {},  # failed-gate name -> count (WAIT verdicts)
+}
+COUNTERS_LOCK = threading.Lock()
+# Per-instrument last verdict (was it READY?) so ready_setups_detected counts a
+# fresh setup once per non-READY -> READY transition, not on every heartbeat re-eval.
+_READY_STATE_BY_INST = {}
 # ── Trade-management watcher state (additive; separate from manual ACTIVE_TRADE) ──
 MANAGED_TRADES_BY_KEY = {}  # (instrument,direction,entry_lo,date) -> managed-trade dict
 LAST_READY_BY_TICKER  = {}  # instrument -> last READY card entry snapshot (for /why)
@@ -412,6 +427,17 @@ EARLY_WINDOW_MIN     = float(os.environ.get("EARLY_WINDOW_MIN", 10))
 # Secondary guard against re-firing the same setup within this many seconds (the
 # per-setup dedupe is primary; this just bounds edge cases).
 EARLY_ALERT_COOLDOWN_SEC = int(os.environ.get("EARLY_ALERT_COOLDOWN_SEC", 180))
+
+# ── Heartbeat (periodic) market re-evaluation (additive, DIAGNOSTIC-ONLY) ──────
+# Re-scores every instrument on a fixed cadence so the Diagnostics page reflects a
+# live, continuously-updated read instead of only the (infrequent) TradingView
+# webhooks. It calls full_analysis + records eval metrics ONLY — it NEVER posts to
+# Discord, journals, or sends a live/EARLY/tiered alert (those stay driven by the
+# webhook path + _trade_ready_loop), so it is safe on BOTH dev and prod and can
+# never change a READY/WAIT verdict or double-post. Distinct from the Discord
+# check-in HEARTBEAT_INTERVAL above.
+EVAL_HEARTBEAT_ENABLED  = os.environ.get("EVAL_HEARTBEAT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+EVAL_HEARTBEAT_INTERVAL = int(os.environ.get("EVAL_HEARTBEAT_INTERVAL", 15))  # seconds (default 15s)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 # ── Weekly performance report (additive) ──────────────────────────────────────
 # Posts a week-in-review embed once a week, just after the close. Default is
@@ -5790,7 +5816,8 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
 
 
 def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_at,
-                         eval_duration_ms, alert_sent_at, instrument, tiered_sent=False):
+                         eval_duration_ms, alert_sent_at, instrument, tiered_sent=False,
+                         trigger="webhook"):
     """Append one per-evaluation timing + volatility record to EVAL_METRICS (the
     live Diagnostics page / /eval-metrics read this). Best-effort — it must never
     raise into the worker. Phase timings come from the thread-local accumulator
@@ -5901,6 +5928,16 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         "confirmationsNeeded":  gd.get("confirmations_needed"),
         "readyThreshold":       gd.get("ready_threshold"),
         "gateBlockers":         blockers,
+        # ── Expanded WAIT diagnostics (additive; surfaced on the Diagnostics page) ──
+        "trigger":              trigger,
+        "vwapConfirmed":        gd.get("vwap_confirmed"),
+        "structureConfirmed":   gd.get("structure_confirmed"),
+        "candleConfirmed":      gd.get("candle_confirmed"),
+        "liquidityConfirmed":   gd.get("liquidity_sweep"),
+        "volatilityConfirmed":  (None if gd.get("volatility_block") is None
+                                 else (not gd.get("volatility_block"))),
+        "confidenceScore":      (a or {}).get("confidence"),
+        "waitReason":           (a or {}).get("strict_reason") or (a or {}).get("reason"),
         # ── Alert dispatch + cooldown ──
         "alertSent":            alert_sent,
         "webhookSent":          bool(alert_sent_at),
@@ -5921,6 +5958,32 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     }
     with EVAL_METRICS_LOCK:
         EVAL_METRICS.append(record)
+
+    # ── Cumulative counters (separate lock; NEVER nested in EVAL_METRICS_LOCK) ──
+    # Best-effort, like the rest of this function — counter math must never raise
+    # into the worker / heartbeat loop.
+    try:
+        verdict_str = (a or {}).get("verdict") or ""
+        is_ready    = verdict_str.endswith("READY")
+        with COUNTERS_LOCK:
+            COUNTERS["evaluations_run"] += 1
+            if alert_sent:
+                COUNTERS["alerts_sent"] += 1
+            # Count a fresh setup once per non-READY -> READY transition per
+            # instrument (NOT on every heartbeat re-eval of a still-READY setup).
+            prev_ready = _READY_STATE_BY_INST.get(inst_key, False)
+            if is_ready and not prev_ready:
+                COUNTERS["ready_setups_detected"] += 1
+            if inst_key is not None:
+                _READY_STATE_BY_INST[inst_key] = is_ready
+            # Tally each failed gate on a WAIT verdict so the operator can see the
+            # dominant reasons setups don't fire.
+            if not is_ready:
+                for _fc in (gd.get("failed_conditions") or []):
+                    COUNTERS["wait_reasons_breakdown"][_fc] = \
+                        COUNTERS["wait_reasons_breakdown"].get(_fc, 0) + 1
+    except Exception as exc:
+        logger.error("Counter update failed (eval still recorded): %s", exc)
 
 
 def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
@@ -6177,11 +6240,52 @@ def _enqueue_slow(fn):
     _SLOW_TASKS.put(fn)
 
 
+# ── Heartbeat market re-evaluation loop (additive, DIAGNOSTIC-ONLY) ───────────
+# Periodically re-scores every instrument so the Diagnostics page shows a live,
+# continuously-updated read (counters, gate signals, WAIT reasons) instead of only
+# the infrequent TradingView webhooks. It calls full_analysis + _record_eval_metrics
+# ONLY — never a Discord / journal / EARLY / tiered / live-card path — so it can
+# never alter a READY/WAIT verdict or post a duplicate alert. Fail-open per
+# instrument, and strictly less frequent than the existing /status polling that
+# already calls full_analysis, so it adds no new concurrency risk.
+_HEARTBEAT_INSTRUMENTS = ("MGC", "MNQ")
+
+
+def _run_heartbeat_evaluations():
+    for inst in _HEARTBEAT_INSTRUMENTS:
+        try:
+            _eval_timing_begin()          # per-instrument so phase timings don't bleed
+            _t0     = time.perf_counter()
+            started = now_utc()
+            a       = full_analysis(ticker_override=inst)
+            finished = now_utc()
+            dur_ms  = round((time.perf_counter() - _t0) * 1000.0, 3)
+            _record_eval_metrics(a, None, started, finished, dur_ms, None, inst,
+                                 tiered_sent=False, trigger="heartbeat")
+        except Exception as exc:
+            logger.error("Heartbeat evaluation failed for %s: %s", inst, exc)
+
+
+def _heartbeat_eval_loop():
+    """Run a heartbeat evaluation pass now, then reschedule every
+    EVAL_HEARTBEAT_INTERVAL seconds. Diagnostic-only; safe on dev and prod."""
+    try:
+        if EVAL_HEARTBEAT_ENABLED:
+            _run_heartbeat_evaluations()
+    except Exception as exc:
+        logger.error("Heartbeat eval loop error: %s", exc)
+    finally:
+        threading.Timer(EVAL_HEARTBEAT_INTERVAL, _heartbeat_eval_loop).start()
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, ZONE_MITIGATED_FLAG
+    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, ZONE_MITIGATED_FLAG, LAST_WEBHOOK_AT
 
     webhook_received_at = now_utc()   # T0 for the webhook->alert delay metric
+    LAST_WEBHOOK_AT = webhook_received_at   # any inbound POST, before any early return
+    with COUNTERS_LOCK:
+        COUNTERS["webhooks_received"] += 1
 
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -6432,6 +6536,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
   .card{background:#12121e;border:1px solid #1e1e32;border-radius:12px;padding:12px 14px;min-width:140px;flex:1}
   .card .k{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#666;margin-bottom:6px}
   .card .v{font-size:20px;font-weight:800}
+  .card .v.sm{font-size:13px;font-weight:600;white-space:normal;word-break:break-word;line-height:1.3}
   .good{color:#22c55e}.warn{color:#f59e0b}.bad{color:#ef4444}.muted{color:#888}
   .wrap{overflow-x:auto;border:1px solid #1e1e32;border-radius:12px}
   table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}
@@ -6461,8 +6566,9 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <th>Sent?</th><th>Cooldown Left ms</th><th>Suppressed</th>
 <th>Event Start</th><th>Sweep</th><th>CHOCH</th><th>Displacement</th>
 <th>Early Alert</th><th>Ready Alert</th><th>Delay s</th><th>Waited Close</th>
+<th>Trigger</th><th>Zone</th><th>VWAP</th><th>Struct</th><th>Candle</th><th>Liq</th><th>Vol</th><th>Conf</th><th>Wait Reason</th>
 </tr></thead>
-<tbody id="rows"><tr><td class="empty" colspan="34">Loading...</td></tr></tbody>
+<tbody id="rows"><tr><td class="empty" colspan="43">Loading...</td></tr></tbody>
 </table>
 </div>
 <script>
@@ -6489,12 +6595,20 @@ function delayClass(v){
   return 'bad';
 }
 function card(k,v,cls){return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';}
+function yn(v){return (v===true)?'<span class="good">Y</span>':((v===false)?'<span class="bad">N</span>':'<span class="muted">-</span>');}
+function pct(v){return (v===null||v===undefined)?'-':Number(v).toFixed(0)+'%';}
+function fmtAgo(sec){
+  if(sec===null||sec===undefined) return 'never';
+  if(sec<60) return Math.round(sec)+'s ago';
+  if(sec<3600) return Math.round(sec/60)+'m ago';
+  return Math.round(sec/3600)+'h ago';
+}
 function showError(msg){
   var u=document.getElementById('updated');
   if(u){ u.className='bad'; u.textContent='\u26a0 '+msg+' \u2014 retrying every second'; }
   var rows=document.getElementById('rows');
   if(rows && rows.querySelector('.empty')){
-    rows.innerHTML='<tr><td class="empty" colspan="34">'+msg+' \u2014 retrying every second.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="43">'+msg+' \u2014 retrying every second.</td></tr>';
   }
 }
 async function refresh(){
@@ -6509,23 +6623,31 @@ async function refresh(){
   var u=document.getElementById('updated');
   u.className='muted';
   u.textContent='updated '+new Date().toLocaleTimeString('en-US',{hour12:false});
+  var st=data.stats||{};
+  var c=st.counters||{};
+  var sess=st.session||{};
+  var wrb=c.wait_reasons_breakdown||{};
+  var wrbTop=Object.keys(wrb).sort(function(a,b){return wrb[b]-wrb[a];}).slice(0,5)
+              .map(function(k){return k+' ('+wrb[k]+')';}).join(', ')||'-';
   var sum=document.getElementById('summary');
-  if(evals.length){
-    var e=evals[0];
-    var ready=(e.verdict||'').indexOf('READY')>=0;
-    sum.innerHTML=
-      card('Latest verdict', e.verdict||'-', ready?'good':'muted')+
-      card('Eval duration', ms(e.evaluationDurationMs)+' ms', (e.evaluationDurationMs!==null&&e.evaluationDurationMs<1000)?'good':'warn')+
-      card('Alert delay', ms(e.totalAlertDelayMs)+' ms', delayClass(e.totalAlertDelayMs))+
-      card('Scoring', ms(e.scoringMs)+' ms', 'muted')+
-      card('Caught early', e.earlyAlertTime?'yes':(e.waitedForCandleClose?'no — waited close':'-'), e.earlyAlertTime?'good':(e.waitedForCandleClose?'bad':'muted'))+
-      card('Evaluations', evals.length, 'muted');
-  }else{
-    sum.innerHTML=card('Evaluations','0','muted');
-  }
+  var e=evals.length?evals[0]:null;
+  var ready=!!(e&&(e.verdict||'').indexOf('READY')>=0);
+  var sinceTxt=fmtAgo(st.timeSinceLastWebhookSec);
+  var staleWh=(st.timeSinceLastWebhookSec==null||st.timeSinceLastWebhookSec>900);
+  sum.innerHTML=
+    card('Latest verdict', e?(e.verdict||'-'):'-', ready?'good':'muted')+
+    card('Latest WAIT reason', e?(ready?'\u2014 ready \u2014':(e.waitReason||e.gateBlockers||'-')):'-', 'sm '+(ready?'good':'warn'))+
+    card('Webhooks received', (c.webhooks_received!=null?c.webhooks_received:'-'), 'muted')+
+    card('Evaluations run', (c.evaluations_run!=null?c.evaluations_run:'-'), 'muted')+
+    card('READY setups', (c.ready_setups_detected!=null?c.ready_setups_detected:'-'), (c.ready_setups_detected>0?'good':'muted'))+
+    card('Alerts sent', (c.alerts_sent!=null?c.alerts_sent:'-'), (c.alerts_sent>0?'good':'muted'))+
+    card('Last webhook', sinceTxt, (staleWh?'warn':'good'))+
+    card('Eval frequency', (st.evaluationFrequencySeconds!=null?('every '+st.evaluationFrequencySeconds+'s'):'-'), (st.evalHeartbeatEnabled?'good':'bad'))+
+    card('Session', (sess.window||'-'), 'sm '+(sess.preferred?'good':'muted'))+
+    card('Top WAIT reasons', wrbTop, 'sm muted');
   var rows=document.getElementById('rows');
   if(!evals.length){
-    rows.innerHTML='<tr><td class="empty" colspan="34">No evaluations yet - waiting for the next webhook.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="43">No evaluations yet - waiting for the next webhook.</td></tr>';
     return;
   }
   rows.innerHTML=evals.map(function(e){
@@ -6565,6 +6687,15 @@ async function refresh(){
       '<td>'+etTime(e.readyAlertTime)+'</td>'+
       '<td>'+(e.alertDelaySeconds==null?'-':Number(e.alertDelaySeconds).toFixed(1))+'</td>'+
       '<td class="'+(e.waitedForCandleClose===true?'bad':(e.waitedForCandleClose===false?'good':'muted'))+'">'+(e.waitedForCandleClose===true?'yes':(e.waitedForCandleClose===false?'no':'-'))+'</td>'+
+      '<td class="'+(e.trigger==='heartbeat'?'muted':'')+'">'+(e.trigger||'webhook')+'</td>'+
+      '<td>'+yn(e.zoneValid)+'</td>'+
+      '<td>'+yn(e.vwapConfirmed)+'</td>'+
+      '<td>'+yn(e.structureConfirmed)+'</td>'+
+      '<td>'+yn(e.candleConfirmed)+'</td>'+
+      '<td>'+yn(e.liquidityConfirmed)+'</td>'+
+      '<td>'+yn(e.volatilityConfirmed)+'</td>'+
+      '<td>'+pct(e.confidenceScore)+'</td>'+
+      '<td style="text-align:left">'+(e.waitReason||'-')+'</td>'+
     '</tr>';
   }).join('');
 }
@@ -6579,13 +6710,34 @@ setInterval(refresh,1000);
 def get_eval_metrics():
     """Owner-only JSON feed of the last EVAL_METRICS_MAX scored evaluations
     (newest first). Each record carries the per-phase timings, the webhook->alert
-    delay and the volatility reading. Powers the live Diagnostics page."""
+    delay and the volatility reading. Powers the live Diagnostics page. The "stats"
+    block carries the cumulative counters, current session, last-webhook timing and
+    the heartbeat evaluation cadence."""
     with EVAL_METRICS_LOCK:
         snapshot = list(EVAL_METRICS)
+    with COUNTERS_LOCK:
+        counters = {
+            "webhooks_received":      COUNTERS["webhooks_received"],
+            "evaluations_run":        COUNTERS["evaluations_run"],
+            "ready_setups_detected":  COUNTERS["ready_setups_detected"],
+            "alerts_sent":            COUNTERS["alerts_sent"],
+            "wait_reasons_breakdown": dict(COUNTERS["wait_reasons_breakdown"]),
+        }
+    last_wh   = LAST_WEBHOOK_AT
+    since_sec = round((now_utc() - last_wh).total_seconds(), 1) if last_wh else None
+    stats = {
+        "counters":                   counters,
+        "session":                    get_session_state(),
+        "lastWebhookReceived":        last_wh.isoformat() if last_wh else None,
+        "timeSinceLastWebhookSec":    since_sec,
+        "evaluationFrequencySeconds": EVAL_HEARTBEAT_INTERVAL,
+        "evalHeartbeatEnabled":       EVAL_HEARTBEAT_ENABLED,
+    }
     return jsonify({
         "evaluations": snapshot[::-1],
         "count":       len(snapshot),
         "max":         EVAL_METRICS_MAX,
+        "stats":       stats,
     }), 200
 
 
@@ -7631,6 +7783,8 @@ if __name__ == "__main__":
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
+    if EVAL_HEARTBEAT_ENABLED:
+        threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
