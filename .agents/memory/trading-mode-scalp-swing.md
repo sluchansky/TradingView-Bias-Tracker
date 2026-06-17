@@ -24,6 +24,11 @@ windows scoring to recent alerts, and lets BOS-only "Attempt" setups become trad
 - **Attempts never reach top conviction.** Decision logic maps Attempt → trend_class but caps the
   recommendation at BIAS/TRADE, never STRONG/HIGH CONVICTION. `MIN_TOTAL_SCORE` is a confluence
   floor so a single BOS can't alone hit the TRADE tier.
+- **Volatility is gate-vs-modifier by mode (`VOL_HARD_GATE`).** SWING hard-gates on a BLOCK regime
+  (WAIT) and adds 0 to the Edge Score; SCALP never gates on volatility and instead folds it into the
+  score (Normal +10 / Elevated 0 / Extreme −10). See volatility-monitor-gate for the full contract.
+  Any new safety layer added in one mode must declare its mode behavior the same way (a `cfg()` key),
+  never a hardcoded gate.
 
 **MGC vs MNQ symmetry trap:** zone-confirmed / confirmation checks in `get_setup_stage` must match
 **both** instruments' alert strings. A past bug hardcoded only the `MGC ...` variants, so MNQ could

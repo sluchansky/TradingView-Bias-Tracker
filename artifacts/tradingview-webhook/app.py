@@ -142,7 +142,10 @@ MODES = {
         "VOL_QUIET_CAUTION": 0.55,    # <= this = quiet (flag)
         "VOL_QUIET_BLOCK":   0.35,    # <= this = dead (hold)
         "VOL_HIGH_CAUTION":  1.6,     # >= this = elevated (flag)
-        "VOL_HIGH_BLOCK":    2.5,     # >= this = wild (hold)
+        "VOL_HIGH_BLOCK":    2.5,     # >= this = wild (extreme)
+        # SCALP: volatility is NOT a hard gate. It folds into the Edge Score as a
+        # modifier (Normal +10 / Elevated 0 / Extreme -10) instead of forcing WAIT.
+        "VOL_HARD_GATE":     False,
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -162,6 +165,8 @@ MODES = {
         "VOL_QUIET_BLOCK":   0.30,
         "VOL_HIGH_CAUTION":  1.8,
         "VOL_HIGH_BLOCK":    3.0,
+        # SWING keeps volatility as a hard gate - a BLOCK regime holds READY->WAIT.
+        "VOL_HARD_GATE":     True,
     },
 }
 
@@ -2449,28 +2454,29 @@ def _median(vals):
 
 
 def _fetch_volatility_from_market(instrument):
-    """Return (recent_atr_pts, ratio) for an instrument from the public 1-min feed.
+    """Return (recent_atr_pts, baseline_pts, ratio) for an instrument from the
+    public 1-min feed.
 
     recent_atr = mean true-range of the last VOL_ATR_BARS bars; baseline = median
     true-range across all valid session bars; ratio = recent_atr / baseline. The
     ratio is self-normalising, so one set of thresholds works for both MGC and
-    MNQ despite very different absolute point sizes. (None, None) on any error.
+    MNQ despite very different absolute point sizes. (None, None, None) on error.
     """
     symbol = VWAP_FEED_SYMBOL.get(instrument)
     if not symbol:
-        return None, None
+        return None, None, None
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
         resp = requests.get(url, params={"interval": "1m", "range": "1d"},
                             headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         if resp.status_code != 200:
-            return None, None
+            return None, None, None
         result = resp.json()["chart"]["result"][0]
         quote  = result["indicators"]["quote"][0]
         highs, lows, closes = quote["high"], quote["low"], quote["close"]
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
         logger.warning("Volatility fetch failed for %s: %s", instrument, exc)
-        return None, None
+        return None, None, None
 
     trs, prev_close = [], None
     for high, low, close in zip(highs, lows, closes):
@@ -2483,24 +2489,40 @@ def _fetch_volatility_from_market(instrument):
         prev_close = close
 
     if len(trs) < VOL_MIN_BARS:
-        return None, None
+        return None, None, None
     recent     = trs[-VOL_ATR_BARS:]
     recent_atr = sum(recent) / len(recent)
     baseline   = _median(trs)
     if baseline <= 0:
-        return None, None
-    return round(recent_atr, 4), round(recent_atr / baseline, 3)
+        return None, None, None
+    return round(recent_atr, 4), round(baseline, 4), round(recent_atr / baseline, 3)
 
 
 def _update_volatility_auto(instrument):
     """Refresh the stored volatility reading for one instrument (best-effort)."""
-    atr_pts, ratio = _fetch_volatility_from_market(instrument)
+    atr_pts, baseline_pts, ratio = _fetch_volatility_from_market(instrument)
     if atr_pts is None or ratio is None:
         return
     VOLATILITY_BY_TICKER[instrument] = {
-        "atr_pts": atr_pts, "ratio": ratio, "ts": now_utc().isoformat(),
+        "atr_pts": atr_pts, "baseline_pts": baseline_pts,
+        "ratio": ratio, "ts": now_utc().isoformat(),
     }
-    logger.info("Volatility auto-fetch: %s ATR=%.4f ratio=%.2f", instrument, atr_pts, ratio)
+    logger.info("Volatility auto-fetch: %s ATR=%.4f base=%.4f ratio=%.2f",
+                instrument, atr_pts, baseline_pts or 0.0, ratio)
+
+
+def _vol_regime_score_adj(regime):
+    """Edge-score modifier for a volatility regime when volatility is a SCALP
+    score modifier (not a hard gate): Normal +10, Elevated/Quiet 0, Extreme
+    (Wild/Dead) -10. Returns 0 in hard-gate (SWING) mode so the Edge Score is
+    unchanged there - the regime holds the setup at the gate instead."""
+    if cfg("VOL_HARD_GATE"):
+        return 0
+    if regime == "NORMAL":
+        return 10
+    if regime in ("HIGH_BLOCK", "QUIET_BLOCK"):
+        return -10
+    return 0
 
 
 def get_volatility(ticker):
@@ -2512,8 +2534,13 @@ def get_volatility(ticker):
     so the strict gate never holds a trade on data it does not have.
     """
     inst = instrument_of(ticker)
-    base = {"atr_pts": None, "ratio": None, "regime": "NA", "status": "missing",
-            "blocked": False, "caution": False, "label": "Unavailable", "display": "—"}
+    base = {"atr_pts": None, "baseline_pts": None, "ratio": None, "regime": "NA",
+            "status": "missing", "blocked": False, "caution": False,
+            "hard_gate": bool(cfg("VOL_HARD_GATE")), "score_adj": 0,
+            "threshold_elevated": cfg("VOL_HIGH_CAUTION"),
+            "threshold_extreme": cfg("VOL_HIGH_BLOCK"),
+            "decision": "Unavailable - no score effect",
+            "label": "Unavailable", "display": "—"}
     rec = VOLATILITY_BY_TICKER.get(inst)
     if not rec or rec.get("ratio") is None:
         return base
@@ -2529,7 +2556,14 @@ def get_volatility(ticker):
         ratio = float(rec["ratio"])
     except (TypeError, ValueError):
         return base
-    atr_pts = rec.get("atr_pts")
+    atr_pts      = rec.get("atr_pts")
+    baseline_pts = rec.get("baseline_pts")
+    if baseline_pts is None:
+        # Older readings stored before baseline tracking — derive from the ratio.
+        try:
+            baseline_pts = round(float(atr_pts) / ratio, 4) if ratio else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            baseline_pts = None
     if ratio <= cfg("VOL_QUIET_BLOCK"):
         regime, label, blocked, caution = "QUIET_BLOCK", "Dead / too quiet", True, False
     elif ratio >= cfg("VOL_HIGH_BLOCK"):
@@ -2541,13 +2575,32 @@ def get_volatility(ticker):
     else:
         regime, label, blocked, caution = "NORMAL", "Normal", False, False
 
+    hard_gate = bool(cfg("VOL_HARD_GATE"))
+    score_adj = _vol_regime_score_adj(regime)
+    if hard_gate and blocked:
+        decision, adj_tag = f"{label} - HOLD (volatility gate)", "HOLD"
+    elif score_adj > 0:
+        decision, adj_tag = f"{label} - Edge +{score_adj}", f"+{score_adj}"
+    elif score_adj < 0:
+        decision, adj_tag = f"{label} - Edge {score_adj}", f"{score_adj}"
+    else:
+        decision, adj_tag = f"{label} - no score effect", "0"
+
     try:
         atr_disp = f"{float(atr_pts):.2f}" if atr_pts is not None else "—"
     except (TypeError, ValueError):
         atr_disp = "—"
-    return {"atr_pts": atr_pts, "ratio": ratio, "regime": regime, "status": "ok",
-            "blocked": blocked, "caution": caution, "label": label,
-            "display": f"ATR {atr_disp} pts · {ratio:.2f}× normal · {label}"}
+    try:
+        base_disp = f"{float(baseline_pts):.2f}" if baseline_pts is not None else "—"
+    except (TypeError, ValueError):
+        base_disp = "—"
+    return {"atr_pts": atr_pts, "baseline_pts": baseline_pts, "ratio": ratio,
+            "regime": regime, "status": "ok", "blocked": blocked, "caution": caution,
+            "hard_gate": hard_gate, "score_adj": score_adj,
+            "threshold_elevated": cfg("VOL_HIGH_CAUTION"),
+            "threshold_extreme": cfg("VOL_HIGH_BLOCK"),
+            "decision": decision, "label": label,
+            "display": f"ATR {atr_disp} pts · {ratio:.2f}× (base {base_disp}) · {label} [{adj_tag}]"}
 
 
 def _vwap_autofetch_loop():
@@ -2603,17 +2656,21 @@ EDGE_READY_THRESHOLD = 80   # minimum Edge Score for a READY setup
 CONFLICT_WINDOW_MIN  = 10   # opposing structure within this many minutes = conflict
 
 
-def compute_trade_edge_components(signals):
+def compute_trade_edge_components(signals, vol_adj=0):
     """THE Edge Score — pure additive sum of the six confluence components (max
-    100). `signals` is a dict of booleans keyed by EDGE_COMPONENTS[*][0]. Returns
-    (score, breakdown) where breakdown lists {"label", "points"} for each credited
-    component. Shared by the READY gate and the display layer so the gate score
-    and the shown Edge Score are guaranteed identical."""
+    100), plus an optional volatility modifier (SCALP only). `signals` is a dict
+    of booleans keyed by EDGE_COMPONENTS[*][0]. `vol_adj` is the volatility Edge
+    modifier (Normal +10 / Elevated 0 / Extreme -10; 0 when volatility is a hard
+    gate or unavailable). Returns (score, breakdown) where breakdown lists
+    {"label", "points"} for each credited component. Shared by the READY gate and
+    the display layer so the gate score and the shown Edge Score are identical."""
     breakdown = []
     for key, label, pts in EDGE_COMPONENTS:
         if signals.get(key):
             breakdown.append({"label": label, "points": pts})
-    score = min(100, sum(item["points"] for item in breakdown))
+    if vol_adj:
+        breakdown.append({"label": "Volatility", "points": vol_adj})
+    score = max(0, min(100, sum(item["points"] for item in breakdown)))
     return score, breakdown
 
 
@@ -2751,9 +2808,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     sess_state   = session or get_session_state()
     session_pref = bool(sess_state.get("preferred"))
 
-    # ── Volatility gate (FAIL-OPEN — only a hard BLOCK holds READY→WAIT) ──
+    # ── Volatility (FAIL-OPEN). SWING: hard gate — a BLOCK regime holds READY→WAIT.
+    #    SCALP: NOT a gate — folds into the Edge Score as a modifier (Normal +10 /
+    #    Elevated 0 / Extreme -10) so elevated volatility never forces WAIT alone. ──
     vol       = volatility or {}
-    vol_block = bool(vol.get("blocked"))
+    vol_block = bool(vol.get("blocked")) and bool(cfg("VOL_HARD_GATE"))
+    vol_adj   = int(vol.get("score_adj") or 0)
 
     # ── Unified additive Edge Score per direction (single source of truth shared
     #    with the display layer via compute_trade_edge_components). ──
@@ -2767,7 +2827,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "confirmation_candle": has_bear_confirm, "preferred_session": session_pref}
 
     def _edge_for(direction):
-        return compute_trade_edge_components(_signals(direction))
+        return compute_trade_edge_components(_signals(direction), vol_adj)
 
     def _gate_debug(direction):
         sig = _signals(direction)
@@ -4289,13 +4349,15 @@ def compute_edge_breakdown(a, entry):
         "confirmation_candle": bool(conf.get("confirmation_candle")),
         "preferred_session":   bool(sess.get("preferred")),
     }
-    score, raw_breakdown = compute_trade_edge_components(signals)
+    vol_adj = int((a.get("volatility") or {}).get("score_adj") or 0)
+    score, raw_breakdown = compute_trade_edge_components(signals, vol_adj)
 
     # Direction-aware display labels for the generic component names.
     relabel = {
         "Zone Mitigated":         "Demand Zone Reaction"  if is_long else "Supply Zone Reaction",
         "VWAP Confirmation":      "VWAP Reclaim"          if is_long else "VWAP Rejection",
         "Structure Confirmation": "Bullish Structure"     if is_long else "Bearish Structure",
+        "Volatility":             "Calm Market" if vol_adj > 0 else "Extreme Volatility",
     }
     breakdown = [{"label": relabel.get(it["label"], it["label"]), "points": it["points"]}
                  for it in raw_breakdown]
@@ -4333,14 +4395,19 @@ def compute_edge_breakdown(a, entry):
         _risk("Overextended from level")
     if risk_label == "Choppy":
         _risk("Choppy conditions")
-    # Volatility CAUTION (tradable-but-risky) flags the card. A BLOCK regime never
-    # reaches here — it holds the setup at the gate (WAIT).
+    # Volatility regime flags the card with an informational risk line. In SCALP a
+    # BLOCK regime (Wild/Dead) now reaches here too (it no longer gates) — flag it.
     vol = a.get("volatility") or {}
-    if vol.get("status") == "ok" and vol.get("caution"):
-        if vol.get("regime") == "HIGH_CAUTION":
+    if vol.get("status") == "ok":
+        _vreg = vol.get("regime")
+        if _vreg == "HIGH_CAUTION":
             _risk("Elevated volatility")
-        elif vol.get("regime") == "QUIET_CAUTION":
+        elif _vreg == "QUIET_CAUTION":
             _risk("Thin / quiet volatility")
+        elif _vreg == "HIGH_BLOCK":
+            _risk("Extreme volatility")
+        elif _vreg == "QUIET_BLOCK":
+            _risk("Dead / illiquid market")
 
     # Dedup by label, preserving first occurrence.
     def _dedup(items):
@@ -5027,8 +5094,42 @@ def _pf(flag):
     return "PASS" if flag else "FAIL"
 
 
+def _vol_diag_summary(gd, vol):
+    """One-line volatility status for the diagnostic header."""
+    vol = vol or {}
+    if gd.get("volatility_block"):
+        return "BLOCK (holds setup at WAIT)"
+    if vol.get("status") == "ok":
+        return vol.get("decision") or "ok"
+    return "unavailable (fail-open, no score effect)"
+
+
+def _vol_diag_detail(vol):
+    """Indented volatility fields for the diagnostic: currentATR, baselineATR,
+    volatilityMultiplier, volatilityThreshold, volatilityDecision."""
+    vol = vol or {}
+    if vol.get("status") != "ok":
+        return ["    (volatility reading unavailable - fail-open, no effect)"]
+
+    def _n(x):
+        try:
+            return "%.2f" % float(x)
+        except (TypeError, ValueError):
+            return "—"
+    adj = vol.get("score_adj", 0) or 0
+    adj_str = ("+%d" % adj) if adj > 0 else ("%d" % adj)
+    return [
+        "    currentATR ........... %s pts" % _n(vol.get("atr_pts")),
+        "    baselineATR .......... %s pts" % _n(vol.get("baseline_pts")),
+        "    volatilityMultiplier . %sx" % _n(vol.get("ratio")),
+        "    volatilityThreshold .. elevated >= %sx | extreme >= %sx" % (
+            _n(vol.get("threshold_elevated")), _n(vol.get("threshold_extreme"))),
+        "    volatilityDecision ... %s (Edge %s)" % (vol.get("label", "—"), adj_str),
+    ]
+
+
 def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
-                           extra_blockers=None):
+                           extra_blockers=None, vol=None):
     """Human-readable per-gate PASS/FAIL block for one scored webhook. `gd` is the
     candidate direction's gate_debug from evaluate_strict_setup (expanded above).
     Structure passes on ANY ONE of BOS/CHOCH/swing; the individual rows are shown
@@ -5059,11 +5160,14 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
         "  Zone valid (mit+react)  %s" % _pf(gd.get("zone_valid")),
         "  Trading Session (bonus) %s" % _pf(gd.get("session_pref")),
         "  Conflict .............. %s" % ("YES" if gd.get("conflicting_structure") else "no"),
-        "  Volatility ............ %s" % ("BLOCK" if gd.get("volatility_block") else "ok"),
+        "  Volatility ............ %s" % _vol_diag_summary(gd, vol),
+    ]
+    lines.extend(_vol_diag_detail(vol))
+    lines.extend([
         "  Edge Score ............ %d / %d" % (gd.get("edge_score", 0), EDGE_READY_THRESHOLD),
         "",
         "  FINAL READY DECISION: %s" % ("PASS" if ready else "FAIL"),
-    ]
+    ])
     if ready:
         lines.append("  Result: %s" % verdict)
     else:
@@ -5155,8 +5259,11 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             _gd.get("edge_score", 0),
             "" if _gd.get("edge_ok") else ("<%d" % EDGE_READY_THRESHOLD),
         )
+        _vol = a.get("volatility") or {}
         if _gd.get("volatility_block"):
             _gate_str += " vol=BLOCK"
+        elif _vol.get("status") == "ok" and _vol.get("score_adj"):
+            _gate_str += " volAdj=%+d" % _vol.get("score_adj")
     logger.info(
         "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s | Gate: %s",
         normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
@@ -5175,7 +5282,8 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         else "Long" if a.get("verdict") == "LONG READY" else None)
     try:
         _diag = format_gate_diagnostic(resolved_inst, normalized, _candidate, _gd,
-                                       a["verdict"], extra_blockers=_extra)
+                                       a["verdict"], extra_blockers=_extra,
+                                       vol=a.get("volatility"))
         logger.info("Gate diagnostic —\n%s", _diag)
         _record_diagnostic(_diag)
     except Exception as exc:

@@ -17,13 +17,19 @@ gate, alerts, throttling, or the 5-min repost loop.
   live card + periodic repost share one source. `_build_trade_card_embed` renders the
   block when present and FALLS BACK to the old AI Analysis field / `strict_label` when
   absent (legacy/manual entries).
-- Score = pure additive sum of six confluence components, max 100, computed by the SHARED
-  helper `compute_trade_edge_components`: Zone-valid +25, VWAP +20, Structure +20, Liquidity
-  Sweep +15, Confirmation Candle +10, Session +10. NO gate base, NO 75-floor, NO subtraction.
-  The SAME helper backs the READY gate, so the displayed Edge Score == the gate score always.
+- Score = additive sum of six confluence components, max 100, computed by the SHARED
+  helper `compute_trade_edge_components(signals, vol_adj=0)`: Zone-valid +25, VWAP +20,
+  Structure +20, Liquidity Sweep +15, Confirmation Candle +10, Session +10. NO gate base,
+  NO 75-floor. The SAME helper backs the READY gate, so the displayed Edge Score == the gate
+  score always. The ONLY non-confluence term is the **SCALP volatility modifier** `vol_adj`
+  (Normal +10 / Elevated 0 / Extreme −10; 0 in SWING — see volatility-monitor-gate): it is
+  appended as a "Volatility" breakdown line and the final score is clamped 0–100. No other
+  subtraction exists.
 - **Risk lines are INFORMATIONAL warnings only (`points: None`); they do NOT subtract.** Nearby
-  Resistance/Support, Overextended, Choppy, volatility CAUTION render as flags but never lower
-  the score. (The older model subtracted them and floored READY to 75 — both removed.)
+  Resistance/Support, Overextended, Choppy render as flags but never lower the score. The one
+  exception is volatility in SCALP, which is a real scored modifier (`vol_adj`, above) AND also
+  shows an informational regime risk line; in SWING volatility is a hard gate, not a score term.
+  (The older model subtracted all risks and floored READY to 75 — both removed.)
 - Trade strength sub-classifies the Edge Score: Possible = 80–89, Strong = 90–100 (a READY is
   always ≥80 by construction). The gate decides READY/WAIT; strength only ranks a READY trade.
 - **Session Bonus +10 is a pure additive component, NOT READY-gated.** A preferred ET window
