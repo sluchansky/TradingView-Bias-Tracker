@@ -1,0 +1,51 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// Confirmation Candle -> Webhook  (MGC / MNQ)
+//
+// Fires a confirmation alert when a 5m bar closes with momentum:
+//   • Bullish confirmation = candle closes up AND above the prior close.
+//   • Bearish confirmation = candle closes down AND below the prior close.
+//
+// On a confirmed bar it fires an alert() call whose message is the exact JSON
+// the webhook app expects, e.g.
+//   {"alert_type": "MGC BULLISH CONFIRMATION", "ticker": "MGC1!", ...}
+//
+// NOTE: this fires on every qualifying bar by design — the webhook app only
+// counts a confirmation once it lands AFTER a same-direction CHOCH/BOS, so the
+// every-bar stream is filtered app-side, not here.
+//
+// SETUP (one alert per chart):
+//   1. Add this script to your MGC1! chart (and again to your MNQ1! chart).
+//   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
+//   3. Paste your webhook URL under Notifications -> Webhook URL.
+//   4. Leave the message box as-is (the script supplies the JSON). Save.
+//   Auto-detect sets MGC/MNQ from the symbol, so the same script works on both
+//   charts with no manual Instrument setting to get wrong.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("Confirmation Candle -> Webhook (MGC/MNQ)", overlay=true)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ"])
+showMarks    = input.bool(true, "Show confirmation markers on chart")
+
+prefix  = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : "MGC") : manualPrefix
+profile = prefix + " Standard"
+
+// ── Confirmation detection ─────────────────────────────────────────────────
+bull = close > open and close > close[1]   // 5m closes up with momentum
+bear = close < open and close < close[1]   // 5m closes down with momentum
+
+// ── Webhook payloads (exact alert_type strings the app recognises) ─────────
+bullMsg = '{"alert_type": "' + prefix + ' BULLISH CONFIRMATION", "ticker": "' + syminfo.ticker + '", "price": "' + str.tostring(close) + '", "profile": "' + profile + '"}'
+bearMsg = '{"alert_type": "' + prefix + ' BEARISH CONFIRMATION", "ticker": "' + syminfo.ticker + '", "price": "' + str.tostring(close) + '", "profile": "' + profile + '"}'
+
+if barstate.isconfirmed and bull
+    alert(bullMsg, alert.freq_once_per_bar_close)
+if barstate.isconfirmed and bear
+    alert(bearMsg, alert.freq_once_per_bar_close)
+
+// ── Visuals ────────────────────────────────────────────────────────────────
+plotshape(showMarks and bull, title="Bullish Confirmation", style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showMarks and bear, title="Bearish Confirmation", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny)
+// © sluchansky
