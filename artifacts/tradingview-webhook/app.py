@@ -2127,21 +2127,44 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
         for a in alert_history:
             try:
                 if datetime.fromisoformat(a["timestamp"]) >= _cutoff:
-                    recent.append(a["alert_type"])
+                    recent.append(a)
             except (KeyError, ValueError):
                 pass
     else:
-        recent = [a["alert_type"] for a in list(alert_history)[-5:]]
-    has_choch_bos_supply     = any(t in ("CHOCH SUPPLY", "BOS SUPPLY") for t in recent)
-    has_choch_bos_demand     = any(t in ("CHOCH DEMAND", "BOS DEMAND") for t in recent)
-    has_supply_confirmed     = any(t in ("MGC SUPPLY ZONE CONFIRMED", "MNQ SUPPLY ZONE CONFIRMED")
-                                   for t in recent)
-    has_demand_confirmed     = any(t in ("MGC DEMAND ZONE CONFIRMED", "MNQ DEMAND ZONE CONFIRMED")
-                                   for t in recent)
-    has_bullish_confirmation = any(t in ("MGC BULLISH CONFIRMATION", "MNQ BULLISH CONFIRMATION")
-                                   for t in recent)
-    has_bearish_confirmation = any(t in ("MGC BEARISH CONFIRMATION", "MNQ BEARISH CONFIRMATION")
-                                   for t in recent)
+        recent = list(alert_history)[-5:]
+
+    def _stage_latest_ts(types):
+        """Latest timestamp among `recent` alerts whose type is in `types`, else None.
+        Intentionally non-instrument-specific, matching this function's broad staging."""
+        latest = None
+        for a in recent:
+            if a.get("alert_type") not in types:
+                continue
+            try:
+                ts = datetime.fromisoformat(a["timestamp"])
+            except (KeyError, ValueError):
+                continue
+            if latest is None or ts > latest:
+                latest = ts
+        return latest
+
+    _sup_struct_ts = _stage_latest_ts(("CHOCH SUPPLY", "BOS SUPPLY"))
+    _dem_struct_ts = _stage_latest_ts(("CHOCH DEMAND", "BOS DEMAND"))
+    _bull_conf_ts  = _stage_latest_ts(("MGC BULLISH CONFIRMATION", "MNQ BULLISH CONFIRMATION"))
+    _bear_conf_ts  = _stage_latest_ts(("MGC BEARISH CONFIRMATION", "MNQ BEARISH CONFIRMATION"))
+
+    has_choch_bos_supply     = _sup_struct_ts is not None
+    has_choch_bos_demand     = _dem_struct_ts is not None
+    has_supply_confirmed     = _stage_latest_ts(("MGC SUPPLY ZONE CONFIRMED",
+                                                 "MNQ SUPPLY ZONE CONFIRMED")) is not None
+    has_demand_confirmed     = _stage_latest_ts(("MGC DEMAND ZONE CONFIRMED",
+                                                 "MNQ DEMAND ZONE CONFIRMED")) is not None
+    # Confirmation only counts when it closed AFTER the same-direction structure —
+    # the indicator marks every 5m bar, so an un-gated presence check is always true.
+    has_bullish_confirmation = (_bull_conf_ts is not None and _dem_struct_ts is not None
+                                and _bull_conf_ts >= _dem_struct_ts)
+    has_bearish_confirmation = (_bear_conf_ts is not None and _sup_struct_ts is not None
+                                and _bear_conf_ts >= _sup_struct_ts)
 
     # ── Proximity ("at zone" window, mode-dependent) ──
     def dist(a, b):
@@ -2573,31 +2596,65 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     else:
         recent = list(alert_history)[-8:]
 
-    def _has(alert_type, ticker_scoped=False):
+    def _latest_ts(alert_type, ticker_scoped=False):
+        """Most recent timestamp (datetime, UTC) of `alert_type` within the active
+        window, applying the same instrument scoping as `_has`. None if absent."""
+        latest = None
         for a in recent:
             if a.get("alert_type") != alert_type:
                 continue
-            if ticker_scoped:
-                # CONFIRMATION/CONFIRMED types already embed the instrument in their
-                # name, so a plain type match is already instrument-scoped.
-                return True
-            # CHOCH/BOS carry no symbol prefix — use the resolved instrument stored
-            # at ingestion. An untickered shared alert no longer matches either
-            # instrument; old in-memory records fall back to ticker/title parsing.
-            a_inst = (a.get("instrument")
-                      or _instrument_from_text(a.get("ticker"))
-                      or _instrument_from_text(a.get("alert_type")))
-            if a_inst != inst:
+            if not ticker_scoped:
+                # CHOCH/BOS carry no symbol prefix — use the resolved instrument
+                # stored at ingestion. An untickered shared alert no longer matches
+                # either instrument; old in-memory records fall back to text parse.
+                a_inst = (a.get("instrument")
+                          or _instrument_from_text(a.get("ticker"))
+                          or _instrument_from_text(a.get("alert_type")))
+                if a_inst != inst:
+                    continue
+            # CONFIRMATION/CONFIRMED types embed the instrument in their name, so a
+            # plain type match is already instrument-scoped (ticker_scoped=True).
+            try:
+                ts = datetime.fromisoformat(a["timestamp"])
+            except (KeyError, ValueError):
                 continue
-            return True
-        return False
+            if latest is None or ts > latest:
+                latest = ts
+        return latest
 
-    has_bos_demand   = _has("BOS DEMAND")
-    has_bos_supply   = _has("BOS SUPPLY")
-    has_choch_demand = _has("CHOCH DEMAND")
-    has_choch_supply = _has("CHOCH SUPPLY")
-    has_bull_confirm = _has(f"{inst} BULLISH CONFIRMATION", ticker_scoped=True)
-    has_bear_confirm = _has(f"{inst} BEARISH CONFIRMATION", ticker_scoped=True)
+    def _has(alert_type, ticker_scoped=False):
+        return _latest_ts(alert_type, ticker_scoped) is not None
+
+    def _after_anchor(confirm_ts, *anchors):
+        """A confirmation only COUNTS when it landed at/after the most recent
+        same-direction structure anchor present in the window — i.e. a genuine
+        post-structure confirmation candle, not every-bar noise. False if there is
+        no confirmation, or no structure anchor to confirm."""
+        present = [t for t in anchors if t is not None]
+        if confirm_ts is None or not present:
+            return False
+        return confirm_ts >= max(present)
+
+    bos_dem_ts   = _latest_ts("BOS DEMAND")
+    bos_sup_ts   = _latest_ts("BOS SUPPLY")
+    choch_dem_ts = _latest_ts("CHOCH DEMAND")
+    choch_sup_ts = _latest_ts("CHOCH SUPPLY")
+
+    has_bos_demand   = bos_dem_ts is not None
+    has_bos_supply   = bos_sup_ts is not None
+    has_choch_demand = choch_dem_ts is not None
+    has_choch_supply = choch_sup_ts is not None
+    # The "Confirmation Candle" indicator marks a shape on EVERY 5m bar, so a plain
+    # presence check is almost always true and makes the confirmation gate
+    # meaningless. Require the confirmation to have closed AFTER the same-direction
+    # structure (BOS/CHOCH) was in place — that is what a real confirmation candle
+    # is. Pre-structure every-bar confirmations are ignored as noise.
+    has_bull_confirm = _after_anchor(
+        _latest_ts(f"{inst} BULLISH CONFIRMATION", ticker_scoped=True),
+        bos_dem_ts, choch_dem_ts)
+    has_bear_confirm = _after_anchor(
+        _latest_ts(f"{inst} BEARISH CONFIRMATION", ticker_scoped=True),
+        bos_sup_ts, choch_sup_ts)
     has_dem_confirm  = _has(f"{inst} DEMAND ZONE CONFIRMED", ticker_scoped=True)
     has_sup_confirm  = _has(f"{inst} SUPPLY ZONE CONFIRMED", ticker_scoped=True)
     has_bull_sweep   = _has(f"{inst} BULLISH SWEEP", ticker_scoped=True)
