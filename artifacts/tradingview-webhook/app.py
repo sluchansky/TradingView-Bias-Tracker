@@ -1,8 +1,10 @@
 import os
 import re
+import time
 import logging
 import threading
 import queue
+import contextlib
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -54,6 +56,13 @@ ACTIVE_TRADE     = None
 _ENTER_LOCK      = threading.Lock()
 LAST_ALERT_AT    = None   # datetime of most recent webhook alert (UTC)
 LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live card sent (UTC)
+# Per-evaluation performance diagnostics: the last EVAL_METRICS_MAX scored alerts,
+# each with phase timings (indicator/volatility/scoring/notes/screenshot/journal),
+# the webhook->alert delay and the volatility reading. Surfaced as JSON on
+# /eval-metrics and rendered live on the Diagnostics page (/diagnostics-live).
+EVAL_METRICS_MAX  = 100
+EVAL_METRICS      = deque(maxlen=EVAL_METRICS_MAX)
+EVAL_METRICS_LOCK = threading.Lock()   # guards append (worker) vs snapshot (/eval-metrics)
 # ── Trade-management watcher state (additive; separate from manual ACTIVE_TRADE) ──
 MANAGED_TRADES_BY_KEY = {}  # (instrument,direction,entry_lo,date) -> managed-trade dict
 LAST_READY_BY_TICKER  = {}  # instrument -> last READY card entry snapshot (for /why)
@@ -3132,6 +3141,35 @@ def build_strict_trade_plan(direction, ticker, current_price,
 # Full analysis
 # ---------------------------------------------------------------------------
 
+# ── Per-evaluation timing instrumentation ───────────────────────────────────
+# A thread-local accumulator lets full_analysis() and the card builder record how
+# long each phase takes WITHOUT changing their signatures or affecting the many
+# read-only callers (dashboard / status / why / periodic loop). The webhook
+# worker calls _eval_timing_begin() before scoring an alert; every _timed(key)
+# block then adds to that thread's dict. Callers that never call _begin() (every
+# read-only path) get a no-op, so there is zero overhead and no cross-talk.
+_EVAL_TIMING = threading.local()
+
+
+def _eval_timing_begin():
+    _EVAL_TIMING.data = {}
+
+
+def _eval_timing_get():
+    return getattr(_EVAL_TIMING, "data", None)
+
+
+@contextlib.contextmanager
+def _timed(key):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        d = getattr(_EVAL_TIMING, "data", None)
+        if d is not None:
+            d[key] = round(d.get(key, 0.0) + (time.perf_counter() - t0) * 1000.0, 3)
+
+
 def full_analysis(current_price_override=None, ticker_override=None):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -3147,7 +3185,8 @@ def full_analysis(current_price_override=None, ticker_override=None):
     quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
     edge_score               = calculate_edge_score(bias, confidence, strength)
 
-    last_price_by_type, all_supply, all_demand = get_price_context(active_ticker)
+    with _timed("indicatorCalcMs"):
+        last_price_by_type, all_supply, all_demand = get_price_context(active_ticker)
     current_price = current_price_override if current_price_override is not None else current_price_for(active_ticker)
     nearest_supply, nearest_demand = get_nearest_levels(current_price, all_supply, all_demand)
 
@@ -3171,17 +3210,20 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # A trade is recommended ONLY when BOS + CHOCH + 5m confirmation candle + the
     # price-vs-VWAP filter all align on one side. Score 0-100 → Strong/Possible/WAIT.
     # active_ticker resolved at the top (honours the dashboard's instrument tab).
-    vwap_value, vwap_status = get_vwap(active_ticker)
-    volatility = get_volatility(active_ticker)
+    with _timed("indicatorCalcMs"):
+        vwap_value, vwap_status = get_vwap(active_ticker)
+    with _timed("volatilityCalcMs"):
+        volatility = get_volatility(active_ticker)
     # Preferred-session state (ET) computed ONCE here and threaded through the gate
     # AND stored on the result, so the +10 Session Bonus the gate credits and the
     # Session block on the card/status are derived from the same instant.
     session_state = get_session_state()
-    strict = evaluate_strict_setup(
-        current_price, active_ticker, vwap_value, vwap_status,
-        nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
-        volatility=volatility, session=session_state,
-    )
+    with _timed("scoringMs"):
+        strict = evaluate_strict_setup(
+            current_price, active_ticker, vwap_value, vwap_status,
+            nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
+            volatility=volatility, session=session_state,
+        )
     strict_label     = strict["label"]
     strict_score     = strict["score"]
     strict_direction = strict["direction"]
@@ -4700,8 +4742,10 @@ def _build_card_entry(a, ticker=None, record=None):
         bos_type,  choch_type  = "Supply", "Bearish"
 
     # Additive structure block + screenshot (grounded in `a` / webhook record).
-    bos_status, choch_status, vwap_position, sd_zone = build_structure_fields(a, direction)
-    screenshot_url = extract_screenshot_url(record)
+    with _timed("aiNotesMs"):
+        bos_status, choch_status, vwap_position, sd_zone = build_structure_fields(a, direction)
+    with _timed("screenshotMs"):
+        screenshot_url = extract_screenshot_url(record)
 
     entry = {
         "datetime":         datetime.now(timezone.utc).isoformat(),
@@ -4748,8 +4792,9 @@ def _build_card_entry(a, ticker=None, record=None):
         "volatility":         a.get("volatility"),
     }
     entry["setup_categories"] = classify_setup_categories(entry)
-    entry["setup_notes"]      = build_setup_notes(a, entry)
-    entry["trade_thesis"]     = build_trade_thesis(a, entry)
+    with _timed("aiNotesMs"):
+        entry["setup_notes"]  = build_setup_notes(a, entry)
+        entry["trade_thesis"] = build_trade_thesis(a, entry)
     # Session focus + next step, carried onto the card, /why and the journal so a
     # READY is always tagged with the window it fired in and what to do next.
     sess = a.get("session") or get_session_state()
@@ -4843,8 +4888,12 @@ def _build_why_explanation(entry):
     }
 
 
-def create_journal_entry(record, a, sizing):
-    """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates."""
+def create_journal_entry(record, a, sizing, post_discord=True):
+    """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates.
+
+    post_discord=False stores the entry in-memory only and skips the (slow)
+    journal-channel Discord embed, so the webhook worker can send the trade alert
+    first and offload that embed to the slow-task worker."""
     global JOURNAL, JOURNAL_KEYS
 
     strict_label = a.get("strict_label", "WAIT")
@@ -4867,23 +4916,25 @@ def create_journal_entry(record, a, sizing):
         logger.info("Journal dedup skip: %s %s @ %.0f", ticker, direction, zone_key)
         return None
 
-    JOURNAL_KEYS.add(dedup_key)
+    with _timed("journalWriteMs"):
+        JOURNAL_KEYS.add(dedup_key)
 
-    entry["id"]      = len(JOURNAL) + 1
-    entry["outcome"] = "Pending"
-    # Chart screenshot: use a validated public URL when the alert carried one,
-    # else keep the legacy placeholder string and continue (no failure).
-    if entry.get("screenshot_url"):
-        entry["screenshot"] = entry["screenshot_url"]
-    else:
-        entry["screenshot"] = "[ Screenshot placeholder — add URL or image link ]"
-        logger.info("Screenshot unavailable for journal #%d — continuing", entry["id"])
+        entry["id"]      = len(JOURNAL) + 1
+        entry["outcome"] = "Pending"
+        # Chart screenshot: use a validated public URL when the alert carried one,
+        # else keep the legacy placeholder string and continue (no failure).
+        if entry.get("screenshot_url"):
+            entry["screenshot"] = entry["screenshot_url"]
+        else:
+            entry["screenshot"] = "[ Screenshot placeholder — add URL or image link ]"
+            logger.info("Screenshot unavailable for journal #%d — continuing", entry["id"])
 
-    JOURNAL.insert(0, entry)
-    if len(JOURNAL) > 500:
-        JOURNAL.pop()
+        JOURNAL.insert(0, entry)
+        if len(JOURNAL) > 500:
+            JOURNAL.pop()
 
-    send_journal_discord_embed(entry)
+    if post_discord:
+        send_journal_discord_embed(entry)
     logger.info("Journal entry #%d created: %s %s %s @ %s",
                 entry["id"], ticker, strict_label, direction, entry_zone)
     return entry
@@ -5177,16 +5228,68 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
     return "\n".join(lines)
 
 
+def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_at,
+                         eval_duration_ms, alert_sent_at, instrument):
+    """Append one per-evaluation timing + volatility record to EVAL_METRICS (the
+    live Diagnostics page / /eval-metrics read this). Best-effort — it must never
+    raise into the worker. Phase timings come from the thread-local accumulator
+    populated by the _timed() blocks during this evaluation; a phase that did not
+    run for this alert (e.g. no journal write on a WAIT) is left None."""
+    t   = _eval_timing_get() or {}
+    vol = (a or {}).get("volatility") or {}
+    total_delay = None
+    if webhook_received_at is not None and alert_sent_at is not None:
+        total_delay = round((alert_sent_at - webhook_received_at).total_seconds() * 1000.0, 3)
+    record = {
+        "webhookReceivedAt":    webhook_received_at.isoformat() if webhook_received_at else None,
+        "evaluationStartedAt":  eval_started_at.isoformat() if eval_started_at else None,
+        "evaluationFinishedAt": eval_finished_at.isoformat() if eval_finished_at else None,
+        "evaluationDurationMs": eval_duration_ms,
+        "indicatorCalcMs":      t.get("indicatorCalcMs"),
+        "volatilityCalcMs":     t.get("volatilityCalcMs"),
+        "scoringMs":            t.get("scoringMs"),
+        "aiNotesMs":            t.get("aiNotesMs"),
+        "screenshotMs":         t.get("screenshotMs"),
+        "journalWriteMs":       t.get("journalWriteMs"),
+        "alertSentAt":          alert_sent_at.isoformat() if alert_sent_at else None,
+        "totalAlertDelayMs":    total_delay,
+        # ── Volatility reading used by this evaluation ──
+        "currentATR":           vol.get("atr_pts"),
+        "baselineATR":          vol.get("baseline_pts"),
+        "volatilityMultiplier": vol.get("ratio"),
+        "volatilityThreshold":  vol.get("threshold_extreme"),
+        "volatilityDecision":   vol.get("decision"),
+        # ── Context ──
+        "instrument":           instrument,
+        "verdict":              (a or {}).get("verdict"),
+    }
+    with EVAL_METRICS_LOCK:
+        EVAL_METRICS.append(record)
+
+
 def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
-                           account_size, risk_pct, profile_name):
+                           account_size, risk_pct, profile_name,
+                           webhook_received_at=None):
     """Heavy webhook tail (analysis + journaling + Discord) run OFF the request
     thread so TradingView gets a fast ack and never times out. All state this job
     reads (ALERT_HISTORY, zone flags, CURRENT_PRICE/VWAP) is committed
     synchronously before the job is queued; the per-alert price is passed in
-    explicitly so late processing still scores against the correct price."""
+    explicitly so late processing still scores against the correct price.
+
+    Ordering is latency-critical: the READY/WARN/WAIT decision (full_analysis) is
+    scored and TIMED first, the trade alert is sent BEFORE any journaling, and the
+    journal-channel embed is offloaded to the slow-task worker — so nothing slow
+    ever delays the decision or the alert. Per-evaluation timings + the volatility
+    reading are recorded to EVAL_METRICS for the Diagnostics page."""
     global ACTIVE_TRADE
 
+    _eval_timing_begin()
+    eval_started_at = now_utc()
+    _eval_t0 = time.perf_counter()
     a = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst)
+    eval_finished_at = now_utc()
+    eval_duration_ms = round((time.perf_counter() - _eval_t0) * 1000.0, 3)
+    alert_sent_at = None
 
     # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
     # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
@@ -5199,6 +5302,9 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             "%s | %s | Trigger: %s\nResult: WAIT\nBlocked by: zone_consumed "
             "(zone already reacted — scoring skipped)" % (
                 resolved_inst, fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), normalized))
+        _record_eval_metrics(a, webhook_received_at, eval_started_at,
+                             eval_finished_at, eval_duration_ms, alert_sent_at,
+                             resolved_inst)
         return
 
     # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
@@ -5235,16 +5341,33 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # alert exactly once on the triggering webhook; _trade_ready_loop() then
     # re-posts the card every 5 min while the setup stays READY.
     # Fail-open: journaling/enrichment + the live card must never crash the worker.
+    # Dedup + build the card + store the journal IN-MEMORY only (fast). A failure
+    # here must not crash the worker or block the alert below.
     try:
-        journal_entry = create_journal_entry(record, a, sizing)
-        if (journal_entry and not ACTIVE_TRADE
-                and a.get("verdict") in ("LONG READY", "SHORT READY")):
+        journal_entry = create_journal_entry(record, a, sizing, post_discord=False)
+    except Exception as exc:
+        journal_entry = None
+        logger.error("Journal build/store error (alert still attempted): %s", exc)
+
+    # Trade alert FIRST — the instant a brand-new setup is READY, BEFORE any
+    # Discord journal post, so the alert is never queued behind slower work. Its
+    # error handling is isolated so a live-card failure can't suppress the journal
+    # embed offloaded below.
+    if (journal_entry and not ACTIVE_TRADE
+            and a.get("verdict") in ("LONG READY", "SHORT READY")):
+        try:
             send_live_ready_card(journal_entry,
                                  record.get("ticker") or record.get("instrument")
                                  or journal_entry.get("instrument"),
                                  notify=True)
-    except Exception as exc:
-        logger.error("Journal/live-card path error (alert still recorded): %s", exc)
+            alert_sent_at = now_utc()
+        except Exception as exc:
+            logger.error("Live-card send error (alert path): %s", exc)
+
+    # Offload the journal-channel embed (the only slow piece left here), regardless
+    # of the live-card outcome, so the decision worker is free immediately.
+    if journal_entry:
+        _enqueue_slow(lambda e=journal_entry: send_journal_discord_embed(e))
 
     _gd = a.get("gate_debug") or {}
     if a["verdict"] in ("LONG READY", "SHORT READY"):
@@ -5289,6 +5412,10 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     except Exception as exc:
         logger.error("Gate diagnostic formatting failed (alert still recorded): %s", exc)
 
+    _record_eval_metrics(a, webhook_received_at, eval_started_at,
+                         eval_finished_at, eval_duration_ms, alert_sent_at,
+                         resolved_inst)
+
 
 # ── Asynchronous webhook processing ──────────────────────────────────────────
 # TradingView aborts a webhook if the server does not respond quickly ("request
@@ -5331,9 +5458,54 @@ def _ensure_webhook_worker():
         logger.info("Webhook background worker started")
 
 
+# ── Slow-task worker ─────────────────────────────────────────────────────────
+# Everything that is NOT the trade decision or the trade alert (the journal-
+# channel Discord embed, etc.) runs here, OFF the decision worker, so a slow or
+# timing-out Discord POST can never delay the next alert's READY/WARN/WAIT
+# decision or the trade alert itself. Single FIFO thread, so it preserves the
+# same no-race guarantee on shared JOURNAL state that the webhook worker relies
+# on (the in-memory store still happens on the decision worker; only the embed
+# is offloaded).
+_SLOW_TASKS         = queue.Queue()
+_SLOW_WORKER_LOCK   = threading.Lock()
+_SLOW_WORKER_THREAD = None
+
+
+def _slow_task_worker():
+    while True:
+        fn = _SLOW_TASKS.get()
+        try:
+            fn()
+        except Exception as exc:
+            logger.error("Slow task failed: %s", exc)
+        finally:
+            _SLOW_TASKS.task_done()
+
+
+def _ensure_slow_worker():
+    """Start the slow-task worker on first use (idempotent, thread-safe)."""
+    global _SLOW_WORKER_THREAD
+    if _SLOW_WORKER_THREAD is not None and _SLOW_WORKER_THREAD.is_alive():
+        return
+    with _SLOW_WORKER_LOCK:
+        if _SLOW_WORKER_THREAD is not None and _SLOW_WORKER_THREAD.is_alive():
+            return
+        _SLOW_WORKER_THREAD = threading.Thread(
+            target=_slow_task_worker, name="slow-task-worker", daemon=True)
+        _SLOW_WORKER_THREAD.start()
+        logger.info("Slow-task background worker started")
+
+
+def _enqueue_slow(fn):
+    _ensure_slow_worker()
+    _SLOW_TASKS.put(fn)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, ZONE_MITIGATED_FLAG
+
+    webhook_received_at = now_utc()   # T0 for the webhook->alert delay metric
 
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -5520,13 +5692,14 @@ def webhook():
     # zone flags, price/VWAP); the per-alert price is passed explicitly. ──
     _ensure_webhook_worker()
     _WEBHOOK_JOBS.put({
-        "record":        record,
-        "parsed_price":  parsed_price,
-        "resolved_inst": resolved_inst,
-        "normalized":    normalized,
-        "account_size":  account_size,
-        "risk_pct":      risk_pct,
-        "profile_name":  profile_name,
+        "record":              record,
+        "parsed_price":        parsed_price,
+        "resolved_inst":       resolved_inst,
+        "normalized":          normalized,
+        "account_size":        account_size,
+        "risk_pct":            risk_pct,
+        "profile_name":        profile_name,
+        "webhook_received_at": webhook_received_at,
     })
 
     return jsonify({
@@ -5561,6 +5734,153 @@ def get_diagnostics():
                   len(entries), len(GATE_DIAGNOSTICS), GATE_DIAGNOSTICS.maxlen))
     body = "\n\n".join(entries) if entries else "No webhooks received yet."
     return Response(header + "\n" + body + "\n", mimetype="text/plain")
+
+
+# ── Live Diagnostics page ────────────────────────────────────────────────────
+# Static HTML (no server-side templating: no %-formatting, no triple-quote
+# collisions). All data is fetched client-side from /api/eval-metrics every 1s.
+DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostics - AI Trading Partner</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0a0f;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px}
+  a.back{color:#a0a8ff;text-decoration:none;font-size:13px}
+  h1{font-size:18px;font-weight:700;color:#a0a8ff;letter-spacing:.5px;margin:8px 0 2px}
+  .sub{font-size:12px;color:#666;margin-bottom:16px}
+  .cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+  .card{background:#12121e;border:1px solid #1e1e32;border-radius:12px;padding:12px 14px;min-width:140px;flex:1}
+  .card .k{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#666;margin-bottom:6px}
+  .card .v{font-size:20px;font-weight:800}
+  .good{color:#22c55e}.warn{color:#f59e0b}.bad{color:#ef4444}.muted{color:#888}
+  .wrap{overflow-x:auto;border:1px solid #1e1e32;border-radius:12px}
+  table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}
+  th,td{padding:8px 10px;text-align:right;border-bottom:1px solid #16162a}
+  th{position:sticky;top:0;background:#16162a;color:#a0a8ff;font-size:10px;text-transform:uppercase;letter-spacing:.5px;text-align:right}
+  th:nth-child(-n+3),td:nth-child(-n+3){text-align:left}
+  tbody tr:hover{background:#12121e}
+  .v-ready{color:#22c55e;font-weight:700}.v-wait{color:#888}
+  .empty{padding:24px;text-align:center;color:#666}
+</style>
+</head>
+<body>
+<a class="back" href="/api/dashboard">&larr; Back to dashboard</a>
+<h1>Diagnostics</h1>
+<div class="sub">Per-evaluation timing &amp; volatility for the last <span id="cap">100</span> scored alerts &middot; auto-refresh 1s &middot; <span id="updated" class="muted"></span></div>
+<div class="cards" id="summary"></div>
+<div class="wrap">
+<table>
+<thead><tr>
+<th>Webhook Recv (ET)</th><th>Instr</th><th>Verdict</th>
+<th>Eval Start</th><th>Eval Finish</th>
+<th>Eval ms</th><th>Indicator ms</th><th>Volatility ms</th><th>Scoring ms</th>
+<th>AI Notes ms</th><th>Screenshot ms</th><th>Journal ms</th>
+<th>Alert Sent</th><th>Alert Delay ms</th>
+<th>ATR</th><th>Base ATR</th><th>Mult</th><th>Threshold</th><th>Vol Decision</th>
+</tr></thead>
+<tbody id="rows"><tr><td class="empty" colspan="19">Loading...</td></tr></tbody>
+</table>
+</div>
+<script>
+var BASE='/api';
+function ms(v){return (v===null||v===undefined)?'-':Number(v).toFixed(1);}
+function num(v){return (v===null||v===undefined)?'-':Number(v).toFixed(2);}
+function etTime(iso){
+  if(!iso) return '-';
+  var dt=new Date(iso);
+  if(isNaN(dt.getTime())) return '-';
+  var t=dt.toLocaleTimeString('en-US',{hour12:false,timeZone:'America/New_York'});
+  return t+'.'+String(dt.getMilliseconds()).padStart(3,'0');
+}
+function delayClass(v){
+  if(v===null||v===undefined) return 'muted';
+  if(v<1000) return 'good';
+  if(v<3000) return 'warn';
+  return 'bad';
+}
+function card(k,v,cls){return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';}
+async function refresh(){
+  var data;
+  try{
+    var r=await fetch(BASE+'/eval-metrics',{headers:{'Content-Type':'application/json'}});
+    data=await r.json();
+  }catch(e){ return; }
+  var evals=data.evaluations||[];
+  document.getElementById('cap').textContent=data.max||100;
+  document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString('en-US',{hour12:false});
+  var sum=document.getElementById('summary');
+  if(evals.length){
+    var e=evals[0];
+    var ready=(e.verdict||'').indexOf('READY')>=0;
+    sum.innerHTML=
+      card('Latest verdict', e.verdict||'-', ready?'good':'muted')+
+      card('Eval duration', ms(e.evaluationDurationMs)+' ms', (e.evaluationDurationMs!==null&&e.evaluationDurationMs<1000)?'good':'warn')+
+      card('Alert delay', ms(e.totalAlertDelayMs)+' ms', delayClass(e.totalAlertDelayMs))+
+      card('Scoring', ms(e.scoringMs)+' ms', 'muted')+
+      card('Evaluations', evals.length, 'muted');
+  }else{
+    sum.innerHTML=card('Evaluations','0','muted');
+  }
+  var rows=document.getElementById('rows');
+  if(!evals.length){
+    rows.innerHTML='<tr><td class="empty" colspan="19">No evaluations yet - waiting for the next webhook.</td></tr>';
+    return;
+  }
+  rows.innerHTML=evals.map(function(e){
+    var vc=(e.verdict||'').indexOf('READY')>=0?'v-ready':'v-wait';
+    return '<tr>'+
+      '<td>'+etTime(e.webhookReceivedAt)+'</td>'+
+      '<td>'+(e.instrument||'-')+'</td>'+
+      '<td class="'+vc+'">'+(e.verdict||'-')+'</td>'+
+      '<td>'+etTime(e.evaluationStartedAt)+'</td>'+
+      '<td>'+etTime(e.evaluationFinishedAt)+'</td>'+
+      '<td>'+ms(e.evaluationDurationMs)+'</td>'+
+      '<td>'+ms(e.indicatorCalcMs)+'</td>'+
+      '<td>'+ms(e.volatilityCalcMs)+'</td>'+
+      '<td>'+ms(e.scoringMs)+'</td>'+
+      '<td>'+ms(e.aiNotesMs)+'</td>'+
+      '<td>'+ms(e.screenshotMs)+'</td>'+
+      '<td>'+ms(e.journalWriteMs)+'</td>'+
+      '<td>'+etTime(e.alertSentAt)+'</td>'+
+      '<td class="'+delayClass(e.totalAlertDelayMs)+'">'+ms(e.totalAlertDelayMs)+'</td>'+
+      '<td>'+num(e.currentATR)+'</td>'+
+      '<td>'+num(e.baselineATR)+'</td>'+
+      '<td>'+num(e.volatilityMultiplier)+'</td>'+
+      '<td>'+num(e.volatilityThreshold)+'</td>'+
+      '<td style="text-align:left">'+(e.volatilityDecision||'-')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+refresh();
+setInterval(refresh,1000);
+</script>
+</body>
+</html>"""
+
+
+@app.route("/eval-metrics", methods=["GET"])
+def get_eval_metrics():
+    """Owner-only JSON feed of the last EVAL_METRICS_MAX scored evaluations
+    (newest first). Each record carries the per-phase timings, the webhook->alert
+    delay and the volatility reading. Powers the live Diagnostics page."""
+    with EVAL_METRICS_LOCK:
+        snapshot = list(EVAL_METRICS)
+    return jsonify({
+        "evaluations": snapshot[::-1],
+        "count":       len(snapshot),
+        "max":         EVAL_METRICS_MAX,
+    }), 200
+
+
+@app.route("/diagnostics-live", methods=["GET"])
+def diagnostics_live():
+    """Owner-only (dashboard password, enforced by the Express proxy) live
+    Diagnostics page: per-evaluation timing + volatility metrics for the last
+    100 scored alerts, auto-refreshing every second from /eval-metrics."""
+    return Response(DIAGNOSTICS_LIVE_HTML, mimetype="text/html")
 
 
 @app.route("/journal", methods=["GET"])
@@ -6194,6 +6514,7 @@ def dashboard():
 <button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
 <button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
+<a class="btn btn-eod" href="/api/diagnostics-live" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
 
 <div id="toast"></div>
 

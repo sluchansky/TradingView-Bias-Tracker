@@ -59,6 +59,8 @@ router.all(
     "/price",
     "/alerts",
     "/diagnostics",
+    "/diagnostics-live",
+    "/eval-metrics",
     "/status",
     "/mode",
     "/journal",
