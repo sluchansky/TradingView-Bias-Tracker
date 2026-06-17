@@ -79,6 +79,14 @@ ALERT_TYPES = {
     "BOS SUPPLY":                 {"side": "bearish", "score": 2},
     "CHOCH DEMAND":               {"side": "bullish", "score": 3},
     "BOS DEMAND":                 {"side": "bullish", "score": 2},
+    # ── Shared swing-structure alerts (HH/HL bullish, LH/LL bearish) ───────────
+    #    side "structure" keeps them OUT of bias scoring (score_alerts) and the
+    #    supply/demand level builder; the READY structure gate detects them by
+    #    name in evaluate_strict_setup. Un-prefixed → require a `ticker` field.
+    "HH":                         {"side": "structure", "score": 0},
+    "HL":                         {"side": "structure", "score": 0},
+    "LH":                         {"side": "structure", "score": 0},
+    "LL":                         {"side": "structure", "score": 0},
     # ── Zone state alerts (neutral — side effects only, no score contribution) ─
     "MGC ZONE BROKEN":            {"side": "neutral", "score": 0},
     "MGC ZONE MITIGATED":         {"side": "neutral", "score": 0},
@@ -241,11 +249,11 @@ def resolve_instrument(ticker_field, alert_type):
         return {"instrument": from_title, "source": "title",
                 "ticker_present": False, "ok": True, "error": None}
 
-    # 4) Shared alert (BOS/CHOCH) with no ticker → genuinely unresolvable.
+    # 4) Shared alert (BOS/CHOCH/HH/HL/LH/LL) with no ticker → genuinely unresolvable.
     return {"instrument": None, "source": None, "ticker_present": False,
             "ok": False,
-            "error": ("missing ticker field on a shared alert — BOS/CHOCH carry "
-                      "no instrument in the title and cannot be attributed")}
+            "error": ("missing ticker field on a shared alert — BOS/CHOCH/HH/HL/LH/LL "
+                      "carry no instrument in the title and cannot be attributed")}
 
 def spec_for(ticker):
     return INSTRUMENT_SPECS[instrument_of(ticker)]
@@ -1792,20 +1800,16 @@ def _strict_checklist_field(strict_label, strict_score, confluences,
         vwap_txt = f"— ({vwap_status})"
 
     side_word = "below" if is_short else "above"
-    # The reaction requirement is satisfied by a genuine 5m candle OR — on the
-    # mitigation path — by a zone-confirmed alert. Name the SAME confirmation
-    # event the Edge Score credits, so READY and Edge Score never disagree.
-    reaction_ok     = bool(c.get("confirmation"))
-    has_real_candle = bool(c.get("confirmation_candle", c.get("confirmation")))
-    if reaction_ok and not has_real_candle:
-        reaction_line = f"{_mark(True)} Confirmed zone reaction"
-    else:
-        reaction_line = f"{_mark(reaction_ok)} 5m {'bearish' if is_short else 'bullish'} confirmation candle"
+    # The 4 READY gates, identical to what evaluate_strict_setup gates on, so the
+    # card checklist and the verdict never disagree: zone-valid (mitigation + a
+    # same-direction reaction), structure (ANY one of CHOCH/BOS/HH-HL or LH-LL),
+    # price-vs-VWAP, and Edge Score ≥ the READY threshold.
+    struct_hint = "(CHOCH/BOS/LH-LL)" if is_short else "(CHOCH/BOS/HH-HL)"
     lines = [
-        f"{_mark(c.get('bos'))} BOS {'Supply' if is_short else 'Demand'}",
-        f"{_mark(c.get('choch'))} {'Bearish' if is_short else 'Bullish'} CHOCH",
-        reaction_line,
+        f"{_mark(c.get('zone_mitigated'))} {'Supply' if is_short else 'Demand'} zone mitigated + reaction",
+        f"{_mark(c.get('structure_confirmed'))} Structure {struct_hint}",
         f"{_mark(c.get('vwap'))} Price {side_word} VWAP  ·  VWAP {vwap_txt}",
+        f"{_mark(c.get('edge_ok'))} Edge Score ≥ {EDGE_READY_THRESHOLD}",
     ]
     label_emoji = {"A+ Setup": "🔥", "Strong Trade": "🟢", "Possible Trade": "🟡"}.get(strict_label, "⏸")
     header = f"{label_emoji} **{strict_label}** · Score **{strict_score}/100**"
@@ -2566,10 +2570,40 @@ def _active_ticker():
     return "MGC"
 
 
+# ── Unified additive Edge Score (single source of truth: gate + display) ──────
+# Six confluence components, max 100. compute_trade_edge_components is the ONLY
+# place points are assigned, so the READY gate (evaluate_strict_setup) and the
+# displayed Edge Score (compute_edge_breakdown) can never diverge.
+EDGE_COMPONENTS = (
+    ("zone_valid",          "Zone Mitigated",         25),
+    ("vwap_confirmed",      "VWAP Confirmation",      20),
+    ("structure_confirmed", "Structure Confirmation", 20),
+    ("liquidity_sweep",     "Liquidity Sweep",        15),
+    ("confirmation_candle", "Confirmation Candle",    10),
+    ("preferred_session",   "Session Bonus",          10),
+)
+EDGE_READY_THRESHOLD = 80   # minimum Edge Score for a READY setup
+CONFLICT_WINDOW_MIN  = 10   # opposing structure within this many minutes = conflict
+
+
+def compute_trade_edge_components(signals):
+    """THE Edge Score — pure additive sum of the six confluence components (max
+    100). `signals` is a dict of booleans keyed by EDGE_COMPONENTS[*][0]. Returns
+    (score, breakdown) where breakdown lists {"label", "points"} for each credited
+    component. Shared by the READY gate and the display layer so the gate score
+    and the shown Edge Score are guaranteed identical."""
+    breakdown = []
+    for key, label, pts in EDGE_COMPONENTS:
+        if signals.get(key):
+            breakdown.append({"label": label, "points": pts})
+    score = min(100, sum(item["points"] for item in breakdown))
+    return score, breakdown
+
+
 def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                           nearest_supply, nearest_demand,
                           bullish, bearish, confidence, alert_history,
-                          volatility=None):
+                          volatility=None, session=None):
     """Strict checklist recommendation.
 
     A trade is recommended ONLY when ALL of:
@@ -2661,223 +2695,240 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     has_bull_sweep   = _has(f"{inst} BULLISH SWEEP", ticker_scoped=True)
     has_bear_sweep   = _has(f"{inst} BEARISH SWEEP", ticker_scoped=True)
 
-    # ── VWAP condition (required) ──
+    # ── VWAP condition (required gate) ──
     vwap_ok     = vwap_status == "ok" and vwap is not None and current_price is not None
     price_above = bool(vwap_ok and current_price > vwap)
     price_below = bool(vwap_ok and current_price < vwap)
 
-    long_struct  = has_bos_demand and has_choch_demand and has_bull_confirm
-    short_struct = has_bos_supply and has_choch_supply and has_bear_confirm
+    # ── Swing-structure alerts (HH/HL bullish, LH/LL bearish) — shared & ticker-
+    #    scoped at ingestion like CHOCH/BOS. ANY ONE structure signal in the trade
+    #    direction now satisfies the structure gate (no longer BOS *and* CHOCH). ──
+    hh_ts = _latest_ts("HH"); hl_ts = _latest_ts("HL")
+    lh_ts = _latest_ts("LH"); ll_ts = _latest_ts("LL")
+    structure_long  = bool(has_bos_demand or has_choch_demand or hh_ts or hl_ts)
+    structure_short = bool(has_bos_supply or has_choch_supply or lh_ts or ll_ts)
 
-    # ── Zone Mitigated (bullish): a previously-mitigated demand zone that is
-    # retested and reacts is a valid LONG even without a fresh BOS. Requires:
-    # demand zone retested (mitigation flag armed + nearest demand sits on a
-    # mitigated level) + reaction confirmed (5m bullish or demand-zone
-    # confirmation) + price holding above VWAP + bullish CHOCH.
-    has_mitigated_demand      = bool(ZONE_MITIGATED_FLAG and is_near_mitigated_zone(nearest_demand)[0])
-    reaction_confirmed        = has_bull_confirm or has_dem_confirm
-    mitigation_long_confirmed = bool(
-        has_mitigated_demand and reaction_confirmed and price_above and has_choch_demand
+    # ── Zone-valid (required gate): the trade-side zone must have been MITIGATED
+    #    AND then REACTED to. Mitigation alone is the old "consumed / stand-aside"
+    #    state; pairing it with a same-direction reaction (5m confirmation candle,
+    #    zone-confirmed alert, or liquidity sweep) is what makes the retest
+    #    tradeable. Instrument+side scoped via the per-instrument nearest level. ──
+    has_mitigated_demand = bool(ZONE_MITIGATED_FLAG and is_near_mitigated_zone(nearest_demand)[0])
+    has_mitigated_supply = bool(ZONE_MITIGATED_FLAG and is_near_mitigated_zone(nearest_supply)[0])
+    reaction_long  = bool(has_bull_confirm or has_dem_confirm or has_bull_sweep)
+    reaction_short = bool(has_bear_confirm or has_sup_confirm or has_bear_sweep)
+    zone_valid_long  = bool(has_mitigated_demand and reaction_long)
+    zone_valid_short = bool(has_mitigated_supply and reaction_short)
+
+    # ── Conflict (recency-aware): opposing structure on BOTH sides within a short
+    #    window = genuinely choppy → stand aside. A STALE opposite structure does
+    #    NOT block (replaces the old over-broad "any opposite in window" rule). ──
+    long_struct_ts  = max([t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None)
+    short_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts, lh_ts, ll_ts) if t], default=None)
+    is_conflict = bool(
+        long_struct_ts and short_struct_ts
+        and abs((long_struct_ts - short_struct_ts).total_seconds()) <= CONFLICT_WINDOW_MIN * 60
     )
 
-    long_gate    = (long_struct or mitigation_long_confirmed) and price_above
-    short_gate   = short_struct and price_below
+    # ── Preferred-session bonus (NEVER blocks; only ADDS to the Edge Score) ──
+    sess_state   = session or get_session_state()
+    session_pref = bool(sess_state.get("preferred"))
 
-    # ── Volatility gate (additive, FAIL-OPEN) ───────────────────────────────
-    # A BLOCK regime (market too dead or too wild) holds an otherwise-READY
-    # setup. Unavailable volatility (vol['blocked'] is False) NEVER blocks — the
-    # gate must never hold a trade on data it does not have.
-    vol = volatility or {}
+    # ── Volatility gate (FAIL-OPEN — only a hard BLOCK holds READY→WAIT) ──
+    vol       = volatility or {}
     vol_block = bool(vol.get("blocked"))
-    if vol_block:
-        long_gate = short_gate = False
 
-    def _confluences(direction, has_bos, has_choch, has_confirm, vwap_side, zone_conf,
-                     liq_sweep=False, zone_mitigated=False, confirmation_candle=None):
-        # `confirmation` = reaction requirement satisfied — which the mitigation path
-        # lets a zone-confirmed alert meet WITHOUT a 5m candle. `confirmation_candle`
-        # = a GENUINE 5m candle only, so the Edge Score never credits a phantom candle
-        # for a zone-confirmed reaction. Defaults to `confirmation` for callers that
-        # do not distinguish the two (legacy parity).
+    # ── Unified additive Edge Score per direction (single source of truth shared
+    #    with the display layer via compute_trade_edge_components). ──
+    def _signals(direction):
+        if direction == "Long":
+            return {"zone_valid": zone_valid_long, "vwap_confirmed": price_above,
+                    "structure_confirmed": structure_long, "liquidity_sweep": has_bull_sweep,
+                    "confirmation_candle": has_bull_confirm, "preferred_session": session_pref}
+        return {"zone_valid": zone_valid_short, "vwap_confirmed": price_below,
+                "structure_confirmed": structure_short, "liquidity_sweep": has_bear_sweep,
+                "confirmation_candle": has_bear_confirm, "preferred_session": session_pref}
+
+    def _edge_for(direction):
+        return compute_trade_edge_components(_signals(direction))
+
+    def _gate_debug(direction):
+        sig = _signals(direction)
+        score, _bd = _edge_for(direction)
         return {
-            "direction":     direction,
-            "bos":           bool(has_bos),
-            "choch":         bool(has_choch),
-            "confirmation":  bool(has_confirm),
-            "confirmation_candle": bool(has_confirm if confirmation_candle is None else confirmation_candle),
-            "vwap":          bool(vwap_side),
-            "vwap_status":   vwap_status,
-            "vwap_value":    vwap,
-            "zone_confirmed": bool(zone_conf),
-            "liquidity_sweep": bool(liq_sweep),
-            "zone_mitigated": bool(zone_mitigated),
+            "direction":             direction,
+            "zone_valid":            bool(sig["zone_valid"]),
+            "vwap_confirmed":        bool(sig["vwap_confirmed"]),
+            "structure_confirmed":   bool(sig["structure_confirmed"]),
+            "conflicting_structure": is_conflict,
+            "volatility_block":      vol_block,
+            "edge_score":            score,
+            "edge_ok":               bool(score >= EDGE_READY_THRESHOLD),
         }
 
-    bt = cfg("BIAS_THRESHOLD")
+    def _failed_gates(direction):
+        gd = _gate_debug(direction)
+        fails = []
+        if gd["conflicting_structure"]:
+            fails.append("conflicting_structure")
+        if not gd["zone_valid"]:
+            fails.append("zone_valid")
+        if not gd["vwap_confirmed"]:
+            fails.append("vwap_confirmed")
+        if not gd["structure_confirmed"]:
+            fails.append("structure_confirmed")
+        if gd["volatility_block"]:
+            fails.append("volatility_block")
+        if not gd["edge_ok"]:
+            fails.append("edge_score(%d<%d)" % (gd["edge_score"], EDGE_READY_THRESHOLD))
+        return gd, fails
 
-    def _score(direction, zone_conf, anchor):
-        s = 75  # all four required conditions met
-        if zone_conf:
-            s += 8
-        if anchor and current_price is not None and abs(current_price - anchor) / anchor <= cfg("NEAR_PCT"):
-            s += 6
-        if confidence >= cfg("CONF_TRADE"):
-            s += 6
-            if confidence >= cfg("CONF_HIGH"):
-                s += 3
-        gap = (bullish - bearish) if direction == "Long" else (bearish - bullish)
-        if gap >= bt:
-            s += 5
-        return min(100, s)
+    def _is_ready(direction):
+        sig = _signals(direction)
+        score, _bd = _edge_for(direction)
+        return bool(sig["zone_valid"] and sig["vwap_confirmed"]
+                    and sig["structure_confirmed"] and not is_conflict
+                    and not vol_block and score >= EDGE_READY_THRESHOLD)
 
-    # ── Per-direction breakdown (additive) ───────────────────────────────────
-    # Both sides are ALWAYS computed so the dashboard can show the bull case AND
-    # the bear case on demand. This does NOT change the authoritative single
-    # verdict returned below; full_analysis layers a per-direction Edge Score on
-    # top of these blocks. At most one side can gate (price can't be both above
-    # and below VWAP); a full long+short conflict stands both sides aside.
-    is_conflict = long_struct and short_struct
+    def _confluences(direction):
+        """Per-condition detail for journal/embed/edge-display. `zone_mitigated`
+        carries the zone-VALID signal (mitigation + reaction) so the display Edge
+        Score (compute_edge_breakdown) and this gate score stay identical, and so
+        the consumed-zone override in full_analysis is bypassed ONLY on a genuine
+        valid reaction."""
+        if direction == "Short":
+            return {
+                "direction":           "Short",
+                "bos":                 bool(has_bos_supply),
+                "choch":               bool(has_choch_supply),
+                "structure_confirmed": structure_short,
+                "confirmation":        bool(has_bear_confirm or zone_valid_short),
+                "confirmation_candle": bool(has_bear_confirm),
+                "vwap":                price_below,
+                "vwap_status":         vwap_status,
+                "vwap_value":          vwap,
+                "zone_confirmed":      bool(has_sup_confirm),
+                "liquidity_sweep":     bool(has_bear_sweep),
+                "zone_mitigated":      zone_valid_short,
+                "edge_ok":             bool(_edge_for("Short")[0] >= EDGE_READY_THRESHOLD),
+            }
+        return {
+            "direction":           "Long" if direction == "Long" else None,
+            "bos":                 bool(has_bos_demand),
+            "choch":               bool(has_choch_demand),
+            "structure_confirmed": structure_long,
+            "confirmation":        bool(has_bull_confirm or zone_valid_long),
+            "confirmation_candle": bool(has_bull_confirm),
+            "vwap":                price_above,
+            "vwap_status":         vwap_status,
+            "vwap_value":          vwap,
+            "zone_confirmed":      bool(has_dem_confirm),
+            "liquidity_sweep":     bool(has_bull_sweep),
+            "zone_mitigated":      zone_valid_long,
+            "edge_ok":             bool(_edge_for("Long")[0] >= EDGE_READY_THRESHOLD),
+        }
 
     def _dir_block(direction):
-        if direction == "Long":
-            bos_b, choch_b    = has_bos_demand, has_choch_demand
-            confirm_candle    = has_bull_confirm
-            confirm_eff       = has_bull_confirm or mitigation_long_confirmed
-            vwap_side         = price_above
-            zone_conf, anchor = has_dem_confirm, nearest_demand
-            sweep, zone_mit   = has_bull_sweep, mitigation_long_confirmed
-            gate              = long_gate
-        else:
-            bos_b, choch_b    = has_bos_supply, has_choch_supply
-            confirm_candle    = has_bear_confirm
-            confirm_eff       = has_bear_confirm
-            vwap_side         = price_below
-            zone_conf, anchor = has_sup_confirm, nearest_supply
-            sweep, zone_mit   = has_bear_sweep, False
-            gate              = short_gate
-        ready     = bool(gate and not is_conflict)
-        checklist = {"bos": bool(bos_b), "choch": bool(choch_b),
-                     "confirmation": bool(confirm_eff), "vwap": bool(vwap_side)}
+        gd, fails = _failed_gates(direction)
+        score = gd["edge_score"]
+        ready = _is_ready(direction)
+        checklist = {
+            "zone":      gd["zone_valid"],
+            "structure": gd["structure_confirmed"],
+            "vwap":      gd["vwap_confirmed"],
+            "edge":      gd["edge_ok"],
+        }
         met = sum(1 for v in checklist.values() if v)
-        if ready:
-            score, label = _score(direction, zone_conf, anchor), "READY"
-        elif is_conflict:
-            score, label = 0, "WAIT"
-        else:
-            score, label = round(met / 4 * 70), "WAIT"
-        missing = []
-        if not bos_b:
-            missing.append(f"BOS {'Demand' if direction == 'Long' else 'Supply'}")
-        if not choch_b:
-            missing.append(f"{'Bullish' if direction == 'Long' else 'Bearish'} CHOCH")
-        if not confirm_eff:
-            missing.append(f"5m {'bullish' if direction == 'Long' else 'bearish'} confirmation candle")
-        if not vwap_side:
-            if vwap_status != "ok":
-                missing.append(f"price vs VWAP (VWAP {vwap_status})")
-            else:
-                missing.append(f"price {'above' if direction == 'Long' else 'below'} VWAP")
         if is_conflict:
-            reason = "Conflicting structure — both long and short fully confirmed. Stand aside."
+            reason = ("Conflicting structure — opposing structure on both sides within "
+                      f"{CONFLICT_WINDOW_MIN} min. Stand aside.")
         elif ready:
-            reason = f"{direction} confirmed — all strict conditions met."
+            reason = (f"{direction} READY — zone reaction, structure, VWAP and "
+                      f"Edge {score} aligned.")
         elif vol_block:
-            held   = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
-            reason = f"{direction} setup on hold — market {held}: {vol.get('display', 'volatility out of range')}."
+            held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
+            reason = (f"{direction} on hold — market {held}: "
+                      f"{vol.get('display', 'volatility out of range')}.")
         else:
-            reason = (f"{direction} setup incomplete — missing: "
-                      f"{', '.join(missing) if missing else 'confluence'}.")
+            reason = (f"{direction} WAIT — failed gate(s): "
+                      f"{', '.join(fails) if fails else 'confluence'}.")
         return {
-            "direction": direction, "checklist": checklist, "met": met,
-            "ready": ready, "score": score, "label": label,
-            "missing": missing, "reason": reason, "conflict": bool(is_conflict),
-            "confluences": _confluences(direction, bos_b, choch_b, confirm_eff,
-                                        vwap_side, zone_conf, sweep,
-                                        zone_mitigated=zone_mit,
-                                        confirmation_candle=confirm_candle),
+            "direction":   direction,
+            "checklist":   checklist,
+            "met":         met,
+            "ready":       ready,
+            "score":       score,
+            "label":       "READY" if ready else "WAIT",
+            "missing":     fails,
+            "reason":      reason,
+            "conflict":    is_conflict,
+            "gate_debug":  gd,
+            "confluences": _confluences(direction),
         }
 
     directions = {"Long": _dir_block("Long"), "Short": _dir_block("Short")}
 
-    def _ret(d):
-        d["directions"] = directions
-        return d
+    def _ret(payload):
+        payload["directions"] = directions
+        return payload
 
-    # ── Conflict: full bullish AND bearish structure present → stand aside ──
+    # ── Conflict → stand aside (both sides) ──
     if is_conflict:
+        gd = _gate_debug("Long")
+        gd["conflicting_structure"] = True
         return _ret({
-            "label": "WAIT", "direction": None, "score": 0,
-            "confluences": _confluences(None, True, True, True, False, False),
-            "reason": "Conflicting structure — both long and short fully confirmed. Stand aside.",
-            "missing": [],
+            "label":      "WAIT",
+            "direction":  None,
+            "score":      0,
+            "confluences": _confluences(None),
+            "reason":     ("Conflicting structure — opposing structure on both sides "
+                           f"within {CONFLICT_WINDOW_MIN} min. Stand aside."),
+            "missing":    ["conflicting_structure"],
+            "gate_debug": gd,
         })
 
-    if long_gate:
-        score = _score("Long", has_dem_confirm, nearest_demand)
-        reason = (
-            "Long confirmed — BOS demand, bullish CHOCH, 5m bullish candle, price above VWAP."
-            if long_struct else
-            "Long confirmed — demand zone mitigated & retested, bullish reaction, CHOCH demand, price above VWAP."
-        )
-        return _ret({
-            "label": "Strong Trade" if score >= 90 else "Possible Trade",
-            "direction": "Long", "score": score,
-            "confluences": _confluences("Long", has_bos_demand, has_choch_demand,
-                                        has_bull_confirm or mitigation_long_confirmed, True, has_dem_confirm,
-                                        has_bull_sweep, zone_mitigated=mitigation_long_confirmed,
-                                        confirmation_candle=has_bull_confirm),
-            "reason": reason,
-            "missing": [],
-        })
-
-    if short_gate:
-        score = _score("Short", has_sup_confirm, nearest_supply)
-        return _ret({
-            "label": "Strong Trade" if score >= 90 else "Possible Trade",
-            "direction": "Short", "score": score,
-            "confluences": _confluences("Short", True, True, True, True, has_sup_confirm, has_bear_sweep,
-                                        confirmation_candle=has_bear_confirm),
-            "reason": "Short confirmed — BOS supply, bearish CHOCH, 5m bearish candle, price below VWAP.",
-            "missing": [],
-        })
-
-    # ── Gate failed → WAIT. Report progress for the leading direction. ──
-    long_present  = [has_bos_demand, has_choch_demand, has_bull_confirm, price_above]
-    short_present = [has_bos_supply, has_choch_supply, has_bear_confirm, price_below]
-    if sum(short_present) > sum(long_present):
-        lead, present, zone_conf, anchor = "Short", short_present, has_sup_confirm, nearest_supply
-        has_bos, has_choch, has_confirm, vwap_side = short_present
+    # ── Candidate direction = the side price sits on vs VWAP (only one side can
+    #    gate — price cannot be both above and below). With no usable VWAP side,
+    #    lead by whichever side has structure so the WAIT reason is meaningful. ──
+    if price_above:
+        candidate = "Long"
+    elif price_below:
+        candidate = "Short"
+    elif structure_short and not structure_long:
+        candidate = "Short"
     else:
-        lead, present, zone_conf, anchor = "Long", long_present, has_dem_confirm, nearest_demand
-        has_bos, has_choch, has_confirm, vwap_side = long_present
+        candidate = "Long"
 
-    missing = []
-    if not has_bos:
-        missing.append(f"BOS {'Demand' if lead == 'Long' else 'Supply'}")
-    if not has_choch:
-        missing.append(f"{'Bullish' if lead == 'Long' else 'Bearish'} CHOCH")
-    if not has_confirm:
-        missing.append(f"5m {'bullish' if lead == 'Long' else 'bearish'} confirmation candle")
-    if not vwap_side:
-        if vwap_status != "ok":
-            missing.append(f"price vs VWAP (VWAP {vwap_status})")
-        else:
-            missing.append(f"price {'above' if lead == 'Long' else 'below'} VWAP")
+    blk = directions[candidate]
+    if blk["ready"]:
+        score = blk["score"]
+        return _ret({
+            "label":      "Strong Trade" if score >= 90 else "Possible Trade",
+            "direction":  candidate,
+            "score":      score,
+            "confluences": blk["confluences"],
+            "reason":     blk["reason"],
+            "missing":    [],
+            "gate_debug": blk["gate_debug"],
+        })
 
+    # ── WAIT — name the failed gate(s) for the candidate side ──
+    gd, fails = _failed_gates(candidate)
     if vol_block:
         held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
-        missing.insert(0, f"volatility {held} — holding ({vol.get('display', '—')})")
-        reason = f"{lead} setup on hold — market {held}: {vol.get('display', 'volatility out of range')}."
+        reason = (f"{candidate} on hold — market {held}: "
+                  f"{vol.get('display', 'volatility out of range')}.")
     else:
-        reason = (f"{lead} setup incomplete — missing: "
-                  f"{', '.join(missing) if missing else 'confluence'}.")
-
-    score = round(sum(present) / 4 * 70)  # informational progress, always < 75 (WAIT)
+        reason = (f"{candidate} WAIT — failed gate(s): "
+                  f"{', '.join(fails) if fails else 'confluence'}.")
     return _ret({
-        "label": "WAIT", "direction": None, "score": score,
-        "confluences": _confluences(lead, has_bos, has_choch, has_confirm, vwap_side, zone_conf),
-        "reason": reason,
-        "missing": missing,
+        "label":      "WAIT",
+        "direction":  None,
+        "score":      blk["score"],
+        "confluences": blk["confluences"],
+        "reason":     reason,
+        "missing":    fails,
+        "gate_debug": gd,
     })
 
 
@@ -3016,10 +3067,14 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # active_ticker resolved at the top (honours the dashboard's instrument tab).
     vwap_value, vwap_status = get_vwap(active_ticker)
     volatility = get_volatility(active_ticker)
+    # Preferred-session state (ET) computed ONCE here and threaded through the gate
+    # AND stored on the result, so the +10 Session Bonus the gate credits and the
+    # Session block on the card/status are derived from the same instant.
+    session_state = get_session_state()
     strict = evaluate_strict_setup(
         current_price, active_ticker, vwap_value, vwap_status,
         nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
-        volatility=volatility,
+        volatility=volatility, session=session_state,
     )
     strict_label     = strict["label"]
     strict_score     = strict["score"]
@@ -3169,9 +3224,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
     )
 
     # Preferred-session state (Eastern Time) — drives the +10 Session Bonus in the
-    # Edge Score and the Session block on /status, /why and the trade card. Set
-    # BEFORE the Edge Score is derived so the bonus is included consistently.
-    result["session"] = get_session_state()
+    # Edge Score and the Session block on /status, /why and the trade card. Reuses
+    # the SAME instant threaded into the gate so the bonus stays consistent.
+    result["session"] = session_state
+    # Per-gate WAIT debug (which READY gate failed) — surfaced on /status + logs.
+    result["gate_debug"] = strict.get("gate_debug")
 
     # ── Unified Edge Score (single source of truth) ──────────────────────────
     # The transparent, confluence-based Edge Score replaces the legacy bias-derived
@@ -4073,9 +4130,8 @@ def _grade_for_score(score):
     """Map a 0-100 Edge Score to a Trade Grade band.
 
     Bands (Edge Score → Grade): 95-100 A+, 90-94 A, 85-89 B, 80-84 C, below 80
-    WAIT. The grade is a quality label only — it is independent of the READY/WAIT
-    gate, so a thin READY (floored at 75) can read "WAIT" until extra confluences
-    or the +10 Session Bonus lift it to 80+."""
+    WAIT. The grade mirrors the READY gate's Edge ≥ 80 threshold — a READY setup
+    always scores ≥ 80 (grade C or better); anything below 80 reads "WAIT"."""
     s = score or 0
     if s >= 95: return "A+"
     if s >= 90: return "A"
@@ -4151,129 +4207,56 @@ def _entry_trade_strength(entry):
 
 
 def compute_edge_breakdown(a, entry):
-    """Display-only Edge Score / Grade / Reasons / Risk for a READY setup.
+    """Display Edge Score / Grade / Reasons / Risk for a setup.
 
-    Grounded entirely in data full_analysis() already produced (BOS, CHOCH,
-    VWAP, supply/demand zone + confirmed reaction, trend, confidence). Nothing
-    is read from the webhook payload — this is purely a Discord display layer and
-    does not affect scoring, journaling, throttling, or the 5-min repost loop.
+    Computed from the SAME pure additive helper (compute_trade_edge_components)
+    the READY gate uses, reading the confluences full_analysis() already produced,
+    so the displayed Edge Score and the gate score can never diverge. Six additive
+    components (max 100): zone mitigation+reaction (+25), VWAP (+20), structure
+    (+20), liquidity sweep (+15), confirmation candle (+10), preferred session
+    (+10). Risk lines are INFORMATIONAL warnings only — they do NOT reduce the
+    score. Hard blockers (zone broken / consumed) force the score to 0.
 
     Returns {"score": int, "grade": str,
              "score_breakdown": [{"label": str, "points": int}],
-             "risk_adjustments": [{"label": str, "points": int}],
+             "risk_adjustments": [{"label": str, "points": None}],
              "reasons": [str], "risks": [str]}.  (reasons/risks kept for
     backward compatibility — they mirror the breakdown/risk labels.)
     """
     direction = entry.get("direction", "Long")
     is_long   = direction != "Short"
     conf      = a.get("confluences") or {}
-    has_conf  = bool(conf)
+    sess      = a.get("session") or get_session_state()
 
-    # Confluences (from evaluate_strict_setup) are the authoritative signal source.
-    # Fall back to the entry's display strings ONLY for legacy/manual entries that
-    # carry no confluences — otherwise a stale BOS/CHOCH level string (or a price
-    # that merely sits the right side of VWAP) could inflate a WAIT or
-    # mitigation-only setup that the strict gate never actually credited.
-    if has_conf:
-        has_bos   = bool(conf.get("bos"))
-        has_choch = bool(conf.get("choch"))
-        vwap_ok   = bool(conf.get("vwap"))
-    else:
-        has_bos   = str(entry.get("bos_status")   or "None") != "None"
-        has_choch = str(entry.get("choch_status") or "None") != "None"
-        vwap_pos  = str(entry.get("vwap_position") or "").lower()
-        vwap_ok   = vwap_pos.startswith("above") if is_long else vwap_pos.startswith("below")
-    # A zone only counts as "active" when a real nearest zone level exists on the
-    # trade side AND it is intact. Defends the Edge Score against a phantom
-    # "Demand/Supply Zone Active" credit before any zone has been established.
-    zone_present = bool(a.get("nearest_demand") if is_long else a.get("nearest_supply"))
-    zone_active  = zone_present and "intact" in str(entry.get("supply_demand_zone") or "").lower()
-    # "Liquidity Sweep" shows only when a real sweep alert was received from
-    # TradingView (confluences.liquidity_sweep, set in evaluate_strict_setup from a
-    # BULLISH/BEARISH SWEEP alert). "Confirmed Zone Reaction" reflects a
-    # demand/supply-zone-confirmed alert — the SAME event the READY gate accepts as its
-    # reaction requirement. They are distinct TradingView events, so each is credited on
-    # its own; neither is ever fabricated.
-    has_sweep     = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
-    zone_reaction = bool(conf.get("zone_confirmed"))
-    zone_mitig    = bool(conf.get("zone_mitigated"))
-    mkt_dir     = str(a.get("market_direction") or a.get("bias") or "")
-    trend_ok    = (mkt_dir == "Bullish") if is_long else (mkt_dir == "Bearish")
-    try:
-        confidence = max(0.0, min(float(a.get("confidence") or 0), 100.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
+    # The six additive components come straight from the confluences the READY
+    # gate already evaluated, scored by the SAME helper the gate uses, so the
+    # displayed Edge Score equals the gate score. `zone_mitigated` carries the
+    # zone-VALID signal (mitigation + same-direction reaction).
+    has_sweep = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
+    signals = {
+        "zone_valid":          bool(conf.get("zone_mitigated")),
+        "vwap_confirmed":      bool(conf.get("vwap")),
+        "structure_confirmed": bool(conf.get("structure_confirmed")),
+        "liquidity_sweep":     has_sweep,
+        "confirmation_candle": bool(conf.get("confirmation_candle")),
+        "preferred_session":   bool(sess.get("preferred")),
+    }
+    score, raw_breakdown = compute_trade_edge_components(signals)
 
-    has_confirm = bool(conf.get("confirmation"))
-    # A GENUINE 5m confirmation candle only — NOT the mitigation path's zone-confirmed
-    # substitute (which sets `confirmation` true without a candle). Falls back to
-    # `confirmation` for legacy entries that carry no explicit candle flag.
-    has_real_candle = bool(conf.get("confirmation_candle", conf.get("confirmation")))
+    # Direction-aware display labels for the generic component names.
+    relabel = {
+        "Zone Mitigated":         "Demand Zone Reaction"  if is_long else "Supply Zone Reaction",
+        "VWAP Confirmation":      "VWAP Reclaim"          if is_long else "VWAP Rejection",
+        "Structure Confirmation": "Bullish Structure"     if is_long else "Bearish Structure",
+    }
+    breakdown = [{"label": relabel.get(it["label"], it["label"]), "points": it["points"]}
+                 for it in raw_breakdown]
 
-    # ── Score breakdown ──────────────────────────────────────────────────────
-    # The 4 required gate conditions form the 75-point foundation — a READY trade
-    # has all four, so every READY trade is at least a 75 "Possible Trade". Bonus
-    # confluences push toward 100; risk adjustments pull back down.
-    breakdown = []
-    def _add(label, pts):
-        breakdown.append({"label": label, "points": pts})
-
-    if has_bos:
-        _add("BOS Demand" if is_long else "BOS Supply", 25)
-    if has_choch:
-        _add("Bullish CHOCH" if is_long else "Bearish CHOCH", 25)
-    if has_real_candle:
-        _add("Confirmation Candle", 15)
-    if vwap_ok:
-        _add("VWAP Reclaim" if is_long else "VWAP Rejection", 10)
-
-    gate_pass = has_bos and has_choch and has_confirm and vwap_ok
-
-    # Readiness — keyed off the actual READY verdict (not a re-derived gate) so the
-    # zone-mitigation path, which can pass the gate without a fresh BOS, still counts
-    # as READY. Computed here so the Session Bonus and the score floor share it.
-    strict_label = str(entry.get("strict_label") or a.get("strict_label") or "")
-    is_ready = (strict_label in ("Strong Trade", "Possible Trade")
-                or str(entry.get("verdict") or a.get("verdict") or "").upper() == "READY")
-    ready_state = gate_pass or is_ready
-
-    # Bonus confluences (additive). A liquidity sweep and a confirmed zone reaction are
-    # distinct events, so each is credited independently. The zone-confirmed reaction is
-    # ALWAYS credited when present — including on a mitigated zone, where it is exactly
-    # what satisfied the READY gate's reaction requirement — and ONLY here, never as a
-    # phantom Confirmation Candle, so READY and the Edge Score agree on the same
-    # confirmation event and count it once.
-    if has_sweep:
-        _add("Liquidity Sweep", 8)
-    if zone_reaction:
-        _add("Confirmed Zone Reaction", 5)
-    if zone_active:
-        _add("Demand Zone Active" if is_long else "Supply Zone Active", 5)
-    if trend_ok:
-        _add("Bullish Trend" if is_long else "Bearish Trend", 4)
-    if zone_mitig:
-        _add("Zone Mitigated", 3)
-    try:
-        if confidence >= float(cfg("CONF_HIGH")):
-            _add("High Confidence", 6)
-        elif confidence >= float(cfg("CONF_TRADE")):
-            _add("Elevated Confidence", 3)
-    except (TypeError, ValueError):
-        pass
-
-    # Session Bonus (+10) when a READY setup falls inside a preferred trading
-    # window. Gated on `ready_state` so a non-READY/WAIT analysis is never inflated
-    # — the bonus rewards taking the BEST setups during the BEST hours, not merely
-    # being awake at the right time. Time-based (not payload-based), so it stays in
-    # lockstep with the Session block shown on the card / status / why.
-    sess = a.get("session") or get_session_state()
-    if ready_state and sess.get("preferred"):
-        _add("Session Bonus", int(sess.get("bonus", SESSION_BONUS_POINTS)))
-
-    # ── Risk adjustments (subtract) ──────────────────────────────────────────
+    # ── Risk lines — INFORMATIONAL warnings only; they do NOT reduce the Edge
+    #    Score (the score is the pure additive sum above). Shown as bullet flags. ─
     risk_adj = []
-    def _risk(label, pts):
-        risk_adj.append({"label": label, "points": -abs(pts)})
+    def _risk(label):
+        risk_adj.append({"label": label, "points": None})
 
     risk_label = str(a.get("risk_label") or "")
     price = a.get("current_price")
@@ -4295,21 +4278,21 @@ def compute_edge_breakdown(a, entry):
         near_opposite = False
 
     if is_long and (near_opposite or risk_label in ("Testing Supply", "Approaching Supply")):
-        _risk("Nearby Resistance", 4)
+        _risk("Nearby Resistance")
     if not is_long and (near_opposite or risk_label in ("Testing Demand", "Approaching Demand")):
-        _risk("Nearby Support", 4)
+        _risk("Nearby Support")
     if a.get("overextended") or risk_label == "Overextended":
-        _risk("Overextended from level", 3)
+        _risk("Overextended from level")
     if risk_label == "Choppy":
-        _risk("Choppy conditions", 3)
-    # Volatility CAUTION (tradable-but-risky) dents the score and flags the card.
-    # A BLOCK regime never reaches here — it holds the setup at the gate (WAIT).
+        _risk("Choppy conditions")
+    # Volatility CAUTION (tradable-but-risky) flags the card. A BLOCK regime never
+    # reaches here — it holds the setup at the gate (WAIT).
     vol = a.get("volatility") or {}
     if vol.get("status") == "ok" and vol.get("caution"):
         if vol.get("regime") == "HIGH_CAUTION":
-            _risk("Elevated volatility", 5)
+            _risk("Elevated volatility")
         elif vol.get("regime") == "QUIET_CAUTION":
-            _risk("Thin / quiet volatility", 5)
+            _risk("Thin / quiet volatility")
 
     # Dedup by label, preserving first occurrence.
     def _dedup(items):
@@ -4322,14 +4305,6 @@ def compute_edge_breakdown(a, entry):
         return out
     breakdown = _dedup(breakdown)
     risk_adj  = _dedup(risk_adj)
-
-    raw   = sum(it["points"] for it in breakdown) + sum(it["points"] for it in risk_adj)
-    # Floor any READY trade at 75 so its Edge Score is always 75-100 and classifiable
-    # as Possible/Strong. `ready_state` (computed above) keys off the actual READY
-    # verdict, so the zone-mitigation path — which can pass the gate without a fresh
-    # BOS — is still floored correctly.
-    floor = 75 if ready_state else 0
-    score = max(floor, min(100, raw))
 
     # Hard blockers override everything: a broken structure or a consumed
     # (mitigated-near) zone is not tradeable, so its Edge Score is 0 regardless of
@@ -5029,10 +5004,25 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     except Exception as exc:
         logger.error("Journal/live-card path error (alert still recorded): %s", exc)
 
+    _gd = a.get("gate_debug") or {}
+    if a["verdict"] in ("LONG READY", "SHORT READY"):
+        _gate_str = "READY"
+    elif _gd.get("conflicting_structure"):
+        _gate_str = "conflict"
+    else:
+        _gate_str = "zone=%s vwap=%s struct=%s edge=%d%s" % (
+            "Y" if _gd.get("zone_valid") else "N",
+            "Y" if _gd.get("vwap_confirmed") else "N",
+            "Y" if _gd.get("structure_confirmed") else "N",
+            _gd.get("edge_score", 0),
+            "" if _gd.get("edge_ok") else ("<%d" % EDGE_READY_THRESHOLD),
+        )
+        if _gd.get("volatility_block"):
+            _gate_str += " vol=BLOCK"
     logger.info(
-        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
+        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s | Gate: %s",
         normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
-        a["recommendation"], a["verdict"], a["structure_class"], a["risk_label"],
+        a["recommendation"], a["verdict"], a["structure_class"], a["risk_label"], _gate_str,
     )
 
 
@@ -5460,6 +5450,7 @@ def status():
         "strict_direction":    a.get("strict_direction"),
         "strict_reason":       a.get("strict_reason"),
         "strict_missing":      a.get("strict_missing"),
+        "gate_debug":          a.get("gate_debug"),
         "confluences":         a.get("confluences"),
         "directions":          a.get("directions"),
         "vwap_value":          a.get("vwap_value"),
@@ -6111,10 +6102,10 @@ function renderDirView() {
   // Checklist for the selected side.
   const ck = (blk && blk.checklist) ? blk.checklist : (d.confluences || {});
   list.innerHTML =
-    ckItem('BOS '+(isShort?'Supply':'Demand'), !!ck.bos) +
-    ckItem((isShort?'Bearish':'Bullish')+' CHOCH', !!ck.choch) +
-    ckItem('5m '+(isShort?'Bearish':'Bullish')+' Candle', !!ck.confirmation) +
-    ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap);
+    ckItem((isShort?'Supply':'Demand')+' zone mitigated + reaction', !!ck.zone) +
+    ckItem('Structure '+(isShort?'(CHOCH/BOS/LH-LL)':'(CHOCH/BOS/HH-HL)'), !!ck.structure) +
+    ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap) +
+    ckItem('Edge Score \u2265 80', !!ck.edge);
 
   // Per-direction Edge Score.
   const score = blk && blk.edge_score!=null ? blk.edge_score

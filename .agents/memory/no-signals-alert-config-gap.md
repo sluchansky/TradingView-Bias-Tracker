@@ -20,19 +20,26 @@ received zero CHOCH/BOS alerts. (Contrast the simpler variant: if you only ever 
 MITIGATED / ZONE BROKEN / VWAP arriving, the user isn't sending directional alerts at all.)
 
 **Recognized structure alert types (ALERT_RULES):** `CHOCH SUPPLY`, `CHOCH DEMAND`,
-`BOS SUPPLY`, `BOS DEMAND`. CRITICAL: these are **shared / un-prefixed** (no MGC/MNQ in the
-name) and therefore **REQUIRE a `ticker` field** to resolve the instrument — without ticker
-they're rejected as unresolvable. Zone alerts, by contrast, embed the instrument in the name
-(e.g. `MNQ NEW SUPPLY ZONE`) and don't strictly need ticker.
+`BOS SUPPLY`, `BOS DEMAND`, plus the swing-structure alerts `HH`, `HL` (bullish) and `LH`, `LL`
+(bearish). CRITICAL: ALL of these are **shared / un-prefixed** (no MGC/MNQ in the name) and
+therefore **REQUIRE a `ticker` field** to resolve the instrument — without ticker they're
+rejected as unresolvable. Zone alerts, by contrast, embed the instrument in the name (e.g.
+`MNQ NEW SUPPLY ZONE`) and don't strictly need ticker.
 
-**Full READY recipe (per side):** BOS + CHOCH (structure) + Zone Confirmed + 5m confirmation
-candle (`<INST> BULLISH/BEARISH CONFIRMATION`) + price on the correct side of VWAP. The
-CHOCH/BOS structure is the gate that must open first; zones + VWAP alone can never reach READY.
+**Full READY recipe (per side):** structure_confirmed (ANY ONE of CHOCH/BOS/HH/HL for long,
+CHOCH/BOS/LH/LL for short) + zone_valid (zone MITIGATED + a same-direction reaction) + price on
+the correct side of VWAP + Edge Score ≥ 80, with no opposing-structure conflict. Some structure
+signal is the gate that must open first; a zone + VWAP alone can never reach READY.
 
-**The fix is on the user's TradingView side**, not in app.py: create CHOCH/BOS (and
-confirmation) alerts with the exact alert_type strings + a `ticker` field. Do NOT loosen the
-gate in code unless the user explicitly asks — the strict structure-first ruleset is
-intentional. Also note: a junk `{{strategy.order.comment}}` alert (Pine strategy placeholder
+**Diagnose the new per-gate WAIT debug:** the scored "Alert:" log line ends with a `Gate:` field
+(e.g. `Gate: zone=N vwap=Y struct=N edge=20<80`) and `/status` carries `gate_debug` + a
+plain-English `strict_reason` naming the failed gate(s). Use these to see exactly which gate is
+holding the setup before blaming structure/config.
+
+**If structure truly is the gap, the fix is on the user's TradingView side**, not in app.py:
+create the structure (and reaction) alerts with the exact alert_type strings + a `ticker` field.
+NOTE: the gate was deliberately LOOSENED (structure ANY-ONE, not BOS+CHOCH-both) per an explicit
+user request — do not silently re-tighten it. Also note: a junk `{{strategy.order.comment}}` alert (Pine strategy placeholder
 fired from an indicator) and empty-body alerts are harmless (rejected/200) but are noise; fix
 or delete them on the TradingView side.
 

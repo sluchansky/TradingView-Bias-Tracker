@@ -26,10 +26,13 @@ If you write `(FLAG or near_sup_mz or near_dem_mz)` the global flag leaks: an MG
 mitigation alert flips MNQ's analysis (and vice-versa). Always AND the global
 flag with this-ticker proximity.
 
-**Confirmation display:** the confluences/confirmation line must treat a
-mitigation-confirmed long as a confirmation source
-(`has_bull_confirm or mitigation_long_confirmed`), otherwise a genuinely
-confirmed mitigation entry renders as "unconfirmed" on the card.
+**Zone-valid is the tradeable mitigation:** a mitigated zone is tradeable ONLY
+when paired with a same-direction REACTION (5m confirmation candle, zone-confirmed,
+or liquidity sweep). `evaluate_strict_setup` computes
+`zone_valid_long/short = has_mitigated_* AND reaction_*` and exposes it as
+`confluences.zone_mitigated`, which is exactly what the +25 Zone Edge component
+credits — so mitigation alone (no reaction) is NOT a signal, it is the old
+"consumed / stand-aside" state.
 
 **Why:** the global flags are cheap to read but have no instrument identity;
 proximity is the only per-instrument anchor. Skipping the AND caused live
