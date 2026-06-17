@@ -41,3 +41,12 @@ Message box gives "JSON Parse error". Quote the price placeholder as `"price":"{
 TradingView's editor validates it as JSON; the webhook does `float(price)` so a quoted string
 parses fine. Direction→alert_type mapping: bullish CHOCH/BOS → `CHOCH DEMAND` / `BOS DEMAND`;
 bearish → `CHOCH SUPPLY` / `BOS SUPPLY`.
+
+**The Message box must be PURE JSON — no leading/trailing prose.** A human label before the JSON
+(e.g. `MGC bearish CHOCH. {"alert_type":"CHOCH SUPPLY",...}`) makes the whole body invalid JSON.
+The webhook does `get_json(force=True, silent=True)`; on failure it falls back to
+`{"alert_type": raw_body.strip()}`, so the entire label+JSON string becomes the "alert_type" →
+unrecognized → ignored with a **200** (silent). Symptom: structure stays Undefined even though the
+indicator's alerts are clearly firing. This is the most common reason a *correctly-formatted* JSON
+still never registers. (Confirmation/zone alerts that DID work had pure-JSON Message boxes — the
+contrast is the tell.) Fix is TradingView-side: strip everything outside the `{...}`.
