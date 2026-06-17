@@ -214,15 +214,28 @@ MODES = {
         "VOL_HARD_GATE":     False,
         # ── READY gate (mode-tunable). SCALP loosens the gate so it fires earlier:
         #    VWAP, structure AND zone are DEMOTED from hard gates to scoring
-        #    confirmations, the Edge threshold drops to 55, and >=2 confirmations are
-        #    required. SWING keeps the strict zone AND vwap AND structure AND edge>=80
-        #    behaviour exactly. A loosened zone still contributes its 25pt Edge
-        #    component — it just no longer hard-blocks READY in SCALP. ──
-        "EDGE_READY_THRESHOLD":   55,
+        #    confirmations, and >=2 confirmations are required. SWING keeps the strict
+        #    zone AND vwap AND structure AND edge>=80 behaviour exactly. A loosened
+        #    zone still contributes its 25pt Edge component — it just no longer
+        #    hard-blocks READY in SCALP.
+        #    Two-tier readiness: EDGE_READY_THRESHOLD (35) is the ACTIONABLE floor and
+        #    EDGE_FULL_READY_THRESHOLD (50) the FULL-READY floor. A passing setup that
+        #    scores 35-49 is an EARLY READY (labelled, lower conviction); 50+ is a full
+        #    READY. SWING sets both floors to 80, so it never produces an EARLY READY. ──
+        "EDGE_READY_THRESHOLD":      35,   # actionable floor (EARLY READY)
+        "EDGE_FULL_READY_THRESHOLD": 50,   # full-READY floor (35-49 = EARLY READY)
         "GATE_REQUIRE_VWAP":      False,
         "GATE_REQUIRE_STRUCTURE": False,
         "GATE_REQUIRE_ZONE":      False,
         "MIN_CONFIRMATIONS":      2,
+        # ── Score-aware conflict (SCALP). When opposing structure sits on BOTH sides
+        #    within CONFLICT_WINDOW_MIN, take the DOMINANT side unless the two sides'
+        #    Edge Scores are within CONFLICT_WAIT_GAP (then it's a true conflict →
+        #    WAIT). CONFLICT_DOMINANT_GAP (>= 20 ahead) flags a clearly dominant side
+        #    in the diagnostics block. SWING keeps the original always-WAIT behaviour. ──
+        "CONFLICT_SCORE_AWARE":   True,
+        "CONFLICT_WAIT_GAP":      10,
+        "CONFLICT_DOMINANT_GAP":  20,
         # Tiered WATCH/ARMED early alerts (SCALP only — fire before a full READY).
         "ENABLE_TIERED_ALERTS":     True,
         "WATCH_ARMED_COOLDOWN_SEC": 900,
@@ -250,11 +263,16 @@ MODES = {
         # SWING keeps the original strict gate: zone AND vwap AND structure AND
         # edge>=80, with no tiered early alerts. Expressed via the same cfg keys so
         # the READY boolean reduces to the historical behaviour exactly.
-        "EDGE_READY_THRESHOLD":   80,
+        "EDGE_READY_THRESHOLD":      80,
+        "EDGE_FULL_READY_THRESHOLD": 80,   # SWING: floor == full → no EARLY READY band
         "GATE_REQUIRE_VWAP":      True,
         "GATE_REQUIRE_STRUCTURE": True,
         "GATE_REQUIRE_ZONE":      True,
         "MIN_CONFIRMATIONS":      0,
+        # SWING keeps the original always-WAIT-on-conflict (not score-aware).
+        "CONFLICT_SCORE_AWARE":   False,
+        "CONFLICT_WAIT_GAP":      0,
+        "CONFLICT_DOMINANT_GAP":  0,
         "ENABLE_TIERED_ALERTS":     False,
         "WATCH_ARMED_COOLDOWN_SEC": 900,
     },
@@ -268,6 +286,41 @@ if TRADING_MODE not in MODES:
 def cfg(key):
     """Read a threshold for the currently active trading mode."""
     return MODES.get(TRADING_MODE, MODES["SCALP"])[key]
+
+
+# ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
+# EARLY READY (SCALP Edge 35-49) is actionable but lower-conviction than a full
+# READY (Edge >= 50). Both end in the word "READY", so a stray verdict.endswith(
+# "READY") would treat them identically. To make every consumer's intent explicit
+# (and to keep full-conviction-only paths exact), ALL verdict checks go through
+# these helpers instead of string matching.
+FULL_READY_VERDICTS  = ("LONG READY", "SHORT READY")
+EARLY_READY_VERDICTS = ("LONG EARLY READY", "SHORT EARLY READY")
+
+
+def is_full_ready(verdict):
+    """A full-conviction READY (Edge >= the full-READY floor)."""
+    return verdict in FULL_READY_VERDICTS
+
+
+def is_early_ready(verdict):
+    """An EARLY READY (Edge in the actionable-but-below-full band; SCALP only)."""
+    return verdict in EARLY_READY_VERDICTS
+
+
+def is_actionable(verdict):
+    """A tradeable alert — full READY OR EARLY READY (the union)."""
+    return verdict in FULL_READY_VERDICTS or verdict in EARLY_READY_VERDICTS
+
+
+def ready_direction(verdict):
+    """Long / Short for any (full or early) READY verdict, else None."""
+    if verdict in ("LONG READY", "LONG EARLY READY"):
+        return "Long"
+    if verdict in ("SHORT READY", "SHORT EARLY READY"):
+        return "Short"
+    return None
+
 
 DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — fallback when no profile/account_size given
 DEFAULT_RISK_PCT     = 0.01     # 1% — fallback when no profile/risk_pct given
@@ -498,7 +551,26 @@ EVAL_HEARTBEAT_INTERVAL = int(os.environ.get("EVAL_HEARTBEAT_INTERVAL", 15))  # 
 # ── Inbound signal de-dup + setup-state lifecycle (additive, DIAGNOSTIC) ──────
 # How long the SAME (instrument, alert_type) is treated as a repeat of the same
 # signal (TradingView now repeats alerts every minute while the condition holds).
-SIGNAL_DEDUP_COOLDOWN_SEC = int(os.environ.get("SIGNAL_DEDUP_COOLDOWN_SEC", 240))  # default 4 min
+# Per-instrument now: MNQ moves faster than MGC, so MNQ de-dups for 60s and MGC for
+# 90s (was a single 240s scalar — far too long for SCALP, it swallowed live repeats).
+# A global SIGNAL_DEDUP_COOLDOWN_SEC env (if set > 0) overrides BOTH as one knob.
+_SIGNAL_DEDUP_COOLDOWN_OVERRIDE = int(os.environ.get("SIGNAL_DEDUP_COOLDOWN_SEC", 0))
+SIGNAL_DEDUP_COOLDOWN_MNQ = int(os.environ.get("SIGNAL_DEDUP_COOLDOWN_MNQ", 60))   # MNQ default 60s
+SIGNAL_DEDUP_COOLDOWN_MGC = int(os.environ.get("SIGNAL_DEDUP_COOLDOWN_MGC", 90))   # MGC default 90s
+# Back-compat scalar for non-instrument-scoped callers/diagnostics: the override if
+# set, else the MNQ value (the shorter of the two).
+SIGNAL_DEDUP_COOLDOWN_SEC = _SIGNAL_DEDUP_COOLDOWN_OVERRIDE or SIGNAL_DEDUP_COOLDOWN_MNQ
+
+
+def signal_dedup_cooldown_sec(instrument):
+    """Per-instrument de-dup cooldown (seconds). A global SIGNAL_DEDUP_COOLDOWN_SEC
+    env (>0) wins for every instrument (single-knob override); otherwise MNQ=60s,
+    MGC=90s (each env-overridable). Only MNQ-resolving tickers get the 60s value;
+    every other ticker (including unknowns, which instrument_of() maps to MGC)
+    falls back to the longer, more conservative 90s MGC value."""
+    if _SIGNAL_DEDUP_COOLDOWN_OVERRIDE:
+        return _SIGNAL_DEDUP_COOLDOWN_OVERRIDE
+    return SIGNAL_DEDUP_COOLDOWN_MGC if instrument_of(instrument) == "MGC" else SIGNAL_DEDUP_COOLDOWN_MNQ
 # How long a non-ACTIVE setup (FORMING/READY) or an ACTIVE setup may persist before
 # the per-instrument lifecycle marks it EXPIRED (display-only; never gates).
 SETUP_STATE_TTL_SEC       = int(os.environ.get("SETUP_STATE_TTL_SEC", 1800))  # default 30 min
@@ -1876,10 +1948,11 @@ def build_why(bias, confidence, bullish, bearish, counts,
                 f"with minimal opposition. Trend continuation likely. Score {score_dom} vs {score_opp}.")
     if verdict in ("SHORT BIAS", "LONG BIAS"):
         return (f"Confidence {confidence}%. {signal_text}. Clear {direction} edge. Score {score_dom} vs {score_opp}.")
-    if verdict in ("LONG READY", "SHORT READY"):
-        zone_side = "demand zone" if verdict == "LONG READY" else "supply zone"
+    if is_actionable(verdict):
+        zone_side = "demand zone" if ready_direction(verdict) == "Long" else "supply zone"
+        _setup    = "early entry setup forming" if is_early_ready(verdict) else "entry setup ready"
         return (f"Confidence {confidence}%. {signal_text}. Price at {zone_side} — "
-                f"entry setup ready. Score {score_dom} vs {score_opp}.")
+                f"{_setup}. Score {score_dom} vs {score_opp}.")
     if verdict == "WATCH":
         return (f"Confidence {confidence}%. {signal_text}. Setup forming — "
                 f"wait for entry confirmation. Score {score_dom} vs {score_opp}.")
@@ -1916,9 +1989,11 @@ def bias_color(verdict):
         "STRONG SHORT": 0xCC0000,
         "SHORT BIAS":   0xFF5555,
         "SHORT READY":  0xDD2222,
+        "SHORT EARLY READY": 0xE0781E,
         "WATCH":        0xFFAA00,
         "WAIT":         0x888888,
         "LONG READY":   0x00CC44,
+        "LONG EARLY READY":  0xBFA600,
         "LONG BIAS":    0x55CC55,
         "STRONG LONG":  0x00AA00,
     }.get(verdict, 0x888888)
@@ -1927,9 +2002,11 @@ VERDICT_EMOJI = {
     "STRONG SHORT": "🔴🔴",
     "SHORT BIAS":   "🔴",
     "SHORT READY":  "🔴✅",
+    "SHORT EARLY READY": "🟡🔴",
     "WATCH":        "👁️",
     "WAIT":         "⏸️",
     "LONG READY":   "🟢✅",
+    "LONG EARLY READY":  "🟡🟢",
     "LONG BIAS":    "🟢",
     "STRONG LONG":  "🟢🟢",
 }
@@ -2333,8 +2410,10 @@ def send_discord_message(alert_data, bias, strength, bullish, bearish,
 
     if active_trade_info:
         _context_title = "📈 ACTIVE TRADE"
-    elif verdict in ("LONG READY", "SHORT READY"):
+    elif is_full_ready(verdict):
         _context_title = "🔥 HIGH CONVICTION TRADE"
+    elif is_early_ready(verdict):
+        _context_title = "⚡ EARLY SETUP"
     else:
         _context_title = "👀 WATCHLIST SETUP"
 
@@ -3071,7 +3150,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     #    NOT block (replaces the old over-broad "any opposite in window" rule). ──
     long_struct_ts  = max([t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None)
     short_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts, lh_ts, ll_ts) if t], default=None)
-    is_conflict = bool(
+    opposing_present = bool(
         long_struct_ts and short_struct_ts
         and abs((long_struct_ts - short_struct_ts).total_seconds()) <= CONFLICT_WINDOW_MIN * 60
     )
@@ -3089,10 +3168,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     # ── READY-gate configuration (mode-tunable). SWING keeps zone, VWAP & structure
     #    as hard gates with edge>=80; SCALP demotes ALL THREE to confirmations, drops
-    #    the edge threshold to 55, and requires MIN_CONFIRMATIONS confluences instead.
-    #    A demoted zone still scores its 25pt Edge component — it just no longer
-    #    hard-blocks READY in SCALP. ──
-    ready_threshold   = cfg("EDGE_READY_THRESHOLD")
+    #    the actionable edge floor to 35 (full READY at 50), and requires
+    #    MIN_CONFIRMATIONS confluences instead. A demoted zone still scores its 25pt
+    #    Edge component — it just no longer hard-blocks READY in SCALP. ──
+    ready_threshold      = cfg("EDGE_READY_THRESHOLD")        # actionable floor (EARLY)
+    full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
     require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
     require_zone      = bool(cfg("GATE_REQUIRE_ZONE"))
@@ -3117,6 +3197,23 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     def _edge_for(direction):
         return compute_trade_edge_components(_signals(direction), vol_adj)
+
+    # ── Score-aware conflict resolution (single source for the gate AND the
+    #    diagnostics block). `opposing_present` (above) = opposing structure on both
+    #    sides within the conflict window. In SCALP we only WAIT on a TRUE conflict —
+    #    the two directions are genuinely balanced (Edge gap <= CONFLICT_WAIT_GAP);
+    #    otherwise we commit to the dominant (higher-Edge) side. SWING keeps the
+    #    original always-WAIT-on-opposing behaviour (CONFLICT_SCORE_AWARE=False). ──
+    long_score           = _edge_for("Long")[0]
+    short_score          = _edge_for("Short")[0]
+    conflict_gap         = abs(long_score - short_score)
+    dominant_direction   = "Long" if long_score >= short_score else "Short"
+    score_aware_conflict = bool(cfg("CONFLICT_SCORE_AWARE"))
+    conflict_wait_gap    = int(cfg("CONFLICT_WAIT_GAP"))
+    if opposing_present and score_aware_conflict:
+        true_conflict = conflict_gap <= conflict_wait_gap
+    else:
+        true_conflict = opposing_present
 
     def _confirmations(direction):
         """Count the REAL confirmations present for `direction`. SCALP READY needs
@@ -3172,7 +3269,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "require_structure":     require_structure,
             "require_zone":          require_zone,
             "ready_threshold":       ready_threshold,
-            "conflicting_structure": is_conflict,
+            "full_ready_threshold":  full_ready_threshold,
+            "conflicting_structure": true_conflict,
             "volatility_block":      vol_block,
             "edge_score":            score,
             "edge_ok":               bool(score >= ready_threshold),
@@ -3203,21 +3301,35 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         gd["failed_conditions"] = fails
         return gd, fails
 
-    def _is_ready(direction):
+    def _readiness(direction):
+        """Readiness LEVEL for a direction: 'FULL' (Edge >= full-READY floor),
+        'EARLY' (Edge >= the actionable floor but below full) or None. The gate
+        conditions (mode-required zone/vwap/structure, confirmations count, no true
+        conflict, no vol block) are IDENTICAL for FULL and EARLY — only the Edge band
+        differs. SWING sets both floors to 80, so it only ever returns 'FULL' or None
+        (no EARLY band): it reduces to the historical zone AND vwap AND structure AND
+        edge>=80 gate exactly. SCALP: actionable floor 35, full floor 50. The
+        consumed/broken-zone safety still lives downstream in full_analysis
+        (zone_broken_active / zone_mitigated_near)."""
         sig = _signals(direction)
         score, _bd = _edge_for(direction)
-        # cfg-expressed READY. SWING (require_zone/vwap/structure=True, min_conf=0,
-        # thresh=80) reduces to the historical zone AND vwap AND structure AND
-        # edge>=80 gate exactly; SCALP drops the zone/vwap/structure hard ANDs for a
-        # confirmations-count gate at edge>=55. The consumed/broken-zone safety still
-        # lives downstream in full_analysis (zone_broken_active / zone_mitigated_near).
-        return bool(
-            (not require_zone or sig["zone_valid"]) and not is_conflict and not vol_block
-            and score >= ready_threshold
+        gates_ok = bool(
+            (not require_zone or sig["zone_valid"]) and not true_conflict and not vol_block
             and (not require_vwap or sig["vwap_confirmed"])
             and (not require_structure or sig["structure_confirmed"])
             and _confirmations(direction) >= min_confirmations
         )
+        if not gates_ok:
+            return None
+        if score >= full_ready_threshold:
+            return "FULL"
+        if score >= ready_threshold:
+            return "EARLY"
+        return None
+
+    def _is_ready(direction):
+        """Actionable (full OR early) READY for a direction."""
+        return _readiness(direction) is not None
 
     def _confluences(direction):
         """Per-condition detail for journal/embed/edge-display. `zone_mitigated`
@@ -3260,7 +3372,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     def _dir_block(direction):
         gd, fails = _failed_gates(direction)
         score = gd["edge_score"]
-        ready = _is_ready(direction)
+        readiness = _readiness(direction)
+        ready = readiness is not None
         checklist = {
             "zone":      gd["zone_valid"],
             "structure": gd["structure_confirmed"],
@@ -3268,16 +3381,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "edge":      gd["edge_ok"],
         }
         met = sum(1 for v in checklist.values() if v)
-        if is_conflict:
+        if true_conflict:
             reason = ("Conflicting structure — opposing structure on both sides within "
-                      f"{CONFLICT_WINDOW_MIN} min. Stand aside.")
+                      f"{CONFLICT_WINDOW_MIN} min, Edge gap {conflict_gap} <= "
+                      f"{conflict_wait_gap}. Stand aside.")
         elif ready:
+            _lvl = "EARLY READY" if readiness == "EARLY" else "READY"
             if require_vwap and require_structure:
-                reason = (f"{direction} READY — zone reaction, structure, VWAP and "
+                reason = (f"{direction} {_lvl} — zone reaction, structure, VWAP and "
                           f"Edge {score} aligned.")
             else:
                 _lead = "zone reaction + " if gd["zone_valid"] else ""
-                reason = (f"{direction} READY — {_lead}"
+                reason = (f"{direction} {_lvl} — {_lead}"
                           f"{gd['confirmations_passed']} confirmations, Edge {score}.")
         elif vol_block:
             held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
@@ -3291,11 +3406,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "checklist":   checklist,
             "met":         met,
             "ready":       ready,
+            "readiness":   readiness,
             "score":       score,
             "label":       "READY" if ready else "WAIT",
             "missing":     fails,
             "reason":      reason,
-            "conflict":    is_conflict,
+            "conflict":    true_conflict,
             "gate_debug":  gd,
             "confluences": _confluences(direction),
         }
@@ -3304,10 +3420,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
 
     def _ret(payload):
         payload["directions"] = directions
+        # Diagnostics (additive): per-direction Edge Scores + conflict resolution.
+        # setdefault so a caller that already set them (none today) is never clobbered.
+        payload.setdefault("long_score", long_score)
+        payload.setdefault("short_score", short_score)
+        payload.setdefault("conflict_gap", conflict_gap)
+        payload.setdefault("dominant_direction", dominant_direction)
         return payload
 
-    # ── Conflict → stand aside (both sides) ──
-    if is_conflict:
+    # ── True conflict → stand aside (both sides). SCALP only reaches here when the
+    #    two directions are balanced within CONFLICT_WAIT_GAP; a clearly dominant
+    #    side falls through to candidate selection below. ──
+    if true_conflict:
         gd = _gate_debug("Long")
         gd["conflicting_structure"] = True
         gd["failed_conditions"] = ["conflicting_structure"]
@@ -3318,7 +3442,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "confluences": _confluences(None),
             "candidate":  None,
             "reason":     ("Conflicting structure — opposing structure on both sides "
-                           f"within {CONFLICT_WINDOW_MIN} min. Stand aside."),
+                           f"within {CONFLICT_WINDOW_MIN} min, Edge gap {conflict_gap} "
+                           f"<= {conflict_wait_gap}. Stand aside."),
             "missing":    ["conflicting_structure"],
             "gate_debug": gd,
         })
@@ -3350,6 +3475,13 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             )
         candidate = "Long" if _cand_key("Long") >= _cand_key("Short") else "Short"
 
+    # ── Score-aware conflict (SCALP): opposing structure on both sides but NOT a
+    #    true conflict → commit to the dominant (higher-Edge) side instead of
+    #    standing aside. SWING never reaches here (true_conflict already returned
+    #    WAIT above when opposing_present). ──
+    if opposing_present and not true_conflict and score_aware_conflict:
+        candidate = dominant_direction
+
     blk = directions[candidate]
     if blk["ready"]:
         score = blk["score"]
@@ -3358,6 +3490,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "direction":  candidate,
             "candidate":  candidate,
             "score":      score,
+            "readiness":  blk["readiness"],
             "confluences": blk["confluences"],
             "reason":     blk["reason"],
             "missing":    [],
@@ -3579,7 +3712,15 @@ def full_analysis(current_price_override=None, ticker_override=None):
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand
         )
         if trade_plan["trade_plan"]:
-            verdict = "LONG READY" if strict_direction == "Long" else "SHORT READY"
+            # EARLY READY (SCALP Edge 35-49) is actionable but labelled lower
+            # conviction; a full READY is Edge >= the full-READY floor. Both still
+            # require a valid trade plan (R:R + anchor zone), so an EARLY setup that
+            # can't form a real plan still falls through to WAIT below.
+            _early = strict.get("readiness") == "EARLY"
+            if strict_direction == "Long":
+                verdict = "LONG EARLY READY" if _early else "LONG READY"
+            else:
+                verdict = "SHORT EARLY READY" if _early else "SHORT READY"
         else:
             # Fixed targets can't meet the 1:2 R:R (or no anchor zone) → no trade.
             verdict        = "WAIT"
@@ -3602,11 +3743,19 @@ def full_analysis(current_price_override=None, ticker_override=None):
     )
 
     # Align the displayed lifecycle stage with the authoritative strict verdict.
-    if verdict in ("LONG READY", "SHORT READY"):
+    if is_actionable(verdict):
         setup_stage      = "Trade Ready"
         stage_direction  = strict_direction
-        stage_next_step  = strict_reason or "All strict conditions met — enter now."
-        stage_entry_rule = f"Enter {strict_direction.lower()} per strict checklist."
+        if is_early_ready(verdict):
+            stage_next_step  = strict_reason or (
+                "Early setup — enter aggressive (reduced size) or wait for the "
+                "confirmation candle.")
+            stage_entry_rule = (
+                f"Enter {strict_direction.lower()} early at reduced size, "
+                "or wait for a confirmation candle.")
+        else:
+            stage_next_step  = strict_reason or "All strict conditions met — enter now."
+            stage_entry_rule = f"Enter {strict_direction.lower()} per strict checklist."
 
     # ── Zone Broken: cancel setup, reduce confidence, mark structure invalidated ──
     # Scoped to the analyzed instrument: a broken MGC zone must not invalidate a
@@ -3748,7 +3897,9 @@ def full_analysis(current_price_override=None, ticker_override=None):
     alert_level = None
     _cand   = result.get("gate_candidate")
     _gd_lvl = result.get("gate_debug") or {}
-    if result["verdict"] in ("LONG READY", "SHORT READY"):
+    # Actionable verdicts (full READY *and* EARLY READY) own the signal — mark the
+    # operational level READY so the tiered ladder defers (no redundant WATCH/ARMED).
+    if is_actionable(result["verdict"]):
         alert_level = "READY"
     elif (_cand in ("Long", "Short")
           and not zone_broken_active and not zone_mitigated_near):
@@ -3777,9 +3928,26 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["edge_score"]        = eb["score"]
     result["edge_grade"]        = eb["grade"]
     # ── Conviction tier (display-only, score-banded) — distinct from alert_level
-    #    (operational dispatch state). HIGH CONVICTION >=70 / READY 55-69 / ARMED
-    #    40-54 / None. Names the STRENGTH of the Edge Score; never gates anything. ──
+    #    (operational dispatch state). HIGH CONVICTION >=70 / READY 50-69 / EARLY
+    #    READY 35-49 / None. Names the STRENGTH of the Edge Score; never gates. ──
     result["conviction_tier"]   = _score_tier(result["edge_score"])
+
+    # ── Gate diagnostics (additive, display-only) — surfaced on every alert,
+    #    /status and the dashboard probability gauge. These are the SAME numbers
+    #    the gate used to decide READY / WAIT / conflict (sourced from `strict`),
+    #    plus the single volatility read, so the displayed values can never diverge
+    #    from the decision. All keys ALWAYS set (single-return-path invariant). ──
+    result["long_score"]            = strict.get("long_score")
+    result["short_score"]           = strict.get("short_score")
+    result["conflict_gap"]          = strict.get("conflict_gap")
+    result["dominant_direction"]    = strict.get("dominant_direction")
+    result["current_atr"]           = volatility.get("atr_pts")
+    result["volatility_multiplier"] = volatility.get("ratio")
+    result["ready_reason"]          = strict_reason
+    result["rejected_reasons"]      = strict_missing
+    # Decision-support header (Quality/Probability/Risk/Reward/Window/Recommendation)
+    # — all real-derived from the fields set above.
+    result["decision_support"]      = _decision_support(result)
 
     # ── Per-direction Edge Scores (additive, display-only) ───────────────────
     # The dashboard Long/Short toggle shows the bull case AND the bear case. The
@@ -3806,7 +3974,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
             )
         elif _d == auth_dir:
             # Mirror the authoritative final decision so the favored side is identical.
-            ready_dir = result["verdict"] in ("LONG READY", "SHORT READY")
+            ready_dir = is_actionable(result["verdict"])
             block.update(
                 ready=bool(ready_dir),
                 label="READY" if ready_dir else "WAIT",
@@ -3856,6 +4024,15 @@ def full_analysis(current_price_override=None, ticker_override=None):
         result["conviction_tier"] = None
         result["edge_score"]      = 0
         result["edge_grade"]      = None
+        # Neutralise the live diagnostics too — there is no live tape when closed,
+        # so stale per-direction scores must not read as a tradeable signal.
+        result["long_score"]         = None
+        result["short_score"]        = None
+        result["conflict_gap"]       = None
+        result["dominant_direction"] = None
+        result["ready_reason"]       = result["strict_reason"]
+        result["rejected_reasons"]   = ["market_closed"]
+        result["decision_support"]   = _decision_support(result)
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
             if _blk:
@@ -4022,6 +4199,32 @@ def _build_trade_card_embed(entry, footer_text):
 
     tier = entry.get("conviction_tier")
     tier_disp = f"  ·  Tier: **{tier}**" if tier else ""
+
+    # ── Decision-support header (all real-derived; never fabricated) ──────────
+    ds = entry.get("decision_support") or _decision_support(entry)
+    ds_field = {
+        "name": "🧭 Decision Support",
+        "value": (
+            f"⭐ **Quality:** {ds['quality']}\n"
+            f"🎯 **Probability:** {ds['probability']}%\n"
+            f"⚠️ **Risk:** {ds['risk']}\n"
+            f"💰 **Reward:** {ds['reward']}\n"
+            f"🪟 **Trade Window:** {ds['trade_window']}\n"
+            f"✅ **Recommendation:** {ds['recommendation']}"
+        ),
+        "inline": False,
+    }
+    # ── Per-direction gate diagnostics (the SAME numbers that drove the gate) ──
+    diag_field = {
+        "name": "🔬 Diagnostics",
+        "value": (
+            f"Long {_val(entry.get('long_score'))} · Short {_val(entry.get('short_score'))} · "
+            f"Gap {_val(entry.get('conflict_gap'))} · Dominant {_val(entry.get('dominant_direction'))}\n"
+            f"Edge {_val(entry.get('edge_score'))} · ATR {_val(entry.get('current_atr'))} · "
+            f"Vol× {_val(entry.get('volatility_multiplier'))}"
+        ),
+        "inline": False,
+    }
     embed = {
         "author":      {"name": f"{BOT_NAME} · {strength_disp} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
@@ -4029,6 +4232,8 @@ def _build_trade_card_embed(entry, footer_text):
         "color":       color,
         "timestamp":   entry["datetime"],
         "fields": [
+            ds_field,
+            diag_field,
             {"name": "📊 Instrument",          "value": _val(entry.get("symbol")),    "inline": True},
             {"name": "🕐 Time",                "value": fmt_et(entry["datetime"], "%Y-%m-%d %H:%M:%S ET"), "inline": True},
             {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
@@ -4201,6 +4406,16 @@ def _build_tiered_embed(a, inst, level):
         fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
     if missing:
         fields.append({"name": "Still needs", "value": ", ".join(missing[:4]), "inline": False})
+    # Per-direction gate diagnostics (real numbers; display-only) so the early
+    # alert carries the same transparency as the READY card.
+    _dv = lambda v: v if v not in (None, "") else "—"
+    fields.append({
+        "name": "Diagnostics",
+        "value": (f"L {_dv(a.get('long_score'))} · S {_dv(a.get('short_score'))} · "
+                  f"Gap {_dv(a.get('conflict_gap'))} · Edge {edge} · "
+                  f"ATR {_dv(a.get('current_atr'))} · Vol× {_dv(a.get('volatility_multiplier'))}"),
+        "inline": False,
+    })
     tail = {
         "WATCH FOR ENTRY": "confirmations in — waiting on one decisive trigger (BOS/CHOCH/rejection candle/VWAP) to go READY.",
         "ARMED":           "gathering confirmations.",
@@ -4375,6 +4590,15 @@ def _build_early_embed(a, inst, direction, t):
         fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
     fields.append({"name": "Sweep",     "value": et(t.get("sweep")),     "inline": True})
     fields.append({"name": "Structure", "value": et(t.get("structure")), "inline": True})
+    # Per-direction gate diagnostics (real numbers; display-only).
+    _dv = lambda v: v if v not in (None, "") else "—"
+    fields.append({
+        "name": "Diagnostics",
+        "value": (f"L {_dv(a.get('long_score'))} · S {_dv(a.get('short_score'))} · "
+                  f"Gap {_dv(a.get('conflict_gap'))} · Edge {_dv(a.get('edge_score'))} · "
+                  f"ATR {_dv(a.get('current_atr'))} · Vol× {_dv(a.get('volatility_multiplier'))}"),
+        "inline": False,
+    })
     return {
         "title":       f"{title} · {inst}",
         "description": "Early, *unconfirmed* entry — fired before the candle close. "
@@ -4461,9 +4685,10 @@ def _maybe_dispatch_early_alert(a, record):
         # when the ambiguity later resolves back to that same side in-window.
         return False
     key = (inst, chosen)
-    # READY already owns the signal — never post EARLY at/after the confirmation;
-    # mark dedupe so a late EARLY can't fire after READY for this setup.
-    if a.get("verdict") in ("LONG READY", "SHORT READY"):
+    # An actionable verdict (full READY *or* EARLY READY) already owns the signal —
+    # never post the intrabar ⚡EARLY teaser at/after it; mark dedupe so a late EARLY
+    # can't fire after the verdict card for this setup.
+    if is_actionable(a.get("verdict")):
         LAST_EARLY_ANCHOR[key] = "ready"
         return False
     # Honour the same hard invalidations the gate uses (display-side only).
@@ -4519,7 +4744,7 @@ def _trade_ready_loop():
                     continue
                 # Re-check ACTIVE_TRADE just before sending (it may have changed
                 # while full_analysis ran).
-                if not ACTIVE_TRADE and a.get("verdict") in ("LONG READY", "SHORT READY"):
+                if not ACTIVE_TRADE and is_actionable(a.get("verdict")):
                     entry = _build_card_entry(a, ticker=f"{inst}1!")
                     send_live_ready_card(entry, inst)
     except Exception as exc:  # never let the loop die
@@ -5068,9 +5293,10 @@ def _grade_for_score(score):
     if s >= 90: return "A"
     if s >= 85: return "B"
     if s >= 80: return "C"
-    # A valid READY in a looser mode (SCALP, threshold 65) is still a real trade —
-    # grade it C rather than the "WAIT" floor so the card's grade never contradicts
-    # its READY verdict. SWING (threshold 80) is unaffected: s>=80 already returned.
+    # A valid READY in a looser mode (SCALP, actionable floor 35 / full 50) is still
+    # a real trade — grade it C rather than the "WAIT" floor so the card's grade never
+    # contradicts its READY/EARLY READY verdict. SWING (threshold 80) is unaffected:
+    # s>=80 already returned above.
     if s >= cfg("EDGE_READY_THRESHOLD"): return "C"
     return "WAIT"
 
@@ -5096,22 +5322,101 @@ def _trade_strength_from_score(score):
 
 def _score_tier(score):
     """Conviction tier from the Edge Score (display-only) — the user-facing band
-    naming. HIGH CONVICTION >= 70, READY 55-69, ARMED 40-54, else None. Distinct
-    from the operational alert_level ladder (WATCH/ARMED/WATCH FOR ENTRY/READY): a
-    tier names the STRENGTH of an Edge Score, not the dispatch state, and never
-    gates a trade. SCALP READY fires at edge >= 55 so the READY band aligns with the
-    gate threshold; in SWING (threshold 80) a READY always lands in HIGH CONVICTION."""
+    naming. HIGH CONVICTION >= 70, READY 50-69, EARLY READY 35-49, else None.
+    Distinct from the operational alert_level ladder (WATCH/ARMED/WATCH FOR ENTRY/
+    READY): a tier names the STRENGTH of an Edge Score, not the dispatch state, and
+    never gates a trade. The bands line up with the SCALP gate floors (actionable 35,
+    full 50); in SWING (threshold 80) a READY always lands in HIGH CONVICTION."""
     try:
         s = float(score)
     except (TypeError, ValueError):
         return None
     if s >= 70:
         return "HIGH CONVICTION"
-    if s >= 55:
+    if s >= 50:
         return "READY"
-    if s >= 40:
-        return "ARMED"
+    if s >= 35:
+        return "EARLY READY"
     return None
+
+
+def _decision_support(a):
+    """Decision-support header for the live trade card + dashboard gauge. EVERY
+    field is derived from REAL analysis data — nothing is fabricated. `a` may be a
+    full_analysis result OR a card-entry dict (both carry edge_score,
+    conviction_tier, verdict, a volatility dict, a preferred-session flag and a
+    trade plan), so it reads everything defensively with .get().
+
+      quality        ← conviction tier: HIGH CONVICTION→HIGH, READY→MODERATE,
+                       EARLY READY→SPECULATIVE, else LOW
+      probability    ← the Edge Score (the SAME number shown as EdgeScore)
+      risk           ← volatility regime: Normal→Low, Caution→Moderate,
+                       Block→High, unavailable→Unknown
+      reward         ← trade-plan T2 R:R: >=3 Excellent / >=2 Good / >=1.5 Fair / else Poor
+      trade_window   ← preferred-session flag
+      recommendation ← tier + verdict: full READY enter / EARLY READY aggressive-
+                       enter-or-wait / else stand aside
+    """
+    a = a or {}
+    edge    = int(a.get("edge_score") or 0)
+    tier    = a.get("conviction_tier") or _score_tier(edge)
+    verdict = a.get("verdict") or ""
+    vol     = a.get("volatility") or {}
+    regime  = (vol.get("regime") or "NA").upper()
+
+    quality = {"HIGH CONVICTION": "HIGH", "READY": "MODERATE",
+               "EARLY READY": "SPECULATIVE"}.get(tier, "LOW")
+
+    if vol.get("status") != "ok":
+        risk = "Unknown"
+    elif vol.get("blocked"):
+        risk = "High"
+    elif vol.get("caution"):
+        risk = "Moderate"
+    elif regime == "NORMAL":
+        risk = "Low"
+    else:
+        risk = "Moderate"
+
+    rr = a.get("rr_num")
+    if rr is None:
+        rr = (a.get("trade_plan") or {}).get("rr_num")
+    try:
+        rr_f = float(rr)
+    except (TypeError, ValueError):
+        rr_f = None
+    if rr_f is None:
+        reward = "—"
+    elif rr_f >= 3:
+        reward = f"Excellent ({rr_f:.1f}R)"
+    elif rr_f >= 2:
+        reward = f"Good ({rr_f:.1f}R)"
+    elif rr_f >= 1.5:
+        reward = f"Fair ({rr_f:.1f}R)"
+    else:
+        reward = f"Poor ({rr_f:.1f}R)"
+
+    pref = a.get("session_preferred")
+    if pref is None:
+        pref = (a.get("session") or {}).get("preferred")
+    trade_window = "Preferred window" if pref else "Off-hours"
+
+    if is_full_ready(verdict):
+        recommendation = f"ENTER {ready_direction(verdict).upper()} — full conviction setup."
+    elif is_early_ready(verdict):
+        recommendation = (f"EARLY {ready_direction(verdict).upper()} — enter aggressive at "
+                          "reduced size, or wait for the confirmation candle.")
+    else:
+        recommendation = "STAND ASIDE — no qualified setup."
+
+    return {
+        "quality":        quality,
+        "probability":    edge,
+        "risk":           risk,
+        "reward":         reward,
+        "trade_window":   trade_window,
+        "recommendation": recommendation,
+    }
 
 
 def _strength_display(strength):
@@ -5625,6 +5930,17 @@ def _build_card_entry(a, ticker=None, record=None):
     # Conviction tier (score band) for the READY card label — reuse the value
     # full_analysis already computed; recompute only for a bare/legacy `a`.
     entry["conviction_tier"]   = a.get("conviction_tier") or _score_tier(entry["edge_score"])
+    # Gate diagnostics + decision-support header — reuse the values full_analysis
+    # already computed (recompute the header only for a bare/legacy `a`).
+    entry["long_score"]            = a.get("long_score")
+    entry["short_score"]           = a.get("short_score")
+    entry["conflict_gap"]          = a.get("conflict_gap")
+    entry["dominant_direction"]    = a.get("dominant_direction")
+    entry["current_atr"]           = a.get("current_atr")
+    entry["volatility_multiplier"] = a.get("volatility_multiplier")
+    entry["ready_reason"]          = a.get("ready_reason") or a.get("strict_reason")
+    entry["rejected_reasons"]      = a.get("rejected_reasons") or a.get("strict_missing")
+    entry["decision_support"]      = a.get("decision_support") or _decision_support(entry)
     return entry
 
 
@@ -5996,7 +6312,7 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
     gate, so the breakdown never misreports the cause of a WAIT."""
     gd    = gd or {}
     side  = "Supply" if candidate == "Short" else "Demand"
-    ready = verdict in ("LONG READY", "SHORT READY")
+    ready = is_actionable(verdict)
     cmp_  = "<" if candidate == "Short" else ">"
     fails = list(gd.get("failed_conditions") or [])
     for b in (extra_blockers or []):
@@ -6079,7 +6395,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
                       and cooldown_remaining_ms is not None and cooldown_remaining_ms > 0)
     blockers = ", ".join(gd.get("failed_conditions") or [])
     if not blockers:
-        blockers = "READY" if verdict.endswith("READY") else "-"
+        blockers = "READY" if is_actionable(verdict) else "-"
 
     # ── EARLY pre-READY timing (additive diagnostics; never affects the gate) ────
     et_slot         = dict(EARLY_EVENT_TIMES.get(inst_key) or {}) if inst_key else {}
@@ -6097,7 +6413,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     # READY from an earlier setup and must not pair with a fresh event.
     ready_dt         = LAST_READY_SENT_AT.get(inst_key) if inst_key else None
     ready_is_current = bool(ready_dt) and (
-        verdict.endswith("READY")
+        is_actionable(verdict)
         or (event_start_dt is not None and ready_dt >= event_start_dt))
     ready_at_iso    = ready_dt.isoformat() if ready_is_current else None
     first_alert_iso = early_at_iso or ready_at_iso   # EARLY if it fired, else READY
@@ -6115,7 +6431,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     # WAIT re-evaluations after a prior READY, so a stale READY can't read as True).
     if early_at_iso:
         waited_for_candle_close = False
-    elif verdict.endswith("READY"):
+    elif is_actionable(verdict):
         waited_for_candle_close = True
     else:
         waited_for_candle_close = None
@@ -6217,7 +6533,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     # into the worker / heartbeat loop.
     try:
         verdict_str = (a or {}).get("verdict") or ""
-        is_ready    = verdict_str.endswith("READY")
+        is_ready    = is_actionable(verdict_str)
         if (a or {}).get("market_open") is False:
             # Market closed — evaluations are paused. Never tally a quiet tape as
             # an evaluation or a failed/rejected signal (the row is still recorded
@@ -6296,7 +6612,7 @@ def _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False):
         return
     a         = a or {}
     verdict   = a.get("verdict") or ""
-    ready     = verdict.endswith("READY")
+    ready     = is_actionable(verdict)
     invalid   = bool(a.get("zone_broken_active") or a.get("zone_mitigated_near"))
     candidate = a.get("gate_candidate")
     if verdict.startswith("LONG"):
@@ -6463,7 +6779,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # error handling is isolated so a live-card failure can't suppress the journal
     # embed offloaded below.
     if (journal_entry and not ACTIVE_TRADE
-            and a.get("verdict") in ("LONG READY", "SHORT READY")):
+            and is_actionable(a.get("verdict"))):
         try:
             send_live_ready_card(journal_entry,
                                  record.get("ticker") or record.get("instrument")
@@ -6489,7 +6805,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         _enqueue_slow(lambda e=journal_entry: send_journal_discord_embed(e))
 
     _gd = a.get("gate_debug") or {}
-    if a["verdict"] in ("LONG READY", "SHORT READY"):
+    if is_actionable(a["verdict"]):
         _gate_str = "READY"
     elif _gd.get("conflicting_structure"):
         _gate_str = "conflict"
@@ -6519,9 +6835,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     _extra = []
     if a.get("zone_broken_active"):
         _extra.append("zone_broken")
-    _candidate = a.get("gate_candidate") or (
-        "Short" if a.get("verdict") == "SHORT READY"
-        else "Long" if a.get("verdict") == "LONG READY" else None)
+    _candidate = a.get("gate_candidate") or ready_direction(a.get("verdict"))
     try:
         _diag = format_gate_diagnostic(resolved_inst, normalized, _candidate, _gd,
                                        a["verdict"], extra_blockers=_extra,
@@ -6896,15 +7210,17 @@ def webhook():
     is_duplicate          = False
     cooldown_remaining_ms = None
     try:
-        sig_key = (instrument_of(resolved_inst), normalized)
+        _dedup_inst   = instrument_of(resolved_inst)
+        _cooldown_sec = signal_dedup_cooldown_sec(_dedup_inst)
+        sig_key = (_dedup_inst, normalized)
         with DEDUP_LOCK:
             _prev_seen = SIGNAL_DEDUP.get(sig_key)
             if _prev_seen is not None:
                 _elapsed = (webhook_received_at - _prev_seen).total_seconds()
-                if 0 <= _elapsed < SIGNAL_DEDUP_COOLDOWN_SEC:
+                if 0 <= _elapsed < _cooldown_sec:
                     is_duplicate          = True
                     cooldown_remaining_ms = round(
-                        (SIGNAL_DEDUP_COOLDOWN_SEC - _elapsed) * 1000.0, 1)
+                        (_cooldown_sec - _elapsed) * 1000.0, 1)
             SIGNAL_DEDUP[sig_key] = webhook_received_at
         if is_duplicate:
             with COUNTERS_LOCK:
@@ -7263,6 +7579,8 @@ def get_eval_metrics():
         "averageProcessingTimeMs":    avg_processing_ms,
         "currentQueueLength":         _WEBHOOK_JOBS.qsize(),
         "signalDedupCooldownSec":     SIGNAL_DEDUP_COOLDOWN_SEC,
+        "signalDedupCooldownMNQSec":  signal_dedup_cooldown_sec("MNQ"),
+        "signalDedupCooldownMGCSec":  signal_dedup_cooldown_sec("MGC"),
         "setupStateTtlSec":           SETUP_STATE_TTL_SEC,
         "setupStates":                setup_states,
     }
@@ -7318,6 +7636,8 @@ def add_journal_entry():
         "TRADE READY":           "Trade Ready",
         "LONG READY":            "Trade Ready",
         "SHORT READY":           "Trade Ready",
+        "LONG EARLY READY":      "Trade Ready",
+        "SHORT EARLY READY":     "Trade Ready",
         "SHORT FORMING":         "Setup Forming",
         "ENTERED":               "Entered",
         "T1 HIT":                "T1 Hit",
@@ -7486,6 +7806,15 @@ def status():
         "edge_grade":          a.get("edge_grade"),
         "edge_breakdown":      a.get("edge_breakdown"),
         "conviction_tier":     a.get("conviction_tier"),
+        "long_score":          a.get("long_score"),
+        "short_score":         a.get("short_score"),
+        "conflict_gap":        a.get("conflict_gap"),
+        "dominant_direction":  a.get("dominant_direction"),
+        "current_atr":         a.get("current_atr"),
+        "volatility_multiplier": a.get("volatility_multiplier"),
+        "ready_reason":        a.get("ready_reason"),
+        "rejected_reasons":    a.get("rejected_reasons"),
+        "decision_support":    a.get("decision_support"),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
@@ -7819,8 +8148,19 @@ def dashboard():
   .rec-badge{font-size:13px;font-weight:800;padding:5px 12px;border-radius:20px;background:#1e1e32;color:#888;letter-spacing:.5px}
   .rec-badge.ready-long{background:#0d1f14;color:#22c55e;border:1px solid #22c55e}
   .rec-badge.ready-short{background:#1f0d0d;color:#ef4444;border:1px solid #ef4444}
+  .rec-badge.early-long{background:#10180d;color:#a3e635;border:1px solid #4d7c0f}
+  .rec-badge.early-short{background:#180d10;color:#fb923c;border:1px solid #7c4d0f}
   .rec-badge.wait{background:#1f1a0d;color:#f59e0b;border:1px solid #5a4a1a}
   #rec-meta{font-size:12px;color:#888;margin-bottom:12px;line-height:1.6}
+  .rec-gauge{position:relative;width:220px;margin:2px auto 14px;text-align:center}
+  .gauge-svg{width:220px;height:auto;display:block;transition:filter .3s}
+  .gauge-center{position:absolute;top:46px;left:0;right:0;text-align:center;pointer-events:none}
+  .gauge-prob{font-size:30px;font-weight:800;line-height:1}
+  .gauge-conf{font-size:10px;color:#9aa0b5;margin-top:3px;letter-spacing:.6px;text-transform:uppercase}
+  .gauge-dir{font-size:12px;font-weight:700;margin-top:3px}
+  .gauge-scores{font-size:11px;color:#9aa0b5;font-family:ui-monospace,monospace;margin-top:6px;line-height:1.5}
+  #g-needle{transition:transform .5s cubic-bezier(.34,1.56,.64,1)}
+  .rec-gauge.glow .gauge-svg{filter:drop-shadow(0 0 9px rgba(34,197,94,.8))}
   .rec-score-wrap{height:8px;background:#0d0d18;border-radius:6px;overflow:hidden;margin-bottom:4px}
   #rec-score-bar{height:100%;width:0;background:#f59e0b;border-radius:6px;transition:width .4s,background .4s}
   #rec-score-num{font-size:11px;color:#666;text-align:right;margin-bottom:12px}
@@ -7876,6 +8216,24 @@ def dashboard():
     <span id="rec-badge" class="rec-badge wait">…</span>
   </div>
   <div id="rec-meta"></div>
+  <!-- Trade Probability Gauge (speedometer / RPM style) — fed by /status fields -->
+  <div id="rec-gauge" class="rec-gauge">
+    <svg viewBox="0 0 200 116" class="gauge-svg" aria-hidden="true">
+      <path id="g-band-red"    fill="none" stroke="#ef4444" stroke-width="16"></path>
+      <path id="g-band-yellow" fill="none" stroke="#eab308" stroke-width="16"></path>
+      <path id="g-band-green"  fill="none" stroke="#22c55e" stroke-width="16"></path>
+      <g id="g-needle">
+        <line x1="100" y1="100" x2="100" y2="36" stroke="#e8e8f0" stroke-width="3" stroke-linecap="round"></line>
+      </g>
+      <circle cx="100" cy="100" r="6" fill="#e8e8f0"></circle>
+    </svg>
+    <div class="gauge-center">
+      <div id="g-prob" class="gauge-prob">—</div>
+      <div id="g-conf" class="gauge-conf">—</div>
+      <div id="g-dir"  class="gauge-dir">—</div>
+    </div>
+    <div id="g-scores" class="gauge-scores"></div>
+  </div>
   <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
   <div id="rec-score-num"></div>
   <div id="rec-checklist" class="rec-checklist"></div>
@@ -8055,6 +8413,76 @@ let lastRec = null;
 function ckItem(label, ok) {
   return '<div class="rec-item '+(ok?'ok':'no')+'"><span class="ck">'+(ok?'✅':'⬜')+'</span>'+label+'</div>';
 }
+
+// ── Verdict helpers (mirror the Python is_full_ready / is_early_ready / is_actionable
+//    / ready_direction so EARLY READY is treated as actionable but labelled). ──
+function jsIsFullReady(v){ return v==='LONG READY' || v==='SHORT READY'; }
+function jsIsEarlyReady(v){ return v==='LONG EARLY READY' || v==='SHORT EARLY READY'; }
+function jsIsActionable(v){ return jsIsFullReady(v) || jsIsEarlyReady(v); }
+function jsReadyDir(v){
+  if(!jsIsActionable(v)) return null;
+  return /LONG/.test(v) ? 'Long' : (/SHORT/.test(v) ? 'Short' : null);
+}
+
+// ── Trade Probability Gauge (speedometer) ────────────────────────────────────
+// Semi-circle 0-100 with a needle, red 0-40 / yellow 41-69 / green 70-100 bands,
+// and a deep-green glow on a HIGH-QUALITY full READY. Reads /status fields only.
+function gaugeArc(v0, v1, r){
+  var cx=100, cy=100;
+  var a0=Math.PI*(1 - v0/100), a1=Math.PI*(1 - v1/100);
+  var x0=(cx + r*Math.cos(a0)).toFixed(2), y0=(cy - r*Math.sin(a0)).toFixed(2);
+  var x1=(cx + r*Math.cos(a1)).toFixed(2), y1=(cy - r*Math.sin(a1)).toFixed(2);
+  return 'M '+x0+' '+y0+' A '+r+' '+r+' 0 0 1 '+x1+' '+y1;
+}
+var gaugeBandsDrawn=false;
+function drawGaugeBands(){
+  if(gaugeBandsDrawn) return;
+  var R=80;
+  var r=document.getElementById('g-band-red');
+  var y=document.getElementById('g-band-yellow');
+  var g=document.getElementById('g-band-green');
+  if(!r||!y||!g) return;
+  r.setAttribute('d', gaugeArc(0,40,R));
+  y.setAttribute('d', gaugeArc(40,70,R));
+  g.setAttribute('d', gaugeArc(70,100,R));
+  gaugeBandsDrawn=true;
+}
+function renderGauge(d){
+  var wrap=document.getElementById('rec-gauge');
+  if(!wrap) return;
+  drawGaugeBands();
+  var ds=d.decision_support||{};
+  var prob = ds.probability!=null ? ds.probability : (d.edge_score!=null ? d.edge_score : 0);
+  prob = Math.max(0, Math.min(100, Number(prob)||0));
+  // Needle: value 0 -> -90deg (left), 50 -> 0deg (up), 100 -> +90deg (right).
+  var needle=document.getElementById('g-needle');
+  var deg=(prob/100)*180-90;
+  if(needle) needle.setAttribute('transform','rotate('+deg.toFixed(1)+' 100 100)');
+  var col = prob>=70?'#22c55e':(prob>=41?'#eab308':'#ef4444');
+  var probEl=document.getElementById('g-prob');
+  if(probEl){ probEl.textContent=Math.round(prob)+'%'; probEl.style.color=col; }
+  // Confidence label = decision-support Quality (falls back to conviction tier).
+  var quality = ds.quality || d.conviction_tier || '—';
+  var confEl=document.getElementById('g-conf');
+  if(confEl) confEl.textContent = quality;
+  // Dominant direction.
+  var dom = d.dominant_direction || jsReadyDir(d.verdict);
+  var dirTxt='—', dirCol='#9aa0b5';
+  if(dom==='Long'){ dirTxt='📈 LONG'; dirCol='#22c55e'; }
+  else if(dom==='Short'){ dirTxt='📉 SHORT'; dirCol='#ef4444'; }
+  var dirEl=document.getElementById('g-dir');
+  if(dirEl){ dirEl.textContent=dirTxt; dirEl.style.color=dirCol; }
+  // Long / Short / Edge-difference / Dominant row.
+  var ls=d.long_score, ss=d.short_score;
+  var diff=(ls!=null&&ss!=null)?Math.abs(ls-ss):(d.conflict_gap!=null?d.conflict_gap:null);
+  var _n=function(x){ return x!=null?x:'—'; };
+  var sc=document.getElementById('g-scores');
+  if(sc) sc.innerHTML='Long <b style="color:#e8e8f0">'+_n(ls)+'</b> · Short <b style="color:#e8e8f0">'+_n(ss)
+    +'</b><br>Δ Edge <b style="color:#e8e8f0">'+_n(diff)+'</b> · Dom <b style="color:#e8e8f0">'+_n(d.dominant_direction)+'</b>';
+  // Deep-green glow only for a HIGH-QUALITY full READY (high conviction + green band).
+  var hi = (quality==='HIGH') || (d.conviction_tier==='HIGH CONVICTION');
+  wrap.classList.toggle('glow', !!(hi && jsIsFullReady(d.verdict) && prob>=70));
+}
 async function refreshRec() {
   try {
     const d = await api('/status?ticker='+encodeURIComponent(sym));
@@ -8085,14 +8513,21 @@ async function refreshRec() {
       const sb = document.querySelector('.dir-btn.short');
       if (lb) lb.classList.remove('rec');
       if (sb) sb.classList.remove('rec');
+      renderGauge(d);
       renderDirView();
       markUpdated();
       return;
     }
 
     badge.textContent = v;
-    badge.className = 'rec-badge ' + (v==='LONG READY'?'ready-long':v==='SHORT READY'?'ready-short':'wait');
-    card.style.borderColor = v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b':'#1e1e32';
+    badge.className = 'rec-badge ' + (
+      jsIsFullReady(v) ? (v==='LONG READY'?'ready-long':'ready-short')
+      : jsIsEarlyReady(v) ? (v==='LONG EARLY READY'?'early-long':'early-short')
+      : 'wait');
+    card.style.borderColor =
+      v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b'
+      : v==='LONG EARLY READY'?'#26301b':v==='SHORT EARLY READY'?'#301b1b'
+      : '#1e1e32';
 
     const inst  = d.active_ticker ? String(d.active_ticker).replace('1!','') : '—';
     const _pval = d.display_price!=null ? d.display_price
@@ -8118,7 +8553,7 @@ async function refreshRec() {
     // Operational early-warning level (only meaningful pre-READY) + conviction tier
     // (score band). Display-only — these never change the verdict above.
     let lvlTxt = '';
-    if (v!=='LONG READY' && v!=='SHORT READY' && d.alert_level) {
+    if (!jsIsActionable(v) && d.alert_level) {
       const lc = d.alert_level==='WATCH FOR ENTRY' ? '#3b82f6'
                : d.alert_level==='ARMED' ? '#e67e22' : '#eab308';
       lvlTxt = ' &nbsp;·&nbsp; <b style="color:'+lc+'">'+d.alert_level+'</b>';
@@ -8126,13 +8561,18 @@ async function refreshRec() {
     let convTxt = '';
     if (d.conviction_tier) {
       const cc = d.conviction_tier==='HIGH CONVICTION' ? '#22c55e'
-               : d.conviction_tier==='READY' ? '#3b82f6' : '#eab308';
+               : d.conviction_tier==='READY' ? '#3b82f6'
+               : d.conviction_tier==='EARLY READY' ? '#a3e635' : '#eab308';
       convTxt = ' &nbsp;·&nbsp; <span style="color:#6b7280;font-size:11px">Tier</span> <b style="color:'+cc+'">'+d.conviction_tier+'</b>';
     }
     meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
 
-    // Mark the recommended toggle button (the system's READY side) — no auto-switch.
-    const readyDir = v==='LONG READY' ? 'Long' : v==='SHORT READY' ? 'Short' : null;
+    // Trade probability gauge — fed by the authoritative /status fields.
+    renderGauge(d);
+
+    // Mark the recommended toggle button (the system's actionable side, incl. EARLY
+    // READY) — display-only hint, no auto-switch.
+    const readyDir = jsReadyDir(v);
     const lb = document.querySelector('.dir-btn.long');
     const sb = document.querySelector('.dir-btn.short');
     if (lb) lb.classList.toggle('rec', readyDir==='Long');
@@ -8215,8 +8655,9 @@ function renderDirView() {
   bar.style.background = score>=90 ? '#22c55e' : score>=75 ? '#a0a8ff' : '#f59e0b';
   num.textContent = dir + ' Edge ' + score + '/100' + grade + ' · ' + label + met;
 
-  // Trade plan + Apply only when the SELECTED side is the one the system says READY.
-  const readyDir = d.verdict==='LONG READY' ? 'Long' : d.verdict==='SHORT READY' ? 'Short' : null;
+  // Trade plan + Apply only when the SELECTED side is the system's actionable side
+  // (full READY or EARLY READY).
+  const readyDir = jsReadyDir(d.verdict);
   const tp = d.trade_plan || {};
   if (readyDir === dir && tp.trade_plan) {
     planEl.style.display = 'block';
@@ -8240,8 +8681,7 @@ function renderDirView() {
 function applyRec() {
   if (!lastRec) return;
   const tp = lastRec.trade_plan || {};
-  const dirReady = lastRec.verdict==='LONG READY' ? 'Long'
-                 : lastRec.verdict==='SHORT READY' ? 'Short' : null;
+  const dirReady = jsReadyDir(lastRec.verdict);
   if (!dirReady || !tp.trade_plan) { toast('No ready setup to apply', false); return; }
   const inst = (lastRec.active_ticker||'').toString().replace('1!','');
   if (inst==='MGC' || inst==='MNQ') setSymbol(inst);

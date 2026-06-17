@@ -30,9 +30,26 @@ windows scoring to recent alerts, and lets BOS-only "Attempt" setups become trad
   Any new safety layer added in one mode must declare its mode behavior the same way (a `cfg()` key),
   never a hardcoded gate.
 - **The READY gate itself is now mode-tunable** via `GATE_REQUIRE_ZONE/VWAP/STRUCTURE`, `MIN_CONFIRMATIONS`
-  and `EDGE_READY_THRESHOLD` (SWING keeps zone/vwap/structure as hard gates @ Edge≥80; SCALP demotes all
-  three to confirmations @ Edge≥55, zone no longer hard-blocks). The old "gate byte-for-byte unchanged"
-  rule applies to **SWING only** now — see strict-trade-ruleset.md for the full per-mode formula.
+  and the edge floors (SWING keeps zone/vwap/structure as hard gates @ Edge≥80, single-tier; SCALP demotes
+  all three to confirmations and is **two-tier**: an *actionable* floor (EARLY READY) below a *full* READY
+  floor). The old "gate byte-for-byte unchanged" rule applies to **SWING only** now — see
+  strict-trade-ruleset.md for the full per-mode formula.
+- **SCALP readiness is two-tier; EARLY READY still endswith "READY".** SCALP emits `LONG/SHORT EARLY READY`
+  for the actionable-but-below-full band so existing dispatch/journal/dashboard treat it as a live setup —
+  but it is deliberately labeled. **Why:** any consumer that pattern-matched the verdict string would
+  silently mis-handle the new tier. **How to apply:** never compare a verdict to the literal
+  `"LONG READY"/"SHORT READY"`; route every check through the shared verdict helpers
+  (`is_actionable`/`is_full_ready`/`is_early_ready`/`ready_direction` and their JS twins) so EARLY READY
+  is classified consistently. SWING never emits an EARLY tier.
+- **Conflict resolution is mode-split.** SWING always stands aside when opposing structure is present on
+  both sides (WAIT). SCALP is score-aware: it WAITs only when the two sides are balanced
+  (Edge gap ≤ `CONFLICT_WAIT_GAP`); otherwise it commits to the dominant (higher-Edge) side, which still
+  must clear readiness/trade-plan plus the zone-broken/zone-mitigated/market-closed overrides. **Why:** a
+  clearly dominant directional bias shouldn't be vetoed by a stale opposite structure. Don't let SCALP's
+  dominant-side path leak into SWING.
+- **Per-instrument de-dup cooldown** (`signal_dedup_cooldown_sec`): only MNQ-resolving tickers get the
+  short value; MGC and *every unknown ticker* (instrument_of defaults to MGC) get the longer, more
+  conservative value. A global single-knob env override wins for all instruments.
 
 **MGC vs MNQ symmetry trap:** zone-confirmed / confirmation checks in `get_setup_stage` must match
 **both** instruments' alert strings. A past bug hardcoded only the `MGC ...` variants, so MNQ could
