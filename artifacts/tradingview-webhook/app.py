@@ -213,12 +213,15 @@ MODES = {
         # modifier (Normal +10 / Elevated 0 / Extreme -10) instead of forcing WAIT.
         "VOL_HARD_GATE":     False,
         # ── READY gate (mode-tunable). SCALP loosens the gate so it fires earlier:
-        #    VWAP & structure are DEMOTED from hard gates to confirmations, the Edge
-        #    threshold drops to 65, and >=2 confirmations are required. SWING keeps
-        #    the strict zone AND vwap AND structure AND edge>=80 behaviour exactly. ──
-        "EDGE_READY_THRESHOLD":   65,
+        #    VWAP, structure AND zone are DEMOTED from hard gates to scoring
+        #    confirmations, the Edge threshold drops to 55, and >=2 confirmations are
+        #    required. SWING keeps the strict zone AND vwap AND structure AND edge>=80
+        #    behaviour exactly. A loosened zone still contributes its 25pt Edge
+        #    component — it just no longer hard-blocks READY in SCALP. ──
+        "EDGE_READY_THRESHOLD":   55,
         "GATE_REQUIRE_VWAP":      False,
         "GATE_REQUIRE_STRUCTURE": False,
+        "GATE_REQUIRE_ZONE":      False,
         "MIN_CONFIRMATIONS":      2,
         # Tiered WATCH/ARMED early alerts (SCALP only — fire before a full READY).
         "ENABLE_TIERED_ALERTS":     True,
@@ -250,6 +253,7 @@ MODES = {
         "EDGE_READY_THRESHOLD":   80,
         "GATE_REQUIRE_VWAP":      True,
         "GATE_REQUIRE_STRUCTURE": True,
+        "GATE_REQUIRE_ZONE":      True,
         "MIN_CONFIRMATIONS":      0,
         "ENABLE_TIERED_ALERTS":     False,
         "WATCH_ARMED_COOLDOWN_SEC": 900,
@@ -2998,12 +3002,15 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     vol_block = bool(vol.get("blocked")) and bool(cfg("VOL_HARD_GATE"))
     vol_adj   = int(vol.get("score_adj") or 0)
 
-    # ── READY-gate configuration (mode-tunable). SWING keeps VWAP & structure as
-    #    hard gates with edge>=80; SCALP demotes them to confirmations, drops the
-    #    edge threshold to 65, and requires MIN_CONFIRMATIONS confluences instead. ──
+    # ── READY-gate configuration (mode-tunable). SWING keeps zone, VWAP & structure
+    #    as hard gates with edge>=80; SCALP demotes ALL THREE to confirmations, drops
+    #    the edge threshold to 55, and requires MIN_CONFIRMATIONS confluences instead.
+    #    A demoted zone still scores its 25pt Edge component — it just no longer
+    #    hard-blocks READY in SCALP. ──
     ready_threshold   = cfg("EDGE_READY_THRESHOLD")
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
     require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
+    require_zone      = bool(cfg("GATE_REQUIRE_ZONE"))
     min_confirmations = int(cfg("MIN_CONFIRMATIONS"))
 
     # ── Trend alignment (real, derived — never fabricated): the candidate side
@@ -3078,6 +3085,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "confirmations_needed":  min_confirmations,
             "require_vwap":          require_vwap,
             "require_structure":     require_structure,
+            "require_zone":          require_zone,
             "ready_threshold":       ready_threshold,
             "conflicting_structure": is_conflict,
             "volatility_block":      vol_block,
@@ -3091,10 +3099,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         fails = []
         if gd["conflicting_structure"]:
             fails.append("conflicting_structure")
-        if not gd["zone_valid"]:
+        # Zone, VWAP & structure are hard gates only when the mode requires them
+        # (SWING); in SCALP they are confirmations, surfaced via confirmations_passed
+        # below. A demoted zone still scores its 25pt Edge component.
+        if require_zone and not gd["zone_valid"]:
             fails.append("zone_valid")
-        # VWAP & structure are hard gates only when the mode requires them (SWING);
-        # in SCALP they are confirmations, surfaced via confirmations_passed below.
         if require_vwap and not gd["vwap_confirmed"]:
             fails.append("vwap_confirmed")
         if require_structure and not gd["structure_confirmed"]:
@@ -3112,12 +3121,13 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     def _is_ready(direction):
         sig = _signals(direction)
         score, _bd = _edge_for(direction)
-        # cfg-expressed READY. SWING (require_vwap/structure=True, min_conf=0,
+        # cfg-expressed READY. SWING (require_zone/vwap/structure=True, min_conf=0,
         # thresh=80) reduces to the historical zone AND vwap AND structure AND
-        # edge>=80 gate exactly; SCALP swaps the vwap/structure ANDs for a
-        # confirmations-count gate at edge>=65.
+        # edge>=80 gate exactly; SCALP drops the zone/vwap/structure hard ANDs for a
+        # confirmations-count gate at edge>=55. The consumed/broken-zone safety still
+        # lives downstream in full_analysis (zone_broken_active / zone_mitigated_near).
         return bool(
-            sig["zone_valid"] and not is_conflict and not vol_block
+            (not require_zone or sig["zone_valid"]) and not is_conflict and not vol_block
             and score >= ready_threshold
             and (not require_vwap or sig["vwap_confirmed"])
             and (not require_structure or sig["structure_confirmed"])
@@ -3181,7 +3191,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 reason = (f"{direction} READY — zone reaction, structure, VWAP and "
                           f"Edge {score} aligned.")
             else:
-                reason = (f"{direction} READY — zone reaction + "
+                _lead = "zone reaction + " if gd["zone_valid"] else ""
+                reason = (f"{direction} READY — {_lead}"
                           f"{gd['confirmations_passed']} confirmations, Edge {score}.")
         elif vol_block:
             held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
@@ -3635,10 +3646,13 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # ── Tiered alert level (SCALP early-warning ladder) — additive, DISPLAY-ONLY.
     #    Computed independently of the verdict; it NEVER alters verdict / score /
     #    direction / trade plan, so SWING decisions stay byte-for-byte identical.
-    #      WATCH = price is at a fresh trade-side zone (within WATCH_PCT)
-    #      ARMED = at the zone AND >= 1 real confirmation present
-    #      READY = the full READY gate passed (verdict LONG/SHORT READY)
-    #      None  = no candidate side, zone consumed/broken, or price away from zone
+    #      WATCH           = price is at a fresh trade-side zone (within WATCH_PCT)
+    #      ARMED           = at the zone AND >= 1 real confirmation present
+    #      WATCH FOR ENTRY = at the zone, confirmations satisfied AND Edge >= 50 but
+    #                        the full READY gate has not passed yet — one decisive
+    #                        trigger (BOS/CHOCH/rejection candle/VWAP) tips it READY
+    #      READY           = the full READY gate passed (verdict LONG/SHORT READY)
+    #      None            = no candidate side, zone consumed/broken, price away
     #    The trade-side zone is demand for Long / supply for Short. A consumed
     #    (mitigated-near) or broken zone yields None — we never WATCH a dead zone. ──
     alert_level = None
@@ -3652,7 +3666,14 @@ def full_analysis(current_price_override=None, ticker_override=None):
         if (_zone and current_price
                 and abs(current_price - _zone) / _zone <= cfg("WATCH_PCT")):
             _confs = int(_gd_lvl.get("confirmations_passed") or 0)
-            alert_level = "ARMED" if _confs >= 1 else "WATCH"
+            _need  = int(_gd_lvl.get("confirmations_needed") or 0)
+            _edge  = int(_gd_lvl.get("edge_score") or 0)
+            if _confs >= _need and _edge >= 50:
+                alert_level = "WATCH FOR ENTRY"
+            elif _confs >= 1:
+                alert_level = "ARMED"
+            else:
+                alert_level = "WATCH"
     result["alert_level"] = alert_level
 
     # ── Unified Edge Score (single source of truth) ──────────────────────────
@@ -3665,6 +3686,10 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["edge_breakdown"]    = eb
     result["edge_score"]        = eb["score"]
     result["edge_grade"]        = eb["grade"]
+    # ── Conviction tier (display-only, score-banded) — distinct from alert_level
+    #    (operational dispatch state). HIGH CONVICTION >=70 / READY 55-69 / ARMED
+    #    40-54 / None. Names the STRENGTH of the Edge Score; never gates anything. ──
+    result["conviction_tier"]   = _score_tier(result["edge_score"])
 
     # ── Per-direction Edge Scores (additive, display-only) ───────────────────
     # The dashboard Long/Short toggle shows the bull case AND the bear case. The
@@ -3873,10 +3898,12 @@ def _build_trade_card_embed(entry, footer_text):
     else:
         analysis_field = {"name": "🤖 AI Analysis", "value": notes_text, "inline": False}
 
+    tier = entry.get("conviction_tier")
+    tier_disp = f"  ·  Tier: **{tier}**" if tier else ""
     embed = {
         "author":      {"name": f"{BOT_NAME} · {strength_disp} Detected"},
         "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
-        "description": f"**{strength_disp}**  ·  Verdict: **{entry['verdict']}**",
+        "description": f"**{strength_disp}**  ·  Verdict: **{entry['verdict']}**{tier_disp}",
         "color":       color,
         "timestamp":   entry["datetime"],
         "fields": [
@@ -4035,8 +4062,9 @@ def _build_tiered_embed(a, inst, level):
     grade  = a.get("edge_grade", "")
     side_word = "demand" if cand == "Long" else "supply"
     title_emoji, color = {
-        "WATCH": ("👀 WATCH", 0xF1C40F),
-        "ARMED": ("🎯 ARMED", 0xE67E22),
+        "WATCH":           ("👀 WATCH", 0xF1C40F),
+        "ARMED":           ("🎯 ARMED", 0xE67E22),
+        "WATCH FOR ENTRY": ("⚡ WATCH FOR ENTRY", 0x3498DB),
     }.get(level, ("👀 WATCH", 0xF1C40F))
     # What still blocks READY (the gate's own failed conditions), conflict aside.
     missing = [m for m in (a.get("strict_missing") or []) if m != "conflicting_structure"]
@@ -4051,7 +4079,10 @@ def _build_tiered_embed(a, inst, level):
         fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
     if missing:
         fields.append({"name": "Still needs", "value": ", ".join(missing[:4]), "inline": False})
-    tail = "gathering confirmations." if level == "ARMED" else "watching for confirmation."
+    tail = {
+        "WATCH FOR ENTRY": "confirmations in — waiting on one decisive trigger (BOS/CHOCH/rejection candle/VWAP) to go READY.",
+        "ARMED":           "gathering confirmations.",
+    }.get(level, "watching for confirmation.")
     return {
         "title":       f"{title_emoji} · {inst}",
         "description": f"Price is at a fresh {side_word} zone — {tail}",
@@ -4099,8 +4130,8 @@ def _maybe_send_tiered_alert(a, record):
     if level == "READY":
         LAST_TIER_LEVEL[inst] = "READY"
         return False
-    # No tier: forget the standing level so the next WATCH/ARMED fires immediately.
-    if level not in ("WATCH", "ARMED"):
+    # No tier: forget the standing level so the next early alert fires immediately.
+    if level not in ("WATCH", "ARMED", "WATCH FOR ENTRY"):
         LAST_TIER_LEVEL.pop(inst, None)
         LAST_TIER_AT.pop(inst, None)
         return False
@@ -4939,6 +4970,26 @@ def _trade_strength_from_score(score):
     return None
 
 
+def _score_tier(score):
+    """Conviction tier from the Edge Score (display-only) — the user-facing band
+    naming. HIGH CONVICTION >= 70, READY 55-69, ARMED 40-54, else None. Distinct
+    from the operational alert_level ladder (WATCH/ARMED/WATCH FOR ENTRY/READY): a
+    tier names the STRENGTH of an Edge Score, not the dispatch state, and never
+    gates a trade. SCALP READY fires at edge >= 55 so the READY band aligns with the
+    gate threshold; in SWING (threshold 80) a READY always lands in HIGH CONVICTION."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return None
+    if s >= 70:
+        return "HIGH CONVICTION"
+    if s >= 55:
+        return "READY"
+    if s >= 40:
+        return "ARMED"
+    return None
+
+
 def _strength_display(strength):
     """Bold, color-coded Discord label for a trade strength."""
     return {"A+ Setup":       "🔥 A+ SETUP",
@@ -5447,6 +5498,9 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["risk_adjustments"]  = eb.get("risk_adjustments", [])
     entry["trade_strength"]    = _trade_strength_from_score(entry["edge_score"]) or entry.get("strict_label")
     entry["a_plus"]            = (entry["trade_strength"] == "A+ Setup")
+    # Conviction tier (score band) for the READY card label — reuse the value
+    # full_analysis already computed; recompute only for a bare/legacy `a`.
+    entry["conviction_tier"]   = a.get("conviction_tier") or _score_tier(entry["edge_score"])
     return entry
 
 
@@ -5884,12 +5938,13 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     inst_key    = instrument_of(instrument) if instrument else None
     alert_sent  = bool(alert_sent_at) or bool(tiered_sent)
     # Which throttle governs this level: READY re-posts on TRADE_READY_INTERVAL vs
-    # LAST_LIVE_CARD_AT; WATCH/ARMED on WATCH_ARMED_COOLDOWN_SEC vs LAST_TIER_AT.
+    # LAST_LIVE_CARD_AT; the early tiers (WATCH / ARMED / WATCH FOR ENTRY) on
+    # WATCH_ARMED_COOLDOWN_SEC vs LAST_TIER_AT.
     last_alert_at, cooldown_ms = None, None
     if alert_level == "READY":
         last_alert_at = LAST_LIVE_CARD_AT.get(inst_key) if inst_key else None
         cooldown_ms   = TRADE_READY_INTERVAL * 1000
-    elif alert_level in ("WATCH", "ARMED"):
+    elif alert_level in ("WATCH", "ARMED", "WATCH FOR ENTRY"):
         last_alert_at = LAST_TIER_AT.get(inst_key) if inst_key else None
         cooldown_ms   = int(cfg("WATCH_ARMED_COOLDOWN_SEC")) * 1000
     cooldown_remaining_ms = None
@@ -7296,6 +7351,8 @@ def status():
         "edge_score":          a["edge_score"],
         "edge_grade":          a.get("edge_grade"),
         "edge_breakdown":      a.get("edge_breakdown"),
+        "conviction_tier":     a.get("conviction_tier"),
+        "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
         "session_window":      (a.get("session") or {}).get("window"),
@@ -7894,7 +7951,21 @@ async function refreshRec() {
       const vr = vol.ratio!=null ? ' <span style="color:#6b7280;font-size:11px">'+Number(vol.ratio).toFixed(2)+'×</span>' : '';
       volTxt = ' &nbsp;·&nbsp; Vol <b style="color:'+vc+'">'+(vol.label||'—')+'</b>'+vr;
     }
-    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt;
+    // Operational early-warning level (only meaningful pre-READY) + conviction tier
+    // (score band). Display-only — these never change the verdict above.
+    let lvlTxt = '';
+    if (v!=='LONG READY' && v!=='SHORT READY' && d.alert_level) {
+      const lc = d.alert_level==='WATCH FOR ENTRY' ? '#3b82f6'
+               : d.alert_level==='ARMED' ? '#e67e22' : '#eab308';
+      lvlTxt = ' &nbsp;·&nbsp; <b style="color:'+lc+'">'+d.alert_level+'</b>';
+    }
+    let convTxt = '';
+    if (d.conviction_tier) {
+      const cc = d.conviction_tier==='HIGH CONVICTION' ? '#22c55e'
+               : d.conviction_tier==='READY' ? '#3b82f6' : '#eab308';
+      convTxt = ' &nbsp;·&nbsp; <span style="color:#6b7280;font-size:11px">Tier</span> <b style="color:'+cc+'">'+d.conviction_tier+'</b>';
+    }
+    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
 
     // Mark the recommended toggle button (the system's READY side) — no auto-switch.
     const readyDir = v==='LONG READY' ? 'Long' : v==='SHORT READY' ? 'Short' : null;
@@ -7926,13 +7997,16 @@ function renderDirView() {
   const isShort = dir === 'Short';
   const blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
 
-  // Checklist for the selected side.
+  // Checklist for the selected side. The Edge threshold is mode-dependent (SCALP 55
+  // / SWING 80), so read it from gate_debug rather than hard-coding "80".
   const ck = (blk && blk.checklist) ? blk.checklist : (d.confluences || {});
+  const _thr = (blk && blk.gate_debug && blk.gate_debug.ready_threshold!=null)
+             ? blk.gate_debug.ready_threshold : 80;
   list.innerHTML =
     ckItem((isShort?'Supply':'Demand')+' zone mitigated + reaction', !!ck.zone) +
     ckItem('Structure '+(isShort?'(CHOCH/BOS/LH-LL)':'(CHOCH/BOS/HH-HL)'), !!ck.structure) +
     ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap) +
-    ckItem('Edge Score \u2265 80', !!ck.edge);
+    ckItem('Edge Score \u2265 '+_thr, !!ck.edge);
 
   // Raw gate debug — exact per-condition booleans driving the verdict.
   const gd = (blk && blk.gate_debug) ? blk.gate_debug : null;

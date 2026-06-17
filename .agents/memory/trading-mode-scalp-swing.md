@@ -29,6 +29,10 @@ windows scoring to recent alerts, and lets BOS-only "Attempt" setups become trad
   score (Normal +10 / Elevated 0 / Extreme −10). See volatility-monitor-gate for the full contract.
   Any new safety layer added in one mode must declare its mode behavior the same way (a `cfg()` key),
   never a hardcoded gate.
+- **The READY gate itself is now mode-tunable** via `GATE_REQUIRE_ZONE/VWAP/STRUCTURE`, `MIN_CONFIRMATIONS`
+  and `EDGE_READY_THRESHOLD` (SWING keeps zone/vwap/structure as hard gates @ Edge≥80; SCALP demotes all
+  three to confirmations @ Edge≥55, zone no longer hard-blocks). The old "gate byte-for-byte unchanged"
+  rule applies to **SWING only** now — see strict-trade-ruleset.md for the full per-mode formula.
 
 **MGC vs MNQ symmetry trap:** zone-confirmed / confirmation checks in `get_setup_stage` must match
 **both** instruments' alert strings. A past bug hardcoded only the `MGC ...` variants, so MNQ could

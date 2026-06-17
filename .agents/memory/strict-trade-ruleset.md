@@ -11,10 +11,26 @@ verdict-mapping block. Any future change to the final LONG/SHORT/WAIT decision m
 the strict path, not by re-adding a parallel confidence gate.
 
 ## Constraints any change must keep
-- **READY = zone_valid AND vwap_confirmed AND structure_confirmed AND not conflicting AND Edge≥80**,
-  evaluated PER DIRECTION (candidate side chosen by which side of VWAP price sits on). A pre-existing
-  **volatility BLOCK** also holds READY→WAIT (fail-open: only a hard BLOCK regime — see
-  `volatility-monitor-gate.md`) — intentional safety, NOT part of the user's 5-term formula; keep it.
+- **The READY gate is MODE-TUNABLE — the old "byte-for-byte unchanged" invariant was EXPLICITLY
+  OVERRIDDEN for SCALP by the user.** `_is_ready` reduces to per-`cfg()` keys: `(not require_zone or
+  zone_valid) AND not conflict AND not vol_block AND Edge≥EDGE_READY_THRESHOLD AND (not require_vwap
+  or vwap_confirmed) AND (not require_structure or structure_confirmed) AND confirmations≥MIN_CONFIRMATIONS`.
+  - **SWING** (`GATE_REQUIRE_ZONE/VWAP/STRUCTURE`=True, `MIN_CONFIRMATIONS`=0, threshold 80) reduces
+    EXACTLY to the historical `zone AND vwap AND structure AND Edge≥80` gate — **must stay so.**
+  - **SCALP** (all three require_* False, `MIN_CONFIRMATIONS`=2, threshold **55**) demotes zone/vwap/
+    structure to *confirmations* (counted toward the ≥2), NOT hard ANDs. A demoted zone STILL scores its
+    25pt Edge component — it just no longer hard-blocks. So SCALP can fire READY with `zone_valid` False
+    (e.g. Edge 55 from structure20+sweep15+vwap20). **Do not "re-tighten" SCALP thinking this is a bug.**
+  - Req5 "auto-upgrade ARMED→READY" needs NO force path: a natural Edge climb (BOS/CHOCH→struct20,
+    rejection candle→10, VWAP→20) crossing 55 flips `_is_ready`, which emits the existing trade card.
+  - When `zone_valid` is False the SCALP READY `reason` must NOT claim "zone reaction" (gate on
+    `gd["zone_valid"]`).
+- A pre-existing **volatility BLOCK** also holds READY→WAIT (fail-open: only a hard BLOCK regime — see
+  `volatility-monitor-gate.md`) — intentional safety; keep it.
+- **alert_level vs conviction_tier are TWO SEPARATE fields by design — never merge them.** `alert_level`
+  is the OPERATIONAL early-warning ladder (WATCH < ARMED < WATCH FOR ENTRY < READY); `conviction_tier`
+  is the SCORE BAND (`_score_tier`: ARMED 40-54 / READY 55-69 / HIGH CONVICTION 70+). "WATCH FOR ENTRY" =
+  in-zone AND confirmations≥needed AND Edge≥50 but gate not yet READY. Both display-only, never gate.
 - **structure_confirmed = ANY ONE of** CHOCH/BOS in direction, HH/HL (long), LH/LL (short). It is NOT
   "BOS AND CHOCH" — that older both-required rule was the #1 cause of always-WAIT and was loosened.
 - **zone_valid = trade-side zone MITIGATED + a same-direction REACTION** (5m confirmation candle OR
@@ -26,8 +42,8 @@ the strict path, not by re-adding a parallel confidence gate.
 - **VWAP equality → WAIT.** Gate uses strict inequalities (price > VWAP long, price < VWAP short).
 - **Edge Score is the single additive helper `compute_trade_edge_components`** (zone25/vwap20/
   structure20/sweep15/candle10/session10, max 100) shared by the gate AND the display layer — the gate
-  score and the shown Edge Score can never diverge. NO 75-floor anymore; a READY is always ≥80 by
-  construction. Session is a pure additive component (NEVER blocks, no longer READY-gated).
+  score and the shown Edge Score can never diverge. NO 75-floor; in SWING a READY is ≥80 by construction,
+  in SCALP ≥55. Session is a pure additive component (NEVER blocks, no longer READY-gated).
 - **Every WAIT names the failed gate(s)** via `reason`/`missing`/`gate_debug` (also on `/status` and the
   scored "Alert:" log `Gate:` field). Keep this per-gate debug surface when touching the gate.
 - **Journal gates solely on `strict_label` ∈ (Strong Trade, Possible Trade); WAIT must never journal.**
