@@ -32,9 +32,20 @@ the correct side of VWAP + Edge Score ≥ 80, with no opposing-structure conflic
 signal is the gate that must open first; a zone + VWAP alone can never reach READY.
 
 **Diagnose the new per-gate WAIT debug:** the scored "Alert:" log line ends with a `Gate:` field
-(e.g. `Gate: zone=N vwap=Y struct=N edge=20<80`) and `/status` carries `gate_debug` + a
-plain-English `strict_reason` naming the failed gate(s). Use these to see exactly which gate is
-holding the setup before blaming structure/config.
+(e.g. `Gate: zone=N vwap=Y struct=N edge=20<80`) and `/status` carries `gate_debug` (now incl.
+`candle_confirmed` + `failed_conditions`) + a plain-English `strict_reason` naming the failed
+gate(s). Use these to see exactly which gate is holding the setup before blaming structure/config.
+
+**Two non-code blockers seen live, both UPSTREAM of the gate — check them FIRST:**
+1. **Deploy gap.** Loosening the gate in the repo does NOTHING until the Reserved VM is
+   re-published. Tell-tale: prod "Alert:" lines still use the OLD format (`… | Struct: … |
+   Risk: …`) with NO `Gate:` field. Always confirm the new code is actually live before debugging.
+2. **Input-mix gap.** The chart was sending ONLY `… CONFIRMATION` (every 5m bar) + occasional
+   `BOS`; ZERO `CHOCH`, `ZONE MITIGATED`, or `SWEEP` ever arrived. `zone_valid` is a HARD gate
+   that requires a `ZONE MITIGATED` alert (+ a reaction), so with none sent it can NEVER be TRUE
+   → READY impossible regardless of code. Quantify by grepping prod logs per alert type (a regex
+   for `CHOCH|ZONE MITIGATED|SWEEP|READY` returning "No deployment logs found" = none arriving)
+   before tuning any threshold.
 
 **If structure truly is the gap, the fix is on the user's TradingView side**, not in app.py:
 create the structure (and reaction) alerts with the exact alert_type strings + a `ticker` field.

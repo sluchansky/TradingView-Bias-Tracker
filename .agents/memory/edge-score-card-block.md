@@ -52,6 +52,16 @@ score while `gate_debug.edge_score` still shows raw components.
 **How to apply:** any new edge component goes in `EDGE_COMPONENTS` ONCE; never add a credit in the
 display layer that the gate doesn't also see, or READY and the shown score will disagree again.
 
+**The READY threshold must not exceed the sum of the HARD-required components.** The three
+required gates (zone 25 + vwap 20 + structure 20 = 65) are AND-ed, but `EDGE_READY_THRESHOLD = 80`,
+so passing all three is NOT enough — READY structurally always needs a 4th confluence (sweep +15,
+or candle +10 plus session +10). And since `zone_valid` itself requires a reaction, a clean
+mitigation+candle+structure+VWAP setup OUTSIDE a session window tops out at 75 → still WAIT.
+**Why:** this is a silent over-filter; if "always WAIT" recurs with the three requireds green, the
+80 > 65 gap is the cause. **How to apply:** fix by lowering the threshold to 65 (three requireds =
+READY, extras = Strong), or reweighting the three requireds to total 80 — do not just keep raising
+inputs. Keep the threshold ≤ the AND-required sum unless a 4th confluence is intentionally required.
+
 **Never fabricate a signal label.** A reason label must map to something the app actually
 produces. The bonus shows "Liquidity Sweep" ONLY when a real sweep flag is set
 (`confluences.liquidity_sweep` / `confluences.sweep` / `a["liquidity_sweep"]`), and shows

@@ -2760,10 +2760,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "zone_valid":            bool(sig["zone_valid"]),
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
             "structure_confirmed":   bool(sig["structure_confirmed"]),
+            "candle_confirmed":      bool(sig["confirmation_candle"]),
             "conflicting_structure": is_conflict,
             "volatility_block":      vol_block,
             "edge_score":            score,
             "edge_ok":               bool(score >= EDGE_READY_THRESHOLD),
+            "failed_conditions":     [],
         }
 
     def _failed_gates(direction):
@@ -2781,6 +2783,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             fails.append("volatility_block")
         if not gd["edge_ok"]:
             fails.append("edge_score(%d<%d)" % (gd["edge_score"], EDGE_READY_THRESHOLD))
+        gd["failed_conditions"] = fails
         return gd, fails
 
     def _is_ready(direction):
@@ -2876,6 +2879,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     if is_conflict:
         gd = _gate_debug("Long")
         gd["conflicting_structure"] = True
+        gd["failed_conditions"] = ["conflicting_structure"]
         return _ret({
             "label":      "WAIT",
             "direction":  None,
@@ -6106,6 +6110,20 @@ function renderDirView() {
     ckItem('Structure '+(isShort?'(CHOCH/BOS/LH-LL)':'(CHOCH/BOS/HH-HL)'), !!ck.structure) +
     ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap) +
     ckItem('Edge Score \u2265 80', !!ck.edge);
+
+  // Raw gate debug — exact per-condition booleans driving the verdict.
+  const gd = (blk && blk.gate_debug) ? blk.gate_debug : null;
+  if (gd) {
+    const yn = v => v ? '\u2713' : '\u2717';
+    const fails = (gd.failed_conditions && gd.failed_conditions.length)
+                ? gd.failed_conditions.join(', ') : 'none';
+    list.innerHTML +=
+      '<div style="margin-top:8px;padding-top:6px;border-top:1px solid #1e1e32;' +
+      'font-size:11px;line-height:1.5;color:#6b7280;font-family:ui-monospace,monospace">' +
+      'debug · zone_valid '+yn(gd.zone_valid)+' · vwap_confirmed '+yn(gd.vwap_confirmed)+
+      ' · structure_confirmed '+yn(gd.structure_confirmed)+' · candle_confirmed '+yn(gd.candle_confirmed)+
+      '<br>edge_score '+(gd.edge_score!=null?gd.edge_score:0)+'/100 · failed_conditions: '+fails+'</div>';
+  }
 
   // Per-direction Edge Score.
   const score = blk && blk.edge_score!=null ? blk.edge_score
