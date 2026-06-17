@@ -2712,15 +2712,6 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "zone_mitigated": bool(zone_mitigated),
         }
 
-    # ── Conflict: full bullish AND bearish structure present → stand aside ──
-    if long_struct and short_struct:
-        return {
-            "label": "WAIT", "direction": None, "score": 0,
-            "confluences": _confluences(None, True, True, True, False, False),
-            "reason": "Conflicting structure — both long and short fully confirmed. Stand aside.",
-            "missing": [],
-        }
-
     bt = cfg("BIAS_THRESHOLD")
 
     def _score(direction, zone_conf, anchor):
@@ -2738,6 +2729,88 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             s += 5
         return min(100, s)
 
+    # ── Per-direction breakdown (additive) ───────────────────────────────────
+    # Both sides are ALWAYS computed so the dashboard can show the bull case AND
+    # the bear case on demand. This does NOT change the authoritative single
+    # verdict returned below; full_analysis layers a per-direction Edge Score on
+    # top of these blocks. At most one side can gate (price can't be both above
+    # and below VWAP); a full long+short conflict stands both sides aside.
+    is_conflict = long_struct and short_struct
+
+    def _dir_block(direction):
+        if direction == "Long":
+            bos_b, choch_b    = has_bos_demand, has_choch_demand
+            confirm_candle    = has_bull_confirm
+            confirm_eff       = has_bull_confirm or mitigation_long_confirmed
+            vwap_side         = price_above
+            zone_conf, anchor = has_dem_confirm, nearest_demand
+            sweep, zone_mit   = has_bull_sweep, mitigation_long_confirmed
+            gate              = long_gate
+        else:
+            bos_b, choch_b    = has_bos_supply, has_choch_supply
+            confirm_candle    = has_bear_confirm
+            confirm_eff       = has_bear_confirm
+            vwap_side         = price_below
+            zone_conf, anchor = has_sup_confirm, nearest_supply
+            sweep, zone_mit   = has_bear_sweep, False
+            gate              = short_gate
+        ready     = bool(gate and not is_conflict)
+        checklist = {"bos": bool(bos_b), "choch": bool(choch_b),
+                     "confirmation": bool(confirm_eff), "vwap": bool(vwap_side)}
+        met = sum(1 for v in checklist.values() if v)
+        if ready:
+            score, label = _score(direction, zone_conf, anchor), "READY"
+        elif is_conflict:
+            score, label = 0, "WAIT"
+        else:
+            score, label = round(met / 4 * 70), "WAIT"
+        missing = []
+        if not bos_b:
+            missing.append(f"BOS {'Demand' if direction == 'Long' else 'Supply'}")
+        if not choch_b:
+            missing.append(f"{'Bullish' if direction == 'Long' else 'Bearish'} CHOCH")
+        if not confirm_eff:
+            missing.append(f"5m {'bullish' if direction == 'Long' else 'bearish'} confirmation candle")
+        if not vwap_side:
+            if vwap_status != "ok":
+                missing.append(f"price vs VWAP (VWAP {vwap_status})")
+            else:
+                missing.append(f"price {'above' if direction == 'Long' else 'below'} VWAP")
+        if is_conflict:
+            reason = "Conflicting structure — both long and short fully confirmed. Stand aside."
+        elif ready:
+            reason = f"{direction} confirmed — all strict conditions met."
+        elif vol_block:
+            held   = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
+            reason = f"{direction} setup on hold — market {held}: {vol.get('display', 'volatility out of range')}."
+        else:
+            reason = (f"{direction} setup incomplete — missing: "
+                      f"{', '.join(missing) if missing else 'confluence'}.")
+        return {
+            "direction": direction, "checklist": checklist, "met": met,
+            "ready": ready, "score": score, "label": label,
+            "missing": missing, "reason": reason, "conflict": bool(is_conflict),
+            "confluences": _confluences(direction, bos_b, choch_b, confirm_eff,
+                                        vwap_side, zone_conf, sweep,
+                                        zone_mitigated=zone_mit,
+                                        confirmation_candle=confirm_candle),
+        }
+
+    directions = {"Long": _dir_block("Long"), "Short": _dir_block("Short")}
+
+    def _ret(d):
+        d["directions"] = directions
+        return d
+
+    # ── Conflict: full bullish AND bearish structure present → stand aside ──
+    if is_conflict:
+        return _ret({
+            "label": "WAIT", "direction": None, "score": 0,
+            "confluences": _confluences(None, True, True, True, False, False),
+            "reason": "Conflicting structure — both long and short fully confirmed. Stand aside.",
+            "missing": [],
+        })
+
     if long_gate:
         score = _score("Long", has_dem_confirm, nearest_demand)
         reason = (
@@ -2745,7 +2818,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             if long_struct else
             "Long confirmed — demand zone mitigated & retested, bullish reaction, CHOCH demand, price above VWAP."
         )
-        return {
+        return _ret({
             "label": "Strong Trade" if score >= 90 else "Possible Trade",
             "direction": "Long", "score": score,
             "confluences": _confluences("Long", has_bos_demand, has_choch_demand,
@@ -2754,18 +2827,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                                         confirmation_candle=has_bull_confirm),
             "reason": reason,
             "missing": [],
-        }
+        })
 
     if short_gate:
         score = _score("Short", has_sup_confirm, nearest_supply)
-        return {
+        return _ret({
             "label": "Strong Trade" if score >= 90 else "Possible Trade",
             "direction": "Short", "score": score,
             "confluences": _confluences("Short", True, True, True, True, has_sup_confirm, has_bear_sweep,
                                         confirmation_candle=has_bear_confirm),
             "reason": "Short confirmed — BOS supply, bearish CHOCH, 5m bearish candle, price below VWAP.",
             "missing": [],
-        }
+        })
 
     # ── Gate failed → WAIT. Report progress for the leading direction. ──
     long_present  = [has_bos_demand, has_choch_demand, has_bull_confirm, price_above]
@@ -2799,12 +2872,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                   f"{', '.join(missing) if missing else 'confluence'}.")
 
     score = round(sum(present) / 4 * 70)  # informational progress, always < 75 (WAIT)
-    return {
+    return _ret({
         "label": "WAIT", "direction": None, "score": score,
         "confluences": _confluences(lead, has_bos, has_choch, has_confirm, vwap_side, zone_conf),
         "reason": reason,
         "missing": missing,
-    }
+    })
 
 
 def build_strict_trade_plan(direction, ticker, current_price,
@@ -3109,6 +3182,54 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["edge_breakdown"]    = eb
     result["edge_score"]        = eb["score"]
     result["edge_grade"]        = eb["grade"]
+
+    # ── Per-direction Edge Scores (additive, display-only) ───────────────────
+    # The dashboard Long/Short toggle shows the bull case AND the bear case. The
+    # favored side REUSES the authoritative breakdown verbatim (guaranteed parity
+    # with edge_score above); the other side is scored from its own confluences
+    # with a WAIT state so it is never floored at 75. A conflict or a hard blocker
+    # (zone broken / consumed) zeros both sides — neither is tradeable.
+    dirs_raw = strict.get("directions") or {}
+    auth_dir = (result.get("confluences") or {}).get("direction")
+    blockers = bool(result.get("zone_broken_active") or result.get("zone_mitigated_near"))
+    out_dirs = {}
+    for _d in ("Long", "Short"):
+        block = dict(dirs_raw.get(_d) or {})
+        if block.get("conflict"):
+            block.update(
+                ready=False, label="WAIT", score=0,
+                edge_score=0, edge_grade=_grade_for_score(0),
+                edge_breakdown={
+                    "score": 0, "grade": _grade_for_score(0),
+                    "score_breakdown": [],
+                    "risk_adjustments": [{"label": "Conflicting structure — stand aside", "points": None}],
+                    "reasons": [], "risks": ["Conflicting structure — stand aside"],
+                },
+            )
+        elif _d == auth_dir:
+            # Mirror the authoritative final decision so the favored side is identical.
+            ready_dir = result["verdict"] in ("LONG READY", "SHORT READY")
+            block.update(
+                ready=bool(ready_dir),
+                label="READY" if ready_dir else "WAIT",
+                score=0 if blockers else result["strict_score"],
+                reason=result.get("strict_reason") or block.get("reason"),
+                edge_score=result["edge_score"],
+                edge_grade=result["edge_grade"],
+                edge_breakdown=result["edge_breakdown"],
+            )
+        else:
+            a_copy = dict(result)
+            a_copy["confluences"]      = block.get("confluences") or {}
+            a_copy["strict_direction"] = _d
+            a_copy["strict_label"]     = "WAIT"
+            a_copy["verdict"]          = "WAIT"
+            eb_d = _analysis_edge_breakdown(a_copy)
+            block.update(edge_score=eb_d["score"], edge_grade=eb_d["grade"], edge_breakdown=eb_d)
+            if blockers:
+                block.update(ready=False, label="WAIT", score=0)
+        out_dirs[_d] = block
+    result["directions"] = out_dirs
     return result
 
 
@@ -5312,6 +5433,7 @@ def status():
         "strict_reason":       a.get("strict_reason"),
         "strict_missing":      a.get("strict_missing"),
         "confluences":         a.get("confluences"),
+        "directions":          a.get("directions"),
         "vwap_value":          a.get("vwap_value"),
         "vwap_status":         a.get("vwap_status"),
         "vwap_source":         (VWAP_BY_TICKER.get(a.get("active_ticker")) or {}).get("source"),
@@ -5628,6 +5750,10 @@ def dashboard():
   .dir-btn{flex:1;padding:14px;border-radius:12px;border:2px solid #1e1e32;background:#12121e;font-size:16px;font-weight:700;cursor:pointer;transition:all .15s;color:#888}
   .dir-btn.long.active{border-color:#22c55e;color:#22c55e;background:#0d1f14}
   .dir-btn.short.active{border-color:#ef4444;color:#ef4444;background:#1f0d0d}
+  .dir-btn .rec-tag{display:none;font-size:10px;font-weight:800;letter-spacing:.5px;opacity:.9;margin-left:6px}
+  .dir-btn.long.rec{box-shadow:0 0 12px rgba(34,197,94,.55);border-color:#22c55e}
+  .dir-btn.short.rec{box-shadow:0 0 12px rgba(239,68,68,.55);border-color:#ef4444}
+  .dir-btn.rec .rec-tag{display:inline}
   /* Overrides */
   details{margin-bottom:16px}
   summary{font-size:13px;color:#555;cursor:pointer;padding:6px 0;user-select:none;list-style:none}
@@ -5739,8 +5865,8 @@ def dashboard():
 
 <!-- Direction -->
 <div class="dir-row">
-  <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG</div>
-  <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT</div>
+  <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
+  <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
 </div>
 
 <!-- Optional overrides -->
@@ -5780,6 +5906,7 @@ function setDir(d) {
   document.querySelectorAll('.dir-btn').forEach(b=>b.classList.remove('active'));
   document.querySelector('.dir-btn.'+(d==='Long'?'long':'short')).classList.add('active');
   updateEnterBtn();
+  renderDirView();   // instant: re-render the analysis panel for the selected side (no refetch)
 }
 function updateEnterBtn() {
   const b = document.getElementById('btn-enter');
@@ -5894,20 +6021,12 @@ async function refreshRec() {
     const d = await api('/status?ticker='+encodeURIComponent(sym));
     lastRec = d;
     if (d.trading_mode) paintMode(d.trading_mode);
-    const badge  = document.getElementById('rec-badge');
-    const meta   = document.getElementById('rec-meta');
-    const bar    = document.getElementById('rec-score-bar');
-    const num    = document.getElementById('rec-score-num');
-    const list   = document.getElementById('rec-checklist');
-    const planEl = document.getElementById('rec-plan');
-    const reason = document.getElementById('rec-reason');
-    const apply  = document.getElementById('btn-apply');
-    const card   = document.getElementById('rec-card');
+    const badge = document.getElementById('rec-badge');
+    const meta  = document.getElementById('rec-meta');
+    const card  = document.getElementById('rec-card');
 
+    // ── Authoritative header (the system's single call) — toggle-independent ──
     const v = d.verdict || 'WAIT';
-    const ready = v === 'LONG READY' || v === 'SHORT READY';
-    const dirReady = v === 'LONG READY' ? 'Long' : v === 'SHORT READY' ? 'Short' : null;
-
     badge.textContent = v;
     badge.className = 'rec-badge ' + (v==='LONG READY'?'ready-long':v==='SHORT READY'?'ready-short':'wait');
     card.style.borderColor = v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b':'#1e1e32';
@@ -5931,36 +6050,75 @@ async function refreshRec() {
     }
     meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b> &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt;
 
-    const score = d.edge_score!=null ? d.edge_score : 0;
-    const grade = d.edge_grade ? ' · ' + d.edge_grade : '';
-    bar.style.width = score + '%';
-    bar.style.background = score>=90 ? '#22c55e' : score>=75 ? '#a0a8ff' : '#f59e0b';
-    num.textContent = 'Edge ' + score + '/100' + grade + ' · ' + (d.strict_label||'WAIT');
+    // Mark the recommended toggle button (the system's READY side) — no auto-switch.
+    const readyDir = v==='LONG READY' ? 'Long' : v==='SHORT READY' ? 'Short' : null;
+    const lb = document.querySelector('.dir-btn.long');
+    const sb = document.querySelector('.dir-btn.short');
+    if (lb) lb.classList.toggle('rec', readyDir==='Long');
+    if (sb) sb.classList.toggle('rec', readyDir==='Short');
 
-    const c = d.confluences || {};
-    const ld = (d.strict_direction || c.direction || dirReady || '').toString();
-    const isShort = ld === 'Short';
-    list.innerHTML =
-      ckItem('BOS '+(isShort?'Supply':'Demand'), !!c.bos) +
-      ckItem((isShort?'Bearish':'Bullish')+' CHOCH', !!c.choch) +
-      ckItem('5m '+(isShort?'Bearish':'Bullish')+' Candle', !!c.confirmation) +
-      ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!c.vwap);
-
-    const tp = d.trade_plan || {};
-    if (ready && tp.trade_plan) {
-      planEl.style.display = 'block';
-      planEl.innerHTML =
-        'Entry <b>'+tp.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_loss+'</b><br>' +
-        'T1 <b>'+tp.target1+'</b> &nbsp;·&nbsp; T2 <b>'+tp.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(tp.rr!=null?tp.rr:'—')+'</b>';
-      apply.style.display = 'block';
-    } else {
-      planEl.style.display = 'none';
-      apply.style.display = 'none';
-    }
-
-    reason.textContent = d.strict_reason || '';
+    // Per-direction body driven by the current toggle.
+    renderDirView();
     markUpdated();
   } catch(e) {}
+}
+
+// Render the checklist + edge score + plan/reason for the CURRENTLY SELECTED
+// direction (the Long/Short toggle). Reads lastRec.directions[dir]; falls back to
+// the authoritative favored block if directions is missing (older server).
+function renderDirView() {
+  if (!lastRec) return;
+  const d = lastRec;
+  const bar    = document.getElementById('rec-score-bar');
+  const num    = document.getElementById('rec-score-num');
+  const list   = document.getElementById('rec-checklist');
+  const planEl = document.getElementById('rec-plan');
+  const reason = document.getElementById('rec-reason');
+  const apply  = document.getElementById('btn-apply');
+  if (!bar) return;
+
+  const isShort = dir === 'Short';
+  const blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
+
+  // Checklist for the selected side.
+  const ck = (blk && blk.checklist) ? blk.checklist : (d.confluences || {});
+  list.innerHTML =
+    ckItem('BOS '+(isShort?'Supply':'Demand'), !!ck.bos) +
+    ckItem((isShort?'Bearish':'Bullish')+' CHOCH', !!ck.choch) +
+    ckItem('5m '+(isShort?'Bearish':'Bullish')+' Candle', !!ck.confirmation) +
+    ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap);
+
+  // Per-direction Edge Score.
+  const score = blk && blk.edge_score!=null ? blk.edge_score
+              : (d.edge_score!=null ? d.edge_score : 0);
+  const grade = blk && blk.edge_grade ? ' · ' + blk.edge_grade
+              : (d.edge_grade ? ' · ' + d.edge_grade : '');
+  const label = blk ? (blk.label || 'WAIT') : (d.strict_label || 'WAIT');
+  const met   = blk && blk.met!=null ? ' · ' + blk.met + '/4' : '';
+  bar.style.width = score + '%';
+  bar.style.background = score>=90 ? '#22c55e' : score>=75 ? '#a0a8ff' : '#f59e0b';
+  num.textContent = dir + ' Edge ' + score + '/100' + grade + ' · ' + label + met;
+
+  // Trade plan + Apply only when the SELECTED side is the one the system says READY.
+  const readyDir = d.verdict==='LONG READY' ? 'Long' : d.verdict==='SHORT READY' ? 'Short' : null;
+  const tp = d.trade_plan || {};
+  if (readyDir === dir && tp.trade_plan) {
+    planEl.style.display = 'block';
+    planEl.innerHTML =
+      'Entry <b>'+tp.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_loss+'</b><br>' +
+      'T1 <b>'+tp.target1+'</b> &nbsp;·&nbsp; T2 <b>'+tp.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(tp.rr!=null?tp.rr:'—')+'</b>';
+    apply.style.display = 'block';
+  } else {
+    planEl.style.display = 'none';
+    apply.style.display = 'none';
+  }
+
+  // Reason for the selected side; nudge to the ready side when viewing the other.
+  let txt = (blk && blk.reason) ? blk.reason : (d.strict_reason || '');
+  if (readyDir && readyDir !== dir) {
+    txt = '↪ System says ' + d.verdict + ' — switch to ' + readyDir + ' for the live setup.  ' + txt;
+  }
+  reason.textContent = txt;
 }
 
 function applyRec() {
