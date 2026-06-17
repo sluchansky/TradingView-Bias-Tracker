@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import threading
+import queue
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -4963,6 +4964,119 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
 # Routes
 # ---------------------------------------------------------------------------
 
+def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
+                           account_size, risk_pct, profile_name):
+    """Heavy webhook tail (analysis + journaling + Discord) run OFF the request
+    thread so TradingView gets a fast ack and never times out. All state this job
+    reads (ALERT_HISTORY, zone flags, CURRENT_PRICE/VWAP) is committed
+    synchronously before the job is queued; the per-alert price is passed in
+    explicitly so late processing still scores against the correct price."""
+    global ACTIVE_TRADE
+
+    a = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst)
+
+    # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
+    # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
+    # False (handled as a LONG above) and falls through to the READY-card path. ──
+    if a.get("zone_mitigated_near"):
+        _mz_price = a.get("mitigated_zone_price")
+        send_zone_mitigated_message(record, _mz_price)
+        logger.info("Zone mitigated (unconfirmed) — %s — scoring skipped", normalized)
+        return
+
+    # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
+    _risk_mult = (cfg("RISK_MULT_ATTEMPT")
+                  if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
+                  else 1.0)
+    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
+
+    # ── Active trade: check events (T1 / T2 / Stop lifecycle alerts) ──
+    if ACTIVE_TRADE and parsed_price is not None:
+        events = check_trade_events(ACTIVE_TRADE, parsed_price)
+        for event in events:
+            send_trade_event_message(event, ACTIVE_TRADE, parsed_price)
+            if event == "T1_HIT":
+                ACTIVE_TRADE["t1_hit"] = True
+                ACTIVE_TRADE["status"] = "breakeven"
+                ACTIVE_TRADE["suggested_stop"] = ACTIVE_TRADE["entry_price"]
+                _update_journal_outcome("T1 Hit — Partial ⚠️")
+            elif event == "T2_HIT":
+                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
+                _update_journal_outcome("Win — T2 Hit ✅", pnl_dollars=d_pnl)
+                ACTIVE_TRADE = None
+                break
+            elif event == "STOP_HIT":
+                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
+                _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
+                ACTIVE_TRADE = None
+                break
+
+    # ── Trading Journal + live alert ───────────────────────────────────────────
+    # The main alert channel now receives the same clean trade-card as the
+    # journal, but ONLY when a brand-new setup is READY. create_journal_entry()
+    # returns the entry just once per setup (deduped), so this fires the instant
+    # alert exactly once on the triggering webhook; _trade_ready_loop() then
+    # re-posts the card every 5 min while the setup stays READY.
+    # Fail-open: journaling/enrichment + the live card must never crash the worker.
+    try:
+        journal_entry = create_journal_entry(record, a, sizing)
+        if (journal_entry and not ACTIVE_TRADE
+                and a.get("verdict") in ("LONG READY", "SHORT READY")):
+            send_live_ready_card(journal_entry,
+                                 record.get("ticker") or record.get("instrument")
+                                 or journal_entry.get("instrument"),
+                                 notify=True)
+    except Exception as exc:
+        logger.error("Journal/live-card path error (alert still recorded): %s", exc)
+
+    logger.info(
+        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
+        normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
+        a["recommendation"], a["verdict"], a["structure_class"], a["risk_label"],
+    )
+
+
+# ── Asynchronous webhook processing ──────────────────────────────────────────
+# TradingView aborts a webhook if the server does not respond quickly ("request
+# took too long and timed out"). The analysis itself is in-memory/fast, but the
+# Discord POSTs in the tail (journal + live card, each up to 5-10 s) can stack
+# and blow past that timeout. So the request thread does only the fast, in-memory
+# state commit (record + zone flags + price/VWAP) and then hands the heavy tail
+# to a single background worker, returning an immediate ack. The worker is
+# serialized (one job at a time, FIFO) so concurrent alerts (e.g. MGC + MNQ on
+# the same bar) never race on shared state.
+_WEBHOOK_JOBS          = queue.Queue()
+_WEBHOOK_WORKER_LOCK   = threading.Lock()
+_WEBHOOK_WORKER_THREAD = None
+
+
+def _webhook_worker():
+    while True:
+        job = _WEBHOOK_JOBS.get()
+        try:
+            _process_webhook_alert(**job)
+        except Exception as exc:
+            logger.error("Webhook background processing failed: %s", exc)
+        finally:
+            _WEBHOOK_JOBS.task_done()
+
+
+def _ensure_webhook_worker():
+    """Start the background worker on first use (idempotent, thread-safe). Lazy
+    start keeps module import side-effect-free and works regardless of how Flask
+    is launched (python app.py or a WSGI server)."""
+    global _WEBHOOK_WORKER_THREAD
+    if _WEBHOOK_WORKER_THREAD is not None and _WEBHOOK_WORKER_THREAD.is_alive():
+        return
+    with _WEBHOOK_WORKER_LOCK:
+        if _WEBHOOK_WORKER_THREAD is not None and _WEBHOOK_WORKER_THREAD.is_alive():
+            return
+        _WEBHOOK_WORKER_THREAD = threading.Thread(
+            target=_webhook_worker, name="webhook-worker", daemon=True)
+        _WEBHOOK_WORKER_THREAD.start()
+        logger.info("Webhook background worker started")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, ZONE_MITIGATED_FLAG
@@ -5140,114 +5254,28 @@ def webhook():
         except (ValueError, TypeError):
             risk_pct = DEFAULT_RISK_PCT
 
-    a = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst)
-
-    # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
-    # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
-    # False (handled as a LONG above) and falls through to the READY-card path. ──
-    if a.get("zone_mitigated_near"):
-        _mz_price = a.get("mitigated_zone_price")
-        send_zone_mitigated_message(record, _mz_price)
-        logger.info("Zone mitigated (unconfirmed) — %s — scoring skipped", normalized)
-        return jsonify({
-            "status":       "zone_mitigated",
-            "alert_type":   normalized,
-            "ticker":       record.get("ticker"),
-            "price":        parsed_price or CURRENT_PRICE,
-            "mitigated_at": _mz_price,
-            "verdict":      "WAIT",
-            "zone_status":  "Consumed / Mitigated",
-            "action":       "Wait for fresh supply or demand zone.",
-            "reason":       "Zone already reacted and is no longer valid for entry.",
-        }), 200
-
-    # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
-    _risk_mult = (cfg("RISK_MULT_ATTEMPT")
-                  if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
-                  else 1.0)
-    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
-
-    # ── Active trade: check events (T1 / T2 / Stop lifecycle alerts) ──
-    if ACTIVE_TRADE and parsed_price is not None:
-        events = check_trade_events(ACTIVE_TRADE, parsed_price)
-        for event in events:
-            send_trade_event_message(event, ACTIVE_TRADE, parsed_price)
-            if event == "T1_HIT":
-                ACTIVE_TRADE["t1_hit"] = True
-                ACTIVE_TRADE["status"] = "breakeven"
-                ACTIVE_TRADE["suggested_stop"] = ACTIVE_TRADE["entry_price"]
-                _update_journal_outcome("T1 Hit — Partial ⚠️")
-            elif event == "T2_HIT":
-                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
-                _update_journal_outcome("Win — T2 Hit ✅", pnl_dollars=d_pnl)
-                ACTIVE_TRADE = None
-                break
-            elif event == "STOP_HIT":
-                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
-                _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
-                ACTIVE_TRADE = None
-                break
-
-    # ── Trading Journal + live alert ───────────────────────────────────────────
-    # The main alert channel now receives the same clean trade-card as the
-    # journal, but ONLY when a brand-new setup is READY. create_journal_entry()
-    # returns the entry just once per setup (deduped), so this fires the instant
-    # alert exactly once on the triggering webhook; _trade_ready_loop() then
-    # re-posts the card every 5 min while the setup stays READY.
-    # Fail-open: journaling/enrichment + the live card must never crash the webhook
-    # or block the alert from being recorded. The alert is already in ALERT_HISTORY
-    # above, so a failure here is logged and the webhook still returns OK.
-    try:
-        journal_entry = create_journal_entry(record, a, sizing)
-        if (journal_entry and not ACTIVE_TRADE
-                and a.get("verdict") in ("LONG READY", "SHORT READY")):
-            send_live_ready_card(journal_entry,
-                                 record.get("ticker") or record.get("instrument")
-                                 or journal_entry.get("instrument"),
-                                 notify=True)
-    except Exception as exc:
-        logger.error("Journal/live-card path error (alert still recorded): %s", exc)
-
-    logger.info(
-        "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s",
-        normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
-        a["recommendation"], a["verdict"], a["structure_class"], a["risk_label"],
-    )
+    # ── Hand the heavy tail (analysis + journaling + Discord) to the background
+    # worker and ack immediately so TradingView never times out. Every piece of
+    # state the job needs has been committed synchronously above (ALERT_HISTORY,
+    # zone flags, price/VWAP); the per-alert price is passed explicitly. ──
+    _ensure_webhook_worker()
+    _WEBHOOK_JOBS.put({
+        "record":        record,
+        "parsed_price":  parsed_price,
+        "resolved_inst": resolved_inst,
+        "normalized":    normalized,
+        "account_size":  account_size,
+        "risk_pct":      risk_pct,
+        "profile_name":  profile_name,
+    })
 
     return jsonify({
-        "status":           "ok",
-        "alert_type":       normalized,
-        "verdict":          a["verdict"],
-        "recommendation":   a["recommendation"],
-        "reasoning_chain":    a["reasoning_chain"],
-        "setup_stage":        a["setup_stage"],
-        "stage_next_step":    a["stage_next_step"],
-        "stage_entry_rule":   a["stage_entry_rule"],
-        "stage_invalidation": a["stage_invalidation"],
-        "market_direction":   a["market_direction"],
-        "trade_opportunity":  a["trade_opportunity"],
-        "opportunity_reason": a["opportunity_reason"],
-        "trade_plan":         a["trade_plan"],
-        "sizing":             sizing,
-        "why":                a["why"],
-        "bias":             a["bias"],
-        "strength":         a["strength"],
-        "confidence":       f"{a['confidence']}%",
-        "edge_score":       a["edge_score"],
-        "trade_quality":    a["quality"],
-        "bullish_score":    a["bullish"],
-        "bearish_score":    a["bearish"],
-        "market_structure": a["structure_label"],
-        "structure_class":  a["structure_class"],
-        "risk_zone":        a["risk_label"],
-        "risk_detail":      a["risk_detail"],
-        "current_price":    a["current_price"],
-        "nearest_supply":   a["nearest_supply"],
-        "nearest_demand":   a["nearest_demand"],
-        "longs_allowed":    a["plan"]["longs_allowed"],
-        "shorts_allowed":   a["plan"]["shorts_allowed"],
-        "action":           a["plan"]["action"],
-        "total_alerts":     len(ALERT_HISTORY),
+        "status":       "accepted",
+        "alert_type":   normalized,
+        "ticker":       record.get("ticker"),
+        "instrument":   resolved_inst,
+        "queued":       True,
+        "total_alerts": len(ALERT_HISTORY),
     }), 200
 
 
@@ -6264,6 +6292,7 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL
     threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()  # re-post READY card every 5 min
