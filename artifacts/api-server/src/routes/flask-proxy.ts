@@ -37,6 +37,13 @@ function proxyToFlask(req: any, res: any) {
     res.status(proxyRes.statusCode ?? 200);
     const ct = proxyRes.headers["content-type"];
     if (ct) res.set("content-type", ct);
+    // Forward Flask's caching directives. The /dashboard route serves inline JS
+    // that changes on every deploy and must be served no-store, otherwise the
+    // browser can run a stale cached dashboard and appear "frozen" on toggles.
+    for (const h of ["cache-control", "pragma", "expires"]) {
+      const v = proxyRes.headers[h];
+      if (v) res.set(h, Array.isArray(v) ? v.join(", ") : v);
+    }
     proxyRes.pipe(res);
   });
 

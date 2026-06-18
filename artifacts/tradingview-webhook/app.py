@@ -8900,7 +8900,7 @@ function toast(msg, ok=true) {
 }
 
 async function api(path, body=null) {
-  const opts = { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'} };
+  const opts = { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'}, cache: 'no-store' };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(BASE+path, opts);
   return r.json();
@@ -9665,7 +9665,15 @@ setInterval(checkStale, 2000);
 </script>
 </body>
 </html>"""
-    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+    return html, 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        # The dashboard is a live view whose inline JS changes on every deploy.
+        # Without this, a browser can serve a stale cached copy of the dashboard
+        # (old toggle/poll wiring) and appear "frozen" on pair/direction switch.
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
 
 
 @app.route("/ping", methods=["GET", "POST", "HEAD"])
