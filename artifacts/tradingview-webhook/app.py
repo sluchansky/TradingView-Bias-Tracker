@@ -4358,9 +4358,9 @@ def send_trade_event_message(event_type, trade, current_price):
     dollar_pnl, pts_pnl = compute_pnl(trade, current_price)
     pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
     msgs = {
-        "T1_HIT":   (f"🎯 **T1 HIT**\n"
-                     f"{pnl_str}\n"
-                     f"Move Stop to Break Even"),
+        "T1_HIT":   (f"✅ **T1 HIT — WIN**\n"
+                     f"Trade Closed\n"
+                     f"{pnl_str}"),
         "T2_HIT":   (f"🎯🎯 **T2 HIT**\n"
                      f"Trade Closed\n"
                      f"{pnl_str}"),
@@ -5068,9 +5068,9 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None):
 # *managed trade* keyed by (instrument, direction, entry-zone low, UTC date). A
 # background pass — piggybacking the VWAP auto-fetch loop — pulls the latest
 # 1-minute bar (high/low/close) from the same public feed and walks the trade
-# through its plan: TP1 → breakeven → partial → TP2 → TP3, or stop/invalidation.
-# Each level fires a Discord update exactly once; the terminal exit posts an
-# outcome card and writes Result / R / MFE / MAE back to the journal entry.
+# to its first terminal level: TP1 reached = Win, stop breached = Loss (the stop
+# is checked first so an ambiguous bar resolves against the trade). The terminal
+# exit posts an outcome card and writes Result / R / MFE / MAE to the journal.
 #
 # This NEVER touches the manual ACTIVE_TRADE flow, the READY gate, throttling,
 # or the existing cards. Every entry point is wrapped in try/except so a feed
@@ -5186,15 +5186,15 @@ def _watch_managed_trades():
 def _evaluate_managed_trade_levels(mt, bar):
     """Walk one managed trade through its plan using a single OHLC bar.
 
-    Terminal precedence is conservative: the stop / breakeven exit is checked
-    *before* targets so an ambiguous bar resolves against the trade. Each level
-    fires its Discord update once (deduped via mt['events_sent'])."""
+    Win/loss definition: a WIN is booked the moment TP1 is reached; a LOSS the
+    moment the stop is breached. The stop is checked *before* TP1 so an ambiguous
+    bar (whose range spans both levels) resolves conservatively against the trade.
+    """
     if mt.get("closed"):
         return
     high, low = bar["high"], bar["low"]
     entry   = mt.get("entry")
     is_long = mt["direction"] == "Long"
-    sent    = mt["events_sent"]
 
     # ── Running MFE / MAE (price points, never negative) ──
     if entry is not None:
@@ -5205,46 +5205,21 @@ def _evaluate_managed_trade_levels(mt, bar):
         mt["mfe"] = round(max(mt["mfe"], fav, 0.0), 4)
         mt["mae"] = round(max(mt["mae"], adv, 0.0), 4)
 
-    # Effective stop: original until TP1, then breakeven (entry) afterwards.
-    eff_stop = entry if (mt.get("be_active") and entry is not None) else mt.get("stop")
-
-    # ── 1) Terminal stop / breakeven exit (checked first; conservative) ──
-    if eff_stop is not None:
-        stop_breached = (low <= eff_stop) if is_long else (high >= eff_stop)
+    # ── 1) Terminal stop (checked first; an ambiguous bar resolves against the trade) ──
+    stop = mt.get("stop")
+    if stop is not None:
+        stop_breached = (low <= stop) if is_long else (high >= stop)
         if stop_breached:
-            if mt.get("be_active"):
-                _close_managed_trade(mt, "Breakeven",
-                                     "Breakeven (stop moved to BE after TP1)", eff_stop)
-            else:
-                _close_managed_trade(mt, "Loss", "Loss (stop hit)", eff_stop)
+            _close_managed_trade(mt, "Loss", "Loss (stop hit)", stop)
             return
 
-    # ── 2) Targets in plan order ──
-    def _reached(level):
-        if level is None:
-            return False
-        return (high >= level) if is_long else (low <= level)
-
-    if "TP1" not in sent and _reached(mt.get("tp1")):
-        sent.add("TP1")
-        mt["be_active"] = True
-        _send_management_update(mt, "🎯 TP1 hit",
-                                f"Target 1 reached at `{mt.get('tp1')}`. Stop moves to breakeven.")
-
-    if "PARTIAL" not in sent and _reached(mt.get("partial")):
-        sent.add("PARTIAL")
-        _send_management_update(mt, "💰 Partial zone",
-                                f"Partial profit zone reached at `{mt.get('partial')}`.")
-
-    if "TP2" not in sent and _reached(mt.get("tp2")):
-        sent.add("TP2")
-        _send_management_update(mt, "🎯 TP2 hit",
-                                f"Target 2 reached at `{mt.get('tp2')}`. Trail the runner toward TP3.")
-
-    if "TP3" not in sent and _reached(mt.get("tp3")):
-        sent.add("TP3")
-        _close_managed_trade(mt, "Win", "Win (TP3 / runner target)", mt.get("tp3"))
-        return
+    # ── 2) Win: TP1 reached closes the trade as a Win ──
+    tp1 = mt.get("tp1")
+    if tp1 is not None:
+        tp1_reached = (high >= tp1) if is_long else (low <= tp1)
+        if tp1_reached:
+            _close_managed_trade(mt, "Win", "Win (TP1 hit)", tp1)
+            return
 
 
 def _close_managed_trade(mt, outcome, result_label, exit_price):
@@ -7062,26 +7037,21 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                   else 1.0)
     sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
 
-    # ── Active trade: check events (T1 / T2 / Stop lifecycle alerts) ──
+    # ── Active trade: a WIN is booked the moment T1 is hit; stop = loss. ──
+    # check_trade_events returns STOP_HIT exclusively, or one/both of T1/T2 — so
+    # stop and targets never co-occur in one call. Stop takes precedence.
     if ACTIVE_TRADE and parsed_price is not None:
         events = check_trade_events(ACTIVE_TRADE, parsed_price)
-        for event in events:
-            send_trade_event_message(event, ACTIVE_TRADE, parsed_price)
-            if event == "T1_HIT":
-                ACTIVE_TRADE["t1_hit"] = True
-                ACTIVE_TRADE["status"] = "breakeven"
-                ACTIVE_TRADE["suggested_stop"] = ACTIVE_TRADE["entry_price"]
-                _update_journal_outcome("T1 Hit — Partial ⚠️")
-            elif event == "T2_HIT":
-                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
-                _update_journal_outcome("Win — T2 Hit ✅", pnl_dollars=d_pnl)
-                ACTIVE_TRADE = None
-                break
-            elif event == "STOP_HIT":
-                d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
-                _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
-                ACTIVE_TRADE = None
-                break
+        if "STOP_HIT" in events:
+            send_trade_event_message("STOP_HIT", ACTIVE_TRADE, parsed_price)
+            d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
+            _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
+            ACTIVE_TRADE = None
+        elif "T1_HIT" in events or "T2_HIT" in events:
+            send_trade_event_message("T1_HIT", ACTIVE_TRADE, parsed_price)
+            d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
+            _update_journal_outcome("Win — T1 Hit ✅", pnl_dollars=d_pnl)
+            ACTIVE_TRADE = None
 
     # ── Trading Journal + live alert ───────────────────────────────────────────
     # The main alert channel now receives the same clean trade-card as the
