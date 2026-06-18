@@ -7628,6 +7628,11 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
   h1{font-size:18px;font-weight:700;color:#a0a8ff;letter-spacing:.5px;margin:8px 0 2px}
   .sub{font-size:12px;color:#666;margin-bottom:16px}
   .cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+  /* Verdict + Why/Reason share one row: 50/50, equal height, side by side on
+     desktop & tablet; stacks only on small mobile. */
+  .verdict-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px;align-items:stretch}
+  .verdict-row .card{min-width:0}
+  @media (max-width:560px){.verdict-row{grid-template-columns:1fr}}
   .card{background:#12121e;border:1px solid #1e1e32;border-radius:12px;padding:12px 14px;min-width:140px;flex:1}
   .card .k{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#666;margin-bottom:6px}
   .card .v{font-size:20px;font-weight:800}
@@ -7647,6 +7652,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <a class="back" href="/api/dashboard">&larr; Back to dashboard</a>
 <h1>Diagnostics</h1>
 <div class="sub">Per-evaluation timing &amp; volatility for the last <span id="cap">100</span> scored alerts &middot; auto-refresh 1s &middot; <span id="updated" class="muted"></span></div>
+<div class="verdict-row" id="verdict-row"></div>
 <div class="cards" id="summary"></div>
 <div class="wrap">
 <table>
@@ -7750,13 +7756,17 @@ async function refresh(){
   var rrKeys=Object.keys(rrLabel).sort(function(a,b){return (rr[b]||0)-(rr[a]||0);});
   var rrTxt=rrKeys.map(function(k){return rrLabel[k]+' ('+(rr[k]||0)+')';}).join(', ');
   var sum=document.getElementById('summary');
+  var vr=document.getElementById('verdict-row');
   var e=evals.length?evals[0]:null;
   var ready=!!(e&&(e.verdict||'').indexOf('READY')>=0);
   var sinceTxt=fmtAgo(st.timeSinceLastWebhookSec);
   var staleWh=(st.timeSinceLastWebhookSec==null||st.timeSinceLastWebhookSec>900);
-  sum.innerHTML=
+  // Verdict (left) + Why/Reason (right) live in their own 50/50 row so the
+  // trade decision and its explanation are always visible together.
+  vr.innerHTML=
     card('Latest verdict', e?(e.verdict||'-'):'-', ready?'good':'muted')+
-    card('Latest WAIT reason', e?(ready?'\u2014 ready \u2014':(e.waitReason||e.gateBlockers||'-')):'-', 'sm '+(ready?'good':'warn'))+
+    card('Latest WAIT reason', e?(ready?'\u2014 ready \u2014':(e.waitReason||e.gateBlockers||'-')):'-', 'sm '+(ready?'good':'warn'));
+  sum.innerHTML=
     card('Webhooks received', (c.webhooks_received!=null?c.webhooks_received:'-'), 'muted')+
     card('Evaluations run', (c.evaluations_run!=null?c.evaluations_run:'-'), 'muted')+
     card('READY setups', (c.ready_setups_detected!=null?c.ready_setups_detected:'-'), (c.ready_setups_detected>0?'good':'muted'))+
