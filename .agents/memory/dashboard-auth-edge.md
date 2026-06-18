@@ -52,6 +52,8 @@ password-protected:** TradingView alerts can only set URL + message body — no 
 HTTP header — so HTTP Basic Auth is impossible on this path; the only real lock is a
 shared secret embedded in the alert JSON body. The dashboard ENTER button still posts
 to the protected `/enter` (human path stays locked); only the machine/TradingView path
-is open. **Reminder:** "entering a trade" only records ACTIVE_TRADE in-memory + posts
-Discord — there is NO real broker/order execution anywhere (every `requests.post` in
-app.py targets Discord). Live order execution would be a separate broker integration.
+is open. **Reminder:** "entering a trade" via ENTER/CLOSE only records ACTIVE_TRADE
+in-memory + posts Discord — it is NOT broker execution. The ONE real money-moving path
+is the owner-only `/traderspost` route (→ TradersPost → Tradovate); see
+`traderspost-order-safety.md` for its invariants. It is protected at the Express edge
+(not in OPEN_PATHS) exactly like `/enter`.

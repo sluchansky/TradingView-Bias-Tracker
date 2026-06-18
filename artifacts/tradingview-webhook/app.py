@@ -518,6 +518,14 @@ TRADERSPOST_TICKER = {
     "MGC": (os.environ.get("TRADERSPOST_TICKER_MGC", "").strip() or "MGC"),
     "MNQ": (os.environ.get("TRADERSPOST_TICKER_MNQ", "").strip() or "MNQ"),
 }
+# Hard safety rails for the (only) money-moving path. The contract count is capped
+# server-side — the browser min/step is NOT a control — and a short per-instrument
+# cooldown collapses accidental double-taps / client retries of the SAME setup into
+# a single live order. Both are env-overridable.
+TRADERSPOST_MAX_CONTRACTS = max(1, int(os.environ.get("TRADERSPOST_MAX_CONTRACTS", 10)))
+TRADERSPOST_COOLDOWN_SEC  = max(0, int(os.environ.get("TRADERSPOST_COOLDOWN_SEC", 60)))
+_TRADERSPOST_LOCK = threading.Lock()
+_TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-send guard
 
 # ── Live-instance gate ────────────────────────────────────────────────────────
 # The Discord webhook secrets are shared between the Replit workspace (dev) and
@@ -8270,50 +8278,89 @@ def traderspost_order():
                         "reason": "TradersPost is not configured (missing TRADERSPOST_WEBHOOK_URL)."}), 400
 
     data = request.get_json(force=True, silent=True) or {}
-    try:
-        contracts = max(1, int(data.get("contracts", 1)))
-    except (ValueError, TypeError):
-        contracts = 1
 
-    # Resolve the setup: explicit entry/stop/t1/t2 win; otherwise pull the active
-    # READY plan for the selected instrument (mirrors /enter's resolution).
-    if data.get("entry"):
-        try:
-            direction = str(data.get("direction", "Long"))
-            entry     = float(data["entry"])
-            stop      = float(data["stop"])
-            t1        = float(data["t1"])
-            t2        = float(data["t2"])
-        except (KeyError, ValueError, TypeError) as exc:
-            return jsonify({"status": "error", "reason": str(exc)}), 400
-        profile    = str(data.get("profile", DEFAULT_PROFILE))
-        instrument = instrument_of(data.get("ticker") or profile)
+    # Contract count is the ONLY user-supplied input and it is capped server-side —
+    # the browser min/step is not a control. Reject non-integer / out-of-range.
+    try:
+        contracts = int(data.get("contracts", 1))
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "reason": "contracts must be a whole number."}), 400
+    if contracts < 1 or contracts > TRADERSPOST_MAX_CONTRACTS:
+        return jsonify({"status": "error",
+                        "reason": f"contracts must be between 1 and {TRADERSPOST_MAX_CONTRACTS}."}), 400
+
+    # The instrument MUST be explicitly and unambiguously MGC or MNQ — a money-moving
+    # route never silently falls back to the active/default instrument.
+    _raw = (data.get("ticker") or "").upper()
+    if "MGC" in _raw and "MNQ" not in _raw:
+        instrument = "MGC"
+    elif "MNQ" in _raw and "MGC" not in _raw:
+        instrument = "MNQ"
     else:
-        _raw = (data.get("ticker") or "").upper()
-        _tk  = instrument_of(_raw) if ("MGC" in _raw or "MNQ" in _raw) else None
-        a  = full_analysis(ticker_override=_tk)
-        tp = a["trade_plan"]
-        if not tp.get("trade_plan") or not tp.get("entry_zone"):
-            return jsonify({"status": "error",
-                            "reason": "No ready setup. Trigger a Long Ready / Short Ready setup first."}), 400
-        try:
-            zone = str(tp["entry_zone"])
-            if "–" in zone:
-                lo_s, hi_s = zone.split("–")
-                entry     = (float(lo_s) + float(hi_s)) / 2
-            else:
-                entry     = float(zone)
-            stop      = float(tp["stop_loss"])
-            t1        = float(tp["target1"])
-            t2        = float(tp["target2"])
-            direction = str(tp["direction"])
-        except (ValueError, TypeError, KeyError) as exc:
-            return jsonify({"status": "error", "reason": str(exc)}), 400
-        profile    = str(data.get("profile", DEFAULT_PROFILE))
-        instrument = instrument_of(a.get("active_ticker") or data.get("ticker") or profile)
+        return jsonify({"status": "error",
+                        "reason": "A valid instrument ticker (MGC or MNQ) is required."}), 400
+
+    # Resolve the live setup SERVER-SIDE only. We never trust client-supplied
+    # entry/stop/targets/direction for a money-moving order — every price and the
+    # direction come from the authoritative full_analysis() for the instrument.
+    a = full_analysis(ticker_override=instrument)
+    verdict = str(a.get("verdict", ""))
+
+    # Authoritative READY gate — mirrors EXACTLY what makes the dashboard button
+    # appear, so an authenticated POST can't bypass the UI. Market-closed can leave
+    # trade_plan populated while neutralizing the verdict, so check both.
+    if a.get("market_open") is False:
+        return jsonify({"status": "error",
+                        "reason": "Market is closed — live orders are paused."}), 409
+    if not is_actionable(verdict):
+        return jsonify({"status": "error",
+                        "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}), 409
+
+    tp = a["trade_plan"]
+    if not tp.get("trade_plan") or not tp.get("entry_zone"):
+        return jsonify({"status": "error",
+                        "reason": "Ready verdict but no trade plan — refusing to send."}), 409
+
+    # Direction comes from the verdict and must agree with the plan, or we refuse.
+    direction = ready_direction(verdict)
+    if direction is None or str(tp.get("direction", "")).lower() != direction.lower():
+        return jsonify({"status": "error",
+                        "reason": "Setup direction is ambiguous — refusing to send."}), 409
+
+    try:
+        zone = str(tp["entry_zone"])
+        if "–" in zone:
+            lo_s, hi_s = zone.split("–")
+            entry = (float(lo_s) + float(hi_s)) / 2
+        else:
+            entry = float(zone)
+        stop = float(tp["stop_loss"])
+        t1   = float(tp["target1"])
+        t2   = float(tp["target2"])
+    except (ValueError, TypeError, KeyError) as exc:
+        return jsonify({"status": "error", "reason": f"Could not read trade plan: {exc}"}), 400
 
     tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
-    action    = "buy" if str(direction).lower().startswith("l") else "sell"
+    action    = "buy" if direction.lower().startswith("l") else "sell"
+
+    # Duplicate-send guard: collapse accidental double-taps / client retries of the
+    # SAME setup into one live order. Reserve the slot BEFORE sending so two
+    # concurrent requests can't both pass; roll it back if the send never lands.
+    fingerprint = f"{instrument}:{action}:{round(entry, 1)}:{round(stop, 1)}:{round(t1, 1)}"
+    now = time.time()
+    with _TRADERSPOST_LOCK:
+        prev = _TRADERSPOST_LAST.get(instrument)
+        if prev and prev[0] == fingerprint and (now - prev[1]) < TRADERSPOST_COOLDOWN_SEC:
+            return jsonify({"status": "error",
+                            "reason": (f"Duplicate order suppressed — the same {instrument} setup was sent "
+                                       f"{int(now - prev[1])}s ago (cooldown {TRADERSPOST_COOLDOWN_SEC}s).")}), 429
+        _TRADERSPOST_LAST[instrument] = (fingerprint, now)
+
+    def _release_slot():
+        # Nothing was placed at the broker — free the cooldown so a retry is allowed.
+        with _TRADERSPOST_LOCK:
+            if _TRADERSPOST_LAST.get(instrument) == (fingerprint, now):
+                _TRADERSPOST_LAST.pop(instrument, None)
 
     # TradersPost MARKET order (no "price" field) + bracket: the exchange-bound
     # protective stop is the plan's stop_loss; the first target is the limit exit.
@@ -8327,16 +8374,32 @@ def traderspost_order():
         "takeProfit": {"limitPrice": round(t1, 2)},
     }
 
+    # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
+    # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
+    # send-side exception (timeout / read error / connection reset / refused) and every
+    # 5xx/3xx is AMBIGUOUS — we can't prove the bytes never reached TradersPost, so the
+    # order may already be live — so we keep the cooldown and make the owner verify at
+    # the broker. Never silently allow a duplicate live order.
     try:
         resp = requests.post(TRADERSPOST_WEBHOOK_URL, json=payload, timeout=10)
     except requests.RequestException as exc:
-        logger.warning("TradersPost send failed: %s", exc)
-        return jsonify({"status": "error", "reason": f"TradersPost request failed: {exc}"}), 502
-
-    if not (200 <= resp.status_code < 300):
-        logger.warning("TradersPost rejected order: %s %s", resp.status_code, resp.text[:300])
+        logger.warning("TradersPost ambiguous send error — cooldown held: %s", exc)
         return jsonify({"status": "error",
-                        "reason": f"TradersPost returned {resp.status_code}: {resp.text[:200]}"}), 502
+                        "reason": (f"TradersPost did not confirm ({exc}). The order MAY have been placed — "
+                                   "check your broker before retrying.")}), 502
+
+    if 200 <= resp.status_code < 300:
+        pass  # success — fall through to confirmation
+    elif 400 <= resp.status_code < 500:
+        _release_slot()
+        logger.warning("TradersPost rejected order (no order placed): %s %s", resp.status_code, resp.text[:300])
+        return jsonify({"status": "error",
+                        "reason": f"TradersPost rejected the order ({resp.status_code}): {resp.text[:200]}"}), 502
+    else:
+        logger.warning("TradersPost ambiguous response — cooldown held: %s %s", resp.status_code, resp.text[:300])
+        return jsonify({"status": "error",
+                        "reason": (f"TradersPost returned {resp.status_code}. The order MAY have been placed — "
+                                   "check your broker before retrying.")}), 502
 
     content = (
         f"🚀 **ORDER SENT → TradersPost — {direction.upper()}**\n"
@@ -9525,7 +9588,7 @@ async function sendOrder() {
   const btn = document.getElementById('btn-send');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
   try {
-    const d = await api('/traderspost', { ticker: inst+'1!', profile: inst+' Standard', contracts: qty });
+    const d = await api('/traderspost', { ticker: inst+'1!', contracts: qty });
     if (d.status === 'sent') toast('🚀 Order sent to TradersPost');
     else toast('Error: ' + (d.reason || d.status), false);
   } catch(e) { toast('Request failed', false); }
