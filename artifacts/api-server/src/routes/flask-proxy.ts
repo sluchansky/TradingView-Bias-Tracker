@@ -56,6 +56,7 @@ router.all(
     "/ping",
     "/webhook",
     "/enter",
+    "/traderspost",
     "/breakeven",
     "/close",
     "/trade",

@@ -503,6 +503,22 @@ DISCORD_APLUS_WEBHOOK_URL   = os.environ.get("DISCORD_APLUS_WEBHOOK_URL", "")
 # (e.g. "<@123456789012345678>") to ping just yourself. Blank = no ping at all.
 DISCORD_ALERT_MENTION       = os.environ.get("DISCORD_ALERT_MENTION", "@everyone").strip()
 
+# ── TradersPost (broker bridge) ───────────────────────────────────────────────
+# One-tap order routing. The dashboard "Send order" button POSTs to the protected
+# /traderspost route, which forwards a MARKET order (with a stop-loss + first-target
+# bracket) to this TradersPost strategy webhook; TradersPost routes it to the
+# connected broker (Tradovate for Apex/Tradeify). Unset = feature OFF (the dashboard
+# hides the button and the route returns a 400). This is the ONLY broker-bound
+# request in the app — every other requests.post targets Discord.
+TRADERSPOST_WEBHOOK_URL = os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()
+# The webhook "ticker" must match what the TradersPost subscription expects. Default
+# to the root symbol (MGC / MNQ); override per instrument if the broker symbol differs
+# (e.g. a dated/continuous contract) via TRADERSPOST_TICKER_MGC / TRADERSPOST_TICKER_MNQ.
+TRADERSPOST_TICKER = {
+    "MGC": (os.environ.get("TRADERSPOST_TICKER_MGC", "").strip() or "MGC"),
+    "MNQ": (os.environ.get("TRADERSPOST_TICKER_MNQ", "").strip() or "MNQ"),
+}
+
 # ── Live-instance gate ────────────────────────────────────────────────────────
 # The Discord webhook secrets are shared between the Replit workspace (dev) and
 # the published deployment (prod). Both run this exact file, so without a gate the
@@ -8153,6 +8169,7 @@ def status():
         "last_valid_time":     a.get("last_valid_time"),
         "discord_configured":      bool(DISCORD_WEBHOOK_URL),
         "mnq_discord_configured":  bool(DISCORD_MNQ_WEBHOOK_URL),
+        "traderspost_configured":  bool(TRADERSPOST_WEBHOOK_URL),
     }), 200
 
 
@@ -8235,6 +8252,112 @@ def enter_trade():
 
     logger.info("Trade entered: %s @ %.1f", direction, entry)
     return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+
+
+@app.route("/traderspost", methods=["POST"])
+def traderspost_order():
+    """One-tap LIVE order → TradersPost (broker bridge to Tradovate).
+
+    Sends a MARKET order with a protective stop-loss + first-target bracket.
+    Owner-only: auth is enforced at the Express /api edge — this route is NOT in
+    OPEN_PATHS, so it requires the dashboard password + same-origin, exactly like
+    /enter. This is the ONLY broker-bound requests.post in this file (every other
+    one targets Discord): it fails CLOSED when unconfigured and never auto-sizes —
+    the contract quantity is always owner-supplied (default 1).
+    """
+    if not TRADERSPOST_WEBHOOK_URL:
+        return jsonify({"status": "error",
+                        "reason": "TradersPost is not configured (missing TRADERSPOST_WEBHOOK_URL)."}), 400
+
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        contracts = max(1, int(data.get("contracts", 1)))
+    except (ValueError, TypeError):
+        contracts = 1
+
+    # Resolve the setup: explicit entry/stop/t1/t2 win; otherwise pull the active
+    # READY plan for the selected instrument (mirrors /enter's resolution).
+    if data.get("entry"):
+        try:
+            direction = str(data.get("direction", "Long"))
+            entry     = float(data["entry"])
+            stop      = float(data["stop"])
+            t1        = float(data["t1"])
+            t2        = float(data["t2"])
+        except (KeyError, ValueError, TypeError) as exc:
+            return jsonify({"status": "error", "reason": str(exc)}), 400
+        profile    = str(data.get("profile", DEFAULT_PROFILE))
+        instrument = instrument_of(data.get("ticker") or profile)
+    else:
+        _raw = (data.get("ticker") or "").upper()
+        _tk  = instrument_of(_raw) if ("MGC" in _raw or "MNQ" in _raw) else None
+        a  = full_analysis(ticker_override=_tk)
+        tp = a["trade_plan"]
+        if not tp.get("trade_plan") or not tp.get("entry_zone"):
+            return jsonify({"status": "error",
+                            "reason": "No ready setup. Trigger a Long Ready / Short Ready setup first."}), 400
+        try:
+            zone = str(tp["entry_zone"])
+            if "–" in zone:
+                lo_s, hi_s = zone.split("–")
+                entry     = (float(lo_s) + float(hi_s)) / 2
+            else:
+                entry     = float(zone)
+            stop      = float(tp["stop_loss"])
+            t1        = float(tp["target1"])
+            t2        = float(tp["target2"])
+            direction = str(tp["direction"])
+        except (ValueError, TypeError, KeyError) as exc:
+            return jsonify({"status": "error", "reason": str(exc)}), 400
+        profile    = str(data.get("profile", DEFAULT_PROFILE))
+        instrument = instrument_of(a.get("active_ticker") or data.get("ticker") or profile)
+
+    tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
+    action    = "buy" if str(direction).lower().startswith("l") else "sell"
+
+    # TradersPost MARKET order (no "price" field) + bracket: the exchange-bound
+    # protective stop is the plan's stop_loss; the first target is the limit exit.
+    payload = {
+        "ticker":     tp_symbol,
+        "action":     action,
+        "quantity":   contracts,
+        "sentiment":  "bullish" if action == "buy" else "bearish",
+        "signal":     "AI Trading Partner READY",
+        "stopLoss":   {"type": "stop", "stopPrice": round(stop, 2)},
+        "takeProfit": {"limitPrice": round(t1, 2)},
+    }
+
+    try:
+        resp = requests.post(TRADERSPOST_WEBHOOK_URL, json=payload, timeout=10)
+    except requests.RequestException as exc:
+        logger.warning("TradersPost send failed: %s", exc)
+        return jsonify({"status": "error", "reason": f"TradersPost request failed: {exc}"}), 502
+
+    if not (200 <= resp.status_code < 300):
+        logger.warning("TradersPost rejected order: %s %s", resp.status_code, resp.text[:300])
+        return jsonify({"status": "error",
+                        "reason": f"TradersPost returned {resp.status_code}: {resp.text[:200]}"}), 502
+
+    content = (
+        f"🚀 **ORDER SENT → TradersPost — {direction.upper()}**\n"
+        f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
+        f"Stop `{stop:.1f}`  ·  T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`"
+    )
+    try:
+        _url = _discord_url(instrument)
+        if _url:
+            requests.post(_url, json={"content": content}, timeout=5)
+    except requests.RequestException:
+        pass
+
+    logger.info("TradersPost order sent: %s %s x%d @ market (stop %.1f, t1 %.1f)",
+                tp_symbol, action, contracts, stop, t1)
+    return jsonify({
+        "status": "sent",
+        "order":  {"ticker": tp_symbol, "action": action, "quantity": contracts,
+                   "direction": direction, "type": "market",
+                   "stopLoss": stop, "takeProfit": t1, "target2": t2},
+    }), 200
 
 
 @app.route("/breakeven", methods=["POST"])
@@ -8578,6 +8701,13 @@ def dashboard():
   <div id="rec-reason" class="rec-reason"></div>
   <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
   <button class="btn btn-apply" id="btn-copy" style="display:none;margin-top:6px" onclick="copyOrder()">📋 Copy Order</button>
+  <div id="send-row" style="display:none;margin-top:6px">
+    <button class="btn btn-apply" id="btn-send" style="background:#3a1d6e;border-color:#5b2da8;color:#ece6ff" onclick="sendOrder()">🚀 Send order to broker</button>
+    <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px;color:#8a93a6;font-size:12px">
+      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#0e0e18;border:1px solid #1e1e32;border-radius:6px;color:#e8e8f0;padding:4px 6px;font-size:13px">
+      <span style="color:#6b7280">· market order via TradersPost</span>
+    </div>
+  </div>
 </div>
 
 <!-- Diagnostics modules (feed off alert_diagnostics) -->
@@ -9142,6 +9272,7 @@ function renderDirView() {
   const reason = document.getElementById('rec-reason');
   const apply  = document.getElementById('btn-apply');
   const copyBtn = document.getElementById('btn-copy');
+  const sendRow = document.getElementById('send-row');
   if (!bar) return;
 
   // Market closed — paused, neutral body (no checklist / score / plan / apply).
@@ -9159,6 +9290,7 @@ function renderDirView() {
     if (planEl) planEl.style.display = 'none';
     if (apply)  apply.style.display = 'none';
     if (copyBtn) copyBtn.style.display = 'none';
+    if (sendRow) sendRow.style.display = 'none';
     if (reason) reason.textContent = d.strict_reason || 'Market closed — live alerts paused.';
     return;
   }
@@ -9216,10 +9348,12 @@ function renderDirView() {
         : '');
     apply.style.display = 'block';
     if (copyBtn) copyBtn.style.display = 'block';
+    if (sendRow) sendRow.style.display = d.traderspost_configured ? 'block' : 'none';
   } else {
     planEl.style.display = 'none';
     apply.style.display = 'none';
     if (copyBtn) copyBtn.style.display = 'none';
+    if (sendRow) sendRow.style.display = 'none';
   }
 
   // Reason for the selected side; nudge to the ready side when viewing the other.
@@ -9368,6 +9502,36 @@ async function copyOrder() {
   } catch(e) { toast('Copy failed — long-press to copy', false); }
 }
 
+// One-tap LIVE order → TradersPost (broker bridge). Only visible when a setup is
+// READY for the selected side AND TradersPost is configured server-side. Sends just
+// the instrument + contract count; the server resolves the live plan, enforces the
+// ready guard, and forwards a MARKET order (+ stop/target bracket) to the broker.
+async function sendOrder() {
+  if (!lastRec) { toast('No ready setup', false); return; }
+  const tp = lastRec.trade_plan || {};
+  const rd = jsReadyDir(lastRec.verdict);
+  if (!rd || !tp.trade_plan) { toast('No ready setup to send', false); return; }
+  if (!lastRec.traderspost_configured) { toast('TradersPost not configured', false); return; }
+  const inst = (lastRec.active_ticker || '').toString().replace('1!','') || sym;
+  let qty = parseInt(document.getElementById('snd-qty').value, 10);
+  if (!qty || qty < 1) qty = 1;
+  const entry = _planMidEntry(tp);
+  const msg = 'Send LIVE market order to TradersPost?\\n\\n'
+    + inst + ' ' + rd.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
+    + '\\nEntry ~' + (entry!=null?entry:'market')
+    + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
+    + '   T1 ' + (tp.target1!=null?tp.target1:'—');
+  if (!confirm(msg)) return;
+  const btn = document.getElementById('btn-send');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
+  try {
+    const d = await api('/traderspost', { ticker: inst+'1!', profile: inst+' Standard', contracts: qty });
+    if (d.status === 'sent') toast('🚀 Order sent to TradersPost');
+    else toast('Error: ' + (d.reason || d.status), false);
+  } catch(e) { toast('Request failed', false); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send order to broker'; } }
+}
+
 let lastUpdateTs = 0;
 function markUpdated() {
   lastUpdateTs = Date.now();
@@ -9481,6 +9645,7 @@ def index():
             "GET /status":     "Full analysis with verdict and reasoning chain",
             "GET|POST /mode":  "Read or switch trading mode (SCALP / SWING)",
             "POST /enter":     "Open an active trade (uses current trade plan or explicit params)",
+            "POST /traderspost": "Send a one-tap market order (+ bracket) to TradersPost (broker bridge)",
             "POST /breakeven": "Move stop loss to entry price",
             "POST /close":     "Close the active trade manually",
             "GET /trade":      "Show active trade status and live PnL",
