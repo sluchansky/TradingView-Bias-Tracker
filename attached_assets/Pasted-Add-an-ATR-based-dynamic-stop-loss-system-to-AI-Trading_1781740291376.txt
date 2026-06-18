@@ -1,0 +1,101 @@
+Add an ATR-based dynamic stop loss system to AI Trading Partner.
+
+Problem:
+The current stop-loss logic is too tight and does not reflect current volatility. Example on MGC: entry around 4293 with stop around 4295. That is only about 20 ticks / $2.00 on gold and can easily get hit by normal market noise.
+
+Goal:
+Replace fixed/tight stop logic with adaptive stops based on ATR + market structure.
+
+Requirements:
+
+1. Add ATR Stop Loss using ATR(14)
+
+Use ATR(14) to calculate dynamic stop distance.
+
+Scalp Mode:
+stopDistance = ATR * 1.0
+
+Normal Intraday Mode:
+stopDistance = ATR * 1.5
+
+High Volatility Mode:
+stopDistance = ATR * 2.0
+
+2. Combine ATR with market structure
+
+Do not use ATR alone. Final stop must consider the nearest valid demand/supply zone.
+
+For LONG setups:
+
+structureStop = nearestDemandLow
+atrStop = entry - (atr * multiplier)
+stopLoss = Math.min(structureStop, atrStop)
+
+For SHORT setups:
+
+structureStop = nearestSupplyHigh
+atrStop = entry + (atr * multiplier)
+stopLoss = Math.max(structureStop, atrStop)
+
+The final stop should be beyond the nearest supply/demand structure and account for current volatility.
+
+3. Add minimum stop distance protection
+
+Never allow stops that are unrealistically tight.
+
+For MGC:
+minimumStopTicks = 50
+
+For MNQ:
+minimumStopTicks = configurable
+
+Final stop distance should be:
+
+stopDistanceTicks = Math.max(calculatedStopDistanceTicks, minimumStopTicks)
+
+Then calculate final stop from entry based on trade direction.
+
+4. Add stop diagnostics
+
+Display this in diagnostics:
+
+ATR(14):
+ATR Multiplier:
+Current Volatility:
+Nearest Demand/Supply:
+Structure Stop:
+ATR Stop:
+Minimum Stop Ticks:
+Final Stop:
+Stop Distance Ticks:
+Risk $ Per Contract:
+Risk/Reward Ratio:
+
+5. Add stop info to READY alerts
+
+Example READY LONG alert:
+
+READY LONG
+Entry: 4293.00
+Stop: 4286.00
+Target 1: 4300.00
+Target 2: 4307.00
+ATR: 4.2
+ATR Multiplier: 1.5x
+Stop Distance: 70 ticks
+Risk Per Contract: $70
+Risk/Reward: 2.8R
+
+Reason:
+Liquidity sweep completed
+Bullish CHOCH confirmed
+Demand zone holding
+VWAP reclaimed
+
+6. Safety rules
+
+Do not allow LONG stop loss above entry.
+Do not allow SHORT stop loss below entry.
+Do not create READY trades if stop loss is invalid.
+If structure stop is missing, fall back to ATR stop + minimum stop distance.
+If ATR is missing or stale, display WAIT with reason: ATR stop data unavailable.

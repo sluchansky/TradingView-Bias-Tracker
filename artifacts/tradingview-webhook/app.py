@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 import logging
 import threading
 import queue
@@ -239,6 +240,10 @@ MODES = {
         # Tiered WATCH/ARMED early alerts (SCALP only — fire before a full READY).
         "ENABLE_TIERED_ALERTS":     True,
         "WATCH_ARMED_COOLDOWN_SEC": 900,
+        # Dynamic ATR stops widen the stop, which lowers the fixed-target R:R. SCALP
+        # no longer hard-blocks a setup purely because TP2 < 1:2 — R:R is displayed,
+        # not gated. (Set True to restore the strict ">= 1:2 on TP2 or no trade" veto.)
+        "ENFORCE_MIN_RR":           False,
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -275,6 +280,8 @@ MODES = {
         "CONFLICT_DOMINANT_GAP":  0,
         "ENABLE_TIERED_ALERTS":     False,
         "WATCH_ARMED_COOLDOWN_SEC": 900,
+        # SWING keeps the original strict "TP2 must be >= 1:2 R:R or no trade" veto.
+        "ENFORCE_MIN_RR":           True,
     },
 }
 
@@ -328,11 +335,22 @@ MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 1
 
 # ── Per-instrument trade specs (strict-recommendation ruleset) ──────────────
 #   tp1 / tp2 / tp3 = fixed target distances in price points from the entry zone
-#   stop_buf    = stop distance beyond the demand/supply zone (price points)
+#   stop_buf    = buffer placed BEYOND the demand/supply zone for the structure stop
 #   point_value = $ per point per contract  (MNQ Micro Nasdaq = $2, MGC Micro Gold = $10)
+#   tick_size   = minimum price increment (MGC 0.1, MNQ 0.25)
+#   min_stop_ticks = floor on the dynamic-stop distance so it can never be
+#                    unrealistically tight (MGC 50, MNQ 40 — both env-overridable)
+def _spec_int_env(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
 INSTRUMENT_SPECS = {
-    "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0},
-    "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0},
+    "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
+            "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40)},
+    "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
+            "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50)},
 }
 
 def instrument_of(ticker):
@@ -2039,6 +2057,11 @@ def _trade_plan_fields(tp, sizing=None):
                 f"**Target 1:** {tp['target1']}\n"
                 f"**Target 2:** {tp['target2']}\n"
                 f"**R:R** {tp['rr']}"
+                + (
+                    f"\n**ATR Stop:** {tp.get('atr_pts')} pts × {tp.get('atr_multiplier')} → "
+                    f"{tp.get('stop_distance_ticks')} ticks (${tp.get('risk_dollars_per_contract')}/contract)"
+                    if tp.get("atr_pts") is not None else ""
+                )
             ),
             "inline": False,
         }
@@ -3518,12 +3541,114 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     })
 
 
-def build_strict_trade_plan(direction, ticker, current_price,
-                            nearest_supply, nearest_demand):
-    """Fixed-target plan per instrument. Stop sits beyond the demand/supply zone.
+def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
+                       ticker, volatility, mode=None):
+    """ATR(14)-based dynamic stop, blended with the nearest demand/supply structure.
 
-    MNQ TP1/TP2 = 20/40 pts, MGC = 5/10 pts. Enforces a minimum 1:2 R:R on TP2;
-    returns a no-plan dict if R:R can't be met or the anchoring zone is missing.
+    The final stop is the WIDER of two candidates — never tighter:
+      • atrStop       = entry ∓ (ATR × multiplier)
+      • structureStop = nearest_demand − stop_buf (Long) / nearest_supply + stop_buf (Short)
+    then floored at the instrument's `min_stop_ticks` so it can never be
+    unrealistically tight, and snapped to whole ticks.
+
+    Multiplier precedence — VOLATILITY WINS over trading mode:
+      2.0 when the regime is elevated/extreme (HIGH_CAUTION / HIGH_BLOCK),
+      else 1.0 in SCALP, else 1.5 (normal intraday / SWING).
+
+    FAIL-CLOSED at the trade-plan layer only: returns {"ok": False, "reason": ...}
+    when the ATR reading needed to size the stop is missing/stale, or when the
+    resulting stop would violate a directional safety rule. (The volatility GATE's
+    scoring stays fail-open elsewhere — this gate is execution safety, not scoring.)
+    """
+    spec = spec_for(ticker)
+    tick      = spec["tick_size"]
+    pv        = spec["point_value"]
+    buf       = spec["stop_buf"]
+    min_ticks = int(spec["min_stop_ticks"])
+
+    vol = volatility or {}
+    atr = vol.get("atr_pts")
+    if vol.get("status") != "ok" or atr is None:
+        return {"ok": False, "reason": "ATR stop data unavailable"}
+    try:
+        atr = float(atr)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "ATR stop data unavailable"}
+    if atr <= 0:
+        return {"ok": False, "reason": "ATR stop data unavailable"}
+
+    # ── Multiplier (volatility wins over mode) ──
+    regime = vol.get("regime")
+    mode   = (mode or TRADING_MODE)
+    if regime in ("HIGH_CAUTION", "HIGH_BLOCK"):
+        mult = 2.0
+    elif mode == "SCALP":
+        mult = 1.0
+    else:
+        mult = 1.5
+
+    atr_dist = atr * mult
+    if direction == "Long":
+        atr_stop = entry - atr_dist
+        structure_stop = (nearest_demand - buf) if nearest_demand is not None else None
+        # Whichever sits FURTHER BELOW entry = the safer, wider stop.
+        calc_stop = min(atr_stop, structure_stop) if structure_stop is not None else atr_stop
+    else:  # Short
+        atr_stop = entry + atr_dist
+        structure_stop = (nearest_supply + buf) if nearest_supply is not None else None
+        # Whichever sits FURTHER ABOVE entry.
+        calc_stop = max(atr_stop, structure_stop) if structure_stop is not None else atr_stop
+
+    calc_dist  = abs(entry - calc_stop)
+    calc_ticks = (calc_dist / tick) if tick else 0.0
+    # Snap UP to whole ticks (never tighter than calculated), then apply the floor.
+    final_ticks = max(math.ceil(calc_ticks - 1e-9), min_ticks)
+    final_dist  = final_ticks * tick
+    final_stop  = (entry - final_dist) if direction == "Long" else (entry + final_dist)
+
+    # ── Safety: the stop must sit on the correct side of entry ──
+    if direction == "Long" and not (final_stop < entry):
+        return {"ok": False, "reason": "Computed stop is not below entry (Long safety)."}
+    if direction == "Short" and not (final_stop > entry):
+        return {"ok": False, "reason": "Computed stop is not above entry (Short safety)."}
+
+    risk_points = abs(entry - final_stop)
+    if risk_points <= 0:
+        return {"ok": False, "reason": "Invalid stop distance."}
+
+    return {
+        "ok":                  True,
+        "multiplier":          mult,
+        "atr_pts":             round(atr, 4),
+        "atr_stop":            round(atr_stop, 4),
+        "structure_stop":      (round(structure_stop, 4) if structure_stop is not None else None),
+        "calculated_stop":     round(calc_stop, 4),
+        "calculated_ticks":    round(calc_ticks, 2),
+        "min_stop_ticks":      min_ticks,
+        "tick_size":           tick,
+        "stop_distance_ticks": int(final_ticks),
+        "final_stop":          round(final_stop, 4),
+        "risk_points":         round(risk_points, 4),
+        "risk_dollars":        round(risk_points * pv, 2),
+        "regime":              regime,
+        "vol_label":           vol.get("label"),
+        "vol_ratio":           vol.get("ratio"),
+        "nearest_demand":      nearest_demand,
+        "nearest_supply":      nearest_supply,
+        "min_floor_applied":   final_ticks > math.ceil(calc_ticks - 1e-9),
+    }
+
+
+def build_strict_trade_plan(direction, ticker, current_price,
+                            nearest_supply, nearest_demand,
+                            volatility=None, mode=None):
+    """Fixed-target plan per instrument with an ATR(14)-based DYNAMIC stop.
+
+    Targets stay fixed (MNQ TP1/TP2/TP3 = 20/40/60 pts, MGC = 5/10/15). The stop is
+    sized by `_dynamic_stop_plan` — ATR×multiplier blended with the nearest zone and
+    floored at the instrument's min stop ticks. Returns a no-plan dict if the
+    anchoring zone is missing, the ATR reading needed to size the stop is
+    unavailable, or (SWING / ENFORCE_MIN_RR) the fixed TP2 can't make 1:2.
     """
     spec = spec_for(ticker)
     inst = instrument_of(ticker)
@@ -3539,29 +3664,45 @@ def build_strict_trade_plan(direction, ticker, current_price,
                 # Additive management keys kept present (None) for reader parity.
                 "target3": None, "be_level": None, "partial_level": None,
                 "runner_target": None, "risk_points": None, "reward_points": None,
-                "rr_num": None, "max_invalidation": None, "management": None}
+                "rr_num": None, "max_invalidation": None, "management": None,
+                # Additive ATR-stop metadata kept present (None) for reader parity.
+                "atr_pts": None, "atr_multiplier": None, "atr_stop": None,
+                "structure_stop": None, "calculated_stop": None,
+                "min_stop_ticks": None, "tick_size": None,
+                "stop_distance_ticks": None, "risk_dollars_per_contract": None,
+                "nearest_demand": nearest_demand, "nearest_supply": nearest_supply,
+                "volatility_regime": None, "volatility_label": None,
+                "min_floor_applied": None}
 
     if direction == "Long":
         anchor = nearest_demand
         if anchor is None:
             return no_plan("No demand zone to anchor the entry.")
         lo, hi = anchor, anchor + buf
-        stop   = anchor - buf
         t1, t2, t3 = anchor + tp1d, anchor + tp2d, anchor + tp3d
     else:  # Short
         anchor = nearest_supply
         if anchor is None:
             return no_plan("No supply zone to anchor the entry.")
         lo, hi = anchor - buf, anchor
-        stop   = anchor + buf
         t1, t2, t3 = anchor - tp1d, anchor - tp2d, anchor - tp3d
 
-    entry  = (lo + hi) / 2
-    risk   = abs(entry - stop)
+    entry = (lo + hi) / 2
+
+    # ── ATR(14)-based dynamic stop (replaces the old fixed anchor ± buf stop) ──
+    sp = _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
+                            ticker, volatility, mode)
+    if not sp["ok"]:
+        # ATR unavailable / safety violation → no trade plan (caller maps to WAIT).
+        return no_plan(sp["reason"])
+    stop = sp["final_stop"]
+    risk = sp["risk_points"]
     if risk <= 0:
         return no_plan("Invalid stop distance.")
     r1, r2 = abs(t1 - entry) / risk, abs(t2 - entry) / risk
-    if r2 < 2.0:
+    # Wider ATR stops lower the fixed-target R:R. SCALP displays R:R instead of
+    # gating on it; SWING (ENFORCE_MIN_RR) keeps the strict ">= 1:2 on TP2" veto.
+    if cfg("ENFORCE_MIN_RR") and r2 < 2.0:
         return no_plan(f"Stop distance {risk:.1f} pts makes fixed TP2 only {r2:.1f}R (min 1:2).")
 
     # ── Additive trade-management plan (does NOT alter the existing fields) ──
@@ -3578,7 +3719,7 @@ def build_strict_trade_plan(direction, ticker, current_price,
                     f"{zone_word} zone invalidates the setup.")
     return {
         "trade_plan": True,
-        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} / TP3 {tp3d:g} pts), stop beyond zone.",
+        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} / TP3 {tp3d:g} pts), ATR-dynamic stop.",
         "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
         "stop_loss":  fmt(stop),
         "target1":    fmt(t1),
@@ -3596,7 +3737,23 @@ def build_strict_trade_plan(direction, ticker, current_price,
         "reward_points":    round(reward, 2),
         "rr_num":           round(rr_runner, 2),
         "max_invalidation": invalidation,
-        # Numeric snapshot consumed by the trade-management watcher.
+        # ── Additive ATR dynamic-stop metadata (display/diagnostics; single source) ──
+        "atr_pts":                   sp["atr_pts"],
+        "atr_multiplier":            sp["multiplier"],
+        "atr_stop":                  fmt(sp["atr_stop"]),
+        "structure_stop":            (fmt(sp["structure_stop"]) if sp["structure_stop"] is not None else None),
+        "calculated_stop":           fmt(sp["calculated_stop"]),
+        "min_stop_ticks":            sp["min_stop_ticks"],
+        "tick_size":                 sp["tick_size"],
+        "stop_distance_ticks":       sp["stop_distance_ticks"],
+        "risk_dollars_per_contract": sp["risk_dollars"],
+        "nearest_demand":            nearest_demand,
+        "nearest_supply":            nearest_supply,
+        "volatility_regime":         sp["regime"],
+        "volatility_label":          sp["vol_label"],
+        "min_floor_applied":         sp["min_floor_applied"],
+        # Numeric snapshot consumed by the trade-management watcher. Stop/risk come
+        # from the FINAL dynamic stop only (no drift vs the displayed stop).
         "management": {
             "direction": direction, "instrument": inst, "point_value": pv,
             "entry": round(entry, 4), "entry_lo": round(lo, 4), "entry_hi": round(hi, 4),
@@ -3709,7 +3866,8 @@ def full_analysis(current_price_override=None, ticker_override=None):
 
     if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
         trade_plan = build_strict_trade_plan(
-            strict_direction, active_ticker, current_price, nearest_supply, nearest_demand
+            strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
+            volatility=volatility, mode=TRADING_MODE,
         )
         if trade_plan["trade_plan"]:
             # EARLY READY (SCALP Edge 35-49) is actionable but labelled lower
@@ -4272,6 +4430,11 @@ def _build_trade_card_embed(entry, footer_text):
         if rp is not None and rwp is not None:
             rr_txt = f" · R:R {rrn}R" if rrn is not None else ""
             mgmt_lines.append(f"⚖️ Risk: {rp} pts · Reward: {rwp} pts{rr_txt}")
+        if entry.get("atr_pts") is not None:
+            mgmt_lines.append(
+                f"📏 ATR Stop: {entry.get('atr_pts')} pts × {entry.get('atr_multiplier')} "
+                f"→ {entry.get('stop_distance_ticks')} ticks "
+                f"(${entry.get('risk_dollars_per_contract')}/contract)")
         if entry.get("max_invalidation"):
             mgmt_lines.append(f"🚫 Invalidation: {entry['max_invalidation']}")
         if mgmt_lines:
@@ -5881,6 +6044,19 @@ def _build_card_entry(a, ticker=None, record=None):
         "rr_num":           tp.get("rr_num"),
         "max_invalidation": tp.get("max_invalidation"),
         "management_plan":  tp.get("management"),
+        # ── Additive ATR dynamic-stop metadata (single source = the trade plan) ──
+        "atr_pts":                   tp.get("atr_pts"),
+        "atr_multiplier":            tp.get("atr_multiplier"),
+        "atr_stop":                  tp.get("atr_stop"),
+        "structure_stop":            tp.get("structure_stop"),
+        "calculated_stop":           tp.get("calculated_stop"),
+        "min_stop_ticks":            tp.get("min_stop_ticks"),
+        "tick_size":                 tp.get("tick_size"),
+        "stop_distance_ticks":       tp.get("stop_distance_ticks"),
+        "risk_dollars_per_contract": tp.get("risk_dollars_per_contract"),
+        "volatility_regime":         tp.get("volatility_regime"),
+        "volatility_label":          tp.get("volatility_label"),
+        "min_floor_applied":         tp.get("min_floor_applied"),
         "bos_type":         bos_type,
         "choch_type":       choch_type,
         "bos_level":        bos_level,
@@ -6303,6 +6479,37 @@ def _vol_diag_detail(vol):
     ]
 
 
+def _stop_diag_lines(tp):
+    """Human-readable ATR dynamic-stop breakdown for the owner-only /diagnostics
+    text view. `tp` is a build_strict_trade_plan result dict; lines are emitted
+    only when ATR stop metadata is present (additive / display-only — never used
+    by the trade decision)."""
+    tp = tp or {}
+
+    def _n(x):
+        if x is None:
+            return "—"
+        try:
+            return "%g" % float(x)
+        except (TypeError, ValueError):
+            return str(x)
+    return [
+        "    currentATR ........... %s pts" % _n(tp.get("atr_pts")),
+        "    atrMultiplier ........ %sx" % _n(tp.get("atr_multiplier")),
+        "    nearestDemand ........ %s" % _n(tp.get("nearest_demand")),
+        "    nearestSupply ........ %s" % _n(tp.get("nearest_supply")),
+        "    structureStop ........ %s" % _n(tp.get("structure_stop")),
+        "    atrStop .............. %s" % _n(tp.get("atr_stop")),
+        "    minStopTicks ......... %s%s" % (
+            _n(tp.get("min_stop_ticks")),
+            " (FLOOR APPLIED)" if tp.get("min_floor_applied") else ""),
+        "    finalStop ............ %s" % _n(tp.get("stop_loss")),
+        "    stopDistanceTicks .... %s" % _n(tp.get("stop_distance_ticks")),
+        "    riskPerContract ...... $%s" % _n(tp.get("risk_dollars_per_contract")),
+        "    riskReward ........... %s" % _n(tp.get("rr")),
+    ]
+
+
 def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
                            extra_blockers=None, vol=None):
     """Human-readable per-gate PASS/FAIL block for one scored webhook. `gd` is the
@@ -6451,6 +6658,9 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     else:
         direction = None
     setup_type = signal_type or (a or {}).get("setup_stage") or (a or {}).get("structure_class")
+    _eval_tp = (a or {}).get("trade_plan") or {}
+    if not isinstance(_eval_tp, dict):
+        _eval_tp = {}
     if webhook_received_at is not None and eval_finished_at is not None:
         total_latency_ms = round((eval_finished_at - webhook_received_at).total_seconds() * 1000.0, 3)
     else:
@@ -6475,6 +6685,18 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         "volatilityMultiplier": vol.get("ratio"),
         "volatilityThreshold":  vol.get("threshold_extreme"),
         "volatilityDecision":   vol.get("decision"),
+        # ── ATR dynamic-stop breakdown (single source = this eval's trade plan) ──
+        "atrMultiplier":          _eval_tp.get("atr_multiplier"),
+        "nearestDemand":          _eval_tp.get("nearest_demand"),
+        "nearestSupply":          _eval_tp.get("nearest_supply"),
+        "structureStop":          _eval_tp.get("structure_stop"),
+        "atrStop":                _eval_tp.get("atr_stop"),
+        "minStopTicks":           _eval_tp.get("min_stop_ticks"),
+        "stopDistanceTicks":      _eval_tp.get("stop_distance_ticks"),
+        "finalStop":              _eval_tp.get("stop_loss"),
+        "riskDollarsPerContract": _eval_tp.get("risk_dollars_per_contract"),
+        "riskReward":             _eval_tp.get("rr"),
+        "minFloorApplied":        _eval_tp.get("min_floor_applied"),
         # ── Context ──
         "instrument":           instrument,
         "verdict":              (a or {}).get("verdict"),
@@ -6840,6 +7062,9 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         _diag = format_gate_diagnostic(resolved_inst, normalized, _candidate, _gd,
                                        a["verdict"], extra_blockers=_extra,
                                        vol=a.get("volatility"))
+        _tp_diag = a.get("trade_plan")
+        if isinstance(_tp_diag, dict) and _tp_diag.get("atr_pts") is not None:
+            _diag += "\n  ATR dynamic stop —\n" + "\n".join(_stop_diag_lines(_tp_diag))
         logger.info("Gate diagnostic —\n%s", _diag)
         _record_diagnostic(_diag)
     except Exception as exc:
@@ -8688,7 +8913,10 @@ function renderDirView() {
     planEl.style.display = 'block';
     planEl.innerHTML =
       'Entry <b>'+tp.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_loss+'</b><br>' +
-      'T1 <b>'+tp.target1+'</b> &nbsp;·&nbsp; T2 <b>'+tp.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(tp.rr!=null?tp.rr:'—')+'</b>';
+      'T1 <b>'+tp.target1+'</b> &nbsp;·&nbsp; T2 <b>'+tp.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(tp.rr!=null?tp.rr:'—')+'</b>' +
+      (tp.atr_pts!=null
+        ? '<br>ATR <b>'+tp.atr_pts+'</b> × <b>'+tp.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_distance_ticks+'</b> ticks &nbsp;·&nbsp; Risk <b>$'+tp.risk_dollars_per_contract+'</b>/ct'
+        : '');
     apply.style.display = 'block';
   } else {
     planEl.style.display = 'none';
