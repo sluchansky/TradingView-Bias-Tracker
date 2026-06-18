@@ -8198,7 +8198,17 @@ def enter_trade():
         except (KeyError, ValueError, TypeError) as exc:
             return jsonify({"status": "error", "reason": str(exc)}), 400
     else:
-        a  = full_analysis()
+        # Resolve the instrument from the request so the tracked plan matches the
+        # selected/viewed instrument (per-instrument dashboard; the global default
+        # may differ from the tab the user is acting on, which would otherwise let
+        # a confirmed broker order for one instrument record a trade for another).
+        _raw = str(data.get("ticker") or "").upper()
+        if "MGC" in _raw and "MNQ" not in _raw:
+            a = full_analysis(ticker_override="MGC")
+        elif "MNQ" in _raw and "MGC" not in _raw:
+            a = full_analysis(ticker_override="MNQ")
+        else:
+            a = full_analysis()
         tp = a["trade_plan"]
         if not tp.get("trade_plan") or not tp.get("entry_zone"):
             return jsonify({"status": "error", "reason": "No active trade plan. Send entry/stop/t1/t2 or trigger a Short Ready / Long Ready setup first."}), 400
@@ -8224,6 +8234,15 @@ def enter_trade():
                       else 1.0)
         sz        = calculate_position_sizing(tp, acct_size, risk_pct * _risk_mult, profile)
         contracts = int(sz.get("contracts", 1)) if sz else 1
+        # Honor an explicit owner-supplied contract count so the tracked trade
+        # matches the size actually sent to the broker (sizing is only a default).
+        if data.get("contracts") not in (None, ""):
+            try:
+                _c = int(data["contracts"])
+                if _c >= 1:
+                    contracts = _c
+            except (ValueError, TypeError):
+                pass
 
     symbol = instrument_of(profile)
 
@@ -8857,6 +8876,7 @@ def dashboard():
 
 <!-- Action buttons -->
 <button class="btn btn-enter" id="btn-enter" onclick="enterTrade()">📈 ENTER LONG</button>
+<div style="font-size:11px;color:#6b7280;margin:-6px 0 8px;text-align:center">On a READY setup this places a REAL broker order (Tradovate via TradersPost) and tracks it. Typing your own entry/stop = tracking only, no broker order.</div>
 <button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
 <button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
@@ -8923,13 +8943,63 @@ async function enterTrade() {
   if (t1) body.t1        = parseFloat(t1);
   if (t2) body.t2        = parseFloat(t2);
   if (c)  body.contracts = parseInt(c);
+
+  // Any typed-in price (entry / stop / targets) means a manual, server-unvalidated
+  // plan → tracking-only: the broker route deliberately refuses client-supplied
+  // prices. A real order only fires on a READY setup for the selected side, using
+  // the server's own plan.
+  const manual = !!(e || s || t1 || t2);
+  const rd = lastRec ? jsReadyDir(lastRec.verdict) : null;
+  // Only fire a real order when the loaded snapshot is for the CURRENTLY-selected
+  // instrument; a stale snapshot from just before a symbol toggle could otherwise
+  // target the wrong instrument (the server gate would still refuse, but we never
+  // rely on that for instrument selection).
+  const recInst = lastRec ? String(lastRec.active_ticker || '').replace('1!','') : '';
+  const liveEligible = !manual && !!lastRec && recInst === sym
+                       && !!lastRec.traderspost_configured && rd === dir;
+  const btn = document.getElementById('btn-enter');
+
+  if (liveEligible) {
+    const tp = lastRec.trade_plan || {};
+    const entry = _planMidEntry(tp);
+    const inst0 = sym;
+    let q0 = parseInt(c || '1', 10); if (!q0 || q0 < 1) q0 = 1;
+    const msg = '\u26a0 This places a REAL market order on your broker (Tradovate via TradersPost).\\n\\n'
+      + inst0 + ' ' + dir.toUpperCase() + '  ·  ' + q0 + ' contract' + (q0>1?'s':'')
+      + '\\nEntry ~' + (entry!=null?entry:'market')
+      + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
+      + '   T1 ' + (tp.target1!=null?tp.target1:'—')
+      + '\\n\\nProceed?';
+    if (!confirm(msg)) return;
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = liveEligible ? '⏳ Sending order…' : '⏳ Entering…'; }
   try {
-    const d = await api('/enter', body);
-    if (d.status === 'entered') {
-      toast('✅ Trade entered!'); refresh();
+    // 1) Place the REAL broker order first. The server is authoritative on the
+    //    READY gate, sizing cap, and duplicate guard — if it doesn't confirm a
+    //    send, we abort and never record a phantom tracked trade.
+    if (liveEligible) {
+      const inst = sym;
+      let qty = parseInt(c || '1', 10); if (!qty || qty < 1) qty = 1;
+      let od;
+      try { od = await api('/traderspost', { ticker: inst+'1!', contracts: qty }); }
+      catch(err) { toast('Broker request failed — check your broker before retrying', false); return; }
+      if (!od || od.status !== 'sent') { toast('Broker: ' + ((od && (od.reason||od.status)) || 'no response'), false); return; }
+      toast('🚀 Order sent to broker');
     }
-    else toast('Error: '+(d.reason||d.status), false);
-  } catch(err) { toast('Request failed', false); }
+    // 2) Record the local tracked trade (after a confirmed send, or tracking-only).
+    let d;
+    try { d = await api('/enter', body); }
+    catch(err) { toast('Tracking failed (broker order already sent)', false); return; }
+    if (d.status === 'entered') {
+      toast(liveEligible ? '✅ Order sent + trade tracked' : '✅ Trade tracked (no broker order)');
+      refresh();
+    } else {
+      toast('Error: '+(d.reason||d.status), false);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; updateEnterBtn(); }
+  }
 }
 
 async function setVwap() {
