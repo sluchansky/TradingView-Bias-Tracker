@@ -8525,6 +8525,9 @@ def dashboard():
 <body>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
+<div id="alert-ctl" style="text-align:center;margin:2px 0 8px;font-size:12px">
+  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:#8a93a6;border:1px solid #1e1e32;border-radius:999px;padding:3px 12px;background:#12121e">🔔 READY alerts: on</span>
+</div>
 
 <!-- Sensitivity (trading mode) -->
 <div id="mode-row">
@@ -8574,6 +8577,7 @@ def dashboard():
   <div id="rec-plan" class="rec-plan"></div>
   <div id="rec-reason" class="rec-reason"></div>
   <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
+  <button class="btn btn-apply" id="btn-copy" style="display:none;margin-top:6px" onclick="copyOrder()">📋 Copy Order</button>
 </div>
 
 <!-- Diagnostics modules (feed off alert_diagnostics) -->
@@ -9115,6 +9119,10 @@ async function refreshRec() {
     if (lb) lb.classList.toggle('rec', readyDir==='Long');
     if (sb) sb.classList.toggle('rec', readyDir==='Short');
 
+    // Loud, can't-miss alert the moment a setup flips to READY (fires once per
+    // FORMING -> READY transition, per instrument). Display/sound only — no trades.
+    maybeReadyAlert(inst, v);
+
     // Per-direction body driven by the current toggle.
     renderDirView();
     markUpdated();
@@ -9133,6 +9141,7 @@ function renderDirView() {
   const planEl = document.getElementById('rec-plan');
   const reason = document.getElementById('rec-reason');
   const apply  = document.getElementById('btn-apply');
+  const copyBtn = document.getElementById('btn-copy');
   if (!bar) return;
 
   // Market closed — paused, neutral body (no checklist / score / plan / apply).
@@ -9149,6 +9158,7 @@ function renderDirView() {
     if (num) num.textContent = 'Paused';
     if (planEl) planEl.style.display = 'none';
     if (apply)  apply.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = 'none';
     if (reason) reason.textContent = d.strict_reason || 'Market closed — live alerts paused.';
     return;
   }
@@ -9205,9 +9215,11 @@ function renderDirView() {
         ? '<br>ATR <b>'+tp.atr_pts+'</b> × <b>'+tp.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_distance_ticks+'</b> ticks &nbsp;·&nbsp; Risk <b>$'+tp.risk_dollars_per_contract+'</b>/ct'
         : '');
     apply.style.display = 'block';
+    if (copyBtn) copyBtn.style.display = 'block';
   } else {
     planEl.style.display = 'none';
     apply.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = 'none';
   }
 
   // Reason for the selected side; nudge to the ready side when viewing the other.
@@ -9238,6 +9250,122 @@ function applyRec() {
   if (tp.target2!=null)   document.getElementById('f-t2').value   = tp.target2;
   document.querySelector('details').open = true;
   toast('⬇️ Setup applied — review & ENTER');
+}
+
+// ── One-tap order copy + loud READY alert (prop-firm safe: NO broker calls) ──
+let _audioCtx = null;
+let soundOn = (localStorage.getItem('readySound') !== 'off');
+let _readyState = {};   // instrument -> was actionable on the previous poll
+
+function _ensureAudio() {
+  try {
+    if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  } catch(e) {}
+  return _audioCtx;
+}
+function playReadyChime() {
+  if (!soundOn) return;
+  const ctx = _ensureAudio();
+  if (!ctx) return;
+  const t0 = ctx.currentTime;
+  [880, 1175, 1568].forEach(function(f, i){
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = f;
+    const t = t0 + i * 0.18;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.35, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(t); o.stop(t + 0.18);
+  });
+}
+function paintSndToggle() {
+  const el = document.getElementById('snd-toggle');
+  if (el) el.textContent = soundOn ? '🔔 READY alerts: on' : '🔕 READY alerts: off';
+}
+function toggleSound() {
+  soundOn = !soundOn;
+  localStorage.setItem('readySound', soundOn ? 'on' : 'off');
+  paintSndToggle();
+  if (soundOn) { _ensureAudio(); playReadyChime(); toast('🔔 Alert sound on'); }
+  else toast('🔕 Alert sound off');
+}
+function notifyReady(title, body) {
+  try {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') { new Notification(title, { body: body }); }
+    else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then(function(p){ if (p === 'granted') new Notification(title, { body: body }); });
+    }
+  } catch(e) {}
+}
+function readyBanner(msg) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.style.background = '#16261b';
+  t.style.borderLeft = '4px solid #22c55e';
+  t.classList.add('show');
+  if (t._rt) clearTimeout(t._rt);
+  t._rt = setTimeout(function(){ t.classList.remove('show'); }, 9000);
+}
+function maybeReadyAlert(inst, v) {
+  const actionable = jsIsActionable(v);
+  const prev = _readyState[inst];
+  _readyState[inst] = actionable;
+  if (actionable && !prev) {
+    const rd = jsReadyDir(v) || '';
+    const tp = (lastRec && lastRec.trade_plan) || {};
+    const entry = tp.entry_zone ? (' · Entry ' + tp.entry_zone) : '';
+    readyBanner('🔔 ' + inst + ' ' + (rd ? rd.toUpperCase() + ' ' : '') + v + entry + ' — tap “Copy Order”');
+    playReadyChime();
+    notifyReady(inst + ' ' + v, 'Entry ' + (tp.entry_zone || '—') + '  ·  Stop ' + (tp.stop_loss != null ? tp.stop_loss : '—'));
+  }
+}
+
+function _planMidEntry(tp) {
+  if (!tp || tp.entry_zone == null) return null;
+  const parts = String(tp.entry_zone).split('–');
+  if (parts.length === 2) {
+    const mid = (parseFloat(parts[0]) + parseFloat(parts[1])) / 2;
+    if (!isNaN(mid)) return mid.toFixed(1);
+  }
+  const n = parseFloat(tp.entry_zone);
+  return isNaN(n) ? String(tp.entry_zone) : n.toFixed(1);
+}
+function buildOrderText() {
+  if (!lastRec) return null;
+  const tp = lastRec.trade_plan || {};
+  const rd = jsReadyDir(lastRec.verdict);
+  if (!rd || !tp.trade_plan) return null;
+  const inst = (lastRec.active_ticker || '').toString().replace('1!','') || sym;
+  const entry = _planMidEntry(tp);
+  const zone = (tp.entry_zone && String(tp.entry_zone).indexOf('–') >= 0) ? (' (zone ' + tp.entry_zone + ')') : '';
+  const lines = [
+    inst + ' ' + rd.toUpperCase(),
+    'Entry ' + (entry != null ? entry : (tp.entry_zone || '—')) + zone,
+    'Stop  ' + (tp.stop_loss != null ? tp.stop_loss : '—'),
+    'T1    ' + (tp.target1 != null ? tp.target1 : '—'),
+    'T2    ' + (tp.target2 != null ? tp.target2 : '—')
+  ];
+  if (tp.rr != null) lines.push('R:R   ' + tp.rr);
+  return lines.join('\\n');
+}
+async function copyOrder() {
+  const txt = buildOrderText();
+  if (!txt) { toast('No ready setup to copy', false); return; }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(txt);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    toast('📋 Order copied — paste into your order ticket');
+  } catch(e) { toast('Copy failed — long-press to copy', false); }
 }
 
 let lastUpdateTs = 0;
@@ -9302,6 +9430,8 @@ async function refresh() {
 }
 
 // Poll every 3 seconds
+paintSndToggle();
+window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); refreshRec(); loadMode();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
