@@ -2002,6 +2002,39 @@ def fmt_window_counts(counts, total):
         parts.append("🟢 " + ", ".join(bull_parts))
     return "\n".join(parts) if parts else "No alerts"
 
+def _humanize_gate_rejections(gd):
+    """Translate a gate_debug `failed_conditions` list into plain-English strings for
+    the alert-diagnostics block / dashboard "Why Not Ready" panel. Display-only. The
+    raw edge_score(<thr) line is dropped — the EdgeScore vs required_score already
+    conveys it numerically — so the list reads as human gate reasons only."""
+    gd = gd or {}
+    out = []
+    for f in (gd.get("failed_conditions") or []):
+        if not f:
+            continue
+        if f.startswith("edge_score("):
+            continue
+        if f == "conflicting_structure":
+            out.append("Conflicting structure — long & short both active")
+        elif f == "zone_valid":
+            out.append("Price not at a valid trade-side zone")
+        elif f == "vwap_confirmed":
+            out.append("VWAP not confirming the direction")
+        elif f == "structure_confirmed":
+            out.append("No confirming market structure (BOS/CHOCH)")
+        elif f == "volatility_block":
+            out.append("Volatility out of tradeable range")
+        elif f.startswith("confirmations("):
+            try:
+                inner = f[f.index("(") + 1:f.index(")")]
+                got, need = inner.split("<")
+                out.append("Only %s of %s confirmations present" % (got, need))
+            except (ValueError, IndexError):
+                out.append("Not enough confirmations present")
+        else:
+            out.append(f)
+    return out
+
 def bias_color(verdict):
     return {
         "STRONG SHORT": 0xCC0000,
@@ -4103,6 +4136,37 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["volatility_multiplier"] = volatility.get("ratio")
     result["ready_reason"]          = strict_reason
     result["rejected_reasons"]      = strict_missing
+    # ── Alert diagnostics (additive, DISPLAY/observability ONLY) ─────────────
+    # One transparent snapshot bundling the two per-direction scores, the unified
+    # Edge Score, the conflict gap, the live ATR / volatility multiplier, plus the
+    # human READY reason and the humanised rejected gate reasons. Attached to every
+    # alert + /status + the dashboard diagnostics modules. NEVER feeds the trade
+    # decision, so SWING is byte-for-byte unchanged. The market-closed override
+    # below zeros it so a paused market can't present a stale "why".
+    _diag_gd    = result.get("gate_debug") or {}
+    _diag_long  = int(strict.get("long_score",  _diag_gd.get("long_score",  0)) or 0)
+    _diag_short = int(strict.get("short_score", _diag_gd.get("short_score", 0)) or 0)
+    _diag_gap   = int(strict.get("conflict_gap", _diag_gd.get("conflict_gap", 0)) or 0)
+    if _diag_long > _diag_short:
+        _diag_dom = "Long"
+    elif _diag_short > _diag_long:
+        _diag_dom = "Short"
+    else:
+        _diag_dom = "Neutral"
+    _diag_ready = is_actionable(result["verdict"])
+    result["alert_diagnostics"] = {
+        "long_score":            _diag_long,
+        "short_score":           _diag_short,
+        "edge_score":            int(result.get("edge_score") or 0),
+        "conflict_gap":          _diag_gap,
+        "dominant_direction":    _diag_dom,
+        "current_atr":           (volatility or {}).get("atr_pts"),
+        "volatility_multiplier": (volatility or {}).get("ratio"),
+        "ready_reason":          (strict_reason if _diag_ready else ""),
+        "rejected_reasons":      _humanize_gate_rejections(_diag_gd),
+        "current_score":         int(result.get("edge_score") or 0),
+        "required_score":        int(cfg("EDGE_READY_THRESHOLD")),
+    }
     # Decision-support header (Quality/Probability/Risk/Reward/Window/Recommendation)
     # — all real-derived from the fields set above.
     result["decision_support"]      = _decision_support(result)
@@ -4190,6 +4254,19 @@ def full_analysis(current_price_override=None, ticker_override=None):
         result["dominant_direction"] = None
         result["ready_reason"]       = result["strict_reason"]
         result["rejected_reasons"]   = ["market_closed"]
+        result["alert_diagnostics"] = {
+            "long_score":            0,
+            "short_score":           0,
+            "edge_score":            0,
+            "conflict_gap":          0,
+            "dominant_direction":    "Neutral",
+            "current_atr":           None,
+            "volatility_multiplier": None,
+            "ready_reason":          "",
+            "rejected_reasons":      ["Market closed — live alerts paused"],
+            "current_score":         0,
+            "required_score":        int(cfg("EDGE_READY_THRESHOLD")),
+        }
         result["decision_support"]   = _decision_support(result)
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
@@ -6116,6 +6193,7 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["volatility_multiplier"] = a.get("volatility_multiplier")
     entry["ready_reason"]          = a.get("ready_reason") or a.get("strict_reason")
     entry["rejected_reasons"]      = a.get("rejected_reasons") or a.get("strict_missing")
+    entry["alert_diagnostics"]     = a.get("alert_diagnostics")
     entry["decision_support"]      = a.get("decision_support") or _decision_support(entry)
     return entry
 
@@ -8039,6 +8117,7 @@ def status():
         "volatility_multiplier": a.get("volatility_multiplier"),
         "ready_reason":        a.get("ready_reason"),
         "rejected_reasons":    a.get("rejected_reasons"),
+        "alert_diagnostics":   a.get("alert_diagnostics"),
         "decision_support":    a.get("decision_support"),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
@@ -8397,6 +8476,36 @@ def dashboard():
   .rec-plan b{color:#e8e8f0}
   .rec-reason{font-size:12px;color:#888;line-height:1.5;font-style:italic}
   .btn-apply{background:#16162a;color:#a0a8ff;border:2px solid #a0a8ff;font-size:14px;padding:13px;margin-top:12px;margin-bottom:0}
+  /* Diagnostics modules */
+  .mod{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:16px;margin-bottom:14px}
+  .mod-h{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b7280;margin-bottom:12px;font-weight:700}
+  .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
+  .mgauge-center{position:absolute;left:0;right:0;bottom:6px;text-align:center;pointer-events:none}
+  .mgauge-prob{font-size:34px;font-weight:800;line-height:1;letter-spacing:-1px}
+  .gauge-sub{font-size:12px;color:#9aa0b4;margin-top:4px;font-weight:600;letter-spacing:.4px}
+  .gauge-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+  .gstat{background:#0d0d18;border-radius:10px;padding:9px 6px;text-align:center}
+  .gstat .l{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:#6b7280}
+  .gstat .v{font-size:15px;font-weight:800;margin-top:3px}
+  .sg-row{margin-bottom:10px}
+  .sg-row:last-child{margin-bottom:0}
+  .sg-top{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;color:#cfd2e0;font-weight:600}
+  .sg-track{height:14px;background:#0d0d18;border-radius:8px;overflow:hidden}
+  .sg-fill{height:100%;border-radius:8px;transition:width .4s}
+  .sg-fill.long{background:linear-gradient(90deg,#15803d,#22c55e)}
+  .sg-fill.short{background:linear-gradient(90deg,#991b1b,#ef4444)}
+  .ai-ck{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .ai-item{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 10px;border-radius:8px;background:#0d0d18;color:#9aa0b4}
+  .ai-item .ic{width:16px;text-align:center;font-weight:800}
+  .ai-item.ok{color:#cfe9d6} .ai-item.ok .ic{color:#22c55e}
+  .ai-item.no .ic{color:#ef4444}
+  .cd-big{font-size:30px;font-weight:800;text-align:center;letter-spacing:-1px}
+  .cd-sub{font-size:12px;color:#9aa0b4;text-align:center;margin-top:4px}
+  .cd-track{height:10px;background:#0d0d18;border-radius:6px;overflow:hidden;margin-top:12px}
+  .cd-fill{height:100%;border-radius:6px;transition:width .4s,background .4s}
+  .wn-item{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#e7c0c0;background:#1a0f0f;border:1px solid #3a1b1b;border-radius:8px;padding:9px 11px;margin-bottom:8px;line-height:1.4}
+  .wn-item:last-child{margin-bottom:0}
+  .wn-ok{font-size:13px;color:#cfe9d6;background:#0d1f14;border:1px solid #1b3a26;border-radius:8px;padding:11px;line-height:1.5}
   /* Toast */
   #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1e1e32;color:#e8e8f0;padding:12px 24px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap}
   #toast.show{opacity:1}
@@ -8465,6 +8574,53 @@ def dashboard():
   <div id="rec-plan" class="rec-plan"></div>
   <div id="rec-reason" class="rec-reason"></div>
   <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
+</div>
+
+<!-- Diagnostics modules (feed off alert_diagnostics) -->
+<div class="mod" id="mod-prob">
+  <div class="mod-h">⏱ Trade Probability Meter</div>
+  <div class="gauge-wrap">
+    <svg id="gauge-svg" viewBox="0 0 220 132" style="width:100%;display:block"></svg>
+    <div class="mgauge-center">
+      <div class="mgauge-prob" id="gauge-prob">—</div>
+      <div class="gauge-sub" id="gauge-sub"></div>
+    </div>
+  </div>
+  <div class="gauge-stats">
+    <div class="gstat"><div class="l">Long</div><div class="v" id="gs-long" style="color:#22c55e">—</div></div>
+    <div class="gstat"><div class="l">Short</div><div class="v" id="gs-short" style="color:#ef4444">—</div></div>
+    <div class="gstat"><div class="l">Edge Δ</div><div class="v" id="gs-gap" style="color:#e8e8f0">—</div></div>
+    <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#a0a8ff">—</div></div>
+  </div>
+</div>
+
+<div class="mod" id="mod-scores">
+  <div class="mod-h">⚖️ Long vs Short Score</div>
+  <div class="sg-row">
+    <div class="sg-top"><span>📈 Long</span><span id="sg-long-n">0</span></div>
+    <div class="sg-track"><div class="sg-fill long" id="sg-long-f" style="width:0%"></div></div>
+  </div>
+  <div class="sg-row">
+    <div class="sg-top"><span>📉 Short</span><span id="sg-short-n">0</span></div>
+    <div class="sg-track"><div class="sg-fill short" id="sg-short-f" style="width:0%"></div></div>
+  </div>
+</div>
+
+<div class="mod" id="mod-checklist">
+  <div class="mod-h">🤖 AI Trade Checklist</div>
+  <div class="ai-ck" id="ai-ck"></div>
+</div>
+
+<div class="mod" id="mod-countdown">
+  <div class="mod-h">🎯 Setup Countdown</div>
+  <div class="cd-big" id="cd-big">—</div>
+  <div class="cd-sub" id="cd-sub"></div>
+  <div class="cd-track"><div class="cd-fill" id="cd-fill" style="width:0%"></div></div>
+</div>
+
+<div class="mod" id="mod-whynot">
+  <div class="mod-h">🚦 Why Not Ready</div>
+  <div id="wn-body"></div>
 </div>
 
 <!-- Symbol tabs -->
@@ -8733,6 +8889,135 @@ function renderGauge(d){
   var hi = (quality==='HIGH');
   wrap.classList.toggle('glow', !!(hi && jsIsFullReady(d.verdict) && jsReadyDir(d.verdict)===dir && prob>=70));
 }
+
+// ── Diagnostics modules (5) — all DISPLAY-ONLY, fed by alert_diagnostics ──────
+// Verdict helpers: reuse the authoritative ones already defined above.
+function isFullReady(v){ return jsIsFullReady(v); }
+function isEarlyReady(v){ return jsIsEarlyReady(v); }
+function isReadyVerdict(v){ return jsIsActionable(v); }
+function readySide(v){ return jsReadyDir(v); }
+function _modTxt(id,val){ const e=document.getElementById(id); if(e) e.textContent=val; }
+function _modW(id,val){ const e=document.getElementById(id); if(e) e.style.width=Math.max(0,Math.min(100,Number(val)||0))+'%'; }
+function _modEsc(s){ return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function _gPolar(r,deg){ const a=deg*Math.PI/180; return [110 + r*Math.cos(a), 110 - r*Math.sin(a)]; }
+function _gArc(r,vStart,vEnd){
+  const d0=180-1.8*vStart, d1=180-1.8*vEnd;
+  const p0=_gPolar(r,d0), p1=_gPolar(r,d1);
+  const large=Math.abs(d1-d0)>180?1:0;
+  return 'M'+p0[0].toFixed(2)+' '+p0[1].toFixed(2)+' A'+r+' '+r+' 0 '+large+' 1 '+p1[0].toFixed(2)+' '+p1[1].toFixed(2);
+}
+function gaugeColor(v,prob){
+  if (isFullReady(v))  return prob>=90 ? '#15803d' : '#22c55e';   // HQ deep-green / READY green
+  if (isEarlyReady(v)) return '#eab308';                          // EARLY yellow
+  return prob<40 ? '#ef4444' : '#eab308';                         // WAIT red/yellow
+}
+function renderModules(d){
+  if (!d) return;
+  const diag   = d.alert_diagnostics || {};
+  const v      = d.verdict || 'WAIT';
+  const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
+  const longS  = Number(diag.long_score||0);
+  const shortS = Number(diag.short_score||0);
+  const gap    = Number(diag.conflict_gap!=null?diag.conflict_gap:Math.abs(longS-shortS));
+  const dom    = diag.dominant_direction || (longS>shortS?'Long':shortS>longS?'Short':'Neutral');
+  const col    = gaugeColor(v, prob);
+  const hq     = isFullReady(v) && prob>=90;
+
+  // ── Module 1: speedometer / RPM gauge ──
+  const svg = document.getElementById('gauge-svg');
+  if (svg){
+    let s = '<defs><filter id="gglow" x="-60%" y="-60%" width="220%" height="220%">'
+          + '<feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/>'
+          + '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+    s += '<path d="'+_gArc(82,0,40)+'" stroke="#ef4444" stroke-width="16" fill="none" stroke-linecap="round" opacity="0.9"/>';
+    s += '<path d="'+_gArc(82,41,69)+'" stroke="#eab308" stroke-width="16" fill="none" opacity="0.9"/>';
+    s += '<path d="'+_gArc(82,70,100)+'" stroke="#22c55e" stroke-width="16" fill="none" stroke-linecap="round" opacity="0.9"/>';
+    [0,25,50,75,100].forEach(function(t){
+      const p=_gPolar(100, 180-1.8*t);
+      s += '<text x="'+p[0].toFixed(1)+'" y="'+(p[1]+3).toFixed(1)+'" fill="#6b7280" font-size="9" '
+         + 'text-anchor="middle" font-family="ui-monospace,monospace">'+t+'</text>';
+    });
+    const n=_gPolar(72, 180-1.8*prob);
+    s += '<line x1="110" y1="110" x2="'+n[0].toFixed(2)+'" y2="'+n[1].toFixed(2)+'" stroke="'+col+'" '
+       + 'stroke-width="3.5" stroke-linecap="round"'+(hq?' filter="url(#gglow)"':'')+'/>';
+    s += '<circle cx="110" cy="110" r="6.5" fill="'+col+'"'+(hq?' filter="url(#gglow)"':'')+'/>';
+    s += '<circle cx="110" cy="110" r="2.5" fill="#0d0d18"/>';
+    svg.innerHTML = s;
+  }
+  const probEl=document.getElementById('gauge-prob');
+  if (probEl){ probEl.textContent=Math.round(prob)+'%'; probEl.style.color=col; }
+  const subEl=document.getElementById('gauge-sub');
+  if (subEl){
+    const conf = prob>=70 ? 'HIGH' : prob>=41 ? 'MOD' : 'LOW';
+    const dirTxt = readySide(v) || (dom!=='Neutral'?dom:'—');
+    const stateTxt = isFullReady(v) ? (prob>=90?'HIGH QUALITY READY':'READY')
+                   : isEarlyReady(v) ? 'EARLY READY' : 'WAIT';
+    subEl.innerHTML = '<b style="color:'+col+'">'+stateTxt+'</b> · '+conf+' confidence · '+dirTxt;
+  }
+  _modTxt('gs-long', longS); _modTxt('gs-short', shortS); _modTxt('gs-gap', gap);
+  const domEl=document.getElementById('gs-dom');
+  if (domEl){ domEl.textContent=dom; domEl.style.color = dom==='Long'?'#22c55e':dom==='Short'?'#ef4444':'#6b7280'; }
+
+  // ── Module 2: Long vs Short score bars ──
+  _modW('sg-long-f', longS);  _modTxt('sg-long-n', longS);
+  _modW('sg-short-f', shortS); _modTxt('sg-short-n', shortS);
+
+  // ── Module 3: AI Trade Checklist (gate booleans of the dominant side) ──
+  const aiGd = (d.directions && dom!=='Neutral' && d.directions[dom] && d.directions[dom].gate_debug)
+             ? d.directions[dom].gate_debug : (d.gate_debug || {});
+  const reqd = Number(diag.required_score!=null?diag.required_score:(aiGd.ready_threshold!=null?aiGd.ready_threshold:50));
+  const edgeNow = Number(aiGd.edge_score!=null?aiGd.edge_score:prob);
+  const items = [
+    ['Trade-side zone valid', !!aiGd.zone_valid],
+    ['Structure (BOS/CHOCH)', !!aiGd.structure_confirmed],
+    ['VWAP confirming', !!aiGd.vwap_confirmed],
+    ['Confirmation candle', !!aiGd.candle_confirmed],
+    ['Liquidity sweep', !!aiGd.liquidity_sweep],
+    ['Edge \u2265 '+reqd, edgeNow>=reqd]
+  ];
+  const aiEl=document.getElementById('ai-ck');
+  if (aiEl) aiEl.innerHTML = items.map(function(it){
+    return '<div class="ai-item '+(it[1]?'ok':'no')+'"><span class="ic">'+(it[1]?'\u2713':'\u2717')
+         + '</span><span>'+it[0]+'</span></div>';
+  }).join('');
+
+  // ── Module 4: Setup Countdown (Edge points to the next trigger) ──
+  const cur = Number(diag.current_score!=null?diag.current_score:prob);
+  const cdBig=document.getElementById('cd-big'), cdSub=document.getElementById('cd-sub'), cdFill=document.getElementById('cd-fill');
+  if (cdBig){
+    const pct = Math.max(0, Math.min(100, reqd>0 ? cur/reqd*100 : 0));
+    if (isFullReady(v)){
+      cdBig.textContent='READY'; cdBig.style.color='#22c55e';
+      if (cdSub) cdSub.textContent='Setup is live — trade plan available';
+      if (cdFill){ cdFill.style.width='100%'; cdFill.style.background='#22c55e'; }
+    } else if (isEarlyReady(v)){
+      const togo=Math.max(0, reqd-cur);
+      cdBig.textContent='+'+togo+' pts'; cdBig.style.color='#eab308';
+      if (cdSub) cdSub.textContent='Early entry active — '+togo+' Edge pts to full READY ('+reqd+')';
+      if (cdFill){ cdFill.style.width=pct+'%'; cdFill.style.background='#eab308'; }
+    } else {
+      const togo=Math.max(0, reqd-cur);
+      cdBig.textContent='+'+togo+' pts'; cdBig.style.color='#f59e0b';
+      if (cdSub) cdSub.textContent=togo+' Edge pts to trigger (need '+reqd+', now '+cur+')';
+      if (cdFill){ cdFill.style.width=pct+'%'; cdFill.style.background = cur>=reqd?'#22c55e':'#f59e0b'; }
+    }
+  }
+
+  // ── Module 5: Why Not Ready ──
+  const wn=document.getElementById('wn-body');
+  if (wn){
+    if (isReadyVerdict(v)){
+      wn.innerHTML = '<div class="wn-ok">\u2705 <b>'+(isFullReady(v)?'All systems go':'Early entry active')+'</b>'
+                   + (diag.ready_reason ? '<br>'+_modEsc(diag.ready_reason) : '') + '</div>';
+    } else {
+      const rr = diag.rejected_reasons || [];
+      wn.innerHTML = rr.length
+        ? rr.map(function(r){ return '<div class="wn-item">\u26d4 <span>'+_modEsc(r)+'</span></div>'; }).join('')
+        : '<div class="wn-ok">No blocking gate reasons reported.</div>';
+    }
+  }
+}
+
 async function refreshRec() {
   try {
     const d = await api('/status?ticker='+encodeURIComponent(sym));
@@ -8764,6 +9049,7 @@ async function refreshRec() {
       if (lb) lb.classList.remove('rec');
       if (sb) sb.classList.remove('rec');
       renderGauge(d);
+      renderModules(d);
       renderDirView();
       markUpdated();
       return;
@@ -8819,6 +9105,7 @@ async function refreshRec() {
 
     // Trade probability gauge — fed by the authoritative /status fields.
     renderGauge(d);
+    renderModules(d);
 
     // Mark the recommended toggle button (the system's actionable side, incl. EARLY
     // READY) — display-only hint, no auto-switch.
