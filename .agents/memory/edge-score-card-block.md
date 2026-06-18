@@ -17,21 +17,25 @@ gate, alerts, throttling, or the 5-min repost loop.
   live card + periodic repost share one source. `_build_trade_card_embed` renders the
   block when present and FALLS BACK to the old AI Analysis field / `strict_label` when
   absent (legacy/manual entries).
-- Score = additive sum of six confluence components, max 100, computed by the SHARED
-  helper `compute_trade_edge_components(signals, vol_adj=0)`: Zone-valid +25, VWAP +20,
-  Structure +20, Liquidity Sweep +15, Confirmation Candle +10, Session +10. NO gate base,
-  NO 75-floor. The SAME helper backs the READY gate, so the displayed Edge Score == the gate
-  score always. The ONLY non-confluence term is the **SCALP volatility modifier** `vol_adj`
-  (Normal +10 / Elevated 0 / Extreme −10; 0 in SWING — see volatility-monitor-gate): it is
-  appended as a "Volatility" breakdown line and the final score is clamped 0–100. No other
-  subtraction exists.
+- Score = additive sum of confluence components, **max `EDGE_SCORE_MAX = 120`**, computed by
+  the SHARED helper `compute_trade_edge_components(signals, vol_adj=0, rvol_adj=0)`: Zone-valid
+  +25, VWAP +20, Structure +20, Liquidity Sweep +15, Confirmation Candle +10, Session +10, and
+  **CVD Agreement +10** (see cvd-rvol-filter). NO gate base, NO 75-floor. The SAME helper backs
+  the READY gate, so displayed Edge == gate Edge always. Two non-confluence modifiers: the
+  **SCALP volatility modifier** `vol_adj` (Normal +10 / Elevated 0 / Extreme −10; 0 in SWING —
+  see volatility-monitor-gate) and the **RVOL modifier** `rvol_adj` (+10 ≥1.5 / 0 / −5 <1.0;
+  NEVER gates). Both append a breakdown line; the final score is clamped 0–`EDGE_SCORE_MAX`.
+  The six confluences sum to 100; CVD(+10) and RVOL(+10) lift the ceiling to 120.
 - **Risk lines are INFORMATIONAL warnings only (`points: None`); they do NOT subtract.** Nearby
   Resistance/Support, Overextended, Choppy render as flags but never lower the score. The one
   exception is volatility in SCALP, which is a real scored modifier (`vol_adj`, above) AND also
   shows an informational regime risk line; in SWING volatility is a hard gate, not a score term.
   (The older model subtracted all risks and floored READY to 75 — both removed.)
-- Trade strength sub-classifies the Edge Score: Possible = 80–89, Strong = 90–100 (a READY is
-  always ≥80 by construction). The gate decides READY/WAIT; strength only ranks a READY trade.
+- Trade strength sub-classifies the Edge Score (`_trade_strength_from_score`): **Possible 75–79,
+  Strong 80–84, A+ Setup ≥85** (below 75 → None). The gate decides READY/WAIT; strength only ranks
+  a READY trade. NOTE: "A+ Setup" feeds the DISPLAY `trade_strength` only — it must NEVER become
+  `strict_label` (the journal gates on `strict_label ∈ {Strong Trade, Possible Trade}`; the inline
+  strict_label still uses score≥90 Strong else Possible, unchanged).
 - **Session Bonus +10 is a pure additive component, NOT READY-gated.** A preferred ET window
   (`get_session_state`: half-open `[05:00,08:00)`, `[08:00,11:00)`, `[20:00,23:00)`) adds +10 to
   the Edge Score directly. `full_analysis` computes the session state ONCE and threads the same
@@ -39,11 +43,10 @@ gate, alerts, throttling, or the 5-min repost loop.
 
 ## Letter-grade bands (display-only, quality NOT verdict)
 
-`_grade_for_score`: **95–100 A+ · 90–94 A · 85–89 B · 80–84 C · below 80 WAIT**. The grade
-is a quality label only; it does NOT change the READY/WAIT verdict or journaling. Now that the
-READY gate itself requires Edge ≥ 80, a READY setup is ALWAYS grade C or better — the old
-"thin READY floored to 75 displays WAIT" tension is gone; anything < 80 is a genuine WAIT.
-Note: `QUALITY_LABELS` (A+/A/B/C/D market-quality) is a DIFFERENT scale — do not conflate.
+`_grade_for_score`: **≥85 A+ · ≥80 A · ≥`EDGE_READY_THRESHOLD` (SCALP 75 / SWING 80) B · below WAIT**.
+The grade is a quality label only; it does NOT change the READY/WAIT verdict or journaling. A valid
+READY (≥ the mode floor) is ALWAYS grade B or better, so the card's grade never contradicts its
+READY verdict. Note: `QUALITY_LABELS` (A+/A/B/C/D market-quality) is a DIFFERENT scale — do not conflate.
 
 ## The durable rules
 
@@ -58,15 +61,13 @@ score while `gate_debug.edge_score` still shows raw components.
 **How to apply:** any new edge component goes in `EDGE_COMPONENTS` ONCE; never add a credit in the
 display layer that the gate doesn't also see, or READY and the shown score will disagree again.
 
-**The READY threshold must not exceed the sum of the HARD-required components.** The three
-required gates (zone 25 + vwap 20 + structure 20 = 65) are AND-ed, but `EDGE_READY_THRESHOLD = 80`,
-so passing all three is NOT enough — READY structurally always needs a 4th confluence (sweep +15,
-or candle +10 plus session +10). And since `zone_valid` itself requires a reaction, a clean
-mitigation+candle+structure+VWAP setup OUTSIDE a session window tops out at 75 → still WAIT.
-**Why:** this is a silent over-filter; if "always WAIT" recurs with the three requireds green, the
-80 > 65 gap is the cause. **How to apply:** fix by lowering the threshold to 65 (three requireds =
-READY, extras = Strong), or reweighting the three requireds to total 80 — do not just keep raising
-inputs. Keep the threshold ≤ the AND-required sum unless a 4th confluence is intentionally required.
+**The READY threshold (`EDGE_READY_THRESHOLD`) is mode-tuned: SCALP 75, SWING 80.** In SWING the
+three required gates (zone 25 + vwap 20 + structure 20 = 65) are AND-ed AND Edge≥80, so passing all
+three is NOT enough — READY structurally needs a 4th confluence. In SCALP those three are demoted to
+confirmations (not hard gates) and the floor is 75. CVD is a separate HARD veto (fail-open) on top.
+**Why:** an over-high threshold vs the AND-required sum is a silent over-filter; if "always WAIT"
+recurs with the requireds green, check the threshold-vs-component-sum gap. **How to apply:** keep the
+threshold reachable by the intended component set; never just keep raising input weights to compensate.
 
 **Never fabricate a signal label.** A reason label must map to something the app actually
 produces. The bonus shows "Liquidity Sweep" ONLY when a real sweep flag is set
