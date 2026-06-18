@@ -8458,8 +8458,8 @@ def dashboard():
   #rec-meta{font-size:12px;color:#888;margin-bottom:12px;line-height:1.6}
   .rec-gauge{position:relative;width:220px;margin:2px auto 14px;text-align:center}
   .gauge-svg{width:220px;height:auto;display:block;transition:filter .3s}
-  .gauge-center{position:absolute;top:46px;left:0;right:0;text-align:center;pointer-events:none}
-  .gauge-prob{font-size:30px;font-weight:800;line-height:1}
+  .gauge-center{position:absolute;top:50px;left:0;right:0;text-align:center;pointer-events:none}
+  .gauge-prob{font-size:22px;font-weight:800;line-height:1}
   .gauge-conf{font-size:10px;color:#9aa0b5;margin-top:3px;letter-spacing:.6px;text-transform:uppercase}
   .gauge-dir{font-size:12px;font-weight:700;margin-top:3px}
   .gauge-scores{font-size:11px;color:#9aa0b5;font-family:ui-monospace,monospace;margin-top:6px;line-height:1.5}
@@ -8480,9 +8480,9 @@ def dashboard():
   .mod{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:16px;margin-bottom:14px}
   .mod-h{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b7280;margin-bottom:12px;font-weight:700}
   .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
-  .mgauge-center{position:absolute;left:0;right:0;bottom:6px;text-align:center;pointer-events:none}
-  .mgauge-prob{font-size:34px;font-weight:800;line-height:1;letter-spacing:-1px}
-  .gauge-sub{font-size:12px;color:#9aa0b4;margin-top:4px;font-weight:600;letter-spacing:.4px}
+  .mgauge-center{position:absolute;left:0;right:0;bottom:24%;text-align:center;pointer-events:none}
+  .mgauge-prob{font-size:21px;font-weight:800;line-height:1;letter-spacing:0}
+  .gauge-sub{font-size:10px;color:#9aa0b4;margin-top:3px;font-weight:600;letter-spacing:.3px}
   .gauge-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
   .gstat{background:#0d0d18;border-radius:10px;padding:9px 6px;text-align:center}
   .gstat .l{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:#6b7280}
