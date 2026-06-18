@@ -7642,7 +7642,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
   table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}
   th,td{padding:8px 10px;text-align:right;border-bottom:1px solid #16162a}
   th{position:sticky;top:0;background:#16162a;color:#a0a8ff;font-size:10px;text-transform:uppercase;letter-spacing:.5px;text-align:right}
-  th:nth-child(-n+3),td:nth-child(-n+3){text-align:left}
+  th:nth-child(-n+4),td:nth-child(-n+4){text-align:left}
   tbody tr:hover{background:#12121e}
   .v-ready{color:#22c55e;font-weight:700}.v-wait{color:#888}
   .empty{padding:24px;text-align:center;color:#666}
@@ -7657,7 +7657,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <div class="wrap">
 <table>
 <thead><tr>
-<th>Webhook Recv (ET)</th><th>Instr</th><th>Verdict</th>
+<th>Webhook Recv (ET)</th><th>Instr</th><th>Verdict</th><th>Wait Reason</th>
 <th>Dir</th><th>Setup</th><th>Dup</th>
 <th>Eval Start</th><th>Eval Finish</th>
 <th>Eval ms</th><th>Total ms</th><th>Indicator ms</th><th>Volatility ms</th><th>Scoring ms</th>
@@ -7668,7 +7668,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <th>Sent?</th><th>Cooldown Left ms</th><th>Suppressed</th>
 <th>Event Start</th><th>Sweep</th><th>CHOCH</th><th>Displacement</th>
 <th>Early Alert</th><th>Ready Alert</th><th>Delay s</th><th>Waited Close</th>
-<th>Trigger</th><th>Zone</th><th>VWAP</th><th>Struct</th><th>Candle</th><th>Liq</th><th>Vol</th><th>Conf</th><th>Wait Reason</th>
+<th>Trigger</th><th>Zone</th><th>VWAP</th><th>Struct</th><th>Candle</th><th>Liq</th><th>Vol</th><th>Conf</th>
 </tr></thead>
 <tbody id="rows"><tr><td class="empty" colspan="47">Loading...</td></tr></tbody>
 </table>
@@ -7795,6 +7795,7 @@ async function refresh(){
       '<td>'+etTime(e.webhookReceivedAt)+'</td>'+
       '<td>'+(e.instrument||'-')+'</td>'+
       '<td class="'+vc+'">'+(e.verdict||'-')+'</td>'+
+      '<td style="text-align:left">'+(e.waitReason||'-')+'</td>'+
       '<td>'+(e.direction||'-')+'</td>'+
       '<td style="text-align:left">'+(e.setupType||'-')+'</td>'+
       '<td class="'+(e.isDuplicate?'warn':'muted')+'">'+(e.isDuplicate?'dup':'-')+'</td>'+
@@ -7838,7 +7839,6 @@ async function refresh(){
       '<td>'+yn(e.liquidityConfirmed)+'</td>'+
       '<td>'+yn(e.volatilityConfirmed)+'</td>'+
       '<td>'+pct(e.confidenceScore)+'</td>'+
-      '<td style="text-align:left">'+(e.waitReason||'-')+'</td>'+
     '</tr>';
   }).join('');
 }
@@ -8786,6 +8786,12 @@ def dashboard():
     </div>
     <div id="g-scores" class="gauge-scores"></div>
   </div>
+  <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
+       MGC/MNQ and read the dial together. -->
+  <div class="tabs">
+    <div class="tab active" onclick="setSymbol('MGC')">MGC (Gold)</div>
+    <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
+  </div>
   <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
   <div id="rec-score-num"></div>
   <div id="rec-checklist" class="rec-checklist"></div>
@@ -8847,12 +8853,6 @@ def dashboard():
 <div class="mod" id="mod-whynot">
   <div class="mod-h">🚦 Why Not Ready</div>
   <div id="wn-body"></div>
-</div>
-
-<!-- Symbol tabs -->
-<div class="tabs">
-  <div class="tab active" onclick="setSymbol('MGC')">MGC (Gold)</div>
-  <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
 </div>
 
 <!-- VWAP is fetched automatically; manual entry just overrides it temporarily -->
