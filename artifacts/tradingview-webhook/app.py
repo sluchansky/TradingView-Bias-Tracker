@@ -8797,6 +8797,18 @@ def dashboard():
     <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
     <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
+  <!-- Long vs Short Score — moved up to sit directly under the Long/Short toggle. -->
+  <div class="mod" id="mod-scores">
+    <div class="mod-h">⚖️ Long vs Short Score</div>
+    <div class="sg-row">
+      <div class="sg-top"><span>📈 Long</span><span id="sg-long-n">0</span></div>
+      <div class="sg-track"><div class="sg-fill long" id="sg-long-f" style="width:0%"></div></div>
+    </div>
+    <div class="sg-row">
+      <div class="sg-top"><span>📉 Short</span><span id="sg-short-n">0</span></div>
+      <div class="sg-track"><div class="sg-fill short" id="sg-short-f" style="width:0%"></div></div>
+    </div>
+  </div>
   <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
   <div id="rec-score-num"></div>
   <div id="rec-checklist" class="rec-checklist"></div>
@@ -8828,18 +8840,6 @@ def dashboard():
     <div class="gstat"><div class="l">Short</div><div class="v" id="gs-short" style="color:#ef4444">—</div></div>
     <div class="gstat"><div class="l">Edge Δ</div><div class="v" id="gs-gap" style="color:#e8e8f0">—</div></div>
     <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#a0a8ff">—</div></div>
-  </div>
-</div>
-
-<div class="mod" id="mod-scores">
-  <div class="mod-h">⚖️ Long vs Short Score</div>
-  <div class="sg-row">
-    <div class="sg-top"><span>📈 Long</span><span id="sg-long-n">0</span></div>
-    <div class="sg-track"><div class="sg-fill long" id="sg-long-f" style="width:0%"></div></div>
-  </div>
-  <div class="sg-row">
-    <div class="sg-top"><span>📉 Short</span><span id="sg-short-n">0</span></div>
-    <div class="sg-track"><div class="sg-fill short" id="sg-short-f" style="width:0%"></div></div>
   </div>
 </div>
 
