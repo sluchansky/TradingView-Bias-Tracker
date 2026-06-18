@@ -8792,6 +8792,11 @@ def dashboard():
     <div class="tab active" onclick="setSymbol('MGC')">MGC (Gold)</div>
     <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
   </div>
+  <!-- Direction (Long/Short) — directly under the pair selector. -->
+  <div class="dir-row">
+    <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
+    <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
+  </div>
   <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
   <div id="rec-score-num"></div>
   <div id="rec-checklist" class="rec-checklist"></div>
@@ -8865,12 +8870,6 @@ def dashboard():
   <button class="btn" style="background:#16203a;color:#9ec5ff;border:1px solid #2a3a5a" onclick="setVwap()">Override VWAP</button>
   <div style="font-size:11px;color:#6b7280;margin-top:6px">A manual value holds for ~10 min, then auto resumes.</div>
 </details>
-
-<!-- Direction -->
-<div class="dir-row">
-  <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
-  <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
-</div>
 
 <!-- Optional overrides -->
 <details>
