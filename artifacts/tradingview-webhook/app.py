@@ -4479,6 +4479,39 @@ STRATEGY_ENGINE_MODE = os.environ.get("STRATEGY_ENGINE_MODE", "display").strip()
 if STRATEGY_ENGINE_MODE not in ("display", "control"):
     STRATEGY_ENGINE_MODE = "display"
 
+# ════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE LEARNING ENGINE (Phases 3–4) — durable per-strategy analytics.
+# Every CLOSED managed trade is persisted to Postgres with its entry-time
+# strategy / regime / session / indicator snapshot. After every 20 closes we
+# recompute per-strategy win rate / profit factor / avg R / best hours / best
+# regime, derive a BOUNDED weight per strategy (boost winners, cut losers, NEVER
+# disable one), and fold a CAPPED adjustment back into the engine's displayed
+# confidence. STRICTLY FAIL-OPEN: any DB hiccup degrades to "no history" and can
+# never touch the strict gate, sizing, dedupe, or the /traderspost money path.
+# Schema is created via the database tool (dev) + Publish diff (prod) — the app
+# only ever does INSERT/SELECT, never DDL.
+# ════════════════════════════════════════════════════════════════════════════
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:                                  # pragma: no cover - optional dep
+    psycopg2 = None
+
+LEARNING_DB_URL        = os.environ.get("DATABASE_URL")
+LEARNING_DB_ENABLED    = bool(LEARNING_DB_URL and psycopg2)
+LEARNING_LOCK          = threading.Lock()          # guards the in-memory caches below
+LEARNING_RECOMPUTE_LOCK = threading.Lock()         # serializes recomputes so a slow run can't overwrite a newer cache
+LEARNING_MIN_SAMPLE    = 20                         # min closed trades before history weights a strategy
+LEARNING_RECALC_EVERY  = 20                         # recompute analytics every N closed trades
+LEARNING_WEIGHT_FLOOR  = 0.65                       # weights nudge but NEVER disable a strategy
+LEARNING_WEIGHT_CEIL   = 1.35
+LEARNING_CONF_ADJ_CAP  = 15                         # max ± confidence points history may move
+LEARNING_SNAPSHOT_MAX_AGE = 180                     # secs: entry snapshot considered "fresh"
+LAST_STRATEGY_SNAPSHOT_BY_INST = {}                 # inst -> entry-context snapshot (for trade tagging)
+STRATEGY_WEIGHTS       = {}                         # strategy_key -> weight (float)
+LEARNING_SAMPLE_BY_KEY = {}                         # strategy_key -> closed-trade count (int)
+LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total_trades": 0}
+
 # Opening-range + Opening-Drive window (Eastern Time, decimal hours).
 OPENING_RANGE_START_ET      = 8.0    # OR builds from 08:00 ET
 OPENING_RANGE_BUILD_MIN     = 30     # ...over the first 30 minutes
@@ -4976,6 +5009,9 @@ def _closed_strategy_engine():
         "ready": False, "reason": "Market closed — strategy engine paused.",
         "missing": [], "conditions": [], "strategies": [],
         "opening_range": {"high": None, "low": None, "complete": False, "active_window": False},
+        # Adaptive-learning telemetry (key parity with the open-market path).
+        "base_confidence": 0, "history_weight": 1.0,
+        "history_sample_size": 0, "history_adjustment": 0,
     }
 
 
@@ -5037,14 +5073,28 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
             engine.update(active_strategy="None", active_key=None, direction=None,
                           confidence=0, quality="Avoid", expected_target_r=None,
                           ready=False, reason="No eligible strategy for current conditions.",
-                          missing=[], conditions=[])
+                          missing=[], conditions=[],
+                          base_confidence=0, history_weight=1.0,
+                          history_sample_size=0, history_adjustment=0)
             return engine
 
         a    = evals[active_key]
         defn = STRATEGY_DEFS[active_key]
         edge_norm  = min(100, round((edge_score or 0) / EDGE_SCORE_MAX * 100))
         regime_fit = 100 if regime["regime"] in defn["regimes"] else 40
-        confidence = int(max(0, min(100, round(a["completeness"] * 0.60 + edge_norm * 0.25 + regime_fit * 0.15))))
+        base_confidence = int(max(0, min(100, round(a["completeness"] * 0.60 + edge_norm * 0.25 + regime_fit * 0.15))))
+        # ── Adaptive learning (Phase 4): fold a BOUNDED per-strategy history weight
+        # into confidence once the strategy has >= LEARNING_MIN_SAMPLE closed trades.
+        # Capped to ±LEARNING_CONF_ADJ_CAP so history nudges, never dominates. The
+        # engine stays DISPLAY-ONLY in Phase 1 — this only moves what's shown, never
+        # the strict gate / verdict / money path. FAIL-OPEN: default weight 1.0.
+        hist_weight, hist_n = _strategy_weight_for(active_key)
+        hist_adj = 0
+        if hist_n >= LEARNING_MIN_SAMPLE:
+            hist_adj = int(max(-LEARNING_CONF_ADJ_CAP,
+                               min(LEARNING_CONF_ADJ_CAP,
+                                   round(base_confidence * (hist_weight - 1.0)))))
+        confidence = int(max(0, min(100, base_confidence + hist_adj)))
         grade = _strategy_grade(a["fully_met"], confidence, defn["max_grade"])
         if a["fully_met"] and a["direction"]:
             reason = f"All {a['label']} confirmations met — READY {a['direction']}."
@@ -5056,6 +5106,8 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
             active_strategy=a["label"], active_key=active_key, direction=a["direction"],
             confidence=confidence, quality=grade, expected_target_r=a["target_r"],
             ready=a["fully_met"], reason=reason, missing=a["missing"], conditions=a["conditions"],
+            base_confidence=base_confidence, history_weight=round(hist_weight, 3),
+            history_sample_size=hist_n, history_adjustment=hist_adj,
         )
         return engine
     except Exception as exc:
@@ -5065,6 +5117,435 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
         out["regime_reason"] = "Engine unavailable — defaulting safe"
         out["reason"]        = "Strategy engine unavailable."
         return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Adaptive-learning helpers (Phases 3–4). Every function is FAIL-OPEN: a DB or
+# data hiccup logs + degrades to "no history", never raising into the analysis,
+# alert, or trade-management paths. None of this is reachable from the strict
+# gate, sizing, dedupe, or the /traderspost money path.
+# ════════════════════════════════════════════════════════════════════════════
+def _learning_conn():
+    """Open a short-lived autocommit connection. Returns None on any error."""
+    if not LEARNING_DB_ENABLED:
+        return None
+    try:
+        conn = psycopg2.connect(LEARNING_DB_URL, connect_timeout=5)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = 8000")
+        except Exception:
+            pass
+        return conn
+    except Exception as exc:
+        logger.warning("learning DB connect failed: %s", exc)
+        return None
+
+
+def _learning_session_name(dt_utc=None):
+    """Map an instant to its ET trading session: Asia(18–02) / London(02–08) /
+    New York(08–16); 'Off-hours' between 16–18 ET. Never raises."""
+    try:
+        h = (dt_utc or now_utc()).astimezone(ET_TZ).hour
+        if 8 <= h < 16:        return "New York"
+        if 2 <= h < 8:         return "London"
+        if h >= 18 or h < 2:   return "Asia"
+        return "Off-hours"
+    except Exception:
+        return "Unknown"
+
+
+def _fmt_hour_et(h):
+    """'09:00–10:00 ET' label for an integer ET hour."""
+    try:
+        return "%02d:00–%02d:00 ET" % (int(h), (int(h) + 1) % 24)
+    except Exception:
+        return "—"
+
+
+def _learning_weight(win_rate, profit_factor, avg_r, n):
+    """Deterministic, BOUNDED per-strategy weight in [FLOOR, CEIL]. Returns 1.0
+    (neutral) while under-sampled; NEVER returns 0 (a strategy is never disabled).
+    win_rate is a fraction 0..1; profit_factor capped upstream; avg_r in R."""
+    if n < LEARNING_MIN_SAMPLE:
+        return 1.0
+    def _c(v, lo, hi):
+        return max(lo, min(hi, v))
+    wr_score = _c((win_rate - 0.50) / 0.25, -1.0, 1.0)
+    pf_score = _c((profit_factor - 1.0) / 1.0, -1.0, 1.0)
+    r_score  = _c(avg_r / 0.75, -1.0, 1.0)
+    perf     = 0.45 * wr_score + 0.35 * pf_score + 0.20 * r_score
+    sample   = min(1.0, n / 60.0)
+    return _c(1.0 + 0.35 * perf * sample, LEARNING_WEIGHT_FLOOR, LEARNING_WEIGHT_CEIL)
+
+
+def _strategy_weight_for(key):
+    """(weight, sample_size) for a strategy_key from the in-memory cache. Neutral
+    (1.0, 0) when unknown so callers never special-case 'no history'."""
+    if not key:
+        return (1.0, 0)
+    with LEARNING_LOCK:
+        return (STRATEGY_WEIGHTS.get(key, 1.0), LEARNING_SAMPLE_BY_KEY.get(key, 0))
+
+
+def _update_learning_snapshot(result, ticker_override=None):
+    """Cache the freshest engine + indicator snapshot per instrument so a trade can
+    be tagged with its entry context when it registers. Telemetry only."""
+    if not LEARNING_DB_ENABLED:
+        return
+    try:
+        se   = result.get("strategy_engine") or {}
+        inst = instrument_of(ticker_override or result.get("active_ticker") or "")
+        if not inst:
+            return
+        snap = {
+            "ts": now_utc().isoformat(),
+            "price": result.get("current_price"),
+            "strategy": se.get("active_strategy"),
+            "strategy_key": se.get("active_key"),
+            "regime": se.get("market_regime"),
+            "session": _learning_session_name(),
+            "direction": se.get("direction"),
+            "confidence": se.get("base_confidence", se.get("confidence")),
+            "quality": se.get("quality"),
+            "edge_score": result.get("edge_score"),
+            "indicators": {
+                "vwap_value":            result.get("vwap_value"),
+                "vwap_status":           result.get("vwap_status"),
+                "cvd_state":             result.get("cvd_state"),
+                "cvd_value":             result.get("cvd_value"),
+                "cvd_direction":         result.get("cvd_direction"),
+                "rvol_value":            result.get("rvol_value"),
+                "current_atr":           result.get("current_atr"),
+                "volatility_multiplier": result.get("volatility_multiplier"),
+                "conviction_tier":       result.get("conviction_tier"),
+                "structure_label":       result.get("structure_label"),
+                "edge_score":            result.get("edge_score"),
+            },
+        }
+        with LEARNING_LOCK:
+            LAST_STRATEGY_SNAPSHOT_BY_INST[inst] = snap
+    except Exception as exc:
+        logger.debug("learning snapshot skip: %s", exc)
+
+
+def _capture_learning_ctx(instrument):
+    """Read the freshest engine snapshot for an instrument at trade registration.
+    Returns a dict (marked 'stale' if older than the freshness window) or None."""
+    if not LEARNING_DB_ENABLED:
+        return None
+    try:
+        with LEARNING_LOCK:
+            snap = LAST_STRATEGY_SNAPSHOT_BY_INST.get(instrument)
+        if not snap:
+            return None
+        ctx = dict(snap)
+        try:
+            age = (now_utc() - datetime.fromisoformat(snap["ts"])).total_seconds()
+            ctx["stale"] = age > LEARNING_SNAPSHOT_MAX_AGE
+        except Exception:
+            ctx["stale"] = False
+        return ctx
+    except Exception:
+        return None
+
+
+def _record_strategy_trade(mt):
+    """Persist one CLOSED managed trade for adaptive analytics. FAIL-OPEN and
+    idempotent (managed_key UNIQUE + ON CONFLICT DO NOTHING so an idempotent
+    repost can never double-count). Triggers a recompute every Nth insert."""
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = None
+    try:
+        ctx = mt.get("learning_ctx") or {}
+        ind = ctx.get("indicators") or {}
+        try:
+            managed_key = "|".join(str(x) for x in (mt.get("key") or ()))
+        except Exception:
+            managed_key = None
+        if not managed_key:
+            return
+        opened_at = mt.get("registered_at")
+        closed_at = mt.get("closed_at")
+        hold_min  = None
+        try:
+            if opened_at and closed_at:
+                hold_min = round((datetime.fromisoformat(closed_at)
+                                  - datetime.fromisoformat(opened_at)).total_seconds() / 60.0, 2)
+        except Exception:
+            hold_min = None
+        try:
+            opened_dt = datetime.fromisoformat(opened_at) if opened_at else None
+        except Exception:
+            opened_dt = None
+        conf = ctx.get("confidence")
+        try:
+            conf = int(round(float(conf))) if conf is not None else None
+        except Exception:
+            conf = None
+        row = (
+            managed_key,
+            mt.get("journal_id"),
+            opened_at,
+            closed_at,
+            mt.get("symbol") or mt.get("instrument"),
+            ctx.get("strategy_key"),
+            ctx.get("strategy") or "Unknown",
+            ctx.get("regime") or "UNKNOWN",
+            ctx.get("session") or _learning_session_name(opened_dt),
+            mt.get("direction"),
+            mt.get("entry"),
+            mt.get("stop"),
+            mt.get("tp1"),
+            mt.get("outcome"),
+            mt.get("r_multiple"),
+            hold_min,
+            conf,
+            ctx.get("quality"),
+            ctx.get("edge_score"),
+            STRATEGY_ENGINE_MODE,
+            psycopg2.extras.Json(ind),
+        )
+        conn = _learning_conn()
+        if conn is None:
+            return
+        inserted = None
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO strategy_trades
+                       (managed_key, journal_id, opened_at, closed_at, symbol,
+                        strategy_key, strategy, market_regime, session, direction,
+                        entry, stop, target, result, r_multiple, hold_minutes,
+                        confidence, quality, edge_score, mode, indicators)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (managed_key) DO NOTHING
+                   RETURNING id""",
+                row,
+            )
+            inserted = cur.fetchone()
+        if inserted:
+            logger.info("strategy_trades recorded: %s %s %s (%sR)",
+                        row[4], row[6], row[13], row[14])
+            _maybe_recompute_learning()
+    except Exception as exc:
+        logger.warning("record_strategy_trade failed: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _maybe_recompute_learning():
+    """If the running total of closed trades is a multiple of LEARNING_RECALC_EVERY,
+    launch a background recompute so the watcher thread is never blocked."""
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM strategy_trades")
+            n = cur.fetchone()[0]
+        if n and n % LEARNING_RECALC_EVERY == 0:
+            threading.Thread(target=_recompute_learning,
+                             name="learning-recompute", daemon=True).start()
+    except Exception as exc:
+        logger.debug("learning recompute trigger skip: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _recompute_learning():
+    """Recompute per-strategy analytics + bounded weights from strategy_trades and
+    swap the in-memory caches atomically. Also persists strategy_weights for
+    continuity/inspection. FAIL-OPEN; runs at startup and every Nth close."""
+    global LEARNING_ANALYTICS
+    if not LEARNING_DB_ENABLED:
+        return
+    # Serialize: hold this across the whole read→compute→swap so an older/slower
+    # recompute can never clobber a newer cache snapshot (architect note D).
+    LEARNING_RECOMPUTE_LOCK.acquire()
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT strategy_key,
+                   max(strategy)                                            AS strategy,
+                   count(*)                                                 AS n,
+                   avg((result='Win')::int::float)                          AS win_rate,
+                   avg(r_multiple)                                          AS avg_r,
+                   avg(hold_minutes)                                        AS avg_hold,
+                   sum(CASE WHEN r_multiple > 0 THEN r_multiple ELSE 0 END) AS gross_win,
+                   sum(CASE WHEN r_multiple < 0 THEN -r_multiple ELSE 0 END) AS gross_loss
+            FROM strategy_trades
+            WHERE strategy_key IS NOT NULL
+            GROUP BY strategy_key
+        """)
+        strat_rows = cur.fetchall()
+        cur.execute("""
+            SELECT EXTRACT(HOUR FROM opened_at AT TIME ZONE 'America/New_York')::int AS hour_et,
+                   count(*) AS n,
+                   avg((result='Win')::int::float) AS win_rate,
+                   avg(r_multiple) AS avg_r
+            FROM strategy_trades
+            WHERE opened_at IS NOT NULL
+            GROUP BY hour_et
+            ORDER BY win_rate DESC NULLS LAST, n DESC
+        """)
+        hour_rows = cur.fetchall()
+        cur.execute("""
+            SELECT market_regime AS regime,
+                   count(*) AS n,
+                   avg((result='Win')::int::float) AS win_rate,
+                   avg(r_multiple) AS avg_r
+            FROM strategy_trades
+            WHERE market_regime IS NOT NULL
+            GROUP BY market_regime
+            ORDER BY win_rate DESC NULLS LAST, n DESC
+        """)
+        regime_rows = cur.fetchall()
+        cur.execute("""
+            WITH recent AS (
+                SELECT r_multiple,
+                       row_number() OVER (ORDER BY closed_at DESC) AS rn
+                FROM strategy_trades WHERE closed_at IS NOT NULL
+            )
+            SELECT avg(CASE WHEN rn <= 10 THEN r_multiple END)             AS recent_r,
+                   avg(CASE WHEN rn > 10 AND rn <= 20 THEN r_multiple END) AS prior_r,
+                   count(*)                                                AS total
+            FROM recent
+        """)
+        trend_row = cur.fetchone() or {}
+        cur.close()
+
+        def _f(v, d=0.0):
+            try:
+                return float(v) if v is not None else d
+            except Exception:
+                return d
+
+        new_weights, new_samples, ranking = {}, {}, []
+        for r in strat_rows:
+            key = r["strategy_key"]
+            n   = int(r["n"] or 0)
+            wr  = _f(r["win_rate"])
+            avg_r = _f(r["avg_r"])
+            gw, gl = _f(r["gross_win"]), _f(r["gross_loss"])
+            pf  = (gw / gl) if gl > 0 else (3.0 if gw > 0 else 0.0)
+            pf  = min(pf, 3.0)
+            w   = _learning_weight(wr, pf, avg_r, n)
+            new_weights[key] = w
+            new_samples[key] = n
+            ranking.append({
+                "strategy_key": key, "strategy": r["strategy"] or key, "n": n,
+                "win_rate": round(wr * 100, 1), "avg_r": round(avg_r, 2),
+                "profit_factor": round(pf, 2),
+                "avg_hold_min": round(_f(r["avg_hold"]), 1),
+                "weight": round(w, 3),
+            })
+        ranking.sort(key=lambda x: (x["weight"], x["win_rate"], x["avg_r"]), reverse=True)
+
+        best_hours = [{
+            "hour_et": int(h["hour_et"]), "label": _fmt_hour_et(int(h["hour_et"])),
+            "n": int(h["n"]), "win_rate": round(_f(h["win_rate"]) * 100, 1),
+            "avg_r": round(_f(h["avg_r"]), 2),
+        } for h in hour_rows if h["hour_et"] is not None][:4]
+
+        best_conditions = [{
+            "regime": rr["regime"], "n": int(rr["n"]),
+            "win_rate": round(_f(rr["win_rate"]) * 100, 1),
+            "avg_r": round(_f(rr["avg_r"]), 2),
+        } for rr in regime_rows][:4]
+
+        ranked_qual = [r for r in ranking if r["n"] >= LEARNING_MIN_SAMPLE] or ranking
+        top_strategy    = ranked_qual[0] if ranked_qual else None
+        bottom_strategy = ranked_qual[-1] if len(ranked_qual) > 1 else None
+
+        total   = int(trend_row.get("total") or 0)
+        recent_r, prior_r = trend_row.get("recent_r"), trend_row.get("prior_r")
+        trend = {"label": "Insufficient data", "recent_avg_r": None,
+                 "prior_avg_r": None, "delta": None}
+        if recent_r is not None and prior_r is not None:
+            delta = _f(recent_r) - _f(prior_r)
+            trend = {
+                "label": "Improving" if delta > 0.10 else "Declining" if delta < -0.10 else "Flat",
+                "recent_avg_r": round(_f(recent_r), 2),
+                "prior_avg_r": round(_f(prior_r), 2),
+                "delta": round(delta, 2),
+            }
+
+        analytics = {
+            "enabled": True, "ready": total > 0, "total_trades": total,
+            "ranking": ranking, "best_hours": best_hours,
+            "best_conditions": best_conditions, "top_strategy": top_strategy,
+            "bottom_strategy": bottom_strategy, "trend": trend,
+            "min_sample": LEARNING_MIN_SAMPLE,
+            "next_recalc_in": (LEARNING_RECALC_EVERY - (total % LEARNING_RECALC_EVERY)) % LEARNING_RECALC_EVERY,
+            "updated_at": now_utc().isoformat(),
+        }
+
+        try:
+            wconn = _learning_conn()
+            if wconn is not None:
+                bh = best_hours[0]["hour_et"] if best_hours else None
+                br = best_conditions[0]["regime"] if best_conditions else None
+                with wconn.cursor() as wc:
+                    for r in ranking:
+                        wc.execute("""
+                            INSERT INTO strategy_weights
+                                (strategy_key, weight, sample_size, win_rate, profit_factor,
+                                 avg_r, best_hour_et, best_regime, trend, updated_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                            ON CONFLICT (strategy_key) DO UPDATE SET
+                                weight=EXCLUDED.weight, sample_size=EXCLUDED.sample_size,
+                                win_rate=EXCLUDED.win_rate, profit_factor=EXCLUDED.profit_factor,
+                                avg_r=EXCLUDED.avg_r, best_hour_et=EXCLUDED.best_hour_et,
+                                best_regime=EXCLUDED.best_regime, trend=EXCLUDED.trend,
+                                updated_at=NOW()
+                        """, (r["strategy_key"], r["weight"], r["n"], r["win_rate"] / 100.0,
+                              r["profit_factor"], r["avg_r"], bh, br, trend["label"]))
+                wconn.close()
+        except Exception as exc:
+            logger.debug("strategy_weights upsert skip: %s", exc)
+
+        with LEARNING_LOCK:
+            STRATEGY_WEIGHTS.clear();        STRATEGY_WEIGHTS.update(new_weights)
+            LEARNING_SAMPLE_BY_KEY.clear();  LEARNING_SAMPLE_BY_KEY.update(new_samples)
+            LEARNING_ANALYTICS = analytics
+        logger.info("learning analytics recomputed: %s trades across %s strategies",
+                    total, len(ranking))
+    except Exception as exc:
+        logger.warning("recompute_learning failed: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        LEARNING_RECOMPUTE_LOCK.release()
+
+
+def _learning_engine_view():
+    """Snapshot of the cached analytics for /status + the dashboard (never per-request
+    SQL). Returns a disabled stub when learning is off."""
+    if not LEARNING_DB_ENABLED:
+        return {"enabled": False, "ready": False, "total_trades": 0,
+                "reason": "No database configured."}
+    with LEARNING_LOCK:
+        return dict(LEARNING_ANALYTICS)
 
 
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
@@ -5718,6 +6199,12 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _blk = result["directions"].get(_d)
             if _blk:
                 _blk.update(ready=False, label="WAIT")
+    # Adaptive-learning: cache the freshest engine+indicator snapshot per instrument
+    # so a setup that registers right after this can be tagged with its entry context.
+    try:
+        _update_learning_snapshot(result, ticker_override)
+    except Exception:
+        pass
     return result
 
 
@@ -6632,6 +7119,9 @@ def _register_managed_trade(entry, ticker=""):
         "trade_strength": entry.get("trade_strength"),
         "edge_score": entry.get("edge_score"),
         "journal_id": entry.get("id"),
+        # Adaptive-learning: freeze the entry-time engine/indicator context so the
+        # trade can be tagged with its regime/strategy/session/indicators at close.
+        "learning_ctx": _capture_learning_ctx(instrument),
     }
     MANAGED_TRADES_BY_KEY[key] = mt
     logger.info("Managed trade registered: %s %s entry≈%s", instrument, direction, mp.get("entry"))
@@ -6751,6 +7241,14 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
 
     _send_outcome_update(mt)
     _apply_outcome_to_journal(mt)
+
+    # Adaptive-learning: persist AFTER the user-facing outcome card + journal so a
+    # slow DB can never delay the notification. Idempotent + FAIL-OPEN (architect
+    # note B); mt already carries closed_at/outcome/r_multiple at this point.
+    try:
+        _record_strategy_trade(mt)
+    except Exception as exc:
+        logger.warning("strategy-trade persist error: %s", exc)
 
 
 def _send_management_update(mt, title, detail):
@@ -9817,6 +10315,7 @@ def status():
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
+        "learning_engine":     _learning_engine_view(),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
@@ -10485,6 +10984,17 @@ def dashboard():
   .se-row .pct{flex:0 0 38px;text-align:right;font-variant-numeric:tabular-nums}
   .se-row.ineligible{opacity:.45}
   .se-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
+  .le-top{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+  .le-sub{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:14px 0 6px}
+  .le-rank{display:flex;flex-direction:column;gap:5px}
+  .le-row{display:grid;grid-template-columns:1fr 48px 52px 64px 44px;gap:8px;align-items:center;font-size:12px;color:#cdd3e0;padding:4px 8px;background:var(--inset);border:1px solid var(--border);border-radius:2px}
+  .le-row .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .le-row .st{text-align:right;font-variant-numeric:tabular-nums}
+  .le-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:6px}
+  .le-list{display:flex;flex-direction:column;gap:5px}
+  .le-li{display:flex;justify-content:space-between;font-size:12px;color:#cdd3e0;padding:3px 6px;background:var(--inset);border:1px solid var(--border);border-radius:2px}
+  .le-empty{font-size:11px;color:var(--muted);font-style:italic}
+  .le-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:12px;font-style:italic}
   .cd-big{font-size:30px;font-weight:800;text-align:center;letter-spacing:-1px;color:var(--amber)}
   .cd-sub{font-size:12px;color:var(--muted);text-align:center;margin-top:4px}
   .cd-track{height:10px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden;margin-top:12px}
@@ -10651,6 +11161,30 @@ def dashboard():
   </div>
   <div class="se-list" id="se-list"></div>
   <div class="se-fid" id="se-fid"></div>
+</div>
+
+<!-- Adaptive Learning Engine — per-strategy analytics from closed trades (Postgres) -->
+<div class="mod" id="mod-learning">
+  <div class="mod-h">🧠 Adaptive Learning <span id="le-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="le-top">
+    <div class="gstat"><div class="l">Trades Logged</div><div class="v" id="le-total">—</div></div>
+    <div class="gstat"><div class="l">Top Strategy</div><div class="v" id="le-top">—</div></div>
+    <div class="gstat"><div class="l">Bottom Strategy</div><div class="v" id="le-bottom">—</div></div>
+    <div class="gstat"><div class="l">Recent Trend</div><div class="v" id="le-trend">—</div></div>
+  </div>
+  <div class="le-sub">Strategy Performance Ranking</div>
+  <div class="le-rank" id="le-rank"></div>
+  <div class="le-grid">
+    <div>
+      <div class="le-sub">Best Hours (ET)</div>
+      <div class="le-list" id="le-hours"></div>
+    </div>
+    <div>
+      <div class="le-sub">Best Conditions</div>
+      <div class="le-list" id="le-cond"></div>
+    </div>
+  </div>
+  <div class="le-fid" id="le-fid"></div>
 </div>
 
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
@@ -11159,6 +11693,104 @@ function renderModules(d){
 
   // ── Module 7: Multi-strategy engine (DISPLAY-ONLY in Phase 1) ──
   renderStrategyEngine(d);
+
+  // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
+  renderLearningEngine(d);
+}
+
+// Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
+// trades from Postgres; served from an in-memory cache, never per-request SQL).
+function _leColor(wr){ return wr>=55 ? '#22c55e' : wr>=45 ? '#eab308' : '#ef4444'; }
+function renderLearningEngine(d){
+  const le = (d && d.learning_engine) || null;
+  const metaEl = document.getElementById('le-meta');
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const clr  = function(id){ const e=document.getElementById(id); if(e) e.innerHTML=''; };
+  if (!le || le.enabled===false || !le.ready){
+    if (metaEl) metaEl.textContent = (le && le.enabled===false) ? '· OFFLINE' : '· AWAITING TRADES';
+    setT('le-total', le && le.total_trades!=null ? le.total_trades : '0');
+    setT('le-top','—'); setT('le-bottom','—'); setT('le-trend','—');
+    clr('le-rank'); clr('le-hours'); clr('le-cond');
+    const f=document.getElementById('le-fid');
+    if (f) f.textContent = (le && le.enabled===false)
+      ? 'No database configured — learning paused.'
+      : 'Logging trades. Rankings appear once outcomes accrue; weights apply at '
+        + ((le && le.min_sample) || 20) + ' trades per strategy.';
+    return;
+  }
+  if (metaEl){
+    const nx = le.next_recalc_in;
+    metaEl.textContent = '· ' + le.total_trades + ' TRADES'
+      + (nx!=null && nx>0 ? ' · recalc in '+nx : '');
+  }
+  setT('le-total', le.total_trades);
+
+  // Top / bottom strategy
+  const ts = le.top_strategy, bs = le.bottom_strategy;
+  const tEl=document.getElementById('le-top');
+  if (tEl){
+    if (ts){ tEl.textContent = (ts.strategy||ts.strategy_key)+' ('+ts.win_rate+'%)';
+             tEl.style.color = _leColor(ts.win_rate); }
+    else { tEl.textContent='—'; tEl.style.color='#6b7280'; }
+  }
+  const bEl=document.getElementById('le-bottom');
+  if (bEl){
+    if (bs && (!ts || bs.strategy_key!==ts.strategy_key)){
+      bEl.textContent = (bs.strategy||bs.strategy_key)+' ('+bs.win_rate+'%)';
+      bEl.style.color = _leColor(bs.win_rate);
+    } else { bEl.textContent='—'; bEl.style.color='#6b7280'; }
+  }
+
+  // Recent improvement trend
+  const tr = le.trend || {};
+  const trEl=document.getElementById('le-trend');
+  if (trEl){
+    trEl.textContent = tr.label || '—';
+    trEl.style.color = tr.label==='Improving' ? '#22c55e'
+                     : tr.label==='Declining' ? '#ef4444' : '#6b7280';
+  }
+
+  // Strategy performance ranking
+  const rankEl=document.getElementById('le-rank');
+  if (rankEl){
+    const rows = le.ranking || [];
+    rankEl.innerHTML = rows.length ? rows.map(function(r){
+      const wclr = _leColor(r.win_rate);
+      const tag  = r.n < (le.min_sample||20)
+        ? ' <span style="color:#6b7280;font-size:9px">('+r.n+' · sampling)</span>' : '';
+      return '<div class="le-row">'
+           + '<div class="nm">'+_modEsc(r.strategy||r.strategy_key)+tag+'</div>'
+           + '<div class="st" style="color:'+wclr+'">'+r.win_rate+'%</div>'
+           + '<div class="st">'+(r.avg_r>=0?'+':'')+r.avg_r+'R</div>'
+           + '<div class="st">PF '+r.profit_factor+'</div>'
+           + '<div class="st" style="color:'+(r.weight>1?'#22c55e':r.weight<1?'#ef4444':'#6b7280')+'">×'+r.weight+'</div>'
+           + '</div>';
+    }).join('') : '<div class="le-empty">No closed trades yet.</div>';
+  }
+
+  // Best hours (ET)
+  const hEl=document.getElementById('le-hours');
+  if (hEl){
+    const hrs = le.best_hours || [];
+    hEl.innerHTML = hrs.length ? hrs.map(function(h){
+      return '<div class="le-li"><span>'+_modEsc(h.label)+'</span>'
+           + '<span style="color:'+_leColor(h.win_rate)+'">'+h.win_rate+'% · '+h.n+'t</span></div>';
+    }).join('') : '<div class="le-empty">—</div>';
+  }
+
+  // Best market conditions (regime)
+  const cEl=document.getElementById('le-cond');
+  if (cEl){
+    const cs = le.best_conditions || [];
+    cEl.innerHTML = cs.length ? cs.map(function(c){
+      return '<div class="le-li"><span>'+_modEsc(c.regime)+'</span>'
+           + '<span style="color:'+_leColor(c.win_rate)+'">'+c.win_rate+'% · '+c.n+'t</span></div>';
+    }).join('') : '<div class="le-empty">—</div>';
+  }
+
+  const f=document.getElementById('le-fid');
+  if (f) f.textContent = 'Recomputed every '+(le.min_sample||20)
+       +' closed trades · weights bounded ×0.65–×1.35, never disable a strategy.';
 }
 
 // Strategy engine panel — fed by d.strategy_engine (compute_strategy_engine in
@@ -11821,6 +12453,8 @@ if __name__ == "__main__":
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
+    if LEARNING_DB_ENABLED:
+        threading.Thread(target=_recompute_learning, daemon=True).start()  # warm the learning cache from Postgres at boot (display-only)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
