@@ -4440,6 +4440,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # the delta agrees, "Conflicting" when it opposes, the raw bias when there is no
     # dominant side, and "Unknown" when CVD has not been reported for this instrument.
     _cvd_st = strict.get("cvd_state")
+    _cvd_live = CVD_BY_TICKER.get(active_ticker) or {}
     if not _cvd_st:
         _cvd_agree = "Unknown"
     elif _diag_dom == "Neutral":
@@ -4480,7 +4481,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
         "location_ok":           bool(_diag_gd.get("location_ok")),
         "near_vwap":             bool(_diag_gd.get("near_vwap")),
         # CVD hard-filter + RVOL soft-modifier diagnostics (display-only).
+        # cvd_state is the COMMITTED direction (what the gate vetoes on); cvd_pending
+        # + cvd_opposite_count expose the 2-candle flip confirmation in progress.
         "cvd_state":             _cvd_st,
+        "cvd_pending":           _cvd_live.get("pending_dir"),
+        "cvd_opposite_count":    int(_cvd_live.get("opposite_count") or 0),
         "cvd_value":             strict.get("cvd_value"),
         "cvd_direction":         strict.get("cvd_direction"),
         "cvd_agreement":         _cvd_agree,
@@ -4635,6 +4640,8 @@ def full_analysis(current_price_override=None, ticker_override=None):
             "location_ok":           False,
             "near_vwap":             False,
             "cvd_state":             None,
+            "cvd_pending":           None,
+            "cvd_opposite_count":    0,
             "cvd_value":             None,
             "cvd_direction":         None,
             "cvd_agreement":         "Unknown",
@@ -7816,7 +7823,7 @@ def webhook():
     #    from its change vs the prior reading and left None when unmeasurable, so
     #    no label is fabricated. Data-only: store + ack, never scored.
     if normalized in CVD_TYPES:
-        cvd_state = "bullish" if normalized in CVD_BULLISH_TYPES else "bearish"
+        signaled_state = "bullish" if normalized in CVD_BULLISH_TYPES else "bearish"
         raw_cvd = data.get("cvd")
         if raw_cvd is None:
             raw_cvd = data.get("cvd_value")
@@ -7834,24 +7841,75 @@ def webhook():
                 cvd_dir = "falling"
             else:
                 cvd_dir = _prev_cvd.get("direction")
+
+        # ── 2-candle confirmation debounce on the COMMITTED state ───────────────
+        #   The committed direction (the ONLY thing evaluate_strict_setup vetoes
+        #   on, via cvd.get("state")) flips ONLY after the OPPOSITE direction is
+        #   signaled on 2 DISTINCT 1-minute candles. Rules:
+        #     • First-ever reading commits immediately (fail-open baseline).
+        #     • A signal AGREEING with the committed state clears any pending flip
+        #       (opposite_count -> 0).
+        #     • An opposite signal increments opposite_count once per NEW 1-minute
+        #       candle (same-minute repeats never double-count); a skipped minute
+        #       with no signal does NOT reset the count.
+        #     • opposite_count reaching 2 flips the committed state, then resets.
+        _committed    = _prev_cvd.get("state")
+        _pending      = _prev_cvd.get("pending_dir")
+        _opp_count    = int(_prev_cvd.get("opposite_count") or 0)
+        _last_opp_min = _prev_cvd.get("last_opposite_minute")
+        _this_min     = int(now_utc().timestamp() // 60)   # 1-minute candle bucket
+
+        if _committed is None:
+            committed_state = signaled_state               # establish baseline
+            pending_dir, opp_count, last_opp_min = None, 0, None
+            _flip_note = "baseline"
+        elif signaled_state == _committed:
+            committed_state = _committed                    # reaffirmed -> clear pending
+            pending_dir, opp_count, last_opp_min = None, 0, None
+            _flip_note = "confirmed"
+        else:
+            # Opposite direction — count DISTINCT 1-minute candles toward a flip.
+            _same_candle = (_pending == signaled_state
+                            and _last_opp_min is not None
+                            and _this_min == _last_opp_min)
+            if _same_candle:
+                opp_count, last_opp_min = _opp_count, _last_opp_min   # repeat in same candle
+            else:
+                opp_count    = (_opp_count if _pending == signaled_state else 0) + 1
+                last_opp_min = _this_min
+            if opp_count >= 2:
+                committed_state = signaled_state            # 2 distinct candles -> FLIP
+                pending_dir, opp_count, last_opp_min = None, 0, None
+                _flip_note = "flip 2/2 -> %s" % signaled_state
+            else:
+                committed_state = _committed                # hold; watch only
+                pending_dir = signaled_state
+                _flip_note = "watch %d/2 -> %s" % (opp_count, signaled_state)
+
         CVD_BY_TICKER[resolved_inst] = {
-            "state":     cvd_state,
-            "value":     cvd_val,
-            "direction": cvd_dir,
-            "ts":        now_utc().isoformat(),
+            "state":                committed_state,
+            "value":                cvd_val,
+            "direction":            cvd_dir,
+            "ts":                   now_utc().isoformat(),
+            "pending_dir":          pending_dir,
+            "opposite_count":       opp_count,
+            "last_opposite_minute": last_opp_min,
         }
-        logger.info("CVD update: %s = %s (value=%s, dir=%s)",
-                    resolved_inst, cvd_state, cvd_val, cvd_dir)
-        _record_diagnostic("%s | %s — CVD %s (value=%s, dir=%s) — data only, no scoring" % (
+        logger.info("CVD update: %s signaled=%s committed=%s (%s, value=%s, dir=%s)",
+                    resolved_inst, signaled_state, committed_state, _flip_note, cvd_val, cvd_dir)
+        _record_diagnostic("%s | %s — CVD signaled %s, committed %s (%s) — data only, no scoring" % (
             fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"),
-            resolved_inst, cvd_state, cvd_val, cvd_dir))
+            resolved_inst, signaled_state, committed_state, _flip_note))
         return jsonify({
-            "status":        "cvd_updated",
-            "ticker":        resolved_inst,
-            "cvd_state":     cvd_state,
-            "cvd_value":     cvd_val,
-            "cvd_direction": cvd_dir,
-            "price":         parsed_price if parsed_price is not None else CURRENT_PRICE,
+            "status":             "cvd_updated",
+            "ticker":             resolved_inst,
+            "cvd_state":          committed_state,
+            "cvd_signaled":       signaled_state,
+            "cvd_pending":        pending_dir,
+            "cvd_opposite_count": opp_count,
+            "cvd_value":          cvd_val,
+            "cvd_direction":      cvd_dir,
+            "price":              parsed_price if parsed_price is not None else CURRENT_PRICE,
         }), 200
 
     # ── Volume-spike ingestion (VOLUME SPIKE) — one half of the +15 volume edge ──
@@ -9321,6 +9379,8 @@ def dashboard():
     <div class="gstat"><div class="l">CVD Value</div><div class="v" id="cvd-value">—</div></div>
     <div class="gstat"><div class="l">CVD Dir</div><div class="v" id="cvd-dir">—</div></div>
     <div class="gstat"><div class="l">Agreement</div><div class="v" id="cvd-agree">—</div></div>
+    <div class="gstat"><div class="l">Pending Flip</div><div class="v" id="cvd-pending">—</div></div>
+    <div class="gstat"><div class="l">Opp. Candles</div><div class="v" id="cvd-oppcount">—</div></div>
     <div class="gstat"><div class="l">Rel Volume</div><div class="v" id="cvd-rvol">—</div></div>
     <div class="gstat"><div class="l">Volume</div><div class="v" id="cvd-volstate">—</div></div>
   </div>
@@ -9782,6 +9842,16 @@ function renderModules(d){
   const cvdAgree = diag.cvd_agreement || 'Unknown';
   _setCvd('cvd-agree', cvdAgree,
     cvdAgree==='Confirmed' ? '#22c55e' : cvdAgree==='Conflicting' ? '#ef4444' : '#6b7280');
+  // 2-candle flip confirmation in progress — the committed state above holds until
+  // the opposite direction confirms on 2 distinct 1-minute candles (then it flips).
+  const cvdPend = diag.cvd_pending;
+  const cvdOpp  = Number(diag.cvd_opposite_count || 0);
+  _setCvd('cvd-pending',
+    cvdPend==='bullish' ? '\u25b2 Bullish' : cvdPend==='bearish' ? '\u25bc Bearish' : 'None',
+    cvdPend==='bullish' ? '#22c55e' : cvdPend==='bearish' ? '#ef4444' : '#6b7280');
+  _setCvd('cvd-oppcount',
+    cvdPend ? (cvdOpp + '/2') : '\u2014',
+    cvdOpp>=1 ? '#f59e0b' : '#6b7280');
   _setCvd('cvd-rvol',
     diag.rvol_value!=null ? Number(diag.rvol_value).toFixed(2)+'\u00d7' : '—');
   // Volume confirmation state (+15 Edge component, fail-open READY gate):
