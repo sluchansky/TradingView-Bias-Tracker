@@ -125,8 +125,15 @@ _DUP_TS           = deque(maxlen=5000)   # duplicate-signal timestamps (UTC)
 MANAGED_TRADES_BY_KEY = {}  # (instrument,direction,entry_lo,date) -> managed-trade dict
 LAST_READY_BY_TICKER  = {}  # instrument -> last READY card entry snapshot (for /why)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
-MITIGATED_PRICES    = []     # [{"price": float, "ts": str}]
-ZONE_MITIGATED_FLAG = False  # True once any zone is mitigated; cleared on new structure or /clear
+# Zone-mitigation state is tracked PER INSTRUMENT so one instrument's mitigation
+# flood (e.g. MGC) can never arm, evict, or clear another's (e.g. MNQ) state.
+# Each entry is {"price": float, "ts": iso8601}; the flag marks mitigation
+# currently active for that instrument (armed by a ZONE MITIGATED alert, cleared
+# by a SAME-instrument structure reset or /clear). is_near_mitigated_zone() also
+# expires entries older than the mode's MITIGATED_TTL_MIN so a stale consumed
+# zone stops blocking forever (SCALP=30 min; SWING=None → no expiry, historical).
+MITIGATED_PRICES_BY_TICKER = {}   # {inst: [{"price": float, "ts": str}, ...]} cap 10 each
+MITIGATED_FLAG_BY_TICKER   = {}   # {inst: bool} — mitigation active for this instrument
 VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso}, "MGC": {...}} — latest VWAP per instrument
 VOLATILITY_BY_TICKER = {}     # {"MNQ": {"atr_pts","ratio","ts"}, "MGC": {...}} — latest volatility per instrument
 # CVD (Cumulative Volume Delta) confirmation state, per instrument. Set by the
@@ -244,6 +251,7 @@ MODES = {
         "MIN_TOTAL_SCORE":   4,       # require real confluence before TRADE/HIGH tiers
         "SCORE_WINDOW_MIN":  45,      # score only the last 45 min of alerts
         "STAGE_WINDOW_MIN":  30,      # setup-stage looks back 30 min, not last 5 alerts
+        "MITIGATED_TTL_MIN": 30,      # a consumed-zone mitigation expires after 30 min (un-sticks stale "scoring skipped")
         "ATTEMPT_TRADABLE":  True,    # BOS-only structures can trade (capped at BIAS)
         "RISK_MULT_ATTEMPT": 0.5,     # half size on BOS-only entries
         # Volatility regime thresholds — ratio of recent 1m ATR to the session-
@@ -314,6 +322,7 @@ MODES = {
         "MIN_TOTAL_SCORE":   0,
         "SCORE_WINDOW_MIN":  None,    # score full history
         "STAGE_WINDOW_MIN":  None,    # last 5 alerts
+        "MITIGATED_TTL_MIN": None,    # SWING: no mitigation expiry (historical behaviour)
         "ATTEMPT_TRADABLE":  False,
         "RISK_MULT_ATTEMPT": 1.0,
         # Volatility thresholds — swing tolerates a bit more before holding.
@@ -2800,20 +2809,51 @@ def _handle_zone_broken(price, instrument=None):
     logger.info("Zone broken at %.1f — cancelled %d directional alerts", price, cancelled)
 
 
-def _handle_zone_mitigated(price):
-    """Record the consumed zone level and arm the mitigation flag."""
-    global MITIGATED_PRICES, ZONE_MITIGATED_FLAG
-    MITIGATED_PRICES.append({"price": price, "ts": datetime.now(timezone.utc).isoformat()})
-    MITIGATED_PRICES    = MITIGATED_PRICES[-10:]
-    ZONE_MITIGATED_FLAG = True
-    logger.info("Zone mitigated at %.1f — flag armed, %d levels tracked", price, len(MITIGATED_PRICES))
+def _handle_zone_mitigated(price, ticker):
+    """Record the consumed zone level and arm the mitigation flag FOR ONE
+    INSTRUMENT. State is instrument-scoped so an MGC mitigation never arms (or
+    evicts) MNQ's state and vice-versa."""
+    inst = instrument_of(ticker)
+    lst  = MITIGATED_PRICES_BY_TICKER.setdefault(inst, [])
+    lst.append({"price": price, "ts": datetime.now(timezone.utc).isoformat()})
+    MITIGATED_PRICES_BY_TICKER[inst] = lst[-10:]
+    MITIGATED_FLAG_BY_TICKER[inst]   = True
+    logger.info("Zone mitigated at %.1f (%s) — flag armed, %d levels tracked",
+                price, inst, len(MITIGATED_PRICES_BY_TICKER[inst]))
 
 
-def is_near_mitigated_zone(price):
-    """Return (True, consumed_price) if price is within MITIGATED_TOLERANCE_PCT of any mitigated zone."""
-    if price is None or not MITIGATED_PRICES:
+def is_near_mitigated_zone(price, ticker):
+    """Return (True, consumed_price) if `price` is within MITIGATED_TOLERANCE_PCT
+    of any of THIS instrument's mitigated zones that are still fresh.
+
+    Entries older than the active mode's MITIGATED_TTL_MIN are expired (and pruned
+    in place) so a stale consumed zone no longer suppresses scoring forever — the
+    bug that left MNQ permanently "scoring skipped". SWING uses TTL None → no
+    expiry (historical behaviour). Expiry is money-safe: an expired mitigation
+    makes zone_valid_* False, so the READY gate still fails; it only stops the
+    consumed-zone short-circuit from blocking evaluation indefinitely.
+    """
+    inst    = instrument_of(ticker)
+    records = MITIGATED_PRICES_BY_TICKER.get(inst)
+    if price is None or not records:
         return False, None
-    for mz in MITIGATED_PRICES:
+    ttl_min = cfg("MITIGATED_TTL_MIN")
+    if ttl_min is not None:
+        cutoff = now_utc() - timedelta(minutes=ttl_min)
+        fresh  = []
+        for mz in records:
+            try:
+                keep = datetime.fromisoformat(mz["ts"]) >= cutoff
+            except (ValueError, TypeError, KeyError):
+                keep = True   # fail-open: never drop an un-parseable record
+            if keep:
+                fresh.append(mz)
+        if len(fresh) != len(records):
+            MITIGATED_PRICES_BY_TICKER[inst] = fresh
+        records = fresh
+        if not records:
+            return False, None
+    for mz in records:
         ref = mz["price"]
         if ref and abs(price - ref) / ref <= MITIGATED_TOLERANCE_PCT:
             return True, ref
@@ -3341,8 +3381,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     #    state; pairing it with a same-direction reaction (5m confirmation candle,
     #    zone-confirmed alert, or liquidity sweep) is what makes the retest
     #    tradeable. Instrument+side scoped via the per-instrument nearest level. ──
-    has_mitigated_demand = bool(ZONE_MITIGATED_FLAG and is_near_mitigated_zone(nearest_demand)[0])
-    has_mitigated_supply = bool(ZONE_MITIGATED_FLAG and is_near_mitigated_zone(nearest_supply)[0])
+    has_mitigated_demand = bool(MITIGATED_FLAG_BY_TICKER.get(inst) and is_near_mitigated_zone(nearest_demand, inst)[0])
+    has_mitigated_supply = bool(MITIGATED_FLAG_BY_TICKER.get(inst) and is_near_mitigated_zone(nearest_supply, inst)[0])
     reaction_long  = bool(has_bull_confirm or has_dem_confirm or has_bull_sweep)
     reaction_short = bool(has_bear_confirm or has_sup_confirm or has_bear_sweep)
     zone_valid_long  = bool(has_mitigated_demand and reaction_long)
@@ -4348,20 +4388,23 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # ── Zone Mitigated: a consumed zone blocks entries UNLESS the mitigation is
     # a confirmed bullish reaction (handled as a LONG via the strict gate). ──
     mitig_confirmed = bool(confluences.get("zone_mitigated"))
-    near_sup_mz, mz_sup_price = is_near_mitigated_zone(nearest_supply)
-    near_dem_mz, mz_dem_price = is_near_mitigated_zone(nearest_demand)
-    # Block only when mitigation is active (flag not yet cleared by a structure
-    # reset) AND the ACTIVE instrument's nearest zone actually sits on a mitigated
-    # price. The flag alone is global, so requiring proximity keeps a mitigated
-    # MGC zone from WAIT-blocking an unrelated MNQ alert (and vice-versa).
+    _mit_inst = instrument_of(active_ticker)
+    near_sup_mz, mz_sup_price = is_near_mitigated_zone(nearest_supply, _mit_inst)
+    near_dem_mz, mz_dem_price = is_near_mitigated_zone(nearest_demand, _mit_inst)
+    # Block only when THIS instrument's mitigation is active (flag not yet cleared
+    # by a same-instrument structure reset, entries not yet TTL-expired) AND its
+    # nearest zone actually sits on a mitigated price. State is instrument-scoped
+    # so a mitigated MGC zone can neither WAIT-block nor arm an unrelated MNQ
+    # alert (and vice-versa).
     zone_mitigated_near = (
-        ZONE_MITIGATED_FLAG and (near_sup_mz or near_dem_mz)
+        MITIGATED_FLAG_BY_TICKER.get(_mit_inst) and (near_sup_mz or near_dem_mz)
         and not zone_broken_active
         and not mitig_confirmed
     )
+    _mit_records = MITIGATED_PRICES_BY_TICKER.get(_mit_inst)
     mitigated_zone_price = (
         mz_sup_price or mz_dem_price
-        or (MITIGATED_PRICES[-1]["price"] if MITIGATED_PRICES else None)
+        or (_mit_records[-1]["price"] if _mit_records else None)
     )
     if zone_mitigated_near:
         # Full override — zone mitigation supersedes ALL scores, setups, and plans
@@ -7971,7 +8014,7 @@ def _heartbeat_eval_loop():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, ZONE_MITIGATED_FLAG, LAST_WEBHOOK_AT
+    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT
 
     webhook_received_at = now_utc()   # T0 for the webhook->alert delay metric
     LAST_WEBHOOK_AT = webhook_received_at   # any inbound POST, before any early return
@@ -8249,7 +8292,7 @@ def webhook():
             ZONE_BROKEN_AT = {"price": None, "alerts_since": 0, "instrument": _zb_instrument}
     elif normalized in ("MGC ZONE MITIGATED", "MNQ ZONE MITIGATED"):
         if parsed_price is not None:
-            _handle_zone_mitigated(parsed_price)
+            _handle_zone_mitigated(parsed_price, resolved_inst)
     elif ZONE_BROKEN_AT is not None and normalized not in _zone_neutral:
         # Count expiry only on same-instrument alerts so the other instrument's
         # activity can't prematurely clear this instrument's broken-zone blocker.
@@ -8267,9 +8310,10 @@ def webhook():
         "MGC NEW SUPPLY ZONE", "MGC NEW DEMAND ZONE",
         "MNQ NEW SUPPLY ZONE", "MNQ NEW DEMAND ZONE",
     ))
-    if normalized in _STRUCTURE_RESET and ZONE_MITIGATED_FLAG:
-        ZONE_MITIGATED_FLAG = False
-        logger.info("Zone mitigation cleared — new structure alert: %s", normalized)
+    if normalized in _STRUCTURE_RESET and MITIGATED_FLAG_BY_TICKER.get(resolved_inst):
+        MITIGATED_FLAG_BY_TICKER[resolved_inst] = False
+        logger.info("Zone mitigation cleared (%s) — new structure alert: %s",
+                    resolved_inst, normalized)
 
     # ── Account Profile selection ──
     profile_name = str(data.get("profile") or DEFAULT_PROFILE).strip()
@@ -8813,14 +8857,14 @@ def add_journal_entry():
 
 @app.route("/clear", methods=["POST"])
 def clear_alerts():
-    global CURRENT_PRICE, ZONE_BROKEN_AT, MITIGATED_PRICES, ZONE_MITIGATED_FLAG, JOURNAL_KEYS
+    global CURRENT_PRICE, ZONE_BROKEN_AT, JOURNAL_KEYS
     ALERT_HISTORY.clear()
     CURRENT_PRICE       = None
     CURRENT_PRICE_BY_TICKER.clear()
     CURRENT_PRICE_TS_BY_TICKER.clear()
     ZONE_BROKEN_AT      = None
-    MITIGATED_PRICES    = []
-    ZONE_MITIGATED_FLAG = False
+    MITIGATED_PRICES_BY_TICKER.clear()
+    MITIGATED_FLAG_BY_TICKER.clear()
     JOURNAL_KEYS.clear()
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
