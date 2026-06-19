@@ -100,3 +100,13 @@ Zone types are **prefixed-only** (`MGC …`/`MNQ …`) and must hardcode the ins
 `CVD …` is unprefixed and self-resolves from `ticker`. `ZONE MITIGATED` is prefixed AND needs a real
 `"price":"{{close}}"`: the +0.3% (`MITIGATED_TOLERANCE_PCT`) proximity check populates
 `MITIGATED_PRICES`, so a price-less mitigation can NEVER open `zone_valid` even if it registers.
+
+**RESOLVED / confirmed live:** after the user recreated the two broken alerts, prod began receiving the
+canonical forms `{"alert_type":"MGC ZONE MITIGATED","price":"4170.4"}` and `{"alert_type":"MNQ VOLUME SPIKE"}`
+with ZERO `Unrecognized alert type` warnings, and the scored line flipped to **`Gate: zone=Y …`** for the
+first time (was always `zone=N`). So the zone HARD gate now opens. Lesson for future "0 signals": once the
+config gap is closed, remaining WAITs are LEGITIMATE alignment, not config — e.g. MGC showed
+`zone=Y vwap=N struct=Y edge=35<70`: the gate is just waiting for VWAP side + edge≥threshold to coincide
+with the (transient) zone-mitigation window. Don't re-investigate as a config bug; the pieces simply have
+to line up on the SAME instrument at the SAME time. (Note: VOLUME SPIKE fired on MNQ while the mitigation
+was on MGC, so a clean same-instrument +volume edge bump wasn't captured in that window.)
