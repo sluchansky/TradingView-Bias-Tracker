@@ -27,6 +27,14 @@ SAME shared Edge helper (`compute_trade_edge_components`) so gate score == displ
 every trade the moment the feed lags or is unconfigured. The veto only fires on a PRESENT, CONFLICTING reading.
 **How to apply:** any future directional "confirmation" signal (delta, order-flow, footprint) should
 follow the same shape — hard veto on conflict, fail-open on absence, +N Edge on agreement.
+- **Single per-instrument slot = last-writer-wins.** `CVD_BY_TICKER[inst]` holds ONE state, so if the
+  user routes multiple directional volume indicators into the CVD types (seen live: a "CVD"
+  zero-cross/divergence indicator AND a separate "volume delta" indicator, both sending
+  `CVD BULLISH`/`CVD BEARISH`), they overwrite each other and the gate reads whichever fired most
+  recently. If they disagree the state flips per alert — this is config, not a bug. Combining them
+  (e.g. bullish only when BOTH agree, else neutral) is NOT possible via alert formatting alone; it
+  needs code (an aggregation layer keyed by source). Diagnose unexpected CVD flips by checking how
+  many distinct indicators feed the CVD types before touching the gate logic.
 
 ## RVOL = SOFT Edge modifier, NEVER gates
 - Optional `rvol` field parsed off ANY webhook payload into `RVOL_BY_TICKER` (no dedicated alert type).
