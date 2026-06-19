@@ -9048,133 +9048,153 @@ def dashboard():
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>AI Trading Partner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0a0a0f;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;padding:16px}
-  h1{font-size:18px;font-weight:700;text-align:center;padding:12px 0 18px;color:#a0a8ff;letter-spacing:.5px}
+  /* ── 80s Bloomberg terminal: black screen, amber/green/red phosphor ── */
+  :root{
+    --bg:#000; --panel:#0b0a06; --inset:#070602;
+    --border:#2c2410; --border-lit:#574716;
+    --amber:#ffb000; --amber-dim:#c79126; --amber-deep:#352808;
+    --cyan:#39d7e6; --cyan-deep:#08252b;
+    --green:#27d36b; --red:#ff4d4d; --warn:#f5a623;
+    --text:#e8ddc4; --muted:#8a7a4a;
+    --mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace;
+  }
+  body{background:var(--bg);color:var(--text);font-family:var(--mono);min-height:100vh;padding:16px}
+  /* CRT scanlines + faint amber top vignette (decorative, never block clicks) */
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:9998;
+    background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0px,rgba(0,0,0,.16) 1px,transparent 1px,transparent 3px)}
+  body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9997;
+    background:radial-gradient(120% 90% at 50% 0%,rgba(255,176,0,.05),rgba(0,0,0,0) 55%)}
+  h1{font-size:17px;font-weight:700;text-align:center;padding:12px 0 16px;color:var(--amber);letter-spacing:2px;text-transform:uppercase;text-shadow:0 0 9px rgba(255,176,0,.55)}
+  h1::after{content:"_";margin-left:1px;color:var(--amber);animation:cblink 1.1s steps(1) infinite}
+  @keyframes cblink{0%,49%{opacity:1}50%,100%{opacity:0}}
   /* Status card */
-  #status-card{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:18px;margin-bottom:18px;min-height:100px}
-  #status-label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:8px}
-  #trade-info{font-size:22px;font-weight:700}
-  #trade-detail{font-size:13px;color:#888;margin-top:6px;line-height:1.6}
+  #status-card{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:18px;margin-bottom:18px;min-height:100px}
+  #status-label{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:8px}
+  #trade-info{font-size:22px;font-weight:700;color:var(--text)}
+  #trade-detail{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.6}
   #pnl{font-size:26px;font-weight:800;margin-top:8px}
-  .pnl-pos{color:#22c55e} .pnl-neg{color:#ef4444} .pnl-flat{color:#888}
+  .pnl-pos{color:var(--green)} .pnl-neg{color:var(--red)} .pnl-flat{color:var(--muted)}
   /* Tabs */
   .tabs{display:flex;gap:8px;margin-bottom:14px}
-  .tab{flex:1;padding:12px;border-radius:12px;border:2px solid #1e1e32;background:#12121e;color:#888;font-size:15px;font-weight:600;cursor:pointer;text-align:center;transition:all .15s}
-  .tab.active{border-color:#a0a8ff;color:#a0a8ff;background:#16162a}
+  .tab{flex:1;padding:12px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-transform:uppercase;letter-spacing:1px;transition:all .15s}
+  .tab.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep);box-shadow:0 0 10px rgba(255,176,0,.25)}
   /* Direction toggle */
   .dir-row{display:flex;gap:8px;margin-bottom:16px}
-  .dir-btn{flex:1;padding:14px;border-radius:12px;border:2px solid #1e1e32;background:#12121e;font-size:16px;font-weight:700;cursor:pointer;transition:all .15s;color:#888}
-  .dir-btn.long.active{border-color:#22c55e;color:#22c55e;background:#0d1f14}
-  .dir-btn.short.active{border-color:#ef4444;color:#ef4444;background:#1f0d0d}
+  .dir-btn{flex:1;padding:14px;border-radius:2px;border:1px solid var(--border);background:var(--panel);font-size:15px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px;transition:all .15s;color:var(--muted)}
+  .dir-btn.long.active{border-color:var(--green);color:var(--green);background:#0a2113}
+  .dir-btn.short.active{border-color:var(--red);color:var(--red);background:#210d0d}
   .dir-btn .rec-tag{display:none;font-size:10px;font-weight:800;letter-spacing:.5px;opacity:.9;margin-left:6px}
-  .dir-btn.long.rec{box-shadow:0 0 12px rgba(34,197,94,.55);border-color:#22c55e}
-  .dir-btn.short.rec{box-shadow:0 0 12px rgba(239,68,68,.55);border-color:#ef4444}
+  .dir-btn.long.rec{box-shadow:0 0 12px rgba(39,211,107,.55);border-color:var(--green)}
+  .dir-btn.short.rec{box-shadow:0 0 12px rgba(255,77,77,.55);border-color:var(--red)}
   .dir-btn.rec .rec-tag{display:inline}
   /* Overrides */
   details{margin-bottom:16px}
-  summary{font-size:13px;color:#555;cursor:pointer;padding:6px 0;user-select:none;list-style:none}
+  summary{font-size:12px;color:var(--muted);cursor:pointer;padding:6px 0;user-select:none;list-style:none;text-transform:uppercase;letter-spacing:.5px}
   summary::-webkit-details-marker{display:none}
-  summary::before{content:'▶ ';font-size:10px}
-  details[open] summary::before{content:'▼ '}
+  summary::before{content:'> ';color:var(--amber-dim)}
+  details[open] summary::before{content:'v '}
   .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
   .field{display:flex;flex-direction:column;gap:4px}
-  .field label{font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.5px}
-  .field input{background:#0d0d18;border:1px solid #1e1e32;border-radius:8px;color:#e8e8f0;font-size:15px;padding:10px 12px;width:100%;outline:none}
-  .field input:focus{border-color:#a0a8ff}
+  .field label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .field input{background:var(--inset);border:1px solid var(--border);border-radius:2px;color:var(--text);font-family:var(--mono);font-size:15px;padding:10px 12px;width:100%;outline:none}
+  .field input:focus{border-color:var(--amber);box-shadow:0 0 8px rgba(255,176,0,.25)}
   /* Buttons */
-  .btn{width:100%;padding:18px;border-radius:14px;border:none;font-size:18px;font-weight:800;cursor:pointer;margin-bottom:10px;transition:all .1s;letter-spacing:.3px}
+  .btn{width:100%;padding:18px;border-radius:2px;border:none;font-family:var(--mono);font-size:17px;font-weight:800;cursor:pointer;margin-bottom:10px;transition:all .1s;letter-spacing:1px;text-transform:uppercase}
   .btn:active{transform:scale(.97)}
-  .btn-enter{background:#22c55e;color:#fff}
-  .btn-enter.short{background:#ef4444}
-  .btn-close{background:#f59e0b;color:#000}
-  .btn-be{background:#1e1e32;color:#a0a8ff;border:2px solid #a0a8ff;font-size:15px;padding:14px}
-  .btn-eod{background:#1e1e32;color:#888;border:1px solid #2a2a40;font-size:13px;padding:12px;margin-top:6px}
+  .btn-enter{background:var(--green);color:#04140a}
+  .btn-enter.short{background:var(--red);color:#1f0404}
+  .btn-close{background:var(--warn);color:#1a1304}
+  .btn-be{background:var(--amber-deep);color:var(--amber);border:1px solid var(--amber);font-size:14px;padding:14px}
+  .btn-eod{background:var(--inset);color:var(--muted);border:1px solid var(--border);font-size:12px;padding:12px;margin-top:6px}
   .btn:disabled{opacity:.4;cursor:not-allowed}
   /* Recommendation card */
-  #rec-card{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:18px;margin-bottom:18px;transition:border-color .3s}
+  #rec-card{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:18px;margin-bottom:18px;transition:border-color .3s}
   .rec-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-  #rec-label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#555}
-  .rec-badge{font-size:13px;font-weight:800;padding:5px 12px;border-radius:20px;background:#1e1e32;color:#888;letter-spacing:.5px}
-  .rec-badge.ready-long{background:#0d1f14;color:#22c55e;border:1px solid #22c55e}
-  .rec-badge.ready-short{background:#1f0d0d;color:#ef4444;border:1px solid #ef4444}
+  #rec-label{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--muted)}
+  .rec-badge{font-size:12px;font-weight:800;padding:5px 12px;border-radius:2px;background:var(--inset);color:var(--muted);letter-spacing:1px;text-transform:uppercase;border:1px solid var(--border)}
+  .rec-badge.ready-long{background:#0a2113;color:var(--green);border:1px solid var(--green)}
+  .rec-badge.ready-short{background:#210d0d;color:var(--red);border:1px solid var(--red)}
   .rec-badge.early-long{background:#10180d;color:#a3e635;border:1px solid #4d7c0f}
   .rec-badge.early-short{background:#180d10;color:#fb923c;border:1px solid #7c4d0f}
-  .rec-badge.wait{background:#1f1a0d;color:#f59e0b;border:1px solid #5a4a1a}
-  #rec-meta{font-size:12px;color:#888;margin-bottom:12px;line-height:1.6}
+  .rec-badge.wait{background:#1f1a0d;color:var(--warn);border:1px solid #5a4a1a}
+  #rec-meta{font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.6}
   .rec-gauge{position:relative;width:220px;margin:2px auto 14px;text-align:center}
   .gauge-svg{width:220px;height:auto;display:block;transition:filter .3s}
   .gauge-center{position:absolute;top:50px;left:0;right:0;text-align:center;pointer-events:none}
-  .gauge-prob{font-size:22px;font-weight:800;line-height:1}
-  .gauge-conf{font-size:10px;color:#9aa0b5;margin-top:3px;letter-spacing:.6px;text-transform:uppercase}
+  .gauge-prob{font-size:22px;font-weight:800;line-height:1;color:var(--amber)}
+  .gauge-conf{font-size:10px;color:var(--muted);margin-top:3px;letter-spacing:.6px;text-transform:uppercase}
   .gauge-dir{font-size:12px;font-weight:700;margin-top:3px}
-  .gauge-scores{font-size:11px;color:#9aa0b5;font-family:ui-monospace,monospace;margin-top:6px;line-height:1.5}
+  .gauge-scores{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:6px;line-height:1.5}
   #g-needle{transition:transform .5s cubic-bezier(.34,1.56,.64,1)}
-  .rec-gauge.glow .gauge-svg{filter:drop-shadow(0 0 9px rgba(34,197,94,.8))}
-  .rec-score-wrap{height:8px;background:#0d0d18;border-radius:6px;overflow:hidden;margin-bottom:4px}
-  #rec-score-bar{height:100%;width:0;background:#f59e0b;border-radius:6px;transition:width .4s,background .4s}
-  #rec-score-num{font-size:11px;color:#666;text-align:right;margin-bottom:12px}
+  .rec-gauge.glow .gauge-svg{filter:drop-shadow(0 0 9px rgba(39,211,107,.8))}
+  .rec-score-wrap{height:8px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden;margin-bottom:4px}
+  #rec-score-bar{height:100%;width:0;background:var(--amber);transition:width .4s,background .4s}
+  #rec-score-num{font-size:11px;color:var(--muted);text-align:right;margin-bottom:12px}
   .rec-checklist{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
-  .rec-item{display:flex;align-items:center;gap:8px;font-size:13px;padding:8px 10px;border-radius:8px;background:#0d0d18}
+  .rec-item{display:flex;align-items:center;gap:8px;font-size:13px;padding:8px 10px;border-radius:2px;background:var(--inset);border:1px solid var(--border)}
   .rec-item .ck{font-size:13px;width:16px;text-align:center}
-  .rec-item.ok{color:#cfe9d6} .rec-item.no{color:#6a6a7a}
-  .rec-plan{font-size:13px;color:#bbb;line-height:1.8;background:#0d0d18;border-radius:10px;padding:12px;margin-bottom:10px;display:none}
-  .rec-plan b{color:#e8e8f0}
-  .rec-reason{font-size:12px;color:#888;line-height:1.5;font-style:italic}
-  .btn-apply{background:#16162a;color:#a0a8ff;border:2px solid #a0a8ff;font-size:14px;padding:13px;margin-top:12px;margin-bottom:0}
+  .rec-item.ok{color:#bfe6c8} .rec-item.no{color:var(--muted)}
+  .rec-plan{font-size:13px;color:var(--text);line-height:1.8;background:var(--inset);border:1px solid var(--border);border-radius:2px;padding:12px;margin-bottom:10px;display:none}
+  .rec-plan b{color:var(--amber)}
+  .rec-reason{font-size:12px;color:var(--muted);line-height:1.5;font-style:italic}
+  .btn-apply{background:var(--amber-deep);color:var(--amber);border:1px solid var(--amber);font-size:14px;padding:13px;margin-top:12px;margin-bottom:0}
   /* Diagnostics modules */
-  .mod{background:#12121e;border:1px solid #1e1e32;border-radius:16px;padding:16px;margin-bottom:14px}
-  .mod-h{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b7280;margin-bottom:12px;font-weight:700}
+  .mod{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:16px;margin-bottom:14px}
+  .mod-h{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--amber-dim);margin-bottom:12px;font-weight:700}
   .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
   .mgauge-center{position:absolute;left:0;right:0;bottom:24%;text-align:center;pointer-events:none}
-  .mgauge-prob{font-size:21px;font-weight:800;line-height:1;letter-spacing:0}
-  .gauge-sub{font-size:10px;color:#9aa0b4;margin-top:3px;font-weight:600;letter-spacing:.3px}
+  .mgauge-prob{font-size:21px;font-weight:800;line-height:1;letter-spacing:0;color:var(--amber)}
+  .gauge-sub{font-size:10px;color:var(--muted);margin-top:3px;font-weight:600;letter-spacing:.3px}
   .gauge-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
-  .gstat{background:#0d0d18;border-radius:10px;padding:9px 6px;text-align:center}
-  .gstat .l{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:#6b7280}
+  .gstat{background:var(--inset);border:1px solid var(--border);border-radius:2px;padding:9px 6px;text-align:center}
+  .gstat .l{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
   .gstat .v{font-size:15px;font-weight:800;margin-top:3px}
   .cvd-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:2px}
   .sg-row{margin-bottom:10px}
   .sg-row:last-child{margin-bottom:0}
-  .sg-top{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;color:#cfd2e0;font-weight:600}
-  .sg-track{height:14px;background:#0d0d18;border-radius:8px;overflow:hidden}
-  .sg-fill{height:100%;border-radius:8px;transition:width .4s}
-  .sg-fill.long{background:linear-gradient(90deg,#15803d,#22c55e)}
-  .sg-fill.short{background:linear-gradient(90deg,#991b1b,#ef4444)}
+  .sg-top{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;color:var(--text);font-weight:600}
+  .sg-track{height:14px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden}
+  .sg-fill{height:100%;transition:width .4s}
+  .sg-fill.long{background:linear-gradient(90deg,#0f7a3a,var(--green))}
+  .sg-fill.short{background:linear-gradient(90deg,#7a1414,var(--red))}
   .ai-ck{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .ai-item{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 10px;border-radius:8px;background:#0d0d18;color:#9aa0b4}
+  .ai-item{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 10px;border-radius:2px;background:var(--inset);border:1px solid var(--border);color:var(--muted)}
   .ai-item .ic{width:16px;text-align:center;font-weight:800}
-  .ai-item.ok{color:#cfe9d6} .ai-item.ok .ic{color:#22c55e}
-  .ai-item.no .ic{color:#ef4444}
-  .cd-big{font-size:30px;font-weight:800;text-align:center;letter-spacing:-1px}
-  .cd-sub{font-size:12px;color:#9aa0b4;text-align:center;margin-top:4px}
-  .cd-track{height:10px;background:#0d0d18;border-radius:6px;overflow:hidden;margin-top:12px}
-  .cd-fill{height:100%;border-radius:6px;transition:width .4s,background .4s}
-  .wn-item{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#e7c0c0;background:#1a0f0f;border:1px solid #3a1b1b;border-radius:8px;padding:9px 11px;margin-bottom:8px;line-height:1.4}
+  .ai-item.ok{color:#bfe6c8} .ai-item.ok .ic{color:var(--green)}
+  .ai-item.no .ic{color:var(--red)}
+  .cd-big{font-size:30px;font-weight:800;text-align:center;letter-spacing:-1px;color:var(--amber)}
+  .cd-sub{font-size:12px;color:var(--muted);text-align:center;margin-top:4px}
+  .cd-track{height:10px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden;margin-top:12px}
+  .cd-fill{height:100%;transition:width .4s,background .4s}
+  .wn-item{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#e7c0c0;background:#1a0f0f;border:1px solid #3a1b1b;border-radius:2px;padding:9px 11px;margin-bottom:8px;line-height:1.4}
   .wn-item:last-child{margin-bottom:0}
-  .wn-ok{font-size:13px;color:#cfe9d6;background:#0d1f14;border:1px solid #1b3a26;border-radius:8px;padding:11px;line-height:1.5}
+  .wn-ok{font-size:13px;color:#bfe6c8;background:#0a2113;border:1px solid #1b3a26;border-radius:2px;padding:11px;line-height:1.5}
   /* Toast */
-  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1e1e32;color:#e8e8f0;padding:12px 24px;border-radius:10px;font-size:14px;opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap}
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0b0a06;color:var(--text);border:1px solid var(--border-lit);padding:12px 24px;border-radius:2px;font-size:14px;font-family:var(--mono);opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap;z-index:9999}
   #toast.show{opacity:1}
-  #refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-right:6px;animation:pulse 2s infinite}
+  #refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:6px;box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-  #last-updated{font-size:12px;color:#6b7280;margin:-6px 0 16px 14px}
-  #last-updated.stale{color:#f59e0b}
+  #last-updated{font-size:12px;color:var(--muted);margin:-6px 0 16px 14px}
+  #last-updated.stale{color:var(--warn)}
   /* Sensitivity (trading mode) toggle */
   #mode-row{display:flex;align-items:center;gap:10px;margin-bottom:18px}
-  #mode-cap{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#555;white-space:nowrap}
-  .mode-seg{display:flex;flex:1;background:#0d0d18;border:1px solid #1e1e32;border-radius:12px;padding:4px;gap:4px}
-  .mode-btn{flex:1;text-align:center;font-size:12px;font-weight:700;padding:9px 6px;border-radius:9px;color:#6a6a7a;cursor:pointer;transition:all .15s;letter-spacing:.3px}
-  #mode-scalp.active{background:#3a2a0d;color:#f5b342;box-shadow:inset 0 0 0 1px #5a4a1a}
-  #mode-swing.active{background:#16203a;color:#9ec5ff;box-shadow:inset 0 0 0 1px #2a3a5a}
+  #mode-cap{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);white-space:nowrap}
+  .mode-seg{display:flex;flex:1;background:var(--inset);border:1px solid var(--border);border-radius:2px;padding:4px;gap:4px}
+  .mode-btn{flex:1;text-align:center;font-size:12px;font-weight:700;padding:9px 6px;border-radius:2px;color:var(--muted);cursor:pointer;transition:all .15s;letter-spacing:.5px;text-transform:uppercase}
+  #mode-scalp.active{background:var(--amber-deep);color:var(--amber);box-shadow:inset 0 0 0 1px var(--amber)}
+  #mode-swing.active{background:var(--cyan-deep);color:var(--cyan);box-shadow:inset 0 0 0 1px #2a5560}
 </style>
 </head>
 <body>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
 <div id="alert-ctl" style="text-align:center;margin:2px 0 8px;font-size:12px">
-  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:#8a93a6;border:1px solid #1e1e32;border-radius:999px;padding:3px 12px;background:#12121e">🔔 READY alerts: on</span>
+  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:#c79126;border:1px solid #2c2410;border-radius:999px;padding:3px 12px;background:#0b0a06">🔔 READY alerts: on</span>
 </div>
 
 <!-- Sensitivity (trading mode) -->
@@ -9250,9 +9270,9 @@ def dashboard():
   <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
   <button class="btn btn-apply" id="btn-copy" style="display:none;margin-top:6px" onclick="copyOrder()">📋 Copy Order</button>
   <div id="send-row" style="display:none;margin-top:6px">
-    <button class="btn btn-apply" id="btn-send" style="background:#3a1d6e;border-color:#5b2da8;color:#ece6ff" onclick="sendOrder()">🚀 Send order to broker</button>
+    <button class="btn btn-apply" id="btn-send" style="background:#08252b;border:1px solid #39d7e6;color:#7fe9f5" onclick="sendOrder()">🚀 Send order to broker</button>
     <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px;color:#8a93a6;font-size:12px">
-      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#0e0e18;border:1px solid #1e1e32;border-radius:6px;color:#e8e8f0;padding:4px 6px;font-size:13px">
+      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#070602;border:1px solid #2c2410;border-radius:2px;color:#e8ddc4;padding:4px 6px;font-size:13px">
       <span style="color:#6b7280">· market order via TradersPost</span>
     </div>
   </div>
@@ -9272,7 +9292,7 @@ def dashboard():
     <div class="gstat"><div class="l">Long</div><div class="v" id="gs-long" style="color:#22c55e">—</div></div>
     <div class="gstat"><div class="l">Short</div><div class="v" id="gs-short" style="color:#ef4444">—</div></div>
     <div class="gstat"><div class="l">Edge Δ</div><div class="v" id="gs-gap" style="color:#e8e8f0">—</div></div>
-    <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#a0a8ff">—</div></div>
+    <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#ffb000">—</div></div>
   </div>
 </div>
 
@@ -9313,7 +9333,7 @@ def dashboard():
     <div class="field"><label>VWAP value</label><input id="f-vwap" type="number" step="0.01" placeholder="auto — type to override"></div>
     <div class="field"><label>Current price (optional)</label><input id="f-vwap-price" type="number" step="0.1" placeholder="optional"></div>
   </div>
-  <button class="btn" style="background:#16203a;color:#9ec5ff;border:1px solid #2a3a5a" onclick="setVwap()">Override VWAP</button>
+  <button class="btn" style="background:#08252b;color:#7fe9f5;border:1px solid #2a5560" onclick="setVwap()">Override VWAP</button>
   <div style="font-size:11px;color:#6b7280;margin-top:6px">A manual value holds for ~10 min, then auto resumes.</div>
 </details>
 
@@ -9796,7 +9816,7 @@ async function refreshRec() {
         ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
           + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
         : '';
-      meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; '
+      meta.innerHTML = '<b style="color:#ffb000">'+inst+'</b> &nbsp;·&nbsp; '
         + '<b style="color:#f59e0b">🌙 Live alerts paused</b>' + no + lv;
       const lb = document.querySelector('.dir-btn.long');
       const sb = document.querySelector('.dir-btn.short');
@@ -9855,7 +9875,7 @@ async function refreshRec() {
                : d.conviction_tier==='EARLY READY' ? '#a3e635' : '#eab308';
       convTxt = ' &nbsp;·&nbsp; <span style="color:#6b7280;font-size:11px">Tier</span> <b style="color:'+cc+'">'+d.conviction_tier+'</b>';
     }
-    meta.innerHTML = '<b style="color:#a0a8ff">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
+    meta.innerHTML = '<b style="color:#ffb000">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
 
     // Trade probability gauge — fed by the authoritative /status fields.
     renderGauge(d);
@@ -9951,7 +9971,7 @@ function renderDirView() {
   const label = blk ? (blk.label || 'WAIT') : (d.strict_label || 'WAIT');
   const met   = blk && blk.met!=null ? ' · ' + blk.met + '/4' : '';
   bar.style.width = Math.max(0, Math.min(100, score / EDGE_MAX * 100)) + '%';
-  bar.style.background = score>=85 ? '#22c55e' : score>=75 ? '#a0a8ff' : '#f59e0b';
+  bar.style.background = score>=85 ? '#22c55e' : score>=75 ? '#ffb000' : '#f59e0b';
   num.textContent = dir + ' Edge ' + score + '/' + EDGE_MAX + grade + ' · ' + label + met;
 
   // Trade plan + Apply only when the SELECTED side is the system's actionable side
@@ -10200,7 +10220,7 @@ async function refresh() {
 
     if (d.status === 'no_active_trade') {
       activeTrade = null;
-      card.style.borderColor = '#1e1e32';
+      card.style.borderColor = '#2c2410';
       info.textContent = 'No Active Trade';
       info.style.color = '#555';
       detail.textContent = '';
