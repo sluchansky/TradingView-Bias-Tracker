@@ -42,3 +42,17 @@ invariants, not preferences.
   broker. Never auto-retry an ambiguous broker send. **Why:** a `ConnectionError` can
   be a reset AFTER TradersPost received the order, so "connection failed" is not proof
   of "no order placed."
+
+## Data/confirmation alerts must NOT be pointed at TradersPost
+TradersPost only accepts **JSON trade orders**, and in this app those come ONLY from the
+dashboard ENTER button (`/traderspost`, always valid JSON). Confirmation/data TradingView
+alerts (VOLUME SPIKE, CVD, zone, structure) must be pointed at the **APP** webhook
+(`https://<app-domain>/api/webhook`) with a JSON `alert_type` message — never at the
+TradersPost strategy webhook.
+**Symptom of a misroute:** TradersPost rejects with `Unexpected 'V' at line 1 column 1 of the
+JSON5 data — Payload: Volume Crossing Up Threshold (Red)` (or similar plain text). That plain
+text is a TradingView indicator's DEFAULT message hitting the TradersPost webhook URL — it is a
+TradingView alert misconfiguration, NOT an app/code bug (the app never sends non-JSON to
+TradersPost). Fix = repoint that alert at the app webhook and set its message to JSON, e.g.
+`{"alert_type":"MNQ VOLUME SPIKE","ticker":"{{ticker}}"}` (prefixed type self-resolves the
+instrument; `{{ticker}}` is harmless extra).
