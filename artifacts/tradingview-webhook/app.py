@@ -256,24 +256,37 @@ MODES = {
         # modifier (Normal +10 / Elevated 0 / Extreme -10) instead of forcing WAIT.
         "VOL_HARD_GATE":     False,
         # ── READY gate (mode-tunable). SCALP READY now requires, ALL of:
-        #    Edge >= 70  AND  market structure (BOS/CHOCH/HH/HL/LH/LL on the trade
-        #    side)  AND  location (price near VWAP OR near the trade-side zone)  AND
-        #    volume_ok (fail-open: a volume spike OR RVOL >= RVOL_CONFIRM_THRESHOLD,
-        #    or simply no volume data). VWAP-direction and zone-reaction still SCORE
-        #    but no longer hard-block in SCALP (VWAP via the +15 component, zone via
-        #    the location gate). SWING keeps the strict zone AND vwap AND structure
-        #    AND edge>=80 behaviour exactly.
-        #    READY floor: EDGE_READY_THRESHOLD (70) is the single READY floor and
-        #    EDGE_FULL_READY_THRESHOLD (70) matches it, so SCALP emits no EARLY band —
-        #    a setup is READY at Edge >= 70 (A+ SETUP at >= 85) or it WAITs. ──
-        "EDGE_READY_THRESHOLD":      70,   # READY floor (A+ SETUP at >= 85)
-        "EDGE_FULL_READY_THRESHOLD": 70,   # full-READY floor == READY floor (no EARLY band)
-        "GATE_REQUIRE_VWAP":      False,   # VWAP scores (+15) but does not hard-block in SCALP
+        #    Edge >= 60  AND  a valid fresh trade-side zone (mitigation + reaction)
+        #    AND  market structure (BOS/CHOCH/HH/HL/LH/LL on the trade side)  AND
+        #    VWAP confirmation (price on the trade side of VWAP)  AND volume_ok
+        #    (fail-open: a volume spike OR RVOL >= RVOL_CONFIRM_THRESHOLD, or simply
+        #    no volume data). SWING keeps the strict zone AND vwap AND structure AND
+        #    edge>=80 behaviour exactly.
+        #    READY floor: EDGE_READY_THRESHOLD (60) is the single READY floor and
+        #    EDGE_FULL_READY_THRESHOLD (60) matches it, so SCALP emits no EARLY band —
+        #    a setup is READY at Edge >= 60 (a "Strong READY" at >= 75) or it WAITs.
+        #    EDGE_STRONG_THRESHOLD (75) only upgrades the LABEL ("Strong Trade" /
+        #    "Strong READY"); it never changes the READY decision. SETUP BUILDING
+        #    (informational, NON-actionable) fills the Edge 50-59 band when a valid
+        #    zone + confirming structure are present but the Edge is still climbing
+        #    to the READY floor (EDGE_SETUP_BUILDING_THRESHOLD .. EDGE_READY_THRESHOLD).
+        #    location & CVD-conflict are SOFT score modifiers in SCALP (see
+        #    GATE_SOFT_MODIFIERS), not hard blocks. ──
+        "EDGE_READY_THRESHOLD":          60,   # READY floor
+        "EDGE_FULL_READY_THRESHOLD":     60,   # full-READY floor == READY floor (no EARLY band)
+        "EDGE_STRONG_THRESHOLD":         75,   # label-only: "Strong Trade" / "Strong READY"
+        "EDGE_SETUP_BUILDING_THRESHOLD": 50,   # informational SETUP BUILDING band floor (< READY)
+        "GATE_REQUIRE_VWAP":      True,    # VWAP confirmation is a hard READY requirement
         "GATE_REQUIRE_STRUCTURE": True,    # structure is a hard READY requirement
-        "GATE_REQUIRE_ZONE":      False,   # zone no longer hard-blocks (folded into location gate)
-        "GATE_REQUIRE_LOCATION":  True,    # price must be near VWAP OR the trade-side zone
+        "GATE_REQUIRE_ZONE":      True,    # a valid fresh trade-side zone is a hard READY requirement
+        "GATE_REQUIRE_LOCATION":  False,   # location is a SOFT modifier (-5), not a hard gate
+        # CVD is a SOFT modifier (-10) in SCALP, not a hard veto (SWING keeps it hard).
+        "GATE_CVD_HARD":          False,
+        # Enable the SCALP soft Edge penalties: cooldown -5, location mismatch -5,
+        # CVD conflict -10. SWING leaves this False so its score is the pure additive sum.
+        "GATE_SOFT_MODIFIERS":    True,
         "RVOL_CONFIRM_THRESHOLD": 1.5,     # RVOL >= this confirms volume (alongside a volume spike)
-        "MIN_CONFIRMATIONS":      0,       # structure+location+volume+edge ARE the gate now
+        "MIN_CONFIRMATIONS":      0,       # zone+structure+vwap+volume+edge ARE the gate now
         # ── Score-aware conflict (SCALP). When opposing structure sits on BOTH sides
         #    within CONFLICT_WINDOW_MIN, take the DOMINANT side unless the two sides'
         #    Edge Scores are within CONFLICT_WAIT_GAP (then it's a true conflict →
@@ -313,14 +326,20 @@ MODES = {
         # SWING keeps the original strict gate: zone AND vwap AND structure AND
         # edge>=80, with no tiered early alerts. Expressed via the same cfg keys so
         # the READY boolean reduces to the historical behaviour exactly.
-        "EDGE_READY_THRESHOLD":      80,
-        "EDGE_FULL_READY_THRESHOLD": 80,   # SWING: floor == full → no EARLY READY band
+        "EDGE_READY_THRESHOLD":          80,
+        "EDGE_FULL_READY_THRESHOLD":     80,   # SWING: floor == full → no EARLY READY band
+        "EDGE_STRONG_THRESHOLD":         80,   # == READY floor → "Strong Trade" label unchanged
+        "EDGE_SETUP_BUILDING_THRESHOLD": None, # SWING never emits SETUP BUILDING
         "GATE_REQUIRE_VWAP":      True,
         "GATE_REQUIRE_STRUCTURE": True,
         "GATE_REQUIRE_ZONE":      True,
         # SWING already hard-gates zone AND vwap, which implies location — keep the
         # dedicated location gate OFF so SWING behaviour is unchanged.
         "GATE_REQUIRE_LOCATION":  False,
+        # SWING keeps CVD as a HARD veto and applies NO soft Edge modifiers, so its
+        # score remains the pure additive confluence sum (byte-for-byte unchanged).
+        "GATE_CVD_HARD":          True,
+        "GATE_SOFT_MODIFIERS":    False,
         "RVOL_CONFIRM_THRESHOLD": 1.5,     # volume is fail-open in SWING (no volume feed today)
         "MIN_CONFIRMATIONS":      0,
         # SWING keeps the original always-WAIT-on-conflict (not score-aware).
@@ -610,6 +629,11 @@ HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (
 # is READY (in addition to the instant alert on the triggering webhook).
 TRADE_READY_INTERVAL = int(os.environ.get("TRADE_READY_INTERVAL", 300))  # seconds (default 5 min)
 
+# Informational SETUP BUILDING heads-up: re-post at most once per this interval while
+# an instrument stays in the building band (SCALP only). Longer than READY so the
+# non-actionable heads-up is never spammy.
+SETUP_BUILDING_INTERVAL = int(os.environ.get("SETUP_BUILDING_INTERVAL", 600))  # seconds (default 10 min)
+
 # ── EARLY intrabar pre-READY alert config (additive, DISPLAY-ONLY) ────────────
 # An ⚡ EARLY LONG/SHORT fires the instant a liquidity sweep + a structure shift
 # (CHOCH / BOS / HH-HL-LH-LL "displacement") appear together in the window —
@@ -638,7 +662,7 @@ EARLY_ALERT_COOLDOWN_SEC = int(os.environ.get("EARLY_ALERT_COOLDOWN_SEC", 180))
 # never change a READY/WAIT verdict or double-post. Distinct from the Discord
 # check-in HEARTBEAT_INTERVAL above.
 EVAL_HEARTBEAT_ENABLED  = os.environ.get("EVAL_HEARTBEAT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-EVAL_HEARTBEAT_INTERVAL = int(os.environ.get("EVAL_HEARTBEAT_INTERVAL", 15))  # seconds (default 15s)
+EVAL_HEARTBEAT_INTERVAL = int(os.environ.get("EVAL_HEARTBEAT_INTERVAL", 3))  # seconds (default 3s)
 # ── Inbound signal de-dup + setup-state lifecycle (additive, DIAGNOSTIC) ──────
 # How long the SAME (instrument, alert_type) is treated as a repeat of the same
 # signal (TradingView now repeats alerts every minute while the condition holds).
@@ -3180,27 +3204,34 @@ def _rvol_adjustment(rvol_value):
     return 0
 
 
-def compute_trade_edge_components(signals):
-    """THE Edge Score — pure additive sum of the weighted confluence components
+def compute_trade_edge_components(signals, modifiers=None):
+    """THE Edge Score — additive sum of the weighted confluence components
     (BOS+20, CHOCH+20, VWAP+15, Sweep+15, Volume+15, CVD+15, Session+10 = max 110),
-    clamped to EDGE_SCORE_MAX. `signals` is a dict of booleans keyed by
-    EDGE_COMPONENTS[*][0]. Volatility and RVOL no longer feed the score (volume is a
-    first-class +15 component instead; volatility is informational + a SWING hard
-    gate). Returns (score, breakdown) where breakdown lists {"label", "points"} for
-    each credited component. Shared by the READY gate and the display layer so the
-    gate score and the shown Edge Score are identical."""
+    optionally reduced by SOFT negative `modifiers`, then clamped to [0, EDGE_SCORE_MAX].
+    `signals` is a dict of booleans keyed by EDGE_COMPONENTS[*][0]. `modifiers` is an
+    optional list of {"label", "points"} dicts with points < 0 (SCALP only: cooldown
+    -5, location mismatch -5, CVD conflict -10) — SWING passes None so its score is
+    the pure additive sum (byte-for-byte unchanged). Volatility and RVOL do not feed
+    the score (volume is a first-class +15 component instead; volatility is
+    informational + a SWING hard gate). Returns (score, breakdown) where `breakdown`
+    lists ONLY the credited POSITIVE components (modifiers are NOT folded into it, so
+    the raw/uncapped additive accounting for the cap display stays correct); the
+    caller surfaces the modifier lines separately. Shared by the READY gate and the
+    display layer so the gate score and the shown Edge Score are identical."""
     breakdown = []
     for key, label, pts in EDGE_COMPONENTS:
         if signals.get(key):
             breakdown.append({"label": label, "points": pts})
-    score = max(0, min(EDGE_SCORE_MAX, sum(item["points"] for item in breakdown)))
+    base    = sum(item["points"] for item in breakdown)
+    mod_sum = sum(int(m.get("points") or 0) for m in (modifiers or []) if m)
+    score   = max(0, min(EDGE_SCORE_MAX, base + mod_sum))
     return score, breakdown
 
 
 def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                           nearest_supply, nearest_demand,
                           bullish, bearish, confidence, alert_history,
-                          volatility=None, session=None):
+                          volatility=None, session=None, cooldown_active=False):
     """Strict checklist recommendation.
 
     A trade is recommended ONLY when ALL of:
@@ -3398,15 +3429,20 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     location_short = bool(near_vwap or _within(nearest_supply))
 
     # ── READY-gate configuration (mode-tunable). SWING keeps zone, VWAP & structure
-    #    as hard gates with edge>=80. SCALP READY = edge>=70 AND structure (hard) AND
-    #    location (near VWAP OR trade-side zone) AND volume_ok (fail-open); VWAP-
-    #    direction and zone-reaction still SCORE but no longer hard-block. ──
+    #    as hard gates with edge>=80. SCALP READY = edge>=60 AND a valid fresh zone
+    #    (hard) AND structure (hard) AND VWAP confirmation (hard) AND volume_ok
+    #    (fail-open). location & CVD-conflict are SOFT Edge penalties in SCALP (see
+    #    _edge_modifiers / GATE_SOFT_MODIFIERS), never hard blocks. ──
     ready_threshold      = cfg("EDGE_READY_THRESHOLD")        # actionable floor (EARLY)
     full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
+    strong_threshold     = cfg("EDGE_STRONG_THRESHOLD")       # label-only "Strong" upgrade
+    setup_building_threshold = cfg("EDGE_SETUP_BUILDING_THRESHOLD")  # informational band floor (None=off)
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
     require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
     require_zone      = bool(cfg("GATE_REQUIRE_ZONE"))
     require_location  = bool(cfg("GATE_REQUIRE_LOCATION"))
+    cvd_hard          = bool(cfg("GATE_CVD_HARD"))            # CVD hard veto (SWING) vs soft (SCALP)
+    soft_modifiers    = bool(cfg("GATE_SOFT_MODIFIERS"))      # enable SCALP soft Edge penalties
     min_confirmations = int(cfg("MIN_CONFIRMATIONS"))
 
     # ── Trend alignment (real, derived — never fabricated): the candidate side
@@ -3430,9 +3466,30 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "volume_confirmed": volume_confirmed, "cvd_confirmed": cvd_confirmed_short,
                 "preferred_session": session_pref}
 
+    def _edge_modifiers(direction):
+        """SOFT negative Edge penalties for `direction` (SCALP only; SWING returns []
+        because GATE_SOFT_MODIFIERS is False). cooldown_active -5 (a repeat signal
+        inside the dedup window), location mismatch -5 (price not near VWAP nor the
+        trade-side zone), CVD conflict -10 (delta opposes the trade — ONLY when CVD is
+        not a hard veto). These nudge the Edge Score but NEVER hard-block. The list is
+        stamped into gate_debug so the display layer reuses the EXACT same modifiers
+        (gate score == shown Edge Score)."""
+        if not soft_modifiers:
+            return []
+        mods = []
+        loc_ok = location_long if direction == "Long" else location_short
+        cvd_cf = cvd_conflict_long if direction == "Long" else cvd_conflict_short
+        if not loc_ok:
+            mods.append({"label": "Location mismatch", "points": -5})
+        if cvd_cf and not cvd_hard:
+            mods.append({"label": "CVD conflict", "points": -10})
+        if cooldown_active:
+            mods.append({"label": "Cooldown (repeat signal)", "points": -5})
+        return mods
+
     def _edge_for(direction):
-        # Pure additive component sum — volatility/RVOL modifiers no longer feed it.
-        return compute_trade_edge_components(_signals(direction))
+        # Additive component sum + SOFT modifiers (SCALP); SWING passes [] → pure sum.
+        return compute_trade_edge_components(_signals(direction), _edge_modifiers(direction))
 
     # ── Score-aware conflict resolution (single source for the gate AND the
     #    diagnostics block). `opposing_present` (above) = opposing structure on both
@@ -3539,6 +3596,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "require_zone":          require_zone,
             "ready_threshold":       ready_threshold,
             "full_ready_threshold":  full_ready_threshold,
+            "strong_threshold":      strong_threshold,
+            "setup_building_threshold": setup_building_threshold,
+            # SOFT Edge penalties applied to THIS direction's score (SCALP only).
+            # Stamped so the display layer reuses the identical modifiers (parity).
+            "edge_modifiers":        _edge_modifiers(direction),
             "conflicting_structure": true_conflict,
             "volatility_block":      vol_block,
             "edge_score":            score,
@@ -3568,9 +3630,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         # blocks READY).
         if not gd["volume_ok"]:
             fails.append("volume_unconfirmed")
-        # CVD HARD filter (both modes; fails open when CVD is unknown so SWING is
-        # unchanged today). A delta opposing the trade direction vetoes READY.
-        if gd["cvd_conflict"]:
+        # CVD filter — a HARD veto only when GATE_CVD_HARD (SWING). In SCALP CVD is a
+        # SOFT Edge modifier (-10, surfaced in edge_modifiers), NOT a failed gate.
+        # Fails open when CVD is unknown so SWING is unchanged today.
+        if cvd_hard and gd["cvd_conflict"]:
             fails.append("cvd_conflict")
         if gd["confirmations_passed"] < min_confirmations:
             fails.append("confirmations(%d<%d)"
@@ -3603,7 +3666,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             and (not require_structure or gd["structure_confirmed"])
             and (not require_location or gd["location_ok"])
             and gd["volume_ok"]             # volume FAIL-OPEN (only blocks data-present+unconfirmed)
-            and cvd_ok                      # CVD hard veto (fail-open when unknown)
+            and (not cvd_hard or cvd_ok)    # CVD hard veto ONLY when GATE_CVD_HARD (SWING); SCALP soft
             and _confirmations(direction) >= min_confirmations
         )
         if not gates_ok:
@@ -3792,10 +3855,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     if blk["ready"]:
         score = blk["score"]
         # Journal label stays in {Strong Trade, Possible Trade, WAIT}. A READY setup
-        # always clears full_ready_threshold, so it is a "Strong Trade"; the finer
-        # display tier (A+ / Strong / Possible) is computed separately downstream.
+        # clears ready_threshold; it is upgraded to "Strong Trade" ("Strong READY")
+        # at strong_threshold (SCALP 75; SWING 80 == its READY floor, so SWING's label
+        # is unchanged). The finer display grade is computed separately downstream.
         return _ret({
-            "label":      "Strong Trade" if score >= full_ready_threshold else "Possible Trade",
+            "label":      "Strong Trade" if score >= strong_threshold else "Possible Trade",
             "direction":  candidate,
             "candidate":  candidate,
             "score":      score,
@@ -3804,6 +3868,30 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "reason":     blk["reason"],
             "missing":    [],
             "gate_debug": blk["gate_debug"],
+        })
+
+    # ── SETUP BUILDING (informational, NON-actionable; SCALP only) ──────────────
+    # A valid fresh zone + confirming structure are present and the Edge is climbing
+    # toward the READY floor (EDGE_SETUP_BUILDING_THRESHOLD <= edge < READY). This is
+    # a heads-up ONLY: full_analysis maps it to the non-actionable "SETUP BUILDING"
+    # verdict, builds NO trade plan, and the broker path never sees it. Disabled when
+    # the building floor is None (SWING) — so SWING falls straight through to WAIT.
+    _bgd = blk["gate_debug"]
+    if (setup_building_threshold is not None and not true_conflict and not vol_block
+            and _bgd.get("zone_valid") and _bgd.get("structure_confirmed")
+            and setup_building_threshold <= blk["score"] < ready_threshold):
+        return _ret({
+            "label":      "Setup Building",
+            "direction":  None,
+            "candidate":  candidate,
+            "score":      blk["score"],
+            "readiness":  None,
+            "confluences": blk["confluences"],
+            "reason":     (f"{candidate} setup building — valid zone + structure, Edge "
+                           f"{blk['score']} climbing toward READY (>= {ready_threshold}). "
+                           f"Informational only — not a trade."),
+            "missing":    blk["missing"],
+            "gate_debug": _bgd,
         })
 
     # ── WAIT — name the failed gate(s) for the candidate side ──
@@ -4097,7 +4185,7 @@ def _timed(key):
             d[key] = round(d.get(key, 0.0) + (time.perf_counter() - t0) * 1000.0, 3)
 
 
-def full_analysis(current_price_override=None, ticker_override=None):
+def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
     active_ticker = instrument_of(ticker_override) if ticker_override else _active_ticker()
@@ -4154,7 +4242,7 @@ def full_analysis(current_price_override=None, ticker_override=None):
         strict = evaluate_strict_setup(
             current_price, active_ticker, vwap_value, vwap_status,
             nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
-            volatility=volatility, session=session_state,
+            volatility=volatility, session=session_state, cooldown_active=cooldown_active,
         )
     strict_label     = strict["label"]
     strict_score     = strict["score"]
@@ -4184,6 +4272,22 @@ def full_analysis(current_price_override=None, ticker_override=None):
             verdict        = "WAIT"
             strict_label   = "WAIT"
             strict_reason  = trade_plan.get("reason", strict_reason)
+    elif strict_label == "Setup Building" and strict.get("candidate"):
+        # SETUP BUILDING (informational, NON-actionable). Like MARKET CLOSED, the
+        # journaling label is forced to WAIT so the journal + live-card paths skip it;
+        # the building state is surfaced via the verdict + diagnostics ONLY. NO trade
+        # plan is built, so the broker path (is_actionable + top-level trade_plan)
+        # can never light up for a building setup.
+        verdict       = "SETUP BUILDING"
+        strict_label  = "WAIT"
+        trade_plan = {
+            "trade_plan": False,
+            "reason":     strict_reason or "Setup building — not yet READY.",
+            "entry_zone": None, "stop_loss": None,
+            "target1":    None, "target2":   None,
+            "rr":         None, "direction": strict.get("candidate"),
+            "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+        }
     else:
         verdict    = "WAIT"
         trade_plan = {
@@ -4359,6 +4463,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # operational level READY so the tiered ladder defers (no redundant WATCH/ARMED).
     if is_actionable(result["verdict"]):
         alert_level = "READY"
+    # SETUP BUILDING is informational (NON-actionable): surface its own operational
+    # level so the dedicated dispatcher can post it, and the tiered WATCH/ARMED ladder
+    # is bypassed (the building heads-up owns the level). Never an actionable signal.
+    elif result["verdict"] == "SETUP BUILDING":
+        alert_level = "SETUP BUILDING"
     elif (_cand in ("Long", "Short")
           and not zone_broken_active and not zone_mitigated_near):
         _zone = nearest_demand if _cand == "Long" else nearest_supply
@@ -4452,6 +4561,40 @@ def full_analysis(current_price_override=None, ticker_override=None):
     # Per-setup score diagnostics (the authoritative breakdown for the favored side).
     _diag_eb       = result.get("edge_breakdown") or {}
     _diag_blockers = list(_diag_gd.get("failed_conditions") or [])
+    # ── camelCase diagnostics (dashboard modules) — additive, observability-only ──
+    _req_edge = int(cfg("EDGE_READY_THRESHOLD"))
+    _strong   = cfg("EDGE_STRONG_THRESHOLD")
+    _edge_now = int(result.get("edge_score") or 0)
+    # readyStrength: only meaningful on an actionable verdict — "Strong" at/above the
+    # strong threshold, else "Standard". None when not READY (incl. SETUP BUILDING/WAIT).
+    if _diag_ready:
+        _ready_strength = "Strong" if (_strong is not None and _edge_now >= int(_strong)) else "Standard"
+    else:
+        _ready_strength = None
+    # vwapDistance: absolute points between price and the live VWAP (None-safe).
+    try:
+        _vwap_dist = (abs(float(current_price) - float(vwap_value))
+                      if (current_price is not None and vwap_value is not None) else None)
+    except (TypeError, ValueError):
+        _vwap_dist = None
+    if _vwap_dist is not None:
+        _vwap_dist = round(_vwap_dist, 2)
+    # zoneAge: best-effort minutes since the latest zone-FORMING alert for this
+    # instrument (NEW/CONFIRMED demand/supply). None when none found or unparseable.
+    _zone_age = None
+    try:
+        _inst_age = instrument_of(active_ticker)
+        for _al in reversed(ALERT_HISTORY):
+            _at = str(_al.get("alert_type") or "").upper()
+            if "ZONE" not in _at or "BROKEN" in _at or "MITIGATED" in _at:
+                continue
+            _ai = _al.get("instrument") or instrument_of(_al.get("ticker") or "")
+            if _inst_age and _ai and _ai != _inst_age:
+                continue
+            _zone_age = int((now_utc() - datetime.fromisoformat(_al["timestamp"])).total_seconds() // 60)
+            break
+    except Exception:
+        _zone_age = None
     result["alert_diagnostics"] = {
         "long_score":            _diag_long,
         "short_score":           _diag_short,
@@ -4491,6 +4634,19 @@ def full_analysis(current_price_override=None, ticker_override=None):
         "cvd_agreement":         _cvd_agree,
         "rvol_value":            strict.get("rvol_value"),
         "rvol_adj":              int(strict.get("rvol_adj") or 0),
+        # ── camelCase diagnostics consumed by the dashboard modules (additive,
+        #    display-only). edgeScore/requiredEdgeScore/failedGates/scoreBreakdown
+        #    mirror the snake_case fields above; zoneAge/zoneConsumed/vwapDistance/
+        #    cvdState/readyStrength are new heads-up signals for the SCALP redesign. ──
+        "edgeScore":             _edge_now,
+        "requiredEdgeScore":     _req_edge,
+        "failedGates":           _diag_blockers,
+        "scoreBreakdown":        _diag_eb.get("score_breakdown") or [],
+        "zoneAge":               _zone_age,
+        "zoneConsumed":          bool(result.get("zone_mitigated_near")),
+        "vwapDistance":          _vwap_dist,
+        "cvdState":              _cvd_st,
+        "readyStrength":         _ready_strength,
     }
     # Decision-support header (Quality/Probability/Risk/Reward/Window/Recommendation)
     # — all real-derived from the fields set above.
@@ -4537,6 +4693,9 @@ def full_analysis(current_price_override=None, ticker_override=None):
             a_copy["strict_direction"] = _d
             a_copy["strict_label"]     = "WAIT"
             a_copy["verdict"]          = "WAIT"
+            # Read THIS side's own stamped soft modifiers (not the candidate's) so the
+            # non-favored Edge Score keeps gate↔display parity for its own direction.
+            a_copy["gate_debug"]       = block.get("gate_debug") or {}
             eb_d = _analysis_edge_breakdown(a_copy)
             block.update(edge_score=eb_d["score"], edge_grade=eb_d["grade"], edge_breakdown=eb_d)
             if blockers:
@@ -4647,6 +4806,16 @@ def full_analysis(current_price_override=None, ticker_override=None):
             "cvd_agreement":         "Unknown",
             "rvol_value":            None,
             "rvol_adj":              0,
+            # camelCase diagnostics — neutralised while the market is closed.
+            "edgeScore":             0,
+            "requiredEdgeScore":     int(cfg("EDGE_READY_THRESHOLD")),
+            "failedGates":           ["market_closed"],
+            "scoreBreakdown":        [],
+            "zoneAge":               None,
+            "zoneConsumed":          False,
+            "vwapDistance":          None,
+            "cvdState":              None,
+            "readyStrength":         None,
         }
         result["decision_support"]   = _decision_support(result)
         for _d in ("Long", "Short"):
@@ -4975,6 +5144,11 @@ def send_live_ready_card(entry, ticker="", notify=False):
 LAST_TIER_LEVEL = {}   # instrument -> last alert_level seen ("WATCH"/"ARMED"/"READY")
 LAST_TIER_AT    = {}   # instrument -> datetime (UTC) of last WATCH/ARMED post attempt
 
+# SETUP BUILDING throttle state (SCALP only): the informational "setup building"
+# heads-up posts once when an instrument ENTERS the building band and then at most
+# once per SETUP_BUILDING_COOLDOWN_SEC while it persists, so it never spams.
+LAST_BUILDING_AT = {}  # instrument -> datetime (UTC) of last SETUP BUILDING post attempt
+
 # ── EARLY pre-READY alert runtime state (additive, display-only) ──────────────
 LAST_EARLY_ANCHOR  = {}  # (instrument, direction) -> structure-anchor ISO already EARLY-alerted (per-setup dedupe)
 LAST_EARLY_AT      = {}  # (instrument, direction) -> datetime (UTC) of last EARLY post (cooldown guard)
@@ -5117,6 +5291,80 @@ def _maybe_send_tiered_alert(a, record):
         logger.error("Tiered alert build error (%s/%s): %s", inst, level, exc)
         return False
     _enqueue_slow(lambda u=url, e=embed, i=inst, lv=level: _post_tiered_embed(u, e, i, lv))
+    return True
+
+
+def _build_setup_building_embed(a, inst):
+    """Compact informational SETUP BUILDING embed (SCALP only). NON-actionable — it
+    announces that a valid fresh zone + confirming structure are present and the Edge
+    is climbing toward the READY floor, BEFORE a tradeable setup exists. Everything
+    shown is read from the analysis `a` (never fabricated); there is NO trade plan."""
+    cand   = a.get("gate_candidate") or "—"
+    gd     = a.get("gate_debug") or {}
+    price  = a.get("current_price")
+    zone   = a.get("nearest_demand") if cand == "Long" else a.get("nearest_supply")
+    edge   = a.get("edge_score", 0)
+    need   = int(gd.get("ready_threshold") or cfg("EDGE_READY_THRESHOLD") or 0)
+    side_word = "demand" if cand == "Long" else "supply"
+    missing = [m for m in (a.get("strict_missing") or []) if m != "conflicting_structure"]
+    fields = [
+        {"name": "Setup",     "value": f"{cand} · at {side_word} zone", "inline": True},
+        {"name": "Edge",      "value": f"{edge}/{EDGE_SCORE_MAX} (need ≥ {need})", "inline": True},
+    ]
+    if price is not None:
+        fields.append({"name": "Price", "value": f"{price:,.2f}", "inline": True})
+    if zone:
+        fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
+    if missing:
+        fields.append({"name": "Still needs", "value": ", ".join(missing[:4]), "inline": False})
+    return {
+        "title":       f"🏗️ SETUP BUILDING · {inst}",
+        "description": (f"A {cand} setup is forming at a fresh {side_word} zone — Edge is "
+                       f"climbing toward READY. Informational only — **not a trade yet.**"),
+        "color":       0x95A5A6,
+        "fields":      fields,
+        "footer":      {"text": f"Setup Building · {inst} · non-actionable"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _maybe_send_setup_building_alert(a, record):
+    """Fire the informational SETUP BUILDING heads-up (SCALP only) for analysis `a`.
+    Throttled per instrument: posts once when the instrument ENTERS the building band
+    and then at most once per SETUP_BUILDING_INTERVAL while it persists; the standing
+    state is cleared the moment the verdict leaves SETUP BUILDING, so the next build
+    fires immediately.
+
+    NON-actionable: this never builds a trade plan, never touches the verdict, the
+    journal, or managed trades — purely a display heads-up. The Discord POST is
+    OFFLOADED to the slow-task worker so it never blocks the webhook worker. Returns
+    True iff an embed was enqueued. Fail-open: never raises into the webhook tail."""
+    inst = instrument_of(record.get("ticker") or record.get("instrument")
+                         or a.get("active_ticker") or "")
+    if not inst:
+        return False
+    # Only the SCALP-only informational verdict fires here. Any other verdict clears
+    # the standing throttle so a later build is treated as a fresh entry.
+    if a.get("verdict") != "SETUP BUILDING":
+        LAST_BUILDING_AT.pop(inst, None)
+        return False
+    now      = datetime.now(timezone.utc)
+    last_at  = LAST_BUILDING_AT.get(inst)
+    cooled   = (last_at is None or (now - last_at).total_seconds() >= SETUP_BUILDING_INTERVAL)
+    if not cooled:
+        return False
+    # Record the attempt up-front so a transient post failure can't turn into a
+    # per-webhook retry storm; the next attempt waits for the interval.
+    LAST_BUILDING_AT[inst] = now
+    url = _tiered_alert_url(inst)
+    if not url:
+        return False
+    try:
+        embed = _build_setup_building_embed(a, inst)
+    except Exception as exc:
+        logger.error("Setup-building alert build error (%s): %s", inst, exc)
+        return False
+    _enqueue_slow(lambda u=url, e=embed, i=inst: _post_tiered_embed(u, e, i, "SETUP BUILDING"))
     return True
 
 
@@ -6099,7 +6347,13 @@ def compute_edge_breakdown(a, entry):
         "cvd_confirmed":     bool(conf.get("cvd_confirmed")),
         "preferred_session": bool(sess.get("preferred")),
     }
-    score, raw_breakdown = compute_trade_edge_components(signals)
+    # SOFT Edge modifiers (SCALP only) — the EXACT list the gate stamped for THIS
+    # direction (entry.edge_modifiers), so the displayed Edge Score equals the gate
+    # score. SWING stamps none → pure additive sum (byte-for-byte unchanged). The
+    # modifiers reduce the final score but are NOT folded into raw_breakdown, so the
+    # cap accounting below stays the additive-only positive total.
+    modifiers = entry.get("edge_modifiers") or []
+    score, raw_breakdown = compute_trade_edge_components(signals, modifiers)
     raw_score   = sum(it["points"] for it in raw_breakdown)
     cap_applied = raw_score > EDGE_SCORE_MAX
 
@@ -6112,6 +6366,10 @@ def compute_edge_breakdown(a, entry):
     }
     breakdown = [{"label": relabel.get(it["label"], it["label"]), "points": it["points"]}
                  for it in raw_breakdown]
+    # Surface the SOFT modifier lines (negative) right after the positive components,
+    # so the visible Score Breakdown sums to the displayed (gate) score.
+    breakdown += [{"label": m["label"], "points": int(m["points"])}
+                  for m in modifiers if m]
 
     # Per-setup diagnostics: EVERY component with its present/points, plus the list
     # of confirmations that did NOT fire. Lets the card / dashboard render the full
@@ -6231,6 +6489,9 @@ def _analysis_edge_breakdown(a):
     direction = (a.get("strict_direction") or conf.get("direction") or tp.get("direction")
                  or ("Long" if bias == "Bullish" else "Short" if bias == "Bearish" else "Long"))
     bos_s, choch_s, vwap_pos, sd_zone = build_structure_fields(a, direction)
+    # Reuse the EXACT soft modifiers the gate stamped for the candidate direction so
+    # the unified Edge Score matches the gate score (parity). SWING stamps none.
+    _gd = a.get("gate_debug") or {}
     edge_entry = {
         "direction":          direction,
         "bos_status":         bos_s,
@@ -6239,6 +6500,7 @@ def _analysis_edge_breakdown(a):
         "supply_demand_zone": sd_zone,
         "strict_label":       a.get("strict_label"),
         "verdict":            a.get("verdict"),
+        "edge_modifiers":     _gd.get("edge_modifiers") or [],
     }
     return compute_edge_breakdown(a, edge_entry)
 
@@ -7383,7 +7645,8 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     _eval_timing_begin()
     eval_started_at = now_utc()
     _eval_t0 = time.perf_counter()
-    a = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst)
+    a = full_analysis(current_price_override=parsed_price, ticker_override=resolved_inst,
+                      cooldown_active=is_duplicate)
     eval_finished_at = now_utc()
     eval_duration_ms = round((time.perf_counter() - _eval_t0) * 1000.0, 3)
     alert_sent_at = None
@@ -7420,6 +7683,14 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         _maybe_dispatch_early_alert(a, record)
     except Exception as exc:
         logger.error("EARLY alert dispatch error: %s", exc)
+
+    # ── SETUP BUILDING heads-up (additive, NON-actionable, SCALP only). Fired HERE
+    # alongside the EARLY alert — purely informational, never alters the verdict,
+    # the journal, or managed trades. Throttled per instrument. ──
+    try:
+        _maybe_send_setup_building_alert(a, record)
+    except Exception as exc:
+        logger.error("Setup-building alert dispatch error: %s", exc)
 
     # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
     _risk_mult = (cfg("RISK_MULT_ATTEMPT")
