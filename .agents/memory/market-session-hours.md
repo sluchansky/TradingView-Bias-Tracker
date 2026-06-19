@@ -41,3 +41,40 @@ directions ready=False/WAIT), it never removes keys.
   wants total closed-market Discord silence.
 - `last_valid_data_for(ticker)` prefers the last *alert* price+ts, falls back to
   the auto-sourced price, so the closed banner shows the real last tape value.
+
+## Exchange-holiday calendar (full-day + early-close half-days)
+
+Holidays live ENTIRELY inside `market_session_status` so the money gate
+(/traderspost), /status, heartbeat counters and dashboard banner all inherit them
+with no other call-site change. It **reuses the existing `market_open` /
+`market_reason` / `next_open` wire keys** — no /status whitelist change needed.
+
+The calendar is computed algorithmically per year (no annual maintenance):
+`_nth_weekday`, `_last_weekday`, `_easter` (Gregorian computus → Good Friday),
+`_observed` (federal Sat→Fri / Sun→Mon shift), cached in `_HOLIDAY_CACHE`.
+- FULL closures: New Year's, Good Friday, Memorial, Juneteenth, Independence,
+  Labor, Thanksgiving, Christmas.
+- EARLY (13:00 ET) half-days: July 3, day after Thanksgiving, Christmas Eve —
+  each SKIPPED if it collides with a full holiday (e.g. when July 4 is a Saturday,
+  observance makes July 3 a FULL Independence Day, not an early close) or a weekend.
+- `MARKET_HOLIDAYS_EXTRA` env adds/overrides: comma list of `YYYY-MM-DD` (full) or
+  `YYYY-MM-DD:early`. Whole feature gated by `MARKET_HOURS_ENABLED`.
+
+**Why `_session_open_at(et)` is the single source of truth:** both the open/closed
+decision AND the `_next_session_open` forward scan call it, so they can never
+disagree. The next-open scan steps hourly **in UTC** (DST-safe — never add
+timedelta to an ET-aware datetime across a DST boundary) and converts each probe
+to ET for the wall-clock check.
+
+**Conservative model (intentional):** a FULL holiday closes the entire ET calendar
+day INCLUDING its evening session, so after e.g. Memorial Day the banner reports
+the next open as the following day 00:00 ET, not the real ~18:00 evening Globex
+reopen. This over-pauses by a few evening hours on a holiday — the SAFE direction
+for a money gate, and aligned with the user's "full-day closure" choice. EARLY
+days open under normal rules until 13:00 ET then close for the rest of the ET day;
+the evening session (≥18:00 ET) also closes if the NEXT day is a FULL holiday.
+
+**How to apply:** the weekend ("Weekend close") and daily-halt ("Daily maintenance
+break") reason strings are unchanged — preserve them so non-holiday behaviour does
+not regress. Any new closure type belongs inside `_session_open_at` (so the scan
+stays consistent), not bolted onto the status function separately.

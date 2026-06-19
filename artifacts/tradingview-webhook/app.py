@@ -7,7 +7,7 @@ import threading
 import queue
 import contextlib
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response
@@ -1363,6 +1363,164 @@ def get_session_state(now=None):
 MARKET_HOURS_ENABLED = os.environ.get("MARKET_HOURS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 MARKET_OPEN_HOUR_ET  = 18   # weekly open (Sun) + daily reopen after maintenance
 MARKET_CLOSE_HOUR_ET = 17   # daily maintenance start (Mon–Thu) + Friday weekly close
+EARLY_CLOSE_HOUR_ET  = 13   # holiday half-day early close (~1:00 PM ET)
+
+# Exchange-holiday calendar (CME Globex / COMEX). MNQ & MGC pause on US market
+# holidays just like they do on weekends. Two kinds:
+#   "full"  — closed the entire ET calendar day (e.g. Christmas, Juneteenth).
+#   "early" — open under normal hours until EARLY_CLOSE_HOUR_ET, then closed for
+#             the rest of that ET day (e.g. day after Thanksgiving, Christmas Eve).
+# Dates are computed algorithmically per year (no annual maintenance) with the
+# federal Sat→Fri / Sun→Mon observance rule for the fixed-date holidays. Add to or
+# override the calendar with MARKET_HOLIDAYS_EXTRA — a comma list of "YYYY-MM-DD"
+# (full) or "YYYY-MM-DD:early". The whole calendar is gated by MARKET_HOURS_ENABLED,
+# so MARKET_HOURS_ENABLED=0 disables holidays too (always OPEN).
+MARKET_HOLIDAYS_EXTRA = os.environ.get("MARKET_HOLIDAYS_EXTRA", "").strip()
+_HOLIDAY_CACHE = {}
+
+
+def _nth_weekday(year, month, weekday, n):
+    """The n-th `weekday` (Mon=0…Sun=6) of a month, e.g. 4th Thursday of Nov."""
+    first  = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + (n - 1) * 7)
+
+
+def _last_weekday(year, month, weekday):
+    """The last `weekday` of a month, e.g. last Monday of May (Memorial Day)."""
+    if month == 12:
+        last = date(year, 12, 31)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _easter(year):
+    """Easter Sunday (anonymous Gregorian computus) — anchors Good Friday."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day   = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _observed(d):
+    """Federal observance shift: Saturday → Friday, Sunday → Monday."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _holiday_env_overrides(year):
+    """Parse MARKET_HOLIDAYS_EXTRA into [(date, kind, name)] for the given year."""
+    out = []
+    if not MARKET_HOLIDAYS_EXTRA:
+        return out
+    for tok in MARKET_HOLIDAYS_EXTRA.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        parts = tok.split(":")
+        try:
+            d = date.fromisoformat(parts[0].strip())
+        except ValueError:
+            continue
+        kind = parts[1].strip().lower() if len(parts) > 1 else "full"
+        if kind not in ("full", "early"):
+            kind = "full"
+        if d.year == year:
+            out.append((d, kind, "Scheduled holiday"))
+    return out
+
+
+def _holiday_calendar(year):
+    """{date: (kind, name)} of CME/COMEX market holidays for a calendar year."""
+    cached = _HOLIDAY_CACHE.get(year)
+    if cached is not None:
+        return cached
+    cal = {}
+    full = {
+        _observed(date(year, 1, 1)):       "New Year's Day",
+        _easter(year) - timedelta(days=2): "Good Friday",
+        _last_weekday(year, 5, 0):         "Memorial Day",
+        _observed(date(year, 6, 19)):      "Juneteenth",
+        _observed(date(year, 7, 4)):       "Independence Day",
+        _nth_weekday(year, 9, 0, 1):       "Labor Day",
+        _nth_weekday(year, 11, 3, 4):      "Thanksgiving Day",
+        _observed(date(year, 12, 25)):     "Christmas Day",
+    }
+    for d, name in full.items():
+        cal[d] = ("full", name)
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    early = {
+        date(year, 7, 3):                 "Independence Day (early close)",
+        thanksgiving + timedelta(days=1): "Day after Thanksgiving",
+        date(year, 12, 24):               "Christmas Eve",
+    }
+    for d, name in early.items():
+        if d in cal or d.weekday() >= 5:   # already a full holiday, or a weekend
+            continue
+        cal[d] = ("early", name)
+    for d, kind, name in _holiday_env_overrides(year):
+        cal[d] = (kind, name)
+    _HOLIDAY_CACHE[year] = cal
+    return cal
+
+
+def _market_holiday(d):
+    """(kind, name) for an ET date — kind is "full", "early", or None if open."""
+    return _holiday_calendar(d.year).get(d, (None, None))
+
+
+def _session_open_at(et):
+    """True iff MNQ/MGC trade at the given ET-aware instant (weekly + daily-halt +
+    holiday rules). Single source of truth for both the open decision and the
+    next-open forward scan, so the two can never disagree."""
+    wd   = et.weekday()
+    hour = et.hour + et.minute / 60.0
+    if wd == 5:                                       # Saturday — closed all day
+        base_open = False
+    elif wd == 6:                                     # Sunday — opens 18:00 ET
+        base_open = hour >= MARKET_OPEN_HOUR_ET
+    elif wd == 4:                                     # Friday — closes 17:00 ET
+        base_open = hour < MARKET_CLOSE_HOUR_ET
+    else:                                             # Mon–Thu — 17:00–18:00 halt
+        base_open = not (MARKET_CLOSE_HOUR_ET <= hour < MARKET_OPEN_HOUR_ET)
+    if not base_open:
+        return False
+    kind, _ = _market_holiday(et.date())
+    if kind == "full":
+        return False
+    if kind == "early" and hour >= EARLY_CLOSE_HOUR_ET:
+        return False
+    # The evening session (≥18:00 ET) belongs to the NEXT day's trading session;
+    # if that day is a full holiday the market never reopens that evening.
+    if hour >= MARKET_OPEN_HOUR_ET:
+        nkind, _ = _market_holiday((et + timedelta(days=1)).date())
+        if nkind == "full":
+            return False
+    return True
+
+
+def _next_session_open(base_utc):
+    """First UTC instant the market is open after `base_utc`. Scans hourly (opens
+    land on the top of the hour) for up to ~12 days so a holiday-stacked weekend
+    still resolves."""
+    probe = base_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    for _ in range(12 * 24):
+        if _session_open_at(probe.astimezone(ET_TZ)):
+            return probe
+        probe += timedelta(hours=1)
+    return None
 
 
 def market_session_status(now=None):
@@ -1373,7 +1531,9 @@ def market_session_status(now=None):
       {"open": bool, "status": "OPEN"|"CLOSED",
        "next_open": datetime|None (UTC, aware), "next_open_et": str,
        "reason": str}
-    When MARKET_HOURS_ENABLED is False it always reports OPEN, so every downstream
+    Reflects weekly hours, the daily maintenance halt AND exchange holidays
+    (full-day closures + ~1:00 PM ET early-close half-days). When
+    MARKET_HOURS_ENABLED is False it always reports OPEN, so every downstream
     consumer behaves exactly as it did before this feature was added."""
     base = now or datetime.now(timezone.utc)
     if base.tzinfo is None:
@@ -1382,39 +1542,31 @@ def market_session_status(now=None):
         return {"open": True, "status": "OPEN", "next_open": None,
                 "next_open_et": "", "reason": ""}
 
-    et   = base.astimezone(ET_TZ)
-    wd   = et.weekday()                  # Mon=0 … Sun=6
-    hour = et.hour + et.minute / 60.0
-
-    if wd == 5:                                       # Saturday — closed all day
-        is_open = False
-    elif wd == 6:                                     # Sunday — opens 18:00 ET
-        is_open = hour >= MARKET_OPEN_HOUR_ET
-    elif wd == 4:                                     # Friday — closes 17:00 ET
-        is_open = hour < MARKET_CLOSE_HOUR_ET
-    else:                                             # Mon–Thu — 17:00–18:00 halt
-        is_open = not (MARKET_CLOSE_HOUR_ET <= hour < MARKET_OPEN_HOUR_ET)
-
-    if is_open:
+    et = base.astimezone(ET_TZ)
+    if _session_open_at(et):
         return {"open": True, "status": "OPEN", "next_open": None,
                 "next_open_et": "", "reason": ""}
 
-    # ── Closed: compute the next reopen instant (ET → UTC) ───────────────────
-    in_daily_halt = (wd in (0, 1, 2, 3)
-                     and MARKET_CLOSE_HOUR_ET <= hour < MARKET_OPEN_HOUR_ET)
-    if in_daily_halt:
-        no_et  = et.replace(hour=MARKET_OPEN_HOUR_ET, minute=0, second=0, microsecond=0)
+    # ── Closed: explain why, then scan forward to the next reopen instant ─────
+    hour         = et.hour + et.minute / 60.0
+    wd           = et.weekday()
+    kind, name   = _market_holiday(et.date())
+    nkind, nname = _market_holiday((et + timedelta(days=1)).date())
+    if kind == "full":
+        reason = f"Holiday — {name}"
+    elif kind == "early" and hour >= EARLY_CLOSE_HOUR_ET:
+        reason = f"Early close — {name} (1:00 PM ET)"
+    elif hour >= MARKET_OPEN_HOUR_ET and nkind == "full":
+        reason = f"Holiday — {nname}"
+    elif wd in (0, 1, 2, 3) and MARKET_CLOSE_HOUR_ET <= hour < MARKET_OPEN_HOUR_ET:
         reason = "Daily maintenance break"
     else:
-        # Weekend (Fri ≥17:00, Sat, or Sun <18:00) → upcoming Sunday 18:00 ET.
-        days_until_sun = (6 - wd) % 7                 # Fri→2, Sat→1, Sun→0
-        no_et  = (et + timedelta(days=days_until_sun)).replace(
-                     hour=MARKET_OPEN_HOUR_ET, minute=0, second=0, microsecond=0)
         reason = "Weekend close"
-    next_open = no_et.astimezone(timezone.utc)
+
+    next_open = _next_session_open(base)
     return {
         "open": False, "status": "CLOSED", "next_open": next_open,
-        "next_open_et": fmt_et(next_open, "%a %b %-d, %-I:%M %p ET"),
+        "next_open_et": fmt_et(next_open, "%a %b %-d, %-I:%M %p ET") if next_open else "",
         "reason": reason,
     }
 
