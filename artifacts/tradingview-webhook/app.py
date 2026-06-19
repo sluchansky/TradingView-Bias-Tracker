@@ -604,6 +604,88 @@ TRADERSPOST_COOLDOWN_SEC  = max(0, int(os.environ.get("TRADERSPOST_COOLDOWN_SEC"
 _TRADERSPOST_LOCK = threading.Lock()
 _TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-send guard
 
+# ── Execution mode (configurable order routing) ──────────────────────────────
+# The dashboard ENTER button routes a server-authoritative order through the ONE
+# audited gate (/traderspost). EXECUTION_MODE selects how that order is delivered:
+#   manual_only  – no automated send; the dashboard shows the exact plan to place
+#                  by hand. The SAFE default when nothing is configured.
+#   paper        – simulate/log only; no broker is contacted (trade still tracks).
+#   traderspost  – LIVE: forward to TRADERSPOST_WEBHOOK_URL (TradersPost → Tradovate).
+#   pickmytrade  – LIVE: forward to EXECUTION_WEBHOOK_URL (PickMyTrade webhook).
+# EXECUTION_MODE unset → resolved at request time: traderspost if its URL is set,
+# else pickmytrade if EXECUTION_WEBHOOK_URL is set, else manual_only. This keeps the
+# legacy default (live TradersPost when TRADERSPOST_WEBHOOK_URL exists) byte-for-byte.
+EXECUTION_WEBHOOK_URL = os.environ.get("EXECUTION_WEBHOOK_URL", "").strip()
+EXECUTION_ACCOUNT_ID  = os.environ.get("EXECUTION_ACCOUNT_ID", "").strip()
+EXECUTION_TOKEN       = os.environ.get("EXECUTION_TOKEN", "").strip()   # PickMyTrade body token
+_EXECUTION_MODE_RAW   = os.environ.get("EXECUTION_MODE", "").strip().lower()
+_VALID_EXECUTION_MODES = {"manual_only", "paper", "traderspost", "pickmytrade"}
+_EXECUTION_PROVIDER_LABELS = {
+    "manual_only": "Manual (no auto-send)",
+    "paper":       "Paper (simulated)",
+    "traderspost": "TradersPost → Tradovate",
+    "pickmytrade": "PickMyTrade",
+}
+
+def resolve_execution_mode():
+    """Resolve the active execution mode per request (so a secret change takes
+    effect on the next restart predictably). An explicit, valid EXECUTION_MODE wins;
+    otherwise default to a LIVE provider only when its URL is set, else manual_only."""
+    if _EXECUTION_MODE_RAW in _VALID_EXECUTION_MODES:
+        return _EXECUTION_MODE_RAW
+    if TRADERSPOST_WEBHOOK_URL:
+        return "traderspost"
+    if EXECUTION_WEBHOOK_URL:
+        return "pickmytrade"
+    return "manual_only"
+
+def execution_is_live(mode=None):
+    """True for provider modes that POST to a real broker bridge."""
+    return (mode or resolve_execution_mode()) in ("traderspost", "pickmytrade")
+
+def execution_configured(mode=None):
+    """True when the resolved mode can act. manual_only / paper need no URL; live
+    providers need their destination configured."""
+    mode = mode or resolve_execution_mode()
+    if mode == "traderspost":
+        return bool(TRADERSPOST_WEBHOOK_URL)
+    if mode == "pickmytrade":
+        return bool(EXECUTION_WEBHOOK_URL)
+    return True
+
+def adapt_traderspost(intent):
+    """Canonical intent → TradersPost MARKET order + protective-stop/first-target
+    bracket. MUST stay byte-equivalent to the legacy payload when mode=traderspost."""
+    return {
+        "ticker":     intent["broker_symbol"],
+        "action":     intent["action"],
+        "quantity":   intent["quantity"],
+        "sentiment":  "bullish" if intent["action"] == "buy" else "bearish",
+        "signal":     "AI Trading Partner READY",
+        "stopLoss":   {"type": "stop", "stopPrice": intent["stop"]},
+        "takeProfit": {"limitPrice": intent["target1"]},
+    }
+
+def adapt_pickmytrade(intent):
+    """Canonical intent → PickMyTrade webhook payload (add-trade-data): a MARKET
+    order with absolute stop-loss + first take-profit. The auth token and account id
+    live in the JSON body (never the URL). Field names are isolated here so the rest
+    of the gateway stays provider-agnostic."""
+    payload = {
+        "symbol":          intent["broker_symbol"],
+        "data":            intent["action"],   # "buy" / "sell"
+        "quantity":        intent["quantity"],
+        "order_type":      "MKT",
+        "risk_percentage": 0,
+        "sl":              intent["stop"],
+        "tp":              intent["target1"],
+    }
+    if EXECUTION_TOKEN:
+        payload["token"] = EXECUTION_TOKEN
+    if intent.get("account_id"):
+        payload["account_id"] = intent["account_id"]
+    return payload
+
 # ── Live-instance gate ────────────────────────────────────────────────────────
 # The Discord webhook secrets are shared between the Replit workspace (dev) and
 # the published deployment (prod). Both run this exact file, so without a gate the
@@ -8993,6 +9075,10 @@ def status():
         "discord_configured":      bool(DISCORD_WEBHOOK_URL),
         "mnq_discord_configured":  bool(DISCORD_MNQ_WEBHOOK_URL),
         "traderspost_configured":  bool(TRADERSPOST_WEBHOOK_URL),
+        "execution_mode":           resolve_execution_mode(),
+        "execution_live":           execution_is_live() and execution_configured(),
+        "execution_enabled":        execution_configured(),
+        "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
     }), 200
 
 
@@ -9098,18 +9184,25 @@ def enter_trade():
 
 @app.route("/traderspost", methods=["POST"])
 def traderspost_order():
-    """One-tap LIVE order → TradersPost (broker bridge to Tradovate).
+    """One-tap order execution gateway — the SINGLE audited money gate.
 
-    Sends a MARKET order with a protective stop-loss + first-target bracket.
-    Owner-only: auth is enforced at the Express /api edge — this route is NOT in
-    OPEN_PATHS, so it requires the dashboard password + same-origin, exactly like
-    /enter. This is the ONLY broker-bound requests.post in this file (every other
-    one targets Discord): it fails CLOSED when unconfigured and never auto-sizes —
-    the contract quantity is always owner-supplied (default 1).
+    EXECUTION_MODE selects delivery: manual_only (return the plan, no send),
+    paper (simulate/log), traderspost (→ TradersPost → Tradovate), or pickmytrade
+    (→ PickMyTrade webhook). Owner-only: auth is enforced at the Express /api edge —
+    this route is NOT in OPEN_PATHS, so it requires the dashboard password +
+    same-origin, exactly like /enter. Still the ONLY broker-bound requests.post in
+    this file (every other one targets Discord): server-authoritative on
+    price/direction/size (client sends only ticker + contracts, default 1), live
+    providers fail CLOSED, and it never auto-sizes.
     """
-    if not TRADERSPOST_WEBHOOK_URL:
+    mode = resolve_execution_mode()
+    provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
+
+    # Live providers require their destination URL; manual_only / paper never do.
+    if execution_is_live(mode) and not execution_configured(mode):
+        miss = "TRADERSPOST_WEBHOOK_URL" if mode == "traderspost" else "EXECUTION_WEBHOOK_URL"
         return jsonify({"status": "error",
-                        "reason": "TradersPost is not configured (missing TRADERSPOST_WEBHOOK_URL)."}), 400
+                        "reason": f"{provider_label} is not configured (missing {miss})."}), 400
 
     data = request.get_json(force=True, silent=True) or {}
 
@@ -9177,6 +9270,64 @@ def traderspost_order():
     tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
     action    = "buy" if direction.lower().startswith("l") else "sell"
 
+    # Canonical, server-authoritative execution intent — the ONE source of truth that
+    # every provider adapter, the response, and the on-screen plan all render from.
+    intent = {
+        "instrument":    instrument,
+        "broker_symbol": tp_symbol,
+        "direction":     direction,
+        "action":        action,
+        "quantity":      contracts,
+        "order_type":    "market",
+        "entry":         round(entry, 2),
+        "stop":          round(stop, 2),
+        "target1":       round(t1, 2),
+        "target2":       round(t2, 2),
+        "account_id":    EXECUTION_ACCOUNT_ID,
+        "mode":          mode,
+        "provider":      provider_label,
+    }
+    plan_public = {
+        "instrument": instrument, "broker_symbol": tp_symbol, "direction": direction,
+        "action": action, "quantity": contracts, "type": "market",
+        "entry": intent["entry"], "stopLoss": intent["stop"],
+        "takeProfit": intent["target1"], "target2": intent["target2"],
+    }
+
+    # ── manual_only: NEVER contacts a broker. Returns the exact server-authoritative
+    #    plan so the owner can place it by hand (the safe default when nothing is set).
+    if mode == "manual_only":
+        logger.info("Execution manual_only — plan returned (no send): %s %s x%d (stop %.1f, t1 %.1f)",
+                    tp_symbol, action, contracts, stop, t1)
+        return jsonify({
+            "status": "manual_required",
+            "provider": provider_label, "mode": mode, "broker_verify_required": False,
+            "message": (f"Place this {instrument} {direction.upper()} order yourself: "
+                        f"{contracts} @ market · stop {intent['stop']} · T1 {intent['target1']}."),
+            "plan": plan_public,
+        }), 200
+
+    # ── paper: simulate/log only. No broker send, no broker dedupe; trade still tracks.
+    if mode == "paper":
+        logger.info("PAPER order simulated: %s %s x%d @ market (stop %.1f, t1 %.1f)",
+                    tp_symbol, action, contracts, stop, t1)
+        try:
+            _url = _discord_url(instrument)
+            if _url:
+                requests.post(_url, json={"content": (
+                    f"🧪 **PAPER ORDER (simulated) — {direction.upper()}**\n"
+                    f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
+                    f"Stop `{stop:.1f}`  ·  T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`")}, timeout=5)
+        except requests.RequestException:
+            pass
+        return jsonify({
+            "status": "simulated",
+            "provider": provider_label, "mode": mode, "broker_verify_required": False,
+            "message": f"Paper order simulated ({instrument} {direction.upper()} x{contracts}). No broker contacted.",
+            "plan": plan_public,
+        }), 200
+
+    # ── LIVE providers (traderspost / pickmytrade) below ─────────────────────────
     # Duplicate-send guard: collapse accidental double-taps / client retries of the
     # SAME setup into one live order. Reserve the slot BEFORE sending so two
     # concurrent requests can't both pass; roll it back if the send never lands.
@@ -9196,47 +9347,44 @@ def traderspost_order():
             if _TRADERSPOST_LAST.get(instrument) == (fingerprint, now):
                 _TRADERSPOST_LAST.pop(instrument, None)
 
-    # TradersPost MARKET order (no "price" field) + bracket: the exchange-bound
-    # protective stop is the plan's stop_loss; the first target is the limit exit.
-    payload = {
-        "ticker":     tp_symbol,
-        "action":     action,
-        "quantity":   contracts,
-        "sentiment":  "bullish" if action == "buy" else "bearish",
-        "signal":     "AI Trading Partner READY",
-        "stopLoss":   {"type": "stop", "stopPrice": round(stop, 2)},
-        "takeProfit": {"limitPrice": round(t1, 2)},
-    }
+    # Provider-specific payload + destination via isolated adapters. The TradersPost
+    # adapter is byte-equivalent to the legacy payload when mode == "traderspost".
+    if mode == "traderspost":
+        send_url = TRADERSPOST_WEBHOOK_URL
+        payload  = adapt_traderspost(intent)
+    else:  # pickmytrade
+        send_url = EXECUTION_WEBHOOK_URL
+        payload  = adapt_pickmytrade(intent)
 
     # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
     # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
     # send-side exception (timeout / read error / connection reset / refused) and every
-    # 5xx/3xx is AMBIGUOUS — we can't prove the bytes never reached TradersPost, so the
+    # 5xx/3xx is AMBIGUOUS — we can't prove the bytes never reached the provider, so the
     # order may already be live — so we keep the cooldown and make the owner verify at
     # the broker. Never silently allow a duplicate live order.
     try:
-        resp = requests.post(TRADERSPOST_WEBHOOK_URL, json=payload, timeout=10)
+        resp = requests.post(send_url, json=payload, timeout=10)
     except requests.RequestException as exc:
-        logger.warning("TradersPost ambiguous send error — cooldown held: %s", exc)
-        return jsonify({"status": "error",
-                        "reason": (f"TradersPost did not confirm ({exc}). The order MAY have been placed — "
+        logger.warning("%s ambiguous send error — cooldown held: %s", provider_label, exc)
+        return jsonify({"status": "error", "broker_verify_required": True,
+                        "reason": (f"{provider_label} did not confirm ({exc}). The order MAY have been placed — "
                                    "check your broker before retrying.")}), 502
 
     if 200 <= resp.status_code < 300:
         pass  # success — fall through to confirmation
     elif 400 <= resp.status_code < 500:
         _release_slot()
-        logger.warning("TradersPost rejected order (no order placed): %s %s", resp.status_code, resp.text[:300])
+        logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
         return jsonify({"status": "error",
-                        "reason": f"TradersPost rejected the order ({resp.status_code}): {resp.text[:200]}"}), 502
+                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}), 502
     else:
-        logger.warning("TradersPost ambiguous response — cooldown held: %s %s", resp.status_code, resp.text[:300])
-        return jsonify({"status": "error",
-                        "reason": (f"TradersPost returned {resp.status_code}. The order MAY have been placed — "
+        logger.warning("%s ambiguous response — cooldown held: %s %s", provider_label, resp.status_code, resp.text[:300])
+        return jsonify({"status": "error", "broker_verify_required": True,
+                        "reason": (f"{provider_label} returned {resp.status_code}. The order MAY have been placed — "
                                    "check your broker before retrying.")}), 502
 
     content = (
-        f"🚀 **ORDER SENT → TradersPost — {direction.upper()}**\n"
+        f"🚀 **ORDER SENT → {provider_label} — {direction.upper()}**\n"
         f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
         f"Stop `{stop:.1f}`  ·  T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`"
     )
@@ -9247,10 +9395,12 @@ def traderspost_order():
     except requests.RequestException:
         pass
 
-    logger.info("TradersPost order sent: %s %s x%d @ market (stop %.1f, t1 %.1f)",
-                tp_symbol, action, contracts, stop, t1)
+    logger.info("%s order sent: %s %s x%d @ market (stop %.1f, t1 %.1f)",
+                provider_label, tp_symbol, action, contracts, stop, t1)
     return jsonify({
         "status": "sent",
+        "provider": provider_label, "mode": mode, "broker_verify_required": False,
+        "plan": plan_public,
         "order":  {"ticker": tp_symbol, "action": action, "quantity": contracts,
                    "direction": direction, "type": "market",
                    "stopLoss": stop, "takeProfit": t1, "target2": t2},
@@ -9646,7 +9796,7 @@ def dashboard():
     <button class="btn btn-apply" id="btn-send" style="background:#08252b;border:1px solid #39d7e6;color:#7fe9f5" onclick="sendOrder()">🚀 Send order to broker</button>
     <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px;color:#8a93a6;font-size:12px">
       Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#070602;border:1px solid #2c2410;border-radius:2px;color:#e8ddc4;padding:4px 6px;font-size:13px">
-      <span style="color:#6b7280">· market order via TradersPost</span>
+      <span style="color:#6b7280">· one-tap market order</span>
     </div>
   </div>
 </div>
@@ -9726,7 +9876,7 @@ def dashboard():
 
 <!-- Action buttons -->
 <button class="btn btn-enter" id="btn-enter" onclick="enterTrade()">📈 ENTER LONG</button>
-<div style="font-size:11px;color:#6b7280;margin:-6px 0 8px;text-align:center">On a READY setup this places a REAL broker order (Tradovate via TradersPost) and tracks it. Typing your own entry/stop = tracking only, no broker order.</div>
+<div style="font-size:11px;color:#6b7280;margin:-6px 0 8px;text-align:center">On a READY setup this routes a one-tap order through your configured execution mode and tracks it. Typing your own entry/stop = tracking only, no broker order.</div>
 <button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
 <button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
@@ -9795,27 +9945,34 @@ async function enterTrade() {
   if (c)  body.contracts = parseInt(c);
 
   // Any typed-in price (entry / stop / targets) means a manual, server-unvalidated
-  // plan → tracking-only: the broker route deliberately refuses client-supplied
-  // prices. A real order only fires on a READY setup for the selected side, using
-  // the server's own plan.
+  // plan → tracking-only: the execution gateway deliberately refuses client-supplied
+  // prices. The gateway only acts on a READY setup for the selected side, using the
+  // server's own plan.
   const manual = !!(e || s || t1 || t2);
   const rd = lastRec ? jsReadyDir(lastRec.verdict) : null;
-  // Only fire a real order when the loaded snapshot is for the CURRENTLY-selected
+  // Only engage the gateway when the loaded snapshot is for the CURRENTLY-selected
   // instrument; a stale snapshot from just before a symbol toggle could otherwise
   // target the wrong instrument (the server gate would still refuse, but we never
   // rely on that for instrument selection).
   const recInst = lastRec ? String(lastRec.active_ticker || '').replace('1!','') : '';
-  const liveEligible = !manual && !!lastRec && recInst === sym
-                       && !!lastRec.traderspost_configured && rd === dir;
+  const gatewayEligible = !manual && !!lastRec && recInst === sym
+                          && !!lastRec.execution_enabled && rd === dir;
+  const mode  = lastRec ? (lastRec.execution_mode || 'manual_only') : 'manual_only';
+  const live  = !!(lastRec && lastRec.execution_live);
+  const label = (lastRec && lastRec.execution_provider_label) || 'broker';
   const btn = document.getElementById('btn-enter');
 
-  if (liveEligible) {
+  if (gatewayEligible) {
     const tp = lastRec.trade_plan || {};
     const entry = _planMidEntry(tp);
-    const inst0 = sym;
     let q0 = parseInt(c || '1', 10); if (!q0 || q0 < 1) q0 = 1;
-    const msg = '\u26a0 This places a REAL market order on your broker (Tradovate via TradersPost).\\n\\n'
-      + inst0 + ' ' + dir.toUpperCase() + '  ·  ' + q0 + ' contract' + (q0>1?'s':'')
+    const head = live
+      ? '\u26a0 This places a REAL market order on your broker (' + label + ').'
+      : (mode === 'paper'
+          ? '🧪 This submits a SIMULATED (paper) order — no real broker is contacted.'
+          : '📋 Manual mode — this tracks the trade and shows the exact order to place yourself.');
+    const msg = head + '\\n\\n'
+      + sym + ' ' + dir.toUpperCase() + '  ·  ' + q0 + ' contract' + (q0>1?'s':'')
       + '\\nEntry ~' + (entry!=null?entry:'market')
       + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
       + '   T1 ' + (tp.target1!=null?tp.target1:'—')
@@ -9823,26 +9980,33 @@ async function enterTrade() {
     if (!confirm(msg)) return;
   }
 
-  if (btn) { btn.disabled = true; btn.textContent = liveEligible ? '⏳ Sending order…' : '⏳ Entering…'; }
+  if (btn) { btn.disabled = true; btn.textContent = gatewayEligible ? (live ? '⏳ Sending order…' : '⏳ Submitting…') : '⏳ Entering…'; }
   try {
-    // 1) Place the REAL broker order first. The server is authoritative on the
-    //    READY gate, sizing cap, and duplicate guard — if it doesn't confirm a
-    //    send, we abort and never record a phantom tracked trade.
-    if (liveEligible) {
-      const inst = sym;
+    // 1) Run the execution gateway first. The server is authoritative on the READY
+    //    gate, sizing cap, duplicate guard, and routing per EXECUTION_MODE. For a
+    //    LIVE provider we abort tracking unless the send is confirmed, so no phantom
+    //    trade is recorded. Paper/manual never contact a broker.
+    if (gatewayEligible) {
       let qty = parseInt(c || '1', 10); if (!qty || qty < 1) qty = 1;
       let od;
-      try { od = await api('/traderspost', { ticker: inst+'1!', contracts: qty }); }
-      catch(err) { toast('Broker request failed — check your broker before retrying', false); return; }
-      if (!od || od.status !== 'sent') { toast('Broker: ' + ((od && (od.reason||od.status)) || 'no response'), false); return; }
-      toast('🚀 Order sent to broker');
+      try { od = await api('/traderspost', { ticker: sym+'1!', contracts: qty }); }
+      catch(err) { toast(live ? 'Execution failed — check your broker before retrying' : 'Execution failed — try again', false); return; }
+      const st = od && od.status;
+      if (st === 'sent')                 toast('🚀 Order sent to ' + (od.provider || label));
+      else if (st === 'simulated')       toast('🧪 Paper order simulated (no broker)');
+      else if (st === 'manual_required') toast('📋 ' + (od.message || 'Place this order manually on your broker'));
+      else { toast('Execution: ' + ((od && (od.reason||od.status)) || 'no response'), false); return; }
     }
-    // 2) Record the local tracked trade (after a confirmed send, or tracking-only).
+    // 2) Record the local tracked trade (after a confirmed send/simulate/manual plan,
+    //    or tracking-only when the gateway wasn't engaged).
     let d;
     try { d = await api('/enter', body); }
-    catch(err) { toast('Tracking failed (broker order already sent)', false); return; }
+    catch(err) { toast('Tracking failed' + (live ? ' (broker order already sent)' : ''), false); return; }
     if (d.status === 'entered') {
-      toast(liveEligible ? '✅ Order sent + trade tracked' : '✅ Trade tracked (no broker order)');
+      toast(gatewayEligible
+        ? (live ? '✅ Order sent + trade tracked'
+                : (mode === 'paper' ? '✅ Paper order + trade tracked' : '✅ Tracked — place the order manually'))
+        : '✅ Trade tracked (no broker order)');
       refresh();
     } else {
       toast('Error: '+(d.reason||d.status), false);
@@ -10376,7 +10540,12 @@ function renderDirView() {
     planEl.innerHTML = planRow(tp);
     apply.style.display = 'block';
     if (copyBtn) copyBtn.style.display = 'block';
-    if (sendRow) sendRow.style.display = d.traderspost_configured ? 'block' : 'none';
+    // Send controls only when the snapshot is for the selected instrument — hides the
+    // button during the brief stale window right after a symbol toggle.
+    if (sendRow) {
+      const recInst = String(d.active_ticker || '').replace('1!','');
+      sendRow.style.display = (d.execution_enabled && recInst === sym) ? 'block' : 'none';
+    }
   } else if (pp && pp.trade_plan) {
     // POTENTIAL setup forming for the selected side — DISPLAY ONLY. The broker
     // actions (Apply / Copy / Send) stay hidden: they are gated on the actionable
@@ -10543,21 +10712,32 @@ async function copyOrder() {
   } catch(e) { toast('Copy failed — long-press to copy', false); }
 }
 
-// One-tap LIVE order → TradersPost (broker bridge). Only visible when a setup is
-// READY for the selected side AND TradersPost is configured server-side. Sends just
-// the instrument + contract count; the server resolves the live plan, enforces the
-// ready guard, and forwards a MARKET order (+ stop/target bracket) to the broker.
+// One-tap order via the configured execution gateway. Only visible when a setup is
+// READY for the selected side AND execution is enabled server-side. Sends just the
+// instrument + contract count; the server resolves the live plan, enforces the ready
+// guard, and routes per EXECUTION_MODE (manual plan / paper sim / live broker order).
 async function sendOrder() {
   if (!lastRec) { toast('No ready setup', false); return; }
   const tp = lastRec.trade_plan || {};
   const rd = jsReadyDir(lastRec.verdict);
   if (!rd || !tp.trade_plan) { toast('No ready setup to send', false); return; }
-  if (!lastRec.traderspost_configured) { toast('TradersPost not configured', false); return; }
-  const inst = (lastRec.active_ticker || '').toString().replace('1!','') || sym;
+  if (!lastRec.execution_enabled) { toast('Execution not configured', false); return; }
+  // The loaded snapshot MUST be for the currently-selected instrument — never act on
+  // a stale snapshot from just before a symbol toggle (mirrors enterTrade()).
+  const recInst = String(lastRec.active_ticker || '').replace('1!','');
+  if (recInst !== sym) { toast('Snapshot still updating — try again', false); return; }
+  const mode  = lastRec.execution_mode || 'manual_only';
+  const live  = !!lastRec.execution_live;
+  const label = lastRec.execution_provider_label || 'broker';
+  const inst = recInst || sym;
   let qty = parseInt(document.getElementById('snd-qty').value, 10);
   if (!qty || qty < 1) qty = 1;
   const entry = _planMidEntry(tp);
-  const msg = 'Send LIVE market order to TradersPost?\\n\\n'
+  const head = live
+    ? 'Send LIVE market order to ' + label + '?'
+    : (mode === 'paper' ? 'Submit a SIMULATED (paper) order — no real broker?'
+                        : 'Manual mode — show the exact order to place yourself?');
+  const msg = head + '\\n\\n'
     + inst + ' ' + rd.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
     + '\\nEntry ~' + (entry!=null?entry:'market')
     + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
@@ -10567,9 +10747,11 @@ async function sendOrder() {
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
   try {
     const d = await api('/traderspost', { ticker: inst+'1!', contracts: qty });
-    if (d.status === 'sent') toast('🚀 Order sent to TradersPost');
+    if (d.status === 'sent')                 toast('🚀 Order sent to ' + (d.provider || label));
+    else if (d.status === 'simulated')       toast('🧪 Paper order simulated (no broker)');
+    else if (d.status === 'manual_required') toast('📋 ' + (d.message || 'Place this order manually'));
     else toast('Error: ' + (d.reason || d.status), false);
-  } catch(e) { toast('Request failed', false); }
+  } catch(e) { toast('Request failed' + (live ? ' — check your broker' : ''), false); }
   finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send order to broker'; } }
 }
 
@@ -10695,7 +10877,7 @@ def index():
             "GET /status":     "Full analysis with verdict and reasoning chain",
             "GET|POST /mode":  "Read or switch trading mode (SCALP / SWING)",
             "POST /enter":     "Open an active trade (uses current trade plan or explicit params)",
-            "POST /traderspost": "Send a one-tap market order (+ bracket) to TradersPost (broker bridge)",
+            "POST /traderspost": "One-tap order execution gateway (routes per EXECUTION_MODE: manual/paper/live broker)",
             "POST /breakeven": "Move stop loss to entry price",
             "POST /close":     "Close the active trade manually",
             "GET /trade":      "Show active trade status and live PnL",
