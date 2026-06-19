@@ -4459,6 +4459,614 @@ def _timed(key):
             d[key] = round(d.get(key, 0.0) + (time.perf_counter() - t0) * 1000.0, 3)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Multi-strategy engine (Phase 1 — DETECTION + SCORING + DISPLAY ONLY)
+# ────────────────────────────────────────────────────────────────────────────
+# Detects the current market regime, scores five named strategies against the
+# live signals, and selects the best-fit one (FIXED priority, Opening Drive
+# time-gated to 08:00–10:00 ET). Phase 1 is DISPLAY-ONLY: it never touches the
+# verdict / directions / trade_plan / money path — those stay owned by
+# evaluate_strict_setup + full_analysis. STRATEGY_ENGINE_MODE = display | control
+# (the `control` wiring lands in Phase 2). Every helper FAILS OPEN: missing data
+# degrades to BALANCED / Neutral / not-ready, never an exception.
+#
+# OHLC caveat: the feed has no candle bars, so "candle closes outside range",
+# "rejection candle" and "continuation candle" are APPROXIMATED from the 5m
+# CONFIRMATION alerts + liquidity sweeps + price ticks; confidence is lower when
+# a close-confirmation is unavailable.
+# ════════════════════════════════════════════════════════════════════════════
+STRATEGY_ENGINE_MODE = os.environ.get("STRATEGY_ENGINE_MODE", "display").strip().lower()
+if STRATEGY_ENGINE_MODE not in ("display", "control"):
+    STRATEGY_ENGINE_MODE = "display"
+
+# Opening-range + Opening-Drive window (Eastern Time, decimal hours).
+OPENING_RANGE_START_ET      = 8.0    # OR builds from 08:00 ET
+OPENING_RANGE_BUILD_MIN     = 30     # ...over the first 30 minutes
+OPENING_DRIVE_WINDOW_END_ET = 10.0   # Opening Drive is only eligible 08:00–10:00 ET
+
+# Detection thresholds (FAIL-OPEN; tuned conservatively).
+STRAT_VWAP_PULLBACK_ATR  = 0.6     # price within 0.6*ATR of VWAP == "pullback into VWAP"
+STRAT_EXHAUSTION_EXT_ATR = 2.0     # price >= 2.0*ATR from VWAP == "extremely extended"
+STRAT_RANGE_TIGHT_ATR    = 1.5     # consolidation width <= 1.5*ATR == "tight range"
+STRAT_MOVE_THRESH_PCT    = 0.0015  # +/-0.15% session move == directional session bias
+RANGE_LOOKBACK_MIN       = 30      # rolling window for the consolidation range
+BREAKOUT_RECENT_SEC      = 180     # exclude the last 3 min so a breakout tick isn't in its own range
+
+# Per-instrument intraday tracker (opening range + per-session OHLC + rolling
+# ticks). Detection-only; guarded by a lock since it's written from the webhook
+# worker and read from request threads.
+INTRADAY_LOCK      = threading.Lock()
+INTRADAY_BY_TICKER = {}
+
+# Strategy registry. Priority order is FIXED (Opening Drive first); strategies
+# 4 & 5 cap at grade "A" (never "A+ Institutional"). `regimes` is the set of
+# regimes a strategy fits (feeds the confidence regime-fit term + the fallback).
+STRATEGY_DEFS = {
+    "OPENING_DRIVE": {
+        "label": "Opening Drive", "target_r": 2.0, "max_grade": "A+",
+        "regimes": {"TRENDING", "VOLATILE", "BALANCED"},
+    },
+    "LIQUIDITY_SWEEP_REVERSAL": {
+        "label": "Liquidity Sweep Reversal", "target_r": 2.0, "max_grade": "A+",
+        "regimes": {"VOLATILE", "RANGING", "BALANCED"},
+    },
+    "VWAP_TREND_CONTINUATION": {
+        "label": "VWAP Trend Continuation", "target_r": 1.8, "max_grade": "A+",
+        "regimes": {"TRENDING", "BALANCED"},
+    },
+    "RANGE_EXPANSION_BREAKOUT": {
+        "label": "Range Expansion Breakout", "target_r": 2.0, "max_grade": "A",
+        "regimes": {"RANGING", "BALANCED"},
+    },
+    "EXHAUSTION_FADE": {
+        "label": "Exhaustion Fade", "target_r": 1.5, "max_grade": "A",
+        "regimes": {"VOLATILE", "BALANCED"},
+    },
+}
+STRATEGY_PRIORITY = [
+    "OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
+    "RANGE_EXPANSION_BREAKOUT", "EXHAUSTION_FADE",
+]
+
+
+def _bias_session_for(et_dt):
+    """(session_name, session_id) for an ET datetime — Asia 18:00→02:00 (wraps),
+    London 02:00→08:00, New York 08:00→16:00. session_id is the ET date of the
+    session START so ticks across midnight map to one instance. (None, None) in
+    the 16:00–18:00 gap (incl. the daily maintenance halt)."""
+    h = et_dt.hour + et_dt.minute / 60.0
+    d = et_dt.date()
+    if h >= 18.0:
+        return ("Asia", d.isoformat())
+    if h < 2.0:
+        return ("Asia", (d - timedelta(days=1)).isoformat())
+    if 2.0 <= h < 8.0:
+        return ("London", d.isoformat())
+    if 8.0 <= h < 16.0:
+        return ("New York", d.isoformat())
+    return (None, None)
+
+
+def _update_intraday_tracker(inst, price, ts=None):
+    """Feed a price tick into the per-instrument intraday tracker (opening range,
+    per-session OHLC, rolling ticks). FAIL-OPEN: never raises into the caller."""
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return
+    try:
+        now = ts or now_utc()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        et = now.astimezone(ET_TZ)
+        et_date = et.date().isoformat()
+        h = et.hour + et.minute / 60.0
+        or_start = OPENING_RANGE_START_ET
+        or_end   = OPENING_RANGE_START_ET + OPENING_RANGE_BUILD_MIN / 60.0
+        with INTRADAY_LOCK:
+            rec = INTRADAY_BY_TICKER.get(inst)
+            if rec is None:
+                rec = {"or_date": None, "or_high": None, "or_low": None,
+                       "or_complete": False, "sessions": {}, "ticks": deque(maxlen=600)}
+                INTRADAY_BY_TICKER[inst] = rec
+            # Opening range — reset each ET day, build 08:00–08:30, lock after.
+            if rec["or_date"] != et_date:
+                rec["or_date"]     = et_date
+                rec["or_high"]     = None
+                rec["or_low"]      = None
+                rec["or_complete"] = False
+            if or_start <= h < or_end:
+                rec["or_high"] = price if rec["or_high"] is None else max(rec["or_high"], price)
+                rec["or_low"]  = price if rec["or_low"]  is None else min(rec["or_low"],  price)
+                rec["or_complete"] = False
+            elif h >= or_end and rec["or_high"] is not None:
+                rec["or_complete"] = True
+            # Per-session OHLC (Asia/London/New York).
+            sname, sid = _bias_session_for(et)
+            if sname:
+                s = rec["sessions"].get(sname)
+                if s is None or s.get("id") != sid:
+                    rec["sessions"][sname] = {"id": sid, "open": price,
+                                              "high": price, "low": price, "last": price}
+                else:
+                    s["high"] = max(s["high"], price)
+                    s["low"]  = min(s["low"],  price)
+                    s["last"] = price
+            rec["ticks"].append((now.isoformat(), price))
+    except Exception:
+        return
+
+
+def _intraday_or(inst):
+    with INTRADAY_LOCK:
+        rec = INTRADAY_BY_TICKER.get(inst)
+        if not rec:
+            return {"high": None, "low": None, "complete": False}
+        return {"high": rec.get("or_high"), "low": rec.get("or_low"),
+                "complete": bool(rec.get("or_complete"))}
+
+
+def _intraday_range(inst):
+    """Rolling consolidation range over the last RANGE_LOOKBACK_MIN, EXCLUDING the
+    most recent BREAKOUT_RECENT_SEC so a breakout tick isn't counted inside its own
+    range. Returns None fields when too few ticks."""
+    with INTRADAY_LOCK:
+        rec   = INTRADAY_BY_TICKER.get(inst)
+        ticks = list((rec or {}).get("ticks") or [])
+    if not ticks:
+        return {"high": None, "low": None, "width": None}
+    now    = now_utc()
+    lo_cut = now - timedelta(minutes=RANGE_LOOKBACK_MIN)
+    hi_cut = now - timedelta(seconds=BREAKOUT_RECENT_SEC)
+    prices = []
+    for t_iso, p in ticks:
+        try:
+            t = datetime.fromisoformat(t_iso)
+        except (ValueError, TypeError):
+            continue
+        if lo_cut <= t <= hi_cut:
+            prices.append(p)
+    if len(prices) < 3:
+        return {"high": None, "low": None, "width": None}
+    hi, lo = max(prices), min(prices)
+    return {"high": hi, "low": lo, "width": hi - lo}
+
+
+def _volume_spike_fresh(inst):
+    sp = VOLUME_SPIKE_BY_TICKER.get(inst) or {}
+    ts = sp.get("ts")
+    if not ts:
+        return False
+    try:
+        return (now_utc() - datetime.fromisoformat(ts)).total_seconds() / 60.0 <= VOLUME_SPIKE_TTL_MIN
+    except (ValueError, TypeError):
+        return False
+
+
+def _strategy_signal_snapshot(inst):
+    """Granular per-instrument signal booleans from the alert history (same window
+    + anchor logic the strict gate uses). Read-only; FAIL-OPEN."""
+    stage_window = cfg("STAGE_WINDOW_MIN")
+    # Snapshot the deque once: ALERT_HISTORY is mutated by the webhook worker thread,
+    # and iterating it live can raise "deque mutated during iteration" (which would
+    # only trip the engine's fail-open fallback, but the snapshot is cheap insurance).
+    history = list(ALERT_HISTORY)
+    if stage_window:
+        cutoff = now_utc() - timedelta(minutes=stage_window)
+        recent = []
+        for a in history:
+            try:
+                if datetime.fromisoformat(a["timestamp"]) >= cutoff:
+                    recent.append(a)
+            except (KeyError, ValueError):
+                pass
+    else:
+        recent = history[-8:]
+
+    def latest(alert_type, scoped=False):
+        found = None
+        for a in recent:
+            if a.get("alert_type") != alert_type:
+                continue
+            if not scoped:
+                a_inst = (a.get("instrument")
+                          or _instrument_from_text(a.get("ticker"))
+                          or _instrument_from_text(a.get("alert_type")))
+                if a_inst != inst:
+                    continue
+            try:
+                ts = datetime.fromisoformat(a["timestamp"])
+            except (KeyError, ValueError):
+                continue
+            if found is None or ts > found:
+                found = ts
+        return found
+
+    def after(confirm_ts, *anchors):
+        present = [t for t in anchors if t is not None]
+        return bool(confirm_ts is not None and present and confirm_ts >= max(present))
+
+    bos_dem = latest("BOS DEMAND");   bos_sup = latest("BOS SUPPLY")
+    ch_dem  = latest("CHOCH DEMAND"); ch_sup  = latest("CHOCH SUPPLY")
+    hh = latest("HH"); hl = latest("HL"); lh = latest("LH"); ll = latest("LL")
+    bull_conf = after(latest(f"{inst} BULLISH CONFIRMATION", True), bos_dem, ch_dem)
+    bear_conf = after(latest(f"{inst} BEARISH CONFIRMATION", True), bos_sup, ch_sup)
+    return {
+        "has_bos_demand":     bos_dem is not None,
+        "has_bos_supply":     bos_sup is not None,
+        "has_choch_demand":   ch_dem is not None,
+        "has_choch_supply":   ch_sup is not None,
+        "structure_long":     bool(bos_dem or ch_dem or hh or hl),
+        "structure_short":    bool(bos_sup or ch_sup or lh or ll),
+        "has_bull_confirm":   bull_conf,
+        "has_bear_confirm":   bear_conf,
+        "has_bull_sweep":     latest(f"{inst} BULLISH SWEEP", True) is not None,
+        "has_bear_sweep":     latest(f"{inst} BEARISH SWEEP", True) is not None,
+        "volume_spike_fresh": _volume_spike_fresh(inst),
+        "rvol_value":         (RVOL_BY_TICKER.get(inst) or {}).get("value"),
+    }
+
+
+def build_strategy_context(ticker, current_price, vwap_value, vwap_status, volatility):
+    """Assemble all detection inputs for one instrument into a flat dict consumed
+    by the regime detector + the five strategy scorers. FAIL-OPEN throughout."""
+    inst = instrument_of(ticker)
+    snap = _strategy_signal_snapshot(inst)
+    vol  = volatility or {}
+    atr_pts   = vol.get("atr_pts")
+    atr_ratio = vol.get("ratio")
+    price     = current_price
+    vwap_ok   = bool(vwap_status == "ok" and vwap_value is not None and price is not None)
+    price_above = bool(vwap_ok and price > vwap_value)
+    price_below = bool(vwap_ok and price < vwap_value)
+    vwap_dist_pts = abs(price - vwap_value) if vwap_ok else None
+    try:
+        vwap_dist_atr = (vwap_dist_pts / atr_pts) if (vwap_dist_pts is not None and atr_pts) else None
+    except (TypeError, ZeroDivisionError):
+        vwap_dist_atr = None
+    atr_contraction = bool(atr_ratio is not None and atr_ratio <= cfg("VOL_QUIET_CAUTION"))
+    atr_stretched   = bool(atr_ratio is not None and atr_ratio >= cfg("VOL_HIGH_CAUTION"))
+    near_vwap       = bool(vwap_dist_atr is not None and vwap_dist_atr <= STRAT_VWAP_PULLBACK_ATR)
+
+    rng = _intraday_range(inst)
+    range_width = rng["width"]
+    range_tight = bool(range_width is not None and atr_pts and range_width <= STRAT_RANGE_TIGHT_ATR * atr_pts)
+    broke_range_high = bool(rng["high"] is not None and price is not None and price > rng["high"])
+    broke_range_low  = bool(rng["low"]  is not None and price is not None and price < rng["low"])
+
+    ortrk   = _intraday_or(inst)
+    et_now  = now_utc().astimezone(ET_TZ)
+    et_hour = et_now.hour + et_now.minute / 60.0
+    in_opening_window = bool(OPENING_RANGE_START_ET <= et_hour < OPENING_DRIVE_WINDOW_END_ET)
+
+    try:
+        rvol_ok = bool(snap["rvol_value"] is not None
+                       and float(snap["rvol_value"]) >= float(cfg("RVOL_CONFIRM_THRESHOLD")))
+    except (TypeError, ValueError):
+        rvol_ok = False
+    volume_ok = bool(snap["volume_spike_fresh"] or rvol_ok)
+
+    cvd = CVD_BY_TICKER.get(inst) or {}
+    ctx = {
+        "inst": inst, "price": price,
+        "vwap_ok": vwap_ok, "price_above_vwap": price_above, "price_below_vwap": price_below,
+        "vwap_dist_pts": vwap_dist_pts, "vwap_dist_atr": vwap_dist_atr, "near_vwap": near_vwap,
+        "atr_pts": atr_pts, "atr_ratio": atr_ratio,
+        "atr_contraction": atr_contraction, "atr_stretched": atr_stretched,
+        "cvd_state": cvd.get("state"), "cvd_direction": cvd.get("direction"),
+        "or_high": ortrk["high"], "or_low": ortrk["low"], "or_complete": ortrk["complete"],
+        "range_high": rng["high"], "range_low": rng["low"], "range_width": range_width,
+        "range_tight": range_tight,
+        "broke_range_high": broke_range_high, "broke_range_low": broke_range_low,
+        "in_opening_window": in_opening_window, "et_hour": et_hour,
+        "volume_ok": volume_ok,
+    }
+    ctx.update(snap)
+    return ctx
+
+
+def detect_market_regime(ctx):
+    """TRENDING / RANGING / VOLATILE / BALANCED from ATR ratio + VWAP alignment +
+    structure + consolidation width. FAIL-OPEN to BALANCED."""
+    atr_ratio = ctx.get("atr_ratio")
+    if atr_ratio is not None and atr_ratio >= cfg("VOL_HIGH_CAUTION"):
+        return {"regime": "VOLATILE", "reason": f"ATR {atr_ratio:.2f}x baseline — elevated volatility"}
+    trend_long  = ctx["structure_long"]  and ctx["price_above_vwap"] and not ctx["structure_short"]
+    trend_short = ctx["structure_short"] and ctx["price_below_vwap"] and not ctx["structure_long"]
+    if trend_long or trend_short:
+        return {"regime": "TRENDING",
+                "reason": f"Aligned structure + price {'above' if trend_long else 'below'} VWAP"}
+    if ctx["atr_contraction"] or ctx["range_tight"]:
+        return {"regime": "RANGING", "reason": "ATR contraction / tight consolidation"}
+    return {"regime": "BALANCED", "reason": "No dominant regime"}
+
+
+def detect_session_bias(inst):
+    """Per-session directional bias (last vs session open) for Asia/London/NY."""
+    out = {"Asia": "Neutral", "London": "Neutral", "New York": "Neutral"}
+    with INTRADAY_LOCK:
+        rec      = INTRADAY_BY_TICKER.get(inst)
+        sessions = dict((rec or {}).get("sessions") or {})
+    for name in out:
+        s = sessions.get(name)
+        if not s or not s.get("open"):
+            continue
+        try:
+            pct = (s["last"] - s["open"]) / s["open"]
+        except (TypeError, ZeroDivisionError):
+            continue
+        if pct > STRAT_MOVE_THRESH_PCT:
+            out[name] = "Bullish"
+        elif pct < -STRAT_MOVE_THRESH_PCT:
+            out[name] = "Bearish"
+    return out
+
+
+def _score_opening_drive(ctx):
+    long_break  = bool(ctx["or_complete"] and ctx["or_high"] is not None
+                       and ctx["price"] is not None and ctx["price"] > ctx["or_high"])
+    short_break = bool(ctx["or_complete"] and ctx["or_low"] is not None
+                       and ctx["price"] is not None and ctx["price"] < ctx["or_low"])
+    if ctx["price_above_vwap"]:
+        direction = "Long"
+    elif ctx["price_below_vwap"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("Opening range high broken", long_break),
+            ("Price above VWAP", ctx["price_above_vwap"]),
+            ("Strong opening volume", ctx["volume_ok"]),
+            ("CVD confirms (bullish)", ctx["cvd_state"] == "bullish"),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("Opening range low broken", short_break),
+            ("Price below VWAP", ctx["price_below_vwap"]),
+            ("Strong opening volume", ctx["volume_ok"]),
+            ("CVD confirms (bearish)", ctx["cvd_state"] == "bearish"),
+        ]
+    else:
+        conditions = [("Directional bias vs VWAP", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 2.0}
+
+
+def _score_liquidity_sweep_reversal(ctx):
+    if ctx["has_bull_sweep"]:
+        direction = "Long"
+    elif ctx["has_bear_sweep"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("Bullish liquidity sweep", ctx["has_bull_sweep"]),
+            ("Bullish CHOCH (structure shift)", ctx["has_choch_demand"]),
+            ("Rejection / reclaim candle", ctx["has_bull_confirm"]),
+            ("CVD turns bullish", ctx["cvd_state"] == "bullish"),
+            ("Price back above VWAP", ctx["price_above_vwap"]),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("Bearish liquidity sweep", ctx["has_bear_sweep"]),
+            ("Bearish CHOCH (structure shift)", ctx["has_choch_supply"]),
+            ("Rejection / reclaim candle", ctx["has_bear_confirm"]),
+            ("CVD turns bearish", ctx["cvd_state"] == "bearish"),
+            ("Price back below VWAP", ctx["price_below_vwap"]),
+        ]
+    else:
+        conditions = [("Liquidity sweep present", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 2.0}
+
+
+def _score_vwap_trend_continuation(ctx):
+    if ctx["price_above_vwap"]:
+        direction = "Long"
+    elif ctx["price_below_vwap"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("Price above VWAP (uptrend)", ctx["price_above_vwap"]),
+            ("Pullback into VWAP", ctx["near_vwap"]),
+            ("Volume expansion", ctx["volume_ok"]),
+            ("Continuation candle", ctx["has_bull_confirm"]),
+            ("Bullish structure intact", ctx["structure_long"]),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("Price below VWAP (downtrend)", ctx["price_below_vwap"]),
+            ("Pullback into VWAP", ctx["near_vwap"]),
+            ("Volume expansion", ctx["volume_ok"]),
+            ("Continuation candle", ctx["has_bear_confirm"]),
+            ("Bearish structure intact", ctx["structure_short"]),
+        ]
+    else:
+        conditions = [("Price on one side of VWAP", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 1.8}
+
+
+def _score_range_expansion_breakout(ctx):
+    if ctx["broke_range_high"]:
+        direction = "Long"
+    elif ctx["broke_range_low"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("ATR contraction (squeeze)", ctx["atr_contraction"]),
+            ("Tight consolidation range", ctx["range_tight"]),
+            ("Volume spike", ctx["volume_ok"]),
+            ("Breakout above range", ctx["broke_range_high"]),
+            ("Breakout close confirmed", ctx["has_bull_confirm"]),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("ATR contraction (squeeze)", ctx["atr_contraction"]),
+            ("Tight consolidation range", ctx["range_tight"]),
+            ("Volume spike", ctx["volume_ok"]),
+            ("Breakout below range", ctx["broke_range_low"]),
+            ("Breakout close confirmed", ctx["has_bear_confirm"]),
+        ]
+    else:
+        conditions = [("Range breakout in progress", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 2.0}
+
+
+def _score_exhaustion_fade(ctx):
+    ext = ctx["vwap_dist_atr"]
+    extended_above = bool(ext is not None and ctx["price_above_vwap"] and ext >= STRAT_EXHAUSTION_EXT_ATR)
+    extended_below = bool(ext is not None and ctx["price_below_vwap"] and ext >= STRAT_EXHAUSTION_EXT_ATR)
+    if extended_above:
+        direction = "Short"   # fade the over-extension downward
+    elif extended_below:
+        direction = "Long"
+    else:
+        direction = None
+    if direction == "Short":
+        conditions = [
+            ("Price extended above VWAP", extended_above),
+            ("ATR stretched", ctx["atr_stretched"]),
+            ("CVD divergence (bearish)", ctx["cvd_state"] == "bearish"),
+            ("Rejection candle", ctx["has_bear_confirm"] or ctx["has_bear_sweep"]),
+        ]
+    elif direction == "Long":
+        conditions = [
+            ("Price extended below VWAP", extended_below),
+            ("ATR stretched", ctx["atr_stretched"]),
+            ("CVD divergence (bullish)", ctx["cvd_state"] == "bullish"),
+            ("Rejection candle", ctx["has_bull_confirm"] or ctx["has_bull_sweep"]),
+        ]
+    else:
+        conditions = [("Price extended from VWAP", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 1.5}
+
+
+STRATEGY_SCORERS = {
+    "OPENING_DRIVE":            _score_opening_drive,
+    "LIQUIDITY_SWEEP_REVERSAL": _score_liquidity_sweep_reversal,
+    "VWAP_TREND_CONTINUATION":  _score_vwap_trend_continuation,
+    "RANGE_EXPANSION_BREAKOUT": _score_range_expansion_breakout,
+    "EXHAUSTION_FADE":          _score_exhaustion_fade,
+}
+
+
+def _strategy_grade(fully_met, confidence, max_grade):
+    """A+ Institutional / A / B / Avoid from readiness + confidence, capped by the
+    strategy's max grade (strategies 4 & 5 never reach A+)."""
+    if fully_met and confidence >= 85 and max_grade == "A+":
+        return "A+ Institutional"
+    if fully_met and confidence >= 70:
+        return "A"
+    if confidence >= 55:
+        return "B"
+    return "Avoid"
+
+
+def _closed_strategy_engine():
+    return {
+        "mode": STRATEGY_ENGINE_MODE,
+        "market_regime": "CLOSED", "regime_reason": "Market closed — engine paused",
+        "session_bias": {"Asia": "Neutral", "London": "Neutral", "New York": "Neutral"},
+        "active_strategy": "None", "active_key": None, "direction": None,
+        "confidence": 0, "quality": "Avoid", "expected_target_r": None,
+        "ready": False, "reason": "Market closed — strategy engine paused.",
+        "missing": [], "conditions": [], "strategies": [],
+        "opening_range": {"high": None, "low": None, "complete": False, "active_window": False},
+    }
+
+
+def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, volatility, edge_score):
+    """Phase 1 detection: regime + session bias + scored strategies + selection.
+    DISPLAY-ONLY — returns a dict for /status + the dashboard; never alters the
+    verdict or money path. FAIL-OPEN: any error degrades to a safe 'no active
+    strategy' result so the analysis pipeline can never crash on it."""
+    try:
+        inst   = instrument_of(ticker)
+        ctx    = build_strategy_context(ticker, current_price, vwap_value, vwap_status, volatility)
+        regime = detect_market_regime(ctx)
+        bias   = detect_session_bias(inst)
+
+        evals = {}
+        for key in STRATEGY_PRIORITY:
+            ev    = STRATEGY_SCORERS[key](ctx)
+            conds = ev["conditions"]
+            total = len(conds)
+            met   = sum(1 for _, m in conds if m)
+            completeness = round(met / total * 100) if total else 0
+            eligible = True
+            if key == "OPENING_DRIVE" and not ctx["in_opening_window"]:
+                eligible = False
+            fully = bool(ev["direction"] is not None and met == total and eligible)
+            evals[key] = {
+                "key": key, "label": STRATEGY_DEFS[key]["label"],
+                "direction": ev["direction"], "target_r": ev["target_r"],
+                "conditions": [{"label": l, "met": bool(m)} for l, m in conds],
+                "missing": [l for l, m in conds if not m],
+                "completeness": completeness, "met": met, "total": total,
+                "eligible": eligible, "fully_met": fully,
+            }
+
+        ready_keys = [k for k in STRATEGY_PRIORITY if evals[k]["fully_met"]]
+        if ready_keys:
+            active_key = ready_keys[0]
+        else:
+            cands = [k for k in STRATEGY_PRIORITY if evals[k]["eligible"]]
+            active_key = max(
+                cands, key=lambda k: (evals[k]["completeness"], -STRATEGY_PRIORITY.index(k))
+            ) if cands else None
+
+        engine = {
+            "mode": STRATEGY_ENGINE_MODE,
+            "market_regime": regime["regime"], "regime_reason": regime["reason"],
+            "session_bias": bias,
+            "opening_range": {"high": ctx["or_high"], "low": ctx["or_low"],
+                              "complete": ctx["or_complete"], "active_window": ctx["in_opening_window"]},
+            "strategies": [
+                {"key": evals[k]["key"], "label": evals[k]["label"],
+                 "direction": evals[k]["direction"], "completeness": evals[k]["completeness"],
+                 "eligible": evals[k]["eligible"], "fully_met": evals[k]["fully_met"]}
+                for k in STRATEGY_PRIORITY
+            ],
+        }
+
+        if active_key is None:
+            engine.update(active_strategy="None", active_key=None, direction=None,
+                          confidence=0, quality="Avoid", expected_target_r=None,
+                          ready=False, reason="No eligible strategy for current conditions.",
+                          missing=[], conditions=[])
+            return engine
+
+        a    = evals[active_key]
+        defn = STRATEGY_DEFS[active_key]
+        edge_norm  = min(100, round((edge_score or 0) / EDGE_SCORE_MAX * 100))
+        regime_fit = 100 if regime["regime"] in defn["regimes"] else 40
+        confidence = int(max(0, min(100, round(a["completeness"] * 0.60 + edge_norm * 0.25 + regime_fit * 0.15))))
+        grade = _strategy_grade(a["fully_met"], confidence, defn["max_grade"])
+        if a["fully_met"] and a["direction"]:
+            reason = f"All {a['label']} confirmations met — READY {a['direction']}."
+        elif a["direction"]:
+            reason = f"Forming {a['label']} ({a['direction']}): {len(a['missing'])} confirmation(s) missing."
+        else:
+            reason = f"{a['label']} watching — no directional trigger yet."
+        engine.update(
+            active_strategy=a["label"], active_key=active_key, direction=a["direction"],
+            confidence=confidence, quality=grade, expected_target_r=a["target_r"],
+            ready=a["fully_met"], reason=reason, missing=a["missing"], conditions=a["conditions"],
+        )
+        return engine
+    except Exception as exc:
+        logger.warning("strategy engine error: %s", exc)
+        out = _closed_strategy_engine()
+        out["market_regime"] = "BALANCED"
+        out["regime_reason"] = "Engine unavailable — defaulting safe"
+        out["reason"]        = "Strategy engine unavailable."
+        return out
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -5002,6 +5610,15 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         out_dirs[_d] = block
     result["directions"] = out_dirs
 
+    # ── Multi-strategy engine (Phase 1 — DISPLAY-ONLY detection) ─────────────
+    # Regime + session bias + scored strategies + best-fit selection. Does NOT
+    # touch verdict / directions / trade_plan (those stay owned by the strict
+    # gate). The market-closed override below replaces it with a paused snapshot.
+    result["strategy_engine"] = compute_strategy_engine(
+        active_ticker, current_price, vwap_value, vwap_status, volatility,
+        result.get("edge_score"),
+    )
+
     # ── Market-session awareness (additive; single neutralising override) ────
     # MNQ/MGC share the CME/COMEX schedule. While the market is CLOSED there is no
     # live tape, so reporting WAIT (or counting "failed" evals) is misleading. We
@@ -5095,6 +5712,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "readyStrength":         None,
         }
         result["decision_support"]   = _decision_support(result)
+        # Strategy engine paused while the market is closed (no live tape).
+        result["strategy_engine"]    = _closed_strategy_engine()
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
             if _blk:
@@ -8334,6 +8953,9 @@ def webhook():
         CURRENT_PRICE = parsed_price
         CURRENT_PRICE_BY_TICKER[resolved_inst] = parsed_price
         CURRENT_PRICE_TS_BY_TICKER[resolved_inst] = now_utc().isoformat()
+        # Feed the intraday tracker (opening range + per-session OHLC) for the
+        # multi-strategy engine. FAIL-OPEN — never disrupts the webhook path.
+        _update_intraday_tracker(resolved_inst, parsed_price)
 
     # ── VWAP ingestion (required input for the strict price-vs-VWAP filter) ──
     raw_vwap = data.get("vwap")
@@ -9096,6 +9718,8 @@ def clear_alerts():
     CURRENT_PRICE       = None
     CURRENT_PRICE_BY_TICKER.clear()
     CURRENT_PRICE_TS_BY_TICKER.clear()
+    with INTRADAY_LOCK:
+        INTRADAY_BY_TICKER.clear()
     ZONE_BROKEN_AT      = None
     MITIGATED_PRICES_BY_TICKER.clear()
     MITIGATED_FLAG_BY_TICKER.clear()
@@ -9192,6 +9816,7 @@ def status():
         "rejected_reasons":    a.get("rejected_reasons"),
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "decision_support":    a.get("decision_support"),
+        "strategy_engine":     a.get("strategy_engine"),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
@@ -9842,6 +10467,24 @@ def dashboard():
   .ai-item .ic{width:16px;text-align:center;font-weight:800}
   .ai-item.ok{color:#bfe6c8} .ai-item.ok .ic{color:var(--green)}
   .ai-item.no .ic{color:var(--red)}
+  .se-top{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+  .se-strat{font-size:18px;font-weight:800;letter-spacing:-.3px;color:var(--amber);text-align:center;padding:8px 6px;background:var(--inset);border:1px solid var(--border);border-radius:2px}
+  .se-strat .dir{font-size:13px;font-weight:700;margin-left:6px}
+  .se-reason{font-size:12.5px;color:#cdd3e0;line-height:1.45;margin-top:10px;text-align:center}
+  .se-missing{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;justify-content:center}
+  .se-chip{font-size:11px;padding:4px 9px;border-radius:2px;background:#241a0c;border:1px solid #4a3a18;color:#e0c98a}
+  .se-bias-h{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:14px 0 6px}
+  .se-bias{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .se-list{margin-top:12px;display:flex;flex-direction:column;gap:6px}
+  .se-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+  .se-row.active{color:#e8ddc4;font-weight:700}
+  .se-row .nm{flex:0 0 150px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .se-row .bar{flex:1;height:8px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden}
+  .se-row .bar .fill{height:100%;background:var(--amber-dim);transition:width .4s}
+  .se-row.active .bar .fill{background:var(--amber)}
+  .se-row .pct{flex:0 0 38px;text-align:right;font-variant-numeric:tabular-nums}
+  .se-row.ineligible{opacity:.45}
+  .se-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
   .cd-big{font-size:30px;font-weight:800;text-align:center;letter-spacing:-1px;color:var(--amber)}
   .cd-sub{font-size:12px;color:var(--muted);text-align:center;margin-top:4px}
   .cd-track{height:10px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden;margin-top:12px}
@@ -9986,6 +10629,28 @@ def dashboard():
 <div class="mod" id="mod-whynot">
   <div class="mod-h">🚦 Why Not Ready</div>
   <div id="wn-body"></div>
+</div>
+
+<!-- Multi-strategy engine (Phase 1 — display-only; existing gate stays authoritative) -->
+<div class="mod" id="mod-strategy">
+  <div class="mod-h">🎛️ Strategy Engine <span id="se-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="se-top">
+    <div class="gstat"><div class="l">Market Regime</div><div class="v" id="se-regime">—</div></div>
+    <div class="gstat"><div class="l">Confidence</div><div class="v" id="se-conf">—</div></div>
+    <div class="gstat"><div class="l">Quality</div><div class="v" id="se-quality">—</div></div>
+    <div class="gstat"><div class="l">Expected R</div><div class="v" id="se-target">—</div></div>
+  </div>
+  <div class="se-strat" id="se-active">—</div>
+  <div class="se-reason" id="se-reason"></div>
+  <div class="se-missing" id="se-missing"></div>
+  <div class="se-bias-h">Session Bias (ET)</div>
+  <div class="se-bias">
+    <div class="gstat"><div class="l">Asia 18–02</div><div class="v" id="se-bias-asia">—</div></div>
+    <div class="gstat"><div class="l">London 02–08</div><div class="v" id="se-bias-london">—</div></div>
+    <div class="gstat"><div class="l">New York 08–16</div><div class="v" id="se-bias-ny">—</div></div>
+  </div>
+  <div class="se-list" id="se-list"></div>
+  <div class="se-fid" id="se-fid"></div>
 </div>
 
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
@@ -10491,6 +11156,118 @@ function renderModules(d){
   _setCvd('cvd-volstate',
     volSt==='confirmed' ? 'Confirmed' : volSt==='unconfirmed' ? 'Unconfirmed' : 'No data',
     volSt==='confirmed' ? '#22c55e' : volSt==='unconfirmed' ? '#ef4444' : '#6b7280');
+
+  // ── Module 7: Multi-strategy engine (DISPLAY-ONLY in Phase 1) ──
+  renderStrategyEngine(d);
+}
+
+// Strategy engine panel — fed by d.strategy_engine (compute_strategy_engine in
+// Python). Phase 1 is display-only: it never changes the verdict/money path; the
+// existing gate above stays authoritative until STRATEGY_ENGINE_MODE=control.
+function _seQualityColor(q){
+  if (!q) return '#6b7280';
+  if (q.indexOf('A+')===0) return '#15803d';
+  if (q.charAt(0)==='A')   return '#22c55e';
+  if (q.charAt(0)==='B')   return '#eab308';
+  return '#ef4444';                              // Avoid
+}
+function _seBias(id, val){
+  const e=document.getElementById(id);
+  if (!e) return;
+  const t = val || 'Neutral';
+  e.textContent = t;
+  e.style.color = t==='Bullish' ? '#22c55e' : t==='Bearish' ? '#ef4444' : '#6b7280';
+}
+function renderStrategyEngine(d){
+  const se = (d && d.strategy_engine) || null;
+  const modeEl = document.getElementById('se-mode');
+  if (modeEl) modeEl.textContent = se && se.mode ? '· '+String(se.mode).toUpperCase() : '';
+  if (!se){
+    _modTxt('se-regime','—'); _modTxt('se-conf','—'); _modTxt('se-quality','—');
+    _modTxt('se-target','—'); _modTxt('se-active','—');
+    const r0=document.getElementById('se-reason'); if(r0) r0.textContent='';
+    const m0=document.getElementById('se-missing'); if(m0) m0.innerHTML='';
+    const l0=document.getElementById('se-list'); if(l0) l0.innerHTML='';
+    const f0=document.getElementById('se-fid'); if(f0) f0.textContent='';
+    return;
+  }
+
+  // Regime
+  const regEl=document.getElementById('se-regime');
+  if (regEl){
+    const reg = se.market_regime || '—';
+    regEl.textContent = reg;
+    regEl.style.color = reg==='TRENDING' ? '#22c55e'
+                      : reg==='VOLATILE' ? '#ef4444'
+                      : reg==='RANGING'  ? '#3b82f6'
+                      : reg==='CLOSED'   ? '#6b7280' : '#eab308';
+  }
+
+  // Confidence / Quality / Expected R
+  const conf = Number(se.confidence||0);
+  const confEl=document.getElementById('se-conf');
+  if (confEl){
+    confEl.textContent = Math.round(conf)+'%';
+    confEl.style.color = conf>=85 ? '#22c55e' : conf>=55 ? '#eab308' : '#6b7280';
+  }
+  const qEl=document.getElementById('se-quality');
+  if (qEl){ qEl.textContent = se.quality || '—'; qEl.style.color = _seQualityColor(se.quality); }
+  _modTxt('se-target', se.expected_target_r!=null ? Number(se.expected_target_r).toFixed(1)+'R' : '—');
+
+  // Selected strategy + direction
+  const actEl=document.getElementById('se-active');
+  if (actEl){
+    const nm = se.active_strategy || 'None';
+    if (se.direction && nm!=='None'){
+      const dc = se.direction==='Long' ? '#22c55e' : '#ef4444';
+      actEl.innerHTML = _modEsc(nm)+'<span class="dir" style="color:'+dc+'">'+_modEsc(se.direction)+'</span>';
+    } else {
+      actEl.textContent = nm;
+    }
+  }
+
+  // READY/ENTER reason
+  const reEl=document.getElementById('se-reason');
+  if (reEl) reEl.textContent = se.reason || '';
+
+  // Missing confirmations (chips)
+  const msEl=document.getElementById('se-missing');
+  if (msEl){
+    const miss = se.missing || [];
+    msEl.innerHTML = (se.ready && (!miss.length))
+      ? '<span class="se-chip" style="background:#0f2417;border-color:#1b3a26;color:#7fe9a3">\u2713 All confirmations met</span>'
+      : miss.map(function(m){ return '<span class="se-chip">'+_modEsc(m)+'</span>'; }).join('');
+  }
+
+  // Session bias
+  const sb = se.session_bias || {};
+  _seBias('se-bias-asia',   sb.Asia);
+  _seBias('se-bias-london', sb.London);
+  _seBias('se-bias-ny',     sb['New York']);
+
+  // Strategy completeness list (priority order, eligibility-aware)
+  const listEl=document.getElementById('se-list');
+  if (listEl){
+    const rows = se.strategies || [];
+    listEl.innerHTML = rows.map(function(s){
+      const isActive = se.active_key && s.key===se.active_key;
+      const cls = 'se-row' + (isActive?' active':'') + (s.eligible===false?' ineligible':'');
+      const pc  = Math.max(0, Math.min(100, Number(s.completeness||0)));
+      const tag = s.eligible===false ? ' <span style="color:#6b7280;font-size:10px">(off-window)</span>'
+                : s.fully_met ? ' <span style="color:#22c55e;font-size:10px">\u2713</span>' : '';
+      return '<div class="'+cls+'"><div class="nm">'+_modEsc(s.label||s.key)+tag+'</div>'
+           + '<div class="bar"><div class="fill" style="width:'+pc+'%"></div></div>'
+           + '<div class="pct">'+Math.round(pc)+'%</div></div>';
+    }).join('');
+  }
+
+  // Fidelity caveat — OHLC-derived confirmations are approximated from alerts/ticks.
+  const fidEl=document.getElementById('se-fid');
+  if (fidEl){
+    fidEl.textContent = se.market_regime==='CLOSED'
+      ? 'Market closed — engine paused.'
+      : 'Display-only. Candle confirmations approximated from alerts + price ticks; gate stays authoritative.';
+  }
 }
 
 async function refreshRec() {
