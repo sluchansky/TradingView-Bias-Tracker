@@ -68,3 +68,24 @@ unrecognized → ignored with a **200** (silent). Symptom: structure stays Undef
 indicator's alerts are clearly firing. This is the most common reason a *correctly-formatted* JSON
 still never registers. (Confirmation/zone alerts that DID work had pure-JSON Message boxes — the
 contrast is the tell.) Fix is TradingView-side: strip everything outside the `{...}`.
+
+**Indicator DEFAULT plain-text messages are dropped — map them to canonical JSON.** The user's
+zone/volume/CVD indicators ship human-readable default alert messages that match NO alert_type and
+are silently dropped (200 + `Unrecognized alert type`). The structure (BOS/CHOCH) + confirmation +
+VWAP alerts were sent as proper JSON and worked, masking that the *rest* never registered. Confirm
+by grepping prod logs for `Unrecognized alert type` — it lists every dropped phrase verbatim.
+Phrase → canonical alert_type seen live:
+- `Bullish/Bearish Zero Cross on <SYM>` **and** `Bullish/Bearish Divergence on <SYM>` = the **CVD**
+  indicator (it fires BOTH event kinds). Per user choice, both bullish events → `CVD BULLISH`, both
+  bearish → `CVD BEARISH`. Unprefixed → need a `ticker`. No numeric value travels in the text, and
+  that's fine: CVD magnitude is display-only; only the bullish/bearish STATE is the (hard) filter.
+- `New Supply/Demand Zone (BOS/CHOCH) confirmed on <SYM>` → `<INST> NEW SUPPLY/DEMAND ZONE`
+  (use `… SUPPLY/DEMAND ZONE CONFIRMED`, score 2, only if a *separate* validated-zone event exists).
+- `Price has broken through a confirmed zone on <SYM>` → `<INST> ZONE BROKEN`.
+- `Price has mitigated a confirmed zone on <SYM>` → `<INST> ZONE MITIGATED`.
+- `Volume Crossing Up Threshold (Red)` → `VOLUME SPIKE` — **but it carries NO ticker/symbol at all**,
+  so it can't be routed and MUST get a `"ticker":"{{ticker}}"` added (volume spikes are
+  direction-agnostic, so a "(Green)" variant maps to the same type).
+Zone types are **prefixed-only** (`MGC …`/`MNQ …`), so their alert_type must hardcode the instrument
+to match the chart (TradingView can't build it from `{{ticker}}`); `CVD …`/`VOLUME SPIKE` are
+unprefixed and self-resolve from the `ticker` field.
