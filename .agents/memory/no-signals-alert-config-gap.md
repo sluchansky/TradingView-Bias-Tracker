@@ -83,9 +83,20 @@ Phrase → canonical alert_type seen live:
   (use `… SUPPLY/DEMAND ZONE CONFIRMED`, score 2, only if a *separate* validated-zone event exists).
 - `Price has broken through a confirmed zone on <SYM>` → `<INST> ZONE BROKEN`.
 - `Price has mitigated a confirmed zone on <SYM>` → `<INST> ZONE MITIGATED`.
-- `Volume Crossing Up Threshold (Red)` → `VOLUME SPIKE` — **but it carries NO ticker/symbol at all**,
-  so it can't be routed and MUST get a `"ticker":"{{ticker}}"` added (volume spikes are
-  direction-agnostic, so a "(Green)" variant maps to the same type).
-Zone types are **prefixed-only** (`MGC …`/`MNQ …`), so their alert_type must hardcode the instrument
-to match the chart (TradingView can't build it from `{{ticker}}`); `CVD …`/`VOLUME SPIKE` are
-unprefixed and self-resolve from the `ticker` field.
+- `Volume Crossing Up Threshold (Red)` → `VOLUME SPIKE` — **carries NO ticker/symbol at all**.
+  BULLETPROOF FIX: use the PREFIXED form `{"alert_type":"MGC VOLUME SPIKE"}` (or `MNQ …`) on the
+  matching chart — VOLUME SPIKE ingestion needs NEITHER ticker NOR price (it only stamps a freshness
+  ts in `VOLUME_SPIKE_BY_TICKER`), so NO placeholders are required. (Unprefixed `VOLUME SPIKE` also
+  works but then needs `"ticker":"{{ticker}}"`.) Direction-agnostic, so a "(Green)" variant maps to
+  the same type.
+- **Literal-placeholder gotcha (confirmed live):** a VOLUME alert fired for hours as
+  `{"alert_type":"VOLUME SPIKE","ticker":"{{ticker}}","price":{{close}}}` with `{{ticker}}`/`{{close}}`
+  UNSUBSTITUTED — `"price":{{close}}` unquoted is invalid JSON → whole body dropped as alert_type →
+  "Unrecognized alert type". The SAME chart's SWEEP alert DID substitute (`"price":4149.9`), so
+  placeholders work per-alert; the cure is to recreate the broken alert like the working one, or just
+  drop placeholders (prefixed VOLUME SPIKE needs none).
+Zone types are **prefixed-only** (`MGC …`/`MNQ …`) and must hardcode the instrument to match the chart
+(TradingView can't build it from `{{ticker}}`). VOLUME SPIKE has BOTH prefixed and unprefixed forms;
+`CVD …` is unprefixed and self-resolves from `ticker`. `ZONE MITIGATED` is prefixed AND needs a real
+`"price":"{{close}}"`: the +0.3% (`MITIGATED_TOLERANCE_PCT`) proximity check populates
+`MITIGATED_PRICES`, so a price-less mitigation can NEVER open `zone_valid` even if it registers.
