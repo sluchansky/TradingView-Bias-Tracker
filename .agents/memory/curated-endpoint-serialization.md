@@ -20,3 +20,10 @@ handlers (e.g. `/status`, and any other curated read endpoints) and add the key 
 each curated response dict — don't assume the endpoint returns the full analysis. To
 diagnose "value present internally but `None` in the API response," check the route's
 explicit dict before suspecting the producer, threads, or the data source.
+
+**Exception — nested diagnostics ride free.** `alert_diagnostics` (and `gate_debug`) are
+copied through to `/status` as whole nested dicts, so NEW diagnostic sub-keys added
+inside them (e.g. `score_breakdown`, `components`, `volume_state`, `location_ok`,
+`ready_blockers`, `raw_score`/`max_score`/`cap_applied`) surface automatically WITHOUT a
+per-route edit. Prefer putting new per-setup diagnostics inside `alert_diagnostics`
+rather than as loose top-level `/status` keys — fewer serialization gaps.

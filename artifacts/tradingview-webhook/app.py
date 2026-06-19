@@ -92,9 +92,9 @@ COUNTERS = {
 # a +10 BONUS, never a hard gate, so it can never reject a setup; it is shown at 0 so
 # the operator can SEE that session is not the bottleneck (it is not a filter).
 REJECTION_REASON_KEYS = (
-    "zone_valid", "vwap_confirmed", "structure_confirmed", "candle_confirmed",
-    "volatility_block", "edge_score_low", "conflicting_structure",
-    "session_filter", "cooldown_duplicate",
+    "zone_valid", "vwap_confirmed", "structure_confirmed", "location",
+    "volume_unconfirmed", "cvd_conflict", "volatility_block", "edge_score_low",
+    "conflicting_structure", "session_filter", "cooldown_duplicate",
 )
 COUNTERS_LOCK = threading.Lock()
 # Per-instrument last verdict (was it READY?) so ready_setups_detected counts a
@@ -139,6 +139,12 @@ CVD_BY_TICKER       = {}
 # -5 <1.0, 0 missing); it NEVER gates. Populated opportunistically from an `rvol`
 # field on any webhook payload (no dedicated alert today). {"MNQ": {"value": float, "ts": iso}, ...}
 RVOL_BY_TICKER      = {}
+# Volume-spike confirmation state, per instrument. Set by the VOLUME SPIKE webhook
+# alerts (data-only, like CVD); read by the strict gate as one half of the volume
+# confirmation (the other half is RVOL >= the mode's RVOL_CONFIRM_THRESHOLD). A
+# spike is only "fresh" for VOLUME_SPIKE_TTL_MIN minutes after it arrives.
+# {"MNQ": {"ts": iso}, "MGC": {"ts": iso}}
+VOLUME_SPIKE_BY_TICKER = {}
 
 ALERT_TYPES = {
     # ── MGC alert types ────────────────────────────────────────────────────────
@@ -199,6 +205,14 @@ ALERT_TYPES = {
     "MGC CVD BEARISH": {"side": "data", "score": 0},
     "MNQ CVD BULLISH": {"side": "data", "score": 0},
     "MNQ CVD BEARISH": {"side": "data", "score": 0},
+    # ── Volume-spike alerts (data-only — set the per-instrument volume-spike state
+    #    read by the strict gate as one half of the +15 volume confirmation, never
+    #    bias scoring). Unprefixed forms require a `ticker` field; prefixed forms
+    #    self-resolve. Underscore and spaced spellings are both accepted. ──
+    "VOLUME_SPIKE":     {"side": "data", "score": 0},
+    "VOLUME SPIKE":     {"side": "data", "score": 0},
+    "MGC VOLUME SPIKE": {"side": "data", "score": 0},
+    "MNQ VOLUME SPIKE": {"side": "data", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -207,6 +221,8 @@ SWEEP_TYPES  = {k for k, v in ALERT_TYPES.items() if v["side"] == "sweep"}
 # CVD confirmation alert sets (data-only — store per-instrument state, never score).
 CVD_BULLISH_TYPES = {"CVD_BULLISH", "CVD BULLISH", "MGC CVD BULLISH", "MNQ CVD BULLISH"}
 CVD_BEARISH_TYPES = {"CVD_BEARISH", "CVD BEARISH", "MGC CVD BEARISH", "MNQ CVD BEARISH"}
+# Volume-spike alert set (data-only — store per-instrument spike timestamp, never score).
+VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE", "MGC VOLUME SPIKE", "MNQ VOLUME SPIKE"}
 CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
 
 # ---------------------------------------------------------------------------
@@ -239,22 +255,25 @@ MODES = {
         # SCALP: volatility is NOT a hard gate. It folds into the Edge Score as a
         # modifier (Normal +10 / Elevated 0 / Extreme -10) instead of forcing WAIT.
         "VOL_HARD_GATE":     False,
-        # ── READY gate (mode-tunable). SCALP loosens the gate so it fires earlier:
-        #    VWAP, structure AND zone are DEMOTED from hard gates to scoring
-        #    confirmations, and >=2 confirmations are required. SWING keeps the strict
-        #    zone AND vwap AND structure AND edge>=80 behaviour exactly. A loosened
-        #    zone still contributes its 25pt Edge component — it just no longer
-        #    hard-blocks READY in SCALP.
-        #    READY floor: EDGE_READY_THRESHOLD (75) is the single READY floor and
-        #    EDGE_FULL_READY_THRESHOLD (75) matches it, so SCALP no longer emits an
-        #    EARLY READY band — a setup is READY at Edge >= 75 (A+ SETUP at >= 85) or
-        #    it WAITs. SWING sets both floors to 80, keeping its strict gate exactly. ──
-        "EDGE_READY_THRESHOLD":      75,   # READY floor (A+ SETUP at >= 85)
-        "EDGE_FULL_READY_THRESHOLD": 75,   # full-READY floor == READY floor (no EARLY band)
-        "GATE_REQUIRE_VWAP":      False,
-        "GATE_REQUIRE_STRUCTURE": False,
-        "GATE_REQUIRE_ZONE":      False,
-        "MIN_CONFIRMATIONS":      2,
+        # ── READY gate (mode-tunable). SCALP READY now requires, ALL of:
+        #    Edge >= 70  AND  market structure (BOS/CHOCH/HH/HL/LH/LL on the trade
+        #    side)  AND  location (price near VWAP OR near the trade-side zone)  AND
+        #    volume_ok (fail-open: a volume spike OR RVOL >= RVOL_CONFIRM_THRESHOLD,
+        #    or simply no volume data). VWAP-direction and zone-reaction still SCORE
+        #    but no longer hard-block in SCALP (VWAP via the +15 component, zone via
+        #    the location gate). SWING keeps the strict zone AND vwap AND structure
+        #    AND edge>=80 behaviour exactly.
+        #    READY floor: EDGE_READY_THRESHOLD (70) is the single READY floor and
+        #    EDGE_FULL_READY_THRESHOLD (70) matches it, so SCALP emits no EARLY band —
+        #    a setup is READY at Edge >= 70 (A+ SETUP at >= 85) or it WAITs. ──
+        "EDGE_READY_THRESHOLD":      70,   # READY floor (A+ SETUP at >= 85)
+        "EDGE_FULL_READY_THRESHOLD": 70,   # full-READY floor == READY floor (no EARLY band)
+        "GATE_REQUIRE_VWAP":      False,   # VWAP scores (+15) but does not hard-block in SCALP
+        "GATE_REQUIRE_STRUCTURE": True,    # structure is a hard READY requirement
+        "GATE_REQUIRE_ZONE":      False,   # zone no longer hard-blocks (folded into location gate)
+        "GATE_REQUIRE_LOCATION":  True,    # price must be near VWAP OR the trade-side zone
+        "RVOL_CONFIRM_THRESHOLD": 1.5,     # RVOL >= this confirms volume (alongside a volume spike)
+        "MIN_CONFIRMATIONS":      0,       # structure+location+volume+edge ARE the gate now
         # ── Score-aware conflict (SCALP). When opposing structure sits on BOTH sides
         #    within CONFLICT_WINDOW_MIN, take the DOMINANT side unless the two sides'
         #    Edge Scores are within CONFLICT_WAIT_GAP (then it's a true conflict →
@@ -299,6 +318,10 @@ MODES = {
         "GATE_REQUIRE_VWAP":      True,
         "GATE_REQUIRE_STRUCTURE": True,
         "GATE_REQUIRE_ZONE":      True,
+        # SWING already hard-gates zone AND vwap, which implies location — keep the
+        # dedicated location gate OFF so SWING behaviour is unchanged.
+        "GATE_REQUIRE_LOCATION":  False,
+        "RVOL_CONFIRM_THRESHOLD": 1.5,     # volume is fail-open in SWING (no volume feed today)
         "MIN_CONFIRMATIONS":      0,
         # SWING keeps the original always-WAIT-on-conflict (not score-aware).
         "CONFLICT_SCORE_AWARE":   False,
@@ -2072,6 +2095,12 @@ def _humanize_gate_rejections(gd):
             out.append("VWAP not confirming the direction")
         elif f == "structure_confirmed":
             out.append("No confirming market structure (BOS/CHOCH)")
+        elif f == "location":
+            out.append("Price not near VWAP or the trade-side zone")
+        elif f == "volume_unconfirmed":
+            out.append("Volume present but not confirming (no spike / RVOL low)")
+        elif f == "cvd_conflict":
+            out.append("CVD opposing the trade direction")
         elif f == "volatility_block":
             out.append("Volatility out of tradeable range")
         elif f.startswith("confirmations("):
@@ -3098,28 +3127,41 @@ def _active_ticker():
 
 
 # ── Unified additive Edge Score (single source of truth: gate + display) ──────
-# Six confluence components, max 100. compute_trade_edge_components is the ONLY
-# place points are assigned, so the READY gate (evaluate_strict_setup) and the
-# displayed Edge Score (compute_edge_breakdown) can never diverge.
+# compute_trade_edge_components is the ONLY place points are assigned, so the READY
+# gate (evaluate_strict_setup) and the displayed Edge Score (compute_edge_breakdown)
+# can never diverge.
+# ── Weighted Edge Score components (single source of truth for gate AND display).
+#    Each component is a boolean confluence keyed by EDGE_COMPONENTS[*][0]; the score
+#    is the pure additive sum of the points for every component present, clamped to
+#    EDGE_SCORE_MAX. Structure is split into two independent components (BOS +20 and
+#    CHOCH +20) so a setup carrying BOTH is scored higher than one with only one.
+#    Volume is a first-class +15 component (a recent volume-spike alert OR RVOL >=
+#    the mode's RVOL_CONFIRM_THRESHOLD). Zone mitigation and confirmation candle no
+#    longer SCORE (zone stays a SWING hard gate + a location input; the confirmation
+#    candle fires every bar and is too noisy to score). Volatility and the old RVOL
+#    +/-5/+10 modifier no longer feed the score — volatility is informational + a
+#    SWING hard gate only. ──
 EDGE_COMPONENTS = (
-    ("zone_valid",          "Zone Mitigated",         25),
-    ("vwap_confirmed",      "VWAP Confirmation",      20),
-    ("structure_confirmed", "Structure Confirmation", 20),
-    ("liquidity_sweep",     "Liquidity Sweep",        15),
-    ("confirmation_candle", "Confirmation Candle",    10),
-    ("preferred_session",   "Session Bonus",          10),
-    # CVD (Cumulative Volume Delta) AGREEMENT — +10 when delta confirms the trade
+    ("bos_confirmed",     "BOS Confirmed",       20),
+    ("choch_confirmed",   "CHOCH Confirmed",     20),
+    ("vwap_confirmed",    "VWAP Confirmation",   15),
+    ("liquidity_sweep",   "Liquidity Sweep",     15),
+    ("volume_confirmed",  "Volume Confirmation", 15),
+    # CVD (Cumulative Volume Delta) AGREEMENT — +15 when delta confirms the trade
     # direction. CVD is also a HARD veto in the gate (handled separately); this
     # component only credits the additive bonus when it agrees.
-    ("cvd_confirmed",       "CVD Agreement",          10),
+    ("cvd_confirmed",     "CVD Agreement",       15),
+    ("preferred_session", "Session Bonus",       10),
 )
-# Maximum possible Edge Score. The six confluences sum to 100; the CVD Agreement
-# component (+10) and the RVOL modifier (+10) lift the ceiling to 120 so a fully
-# confirmed setup can be rewarded above 100. The volatility modifier overlaps the
-# existing 0-100 band, so it does not raise the cap further.
-EDGE_SCORE_MAX = 120
-EDGE_READY_THRESHOLD = 80   # minimum Edge Score for a READY setup
+# Maximum possible Edge Score = the sum of every component above
+# (20+20+15+15+15+15+10 = 110). The score is the pure additive sum of the
+# confluences present, clamped to this ceiling; no soft modifiers raise it.
+EDGE_SCORE_MAX = 110
+EDGE_READY_THRESHOLD = 70   # default minimum Edge Score for a READY setup (mode-tunable)
 CONFLICT_WINDOW_MIN  = 10   # opposing structure within this many minutes = conflict
+# A volume-spike alert is only treated as a live volume confirmation for this many
+# minutes after it arrives (a spike is a momentary event, unlike persistent CVD state).
+VOLUME_SPIKE_TTL_MIN = 20
 
 
 def _rvol_adjustment(rvol_value):
@@ -3138,25 +3180,19 @@ def _rvol_adjustment(rvol_value):
     return 0
 
 
-def compute_trade_edge_components(signals, vol_adj=0, rvol_adj=0):
-    """THE Edge Score — pure additive sum of the confluence components (six core
-    confluences max 100, plus the +10 CVD Agreement component = max 110), plus an
-    optional volatility modifier (SCALP only) and an optional RVOL modifier
-    (+10/-5/0). `signals` is a dict of booleans keyed by EDGE_COMPONENTS[*][0].
-    `vol_adj` is the volatility Edge modifier (Normal +10 / Elevated 0 / Extreme
-    -10; 0 when volatility is a hard gate or unavailable). `rvol_adj` is the SOFT
-    relative-volume modifier (see _rvol_adjustment). Returns (score, breakdown)
-    where breakdown lists {"label", "points"} for each credited component. Shared
-    by the READY gate and the display layer so the gate score and the shown Edge
-    Score are identical."""
+def compute_trade_edge_components(signals):
+    """THE Edge Score — pure additive sum of the weighted confluence components
+    (BOS+20, CHOCH+20, VWAP+15, Sweep+15, Volume+15, CVD+15, Session+10 = max 110),
+    clamped to EDGE_SCORE_MAX. `signals` is a dict of booleans keyed by
+    EDGE_COMPONENTS[*][0]. Volatility and RVOL no longer feed the score (volume is a
+    first-class +15 component instead; volatility is informational + a SWING hard
+    gate). Returns (score, breakdown) where breakdown lists {"label", "points"} for
+    each credited component. Shared by the READY gate and the display layer so the
+    gate score and the shown Edge Score are identical."""
     breakdown = []
     for key, label, pts in EDGE_COMPONENTS:
         if signals.get(key):
             breakdown.append({"label": label, "points": pts})
-    if vol_adj:
-        breakdown.append({"label": "Volatility", "points": vol_adj})
-    if rvol_adj:
-        breakdown.append({"label": "Relative Volume", "points": rvol_adj})
     score = max(0, min(EDGE_SCORE_MAX, sum(item["points"] for item in breakdown)))
     return score, breakdown
 
@@ -3320,21 +3356,57 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     cvd_long_ok    = not cvd_conflict_long         # fail-open: unknown → True
     cvd_short_ok   = not cvd_conflict_short
 
-    # ── RVOL (relative volume) — SOFT Edge modifier only, NEVER a gate. ──
+    # ── RVOL (relative volume). No longer a soft Edge modifier — it now feeds the
+    #    +15 Volume component as one half of volume_confirmed (see below). The reading
+    #    is kept for display + volume confirmation; rvol_adj stays 0 (the legacy
+    #    score modifier is retired). ──
     rvol           = RVOL_BY_TICKER.get(inst) or {}
     rvol_value     = rvol.get("value")
-    rvol_adj       = _rvol_adjustment(rvol_value)
+    rvol_adj       = 0   # retired: RVOL feeds volume_confirmed, not a score modifier
+
+    # ── Volume confirmation (the +15 Volume Edge component AND a fail-open READY
+    #    gate). Confirmed when a volume-spike alert is still fresh (within
+    #    VOLUME_SPIKE_TTL_MIN) OR RVOL >= the mode's RVOL_CONFIRM_THRESHOLD. FAIL-OPEN:
+    #    when NO volume data is present at all, volume_ok defaults True so a missing
+    #    feed never blocks READY. volume_confirmed (data present AND positive) is what
+    #    credits the score; volume_data_present distinguishes "absent" from "failed". ──
+    rvol_confirm_threshold = float(cfg("RVOL_CONFIRM_THRESHOLD"))
+    _spike = VOLUME_SPIKE_BY_TICKER.get(inst) or {}
+    volume_spike_fresh = False
+    if _spike.get("ts"):
+        try:
+            volume_spike_fresh = (now_utc() - datetime.fromisoformat(_spike["ts"])
+                                  ) <= timedelta(minutes=VOLUME_SPIKE_TTL_MIN)
+        except (ValueError, TypeError):
+            volume_spike_fresh = False
+    rvol_confirm        = bool(rvol_value is not None and rvol_value >= rvol_confirm_threshold)
+    volume_data_present = bool(volume_spike_fresh or rvol_value is not None)
+    volume_confirmed    = bool(volume_spike_fresh or rvol_confirm)
+    volume_ok           = bool(volume_confirmed or not volume_data_present)  # fail-open
+    volume_state        = ("confirmed" if volume_confirmed
+                           else ("unconfirmed" if volume_data_present else "no_data"))
+
+    # ── Location (SCALP READY gate): price must sit NEAR the VWAP OR the trade-side
+    #    zone (within cfg NEAR_PCT of price). SWING leaves GATE_REQUIRE_LOCATION
+    #    False — its hard zone+VWAP gates already imply location. ──
+    _near_pct_loc = float(cfg("NEAR_PCT"))
+    def _within(level):
+        return bool(level is not None and current_price is not None
+                    and abs(current_price - level) <= current_price * _near_pct_loc)
+    near_vwap      = bool(vwap_ok and _within(vwap))
+    location_long  = bool(near_vwap or _within(nearest_demand))
+    location_short = bool(near_vwap or _within(nearest_supply))
 
     # ── READY-gate configuration (mode-tunable). SWING keeps zone, VWAP & structure
-    #    as hard gates with edge>=80; SCALP demotes ALL THREE to confirmations, drops
-    #    the actionable edge floor to 35 (full READY at 50), and requires
-    #    MIN_CONFIRMATIONS confluences instead. A demoted zone still scores its 25pt
-    #    Edge component — it just no longer hard-blocks READY in SCALP. ──
+    #    as hard gates with edge>=80. SCALP READY = edge>=70 AND structure (hard) AND
+    #    location (near VWAP OR trade-side zone) AND volume_ok (fail-open); VWAP-
+    #    direction and zone-reaction still SCORE but no longer hard-block. ──
     ready_threshold      = cfg("EDGE_READY_THRESHOLD")        # actionable floor (EARLY)
     full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
     require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
     require_zone      = bool(cfg("GATE_REQUIRE_ZONE"))
+    require_location  = bool(cfg("GATE_REQUIRE_LOCATION"))
     min_confirmations = int(cfg("MIN_CONFIRMATIONS"))
 
     # ── Trend alignment (real, derived — never fabricated): the candidate side
@@ -3346,18 +3418,21 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     # ── Unified additive Edge Score per direction (single source of truth shared
     #    with the display layer via compute_trade_edge_components). ──
     def _signals(direction):
+        # Keys MUST match EDGE_COMPONENTS[*][0]. Structure is split into independent
+        # BOS (+20) and CHOCH (+20) components; volume_confirmed is directionless.
         if direction == "Long":
-            return {"zone_valid": zone_valid_long, "vwap_confirmed": price_above,
-                    "structure_confirmed": structure_long, "liquidity_sweep": has_bull_sweep,
-                    "confirmation_candle": has_bull_confirm, "preferred_session": session_pref,
-                    "cvd_confirmed": cvd_confirmed_long}
-        return {"zone_valid": zone_valid_short, "vwap_confirmed": price_below,
-                "structure_confirmed": structure_short, "liquidity_sweep": has_bear_sweep,
-                "confirmation_candle": has_bear_confirm, "preferred_session": session_pref,
-                "cvd_confirmed": cvd_confirmed_short}
+            return {"bos_confirmed": has_bos_demand, "choch_confirmed": has_choch_demand,
+                    "vwap_confirmed": price_above, "liquidity_sweep": has_bull_sweep,
+                    "volume_confirmed": volume_confirmed, "cvd_confirmed": cvd_confirmed_long,
+                    "preferred_session": session_pref}
+        return {"bos_confirmed": has_bos_supply, "choch_confirmed": has_choch_supply,
+                "vwap_confirmed": price_below, "liquidity_sweep": has_bear_sweep,
+                "volume_confirmed": volume_confirmed, "cvd_confirmed": cvd_confirmed_short,
+                "preferred_session": session_pref}
 
     def _edge_for(direction):
-        return compute_trade_edge_components(_signals(direction), vol_adj, rvol_adj)
+        # Pure additive component sum — volatility/RVOL modifiers no longer feed it.
+        return compute_trade_edge_components(_signals(direction))
 
     # ── Score-aware conflict resolution (single source for the gate AND the
     #    diagnostics block). `opposing_present` (above) = opposing structure on both
@@ -3377,17 +3452,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         true_conflict = opposing_present
 
     def _confirmations(direction):
-        """Count the REAL confirmations present for `direction`. SCALP READY needs
-        >= MIN_CONFIRMATIONS of them; VWAP and structure are confirmations here, not
-        hard gates. Structure contributes per-signal (BOS / CHOCH / swing) so a
-        richer structure picture counts for more. 'volume' has no alert source in
-        this system, so it is never counted or fabricated."""
+        """Count the REAL confirmations present for `direction`. Display/diagnostic
+        only now — both modes set MIN_CONFIRMATIONS=0, so the gate is structure +
+        location + volume + edge, not a raw confirmation count. Structure contributes
+        per-signal (BOS / CHOCH / swing) and volume_confirmed counts when present."""
         if direction == "Long":
             flags = [price_above, has_bos_demand, has_choch_demand,
-                     bool(hh_ts or hl_ts), has_bull_sweep, has_bull_confirm, trend_long]
+                     bool(hh_ts or hl_ts), has_bull_sweep, has_bull_confirm, trend_long,
+                     volume_confirmed]
         else:
             flags = [price_below, has_bos_supply, has_choch_supply,
-                     bool(lh_ts or ll_ts), has_bear_sweep, has_bear_confirm, trend_short]
+                     bool(lh_ts or ll_ts), has_bear_sweep, has_bear_confirm, trend_short,
+                     volume_confirmed]
         return sum(1 for f in flags if f)
 
     def _gate_debug(direction):
@@ -3402,36 +3478,58 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             _zone_pres   = nearest_demand is not None
             _zone_mit    = has_mitigated_demand
             _reaction    = reaction_long
+            _zone_valid  = zone_valid_long
+            _structure   = structure_long
+            _candle      = has_bull_confirm
+            _location    = location_long
         else:
             _bos, _choch = has_bos_supply, has_choch_supply
             _swing       = bool(lh_ts or ll_ts)
             _zone_pres   = nearest_supply is not None
             _zone_mit    = has_mitigated_supply
             _reaction    = reaction_short
+            _zone_valid  = zone_valid_short
+            _structure   = structure_short
+            _candle      = has_bear_confirm
+            _location    = location_short
         return {
             "direction":             direction,
             "bos":                   bool(_bos),
             "choch":                 bool(_choch),
+            # Mirror the scored component keys (identical to bos/choch) so the
+            # per-setup score breakdown can render every EDGE_COMPONENTS key uniformly.
+            "bos_confirmed":         bool(sig["bos_confirmed"]),
+            "choch_confirmed":       bool(sig["choch_confirmed"]),
             "swing":                 bool(_swing),
             "zone_present":          bool(_zone_pres),
             "zone_mitigated":        bool(_zone_mit),
             "reaction":              bool(_reaction),
             "session_pref":          bool(session_pref),
-            "zone_valid":            bool(sig["zone_valid"]),
+            "zone_valid":            bool(_zone_valid),
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
-            "structure_confirmed":   bool(sig["structure_confirmed"]),
-            "candle_confirmed":      bool(sig["confirmation_candle"]),
+            "structure_confirmed":   bool(_structure),
+            "candle_confirmed":      bool(_candle),
             "liquidity_sweep":       bool(sig["liquidity_sweep"]),
             "trend_aligned":         bool(trend_long if direction == "Long" else trend_short),
-            "volume_confirmed":      None,
-            # CVD hard-confirmation filter (fail-open) + the +10 agreement bonus.
+            # Volume confirmation (+15 Edge component) AND fail-open READY gate.
+            "volume_confirmed":      bool(sig["volume_confirmed"]),
+            "volume_ok":             bool(volume_ok),
+            "volume_data_present":   bool(volume_data_present),
+            "volume_state":          volume_state,
+            "rvol_confirm":          bool(rvol_confirm),
+            "volume_spike_fresh":    bool(volume_spike_fresh),
+            # Location gate (near VWAP OR the trade-side zone).
+            "near_vwap":             bool(near_vwap),
+            "location_ok":           bool(_location),
+            "require_location":      require_location,
+            # CVD hard-confirmation filter (fail-open) + the +15 agreement bonus.
             "cvd_state":             cvd_state,
             "cvd_value":             cvd_value,
             "cvd_direction":         cvd_direction,
             "cvd_confirmed":         bool(sig["cvd_confirmed"]),
             "cvd_conflict":          bool(cvd_conflict_long if direction == "Long" else cvd_conflict_short),
             "cvd_ok":                bool(cvd_long_ok if direction == "Long" else cvd_short_ok),
-            # RVOL soft modifier (never gates).
+            # RVOL reading (retired as a score modifier; feeds volume_confirmed).
             "rvol_value":            rvol_value,
             "rvol_adj":              rvol_adj,
             "confirmations_passed":  _confirmations(direction),
@@ -3462,6 +3560,14 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             fails.append("vwap_confirmed")
         if require_structure and not gd["structure_confirmed"]:
             fails.append("structure_confirmed")
+        # Location (SCALP hard gate): price must be near VWAP or the trade-side zone.
+        if require_location and not gd["location_ok"]:
+            fails.append("location")
+        # Volume FAIL-OPEN: only blocks when volume data IS present but unconfirmed
+        # (volume_ok already encodes "confirmed OR no data" — a missing feed never
+        # blocks READY).
+        if not gd["volume_ok"]:
+            fails.append("volume_unconfirmed")
         # CVD HARD filter (both modes; fails open when CVD is unknown so SWING is
         # unchanged today). A delta opposing the trade direction vetoes READY.
         if gd["cvd_conflict"]:
@@ -3483,16 +3589,20 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         conflict, no vol block) are IDENTICAL for FULL and EARLY — only the Edge band
         differs. SWING sets both floors to 80, so it only ever returns 'FULL' or None
         (no EARLY band): it reduces to the historical zone AND vwap AND structure AND
-        edge>=80 gate exactly. SCALP: actionable floor 35, full floor 50. The
+        edge>=80 gate exactly. SCALP sets both floors to 70 (no EARLY band): READY =
+        edge>=70 AND structure AND location AND volume_ok (fail-open). The
         consumed/broken-zone safety still lives downstream in full_analysis
         (zone_broken_active / zone_mitigated_near)."""
-        sig = _signals(direction)
-        score, _bd = _edge_for(direction)
+        gd = _gate_debug(direction)
+        score  = gd["edge_score"]
         cvd_ok = cvd_long_ok if direction == "Long" else cvd_short_ok
         gates_ok = bool(
-            (not require_zone or sig["zone_valid"]) and not true_conflict and not vol_block
-            and (not require_vwap or sig["vwap_confirmed"])
-            and (not require_structure or sig["structure_confirmed"])
+            not true_conflict and not vol_block
+            and (not require_zone or gd["zone_valid"])
+            and (not require_vwap or gd["vwap_confirmed"])
+            and (not require_structure or gd["structure_confirmed"])
+            and (not require_location or gd["location_ok"])
+            and gd["volume_ok"]             # volume FAIL-OPEN (only blocks data-present+unconfirmed)
             and cvd_ok                      # CVD hard veto (fail-open when unknown)
             and _confirmations(direction) >= min_confirmations
         )
@@ -3530,6 +3640,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "zone_mitigated":      zone_valid_short,
                 "cvd_confirmed":       bool(cvd_confirmed_short),
                 "cvd_state":           cvd_state,
+                "volume_confirmed":    bool(volume_confirmed),   # directionless
                 "edge_ok":             bool(_edge_for("Short")[0] >= ready_threshold),
             }
         return {
@@ -3547,6 +3658,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "zone_mitigated":      zone_valid_long,
             "cvd_confirmed":       bool(cvd_confirmed_long),
             "cvd_state":           cvd_state,
+            "volume_confirmed":    bool(volume_confirmed),   # directionless
             "edge_ok":             bool(_edge_for("Long")[0] >= ready_threshold),
         }
 
@@ -3558,6 +3670,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         checklist = {
             "zone":      gd["zone_valid"],
             "structure": gd["structure_confirmed"],
+            "location":  gd["location_ok"],
+            "volume":    gd["volume_ok"],
             "vwap":      gd["vwap_confirmed"],
             "edge":      gd["edge_ok"],
         }
@@ -3614,6 +3728,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         payload.setdefault("cvd_direction", cvd_direction)
         payload.setdefault("rvol_value", rvol_value)
         payload.setdefault("rvol_adj", rvol_adj)
+        # Volume confirmation (directionless) for display + the full_analysis stamps.
+        payload.setdefault("volume_confirmed", volume_confirmed)
+        payload.setdefault("volume_data_present", volume_data_present)
+        payload.setdefault("volume_state", volume_state)
         return payload
 
     # ── True conflict → stand aside (both sides). SCALP only reaches here when the
@@ -3673,8 +3791,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     blk = directions[candidate]
     if blk["ready"]:
         score = blk["score"]
+        # Journal label stays in {Strong Trade, Possible Trade, WAIT}. A READY setup
+        # always clears full_ready_threshold, so it is a "Strong Trade"; the finer
+        # display tier (A+ / Strong / Possible) is computed separately downstream.
         return _ret({
-            "label":      "Strong Trade" if score >= 90 else "Possible Trade",
+            "label":      "Strong Trade" if score >= full_ready_threshold else "Possible Trade",
             "direction":  candidate,
             "candidate":  candidate,
             "score":      score,
@@ -3806,14 +3927,22 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
 
 def build_strict_trade_plan(direction, ticker, current_price,
                             nearest_supply, nearest_demand,
-                            volatility=None, mode=None):
+                            volatility=None, mode=None, vwap=None):
     """Fixed-target plan per instrument with an ATR(14)-based DYNAMIC stop.
 
     Targets stay fixed (MNQ TP1/TP2/TP3 = 20/40/60 pts, MGC = 5/10/15). The stop is
     sized by `_dynamic_stop_plan` — ATR×multiplier blended with the nearest zone and
-    floored at the instrument's min stop ticks. Returns a no-plan dict if the
-    anchoring zone is missing, the ATR reading needed to size the stop is
-    unavailable, or (SWING / ENFORCE_MIN_RR) the fixed TP2 can't make 1:2.
+    floored at the instrument's min stop ticks.
+
+    Anchor priority: the trade-side structural zone when present (the highest-quality
+    level), else VWAP. The SCALP READY gate accepts location as "near VWAP OR
+    trade-side zone", so a near-VWAP setup with no zone must still produce a plan
+    (anchored on VWAP) — otherwise the OR-location path would be dead and the gate
+    would say READY while the verdict silently downgraded to WAIT.
+
+    Returns a no-plan dict if neither a zone nor VWAP is available to anchor the
+    entry, the ATR reading needed to size the stop is unavailable, or (SWING /
+    ENFORCE_MIN_RR) the fixed TP2 can't make 1:2.
     """
     spec = spec_for(ticker)
     inst = instrument_of(ticker)
@@ -3839,16 +3968,20 @@ def build_strict_trade_plan(direction, ticker, current_price,
                 "volatility_regime": None, "volatility_label": None,
                 "min_floor_applied": None}
 
+    # Anchor on the trade-side zone when present, else fall back to VWAP (see
+    # docstring — keeps the "near VWAP OR zone" READY path alive).
     if direction == "Long":
-        anchor = nearest_demand
+        anchor = nearest_demand if nearest_demand is not None else vwap
+        anchored_on_vwap = nearest_demand is None
         if anchor is None:
-            return no_plan("No demand zone to anchor the entry.")
+            return no_plan("No demand zone or VWAP to anchor the entry.")
         lo, hi = anchor, anchor + buf
         t1, t2, t3 = anchor + tp1d, anchor + tp2d, anchor + tp3d
     else:  # Short
-        anchor = nearest_supply
+        anchor = nearest_supply if nearest_supply is not None else vwap
+        anchored_on_vwap = nearest_supply is None
         if anchor is None:
-            return no_plan("No supply zone to anchor the entry.")
+            return no_plan("No supply zone or VWAP to anchor the entry.")
         lo, hi = anchor - buf, anchor
         t1, t2, t3 = anchor - tp1d, anchor - tp2d, anchor - tp3d
 
@@ -3878,13 +4011,14 @@ def build_strict_trade_plan(direction, ticker, current_price,
     rr_runner = reward / risk
     zone_word = "demand" if direction == "Long" else "supply"
     side_word = "below" if direction == "Long" else "above"
+    anchor_word = "VWAP" if anchored_on_vwap else f"{zone_word} zone"
 
     fmt = (lambda v: f"{v:.1f}") if inst == "MNQ" else (lambda v: f"{v:.2f}")
-    invalidation = (f"Price closing {side_word} the stop ({fmt(stop)}) or losing the "
-                    f"{zone_word} zone invalidates the setup.")
+    invalidation = (f"Price closing {side_word} the stop ({fmt(stop)}) or losing "
+                    f"{anchor_word} invalidates the setup.")
     return {
         "trade_plan": True,
-        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} / TP3 {tp3d:g} pts), ATR-dynamic stop.",
+        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} / TP3 {tp3d:g} pts), ATR-dynamic stop, {anchor_word}-anchored.",
         "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
         "stop_loss":  fmt(stop),
         "target1":    fmt(t1),
@@ -4032,20 +4166,21 @@ def full_analysis(current_price_override=None, ticker_override=None):
     if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
-            volatility=volatility, mode=TRADING_MODE,
+            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
         )
         if trade_plan["trade_plan"]:
             # EARLY READY (SCALP Edge 35-49) is actionable but labelled lower
             # conviction; a full READY is Edge >= the full-READY floor. Both still
-            # require a valid trade plan (R:R + anchor zone), so an EARLY setup that
-            # can't form a real plan still falls through to WAIT below.
+            # require a valid trade plan (R:R + an anchor — a trade-side zone OR
+            # VWAP), so an EARLY setup that can't form a real plan still falls
+            # through to WAIT below.
             _early = strict.get("readiness") == "EARLY"
             if strict_direction == "Long":
                 verdict = "LONG EARLY READY" if _early else "LONG READY"
             else:
                 verdict = "SHORT EARLY READY" if _early else "SHORT READY"
         else:
-            # Fixed targets can't meet the 1:2 R:R (or no anchor zone) → no trade.
+            # Fixed targets can't meet the 1:2 R:R (or no zone/VWAP anchor) → no trade.
             verdict        = "WAIT"
             strict_label   = "WAIT"
             strict_reason  = trade_plan.get("reason", strict_reason)
@@ -4249,6 +4384,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["cvd_direction"] = strict.get("cvd_direction")
     result["rvol_value"]    = strict.get("rvol_value")
     result["rvol_adj"]      = strict.get("rvol_adj")
+    # Volume confirmation (directionless) — stamped BEFORE the Edge breakdown so
+    # compute_edge_breakdown reads the SAME volume_confirmed the gate scored.
+    result["volume_confirmed"]    = strict.get("volume_confirmed")
+    result["volume_data_present"] = strict.get("volume_data_present")
+    result["volume_state"]        = strict.get("volume_state")
 
     # ── Unified Edge Score (single source of truth) ──────────────────────────
     # The transparent, confluence-based Edge Score replaces the legacy bias-derived
@@ -4308,6 +4448,9 @@ def full_analysis(current_price_override=None, ticker_override=None):
         _cvd_agree = "Confirmed"
     else:
         _cvd_agree = "Conflicting"
+    # Per-setup score diagnostics (the authoritative breakdown for the favored side).
+    _diag_eb       = result.get("edge_breakdown") or {}
+    _diag_blockers = list(_diag_gd.get("failed_conditions") or [])
     result["alert_diagnostics"] = {
         "long_score":            _diag_long,
         "short_score":           _diag_short,
@@ -4320,6 +4463,22 @@ def full_analysis(current_price_override=None, ticker_override=None):
         "rejected_reasons":      _humanize_gate_rejections(_diag_gd),
         "current_score":         int(result.get("edge_score") or 0),
         "required_score":        int(cfg("EDGE_READY_THRESHOLD")),
+        # Per-setup Edge breakdown (display/observability): the credited components,
+        # the confirmations that did NOT fire, the gates blocking READY, and the
+        # honest raw-vs-clamped accounting.
+        "score_breakdown":       _diag_eb.get("score_breakdown") or [],
+        "components":            _diag_eb.get("components") or [],
+        "failed_confirmations":  _diag_eb.get("failed_confirmations") or [],
+        "ready_blockers":        _diag_blockers,
+        "raw_score":             int(_diag_eb.get("raw_score") or 0),
+        "max_score":             EDGE_SCORE_MAX,
+        "cap_applied":           bool(_diag_eb.get("cap_applied")),
+        # Volume confirmation (+15 component, fail-open READY gate) + location gate.
+        "volume_state":          _diag_gd.get("volume_state"),
+        "volume_confirmed":      bool(_diag_gd.get("volume_confirmed")),
+        "volume_data_present":   bool(_diag_gd.get("volume_data_present")),
+        "location_ok":           bool(_diag_gd.get("location_ok")),
+        "near_vwap":             bool(_diag_gd.get("near_vwap")),
         # CVD hard-filter + RVOL soft-modifier diagnostics (display-only).
         "cvd_state":             _cvd_st,
         "cvd_value":             strict.get("cvd_value"),
@@ -4398,7 +4557,11 @@ def full_analysis(current_price_override=None, ticker_override=None):
     result["last_valid_source"] = _lv_src
     if not market["open"]:
         result["verdict"]         = "MARKET CLOSED"
-        result["strict_label"]    = "MARKET CLOSED"
+        # strict_label is the JOURNALING label and must stay in
+        # {Strong Trade, Possible Trade, WAIT}; the closed state is surfaced via
+        # verdict + market_status + strict_reason instead (the dashboard badge reads
+        # those, not strict_label), so closed evals never journal as a tradeable setup.
+        result["strict_label"]    = "WAIT"
         result["strict_reason"]   = (
             "Market closed — live alerts paused"
             + (f". Next open: {market['next_open_et']}." if market["next_open_et"] else ".")
@@ -4415,12 +4578,15 @@ def full_analysis(current_price_override=None, ticker_override=None):
         result["dominant_direction"] = None
         result["ready_reason"]       = result["strict_reason"]
         result["rejected_reasons"]   = ["market_closed"]
-        # Neutralise the CVD / RVOL stamps too — there is no live tape when closed.
+        # Neutralise the CVD / RVOL / volume stamps too — there is no live tape closed.
         result["cvd_state"]          = None
         result["cvd_value"]          = None
         result["cvd_direction"]      = None
         result["rvol_value"]         = None
         result["rvol_adj"]           = 0
+        result["volume_confirmed"]    = False
+        result["volume_data_present"] = False
+        result["volume_state"]        = None
         result["alert_diagnostics"] = {
             "long_score":            0,
             "short_score":           0,
@@ -4433,6 +4599,19 @@ def full_analysis(current_price_override=None, ticker_override=None):
             "rejected_reasons":      ["Market closed — live alerts paused"],
             "current_score":         0,
             "required_score":        int(cfg("EDGE_READY_THRESHOLD")),
+            # Per-setup Edge breakdown — neutralised while the market is closed.
+            "score_breakdown":       [],
+            "components":            [],
+            "failed_confirmations":  [],
+            "ready_blockers":        ["market_closed"],
+            "raw_score":             0,
+            "max_score":             EDGE_SCORE_MAX,
+            "cap_applied":           False,
+            "volume_state":          None,
+            "volume_confirmed":      False,
+            "volume_data_present":   False,
+            "location_ok":           False,
+            "near_vwap":             False,
             "cvd_state":             None,
             "cvd_value":             None,
             "cvd_direction":         None,
@@ -5673,25 +5852,24 @@ def classify_setup_categories(entry):
 def _grade_for_score(score):
     """Map an Edge Score (0-EDGE_SCORE_MAX) to a Trade Grade band.
 
-    Bands (Edge Score → Grade): >= 85 A+, >= 80 A, >= the mode READY floor B,
-    below WAIT. The A+ band lines up with the A+ SETUP threshold (85) and B with
-    the READY gate floor (SCALP 75 / SWING 80) — a READY setup is always grade B
-    or better; anything below the floor reads "WAIT"."""
+    Bands (Edge Score → Grade): >= 85 A+, >= 70 A (Strong), >= 50 B (Possible),
+    below WAIT. These line up 1:1 with the display tiers — A+ Setup (>= 85),
+    Strong Trade (>= 70), Possible Trade (>= 50) — so a card's grade never
+    contradicts its tier. A SCALP READY (floor 70) is always grade A or better;
+    a SWING READY (floor 80) is grade A or better too."""
     s = score or 0
     if s >= 85: return "A+"
-    if s >= 80: return "A"
-    # A valid READY (SCALP floor 75 / SWING floor 80) grades B rather than the
-    # "WAIT" floor so the card's grade never contradicts its READY verdict. In
-    # SWING the floor is 80, already returned as A above.
-    if s >= cfg("EDGE_READY_THRESHOLD"): return "B"
+    if s >= 70: return "A"
+    if s >= 50: return "B"
     return "WAIT"
 
 
 # ── Trade-strength classification (display / journal / analytics) ──────────────
-# A READY setup (the strict gate passed) is sub-classified PURELY by its Edge
-# Score: 75-79 → Possible Trade, 80-84 → Strong Trade, >= 85 → A+ Setup. This
-# never affects the READY gate itself (evaluate_strict_setup); it only labels an
-# already-READY trade. A score below 75 is not a READY strength and returns None.
+# Display tier sub-classification by Edge Score: 50-69 → Possible Trade, 70-84 →
+# Strong Trade, >= 85 → A+ Setup. This never affects the READY gate itself
+# (evaluate_strict_setup); it only labels a setup for display. A score below 50 is
+# not a qualified tier and returns None. NOTE: "A+ Setup" is a DISPLAY tier only —
+# the journal strict_label stays in {Strong Trade, Possible Trade, WAIT}.
 def _trade_strength_from_score(score):
     try:
         s = float(score)
@@ -5699,20 +5877,21 @@ def _trade_strength_from_score(score):
         return None
     if s >= 85:
         return "A+ Setup"
-    if s >= 80:
+    if s >= 70:
         return "Strong Trade"
-    if s >= 75:
+    if s >= 50:
         return "Possible Trade"
     return None
 
 
 def _score_tier(score):
     """Conviction tier from the Edge Score (display-only) — the user-facing band
-    naming. HIGH CONVICTION >= 70, READY 50-69, EARLY READY 35-49, else None.
+    naming. HIGH CONVICTION >= 70, READY 50-69, else None.
     Distinct from the operational alert_level ladder (WATCH/ARMED/WATCH FOR ENTRY/
     READY): a tier names the STRENGTH of an Edge Score, not the dispatch state, and
-    never gates a trade. The bands line up with the SCALP gate floors (actionable 35,
-    full 50); in SWING (threshold 80) a READY always lands in HIGH CONVICTION."""
+    never gates a trade. The bands line up with the display tiers — HIGH CONVICTION
+    >= 70 (Strong/A+), READY 50-69 (Possible); in SWING (floor 80) a READY always
+    lands in HIGH CONVICTION."""
     try:
         s = float(score)
     except (TypeError, ValueError):
@@ -5721,8 +5900,6 @@ def _score_tier(score):
         return "HIGH CONVICTION"
     if s >= 50:
         return "READY"
-    if s >= 35:
-        return "EARLY READY"
     return None
 
 
@@ -5845,7 +6022,7 @@ def _display_edge_score(entry):
 
 def _entry_trade_strength(entry):
     """Trade strength for a stored entry: the explicit field if present, else
-    derived from its Edge Score (only when ≥75, i.e. an actual READY trade)."""
+    derived from its Edge Score (only when ≥50, i.e. a qualified display tier)."""
     st = entry.get("trade_strength")
     if st in ("Possible Trade", "Strong Trade", "A+ Setup"):
         return st
@@ -5857,15 +6034,18 @@ def compute_edge_breakdown(a, entry):
 
     Computed from the SAME pure additive helper (compute_trade_edge_components)
     the READY gate uses, reading the confluences full_analysis() already produced,
-    so the displayed Edge Score and the gate score can never diverge. Six additive
-    components (max 100): zone mitigation+reaction (+25), VWAP (+20), structure
-    (+20), liquidity sweep (+15), confirmation candle (+10), preferred session
-    (+10). Risk lines are INFORMATIONAL warnings only — they do NOT reduce the
-    score. Hard blockers (zone broken / consumed) force the score to 0.
+    so the displayed Edge Score and the gate score can never diverge. Seven additive
+    components (max 110): BOS (+20), CHOCH (+20), VWAP (+15), liquidity sweep (+15),
+    volume (+15), CVD agreement (+15), preferred session (+10). Risk lines are
+    INFORMATIONAL warnings only — they do NOT reduce the score. Hard blockers (zone
+    broken / consumed) force the score to 0.
 
     Returns {"score": int, "grade": str,
              "score_breakdown": [{"label": str, "points": int}],
              "risk_adjustments": [{"label": str, "points": None}],
+             "components": [{"key","label","points","present"}],
+             "failed_confirmations": [str], "raw_score": int,
+             "max_score": int, "cap_applied": bool,
              "reasons": [str], "risks": [str]}.  (reasons/risks kept for
     backward compatibility — they mirror the breakdown/risk labels.)
     """
@@ -5874,42 +6054,45 @@ def compute_edge_breakdown(a, entry):
     conf      = a.get("confluences") or {}
     sess      = a.get("session") or get_session_state()
 
-    # The six additive components come straight from the confluences the READY
-    # gate already evaluated, scored by the SAME helper the gate uses, so the
-    # displayed Edge Score equals the gate score. `zone_mitigated` carries the
-    # zone-VALID signal (mitigation + same-direction reaction).
     has_sweep = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
+    # The seven additive components — same keys the READY gate scores in _signals,
+    # so the displayed Edge Score equals the gate score. Structure is split into BOS
+    # and CHOCH; volume is a first-class component (spike OR RVOL >= threshold,
+    # resolved by the gate and stamped on the confluences / `a`).
     signals = {
-        "zone_valid":          bool(conf.get("zone_mitigated")),
-        "vwap_confirmed":      bool(conf.get("vwap")),
-        "structure_confirmed": bool(conf.get("structure_confirmed")),
-        "liquidity_sweep":     has_sweep,
-        "confirmation_candle": bool(conf.get("confirmation_candle")),
-        "preferred_session":   bool(sess.get("preferred")),
-        # CVD agreement (+10) — the gate already resolved it per direction into the
+        "bos_confirmed":     bool(conf.get("bos")),
+        "choch_confirmed":   bool(conf.get("choch")),
+        "vwap_confirmed":    bool(conf.get("vwap")),
+        "liquidity_sweep":   has_sweep,
+        "volume_confirmed":  bool(conf.get("volume_confirmed") or a.get("volume_confirmed")),
+        # CVD agreement (+15) — the gate already resolved it per direction into the
         # confluences, so the displayed score matches the gate score exactly.
-        "cvd_confirmed":       bool(conf.get("cvd_confirmed")),
+        "cvd_confirmed":     bool(conf.get("cvd_confirmed")),
+        "preferred_session": bool(sess.get("preferred")),
     }
-    vol_adj = int((a.get("volatility") or {}).get("score_adj") or 0)
-    # RVOL soft modifier — full_analysis stamps the resolved adjustment on `a`;
-    # recompute from rvol_value as a fallback so display and gate never diverge.
-    rvol_adj = a.get("rvol_adj")
-    if rvol_adj is None:
-        rvol_adj = _rvol_adjustment(a.get("rvol_value"))
-    rvol_adj = int(rvol_adj or 0)
-    score, raw_breakdown = compute_trade_edge_components(signals, vol_adj, rvol_adj)
+    score, raw_breakdown = compute_trade_edge_components(signals)
+    raw_score   = sum(it["points"] for it in raw_breakdown)
+    cap_applied = raw_score > EDGE_SCORE_MAX
 
     # Direction-aware display labels for the generic component names.
     relabel = {
-        "Zone Mitigated":         "Demand Zone Reaction"  if is_long else "Supply Zone Reaction",
-        "VWAP Confirmation":      "VWAP Reclaim"          if is_long else "VWAP Rejection",
-        "Structure Confirmation": "Bullish Structure"     if is_long else "Bearish Structure",
-        "CVD Agreement":          "CVD Confirms Long"     if is_long else "CVD Confirms Short",
-        "Volatility":             "Calm Market" if vol_adj > 0 else "Extreme Volatility",
-        "Relative Volume":        "Heavy Volume (RVOL)" if rvol_adj > 0 else "Thin Volume (RVOL)",
+        "BOS Confirmed":     "Bullish BOS"        if is_long else "Bearish BOS",
+        "CHOCH Confirmed":   "Bullish CHOCH"      if is_long else "Bearish CHOCH",
+        "VWAP Confirmation": "VWAP Reclaim"       if is_long else "VWAP Rejection",
+        "CVD Agreement":     "CVD Confirms Long"  if is_long else "CVD Confirms Short",
     }
     breakdown = [{"label": relabel.get(it["label"], it["label"]), "points": it["points"]}
                  for it in raw_breakdown]
+
+    # Per-setup diagnostics: EVERY component with its present/points, plus the list
+    # of confirmations that did NOT fire. Lets the card / dashboard render the full
+    # 7-component checklist uniformly (present and absent alike).
+    components = [{"key": key, "label": relabel.get(label, label),
+                  "points": pts, "present": bool(signals.get(key))}
+                 for key, label, pts in EDGE_COMPONENTS]
+    failed_confirmations = [relabel.get(label, label)
+                            for key, label, pts in EDGE_COMPONENTS
+                            if not signals.get(key)]
 
     # ── Risk lines — INFORMATIONAL warnings only; they do NOT reduce the Edge
     #    Score (the score is the pure additive sum above). Shown as bullet flags. ─
@@ -5980,12 +6163,25 @@ def compute_edge_breakdown(a, entry):
         breakdown = []
         risk_adj  = [{"label": blocker, "points": None}]
         score     = 0
+        raw_score = 0
+        cap_applied = False
+        for c in components:
+            c["present"] = False
+        failed_confirmations = [c["label"] for c in components]
 
     return {
         "score": score,
         "grade": _grade_for_score(score),
         "score_breakdown": breakdown,
         "risk_adjustments": risk_adj,
+        # Per-setup diagnostics: full component list + which confirmations failed,
+        # and the honest raw-vs-clamped accounting (cap_applied is True only if the
+        # additive sum actually exceeded EDGE_SCORE_MAX — with max 110 it never does).
+        "components": components,
+        "failed_confirmations": failed_confirmations,
+        "raw_score": raw_score,
+        "max_score": EDGE_SCORE_MAX,
+        "cap_applied": cap_applied,
         # Backward-compatible plain-label lists (mirror the structured items).
         "reasons": [it["label"] for it in breakdown],
         "risks":   [it["label"] for it in risk_adj],
@@ -7041,8 +7237,15 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
                         _bump_rr("vwap_confirmed")
                     if gd.get("structure_confirmed") is False:
                         _bump_rr("structure_confirmed")
-                    if gd.get("candle_confirmed") is False:
-                        _bump_rr("candle_confirmed")
+                    if gd.get("location_ok") is False:
+                        _bump_rr("location")
+                    # Volume FAIL-OPEN: only count when data is present but unconfirmed
+                    # (volume_ok already encodes "confirmed OR no data" — a missing feed
+                    # never rejects a setup, so it must never inflate this counter).
+                    if not gd.get("volume_ok"):
+                        _bump_rr("volume_unconfirmed")
+                    if gd.get("cvd_conflict"):
+                        _bump_rr("cvd_conflict")
                     if gd.get("volatility_block"):
                         _bump_rr("volatility_block")
                     if not gd.get("edge_ok"):
@@ -7629,6 +7832,22 @@ def webhook():
             "price":         parsed_price if parsed_price is not None else CURRENT_PRICE,
         }), 200
 
+    # ── Volume-spike ingestion (VOLUME SPIKE) — one half of the +15 volume edge ──
+    #    A volume spike is a momentary event, so we store only its arrival time and
+    #    treat it as "fresh" for VOLUME_SPIKE_TTL_MIN minutes (see evaluate_strict
+    #    _setup). Data-only: it stores + acks, never scores or biases. FAIL-OPEN —
+    #    until a spike arrives, volume confirmation falls back to RVOL / no-data.
+    if normalized in VOLUME_SPIKE_TYPES:
+        VOLUME_SPIKE_BY_TICKER[resolved_inst] = {"ts": now_utc().isoformat()}
+        logger.info("Volume-spike update: %s", resolved_inst)
+        _record_diagnostic("%s | %s — VOLUME SPIKE — data only, no scoring" % (
+            fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), resolved_inst))
+        return jsonify({
+            "status": "volume_spike_updated",
+            "ticker": resolved_inst,
+            "price":  parsed_price if parsed_price is not None else CURRENT_PRICE,
+        }), 200
+
     # ── Data-only VWAP push — store already updated above; ack without scoring ──
     if normalized in _DATA_ONLY_TYPES:
         _vk = resolved_inst
@@ -7939,7 +8158,8 @@ async function refresh(){
               .map(function(k){return k+' ('+wrb[k]+')';}).join(', ')||'-';
   var rr=c.rejection_reasons||{};
   var rrLabel={zone_valid:'zone_valid',vwap_confirmed:'vwap_confirmed',
-    structure_confirmed:'structure_confirmed',candle_confirmed:'candle_confirmed',
+    structure_confirmed:'structure_confirmed',location:'location',
+    volume_unconfirmed:'volume',cvd_conflict:'cvd_conflict',
     volatility_block:'volatility_block',edge_score_low:'edge_score',
     conflicting_structure:'conflict',cooldown_duplicate:'cooldown_dup',
     session_filter:'session(bonus,n/a)'};
@@ -9060,7 +9280,7 @@ def dashboard():
     <div class="gstat"><div class="l">CVD Dir</div><div class="v" id="cvd-dir">—</div></div>
     <div class="gstat"><div class="l">Agreement</div><div class="v" id="cvd-agree">—</div></div>
     <div class="gstat"><div class="l">Rel Volume</div><div class="v" id="cvd-rvol">—</div></div>
-    <div class="gstat"><div class="l">RVOL Edge</div><div class="v" id="cvd-rvoladj">—</div></div>
+    <div class="gstat"><div class="l">Volume</div><div class="v" id="cvd-volstate">—</div></div>
   </div>
 </div>
 
@@ -9450,10 +9670,10 @@ function renderModules(d){
   const reqd = Number(diag.required_score!=null?diag.required_score:(aiGd.ready_threshold!=null?aiGd.ready_threshold:50));
   const edgeNow = Number(aiGd.edge_score!=null?aiGd.edge_score:prob);
   const items = [
-    ['Trade-side zone valid', !!aiGd.zone_valid],
     ['Structure (BOS/CHOCH)', !!aiGd.structure_confirmed],
+    ['Location (VWAP / zone)', !!aiGd.location_ok],
+    ['Volume confirming', !!aiGd.volume_confirmed],
     ['VWAP confirming', !!aiGd.vwap_confirmed],
-    ['Confirmation candle', !!aiGd.candle_confirmed],
     ['Liquidity sweep', !!aiGd.liquidity_sweep],
     ['Edge \u2265 '+reqd, edgeNow>=reqd]
   ];
@@ -9499,9 +9719,10 @@ function renderModules(d){
     }
   }
 
-  // ── Module 6: Volume Delta (CVD) + RVOL ── CVD is a HARD confirmation filter
+  // ── Module 6: Volume Delta (CVD) + Volume ── CVD is a HARD confirmation filter
   //    (rejects a long on bearish delta / a short on bullish delta, fail-open when
-  //    unknown); RVOL is a soft Edge modifier. Display-only mirror of the gate. ──
+  //    unknown). Volume is a first-class +15 Edge component (a recent spike OR RVOL
+  //    >= threshold) and a fail-open READY gate. Display-only mirror of the gate. ──
   const _setCvd = function(id, txt, col){
     const e=document.getElementById(id);
     if(e){ e.textContent=txt; e.style.color = col || '#e8e8f0'; }
@@ -9521,9 +9742,12 @@ function renderModules(d){
     cvdAgree==='Confirmed' ? '#22c55e' : cvdAgree==='Conflicting' ? '#ef4444' : '#6b7280');
   _setCvd('cvd-rvol',
     diag.rvol_value!=null ? Number(diag.rvol_value).toFixed(2)+'\u00d7' : '—');
-  const rAdj = Number(diag.rvol_adj||0);
-  _setCvd('cvd-rvoladj',
-    (rAdj>0?'+':'')+rAdj, rAdj>0 ? '#22c55e' : rAdj<0 ? '#ef4444' : '#6b7280');
+  // Volume confirmation state (+15 Edge component, fail-open READY gate):
+  // confirmed (spike OR RVOL>=thr) / unconfirmed (data present, no spike) / no data.
+  const volSt = diag.volume_state;
+  _setCvd('cvd-volstate',
+    volSt==='confirmed' ? 'Confirmed' : volSt==='unconfirmed' ? 'Unconfirmed' : 'No data',
+    volSt==='confirmed' ? '#22c55e' : volSt==='unconfirmed' ? '#ef4444' : '#6b7280');
 }
 
 async function refreshRec() {

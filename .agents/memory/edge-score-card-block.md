@@ -1,103 +1,71 @@
 ---
 name: Edge Score card block & trade-strength classification
-description: How the transparent Edge Score block + Possible/Strong trade-strength label on READY cards are computed; the floor-on-READY-verdict rule, the no-fabricated-signal rule, and the alert-driven nature behind the Liquidity Sweep reason.
+description: How the transparent Edge Score block + Possible/Strong/A+ tier label on READY cards are computed; the weighted-component model (max 110), the no-fabricated-signal rule, the gate==display invariant, and the alert-driven nature behind Sweep/Volume/CVD.
 ---
 
 # Edge Score block + trade-strength (display-only)
 
-The clean READY trade card shows a transparent "⚡ Edge Score" block that REPLACES the
-old free-text "🤖 AI Analysis" field, plus a 🟡 POSSIBLE TRADE / 🟢 STRONG TRADE label.
-Both are a **display layer only**: computed from data `full_analysis()` already produces,
-never requiring new webhook fields, and never altering webhook parsing, the READY/WAIT
-gate, alerts, throttling, or the 5-min repost loop.
+The clean READY trade card shows a transparent "⚡ Edge Score" block plus a
+🟡 POSSIBLE TRADE / 🟢 STRONG TRADE / A+ tier label. Both are a **display layer only**:
+computed from data `full_analysis()` already produces, never altering webhook parsing,
+the READY/WAIT gate, alerts, throttling, or the 5-min repost loop.
 
-- Computed at the `_build_card_entry` seam (`compute_edge_breakdown` stamps
-  `entry["edge_breakdown"]` and sets the authoritative `entry["edge_score"]`,
-  `edge_grade`, `score_breakdown`, `risk_adjustments`, `trade_strength`). Journal +
-  live card + periodic repost share one source. `_build_trade_card_embed` renders the
-  block when present and FALLS BACK to the old AI Analysis field / `strict_label` when
-  absent (legacy/manual entries).
-- Score = additive sum of confluence components, **max `EDGE_SCORE_MAX = 120`**, computed by
-  the SHARED helper `compute_trade_edge_components(signals, vol_adj=0, rvol_adj=0)`: Zone-valid
-  +25, VWAP +20, Structure +20, Liquidity Sweep +15, Confirmation Candle +10, Session +10, and
-  **CVD Agreement +10** (see cvd-rvol-filter). NO gate base, NO 75-floor. The SAME helper backs
-  the READY gate, so displayed Edge == gate Edge always. Two non-confluence modifiers: the
-  **SCALP volatility modifier** `vol_adj` (Normal +10 / Elevated 0 / Extreme −10; 0 in SWING —
-  see volatility-monitor-gate) and the **RVOL modifier** `rvol_adj` (+10 ≥1.5 / 0 / −5 <1.0;
-  NEVER gates). Both append a breakdown line; the final score is clamped 0–`EDGE_SCORE_MAX`.
-  The six confluences sum to 100; CVD(+10) and RVOL(+10) lift the ceiling to 120.
-- **Risk lines are INFORMATIONAL warnings only (`points: None`); they do NOT subtract.** Nearby
-  Resistance/Support, Overextended, Choppy render as flags but never lower the score. The one
-  exception is volatility in SCALP, which is a real scored modifier (`vol_adj`, above) AND also
-  shows an informational regime risk line; in SWING volatility is a hard gate, not a score term.
-  (The older model subtracted all risks and floored READY to 75 — both removed.)
-- Trade strength sub-classifies the Edge Score (`_trade_strength_from_score`): **Possible 75–79,
-  Strong 80–84, A+ Setup ≥85** (below 75 → None). The gate decides READY/WAIT; strength only ranks
-  a READY trade. NOTE: "A+ Setup" feeds the DISPLAY `trade_strength` only — it must NEVER become
-  `strict_label` (the journal gates on `strict_label ∈ {Strong Trade, Possible Trade}`; the inline
-  strict_label still uses score≥90 Strong else Possible, unchanged).
-- **Session Bonus +10 is a pure additive component, NOT READY-gated.** A preferred ET window
-  (`get_session_state`: half-open `[05:00,08:00)`, `[08:00,11:00)`, `[20:00,23:00)`) adds +10 to
-  the Edge Score directly. `full_analysis` computes the session state ONCE and threads the same
-  instant into both the gate and the display so the +10 is identical on /status, /why, card, journal.
+- Computed at the `_build_card_entry` seam; `_analysis_edge_breakdown` reuses
+  `compute_edge_breakdown`, which calls the ONE scorer, so journal + live card +
+  periodic repost + /status all share one source.
 
-## Letter-grade bands (display-only, quality NOT verdict)
+## The weighted-component model (current)
 
-`_grade_for_score`: **≥85 A+ · ≥80 A · ≥`EDGE_READY_THRESHOLD` (SCALP 75 / SWING 80) B · below WAIT**.
-The grade is a quality label only; it does NOT change the READY/WAIT verdict or journaling. A valid
-READY (≥ the mode floor) is ALWAYS grade B or better, so the card's grade never contradicts its
-READY verdict. Note: `QUALITY_LABELS` (A+/A/B/C/D market-quality) is a DIFFERENT scale — do not conflate.
+- Score = additive sum of weighted components, **max `EDGE_SCORE_MAX = 110`**, via the
+  SHARED helper **`compute_trade_edge_components(signals)`** (single arg — the old
+  `vol_adj`/`rvol_adj` modifier params were REMOVED). `signals` is a dict of booleans
+  keyed by `EDGE_COMPONENTS[*][0]`.
+- **`EDGE_COMPONENTS` (7 tuples, sum 110):** BOS Confirmed +20, CHOCH Confirmed +20,
+  VWAP +15, Liquidity Sweep +15, **Volume +15** (a recent volume spike OR RVOL ≥
+  `cfg("RVOL_CONFIRM_THRESHOLD")` ≈ 1.5), **CVD Agreement +15**, Session +10.
+- **Structure is SPLIT into two independent components** (BOS +20 and CHOCH +20) — both
+  can credit on one setup. There is NO combined "Structure +20" term anymore.
+- **Dropped from SCORING vs the old model:** `zone_valid` (+25) and
+  `confirmation_candle` (+10) no longer score at all; the separate RVOL ± and
+  volatility ± modifiers are gone. Volatility is now informational + a SWING hard gate
+  only; RVOL feeds the Volume component (spike OR RVOL≥thr), not a standalone modifier.
+- `cap_applied` is effectively always False (raw max is exactly 110 = EDGE_SCORE_MAX);
+  it stays in the diagnostics for honesty if weights ever exceed the cap.
+- **Risk lines are INFORMATIONAL warnings only (`points: None`); they never subtract.**
+  The only DISPLAY divergence from the gate score is a hard blocker
+  (`zone_broken_active`/`zone_mitigated_near`) zeroing the display score while
+  `gate_debug.edge_score` still reports raw components.
+
+## Tiers and grades (display-only, quality NOT verdict)
+
+- **Trade strength (`_trade_strength_from_score`): Possible ≥50, Strong ≥70, A+ Setup
+  ≥85** (below 50 → None). "A+ Setup" feeds the DISPLAY `trade_strength` ONLY — it must
+  NEVER become `strict_label` (journaling label stays in {Strong Trade, Possible Trade,
+  WAIT}).
+- **Grade (`_grade_for_score`): ≥85 A+ · ≥70 A · ≥50 B · below WAIT.** Quality label
+  only; never changes the READY/WAIT verdict. A valid SCALP READY (Edge ≥70) is always
+  grade A or better. `QUALITY_LABELS` (A+/A/B/C/D market-quality) is a DIFFERENT scale.
+- **Session +10 is a pure additive component, NOT READY-gated.** `full_analysis`
+  computes the session state ONCE and threads the same instant into gate + display so
+  the +10 is identical everywhere.
 
 ## The durable rules
 
-**Gate score and display score MUST come from the same helper — never recompute points in two
-places.** `compute_trade_edge_components(signals)` is the single source: the gate calls it to
-decide READY, and `compute_edge_breakdown` calls it to display, reading the gate's `confluences`
-(where `zone_mitigated` carries the full zone-VALID signal) so the two always agree.
-**Why:** the previous design scored the gate and the card separately (gate base + 75-floor on one
-side, additive bonuses/subtractive risks on the other) and they drifted. The only legitimate
-divergence now is a hard blocker (`zone_broken_active`/`zone_mitigated_near`) zeroing the DISPLAY
-score while `gate_debug.edge_score` still shows raw components.
-**How to apply:** any new edge component goes in `EDGE_COMPONENTS` ONCE; never add a credit in the
-display layer that the gate doesn't also see, or READY and the shown score will disagree again.
+**Gate score and display score MUST come from the same helper — never recompute points
+in two places.** `compute_trade_edge_components(signals)` is the single source: the gate
+(`_signals`) calls it to decide READY; `compute_edge_breakdown` calls it to display.
+**Why:** the previous design scored gate and card separately and they drifted.
+**How to apply:** any new edge component goes in `EDGE_COMPONENTS` ONCE, with a matching
+boolean key produced by BOTH `_signals` (gate) and `compute_edge_breakdown` (display);
+never add a credit one side can't see, or READY and the shown score disagree again.
 
-**The READY threshold (`EDGE_READY_THRESHOLD`) is mode-tuned: SCALP 75, SWING 80.** In SWING the
-three required gates (zone 25 + vwap 20 + structure 20 = 65) are AND-ed AND Edge≥80, so passing all
-three is NOT enough — READY structurally needs a 4th confluence. In SCALP those three are demoted to
-confirmations (not hard gates) and the floor is 75. CVD is a separate HARD veto (fail-open) on top.
-**Why:** an over-high threshold vs the AND-required sum is a silent over-filter; if "always WAIT"
-recurs with the requireds green, check the threshold-vs-component-sum gap. **How to apply:** keep the
-threshold reachable by the intended component set; never just keep raising input weights to compensate.
-
-**Never fabricate a signal label.** A reason label must map to something the app actually
-produces. The bonus shows "Liquidity Sweep" ONLY when a real sweep flag is set
-(`confluences.liquidity_sweep` / `confluences.sweep` / `a["liquidity_sweep"]`), and shows
-"Confirmed Zone Reaction" from `zone_confirmed`. These are INDEPENDENT — both can appear on
-one card — NOT mutually exclusive. An earlier version mislabeled `zone_confirmed` itself as
-"Liquidity Sweep" and was rejected.
-
-**Reaction-satisfied (`confirmation`) ≠ real 5m candle (`confirmation_candle`).** The READY
-gate's reaction requirement is met by a genuine 5m confirmation candle OR — on the mitigation
-path — by a DEMAND/SUPPLY ZONE CONFIRMED alert. `_confluences()` emits BOTH `confirmation`
-(reaction satisfied; drives the gate) and `confirmation_candle` (a real candle only; defaults
-to `confirmation` for legacy dicts). The Edge Score credits "Confirmation Candle" +10 ONLY from
-`confirmation_candle`; a zone-confirmed reaction has NO standalone credit — it feeds `zone_valid`
-(+25) as the reaction half of mitigation+reaction, counted ONCE there and never as a phantom
-candle; READY + Edge Score + the strict checklist all name the same event.
-**Why:** the mitigation path once set `confirmation = has_bull_confirm OR mitigation_long_confirmed`,
-so a zone-confirmed READY scored a phantom +15 candle AND suppressed the real zone-reaction
-credit (and `/why` even told the user to "Add confluence: Confirmed Zone Reaction" while it
-was present). **How to apply:** keep gate-satisfaction flags separate from "what literally
-fired" flags whenever one requirement can be met by multiple distinct events; credit each once.
+**Never fabricate a signal label.** A reason label must map to something the app
+actually produces (a real sweep flag, real volume confirmation, real CVD agreement) —
+see zone-presence-not-from-strings.md for the phantom-zone bug this prevents.
 
 **This app is alert-driven — it has NO OHLC/candle history.** All structure (BOS, CHOCH,
-zone confirmed, confirmations, liquidity sweeps) arrives as TradingView webhook alerts in
-`ALERT_TYPES` and is aggregated; nothing is computed from bars. A real "Liquidity Sweep"
-cannot be detected from price action internally — it is wired as new alert types:
-`{MGC,MNQ} {BULLISH,BEARISH} SWEEP`, each `side="sweep"`, `score=0`. `side="sweep"`/score 0
-keeps them OUT of bias scoring and OUT of supply/demand level building;
-`evaluate_strict_setup` detects them via the `_has()` recency helper and sets
-`confluences.liquidity_sweep` on the READY long/short path.
-**How to apply:** any future price-action / "edge" signal the chart sees but the server
-cannot compute (sweeps, FVGs, displacement, etc.) must be added as a new alert type the
-same way — not faked from a loosely-related existing flag.
+zone confirmed, sweeps), plus Volume and CVD, arrive as TradingView webhook alerts in
+`ALERT_TYPES` and are aggregated; nothing is computed from bars. Any new price-action /
+edge signal the chart sees but the server cannot compute must be added as a NEW alert
+type (e.g. `{MGC,MNQ} {BULLISH,BEARISH} SWEEP`, volume/CVD alerts) — never faked from a
+loosely-related existing flag.
