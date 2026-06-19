@@ -31,3 +31,13 @@ dev workspace instance added a second offset 300s chain to the same channel.
 - Any NEW unconditional or scheduled external notifier must be gated the same
   way. Webhook-driven sends are intentionally NOT gated because TradingView only
   POSTs alerts to the prod URL, so dev never forwards a real alert.
+- **Testing caveat:** because the webhook inline READY card (`send_live_ready_card`
+  at the end of the webhook worker) is ungated, manually POSTing a READY-forming
+  sequence to the DEV `/webhook` WILL post a real trade card — with `@everyone`
+  (`notify=True`) — to the shared live channel. The startup log
+  "`DISCORD_LIVE_ENABLED=False … trade-ready … disabled`" refers ONLY to the
+  periodic 5-min re-post loop, NOT this first inline post; don't read it as "dev
+  won't post READY cards." `send_live_ready_card` logs nothing on success (only on
+  failure/skip), and `_register_managed_trade` runs AFTER the Discord POST inside
+  it, so a "Managed trade registered" log with no "post failed"/"URL not set"
+  warning is strong evidence the card actually posted.
