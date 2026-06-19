@@ -4536,6 +4536,28 @@ def full_analysis(current_price_override=None, ticker_override=None):
             block.update(edge_score=eb_d["score"], edge_grade=eb_d["grade"], edge_breakdown=eb_d)
             if blockers:
                 block.update(ready=False, label="WAIT", score=0)
+
+        # ── Potential trade plan (DISPLAY-ONLY; NEVER broker-eligible) ──────────
+        # As soon as a structural setup is FORMING for this side, surface the
+        # would-be entry / stop / targets / R:R so the user can pre-plan BEFORE a
+        # full READY. The real-order path keys off the actionable verdict + the
+        # top-level result["trade_plan"] only, so this nested per-direction preview
+        # can never light up the Apply / Copy / Send broker actions. Suppressed on
+        # conflict, a hard blocker (zone broken/consumed), a missing price, a closed
+        # session, or before any structural alert exists — and kept as None in all
+        # those cases for single-return-path reader parity.
+        potential_plan = None
+        _gd = block.get("gate_debug") or {}
+        if (current_price is not None and market["open"]
+                and not block.get("conflict") and not blockers
+                and _gd.get("structure_confirmed")):
+            _pp = build_strict_trade_plan(
+                _d, active_ticker, current_price, nearest_supply, nearest_demand,
+                volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+            )
+            if _pp.get("trade_plan"):
+                potential_plan = _pp
+        block["potential_plan"] = potential_plan
         out_dirs[_d] = block
     result["directions"] = out_dirs
 
@@ -9936,17 +9958,33 @@ function renderDirView() {
   // (full READY or EARLY READY).
   const readyDir = jsReadyDir(d.verdict);
   const tp = d.trade_plan || {};
-  if (readyDir === dir && tp.trade_plan) {
-    planEl.style.display = 'block';
-    planEl.innerHTML =
-      'Entry <b>'+tp.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_loss+'</b><br>' +
-      'T1 <b>'+tp.target1+'</b> &nbsp;·&nbsp; T2 <b>'+tp.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(tp.rr!=null?tp.rr:'—')+'</b>' +
-      (tp.atr_pts!=null
-        ? '<br>ATR <b>'+tp.atr_pts+'</b> × <b>'+tp.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+tp.stop_distance_ticks+'</b> ticks &nbsp;·&nbsp; Risk <b>$'+tp.risk_dollars_per_contract+'</b>/ct'
+  const pp = (blk && blk.potential_plan) ? blk.potential_plan : null;
+  const planRow = (p) =>
+      'Entry <b>'+p.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_loss+'</b><br>' +
+      'T1 <b>'+p.target1+'</b> &nbsp;·&nbsp; T2 <b>'+p.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(p.rr!=null?p.rr:'—')+'</b>' +
+      (p.atr_pts!=null
+        ? '<br>ATR <b>'+p.atr_pts+'</b> × <b>'+p.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_distance_ticks+'</b> ticks &nbsp;·&nbsp; Risk <b>$'+p.risk_dollars_per_contract+'</b>/ct'
         : '');
+  if (readyDir === dir && tp.trade_plan) {
+    // READY / EARLY READY for the selected side — live plan + broker actions.
+    planEl.style.display = 'block';
+    planEl.innerHTML = planRow(tp);
     apply.style.display = 'block';
     if (copyBtn) copyBtn.style.display = 'block';
     if (sendRow) sendRow.style.display = d.traderspost_configured ? 'block' : 'none';
+  } else if (pp && pp.trade_plan) {
+    // POTENTIAL setup forming for the selected side — DISPLAY ONLY. The broker
+    // actions (Apply / Copy / Send) stay hidden: they are gated on the actionable
+    // verdict + the top-level trade_plan, never on this preview.
+    const miss = (blk && blk.missing && blk.missing.length) ? blk.missing.join(', ') : 'confirmation';
+    planEl.style.display = 'block';
+    planEl.innerHTML =
+      '<div style="color:#f59e0b;font-weight:600;margin-bottom:4px">⏳ POTENTIAL '+dir.toUpperCase()+' — not yet READY</div>' +
+      planRow(pp) +
+      '<div style="color:#6b7280;font-size:11px;margin-top:5px">Preview only · waiting on: '+miss+' · no broker order until READY</div>';
+    apply.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = 'none';
+    if (sendRow) sendRow.style.display = 'none';
   } else {
     planEl.style.display = 'none';
     apply.style.display = 'none';
