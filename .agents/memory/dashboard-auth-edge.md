@@ -57,3 +57,12 @@ in-memory + posts Discord — it is NOT broker execution. The ONE real money-mov
 is the owner-only `/traderspost` route (→ TradersPost → Tradovate); see
 `traderspost-order-safety.md` for its invariants. It is protected at the Express edge
 (not in OPEN_PATHS) exactly like `/enter`.
+
+**Visually testing the dashboard is blocked through the public proxy when
+`DASHBOARD_PASSWORD` is set.** The Express fail-OPEN only triggers when the secret is
+UNSET; with it set (the normal case), `/api/dashboard` and every protected path return
+401 even in dev — so Playwright/screenshot smokes that route through the public proxy
+cannot reach the dashboard without embedding the password (don't). **How to apply:**
+verify dashboard changes against Flask DIRECTLY (`curl localhost:8000/dashboard` +
+`/status?ticker=…`) and syntax-check the rendered inline JS (`node --check` on the
+extracted `<script>` blocks) instead of bypassing auth.

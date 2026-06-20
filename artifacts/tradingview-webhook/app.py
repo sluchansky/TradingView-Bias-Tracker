@@ -5548,6 +5548,222 @@ def _learning_engine_view():
         return dict(LEARNING_ANALYTICS)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Display-only feeds: intraday equity curve + economic-calendar news filter.
+# Both are READ-ONLY and never touch the strict gate, sizing, dedupe, session/
+# holiday override, or the /traderspost money path. They are folded into
+# full_analysis() / `/status` purely for display.
+# ─────────────────────────────────────────────────────────────────────────────
+EQUITY_CACHE_TTL = 20.0                 # seconds; /status polls ~every 3s
+_EQUITY_LOCK     = threading.Lock()
+_EQUITY_CACHE    = {}                   # ticker -> (fetched_at, payload)
+
+
+def _empty_equity_curve(ticker, available=True, note=None):
+    return {
+        "available": available, "symbol": ticker, "points": [],
+        "count": 0, "wins": 0, "losses": 0, "total_r": 0.0, "note": note,
+    }
+
+
+def get_today_equity_curve(ticker):
+    """Cumulative-R points for trades CLOSED today (ET) for `ticker`, built from
+    real strategy_trades rows. Display-only; short-cached; FAIL-OPEN (returns an
+    honest empty state on any error). No backfill — accrues forward."""
+    ticker = (ticker or "").upper() or "MGC"
+    now = time.time()
+    with _EQUITY_LOCK:
+        hit = _EQUITY_CACHE.get(ticker)
+        if hit and (now - hit[0]) < EQUITY_CACHE_TTL:
+            return hit[1]
+    if not LEARNING_DB_ENABLED:
+        out = _empty_equity_curve(ticker, available=False, note="Trade history unavailable")
+        with _EQUITY_LOCK:
+            _EQUITY_CACHE[ticker] = (now, out)
+        return out
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return _empty_equity_curve(ticker, available=False, note="Trade history unavailable")
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT closed_at, r_multiple, result, strategy_key, strategy, direction
+            FROM strategy_trades
+            WHERE symbol = %s
+              AND r_multiple IS NOT NULL
+              AND closed_at IS NOT NULL
+              AND (closed_at AT TIME ZONE 'America/New_York')::date
+                  = (now() AT TIME ZONE 'America/New_York')::date
+            ORDER BY closed_at ASC
+            """,
+            (ticker,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        points, cum, wins, losses = [], 0.0, 0, 0
+        for r in rows:
+            try:
+                rm = float(r["r_multiple"])
+            except Exception:
+                continue
+            cum += rm
+            if rm > 0:
+                wins += 1
+            elif rm < 0:
+                losses += 1
+            points.append({
+                "t":        fmt_et(r["closed_at"], "%H:%M"),
+                "r":        round(rm, 2),
+                "cum":      round(cum, 2),
+                "result":   r.get("result"),
+                "strategy": r.get("strategy") or r.get("strategy_key"),
+                "dir":      r.get("direction"),
+            })
+        out = {
+            "available": True, "symbol": ticker, "points": points,
+            "count": len(points), "wins": wins, "losses": losses,
+            "total_r": round(cum, 2),
+            "note": None if points else "No closed trades today",
+        }
+        with _EQUITY_LOCK:
+            _EQUITY_CACHE[ticker] = (now, out)
+        return out
+    except Exception as exc:
+        logger.warning("equity curve query failed: %s", exc)
+        return _empty_equity_curve(ticker, available=False, note="Trade history unavailable")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+NEWS_FEED_URL   = os.environ.get(
+    "NEWS_FEED_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+NEWS_TTL_SEC    = int(os.environ.get("NEWS_TTL_SEC", "900"))    # refresh raw feed every 15m
+NEWS_RETRY_SEC  = int(os.environ.get("NEWS_RETRY_SEC", "60"))   # backoff between failed fetches
+NEWS_WINDOW_MIN = int(os.environ.get("NEWS_WINDOW_MIN", "30"))  # high-impact "near" window (mins before)
+NEWS_AFTER_MIN  = int(os.environ.get("NEWS_AFTER_MIN", "15"))   # ...and minutes after the event
+NEWS_CURRENCIES = {"USD"}              # MGC/MNQ are USD-denominated US futures
+_NEWS_LOCK              = threading.Lock()
+_NEWS_REFRESH_LOCK      = threading.Lock()
+_NEWS_REFRESH_IN_FLIGHT = False
+_NEWS_STATE = {"events": None, "fetched_at": 0.0, "last_attempt": 0.0, "error": None}
+
+
+def _fetch_news_raw():
+    """Fetch + parse the public ForexFactory weekly economic calendar (no auth).
+    Returns (events_list, error_str); events_list is None on failure."""
+    try:
+        resp = requests.get(
+            NEWS_FEED_URL, timeout=6,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-dashboard/1.0)"})
+        if resp.status_code != 200:
+            return None, "HTTP %s" % resp.status_code
+        raw = resp.json()
+        events = []
+        for ev in (raw if isinstance(raw, list) else []):
+            try:
+                dt_s = (ev.get("date") or "").strip()
+                if not dt_s:
+                    continue
+                dt = datetime.fromisoformat(dt_s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                events.append({
+                    "title":   (ev.get("title") or "").strip(),
+                    "country": (ev.get("country") or "").strip().upper(),
+                    "impact":  (ev.get("impact") or "").strip(),
+                    "dt":      dt.astimezone(timezone.utc),
+                })
+            except Exception:
+                continue
+        return events, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _news_refresh_async():
+    """Refresh the raw feed cache in a daemon thread; single-flight; never raises."""
+    global _NEWS_REFRESH_IN_FLIGHT
+    with _NEWS_REFRESH_LOCK:
+        if _NEWS_REFRESH_IN_FLIGHT:
+            return
+        _NEWS_REFRESH_IN_FLIGHT = True
+    try:
+        with _NEWS_LOCK:
+            _NEWS_STATE["last_attempt"] = time.time()
+        events, err = _fetch_news_raw()
+        with _NEWS_LOCK:
+            if events is not None:
+                _NEWS_STATE["events"]     = events
+                _NEWS_STATE["fetched_at"] = time.time()
+                _NEWS_STATE["error"]      = None
+            else:
+                _NEWS_STATE["error"]      = err
+    finally:
+        with _NEWS_REFRESH_LOCK:
+            _NEWS_REFRESH_IN_FLIGHT = False
+
+
+def get_news_filter():
+    """Display-only economic-calendar view. Reads the cached raw feed and computes
+    time-relative fields against NOW on every call; kicks off a background refresh
+    when stale. NEVER blocks the request and NEVER gates trades. FAIL-OPEN."""
+    now_t = time.time()
+    with _NEWS_LOCK:
+        events       = list(_NEWS_STATE["events"]) if _NEWS_STATE["events"] is not None else None
+        fetched_at   = _NEWS_STATE["fetched_at"]
+        last_attempt = _NEWS_STATE["last_attempt"]
+        error        = _NEWS_STATE["error"]
+    stale = (events is None) or ((now_t - fetched_at) > NEWS_TTL_SEC)
+    if stale and (now_t - last_attempt) > NEWS_RETRY_SEC:
+        try:
+            threading.Thread(target=_news_refresh_async, daemon=True).start()
+        except Exception:
+            pass
+    if events is None:
+        return {
+            "available": False, "stale": True, "window_min": NEWS_WINDOW_MIN,
+            "within_window": False, "next_event": None, "upcoming": [],
+            "high_impact_count": 0, "error": error, "as_of": None,
+        }
+    now_dt = datetime.now(timezone.utc)
+    upcoming, within = [], False
+    for ev in events:
+        if ev["impact"] != "High":
+            continue
+        if NEWS_CURRENCIES and ev["country"] not in NEWS_CURRENCIES:
+            continue
+        mins = (ev["dt"] - now_dt).total_seconds() / 60.0
+        item = {
+            "title": ev["title"], "country": ev["country"], "impact": ev["impact"],
+            "time_et": fmt_et(ev["dt"], "%a %H:%M ET"),
+            "minutes_until": int(round(mins)),
+        }
+        if -NEWS_AFTER_MIN <= mins <= NEWS_WINDOW_MIN:
+            within = True
+        if mins >= -NEWS_AFTER_MIN:
+            upcoming.append((mins, item))
+    upcoming.sort(key=lambda x: x[0])
+    upcoming_items = [it for _, it in upcoming]
+    return {
+        "available": True,
+        "stale": stale,
+        "window_min": NEWS_WINDOW_MIN,
+        "within_window": within,
+        "next_event": (upcoming_items[0] if upcoming_items else None),
+        "upcoming": upcoming_items[:5],
+        "high_impact_count": len(upcoming_items),
+        "error": error,
+        "as_of": (fmt_et(datetime.fromtimestamp(fetched_at, tz=timezone.utc), "%H:%M ET")
+                  if fetched_at else None),
+    }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -6100,6 +6316,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result.get("edge_score"),
     )
 
+    # ── Display-only feeds (READ-ONLY; never touch the gate / money path) ─────
+    result["equity_curve_today"] = get_today_equity_curve(active_ticker)
+    result["news_filter"]        = get_news_filter()
+
     # ── Market-session awareness (additive; single neutralising override) ────
     # MNQ/MGC share the CME/COMEX schedule. While the market is CLOSED there is no
     # live tape, so reporting WAIT (or counting "failed" evals) is misleading. We
@@ -6195,6 +6415,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["decision_support"]   = _decision_support(result)
         # Strategy engine paused while the market is closed (no live tape).
         result["strategy_engine"]    = _closed_strategy_engine()
+        # Display-only feeds stay present for parity with the open path.
+        result["equity_curve_today"] = get_today_equity_curve(active_ticker)
+        result["news_filter"]        = get_news_filter()
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
             if _blk:
@@ -10315,6 +10538,8 @@ def status():
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
+        "equity_curve_today":  a.get("equity_curve_today"),
+        "news_filter":         a.get("news_filter"),
         "learning_engine":     _learning_engine_view(),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
@@ -11030,14 +11255,53 @@ def dashboard():
   .mode-btn{flex:1;text-align:center;font-size:12px;font-weight:700;padding:9px 6px;border-radius:2px;color:var(--muted);cursor:pointer;transition:all .15s;letter-spacing:.5px;text-transform:uppercase}
   #mode-scalp.active{background:var(--amber-deep);color:var(--amber);box-shadow:inset 0 0 0 1px var(--amber)}
   #mode-swing.active{background:var(--cyan-deep);color:var(--cyan);box-shadow:inset 0 0 0 1px #2a5560}
+  /* Equity curve (today) */
+  .eq-top{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+  .eq-chart{width:100%;height:120px;display:block;background:var(--inset);border:1px solid var(--border);border-radius:2px}
+  .eq-empty{font-size:11px;color:var(--muted);font-style:italic;text-align:center;padding:26px 0}
+  .eq-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
+  /* News filter (economic calendar) */
+  .nf-status{font-size:12.5px;font-weight:800;text-align:center;padding:11px;border-radius:2px;margin-bottom:12px;border:1px solid var(--border);color:var(--muted);line-height:1.4}
+  .nf-status.clear{color:#bfe6c8;background:#0a2113;border-color:#1b3a26}
+  .nf-status.warn{color:#ffd9a0;background:#241405;border-color:#5a3a14}
+  .nf-row{display:flex;align-items:center;gap:10px;font-size:12px;color:#cdd3e0;padding:7px 10px;background:var(--inset);border:1px solid var(--border);border-radius:2px;margin-bottom:6px}
+  .nf-row:last-child{margin-bottom:0}
+  .nf-imp{flex:0 0 auto;font-size:9px;font-weight:800;letter-spacing:.5px;color:#ff5252}
+  .nf-ttl{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .nf-when{flex:0 0 auto;font-variant-numeric:tabular-nums;color:var(--muted)}
+  .nf-empty{font-size:11px;color:var(--muted);font-style:italic;text-align:center;padding:14px 0}
+  .nf-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
+  /* ── Retro Terminal Mode: green phosphor on black CRT (toggle via [data-theme=retro]) ── */
+  html[data-theme="retro"]{
+    --bg:#020806; --panel:#05150e; --inset:#03110b;
+    --border:#0f3d29; --border-lit:#22a86a;
+    --amber:#3dff9e; --amber-dim:#2bd486; --amber-deep:#06281c;
+    --cyan:#3bf0d4; --cyan-deep:#053029;
+    --green:#3dff9e; --red:#ff5252; --warn:#ffd24a;
+    --text:#86ffc2; --muted:#4f9472;
+    background-color:#020806;
+    background-image:linear-gradient(rgba(61,255,158,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(61,255,158,.05) 1px,transparent 1px);
+    background-size:34px 34px;
+  }
+  html[data-theme="retro"] .vw-bg{display:none}
+  html[data-theme="retro"] body::after{background:radial-gradient(120% 90% at 50% 0%,rgba(61,255,158,.06),rgba(0,0,0,0) 55%)}
+  html[data-theme="retro"] h1{text-shadow:0 0 10px rgba(61,255,158,.7),0 0 24px rgba(61,255,158,.3)}
+  html[data-theme="retro"] .tab.active{box-shadow:0 0 12px rgba(61,255,158,.35)}
+  html[data-theme="retro"] .field input:focus{box-shadow:0 0 10px rgba(61,255,158,.3)}
+  html[data-theme="retro"] #status-card,
+  html[data-theme="retro"] #rec-card,
+  html[data-theme="retro"] .mod{box-shadow:0 0 18px rgba(20,90,55,.22)}
+  html[data-theme="retro"] .se-chip{background:#06281c;border-color:#0f5d3a;color:#9bffcb}
 </style>
+<script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
 </head>
 <body>
 <div class="vw-bg" aria-hidden="true"></div>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
-<div id="alert-ctl" style="text-align:center;margin:2px 0 8px;font-size:12px">
-  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:#cf7fc8;border:1px solid #3a2363;border-radius:999px;padding:3px 12px;background:#1a0d33">🔔 READY alerts: on</span>
+<div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 READY alerts: on</span>
+  <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
 </div>
 
 <!-- Sensitivity (trading mode) -->
@@ -11200,6 +11464,28 @@ def dashboard():
     </div>
   </div>
   <div class="le-fid" id="le-fid"></div>
+</div>
+
+<!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
+<div class="mod" id="mod-equity">
+  <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="eq-top">
+    <div class="gstat"><div class="l">Net R</div><div class="v" id="eq-net">—</div></div>
+    <div class="gstat"><div class="l">Trades</div><div class="v" id="eq-count">—</div></div>
+    <div class="gstat"><div class="l">Wins</div><div class="v" id="eq-wins">—</div></div>
+    <div class="gstat"><div class="l">Losses</div><div class="v" id="eq-losses">—</div></div>
+  </div>
+  <svg id="eq-chart" class="eq-chart" viewBox="0 0 320 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+  <div class="eq-empty" id="eq-empty" style="display:none"></div>
+  <div class="eq-fid">Cumulative R of trades closed today (ET). Accrues live — no backfill.</div>
+</div>
+
+<!-- Economic-calendar news filter (ForexFactory; DISPLAY-ONLY — never gates trades) -->
+<div class="mod" id="mod-news">
+  <div class="mod-h">📰 News Filter <span id="nf-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="nf-status" id="nf-status">—</div>
+  <div id="nf-list"></div>
+  <div class="nf-fid">High-impact USD events (ForexFactory). Display-only — does not block trades.</div>
 </div>
 
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
@@ -11711,6 +11997,12 @@ function renderModules(d){
 
   // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
   renderLearningEngine(d);
+
+  // ── Module 9: Equity curve (today) — display-only, real closed trades ──
+  renderEquityCurve(d);
+
+  // ── Module 10: News filter (economic calendar) — display-only ──
+  renderNewsFilter(d);
 }
 
 // Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
@@ -11806,6 +12098,106 @@ function renderLearningEngine(d){
   const f=document.getElementById('le-fid');
   if (f) f.textContent = 'Recomputed every '+(le.min_sample||20)
        +' closed trades · weights bounded ×0.65–×1.35, never disable a strategy.';
+}
+
+// Equity curve (today) — fed by d.equity_curve_today (cumulative R of trades
+// CLOSED today in ET, from real strategy_trades). Display-only; honest empties.
+function renderEquityCurve(d){
+  const eq = (d && d.equity_curve_today) || null;
+  const setT=function(id,v){const e=document.getElementById(id);if(e)e.textContent=v;};
+  const svg=document.getElementById('eq-chart');
+  const emptyEl=document.getElementById('eq-empty');
+  const metaEl=document.getElementById('eq-meta');
+  const off=!!(eq && eq.available===false);
+  const pts=(eq&&eq.points)||[];
+  if (eq && !off){
+    const net=eq.total_r||0;
+    const nEl=document.getElementById('eq-net');
+    if(nEl){nEl.textContent=(net>=0?'+':'')+net.toFixed(2)+'R';
+            nEl.style.color=net>0?'#22c55e':net<0?'#ef4444':'#6b7280';}
+    setT('eq-count',eq.count!=null?eq.count:'0');
+    setT('eq-wins',eq.wins!=null?eq.wins:'0');
+    setT('eq-losses',eq.losses!=null?eq.losses:'0');
+  } else {
+    setT('eq-net','—');setT('eq-count','—');setT('eq-wins','—');setT('eq-losses','—');
+  }
+  if (metaEl) metaEl.textContent = off ? '· OFFLINE' : '';
+  if (!eq || !pts.length){
+    if(svg) svg.style.display='none';
+    if(emptyEl){
+      emptyEl.style.display='block';
+      emptyEl.textContent = off ? (eq.note || 'Trade history unavailable.')
+                                : ((eq && eq.note) || 'No closed trades today yet.');
+    }
+    return;
+  }
+  if(emptyEl) emptyEl.style.display='none';
+  if(!svg) return;
+  svg.style.display='block';
+  const W=320,H=120,pad=10;
+  const cum=pts.map(function(p){return p.cum;});
+  const series=[0].concat(cum);
+  let lo=Math.min.apply(null,series), hi=Math.max.apply(null,series);
+  if (lo===hi){lo-=1;hi+=1;}
+  const n=series.length;
+  const xFor=function(i){return pad + (W-2*pad)*(n===1?0.5:i/(n-1));};
+  const yFor=function(v){return pad + (H-2*pad)*(1-(v-lo)/(hi-lo));};
+  const yZero=yFor(0);
+  let dpath='';
+  for(let i=0;i<n;i++){dpath+=(i===0?'M':'L')+xFor(i).toFixed(1)+' '+yFor(series[i]).toFixed(1)+' ';}
+  const net=cum.length?cum[cum.length-1]:0;
+  const col=net>0?'#22c55e':net<0?'#ef4444':'#9aa6b2';
+  let s='';
+  s+='<line x1="'+pad+'" y1="'+yZero.toFixed(1)+'" x2="'+(W-pad)+'" y2="'+yZero.toFixed(1)+'" style="stroke:var(--border)" stroke-width="1" stroke-dasharray="3 3"/>';
+  const area=dpath+'L'+xFor(n-1).toFixed(1)+' '+yZero.toFixed(1)+' L'+xFor(0).toFixed(1)+' '+yZero.toFixed(1)+' Z';
+  s+='<path d="'+area+'" fill="'+col+'" opacity="0.12"/>';
+  s+='<path d="'+dpath+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+  for(let i=1;i<n;i++){
+    const dotcol=(pts[i-1].r>=0)?'#22c55e':'#ef4444';
+    s+='<circle cx="'+xFor(i).toFixed(1)+'" cy="'+yFor(cum[i-1]).toFixed(1)+'" r="2.4" fill="'+dotcol+'"/>';
+  }
+  svg.innerHTML=s;
+}
+
+// News filter — fed by d.news_filter (cached ForexFactory high-impact USD events).
+// DISPLAY-ONLY: surfaces an upcoming-news window; never gates trades.
+function renderNewsFilter(d){
+  const nf=(d&&d.news_filter)||null;
+  const statusEl=document.getElementById('nf-status');
+  const listEl=document.getElementById('nf-list');
+  const metaEl=document.getElementById('nf-meta');
+  if(metaEl) metaEl.textContent = (nf&&nf.as_of) ? ('· '+nf.as_of)
+                                  : ((nf&&nf.available===false) ? '· LOADING' : '');
+  if(!nf || nf.available===false){
+    if(statusEl){statusEl.className='nf-status';statusEl.textContent='Loading economic calendar…';}
+    if(listEl) listEl.innerHTML='';
+    return;
+  }
+  if(statusEl){
+    if(nf.within_window){
+      const ne=nf.next_event;
+      statusEl.className='nf-status warn';
+      statusEl.textContent='⚠ HIGH-IMPACT NEWS WINDOW'+(ne?(' · '+ne.title):'');
+    } else {
+      statusEl.className='nf-status clear';
+      statusEl.textContent='✓ No high-impact news within '+(nf.window_min||30)+' min';
+    }
+  }
+  if(listEl){
+    const ev=nf.upcoming||[];
+    const win=nf.window_min||30;
+    listEl.innerHTML = ev.length ? ev.map(function(e){
+      const m=e.minutes_until;
+      const when = (m<0) ? (Math.abs(m)+'m ago')
+                 : (m<60) ? ('in '+m+'m') : e.time_et;
+      const near = (m>=-15 && m<=win);
+      return '<div class="nf-row">'
+        + '<span class="nf-imp">'+_modEsc(e.country||'USD')+'</span>'
+        + '<span class="nf-ttl">'+_modEsc(e.title||'—')+'</span>'
+        + '<span class="nf-when"'+(near?' style="color:var(--warn)"':'')+'>'+_modEsc(when)+'</span>'
+        + '</div>';
+    }).join('') : '<div class="nf-empty">No upcoming high-impact USD events this week.</div>';
+  }
 }
 
 // Strategy engine panel — fed by d.strategy_engine (compute_strategy_engine in
@@ -12211,6 +12603,20 @@ function toggleSound() {
   if (soundOn) { _ensureAudio(); playReadyChime(); toast('🔔 Alert sound on'); }
   else toast('🔕 Alert sound off');
 }
+// ── Theme toggle: switch between vaporwave (default) and Retro Terminal Mode ──
+function paintThemeToggle() {
+  const el = document.getElementById('theme-toggle');
+  if (!el) return;
+  const on = (document.documentElement.dataset.theme === 'retro');
+  el.textContent = on ? '🖥️ Retro Mode: on' : '🖥️ Retro Mode: off';
+}
+function toggleTheme() {
+  const on = (document.documentElement.dataset.theme === 'retro');
+  if (on) { delete document.documentElement.dataset.theme; localStorage.setItem('dashboardTheme', 'vapor'); }
+  else { document.documentElement.dataset.theme = 'retro'; localStorage.setItem('dashboardTheme', 'retro'); }
+  paintThemeToggle();
+  toast(on ? '🌆 Vaporwave mode' : '🖥️ Retro terminal mode');
+}
 function notifyReady(title, body) {
   try {
     if (!('Notification' in window)) return;
@@ -12394,6 +12800,7 @@ async function refresh() {
 
 // Poll every 3 seconds
 paintSndToggle();
+paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); refreshRec(); loadMode();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
