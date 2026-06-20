@@ -10852,27 +10852,41 @@ def dashboard():
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  /* ── 80s Bloomberg terminal: black screen, amber/green/red phosphor ── */
+  /* ── Vaporwave / synthwave: neon pink-cyan phosphor on deep purple sunset ── */
   :root{
-    --bg:#000; --panel:#0b0a06; --inset:#070602;
-    --border:#2c2410; --border-lit:#574716;
-    --amber:#ffb000; --amber-dim:#c79126; --amber-deep:#352808;
-    --cyan:#39d7e6; --cyan-deep:#08252b;
-    --green:#27d36b; --red:#ff4d4d; --warn:#f5a623;
-    --text:#e8ddc4; --muted:#8a7a4a;
+    --bg:#0d0221; --panel:#1a0d33; --inset:#120726;
+    --border:#3a2363; --border-lit:#8a3fb5;
+    --amber:#ff5fb0; --amber-dim:#cf7fc8; --amber-deep:#3a0f33;
+    --cyan:#40e0ff; --cyan-deep:#08303a;
+    --green:#2bf5a0; --red:#ff476b; --warn:#ffb14e;
+    --text:#f3e9ff; --muted:#9d86c4;
     --mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace;
   }
-  body{background:var(--bg);color:var(--text);font-family:var(--mono);min-height:100vh;padding:16px}
-  /* CRT scanlines + faint amber top vignette (decorative, never block clicks) */
+  html{background:var(--bg)}
+  body{background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:16px;position:relative}
+  /* ── Vaporwave sunset sky + neon perspective grid floor (decorative, behind content) ── */
+  .vw-bg{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
+    background:
+      radial-gradient(82% 48% at 50% -4%,rgba(255,126,183,.50),rgba(255,150,80,.26) 30%,rgba(168,60,140,.12) 50%,rgba(13,2,33,0) 70%),
+      linear-gradient(180deg,#2a0f4d 0%,#1a0a36 42%,#0d0221 100%)}
+  .vw-bg::before{content:"";position:absolute;left:50%;top:2.5vh;width:230px;height:230px;transform:translateX(-50%);border-radius:50%;
+    background:radial-gradient(circle at 50% 45%,#ffd76e 0%,#ff8a5c 34%,#ff4f9e 64%,rgba(255,79,158,0) 72%);opacity:.85;filter:blur(2px)}
+  .vw-bg::after{content:"";position:absolute;left:-30%;right:-30%;bottom:-4%;height:48vh;
+    background-image:
+      repeating-linear-gradient(90deg,transparent 0 39px,rgba(255,46,151,.55) 39px 41px),
+      repeating-linear-gradient(0deg,transparent 0 39px,rgba(64,224,255,.42) 39px 41px);
+    transform:perspective(320px) rotateX(70deg);transform-origin:bottom center;
+    -webkit-mask-image:linear-gradient(180deg,transparent 0%,#000 60%);mask-image:linear-gradient(180deg,transparent 0%,#000 60%);opacity:.55}
+  /* CRT scanlines overlay + faint pink top vignette (decorative, never block clicks) */
   body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:9998;
-    background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0px,rgba(0,0,0,.16) 1px,transparent 1px,transparent 3px)}
+    background:repeating-linear-gradient(0deg,rgba(0,0,0,.18) 0px,rgba(0,0,0,.18) 1px,transparent 1px,transparent 3px)}
   body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9997;
-    background:radial-gradient(120% 90% at 50% 0%,rgba(255,176,0,.05),rgba(0,0,0,0) 55%)}
-  h1{font-size:17px;font-weight:700;text-align:center;padding:12px 0 16px;color:var(--amber);letter-spacing:2px;text-transform:uppercase;text-shadow:0 0 9px rgba(255,176,0,.55)}
+    background:radial-gradient(120% 90% at 50% 0%,rgba(255,90,176,.06),rgba(0,0,0,0) 55%)}
+  h1{font-size:17px;font-weight:700;text-align:center;padding:12px 0 16px;color:var(--amber);letter-spacing:2px;text-transform:uppercase;text-shadow:0 0 10px rgba(255,95,176,.7),0 0 24px rgba(255,95,176,.35)}
   h1::after{content:"_";margin-left:1px;color:var(--amber);animation:cblink 1.1s steps(1) infinite}
   @keyframes cblink{0%,49%{opacity:1}50%,100%{opacity:0}}
   /* Status card */
-  #status-card{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:18px;margin-bottom:18px;min-height:100px}
+  #status-card{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:18px;margin-bottom:18px;min-height:100px;box-shadow:0 0 22px rgba(122,40,140,.18)}
   #status-label{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:8px}
   #trade-info{font-size:22px;font-weight:700;color:var(--text)}
   #trade-detail{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.6}
@@ -10881,7 +10895,7 @@ def dashboard():
   /* Tabs */
   .tabs{display:flex;gap:8px;margin-bottom:14px}
   .tab{flex:1;padding:12px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-transform:uppercase;letter-spacing:1px;transition:all .15s}
-  .tab.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep);box-shadow:0 0 10px rgba(255,176,0,.25)}
+  .tab.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep);box-shadow:0 0 12px rgba(255,95,176,.35)}
   /* Direction toggle */
   .dir-row{display:flex;gap:8px;margin-bottom:16px}
   .dir-btn{flex:1;padding:14px;border-radius:2px;border:1px solid var(--border);background:var(--panel);font-size:15px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px;transition:all .15s;color:var(--muted)}
@@ -10901,7 +10915,7 @@ def dashboard():
   .field{display:flex;flex-direction:column;gap:4px}
   .field label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
   .field input{background:var(--inset);border:1px solid var(--border);border-radius:2px;color:var(--text);font-family:var(--mono);font-size:15px;padding:10px 12px;width:100%;outline:none}
-  .field input:focus{border-color:var(--amber);box-shadow:0 0 8px rgba(255,176,0,.25)}
+  .field input:focus{border-color:var(--amber);box-shadow:0 0 10px rgba(255,95,176,.3)}
   /* Buttons */
   .btn{width:100%;padding:18px;border-radius:2px;border:none;font-family:var(--mono);font-size:17px;font-weight:800;cursor:pointer;margin-bottom:10px;transition:all .1s;letter-spacing:1px;text-transform:uppercase}
   .btn:active{transform:scale(.97)}
@@ -10912,7 +10926,7 @@ def dashboard():
   .btn-eod{background:var(--inset);color:var(--muted);border:1px solid var(--border);font-size:12px;padding:12px;margin-top:6px}
   .btn:disabled{opacity:.4;cursor:not-allowed}
   /* Recommendation card */
-  #rec-card{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:18px;margin-bottom:18px;transition:border-color .3s}
+  #rec-card{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:18px;margin-bottom:18px;transition:border-color .3s;box-shadow:0 0 22px rgba(122,40,140,.18)}
   .rec-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
   #rec-label{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--muted)}
   .rec-badge{font-size:12px;font-weight:800;padding:5px 12px;border-radius:2px;background:var(--inset);color:var(--muted);letter-spacing:1px;text-transform:uppercase;border:1px solid var(--border)}
@@ -10943,7 +10957,7 @@ def dashboard():
   .rec-reason{font-size:12px;color:var(--muted);line-height:1.5;font-style:italic}
   .btn-apply{background:var(--amber-deep);color:var(--amber);border:1px solid var(--amber);font-size:14px;padding:13px;margin-top:12px;margin-bottom:0}
   /* Diagnostics modules */
-  .mod{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:16px;margin-bottom:14px}
+  .mod{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:16px;margin-bottom:14px;box-shadow:0 0 18px rgba(122,40,140,.14)}
   .mod-h{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--amber-dim);margin-bottom:12px;font-weight:700}
   .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
   .mgauge-center{position:absolute;left:0;right:0;bottom:24%;text-align:center;pointer-events:none}
@@ -10971,12 +10985,12 @@ def dashboard():
   .se-strat .dir{font-size:13px;font-weight:700;margin-left:6px}
   .se-reason{font-size:12.5px;color:#cdd3e0;line-height:1.45;margin-top:10px;text-align:center}
   .se-missing{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;justify-content:center}
-  .se-chip{font-size:11px;padding:4px 9px;border-radius:2px;background:#241a0c;border:1px solid #4a3a18;color:#e0c98a}
+  .se-chip{font-size:11px;padding:4px 9px;border-radius:2px;background:#2a1542;border:1px solid #5a3a7a;color:#e7c8ff}
   .se-bias-h{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin:14px 0 6px}
   .se-bias{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
   .se-list{margin-top:12px;display:flex;flex-direction:column;gap:6px}
   .se-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
-  .se-row.active{color:#e8ddc4;font-weight:700}
+  .se-row.active{color:#f3e9ff;font-weight:700}
   .se-row .nm{flex:0 0 150px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .se-row .bar{flex:1;height:8px;background:var(--inset);border:1px solid var(--border);border-radius:2px;overflow:hidden}
   .se-row .bar .fill{height:100%;background:var(--amber-dim);transition:width .4s}
@@ -11003,7 +11017,7 @@ def dashboard():
   .wn-item:last-child{margin-bottom:0}
   .wn-ok{font-size:13px;color:#bfe6c8;background:#0a2113;border:1px solid #1b3a26;border-radius:2px;padding:11px;line-height:1.5}
   /* Toast */
-  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0b0a06;color:var(--text);border:1px solid var(--border-lit);padding:12px 24px;border-radius:2px;font-size:14px;font-family:var(--mono);opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap;z-index:9999}
+  #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--panel);color:var(--text);border:1px solid var(--border-lit);padding:12px 24px;border-radius:2px;font-size:14px;font-family:var(--mono);opacity:0;transition:opacity .3s;pointer-events:none;white-space:nowrap;z-index:9999}
   #toast.show{opacity:1}
   #refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:6px;box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
@@ -11019,10 +11033,11 @@ def dashboard():
 </style>
 </head>
 <body>
+<div class="vw-bg" aria-hidden="true"></div>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
 <div id="alert-ctl" style="text-align:center;margin:2px 0 8px;font-size:12px">
-  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:#c79126;border:1px solid #2c2410;border-radius:999px;padding:3px 12px;background:#0b0a06">🔔 READY alerts: on</span>
+  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:#cf7fc8;border:1px solid #3a2363;border-radius:999px;padding:3px 12px;background:#1a0d33">🔔 READY alerts: on</span>
 </div>
 
 <!-- Sensitivity (trading mode) -->
@@ -11100,7 +11115,7 @@ def dashboard():
   <div id="send-row" style="display:none;margin-top:6px">
     <button class="btn btn-apply" id="btn-send" style="background:#08252b;border:1px solid #39d7e6;color:#7fe9f5" onclick="sendOrder()">🚀 Send order to broker</button>
     <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px;color:#8a93a6;font-size:12px">
-      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#070602;border:1px solid #2c2410;border-radius:2px;color:#e8ddc4;padding:4px 6px;font-size:13px">
+      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #3a2363;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
       <span style="color:#6b7280">· one-tap market order</span>
     </div>
   </div>
@@ -11120,7 +11135,7 @@ def dashboard():
     <div class="gstat"><div class="l">Long</div><div class="v" id="gs-long" style="color:#22c55e">—</div></div>
     <div class="gstat"><div class="l">Short</div><div class="v" id="gs-short" style="color:#ef4444">—</div></div>
     <div class="gstat"><div class="l">Edge Δ</div><div class="v" id="gs-gap" style="color:#e8e8f0">—</div></div>
-    <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#ffb000">—</div></div>
+    <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#ff5fb0">—</div></div>
   </div>
 </div>
 
@@ -11926,7 +11941,7 @@ async function refreshRec() {
         ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
           + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
         : '';
-      meta.innerHTML = '<b style="color:#ffb000">'+inst+'</b> &nbsp;·&nbsp; '
+      meta.innerHTML = '<b style="color:#ff5fb0">'+inst+'</b> &nbsp;·&nbsp; '
         + '<b style="color:#f59e0b">🌙 Live alerts paused</b>' + no + lv;
       const lb = document.querySelector('.dir-btn.long');
       const sb = document.querySelector('.dir-btn.short');
@@ -11985,7 +12000,7 @@ async function refreshRec() {
                : d.conviction_tier==='EARLY READY' ? '#a3e635' : '#eab308';
       convTxt = ' &nbsp;·&nbsp; <span style="color:#6b7280;font-size:11px">Tier</span> <b style="color:'+cc+'">'+d.conviction_tier+'</b>';
     }
-    meta.innerHTML = '<b style="color:#ffb000">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
+    meta.innerHTML = '<b style="color:#ff5fb0">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
 
     // Trade probability gauge — fed by the authoritative /status fields.
     renderGauge(d);
@@ -12081,7 +12096,7 @@ function renderDirView() {
   const label = blk ? (blk.label || 'WAIT') : (d.strict_label || 'WAIT');
   const met   = blk && blk.met!=null ? ' · ' + blk.met + '/4' : '';
   bar.style.width = Math.max(0, Math.min(100, score / EDGE_MAX * 100)) + '%';
-  bar.style.background = score>=85 ? '#22c55e' : score>=75 ? '#ffb000' : '#f59e0b';
+  bar.style.background = score>=85 ? '#2bf5a0' : score>=75 ? '#ff5fb0' : '#ffb14e';
   num.textContent = dir + ' Edge ' + score + '/' + EDGE_MAX + grade + ' · ' + label + met;
 
   // Trade plan + Apply only when the SELECTED side is the system's actionable side
@@ -12348,9 +12363,9 @@ async function refresh() {
 
     if (d.status === 'no_active_trade') {
       activeTrade = null;
-      card.style.borderColor = '#2c2410';
+      card.style.borderColor = '#3a2363';
       info.textContent = 'No Active Trade';
-      info.style.color = '#555';
+      info.style.color = '#9d86c4';
       detail.textContent = '';
       pnl.textContent = '';
       btnClose.style.display = 'none';
