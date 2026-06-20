@@ -82,6 +82,14 @@ router.all(
     "/why",
     "/why/:ticker",
     "/dashboard",
+    // Backtesting engine (owner-only; NOT in dashboard-auth OPEN_PATHS). The raw
+    // body limit for CSV uploads is raised in app.ts.
+    "/backtest/upload",
+    "/backtest/datasets",
+    "/backtest/datasets/:id",
+    "/backtest/run",
+    "/backtest/runs/:id",
+    "/backtest/export",
   ],
   proxyToFlask,
 );

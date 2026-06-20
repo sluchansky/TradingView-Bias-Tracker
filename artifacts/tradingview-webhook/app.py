@@ -9586,6 +9586,487 @@ def _heartbeat_eval_loop():
         threading.Timer(EVAL_HEARTBEAT_INTERVAL, _heartbeat_eval_loop).start()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# BACKTESTING ENGINE — READ-ONLY research surface. Completely decoupled from the
+# live money path: it only INSERT/SELECTs into the backtest_* tables, never reads
+# or mutates a live global, never posts Discord, never writes strategy_trades,
+# never touches the gate / sizing / dedupe / /traderspost. All endpoints are
+# owner-gated by the Express dashboard auth (they are NOT in OPEN_PATHS). Every
+# helper is FAIL-OPEN: a DB/parse hiccup degrades to a clean JSON error, never a
+# 500 into the analysis path.
+# ════════════════════════════════════════════════════════════════════════════
+import json as _bt_json_mod
+import csv as _bt_csv_mod
+import io as _bt_io_mod
+
+try:
+    import backtest_engine as bt
+    BACKTEST_AVAILABLE = True
+except Exception as _bt_import_exc:   # pragma: no cover - defensive
+    bt = None
+    BACKTEST_AVAILABLE = False
+    logger.warning("backtest engine import failed (backtest disabled): %s", _bt_import_exc)
+
+
+def _bt_conn(statement_timeout_ms=30000):
+    """Short-lived autocommit connection for the backtest tables. None on error."""
+    if not LEARNING_DB_ENABLED:
+        return None
+    try:
+        conn = psycopg2.connect(LEARNING_DB_URL, connect_timeout=5)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = %s", (int(statement_timeout_ms),))
+        except Exception:
+            pass
+        return conn
+    except Exception as exc:
+        logger.warning("backtest DB connect failed: %s", exc)
+        return None
+
+
+def _bt_json_safe(obj):
+    """Recursively replace non-finite floats with None so the result is valid
+    JSONB (Postgres rejects Infinity/NaN tokens)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _bt_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_bt_json_safe(v) for v in obj]
+    return obj
+
+
+def _bt_store_dataset(symbol, timeframe, source_tz, source_label, filename, parsed):
+    """Persist a parsed dataset + its candles. Dedupe by file sha256 (re-uploading
+    the identical file reuses the existing dataset)."""
+    conn = _bt_conn()
+    if conn is None:
+        return {"ok": False, "error": "Database unavailable — backtest storage offline."}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, row_count FROM backtest_datasets WHERE sha256=%s",
+                        (parsed["sha256"],))
+            existing = cur.fetchone()
+            if existing:
+                return {"ok": True, "reused": True, "dataset_id": existing[0],
+                        "row_count": existing[1]}
+            cur.execute(
+                """INSERT INTO backtest_datasets
+                       (symbol, timeframe, source_label, source_tz, original_filename,
+                        sha256, row_count, gap_count, first_ts, last_ts)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   RETURNING id""",
+                (symbol, timeframe, source_label, source_tz, filename,
+                 parsed["sha256"], parsed["row_count"], parsed["gap_count"],
+                 parsed["first_ts"], parsed["last_ts"]))
+            ds_id = cur.fetchone()[0]
+            rows = [(ds_id, symbol, timeframe, c["ts"], c["open"], c["high"],
+                     c["low"], c["close"], c["volume"]) for c in parsed["candles"]]
+            psycopg2.extras.execute_values(
+                cur,
+                """INSERT INTO backtest_candles
+                       (dataset_id, symbol, timeframe, ts, open, high, low, close, volume)
+                   VALUES %s ON CONFLICT (dataset_id, ts) DO NOTHING""",
+                rows, page_size=1000)
+        return {"ok": True, "reused": False, "dataset_id": ds_id,
+                "row_count": parsed["row_count"]}
+    except Exception as exc:
+        # A concurrent identical upload can trip the sha256 unique index — re-read.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, row_count FROM backtest_datasets WHERE sha256=%s",
+                            (parsed["sha256"],))
+                existing = cur.fetchone()
+            if existing:
+                return {"ok": True, "reused": True, "dataset_id": existing[0],
+                        "row_count": existing[1]}
+        except Exception:
+            pass
+        logger.warning("backtest store dataset failed: %s", exc)
+        return {"ok": False, "error": f"Storage error: {exc}"}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_list_datasets():
+    conn = _bt_conn()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, symbol, timeframe, source_label, source_tz, row_count,
+                          gap_count, first_ts, last_ts, uploaded_at, original_filename
+                   FROM backtest_datasets ORDER BY uploaded_at DESC LIMIT 200""")
+            out = []
+            for r in cur.fetchall():
+                out.append({
+                    "id": r[0], "symbol": r[1], "timeframe": r[2], "source_label": r[3],
+                    "source_tz": r[4], "row_count": r[5], "gap_count": r[6],
+                    "first_ts": r[7].isoformat() if r[7] else None,
+                    "last_ts": r[8].isoformat() if r[8] else None,
+                    "uploaded_at": r[9].isoformat() if r[9] else None,
+                    "filename": r[10]})
+            return out
+    except Exception as exc:
+        logger.warning("backtest list datasets failed: %s", exc)
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_get_dataset(dataset_id):
+    conn = _bt_conn()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, symbol, timeframe, source_tz, row_count
+                           FROM backtest_datasets WHERE id=%s""", (dataset_id,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {"id": r[0], "symbol": r[1], "timeframe": r[2],
+                    "source_tz": r[3], "row_count": r[4]}
+    except Exception as exc:
+        logger.warning("backtest get dataset failed: %s", exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_delete_dataset(dataset_id):
+    conn = _bt_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM backtest_datasets WHERE id=%s", (dataset_id,))
+        return True
+    except Exception as exc:
+        logger.warning("backtest delete dataset failed: %s", exc)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_load_candles(dataset_id, start_ts=None, end_ts=None):
+    """Return ascending UTC candle dicts for a dataset (optionally range-clamped)."""
+    conn = _bt_conn()
+    if conn is None:
+        return []
+    try:
+        q = ["SELECT ts, open, high, low, close, volume FROM backtest_candles WHERE dataset_id=%s"]
+        params = [dataset_id]
+        if start_ts is not None:
+            q.append("AND ts >= %s"); params.append(start_ts)
+        if end_ts is not None:
+            q.append("AND ts <= %s"); params.append(end_ts)
+        q.append("ORDER BY ts ASC")
+        with conn.cursor() as cur:
+            cur.execute(" ".join(q), tuple(params))
+            out = []
+            for r in cur.fetchall():
+                ts = r[0]
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                out.append({"ts": ts.astimezone(timezone.utc), "open": float(r[1]),
+                            "high": float(r[2]), "low": float(r[3]), "close": float(r[4]),
+                            "volume": float(r[5]) if r[5] is not None else 0.0})
+            return out
+    except Exception as exc:
+        logger.warning("backtest load candles failed: %s", exc)
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_create_run(params):
+    conn = _bt_conn()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO backtest_runs (params, status, progress) VALUES (%s,'queued',0) RETURNING id",
+                (psycopg2.extras.Json(_bt_json_safe(params)),))
+            return cur.fetchone()[0]
+    except Exception as exc:
+        logger.warning("backtest create run failed: %s", exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_update_run(run_id, status=None, progress=None, result=None, error=None):
+    conn = _bt_conn()
+    if conn is None:
+        return
+    try:
+        sets, vals = ["updated_at = now()"], []
+        if status is not None:
+            sets.append("status = %s"); vals.append(status)
+        if progress is not None:
+            sets.append("progress = %s"); vals.append(float(progress))
+        if result is not None:
+            sets.append("result_json = %s"); vals.append(psycopg2.extras.Json(_bt_json_safe(result)))
+        if error is not None:
+            sets.append("error = %s"); vals.append(str(error)[:2000])
+        vals.append(run_id)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE backtest_runs SET {', '.join(sets)} WHERE id=%s", tuple(vals))
+    except Exception as exc:
+        logger.warning("backtest update run failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_get_run(run_id):
+    conn = _bt_conn()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, params, status, progress, result_json, error,
+                                  created_at, updated_at
+                           FROM backtest_runs WHERE id=%s""", (run_id,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return {"id": r[0], "params": r[1], "status": r[2], "progress": r[3],
+                    "result": r[4], "error": r[5],
+                    "created_at": r[6].isoformat() if r[6] else None,
+                    "updated_at": r[7].isoformat() if r[7] else None}
+    except Exception as exc:
+        logger.warning("backtest get run failed: %s", exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bt_run_worker(run_id, dataset_id, params):
+    """Background backtest executor. FAIL-OPEN: any error lands as status=error."""
+    try:
+        _bt_update_run(run_id, status="running", progress=0.1)
+        candles = _bt_load_candles(dataset_id, params.get("start_ts"), params.get("end_ts"))
+        if not candles:
+            _bt_update_run(run_id, status="error",
+                           error="No candles found for this dataset / date range.")
+            return
+        _bt_update_run(run_id, progress=0.4)
+        result = bt.run_backtest(candles, params)
+        if not result.get("ok"):
+            _bt_update_run(run_id, status="error",
+                           error=result.get("error") or "Backtest failed.")
+            return
+        # Echo the human-facing params so the UI/export has full context.
+        result["params_echo"] = {
+            "dataset_id": dataset_id, "mode": params.get("mode"),
+            "session": params.get("session") or "All",
+            "strategies": params.get("strategies"),
+            "start": params.get("start_label"), "end": params.get("end_label"),
+        }
+        _bt_update_run(run_id, status="done", progress=1.0, result=result)
+    except Exception as exc:
+        logger.warning("backtest worker crashed: %s", exc)
+        try:
+            _bt_update_run(run_id, status="error", error=f"Worker error: {exc}")
+        except Exception:
+            pass
+
+
+def _bt_et_bounds(date_str, end_of_day=False):
+    """Interpret a YYYY-MM-DD (or full ISO) string as an ET instant → UTC datetime."""
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+    try:
+        if "T" in s or " " in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ET_TZ)
+            return dt.astimezone(timezone.utc)
+        d = datetime.strptime(s, "%Y-%m-%d").date()
+        t = datetime.max.time().replace(microsecond=0) if end_of_day else datetime.min.time()
+        return datetime.combine(d, t).replace(tzinfo=ET_TZ).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _bt_guard():
+    """None when backtest is usable, else a (json, status) error tuple."""
+    if not BACKTEST_AVAILABLE:
+        return jsonify({"ok": False, "error": "Backtest engine unavailable."}), 503
+    if not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "Database not configured — backtest disabled."}), 503
+    return None
+
+
+@app.route("/backtest/upload", methods=["POST"])
+def bt_upload():
+    """Owner-only. Body = raw CSV text; query: symbol, timeframe, tz, label, filename."""
+    guard = _bt_guard()
+    if guard:
+        return guard
+    symbol = (request.args.get("symbol") or "").upper().strip()
+    timeframe = (request.args.get("timeframe") or "").lower().strip()
+    source_tz = request.args.get("tz") or "America/New_York"
+    label = request.args.get("label") or None
+    filename = request.args.get("filename") or None
+    if symbol not in bt.VALID_SYMBOLS:
+        return jsonify({"ok": False, "error": "symbol must be MGC or MNQ"}), 400
+    if timeframe not in bt.VALID_TIMEFRAMES:
+        return jsonify({"ok": False, "error": "timeframe must be 1m/3m/5m/15m"}), 400
+    try:
+        ZoneInfo(source_tz)
+    except Exception:
+        return jsonify({"ok": False, "error": f"unknown timezone '{source_tz}'"}), 400
+    raw = request.get_data(cache=False, as_text=True)
+    if not raw or not raw.strip():
+        return jsonify({"ok": False, "error": "empty upload body"}), 400
+    parsed = bt.parse_candles_csv(raw, symbol, timeframe, source_tz=source_tz)
+    if not parsed["ok"]:
+        return jsonify({"ok": False, "error": parsed["error"]}), 400
+    stored = _bt_store_dataset(symbol, timeframe, source_tz, label, filename, parsed)
+    if not stored.get("ok"):
+        return jsonify(stored), 500
+    return jsonify({
+        "ok": True, "dataset_id": stored["dataset_id"], "reused": stored.get("reused", False),
+        "row_count": parsed["row_count"], "skipped": parsed["skipped"],
+        "dup_removed": parsed["dup_removed"], "gap_count": parsed["gap_count"],
+        "inferred_timeframe": parsed["inferred_timeframe"],
+        "first_ts": parsed["first_ts"].isoformat() if parsed["first_ts"] else None,
+        "last_ts": parsed["last_ts"].isoformat() if parsed["last_ts"] else None,
+        "warnings": parsed["warnings"],
+    })
+
+
+@app.route("/backtest/datasets", methods=["GET"])
+def bt_datasets():
+    guard = _bt_guard()
+    if guard:
+        return guard
+    return jsonify({"ok": True, "datasets": _bt_list_datasets()})
+
+
+@app.route("/backtest/datasets/<int:dataset_id>", methods=["DELETE"])
+def bt_delete_dataset(dataset_id):
+    guard = _bt_guard()
+    if guard:
+        return guard
+    ok = _bt_delete_dataset(dataset_id)
+    return jsonify({"ok": ok})
+
+
+@app.route("/backtest/run", methods=["POST"])
+def bt_run():
+    guard = _bt_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True, silent=True) or {}
+    dataset_id = body.get("dataset_id")
+    if not dataset_id:
+        return jsonify({"ok": False, "error": "dataset_id required"}), 400
+    ds = _bt_get_dataset(dataset_id)
+    if not ds:
+        return jsonify({"ok": False, "error": "dataset not found"}), 404
+    mode = (body.get("mode") or "SCALP").upper()
+    if mode not in bt.BT_MODES:
+        mode = "SCALP"
+    session = body.get("session") or None
+    if session in ("", "All", "all"):
+        session = None
+    strategies = body.get("strategies") or None
+    if strategies and not isinstance(strategies, list):
+        strategies = [strategies]
+    start_label = body.get("start") or None
+    end_label = body.get("end") or None
+    params = {
+        "symbol": ds["symbol"], "timeframe": ds["timeframe"], "mode": mode,
+        "session": session, "strategies": strategies,
+        "start_ts": _bt_et_bounds(start_label, end_of_day=False),
+        "end_ts": _bt_et_bounds(end_label, end_of_day=True),
+        "start_label": start_label, "end_label": end_label,
+        "slippage_ticks": float(body.get("slippage_ticks", 1.0) or 1.0),
+        "commission_per_side": float(body.get("commission_per_side", 0.62) or 0.62),
+    }
+    run_id = _bt_create_run({**params,
+                             "start_ts": params["start_ts"].isoformat() if params["start_ts"] else None,
+                             "end_ts": params["end_ts"].isoformat() if params["end_ts"] else None})
+    if run_id is None:
+        return jsonify({"ok": False, "error": "could not create run"}), 500
+    threading.Thread(target=_bt_run_worker, args=(run_id, dataset_id, params),
+                     name=f"backtest-run-{run_id}", daemon=True).start()
+    return jsonify({"ok": True, "run_id": run_id})
+
+
+@app.route("/backtest/runs/<int:run_id>", methods=["GET"])
+def bt_run_status(run_id):
+    guard = _bt_guard()
+    if guard:
+        return guard
+    run = _bt_get_run(run_id)
+    if not run:
+        return jsonify({"ok": False, "error": "run not found"}), 404
+    return jsonify({"ok": True, "run_id": run["id"], "status": run["status"],
+                    "progress": run["progress"], "error": run["error"],
+                    "result": run["result"]})
+
+
+@app.route("/backtest/export", methods=["GET"])
+def bt_export():
+    guard = _bt_guard()
+    if guard:
+        return guard
+    try:
+        run_id = int(request.args.get("run_id"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "run_id required"}), 400
+    run = _bt_get_run(run_id)
+    if not run or not run.get("result"):
+        return jsonify({"ok": False, "error": "no completed run with that id"}), 404
+    trades = (run["result"] or {}).get("trades", [])
+    buf = _bt_io_mod.StringIO()
+    cols = ["strategy", "direction", "entry_ts", "exit_ts", "entry", "stop", "exit",
+            "tp1", "tp3", "risk_points", "gross_points", "pnl_dollars", "r_multiple",
+            "regime", "session", "entry_hour_et", "hold_minutes", "entry_reason",
+            "exit_reason"]
+    w = _bt_csv_mod.writer(buf)
+    w.writerow(cols)
+    for t in trades:
+        w.writerow([t.get(c) for c in cols])
+    csv_text = buf.getvalue()
+    return Response(csv_text, mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="backtest_run_{run_id}.csv"'})
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT
@@ -11292,6 +11773,33 @@ def dashboard():
   html[data-theme="retro"] #rec-card,
   html[data-theme="retro"] .mod{box-shadow:0 0 18px rgba(20,90,55,.22)}
   html[data-theme="retro"] .se-chip{background:#06281c;border-color:#0f5d3a;color:#9bffcb}
+  /* ── Backtest tab ── */
+  #view-seg{display:flex;gap:8px;max-width:360px;margin:0 auto 16px}
+  .view-btn{flex:1;padding:10px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:13px;font-weight:700;cursor:pointer;text-align:center;text-transform:uppercase;letter-spacing:1px;transition:all .15s}
+  .view-btn.active{border-color:var(--cyan);color:var(--cyan);background:var(--cyan-deep);box-shadow:0 0 12px rgba(64,224,255,.3)}
+  .bt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .bt-f{display:flex;flex-direction:column;gap:4px}
+  .bt-f label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+  .bt-f select,.bt-f input{background:var(--inset);border:1px solid var(--border);border-radius:2px;color:var(--text);padding:8px;font-family:var(--mono);font-size:13px}
+  .bt-f select:focus,.bt-f input:focus{outline:none;border-color:var(--cyan)}
+  .bt-btn{width:100%;margin-top:10px;padding:12px;border-radius:2px;border:1px solid var(--cyan);background:var(--cyan-deep);color:var(--cyan);font-family:var(--mono);font-size:14px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
+  .bt-btn:disabled{opacity:.5;cursor:not-allowed}
+  .bt-btn.alt{border-color:var(--border-lit);background:var(--amber-deep);color:var(--amber);margin-top:10px}
+  .bt-msg{font-size:12px;margin-top:8px;color:var(--muted);line-height:1.55;white-space:pre-wrap}
+  .bt-msg.err{color:var(--red)} .bt-msg.ok{color:var(--green)}
+  .bt-tbl{width:100%;border-collapse:collapse;font-size:12px}
+  .bt-tbl th,.bt-tbl td{padding:6px 8px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
+  .bt-tbl th{color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-size:10px;position:sticky;top:0;background:var(--panel);z-index:1}
+  .bt-tbl th:first-child,.bt-tbl td:first-child{text-align:left}
+  .bt-tbl td:nth-last-child(-n+2){text-align:left;white-space:normal;min-width:140px;color:var(--muted)}
+  .bt-tbl tr.sel td{background:var(--cyan-deep)}
+  .bt-scroll{max-height:360px;overflow:auto;border:1px solid var(--border);border-radius:2px}
+  .bt-prog{height:10px;border-radius:999px;background:var(--inset);border:1px solid var(--border);overflow:hidden;margin-top:10px}
+  .bt-prog>div{height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--amber));transition:width .3s}
+  .bt-pos{color:var(--green)} .bt-neg{color:var(--red)}
+  .bt-mini{font-size:11px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
+  .bt-eq{width:100%;height:200px;display:block;margin-top:6px}
+  .bt-x{cursor:pointer;color:var(--red);font-weight:700;user-select:none}
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
 </head>
@@ -11303,6 +11811,14 @@ def dashboard():
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 READY alerts: on</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
 </div>
+
+<!-- Live | Backtest top-level view toggle -->
+<div id="view-seg">
+  <div class="view-btn active" id="vb-live" onclick="setView('live')">📊 Live</div>
+  <div class="view-btn" id="vb-bt" onclick="setView('backtest')">🧪 Backtest</div>
+</div>
+
+<div id="view-live">
 
 <!-- Sensitivity (trading mode) -->
 <div id="mode-row">
@@ -11533,6 +12049,84 @@ def dashboard():
 <button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
 <a class="btn btn-eod" href="/api/diagnostics-live" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
+
+</div><!-- /#view-live -->
+
+<!-- ════════════════ BACKTEST VIEW (read-only research; not wired to /status) ════════════════ -->
+<div id="view-backtest" style="display:none">
+
+  <div class="mod">
+    <div class="mod-h">📥 Upload Candles (CSV)</div>
+    <div class="bt-mini" style="margin-bottom:8px">Columns: Date, Time, Open, High, Low, Close, Volume. Times read in the source timezone below (Eastern by default).</div>
+    <div class="bt-grid">
+      <div class="bt-f"><label>Symbol</label><select id="up-sym"><option>MGC</option><option>MNQ</option></select></div>
+      <div class="bt-f"><label>Timeframe</label><select id="up-tf"><option>1m</option><option>3m</option><option selected>5m</option><option>15m</option></select></div>
+      <div class="bt-f"><label>Source timezone</label><select id="up-tz"><option value="America/New_York" selected>Eastern (ET)</option><option value="America/Chicago">Central (CT)</option><option value="UTC">UTC</option></select></div>
+      <div class="bt-f"><label>Label (optional)</label><input id="up-label" type="text" placeholder="e.g. MGC 5m 2025"></div>
+    </div>
+    <div class="bt-f" style="margin-top:10px"><label>CSV file</label><input id="up-file" type="file" accept=".csv,text/csv"></div>
+    <button class="bt-btn" id="up-btn" onclick="btUpload()">Upload &amp; Validate</button>
+    <div class="bt-msg" id="up-msg"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">🗄️ Datasets</div>
+    <div class="bt-scroll"><table class="bt-tbl" id="ds-tbl">
+      <thead><tr><th>Use</th><th>Symbol</th><th>TF</th><th>Rows</th><th>Range (ET)</th><th>Label</th><th></th></tr></thead>
+      <tbody id="ds-body"><tr><td colspan="7" class="bt-mini">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">⚙️ Run Backtest</div>
+    <div class="bt-grid">
+      <div class="bt-f"><label>Sensitivity</label><select id="rn-mode"><option>SCALP</option><option>SWING</option></select></div>
+      <div class="bt-f"><label>Session</label><select id="rn-sess"><option value="all" selected>All sessions</option><option value="Asia">Asia (18–02 ET)</option><option value="London">London (02–08 ET)</option><option value="New York">New York (08–16 ET)</option></select></div>
+      <div class="bt-f"><label>Strategy</label><select id="rn-strat"><option value="all" selected>All strategies</option><option value="OPENING_DRIVE">Opening Drive</option><option value="LIQUIDITY_SWEEP_REVERSAL">Liquidity Sweep Reversal</option><option value="VWAP_TREND_CONTINUATION">VWAP Trend Continuation</option><option value="RANGE_EXPANSION_BREAKOUT">Range Expansion Breakout</option><option value="EXHAUSTION_FADE">Exhaustion Fade</option></select></div>
+      <div class="bt-f"><label>&nbsp;</label><div class="bt-mini" style="padding:8px 0">Date range is optional — leave blank for the full dataset.</div></div>
+      <div class="bt-f"><label>Start date (ET)</label><input id="rn-start" type="date"></div>
+      <div class="bt-f"><label>End date (ET)</label><input id="rn-end" type="date"></div>
+      <div class="bt-f"><label>Slippage (ticks)</label><input id="rn-slip" type="number" min="0" step="1" value="1"></div>
+      <div class="bt-f"><label>Commission ($/side)</label><input id="rn-comm" type="number" min="0" step="0.01" value="0.62"></div>
+    </div>
+    <button class="bt-btn" id="rn-btn" onclick="btRun()">Run Backtest</button>
+    <div class="bt-prog" id="rn-prog" style="display:none"><div id="rn-prog-f"></div></div>
+    <div class="bt-msg" id="rn-msg"></div>
+  </div>
+
+  <div id="bt-results" style="display:none">
+    <div class="mod">
+      <div class="mod-h">🏆 Strategy Ranking <span class="bt-mini" id="rk-cap"></span></div>
+      <div class="bt-scroll"><table class="bt-tbl" id="rk-tbl">
+        <thead><tr><th>#</th><th>Strategy</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net $</th><th>Net R</th><th>Avg R</th><th>Max DD (R)</th><th>Best hour</th><th>Best regime</th><th>Avg hold</th></tr></thead>
+        <tbody id="rk-body"></tbody>
+      </table></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">📈 Equity Curve (cumulative R)</div>
+      <div class="bt-f" style="max-width:300px"><label>Series</label><select id="eq-sel" onchange="btDrawEquity()"></select></div>
+      <svg class="bt-eq" id="eq-svg" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      <div class="bt-mini" id="eq-cap"></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🤝 Signal Agreement</div>
+      <div class="bt-msg" id="ag-msg"></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">📋 Trade Log <span class="bt-mini" id="tl-count"></span></div>
+      <div class="bt-f" style="max-width:300px;margin-bottom:6px"><label>Filter strategy</label><select id="tl-sel" onchange="btRenderTrades()"></select></div>
+      <div class="bt-scroll"><table class="bt-tbl" id="tl-tbl">
+        <thead><tr><th>#</th><th>Strategy</th><th>Dir</th><th>Entry (ET)</th><th>Exit (ET)</th><th>Regime</th><th>Session</th><th>Entry</th><th>Stop</th><th>Exit</th><th>R</th><th>$</th><th>Hold</th><th>Entry reason</th><th>Exit reason</th></tr></thead>
+        <tbody id="tl-body"></tbody>
+      </table></div>
+      <button class="bt-btn alt" id="ex-btn" onclick="btExport()">⬇️ Export Trade Log (CSV)</button>
+    </div>
+  </div>
+
+</div><!-- /#view-backtest -->
 
 <div id="toast"></div>
 
@@ -12796,6 +13390,252 @@ async function refresh() {
     }
     markUpdated();
   } catch(e) {}
+}
+
+// ══════════════════════ BACKTEST TAB (read-only; own poll, not /status) ══════════════════════
+let btResult = null, btRunId = null, btPollTimer = null, btSelDataset = null;
+const BT_STRAT_LABELS = {
+  OPENING_DRIVE:'Opening Drive', LIQUIDITY_SWEEP_REVERSAL:'Liquidity Sweep Reversal',
+  VWAP_TREND_CONTINUATION:'VWAP Trend Continuation', RANGE_EXPANSION_BREAKOUT:'Range Expansion Breakout',
+  EXHAUSTION_FADE:'Exhaustion Fade'
+};
+function btEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function btNum(v,d){ d=(d==null?2:d); return (v===null||v===undefined||v==='')?'—':(typeof v==='number'?v.toFixed(d):v); }
+function btP(v){ return (v===null||v===undefined)?'n/a':v+'%'; }
+function btFmtTs(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}); }catch(e){ return iso; } }
+function btFmtDate(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString('en-US',{timeZone:'America/New_York',year:'numeric',month:'short',day:'2-digit'}); }catch(e){ return iso; } }
+
+function setView(v){
+  const live = (v!=='backtest');
+  document.getElementById('view-live').style.display = live ? '' : 'none';
+  document.getElementById('view-backtest').style.display = live ? 'none' : '';
+  document.getElementById('vb-live').classList.toggle('active', live);
+  document.getElementById('vb-bt').classList.toggle('active', !live);
+  if(!live && btSelDataset===null) btLoadDatasets();
+}
+
+async function btUpload(){
+  const f = document.getElementById('up-file').files[0];
+  const msg = document.getElementById('up-msg');
+  if(!f){ msg.className='bt-msg err'; msg.textContent='Choose a CSV file first.'; return; }
+  const btn = document.getElementById('up-btn'); btn.disabled=true; btn.textContent='Uploading…';
+  msg.className='bt-msg'; msg.textContent='Reading file…';
+  try{
+    const text = await f.text();
+    const q = new URLSearchParams({
+      symbol: document.getElementById('up-sym').value,
+      timeframe: document.getElementById('up-tf').value,
+      tz: document.getElementById('up-tz').value,
+      label: document.getElementById('up-label').value || '',
+      filename: f.name || ''
+    });
+    const r = await fetch(BASE+'/backtest/upload?'+q.toString(),
+      {method:'POST', headers:{'Content-Type':'text/csv'}, body:text, cache:'no-store'});
+    const d = await r.json();
+    if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Upload failed'); return; }
+    let s = (d.reused?'Reused existing dataset':'Stored dataset')+' #'+d.dataset_id+' · '+d.row_count+' rows';
+    if(d.dup_removed) s+=' · '+d.dup_removed+' dupes removed';
+    if(d.skipped) s+=' · '+d.skipped+' skipped';
+    if(d.gap_count) s+=' · '+d.gap_count+' gaps';
+    if(d.inferred_timeframe) s+=' · inferred '+d.inferred_timeframe;
+    if(d.warnings && d.warnings.length) s+='\n⚠ '+d.warnings.join('\n⚠ ');
+    msg.className='bt-msg ok'; msg.textContent='✓ '+s;
+    btLoadDatasets();
+  }catch(e){ msg.className='bt-msg err'; msg.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent='Upload & Validate'; }
+}
+
+async function btLoadDatasets(){
+  const body = document.getElementById('ds-body');
+  try{
+    const d = await api('/backtest/datasets');
+    const rows = (d && d.datasets) || [];
+    if(!rows.length){ btSelDataset=null; body.innerHTML='<tr><td colspan="7" class="bt-mini">No datasets yet — upload a CSV above.</td></tr>'; return; }
+    if(btSelDataset===null || !rows.some(r=>r.id===btSelDataset)) btSelDataset = rows[0].id;
+    body.innerHTML = rows.map(r=>{
+      const sel=(btSelDataset===r.id);
+      const range=btFmtDate(r.first_ts)+' → '+btFmtDate(r.last_ts);
+      return '<tr class="'+(sel?'sel':'')+'">'+
+        '<td><input type="radio" name="ds" '+(sel?'checked':'')+' onclick="btSelectDataset('+r.id+')"></td>'+
+        '<td>'+btEsc(r.symbol)+'</td><td>'+btEsc(r.timeframe)+'</td><td>'+r.row_count+'</td>'+
+        '<td>'+range+'</td><td>'+btEsc(r.source_label||r.filename||'—')+'</td>'+
+        '<td><span class="bt-x" title="Delete" onclick="btDeleteDataset('+r.id+')">✕</span></td></tr>';
+    }).join('');
+  }catch(e){ body.innerHTML='<tr><td colspan="7" class="bt-msg err">'+btEsc(''+e)+'</td></tr>'; }
+}
+function btSelectDataset(id){ btSelDataset=id; btLoadDatasets(); }
+async function btDeleteDataset(id){
+  if(!confirm('Delete dataset #'+id+'? This removes its candles too.')) return;
+  try{
+    await fetch(BASE+'/backtest/datasets/'+id, {method:'DELETE', cache:'no-store'});
+    if(btSelDataset===id) btSelDataset=null;
+    btLoadDatasets();
+  }catch(e){ toast('Delete failed', false); }
+}
+
+async function btRun(){
+  const msg=document.getElementById('rn-msg');
+  if(btSelDataset===null){ msg.className='bt-msg err'; msg.textContent='Select a dataset first.'; return; }
+  const strat=document.getElementById('rn-strat').value;
+  const body={
+    dataset_id: btSelDataset,
+    mode: document.getElementById('rn-mode').value,
+    session: document.getElementById('rn-sess').value,
+    strategies: (strat==='all') ? null : [strat],
+    start: document.getElementById('rn-start').value || null,
+    end: document.getElementById('rn-end').value || null,
+    slippage_ticks: parseFloat(document.getElementById('rn-slip').value||'1'),
+    commission_per_side: parseFloat(document.getElementById('rn-comm').value||'0.62'),
+  };
+  const btn=document.getElementById('rn-btn'); btn.disabled=true; btn.textContent='Running…';
+  msg.className='bt-msg'; msg.textContent='Submitting…';
+  document.getElementById('bt-results').style.display='none';
+  const prog=document.getElementById('rn-prog'); document.getElementById('rn-prog-f').style.width='5%';
+  prog.style.display='block';
+  try{
+    const d=await api('/backtest/run', body);
+    if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Run failed'); btRunDone(); prog.style.display='none'; return; }
+    btRunId=d.run_id; msg.textContent='Running #'+btRunId+'…';
+    btPollRun();
+  }catch(e){ msg.className='bt-msg err'; msg.textContent='✗ '+e; btRunDone(); prog.style.display='none'; }
+}
+function btRunDone(){ const btn=document.getElementById('rn-btn'); btn.disabled=false; btn.textContent='Run Backtest'; }
+function btPollRun(){
+  if(btPollTimer) clearTimeout(btPollTimer);
+  btPollTimer=setTimeout(async ()=>{
+    try{
+      const d=await api('/backtest/runs/'+btRunId);
+      const progF=document.getElementById('rn-prog-f');
+      const msg=document.getElementById('rn-msg');
+      if(!d || !d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+((d&&d.error)||'run lost'); btRunDone(); return; }
+      progF.style.width=Math.round((d.progress||0)*100)+'%';
+      if(d.status==='done'){ btResult=d.result; msg.className='bt-msg ok'; msg.textContent='✓ Completed run #'+btRunId; btRunDone(); btRenderResults(); return; }
+      if(d.status==='error'){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Backtest error'); btRunDone(); return; }
+      msg.textContent='Running #'+btRunId+'… ('+d.status+')';
+      btPollRun();
+    }catch(e){ btPollRun(); }
+  }, 1200);
+}
+
+function btRenderResults(){
+  const res=btResult; if(!res){ return; }
+  document.getElementById('bt-results').style.display='block';
+  document.getElementById('rk-cap').textContent =
+    res.symbol+' · '+res.mode+' · '+res.session+' · '+(res.timeframe||'')+' · '+res.total_trades+' trades';
+  // Ranking table
+  const rb=document.getElementById('rk-body');
+  const ranked=(res.ranking||[]).map(k=>res.strategies[k]).filter(Boolean);
+  rb.innerHTML = ranked.length ? ranked.map((m,idx)=>{
+    const npos=(m.net_r>=0), dpos=(m.net_pnl>=0);
+    return '<tr>'+
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+btEsc(m.label||m.key)+'</td>'+
+      '<td>'+m.total_trades+'</td>'+
+      '<td>'+(m.win_rate===null?'—':m.win_rate+'%')+'</td>'+
+      '<td>'+(m.profit_factor===null?'—':m.profit_factor)+'</td>'+
+      '<td class="'+(dpos?'bt-pos':'bt-neg')+'">'+(dpos?'+':'−')+'$'+btNum(Math.abs(m.net_pnl),0)+'</td>'+
+      '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(m.net_r,2)+'R</td>'+
+      '<td>'+btNum(m.avg_r,2)+'</td>'+
+      '<td>'+btNum(m.max_drawdown_r,2)+'</td>'+
+      '<td>'+btEsc(m.best_hour_label||'—')+'</td>'+
+      '<td>'+btEsc(m.best_regime||'—')+'</td>'+
+      '<td>'+(m.avg_hold_minutes===null?'—':m.avg_hold_minutes+'m')+'</td>'+
+      '</tr>';
+  }).join('') : '<tr><td colspan="12" class="bt-mini">No trades generated for these filters.</td></tr>';
+  // Equity series selector
+  const eqSel=document.getElementById('eq-sel');
+  let opts='<option value="__combined__">Combined (all selected)</option>';
+  ranked.forEach(m=>{ opts+='<option value="'+m.key+'">'+btEsc(m.label||m.key)+'</option>'; });
+  eqSel.innerHTML=opts; eqSel.value='__combined__';
+  btDrawEquity();
+  // Trade-log filter
+  const tlSel=document.getElementById('tl-sel');
+  let topts='<option value="all">All strategies</option>';
+  ranked.forEach(m=>{ topts+='<option value="'+m.key+'">'+btEsc(m.label||m.key)+'</option>'; });
+  tlSel.innerHTML=topts; tlSel.value='all';
+  btRenderTrades();
+  // Signal agreement
+  const ag=document.getElementById('ag-msg'); const sa=res.signal_agreement||{};
+  if(sa.available){
+    const mt=sa.match||{};
+    ag.className='bt-msg';
+    ag.textContent='Overall agreement: '+(sa.overall===null?'—':sa.overall+'%')+
+      '\nBOS '+btP(mt.bos)+' · CHOCH '+btP(mt.choch)+' · Zone '+btP(mt.zone)+' · Sweep '+btP(mt.sweep)+
+      ((sa.diagnostics&&sa.diagnostics.length)? '\n⚠ '+sa.diagnostics.join(' · '):'');
+  }else{
+    const rc=sa.reconstructed||{};
+    ag.className='bt-msg';
+    ag.textContent=(sa.message||'No captured live signals for this period.')+
+      '\nReconstructed structure events — BOS '+(rc.bos||0)+' · CHOCH '+(rc.choch||0)+' · Zone '+(rc.zone||0)+' · Sweep '+(rc.sweep||0);
+  }
+}
+
+function btRenderTrades(){
+  const res=btResult; if(!res) return;
+  const f=document.getElementById('tl-sel').value;
+  let trades=(res.trades||[]).slice();
+  if(f!=='all') trades=trades.filter(t=>t.strategy===f);
+  trades.sort((a,b)=> (a.entry_ts<b.entry_ts?-1:(a.entry_ts>b.entry_ts?1:0)));
+  document.getElementById('tl-count').textContent='('+trades.length+' trades)';
+  const tb=document.getElementById('tl-body');
+  tb.innerHTML = trades.length ? trades.map((t,idx)=>{
+    const rpos=(t.r_multiple>=0), dpos=(t.pnl_dollars>=0);
+    return '<tr>'+
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+btEsc(BT_STRAT_LABELS[t.strategy]||t.strategy)+'</td>'+
+      '<td class="'+(t.direction==='Long'?'bt-pos':'bt-neg')+'">'+btEsc(t.direction)+'</td>'+
+      '<td>'+btFmtTs(t.entry_ts)+'</td>'+
+      '<td>'+btFmtTs(t.exit_ts)+'</td>'+
+      '<td>'+btEsc(t.regime||'—')+'</td>'+
+      '<td>'+btEsc(t.session||'—')+'</td>'+
+      '<td>'+btNum(t.entry,2)+'</td>'+
+      '<td>'+btNum(t.stop,2)+'</td>'+
+      '<td>'+btNum(t.exit,2)+'</td>'+
+      '<td class="'+(rpos?'bt-pos':'bt-neg')+'">'+(rpos?'+':'')+btNum(t.r_multiple,2)+'</td>'+
+      '<td class="'+(dpos?'bt-pos':'bt-neg')+'">'+(dpos?'+':'−')+'$'+btNum(Math.abs(t.pnl_dollars),0)+'</td>'+
+      '<td>'+(t.hold_minutes==null?'—':t.hold_minutes+'m')+'</td>'+
+      '<td>'+btEsc(t.entry_reason||'')+'</td>'+
+      '<td>'+btEsc(t.exit_reason||'')+'</td>'+
+      '</tr>';
+  }).join('') : '<tr><td colspan="15" class="bt-mini">No trades for this filter.</td></tr>';
+}
+
+function btDrawEquity(){
+  const res=btResult; if(!res) return;
+  const sel=document.getElementById('eq-sel').value;
+  const curve = (sel==='__combined__') ? (res.combined_equity_curve||[])
+                                       : (((res.strategies[sel]||{}).equity_curve)||[]);
+  const svg=document.getElementById('eq-svg'); const cap=document.getElementById('eq-cap');
+  const W=600,H=200,pad=10;
+  if(!curve.length){ svg.innerHTML='<text x="300" y="104" fill="#9d86c4" font-size="12" text-anchor="middle">No trades to chart</text>'; cap.textContent=''; return; }
+  let min=0,max=0;
+  curve.forEach(p=>{ if(p.cum_r<min)min=p.cum_r; if(p.cum_r>max)max=p.cum_r; });
+  if(max===min){ max+=1; min-=1; }
+  const n=curve.length;
+  const X=i=> pad + (n===1?0:(i/(n-1))*(W-2*pad));
+  const Y=v=> pad + (1-((v-min)/(max-min)))*(H-2*pad);
+  const pts=curve.map((p,i)=> X(i).toFixed(1)+','+Y(p.cum_r).toFixed(1)).join(' ');
+  const zeroY=Y(0).toFixed(1);
+  const last=curve[n-1].cum_r;
+  const color = last>=0 ? '#2bf5a0' : '#ff476b';
+  svg.innerHTML=
+    '<line x1="'+pad+'" y1="'+zeroY+'" x2="'+(W-pad)+'" y2="'+zeroY+'" stroke="#3a2363" stroke-width="1" stroke-dasharray="4 4"></line>'+
+    '<polyline fill="none" stroke="'+color+'" stroke-width="2" points="'+pts+'"></polyline>';
+  cap.textContent=n+' trades · final '+(last>=0?'+':'')+last.toFixed(2)+'R · peak '+max.toFixed(2)+'R · trough '+min.toFixed(2)+'R';
+}
+
+async function btExport(){
+  if(!btRunId){ toast('Run a backtest first', false); return; }
+  try{
+    const r=await fetch(BASE+'/backtest/export?run_id='+btRunId, {cache:'no-store'});
+    if(!r.ok){ toast('Export failed', false); return; }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='backtest_run_'+btRunId+'.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }catch(e){ toast('Export failed', false); }
 }
 
 // Poll every 3 seconds

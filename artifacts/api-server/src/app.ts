@@ -33,6 +33,17 @@ app.use(cors());
 // catch-all type buffers the bytes without attempting (and failing) to parse
 // non-JSON payloads. Flask does all parsing (get_json(force=True) + raw-text
 // fallback), so the proxy only needs to relay the original bytes + content-type.
+//
+// Large bodies are needed by exactly ONE endpoint — the authenticated backtest
+// CSV upload (e.g. a year of 1-minute bars). Scope the big limit to that single
+// path so the many other (and the open) /api endpoints don't buffer multi-MB
+// payloads; a global 64mb cap was an unauthenticated memory/availability surface.
+// Body-parser marks req._body once consumed, so the tight global parser below is
+// a no-op on the upload path (no double read). Webhook payloads remain tiny.
+app.use(
+  "/api/backtest/upload",
+  express.raw({ type: () => true, limit: "32mb" }),
+);
 app.use(express.raw({ type: () => true, limit: "1mb" }));
 
 app.use("/api", router);
