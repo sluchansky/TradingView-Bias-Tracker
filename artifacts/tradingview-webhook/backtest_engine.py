@@ -857,7 +857,7 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
                       session_filter=None,
                       max_trades_per_session=MAX_TRADES_PER_SESSION,
                       min_target_r=MIN_TARGET_R,
-                      block_extreme_volatility=True,
+                      block_extreme_volatility=False,
                       news_blackouts_et=NEWS_BLACKOUTS_ET):
     """Replay one strategy over the snapshots. Entry on the bar AFTER a
     close-confirmed signal (next-bar open ± slippage). Management: 50% off at TP1
@@ -1204,10 +1204,11 @@ def run_backtest(candles, params):
     session_filter = params.get("session") or None
     slippage = float(params.get("slippage_ticks", 1.0))
     commission = float(params.get("commission_per_side", 0.62))
-    # Research no-trade filters (defaults on; None/0 disables the numeric ones).
+    # Research no-trade filters. Numeric caps default on (None/0 disables them);
+    # extreme-volatility blocking defaults OFF (only blocks if explicitly requested).
     max_tps = params.get("max_trades_per_session", MAX_TRADES_PER_SESSION)
     min_tr = params.get("min_target_r", MIN_TARGET_R)
-    block_vol = params.get("block_extreme_volatility", True)
+    block_vol = params.get("block_extreme_volatility", False)
     news_bl = params.get("news_blackouts_et", NEWS_BLACKOUTS_ET)
     want = params.get("strategies") or STRATEGY_ORDER
     # Disabled strategies never trade, even when explicitly requested.
