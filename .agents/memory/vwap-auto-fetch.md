@@ -50,3 +50,21 @@ chart VWAP" over a one-time TradingView alert setup.
 - **The fetch loop must never die or block requests.** It runs on a rescheduling
   timer (mirrors the heartbeat loop), swallows all errors, and a failed fetch leaves
   the previous value untouched rather than clearing it.
+
+- **Market-closed = Yahoo HTTP 200 with an EMPTY quote block (NOT a feed failure).**
+  When MGC/MNQ are closed (weekend, the daily 17–18 ET halt, holidays) the Yahoo
+  chart endpoint returns 200 with `timestamp: None` and an empty `indicators.quote[0]`
+  dict, so a bare `quote["high"]` raises `KeyError: 'high'`. This is the benign
+  closed-market artifact, not an outage — the feeds are fail-open, so no bad trade
+  results.
+  **Why:** this KeyError used to fire every fetch cycle (~seconds) across VWAP /
+  volatility / latest-bar and spammed WARNING logs, burying real errors and looking
+  like a broken publish.
+  **How to apply:** all three intraday feeds share `_fetch_intraday_quote(symbol)`
+  which classifies the result as `(quote, None)` success / `(None, MARKET_CLOSED_SENTINEL)`
+  benign-closed / `(None, "<reason>")` genuine error (incl. an incomplete-payload
+  guard, since key access moved outside the old try/except). `_log_feed_status` logs
+  the closed case once per transition (INFO) and keeps real errors as per-cycle
+  WARNING. Detection is `not quote or quote.get("high") is None` — open-market
+  payloads always carry a populated `high` list, so this never misclassifies a live
+  bar. Any new intraday feed should route through the same helpers, not re-`quote["high"]`.

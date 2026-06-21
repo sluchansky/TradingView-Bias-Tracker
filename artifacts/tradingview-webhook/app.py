@@ -3120,16 +3120,22 @@ def get_vwap(ticker, max_age_min=None):
     return float(rec["value"]), "ok"
 
 
-def _fetch_vwap_from_market(instrument):
-    """Compute today's session VWAP for an instrument from a public market feed.
+# ── Shared intraday-feed fetch + quiet status logging ────────────────────────
+# Yahoo returns HTTP 200 with an EMPTY quote block when the market is closed (no
+# intraday bars yet). That benign "market closed" case used to raise KeyError
+# 'high' and spam the logs every cycle; we now classify it separately so it is
+# logged once per transition while genuine failures stay visible as warnings.
+MARKET_CLOSED_SENTINEL = "no intraday data (market closed)"
+_FEED_STATUS = {}  # (label, instrument) -> "ok" | "closed" | "error"
 
-    Returns (value, error). VWAP = Σ(typical_price × volume) / Σ(volume) over the
-    1-minute bars of the current trading day, where typical_price = (H+L+C)/3.
-    MGC/MNQ track GC=F/NQ=F (same price level), so the VWAP is interchangeable.
+
+def _fetch_intraday_quote(symbol):
+    """Fetch the 1-min/1d Yahoo chart `quote` block for `symbol`.
+
+    Returns (quote_dict, err). The benign market-closed case (empty quote block)
+    returns (None, MARKET_CLOSED_SENTINEL); a genuine failure returns
+    (None, "<reason>"); success returns (quote_dict, None).
     """
-    symbol = VWAP_FEED_SYMBOL.get(instrument)
-    if not symbol:
-        return None, f"no feed symbol for {instrument}"
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
         resp = requests.get(
@@ -3142,10 +3148,57 @@ def _fetch_vwap_from_market(instrument):
             return None, f"HTTP {resp.status_code}"
         result = resp.json()["chart"]["result"][0]
         quote  = result["indicators"]["quote"][0]
-        highs, lows, closes = quote["high"], quote["low"], quote["close"]
-        volumes = quote["volume"]
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
         return None, f"fetch error: {exc}"
+    # Market closed / no session yet: Yahoo returns 200 with an empty quote block.
+    if not quote or quote.get("high") is None:
+        return None, MARKET_CLOSED_SENTINEL
+    # Populated-but-incomplete payload is a genuine anomaly, not the benign closed
+    # case — surface it as a real error (logged as a warning) rather than letting a
+    # later key access raise. (Open-market payloads always include all OHLCV keys.)
+    if quote.get("low") is None or quote.get("close") is None:
+        return None, "incomplete quote payload"
+    return quote, None
+
+
+def _log_feed_status(label, instrument, err):
+    """Quiet logging for the best-effort market feeds. The benign market-closed
+    case is logged once per transition (INFO); genuine errors stay visible
+    (WARNING every cycle). `err` is None on success."""
+    key = (label, instrument)
+    prev = _FEED_STATUS.get(key)
+    if err is None:
+        if prev in ("closed", "error"):
+            logger.info("%s for %s: feed resumed.", label, instrument)
+        _FEED_STATUS[key] = "ok"
+    elif err == MARKET_CLOSED_SENTINEL:
+        if prev != "closed":
+            logger.info(
+                "%s for %s: no intraday data (market closed) — resumes at the open.",
+                label, instrument)
+        _FEED_STATUS[key] = "closed"
+    else:
+        logger.warning("%s failed for %s: %s", label, instrument, err)
+        _FEED_STATUS[key] = "error"
+
+
+def _fetch_vwap_from_market(instrument):
+    """Compute today's session VWAP for an instrument from a public market feed.
+
+    Returns (value, error). VWAP = Σ(typical_price × volume) / Σ(volume) over the
+    1-minute bars of the current trading day, where typical_price = (H+L+C)/3.
+    MGC/MNQ track GC=F/NQ=F (same price level), so the VWAP is interchangeable.
+    """
+    symbol = VWAP_FEED_SYMBOL.get(instrument)
+    if not symbol:
+        return None, f"no feed symbol for {instrument}"
+    quote, err = _fetch_intraday_quote(symbol)
+    if err:
+        return None, err
+    highs, lows, closes = quote["high"], quote["low"], quote["close"]
+    volumes = quote.get("volume")
+    if volumes is None:
+        return None, "incomplete quote payload (no volume)"
 
     num = den = 0.0
     for high, low, close, vol in zip(highs, lows, closes, volumes):
@@ -3178,8 +3231,9 @@ def _update_vwap_auto(instrument):
         return  # keep the exact, operator-supplied value
     value, err = _fetch_vwap_from_market(instrument)
     if value is None:
-        logger.warning("VWAP auto-fetch failed for %s: %s", instrument, err)
+        _log_feed_status("VWAP auto-fetch", instrument, err)
         return
+    _log_feed_status("VWAP auto-fetch", instrument, None)
     # Re-check after the (slow) HTTP fetch: a chart/manual push may have landed
     # while it was in flight — never clobber a fresh operator value.
     if _chart_override_active(instrument):
@@ -3235,18 +3289,12 @@ def _fetch_volatility_from_market(instrument):
     symbol = VWAP_FEED_SYMBOL.get(instrument)
     if not symbol:
         return None, None, None
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    try:
-        resp = requests.get(url, params={"interval": "1m", "range": "1d"},
-                            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if resp.status_code != 200:
-            return None, None, None
-        result = resp.json()["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-        highs, lows, closes = quote["high"], quote["low"], quote["close"]
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-        logger.warning("Volatility fetch failed for %s: %s", instrument, exc)
+    quote, err = _fetch_intraday_quote(symbol)
+    if err:
+        _log_feed_status("Volatility fetch", instrument, err)
         return None, None, None
+    _log_feed_status("Volatility fetch", instrument, None)
+    highs, lows, closes = quote["high"], quote["low"], quote["close"]
 
     trs, prev_close = [], None
     for high, low, close in zip(highs, lows, closes):
@@ -7360,18 +7408,12 @@ def _fetch_latest_bar(instrument):
     symbol = VWAP_FEED_SYMBOL.get(instrument)
     if not symbol:
         return None
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    try:
-        resp = requests.get(url, params={"interval": "1m", "range": "1d"},
-                            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if resp.status_code != 200:
-            return None
-        result = resp.json()["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-        highs, lows, closes = quote["high"], quote["low"], quote["close"]
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-        logger.warning("Latest-bar fetch failed for %s: %s", instrument, exc)
+    quote, err = _fetch_intraday_quote(symbol)
+    if err:
+        _log_feed_status("Latest-bar fetch", instrument, err)
         return None
+    _log_feed_status("Latest-bar fetch", instrument, None)
+    highs, lows, closes = quote["high"], quote["low"], quote["close"]
     for i in range(len(closes) - 1, -1, -1):
         if highs[i] is not None and lows[i] is not None and closes[i] is not None:
             return {"high": float(highs[i]), "low": float(lows[i]), "close": float(closes[i])}
@@ -10788,7 +10830,16 @@ async function refresh(){
     rows.innerHTML='<tr><td class="empty" colspan="47">No evaluations yet - waiting for the next webhook.</td></tr>';
     return;
   }
-  rows.innerHTML=evals.map(function(e){
+  // READY setups float to the top (they are the actionable rows); the heartbeat
+  // re-evaluates constantly, so a strict newest-first order would bury them. The
+  // sort is stable, so newest-first is preserved WITHIN the READY and non-READY
+  // groups. Display-only - does not change evaluation order anywhere else.
+  var ordered=evals.slice().sort(function(a,b){
+    var ra=((a.verdict||'').indexOf('READY')>=0)?0:1;
+    var rb=((b.verdict||'').indexOf('READY')>=0)?0:1;
+    return ra-rb;
+  });
+  rows.innerHTML=ordered.map(function(e){
     var vc=(e.verdict||'').indexOf('READY')>=0?'v-ready':'v-wait';
     return '<tr>'+
       '<td>'+etTime(e.webhookReceivedAt)+'</td>'+
