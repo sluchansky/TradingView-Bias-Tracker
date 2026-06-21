@@ -10060,6 +10060,9 @@ def bt_run():
     except (TypeError, ValueError):
         min_tr = bt.MIN_TARGET_R
     min_tr = max(0.0, min(min_tr, 10.0))
+    management = body.get("management") or bt.BT_DEFAULT_MGMT
+    if management not in bt.BT_RUN_MANAGEMENTS:
+        management = bt.BT_DEFAULT_MGMT
     params = {
         "symbol": ds["symbol"], "timeframe": ds["timeframe"], "mode": mode,
         "session": session, "strategies": strategies,
@@ -10070,6 +10073,7 @@ def bt_run():
         "commission_per_side": float(body.get("commission_per_side", 0.62) or 0.62),
         "max_trades_per_session": max_tps,
         "min_target_r": min_tr,
+        "management": management,
     }
     run_id = _bt_create_run({**params,
                              "start_ts": params["start_ts"].isoformat() if params["start_ts"] else None,
@@ -12224,15 +12228,16 @@ def dashboard():
       <div class="bt-f"><label>Sensitivity</label><select id="rn-mode"><option>SCALP</option><option>SWING</option></select></div>
       <div class="bt-f"><label>Session</label><select id="rn-sess"><option value="all" selected>All sessions</option><option value="Asia">Asia (18–02 ET)</option><option value="London">London (02–08 ET)</option><option value="New York">New York (08–16 ET)</option></select></div>
       <div class="bt-f"><label>Strategy</label><select id="rn-strat"><option value="all" selected>All strategies</option><option value="OPENING_DRIVE">Opening Drive</option><option value="LIQUIDITY_SWEEP_REVERSAL">Liquidity Sweep Reversal</option><option value="VWAP_TREND_CONTINUATION">VWAP Trend Continuation</option><option value="RANGE_EXPANSION_BREAKOUT">Range Expansion Breakout</option><option value="EXHAUSTION_FADE">Exhaustion Fade</option></select></div>
+      <div class="bt-f"><label>Exit management</label><select id="rn-mgmt"><option value="target_1_5r" selected>1.5R target (let winners run)</option><option value="target_2r">2.0R target</option><option value="target_1r">1.0R target</option><option value="partial_1r_runner_2r">Partial @1R, runner @2R</option><option value="be_after_1r">BE after 1R (2R target)</option><option value="partial_tp3">Partial @TP1 → TP3 (legacy, conservative)</option></select></div>
       <div class="bt-f"><label>&nbsp;</label><div class="bt-mini" style="padding:8px 0">Date range is optional — leave blank for the full dataset.</div></div>
       <div class="bt-f"><label>Start date (ET)</label><input id="rn-start" type="date"></div>
       <div class="bt-f"><label>End date (ET)</label><input id="rn-end" type="date"></div>
       <div class="bt-f"><label>Slippage (ticks)</label><input id="rn-slip" type="number" min="0" step="1" value="1"></div>
       <div class="bt-f"><label>Commission ($/side)</label><input id="rn-comm" type="number" min="0" step="0.01" value="0.62"></div>
-      <div class="bt-f"><label>Min target (R)</label><input id="rn-minr" type="number" min="0" max="10" step="0.1" value="1.5"></div>
+      <div class="bt-f"><label>Min target (R)</label><input id="rn-minr" type="number" min="0" max="10" step="0.1" value="1.0"></div>
       <div class="bt-f"><label>Max trades / session</label><input id="rn-maxt" type="number" min="0" max="100" step="1" value="3"></div>
     </div>
-    <div class="bt-mini" style="margin-top:-2px;margin-bottom:8px">Min target R rejects setups whose first target is below this R:R (0 = off). Max trades/session caps entries per ET session-day (0 = off). MGC's fixed first target is only ~1.0R, so a 1.5R minimum yields 0 MGC trades.</div>
+    <div class="bt-mini" style="margin-top:-2px;margin-bottom:8px">Exit management sets how trades are closed — fixed-R targets let winners run, while the legacy partial banks half at TP1 then trails to breakeven (more conservative, smaller winners). Min target R rejects setups whose fixed first target is below this R:R (0 = off); MGC's first target is only ~1.0R, so keep it ≤ 1.0 to include MGC. Max trades/session caps entries per ET session-day (0 = off).</div>
     <button class="bt-btn" id="rn-btn" onclick="btRun()">Run Backtest</button>
     <div class="bt-prog" id="rn-prog" style="display:none"><div id="rn-prog-f"></div></div>
     <div class="bt-msg" id="rn-msg"></div>
@@ -13719,8 +13724,9 @@ async function btRun(){
     end: document.getElementById('rn-end').value || null,
     slippage_ticks: parseFloat(document.getElementById('rn-slip').value||'1'),
     commission_per_side: parseFloat(document.getElementById('rn-comm').value||'0.62'),
-    min_target_r: parseFloat(document.getElementById('rn-minr').value||'1.5'),
+    min_target_r: parseFloat(document.getElementById('rn-minr').value||'1.0'),
     max_trades_per_session: parseInt(document.getElementById('rn-maxt').value||'3', 10),
+    management: document.getElementById('rn-mgmt').value,
   };
   const btn=document.getElementById('rn-btn'); btn.disabled=true; btn.textContent='Running…';
   msg.className='bt-msg'; msg.textContent='Submitting…';
@@ -13787,6 +13793,7 @@ function btRenderResults(){
   // Active filters caption
   const fl=res.filters||{};
   const fbits=[];
+  if(fl.management_label) fbits.push('Exit: '+fl.management_label);
   if(fl.disabled_strategies&&fl.disabled_strategies.length) fbits.push('Disabled: '+fl.disabled_strategies.map(s=>BT_STRAT_LABELS[s]||s).join(', '));
   if(fl.max_trades_per_session) fbits.push('Max '+fl.max_trades_per_session+' trades/session');
   if(fl.min_target_r) fbits.push('Min target '+fl.min_target_r+'R');

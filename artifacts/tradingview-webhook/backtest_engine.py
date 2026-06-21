@@ -112,10 +112,11 @@ DISABLED_STRATEGIES = {"EXHAUSTION_FADE"}
 # ── Research no-trade filters (applied in simulate_strategy, all causal) ──────
 # Default max trades per ET session-day bucket (per strategy). None/0 disables.
 MAX_TRADES_PER_SESSION = 3
-# Minimum reward:risk required on the FIRST (expectancy-critical) target. The 50%
-# partial exits at TP1 and the runner's stop jumps to breakeven, so TP1 is the R
-# that actually drives expectancy. None/0 disables.
-MIN_TARGET_R = 1.5
+# Minimum reward:risk required on the FIRST (expectancy-critical) target, measured
+# as the instrument's fixed first target (spec tp1) over the trade's risk. None/0
+# disables. MGC's fixed first target is only ~1.0R, so keep this <= 1.0 to admit
+# MGC trades.
+MIN_TARGET_R = 1.0
 # High-impact-news blackout windows in fractional ET hours [lo, hi). There is no
 # economic-calendar feed available, so this is a configurable time-of-day blackout
 # around the 08:30 ET macro release cluster rather than a true news filter.
@@ -148,6 +149,16 @@ OPT_MGMT_LABELS = {
     "target_2r": "2.0R target",
     "partial_1r_runner_2r": "Partial @1R, runner @2R",
     "be_after_1r": "BE after 1R (2R target)"}
+# Single-run management models = the optimizer's R-based set PLUS the legacy
+# spec-target partial (50% off at spec TP1, runner to spec TP3 with a breakeven
+# stop). The R-based models let winners run instead of capping the runner at
+# breakeven, which is why the single-run default is a fixed 1.5R target rather
+# than the legacy partial.
+BT_MGMT_LEGACY = "partial_tp3"
+BT_RUN_MANAGEMENTS = OPT_MANAGEMENTS + [BT_MGMT_LEGACY]
+BT_DEFAULT_MGMT = "target_1_5r"
+BT_RUN_MGMT_LABELS = {**OPT_MGMT_LABELS,
+                      BT_MGMT_LEGACY: "Partial @TP1 → TP3 (legacy, BE)"}
 OPT_MIN_TRADES = 10        # min trades for a combo to enter best/worst rankings
 OPT_TABLE_ROWS = 250       # ranked combinations retained for the table + CSV
 
@@ -858,10 +869,12 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
                       max_trades_per_session=MAX_TRADES_PER_SESSION,
                       min_target_r=MIN_TARGET_R,
                       block_extreme_volatility=False,
-                      news_blackouts_et=NEWS_BLACKOUTS_ET):
+                      news_blackouts_et=NEWS_BLACKOUTS_ET,
+                      management=BT_DEFAULT_MGMT):
     """Replay one strategy over the snapshots. Entry on the bar AFTER a
-    close-confirmed signal (next-bar open ± slippage). Management: 50% off at TP1
-    + stop→breakeven, runner to TP3; worst-case same-bar fill (stop/BE first).
+    close-confirmed signal (next-bar open ± slippage). Exits follow the chosen
+    `management` model (fixed-R targets, partial+runner, BE-after-1R, or the
+    legacy spec-target partial); worst-case same-bar fill (stop/BE first).
     Returns a list of closed-trade dicts.
 
     Research no-trade filters (all CAUSAL — evaluated on the signal bar):
@@ -946,14 +959,39 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
         else:
             tp1, tp3 = entry - tp1d, entry - tp3d
 
-        # ── Walk forward to resolve the trade ──
-        result = _walk_trade(snaps, candles, entry_bar, direction, entry, stop,
-                             tp1, tp3, slip)
-        exit_price, exit_bar, exit_reason, half1_pts, half2_pts = result
-        gross_pts = 0.5 * half1_pts + 0.5 * half2_pts
+        # ── Walk forward to resolve the trade under the chosen management ──
+        # Entry selection above is identical for every management model; only the
+        # EXIT differs. The legacy model banks 50% at spec TP1 and trails the
+        # runner to spec TP3 with a breakeven stop; the R-based models (default)
+        # let the position run to a fixed/partial R target so winners are not
+        # capped at breakeven. All paths keep worst-case same-bar fills.
         commission = commission_per_side * 2.0
-        pnl_dollars = gross_pts * pv - commission
-        r_mult = pnl_dollars / (risk * pv) if risk > 0 else 0.0
+        if management == BT_MGMT_LEGACY:
+            (exit_price, exit_bar, exit_reason,
+             half1_pts, half2_pts) = _walk_trade(snaps, candles, entry_bar,
+                                                 direction, entry, stop,
+                                                 tp1, tp3, slip)
+            gross_pts = 0.5 * half1_pts + 0.5 * half2_pts
+            pnl_dollars = gross_pts * pv - commission
+            r_mult = pnl_dollars / (risk * pv) if risk > 0 else 0.0
+            disp_tp1, disp_tp3 = tp1, tp3
+        else:
+            (exit_price, exit_bar, exit_reason,
+             r_gross) = _walk_managed(candles, entry_bar, direction, entry,
+                                      stop, risk, slip, management)
+            comm_r = (commission / (risk * pv)) if risk > 0 else 0.0
+            r_mult = r_gross - comm_r
+            gross_pts = r_gross * risk
+            pnl_dollars = r_gross * risk * pv - commission
+            # Nominal target levels for the trade log / CSV (R-based, per model).
+            _rr = {"target_1r": 1.0, "target_1_5r": 1.5, "target_2r": 2.0,
+                   "partial_1r_runner_2r": 2.0, "be_after_1r": 2.0}.get(management, 1.0)
+            _first = {"partial_1r_runner_2r": 1.0,
+                      "be_after_1r": 1.0}.get(management, _rr)
+            if direction == "Long":
+                disp_tp1, disp_tp3 = entry + _first * risk, entry + _rr * risk
+            else:
+                disp_tp1, disp_tp3 = entry - _first * risk, entry - _rr * risk
         entry_ts = candles[entry_bar]["ts"]
         exit_ts = candles[exit_bar]["ts"]
         hold_min = (exit_ts - entry_ts).total_seconds() / 60.0
@@ -962,7 +1000,7 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
             "entry_ts": entry_ts.isoformat(), "exit_ts": exit_ts.isoformat(),
             "entry": round(entry, 4), "stop": round(stop, 4),
             "exit": round(exit_price, 4),
-            "tp1": round(tp1, 4), "tp3": round(tp3, 4),
+            "tp1": round(disp_tp1, 4), "tp3": round(disp_tp3, 4),
             "risk_points": round(risk, 4), "gross_points": round(gross_pts, 4),
             "pnl_dollars": round(pnl_dollars, 2), "r_multiple": round(r_mult, 4),
             "regime": s["regime"], "session": s["session"] or "Off-hours",
@@ -1210,6 +1248,9 @@ def run_backtest(candles, params):
     min_tr = params.get("min_target_r", MIN_TARGET_R)
     block_vol = params.get("block_extreme_volatility", False)
     news_bl = params.get("news_blackouts_et", NEWS_BLACKOUTS_ET)
+    management = params.get("management") or BT_DEFAULT_MGMT
+    if management not in BT_RUN_MANAGEMENTS:
+        management = BT_DEFAULT_MGMT
     want = params.get("strategies") or STRATEGY_ORDER
     # Disabled strategies never trade, even when explicitly requested.
     want = [s for s in want if s in DETECTORS and s not in DISABLED_STRATEGIES]
@@ -1236,7 +1277,8 @@ def run_backtest(candles, params):
                                    max_trades_per_session=max_tps,
                                    min_target_r=min_tr,
                                    block_extreme_volatility=block_vol,
-                                   news_blackouts_et=news_bl)
+                                   news_blackouts_et=news_bl,
+                                   management=management)
         m = _strategy_metrics(trades)
         m["key"] = key
         m["label"] = STRATEGY_DEFS[key]["label"]
@@ -1273,6 +1315,8 @@ def run_backtest(candles, params):
             "min_target_r": min_tr,
             "block_extreme_volatility": bool(block_vol),
             "news_blackouts_et": [list(w) for w in news_bl] if news_bl else [],
+            "management": management,
+            "management_label": BT_RUN_MGMT_LABELS.get(management, management),
             "disabled_strategies": sorted(DISABLED_STRATEGIES),
         },
         "strategies": {k: {kk: vv for kk, vv in per_strategy[k].items() if kk != "trades"}
