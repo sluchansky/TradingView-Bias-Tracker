@@ -9934,14 +9934,19 @@ def bt_upload():
     guard = _bt_guard()
     if guard:
         return guard
-    symbol = (request.args.get("symbol") or "").upper().strip()
-    timeframe = (request.args.get("timeframe") or "").lower().strip()
+    # symbol/timeframe accept a concrete value OR "auto"/blank to request detection.
+    symbol_raw = (request.args.get("symbol") or "auto").strip()
+    timeframe_raw = (request.args.get("timeframe") or "auto").strip()
     source_tz = request.args.get("tz") or "America/New_York"
     label = request.args.get("label") or None
     filename = request.args.get("filename") or None
-    if symbol not in bt.VALID_SYMBOLS:
+    auto_symbol = symbol_raw.lower() in ("", "auto")
+    auto_tf = timeframe_raw.lower() in ("", "auto")
+    symbol = "auto" if auto_symbol else symbol_raw.upper()
+    timeframe = "auto" if auto_tf else timeframe_raw.lower()
+    if not auto_symbol and symbol not in bt.VALID_SYMBOLS:
         return jsonify({"ok": False, "error": "symbol must be MGC or MNQ"}), 400
-    if timeframe not in bt.VALID_TIMEFRAMES:
+    if not auto_tf and timeframe not in bt.VALID_TIMEFRAMES:
         return jsonify({"ok": False, "error": "timeframe must be 1m/3m/5m/15m"}), 400
     try:
         ZoneInfo(source_tz)
@@ -9950,14 +9955,21 @@ def bt_upload():
     raw = request.get_data(cache=False, as_text=True)
     if not raw or not raw.strip():
         return jsonify({"ok": False, "error": "empty upload body"}), 400
-    parsed = bt.parse_candles_csv(raw, symbol, timeframe, source_tz=source_tz)
+    parsed = bt.parse_candles_csv(raw, symbol, timeframe, source_tz=source_tz,
+                                  filename=filename)
     if not parsed["ok"]:
         return jsonify({"ok": False, "error": parsed["error"]}), 400
-    stored = _bt_store_dataset(symbol, timeframe, source_tz, label, filename, parsed)
+    # Persist using the engine-resolved (possibly auto-detected) symbol/timeframe.
+    eff_symbol = parsed["symbol"]
+    eff_timeframe = parsed["timeframe"]
+    stored = _bt_store_dataset(eff_symbol, eff_timeframe, source_tz, label, filename, parsed)
     if not stored.get("ok"):
         return jsonify(stored), 500
     return jsonify({
         "ok": True, "dataset_id": stored["dataset_id"], "reused": stored.get("reused", False),
+        "symbol": eff_symbol, "timeframe": eff_timeframe,
+        "detected_symbol": parsed["detected_symbol"],
+        "detected_timeframe": parsed["detected_timeframe"],
         "row_count": parsed["row_count"], "skipped": parsed["skipped"],
         "dup_removed": parsed["dup_removed"], "gap_count": parsed["gap_count"],
         "inferred_timeframe": parsed["inferred_timeframe"],
@@ -12057,15 +12069,17 @@ def dashboard():
 
   <div class="mod">
     <div class="mod-h">📥 Upload Candles (CSV)</div>
-    <div class="bt-mini" style="margin-bottom:8px">Columns: Date, Time, Open, High, Low, Close, Volume. Times read in the source timezone below (Eastern by default).</div>
+    <div class="bt-mini" style="margin-bottom:8px">Upload a TradingView candle CSV (MGC or MNQ). Columns: Date, Time, Open, High, Low, Close, Volume. Symbol &amp; timeframe are auto-detected by default. Works with the market closed — it replays your historical candles, not live webhooks.</div>
     <div class="bt-grid">
-      <div class="bt-f"><label>Symbol</label><select id="up-sym"><option>MGC</option><option>MNQ</option></select></div>
-      <div class="bt-f"><label>Timeframe</label><select id="up-tf"><option>1m</option><option>3m</option><option selected>5m</option><option>15m</option></select></div>
+      <div class="bt-f"><label>Symbol</label><select id="up-sym"><option value="auto" selected>Auto-detect</option><option value="MGC">MGC</option><option value="MNQ">MNQ</option></select></div>
+      <div class="bt-f"><label>Timeframe</label><select id="up-tf"><option value="auto" selected>Auto-detect</option><option value="1m">1m</option><option value="3m">3m</option><option value="5m">5m</option><option value="15m">15m</option></select></div>
       <div class="bt-f"><label>Source timezone</label><select id="up-tz"><option value="America/New_York" selected>Eastern (ET)</option><option value="America/Chicago">Central (CT)</option><option value="UTC">UTC</option></select></div>
       <div class="bt-f"><label>Label (optional)</label><input id="up-label" type="text" placeholder="e.g. MGC 5m 2025"></div>
     </div>
     <div class="bt-f" style="margin-top:10px"><label>CSV file</label><input id="up-file" type="file" accept=".csv,text/csv"></div>
-    <button class="bt-btn" id="up-btn" onclick="btUpload()">Upload &amp; Validate</button>
+    <button class="bt-btn" id="upr-btn" onclick="btUploadAndRun()">📤 Upload &amp; Run Backtest</button>
+    <button class="bt-btn alt" id="up-btn" onclick="btUpload()">Upload only</button>
+    <div class="bt-mini" style="margin-top:6px">“Upload &amp; Run” stores the file and immediately runs the backtest using the Run settings below.</div>
     <div class="bt-msg" id="up-msg"></div>
   </div>
 
@@ -13414,35 +13428,54 @@ function setView(v){
   if(!live && btSelDataset===null) btLoadDatasets();
 }
 
-async function btUpload(){
+async function btDoUpload(){
+  // Uploads the chosen CSV, refreshes + selects the new dataset, and returns its
+  // id (or null on failure — the message is already shown to the user).
   const f = document.getElementById('up-file').files[0];
   const msg = document.getElementById('up-msg');
-  if(!f){ msg.className='bt-msg err'; msg.textContent='Choose a CSV file first.'; return; }
-  const btn = document.getElementById('up-btn'); btn.disabled=true; btn.textContent='Uploading…';
+  if(!f){ msg.className='bt-msg err'; msg.textContent='Choose a CSV file first.'; return null; }
   msg.className='bt-msg'; msg.textContent='Reading file…';
+  const text = await f.text();
+  const q = new URLSearchParams({
+    symbol: document.getElementById('up-sym').value,
+    timeframe: document.getElementById('up-tf').value,
+    tz: document.getElementById('up-tz').value,
+    label: document.getElementById('up-label').value || '',
+    filename: f.name || ''
+  });
+  const r = await fetch(BASE+'/backtest/upload?'+q.toString(),
+    {method:'POST', headers:{'Content-Type':'text/csv'}, body:text, cache:'no-store'});
+  const d = await r.json();
+  if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Upload failed'); return null; }
+  let s = (d.reused?'Reused existing dataset':'Stored dataset')+' #'+d.dataset_id+
+          ' · '+btEsc(d.symbol||'?')+' '+btEsc(d.timeframe||'')+' · '+d.row_count+' rows';
+  const det=[]; if(d.detected_symbol) det.push('symbol'); if(d.detected_timeframe) det.push('timeframe');
+  if(det.length) s+=' · auto-detected '+det.join(' & ');
+  if(d.dup_removed) s+=' · '+d.dup_removed+' dupes removed';
+  if(d.skipped) s+=' · '+d.skipped+' skipped';
+  if(d.gap_count) s+=' · '+d.gap_count+' gaps';
+  if(d.warnings && d.warnings.length) s+='\n⚠ '+d.warnings.join('\n⚠ ');
+  msg.className='bt-msg ok'; msg.textContent='✓ '+s;
+  btSelDataset = d.dataset_id;
+  await btLoadDatasets();
+  return d.dataset_id;
+}
+async function btUpload(){
+  const btn=document.getElementById('up-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Uploading…';
+  try{ await btDoUpload(); }
+  catch(e){ const m=document.getElementById('up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
+}
+async function btUploadAndRun(){
+  const btn=document.getElementById('upr-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Uploading…';
   try{
-    const text = await f.text();
-    const q = new URLSearchParams({
-      symbol: document.getElementById('up-sym').value,
-      timeframe: document.getElementById('up-tf').value,
-      tz: document.getElementById('up-tz').value,
-      label: document.getElementById('up-label').value || '',
-      filename: f.name || ''
-    });
-    const r = await fetch(BASE+'/backtest/upload?'+q.toString(),
-      {method:'POST', headers:{'Content-Type':'text/csv'}, body:text, cache:'no-store'});
-    const d = await r.json();
-    if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Upload failed'); return; }
-    let s = (d.reused?'Reused existing dataset':'Stored dataset')+' #'+d.dataset_id+' · '+d.row_count+' rows';
-    if(d.dup_removed) s+=' · '+d.dup_removed+' dupes removed';
-    if(d.skipped) s+=' · '+d.skipped+' skipped';
-    if(d.gap_count) s+=' · '+d.gap_count+' gaps';
-    if(d.inferred_timeframe) s+=' · inferred '+d.inferred_timeframe;
-    if(d.warnings && d.warnings.length) s+='\n⚠ '+d.warnings.join('\n⚠ ');
-    msg.className='bt-msg ok'; msg.textContent='✓ '+s;
-    btLoadDatasets();
-  }catch(e){ msg.className='bt-msg err'; msg.textContent='✗ '+e; }
-  finally{ btn.disabled=false; btn.textContent='Upload & Validate'; }
+    const id = await btDoUpload();
+    if(id===null) return;            // failure already surfaced
+    btn.textContent='Running…';
+    await btRun();                   // uses btSelDataset + the Run settings below
+    const sec=document.getElementById('rn-msg'); if(sec) sec.scrollIntoView({behavior:'smooth',block:'center'});
+  }catch(e){ const m=document.getElementById('up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
 }
 
 async function btLoadDatasets(){

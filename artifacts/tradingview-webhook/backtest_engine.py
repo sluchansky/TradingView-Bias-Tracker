@@ -25,6 +25,7 @@ bull confirm = close>open and close>close[1]).
 
 import csv
 import io
+import re
 import math
 import hashlib
 import statistics
@@ -76,6 +77,16 @@ CVD_SLOPE_BARS         = 3      # bars used to read the CVD slope direction
 TIMEFRAME_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900}
 VALID_SYMBOLS = ("MGC", "MNQ")
 VALID_TIMEFRAMES = ("1m", "3m", "5m", "15m")
+# Filename ticker tokens → backtest instrument. The full-size underlyings (GC/NQ)
+# map to their micros (MGC/MNQ): the app already treats them as the same scale
+# (VWAP auto-fetch sources GC=F/NQ=F), and traders often export the deeper-volume
+# underlying as a proxy for the thin micro feed.
+SYMBOL_ALIASES = {"MGC": "MGC", "GC": "MGC", "MNQ": "MNQ", "NQ": "MNQ"}
+# Longest-first alternation + letter boundaries so "MGC1!" resolves to MGC (never
+# also "GC"), "GC1!" resolves to MGC, and a 2-letter token never matches inside an
+# unrelated word (e.g. "BIGCAP" / "INQUIRY").
+_SYMBOL_TOKEN_RE = re.compile(
+    r"(?<![A-Z])(" + "|".join(sorted(SYMBOL_ALIASES, key=len, reverse=True)) + r")(?![A-Z])")
 
 STRATEGY_DEFS = {
     "OPENING_DRIVE":            {"label": "Opening Drive",            "max_grade": "A+",
@@ -171,7 +182,30 @@ def _to_float(v):
         return None
 
 
-def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York"):
+def _detect_symbol(filename, med_close):
+    """Best-effort instrument detection for CSV uploads. Returns (symbol, reason)
+    on success or (None, why_failed). Filename hints win — TradingView exports
+    embed the ticker (e.g. MGC1!, MNQ1!, or the full-size GC1!/NQ1! proxy) — and
+    the price scale is a fallback used only when it points to exactly one instrument
+    (the configured ranges overlap)."""
+    fn = str(filename or "").upper()
+    fn_hits = sorted({SYMBOL_ALIASES[t] for t in _SYMBOL_TOKEN_RE.findall(fn)})
+    if len(fn_hits) == 1:
+        return fn_hits[0], f"filename '{filename}'"
+    if len(fn_hits) > 1:
+        return None, f"filename names more than one instrument ({', '.join(fn_hits)})"
+    rng_hits = [s for s, spec in BT_SPECS.items()
+                if spec["price_lo"] <= med_close <= spec["price_hi"]]
+    if len(rng_hits) == 1:
+        return rng_hits[0], f"price scale (~{med_close:.0f})"
+    if len(rng_hits) > 1:
+        return None, (f"price ~{med_close:.0f} fits both MGC and MNQ — "
+                      f"name the file with the ticker or pick it manually")
+    return None, f"median price {med_close:.0f} matches no known instrument scale"
+
+
+def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York",
+                      filename=None):
     """Parse a TradingView/broker OHLCV CSV into a sorted, deduped candle list.
 
     Accepts the documented Date,Time,Open,High,Low,Close,Volume layout plus
@@ -184,14 +218,27 @@ def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York")
     out = {"ok": False, "error": None, "candles": [], "warnings": [],
            "row_count": 0, "skipped": 0, "dup_removed": 0,
            "inferred_timeframe": None, "gap_count": 0,
-           "first_ts": None, "last_ts": None, "sha256": None}
+           "first_ts": None, "last_ts": None, "sha256": None,
+           "symbol": None, "timeframe": None,
+           "detected_symbol": False, "detected_timeframe": False}
 
-    if symbol not in VALID_SYMBOLS:
-        out["error"] = f"Unsupported symbol '{symbol}' (expected MGC or MNQ)."
-        return out
-    if timeframe not in VALID_TIMEFRAMES:
-        out["error"] = f"Unsupported timeframe '{timeframe}' (expected 1m/3m/5m/15m)."
-        return out
+    # symbol/timeframe may be a concrete value OR "auto"/None to request detection.
+    auto_symbol = symbol is None or str(symbol).strip().lower() in ("", "auto")
+    auto_tf = timeframe is None or str(timeframe).strip().lower() in ("", "auto")
+    if auto_symbol:
+        symbol = None
+    else:
+        symbol = str(symbol).strip().upper()
+        if symbol not in VALID_SYMBOLS:
+            out["error"] = f"Unsupported symbol '{symbol}' (expected MGC or MNQ)."
+            return out
+    if auto_tf:
+        timeframe = None
+    else:
+        timeframe = str(timeframe).strip().lower()
+        if timeframe not in VALID_TIMEFRAMES:
+            out["error"] = f"Unsupported timeframe '{timeframe}' (expected 1m/3m/5m/15m)."
+            return out
 
     if isinstance(raw_text, bytes):
         try:
@@ -297,14 +344,22 @@ def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York")
     out["dup_removed"] = (len(data_rows) - skipped) - len(candles)
     out["skipped"] = skipped
 
-    # ── Price-scale sanity (catches an MNQ file uploaded as MGC, etc.) ──
-    spec = BT_SPECS[symbol]
+    # ── Instrument resolution + price-scale sanity ──
     med_close = statistics.median(c["close"] for c in candles)
+    if auto_symbol:
+        symbol, why = _detect_symbol(filename, med_close)
+        if symbol is None:
+            out["error"] = (f"Could not auto-detect the instrument: {why}. "
+                            f"Please choose MGC or MNQ manually.")
+            return out
+        out["detected_symbol"] = True
+    spec = BT_SPECS[symbol]
     if not (spec["price_lo"] <= med_close <= spec["price_hi"]):
         out["error"] = (f"Median price {med_close:.1f} is outside the plausible {symbol} "
                         f"range ({spec['price_lo']:.0f}–{spec['price_hi']:.0f}). "
                         f"Is this the right instrument/scale?")
         return out
+    out["symbol"] = symbol
 
     # ── Timeframe inference from the median delta ──
     deltas = [(candles[i]["ts"] - candles[i - 1]["ts"]).total_seconds()
@@ -313,17 +368,26 @@ def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York")
         med_delta = statistics.median(deltas)
         inferred = min(TIMEFRAME_SECONDS, key=lambda k: abs(TIMEFRAME_SECONDS[k] - med_delta))
         out["inferred_timeframe"] = inferred
-        if inferred != timeframe:
+        if auto_tf:
+            timeframe = inferred
+            out["detected_timeframe"] = True
+        elif inferred != timeframe:
             out["warnings"].append(
                 f"Declared timeframe {timeframe} but the data looks like {inferred} "
                 f"(median spacing {med_delta:.0f}s). Using declared {timeframe}.")
         expected = TIMEFRAME_SECONDS[timeframe]
         out["gap_count"] = sum(1 for d in deltas if d > expected * 2.0)
+    elif auto_tf:
+        # Single candle — cannot infer spacing; fall back to a safe default.
+        timeframe = "5m"
+        out["inferred_timeframe"] = timeframe
+        out["detected_timeframe"] = True
 
     out["candles"] = candles
     out["row_count"] = len(candles)
     out["first_ts"] = candles[0]["ts"]
     out["last_ts"] = candles[-1]["ts"]
+    out["timeframe"] = timeframe
     out["ok"] = True
     return out
 
@@ -1130,6 +1194,35 @@ def _self_test():
     bad = parse_candles_csv("\n".join(rows), "MNQ", "5m")
     assert not bad["ok"] and "range" in (bad["error"] or ""), bad
     print(f"Scale-mismatch rejected: {bad['error'][:60]}...")
+
+    # 2b) Auto-detect symbol (from filename + from price) and timeframe
+    csv_text = "\n".join(rows)
+    a_fn = parse_candles_csv(csv_text, "auto", "auto", filename="COMEX_MGC1!, 5.csv")
+    assert a_fn["ok"] and a_fn["symbol"] == "MGC" and a_fn["timeframe"] == "5m", a_fn
+    assert a_fn["detected_symbol"] and a_fn["detected_timeframe"], a_fn
+    a_px = parse_candles_csv(csv_text, "auto", "auto")  # no filename → price scale (~2387 → MGC)
+    assert a_px["ok"] and a_px["symbol"] == "MGC", a_px
+    mnq_rows = ["Date,Time,Open,High,Low,Close,Volume"]
+    for c in _synthetic_candles(120, "MNQ"):
+        et = c["ts"].astimezone(ET_TZ)
+        mnq_rows.append(f"{et.strftime('%Y-%m-%d')},{et.strftime('%H:%M:%S')},"
+                        f"{c['open']},{c['high']},{c['low']},{c['close']},{int(c['volume'])}")
+    a_mnq = parse_candles_csv("\n".join(mnq_rows), None, None, filename="CME_MNQ1!_15.csv")
+    assert a_mnq["ok"] and a_mnq["symbol"] == "MNQ", a_mnq
+    # full-size GC/NQ exports are aliases for the micros (one-click still detects)
+    a_gc = parse_candles_csv(csv_text, "auto", "auto", filename="COMEX_GC1!, 5.csv")
+    assert a_gc["ok"] and a_gc["symbol"] == "MGC", a_gc
+    nq_sym, _nqw = _detect_symbol("CME_NQ1!.csv", 18000.0)
+    assert nq_sym == "MNQ", (nq_sym, _nqw)
+    # boundary guard: GC/NQ inside an unrelated word must NOT be read as a ticker
+    bg_sym, bg_why = _detect_symbol("BIGCAP_INQUIRY.csv", 2387.0)
+    assert bg_sym == "MGC" and "price scale" in bg_why, (bg_sym, bg_why)
+    # filename naming a contradicting instrument must fail the price-scale sanity
+    contra = parse_candles_csv(csv_text, "auto", "auto", filename="some_MNQ_export.csv")
+    assert not contra["ok"] and "range" in (contra["error"] or ""), contra
+    print(f"Auto-detect OK: filename→{a_fn['symbol']}/{a_fn['timeframe']}, "
+          f"price→{a_px['symbol']}, mnq→{a_mnq['symbol']}, GC→{a_gc['symbol']}/NQ→{nq_sym}; "
+          f"boundary-guarded + contradiction rejected ✓")
 
     # 3) Indicators causal + no NaNs
     big = _synthetic_candles(900, "MGC")

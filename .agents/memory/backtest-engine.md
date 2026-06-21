@@ -52,3 +52,22 @@ Signal-agreement panel must report "unavailable" when no live signals were captu
 (no forward-capture log yet) rather than fabricating agreement numbers. Engine is an
 *approximation* of the TV indicators (BOS/CHOCH/zones reconstructed via pivot SMC);
 confirmation candle is per-bar, exact only for 5m datasets.
+
+## CSV auto-detect (symbol/timeframe) + GC/NQ aliases
+`parse_candles_csv` accepts symbol/timeframe = "auto"/None/"" and the upload route
+stores the engine-RESOLVED value (returns `detected_symbol`/`detected_timeframe`
+flags). `_detect_symbol(filename, med_close)`: **filename is authoritative**, price
+scale is fallback ONLY when exactly one instrument's range matches. The price ranges
+deliberately OVERLAP (MGC 400–12000, MNQ 3000–60000) so price alone is often
+ambiguous — hence filename-first.
+**Why aliases:** full-size `GC`/`NQ` tokens map to the micros `MGC`/`MNQ`
+(SYMBOL_ALIASES) — the app already treats them as the same scale (VWAP auto-fetch
+sources GC=F/NQ=F) and traders export the deeper-volume underlying as a proxy. Match
+via `_SYMBOL_TOKEN_RE` (longest-first alternation + `(?<![A-Z])...(?![A-Z])` letter
+boundaries) so `MGC1!`→MGC (never also GC), `GC1!`→MGC, and a 2-letter token never
+fires inside an unrelated word ("BIGCAP"/"INQUIRY"). A filename naming two distinct
+instruments, or a filename-vs-price-scale contradiction, is REJECTED with a clear
+400 (the range sanity check is the fail-safe) — never silently mis-classified.
+**How to apply:** concrete (non-auto) symbol/timeframe keeps prior strict behavior;
+don't loosen the contradiction rejection into a guess. New aliases go in
+SYMBOL_ALIASES (regex rebuilds from its keys).
