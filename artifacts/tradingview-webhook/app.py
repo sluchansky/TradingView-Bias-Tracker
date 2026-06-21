@@ -13454,7 +13454,7 @@ async function btDoUpload(){
   if(d.dup_removed) s+=' · '+d.dup_removed+' dupes removed';
   if(d.skipped) s+=' · '+d.skipped+' skipped';
   if(d.gap_count) s+=' · '+d.gap_count+' gaps';
-  if(d.warnings && d.warnings.length) s+='\n⚠ '+d.warnings.join('\n⚠ ');
+  if(d.warnings && d.warnings.length) s+='\\n⚠ '+d.warnings.join('\\n⚠ ');
   msg.className='bt-msg ok'; msg.textContent='✓ '+s;
   btSelDataset = d.dataset_id;
   await btLoadDatasets();
@@ -13593,13 +13593,13 @@ function btRenderResults(){
     const mt=sa.match||{};
     ag.className='bt-msg';
     ag.textContent='Overall agreement: '+(sa.overall===null?'—':sa.overall+'%')+
-      '\nBOS '+btP(mt.bos)+' · CHOCH '+btP(mt.choch)+' · Zone '+btP(mt.zone)+' · Sweep '+btP(mt.sweep)+
-      ((sa.diagnostics&&sa.diagnostics.length)? '\n⚠ '+sa.diagnostics.join(' · '):'');
+      '\\nBOS '+btP(mt.bos)+' · CHOCH '+btP(mt.choch)+' · Zone '+btP(mt.zone)+' · Sweep '+btP(mt.sweep)+
+      ((sa.diagnostics&&sa.diagnostics.length)? '\\n⚠ '+sa.diagnostics.join(' · '):'');
   }else{
     const rc=sa.reconstructed||{};
     ag.className='bt-msg';
     ag.textContent=(sa.message||'No captured live signals for this period.')+
-      '\nReconstructed structure events — BOS '+(rc.bos||0)+' · CHOCH '+(rc.choch||0)+' · Zone '+(rc.zone||0)+' · Sweep '+(rc.sweep||0);
+      '\\nReconstructed structure events — BOS '+(rc.bos||0)+' · CHOCH '+(rc.choch||0)+' · Zone '+(rc.zone||0)+' · Sweep '+(rc.sweep||0);
   }
 }
 
