@@ -10019,6 +10019,17 @@ def bt_run():
         strategies = [strategies]
     start_label = body.get("start") or None
     end_label = body.get("end") or None
+    # Research no-trade filters (clamped to sane bounds; defaults from the engine).
+    try:
+        max_tps = int(body.get("max_trades_per_session", bt.MAX_TRADES_PER_SESSION))
+    except (TypeError, ValueError):
+        max_tps = bt.MAX_TRADES_PER_SESSION
+    max_tps = max(0, min(max_tps, 100))
+    try:
+        min_tr = float(body.get("min_target_r", bt.MIN_TARGET_R))
+    except (TypeError, ValueError):
+        min_tr = bt.MIN_TARGET_R
+    min_tr = max(0.0, min(min_tr, 10.0))
     params = {
         "symbol": ds["symbol"], "timeframe": ds["timeframe"], "mode": mode,
         "session": session, "strategies": strategies,
@@ -10027,6 +10038,8 @@ def bt_run():
         "start_label": start_label, "end_label": end_label,
         "slippage_ticks": float(body.get("slippage_ticks", 1.0) or 1.0),
         "commission_per_side": float(body.get("commission_per_side", 0.62) or 0.62),
+        "max_trades_per_session": max_tps,
+        "min_target_r": min_tr,
     }
     run_id = _bt_create_run({**params,
                              "start_ts": params["start_ts"].isoformat() if params["start_ts"] else None,
@@ -12112,9 +12125,15 @@ def dashboard():
     <div class="mod">
       <div class="mod-h">🏆 Strategy Ranking <span class="bt-mini" id="rk-cap"></span></div>
       <div class="bt-scroll"><table class="bt-tbl" id="rk-tbl">
-        <thead><tr><th>#</th><th>Strategy</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net $</th><th>Net R</th><th>Avg R</th><th>Max DD (R)</th><th>Best hour</th><th>Best regime</th><th>Avg hold</th></tr></thead>
+        <thead><tr><th>#</th><th>Strategy</th><th>Tradable</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net $</th><th>Net R</th><th>Avg R</th><th>Avg Win R</th><th>Avg Loss R</th><th>Max DD (R)</th><th>Best hour</th><th>Best regime</th><th>Avg hold</th></tr></thead>
         <tbody id="rk-body"></tbody>
       </table></div>
+      <div class="bt-mini" id="rk-filters" style="margin-top:6px"></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🔍 Why Losing Trades Failed</div>
+      <div class="bt-mini" id="lr-body">No results yet.</div>
     </div>
 
     <div class="mod">
@@ -13560,21 +13579,44 @@ function btRenderResults(){
   const ranked=(res.ranking||[]).map(k=>res.strategies[k]).filter(Boolean);
   rb.innerHTML = ranked.length ? ranked.map((m,idx)=>{
     const npos=(m.net_r>=0), dpos=(m.net_pnl>=0);
+    const tradable=(m.tradable===true);
+    const tradeCell = m.total_trades>0
+      ? '<td class="'+(tradable?'bt-pos':'bt-neg')+'">'+(tradable?'✓ Yes':'✗ No')+'</td>'
+      : '<td class="bt-mini">—</td>';
     return '<tr>'+
       '<td>'+(idx+1)+'</td>'+
       '<td>'+btEsc(m.label||m.key)+'</td>'+
+      tradeCell+
       '<td>'+m.total_trades+'</td>'+
       '<td>'+(m.win_rate===null?'—':m.win_rate+'%')+'</td>'+
       '<td>'+(m.profit_factor===null?'—':m.profit_factor)+'</td>'+
       '<td class="'+(dpos?'bt-pos':'bt-neg')+'">'+(dpos?'+':'−')+'$'+btNum(Math.abs(m.net_pnl),0)+'</td>'+
       '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(m.net_r,2)+'R</td>'+
       '<td>'+btNum(m.avg_r,2)+'</td>'+
+      '<td class="bt-pos">'+(m.avg_winner_r==null?'—':'+'+btNum(m.avg_winner_r,2))+'</td>'+
+      '<td class="bt-neg">'+(m.avg_loser_r==null?'—':btNum(m.avg_loser_r,2))+'</td>'+
       '<td>'+btNum(m.max_drawdown_r,2)+'</td>'+
       '<td>'+btEsc(m.best_hour_label||'—')+'</td>'+
       '<td>'+btEsc(m.best_regime||'—')+'</td>'+
       '<td>'+(m.avg_hold_minutes===null?'—':m.avg_hold_minutes+'m')+'</td>'+
       '</tr>';
-  }).join('') : '<tr><td colspan="12" class="bt-mini">No trades generated for these filters.</td></tr>';
+  }).join('') : '<tr><td colspan="15" class="bt-mini">No trades generated for these filters.</td></tr>';
+  // Active filters caption
+  const fl=res.filters||{};
+  const fbits=[];
+  if(fl.disabled_strategies&&fl.disabled_strategies.length) fbits.push('Disabled: '+fl.disabled_strategies.map(s=>BT_STRAT_LABELS[s]||s).join(', '));
+  if(fl.max_trades_per_session) fbits.push('Max '+fl.max_trades_per_session+' trades/session');
+  if(fl.min_target_r) fbits.push('Min target '+fl.min_target_r+'R');
+  if(fl.block_extreme_volatility) fbits.push('Extreme-volatility blocked');
+  if(fl.news_blackouts_et&&fl.news_blackouts_et.length) fbits.push(fl.news_blackouts_et.length+' news blackout(s)');
+  document.getElementById('rk-filters').textContent = fbits.length ? ('Filters — '+fbits.join(' · ')) : '';
+  // Loss-reason breakdown per strategy
+  const lr=document.getElementById('lr-body');
+  const lrParts=ranked.filter(m=>m.loss_reasons&&m.loss_reasons.length).map(m=>{
+    const items=m.loss_reasons.map(r=>btEsc(r.reason)+' ('+r.count+')').join(', ');
+    return '<div style="margin-bottom:4px"><b>'+btEsc(m.label||m.key)+'</b>: '+items+'</div>';
+  });
+  lr.innerHTML = lrParts.length ? lrParts.join('') : 'No losing trades in these results.';
   // Equity series selector
   const eqSel=document.getElementById('eq-sel');
   let opts='<option value="__combined__">Combined (all selected)</option>';

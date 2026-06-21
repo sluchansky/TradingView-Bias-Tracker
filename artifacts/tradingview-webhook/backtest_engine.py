@@ -101,7 +101,25 @@ STRATEGY_DEFS = {
                                  "regimes": {"VOLATILE", "BALANCED"}},
 }
 STRATEGY_ORDER = ["OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
-                  "RANGE_EXPANSION_BREAKOUT", "EXHAUSTION_FADE"]
+                  "RANGE_EXPANSION_BREAKOUT"]
+
+# Strategies that must never trade in the backtest right now. EXHAUSTION_FADE is a
+# counter-trend fade that audited as the weakest performer — disabled by request.
+# The detector + STRATEGY_DEFS entry are kept so it can be re-enabled by deleting
+# it from this set (no other change needed).
+DISABLED_STRATEGIES = {"EXHAUSTION_FADE"}
+
+# ── Research no-trade filters (applied in simulate_strategy, all causal) ──────
+# Default max trades per ET session-day bucket (per strategy). None/0 disables.
+MAX_TRADES_PER_SESSION = 3
+# Minimum reward:risk required on the FIRST (expectancy-critical) target. The 50%
+# partial exits at TP1 and the runner's stop jumps to breakeven, so TP1 is the R
+# that actually drives expectancy. None/0 disables.
+MIN_TARGET_R = 1.5
+# High-impact-news blackout windows in fractional ET hours [lo, hi). There is no
+# economic-calendar feed available, so this is a configurable time-of-day blackout
+# around the 08:30 ET macro release cluster rather than a true news filter.
+NEWS_BLACKOUTS_ET = ((8 + 28 / 60.0, 8 + 32 / 60.0),)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -798,11 +816,22 @@ def bt_stop_plan(direction, entry, demand_zone, supply_zone, spec, atr, mode, re
 # ════════════════════════════════════════════════════════════════════════════
 def simulate_strategy(snaps, candles, strat_key, spec, mode,
                       slippage_ticks=1.0, commission_per_side=0.62,
-                      session_filter=None):
+                      session_filter=None,
+                      max_trades_per_session=MAX_TRADES_PER_SESSION,
+                      min_target_r=MIN_TARGET_R,
+                      block_extreme_volatility=True,
+                      news_blackouts_et=NEWS_BLACKOUTS_ET):
     """Replay one strategy over the snapshots. Entry on the bar AFTER a
     close-confirmed signal (next-bar open ± slippage). Management: 50% off at TP1
     + stop→breakeven, runner to TP3; worst-case same-bar fill (stop/BE first).
-    Returns a list of closed-trade dicts."""
+    Returns a list of closed-trade dicts.
+
+    Research no-trade filters (all CAUSAL — evaluated on the signal bar):
+      • max_trades_per_session: cap entries per ET session-day bucket (None/0 off).
+      • min_target_r: reject if the first target's RR (tp1/risk) is below this.
+      • block_extreme_volatility: reject when atr_ratio >= the mode's vol_high_block.
+      • news_blackouts_et: reject when the signal bar's ET hour is in a blackout.
+    """
     trades = []
     n = len(snaps)
     tick = spec["tick_size"]
@@ -810,6 +839,7 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
     slip = slippage_ticks * tick
     mk = BT_MODES.get(mode, BT_MODES["SCALP"])
     detector = DETECTORS[strat_key]
+    session_counts = {}
     i = 0
     while i < n - 1:
         s = snaps[i]
@@ -829,6 +859,26 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
             i += 1
             continue
 
+        # ── No-trade filters (causal: state as of the signal bar's close) ──
+        et_sig = s["et"]
+        h_et = et_sig.hour + et_sig.minute / 60.0
+        # High-impact-news blackout (configurable ET windows; no live econ feed).
+        if news_blackouts_et and any(lo <= h_et < hi for lo, hi in news_blackouts_et):
+            i += 1
+            continue
+        # Extreme volatility: skip when ATR ratio is at/above the block threshold.
+        if (block_extreme_volatility and s["atr_ratio"] is not None
+                and s["atr_ratio"] >= mk["vol_high_block"]):
+            i += 1
+            continue
+        # Max trades per ET session-day bucket (per strategy).
+        sess_key = (s["session"] or "Off-hours",
+                    _session_for_et(et_sig)[1] or et_sig.date().isoformat())
+        if (max_trades_per_session
+                and session_counts.get(sess_key, 0) >= max_trades_per_session):
+            i += 1
+            continue
+
         entry_bar = i + 1
         raw_entry = candles[entry_bar]["open"]
         entry = raw_entry + slip if direction == "Long" else raw_entry - slip
@@ -841,6 +891,15 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
         stop = plan["stop"]
         risk = plan["risk_points"]
         tp1d, tp2d, tp3d = spec["tp1"], spec["tp2"], spec["tp3"]
+        # Reject trades where the stop is wider than the first target (stop > target).
+        if risk > tp1d:
+            i += 1
+            continue
+        # Minimum reward:risk on the first (expectancy-critical) target.
+        if min_target_r and (tp1d / risk) < min_target_r:
+            i += 1
+            continue
+        # SWING legacy runner-RR gate (unchanged).
         if mk["enforce_min_rr"] and (tp2d / risk) < 2.0:
             i += 1
             continue
@@ -873,6 +932,7 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
             "entry_reason": entry_reason, "exit_reason": exit_reason,
             "hold_minutes": round(hold_min, 1),
         })
+        session_counts[sess_key] = session_counts.get(sess_key, 0) + 1
         # Resume scanning AFTER the trade closes (one open position per strategy).
         i = max(exit_bar, entry_bar) + 1
     return trades
@@ -970,6 +1030,8 @@ def _strategy_metrics(trades):
     if not trades:
         return {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": None,
                 "profit_factor": None, "net_pnl": 0.0, "net_r": 0.0, "avg_r": None,
+                "avg_winner_r": None, "avg_loser_r": None, "tradable": False,
+                "loss_reasons": [],
                 "max_drawdown_r": 0.0, "best_hour": None, "best_regime": None,
                 "avg_hold_minutes": None, "equity_curve": []}
     rs = [t["r_multiple"] for t in trades]
@@ -978,6 +1040,21 @@ def _strategy_metrics(trades):
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     pf = (gross_profit / gross_loss) if gross_loss > 0 else (None if gross_profit == 0 else float("inf"))
+    avg_r_val = sum(rs) / len(rs)
+    avg_winner_r = (sum(wins) / len(wins)) if wins else None
+    avg_loser_r = (sum(losses) / len(losses)) if losses else None
+    # "Tradable" gate (research): profit factor must be a real number > 1 (or all
+    # winners → ∞) AND average R must be positive. Compare the RAW pf, never the
+    # display string.
+    pf_ok = (pf == float("inf")) or (isinstance(pf, (int, float)) and pf > 1.0)
+    tradable = bool(avg_r_val > 0 and pf_ok)
+    # Why each losing trade failed — count exit reasons across losing/scratch trades.
+    loss_reason_counts = {}
+    for t in trades:
+        if t["r_multiple"] <= 0:
+            loss_reason_counts[t["exit_reason"]] = loss_reason_counts.get(t["exit_reason"], 0) + 1
+    loss_reasons = [{"reason": k, "count": v} for k, v in
+                    sorted(loss_reason_counts.items(), key=lambda kv: -kv[1])]
     # Best hour / regime by net R.
     by_hour, by_regime = {}, {}
     for t in trades:
@@ -1000,7 +1077,11 @@ def _strategy_metrics(trades):
                           ("∞" if pf == float("inf") else None)),
         "net_pnl": round(sum(t["pnl_dollars"] for t in trades), 2),
         "net_r": round(sum(rs), 2),
-        "avg_r": round(sum(rs) / len(rs), 3),
+        "avg_r": round(avg_r_val, 3),
+        "avg_winner_r": (round(avg_winner_r, 3) if avg_winner_r is not None else None),
+        "avg_loser_r": (round(avg_loser_r, 3) if avg_loser_r is not None else None),
+        "tradable": tradable,
+        "loss_reasons": loss_reasons,
         "max_drawdown_r": round(_max_drawdown_r([t["r_multiple"] for t in ordered]), 2),
         "best_hour": best_hour,
         "best_hour_label": (f"{best_hour:02d}:00–{(best_hour + 1) % 24:02d}:00 ET"
@@ -1085,8 +1166,14 @@ def run_backtest(candles, params):
     session_filter = params.get("session") or None
     slippage = float(params.get("slippage_ticks", 1.0))
     commission = float(params.get("commission_per_side", 0.62))
+    # Research no-trade filters (defaults on; None/0 disables the numeric ones).
+    max_tps = params.get("max_trades_per_session", MAX_TRADES_PER_SESSION)
+    min_tr = params.get("min_target_r", MIN_TARGET_R)
+    block_vol = params.get("block_extreme_volatility", True)
+    news_bl = params.get("news_blackouts_et", NEWS_BLACKOUTS_ET)
     want = params.get("strategies") or STRATEGY_ORDER
-    want = [s for s in want if s in DETECTORS]
+    # Disabled strategies never trade, even when explicitly requested.
+    want = [s for s in want if s in DETECTORS and s not in DISABLED_STRATEGIES]
 
     # Date-range filter (inclusive), applied BEFORE indicator computation so the
     # session-anchored VWAP/ATR warm up within the selected window.
@@ -1106,7 +1193,11 @@ def run_backtest(candles, params):
         trades = simulate_strategy(snaps, candles, key, spec, mode,
                                    slippage_ticks=slippage,
                                    commission_per_side=commission,
-                                   session_filter=session_filter)
+                                   session_filter=session_filter,
+                                   max_trades_per_session=max_tps,
+                                   min_target_r=min_tr,
+                                   block_extreme_volatility=block_vol,
+                                   news_blackouts_et=news_bl)
         m = _strategy_metrics(trades)
         m["key"] = key
         m["label"] = STRATEGY_DEFS[key]["label"]
@@ -1138,6 +1229,13 @@ def run_backtest(candles, params):
         "first_ts": candles[0]["ts"].isoformat(),
         "last_ts": candles[-1]["ts"].isoformat(),
         "slippage_ticks": slippage, "commission_per_side": commission,
+        "filters": {
+            "max_trades_per_session": max_tps,
+            "min_target_r": min_tr,
+            "block_extreme_volatility": bool(block_vol),
+            "news_blackouts_et": [list(w) for w in news_bl] if news_bl else [],
+            "disabled_strategies": sorted(DISABLED_STRATEGIES),
+        },
         "strategies": {k: {kk: vv for kk, vv in per_strategy[k].items() if kk != "trades"}
                        for k in want},
         "ranking": ranking_keys,

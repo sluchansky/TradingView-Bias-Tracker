@@ -53,6 +53,26 @@ Signal-agreement panel must report "unavailable" when no live signals were captu
 *approximation* of the TV indicators (BOS/CHOCH/zones reconstructed via pivot SMC);
 confirmation candle is per-bar, exact only for 5m datasets.
 
+## Research no-trade filters & tradable metric (config-only, never money path)
+The engine has research-only knobs: `DISABLED_STRATEGIES` (Exhaustion Fade is
+disabled and excluded even when explicitly requested in `strategies=[...]`),
+`MAX_TRADES_PER_SESSION` (per strategy, bucketed by `_session_for_et` session-day),
+`MIN_TARGET_R`, `NEWS_BLACKOUTS_ET`, and an extreme-volatility skip. All filters are
+CAUSAL: evaluated AFTER signal detection but BEFORE next-bar entry, reading only
+signal-bar state (`s["et"]`, `s["atr_ratio"]`, `s["session"]`) — never a future bar.
+**Design decisions a future agent might second-guess:**
+- `min_target_r` and the `risk > tp1d` (stop>target) reject both key off **TP1, not
+  TP3** — because 50% scales at TP1 and the runner moves to BE, so TP1's RR is the
+  expectancy-critical one.
+- `tradable` = raw PF>1 (or `inf` for all-winners) AND avg R>0, computed from the
+  **raw numeric pf BEFORE** it's converted to the "∞"/None display string. Never
+  compare the display string.
+- `run_backtest()` assumes numeric filter params; only the `/backtest/run` Flask
+  route clamps them (max_trades 0..100, min_target_r 0..10). If the engine is ever
+  exposed beyond that route, clamp inside the engine too.
+- Empty-trades metrics dict must carry the same new keys (`tradable=False`,
+  `avg_winner_r`/`avg_loser_r=None`, `loss_reasons=[]`) for serialization parity.
+
 ## CSV auto-detect (symbol/timeframe) + GC/NQ aliases
 `parse_candles_csv` accepts symbol/timeframe = "auto"/None/"" and the upload route
 stores the engine-RESOLVED value (returns `detected_symbol`/`detected_timeframe`
