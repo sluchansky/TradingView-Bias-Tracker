@@ -12115,7 +12115,10 @@ def dashboard():
       <div class="bt-f"><label>End date (ET)</label><input id="rn-end" type="date"></div>
       <div class="bt-f"><label>Slippage (ticks)</label><input id="rn-slip" type="number" min="0" step="1" value="1"></div>
       <div class="bt-f"><label>Commission ($/side)</label><input id="rn-comm" type="number" min="0" step="0.01" value="0.62"></div>
+      <div class="bt-f"><label>Min target (R)</label><input id="rn-minr" type="number" min="0" max="10" step="0.1" value="1.5"></div>
+      <div class="bt-f"><label>Max trades / session</label><input id="rn-maxt" type="number" min="0" max="100" step="1" value="3"></div>
     </div>
+    <div class="bt-mini" style="margin-top:-2px;margin-bottom:8px">Min target R rejects setups whose first target is below this R:R (0 = off). Max trades/session caps entries per ET session-day (0 = off). MGC's fixed first target is only ~1.0R, so a 1.5R minimum yields 0 MGC trades.</div>
     <button class="bt-btn" id="rn-btn" onclick="btRun()">Run Backtest</button>
     <div class="bt-prog" id="rn-prog" style="display:none"><div id="rn-prog-f"></div></div>
     <div class="bt-msg" id="rn-msg"></div>
@@ -13538,6 +13541,8 @@ async function btRun(){
     end: document.getElementById('rn-end').value || null,
     slippage_ticks: parseFloat(document.getElementById('rn-slip').value||'1'),
     commission_per_side: parseFloat(document.getElementById('rn-comm').value||'0.62'),
+    min_target_r: parseFloat(document.getElementById('rn-minr').value||'1.5'),
+    max_trades_per_session: parseInt(document.getElementById('rn-maxt').value||'3', 10),
   };
   const btn=document.getElementById('rn-btn'); btn.disabled=true; btn.textContent='Running…';
   msg.className='bt-msg'; msg.textContent='Submitting…';

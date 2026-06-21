@@ -72,6 +72,13 @@ signal-bar state (`s["et"]`, `s["atr_ratio"]`, `s["session"]`) — never a futur
   exposed beyond that route, clamp inside the engine too.
 - Empty-trades metrics dict must carry the same new keys (`tradable=False`,
   `avg_winner_r`/`avg_loser_r=None`, `loss_reasons=[]`) for serialization parity.
+- **MGC zeroes out at the default 1.5R min target — this is correct, not a bug.**
+  MGC's first target (`tp1=5.0`) equals its minimum stop (`min_stop_ticks 50 ×
+  tick 0.1 = 5.0`), so every MGC trade is at best **1.0R at TP1** and can never
+  satisfy `min_target_r=1.5` → 0 trades. MNQ passes (tp1=20 vs ~10–13pt stops ≈
+  1.5–2R). The dashboard exposes Min Target R / Max Trades-per-session inputs
+  (default 1.5 / 3) so MGC can be explored at 1.0R; the form caption states this.
+  Don't "fix" by silently lowering the default or by moving the gate to TP3.
 
 ## CSV auto-detect (symbol/timeframe) + GC/NQ aliases
 `parse_candles_csv` accepts symbol/timeframe = "auto"/None/"" and the upload route
