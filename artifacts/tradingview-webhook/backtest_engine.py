@@ -121,6 +121,44 @@ MIN_TARGET_R = 1.5
 # around the 08:30 ET macro release cluster rather than a true news filter.
 NEWS_BLACKOUTS_ET = ((8 + 28 / 60.0, 8 + 32 / 60.0),)
 
+# ── Optimization-study sweep dimensions (research-only; see run_optimization) ──
+OPT_SCORE_THRESHOLDS = [65, 70, 75, 80, 85]
+OPT_SESSIONS = ["All", "Asia", "London", "New York",
+                "0800-1100", "2000-2300", "0500-0800"]
+OPT_SESSION_LABELS = {
+    "All": "All sessions", "Asia": "Asia", "London": "London",
+    "New York": "New York", "0800-1100": "08:00–11:00 ET",
+    "2000-2300": "20:00–23:00 ET", "0500-0800": "05:00–08:00 ET"}
+OPT_HOUR_WINDOWS = {"0800-1100": (8.0, 11.0), "2000-2300": (20.0, 23.0),
+                    "0500-0800": (5.0, 8.0)}
+OPT_TRENDS = ["none", "5m", "15m", "5m+15m"]
+OPT_TREND_LABELS = {"none": "No trend filter", "5m": "5m trend agree",
+                    "15m": "15m trend agree", "5m+15m": "5m+15m trend agree"}
+OPT_VOLUMES = ["none", "1.25", "1.5"]
+OPT_VOLUME_LABELS = {"none": "No volume filter", "1.25": "RVOL ≥ 1.25×",
+                     "1.5": "RVOL ≥ 1.5×"}
+OPT_GRADES = ["All", "B", "A", "A+"]
+OPT_GRADE_FLOOR = {"All": 0, "B": 50, "A": 70, "A+": 85}
+OPT_GRADE_LABELS = {"All": "All grades", "B": "B or better",
+                    "A": "A or better", "A+": "A+ only"}
+OPT_MANAGEMENTS = ["target_1r", "target_1_5r", "target_2r",
+                   "partial_1r_runner_2r", "be_after_1r"]
+OPT_MGMT_LABELS = {
+    "target_1r": "1.0R target", "target_1_5r": "1.5R target",
+    "target_2r": "2.0R target",
+    "partial_1r_runner_2r": "Partial @1R, runner @2R",
+    "be_after_1r": "BE after 1R (2R target)"}
+OPT_MIN_TRADES = 10        # min trades for a combo to enter best/worst rankings
+OPT_TABLE_ROWS = 250       # ranked combinations retained for the table + CSV
+
+# Live Edge Score grounding for the BT-score reconstruction (mirror app.py
+# EDGE_COMPONENTS / RVOL_CONFIRM_THRESHOLD / SESSION_WINDOWS as of this build so
+# the swept score thresholds line up 1:1 with the live gate): BOS +20, CHOCH +20,
+# VWAP +15, Sweep +15, Volume +15, CVD +15, Session +10 = max 110.
+BT_EDGE_SCORE_MAX = 110
+BT_RVOL_CONFIRM_THRESHOLD = 1.5     # RVOL proxy for the live volume-spike confirmation
+BT_SESSION_BONUS_WINDOWS = ((5.0, 8.0), (8.0, 11.0), (20.0, 23.0))  # live preferred ET windows
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # CSV INGESTION
@@ -1247,6 +1285,495 @@ def run_backtest(candles, params):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# OPTIMIZATION STUDY (research-only) — parameter / filter sweep per strategy.
+#
+# Design (architect-ruled): only the dimensions that change EXECUTION prices are
+# simulated — strategy × trade-management (~24 sims). Every candidate trade is
+# tagged with its causal decision-time context (BT edge score, grade, named
+# session, ET hour, regime, RVOL, 5m/15m higher-timeframe trend agreement). The
+# remaining dimensions (score threshold, grade, session/hour window, trend
+# alignment, volume) are then a pure POST-HOC SUBSET of that tagged list — they
+# change which trades are INCLUDED, never the entry/exit prices. This collapses a
+# ~80k-combination brute force into a handful of simulations + fast subset
+# scoring, while staying byte-isolated from the live money path.
+#
+# Documented approximations:
+#   • The one-position-per-strategy rule is applied at candidate generation
+#     (unfiltered). A post-hoc filter therefore DROPS a trade rather than freeing
+#     the engine to take a later overlapping one — mildly conservative on counts.
+#   • "BT score" is a causal RECONSTRUCTION of the live additive Edge Score using
+#     the SAME component weights as live EDGE_COMPONENTS (BOS+20/CHOCH+20/VWAP+15/
+#     Sweep+15/Volume+15/CVD+15/Session+10, max 110), NOT the live alert-driven
+#     score. Volume confirmation is proxied by RVOL (the live volume-spike feed is
+#     not replayable). Grade is derived from it (A+≥85 / A≥70 / B≥50).
+#   • The sweep is UNCAPPED (no max-trades-per-session) and excludes the
+#     news/extreme-volatility skips so filter effects are isolated.
+# ════════════════════════════════════════════════════════════════════════════
+def _grade_from_score(sc):
+    if sc >= 85:
+        return "A+"
+    if sc >= 70:
+        return "A"
+    if sc >= 50:
+        return "B"
+    return "WAIT"
+
+
+def _bt_edge_score(s, direction):
+    """Causal reconstruction of the live additive Edge Score (max 110) from the
+    signal-bar snapshot, using the SAME component weights as the live
+    EDGE_COMPONENTS so the swept score thresholds line up 1:1 with the live gate:
+    BOS +20, CHOCH +20, VWAP +15, Sweep +15, Volume +15, CVD +15, Session +10.
+    Only fields replayable historically are used: volume confirmation is proxied
+    by RVOL >= BT_RVOL_CONFIRM_THRESHOLD (the live volume-spike feed cannot be
+    replayed), and the session bonus fires inside the live preferred ET windows.
+    Zone proximity, the confirmation candle and the retired RVOL +/- modifier do
+    NOT score — they no longer feed the live Edge Score."""
+    long = (direction == "Long")
+    score = 0
+    if (long and s["bos_long"]) or (not long and s["bos_short"]):
+        score += 20
+    if (long and s["choch_long"]) or (not long and s["choch_short"]):
+        score += 20
+    if s["vwap"] is not None and (
+        (long and s["close"] > s["vwap"]) or (not long and s["close"] < s["vwap"])
+    ):
+        score += 15
+    if (long and s["sweep_bull"]) or (not long and s["sweep_bear"]):
+        score += 15
+    rv = s["rvol"]
+    if rv is not None and rv >= BT_RVOL_CONFIRM_THRESHOLD:
+        score += 15
+    cvd = s["cvd_state"]
+    if (long and cvd == "bullish") or (not long and cvd == "bearish"):
+        score += 15
+    et = s["et"]
+    hour_f = et.hour + et.minute / 60.0
+    if any(lo <= hour_f < hi for lo, hi in BT_SESSION_BONUS_WINDOWS):
+        score += 10
+    return max(0, min(BT_EDGE_SCORE_MAX, score))
+
+
+def _htf_trend_array(candles, htf_sec):
+    """Per-base-bar higher-timeframe trend sign (+1/-1/0) available AS OF that
+    bar's close, using only COMPLETED htf buckets (no look-ahead). Trend = sign
+    of EMA(3) − EMA(8) over completed-bucket closes."""
+    n = len(candles)
+    out = [0] * n
+    af, asw = 2.0 / (3 + 1), 2.0 / (8 + 1)
+    ema_f = ema_s = None
+    cur_bucket = None
+    cur_close = None
+    avail = 0
+    for i, c in enumerate(candles):
+        b = math.floor(c["ts"].timestamp() / htf_sec)
+        if cur_bucket is None:
+            cur_bucket, cur_close = b, c["close"]
+        elif b != cur_bucket:
+            close = cur_close
+            ema_f = close if ema_f is None else af * close + (1 - af) * ema_f
+            ema_s = close if ema_s is None else asw * close + (1 - asw) * ema_s
+            avail = 1 if ema_f > ema_s else (-1 if ema_f < ema_s else 0)
+            cur_bucket, cur_close = b, c["close"]
+        else:
+            cur_close = c["close"]
+        out[i] = avail
+    return out
+
+
+def _walk_managed(candles, entry_bar, direction, entry, stop, risk, slip, mgmt):
+    """Resolve a trade under an R-based management model. Returns
+    (exit_price, exit_bar, exit_reason, r_gross). Worst-case same-bar discipline:
+    the ACTIVE stop is always checked before the target / BE arming."""
+    n = len(candles)
+    long = (direction == "Long")
+    R = risk
+
+    def tp(rr):
+        return entry + rr * R if long else entry - rr * R
+
+    if mgmt in ("target_1r", "target_1_5r", "target_2r"):
+        rr = {"target_1r": 1.0, "target_1_5r": 1.5, "target_2r": 2.0}[mgmt]
+        tgt = tp(rr)
+        j = entry_bar
+        while j < n:
+            hi, lo = candles[j]["high"], candles[j]["low"]
+            if long:
+                if lo <= stop:
+                    px = stop - slip
+                    return (px, j, "Stop loss (-1R)", (px - entry) / R)
+                if hi >= tgt:
+                    return (tgt, j, f"Target {rr:g}R", (tgt - entry) / R)
+            else:
+                if hi >= stop:
+                    px = stop + slip
+                    return (px, j, "Stop loss (-1R)", (entry - px) / R)
+                if lo <= tgt:
+                    return (tgt, j, f"Target {rr:g}R", (entry - tgt) / R)
+            j += 1
+        last = candles[-1]["close"]
+        r = (last - entry) / R if long else (entry - last) / R
+        return (last, n - 1, "Open at end of data", r)
+
+    if mgmt == "be_after_1r":
+        tgt, one = tp(2.0), tp(1.0)
+        cur_stop = stop
+        armed = False
+        j = entry_bar
+        while j < n:
+            hi, lo = candles[j]["high"], candles[j]["low"]
+            if long:
+                if lo <= cur_stop:
+                    px = cur_stop - slip
+                    return (px, j, "Breakeven stop (+1R armed)" if armed
+                            else "Stop loss (-1R)", (px - entry) / R)
+                if not armed and hi >= one:
+                    armed = True
+                    cur_stop = entry
+                    if lo <= entry:
+                        px = entry - slip
+                        return (px, j, "Breakeven stop (+1R armed)", (px - entry) / R)
+                if hi >= tgt:
+                    return (tgt, j, "Target 2R (BE after 1R)", (tgt - entry) / R)
+            else:
+                if hi >= cur_stop:
+                    px = cur_stop + slip
+                    return (px, j, "Breakeven stop (+1R armed)" if armed
+                            else "Stop loss (-1R)", (entry - px) / R)
+                if not armed and lo <= one:
+                    armed = True
+                    cur_stop = entry
+                    if hi >= entry:
+                        px = entry + slip
+                        return (px, j, "Breakeven stop (+1R armed)", (entry - px) / R)
+                if lo <= tgt:
+                    return (tgt, j, "Target 2R (BE after 1R)", (entry - tgt) / R)
+            j += 1
+        last = candles[-1]["close"]
+        r = (last - entry) / R if long else (entry - last) / R
+        return (last, n - 1, "Open at end of data", r)
+
+    # partial_1r_runner_2r — 50% off at +1R, runner stop→BE, runner target +2R.
+    one, tgt = tp(1.0), tp(2.0)
+    cur_stop = stop
+    half1 = False
+    j = entry_bar
+    while j < n:
+        hi, lo = candles[j]["high"], candles[j]["low"]
+        if long:
+            if not half1:
+                if lo <= cur_stop:
+                    px = cur_stop - slip
+                    return (px, j, "Stop loss (-1R)", (px - entry) / R)
+                if hi >= one:
+                    half1 = True
+                    cur_stop = entry
+                    if lo <= entry:
+                        px = entry - slip
+                        return (px, j, "TP1 +1R, runner BE",
+                                0.5 * 1.0 + 0.5 * ((px - entry) / R))
+            else:
+                if lo <= cur_stop:
+                    px = entry - slip
+                    return (px, j, "TP1 +1R, runner BE",
+                            0.5 * 1.0 + 0.5 * ((px - entry) / R))
+                if hi >= tgt:
+                    return (tgt, j, "TP1 +1R, runner +2R", 0.5 * 1.0 + 0.5 * 2.0)
+        else:
+            if not half1:
+                if hi >= cur_stop:
+                    px = cur_stop + slip
+                    return (px, j, "Stop loss (-1R)", (entry - px) / R)
+                if lo <= one:
+                    half1 = True
+                    cur_stop = entry
+                    if hi >= entry:
+                        px = entry + slip
+                        return (px, j, "TP1 +1R, runner BE",
+                                0.5 * 1.0 + 0.5 * ((entry - px) / R))
+            else:
+                if hi >= cur_stop:
+                    px = entry + slip
+                    return (px, j, "TP1 +1R, runner BE",
+                            0.5 * 1.0 + 0.5 * ((entry - px) / R))
+                if lo <= tgt:
+                    return (tgt, j, "TP1 +1R, runner +2R", 0.5 * 1.0 + 0.5 * 2.0)
+        j += 1
+    last = candles[-1]["close"]
+    rem = (last - entry) / R if long else (entry - last) / R
+    if not half1:
+        return (last, n - 1, "Open at end of data", rem)
+    return (last, n - 1, "TP1 +1R, runner closed at end", 0.5 * 1.0 + 0.5 * rem)
+
+
+def _opt_candidates(snaps, candles, strat_key, spec, mode, mgmt,
+                    slippage_ticks, commission_per_side, tf5, tf15):
+    """All candidate trades for one strategy under one management model — detector
+    signal + conflict guard + valid stop plan ONLY (no quality/session/trend/
+    volume/news/max-trades gates). Each trade carries its causal decision-time
+    tags for post-hoc subsetting. Pre-sorted by exit time for incremental DD."""
+    tick = spec["tick_size"]
+    pv = spec["point_value"]
+    slip = slippage_ticks * tick
+    detector = DETECTORS[strat_key]
+    n = len(snaps)
+    out = []
+    i = 0
+    while i < n - 1:
+        s = snaps[i]
+        sig = detector(s)
+        if not sig:
+            i += 1
+            continue
+        direction = sig[0]
+        if direction == "Long" and s["choch_short"]:
+            i += 1
+            continue
+        if direction == "Short" and s["choch_long"]:
+            i += 1
+            continue
+        entry_bar = i + 1
+        raw = candles[entry_bar]["open"]
+        entry = raw + slip if direction == "Long" else raw - slip
+        plan = bt_stop_plan(direction, entry, s["demand_zone"], s["supply_zone"],
+                            spec, s["atr"], mode, s["regime"])
+        if plan is None:
+            i += 1
+            continue
+        stop, risk = plan["stop"], plan["risk_points"]
+        ex_px, ex_bar, ex_reason, r_gross = _walk_managed(
+            candles, entry_bar, direction, entry, stop, risk, slip, mgmt)
+        comm_r = (2.0 * commission_per_side) / (risk * pv) if risk > 0 else 0.0
+        et = s["et"]
+        out.append({
+            "strategy": strat_key, "direction": direction,
+            "r": r_gross - comm_r, "exit_reason": ex_reason,
+            "entry_ts": candles[entry_bar]["ts"].isoformat(),
+            "exit_ts": candles[ex_bar]["ts"].isoformat(),
+            "bt_score": _bt_edge_score(s, direction),
+            "session": s["session"] or "Off-hours",
+            "sig_hour_f": et.hour + et.minute / 60.0, "sig_hour": et.hour,
+            "regime": s["regime"], "rvol": s["rvol"],
+            "htf5_agree": (tf5[i] != 0 and (direction == "Long") == (tf5[i] > 0)),
+            "htf15_agree": (tf15[i] != 0 and (direction == "Long") == (tf15[i] > 0)),
+        })
+        i = max(ex_bar, entry_bar) + 1
+    for t in out:
+        t["grade"] = _grade_from_score(t["bt_score"])
+    out.sort(key=lambda t: t["exit_ts"])
+    return out
+
+
+def _opt_session_ok(t, opt):
+    if opt == "All":
+        return True
+    if opt in OPT_HOUR_WINDOWS:
+        lo, hi = OPT_HOUR_WINDOWS[opt]
+        return lo <= t["sig_hour_f"] < hi
+    return t["session"] == opt
+
+
+def _opt_trend_ok(t, opt):
+    if opt == "none":
+        return True
+    if opt == "5m":
+        return t["htf5_agree"]
+    if opt == "15m":
+        return t["htf15_agree"]
+    return t["htf5_agree"] and t["htf15_agree"]
+
+
+def _opt_volume_ok(t, opt):
+    if opt == "none":
+        return True
+    rv = t["rvol"]
+    if rv is None:
+        return False
+    return rv >= (1.25 if opt == "1.25" else 1.5)
+
+
+def _opt_metrics(trades):
+    """Lightweight subset metrics. `trades` MUST be pre-sorted by exit time so the
+    running drawdown is chronologically correct."""
+    k = len(trades)
+    if k == 0:
+        return None
+    rs = [t["r"] for t in trades]
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r <= 0]
+    gp, gl = sum(wins), abs(sum(losses))
+    pf = (gp / gl) if gl > 0 else (math.inf if gp > 0 else 0.0)
+    net_r = sum(rs)
+    peak = cum = mdd = 0.0
+    for r in rs:
+        cum += r
+        if cum > peak:
+            peak = cum
+        if peak - cum > mdd:
+            mdd = peak - cum
+    by_hour, by_reg = {}, {}
+    for t in trades:
+        by_hour.setdefault(t["sig_hour"], []).append(t["r"])
+        by_reg.setdefault(t["regime"], []).append(t["r"])
+    bh = max(by_hour, key=lambda h: sum(by_hour[h])) if by_hour else None
+    br = max(by_reg, key=lambda g: sum(by_reg[g])) if by_reg else None
+    pf_ok = (pf == math.inf) or (pf > 1.0)
+    return {
+        "trades": k,
+        "win_rate": round(len(wins) / k * 100.0, 1),
+        "pf": (None if pf == 0.0 else ("inf" if pf == math.inf else round(pf, 2))),
+        "pf_num": (1e9 if pf == math.inf else round(pf, 4)),
+        "net_r": round(net_r, 2),
+        "avg_r": round(net_r / k, 3),
+        "avg_win_r": (round(sum(wins) / len(wins), 3) if wins else None),
+        "avg_loss_r": (round(sum(losses) / len(losses), 3) if losses else None),
+        "max_dd_r": round(mdd, 2),
+        "best_hour": bh,
+        "best_hour_label": (f"{bh:02d}:00–{(bh + 1) % 24:02d}:00 ET"
+                            if bh is not None else None),
+        "best_regime": br,
+        "tradable": bool(net_r / k > 0 and pf_ok),
+    }
+
+
+def _opt_rank(m):
+    """Research ranking: total Net R, then Profit Factor, then smaller drawdown."""
+    return (m["net_r"], m["pf_num"], -m["max_dd_r"])
+
+
+def run_optimization(candles, params):
+    """Sweep filter / management combinations per strategy and rank them by
+    Profit Factor / Net R / Max Drawdown. Pure + read-only — never touches live
+    globals, Discord, the broker path, or full_analysis."""
+    symbol = params.get("symbol", "MGC")
+    mode = (params.get("mode") or "SCALP").upper()
+    if mode not in BT_MODES:
+        mode = "SCALP"
+    spec = BT_SPECS.get(symbol, BT_SPECS["MGC"])
+    slippage = float(params.get("slippage_ticks", 1.0))
+    commission = float(params.get("commission_per_side", 0.62))
+    min_trades = int(params.get("min_trades", OPT_MIN_TRADES))
+    strategies = [s for s in (params.get("strategies") or STRATEGY_ORDER)
+                  if s in DETECTORS and s not in DISABLED_STRATEGIES]
+    start_ts, end_ts = params.get("start_ts"), params.get("end_ts")
+    if start_ts or end_ts:
+        candles = [c for c in candles
+                   if (start_ts is None or c["ts"] >= start_ts)
+                   and (end_ts is None or c["ts"] <= end_ts)]
+    need = VOL_MIN_BARS + PIVOT_LEFT + PIVOT_RIGHT + 2
+    if len(candles) < need:
+        return {"ok": False,
+                "error": f"Not enough candles ({len(candles)}) — need ≥ {need}."}
+    snaps = compute_indicators(candles, mode=mode)
+    tf5 = _htf_trend_array(candles, 300)
+    tf15 = _htf_trend_array(candles, 900)
+
+    rows = []
+    regime_best = {}
+    REGIMES = ("TRENDING", "RANGING", "VOLATILE", "BALANCED")
+    for strat in strategies:
+        for mgmt in OPT_MANAGEMENTS:
+            cands = _opt_candidates(snaps, candles, strat, spec, mode, mgmt,
+                                    slippage, commission, tf5, tf15)
+            if not cands:
+                continue
+            # Best-by-regime: isolate regime (session=All / trend=none / vol=none).
+            for reg in REGIMES:
+                reg_tr = [t for t in cands if t["regime"] == reg]
+                if len(reg_tr) < min_trades:
+                    continue
+                for thr in OPT_SCORE_THRESHOLDS:
+                    m = _opt_metrics([t for t in reg_tr if t["bt_score"] >= thr])
+                    if not m or m["trades"] < min_trades:
+                        continue
+                    row = {"strategy": strat, "mgmt": mgmt, "score": thr,
+                           "regime": reg, **m}
+                    cur = regime_best.get(reg)
+                    if cur is None or _opt_rank(m) > _opt_rank(cur):
+                        regime_best[reg] = row
+            # Main sweep: session × trend × volume × score × grade.
+            for sess in OPT_SESSIONS:
+                s_sub = [t for t in cands if _opt_session_ok(t, sess)]
+                if not s_sub:
+                    continue
+                for tr in OPT_TRENDS:
+                    t_sub = [t for t in s_sub if _opt_trend_ok(t, tr)]
+                    if not t_sub:
+                        continue
+                    for vol in OPT_VOLUMES:
+                        v_sub = [t for t in t_sub if _opt_volume_ok(t, vol)]
+                        if not v_sub:
+                            continue
+                        eff_cache = {}
+                        for thr in OPT_SCORE_THRESHOLDS:
+                            for gr in OPT_GRADES:
+                                eff = max(thr, OPT_GRADE_FLOOR[gr])
+                                if eff not in eff_cache:
+                                    eff_cache[eff] = _opt_metrics(
+                                        [t for t in v_sub if t["bt_score"] >= eff])
+                                m = eff_cache[eff]
+                                if not m:
+                                    continue
+                                rows.append({
+                                    "strategy": strat, "mgmt": mgmt,
+                                    "session": sess, "trend": tr, "volume": vol,
+                                    "score": thr, "grade": gr, **m})
+
+    eligible = [r for r in rows if r["trades"] >= min_trades]
+    ranked = sorted(rows, key=_opt_rank, reverse=True)
+    ranked_elig = sorted(eligible, key=_opt_rank, reverse=True)
+    best_overall = ranked_elig[0] if ranked_elig else (ranked[0] if ranked else None)
+    best_by_strategy = {}
+    for r in ranked_elig:
+        best_by_strategy.setdefault(r["strategy"], r)
+    best_by_session = {}
+    for r in ranked_elig:
+        best_by_session.setdefault(r["session"], r)
+    worst = sorted(eligible, key=_opt_rank)[0] if eligible else None
+
+    return {
+        "ok": True, "kind": "optimization",
+        "symbol": symbol, "mode": mode, "timeframe": params.get("timeframe"),
+        "bars": len(candles),
+        "first_ts": candles[0]["ts"].isoformat(),
+        "last_ts": candles[-1]["ts"].isoformat(),
+        "slippage_ticks": slippage, "commission_per_side": commission,
+        "min_trades": min_trades, "strategies": strategies,
+        "total_combos": len(rows), "eligible_combos": len(eligible),
+        "labels": {
+            "strategy": {k: STRATEGY_DEFS[k]["label"] for k in STRATEGY_DEFS},
+            "mgmt": OPT_MGMT_LABELS, "session": OPT_SESSION_LABELS,
+            "trend": OPT_TREND_LABELS, "volume": OPT_VOLUME_LABELS,
+            "grade": OPT_GRADE_LABELS,
+        },
+        "table": ranked[:OPT_TABLE_ROWS],
+        "best_overall": best_overall,
+        "best_by_strategy": best_by_strategy,
+        "best_by_session": best_by_session,
+        "best_by_regime": regime_best,
+        "worst_to_avoid": worst,
+        "notes": [
+            "BT score is a causal reconstruction of the live Edge Score using the "
+            "same component weights as the live gate (BOS 20, CHOCH 20, VWAP 15, "
+            "Sweep 15, Volume 15, CVD 15, Session 10; max 110), not the live "
+            "alert-driven score. Volume confirmation is proxied by RVOL because the "
+            "live volume-spike feed cannot be replayed historically.",
+            "Grade is derived from BT score (A+ ≥85, A ≥70, B ≥50); the effective "
+            "quality filter is the stricter of the score threshold and grade floor.",
+            "Filters are post-hoc subsets of simulated trades; the "
+            "one-position-per-strategy rule is applied before filtering, so a "
+            "filter drops a trade rather than promoting a later overlapping one "
+            "(mildly conservative on trade counts).",
+            "Sweep is uncapped (no max-trades-per-session) and excludes "
+            "news/extreme-volatility skips so filter effects are isolated. "
+            "Exhaustion Fade is excluded.",
+            f"Combinations with fewer than {min_trades} trades are shown in the "
+            "table but excluded from the best/worst rankings.",
+        ],
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # SELF-TEST — synthetic data + invariant checks. Run: python backtest_engine.py
 # ════════════════════════════════════════════════════════════════════════════
 def _synthetic_candles(n=900, symbol="MGC", seed=7):
@@ -1354,6 +1881,34 @@ def _self_test():
     res2 = run_backtest(big, {"symbol": "MGC", "timeframe": "5m", "mode": "SWING"})
     assert res2["ok"]
     print(f"SWING run OK: {res2['total_trades']} trades")
+
+    # 6) BT score stays in sync with the live Edge Score components (max 110):
+    #    BOS 20 + CHOCH 20 + VWAP 15 + Sweep 15 + Volume 15 + CVD 15 + Session 10.
+    assert BT_EDGE_SCORE_MAX == 110, BT_EDGE_SCORE_MAX
+    assert 20 + 20 + 15 + 15 + 15 + 15 + 10 == BT_EDGE_SCORE_MAX
+    _pref_et = snaps[0]["et"].replace(hour=9, minute=0)   # inside 08:00–11:00 ET
+    _off_et = snaps[0]["et"].replace(hour=2, minute=0)    # outside every window
+    full_long = {"bos_long": True, "bos_short": False,
+                 "choch_long": True, "choch_short": False,
+                 "vwap": 100.0, "close": 101.0,
+                 "sweep_bull": True, "sweep_bear": False,
+                 "rvol": 2.0, "cvd_state": "bullish", "et": _pref_et}
+    assert _bt_edge_score(full_long, "Long") == 110, _bt_edge_score(full_long, "Long")
+    none_long = {"bos_long": False, "bos_short": False,
+                 "choch_long": False, "choch_short": False,
+                 "vwap": 100.0, "close": 99.0,
+                 "sweep_bull": False, "sweep_bear": False,
+                 "rvol": 0.5, "cvd_state": "neutral", "et": _off_et}
+    assert _bt_edge_score(none_long, "Long") == 0, _bt_edge_score(none_long, "Long")
+    # Zone proximity and confirmation candle are RETIRED from live → must not score.
+    assert _bt_edge_score({**none_long, "demand_zone": 99.0, "supply_zone": 103.0,
+                           "atr": 1.0, "confirm_bull": True, "confirm_bear": False},
+                          "Long") == 0
+    assert (_grade_from_score(110), _grade_from_score(85), _grade_from_score(70),
+            _grade_from_score(50), _grade_from_score(49)) == \
+        ("A+", "A+", "A", "B", "WAIT")
+    print("BT score in sync with live EDGE_COMPONENTS (max 110); zone/confirmation "
+          "excluded; grade bands A+/A/B/WAIT ✓")
     print("ALL SELF-TESTS PASSED ✓")
 
 

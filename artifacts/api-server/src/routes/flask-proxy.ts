@@ -88,6 +88,7 @@ router.all(
     "/backtest/datasets",
     "/backtest/datasets/:id",
     "/backtest/run",
+    "/backtest/optimize",
     "/backtest/runs/:id",
     "/backtest/export",
   ],

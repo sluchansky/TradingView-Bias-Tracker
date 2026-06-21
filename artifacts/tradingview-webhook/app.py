@@ -9901,6 +9901,36 @@ def _bt_run_worker(run_id, dataset_id, params):
             pass
 
 
+def _bt_opt_worker(run_id, dataset_id, params):
+    """Background optimization-study executor. FAIL-OPEN like _bt_run_worker."""
+    try:
+        _bt_update_run(run_id, status="running", progress=0.1)
+        candles = _bt_load_candles(dataset_id, params.get("start_ts"), params.get("end_ts"))
+        if not candles:
+            _bt_update_run(run_id, status="error",
+                           error="No candles found for this dataset / date range.")
+            return
+        _bt_update_run(run_id, progress=0.4)
+        result = bt.run_optimization(candles, params)
+        if not result.get("ok"):
+            _bt_update_run(run_id, status="error",
+                           error=result.get("error") or "Optimization failed.")
+            return
+        result["params_echo"] = {
+            "dataset_id": dataset_id, "mode": params.get("mode"),
+            "strategies": params.get("strategies"),
+            "start": params.get("start_label"), "end": params.get("end_label"),
+            "min_trades": params.get("min_trades"),
+        }
+        _bt_update_run(run_id, status="done", progress=1.0, result=result)
+    except Exception as exc:
+        logger.warning("optimization worker crashed: %s", exc)
+        try:
+            _bt_update_run(run_id, status="error", error=f"Worker error: {exc}")
+        except Exception:
+            pass
+
+
 def _bt_et_bounds(date_str, end_of_day=False):
     """Interpret a YYYY-MM-DD (or full ISO) string as an ET instant → UTC datetime."""
     if not date_str:
@@ -10051,6 +10081,53 @@ def bt_run():
     return jsonify({"ok": True, "run_id": run_id})
 
 
+@app.route("/backtest/optimize", methods=["POST"])
+def bt_optimize():
+    """Owner-only RESEARCH parameter/filter sweep. Reuses the async run plumbing
+    (backtest_runs) but dispatches the optimization worker. Pure + read-only."""
+    guard = _bt_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True, silent=True) or {}
+    dataset_id = body.get("dataset_id")
+    if not dataset_id:
+        return jsonify({"ok": False, "error": "dataset_id required"}), 400
+    ds = _bt_get_dataset(dataset_id)
+    if not ds:
+        return jsonify({"ok": False, "error": "dataset not found"}), 404
+    mode = (body.get("mode") or "SCALP").upper()
+    if mode not in bt.BT_MODES:
+        mode = "SCALP"
+    strategies = body.get("strategies") or None
+    if strategies and not isinstance(strategies, list):
+        strategies = [strategies]
+    start_label = body.get("start") or None
+    end_label = body.get("end") or None
+    try:
+        min_trades = int(body.get("min_trades", bt.OPT_MIN_TRADES))
+    except (TypeError, ValueError):
+        min_trades = bt.OPT_MIN_TRADES
+    min_trades = max(1, min(min_trades, 1000))
+    params = {
+        "symbol": ds["symbol"], "timeframe": ds["timeframe"], "mode": mode,
+        "strategies": strategies,
+        "start_ts": _bt_et_bounds(start_label, end_of_day=False),
+        "end_ts": _bt_et_bounds(end_label, end_of_day=True),
+        "start_label": start_label, "end_label": end_label,
+        "slippage_ticks": float(body.get("slippage_ticks", 1.0) or 1.0),
+        "commission_per_side": float(body.get("commission_per_side", 0.62) or 0.62),
+        "min_trades": min_trades,
+    }
+    run_id = _bt_create_run({**params, "kind": "optimization",
+                             "start_ts": params["start_ts"].isoformat() if params["start_ts"] else None,
+                             "end_ts": params["end_ts"].isoformat() if params["end_ts"] else None})
+    if run_id is None:
+        return jsonify({"ok": False, "error": "could not create run"}), 500
+    threading.Thread(target=_bt_opt_worker, args=(run_id, dataset_id, params),
+                     name=f"backtest-opt-{run_id}", daemon=True).start()
+    return jsonify({"ok": True, "run_id": run_id})
+
+
 @app.route("/backtest/runs/<int:run_id>", methods=["GET"])
 def bt_run_status(run_id):
     guard = _bt_guard()
@@ -10076,7 +10153,37 @@ def bt_export():
     run = _bt_get_run(run_id)
     if not run or not run.get("result"):
         return jsonify({"ok": False, "error": "no completed run with that id"}), 404
-    trades = (run["result"] or {}).get("trades", [])
+    result = run["result"] or {}
+    if result.get("kind") == "optimization":
+        buf = _bt_io_mod.StringIO()
+        cols = ["rank", "strategy", "management", "score_min", "grade", "session",
+                "trend", "volume", "regime", "trades", "win_rate", "profit_factor",
+                "net_r", "avg_r", "avg_win_r", "avg_loss_r", "max_dd_r",
+                "best_hour", "best_regime"]
+        labels = result.get("labels", {})
+        w = _bt_csv_mod.writer(buf)
+        w.writerow(cols)
+        for idx, row in enumerate(result.get("table", []), start=1):
+            w.writerow([
+                idx,
+                labels.get("strategy", {}).get(row.get("strategy"), row.get("strategy")),
+                labels.get("mgmt", {}).get(row.get("mgmt"), row.get("mgmt")),
+                row.get("score"),
+                labels.get("grade", {}).get(row.get("grade"), row.get("grade")),
+                labels.get("session", {}).get(row.get("session"), row.get("session")),
+                labels.get("trend", {}).get(row.get("trend"), row.get("trend")),
+                labels.get("volume", {}).get(row.get("volume"), row.get("volume")),
+                row.get("regime", ""),
+                row.get("trades"), row.get("win_rate"), row.get("pf"),
+                row.get("net_r"), row.get("avg_r"), row.get("avg_win_r"),
+                row.get("avg_loss_r"), row.get("max_dd_r"),
+                row.get("best_hour_label"), row.get("best_regime"),
+            ])
+        csv_text = buf.getvalue()
+        return Response(csv_text, mimetype="text/csv",
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="optimization_run_{run_id}.csv"'})
+    trades = result.get("trades", [])
     buf = _bt_io_mod.StringIO()
     cols = ["strategy", "direction", "entry_ts", "exit_ts", "entry", "stop", "exit",
             "tp1", "tp3", "risk_points", "gross_points", "pnl_dollars", "r_multiple",
@@ -11823,6 +11930,13 @@ def dashboard():
   .bt-prog>div{height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--amber));transition:width .3s}
   .bt-pos{color:var(--green)} .bt-neg{color:var(--red)}
   .bt-mini{font-size:11px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
+  .bt-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+  .bt-card{border:1px solid var(--border);border-radius:3px;background:var(--inset);padding:10px 12px}
+  .bt-card.best{border-color:var(--cyan);background:var(--cyan-deep)}
+  .bt-card .bt-card-h{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:4px}
+  .bt-card .bt-card-t{font-size:13px;font-weight:700;color:var(--text);line-height:1.35;margin-bottom:6px}
+  .bt-card .bt-card-m{font-size:11px;color:var(--muted);line-height:1.6}
+  .bt-card .bt-card-m b{color:var(--text)}
   .bt-eq{width:100%;height:200px;display:block;margin-top:6px}
   .bt-x{cursor:pointer;color:var(--red);font-weight:700;user-select:none}
 </style>
@@ -12159,6 +12273,70 @@ def dashboard():
         <tbody id="tl-body"></tbody>
       </table></div>
       <button class="bt-btn alt" id="ex-btn" onclick="btExport()">⬇️ Export Trade Log (CSV)</button>
+    </div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">🔬 Optimization Study</div>
+    <div class="bt-mini" style="margin-bottom:8px">Sweeps every combination of <b>score threshold</b> (65–85), <b>session/hour window</b>, <b>trend filter</b> (5m/15m), <b>volume filter</b> (RVOL), <b>grade</b> (B/A/A+) and <b>trade management</b> (1R/1.5R/2R, partial+runner, breakeven-after-1R) for the four core strategies, then ranks them by Profit Factor, Net R and Max Drawdown. Research only — it never changes the live strategy or money path. Uses the dataset selected in <b>Datasets</b> above plus the Sensitivity/date range from <b>Run Backtest</b>.</div>
+    <div class="bt-grid">
+      <div class="bt-f"><label>Min trades (for ranking)</label><input id="opt-mintr" type="number" min="1" max="1000" step="1" value="10"></div>
+      <div class="bt-f"><label>&nbsp;</label><div class="bt-mini" style="padding:8px 0">Combinations below this trade count still appear in the full table but are excluded from the “best/worst” picks.</div></div>
+    </div>
+    <button class="bt-btn" id="opt-btn" onclick="optRun()">Run Optimization Study</button>
+    <div class="bt-prog" id="opt-prog" style="display:none"><div id="opt-prog-f"></div></div>
+    <div class="bt-msg" id="opt-msg"></div>
+  </div>
+
+  <div id="opt-results" style="display:none">
+    <div class="mod">
+      <div class="mod-h">⭐ Best Combinations <span class="bt-mini" id="opt-cap"></span></div>
+      <div id="opt-cards" class="bt-cards"></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🏅 Best Per Strategy</div>
+      <div class="bt-scroll"><table class="bt-tbl" id="opt-strat-tbl">
+        <thead><tr><th>Strategy</th><th>Management</th><th>Score≥</th><th>Grade</th><th>Session</th><th>Trend</th><th>Volume</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net R</th><th>Avg R</th><th>Max DD (R)</th></tr></thead>
+        <tbody id="opt-strat-body"></tbody>
+      </table></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🕑 Best Per Session</div>
+      <div class="bt-scroll"><table class="bt-tbl" id="opt-sess-tbl">
+        <thead><tr><th>Session / window</th><th>Strategy</th><th>Management</th><th>Score≥</th><th>Grade</th><th>Trend</th><th>Volume</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net R</th><th>Max DD (R)</th></tr></thead>
+        <tbody id="opt-sess-body"></tbody>
+      </table></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🌐 Best Per Market Regime</div>
+      <div class="bt-mini" style="margin-bottom:6px">Regime is isolated (all sessions, no trend/volume filter) so each row is the strongest strategy+management+score for that market condition.</div>
+      <div class="bt-scroll"><table class="bt-tbl" id="opt-reg-tbl">
+        <thead><tr><th>Regime</th><th>Strategy</th><th>Management</th><th>Score≥</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net R</th><th>Avg R</th><th>Max DD (R)</th></tr></thead>
+        <tbody id="opt-reg-body"></tbody>
+      </table></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🏆 Ranked Combinations <span class="bt-mini" id="opt-rk-cap"></span></div>
+      <div class="bt-f" style="max-width:340px;margin-bottom:6px"><label>Filter strategy</label><select id="opt-rk-sel" onchange="optRenderTable()"></select></div>
+      <div class="bt-scroll"><table class="bt-tbl" id="opt-rk-tbl">
+        <thead><tr><th>#</th><th>Strategy</th><th>Management</th><th>Score≥</th><th>Grade</th><th>Session</th><th>Trend</th><th>Volume</th><th>Trades</th><th>Win%</th><th>PF</th><th>Net R</th><th>Avg R</th><th>Max DD (R)</th><th>Best hour</th></tr></thead>
+        <tbody id="opt-rk-body"></tbody>
+      </table></div>
+      <button class="bt-btn alt" id="opt-ex-btn" onclick="optExport()">⬇️ Export Ranked Table (CSV)</button>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">⚠️ Worst To Avoid</div>
+      <div class="bt-msg" id="opt-worst"></div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">ℹ️ Method &amp; Caveats</div>
+      <ul class="bt-mini" id="opt-notes" style="margin:0;padding-left:18px"></ul>
     </div>
   </div>
 
@@ -13713,6 +13891,201 @@ async function btExport(){
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a');
     a.href=url; a.download='backtest_run_'+btRunId+'.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }catch(e){ toast('Export failed', false); }
+}
+
+// ══════════════════════ OPTIMIZATION STUDY (read-only research) ══════════════════════
+let optResult=null, optRunId=null, optPollTimer=null;
+function optL(kind,key){ const m=(optResult&&optResult.labels&&optResult.labels[kind])||{}; return m[key]||key; }
+function optPF(v){ return (v===null||v===undefined)?'—':(v==='inf'?'∞':v); }
+function optCombo(row){
+  return optL('strategy',row.strategy)+' · '+optL('mgmt',row.mgmt)+' · Score≥'+row.score+
+    ' · '+optL('grade',row.grade)+' · '+optL('session',row.session)+
+    ' · '+optL('trend',row.trend)+' · '+optL('volume',row.volume);
+}
+function optRow(row, cols){ return cols.map(c=>c(row)).join(''); }
+function optMetricCells(row){
+  const npos=(row.net_r>=0);
+  return '<td>'+row.trades+'</td>'+
+    '<td>'+(row.win_rate==null?'—':row.win_rate+'%')+'</td>'+
+    '<td>'+optPF(row.pf)+'</td>'+
+    '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(row.net_r,2)+'R</td>'+
+    '<td>'+btNum(row.avg_r,3)+'</td>'+
+    '<td>'+btNum(row.max_dd_r,2)+'</td>';
+}
+
+async function optRun(){
+  const msg=document.getElementById('opt-msg');
+  if(btSelDataset===null){ msg.className='bt-msg err'; msg.textContent='Select a dataset first (Datasets above).'; return; }
+  const strat=document.getElementById('rn-strat').value;
+  const body={
+    dataset_id: btSelDataset,
+    mode: document.getElementById('rn-mode').value,
+    strategies: (strat==='all'||strat==='EXHAUSTION_FADE') ? null : [strat],
+    start: document.getElementById('rn-start').value || null,
+    end: document.getElementById('rn-end').value || null,
+    slippage_ticks: parseFloat(document.getElementById('rn-slip').value||'1'),
+    commission_per_side: parseFloat(document.getElementById('rn-comm').value||'0.62'),
+    min_trades: parseInt(document.getElementById('opt-mintr').value||'10', 10),
+  };
+  const btn=document.getElementById('opt-btn'); btn.disabled=true; btn.textContent='Running…';
+  msg.className='bt-msg'; msg.textContent='Submitting…';
+  document.getElementById('opt-results').style.display='none';
+  const prog=document.getElementById('opt-prog'); document.getElementById('opt-prog-f').style.width='5%';
+  prog.style.display='block';
+  try{
+    const d=await api('/backtest/optimize', body);
+    if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Optimization failed'); optRunDone(); prog.style.display='none'; return; }
+    optRunId=d.run_id; msg.textContent='Running study #'+optRunId+'…';
+    optPoll();
+  }catch(e){ msg.className='bt-msg err'; msg.textContent='✗ '+e; optRunDone(); prog.style.display='none'; }
+}
+function optRunDone(){ const btn=document.getElementById('opt-btn'); btn.disabled=false; btn.textContent='Run Optimization Study'; }
+function optPoll(){
+  if(optPollTimer) clearTimeout(optPollTimer);
+  optPollTimer=setTimeout(async ()=>{
+    try{
+      const d=await api('/backtest/runs/'+optRunId);
+      const progF=document.getElementById('opt-prog-f');
+      const msg=document.getElementById('opt-msg');
+      if(!d || !d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+((d&&d.error)||'run lost'); optRunDone(); return; }
+      progF.style.width=Math.round((d.progress||0)*100)+'%';
+      if(d.status==='done'){ optResult=d.result; msg.className='bt-msg ok'; msg.textContent='✓ Completed study #'+optRunId; optRunDone(); optRender(); return; }
+      if(d.status==='error'){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Optimization error'); optRunDone(); return; }
+      msg.textContent='Running study #'+optRunId+'… ('+d.status+')';
+      optPoll();
+    }catch(e){ optPoll(); }
+  }, 1200);
+}
+
+function optCardHtml(label, row, best){
+  if(!row) return '';
+  const npos=(row.net_r>=0);
+  return '<div class="bt-card'+(best?' best':'')+'">'+
+    '<div class="bt-card-h">'+btEsc(label)+'</div>'+
+    '<div class="bt-card-t">'+btEsc(optL('strategy',row.strategy))+'</div>'+
+    '<div class="bt-card-m">'+
+      '<b>'+btEsc(optL('mgmt',row.mgmt))+'</b><br>'+
+      'Score≥'+row.score+' · '+btEsc(optL('grade',row.grade))+'<br>'+
+      btEsc(optL('session',row.session))+'<br>'+
+      btEsc(optL('trend',row.trend))+' · '+btEsc(optL('volume',row.volume))+'<br>'+
+      '<b class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(row.net_r,2)+'R</b>'+
+      ' · PF '+optPF(row.pf)+' · '+row.trades+' trades<br>'+
+      'Win '+(row.win_rate==null?'—':row.win_rate+'%')+' · Max DD '+btNum(row.max_dd_r,2)+'R'+
+    '</div></div>';
+}
+
+function optRender(){
+  const res=optResult; if(!res) return;
+  document.getElementById('opt-results').style.display='block';
+  document.getElementById('opt-cap').textContent =
+    res.symbol+' · '+res.mode+' · '+(res.timeframe||'')+' · '+res.bars+' bars · '+
+    res.total_combos+' combos ('+res.eligible_combos+' eligible)';
+  // Best-combination cards
+  const cards=[];
+  cards.push(optCardHtml('★ Best overall', res.best_overall, true));
+  const bs=res.best_by_strategy||{};
+  (res.strategies||[]).forEach(k=>{ if(bs[k]) cards.push(optCardHtml('Best · '+optL('strategy',k), bs[k], false)); });
+  document.getElementById('opt-cards').innerHTML = cards.filter(Boolean).join('') ||
+    '<div class="bt-mini">No combinations met the minimum trade count.</div>';
+  // Best per strategy
+  const sb=document.getElementById('opt-strat-body');
+  const stratRows=(res.strategies||[]).map(k=>bs[k]).filter(Boolean);
+  sb.innerHTML = stratRows.length ? stratRows.map(r=>'<tr>'+
+    '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+    '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+    '<td>'+r.score+'</td>'+
+    '<td>'+btEsc(optL('grade',r.grade))+'</td>'+
+    '<td>'+btEsc(optL('session',r.session))+'</td>'+
+    '<td>'+btEsc(optL('trend',r.trend))+'</td>'+
+    '<td>'+btEsc(optL('volume',r.volume))+'</td>'+
+    optMetricCells(r)+'</tr>').join('') :
+    '<tr><td colspan="13" class="bt-mini">No eligible combinations.</td></tr>';
+  // Best per session
+  const seb=document.getElementById('opt-sess-body');
+  const sessMap=res.best_by_session||{};
+  const sessKeys=Object.keys(sessMap);
+  seb.innerHTML = sessKeys.length ? sessKeys.map(k=>{ const r=sessMap[k]; return '<tr>'+
+    '<td>'+btEsc(optL('session',k))+'</td>'+
+    '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+    '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+    '<td>'+r.score+'</td>'+
+    '<td>'+btEsc(optL('grade',r.grade))+'</td>'+
+    '<td>'+btEsc(optL('trend',r.trend))+'</td>'+
+    '<td>'+btEsc(optL('volume',r.volume))+'</td>'+
+    '<td>'+r.trades+'</td>'+
+    '<td>'+(r.win_rate==null?'—':r.win_rate+'%')+'</td>'+
+    '<td>'+optPF(r.pf)+'</td>'+
+    '<td class="'+(r.net_r>=0?'bt-pos':'bt-neg')+'">'+(r.net_r>=0?'+':'')+btNum(r.net_r,2)+'R</td>'+
+    '<td>'+btNum(r.max_dd_r,2)+'</td></tr>'; }).join('') :
+    '<tr><td colspan="12" class="bt-mini">No eligible combinations.</td></tr>';
+  // Best per regime
+  const rgb=document.getElementById('opt-reg-body');
+  const regMap=res.best_by_regime||{};
+  const regKeys=Object.keys(regMap);
+  rgb.innerHTML = regKeys.length ? regKeys.map(k=>{ const r=regMap[k]; return '<tr>'+
+    '<td>'+btEsc(k)+'</td>'+
+    '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+    '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+    '<td>'+r.score+'</td>'+
+    optMetricCells(r)+'</tr>'; }).join('') :
+    '<tr><td colspan="10" class="bt-mini">No regime had enough trades.</td></tr>';
+  // Ranked-table strategy filter
+  const sel=document.getElementById('opt-rk-sel');
+  let opts='<option value="all">All strategies</option>';
+  (res.strategies||[]).forEach(k=>{ opts+='<option value="'+k+'">'+btEsc(optL('strategy',k))+'</option>'; });
+  sel.innerHTML=opts; sel.value='all';
+  optRenderTable();
+  // Worst to avoid
+  const w=document.getElementById('opt-worst'); const wr=res.worst_to_avoid;
+  if(wr){ w.className='bt-msg'; w.textContent='Lowest-ranked eligible combination: '+optCombo(wr)+
+    ' → Net '+btNum(wr.net_r,2)+'R · PF '+optPF(wr.pf)+' · '+wr.trades+' trades · Max DD '+btNum(wr.max_dd_r,2)+'R.'; }
+  else { w.className='bt-msg'; w.textContent='No eligible combination to flag.'; }
+  // Notes
+  const nb=document.getElementById('opt-notes');
+  nb.innerHTML=(res.notes||[]).map(n=>'<li>'+btEsc(n)+'</li>').join('');
+}
+
+function optRenderTable(){
+  const res=optResult; if(!res) return;
+  const f=document.getElementById('opt-rk-sel').value;
+  let rows=(res.table||[]).slice();
+  if(f!=='all') rows=rows.filter(r=>r.strategy===f);
+  document.getElementById('opt-rk-cap').textContent='(top '+rows.length+' of '+res.total_combos+' combos)';
+  const tb=document.getElementById('opt-rk-body');
+  tb.innerHTML = rows.length ? rows.map((r,idx)=>{
+    const npos=(r.net_r>=0); const elig=(r.trades>=res.min_trades);
+    return '<tr'+(elig?'':' style="opacity:.55"')+'>'+
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+      '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+      '<td>'+r.score+'</td>'+
+      '<td>'+btEsc(optL('grade',r.grade))+'</td>'+
+      '<td>'+btEsc(optL('session',r.session))+'</td>'+
+      '<td>'+btEsc(optL('trend',r.trend))+'</td>'+
+      '<td>'+btEsc(optL('volume',r.volume))+'</td>'+
+      '<td>'+r.trades+'</td>'+
+      '<td>'+(r.win_rate==null?'—':r.win_rate+'%')+'</td>'+
+      '<td>'+optPF(r.pf)+'</td>'+
+      '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(r.net_r,2)+'R</td>'+
+      '<td>'+btNum(r.avg_r,3)+'</td>'+
+      '<td>'+btNum(r.max_dd_r,2)+'</td>'+
+      '<td>'+btEsc(r.best_hour_label||'—')+'</td>'+
+      '</tr>';
+  }).join('') : '<tr><td colspan="15" class="bt-mini">No combinations for this filter.</td></tr>';
+}
+
+async function optExport(){
+  if(!optRunId){ toast('Run an optimization study first', false); return; }
+  try{
+    const r=await fetch(BASE+'/backtest/export?run_id='+optRunId, {cache:'no-store'});
+    if(!r.ok){ toast('Export failed', false); return; }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='optimization_run_'+optRunId+'.csv';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(url), 2000);
   }catch(e){ toast('Export failed', false); }

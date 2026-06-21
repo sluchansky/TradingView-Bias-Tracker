@@ -20,7 +20,7 @@ SAME shared Edge helper (`compute_trade_edge_components`) so gate score == displ
 - **FAIL-OPEN is the core safety rule:** when CVD is unknown for the instrument, `cvd_ok` is True —
   the filter never blocks on missing data. This is why SWING is unchanged today (no CVD feed yet):
   CVD applies to BOTH modes but fail-open makes it a no-op until a feed arrives.
-- When CVD CONFIRMS the trade direction it credits a **+10 "CVD Agreement"** Edge component
+- When CVD CONFIRMS the trade direction it credits a **+15 "CVD Agreement"** Edge component
   (`cvd_confirmed` in `EDGE_COMPONENTS`). Confirmation alone never makes a trade — it is one
   confluence among the others, behind the READY floor.
 **Why fail-open, not fail-closed:** a confirmation filter that blocks on absence would silently kill
@@ -56,21 +56,24 @@ flip logic must keep the gate reading committed `state` only — never let the g
 "Distinct candle" = server-receipt minute today; if it must mean chart candle, bucket on a TV-sent
 candle timestamp instead.
 
-## RVOL = SOFT Edge modifier, NEVER gates
+## RVOL — feeds the Volume component, NEVER gates (standalone ± modifier is RETIRED)
 - Optional `rvol` field parsed off ANY webhook payload into `RVOL_BY_TICKER` (no dedicated alert type).
-- `_rvol_adjustment(rvol)`: **+10 if ≥1.5, 0 if missing or 1.0–1.5, −5 if <1.0.** Passed as
-  `rvol_adj` into `compute_trade_edge_components` and shown as an "RVOL" breakdown line.
-- It NEVER appears in `gates_ok` / failed gates and NEVER forces WAIT — it only nudges the Edge score
-  (which can in turn move a borderline setup across the READY floor, but RVOL itself is not a gate).
+- **CURRENT:** RVOL is one half of the **Volume +15** `EDGE_COMPONENTS` term — `volume_confirmed`
+  is True when a fresh volume spike exists OR `rvol ≥ cfg("RVOL_CONFIRM_THRESHOLD")` (≈1.5). There is
+  **NO standalone RVOL ± Edge modifier anymore** (`_rvol_adjustment` and the old `rvol_adj`/`vol_adj`
+  params into `compute_trade_edge_components` were REMOVED). RVOL NEVER appears in `gates_ok` / failed
+  gates and NEVER forces WAIT.
 **Why:** RVOL is a quality signal, not a permission signal; making it a gate would reject valid
-structure on a quiet bar.
+structure on a quiet bar. The old +10/−5 modifier was folded into the first-class Volume component.
 
-## Edge ceiling + thresholds that came with this
-- `EDGE_SCORE_MAX` raised 100 → 120 (the six confluences sum to 100; CVD +10 and RVOL +10 lift the
-  ceiling). Every `/100` display (embeds + dashboard bars) must use `EDGE_SCORE_MAX`, injected into
-  the dashboard JS via a `__EDGE_MAX__` placeholder replace at the `/dashboard` return.
-- SCALP READY floor 75, A+ at ≥85 (see edge-score-card-block for grade/strength bands). SWING stays
-  80/80 byte-for-byte; CVD fail-open + RVOL-never-gates are what keep SWING identical.
+## Edge ceiling + thresholds
+- **`EDGE_SCORE_MAX` is 110** (current): the 7 `EDGE_COMPONENTS` sum to exactly 110
+  (BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10). (HISTORICAL: an interim model briefly used
+  120 with a separate RVOL +10 modifier — that is GONE; do NOT assume 120 or a zone/candle term.)
+  Every `/N` display (embeds + dashboard bars) must use `EDGE_SCORE_MAX`, injected into the dashboard
+  JS via a `__EDGE_MAX__` placeholder replace at the `/dashboard` return.
+- A+ at ≥85 (see edge-score-card-block for the grade/strength bands and the mode-tunable READY floor).
+  SWING stays byte-for-byte; CVD fail-open + RVOL-never-gates are what keep SWING identical.
 
 ## Display path
 CVD/RVOL reach the dashboard via `alert_diagnostics` (cvd_state/cvd_value/cvd_direction/
