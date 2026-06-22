@@ -13280,6 +13280,52 @@ async function refreshRec() {
   } catch(e) {}
 }
 
+// ── Live-anchored POTENTIAL preview (DISPLAY ONLY) ─────────────────────────
+// The server's potential_plan anchors Entry/Stop/T1/T2 to the setup ZONE, so the
+// numbers look frozen while price drifts. For the forming preview ONLY, re-anchor
+// those four prices to the LIVE price on a 30s heartbeat (they hold steady, then
+// jump every 30s) so they visibly track the market. The plan GEOMETRY (stop /
+// target distances, R:R, ATR, ticks, risk, zone width) is preserved verbatim from
+// the authoritative server plan — only the anchor point moves. This NEVER feeds the
+// broker path: Apply / Copy / Send stay hidden here and key off the top-level
+// trade_plan + actionable verdict, never this preview.
+let _ppAnchor = {};                 // "INST|DIR" -> { price, ts }
+const PP_REANCHOR_MS = 30000;       // re-anchor the preview to the live price every 30s
+function _liveAnchoredPotential(pp, dir, inst) {
+  const live = (lastRec && lastRec.display_price != null) ? lastRec.display_price
+             : (lastRec && lastRec.current_price != null) ? lastRec.current_price : null;
+  if (pp == null || live == null || isNaN(Number(live))) {
+    return { anchored: false, plan: pp, anchorTxt: '', secsLeft: null };
+  }
+  const key = inst + '|' + dir;
+  const now = Date.now();
+  let a = _ppAnchor[key];
+  if (!a || (now - a.ts) >= PP_REANCHOR_MS) { a = { price: Number(live), ts: now }; _ppAnchor[key] = a; }
+  const anchor = a.price;
+  const TICK = (inst === 'MGC') ? 0.1 : 0.25;
+  const DEC  = (inst === 'MGC') ? 1 : 2;
+  const rt   = (x) => Math.round(x / TICK) * TICK;
+  const fmt  = (x) => rt(x).toFixed(DEC);
+  // Geometry from the authoritative server plan: offsets relative to the entry mid.
+  const parts = String(pp.entry_zone == null ? '' : pp.entry_zone).split(/\s*[–—-]\s*/);
+  let lo = parseFloat(parts[0]); let hi = parts.length > 1 ? parseFloat(parts[1]) : lo;
+  if (isNaN(lo)) lo = anchor; if (isNaN(hi)) hi = lo;
+  const entryMid = (lo + hi) / 2;
+  const width = Math.abs(hi - lo);
+  const reanch = (t) => {
+    const n = (t == null) ? NaN : Number(t);
+    if (isNaN(n)) return t;                 // preserve unparseable values untouched
+    return fmt(anchor + (n - entryMid));    // same signed offset, new anchor
+  };
+  const plan = Object.assign({}, pp);
+  plan.entry_zone = width > 0 ? (fmt(anchor - width / 2) + '–' + fmt(anchor + width / 2)) : fmt(anchor);
+  plan.stop_loss  = reanch(pp.stop_loss);
+  plan.target1    = reanch(pp.target1);
+  plan.target2    = reanch(pp.target2);
+  const secsLeft  = Math.max(0, Math.ceil((PP_REANCHOR_MS - (now - a.ts)) / 1000));
+  return { anchored: true, plan: plan, anchorTxt: fmt(anchor), secsLeft: secsLeft };
+}
+
 // Render the checklist + edge score + plan/reason for the CURRENTLY SELECTED
 // direction (the Long/Short toggle). Reads lastRec.directions[dir]; falls back to
 // the authoritative favored block if directions is missing (older server).
@@ -13383,10 +13429,20 @@ function renderDirView() {
     // actions (Apply / Copy / Send) stay hidden: they are gated on the actionable
     // verdict + the top-level trade_plan, never on this preview.
     const miss = (blk && blk.missing && blk.missing.length) ? blk.missing.join(', ') : 'confirmation';
+    // Re-anchor the four preview prices to the LIVE price every 30s so they visibly
+    // track the market (the server plan is zone-anchored, so it otherwise looks
+    // frozen). Geometry is preserved; the broker path never reads this preview.
+    const ppInst = (d.active_ticker||'').toString().replace('1!','') || sym;
+    const la = _liveAnchoredPotential(pp, dir, ppInst);
+    const shown = la.anchored ? la.plan : pp;
+    const anchNote = la.anchored
+      ? '<div style="color:#22c55e;font-size:11px;margin-top:5px">⟳ Preview anchored to live price <b>'+la.anchorTxt+'</b> · updates every 30s'+(la.secsLeft!=null?' (next in '+la.secsLeft+'s)':'')+' · actual setup zone unchanged</div>'
+      : '';
     planEl.style.display = 'block';
     planEl.innerHTML =
       '<div style="color:#f59e0b;font-weight:600;margin-bottom:4px">⏳ POTENTIAL '+dir.toUpperCase()+' — not yet READY</div>' +
-      planRow(pp) +
+      planRow(shown) +
+      anchNote +
       '<div style="color:#6b7280;font-size:11px;margin-top:5px">Preview only · waiting on: '+miss+' · no broker order until READY</div>';
     apply.style.display = 'none';
     if (copyBtn) copyBtn.style.display = 'none';

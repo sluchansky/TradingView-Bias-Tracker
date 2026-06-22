@@ -28,3 +28,13 @@ VWAP/anchor-only states don't spam previews), (3) default the field to None on e
 directions block for reader parity, and (4) guard the frontend on `pp && pp.trade_plan`
 so a no-plan dict (trade_plan:False) or None hides cleanly. Never broaden top-level
 `trade_plan` for non-READY states.
+
+**Zone-anchored numbers look "frozen" by design — NOT a bug.** entry_zone is the setup
+zone bounds and targets are fixed offsets, so the preview numbers barely move while
+price drifts. A client-side display-only variant (`_liveAnchoredPotential` in
+`renderDirView`'s POTENTIAL branch) re-anchors entry/stop/T1/T2 to the LIVE price on a
+30s heartbeat so they visibly track the market, PRESERVING the server plan's geometry
+(signed offset from entry mid; rr/atr/ticks/risk copied untouched). It returns a COPY
+(`shown`) used ONLY for `planRow` display — never reuse `shown` in the READY/Apply/Send
+paths. If asked to make preview numbers "update", this is the lever; do it in JS, never
+by re-anchoring the server `potential_plan` (that's zone-authoritative).
