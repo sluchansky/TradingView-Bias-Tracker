@@ -12002,7 +12002,7 @@ def dashboard():
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
 <div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
-  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 READY alerts: on</span>
+  <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Setup bell: on</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
 </div>
 
@@ -13440,32 +13440,64 @@ function _ensureAudio() {
   } catch(e) {}
   return _audioCtx;
 }
+// One-time autoplay unlock: first user gesture primes the AudioContext so the
+// first READY bell is never swallowed by the browser's autoplay policy.
+try {
+  window.addEventListener('pointerdown', _ensureAudio, { once: true });
+  window.addEventListener('keydown', _ensureAudio, { once: true });
+} catch(e) {}
 function playReadyChime() {
   if (!soundOn) return;
   const ctx = _ensureAudio();
   if (!ctx) return;
-  const t0 = ctx.currentTime;
-  [880, 1175, 1568].forEach(function(f, i){
-    const o = ctx.createOscillator(), g = ctx.createGain();
-    o.type = 'sine'; o.frequency.value = f;
-    const t = t0 + i * 0.18;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(0.35, t + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
-    o.connect(g); g.connect(ctx.destination);
-    o.start(t); o.stop(t + 0.18);
-  });
+  try {
+  const t0  = ctx.currentTime;
+  const dur = 2.8;
+
+  // Master output: loud strike, long sustain, short decay tail.
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0.0001, t0);
+  master.gain.exponentialRampToValueAtTime(0.85, t0 + 0.015);
+  master.gain.setValueAtTime(0.85, t0 + dur - 0.45);
+  master.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  master.connect(ctx.destination);
+
+  // Clapper: a square LFO hammers the bell ~22x/sec for the buzzy ring.
+  // gate.gain base 0.5 + LFO(+/-0.5) -> oscillates 0..1 (on/off).
+  const gate = ctx.createGain();
+  gate.gain.setValueAtTime(0.5, t0);
+  gate.connect(master);
+  const lfo = ctx.createOscillator(), lfoAmt = ctx.createGain();
+  lfo.type = 'square'; lfo.frequency.value = 22;
+  lfoAmt.gain.value = 0.5;
+  lfo.connect(lfoAmt); lfoAmt.connect(gate.gain);
+  lfo.start(t0); lfo.stop(t0 + dur);
+
+  // Bright metallic timbre: detuned inharmonic partials through a bandpass.
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass'; bp.frequency.value = 2000; bp.Q.value = 0.7;
+  bp.connect(gate);
+  [[640,0.50,'sawtooth'],[965,0.34,'sawtooth'],[1290,0.22,'square'],[2570,0.14,'square']]
+    .forEach(function(p){
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = p[2]; o.frequency.value = p[0];
+      o.detune.value = (Math.random()*16 - 8);
+      g.gain.value = p[1];
+      o.connect(g); g.connect(bp);
+      o.start(t0); o.stop(t0 + dur + 0.05);
+    });
+  } catch(e) {}
 }
 function paintSndToggle() {
   const el = document.getElementById('snd-toggle');
-  if (el) el.textContent = soundOn ? '🔔 READY alerts: on' : '🔕 READY alerts: off';
+  if (el) el.textContent = soundOn ? '🔔 Setup bell: on' : '🔕 Setup bell: off';
 }
 function toggleSound() {
   soundOn = !soundOn;
   localStorage.setItem('readySound', soundOn ? 'on' : 'off');
   paintSndToggle();
-  if (soundOn) { _ensureAudio(); playReadyChime(); toast('🔔 Alert sound on'); }
-  else toast('🔕 Alert sound off');
+  if (soundOn) { _ensureAudio(); playReadyChime(); toast('🔔 Setup bell on'); }
+  else toast('🔕 Setup bell off');
 }
 // ── Theme toggle: switch between vaporwave (default) and Retro Terminal Mode ──
 function paintThemeToggle() {
