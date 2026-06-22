@@ -57,3 +57,28 @@ makes `zone_valid_*` False → READY still fails. Expiry can never create a READ
 **How to apply:** any new mitigation-derived signal must read the per-instrument
 dicts (gate the flag with this-instrument proximity), never reintroduce a global
 flag, and must not treat bare confirmations as reactions.
+
+## Proximity is an INSTRUMENT-SCALED absolute points band (not a flat %)
+
+`is_near_mitigated_zone` compares `abs(price - ref) <= tol` where
+`tol = spec.mitig_tol_pts` (per-instrument absolute POINTS), falling back to
+`abs(ref) * MITIGATED_TOLERANCE_PCT` (0.3%) only for an instrument without a spec.
+Defaults are env-overridable: `MNQ_MITIG_TOL_PTS=15.0`, `MGC_MITIG_TOL_PTS=12.0`
+(via `_spec_float_env`, mirroring `min_stop_ticks`).
+
+**Why:** a flat 0.3% does not scale across price levels — ~92 pts on MNQ@30k
+(> 4x its 20-pt tp1) vs ~12.6 pts on MGC@4.2k. On a choppy structureless MNQ night
+one mitigated zone's ~92-pt band swallowed the whole session's ~27-pt range, so
+EVERY MNQ evaluation read "near a consumed zone" → constant "scoring skipped". MGC
+@12 ≈ its old 12.6 (intentionally unchanged — least surprise; only MNQ was broken).
+
+**Money-safe:** tightening only NARROWS the band → can only REMOVE over-blocking
+(zone_mitigated_near WAIT) and make `has_mitigated_*`→`zone_valid_*` HARDER (more
+conservative). Same argument as the TTL: never fabricates a READY (structure + edge
++ reaction still gate). A genuinely new zone >tol from a consumed level is no longer
+falsely treated as consumed; price sitting on the zone still correctly blocks.
+
+**How to apply:** keep consumed-zone proximity in absolute points per instrument;
+if real MNQ zones routinely span wider than tol, raise `MNQ_MITIG_TOL_PTS` (no code
+change) rather than reverting to a percentage. Note: the LIVE deployed app runs its
+own copy — a code change here needs a republish to take effect in production.

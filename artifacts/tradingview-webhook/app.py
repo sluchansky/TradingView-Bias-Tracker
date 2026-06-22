@@ -423,11 +423,19 @@ def _spec_int_env(name, default):
     except (TypeError, ValueError):
         return int(default)
 
+def _spec_float_env(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
 INSTRUMENT_SPECS = {
     "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
-            "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40)},
+            "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
+            "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0)},
     "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
-            "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50)},
+            "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
+            "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0)},
 }
 
 def instrument_of(ticker):
@@ -3013,7 +3021,10 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
 # ---------------------------------------------------------------------------
 
 ZONE_BROKEN_EXPIRY       = 5      # Expire ZONE_BROKEN_AT after N subsequent non-zone alerts
-MITIGATED_TOLERANCE_PCT  = 0.003  # 0.3% proximity check for consumed zone warning
+MITIGATED_TOLERANCE_PCT  = 0.003  # legacy % proximity — FALLBACK only; per-instrument
+                                  # absolute points band (spec.mitig_tol_pts) is preferred.
+                                  # A flat 0.3% is ~92 pts on MNQ@30k (blankets the whole
+                                  # session) vs ~12.6 pts on MGC@4.2k — hence instrument-scaled.
 
 
 def _handle_zone_broken(price, instrument=None):
@@ -3057,8 +3068,9 @@ def _handle_zone_mitigated(price, ticker):
 
 
 def is_near_mitigated_zone(price, ticker):
-    """Return (True, consumed_price) if `price` is within MITIGATED_TOLERANCE_PCT
-    of any of THIS instrument's mitigated zones that are still fresh.
+    """Return (True, consumed_price) if `price` is within the instrument's
+    consumed-zone proximity band of any of THIS instrument's mitigated zones that
+    are still fresh.
 
     Entries older than the active mode's MITIGATED_TTL_MIN are expired (and pruned
     in place) so a stale consumed zone no longer suppresses scoring forever — the
@@ -3087,9 +3099,17 @@ def is_near_mitigated_zone(price, ticker):
         records = fresh
         if not records:
             return False, None
+    # Proximity is an instrument-scaled ABSOLUTE points window: a consumed zone
+    # blocks only its own price area, not a price-proportional slice. A flat 0.3%
+    # is ~92 pts on MNQ (> 4x its 20-pt first target) which blanketed the whole
+    # session. Fall back to the legacy percentage for any instrument lacking a spec.
+    tol_pts = INSTRUMENT_SPECS.get(inst, {}).get("mitig_tol_pts")
     for mz in records:
         ref = mz["price"]
-        if ref and abs(price - ref) / ref <= MITIGATED_TOLERANCE_PCT:
+        if not ref:
+            continue
+        tol = tol_pts if tol_pts is not None else abs(ref) * MITIGATED_TOLERANCE_PCT
+        if abs(price - ref) <= tol:
             return True, ref
     return False, None
 
