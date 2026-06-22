@@ -1,0 +1,57 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// Volume Spike -> Webhook  (MGC / MNQ)
+//
+// Fires a volume-spike alert when a bar closes with relative volume well above
+// its recent average:
+//   • Spike = bar volume >= average(volume, lookback) * multiplier.
+//
+// On a confirmed spike it fires an alert() call whose message is the exact JSON
+// the webhook app expects, e.g.
+//   {"alert_type": "MGC VOLUME SPIKE", "ticker": "MGC1!", "price": "4209.8"}
+//
+// The webhook treats a spike as data-only: it stores the arrival time and keeps
+// it "fresh" for ~20 minutes as one half of the +15 volume edge (paired with
+// RVOL). It never scores or biases on its own and is FAIL-OPEN.
+//
+// WHY THIS SCRIPT EXISTS:
+//   A hand-typed alert with {"ticker":"{{ticker}}","price":{{close}}} does NOT
+//   work — TradingView does not substitute {{...}} placeholders inside an
+//   alert() message, so the app receives the literal text, rejects the
+//   unrecognized ticker, and fails to parse the malformed price. This script
+//   builds the JSON with real values (syminfo.ticker + str.tostring(close)),
+//   exactly like the confirmation and sweep scripts.
+//
+// SETUP (one alert per chart):
+//   1. Add this script to your MGC1! chart (and again to your MNQ1! chart).
+//   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
+//   3. Paste your webhook URL under Notifications -> Webhook URL.
+//   4. Leave the message box as-is (the script supplies the JSON). Save.
+//   Auto-detect sets MGC/MNQ from the symbol, so the same script works on both
+//   charts with no manual Instrument setting to get wrong.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("Volume Spike -> Webhook (MGC/MNQ)", overlay=true)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ"])
+lookback     = input.int(20,  "Volume average lookback (bars)", minval=2, tooltip="Bars used for the average-volume baseline.")
+multiplier   = input.float(2.0, "Spike multiplier", minval=1.0, step=0.1, tooltip="Bar volume must be at least this many times the average to count as a spike.")
+showMarks    = input.bool(true, "Show spike markers on chart")
+
+prefix  = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : "MGC") : manualPrefix
+profile = prefix + " Standard"
+
+// ── Volume-spike detection ─────────────────────────────────────────────────
+avgVol = ta.sma(volume, lookback)
+spike  = not na(avgVol) and avgVol > 0 and volume >= avgVol * multiplier
+
+// ── Webhook payload (exact alert_type string the app recognises) ───────────
+spikeMsg = '{"alert_type": "' + prefix + ' VOLUME SPIKE", "ticker": "' + syminfo.ticker + '", "price": "' + str.tostring(close) + '", "profile": "' + profile + '"}'
+
+if barstate.isconfirmed and spike
+    alert(spikeMsg, alert.freq_once_per_bar_close)
+
+// ── Visuals ────────────────────────────────────────────────────────────────
+plotshape(showMarks and spike, title="Volume Spike", style=shape.diamond, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny, text="Vol")
+// © sluchansky
