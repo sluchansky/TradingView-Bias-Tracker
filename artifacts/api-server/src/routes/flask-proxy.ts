@@ -75,6 +75,7 @@ router.all(
     "/eval-metrics",
     "/status",
     "/mode",
+    "/alerts/mute",
     "/journal",
     "/journal/",
     "/eod",

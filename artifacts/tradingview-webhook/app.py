@@ -459,6 +459,32 @@ def _instrument_from_text(value):
         return "MGC"
     return None
 
+
+# ── Per-instrument alert mute (server-side, in-memory) ────────────────────────
+# When an instrument is muted the engine STILL evaluates it, writes the journal
+# record, and records diagnostics/eval-metrics — only its Discord NEW-SETUP alert
+# sends are suppressed (live READY card incl. @everyone + A+ mirror, EARLY teaser,
+# tiered WATCH/ARMED, new-entry journal embed, zone-mitigated notice). Lifecycle /
+# outcome / execution alerts for an ALREADY-ACTIVE position are NEVER muted (a live
+# position's stop/target must always alert). In-memory BY DESIGN: a restart /
+# republish resets to unmuted — fail-safe, since a stale silent mute that drops
+# real alerts forever is worse for a trading tool than re-enabling on restart.
+ALERTS_MUTED      = {"MGC": False, "MNQ": False}
+ALERTS_MUTED_LOCK = threading.Lock()
+
+
+def _alerts_muted(ticker_or_inst):
+    """True iff alerts for the instrument named by `ticker_or_inst` are muted.
+    STRICT: resolves to MGC/MNQ only when the value UNAMBIGUOUSLY names one (via
+    _instrument_from_text); anything unknown/empty/ambiguous is treated as NOT
+    muted, so the fail-safe is always toward alerting (never silence by accident)."""
+    inst = _instrument_from_text(ticker_or_inst)
+    if inst is None:
+        return False
+    with ALERTS_MUTED_LOCK:
+        return bool(ALERTS_MUTED.get(inst, False))
+
+
 def resolve_instrument(ticker_field, alert_type):
     """Authoritative instrument resolution for an incoming TradingView alert.
 
@@ -2581,6 +2607,15 @@ def _strict_checklist_field(strict_label, strict_score, confluences,
 def send_zone_mitigated_message(alert_data, mitigated_price):
     """Minimal Discord embed for zone-consumed state — no scoring performed."""
     ticker    = alert_data.get("ticker") or "MGC"
+    # Suppress for a muted instrument. Resolve from the AUTHORITATIVE fields, not
+    # the raw ticker alone: a title-resolved alert can arrive with ticker=None
+    # while `instrument` (resolved_inst) / `alert_type` still name MNQ/MGC, so
+    # checking ticker alone would let a muted notice escape. _alerts_muted() stays
+    # strict (anything that doesn't unambiguously name one instrument → not muted).
+    if _alerts_muted(alert_data.get("ticker")
+                     or alert_data.get("instrument")
+                     or alert_data.get("alert_type")):
+        return
     _url      = _discord_url(ticker)
     if not _url:
         logger.warning("DISCORD_WEBHOOK_URL not set — skipping")
@@ -6581,6 +6616,10 @@ def send_journal_discord_embed(entry):
     if not DISCORD_JOURNAL_WEBHOOK_URL:
         logger.warning("DISCORD_JOURNAL_WEBHOOK_URL not set — journal Discord post skipped")
         return
+    # Muted: skip the Discord embed only. The journal RECORD is created separately
+    # (create_journal_entry, post_discord=False), so the dashboard/DB keep it.
+    if _alerts_muted(entry.get("symbol") or entry.get("instrument")):
+        return
 
     embed = _build_trade_card_embed(entry, f"Journal Entry #{entry['id']}")
 
@@ -6760,11 +6799,21 @@ def send_live_ready_card(entry, ticker="", notify=False):
     notify=True prepends DISCORD_ALERT_MENTION (e.g. @everyone) so the message
     pings phones set to "Only @mentions". Used ONLY for the instant first post of
     a fresh setup; the 5-min re-post loop calls with notify=False so a standing
-    READY setup buzzes the phone once, not every interval."""
+    READY setup buzzes the phone once, not every interval.
+
+    Returns True iff the main live-card Discord POST was actually DISPATCHED (the
+    URL is set AND the instrument is not muted), so callers count only a real alert
+    (alert_sent_at / alerts_sent). When the instrument is muted the two Discord
+    POSTs are skipped but every TRACKING side-effect still runs — throttle stamps,
+    _register_managed_trade and the LAST_READY snapshot — so a muted instrument is
+    evaluated and tracked exactly like an un-muted one, just silently."""
     url = _discord_url(ticker or entry.get("symbol", ""))
     if not url:
         logger.warning("DISCORD_WEBHOOK_URL not set — live ready card skipped")
-        return
+        return False
+    # Checked at SEND time (most up-to-date) — suppresses ONLY the two Discord
+    # POSTs below, never the tracking that follows.
+    muted = _alerts_muted(ticker or entry.get("symbol", ""))
     footer = f"Live Signal · {entry.get('symbol') or ticker or '—'}"
     # Record the send time per-instrument so the periodic loop throttles against it
     # (prevents an instant card and a periodic card landing seconds apart).
@@ -6775,31 +6824,38 @@ def send_live_ready_card(entry, ticker="", notify=False):
     # Build + post inside the guard so a render failure (e.g. an unforeseen new
     # card field) can never raise into the caller — the alert path stays fail-open.
     embed = None
-    try:
-        embed = _build_trade_card_embed(entry, footer)
-        payload = {"embeds": [embed]}
-        if notify and DISCORD_ALERT_MENTION:
-            # The single phone-pinging message: prepend the mention and allow it
-            # so a "Only @mentions" device buzzes exactly on a fresh READY setup.
-            payload["content"] = DISCORD_ALERT_MENTION
-            payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code not in (200, 204):
-            logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
-    except Exception as exc:
-        logger.error("Live ready card build/post error: %s", exc)
-    # Optionally mirror 🔥 A+ setups to a dedicated channel (additive — the card
-    # already posted to the normal channel above, so this never blocks/relocates
-    # Possible/Strong/A+ alerts). Skipped entirely when no A+ channel is set.
-    try:
-        if (embed is not None and entry.get("trade_strength") == "A+ Setup"
-                and DISCORD_APLUS_WEBHOOK_URL and DISCORD_APLUS_WEBHOOK_URL != url):
-            requests.post(DISCORD_APLUS_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
-    except Exception as exc:
-        logger.error("A+ channel mirror error: %s", exc)
+    dispatched = False
+    if not muted:
+        try:
+            embed = _build_trade_card_embed(entry, footer)
+            payload = {"embeds": [embed]}
+            if notify and DISCORD_ALERT_MENTION:
+                # The single phone-pinging message: prepend the mention and allow it
+                # so a "Only @mentions" device buzzes exactly on a fresh READY setup.
+                payload["content"] = DISCORD_ALERT_MENTION
+                payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
+            resp = requests.post(url, json=payload, timeout=10)
+            dispatched = True
+            if resp.status_code not in (200, 204):
+                logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            logger.error("Live ready card build/post error: %s", exc)
+        # Optionally mirror 🔥 A+ setups to a dedicated channel (additive — the card
+        # already posted to the normal channel above, so this never blocks/relocates
+        # Possible/Strong/A+ alerts). Skipped entirely when no A+ channel is set.
+        try:
+            if (embed is not None and entry.get("trade_strength") == "A+ Setup"
+                    and DISCORD_APLUS_WEBHOOK_URL and DISCORD_APLUS_WEBHOOK_URL != url):
+                requests.post(DISCORD_APLUS_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        except Exception as exc:
+            logger.error("A+ channel mirror error: %s", exc)
+    else:
+        logger.info("Live ready card suppressed (alerts muted): %s",
+                    instrument_of(ticker or entry.get("symbol", "")))
     # ── Additive: register the setup with the trade-management watcher and store
     # the latest READY snapshot (for /why). Both fail-open so a hiccup here can
-    # never block the alert that already posted above. ──
+    # never block the alert that already posted above. These run REGARDLESS of mute
+    # so a muted instrument stays fully tracked (no data gap). ──
     try:
         _register_managed_trade(entry, ticker)
     except Exception as exc:
@@ -6808,6 +6864,7 @@ def send_live_ready_card(entry, ticker="", notify=False):
         LAST_READY_BY_TICKER[instrument_of(ticker or entry.get("symbol", ""))] = entry
     except Exception as exc:
         logger.error("LAST_READY snapshot error: %s", exc)
+    return dispatched
 
 
 # ── Tiered WATCH/ARMED early alerts (SCALP) ───────────────────────────────────
@@ -6904,6 +6961,9 @@ def _post_tiered_embed(url, embed, inst, level):
     the webhook worker (via _enqueue_slow) so a slow or timing-out Discord call can
     never delay the decision, the READY card, the journal enqueue, or the next
     webhook evaluation. Best-effort — logs and swallows any failure."""
+    # Muted-instrument choke point (covers WATCH/ARMED + SETUP BUILDING enqueues).
+    if _alerts_muted(inst):
+        return
     try:
         resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
         if resp.status_code not in (200, 204):
@@ -6930,6 +6990,11 @@ def _maybe_send_tiered_alert(a, record):
     inst  = instrument_of(record.get("ticker") or record.get("instrument")
                           or a.get("active_ticker") or "")
     if not inst:
+        return False
+    # Muted: skip the tiered WATCH/ARMED early alert entirely — no enqueue and not
+    # counted as sent (tiered_sent stays False). The instrument was still evaluated
+    # above; only the Discord teaser is suppressed.
+    if _alerts_muted(inst):
         return False
 
     # READY: record (so a later ARMED/WATCH is a transition) but let the live card post it.
@@ -7157,6 +7222,10 @@ def _post_early_embed(url, embed, inst, direction, ping):
     """Slow-task worker body: POST a prebuilt EARLY embed to Discord, OFF the
     webhook worker (via _enqueue_slow) so a slow/timing-out call can never delay the
     decision, the READY card, or the next webhook. Best-effort — swallows failures."""
+    # Muted: suppress the EARLY teaser send (dedupe/diagnostics state already set
+    # at enqueue time is preserved, so tracking is unaffected).
+    if _alerts_muted(inst):
+        return
     try:
         payload = {"embeds": [embed]}
         if ping and DISCORD_ALERT_MENTION:
@@ -9415,11 +9484,16 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     if (journal_entry and not ACTIVE_TRADE
             and is_actionable(a.get("verdict"))):
         try:
-            send_live_ready_card(journal_entry,
+            _dispatched = send_live_ready_card(journal_entry,
                                  record.get("ticker") or record.get("instrument")
                                  or journal_entry.get("instrument"),
                                  notify=True)
-            alert_sent_at = now_utc()
+            # Stamp the alert time ONLY when a Discord card was actually sent, so a
+            # muted instrument never inflates alert_sent_at / the alerts_sent counter
+            # / the READY->ACTIVE setup-state transition (it is still evaluated and
+            # journaled above — just silent on Discord).
+            if _dispatched:
+                alert_sent_at = now_utc()
         except Exception as exc:
             logger.error("Live-card send error (alert path): %s", exc)
 
@@ -12083,12 +12157,14 @@ def dashboard():
   </div>
   <!-- Instrument focus (display-only): hide one instrument to watch a single
        market at a time. Alerts & tracking keep running in the background for
-       BOTH — this only changes what this browser shows, and the choice is saved
-       locally so it survives reloads and republishes. -->
+       BOTH — unchecking an instrument HIDES its tab AND MUTES its Discord alerts;
+       the engine keeps evaluating, journaling and tracking it silently (no data
+       gap). The mute is server-side, so this row reflects + sets that state. -->
   <div class="focus-row">
-    <span class="focus-lbl">Show</span>
+    <span class="focus-lbl">Focus</span>
     <label class="focus-chip"><input type="checkbox" id="foc-MGC" checked onchange="toggleInstrument('MGC', this.checked)"><span>MGC</span></label>
     <label class="focus-chip"><input type="checkbox" id="foc-MNQ" checked onchange="toggleInstrument('MNQ', this.checked)"><span>MNQ</span></label>
+    <span class="focus-lbl" style="opacity:.6">unchecking mutes its alerts · still tracked</span>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
@@ -12447,10 +12523,13 @@ function setSymbol(s) {
   refreshRec();   // switch the displayed analysis to the selected instrument now
 }
 // ── Instrument focus (DISPLAY-ONLY) ─────────────────────────────────────────
-// Hide an instrument to focus on one market at a time. This NEVER touches the
-// server, the webhook/alert path, or the trade gate — both instruments keep
-// running in the background. The choice is stored per-browser (localStorage) so
-// it survives reloads AND server restarts/republishes.
+// Focus = hide an instrument's tab AND mute its Discord alerts. The trade GATE,
+// scoring, sizing, journaling and diagnostics are NEVER touched — both instruments
+// keep being evaluated/tracked in the background; a muted one just goes silent on
+// Discord (no data gap). The mute is SERVER-SIDE (alert dispatch runs with no
+// browser open), so the server is the source of truth; localStorage is an instant-
+// paint cache reconciled by loadAlertMutes() on boot. A restart/republish resets
+// the server to unmuted (fail-safe toward alerting).
 function instrEnabled(inst){ try { return localStorage.getItem('focus_'+inst) !== '0'; } catch(e){ return true; } }
 function applyInstrumentFocus(){
   const tabs = document.querySelectorAll('.tabs .tab');   // [0]=MGC, [1]=MNQ (matches setSymbol)
@@ -12468,13 +12547,37 @@ function applyInstrumentFocus(){
 }
 function toggleInstrument(inst, on){
   const other = inst==='MGC' ? 'MNQ' : 'MGC';
-  if (!on && !instrEnabled(other)){            // never allow hiding BOTH
+  if (!on && !instrEnabled(other)){            // never allow hiding/muting BOTH
     const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = true;
     toast('Keep at least one instrument showing', false);
     return;
   }
   try { localStorage.setItem('focus_'+inst, on ? '1' : '0'); } catch(e){}
   applyInstrumentFocus();
+  // Persist the alert mute server-side (muted = hidden). Display is already updated
+  // above; this is what actually silences Discord for the hidden pair while it keeps
+  // being evaluated and tracked. On failure, resync from the server so the row never
+  // claims "muted" when the server didn't accept it.
+  api('/alerts/mute', { instrument: inst, muted: !on })
+    .then(function(d){
+      if (!d || d.status !== 'ok'){ toast('Mute update failed', false); loadAlertMutes(); return; }
+      toast(on ? (inst + ' shown — alerts on')
+               : (inst + ' hidden — alerts muted (still tracked)'));
+    })
+    .catch(function(){ toast('Mute update failed', false); loadAlertMutes(); });
+}
+// On boot, reconcile the focus row with the SERVER mute state (authoritative):
+// muted -> hidden, unmuted -> shown. Keeps devices consistent and reflects a
+// post-republish reset (everything unmuted) rather than a stale local choice.
+async function loadAlertMutes(){
+  try {
+    const d = await api('/alerts/mute');
+    if (!d || !d.muted) return;
+    ['MGC','MNQ'].forEach(function(inst){
+      try { localStorage.setItem('focus_'+inst, d.muted[inst] ? '0' : '1'); } catch(e){}
+    });
+    applyInstrumentFocus();
+  } catch(e){}
 }
 function setDir(d) {
   dir = d;
@@ -14305,7 +14408,7 @@ async function optExport(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
@@ -14347,6 +14450,33 @@ def mode():
         "available_modes": list(MODES),
         "thresholds":      MODES[TRADING_MODE],
     }), 200
+
+
+@app.route("/alerts/mute", methods=["GET", "POST"])
+def alerts_mute():
+    """Read or set the per-instrument alert mute flags (MGC / MNQ).
+
+    Muting suppresses the Discord NEW-SETUP alerts for that instrument — the live
+    READY card (incl. @everyone + A+ mirror), the EARLY teaser, the tiered
+    WATCH/ARMED alerts, the new-entry journal embed and the zone-mitigated notice —
+    while the engine keeps EVALUATING it, writing the journal record, and recording
+    diagnostics/eval-metrics (no data gap). Active-position lifecycle / outcome /
+    execution alerts are NEVER muted. State is in-memory and resets to unmuted on
+    restart (fail-safe toward alerting). Owner-only (Basic Auth + CSRF via the
+    Express proxy; deliberately NOT in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        inst = _instrument_from_text(data.get("instrument") or data.get("inst"))
+        if inst is None:
+            return jsonify({"status": "error",
+                            "reason": "instrument must be exactly 'MGC' or 'MNQ'."}), 400
+        muted = bool(data.get("muted"))
+        with ALERTS_MUTED_LOCK:
+            ALERTS_MUTED[inst] = muted
+        logger.info("Alerts %s for %s", "MUTED" if muted else "UNMUTED", inst)
+    with ALERTS_MUTED_LOCK:
+        snapshot = dict(ALERTS_MUTED)
+    return jsonify({"status": "ok", "muted": snapshot}), 200
 
 
 @app.route("/", methods=["GET"])
