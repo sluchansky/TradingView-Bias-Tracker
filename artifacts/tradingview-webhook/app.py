@@ -12940,10 +12940,10 @@ function toggleAuto(inst){
     const prov = AUTO_META.execution_provider_label || AUTO_META.execution_mode || 'manual';
     let msg;
     if (live){
-      msg = 'Enable AUTO-TRADE for ' + inst + '?\n\nThis automatically places REAL orders (' + prov + ') the instant a setup goes READY: ' + (AUTO_META.contracts||1) + ' contract(s), up to ' + (AUTO_META.max_per_day||0) + '/day.';
-      if (!AUTO_META.is_live_instance) msg += '\n\nNote: this is NOT the live instance, so live orders will be skipped here.';
+      msg = 'Enable AUTO-TRADE for ' + inst + '?\\n\\nThis automatically places REAL orders (' + prov + ') the instant a setup goes READY: ' + (AUTO_META.contracts||1) + ' contract(s), up to ' + (AUTO_META.max_per_day||0) + '/day.';
+      if (!AUTO_META.is_live_instance) msg += '\\n\\nNote: this is NOT the live instance, so live orders will be skipped here.';
     } else {
-      msg = 'Enable AUTO-TRADE for ' + inst + '?\n\nExecution mode is ' + prov + ' - no real broker order will be sent.';
+      msg = 'Enable AUTO-TRADE for ' + inst + '?\\n\\nExecution mode is ' + prov + ' - no real broker order will be sent.';
     }
     if (!confirm(msg)) return;
   }

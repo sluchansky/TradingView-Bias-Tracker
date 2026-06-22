@@ -15,6 +15,10 @@ a runtime **500 only on the route that serves that string** (here `/dashboard`).
 text `\ud83e...`; the surrogates only exist after Python compiles the `\u` escapes. So the
 file looks clean while the loaded module is broken.
 
+**It also masks sibling bugs:** while this route 500s, the browser never receives the page,
+so any inline-JS syntax bug on the same route (see `dashboard-js-string-escape-bug.md`)
+stays hidden. After fixing the 500, re-validate the served JS with `node --check`.
+
 **How to apply:**
 - In Python source, never represent an astral emoji as a `\uXXXX\uXXXX` surrogate pair.
   Use the actual glyph (`'🧪'`), or `'\U0001F9EA'` (capital-U 8-digit), or a BMP char
