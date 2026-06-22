@@ -76,6 +76,7 @@ router.all(
     "/status",
     "/mode",
     "/alerts/mute",
+    "/auto-trade",
     "/journal",
     "/journal/",
     "/eod",

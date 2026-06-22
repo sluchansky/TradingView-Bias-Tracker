@@ -638,6 +638,50 @@ TRADERSPOST_COOLDOWN_SEC  = max(0, int(os.environ.get("TRADERSPOST_COOLDOWN_SEC"
 _TRADERSPOST_LOCK = threading.Lock()
 _TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-send guard
 
+
+# -- Auto-trade (hands-free execution) state ----------------------------------
+# When ON for an instrument, a brand-new READY setup automatically routes a
+# server-authoritative order through the SAME audited gateway as the manual button
+# (execute_trade_gateway). OFF by default and RESET TO OFF on every restart/
+# republish (fail-safe toward NOT trading). Live (real-broker) auto execution
+# additionally requires the live/prod instance (DISCORD_LIVE_ENABLED) so a dev
+# instance never places a real auto order on a stray webhook.
+AUTO_TRADE       = {"MGC": False, "MNQ": False}
+AUTO_TRADE_LOCK  = threading.Lock()
+# Serialises the auto-execute critical section so two near-simultaneous READYs
+# can't both pass the no-active-trade check before ACTIVE_TRADE is set after a
+# confirmed send (the webhook worker is single-threaded today; this is defensive).
+_AUTO_EXEC_LOCK  = threading.Lock()
+# Contracts per auto entry (NEVER taken from the browser) + a per-day, per-instrument
+# auto-entry cap (ET-date keyed, in-memory). Both env-overridable; contracts capped
+# by the same server limit as the manual gateway.
+AUTO_TRADE_CONTRACTS   = max(1, min(TRADERSPOST_MAX_CONTRACTS,
+                                    int(os.environ.get("AUTO_TRADE_CONTRACTS", 1))))
+AUTO_TRADE_MAX_PER_DAY = max(1, int(os.environ.get("AUTO_TRADE_MAX_PER_DAY", 5)))
+_AUTO_TRADE_COUNT = {}   # (et_date_str, instrument) -> entries today
+
+
+def auto_trade_enabled(inst):
+    """True when AUTO-TRADE is armed for the resolved instrument."""
+    inst = instrument_of(inst) if inst else None
+    if not inst:
+        return False
+    with AUTO_TRADE_LOCK:
+        return bool(AUTO_TRADE.get(inst))
+
+
+def _auto_trade_count_today(inst):
+    key = (fmt_et(now_utc(), "%Y-%m-%d"), inst)
+    with AUTO_TRADE_LOCK:
+        return _AUTO_TRADE_COUNT.get(key, 0)
+
+
+def _auto_trade_bump_count(inst):
+    key = (fmt_et(now_utc(), "%Y-%m-%d"), inst)
+    with AUTO_TRADE_LOCK:
+        _AUTO_TRADE_COUNT[key] = _AUTO_TRADE_COUNT.get(key, 0) + 1
+
+
 # ── Execution mode (configurable order routing) ──────────────────────────────
 # The dashboard ENTER button routes a server-authoritative order through the ONE
 # audited gate (/traderspost). EXECUTION_MODE selects how that order is delivered:
@@ -9497,6 +9541,19 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         except Exception as exc:
             logger.error("Live-card send error (alert path): %s", exc)
 
+    # -- Auto-trade (hands-free execution; additive + fail-open) --------------
+    # Same fire-once signal as the live card above: create_journal_entry() returns
+    # journal_entry only once per setup, and ACTIVE_TRADE is still None here. When
+    # AUTO is ON for this instrument, route an order through the SAME audited
+    # gateway the manual button uses. Never raises into the webhook worker.
+    if (journal_entry and not ACTIVE_TRADE
+            and is_actionable(a.get("verdict"))
+            and auto_trade_enabled(resolved_inst)):
+        try:
+            _maybe_auto_execute(resolved_inst)
+        except Exception as exc:
+            logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
+
     # Tiered WATCH/ARMED early alert (SCALP only). Mutually exclusive with the READY
     # card above (alert_level is READY vs WATCH/ARMED) and throttled per instrument.
     # The throttle state is recorded synchronously but the Discord POST is offloaded
@@ -11447,29 +11504,25 @@ def enter_trade():
 
 @app.route("/traderspost", methods=["POST"])
 def traderspost_order():
-    """One-tap order execution gateway — the SINGLE audited money gate.
+    """One-tap order execution gateway - the SINGLE audited money gate.
 
     EXECUTION_MODE selects delivery: manual_only (return the plan, no send),
-    paper (simulate/log), traderspost (→ TradersPost → Tradovate), or pickmytrade
-    (→ PickMyTrade webhook). Owner-only: auth is enforced at the Express /api edge —
+    paper (simulate/log), traderspost (-> TradersPost -> Tradovate), or pickmytrade
+    (-> PickMyTrade webhook). Owner-only: auth is enforced at the Express /api edge -
     this route is NOT in OPEN_PATHS, so it requires the dashboard password +
     same-origin, exactly like /enter. Still the ONLY broker-bound requests.post in
     this file (every other one targets Discord): server-authoritative on
     price/direction/size (client sends only ticker + contracts, default 1), live
     providers fail CLOSED, and it never auto-sizes.
+
+    This route only PARSES + validates the request (contracts + instrument); the
+    server-authoritative resolve/gate/send lives in execute_trade_gateway(), so the
+    auto-trade hook shares the EXACT same money gate (incl. the duplicate-send
+    cooldown) with no second divergent broker path.
     """
-    mode = resolve_execution_mode()
-    provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
-
-    # Live providers require their destination URL; manual_only / paper never do.
-    if execution_is_live(mode) and not execution_configured(mode):
-        miss = "TRADERSPOST_WEBHOOK_URL" if mode == "traderspost" else "EXECUTION_WEBHOOK_URL"
-        return jsonify({"status": "error",
-                        "reason": f"{provider_label} is not configured (missing {miss})."}), 400
-
     data = request.get_json(force=True, silent=True) or {}
 
-    # Contract count is the ONLY user-supplied input and it is capped server-side —
+    # Contract count is the ONLY user-supplied input and it is capped server-side -
     # the browser min/step is not a control. Reject non-integer / out-of-range.
     try:
         contracts = int(data.get("contracts", 1))
@@ -11479,7 +11532,7 @@ def traderspost_order():
         return jsonify({"status": "error",
                         "reason": f"contracts must be between 1 and {TRADERSPOST_MAX_CONTRACTS}."}), 400
 
-    # The instrument MUST be explicitly and unambiguously MGC or MNQ — a money-moving
+    # The instrument MUST be explicitly and unambiguously MGC or MNQ - a money-moving
     # route never silently falls back to the active/default instrument.
     _raw = (data.get("ticker") or "").upper()
     if "MGC" in _raw and "MNQ" not in _raw:
@@ -11489,6 +11542,34 @@ def traderspost_order():
     else:
         return jsonify({"status": "error",
                         "reason": "A valid instrument ticker (MGC or MNQ) is required."}), 400
+
+    result, code = execute_trade_gateway(instrument, contracts, source="manual")
+    return jsonify(result), code
+
+
+def execute_trade_gateway(instrument, contracts, source="manual"):
+    """Shared, server-authoritative execution gate behind /traderspost AND the
+    auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
+    auto path reads result["plan"] to track ACTIVE_TRADE. Server-authoritative on
+    price/direction/size; live providers fail CLOSED; duplicate-send guarded; never
+    auto-sizes. instrument is pre-resolved 'MGC'/'MNQ'; contracts is defensively
+    clamped to the same server cap (the manual route already range-checks it)."""
+    mode = resolve_execution_mode()
+    provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
+    logger.debug("execute_trade_gateway: source=%s instrument=%s mode=%s", source, instrument, mode)
+
+    # Live providers require their destination URL; manual_only / paper never do.
+    if execution_is_live(mode) and not execution_configured(mode):
+        miss = "TRADERSPOST_WEBHOOK_URL" if mode == "traderspost" else "EXECUTION_WEBHOOK_URL"
+        return {"status": "error",
+                "reason": f"{provider_label} is not configured (missing {miss})."}, 400
+
+    # Defensive size clamp (never trusts the browser; auto passes a pre-capped value).
+    try:
+        contracts = int(contracts)
+    except (ValueError, TypeError):
+        return {"status": "error", "reason": "contracts must be a whole number."}, 400
+    contracts = max(1, min(TRADERSPOST_MAX_CONTRACTS, contracts))
 
     # Resolve the live setup SERVER-SIDE only. We never trust client-supplied
     # entry/stop/targets/direction for a money-moving order — every price and the
@@ -11500,22 +11581,22 @@ def traderspost_order():
     # appear, so an authenticated POST can't bypass the UI. Market-closed can leave
     # trade_plan populated while neutralizing the verdict, so check both.
     if a.get("market_open") is False:
-        return jsonify({"status": "error",
-                        "reason": "Market is closed — live orders are paused."}), 409
+        return {"status": "error",
+                        "reason": "Market is closed — live orders are paused."}, 409
     if not is_actionable(verdict):
-        return jsonify({"status": "error",
-                        "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}), 409
+        return {"status": "error",
+                        "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}, 409
 
     tp = a["trade_plan"]
     if not tp.get("trade_plan") or not tp.get("entry_zone"):
-        return jsonify({"status": "error",
-                        "reason": "Ready verdict but no trade plan — refusing to send."}), 409
+        return {"status": "error",
+                        "reason": "Ready verdict but no trade plan — refusing to send."}, 409
 
     # Direction comes from the verdict and must agree with the plan, or we refuse.
     direction = ready_direction(verdict)
     if direction is None or str(tp.get("direction", "")).lower() != direction.lower():
-        return jsonify({"status": "error",
-                        "reason": "Setup direction is ambiguous — refusing to send."}), 409
+        return {"status": "error",
+                        "reason": "Setup direction is ambiguous — refusing to send."}, 409
 
     try:
         zone = str(tp["entry_zone"])
@@ -11528,7 +11609,7 @@ def traderspost_order():
         t1   = float(tp["target1"])
         t2   = float(tp["target2"])
     except (ValueError, TypeError, KeyError) as exc:
-        return jsonify({"status": "error", "reason": f"Could not read trade plan: {exc}"}), 400
+        return {"status": "error", "reason": f"Could not read trade plan: {exc}"}, 400
 
     tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
     action    = "buy" if direction.lower().startswith("l") else "sell"
@@ -11562,13 +11643,13 @@ def traderspost_order():
     if mode == "manual_only":
         logger.info("Execution manual_only — plan returned (no send): %s %s x%d (stop %.1f, t1 %.1f)",
                     tp_symbol, action, contracts, stop, t1)
-        return jsonify({
+        return {
             "status": "manual_required",
             "provider": provider_label, "mode": mode, "broker_verify_required": False,
             "message": (f"Place this {instrument} {direction.upper()} order yourself: "
                         f"{contracts} @ market · stop {intent['stop']} · T1 {intent['target1']}."),
             "plan": plan_public,
-        }), 200
+        }, 200
 
     # ── paper: simulate/log only. No broker send, no broker dedupe; trade still tracks.
     if mode == "paper":
@@ -11583,12 +11664,12 @@ def traderspost_order():
                     f"Stop `{stop:.1f}`  ·  T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`")}, timeout=5)
         except requests.RequestException:
             pass
-        return jsonify({
+        return {
             "status": "simulated",
             "provider": provider_label, "mode": mode, "broker_verify_required": False,
             "message": f"Paper order simulated ({instrument} {direction.upper()} x{contracts}). No broker contacted.",
             "plan": plan_public,
-        }), 200
+        }, 200
 
     # ── LIVE providers (traderspost / pickmytrade) below ─────────────────────────
     # Duplicate-send guard: collapse accidental double-taps / client retries of the
@@ -11599,9 +11680,9 @@ def traderspost_order():
     with _TRADERSPOST_LOCK:
         prev = _TRADERSPOST_LAST.get(instrument)
         if prev and prev[0] == fingerprint and (now - prev[1]) < TRADERSPOST_COOLDOWN_SEC:
-            return jsonify({"status": "error",
+            return {"status": "error",
                             "reason": (f"Duplicate order suppressed — the same {instrument} setup was sent "
-                                       f"{int(now - prev[1])}s ago (cooldown {TRADERSPOST_COOLDOWN_SEC}s).")}), 429
+                                       f"{int(now - prev[1])}s ago (cooldown {TRADERSPOST_COOLDOWN_SEC}s).")}, 429
         _TRADERSPOST_LAST[instrument] = (fingerprint, now)
 
     def _release_slot():
@@ -11629,22 +11710,22 @@ def traderspost_order():
         resp = requests.post(send_url, json=payload, timeout=10)
     except requests.RequestException as exc:
         logger.warning("%s ambiguous send error — cooldown held: %s", provider_label, exc)
-        return jsonify({"status": "error", "broker_verify_required": True,
+        return {"status": "error", "broker_verify_required": True,
                         "reason": (f"{provider_label} did not confirm ({exc}). The order MAY have been placed — "
-                                   "check your broker before retrying.")}), 502
+                                   "check your broker before retrying.")}, 502
 
     if 200 <= resp.status_code < 300:
         pass  # success — fall through to confirmation
     elif 400 <= resp.status_code < 500:
         _release_slot()
         logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
-        return jsonify({"status": "error",
-                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}), 502
+        return {"status": "error",
+                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}, 502
     else:
         logger.warning("%s ambiguous response — cooldown held: %s %s", provider_label, resp.status_code, resp.text[:300])
-        return jsonify({"status": "error", "broker_verify_required": True,
+        return {"status": "error", "broker_verify_required": True,
                         "reason": (f"{provider_label} returned {resp.status_code}. The order MAY have been placed — "
-                                   "check your broker before retrying.")}), 502
+                                   "check your broker before retrying.")}, 502
 
     content = (
         f"🚀 **ORDER SENT → {provider_label} — {direction.upper()}**\n"
@@ -11660,14 +11741,81 @@ def traderspost_order():
 
     logger.info("%s order sent: %s %s x%d @ market (stop %.1f, t1 %.1f)",
                 provider_label, tp_symbol, action, contracts, stop, t1)
-    return jsonify({
+    return {
         "status": "sent",
         "provider": provider_label, "mode": mode, "broker_verify_required": False,
         "plan": plan_public,
         "order":  {"ticker": tp_symbol, "action": action, "quantity": contracts,
                    "direction": direction, "type": "market",
                    "stopLoss": stop, "takeProfit": t1, "target2": t2},
-    }), 200
+    }, 200
+
+
+def _maybe_auto_execute(inst):
+    """Fire the audited execution gateway for a brand-new READY setup when AUTO is
+    ON for inst. Fail-open: any problem logs and returns without trading. Sets
+    ACTIVE_TRADE only AFTER a confirmed send/simulate, using the gateway's
+    server-authoritative plan (never client data), so the one-position guard + the
+    trade watcher engage and the next webhook can't re-enter the same setup."""
+    global ACTIVE_TRADE
+    inst = instrument_of(inst) if inst else None
+    if not inst:
+        return
+    mode = resolve_execution_mode()
+    # Live (real-broker) auto-execution is gated to the live/prod instance so a dev
+    # instance never places a real auto order on a stray webhook. Paper / manual_only
+    # are safe anywhere (manual_only never sends; paper only simulates).
+    if execution_is_live(mode) and not DISCORD_LIVE_ENABLED:
+        logger.info("Auto-trade skipped for %s - live mode (%s) but not the live instance.", inst, mode)
+        return
+    with _AUTO_EXEC_LOCK:
+        if ACTIVE_TRADE:
+            return
+        if _auto_trade_count_today(inst) >= AUTO_TRADE_MAX_PER_DAY:
+            logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", AUTO_TRADE_MAX_PER_DAY, inst)
+            return
+        result, code = execute_trade_gateway(inst, AUTO_TRADE_CONTRACTS, source="auto")
+        status = (result or {}).get("status")
+        if status in ("sent", "simulated"):
+            plan = result.get("plan") or {}
+            try:
+                with _ENTER_LOCK:
+                    if not ACTIVE_TRADE:
+                        ACTIVE_TRADE = {
+                            "direction":   plan.get("direction"),
+                            "entry_price": float(plan.get("entry")),
+                            "stop_loss":   float(plan.get("stopLoss")),
+                            "target1":     float(plan.get("takeProfit")),
+                            "target2":     float(plan.get("target2")),
+                            "contracts":   int(plan.get("quantity", AUTO_TRADE_CONTRACTS)),
+                            "profile":     inst,
+                            "symbol":      inst,
+                            "opened_at":   now_utc().isoformat(),
+                            "t1_hit":      False,
+                            "t2_hit":      False,
+                            "status":      "active",
+                        }
+                _auto_trade_bump_count(inst)
+                logger.info("AUTO-TRADE entered %s %s x%s via %s (%s).",
+                            inst, plan.get("direction"), plan.get("quantity"),
+                            result.get("provider"), status)
+            except (TypeError, ValueError) as exc:
+                logger.error("Auto-trade tracking failed after %s send (VERIFY BROKER): %s", status, exc)
+        elif (result or {}).get("broker_verify_required"):
+            # Ambiguous live send - the order MAY be live. Disarm this instrument's
+            # auto toggle so it can't keep firing into an uncertain broker state;
+            # require manual re-enable + broker verification.
+            with AUTO_TRADE_LOCK:
+                AUTO_TRADE[inst] = False
+            logger.warning("Auto-trade DISARMED for %s - ambiguous broker response: %s",
+                           inst, (result or {}).get("reason"))
+            try:
+                _record_diagnostic("%s | AUTO-TRADE disarmed - ambiguous broker response; verify manually." % inst)
+            except Exception:
+                pass
+        else:
+            logger.info("Auto-trade no-op for %s - gateway %s: %s",
+                        inst, status, (result or {}).get("reason"))
 
 
 @app.route("/breakeven", methods=["POST"])
@@ -11888,6 +12036,7 @@ def dashboard():
   .focus-chip{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--muted);user-select:none}
   .mute-pill{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:12px;font-weight:600;padding:4px 12px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--green)}
   .mute-pill.is-muted{color:var(--red);border-color:var(--red);opacity:.9}
+  .mute-pill.is-armed{color:#04110b;border-color:var(--green);background:var(--green);opacity:1}
   .focus-chip input{accent-color:var(--amber);cursor:pointer;width:15px;height:15px;margin:0}
   .focus-chip span{font-weight:600;letter-spacing:.5px}
   /* Direction toggle */
@@ -12176,6 +12325,15 @@ def dashboard():
     <span id="mute-MGC" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MGC');}">🔔 MGC: on</span>
     <span id="mute-MNQ" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MNQ');}">🔔 MNQ: on</span>
     <span class="focus-lbl" style="opacity:.6">mute silences Discord · still tracked</span>
+  </div>
+  <!-- Auto-trade (server-side, affects EXECUTION): when ON, a brand-new READY
+       setup auto-sends an order through the SAME audited gateway as the manual
+       button. OFF by default; resets to OFF on restart/republish (fail-safe). -->
+  <div class="focus-row">
+    <span class="focus-lbl">Auto-trade</span>
+    <span id="auto-MGC" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MGC');}">MGC: off</span>
+    <span id="auto-MNQ" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MNQ');}">MNQ: off</span>
+    <span id="auto-mode-lbl" class="focus-lbl" style="opacity:.6">off by default - resets on restart</span>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
@@ -12603,6 +12761,60 @@ function toggleMute(inst){
     })
     .catch(function(){ MUTE_STATE[inst] = !next; renderMuteUI(); toast('Mute update failed', false); });
 }
+
+let AUTO_STATE = { MGC:false, MNQ:false };
+let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_live:false, is_live_instance:false, max_per_day:0, contracts:1 };
+async function loadAutoTrade(){
+  try {
+    const d = await api('/auto-trade');
+    if (d && d.enabled) AUTO_STATE = d.enabled;
+    if (d && d.status === 'ok') AUTO_META = { execution_provider_label:d.execution_provider_label, execution_mode:d.execution_mode, execution_live:d.execution_live, is_live_instance:d.is_live_instance, max_per_day:d.max_per_day, contracts:d.contracts };
+  } catch(e){}
+  renderAutoUI();
+}
+function renderAutoUI(){
+  ['MGC','MNQ'].forEach(function(inst){
+    const el = document.getElementById('auto-'+inst);
+    if (!el) return;
+    const on = !!(AUTO_STATE && AUTO_STATE[inst]);
+    el.textContent = (on ? '\ud83d\udfe2 ' : '\ud83e\udd16 ') + inst + (on ? ': ON' : ': off');
+    el.classList.toggle('is-armed', on);
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  const lbl = document.getElementById('auto-mode-lbl');
+  if (lbl){
+    const live = !!AUTO_META.execution_live;
+    const prov = AUTO_META.execution_provider_label || AUTO_META.execution_mode || 'manual';
+    lbl.textContent = (live ? ('LIVE - ' + prov) : prov) + ' \u00b7 x' + (AUTO_META.contracts||1) + ' \u00b7 max ' + (AUTO_META.max_per_day||0) + '/day' + (AUTO_META.is_live_instance ? '' : ' \u00b7 (not live instance)');
+    lbl.style.color = live ? '#ff8a8a' : '';
+  }
+}
+function toggleAuto(inst){
+  const next = !(AUTO_STATE && AUTO_STATE[inst]);
+  if (next){
+    const live = !!AUTO_META.execution_live;
+    const prov = AUTO_META.execution_provider_label || AUTO_META.execution_mode || 'manual';
+    let msg;
+    if (live){
+      msg = 'Enable AUTO-TRADE for ' + inst + '?\n\nThis automatically places REAL orders (' + prov + ') the instant a setup goes READY: ' + (AUTO_META.contracts||1) + ' contract(s), up to ' + (AUTO_META.max_per_day||0) + '/day.';
+      if (!AUTO_META.is_live_instance) msg += '\n\nNote: this is NOT the live instance, so live orders will be skipped here.';
+    } else {
+      msg = 'Enable AUTO-TRADE for ' + inst + '?\n\nExecution mode is ' + prov + ' - no real broker order will be sent.';
+    }
+    if (!confirm(msg)) return;
+  }
+  AUTO_STATE[inst] = next; renderAutoUI();
+  api('/auto-trade', { instrument: inst, enabled: next })
+    .then(function(d){
+      if (!d || d.status !== 'ok'){ AUTO_STATE[inst] = !next; renderAutoUI(); toast('Auto-trade update failed', false); return; }
+      if (d.enabled) AUTO_STATE = d.enabled;
+      AUTO_META = { execution_provider_label:d.execution_provider_label, execution_mode:d.execution_mode, execution_live:d.execution_live, is_live_instance:d.is_live_instance, max_per_day:d.max_per_day, contracts:d.contracts };
+      renderAutoUI();
+      toast(next ? (inst + ' AUTO-TRADE armed') : (inst + ' auto-trade off'));
+    })
+    .catch(function(){ AUTO_STATE[inst] = !next; renderAutoUI(); toast('Auto-trade update failed', false); });
+}
+
 function setDir(d) {
   dir = d;
   document.querySelectorAll('.dir-btn').forEach(b=>b.classList.remove('active'));
@@ -14468,7 +14680,7 @@ async function optExport(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
@@ -14538,6 +14750,41 @@ def alerts_mute():
         snapshot = dict(ALERTS_MUTED)
     return jsonify({"status": "ok", "muted": snapshot}), 200
 
+
+
+@app.route("/auto-trade", methods=["GET", "POST"])
+def auto_trade_toggle():
+    """Read or set the per-instrument AUTO-TRADE flags (MGC / MNQ).
+
+    When ON, a brand-new READY setup automatically routes a server-authoritative
+    order through the SAME audited gateway as the manual button. OFF by default and
+    RESET TO OFF on restart/republish (fail-safe toward NOT trading). Live
+    (real-broker) auto execution additionally requires the live/prod instance.
+    Owner-only (Basic Auth + CSRF via the Express proxy; deliberately NOT in
+    OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        inst = _instrument_from_text(data.get("instrument") or data.get("inst"))
+        if inst is None:
+            return jsonify({"status": "error",
+                            "reason": "instrument must be exactly 'MGC' or 'MNQ'."}), 400
+        enabled = bool(data.get("enabled"))
+        with AUTO_TRADE_LOCK:
+            AUTO_TRADE[inst] = enabled
+        logger.info("Auto-trade %s for %s", "ENABLED" if enabled else "DISABLED", inst)
+    with AUTO_TRADE_LOCK:
+        snapshot = dict(AUTO_TRADE)
+    mode = resolve_execution_mode()
+    return jsonify({
+        "status":                   "ok",
+        "enabled":                  snapshot,
+        "execution_mode":           mode,
+        "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(mode, mode),
+        "execution_live":           execution_is_live(mode) and execution_configured(mode),
+        "is_live_instance":         DISCORD_LIVE_ENABLED,
+        "max_per_day":              AUTO_TRADE_MAX_PER_DAY,
+        "contracts":                AUTO_TRADE_CONTRACTS,
+    }), 200
 
 @app.route("/", methods=["GET"])
 def index():
