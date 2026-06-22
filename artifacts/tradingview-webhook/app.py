@@ -2,6 +2,7 @@ import os
 import re
 import time
 import math
+import uuid
 import logging
 import threading
 import queue
@@ -7422,6 +7423,7 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None):
             entry["outcome"] = new_outcome
             if pnl_dollars is not None:
                 entry["pnl_dollars"] = round(pnl_dollars, 2)
+            _persist_journal_entry(entry)  # fail-open: mirror the outcome update to Postgres
             logger.info("Journal #%d outcome → %s", entry["id"], new_outcome)
             # Post a short update line to the journal channel
             if DISCORD_JOURNAL_WEBHOOK_URL:
@@ -8702,6 +8704,139 @@ def _build_why_explanation(entry):
     }
 
 
+# ── Journal persistence (Postgres, fail-open) ────────────────────────────────
+# The in-memory JOURNAL is the runtime source of truth; this MIRRORS it to
+# Postgres so the day's setups + outcomes survive a restart/deploy. Without it,
+# the in-memory journal is wiped on every restart and the manual EOD summary
+# comes back blank. Every write is FAIL-OPEN — a DB error is logged and
+# swallowed so journaling and the trade path are never affected. Reuses the
+# learning-engine connection helper / DATABASE_URL. Display/analytics only:
+# nothing here ever feeds the strict gate, sizing, or the money path.
+JOURNAL_DB_READY = False
+
+
+def _journal_dedup_key(entry):
+    """Stable dedup key for a journal entry: (instrument, direction, zone_low).
+    SINGLE SOURCE OF TRUTH shared by create_journal_entry and the DB reload so
+    the two can never drift. Mirrors the original inline logic exactly (note the
+    en-dash separator used by entry_zone)."""
+    entry_zone = entry.get("entry_zone")
+    try:
+        zone_key = round(float(str(entry_zone).split("–")[0]), 0) if entry_zone else 0.0
+    except (TypeError, ValueError):
+        zone_key = 0.0
+    return (instrument_of(entry.get("symbol", "")), entry.get("direction"), zone_key)
+
+
+def _ensure_journal_key(entry):
+    """Guarantee a stable unique journal_key (the DB primary key) on an entry.
+    entry['id'] is positional and not stable across reload, so a uuid is used for
+    persistence. Idempotent."""
+    if entry is not None and not entry.get("journal_key"):
+        entry["journal_key"] = uuid.uuid4().hex
+    return entry
+
+
+def _check_journal_db_ready():
+    """Probe whether the journal_entries table is available and set
+    JOURNAL_DB_READY accordingly. NO DDL — the table is created out-of-band
+    (database tool in dev, Publish schema-diff in prod), matching the
+    learning-engine convention of app-side INSERT/SELECT only. FAIL-OPEN: if the
+    table is missing or the DB is unavailable, JOURNAL_DB_READY stays False and
+    journaling falls back to in-memory only."""
+    global JOURNAL_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM journal_entries LIMIT 1")
+            cur.fetchone()
+        JOURNAL_DB_READY = True
+        logger.info("journal_entries table ready")
+    except Exception as exc:
+        logger.warning("journal table unavailable (persistence disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_journal_entry(entry):
+    """Upsert one journal entry by journal_key. FAIL-OPEN. The key is assigned
+    SYNCHRONOUSLY (so the in-memory entry + DB row match), and a snapshot of the
+    entry is captured before the DB write is offloaded to the slow-task worker —
+    so a DB stall never delays a trade decision, and a later mutation of the same
+    entry can't corrupt this write (the next persist call writes the new state)."""
+    if not JOURNAL_DB_READY or not entry:
+        return
+    _ensure_journal_key(entry)
+    key      = entry["journal_key"]
+    snapshot = dict(entry)
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO journal_entries (journal_key, entry)
+                       VALUES (%s, %s)
+                       ON CONFLICT (journal_key)
+                       DO UPDATE SET entry = EXCLUDED.entry, updated_at = now()""",
+                    (key, psycopg2.extras.Json(snapshot)),
+                )
+        except Exception as exc:
+            logger.warning("journal persist failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _load_journal_from_db(limit=500):
+    """Restore the in-memory JOURNAL from Postgres at boot (newest-first) and
+    rebuild JOURNAL_KEYS via the shared dedup helper. FAIL-OPEN: on any error the
+    journal stays empty and the app continues. Must run BEFORE the webhook worker
+    starts so a reloaded setup still dedupes correctly."""
+    global JOURNAL
+    if not JOURNAL_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT entry FROM journal_entries
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                (int(limit),),
+            )
+            rows = cur.fetchall()
+        loaded = [r[0] for r in rows if isinstance(r[0], dict)]
+        JOURNAL = loaded
+        JOURNAL_KEYS.clear()
+        for e in JOURNAL:
+            JOURNAL_KEYS.add(_journal_dedup_key(e))
+        logger.info("Journal restored from DB: %d entr%s",
+                    len(JOURNAL), "y" if len(JOURNAL) == 1 else "ies")
+    except Exception as exc:
+        logger.warning("journal load failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def create_journal_entry(record, a, sizing, post_discord=True):
     """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates.
 
@@ -8720,14 +8855,10 @@ def create_journal_entry(record, a, sizing, post_discord=True):
     entry_zone = entry["entry_zone"]
 
     # Dedup key: instrument + direction + entry-zone low rounded to nearest integer.
-    try:
-        zone_key = round(float(str(entry_zone).split("–")[0]), 0) if entry_zone else 0.0
-    except (TypeError, ValueError):
-        zone_key = 0.0
-    dedup_key = (instrument_of(ticker), direction, zone_key)
+    dedup_key = _journal_dedup_key(entry)
 
     if dedup_key in JOURNAL_KEYS:
-        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, direction, zone_key)
+        logger.info("Journal dedup skip: %s %s @ %.0f", ticker, direction, dedup_key[2])
         return None
 
     with _timed("journalWriteMs"):
@@ -8743,10 +8874,12 @@ def create_journal_entry(record, a, sizing, post_discord=True):
             entry["screenshot"] = "[ Screenshot placeholder — add URL or image link ]"
             logger.info("Screenshot unavailable for journal #%d — continuing", entry["id"])
 
+        _ensure_journal_key(entry)
         JOURNAL.insert(0, entry)
         if len(JOURNAL) > 500:
             JOURNAL.pop()
 
+    _persist_journal_entry(entry)  # fail-open Postgres mirror (off the decision worker)
     if post_discord:
         send_journal_discord_embed(entry)
     logger.info("Journal entry #%d created: %s %s %s @ %s",
@@ -11242,10 +11375,12 @@ def add_journal_entry():
     entry["setup_notes"]  = str(data.get("setup_notes") or entry["why_qualifies"] or "—")
     entry["trade_thesis"] = str(data.get("trade_thesis") or build_trade_thesis({}, entry))
 
+    _ensure_journal_key(entry)
     JOURNAL.insert(0, entry)
     if len(JOURNAL) > 500:
         JOURNAL.pop()
 
+    _persist_journal_entry(entry)  # fail-open Postgres mirror
     send_journal_discord_embed(entry)
     logger.info("Manual journal entry #%d created: %s %s", entry["id"], entry["symbol"], entry["direction"])
     return jsonify({"status": "created", "entry": entry}), 201
@@ -11896,12 +12031,21 @@ def get_trade():
     if not ACTIVE_TRADE:
         return jsonify({"status": "no_active_trade"}), 200
     result = dict(ACTIVE_TRADE)
-    cp = CURRENT_PRICE
+    # Live status uses the BEST available price for the trade's instrument: the
+    # fresh alert/chart price when present, else the auto-fetched market price
+    # (see display_price_for). This keeps the trade-status section live even when
+    # no TradingView price alerts are arriving — e.g. while testing or right
+    # after a restart — instead of showing the static levels with no P&L.
+    # DISPLAY-ONLY: compute_pnl/compute_distances never touch the gate or money
+    # path; price_source lets the dashboard label an auto/stale readout.
+    trade_inst       = ACTIVE_TRADE.get("symbol") or ACTIVE_TRADE.get("profile") or DEFAULT_PROFILE
+    cp, price_source = display_price_for(trade_inst)
     if cp is not None:
         dollar_pnl, pts_pnl   = compute_pnl(ACTIVE_TRADE, cp)
         to_t1, to_t2, to_stop = compute_distances(ACTIVE_TRADE, cp)
         result.update({
             "current_price": cp,
+            "price_source":  price_source,
             "pnl_dollars":   round(dollar_pnl, 2),
             "pnl_points":    round(pts_pnl, 2),
             "to_t1_pts":     round(to_t1, 2),
@@ -12777,7 +12921,7 @@ function renderAutoUI(){
     const el = document.getElementById('auto-'+inst);
     if (!el) return;
     const on = !!(AUTO_STATE && AUTO_STATE[inst]);
-    el.textContent = (on ? '\ud83d\udfe2 ' : '\ud83e\udd16 ') + inst + (on ? ': ON' : ': off');
+    el.textContent = (on ? '\U0001F7E2 ' : '\U0001F916 ') + inst + (on ? ': ON' : ': off');
     el.classList.toggle('is-armed', on);
     el.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
@@ -14810,6 +14954,9 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    if LEARNING_DB_ENABLED:
+        _check_journal_db_ready()                  # probe journal_entries (no DDL; table created via DB tool/publish diff)
+        _load_journal_from_db()                    # restore today's journal so EOD survives restarts (BEFORE the worker)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
