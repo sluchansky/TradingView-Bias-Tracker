@@ -7,10 +7,19 @@ description: All live trade plans use a fixed 1:1 risk:reward; the tick-grid ser
 
 All live trade plans are **fixed 1:1 R:R** (the older tiered TP1/TP2/TP3 / MNQ 20·40·60 /
 MGC 5·10·15 ladder is retired for the *plan*) — **EXCEPT the one sanctioned ORB 1:4 exception
-below**. Stop is computed first (ATR/structure/zone, floored at min ticks);
-`RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`. Plans below the min stop
-(MGC < 5 pts, MNQ < 20 pts) are rejected outright (no trade). `build_strict_trade_plan` sets
+below**. Stop is computed first (ATR/structure/zone), snapped UP to whole ticks;
+`RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`. `build_strict_trade_plan` sets
 `target1 == target2`, `rr = "1:1"`, `rr_num = 1.0`; `_decision_support` reward reads `"1:1 (fixed)"`.
+
+## Min-stop is a HARD REJECT (mode-aware `min_stop_pts`), NOT a tick floor
+`_dynamic_stop_plan` REJECTS a setup outright (no trade) when the calculated stop distance is
+below the instrument's mode `min_stop_pts` — it NEVER silently widens to a floor. The companion
+`min_stop_ticks` is **metadata only** (the snap is ceil-up to whole ticks). Values are mode-aware:
+SWING MGC<5 / MNQ<20 pts; SCALP MGC<3 / MNQ<10 pts (all env-overridable).
+**Why:** silently widening a too-tight stop changes risk/size behind the user's back and breaks
+exact 1:1; rejecting is honest. **How to apply:** any stop change — live OR the copied backtest
+`bt_stop_plan` — must keep the hard-reject + snap-only shape (see backtest-engine.md for the
+parity contract). Don't reintroduce a `max(ceil, min_ticks)` floor.
 
 ## Sanctioned exception — a truly-ready Opening Range Breakout = 1:4 (user-approved)
 `_apply_orb_target_override(result)` runs right after `compute_strategy_engine` and rewrites

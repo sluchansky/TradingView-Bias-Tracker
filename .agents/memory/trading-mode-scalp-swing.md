@@ -5,9 +5,19 @@ description: Why the TradingView webhook has two sensitivity profiles and the in
 
 # SCALP vs SWING mode (tradingview-webhook/app.py)
 
-A `MODES` dict + `TRADING_MODE` env (default **SCALP**) + `cfg(key)` accessor gate every
-sensitivity threshold. Never reintroduce module-level scoring constants — read them through
-`cfg()` so both profiles stay consistent.
+A `MODES` dict + `TRADING_MODE` env (default **SCALP**) + `cfg(key)`/`cfg_for(mode,key)` accessors
+gate every sensitivity threshold. Never reintroduce module-level scoring constants — read them
+through `cfg()` so both profiles stay consistent. The same rule extends to money-path knobs: the
+per-trade dollar ceiling and the live-card re-post cadence are runtime resolvers `max_risk_cap()` /
+`trade_ready_interval()` (env wins, else the active mode's knob: e.g. cap SWING 100 / SCALP 50) —
+NEVER capture them as a module constant at import or you freeze one mode's value across a switch.
+
+**Setup-size multiplier only ever REDUCES size.** `_setup_risk_mult(verdict, structure_class)`
+returns a ≤1 multiplier (EARLY/Attempt setups size at `RISK_MULT_EARLY`/`RISK_MULT_ATTEMPT`).
+`size_mult` scales the CONTRACT COUNT downward — not the dollar budget — and `over_cap` is computed
+on the FULL (un-multiplied) size, so the multiplier can never lift realized risk above
+`max_risk_cap()`. Pass it at EVERY sizing site (both display sites + the gateway) or the embed and
+the order disagree.
 
 **Why:** The user got *constant WAIT* during fast markets because the old (swing-only)
 thresholds were too strict for scalping. SCALP loosens bias/distance/confidence thresholds,

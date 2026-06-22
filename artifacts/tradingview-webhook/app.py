@@ -250,11 +250,12 @@ MODES = {
         "CONF_TRADE":        68,      # trade tier
         "CONF_WATCH":        58,      # watch/plan-eligible tier
         "MIN_TOTAL_SCORE":   4,       # require real confluence before TRADE/HIGH tiers
-        "SCORE_WINDOW_MIN":  45,      # score only the last 45 min of alerts
+        "SCORE_WINDOW_MIN":  20,      # score only the last 20 min of alerts (faster scalp response)
         "STAGE_WINDOW_MIN":  30,      # setup-stage looks back 30 min, not last 5 alerts
         "MITIGATED_TTL_MIN": 30,      # a consumed-zone mitigation expires after 30 min (un-sticks stale "scoring skipped")
         "ATTEMPT_TRADABLE":  True,    # BOS-only structures can trade (capped at BIAS)
         "RISK_MULT_ATTEMPT": 0.5,     # half size on BOS-only entries
+        "RISK_MULT_EARLY":   0.5,     # half size on EARLY-tier entries (Edge 50-59)
         # Volatility regime thresholds — ratio of recent 1m ATR to the session-
         # typical range. CAUTION flags + dents the Edge Score; BLOCK holds the setup.
         "VOL_QUIET_CAUTION": 0.55,    # <= this = quiet (flag)
@@ -271,20 +272,21 @@ MODES = {
         #    (fail-open: a volume spike OR RVOL >= RVOL_CONFIRM_THRESHOLD, or simply
         #    no volume data). SWING keeps the strict zone AND vwap AND structure AND
         #    edge>=80 behaviour exactly.
-        #    READY floor: EDGE_READY_THRESHOLD (60) is the single READY floor and
-        #    EDGE_FULL_READY_THRESHOLD (60) matches it, so SCALP emits no EARLY band —
-        #    a setup is READY at Edge >= 60 (a "Strong READY" at >= 75) or it WAITs.
-        #    EDGE_STRONG_THRESHOLD (75) only upgrades the LABEL ("Strong Trade" /
-        #    "Strong READY"); it never changes the READY decision. SETUP BUILDING
-        #    (informational, NON-actionable) fills the Edge 50-59 band when a valid
-        #    zone + confirming structure are present but the Edge is still climbing
-        #    to the READY floor (EDGE_SETUP_BUILDING_THRESHOLD .. EDGE_READY_THRESHOLD).
+        #    READY bands: a HALF-SIZE EARLY entry fires at Edge 50-59
+        #    (EDGE_READY_THRESHOLD .. EDGE_FULL_READY_THRESHOLD) and a FULL-SIZE READY
+        #    at Edge >= 60 (EDGE_FULL_READY_THRESHOLD); below 50 it WAITs. This is the
+        #    "get in early, smaller" scalp behaviour — the full-size quality bar (60)
+        #    is unchanged. EDGE_STRONG_THRESHOLD (75) only upgrades the LABEL ("Strong
+        #    Trade" / "Strong READY"); it never changes the READY decision. SETUP
+        #    BUILDING (informational, NON-actionable) fills the Edge 40-49 band when a
+        #    valid zone + confirming structure are present but the Edge is still
+        #    climbing to the EARLY floor (EDGE_SETUP_BUILDING_THRESHOLD .. EDGE_READY_THRESHOLD).
         #    location & CVD-conflict are SOFT score modifiers in SCALP (see
         #    GATE_SOFT_MODIFIERS), not hard blocks. ──
-        "EDGE_READY_THRESHOLD":          60,   # READY floor
-        "EDGE_FULL_READY_THRESHOLD":     60,   # full-READY floor == READY floor (no EARLY band)
+        "EDGE_READY_THRESHOLD":          50,   # actionable floor: Edge 50-59 = half-size EARLY
+        "EDGE_FULL_READY_THRESHOLD":     60,   # full-size READY floor (Edge >= 60)
         "EDGE_STRONG_THRESHOLD":         75,   # label-only: "Strong Trade" / "Strong READY"
-        "EDGE_SETUP_BUILDING_THRESHOLD": 50,   # informational SETUP BUILDING band floor (< READY)
+        "EDGE_SETUP_BUILDING_THRESHOLD": 40,   # informational SETUP BUILDING band floor (< EARLY)
         "GATE_REQUIRE_VWAP":      True,    # VWAP confirmation is a hard READY requirement
         "GATE_REQUIRE_STRUCTURE": True,    # structure is a hard READY requirement
         "GATE_REQUIRE_ZONE":      True,    # a valid fresh trade-side zone is a hard READY requirement
@@ -311,6 +313,18 @@ MODES = {
         # no longer hard-blocks a setup purely because TP2 < 1:2 — R:R is displayed,
         # not gated. (Set True to restore the strict ">= 1:2 on TP2 or no trade" veto.)
         "ENFORCE_MIN_RR":           False,
+        # ── Quick-scalp tuning (SCALP only; SWING keeps its own values below) ──
+        # Tighter ATR-stop multiplier so a scalp "cuts losers fast" (normal vol /
+        # elevated vol). SWING keeps 1.5 / 2.0. Volatility still wins over mode (the
+        # elevated multiplier applies in HIGH_CAUTION / HIGH_BLOCK regimes).
+        "STOP_ATR_MULT":            0.75,
+        "STOP_ATR_MULT_HIGH":       1.25,
+        # Smaller per-trade dollar ceiling for SCALP (env MAX_RISK_DOLLARS_PER_TRADE
+        # still overrides). SWING keeps 100.
+        "MAX_RISK_DOLLARS":         50,
+        # Faster READY re-check / re-post cadence (seconds) so the probability tracks
+        # fresh moves. SWING keeps 300. Env TRADE_READY_INTERVAL still overrides.
+        "TRADE_READY_INTERVAL_SEC": 120,
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -360,6 +374,14 @@ MODES = {
         "WATCH_ARMED_COOLDOWN_SEC": 900,
         # SWING keeps the original strict "TP2 must be >= 1:2 R:R or no trade" veto.
         "ENFORCE_MIN_RR":           True,
+        # SWING keeps the historical stop multipliers (1.5 normal / 2.0 elevated), the
+        # original $100 per-trade ceiling and the 5-min READY cadence. These keys exist
+        # only so the mode-aware readers resolve to SWING's pre-existing behaviour.
+        "STOP_ATR_MULT":            1.5,
+        "STOP_ATR_MULT_HIGH":       2.0,
+        "MAX_RISK_DOLLARS":         100,
+        "TRADE_READY_INTERVAL_SEC": 300,
+        "RISK_MULT_EARLY":          1.0,
     },
 }
 
@@ -373,9 +395,15 @@ def cfg(key):
     return MODES.get(TRADING_MODE, MODES["SCALP"])[key]
 
 
+def cfg_for(mode, key):
+    """Read a threshold for an EXPLICIT mode (used where the mode can differ from the
+    global TRADING_MODE, e.g. the stop planner invoked with an explicit mode)."""
+    return MODES.get(mode, MODES.get(TRADING_MODE, MODES["SCALP"]))[key]
+
+
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
-# EARLY READY (SCALP Edge 35-49) is actionable but lower-conviction than a full
-# READY (Edge >= 50). Both end in the word "READY", so a stray verdict.endswith(
+# EARLY READY (SCALP Edge 50-59) is actionable but lower-conviction (half size)
+# than a full READY (Edge >= 60). Both end in the word "READY", so verdict.endswith(
 # "READY") would treat them identically. To make every consumer's intent explicit
 # (and to keep full-conviction-only paths exact), ALL verdict checks go through
 # these helpers instead of string matching.
@@ -407,6 +435,19 @@ def ready_direction(verdict):
     return None
 
 
+def _setup_risk_mult(verdict, structure_class):
+    """Position-size multiplier for reduced-conviction SCALP setups. Returns the
+    SMALLER of the BOS-only "Attempt" half-size and the EARLY-tier half-size — both
+    mean "trade this smaller", and min() (NOT the product) avoids accidentally
+    quarter-sizing a setup that is both. Applied to the CONTRACT COUNT, never to
+    risk_pct (the hard dollar cap binds the budget, so scaling risk_pct is a no-op).
+    SWING's knobs are 1.0 and SWING never emits EARLY, so SWING is always 1.0
+    (size unchanged)."""
+    attempt = cfg("RISK_MULT_ATTEMPT") if structure_class in ("Bullish Attempt", "Bearish Attempt") else 1.0
+    early   = cfg("RISK_MULT_EARLY") if is_early_ready(verdict) else 1.0
+    return min(attempt, early)
+
+
 DEFAULT_ACCOUNT_SIZE = 50_000   # $50,000 — fallback when no profile/account_size given
 DEFAULT_RISK_PCT     = 0.01     # 1% — fallback when no profile/risk_pct given
 MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 10 oz)
@@ -434,10 +475,17 @@ INSTRUMENT_SPECS = {
     "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
             "min_stop_pts": _spec_float_env("MNQ_MIN_STOP_PTS", 20.0),
+            # SCALP-only tighter floors ("cut losers fast"); SWING/default use the
+            # values above. MNQ scalp floor stays 40 ticks (= 10 pts).
+            "scalp_min_stop_ticks": _spec_int_env("MNQ_SCALP_MIN_STOP_TICKS", 40),
+            "scalp_min_stop_pts": _spec_float_env("MNQ_SCALP_MIN_STOP_PTS", 10.0),
             "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0)},
     "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
             "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
             "min_stop_pts": _spec_float_env("MGC_MIN_STOP_PTS", 5.0),
+            # SCALP-only tighter floors: MGC drops to 30 ticks (= 3 pts).
+            "scalp_min_stop_ticks": _spec_int_env("MGC_SCALP_MIN_STOP_TICKS", 30),
+            "scalp_min_stop_pts": _spec_float_env("MGC_SCALP_MIN_STOP_PTS", 3.0),
             "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0)},
 }
 
@@ -640,8 +688,19 @@ TRADERSPOST_MAX_CONTRACTS = max(1, int(os.environ.get("TRADERSPOST_MAX_CONTRACTS
 # Absolute per-trade risk ceiling (USD). BOTH the displayed sizing and the (only)
 # money-moving path cap risk at this; a setup whose SINGLE-contract risk already
 # exceeds it (stop too wide for the account) is SKIPPED, never forced through at one
-# contract over the cap. Default $100 on the $50k account (= 0.20%). Env-overridable.
-MAX_RISK_DOLLARS_PER_TRADE = max(1, int(os.environ.get("MAX_RISK_DOLLARS_PER_TRADE", 100)))
+# contract over the cap. Mode-aware: SCALP $50 / SWING $100 on the $50k account; env
+# MAX_RISK_DOLLARS_PER_TRADE overrides both.
+def max_risk_cap():
+    """Absolute per-trade risk ceiling (USD). Env MAX_RISK_DOLLARS_PER_TRADE wins;
+    otherwise the active mode's MAX_RISK_DOLLARS (SCALP 50 / SWING 100). BOTH the
+    displayed sizing and the money path read this, so they never diverge."""
+    _env = os.environ.get("MAX_RISK_DOLLARS_PER_TRADE")
+    if _env is not None:
+        try:
+            return max(1, int(_env))
+        except (TypeError, ValueError):
+            pass
+    return max(1, int(cfg("MAX_RISK_DOLLARS")))
 TRADERSPOST_COOLDOWN_SEC  = max(0, int(os.environ.get("TRADERSPOST_COOLDOWN_SEC", 60)))
 _TRADERSPOST_LOCK = threading.Lock()
 _TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-send guard
@@ -802,9 +861,19 @@ def _discord_url(hint: str = "") -> str:
 
 
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (default 5 min)
-# Recurring "trade ready" alert: re-post the clean card every 5 min while a setup
-# is READY (in addition to the instant alert on the triggering webhook).
-TRADE_READY_INTERVAL = int(os.environ.get("TRADE_READY_INTERVAL", 300))  # seconds (default 5 min)
+# Recurring "trade ready" alert: re-post the clean card every cadence while a setup
+# is READY (in addition to the instant alert on the triggering webhook). Mode-aware
+# (SCALP 120s / SWING 300s); env TRADE_READY_INTERVAL overrides both.
+def trade_ready_interval():
+    """READY re-check / re-post cadence (seconds). Env TRADE_READY_INTERVAL wins;
+    otherwise the active mode's TRADE_READY_INTERVAL_SEC (SCALP 120 / SWING 300)."""
+    _env = os.environ.get("TRADE_READY_INTERVAL")
+    if _env is not None:
+        try:
+            return int(_env)
+        except (TypeError, ValueError):
+            pass
+    return int(cfg("TRADE_READY_INTERVAL_SEC"))
 
 # Informational SETUP BUILDING heads-up: re-post at most once per this interval while
 # an instrument stays in the building band (SCALP only). Longer than READY so the
@@ -2278,26 +2347,33 @@ def generate_trade_plan(trade_opportunity, structure_label, risk_label,
 
 
 def _risk_capped_contracts(stop_dist, point_value, account_size, risk_pct,
-                           hard_cap_dollars=None, max_contracts=None):
+                           hard_cap_dollars=None, max_contracts=None, size_mult=1.0):
     """Pure sizing core shared by the display sizing AND the money-path gateway.
 
-    Budget = min(account_size * risk_pct, MAX_RISK_DOLLARS_PER_TRADE), so realized
-    risk is NEVER above the absolute per-trade ceiling regardless of the profile's
-    percent. Returns the FLOOR number of contracts that fit the budget (capped at the
-    server contract limit) — which is 0 when a single contract already risks more than
-    the ceiling (over_cap == True → the caller must SKIP, not round up to 1).
+    Budget = min(account_size * risk_pct, max_risk_cap()), so realized risk is NEVER
+    above the absolute per-trade ceiling regardless of the profile's percent. Returns
+    the FLOOR number of contracts that fit the budget (capped at the server contract
+    limit) — which is 0 when a single contract already risks more than the ceiling
+    (over_cap == True → the caller must SKIP, not round up to 1).
+
+    size_mult (<= 1.0) scales the reduced-conviction CONTRACT COUNT (BOS-only Attempt
+    / EARLY tier). It is applied to the count, NOT the dollar budget — the hard cap
+    binds the budget, so scaling risk_pct would be a no-op. A sizeable full-size setup
+    is never rounded below 1 contract; over_cap is judged on the FULL (pre-mult) size.
     """
-    hard_cap = MAX_RISK_DOLLARS_PER_TRADE if hard_cap_dollars is None else hard_cap_dollars
+    hard_cap = max_risk_cap() if hard_cap_dollars is None else hard_cap_dollars
     max_ct   = TRADERSPOST_MAX_CONTRACTS if max_contracts is None else max_contracts
     rpc      = float(stop_dist) * float(point_value)
     budget   = min(float(account_size) * float(risk_pct), float(hard_cap))
     if rpc <= 0:
         return {"contracts": 0, "risk_per_contract": 0.0, "budget": budget, "over_cap": True}
-    n = min(int(budget // rpc), int(max_ct))
-    return {"contracts": n, "risk_per_contract": rpc, "budget": budget, "over_cap": n < 1}
+    n_full   = min(int(budget // rpc), int(max_ct))
+    over_cap = n_full < 1
+    n        = n_full if over_cap else max(1, int(n_full * float(size_mult)))
+    return {"contracts": n, "risk_per_contract": rpc, "budget": budget, "over_cap": over_cap}
 
 
-def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name=""):
+def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name="", size_mult=1.0):
     """
     Compute position sizing from a generated trade plan.
 
@@ -2325,8 +2401,9 @@ def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name="
             return {}
 
         sized               = _risk_capped_contracts(stop_dist, point_value,
-                                                      account_size, risk_pct)
-        dollar_risk         = sized["budget"]            # capped at MAX_RISK_DOLLARS_PER_TRADE
+                                                      account_size, risk_pct,
+                                                      size_mult=size_mult)
+        dollar_risk         = sized["budget"]            # capped at max_risk_cap()
         risk_per_contract   = sized["risk_per_contract"]
         over_cap            = sized["over_cap"]
         contracts           = sized["contracts"]
@@ -2348,11 +2425,11 @@ def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name="
             "profit_t1":          f"${profit_t1:,.0f}",
             "profit_t2":          f"${profit_t2:,.0f}",
             "over_risk_cap":      over_cap,
-            "risk_cap":           f"${MAX_RISK_DOLLARS_PER_TRADE:,.0f}",
+            "risk_cap":           f"${max_risk_cap():,.0f}",
         }
         if over_cap:
             out["note"] = (f"1 contract risks ${risk_per_contract:,.0f} — over the "
-                           f"${MAX_RISK_DOLLARS_PER_TRADE:,.0f} cap; setup skipped.")
+                           f"${max_risk_cap():,.0f} cap; setup skipped.")
         return out
     except (ValueError, TypeError, ZeroDivisionError):
         return {}
@@ -4113,8 +4190,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         conflict, no vol block) are IDENTICAL for FULL and EARLY — only the Edge band
         differs. SWING sets both floors to 80, so it only ever returns 'FULL' or None
         (no EARLY band): it reduces to the historical zone AND vwap AND structure AND
-        edge>=80 gate exactly. SCALP sets both floors to 70 (no EARLY band): READY =
-        edge>=70 AND structure AND location AND volume_ok (fail-open). The
+        edge>=80 gate exactly. SCALP sets the actionable floor to 50 and the full
+        floor to 60, so Edge 50-59 returns 'EARLY' (half size) and Edge >= 60 returns
+        'FULL'; READY (either band) = edge AND zone AND structure AND vwap AND
+        volume_ok (fail-open). The
         consumed/broken-zone safety still lives downstream in full_analysis
         (zone_broken_active / zone_mitigated_near)."""
         gd = _gate_debug(direction)
@@ -4386,9 +4465,10 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     then floored at the instrument's `min_stop_ticks` so it can never be
     unrealistically tight, and snapped to whole ticks.
 
-    Multiplier precedence — VOLATILITY WINS over trading mode:
-      2.0 when the regime is elevated/extreme (HIGH_CAUTION / HIGH_BLOCK),
-      else 1.0 in SCALP, else 1.5 (normal intraday / SWING).
+    Multiplier precedence — VOLATILITY WINS over trading mode (mode-tunable knobs):
+      STOP_ATR_MULT_HIGH when the regime is elevated/extreme (HIGH_CAUTION /
+      HIGH_BLOCK), else STOP_ATR_MULT. SCALP 0.75 / 1.25 (tight — cut losers fast);
+      SWING 1.5 / 2.0 (historical, unchanged).
 
     FAIL-CLOSED at the trade-plan layer only: returns {"ok": False, "reason": ...}
     when the ATR reading needed to size the stop is missing/stale, or when the
@@ -4399,9 +4479,15 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     tick      = spec["tick_size"]
     pv        = spec["point_value"]
     buf       = spec["stop_buf"]
-    min_ticks = int(spec["min_stop_ticks"])
-    min_pts   = float(spec.get("min_stop_pts", 0.0))
     inst      = instrument_of(ticker)
+    # Mode-aware minimum-stop floors: SCALP uses tighter floors ("cut losers fast");
+    # SWING/default keep the historical floors byte-for-byte.
+    if (mode or TRADING_MODE) == "SCALP":
+        min_ticks = int(spec.get("scalp_min_stop_ticks", spec["min_stop_ticks"]))
+        min_pts   = float(spec.get("scalp_min_stop_pts", spec.get("min_stop_pts", 0.0)))
+    else:
+        min_ticks = int(spec["min_stop_ticks"])
+        min_pts   = float(spec.get("min_stop_pts", 0.0))
 
     vol = volatility or {}
     atr = vol.get("atr_pts")
@@ -4414,15 +4500,14 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     if atr <= 0:
         return {"ok": False, "reason": "ATR stop data unavailable"}
 
-    # ── Multiplier (volatility wins over mode) ──
+    # ── Multiplier (volatility wins over mode) — mode-tunable via cfg knobs so SCALP
+    #    can tighten its stops while SWING keeps the historical 1.5 / 2.0. ──
     regime = vol.get("regime")
     mode   = (mode or TRADING_MODE)
     if regime in ("HIGH_CAUTION", "HIGH_BLOCK"):
-        mult = 2.0
-    elif mode == "SCALP":
-        mult = 1.0
+        mult = float(cfg_for(mode, "STOP_ATR_MULT_HIGH"))
     else:
-        mult = 1.5
+        mult = float(cfg_for(mode, "STOP_ATR_MULT"))
 
     atr_dist = atr * mult
     if direction == "Long":
@@ -4440,8 +4525,8 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     # ── HARD minimum-stop guard (fixed 1:1 risk model) ──
     # A calculated stop tighter than the instrument's minimum is REJECTED outright
     # (no silent widening): extremely tight stops get knocked out by ordinary market
-    # noise. MGC 5 pts / MNQ 20 pts, both env-overridable (MGC_MIN_STOP_PTS /
-    # MNQ_MIN_STOP_PTS). Checked on the RAW calculated distance, before tick snapping.
+    # noise. SWING/default MGC 5 pts / MNQ 20 pts; SCALP tightens to MGC 3 pts /
+    # MNQ 10 pts (all env-overridable). Checked on the RAW calc distance, pre-snap.
     if min_pts > 0 and calc_dist < min_pts:
         return {"ok": False,
                 "reason": (f"Calculated stop {calc_dist:.1f} pts is below the {inst} "
@@ -6112,8 +6197,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
         )
         if trade_plan["trade_plan"]:
-            # EARLY READY (SCALP Edge 35-49) is actionable but labelled lower
-            # conviction; a full READY is Edge >= the full-READY floor. Both still
+            # EARLY READY (SCALP Edge 50-59) is actionable but half size / lower
+            # conviction; a full READY is Edge >= the full-READY floor (60). Both still
             # require a valid trade plan (R:R + an anchor — a trade-side zone OR
             # VWAP), so an EARLY setup that can't form a real plan still falls
             # through to WAIT below.
@@ -7529,7 +7614,7 @@ def _trade_ready_loop():
                 # Throttle: skip if a card (instant or periodic) was sent for this
                 # instrument within the last TRADE_READY_INTERVAL seconds.
                 last = LAST_LIVE_CARD_AT.get(inst)
-                if last and (now - last).total_seconds() < TRADE_READY_INTERVAL:
+                if last and (now - last).total_seconds() < trade_ready_interval():
                     continue
                 try:
                     a = full_analysis(ticker_override=inst)
@@ -7544,7 +7629,7 @@ def _trade_ready_loop():
     except Exception as exc:  # never let the loop die
         logger.warning("trade-ready loop error: %s", exc)
     finally:
-        threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()
+        threading.Timer(trade_ready_interval(), _trade_ready_loop).start()
 
 
 def _update_journal_outcome(new_outcome, pnl_dollars=None):
@@ -9401,7 +9486,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
     last_alert_at, cooldown_ms = None, None
     if alert_level == "READY":
         last_alert_at = LAST_LIVE_CARD_AT.get(inst_key) if inst_key else None
-        cooldown_ms   = TRADE_READY_INTERVAL * 1000
+        cooldown_ms   = trade_ready_interval() * 1000
     elif alert_level in ("WATCH", "ARMED", "WATCH FOR ENTRY"):
         last_alert_at = LAST_TIER_AT.get(inst_key) if inst_key else None
         cooldown_ms   = int(cfg("WATCH_ARMED_COOLDOWN_SEC")) * 1000
@@ -9781,11 +9866,10 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     except Exception as exc:
         logger.error("Setup-building alert dispatch error: %s", exc)
 
-    # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
-    _risk_mult = (cfg("RISK_MULT_ATTEMPT")
-                  if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
-                  else 1.0)
-    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct * _risk_mult, profile_name)
+    # Reduced-conviction setups (BOS-only "Attempt" / EARLY tier) trade at smaller
+    # size — applied to the contract COUNT (mode-aware; SWING stays full size).
+    _size_mult = _setup_risk_mult(a.get("verdict", ""), a.get("structure_class"))
+    sizing = calculate_position_sizing(a["trade_plan"], account_size, risk_pct, profile_name, size_mult=_size_mult)
 
     # ── Active trade: a WIN is booked the moment T1 is hit; stop = loss. ──
     # check_trade_events returns STOP_HIT exclusively, or one/both of T1/T2 — so
@@ -11759,11 +11843,10 @@ def enter_trade():
         profile   = str(data.get("profile", DEFAULT_PROFILE))
         acct_size = ACCOUNT_PROFILES.get(profile, {}).get("account_size", DEFAULT_ACCOUNT_SIZE)
         risk_pct  = ACCOUNT_PROFILES.get(profile, {}).get("risk_pct", DEFAULT_RISK_PCT)
-        # BOS-only ("Attempt") entries trade at reduced size (mode-dependent).
-        _risk_mult = (cfg("RISK_MULT_ATTEMPT")
-                      if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
-                      else 1.0)
-        sz        = calculate_position_sizing(tp, acct_size, risk_pct * _risk_mult, profile)
+        # Reduced-conviction setups (BOS-only "Attempt" / EARLY tier) trade at smaller
+        # size — applied to the contract COUNT (mode-aware; SWING stays full size).
+        _size_mult = _setup_risk_mult(a.get("verdict", ""), a.get("structure_class"))
+        sz        = calculate_position_sizing(tp, acct_size, risk_pct, profile, size_mult=_size_mult)
         contracts = max(1, int(sz.get("contracts", 1))) if sz else 1
         # Honor an explicit owner-supplied contract count so the tracked trade
         # matches the size actually sent to the broker (sizing is only a default).
@@ -11922,6 +12005,11 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     if not is_actionable(verdict):
         return {"status": "error",
                         "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}, 409
+    # Hands-free AUTO execution fires on FULL-conviction READY only — an EARLY-tier
+    # (Edge 50-59) setup is shown and manually tradeable, but never auto-sent.
+    if source == "auto" and is_early_ready(verdict):
+        return {"status": "skipped",
+                "reason": "EARLY-tier setup — auto-execution fires on full READY only."}, 200
 
     tp = a["trade_plan"]
     if not tp.get("trade_plan") or not tp.get("entry_zone"):
@@ -11948,16 +12036,19 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         return {"status": "error", "reason": f"Could not read trade plan: {exc}"}, 400
 
     # ── Absolute per-trade risk cap (the money path's hard ceiling) ──────────────
-    # Size the live order so it can NEVER risk more than MAX_RISK_DOLLARS_PER_TRADE.
-    # If a SINGLE contract already risks more than the cap (stop too wide for the
-    # account), the setup is SKIPPED rather than forced through over-cap — identical
-    # rule for the manual button and hands-free auto execution. Clamp (never round up).
+    # Size the live order so it can NEVER risk more than max_risk_cap(). If a SINGLE
+    # contract already risks more than the cap (stop too wide for the account), the
+    # setup is SKIPPED rather than forced through over-cap — identical rule for the
+    # manual button and hands-free auto execution. Clamp (never round up). Reduced-
+    # conviction setups (BOS-only Attempt / EARLY tier) size down via _setup_risk_mult.
+    _size_mult = _setup_risk_mult(verdict, a.get("structure_class"))
     _sized = _risk_capped_contracts(abs(entry - stop), point_value_for(instrument),
-                                    DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PCT)
+                                    DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PCT,
+                                    size_mult=_size_mult)
     if _sized["over_cap"]:
         return {"status": "error",
                 "reason": (f"Single-contract risk ${_sized['risk_per_contract']:,.0f} exceeds the "
-                           f"${MAX_RISK_DOLLARS_PER_TRADE:,.0f} per-trade cap — order skipped.")}, 409
+                           f"${max_risk_cap():,.0f} per-trade cap — order skipped.")}, 409
     contracts = max(1, min(int(contracts), _sized["contracts"]))
 
     tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
@@ -15186,7 +15277,7 @@ if __name__ == "__main__":
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
         threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
-        threading.Timer(TRADE_READY_INTERVAL, _trade_ready_loop).start()  # re-post READY card every 5 min
+        threading.Timer(trade_ready_interval(), _trade_ready_loop).start()  # re-post READY card (mode-aware cadence)
         _schedule_eod()                               # schedule daily EOD summary
         _schedule_weekly_report()                     # schedule weekly report (Fri after close)
     else:

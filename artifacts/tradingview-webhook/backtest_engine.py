@@ -40,19 +40,23 @@ ET_TZ = ZoneInfo("America/New_York")
 BT_SPECS = {
     "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0,
             "point_value": 2.0, "tick_size": 0.25, "min_stop_ticks": 40,
+            "scalp_min_stop_ticks": 40, "min_stop_pts": 20.0,
+            "scalp_min_stop_pts": 10.0,
             "price_lo": 3000.0, "price_hi": 60000.0},
     "MGC": {"tp1": 5.0, "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0,
             "point_value": 10.0, "tick_size": 0.1, "min_stop_ticks": 50,
+            "scalp_min_stop_ticks": 30, "min_stop_pts": 5.0,
+            "scalp_min_stop_pts": 3.0,
             "price_lo": 400.0, "price_hi": 12000.0},
 }
 
 # ── Copied mode knobs (mirror live MODES) — only what the backtest needs ───────
 BT_MODES = {
-    "SCALP": {"stop_mult": 1.0, "enforce_min_rr": False,
+    "SCALP": {"stop_mult": 0.75, "stop_mult_high": 1.25, "enforce_min_rr": False,
               "vol_high_caution": 1.6, "vol_high_block": 2.5,
               "vol_quiet_caution": 0.55, "vol_quiet_block": 0.35,
               "rvol_confirm": 1.5, "near_pct": 0.006, "extended_pct": 0.016},
-    "SWING": {"stop_mult": 1.5, "enforce_min_rr": True,
+    "SWING": {"stop_mult": 1.5, "stop_mult_high": 2.0, "enforce_min_rr": True,
               "vol_high_caution": 1.8, "vol_high_block": 3.0,
               "vol_quiet_caution": 0.50, "vol_quiet_block": 0.30,
               "rvol_confirm": 1.5, "near_pct": 0.005, "extended_pct": 0.010},
@@ -823,17 +827,28 @@ DETECTORS = {
 # STOP / TARGET PLAN — copied from live _dynamic_stop_plan (ATR explicit input).
 # ════════════════════════════════════════════════════════════════════════════
 def bt_stop_plan(direction, entry, demand_zone, supply_zone, spec, atr, mode, regime):
-    """ATR×mult stop blended with the nearest zone, floored at min ticks. Mirrors
-    _dynamic_stop_plan: the WIDER of the ATR stop and the structure stop, snapped
-    up to whole ticks, with the volatility-wins-over-mode multiplier."""
+    """ATR×mult stop blended with the nearest zone. Mirrors _dynamic_stop_plan: the
+    WIDER of the ATR stop and the structure stop, with a HARD minimum-stop guard
+    (too-tight stops are REJECTED outright — no silent widening / tick floor), then
+    snapped up to whole ticks, with the volatility-wins-over-mode multiplier."""
     if atr is None or atr <= 0:
         return None
     tick = spec["tick_size"]
     buf = spec["stop_buf"]
-    min_ticks = int(spec["min_stop_ticks"])
     mk = BT_MODES.get(mode, BT_MODES["SCALP"])
+    # Mode-aware minimum-stop guard (mirrors live): SCALP tightens to its own floor;
+    # SWING/default keep the documented backtest minimum. min_pts is the HARD reject;
+    # min_ticks is metadata only (no flooring), exactly as live _dynamic_stop_plan.
+    if mode == "SCALP":
+        min_ticks = int(spec.get("scalp_min_stop_ticks", spec["min_stop_ticks"]))
+        min_pts   = float(spec.get("scalp_min_stop_pts", spec.get("min_stop_pts", 0.0)))
+    else:
+        min_ticks = int(spec["min_stop_ticks"])
+        min_pts   = float(spec.get("min_stop_pts", 0.0))
+    # Volatility wins over mode (mirrors live): the elevated-regime multiplier is the
+    # mode's high knob; otherwise the mode's base multiplier.
     if regime in ("VOLATILE",):
-        mult = 2.0
+        mult = mk.get("stop_mult_high", 2.0)
     else:
         mult = mk["stop_mult"]
     atr_dist = atr * mult
@@ -845,8 +860,15 @@ def bt_stop_plan(direction, entry, demand_zone, supply_zone, spec, atr, mode, re
         atr_stop = entry + atr_dist
         structure_stop = (supply_zone + buf) if supply_zone is not None else None
         calc_stop = max(atr_stop, structure_stop) if structure_stop is not None else atr_stop
-    calc_ticks = abs(entry - calc_stop) / tick if tick else 0.0
-    final_ticks = max(math.ceil(calc_ticks - 1e-9), min_ticks)
+    calc_dist = abs(entry - calc_stop)
+    # HARD minimum-stop guard (mirrors live): a calculated stop tighter than the
+    # instrument minimum is REJECTED outright (no trade) — checked on the RAW calc
+    # distance, pre-snap. There is NO artificial tick floor.
+    if min_pts > 0 and calc_dist < min_pts:
+        return None
+    calc_ticks = calc_dist / tick if tick else 0.0
+    # Snap UP to whole ticks (never tighter than calculated); min_ticks is metadata.
+    final_ticks = math.ceil(calc_ticks - 1e-9)
     final_dist = final_ticks * tick
     final_stop = (entry - final_dist) if direction == "Long" else (entry + final_dist)
     if direction == "Long" and not final_stop < entry:
@@ -857,7 +879,7 @@ def bt_stop_plan(direction, entry, demand_zone, supply_zone, spec, atr, mode, re
     if risk <= 0:
         return None
     return {"stop": final_stop, "risk_points": risk, "multiplier": mult,
-            "stop_ticks": int(final_ticks)}
+            "stop_ticks": int(final_ticks), "min_stop_ticks": min_ticks}
 
 
 # ════════════════════════════════════════════════════════════════════════════
