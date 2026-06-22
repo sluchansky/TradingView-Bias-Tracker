@@ -11809,6 +11809,11 @@ def dashboard():
   .tabs{display:flex;gap:8px;margin-bottom:14px}
   .tab{flex:1;padding:12px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-transform:uppercase;letter-spacing:1px;transition:all .15s}
   .tab.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep);box-shadow:0 0 12px rgba(255,95,176,.35)}
+  .focus-row{display:flex;align-items:center;gap:12px;margin-bottom:8px;font-size:12px}
+  .focus-lbl{color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-weight:600}
+  .focus-chip{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--muted);user-select:none}
+  .focus-chip input{accent-color:var(--amber);cursor:pointer;width:15px;height:15px;margin:0}
+  .focus-chip span{font-weight:600;letter-spacing:.5px}
   /* Direction toggle */
   .dir-row{display:flex;gap:8px;margin-bottom:16px}
   .dir-btn{flex:1;padding:14px;border-radius:2px;border:1px solid var(--border);background:var(--panel);font-size:15px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px;transition:all .15s;color:var(--muted)}
@@ -12075,6 +12080,15 @@ def dashboard():
       <div id="g-dir"  class="gauge-dir">—</div>
     </div>
     <div id="g-scores" class="gauge-scores"></div>
+  </div>
+  <!-- Instrument focus (display-only): hide one instrument to watch a single
+       market at a time. Alerts & tracking keep running in the background for
+       BOTH — this only changes what this browser shows, and the choice is saved
+       locally so it survives reloads and republishes. -->
+  <div class="focus-row">
+    <span class="focus-lbl">Show</span>
+    <label class="focus-chip"><input type="checkbox" id="foc-MGC" checked onchange="toggleInstrument('MGC', this.checked)"><span>MGC</span></label>
+    <label class="focus-chip"><input type="checkbox" id="foc-MNQ" checked onchange="toggleInstrument('MNQ', this.checked)"><span>MNQ</span></label>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
@@ -12431,6 +12445,36 @@ function setSymbol(s) {
   if (vs) vs.textContent = s;
   updateEnterBtn();
   refreshRec();   // switch the displayed analysis to the selected instrument now
+}
+// ── Instrument focus (DISPLAY-ONLY) ─────────────────────────────────────────
+// Hide an instrument to focus on one market at a time. This NEVER touches the
+// server, the webhook/alert path, or the trade gate — both instruments keep
+// running in the background. The choice is stored per-browser (localStorage) so
+// it survives reloads AND server restarts/republishes.
+function instrEnabled(inst){ try { return localStorage.getItem('focus_'+inst) !== '0'; } catch(e){ return true; } }
+function applyInstrumentFocus(){
+  const tabs = document.querySelectorAll('.tabs .tab');   // [0]=MGC, [1]=MNQ (matches setSymbol)
+  const idx = { MGC:0, MNQ:1 };
+  const on = { MGC: instrEnabled('MGC'), MNQ: instrEnabled('MNQ') };
+  if (!on.MGC && !on.MNQ){                 // never hide BOTH — force MGC visible (in-memory; no recursion)
+    on.MGC = true;
+    try { localStorage.setItem('focus_MGC','1'); } catch(e){}
+  }
+  ['MGC','MNQ'].forEach(function(inst){
+    const t = tabs[idx[inst]];                if (t)  t.style.display = on[inst] ? '' : 'none';
+    const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = on[inst];
+  });
+  if (!on[sym]) setSymbol(on.MGC ? 'MGC' : 'MNQ');
+}
+function toggleInstrument(inst, on){
+  const other = inst==='MGC' ? 'MNQ' : 'MGC';
+  if (!on && !instrEnabled(other)){            // never allow hiding BOTH
+    const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = true;
+    toast('Keep at least one instrument showing', false);
+    return;
+  }
+  try { localStorage.setItem('focus_'+inst, on ? '1' : '0'); } catch(e){}
+  applyInstrumentFocus();
 }
 function setDir(d) {
   dir = d;
@@ -14261,7 +14305,7 @@ async function optExport(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); refreshRec(); loadMode();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
 </script>

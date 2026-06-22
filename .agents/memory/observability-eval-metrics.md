@@ -36,3 +36,15 @@ reflects continuous evaluation even with zero webhooks.
 **How to apply:** when adding any new diagnostic that re-runs scoring on a timer or
 records to EVAL_METRICS, route it through `_record_eval_metrics` only, keep counter
 mutation outside EVAL_METRICS_LOCK, and pull the WAIT reason from `strict_reason`.
+
+## Diagnostics stats are IN-MEMORY — a restart/republish wipes them
+
+EVAL_METRICS + COUNTERS live only in process memory; nothing persists them to
+Postgres. So every Flask restart — including a **republish** — resets the
+Diagnostics page to zero. The user perceives this as "it deleted all my stats."
+**Why it matters:** do NOT tell the user "publishing won't lose your data" without
+qualifying it — that's true for the DB (trades/journal/backtest) but FALSE for the
+diagnostics counters. If they want those to survive restarts, that's a real
+follow-up: persist eval-metrics/counters to a DB table (INSERT/SELECT only, DDL via
+the database tool) and hydrate on boot. Keep any such change diagnostic-only (same
+side-effect-free invariants above).
