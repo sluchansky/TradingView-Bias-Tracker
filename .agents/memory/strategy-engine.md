@@ -22,7 +22,9 @@ then surfaces confidence%, quality grade, READY reason, missing confirmations, e
 
 ## Strategy priority (fixed; tie-break = priority order)
 1 Opening Drive (8:00–10:00 ET ONLY) · 2 Liquidity Sweep Reversal · 3 VWAP Trend
-Continuation · 4 Range Expansion Breakout · 5 Exhaustion Fade.
+Continuation · 4 Range Expansion Breakout · 5 Opening Range Breakout (ORB).
+ORB **replaced Exhaustion Fade** in the LIVE engine; the SEPARATE backtest module keeps its own
+Exhaustion Fade detector (different code path — do NOT "fix" that to ORB).
 Selection: among fully-met strategies pick the lowest priority number; else highest
 completeness with priority tiebreak.
 
@@ -36,6 +38,12 @@ completeness with priority tiebreak.
 - Instrument-scoped state only: per-ticker trackers/blockers must not zero the other instrument.
 - INTRADAY_BY_TICKER is mutated under INTRADAY_LOCK (incl. the /clear reset); the alert-history
   scan snapshots the deque before iterating (webhook worker mutates it concurrently).
+
+## ORB 1:4 target override — the engine's ONLY money-path effect
+Even in `display` mode the engine has ONE sanctioned money-path effect: `_apply_orb_target_override`
+retargets a truly-ready ORB plan from 1:1 to 1:4 (full detail in fixed-1to1-rr.md). Gated on
+`strategy_engine.ready` (== active strategy `fully_met`) — the fallback `active_key` (highest
+completeness when nothing is fully met) must NOT earn 1:4. All other strategies stay fixed 1:1.
 
 ## Fidelity caveat
 No full OHLC feed: "close outside range" / "rejection candle" / "continuation candle" are

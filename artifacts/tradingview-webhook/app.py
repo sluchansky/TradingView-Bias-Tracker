@@ -637,6 +637,11 @@ TRADERSPOST_TICKER = {
 # cooldown collapses accidental double-taps / client retries of the SAME setup into
 # a single live order. Both are env-overridable.
 TRADERSPOST_MAX_CONTRACTS = max(1, int(os.environ.get("TRADERSPOST_MAX_CONTRACTS", 10)))
+# Absolute per-trade risk ceiling (USD). BOTH the displayed sizing and the (only)
+# money-moving path cap risk at this; a setup whose SINGLE-contract risk already
+# exceeds it (stop too wide for the account) is SKIPPED, never forced through at one
+# contract over the cap. Default $100 on the $50k account (= 0.20%). Env-overridable.
+MAX_RISK_DOLLARS_PER_TRADE = max(1, int(os.environ.get("MAX_RISK_DOLLARS_PER_TRADE", 100)))
 TRADERSPOST_COOLDOWN_SEC  = max(0, int(os.environ.get("TRADERSPOST_COOLDOWN_SEC", 60)))
 _TRADERSPOST_LOCK = threading.Lock()
 _TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-send guard
@@ -2272,6 +2277,26 @@ def generate_trade_plan(trade_opportunity, structure_label, risk_label,
     return no_plan("No trade plan available for this opportunity.")
 
 
+def _risk_capped_contracts(stop_dist, point_value, account_size, risk_pct,
+                           hard_cap_dollars=None, max_contracts=None):
+    """Pure sizing core shared by the display sizing AND the money-path gateway.
+
+    Budget = min(account_size * risk_pct, MAX_RISK_DOLLARS_PER_TRADE), so realized
+    risk is NEVER above the absolute per-trade ceiling regardless of the profile's
+    percent. Returns the FLOOR number of contracts that fit the budget (capped at the
+    server contract limit) — which is 0 when a single contract already risks more than
+    the ceiling (over_cap == True → the caller must SKIP, not round up to 1).
+    """
+    hard_cap = MAX_RISK_DOLLARS_PER_TRADE if hard_cap_dollars is None else hard_cap_dollars
+    max_ct   = TRADERSPOST_MAX_CONTRACTS if max_contracts is None else max_contracts
+    rpc      = float(stop_dist) * float(point_value)
+    budget   = min(float(account_size) * float(risk_pct), float(hard_cap))
+    if rpc <= 0:
+        return {"contracts": 0, "risk_per_contract": 0.0, "budget": budget, "over_cap": True}
+    n = min(int(budget // rpc), int(max_ct))
+    return {"contracts": n, "risk_per_contract": rpc, "budget": budget, "over_cap": n < 1}
+
+
 def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name=""):
     """
     Compute position sizing from a generated trade plan.
@@ -2299,24 +2324,36 @@ def calculate_position_sizing(trade_plan, account_size, risk_pct, profile_name="
         if stop_dist == 0:
             return {}
 
-        dollar_risk         = account_size * risk_pct
-        risk_per_contract   = stop_dist * point_value
-        contracts           = max(1, int(dollar_risk / risk_per_contract))
-        max_loss            = contracts * risk_per_contract
+        sized               = _risk_capped_contracts(stop_dist, point_value,
+                                                      account_size, risk_pct)
+        dollar_risk         = sized["budget"]            # capped at MAX_RISK_DOLLARS_PER_TRADE
+        risk_per_contract   = sized["risk_per_contract"]
+        over_cap            = sized["over_cap"]
+        contracts           = sized["contracts"]
+        # Honest over-cap display: when a single contract already risks more than the
+        # hard cap, the setup is NOT sizeable — show 0 contracts and the true 1-contract
+        # loss instead of a reassuring (but wrong) "1 contract within budget".
+        max_loss            = (contracts * risk_per_contract) if not over_cap else risk_per_contract
         profit_t1           = contracts * t1_dist * point_value
         profit_t2           = contracts * t2_dist * point_value
 
-        return {
+        out = {
             "profile":            profile_name or "Custom",
             "account_size":       f"${account_size:,.0f}",
-            "risk_per_trade":     f"{risk_pct * 100:.2f}%",
+            "risk_per_trade":     (f"{dollar_risk / account_size * 100:.2f}%" if account_size else "—"),
             "dollar_risk":        f"${dollar_risk:,.0f}",
             "risk_per_contract":  f"${risk_per_contract:,.0f}",
             "contracts":          str(contracts),
             "max_loss":           f"${max_loss:,.0f}",
             "profit_t1":          f"${profit_t1:,.0f}",
             "profit_t2":          f"${profit_t2:,.0f}",
+            "over_risk_cap":      over_cap,
+            "risk_cap":           f"${MAX_RISK_DOLLARS_PER_TRADE:,.0f}",
         }
+        if over_cap:
+            out["note"] = (f"1 contract risks ${risk_per_contract:,.0f} — over the "
+                           f"${MAX_RISK_DOLLARS_PER_TRADE:,.0f} cap; setup skipped.")
+        return out
     except (ValueError, TypeError, ZeroDivisionError):
         return {}
 
@@ -4605,6 +4642,61 @@ def build_strict_trade_plan(direction, ticker, current_price,
     }
 
 
+def _apply_orb_target_override(result):
+    """The ONE sanctioned exception to the fixed-1:1 rule.
+
+    When the live strategy engine classifies the active, ACTIONABLE setup as
+    OPENING_RANGE_BREAKOUT and its direction agrees with the authoritative plan,
+    retarget the take-profit to a fixed 1:4 R:R. Rewrites ONLY result["trade_plan"]
+    (the single dict the live alert card, the execution gateway, and the managed-trade
+    watcher all read), so the 1:4 flows everywhere the money path looks — every other
+    strategy stays 1:1, and the display-only per-direction previews stay 1:1. The
+    stop/entry/direction are NOT touched (the strict gate still owns those).
+
+    FAIL-OPEN and fully guarded: any missing/mismatched field leaves the 1:1 plan
+    untouched, so this can never crash the analysis pipeline or fabricate a target.
+    """
+    try:
+        se = result.get("strategy_engine") or {}
+        if se.get("active_key") != "OPENING_RANGE_BREAKOUT":
+            return
+        # Only a TRULY-ready (fully-met) ORB classification earns the 1:4 exception.
+        # compute_strategy_engine falls back to the highest-completeness eligible
+        # strategy even when NONE is fully met, so without this guard a forming/fallback
+        # ORB sitting under an otherwise-READY strict setup would wrongly inherit 1:4.
+        # engine["ready"] == active strategy's fully_met, so this is the exact gate.
+        if not se.get("ready"):
+            return
+        if not is_actionable(result.get("verdict")):
+            return
+        tp = result.get("trade_plan") or {}
+        if not tp.get("trade_plan"):
+            return
+        mgmt  = tp.get("management") or {}
+        entry = mgmt.get("entry")
+        risk  = mgmt.get("risk_points")
+        pdir  = tp.get("direction")
+        if entry is None or not risk or risk <= 0 or pdir not in ("Long", "Short"):
+            return
+        # The engine's direction must agree with the plan's, or we don't touch it.
+        if se.get("direction") != pdir:
+            return
+        rr_mult = 4.0
+        new_tp  = (entry + rr_mult * risk) if pdir == "Long" else (entry - rr_mult * risk)
+        fmt = lambda v: f"{v:.2f}"   # serialises both tick grids exactly (see build_strict_trade_plan)
+        tp["target1"]       = fmt(new_tp)
+        tp["target2"]       = fmt(new_tp)   # single TP; mirror kept equal for readers
+        tp["rr"]            = "1:4"
+        tp["rr_num"]        = rr_mult
+        tp["reward_points"] = round(rr_mult * risk, 2)
+        tp["reason"]        = (f"{tp.get('instrument', '')} {pdir} — Opening Range Breakout, "
+                               f"fixed 1:4 R:R, ATR/structure stop ({risk:.1f} pts).").strip()
+        mgmt["tp1"]         = round(new_tp, 4)
+        tp["management"]    = mgmt
+    except Exception as exc:
+        logger.warning("ORB target override skipped: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Full analysis
 # ---------------------------------------------------------------------------
@@ -4698,7 +4790,6 @@ OPENING_DRIVE_WINDOW_END_ET = 10.0   # Opening Drive is only eligible 08:00–10
 
 # Detection thresholds (FAIL-OPEN; tuned conservatively).
 STRAT_VWAP_PULLBACK_ATR  = 0.6     # price within 0.6*ATR of VWAP == "pullback into VWAP"
-STRAT_EXHAUSTION_EXT_ATR = 2.0     # price >= 2.0*ATR from VWAP == "extremely extended"
 STRAT_RANGE_TIGHT_ATR    = 1.5     # consolidation width <= 1.5*ATR == "tight range"
 STRAT_MOVE_THRESH_PCT    = 0.0015  # +/-0.15% session move == directional session bias
 RANGE_LOOKBACK_MIN       = 30      # rolling window for the consolidation range
@@ -4730,14 +4821,14 @@ STRATEGY_DEFS = {
         "label": "Range Expansion Breakout", "target_r": 2.0, "max_grade": "A",
         "regimes": {"RANGING", "BALANCED"},
     },
-    "EXHAUSTION_FADE": {
-        "label": "Exhaustion Fade", "target_r": 1.5, "max_grade": "A",
-        "regimes": {"VOLATILE", "BALANCED"},
+    "OPENING_RANGE_BREAKOUT": {
+        "label": "Opening Range Breakout", "target_r": 4.0, "max_grade": "A",
+        "regimes": {"TRENDING", "VOLATILE", "BALANCED"},
     },
 }
 STRATEGY_PRIORITY = [
     "OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
-    "RANGE_EXPANSION_BREAKOUT", "EXHAUSTION_FADE",
+    "RANGE_EXPANSION_BREAKOUT", "OPENING_RANGE_BREAKOUT",
 ]
 
 
@@ -5128,33 +5219,39 @@ def _score_range_expansion_breakout(ctx):
     return {"direction": direction, "conditions": conditions, "target_r": 2.0}
 
 
-def _score_exhaustion_fade(ctx):
-    ext = ctx["vwap_dist_atr"]
-    extended_above = bool(ext is not None and ctx["price_above_vwap"] and ext >= STRAT_EXHAUSTION_EXT_ATR)
-    extended_below = bool(ext is not None and ctx["price_below_vwap"] and ext >= STRAT_EXHAUSTION_EXT_ATR)
-    if extended_above:
-        direction = "Short"   # fade the over-extension downward
-    elif extended_below:
+def _score_opening_range_breakout(ctx):
+    """Post-opening-range breakout: price closes beyond the COMPLETED opening range on
+    a volume push with a confirming candle. Distinct from Opening Drive — which also
+    requires VWAP-side alignment + CVD momentum and only fires inside the opening
+    window — ORB is the plain range break and targets a wider, fixed 1:4 (the one
+    sanctioned exception to the 1:1 rule, applied to the trade plan downstream)."""
+    long_break  = bool(ctx["or_complete"] and ctx["or_high"] is not None
+                       and ctx["price"] is not None and ctx["price"] > ctx["or_high"])
+    short_break = bool(ctx["or_complete"] and ctx["or_low"] is not None
+                       and ctx["price"] is not None and ctx["price"] < ctx["or_low"])
+    if long_break:
         direction = "Long"
+    elif short_break:
+        direction = "Short"
     else:
         direction = None
-    if direction == "Short":
+    if direction == "Long":
         conditions = [
-            ("Price extended above VWAP", extended_above),
-            ("ATR stretched", ctx["atr_stretched"]),
-            ("CVD divergence (bearish)", ctx["cvd_state"] == "bearish"),
-            ("Rejection candle", ctx["has_bear_confirm"] or ctx["has_bear_sweep"]),
+            ("Opening range complete", ctx["or_complete"]),
+            ("Break above opening-range high", long_break),
+            ("Volume push", ctx["volume_ok"]),
+            ("Breakout close confirmed", ctx["has_bull_confirm"]),
         ]
-    elif direction == "Long":
+    elif direction == "Short":
         conditions = [
-            ("Price extended below VWAP", extended_below),
-            ("ATR stretched", ctx["atr_stretched"]),
-            ("CVD divergence (bullish)", ctx["cvd_state"] == "bullish"),
-            ("Rejection candle", ctx["has_bull_confirm"] or ctx["has_bull_sweep"]),
+            ("Opening range complete", ctx["or_complete"]),
+            ("Break below opening-range low", short_break),
+            ("Volume push", ctx["volume_ok"]),
+            ("Breakout close confirmed", ctx["has_bear_confirm"]),
         ]
     else:
-        conditions = [("Price extended from VWAP", False)]
-    return {"direction": direction, "conditions": conditions, "target_r": 1.5}
+        conditions = [("Opening-range breakout in progress", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 4.0}
 
 
 STRATEGY_SCORERS = {
@@ -5162,7 +5259,7 @@ STRATEGY_SCORERS = {
     "LIQUIDITY_SWEEP_REVERSAL": _score_liquidity_sweep_reversal,
     "VWAP_TREND_CONTINUATION":  _score_vwap_trend_continuation,
     "RANGE_EXPANSION_BREAKOUT": _score_range_expansion_breakout,
-    "EXHAUSTION_FADE":          _score_exhaustion_fade,
+    "OPENING_RANGE_BREAKOUT":   _score_opening_range_breakout,
 }
 
 
@@ -6494,6 +6591,11 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         active_ticker, current_price, vwap_value, vwap_status, volatility,
         result.get("edge_score"),
     )
+    # ORB-only exception to the fixed-1:1 rule: a real, actionable Opening-Range-
+    # Breakout setup retargets to 1:4 (rewrites the authoritative trade_plan in place;
+    # all other strategies remain 1:1). Runs while the market is open; the closed
+    # override below independently neutralizes the verdict so no closed-market send.
+    _apply_orb_target_override(result)
 
     # ── Display-only feeds (READ-ONLY; never touch the gate / money path) ─────
     result["equity_curve_today"] = get_today_equity_curve(active_ticker)
@@ -8970,6 +9072,11 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
 
     # ── ENTER ─────────────────────────────────────────────────────────────
     if is_enter:
+        # R:R multiple for the LOCAL tracked TP (Discord-only path). Defaults to 1:1;
+        # the plan-sourced fill below lifts it from the authoritative plan so a truly-
+        # ready Opening Range Breakout is tracked/announced at its sanctioned 1:4.
+        _rr_mult  = 1.0
+        _rr_label = "1:1"
         try:
             entry = float(data["entry"]) if data.get("entry") else None
             stop  = float(data["stop"])  if data.get("stop")  else None
@@ -9001,6 +9108,9 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
                     t2   = float(tp["target2"])
             except (ValueError, TypeError, KeyError) as exc:
                 return jsonify({"status": "error", "reason": f"Missing trade plan params: {exc}"}), 400
+            # Authoritative plan drives the tracked R:R (1:4 only for a truly-ready ORB).
+            _rr_mult  = float(tp.get("rr_num", 1.0) or 1.0)
+            _rr_label = str(tp.get("rr", "1:1") or "1:1")
 
         contracts = int(data.get("contracts", 1))
         symbol    = resolved_inst
@@ -9023,11 +9133,12 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
                                        f"(stop {'below' if stop < entry else 'above'} entry = {inferred}).")}), 400
         direction = inferred
 
-        # Enforce the system-wide fixed 1:1 model on the tracked trade: the take-profit
-        # always sits the same distance from entry as the stop, regardless of any t1/t2
-        # supplied in the alert (deeper targets are retired).
+        # Re-derive the tracked take-profit FROM entry/stop at the plan's R:R multiple
+        # (_rr_mult is 1.0 everywhere except a truly-ready Opening Range Breakout, which
+        # the authoritative plan marks 1:4), rather than trusting client-supplied t1/t2
+        # (deeper targets are retired). Keeps the tracked exit consistent with the plan.
         _risk = abs(entry - stop)
-        t1 = (entry + _risk) if direction == "Long" else (entry - _risk)
+        t1 = (entry + _rr_mult * _risk) if direction == "Long" else (entry - _rr_mult * _risk)
         t2 = t1
 
         # Record the trade for local tracking. _ENTER_LOCK serialises the
@@ -9050,7 +9161,7 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
         content = (
             f"✅ **TRADE ENTERED — {direction.upper()}**\n"
             f"Entry `{entry:.2f}`  ·  Stop `{stop:.2f}`  ·  "
-            f"TP `{t1:.2f}` (1:1)  ·  Contracts `{contracts}`"
+            f"TP `{t1:.2f}` ({_rr_label})  ·  Contracts `{contracts}`"
         )
         _url = _discord_url(normalized)
         if _url:
@@ -11595,6 +11706,14 @@ def enter_trade():
     global ACTIVE_TRADE
     data = request.get_json(force=True, silent=True) or {}
 
+    # R:R multiple for the LOCAL tracked TP. Defaults to the system-wide 1:1; the
+    # plan-sourced branch below lifts it from the authoritative trade_plan so a real,
+    # truly-ready Opening Range Breakout (the one sanctioned 1:4 exception) is TRACKED
+    # at 1:4 too — matching the 1:4 order the gateway sends — instead of booking the
+    # win early at a forced 1:1. Client-typed plans have no engine context → stay 1:1.
+    _rr_mult  = 1.0
+    _rr_label = "1:1"
+
     if data.get("entry"):
         try:
             direction = str(data.get("direction", "Long"))
@@ -11634,6 +11753,9 @@ def enter_trade():
             direction = str(tp["direction"])
         except (ValueError, TypeError, KeyError) as exc:
             return jsonify({"status": "error", "reason": str(exc)}), 400
+        # Authoritative plan drives the tracked R:R (1:4 only for a truly-ready ORB).
+        _rr_mult  = float(tp.get("rr_num", 1.0) or 1.0)
+        _rr_label = str(tp.get("rr", "1:1") or "1:1")
         profile   = str(data.get("profile", DEFAULT_PROFILE))
         acct_size = ACCOUNT_PROFILES.get(profile, {}).get("account_size", DEFAULT_ACCOUNT_SIZE)
         risk_pct  = ACCOUNT_PROFILES.get(profile, {}).get("risk_pct", DEFAULT_RISK_PCT)
@@ -11642,7 +11764,7 @@ def enter_trade():
                       if a.get("structure_class") in ("Bullish Attempt", "Bearish Attempt")
                       else 1.0)
         sz        = calculate_position_sizing(tp, acct_size, risk_pct * _risk_mult, profile)
-        contracts = int(sz.get("contracts", 1)) if sz else 1
+        contracts = max(1, int(sz.get("contracts", 1))) if sz else 1
         # Honor an explicit owner-supplied contract count so the tracked trade
         # matches the size actually sent to the broker (sizing is only a default).
         if data.get("contracts") not in (None, ""):
@@ -11672,11 +11794,13 @@ def enter_trade():
                                    f"(stop {'below' if stop < entry else 'above'} entry = {inferred}).")}), 400
     direction = inferred
 
-    # Enforce the system-wide fixed 1:1 model on the tracked trade: the take-profit
-    # always sits the same distance from entry as the stop, regardless of any t1/t2
-    # supplied (deeper targets are retired).
+    # Re-derive the tracked take-profit FROM entry/stop at the plan's R:R multiple
+    # (_rr_mult is 1.0 for every strategy except a truly-ready Opening Range Breakout,
+    # which the authoritative plan marks 1:4). Computing it here — rather than trusting
+    # any client-supplied t1/t2 (deeper targets are retired) — keeps the tracked exit
+    # consistent with the order the gateway actually sends.
     _risk = abs(entry - stop)
-    t1 = (entry + _risk) if direction == "Long" else (entry - _risk)
+    t1 = (entry + _rr_mult * _risk) if direction == "Long" else (entry - _rr_mult * _risk)
     t2 = t1
 
     # Record the trade for local tracking. _ENTER_LOCK serialises the
@@ -11700,7 +11824,7 @@ def enter_trade():
     content = (
         f"✅ **TRADE ENTERED — {direction.upper()}**\n"
         f"Entry `{entry:.2f}`  ·  Stop `{stop:.2f}`  ·  "
-        f"TP `{t1:.2f}` (1:1)  ·  "
+        f"TP `{t1:.2f}` ({_rr_label})  ·  "
         f"Contracts `{contracts}`  ·  Profile `{profile}`"
     )
     try:
@@ -11823,6 +11947,19 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     except (ValueError, TypeError, KeyError) as exc:
         return {"status": "error", "reason": f"Could not read trade plan: {exc}"}, 400
 
+    # ── Absolute per-trade risk cap (the money path's hard ceiling) ──────────────
+    # Size the live order so it can NEVER risk more than MAX_RISK_DOLLARS_PER_TRADE.
+    # If a SINGLE contract already risks more than the cap (stop too wide for the
+    # account), the setup is SKIPPED rather than forced through over-cap — identical
+    # rule for the manual button and hands-free auto execution. Clamp (never round up).
+    _sized = _risk_capped_contracts(abs(entry - stop), point_value_for(instrument),
+                                    DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PCT)
+    if _sized["over_cap"]:
+        return {"status": "error",
+                "reason": (f"Single-contract risk ${_sized['risk_per_contract']:,.0f} exceeds the "
+                           f"${MAX_RISK_DOLLARS_PER_TRADE:,.0f} per-trade cap — order skipped.")}, 409
+    contracts = max(1, min(int(contracts), _sized["contracts"]))
+
     tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
     action    = "buy" if direction.lower().startswith("l") else "sell"
 
@@ -11859,7 +11996,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
             "status": "manual_required",
             "provider": provider_label, "mode": mode, "broker_verify_required": False,
             "message": (f"Place this {instrument} {direction.upper()} order yourself: "
-                        f"{contracts} @ market · stop {intent['stop']} · TP {intent['target1']} (1:1)."),
+                        f"{contracts} @ market · stop {intent['stop']} · TP {intent['target1']} ({tp.get('rr','1:1')})."),
             "plan": plan_public,
         }, 200
 
@@ -11873,7 +12010,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
                 requests.post(_url, json={"content": (
                     f"🧪 **PAPER ORDER (simulated) — {direction.upper()}**\n"
                     f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
-                    f"Stop `{stop:.2f}`  ·  TP `{t1:.2f}` (1:1)")}, timeout=5)
+                    f"Stop `{stop:.2f}`  ·  TP `{t1:.2f}` ({tp.get('rr','1:1')})")}, timeout=5)
         except requests.RequestException:
             pass
         return {
@@ -11942,7 +12079,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     content = (
         f"🚀 **ORDER SENT → {provider_label} — {direction.upper()}**\n"
         f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
-        f"Stop `{stop:.2f}`  ·  TP `{t1:.2f}` (1:1)"
+        f"Stop `{stop:.2f}`  ·  TP `{t1:.2f}` ({tp.get('rr','1:1')})"
     )
     try:
         _url = _discord_url(instrument)
@@ -13115,7 +13252,7 @@ async function enterTrade() {
       + sym + ' ' + dir.toUpperCase() + '  ·  ' + q0 + ' contract' + (q0>1?'s':'')
       + '\\nEntry ~' + (entry!=null?entry:'market')
       + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
-      + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (1:1)'
+      + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (' + (tp.rr||'1:1') + ')'
       + '\\n\\nProceed?';
     if (!confirm(msg)) return;
   }
@@ -14339,7 +14476,7 @@ async function sendOrder() {
     + inst + ' ' + rd.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
     + '\\nEntry ~' + (entry!=null?entry:'market')
     + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
-    + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (1:1)';
+    + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (' + (tp.rr||'1:1') + ')';
   if (!confirm(msg)) return;
   const btn = document.getElementById('btn-send');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }

@@ -6,11 +6,37 @@ description: All live trade plans use a fixed 1:1 risk:reward; the tick-grid ser
 # Fixed 1:1 R:R model
 
 All live trade plans are **fixed 1:1 R:R** (the older tiered TP1/TP2/TP3 / MNQ 20·40·60 /
-MGC 5·10·15 ladder is retired for the *plan*). Stop is computed first (ATR/structure/zone,
-floored at min ticks); `RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`.
-Plans below the min stop (MGC < 5 pts, MNQ < 20 pts) are rejected outright (no trade).
-`build_strict_trade_plan` sets `target1 == target2`, `rr = "1:1"`; `_decision_support`
-reward reads `"1:1 (fixed)"`.
+MGC 5·10·15 ladder is retired for the *plan*) — **EXCEPT the one sanctioned ORB 1:4 exception
+below**. Stop is computed first (ATR/structure/zone, floored at min ticks);
+`RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`. Plans below the min stop
+(MGC < 5 pts, MNQ < 20 pts) are rejected outright (no trade). `build_strict_trade_plan` sets
+`target1 == target2`, `rr = "1:1"`, `rr_num = 1.0`; `_decision_support` reward reads `"1:1 (fixed)"`.
+
+## Sanctioned exception — a truly-ready Opening Range Breakout = 1:4 (user-approved)
+`_apply_orb_target_override(result)` runs right after `compute_strategy_engine` and rewrites
+ONLY `trade_plan` target1/target2 (`:.2f`), `rr="1:4"`, `rr_num=4.0`, `reward_points`, `reason`,
+and `management.tp1`. entry/stop/direction/verdict are NOT touched (the strict gate still owns
+those). FAIL-OPEN: any missing/mismatched field leaves the 1:1 plan untouched.
+**Guards (ALL required):** `strategy_engine.active_key == "OPENING_RANGE_BREAKOUT"` AND
+`strategy_engine.ready` AND actionable verdict AND valid `management.entry`/`risk_points` AND
+engine direction == plan direction.
+**Why `ready` is load-bearing:** `compute_strategy_engine` falls back to the highest-completeness
+*eligible* strategy even when none is fully met (`engine["ready"]` == active strategy `fully_met`),
+so without the `ready` guard a forming/fallback ORB under an otherwise-READY strict setup would
+wrongly inherit 1:4. The fallback active_key must NOT earn the exception.
+**Tracking parity:** every surface reads the SAME authoritative plan, so a real ORB is 1:4 on the
+broker order AND in local tracking — gateway parses `target1`; `_maybe_auto_execute` uses gateway
+`plan.takeProfit`; both local ENTER paths re-derive `t1 = entry ± rr_num*risk` (rr_num lifted from
+the plan, default 1.0). Non-ORB is byte-identical 1:1 because base plan emits `rr_num=1.0`.
+
+## $100/trade risk ceiling ($50,000 account)
+`MAX_RISK_DOLLARS_PER_TRADE` (default 100, env-overridable) is a CEILING — clamp DOWN only, never
+up. Pure helper `_risk_capped_contracts(stop_dist, point_value, account, risk_pct)`:
+`budget = min(account*pct, hard_cap)`, `contracts = budget // (stop_dist*pv)`, clamped to broker
+max; `over_cap` true when result < 1 (one contract already risks > $100 → stop too wide).
+`execute_trade_gateway` (the single money choke for BOTH manual `/traderspost` and
+`_maybe_auto_execute`) returns **409 SKIP** when over_cap — it NEVER silently sends 1 contract over
+the ceiling. `calculate_position_sizing` exposes `over_risk_cap/risk_cap/note` and shows 0 honestly.
 
 ## Invariant 1 — serialize EVERY plan price with `:.2f`, never `:.1f`
 **Why:** MNQ tick is **0.25**. `:.1f` rounds a valid quarter-tick (e.g. `30022.75`) to
@@ -34,8 +60,8 @@ or you reintroduce a half-tick midpoint drift through the gateway.
 ## Invariant 3 — ENTER tracking derives direction from the stop side, not a defaulted "Long"
 Both ENTER tracking paths (`_handle_command_alert` ENTER branch and the `/enter` route)
 infer `direction = "Long" if stop < entry else "Short"`, reject `entry == stop`, and reject an
-explicit direction that contradicts the stop placement; then recompute `t1 = entry ± risk`,
-`t2 = t1`.
+explicit direction that contradicts the stop placement; then recompute `t1 = entry ± rr_num*risk`,
+`t2 = t1` (rr_num lifted from the authoritative plan: 1.0 for all strategies, 4.0 for a ready ORB).
 **Why:** `direction` used to default `"Long"` when omitted, so a Short ENTER would place the
 1:1 TP on the *stop* side while announcing "(1:1)" and mis-tag `ACTIVE_TRADE` (consumed by
 `compute_pnl` / `compute_distances` / `check_trade_events`). Stop side is the bracket's ground
