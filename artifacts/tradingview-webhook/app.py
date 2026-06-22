@@ -11886,6 +11886,8 @@ def dashboard():
   .focus-row{display:flex;align-items:center;gap:12px;margin-bottom:8px;font-size:12px}
   .focus-lbl{color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-weight:600}
   .focus-chip{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--muted);user-select:none}
+  .mute-pill{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:12px;font-weight:600;padding:4px 12px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--green)}
+  .mute-pill.is-muted{color:var(--red);border-color:var(--red);opacity:.9}
   .focus-chip input{accent-color:var(--amber);cursor:pointer;width:15px;height:15px;margin:0}
   .focus-chip span{font-weight:600;letter-spacing:.5px}
   /* Direction toggle */
@@ -12155,16 +12157,25 @@ def dashboard():
     </div>
     <div id="g-scores" class="gauge-scores"></div>
   </div>
-  <!-- Instrument focus (display-only): hide one instrument to watch a single
-       market at a time. Alerts & tracking keep running in the background for
-       BOTH — unchecking an instrument HIDES its tab AND MUTES its Discord alerts;
-       the engine keeps evaluating, journaling and tracking it silently (no data
-       gap). The mute is server-side, so this row reflects + sets that state. -->
+  <!-- Instrument focus (display-only, this device): hide one instrument to watch
+       a single market at a time. This ONLY shows/hides the tab — it does NOT
+       affect alerts. Use the Alerts mute row below to silence a pair's Discord
+       notifications (the engine keeps evaluating / journaling / tracking either
+       way, so there is never a data gap). -->
   <div class="focus-row">
     <span class="focus-lbl">Focus</span>
     <label class="focus-chip"><input type="checkbox" id="foc-MGC" checked onchange="toggleInstrument('MGC', this.checked)"><span>MGC</span></label>
     <label class="focus-chip"><input type="checkbox" id="foc-MNQ" checked onchange="toggleInstrument('MNQ', this.checked)"><span>MNQ</span></label>
-    <span class="focus-lbl" style="opacity:.6">unchecking mutes its alerts · still tracked</span>
+    <span class="focus-lbl" style="opacity:.6">show / hide a pair on this device</span>
+  </div>
+  <!-- Alert mute (server-side, affects every device): silence a pair's Discord
+       NEW-SETUP alerts while the engine keeps evaluating, journaling and tracking
+       it. Independent of Focus above. Resets to ON on restart/republish. -->
+  <div class="focus-row">
+    <span class="focus-lbl">Alerts</span>
+    <span id="mute-MGC" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MGC');}">🔔 MGC: on</span>
+    <span id="mute-MNQ" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MNQ');}">🔔 MNQ: on</span>
+    <span class="focus-lbl" style="opacity:.6">mute silences Discord · still tracked</span>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
@@ -12513,6 +12524,7 @@ def dashboard():
 <script>
 const BASE = '/api';
 let sym = 'MGC', dir = 'Long', activeTrade = null;
+let MUTE_STATE = { MGC: false, MNQ: false };   // server-side alert mute, painted by loadAlertMutes()
 
 function setSymbol(s) {
   sym = s;
@@ -12552,32 +12564,44 @@ function toggleInstrument(inst, on){
     toast('Keep at least one instrument showing', false);
     return;
   }
+  // Focus is DISPLAY-ONLY (this device): show/hide a pair's tab. It no longer
+  // touches the server-side alert mute — muting is its own explicit control
+  // (toggleMute) so hiding a pair here never silences Discord for everyone.
   try { localStorage.setItem('focus_'+inst, on ? '1' : '0'); } catch(e){}
   applyInstrumentFocus();
-  // Persist the alert mute server-side (muted = hidden). Display is already updated
-  // above; this is what actually silences Discord for the hidden pair while it keeps
-  // being evaluated and tracked. On failure, resync from the server so the row never
-  // claims "muted" when the server didn't accept it.
-  api('/alerts/mute', { instrument: inst, muted: !on })
-    .then(function(d){
-      if (!d || d.status !== 'ok'){ toast('Mute update failed', false); loadAlertMutes(); return; }
-      toast(on ? (inst + ' shown — alerts on')
-               : (inst + ' hidden — alerts muted (still tracked)'));
-    })
-    .catch(function(){ toast('Mute update failed', false); loadAlertMutes(); });
+  toast(on ? (inst + ' shown') : (inst + ' hidden (alerts unchanged)'));
 }
-// On boot, reconcile the focus row with the SERVER mute state (authoritative):
-// muted -> hidden, unmuted -> shown. Keeps devices consistent and reflects a
-// post-republish reset (everything unmuted) rather than a stale local choice.
+// On boot, load the SERVER mute state (authoritative) and paint the explicit
+// mute toggles. Mute is independent of focus/display; a restart/republish resets
+// everything to unmuted (fail-safe toward alerting).
 async function loadAlertMutes(){
   try {
     const d = await api('/alerts/mute');
-    if (!d || !d.muted) return;
-    ['MGC','MNQ'].forEach(function(inst){
-      try { localStorage.setItem('focus_'+inst, d.muted[inst] ? '0' : '1'); } catch(e){}
-    });
-    applyInstrumentFocus();
+    if (d && d.muted) MUTE_STATE = d.muted;
   } catch(e){}
+  renderMuteUI();
+}
+function renderMuteUI(){
+  ['MGC','MNQ'].forEach(function(inst){
+    const el = document.getElementById('mute-'+inst);
+    if (!el) return;
+    const muted = !!(MUTE_STATE && MUTE_STATE[inst]);
+    el.textContent = (muted ? '🔕 ' : '🔔 ') + inst + (muted ? ': muted' : ': on');
+    el.classList.toggle('is-muted', muted);
+    el.setAttribute('aria-pressed', muted ? 'true' : 'false');
+  });
+}
+function toggleMute(inst){
+  const next = !(MUTE_STATE && MUTE_STATE[inst]);
+  MUTE_STATE[inst] = next; renderMuteUI();                 // optimistic paint
+  api('/alerts/mute', { instrument: inst, muted: next })
+    .then(function(d){
+      if (!d || d.status !== 'ok'){ MUTE_STATE[inst] = !next; renderMuteUI(); toast('Mute update failed', false); return; }
+      if (d.muted) MUTE_STATE = d.muted;
+      renderMuteUI();
+      toast(next ? (inst + ' alerts muted — still evaluated & tracked') : (inst + ' alerts on'));
+    })
+    .catch(function(){ MUTE_STATE[inst] = !next; renderMuteUI(); toast('Mute update failed', false); });
 }
 function setDir(d) {
   dir = d;
@@ -13567,6 +13591,42 @@ function renderDirView() {
   bar.style.width = Math.max(0, Math.min(100, score / EDGE_MAX * 100)) + '%';
   bar.style.background = score>=85 ? '#2bf5a0' : score>=75 ? '#ff5fb0' : '#ffb14e';
   num.textContent = dir + ' Edge ' + score + '/' + EDGE_MAX + grade + ' · ' + label + met;
+
+  // Edge component breakdown — appended right under the gate-light checklist so a
+  // green checklist that still isn't READY is self-explanatory: it shows exactly
+  // which SCORED confluences are contributing and which are missing, plus the gap
+  // to the (mode-dependent) READY threshold. Note zone & VWAP-location pass the
+  // gate but score 0 here — that's why "all gates green" can still sit below the
+  // threshold. Display-only; reads the same edge_breakdown the gate scored.
+  const eb = (blk && blk.edge_breakdown) ? blk.edge_breakdown
+           : (d.edge_breakdown || null);
+  if (eb && eb.components && eb.components.length){
+    const thr = (gd && gd.ready_threshold!=null) ? gd.ready_threshold : _thr;
+    const rows = eb.components.map(function(c){
+      const ok = !!c.present;
+      return '<div style="display:flex;justify-content:space-between;font-size:11px;line-height:1.7;'
+           + (ok?'color:#9fe7c0':'color:#6b7280')+'">'
+           + '<span>'+(ok?'\u2713':'\u2717')+' '+c.label+'</span>'
+           + '<span>'+(ok?('+'+c.points):('+'+c.points+' missing'))+'</span></div>';
+    }).join('');
+    const gap = Math.max(0, thr - score);
+    const missing = eb.components.filter(function(c){return !c.present;})
+                      .sort(function(a,b){return b.points-a.points;});
+    const hint = gap>0
+      ? ('\u26A0\uFE0F Short by '+gap+' \u2014 add '+(missing.length
+          ? missing.slice(0,2).map(function(m){return m.label;}).join(' or ')
+          : 'more confluence'))
+      : '\u2713 Threshold met';
+    list.innerHTML +=
+      '<details class="edge-bd"'+(gap>0?' open':'')+' style="margin-top:8px">'
+      + '<summary style="font-size:11px;color:#8a93a6;cursor:pointer;list-style:none">'
+      + '🧮 Edge components \u00B7 '+score+'/'+EDGE_MAX+' \u00B7 need '+thr+'</summary>'
+      + '<div style="margin-top:6px;padding:8px;border:1px solid #1e1e32;border-radius:4px;background:#0d0820">'
+      + rows
+      + '<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e1e32;font-size:11px;color:'
+      + (gap>0?'#ffb14e':'#9fe7c0')+'">'+hint+'</div>'
+      + '</div></details>';
+  }
 
   // Trade plan + Apply only when the SELECTED side is the system's actionable side
   // (full READY or EARLY READY).
