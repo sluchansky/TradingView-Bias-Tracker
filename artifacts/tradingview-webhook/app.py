@@ -433,9 +433,11 @@ def _spec_float_env(name, default):
 INSTRUMENT_SPECS = {
     "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
+            "min_stop_pts": _spec_float_env("MNQ_MIN_STOP_PTS", 20.0),
             "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0)},
     "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
             "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
+            "min_stop_pts": _spec_float_env("MGC_MIN_STOP_PTS", 5.0),
             "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0)},
 }
 
@@ -4361,6 +4363,8 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     pv        = spec["point_value"]
     buf       = spec["stop_buf"]
     min_ticks = int(spec["min_stop_ticks"])
+    min_pts   = float(spec.get("min_stop_pts", 0.0))
+    inst      = instrument_of(ticker)
 
     vol = volatility or {}
     atr = vol.get("atr_pts")
@@ -4396,9 +4400,19 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
         calc_stop = max(atr_stop, structure_stop) if structure_stop is not None else atr_stop
 
     calc_dist  = abs(entry - calc_stop)
+    # ── HARD minimum-stop guard (fixed 1:1 risk model) ──
+    # A calculated stop tighter than the instrument's minimum is REJECTED outright
+    # (no silent widening): extremely tight stops get knocked out by ordinary market
+    # noise. MGC 5 pts / MNQ 20 pts, both env-overridable (MGC_MIN_STOP_PTS /
+    # MNQ_MIN_STOP_PTS). Checked on the RAW calculated distance, before tick snapping.
+    if min_pts > 0 and calc_dist < min_pts:
+        return {"ok": False,
+                "reason": (f"Calculated stop {calc_dist:.1f} pts is below the {inst} "
+                           f"minimum {min_pts:g} pts — too tight, no trade.")}
     calc_ticks = (calc_dist / tick) if tick else 0.0
-    # Snap UP to whole ticks (never tighter than calculated), then apply the floor.
-    final_ticks = max(math.ceil(calc_ticks - 1e-9), min_ticks)
+    # Snap UP to whole ticks (never tighter than calculated). No artificial floor —
+    # the minimum-stop guard above already rejects anything too tight.
+    final_ticks = math.ceil(calc_ticks - 1e-9)
     final_dist  = final_ticks * tick
     final_stop  = (entry - final_dist) if direction == "Long" else (entry + final_dist)
 
@@ -4431,18 +4445,19 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
         "vol_ratio":           vol.get("ratio"),
         "nearest_demand":      nearest_demand,
         "nearest_supply":      nearest_supply,
-        "min_floor_applied":   final_ticks > math.ceil(calc_ticks - 1e-9),
+        "min_floor_applied":   False,
     }
 
 
 def build_strict_trade_plan(direction, ticker, current_price,
                             nearest_supply, nearest_demand,
                             volatility=None, mode=None, vwap=None):
-    """Fixed-target plan per instrument with an ATR(14)-based DYNAMIC stop.
+    """Single-target plan per instrument at a FIXED 1:1 risk:reward.
 
-    Targets stay fixed (MNQ TP1/TP2/TP3 = 20/40/60 pts, MGC = 5/10/15). The stop is
-    sized by `_dynamic_stop_plan` — ATR×multiplier blended with the nearest zone and
-    floored at the instrument's min stop ticks.
+    The stop is sized FIRST by `_dynamic_stop_plan` (ATR×multiplier blended with the
+    nearest zone, snapped to ticks, and REJECTED outright if tighter than the
+    instrument minimum — MGC 5 pts / MNQ 20 pts). The single take-profit is then
+    placed the same distance from entry as the stop, so every plan is exactly 1:1.
 
     Anchor priority: the trade-side structural zone when present (the highest-quality
     level), else VWAP. The SCALP READY gate accepts location as "near VWAP OR
@@ -4451,13 +4466,12 @@ def build_strict_trade_plan(direction, ticker, current_price,
     would say READY while the verdict silently downgraded to WAIT.
 
     Returns a no-plan dict if neither a zone nor VWAP is available to anchor the
-    entry, the ATR reading needed to size the stop is unavailable, or (SWING /
-    ENFORCE_MIN_RR) the fixed TP2 can't make 1:2.
+    entry, the ATR reading needed to size the stop is unavailable, or the calculated
+    stop is below the instrument minimum (too tight — see `_dynamic_stop_plan`).
     """
     spec = spec_for(ticker)
     inst = instrument_of(ticker)
-    tp1d, tp2d, buf, pv = spec["tp1"], spec["tp2"], spec["stop_buf"], spec["point_value"]
-    tp3d = spec.get("tp3", tp2d * 1.5)
+    buf, pv = spec["stop_buf"], spec["point_value"]
 
     def no_plan(reason):
         return {"trade_plan": False, "reason": reason,
@@ -4486,67 +4500,83 @@ def build_strict_trade_plan(direction, ticker, current_price,
         if anchor is None:
             return no_plan("No demand zone or VWAP to anchor the entry.")
         lo, hi = anchor, anchor + buf
-        t1, t2, t3 = anchor + tp1d, anchor + tp2d, anchor + tp3d
     else:  # Short
         anchor = nearest_supply if nearest_supply is not None else vwap
         anchored_on_vwap = nearest_supply is None
         if anchor is None:
             return no_plan("No supply zone or VWAP to anchor the entry.")
         lo, hi = anchor - buf, anchor
-        t1, t2, t3 = anchor - tp1d, anchor - tp2d, anchor - tp3d
 
-    entry = (lo + hi) / 2
+    # Snap entry to the instrument tick grid (MNQ 0.25 / MGC 0.1), then re-centre the
+    # zone band on it. The raw zone midpoint can fall between ticks (especially when
+    # VWAP-anchored); since the stop is sized FROM entry and the 1:1 TP mirrors that
+    # distance, an off-grid entry would push the stop AND TP off-grid too — sending
+    # invalid prices to the broker and breaking the exact 1:1 the moment the gateway
+    # re-parses the rounded strings. stop_buf/2 is a whole-tick multiple for both
+    # instruments (MNQ 2.5 = 10 ticks, MGC 0.5 = 5 ticks), so the re-centred lo/hi stay
+    # on-grid and every (lo+hi)/2 consumer (gateway, sizing, /enter) re-derives the SAME
+    # entry the stop/TP were built from.
+    tick   = spec["tick_size"]
+    entry  = round(round(((lo + hi) / 2) / tick) * tick, 10)
+    lo, hi = entry - buf / 2, entry + buf / 2
 
-    # ── ATR(14)-based dynamic stop (replaces the old fixed anchor ± buf stop) ──
+    # ── ATR(14)-based dynamic stop (sized FIRST; the 1:1 TP derives from it) ──
     sp = _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
                             ticker, volatility, mode)
     if not sp["ok"]:
-        # ATR unavailable / safety violation → no trade plan (caller maps to WAIT).
+        # ATR unavailable / safety violation / stop too tight → no trade plan
+        # (caller maps to WAIT). The min-stop rejection lives in _dynamic_stop_plan.
         return no_plan(sp["reason"])
     stop = sp["final_stop"]
     risk = sp["risk_points"]
     if risk <= 0:
         return no_plan("Invalid stop distance.")
-    r1, r2 = abs(t1 - entry) / risk, abs(t2 - entry) / risk
-    # Wider ATR stops lower the fixed-target R:R. SCALP displays R:R instead of
-    # gating on it; SWING (ENFORCE_MIN_RR) keeps the strict ">= 1:2 on TP2" veto.
-    if cfg("ENFORCE_MIN_RR") and r2 < 2.0:
-        return no_plan(f"Stop distance {risk:.1f} pts makes fixed TP2 only {r2:.1f}R (min 1:2).")
 
-    # ── Additive trade-management plan (does NOT alter the existing fields) ──
-    be_level  = t1                 # move stop to breakeven once TP1 prints
-    partial   = (t1 + t2) / 2      # scale out a partial between TP1 and TP2
-    runner    = t3                 # let the runner ride to TP3
-    reward    = abs(t3 - entry)    # reward measured to the runner target
-    rr_runner = reward / risk
+    # ── FIXED 1:1 RISK:REWARD ────────────────────────────────────────────────
+    # RiskDistance == |entry − stop|. The single take-profit sits the SAME distance
+    # on the other side of entry, so reward == risk and R:R is always 1:1. Because
+    # full_analysis recomputes this plan fresh on every poll/webhook, the TP always
+    # re-derives from the CURRENT stop — if the stop widens/tightens before entry the
+    # 1:1 is preserved automatically (no stale cached target reaches the broker).
+    take_profit  = (entry + risk) if direction == "Long" else (entry - risk)
+    reward       = risk
+    risk_dollars = round(risk * pv, 2)   # per contract; == expected profit at 1:1
+
     zone_word = "demand" if direction == "Long" else "supply"
     side_word = "below" if direction == "Long" else "above"
     anchor_word = "VWAP" if anchored_on_vwap else f"{zone_word} zone"
 
-    fmt = (lambda v: f"{v:.1f}") if inst == "MNQ" else (lambda v: f"{v:.2f}")
+    # Two decimals serialises BOTH tick grids exactly (MNQ 0.25, MGC 0.1). One decimal
+    # would silently destroy MNQ quarter-ticks (30022.75 → "30022.8", an invalid tick)
+    # the instant a consumer re-parses the string to place a broker order.
+    fmt = lambda v: f"{v:.2f}"
     invalidation = (f"Price closing {side_word} the stop ({fmt(stop)}) or losing "
                     f"{anchor_word} invalidates the setup.")
     return {
         "trade_plan": True,
-        "reason": f"{inst} {direction} — fixed targets (TP1 {tp1d:g} / TP2 {tp2d:g} / TP3 {tp3d:g} pts), ATR-dynamic stop, {anchor_word}-anchored.",
+        "reason": (f"{inst} {direction} — fixed 1:1 R:R, ATR/structure stop "
+                   f"({risk:.1f} pts), {anchor_word}-anchored."),
         "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
         "stop_loss":  fmt(stop),
-        "target1":    fmt(t1),
-        "target2":    fmt(t2),
-        "rr":         f"T1 1:{r1:.1f} / T2 1:{r2:.1f}",
+        "target1":    fmt(take_profit),
+        # target2 MIRRORS the single 1:1 TP (kept present + equal so live consumers
+        # that read target2 — sizing, /enter, the execution gateway, the ACTIVE_TRADE
+        # lifecycle — never KeyError/500). Display layers render one "Take Profit".
+        "target2":    fmt(take_profit),
+        "rr":         "1:1",
         "direction":  direction,
         "instrument": inst,
         "point_value": pv,
-        # ── Additive management fields ──
-        "target3":          fmt(t3),
-        "be_level":         fmt(be_level),
-        "partial_level":    fmt(partial),
-        "runner_target":    fmt(runner),
+        # ── Single-exit 1:1 model: deeper targets / partials / breakeven retired ──
+        "target3":          None,
+        "be_level":         None,
+        "partial_level":    None,
+        "runner_target":    None,
         "risk_points":      round(risk, 2),
         "reward_points":    round(reward, 2),
-        "rr_num":           round(rr_runner, 2),
+        "rr_num":           1.0,
         "max_invalidation": invalidation,
-        # ── Additive ATR dynamic-stop metadata (display/diagnostics; single source) ──
+        # ── ATR dynamic-stop metadata (display/diagnostics; single source) ──
         "atr_pts":                   sp["atr_pts"],
         "atr_multiplier":            sp["multiplier"],
         "atr_stop":                  fmt(sp["atr_stop"]),
@@ -4555,21 +4585,22 @@ def build_strict_trade_plan(direction, ticker, current_price,
         "min_stop_ticks":            sp["min_stop_ticks"],
         "tick_size":                 sp["tick_size"],
         "stop_distance_ticks":       sp["stop_distance_ticks"],
-        "risk_dollars_per_contract": sp["risk_dollars"],
+        "risk_dollars_per_contract": risk_dollars,
         "nearest_demand":            nearest_demand,
         "nearest_supply":            nearest_supply,
         "volatility_regime":         sp["regime"],
         "volatility_label":          sp["vol_label"],
         "min_floor_applied":         sp["min_floor_applied"],
-        # Numeric snapshot consumed by the trade-management watcher. Stop/risk come
-        # from the FINAL dynamic stop only (no drift vs the displayed stop).
+        # Numeric snapshot consumed by the trade-management watcher. Single TP only:
+        # tp1 = the 1:1 target; deeper levels retired (None). The watcher books a WIN
+        # on tp1 and a LOSS on stop — exactly the 1:1 outcome set.
         "management": {
             "direction": direction, "instrument": inst, "point_value": pv,
             "entry": round(entry, 4), "entry_lo": round(lo, 4), "entry_hi": round(hi, 4),
             "stop": round(stop, 4),
-            "tp1": round(t1, 4), "tp2": round(t2, 4), "tp3": round(t3, 4),
-            "be_level": round(be_level, 4), "partial": round(partial, 4),
-            "runner": round(runner, 4), "risk_points": round(risk, 4),
+            "tp1": round(take_profit, 4), "tp2": None, "tp3": None,
+            "be_level": None, "partial": None,
+            "runner": None, "risk_points": round(risk, 4),
         },
     }
 
@@ -6623,7 +6654,11 @@ def check_trade_events(trade, current_price):
     if stop_hit:
         events.append("STOP_HIT")
     else:
-        if t2_hit and not trade.get("t2_hit"):
+        # At a fixed 1:1 R:R, target2 mirrors target1 (single exit). Only emit a
+        # distinct T2 event when the plan carries a genuinely deeper second target,
+        # so a 1:1 close books one WIN (T1) instead of double-firing T1 + T2.
+        distinct_t2 = trade.get("target2") != trade.get("target1")
+        if t2_hit and distinct_t2 and not trade.get("t2_hit"):
             events.append("T2_HIT")
         if t1_hit and not trade.get("t1_hit"):
             events.append("T1_HIT")
@@ -6783,9 +6818,9 @@ def _build_trade_card_embed(entry, footer_text):
             {"name": "🏗️ BOS Type",            "value": _typed(entry.get("bos_type"), entry.get("bos_level")), "inline": True},
             {"name": "🔀 CHOCH Type",          "value": _typed(entry.get("choch_type"), entry.get("choch_level")), "inline": True},
             {"name": "📐 Entry",               "value": _val(entry.get("entry_zone")), "inline": True},
-            {"name": "🛑 Stop",                "value": _val(entry.get("stop_loss")),  "inline": True},
-            {"name": "🎯 TP1",                 "value": _val(entry.get("target1")),    "inline": True},
-            {"name": "🎯 TP2",                 "value": _val(entry.get("target2")),    "inline": True},
+            {"name": "🛑 Stop Loss",           "value": _val(entry.get("stop_loss")),  "inline": True},
+            {"name": "🎯 Take Profit",         "value": _val(entry.get("target1")),    "inline": True},
+            {"name": "📏 Risk Distance",       "value": (f"{entry.get('risk_points')} pts" if entry.get('risk_points') is not None else "—"), "inline": True},
             {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
             {"name": "📈 VWAP",                "value": _val(entry.get("vwap_position")), "inline": True},
             {"name": "🧱 Zone",                "value": _val(entry.get("supply_demand_zone")), "inline": True},
@@ -6811,10 +6846,10 @@ def _build_trade_card_embed(entry, footer_text):
             mgmt_lines.append(f"💰 Partial: {entry['partial_level']}")
         if entry.get("runner_target") not in (None, ""):
             mgmt_lines.append(f"🏃 Runner: {entry['runner_target']}")
-        rp, rwp, rrn = entry.get("risk_points"), entry.get("reward_points"), entry.get("rr_num")
-        if rp is not None and rwp is not None:
-            rr_txt = f" · R:R {rrn}R" if rrn is not None else ""
-            mgmt_lines.append(f"⚖️ Risk: {rp} pts · Reward: {rwp} pts{rr_txt}")
+        rdc = entry.get("risk_dollars_per_contract")
+        if rdc is not None:
+            # Fixed 1:1 R:R → expected profit per contract == dollar risk per contract.
+            mgmt_lines.append(f"⚖️ R:R 1:1 · Dollar Risk ${rdc}/ct · Expected Profit ${rdc}/ct")
         if entry.get("atr_pts") is not None:
             mgmt_lines.append(
                 f"📏 ATR Stop: {entry.get('atr_pts')} pts × {entry.get('atr_multiplier')} "
@@ -8019,16 +8054,10 @@ def _decision_support(a):
         rr_f = float(rr)
     except (TypeError, ValueError):
         rr_f = None
-    if rr_f is None:
-        reward = "—"
-    elif rr_f >= 3:
-        reward = f"Excellent ({rr_f:.1f}R)"
-    elif rr_f >= 2:
-        reward = f"Good ({rr_f:.1f}R)"
-    elif rr_f >= 1.5:
-        reward = f"Fair ({rr_f:.1f}R)"
-    else:
-        reward = f"Poor ({rr_f:.1f}R)"
+    # Fixed 1:1 risk model: the reward distance always equals risk by design, so the
+    # old R-multiple grade (Excellent/Good/Fair/Poor) no longer carries meaning —
+    # report the fixed ratio honestly instead of flagging every setup as "Poor".
+    reward = "1:1 (fixed)" if rr_f is not None else "—"
 
     pref = a.get("session_preferred")
     if pref is None:
@@ -8973,9 +9002,33 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
             except (ValueError, TypeError, KeyError) as exc:
                 return jsonify({"status": "error", "reason": f"Missing trade plan params: {exc}"}), 400
 
-        direction = str(data.get("direction", "Long"))
         contracts = int(data.get("contracts", 1))
         symbol    = resolved_inst
+
+        # The stop side is the ground truth for a bracket trade (stop below entry =
+        # Long, above = Short). Resolve direction from the explicit field when given,
+        # else infer it from the stop side; reject a payload whose stated direction
+        # contradicts the stop placement. Without this an omitted direction defaults
+        # Long, so a Short ENTER would put the 1:1 take-profit on the stop side while
+        # announcing "(1:1)" and mis-tag ACTIVE_TRADE for the win/loss watcher.
+        if entry == stop:
+            return jsonify({"status": "error",
+                            "reason": "Entry and stop are equal — cannot place a 1:1 trade."}), 400
+        inferred = "Long" if stop < entry else "Short"
+        _dir_raw = data.get("direction")
+        if _dir_raw and str(_dir_raw)[0].lower() in ("l", "s") \
+                and str(_dir_raw)[0].lower() != inferred[0].lower():
+            return jsonify({"status": "error",
+                            "reason": (f"Direction '{_dir_raw}' contradicts the stop placement "
+                                       f"(stop {'below' if stop < entry else 'above'} entry = {inferred}).")}), 400
+        direction = inferred
+
+        # Enforce the system-wide fixed 1:1 model on the tracked trade: the take-profit
+        # always sits the same distance from entry as the stop, regardless of any t1/t2
+        # supplied in the alert (deeper targets are retired).
+        _risk = abs(entry - stop)
+        t1 = (entry + _risk) if direction == "Long" else (entry - _risk)
+        t2 = t1
 
         # Record the trade for local tracking. _ENTER_LOCK serialises the
         # assignment so two concurrent ENTERs can't race on ACTIVE_TRADE.
@@ -8996,8 +9049,8 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
             }
         content = (
             f"✅ **TRADE ENTERED — {direction.upper()}**\n"
-            f"Entry `{entry:.1f}`  ·  Stop `{stop:.1f}`  ·  "
-            f"T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`  ·  Contracts `{contracts}`"
+            f"Entry `{entry:.2f}`  ·  Stop `{stop:.2f}`  ·  "
+            f"TP `{t1:.2f}` (1:1)  ·  Contracts `{contracts}`"
         )
         _url = _discord_url(normalized)
         if _url:
@@ -11602,6 +11655,30 @@ def enter_trade():
 
     symbol = instrument_of(profile)
 
+    # The stop side is the ground truth for a bracket trade (stop below entry = Long,
+    # above = Short). Resolve direction from the explicit field when given, else infer
+    # it from the stop side; reject a payload whose stated direction contradicts the
+    # stop placement. Without this an omitted direction defaults Long, so a Short ENTER
+    # would put the 1:1 take-profit on the stop side while announcing "(1:1)".
+    if entry == stop:
+        return jsonify({"status": "error",
+                        "reason": "Entry and stop are equal — cannot place a 1:1 trade."}), 400
+    inferred = "Long" if stop < entry else "Short"
+    _dir_raw = data.get("direction")
+    if _dir_raw and str(_dir_raw)[0].lower() in ("l", "s") \
+            and str(_dir_raw)[0].lower() != inferred[0].lower():
+        return jsonify({"status": "error",
+                        "reason": (f"Direction '{_dir_raw}' contradicts the stop placement "
+                                   f"(stop {'below' if stop < entry else 'above'} entry = {inferred}).")}), 400
+    direction = inferred
+
+    # Enforce the system-wide fixed 1:1 model on the tracked trade: the take-profit
+    # always sits the same distance from entry as the stop, regardless of any t1/t2
+    # supplied (deeper targets are retired).
+    _risk = abs(entry - stop)
+    t1 = (entry + _risk) if direction == "Long" else (entry - _risk)
+    t2 = t1
+
     # Record the trade for local tracking. _ENTER_LOCK serialises the
     # assignment so two concurrent ENTERs can't race on ACTIVE_TRADE.
     with _ENTER_LOCK:
@@ -11622,8 +11699,8 @@ def enter_trade():
 
     content = (
         f"✅ **TRADE ENTERED — {direction.upper()}**\n"
-        f"Entry `{entry:.1f}`  ·  Stop `{stop:.1f}`  ·  "
-        f"T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`  ·  "
+        f"Entry `{entry:.2f}`  ·  Stop `{stop:.2f}`  ·  "
+        f"TP `{t1:.2f}` (1:1)  ·  "
         f"Contracts `{contracts}`  ·  Profile `{profile}`"
     )
     try:
@@ -11782,7 +11859,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
             "status": "manual_required",
             "provider": provider_label, "mode": mode, "broker_verify_required": False,
             "message": (f"Place this {instrument} {direction.upper()} order yourself: "
-                        f"{contracts} @ market · stop {intent['stop']} · T1 {intent['target1']}."),
+                        f"{contracts} @ market · stop {intent['stop']} · TP {intent['target1']} (1:1)."),
             "plan": plan_public,
         }, 200
 
@@ -11796,7 +11873,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
                 requests.post(_url, json={"content": (
                     f"🧪 **PAPER ORDER (simulated) — {direction.upper()}**\n"
                     f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
-                    f"Stop `{stop:.1f}`  ·  T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`")}, timeout=5)
+                    f"Stop `{stop:.2f}`  ·  TP `{t1:.2f}` (1:1)")}, timeout=5)
         except requests.RequestException:
             pass
         return {
@@ -11865,7 +11942,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     content = (
         f"🚀 **ORDER SENT → {provider_label} — {direction.upper()}**\n"
         f"{tp_symbol} · {action.upper()} `{contracts}` @ MARKET  ·  "
-        f"Stop `{stop:.1f}`  ·  T1 `{t1:.1f}`  ·  T2 `{t2:.1f}`"
+        f"Stop `{stop:.2f}`  ·  TP `{t1:.2f}` (1:1)"
     )
     try:
         _url = _discord_url(instrument)
@@ -13038,7 +13115,7 @@ async function enterTrade() {
       + sym + ' ' + dir.toUpperCase() + '  ·  ' + q0 + ' contract' + (q0>1?'s':'')
       + '\\nEntry ~' + (entry!=null?entry:'market')
       + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
-      + '   T1 ' + (tp.target1!=null?tp.target1:'—')
+      + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (1:1)'
       + '\\n\\nProceed?';
     if (!confirm(msg)) return;
   }
@@ -13990,10 +14067,14 @@ function renderDirView() {
   const tp = d.trade_plan || {};
   const pp = (blk && blk.potential_plan) ? blk.potential_plan : null;
   const planRow = (p) =>
-      'Entry <b>'+p.entry_zone+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_loss+'</b><br>' +
-      'T1 <b>'+p.target1+'</b> &nbsp;·&nbsp; T2 <b>'+p.target2+'</b> &nbsp;·&nbsp; R:R <b>'+(p.rr!=null?p.rr:'—')+'</b>' +
+      'Entry <b>'+p.entry_zone+'</b> &nbsp;·&nbsp; Stop Loss <b>'+p.stop_loss+'</b><br>' +
+      'Take Profit <b>'+p.target1+'</b> &nbsp;·&nbsp; RR: <b>'+(p.rr!=null?p.rr:'1:1')+'</b>' +
+      (p.risk_points!=null ? '<br>Risk Distance <b>'+p.risk_points+'</b> pts' : '') +
+      (p.risk_dollars_per_contract!=null
+        ? ' &nbsp;·&nbsp; Dollar Risk <b>$'+p.risk_dollars_per_contract+'</b>/ct &nbsp;·&nbsp; Expected Profit <b>$'+p.risk_dollars_per_contract+'</b>/ct'
+        : '') +
       (p.atr_pts!=null
-        ? '<br>ATR <b>'+p.atr_pts+'</b> × <b>'+p.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_distance_ticks+'</b> ticks &nbsp;·&nbsp; Risk <b>$'+p.risk_dollars_per_contract+'</b>/ct'
+        ? '<br>ATR <b>'+p.atr_pts+'</b> × <b>'+p.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_distance_ticks+'</b> ticks'
         : '');
   if (readyDir === dir && tp.trade_plan) {
     // READY / EARLY READY for the selected side — live plan + broker actions.
@@ -14207,10 +14288,10 @@ function buildOrderText() {
     inst + ' ' + rd.toUpperCase(),
     'Entry ' + (entry != null ? entry : (tp.entry_zone || '—')) + zone,
     'Stop  ' + (tp.stop_loss != null ? tp.stop_loss : '—'),
-    'T1    ' + (tp.target1 != null ? tp.target1 : '—'),
-    'T2    ' + (tp.target2 != null ? tp.target2 : '—')
+    'TP    ' + (tp.target1 != null ? tp.target1 : '—')
   ];
-  if (tp.rr != null) lines.push('R:R   ' + tp.rr);
+  if (tp.risk_points != null) lines.push('Risk  ' + tp.risk_points + ' pts');
+  lines.push('R:R   ' + (tp.rr != null ? tp.rr : '1:1'));
   return lines.join('\\n');
 }
 async function copyOrder() {
@@ -14258,7 +14339,7 @@ async function sendOrder() {
     + inst + ' ' + rd.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
     + '\\nEntry ~' + (entry!=null?entry:'market')
     + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
-    + '   T1 ' + (tp.target1!=null?tp.target1:'—');
+    + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (1:1)';
   if (!confirm(msg)) return;
   const btn = document.getElementById('btn-send');
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
@@ -14318,8 +14399,8 @@ async function refresh() {
       info.style.color = isLong ? '#22c55e' : '#ef4444';
       info.textContent = (isLong?'📈':'📉') + ' ' + d.direction + ' — ' + (d.profile||'').split(' ')[0];
       detail.innerHTML =
-        'Entry <b>'+d.entry_price+'</b> &nbsp;·&nbsp; Stop <b>'+d.stop_loss+'</b><br>' +
-        'T1 <b>'+d.target1+'</b> &nbsp;·&nbsp; T2 <b>'+d.target2+'</b> &nbsp;·&nbsp; '+d.contracts+'x';
+        'Entry <b>'+d.entry_price+'</b> &nbsp;·&nbsp; Stop Loss <b>'+d.stop_loss+'</b><br>' +
+        'Take Profit <b>'+d.target1+'</b> &nbsp;·&nbsp; '+d.contracts+'x';
       if (d.pnl_dollars !== undefined) {
         const v = d.pnl_dollars;
         const s = v >= 0 ? '+$'+Math.abs(v).toFixed(0) : '-$'+Math.abs(v).toFixed(0);
