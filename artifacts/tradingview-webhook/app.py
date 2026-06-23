@@ -9997,6 +9997,16 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             send_trade_event_message("STOP_HIT", ACTIVE_TRADE, parsed_price)
             d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
             _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
+            # SCALP re-entry: a stop-out re-arms this setup so AUTO can enter it
+            # again the instant it is READY again (operator request). The WIN path
+            # below intentionally does NOT re-arm (no immediate re-entry after a win
+            # while READY lingers). SWING never populates AUTO_FIRED_KEYS, so this is
+            # a no-op there — its money path is unchanged.
+            if TRADING_MODE == "SCALP":
+                _stopped_key = ACTIVE_TRADE.get("auto_setup_key")
+                if _stopped_key is not None:
+                    with AUTO_TRADE_LOCK:
+                        AUTO_FIRED_KEYS.discard(_stopped_key)
             ACTIVE_TRADE = None
         elif "T1_HIT" in events or "T2_HIT" in events:
             send_trade_event_message("T1_HIT", ACTIVE_TRADE, parsed_price)
@@ -10052,21 +10062,29 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # re-formed). Triggering on the LIVE full-READY verdict, independent of the
     # journal, fires auto the instant the setup reaches full conviction. EARLY
     # never auto-fires (is_full_ready excludes it; the gateway also backstops it).
-    # AUTO_FIRED_KEYS restores the journal's old "once per setup" property so a
-    # closed trade can't re-enter while READY lingers; the key is recorded only on
-    # a CONFIRMED entry, so a transient gateway failure still retries next webhook.
-    # SWING is unchanged: it never emits EARLY, so its first READY always creates
-    # the journal entry the original guard required — SWING keeps that exact
-    # condition so its money path stays byte-for-byte identical.
+    # AUTO_FIRED_KEYS keeps a per-setup "one entry per READY event" throttle so a
+    # continuously-READY setup can't machine-gun the daily cap in minutes; the key
+    # is recorded only on a CONFIRMED entry (a transient gateway failure retries on
+    # the next webhook). Operator change: a live position no longer blocks a new auto
+    # entry (the `not ACTIVE_TRADE` precondition is gone and _maybe_auto_execute is
+    # called with allow_stack=True), so distinct setups (new zones) and post-stop-out
+    # re-entries can open concurrently — bounded only by the per-day cap. A STOP-OUT
+    # re-arms the stopped setup (see the STOP_HIT handler) so it re-enters the instant
+    # it is READY again; a WIN intentionally does NOT re-arm. EARLY never auto-fires
+    # (is_full_ready excludes it; the gateway also backstops it).
+    # SWING is unchanged: it never emits EARLY and keeps the original journal-gated,
+    # one-position condition (allow_stack defaults False), so its money path stays
+    # byte-for-byte identical.
     if TRADING_MODE == "SCALP":
-        if (not ACTIVE_TRADE and is_full_ready(a.get("verdict"))
+        if (is_full_ready(a.get("verdict"))
                 and auto_trade_enabled(resolved_inst)):
             _setup_key = _auto_setup_key(a, resolved_inst)
             with AUTO_TRADE_LOCK:
                 _already_fired = _setup_key in AUTO_FIRED_KEYS
             if not _already_fired:
                 try:
-                    if _maybe_auto_execute(resolved_inst):
+                    if _maybe_auto_execute(resolved_inst, allow_stack=True,
+                                           setup_key=_setup_key):
                         with AUTO_TRADE_LOCK:
                             AUTO_FIRED_KEYS.add(_setup_key)
                 except Exception as exc:
@@ -12350,12 +12368,16 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     }, 200
 
 
-def _maybe_auto_execute(inst):
+def _maybe_auto_execute(inst, allow_stack=False, setup_key=None):
     """Fire the audited execution gateway for a brand-new READY setup when AUTO is
     ON for inst. Fail-open: any problem logs and returns without trading. Sets
     ACTIVE_TRADE only AFTER a confirmed send/simulate, using the gateway's
-    server-authoritative plan (never client data), so the one-position guard + the
-    trade watcher engage and the next webhook can't re-enter the same setup.
+    server-authoritative plan (never client data). allow_stack=False (SWING) keeps
+    the one-position guard so a live trade blocks a new entry; allow_stack=True
+    (SCALP) lets a new setup enter while another position is open (concurrent setups
+    + post-stop-out re-entry), still bounded by the caller's AUTO_FIRED_KEYS "one
+    entry per READY event" throttle and the per-day cap. setup_key, when given, is
+    tagged onto the tracked ACTIVE_TRADE so a stop-out can re-arm exactly that setup.
 
     Returns True ONLY when the order reached the broker (status sent/simulated) so
     the caller's per-setup guard records the entry and won't re-fire; returns False
@@ -12375,7 +12397,7 @@ def _maybe_auto_execute(inst):
         logger.info("Auto-trade skipped for %s - live mode (%s) but not the live instance.", inst, mode)
         return False
     with _AUTO_EXEC_LOCK:
-        if ACTIVE_TRADE:
+        if ACTIVE_TRADE and not allow_stack:
             return False
         if _auto_trade_count_today(inst) >= AUTO_TRADE_MAX_PER_DAY:
             logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", AUTO_TRADE_MAX_PER_DAY, inst)
@@ -12401,6 +12423,8 @@ def _maybe_auto_execute(inst):
                             "t2_hit":      False,
                             "status":      "active",
                         }
+                        if setup_key is not None:
+                            ACTIVE_TRADE["auto_setup_key"] = setup_key
                 _auto_trade_bump_count(inst)
                 logger.info("AUTO-TRADE entered %s %s x%s via %s (%s).",
                             inst, plan.get("direction"), plan.get("quantity"),

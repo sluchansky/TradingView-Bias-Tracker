@@ -1,6 +1,6 @@
 ---
 name: SCALP auto-execute trigger timing
-description: Why SCALP hands-free auto-entry triggers on the LIVE full-READY verdict (not the journal dedup), and how it stays "fire once per setup".
+description: Why SCALP hands-free auto-entry triggers on the LIVE full-READY verdict (not the journal dedup), how it stays "fire once per setup", and how stacking + re-entry-after-stop-out are layered on without breaking SWING.
 ---
 
 # SCALP auto-execute trigger timing
@@ -11,6 +11,29 @@ per setup" is enforced by a dedicated per-setup set `AUTO_FIRED_KEYS` keyed
 `(instrument, direction, zone_low)` — the SAME identity the journal dedups on —
 recorded ONLY on a confirmed broker entry. SWING keeps the original
 journal-gated condition (`journal_entry and is_actionable`) verbatim.
+
+**STACKING + re-entry-after-stop-out (operator request, SCALP-only):** a live
+position NO LONGER blocks a new SCALP auto entry. The webhook SCALP block dropped
+its `not ACTIVE_TRADE` precondition and calls
+`_maybe_auto_execute(inst, allow_stack=True, setup_key=_setup_key)`; the guard
+inside is now `if ACTIVE_TRADE and not allow_stack: return False` (SWING passes
+`allow_stack=False` → unchanged). Concurrency is bounded by TWO things only:
+`AUTO_FIRED_KEYS` (one entry per READY *event* per setup — prevents a
+continuously-READY setup from machine-gunning) and the per-day cap
+(`AUTO_TRADE_MAX_PER_DAY`, default 20/instrument; `_auto_trade_bump_count` runs on
+EVERY confirmed send so the cap is the hard backstop). Re-entry: the tracked
+`ACTIVE_TRADE` is tagged `auto_setup_key=setup_key` (added ONLY when `setup_key`
+is provided → SCALP only), and the price-based **STOP_HIT** handler discards that
+key from `AUTO_FIRED_KEYS` so the setup re-arms and re-enters the instant it is
+READY again. The **WIN (T1/T2)** path intentionally does NOT re-arm. Re-arm is
+gated `if TRADING_MODE == "SCALP"`.
+
+**Single-ACTIVE_TRADE tracking caveat:** `ACTIVE_TRADE` is still ONE global dict,
+so it tracks only ONE position. Stacked broker positions beyond it are untracked
+(no dashboard P&L/stop, broker manages real brackets) and CANNOT re-arm their own
+setup (only the tracked position's stop-out re-arms). Operator explicitly accepted
+this. Re-arm only fires on the app's price-based STOP_HIT detection (needs a
+price-bearing webhook crossing the stop) — NOT on a CLOSE webhook or manual close.
 
 **Why:** A SCALP setup routinely fires EARLY READY first (Edge 50-59, half-size,
 intentionally NEVER auto-traded). The EARLY READY CLAIMS the journal dedup slot,
@@ -34,13 +57,22 @@ reached the broker (sent/simulated) — True even when the local `ACTIVE_TRADE`
 tracking write throws (the position is real; must not re-send → verify broker).
 
 **How to apply** — any change to the auto-entry trigger MUST:
-1. Keep SWING on the EXACT original journal-gated condition. SWING never emits
-   EARLY, so `is_actionable == is_full_ready` there and the money path stays
-   byte-identical.
+1. Keep SWING on the EXACT original journal-gated condition + `allow_stack=False`
+   + `setup_key=None` (so no `auto_setup_key` is added to its ACTIVE_TRADE dict)
+   + STOP_HIT re-arm gated on SCALP. SWING never emits EARLY (so
+   `is_actionable == is_full_ready`) and never populates `AUTO_FIRED_KEYS`, so its
+   money path stays behaviorally byte-identical.
 2. Keep EARLY out of auto (full conviction only); the gateway also backstops
    `source=="auto" and is_early_ready`.
 3. Preserve the per-setup once-guard + its confirmed-send-only marking + the
-   `/clear` reset (and empty-on-restart, when AUTO also resets OFF).
+   `/clear` reset (and empty-on-restart, when AUTO also resets OFF). For SCALP,
+   the once-guard is now RELEASED on stop-out (re-arm) but NEVER on a win.
 4. Split `entry_zone` on the EN-DASH "–" (matches `_journal_dedup_key` and the
    `f"{lo}–{hi}"` trade_plan format) or every same-direction setup collapses to
    `zone_low=0.0` and over-suppresses legitimate distinct setups.
+5. Never re-add a blanket `not ACTIVE_TRADE` precondition to the SCALP block — it
+   would silently kill stacking + post-stop-out re-entry. The daily cap (not the
+   one-position guard) is the runaway backstop for SCALP.
+6. Webhook worker is single-threaded, so the `AUTO_FIRED_KEYS` check-then-add is
+   safe today; if it ever goes parallel, make check+add atomic or the same setup
+   can double-send before the key is recorded.
