@@ -5511,7 +5511,7 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
 
 def build_strict_trade_plan(direction, ticker, current_price,
                             nearest_supply, nearest_demand,
-                            volatility=None, mode=None, vwap=None):
+                            volatility=None, mode=None, vwap=None, edge_score=None):
     """Single-target plan per instrument at a FIXED 1:1 risk:reward.
 
     The stop is sized FIRST by `_dynamic_stop_plan` (ATR×multiplier blended with the
@@ -5615,7 +5615,7 @@ def build_strict_trade_plan(direction, ticker, current_price,
     fmt = lambda v: f"{v:.2f}"
     invalidation = (f"Price closing {side_word} the stop ({fmt(stop)}) or losing "
                     f"{anchor_word} invalidates the setup.")
-    return {
+    plan = {
         "trade_plan": True,
         "reason": (f"{inst} {direction} — fixed 1:1 R:R, ATR/structure stop "
                    f"({risk:.1f} pts), {anchor_word}-anchored."),
@@ -5669,6 +5669,41 @@ def build_strict_trade_plan(direction, ticker, current_price,
         },
     }
 
+    # ── SCALP dynamic-exit geometry (Phase S3) ───────────────────────────────────
+    # When SCALP dynamic exits are active, STAGE the multi-target geometry — TP2, an
+    # optional 2R runner, a delayed-BE level, and the scale-out split — as INERT
+    # metadata inside `management`. The broker-facing primary stays at the existing 1R:
+    # target1/target2/rr/rr_num/reward_points and management.tp1 are NOT touched, so the
+    # single broker TP, the dup-order fingerprint, the ACTIVE_TRADE init and today's
+    # single-WIN-at-tp1 booking are all unchanged. The live exit lifecycle that books
+    # partials and moves the stop to BE lands in Phase S4 — nothing acts on tp2 / runner
+    # / be_level yet. SWING, the master-flag-off path, and the no-flag SCALP path never
+    # enter here, so those plans stay byte-identical. The geometry comes from the SAME
+    # helper the dashboard diagnostics use, so the plan and
+    # result["scalp_quality"].targets can never drift.
+    if _scalp_dynamic_enabled(mode):
+        t1r = cfg_for(mode, "SCALP_TP1_R")
+        t2r = cfg_for(mode, "SCALP_TP2_R")
+        rnr = cfg_for(mode, "SCALP_RUNNER_R")
+        pcts = (cfg_for(mode, "SCALP_TP1_PCT"),
+                cfg_for(mode, "SCALP_TP2_PCT"),
+                cfg_for(mode, "SCALP_RUNNER_PCT"))
+        if not (0 < t1r <= t2r <= rnr and all(0 <= p <= 1 for p in pcts)
+                and abs(sum(pcts) - 1.0) < 1e-6):
+            return no_plan("Invalid SCALP dynamic target configuration.")
+        geo  = _scalp_dynamic_targets(direction, entry, risk, edge_score, mode)
+        rows = {row["label"]: row for row in geo["targets"]}
+        runner_row = rows.get("Runner")
+        mgmt = plan["management"]
+        mgmt["tp2"]        = rows["TP2"]["price"]
+        mgmt["tp3"]        = runner_row["price"] if runner_row else None
+        mgmt["runner"]     = runner_row["price"] if runner_row else None
+        mgmt["be_level"]   = round(entry, 4)            # delayed-BE target (S4 acts on it)
+        mgmt["tp1_pct"]    = rows["TP1"]["pct"]
+        mgmt["tp2_pct"]    = rows["TP2"]["pct"]
+        mgmt["runner_pct"] = runner_row["pct"] if runner_row else None
+    return plan
+
 
 def _apply_orb_target_override(result):
     """The ONE sanctioned exception to the fixed-1:1 rule.
@@ -5720,6 +5755,13 @@ def _apply_orb_target_override(result):
         tp["reason"]        = (f"{tp.get('instrument', '')} {pdir} — Opening Range Breakout, "
                                f"fixed 1:4 R:R, ATR/structure stop ({risk:.1f} pts).").strip()
         mgmt["tp1"]         = round(new_tp, 4)
+        # ORB is the ONE sanctioned single-target (1:4) exception — strip any staged
+        # SCALP dynamic-exit geometry so an ORB plan never carries contradictory
+        # TP2/runner/BE metadata under its 4R primary. No-op (None→None / absent) for
+        # SWING and the non-dynamic SCALP path, so those stay byte-identical.
+        for _k in ("tp2", "tp3", "runner", "be_level", "tp1_pct", "tp2_pct", "runner_pct"):
+            if _k in mgmt:
+                mgmt[_k] = None
         tp["management"]    = mgmt
     except Exception as exc:
         logger.warning("ORB target override skipped: %s", exc)
@@ -5804,6 +5846,45 @@ def _vwap_chop_status(inst, vwap_value, atr_pts):
     return {"status": "choppy" if choppy else "clear",
             "crossings": crossings, "window_min": win,
             "in_band_ratio": in_band_ratio, "detail": detail}
+
+
+def _scalp_dynamic_targets(direction, entry, risk, edge_score, mode=None):
+    """SINGLE source of the SCALP dynamic-exit target geometry — TP1 / TP2 / an optional
+    2R runner as R-multiples off `risk`. Shared by the DISPLAY diagnostics
+    (compute_scalp_quality) and the money-path plan builder (build_strict_trade_plan's
+    SCALP branch) so the dashboard and the plan can NEVER drift (req 3). PURE: no veto,
+    no I/O. The runner is offered only when Edge >= SCALP_RUNNER_MIN_EDGE; when it is
+    absent its scale-out share folds into TP2 (the final exit)."""
+    m     = mode or TRADING_MODE
+    tp1_r = cfg_for(m, "SCALP_TP1_R")
+    tp2_r = cfg_for(m, "SCALP_TP2_R")
+    run_r = cfg_for(m, "SCALP_RUNNER_R")
+    runner_enabled = bool(isinstance(edge_score, (int, float))
+                          and edge_score >= cfg_for(m, "SCALP_RUNNER_MIN_EDGE"))
+
+    def tgt(r_mult):
+        return round((entry + r_mult * risk) if direction == "Long"
+                     else (entry - r_mult * risk), 2)
+
+    targets = [
+        {"label": "TP1", "r": tp1_r, "price": tgt(tp1_r), "pct": cfg_for(m, "SCALP_TP1_PCT")},
+        {"label": "TP2", "r": tp2_r, "price": tgt(tp2_r), "pct": cfg_for(m, "SCALP_TP2_PCT")},
+    ]
+    if runner_enabled:
+        targets.append({"label": "Runner", "r": run_r, "price": tgt(run_r),
+                        "pct": cfg_for(m, "SCALP_RUNNER_PCT")})
+    else:
+        # No runner: its share folds into TP2 (the final exit).
+        targets[1]["pct"] = round(cfg_for(m, "SCALP_TP2_PCT") + cfg_for(m, "SCALP_RUNNER_PCT"), 4)
+
+    final_r = run_r if runner_enabled else tp2_r
+    return {
+        "targets":          targets,
+        "runner_enabled":   runner_enabled,
+        "first_target_pts": round(tp1_r * risk, 2),
+        "rr_num":           float(final_r),
+        "rr":               f"1:{final_r:g}",
+    }
 
 
 def compute_scalp_quality(direction, current_price, vwap_value, vwap_status,
@@ -5938,39 +6019,22 @@ def compute_scalp_quality(direction, current_price, vwap_value, vwap_status,
         # ── Planned dynamic-exit geometry (preview of S3). Targets are R-multiples off
         #    the plan's risk; the runner only when Edge >= SCALP_RUNNER_MIN_EDGE.
         if has_geo:
-            tp1_r = cfg("SCALP_TP1_R"); tp2_r = cfg("SCALP_TP2_R"); run_r = cfg("SCALP_RUNNER_R")
-            runner_enabled = bool(isinstance(edge_score, (int, float))
-                                  and edge_score >= cfg("SCALP_RUNNER_MIN_EDGE"))
-            out["runner_enabled"]   = runner_enabled
+            # Target geometry comes from the SHARED helper so the dashboard diagnostics
+            # and the money-path plan (build_strict_trade_plan) can never drift (req 3).
+            geo   = _scalp_dynamic_targets(direction, entry, risk, edge_score)
+            tp1_r = cfg("SCALP_TP1_R")
+            out["runner_enabled"]   = geo["runner_enabled"]
             out["initial_risk_pts"] = round(risk, 2)
             if pv:
                 out["initial_risk_dollars"] = round(risk * pv, 2)
-
-            def tgt(r_mult):
-                return round((entry + r_mult * risk) if direction == "Long"
-                             else (entry - r_mult * risk), 2)
-
-            targets = [
-                {"label": "TP1", "r": tp1_r, "price": tgt(tp1_r), "pct": cfg("SCALP_TP1_PCT")},
-                {"label": "TP2", "r": tp2_r, "price": tgt(tp2_r), "pct": cfg("SCALP_TP2_PCT")},
-            ]
-            if runner_enabled:
-                targets.append({"label": "Runner", "r": run_r, "price": tgt(run_r),
-                                "pct": cfg("SCALP_RUNNER_PCT")})
-            else:
-                # No runner: its share folds into TP2 (the final exit).
-                targets[1]["pct"] = round(cfg("SCALP_TP2_PCT") + cfg("SCALP_RUNNER_PCT"), 4)
-            out["targets"] = targets
-
+            out["targets"]            = geo["targets"]
             out["first_target_pts"]   = round(tp1_r * risk, 2)
             out["planned_reward_pts"] = out["first_target_pts"]
             out["loss_pts"]           = round(risk, 2)
             # req 6: planned loss (1R) must not exceed the planned FIRST target.
             out["loss_le_first_target"] = bool(risk <= tp1_r * risk + 1e-9)
-
-            final_r = run_r if runner_enabled else tp2_r
-            out["rr_num"] = float(final_r)
-            out["rr"]     = f"1:{final_r:g}"
+            out["rr_num"] = geo["rr_num"]
+            out["rr"]     = geo["rr"]
 
         # ── Overall display gate (NO veto in S1): every known check passes + not choppy.
         checks = [out["quality_pass"], out["room_pass"], out["loss_le_first_target"]]
@@ -5991,6 +6055,152 @@ def compute_scalp_quality(direction, current_price, vwap_value, vwap_status,
     except Exception as exc:   # FAIL-OPEN — diagnostics must never break analysis.
         out["notes"] = [f"scalp_quality computation skipped: {exc}"]
     return out
+
+
+def _scalp_live_lifecycle(inst):
+    """(be_moved, exit_reason) for the viewed instrument's SCALP-dynamic managed trade —
+    the OPEN one if any, else the most-recent trade that CLOSED TODAY (ET trading day) so
+    the panel shows the live BE state while a position runs and the last exit once flat
+    (req 7). Closed candidates are ranked by closed_at (the real exit time, registered_at
+    only as a fallback) so stacked trades resolve in exit order, and bounded to today's ET
+    trading day (matching the journal's closed_at convention) so a stale prior-session
+    close that lingers in memory until register-time housekeeping never leaks in.
+    DISPLAY-ONLY, fail-open -> (None, None). MANAGED_TRADES_BY_KEY is read lock-free off a
+    list() snapshot, consistent with existing readers; any error degrades silently."""
+    try:
+        if not inst:
+            return (None, None)
+        try:
+            today_et = now_utc().astimezone(ET_TZ).date()
+        except Exception:
+            today_et = None
+        open_mt = None
+        closed_mt = None
+        closed_key = ""
+        for mt in list(MANAGED_TRADES_BY_KEY.values()):
+            if mt.get("instrument") != inst:
+                continue
+            if not mt.get("closed"):
+                ra = mt.get("registered_at") or ""
+                if open_mt is None or ra > (open_mt.get("registered_at") or ""):
+                    open_mt = mt
+                continue
+            ca = mt.get("closed_at") or mt.get("registered_at") or ""
+            if today_et is not None:
+                ok_today = False
+                if ca:
+                    try:
+                        ok_today = (datetime.fromisoformat(ca).astimezone(ET_TZ).date()
+                                    == today_et)
+                    except Exception:
+                        ok_today = False
+                if not ok_today:
+                    continue
+            if closed_mt is None or ca > closed_key:
+                closed_mt = mt
+                closed_key = ca
+        chosen = open_mt or closed_mt
+        if chosen is None:
+            return (None, None)
+        return (bool(chosen.get("be_moved")), chosen.get("exit_reason"))
+    except Exception:
+        return (None, None)
+
+
+def _scalp_diag_block(a):
+    """Curated, DISPLAY-ONLY SCALP diagnostics block for /status + the dashboard panel
+    (req 7). Flattens the relevant result['scalp_quality'] fields (the S1-S3 setup-quality /
+    room / risk / target / chop diagnostics) and overlays the live-lifecycle be_moved /
+    exit_reason from the viewed instrument's managed trade (S4). FAIL-OPEN: any error
+    degrades to an inert disabled block so the dashboard render never breaks. Carries NO
+    money-path authority — it only mirrors what the gate / lifecycle already decided."""
+    try:
+        sq = (a or {}).get("scalp_quality") or {}
+        be_moved, exit_reason = _scalp_live_lifecycle((a or {}).get("active_ticker"))
+        return {
+            "enabled":               bool(sq.get("enabled")),
+            "setup_quality_score":   sq.get("setup_quality_score"),
+            "min_quality":           sq.get("min_quality"),
+            "quality_pass":          sq.get("quality_pass"),
+            "room_to_target_r":      sq.get("room_to_target_r"),
+            "room_min_r":            sq.get("room_min_r"),
+            "room_pass":             sq.get("room_pass"),
+            "nearest_opposing_zone": sq.get("nearest_opposing_zone"),
+            "initial_risk_pts":      sq.get("initial_risk_pts"),
+            "initial_risk_dollars":  sq.get("initial_risk_dollars"),
+            "planned_reward_pts":    sq.get("planned_reward_pts"),
+            "rr":                    sq.get("rr"),
+            "runner_enabled":        bool(sq.get("runner_enabled")),
+            "chop_status":           sq.get("chop_status") or "unknown",
+            "loss_le_first_target":  sq.get("loss_le_first_target"),
+            "overall_pass":          sq.get("overall_pass"),
+            "be_moved":              be_moved,
+            "exit_reason":           exit_reason,
+            "notes":                 sq.get("notes") or [],
+        }
+    except Exception:
+        return {
+            "enabled": False, "setup_quality_score": None, "min_quality": None,
+            "quality_pass": None, "room_to_target_r": None, "room_min_r": None,
+            "room_pass": None, "nearest_opposing_zone": None, "initial_risk_pts": None,
+            "initial_risk_dollars": None, "planned_reward_pts": None, "rr": None,
+            "runner_enabled": False, "chop_status": "unknown", "loss_le_first_target": None,
+            "overall_pass": None, "be_moved": None, "exit_reason": None, "notes": [],
+        }
+
+
+def _scalp_dynamic_enabled(mode=None):
+    """True when SCALP dynamic-exit behaviour is active for `mode` (default the live
+    TRADING_MODE). Single source of truth for every SCALP-only money-path branch so
+    SWING / master-flag-off stays byte-identical."""
+    m = mode or TRADING_MODE
+    return bool(m == "SCALP" and cfg_for(m, "SCALP_DYNAMIC_EXITS_ENABLED"))
+
+
+def _scalp_entry_veto_reasons(sq):
+    """Derive SCALP entry VETOES from an already-computed scalp_quality block (the
+    SAME numbers the dashboard shows — so the gate and the diagnostics can NEVER
+    drift). Returns a list of (code, human_reason); an empty list means allowed.
+
+    Money-path FAIL-CLOSED: an unusable block (not a dict / not enabled), a block whose
+    computation errored (a 'skipped' note from compute_scalp_quality's fail-OPEN catch),
+    or an INCOMPLETE block (any core check left None) all return a single 'unavailable'
+    veto, so a broken/partial computation can NEVER let an unchecked trade through. A
+    genuine actionable plan always yields the four core checks as booleans; only after
+    that completeness gate does each filter veto on its EXPLICIT failure (False)."""
+    if not isinstance(sq, dict) or not sq.get("enabled"):
+        return [("unavailable", "SCALP entry checks unavailable")]
+    # ── FAIL-CLOSED completeness gate (money path) ───────────────────────────────
+    # compute_scalp_quality fail-OPENS on any internal error: it returns enabled=True
+    # with the checks left None and a "...computation skipped..." note. That is the
+    # right behaviour for the DISPLAY block, but reading such a block as "allowed"
+    # here would let an UNCHECKED SCALP order through. A genuine actionable plan
+    # always yields the four core checks as booleans, so:
+    #   • any "skipped" note  → the computation errored → refuse, and
+    #   • any required check None/missing → incomplete → refuse.
+    if any("skipped" in str(n).lower() for n in (sq.get("notes") or [])):
+        return [("unavailable", "SCALP entry checks errored — no trade")]
+    comps = sq.get("quality_components") or {}
+    if (sq.get("quality_pass") is None or sq.get("room_pass") is None
+            or sq.get("loss_le_first_target") is None
+            or comps.get("not_entering_opposing_zone") is None):
+        return [("unavailable", "SCALP entry checks incomplete — no trade")]
+    reasons = []
+    if sq.get("quality_pass") is False:
+        reasons.append(("quality",
+                        f"setup quality {sq.get('setup_quality_score')} "
+                        f"< {sq.get('min_quality')}"))
+    if sq.get("room_pass") is False:
+        reasons.append(("room",
+                        f"only {sq.get('room_to_target_r')}R room to the opposing "
+                        f"zone (need {sq.get('room_min_r')}R)"))
+    if comps.get("not_entering_opposing_zone") is False:
+        reasons.append(("opposing_zone", "price entering the opposing zone"))
+    if sq.get("chop_status") == "choppy":
+        reasons.append(("chop", "chop filter — price oscillating around VWAP"))
+    if sq.get("loss_le_first_target") is False:
+        reasons.append(("loss_size", "planned loss exceeds the first target"))
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -7405,7 +7615,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
-            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value, edge_score=edge_score,
         )
         if trade_plan["trade_plan"]:
             # EARLY READY (SCALP Edge 50-59) is actionable but half size / lower
@@ -7449,6 +7659,47 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "rr":         None, "direction": strict_direction,
             "instrument": active_ticker, "point_value": point_value_for(active_ticker),
         }
+
+    # ── SCALP dynamic-exit ENTRY VETOES (Phase S2, MONEY-PATH) ───────────────────
+    # SCALP-only + master-flag-gated. Turns the S1 diagnostics into real entry
+    # filters: an Edge-actionable setup (READY or EARLY) that fails setup-quality,
+    # room-to-target, opposing-zone, chop, or loss-size becomes WAIT with a precise
+    # reason and NO trade plan — so neither the live card nor the execution gateway
+    # (which re-checks is_actionable from THIS verdict) can act on it. Computed once
+    # from the REAL plan just built and reused for the display block below, so the
+    # gate and the dashboard can never drift. FAIL-CLOSED: if the check can't run the
+    # setup is vetoed. SWING / flag-off skip this entirely → byte-identical.
+    scalp_quality_block = None
+    if _scalp_dynamic_enabled() and is_actionable(verdict) and strict_direction:
+        try:
+            _sq = compute_scalp_quality(
+                strict_direction, current_price, vwap_value, vwap_status,
+                nearest_supply, nearest_demand, trade_plan, edge_score,
+                instrument_of(active_ticker),
+                (volatility or {}).get("atr_pts"),
+            )
+            _veto = _scalp_entry_veto_reasons(_sq)
+        except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
+            _sq   = None
+            _veto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
+        if _veto:
+            verdict       = "WAIT"
+            strict_label  = "WAIT"
+            strict_reason = "SCALP filter: " + "; ".join(m for _, m in _veto) + "."
+            trade_plan = {
+                "trade_plan": False,
+                "reason":     strict_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": strict_direction,
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
+            if isinstance(_sq, dict):
+                _sq["overall_pass"] = False
+                # Reuse this block for display so the dashboard keeps the REJECTED
+                # setup's geometry + failing checks (recomputing after the plan is
+                # dropped below would read the nulled plan and lose them).
+                scalp_quality_block = _sq
 
     # get_setup_stage retained for lifecycle display context in the embed.
     setup_stage, stage_next_step, stage_entry_rule, stage_invalidation, stage_direction = get_setup_stage(
@@ -8026,13 +8277,19 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         _sq_dir = strict.get("candidate")
     if not result.get("market_open"):
         _sq_dir = None
-    result["scalp_quality"] = compute_scalp_quality(
-        _sq_dir, result.get("current_price"), result.get("vwap_value"),
-        result.get("vwap_status"), result.get("nearest_supply"),
-        result.get("nearest_demand"), result.get("trade_plan"),
-        result.get("edge_score"), instrument_of(active_ticker),
-        (result.get("volatility") or {}).get("atr_pts"),
-    )
+    if scalp_quality_block is not None and result.get("market_open"):
+        # A SCALP entry veto fired above and dropped the trade plan; reuse the block
+        # computed from the REAL (pre-veto) plan so the dashboard still shows the
+        # rejected setup's geometry + failing checks.
+        result["scalp_quality"] = scalp_quality_block
+    else:
+        result["scalp_quality"] = compute_scalp_quality(
+            _sq_dir, result.get("current_price"), result.get("vwap_value"),
+            result.get("vwap_status"), result.get("nearest_supply"),
+            result.get("nearest_demand"), result.get("trade_plan"),
+            result.get("edge_score"), instrument_of(active_ticker),
+            (result.get("volatility") or {}).get("atr_pts"),
+        )
 
     # Adaptive-learning: cache the freshest engine+indicator snapshot per instrument
     # so a setup that registers right after this can be tagged with its entry context.
@@ -8996,11 +9253,19 @@ def _register_managed_trade(entry, ticker=""):
     existing = MANAGED_TRADES_BY_KEY.get(key)
     if existing is not None:
         if not existing.get("closed"):
-            # Refresh plan numbers, preserve progress (events/MFE/MAE/be_active).
-            existing.update({k: mp.get(k) for k in
-                             ("entry", "entry_lo", "entry_hi", "stop", "tp1", "tp2",
-                              "tp3", "be_level", "partial", "runner", "risk_points",
-                              "point_value")})
+            # A SCALP-dynamic trade that has begun PROGRESSING (a partial booked or
+            # the stop moved to BE) FREEZES its plan: refreshing levels/pcts/stop
+            # mid-walk would clobber a moved stop or re-base already-booked partial R.
+            # A trade that hasn't triggered anything refreshes its plan numbers as
+            # before (legacy never sets these flags -> byte-identical full refresh).
+            started = bool(existing.get("tp1_hit") or existing.get("be_moved"))
+            if not started:
+                # Refresh plan numbers, preserve progress (events/MFE/MAE/be_active).
+                existing.update({k: mp.get(k) for k in
+                                 ("entry", "entry_lo", "entry_hi", "stop", "tp1", "tp2",
+                                  "tp3", "be_level", "partial", "runner", "risk_points",
+                                  "point_value", "tp1_pct", "tp2_pct", "runner_pct")})
+                existing["initial_stop"] = mp.get("stop")
         return existing
 
     mt = {
@@ -9009,10 +9274,18 @@ def _register_managed_trade(entry, ticker=""):
         "entry": mp.get("entry"), "entry_lo": mp.get("entry_lo"), "entry_hi": mp.get("entry_hi"),
         "stop": mp.get("stop"), "tp1": mp.get("tp1"), "tp2": mp.get("tp2"), "tp3": mp.get("tp3"),
         "be_level": mp.get("be_level"), "partial": mp.get("partial"), "runner": mp.get("runner"),
+        "tp1_pct": mp.get("tp1_pct"), "tp2_pct": mp.get("tp2_pct"),
+        "runner_pct": mp.get("runner_pct"),
         "risk_points": mp.get("risk_points"), "point_value": mp.get("point_value"),
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "events_sent": set(), "updates": [],
         "mfe": 0.0, "mae": 0.0, "be_active": False, "closed": False,
+        # S4 dynamic-lifecycle state (SCALP local/paper; inert for SWING / legacy
+        # single-TP / live-broker paths — exit_reason stays None there).
+        "initial_stop": mp.get("stop"),
+        "remaining_pct": 1.0, "realized_r": 0.0,
+        "tp1_hit": False, "tp2_hit": False, "runner_hit": False,
+        "be_moved": False, "exit_reason": None,
         "trade_strength": entry.get("trade_strength"),
         "edge_score": entry.get("edge_score"),
         "journal_id": entry.get("id"),
@@ -9023,6 +9296,62 @@ def _register_managed_trade(entry, ticker=""):
     MANAGED_TRADES_BY_KEY[key] = mt
     logger.info("Managed trade registered: %s %s entry≈%s", instrument, direction, mp.get("entry"))
     return mt
+
+
+def _tag_dynamic_paper_managed_trade(inst, plan, setup_key):
+    """Option C (S4): for a SCALP dynamic PAPER (simulated, non-live) AUTO entry,
+    let the MANAGED_TRADES dynamic lifecycle be the SOLE tracker/authority for the
+    journal / outcome / learning instead of creating a 1-slot ACTIVE_TRADE.
+
+    Why: an ACTIVE_TRADE would be finalised by check_trade_events at a flat 1:1 the
+    instant TP1 prints, racing — and overwriting — the managed trade's BLENDED-R
+    close (a paper trade forced back to 1:1, the exact S4 bug). MANAGED_TRADES is
+    1:N (it already supports stacked SCALP setups) whereas ACTIVE_TRADES is one slot
+    per instrument, so making the managed trade authoritative also sidesteps the
+    1:N "which managed close clears the single active slot" ambiguity.
+
+    Matches the just-registered open managed trade for this setup (registered by
+    send_live_ready_card BEFORE auto-exec on the SAME webhook) by instrument +
+    direction + nearest entry within tolerance, and tags it with the auto-exec
+    context so its close can re-arm / cooldown like the legacy ACTIVE_TRADE path.
+
+    Returns True only when a matching open managed trade was tagged. False (no
+    match) tells the caller to FALL BACK to legacy ACTIVE_TRADE tracking, so a
+    missing managed trade can never leave the paper position untracked (fail-closed).
+    """
+    try:
+        direction = plan.get("direction")
+        entry = float(plan.get("entry"))
+    except (TypeError, ValueError):
+        return False
+    if not direction:
+        return False
+    best, best_dist = None, None
+    for mt in MANAGED_TRADES_BY_KEY.values():
+        if mt.get("closed"):
+            continue
+        if mt.get("instrument") != inst or mt.get("direction") != direction:
+            continue
+        me = mt.get("entry")
+        if me is None:
+            continue
+        try:
+            dist = abs(float(me) - entry)
+        except (TypeError, ValueError):
+            continue
+        if best is None or dist < best_dist:
+            best, best_dist = mt, dist
+    if best is None:
+        return False
+    # Guard against tagging a DIFFERENT (older, stacked) setup: the freshly
+    # registered managed trade shares this plan's entry, so the match must be close.
+    tol = best.get("risk_points") or (abs(entry) * 0.01)
+    if best_dist is not None and best_dist > (tol or 0.0):
+        return False
+    best["auto_setup_key"]   = setup_key
+    best["auto_exec_status"] = "simulated"
+    best["auto_opened_at"]   = now_utc().isoformat()
+    return True
 
 
 def _fetch_latest_bar(instrument):
@@ -9065,6 +9394,173 @@ def _watch_managed_trades():
             logger.error("Managed-trade eval error (%s): %s", mt.get("key"), exc)
 
 
+def _scalp_dynamic_lifecycle_enabled(mt):
+    """True only when the SCALP dynamic multi-leg exit lifecycle should drive THIS
+    managed trade LOCALLY (journal / alerts / dashboard). ALL three gates fail-closed:
+
+      1) SCALP + master flag on (_scalp_dynamic_enabled, keyed on TRADING_MODE) so
+         SWING / flag-off walks the byte-identical legacy single-TP path below.
+      2) execution NOT live. A real broker (traderspost / pickmytrade) sends ONE TP
+         = intent.target1 and flattens the WHOLE position there; a local multi-leg /
+         runner walk would book partial + runner R the broker never held (desync). In
+         live modes we collapse to the legacy broker-owned single exit.
+      3) the trade actually carries the staged dynamic geometry (tp1/tp2 + a usable
+         entry/stop/risk basis).
+    """
+    try:
+        if not _scalp_dynamic_enabled():
+            return False
+        if execution_is_live(resolve_execution_mode()):
+            return False
+        if not mt:
+            return False
+        if mt.get("entry") is None or mt.get("tp1") is None or mt.get("tp2") is None:
+            return False
+        if mt.get("stop") is None or not mt.get("risk_points"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _dynamic_leg_r(price, entry, risk, is_long):
+    """Signed R of an exit at `price` vs `entry` on the ORIGINAL risk basis, so a
+    BE-moved stop books ~0R rather than a re-based number."""
+    if price is None or entry is None or not risk:
+        return 0.0
+    pts = (price - entry) if is_long else (entry - price)
+    return pts / risk
+
+
+def _maybe_move_be_to_entry(mt, bar):
+    """Delayed break-even (req 4): after TP1, move the stop to entry only when the
+    configured condition holds (favorable close OR price reached 1R). Idempotent;
+    mirrors the move onto the ACTIVE_TRADES tracker best-effort. Caller is already
+    gated to the SCALP dynamic lifecycle, so cfg() resolves SCALP knobs."""
+    if mt.get("be_moved"):
+        return
+    if cfg("SCALP_BE_AFTER_TP1_ONLY") and not mt.get("tp1_hit"):
+        return
+    entry = mt.get("entry")
+    if entry is None:
+        return
+    is_long = mt["direction"] == "Long"
+    if cfg("SCALP_BE_REQUIRE_FAVOR_CLOSE_OR_1R"):
+        close = bar.get("close")
+        tp1   = mt.get("tp1")
+        favor_close = close is not None and ((close > entry) if is_long else (close < entry))
+        reached_1r  = tp1 is not None and ((bar["high"] >= tp1) if is_long else (bar["low"] <= tp1))
+        if not (favor_close or reached_1r):
+            return
+    mt["stop"]      = entry
+    mt["be_moved"]  = True
+    mt["be_active"] = True
+    _send_management_update(mt, "Stop \u2192 break-even",
+                            f"Stop moved to entry ({entry}) after TP1.")
+    # Best-effort mirror onto the broker/dashboard tracker so manual views agree.
+    try:
+        _at = active_trade_for(mt.get("instrument"))
+        if (_at and _at.get("status") != "closed"
+                and _at.get("direction") == mt.get("direction")):
+            _at["stop_loss"] = entry
+    except Exception:
+        pass
+
+
+def _finalize_dynamic_close(mt, exit_price, exit_reason):
+    """Close a SCALP-dynamic managed trade on its BLENDED realized R. Outcome is
+    derived from realized_r (Win>0 / Loss<0 / Breakeven==0) so a TP1-then-BE-stop
+    books the partial profit rather than a flat loss."""
+    realized = mt.get("realized_r") or 0.0
+    if realized > 1e-9:
+        outcome = "Win"
+    elif realized < -1e-9:
+        outcome = "Loss"
+    else:
+        outcome = "Breakeven"
+    reason_label = {
+        "stop":           "stop hit",
+        "breakeven_stop": "break-even stop",
+        "tp1":            "TP1",
+        "tp2":            "TP2",
+        "runner":         "runner",
+    }.get(exit_reason, exit_reason or "closed")
+    mt["exit_reason"] = exit_reason
+    _close_managed_trade(mt, outcome, f"{outcome} ({reason_label})", exit_price)
+
+
+def _evaluate_dynamic_managed_levels(mt, bar):
+    """SCALP dynamic multi-leg exit walk for ONE OHLC bar (local/paper only; caller
+    has already gated on _scalp_dynamic_lifecycle_enabled).
+
+    Conservative ordering, stop FIRST: the (possibly BE-moved) stop is tested before
+    any favorable level so an ambiguous bar resolves against the trade. With the stop
+    ruled out for this bar, favorable legs are walked in ascending order
+    TP1 -> [delayed BE] -> TP2 -> runner; a single large bar may fill several. Each
+    leg books leg_pct * leg_R into realized_r exactly once, decrements remaining_pct,
+    and the final leg (runner, or TP2 when no runner) closes the trade."""
+    high, low = bar["high"], bar["low"]
+    entry   = mt.get("entry")
+    risk    = mt.get("risk_points") or 0.0
+    is_long = mt["direction"] == "Long"
+
+    # ── 1) Stop first (BE-aware). Books the remaining position at the stop's R. ──
+    stop = mt.get("stop")
+    if stop is not None:
+        breached = (low <= stop) if is_long else (high >= stop)
+        if breached:
+            leg_r = _dynamic_leg_r(stop, entry, risk, is_long)
+            mt["realized_r"]    = round((mt.get("realized_r") or 0.0)
+                                        + (mt.get("remaining_pct") or 0.0) * leg_r, 4)
+            mt["remaining_pct"] = 0.0
+            reason = "breakeven_stop" if (mt.get("be_moved") and abs(leg_r) < 1e-9) else "stop"
+            _finalize_dynamic_close(mt, stop, reason)
+            return
+
+    # ── 2) TP1 partial + delayed break-even ──
+    if not mt.get("tp1_hit"):
+        tp1 = mt.get("tp1")
+        if tp1 is not None and ((high >= tp1) if is_long else (low <= tp1)):
+            mt["tp1_hit"] = True
+            pct   = mt.get("tp1_pct") or 0.0
+            leg_r = _dynamic_leg_r(tp1, entry, risk, is_long)
+            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+            mt["remaining_pct"] = round(max(0.0, (mt.get("remaining_pct") or 0.0) - pct), 4)
+            _send_management_update(mt, "TP1 hit",
+                                    f"Booked {round(pct * 100)}% at {tp1} (+{leg_r:.2f}R).")
+            _maybe_move_be_to_entry(mt, bar)
+
+    # ── 3) TP2 ──
+    if mt.get("tp1_hit") and not mt.get("tp2_hit"):
+        tp2 = mt.get("tp2")
+        if tp2 is not None and ((high >= tp2) if is_long else (low <= tp2)):
+            mt["tp2_hit"] = True
+            has_runner = mt.get("runner") is not None and (mt.get("runner_pct") or 0.0) > 0.0
+            pct   = (mt.get("tp2_pct") or 0.0) if has_runner else (mt.get("remaining_pct") or 0.0)
+            leg_r = _dynamic_leg_r(tp2, entry, risk, is_long)
+            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+            mt["remaining_pct"] = round(max(0.0, (mt.get("remaining_pct") or 0.0) - pct), 4)
+            _send_management_update(mt, "TP2 hit",
+                                    f"Booked {round(pct * 100)}% at {tp2} (+{leg_r:.2f}R).")
+            if not has_runner or (mt.get("remaining_pct") or 0.0) <= 1e-9:
+                _finalize_dynamic_close(mt, tp2, "tp2")
+                return
+
+    # ── 4) Runner ──
+    if mt.get("tp2_hit") and not mt.get("runner_hit") and mt.get("runner") is not None:
+        runner = mt.get("runner")
+        if (high >= runner) if is_long else (low <= runner):
+            mt["runner_hit"] = True
+            pct   = mt.get("remaining_pct") or 0.0
+            leg_r = _dynamic_leg_r(runner, entry, risk, is_long)
+            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+            mt["remaining_pct"] = 0.0
+            _send_management_update(mt, "Runner hit",
+                                    f"Booked final {round(pct * 100)}% at {runner} (+{leg_r:.2f}R).")
+            _finalize_dynamic_close(mt, runner, "runner")
+            return
+
+
 def _evaluate_managed_trade_levels(mt, bar):
     """Walk one managed trade through its plan using a single OHLC bar.
 
@@ -9086,6 +9582,14 @@ def _evaluate_managed_trade_levels(mt, bar):
             fav, adv = entry - low, high - entry
         mt["mfe"] = round(max(mt["mfe"], fav, 0.0), 4)
         mt["mae"] = round(max(mt["mae"], adv, 0.0), 4)
+
+    # ── SCALP dynamic multi-leg exit lifecycle (req 3/4): partial scale at TP1/TP2/
+    # runner + delayed break-even. Gated to SCALP + master flag + local/paper exec +
+    # a trade carrying dynamic geometry; SWING / flag-off / live-broker fall through
+    # to the byte-identical legacy stop-first / TP1=Win path below. ──
+    if _scalp_dynamic_lifecycle_enabled(mt):
+        _evaluate_dynamic_managed_levels(mt, bar)
+        return
 
     # ── 1) Terminal stop (checked first; an ambiguous bar resolves against the trade) ──
     stop = mt.get("stop")
@@ -9120,13 +9624,22 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
     pv      = mt.get("point_value") or 0.0
     is_long = mt["direction"] == "Long"
 
-    if entry is not None and exit_price is not None:
-        pnl_points = (exit_price - entry) if is_long else (entry - exit_price)
+    if mt.get("exit_reason") is not None:
+        # SCALP dynamic close: PnL/R is the BLENDED realized R booked across the legs,
+        # not a single-exit number (a TP1-then-BE-stop is a partial WIN, not a flat
+        # loss). exit_reason is set ONLY by the dynamic finaliser, so the legacy /
+        # SWING single-TP path (exit_reason None) is byte-identical below.
+        mt["r_multiple"]  = round(mt.get("realized_r") or 0.0, 2)
+        mt["pnl_points"]  = round(mt["r_multiple"] * risk, 4)
+        mt["pnl_dollars"] = round(mt["pnl_points"] * pv, 2)
     else:
-        pnl_points = 0.0
-    mt["pnl_points"]  = round(pnl_points, 4)
-    mt["pnl_dollars"] = round(pnl_points * pv, 2)
-    mt["r_multiple"]  = round(pnl_points / risk, 2) if risk else 0.0
+        if entry is not None and exit_price is not None:
+            pnl_points = (exit_price - entry) if is_long else (entry - exit_price)
+        else:
+            pnl_points = 0.0
+        mt["pnl_points"]  = round(pnl_points, 4)
+        mt["pnl_dollars"] = round(pnl_points * pv, 2)
+        mt["r_multiple"]  = round(pnl_points / risk, 2) if risk else 0.0
     mt["mfe_r"]       = round(mt["mfe"] / risk, 2) if risk else 0.0
     mt["mae_r"]       = round(mt["mae"] / risk, 2) if risk else 0.0
 
@@ -9140,6 +9653,31 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
         _record_strategy_trade(mt)
     except Exception as exc:
         logger.warning("strategy-trade persist error: %s", exc)
+
+    # ── Option C (S4): a SCALP dynamic PAPER auto trade has NO ACTIVE_TRADE slot —
+    # this managed lifecycle is its sole authority — so reproduce the post-outcome
+    # auto bookkeeping that the legacy ACTIVE_TRADES/check_trade_events path applies
+    # for live / legacy-paper trades: re-arm the setup on a stop-loss (so AUTO can
+    # re-enter once it is READY again) and apply the per-asset post-outcome cooldown.
+    # Tag-gated (auto_exec_status=="simulated"): only tagged paper auto trades, never
+    # SWING / live / manual_only / untracked managed trades. Fail-open. ──
+    if mt.get("auto_exec_status") == "simulated":
+        try:
+            _inst    = mt.get("instrument")
+            _outcome = mt.get("outcome")
+            if _outcome == "Loss":
+                # A losing managed close is a pre-TP1 stop-out (realized_r < 0); re-arm
+                # exactly as check_trade_events does on STOP_HIT so the setup can fire
+                # again the instant it is READY (SCALP re-entry).
+                _key = mt.get("auto_setup_key")
+                if _key is not None:
+                    with AUTO_TRADE_LOCK:
+                        AUTO_FIRED_KEYS.discard(_key)
+                _set_outcome_cooldown(_inst, cooldown_after_loss(_inst), "loss")
+            elif _outcome == "Win":
+                _set_outcome_cooldown(_inst, cooldown_after_win(_inst), "win")
+        except Exception as exc:
+            logger.warning("paper-dynamic post-outcome bookkeeping error: %s", exc)
 
 
 def _send_management_update(mt, title, detail):
@@ -9177,6 +9715,9 @@ def _send_outcome_update(mt):
         ],
         "footer": {"text": "Trade-management outcome · auto-tracked"},
     }
+    if mt.get("exit_reason"):
+        embed["fields"].append({"name": "Exit Reason",
+                                "value": str(mt.get("exit_reason")), "inline": True})
     updates = mt.get("updates") or []
     if updates:
         embed["fields"].append({"name": "Management Path",
@@ -13174,6 +13715,7 @@ def status():
         "ready_reason":        a.get("ready_reason"),
         "rejected_reasons":    a.get("rejected_reasons"),
         "alert_diagnostics":   a.get("alert_diagnostics"),
+        "scalp_diagnostics":   _scalp_diag_block(a),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
         "equity_curve_today":  a.get("equity_curve_today"),
@@ -13531,10 +14073,29 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         tp = build_strict_trade_plan(dual_dir, instrument, _cp,
                                      a.get("nearest_supply"), a.get("nearest_demand"),
                                      volatility=a.get("volatility"), mode="SCALP",
-                                     vwap=a.get("vwap_value"))
+                                     vwap=a.get("vwap_value"), edge_score=a.get("edge_score"))
         if not tp.get("trade_plan") or not tp.get("entry_zone"):
             return {"status": "error",
                     "reason": f"Dual-TF: no valid trade plan ({tp.get('reason')})."}, 409
+        # SCALP dynamic-exit entry vetoes apply to the dual-TF money path too: it
+        # builds its plan directly and bypasses the Edge is_actionable check, so the
+        # full_analysis veto does NOT cover it. Re-run the SAME checks against THIS
+        # plan + direction and stand down (fail-closed) on any failure.
+        if _scalp_dynamic_enabled():
+            try:
+                _dsq = compute_scalp_quality(
+                    dual_dir, _cp, a.get("vwap_value"), a.get("vwap_status"),
+                    a.get("nearest_supply"), a.get("nearest_demand"), tp,
+                    a.get("edge_score"), instrument,
+                    (a.get("volatility") or {}).get("atr_pts"),
+                )
+                _dveto = _scalp_entry_veto_reasons(_dsq)
+            except Exception as exc:   # FAIL-CLOSED
+                _dveto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
+            if _dveto:
+                return {"status": "error",
+                        "reason": ("Dual-TF: SCALP filter — "
+                                   + "; ".join(m for _, m in _dveto) + ".")}, 409
         direction = dual_dir
     else:
         if not is_actionable(verdict):
@@ -13792,6 +14353,24 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
             plan = result.get("plan") or {}
+            # Option C (S4): a SCALP dynamic PAPER (simulated, non-live) auto entry is
+            # tracked SOLELY by the MANAGED_TRADES dynamic lifecycle (blended-R journal
+            # / outcome / learning). Creating a 1-slot ACTIVE_TRADE here would let
+            # check_trade_events finalise it at a flat 1:1 the instant TP1 prints and
+            # race the managed close. Tag the just-registered managed trade and skip
+            # the ACTIVE_TRADE slot. FAIL-CLOSED: if no managed trade matches, fall
+            # through to legacy ACTIVE_TRADE tracking so the position is never untracked.
+            # SWING / live-broker never reach this branch (_scalp_dynamic_enabled False /
+            # execution_is_live True) -> byte-identical legacy path below.
+            if (status == "simulated" and _scalp_dynamic_enabled()
+                    and not execution_is_live(mode)
+                    and _tag_dynamic_paper_managed_trade(inst, plan, setup_key)):
+                _auto_trade_bump_count(inst)
+                logger.info("AUTO-TRADE (paper dynamic) entered %s %s x%s via %s — "
+                            "managed-trade authoritative; no ACTIVE_TRADE slot.",
+                            inst, plan.get("direction"), plan.get("quantity"),
+                            result.get("provider"))
+                return True
             try:
                 # One slot per instrument; overwrite=False preserves an existing
                 # position for this instrument (SCALP stacking lives broker-side).
@@ -14495,6 +15074,23 @@ def dashboard():
 <div class="mod" id="mod-whynot">
   <div class="mod-h">🚦 Why Not Ready</div>
   <div id="wn-body"></div>
+</div>
+
+<!-- SCALP dynamic-exit diagnostics (req 7 — DISPLAY-ONLY; hidden unless SCALP dynamic exits are on) -->
+<div class="mod" id="mod-scalpdiag" style="display:none">
+  <div class="mod-h">🩺 SCALP Diagnostics <span id="sd-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Setup Quality</div><div class="v" id="sd-quality">—</div></div>
+    <div class="gstat"><div class="l">Room to Zone</div><div class="v" id="sd-room">—</div></div>
+    <div class="gstat"><div class="l">R : R</div><div class="v" id="sd-rr">—</div></div>
+    <div class="gstat"><div class="l">Initial Risk</div><div class="v" id="sd-risk">—</div></div>
+    <div class="gstat"><div class="l">Planned Reward</div><div class="v" id="sd-reward">—</div></div>
+    <div class="gstat"><div class="l">Opposing Zone</div><div class="v" id="sd-zone">—</div></div>
+    <div class="gstat"><div class="l">Chop</div><div class="v" id="sd-chop">—</div></div>
+    <div class="gstat"><div class="l">BE Moved</div><div class="v" id="sd-be">—</div></div>
+    <div class="gstat"><div class="l">Exit Reason</div><div class="v" id="sd-exit">—</div></div>
+  </div>
+  <div class="se-reason" id="sd-notes"></div>
 </div>
 
 <!-- Multi-strategy engine (Phase 1 — display-only; existing gate stays authoritative) -->
@@ -15305,6 +15901,53 @@ function renderModules(d){
       wn.innerHTML = rr.length
         ? rr.map(function(r){ return '<div class="wn-item">\u26d4 <span>'+_modEsc(r)+'</span></div>'; }).join('')
         : '<div class="wn-ok">No blocking gate reasons reported.</div>';
+    }
+  }
+
+  // ── Module: SCALP Diagnostics (req 7 — DISPLAY-ONLY; SCALP dynamic-exits only) ──
+  const sd = d.scalp_diagnostics || {};
+  const sdMod = document.getElementById('mod-scalpdiag');
+  if (sdMod){
+    if (!sd.enabled){
+      sdMod.style.display = 'none';
+    } else {
+      sdMod.style.display = '';
+      const _passCol = function(p){ return p===true?'#22c55e':p===false?'#ef4444':''; };
+      const _sdSet = function(id, txt, col){
+        const e=document.getElementById(id);
+        if(e){ e.textContent=txt; e.style.color = col || ''; }
+      };
+      const q = sd.setup_quality_score;
+      _sdSet('sd-quality', q==null?'—':(q+'/'+(sd.min_quality!=null?sd.min_quality:100)), _passCol(sd.quality_pass));
+      _sdSet('sd-room', sd.room_to_target_r==null?'—':(sd.room_to_target_r+'R'), _passCol(sd.room_pass));
+      _sdSet('sd-rr', sd.rr || '—', null);
+      let riskTxt='—';
+      if (sd.initial_risk_pts!=null){
+        riskTxt = sd.initial_risk_pts+' pts';
+        if (sd.initial_risk_dollars!=null) riskTxt += ' ($'+sd.initial_risk_dollars+')';
+      }
+      _sdSet('sd-risk', riskTxt, null);
+      let rewTxt = sd.planned_reward_pts==null?'—':(sd.planned_reward_pts+' pts');
+      if (sd.runner_enabled) rewTxt += ' +runner';
+      _sdSet('sd-reward', rewTxt, null);
+      _sdSet('sd-zone', sd.nearest_opposing_zone==null?'—':sd.nearest_opposing_zone, null);
+      const chop = sd.chop_status || 'unknown';
+      _sdSet('sd-chop', chop.charAt(0).toUpperCase()+chop.slice(1),
+             chop==='choppy'?'#ef4444':chop==='clear'?'#22c55e':'');
+      _sdSet('sd-be', sd.be_moved==null?'—':(sd.be_moved?'Yes':'No'),
+             sd.be_moved===true?'#22c55e':null);
+      _sdSet('sd-exit', sd.exit_reason?String(sd.exit_reason):'—', null);
+      const sdv=document.getElementById('sd-verdict');
+      if (sdv){
+        if (sd.overall_pass===true){ sdv.textContent='ALLOWED'; sdv.style.color='#22c55e'; }
+        else if (sd.overall_pass===false){ sdv.textContent='SKIPPED'; sdv.style.color='#ef4444'; }
+        else { sdv.textContent=''; }
+      }
+      const sdn=document.getElementById('sd-notes');
+      if (sdn){
+        const notes = sd.notes || [];
+        sdn.innerHTML = notes.length ? notes.map(function(n){ return '\u26a0 '+_modEsc(n); }).join('<br>') : '';
+      }
     }
   }
 
