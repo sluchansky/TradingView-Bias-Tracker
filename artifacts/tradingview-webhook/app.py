@@ -735,6 +735,14 @@ AUTO_TRADE_CONTRACTS   = max(1, min(TRADERSPOST_MAX_CONTRACTS,
                                     int(os.environ.get("AUTO_TRADE_CONTRACTS", 1))))
 AUTO_TRADE_MAX_PER_DAY = max(1, int(os.environ.get("AUTO_TRADE_MAX_PER_DAY", 5)))
 _AUTO_TRADE_COUNT = {}   # (et_date_str, instrument) -> entries today
+# Per-setup "auto already entered" guard: (instrument, direction, zone_low) — the
+# SAME identity the journal dedups on. SCALP auto fires on the LIVE full-READY
+# verdict (not the journal entry, which the EARLY tier claims first), so this set
+# gives auto the journal's old "fire exactly once per setup" property back: a setup
+# that has auto-entered can't re-enter after its trade closes while the verdict
+# still lingers at READY. Cleared by /clear; naturally empty on restart (when AUTO
+# is also reset OFF), so the fail-safe is always toward NOT re-entering.
+AUTO_FIRED_KEYS = set()
 
 
 def auto_trade_enabled(inst):
@@ -756,6 +764,22 @@ def _auto_trade_bump_count(inst):
     key = (fmt_et(now_utc(), "%Y-%m-%d"), inst)
     with AUTO_TRADE_LOCK:
         _AUTO_TRADE_COUNT[key] = _AUTO_TRADE_COUNT.get(key, 0) + 1
+
+
+def _auto_setup_key(a, inst):
+    """Stable per-setup identity for the auto-execute 'fire once' guard:
+    (instrument, direction, zone_low) — the same shape the journal dedups on, so
+    SCALP auto fires exactly once per setup but on the FULL-READY verdict instead
+    of the EARLY one that claims the journal slot. Self-consistent across webhooks
+    for a given setup; computed from the authoritative trade plan (en-dash zone
+    separator, matching _journal_dedup_key)."""
+    try:
+        zone = str((a.get("trade_plan") or {}).get("entry_zone", ""))
+        zone_low = round(float(zone.split("–")[0]), 0) if zone else 0.0
+    except (TypeError, ValueError):
+        zone_low = 0.0
+    return (instrument_of(inst) if inst else None,
+            ready_direction(a.get("verdict")), zone_low)
 
 
 # ── Execution mode (configurable order routing) ──────────────────────────────
@@ -10016,17 +10040,45 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             logger.error("Live-card send error (alert path): %s", exc)
 
     # -- Auto-trade (hands-free execution; additive + fail-open) --------------
-    # Same fire-once signal as the live card above: create_journal_entry() returns
-    # journal_entry only once per setup, and ACTIVE_TRADE is still None here. When
-    # AUTO is ON for this instrument, route an order through the SAME audited
-    # gateway the manual button uses. Never raises into the webhook worker.
-    if (journal_entry and not ACTIVE_TRADE
-            and is_actionable(a.get("verdict"))
-            and auto_trade_enabled(resolved_inst)):
-        try:
-            _maybe_auto_execute(resolved_inst)
-        except Exception as exc:
-            logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
+    # AUTO enters on the FIRST FULL-conviction READY, routed through the SAME
+    # audited gateway as the manual button. Never raises into the webhook worker.
+    #
+    # SCALP timing fix: the auto trigger must NOT be gated on the journal dedup.
+    # A SCALP setup routinely fires EARLY READY first — which claims the journal
+    # dedup slot AND is intentionally never auto-traded (full conviction only) —
+    # then strengthens to FULL READY a bar or two later. That FULL READY is
+    # journal-deduped, so the old `journal_entry and ...` guard skipped auto
+    # entirely, delaying the entry by minutes (or missing it until the setup
+    # re-formed). Triggering on the LIVE full-READY verdict, independent of the
+    # journal, fires auto the instant the setup reaches full conviction. EARLY
+    # never auto-fires (is_full_ready excludes it; the gateway also backstops it).
+    # AUTO_FIRED_KEYS restores the journal's old "once per setup" property so a
+    # closed trade can't re-enter while READY lingers; the key is recorded only on
+    # a CONFIRMED entry, so a transient gateway failure still retries next webhook.
+    # SWING is unchanged: it never emits EARLY, so its first READY always creates
+    # the journal entry the original guard required — SWING keeps that exact
+    # condition so its money path stays byte-for-byte identical.
+    if TRADING_MODE == "SCALP":
+        if (not ACTIVE_TRADE and is_full_ready(a.get("verdict"))
+                and auto_trade_enabled(resolved_inst)):
+            _setup_key = _auto_setup_key(a, resolved_inst)
+            with AUTO_TRADE_LOCK:
+                _already_fired = _setup_key in AUTO_FIRED_KEYS
+            if not _already_fired:
+                try:
+                    if _maybe_auto_execute(resolved_inst):
+                        with AUTO_TRADE_LOCK:
+                            AUTO_FIRED_KEYS.add(_setup_key)
+                except Exception as exc:
+                    logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
+    else:
+        if (journal_entry and not ACTIVE_TRADE
+                and is_actionable(a.get("verdict"))
+                and auto_trade_enabled(resolved_inst)):
+            try:
+                _maybe_auto_execute(resolved_inst)
+            except Exception as exc:
+                logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
 
     # Tiered WATCH/ARMED early alert (SCALP only). Mutually exclusive with the READY
     # card above (alert_level is READY vs WATCH/ARMED) and throttled per instrument.
@@ -11752,6 +11804,8 @@ def clear_alerts():
     MITIGATED_PRICES_BY_TICKER.clear()
     MITIGATED_FLAG_BY_TICKER.clear()
     JOURNAL_KEYS.clear()
+    with AUTO_TRADE_LOCK:
+        AUTO_FIRED_KEYS.clear()
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
 
@@ -12301,24 +12355,31 @@ def _maybe_auto_execute(inst):
     ON for inst. Fail-open: any problem logs and returns without trading. Sets
     ACTIVE_TRADE only AFTER a confirmed send/simulate, using the gateway's
     server-authoritative plan (never client data), so the one-position guard + the
-    trade watcher engage and the next webhook can't re-enter the same setup."""
+    trade watcher engage and the next webhook can't re-enter the same setup.
+
+    Returns True ONLY when the order reached the broker (status sent/simulated) so
+    the caller's per-setup guard records the entry and won't re-fire; returns False
+    on every skip / no-op / ambiguous-disarm path so a transient failure can retry
+    on the next webhook. A True result after a confirmed send is returned even if
+    the local ACTIVE_TRADE tracking write fails — the position is real, so the
+    setup MUST NOT be re-sent (the operator is told to verify the broker)."""
     global ACTIVE_TRADE
     inst = instrument_of(inst) if inst else None
     if not inst:
-        return
+        return False
     mode = resolve_execution_mode()
     # Live (real-broker) auto-execution is gated to the live/prod instance so a dev
     # instance never places a real auto order on a stray webhook. Paper / manual_only
     # are safe anywhere (manual_only never sends; paper only simulates).
     if execution_is_live(mode) and not DISCORD_LIVE_ENABLED:
         logger.info("Auto-trade skipped for %s - live mode (%s) but not the live instance.", inst, mode)
-        return
+        return False
     with _AUTO_EXEC_LOCK:
         if ACTIVE_TRADE:
-            return
+            return False
         if _auto_trade_count_today(inst) >= AUTO_TRADE_MAX_PER_DAY:
             logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", AUTO_TRADE_MAX_PER_DAY, inst)
-            return
+            return False
         result, code = execute_trade_gateway(inst, AUTO_TRADE_CONTRACTS, source="auto")
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
@@ -12346,6 +12407,9 @@ def _maybe_auto_execute(inst):
                             result.get("provider"), status)
             except (TypeError, ValueError) as exc:
                 logger.error("Auto-trade tracking failed after %s send (VERIFY BROKER): %s", status, exc)
+            # Order reached the broker - never re-send this setup, even if the local
+            # tracking write above failed (the position is real; verify manually).
+            return True
         elif (result or {}).get("broker_verify_required"):
             # Ambiguous live send - the order MAY be live. Disarm this instrument's
             # auto toggle so it can't keep firing into an uncertain broker state;
@@ -12358,9 +12422,11 @@ def _maybe_auto_execute(inst):
                 _record_diagnostic("%s | AUTO-TRADE disarmed - ambiguous broker response; verify manually." % inst)
             except Exception:
                 pass
+            return False
         else:
             logger.info("Auto-trade no-op for %s - gateway %s: %s",
                         inst, status, (result or {}).get("reason"))
+            return False
 
 
 @app.route("/breakeven", methods=["POST"])
