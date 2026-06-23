@@ -69,4 +69,4 @@ channel = "stable-25_05"
 TRADOVATE_ENV = "demo"
 
 [userenv.production]
-DUAL_TF_ENGINE = "1"
+DUAL_TF_ENGINE = "0"

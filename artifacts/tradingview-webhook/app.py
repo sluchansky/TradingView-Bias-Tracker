@@ -250,6 +250,13 @@ ALERT_TYPES = {
     "MGC DELTA SPIKE BEARISH": {"side": "dual_tf", "score": 0},
     "MNQ DELTA SPIKE BULLISH": {"side": "dual_tf", "score": 0},
     "MNQ DELTA SPIKE BEARISH": {"side": "dual_tf", "score": 0},
+    # Bare (un-prefixed) 5s sweep names from the dual-TF indicator — convergence
+    # confirmations only, NOT scoring sweeps (the prefixed "MGC/MNQ BULLISH SWEEP"
+    # remain side=="sweep" for the scoring lane).
+    "BULLISH_SWEEP":           {"side": "dual_tf", "score": 0},
+    "BEARISH_SWEEP":           {"side": "dual_tf", "score": 0},
+    "BULLISH SWEEP":           {"side": "dual_tf", "score": 0},
+    "BEARISH SWEEP":           {"side": "dual_tf", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -263,19 +270,26 @@ VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE", "MGC VOLUME SPIKE", "MNQ V
 CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
 
 # ── Dual-timeframe (1m bias + 5s execution) SCALP engine ─────────────────────
-# Operator-confirmed entry model layered ON TOP OF (never replacing) the existing
-# scoring. 1m structure sets a standing BIAS; a REQUIRED 5s entry-trigger alert
-# plus >=2 agreeing 5s confirmations fire ONE entry through the SAME audited
+# Operator-confirmed CONVERGENCE entry model layered ON TOP OF (never replacing) the
+# existing scoring. 1m structure sets a standing BIAS; an entry fires when the bias is
+# standing AND >=2 distinct aligned 5s confirmations (CVD / sweep / volume; volume is
+# directionless) land within DUAL_TF_CONFIRM_WINDOW_SEC of each other — NO dedicated
+# entry-trigger alert is required. The single entry routes through the SAME audited
 # execution gateway. Entirely behind DUAL_TF_ENGINE (default OFF => byte-identical
 # no-op) and SCALP-only. The SWING money path is never touched.
 DUAL_TF_ENGINE = os.environ.get("DUAL_TF_ENGINE", "").strip().lower() in ("1", "true", "yes", "on")
 DUAL_TF_BIAS_TTL_SEC    = 600   # 10 min: a standing bias expires if no entry fires
-DUAL_TF_CONFIRM_TTL_SEC = 600   # a 5s confirmation / trigger stays "fresh" this long
-DUAL_TF_MIN_CONFIRMS    = 2     # require >=2 distinct fresh confirmations (besides trigger)
+# Convergence window: each of the >=2 confirmations must be this fresh (seconds) to
+# count, so an entry fires only when they all land within this window of NOW (=> within
+# this window of EACH OTHER). Operator spec = 10s; env-tunable for latency headroom.
+DUAL_TF_CONFIRM_WINDOW_SEC = int(os.environ.get("DUAL_TF_CONFIRM_WINDOW_SEC", "10"))
+DUAL_TF_MIN_CONFIRMS    = 2     # require >=2 distinct fresh confirmations agreeing with bias
 DUAL_TF_LOCK = threading.Lock()
-# {inst: {"bias": "Long"/"Short"/None, "bias_ts": iso, "bias_source": str|None,
+# {inst: {"bias": "Long"/"Short"/None, "bias_ts": iso, "bias_epoch": iso|None,
+#         "bias_source": str|None,
 #         "confirmations": {category: {"direction": str|None, "ts": iso}},
-#         "trigger": {"direction", "ts"}|None, "last_confirm_ts": iso|None,
+#         "trigger": {"direction", "ts"}|None (vestigial — no longer gates READY),
+#         "last_confirm_ts": iso|None,
 #         "expired_reason": str|None}}
 DUAL_TF_STATE_BY_TICKER = {}
 
@@ -291,9 +305,18 @@ DELTA_SPIKE_BULL_TYPES = {"DELTA_SPIKE_BULLISH", "DELTA SPIKE BULLISH",
                           "MGC DELTA SPIKE BULLISH", "MNQ DELTA SPIKE BULLISH"}
 DELTA_SPIKE_BEAR_TYPES = {"DELTA_SPIKE_BEARISH", "DELTA SPIKE BEARISH",
                           "MGC DELTA SPIKE BEARISH", "MNQ DELTA SPIKE BEARISH"}
+# Bare 5s sweep names — convergence confirmations kept SEPARATE from the scoring
+# SWEEP_TYPES (side=="sweep") so they never enter the heavy scoring/SWING lane.
+DUAL_TF_SWEEP_BULL_TYPES = {"BULLISH_SWEEP", "BULLISH SWEEP"}
+DUAL_TF_SWEEP_BEAR_TYPES = {"BEARISH_SWEEP", "BEARISH SWEEP"}
+DUAL_TF_SWEEP_TYPES = DUAL_TF_SWEEP_BULL_TYPES | DUAL_TF_SWEEP_BEAR_TYPES
 # Every brand-new 5s type — these ack fast and are kept OUT of the heavy scoring lane.
+# (CVD/volume are deliberately NOT here: they must reach their data-only ingestion below
+# so the CVD committed-state + volume-spike stores still update while ALSO counting as
+# dual-TF confirmations.)
 DUAL_TF_FAST_TYPES = (ENTRY_TRIGGER_TYPES | VWAP_RECLAIM_TYPES | VWAP_REJECT_TYPES
-                      | DELTA_SPIKE_BULL_TYPES | DELTA_SPIKE_BEAR_TYPES)
+                      | DELTA_SPIKE_BULL_TYPES | DELTA_SPIKE_BEAR_TYPES
+                      | DUAL_TF_SWEEP_TYPES)
 # 1m BIAS setters: BOS/CHOCH are authoritative (set/flip + opposite-expiry); demand/
 # supply zones are confluence (bootstrap a bias only when none stands, refresh age).
 _DUAL_TF_BULL_STRUCT = {"BOS DEMAND", "CHOCH DEMAND"}
@@ -857,7 +880,7 @@ def _auto_setup_key(a, inst):
 # SCALP (each re-checks). They only mutate DUAL_TF_STATE_BY_TICKER under DUAL_TF_LOCK
 # and ENQUEUE worker jobs — never fire an order inline (that stays single-threaded).
 def _dual_tf_blank_state():
-    return {"bias": None, "bias_ts": None, "bias_source": None,
+    return {"bias": None, "bias_ts": None, "bias_epoch": None, "bias_source": None,
             "confirmations": {}, "trigger": None,
             "last_confirm_ts": None, "expired_reason": None}
 
@@ -885,6 +908,10 @@ def _dual_tf_signal(normalized):
         return {"kind": "confirm", "category": "delta", "direction": "Short"}
     if normalized in VOLUME_SPIKE_TYPES:
         return {"kind": "confirm", "category": "volume", "direction": None}
+    if normalized in DUAL_TF_SWEEP_BULL_TYPES:
+        return {"kind": "confirm", "category": "sweep", "direction": "Long"}
+    if normalized in DUAL_TF_SWEEP_BEAR_TYPES:
+        return {"kind": "confirm", "category": "sweep", "direction": "Short"}
     if normalized in SWEEP_TYPES:
         if "BULLISH" in normalized:
             return {"kind": "confirm", "category": "sweep", "direction": "Long"}
@@ -910,7 +937,7 @@ def _dual_tf_fresh_confirms(st, bias_dir, now_ts):
     fresh = []
     for cat, info in (st.get("confirmations") or {}).items():
         age = _dual_tf_age_sec(info.get("ts"), now_ts)
-        if age is None or age > DUAL_TF_CONFIRM_TTL_SEC:
+        if age is None or age > DUAL_TF_CONFIRM_WINDOW_SEC:
             continue
         d = info.get("direction")
         if d is not None and bias_dir is not None and d != bias_dir:
@@ -927,6 +954,7 @@ def _dual_tf_expire_in_place(st, now_ts):
     age = _dual_tf_age_sec(st.get("bias_ts"), now_ts)
     if age is not None and age > DUAL_TF_BIAS_TTL_SEC:
         st["bias"] = None
+        st["bias_epoch"] = None
         st["bias_source"] = None
         st["confirmations"] = {}
         st["trigger"] = None
@@ -957,6 +985,7 @@ def _dual_tf_update_bias(normalized, inst):
         if struct_dir is not None:   # BOS / CHOCH — authoritative
             if cur is not None and cur != struct_dir:
                 st["bias"] = None
+                st["bias_epoch"] = None
                 st["bias_source"] = None
                 st["confirmations"] = {}
                 st["trigger"] = None
@@ -969,6 +998,7 @@ def _dual_tf_update_bias(normalized, inst):
             else:                                    # fresh bias — start confirmations clean
                 st["bias"] = struct_dir
                 st["bias_ts"] = now_ts.isoformat()
+                st["bias_epoch"] = now_ts.isoformat()   # STABLE per-episode id (fire-once key)
                 st["bias_source"] = normalized
                 st["confirmations"] = {}
                 st["trigger"] = None
@@ -978,6 +1008,7 @@ def _dual_tf_update_bias(normalized, inst):
             if cur is None:
                 st["bias"] = zone_dir
                 st["bias_ts"] = now_ts.isoformat()
+                st["bias_epoch"] = now_ts.isoformat()   # STABLE per-episode id (fire-once key)
                 st["bias_source"] = normalized
                 st["confirmations"] = {}
                 st["trigger"] = None
@@ -988,11 +1019,12 @@ def _dual_tf_update_bias(normalized, inst):
 
 
 def _dual_tf_record_5s_signal(normalized, inst):
-    """5s EXECUTION lane (SCALP + flag only). Records an entry-trigger or confirmation
-    into the per-instrument state and returns the entry DIRECTION when the READY rule
-    is satisfied (standing bias + aligned fresh trigger + >=2 fresh agreeing
-    confirmations), else None. Pure state — NEVER fires an order. No-op unless flag
-    ON + SCALP."""
+    """5s EXECUTION lane (SCALP + flag only). Records a confirmation (or a now-vestigial
+    entry-trigger) into the per-instrument state and returns the entry DIRECTION when the
+    CONVERGENCE rule is satisfied (standing bias + >=2 distinct fresh confirmations
+    agreeing with the bias; directionless categories like volume always agree), else None.
+    No dedicated entry-trigger is required. Pure state — NEVER fires an order. No-op unless
+    flag ON + SCALP."""
     if not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP") or not inst:
         return None
     sig = _dual_tf_signal(normalized)
@@ -1012,12 +1044,10 @@ def _dual_tf_record_5s_signal(normalized, inst):
         else:   # trigger (latest aligned trigger wins)
             st["trigger"] = {"direction": sig["direction"], "ts": now_ts.isoformat()}
         bias = st.get("bias")
-        trig = st.get("trigger")
-        if not bias or not trig or trig.get("direction") != bias:
+        if not bias:
             return None
-        trig_age = _dual_tf_age_sec(trig.get("ts"), now_ts)
-        if trig_age is None or trig_age > DUAL_TF_CONFIRM_TTL_SEC:
-            return None
+        # CONVERGENCE: standing bias + >=2 distinct fresh aligned confirmations within
+        # DUAL_TF_CONFIRM_WINDOW_SEC. No dedicated entry-trigger required.
         if len(_dual_tf_fresh_confirms(st, bias, now_ts)) >= DUAL_TF_MIN_CONFIRMS:
             return bias
     return None
@@ -1035,16 +1065,10 @@ def _dual_tf_ready_now(inst):
         bias = st.get("bias")
         if not bias:
             return False, None, None, st.get("expired_reason") or "no bias"
-        trig = st.get("trigger")
-        if not trig or trig.get("direction") != bias:
-            return False, bias, st.get("bias_ts"), "no aligned trigger"
-        trig_age = _dual_tf_age_sec(trig.get("ts"), now_ts)
-        if trig_age is None or trig_age > DUAL_TF_CONFIRM_TTL_SEC:
-            return False, bias, st.get("bias_ts"), "trigger stale"
         n = len(_dual_tf_fresh_confirms(st, bias, now_ts))
         if n < DUAL_TF_MIN_CONFIRMS:
-            return False, bias, st.get("bias_ts"), "only %d/%d confirmations" % (n, DUAL_TF_MIN_CONFIRMS)
-        return True, bias, st.get("bias_ts"), "ready"
+            return False, bias, st.get("bias_epoch"), "only %d/%d confirmations" % (n, DUAL_TF_MIN_CONFIRMS)
+        return True, bias, st.get("bias_epoch"), "ready"
 
 
 def _dual_tf_snapshot(inst):
@@ -1075,21 +1099,14 @@ def _dual_tf_snapshot(inst):
             out["timeRemaining"] = max(0, int(DUAL_TF_BIAS_TTL_SEC - age))
         fresh = _dual_tf_fresh_confirms(st, bias, now_ts)
         out["dualTfConfirmations"] = sorted(fresh)
-        trig = st.get("trigger")
-        trig_ok = bool(trig and trig.get("direction") == bias
-                       and (_dual_tf_age_sec(trig.get("ts"), now_ts) or 1e9) <= DUAL_TF_CONFIRM_TTL_SEC)
-        if trig_ok and len(fresh) >= DUAL_TF_MIN_CONFIRMS:
+        if len(fresh) >= DUAL_TF_MIN_CONFIRMS:
             out["dualTfReady"] = True
             out["dualTfDirection"] = bias
-            out["dualTfReason"] = "Trigger + %d confirmations (%s)" % (
+            out["dualTfReason"] = "%d aligned confirmations (%s)" % (
                 len(fresh), ", ".join(sorted(fresh)))
         else:
-            need = []
-            if not trig_ok:
-                need.append("entry trigger")
-            if len(fresh) < DUAL_TF_MIN_CONFIRMS:
-                need.append("%d/%d confirmations" % (len(fresh), DUAL_TF_MIN_CONFIRMS))
-            out["dualTfReason"] = ("Waiting: " + " + ".join(need)) if need else None
+            out["dualTfReason"] = "Waiting: %d/%d aligned confirmations within %ds" % (
+                len(fresh), DUAL_TF_MIN_CONFIRMS, DUAL_TF_CONFIRM_WINDOW_SEC)
     return out
 
 
@@ -1102,13 +1119,16 @@ def _process_dual_tf_entry_job(resolved_inst, direction=None, trigger_price=None
     inst = instrument_of(resolved_inst) if resolved_inst else None
     if not inst or not auto_trade_enabled(inst):
         return
-    ready, ready_dir, bias_ts, why = _dual_tf_ready_now(inst)
+    ready, ready_dir, bias_epoch, why = _dual_tf_ready_now(inst)
     if not ready or (direction is not None and ready_dir != direction):
         logger.info("Dual-TF entry skipped %s — not ready at execution: %s", inst, why)
         return
-    # Per-setup fire-once key: a NEW bias (new structure => new bias_ts) re-arms; a
-    # STOP_HIT re-arm discards it (same as the legacy SCALP auto key) so re-entries work.
-    setup_key = ("dual_tf", inst, ready_dir, bias_ts)
+    # Per-setup fire-once key keyed on the STABLE bias_epoch (minted once per bias
+    # episode, NEVER refreshed by a reaffirming BOS/CHOCH or agreeing zone) so a single
+    # standing bias fires EXACTLY ONE entry no matter how many confirmations stream in.
+    # A FRESH bias (flip / new structure / new bootstrap) mints a new epoch and re-arms;
+    # a STOP_HIT re-arm discards this key (like the legacy SCALP auto key) so re-entries work.
+    setup_key = ("dual_tf", inst, ready_dir, bias_epoch)
     with AUTO_TRADE_LOCK:
         if setup_key in AUTO_FIRED_KEYS:
             return
@@ -10415,7 +10435,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # byte-for-byte identical.
     if TRADING_MODE == "SCALP":
         # When the dual-TF engine is ON it OWNS SCALP auto-execution (fired from the
-        # dual_tf_entry worker job via the 1m-bias + 5s-trigger rule), so the legacy
+        # dual_tf_entry worker job via the 1m-bias + 5s-convergence rule), so the legacy
         # Edge-verdict SCALP auto trigger is disabled here to avoid a double entry.
         # Flag OFF => this condition is byte-identical to before.
         if (not DUAL_TF_ENGINE
@@ -11336,6 +11356,22 @@ def webhook():
                 logger.info("Normalized alternate VWAP alert (signal=%r) → %s",
                             _sig, data["alert_type"])
 
+    # ── Compatibility shim: dual-TF 5s event schema ──────────────────────────
+    # The new 5s indicator posts {"event":"BULLISH_SWEEP","ticker":"MNQ1!",...}
+    # (the bare confirmation name lives in `event`, NOT `alert_type`). Map it onto
+    # alert_type so the bare 5s names resolve through ALERT_TYPES instead of being
+    # dropped as "unrecognized". GATED to flag-ON + SCALP so the engine's dormant
+    # (flag-OFF) behavior stays byte-identical — with the flag OFF a stray new-type
+    # `event` payload still reads as "unrecognized", exactly as before this change.
+    if (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"
+            and not (data.get("alert_type") or data.get("message") or data.get("text"))):
+        _evt = str(data.get("event") or "").strip()
+        if _evt:
+            data["alert_type"] = _evt.upper()
+            data.setdefault("ticker", data.get("symbol") or data.get("ticker"))
+            logger.info("Normalized dual-TF event alert (event=%r) → %s",
+                        _evt, data["alert_type"])
+
     alert_type = (data.get("alert_type") or data.get("message") or data.get("text") or "")
     normalized = alert_type.strip().upper()
 
@@ -11412,9 +11448,17 @@ def webhook():
     # ── Dual-timeframe (1m bias + 5s execution) SCALP engine — additive, gated ──
     #    Both helpers self-filter to no-ops unless DUAL_TF_ENGINE is ON + SCALP.
     #    The 1m BIAS lane consumes BOS/CHOCH/zone alerts; the 5s lane records the
-    #    entry-trigger + confirmations and, when the READY rule is met, ENQUEUES a
+    #    aligned confirmations (sweep / delta / CVD / volume) and, when the
+    #    CONVERGENCE rule is met (standing bias + >=2 distinct aligned confirmations
+    #    within DUAL_TF_CONFIRM_WINDOW_SEC — no dedicated entry-trigger), ENQUEUES a
     #    single-worker entry job (it NEVER fires an order inline). Run BEFORE the
     #    data-only early returns so CVD/volume/VWAP/sweep all count as confirmations.
+    #    CVD-ordering note: the confirmation is recorded here from the bare alert
+    #    NAME only; the CVD committed-state + volume-spike stores are still updated by
+    #    their own data-only ingestion below (these types are deliberately NOT in
+    #    DUAL_TF_FAST_TYPES). The worker re-derives a FRESH full_analysis at execution
+    #    and the dual_tf gateway vetoes only on an actionable OPPOSITE Edge verdict —
+    #    never on committed CVD state — so the record-before-ingest order is benign.
     _dual_tf_update_bias(normalized, resolved_inst)
     if DUAL_TF_ENGINE and TRADING_MODE == "SCALP":
         try:
@@ -12573,7 +12617,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         # fail-closed money path are shared below.
         if not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"):
             return {"status": "error", "reason": "Dual-TF engine disabled."}, 409
-        ready, dual_dir, _bias_ts, _why = _dual_tf_ready_now(instrument)
+        ready, dual_dir, _bias_epoch, _why = _dual_tf_ready_now(instrument)
         if not ready or dual_dir is None:
             return {"status": "error", "reason": f"Dual-TF not ready ({_why})."}, 409
         # Opposite-direction Edge conflict veto: if the Edge gate is READY the OTHER
