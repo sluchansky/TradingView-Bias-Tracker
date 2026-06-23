@@ -889,23 +889,22 @@ def _dual_tf_signal(normalized):
     """Classify an inbound alert for the 5s execution lane. Returns
     {"kind": "trigger"|"confirm"|None, "category": str|None, "direction": "Long"/
     "Short"/None}. A None direction means directionless (a volume spike agrees with
-    any bias)."""
+    any bias).
+
+    The CONVERGENCE confirmation set is exactly {cvd, sweep, volume} (operator-fixed):
+    LONG = CVD_BULLISH / BULLISH_SWEEP / VOLUME_SPIKE, SHORT = CVD_BEARISH /
+    BEARISH_SWEEP / VOLUME_SPIKE (volume directionless). VWAP reclaim/reject and DELTA
+    spikes are NOT convergence confirmations — they still fast-ack (they stay in
+    DUAL_TF_FAST_TYPES) but never count toward the >=2-confirmation rule. Entry-trigger
+    types are vestigial (recorded but never read; convergence requires no trigger)."""
     if normalized in ENTRY_TRIGGER_LONG_TYPES:
         return {"kind": "trigger", "category": "trigger", "direction": "Long"}
     if normalized in ENTRY_TRIGGER_SHORT_TYPES:
         return {"kind": "trigger", "category": "trigger", "direction": "Short"}
-    if normalized in VWAP_RECLAIM_TYPES:
-        return {"kind": "confirm", "category": "vwap", "direction": "Long"}
-    if normalized in VWAP_REJECT_TYPES:
-        return {"kind": "confirm", "category": "vwap", "direction": "Short"}
     if normalized in CVD_BULLISH_TYPES:
         return {"kind": "confirm", "category": "cvd", "direction": "Long"}
     if normalized in CVD_BEARISH_TYPES:
         return {"kind": "confirm", "category": "cvd", "direction": "Short"}
-    if normalized in DELTA_SPIKE_BULL_TYPES:
-        return {"kind": "confirm", "category": "delta", "direction": "Long"}
-    if normalized in DELTA_SPIKE_BEAR_TYPES:
-        return {"kind": "confirm", "category": "delta", "direction": "Short"}
     if normalized in VOLUME_SPIKE_TYPES:
         return {"kind": "confirm", "category": "volume", "direction": None}
     if normalized in DUAL_TF_SWEEP_BULL_TYPES:
@@ -11375,7 +11374,13 @@ def webhook():
     alert_type = (data.get("alert_type") or data.get("message") or data.get("text") or "")
     normalized = alert_type.strip().upper()
 
-    if normalized not in ALERT_TYPES:
+    # Bare 5s sweep names (BULLISH_SWEEP / BEARISH_SWEEP) are recognized ONLY when the
+    # engine is live; with the flag OFF they are unknown to the system exactly as
+    # before this engine shipped, so a direct (non-`event`) bare-sweep payload stays
+    # "unrecognized" — keeping the dormant flag-OFF contract byte-identical.
+    _dormant_sweep = (normalized in DUAL_TF_SWEEP_TYPES
+                      and not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"))
+    if normalized not in ALERT_TYPES or _dormant_sweep:
         logger.warning("Unrecognized alert type: %r", alert_type)
         _record_diagnostic("%s | IGNORED — unrecognized/empty alert: %r" % (
             fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), alert_type))
@@ -11445,38 +11450,15 @@ def webhook():
             RVOL_BY_TICKER[resolved_inst] = {"value": rvol_val,
                                              "ts": now_utc().isoformat()}
 
-    # ── Dual-timeframe (1m bias + 5s execution) SCALP engine — additive, gated ──
-    #    Both helpers self-filter to no-ops unless DUAL_TF_ENGINE is ON + SCALP.
-    #    The 1m BIAS lane consumes BOS/CHOCH/zone alerts; the 5s lane records the
-    #    aligned confirmations (sweep / delta / CVD / volume) and, when the
-    #    CONVERGENCE rule is met (standing bias + >=2 distinct aligned confirmations
-    #    within DUAL_TF_CONFIRM_WINDOW_SEC — no dedicated entry-trigger), ENQUEUES a
-    #    single-worker entry job (it NEVER fires an order inline). Run BEFORE the
-    #    data-only early returns so CVD/volume/VWAP/sweep all count as confirmations.
-    #    CVD-ordering note: the confirmation is recorded here from the bare alert
-    #    NAME only; the CVD committed-state + volume-spike stores are still updated by
-    #    their own data-only ingestion below (these types are deliberately NOT in
-    #    DUAL_TF_FAST_TYPES). The worker re-derives a FRESH full_analysis at execution
-    #    and the dual_tf gateway vetoes only on an actionable OPPOSITE Edge verdict —
-    #    never on committed CVD state — so the record-before-ingest order is benign.
-    _dual_tf_update_bias(normalized, resolved_inst)
-    if DUAL_TF_ENGINE and TRADING_MODE == "SCALP":
-        try:
-            _dtf_dir = _dual_tf_record_5s_signal(normalized, resolved_inst)
-            if _dtf_dir is not None:
-                _ensure_webhook_worker()
-                _WEBHOOK_JOBS.put({"job_type": "dual_tf_entry",
-                                   "resolved_inst": resolved_inst,
-                                   "direction": _dtf_dir,
-                                   "trigger_price": parsed_price})
-        except Exception as exc:
-            logger.error("Dual-TF 5s record/enqueue error (non-fatal): %s", exc)
-    # Brand-new 5s execution types ack fast — recorded above, kept OUT of the heavy
-    # scoring lane (no full_analysis). Unconditional so a stray new-type alert never
-    # falls through to scoring even when the flag is OFF.
-    if normalized in DUAL_TF_FAST_TYPES:
-        return jsonify({"status": "dual_tf_signal", "alert_type": normalized,
-                        "ticker": resolved_inst, "price": parsed_price}), 200
+    # ── Data-only stores (CVD / volume-spike) ingest FIRST — flag-independent ─────
+    #    These run BEFORE the dual-TF convergence record/enqueue below so the CVD
+    #    committed-state + volume-spike timestamp the triggering confirmation just
+    #    wrote are already visible when the single-worker entry job re-derives a fresh
+    #    full_analysis (the worker could otherwise race ahead of a same-request store
+    #    write). The ack response is computed here and returned AFTER the dual-TF
+    #    block. CVD/volume are deliberately NOT in DUAL_TF_FAST_TYPES so they ALWAYS
+    #    reach this ingestion (flag ON or OFF) — the Edge gate's CVD filter needs it.
+    _data_only_resp = None
 
     # ── CVD ingestion (CVD_BULLISH / CVD_BEARISH) — HARD confirmation filter ──
     #    Cumulative Volume Delta sign per instrument: bullish (delta > 0) confirms
@@ -11564,7 +11546,7 @@ def webhook():
         _record_diagnostic("%s | %s — CVD signaled %s, committed %s (%s) — data only, no scoring" % (
             fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"),
             resolved_inst, signaled_state, committed_state, _flip_note))
-        return jsonify({
+        _data_only_resp = jsonify({
             "status":             "cvd_updated",
             "ticker":             resolved_inst,
             "cvd_state":          committed_state,
@@ -11586,11 +11568,44 @@ def webhook():
         logger.info("Volume-spike update: %s", resolved_inst)
         _record_diagnostic("%s | %s — VOLUME SPIKE — data only, no scoring" % (
             fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), resolved_inst))
-        return jsonify({
+        _data_only_resp = jsonify({
             "status": "volume_spike_updated",
             "ticker": resolved_inst,
             "price":  parsed_price if parsed_price is not None else CURRENT_PRICE,
         }), 200
+
+    # ── Dual-timeframe (1m bias + 5s execution) SCALP engine — additive, gated ──
+    #    Both helpers self-filter to no-ops unless DUAL_TF_ENGINE is ON + SCALP.
+    #    The 1m BIAS lane consumes BOS/CHOCH/zone alerts; the 5s lane records the
+    #    aligned confirmations (CVD / sweep / volume) and, when the CONVERGENCE rule
+    #    is met (standing bias + >=2 distinct aligned confirmations within
+    #    DUAL_TF_CONFIRM_WINDOW_SEC — no dedicated entry-trigger), ENQUEUES a single-
+    #    worker entry job (it NEVER fires an order inline). The CVD/volume committed
+    #    stores were already updated ABOVE, so by the time the worker re-derives a
+    #    fresh full_analysis the triggering confirmation's data is visible (no race).
+    _dual_tf_update_bias(normalized, resolved_inst)
+    if DUAL_TF_ENGINE and TRADING_MODE == "SCALP":
+        try:
+            _dtf_dir = _dual_tf_record_5s_signal(normalized, resolved_inst)
+            if _dtf_dir is not None:
+                _ensure_webhook_worker()
+                _WEBHOOK_JOBS.put({"job_type": "dual_tf_entry",
+                                   "resolved_inst": resolved_inst,
+                                   "direction": _dtf_dir,
+                                   "trigger_price": parsed_price})
+        except Exception as exc:
+            logger.error("Dual-TF 5s record/enqueue error (non-fatal): %s", exc)
+
+    # Data-only CVD / volume-spike ack (store written ABOVE, before the enqueue).
+    if _data_only_resp is not None:
+        return _data_only_resp
+
+    # Brand-new 5s execution types ack fast — recorded above, kept OUT of the heavy
+    # scoring lane (no full_analysis). Unconditional so a stray new-type alert never
+    # falls through to scoring even when the flag is OFF.
+    if normalized in DUAL_TF_FAST_TYPES:
+        return jsonify({"status": "dual_tf_signal", "alert_type": normalized,
+                        "ticker": resolved_inst, "price": parsed_price}), 200
 
     # ── Data-only VWAP push — store already updated above; ack without scoring ──
     if normalized in _DATA_ONLY_TYPES:

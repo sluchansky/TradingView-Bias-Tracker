@@ -12,14 +12,17 @@ money path is never touched.
 ## Bias model (operator-confirmed)
 - **1m bias setters: BOS/CHOCH (authoritative — set / flip / opposite-expire) + Supply/
   Demand zones (confluence — bootstrap a bias ONLY when none stands, refresh age).**
-- **VWAP is NOT a bias source.** The operator explicitly chose to keep bias structural
-  (BOS/CHOCH + zones) and use VWAP reclaim/reject ONLY as a 5s confirmation.
-  **Why:** the spec also said "after expiry wait for new 1m *structure*", and a
-  continuous price-vs-VWAP setter would thrash + re-arm right after expiry. If a future
-  request wants VWAP-position bias, implement it as confluence-bootstrap (like zones),
-  not an authoritative flip, and reconcile with the post-expiry "wait for structure" rule.
-- 5s READY = standing bias + a REQUIRED aligned entry-trigger + ≥2 distinct fresh
-  confirmations agreeing with the bias (directionless categories like volume always agree).
+- **VWAP is NOT a bias source AND (post-rewrite) NOT a confirmation either.** Bias stays
+  structural (BOS/CHOCH + zones). **Why:** the spec also said "after expiry wait for new 1m
+  *structure*", and a continuous price-vs-VWAP setter would thrash + re-arm right after expiry.
+  If a future request wants VWAP-position bias, implement it as confluence-bootstrap (like
+  zones), not an authoritative flip, and reconcile with the post-expiry "wait for structure" rule.
+- **5s READY = CONVERGENCE (operator-chosen):** standing bias + ≥2 distinct fresh ALIGNED
+  confirmations within `DUAL_TF_CONFIRM_WINDOW_SEC` (10s). **NO entry-trigger required** — the
+  `trigger` field is now vestigial (still recorded, NEVER read for readiness). Confirmation
+  categories are **CVD / sweep / volume ONLY**; `_dual_tf_signal` returns `kind=None` for
+  VWAP reclaim/reject and DELTA spike so they CANNOT count. Volume is directionless (always
+  agrees); opposite-direction CVD/sweep is filtered out by `_dual_tf_fresh_confirms`, not counted.
 - Expiry: opposite 1m BOS/CHOCH (`opposite_structure`) OR bias-TTL stale (`timeout_10min`);
   both clear the trigger + pending confirmations. Expiry is LAZY (on webhook + /status read),
   no timer thread.
@@ -47,10 +50,24 @@ money path is never touched.
   and smoke-test the call path (both `source="auto"` and `source="dual_tf"`), not just boot.
 
 ## Brand-new alert names (additive; nothing replaced)
-- New (must be added in TradingView): `ENTRY TRIGGER LONG/SHORT` (required trigger),
-  `VWAP RECLAIM/REJECT`, `DELTA SPIKE BULLISH/BEARISH`. Each accepts spaced, underscore,
-  and `MGC/MNQ`-prefixed spellings; un-prefixed needs a `ticker` field.
+- New (added in TradingView): `ENTRY TRIGGER LONG/SHORT` (now VESTIGIAL — recorded, not
+  required for readiness), `VWAP RECLAIM/REJECT`, `DELTA SPIKE BULLISH/BEARISH` (fast-ack but
+  NEVER count as confirmations post-rewrite). Each accepts spaced, underscore, and
+  `MGC/MNQ`-prefixed spellings; un-prefixed needs a `ticker` field.
 - Reused (unchanged): BOS/CHOCH demand/supply, demand/supply zones, CVD bull/bear,
   volume spike, bullish/bearish sweep.
 - The brand-new 5s types fast-ack and are kept OUT of the scoring lane; this is safe even
   flag-OFF because they are names the old system never used.
+
+## Flag-OFF byte-identical no-op — two non-obvious traps
+- **Reused names need a dormant guard, brand-new names don't.** CVD/volume/prefixed-sweep
+  are LEGACY names with existing behavior, so gating the engine alone isn't enough: a BARE
+  `BULLISH_SWEEP`/`BEARISH_SWEEP` would otherwise stay "recognized" and change the legacy
+  flow. Fix = `_dormant_sweep = normalized in DUAL_TF_SWEEP_TYPES and not (DUAL_TF_ENGINE and
+  SCALP)`, folded into the unknown-type guard so dormant bare sweeps fall back to legacy
+  "unrecognized". **How to apply:** any time the engine reuses an existing alert name, prove
+  the flag-OFF path is unchanged for THAT name, not just that the engine no-ops.
+- **Write the data store BEFORE enqueuing the entry job.** The dual_tf_entry worker re-derives
+  a FRESH full_analysis, so the triggering CVD/volume must be committed first. CVD/volume
+  ingestion was moved ABOVE the dual-TF enqueue block; both now assign `_data_only_resp`
+  (returned after the block) instead of returning early. Storing after the enqueue is a race.
