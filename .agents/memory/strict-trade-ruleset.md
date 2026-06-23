@@ -15,17 +15,21 @@ the strict path, not by re-adding a parallel confidence gate.
   was EXPLICITLY OVERRIDDEN for SCALP by the user.** `_is_ready` reads `gate_debug` flags:
   structure (hard) AND location (hard) AND volume_ok (fail-open) AND Edge≥`EDGE_READY_THRESHOLD`
   AND not-conflict AND not-vol_block; VWAP and zone are gated only when their `GATE_REQUIRE_*` is on.
-  - **SCALP READY = Edge≥70 AND structure AND location(near VWAP OR active trade-side zone) AND
-    volume_ok(FAIL-OPEN).** `MIN_CONFIRMATIONS`=0. `GATE_REQUIRE_VWAP/ZONE`=False (VWAP still scores
-    +15; zone is folded into the location gate, no longer a hard block). `GATE_REQUIRE_LOCATION/
-    STRUCTURE`=True. **No EARLY band:** `EDGE_FULL_READY_THRESHOLD`==`EDGE_READY_THRESHOLD`==70, so a
-    setup is READY at Edge≥70 (A+ DISPLAY at ≥85) or it WAITs — the EARLY READY verdict no longer fires
-    in SCALP. **Do not "re-tighten" thinking this is a bug.**
-  - **SWING** (`GATE_REQUIRE_ZONE/VWAP/STRUCTURE`=True, `GATE_REQUIRE_LOCATION`=False, threshold 80)
-    reduces EXACTLY to the historical `zone AND vwap AND structure AND Edge≥80` gate — **must stay so.**
+  - **SCALP READY hard gates = structure(`GATE_REQUIRE_STRUCTURE`) AND VWAP(`GATE_REQUIRE_VWAP`) AND
+    volume_ok(FAIL-OPEN) AND Edge band.** `MIN_CONFIRMATIONS`=0. **The supply/demand ZONE is FULLY
+    demoted: `GATE_REQUIRE_ZONE`=False** — structure+VWAP+Edge fire WITHOUT any zone reaction; zone state
+    only informs/accelerates the label, never blocks. `GATE_REQUIRE_LOCATION`=False (location is a SOFT
+    −5 modifier), `GATE_CVD_HARD`=False (CVD a SOFT −10 veto, not a hard one), `GATE_SOFT_MODIFIERS`=True
+    (cooldown −5 / location −5 / CVD −10). **Edge bands, NOT one floor:** `EDGE_SETUP_BUILDING_THRESHOLD`=40
+    (40-49 informational, non-actionable) < `EDGE_READY_THRESHOLD`=50 (50-59 HALF-SIZE EARLY READY) <
+    `EDGE_FULL_READY_THRESHOLD`=60 (≥60 FULL-SIZE READY); `EDGE_STRONG_THRESHOLD`=75 upgrades only the
+    LABEL ("Strong"). The EARLY band IS live in SCALP — do NOT collapse it back to one floor thinking it's a bug.
+  - **SWING** (`GATE_REQUIRE_ZONE/VWAP/STRUCTURE`=True, `GATE_REQUIRE_LOCATION`=False, `GATE_CVD_HARD`=True,
+    `GATE_SOFT_MODIFIERS`=False, all Edge thresholds==80) reduces EXACTLY to the historical `zone AND vwap
+    AND structure AND Edge≥80` gate — pure additive score, no EARLY / SETUP-BUILDING band — **must stay so.**
   - **Volume is FAIL-OPEN:** `volume_ok` = volume_confirmed OR no volume data present — a missing feed
     NEVER blocks; only data-present-but-unconfirmed blocks. Volume also scores +15 (spike OR RVOL≥thr).
-  - When location/structure fails the SCALP READY `reason` must NOT claim "zone reaction"/"near VWAP";
+  - When a hard gate fails the SCALP READY `reason` must NOT claim "zone reaction"/"near VWAP";
     gate on the real `gate_debug` flags. Classify READY verdicts ONLY via the verdict helpers
     (`is_full_ready` etc.), never a literal `"LONG READY"` compare — see trading-mode-scalp-swing.md.
 - A pre-existing **volatility BLOCK** also holds READY→WAIT (fail-open: only a hard BLOCK regime — see
@@ -69,9 +73,13 @@ the strict path, not by re-adding a parallel confidence gate.
   `market_open`/`verdict`, not `strict_label`).
   Dedup key is (instrument, direction, rounded zone_low); `JOURNAL_KEYS` is in-memory only (no expiry
   until restart) — same zone later in the day won't re-journal. Intended.
-- **Zone-broken and zone-mitigated-near branches still reset the full strict payload** (strict_label=
-  WAIT, strict_score=0, no-plan trade_plan); the display Edge Score is hard-zeroed by these blockers
-  while `gate_debug.edge_score` reports raw components — expected, the blocker is the override.
+- **Zone-broken / zone-mitigated-near are HARD blockers ONLY when `cfg("GATE_REQUIRE_ZONE")` is on (SWING).**
+  In SWING they still reset the full strict payload (strict_label=WAIT, strict_score=0, no-plan trade_plan)
+  and hard-zero the display Edge Score while `gate_debug.edge_score` keeps raw components — expected, the
+  blocker is the override. **In SCALP every one of these zone short-circuits is bypassed** (the gate, the
+  full_analysis override, the webhook consumed-zone short-circuit, and `_update_setup_state` invalidation —
+  see zone-mitigated-detection.md) so a consumed/broken zone is purely informational and NEVER forces WAIT,
+  zeros the score, or skips dispatch.
 
 ## Instrument resolution contract (ticker is authoritative)
 `webhook()` resolves the instrument once via `resolve_instrument(ticker, alert_type)` and stores it on

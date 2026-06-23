@@ -265,13 +265,16 @@ MODES = {
         # SCALP: volatility is NOT a hard gate. It folds into the Edge Score as a
         # modifier (Normal +10 / Elevated 0 / Extreme -10) instead of forcing WAIT.
         "VOL_HARD_GATE":     False,
-        # ── READY gate (mode-tunable). SCALP READY now requires, ALL of:
-        #    Edge >= 60  AND  a valid fresh trade-side zone (mitigation + reaction)
-        #    AND  market structure (BOS/CHOCH/HH/HL/LH/LL on the trade side)  AND
-        #    VWAP confirmation (price on the trade side of VWAP)  AND volume_ok
-        #    (fail-open: a volume spike OR RVOL >= RVOL_CONFIRM_THRESHOLD, or simply
-        #    no volume data). SWING keeps the strict zone AND vwap AND structure AND
-        #    edge>=80 behaviour exactly.
+        # ── READY gate (mode-tunable). SCALP READY requires ALL of:
+        #    Edge >= 60  AND  market structure (BOS/CHOCH/HH/HL/LH/LL on the trade
+        #    side)  AND  VWAP confirmation (price on the trade side of VWAP)  AND
+        #    volume_ok (fail-open: a volume spike OR RVOL >= RVOL_CONFIRM_THRESHOLD,
+        #    or simply no volume data). The supply/demand ZONE is DEMOTED to a
+        #    confirmation in SCALP (GATE_REQUIRE_ZONE False): a present, un-consumed
+        #    zone (state Fresh/Tested) accelerates/labels the setup but is NEVER
+        #    required, so trend continuation fires without a zone reaction. SWING
+        #    keeps the strict zone AND vwap AND structure AND edge>=80 behaviour
+        #    exactly.
         #    READY bands: a HALF-SIZE EARLY entry fires at Edge 50-59
         #    (EDGE_READY_THRESHOLD .. EDGE_FULL_READY_THRESHOLD) and a FULL-SIZE READY
         #    at Edge >= 60 (EDGE_FULL_READY_THRESHOLD); below 50 it WAITs. This is the
@@ -289,7 +292,7 @@ MODES = {
         "EDGE_SETUP_BUILDING_THRESHOLD": 40,   # informational SETUP BUILDING band floor (< EARLY)
         "GATE_REQUIRE_VWAP":      True,    # VWAP confirmation is a hard READY requirement
         "GATE_REQUIRE_STRUCTURE": True,    # structure is a hard READY requirement
-        "GATE_REQUIRE_ZONE":      True,    # a valid fresh trade-side zone is a hard READY requirement
+        "GATE_REQUIRE_ZONE":      False,   # zone DEMOTED to a confirmation — structure+VWAP+Edge fire alone; zone state only informs/accelerates
         "GATE_REQUIRE_LOCATION":  False,   # location is a SOFT modifier (-5), not a hard gate
         # CVD is a SOFT modifier (-10) in SCALP, not a hard veto (SWING keeps it hard).
         "GATE_CVD_HARD":          False,
@@ -3892,6 +3895,29 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     zone_valid_long  = bool(has_mitigated_demand and reaction_long)
     zone_valid_short = bool(has_mitigated_supply and reaction_short)
 
+    # ── Zone STATE machine (Fresh / Tested / Consumed). SCALP demotes zone to a
+    #    CONFIRMATION (GATE_REQUIRE_ZONE False): structure+VWAP+Edge fire on their
+    #    own and a present, un-consumed zone (Fresh/Tested) just accelerates/labels
+    #    the setup — no separate reaction candle required. SWING keeps the strict
+    #    zone_valid = mitigated AND reaction gate above. State is derived from the
+    #    same alert-driven primitives: "Consumed" = the nearest zone sits on a
+    #    mitigated/reacted (TTL-expiring) price — the alert-driven analog of "price
+    #    closed beyond / consumed the zone"; "Tested" = price is within cfg NEAR_PCT
+    #    of the level; otherwise "Fresh". zone_valid_soft (present & un-consumed) is
+    #    the SCALP zoneValid surfaced in diagnostics — it never gates SWING. ──
+    def _zone_state(level, consumed_near):
+        if level is None:
+            return "None", False
+        if consumed_near:
+            return "Consumed", False
+        tested = bool(
+            current_price is not None and level
+            and abs(current_price - level) / level <= cfg("NEAR_PCT")
+        )
+        return ("Tested" if tested else "Fresh"), True
+    zone_state_long,  zone_valid_soft_long  = _zone_state(nearest_demand, has_mitigated_demand)
+    zone_state_short, zone_valid_soft_short = _zone_state(nearest_supply, has_mitigated_supply)
+
     # ── Conflict (recency-aware): opposing structure on BOTH sides within a short
     #    window = genuinely choppy → stand aside. A STALE opposite structure does
     #    NOT block (replaces the old over-broad "any opposite in window" rule). ──
@@ -4080,6 +4106,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             _zone_mit    = has_mitigated_demand
             _reaction    = reaction_long
             _zone_valid  = zone_valid_long
+            _zone_state_str  = zone_state_long
+            _zone_valid_soft = zone_valid_soft_long
             _structure   = structure_long
             _candle      = has_bull_confirm
             _location    = location_long
@@ -4090,6 +4118,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             _zone_mit    = has_mitigated_supply
             _reaction    = reaction_short
             _zone_valid  = zone_valid_short
+            _zone_state_str  = zone_state_short
+            _zone_valid_soft = zone_valid_soft_short
             _structure   = structure_short
             _candle      = has_bear_confirm
             _location    = location_short
@@ -4107,6 +4137,15 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "reaction":              bool(_reaction),
             "session_pref":          bool(session_pref),
             "zone_valid":            bool(_zone_valid),
+            # Zone STATE machine + requirement-5 diagnostic aliases. zone_valid above
+            # stays the SWING strict (mitigated AND reaction) gate value; zoneValid is
+            # mode-aware (SWING strict, SCALP soft present/un-consumed Fresh/Tested).
+            "zoneState":             _zone_state_str,
+            "zoneValid":             bool(_zone_valid if require_zone else _zone_valid_soft),
+            "bosState":              bool(_bos),
+            "chochState":            bool(_choch),
+            "vwapState":             bool(sig["vwap_confirmed"]),
+            "edgeScore":             int(score),
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
             "structure_confirmed":   bool(_structure),
             "candle_confirmed":      bool(_candle),
@@ -4187,6 +4226,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         if not gd["edge_ok"]:
             fails.append("edge_score(%d<%d)" % (gd["edge_score"], ready_threshold))
         gd["failed_conditions"] = fails
+        gd["blockedBy"]         = list(fails)   # requirement-5 alias for diagnostics
         return gd, fails
 
     def _readiness(direction):
@@ -4350,6 +4390,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         gd = _gate_debug("Long")
         gd["conflicting_structure"] = True
         gd["failed_conditions"] = ["conflicting_structure"]
+        gd["blockedBy"] = ["conflicting_structure"]
         return _ret({
             "label":      "WAIT",
             "direction":  None,
@@ -6288,7 +6329,12 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         ZONE_BROKEN_AT is not None
         and ZONE_BROKEN_AT.get("instrument") in (None, instrument_of(active_ticker))
     )
-    if zone_broken_active:
+    # SWING hard-gates on zone (GATE_REQUIRE_ZONE True): a broken or consumed zone is
+    # a full WAIT override. SCALP demotes zone to a confirmation, so a broken/consumed
+    # zone only updates the zone STATE for display and NEVER overrides a
+    # structure+VWAP+Edge READY. cfg() reads the active mode so SWING stays unchanged.
+    zone_hard_gate = bool(cfg("GATE_REQUIRE_ZONE"))
+    if zone_broken_active and zone_hard_gate:
         confidence         = max(0, confidence - 30)
         setup_stage        = "Watching"
         stage_direction    = None
@@ -6330,7 +6376,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         mz_sup_price or mz_dem_price
         or (_mit_records[-1]["price"] if _mit_records else None)
     )
-    if zone_mitigated_near:
+    if zone_mitigated_near and zone_hard_gate:
         # Full override — zone mitigation supersedes ALL scores, setups, and plans
         confidence         = max(0, confidence - 15)
         verdict            = "WAIT"
@@ -6437,8 +6483,13 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # is bypassed (the building heads-up owns the level). Never an actionable signal.
     elif result["verdict"] == "SETUP BUILDING":
         alert_level = "SETUP BUILDING"
+    # The "dead zone → never WATCH" rule is a ZONE HARD-GATE behaviour: it holds in
+    # SWING (cfg on) but is bypassed in SCALP (zone demoted), so a consumed/broken
+    # zone no longer mutes the tiered WATCH/ARMED teaser ladder. The ladder still
+    # only fires near an existing zone (the inner proximity test below).
     elif (_cand in ("Long", "Short")
-          and not zone_broken_active and not zone_mitigated_near):
+          and (not cfg("GATE_REQUIRE_ZONE")
+               or (not zone_broken_active and not zone_mitigated_near))):
         _zone = nearest_demand if _cand == "Long" else nearest_supply
         if (_zone and current_price
                 and abs(current_price - _zone) / _zone <= cfg("WATCH_PCT")):
@@ -6629,7 +6680,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # (zone broken / consumed) zeros both sides — neither is tradeable.
     dirs_raw = strict.get("directions") or {}
     auth_dir = (result.get("confluences") or {}).get("direction")
-    blockers = bool(result.get("zone_broken_active") or result.get("zone_mitigated_near"))
+    # Zone is a hard blocker only in SWING (GATE_REQUIRE_ZONE). In SCALP a broken/
+    # consumed zone is non-blocking, so it must not zero the direction cards either.
+    blockers = bool(cfg("GATE_REQUIRE_ZONE")
+                    and (result.get("zone_broken_active") or result.get("zone_mitigated_near")))
     out_dirs = {}
     for _d in ("Long", "Short"):
         block = dict(dirs_raw.get(_d) or {})
@@ -7596,8 +7650,11 @@ def _maybe_dispatch_early_alert(a, record):
     if is_actionable(a.get("verdict")):
         LAST_EARLY_ANCHOR[key] = "ready"
         return False
-    # Honour the same hard invalidations the gate uses (display-side only).
-    if a.get("zone_broken_active") or ACTIVE_TRADE:
+    # Honour the same hard invalidations the gate uses (display-side only). The
+    # broken-zone skip is a ZONE HARD-GATE behaviour: it holds in SWING (cfg on) and
+    # is bypassed in SCALP (zone demoted), so a broken zone no longer mutes the EARLY
+    # teaser. An active trade still suppresses the teaser in EVERY mode.
+    if (cfg("GATE_REQUIRE_ZONE") and a.get("zone_broken_active")) or ACTIVE_TRADE:
         return False
     if LAST_EARLY_ANCHOR.get(key):     # already EARLY-alerted this active setup
         return False
@@ -8480,7 +8537,7 @@ def compute_edge_breakdown(a, entry):
     # (mitigated-near) zone is not tradeable, so its Edge Score is 0 regardless of
     # any residual confluences still present in `a`. A single decisive risk line
     # explains the zero so the breakdown stays self-consistent.
-    if a.get("zone_broken_active") or a.get("zone_mitigated_near"):
+    if cfg("GATE_REQUIRE_ZONE") and (a.get("zone_broken_active") or a.get("zone_mitigated_near")):
         blocker = ("Structure invalidated — zone broken"
                    if a.get("zone_broken_active") else "Zone consumed — invalid entry")
         breakdown = []
@@ -9462,6 +9519,8 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
         "  Zone Mitigated ........ %s" % _pf(gd.get("zone_mitigated")),
         "  Reaction (candle/sweep) %s" % _pf(gd.get("reaction")),
         "  Zone valid (mit+react)  %s" % _pf(gd.get("zone_valid")),
+        "  Zone state ............ %s" % (gd.get("zoneState") or "—"),
+        "  Zone valid (gate) ..... %s" % _pf(gd.get("zoneValid")),
         "  Trading Session (bonus) %s" % _pf(gd.get("session_pref")),
         "  Conflict .............. %s" % ("YES" if gd.get("conflicting_structure") else "no"),
         "  Volatility ............ %s" % _vol_diag_summary(gd, vol),
@@ -9764,7 +9823,12 @@ def _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False):
     a         = a or {}
     verdict   = a.get("verdict") or ""
     ready     = is_actionable(verdict)
-    invalid   = bool(a.get("zone_broken_active") or a.get("zone_mitigated_near"))
+    # Zone broken/mitigated INVALIDATES a live setup ONLY when the zone is a hard
+    # gate (SWING). In SCALP the zone is demoted to a non-blocking signal, so a
+    # consumed/broken zone never invalidates the (display-only) setup state — the
+    # setup stays live exactly as the demoted gate scored it.
+    invalid   = bool(cfg("GATE_REQUIRE_ZONE")
+                     and (a.get("zone_broken_active") or a.get("zone_mitigated_near")))
     candidate = a.get("gate_candidate")
     if verdict.startswith("LONG"):
         cur_dir = "Long"
@@ -9854,8 +9918,11 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
 
     # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
     # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
-    # False (handled as a LONG above) and falls through to the READY-card path. ──
-    if a.get("zone_mitigated_near"):
+    # False (handled as a LONG above) and falls through to the READY-card path.
+    # ZONE-HARD-GATE ONLY (SWING): in SCALP the zone is a non-blocking signal
+    # (GATE_REQUIRE_ZONE False), so a consumed zone must NOT short-circuit the
+    # live dispatch — fall through to the normal scoring / READY-card path. ──
+    if cfg("GATE_REQUIRE_ZONE") and a.get("zone_mitigated_near"):
         _mz_price = a.get("mitigated_zone_price")
         send_zone_mitigated_message(record, _mz_price)
         logger.info("Zone mitigated (unconfirmed) — %s — scoring skipped", normalized)
@@ -9983,7 +10050,10 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         _gate_str = "conflict"
     else:
         _gate_str = "zone=%s vwap=%s struct=%s edge=%d%s" % (
-            "Y" if _gd.get("zone_valid") else "N",
+            # SWING (require_zone) logs zone as the strict Y/N gate value; SCALP logs
+            # the zone STATE (Fresh/Tested/Consumed/None) since zone no longer gates.
+            (("Y" if _gd.get("zone_valid") else "N") if _gd.get("require_zone")
+                else (_gd.get("zoneState") or "—")),
             "Y" if _gd.get("vwap_confirmed") else "N",
             "Y" if _gd.get("structure_confirmed") else "N",
             _gd.get("edge_score", 0),
@@ -11104,7 +11174,16 @@ def webhook():
         "MGC NEW SUPPLY ZONE", "MGC NEW DEMAND ZONE",
         "MNQ NEW SUPPLY ZONE", "MNQ NEW DEMAND ZONE",
     ))
-    if normalized in _STRUCTURE_RESET and MITIGATED_FLAG_BY_TICKER.get(resolved_inst):
+    # SWING ONLY: a new structure alert clears the consumed-zone mitigation flag so a
+    # fresh BOS/CHOCH re-opens the zone gate. SCALP must NOT clear here — doing so wiped
+    # the flag every time required structure formed, so structure and a valid zone could
+    # never coexist (the root cause of "nothing fires on trends"). In SCALP the
+    # mitigation/consumed state persists and is reset ONLY by a new mitigation, a ZONE
+    # BROKEN (price beyond the invalidation level) or TTL expiry (is_near_mitigated_zone
+    # / MITIGATED_TTL_MIN), matching the zone state machine.
+    if (cfg("GATE_REQUIRE_ZONE")
+            and normalized in _STRUCTURE_RESET
+            and MITIGATED_FLAG_BY_TICKER.get(resolved_inst)):
         MITIGATED_FLAG_BY_TICKER[resolved_inst] = False
         logger.info("Zone mitigation cleared (%s) — new structure alert: %s",
                     resolved_inst, normalized)

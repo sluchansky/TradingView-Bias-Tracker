@@ -32,9 +32,12 @@ the READY/WAIT gate, alerts, throttling, or the 5-min repost loop.
 - `cap_applied` is effectively always False (raw max is exactly 110 = EDGE_SCORE_MAX);
   it stays in the diagnostics for honesty if weights ever exceed the cap.
 - **Risk lines are INFORMATIONAL warnings only (`points: None`); they never subtract.**
-  The only DISPLAY divergence from the gate score is a hard blocker
+  The only DISPLAY divergence from the gate score is a zone hard blocker
   (`zone_broken_active`/`zone_mitigated_near`) zeroing the display score while
-  `gate_debug.edge_score` still reports raw components.
+  `gate_debug.edge_score` still reports raw components — and that zeroing now fires
+  ONLY when `cfg("GATE_REQUIRE_ZONE")` is on (SWING). In SCALP the zone is fully
+  demoted, so a broken/consumed zone never zeros the display score (see
+  zone-mitigated-detection.md).
 
 ## Tiers and grades (display-only, quality NOT verdict)
 
