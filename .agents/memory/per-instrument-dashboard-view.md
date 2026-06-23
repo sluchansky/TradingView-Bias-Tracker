@@ -1,11 +1,15 @@
 ---
-name: Per-instrument dashboard view (MGC/MNQ tab switch)
+name: Per-instrument dashboard view (MGC/MNQ/MES/MYM tab switch)
 description: How the dashboard's symbol tabs switch the displayed analysis, and the invariants any per-instrument change must preserve.
 ---
 
 # Per-instrument dashboard view
 
-The dashboard's MGC/MNQ tabs switch the *displayed* analysis, not just the manual-entry target. The tab's `sym` is sent as `/status?ticker=<sym>`, and `full_analysis(ticker_override=...)` resolves `active_ticker` from the override (falling back to `_active_ticker()` = last-alerted instrument when absent).
+**Instrument set is now four: MGC, MNQ, MES, MYM.** The server was always N-instrument ready (`enabled_instruments()` drives the registry, `ALERTS_MUTED`/`AUTO_TRADE` maps, and `_instrument_from_text`); adding MES/MYM was a *dashboard-UI* parity job (focus chips, mute pills, auto-trade pills, instrument tabs with `data-tk`). Driver: a single JS `const INSTRUMENTS = ['MGC','MNQ','MES','MYM']` replaced every binary MGC/MNQ JS branch (MUTE/AUTO init, setSymbol active-toggle via `.tabs .tab[data-tk]`, focus "never hide ALL", auto-select, etc.). Adding a 5th instrument = extend `INSTRUMENTS` + `INSTRUMENT_TICK` and add the three control rows + a tab; the server side needs no JS-driven change.
+
+**Price formatting is per-instrument via ONE helper — never hardcode `toFixed`.** `INSTRUMENT_TICK = {MGC:0.1, MNQ:0.25, MES:0.25, MYM:1.0}` (mirrors server `specs[*].tick_size`) and `fmtPrice(inst, x)` (rounds to tick, decimals derived from the tick: 0.1→1dp, 0.25→2dp, 1.0→0dp) are the single source of truth for every price the dashboard JS renders/prefills (preview re-anchor `_liveAnchoredPotential`, VWAP display, `_planMidEntry`, the manual entry-field prefill). **Why:** gold-style `toFixed(1)` / `inst==='MGC'?0.1:0.25` binaries silently render MES/MYM (and MNQ) at the wrong tick/decimals once those instruments became user-selectable — MYM is whole points (0dp), Dow at 1dp is an invalid tick. **How to apply:** any new JS spot that formats an instrument price must call `fmtPrice(inst, x)`; never re-introduce a literal `toFixed` on a price. (SVG coords, %, R-values, $ are intentionally raw `toFixed`.) Display-only: no money/gate/scoring/sizing/broker-payload impact.
+
+The dashboard's instrument tabs switch the *displayed* analysis, not just the manual-entry target. The tab's `sym` is sent as `/status?ticker=<sym>`, and `full_analysis(ticker_override=...)` resolves `active_ticker` from the override (falling back to `_active_ticker()` = last-alerted instrument when absent).
 
 **Why:** the analysis model is built around a single "active" (last-alerted) instrument; without an override the user could only ever see whichever instrument alerted last, so tapping the other tab appeared to do nothing.
 

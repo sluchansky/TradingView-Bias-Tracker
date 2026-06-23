@@ -16038,7 +16038,7 @@ def dashboard():
   .tabs{display:flex;gap:8px;margin-bottom:14px}
   .tab{flex:1;padding:12px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-transform:uppercase;letter-spacing:1px;transition:all .15s}
   .tab.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep);box-shadow:0 0 12px rgba(255,95,176,.35)}
-  .focus-row{display:flex;align-items:center;gap:12px;margin-bottom:8px;font-size:12px}
+  .focus-row{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:8px;font-size:12px}
   .focus-lbl{color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-weight:600}
   .focus-chip{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--muted);user-select:none}
   .mute-pill{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:12px;font-weight:600;padding:4px 12px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--green)}
@@ -16322,7 +16322,9 @@ def dashboard():
     <span class="focus-lbl">Focus</span>
     <label class="focus-chip"><input type="checkbox" id="foc-MGC" checked onchange="toggleInstrument('MGC', this.checked)"><span>MGC</span></label>
     <label class="focus-chip"><input type="checkbox" id="foc-MNQ" checked onchange="toggleInstrument('MNQ', this.checked)"><span>MNQ</span></label>
-    <span class="focus-lbl" style="opacity:.6">show / hide a pair on this device</span>
+    <label class="focus-chip"><input type="checkbox" id="foc-MES" checked onchange="toggleInstrument('MES', this.checked)"><span>MES</span></label>
+    <label class="focus-chip"><input type="checkbox" id="foc-MYM" checked onchange="toggleInstrument('MYM', this.checked)"><span>MYM</span></label>
+    <span class="focus-lbl" style="opacity:.6">show / hide an instrument on this device</span>
   </div>
   <!-- Alert mute (server-side, affects every device): silence a pair's Discord
        NEW-SETUP alerts while the engine keeps evaluating, journaling and tracking
@@ -16331,6 +16333,8 @@ def dashboard():
     <span class="focus-lbl">Alerts</span>
     <span id="mute-MGC" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MGC');}">🔔 MGC: on</span>
     <span id="mute-MNQ" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MNQ');}">🔔 MNQ: on</span>
+    <span id="mute-MES" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MES');}">🔔 MES: on</span>
+    <span id="mute-MYM" class="mute-pill" role="button" tabindex="0" onclick="toggleMute('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleMute('MYM');}">🔔 MYM: on</span>
     <span class="focus-lbl" style="opacity:.6">mute silences Discord · still tracked</span>
   </div>
   <!-- Auto-trade (server-side, affects EXECUTION): when ON, a brand-new READY
@@ -16340,13 +16344,17 @@ def dashboard():
     <span class="focus-lbl">Auto-trade</span>
     <span id="auto-MGC" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MGC');}">MGC: off</span>
     <span id="auto-MNQ" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MNQ');}">MNQ: off</span>
+    <span id="auto-MES" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MES');}">MES: off</span>
+    <span id="auto-MYM" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MYM');}">MYM: off</span>
     <span id="auto-mode-lbl" class="focus-lbl" style="opacity:.6">off by default - resets on restart</span>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
   <div class="tabs">
-    <div class="tab active" onclick="userPickedSetup=true; setSymbol('MGC')">MGC (Gold)</div>
-    <div class="tab" onclick="userPickedSetup=true; setSymbol('MNQ')">MNQ (Nasdaq)</div>
+    <div class="tab active" data-tk="MGC" onclick="userPickedSetup=true; setSymbol('MGC')">MGC (Gold)</div>
+    <div class="tab" data-tk="MNQ" onclick="userPickedSetup=true; setSymbol('MNQ')">MNQ (Nasdaq)</div>
+    <div class="tab" data-tk="MES" onclick="userPickedSetup=true; setSymbol('MES')">MES (S&amp;P)</div>
+    <div class="tab" data-tk="MYM" onclick="userPickedSetup=true; setSymbol('MYM')">MYM (Dow)</div>
   </div>
   <!-- Direction (Long/Short) — directly under the pair selector. -->
   <div class="dir-row">
@@ -16727,13 +16735,20 @@ def dashboard():
 
 <script>
 const BASE = '/api';
+const INSTRUMENTS = ['MGC','MNQ','MES','MYM'];   // every traded instrument (display order)
+const INSTRUMENT_TICK = { MGC:0.1, MNQ:0.25, MES:0.25, MYM:1.0 };   // mirrors server specs[*].tick_size — preview prices round to this
+function fmtPrice(inst, x){   // round to the instrument tick + format to its decimals (MGC 0.1/1dp · MNQ&MES 0.25/2dp · MYM 1.0/0dp)
+  const n = Number(x); if (!isFinite(n)) return x;
+  const t = INSTRUMENT_TICK[inst] || INSTRUMENT_TICK[sym] || 0.25;
+  return (Math.round(n / t) * t).toFixed((String(t).split('.')[1] || '').length);
+}
 let sym = 'MGC', dir = 'Long', activeTrade = null;
 let userPickedSetup = false;   // set true on a manual tab/direction click — disables landing auto-select
-let MUTE_STATE = { MGC: false, MNQ: false };   // server-side alert mute, painted by loadAlertMutes()
+let MUTE_STATE = { MGC: false, MNQ: false, MES: false, MYM: false };   // server-side alert mute, painted by loadAlertMutes()
 
 function setSymbol(s) {
   sym = s;
-  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', (i===0&&s==='MGC')||(i===1&&s==='MNQ')));
+  document.querySelectorAll('.tabs .tab').forEach(function(t){ t.classList.toggle('active', t.dataset.tk===s); });
   const vs = document.getElementById('vwap-sym');
   if (vs) vs.textContent = s;
   updateEnterBtn();
@@ -16749,22 +16764,21 @@ function setSymbol(s) {
 // the server to unmuted (fail-safe toward alerting).
 function instrEnabled(inst){ try { return localStorage.getItem('focus_'+inst) !== '0'; } catch(e){ return true; } }
 function applyInstrumentFocus(){
-  const tabs = document.querySelectorAll('.tabs .tab');   // [0]=MGC, [1]=MNQ (matches setSymbol)
-  const idx = { MGC:0, MNQ:1 };
-  const on = { MGC: instrEnabled('MGC'), MNQ: instrEnabled('MNQ') };
-  if (!on.MGC && !on.MNQ){                 // never hide BOTH — force MGC visible (in-memory; no recursion)
+  const on = {};
+  INSTRUMENTS.forEach(function(inst){ on[inst] = instrEnabled(inst); });
+  if (!INSTRUMENTS.some(function(i){ return on[i]; })){   // never hide ALL — force MGC visible (in-memory; no recursion)
     on.MGC = true;
     try { localStorage.setItem('focus_MGC','1'); } catch(e){}
   }
-  ['MGC','MNQ'].forEach(function(inst){
-    const t = tabs[idx[inst]];                if (t)  t.style.display = on[inst] ? '' : 'none';
+  INSTRUMENTS.forEach(function(inst){
+    const t = document.querySelector('.tabs .tab[data-tk="'+inst+'"]'); if (t)  t.style.display = on[inst] ? '' : 'none';
     const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = on[inst];
   });
-  if (!on[sym]) setSymbol(on.MGC ? 'MGC' : 'MNQ');
+  if (!on[sym]) setSymbol(INSTRUMENTS.find(function(i){ return on[i]; }) || 'MGC');
 }
 function toggleInstrument(inst, on){
-  const other = inst==='MGC' ? 'MNQ' : 'MGC';
-  if (!on && !instrEnabled(other)){            // never allow hiding/muting BOTH
+  const anyOther = INSTRUMENTS.some(function(i){ return i!==inst && instrEnabled(i); });
+  if (!on && !anyOther){            // never allow hiding ALL instruments
     const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = true;
     toast('Keep at least one instrument showing', false);
     return;
@@ -16787,7 +16801,7 @@ async function loadAlertMutes(){
   renderMuteUI();
 }
 function renderMuteUI(){
-  ['MGC','MNQ'].forEach(function(inst){
+  INSTRUMENTS.forEach(function(inst){
     const el = document.getElementById('mute-'+inst);
     if (!el) return;
     const muted = !!(MUTE_STATE && MUTE_STATE[inst]);
@@ -16809,7 +16823,7 @@ function toggleMute(inst){
     .catch(function(){ MUTE_STATE[inst] = !next; renderMuteUI(); toast('Mute update failed', false); });
 }
 
-let AUTO_STATE = { MGC:false, MNQ:false };
+let AUTO_STATE = { MGC:false, MNQ:false, MES:false, MYM:false };
 let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_live:false, is_live_instance:false, max_per_day:0, contracts:1 };
 async function loadAutoTrade(){
   try {
@@ -16820,7 +16834,7 @@ async function loadAutoTrade(){
   renderAutoUI();
 }
 function renderAutoUI(){
-  ['MGC','MNQ'].forEach(function(inst){
+  INSTRUMENTS.forEach(function(inst){
     const el = document.getElementById('auto-'+inst);
     if (!el) return;
     const on = !!(AUTO_STATE && AUTO_STATE[inst]);
@@ -16930,7 +16944,7 @@ async function enterTrade() {
 
   if (gatewayEligible) {
     const tp = lastRec.trade_plan || {};
-    const entry = _planMidEntry(tp);
+    const entry = _planMidEntry(tp, recInst || sym);
     let q0 = parseInt(c || '1', 10); if (!q0 || q0 < 1) q0 = 1;
     const head = live
       ? '\u26a0 This places a REAL market order on your broker (' + label + ').'
@@ -17768,7 +17782,7 @@ async function refreshRec() {
     const vsrc  = d.vwap_source==='chart' ? ' <span style="color:#6b7280;font-size:11px">(manual)</span>'
                 : d.vwap_source==='auto'  ? ' <span style="color:#6b7280;font-size:11px">(auto)</span>' : '';
     const vwap  = (d.vwap_status==='ok' && d.vwap_value!=null)
-      ? Number(d.vwap_value).toFixed(1) + vsrc
+      ? fmtPrice(inst, d.vwap_value) + vsrc
       : 'n/a ('+(d.vwap_status||'—')+')';
     const sess = d.session_preferred
       ? '<span style="color:#22c55e">● Preferred Session (+'+(d.session_bonus!=null?d.session_bonus:10)+')</span>'
@@ -17841,10 +17855,7 @@ function _liveAnchoredPotential(pp, dir, inst) {
   let a = _ppAnchor[key];
   if (!a || (now - a.ts) >= PP_REANCHOR_MS) { a = { price: Number(live), ts: now }; _ppAnchor[key] = a; }
   const anchor = a.price;
-  const TICK = (inst === 'MGC') ? 0.1 : 0.25;
-  const DEC  = (inst === 'MGC') ? 1 : 2;
-  const rt   = (x) => Math.round(x / TICK) * TICK;
-  const fmt  = (x) => rt(x).toFixed(DEC);
+  const fmt  = (x) => fmtPrice(inst, x);   // per-instrument tick/decimals — single source of truth
   // Geometry from the authoritative server plan: offsets relative to the entry mid.
   const parts = String(pp.entry_zone == null ? '' : pp.entry_zone).split(/\s*[–—-]\s*/);
   let lo = parseFloat(parts[0]); let hi = parts.length > 1 ? parseFloat(parts[1]) : lo;
@@ -18050,13 +18061,13 @@ function applyRec() {
   const dirReady = jsReadyDir(lastRec.verdict);
   if (!dirReady || !tp.trade_plan) { toast('No ready setup to apply', false); return; }
   const inst = (lastRec.active_ticker||'').toString().replace('1!','');
-  if (inst==='MGC' || inst==='MNQ') setSymbol(inst);
+  if (INSTRUMENTS.indexOf(inst) !== -1) setSymbol(inst);
   setDir(dirReady);
   if (tp.entry_zone) {
     const parts = String(tp.entry_zone).split('–');
     if (parts.length===2) {
       const mid = (parseFloat(parts[0]) + parseFloat(parts[1])) / 2;
-      if (!isNaN(mid)) document.getElementById('f-entry').value = mid.toFixed(1);
+      if (!isNaN(mid)) document.getElementById('f-entry').value = fmtPrice(inst, mid);
     }
   }
   if (tp.stop_loss!=null) document.getElementById('f-stop').value = tp.stop_loss;
@@ -18225,15 +18236,15 @@ function maybeReadyAlert(inst, v) {
   }
 }
 
-function _planMidEntry(tp) {
+function _planMidEntry(tp, inst) {
   if (!tp || tp.entry_zone == null) return null;
   const parts = String(tp.entry_zone).split('–');
   if (parts.length === 2) {
     const mid = (parseFloat(parts[0]) + parseFloat(parts[1])) / 2;
-    if (!isNaN(mid)) return mid.toFixed(1);
+    if (!isNaN(mid)) return fmtPrice(inst, mid);
   }
   const n = parseFloat(tp.entry_zone);
-  return isNaN(n) ? String(tp.entry_zone) : n.toFixed(1);
+  return isNaN(n) ? String(tp.entry_zone) : fmtPrice(inst, n);
 }
 function buildOrderText() {
   if (!lastRec) return null;
@@ -18241,7 +18252,7 @@ function buildOrderText() {
   const rd = jsReadyDir(lastRec.verdict);
   if (!rd || !tp.trade_plan) return null;
   const inst = (lastRec.active_ticker || '').toString().replace('1!','') || sym;
-  const entry = _planMidEntry(tp);
+  const entry = _planMidEntry(tp, inst);
   const zone = (tp.entry_zone && String(tp.entry_zone).indexOf('–') >= 0) ? (' (zone ' + tp.entry_zone + ')') : '';
   const lines = [
     inst + ' ' + rd.toUpperCase(),
@@ -18289,7 +18300,7 @@ async function sendOrder() {
   const inst = recInst || sym;
   let qty = parseInt(document.getElementById('snd-qty').value, 10);
   if (!qty || qty < 1) qty = 1;
-  const entry = _planMidEntry(tp);
+  const entry = _planMidEntry(tp, inst);
   const head = live
     ? 'Send LIVE market order to ' + label + '?'
     : (mode === 'paper' ? 'Submit a SIMULATED (paper) order — no real broker?'
@@ -18881,7 +18892,7 @@ async function autoSelectBestSetup(){
   try {
     if (userPickedSetup) return;                      // user already chose — never override
     const num = function(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; };
-    let cands = ['MGC','MNQ'].filter(instrEnabled);   // respect display focus
+    let cands = INSTRUMENTS.filter(instrEnabled);   // respect display focus
     if (!cands.length) cands = ['MGC'];
     const recs = await Promise.all(cands.map(function(s){
       return api('/status?ticker='+encodeURIComponent(s))
