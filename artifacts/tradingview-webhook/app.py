@@ -13485,13 +13485,13 @@ def dashboard():
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
   <div class="tabs">
-    <div class="tab active" onclick="setSymbol('MGC')">MGC (Gold)</div>
-    <div class="tab" onclick="setSymbol('MNQ')">MNQ (Nasdaq)</div>
+    <div class="tab active" onclick="userPickedSetup=true; setSymbol('MGC')">MGC (Gold)</div>
+    <div class="tab" onclick="userPickedSetup=true; setSymbol('MNQ')">MNQ (Nasdaq)</div>
   </div>
   <!-- Direction (Long/Short) — directly under the pair selector. -->
   <div class="dir-row">
-    <div class="dir-btn long active" onclick="setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
-    <div class="dir-btn short" onclick="setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
+    <div class="dir-btn long active" onclick="userPickedSetup=true; setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
+    <div class="dir-btn short" onclick="userPickedSetup=true; setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
   <!-- Long vs Short Score — moved up to sit directly under the Long/Short toggle. -->
   <div class="mod" id="mod-scores">
@@ -13829,6 +13829,7 @@ def dashboard():
 <script>
 const BASE = '/api';
 let sym = 'MGC', dir = 'Long', activeTrade = null;
+let userPickedSetup = false;   // set true on a manual tab/direction click — disables landing auto-select
 let MUTE_STATE = { MGC: false, MNQ: false };   // server-side alert mute, painted by loadAlertMutes()
 
 function setSymbol(s) {
@@ -15880,11 +15881,56 @@ async function optExport(){
   }catch(e){ toast('Export failed', false); }
 }
 
+// ── Default to the best-probability setup on landing (DISPLAY-ONLY) ──────────
+// On page load, open straight to the instrument + direction with the strongest
+// setup. "Best" = an actionable setup (READY / EARLY) beats a non-actionable one;
+// within the same tier the higher Edge Score wins. Direction defaults to that
+// instrument's favored side. This only chooses the INITIAL tab/direction — once
+// you switch manually it never moves again, and it never touches the gate,
+// scoring, sizing or any money path. Fail-open: any error leaves the MGC / Long
+// default untouched. Hidden (focused-out) instruments are never auto-selected.
+async function autoSelectBestSetup(){
+  try {
+    if (userPickedSetup) return;                      // user already chose — never override
+    const num = function(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; };
+    let cands = ['MGC','MNQ'].filter(instrEnabled);   // respect display focus
+    if (!cands.length) cands = ['MGC'];
+    const recs = await Promise.all(cands.map(function(s){
+      return api('/status?ticker='+encodeURIComponent(s))
+               .then(function(d){ return { s:s, d:d }; })
+               .catch(function(){ return { s:s, d:null }; });
+    }));
+    let best = null;
+    recs.forEach(function(r){
+      if (!r.d) return;
+      const cand = {
+        s:    r.s,
+        d:    r.d,
+        act:  jsIsActionable(r.d.verdict) ? 1 : 0,
+        edge: num(r.d.edge_score)
+      };
+      if (!best){ best = cand; return; }
+      const better = (cand.act !== best.act) ? (cand.act > best.act)
+                                             : (cand.edge > best.edge);
+      if (better) best = cand;
+    });
+    if (!best) return;
+    let bdir = jsReadyDir(best.d.verdict);            // ready side when actionable
+    if (!bdir){                                       // else the higher per-side edge
+      bdir = (num(best.d.short_score) > num(best.d.long_score)) ? 'Short' : 'Long';
+    }
+    if (userPickedSetup) return;                      // re-check after await — manual pick wins
+    if (best.s !== sym) setSymbol(best.s);            // setSymbol() re-fetches analysis
+    if (bdir && bdir !== dir) setDir(bdir);
+  } catch(e){ /* fail-open: keep the MGC / Long default */ }
+}
+
 // Poll every 3 seconds
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade();
+autoSelectBestSetup();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
