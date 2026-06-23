@@ -221,6 +221,35 @@ ALERT_TYPES = {
     "VOLUME SPIKE":     {"side": "data", "score": 0},
     "MGC VOLUME SPIKE": {"side": "data", "score": 0},
     "MNQ VOLUME SPIKE": {"side": "data", "score": 0},
+    # ── Dual-timeframe 5s EXECUTION alerts (side "dual_tf" so they NEVER enter any
+    #    scoring set — SUPPLY/DEMAND/SWEEP are filtered by side). Recognized here only
+    #    so they ack fast and feed the dual-TF 5s lane. Unprefixed forms require a
+    #    `ticker` field; prefixed forms self-resolve. Underscore + spaced spellings
+    #    both accepted. Consumed ONLY when DUAL_TF_ENGINE is ON + TRADING_MODE=SCALP. ──
+    "ENTRY_TRIGGER_LONG":      {"side": "dual_tf", "score": 0},
+    "ENTRY_TRIGGER_SHORT":     {"side": "dual_tf", "score": 0},
+    "ENTRY TRIGGER LONG":      {"side": "dual_tf", "score": 0},
+    "ENTRY TRIGGER SHORT":     {"side": "dual_tf", "score": 0},
+    "MGC ENTRY TRIGGER LONG":  {"side": "dual_tf", "score": 0},
+    "MGC ENTRY TRIGGER SHORT": {"side": "dual_tf", "score": 0},
+    "MNQ ENTRY TRIGGER LONG":  {"side": "dual_tf", "score": 0},
+    "MNQ ENTRY TRIGGER SHORT": {"side": "dual_tf", "score": 0},
+    "VWAP_RECLAIM":            {"side": "dual_tf", "score": 0},
+    "VWAP_REJECT":             {"side": "dual_tf", "score": 0},
+    "VWAP RECLAIM":            {"side": "dual_tf", "score": 0},
+    "VWAP REJECT":             {"side": "dual_tf", "score": 0},
+    "MGC VWAP RECLAIM":        {"side": "dual_tf", "score": 0},
+    "MGC VWAP REJECT":         {"side": "dual_tf", "score": 0},
+    "MNQ VWAP RECLAIM":        {"side": "dual_tf", "score": 0},
+    "MNQ VWAP REJECT":         {"side": "dual_tf", "score": 0},
+    "DELTA_SPIKE_BULLISH":     {"side": "dual_tf", "score": 0},
+    "DELTA_SPIKE_BEARISH":     {"side": "dual_tf", "score": 0},
+    "DELTA SPIKE BULLISH":     {"side": "dual_tf", "score": 0},
+    "DELTA SPIKE BEARISH":     {"side": "dual_tf", "score": 0},
+    "MGC DELTA SPIKE BULLISH": {"side": "dual_tf", "score": 0},
+    "MGC DELTA SPIKE BEARISH": {"side": "dual_tf", "score": 0},
+    "MNQ DELTA SPIKE BULLISH": {"side": "dual_tf", "score": 0},
+    "MNQ DELTA SPIKE BEARISH": {"side": "dual_tf", "score": 0},
 }
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
@@ -232,6 +261,47 @@ CVD_BEARISH_TYPES = {"CVD_BEARISH", "CVD BEARISH", "MGC CVD BEARISH", "MNQ CVD B
 # Volume-spike alert set (data-only — store per-instrument spike timestamp, never score).
 VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE", "MGC VOLUME SPIKE", "MNQ VOLUME SPIKE"}
 CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
+
+# ── Dual-timeframe (1m bias + 5s execution) SCALP engine ─────────────────────
+# Operator-confirmed entry model layered ON TOP OF (never replacing) the existing
+# scoring. 1m structure sets a standing BIAS; a REQUIRED 5s entry-trigger alert
+# plus >=2 agreeing 5s confirmations fire ONE entry through the SAME audited
+# execution gateway. Entirely behind DUAL_TF_ENGINE (default OFF => byte-identical
+# no-op) and SCALP-only. The SWING money path is never touched.
+DUAL_TF_ENGINE = os.environ.get("DUAL_TF_ENGINE", "").strip().lower() in ("1", "true", "yes", "on")
+DUAL_TF_BIAS_TTL_SEC    = 600   # 10 min: a standing bias expires if no entry fires
+DUAL_TF_CONFIRM_TTL_SEC = 600   # a 5s confirmation / trigger stays "fresh" this long
+DUAL_TF_MIN_CONFIRMS    = 2     # require >=2 distinct fresh confirmations (besides trigger)
+DUAL_TF_LOCK = threading.Lock()
+# {inst: {"bias": "Long"/"Short"/None, "bias_ts": iso, "bias_source": str|None,
+#         "confirmations": {category: {"direction": str|None, "ts": iso}},
+#         "trigger": {"direction", "ts"}|None, "last_confirm_ts": iso|None,
+#         "expired_reason": str|None}}
+DUAL_TF_STATE_BY_TICKER = {}
+
+# 5s EXECUTION alert sets (recognized => fast-ack + dual-TF record, never scoring).
+ENTRY_TRIGGER_LONG_TYPES  = {"ENTRY_TRIGGER_LONG", "ENTRY TRIGGER LONG",
+                             "MGC ENTRY TRIGGER LONG", "MNQ ENTRY TRIGGER LONG"}
+ENTRY_TRIGGER_SHORT_TYPES = {"ENTRY_TRIGGER_SHORT", "ENTRY TRIGGER SHORT",
+                             "MGC ENTRY TRIGGER SHORT", "MNQ ENTRY TRIGGER SHORT"}
+ENTRY_TRIGGER_TYPES = ENTRY_TRIGGER_LONG_TYPES | ENTRY_TRIGGER_SHORT_TYPES
+VWAP_RECLAIM_TYPES = {"VWAP_RECLAIM", "VWAP RECLAIM", "MGC VWAP RECLAIM", "MNQ VWAP RECLAIM"}
+VWAP_REJECT_TYPES  = {"VWAP_REJECT", "VWAP REJECT", "MGC VWAP REJECT", "MNQ VWAP REJECT"}
+DELTA_SPIKE_BULL_TYPES = {"DELTA_SPIKE_BULLISH", "DELTA SPIKE BULLISH",
+                          "MGC DELTA SPIKE BULLISH", "MNQ DELTA SPIKE BULLISH"}
+DELTA_SPIKE_BEAR_TYPES = {"DELTA_SPIKE_BEARISH", "DELTA SPIKE BEARISH",
+                          "MGC DELTA SPIKE BEARISH", "MNQ DELTA SPIKE BEARISH"}
+# Every brand-new 5s type — these ack fast and are kept OUT of the heavy scoring lane.
+DUAL_TF_FAST_TYPES = (ENTRY_TRIGGER_TYPES | VWAP_RECLAIM_TYPES | VWAP_REJECT_TYPES
+                      | DELTA_SPIKE_BULL_TYPES | DELTA_SPIKE_BEAR_TYPES)
+# 1m BIAS setters: BOS/CHOCH are authoritative (set/flip + opposite-expiry); demand/
+# supply zones are confluence (bootstrap a bias only when none stands, refresh age).
+_DUAL_TF_BULL_STRUCT = {"BOS DEMAND", "CHOCH DEMAND"}
+_DUAL_TF_BEAR_STRUCT = {"BOS SUPPLY", "CHOCH SUPPLY"}
+_DUAL_TF_BULL_ZONE = {"MGC NEW DEMAND ZONE", "MGC DEMAND ZONE CONFIRMED",
+                      "MNQ NEW DEMAND ZONE", "MNQ DEMAND ZONE CONFIRMED"}
+_DUAL_TF_BEAR_ZONE = {"MGC NEW SUPPLY ZONE", "MGC SUPPLY ZONE CONFIRMED",
+                      "MNQ NEW SUPPLY ZONE", "MNQ SUPPLY ZONE CONFIRMED"}
 
 # ---------------------------------------------------------------------------
 # Trading mode profiles — SCALP (fast, sensitive) vs SWING (slower, stricter)
@@ -780,6 +850,274 @@ def _auto_setup_key(a, inst):
         zone_low = 0.0
     return (instrument_of(inst) if inst else None,
             ready_direction(a.get("verdict")), zone_low)
+
+
+# ── Dual-timeframe (1m bias + 5s execution) engine helpers ───────────────────
+# ALL functions below are no-ops unless DUAL_TF_ENGINE is ON and TRADING_MODE is
+# SCALP (each re-checks). They only mutate DUAL_TF_STATE_BY_TICKER under DUAL_TF_LOCK
+# and ENQUEUE worker jobs — never fire an order inline (that stays single-threaded).
+def _dual_tf_blank_state():
+    return {"bias": None, "bias_ts": None, "bias_source": None,
+            "confirmations": {}, "trigger": None,
+            "last_confirm_ts": None, "expired_reason": None}
+
+
+def _dual_tf_signal(normalized):
+    """Classify an inbound alert for the 5s execution lane. Returns
+    {"kind": "trigger"|"confirm"|None, "category": str|None, "direction": "Long"/
+    "Short"/None}. A None direction means directionless (a volume spike agrees with
+    any bias)."""
+    if normalized in ENTRY_TRIGGER_LONG_TYPES:
+        return {"kind": "trigger", "category": "trigger", "direction": "Long"}
+    if normalized in ENTRY_TRIGGER_SHORT_TYPES:
+        return {"kind": "trigger", "category": "trigger", "direction": "Short"}
+    if normalized in VWAP_RECLAIM_TYPES:
+        return {"kind": "confirm", "category": "vwap", "direction": "Long"}
+    if normalized in VWAP_REJECT_TYPES:
+        return {"kind": "confirm", "category": "vwap", "direction": "Short"}
+    if normalized in CVD_BULLISH_TYPES:
+        return {"kind": "confirm", "category": "cvd", "direction": "Long"}
+    if normalized in CVD_BEARISH_TYPES:
+        return {"kind": "confirm", "category": "cvd", "direction": "Short"}
+    if normalized in DELTA_SPIKE_BULL_TYPES:
+        return {"kind": "confirm", "category": "delta", "direction": "Long"}
+    if normalized in DELTA_SPIKE_BEAR_TYPES:
+        return {"kind": "confirm", "category": "delta", "direction": "Short"}
+    if normalized in VOLUME_SPIKE_TYPES:
+        return {"kind": "confirm", "category": "volume", "direction": None}
+    if normalized in SWEEP_TYPES:
+        if "BULLISH" in normalized:
+            return {"kind": "confirm", "category": "sweep", "direction": "Long"}
+        if "BEARISH" in normalized:
+            return {"kind": "confirm", "category": "sweep", "direction": "Short"}
+    return {"kind": None, "category": None, "direction": None}
+
+
+def _dual_tf_age_sec(iso_ts, now_ts):
+    """Seconds between an ISO timestamp and now_ts, or None if unparseable."""
+    if not iso_ts:
+        return None
+    try:
+        return (now_ts - datetime.fromisoformat(iso_ts)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def _dual_tf_fresh_confirms(st, bias_dir, now_ts):
+    """Distinct confirmation categories that are still fresh (within TTL) AND agree
+    with bias_dir (directionless categories always agree). Returns a list of category
+    names (the trigger is NOT a confirmation)."""
+    fresh = []
+    for cat, info in (st.get("confirmations") or {}).items():
+        age = _dual_tf_age_sec(info.get("ts"), now_ts)
+        if age is None or age > DUAL_TF_CONFIRM_TTL_SEC:
+            continue
+        d = info.get("direction")
+        if d is not None and bias_dir is not None and d != bias_dir:
+            continue
+        fresh.append(cat)
+    return fresh
+
+
+def _dual_tf_expire_in_place(st, now_ts):
+    """Caller MUST hold DUAL_TF_LOCK. Expire a standing bias after BIAS_TTL with no
+    entry (clears confirmations + trigger). Idempotent."""
+    if not st or not st.get("bias"):
+        return
+    age = _dual_tf_age_sec(st.get("bias_ts"), now_ts)
+    if age is not None and age > DUAL_TF_BIAS_TTL_SEC:
+        st["bias"] = None
+        st["bias_source"] = None
+        st["confirmations"] = {}
+        st["trigger"] = None
+        st["expired_reason"] = "timeout_10min"
+
+
+def _dual_tf_update_bias(normalized, inst):
+    """1m BIAS lane (SCALP + flag only). BOS/CHOCH set/flip the standing bias; an
+    OPPOSITE BOS/CHOCH expires it immediately (expiredReason='opposite_structure')
+    and clears confirmations. Demand/supply zones are confluence: they bootstrap a
+    bias only when none stands, else refresh its age when they agree. Called from the
+    webhook request thread. No-op unless flag ON + SCALP."""
+    if not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP") or not inst:
+        return
+    struct_dir = ("Long" if normalized in _DUAL_TF_BULL_STRUCT
+                  else "Short" if normalized in _DUAL_TF_BEAR_STRUCT else None)
+    zone_dir = ("Long" if normalized in _DUAL_TF_BULL_ZONE
+                else "Short" if normalized in _DUAL_TF_BEAR_ZONE else None)
+    if struct_dir is None and zone_dir is None:
+        return
+    now_ts = now_utc()
+    with DUAL_TF_LOCK:
+        st = DUAL_TF_STATE_BY_TICKER.get(inst)
+        if st is None:
+            st = _dual_tf_blank_state()
+            DUAL_TF_STATE_BY_TICKER[inst] = st
+        cur = st.get("bias")
+        if struct_dir is not None:   # BOS / CHOCH — authoritative
+            if cur is not None and cur != struct_dir:
+                st["bias"] = None
+                st["bias_source"] = None
+                st["confirmations"] = {}
+                st["trigger"] = None
+                st["expired_reason"] = "opposite_structure"
+                logger.info("Dual-TF bias EXPIRED %s — opposite structure %s", inst, normalized)
+                return
+            if cur == struct_dir:
+                st["bias_ts"] = now_ts.isoformat()   # reaffirm — refresh age, keep confirms
+                st["expired_reason"] = None
+            else:                                    # fresh bias — start confirmations clean
+                st["bias"] = struct_dir
+                st["bias_ts"] = now_ts.isoformat()
+                st["bias_source"] = normalized
+                st["confirmations"] = {}
+                st["trigger"] = None
+                st["expired_reason"] = None
+                logger.info("Dual-TF bias SET %s %s (%s)", inst, struct_dir, normalized)
+        else:                        # zone — confluence only (never flips/expires)
+            if cur is None:
+                st["bias"] = zone_dir
+                st["bias_ts"] = now_ts.isoformat()
+                st["bias_source"] = normalized
+                st["confirmations"] = {}
+                st["trigger"] = None
+                st["expired_reason"] = None
+                logger.info("Dual-TF bias SET %s %s (zone %s)", inst, zone_dir, normalized)
+            elif cur == zone_dir:
+                st["bias_ts"] = now_ts.isoformat()   # agreeing zone refreshes age
+
+
+def _dual_tf_record_5s_signal(normalized, inst):
+    """5s EXECUTION lane (SCALP + flag only). Records an entry-trigger or confirmation
+    into the per-instrument state and returns the entry DIRECTION when the READY rule
+    is satisfied (standing bias + aligned fresh trigger + >=2 fresh agreeing
+    confirmations), else None. Pure state — NEVER fires an order. No-op unless flag
+    ON + SCALP."""
+    if not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP") or not inst:
+        return None
+    sig = _dual_tf_signal(normalized)
+    if sig["kind"] is None:
+        return None
+    now_ts = now_utc()
+    with DUAL_TF_LOCK:
+        st = DUAL_TF_STATE_BY_TICKER.get(inst)
+        if st is None:
+            st = _dual_tf_blank_state()
+            DUAL_TF_STATE_BY_TICKER[inst] = st
+        _dual_tf_expire_in_place(st, now_ts)
+        st["last_confirm_ts"] = now_ts.isoformat()
+        if sig["kind"] == "confirm":
+            st.setdefault("confirmations", {})[sig["category"]] = {
+                "direction": sig["direction"], "ts": now_ts.isoformat()}
+        else:   # trigger (latest aligned trigger wins)
+            st["trigger"] = {"direction": sig["direction"], "ts": now_ts.isoformat()}
+        bias = st.get("bias")
+        trig = st.get("trigger")
+        if not bias or not trig or trig.get("direction") != bias:
+            return None
+        trig_age = _dual_tf_age_sec(trig.get("ts"), now_ts)
+        if trig_age is None or trig_age > DUAL_TF_CONFIRM_TTL_SEC:
+            return None
+        if len(_dual_tf_fresh_confirms(st, bias, now_ts)) >= DUAL_TF_MIN_CONFIRMS:
+            return bias
+    return None
+
+
+def _dual_tf_ready_now(inst):
+    """Worker/gateway-time readiness re-check under lock (lazy-expires first). Returns
+    (ready: bool, direction|None, bias_ts|None, reason). Never trusts queued data."""
+    now_ts = now_utc()
+    with DUAL_TF_LOCK:
+        st = DUAL_TF_STATE_BY_TICKER.get(inst)
+        if st is None:
+            return False, None, None, "no state"
+        _dual_tf_expire_in_place(st, now_ts)
+        bias = st.get("bias")
+        if not bias:
+            return False, None, None, st.get("expired_reason") or "no bias"
+        trig = st.get("trigger")
+        if not trig or trig.get("direction") != bias:
+            return False, bias, st.get("bias_ts"), "no aligned trigger"
+        trig_age = _dual_tf_age_sec(trig.get("ts"), now_ts)
+        if trig_age is None or trig_age > DUAL_TF_CONFIRM_TTL_SEC:
+            return False, bias, st.get("bias_ts"), "trigger stale"
+        n = len(_dual_tf_fresh_confirms(st, bias, now_ts))
+        if n < DUAL_TF_MIN_CONFIRMS:
+            return False, bias, st.get("bias_ts"), "only %d/%d confirmations" % (n, DUAL_TF_MIN_CONFIRMS)
+        return True, bias, st.get("bias_ts"), "ready"
+
+
+def _dual_tf_snapshot(inst):
+    """Read-only /status display snapshot (lazy-expires first). Always safe to call —
+    returns dualTfEngineEnabled False with empty fields when the flag is OFF."""
+    out = {"dualTfEngineEnabled": bool(DUAL_TF_ENGINE),
+           "biasDirection": None, "biasAgeSeconds": None, "timeRemaining": None,
+           "expiredReason": None, "dualTfReady": False, "dualTfDirection": None,
+           "dualTfConfirmations": [], "dualTfReason": None}
+    inst = instrument_of(inst) if inst else None
+    if not DUAL_TF_ENGINE or not inst:
+        return out
+    now_ts = now_utc()
+    with DUAL_TF_LOCK:
+        st = DUAL_TF_STATE_BY_TICKER.get(inst)
+        if st is None:
+            return out
+        _dual_tf_expire_in_place(st, now_ts)
+        out["expiredReason"] = st.get("expired_reason")
+        bias = st.get("bias")
+        if not bias:
+            out["dualTfReason"] = "No standing 1m bias"
+            return out
+        out["biasDirection"] = bias
+        age = _dual_tf_age_sec(st.get("bias_ts"), now_ts)
+        if age is not None:
+            out["biasAgeSeconds"] = int(age)
+            out["timeRemaining"] = max(0, int(DUAL_TF_BIAS_TTL_SEC - age))
+        fresh = _dual_tf_fresh_confirms(st, bias, now_ts)
+        out["dualTfConfirmations"] = sorted(fresh)
+        trig = st.get("trigger")
+        trig_ok = bool(trig and trig.get("direction") == bias
+                       and (_dual_tf_age_sec(trig.get("ts"), now_ts) or 1e9) <= DUAL_TF_CONFIRM_TTL_SEC)
+        if trig_ok and len(fresh) >= DUAL_TF_MIN_CONFIRMS:
+            out["dualTfReady"] = True
+            out["dualTfDirection"] = bias
+            out["dualTfReason"] = "Trigger + %d confirmations (%s)" % (
+                len(fresh), ", ".join(sorted(fresh)))
+        else:
+            need = []
+            if not trig_ok:
+                need.append("entry trigger")
+            if len(fresh) < DUAL_TF_MIN_CONFIRMS:
+                need.append("%d/%d confirmations" % (len(fresh), DUAL_TF_MIN_CONFIRMS))
+            out["dualTfReason"] = ("Waiting: " + " + ".join(need)) if need else None
+    return out
+
+
+def _process_dual_tf_entry_job(resolved_inst, direction=None, trigger_price=None, **_):
+    """Single-worker handler for a dual-TF READY. Re-checks readiness under lock, then
+    routes through the SAME audited execution gateway as manual/auto (source='dual_tf').
+    Fail-open: never raises into the worker. No-op unless flag ON + SCALP."""
+    if not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"):
+        return
+    inst = instrument_of(resolved_inst) if resolved_inst else None
+    if not inst or not auto_trade_enabled(inst):
+        return
+    ready, ready_dir, bias_ts, why = _dual_tf_ready_now(inst)
+    if not ready or (direction is not None and ready_dir != direction):
+        logger.info("Dual-TF entry skipped %s — not ready at execution: %s", inst, why)
+        return
+    # Per-setup fire-once key: a NEW bias (new structure => new bias_ts) re-arms; a
+    # STOP_HIT re-arm discards it (same as the legacy SCALP auto key) so re-entries work.
+    setup_key = ("dual_tf", inst, ready_dir, bias_ts)
+    with AUTO_TRADE_LOCK:
+        if setup_key in AUTO_FIRED_KEYS:
+            return
+    try:
+        if _maybe_auto_execute(inst, allow_stack=True, setup_key=setup_key, source="dual_tf"):
+            with AUTO_TRADE_LOCK:
+                AUTO_FIRED_KEYS.add(setup_key)
+    except Exception as exc:
+        logger.error("Dual-TF auto-execute error (non-fatal): %s", exc)
 
 
 # ── Execution mode (configurable order routing) ──────────────────────────────
@@ -10076,7 +10414,12 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # one-position condition (allow_stack defaults False), so its money path stays
     # byte-for-byte identical.
     if TRADING_MODE == "SCALP":
-        if (is_full_ready(a.get("verdict"))
+        # When the dual-TF engine is ON it OWNS SCALP auto-execution (fired from the
+        # dual_tf_entry worker job via the 1m-bias + 5s-trigger rule), so the legacy
+        # Edge-verdict SCALP auto trigger is disabled here to avoid a double entry.
+        # Flag OFF => this condition is byte-identical to before.
+        if (not DUAL_TF_ENGINE
+                and is_full_ready(a.get("verdict"))
                 and auto_trade_enabled(resolved_inst)):
             _setup_key = _auto_setup_key(a, resolved_inst)
             with AUTO_TRADE_LOCK:
@@ -10213,7 +10556,11 @@ def _webhook_worker():
     while True:
         job = _WEBHOOK_JOBS.get()
         try:
-            _process_webhook_alert(**job)
+            if job.get("job_type") == "dual_tf_entry":
+                _process_dual_tf_entry_job(
+                    **{k: v for k, v in job.items() if k != "job_type"})
+            else:
+                _process_webhook_alert(**job)
         except Exception as exc:
             logger.error("Webhook background processing failed: %s", exc)
         finally:
@@ -11062,6 +11409,31 @@ def webhook():
             RVOL_BY_TICKER[resolved_inst] = {"value": rvol_val,
                                              "ts": now_utc().isoformat()}
 
+    # ── Dual-timeframe (1m bias + 5s execution) SCALP engine — additive, gated ──
+    #    Both helpers self-filter to no-ops unless DUAL_TF_ENGINE is ON + SCALP.
+    #    The 1m BIAS lane consumes BOS/CHOCH/zone alerts; the 5s lane records the
+    #    entry-trigger + confirmations and, when the READY rule is met, ENQUEUES a
+    #    single-worker entry job (it NEVER fires an order inline). Run BEFORE the
+    #    data-only early returns so CVD/volume/VWAP/sweep all count as confirmations.
+    _dual_tf_update_bias(normalized, resolved_inst)
+    if DUAL_TF_ENGINE and TRADING_MODE == "SCALP":
+        try:
+            _dtf_dir = _dual_tf_record_5s_signal(normalized, resolved_inst)
+            if _dtf_dir is not None:
+                _ensure_webhook_worker()
+                _WEBHOOK_JOBS.put({"job_type": "dual_tf_entry",
+                                   "resolved_inst": resolved_inst,
+                                   "direction": _dtf_dir,
+                                   "trigger_price": parsed_price})
+        except Exception as exc:
+            logger.error("Dual-TF 5s record/enqueue error (non-fatal): %s", exc)
+    # Brand-new 5s execution types ack fast — recorded above, kept OUT of the heavy
+    # scoring lane (no full_analysis). Unconditional so a stray new-type alert never
+    # falls through to scoring even when the flag is OFF.
+    if normalized in DUAL_TF_FAST_TYPES:
+        return jsonify({"status": "dual_tf_signal", "alert_type": normalized,
+                        "ticker": resolved_inst, "price": parsed_price}), 200
+
     # ── CVD ingestion (CVD_BULLISH / CVD_BEARISH) — HARD confirmation filter ──
     #    Cumulative Volume Delta sign per instrument: bullish (delta > 0) confirms
     #    longs and vetoes shorts; bearish (delta < 0) confirms shorts and vetoes
@@ -11869,6 +12241,8 @@ def status():
         w_bull, w_bear, _ = score_alerts(alerts_in_window(minutes))
         windows[label] = {"alert_counts": w_counts, "total": w_total,
                           "bullish_score": w_bull, "bearish_score": w_bear}
+    # Dual-timeframe engine display (DISPLAY-ONLY; lazy-expires; all-None when flag OFF).
+    _dtf = _dual_tf_snapshot(a.get("active_ticker"))
     return jsonify({
         "status":              "running",
         "version":             "11.0",
@@ -11959,6 +12333,16 @@ def status():
         "execution_live":           execution_is_live() and execution_configured(),
         "execution_enabled":        execution_configured(),
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
+        # ── Dual-timeframe (1m bias + 5s execution) engine — DISPLAY-ONLY ──
+        "dualTfEngineEnabled": _dtf["dualTfEngineEnabled"],
+        "biasDirection":       _dtf["biasDirection"],
+        "biasAgeSeconds":      _dtf["biasAgeSeconds"],
+        "timeRemaining":       _dtf["timeRemaining"],
+        "expiredReason":       _dtf["expiredReason"],
+        "dualTfReady":         _dtf["dualTfReady"],
+        "dualTfDirection":     _dtf["dualTfDirection"],
+        "dualTfConfirmations": _dtf["dualTfConfirmations"],
+        "dualTfReason":        _dtf["dualTfReason"],
     }), 200
 
 
@@ -12179,25 +12563,59 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     if a.get("market_open") is False:
         return {"status": "error",
                         "reason": "Market is closed — live orders are paused."}, 409
-    if not is_actionable(verdict):
-        return {"status": "error",
-                        "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}, 409
-    # Hands-free AUTO execution fires on FULL-conviction READY only — an EARLY-tier
-    # (Edge 50-59) setup is shown and manually tradeable, but never auto-sent.
-    if source == "auto" and is_early_ready(verdict):
-        return {"status": "skipped",
-                "reason": "EARLY-tier setup — auto-execution fires on full READY only."}, 200
 
-    tp = a["trade_plan"]
-    if not tp.get("trade_plan") or not tp.get("entry_zone"):
-        return {"status": "error",
-                        "reason": "Ready verdict but no trade plan — refusing to send."}, 409
+    if source == "dual_tf":
+        # ── Dual-timeframe SCALP entry (AUTHORITATIVE) ───────────────────────────
+        # The plan is built SERVER-SIDE from the STANDING 1m bias + current price —
+        # NOT from the Edge verdict — so this branch bypasses ONLY the is_actionable /
+        # EARLY-tier checks. EVERY other safety is preserved: market/session/holiday
+        # already enforced above; risk cap, daily cap, dedupe and the gateway
+        # fail-closed money path are shared below.
+        if not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"):
+            return {"status": "error", "reason": "Dual-TF engine disabled."}, 409
+        ready, dual_dir, _bias_ts, _why = _dual_tf_ready_now(instrument)
+        if not ready or dual_dir is None:
+            return {"status": "error", "reason": f"Dual-TF not ready ({_why})."}, 409
+        # Opposite-direction Edge conflict veto: if the Edge gate is READY the OTHER
+        # way, stand down. A same-direction or WAIT verdict does NOT block.
+        if is_actionable(verdict):
+            _edge_dir = ready_direction(verdict)
+            if _edge_dir is not None and _edge_dir.lower() != dual_dir.lower():
+                return {"status": "error",
+                        "reason": (f"Edge gate is {_edge_dir} READY — conflicts with "
+                                   f"dual-TF {dual_dir}; entry skipped.")}, 409
+        _cp = CURRENT_PRICE_BY_TICKER.get(instrument)
+        if _cp is None:
+            return {"status": "error",
+                    "reason": "No current price to anchor the dual-TF plan."}, 409
+        tp = build_strict_trade_plan(dual_dir, instrument, _cp,
+                                     a.get("nearest_supply"), a.get("nearest_demand"),
+                                     volatility=a.get("volatility"), mode="SCALP",
+                                     vwap=a.get("vwap_value"))
+        if not tp.get("trade_plan") or not tp.get("entry_zone"):
+            return {"status": "error",
+                    "reason": f"Dual-TF: no valid trade plan ({tp.get('reason')})."}, 409
+        direction = dual_dir
+    else:
+        if not is_actionable(verdict):
+            return {"status": "error",
+                            "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}, 409
+        # Hands-free AUTO execution fires on FULL-conviction READY only — an EARLY-tier
+        # (Edge 50-59) setup is shown and manually tradeable, but never auto-sent.
+        if source == "auto" and is_early_ready(verdict):
+            return {"status": "skipped",
+                    "reason": "EARLY-tier setup — auto-execution fires on full READY only."}, 200
 
-    # Direction comes from the verdict and must agree with the plan, or we refuse.
-    direction = ready_direction(verdict)
-    if direction is None or str(tp.get("direction", "")).lower() != direction.lower():
-        return {"status": "error",
-                        "reason": "Setup direction is ambiguous — refusing to send."}, 409
+        tp = a["trade_plan"]
+        if not tp.get("trade_plan") or not tp.get("entry_zone"):
+            return {"status": "error",
+                            "reason": "Ready verdict but no trade plan — refusing to send."}, 409
+
+        # Direction comes from the verdict and must agree with the plan, or we refuse.
+        direction = ready_direction(verdict)
+        if direction is None or str(tp.get("direction", "")).lower() != direction.lower():
+            return {"status": "error",
+                            "reason": "Setup direction is ambiguous — refusing to send."}, 409
 
     try:
         zone = str(tp["entry_zone"])
@@ -12218,7 +12636,9 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     # setup is SKIPPED rather than forced through over-cap — identical rule for the
     # manual button and hands-free auto execution. Clamp (never round up). Reduced-
     # conviction setups (BOS-only Attempt / EARLY tier) size down via _setup_risk_mult.
-    _size_mult = _setup_risk_mult(verdict, a.get("structure_class"))
+    # Dual-TF entries are full-size (1:1, $100-capped below); the Edge structure_class
+    # reduced-size modifier applies only to the Edge-verdict auto/manual paths.
+    _size_mult = 1.0 if source == "dual_tf" else _setup_risk_mult(verdict, a.get("structure_class"))
     _sized = _risk_capped_contracts(abs(entry - stop), point_value_for(instrument),
                                     DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PCT,
                                     size_mult=_size_mult)
@@ -12368,7 +12788,7 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     }, 200
 
 
-def _maybe_auto_execute(inst, allow_stack=False, setup_key=None):
+def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
     """Fire the audited execution gateway for a brand-new READY setup when AUTO is
     ON for inst. Fail-open: any problem logs and returns without trading. Sets
     ACTIVE_TRADE only AFTER a confirmed send/simulate, using the gateway's
@@ -12402,7 +12822,7 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None):
         if _auto_trade_count_today(inst) >= AUTO_TRADE_MAX_PER_DAY:
             logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", AUTO_TRADE_MAX_PER_DAY, inst)
             return False
-        result, code = execute_trade_gateway(inst, AUTO_TRADE_CONTRACTS, source="auto")
+        result, code = execute_trade_gateway(inst, AUTO_TRADE_CONTRACTS, source=source)
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
             plan = result.get("plan") or {}
