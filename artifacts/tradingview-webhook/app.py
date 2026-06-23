@@ -154,23 +154,62 @@ RVOL_BY_TICKER      = {}
 # {"MNQ": {"ts": iso}, "MGC": {"ts": iso}}
 VOLUME_SPIKE_BY_TICKER = {}
 
-ALERT_TYPES = {
-    # ── MGC alert types ────────────────────────────────────────────────────────
-    "MGC NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
-    "MGC SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
-    "MGC NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
-    "MGC DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
-    # ── MNQ alert types ────────────────────────────────────────────────────────
-    "MNQ NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
-    "MNQ SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
-    "MNQ NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
-    "MNQ DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
-    # ── Shared structure alerts (apply to whichever symbol is active) ──────────
+# ── Alert vocabulary (generated per instrument from one template) ────────────
+# The full prefixed alert set ("MGC NEW SUPPLY ZONE", "MNQ BULLISH SWEEP", …) is
+# GENERATED per instrument from a single template, so adding an asset never means
+# hand-writing ~20 new alert strings. _ALERT_INSTRUMENTS lists which instruments get
+# the prefixed vocabulary; it is asserted to match the ASSETS registry (the single
+# source of truth) immediately after that registry is defined, so the two can never
+# silently drift. It must live here because ALERT_TYPES is built above the registry.
+_ALERT_INSTRUMENTS = ("MGC", "MNQ", "MES", "MYM")
+
+# Per-instrument alert template: suffix -> {side, score}. Suffixes (and their
+# side/score) are byte-identical to the original hand-written MGC/MNQ entries.
+_PER_INSTRUMENT_ALERT_TEMPLATE = {
+    # Zones (the only per-instrument entries that score bias)
+    "NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
+    "SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
+    "NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
+    "DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
+    # Zone state (neutral — side effects only, no score)
+    "ZONE BROKEN":            {"side": "neutral", "score": 0},
+    "ZONE MITIGATED":         {"side": "neutral", "score": 0},
+    # Stage-4 confirmation candle closed (neutral, no score)
+    "BULLISH CONFIRMATION":   {"side": "neutral", "score": 0},
+    "BEARISH CONFIRMATION":   {"side": "neutral", "score": 0},
+    # Liquidity sweeps (display/edge only, no score)
+    "BULLISH SWEEP":          {"side": "sweep", "score": 0},
+    "BEARISH SWEEP":          {"side": "sweep", "score": 0},
+    # Trade lifecycle commands (sent directly from the TradingView strategy)
+    "ENTER":                  {"side": "command", "score": 0},
+    "CLOSE":                  {"side": "command", "score": 0},
+    # Data-only VWAP push (updates the VWAP store; no scoring)
+    "VWAP":                   {"side": "data", "score": 0},
+    # CVD confirmation (data-only — sets per-instrument CVD state, never bias scoring)
+    "CVD BULLISH":            {"side": "data", "score": 0},
+    "CVD BEARISH":            {"side": "data", "score": 0},
+    # Volume-spike confirmation (data-only)
+    "VOLUME SPIKE":           {"side": "data", "score": 0},
+    # Dual-timeframe 5s execution alerts (side "dual_tf" => never scored; consumed
+    # only when DUAL_TF_ENGINE is ON + TRADING_MODE=SCALP)
+    "ENTRY TRIGGER LONG":     {"side": "dual_tf", "score": 0},
+    "ENTRY TRIGGER SHORT":    {"side": "dual_tf", "score": 0},
+    "VWAP RECLAIM":           {"side": "dual_tf", "score": 0},
+    "VWAP REJECT":            {"side": "dual_tf", "score": 0},
+    "DELTA SPIKE BULLISH":    {"side": "dual_tf", "score": 0},
+    "DELTA SPIKE BEARISH":    {"side": "dual_tf", "score": 0},
+}
+
+# Shared, un-prefixed alert types — apply to whichever instrument the payload's
+# `ticker` field names (structure alerts apply to the active instrument). NOT
+# per-instrument. Byte-identical to the originals.
+_SHARED_ALERT_TYPES = {
+    # ── Shared structure alerts (scored) ──
     "CHOCH SUPPLY":               {"side": "bearish", "score": 3},
     "BOS SUPPLY":                 {"side": "bearish", "score": 2},
     "CHOCH DEMAND":               {"side": "bullish", "score": 3},
     "BOS DEMAND":                 {"side": "bullish", "score": 2},
-    # ── Shared swing-structure alerts (HH/HL bullish, LH/LL bearish) ───────────
+    # ── Shared swing-structure alerts (HH/HL bullish, LH/LL bearish) ──
     #    side "structure" keeps them OUT of bias scoring (score_alerts) and the
     #    supply/demand level builder; the READY structure gate detects them by
     #    name in evaluate_strict_setup. Un-prefixed → require a `ticker` field.
@@ -178,95 +217,59 @@ ALERT_TYPES = {
     "HL":                         {"side": "structure", "score": 0},
     "LH":                         {"side": "structure", "score": 0},
     "LL":                         {"side": "structure", "score": 0},
-    # ── Zone state alerts (neutral — side effects only, no score contribution) ─
-    "MGC ZONE BROKEN":            {"side": "neutral", "score": 0},
-    "MGC ZONE MITIGATED":         {"side": "neutral", "score": 0},
-    "MNQ ZONE BROKEN":            {"side": "neutral", "score": 0},
-    "MNQ ZONE MITIGATED":         {"side": "neutral", "score": 0},
-    # Stage 4 triggers — 5m confirmation candle closed (neutral, no score)
-    "MGC BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    "MGC BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    "MNQ BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    "MNQ BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    # ── Liquidity sweep alerts (stop-hunt then reversal; display/edge only, no score) ─
-    "MGC BULLISH SWEEP":  {"side": "sweep", "score": 0},
-    "MGC BEARISH SWEEP":  {"side": "sweep", "score": 0},
-    "MNQ BULLISH SWEEP":  {"side": "sweep", "score": 0},
-    "MNQ BEARISH SWEEP":  {"side": "sweep", "score": 0},
-    # ── Trade lifecycle commands (sent directly from TradingView strategy) ───────
-    "MGC ENTER":  {"side": "command", "score": 0},
-    "MNQ ENTER":  {"side": "command", "score": 0},
-    "MGC CLOSE":  {"side": "command", "score": 0},
-    "MNQ CLOSE":  {"side": "command", "score": 0},
-    # ── Data-only VWAP push (updates the VWAP store; no scoring) ─────────────────
-    "MGC VWAP":   {"side": "data", "score": 0},
-    "MNQ VWAP":   {"side": "data", "score": 0},
-    # ── CVD (Cumulative Volume Delta) confirmation alerts (data-only — they set the
-    #    per-instrument CVD state read by the strict gate, never bias scoring). The
-    #    unprefixed forms require a `ticker` field; prefixed forms self-resolve. Both
-    #    underscore (TradingView default) and spaced spellings are accepted. ──
+    # ── CVD (data-only) — underscore (TradingView default) + spaced un-prefixed ──
     "CVD_BULLISH":     {"side": "data", "score": 0},
     "CVD_BEARISH":     {"side": "data", "score": 0},
     "CVD BULLISH":     {"side": "data", "score": 0},
     "CVD BEARISH":     {"side": "data", "score": 0},
-    "MGC CVD BULLISH": {"side": "data", "score": 0},
-    "MGC CVD BEARISH": {"side": "data", "score": 0},
-    "MNQ CVD BULLISH": {"side": "data", "score": 0},
-    "MNQ CVD BEARISH": {"side": "data", "score": 0},
-    # ── Volume-spike alerts (data-only — set the per-instrument volume-spike state
-    #    read by the strict gate as one half of the +15 volume confirmation, never
-    #    bias scoring). Unprefixed forms require a `ticker` field; prefixed forms
-    #    self-resolve. Underscore and spaced spellings are both accepted. ──
+    # ── Volume-spike (data-only) — un-prefixed forms ──
     "VOLUME_SPIKE":     {"side": "data", "score": 0},
     "VOLUME SPIKE":     {"side": "data", "score": 0},
-    "MGC VOLUME SPIKE": {"side": "data", "score": 0},
-    "MNQ VOLUME SPIKE": {"side": "data", "score": 0},
-    # ── Dual-timeframe 5s EXECUTION alerts (side "dual_tf" so they NEVER enter any
-    #    scoring set — SUPPLY/DEMAND/SWEEP are filtered by side). Recognized here only
-    #    so they ack fast and feed the dual-TF 5s lane. Unprefixed forms require a
-    #    `ticker` field; prefixed forms self-resolve. Underscore + spaced spellings
-    #    both accepted. Consumed ONLY when DUAL_TF_ENGINE is ON + TRADING_MODE=SCALP. ──
+    # ── Dual-TF 5s execution (un-prefixed) — ack fast + feed the 5s lane ──
     "ENTRY_TRIGGER_LONG":      {"side": "dual_tf", "score": 0},
     "ENTRY_TRIGGER_SHORT":     {"side": "dual_tf", "score": 0},
     "ENTRY TRIGGER LONG":      {"side": "dual_tf", "score": 0},
     "ENTRY TRIGGER SHORT":     {"side": "dual_tf", "score": 0},
-    "MGC ENTRY TRIGGER LONG":  {"side": "dual_tf", "score": 0},
-    "MGC ENTRY TRIGGER SHORT": {"side": "dual_tf", "score": 0},
-    "MNQ ENTRY TRIGGER LONG":  {"side": "dual_tf", "score": 0},
-    "MNQ ENTRY TRIGGER SHORT": {"side": "dual_tf", "score": 0},
     "VWAP_RECLAIM":            {"side": "dual_tf", "score": 0},
     "VWAP_REJECT":             {"side": "dual_tf", "score": 0},
     "VWAP RECLAIM":            {"side": "dual_tf", "score": 0},
     "VWAP REJECT":             {"side": "dual_tf", "score": 0},
-    "MGC VWAP RECLAIM":        {"side": "dual_tf", "score": 0},
-    "MGC VWAP REJECT":         {"side": "dual_tf", "score": 0},
-    "MNQ VWAP RECLAIM":        {"side": "dual_tf", "score": 0},
-    "MNQ VWAP REJECT":         {"side": "dual_tf", "score": 0},
     "DELTA_SPIKE_BULLISH":     {"side": "dual_tf", "score": 0},
     "DELTA_SPIKE_BEARISH":     {"side": "dual_tf", "score": 0},
     "DELTA SPIKE BULLISH":     {"side": "dual_tf", "score": 0},
     "DELTA SPIKE BEARISH":     {"side": "dual_tf", "score": 0},
-    "MGC DELTA SPIKE BULLISH": {"side": "dual_tf", "score": 0},
-    "MGC DELTA SPIKE BEARISH": {"side": "dual_tf", "score": 0},
-    "MNQ DELTA SPIKE BULLISH": {"side": "dual_tf", "score": 0},
-    "MNQ DELTA SPIKE BEARISH": {"side": "dual_tf", "score": 0},
-    # Bare (un-prefixed) 5s sweep names from the dual-TF indicator — convergence
-    # confirmations only, NOT scoring sweeps (the prefixed "MGC/MNQ BULLISH SWEEP"
-    # remain side=="sweep" for the scoring lane).
+    # ── Bare (un-prefixed) 5s sweep names — convergence confirmations only, NOT
+    #    scoring sweeps (the prefixed "MGC/MNQ BULLISH SWEEP" stay side=="sweep"). ──
     "BULLISH_SWEEP":           {"side": "dual_tf", "score": 0},
     "BEARISH_SWEEP":           {"side": "dual_tf", "score": 0},
     "BULLISH SWEEP":           {"side": "dual_tf", "score": 0},
     "BEARISH SWEEP":           {"side": "dual_tf", "score": 0},
 }
 
+# Build the full table: prefixed-per-instrument first, then shared. Prefixed keys
+# always carry an instrument token so they can never collide with the un-prefixed
+# shared keys.
+ALERT_TYPES = {}
+for _alert_inst in _ALERT_INSTRUMENTS:
+    for _alert_suffix, _alert_meta in _PER_INSTRUMENT_ALERT_TEMPLATE.items():
+        ALERT_TYPES["%s %s" % (_alert_inst, _alert_suffix)] = dict(_alert_meta)
+ALERT_TYPES.update(_SHARED_ALERT_TYPES)
+
+
+def _per_inst_alert_set(suffix):
+    """All prefixed alert names for `suffix` across _ALERT_INSTRUMENTS, e.g.
+    _per_inst_alert_set("CVD BULLISH") -> {"MGC CVD BULLISH", "MNQ CVD BULLISH", …}."""
+    return {"%s %s" % (i, suffix) for i in _ALERT_INSTRUMENTS}
+
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
 SWEEP_TYPES  = {k for k, v in ALERT_TYPES.items() if v["side"] == "sweep"}
 # CVD confirmation alert sets (data-only — store per-instrument state, never score).
-CVD_BULLISH_TYPES = {"CVD_BULLISH", "CVD BULLISH", "MGC CVD BULLISH", "MNQ CVD BULLISH"}
-CVD_BEARISH_TYPES = {"CVD_BEARISH", "CVD BEARISH", "MGC CVD BEARISH", "MNQ CVD BEARISH"}
+# Registry-driven: the prefixed forms cover every alert instrument automatically.
+CVD_BULLISH_TYPES = {"CVD_BULLISH", "CVD BULLISH"} | _per_inst_alert_set("CVD BULLISH")
+CVD_BEARISH_TYPES = {"CVD_BEARISH", "CVD BEARISH"} | _per_inst_alert_set("CVD BEARISH")
 # Volume-spike alert set (data-only — store per-instrument spike timestamp, never score).
-VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE", "MGC VOLUME SPIKE", "MNQ VOLUME SPIKE"}
+VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE"} | _per_inst_alert_set("VOLUME SPIKE")
 CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
 
 # ── Dual-timeframe (1m bias + 5s execution) SCALP engine ─────────────────────
@@ -294,17 +297,17 @@ DUAL_TF_LOCK = threading.Lock()
 DUAL_TF_STATE_BY_TICKER = {}
 
 # 5s EXECUTION alert sets (recognized => fast-ack + dual-TF record, never scoring).
-ENTRY_TRIGGER_LONG_TYPES  = {"ENTRY_TRIGGER_LONG", "ENTRY TRIGGER LONG",
-                             "MGC ENTRY TRIGGER LONG", "MNQ ENTRY TRIGGER LONG"}
-ENTRY_TRIGGER_SHORT_TYPES = {"ENTRY_TRIGGER_SHORT", "ENTRY TRIGGER SHORT",
-                             "MGC ENTRY TRIGGER SHORT", "MNQ ENTRY TRIGGER SHORT"}
+ENTRY_TRIGGER_LONG_TYPES  = ({"ENTRY_TRIGGER_LONG", "ENTRY TRIGGER LONG"}
+                             | _per_inst_alert_set("ENTRY TRIGGER LONG"))
+ENTRY_TRIGGER_SHORT_TYPES = ({"ENTRY_TRIGGER_SHORT", "ENTRY TRIGGER SHORT"}
+                             | _per_inst_alert_set("ENTRY TRIGGER SHORT"))
 ENTRY_TRIGGER_TYPES = ENTRY_TRIGGER_LONG_TYPES | ENTRY_TRIGGER_SHORT_TYPES
-VWAP_RECLAIM_TYPES = {"VWAP_RECLAIM", "VWAP RECLAIM", "MGC VWAP RECLAIM", "MNQ VWAP RECLAIM"}
-VWAP_REJECT_TYPES  = {"VWAP_REJECT", "VWAP REJECT", "MGC VWAP REJECT", "MNQ VWAP REJECT"}
-DELTA_SPIKE_BULL_TYPES = {"DELTA_SPIKE_BULLISH", "DELTA SPIKE BULLISH",
-                          "MGC DELTA SPIKE BULLISH", "MNQ DELTA SPIKE BULLISH"}
-DELTA_SPIKE_BEAR_TYPES = {"DELTA_SPIKE_BEARISH", "DELTA SPIKE BEARISH",
-                          "MGC DELTA SPIKE BEARISH", "MNQ DELTA SPIKE BEARISH"}
+VWAP_RECLAIM_TYPES = {"VWAP_RECLAIM", "VWAP RECLAIM"} | _per_inst_alert_set("VWAP RECLAIM")
+VWAP_REJECT_TYPES  = {"VWAP_REJECT", "VWAP REJECT"} | _per_inst_alert_set("VWAP REJECT")
+DELTA_SPIKE_BULL_TYPES = ({"DELTA_SPIKE_BULLISH", "DELTA SPIKE BULLISH"}
+                          | _per_inst_alert_set("DELTA SPIKE BULLISH"))
+DELTA_SPIKE_BEAR_TYPES = ({"DELTA_SPIKE_BEARISH", "DELTA SPIKE BEARISH"}
+                          | _per_inst_alert_set("DELTA SPIKE BEARISH"))
 # Bare 5s sweep names — convergence confirmations kept SEPARATE from the scoring
 # SWEEP_TYPES (side=="sweep") so they never enter the heavy scoring/SWING lane.
 DUAL_TF_SWEEP_BULL_TYPES = {"BULLISH_SWEEP", "BULLISH SWEEP"}
@@ -321,10 +324,10 @@ DUAL_TF_FAST_TYPES = (ENTRY_TRIGGER_TYPES | VWAP_RECLAIM_TYPES | VWAP_REJECT_TYP
 # supply zones are confluence (bootstrap a bias only when none stands, refresh age).
 _DUAL_TF_BULL_STRUCT = {"BOS DEMAND", "CHOCH DEMAND"}
 _DUAL_TF_BEAR_STRUCT = {"BOS SUPPLY", "CHOCH SUPPLY"}
-_DUAL_TF_BULL_ZONE = {"MGC NEW DEMAND ZONE", "MGC DEMAND ZONE CONFIRMED",
-                      "MNQ NEW DEMAND ZONE", "MNQ DEMAND ZONE CONFIRMED"}
-_DUAL_TF_BEAR_ZONE = {"MGC NEW SUPPLY ZONE", "MGC SUPPLY ZONE CONFIRMED",
-                      "MNQ NEW SUPPLY ZONE", "MNQ SUPPLY ZONE CONFIRMED"}
+_DUAL_TF_BULL_ZONE = (_per_inst_alert_set("NEW DEMAND ZONE")
+                      | _per_inst_alert_set("DEMAND ZONE CONFIRMED"))
+_DUAL_TF_BEAR_ZONE = (_per_inst_alert_set("NEW SUPPLY ZONE")
+                      | _per_inst_alert_set("SUPPLY ZONE CONFIRMED"))
 
 # ---------------------------------------------------------------------------
 # Trading mode profiles — SCALP (fast, sensitive) vs SWING (slower, stricter)
@@ -569,8 +572,59 @@ def _spec_float_env(name, default):
     except (TypeError, ValueError):
         return float(default)
 
-INSTRUMENT_SPECS = {
-    "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
+# ── Asset registry (config-driven; single source of truth for every instrument) ─
+# Adding a tradable asset is a CONFIG edit here, NOT code surgery: per-asset specs,
+# VWAP feed, Discord routing, TradersPost ticker, account profiles, aliases and
+# (later) per-asset safety all derive from this one dict. MGC is the DEFAULT
+# instrument — the lenient normalizer instrument_of() falls back to it, exactly as
+# the original hard-coded "MNQ else MGC" behaviour did. Order is logical (default
+# first); nothing iterates the derived dicts in an order-dependent way.
+DEFAULT_INSTRUMENT = "MGC"
+ASSETS = {
+    "MGC": {
+        "symbol":      "MGC",
+        "enabled":     True,
+        "is_default":  True,
+        "asset_class": "gold",
+        "aliases":     ["MGC"],
+        "vwap_feed":   "GC=F",                 # micro gold ≈ GC=F
+        "discord_env":        "DISCORD_WEBHOOK_URL",
+        "discord_is_default": True,            # MGC uses the main/default channel
+        "traderspost_env":     "TRADERSPOST_TICKER_MGC",
+        "traderspost_default": "MGC",
+        "account_size": 50_000,
+        "profiles":     {"Conservative": 0.005, "Standard": 0.010},
+        "index_confirm": False,                # MGC is EXCLUDED from cross-market index confirmation
+        "safety": {},                          # per-asset safety controls (populated in a later phase)
+        "specs": {
+            "tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
+            "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
+            "min_stop_pts": _spec_float_env("MGC_MIN_STOP_PTS", 5.0),
+            # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
+            # tunable, so a stale legacy MGC_SCALP_MIN_STOP_* secret can NEVER re-enable
+            # the rejection in production. SWING keeps its env-tunable minimum (above).
+            "scalp_min_stop_ticks": 0,
+            "scalp_min_stop_pts": 0.0,
+            "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0),
+        },
+    },
+    "MNQ": {
+        "symbol":      "MNQ",
+        "enabled":     True,
+        "is_default":  False,
+        "asset_class": "index",
+        "aliases":     ["MNQ"],
+        "vwap_feed":   "NQ=F",                 # micro Nasdaq ≈ NQ=F
+        "discord_env":        "DISCORD_MNQ_WEBHOOK_URL",
+        "discord_is_default": False,
+        "traderspost_env":     "TRADERSPOST_TICKER_MNQ",
+        "traderspost_default": "MNQ",
+        "account_size": 100_000,
+        "profiles":     {"Conservative": 0.005, "Standard": 0.010},
+        "index_confirm": True,                 # MNQ participates in cross-market index confirmation
+        "safety": {},
+        "specs": {
+            "tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
             "min_stop_pts": _spec_float_env("MNQ_MIN_STOP_PTS", 20.0),
             # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
@@ -579,38 +633,127 @@ INSTRUMENT_SPECS = {
             # byte-for-byte.
             "scalp_min_stop_ticks": 0,
             "scalp_min_stop_pts": 0.0,
-            "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0)},
-    "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
-            "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
-            "min_stop_pts": _spec_float_env("MGC_MIN_STOP_PTS", 5.0),
-            # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
-            # tunable, so a stale legacy MGC_SCALP_MIN_STOP_* secret can NEVER re-enable
-            # the rejection in production. SWING keeps its env-tunable minimum (above).
+            "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0),
+        },
+    },
+    "MES": {
+        "symbol":      "MES",
+        "enabled":     True,
+        "is_default":  False,
+        "asset_class": "index",
+        "aliases":     ["MES"],
+        "vwap_feed":   "ES=F",                 # micro S&P 500 ≈ ES=F
+        "discord_env":        "DISCORD_MES_WEBHOOK_URL",
+        "discord_is_default": False,           # falls back to the main channel until the secret exists
+        "traderspost_env":     "TRADERSPOST_TICKER_MES",
+        "traderspost_default": "MES",
+        "account_size": 100_000,               # mirrors MNQ (index micro); per-asset risk tuning later
+        "profiles":     {"Conservative": 0.005, "Standard": 0.010},
+        "index_confirm": True,                 # MES participates in cross-market index confirmation
+        "safety": {},                          # per-asset safety controls (populated in a later phase)
+        "specs": {
+            # CME Micro E-mini S&P 500: $5/point, 0.25 tick. tp1/2/3 are vestigial
+            # display fallbacks (live plans compute their own 1:1 targets).
+            "tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 2.0, "point_value": 5.0,
+            "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MES_MIN_STOP_TICKS", 16),
+            "min_stop_pts": _spec_float_env("MES_MIN_STOP_PTS", 4.0),
             "scalp_min_stop_ticks": 0,
             "scalp_min_stop_pts": 0.0,
-            "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0)},
+            "mitig_tol_pts": _spec_float_env("MES_MITIG_TOL_PTS", 6.0),
+        },
+    },
+    "MYM": {
+        "symbol":      "MYM",
+        "enabled":     True,
+        "is_default":  False,
+        "asset_class": "index",
+        "aliases":     ["MYM"],
+        "vwap_feed":   "YM=F",                 # micro Dow ≈ YM=F
+        "discord_env":        "DISCORD_MYM_WEBHOOK_URL",
+        "discord_is_default": False,           # falls back to the main channel until the secret exists
+        "traderspost_env":     "TRADERSPOST_TICKER_MYM",
+        "traderspost_default": "MYM",
+        "account_size": 100_000,               # mirrors MNQ (index micro); per-asset risk tuning later
+        "profiles":     {"Conservative": 0.005, "Standard": 0.010},
+        "index_confirm": True,                 # MYM participates in cross-market index confirmation
+        "safety": {},                          # per-asset safety controls (populated in a later phase)
+        "specs": {
+            # CME Micro E-mini Dow: $0.50/point, 1.0 tick. tp1/2/3 are vestigial
+            # display fallbacks (live plans compute their own 1:1 targets).
+            "tp1": 40.0, "tp2": 80.0, "tp3": 120.0, "stop_buf": 8.0, "point_value": 0.5,
+            "tick_size": 1.0,  "min_stop_ticks": _spec_int_env("MYM_MIN_STOP_TICKS", 30),
+            "min_stop_pts": _spec_float_env("MYM_MIN_STOP_PTS", 30.0),
+            "scalp_min_stop_ticks": 0,
+            "scalp_min_stop_pts": 0.0,
+            "mitig_tol_pts": _spec_float_env("MYM_MITIG_TOL_PTS", 40.0),
+        },
+    },
 }
 
-def instrument_of(ticker):
-    """Normalize any raw ticker (e.g. 'MNQ1!', 'MGC') to 'MNQ' or 'MGC'.
+# Guard: the alert-vocabulary instrument list (defined above the registry because
+# ALERT_TYPES is built there) must match the registry exactly, so the two can never
+# silently drift. Fails loudly at import the moment they diverge.
+assert set(_ALERT_INSTRUMENTS) == set(ASSETS), (
+    "ALERT_TYPES instruments %r drifted from ASSETS registry %r — keep them in sync"
+    % (tuple(_ALERT_INSTRUMENTS), tuple(ASSETS))
+)
 
-    NOTE: this is the *lenient* legacy normalizer — anything that does not
-    contain 'MNQ' (including None/empty/unknown) silently becomes 'MGC'. It is
-    safe only for display/legacy fallbacks. For ingesting a TradingView alert
-    use resolve_instrument(), which is ticker-first and never silently defaults.
+
+def enabled_instruments():
+    """Registry-ordered list of enabled instrument symbols (e.g. ['MGC','MNQ'])."""
+    return [k for k, a in ASSETS.items() if a.get("enabled")]
+
+
+def asset_cfg(inst, key, default=None):
+    """Layered config read for an asset: per-asset MODE override → per-asset default
+    → active-mode global (MODES[TRADING_MODE]) → provided `default`. In the MGC/MNQ
+    baseline no asset declares overrides, so this returns exactly cfg(key) for any
+    MODES key — it is infrastructure for per-asset tuning added later."""
+    a = ASSETS.get(inst) or {}
+    mode_ov = (a.get("modes") or {}).get(TRADING_MODE) or {}
+    if key in mode_ov:
+        return mode_ov[key]
+    acfg = a.get("cfg") or {}
+    if key in acfg:
+        return acfg[key]
+    mode_tbl = MODES.get(TRADING_MODE, MODES["SCALP"])
+    if key in mode_tbl:
+        return mode_tbl[key]
+    return default
+
+
+# Per-instrument trade specs, derived from the registry (single source of truth).
+INSTRUMENT_SPECS = {k: a["specs"] for k, a in ASSETS.items()}
+
+
+def instrument_of(ticker):
+    """Normalize any raw ticker (e.g. 'MNQ1!', 'MGC') to an enabled instrument.
+
+    NOTE: this is the *lenient* legacy normalizer — anything that does not match a
+    non-default enabled asset's alias (including None/empty/unknown) silently
+    becomes the DEFAULT instrument (MGC), exactly as the original "MNQ else MGC"
+    did. It is safe only for display/legacy fallbacks. For ingesting a TradingView
+    alert use resolve_instrument(), which is ticker-first and never silently
+    defaults. Registry-driven: once an asset's aliases are added it is recognized
+    here automatically.
     """
-    return "MNQ" if "MNQ" in str(ticker or "").upper() else "MGC"
+    s = str(ticker or "").upper()
+    for inst in enabled_instruments():
+        if inst == DEFAULT_INSTRUMENT:
+            continue
+        if any(alias in s for alias in ASSETS[inst]["aliases"]):
+            return inst
+    return DEFAULT_INSTRUMENT
+
 
 def _instrument_from_text(value):
-    """Return 'MNQ'/'MGC' iff `value` unambiguously names exactly one of them,
-    else None (neither present, or — defensively — both present)."""
+    """Return an enabled instrument iff `value` unambiguously names exactly one of
+    them (via its registry aliases), else None (none present, or — defensively —
+    more than one present)."""
     s = str(value or "").upper()
-    has_mnq, has_mgc = "MNQ" in s, "MGC" in s
-    if has_mnq and not has_mgc:
-        return "MNQ"
-    if has_mgc and not has_mnq:
-        return "MGC"
-    return None
+    matches = [inst for inst in enabled_instruments()
+               if any(alias in s for alias in ASSETS[inst]["aliases"])]
+    return matches[0] if len(matches) == 1 else None
 
 
 # ── Per-instrument alert mute (server-side, in-memory) ────────────────────────
@@ -622,7 +765,7 @@ def _instrument_from_text(value):
 # position's stop/target must always alert). In-memory BY DESIGN: a restart /
 # republish resets to unmuted — fail-safe, since a stale silent mute that drops
 # real alerts forever is worse for a trading tool than re-enabling on restart.
-ALERTS_MUTED      = {"MGC": False, "MNQ": False}
+ALERTS_MUTED      = {inst: False for inst in enabled_instruments()}
 ALERTS_MUTED_LOCK = threading.Lock()
 
 
@@ -743,11 +886,12 @@ def last_valid_data_for(ticker):
     return None, None, None
 
 
+# Account profiles, derived from the registry (account_size + per-asset risk_pct).
+# Keys/values are byte-identical to the original hand-written table for MGC/MNQ.
 ACCOUNT_PROFILES = {
-    "MGC Conservative": {"account_size": 50_000,  "risk_pct": 0.005},
-    "MGC Standard":     {"account_size": 50_000,  "risk_pct": 0.010},
-    "MNQ Conservative": {"account_size": 100_000, "risk_pct": 0.005},
-    "MNQ Standard":     {"account_size": 100_000, "risk_pct": 0.010},
+    f"{inst} {pname}": {"account_size": a["account_size"], "risk_pct": rpct}
+    for inst, a in ASSETS.items()
+    for pname, rpct in a["profiles"].items()
 }
 DEFAULT_PROFILE = "MGC Standard"
 
@@ -779,8 +923,8 @@ TRADERSPOST_WEBHOOK_URL = os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()
 # to the root symbol (MGC / MNQ); override per instrument if the broker symbol differs
 # (e.g. a dated/continuous contract) via TRADERSPOST_TICKER_MGC / TRADERSPOST_TICKER_MNQ.
 TRADERSPOST_TICKER = {
-    "MGC": (os.environ.get("TRADERSPOST_TICKER_MGC", "").strip() or "MGC"),
-    "MNQ": (os.environ.get("TRADERSPOST_TICKER_MNQ", "").strip() or "MNQ"),
+    inst: (os.environ.get(a["traderspost_env"], "").strip() or a["traderspost_default"])
+    for inst, a in ASSETS.items()
 }
 # Hard safety rails for the (only) money-moving path. The contract count is capped
 # server-side — the browser min/step is NOT a control — and a short per-instrument
@@ -815,7 +959,7 @@ _TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-se
 # republish (fail-safe toward NOT trading). Live (real-broker) auto execution
 # additionally requires the live/prod instance (DISCORD_LIVE_ENABLED) so a dev
 # instance never places a real auto order on a stray webhook.
-AUTO_TRADE       = {"MGC": False, "MNQ": False}
+AUTO_TRADE       = {inst: False for inst in enabled_instruments()}
 AUTO_TRADE_LOCK  = threading.Lock()
 # Serialises the auto-execute critical section so two near-simultaneous READYs
 # can't both pass the no-active-trade check before ACTIVE_TRADE is set after a
@@ -1241,15 +1385,27 @@ DISCORD_LIVE_ENABLED = (
 )
 
 
-def _discord_url(hint: str = "") -> str:
-    """Return the correct trade-alert webhook URL based on symbol hint.
-
-    If the hint contains 'MNQ' (case-insensitive) and a dedicated MNQ URL is
-    configured, returns that; otherwise falls back to the MGC/default URL.
-    """
-    if "MNQ" in str(hint).upper() and DISCORD_MNQ_WEBHOOK_URL:
-        return DISCORD_MNQ_WEBHOOK_URL
+def _asset_discord_url(inst: str) -> str:
+    """Resolve the trade-alert webhook URL for an instrument from the registry.
+    Default-channel assets (MGC) use DISCORD_WEBHOOK_URL; a non-default asset uses
+    its dedicated channel env when set, else falls back to the main channel. This
+    per-asset fallback is what lets MES/MYM route to the main channel until their
+    dedicated secrets exist."""
+    a = ASSETS.get(inst) or {}
+    if not a.get("discord_is_default"):
+        env = a.get("discord_env") or ""
+        url = os.environ.get(env, "") if env else ""
+        if url:
+            return url
     return DISCORD_WEBHOOK_URL
+
+
+def _discord_url(hint: str = "") -> str:
+    """Return the correct trade-alert webhook URL based on a symbol hint, via the
+    registry. Byte-identical to the legacy 'MNQ in hint → MNQ channel else default'
+    for the MGC/MNQ baseline.
+    """
+    return _asset_discord_url(instrument_of(hint))
 
 
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 300))  # seconds (default 5 min)
@@ -1350,7 +1506,8 @@ VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # 
 # keeps moving. Display-only — never affects the gate.
 PRICE_FRESH_MIN = float(os.environ.get("PRICE_FRESH_MIN", 5))  # minutes
 # MGC (micro gold) ≈ GC=F, MNQ (micro Nasdaq) ≈ NQ=F — same price, so same VWAP.
-VWAP_FEED_SYMBOL = {"MGC": "GC=F", "MNQ": "NQ=F"}
+# Derived from the registry's per-asset vwap_feed (new assets auto-covered).
+VWAP_FEED_SYMBOL = {inst: a["vwap_feed"] for inst, a in ASSETS.items()}
 
 
 def _send_heartbeat():
