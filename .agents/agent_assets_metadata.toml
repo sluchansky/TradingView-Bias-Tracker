@@ -6,3 +6,9 @@ id = "iKR4nChLzaVjwKD04WKGt"
 uri = "file://artifacts/tradingview-webhook/ARCHITECTURE.md"
 type = "text"
 title = "TradingView Webhook — Architecture Report"
+
+[[outputs]]
+id = "kCTCcZS61fD2Alb9phZGD"
+uri = "file://attached_assets/generated_audio/exchange_bell.mp3"
+type = "audio"
+title = "stock exchange opening bell"

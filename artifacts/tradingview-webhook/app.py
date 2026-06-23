@@ -13097,6 +13097,30 @@ def why_endpoint(ticker=None):
     return jsonify(explanation), 200
 
 
+# ── Stock-exchange opening bell audio (data URI, injected into the dashboard) ──
+# Loaded once at import and base64-inlined into the dashboard HTML so the browser
+# needs NO extra route / proxy-whitelist / auth path to fetch it. Fail-open: if the
+# asset is missing the constant is "" and the dashboard simply has no trade bell.
+def _load_bell_data_uri():
+    import base64 as _b64
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [
+        os.path.join(_here, "..", "..", "attached_assets", "generated_audio", "exchange_bell.mp3"),
+        os.path.join(os.getcwd(), "attached_assets", "generated_audio", "exchange_bell.mp3"),
+        os.path.join(_here, "exchange_bell.mp3"),
+    ]
+    for _p in _candidates:
+        try:
+            with open(_p, "rb") as _f:
+                return "data:audio/mpeg;base64," + _b64.b64encode(_f.read()).decode("ascii")
+        except Exception:
+            continue
+    return ""
+
+
+BELL_DATA_URI = _load_bell_data_uri()
+
+
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     html = """<!DOCTYPE html>
@@ -15057,6 +15081,8 @@ function applyRec() {
 let _audioCtx = null;
 let soundOn = (localStorage.getItem('readySound') !== 'off');
 let _readyState = {};   // instrument -> was actionable on the previous poll
+let _lastTradeOpenedAt = null;   // opened_at of the last seen ACTIVE_TRADE (bell de-dupe)
+let _tradeBellInit = false;      // first /trade poll sets the baseline WITHOUT ringing
 
 function _ensureAudio() {
   try {
@@ -15071,6 +15097,45 @@ try {
   window.addEventListener('pointerdown', _ensureAudio, { once: true });
   window.addEventListener('keydown', _ensureAudio, { once: true });
 } catch(e) {}
+
+// ── Stock-exchange opening bell: a real recording that rings ONCE when a NEW
+//    trade is taken (wired in refresh()). Inlined as a data URI so it needs no
+//    extra route / proxy whitelist / auth. Played through the SAME AudioContext
+//    the READY chime uses, so the existing autoplay-unlock primes it too; a cached
+//    HTMLAudio element is the fallback for the brief window before decode resolves.
+const BELL_DATA_URI = "__BELL_DATA_URI__";
+let _bellBuf = null, _bellEl = null;
+function _initBell() {
+  if (!BELL_DATA_URI) return;
+  if (!_bellEl) { try { _bellEl = new Audio(BELL_DATA_URI); _bellEl.preload = 'auto'; _bellEl.volume = 1.0; } catch(e) {} }
+  const ctx = _ensureAudio();
+  if (ctx && !_bellBuf) {
+    try {
+      const b64 = BELL_DATA_URI.split(',')[1] || '';
+      const bin = atob(b64), n = bin.length, bytes = new Uint8Array(n);
+      for (let i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+      ctx.decodeAudioData(bytes.buffer, function(b){ _bellBuf = b; }, function(){});
+    } catch(e) {}
+  }
+}
+try {
+  window.addEventListener('pointerdown', _initBell, { once: true });
+  window.addEventListener('keydown', _initBell, { once: true });
+} catch(e) {}
+function playExchangeBell() {
+  if (!soundOn || !BELL_DATA_URI) return;
+  _initBell();   // idempotent: ensure the HTMLAudio fallback exists + decode is kicked off
+  const ctx = _ensureAudio();
+  if (ctx && _bellBuf) {
+    try {
+      const s = ctx.createBufferSource(); s.buffer = _bellBuf;
+      const g = ctx.createGain(); g.gain.value = 1.0;
+      s.connect(g); g.connect(ctx.destination); s.start();
+      return;
+    } catch(e) {}
+  }
+  try { if (_bellEl) { _bellEl.currentTime = 0; _bellEl.play().catch(function(){}); } } catch(e) {}
+}
 function playReadyChime() {
   if (!soundOn) return;
   const ctx = _ensureAudio();
@@ -15281,6 +15346,15 @@ function checkStale() {
 async function refresh() {
   try {
     const d = await api('/trade');
+    // ── Stock-exchange bell on a NEWLY taken trade (unique opened_at). The first
+    //    poll sets the baseline silently so a trade already live when the dashboard
+    //    loads does NOT ring; only a fresh entry afterwards rings. ──
+    try {
+      const _curOpen = (d && d.status !== 'no_active_trade') ? (d.opened_at || null) : null;
+      if (!_tradeBellInit) { _tradeBellInit = true; _lastTradeOpenedAt = _curOpen; }
+      else if (_curOpen && _curOpen !== _lastTradeOpenedAt) { _lastTradeOpenedAt = _curOpen; playExchangeBell(); toast('🔔 Trade taken — ' + (d.direction || '') + ' ' + (d.symbol || '')); }
+      else { _lastTradeOpenedAt = _curOpen; }
+    } catch(e) {}
     const card = document.getElementById('status-card');
     const info = document.getElementById('trade-info');
     const detail = document.getElementById('trade-detail');
@@ -15817,6 +15891,7 @@ setInterval(checkStale, 2000);
 </body>
 </html>"""
     html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
+    html = html.replace("__BELL_DATA_URI__", BELL_DATA_URI)
     return html, 200, {
         "Content-Type": "text/html; charset=utf-8",
         # The dashboard is a live view whose inline JS changes on every deploy.
