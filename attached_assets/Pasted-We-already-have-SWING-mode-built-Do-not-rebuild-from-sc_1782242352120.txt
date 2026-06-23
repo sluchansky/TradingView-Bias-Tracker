@@ -1,0 +1,104 @@
+We already have SWING mode built. Do not rebuild from scratch.
+
+Audit and adjust the existing SWING mode so it is truly different from SCALP mode.
+
+Required SWING mode changes:
+
+1. Disable scalp logic inside SWING mode
+SWING mode should not use:
+- 1-minute entries
+- tiny TP targets
+- instant break-even movement
+- overactive exit logic
+- scalp-style chop exits
+
+2. Use higher timeframe confirmation
+SWING mode must prioritize:
+- 1H trend
+- 4H trend
+- Daily key levels
+- major supply/demand
+- major liquidity zones
+
+3. Swing entry rules
+Allow entries only when:
+- 1H and 4H bias agree
+- price pulls back into a valid zone
+- structure supports the direction
+- there is at least 1:2 reward-to-risk available
+- stop can be placed beyond structure or ATR level
+
+4. Swing trade management
+Once in a SWING trade, analyze every 15 minutes but do not overreact to every candle.
+
+Each review should decide:
+- HOLD
+- REDUCE
+- MOVE STOP
+- EXIT
+
+Do not exit just because a 1m or 5m candle goes against the trade.
+
+5. Thesis tracking
+Every SWING trade needs:
+- original trade thesis
+- current thesis status: VALID / WEAKENING / INVALID
+- reason for status
+- invalidation level
+- next target
+- next review time
+
+6. Stop rules
+Initial stop must be based on:
+- structure invalidation
+OR
+- ATR swing stop
+OR
+- key level break
+
+Do not use tight scalp stops in SWING mode.
+
+7. Break-even rule
+Do not move stop to break-even early.
+For SWING:
+Move stop only after:
+- TP1 is hit
+OR
+- price reaches at least 1R
+OR
+- higher timeframe structure confirms continuation.
+
+8. Dashboard display
+Add clear SWING-specific fields:
+Mode: SWING
+Higher Timeframe Bias
+1H Bias
+4H Bias
+Daily Level Nearby
+Trade Thesis
+Thesis Status
+Invalidation Level
+Initial Risk
+Current R
+Planned RR
+Next Target
+Next Review Time
+Last Review Decision
+Reason To Hold
+Reason To Exit
+
+9. Journal updates
+Every swing review should log:
+timestamp
+symbol
+price
+bias
+thesisStatus
+decision
+reason
+stop
+targets
+currentR
+
+Goal:
+SWING mode should hold good trades longer, avoid scalp exits, and only exit when the trade thesis is actually invalidated.
