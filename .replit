@@ -30,7 +30,11 @@ args = "parity"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "swing_golden"
+args = "scalp_golden"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "swing_flagoff"
 
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
@@ -59,20 +63,31 @@ args = "/home/runner/workspace/.pythonlibs/bin/python3 -m py_compile artifacts/t
 name = "parity"
 author = "agent"
 
+[workflows.workflow.metadata]
+isValidation = true
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "bash .local/state/check_parity.sh"
+
+[[workflows.workflow]]
+name = "scalp_golden"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_scalp_golden.sh"
 
 [workflows.workflow.metadata]
 isValidation = true
 
 [[workflows.workflow]]
-name = "swing_golden"
+name = "swing_flagoff"
 author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "bash .local/state/check_swing_golden.sh"
+args = "bash .local/state/check_swing_flagoff_golden.sh"
 
 [workflows.workflow.metadata]
 isValidation = true

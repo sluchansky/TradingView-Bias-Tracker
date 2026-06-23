@@ -214,6 +214,13 @@ MITIGATED_PRICES_BY_TICKER = {}   # {inst: [{"price": float, "ts": str}, ...]} c
 MITIGATED_FLAG_BY_TICKER   = {}   # {inst: bool} — mitigation active for this instrument
 VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso}, "MGC": {...}} — latest VWAP per instrument
 VOLATILITY_BY_TICKER = {}     # {"MNQ": {"atr_pts","ratio","ts"}, "MGC": {...}} — latest volatility per instrument
+# SWING higher-timeframe context per instrument (auto-computed from the Yahoo HTF
+# feed; optionally overlaid by inbound chart pushes during a grace window — P3).
+# DISPLAY-ONLY until the SWING money gate (P4) reads it fail-CLOSED. Schema per inst:
+# {"1H": {bias,ema_fast,ema_slow,atr,confidence,bars,ts,source},
+#  "4H": {...same...}, "1D": {bias,atr,levels{...},confidence,bars,ts,source}}
+# Written ONLY when _swing_htf_enabled() (SWING + flag on); empty/ignored in SCALP.
+HTF_STATE_BY_INST   = {}
 # CVD (Cumulative Volume Delta) confirmation state, per instrument. Set by the
 # CVD_BULLISH / CVD_BEARISH webhook alerts; read by the strict gate as a HARD
 # confirmation filter (reject longs when bearish, shorts when bullish) that
@@ -526,6 +533,21 @@ MODES = {
         "SCALP_BE_AFTER_TP1_ONLY":            True,  # never move stop to BE before TP1 is hit
         "SCALP_BE_REQUIRE_FAVOR_CLOSE_OR_1R": True,  # after TP1, BE only on favorable close OR price >= 1R
         "SCALP_LOSS_LE_FIRST_TARGET":         True,  # skip if planned loss > planned first target
+        # ── SWING HTF overhaul (master-flagged; SWING-ONLY) — INERT in SCALP ──────
+        # SWING-only engine (1H/4H/Daily confirmation, >=1:2 targets, 15-min thesis
+        # management). EVERY consumer guards on _swing_htf_enabled(), which requires
+        # TRADING_MODE == "SWING", so these keys are no-ops in SCALP whatever the
+        # value. Mirrored here only so a shared cfg() read never KeyErrors.
+        "SWING_HTF_ENABLED":                  False,
+        "SWING_MIN_RR":                       2.0,
+        "SWING_REVIEW_INTERVAL_MIN":          15,
+        "SWING_REQUIRE_1H_4H_ALIGN":          True,
+        "SWING_REQUIRE_DAILY_LEVEL":          True,
+        "SWING_HTF_GRACE_MIN":                20,
+        "SWING_HTF_1H_STALE_MIN":             120,
+        "SWING_HTF_4H_STALE_MIN":             360,
+        "SWING_HTF_1D_STALE_MIN":             2160,
+        "SWING_PULLBACK_ZONE_ATR":            0.75,
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -606,6 +628,25 @@ MODES = {
         "SCALP_BE_AFTER_TP1_ONLY":            False,
         "SCALP_BE_REQUIRE_FAVOR_CLOSE_OR_1R": False,
         "SCALP_LOSS_LE_FIRST_TARGET":         False,
+        # ── SWING HTF overhaul (master-flagged; SWING-ONLY) ───────────────────────
+        # Master switch for the SWING higher-timeframe engine. ON for SWING. An env
+        # kill-switch (SWING_HTF_ENABLED=0) force-disables it everywhere (prod safety
+        # + the flag-off golden guard). Every new SWING path goes through
+        # _swing_htf_enabled(); with the flag OFF behavior is byte-identical to
+        # legacy SWING.
+        "SWING_HTF_ENABLED":                  True,
+        # >=1:2 RR (no forced 1:1); 15-min thesis-review cadence; 1H/4H alignment +
+        # daily-level entry gates; inbound chart-push grace window; per-TF staleness
+        # (fail-closed when exceeded); valid-pullback tolerance (in ATR multiples).
+        "SWING_MIN_RR":                       2.0,
+        "SWING_REVIEW_INTERVAL_MIN":          15,
+        "SWING_REQUIRE_1H_4H_ALIGN":          True,
+        "SWING_REQUIRE_DAILY_LEVEL":          True,
+        "SWING_HTF_GRACE_MIN":                20,
+        "SWING_HTF_1H_STALE_MIN":             120,
+        "SWING_HTF_4H_STALE_MIN":             360,
+        "SWING_HTF_1D_STALE_MIN":             2160,
+        "SWING_PULLBACK_ZONE_ATR":            0.75,
     },
 }
 
@@ -623,6 +664,27 @@ def cfg_for(mode, key):
     """Read a threshold for an EXPLICIT mode (used where the mode can differ from the
     global TRADING_MODE, e.g. the stop planner invoked with an explicit mode)."""
     return MODES.get(mode, MODES.get(TRADING_MODE, MODES["SCALP"]))[key]
+
+
+def _swing_htf_enabled(mode=None):
+    """Single master gate for the SWING higher-timeframe overhaul.
+
+    Returns True ONLY when the active (or explicitly given) trading mode is SWING
+    AND the SWING_HTF_ENABLED flag is on. An env kill-switch
+    (SWING_HTF_ENABLED=0) force-disables it everywhere — used by the flag-off
+    golden guard to prove every new SWING path is cleanly gated (flag OFF ==
+    byte-identical to legacy SWING) and as a production safety switch. SCALP can
+    never enter any SWING-HTF path because the mode check fails first.
+    """
+    m = (mode or TRADING_MODE)
+    if m != "SWING":
+        return False
+    if os.environ.get("SWING_HTF_ENABLED", "").strip() == "0":
+        return False
+    try:
+        return bool(cfg_for(m, "SWING_HTF_ENABLED"))
+    except KeyError:
+        return False
 
 
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
@@ -1841,6 +1903,21 @@ PRICE_FRESH_MIN = float(os.environ.get("PRICE_FRESH_MIN", 5))  # minutes
 # MGC (micro gold) ≈ GC=F, MNQ (micro Nasdaq) ≈ NQ=F — same price, so same VWAP.
 # Derived from the registry's per-asset vwap_feed (new assets auto-covered).
 VWAP_FEED_SYMBOL = {inst: a["vwap_feed"] for inst, a in ASSETS.items()}
+
+# ── SWING higher-timeframe (HTF) auto-fetch tuning (display-only infra) ────────
+# HTF context changes slowly (hourly/daily bars), so it refreshes on a much slower
+# cadence than VWAP. The refresh is folded into the VWAP loop but throttled to this
+# interval, and only runs at all when _swing_htf_enabled() (SWING + flag on) — SCALP
+# never fetches HTF. All env-overridable; pure infra (not mode-behaviour knobs).
+HTF_FETCH_INTERVAL = int(os.environ.get("HTF_FETCH_INTERVAL", 300))  # seconds between HTF refreshes
+HTF_1H_INTERVAL    = os.environ.get("HTF_1H_INTERVAL", "60m")        # Yahoo interval for the 1H series
+HTF_1H_RANGE       = os.environ.get("HTF_1H_RANGE", "1mo")           # Yahoo range for the 1H series
+HTF_1D_INTERVAL    = os.environ.get("HTF_1D_INTERVAL", "1d")         # Yahoo interval for the daily series
+HTF_1D_RANGE       = os.environ.get("HTF_1D_RANGE", "6mo")           # Yahoo range for the daily series
+HTF_EMA_FAST       = int(os.environ.get("HTF_EMA_FAST", 8))          # fast EMA period for HTF bias
+HTF_EMA_SLOW       = int(os.environ.get("HTF_EMA_SLOW", 21))         # slow EMA period for HTF bias
+HTF_4H_BUCKET_SEC  = 4 * 3600                                        # resample 60m → 4H buckets (UTC-aligned)
+HTF_SWING_PIVOT_K  = 2                                               # daily pivot half-width for swing H/L detection
 
 
 def _send_heartbeat():
@@ -4527,6 +4604,568 @@ def get_volatility(ticker):
             "display": f"ATR {atr_disp} pts · {ratio:.2f}× (base {base_disp}) · {label} [{adj_tag}]"}
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# SWING higher-timeframe (HTF) data layer — P2 (DISPLAY-ONLY; no gate impact).
+# Auto-computes 1H / 4H / Daily trend + daily key levels per instrument from the
+# same public Yahoo feed used for VWAP. Everything here is FAIL-OPEN for display:
+# any fetch/parse failure leaves the previous reading in place (never clobbers a
+# good value with None) and compute_swing_context() degrades to "unknown" rather
+# than raising. The SWING money gate (P4) reads compute_swing_context() and fails
+# CLOSED on incomplete/stale data — that strictness lives at the gate, not here.
+# Runs ONLY when _swing_htf_enabled() (SWING + flag on); SCALP never fetches HTF.
+# ───────────────────────────────────────────────────────────────────────────
+_HTF_LAST_REFRESH_TS = [0.0]  # monotonic ts of the last HTF refresh (throttle)
+
+
+def _fetch_htf_series(symbol, interval, range_):
+    """Fetch an OHLCV bar series for `symbol` at a higher timeframe.
+
+    Mirrors _fetch_intraday_quote's HTTP/parse contract but keeps the per-bar
+    `timestamp` array (needed to resample 60m → 4H). Returns (bars, err) where
+    bars is a list of {"t","o","h","l","c","v"} oldest→newest with None rows
+    dropped. Benign empty payload → (None, MARKET_CLOSED_SENTINEL).
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        resp = requests.get(
+            url,
+            params={"interval": interval, "range": range_},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        result = resp.json()["chart"]["result"][0]
+        ts     = result.get("timestamp") or []
+        quote  = result["indicators"]["quote"][0]
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        return None, f"fetch error: {exc}"
+    if not quote or not ts or quote.get("close") is None:
+        return None, MARKET_CLOSED_SENTINEL
+    opens  = quote.get("open")  or []
+    highs  = quote.get("high")  or []
+    lows   = quote.get("low")   or []
+    closes = quote.get("close") or []
+    vols   = quote.get("volume") or []
+    bars = []
+    for i, t in enumerate(ts):
+        c = closes[i] if i < len(closes) else None
+        h = highs[i]  if i < len(highs)  else None
+        l = lows[i]   if i < len(lows)   else None
+        if c is None or h is None or l is None:
+            continue
+        o = opens[i] if i < len(opens) and opens[i] is not None else c
+        v = vols[i]  if i < len(vols)  and vols[i]  is not None else 0.0
+        bars.append({"t": int(t), "o": float(o), "h": float(h),
+                     "l": float(l), "c": float(c), "v": float(v)})
+    if not bars:
+        return None, MARKET_CLOSED_SENTINEL
+    return bars, None
+
+
+def _ema(values, period):
+    """Plain EMA over `values` (oldest→newest). None if too few points."""
+    if not values or len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    e = sum(values[:period]) / period   # seed with the SMA of the first `period`
+    for v in values[period:]:
+        e = v * k + e * (1.0 - k)
+    return e
+
+
+def _atr_from_bars(bars, period=14):
+    """Wilder-style mean true range over the last `period` bars. None if empty."""
+    trs, prev = [], None
+    for b in bars:
+        tr = (b["h"] - b["l"]) if prev is None else max(
+            b["h"] - b["l"], abs(b["h"] - prev), abs(b["l"] - prev))
+        if tr >= 0:
+            trs.append(tr)
+        prev = b["c"]
+    if not trs:
+        return None
+    window = trs[-period:] if len(trs) >= period else trs
+    return sum(window) / len(window)
+
+
+def _resample_bars(bars, bucket_sec):
+    """Resample finer bars into fixed UTC-epoch-aligned buckets of `bucket_sec`.
+    OHLC aggregated per bucket; volume summed; order preserved oldest→newest."""
+    buckets, order = {}, []
+    for b in bars:
+        key = int(b["t"] // bucket_sec)
+        agg = buckets.get(key)
+        if agg is None:
+            buckets[key] = {"t": key * bucket_sec, "o": b["o"], "h": b["h"],
+                            "l": b["l"], "c": b["c"], "v": b["v"]}
+            order.append(key)
+        else:
+            agg["h"] = max(agg["h"], b["h"])
+            agg["l"] = min(agg["l"], b["l"])
+            agg["c"] = b["c"]
+            agg["v"] += b["v"]
+    return [buckets[k] for k in order]
+
+
+def _htf_bias_from_bars(bars):
+    """Trend bias for a bar series via fast/slow EMA separation, neutral-banded by
+    ATR so tiny EMA gaps read as 'neutral'. Returns a stable dict; 'unknown' when
+    there is not enough history. confidence = |ema gap| / ATR, clamped to 1.0."""
+    closes = [b["c"] for b in bars]
+    out = {"bias": "unknown", "ema_fast": None, "ema_slow": None,
+           "atr": None, "confidence": 0.0, "bars": len(closes)}
+    if len(closes) < HTF_EMA_SLOW:
+        return out
+    ef = _ema(closes, HTF_EMA_FAST)
+    es = _ema(closes, HTF_EMA_SLOW)
+    atr = _atr_from_bars(bars) or 0.0
+    if ef is None or es is None:
+        return out
+    sep = ef - es
+    eps = 0.10 * atr  # within 10% of ATR of each other = neutral / no edge
+    if sep > eps:
+        bias = "bull"
+    elif sep < -eps:
+        bias = "bear"
+    else:
+        bias = "neutral"
+    conf = min(1.0, abs(sep) / atr) if atr > 0 else 0.0
+    out.update(bias=bias, ema_fast=round(ef, 4), ema_slow=round(es, 4),
+               atr=round(atr, 4), confidence=round(conf, 3))
+    return out
+
+
+def _daily_key_levels(daily_bars):
+    """Derive daily key levels from the daily series: prior fully-formed day's
+    H/L/C plus recent swing highs/lows (pivots of half-width HTF_SWING_PIVOT_K).
+    The last daily bar is treated as the in-progress session, so 'prior day' is
+    the second-to-last bar. Returns {} when there is not enough history."""
+    levels = {"prior_high": None, "prior_low": None, "prior_close": None,
+              "swing_highs": [], "swing_lows": []}
+    if len(daily_bars) < 3:
+        return levels
+    prior = daily_bars[-2]  # last completed day (final bar = in-progress today)
+    levels["prior_high"]  = round(prior["h"], 4)
+    levels["prior_low"]   = round(prior["l"], 4)
+    levels["prior_close"] = round(prior["c"], 4)
+    k = HTF_SWING_PIVOT_K
+    completed = daily_bars[:-1]  # exclude the in-progress bar from pivots
+    for i in range(k, len(completed) - k):
+        hi = completed[i]["h"]
+        lo = completed[i]["l"]
+        if all(hi >= completed[j]["h"] for j in range(i - k, i + k + 1) if j != i):
+            levels["swing_highs"].append(round(hi, 4))
+        if all(lo <= completed[j]["l"] for j in range(i - k, i + k + 1) if j != i):
+            levels["swing_lows"].append(round(lo, 4))
+    # keep the most recent few of each (dedup, preserve recency newest-first)
+    levels["swing_highs"] = list(dict.fromkeys(reversed(levels["swing_highs"])))[:5]
+    levels["swing_lows"]  = list(dict.fromkeys(reversed(levels["swing_lows"])))[:5]
+    return levels
+
+
+def _htf_chart_override_active(instrument, tf):
+    """True if an inbound chart push for this instrument+timeframe is still within
+    its grace window — the auto refresh must not overwrite it while it is. (No
+    chart pushes exist until P3, so this is always False today; written now so the
+    auto-writer is grace-aware from the start.)"""
+    rec = (HTF_STATE_BY_INST.get(instrument) or {}).get(tf)
+    if not rec or rec.get("source") != "chart":
+        return False
+    try:
+        age_min = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
+    except (KeyError, ValueError, TypeError):
+        return False
+    return age_min <= cfg_for("SWING", "SWING_HTF_GRACE_MIN")
+
+
+def _update_htf_auto(instrument):
+    """Refresh 1H / 4H / Daily HTF context for one instrument (best-effort).
+
+    1H comes from the 60m series; 4H is resampled from it; Daily comes from the
+    1d series. Each timeframe is written independently and only when no fresh
+    chart push owns it. Any fetch failure leaves the previous reading untouched.
+    """
+    symbol = VWAP_FEED_SYMBOL.get(instrument)
+    if not symbol:
+        return
+    state = HTF_STATE_BY_INST.setdefault(instrument, {})
+
+    # 1H + 4H from the 60m series
+    bars_60m, err = _fetch_htf_series(symbol, HTF_1H_INTERVAL, HTF_1H_RANGE)
+    if bars_60m:
+        _log_feed_status("HTF 1H fetch", instrument, None)
+        now_iso = now_utc().isoformat()
+        if not _htf_chart_override_active(instrument, "1H"):
+            b1 = _htf_bias_from_bars(bars_60m)
+            b1.update(ts=now_iso, source="auto")
+            state["1H"] = b1
+        if not _htf_chart_override_active(instrument, "4H"):
+            bars_4h = _resample_bars(bars_60m, HTF_4H_BUCKET_SEC)
+            b4 = _htf_bias_from_bars(bars_4h)
+            b4.update(ts=now_iso, source="auto")
+            state["4H"] = b4
+    else:
+        _log_feed_status("HTF 1H fetch", instrument, err)
+
+    # Daily bias + key levels from the 1d series
+    bars_1d, err = _fetch_htf_series(symbol, HTF_1D_INTERVAL, HTF_1D_RANGE)
+    if bars_1d:
+        _log_feed_status("HTF 1D fetch", instrument, None)
+        if not _htf_chart_override_active(instrument, "1D"):
+            bd = _htf_bias_from_bars(bars_1d)
+            bd["levels"] = _daily_key_levels(bars_1d)
+            bd.update(ts=now_utc().isoformat(), source="auto")
+            state["1D"] = bd
+    else:
+        _log_feed_status("HTF 1D fetch", instrument, err)
+
+
+def _refresh_htf_if_due(force=False):
+    """Throttled HTF refresh for all instruments (every HTF_FETCH_INTERVAL). Called
+    from the VWAP loop; only does work when _swing_htf_enabled(). Fail-open."""
+    if not _swing_htf_enabled():
+        return
+    nowm = time.monotonic()
+    if not force and (nowm - _HTF_LAST_REFRESH_TS[0]) < HTF_FETCH_INTERVAL:
+        return
+    _HTF_LAST_REFRESH_TS[0] = nowm
+    for instrument in VWAP_FEED_SYMBOL:
+        try:
+            _update_htf_auto(instrument)
+        except Exception as exc:  # one bad instrument must not skip the others
+            logger.warning("HTF auto-fetch error for %s: %s", instrument, exc)
+
+
+def _tf_staleness_min(tf):
+    """Per-timeframe staleness threshold (minutes) from the SWING knobs."""
+    return cfg_for("SWING", {
+        "1H": "SWING_HTF_1H_STALE_MIN",
+        "4H": "SWING_HTF_4H_STALE_MIN",
+        "1D": "SWING_HTF_1D_STALE_MIN",
+    }[tf])
+
+
+def _htf_tf_view(rec, tf):
+    """Normalise one stored timeframe record into a display/gate view with age +
+    staleness. Missing record → unknown + stale. FAIL-OPEN (never raises)."""
+    view = {"bias": "unknown", "confidence": 0.0, "atr": None, "source": None,
+            "ts": None, "age_min": None, "stale": True, "present": False}
+    if not rec:
+        return view
+    view.update(bias=rec.get("bias", "unknown"),
+                confidence=rec.get("confidence", 0.0),
+                atr=rec.get("atr"), source=rec.get("source"),
+                ts=rec.get("ts"), present=True)
+    try:
+        age = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
+        view["age_min"] = round(age, 1)
+        view["stale"] = age > _tf_staleness_min(tf)
+    except (KeyError, ValueError, TypeError):
+        view["stale"] = True
+    return view
+
+
+def _nearest_levels(price, levels):
+    """Nearest support (highest level below price) and resistance (lowest level
+    above price) from the daily key levels + their distance in points."""
+    if price is None or not levels:
+        return None, None
+    candidates = []
+    for key in ("prior_high", "prior_low", "prior_close"):
+        v = levels.get(key)
+        if v is not None:
+            candidates.append((v, {"prior_high": "Prior day high",
+                                   "prior_low": "Prior day low",
+                                   "prior_close": "Prior day close"}[key]))
+    for v in levels.get("swing_highs", []):
+        candidates.append((v, "Swing high (buy-side liquidity)"))
+    for v in levels.get("swing_lows", []):
+        candidates.append((v, "Swing low (sell-side liquidity)"))
+    # Operator-pushed daily levels (P3 inbound HTF alerts) — additive; only present
+    # while a chart push owns the 1D record (auto resume rebuilds without them).
+    for v in levels.get("chart_levels", []):
+        candidates.append((v, "Operator-pushed level"))
+    support = resistance = None
+    for v, label in candidates:
+        if v <= price:
+            if support is None or v > support["value"]:
+                support = {"value": v, "label": label, "dist": round(price - v, 4)}
+        else:
+            if resistance is None or v < resistance["value"]:
+                resistance = {"value": v, "label": label, "dist": round(v - price, 4)}
+    return support, resistance
+
+
+def compute_swing_context(instrument, price):
+    """PURE, FAIL-OPEN read of the current SWING higher-timeframe context for an
+    instrument. Returns a STABLE schema regardless of data availability so every
+    consumer (dashboard, /status, the P4 gate) sees the same keys. Never raises.
+
+    `complete` is True only when all three timeframes are present AND fresh AND the
+    1H/4H biases are decided (not 'unknown'); `stale` is True if any required TF is
+    stale or missing. The P4 money gate treats not-complete / stale as a veto
+    (fail-CLOSED) — this function itself only describes, it does not decide.
+    """
+    instrument = instrument_of(instrument) if instrument else instrument
+    ctx = {
+        "enabled": _swing_htf_enabled(),
+        "instrument": instrument,
+        "price": price,
+        "bias_1h": "unknown", "bias_4h": "unknown", "bias_daily": "unknown",
+        "conf_1h": 0.0, "conf_4h": 0.0, "conf_daily": 0.0,
+        "atr_1h": None, "atr_4h": None, "atr_daily": None,
+        "aligned_long": False, "aligned_short": False,
+        "daily_levels": {}, "nearest_support": None, "nearest_resistance": None,
+        "daily_level_nearby": None,
+        "freshness": {}, "sources": {},
+        "complete": False, "stale": True, "as_of": now_utc().isoformat(),
+    }
+    try:
+        state = HTF_STATE_BY_INST.get(instrument) or {}
+        v1 = _htf_tf_view(state.get("1H"), "1H")
+        v4 = _htf_tf_view(state.get("4H"), "4H")
+        vd = _htf_tf_view(state.get("1D"), "1D")
+        ctx["bias_1h"], ctx["conf_1h"], ctx["atr_1h"] = v1["bias"], v1["confidence"], v1["atr"]
+        ctx["bias_4h"], ctx["conf_4h"], ctx["atr_4h"] = v4["bias"], v4["confidence"], v4["atr"]
+        ctx["bias_daily"], ctx["conf_daily"], ctx["atr_daily"] = vd["bias"], vd["confidence"], vd["atr"]
+        ctx["freshness"] = {"1H": v1, "4H": v4, "1D": vd}
+        ctx["sources"] = {"1H": v1["source"], "4H": v4["source"], "1D": vd["source"]}
+        ctx["aligned_long"]  = (v1["bias"] == "bull" and v4["bias"] == "bull")
+        ctx["aligned_short"] = (v1["bias"] == "bear" and v4["bias"] == "bear")
+
+        levels = (state.get("1D") or {}).get("levels") or {}
+        ctx["daily_levels"] = levels
+        support, resistance = _nearest_levels(price, levels)
+        ctx["nearest_support"]    = support
+        ctx["nearest_resistance"] = resistance
+        # "Daily level nearby" = the closer of support/resistance, flagged when the
+        # price is within SWING_PULLBACK_ZONE_ATR * daily-ATR of it.
+        nearer = None
+        for side, lvl in (("support", support), ("resistance", resistance)):
+            if lvl is None:
+                continue
+            if nearer is None or lvl["dist"] < nearer["dist"]:
+                nearer = {"value": lvl["value"], "label": lvl["label"],
+                          "side": side, "dist": lvl["dist"]}
+        if nearer is not None:
+            tol_atr = cfg_for("SWING", "SWING_PULLBACK_ZONE_ATR")
+            datr = vd["atr"] or 0.0
+            nearer["within_tolerance"] = bool(datr > 0 and nearer["dist"] <= tol_atr * datr)
+            nearer["dist_atr"] = round(nearer["dist"] / datr, 3) if datr > 0 else None
+            ctx["daily_level_nearby"] = nearer
+
+        required_fresh = (not v1["stale"]) and (not v4["stale"]) and (not vd["stale"])
+        biases_decided = (v1["bias"] in ("bull", "bear", "neutral")
+                          and v4["bias"] in ("bull", "bear", "neutral")
+                          and vd["bias"] in ("bull", "bear", "neutral"))
+        ctx["stale"] = not required_fresh
+        ctx["complete"] = bool(v1["present"] and v4["present"] and vd["present"]
+                               and required_fresh and biases_decided)
+    except Exception as exc:  # display must never break on bad data
+        logger.warning("compute_swing_context error for %s: %s", instrument, exc)
+    return ctx
+
+
+def _swing_entry_veto_reasons(ctx, plan, direction):
+    """Fail-CLOSED SWING entry filters (P4, MONEY-PATH).
+
+    Returns a list of (code, human_reason) tuples; an EMPTY list means the SWING
+    setup PASSES every higher-timeframe confirmation gate. NEVER raises — any
+    incomplete / unknown / broken input yields a veto so a failed check can never
+    let a trade through. SWING-ONLY: the caller gates on `_swing_htf_enabled()`, so
+    SCALP and the flag-off path never reach here.
+
+    Gates (all required):
+      • HTF context present, COMPLETE and FRESH (else fail-closed, no blind trade);
+      • 1H AND 4H bias agree with the trade direction (SWING_REQUIRE_1H_4H_ALIGN);
+      • a daily key level sits on the trade side within SWING_PULLBACK_ZONE_ATR×ATR
+        (SWING_REQUIRE_DAILY_LEVEL — confirms we are trading at major HTF structure);
+      • price has pulled back INTO the trade-side supply/demand zone (no VWAP-only);
+      • the plan carries a real trade-side zone anchor with RR ≥ SWING_MIN_RR — this
+        is already ENFORCED inside build_strict_trade_plan (a failure there drops the
+        plan → WAIT before this runs); re-checked here only defensively.
+    """
+    try:
+        if not isinstance(ctx, dict) or not isinstance(plan, dict):
+            return [("unavailable", "SWING context or plan unavailable")]
+        if direction not in ("Long", "Short"):
+            return [("direction", "trade direction undecided")]
+        if not ctx.get("enabled"):
+            return [("disabled", "SWING higher-timeframe context disabled")]
+        # FAIL-CLOSED on incomplete / stale HTF data — never trade blind.
+        if (not ctx.get("complete")) or ctx.get("stale"):
+            why = []
+            if not ctx.get("complete"):
+                why.append("HTF context incomplete (need 1H/4H/Daily present + decided)")
+            if ctx.get("stale"):
+                why.append("HTF data stale")
+            return [("htf", "; ".join(why))]
+
+        vetoes = []
+        atr_ref = ctx.get("atr_daily") or ctx.get("atr_4h") or plan.get("atr_pts")
+        tol_atr = float(cfg_for("SWING", "SWING_PULLBACK_ZONE_ATR"))
+        price   = ctx.get("price")
+
+        # 1H + 4H bias must agree with the trade direction.
+        if cfg_for("SWING", "SWING_REQUIRE_1H_4H_ALIGN"):
+            if direction == "Long" and not ctx.get("aligned_long"):
+                vetoes.append(("bias", f"1H/4H not both bullish "
+                                       f"(1H={ctx.get('bias_1h')}, 4H={ctx.get('bias_4h')})"))
+            elif direction == "Short" and not ctx.get("aligned_short"):
+                vetoes.append(("bias", f"1H/4H not both bearish "
+                                       f"(1H={ctx.get('bias_1h')}, 4H={ctx.get('bias_4h')})"))
+
+        # A daily key level must sit on the trade side, within pullback tolerance.
+        if cfg_for("SWING", "SWING_REQUIRE_DAILY_LEVEL"):
+            side_lvl = (ctx.get("nearest_support") if direction == "Long"
+                        else ctx.get("nearest_resistance"))
+            if not side_lvl or side_lvl.get("value") is None:
+                vetoes.append(("daily_level", "no daily key level on the trade side"))
+            elif (not atr_ref) or atr_ref <= 0 or side_lvl.get("dist") is None:
+                vetoes.append(("daily_level", "cannot validate daily-level pullback (no HTF ATR)"))
+            elif side_lvl["dist"] > tol_atr * atr_ref:
+                vetoes.append(("daily_level",
+                               f"price not pulled back to the daily level "
+                               f"({side_lvl['dist']:.1f} pts > {tol_atr:.2f}×ATR)"))
+
+        # Price must have pulled back INTO the trade-side supply/demand zone.
+        zone = plan.get("nearest_demand") if direction == "Long" else plan.get("nearest_supply")
+        if zone is None:
+            vetoes.append(("no_zone", "no trade-side supply/demand zone (VWAP-only entry rejected)"))
+        elif price is None or (not atr_ref) or atr_ref <= 0:
+            vetoes.append(("pullback", "cannot validate zone pullback"))
+        elif abs(price - zone) > tol_atr * atr_ref:
+            vetoes.append(("pullback",
+                           f"price not at the {'demand' if direction == 'Long' else 'supply'} "
+                           f"zone ({abs(price - zone):.1f} pts away)"))
+
+        # Defensive RR re-check — build_strict_trade_plan is authoritative.
+        if not plan.get("trade_plan"):
+            vetoes.append(("no_plan", plan.get("reason") or "no SWING trade plan"))
+        else:
+            rr = plan.get("rr_num")
+            min_rr = float(cfg_for("SWING", "SWING_MIN_RR"))
+            if rr is None or float(rr) < min_rr:
+                vetoes.append(("rr", f"planned RR {rr} below {min_rr:.0f}:1 minimum"))
+        return vetoes
+    except Exception as exc:   # FAIL-CLOSED — a broken check must never let a trade through.
+        return [("unavailable", f"SWING entry checks errored ({exc})")]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# P3 — OPTIONAL inbound HTF TradingView alerts (DISPLAY-ONLY overlay).
+# A TradingView alert may EXPLICITLY tag itself with a higher-timeframe field
+# (timeframe/interval/tf = 1H / 4H / 1D). When it does (and only then), it
+# becomes a chart-source overlay in HTF_STATE_BY_INST that WINS over the
+# auto-computed value for SWING_HTF_GRACE_MIN, after which the auto-fetcher
+# resumes — mirroring the VWAP chart-push-wins-then-auto-resumes pattern.
+# CRITICAL: a bare 1m/5m structure alert (no HTF timeframe field, or a
+# sub-hourly one) is NEVER promoted to HTF authority — the 1m ALERT_HISTORY
+# must not masquerade as a higher-timeframe reading. Additive + fail-open; SCALP
+# / flag-off short-circuit before any state write (byte-identical).
+# ───────────────────────────────────────────────────────────────────────────
+# Recognised HTF timeframe spellings → canonical key. Whitespace/_/- are stripped
+# before lookup. Sub-hourly values (1m/5m/15m/…) are intentionally ABSENT so they
+# resolve to None and can never become an HTF overlay.
+_HTF_TF_ALIASES = {
+    "1H": "1H", "60M": "1H", "60": "1H", "H1": "1H", "1HR": "1H",
+    "1HOUR": "1H", "HOURLY": "1H",
+    "4H": "4H", "240M": "4H", "240": "4H", "H4": "4H", "4HR": "4H", "4HOUR": "4H",
+    "1D": "1D", "D": "1D", "D1": "1D", "DAILY": "1D", "1DAY": "1D", "DAY": "1D",
+}
+
+
+def _normalize_htf_timeframe(raw):
+    """Map a free-text timeframe field → '1H'/'4H'/'1D', or None if it is absent,
+    unrecognised, or sub-hourly (which must never be treated as HTF authority)."""
+    if raw is None:
+        return None
+    key = "".join(str(raw).strip().upper().split()).replace("-", "").replace("_", "")
+    return _HTF_TF_ALIASES.get(key)
+
+
+def _htf_bias_from_alert(data, normalized):
+    """Derive a bias ('bull'/'bear'/'neutral') for an inbound HTF push: an explicit
+    bias/direction/trend field wins; otherwise fall back to the alert type's own
+    side (bullish/bearish) or HH/HL vs LH/LL swing-structure direction. None when
+    the alert carries no directional meaning (e.g. a pure level/zone push)."""
+    raw = (data.get("bias") or data.get("direction")
+           or data.get("trend") or data.get("side") or "")
+    s = str(raw).strip().lower()
+    if s in ("bull", "bullish", "long", "up", "buy"):
+        return "bull"
+    if s in ("bear", "bearish", "short", "down", "sell"):
+        return "bear"
+    if s in ("neutral", "range", "flat", "chop", "sideways"):
+        return "neutral"
+    meta = ALERT_TYPES.get(normalized) or {}
+    side = meta.get("side")
+    if side == "bullish":
+        return "bull"
+    if side == "bearish":
+        return "bear"
+    if side == "structure":
+        last = normalized.split()[-1] if normalized else ""
+        if last in ("HH", "HL"):
+            return "bull"
+        if last in ("LH", "LL"):
+            return "bear"
+    return None
+
+
+def _ingest_htf_overlay(data, resolved_inst, normalized):
+    """Write an inbound HTF (1H/4H/1D) bias/level push as a chart-source overlay in
+    HTF_STATE_BY_INST. Returns the canonical timeframe when an overlay was written,
+    else None. SWING+flag only; additive + fail-open (never raises, never affects
+    the gate today — P4's money gate reads the same compute_swing_context())."""
+    if not _swing_htf_enabled():
+        return None
+    tf = _normalize_htf_timeframe(
+        data.get("timeframe") or data.get("interval") or data.get("tf"))
+    if tf is None:
+        return None
+    try:
+        bias = _htf_bias_from_alert(data, normalized)
+        level_val = None
+        for k in ("level", "zone", "key_level", "level_price"):
+            v = data.get(k)
+            if v is None:
+                continue
+            try:
+                level_val = float(v)
+                break
+            except (ValueError, TypeError):
+                pass
+        if bias is None and level_val is None:
+            return None  # nothing actionable to overlay
+        state = HTF_STATE_BY_INST.setdefault(resolved_inst, {})
+        prev = dict(state.get(tf) or {})
+        rec = dict(prev)  # preserve prior auto values (esp. the 1D `levels`) we keep
+        rec["source"] = "chart"
+        rec["ts"] = now_utc().isoformat()
+        if bias is not None:
+            rec["bias"] = bias
+            rec["confidence"] = 1.0  # operator chart push = full confidence
+        else:
+            rec.setdefault("bias", prev.get("bias", "unknown"))
+        if level_val is not None:
+            levels = dict(rec.get("levels") or {})
+            chart_levels = [lv for lv in (levels.get("chart_levels") or [])
+                            if lv != level_val]
+            chart_levels.insert(0, round(level_val, 4))
+            levels["chart_levels"] = chart_levels[:8]
+            rec["levels"] = levels
+        state[tf] = rec
+        logger.info("HTF chart overlay: %s %s bias=%s level=%s (grace %sm)",
+                    resolved_inst, tf, rec.get("bias"), level_val,
+                    cfg_for("SWING", "SWING_HTF_GRACE_MIN"))
+        return tf
+    except Exception as exc:  # additive overlay must never break the webhook
+        logger.warning("HTF overlay ingest error for %s: %s", resolved_inst, exc)
+        return None
+
+
 def _vwap_autofetch_loop():
     """Refresh VWAP for all tracked instruments, evaluate managed trades, then
     reschedule. The managed-trade watch is additive and fail-open so it can
@@ -4541,6 +5180,12 @@ def _vwap_autofetch_loop():
             _update_volatility_auto(instrument)
     except Exception as exc:  # volatility is best-effort — never disrupt VWAP/watcher
         logger.warning("Volatility auto-fetch loop error: %s", exc)
+    try:
+        # SWING HTF context (P2): throttled to HTF_FETCH_INTERVAL and a no-op
+        # outside SWING+flag. Fail-open so it can never disrupt VWAP/watcher.
+        _refresh_htf_if_due()
+    except Exception as exc:
+        logger.warning("HTF auto-fetch loop error: %s", exc)
     try:
         _watch_managed_trades()
     except Exception as exc:
@@ -5511,8 +6156,15 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
 
 def build_strict_trade_plan(direction, ticker, current_price,
                             nearest_supply, nearest_demand,
-                            volatility=None, mode=None, vwap=None, edge_score=None):
+                            volatility=None, mode=None, vwap=None, edge_score=None,
+                            swing_context=None):
     """Single-target plan per instrument at a FIXED 1:1 risk:reward.
+
+    SWING EXCEPTION (P4, master-flag-gated): when `_swing_htf_enabled(mode)` AND a
+    `swing_context` dict is supplied, the plan is NOT 1:1 — it requires a real
+    trade-side supply/demand zone (no VWAP-only anchor) and targets the nearest
+    OPPOSING major higher-timeframe level, which must sit ≥ SWING_MIN_RR away (else
+    no plan). SCALP, the flag-off SWING path, and the ORB override are unaffected.
 
     The stop is sized FIRST by `_dynamic_stop_plan` (ATR×multiplier blended with the
     nearest zone, snapped to ticks). SWING rejects a stop tighter than its minimum
@@ -5595,19 +6247,59 @@ def build_strict_trade_plan(direction, ticker, current_price,
     if risk <= 0:
         return no_plan("Invalid stop distance.")
 
-    # ── FIXED 1:1 RISK:REWARD ────────────────────────────────────────────────
-    # RiskDistance == |entry − stop|. The single take-profit sits the SAME distance
-    # on the other side of entry, so reward == risk and R:R is always 1:1. Because
-    # full_analysis recomputes this plan fresh on every poll/webhook, the TP always
-    # re-derives from the CURRENT stop — if the stop widens/tightens before entry the
-    # 1:1 is preserved automatically (no stale cached target reaches the broker).
-    take_profit  = (entry + risk) if direction == "Long" else (entry - risk)
-    reward       = risk
-    risk_dollars = round(risk * pv, 2)   # per contract; == expected profit at 1:1
+    # ── RISK:REWARD target ───────────────────────────────────────────────────
+    # SCALP / flag-off SWING / ORB base: FIXED 1:1 — RiskDistance == |entry − stop|
+    # and the single take-profit sits the SAME distance on the other side of entry,
+    # so reward == risk. SWING + flag-on instead targets the nearest OPPOSING major
+    # higher-timeframe level (a real, structure-based swing target) and REQUIRES it
+    # sit ≥ SWING_MIN_RR away — else no plan. Because full_analysis recomputes this
+    # plan fresh on every poll/webhook, the TP always re-derives from the CURRENT
+    # stop AND the CURRENT HTF context (no stale cached target reaches the broker).
+    swing_htf_plan = _swing_htf_enabled(mode)
+    swing_target_label = None
+    if swing_htf_plan:
+        # FAIL-CLOSED: a SWING plan needs the HTF context, a real trade-side zone
+        # (no VWAP-only anchor), and an opposing HTF level ≥ SWING_MIN_RR away.
+        if not isinstance(swing_context, dict):
+            return no_plan("SWING higher-timeframe context unavailable.")
+        if anchored_on_vwap:
+            return no_plan("SWING requires a trade-side supply/demand zone (no VWAP-only entry).")
+        min_rr = float(cfg_for(mode, "SWING_MIN_RR"))
+        _lvl = (swing_context.get("nearest_resistance") if direction == "Long"
+                else swing_context.get("nearest_support"))
+        if not _lvl or _lvl.get("value") is None:
+            return no_plan("SWING target unavailable — no opposing higher-timeframe level.")
+        # Snap the HTF target onto the tick grid, then derive reward FROM the snapped
+        # value so the displayed R:R and the broker price can never drift.
+        take_profit = round(round(float(_lvl["value"]) / tick) * tick, 10)
+        reward = (take_profit - entry) if direction == "Long" else (entry - take_profit)
+        if reward <= 0:
+            return no_plan("SWING target level is on the wrong side of entry.")
+        rr_ratio = reward / risk
+        if rr_ratio < min_rr:
+            return no_plan(
+                f"SWING target too close — {rr_ratio:.2f}:1 to the "
+                f"{_lvl.get('label', 'HTF level')}, below the {min_rr:.0f}:1 minimum.")
+        rr_num_val = round(rr_ratio, 2)
+        rr_str = f"{rr_num_val:g}:1"
+        swing_target_label = _lvl.get("label")
+    else:
+        take_profit = (entry + risk) if direction == "Long" else (entry - risk)
+        reward      = risk
+        rr_num_val  = 1.0
+        rr_str      = "1:1"
+    risk_dollars = round(risk * pv, 2)   # per contract risk (== profit at 1:1)
 
     zone_word = "demand" if direction == "Long" else "supply"
     side_word = "below" if direction == "Long" else "above"
     anchor_word = "VWAP" if anchored_on_vwap else f"{zone_word} zone"
+    if swing_htf_plan:
+        plan_reason = (f"{inst} {direction} — SWING {rr_str} R:R to "
+                       f"{swing_target_label or 'HTF level'}, ATR/structure stop "
+                       f"({risk:.1f} pts), {anchor_word}-anchored.")
+    else:
+        plan_reason = (f"{inst} {direction} — fixed 1:1 R:R, ATR/structure stop "
+                       f"({risk:.1f} pts), {anchor_word}-anchored.")
 
     # Two decimals serialises BOTH tick grids exactly (MNQ 0.25, MGC 0.1). One decimal
     # would silently destroy MNQ quarter-ticks (30022.75 → "30022.8", an invalid tick)
@@ -5617,27 +6309,26 @@ def build_strict_trade_plan(direction, ticker, current_price,
                     f"{anchor_word} invalidates the setup.")
     plan = {
         "trade_plan": True,
-        "reason": (f"{inst} {direction} — fixed 1:1 R:R, ATR/structure stop "
-                   f"({risk:.1f} pts), {anchor_word}-anchored."),
+        "reason": plan_reason,
         "entry_zone": f"{fmt(lo)}–{fmt(hi)}",
         "stop_loss":  fmt(stop),
         "target1":    fmt(take_profit),
-        # target2 MIRRORS the single 1:1 TP (kept present + equal so live consumers
+        # target2 MIRRORS the single broker TP (kept present + equal so live consumers
         # that read target2 — sizing, /enter, the execution gateway, the ACTIVE_TRADE
         # lifecycle — never KeyError/500). Display layers render one "Take Profit".
         "target2":    fmt(take_profit),
-        "rr":         "1:1",
+        "rr":         rr_str,
         "direction":  direction,
         "instrument": inst,
         "point_value": pv,
-        # ── Single-exit 1:1 model: deeper targets / partials / breakeven retired ──
+        # ── Single-exit model: deeper targets / partials / breakeven retired ──
         "target3":          None,
         "be_level":         None,
         "partial_level":    None,
         "runner_target":    None,
         "risk_points":      round(risk, 2),
         "reward_points":    round(reward, 2),
-        "rr_num":           1.0,
+        "rr_num":           rr_num_val,
         "max_invalidation": invalidation,
         # ── ATR dynamic-stop metadata (display/diagnostics; single source) ──
         "atr_pts":                   sp["atr_pts"],
@@ -5720,6 +6411,14 @@ def _apply_orb_target_override(result):
     untouched, so this can never crash the analysis pipeline or fabricate a target.
     """
     try:
+        # SWING (flag-on) owns its target geometry: build_strict_trade_plan already set
+        # an HTF-structure target at >= SWING_MIN_RR and the P4 entry veto confirmed
+        # higher-timeframe alignment. The fixed 1:4 ORB retarget is the ONE sanctioned
+        # exception to the legacy FIXED-1:1 rule — it must NEVER rewrite a confirmed
+        # SWING swing-target to an arbitrary 4R. SCALP / flag-off never enter here
+        # (_swing_htf_enabled requires SWING mode + flag), so they stay byte-identical.
+        if _swing_htf_enabled():
+            return
         se = result.get("strategy_engine") or {}
         if se.get("active_key") != "OPENING_RANGE_BREAKOUT":
             return
@@ -6146,6 +6845,80 @@ def _scalp_diag_block(a):
             "initial_risk_dollars": None, "planned_reward_pts": None, "rr": None,
             "runner_enabled": False, "chop_status": "unknown", "loss_le_first_target": None,
             "overall_pass": None, "be_moved": None, "exit_reason": None, "notes": [],
+        }
+
+
+def _swing_diag_block(a):
+    """Curated, DISPLAY-ONLY SWING diagnostics block for /status + the dashboard panel
+    (P7 / req 6). Mirrors compute_swing_context (the SAME HTF read the P4 gate saw, via
+    result['swing_context']) plus the open SWING managed trade's thesis (P5/P6), so the
+    dashboard can NEVER drift from the gate / lifecycle. FAIL-OPEN: any error degrades to
+    an inert disabled block so the render never breaks. Carries NO money-path authority --
+    it only mirrors what the gate / review already decided. `enabled` requires SWING
+    trading mode + the master flag, so in SCALP / flag-off the dashboard hides it."""
+    try:
+        enabled = bool(_swing_htf_enabled())
+        ctx  = (a or {}).get("swing_context") or {}
+        inst = (a or {}).get("active_ticker")
+        lvl  = ctx.get("daily_level_nearby") if isinstance(ctx.get("daily_level_nearby"), dict) else None
+        # Open SWING managed trade (if any) for the VIEWED instrument -> its thesis.
+        thesis, direction = None, None
+        try:
+            for mt in MANAGED_TRADES_BY_KEY.values():
+                if mt.get("closed") or not mt.get("is_swing"):
+                    continue
+                if inst is not None and mt.get("instrument") != inst:
+                    continue
+                t = mt.get("swing_thesis")
+                if isinstance(t, dict):
+                    thesis, direction = t, mt.get("direction")
+                    break
+        except Exception:
+            thesis, direction = None, None
+        status = (thesis or {}).get("status")
+        inval  = (thesis or {}).get("invalidation_level")
+        # Reason TO EXIT: once invalidated, the recorded exit reason; while holding, the
+        # forward-looking invalidation condition (what WOULD end the trade).
+        if not thesis:
+            reason_to_exit = None
+        elif status == "INVALID":
+            reason_to_exit = (thesis or {}).get("reason")
+        else:
+            _d = (direction or "Long").lower()
+            inval_disp = inval if inval is not None else "n/a"
+            reason_to_exit = ("1H+4H bias flips against the " + _d
+                              + ", or price breaches invalidation " + str(inval_disp) + ".")
+        return {
+            "enabled":              enabled,
+            "mode":                 TRADING_MODE,
+            "instrument":           inst,
+            "complete":             bool(ctx.get("complete")),
+            "stale":                bool(ctx.get("stale")),
+            "bias_1h":              ctx.get("bias_1h"),
+            "bias_4h":              ctx.get("bias_4h"),
+            "bias_daily":           ctx.get("bias_daily"),
+            "daily_level_nearby":   (lvl or {}).get("label"),
+            "has_thesis":           bool(thesis),
+            "trade_thesis":         (thesis or {}).get("original_thesis"),
+            "thesis_status":        status,
+            "invalidation_level":   inval,
+            "current_r":            (thesis or {}).get("current_r"),
+            "planned_rr":           (thesis or {}).get("planned_rr"),
+            "next_target":          (thesis or {}).get("next_target"),
+            "last_review_decision": (thesis or {}).get("last_review_decision"),
+            "next_review_at":       (thesis or {}).get("next_review_at"),
+            "reason_to_hold":       (thesis or {}).get("reason"),
+            "reason_to_exit":       reason_to_exit,
+        }
+    except Exception:
+        return {
+            "enabled": False, "mode": TRADING_MODE, "instrument": None,
+            "complete": False, "stale": False, "bias_1h": None, "bias_4h": None,
+            "bias_daily": None, "daily_level_nearby": None, "has_thesis": False,
+            "trade_thesis": None, "thesis_status": None, "invalidation_level": None,
+            "current_r": None, "planned_rr": None, "next_target": None,
+            "last_review_decision": None, "next_review_at": None,
+            "reason_to_hold": None, "reason_to_exit": None,
         }
 
 
@@ -7612,10 +8385,23 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     strict_reason    = strict.get("reason", "")
     strict_missing   = strict.get("missing", [])
 
+    # SWING higher-timeframe context — computed ONCE here (only under SWING + flag-on)
+    # and REUSED by the plan builder (target geometry), the P4 entry veto, the
+    # potential-plan preview, and the display attach below, so the gate and every
+    # surface read the SAME context (no drift). None in SCALP / flag-off → the builder
+    # falls through to its byte-identical 1:1 path and the veto block never runs.
+    swing_ctx = None
+    if _swing_htf_enabled(TRADING_MODE):
+        try:
+            swing_ctx = compute_swing_context(active_ticker, current_price)
+        except Exception:
+            swing_ctx = None
+
     if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
             volatility=volatility, mode=TRADING_MODE, vwap=vwap_value, edge_score=edge_score,
+            swing_context=swing_ctx,
         )
         if trade_plan["trade_plan"]:
             # EARLY READY (SCALP Edge 50-59) is actionable but half size / lower
@@ -7700,6 +8486,36 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 # setup's geometry + failing checks (recomputing after the plan is
                 # dropped below would read the nulled plan and lose them).
                 scalp_quality_block = _sq
+
+    # ── SWING entry MONEY-PATH vetoes (P4) ───────────────────────────────────────
+    # SWING-only + master-flag-gated, mirroring the SCALP veto block above. An
+    # Edge-/strict-actionable setup that fails higher-timeframe confirmation (1H+4H
+    # bias agreement, a daily key level with a valid pullback, fresh HTF data) becomes
+    # WAIT with a precise reason and NO trade plan — so neither the live card nor the
+    # execution gateway (which re-checks is_actionable from THIS verdict) can act on
+    # it. The ≥SWING_MIN_RR target + trade-side-zone requirements are already enforced
+    # inside build_strict_trade_plan (a failure there drops the plan → WAIT BEFORE this
+    # point, so is_actionable is already False); this block adds the HTF-confirmation
+    # gate the builder does not check and re-validates the rest defensively.
+    # FAIL-CLOSED: a broken check vetoes. SCALP / flag-off never enter (mutually
+    # exclusive modes), so those paths stay byte-identical.
+    if _swing_htf_enabled() and is_actionable(verdict) and strict_direction:
+        try:
+            _sv = _swing_entry_veto_reasons(swing_ctx, trade_plan, strict_direction)
+        except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
+            _sv = [("unavailable", f"SWING entry checks unavailable ({exc})")]
+        if _sv:
+            verdict       = "WAIT"
+            strict_label  = "WAIT"
+            strict_reason = "SWING filter: " + "; ".join(m for _, m in _sv) + "."
+            trade_plan = {
+                "trade_plan": False,
+                "reason":     strict_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": strict_direction,
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
 
     # get_setup_stage retained for lifecycle display context in the embed.
     setup_stage, stage_next_step, stage_entry_rule, stage_invalidation, stage_direction = get_setup_stage(
@@ -8140,6 +8956,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _pp = build_strict_trade_plan(
                 _d, active_ticker, current_price, nearest_supply, nearest_demand,
                 volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+                swing_context=swing_ctx,
             )
             if _pp.get("trade_plan"):
                 potential_plan = _pp
@@ -8297,6 +9114,18 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         _update_learning_snapshot(result, ticker_override)
     except Exception:
         pass
+
+    # ── SWING higher-timeframe context (P2 = DISPLAY-ONLY) ────────────────────
+    # Attached only under SWING + flag (SCALP / flag-off → key absent, byte-identical
+    # to today). REUSES the single `swing_ctx` computed once above so the gate (P4),
+    # the plan target geometry, the preview, and this display surface all read the
+    # SAME context (no drift, no redundant fetch). FAIL-OPEN for display: if the
+    # one-time precompute raised (swing_ctx is None), fall back to a stable schema so
+    # the dashboard still renders. Curated /status whitelisting + the dashboard
+    # module land in P7.
+    if _swing_htf_enabled():
+        result["swing_context"] = swing_ctx if isinstance(swing_ctx, dict) else {
+            "enabled": True, "complete": False, "stale": True, "error": "compute_failed"}
     return result
 
 
@@ -9229,6 +10058,95 @@ def _managed_trade_key(instrument, direction, entry_lo):
             datetime.now(timezone.utc).strftime("%Y-%m-%d"))
 
 
+def _build_swing_thesis(entry, mp, swing_ctx):
+    """Build the per-trade SWING thesis (DISPLAY / local-tracking ONLY — it never
+    feeds the strict gate, sizing, dedupe, or the /traderspost money path).
+
+    Sourced from the already-computed plan (mp) + the P4 swing_context so it can
+    never drift from what the gate actually saw. Fail-open: returns a stable-schema
+    dict even when swing_ctx is missing. Caller gates on _swing_htf_enabled().
+    """
+    ctx        = swing_ctx if isinstance(swing_ctx, dict) else {}
+    direction  = entry.get("direction") or (mp or {}).get("direction") or "Long"
+    instrument = entry.get("instrument") or "—"
+    stop       = (mp or {}).get("stop")
+    target     = (mp or {}).get("tp1")
+    planned_rr = entry.get("rr_num")
+    bias_1h    = ctx.get("bias_1h")
+    bias_4h    = ctx.get("bias_4h")
+    bias_daily = ctx.get("bias_daily")
+    lvl        = ctx.get("daily_level_nearby") if isinstance(ctx.get("daily_level_nearby"), dict) else {}
+    lvl_label  = lvl.get("label") if lvl else None
+    review_min = int(cfg_for("SWING", "SWING_REVIEW_INTERVAL_MIN"))
+    rr_str     = f"{planned_rr:.2f}" if isinstance(planned_rr, (int, float)) else "—"
+    thesis_text = (
+        f"{direction} {instrument} on HTF alignment "
+        f"(1H {bias_1h or '—'} / 4H {bias_4h or '—'} / Daily {bias_daily or '—'}); "
+        f"entry on pullback to {lvl_label or 'HTF structure'}, "
+        f"target {target if target is not None else '—'}, "
+        f"invalidation {stop if stop is not None else '—'}."
+    )
+    reason = (
+        f"1H+4H bias aligned {str(direction).lower()}; daily level "
+        f"{lvl_label or 'n/a'} respected; planned RR {rr_str}."
+    )
+    return {
+        "original_thesis":      thesis_text,
+        "status":               "VALID",
+        "reason":               reason,
+        "invalidation_level":   stop,
+        "next_target":          target,
+        "planned_rr":           planned_rr,
+        "current_r":            0.0,
+        "next_review_at":       (now_utc() + timedelta(minutes=review_min)).isoformat(),
+        "last_review_decision": None,
+        # HTF summary for the dashboard (display-only):
+        "bias_1h":              bias_1h,
+        "bias_4h":              bias_4h,
+        "bias_daily":           bias_daily,
+        "daily_level_nearby":   lvl_label,
+        "created_at":           now_utc().isoformat(),
+    }
+
+
+def _find_open_swing_managed_trade(instrument, direction, entry_lo):
+    """SWING (flag-on) cross-UTC-day dedup. _managed_trade_key embeds today's UTC
+    date, so a SWING setup reposted on a LATER day would mint a new key and spawn a
+    duplicate managed trade. Return an existing OPEN managed trade for the same
+    instrument+direction whose entry sits within ~1 risk-unit, so a multi-day hold
+    refreshes the SAME trade. Returns None when there is no close match (the caller
+    then registers a fresh trade)."""
+    try:
+        target_lo = float(entry_lo)
+    except (TypeError, ValueError):
+        return None
+    best, best_dist = None, None
+    for mt in MANAGED_TRADES_BY_KEY.values():
+        if mt.get("closed"):
+            continue
+        # Strictly SWING-local: never let a SWING repost reuse a non-SWING managed
+        # trade if mode/flag state shifts within one process.
+        if not mt.get("is_swing"):
+            continue
+        if mt.get("instrument") != instrument or mt.get("direction") != direction:
+            continue
+        me = mt.get("entry_lo")
+        if me is None:
+            continue
+        try:
+            dist = abs(float(me) - target_lo)
+        except (TypeError, ValueError):
+            continue
+        if best is None or dist < best_dist:
+            best, best_dist = mt, dist
+    if best is None:
+        return None
+    tol = best.get("risk_points") or (abs(target_lo) * 0.01) or 1.0
+    if best_dist is not None and best_dist > tol:
+        return None
+    return best
+
+
 def _register_managed_trade(entry, ticker=""):
     """Register (or refresh) a READY setup with the trade-management watcher.
 
@@ -9243,6 +10161,14 @@ def _register_managed_trade(entry, ticker=""):
     instrument = entry.get("instrument") or instrument_of(ticker or entry.get("symbol", ""))
     direction  = entry.get("direction") or mp.get("direction") or "Long"
     key = _managed_trade_key(instrument, direction, mp.get("entry_lo"))
+
+    # SWING (flag-on): a multi-day hold reposted on a LATER UTC day would otherwise
+    # mint a new date-stamped key and duplicate the trade — reuse the existing open
+    # SWING managed trade instead so its thesis + progress carry forward.
+    if _swing_htf_enabled() and key not in MANAGED_TRADES_BY_KEY:
+        _open_swing = _find_open_swing_managed_trade(instrument, direction, mp.get("entry_lo"))
+        if _open_swing is not None:
+            key = _open_swing["key"]
 
     # Light housekeeping: drop closed trades from previous UTC days.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -9266,6 +10192,10 @@ def _register_managed_trade(entry, ticker=""):
                                   "tp3", "be_level", "partial", "runner", "risk_points",
                                   "point_value", "tp1_pct", "tp2_pct", "runner_pct")})
                 existing["initial_stop"] = mp.get("stop")
+        # SWING (flag-on): keep the persisted snapshot current after a same-setup
+        # repost refresh (display / local-tracking only — no money-path effect).
+        if _swing_htf_enabled() and existing.get("is_swing"):
+            _persist_swing_thesis(existing)
         return existing
 
     mt = {
@@ -9293,8 +10223,21 @@ def _register_managed_trade(entry, ticker=""):
         # trade can be tagged with its regime/strategy/session/indicators at close.
         "learning_ctx": _capture_learning_ctx(instrument),
     }
+    # SWING (flag-on) only: attach the per-trade thesis (DISPLAY / local-tracking
+    # only — never feeds the gate, sizing, dedupe, or the /traderspost money path)
+    # and persist the trade so a multi-day hold survives a restart. SCALP / flag-off
+    # add NOTHING here → the mt dict stays byte-identical.
+    if _swing_htf_enabled():
+        try:
+            mt["is_swing"]     = True
+            mt["thesis_key"]   = uuid.uuid4().hex
+            mt["swing_thesis"] = _build_swing_thesis(entry, mp, entry.get("_swing_context"))
+        except Exception as exc:
+            logger.warning("SWING thesis build failed: %s", exc)
     MANAGED_TRADES_BY_KEY[key] = mt
     logger.info("Managed trade registered: %s %s entry≈%s", instrument, direction, mp.get("entry"))
+    if _swing_htf_enabled() and mt.get("is_swing"):
+        _persist_swing_thesis(mt)
     return mt
 
 
@@ -9561,6 +10504,210 @@ def _evaluate_dynamic_managed_levels(mt, bar):
             return
 
 
+def _swing_lifecycle_enabled(mt):
+    """True only when the SWING 15-min review lifecycle should drive THIS managed
+    trade. Gated on the per-trade is_swing stamp (set ONLY on flag-on SWING
+    registration) AND the SWING master flag, so SCALP / legacy / flag-off trades fall
+    through to the byte-identical SCALP-dynamic + legacy paths below. Fail-closed."""
+    try:
+        return bool(mt) and bool(mt.get("is_swing")) and _swing_htf_enabled()
+    except Exception:
+        return False
+
+
+def _swing_current_r(mt, price):
+    """Signed R of `price` vs entry on the ORIGINAL risk basis (display + review
+    thresholds). 0.0 when entry / risk / price is unavailable."""
+    entry = mt.get("entry")
+    risk  = mt.get("risk_points") or 0.0
+    if entry is None or price is None or not risk:
+        return 0.0
+    pts = (price - entry) if mt.get("direction") == "Long" else (entry - price)
+    try:
+        return round(pts / risk, 2)
+    except Exception:
+        return 0.0
+
+
+def _swing_review_due(thesis):
+    """True when the SWING review window (SWING_REVIEW_INTERVAL_MIN) has elapsed. A
+    missing / unparseable next_review_at reads as due (the apply step reschedules)."""
+    nxt = (thesis or {}).get("next_review_at")
+    if not nxt:
+        return True
+    try:
+        due = datetime.fromisoformat(nxt)
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        return now_utc() >= due
+    except Exception:
+        return True
+
+
+def _schedule_next_swing_review(thesis):
+    """Advance next_review_at one SWING_REVIEW_INTERVAL_MIN window into the future."""
+    if not isinstance(thesis, dict):
+        return
+    try:
+        mins = int(cfg_for("SWING", "SWING_REVIEW_INTERVAL_MIN"))
+    except Exception:
+        mins = 15
+    thesis["next_review_at"] = (now_utc() + timedelta(minutes=mins)).isoformat()
+
+
+def _derive_swing_review_decision(mt, bar, ctx):
+    """Decide HOLD / REDUCE / MOVE_STOP / EXIT for a DUE SWING review from the thesis
+    + the live HTF context. FAIL-OPEN: missing / incomplete / stale HTF defaults HOLD
+    so a feed hiccup can never force a spurious discretionary exit (the hard terminal
+    stop is honored separately on every bar)."""
+    is_long = mt.get("direction") == "Long"
+    cur_r   = _swing_current_r(mt, bar.get("close"))
+
+    if not isinstance(ctx, dict) or not ctx.get("complete") or ctx.get("stale"):
+        return "HOLD"
+
+    aligned_long  = bool(ctx.get("aligned_long"))
+    aligned_short = bool(ctx.get("aligned_short"))
+
+    # EXIT: 1H+4H bias has FULLY flipped against the position -> thesis invalidated.
+    if (is_long and aligned_short) or ((not is_long) and aligned_long):
+        return "EXIT"
+
+    # REDUCE (once, in non-loss): trade-side 1H/4H alignment no longer intact, or the
+    # Daily bias opposes -> weakening but not a full flip.
+    trade_side_intact = aligned_long if is_long else aligned_short
+    daily_opposes     = ctx.get("bias_daily") == ("bear" if is_long else "bull")
+    if (not trade_side_intact or daily_opposes) and cur_r >= 0 and not mt.get("swing_reduced"):
+        return "REDUCE"
+
+    # MOVE STOP (once): >=1R in profit with the stop still beyond entry -> trail to BE.
+    entry = mt.get("entry")
+    stop  = mt.get("stop")
+    stop_beyond_entry = (stop is not None and entry is not None
+                         and ((stop < entry) if is_long else (stop > entry)))
+    if cur_r >= 1.0 and stop_beyond_entry and not mt.get("swing_stop_moved"):
+        return "MOVE_STOP"
+
+    return "HOLD"
+
+
+def _apply_swing_review_decision(mt, decision, bar, ctx):
+    """Apply a SWING review decision. Always refreshes the thesis (status / reason /
+    current_r / last_review_decision / HTF summary) + reschedules + persists. LOCAL
+    state mutations that change the money outcome (stop move, early EXIT close) apply
+    ONLY when execution is NOT live -- a live broker holds a single bracket, so those
+    decisions are Discord/dashboard ADVISORY there (never book exposure the broker did
+    not take, mirroring the SCALP dynamic gate). FAIL-OPEN."""
+    thesis = mt.get("swing_thesis")
+    if not isinstance(thesis, dict):
+        return
+    close   = bar.get("close")
+    is_long = mt.get("direction") == "Long"
+    cur_r   = _swing_current_r(mt, close)
+    try:
+        live = execution_is_live(resolve_execution_mode())
+    except Exception:
+        live = False
+
+    # Refresh the live HTF summary on the thesis (display-only).
+    if isinstance(ctx, dict):
+        thesis["bias_1h"]    = ctx.get("bias_1h")
+        thesis["bias_4h"]    = ctx.get("bias_4h")
+        thesis["bias_daily"] = ctx.get("bias_daily")
+        _lvl = ctx.get("daily_level_nearby") if isinstance(ctx.get("daily_level_nearby"), dict) else None
+        if _lvl:
+            thesis["daily_level_nearby"] = _lvl.get("label")
+    thesis["current_r"]            = cur_r
+    thesis["last_review_decision"] = decision
+
+    if decision == "EXIT":
+        thesis["status"] = "INVALID"
+        thesis["reason"] = "1H+4H HTF bias flipped against the position; thesis invalidated."
+        if not live:
+            outcome = "Win" if cur_r > 0 else ("Loss" if cur_r < 0 else "Breakeven")
+            _send_management_update(
+                mt, "SWING review \u2192 EXIT",
+                f"Thesis invalidated (HTF bias flipped). Exiting at {close} ({cur_r:+.2f}R).")
+            # _close_managed_trade re-persists the (now closed) thesis (P5 close path).
+            _close_managed_trade(mt, outcome, f"SWING thesis exit ({cur_r:+.2f}R)", close)
+            return
+        if not mt.get("swing_exit_advised"):
+            mt["swing_exit_advised"] = True
+            _send_management_update(
+                mt, "SWING review \u2192 EXIT (advisory)",
+                f"Thesis invalidated (HTF bias flipped). Broker bracket still live \u2014 "
+                f"consider a manual exit ({cur_r:+.2f}R).")
+    elif decision == "REDUCE":
+        thesis["status"] = "WEAKENING"
+        thesis["reason"] = "HTF alignment weakening (not a full flip); reduce risk."
+        mt["swing_reduced"] = True
+        _send_management_update(
+            mt, "SWING review \u2192 REDUCE",
+            f"HTF alignment weakening \u2014 consider trimming / reducing risk ({cur_r:+.2f}R).")
+    elif decision == "MOVE_STOP":
+        entry = mt.get("entry")
+        mt["swing_stop_moved"] = True
+        thesis["status"] = "VALID"
+        if (not live) and entry is not None:
+            mt["stop"] = entry
+            thesis["invalidation_level"] = entry
+            _send_management_update(
+                mt, "SWING review \u2192 MOVE STOP",
+                f"In +{cur_r:.2f}R \u2014 stop moved to break-even ({entry}).")
+        else:
+            _send_management_update(
+                mt, "SWING review \u2192 MOVE STOP (advisory)",
+                f"In +{cur_r:.2f}R \u2014 move stop to break-even ({entry}).")
+    else:  # HOLD (silent -- no Discord, just refresh the thesis + reschedule)
+        thesis["status"] = "VALID"
+        thesis["reason"] = "HTF thesis intact; holding."
+
+    _schedule_next_swing_review(thesis)
+    try:
+        _persist_swing_thesis(mt)
+    except Exception as exc:
+        logger.warning("SWING review persist error: %s", exc)
+
+
+def _evaluate_swing_managed_levels(mt, bar):
+    """SWING (flag-on) managed-trade walk for ONE bar. Caller has gated on
+    _swing_lifecycle_enabled. Every bar honors the terminal stop FIRST (hard
+    invalidation; an ambiguous bar resolves against the trade) then banks the single
+    broker TP target immediately (a hit profit target is not an adverse-candle
+    discretionary exit, and local state must mirror the one broker TP). The
+    discretionary HOLD/REDUCE/MOVE-STOP/EXIT thesis review fires at most once per
+    SWING_REVIEW_INTERVAL_MIN window. MFE/MAE already updated by the caller."""
+    high, low = bar.get("high"), bar.get("low")
+    close     = bar.get("close")
+    is_long   = mt.get("direction") == "Long"
+
+    # 1) Terminal stop (hard invalidation; honored every bar).
+    stop = mt.get("stop")
+    if stop is not None and high is not None and low is not None:
+        if (low <= stop) if is_long else (high >= stop):
+            _close_managed_trade(mt, "Loss", "Loss (stop hit)", stop)
+            return
+
+    # 2) Broker TP target (banked immediately to mirror the single broker TP).
+    tp1 = mt.get("tp1")
+    if tp1 is not None and high is not None and low is not None:
+        if (high >= tp1) if is_long else (low <= tp1):
+            _close_managed_trade(mt, "Win", "Win (target hit)", tp1)
+            return
+
+    # 3) 15-min discretionary thesis review (cadence-gated; fail-open).
+    thesis = mt.get("swing_thesis")
+    if not isinstance(thesis, dict) or not _swing_review_due(thesis):
+        return
+    try:
+        ctx = compute_swing_context(mt.get("instrument"), close)
+    except Exception as exc:
+        logger.warning("SWING review HTF read failed (%s): %s", mt.get("key"), exc)
+        ctx = None
+    decision = _derive_swing_review_decision(mt, bar, ctx)
+    _apply_swing_review_decision(mt, decision, bar, ctx)
+
+
 def _evaluate_managed_trade_levels(mt, bar):
     """Walk one managed trade through its plan using a single OHLC bar.
 
@@ -9582,6 +10729,15 @@ def _evaluate_managed_trade_levels(mt, bar):
             fav, adv = entry - low, high - entry
         mt["mfe"] = round(max(mt["mfe"], fav, 0.0), 4)
         mt["mae"] = round(max(mt["mae"], adv, 0.0), 4)
+
+    # ── SWING (flag-on) 15-min thesis review lifecycle: terminal stop + the single
+    # broker TP banked every bar; discretionary HOLD/REDUCE/MOVE-STOP/EXIT only at the
+    # 15-min review. Gated on is_swing (set ONLY on flag-on SWING registration) so
+    # SCALP / legacy / flag-off fall through to the byte-identical SCALP-dynamic +
+    # legacy paths below. ──
+    if _swing_lifecycle_enabled(mt):
+        _evaluate_swing_managed_levels(mt, bar)
+        return
 
     # ── SCALP dynamic multi-leg exit lifecycle (req 3/4): partial scale at TP1/TP2/
     # runner + delayed break-even. Gated to SCALP + master flag + local/paper exec +
@@ -9653,6 +10809,17 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
         _record_strategy_trade(mt)
     except Exception as exc:
         logger.warning("strategy-trade persist error: %s", exc)
+
+    # ── SWING (flag-on) multi-day persistence: mark the thesis row closed so a
+    # stopped/TP'd SWING trade is NOT resurrected as OPEN on the next boot (the
+    # rehydrate query selects WHERE closed = FALSE). Gated on is_swing (set only on
+    # SWING flag-on registration) so SCALP / legacy closes are byte-identical; the
+    # mt already carries closed=True/closed_at/r_multiple here. FAIL-OPEN. ──
+    if mt.get("is_swing"):
+        try:
+            _persist_swing_thesis(mt)
+        except Exception as exc:
+            logger.warning("swing thesis close-persist error: %s", exc)
 
     # ── Option C (S4): a SCALP dynamic PAPER auto trade has NO ACTIVE_TRADE slot —
     # this managed lifecycle is its sole authority — so reproduce the post-outcome
@@ -10659,6 +11826,11 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["rejected_reasons"]      = a.get("rejected_reasons") or a.get("strict_missing")
     entry["alert_diagnostics"]     = a.get("alert_diagnostics")
     entry["decision_support"]      = a.get("decision_support") or _decision_support(entry)
+    # SWING (flag-on) only: carry the P4-computed HTF context onto the entry so the
+    # managed-trade register can build a per-trade thesis WITHOUT recomputing it
+    # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
+    if _swing_htf_enabled():
+        entry["_swing_context"] = a.get("swing_context")
     return entry
 
 
@@ -10856,6 +12028,163 @@ def _load_journal_from_db(limit=500):
                     len(JOURNAL), "y" if len(JOURNAL) == 1 else "ies")
     except Exception as exc:
         logger.warning("journal load failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── SWING thesis persistence (multi-day, restart-safe) ──────────────────────────
+# Same convention as the journal / learning engine: app-side INSERT/SELECT ONLY,
+# NO in-app DDL (the swing_theses table is created via the database tool in dev +
+# the Publish schema-diff in prod). The persisted snapshot is DISPLAY / local-
+# tracking ONLY — it NEVER feeds the strict gate, sizing, dedupe, or the
+# /traderspost money path. FAIL-OPEN throughout.
+SWING_THESIS_DB_READY = False
+
+
+def _check_swing_thesis_db_ready():
+    """Probe the swing_theses table (no DDL) and set SWING_THESIS_DB_READY. FAIL-OPEN:
+    a missing table / unavailable DB disables SWING persistence (in-memory only)."""
+    global SWING_THESIS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM swing_theses LIMIT 1")
+            cur.fetchone()
+        SWING_THESIS_DB_READY = True
+        logger.info("swing_theses table ready")
+    except Exception as exc:
+        logger.warning("swing_theses table unavailable (SWING persistence disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _swing_json_safe(obj):
+    """Deep JSON-safe copy for a managed-trade snapshot: sets/tuples -> lists,
+    non-finite floats -> None. (events_sent is a set; the managed-trade key is a
+    tuple — both must be JSON-encodable for the JSONB payload.)"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _swing_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_swing_json_safe(v) for v in obj]
+    return obj
+
+
+def _swing_mt_snapshot(mt):
+    """Whitelisted, JSON-safe snapshot of a SWING managed trade for persistence.
+    Captures levels, progress flags, MFE/MAE, events_sent, closed state and the
+    thesis so the watcher + 15-min review fully rehydrate after a restart."""
+    keys = (
+        "key", "instrument", "direction", "symbol",
+        "entry", "entry_lo", "entry_hi", "stop", "tp1", "tp2", "tp3",
+        "be_level", "partial", "runner", "tp1_pct", "tp2_pct", "runner_pct",
+        "risk_points", "point_value", "registered_at", "updates",
+        "mfe", "mae", "be_active", "closed", "initial_stop",
+        "remaining_pct", "realized_r", "tp1_hit", "tp2_hit", "runner_hit",
+        "be_moved", "exit_reason", "trade_strength", "edge_score", "journal_id",
+        "thesis_key", "swing_thesis", "is_swing",
+        "swing_reduced", "swing_stop_moved", "swing_exit_advised",
+        "auto_setup_key", "auto_exec_status", "auto_opened_at",
+    )
+    snap = {k: mt.get(k) for k in keys if k in mt}
+    snap["events_sent"] = list(mt.get("events_sent") or [])
+    return _swing_json_safe(snap)
+
+
+def _persist_swing_thesis(mt):
+    """Upsert a SWING managed trade's snapshot by thesis_key. FAIL-OPEN; the DB
+    write is offloaded to the slow-task worker so a stall never delays trade
+    management. The snapshot is captured synchronously (so a later mutation of the
+    same trade can't corrupt this write)."""
+    if not SWING_THESIS_DB_READY or not mt or not mt.get("thesis_key"):
+        return
+    key        = mt["thesis_key"]
+    snapshot   = _swing_mt_snapshot(mt)
+    status     = (mt.get("swing_thesis") or {}).get("status")
+    closed     = bool(mt.get("closed"))
+    instrument = mt.get("instrument")
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO swing_theses (thesis_key, payload, status, closed, instrument)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (thesis_key)
+                       DO UPDATE SET payload    = EXCLUDED.payload,
+                                     status     = EXCLUDED.status,
+                                     closed     = EXCLUDED.closed,
+                                     instrument = EXCLUDED.instrument,
+                                     updated_at = now()""",
+                    (key, psycopg2.extras.Json(snapshot), status, closed, instrument),
+                )
+        except Exception as exc:
+            logger.warning("swing thesis persist failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _restore_swing_mt_snapshot(payload):
+    """Rebuild an in-memory managed-trade dict from a persisted snapshot. events_sent
+    back to a set, key back to a tuple. INERT: the caller inserts it straight into
+    MANAGED_TRADES_BY_KEY without firing any alert / journal / broker side-effect."""
+    if not isinstance(payload, dict):
+        return None
+    mt = dict(payload)
+    mt["events_sent"] = set(mt.get("events_sent") or [])
+    k = mt.get("key")
+    if isinstance(k, list):
+        mt["key"] = tuple(k)
+    mt["source"]        = "postgres"
+    mt["rehydrated_at"] = now_utc().isoformat()
+    return mt
+
+
+def _load_swing_theses_from_db():
+    """Rehydrate OPEN SWING managed trades from Postgres at boot so multi-day holds
+    survive a restart. SWING flag-on ONLY; runs BEFORE the webhook worker + watcher.
+    FAIL-OPEN. INERT — directly populates MANAGED_TRADES_BY_KEY (never calls
+    _register_managed_trade / send_live_ready_card / journal / broker)."""
+    if not SWING_THESIS_DB_READY or not _swing_htf_enabled():
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM swing_theses WHERE closed = FALSE ORDER BY updated_at DESC"
+            )
+            rows = cur.fetchall()
+        restored = 0
+        for (payload,) in rows:
+            mt = _restore_swing_mt_snapshot(payload)
+            if mt is None or not mt.get("key") or mt.get("closed") or not mt.get("is_swing"):
+                continue
+            MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+            restored += 1
+        logger.info("SWING theses restored from DB: %d open", restored)
+    except Exception as exc:
+        logger.warning("swing thesis load failed: %s", exc)
     finally:
         try:
             conn.close()
@@ -12811,6 +14140,16 @@ def webhook():
             RVOL_BY_TICKER[resolved_inst] = {"value": rvol_val,
                                              "ts": now_utc().isoformat()}
 
+    # ── Inbound HTF (1H/4H/1D) chart push (P3) — SWING display-only overlay ───────
+    #    Recognised ONLY when the alert EXPLICITLY tags a higher-timeframe field
+    #    (timeframe/interval/tf). A no-op in SCALP / flag-off (returns before any
+    #    write). Additive + fail-open; never affects the gate (P4 reads the same
+    #    compute_swing_context()). A bare 1m/5m alert is NEVER promoted to HTF.
+    try:
+        _ingest_htf_overlay(data, resolved_inst, normalized)
+    except Exception:
+        pass
+
     # ── Data-only stores (CVD / volume-spike) ingest FIRST — flag-independent ─────
     #    These run BEFORE the dual-TF convergence record/enqueue below so the CVD
     #    committed-state + volume-spike timestamp the triggering confirmation just
@@ -13716,6 +15055,7 @@ def status():
         "rejected_reasons":    a.get("rejected_reasons"),
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "scalp_diagnostics":   _scalp_diag_block(a),
+        "swing_diagnostics":   _swing_diag_block(a),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
         "equity_curve_today":  a.get("equity_curve_today"),
@@ -15093,6 +16433,28 @@ def dashboard():
   <div class="se-reason" id="sd-notes"></div>
 </div>
 
+<!-- SWING thesis diagnostics (P7 / req 6 — DISPLAY-ONLY; hidden unless SWING + SWING_HTF_ENABLED) -->
+<div class="mod" id="mod-swingdiag" style="display:none">
+  <div class="mod-h">🌊 SWING Diagnostics <span id="swd-status" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Mode</div><div class="v" id="swd-mode">—</div></div>
+    <div class="gstat"><div class="l">1H Bias</div><div class="v" id="swd-b1h">—</div></div>
+    <div class="gstat"><div class="l">4H Bias</div><div class="v" id="swd-b4h">—</div></div>
+    <div class="gstat"><div class="l">Daily Level</div><div class="v" id="swd-dlvl">—</div></div>
+    <div class="gstat"><div class="l">Current R</div><div class="v" id="swd-curr">—</div></div>
+    <div class="gstat"><div class="l">Planned RR</div><div class="v" id="swd-rr">—</div></div>
+    <div class="gstat"><div class="l">Next Target</div><div class="v" id="swd-tgt">—</div></div>
+    <div class="gstat"><div class="l">Invalidation</div><div class="v" id="swd-inval">—</div></div>
+    <div class="gstat"><div class="l">Last Review</div><div class="v" id="swd-review">—</div></div>
+  </div>
+  <div class="se-bias-h">Trade Thesis</div>
+  <div class="se-reason" id="swd-thesis"></div>
+  <div class="se-bias-h">Reason To Hold</div>
+  <div class="se-reason" id="swd-hold"></div>
+  <div class="se-bias-h">Reason To Exit</div>
+  <div class="se-reason" id="swd-exit"></div>
+</div>
+
 <!-- Multi-strategy engine (Phase 1 — display-only; existing gate stays authoritative) -->
 <div class="mod" id="mod-strategy">
   <div class="mod-h">🎛️ Strategy Engine <span id="se-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
@@ -15947,6 +17309,48 @@ function renderModules(d){
       if (sdn){
         const notes = sd.notes || [];
         sdn.innerHTML = notes.length ? notes.map(function(n){ return '\u26a0 '+_modEsc(n); }).join('<br>') : '';
+      }
+    }
+  }
+
+  // ── Module: SWING Diagnostics (P7 / req 6 — DISPLAY-ONLY mirror of the HTF gate + per-trade thesis) ──
+  const swd = d.swing_diagnostics || {};
+  const swMod = document.getElementById('mod-swingdiag');
+  if (swMod){
+    if (!swd.enabled){
+      swMod.style.display = 'none';
+    } else {
+      swMod.style.display = '';
+      const _swSet = function(id, txt, col){
+        const e=document.getElementById(id);
+        if(e){ e.textContent = (txt==null||txt==='') ? '—' : txt; e.style.color = col || ''; }
+      };
+      const _swBias = function(id, b){
+        _swSet(id, b ? (b.charAt(0).toUpperCase()+b.slice(1)) : '—',
+               b==='bull'?'#22c55e':b==='bear'?'#ef4444':'');
+      };
+      _swSet('swd-mode', swd.mode || '—', '');
+      _swBias('swd-b1h', swd.bias_1h);
+      _swBias('swd-b4h', swd.bias_4h);
+      _swSet('swd-dlvl', swd.daily_level_nearby || '—', '');
+      _swSet('swd-curr', swd.current_r==null ? '—' : ((swd.current_r>0?'+':'')+swd.current_r+'R'),
+             swd.current_r>0?'#22c55e':swd.current_r<0?'#ef4444':'');
+      _swSet('swd-rr', swd.planned_rr==null ? '—' : ('1:'+swd.planned_rr), '');
+      _swSet('swd-tgt', swd.next_target==null ? '—' : swd.next_target, '');
+      _swSet('swd-inval', swd.invalidation_level==null ? '—' : swd.invalidation_level, '');
+      _swSet('swd-review', swd.last_review_decision || 'Pending', '');
+      const _swHtml = function(id, txt){
+        const e=document.getElementById(id);
+        if(e){ e.innerHTML = txt ? _modEsc(txt) : '—'; }
+      };
+      _swHtml('swd-thesis', swd.has_thesis ? swd.trade_thesis : 'No open SWING trade — live HTF bias only.');
+      _swHtml('swd-hold', swd.reason_to_hold);
+      _swHtml('swd-exit', swd.reason_to_exit);
+      const swst=document.getElementById('swd-status');
+      if (swst){
+        const st = swd.thesis_status;
+        swst.textContent = st || (swd.has_thesis ? '' : 'NO TRADE');
+        swst.style.color = st==='VALID'?'#22c55e':st==='WEAKENING'?'#f59e0b':st==='INVALID'?'#ef4444':'#6b7280';
       }
     }
   }
@@ -17658,6 +19062,9 @@ if __name__ == "__main__":
     if LEARNING_DB_ENABLED:
         _check_journal_db_ready()                  # probe journal_entries (no DDL; table created via DB tool/publish diff)
         _load_journal_from_db()                    # restore today's journal so EOD survives restarts (BEFORE the worker)
+        if _swing_htf_enabled():                   # SWING flag-on only — SCALP boot stays untouched
+            _check_swing_thesis_db_ready()         # probe swing_theses (no DDL; table created via DB tool/publish diff)
+            _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
