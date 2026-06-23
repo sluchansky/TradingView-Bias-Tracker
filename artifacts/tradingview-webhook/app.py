@@ -49,7 +49,17 @@ def _log_incoming_request():
         (_redact(body)[:500] if body else "<empty>"),
     )
 
-ALERT_HISTORY    = deque(maxlen=100)
+# Widened from 100 so a high-frequency instrument can't evict a quiet
+# instrument's recent alerts from the shared scoring window (per-asset isolation).
+# Byte-identity for MGC is preserved because every consumer is bounded:
+#   • SCALP scoring is time-windowed (SCORE_WINDOW_MIN) — a deeper buffer only
+#     retains MORE in-window history under a multi-asset burst, never less.
+#   • The READY gate (evaluate_strict_setup) reads a time-window or the last 8.
+#   • The one unbounded legacy scan (calculate_scores, SWING) is capped at the
+#     original 100 there, so its mixed-instrument score is unchanged.
+# A per-instrument deque was rejected on purpose: the legacy score is computed
+# across ALL instruments' alerts, so splitting it would CHANGE MGC's score.
+ALERT_HISTORY    = deque(maxlen=1000)
 CURRENT_PRICE    = None
 CURRENT_PRICE_BY_TICKER = {}   # {"MNQ": float, "MGC": float} — latest price per instrument (alert-driven)
 CURRENT_PRICE_TS_BY_TICKER = {}  # {"MNQ": iso8601} — UTC time the alert price above was last set
@@ -58,10 +68,77 @@ CURRENT_PRICE_TS_BY_TICKER = {}  # {"MNQ": iso8601} — UTC time the alert price
 # during quiet markets, and is NEVER read by the gate / scoring (which stay on the
 # authoritative alert-driven price above).
 AUTO_PRICE_BY_TICKER = {}      # {"MNQ": {"value": float, "ts": iso8601}}
-ACTIVE_TRADE     = None
-# Serialises the ENTER critical section so two concurrent ENTER requests can
-# never race on the ACTIVE_TRADE record.
+# ── Per-instrument active-trade tracking ───────────────────────────────────
+# Each enabled instrument tracks at most ONE locally-managed position, so an open
+# position on one asset can NEVER block evaluation / alerts / a new entry on
+# another (SCALP "stacking" stays broker-level via AUTO_FIRED_KEYS; the local
+# tracker is one slot per instrument). All access goes through the helper API
+# below under ACTIVE_TRADES_LOCK — never hold the lock across Discord / broker /
+# network calls (snapshot under the lock, do slow work outside, then
+# compare-and-clear by opened_at so a newer trade is never wiped).
+ACTIVE_TRADES_BY_INST = {}                 # inst -> single trade dict
+ACTIVE_TRADES_LOCK    = threading.RLock()
+# Retained (now unused): historical ENTER serialisation lock. Writes now go
+# through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
+
+
+def active_trade_for(inst):
+    """Return the tracked trade dict for instrument `inst`, or None."""
+    if not inst:
+        return None
+    with ACTIVE_TRADES_LOCK:
+        return ACTIVE_TRADES_BY_INST.get(inst)
+
+
+def any_active_trade():
+    """Return one active trade for legacy/aggregate DISPLAY use, or None. With
+    several open, returns the most recently opened (by opened_at)."""
+    with ACTIVE_TRADES_LOCK:
+        if not ACTIVE_TRADES_BY_INST:
+            return None
+        return max(ACTIVE_TRADES_BY_INST.values(),
+                   key=lambda t: t.get("opened_at") or "")
+
+
+def active_trade_count():
+    """Number of instruments currently holding a tracked position."""
+    with ACTIVE_TRADES_LOCK:
+        return len(ACTIVE_TRADES_BY_INST)
+
+
+def set_active_trade(inst, trade, overwrite=True):
+    """Store `trade` as instrument `inst`'s tracked position. With overwrite=False
+    an existing position for that instrument is preserved (returns False)."""
+    if not inst:
+        return False
+    with ACTIVE_TRADES_LOCK:
+        if not overwrite and inst in ACTIVE_TRADES_BY_INST:
+            return False
+        ACTIVE_TRADES_BY_INST[inst] = trade
+        return True
+
+
+def clear_active_trade(inst, opened_at=None):
+    """Clear instrument `inst`'s tracked position and return it (or None). When
+    `opened_at` is given it is a compare-and-clear: the slot is cleared only if the
+    stored trade still carries that opened_at, so a newer trade opened meanwhile
+    (e.g. a re-entry after a stop-out) is never wiped by a stale clear."""
+    if not inst:
+        return None
+    with ACTIVE_TRADES_LOCK:
+        cur = ACTIVE_TRADES_BY_INST.get(inst)
+        if cur is None:
+            return None
+        if opened_at is not None and cur.get("opened_at") != opened_at:
+            return None
+        return ACTIVE_TRADES_BY_INST.pop(inst, None)
+
+
+def active_trade_snapshot():
+    """Shallow {inst: trade} copy for safe iteration outside the lock."""
+    with ACTIVE_TRADES_LOCK:
+        return dict(ACTIVE_TRADES_BY_INST)
 LAST_ALERT_AT    = None   # datetime of most recent recognized/scored webhook alert (UTC)
 LAST_WEBHOOK_AT  = None   # datetime of most recent inbound POST /webhook (UTC), ANY type
 LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live card sent (UTC)
@@ -650,7 +727,12 @@ ASSETS = {
         "account_size": 100_000,               # mirrors MNQ (index micro); per-asset risk tuning later
         "profiles":     {"Conservative": 0.005, "Standard": 0.010},
         "index_confirm": True,                 # MES participates in cross-market index confirmation
-        "safety": {},                          # per-asset safety controls (populated in a later phase)
+        # Per-asset safety policy SEED (the runtime EMERGENCY_DISABLED map is seeded
+        # from this on every boot). MES/MYM ship emergency-disabled until the operator
+        # explicitly arms them; all other limits fall back to SAFETY_DEFAULTS (legacy
+        # globals). All keys: maxTradesPerDay, maxContracts, maxDailyLoss, maxOpenTrades,
+        # cooldownAfterLoss, cooldownAfterWin, emergencyDisable.
+        "safety": {"emergencyDisable": True},
         "specs": {
             # CME Micro E-mini S&P 500: $5/point, 0.25 tick. tp1/2/3 are vestigial
             # display fallbacks (live plans compute their own 1:1 targets).
@@ -676,7 +758,9 @@ ASSETS = {
         "account_size": 100_000,               # mirrors MNQ (index micro); per-asset risk tuning later
         "profiles":     {"Conservative": 0.005, "Standard": 0.010},
         "index_confirm": True,                 # MYM participates in cross-market index confirmation
-        "safety": {},                          # per-asset safety controls (populated in a later phase)
+        # Per-asset safety policy SEED — see MES above. MYM ships emergency-disabled
+        # until the operator arms it; other limits fall back to SAFETY_DEFAULTS.
+        "safety": {"emergencyDisable": True},
         "specs": {
             # CME Micro E-mini Dow: $0.50/point, 1.0 tick. tp1/2/3 are vestigial
             # display fallbacks (live plans compute their own 1:1 targets).
@@ -1001,6 +1085,207 @@ def _auto_trade_bump_count(inst):
     key = (fmt_et(now_utc(), "%Y-%m-%d"), inst)
     with AUTO_TRADE_LOCK:
         _AUTO_TRADE_COUNT[key] = _AUTO_TRADE_COUNT.get(key, 0) + 1
+
+
+# ── Per-asset safety controls (money path) ───────────────────────────────────
+# Every asset gets independently-enforced safety limits. The DEFAULTS below equal
+# today's global behaviour, so MGC/MNQ (which declare no per-asset overrides) stay
+# byte-identical: maxTradesPerDay == the global auto cap, maxContracts == the global
+# server contract ceiling, and every other control defaults to OFF (None / 0 /
+# False). MES/MYM ship emergency-disabled (registry seed) until the operator arms
+# them. All money-path helpers take a STRICT (already-resolved) instrument and fail
+# CLOSED on anything unknown — never the lenient instrument_of() default.
+SAFETY_DEFAULTS = {
+    "maxTradesPerDay":   AUTO_TRADE_MAX_PER_DAY,   # per-day AUTO entry cap (ET day)
+    "maxContracts":      TRADERSPOST_MAX_CONTRACTS,# hard server contract ceiling
+    "maxDailyLoss":      None,                     # USD; None => no daily-loss cap
+    "maxOpenTrades":     None,                     # None => legacy one-slot behaviour
+    "cooldownAfterLoss": 0,                        # seconds; 0 => no post-loss cooldown
+    "cooldownAfterWin":  0,                        # seconds; 0 => no post-win cooldown
+    "emergencyDisable":  False,                    # per-asset money-path kill switch
+}
+
+# Runtime per-asset kill switch, SEEDED from the registry safety block on every
+# boot (so MES/MYM come back emergency-disabled after a restart — fail-safe toward
+# NOT trading). Mutable at runtime via /auto-trade. Guarded by AUTO_TRADE_LOCK (the
+# same arming domain); SAFETY_LOCK below must never nest under AUTO_TRADE_LOCK.
+EMERGENCY_DISABLED = {
+    inst: bool((ASSETS[inst].get("safety") or {}).get("emergencyDisable", False))
+    for inst in enabled_instruments()
+}
+
+# Per-asset post-outcome cooldown timestamps. {inst: {"until": epoch, "reason": str}}.
+# In-memory by design (a restart clears all cooldowns — fail-safe toward allowing a
+# trade, never silently blocking forever).
+SAFETY_LOCK = threading.Lock()
+_OUTCOME_COOLDOWN = {}
+
+
+def safety_cfg(inst, key):
+    """STRICT per-asset safety read for the money path. `inst` MUST be a canonical
+    registry key (callers pre-resolve). Layer: per-asset ASSETS[inst]['safety'][key]
+    -> SAFETY_DEFAULTS[key]. Unknown key -> None."""
+    sd = (ASSETS.get(inst) or {}).get("safety") or {}
+    if key in sd:
+        return sd[key]
+    return SAFETY_DEFAULTS.get(key)
+
+
+def emergency_disabled(inst):
+    """True iff `inst`'s money path is emergency-disabled. Unknown instrument ->
+    True (fail-closed)."""
+    if inst not in ASSETS:
+        return True
+    with AUTO_TRADE_LOCK:
+        return bool(EMERGENCY_DISABLED.get(inst, False))
+
+
+def max_trades_per_day(inst):
+    """Per-asset daily AUTO entry cap. Unknown instrument -> 0 (blocks)."""
+    if inst not in ASSETS:
+        return 0
+    try:
+        return max(0, int(safety_cfg(inst, "maxTradesPerDay")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def max_contracts(inst):
+    """Per-asset hard contract ceiling. Unknown instrument -> 0 (blocks)."""
+    if inst not in ASSETS:
+        return 0
+    try:
+        return max(0, int(safety_cfg(inst, "maxContracts")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def max_open_trades(inst):
+    """Per-asset open-position cap. None => legacy one-slot behaviour (no extra
+    block). A configured positive value blocks a new entry while a tracked position
+    exists (effective 1 today — local tracking is a single slot per instrument).
+    Unknown instrument -> 0 (blocks)."""
+    if inst not in ASSETS:
+        return 0
+    v = safety_cfg(inst, "maxOpenTrades")
+    if v is None:
+        return None
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def max_daily_loss(inst):
+    """Per-asset realized daily-loss cap as a POSITIVE USD magnitude. None => no
+    cap (the default). Unknown instrument -> 0.0 (any realized loss trips it =>
+    fail-closed)."""
+    if inst not in ASSETS:
+        return 0.0
+    v = safety_cfg(inst, "maxDailyLoss")
+    if v is None:
+        return None
+    try:
+        return abs(float(v))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def cooldown_after_loss(inst):
+    """Per-asset post-loss cooldown (seconds). Unknown instrument -> 0."""
+    if inst not in ASSETS:
+        return 0
+    try:
+        return max(0, int(safety_cfg(inst, "cooldownAfterLoss")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def cooldown_after_win(inst):
+    """Per-asset post-win cooldown (seconds). Unknown instrument -> 0."""
+    if inst not in ASSETS:
+        return 0
+    try:
+        return max(0, int(safety_cfg(inst, "cooldownAfterWin")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_outcome_cooldown(inst, seconds, reason):
+    """Arm a post-outcome cooldown for `inst`. A non-positive duration is a no-op
+    (so MGC/MNQ, whose cooldowns default to 0, never even touch SAFETY_LOCK ->
+    byte-identical). Never call while holding AUTO_TRADE_LOCK."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return
+    if seconds <= 0 or inst not in ASSETS:
+        return
+    until = time.time() + seconds
+    with SAFETY_LOCK:
+        _OUTCOME_COOLDOWN[inst] = {"until": until, "reason": reason}
+
+
+def _outcome_cooldown_remaining(inst):
+    """(remaining_whole_seconds, reason) for `inst`'s active cooldown, or (0, None)
+    when none is active. Never call while holding AUTO_TRADE_LOCK."""
+    with SAFETY_LOCK:
+        c = _OUTCOME_COOLDOWN.get(inst)
+    if not c:
+        return 0, None
+    rem = c["until"] - time.time()
+    if rem <= 0:
+        return 0, None
+    return int(rem) + 1, c.get("reason")
+
+
+def _realized_pnl_today(inst):
+    """Signed realized P&L (USD) for `inst`'s CLOSED journal entries on TODAY's ET
+    trading day — the same ET calendar day the per-day entry cap uses, so the two
+    'per day' auto-trade controls reset together. Reads the in-memory JOURNAL
+    (rebuilt from Postgres on boot, so this survives a restart). Mirrors the
+    per-instrument P&L attribution in _compute_eod_stats (stored pnl_dollars).
+    Raises on a genuinely unexpected JOURNAL shape so the money-path caller can
+    fail CLOSED."""
+    today_et = fmt_et(now_utc(), "%Y-%m-%d")
+    total = 0.0
+    for e in list(JOURNAL):
+        if "pnl_dollars" not in e:
+            continue
+        if instrument_of(e.get("symbol", "")) != inst:
+            continue
+        if fmt_et(e.get("datetime", ""), "%Y-%m-%d") != today_et:
+            continue
+        total += float(e["pnl_dollars"])
+    return total
+
+
+def _safety_snapshot(inst):
+    """Per-asset safety + runtime state for the /auto-trade surface (DISPLAY-only;
+    never feeds the gate)."""
+    with AUTO_TRADE_LOCK:
+        armed = bool(AUTO_TRADE.get(inst))
+        ed = bool(EMERGENCY_DISABLED.get(inst, False))
+    cd_rem, cd_reason = _outcome_cooldown_remaining(inst)
+    try:
+        pnl_today = _realized_pnl_today(inst)
+    except Exception:
+        pnl_today = None
+    return {
+        "armed":             armed,
+        "emergencyDisabled": ed,
+        "maxTradesPerDay":   max_trades_per_day(inst),
+        "tradesToday":       _auto_trade_count_today(inst),
+        "maxContracts":      max_contracts(inst),
+        "maxOpenTrades":     max_open_trades(inst),
+        "openTrades":        1 if active_trade_for(inst) else 0,
+        "maxDailyLoss":      max_daily_loss(inst),
+        "pnlToday":          (round(pnl_today, 2) if isinstance(pnl_today, (int, float)) else None),
+        "cooldownAfterLoss": cooldown_after_loss(inst),
+        "cooldownAfterWin":  cooldown_after_win(inst),
+        "cooldownRemaining": cd_rem,
+        "cooldownReason":    cd_reason,
+    }
 
 
 def _auto_setup_key(a, inst):
@@ -1526,9 +1811,10 @@ def _send_heartbeat():
     else:
         last_str = "No alerts received yet"
 
-    # ── Active trade ───────────────────────────────────────────────────────
-    if ACTIVE_TRADE:
-        at         = ACTIVE_TRADE
+    # ── Active trade (aggregate DISPLAY: any open position) ──────────────────
+    _disp_trade = any_active_trade()
+    if _disp_trade:
+        at         = _disp_trade
         sym        = (at.get("profile") or "").split()[0] or "—"
         direction  = at.get("direction", "—")
         entry      = at.get("entry_price", "—")
@@ -2314,7 +2600,14 @@ def score_alerts(alerts):
     return bullish, bearish, counts
 
 def calculate_scores():
-    return score_alerts(ALERT_HISTORY)
+    # Legacy full-history score (SWING path / SCORE_WINDOW_MIN=None). This is the
+    # one ALERT_HISTORY consumer that is NOT time-windowed, so cap it at the
+    # original deque size (100) — the deque was widened 100→1000 only so a busy
+    # asset can't evict a quiet one from the time-windowed/EARLY scans. Capping
+    # here keeps this legacy (mixed-instrument, ranking-only) score byte-identical
+    # to the pre-widening behaviour. The READY gate (evaluate_strict_setup) and the
+    # SCALP windowed scans are independently bounded and unaffected.
+    return score_alerts(list(ALERT_HISTORY)[-100:])
 
 def calculate_bias(bullish, bearish):
     gap = abs(bullish - bearish)
@@ -4230,11 +4523,10 @@ def _active_ticker():
         if rec.get("ticker"):
             return instrument_of(rec["ticker"])
         t = str(rec.get("alert_type", ""))
-        if t.startswith("MNQ"):
-            return "MNQ"
-        if t.startswith("MGC"):
-            return "MGC"
-    return "MGC"
+        _i = _instrument_from_text(t)
+        if _i:
+            return _i
+    return DEFAULT_INSTRUMENT
 
 
 # ── Unified additive Edge Score (single source of truth: gate + display) ──────
@@ -7422,12 +7714,23 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
 # ---------------------------------------------------------------------------
 
 def compute_pnl(trade, current_price):
-    """Returns (dollar_pnl, points_pnl) for the active trade."""
+    """Returns (dollar_pnl, points_pnl) for the active trade.
+
+    Uses the trade instrument's OWN point value (MGC $10, MNQ $2, MES $5, MYM
+    $0.50) so PnL is correct per asset. MGC is unchanged (its spec point value IS
+    MGC_POINT_VALUE); MNQ/MES/MYM now book PnL at their real contract multiplier
+    instead of gold's. Falls back to MGC_POINT_VALUE for an unknown symbol.
+    DISPLAY / JOURNAL only — never feeds the gate, sizing, or the broker order.
+    """
     direction = trade["direction"]
     entry     = trade["entry_price"]
     contracts = trade["contracts"]
     pts = (entry - current_price) if direction == "Short" else (current_price - entry)
-    dollars = pts * MGC_POINT_VALUE * contracts
+    try:
+        pv = point_value_for(trade.get("symbol") or trade.get("profile") or DEFAULT_INSTRUMENT)
+    except Exception:
+        pv = MGC_POINT_VALUE
+    dollars = pts * pv * contracts
     return dollars, pts
 
 
@@ -8194,7 +8497,7 @@ def _maybe_dispatch_early_alert(a, record):
     # broken-zone skip is a ZONE HARD-GATE behaviour: it holds in SWING (cfg on) and
     # is bypassed in SCALP (zone demoted), so a broken zone no longer mutes the EARLY
     # teaser. An active trade still suppresses the teaser in EVERY mode.
-    if (cfg("GATE_REQUIRE_ZONE") and a.get("zone_broken_active")) or ACTIVE_TRADE:
+    if (cfg("GATE_REQUIRE_ZONE") and a.get("zone_broken_active")) or active_trade_for(inst):
         return False
     if LAST_EARLY_ANCHOR.get(key):     # already EARLY-alerted this active setup
         return False
@@ -8231,39 +8534,48 @@ def _trade_ready_loop():
     while a trade is already active (lifecycle alerts cover that case).
     """
     try:
-        if not ACTIVE_TRADE:
-            now = datetime.now(timezone.utc)
-            for inst in ("MGC", "MNQ"):
-                # Throttle: skip if a card (instant or periodic) was sent for this
-                # instrument within the last TRADE_READY_INTERVAL seconds.
-                last = LAST_LIVE_CARD_AT.get(inst)
-                if last and (now - last).total_seconds() < trade_ready_interval():
-                    continue
-                try:
-                    a = full_analysis(ticker_override=inst)
-                except Exception as exc:
-                    logger.error("trade-ready loop analysis error (%s): %s", inst, exc)
-                    continue
-                # Re-check ACTIVE_TRADE just before sending (it may have changed
-                # while full_analysis ran).
-                if not ACTIVE_TRADE and is_actionable(a.get("verdict")):
-                    entry = _build_card_entry(a, ticker=f"{inst}1!")
-                    send_live_ready_card(entry, inst)
+        now = datetime.now(timezone.utc)
+        for inst in enabled_instruments():
+            # Per-instrument isolation: an open position on ONE asset must not
+            # silence READY reposts for the others (only this asset's own live
+            # position suppresses its repost — lifecycle alerts cover that case).
+            if active_trade_for(inst):
+                continue
+            # Throttle: skip if a card (instant or periodic) was sent for this
+            # instrument within the last TRADE_READY_INTERVAL seconds.
+            last = LAST_LIVE_CARD_AT.get(inst)
+            if last and (now - last).total_seconds() < trade_ready_interval():
+                continue
+            try:
+                a = full_analysis(ticker_override=inst)
+            except Exception as exc:
+                logger.error("trade-ready loop analysis error (%s): %s", inst, exc)
+                continue
+            # Re-check this instrument's slot just before sending (it may have
+            # changed while full_analysis ran).
+            if not active_trade_for(inst) and is_actionable(a.get("verdict")):
+                entry = _build_card_entry(a, ticker=f"{inst}1!")
+                send_live_ready_card(entry, inst)
     except Exception as exc:  # never let the loop die
         logger.warning("trade-ready loop error: %s", exc)
     finally:
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()
 
 
-def _update_journal_outcome(new_outcome, pnl_dollars=None):
+def _update_journal_outcome(new_outcome, pnl_dollars=None, symbol=None):
     """Update the most recent journal entry that is still Pending or at T1.
 
     Matches the first entry whose outcome is 'Pending' or starts with 'T1 Hit'.
-    Posts a brief update line to the journal Discord channel.
-    Returns the updated entry or None if nothing matched.
+    When `symbol` (an instrument code) is given, only entries for THAT instrument
+    are eligible — so closing one asset's position can't mark another asset's
+    still-open journal entry (per-asset isolation). Posts a brief update line to
+    the journal Discord channel. Returns the updated entry or None if nothing matched.
     """
+    _want_inst = instrument_of(symbol) if symbol else None
     for entry in JOURNAL:
         o = entry.get("outcome", "")
+        if _want_inst is not None and instrument_of(entry.get("symbol", "")) != _want_inst:
+            continue
         if o == "Pending" or o.startswith("T1 Hit"):
             entry["outcome"] = new_outcome
             if pnl_dollars is not None:
@@ -9764,8 +10076,16 @@ def active_trade_field(trade, current_price):
     return {"name": "📊  ACTIVE TRADE MANAGEMENT", "value": value, "inline": False}
 
 
-_COMMAND_TYPES = {"MGC ENTER", "MNQ ENTER", "MGC CLOSE", "MNQ CLOSE"}
-_DATA_ONLY_TYPES = {"MGC VWAP", "MNQ VWAP"}
+# ENTER / CLOSE command alerts for every enabled instrument (registry-driven), so
+# MES/MYM command alerts route to the command handler instead of falling through
+# to scoring. Built from the same instrument list as the rest of the engine.
+_COMMAND_TYPES = {f"{inst} {act}"
+                  for inst in enabled_instruments()
+                  for act in ("ENTER", "CLOSE")}
+# Registry-driven so every enabled instrument's data-only VWAP push takes the fast
+# inline ack path (the VWAP store is written synchronously above; no heavy scoring).
+# MGC/MNQ membership is unchanged — this is the same set plus MES/MYM.
+_DATA_ONLY_TYPES = _per_inst_alert_set("VWAP")
 
 
 def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
@@ -9774,7 +10094,6 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
     Returns a Flask Response to short-circuit the webhook handler, or None
     to fall through to normal alert scoring.
     """
-    global ACTIVE_TRADE
     profile   = str(data.get("profile", DEFAULT_PROFILE))
     is_enter  = normalized.endswith("ENTER")
 
@@ -9849,23 +10168,24 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
         t1 = (entry + _rr_mult * _risk) if direction == "Long" else (entry - _rr_mult * _risk)
         t2 = t1
 
-        # Record the trade for local tracking. _ENTER_LOCK serialises the
-        # assignment so two concurrent ENTERs can't race on ACTIVE_TRADE.
-        with _ENTER_LOCK:
-            ACTIVE_TRADE = {
-                "direction":   direction,
-                "entry_price": entry,
-                "stop_loss":   stop,
-                "target1":     t1,
-                "target2":     t2,
-                "contracts":   contracts,
-                "profile":     profile,
-                "symbol":      symbol,
-                "opened_at":   now_utc().isoformat(),
-                "t1_hit":      False,
-                "t2_hit":      False,
-                "status":      "active",
-            }
+        # Record the trade for local tracking (one slot per instrument).
+        # set_active_trade() serialises the write on ACTIVE_TRADES_LOCK so two
+        # concurrent ENTERs can't race on this instrument's record.
+        _trade = {
+            "direction":   direction,
+            "entry_price": entry,
+            "stop_loss":   stop,
+            "target1":     t1,
+            "target2":     t2,
+            "contracts":   contracts,
+            "profile":     profile,
+            "symbol":      symbol,
+            "opened_at":   now_utc().isoformat(),
+            "t1_hit":      False,
+            "t2_hit":      False,
+            "status":      "active",
+        }
+        set_active_trade(symbol, _trade)
         content = (
             f"✅ **TRADE ENTERED — {direction.upper()}**\n"
             f"Entry `{entry:.2f}`  ·  Stop `{stop:.2f}`  ·  "
@@ -9878,21 +10198,22 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
             except Exception:
                 pass
         logger.info("ENTER command: %s %s @ %.1f", direction, profile, entry)
-        return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+        return jsonify({"status": "entered", "trade": _trade}), 200
 
-    # ── CLOSE ─────────────────────────────────────────────────────────────
-    if not ACTIVE_TRADE:
+    # ── CLOSE (per-instrument) ────────────────────────────────────────────
+    _at = active_trade_for(resolved_inst)
+    if not _at:
         return jsonify({"status": "error", "reason": "No active trade to close."}), 400
 
     exit_price = parsed_price
-    closed     = dict(ACTIVE_TRADE)
+    closed     = dict(_at)
 
     if exit_price is not None:
-        dollar_pnl, _ = compute_pnl(ACTIVE_TRADE, exit_price)
+        dollar_pnl, _ = compute_pnl(_at, exit_price)
         pnl_str    = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
         content    = (
             f"🏁 **TRADE CLOSED**\n"
-            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
+            f"{_at['direction']} @ `{_at['entry_price']:.1f}`  ·  "
             f"Exit `{exit_price:.1f}`  ·  PnL **{pnl_str}**"
         )
         outcome_str = (
@@ -9903,12 +10224,12 @@ def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
         dollar_pnl  = None
         content     = (
             f"🏁 **TRADE CLOSED**\n"
-            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`"
+            f"{_at['direction']} @ `{_at['entry_price']:.1f}`"
         )
         outcome_str = "Closed Manually"
 
-    ACTIVE_TRADE = None
-    _update_journal_outcome(outcome_str, pnl_dollars=dollar_pnl)
+    clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
+    _update_journal_outcome(outcome_str, pnl_dollars=dollar_pnl, symbol=resolved_inst)
 
     _url = _discord_url(normalized)
     if _url:
@@ -10444,8 +10765,6 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     journal-channel embed is offloaded to the slow-task worker — so nothing slow
     ever delays the decision or the alert. Per-evaluation timings + the volatility
     reading are recorded to EVAL_METRICS for the Diagnostics page."""
-    global ACTIVE_TRADE
-
     _eval_timing_begin()
     eval_started_at = now_utc()
     _eval_t0 = time.perf_counter()
@@ -10507,28 +10826,34 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # ── Active trade: a WIN is booked the moment T1 is hit; stop = loss. ──
     # check_trade_events returns STOP_HIT exclusively, or one/both of T1/T2 — so
     # stop and targets never co-occur in one call. Stop takes precedence.
-    if ACTIVE_TRADE and parsed_price is not None:
-        events = check_trade_events(ACTIVE_TRADE, parsed_price)
+    _at = active_trade_for(resolved_inst)
+    if _at and parsed_price is not None:
+        events = check_trade_events(_at, parsed_price)
         if "STOP_HIT" in events:
-            send_trade_event_message("STOP_HIT", ACTIVE_TRADE, parsed_price)
-            d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
-            _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl)
+            send_trade_event_message("STOP_HIT", _at, parsed_price)
+            d_pnl, _ = compute_pnl(_at, parsed_price)
+            _update_journal_outcome("Loss — Stop Hit ❌", pnl_dollars=d_pnl, symbol=resolved_inst)
             # SCALP re-entry: a stop-out re-arms this setup so AUTO can enter it
             # again the instant it is READY again (operator request). The WIN path
             # below intentionally does NOT re-arm (no immediate re-entry after a win
             # while READY lingers). SWING never populates AUTO_FIRED_KEYS, so this is
             # a no-op there — its money path is unchanged.
             if TRADING_MODE == "SCALP":
-                _stopped_key = ACTIVE_TRADE.get("auto_setup_key")
+                _stopped_key = _at.get("auto_setup_key")
                 if _stopped_key is not None:
                     with AUTO_TRADE_LOCK:
                         AUTO_FIRED_KEYS.discard(_stopped_key)
-            ACTIVE_TRADE = None
+            # Per-asset post-LOSS cooldown (0s default => no-op for MGC/MNQ). Set
+            # OUTSIDE AUTO_TRADE_LOCK (SAFETY_LOCK must never nest under it).
+            _set_outcome_cooldown(resolved_inst, cooldown_after_loss(resolved_inst), "loss")
+            clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
         elif "T1_HIT" in events or "T2_HIT" in events:
-            send_trade_event_message("T1_HIT", ACTIVE_TRADE, parsed_price)
-            d_pnl, _ = compute_pnl(ACTIVE_TRADE, parsed_price)
-            _update_journal_outcome("Win — T1 Hit ✅", pnl_dollars=d_pnl)
-            ACTIVE_TRADE = None
+            send_trade_event_message("T1_HIT", _at, parsed_price)
+            d_pnl, _ = compute_pnl(_at, parsed_price)
+            _update_journal_outcome("Win — T1 Hit ✅", pnl_dollars=d_pnl, symbol=resolved_inst)
+            # Per-asset post-WIN cooldown (0s default => no-op for MGC/MNQ).
+            _set_outcome_cooldown(resolved_inst, cooldown_after_win(resolved_inst), "win")
+            clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
 
     # ── Trading Journal + live alert ───────────────────────────────────────────
     # The main alert channel now receives the same clean trade-card as the
@@ -10549,7 +10874,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # Discord journal post, so the alert is never queued behind slower work. Its
     # error handling is isolated so a live-card failure can't suppress the journal
     # embed offloaded below.
-    if (journal_entry and not ACTIVE_TRADE
+    if (journal_entry and not active_trade_for(resolved_inst)
             and is_actionable(a.get("verdict"))):
         try:
             _dispatched = send_live_ready_card(journal_entry,
@@ -10613,7 +10938,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                 except Exception as exc:
                     logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
     else:
-        if (journal_entry and not ACTIVE_TRADE
+        if (journal_entry and not active_trade_for(resolved_inst)
                 and is_actionable(a.get("verdict"))
                 and auto_trade_enabled(resolved_inst)):
             try:
@@ -10814,7 +11139,7 @@ def _enqueue_slow(fn):
 # never alter a READY/WAIT verdict or post a duplicate alert. Fail-open per
 # instrument, and strictly less frequent than the existing /status polling that
 # already calls full_analysis, so it adds no new concurrency risk.
-_HEARTBEAT_INSTRUMENTS = ("MGC", "MNQ")
+_HEARTBEAT_INSTRUMENTS = tuple(enabled_instruments())
 
 
 def _run_heartbeat_evaluations():
@@ -11472,7 +11797,7 @@ def bt_export():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE, ACTIVE_TRADE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT
+    global CURRENT_PRICE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT
 
     webhook_received_at = now_utc()   # T0 for the webhook->alert delay metric
     LAST_WEBHOOK_AT = webhook_received_at   # any inbound POST, before any early return
@@ -11809,14 +12134,18 @@ def webhook():
     ALERT_HISTORY.append(record)
 
     # ── Zone event side-effects ──
-    _zone_neutral = ("MGC ZONE BROKEN", "MNQ ZONE BROKEN", "MGC ZONE MITIGATED", "MNQ ZONE MITIGATED")
-    if normalized in ("MGC ZONE BROKEN", "MNQ ZONE BROKEN"):
+    #    Registry-driven sets so every enabled instrument's zone events are handled
+    #    (MGC/MNQ membership unchanged — same set plus MES/MYM).
+    _zone_broken_set = _per_inst_alert_set("ZONE BROKEN")
+    _zone_mitig_set  = _per_inst_alert_set("ZONE MITIGATED")
+    _zone_neutral    = _zone_broken_set | _zone_mitig_set
+    if normalized in _zone_broken_set:
         _zb_instrument = _instrument_from_text(normalized)
         if parsed_price is not None:
             _handle_zone_broken(parsed_price, _zb_instrument)
         else:
             ZONE_BROKEN_AT = {"price": None, "alerts_since": 0, "instrument": _zb_instrument}
-    elif normalized in ("MGC ZONE MITIGATED", "MNQ ZONE MITIGATED"):
+    elif normalized in _zone_mitig_set:
         if parsed_price is not None:
             _handle_zone_mitigated(parsed_price, resolved_inst)
     elif ZONE_BROKEN_AT is not None and normalized not in _zone_neutral:
@@ -11831,11 +12160,11 @@ def webhook():
                 logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
 
     # ── Zone Mitigation: clear flag when fresh structure forms ──────────────────
-    _STRUCTURE_RESET = frozenset((
-        "CHOCH SUPPLY", "CHOCH DEMAND", "BOS SUPPLY", "BOS DEMAND",
-        "MGC NEW SUPPLY ZONE", "MGC NEW DEMAND ZONE",
-        "MNQ NEW SUPPLY ZONE", "MNQ NEW DEMAND ZONE",
-    ))
+    _STRUCTURE_RESET = (
+        frozenset(("CHOCH SUPPLY", "CHOCH DEMAND", "BOS SUPPLY", "BOS DEMAND"))
+        | _per_inst_alert_set("NEW SUPPLY ZONE")
+        | _per_inst_alert_set("NEW DEMAND ZONE")
+    )
     # SWING ONLY: a new structure alert clears the consumed-zone mitigation flag so a
     # fresh BOS/CHOCH re-opens the zone gate. SCALP must NOT clear here — doing so wiped
     # the flag every time required structure formed, so structure and a valid zone could
@@ -12453,7 +12782,9 @@ def status():
     # The dashboard's MGC/MNQ tab passes ?ticker= so the view follows the selected
     # instrument; ignore junk values and fall back to the active instrument.
     _raw = (request.args.get("ticker") or "").upper()
-    _tk  = instrument_of(_raw) if ("MGC" in _raw or "MNQ" in _raw) else None
+    # Registry-driven: recognizes every enabled instrument (MGC/MNQ/MES/MYM);
+    # junk/empty/ambiguous → None → full_analysis falls back to the active instrument.
+    _tk  = _instrument_from_text(_raw)
     a = full_analysis(ticker_override=_tk)
     windows = {}
     for label, minutes in TIME_WINDOWS.items():
@@ -12568,8 +12899,11 @@ def status():
 
 @app.route("/enter", methods=["POST"])
 def enter_trade():
-    global ACTIVE_TRADE
     data = request.get_json(force=True, silent=True) or {}
+    # Registry-driven instrument resolution from the request ticker (recognises
+    # MGC/MNQ/MES/MYM); None when unknown/empty/ambiguous. Used both to pick the
+    # plan-branch analysis and to tag the tracked trade's instrument.
+    _resolved_inst = _instrument_from_text(data.get("ticker"))
 
     # R:R multiple for the LOCAL tracked TP. Defaults to the system-wide 1:1; the
     # plan-sourced branch below lifts it from the authoritative trade_plan so a real,
@@ -12595,11 +12929,11 @@ def enter_trade():
         # selected/viewed instrument (per-instrument dashboard; the global default
         # may differ from the tab the user is acting on, which would otherwise let
         # a confirmed broker order for one instrument record a trade for another).
-        _raw = str(data.get("ticker") or "").upper()
-        if "MGC" in _raw and "MNQ" not in _raw:
-            a = full_analysis(ticker_override="MGC")
-        elif "MNQ" in _raw and "MGC" not in _raw:
-            a = full_analysis(ticker_override="MNQ")
+        # The registry-resolved instrument (computed above) picks the analysis; an
+        # unknown/empty/ambiguous ticker falls back to the default analysis —
+        # matching the prior behaviour, but without a silent MGC bias for indices.
+        if _resolved_inst:
+            a = full_analysis(ticker_override=_resolved_inst)
         else:
             a = full_analysis()
         tp = a["trade_plan"]
@@ -12639,7 +12973,9 @@ def enter_trade():
             except (ValueError, TypeError):
                 pass
 
-    symbol = instrument_of(profile)
+    # The ticker-resolved instrument (plan branch) wins; otherwise fall back to the
+    # profile-derived instrument so a typed entry keeps its prior behaviour.
+    symbol = _resolved_inst or instrument_of(profile)
 
     # The stop side is the ground truth for a bracket trade (stop below entry = Long,
     # above = Short). Resolve direction from the explicit field when given, else infer
@@ -12667,23 +13003,22 @@ def enter_trade():
     t1 = (entry + _rr_mult * _risk) if direction == "Long" else (entry - _rr_mult * _risk)
     t2 = t1
 
-    # Record the trade for local tracking. _ENTER_LOCK serialises the
-    # assignment so two concurrent ENTERs can't race on ACTIVE_TRADE.
-    with _ENTER_LOCK:
-        ACTIVE_TRADE = {
-            "direction":   direction,
-            "entry_price": entry,
-            "stop_loss":   stop,
-            "target1":     t1,
-            "target2":     t2,
-            "contracts":   contracts,
-            "profile":     profile,
-            "symbol":      symbol,
-            "opened_at":   now_utc().isoformat(),
-            "t1_hit":      False,
-            "t2_hit":      False,
-            "status":      "active",
-        }
+    # Record the trade for local tracking (one slot per instrument).
+    _trade = {
+        "direction":   direction,
+        "entry_price": entry,
+        "stop_loss":   stop,
+        "target1":     t1,
+        "target2":     t2,
+        "contracts":   contracts,
+        "profile":     profile,
+        "symbol":      symbol,
+        "opened_at":   now_utc().isoformat(),
+        "t1_hit":      False,
+        "t2_hit":      False,
+        "status":      "active",
+    }
+    set_active_trade(symbol, _trade)
 
     content = (
         f"✅ **TRADE ENTERED — {direction.upper()}**\n"
@@ -12699,7 +13034,7 @@ def enter_trade():
         pass
 
     logger.info("Trade entered: %s @ %.1f", direction, entry)
-    return jsonify({"status": "entered", "trade": ACTIVE_TRADE}), 200
+    return jsonify({"status": "entered", "trade": _trade}), 200
 
 
 @app.route("/traderspost", methods=["POST"])
@@ -12722,26 +13057,26 @@ def traderspost_order():
     """
     data = request.get_json(force=True, silent=True) or {}
 
+    # The instrument MUST be explicitly and unambiguously one of the registry assets
+    # (MGC / MNQ / MES / MYM) - a money-moving route never silently falls back to the
+    # active/default instrument. Resolved FIRST so the contract range-check can use
+    # the per-asset ceiling.
+    instrument = _instrument_from_text(data.get("ticker"))
+    if instrument is None:
+        return jsonify({"status": "error",
+                        "reason": "A valid instrument ticker (MGC, MNQ, MES, or MYM) is required."}), 400
+
     # Contract count is the ONLY user-supplied input and it is capped server-side -
-    # the browser min/step is not a control. Reject non-integer / out-of-range.
+    # the browser min/step is not a control. Reject non-integer / out-of-range against
+    # the resolved instrument's per-asset ceiling (TRADERSPOST_MAX_CONTRACTS for MGC/MNQ).
     try:
         contracts = int(data.get("contracts", 1))
     except (ValueError, TypeError):
         return jsonify({"status": "error", "reason": "contracts must be a whole number."}), 400
-    if contracts < 1 or contracts > TRADERSPOST_MAX_CONTRACTS:
+    _max_contracts = max_contracts(instrument)
+    if contracts < 1 or contracts > _max_contracts:
         return jsonify({"status": "error",
-                        "reason": f"contracts must be between 1 and {TRADERSPOST_MAX_CONTRACTS}."}), 400
-
-    # The instrument MUST be explicitly and unambiguously MGC or MNQ - a money-moving
-    # route never silently falls back to the active/default instrument.
-    _raw = (data.get("ticker") or "").upper()
-    if "MGC" in _raw and "MNQ" not in _raw:
-        instrument = "MGC"
-    elif "MNQ" in _raw and "MGC" not in _raw:
-        instrument = "MNQ"
-    else:
-        return jsonify({"status": "error",
-                        "reason": "A valid instrument ticker (MGC or MNQ) is required."}), 400
+                        "reason": f"contracts must be between 1 and {_max_contracts}."}), 400
 
     result, code = execute_trade_gateway(instrument, contracts, source="manual")
     return jsonify(result), code
@@ -12764,12 +13099,63 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         return {"status": "error",
                 "reason": f"{provider_label} is not configured (missing {miss})."}, 400
 
+    # ── Per-asset safety gate (money path; STRICT instrument) ────────────────────
+    # `instrument` is pre-resolved by the caller. Reject anything not in the registry
+    # rather than risk a live order on an unknown/typo'd symbol (fail-closed). For
+    # MGC/MNQ every per-asset control below resolves to its legacy global default, so
+    # this whole block is a no-op and their money path stays byte-identical.
+    if instrument not in ASSETS:
+        return {"status": "error",
+                "reason": f"Unknown instrument {instrument!r} - refusing to send."}, 400
+    # Per-asset emergency kill switch (MES/MYM ship disabled until armed).
+    if emergency_disabled(instrument):
+        return {"status": "error",
+                "reason": f"{instrument} execution is emergency-disabled - re-enable it to trade."}, 409
+    # Per-asset realized daily-loss cap (None => off, the default for every asset).
+    # Fail CLOSED: if the realized P&L can't be computed while a cap is configured,
+    # block rather than risk trading past the limit.
+    _daily_loss_cap = max_daily_loss(instrument)
+    if _daily_loss_cap is not None:
+        try:
+            _pnl_today = _realized_pnl_today(instrument)
+        except Exception as exc:
+            logger.error("Daily-loss check failed for %s (blocking, fail-closed): %s", instrument, exc)
+            return {"status": "error",
+                    "reason": f"{instrument} daily-loss check unavailable - order blocked for safety."}, 409
+        if _pnl_today <= -_daily_loss_cap:
+            return {"status": "error",
+                    "reason": (f"{instrument} hit its ${_daily_loss_cap:,.0f} daily-loss limit "
+                               f"(realized ${_pnl_today:,.0f} today) - paused.")}, 409
+    # Per-asset post-outcome cooldown (after a loss/win; 0 => off, the default).
+    _cool_rem, _cool_reason = _outcome_cooldown_remaining(instrument)
+    if _cool_rem > 0:
+        return {"status": "error",
+                "reason": f"{instrument} in {_cool_reason} cooldown - {_cool_rem}s remaining."}, 429
+    # Per-asset open-position cap (None => legacy unlimited; default for all assets,
+    # so this is a no-op for MGC/MNQ). A configured 0 (or negative) hard-blocks ALL
+    # new positions for the asset (fail-closed); otherwise block once a position is
+    # already open for it.
+    _max_open = max_open_trades(instrument)
+    if _max_open is not None:
+        if _max_open < 1:
+            return {"status": "error",
+                    "reason": f"{instrument} new positions are disabled (max open {_max_open})."}, 409
+        if active_trade_for(instrument):
+            return {"status": "error",
+                    "reason": f"{instrument} already has an open position (max {_max_open})."}, 409
+
     # Defensive size clamp (never trusts the browser; auto passes a pre-capped value).
+    # Per-asset contract ceiling (defaults to the global TRADERSPOST_MAX_CONTRACTS for
+    # MGC/MNQ, so the clamp is identical for them).
     try:
         contracts = int(contracts)
     except (ValueError, TypeError):
         return {"status": "error", "reason": "contracts must be a whole number."}, 400
-    contracts = max(1, min(TRADERSPOST_MAX_CONTRACTS, contracts))
+    _max_contracts = max_contracts(instrument)
+    if _max_contracts < 1:
+        return {"status": "error",
+                "reason": f"{instrument} contracts are not permitted (max {_max_contracts})."}, 409
+    contracts = max(1, min(_max_contracts, contracts))
 
     # Resolve the live setup SERVER-SIDE only. We never trust client-supplied
     # entry/stop/targets/direction for a money-moving order — every price and the
@@ -13023,8 +13409,11 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
     on the next webhook. A True result after a confirmed send is returned even if
     the local ACTIVE_TRADE tracking write fails — the position is real, so the
     setup MUST NOT be re-sent (the operator is told to verify the broker)."""
-    global ACTIVE_TRADE
-    inst = instrument_of(inst) if inst else None
+    # STRICT resolution on the money path: an already-canonical registry instrument
+    # passes through; otherwise resolve via _instrument_from_text (aliases/tickers),
+    # which returns None for anything unknown. NEVER use instrument_of() here - it
+    # defaults unknown input to MGC, which would turn a typo into a real MGC order.
+    inst = inst if inst in ASSETS else _instrument_from_text(inst)
     if not inst:
         return False
     mode = resolve_execution_mode()
@@ -13034,35 +13423,61 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
     if execution_is_live(mode) and not DISCORD_LIVE_ENABLED:
         logger.info("Auto-trade skipped for %s - live mode (%s) but not the live instance.", inst, mode)
         return False
+    # Per-asset emergency kill switch (defense-in-depth; the gateway re-checks). For
+    # MGC/MNQ this is False by default so the auto path is byte-identical; MES/MYM
+    # ship emergency-disabled until the operator arms them.
+    if emergency_disabled(inst):
+        logger.info("Auto-trade skipped for %s - emergency-disabled.", inst)
+        return False
+    # Per-asset post-outcome cooldown (after a loss/win). Default 0s for MGC/MNQ =>
+    # never armed => no-op (byte-identical). Read OUTSIDE _AUTO_EXEC_LOCK.
+    _cd_rem, _cd_reason = _outcome_cooldown_remaining(inst)
+    if _cd_rem > 0:
+        logger.info("Auto-trade skipped for %s - %s cooldown (%ds left).", inst, _cd_reason, _cd_rem)
+        return False
     with _AUTO_EXEC_LOCK:
-        if ACTIVE_TRADE and not allow_stack:
+        if active_trade_for(inst) and not allow_stack:
             return False
-        if _auto_trade_count_today(inst) >= AUTO_TRADE_MAX_PER_DAY:
-            logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", AUTO_TRADE_MAX_PER_DAY, inst)
+        # Per-asset open-position cap (None => legacy unlimited; default for all
+        # assets, so this is a no-op unless explicitly configured). A configured 0
+        # (or negative) hard-blocks ALL new positions (fail-closed).
+        _mot = max_open_trades(inst)
+        if _mot is not None:
+            if _mot < 1:
+                logger.info("Auto-trade skipped for %s - new positions disabled (max open %d).", inst, _mot)
+                return False
+            if active_trade_for(inst):
+                logger.info("Auto-trade skipped for %s - max open trades (%d) reached.", inst, _mot)
+                return False
+        # Per-asset daily ENTRY cap (defaults to the legacy global for MGC/MNQ).
+        _max_pd = max_trades_per_day(inst)
+        if _auto_trade_count_today(inst) >= _max_pd:
+            logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", _max_pd, inst)
             return False
         result, code = execute_trade_gateway(inst, AUTO_TRADE_CONTRACTS, source=source)
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
             plan = result.get("plan") or {}
             try:
-                with _ENTER_LOCK:
-                    if not ACTIVE_TRADE:
-                        ACTIVE_TRADE = {
-                            "direction":   plan.get("direction"),
-                            "entry_price": float(plan.get("entry")),
-                            "stop_loss":   float(plan.get("stopLoss")),
-                            "target1":     float(plan.get("takeProfit")),
-                            "target2":     float(plan.get("target2")),
-                            "contracts":   int(plan.get("quantity", AUTO_TRADE_CONTRACTS)),
-                            "profile":     inst,
-                            "symbol":      inst,
-                            "opened_at":   now_utc().isoformat(),
-                            "t1_hit":      False,
-                            "t2_hit":      False,
-                            "status":      "active",
-                        }
-                        if setup_key is not None:
-                            ACTIVE_TRADE["auto_setup_key"] = setup_key
+                # One slot per instrument; overwrite=False preserves an existing
+                # position for this instrument (SCALP stacking lives broker-side).
+                _trade = {
+                    "direction":   plan.get("direction"),
+                    "entry_price": float(plan.get("entry")),
+                    "stop_loss":   float(plan.get("stopLoss")),
+                    "target1":     float(plan.get("takeProfit")),
+                    "target2":     float(plan.get("target2")),
+                    "contracts":   int(plan.get("quantity", AUTO_TRADE_CONTRACTS)),
+                    "profile":     inst,
+                    "symbol":      inst,
+                    "opened_at":   now_utc().isoformat(),
+                    "t1_hit":      False,
+                    "t2_hit":      False,
+                    "status":      "active",
+                }
+                if setup_key is not None:
+                    _trade["auto_setup_key"] = setup_key
+                set_active_trade(inst, _trade, overwrite=False)
                 _auto_trade_bump_count(inst)
                 logger.info("AUTO-TRADE entered %s %s x%s via %s (%s).",
                             inst, plan.get("direction"), plan.get("quantity"),
@@ -13091,50 +13506,79 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
             return False
 
 
+def _resolve_active_trade(ticker=None):
+    """Resolve which tracked position a management endpoint should act on.
+
+    Returns (instrument, trade, error):
+      • An EXPLICIT but unknown/ambiguous `ticker` is FAIL-CLOSED — returns
+        (None, None, "<reason>") so the caller rejects the request rather than
+        silently acting on an unrelated instrument's open position (a money-path
+        hazard: a typo on /close must never close the wrong trade).
+      • No ticker → legacy single-position fallback: the one open position (most
+        recently opened when several are live), error None.
+      • A recognised ticker → that instrument's slot (trade may be None), error
+        None."""
+    raw = str(ticker).strip() if ticker is not None else ""
+    if raw:
+        inst = _instrument_from_text(raw)
+        if not inst:
+            return None, None, f"Unknown or ambiguous ticker {raw!r}."
+        return inst, active_trade_for(inst), None
+    _at = any_active_trade()
+    return ((instrument_of(_at.get("symbol", "")) if _at else None), _at, None)
+
+
 @app.route("/breakeven", methods=["POST"])
 def set_breakeven():
-    global ACTIVE_TRADE
-    if not ACTIVE_TRADE:
+    data = request.get_json(force=True, silent=True) or {}
+    _inst, _at, _err = _resolve_active_trade(data.get("ticker"))
+    if _err:
+        return jsonify({"status": "error", "reason": _err}), 400
+    if not _at:
         return jsonify({"status": "error", "reason": "No active trade."}), 400
 
-    old_stop = ACTIVE_TRADE["stop_loss"]
-    ACTIVE_TRADE["stop_loss"] = ACTIVE_TRADE["entry_price"]
+    old_stop = _at["stop_loss"]
+    _at["stop_loss"] = _at["entry_price"]
     content = (
         f"🔒 **STOP MOVED TO BREAKEVEN**\n"
-        f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
-        f"Stop `{old_stop:.1f}` → `{ACTIVE_TRADE['entry_price']:.1f}`"
+        f"{_at['direction']} @ `{_at['entry_price']:.1f}`  ·  "
+        f"Stop `{old_stop:.1f}` → `{_at['entry_price']:.1f}`"
     )
     try:
-        _url = _discord_url(ACTIVE_TRADE.get("profile", ""))
+        _url = _discord_url(_at.get("profile", ""))
         if _url:
             requests.post(_url, json={"content": content}, timeout=5)
     except requests.RequestException:
         pass
-    logger.info("Breakeven set: stop moved to %.1f", ACTIVE_TRADE["entry_price"])
-    return jsonify({"status": "breakeven_set", "stop_loss": ACTIVE_TRADE["stop_loss"]}), 200
+    logger.info("Breakeven set: stop moved to %.1f", _at["entry_price"])
+    return jsonify({"status": "breakeven_set", "stop_loss": _at["stop_loss"]}), 200
 
 
 @app.route("/close", methods=["POST"])
 def close_trade():
-    global ACTIVE_TRADE
-    if not ACTIVE_TRADE:
-        return jsonify({"status": "error", "reason": "No active trade."}), 400
     data       = request.get_json(force=True, silent=True) or {}
+    _inst, _at, _err = _resolve_active_trade(data.get("ticker"))
+    if _err:
+        return jsonify({"status": "error", "reason": _err}), 400
+    if not _at:
+        return jsonify({"status": "error", "reason": "No active trade."}), 400
 
-    exit_price = CURRENT_PRICE
+    # Default exit price = the instrument's own best price (per-instrument, never
+    # the global last tick), overridable by an explicit request price.
+    exit_price, _ = display_price_for(_inst)
     try:
         if data.get("price"):
             exit_price = float(data["price"])
     except (ValueError, TypeError):
         pass
 
-    closed = dict(ACTIVE_TRADE)
+    closed = dict(_at)
     if exit_price is not None:
-        dollar_pnl, pts_pnl = compute_pnl(ACTIVE_TRADE, exit_price)
+        dollar_pnl, pts_pnl = compute_pnl(_at, exit_price)
         pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
         content = (
             f"🏁 **TRADE CLOSED MANUALLY**\n"
-            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`  ·  "
+            f"{_at['direction']} @ `{_at['entry_price']:.1f}`  ·  "
             f"Exit `{exit_price:.1f}`  ·  PnL **{pnl_str}**"
         )
         outcome_str = (
@@ -13144,14 +13588,15 @@ def close_trade():
     else:
         content = (
             f"🏁 **TRADE CLOSED MANUALLY**\n"
-            f"{ACTIVE_TRADE['direction']} @ `{ACTIVE_TRADE['entry_price']:.1f}`"
+            f"{_at['direction']} @ `{_at['entry_price']:.1f}`"
         )
         outcome_str = "Closed Manually"
 
-    ACTIVE_TRADE = None
+    clear_active_trade(_inst, opened_at=_at.get("opened_at"))
     _update_journal_outcome(
         outcome_str,
         pnl_dollars=dollar_pnl if exit_price is not None else None,
+        symbol=_inst,
     )
 
     try:
@@ -13166,9 +13611,12 @@ def close_trade():
 
 @app.route("/trade", methods=["GET"])
 def get_trade():
-    if not ACTIVE_TRADE:
+    _inst, _at, _err = _resolve_active_trade(request.args.get("ticker"))
+    if _err:
+        return jsonify({"status": "error", "reason": _err}), 400
+    if not _at:
         return jsonify({"status": "no_active_trade"}), 200
-    result = dict(ACTIVE_TRADE)
+    result = dict(_at)
     # Live status uses the BEST available price for the trade's instrument: the
     # fresh alert/chart price when present, else the auto-fetched market price
     # (see display_price_for). This keeps the trade-status section live even when
@@ -13176,11 +13624,11 @@ def get_trade():
     # after a restart — instead of showing the static levels with no P&L.
     # DISPLAY-ONLY: compute_pnl/compute_distances never touch the gate or money
     # path; price_source lets the dashboard label an auto/stale readout.
-    trade_inst       = ACTIVE_TRADE.get("symbol") or ACTIVE_TRADE.get("profile") or DEFAULT_PROFILE
+    trade_inst       = _at.get("symbol") or _at.get("profile") or DEFAULT_PROFILE
     cp, price_source = display_price_for(trade_inst)
     if cp is not None:
-        dollar_pnl, pts_pnl   = compute_pnl(ACTIVE_TRADE, cp)
-        to_t1, to_t2, to_stop = compute_distances(ACTIVE_TRADE, cp)
+        dollar_pnl, pts_pnl   = compute_pnl(_at, cp)
+        to_t1, to_t2, to_stop = compute_distances(_at, cp)
         result.update({
             "current_price": cp,
             "price_source":  price_source,
@@ -16177,17 +16625,27 @@ def auto_trade_toggle():
         inst = _instrument_from_text(data.get("instrument") or data.get("inst"))
         if inst is None:
             return jsonify({"status": "error",
-                            "reason": "instrument must be exactly 'MGC' or 'MNQ'."}), 400
-        enabled = bool(data.get("enabled"))
-        with AUTO_TRADE_LOCK:
-            AUTO_TRADE[inst] = enabled
-        logger.info("Auto-trade %s for %s", "ENABLED" if enabled else "DISABLED", inst)
+                            "reason": "instrument must be one of MGC, MNQ, MES, or MYM."}), 400
+        # `enabled` arms/disarms auto-execution; `emergencyDisabled` flips the per-asset
+        # kill switch. Both optional so a caller can set either independently (the
+        # dashboard always sends `enabled`, so its existing behaviour is unchanged).
+        if "enabled" in data:
+            enabled = bool(data.get("enabled"))
+            with AUTO_TRADE_LOCK:
+                AUTO_TRADE[inst] = enabled
+            logger.info("Auto-trade %s for %s", "ENABLED" if enabled else "DISABLED", inst)
+        if "emergencyDisabled" in data:
+            ed = bool(data.get("emergencyDisabled"))
+            with AUTO_TRADE_LOCK:
+                EMERGENCY_DISABLED[inst] = ed
+            logger.info("Emergency-disable %s for %s", "SET" if ed else "CLEARED", inst)
     with AUTO_TRADE_LOCK:
         snapshot = dict(AUTO_TRADE)
     mode = resolve_execution_mode()
     return jsonify({
         "status":                   "ok",
         "enabled":                  snapshot,
+        "safety":                   {i: _safety_snapshot(i) for i in enabled_instruments()},
         "execution_mode":           mode,
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(mode, mode),
         "execution_live":           execution_is_live(mode) and execution_configured(mode),
