@@ -862,10 +862,12 @@ def _auto_trade_bump_count(inst):
 def _auto_setup_key(a, inst):
     """Stable per-setup identity for the auto-execute 'fire once' guard:
     (instrument, direction, zone_low) — the same shape the journal dedups on, so
-    SCALP auto fires exactly once per setup but on the FULL-READY verdict instead
-    of the EARLY one that claims the journal slot. Self-consistent across webhooks
-    for a given setup; computed from the authoritative trade plan (en-dash zone
-    separator, matching _journal_dedup_key)."""
+    SCALP auto fires exactly once per setup. ready_direction() collapses EARLY and
+    FULL READY of the same direction to one value, so the FIRST actionable READY
+    (the EARLY tier) claims the key and the later strengthen-to-FULL for the same
+    zone does NOT double-enter. Self-consistent across webhooks for a given setup;
+    computed from the authoritative trade plan (en-dash zone separator, matching
+    _journal_dedup_key)."""
     try:
         zone = str((a.get("trade_plan") or {}).get("entry_zone", ""))
         zone_low = round(float(zone.split("–")[0]), 0) if zone else 0.0
@@ -10407,18 +10409,21 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             logger.error("Live-card send error (alert path): %s", exc)
 
     # -- Auto-trade (hands-free execution; additive + fail-open) --------------
-    # AUTO enters on the FIRST FULL-conviction READY, routed through the SAME
-    # audited gateway as the manual button. Never raises into the webhook worker.
+    # AUTO enters on the FIRST ACTIONABLE READY — EARLY tier (Edge 50-59) included
+    # and intentionally half-sized (RISK_MULT_EARLY, floored at 1 contract) — routed
+    # through the SAME audited gateway as the manual button. Never raises into the
+    # webhook worker.
     #
     # SCALP timing fix: the auto trigger must NOT be gated on the journal dedup.
     # A SCALP setup routinely fires EARLY READY first — which claims the journal
-    # dedup slot AND is intentionally never auto-traded (full conviction only) —
-    # then strengthens to FULL READY a bar or two later. That FULL READY is
-    # journal-deduped, so the old `journal_entry and ...` guard skipped auto
-    # entirely, delaying the entry by minutes (or missing it until the setup
-    # re-formed). Triggering on the LIVE full-READY verdict, independent of the
-    # journal, fires auto the instant the setup reaches full conviction. EARLY
-    # never auto-fires (is_full_ready excludes it; the gateway also backstops it).
+    # dedup slot — then strengthens to FULL READY a bar or two later. The old
+    # `journal_entry and ...` guard skipped auto on that journal-deduped event,
+    # delaying the entry by minutes (or missing it until the setup re-formed).
+    # Triggering on the LIVE actionable verdict, independent of the journal, fires
+    # auto the instant the setup becomes actionable. EARLY tier now auto-fires too
+    # (half-size); AUTO_FIRED_KEYS keys on (instrument, direction, zone_low) — which
+    # is identical for the EARLY and the later FULL READY of the same zone — so the
+    # setup still enters exactly once (at the EARLY point) and never double-enters.
     # AUTO_FIRED_KEYS keeps a per-setup "one entry per READY event" throttle so a
     # continuously-READY setup can't machine-gun the daily cap in minutes; the key
     # is recorded only on a CONFIRMED entry (a transient gateway failure retries on
@@ -10427,8 +10432,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # called with allow_stack=True), so distinct setups (new zones) and post-stop-out
     # re-entries can open concurrently — bounded only by the per-day cap. A STOP-OUT
     # re-arms the stopped setup (see the STOP_HIT handler) so it re-enters the instant
-    # it is READY again; a WIN intentionally does NOT re-arm. EARLY never auto-fires
-    # (is_full_ready excludes it; the gateway also backstops it).
+    # it is READY again; a WIN intentionally does NOT re-arm.
     # SWING is unchanged: it never emits EARLY and keeps the original journal-gated,
     # one-position condition (allow_stack defaults False), so its money path stays
     # byte-for-byte identical.
@@ -10438,7 +10442,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         # Edge-verdict SCALP auto trigger is disabled here to avoid a double entry.
         # Flag OFF => this condition is byte-identical to before.
         if (not DUAL_TF_ENGINE
-                and is_full_ready(a.get("verdict"))
+                and is_actionable(a.get("verdict"))
                 and auto_trade_enabled(resolved_inst)):
             _setup_key = _auto_setup_key(a, resolved_inst)
             with AUTO_TRADE_LOCK:
@@ -12659,11 +12663,9 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         if not is_actionable(verdict):
             return {"status": "error",
                             "reason": f"No ready setup ({verdict or 'WAIT'}). Wait for a Long/Short READY."}, 409
-        # Hands-free AUTO execution fires on FULL-conviction READY only — an EARLY-tier
-        # (Edge 50-59) setup is shown and manually tradeable, but never auto-sent.
-        if source == "auto" and is_early_ready(verdict):
-            return {"status": "skipped",
-                    "reason": "EARLY-tier setup — auto-execution fires on full READY only."}, 200
+        # Hands-free AUTO execution fires on ANY actionable setup — EARLY tier
+        # (Edge 50-59) included. EARLY entries are sized down (half-size) by
+        # _setup_risk_mult below, never blocked here.
 
         tp = a["trade_plan"]
         if not tp.get("trade_plan") or not tp.get("entry_zone"):

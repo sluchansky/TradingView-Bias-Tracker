@@ -1,16 +1,28 @@
 ---
 name: SCALP auto-execute trigger timing
-description: Why SCALP hands-free auto-entry triggers on the LIVE full-READY verdict (not the journal dedup), how it stays "fire once per setup", and how stacking + re-entry-after-stop-out are layered on without breaking SWING.
+description: Why SCALP hands-free auto-entry triggers on the LIVE actionable verdict (EARLY tier included, half-size), not the journal dedup; how it stays "fire once per setup"; and how stacking + re-entry-after-stop-out are layered on without breaking SWING.
 ---
 
 # SCALP auto-execute trigger timing
 
-**Rule:** SCALP hands-free auto-entry fires on the LIVE full-READY verdict
-(`is_full_ready`), decoupled from the journal dedup object. "Fire exactly once
-per setup" is enforced by a dedicated per-setup set `AUTO_FIRED_KEYS` keyed
-`(instrument, direction, zone_low)` — the SAME identity the journal dedups on —
-recorded ONLY on a confirmed broker entry. SWING keeps the original
-journal-gated condition (`journal_entry and is_actionable`) verbatim.
+**Rule:** SCALP hands-free auto-entry fires on the LIVE ACTIONABLE verdict
+(`is_actionable` — EARLY tier Edge 50-59 INCLUDED, not just full READY), decoupled
+from the journal dedup object. EARLY entries are half-sized via `RISK_MULT_EARLY`
+(0.5, floored at 1 contract by `_risk_capped_contracts`). "Fire exactly once per
+setup" is enforced by a dedicated per-setup set `AUTO_FIRED_KEYS` keyed
+`(instrument, direction, zone_low)` via `ready_direction` — IDENTICAL for the EARLY
+and the later FULL READY of the same zone — so the setup enters once (at the EARLY
+point) and the strengthen-to-FULL does NOT double-enter. Recorded ONLY on a
+confirmed broker entry. SWING keeps the original journal-gated condition
+(`journal_entry and is_actionable`) verbatim — and SWING never emits EARLY, so
+`is_actionable == is_full_ready` there (SWING money path unchanged).
+
+**EARLY now auto-fires (operator request "get earlier entries"):** changed from
+`is_full_ready` → `is_actionable` at the SCALP trigger AND removed the gateway's
+`source=="auto" and is_early_ready` skip backstop. The gateway now sizes EARLY down
+(via `_setup_risk_mult`) instead of rejecting it. The auto size is still effectively
+1 contract (AUTO_TRADE_CONTRACTS=1, the half-size mult can't go below the 1-contract
+floor) — true half-sizing only kicks in if AUTO_TRADE_CONTRACTS rises.
 
 **STACKING + re-entry-after-stop-out (operator request, SCALP-only):** a live
 position NO LONGER blocks a new SCALP auto entry. The webhook SCALP block dropped
@@ -35,15 +47,16 @@ setup (only the tracked position's stop-out re-arms). Operator explicitly accept
 this. Re-arm only fires on the app's price-based STOP_HIT detection (needs a
 price-bearing webhook crossing the stop) — NOT on a CLOSE webhook or manual close.
 
-**Why:** A SCALP setup routinely fires EARLY READY first (Edge 50-59, half-size,
-intentionally NEVER auto-traded). The EARLY READY CLAIMS the journal dedup slot,
-so when the setup strengthens to FULL READY (Edge >= 60) a bar or two later that
-FULL READY is journal-deduped (`journal_entry=None`). The old auto trigger was
-gated on `journal_entry`, so it skipped the FULL READY entirely — auto entered
-minutes late, or only when the setup re-formed. Real complaint: "getting in too
-late, should sell on the first short ready not 3 min later." Operator runs
-AUTO-EXECUTE hands-free on a real prop account and chose "enter on the first
-FULL-conviction READY at full size."
+**Why:** A SCALP setup routinely fires EARLY READY first (Edge 50-59, half-size),
+which CLAIMS the journal dedup slot, then strengthens to FULL READY (Edge >= 60) a
+bar or two later — that FULL READY is journal-deduped (`journal_entry=None`). The
+original auto trigger was gated on `journal_entry`, so it skipped the FULL READY
+entirely — auto entered minutes late, or only when the setup re-formed. Real
+complaint: "getting in too late, should sell on the first short ready not 3 min
+later." Operator runs AUTO-EXECUTE hands-free on a real prop account. The trigger
+was first decoupled from the journal to enter on the first FULL READY; then (this
+change) widened to `is_actionable` so it enters on the FIRST EARLY READY of the
+setup — the earliest actionable point — at half-size.
 
 **Why the per-setup guard:** the journal dedup is session-persistent (cleared
 only by `POST /clear`), so the OLD code got "auto fires once per setup, never
@@ -62,8 +75,9 @@ tracking write throws (the position is real; must not re-send → verify broker)
    + STOP_HIT re-arm gated on SCALP. SWING never emits EARLY (so
    `is_actionable == is_full_ready`) and never populates `AUTO_FIRED_KEYS`, so its
    money path stays behaviorally byte-identical.
-2. Keep EARLY out of auto (full conviction only); the gateway also backstops
-   `source=="auto" and is_early_ready`.
+2. SCALP auto fires on `is_actionable` (EARLY tier INCLUDED). The old gateway
+   `source=="auto" and is_early_ready` skip backstop is REMOVED — do NOT re-add it.
+   EARLY must remain half-sized via `_setup_risk_mult` (never blocked outright).
 3. Preserve the per-setup once-guard + its confirmed-send-only marking + the
    `/clear` reset (and empty-on-restart, when AUTO also resets OFF). For SCALP,
    the once-guard is now RELEASED on stop-out (re-arm) but NEVER on a win.
