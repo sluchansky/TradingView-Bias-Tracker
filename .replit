@@ -24,6 +24,14 @@ args = "TradingView Webhook Server"
 task = "workflow.run"
 args = "pycompile"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "parity"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "swing_golden"
+
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
 author = "agent"
@@ -40,9 +48,31 @@ waitForPort = 8000
 name = "pycompile"
 author = "agent"
 
+[workflows.workflow.metadata]
+isValidation = true
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "/home/runner/workspace/.pythonlibs/bin/python3 -m py_compile artifacts/tradingview-webhook/app.py"
+args = "/home/runner/workspace/.pythonlibs/bin/python3 -m py_compile artifacts/tradingview-webhook/app.py && echo PYCOMPILE_OK"
+
+[[workflows.workflow]]
+name = "parity"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_parity.sh"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "swing_golden"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_swing_golden.sh"
 
 [workflows.workflow.metadata]
 isValidation = true

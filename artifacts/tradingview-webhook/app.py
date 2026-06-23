@@ -501,6 +501,31 @@ MODES = {
         # Faster READY re-check / re-post cadence (seconds) so the probability tracks
         # fresh moves. SWING keeps 300. Env TRADE_READY_INTERVAL still overrides.
         "TRADE_READY_INTERVAL_SEC": 120,
+        # ── SCALP dynamic-exit overhaul (master-flagged; SCALP-only) ──────────────
+        # Replaces the forced 1:1 with quality-gated entries + dynamic multi-target
+        # exits + delayed break-even. EVERY consumer ALSO guards on
+        # TRADING_MODE == "SCALP" and cfg("SCALP_DYNAMIC_EXITS_ENABLED"), so SWING
+        # never enters these paths regardless of the values below (the SWING mirror
+        # values are inert no-ops purely as a second safety net). TP1 = 1R (not 0.75R)
+        # so a planned 1R loss is never larger than the planned first target (req 6).
+        "SCALP_DYNAMIC_EXITS_ENABLED":        True,
+        "SCALP_TP1_R":                        1.0,   # first target at 1R
+        "SCALP_TP2_R":                        1.5,   # second target at 1.5R
+        "SCALP_RUNNER_R":                     2.0,   # optional runner at 2R (strong trend only)
+        "SCALP_RUNNER_MIN_EDGE":              75,    # runner only when Edge >= this (== EDGE_STRONG_THRESHOLD)
+        "SCALP_TP1_PCT":                      0.5,   # scale-out fraction booked at TP1
+        "SCALP_TP2_PCT":                      0.25,  # scale-out fraction booked at TP2
+        "SCALP_RUNNER_PCT":                   0.25,  # remainder to the runner (folds into TP2 when no runner)
+        "SCALP_ROOM_MIN_R":                   1.25,  # require >= this R of room to the nearest opposing zone
+        "SCALP_OPPOSING_ZONE_BUFFER_R":       0.25,  # "entering opposing zone" buffer (R) just ahead of entry
+        "SCALP_MIN_SETUP_QUALITY":            70,    # min setupQualityScore (0-100) to allow a trade
+        "SCALP_CHOP_VWAP_BAND_ATR":           0.15,  # price within +/- this*ATR of VWAP counts as "at VWAP"
+        "SCALP_CHOP_CROSS_COUNT":             3,     # this many VWAP crossings in the window = chop
+        "SCALP_CHOP_WINDOW_MIN":              10,    # lookback window (min) for the chop crossing count
+        "SCALP_CHOP_INBAND_RATIO":            0.6,   # >= this fraction of window ticks idling at VWAP = sideways chop
+        "SCALP_BE_AFTER_TP1_ONLY":            True,  # never move stop to BE before TP1 is hit
+        "SCALP_BE_REQUIRE_FAVOR_CLOSE_OR_1R": True,  # after TP1, BE only on favorable close OR price >= 1R
+        "SCALP_LOSS_LE_FIRST_TARGET":         True,  # skip if planned loss > planned first target
     },
     "SWING": {
         "BIAS_THRESHOLD":    3,
@@ -558,6 +583,29 @@ MODES = {
         "MAX_RISK_DOLLARS":         100,
         "TRADE_READY_INTERVAL_SEC": 300,
         "RISK_MULT_EARLY":          1.0,
+        # ── SCALP dynamic-exit overhaul knobs — INERT in SWING ────────────────────
+        # SWING is gated out of the overhaul (every consumer guards on
+        # TRADING_MODE == "SCALP"). These mirror keys exist only so cfg() never
+        # KeyErrors when a shared helper reads one under SWING; their values disable
+        # every new rule as a second safety net (master flag OFF, all vetoes inert).
+        "SCALP_DYNAMIC_EXITS_ENABLED":        False,
+        "SCALP_TP1_R":                        1.0,
+        "SCALP_TP2_R":                        1.5,
+        "SCALP_RUNNER_R":                     2.0,
+        "SCALP_RUNNER_MIN_EDGE":              80,
+        "SCALP_TP1_PCT":                      0.5,
+        "SCALP_TP2_PCT":                      0.25,
+        "SCALP_RUNNER_PCT":                   0.25,
+        "SCALP_ROOM_MIN_R":                   0.0,
+        "SCALP_OPPOSING_ZONE_BUFFER_R":       0.0,
+        "SCALP_MIN_SETUP_QUALITY":            0,
+        "SCALP_CHOP_VWAP_BAND_ATR":           0.0,
+        "SCALP_CHOP_CROSS_COUNT":             999,
+        "SCALP_CHOP_WINDOW_MIN":              0,
+        "SCALP_CHOP_INBAND_RATIO":            1.1,
+        "SCALP_BE_AFTER_TP1_ONLY":            False,
+        "SCALP_BE_REQUIRE_FAVOR_CLOSE_OR_1R": False,
+        "SCALP_LOSS_LE_FIRST_TARGET":         False,
     },
 }
 
@@ -5678,6 +5726,274 @@ def _apply_orb_target_override(result):
 
 
 # ---------------------------------------------------------------------------
+# SCALP dynamic-exit overhaul — diagnostics (Phase S1 = DISPLAY-ONLY)
+# ---------------------------------------------------------------------------
+# These two helpers compute the setup-quality / room / dynamic-exit / chop
+# DIAGNOSTICS that the dashboard renders and that the later money-path phases
+# (S2 entry vetoes, S3 dynamic targets, S4 exit lifecycle) consume. In S1 they
+# are purely additive: result["scalp_quality"] is attached but NOTHING here
+# changes the verdict, the trade_plan, sizing, dedupe, or the broker path.
+# Everything is gated on TRADING_MODE == "SCALP" and cfg("SCALP_DYNAMIC_EXITS_
+# ENABLED") and FAILS OPEN (degrades to None/unknown, never raises), so SWING and
+# the disabled state are byte-identical to today.
+
+def _vwap_chop_status(inst, vwap_value, atr_pts):
+    """Band-filtered VWAP chop detector over the recent tick history.
+
+    Counts how many times price has *committed* to the opposite side of VWAP within
+    the last SCALP_CHOP_WINDOW_MIN minutes — a tick only commits to a side once it
+    clears +/- SCALP_CHOP_VWAP_BAND_ATR * ATR of VWAP, so micro-oscillation inside
+    the band is ignored. Choppy when crossings >= SCALP_CHOP_CROSS_COUNT.
+
+    FAIL-OPEN: returns status "unknown" (never "choppy") when VWAP/ATR/window are
+    missing or there are too few recent ticks. Pure read — no state mutation, no
+    money-path effect (the S2 veto consumes this; S1 only displays it).
+    """
+    win = cfg("SCALP_CHOP_WINDOW_MIN")
+    band_mult = cfg("SCALP_CHOP_VWAP_BAND_ATR")
+    if not (vwap_value and atr_pts and win):
+        return {"status": "unknown", "crossings": None, "window_min": win,
+                "in_band_ratio": None,
+                "detail": "Chop detection unavailable (no VWAP / ATR / window)."}
+    band = band_mult * atr_pts
+    with INTRADAY_LOCK:
+        rec   = INTRADAY_BY_TICKER.get(inst)
+        ticks = list((rec or {}).get("ticks") or [])
+    cut = now_utc() - timedelta(minutes=win)
+    side = 0          # +1 = committed above VWAP, -1 = committed below, 0 = in band
+    crossings = 0
+    seen = 0
+    in_band = 0
+    for t_iso, p in ticks:
+        try:
+            t = datetime.fromisoformat(t_iso)
+        except (ValueError, TypeError):
+            continue
+        if t < cut:
+            continue
+        seen += 1
+        if p > vwap_value + band:
+            cur = 1
+        elif p < vwap_value - band:
+            cur = -1
+        else:
+            cur = 0
+            in_band += 1
+        if cur != 0:
+            if side != 0 and cur != side:
+                crossings += 1
+            side = cur
+    if seen < 4:
+        return {"status": "unknown", "crossings": crossings, "window_min": win,
+                "in_band_ratio": None,
+                "detail": "Not enough recent ticks for chop detection."}
+    in_band_ratio = round(in_band / seen, 3)
+    cross_chop = crossings >= cfg("SCALP_CHOP_CROSS_COUNT")
+    # Sideways: price idling AT VWAP (inside the band) for most of the window is just
+    # as untradeable as repeatedly crossing it — both mean "no clean trend" (req 5).
+    sideways = bool(in_band_ratio >= cfg("SCALP_CHOP_INBAND_RATIO"))
+    choppy = cross_chop or sideways
+    if choppy:
+        why = ("sideways at VWAP" if sideways and not cross_chop
+               else "repeatedly crossing VWAP" if cross_chop and not sideways
+               else "sideways + crossing VWAP")
+        detail = (f"{crossings} VWAP crossing(s), {int(in_band_ratio * 100)}% idle "
+                  f"in {win}m — {why}.")
+    else:
+        detail = f"{crossings} VWAP crossing(s) in {win}m — trending / clear."
+    return {"status": "choppy" if choppy else "clear",
+            "crossings": crossings, "window_min": win,
+            "in_band_ratio": in_band_ratio, "detail": detail}
+
+
+def compute_scalp_quality(direction, current_price, vwap_value, vwap_status,
+                          nearest_supply, nearest_demand, plan, edge_score,
+                          inst, atr_pts):
+    """SCALP setup-quality + dynamic-exit DIAGNOSTICS (S1 = DISPLAY-ONLY, no veto).
+
+    Returns a single nested block (surfaced at result["scalp_quality"]) with the five
+    setup-quality components (trend / VWAP / structure agree, not entering the opposing
+    zone, enough room), the room-to-nearest-opposing-zone in R, the planned dynamic-exit
+    geometry (TP1 / TP2 / optional runner as R-multiples off the plan's risk), the
+    loss-size check (req 6), and the VWAP chop status (req 5).
+
+    The schema keys are ALWAYS present (None / unknown when not computable) so /status
+    key-whitelisting, the dashboard, and any hard-indexing reader never KeyError on a
+    quiet or forming setup. FAIL-OPEN: any sub-computation that can't run degrades to
+    None rather than raising. NOTHING here changes the verdict in S1 — the money-path
+    vetoes that consume these numbers land in S2 (entry), S3 (targets), S4 (exits).
+    """
+    enabled = bool(TRADING_MODE == "SCALP" and cfg("SCALP_DYNAMIC_EXITS_ENABLED"))
+    out = {
+        "enabled": enabled,
+        "direction": direction,
+        "setup_quality_score": None,
+        "quality_components": {
+            "trend_agrees": None, "vwap_agrees": None, "structure_agrees": None,
+            "not_entering_opposing_zone": None, "enough_room": None,
+        },
+        "min_quality": cfg("SCALP_MIN_SETUP_QUALITY"),
+        "quality_pass": None,
+        "room_to_target_r": None,
+        "room_min_r": cfg("SCALP_ROOM_MIN_R"),
+        "room_pass": None,
+        "nearest_opposing_zone": None,
+        "initial_risk_pts": None,
+        "initial_risk_dollars": None,
+        "planned_reward_pts": None,
+        "targets": [],
+        "rr": None,
+        "rr_num": None,
+        "runner_enabled": False,
+        "chop_status": "unknown",
+        "chop_crossings": None,
+        "chop_in_band_ratio": None,
+        "chop_window_min": cfg("SCALP_CHOP_WINDOW_MIN"),
+        "loss_le_first_target": None,
+        "loss_pts": None,
+        "first_target_pts": None,
+        # Live-trade lifecycle fields — populated later by the active-trade tracker
+        # (S4) and rendered on the dashboard (S5). Present now for a stable schema.
+        "be_moved": None,
+        "exit_reason": None,
+        "overall_pass": None,
+        "notes": [],
+    }
+    if not enabled:
+        return out
+    try:
+        # Chop is independent of plan/direction — always compute it.
+        chop = _vwap_chop_status(inst, vwap_value, atr_pts)
+        out["chop_status"]       = chop["status"]
+        out["chop_crossings"]    = chop["crossings"]
+        out["chop_in_band_ratio"] = chop.get("in_band_ratio")
+
+        if direction not in ("Long", "Short"):
+            return out      # forming / no candidate — chop only
+
+        snap = _strategy_signal_snapshot(inst)
+        structure_long  = bool(snap.get("structure_long"))
+        structure_short = bool(snap.get("structure_short"))
+        vwap_ok = bool(vwap_status == "ok" and vwap_value is not None
+                       and current_price is not None)
+        price_above = bool(vwap_ok and current_price > vwap_value)
+        price_below = bool(vwap_ok and current_price < vwap_value)
+
+        if direction == "Long":
+            structure_agrees = structure_long
+            vwap_agrees      = price_above
+            trend_agrees     = bool(structure_long and price_above and not structure_short)
+            opposing_zone    = nearest_supply
+        else:
+            structure_agrees = structure_short
+            vwap_agrees      = price_below
+            trend_agrees     = bool(structure_short and price_below and not structure_long)
+            opposing_zone    = nearest_demand
+        out["nearest_opposing_zone"] = opposing_zone
+
+        # Plan geometry — read NUMERIC management fields (never parse display strings).
+        mgmt  = (plan or {}).get("management") or {}
+        entry = mgmt.get("entry")
+        risk  = (plan or {}).get("risk_points") or mgmt.get("risk_points")
+        pv    = (plan or {}).get("point_value")
+        has_geo = bool((plan or {}).get("trade_plan") and entry is not None
+                       and risk and risk > 0)
+
+        # ── Room to the opposing zone + "not entering opposing zone" (req 1/2). The
+        #    opposing zone must sit >= SCALP_OPPOSING_ZONE_BUFFER_R * risk BEYOND the
+        #    entry, in the trade direction. Falls back to current_price as the entry
+        #    reference when there is no actionable plan yet.
+        ref = entry if entry is not None else current_price
+        not_entering = None
+        room_r = None
+        if opposing_zone is not None and ref is not None:
+            room_pts = (opposing_zone - ref) if direction == "Long" else (ref - opposing_zone)
+            if risk and risk > 0:
+                room_r = round(room_pts / risk, 2)
+                not_entering = bool(room_pts > cfg("SCALP_OPPOSING_ZONE_BUFFER_R") * risk)
+                out["room_pass"] = bool(room_r >= cfg("SCALP_ROOM_MIN_R"))
+            else:
+                not_entering = bool(room_pts > 0)
+        elif opposing_zone is None:
+            # No opposing zone in view → not entering one, room unconstrained.
+            not_entering = True
+            out["room_pass"] = True
+        out["room_to_target_r"] = room_r
+        enough_room = out["room_pass"]
+
+        # ── Setup-quality score: five equal 20-pt components (req 1). Unknown (None)
+        #    components score 0 but are reported so the dashboard can show WHY.
+        comps = {
+            "trend_agrees": trend_agrees,
+            "vwap_agrees": vwap_agrees,
+            "structure_agrees": structure_agrees,
+            "not_entering_opposing_zone": not_entering,
+            "enough_room": enough_room,
+        }
+        out["quality_components"] = comps
+        score = sum(20 for v in comps.values() if v is True)
+        out["setup_quality_score"] = score
+        out["quality_pass"] = bool(score >= cfg("SCALP_MIN_SETUP_QUALITY"))
+
+        # ── Planned dynamic-exit geometry (preview of S3). Targets are R-multiples off
+        #    the plan's risk; the runner only when Edge >= SCALP_RUNNER_MIN_EDGE.
+        if has_geo:
+            tp1_r = cfg("SCALP_TP1_R"); tp2_r = cfg("SCALP_TP2_R"); run_r = cfg("SCALP_RUNNER_R")
+            runner_enabled = bool(isinstance(edge_score, (int, float))
+                                  and edge_score >= cfg("SCALP_RUNNER_MIN_EDGE"))
+            out["runner_enabled"]   = runner_enabled
+            out["initial_risk_pts"] = round(risk, 2)
+            if pv:
+                out["initial_risk_dollars"] = round(risk * pv, 2)
+
+            def tgt(r_mult):
+                return round((entry + r_mult * risk) if direction == "Long"
+                             else (entry - r_mult * risk), 2)
+
+            targets = [
+                {"label": "TP1", "r": tp1_r, "price": tgt(tp1_r), "pct": cfg("SCALP_TP1_PCT")},
+                {"label": "TP2", "r": tp2_r, "price": tgt(tp2_r), "pct": cfg("SCALP_TP2_PCT")},
+            ]
+            if runner_enabled:
+                targets.append({"label": "Runner", "r": run_r, "price": tgt(run_r),
+                                "pct": cfg("SCALP_RUNNER_PCT")})
+            else:
+                # No runner: its share folds into TP2 (the final exit).
+                targets[1]["pct"] = round(cfg("SCALP_TP2_PCT") + cfg("SCALP_RUNNER_PCT"), 4)
+            out["targets"] = targets
+
+            out["first_target_pts"]   = round(tp1_r * risk, 2)
+            out["planned_reward_pts"] = out["first_target_pts"]
+            out["loss_pts"]           = round(risk, 2)
+            # req 6: planned loss (1R) must not exceed the planned FIRST target.
+            out["loss_le_first_target"] = bool(risk <= tp1_r * risk + 1e-9)
+
+            final_r = run_r if runner_enabled else tp2_r
+            out["rr_num"] = float(final_r)
+            out["rr"]     = f"1:{final_r:g}"
+
+        # ── Overall display gate (NO veto in S1): every known check passes + not choppy.
+        checks = [out["quality_pass"], out["room_pass"], out["loss_le_first_target"]]
+        not_choppy = (out["chop_status"] != "choppy")
+        if all(c is not None for c in checks):
+            out["overall_pass"] = bool(all(checks) and not_choppy)
+
+        notes = []
+        if out["quality_pass"] is False:
+            notes.append(f"Setup quality {score} < {cfg('SCALP_MIN_SETUP_QUALITY')}.")
+        if out["room_pass"] is False and room_r is not None:
+            notes.append(f"Only {room_r}R room to opposing zone (need {cfg('SCALP_ROOM_MIN_R')}R).")
+        if out["chop_status"] == "choppy":
+            notes.append("Chop filter: price oscillating around VWAP.")
+        if out["loss_le_first_target"] is False:
+            notes.append("Planned loss exceeds first target.")
+        out["notes"] = notes
+    except Exception as exc:   # FAIL-OPEN — diagnostics must never break analysis.
+        out["notes"] = [f"scalp_quality computation skipped: {exc}"]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Full analysis
 # ---------------------------------------------------------------------------
 
@@ -7700,6 +8016,24 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _blk = result["directions"].get(_d)
             if _blk:
                 _blk.update(ready=False, label="WAIT")
+    # ── SCALP dynamic-exit DIAGNOSTICS (Phase S1 = DISPLAY-ONLY) ──────────────
+    # Computed from the FINAL post-override result so it reflects every WAIT/closed
+    # override above. SCALP-only + flag-gated inside the helper (SWING / disabled →
+    # an inert block, no behaviour change). Direction is the authoritative strict
+    # direction (or the gate's candidate while forming); neutral while closed.
+    _sq_dir = result.get("strict_direction")
+    if not _sq_dir and result.get("market_open"):
+        _sq_dir = strict.get("candidate")
+    if not result.get("market_open"):
+        _sq_dir = None
+    result["scalp_quality"] = compute_scalp_quality(
+        _sq_dir, result.get("current_price"), result.get("vwap_value"),
+        result.get("vwap_status"), result.get("nearest_supply"),
+        result.get("nearest_demand"), result.get("trade_plan"),
+        result.get("edge_score"), instrument_of(active_ticker),
+        (result.get("volatility") or {}).get("atr_pts"),
+    )
+
     # Adaptive-learning: cache the freshest engine+indicator snapshot per instrument
     # so a setup that registers right after this can be tagged with its entry context.
     try:
