@@ -34,17 +34,19 @@ Same-bar collisions resolve WORST-CASE, stop first. This includes the runner: th
 bar where TP1 fills, if that same bar also revisits breakeven, the runner is closed
 at BE on that bar (don't optimistically carry it to the next bar). See `_walk_trade`.
 
-## Stop math is COPIED from live — keep it byte-faithful (hard-reject + snap-only)
-`bt_stop_plan` mirrors live `_dynamic_stop_plan`: HARD-REJECT (return None → no trade) when the
-calculated stop distance is below the mode `min_stop_pts`, then snap UP to whole ticks.
-`min_stop_ticks` is **metadata only**, NOT a tick floor. **A *partial* mirror is worse than
-none:** an earlier version kept the old `max(ceil, min_ticks)` floor and skipped the min_pts
-reject, so a tiny-ATR setup that live REJECTS became a floored trade in research — materially
-wrong results with false confidence. Locked by `test_backtest_stop_parity.py` (NORMAL-regime
-output equality vs live + the tiny-ATR rejection). The HIGH-volatility branch is intentionally
-out of the direct equality test: live keys it off HIGH_CAUTION/HIGH_BLOCK regimes, the backtest
-off its own "VOLATILE" label. `BT_SPECS` must carry `min_stop_pts`/`scalp_min_stop_pts` mirroring
-live `INSTRUMENT_SPECS`.
+## Stop math is COPIED from live — keep it byte-faithful (MODE-SPLIT reject + snap-only)
+`bt_stop_plan` mirrors live `_dynamic_stop_plan`, including the **mode-split minimum**: SWING
+HARD-REJECTS (return None → no trade) when the calculated stop is below the mode `min_stop_pts`;
+**SCALP has NO minimum** (`scalp_min_stop_pts`/`scalp_min_stop_ticks` = 0) so a tiny-ATR SCALP
+setup is ALLOWED and only snapped UP to whole ticks. `min_stop_ticks` is **metadata only**, NOT a
+tick floor. **A *partial* mirror is worse than none:** an earlier version kept the old
+`max(ceil, min_ticks)` floor and skipped the min_pts reject, so a tiny-ATR setup that live
+REJECTS became a floored trade in research — materially wrong results with false confidence.
+Locked by `test_backtest_stop_parity.py`: SCALP tiny-ATR ALLOWED with output equality vs live,
+SWING tiny-ATR REJECTED in both (NORMAL-regime). The HIGH-volatility branch is intentionally out
+of the direct equality test: live keys it off HIGH_CAUTION/HIGH_BLOCK regimes, the backtest off
+its own "VOLATILE" label. `BT_SPECS` must carry `min_stop_pts`/`scalp_min_stop_pts` (=0) mirroring
+live `INSTRUMENT_SPECS` — both engines now keep the SCALP min as a literal 0 (not env-read).
 
 ## Express raw-body scoping (DoS surface)
 Large request bodies are needed by exactly ONE endpoint: `/api/backtest/upload`.

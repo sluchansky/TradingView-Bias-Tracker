@@ -2,16 +2,16 @@
 
 Pure-function tests for `_dynamic_stop_plan` and `build_strict_trade_plan`. They
 exercise: multiplier precedence (VOLATILITY WINS over mode, mode-tunable knobs),
-structure-vs-ATR (wider wins), the per-instrument HARD minimum-stop guard
-(too-tight stops are REJECTED outright — no silent widening, so there is no longer
-an artificial tick "floor"), directional safety, MGC/MNQ symmetry, risk-dollar
-math, ATR-unavailable -> no plan (WAIT), and the FIXED 1:1 R:R model (every plan is
-exactly 1:1; the legacy "<1:2 on TP2 -> no trade" veto no longer fires in either
-mode — ENFORCE_MIN_RR is retained config but unused).
+structure-vs-ATR (wider wins), the mode-aware minimum-stop guard (SWING rejects
+too-tight stops outright; SCALP has NO minimum so a tight stop is allowed as-is,
+snapped only to the tick grid — no artificial widening), directional safety,
+MGC/MNQ symmetry, risk-dollar math, ATR-unavailable -> no plan (WAIT), and the
+FIXED 1:1 R:R model (every plan is exactly 1:1; the legacy "<1:2 on TP2 -> no trade"
+veto no longer fires in either mode — ENFORCE_MIN_RR is retained config but unused).
 
 Mode profiles under test (SCALP is the retuned "cut losers fast" profile; SWING is
 unchanged / byte-for-byte):
-  • SCALP: multiplier 0.75 / 1.25; MGC min 3 pts / 30 ticks; MNQ min 10 pts / 40 ticks.
+  • SCALP: multiplier 0.75 / 1.25; NO minimum stop (0) — tight stops allowed.
   • SWING: multiplier 1.5  / 2.0 ; MGC min 5 pts / 50 ticks; MNQ min 20 pts / 40 ticks.
 
 Runnable two ways:
@@ -112,24 +112,65 @@ def test_structure_wider_than_atr_wins_short():
     assert r["calculated_stop"] == 2011.0
 
 
-def test_scalp_hard_min_stop_rejects_too_tight_mgc():
-    # No silent widening: a stop tighter than the SCALP MGC minimum (3 pts) is
-    # REJECTED outright. atr 0.2 * 0.75 = 0.15 pts << 3.0 -> ok False.
+def test_scalp_no_minimum_allows_tight_stop_mgc():
+    # SCALP has NO minimum stop: a stop far tighter than the legacy 3-pt floor is
+    # ALLOWED as-is (snapped only to the tick grid). atr 0.2 * 0.75 = 0.15 pts ->
+    # ceil(0.15 / 0.1) = 2 ticks -> 0.2 pts; ok True (no rejection).
     r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                _vol(atr=0.2, regime="NORMAL"), "SCALP")
+    assert r["ok"] is True
+    assert r["stop_valid"] is True
+    assert r["stop_invalid_reason"] is None
+    assert r["stop_distance_ticks"] >= 1
+    assert r["final_stop"] < 2000.0
+
+
+def test_swing_minimum_still_rejects_tight_stop_mgc():
+    # SWING is unchanged byte-for-byte: the same tiny ATR is still REJECTED below the
+    # SWING MGC minimum (5 pts). atr 0.2 * 1.5 = 0.3 pts << 5.0 -> ok False.
+    r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
+                               _vol(atr=0.2, regime="NORMAL"), "SWING")
     assert r["ok"] is False
-    assert "too tight" in r["reason"]
+    assert r["stop_valid"] is False
+    assert "too tight" in r["stop_invalid_reason"]
+
+
+def test_scalp_min_hard_disabled_ignores_legacy_env():
+    # PRODUCTION SAFETY: the SCALP minimum is HARD-DISABLED in code (literal 0), NOT
+    # read from env. A stale legacy *_SCALP_MIN_STOP_* secret in prod must NEVER
+    # re-enable the SCALP rejection. Import app fresh in a subprocess with the legacy
+    # vars set to their OLD nonzero values and assert the SCALP mins are still 0.
+    import os, sys, subprocess, json
+    env = dict(os.environ)
+    env.update({
+        "MGC_SCALP_MIN_STOP_PTS": "3.0",  "MGC_SCALP_MIN_STOP_TICKS": "30",
+        "MNQ_SCALP_MIN_STOP_PTS": "10.0", "MNQ_SCALP_MIN_STOP_TICKS": "40",
+    })
+    code = (
+        "import json, app\n"
+        "s = app.INSTRUMENT_SPECS\n"
+        "print('RESULT:' + json.dumps({"
+        "'mgc_pts': s['MGC']['scalp_min_stop_pts'], 'mgc_ticks': s['MGC']['scalp_min_stop_ticks'],"
+        "'mnq_pts': s['MNQ']['scalp_min_stop_pts'], 'mnq_ticks': s['MNQ']['scalp_min_stop_ticks']}))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                         text=True, timeout=120,
+                         cwd=os.path.dirname(os.path.abspath(__file__)))
+    assert out.returncode == 0, out.stderr
+    line = next(l for l in out.stdout.splitlines() if l.startswith("RESULT:"))
+    d = json.loads(line[len("RESULT:"):])
+    assert d["mgc_pts"] == 0.0 and d["mgc_ticks"] == 0, d
+    assert d["mnq_pts"] == 0.0 and d["mnq_ticks"] == 0, d
 
 
 def test_scalp_mgc_valid_stop_snaps_and_surfaces_metadata():
-    # atr 5.0 * 0.75 = 3.75 pts (> 3.0 min) -> ok; snaps UP to whole ticks (0.1, so
-    # 37.5 -> 38) and surfaces the SCALP MGC min_stop_ticks (30) as metadata. The
-    # minimum is enforced by REJECTION (above), not by flooring this distance up.
+    # atr 5.0 * 0.75 = 3.75 pts -> snaps UP to whole ticks (0.1, so 37.5 -> 38). SCALP
+    # has no minimum, so min_stop_ticks metadata is 0 (nothing floored or rejected).
     r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                _vol(atr=5.0, regime="NORMAL"), "SCALP")
     assert r["ok"] is True
     assert r["multiplier"] == 0.75
-    assert r["min_stop_ticks"] == 30
+    assert r["min_stop_ticks"] == 0
     assert r["stop_distance_ticks"] == 38          # ceil(37.5)
     assert round(r["risk_points"], 4) == 3.8
     assert r["final_stop"] == 1996.2
@@ -145,14 +186,14 @@ def test_long_stop_below_entry_short_stop_above():
 
 
 def test_symmetry_specs_mgc_mnq():
-    # SCALP min_stop_ticks metadata + tick size: MGC 30 @ 0.1, MNQ 40 @ 0.25. ATRs
-    # chosen so each stop clears its instrument's SCALP minimum and isn't rejected.
+    # SCALP has no minimum -> min_stop_ticks metadata is 0 for both; only the tick
+    # sizes differ (MGC 0.1, MNQ 0.25).
     rg = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                 _vol(atr=5.0), "SCALP")
     rq = app._dynamic_stop_plan("Long", 20000.0, None, None, "MNQ",
                                 _vol(atr=20.0), "SCALP")
-    assert (rg["min_stop_ticks"], rg["tick_size"]) == (30, 0.1)
-    assert (rq["min_stop_ticks"], rq["tick_size"]) == (40, 0.25)
+    assert (rg["min_stop_ticks"], rg["tick_size"]) == (0, 0.1)
+    assert (rq["min_stop_ticks"], rq["tick_size"]) == (0, 0.25)
 
 
 def test_swing_specs_unchanged():
@@ -195,8 +236,9 @@ def test_plan_success_long_surfaces_metadata():
     assert p["trade_plan"] is True
     assert p["atr_pts"] == 10.0
     assert p["atr_multiplier"] == 0.75
-    assert p["min_stop_ticks"] == 30
-    assert p["stop_distance_ticks"] >= 30
+    assert p["min_stop_ticks"] == 0
+    assert p["stop_distance_ticks"] >= 1
+    assert p["stop_valid"] is True
     assert p["risk_dollars_per_contract"] > 0
     assert p["nearest_demand"] == 1990.0
     assert float(p["stop_loss"]) < 2000.0          # below entry (Long)

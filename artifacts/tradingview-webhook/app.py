@@ -457,8 +457,10 @@ MGC_POINT_VALUE      = 10       # $10 per point per MGC contract (Micro Gold = 1
 #   stop_buf    = buffer placed BEYOND the demand/supply zone for the structure stop
 #   point_value = $ per point per contract  (MNQ Micro Nasdaq = $2, MGC Micro Gold = $10)
 #   tick_size   = minimum price increment (MGC 0.1, MNQ 0.25)
-#   min_stop_ticks = floor on the dynamic-stop distance so it can never be
-#                    unrealistically tight (MGC 50, MNQ 40 — both env-overridable)
+#   min_stop_pts   = HARD reject: a calculated stop tighter than this = no trade.
+#                    SWING keeps a real minimum (MGC 5 / MNQ 20); SCALP minimum is 0
+#                    (DISABLED) so tight stops are allowed if the setup justifies them.
+#   min_stop_ticks = metadata only (NOT a floor); the stop snaps UP to whole ticks.
 def _spec_int_env(name, default):
     try:
         return int(os.environ.get(name, default))
@@ -475,17 +477,21 @@ INSTRUMENT_SPECS = {
     "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
             "min_stop_pts": _spec_float_env("MNQ_MIN_STOP_PTS", 20.0),
-            # SCALP-only tighter floors ("cut losers fast"); SWING/default use the
-            # values above. MNQ scalp floor stays 40 ticks (= 10 pts).
-            "scalp_min_stop_ticks": _spec_int_env("MNQ_SCALP_MIN_STOP_TICKS", 40),
-            "scalp_min_stop_pts": _spec_float_env("MNQ_SCALP_MIN_STOP_PTS", 10.0),
+            # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
+            # tunable, so a stale legacy MNQ_SCALP_MIN_STOP_* secret can NEVER re-enable
+            # the rejection in production. SWING keeps its env-tunable minimum (above)
+            # byte-for-byte.
+            "scalp_min_stop_ticks": 0,
+            "scalp_min_stop_pts": 0.0,
             "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0)},
     "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
             "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
             "min_stop_pts": _spec_float_env("MGC_MIN_STOP_PTS", 5.0),
-            # SCALP-only tighter floors: MGC drops to 30 ticks (= 3 pts).
-            "scalp_min_stop_ticks": _spec_int_env("MGC_SCALP_MIN_STOP_TICKS", 30),
-            "scalp_min_stop_pts": _spec_float_env("MGC_SCALP_MIN_STOP_PTS", 3.0),
+            # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
+            # tunable, so a stale legacy MGC_SCALP_MIN_STOP_* secret can NEVER re-enable
+            # the rejection in production. SWING keeps its env-tunable minimum (above).
+            "scalp_min_stop_ticks": 0,
+            "scalp_min_stop_pts": 0.0,
             "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0)},
 }
 
@@ -4462,8 +4468,10 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     The final stop is the WIDER of two candidates — never tighter:
       • atrStop       = entry ∓ (ATR × multiplier)
       • structureStop = nearest_demand − stop_buf (Long) / nearest_supply + stop_buf (Short)
-    then floored at the instrument's `min_stop_ticks` so it can never be
-    unrealistically tight, and snapped to whole ticks.
+    then snapped UP to whole ticks. There is NO automatic widening: SWING keeps a
+    HARD minimum (`min_stop_pts` — MGC 5 / MNQ 20) below which the setup is rejected,
+    but SCALP's minimum is 0 (disabled), so a tight stop is allowed as-is when the
+    setup/zone/entry justify it (`min_stop_ticks` is display metadata, not a floor).
 
     Multiplier precedence — VOLATILITY WINS over trading mode (mode-tunable knobs):
       STOP_ATR_MULT_HIGH when the regime is elevated/extreme (HIGH_CAUTION /
@@ -4480,8 +4488,8 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     pv        = spec["point_value"]
     buf       = spec["stop_buf"]
     inst      = instrument_of(ticker)
-    # Mode-aware minimum-stop floors: SCALP uses tighter floors ("cut losers fast");
-    # SWING/default keep the historical floors byte-for-byte.
+    # Mode-aware minimum-stop: SWING keeps its HARD minimum (min_stop_pts) byte-for-
+    # byte; SCALP's minimum is 0 (disabled) so tight stops are allowed as-is.
     if (mode or TRADING_MODE) == "SCALP":
         min_ticks = int(spec.get("scalp_min_stop_ticks", spec["min_stop_ticks"]))
         min_pts   = float(spec.get("scalp_min_stop_pts", spec.get("min_stop_pts", 0.0)))
@@ -4489,16 +4497,23 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
         min_ticks = int(spec["min_stop_ticks"])
         min_pts   = float(spec.get("min_stop_pts", 0.0))
 
+    # Every rejection carries stop_valid/stop_invalid_reason for transparent display
+    # (dashboard + /status surface WHY a stop is invalid). `reason` is preserved for
+    # existing consumers (build_strict_trade_plan reads plan["reason"]).
+    def _reject(reason):
+        return {"ok": False, "stop_valid": False,
+                "stop_invalid_reason": reason, "reason": reason}
+
     vol = volatility or {}
     atr = vol.get("atr_pts")
     if vol.get("status") != "ok" or atr is None:
-        return {"ok": False, "reason": "ATR stop data unavailable"}
+        return _reject("ATR stop data unavailable")
     try:
         atr = float(atr)
     except (TypeError, ValueError):
-        return {"ok": False, "reason": "ATR stop data unavailable"}
+        return _reject("ATR stop data unavailable")
     if atr <= 0:
-        return {"ok": False, "reason": "ATR stop data unavailable"}
+        return _reject("ATR stop data unavailable")
 
     # ── Multiplier (volatility wins over mode) — mode-tunable via cfg knobs so SCALP
     #    can tighten its stops while SWING keeps the historical 1.5 / 2.0. ──
@@ -4522,34 +4537,36 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
         calc_stop = max(atr_stop, structure_stop) if structure_stop is not None else atr_stop
 
     calc_dist  = abs(entry - calc_stop)
-    # ── HARD minimum-stop guard (fixed 1:1 risk model) ──
-    # A calculated stop tighter than the instrument's minimum is REJECTED outright
-    # (no silent widening): extremely tight stops get knocked out by ordinary market
-    # noise. SWING/default MGC 5 pts / MNQ 20 pts; SCALP tightens to MGC 3 pts /
-    # MNQ 10 pts (all env-overridable). Checked on the RAW calc distance, pre-snap.
+    # ── Minimum-stop guard (SWING only; fixed 1:1 risk model) ──
+    # SWING rejects a calc stop tighter than its minimum (MGC 5 pts / MNQ 20 pts)
+    # outright — no silent widening. SCALP's minimum is 0 (min_pts == 0), so this
+    # guard is INERT for SCALP and a tight stop is allowed AS-IS (the user's "a tight
+    # stop is fine if the setup justifies it"). Env-overridable; RAW dist, pre-snap.
     if min_pts > 0 and calc_dist < min_pts:
-        return {"ok": False,
-                "reason": (f"Calculated stop {calc_dist:.1f} pts is below the {inst} "
-                           f"minimum {min_pts:g} pts — too tight, no trade.")}
+        return _reject(f"Calculated stop {calc_dist:.1f} pts is below the {inst} "
+                       f"minimum {min_pts:g} pts — too tight, no trade.")
     calc_ticks = (calc_dist / tick) if tick else 0.0
-    # Snap UP to whole ticks (never tighter than calculated). No artificial floor —
-    # the minimum-stop guard above already rejects anything too tight.
+    # Snap UP to whole ticks (grid alignment only — never widened to a minimum). SWING
+    # already rejected anything below its minimum above; SCALP has no minimum, so a
+    # tight stop passes through here at its tick-snapped distance.
     final_ticks = math.ceil(calc_ticks - 1e-9)
     final_dist  = final_ticks * tick
     final_stop  = (entry - final_dist) if direction == "Long" else (entry + final_dist)
 
     # ── Safety: the stop must sit on the correct side of entry ──
     if direction == "Long" and not (final_stop < entry):
-        return {"ok": False, "reason": "Computed stop is not below entry (Long safety)."}
+        return _reject("Computed stop is not below entry (Long safety).")
     if direction == "Short" and not (final_stop > entry):
-        return {"ok": False, "reason": "Computed stop is not above entry (Short safety)."}
+        return _reject("Computed stop is not above entry (Short safety).")
 
     risk_points = abs(entry - final_stop)
     if risk_points <= 0:
-        return {"ok": False, "reason": "Invalid stop distance."}
+        return _reject("Invalid stop distance.")
 
     return {
         "ok":                  True,
+        "stop_valid":          True,
+        "stop_invalid_reason": None,
         "multiplier":          mult,
         "atr_pts":             round(atr, 4),
         "atr_stop":            round(atr_stop, 4),
@@ -4577,9 +4594,10 @@ def build_strict_trade_plan(direction, ticker, current_price,
     """Single-target plan per instrument at a FIXED 1:1 risk:reward.
 
     The stop is sized FIRST by `_dynamic_stop_plan` (ATR×multiplier blended with the
-    nearest zone, snapped to ticks, and REJECTED outright if tighter than the
-    instrument minimum — MGC 5 pts / MNQ 20 pts). The single take-profit is then
-    placed the same distance from entry as the stop, so every plan is exactly 1:1.
+    nearest zone, snapped to ticks). SWING rejects a stop tighter than its minimum
+    (MGC 5 pts / MNQ 20 pts); SCALP has NO minimum, so a tight stop is allowed as-is
+    when the setup justifies it. The single take-profit is then placed the same
+    distance from entry as the stop, so every plan is exactly 1:1.
 
     Anchor priority: the trade-side structural zone when present (the highest-quality
     level), else VWAP. The SCALP READY gate accepts location as "near VWAP OR
@@ -4588,8 +4606,9 @@ def build_strict_trade_plan(direction, ticker, current_price,
     would say READY while the verdict silently downgraded to WAIT.
 
     Returns a no-plan dict if neither a zone nor VWAP is available to anchor the
-    entry, the ATR reading needed to size the stop is unavailable, or the calculated
-    stop is below the instrument minimum (too tight — see `_dynamic_stop_plan`).
+    entry, the ATR reading needed to size the stop is unavailable, the stop sits on
+    the wrong side of entry, or (SWING only) the calculated stop is below the
+    instrument minimum (see `_dynamic_stop_plan`).
     """
     spec = spec_for(ticker)
     inst = instrument_of(ticker)
@@ -4612,6 +4631,7 @@ def build_strict_trade_plan(direction, ticker, current_price,
                 "stop_distance_ticks": None, "risk_dollars_per_contract": None,
                 "nearest_demand": nearest_demand, "nearest_supply": nearest_supply,
                 "volatility_regime": None, "volatility_label": None,
+                "stop_valid": False, "stop_invalid_reason": reason,
                 "min_floor_applied": None}
 
     # Anchor on the trade-side zone when present, else fall back to VWAP (see
@@ -4704,6 +4724,8 @@ def build_strict_trade_plan(direction, ticker, current_price,
         "atr_stop":                  fmt(sp["atr_stop"]),
         "structure_stop":            (fmt(sp["structure_stop"]) if sp["structure_stop"] is not None else None),
         "calculated_stop":           fmt(sp["calculated_stop"]),
+        "stop_valid":                sp.get("stop_valid", True),
+        "stop_invalid_reason":       sp.get("stop_invalid_reason"),
         "min_stop_ticks":            sp["min_stop_ticks"],
         "tick_size":                 sp["tick_size"],
         "stop_distance_ticks":       sp["stop_distance_ticks"],
@@ -6283,6 +6305,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "entry_zone": None, "stop_loss": None,
             "target1":    None, "target2": None,
             "rr":         None, "direction": None,
+            "stop_valid": False,
+            "stop_invalid_reason": "Structure invalidated — zone broken.",
         }
 
     # ── Zone Mitigated: a consumed zone blocks entries UNLESS the mitigation is
@@ -6321,6 +6345,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "entry_zone": None, "stop_loss": None,
             "target1":    None, "target2": None,
             "rr":         None, "direction": None,
+            "stop_valid": False,
+            "stop_invalid_reason": "Zone consumed — wait for fresh supply or demand zone.",
         }
         setup_stage        = "Watching"
         stage_direction    = None
@@ -14302,8 +14328,11 @@ function renderDirView() {
         ? ' &nbsp;·&nbsp; Dollar Risk <b>$'+p.risk_dollars_per_contract+'</b>/ct &nbsp;·&nbsp; Expected Profit <b>$'+p.risk_dollars_per_contract+'</b>/ct'
         : '') +
       (p.atr_pts!=null
-        ? '<br>ATR <b>'+p.atr_pts+'</b> × <b>'+p.atr_multiplier+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_distance_ticks+'</b> ticks'
-        : '');
+        ? '<br>ATR <b>'+p.atr_pts+'</b> × <b>'+p.atr_multiplier+'</b> &nbsp;·&nbsp; Calc Stop <b>'+(p.calculated_stop!=null?p.calculated_stop:p.stop_loss)+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_distance_ticks+'</b> ticks'
+        : '') +
+      (p.stop_valid===false
+        ? '<br><span style="color:#ef4444">⚠ Stop invalid: '+(p.stop_invalid_reason||'see verdict')+'</span>'
+        : (p.stop_valid===true ? ' &nbsp;·&nbsp; <span style="color:#22c55e">Stop ✓ valid</span>' : ''));
   if (readyDir === dir && tp.trade_plan) {
     // READY / EARLY READY for the selected side — live plan + broker actions.
     planEl.style.display = 'block';

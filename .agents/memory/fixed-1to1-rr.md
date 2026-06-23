@@ -11,15 +11,23 @@ below**. Stop is computed first (ATR/structure/zone), snapped UP to whole ticks;
 `RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`. `build_strict_trade_plan` sets
 `target1 == target2`, `rr = "1:1"`, `rr_num = 1.0`; `_decision_support` reward reads `"1:1 (fixed)"`.
 
-## Min-stop is a HARD REJECT (mode-aware `min_stop_pts`), NOT a tick floor
-`_dynamic_stop_plan` REJECTS a setup outright (no trade) when the calculated stop distance is
-below the instrument's mode `min_stop_pts` — it NEVER silently widens to a floor. The companion
-`min_stop_ticks` is **metadata only** (the snap is ceil-up to whole ticks). Values are mode-aware:
-SWING MGC<5 / MNQ<20 pts; SCALP MGC<3 / MNQ<10 pts (all env-overridable).
-**Why:** silently widening a too-tight stop changes risk/size behind the user's back and breaks
-exact 1:1; rejecting is honest. **How to apply:** any stop change — live OR the copied backtest
-`bt_stop_plan` — must keep the hard-reject + snap-only shape (see backtest-engine.md for the
-parity contract). Don't reintroduce a `max(ceil, min_ticks)` floor.
+## Min-stop is MODE-SPLIT: SWING hard-rejects, SCALP has NO minimum
+`_dynamic_stop_plan` NEVER silently widens a too-tight stop to a floor (and `min_stop_ticks` is
+**metadata only** — the snap is always ceil-up to whole ticks). The minimum-distance REJECTION is
+now mode-split:
+- **SWING** still HARD-REJECTS (no trade) when the calculated stop is below `min_stop_pts`
+  (MGC<5 / MNQ<20 pts, env-tunable via `*_MIN_STOP_PTS`). Byte-for-byte unchanged.
+- **SCALP** has **NO minimum** — `scalp_min_stop_pts`/`scalp_min_stop_ticks` are **hard-coded to
+  literal 0 in `INSTRUMENT_SPECS`, NOT env-tunable**. A tight stop is allowed as-is (snapped only
+  to the tick grid). The min-pts guard remains in `_dynamic_stop_plan` but is inert for SCALP.
+**Why:** SCALP needs to take tight stops the setup justifies; auto-widening would change risk/size
+behind the user's back and break exact 1:1. SCALP min was deliberately made non-env-tunable so a
+stale legacy `*_SCALP_MIN_STOP_*` secret can never silently re-enable the rejection in the live
+$50k prop account. **How to apply:** any stop change — live OR the copied backtest `bt_stop_plan` —
+must keep this split (SWING reject, SCALP no-min) and the snap-only shape (see backtest-engine.md
+for the parity contract). Don't reintroduce a `max(ceil, min_ticks)` floor, and don't re-add an env
+read for the SCALP minimum. The only allowed SCALP rejections: invalid/missing stop, wrong side of
+entry, zero/negative distance, size>risk cap (sizing/gateway), zone consumed/mitigated.
 
 ## Sanctioned exception — a truly-ready Opening Range Breakout = 1:4 (user-approved)
 `_apply_orb_target_override(result)` runs right after `compute_strategy_engine` and rewrites
