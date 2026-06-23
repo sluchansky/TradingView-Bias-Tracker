@@ -733,7 +733,7 @@ _AUTO_EXEC_LOCK  = threading.Lock()
 # by the same server limit as the manual gateway.
 AUTO_TRADE_CONTRACTS   = max(1, min(TRADERSPOST_MAX_CONTRACTS,
                                     int(os.environ.get("AUTO_TRADE_CONTRACTS", 1))))
-AUTO_TRADE_MAX_PER_DAY = max(1, int(os.environ.get("AUTO_TRADE_MAX_PER_DAY", 5)))
+AUTO_TRADE_MAX_PER_DAY = max(1, int(os.environ.get("AUTO_TRADE_MAX_PER_DAY", 20)))
 _AUTO_TRADE_COUNT = {}   # (et_date_str, instrument) -> entries today
 # Per-setup "auto already entered" guard: (instrument, direction, zone_low) — the
 # SAME identity the journal dedups on. SCALP auto fires on the LIVE full-READY
