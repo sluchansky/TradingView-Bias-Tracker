@@ -20,6 +20,10 @@ author = "agent"
 task = "workflow.run"
 args = "TradingView Webhook Server"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "pycompile"
+
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
 author = "agent"
@@ -31,6 +35,17 @@ outputType = "console"
 task = "shell.exec"
 args = "/home/runner/workspace/.pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py"
 waitForPort = 8000
+
+[[workflows.workflow]]
+name = "pycompile"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "/home/runner/workspace/.pythonlibs/bin/python3 -m py_compile artifacts/tradingview-webhook/app.py"
+
+[workflows.workflow.metadata]
+isValidation = true
 
 [agent]
 stack = "PNPM_WORKSPACE"
