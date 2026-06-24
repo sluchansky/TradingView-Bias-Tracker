@@ -1247,6 +1247,49 @@ def _set_advisor_enabled(value):
         ADVISOR_ENABLED = bool(value)
 
 
+# Display-only ring buffer of recent auto-trades the Advisor BLOCKED. Recorded
+# AFTER the block decision in _maybe_auto_execute (never affects it); surfaced in
+# /status -> dashboard Analyst module so the toggle isn't a black box. In-memory
+# only (clears on restart, exactly like the toggle, which resets OFF on restart).
+ADVISOR_BLOCKS_MAX  = 25
+ADVISOR_BLOCKS      = deque(maxlen=ADVISOR_BLOCKS_MAX)
+ADVISOR_BLOCKS_LOCK = threading.Lock()
+
+
+def _record_advisor_block(inst, reason):
+    """Append a blocked-auto-trade entry (display-only). Best-effort; never raises."""
+    try:
+        with ADVISOR_BLOCKS_LOCK:
+            ADVISOR_BLOCKS.append({
+                "instrument": inst,
+                "ts":         time.time(),
+                "reason":     str(reason or "").strip() or "—",
+            })
+    except Exception:
+        pass
+
+
+def _recent_advisor_blocks(limit=10):
+    """Most-recent-first serialized view (ET time strings) for the dashboard."""
+    try:
+        with ADVISOR_BLOCKS_LOCK:
+            rows = list(ADVISOR_BLOCKS)[-limit:]
+    except Exception:
+        return []
+    out = []
+    for r in reversed(rows):
+        try:
+            when = fmt_et(datetime.fromtimestamp(r["ts"], tz=timezone.utc), "%m/%d %H:%M ET")
+        except Exception:
+            when = "—"
+        out.append({
+            "instrument": r.get("instrument"),
+            "time":       when,
+            "reason":     r.get("reason"),
+        })
+    return out
+
+
 def auto_trade_enabled(inst):
     """True when AUTO-TRADE is armed for the resolved instrument."""
     inst = instrument_of(inst) if inst else None
@@ -15800,6 +15843,7 @@ def status():
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "analyst":             a.get("analyst"),
         "advisor_enabled":     _advisor_enabled(),
+        "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
         "swing_diagnostics":   _swing_diag_block(a),
         "decision_support":    a.get("decision_support"),
@@ -16456,6 +16500,7 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
         if _adv_block:
             logger.info("Auto-trade BLOCKED by advisor for %s: %s", inst, _adv_reason)
             try:
+                _record_advisor_block(inst, _adv_reason)
                 _record_diagnostic("%s | AUTO-TRADE blocked by advisor — %s" % (inst, _adv_reason))
             except Exception:
                 pass
@@ -17267,6 +17312,8 @@ def dashboard():
   <ul id="an-next" style="margin:4px 0;padding-left:16px"></ul>
   <div class="se-bias-h">Invalidation</div>
   <div class="se-reason" id="an-inval">—</div>
+  <div class="se-bias-h">Recently Blocked by Advisor</div>
+  <ul id="an-blocks" style="margin:4px 0;padding-left:16px"></ul>
   <div id="an-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
@@ -18418,6 +18465,10 @@ function renderAnalystMode(d){
   _set('an-why', (a.why_not_trade && a.why_not_trade.length) ? a.why_not_trade : a.reason_for_waiting, '#cfd0e0');
   _anFill('an-next', a.what_needs_next);
   _set('an-inval', a.invalidation, '#cfd0e0');
+  const _blocks=(d && d.advisor_blocks) || [];
+  _anFill('an-blocks', _blocks.map(function(b){
+    return (b.time||'—')+' · '+(b.instrument||'?')+' · '+(b.reason||'—');
+  }));
   const foot=document.getElementById('an-foot');
   if(foot){ foot.textContent='Reasoning over existing signals · FVG / Order Blocks not tracked yet'+(a.gate_enabled?'':' · veto OFF (display-only)'); }
 }
