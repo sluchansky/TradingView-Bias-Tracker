@@ -1,0 +1,78 @@
+Upgrade AI Trading Partner so it thinks like a professional market analyst, not just a strategy trigger bot.
+
+The bot should use an Analyst Reasoning Engine before allowing any trade.
+
+Process every market update in this order:
+
+1. Market Context
+- What is the higher-timeframe bias?
+- Is price trending, ranging, breaking out, or reverting?
+- Is price near supply, demand, VWAP, prior high/low, liquidity, FVG, OB, or key session level?
+- Is this a clean environment or choppy/noisy?
+
+2. Trade Thesis
+Before any READY signal, the bot must form a written thesis:
+- Why would a long make sense?
+- Why would a short make sense?
+- Which side has the stronger argument?
+- What would prove the thesis wrong?
+
+3. Evidence Scoring
+Score bullish and bearish evidence separately.
+Examples:
+Bullish evidence:
+- reclaimed VWAP
+- swept lows and reversed
+- bullish CHOCH
+- demand holding
+- positive delta/CVD
+- higher lows
+
+Bearish evidence:
+- rejected VWAP
+- swept highs and failed
+- bearish CHOCH
+- supply holding
+- negative delta/CVD
+- lower highs
+
+The bot should not trade just because one strategy fires.
+It should trade only when the full evidence stack supports the same direction.
+
+4. Risk and Location Check
+Before READY, confirm:
+- entry is not chasing
+- stop is logical, not random
+- target has room before opposing supply/demand
+- risk/reward is acceptable
+- trade is not entering directly into resistance/support
+- volatility supports the setup
+
+5. Professional Verdict
+Every output must include:
+- Market Bias
+- Analyst Thesis
+- Bull Case
+- Bear Case
+- Best Trade Idea
+- Invalidation
+- Why Not Trade
+- Confidence
+- Final Verdict: READY LONG, READY SHORT, WAIT, or NO TRADE
+
+Important rule:
+The bot must be allowed to say WAIT even if alerts fire, if the analyst reasoning does not support the trade.
+
+Also add an “Analyst Mode” section to the dashboard showing:
+- Current Market Story
+- What Professionals Are Watching
+- Best Setup Forming
+- Trade Location Quality
+- Risk Quality
+- Reason For Waiting
+- What Needs To Happen Next
+
+Do not remove existing strategies or alerts.
+Use alerts as evidence, not commands.
+The bot should think in layers:
+Context → Thesis → Evidence → Risk → Verdict.
