@@ -41,8 +41,32 @@ strict path.
   ON) over-vetoes valid setups. (Same rr/rr_num split as fixed-1to1-rr.)
 
 ## Scope
-- FVG / Order Blocks are **not tracked yet** — the engine reasons over supply/demand
-  zones, VWAP, structure, sweeps, CVD, volume & HTF only; it explicitly marks FVG/OB as
-  not-tracked rather than inventing detection.
+- FVG / Order Blocks ARE now tracked as **analyst-only display evidence** (alert side
+  `analyst`, score 0, members of `ANALYST_TYPES`): sourced from `pine/fvg_ob.pine`, stored
+  in `ALERT_HISTORY`, read via `_recent_smc_signals(inst)` (recency-windowed
+  `_SMC_RECENCY_MIN`, per-instrument, fail-open, `continue`-on-stale so robust to
+  out-of-order deque entries) and folded into the bull/bear evidence stacks,
+  `what_needs_next`, and `professionals_watching` — NEVER into the gate's `_confluences`
+  or any scoring/level set.
+- The engine reasons over supply/demand zones, VWAP, structure, sweeps, CVD, volume, HTF
+  AND FVG/OB.
 - Evidence weights `_ANALYST_W` (choch/bos 20, vwap/sweep/cvd/volume 15, zone/session/htf
-  10); thresholds READY≥70 / margin≥10 / nothing<25.
+  10, fvg/ob 10); thresholds READY≥70 / margin≥10 / nothing<25.
+
+## Display-only ingestion (the "analyst" alert side) — money-path invariant
+- A non-scoring display-only alert side is NOT safe just because it's excluded from
+  scoring + level sets. Recognized alerts otherwise fall through the SHARED `/webhook`
+  body: price stores (`CURRENT_PRICE*`), `_update_intraday_tracker`, zone-broken expiry
+  (`ZONE_BROKEN_AT["alerts_since"]`), and the `_WEBHOOK_JOBS` worker (which runs
+  `full_analysis`/journal/Discord/auto-exec). So a display-only alert could mutate a gate
+  input or BE THE TRIGGERING webhook that dispatches an already-ready setup.
+- **Rule:** `ANALYST_TYPES` must SHORT-CIRCUIT early in `/webhook` — after ticker/price
+  parsing, BEFORE the price-store block — appending only the `ALERT_HISTORY` record
+  (+ `LAST_ALERT_AT` liveness) and returning `analyst_signal_stored`. It reaches the
+  analyst engine on the NEXT `full_analysis`/`/status` poll, not by enqueuing its own job.
+- **Why:** confirmed by architect review; without the short-circuit FVG/OB violated
+  display-only and could auto-execute. Guarded by `check_fvg_ob.sh` test 6 (asserts no
+  enqueue + no gate-input mutation).
+- `LAST_ALERT_AT` is dashboard-liveness only (not a gate/sizing/exec input); it is hoisted
+  into `/webhook`'s top-level `global` so both the short-circuit and the normal path can
+  assign it without a "assigned before global declaration" SyntaxError.

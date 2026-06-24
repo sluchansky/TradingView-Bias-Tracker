@@ -264,6 +264,14 @@ _PER_INSTRUMENT_ALERT_TEMPLATE = {
     # Liquidity sweeps (display/edge only, no score)
     "BULLISH SWEEP":          {"side": "sweep", "score": 0},
     "BEARISH SWEEP":          {"side": "sweep", "score": 0},
+    # Smart-money structure (DISPLAY-ONLY analyst evidence — pushed by
+    # pine/fvg_ob.pine). side "analyst" keeps them OUT of bias scoring, the
+    # supply/demand level builder and the strict gate; the Analyst Reasoning
+    # Engine reads them from ALERT_HISTORY. They never gate or size a trade.
+    "BULLISH FVG":            {"side": "analyst", "score": 0},
+    "BEARISH FVG":            {"side": "analyst", "score": 0},
+    "BULLISH OB":             {"side": "analyst", "score": 0},
+    "BEARISH OB":             {"side": "analyst", "score": 0},
     # Trade lifecycle commands (sent directly from the TradingView strategy)
     "ENTER":                  {"side": "command", "score": 0},
     "CLOSE":                  {"side": "command", "score": 0},
@@ -348,6 +356,9 @@ def _per_inst_alert_set(suffix):
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
 SWEEP_TYPES  = {k for k, v in ALERT_TYPES.items() if v["side"] == "sweep"}
+# Analyst-only smart-money signals (FVG / Order Blocks). DISPLAY-ONLY evidence:
+# kept out of supply/demand level building (get_price_context) and bias scoring.
+ANALYST_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "analyst"}
 # CVD confirmation alert sets (data-only — store per-instrument state, never score).
 # Registry-driven: the prefixed forms cover every alert instrument automatically.
 CVD_BULLISH_TYPES = {"CVD_BULLISH", "CVD BULLISH"} | _per_inst_alert_set("CVD BULLISH")
@@ -2830,7 +2841,9 @@ def get_price_context(inst=None):
         # existing supply-vs-demand classification.
         if t in SUPPLY_TYPES:
             all_supply_prices.append(price)
-        elif t not in SWEEP_TYPES:
+        elif t not in SWEEP_TYPES and t not in ANALYST_TYPES:
+            # ANALYST_TYPES (FVG / Order Blocks) are display-only evidence and must
+            # never become supply/demand levels (that would feed the gate).
             all_demand_prices.append(price)
     return last_price_by_type, all_supply_prices, all_demand_prices
 
@@ -3516,7 +3529,7 @@ def fmt_window_counts(counts, total):
                   .replace("CONFIRMED", "CONF").replace("NEW SUPPLY", "NEW SUP")
                   .replace("NEW DEMAND", "NEW DEM"))
         _side = ALERT_TYPES[k]["side"]
-        _is_bear = _side == "bearish" or (_side == "sweep" and "BEARISH" in k)
+        _is_bear = _side == "bearish" or (_side in ("sweep", "analyst") and "BEARISH" in k)
         (bear_parts if _is_bear else bull_parts).append(f"{short} ×{v}")
     parts = []
     if bear_parts:
@@ -8366,10 +8379,12 @@ def get_news_filter():
 # an actionable gate verdict to WAIT — it NEVER promotes a trade. The strict gate,
 # every existing strategy/alert and all goldens are untouched: this layer lives
 # entirely on top of full_analysis' assembled `result`, after the authoritative
-# verdict is decided. NOTE: FVG / Order Blocks are not tracked yet (the engine
-# reasons over supply/demand zones, VWAP, structure, sweeps, CVD, volume & HTF).
+# verdict is decided. The engine reasons over supply/demand zones, VWAP, structure,
+# sweeps, CVD, volume, HTF and — when pine/fvg_ob.pine is deployed — Fair Value Gaps
+# and Order Blocks (DISPLAY-ONLY evidence read from ALERT_HISTORY, never the gate).
 _ANALYST_W = {"choch": 20, "bos": 20, "vwap": 15, "sweep": 15,
-              "cvd": 15, "volume": 15, "zone": 10, "session": 10, "htf": 10}
+              "cvd": 15, "volume": 15, "zone": 10, "session": 10, "htf": 10,
+              "fvg": 10, "ob": 10}
 _ANALYST_READY_EVIDENCE = 70   # min dominant-side evidence for an analyst READY
 _ANALYST_MIN_MARGIN     = 10   # min lead over the other side (else mixed -> WAIT)
 _ANALYST_NOTHING        = 25   # both sides below this -> NO TRADE (nothing forming)
@@ -8413,6 +8428,42 @@ def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRA
     }
 
 
+_SMC_RECENCY_MIN = 30   # an FVG/OB alert counts as live analyst evidence for this long
+
+def _recent_smc_signals(inst, within_min=_SMC_RECENCY_MIN):
+    """Scan ALERT_HISTORY for recent Fair-Value-Gap / Order-Block alerts (pushed by
+    pine/fvg_ob.pine) for `inst`, returned per-direction. DISPLAY-ONLY analyst
+    evidence — never touches the gate, sizing, dedupe or the money path. Fail-open:
+    any error (or no alerts) -> all False, so default behaviour is unchanged until
+    those alerts actually flow."""
+    out = {"fvg_long": False, "fvg_short": False, "ob_long": False, "ob_short": False}
+    try:
+        if not inst:
+            return out
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_min)
+        for a in reversed(list(ALERT_HISTORY)):   # newest -> oldest
+            t = a.get("alert_type") or ""
+            if not (t.endswith("FVG") or t.endswith("OB")):
+                continue
+            try:
+                if datetime.fromisoformat(a["timestamp"]) < cutoff:
+                    continue   # outside the recency window — skip (deque cap keeps this cheap)
+            except (KeyError, ValueError, TypeError):
+                continue
+            a_inst = a.get("instrument") or _instrument_from_text(t)
+            if a_inst != inst:
+                continue
+            if   "BULLISH FVG" in t: out["fvg_long"]  = True
+            elif "BEARISH FVG" in t: out["fvg_short"] = True
+            elif "BULLISH OB"  in t: out["ob_long"]   = True
+            elif "BEARISH OB"  in t: out["ob_short"]  = True
+            if all(out.values()):
+                break
+        return out
+    except Exception:
+        return out
+
+
 def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
     """Professional-analyst reasoning over the assembled full_analysis `result`.
     Pure + fail-open (the caller also wraps it in try/except). Returns the block
@@ -8436,6 +8487,9 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
     session  = result.get("session") or {}
     overext  = bool(result.get("overextended"))
     tp       = result.get("trade_plan") or {}
+    # Smart-money evidence (FVG / Order Blocks) — DISPLAY-ONLY, read from recent
+    # alerts. Empty until pine/fvg_ob.pine is deployed, so behaviour is unchanged.
+    smc      = _recent_smc_signals(result.get("active_ticker") or result.get("instrument"))
 
     def _f(x):
         try:
@@ -8471,6 +8525,12 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
 
     bull = _evidence(cL, "Long")
     bear = _evidence(cS, "Short")
+    # FVG / Order-Block evidence (DISPLAY-ONLY, from _recent_smc_signals — NOT from
+    # the gate's confluences, so the strict gate / goldens are untouched).
+    if smc.get("fvg_long"): bull.append(("Bullish FVG (fair-value gap) to fill", _ANALYST_W["fvg"]))
+    if smc.get("ob_long"):  bull.append(("Bullish order block reaction",         _ANALYST_W["ob"]))
+    if smc.get("fvg_short"): bear.append(("Bearish FVG (fair-value gap) to fill", _ANALYST_W["fvg"]))
+    if smc.get("ob_short"):  bear.append(("Bearish order block reaction",         _ANALYST_W["ob"]))
     bull_score = sum(w for _, w in bull)
     bear_score = sum(w for _, w in bear)
 
@@ -8585,6 +8645,11 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
         if not risk_ok:
             if chasing:         what_needs_next.append("a pullback (price is extended)")
             if into_resistance: what_needs_next.append("room to the next opposing zone")
+        # FVG / Order Block (display-only) — note when the leaning side has none yet.
+        if stronger == "Long" and not (smc.get("fvg_long") or smc.get("ob_long")):
+            what_needs_next.append("a bullish FVG or order block to form")
+        elif stronger == "Short" and not (smc.get("fvg_short") or smc.get("ob_short")):
+            what_needs_next.append("a bearish FVG or order block to form")
 
     # ── Verdict (independent of the gate — the analyst may WAIT even when alerts fire) ──
     if top < _ANALYST_NOTHING or stronger == "Neither":
@@ -8665,6 +8730,8 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
     if vwap is not None: watching.append(f"VWAP {_f(vwap)}")
     if dem is not None:  watching.append(f"Demand {_f(dem)}")
     if sup is not None:  watching.append(f"Supply {_f(sup)}")
+    if smc.get("fvg_long") or smc.get("fvg_short"): watching.append("FVG active")
+    if smc.get("ob_long")  or smc.get("ob_short"):  watching.append("Order block active")
     if what_needs_next:  watching.append("Trigger: " + what_needs_next[0])
 
     market_bias = (f"{htf_bias} HTF"
@@ -14443,7 +14510,7 @@ def bt_export():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global CURRENT_PRICE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT
+    global CURRENT_PRICE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT, LAST_ALERT_AT
 
     webhook_received_at = now_utc()   # T0 for the webhook->alert delay metric
     LAST_WEBHOOK_AT = webhook_received_at   # any inbound POST, before any early return
@@ -14546,6 +14613,33 @@ def webhook():
         parsed_price = float(raw_price) if raw_price is not None else None
     except (ValueError, TypeError):
         parsed_price = None
+
+    # ── ANALYST-ONLY signals (FVG / Order Blocks) — DISPLAY-ONLY short-circuit ──
+    #    Recognized, but deliberately walled off from the money path. Store the
+    #    record in ALERT_HISTORY (so the Analyst Reasoning Engine reads it on the
+    #    NEXT full_analysis / dashboard poll) and return a read-only ack. This branch
+    #    runs BEFORE the price stores, the intraday tracker, VWAP ingestion, the zone
+    #    side-effects / zone-broken expiry, dedupe, journaling, Discord, and the
+    #    _WEBHOOK_JOBS worker — so an FVG/OB alert can NEVER mutate a gate input,
+    #    trigger a re-evaluation, or cause an auto-execution. They are advisory
+    #    evidence only, consumed via _recent_smc_signals().
+    if normalized in ANALYST_TYPES:
+        LAST_ALERT_AT = datetime.now(timezone.utc)
+        ALERT_HISTORY.append({
+            "alert_type":        normalized,
+            "ticker":            data.get("ticker"),
+            "instrument":        resolved_inst,
+            "instrument_source": res["source"],
+            "price":             parsed_price,
+            "timestamp":         now_utc().isoformat(),
+            "raw":               data,
+        })
+        return jsonify({
+            "status":     "analyst_signal_stored",
+            "alert_type": normalized,
+            "instrument": resolved_inst,
+            "note":       "display-only smart-money evidence; no gate / money-path effect",
+        }), 200
 
     if parsed_price is not None:
         CURRENT_PRICE = parsed_price
@@ -14785,7 +14879,6 @@ def webhook():
         "timestamp":         now_utc().isoformat(),
         "raw":               data,
     }
-    global LAST_ALERT_AT
     LAST_ALERT_AT = datetime.now(timezone.utc)
     ALERT_HISTORY.append(record)
 

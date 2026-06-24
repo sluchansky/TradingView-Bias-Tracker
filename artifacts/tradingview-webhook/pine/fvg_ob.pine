@@ -1,0 +1,83 @@
+//@version=5
+// =============================================================================
+// FVG + Order Block alerts  →  TradingView webhook  →  app.py (DISPLAY-ONLY)
+// -----------------------------------------------------------------------------
+// Companion to sd_zones.pine / market_structure.pine. Fires four smart-money
+// signals per instrument:
+//     "<PREFIX> BULLISH FVG"   "<PREFIX> BEARISH FVG"
+//     "<PREFIX> BULLISH OB"    "<PREFIX> BEARISH OB"
+// where <PREFIX> is auto-detected from the chart symbol (MGC/MNQ/MES/MYM).
+//
+// app.py treats these as ANALYST-side alerts: they are stored in ALERT_HISTORY
+// and read by the Analyst Reasoning Engine as extra evidence ONLY. They are
+// never scored, never define supply/demand levels, and never gate a trade.
+//
+// SETUP
+//   1. Add this indicator to an MGC / MNQ / MES / MYM chart (5m recommended).
+//   2. Create an alert on it, condition "Any alert() function call".
+//   3. Set the webhook URL to your app's /webhook endpoint.
+//   4. Leave the alert message EMPTY — each alert() below sends its own JSON.
+//   5. "Once Per Bar Close" is enforced in code (alert.freq_once_per_bar_close).
+// =============================================================================
+indicator("FVG + Order Blocks → Webhook", overlay = true)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+show_markers = input.bool(true,  "Show on-chart markers")
+ob_impulse   = input.bool(true,  "Order Block requires breaking prior candle's range")
+
+// ── Instrument auto-detection (mirror of sd_zones.pine) ──────────────────────
+sym = syminfo.ticker
+prefix = str.contains(sym, "MGC") ? "MGC" :
+         str.contains(sym, "MNQ") ? "MNQ" :
+         str.contains(sym, "MES") ? "MES" :
+         str.contains(sym, "MYM") ? "MYM" :
+         str.contains(sym, "GC")  ? "MGC" :
+         str.contains(sym, "NQ")  ? "MNQ" :
+         str.contains(sym, "ES")  ? "MES" :
+         str.contains(sym, "YM")  ? "MYM" : "MGC"
+
+// ── Fair Value Gap (3-candle imbalance) ──────────────────────────────────────
+// Bullish FVG: gap between high[2] and low[0] (current low above high two bars back).
+// Bearish FVG: gap between low[2]  and high[0] (current high below low two bars back).
+bull_fvg = low > high[2]
+bear_fvg = high < low[2]
+
+// ── Order Block (last opposing candle before an impulse that breaks its range) ─
+// Bullish OB: prior candle bearish, current candle bullish and (optionally) closes
+//             above the prior candle's high.
+// Bearish OB: prior candle bullish, current candle bearish and (optionally) closes
+//             below the prior candle's low.
+prev_bear = close[1] < open[1]
+prev_bull = close[1] > open[1]
+cur_bull  = close > open
+cur_bear  = close < open
+
+bull_ob = prev_bear and cur_bull and (not ob_impulse or close > high[1])
+bear_ob = prev_bull and cur_bear and (not ob_impulse or close < low[1])
+
+// ── JSON payload helper ──────────────────────────────────────────────────────
+mk(string label) =>
+    '{"alert_type":"' + prefix + ' ' + label + '","ticker":"' + sym +
+      '","price":' + str.tostring(close) + ',"source":"fvg_ob"}'
+
+// ── Fire alerts (once per closed bar) ────────────────────────────────────────
+if bull_fvg
+    alert(mk("BULLISH FVG"), alert.freq_once_per_bar_close)
+if bear_fvg
+    alert(mk("BEARISH FVG"), alert.freq_once_per_bar_close)
+if bull_ob
+    alert(mk("BULLISH OB"),  alert.freq_once_per_bar_close)
+if bear_ob
+    alert(mk("BEARISH OB"),  alert.freq_once_per_bar_close)
+
+// ── Optional on-chart markers ────────────────────────────────────────────────
+plotshape(show_markers and bull_fvg, title = "Bull FVG", style = shape.triangleup,
+          location = location.belowbar, color = color.new(color.teal, 0), size = size.tiny)
+plotshape(show_markers and bear_fvg, title = "Bear FVG", style = shape.triangledown,
+          location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
+plotshape(show_markers and bull_ob, title = "Bull OB", style = shape.labelup,
+          location = location.belowbar, color = color.new(color.green, 20), size = size.tiny,
+          text = "OB")
+plotshape(show_markers and bear_ob, title = "Bear OB", style = shape.labeldown,
+          location = location.abovebar, color = color.new(color.red, 20), size = size.tiny,
+          text = "OB")
