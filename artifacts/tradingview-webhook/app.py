@@ -8601,6 +8601,8 @@ def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRA
                                    "summary": "—", "quality": "—"},
         "market_story":           reason,
         "professionals_watching": [],
+        "fvg_active":             False,
+        "ob_active":              False,
         "best_setup_forming":     "None",
         "location_quality":       "—",
         "risk_quality":           "—",
@@ -8954,6 +8956,8 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
         "risk":                   risk,
         "market_story":           market_story,
         "professionals_watching": watching,
+        "fvg_active":             bool(smc.get("fvg_long") or smc.get("fvg_short")),
+        "ob_active":              bool(smc.get("ob_long")  or smc.get("ob_short")),
         "best_setup_forming":     best_setup_forming,
         "location_quality":       location_quality,
         "risk_quality":           risk["quality"],
@@ -18073,7 +18077,8 @@ def dashboard():
 
 <!-- Analyst Mode (professional-analyst reasoning over the EXISTING signals — DISPLAY
      by default; the trade VETO is flag-gated server-side, default OFF). Hidden unless
-     the analyst engine is enabled. FVG / Order Blocks are not tracked yet. -->
+     the analyst engine is enabled. FVG / Order Blocks ARE tracked (display-only
+     analyst evidence); the footer shows their live state per instrument. -->
 <div class="mod" id="mod-analyst" style="display:none">
   <div class="mod-h">🧠 Analyst Mode <span id="an-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
   <div class="se-bias-h">Final Verdict</div>
@@ -19339,7 +19344,13 @@ function renderAnalystMode(d){
     return (b.time||'—')+' · '+(b.instrument||'?')+' · '+(b.reason||'—');
   }));
   const foot=document.getElementById('an-foot');
-  if(foot){ foot.textContent='Reasoning over existing signals · FVG / Order Blocks not tracked yet'+(a.gate_enabled?'':' · veto OFF (display-only)'); }
+  if(foot){
+    const _smc=[];
+    if(a.fvg_active) _smc.push('FVG active');
+    if(a.ob_active)  _smc.push('Order block active');
+    const _smcTxt=_smc.length ? _smc.join(' · ') : 'No FVG / Order Block in range';
+    foot.textContent='Reasoning over existing signals · '+_smcTxt+(a.gate_enabled?'':' · veto OFF (display-only)');
+  }
 }
 
 // Professional Review — pre-READY pro-trader grading. TWO models (SCALP / SWING)
