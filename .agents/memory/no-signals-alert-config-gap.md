@@ -101,6 +101,22 @@ Zone types are **prefixed-only** (`MGC …`/`MNQ …`) and must hardcode the ins
 `"price":"{{close}}"`: the +0.3% (`MITIGATED_TOLERANCE_PCT`) proximity check populates
 `MITIGATED_PRICES`, so a price-less mitigation can NEVER open `zone_valid` even if it registers.
 
+**SCALP "no trades fire" with structure PRESENT = missing confluence, edge caps ~45<50 (recurring).**
+Distinct from "0 signals / Struct: Undefined": here structure DID arrive, so the scored line reads
+`struct=Y zone=Tested vwap=Y edge=45<50` — yet still WAIT. Cause: only `… CONFIRMATION` + occasional
+`BOS`/`… ZONE` arrive; ZERO `BULLISH/BEARISH SWEEP`, `CVD BULLISH/BEARISH`, `VOLUME SPIKE`. Edge then
+tops out at structure(BOS/CHOCH +20) + VWAP(+15) + Session(+10) = ~45, below the SCALP 50 READY
+threshold (volAdj +10 is a separate SCALP modifier, NOT folded into the gate `edge=` number). A SINGLE
+confluence alert (+15 each) tips it over. Symptom the user reports as "instrument X never fires": the
+near-miss instruments (MES/MYM seen at edge 35–45 w/ struct=Y) are actually the CLOSEST to firing, not
+the most broken — MGC/MNQ scored LOWER (10–25) in the same window. Webhooks ARE received/attributed/200;
+the gap is purely the missing confluence alerts on TradingView. Prove it: `SWEEP|CVD|VOLUME|RVOL` grep of
+prod logs → "No deployment logs found" (none arriving) AND no `Unrecognized alert type` (so not a
+bad-schema rejection — genuinely not sent). Recognized confluence types: `BULLISH/BEARISH SWEEP`,
+`CVD BULLISH/BEARISH` (also `CVD_…`), `VOLUME SPIKE` (also `VOLUME_SPIKE`). Secondary: auto-trade arming
+resets OFF every publish — re-arm the instrument too, else a future READY still won't auto-execute (moot
+until edge clears 50). NOT a code bug; do not tune thresholds to compensate.
+
 **RESOLVED / confirmed live:** after the user recreated the two broken alerts, prod began receiving the
 canonical forms `{"alert_type":"MGC ZONE MITIGATED","price":"4170.4"}` and `{"alert_type":"MNQ VOLUME SPIKE"}`
 with ZERO `Unrecognized alert type` warnings, and the scored line flipped to **`Gate: zone=Y …`** for the
