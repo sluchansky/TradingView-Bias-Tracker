@@ -1,0 +1,107 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// Supply / Demand Zones -> Webhook   (MGC / MNQ / MES / MYM)
+//
+// Anchors supply/demand zones on confirmed swing pivots and tracks their
+// lifecycle, firing the exact PREFIXED JSON the webhook app expects:
+//   • NEW DEMAND ZONE  = band forms at a swing low.        [bias +1]
+//   • NEW SUPPLY ZONE  = band forms at a swing high.        [bias +1]
+//   • ZONE MITIGATED   = price departs a zone, then returns INTO it (tagged).
+//   • ZONE BROKEN      = price closes through the far side (zone invalidated).
+//
+// Zones no longer drive the Edge Score directly, but they feed the dashboard
+// zone display and the per-instrument mitigation state (which the SCALP gate
+// uses), so they round out the picture. The band thickness is ATR-based.
+//
+// SETUP (one alert per chart):
+//   1. Add this script to each chart: MGC1!, MNQ1!, MES1!, and MYM1!.
+//   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
+//   3. Paste your webhook URL under Notifications -> Webhook URL.
+//   4. Leave the message box as-is (the script supplies the JSON). Save.
+//   Auto-detect sets MGC/MNQ/MES/MYM from the symbol.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("Supply/Demand Zones -> Webhook (MGC/MNQ/MES/MYM)", overlay=true)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ", "MES", "MYM"])
+leftBars     = input.int(10, "Swing left bars",  minval=1)
+rightBars    = input.int(3,  "Swing right bars", minval=1, tooltip="Higher = fewer, stronger zones.")
+zoneFactor   = input.float(0.5, "Zone thickness (x ATR)", minval=0.1, step=0.1)
+showMarks    = input.bool(true, "Show zone markers")
+
+prefix = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : str.contains(syminfo.ticker, "MES") ? "MES" : str.contains(syminfo.ticker, "MYM") ? "MYM" : "MGC") : manualPrefix
+
+atrV = ta.atr(14)
+ph   = ta.pivothigh(high, leftBars, rightBars)
+pl   = ta.pivotlow(low,  leftBars, rightBars)
+
+// Demand zone (anchored at a swing low) + supply zone (at a swing high).
+// state: 0 none, 1 formed, 2 departed (price left the zone), 3 mitigated (returned).
+var float dLow  = na
+var float dHigh = na
+var int   dState = 0
+var float sLow  = na
+var float sHigh = na
+var int   sState = 0
+
+newDemand = false
+newSupply = false
+mitig     = false
+broken    = false
+
+if barstate.isconfirmed
+    // ── form zones on freshly-confirmed pivots ──
+    if not na(pl) and not na(atrV)
+        dLow      := pl
+        dHigh     := pl + atrV * zoneFactor
+        dState    := 1
+        newDemand := true
+    if not na(ph) and not na(atrV)
+        sHigh     := ph
+        sLow      := ph - atrV * zoneFactor
+        sState    := 1
+        newSupply := true
+
+    // ── demand lifecycle ──
+    if dState != 0 and not na(dHigh)
+        if dState == 1 and low > dHigh
+            dState := 2
+        else if dState == 2 and low <= dHigh and high >= dLow
+            dState := 3
+            mitig  := true
+        if close < dLow
+            broken := true
+            dState := 0
+            dLow   := na
+            dHigh  := na
+
+    // ── supply lifecycle ──
+    if sState != 0 and not na(sLow)
+        if sState == 1 and high < sLow
+            sState := 2
+        else if sState == 2 and high >= sLow and low <= sHigh
+            sState := 3
+            mitig  := true
+        if close > sHigh
+            broken := true
+            sState := 0
+            sLow   := na
+            sHigh  := na
+
+    // ── fire webhooks ──
+    if newDemand
+        alert('{"alert_type": "' + prefix + ' NEW DEMAND ZONE", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+    if newSupply
+        alert('{"alert_type": "' + prefix + ' NEW SUPPLY ZONE", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+    if mitig
+        alert('{"alert_type": "' + prefix + ' ZONE MITIGATED", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+    if broken
+        alert('{"alert_type": "' + prefix + ' ZONE BROKEN", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+
+// ── Visuals ────────────────────────────────────────────────────────────────
+plotshape(showMarks and newDemand, title="New Demand Zone", style=shape.labelup,   location=location.belowbar, color=color.new(color.green,  0), textcolor=color.white, size=size.tiny, text="D")
+plotshape(showMarks and newSupply, title="New Supply Zone", style=shape.labeldown, location=location.abovebar, color=color.new(color.red,    0), textcolor=color.white, size=size.tiny, text="S")
+plotshape(showMarks and mitig,     title="Zone Mitigated",  style=shape.diamond,   location=location.top,      color=color.new(color.orange, 0), size=size.tiny, text="Mit")
+plotshape(showMarks and broken,    title="Zone Broken",     style=shape.xcross,    location=location.bottom,   color=color.new(color.gray,   0), size=size.tiny, text="Brk")
+// © sluchansky
