@@ -1223,6 +1223,29 @@ _AUTO_TRADE_COUNT = {}   # (et_date_str, instrument) -> entries today
 # is also reset OFF), so the fail-safe is always toward NOT re-entering.
 AUTO_FIRED_KEYS = set()
 
+# ── Advisor review (Analyst Reasoning as an AUTO-TRADE gate) ──────────────────
+# Global runtime toggle. When ON, the analyst reviews every setup before an
+# auto-trade fires and BLOCKS the auto entry when it explicitly disagrees
+# (veto_would_fire); the dashboard Analyst module is shown. When OFF (default),
+# the advisor is silent, the module is hidden, and auto-trades fire on the base
+# gate alone — byte-identical to the pre-advisor behaviour. Like AUTO_TRADE this
+# is in-memory and RESETS TO OFF on restart (fail-safe toward NOT interfering).
+# It NEVER affects manual ENTER trades, the base gate, scoring, or the journal —
+# only whether an already-READY setup is allowed to AUTO-execute.
+ADVISOR_ENABLED = False
+ADVISOR_LOCK    = threading.Lock()
+
+
+def _advisor_enabled():
+    with ADVISOR_LOCK:
+        return ADVISOR_ENABLED
+
+
+def _set_advisor_enabled(value):
+    global ADVISOR_ENABLED
+    with ADVISOR_LOCK:
+        ADVISOR_ENABLED = bool(value)
+
 
 def auto_trade_enabled(inst):
     """True when AUTO-TRADE is armed for the resolved instrument."""
@@ -8413,6 +8436,7 @@ def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRA
     return {
         "engine_enabled":         _analyst_engine_enabled(),
         "gate_enabled":           _analyst_gate_enabled(),
+        "reviewed":               False,
         "market_bias":            "Neutral",
         "thesis":                 reason,
         "bull_case":              [],
@@ -8769,6 +8793,7 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
     return {
         "engine_enabled":         _analyst_engine_enabled(),
         "gate_enabled":           _analyst_gate_enabled(),
+        "reviewed":               True,
         "market_bias":            market_bias,
         "thesis":                 thesis,
         "bull_case":              bull_case,
@@ -15774,6 +15799,7 @@ def status():
         "rejected_reasons":    a.get("rejected_reasons"),
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "analyst":             a.get("analyst"),
+        "advisor_enabled":     _advisor_enabled(),
         "scalp_diagnostics":   _scalp_diag_block(a),
         "swing_diagnostics":   _swing_diag_block(a),
         "decision_support":    a.get("decision_support"),
@@ -16349,6 +16375,33 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     }, 200
 
 
+def _advisor_blocks_auto_trade(inst):
+    """Advisor (Analyst Reasoning) review of an about-to-fire AUTO-trade.
+
+    Returns (blocked, reason). Consulted ONLY when _advisor_enabled(). Recomputes
+    the analyst verdict for `inst` from the live state (the latest analysis is the
+    authoritative last-second review). FAIL-CLOSED: the operator turned the advisor
+    ON to have EVERY auto-trade reviewed, so anything short of a successful,
+    non-vetoing review BLOCKS the entry — a full_analysis error, a missing analyst
+    block, the analyst engine being disabled, or a fail-open neutral fallback
+    (reviewed=False) all block; a completed review blocks only on explicit
+    disagreement (veto_would_fire). Allows ONLY when a real review ran (reviewed)
+    and did not veto. NEVER touches the base gate, scoring, manual ENTER, or the
+    journal — only whether an already-READY setup is allowed to AUTO-execute."""
+    try:
+        res = full_analysis(ticker_override=inst)
+        analyst = (res or {}).get("analyst") or {}
+        if not analyst.get("reviewed"):
+            return True, "advisor review unavailable (analyst engine off or errored) — blocking auto-trade."
+        if analyst.get("veto_would_fire"):
+            return True, (analyst.get("why_not_trade")
+                          or "advisor reasoning does not support the trade.")
+        return False, ""
+    except Exception as exc:
+        logger.warning("Advisor review failed for %s — blocking auto-trade (fail-closed): %s", inst, exc)
+        return True, "advisor review error — blocking auto-trade."
+
+
 def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
     """Fire the audited execution gateway for a brand-new READY setup when AUTO is
     ON for inst. Fail-open: any problem logs and returns without trading. Sets
@@ -16392,6 +16445,21 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
     if _cd_rem > 0:
         logger.info("Auto-trade skipped for %s - %s cooldown (%ds left).", inst, _cd_reason, _cd_rem)
         return False
+    # Advisor review (opt-in, global). When the advisor is ON it reviews this
+    # about-to-fire setup and BLOCKS the AUTO entry unless a successful analyst
+    # review agrees (fail-closed: an explicit veto, a review error, or the analyst
+    # engine being off all block). OFF by default => skipped entirely =>
+    # byte-identical auto path. Computed OUTSIDE _AUTO_EXEC_LOCK (full_analysis
+    # must not hold the exec lock).
+    if _advisor_enabled():
+        _adv_block, _adv_reason = _advisor_blocks_auto_trade(inst)
+        if _adv_block:
+            logger.info("Auto-trade BLOCKED by advisor for %s: %s", inst, _adv_reason)
+            try:
+                _record_diagnostic("%s | AUTO-TRADE blocked by advisor — %s" % (inst, _adv_reason))
+            except Exception:
+                pass
+            return False
     with _AUTO_EXEC_LOCK:
         if active_trade_for(inst) and not allow_stack:
             return False
@@ -16994,6 +17062,7 @@ def dashboard():
 <div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Setup bell: on</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
+  <span id="advisor-toggle" role="button" tabindex="0" onclick="toggleAdvisor()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvisor();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🧠 Advisor: off</span>
 </div>
 
 <!-- Live | Backtest top-level view toggle -->
@@ -17609,6 +17678,7 @@ function toggleMute(inst){
 
 let AUTO_STATE = { MGC:false, MNQ:false, MES:false, MYM:false };
 let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_live:false, is_live_instance:false, max_per_day:0, contracts:1 };
+let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
 async function loadAutoTrade(){
   try {
     const d = await api('/auto-trade');
@@ -17658,6 +17728,34 @@ function toggleAuto(inst){
       toast(next ? (inst + ' AUTO-TRADE armed') : (inst + ' auto-trade off'));
     })
     .catch(function(){ AUTO_STATE[inst] = !next; renderAutoUI(); toast('Auto-trade update failed', false); });
+}
+
+function renderAdvisorUI(){
+  const el = document.getElementById('advisor-toggle');
+  if(!el) return;
+  el.textContent = ADVISOR_STATE ? '🧠 Advisor: on' : '🧠 Advisor: off';
+  el.style.color = ADVISOR_STATE ? 'var(--green)' : 'var(--amber-dim)';
+  el.style.borderColor = ADVISOR_STATE ? 'var(--green)' : 'var(--border)';
+  el.setAttribute('aria-pressed', ADVISOR_STATE ? 'true' : 'false');
+}
+
+async function loadAdvisor(){
+  try { const d = await api('/advisor'); if (d && d.status === 'ok') ADVISOR_STATE = !!d.enabled; }
+  catch(e){ /* fail-open: keep last painted state */ }
+  renderAdvisorUI();
+}
+
+function toggleAdvisor(){
+  const next = !ADVISOR_STATE;
+  if (next && !confirm('Turn the Advisor ON?\\n\\nWhile ON, the analyst reviews every setup and will BLOCK an AUTO-trade it disagrees with. Manual ENTER trades are unaffected.')) return;
+  ADVISOR_STATE = next; renderAdvisorUI();
+  api('/advisor', { enabled: next })
+    .then(function(d){
+      if (!d || d.status !== 'ok'){ ADVISOR_STATE = !next; renderAdvisorUI(); toast('Advisor update failed', false); return; }
+      ADVISOR_STATE = !!d.enabled; renderAdvisorUI();
+      toast(ADVISOR_STATE ? 'Advisor ON — reviews auto-trades' : 'Advisor off — quiet');
+    })
+    .catch(function(){ ADVISOR_STATE = !next; renderAdvisorUI(); toast('Advisor update failed', false); });
 }
 
 function setDir(d) {
@@ -18282,6 +18380,12 @@ function renderAnalystMode(d){
   const a=(d && d.analyst) || null;
   const mod=document.getElementById('mod-analyst');
   if(!mod) return;
+  // The Advisor toggle (server truth via /status) controls visibility — OFF =>
+  // quiet/hidden. Keep the header pill in sync with the authoritative state.
+  if(d && typeof d.advisor_enabled === 'boolean' && d.advisor_enabled !== ADVISOR_STATE){
+    ADVISOR_STATE = d.advisor_enabled; renderAdvisorUI();
+  }
+  if(!d || !d.advisor_enabled){ mod.style.display='none'; return; }
   if(!a || !a.engine_enabled){ mod.style.display='none'; return; }
   mod.style.display='';
   const _set=function(id, txt, col){
@@ -19864,7 +19968,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor();
 autoSelectBestSetup();
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
@@ -19981,6 +20085,27 @@ def auto_trade_toggle():
         "max_per_day":              AUTO_TRADE_MAX_PER_DAY,
         "contracts":                AUTO_TRADE_CONTRACTS,
     }), 200
+
+
+@app.route("/advisor", methods=["GET", "POST"])
+def advisor_toggle():
+    """Read or set the global ADVISOR review toggle.
+
+    When ON, the analyst reviews every setup before an AUTO-trade fires and BLOCKS
+    the auto entry when it explicitly disagrees; the dashboard Analyst module is
+    shown. When OFF (default), the advisor is silent, the module is hidden, and
+    auto-trades fire on the base gate alone (byte-identical to the pre-advisor
+    behaviour). NEVER affects manual ENTER trades, the base gate, or scoring.
+    In-memory; RESETS TO OFF on restart (fail-safe toward NOT interfering).
+    Owner-only (Basic Auth + CSRF via the Express proxy; deliberately NOT in
+    OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "enabled" in data:
+            _set_advisor_enabled(bool(data.get("enabled")))
+            logger.info("Advisor %s", "ENABLED" if _advisor_enabled() else "DISABLED")
+    return jsonify({"status": "ok", "enabled": _advisor_enabled()}), 200
+
 
 @app.route("/", methods=["GET"])
 def index():
