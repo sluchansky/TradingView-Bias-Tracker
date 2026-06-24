@@ -1,6 +1,6 @@
 //@version=5
 // ───────────────────────────────────────────────────────────────────────────
-// Confirmation Candle -> Webhook  (MGC / MNQ)
+// Confirmation Candle -> Webhook  (MGC / MNQ / MES / MYM)
 //
 // Fires a confirmation alert when a 5m bar closes with momentum:
 //   • Bullish confirmation = candle closes up AND above the prior close.
@@ -15,21 +15,21 @@
 // every-bar stream is filtered app-side, not here.
 //
 // SETUP (one alert per chart):
-//   1. Add this script to your MGC1! chart (and again to your MNQ1! chart).
+//   1. Add this script to each chart: MGC1!, MNQ1!, MES1!, and MYM1!.
 //   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
 //   3. Paste your webhook URL under Notifications -> Webhook URL.
 //   4. Leave the message box as-is (the script supplies the JSON). Save.
-//   Auto-detect sets MGC/MNQ from the symbol, so the same script works on both
-//   charts with no manual Instrument setting to get wrong.
+//   Auto-detect sets MGC/MNQ/MES/MYM from the symbol, so the same script works
+//   on every chart with no manual Instrument setting to get wrong.
 // ───────────────────────────────────────────────────────────────────────────
-indicator("Confirmation Candle -> Webhook (MGC/MNQ)", overlay=true)
+indicator("Confirmation Candle -> Webhook (MGC/MNQ/MES/MYM)", overlay=true)
 
 // ── Inputs ─────────────────────────────────────────────────────────────────
 useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
-manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ"])
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ", "MES", "MYM"])
 showMarks    = input.bool(true, "Show confirmation markers on chart")
 
-prefix  = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : "MGC") : manualPrefix
+prefix  = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : str.contains(syminfo.ticker, "MES") ? "MES" : str.contains(syminfo.ticker, "MYM") ? "MYM" : "MGC") : manualPrefix
 profile = prefix + " Standard"
 
 // ── Confirmation detection ─────────────────────────────────────────────────

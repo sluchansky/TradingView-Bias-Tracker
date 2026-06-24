@@ -1,6 +1,6 @@
 //@version=5
 // ───────────────────────────────────────────────────────────────────────────
-// Liquidity Sweep -> Webhook  (MGC / MNQ)
+// Liquidity Sweep -> Webhook  (MGC / MNQ / MES / MYM)
 //
 // Detects a liquidity sweep (a.k.a. swing-failure / stop-hunt): price pierces a
 // recent swing high/low to grab the stops resting there, then closes back inside.
@@ -13,22 +13,23 @@
 // the webhook app expects, e.g.  {"alert_type":"MGC BULLISH SWEEP", ...}.
 //
 // SETUP (one alert per chart):
-//   1. Add this script to your MGC1! chart (and again to your MNQ1! chart).
+//   1. Add this script to each chart: MGC1!, MNQ1!, MES1!, and MYM1!.
 //   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
 //   3. Paste your webhook URL under Notifications -> Webhook URL.
 //   4. Leave the message box as-is (the script supplies the JSON). Save.
-//   Auto-detect sets MGC/MNQ from the symbol, so the same script works on both.
+//   Auto-detect sets MGC/MNQ/MES/MYM from the symbol, so the same script works
+//   on every chart.
 // ───────────────────────────────────────────────────────────────────────────
-indicator("Liquidity Sweep -> Webhook (MGC/MNQ)", overlay=true)
+indicator("Liquidity Sweep -> Webhook (MGC/MNQ/MES/MYM)", overlay=true)
 
 // ── Inputs ─────────────────────────────────────────────────────────────────
 useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
-manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ"])
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ", "MES", "MYM"])
 leftBars     = input.int(10, "Swing left bars",  minval=1, tooltip="Bars to the left that define a swing pivot.")
 rightBars    = input.int(3,  "Swing right bars", minval=1, tooltip="Bars to the right that confirm a swing pivot. Higher = fewer, stronger sweeps.")
 showMarks    = input.bool(true, "Show sweep markers on chart")
 
-prefix = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : "MGC") : manualPrefix
+prefix = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : str.contains(syminfo.ticker, "MES") ? "MES" : str.contains(syminfo.ticker, "MYM") ? "MYM" : "MGC") : manualPrefix
 
 // ── Track the most-recent confirmed swing high / low ───────────────────────
 var float swingHigh = na
