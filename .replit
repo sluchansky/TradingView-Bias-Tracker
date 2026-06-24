@@ -44,6 +44,10 @@ args = "instrument_isolation"
 task = "workflow.run"
 args = "fvg_ob"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "cross_market"
+
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
 author = "agent"
@@ -118,6 +122,17 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "bash .local/state/check_fvg_ob.sh"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "cross_market"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_cross_market.sh"
 
 [workflows.workflow.metadata]
 isValidation = true

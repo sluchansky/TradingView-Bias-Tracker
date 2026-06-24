@@ -391,6 +391,22 @@ DUAL_TF_LOCK = threading.Lock()
 #         "expired_reason": str|None}}
 DUAL_TF_STATE_BY_TICKER = {}
 
+# ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
+# Directional agreement across the three equity-index micros (MNQ=Nasdaq,
+# MES=S&P, MYM=Dow). Refreshed by _cross_market_loop() (a self-rescheduling
+# daemon Timer, exactly like _trade_ready_loop) into CROSS_MARKET_STATE and
+# surfaced read-only on /status. STRICTLY DISPLAY + NOTIFY: it is NEVER read by
+# the gate / scoring / sizing / dedupe / broker path, so adding or removing it
+# leaves every trade decision byte-identical. The Discord SEND inside the loop is
+# additionally gated to the live instance (DISCORD_LIVE_ENABLED) so dev can never
+# post to the shared live channel.
+INDEX_ALIGNMENT_INSTRUMENTS = ("MNQ", "MES", "MYM")  # equity indexes only (MGC excluded)
+CROSS_MARKET_STATE = {}                 # latest snapshot dict (see compute_index_alignment)
+CROSS_MARKET_LOCK  = threading.Lock()   # guards the snapshot (loop write vs /status read)
+CROSS_MARKET_LAST_ALERT = {}            # {"direction": "Long"/"Short", "ts": datetime} — notifier dedup (loop-thread only)
+CROSS_MARKET_INTERVAL = int(os.environ.get("CROSS_MARKET_INTERVAL", 20))          # snapshot refresh cadence (s)
+CROSS_MARKET_ALERT_COOLDOWN = int(os.environ.get("CROSS_MARKET_ALERT_COOLDOWN", 1800))  # min seconds between same-direction alerts
+
 # 5s EXECUTION alert sets (recognized => fast-ack + dual-TF record, never scoring).
 ENTRY_TRIGGER_LONG_TYPES  = ({"ENTRY_TRIGGER_LONG", "ENTRY TRIGGER LONG"}
                              | _per_inst_alert_set("ENTRY TRIGGER LONG"))
@@ -10491,6 +10507,168 @@ def _trade_ready_loop():
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()
 
 
+# ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
+# Reads each enabled equity-index micro's AUTHORITATIVE per-tab bias (the same
+# calculate_bias() value the dashboard shows when you switch tabs) and reports
+# whether Nasdaq/S&P/Dow agree on direction. This is a pure read layered on top of
+# full_analysis — it NEVER feeds the gate / scoring / sizing / dedupe / broker path.
+_INDEX_DISPLAY_NAMES = {"MNQ": "Nasdaq", "MES": "S&P 500", "MYM": "Dow"}
+
+
+def compute_index_alignment():
+    """Cross-market directional agreement across the enabled equity-index micros
+    (MNQ/MES/MYM). Built from each instrument's authoritative bias
+    (calculate_bias → "Bullish"/"Bearish"/"Choppy" via full_analysis). Returns a
+    snapshot dict; DISPLAY + NOTIFY only — never read by any trade decision."""
+    enabled = set(enabled_instruments())
+    insts = [i for i in INDEX_ALIGNMENT_INSTRUMENTS if i in enabled]
+    members = []
+    for inst in insts:
+        try:
+            a = full_analysis(ticker_override=inst)
+        except Exception as exc:
+            logger.warning("index-alignment analysis error (%s): %s", inst, exc)
+            continue
+        bias = a.get("bias")
+        direction = ("Long" if bias == "Bullish"
+                     else "Short" if bias == "Bearish"
+                     else None)
+        members.append({
+            "instrument": inst,
+            "name":       _INDEX_DISPLAY_NAMES.get(inst, inst),
+            "bias":       bias,            # Bullish / Bearish / Choppy
+            "direction":  direction,       # Long / Short / None (Choppy)
+            "edge_score": a.get("edge_score"),
+            "edge_grade": a.get("edge_grade"),
+            "verdict":    a.get("verdict"),
+        })
+    longs  = [m for m in members if m["direction"] == "Long"]
+    shorts = [m for m in members if m["direction"] == "Short"]
+    total  = len(members)
+    state, direction, agree = "n/a", None, 0
+    if total >= 2:
+        if longs and not shorts and len(longs) == total:
+            state, direction, agree = "Aligned", "Long", len(longs)
+        elif shorts and not longs and len(shorts) == total:
+            state, direction, agree = "Aligned", "Short", len(shorts)
+        elif len(longs) >= 2 and len(longs) > len(shorts):
+            state, direction, agree = "Leaning", "Long", len(longs)
+        elif len(shorts) >= 2 and len(shorts) > len(longs):
+            state, direction, agree = "Leaning", "Short", len(shorts)
+        else:
+            state, direction, agree = "Mixed", None, max(len(longs), len(shorts))
+    return {
+        "state":     state,        # Aligned / Leaning / Mixed / n/a
+        "direction": direction,    # Long / Short / None
+        "agree":     agree,        # indexes agreeing in the dominant direction
+        "total":     total,        # indexes evaluated
+        "members":   members,      # per-index detail (display)
+        "ts":        datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _cross_market_snapshot():
+    """Thread-safe shallow copy of the latest cross-market alignment snapshot for
+    /status (DISPLAY-ONLY). Empty dict until the first loop pass populates it."""
+    with CROSS_MARKET_LOCK:
+        return dict(CROSS_MARKET_STATE)
+
+
+def _maybe_send_cross_market_alert(snap):
+    """Fire the dedicated MES/MYM cross-market confirmation Discord alert when the
+    equity indexes are newly Aligned. Transition-deduped (direction change) and
+    cooldown-throttled, mute-respecting, called ONLY when DISCORD_LIVE_ENABLED.
+    DISPLAY/NOTIFY only — never affects whether a trade is taken. Runs on the single
+    cross-market loop thread, so CROSS_MARKET_LAST_ALERT needs no extra lock."""
+    if snap.get("state") != "Aligned":
+        return
+    direction = snap.get("direction")
+    if direction not in ("Long", "Short"):
+        return
+    now = datetime.now(timezone.utc)
+    with CROSS_MARKET_LOCK:
+        last_dir = CROSS_MARKET_LAST_ALERT.get("direction")
+        last_ts  = CROSS_MARKET_LAST_ALERT.get("ts")
+    # Only fire when the aligned direction CHANGED, or after the cooldown elapsed
+    # for the same direction (a long-running alignment re-pings at most once per
+    # cooldown, never every loop tick).
+    if (direction == last_dir and last_ts
+            and (now - last_ts).total_seconds() < CROSS_MARKET_ALERT_COOLDOWN):
+        return
+    # Targets: the non-Nasdaq index micros (MNQ already has its own READY-card flow).
+    # Respect per-instrument mute (fail-safe toward alerting) and only enabled ones.
+    enabled = set(enabled_instruments())
+    targets = [i for i in ("MES", "MYM") if i in enabled and not _alerts_muted(i)]
+    if not targets:
+        return
+    # Group by resolved channel so MES+MYM sharing the main channel post ONE
+    # combined message (no double-post); dedicated channels later each get their own.
+    by_url = {}
+    for inst in targets:
+        url = _asset_discord_url(inst)
+        if url:
+            by_url.setdefault(url, []).append(inst)
+    if not by_url:
+        return
+    arrow = "📈" if direction == "Long" else "📉"
+    word  = "BULLISH" if direction == "Long" else "BEARISH"
+    lines = []
+    for m in (snap.get("members") or []):
+        dot = ("🟢" if m.get("direction") == "Long"
+               else "🔴" if m.get("direction") == "Short" else "⚪")
+        es  = m.get("edge_score")
+        es_txt = f" · Edge {es}" if isinstance(es, (int, float)) else ""
+        lines.append(f"{dot} **{m.get('name') or m.get('instrument')}** {m.get('bias') or '—'}{es_txt}")
+    detail = "\n".join(lines)
+    sent_any = False
+    for url, insts in by_url.items():
+        names = " & ".join(insts)
+        content = (
+            f"{arrow} **Cross-Market Confirmation — {word}**\n"
+            f"All {snap.get('total')} equity indexes agree on direction.\n"
+            f"{detail}\n"
+            f"_Context for {names}. Display/notify only — does not place or change any trade._"
+        )
+        try:
+            resp = requests.post(url, json={"content": content}, timeout=5)
+            # Only a real 2xx counts as sent; a non-2xx must NOT arm the cooldown,
+            # so a failed post is retried on the next loop pass instead of being
+            # silently suppressed for CROSS_MARKET_ALERT_COOLDOWN seconds.
+            if getattr(resp, "status_code", 0) < 300:
+                sent_any = True
+            else:
+                logger.warning("cross-market alert non-2xx (%s) — not arming cooldown",
+                               getattr(resp, "status_code", "?"))
+        except Exception as exc:
+            logger.warning("cross-market alert post failed: %s", exc)
+    if sent_any:
+        with CROSS_MARKET_LOCK:
+            CROSS_MARKET_LAST_ALERT["direction"] = direction
+            CROSS_MARKET_LAST_ALERT["ts"] = now
+        logger.info("Cross-market alert sent: %s (%d indexes aligned)",
+                    direction, snap.get("agree"))
+
+
+def _cross_market_loop():
+    """Refresh the cross-market index-alignment snapshot (DISPLAY) and, on the LIVE
+    instance only, fire the dedicated MES/MYM cross-confirmation alert when the
+    equity indexes newly agree. Mirrors _trade_ready_loop: a self-rescheduling
+    daemon Timer. Runs on dev + prod (the dashboard needs the snapshot); the Discord
+    SEND is gated to DISCORD_LIVE_ENABLED so dev can't post to the shared live
+    channel. NEVER touches the gate / money path."""
+    try:
+        snap = compute_index_alignment()
+        with CROSS_MARKET_LOCK:
+            CROSS_MARKET_STATE.clear()
+            CROSS_MARKET_STATE.update(snap)
+        if DISCORD_LIVE_ENABLED:
+            _maybe_send_cross_market_alert(snap)
+    except Exception as exc:  # never let the loop die
+        logger.warning("cross-market loop error: %s", exc)
+    finally:
+        threading.Timer(CROSS_MARKET_INTERVAL, _cross_market_loop).start()
+
+
 def _update_journal_outcome(new_outcome, pnl_dollars=None, symbol=None):
     """Update the most recent journal entry that is still Pending or at T1.
 
@@ -15494,6 +15672,12 @@ def clear_alerts():
     JOURNAL_KEYS.clear()
     with AUTO_TRADE_LOCK:
         AUTO_FIRED_KEYS.clear()
+    # Cross-market alignment snapshot is DISPLAY-ONLY; clear it so the dashboard
+    # reflects the wiped state until the next loop pass repopulates it. LAST_ALERT
+    # is cleared under the same lock the notifier uses (avoids a clear-vs-notify race).
+    with CROSS_MARKET_LOCK:
+        CROSS_MARKET_STATE.clear()
+        CROSS_MARKET_LAST_ALERT.clear()
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
 
@@ -15646,6 +15830,8 @@ def status():
         "dualTfDirection":     _dtf["dualTfDirection"],
         "dualTfConfirmations": _dtf["dualTfConfirmations"],
         "dualTfReason":        _dtf["dualTfReason"],
+        # ── Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY-ONLY ──
+        "index_alignment":     _cross_market_snapshot(),
     }), 200
 
 
@@ -16971,6 +17157,14 @@ def dashboard():
   <div id="wn-body"></div>
 </div>
 
+<!-- Cross-market index alignment (Nasdaq/S&P/Dow agreement — DISPLAY + ALERTS only; never gates trades) -->
+<div class="mod" id="mod-xmarket" style="display:none">
+  <div class="mod-h">🔀 Index Alignment <span id="xm-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div id="xm-row" class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
+  <div class="se-reason" id="xm-summary" style="margin-top:8px">—</div>
+  <div class="nf-fid">Directional agreement across Nasdaq (MNQ), S&amp;P (MES) &amp; Dow (MYM). Display/notify only — does not place or change any trade.</div>
+</div>
+
 <!-- Analyst Mode (professional-analyst reasoning over the EXISTING signals — DISPLAY
      by default; the trade VETO is flag-gated server-side, default OFF). Hidden unless
      the analyst engine is enabled. FVG / Order Blocks are not tracked yet. -->
@@ -18016,6 +18210,48 @@ function renderModules(d){
 
   // ── Module 11: Analyst Mode — professional-analyst reasoning (DISPLAY-ONLY) ──
   renderAnalystMode(d);
+
+  // ── Module 12: Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY/NOTIFY only ──
+  const xm = d.index_alignment || null;
+  const xmMod = document.getElementById('mod-xmarket');
+  if (xmMod){
+    const members = (xm && xm.members) || [];
+    if (!xm || members.length < 2){
+      xmMod.style.display = 'none';
+    } else {
+      xmMod.style.display = '';
+      const st  = xm.state || 'n/a';
+      const dir = xm.direction || null;
+      const stCol = st==='Aligned' ? (dir==='Long'?'#22c55e':dir==='Short'?'#ef4444':'#6b7280')
+                  : st==='Leaning' ? '#eab308' : '#6b7280';
+      const vEl = document.getElementById('xm-verdict');
+      if (vEl){
+        const dirTxt = dir ? (' '+(dir==='Long'?'BULLISH':'BEARISH')) : '';
+        vEl.textContent = st.toUpperCase()+dirTxt;
+        vEl.style.color = stCol;
+      }
+      const rowEl = document.getElementById('xm-row');
+      if (rowEl){
+        rowEl.innerHTML = members.map(function(m){
+          const md = m.direction;
+          const c  = md==='Long'?'#22c55e':md==='Short'?'#ef4444':'#6b7280';
+          const ar = md==='Long'?'↑':md==='Short'?'↓':'→';
+          const es = (m.edge_score!=null) ? (' · '+Math.round(Number(m.edge_score))) : '';
+          return '<div class="gstat"><div class="l">'+(m.name||m.instrument)+'</div>'
+               + '<div class="v" style="color:'+c+'">'+ar+' '+(m.bias||'—')+es+'</div></div>';
+        }).join('');
+      }
+      const sEl = document.getElementById('xm-summary');
+      if (sEl){
+        let msg;
+        if (st==='Aligned')      msg = 'All '+xm.total+' equity indexes agree — '+(dir==='Long'?'bullish':'bearish')+'. Cross-market confirmation for MES & MYM.';
+        else if (st==='Leaning') msg = xm.agree+' of '+xm.total+' indexes lean '+(dir==='Long'?'bullish':'bearish')+'. Partial confirmation.';
+        else                     msg = 'Indexes disagree — no cross-market confirmation.';
+        sEl.textContent = msg;
+        sEl.style.color = stCol;
+      }
+    }
+  }
 }
 
 // Analyst Mode — professional-analyst reasoning over the EXISTING signals
@@ -19779,6 +20015,7 @@ if __name__ == "__main__":
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
+    threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:
