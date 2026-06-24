@@ -691,6 +691,21 @@ def _swing_htf_enabled(mode=None):
         return False
 
 
+def _analyst_engine_enabled():
+    """Analyst Reasoning DISPLAY layer — ON by default (fail-open). Kept as a helper
+    (env ANALYST_ENGINE_ENABLED=0 hard-disables) purely as an emergency kill-switch;
+    a bug inside the engine is already swallowed into a neutral block by the caller."""
+    return os.environ.get("ANALYST_ENGINE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _analyst_gate_enabled():
+    """Analyst Reasoning money-path VETO — OFF by default. When ON, the analyst may
+    only DEMOTE an actionable gate verdict to WAIT (it can NEVER promote / force a
+    trade). Flag-gated so live trading stays byte-identical until the operator turns
+    it on after watching the analyst agree (and backtesting it)."""
+    return os.environ.get("ANALYST_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
 # EARLY READY (SCALP Edge 50-59) is actionable but lower-conviction (half size)
 # than a full READY (Edge >= 60). Both end in the word "READY", so verdict.endswith(
@@ -8344,6 +8359,360 @@ def get_news_filter():
     }
 
 
+# ── Analyst Reasoning Engine (professional-analyst layer) ─────────────────────
+# Runs Context -> Thesis -> Evidence -> Risk -> Verdict over the EXISTING signals
+# (alerts/strategies are read as EVIDENCE, never as commands). DISPLAY by default;
+# an optional flag-gated, fail-CLOSED veto (_analyst_gate_enabled) can only DEMOTE
+# an actionable gate verdict to WAIT — it NEVER promotes a trade. The strict gate,
+# every existing strategy/alert and all goldens are untouched: this layer lives
+# entirely on top of full_analysis' assembled `result`, after the authoritative
+# verdict is decided. NOTE: FVG / Order Blocks are not tracked yet (the engine
+# reasons over supply/demand zones, VWAP, structure, sweeps, CVD, volume & HTF).
+_ANALYST_W = {"choch": 20, "bos": 20, "vwap": 15, "sweep": 15,
+              "cvd": 15, "volume": 15, "zone": 10, "session": 10, "htf": 10}
+_ANALYST_READY_EVIDENCE = 70   # min dominant-side evidence for an analyst READY
+_ANALYST_MIN_MARGIN     = 10   # min lead over the other side (else mixed -> WAIT)
+_ANALYST_NOTHING        = 25   # both sides below this -> NO TRADE (nothing forming)
+
+
+def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRADE"):
+    """Fully-populated, safe Analyst block (fail-open fallback + market-closed stub).
+    EVERY key the /status serializer and dashboard read MUST exist here so the
+    single-return-path / hard-indexed-consumer invariant holds in every branch."""
+    return {
+        "engine_enabled":         _analyst_engine_enabled(),
+        "gate_enabled":           _analyst_gate_enabled(),
+        "market_bias":            "Neutral",
+        "thesis":                 reason,
+        "bull_case":              [],
+        "bear_case":              [],
+        "bull_score":             0,
+        "bear_score":             0,
+        "stronger_side":          "Neither",
+        "best_trade_idea":        "No actionable setup.",
+        "invalidation":           "—",
+        "why_not_trade":          reason,
+        "confidence":             0,
+        "final_verdict":          verdict,
+        "context":                {"htf_bias": "Neutral", "regime": "—",
+                                   "location": "—", "environment": "—"},
+        "risk":                   {"chasing": False, "stop_logical": False,
+                                   "target_room": False, "rr_acceptable": False,
+                                   "into_resistance": False,
+                                   "volatility_supports": False, "rr": None,
+                                   "summary": "—", "quality": "—"},
+        "market_story":           reason,
+        "professionals_watching": [],
+        "best_setup_forming":     "None",
+        "location_quality":       "—",
+        "risk_quality":           "—",
+        "reason_for_waiting":     reason,
+        "what_needs_next":        [],
+        "agrees_with_gate":       False,
+        "veto_would_fire":        False,
+    }
+
+
+def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
+    """Professional-analyst reasoning over the assembled full_analysis `result`.
+    Pure + fail-open (the caller also wraps it in try/except). Returns the block
+    documented in _analyst_neutral_block with every key populated for real."""
+    dirs = strict.get("directions") or {}
+    cL   = (dirs.get("Long")  or {}).get("confluences") or {}
+    cS   = (dirs.get("Short") or {}).get("confluences") or {}
+    conflict = bool((dirs.get("Long") or {}).get("conflict")
+                    or (dirs.get("Short") or {}).get("conflict"))
+
+    price    = result.get("current_price")
+    vwap     = result.get("vwap_value")
+    sup      = result.get("nearest_supply")
+    dem      = result.get("nearest_demand")
+    vol      = result.get("volatility") or {}
+    regime_raw = str(vol.get("regime") or "").upper()
+    struct   = str(result.get("structure_label") or "")
+    bias     = result.get("bias") or "Neutral"
+    gate_v   = result.get("verdict")
+    gate_dir = result.get("strict_direction")
+    session  = result.get("session") or {}
+    overext  = bool(result.get("overextended"))
+    tp       = result.get("trade_plan") or {}
+
+    def _f(x):
+        try:
+            return f"{float(x):.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def _near(a, b, pct=0.0015):
+        try:
+            return a is not None and b not in (None, 0) and abs(float(a) - float(b)) / abs(float(b)) <= pct
+        except (TypeError, ValueError, ZeroDivisionError):
+            return False
+
+    # ── Evidence stacks (existing alerts read as EVIDENCE, scored per side) ───
+    def _evidence(conf, side):
+        long_ = (side == "Long")
+        out = []
+        if conf.get("choch"):
+            out.append((("Bullish" if long_ else "Bearish") + " CHOCH (change of character)", _ANALYST_W["choch"]))
+        if conf.get("bos"):
+            out.append((("Bullish" if long_ else "Bearish") + " BOS (break of structure)", _ANALYST_W["bos"]))
+        if conf.get("vwap"):
+            out.append(("Price " + ("reclaimed/holding above VWAP" if long_ else "rejected/holding below VWAP"), _ANALYST_W["vwap"]))
+        if conf.get("liquidity_sweep"):
+            out.append((("Swept lows and reversed up" if long_ else "Swept highs and failed lower"), _ANALYST_W["sweep"]))
+        if conf.get("cvd_confirmed"):
+            out.append((("Positive delta / CVD" if long_ else "Negative delta / CVD"), _ANALYST_W["cvd"]))
+        if conf.get("volume_confirmed"):
+            out.append(("Volume confirmation (elevated RVOL)", _ANALYST_W["volume"]))
+        if conf.get("zone_confirmed") or conf.get("zone_mitigated"):
+            out.append((("Demand zone holding / reaction" if long_ else "Supply zone holding / reaction"), _ANALYST_W["zone"]))
+        return out
+
+    bull = _evidence(cL, "Long")
+    bear = _evidence(cS, "Short")
+    bull_score = sum(w for _, w in bull)
+    bear_score = sum(w for _, w in bear)
+
+    # Directionless tailwind — preferred session window credited to the leading side.
+    if session.get("preferred"):
+        if bull_score > bear_score:
+            bull.append(("Inside a preferred session window", _ANALYST_W["session"])); bull_score += _ANALYST_W["session"]
+        elif bear_score > bull_score:
+            bear.append(("Inside a preferred session window", _ANALYST_W["session"])); bear_score += _ANALYST_W["session"]
+
+    # Higher-timeframe alignment (SWING HTF context, when present).
+    htf_bias = "Neutral"
+    if isinstance(swing_ctx, dict):
+        if swing_ctx.get("aligned_long"):
+            htf_bias = "Bullish"
+            bull.append(("1H/4H higher-timeframe alignment", _ANALYST_W["htf"])); bull_score += _ANALYST_W["htf"]
+        elif swing_ctx.get("aligned_short"):
+            htf_bias = "Bearish"
+            bear.append(("1H/4H higher-timeframe alignment", _ANALYST_W["htf"])); bear_score += _ANALYST_W["htf"]
+    if htf_bias == "Neutral":
+        htf_bias = bias if bias in ("Bullish", "Bearish") else "Neutral"
+
+    stronger  = "Long" if bull_score > bear_score else ("Short" if bear_score > bull_score else "Neither")
+    top       = max(bull_score, bear_score)
+    margin    = abs(bull_score - bear_score)
+    conf_side = cL if stronger == "Long" else (cS if stronger == "Short" else {})
+
+    # ── Market context ───────────────────────────────────────────────────────
+    def _regime():
+        if conflict or stronger == "Neither":
+            return "Ranging / choppy"
+        sweep = cL.get("liquidity_sweep") or cS.get("liquidity_sweep")
+        choch = cL.get("choch") or cS.get("choch")
+        bos   = cL.get("bos") or cS.get("bos")
+        volok = cL.get("volume_confirmed") or cS.get("volume_confirmed")
+        if sweep and choch:
+            return "Reverting (sweep + reversal)"
+        if bos and volok:
+            return "Breaking out"
+        if bos or "bull" in struct.lower() or "bear" in struct.lower():
+            return "Trending"
+        return "Ranging"
+
+    regime = _regime()
+
+    loc_bits = []
+    if _near(price, dem):
+        loc_bits.append("at demand")
+    if _near(price, sup):
+        loc_bits.append("at supply")
+    if _near(price, vwap, 0.001):
+        loc_bits.append("at VWAP")
+    if not loc_bits:
+        loc_bits.append("in mid-range (no nearby zone/VWAP)")
+    location = ", ".join(loc_bits)
+
+    environment = "Choppy" if (conflict or regime.startswith("Ranging")
+                               or regime_raw in ("HIGH_BLOCK", "HIGH_CAUTION")) else "Clean"
+
+    # ── Risk & location check (for the leaning side) ─────────────────────────
+    # Trade plans carry R:R as a DISPLAY string ("1:1", "1:4", "T1 .. / T2 ..");
+    # the numeric value lives in rr_num. Prefer rr_num, fall back to parsing the
+    # string (first "1:X" ratio, else the first number) so the risk check is real
+    # (float("1:1") would otherwise raise -> phantom "no acceptable R:R").
+    rr = tp.get("rr_num")
+    if rr is None:
+        _rr_disp = tp.get("rr")
+        if isinstance(_rr_disp, str):
+            _rm = (re.search(r"1\s*:\s*([0-9]+(?:\.[0-9]+)?)", _rr_disp)
+                   or re.search(r"([0-9]+(?:\.[0-9]+)?)", _rr_disp))
+            if _rm:
+                rr = _rm.group(1)
+    try:
+        rr = float(rr) if rr is not None else None
+    except (TypeError, ValueError):
+        rr = None
+    stop_logical    = bool(tp.get("stop_loss") is not None and tp.get("stop_valid", True))
+    rr_acceptable   = bool(rr is not None and rr >= 1.0)
+    target_room     = rr_acceptable
+    chasing         = overext
+    into_resistance = (stronger == "Long" and _near(price, sup, 0.0015)) \
+                      or (stronger == "Short" and _near(price, dem, 0.0015))
+    volatility_supports = (str(vol.get("status") or "ok").lower() == "ok"
+                           and regime_raw not in ("HIGH_BLOCK",))
+
+    risk = {"chasing": chasing, "stop_logical": stop_logical, "target_room": target_room,
+            "rr_acceptable": rr_acceptable, "into_resistance": into_resistance,
+            "volatility_supports": volatility_supports, "rr": rr}
+    risk_ok = (not chasing and stop_logical and rr_acceptable
+               and not into_resistance and volatility_supports)
+    _risk_pass = (sum(1 for k in ("stop_logical", "target_room", "rr_acceptable",
+                                  "volatility_supports") if risk[k])
+                  + (0 if chasing else 1) + (0 if into_resistance else 1))
+    risk["quality"] = "Good" if risk_ok else ("Fair" if _risk_pass >= 4 else "Poor")
+    _rn = []
+    if chasing:                 _rn.append("price overextended (chasing risk)")
+    if into_resistance:         _rn.append("entering directly into the opposing zone")
+    if not rr_acceptable:       _rn.append("no acceptable R:R yet")
+    if not stop_logical:        _rn.append("no logical stop yet")
+    if not volatility_supports: _rn.append("volatility not supportive")
+    risk["summary"] = "; ".join(_rn) if _rn else "Entry location, stop, R:R and volatility all acceptable."
+
+    # ── Missing high-value evidence on the leaning side (what to wait for) ────
+    _checks = [("choch", "a CHOCH (change of character)"), ("bos", "a BOS (break of structure)"),
+               ("vwap", "price to reclaim/hold the correct side of VWAP"),
+               ("liquidity_sweep", "a liquidity sweep + reversal"),
+               ("cvd_confirmed", "delta/CVD agreement"),
+               ("volume_confirmed", "volume confirmation")]
+    what_needs_next = []
+    if stronger != "Neither":
+        what_needs_next = [name for key, name in _checks if not conf_side.get(key)]
+        if not risk_ok:
+            if chasing:         what_needs_next.append("a pullback (price is extended)")
+            if into_resistance: what_needs_next.append("room to the next opposing zone")
+
+    # ── Verdict (independent of the gate — the analyst may WAIT even when alerts fire) ──
+    if top < _ANALYST_NOTHING or stronger == "Neither":
+        final = "NO TRADE"
+    elif conflict or margin < _ANALYST_MIN_MARGIN:
+        final = "WAIT"
+    elif top >= _ANALYST_READY_EVIDENCE and risk_ok and (gate_dir in (stronger, None)):
+        final = "READY LONG" if stronger == "Long" else "READY SHORT"
+    else:
+        final = "WAIT"
+
+    gate_actionable = is_actionable(gate_v)
+    agrees = (gate_actionable and final in ("READY LONG", "READY SHORT")
+              and ((final.endswith("LONG") and gate_dir == "Long")
+                   or (final.endswith("SHORT") and gate_dir == "Short")))
+    veto_would_fire = bool(gate_actionable and not agrees)
+
+    if stronger == "Neither":
+        confidence = 0
+    else:
+        confidence = max(0, min(95, int(top * 0.7 + margin * 0.5)))
+        if final.startswith("READY"):
+            confidence = max(confidence, 70)
+        elif final == "WAIT":
+            confidence = min(confidence, 65)
+        else:
+            confidence = min(confidence, 40)
+
+    bull_case = [lbl for lbl, _ in bull]
+    bear_case = [lbl for lbl, _ in bear]
+
+    # Best trade idea / forming setup (display-only; real plan if present, else preview).
+    plan = tp if tp.get("trade_plan") else ((result.get("directions") or {}).get(stronger) or {}).get("potential_plan")
+    if stronger == "Neither":
+        best_idea = "No directional edge — stand aside."
+    elif isinstance(plan, dict) and plan.get("entry_zone"):
+        best_idea = (f"{stronger} from {plan.get('entry_zone')} — stop {_f(plan.get('stop_loss'))}, "
+                     f"targets {_f(plan.get('target1'))}/{_f(plan.get('target2'))}"
+                     + (f" (R:R {rr:.1f})" if rr is not None else ""))
+    else:
+        best_idea = f"{stronger} setup forming — no valid entry geometry yet."
+
+    _inv_lvl = plan.get("stop_loss") if isinstance(plan, dict) else None
+    if stronger == "Long":
+        invalidation = f"A close back below {_f(_inv_lvl if _inv_lvl is not None else (dem if dem is not None else vwap))}."
+    elif stronger == "Short":
+        invalidation = f"A close back above {_f(_inv_lvl if _inv_lvl is not None else (sup if sup is not None else vwap))}."
+    else:
+        invalidation = "—"
+
+    if stronger == "Neither":
+        thesis = "Evidence is balanced or insufficient — no side has the stronger argument."
+    else:
+        thesis = (f"{stronger} has the stronger argument ({bull_score} vs {bear_score}). "
+                  + ("Setup confirmed." if final.startswith("READY")
+                     else "Not yet confirmed — waiting on the missing pieces."))
+    market_story = (f"{htf_bias} higher-timeframe bias. Price is {location} in a "
+                    f"{regime.lower()} ({environment.lower()}) environment. " + thesis)
+
+    if final.startswith("READY"):
+        why_not = ""
+        reason_for_waiting = "Evidence aligned and risk acceptable — setup is actionable."
+    elif final == "WAIT":
+        if conflict:
+            why_not = "Opposing structure on both sides — the tape is conflicted."
+        elif margin < _ANALYST_MIN_MARGIN:
+            why_not = "Bullish and bearish evidence are too close — no clear edge."
+        elif not risk_ok:
+            why_not = "A direction is leaning but the risk/location is not acceptable: " + risk["summary"]
+        else:
+            why_not = "A direction is leaning but key confirmation is still missing."
+        reason_for_waiting = why_not
+    else:
+        why_not = "No setup — evidence is insufficient on both sides."
+        reason_for_waiting = why_not
+
+    watching = []
+    if vwap is not None: watching.append(f"VWAP {_f(vwap)}")
+    if dem is not None:  watching.append(f"Demand {_f(dem)}")
+    if sup is not None:  watching.append(f"Supply {_f(sup)}")
+    if what_needs_next:  watching.append("Trigger: " + what_needs_next[0])
+
+    market_bias = (f"{htf_bias} HTF"
+                   + (f" / {stronger} near-term" if stronger != "Neither" else " / no near-term edge"))
+
+    location_quality = "—"
+    if stronger != "Neither":
+        if into_resistance:
+            location_quality = "Poor — entering into the opposing zone"
+        elif (stronger == "Long" and _near(price, dem)) or (stronger == "Short" and _near(price, sup)):
+            location_quality = "Good — at the trade-side zone"
+        elif _near(price, vwap, 0.001):
+            location_quality = "Fair — at VWAP"
+        else:
+            location_quality = "Poor — mid-range, away from a zone"
+
+    best_setup_forming = "None — flat" if stronger == "Neither" else f"{stronger}: {best_idea}"
+
+    return {
+        "engine_enabled":         _analyst_engine_enabled(),
+        "gate_enabled":           _analyst_gate_enabled(),
+        "market_bias":            market_bias,
+        "thesis":                 thesis,
+        "bull_case":              bull_case,
+        "bear_case":              bear_case,
+        "bull_score":             bull_score,
+        "bear_score":             bear_score,
+        "stronger_side":          stronger,
+        "best_trade_idea":        best_idea,
+        "invalidation":           invalidation,
+        "why_not_trade":          why_not,
+        "confidence":             confidence,
+        "final_verdict":          final,
+        "context":                {"htf_bias": htf_bias, "regime": regime,
+                                   "location": location, "environment": environment},
+        "risk":                   risk,
+        "market_story":           market_story,
+        "professionals_watching": watching,
+        "best_setup_forming":     best_setup_forming,
+        "location_quality":       location_quality,
+        "risk_quality":           risk["quality"],
+        "reason_for_waiting":     reason_for_waiting,
+        "what_needs_next":        what_needs_next,
+        "agrees_with_gate":       agrees,
+        "veto_would_fire":        veto_would_fire,
+    }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -9023,6 +9392,50 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     result["last_valid_price"]  = _lv_price
     result["last_valid_time"]   = fmt_et(_lv_ts, "%b %-d, %-I:%M %p ET") if _lv_ts else None
     result["last_valid_source"] = _lv_src
+
+    # ── Analyst Reasoning Engine (Context -> Thesis -> Evidence -> Risk ->
+    #    Verdict). DISPLAY by default; the flag-gated, fail-CLOSED veto can ONLY
+    #    demote an actionable gate verdict to WAIT (never promote). Computed from the
+    #    FINAL assembled result so it reflects every override above. The market-closed
+    #    override below replaces it with a paused stub (single-return-path parity). ──
+    if market["open"]:
+        if _analyst_engine_enabled():
+            try:
+                _analyst = compute_analyst_reasoning(result, strict, swing_ctx, market)
+            except Exception as exc:   # FAIL-OPEN — a broken analyst must never crash analysis.
+                _analyst = _analyst_neutral_block(f"Analyst engine unavailable ({exc}).")
+        else:
+            _analyst = _analyst_neutral_block("Analyst engine disabled.")
+        # Fail-CLOSED veto: only when explicitly enabled AND the analyst disagrees
+        # with an actionable gate verdict. It can ONLY demote to WAIT — never promote.
+        if (_analyst_gate_enabled() and _analyst.get("veto_would_fire")
+                and is_actionable(result["verdict"])):
+            _veto_reason = ("Analyst veto: "
+                            + (_analyst.get("why_not_trade")
+                               or "analyst reasoning does not support the trade."))
+            result["verdict"]       = "WAIT"
+            result["strict_label"]  = "WAIT"
+            result["strict_reason"] = _veto_reason
+            result["trade_plan"]    = {
+                "trade_plan": False, "reason": _veto_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": result.get("strict_direction"),
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
+            for _vd in ("Long", "Short"):
+                _vblk = (result.get("directions") or {}).get(_vd)
+                if _vblk:
+                    _vblk.update(ready=False, label="WAIT")
+            _ad = result.get("alert_diagnostics") or {}
+            _ad["ready_reason"]     = ""
+            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Analyst veto"]
+            result["alert_diagnostics"] = _ad
+            # Decision-support was computed earlier from the pre-veto plan — recompute
+            # it so every display surface agrees with the demoted WAIT verdict.
+            result["decision_support"] = _decision_support(result)
+            _analyst["final_verdict"] = "WAIT"
+        result["analyst"] = _analyst
     if not market["open"]:
         result["verdict"]         = "MARKET CLOSED"
         # strict_label is the JOURNALING label and must stay in
@@ -9105,6 +9518,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         # Display-only feeds stay present for parity with the open path.
         result["equity_curve_today"] = get_today_equity_curve(active_ticker)
         result["news_filter"]        = get_news_filter()
+        # Analyst Reasoning paused while the market is closed (no live tape) — a
+        # fully-populated stub keeps the single-return-path / hard-index invariant.
+        result["analyst"]            = _analyst_neutral_block(
+            "Market closed — live alerts paused.", verdict="NO TRADE")
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
             if _blk:
@@ -15079,6 +15496,7 @@ def status():
         "ready_reason":        a.get("ready_reason"),
         "rejected_reasons":    a.get("rejected_reasons"),
         "alert_diagnostics":   a.get("alert_diagnostics"),
+        "analyst":             a.get("analyst"),
         "scalp_diagnostics":   _scalp_diag_block(a),
         "swing_diagnostics":   _swing_diag_block(a),
         "decision_support":    a.get("decision_support"),
@@ -16460,6 +16878,42 @@ def dashboard():
   <div id="wn-body"></div>
 </div>
 
+<!-- Analyst Mode (professional-analyst reasoning over the EXISTING signals — DISPLAY
+     by default; the trade VETO is flag-gated server-side, default OFF). Hidden unless
+     the analyst engine is enabled. FVG / Order Blocks are not tracked yet. -->
+<div class="mod" id="mod-analyst" style="display:none">
+  <div class="mod-h">🧠 Analyst Mode <span id="an-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div class="se-bias-h">Final Verdict</div>
+  <div id="an-verdict-big" style="font-size:20px;font-weight:800;margin:2px 0 6px">—</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Market Bias</div><div class="v" id="an-bias">—</div></div>
+    <div class="gstat"><div class="l">Confidence</div><div class="v" id="an-conf">—</div></div>
+    <div class="gstat"><div class="l">Stronger Side</div><div class="v" id="an-side">—</div></div>
+    <div class="gstat"><div class="l">Location Quality</div><div class="v" id="an-loc">—</div></div>
+    <div class="gstat"><div class="l">Risk Quality</div><div class="v" id="an-risk">—</div></div>
+    <div class="gstat"><div class="l">Bull / Bear</div><div class="v" id="an-scores">—</div></div>
+  </div>
+  <div class="se-bias-h">Current Market Story</div>
+  <div class="se-reason" id="an-story">—</div>
+  <div class="se-bias-h">Best Trade Idea</div>
+  <div class="se-reason" id="an-idea">—</div>
+  <div class="se-bias-h">Best Setup Forming</div>
+  <div class="se-reason" id="an-forming">—</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <div><div class="se-bias-h" style="color:#22c55e">Bull Case</div><ul id="an-bull" style="margin:4px 0;padding-left:16px"></ul></div>
+    <div><div class="se-bias-h" style="color:#ef4444">Bear Case</div><ul id="an-bear" style="margin:4px 0;padding-left:16px"></ul></div>
+  </div>
+  <div class="se-bias-h">What Professionals Are Watching</div>
+  <ul id="an-watch" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Reason For Waiting / Why Not Trade</div>
+  <div class="se-reason" id="an-why">—</div>
+  <div class="se-bias-h">What Needs To Happen Next</div>
+  <ul id="an-next" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Invalidation</div>
+  <div class="se-reason" id="an-inval">—</div>
+  <div id="an-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
 <!-- SCALP dynamic-exit diagnostics (req 7 — DISPLAY-ONLY; hidden unless SCALP dynamic exits are on) -->
 <div class="mod" id="mod-scalpdiag" style="display:none">
   <div class="mod-h">🩺 SCALP Diagnostics <span id="sd-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
@@ -17466,6 +17920,73 @@ function renderModules(d){
 
   // ── Module 10: News filter (economic calendar) — display-only ──
   renderNewsFilter(d);
+
+  // ── Module 11: Analyst Mode — professional-analyst reasoning (DISPLAY-ONLY) ──
+  renderAnalystMode(d);
+}
+
+// Analyst Mode — professional-analyst reasoning over the EXISTING signals
+// (Context -> Thesis -> Evidence -> Risk -> Verdict). DISPLAY-ONLY on the
+// dashboard; the money-path veto is flag-gated server-side. Fed by d.analyst.
+function _anFill(id, items){
+  const e=document.getElementById(id);
+  if(!e) return;
+  e.innerHTML='';
+  const arr=(items||[]);
+  if(!arr.length){
+    const li=document.createElement('li');
+    li.textContent='—'; li.style.color='#6b7280';
+    e.appendChild(li); return;
+  }
+  arr.forEach(function(t){
+    const li=document.createElement('li');
+    li.textContent=t; e.appendChild(li);
+  });
+}
+function _anVerdictColor(v){
+  v=v||'';
+  if(v.indexOf('READY')===0) return '#22c55e';
+  if(v==='WAIT') return '#f59e0b';
+  return '#6b7280';
+}
+function renderAnalystMode(d){
+  const a=(d && d.analyst) || null;
+  const mod=document.getElementById('mod-analyst');
+  if(!mod) return;
+  if(!a || !a.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  const fv=a.final_verdict||'NO TRADE';
+  _set('an-verdict-big', fv, _anVerdictColor(fv));
+  const vbadge=document.getElementById('an-verdict');
+  if(vbadge){
+    vbadge.textContent=a.gate_enabled ? 'VETO ARMED' : 'DISPLAY';
+    vbadge.style.color=a.gate_enabled ? '#ef4444' : '#6b7280';
+  }
+  _set('an-bias', a.market_bias, '#e8e8f0');
+  const conf=Number(a.confidence||0);
+  _set('an-conf', conf+'%', conf>=70?'#22c55e':conf>=40?'#f59e0b':'#6b7280');
+  const side=a.stronger_side||'Neither';
+  _set('an-side', side, side==='Long'?'#22c55e':side==='Short'?'#ef4444':'#6b7280');
+  const lq=a.location_quality||'—';
+  _set('an-loc', lq, lq.indexOf('Good')===0?'#22c55e':lq.indexOf('Fair')===0?'#f59e0b':lq.indexOf('Poor')===0?'#ef4444':'#e8e8f0');
+  const rq=a.risk_quality||'—';
+  _set('an-risk', rq, rq==='Good'?'#22c55e':rq==='Fair'?'#f59e0b':rq==='Poor'?'#ef4444':'#e8e8f0');
+  _set('an-scores', (a.bull_score!=null?a.bull_score:0)+' / '+(a.bear_score!=null?a.bear_score:0), '#e8e8f0');
+  _set('an-story', a.market_story, '#cfd0e0');
+  _set('an-idea', a.best_trade_idea, '#cfd0e0');
+  _set('an-forming', a.best_setup_forming, '#cfd0e0');
+  _anFill('an-bull', a.bull_case);
+  _anFill('an-bear', a.bear_case);
+  _anFill('an-watch', a.professionals_watching);
+  _set('an-why', (a.why_not_trade && a.why_not_trade.length) ? a.why_not_trade : a.reason_for_waiting, '#cfd0e0');
+  _anFill('an-next', a.what_needs_next);
+  _set('an-inval', a.invalidation, '#cfd0e0');
+  const foot=document.getElementById('an-foot');
+  if(foot){ foot.textContent='Reasoning over existing signals · FVG / Order Blocks not tracked yet'+(a.gate_enabled?'':' · veto OFF (display-only)'); }
 }
 
 // Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
