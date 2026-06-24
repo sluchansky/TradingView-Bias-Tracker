@@ -40,19 +40,19 @@ ET_TZ = ZoneInfo("America/New_York")
 BT_SPECS = {
     "MNQ": {"tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0,
             "point_value": 2.0, "tick_size": 0.25, "min_stop_ticks": 40,
-            "scalp_min_stop_ticks": 0, "min_stop_pts": 20.0,
-            "scalp_min_stop_pts": 0.0,
+            "scalp_min_stop_ticks": 48, "min_stop_pts": 20.0,
+            "scalp_min_stop_pts": 12.0,
             "price_lo": 3000.0, "price_hi": 60000.0},
     "MGC": {"tp1": 5.0, "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0,
             "point_value": 10.0, "tick_size": 0.1, "min_stop_ticks": 50,
-            "scalp_min_stop_ticks": 0, "min_stop_pts": 5.0,
-            "scalp_min_stop_pts": 0.0,
+            "scalp_min_stop_ticks": 30, "min_stop_pts": 5.0,
+            "scalp_min_stop_pts": 3.0,
             "price_lo": 400.0, "price_hi": 12000.0},
 }
 
 # ── Copied mode knobs (mirror live MODES) — only what the backtest needs ───────
 BT_MODES = {
-    "SCALP": {"stop_mult": 0.75, "stop_mult_high": 1.25, "enforce_min_rr": False,
+    "SCALP": {"stop_mult": 1.5, "stop_mult_high": 2.0, "enforce_min_rr": False,
               "vol_high_caution": 1.6, "vol_high_block": 2.5,
               "vol_quiet_caution": 0.55, "vol_quiet_block": 0.35,
               "rvol_confirm": 1.5, "near_pct": 0.006, "extended_pct": 0.016},
@@ -828,18 +828,18 @@ DETECTORS = {
 # ════════════════════════════════════════════════════════════════════════════
 def bt_stop_plan(direction, entry, demand_zone, supply_zone, spec, atr, mode, regime):
     """ATR×mult stop blended with the nearest zone. Mirrors _dynamic_stop_plan: the
-    WIDER of the ATR stop and the structure stop, with a HARD minimum-stop guard
-    (SWING rejects too-tight stops outright; SCALP has NO minimum so a tight stop is
-    allowed as-is — no silent widening / tick floor), then snapped up to whole ticks,
-    with the volatility-wins-over-mode multiplier."""
+    WIDER of the ATR stop and the structure stop, with a mode-aware minimum-stop guard
+    (SWING rejects too-tight stops outright; SCALP WIDENS a too-tight stop up to its
+    per-instrument floor — scalp_min_stop_pts), then snapped up to whole ticks, with
+    the volatility-wins-over-mode multiplier."""
     if atr is None or atr <= 0:
         return None
     tick = spec["tick_size"]
     buf = spec["stop_buf"]
     mk = BT_MODES.get(mode, BT_MODES["SCALP"])
-    # Mode-aware minimum-stop (mirrors live): SWING keeps its HARD minimum (min_pts);
-    # SCALP's minimum is 0 (disabled) so tight stops are allowed as-is. min_ticks is
-    # metadata only (no flooring), exactly as live _dynamic_stop_plan.
+    # Mode-aware minimum-stop (mirrors live): SWING keeps its HARD minimum (min_pts,
+    # reject); SCALP WIDENS a too-tight stop up to its per-instrument floor (min_pts).
+    # min_ticks stays metadata only, exactly as live _dynamic_stop_plan.
     if mode == "SCALP":
         min_ticks = int(spec.get("scalp_min_stop_ticks", spec["min_stop_ticks"]))
         min_pts   = float(spec.get("scalp_min_stop_pts", spec.get("min_stop_pts", 0.0)))
@@ -862,11 +862,15 @@ def bt_stop_plan(direction, entry, demand_zone, supply_zone, spec, atr, mode, re
         structure_stop = (supply_zone + buf) if supply_zone is not None else None
         calc_stop = max(atr_stop, structure_stop) if structure_stop is not None else atr_stop
     calc_dist = abs(entry - calc_stop)
-    # Minimum-stop guard (SWING only, mirrors live): SWING rejects a calc stop tighter
-    # than its minimum (no trade) on the RAW pre-snap distance. SCALP min_pts == 0, so
-    # this is INERT for SCALP — a tight stop passes through. NO artificial tick floor.
+    # Minimum-stop guard (mode-aware, mirrors live) on the RAW pre-snap distance: SWING
+    # rejects a calc stop tighter than its minimum (no trade); SCALP WIDENS up to its
+    # per-instrument floor (scalp_min_stop_pts) instead of rejecting.
     if min_pts > 0 and calc_dist < min_pts:
-        return None
+        if mode == "SCALP":
+            calc_dist = min_pts
+            calc_stop = (entry - calc_dist) if direction == "Long" else (entry + calc_dist)
+        else:
+            return None
     calc_ticks = calc_dist / tick if tick else 0.0
     # Snap UP to whole ticks (never tighter than calculated); min_ticks is metadata.
     final_ticks = math.ceil(calc_ticks - 1e-9)

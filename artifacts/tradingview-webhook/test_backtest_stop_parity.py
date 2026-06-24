@@ -2,7 +2,7 @@
 
 The backtest stop helper is a COPY of the live ATR/structure stop, so the two must
 stay in lock-step. These tests pin the cases the SCALP retune cares about:
-  • SCALP has NO minimum stop — a tight stop is allowed as-is in both engines (parity).
+  • SCALP WIDENS a too-tight stop up to its per-instrument floor in both engines (parity).
   • SWING still rejects a too-tight stop in both engines (parity).
   • a valid stop's snapped distance, multiplier, and min-tick metadata.
 
@@ -52,15 +52,33 @@ def test_valid_stop_parity_no_zone():
         assert round(b["stop"], 4) == round(live["final_stop"], 4), ctx
 
 
-def test_scalp_tight_stop_allowed_parity():
-    # SCALP has NO minimum: a tiny ATR is ALLOWED as-is in both engines (snapped only
-    # to the tick grid). Live and backtest must agree on the resulting stop.
+def test_scalp_tight_stop_widens_to_floor_parity():
+    # SCALP WIDENS a too-tight stop up to its per-instrument floor in BOTH engines.
+    # A tiny ATR (0.2) is below every floor, so live and backtest must agree on the
+    # resulting widened stop.
     for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0)):
         live = app._dynamic_stop_plan("Long", entry, None, None, ticker,
                                       _vol(0.2), "SCALP")
         b = bt.bt_stop_plan("Long", entry, None, None, bt.BT_SPECS[ticker],
                             0.2, "SCALP", "NORMAL")
         assert live["ok"] is True and b is not None, ticker
+        assert live["min_floor_applied"] is True, ticker
+        assert b["stop_ticks"] == live["stop_distance_ticks"], ticker
+        assert round(b["risk_points"], 4) == round(live["risk_points"], 4), ticker
+        assert round(b["stop"], 4) == round(live["final_stop"], 4), ticker
+
+
+def test_scalp_tight_stop_widens_to_floor_short_parity():
+    # SHORT mirror: the floor-widen path must also stay in lock-step between engines.
+    # A tiny ATR (0.2) is below every floor, so both engines widen the stop ABOVE entry
+    # to the per-instrument floor and must agree on ticks / risk / final stop.
+    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0)):
+        live = app._dynamic_stop_plan("Short", entry, None, None, ticker,
+                                      _vol(0.2), "SCALP")
+        b = bt.bt_stop_plan("Short", entry, None, None, bt.BT_SPECS[ticker],
+                            0.2, "SCALP", "NORMAL")
+        assert live["ok"] is True and b is not None, ticker
+        assert live["min_floor_applied"] is True, ticker
         assert b["stop_ticks"] == live["stop_distance_ticks"], ticker
         assert round(b["risk_points"], 4) == round(live["risk_points"], 4), ticker
         assert round(b["stop"], 4) == round(live["final_stop"], 4), ticker

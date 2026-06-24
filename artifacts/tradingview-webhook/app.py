@@ -497,11 +497,15 @@ MODES = {
         # not gated. (Set True to restore the strict ">= 1:2 on TP2 or no trade" veto.)
         "ENFORCE_MIN_RR":           False,
         # ── Quick-scalp tuning (SCALP only; SWING keeps its own values below) ──
-        # Tighter ATR-stop multiplier so a scalp "cuts losers fast" (normal vol /
-        # elevated vol). SWING keeps 1.5 / 2.0. Volatility still wins over mode (the
-        # elevated multiplier applies in HIGH_CAUTION / HIGH_BLOCK regimes).
-        "STOP_ATR_MULT":            0.75,
-        "STOP_ATR_MULT_HIGH":       1.25,
+        # ATR-stop multiplier (normal vol / elevated vol). Widened from the original
+        # 0.75 / 1.25 to 1.5 / 2.0 (now matching SWING) because sub-ATR scalp stops
+        # were tighter than instrument noise and getting wicked out instantly (every
+        # journaled outcome was a full stop-out). Paired with per-instrument SCALP
+        # minimum-stop floors (scalp_min_stop_pts) so a quiet-ATR moment can never
+        # reproduce a microscopic stop. Volatility still wins over mode (the elevated
+        # multiplier applies in HIGH_CAUTION / HIGH_BLOCK regimes).
+        "STOP_ATR_MULT":            1.5,
+        "STOP_ATR_MULT_HIGH":       2.0,
         # Smaller per-trade dollar ceiling for SCALP (env MAX_RISK_DOLLARS_PER_TRADE
         # still overrides). SWING keeps 100.
         "MAX_RISK_DOLLARS":         50,
@@ -787,11 +791,12 @@ ASSETS = {
             "tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
             "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50),
             "min_stop_pts": _spec_float_env("MGC_MIN_STOP_PTS", 5.0),
-            # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
-            # tunable, so a stale legacy MGC_SCALP_MIN_STOP_* secret can NEVER re-enable
-            # the rejection in production. SWING keeps its env-tunable minimum (above).
-            "scalp_min_stop_ticks": 0,
-            "scalp_min_stop_pts": 0.0,
+            # SCALP minimum-stop FLOOR: a calc stop tighter than this is WIDENED up to
+            # the floor (SWING rejects, SCALP widens). Hardcoded literal (NOT env-
+            # tunable) so a stale legacy MGC_SCALP_MIN_STOP_* secret can never change
+            # money behavior. 3 pts = $30 risk (under the $50 SCALP per-trade cap).
+            "scalp_min_stop_ticks": 30,
+            "scalp_min_stop_pts": 3.0,
             "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0),
         },
     },
@@ -814,12 +819,11 @@ ASSETS = {
             "tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
             "min_stop_pts": _spec_float_env("MNQ_MIN_STOP_PTS", 20.0),
-            # SCALP has NO minimum stop — HARD-DISABLED in code (literal 0), NOT env-
-            # tunable, so a stale legacy MNQ_SCALP_MIN_STOP_* secret can NEVER re-enable
-            # the rejection in production. SWING keeps its env-tunable minimum (above)
-            # byte-for-byte.
-            "scalp_min_stop_ticks": 0,
-            "scalp_min_stop_pts": 0.0,
+            # SCALP minimum-stop FLOOR (WIDEN, never reject — see MGC). Hardcoded literal
+            # (NOT env-tunable) so a stale legacy MNQ_SCALP_MIN_STOP_* secret can never
+            # change money behavior. 12 pts = $24 risk (under the $50 SCALP per-trade cap).
+            "scalp_min_stop_ticks": 48,
+            "scalp_min_stop_pts": 12.0,
             "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0),
         },
     },
@@ -849,8 +853,9 @@ ASSETS = {
             "tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 2.0, "point_value": 5.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MES_MIN_STOP_TICKS", 16),
             "min_stop_pts": _spec_float_env("MES_MIN_STOP_PTS", 4.0),
-            "scalp_min_stop_ticks": 0,
-            "scalp_min_stop_pts": 0.0,
+            # SCALP minimum-stop FLOOR (WIDEN, never reject — see MGC). 3 pts = $15 risk.
+            "scalp_min_stop_ticks": 12,
+            "scalp_min_stop_pts": 3.0,
             "mitig_tol_pts": _spec_float_env("MES_MITIG_TOL_PTS", 6.0),
         },
     },
@@ -877,8 +882,9 @@ ASSETS = {
             "tp1": 40.0, "tp2": 80.0, "tp3": 120.0, "stop_buf": 8.0, "point_value": 0.5,
             "tick_size": 1.0,  "min_stop_ticks": _spec_int_env("MYM_MIN_STOP_TICKS", 30),
             "min_stop_pts": _spec_float_env("MYM_MIN_STOP_PTS", 30.0),
-            "scalp_min_stop_ticks": 0,
-            "scalp_min_stop_pts": 0.0,
+            # SCALP minimum-stop FLOOR (WIDEN, never reject — see MGC). 20 pts = $10 risk.
+            "scalp_min_stop_ticks": 20,
+            "scalp_min_stop_pts": 20.0,
             "mitig_tol_pts": _spec_float_env("MYM_MITIG_TOL_PTS", 40.0),
         },
     },
@@ -6034,15 +6040,16 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     The final stop is the WIDER of two candidates — never tighter:
       • atrStop       = entry ∓ (ATR × multiplier)
       • structureStop = nearest_demand − stop_buf (Long) / nearest_supply + stop_buf (Short)
-    then snapped UP to whole ticks. There is NO automatic widening: SWING keeps a
-    HARD minimum (`min_stop_pts` — MGC 5 / MNQ 20) below which the setup is rejected,
-    but SCALP's minimum is 0 (disabled), so a tight stop is allowed as-is when the
-    setup/zone/entry justify it (`min_stop_ticks` is display metadata, not a floor).
+    then snapped UP to whole ticks. Mode-aware minimum stop: SWING keeps a HARD
+    minimum (`min_stop_pts` — MGC 5 / MNQ 20) below which the setup is REJECTED, while
+    SCALP WIDENS a too-tight stop up to its per-instrument floor (`scalp_min_stop_pts`
+    — MGC 3 / MNQ 12 / MES 3 / MYM 20) instead of rejecting, so a quiet-ATR scalp
+    still trades but never on a sub-noise stop (`min_floor_applied` flags when it bit).
 
     Multiplier precedence — VOLATILITY WINS over trading mode (mode-tunable knobs):
       STOP_ATR_MULT_HIGH when the regime is elevated/extreme (HIGH_CAUTION /
-      HIGH_BLOCK), else STOP_ATR_MULT. SCALP 0.75 / 1.25 (tight — cut losers fast);
-      SWING 1.5 / 2.0 (historical, unchanged).
+      HIGH_BLOCK), else STOP_ATR_MULT. SCALP 1.5 / 2.0 (widened from 0.75 / 1.25 — the
+      old multipliers produced stops tighter than instrument noise); SWING 1.5 / 2.0.
 
     FAIL-CLOSED at the trade-plan layer only: returns {"ok": False, "reason": ...}
     when the ATR reading needed to size the stop is missing/stale, or when the
@@ -6055,7 +6062,8 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     buf       = spec["stop_buf"]
     inst      = instrument_of(ticker)
     # Mode-aware minimum-stop: SWING keeps its HARD minimum (min_stop_pts) byte-for-
-    # byte; SCALP's minimum is 0 (disabled) so tight stops are allowed as-is.
+    # byte (reject below it); SCALP uses its per-instrument floor (scalp_min_stop_pts)
+    # to WIDEN a too-tight stop up to the floor (handled at the guard below).
     if (mode or TRADING_MODE) == "SCALP":
         min_ticks = int(spec.get("scalp_min_stop_ticks", spec["min_stop_ticks"]))
         min_pts   = float(spec.get("scalp_min_stop_pts", spec.get("min_stop_pts", 0.0)))
@@ -6103,18 +6111,24 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
         calc_stop = max(atr_stop, structure_stop) if structure_stop is not None else atr_stop
 
     calc_dist  = abs(entry - calc_stop)
-    # ── Minimum-stop guard (SWING only; fixed 1:1 risk model) ──
+    # ── Minimum-stop guard (mode-aware; fixed 1:1 risk model) ──
     # SWING rejects a calc stop tighter than its minimum (MGC 5 pts / MNQ 20 pts)
-    # outright — no silent widening. SCALP's minimum is 0 (min_pts == 0), so this
-    # guard is INERT for SCALP and a tight stop is allowed AS-IS (the user's "a tight
-    # stop is fine if the setup justifies it"). Env-overridable; RAW dist, pre-snap.
+    # outright — no silent widening. SCALP instead WIDENS a too-tight stop up to its
+    # per-instrument floor (scalp_min_stop_pts) so a quiet-ATR scalp still trades but
+    # never on a sub-noise stop that gets wicked out instantly. RAW dist, pre-snap.
+    min_floor_applied = False
     if min_pts > 0 and calc_dist < min_pts:
-        return _reject(f"Calculated stop {calc_dist:.1f} pts is below the {inst} "
-                       f"minimum {min_pts:g} pts — too tight, no trade.")
+        if mode == "SCALP":
+            calc_dist = min_pts
+            calc_stop = (entry - calc_dist) if direction == "Long" else (entry + calc_dist)
+            min_floor_applied = True
+        else:
+            return _reject(f"Calculated stop {calc_dist:.1f} pts is below the {inst} "
+                           f"minimum {min_pts:g} pts — too tight, no trade.")
     calc_ticks = (calc_dist / tick) if tick else 0.0
-    # Snap UP to whole ticks (grid alignment only — never widened to a minimum). SWING
-    # already rejected anything below its minimum above; SCALP has no minimum, so a
-    # tight stop passes through here at its tick-snapped distance.
+    # Snap UP to whole ticks (grid alignment). SWING already rejected anything below its
+    # minimum above; SCALP has already been widened up to its floor above when too tight,
+    # so the distance here is >= the floor (or the natural calc stop when it cleared it).
     final_ticks = math.ceil(calc_ticks - 1e-9)
     final_dist  = final_ticks * tick
     final_stop  = (entry - final_dist) if direction == "Long" else (entry + final_dist)
@@ -6150,7 +6164,7 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
         "vol_ratio":           vol.get("ratio"),
         "nearest_demand":      nearest_demand,
         "nearest_supply":      nearest_supply,
-        "min_floor_applied":   False,
+        "min_floor_applied":   min_floor_applied,
     }
 
 

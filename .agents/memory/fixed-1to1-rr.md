@@ -11,23 +11,29 @@ below**. Stop is computed first (ATR/structure/zone), snapped UP to whole ticks;
 `RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`. `build_strict_trade_plan` sets
 `target1 == target2`, `rr = "1:1"`, `rr_num = 1.0`; `_decision_support` reward reads `"1:1 (fixed)"`.
 
-## Min-stop is MODE-SPLIT: SWING hard-rejects, SCALP has NO minimum
-`_dynamic_stop_plan` NEVER silently widens a too-tight stop to a floor (and `min_stop_ticks` is
-**metadata only** — the snap is always ceil-up to whole ticks). The minimum-distance REJECTION is
-now mode-split:
+## Min-stop is MODE-SPLIT: SWING hard-rejects, SCALP WIDENS to a floor
+The minimum-distance guard in `_dynamic_stop_plan` is mode-split — and the two modes resolve a
+too-tight stop in **opposite** directions:
 - **SWING** still HARD-REJECTS (no trade) when the calculated stop is below `min_stop_pts`
   (MGC<5 / MNQ<20 pts, env-tunable via `*_MIN_STOP_PTS`). Byte-for-byte unchanged.
-- **SCALP** has **NO minimum** — `scalp_min_stop_pts`/`scalp_min_stop_ticks` are **hard-coded to
-  literal 0 in `INSTRUMENT_SPECS`, NOT env-tunable**. A tight stop is allowed as-is (snapped only
-  to the tick grid). The min-pts guard remains in `_dynamic_stop_plan` but is inert for SCALP.
-**Why:** SCALP needs to take tight stops the setup justifies; auto-widening would change risk/size
-behind the user's back and break exact 1:1. SCALP min was deliberately made non-env-tunable so a
-stale legacy `*_SCALP_MIN_STOP_*` secret can never silently re-enable the rejection in the live
-$50k prop account. **How to apply:** any stop change — live OR the copied backtest `bt_stop_plan` —
-must keep this split (SWING reject, SCALP no-min) and the snap-only shape (see backtest-engine.md
-for the parity contract). Don't reintroduce a `max(ceil, min_ticks)` floor, and don't re-add an env
-read for the SCALP minimum. The only allowed SCALP rejections: invalid/missing stop, wrong side of
-entry, zero/negative distance, size>risk cap (sizing/gateway), zone consumed/mitigated.
+- **SCALP** now **WIDENS** a too-tight stop UP to a per-instrument floor instead of rejecting it:
+  if `scalp_min_stop_pts > 0` and the raw distance < floor, SCALP sets distance = floor, recomputes
+  the stop (entry − dist for Long, entry + dist for Short), then ceil-snaps to the tick grid and
+  flags the new return key `min_floor_applied=True`. SWING's branch is the unchanged `_reject`.
+  Floors are **hard-coded literals in `INSTRUMENT_SPECS` (`scalp_min_stop_*`), NOT env-tunable**:
+  MGC 3pts/30t, MNQ 12pts/48t, MES 3pts/12t, MYM 20pts/20t — all exact tick multiples (snap clean)
+  and under the $50 SCALP per-trade cap.
+**Why this reversed:** SCALP previously had NO minimum (tight stops allowed as-is) and the user was
+"losing every single trade" to stops tighter than instrument noise. Fix = widen the SCALP ATR
+multipliers (0.75/1.25 → 1.5/2.0) AND add these WIDENING floors. Widening (never rejecting) keeps a
+SCALP setup tradeable while guaranteeing a survivable stop; risk/size still flow from the (now
+wider) distance so exact 1:1 holds. Floors stay non-env-tunable so a stale legacy
+`*_SCALP_MIN_STOP_*` secret can never silently change them in the live prop account.
+**How to apply:** any stop change — live OR the copied backtest `bt_stop_plan` — must keep this
+split (SWING reject, SCALP widen-to-floor) AND keep live/backtest parity (see backtest-engine.md).
+Do NOT "restore" the old SCALP no-minimum behavior, and do NOT re-add an env read for the SCALP
+floor. SCALP rejections are still only: invalid/missing stop, wrong side of entry, zero/negative
+distance, size>risk cap (sizing/gateway), zone consumed/mitigated.
 
 ## Sanctioned exception — a truly-ready Opening Range Breakout = 1:4 (user-approved)
 `_apply_orb_target_override(result)` runs right after `compute_strategy_engine` and rewrites
