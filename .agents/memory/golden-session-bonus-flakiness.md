@@ -1,30 +1,38 @@
 ---
-name: SCALP/SWING goldens are time-of-day flaky (session bonus)
-description: Why a uniform +10 edge_score drift in the scalp/swing goldens is environmental, not a regression, and how to prove it.
+name: SCALP/SWING goldens — session bonus is now PINNED (was time-of-day flaky)
+description: The scalp/swing golden harness used to flip ±10 with the wall-clock (Edge Score session bonus); it now pins a fixed bonus=0. Keep it pinned — don't revert to session=None or rebaseline around it.
 ---
 
-# Golden flakiness from the live session bonus
+# Golden flakiness from the live session bonus — FIXED by pinning the harness
 
-The `scalp_golden.py` harness (driven by `check_scalp_golden.sh`,
-`check_swing_flagoff_golden.sh`) calls `evaluate_strict_setup` with `session=None`
-and does **not** pin the clock. The Session component of the Edge Score (+10) is
-derived from the live time-of-day, so the snapshot's `edge_score`/`score` floats by
-±10 depending on when the baseline vs the current run happened.
+**Now (fixed):** `scalp_golden.py` defines `FIXED_SESSION = get_session_state(now=_FIXED_NOW)`
+where `_FIXED_NOW` is a fixed UTC instant mapping to **03:00 ET (outside every
+`SESSION_WINDOWS` window → bonus 0)**, and passes it as `session=FIXED_SESSION` into
+`evaluate_strict_setup`. So the +10 Session Edge component is now deterministic and the
+goldens no longer float with the wall-clock. `build_strict_trade_plan` was already
+session-independent (only the gate `score` ever drifted). The real session-window logic
+still runs against the frozen input, so a regression in `get_session_state` itself would
+still surface as a diff. **Do not revert to `session=None`** — that reintroduces the flake.
 
-**Symptom:** goldens fail with a *uniform* `score 15→25` and `edge_score(15<THRESH)→(25<THRESH)`
-across every `empty_history` fixture (SCALP threshold 50, SWING-flagoff 80). Uniform
-+10 everywhere = session bonus, not a logic change.
+**History (why this exists):** the harness used to call `evaluate_strict_setup(session=None)`
+and not pin the clock. The Session component (+10, `SESSION_BONUS_POINTS`) is a pure
+function of live time-of-day (`SESSION_WINDOWS`: 05–08, 08–11, 20–23 ET), so the
+snapshot's `edge_score`/`score` floated ±10 depending on WHEN baseline vs current run
+happened. Rebaselining during a bonus-ON window then made it go RED in the next bonus-OFF
+window (and vice-versa) — a self-inflicted flip-flop.
 
-**Why:** baselines are captured at one moment; re-running in a different session
-window flips the +10. parity (`check_parity.sh`) is clock-independent and stays green.
+**Symptom if it ever returns** (someone reverted the pin): goldens fail with a *uniform*
+`score 15↔25` / `edge_score(15<THRESH)↔(25<THRESH)` across every `empty_history` fixture
+(SCALP threshold 50, SWING-flagoff 80), with **zero** stop/target/risk field changes.
+Uniform ±10 everywhere = session bonus, not a logic change. Fix = restore the
+`FIXED_SESSION` pin, not a rebaseline. `parity` (`check_parity.sh`) was always
+clock-independent and stayed green throughout.
 
-**How to apply / prove it before blaming your change:** extract committed HEAD app.py
-(`git show HEAD:artifacts/tradingview-webhook/app.py` into a temp dir), point the
-harness `sys.path` at that copy, and diff. If HEAD shows the *same* drift vs baseline
-AND HEAD's output is byte-identical to your working-tree output, your change is
-golden-neutral and the failure is environmental. Do **not** rebaseline to "fix" it —
-that masks the flakiness (and SWING-flagoff is meant to be a frozen invariant). The
-real fix (if ever wanted) is to pin the clock/session in the harness.
+**Proving a real change is golden-neutral:** extract committed HEAD app.py
+(`git show HEAD:artifacts/tradingview-webhook/app.py`), point the harness at it, and diff
+HEAD output vs working-tree output. Byte-identical (under the pinned session) = your change
+is golden-neutral. SWING-flagoff is a frozen legacy invariant — only rebaseline SCALP when
+its stop/plan output legitimately changes; never rebaseline to paper over the session bonus.
 
 Display-only dashboard edits (HTML/CSS/JS, equity-curve serialization) never touch
 `evaluate_strict_setup`/`build_strict_trade_plan`, so they cannot move these scores.
