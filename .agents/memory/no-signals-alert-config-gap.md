@@ -117,6 +117,28 @@ bad-schema rejection — genuinely not sent). Recognized confluence types: `BULL
 resets OFF every publish — re-arm the instrument too, else a future READY still won't auto-execute (moot
 until edge clears 50). NOT a code bug; do not tune thresholds to compensate.
 
+**Indicator ON the chart ≠ alert CREATED — coverage is per-indicator-per-chart (recurring).** A
+TradingView indicator placed on a chart (visible markers + status line) sends NOTHING to the webhook
+until you separately create an Alert for it (Condition = that indicator → "Any alert() function call" →
+Notifications → Webhook URL). Users routinely add all the indicators to every chart but only create the
+alert for ONE (commonly Confirmation Candle), so an instrument sits at `Edge 15 | struct=N` forever.
+Full coverage = 5 indicators (Confirmation, Market Structure BOS/CHOCH, Liquidity Sweep, Volume Spike,
+CVD) × 4 charts = **20 alerts** — flag the user's TradingView plan alert cap (Essential 20 / Plus 100 /
+Premium 400) as the likely reason only a subset exist. DIAGNOSE with a per-instrument coverage matrix:
+grep prod `INCOMING.*<TYPE>` (one query each for `BULLISH SWEEP|BEARISH SWEEP`, `VOLUME SPIKE`, `CVD`,
+`CHOCH|BOS|HH|HL|LH|LL`) and tabulate which alert_type prefixes arrive for which ticker. Typical finding
+is a PATCHWORK — no chart has the full set (e.g. SWEEP only on MGC, CVD only on MNQ, VOLUME SPIKE on
+none) — so the fix is "create the missing alerts", instrument-by-instrument, not a code/threshold change.
+
+**Status-line instrument label is the *Manual instrument* INPUT value, NOT what's sent — red herring.**
+The prefixed Pine scripts display their `manualPrefix` input in the TV status line REGARDLESS of whether
+"Auto-detect instrument from symbol" is checked, so a MYM1! chart can show "…MES" while auto-detect is
+correctly sending `MYM`. Never diagnose auto-detect from the status line (bools like useAuto aren't even
+shown there) — diagnose from the PREFIX on arriving `INCOMING POST` bodies in prod logs. Confirmed live:
+MYM1! chart showing "MES" was emitting correct `{"alert_type":"MYM BULLISH CONFIRMATION","ticker":"MYM1!"}`.
+(If the prefix and ticker ever DISAGREE — e.g. manual really was MES on a MYM chart — `resolve_instrument`
+rejects it as a contradiction, ok:False, dropped with 200; that's a separate failure from "no alert created".)
+
 **RESOLVED / confirmed live:** after the user recreated the two broken alerts, prod began receiving the
 canonical forms `{"alert_type":"MGC ZONE MITIGATED","price":"4170.4"}` and `{"alert_type":"MNQ VOLUME SPIKE"}`
 with ZERO `Unrecognized alert type` warnings, and the scored line flipped to **`Gate: zone=Y …`** for the
