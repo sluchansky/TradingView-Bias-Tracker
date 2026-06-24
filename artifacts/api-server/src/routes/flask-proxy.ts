@@ -79,6 +79,7 @@ router.all(
     "/auto-trade",
     "/advisor",
     "/pro-review",
+    "/trade-debate",
     "/journal",
     "/journal/",
     "/eod",

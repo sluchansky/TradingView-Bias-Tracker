@@ -764,6 +764,43 @@ def set_pro_review_gate(value):
     return _pro_review_gate_enabled()
 
 
+# ── Trade Debate Engine flags (display ON by default; money-path veto OFF) ─────
+# Mirrors the Professional Review flags. The debate (Bull vs Bear vs Decision
+# Judge) is a pre-READY DISPLAY layer by default; the WAIT veto is OFF until the
+# operator arms it (the runtime toggle wins over the env seed and RESETS on
+# restart — fail-safe bias toward NOT interfering with live trading).
+TRADE_DEBATE_MIN_GAP        = 15   # gap below this = "too balanced to trade" (WAIT)
+TRADE_DEBATE_DECISIVE_GAP   = 20   # gap above this = a decisive winner (allow READY)
+_TRADE_DEBATE_GATE_OVERRIDE = None   # runtime dashboard toggle; None = follow env
+
+
+def _trade_debate_engine_enabled():
+    """Trade Debate DISPLAY layer — ON by default (fail-open). Env
+    TRADE_DEBATE_ENGINE_ENABLED=0 hard-disables it as an emergency kill-switch; a
+    bug inside the engine is already swallowed into a neutral block by the caller."""
+    return os.environ.get("TRADE_DEBATE_ENGINE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _trade_debate_gate_enabled():
+    """Trade Debate money-path VETO — OFF by default. When ON, the Judge may only
+    DEMOTE an actionable gate verdict to WAIT (it can NEVER promote / force a trade).
+    A runtime dashboard toggle (_TRADE_DEBATE_GATE_OVERRIDE) wins over the env seed
+    so live trading stays byte-identical until the operator turns it on."""
+    if _TRADE_DEBATE_GATE_OVERRIDE is not None:
+        return bool(_TRADE_DEBATE_GATE_OVERRIDE)
+    return os.environ.get("TRADE_DEBATE_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_trade_debate_gate(value):
+    """Runtime override for the Trade Debate VETO (dashboard toggle). Passing None
+    restores env-seed behaviour. RESETS to None on restart (the module global
+    re-initialises), keeping the fail-safe bias toward NOT interfering with live
+    trading after a republish."""
+    global _TRADE_DEBATE_GATE_OVERRIDE
+    _TRADE_DEBATE_GATE_OVERRIDE = None if value is None else bool(value)
+    return _trade_debate_gate_enabled()
+
+
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
 # EARLY READY (SCALP Edge 50-59) is actionable but lower-conviction (half size)
 # than a full READY (Edge >= 60). Both end in the word "READY", so verdict.endswith(
@@ -9315,6 +9352,154 @@ def compute_pro_review(result, strict, swing_ctx=None, market=None, inst=None):
     }
 
 
+# ── Trade Debate Engine (Bull vs Bear vs Decision Judge) ──────────────────────
+# A pre-READY internal debate computed from the FINAL assembled full_analysis
+# result. Each analyst's CASE STRENGTH is DERIVED (never fabricated) from the
+# already-computed per-direction Edge cards (result["directions"]): Bull = the Long
+# case, Bear = the Short case. The Judge compares the two confidences and decides
+# whether the edge is decisive enough — and aligned with the gate's chosen
+# direction — to support the trade. DISPLAY-ONLY by default; the money-path veto is
+# behind _trade_debate_gate_enabled() (default OFF) and can only DEMOTE to WAIT.
+def _debate_side(block):
+    """Build one analyst's case (Bull or Bear) from a per-direction Edge card.
+    Pure + fail-open: a missing/empty card yields a zero-confidence, no-reason side
+    (which can never win a debate)."""
+    block   = block or {}
+    eb      = block.get("edge_breakdown") or {}
+    conf    = int(block.get("edge_score") or 0)
+    grade   = block.get("edge_grade") or "—"
+    reasons = [str(r) for r in (eb.get("reasons") or []) if r]
+    # Strongest evidence = the highest-credited Edge component for this side.
+    strongest, best_pts = "—", None
+    for _item in (eb.get("score_breakdown") or []):
+        _pts = _item.get("points") if isinstance(_item, dict) else None
+        if isinstance(_pts, (int, float)) and _pts > 0 and (best_pts is None or _pts > best_pts):
+            best_pts, strongest = _pts, (_item.get("label") or strongest)
+    if strongest == "—" and reasons:
+        strongest = reasons[0]
+    risks = [str(x) for x in (eb.get("risks") or []) if x]
+    return {
+        "confidence":         conf,
+        "grade":              grade,
+        "reasons":            reasons,
+        "strongest_evidence": strongest,
+        "biggest_risk":       (risks[0] if risks else "None identified"),
+    }
+
+
+def _trade_debate_neutral_block(reason="Trade debate unavailable."):
+    """Fully-populated, SAFE debate block (fail-open fallback + market-closed +
+    disabled stub). EVERY key the /status serializer, dashboard and Discord card
+    read MUST exist here so the single-return-path / hard-indexed-consumer invariant
+    holds in every branch. veto_would_fire stays False so a stub can NEVER demote a
+    trade when the gate is armed."""
+    side = {"confidence": 0, "grade": "—", "reasons": [],
+            "strongest_evidence": "—", "biggest_risk": "—"}
+    return {
+        "engine_enabled":  _trade_debate_engine_enabled(),
+        "gate_enabled":    _trade_debate_gate_enabled(),
+        "bull":            dict(side),
+        "bear":            dict(side),
+        "judge": {
+            "winning_side":      "Balanced",
+            "confidence_gap":    0,
+            "edge_significant":  False,
+            "too_balanced":      True,
+            "final_verdict":     "WAIT",
+            "reason_winner_won": reason,
+            "reason_loser_lost": reason,
+        },
+        "veto_would_fire": False,
+        "summary":         reason,
+    }
+
+
+def compute_trade_debate(result, strict=None):
+    """Run the Bull/Bear/Judge debate over the assembled result. Pure + fail-open.
+
+    Confidence = each side's per-direction Edge Score (case strength, already
+    computed; the favored side mirrors the authoritative edge_score, the other is
+    independently scored). Judge rules (spec): gap < TRADE_DEBATE_MIN_GAP -> too
+    balanced -> WAIT; a decisive winner needs gap > TRADE_DEBATE_DECISIVE_GAP. The
+    armed-gate veto (veto_would_fire) fires only when the gate verdict is ACTIONABLE
+    and the debate is NOT a decisive winner ALIGNED with the trade's direction —
+    i.e. balanced, weak (15-20 band), or pointing the other way. It can only DEMOTE."""
+    dirs = result.get("directions") or {}
+    bull = _debate_side(dirs.get("Long"))
+    bear = _debate_side(dirs.get("Short"))
+    bc, brc = bull["confidence"], bear["confidence"]
+    gap = abs(bc - brc)
+    if bc > brc:
+        winning_side, win, lose = "Bull", bull, bear
+    elif brc > bc:
+        winning_side, win, lose = "Bear", bear, bull
+    else:
+        winning_side, win, lose = "Balanced", bull, bear
+
+    too_balanced     = gap < TRADE_DEBATE_MIN_GAP
+    edge_significant = gap > TRADE_DEBATE_DECISIVE_GAP
+    decisive         = edge_significant and winning_side != "Balanced"
+
+    verdict        = result.get("verdict") or ""
+    actionable     = is_actionable(verdict)
+    trade_dir      = ready_direction(verdict)   # "Long" / "Short" / None
+    winner_aligned = bool(trade_dir and (
+        (trade_dir == "Long"  and winning_side == "Bull") or
+        (trade_dir == "Short" and winning_side == "Bear")))
+
+    # Armed-gate veto: demote only an actionable verdict the debate does NOT
+    # decisively + alignedly support (balanced, weak edge, or wrong direction).
+    veto_would_fire = bool(actionable and not (decisive and winner_aligned))
+    # TAKE ONLY when the gate verdict is actionable AND the debate is a decisive
+    # winner ALIGNED with the trade direction. Every other case (non-actionable,
+    # balanced, weak 15-20 edge, or a decisive winner pointing the OTHER way) reports
+    # WAIT — the winning side / evidence is still shown, but the Judge never displays
+    # a promotional TAKE on a setup it does not actually endorse. This keeps
+    # final_verdict == "TAKE" equivalent to "actionable and not veto_would_fire".
+    final_verdict   = "TAKE" if (actionable and decisive and winner_aligned) else "WAIT"
+
+    if winning_side == "Balanced":
+        reason_winner_won = ("Bull and Bear are evenly matched (%d vs %d) — no decisive edge."
+                             % (bc, brc))
+        reason_loser_lost = ("Neither side built a %d-point lead, so the tape is too "
+                             "balanced to trade." % TRADE_DEBATE_MIN_GAP)
+    else:
+        loser_name = "Bear" if winning_side == "Bull" else "Bull"
+        reason_winner_won = ("%s leads %d to %d (%d-pt edge). Strongest evidence: %s."
+                             % (winning_side, win["confidence"], lose["confidence"], gap,
+                                win["strongest_evidence"]))
+        reason_loser_lost = ("%s trails at %d. Biggest risk: %s."
+                             % (loser_name, lose["confidence"], lose["biggest_risk"]))
+
+    if winning_side == "Balanced":
+        summary = ("⚖️ Balanced debate — Bull %d vs Bear %d (gap %d < %d). Too balanced → WAIT."
+                   % (bc, brc, gap, TRADE_DEBATE_MIN_GAP))
+    else:
+        _emoji = "🟢" if winning_side == "Bull" else "🔴"
+        _opp   = "" if (winner_aligned or not actionable) else " but opposes the setup direction"
+        summary = ("%s %s wins %d-%d (gap %d) → %s%s."
+                   % (_emoji, winning_side, win["confidence"], lose["confidence"], gap,
+                      final_verdict, _opp))
+
+    return {
+        "engine_enabled":  _trade_debate_engine_enabled(),
+        "gate_enabled":    _trade_debate_gate_enabled(),
+        "bull":            bull,
+        "bear":            bear,
+        "judge": {
+            "winning_side":      winning_side,
+            "confidence_gap":    gap,
+            "edge_significant":  edge_significant,
+            "too_balanced":      too_balanced,
+            "final_verdict":     final_verdict,
+            "reason_winner_won": reason_winner_won,
+            "reason_loser_lost": reason_loser_lost,
+        },
+        "veto_would_fire": veto_would_fire,
+        "summary":         summary,
+    }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -10084,6 +10269,51 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             # Decision-support was computed earlier from the pre-veto plan — recompute
             # it so every display surface agrees with the demoted WAIT verdict.
             result["decision_support"] = _decision_support(result)
+        # ── Trade Debate Engine (Bull vs Bear vs Decision Judge). DISPLAY-ONLY
+        #    here; the flag-gated veto is wired in just below, mirroring the pro
+        #    review / analyst layers. Computed from the FINAL assembled result so it
+        #    reflects every override above (Analyst -> Pro Review -> Debate). ──────
+        if _trade_debate_engine_enabled():
+            try:
+                result["trade_debate"] = compute_trade_debate(result, strict)
+            except Exception as exc:   # FAIL-OPEN — a broken debate must never crash analysis.
+                result["trade_debate"] = _trade_debate_neutral_block(
+                    "Trade debate unavailable (%s)." % exc)
+        else:
+            result["trade_debate"] = _trade_debate_neutral_block("Trade debate disabled.")
+        # Fail-CLOSED veto (flag-gated, default OFF): only when explicitly enabled
+        # AND the Judge would not decisively + alignedly support the trade
+        # (veto_would_fire) AND the gate verdict is still actionable. It can ONLY
+        # demote to WAIT — never promote. The neutral / disabled / market-closed stub
+        # sets veto_would_fire=False so it can NEVER demote. Mirrors the pro-review veto.
+        _td = result.get("trade_debate") or {}
+        if (_trade_debate_gate_enabled() and _td.get("veto_would_fire")
+                and is_actionable(result["verdict"])):
+            _td_reason = ("Trade Debate veto: "
+                          + (_td.get("summary")
+                             or "the market is too balanced to trade."))
+            result["verdict"]       = "WAIT"
+            result["strict_label"]  = "WAIT"
+            result["strict_reason"] = _td_reason
+            result["trade_plan"]    = {
+                "trade_plan": False, "reason": _td_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": result.get("strict_direction"),
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
+            for _vd in ("Long", "Short"):
+                _vblk = (result.get("directions") or {}).get(_vd)
+                if _vblk:
+                    _vblk.update(ready=False, label="WAIT")
+            _ad = result.get("alert_diagnostics") or {}
+            _ad["ready_reason"]     = ""
+            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Trade Debate veto"]
+            result["alert_diagnostics"] = _ad
+            # Decision-support was computed earlier from the pre-veto plan — recompute
+            # it so every display surface agrees with the demoted WAIT verdict.
+            result["decision_support"] = _decision_support(result)
+            result["trade_debate"]["judge"]["final_verdict"] = "WAIT"
     if not market["open"]:
         result["verdict"]         = "MARKET CLOSED"
         # strict_label is the JOURNALING label and must stay in
@@ -10172,6 +10402,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "Market closed — live alerts paused.", verdict="NO TRADE")
         result["pro_review"]         = _pro_review_neutral_block(
             "Market closed — live alerts paused.", inst=active_ticker)
+        result["trade_debate"]       = _trade_debate_neutral_block(
+            "Market closed — live alerts paused.")
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
             if _blk:
@@ -10512,6 +10744,30 @@ def _build_trade_card_embed(entry, footer_text):
                                         "inline": False})
     except Exception as exc:
         logger.error("Pro-review card block error: %s", exc)
+
+    # ── Additive: 🧠 Trade Debate field (display-only; Bull vs Bear vs Judge).
+    # Summarizes the pre-READY debate on the live card BEFORE issuing READY. Built
+    # defensively so a missing / neutral / disabled block simply omits the field. ──
+    try:
+        td = entry.get("trade_debate") or {}
+        if td.get("engine_enabled"):
+            jd   = td.get("judge") or {}
+            bull = td.get("bull") or {}
+            bear = td.get("bear") or {}
+            td_lines = [
+                "🟢 Bull **%s** vs 🔴 Bear **%s**  ·  Winner: **%s** (gap %s)"
+                % (bull.get("confidence", "—"), bear.get("confidence", "—"),
+                   jd.get("winning_side", "—"), jd.get("confidence_gap", "—")),
+                "⚖️ Judge: **%s**  ·  %s"
+                % (jd.get("final_verdict", "—"), jd.get("reason_winner_won", "")),
+            ]
+            gate_note = "VETO ARMED" if td.get("gate_enabled") else "display-only"
+            td_lines.append("_Trade Debate · %s_" % gate_note)
+            embed["fields"].append({"name": "🧠 Trade Debate",
+                                    "value": "\n".join(td_lines)[:1024],
+                                    "inline": False})
+    except Exception as exc:
+        logger.error("Trade-debate card block error: %s", exc)
 
     # Attach the chart screenshot when a validated public URL is present.
     shot = entry.get("screenshot_url")
@@ -13111,6 +13367,10 @@ def _build_card_entry(a, ticker=None, record=None):
     # model block onto the card entry so the live card / journal mirror the
     # dashboard. Defensive .get → absent on a bare/legacy `a` (field simply omitted).
     entry["pro_review"] = a.get("pro_review")
+    # Trade Debate Engine (display-only Bull vs Bear vs Judge) — carry the block
+    # onto the card entry so the live card / journal mirror the dashboard. Defensive
+    # .get → absent on a bare/legacy `a` (field simply omitted).
+    entry["trade_debate"] = a.get("trade_debate")
     # SWING (flag-on) only: carry the P4-computed HTF context onto the entry so the
     # managed-trade register can build a per-trade thesis WITHOUT recomputing it
     # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
@@ -16373,6 +16633,7 @@ def status():
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "analyst":             a.get("analyst"),
         "pro_review":          a.get("pro_review"),
+        "trade_debate":        a.get("trade_debate"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -17881,6 +18142,42 @@ def dashboard():
   <div id="pr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
+<!-- Trade Debate Engine (Bull vs Bear vs Decision Judge; pre-READY internal debate.
+     DISPLAY by default; the money-path veto is flag-gated server-side, default OFF.
+     Hidden unless the engine is enabled.) -->
+<div class="mod" id="mod-debate" style="display:none">
+  <div class="mod-h">🧠 Trade Debate <span id="td-badge" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
+    <span style="font-size:11px;color:#9aa">Bull vs Bear → Decision Judge</span>
+    <span id="td-gate-toggle" role="button" tabindex="0" onclick="toggleDebateGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleDebateGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Veto: off</span>
+  </div>
+  <div class="se-bias-h">Decision Judge — <span id="td-verdict" style="font-weight:800">—</span></div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Winning Side</div><div class="v" id="td-winner">—</div></div>
+    <div class="gstat"><div class="l">Confidence Gap</div><div class="v" id="td-gap">—</div></div>
+    <div class="gstat"><div class="l">Edge</div><div class="v" id="td-edge">—</div></div>
+  </div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <div class="gstat" style="text-align:left">
+      <div class="l">🟢 Bull Case — <span id="td-bull-conf">—</span></div>
+      <div style="font-size:11px;color:#9aa;margin-top:2px">Strongest: <span id="td-bull-ev">—</span></div>
+      <div style="font-size:11px;color:#9aa">Biggest risk: <span id="td-bull-risk">—</span></div>
+      <div id="td-bull-reasons" style="font-size:11px;color:#cbd5e1;margin-top:3px"></div>
+    </div>
+    <div class="gstat" style="text-align:left">
+      <div class="l">🔴 Bear Case — <span id="td-bear-conf">—</span></div>
+      <div style="font-size:11px;color:#9aa;margin-top:2px">Strongest: <span id="td-bear-ev">—</span></div>
+      <div style="font-size:11px;color:#9aa">Biggest risk: <span id="td-bear-risk">—</span></div>
+      <div id="td-bear-reasons" style="font-size:11px;color:#cbd5e1;margin-top:3px"></div>
+    </div>
+  </div>
+  <div class="se-bias-h">Why the Winner Won</div>
+  <div class="se-reason" id="td-why-won">—</div>
+  <div class="se-bias-h">Why the Loser Lost</div>
+  <div class="se-reason" id="td-why-lost">—</div>
+  <div id="td-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
 <!-- SCALP dynamic-exit diagnostics (req 7 — DISPLAY-ONLY; hidden unless SCALP dynamic exits are on) -->
 <div class="mod" id="mod-scalpdiag" style="display:none">
   <div class="mod-h">🩺 SCALP Diagnostics <span id="sd-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
@@ -18291,6 +18588,7 @@ let AUTO_STATE = { MGC:false, MNQ:false, MES:false, MYM:false };
 let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_live:false, is_live_instance:false, max_per_day:0, contracts:1 };
 let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
 let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
+let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
 async function loadAutoTrade(){
   try {
     const d = await api('/auto-trade');
@@ -18924,6 +19222,9 @@ function renderModules(d){
   // ── Module 11b: Professional Review — pre-READY pro-trader grading (DISPLAY-ONLY) ──
   renderProReview(d);
 
+  // ── Module 11c: Trade Debate — pre-READY Bull vs Bear vs Judge (DISPLAY-ONLY) ──
+  renderTradeDebate(d);
+
   // ── Module 12: Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY/NOTIFY only ──
   const xm = d.index_alignment || null;
   const xmMod = document.getElementById('mod-xmarket');
@@ -19149,6 +19450,62 @@ function toggleProGate(){
       toast(PRO_GATE_STATE ? 'Pro Review VETO ARMED — may demote to WAIT' : 'Pro Review veto off');
     })
     .catch(function(){ PRO_GATE_STATE=cur; toast('Pro Review veto update failed', false); });
+}
+
+// Trade Debate Engine — pre-READY Bull vs Bear vs Decision Judge, DERIVED from the
+// per-direction Edge cards. DISPLAY-ONLY on the dashboard; the money-path veto is
+// flag-gated server-side. Fed by d.trade_debate. ALL dynamic strings are written via
+// textContent (never innerHTML) so webhook-derived reason text can't inject markup.
+function _tdVerdictColor(v){ return v==='TAKE'?'#22c55e':v==='WAIT'?'#f59e0b':'#6b7280'; }
+function renderTradeDebate(d){
+  const td=(d && d.trade_debate) || null;
+  const mod=document.getElementById('mod-debate');
+  if(!mod) return;
+  if(!td || !td.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  const jd=td.judge||{}, bull=td.bull||{}, bear=td.bear||{};
+  const badge=document.getElementById('td-badge');
+  if(badge){ badge.textContent=td.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=td.gate_enabled?'#ef4444':'#6b7280'; }
+  const ver=jd.final_verdict||'—';
+  _set('td-verdict', ver, _tdVerdictColor(ver));
+  const ws=jd.winning_side||'—';
+  _set('td-winner', ws, ws==='Bull'?'#22c55e':ws==='Bear'?'#ef4444':'#6b7280');
+  _set('td-gap', (jd.confidence_gap!=null?jd.confidence_gap:'—')+' pts');
+  _set('td-edge', jd.too_balanced?'Too balanced':jd.edge_significant?'Significant':'Slight', jd.too_balanced?'#f59e0b':jd.edge_significant?'#22c55e':'#6b7280');
+  _set('td-bull-conf', (bull.confidence!=null?bull.confidence:'—')+'/100'+(bull.grade&&bull.grade!=='—'?(' · '+bull.grade):''));
+  _set('td-bull-ev', bull.strongest_evidence);
+  _set('td-bull-risk', bull.biggest_risk);
+  _set('td-bull-reasons', (bull.reasons&&bull.reasons.length)?('• '+bull.reasons.join('   • ')):'');
+  _set('td-bear-conf', (bear.confidence!=null?bear.confidence:'—')+'/100'+(bear.grade&&bear.grade!=='—'?(' · '+bear.grade):''));
+  _set('td-bear-ev', bear.strongest_evidence);
+  _set('td-bear-risk', bear.biggest_risk);
+  _set('td-bear-reasons', (bear.reasons&&bear.reasons.length)?('• '+bear.reasons.join('   • ')):'');
+  _set('td-why-won', jd.reason_winner_won);
+  _set('td-why-lost', jd.reason_loser_lost);
+  DEBATE_GATE_STATE=!!td.gate_enabled;
+  const gt=document.getElementById('td-gate-toggle');
+  if(gt){ gt.textContent=td.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=td.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=td.gate_enabled?'#ef4444':'var(--border)'; }
+  const foot=document.getElementById('td-foot');
+  if(foot){ foot.textContent='Bull vs Bear judged on Edge case strength · WAIT if gap < 15 · decisive if gap > 20'+(td.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)'); }
+}
+function toggleDebateGate(){
+  const cur=!!DEBATE_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Trade Debate VETO?\\n\\nWhile ARMED, the Decision Judge can DEMOTE an actionable setup to WAIT when the debate is too balanced or opposes the trade direction (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
+  DEBATE_GATE_STATE=next;
+  const gt=document.getElementById('td-gate-toggle');
+  if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/trade-debate', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ DEBATE_GATE_STATE=cur; toast('Trade Debate veto update failed', false); return; }
+      DEBATE_GATE_STATE=!!d.gate_enabled;
+      toast(DEBATE_GATE_STATE ? 'Trade Debate VETO ARMED — may demote to WAIT' : 'Trade Debate veto off');
+    })
+    .catch(function(){ DEBATE_GATE_STATE=cur; toast('Trade Debate veto update failed', false); });
 }
 
 // Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
@@ -20884,6 +21241,45 @@ def pro_review_controls():
         "available_models": list(PRO_REVIEW_MODELS),
         "default_model":    _PRO_REVIEW_DEFAULT_MODEL,
         "models":           models,
+    }), 200
+
+
+@app.route("/trade-debate", methods=["GET", "POST"])
+def trade_debate_controls():
+    """Read or set the Trade Debate money-path VETO toggle. OFF by default; only
+    DEMOTES an actionable verdict to WAIT (it can never promote / force a trade). The
+    runtime toggle wins over the env seed and RESETS on restart (fail-safe toward NOT
+    interfering). NEVER affects manual ENTER, the base strict gate, or scoring. There
+    is ONE debate engine (no per-instrument model), so this endpoint only toggles the
+    veto. Owner-only (Basic Auth + CSRF via the Express proxy; NOT in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "gate_enabled" in data:
+            # Money-path toggle: parse strictly so a stray JSON string ("false") can
+            # never arm the live veto (mirror of /pro-review). Real booleans pass
+            # through; recognised string/number tokens map explicitly; anything
+            # ambiguous (null / "maybe" / {}) is IGNORED, leaving the gate unchanged.
+            _raw = data.get("gate_enabled")
+            _parsed = None
+            if isinstance(_raw, bool):
+                _parsed = _raw
+            elif isinstance(_raw, (int, float)):
+                _parsed = bool(_raw)
+            elif isinstance(_raw, str):
+                _s = _raw.strip().lower()
+                if _s in ("1", "true", "yes", "on"):
+                    _parsed = True
+                elif _s in ("0", "false", "no", "off"):
+                    _parsed = False
+            if _parsed is not None:
+                set_trade_debate_gate(_parsed)
+                logger.info("Trade Debate VETO %s", "ARMED" if _trade_debate_gate_enabled() else "OFF")
+    return jsonify({
+        "status":         "ok",
+        "engine_enabled": _trade_debate_engine_enabled(),
+        "gate_enabled":   _trade_debate_gate_enabled(),
+        "min_gap":        TRADE_DEBATE_MIN_GAP,
+        "decisive_gap":   TRADE_DEBATE_DECISIVE_GAP,
     }), 200
 
 
