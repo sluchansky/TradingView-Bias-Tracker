@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Server, ArrowRight, Zap, Target, BarChart2 } from 'lucide-react';
+import { Activity, Server, ArrowRight, Zap, Target, BarChart2, TrendingUp } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 
 export default function Home() {
@@ -101,6 +101,26 @@ export default function Home() {
             <h3 className="text-xl font-bold">MNQ</h3>
             <p className="text-sm text-muted-foreground font-sans">
               Micro Nasdaq Futures. High-velocity index tracking focusing on volume imbalances and momentum.
+            </p>
+          </Card>
+
+          <Card className="p-6 border-border/40 bg-card hover:border-primary/50 transition-colors flex flex-col gap-4">
+            <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mb-2">
+              <Activity className="w-5 h-5 text-primary" />
+            </div>
+            <h3 className="text-xl font-bold">MES</h3>
+            <p className="text-sm text-muted-foreground font-sans">
+              Micro S&amp;P 500 Futures. Broad-market index setups tracked with the same liquidity and volume scoring.
+            </p>
+          </Card>
+
+          <Card className="p-6 border-border/40 bg-card hover:border-primary/50 transition-colors flex flex-col gap-4">
+            <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mb-2">
+              <TrendingUp className="w-5 h-5 text-primary" />
+            </div>
+            <h3 className="text-xl font-bold">MYM</h3>
+            <p className="text-sm text-muted-foreground font-sans">
+              Micro Dow Futures. Blue-chip index momentum with structure-aware entries and dynamic stops.
             </p>
           </Card>
 

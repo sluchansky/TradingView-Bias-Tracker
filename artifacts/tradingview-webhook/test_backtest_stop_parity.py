@@ -32,8 +32,12 @@ def _vol(atr, regime="NORMAL"):
 _VALID_CASES = [
     ("MGC", 2000.0, 5.0, "SCALP"),
     ("MNQ", 20000.0, 20.0, "SCALP"),
+    ("MES", 5800.0, 5.0, "SCALP"),
+    ("MYM", 43000.0, 20.0, "SCALP"),
     ("MGC", 2000.0, 10.0, "SWING"),
     ("MNQ", 20000.0, 30.0, "SWING"),
+    ("MES", 5800.0, 10.0, "SWING"),
+    ("MYM", 43000.0, 30.0, "SWING"),
 ]
 
 
@@ -56,7 +60,7 @@ def test_scalp_tight_stop_widens_to_floor_parity():
     # SCALP WIDENS a too-tight stop up to its per-instrument floor in BOTH engines.
     # A tiny ATR (0.2) is below every floor, so live and backtest must agree on the
     # resulting widened stop.
-    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0)):
+    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0), ("MES", 5800.0), ("MYM", 43000.0)):
         live = app._dynamic_stop_plan("Long", entry, None, None, ticker,
                                       _vol(0.2), "SCALP")
         b = bt.bt_stop_plan("Long", entry, None, None, bt.BT_SPECS[ticker],
@@ -72,7 +76,7 @@ def test_scalp_tight_stop_widens_to_floor_short_parity():
     # SHORT mirror: the floor-widen path must also stay in lock-step between engines.
     # A tiny ATR (0.2) is below every floor, so both engines widen the stop ABOVE entry
     # to the per-instrument floor and must agree on ticks / risk / final stop.
-    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0)):
+    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0), ("MES", 5800.0), ("MYM", 43000.0)):
         live = app._dynamic_stop_plan("Short", entry, None, None, ticker,
                                       _vol(0.2), "SCALP")
         b = bt.bt_stop_plan("Short", entry, None, None, bt.BT_SPECS[ticker],
@@ -86,7 +90,7 @@ def test_scalp_tight_stop_widens_to_floor_short_parity():
 
 def test_swing_too_tight_rejected_parity():
     # SWING keeps its HARD minimum: a tiny ATR is REJECTED in both engines.
-    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0)):
+    for ticker, entry in (("MGC", 2000.0), ("MNQ", 20000.0), ("MES", 5800.0), ("MYM", 43000.0)):
         live = app._dynamic_stop_plan("Long", entry, None, None, ticker,
                                       _vol(0.2), "SWING")
         b = bt.bt_stop_plan("Long", entry, None, None, bt.BT_SPECS[ticker],

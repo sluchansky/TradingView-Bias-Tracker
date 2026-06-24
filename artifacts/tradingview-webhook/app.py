@@ -16627,9 +16627,9 @@ def dashboard():
 
   <div class="mod">
     <div class="mod-h">📥 Upload Candles (CSV)</div>
-    <div class="bt-mini" style="margin-bottom:8px">Upload a TradingView candle CSV (MGC or MNQ). Columns: Date, Time, Open, High, Low, Close, Volume. Symbol &amp; timeframe are auto-detected by default. Works with the market closed — it replays your historical candles, not live webhooks.</div>
+    <div class="bt-mini" style="margin-bottom:8px">Upload a TradingView candle CSV (MGC, MNQ, MES or MYM). Columns: Date, Time, Open, High, Low, Close, Volume. Symbol &amp; timeframe are auto-detected by default. Works with the market closed — it replays your historical candles, not live webhooks.</div>
     <div class="bt-grid">
-      <div class="bt-f"><label>Symbol</label><select id="up-sym"><option value="auto" selected>Auto-detect</option><option value="MGC">MGC</option><option value="MNQ">MNQ</option></select></div>
+      <div class="bt-f"><label>Symbol</label><select id="up-sym"><option value="auto" selected>Auto-detect</option><option value="MGC">MGC</option><option value="MNQ">MNQ</option><option value="MES">MES</option><option value="MYM">MYM</option></select></div>
       <div class="bt-f"><label>Timeframe</label><select id="up-tf"><option value="auto" selected>Auto-detect</option><option value="1m">1m</option><option value="3m">3m</option><option value="5m">5m</option><option value="15m">15m</option></select></div>
       <div class="bt-f"><label>Source timezone</label><select id="up-tz"><option value="America/New_York" selected>Eastern (ET)</option><option value="America/Chicago">Central (CT)</option><option value="UTC">UTC</option></select></div>
       <div class="bt-f"><label>Label (optional)</label><input id="up-label" type="text" placeholder="e.g. MGC 5m 2025"></div>

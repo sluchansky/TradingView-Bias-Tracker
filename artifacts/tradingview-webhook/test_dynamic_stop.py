@@ -5,14 +5,14 @@ exercise: multiplier precedence (VOLATILITY WINS over mode, mode-tunable knobs),
 structure-vs-ATR (wider wins), the mode-aware minimum-stop guard (SWING rejects
 too-tight stops outright; SCALP WIDENS a too-tight stop up to its per-instrument
 floor — scalp_min_stop_pts), directional safety,
-MGC/MNQ symmetry, risk-dollar math, ATR-unavailable -> no plan (WAIT), and the
+MGC/MNQ/MES/MYM symmetry, risk-dollar math, ATR-unavailable -> no plan (WAIT), and the
 FIXED 1:1 R:R model (every plan is exactly 1:1; the legacy "<1:2 on TP2 -> no trade"
 veto no longer fires in either mode — ENFORCE_MIN_RR is retained config but unused).
 
 Mode profiles under test (SCALP is the retuned "cut losers fast" profile; SWING is
 unchanged / byte-for-byte):
-  • SCALP: multiplier 1.5 / 2.0; per-instrument min-stop FLOOR (MGC 3 / MNQ 12 pts) — too-tight stops WIDENED.
-  • SWING: multiplier 1.5  / 2.0 ; MGC min 5 pts / 50 ticks; MNQ min 20 pts / 40 ticks (reject).
+  • SCALP: multiplier 1.5 / 2.0; per-instrument min-stop FLOOR (MGC 3 / MNQ 12 / MES 3 / MYM 20 pts) — too-tight stops WIDENED.
+  • SWING: multiplier 1.5  / 2.0 ; MGC 5 pts/50t; MNQ 20 pts/40t; MES 4 pts/16t; MYM 30 pts/30t (reject).
 
 Runnable two ways:
   • pytest test_dynamic_stop.py
@@ -233,6 +233,73 @@ def test_risk_dollars_uses_point_value():
                                 _vol(atr=20.0), "SCALP")
     assert rg["risk_dollars"] == round(rg["risk_points"] * 10.0, 2)   # MGC $10/pt
     assert rq["risk_dollars"] == round(rq["risk_points"] * 2.0, 2)    # MNQ $2/pt
+
+
+# ── MES / MYM coverage (full multi-instrument support) ──────────────────────
+
+def test_scalp_tight_stop_widens_to_floor_mes():
+    # SCALP WIDENS a too-tight stop up to the MES floor (3 pts / 12 ticks @ 0.25 tick).
+    # atr 0.2 * 1.5 = 0.3 pts << 3.0 floor -> widened to 3.0 pts -> final_stop 5797.0.
+    r = app._dynamic_stop_plan("Long", 5800.0, None, None, "MES",
+                               _vol(atr=0.2, regime="NORMAL"), "SCALP")
+    assert r["ok"] is True
+    assert r["min_floor_applied"] is True
+    assert r["stop_distance_ticks"] == 12
+    assert round(r["risk_points"], 4) == 3.0
+    assert r["final_stop"] == 5797.0
+
+
+def test_scalp_tight_stop_widens_to_floor_mym():
+    # SCALP WIDENS a too-tight stop up to the MYM floor (20 pts / 20 ticks @ 1.0 tick).
+    # atr 0.2 * 1.5 = 0.3 pts << 20.0 floor -> widened to 20.0 pts -> final_stop 42980.0.
+    r = app._dynamic_stop_plan("Long", 43000.0, None, None, "MYM",
+                               _vol(atr=0.2, regime="NORMAL"), "SCALP")
+    assert r["ok"] is True
+    assert r["min_floor_applied"] is True
+    assert r["stop_distance_ticks"] == 20
+    assert round(r["risk_points"], 4) == 20.0
+    assert r["final_stop"] == 42980.0
+
+
+def test_swing_minimum_still_rejects_tight_stop_mes_mym():
+    # SWING keeps its HARD minimum for the new instruments too: a tiny ATR is REJECTED
+    # below the SWING floor (MES 4 pts, MYM 30 pts).
+    for ticker, entry in (("MES", 5800.0), ("MYM", 43000.0)):
+        r = app._dynamic_stop_plan("Long", entry, None, None, ticker,
+                                   _vol(atr=0.2, regime="NORMAL"), "SWING")
+        assert r["ok"] is False, ticker
+        assert r["stop_valid"] is False, ticker
+        assert "too tight" in r["stop_invalid_reason"], ticker
+
+
+def test_symmetry_specs_mes_mym():
+    # SCALP min_stop_ticks metadata is each instrument's scalp floor (MES 12 / MYM 20);
+    # tick sizes differ (MES 0.25, MYM 1.0). ATRs chosen to clear each floor.
+    rm = app._dynamic_stop_plan("Long", 5800.0, None, None, "MES",
+                                _vol(atr=5.0), "SCALP")
+    ry = app._dynamic_stop_plan("Long", 43000.0, None, None, "MYM",
+                                _vol(atr=20.0), "SCALP")
+    assert (rm["min_stop_ticks"], rm["tick_size"]) == (12, 0.25)
+    assert (ry["min_stop_ticks"], ry["tick_size"]) == (20, 1.0)
+
+
+def test_swing_specs_mes_mym():
+    # SWING floor metadata: MES 16-tick / MYM 30-tick, base multiplier 1.5.
+    rm = app._dynamic_stop_plan("Long", 5800.0, None, None, "MES",
+                                _vol(atr=10.0), "SWING")
+    ry = app._dynamic_stop_plan("Long", 43000.0, None, None, "MYM",
+                                _vol(atr=30.0), "SWING")
+    assert (rm["min_stop_ticks"], rm["multiplier"]) == (16, 1.5)
+    assert (ry["min_stop_ticks"], ry["multiplier"]) == (30, 1.5)
+
+
+def test_risk_dollars_uses_point_value_mes_mym():
+    rm = app._dynamic_stop_plan("Long", 5800.0, None, None, "MES",
+                                _vol(atr=5.0), "SCALP")
+    ry = app._dynamic_stop_plan("Long", 43000.0, None, None, "MYM",
+                                _vol(atr=20.0), "SCALP")
+    assert rm["risk_dollars"] == round(rm["risk_points"] * 5.0, 2)    # MES $5/pt
+    assert ry["risk_dollars"] == round(ry["risk_points"] * 0.5, 2)    # MYM $0.50/pt
 
 
 # ── build_strict_trade_plan ─────────────────────────────────────────────────

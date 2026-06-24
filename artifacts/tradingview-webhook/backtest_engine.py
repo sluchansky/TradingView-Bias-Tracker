@@ -48,6 +48,20 @@ BT_SPECS = {
             "scalp_min_stop_ticks": 30, "min_stop_pts": 5.0,
             "scalp_min_stop_pts": 3.0,
             "price_lo": 400.0, "price_hi": 12000.0},
+    # CME Micro E-mini S&P 500 ($5/pt, 0.25 tick) — mirrors live ASSETS["MES"].specs:
+    # SCALP floor 3 pts / 12 ticks, SWING min 4 pts / 16 ticks.
+    "MES": {"tp1": 5.0, "tp2": 10.0, "tp3": 15.0, "stop_buf": 2.0,
+            "point_value": 5.0, "tick_size": 0.25, "min_stop_ticks": 16,
+            "scalp_min_stop_ticks": 12, "min_stop_pts": 4.0,
+            "scalp_min_stop_pts": 3.0,
+            "price_lo": 1000.0, "price_hi": 10000.0},
+    # CME Micro E-mini Dow ($0.50/pt, 1.0 tick) — mirrors live ASSETS["MYM"].specs:
+    # SCALP floor 20 pts / 20 ticks, SWING min 30 pts / 30 ticks.
+    "MYM": {"tp1": 40.0, "tp2": 80.0, "tp3": 120.0, "stop_buf": 8.0,
+            "point_value": 0.5, "tick_size": 1.0, "min_stop_ticks": 30,
+            "scalp_min_stop_ticks": 20, "min_stop_pts": 30.0,
+            "scalp_min_stop_pts": 20.0,
+            "price_lo": 10000.0, "price_hi": 60000.0},
 }
 
 # ── Copied mode knobs (mirror live MODES) — only what the backtest needs ───────
@@ -79,13 +93,14 @@ VWAP_RESET_ET          = 18.0   # session-anchored VWAP resets at 18:00 ET (CME 
 CVD_SLOPE_BARS         = 3      # bars used to read the CVD slope direction
 
 TIMEFRAME_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900}
-VALID_SYMBOLS = ("MGC", "MNQ")
+VALID_SYMBOLS = ("MGC", "MNQ", "MES", "MYM")
 VALID_TIMEFRAMES = ("1m", "3m", "5m", "15m")
-# Filename ticker tokens → backtest instrument. The full-size underlyings (GC/NQ)
-# map to their micros (MGC/MNQ): the app already treats them as the same scale
-# (VWAP auto-fetch sources GC=F/NQ=F), and traders often export the deeper-volume
-# underlying as a proxy for the thin micro feed.
-SYMBOL_ALIASES = {"MGC": "MGC", "GC": "MGC", "MNQ": "MNQ", "NQ": "MNQ"}
+# Filename ticker tokens → backtest instrument. The full-size underlyings (GC/NQ/
+# ES/YM) map to their micros (MGC/MNQ/MES/MYM): the app already treats them as the
+# same scale (VWAP auto-fetch sources GC=F/NQ=F/ES=F/YM=F), and traders often export
+# the deeper-volume underlying as a proxy for the thin micro feed.
+SYMBOL_ALIASES = {"MGC": "MGC", "GC": "MGC", "MNQ": "MNQ", "NQ": "MNQ",
+                  "MES": "MES", "ES": "MES", "MYM": "MYM", "YM": "MYM"}
 # Longest-first alternation + letter boundaries so "MGC1!" resolves to MGC (never
 # also "GC"), "GC1!" resolves to MGC, and a 2-letter token never matches inside an
 # unrelated word (e.g. "BIGCAP" / "INQUIRY").
@@ -270,8 +285,9 @@ def _detect_symbol(filename, med_close):
     if len(rng_hits) == 1:
         return rng_hits[0], f"price scale (~{med_close:.0f})"
     if len(rng_hits) > 1:
-        return None, (f"price ~{med_close:.0f} fits both MGC and MNQ — "
-                      f"name the file with the ticker or pick it manually")
+        return None, (f"price ~{med_close:.0f} fits multiple instruments "
+                      f"({', '.join(rng_hits)}) — name the file with the ticker "
+                      f"or pick it manually")
     return None, f"median price {med_close:.0f} matches no known instrument scale"
 
 
@@ -301,7 +317,8 @@ def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York",
     else:
         symbol = str(symbol).strip().upper()
         if symbol not in VALID_SYMBOLS:
-            out["error"] = f"Unsupported symbol '{symbol}' (expected MGC or MNQ)."
+            out["error"] = (f"Unsupported symbol '{symbol}' "
+                            f"(expected one of {', '.join(VALID_SYMBOLS)}).")
             return out
     if auto_tf:
         timeframe = None
@@ -421,7 +438,7 @@ def parse_candles_csv(raw_text, symbol, timeframe, source_tz="America/New_York",
         symbol, why = _detect_symbol(filename, med_close)
         if symbol is None:
             out["error"] = (f"Could not auto-detect the instrument: {why}. "
-                            f"Please choose MGC or MNQ manually.")
+                            f"Please choose one of {', '.join(VALID_SYMBOLS)} manually.")
             return out
         out["detected_symbol"] = True
     spec = BT_SPECS[symbol]
@@ -1851,8 +1868,11 @@ def run_optimization(candles, params):
 def _synthetic_candles(n=900, symbol="MGC", seed=7):
     import random
     rnd = random.Random(seed)
-    base = 2400.0 if symbol == "MGC" else 18000.0
-    step = 0.5 if symbol == "MGC" else 5.0
+    # Per-instrument base price + per-bar step, each inside that BT_SPECS price band.
+    # MGC/MNQ keep their original (base, step) byte-for-byte; MES/MYM added with support.
+    _scale = {"MGC": (2400.0, 0.5), "MNQ": (18000.0, 5.0),
+              "MES": (5800.0, 1.5), "MYM": (43000.0, 8.0)}
+    base, step = _scale.get(symbol, (18000.0, 5.0))
     start = datetime(2026, 1, 5, 0, 0, tzinfo=ET_TZ).astimezone(timezone.utc)
     out = []
     price = base
@@ -1897,8 +1917,12 @@ def _self_test():
     a_fn = parse_candles_csv(csv_text, "auto", "auto", filename="COMEX_MGC1!, 5.csv")
     assert a_fn["ok"] and a_fn["symbol"] == "MGC" and a_fn["timeframe"] == "5m", a_fn
     assert a_fn["detected_symbol"] and a_fn["detected_timeframe"], a_fn
-    a_px = parse_candles_csv(csv_text, "auto", "auto")  # no filename → price scale (~2387 → MGC)
-    assert a_px["ok"] and a_px["symbol"] == "MGC", a_px
+    # No filename → price-only fallback. ~2387 now fits BOTH MGC (400–12000) and MES
+    # (1000–10000), so price alone is ambiguous: auto-detect correctly refuses (the
+    # filename path above resolves the very same data to MGC).
+    a_px = parse_candles_csv(csv_text, "auto", "auto")
+    assert (not a_px["ok"]) and a_px["symbol"] is None, a_px
+    assert "MGC" in (a_px["error"] or "") and "MES" in (a_px["error"] or ""), a_px
     mnq_rows = ["Date,Time,Open,High,Low,Close,Volume"]
     for c in _synthetic_candles(120, "MNQ"):
         et = c["ts"].astimezone(ET_TZ)
@@ -1911,15 +1935,25 @@ def _self_test():
     assert a_gc["ok"] and a_gc["symbol"] == "MGC", a_gc
     nq_sym, _nqw = _detect_symbol("CME_NQ1!.csv", 18000.0)
     assert nq_sym == "MNQ", (nq_sym, _nqw)
-    # boundary guard: GC/NQ inside an unrelated word must NOT be read as a ticker
+    # MES/MYM resolve from the filename ticker (and the ES/YM full-size proxies too).
+    es_sym, _ = _detect_symbol("CME_MES1!.csv", 5800.0)
+    assert es_sym == "MES", es_sym
+    assert _detect_symbol("CME_ES1!.csv", 5800.0)[0] == "MES"
+    ym_sym, _ = _detect_symbol("CBOT_MYM1!.csv", 43000.0)
+    assert ym_sym == "MYM", ym_sym
+    assert _detect_symbol("CBOT_YM1!.csv", 43000.0)[0] == "MYM"
+    # boundary guard: GC/NQ inside an unrelated word must NOT be read as a ticker, so
+    # detection falls through to the PRICE branch (a filename match would say
+    # "filename ..."). ~2387 fits both MGC and MES, so price correctly reports ambiguity.
     bg_sym, bg_why = _detect_symbol("BIGCAP_INQUIRY.csv", 2387.0)
-    assert bg_sym == "MGC" and "price scale" in bg_why, (bg_sym, bg_why)
+    assert bg_sym is None and bg_why.startswith("price ") \
+        and "MGC" in bg_why and "MES" in bg_why, (bg_sym, bg_why)
     # filename naming a contradicting instrument must fail the price-scale sanity
     contra = parse_candles_csv(csv_text, "auto", "auto", filename="some_MNQ_export.csv")
     assert not contra["ok"] and "range" in (contra["error"] or ""), contra
     print(f"Auto-detect OK: filename→{a_fn['symbol']}/{a_fn['timeframe']}, "
-          f"price→{a_px['symbol']}, mnq→{a_mnq['symbol']}, GC→{a_gc['symbol']}/NQ→{nq_sym}; "
-          f"boundary-guarded + contradiction rejected ✓")
+          f"price→ambiguous(MGC/MES), mnq→{a_mnq['symbol']}, GC→{a_gc['symbol']}/NQ→{nq_sym}, "
+          f"MES→{es_sym}/MYM→{ym_sym}; boundary-guarded + contradiction rejected ✓")
 
     # 3) Indicators causal + no NaNs
     big = _synthetic_candles(900, "MGC")
@@ -1953,6 +1987,22 @@ def _self_test():
     res2 = run_backtest(big, {"symbol": "MGC", "timeframe": "5m", "mode": "SWING"})
     assert res2["ok"]
     print(f"SWING run OK: {res2['total_trades']} trades")
+
+    # 5b) MES / MYM full-support smoke: each new instrument parses, scale-validates,
+    #     and runs end-to-end in both modes (the engine is no longer MGC/MNQ-only).
+    for _sym in ("MES", "MYM"):
+        _rows = ["Date,Time,Open,High,Low,Close,Volume"]
+        for c in _synthetic_candles(900, _sym):
+            et = c["ts"].astimezone(ET_TZ)
+            _rows.append(f"{et.strftime('%Y-%m-%d')},{et.strftime('%H:%M:%S')},"
+                         f"{c['open']},{c['high']},{c['low']},{c['close']},{int(c['volume'])}")
+        _p = parse_candles_csv("\n".join(_rows), _sym, "5m")
+        assert _p["ok"], (_sym, _p["error"])
+        _cs = _synthetic_candles(900, _sym)
+        for _mode in ("SCALP", "SWING"):
+            _r = run_backtest(_cs, {"symbol": _sym, "timeframe": "5m", "mode": _mode})
+            assert _r["ok"], (_sym, _mode, _r.get("error"))
+        print(f"{_sym} full-support OK: parses + runs SCALP/SWING ✓")
 
     # 6) BT score stays in sync with the live Edge Score components (max 110):
     #    BOS 20 + CHOCH 20 + VWAP 15 + Sweep 15 + Volume 15 + CVD 15 + Session 10.
