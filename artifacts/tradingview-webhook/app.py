@@ -8144,7 +8144,8 @@ def get_today_equity_curve(ticker):
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             """
-            SELECT closed_at, r_multiple, result, strategy_key, strategy, direction
+            SELECT closed_at, r_multiple, result, strategy_key, strategy, direction,
+                   entry, hold_minutes
             FROM strategy_trades
             WHERE symbol = %s
               AND r_multiple IS NOT NULL
@@ -8168,6 +8169,14 @@ def get_today_equity_curve(ticker):
                 wins += 1
             elif rm < 0:
                 losses += 1
+            try:
+                _entry = float(r["entry"]) if r.get("entry") is not None else None
+            except Exception:
+                _entry = None
+            try:
+                _hold = int(r["hold_minutes"]) if r.get("hold_minutes") is not None else None
+            except Exception:
+                _hold = None
             points.append({
                 "t":        fmt_et(r["closed_at"], "%H:%M"),
                 "r":        round(rm, 2),
@@ -8175,6 +8184,8 @@ def get_today_equity_curve(ticker):
                 "result":   r.get("result"),
                 "strategy": r.get("strategy") or r.get("strategy_key"),
                 "dir":      r.get("direction"),
+                "entry":    _entry,
+                "hold":     _hold,
             })
         out = {
             "available": True, "symbol": ticker, "points": points,
@@ -16185,6 +16196,17 @@ def dashboard():
   .eq-chart{width:100%;height:120px;display:block;background:var(--inset);border:1px solid var(--border);border-radius:2px}
   .eq-empty{font-size:11px;color:var(--muted);font-style:italic;text-align:center;padding:26px 0}
   .eq-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
+  /* Today's trades (per-trade list) */
+  #tt-body{overflow-x:auto}
+  .tt-tbl{width:100%;border-collapse:collapse;font-size:11.5px}
+  .tt-tbl th{text-align:left;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.5px;font-size:9.5px;padding:5px 6px;border-bottom:1px solid var(--border)}
+  .tt-tbl td{padding:6px;border-bottom:1px solid var(--border);color:#e8e8f0;white-space:nowrap}
+  .tt-tbl tr:last-child td{border-bottom:none}
+  .tt-tbl td.tt-strat{max-width:120px;overflow:hidden;text-overflow:ellipsis}
+  .tt-empty{font-size:11px;color:var(--muted);font-style:italic;text-align:center;padding:22px 0}
+  .tt-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
+  .tt-w{color:#22c55e;font-weight:700}.tt-l{color:#ef4444;font-weight:700}
+  .tt-long{color:#22c55e}.tt-short{color:#ef4444}
   /* News filter (economic calendar) */
   .nf-status{font-size:12.5px;font-weight:800;text-align:center;padding:11px;border-radius:2px;margin-bottom:12px;border:1px solid var(--border);color:var(--muted);line-height:1.4}
   .nf-status.clear{color:#bfe6c8;background:#0a2113;border-color:#1b3a26}
@@ -16521,6 +16543,13 @@ def dashboard():
   <svg id="eq-chart" class="eq-chart" viewBox="0 0 320 120" preserveAspectRatio="none" aria-hidden="true"></svg>
   <div class="eq-empty" id="eq-empty" style="display:none"></div>
   <div class="eq-fid">Cumulative R of trades closed today (ET). Accrues live — no backfill.</div>
+</div>
+
+<!-- Today's Trades — per-trade list of trades closed today (display-only, from strategy_trades) -->
+<div class="mod" id="mod-trades">
+  <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div id="tt-body"></div>
+  <div class="tt-fid">Each trade closed today (ET) for the selected instrument. Display-only — accrues live, no backfill.</div>
 </div>
 
 <!-- Economic-calendar news filter (ForexFactory; DISPLAY-ONLY — never gates trades) -->
@@ -17418,6 +17447,9 @@ function renderModules(d){
   // ── Module 9: Equity curve (today) — display-only, real closed trades ──
   renderEquityCurve(d);
 
+  // ── Module 9b: Today's trades (per-trade list) — display-only ──
+  renderTodaysTrades(d);
+
   // ── Module 10: News filter (economic calendar) — display-only ──
   renderNewsFilter(d);
 }
@@ -17574,6 +17606,46 @@ function renderEquityCurve(d){
     s+='<circle cx="'+xFor(i).toFixed(1)+'" cy="'+yFor(cum[i-1]).toFixed(1)+'" r="2.4" fill="'+dotcol+'"/>';
   }
   svg.innerHTML=s;
+}
+
+// Today's trades — per-trade list fed by d.equity_curve_today.points (the same
+// real closed strategy_trades that drive the equity curve). Display-only; follows
+// the selected instrument; newest first; honest empty states.
+function renderTodaysTrades(d){
+  const body=document.getElementById('tt-body');
+  const metaEl=document.getElementById('tt-meta');
+  if(!body) return;
+  const eq=(d&&d.equity_curve_today)||null;
+  const inst=(d&&d.active_ticker)?String(d.active_ticker).replace('1!',''):sym;
+  if(metaEl) metaEl.textContent='· '+inst;
+  if(eq && eq.available===false){
+    body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'Trade history unavailable.')+'</div>';
+    return;
+  }
+  const pts=(eq&&eq.points)||[];
+  if(!pts.length){
+    body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'No closed trades today yet.')+'</div>';
+    return;
+  }
+  const esc=function(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});};
+  const rows=pts.slice().reverse().map(function(p){
+    const dl=String(p.dir||'').toLowerCase();
+    const isL=dl.indexOf('long')>=0||dl==='buy';
+    const dcl=isL?'tt-long':'tt-short';
+    const dlbl=p.dir?esc(String(p.dir).toUpperCase()):'—';
+    const win=(p.r!=null&&p.r>=0);
+    const r=(p.r!=null)?((p.r>=0?'+':'')+Number(p.r).toFixed(2)+'R'):'—';
+    const rcl=win?'tt-w':'tt-l';
+    const res=p.result?esc(p.result):((p.r!=null)?(win?'WIN':'LOSS'):'—');
+    const entry=(p.entry!=null)?fmtPrice(inst,p.entry):'—';
+    return '<tr><td>'+esc(p.t||'—')+'</td>'
+      +'<td class="'+dcl+'">'+dlbl+'</td>'
+      +'<td class="tt-strat">'+esc(p.strategy||'—')+'</td>'
+      +'<td>'+entry+'</td>'
+      +'<td class="'+rcl+'">'+r+'</td>'
+      +'<td class="'+rcl+'">'+res+'</td></tr>';
+  }).join('');
+  body.innerHTML='<table class="tt-tbl"><thead><tr><th>Time</th><th>Dir</th><th>Strategy</th><th>Entry</th><th>R</th><th>Result</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
 // News filter — fed by d.news_filter (cached ForexFactory high-impact USD events).
