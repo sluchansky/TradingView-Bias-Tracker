@@ -1,0 +1,63 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// CVD Bias -> Webhook   (MGC / MNQ / MES / MYM)
+//
+// Approximates Cumulative Volume Delta and fires a directional confirmation when
+// the CVD bias FLIPS relative to its signal EMA:
+//   • CVD BULLISH = cumulative delta crosses ABOVE its EMA (net buying pressure).
+//   • CVD BEARISH = cumulative delta crosses BELOW its EMA (net selling pressure).
+//
+// The webhook treats CVD as a data-only HARD directional filter (fail-open): it
+// rejects longs while bearish / shorts while bullish, and adds +15 edge when CVD
+// agrees with the setup direction. It never sets bias on its own.
+//
+// Per-bar delta is approximated from where the bar closes within its range
+// (volume * (close-open)/(high-low)); this avoids needing a paid lower-timeframe
+// volume feed and is stable enough for a directional bias.
+//
+// SETUP (one alert per chart):
+//   1. Add this script to each chart: MGC1!, MNQ1!, MES1!, and MYM1!.
+//   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
+//   3. Paste your webhook URL under Notifications -> Webhook URL.
+//   4. Leave the message box as-is (the script supplies the JSON). Save.
+//   Auto-detect sets MGC/MNQ/MES/MYM from the symbol.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("CVD Bias -> Webhook (MGC/MNQ/MES/MYM)", overlay=false)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+useAuto      = input.bool(true,  "Auto-detect instrument from symbol")
+manualPrefix = input.string("MGC", "Manual instrument (if auto is off)", options=["MGC", "MNQ", "MES", "MYM"])
+sigLen       = input.int(20, "CVD signal EMA length", minval=2, tooltip="Bias flips when CVD crosses this EMA of itself.")
+resetDaily   = input.bool(true, "Reset CVD at each new session/day")
+showPlot     = input.bool(true, "Plot CVD and signal line")
+
+prefix = useAuto ? (str.contains(syminfo.ticker, "MNQ") ? "MNQ" : str.contains(syminfo.ticker, "MES") ? "MES" : str.contains(syminfo.ticker, "MYM") ? "MYM" : "MGC") : manualPrefix
+
+// ── CVD approximation ──────────────────────────────────────────────────────
+rng   = high - low
+delta = rng > 0 ? volume * (close - open) / rng : 0.0
+
+var float cvd = 0.0
+newDay = ta.change(time("D")) != 0
+cvd := (resetDaily and newDay) ? delta : cvd + delta
+sig  = ta.ema(cvd, sigLen)
+
+// ── Fire on a confirmed bias flip, once per bar close ──────────────────────
+var int state = 0   // 1 bullish, -1 bearish
+suffix = ""
+if barstate.isconfirmed
+    if cvd > sig and state != 1
+        state  := 1
+        suffix := "CVD BULLISH"
+    else if cvd < sig and state != -1
+        state  := -1
+        suffix := "CVD BEARISH"
+    if suffix != ""
+        msg = '{"alert_type": "' + prefix + ' ' + suffix + '", "ticker": "' + syminfo.ticker + '"}'
+        alert(msg, alert.freq_once_per_bar_close)
+
+// ── Visuals ────────────────────────────────────────────────────────────────
+plot(showPlot ? cvd : na, "CVD",    color=cvd >= sig ? color.new(color.green, 0) : color.new(color.red, 0), style=plot.style_area)
+plot(showPlot ? sig : na, "Signal", color=color.new(color.gray, 0))
+hline(0, "Zero", color=color.new(color.gray, 70))
+// © sluchansky

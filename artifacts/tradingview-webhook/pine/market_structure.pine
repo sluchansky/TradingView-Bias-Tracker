@@ -1,0 +1,77 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// Market Structure (BOS / CHOCH) -> Webhook   (any instrument, ticker-routed)
+//
+// Detects swing-based market-structure events and fires the exact SHARED JSON
+// the webhook app expects. Structure alerts are UN-prefixed and routed to the
+// right instrument by the "ticker" field, so the SAME script works on every
+// chart with no instrument setting:
+//   • CHOCH DEMAND  = bearish->bullish reversal (close breaks the last swing
+//                     high while the trend was down).      [bias +3, edge 20]
+//   • BOS DEMAND    = bullish continuation (breaks the last swing high in an
+//                     established uptrend).                 [bias +2, edge 20]
+//   • CHOCH SUPPLY  = bullish->bearish reversal.           [bias +3, edge 20]
+//   • BOS SUPPLY    = bearish continuation.                [bias +2, edge 20]
+//
+// THIS is what unsticks an instrument from the ~5 floor: without structure the
+// Edge Score caps around 50 (VWAP+Volume only) and the READY gate never opens.
+//
+// SETUP (one alert per chart):
+//   1. Add this script to each chart you want structure for (e.g. MES1!, MYM1!).
+//   2. Create Alert -> Condition: this indicator -> "Any alert() function call".
+//   3. Paste your webhook URL under Notifications -> Webhook URL.
+//   4. Leave the message box as-is (the script supplies the JSON). Save.
+//   NOTE: structure is intentionally un-prefixed (no "MES "/"MYM " in front) —
+//   the app routes it by the ticker field. Do NOT prefix these or they'll be
+//   rejected as unrecognized.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("Market Structure BOS/CHOCH -> Webhook", overlay=true)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+leftBars  = input.int(10, "Swing left bars",  minval=1, tooltip="Bars to the left that define a pivot.")
+rightBars = input.int(3,  "Swing right bars", minval=1, tooltip="Bars to the right that confirm a pivot. Higher = fewer, stronger breaks.")
+showMarks = input.bool(true, "Show BOS/CHOCH markers on chart")
+
+// ── Most-recent confirmed swing pivots ─────────────────────────────────────
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low,  leftBars, rightBars)
+
+var float lastHigh  = na
+var float lastLow   = na
+var bool  brokeHigh = false   // fire once per swing level, not every bar beyond it
+var bool  brokeLow  = false
+var int   trend     = 0       // 1 bullish, -1 bearish, 0 undetermined
+
+// ── Detect + fire only on a CLOSED bar (no repaint, no intrabar state churn) ─
+alertType = ""
+if barstate.isconfirmed
+    // A freshly-confirmed pivot resets the level + its "broken" guard.
+    if not na(ph)
+        lastHigh  := ph
+        brokeHigh := false
+    if not na(pl)
+        lastLow  := pl
+        brokeLow := false
+
+    bool bullBreak = not na(lastHigh) and close > lastHigh and not brokeHigh
+    bool bearBreak = not na(lastLow)  and close < lastLow  and not brokeLow
+
+    if bullBreak
+        brokeHigh := true
+        alertType := trend < 0 ? "CHOCH DEMAND" : "BOS DEMAND"  // trend 0 => BOS (initial)
+        trend     := 1
+    else if bearBreak
+        brokeLow  := true
+        alertType := trend > 0 ? "CHOCH SUPPLY" : "BOS SUPPLY"
+        trend     := -1
+
+    if alertType != ""
+        msg = '{"alert_type": "' + alertType + '", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+        alert(msg, alert.freq_once_per_bar_close)
+
+// ── Visuals ────────────────────────────────────────────────────────────────
+plotshape(showMarks and alertType == "BOS DEMAND",   title="BOS Demand",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green,  0), size=size.tiny, text="BOS")
+plotshape(showMarks and alertType == "CHOCH DEMAND", title="CHOCH Demand", style=shape.labelup,       location=location.belowbar, color=color.new(color.teal,   0), size=size.tiny, text="CHoCH")
+plotshape(showMarks and alertType == "BOS SUPPLY",   title="BOS Supply",   style=shape.triangledown, location=location.abovebar, color=color.new(color.red,    0), size=size.tiny, text="BOS")
+plotshape(showMarks and alertType == "CHOCH SUPPLY", title="CHOCH Supply", style=shape.labeldown,     location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny, text="CHoCH")
+// © sluchansky
