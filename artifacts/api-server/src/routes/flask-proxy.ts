@@ -78,6 +78,7 @@ router.all(
     "/alerts/mute",
     "/auto-trade",
     "/advisor",
+    "/pro-review",
     "/journal",
     "/journal/",
     "/eod",

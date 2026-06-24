@@ -733,6 +733,37 @@ def _analyst_gate_enabled():
     return os.environ.get("ANALYST_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+# ── Professional Review flags (display ON by default; money-path veto OFF) ─────
+_PRO_REVIEW_GATE_OVERRIDE = None   # runtime dashboard toggle; None = follow env
+
+
+def _pro_review_engine_enabled():
+    """Professional Review DISPLAY layer — ON by default (fail-open). Env
+    PRO_REVIEW_ENGINE_ENABLED=0 hard-disables it as an emergency kill-switch; a bug
+    inside the engine is already swallowed into a neutral block by the caller."""
+    return os.environ.get("PRO_REVIEW_ENGINE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _pro_review_gate_enabled():
+    """Professional Review money-path VETO — OFF by default. When ON, the active
+    model may only DEMOTE an actionable gate verdict to WAIT (it can NEVER promote /
+    force a trade). A runtime dashboard toggle (_PRO_REVIEW_GATE_OVERRIDE) wins over
+    the env seed so live trading stays byte-identical until the operator turns it on."""
+    if _PRO_REVIEW_GATE_OVERRIDE is not None:
+        return bool(_PRO_REVIEW_GATE_OVERRIDE)
+    return os.environ.get("PRO_REVIEW_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_pro_review_gate(value):
+    """Runtime override for the Professional Review VETO (dashboard toggle). Sets
+    the in-memory _PRO_REVIEW_GATE_OVERRIDE; passing None restores env-seed
+    behaviour. RESETS to None on restart (the module global re-initialises), keeping
+    the fail-safe bias toward NOT interfering with live trading after a republish."""
+    global _PRO_REVIEW_GATE_OVERRIDE
+    _PRO_REVIEW_GATE_OVERRIDE = None if value is None else bool(value)
+    return _pro_review_gate_enabled()
+
+
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
 # EARLY READY (SCALP Edge 50-59) is actionable but lower-conviction (half size)
 # than a full READY (Edge >= 60). Both end in the word "READY", so verdict.endswith(
@@ -2578,6 +2609,38 @@ def get_session_state(now=None):
         if start <= hour < end:
             return {"preferred": True, "bonus": SESSION_BONUS_POINTS, "window": label}
     return {"preferred": False, "bonus": 0, "window": "Outside preferred window"}
+
+
+# ── Personal prime trading windows (per-instrument, Eastern Time) ─────────────
+# The operator's preferred hands-on-keyboard hours per instrument (Gold evenings,
+# index futures the US morning). These feed ONLY the Professional Review's
+# session_quality / prime_session check — they do NOT touch the global
+# SESSION_WINDOWS +10 Edge "Session Bonus" (which is score/golden-relevant) or the
+# READY/WAIT gate. Hours are [start, end) in ET so the EST/EDT switch is automatic.
+PRO_PRIME_WINDOWS_BY_INST = {
+    "MGC": [(20.0, 22.0)],   # Gold   — 8-10 PM ET
+    "MNQ": [(9.0, 11.0)],    # Nasdaq — 9-11 AM ET
+    "MES": [(9.0, 11.0)],    # S&P    — index-morning default
+    "MYM": [(9.0, 11.0)],    # Dow    — index-morning default
+}
+
+
+def get_prime_window_state(inst, now=None):
+    """Per-instrument personal prime-window state for a UTC instant. Returns
+    {"prime": bool, "window": str}. Pure function of the clock + instrument;
+    DISPLAY-ONLY (feeds Professional Review session_quality, never the gate)."""
+    try:
+        base = now or datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        et   = base.astimezone(ET_TZ)
+        hour = et.hour + et.minute / 60.0
+        for start, end in PRO_PRIME_WINDOWS_BY_INST.get((inst or "").upper(), []):
+            if start <= hour < end:
+                return {"prime": True, "window": f"{int(start):02d}:00–{int(end):02d}:00 ET"}
+    except Exception:
+        pass
+    return {"prime": False, "window": "Outside personal prime window"}
 
 
 # ── Market session (CME/COMEX futures hours) ─────────────────────────────────
@@ -8864,6 +8927,394 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
     }
 
 
+# ── Professional Review (pre-READY "think like a pro" layer) ──────────────────
+# A unified review brain that grades EVERY potential setup the way a professional
+# discretionary trader would, BEFORE the bot commits to a READY. It runs two
+# independently-selectable MODELS (selected per instrument so they run separately):
+#   • SCALP — the operator's primary style: weights entry timing, VWAP location,
+#     momentum and the personal prime-session window most heavily.
+#   • SWING — 1-7 day holds: weights higher-timeframe alignment, target room and
+#     risk geometry most heavily and is far more forgiving of exact minute timing /
+#     VWAP extension.
+# DISPLAY by default (_pro_review_engine_enabled). The money-path VETO
+# (_pro_review_gate_enabled, default OFF) may ONLY demote an actionable gate verdict
+# to WAIT — never promote. Attached at the full_analysis level (NOT inside
+# evaluate_strict_setup / build_strict_trade_plan), so the strict-gate goldens stay
+# byte-identical in every flag state. Fail-OPEN to a fully-populated neutral block.
+
+PRO_REVIEW_MODELS = ("SCALP", "SWING")
+PRO_NEAR_PCT = 0.005   # within this % of a favorable zone counts as "good location"
+
+# Per-model scoring weights + thresholds. Entry Efficiency = timing + location +
+# momentum + risk (each a fraction of its weight; the four weights sum to 100).
+_PRO_REVIEW_CFG = {
+    "SCALP": {
+        "w":            {"timing": 30, "location": 25, "momentum": 25, "risk": 20},
+        "vwap_ext_pct": 0.0035,   # > this distance from VWAP = over-extended / chasing
+        "min_rr":       1.0,
+        "min_room_r":   1.0,
+        "use_htf":      False,
+    },
+    "SWING": {
+        "w":            {"timing": 15, "location": 25, "momentum": 20, "risk": 40},
+        "vwap_ext_pct": 0.012,    # swings tolerate far more VWAP extension
+        "min_rr":       1.5,
+        "min_room_r":   2.0,
+        "use_htf":      True,
+    },
+}
+
+# Per-instrument model selection ("run them separately"). In-memory + env-seedable;
+# resets to the default on restart (intentional — like auto-trade arming, a restart
+# is a clean, predictable state). Switched at runtime via /pro-review.
+_PRO_REVIEW_DEFAULT_MODEL = os.environ.get("PRO_REVIEW_DEFAULT_MODEL", "SCALP").upper()
+if _PRO_REVIEW_DEFAULT_MODEL not in PRO_REVIEW_MODELS:
+    _PRO_REVIEW_DEFAULT_MODEL = "SCALP"
+PRO_REVIEW_MODEL_BY_INST = {}
+PRO_REVIEW_LOCK = threading.Lock()
+
+
+def pro_review_model_for(inst):
+    """Active review model (SCALP/SWING) for an instrument. Fail-safe default."""
+    if not inst:
+        return _PRO_REVIEW_DEFAULT_MODEL
+    with PRO_REVIEW_LOCK:
+        return PRO_REVIEW_MODEL_BY_INST.get(str(inst).upper(), _PRO_REVIEW_DEFAULT_MODEL)
+
+
+def set_pro_review_model(inst, model):
+    """Set the active review model for an instrument (runtime, in-memory)."""
+    model = str(model).upper()
+    if model not in PRO_REVIEW_MODELS or not inst:
+        return False
+    with PRO_REVIEW_LOCK:
+        PRO_REVIEW_MODEL_BY_INST[str(inst).upper()] = model
+    return True
+
+
+def _pro_num(x):
+    """Coerce a price-ish value (number / dict with price|level|value) to float."""
+    try:
+        if isinstance(x, dict):
+            x = x.get("price") or x.get("level") or x.get("value")
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pro_review_model_stub(model, reason):
+    """Fully-populated, inert per-model block (fail-open / closed / disabled)."""
+    return {
+        "model":                 model,
+        "grade":                 "—",
+        "entry_efficiency":      0,
+        "timing_score":          0,
+        "location_score":        0,
+        "momentum_score":        0,
+        "risk_score":            0,
+        "market_type":           "—",
+        "momentum_strength":     "—",
+        "chase_risk":            "—",
+        "trade_quality":         "—",
+        "session_quality":       "—",
+        "professional_decision": "—",
+        "checklist": {
+            "not_late":            False,
+            "not_chasing":         False,
+            "tp1_room":            False,
+            "momentum_increasing": False,
+            "volume_confirming":   False,
+            "prime_session":       False,
+            "pro_would_take":      False,
+        },
+        "hard_fails":      [],
+        "why_not_trade":   reason,
+        "veto_would_fire": False,
+        "summary":         reason,
+    }
+
+
+def _pro_review_neutral_block(reason="Pro review unavailable.", inst=None):
+    """Fully-populated, safe Pro-Review block (fail-open fallback + market-closed +
+    disabled stub). EVERY key the /status serializer and dashboard read MUST exist
+    here so the single-return-path / hard-indexed-consumer invariant holds in every
+    branch. veto_would_fire stays False so a stub can NEVER demote a trade when the
+    gate is on."""
+    sel    = pro_review_model_for(inst)
+    models = {m: _pro_review_model_stub(m, reason) for m in PRO_REVIEW_MODELS}
+    return {
+        "engine_enabled":   _pro_review_engine_enabled(),
+        "gate_enabled":     _pro_review_gate_enabled(),
+        "selected_model":   sel,
+        "available_models": list(PRO_REVIEW_MODELS),
+        "models":           models,
+        "active":           models[sel],
+    }
+
+
+def _pro_grade_from_efficiency(eff):
+    """Base letter grade from the 0-100 Entry Efficiency (before chase capping)."""
+    if eff < 50:
+        return "D"
+    if eff >= 90:
+        return "A+"
+    if eff >= 80:
+        return "A"
+    if eff >= 65:
+        return "B"
+    return "C"
+
+
+def _pro_eval_model(model, ctx):
+    """Score ONE model from the shared, pre-extracted ctx. Pure + fail-open."""
+    cfgm = _PRO_REVIEW_CFG.get(model, _PRO_REVIEW_CFG["SCALP"])
+    w    = cfgm["w"]
+
+    vdist_pct    = ctx["vdist_pct"]
+    on_vwap_side = ctx["on_vwap_side"]
+    near_zone    = ctx["near_zone"]
+    room_r       = ctx["room_r"]
+    rr_num       = ctx["rr_num"]
+    stop_ok      = ctx["stop_ok"]
+    struct_ok    = ctx["struct_ok"]
+    sweep_recent = ctx["sweep_recent"]
+    vol_conf     = ctx["vol_conf"]
+    cvd_agree    = ctx["cvd_agree"]
+    vol_label    = ctx["vol_label"]
+    htf_agree    = ctx["htf_agree"]
+    prime        = ctx["prime"]
+
+    ext           = cfgm["vwap_ext_pct"]
+    over_extended = (vdist_pct is not None and vdist_pct > ext)
+    if vdist_pct is None:
+        chase_risk = "Low"
+    elif vdist_pct > ext:
+        chase_risk = "High"
+    elif vdist_pct > 0.6 * ext:
+        chase_risk = "Medium"
+    else:
+        chase_risk = "Low"
+
+    room_ok = (room_r is not None and room_r >= cfgm["min_room_r"])
+    rr_ok   = (rr_num  is not None and rr_num  >= cfgm["min_rr"])
+
+    # ── timing ──
+    tf = 0.0
+    if on_vwap_side:               tf += 0.40
+    if not over_extended:          tf += 0.35
+    if struct_ok or sweep_recent:  tf += 0.25
+    timing = w["timing"] * tf
+
+    # ── location ──
+    lf = 0.0
+    if near_zone:    lf += 0.50
+    if room_ok:      lf += 0.30
+    if on_vwap_side: lf += 0.20
+    location = w["location"] * lf
+
+    # ── momentum ──
+    mf = 0.0
+    if cfgm["use_htf"]:
+        if vol_conf:  mf += 0.30
+        if cvd_agree: mf += 0.30
+        if htf_agree: mf += 0.40
+    else:
+        if vol_conf:  mf += 0.40
+        if cvd_agree: mf += 0.35
+        if vol_label in ("Normal", "Elevated"): mf += 0.25
+    momentum = w["momentum"] * mf
+
+    # ── risk ──
+    rf = 0.0
+    if rr_ok:    rf += 0.50
+    if room_ok:  rf += 0.30
+    if stop_ok:  rf += 0.20
+    risk = w["risk"] * rf
+
+    eff = int(round(min(100.0, timing + location + momentum + risk)))
+
+    grade = _pro_grade_from_efficiency(eff)
+    if over_extended or chase_risk == "High":
+        grade = "D"
+    elif chase_risk == "Medium" and grade in ("A+", "A", "B"):
+        grade = "C"
+
+    if   mf >= 0.80: momentum_strength = "Strong"
+    elif mf >= 0.55: momentum_strength = "Building"
+    elif mf >= 0.30: momentum_strength = "Fading"
+    else:            momentum_strength = "Weak"
+
+    if   eff >= 80: trade_quality = "Excellent"
+    elif eff >= 65: trade_quality = "Good"
+    elif eff >= 50: trade_quality = "Fair"
+    else:           trade_quality = "Poor"
+
+    tp1_room = room_ok or rr_ok
+    checklist = {
+        "not_late":            not over_extended,
+        "not_chasing":         chase_risk != "High",
+        "tp1_room":            bool(tp1_room),
+        "momentum_increasing": bool(vol_conf or cvd_agree),
+        "volume_confirming":   bool(vol_conf),
+        "prime_session":       bool(prime),
+        "pro_would_take":      False,
+    }
+
+    hard_fails = []
+    if grade == "D":
+        hard_fails.append("Setup grade D (extended / low quality)")
+    if eff < 80:
+        hard_fails.append("Entry efficiency %d below 80" % eff)
+    if over_extended:
+        hard_fails.append("Price over-extended from VWAP (chasing)")
+    if not tp1_room:
+        hard_fails.append("Insufficient room to first target")
+
+    if hard_fails and (grade == "D" or eff < 60 or chase_risk == "High"):
+        decision = "PASS"
+    elif hard_fails:
+        decision = "WAIT"
+    else:
+        decision = "TAKE"
+    checklist["pro_would_take"] = (decision == "TAKE")
+
+    why = "; ".join(hard_fails) if hard_fails else "Setup meets professional criteria."
+    return {
+        "model":                 model,
+        "grade":                 grade,
+        "entry_efficiency":      eff,
+        "timing_score":          int(round(timing)),
+        "location_score":        int(round(location)),
+        "momentum_score":        int(round(momentum)),
+        "risk_score":            int(round(risk)),
+        "market_type":           ctx["market_type"],
+        "momentum_strength":     momentum_strength,
+        "chase_risk":            chase_risk,
+        "trade_quality":         trade_quality,
+        "session_quality":       "Prime" if prime else "Off-Prime",
+        "professional_decision": decision,
+        "checklist":             checklist,
+        "hard_fails":            hard_fails,
+        "why_not_trade":         why,
+        "veto_would_fire":       decision != "TAKE",
+        "summary":               "%s · %s · Eff %d · %s · %s" % (
+            model, grade, eff, ctx["market_type"], decision),
+    }
+
+
+def _pro_market_type(result, vol_label):
+    """Best-effort market-character label from structure + volatility + conflict."""
+    sc = str(result.get("structure_class") or "").lower()
+    if vol_label == "Extreme":
+        return "Expansion Day"
+    if any(k in sc for k in ("trend", "impuls")):
+        return "Trend Day"
+    if any(k in sc for k in ("range", "consolid", "balance")):
+        return "Range Day"
+    if any(k in sc for k in ("revers", "exhaust")):
+        return "Reversal Day"
+    try:
+        cg = result.get("conflict_gap")
+        if cg is not None and abs(float(cg)) < 10:
+            return "Choppy Day"
+    except (TypeError, ValueError):
+        pass
+    return "Range Day"
+
+
+def compute_pro_review(result, strict, swing_ctx=None, market=None, inst=None):
+    """Professional pre-READY review over the assembled full_analysis `result`.
+    Pure + fail-open (the caller also wraps it in try/except). Computes BOTH models
+    from one shared read of the evaluated setup; the active model is selected per
+    instrument. Returns the block documented in _pro_review_neutral_block."""
+    inst = (inst or result.get("active_ticker") or "")
+
+    # Evaluated direction: the actionable side, else the strict direction, else the
+    # dominant / stronger forming side (so a forming setup still gets graded).
+    direction = ready_direction(result.get("verdict")) or result.get("strict_direction")
+    if direction not in ("Long", "Short"):
+        dd = result.get("dominant_direction")
+        if dd in ("Long", "Short"):
+            direction = dd
+    if direction not in ("Long", "Short"):
+        direction = "Long" if (result.get("long_score") or 0) >= (result.get("short_score") or 0) else "Short"
+    long_ = (direction == "Long")
+
+    price = _pro_num(result.get("current_price"))
+    vwap  = _pro_num(result.get("vwap_value"))
+    vdist_pct, on_vwap_side = None, False
+    if price and vwap:
+        try:
+            vdist_pct    = abs(price - vwap) / price
+            on_vwap_side = (price >= vwap) if long_ else (price <= vwap)
+        except ZeroDivisionError:
+            vdist_pct, on_vwap_side = None, False
+
+    ref = _pro_num(result.get("nearest_demand") if long_ else result.get("nearest_supply"))
+    near_zone = bool(price and ref and abs(price - ref) / price <= PRO_NEAR_PCT)
+
+    tp = result.get("trade_plan") or {}
+    rr_num = _pro_num(tp.get("rr"))
+    if rr_num is None:
+        rr_raw = tp.get("rr")
+        if isinstance(rr_raw, str) and ":" in rr_raw:
+            rr_num = _pro_num(rr_raw.split(":")[-1])
+    room_r = rr_num   # room to first target approximated by the planned R:R
+    stop_ok = bool(tp.get("stop_loss"))
+
+    ad = result.get("alert_diagnostics") or {}
+    comp_str = " ".join(str(c) for c in (ad.get("components") or [])).upper()
+    struct_ok = (("BOS" in comp_str or "CHOCH" in comp_str or "STRUCTURE" in comp_str)
+                 or result.get("strict_direction") == direction)
+    sweep_recent = ("SWEEP" in comp_str)
+
+    vol_conf = bool(result.get("volume_confirmed"))
+    if not vol_conf:
+        rv = _pro_num(result.get("rvol_value"))
+        vol_conf = bool(rv is not None and rv >= 1.5)
+
+    cvd_dir   = result.get("cvd_direction")
+    cvd_agree = (cvd_dir == "Bullish" and long_) or (cvd_dir == "Bearish" and not long_)
+
+    vol       = result.get("volatility")
+    vol_label = vol.get("label") if isinstance(vol, dict) else None
+
+    htf_bias = (swing_ctx or {}).get("htf_bias") or (swing_ctx or {}).get("bias")
+    if not htf_bias:
+        htf_bias = ((result.get("analyst") or {}).get("context") or {}).get("htf_bias")
+    htf_bias = str(htf_bias or "").lower()
+    htf_agree = ("bull" in htf_bias and long_) or ("bear" in htf_bias and not long_)
+
+    prime = bool(get_prime_window_state(inst).get("prime"))
+
+    ctx = {
+        "direction": direction, "vdist_pct": vdist_pct, "on_vwap_side": on_vwap_side,
+        "near_zone": near_zone, "room_r": room_r, "rr_num": rr_num, "stop_ok": stop_ok,
+        "struct_ok": struct_ok, "sweep_recent": sweep_recent, "vol_conf": vol_conf,
+        "cvd_agree": cvd_agree, "vol_label": vol_label, "htf_agree": htf_agree,
+        "prime": prime, "market_type": _pro_market_type(result, vol_label),
+    }
+
+    models = {}
+    for m in PRO_REVIEW_MODELS:
+        try:
+            models[m] = _pro_eval_model(m, ctx)
+        except Exception as exc:   # per-model fail-open
+            models[m] = _pro_review_model_stub(m, "model error (%s)" % exc)
+
+    sel = pro_review_model_for(inst)
+    if sel not in models:
+        sel = _PRO_REVIEW_DEFAULT_MODEL
+    return {
+        "engine_enabled":   _pro_review_engine_enabled(),
+        "gate_enabled":     _pro_review_gate_enabled(),
+        "selected_model":   sel,
+        "available_models": list(PRO_REVIEW_MODELS),
+        "models":           models,
+        "active":           models[sel],
+    }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -9587,6 +10038,52 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             result["decision_support"] = _decision_support(result)
             _analyst["final_verdict"] = "WAIT"
         result["analyst"] = _analyst
+        # ── Professional Review (DISPLAY-ONLY here; the flag-gated veto is wired
+        #    in just below, mirroring the analyst layer). Computed from the FINAL
+        #    assembled result so it reflects every override above. ──────────────
+        if _pro_review_engine_enabled():
+            try:
+                result["pro_review"] = compute_pro_review(
+                    result, strict, swing_ctx, market, active_ticker)
+            except Exception as exc:   # FAIL-OPEN — a broken review must never crash analysis.
+                result["pro_review"] = _pro_review_neutral_block(
+                    "Pro review unavailable (%s)." % exc, inst=active_ticker)
+        else:
+            result["pro_review"] = _pro_review_neutral_block(
+                "Pro review disabled.", inst=active_ticker)
+        # Fail-CLOSED veto (flag-gated, default OFF): only when explicitly enabled
+        # AND the ACTIVE model would not take the trade (veto_would_fire) AND the
+        # gate verdict is still actionable. It can ONLY demote to WAIT — never
+        # promote. The neutral / disabled / market-closed stub sets
+        # veto_would_fire=False so it can NEVER demote. Mirrors the analyst veto.
+        _pr      = result.get("pro_review") or {}
+        _pr_act  = _pr.get("active") or {}
+        if (_pro_review_gate_enabled() and _pr_act.get("veto_would_fire")
+                and is_actionable(result["verdict"])):
+            _pr_reason = ("Pro Review veto: "
+                          + (_pr_act.get("why_not_trade")
+                             or "professional review does not support the trade."))
+            result["verdict"]       = "WAIT"
+            result["strict_label"]  = "WAIT"
+            result["strict_reason"] = _pr_reason
+            result["trade_plan"]    = {
+                "trade_plan": False, "reason": _pr_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": result.get("strict_direction"),
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
+            for _vd in ("Long", "Short"):
+                _vblk = (result.get("directions") or {}).get(_vd)
+                if _vblk:
+                    _vblk.update(ready=False, label="WAIT")
+            _ad = result.get("alert_diagnostics") or {}
+            _ad["ready_reason"]     = ""
+            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Pro Review veto"]
+            result["alert_diagnostics"] = _ad
+            # Decision-support was computed earlier from the pre-veto plan — recompute
+            # it so every display surface agrees with the demoted WAIT verdict.
+            result["decision_support"] = _decision_support(result)
     if not market["open"]:
         result["verdict"]         = "MARKET CLOSED"
         # strict_label is the JOURNALING label and must stay in
@@ -9673,6 +10170,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         # fully-populated stub keeps the single-return-path / hard-index invariant.
         result["analyst"]            = _analyst_neutral_block(
             "Market closed — live alerts paused.", verdict="NO TRADE")
+        result["pro_review"]         = _pro_review_neutral_block(
+            "Market closed — live alerts paused.", inst=active_ticker)
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
             if _blk:
@@ -9986,6 +10485,33 @@ def _build_trade_card_embed(entry, footer_text):
                                     "inline": False})
     except Exception as exc:
         logger.error("Trade-management card block error: %s", exc)
+
+    # ── Additive: 🎓 Professional Review field (display-only; pre-READY pro grade).
+    # Mirrors the dashboard's ACTIVE model verdict on the live card. Built
+    # defensively so a missing/neutral block simply omits the field. ──
+    try:
+        pr = entry.get("pro_review") or {}
+        if pr.get("engine_enabled"):
+            act = pr.get("active") or {}
+            grade = act.get("grade")
+            if grade and grade != "—":
+                hard = act.get("hard_fails") or []
+                pr_lines = [
+                    f"🧠 Model: **{pr.get('selected_model', '—')}**  ·  "
+                    f"Grade: **{grade}**  ·  Eff: **{act.get('entry_efficiency', '—')}/100**",
+                    f"🌐 Market: {act.get('market_type', '—')}  ·  "
+                    f"Chase Risk: {act.get('chase_risk', '—')}  ·  "
+                    f"Decision: {act.get('professional_decision', '—')}",
+                ]
+                if hard:
+                    pr_lines.append("⛔ Hard fails: " + "; ".join(str(h) for h in hard[:3]))
+                gate_note = "VETO ARMED" if pr.get("gate_enabled") else "display-only"
+                pr_lines.append(f"_Pro Review · {gate_note}_")
+                embed["fields"].append({"name": "🎓 Professional Review",
+                                        "value": "\n".join(pr_lines)[:1024],
+                                        "inline": False})
+    except Exception as exc:
+        logger.error("Pro-review card block error: %s", exc)
 
     # Attach the chart screenshot when a validated public URL is present.
     shot = entry.get("screenshot_url")
@@ -12581,6 +13107,10 @@ def _build_card_entry(a, ticker=None, record=None):
     entry["rejected_reasons"]      = a.get("rejected_reasons") or a.get("strict_missing")
     entry["alert_diagnostics"]     = a.get("alert_diagnostics")
     entry["decision_support"]      = a.get("decision_support") or _decision_support(entry)
+    # Professional Review (display-only pre-READY pro grade) — carry the ACTIVE
+    # model block onto the card entry so the live card / journal mirror the
+    # dashboard. Defensive .get → absent on a bare/legacy `a` (field simply omitted).
+    entry["pro_review"] = a.get("pro_review")
     # SWING (flag-on) only: carry the P4-computed HTF context onto the entry so the
     # managed-trade register can build a per-trade thesis WITHOUT recomputing it
     # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
@@ -15842,6 +16372,7 @@ def status():
         "rejected_reasons":    a.get("rejected_reasons"),
         "alert_diagnostics":   a.get("alert_diagnostics"),
         "analyst":             a.get("analyst"),
+        "pro_review":          a.get("pro_review"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -17317,6 +17848,39 @@ def dashboard():
   <div id="an-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
+<!-- Professional Review (pre-READY pro-trader grading; TWO models SCALP/SWING run
+     SEPARATELY per instrument. DISPLAY by default; the money-path veto is
+     flag-gated server-side, default OFF). Hidden unless the engine is enabled. -->
+<div class="mod" id="mod-pro" style="display:none">
+  <div class="mod-h">🎓 Professional Review <span id="pr-badge" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
+    <span style="font-size:11px;color:#9aa">Model (<span id="pr-inst">—</span>):</span>
+    <span id="pr-m-SCALP" role="button" tabindex="0" onclick="setProModel('SCALP')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setProModel('SCALP');}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px">SCALP</span>
+    <span id="pr-m-SWING" role="button" tabindex="0" onclick="setProModel('SWING')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setProModel('SWING');}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px">SWING</span>
+    <span id="pr-gate-toggle" role="button" tabindex="0" onclick="toggleProGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleProGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Veto: off</span>
+  </div>
+  <div class="se-bias-h">Active Model — <span id="pr-model">—</span></div>
+  <div id="pr-decision" style="font-size:20px;font-weight:800;margin:2px 0 6px">—</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Grade</div><div class="v" id="pr-grade">—</div></div>
+    <div class="gstat"><div class="l">Entry Efficiency</div><div class="v" id="pr-eff">—</div></div>
+    <div class="gstat"><div class="l">Trade Quality</div><div class="v" id="pr-quality">—</div></div>
+    <div class="gstat"><div class="l">Market Type</div><div class="v" id="pr-mkt">—</div></div>
+    <div class="gstat"><div class="l">Momentum</div><div class="v" id="pr-mom">—</div></div>
+    <div class="gstat"><div class="l">Chase Risk</div><div class="v" id="pr-chase">—</div></div>
+    <div class="gstat"><div class="l">Session</div><div class="v" id="pr-sess">—</div></div>
+    <div class="gstat"><div class="l">Timing / Loc</div><div class="v" id="pr-tl">—</div></div>
+    <div class="gstat"><div class="l">Mom / Risk</div><div class="v" id="pr-mr">—</div></div>
+  </div>
+  <div class="se-bias-h">Pro Checklist</div>
+  <div id="pr-checklist" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+  <div class="se-bias-h">Why Not Trade</div>
+  <div class="se-reason" id="pr-why">—</div>
+  <div class="se-bias-h">Both Models (run separately per instrument)</div>
+  <div id="pr-both" class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px"></div>
+  <div id="pr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
 <!-- SCALP dynamic-exit diagnostics (req 7 — DISPLAY-ONLY; hidden unless SCALP dynamic exits are on) -->
 <div class="mod" id="mod-scalpdiag" style="display:none">
   <div class="mod-h">🩺 SCALP Diagnostics <span id="sd-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
@@ -17726,6 +18290,7 @@ function toggleMute(inst){
 let AUTO_STATE = { MGC:false, MNQ:false, MES:false, MYM:false };
 let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_live:false, is_live_instance:false, max_per_day:0, contracts:1 };
 let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
+let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
 async function loadAutoTrade(){
   try {
     const d = await api('/auto-trade');
@@ -18356,6 +18921,9 @@ function renderModules(d){
   // ── Module 11: Analyst Mode — professional-analyst reasoning (DISPLAY-ONLY) ──
   renderAnalystMode(d);
 
+  // ── Module 11b: Professional Review — pre-READY pro-trader grading (DISPLAY-ONLY) ──
+  renderProReview(d);
+
   // ── Module 12: Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY/NOTIFY only ──
   const xm = d.index_alignment || null;
   const xmMod = document.getElementById('mod-xmarket');
@@ -18471,6 +19039,116 @@ function renderAnalystMode(d){
   }));
   const foot=document.getElementById('an-foot');
   if(foot){ foot.textContent='Reasoning over existing signals · FVG / Order Blocks not tracked yet'+(a.gate_enabled?'':' · veto OFF (display-only)'); }
+}
+
+// Professional Review — pre-READY pro-trader grading. TWO models (SCALP / SWING)
+// scored from the FINAL assembled analysis and selected SEPARATELY per instrument.
+// DISPLAY-ONLY on the dashboard; the money-path veto is flag-gated server-side.
+// Fed by d.pro_review.
+function _prGradeColor(g){
+  if(g==='A+'||g==='A') return '#22c55e';
+  if(g==='B') return '#84cc16';
+  if(g==='C') return '#f59e0b';
+  if(g==='D') return '#ef4444';
+  return '#6b7280';
+}
+function _prDecisionColor(dec){
+  if(dec==='TAKE') return '#22c55e';
+  if(dec==='WAIT') return '#f59e0b';
+  if(dec==='PASS') return '#ef4444';
+  return '#6b7280';
+}
+function renderProReview(d){
+  const pr=(d && d.pro_review) || null;
+  const mod=document.getElementById('mod-pro');
+  if(!mod) return;
+  if(!pr || !pr.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  const act=pr.active||{};
+  const badge=document.getElementById('pr-badge');
+  if(badge){ badge.textContent=pr.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=pr.gate_enabled?'#ef4444':'#6b7280'; }
+  _set('pr-model', pr.selected_model, '#a78bfa');
+  const dec=act.professional_decision||'—';
+  _set('pr-decision', dec, _prDecisionColor(dec));
+  _set('pr-grade', act.grade, _prGradeColor(act.grade));
+  const eff=Number(act.entry_efficiency||0);
+  _set('pr-eff', eff+'/100', eff>=80?'#22c55e':eff>=65?'#f59e0b':'#ef4444');
+  _set('pr-quality', act.trade_quality);
+  _set('pr-mkt', act.market_type);
+  _set('pr-mom', act.momentum_strength);
+  const chase=act.chase_risk||'—';
+  _set('pr-chase', chase, chase==='Low'?'#22c55e':chase==='Medium'?'#f59e0b':chase==='High'?'#ef4444':'#6b7280');
+  const sess=act.session_quality||'—';
+  _set('pr-sess', sess, sess==='Prime'?'#22c55e':'#6b7280');
+  _set('pr-tl', (act.timing_score!=null?act.timing_score:'—')+' / '+(act.location_score!=null?act.location_score:'—'));
+  _set('pr-mr', (act.momentum_score!=null?act.momentum_score:'—')+' / '+(act.risk_score!=null?act.risk_score:'—'));
+  const cl=act.checklist||{};
+  const order=['not_late','not_chasing','tp1_room','momentum_increasing','volume_confirming','prime_session','pro_would_take'];
+  const labels={not_late:'Not Late',not_chasing:'Not Chasing',tp1_room:'TP1 Room',momentum_increasing:'Momentum',volume_confirming:'Volume',prime_session:'Prime',pro_would_take:'Pro Take'};
+  const cc=document.getElementById('pr-checklist');
+  if(cc){
+    cc.innerHTML=order.map(function(k){
+      const ok=!!cl[k];
+      const col=ok?'#22c55e':'#6b7280';
+      const bg=ok?'rgba(34,197,94,.12)':'rgba(107,114,128,.12)';
+      return '<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+col+';background:'+bg+'">'+(ok?'✓ ':'✗ ')+labels[k]+'</span>';
+    }).join('');
+  }
+  _set('pr-why', act.why_not_trade);
+  const both=document.getElementById('pr-both');
+  if(both){
+    const models=pr.models||{};
+    both.innerHTML=(pr.available_models||[]).map(function(m){
+      const b=models[m]||{};
+      const sel=(m===pr.selected_model);
+      const gc=_prGradeColor(b.grade);
+      const dc=_prDecisionColor(b.professional_decision);
+      return '<div class="gstat" style="'+(sel?'outline:1px solid #a78bfa;':'')+'">'
+        +'<div class="l">'+m+(sel?' (active)':'')+'</div>'
+        +'<div class="v" style="color:'+gc+'">'+(b.grade||'—')+' · '+(b.entry_efficiency!=null?b.entry_efficiency:'—')
+        +' · <span style="color:'+dc+'">'+(b.professional_decision||'—')+'</span></div></div>';
+    }).join('');
+  }
+  // ── Controls (owner): per-instrument model select + global veto toggle ──
+  PRO_GATE_STATE = !!pr.gate_enabled;
+  const _inst=(typeof sym!=='undefined' && sym) ? sym : '—';
+  _set('pr-inst', _inst, '#9aa');
+  ['SCALP','SWING'].forEach(function(m){
+    const b=document.getElementById('pr-m-'+m);
+    if(b){ const on=(m===pr.selected_model); b.style.background=on?'rgba(167,139,250,.18)':'transparent'; b.style.color=on?'#a78bfa':'#9aa'; b.style.borderColor=on?'#a78bfa':'var(--border)'; }
+  });
+  const gt=document.getElementById('pr-gate-toggle');
+  if(gt){ gt.textContent=pr.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=pr.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=pr.gate_enabled?'#ef4444':'var(--border)'; }
+  const foot=document.getElementById('pr-foot');
+  if(foot){ foot.textContent='Two models run separately per instrument · prime windows MGC 8-10pm / MNQ 9-11am ET'+(pr.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)'); }
+}
+function setProModel(m){
+  const inst=(typeof sym!=='undefined' && sym) ? sym : 'MGC';
+  api('/pro-review', { instrument: inst, model: m })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ toast('Pro Review model update failed', false); return; }
+      toast('Pro Review ['+inst+'] model → '+m);
+    })
+    .catch(function(){ toast('Pro Review model update failed', false); });
+}
+function toggleProGate(){
+  const cur=!!PRO_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Professional Review VETO?\\n\\nWhile ARMED, the active model can DEMOTE an actionable setup to WAIT (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
+  PRO_GATE_STATE=next;
+  const gt=document.getElementById('pr-gate-toggle');
+  if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/pro-review', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ PRO_GATE_STATE=cur; toast('Pro Review veto update failed', false); return; }
+      PRO_GATE_STATE=!!d.gate_enabled;
+      toast(PRO_GATE_STATE ? 'Pro Review VETO ARMED — may demote to WAIT' : 'Pro Review veto off');
+    })
+    .catch(function(){ PRO_GATE_STATE=cur; toast('Pro Review veto update failed', false); });
 }
 
 // Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
@@ -20156,6 +20834,57 @@ def advisor_toggle():
             _set_advisor_enabled(bool(data.get("enabled")))
             logger.info("Advisor %s", "ENABLED" if _advisor_enabled() else "DISABLED")
     return jsonify({"status": "ok", "enabled": _advisor_enabled()}), 200
+
+
+@app.route("/pro-review", methods=["GET", "POST"])
+def pro_review_controls():
+    """Read or set the Professional Review controls: per-instrument MODEL selection
+    (SCALP / SWING — the two run separately per instrument) and the global money-path
+    VETO toggle.
+
+    The VETO is OFF by default and only DEMOTES an actionable verdict to WAIT (it can
+    never promote / force a trade). The runtime toggle wins over the env seed and
+    RESETS on restart (fail-safe toward NOT interfering). Model selection is
+    per-instrument and in-memory. NEVER affects manual ENTER trades, the base strict
+    gate, or scoring. Owner-only (Basic Auth + CSRF via the Express proxy;
+    deliberately NOT in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "model" in data:
+            inst = instrument_of(data.get("instrument") or data.get("ticker") or "")
+            if set_pro_review_model(inst, data.get("model")):
+                logger.info("Pro Review model [%s] -> %s", inst, pro_review_model_for(inst))
+        if "gate_enabled" in data:
+            # Money-path toggle: parse strictly so a stray JSON string ("false") can
+            # never arm the live veto. Real booleans (the dashboard) pass straight
+            # through; recognised string/number tokens map explicitly; anything
+            # ambiguous (null / "maybe" / {}) is IGNORED, leaving the gate unchanged
+            # (fail-safe toward NOT interfering with live trading).
+            _raw = data.get("gate_enabled")
+            _parsed = None
+            if isinstance(_raw, bool):
+                _parsed = _raw
+            elif isinstance(_raw, (int, float)):
+                _parsed = bool(_raw)
+            elif isinstance(_raw, str):
+                _s = _raw.strip().lower()
+                if _s in ("1", "true", "yes", "on"):
+                    _parsed = True
+                elif _s in ("0", "false", "no", "off"):
+                    _parsed = False
+            if _parsed is not None:
+                set_pro_review_gate(_parsed)
+                logger.info("Pro Review VETO %s", "ARMED" if _pro_review_gate_enabled() else "OFF")
+    with PRO_REVIEW_LOCK:
+        models = dict(PRO_REVIEW_MODEL_BY_INST)
+    return jsonify({
+        "status":           "ok",
+        "engine_enabled":   _pro_review_engine_enabled(),
+        "gate_enabled":     _pro_review_gate_enabled(),
+        "available_models": list(PRO_REVIEW_MODELS),
+        "default_model":    _PRO_REVIEW_DEFAULT_MODEL,
+        "models":           models,
+    }), 200
 
 
 @app.route("/", methods=["GET"])
