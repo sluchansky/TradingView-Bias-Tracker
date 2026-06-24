@@ -43,6 +43,12 @@ hard-indexed-consumer parity rule; adding to only one branch reintroduces the le
   proxy whitelist (`flask-proxy.ts`) or it 404s before reaching Flask.
 - `/status` exposes top-level `advisor_enabled`; dashboard header pill + analyst module
   visibility key off it.
+- **Blocked-trade log (display-only).** Advisor block decisions are recorded AFTER the
+  decision into a bounded in-memory log (clears on restart like the toggle), exposed via
+  `/status` and shown in the analyst module — so the recording is best-effort, must never
+  raise, and never feeds back into the auto-exec decision or money path. Visible only while
+  Advisor is ON (the analyst module hides when OFF). Its lock must stay standalone (never
+  nested under the auto-exec lock).
 - Smoke: `.local/state/check_advisor.sh` (+ `advisor_smoke.py`) proves the fail-closed
   contract (veto→block, clean→allow, not-reviewed/missing/error→block). NOT registered
   as a workflow — the project is at the 10-workflow cap; run it via bash.
