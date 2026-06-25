@@ -44,6 +44,47 @@ those sibling vetoes**.
   stray value can only make the bot MORE conservative, never force a trade.
   **How to apply:** if you ever change toggle parsing, change all 5 in lockstep.
 
+## ATR-extension math & the mode-correct ATR (the "13 ATR" bug)
+- `atr_extension = abs(price - vwap) / ext_atr`. The math was always correct; the bug
+  was the **denominator timeframe**: it divided a SESSION-VWAP distance by the **1-minute**
+  volatility ATR, so SWING showed implausible readings (e.g. "13 ATR beyond VWAP").
+- `ext_atr` is chosen per mode: **SCALP keeps the 1m volatility ATR (== `unit`)**, so SCALP
+  scoring stays byte-identical. **SWING uses an HTF ATR (1H → 4H → Daily, in that priority)
+  from `swing_ctx`.**
+  **Why:** measuring a session-scale distance against a 1-minute ATR mixes timeframes and
+  inflates the ratio. The denominator must match the distance's timeframe.
+  **How to apply:** if SWING has **no** HTF ATR, set `ext_atr=None` and mark the extension
+  *unavailable* (raw atr/atr_extension = None, decision "HTF ATR unavailable"). NEVER fall
+  back to the 1m `unit` ATR in SWING — that silently reintroduces the mix. The fail-open then
+  flows through the neutral fraction, so a missing HTF ATR can't trip a false veto.
+- The raw timeframe label (`raw.atr_timeframe`) is surfaced on the dashboard precisely so a
+  timeframe mix can never again be invisible.
+
+## Hard-location cap (good room must NOT override a bad location)
+- After the weighted sum, a **DOWN-ONLY** cap forces `score = 69` when `score >= 70` AND a
+  hard trap is present (chasing / ATR-extension > 2 / impulse_pct >= 90 / at swing high|low).
+  `strong_reject` is the sub-70 "BAD LOCATION" tier (constant `ENTRY_QUALITY_STRONG_REJECT`).
+  **Why:** the weighted components can let a great room-to-target / cushion mask a clearly bad
+  entry (e.g. overextended + chasing summed ~77). The product requirement is that good room
+  can never buy back a bad *location*.
+  **How to apply:** the cap may only ever LOWER a score, never raise/force one; it sits below
+  the existing demote-only veto, so all veto/flag-gating invariants are unchanged. The TRAP
+  fixture in the smoke proves uncapped~77 → capped <70.
+
+## Display-only additions (raw / improvement plan / projection / plain-English)
+- `raw` (price/vwap/distance/atr/atr_timeframe/atr_extension/decision), `improvement_plan`,
+  `projected_low/high`, and `plain_english` are **display-only** and ride the existing
+  `result["entry_quality"]` (already `/status`-whitelisted, no new route).
+- `_projected(target)` only lifts the **waitable** components (`_improvable`) up to `target`;
+  a completed liquidity sweep is the one component that can't be waited into existence, so it
+  is excluded. Projection is clamped monotonic via `max(score, ...)` so it can never read
+  below the live score.
+  **How to apply:** keep `_improvable` keys in sync with `ENTRY_QUALITY_COMPONENTS` keys and
+  with whatever bullets the plan emits — if a plan bullet says "wait for X", X's component
+  should be in `_improvable` or the projected range won't reflect that advice.
+- The **neutral / no-candidate early return must include every new key** (raw={}, plan=[],
+  projected_*, plain_english, strong_reject) or the dashboard JS reads undefined.
+
 ## Testing
 - The strict-gate goldens snapshot the strict funcs ONLY (not `full_analysis`), so they
   stay byte-identical for this purely additive layer and do NOT cover the veto wiring.

@@ -857,6 +857,7 @@ def set_learning_gate(value):
 # is OFF until the operator arms it (the runtime toggle wins over the env seed and
 # RESETS on restart — fail-safe bias toward NOT interfering with live trading).
 ENTRY_QUALITY_MIN_SCORE     = 70     # below this = poor entry location (Reject band)
+ENTRY_QUALITY_STRONG_REJECT = 60     # below this = BAD location (display: "WAIT / BAD LOCATION")
 ENTRY_QUALITY_OVERRIDE_EDGE = 90     # Edge >= this = "extremely high confidence" → veto suppressed
 _ENTRY_QUALITY_GATE_OVERRIDE = None  # runtime dashboard toggle; None = follow env
 
@@ -11181,6 +11182,13 @@ def _entry_quality_neutral_block(reason="Entry Quality engine disabled.", direct
         "edge_score":       None,
         "summary":          reason,
         "why_not_trade":    "",
+        "strong_reject":    False,
+        "strong_reject_score": ENTRY_QUALITY_STRONG_REJECT,
+        "raw":              {},
+        "improvement_plan": [],
+        "projected_low":    None,
+        "projected_high":   None,
+        "plain_english":    reason,
         "final_verdict":    None,
     }
 
@@ -11203,6 +11211,24 @@ def compute_entry_quality(result, strict=None, swing_ctx=None):
     vol = result.get("volatility") or {}
     atr = vol.get("atr_pts")
     unit = atr if (isinstance(atr, (int, float)) and atr > 0) else (price * 0.0015)
+
+    # Mode-correct ATR for the EXTENSION metric ONLY (don't measure a session-VWAP
+    # distance in 1-minute ATRs for SWING). SCALP: the 1-minute volatility ATR
+    # (== unit, so SCALP scoring stays byte-identical). SWING: a higher-timeframe
+    # ATR (1H → 4H → Daily) from swing_ctx, NEVER the 1-minute ATR. If no HTF ATR is
+    # present in SWING we mark the extension UNAVAILABLE (ext_atr=None) and fail OPEN
+    # to the neutral fraction — mixing in the 1m ATR is forbidden, since that is the
+    # exact timeframe-mix that produced implausible "13 ATR" readings. The timeframe
+    # label is surfaced raw on the dashboard so it can never be silently mixed.
+    ext_atr, ext_tf = unit, "1m"
+    if TRADING_MODE == "SWING":
+        ext_atr, ext_tf = None, "HTF unavailable"
+        if isinstance(swing_ctx, dict):
+            for _ak, _alabel in (("atr_1h", "1H"), ("atr_4h", "4H"), ("atr_daily", "Daily")):
+                _av = swing_ctx.get(_ak)
+                if isinstance(_av, (int, float)) and _av > 0:
+                    ext_atr, ext_tf = float(_av), _alabel
+                    break
 
     resistance = result.get("nearest_supply")   # level ABOVE price
     support    = result.get("nearest_demand")   # level BELOW price
@@ -11258,18 +11284,33 @@ def compute_entry_quality(result, strict=None, swing_ctx=None):
         details["impulse_completed"] = "no leg"
 
     # 4) ATR extension from the mean (VWAP) — far beyond mean in trade dir = stretched.
+    #    Uses the MODE-CORRECT ATR (ext_atr / ext_tf): SCALP 1m, SWING 1H/4H/Daily.
     ext = None
-    if vwap and unit:
-        ext = ((price - vwap) if is_long else (vwap - price)) / unit
+    ext_decision = "VWAP unavailable"
+    if vwap and ext_atr:
+        ext = ((price - vwap) if is_long else (vwap - price)) / ext_atr
         if ext <= 0:
             fracs["atr_extension"] = 1.0   # at/below the mean (for a long) = not extended
-            details["atr_extension"] = "%.2f ATR from VWAP" % ext
+            details["atr_extension"] = "%.2f ATR from VWAP (%s)" % (ext, ext_tf)
+            ext_decision = "At/below VWAP — not extended"
         else:
             fracs["atr_extension"] = 1.0 - (_eq_lin(ext, 0.5, 3.0) or 0.0)
-            details["atr_extension"] = "%.2f ATR beyond VWAP" % ext
+            details["atr_extension"] = "%.2f ATR beyond VWAP (%s)" % (ext, ext_tf)
+            if ext <= 1.0:
+                ext_decision = "Near VWAP — healthy"
+            elif ext <= 2.0:
+                ext_decision = "Stretched from VWAP"
+            else:
+                ext_decision = "Overextended — chasing risk"
     else:
         fracs["atr_extension"] = _EQ_NEUTRAL_FRAC
-        details["atr_extension"] = "no VWAP"
+        if vwap and not ext_atr:
+            # VWAP exists but no mode-correct ATR (SWING without HTF ATR): withhold the
+            # extension rather than computing it from the wrong timeframe.
+            details["atr_extension"] = "HTF ATR unavailable (%s)" % ext_tf
+            ext_decision = "HTF ATR unavailable"
+        else:
+            details["atr_extension"] = "no VWAP"
 
     # 5) Pullback quality — entering on a controlled retrace (calmer side of VWAP,
     #    near the zone), not at full extension.
@@ -11387,10 +11428,24 @@ def compute_entry_quality(result, strict=None, swing_ctx=None):
             "score": round(pts, 1), "detail": details.get(key, ""),
         })
     score = int(round(max(0.0, min(100.0, total))))
+
+    # Good room-to-target must NEVER override a BAD location. When a HARD location
+    # trap is present (chasing / overextended / impulse nearly done / sitting on a
+    # swing extreme), the score can't sit in the Acceptable band on the strength of
+    # room or cushion alone — cap it just below the Reject line. Cap DOWN only: it can
+    # never raise a score, so it only makes the engine MORE conservative (safe for a
+    # demote-only veto). SCALP common path is unaffected (traps already score < 70).
+    hard_trap = bool(chasing
+                     or (ext is not None and ext > 2.0)
+                     or (impulse_pct is not None and impulse_pct >= 90)
+                     or near_high or near_low)
+    if hard_trap and score >= ENTRY_QUALITY_MIN_SCORE:
+        score = ENTRY_QUALITY_MIN_SCORE - 1
     grade = _eq_grade(score)
 
     edge_score = result.get("edge_score")
     reject = score < ENTRY_QUALITY_MIN_SCORE
+    strong_reject = score < ENTRY_QUALITY_STRONG_REJECT
     override_applied = bool(reject and isinstance(edge_score, (int, float))
                            and edge_score >= ENTRY_QUALITY_OVERRIDE_EDGE)
     veto_would_fire = bool(reject and not override_applied)
@@ -11413,6 +11468,87 @@ def compute_entry_quality(result, strict=None, swing_ctx=None):
         "impulse_pct":      impulse_pct,
     }
 
+    # ── Entry Improvement Plan — what the trader can WAIT for, plus the score those
+    #    fixes would project to. The "improvable" components are the location traps a
+    #    pullback / fresh confirmation can clear (a deeper pullback simultaneously eases
+    #    extension, tightens cushion AND opens room-to-target, so room_to_resistance is
+    #    improvable too). A COMPLETED liquidity sweep is the only component that can't be
+    #    waited into existence, so it is excluded from both the plan and the projection.
+    _improvable = ("impulse_completed", "atr_extension", "pullback_quality",
+                   "cushion_at_support", "momentum", "room_to_resistance", "not_chasing",
+                   "not_near_swing_high" if is_long else "not_near_swing_low")
+    improvement_plan = []
+    if near_high or near_low:
+        improvement_plan.append("Avoid entering at the swing %s — wait for a break-and-retest"
+                                % ("high" if is_long else "low"))
+    if chasing:
+        improvement_plan.append("Stop chasing — let price come back to value before entry")
+    if ext is not None and ext > 1.0:
+        improvement_plan.append("Wait for price to pull back within 1.0 ATR of VWAP")
+    if impulse_pct is not None and impulse_pct >= 60:
+        improvement_plan.append("Wait for a 38–50% pullback of the current impulse")
+    if (fracs.get("cushion_at_support") or 0.0) < 0.6:
+        improvement_plan.append("Wait for a fresh %s retest (tighter risk)"
+                                % ("demand/support" if is_long else "supply/resistance"))
+    if (fracs.get("pullback_quality") or 0.0) < 0.6:
+        improvement_plan.append("Wait for a controlled pullback toward the zone (calmer side of VWAP)")
+    if (fracs.get("momentum") or 0.0) < 0.6:
+        improvement_plan.append("Wait for %s CVD or a volume spike to confirm"
+                                % ("bullish" if is_long else "bearish"))
+    if (fracs.get("room_to_resistance") or 0.0) < 0.5:
+        improvement_plan.append("Limited room to target — wait for a deeper pullback to improve R:R")
+
+    def _projected(target):
+        tot = 0.0
+        for _k, _l, _w in ENTRY_QUALITY_COMPONENTS:
+            _f = fracs.get(_k)
+            if _f is None:
+                _f = _EQ_NEUTRAL_FRAC
+            if _k in _improvable and _f < target:
+                _f = target
+            tot += _w * _f
+        return int(round(max(0.0, min(100.0, tot))))
+
+    projected_low  = max(score, _projected(0.80))
+    projected_high = max(projected_low, _projected(1.0))
+
+    raw = {
+        "price":            round(price, 2) if isinstance(price, (int, float)) else None,
+        "vwap":             round(vwap, 2) if isinstance(vwap, (int, float)) else None,
+        "distance_from_vwap": (round(price - vwap, 2)
+                               if (isinstance(price, (int, float)) and isinstance(vwap, (int, float)))
+                               else None),
+        "atr":              round(ext_atr, 4) if isinstance(ext_atr, (int, float)) else None,
+        "atr_timeframe":    ext_tf,
+        "atr_extension":    (round(abs(price - vwap) / ext_atr, 2) if (vwap and ext_atr) else None),
+        "atr_extension_signed": (round(ext, 2) if ext is not None else None),
+        "atr_extension_decision": ext_decision,
+    }
+
+    # Plain-English explanation: direction can be right while the LOCATION is wrong.
+    if reject:
+        _bits = []
+        if impulse_pct is not None and impulse_pct >= 80:
+            _bits.append("the impulse leg is nearly complete")
+        if ext is not None and ext > 2.0:
+            _bits.append("price is overextended from VWAP")
+        elif ext is not None and ext > 1.0:
+            _bits.append("price is stretched from VWAP")
+        if chasing:
+            _bits.append("the entry would be chasing the move")
+        if near_high or near_low:
+            _bits.append("price is sitting at a swing %s" % ("high" if is_long else "low"))
+        _cause = (" " + "; ".join(_bits) + ".") if _bits else ""
+        _lead = ("Bad entry location — do not chase." if strong_reject
+                 else "The trade idea may be directionally correct, but the entry LOCATION is poor.")
+        plain_english = _lead + _cause + " Wait for a pullback or fresh confirmation before entering."
+        if override_applied:
+            plain_english += (" (Edge %s ≥ %d overrides the location veto.)"
+                              % (edge_score, ENTRY_QUALITY_OVERRIDE_EDGE))
+    else:
+        plain_english = ("Entry location is acceptable (%s) — direction and timing line up and no "
+                         "major location traps are present." % (grade or "OK"))
+
     return {
         "engine_enabled":   _entry_quality_engine_enabled(),
         "gate_enabled":     _entry_quality_gate_enabled(),
@@ -11430,6 +11566,13 @@ def compute_entry_quality(result, strict=None, swing_ctx=None):
         "edge_score":       edge_score,
         "summary":          "Entry Quality %d/100 (%s) — %s" % (score, grade, direction),
         "why_not_trade":    why,
+        "strong_reject":    strong_reject,
+        "strong_reject_score": ENTRY_QUALITY_STRONG_REJECT,
+        "raw":              raw,
+        "improvement_plan": improvement_plan,
+        "projected_low":    projected_low,
+        "projected_high":   projected_high,
+        "plain_english":    plain_english,
         "final_verdict":    None,
     }
 
@@ -20394,6 +20537,13 @@ def dashboard():
   .mode-btn{flex:1;text-align:center;font-size:12px;font-weight:700;padding:9px 6px;border-radius:2px;color:var(--muted);cursor:pointer;transition:all .15s;letter-spacing:.5px;text-transform:uppercase}
   #mode-scalp.active{background:var(--amber-deep);color:var(--amber);box-shadow:inset 0 0 0 1px var(--amber)}
   #mode-swing.active{background:var(--cyan-deep);color:var(--cyan);box-shadow:inset 0 0 0 1px #2a5560}
+  /* Entry Quality — raw math + improvement plan */
+  .eqx-raw{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:11.5px;margin:4px 0 2px}
+  .eqx-raw .k{color:#9aa;white-space:nowrap}
+  .eqx-raw .v{text-align:right;font-variant-numeric:tabular-nums;color:#e8e8f0}
+  .eqx-plan-item{display:flex;gap:6px;font-size:11.5px;color:#cdd3e0;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+  .eqx-plan-item:last-child{border-bottom:none}
+  .eqx-plan-empty{font-size:11px;color:#6b7280;font-style:italic}
   /* Equity curve (today) */
   .eq-top{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
   .eq-chart{width:100%;height:120px;display:block;background:var(--inset);border:1px solid var(--border);border-radius:2px}
@@ -20781,14 +20931,22 @@ def dashboard():
     <span style="font-size:11px;color:#9aa">Location score — separate from the Edge gate</span>
     <span id="eq-gate-toggle" role="button" tabindex="0" onclick="toggleEntryGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEntryGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Veto: off</span>
   </div>
-  <div style="display:flex;align-items:baseline;gap:10px;margin:2px 0 6px">
+  <div style="display:flex;align-items:baseline;gap:10px;margin:2px 0 6px;flex-wrap:wrap">
     <div id="eq-score" style="font-size:28px;font-weight:800">—</div>
     <div id="eq-grade" style="font-size:14px;font-weight:700">—</div>
     <div id="eq-dir" style="font-size:12px;color:#9aa"></div>
+    <div id="eq-verdict" style="font-size:11px;font-weight:800;letter-spacing:.5px;margin-left:auto"></div>
   </div>
   <div id="eq-bars"></div>
+  <div class="se-bias-h">Entry Math (raw)</div>
+  <div id="eq-raw" class="eqx-raw"></div>
   <div class="se-bias-h">Location Flags</div>
   <div id="eq-flags" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+  <div class="se-bias-h">What This Means</div>
+  <div class="se-reason" id="eq-plain">—</div>
+  <div class="se-bias-h">Entry Improvement Plan</div>
+  <div id="eq-plan"></div>
+  <div id="eq-proj" style="font-size:11px;color:#9aa;margin-top:6px"></div>
   <div class="se-bias-h">Assessment</div>
   <div class="se-reason" id="eq-why">—</div>
   <div id="eq-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
@@ -22426,6 +22584,47 @@ function renderEntryQuality(d){
     if(flags.sweep_complete===true) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#22c55e;background:rgba(34,197,94,.12)">✓ Sweep Done</span>');
     if(flags.impulse_pct!=null) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#9aa;background:rgba(148,163,184,.12)">Impulse '+flags.impulse_pct+'%</span>');
     fl.innerHTML=chips.join('');
+  }
+  // Entry verdict pill (display tiering): BAD (<60) / POOR (<70) / OK (>=70).
+  const verd=document.getElementById('eq-verdict');
+  if(verd){
+    if(score==null || !eq.available){ verd.textContent=''; }
+    else if(eq.strong_reject){ verd.textContent='WAIT · BAD LOCATION'; verd.style.color='#ef4444'; }
+    else if(eq.reject){ verd.textContent=eq.override_applied?'POOR · EDGE OVERRIDE':'CAUTION · POOR LOCATION'; verd.style.color='#f59e0b'; }
+    else { verd.textContent='OK LOCATION'; verd.style.color='#22c55e'; }
+  }
+  // Raw entry math (price / VWAP / distance / ATR + timeframe / extension / decision).
+  const rawEl=document.getElementById('eq-raw');
+  if(rawEl){
+    const r=eq.raw||{};
+    const rows=[
+      ['Price', (r.price==null?'—':r.price)],
+      ['VWAP', (r.vwap==null?'—':r.vwap)],
+      ['Distance from VWAP', (r.distance_from_vwap==null?'—':(r.distance_from_vwap+' pts'))],
+      ['ATR ('+(r.atr_timeframe||'?')+')', (r.atr==null?'—':(r.atr+' pts'))],
+      ['ATR Extension', (r.atr_extension==null?'—':(r.atr_extension+' ATR'))],
+      ['Decision', (r.atr_extension_decision||'—')]
+    ];
+    rawEl.innerHTML=rows.map(function(p){
+      return '<div class="k">'+_eqEsc(p[0])+'</div><div class="v">'+_eqEsc(p[1])+'</div>';
+    }).join('');
+  }
+  // Plain-English explanation.
+  _set('eq-plain', eq.plain_english||'—');
+  // Entry improvement plan + projected score.
+  const planEl=document.getElementById('eq-plan');
+  const plan=eq.improvement_plan||[];
+  if(planEl){
+    planEl.innerHTML=plan.length
+      ? plan.map(function(s){ return '<div class="eqx-plan-item"><span>→</span><span>'+_eqEsc(s)+'</span></div>'; }).join('')
+      : '<div class="eqx-plan-empty">No blocking conditions — entry location is clear.</div>';
+  }
+  const projEl=document.getElementById('eq-proj');
+  if(projEl){
+    if(plan.length && eq.projected_high!=null){
+      const lo=(eq.projected_low!=null?eq.projected_low:eq.projected_high);
+      projEl.textContent='Projected score if these conditions improve: '+lo+'–'+eq.projected_high+'/100';
+    } else { projEl.textContent=''; }
   }
   let assess=eq.why_not_trade||'';
   if(!assess){
