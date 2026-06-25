@@ -70,3 +70,23 @@ strict path.
 - `LAST_ALERT_AT` is dashboard-liveness only (not a gate/sizing/exec input); it is hoisted
   into `/webhook`'s top-level `global` so both the short-circuit and the normal path can
   assign it without a "assigned before global declaration" SyntaxError.
+
+## Pro-analyst display blocks (market_phase / analyst_outlook / entry_probability)
+- `result["analyst"]` now carries three extra DISPLAY-ONLY blocks plus `game_plan.next_opportunity`:
+  `market_phase` (8 phases in `_ANALYST_PHASES` + confidence + reasons + signals),
+  `analyst_outlook` (intent/control/liquidity/next-entry/invalidation/continuation-vs-reversal
+  + multi-line `wait_reasoning`), and `entry_probability` (current EQ score + projected scenarios).
+  Each has a `*_neutral()` twin and is mirrored into `_analyst_neutral_block`; new keys must be
+  added to BOTH twins or the single-return-path / hard-indexed-consumer 500 invariant breaks.
+- `entry_probability` is a NEUTRAL placeholder inside `compute_analyst_reasoning`'s return and is
+  OVERWRITTEN post-hoc in `full_analysis` (right after the memory_review overwrite) because it
+  CONSUMES `result["entry_quality"]`, which is computed AFTER the analyst runs. It only reads that
+  block (improvements/projected_high/better_entry_zone) — never recomputes EQ.
+- **Mode-correct ATR wiring gotcha (regressed once):** the Market-Phase VWAP-extension signal
+  needs the right ATR per mode, sourced via the single helper `_analyst_phase_atr(mode, swing_ctx, vol)`:
+  SCALP = `vol["atr_pts"]` (1m), SWING = `swing_ctx` HTF ATR `atr_1h`→`atr_4h`→`atr_daily`
+  (NOT `atr`/`atr_pts`/`htf_atr` — those keys don't exist in `compute_swing_context`'s schema, so
+  reading them silently disabled the extension on every real SWING run). Helper is pure/fail-open,
+  returns a positive float or None (extension "unavailable", never the wrong-TF ATR). Guarded by
+  `analyst_pro_smoke.py` section 6; whole feature guarded by `check_analyst_pro.sh` (not a workflow —
+  workflow slots are full at 11/10 — run it directly like the other check scripts).

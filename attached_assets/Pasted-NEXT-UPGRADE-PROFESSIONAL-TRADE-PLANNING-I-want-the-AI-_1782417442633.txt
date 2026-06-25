@@ -1,0 +1,153 @@
+NEXT UPGRADE – PROFESSIONAL TRADE PLANNING
+
+I want the AI Trading Partner to behave like a professional institutional analyst, not just a rule-based strategy checker. The AI should continuously analyze the market, think ahead, and explain what it is waiting for before taking a trade.
+
+1. MARKET PHASE ANALYSIS
+
+Add a "Market Phase" section that continuously classifies the current market.
+
+Possible phases:
+- Trend Beginning
+- Trend Developing
+- Trend Mature
+- Trend Exhausted
+- Pullback
+- Consolidation
+- Breakout
+- Reversal Watch
+
+Display the current phase along with a confidence percentage.
+
+Example:
+
+Market Phase: Trend Exhausted (94%)
+
+Reason:
+- Impulse leg is nearly complete.
+- Price is significantly extended from VWAP.
+- Selling now would likely be chasing the move.
+- Risk-to-reward is poor until price retraces.
+
+The Market Phase should update continuously as new data arrives.
+
+------------------------------------------------------------
+
+2. BETTER ENTRY PROBABILITY
+
+Instead of only displaying the current Entry Quality score, estimate how much the trade quality would improve if the market changes.
+
+Example:
+
+Current Entry Quality:
+33%
+
+After Pullback to VWAP:
+82%
+
+At Fresh Supply Zone:
+91%
+
+After Bearish Rejection:
+95%
+
+This tells the trader why waiting may produce a significantly better trade.
+
+------------------------------------------------------------
+
+3. NEXT OPPORTUNITY PANEL
+
+When a trade is rejected, do not stop the analysis.
+
+Instead, immediately begin planning the next high-probability setup.
+
+Display:
+
+NEXT OPPORTUNITY
+
+Current Market Bias:
+Bullish / Bearish / Neutral
+
+Waiting For:
+- Pullback to VWAP
+- Rejection Candle
+- CVD Confirmation
+- Delta Confirmation
+- Fresh Supply/Demand Zone
+- Structure Confirmation
+- Volume Confirmation
+
+Estimated Entry Price
+
+Suggested Stop Loss
+
+Suggested Take Profit
+
+Projected Risk/Reward
+
+Projected Confidence
+
+Estimated Time Until Setup (if possible)
+
+This section should update continuously until a READY signal is produced.
+
+------------------------------------------------------------
+
+4. PROFESSIONAL WAIT REASONING
+
+Whenever the verdict is WAIT, explain the decision like a professional trader.
+
+Instead of generic messages, explain exactly why.
+
+Example:
+
+Reason for WAIT:
+
+Current price is overextended.
+
+The impulse leg is nearly complete.
+
+Entering now would mean chasing momentum.
+
+Professional traders typically wait for a pullback before entering.
+
+Waiting improves the probability while reducing risk.
+
+------------------------------------------------------------
+
+5. PROFESSIONAL ANALYST OUTLOOK
+
+Add a completely new analysis section.
+
+Professional Analyst Outlook
+
+Answer questions such as:
+
+- What is the market trying to accomplish?
+- Who currently controls the market?
+- Where is liquidity likely sitting?
+- Where is the next high-probability entry?
+- What would invalidate the current trade idea?
+- What would immediately increase confidence?
+- What would immediately cancel the setup?
+- Is the AI expecting continuation or reversal?
+
+This should read like a market analyst giving a live briefing.
+
+------------------------------------------------------------
+
+6. THINK AHEAD INSTEAD OF REACTING
+
+The AI should no longer simply evaluate alerts.
+
+It should continuously build a forward-looking market thesis.
+
+Even when there is no trade, the AI should always explain:
+
+- What it is waiting for.
+- Why it is waiting.
+- What conditions must occur before issuing READY.
+- Where the next ideal entry is likely to occur.
+- Whether patience is expected to improve the trade.
+- Whether buyers or sellers are currently gaining or losing control.
+
+The goal is to make the AI feel like an experienced trading partner who is always thinking several steps ahead instead of only reacting when an alert triggers.

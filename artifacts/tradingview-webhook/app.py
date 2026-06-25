@@ -9866,6 +9866,9 @@ def _analyst_game_plan_neutral():
         "risk_reward_forecast":   {"reward": "—", "risk": "—", "expected_r": "—",
                                    "p_tp1": 0, "p_tp2": 0},
         "ai_conclusion":          "Standing aside — no clear edge right now.",
+        "next_opportunity":       {"bias": "—", "waiting_for": [], "estimated_entry": "—",
+                                   "stop": "—", "target": "—", "projected_rr": "—",
+                                   "projected_confidence": 0, "time_until_setup": "—"},
     }
 
 
@@ -10139,6 +10142,46 @@ def _analyst_game_plan(ctx):
             conclusion = ("The %s thesis is building but unconfirmed; waiting for the trigger is a "
                           "higher-probability approach than anticipating it." % stronger.lower())
 
+        # ── (10) Next opportunity (forward plan — populated even on WAIT) ─────
+        if   stronger == "Long":  no_bias = "Long — buyers leaning"
+        elif stronger == "Short": no_bias = "Short — sellers leaning"
+        else:                     no_bias = "Neutral — no edge yet"
+        no_wait = []
+        if chasing:
+            no_wait.append("Pullback to VWAP")
+        no_wait.extend(what_next[:4])
+        if not no_wait:
+            no_wait = ["A clear directional trigger"]
+        # Forward entry zone: the actual plan entry when actionable, else the trade-side
+        # value the next high-probability entry would form at (demand / supply / VWAP).
+        if actionable and _entry is not None:
+            _no_e = _entry
+        elif stronger == "Long":
+            _no_e = _pf(dem) if dem is not None else _pf(vwap)
+        elif stronger == "Short":
+            _no_e = _pf(sup) if sup is not None else _pf(vwap)
+        else:
+            _no_e = _pf(vwap)
+        if _no_e is None:
+            _no_e = _entry
+        if (_no_e is not None and _stopf is not None and _t1 is not None
+                and abs(_no_e - _stopf) > 0):
+            no_rr = "1:%.1f" % (abs(_t1 - _no_e) / abs(_no_e - _stopf))
+        elif rr is not None:
+            no_rr = "1:%.1f" % float(rr)
+        else:
+            no_rr = "—"
+        next_opportunity = {
+            "bias":                 no_bias,
+            "waiting_for":          no_wait[:5],
+            "estimated_entry":      _f(_no_e) if _no_e is not None else "—",
+            "stop":                 _f(_stopf) if _stopf is not None else "—",
+            "target":               _f(_t1) if _t1 is not None else "—",
+            "projected_rr":         no_rr,
+            "projected_confidence": int(move_conf),
+            "time_until_setup":     horizon.get("setup", "—"),
+        }
+
         return {
             "thesis":                 thesis,
             "prob_long":              prob_long,
@@ -10153,9 +10196,377 @@ def _analyst_game_plan(ctx):
             "time_horizon":           horizon,
             "risk_reward_forecast":   rrf,
             "ai_conclusion":          conclusion,
+            "next_opportunity":       next_opportunity,
         }
     except Exception:
         return _analyst_game_plan_neutral()
+
+
+# ── Professional analyst upgrades (DISPLAY-ONLY) ──────────────────────────────
+# Three pure, FAIL-OPEN helpers that make the Analyst reason like an institutional
+# desk: a Market-Phase classifier, a forward Entry-Probability projection and a
+# professional Analyst Outlook (intent / control / liquidity / next-entry /
+# invalidation / continuation-vs-reversal + multi-line WAIT reasoning). Each has a
+# fully-populated neutral block (the schema contract) and a try/except wrapper that
+# degrades to it. They NEVER touch the gate, scoring, sizing, dedupe or execution,
+# so the strict-gate goldens are completely unaffected.
+
+_ANALYST_PHASES = ("Trend Beginning", "Trend Developing", "Trend Mature",
+                   "Trend Exhausted", "Pullback", "Consolidation", "Breakout",
+                   "Reversal Watch")
+
+
+def _analyst_phase_atr(mode, swing_ctx, vol):
+    """MODE-CORRECT ATR for the analyst VWAP-extension reading. SCALP uses the 1m
+    volatility ATR (vol.atr_pts); SWING uses the HTF ATR from compute_swing_context
+    (atr_1h -> atr_4h -> atr_daily, nearest-TF first). Returns a positive float, or
+    None when no usable ATR exists (extension is then marked unavailable, never the
+    wrong-timeframe ATR). Pure + FAIL-OPEN — display-only."""
+    try:
+        if mode == "SWING":
+            sc = swing_ctx if isinstance(swing_ctx, dict) else {}
+            raw = sc.get("atr_1h") or sc.get("atr_4h") or sc.get("atr_daily")
+        else:
+            raw = vol.get("atr_pts") if isinstance(vol, dict) else None
+        val = float(raw) if raw is not None else None
+        return val if (val is not None and val > 0) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _analyst_market_phase_neutral():
+    """Stable Market-Phase schema (fail-open default)."""
+    return {
+        "phase":      "Consolidation",
+        "confidence": 0,
+        "reasons":    [],
+        "signals":    {"structure": "—", "vwap_extension_atr": None,
+                       "impulse_pct": None, "volume": "—", "cvd": "—",
+                       "volatility": "—"},
+    }
+
+
+def _analyst_market_phase(ctx):
+    """Classify the current market phase (one of _ANALYST_PHASES) the way a pro reads
+    the tape, from the already-computed analyst locals. Pure + FAIL-OPEN."""
+    try:
+        s        = ctx.get("stronger") or "Neither"
+        conflict = bool(ctx.get("conflict"))
+        total    = int(ctx.get("total") or 0)
+        margin   = int(ctx.get("margin") or 0)
+        cs       = ctx.get("conf_side") if isinstance(ctx.get("conf_side"), dict) else {}
+        bos      = bool(cs.get("bos"))
+        choch    = bool(cs.get("choch"))
+        sweep    = bool(cs.get("liquidity_sweep"))
+        vol_ok   = bool(cs.get("volume_confirmed"))
+        cvd_ok   = bool(cs.get("cvd_confirmed"))
+        vwap_ok  = bool(cs.get("vwap"))
+        chasing  = bool(ctx.get("chasing"))
+        into_res = bool(ctx.get("into_resistance"))
+        ext      = ctx.get("vwap_ext_atr")
+        try:
+            ext = float(ext) if ext is not None else None
+        except (TypeError, ValueError):
+            ext = None
+        near     = ctx.get("near") if callable(ctx.get("near")) else (lambda a, b, pct=0.0015: False)
+        vol_lbl  = str(ctx.get("vol_label") or "—")
+
+        def _num(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+        pn  = _num(ctx.get("price"))
+        dem = _num(ctx.get("dem"))
+        sup = _num(ctx.get("sup"))
+
+        if   choch and bos: struct_txt = "CHOCH + BOS"
+        elif choch:         struct_txt = "CHOCH (change of character)"
+        elif bos:           struct_txt = "BOS (break of structure)"
+        else:               struct_txt = "No fresh break"
+
+        impulse_pct = None
+        if ext is not None:
+            impulse_pct = int(max(0, min(100, round(ext / 2.0 * 100))))
+
+        reasons = []
+        # ── classify (priority order — first match wins) ─────────────────────
+        if s == "Neither" or total <= 0:
+            phase = "Consolidation"
+            reasons.append("No side has the stronger argument — price is rotating.")
+        elif conflict or margin < 1:
+            phase = "Consolidation"
+            reasons.append("Bullish and bearish evidence are balanced — range conditions.")
+        elif sweep and choch:
+            phase = "Reversal Watch"
+            reasons.append("Liquidity sweep + change of character — possible reversal.")
+        elif chasing or (ext is not None and ext >= 2.0) or (bos and not cvd_ok and ext is not None and ext >= 1.5):
+            phase = "Trend Exhausted"
+            if chasing:
+                reasons.append("Price is over-extended from value (chasing risk).")
+            if ext is not None and ext >= 2.0:
+                reasons.append("Price is %.1f ATR from VWAP — stretched." % ext)
+            if bos and not cvd_ok:
+                reasons.append("Momentum (CVD) is no longer confirming the push.")
+        elif bos and vol_ok and (ext is None or ext < 1.0) and (
+                (s == "Long" and near(pn, sup)) or (s == "Short" and near(pn, dem))):
+            phase = "Breakout"
+            reasons.append("Break of structure on confirming volume at the level — breakout in progress.")
+        elif s != "Neither" and pn is not None and ((s == "Long" and dem is not None and pn <= (dem + (sup - dem) * 0.5 if sup is not None else pn + 1))
+                                                     or (s == "Short" and sup is not None and pn >= (sup - (sup - dem) * 0.5 if dem is not None else pn - 1))) and not chasing:
+            phase = "Pullback"
+            reasons.append("Trend is %s but price is pulling back toward value." % s.lower())
+        elif (bos or choch) and (ext is None or ext < 0.5):
+            phase = "Trend Beginning"
+            reasons.append("Fresh structure break with little extension — early trend.")
+        elif ext is not None and ext >= 1.0:
+            phase = "Trend Mature"
+            reasons.append("Trend established and extended ~%.1f ATR from value." % ext)
+        elif bos and (cvd_ok or vwap_ok):
+            phase = "Trend Developing"
+            reasons.append("Structure break with momentum / VWAP agreement — trend developing.")
+        else:
+            phase = "Trend Developing"
+            reasons.append("A directional lean is building.")
+
+        if vol_ok:   reasons.append("Volume is confirming.")
+        if cvd_ok:   reasons.append("Delta / CVD agrees with the move.")
+        if into_res: reasons.append("Price is pushing into the opposing zone.")
+
+        confidence = 45
+        confidence += min(20, margin * 4)
+        if bos:      confidence += 6
+        if choch:    confidence += 6
+        if vol_ok:   confidence += 6
+        if cvd_ok:   confidence += 6
+        if sweep:    confidence += 4
+        if conflict: confidence -= 15
+        if ext is None: confidence -= 8
+        confidence = int(max(30, min(90, confidence)))
+
+        return {
+            "phase":      phase,
+            "confidence": confidence,
+            "reasons":    reasons[:6],
+            "signals":    {
+                "structure":          struct_txt,
+                "vwap_extension_atr": (round(ext, 2) if ext is not None else None),
+                "impulse_pct":        impulse_pct,
+                "volume":             ("Confirming" if vol_ok else "Not confirming"),
+                "cvd":                ("Agrees" if cvd_ok else "Neutral / against"),
+                "volatility":         vol_lbl,
+            },
+        }
+    except Exception:
+        return _analyst_market_phase_neutral()
+
+
+def _analyst_outlook_neutral():
+    """Stable professional Analyst-Outlook schema (fail-open default)."""
+    return {
+        "market_intent":               "Awaiting a clear directional intent.",
+        "control":                     "Balanced — neither side in control.",
+        "liquidity":                   "—",
+        "next_high_probability_entry": "—",
+        "invalidates":                 "—",
+        "increases_confidence":        "—",
+        "cancels_setup":               "—",
+        "continuation_vs_reversal":    "Undecided",
+        "wait_reasoning":              [],
+    }
+
+
+def _analyst_outlook(ctx):
+    """A professional desk briefing over the assembled analyst locals: intent,
+    control, liquidity, next high-probability entry, invalidation, what increases
+    confidence, what cancels the setup, continuation-vs-reversal and a multi-line
+    WAIT rationale. Populated CONTINUOUSLY (even on WAIT). Pure + FAIL-OPEN."""
+    try:
+        s         = ctx.get("stronger") or "Neither"
+        final     = ctx.get("final") or "NO TRADE"
+        conflict  = bool(ctx.get("conflict"))
+        chasing   = bool(ctx.get("chasing"))
+        into_res  = bool(ctx.get("into_resistance"))
+        phase     = (ctx.get("phase") or {}).get("phase") or "Consolidation"
+        what_next = list(ctx.get("what_needs_next") or [])
+        dem       = ctx.get("dem")
+        sup       = ctx.get("sup")
+        vwap      = ctx.get("vwap")
+        sweep     = bool(ctx.get("sweep"))
+        invalidation = ctx.get("invalidation") or "—"
+        actionable = final.startswith("READY")
+        _f        = ctx.get("fmt") if callable(ctx.get("fmt")) else (lambda x: "—")
+
+        if   s == "Long":  control = "Buyers are in short-term control."
+        elif s == "Short": control = "Sellers are in short-term control."
+        else:              control = "Balanced — neither side in control."
+
+        if   s == "Long":  intent = "Buyers are working to take out liquidity above the highs and continue higher."
+        elif s == "Short": intent = "Sellers are working to take out liquidity below the lows and continue lower."
+        else:              intent = "The market is rotating to build liquidity before committing to a direction."
+        if phase == "Reversal Watch":
+            intent = "Price swept liquidity and may be reversing — the prior move looks exhausted."
+        elif phase == "Breakout":
+            intent = "Price is breaking structure and attempting to expand the range."
+        elif phase == "Trend Exhausted":
+            intent = "The current leg looks over-extended; the move is closer to its end than its start."
+
+        liq_bits = []
+        if s == "Long" and sup is not None:  liq_bits.append("resting liquidity above near " + _f(sup))
+        if s == "Short" and dem is not None: liq_bits.append("resting liquidity below near " + _f(dem))
+        if vwap is not None:                 liq_bits.append("value at VWAP " + _f(vwap))
+        if dem is not None:                  liq_bits.append("demand " + _f(dem))
+        if sup is not None:                  liq_bits.append("supply " + _f(sup))
+        liquidity = "; ".join(list(dict.fromkeys(liq_bits))) if liq_bits else "No clear liquidity pool nearby."
+
+        if actionable:
+            nhe = "Setup is valid now — the high-probability entry is live."
+        elif s == "Long":
+            nhe = "On a pullback into VWAP / demand" + ((" " + _f(dem)) if dem is not None else "") + " with a bullish rejection."
+        elif s == "Short":
+            nhe = "On a rally into VWAP / supply" + ((" " + _f(sup)) if sup is not None else "") + " with a bearish rejection."
+        else:
+            nhe = "After a sweep and a clear change of character picks a side."
+
+        if what_next:
+            increases = "Confirmation from " + ", ".join(what_next[:3]) + "."
+        elif actionable:
+            increases = "Follow-through that holds the entry with delta agreement."
+        else:
+            increases = "A clean structure shift with volume and CVD agreement."
+
+        if   s == "Long":  cancels = "A bearish CHOCH or losing demand / VWAP cancels the long."
+        elif s == "Short": cancels = "A bullish CHOCH or reclaiming supply / VWAP cancels the short."
+        else:              cancels = "Continued chop with no break of structure cancels any setup."
+
+        if phase == "Reversal Watch":
+            cvr = "Leaning reversal — watch for confirmation of the new direction."
+        elif phase == "Trend Exhausted":
+            cvr = "Continuation is tiring — reversal risk rising."
+        elif phase in ("Trend Beginning", "Trend Developing", "Trend Mature", "Breakout", "Pullback"):
+            cvr = "Continuation favored while structure holds."
+        else:
+            cvr = "Undecided — range until a side commits."
+
+        wait = []
+        if not actionable:
+            if s == "Neither" or conflict:
+                wait.append("Both sides are still fighting for control — there is no clean edge yet.")
+            if chasing:
+                wait.append("Price is over-extended from value; entering here is chasing, not trading.")
+            if phase == "Trend Exhausted":
+                wait.append("The current leg is late — the easy part of the move is likely gone.")
+            if into_res:
+                wait.append("An entry here would be straight into the opposing zone with little room.")
+            for w in what_next[:2]:
+                wait.append("Waiting for " + w + ".")
+            if not wait:
+                wait.append("A direction is leaning but the trigger has not fired — patience improves probability.")
+        else:
+            wait.append("No wait required — the setup is actionable now.")
+
+        return {
+            "market_intent":               intent,
+            "control":                     control,
+            "liquidity":                   liquidity,
+            "next_high_probability_entry": nhe.strip(),
+            "invalidates":                 invalidation,
+            "increases_confidence":        increases,
+            "cancels_setup":               cancels,
+            "continuation_vs_reversal":    cvr,
+            "wait_reasoning":              wait[:5],
+        }
+    except Exception:
+        return _analyst_outlook_neutral()
+
+
+def _analyst_entry_probability_neutral():
+    """Stable Entry-Probability schema (fail-open default)."""
+    return {
+        "available":   False,
+        "current":     None,
+        "scenarios":   [],
+        "explanation": "Entry-probability projection unavailable.",
+    }
+
+
+def _analyst_entry_probability(eq, analyst, result, mode):
+    """DISPLAY-ONLY forward entry-probability projection. CONSUMES the already-computed
+    Entry Quality block (eq) — it NEVER recomputes it — and reframes EQ's own current
+    score, improvement uplifts (each carries real `points`) and projected ceiling as
+    'what would this entry be worth under each scenario'. Anchored to real EQ numbers
+    (no fabricated probabilities). Pure + FAIL-OPEN; never touches the money path."""
+    try:
+        if not isinstance(eq, dict) or not eq.get("available") or eq.get("score") is None:
+            return _analyst_entry_probability_neutral()
+        score = int(round(float(eq.get("score"))))
+        grade = eq.get("grade") or eq.get("verdict_label") or "—"
+
+        def _lbl(text):
+            t = (text or "").lower()
+            if "vwap" in t:                                  return "After pullback to VWAP"
+            if "pullback" in t or "closer" in t:             return "After a pullback into value"
+            if "zone" in t or "demand" in t or "supply" in t: return "At a fresh trade-side zone"
+            if "impulse" in t or "complete" in t:            return "After the impulse completes"
+            if "sweep" in t or "reject" in t:                return "After a sweep / rejection"
+            if "momentum" in t or "cvd" in t or "delta" in t: return "After momentum (CVD) confirms"
+            if "volume" in t:                                return "After volume confirms"
+            return (text or "Improved entry")
+
+        scenarios = [{
+            "label":       "Current entry (now)",
+            "probability": max(0, min(100, score)),
+            "basis":       str(grade),
+            "conditions":  "Entering at the current price right now.",
+        }]
+        for imp in (eq.get("improvements") or [])[:4]:
+            try:
+                pts = int(round(float(imp.get("points") or 0)))
+            except (TypeError, ValueError):
+                pts = 0
+            if pts <= 0:
+                continue
+            scenarios.append({
+                "label":       _lbl(imp.get("text")),
+                "probability": max(score, min(95, score + pts)),
+                "basis":       "+%d pts vs entering now" % pts,
+                "conditions":  imp.get("text") or "",
+            })
+
+        _hi = eq.get("projected_high")
+        try:
+            _hi = int(round(float(_hi))) if _hi is not None else None
+        except (TypeError, ValueError):
+            _hi = None
+        best = max(sc["probability"] for sc in scenarios)
+        if _hi is not None and _hi > best:
+            scenarios.append({
+                "label":       "Best available entry (patient)",
+                "probability": min(95, _hi),
+                "basis":       "EQ projected ceiling",
+                "conditions":  "Wait for the highest-quality location to line up.",
+            })
+            best = min(95, _hi)
+
+        bz = eq.get("better_entry_zone")
+        if isinstance(bz, dict) and bz.get("low") is not None and bz.get("high") is not None:
+            zone_txt = " A better entry sits near %s-%s." % (bz.get("low"), bz.get("high"))
+        else:
+            zone_txt = ""
+        if len(scenarios) == 1:
+            explanation = ("Entering now scores %d/100 (%s). No higher-probability scenario "
+                           "is projected from here." % (score, grade))
+        else:
+            explanation = ("Entering now scores %d/100 (%s); patience improves the probability "
+                           "toward %d%% under better conditions.%s" % (score, grade, best, zone_txt))
+        return {
+            "available":   True,
+            "current":     max(0, min(100, score)),
+            "scenarios":   scenarios,
+            "explanation": explanation,
+        }
+    except Exception:
+        return _analyst_entry_probability_neutral()
 
 
 def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRADE"):
@@ -10197,6 +10608,9 @@ def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRA
         "agrees_with_gate":       False,
         "veto_would_fire":        False,
         "game_plan":              _analyst_game_plan_neutral(),
+        "market_phase":           _analyst_market_phase_neutral(),
+        "analyst_outlook":        _analyst_outlook_neutral(),
+        "entry_probability":      _analyst_entry_probability_neutral(),
         "memory_review":          build_analyst_memory_review(None),
     }
 
@@ -10523,6 +10937,34 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
 
     best_setup_forming = "None — flat" if stronger == "Neither" else f"{stronger}: {best_idea}"
 
+    # ── Professional analyst upgrades (DISPLAY-ONLY): mode-correct VWAP extension
+    #    (SCALP = 1m volatility ATR; SWING = HTF ATR from swing_ctx, else mark the
+    #    extension unavailable), the Market-Phase classifier and the Analyst Outlook.
+    #    All pure + fail-open; never feeds the gate / scoring / sizing / dedupe.
+    _phase_atr = _analyst_phase_atr(TRADING_MODE, swing_ctx, vol)
+    _vwap_ext_atr = None
+    try:
+        if _phase_atr and price is not None and vwap is not None:
+            _vwap_ext_atr = abs(float(price) - float(vwap)) / _phase_atr
+    except (TypeError, ValueError, ZeroDivisionError):
+        _vwap_ext_atr = None
+    _phase_block = _analyst_market_phase({
+        "stronger": stronger, "conflict": conflict,
+        "total": bull_score + bear_score, "top": top, "margin": margin,
+        "conf_side": conf_side, "chasing": chasing, "into_resistance": into_resistance,
+        "vwap_ext_atr": _vwap_ext_atr, "price": price, "vwap": vwap,
+        "dem": dem, "sup": sup, "near": _near, "regime": regime,
+        "vol_label": (vol.get("label") if isinstance(vol, dict) else None),
+    })
+    _outlook_block = _analyst_outlook({
+        "stronger": stronger, "final": final, "conflict": conflict,
+        "chasing": chasing, "into_resistance": into_resistance,
+        "phase": _phase_block, "what_needs_next": what_needs_next,
+        "price": price, "vwap": vwap, "dem": dem, "sup": sup,
+        "sweep": bool(conf_side.get("liquidity_sweep")),
+        "invalidation": invalidation, "fmt": _f,
+    })
+
     return {
         "engine_enabled":         _analyst_engine_enabled(),
         "gate_enabled":           _analyst_gate_enabled(),
@@ -10565,6 +11007,11 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
             "reason_for_waiting": reason_for_waiting, "what_needs_next": what_needs_next,
             "fmt": _f,
         }),
+        "market_phase":           _phase_block,
+        "analyst_outlook":        _outlook_block,
+        # Placeholder; full_analysis overwrites this (after entry_quality is computed)
+        # with the real Entry-Quality-anchored forward projection.
+        "entry_probability":      _analyst_entry_probability_neutral(),
         # Placeholder; full_analysis overwrites this with the SHARED memory review.
         "memory_review":          build_analyst_memory_review(None),
     }
@@ -12914,6 +13361,16 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     try:
         if isinstance(result.get("analyst"), dict):
             result["analyst"]["memory_review"] = build_analyst_memory_review(_memory_ctx)
+    except Exception:
+        pass
+    # Entry Probability is a FORWARD projection over the Entry Quality block, which is
+    # computed AFTER the analyst (ordering), so it is attached post-hoc here — exactly
+    # like the shared memory review above. DISPLAY-ONLY + fail-open; the guard means the
+    # market-closed / no-analyst branches keep the neutral placeholder.
+    try:
+        if isinstance(result.get("analyst"), dict):
+            result["analyst"]["entry_probability"] = _analyst_entry_probability(
+                result.get("entry_quality"), result["analyst"], result, TRADING_MODE)
     except Exception:
         pass
 
@@ -21325,6 +21782,40 @@ def dashboard():
   <div class="se-bias-h">Current Market Story</div>
   <div class="se-reason" id="an-story">—</div>
 
+  <!-- ── Market Phase (DISPLAY-ONLY; a.market_phase) ── -->
+  <div class="se-bias-h" style="color:#7aa2ff;margin-top:10px">Market Phase <span id="mp-conf" style="font-size:10px;color:#6b7280"></span></div>
+  <div class="se-reason" id="mp-phase" style="font-weight:600">—</div>
+  <ul id="mp-reasons" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px">
+    <div class="gstat"><div class="l">Structure</div><div class="v" id="mp-struct" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">VWAP Ext (ATR)</div><div class="v" id="mp-vext" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Volume</div><div class="v" id="mp-vol" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">CVD</div><div class="v" id="mp-cvd" style="font-size:12px">—</div></div>
+  </div>
+
+  <!-- ── Professional Analyst Outlook (DISPLAY-ONLY; a.analyst_outlook) ── -->
+  <div class="se-bias-h" style="color:#7aa2ff;margin-top:10px">Professional Analyst Outlook</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div class="gstat"><div class="l">Market Intent</div><div class="v" id="ao-intent" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Who's in Control</div><div class="v" id="ao-control" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Liquidity</div><div class="v" id="ao-liq" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Continuation vs Reversal</div><div class="v" id="ao-cvr" style="font-size:12px">—</div></div>
+  </div>
+  <div class="se-bias-h">Next High-Probability Entry</div>
+  <div class="se-reason" id="ao-nhe">—</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px">
+    <div class="gstat"><div class="l">Invalidates If</div><div class="v" id="ao-inval" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Confidence Rises If</div><div class="v" id="ao-incr" style="font-size:12px">—</div></div>
+  </div>
+  <div class="gstat" style="margin-top:6px"><div class="l">Cancels Setup</div><div class="v" id="ao-cancel" style="font-size:12px">—</div></div>
+  <div class="se-bias-h">Why Wait</div>
+  <ul id="ao-wait" style="margin:4px 0;padding-left:16px"></ul>
+
+  <!-- ── Entry Probability (DISPLAY-ONLY; a.entry_probability) ── -->
+  <div class="se-bias-h" style="color:#7aa2ff;margin-top:10px">Entry Probability <span id="ep-current" style="font-size:10px;color:#6b7280"></span></div>
+  <ul id="ep-scen" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-reason" id="ep-explain" style="font-style:italic">—</div>
+
   <!-- ── Professional Trade Plan (DISPLAY-ONLY pro-analyst layer; a.game_plan) ── -->
   <div class="se-bias-h" style="color:#7aa2ff;margin-top:10px">Professional Trade Plan</div>
   <div class="se-reason" id="gp-thesis">—</div>
@@ -21372,6 +21863,21 @@ def dashboard():
   </div>
   <div class="se-bias-h" style="color:#f59e0b">AI Conclusion</div>
   <div class="se-reason" id="gp-conclusion" style="font-style:italic;color:#e8e8f0">—</div>
+
+  <!-- ── Next Opportunity (DISPLAY-ONLY; a.game_plan.next_opportunity) ── -->
+  <div class="se-bias-h" style="color:#f59e0b">Next Opportunity <span id="no-conf" style="font-size:10px;color:#6b7280"></span></div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div class="gstat"><div class="l">Bias</div><div class="v" id="no-bias" style="font-size:13px">—</div></div>
+    <div class="gstat"><div class="l">Est. Time to Setup</div><div class="v" id="no-eta" style="font-size:13px">—</div></div>
+  </div>
+  <div class="se-bias-h">Waiting For</div>
+  <ul id="no-wait" style="margin:4px 0;padding-left:16px;list-style:none"></ul>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Entry</div><div class="v" id="no-entry" style="font-size:13px">—</div></div>
+    <div class="gstat"><div class="l">Stop</div><div class="v" id="no-stop" style="font-size:13px">—</div></div>
+    <div class="gstat"><div class="l">Target</div><div class="v" id="no-target" style="font-size:13px">—</div></div>
+  </div>
+  <div class="gstat" style="margin-top:6px"><div class="l">Projected R:R</div><div class="v" id="no-rr" style="font-size:13px">—</div></div>
 
   <div class="se-bias-h">Best Trade Idea</div>
   <div class="se-reason" id="an-idea">—</div>
@@ -22871,6 +23377,36 @@ function renderAnalystMode(d){
   _set('an-risk', rq, rq==='Good'?'#22c55e':rq==='Fair'?'#f59e0b':rq==='Poor'?'#ef4444':'#e8e8f0');
   _set('an-scores', (a.bull_score!=null?a.bull_score:0)+' / '+(a.bear_score!=null?a.bear_score:0), '#e8e8f0');
   _set('an-story', a.market_story, '#cfd0e0');
+  // Market Phase (DISPLAY-ONLY; a.market_phase).
+  const mp=a.market_phase||{};
+  _set('mp-phase', mp.phase, '#e8e8f0');
+  const mpc=document.getElementById('mp-conf');
+  if(mpc) mpc.textContent=(mp.confidence!=null)?('· '+mp.confidence+'% confidence'):'';
+  _anFill('mp-reasons', mp.reasons);
+  const mps=mp.signals||{};
+  _set('mp-struct', mps.structure, '#e8e8f0');
+  _set('mp-vext', (mps.vwap_extension_atr!=null)?(mps.vwap_extension_atr+'x'):'n/a', '#e8e8f0');
+  _set('mp-vol', mps.volume, '#e8e8f0');
+  _set('mp-cvd', mps.cvd, '#e8e8f0');
+  // Professional Analyst Outlook (DISPLAY-ONLY; a.analyst_outlook).
+  const ao=a.analyst_outlook||{};
+  _set('ao-intent', ao.market_intent, '#e8e8f0');
+  _set('ao-control', ao.control, '#e8e8f0');
+  _set('ao-liq', ao.liquidity, '#e8e8f0');
+  _set('ao-cvr', ao.continuation_vs_reversal, '#e8e8f0');
+  _set('ao-nhe', ao.next_high_probability_entry, '#cfd0e0');
+  _set('ao-inval', ao.invalidates, '#e8e8f0');
+  _set('ao-incr', ao.increases_confidence, '#e8e8f0');
+  _set('ao-cancel', ao.cancels_setup, '#e8e8f0');
+  _anFill('ao-wait', ao.wait_reasoning);
+  // Entry Probability (DISPLAY-ONLY; a.entry_probability).
+  const ep=a.entry_probability||{};
+  const epc=document.getElementById('ep-current');
+  if(epc) epc.textContent=(ep.available&&ep.current!=null)?('· now '+ep.current+'/100'):'';
+  _anFill('ep-scen', (ep.scenarios||[]).map(function(s){
+    return (s.label||'?')+' — '+(s.probability!=null?s.probability+'/100':'?')+' ('+(s.basis||'—')+')';
+  }));
+  _set('ep-explain', ep.explanation, '#cfd0e0');
   // Professional Trade Plan (DISPLAY-ONLY; consumes a.game_plan, fully fail-safe).
   const gp=a.game_plan||{};
   _set('gp-thesis', gp.thesis, '#cfd0e0');
@@ -22907,6 +23443,17 @@ function renderAnalystMode(d){
   _set('gp-rr-tp1', Number(rrf.p_tp1||0)+'%', '#e8e8f0');
   _set('gp-rr-tp2', Number(rrf.p_tp2||0)+'%', '#e8e8f0');
   _set('gp-conclusion', gp.ai_conclusion, '#e8e8f0');
+  // Next Opportunity (DISPLAY-ONLY; gp.next_opportunity).
+  const no=gp.next_opportunity||{};
+  _set('no-bias', no.bias, (no.bias&&no.bias.indexOf('Long')>=0)?'#22c55e':(no.bias&&no.bias.indexOf('Short')>=0)?'#ef4444':'#e8e8f0');
+  const noc=document.getElementById('no-conf');
+  if(noc) noc.textContent=(no.projected_confidence!=null)?('· '+no.projected_confidence+'% projected'):'';
+  _set('no-eta', no.time_until_setup, '#e8e8f0');
+  _anFill('no-wait', (no.waiting_for||[]).map(function(w){ return '☐ '+w; }));
+  _set('no-entry', no.estimated_entry, '#e8e8f0');
+  _set('no-stop', no.stop, '#ef4444');
+  _set('no-target', no.target, '#22c55e');
+  _set('no-rr', no.projected_rr, '#e8e8f0');
   _set('an-idea', a.best_trade_idea, '#cfd0e0');
   _set('an-forming', a.best_setup_forming, '#cfd0e0');
   _anFill('an-bull', a.bull_case);
