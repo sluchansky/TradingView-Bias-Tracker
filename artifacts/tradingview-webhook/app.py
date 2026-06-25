@@ -9846,6 +9846,318 @@ _ANALYST_MIN_MARGIN     = 10   # min lead over the other side (else mixed -> WAI
 _ANALYST_NOTHING        = 25   # both sides below this -> NO TRADE (nothing forming)
 
 
+def _analyst_game_plan_neutral():
+    """Stable, fully-populated DISPLAY-ONLY professional game-plan schema (fail-open
+    default). _analyst_game_plan() mirrors this exactly — EVERY key the dashboard
+    reads must exist here so the neutral / market-closed branches never render
+    `undefined`."""
+    return {
+        "thesis":                 "No professional read available.",
+        "prob_long":              0,
+        "prob_short":             0,
+        "action":                 "WAIT",
+        "action_reason":          "No actionable setup.",
+        "next_expected_move":     {"moves": [], "confidence": 0},
+        "invalidation":           [],
+        "professional_game_plan": [],
+        "scenario_tree":          [],
+        "dynamic_confidence":     {"long": 0, "short": 0, "neutral": 100},
+        "time_horizon":           {"move": "—", "setup": "—", "expires": "—"},
+        "risk_reward_forecast":   {"reward": "—", "risk": "—", "expected_r": "—",
+                                   "p_tp1": 0, "p_tp2": 0},
+        "ai_conclusion":          "Standing aside — no clear edge right now.",
+    }
+
+
+def _analyst_game_plan(ctx):
+    """DISPLAY-ONLY 'think like a professional analyst' trade-plan layer for the
+    Analyst engine.
+
+    Pure + FAIL-OPEN: derives a pro-analyst game plan (probabilistic plan, next
+    expected move, invalidation list, pro checklist, scenario tree, dynamic
+    confidence, time horizon, R:R forecast and a one-line conclusion) purely from
+    the already-computed analyst locals passed in `ctx`. It NEVER touches the gate,
+    scoring, sizing, dedupe or execution; any error degrades to the neutral schema,
+    so the money path and the strict-gate goldens are completely unaffected. See
+    _analyst_game_plan_neutral() for the contract."""
+    try:
+        mode        = (ctx.get("mode") or "SCALP").upper()
+        final       = ctx.get("final") or "NO TRADE"
+        stronger    = ctx.get("stronger") or "Neither"
+        bull        = int(ctx.get("bull_score") or 0)
+        bear        = int(ctx.get("bear_score") or 0)
+        top         = int(ctx.get("top") or 0)
+        margin      = int(ctx.get("margin") or 0)
+        conf        = int(ctx.get("confidence") or 0)
+        regime      = str(ctx.get("regime") or "—")
+        conflict    = bool(ctx.get("conflict"))
+        risk        = ctx.get("risk") if isinstance(ctx.get("risk"), dict) else {}
+        risk_ok     = bool(ctx.get("risk_ok"))
+        rr          = ctx.get("rr")
+        plan        = ctx.get("plan") if isinstance(ctx.get("plan"), dict) else {}
+        price       = ctx.get("price")
+        vwap        = ctx.get("vwap")
+        dem         = ctx.get("dem")
+        sup         = ctx.get("sup")
+        reason_wait = ctx.get("reason_for_waiting") or "Waiting for confirmation."
+        what_next   = list(ctx.get("what_needs_next") or [])
+        _f          = ctx.get("fmt") if callable(ctx.get("fmt")) else (lambda x: "—")
+        actionable  = final.startswith("READY")
+        chasing     = bool(risk.get("chasing"))
+        into_res    = bool(risk.get("into_resistance"))
+
+        def _pf(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+
+        # ── (1/6) Probabilities + dynamic three-way confidence ───────────────
+        total = bull + bear
+        if total <= 0:
+            prob_long = prob_short = 0
+        else:
+            prob_long  = int(round(100.0 * bull / total))
+            prob_short = 100 - prob_long
+        # Neutral share rises as the read gets less decisive / conflicted / not yet
+        # actionable; the directional pool is split by the evidence ratio.
+        if total <= 0:
+            neutral = 100
+        else:
+            decisiveness = min(1.0, margin / float(max(1, top)))
+            neutral = int(round(100 * (1.0 - decisiveness) * 0.55))
+            if conflict:       neutral += 15
+            if not actionable: neutral += 10
+            neutral = max(5, min(90, neutral))
+        dir_pool = 100 - neutral
+        if total <= 0:
+            c_long = c_short = 0
+        else:
+            c_long  = int(round(dir_pool * bull / float(total)))
+            c_short = max(0, dir_pool - c_long)
+
+        # ── (1) Action + reason + professional thesis ────────────────────────
+        if actionable:
+            action = "ENTER " + ("LONG" if final.endswith("LONG") else "SHORT")
+            action_reason = "Evidence aligned and risk acceptable — entry is valid now."
+        else:
+            action = "WAIT"
+            if stronger == "Neither":
+                action_reason = "No directional edge — stand aside until one side takes control."
+            elif conflict:
+                action_reason = "Tape is conflicted — wait for the structure to resolve."
+            elif chasing:
+                action_reason = "Price is extended — wait for a pullback into value before entering."
+            elif into_res:
+                action_reason = "Entry would be into the opposing zone — wait for better location."
+            elif what_next:
+                action_reason = "Waiting for " + what_next[0] + "."
+            else:
+                action_reason = reason_wait
+
+        if stronger == "Neither":
+            thesis = ("Evidence is balanced between buyers and sellers and there is no clear "
+                      "edge yet. Probability favors patience until one side takes control.")
+        else:
+            who  = "Buyers" if stronger == "Long" else "Sellers"
+            verb = "regained short-term control" if stronger == "Long" else "taken short-term control"
+            lead = "%s have %s (%d vs %d on the evidence)." % (who, verb, max(bull, bear), min(bull, bear))
+            if actionable:
+                tail = " Location, structure and risk align — the setup is actionable now."
+            elif chasing:
+                tail = (" However price is extended and entry quality is poor; probability favors "
+                        "a pullback before continuation.")
+            elif into_res:
+                tail = (" However price is pushing into the opposing zone, so a better entry is "
+                        "likely on a pullback.")
+            elif conflict:
+                tail = " The opposing side is still active, so the edge is not yet clean."
+            else:
+                tail = " Key confirmation is still missing, so the plan is to wait for the trigger."
+            thesis = lead + tail
+
+        # ── (2) Next expected move + confidence ──────────────────────────────
+        moves = []
+        _p, _v = _pf(price), _pf(vwap)
+        if stronger == "Long":
+            if chasing or (_p is not None and _v is not None and _p > _v):
+                moves.append("Pull back toward VWAP")
+            if dem is not None:
+                moves.append("Retest demand near " + _f(dem))
+            moves.append("Form a bullish rejection / reclaim")
+            moves.append("Continue toward liquidity above the highs")
+        elif stronger == "Short":
+            if chasing or (_p is not None and _v is not None and _p < _v):
+                moves.append("Rally back toward VWAP")
+            if sup is not None:
+                moves.append("Retest supply near " + _f(sup))
+            moves.append("Form a bearish rejection / lower-high")
+            moves.append("Continue toward liquidity below the lows")
+        else:
+            moves.append("Chop around VWAP until a side commits")
+            moves.append("Sweep a near-side level to source liquidity")
+            moves.append("Build structure before a directional move")
+        if stronger == "Neither":
+            move_conf = 40
+        else:
+            move_conf = int(round(max(prob_long, prob_short) * 0.85))
+            if not (conflict or regime.lower().startswith("rang")):
+                move_conf += 8
+            move_conf = max(35, min(90, move_conf))
+
+        # ── (3) Trade invalidation (explicit list) ───────────────────────────
+        inval = []
+        _stop = plan.get("stop_loss")
+        if _stop is not None and _pf(_stop) is not None:
+            inval.append("Price closes through the stop at " + _f(_stop))
+        if stronger == "Long":
+            if dem is not None: inval.append("Demand breaks (close below " + _f(dem) + ")")
+            inval.append("A bearish CHOCH confirms")
+            inval.append("VWAP is lost with strong negative delta")
+            inval.append("CVD turns aggressively negative")
+        elif stronger == "Short":
+            if sup is not None: inval.append("Supply breaks (close above " + _f(sup) + ")")
+            inval.append("A bullish CHOCH confirms")
+            inval.append("VWAP is reclaimed with strong positive delta")
+            inval.append("CVD turns aggressively positive")
+        else:
+            inval.append("Either side breaks structure with momentum")
+            inval.append("A clean VWAP reclaim or loss on rising delta")
+
+        # ── (4) Professional game plan (what a pro would do) ─────────────────
+        steps = []
+        if actionable:
+            steps.append("Setup is valid — execute the planned entry")
+            steps.append(("Place the stop at " + _f(_stop)) if _stop is not None
+                         else "Place a logical stop beyond structure")
+            steps.append("Manage toward T1 " + _f(plan.get("target1")) + " / T2 " + _f(plan.get("target2")))
+            steps.append("Take partials and protect the trade — do not widen the stop")
+        elif stronger == "Neither":
+            steps.append("Stay flat — there is no edge")
+            steps.append("Mark VWAP and the nearest demand / supply")
+            steps.append("Wait for a sweep plus a structure shift")
+            steps.append("Re-engage only on a clear directional lean")
+        else:
+            if chasing:
+                steps.append("Wait for a pullback — do not chase price here")
+            steps.append("Watch CVD / delta for agreement")
+            steps.append("Watch VWAP and the trade-side zone for a reaction")
+            steps.append("Enter only after a " + stronger.lower() + " confirmation")
+            steps.append("Skip the trade if price continues vertically without a pullback")
+
+        # ── (5) Scenario tree (A/B/C — probabilities sum to 100) ─────────────
+        if stronger == "Neither" or conflict or total <= 0:
+            scenarios = [
+                {"label": "A", "prob": 45, "desc": "Range continues around VWAP until a side commits"},
+                {"label": "B", "prob": 30, "desc": "Bullish break and reclaim sets up a long"},
+                {"label": "C", "prob": 25, "desc": "Bearish breakdown sets up a short"},
+            ]
+        else:
+            lean = max(prob_long, prob_short)
+            pA = max(40, min(72, lean))
+            pC = max(8, min(35, 100 - lean))
+            pB = 100 - pA - pC
+            if pB < 5:
+                pA += (pB - 5); pB = 5
+            if stronger == "Long":
+                scenarios = [
+                    {"label": "A", "prob": pA, "desc": "Pullback, reclaim, then long continuation toward the highs"},
+                    {"label": "B", "prob": pB, "desc": "Consolidation above VWAP before resolving higher"},
+                    {"label": "C", "prob": pC, "desc": "Demand breaks and price reverses into a short"},
+                ]
+            else:
+                scenarios = [
+                    {"label": "A", "prob": pA, "desc": "Lower-high, rejection, then short continuation toward the lows"},
+                    {"label": "B", "prob": pB, "desc": "Consolidation below VWAP before resolving lower"},
+                    {"label": "C", "prob": pC, "desc": "Supply breaks and price reverses into a long"},
+                ]
+
+        # ── (7) Time horizon (mode-dependent) ────────────────────────────────
+        if mode == "SWING":
+            horizon = {"move": "2-8 hours", "setup": "within the next 2-4 candles (1H)",
+                       "expires": "no confirmation within ~2 hours"}
+        else:
+            horizon = {"move": "5-15 minutes", "setup": "within the next 3-5 candles (5m)",
+                       "expires": "no confirmation within 20 minutes"}
+
+        # ── (8) Risk vs reward forecast ──────────────────────────────────────
+        def _mid(zone):
+            if isinstance(zone, (int, float)):
+                return float(zone)
+            if isinstance(zone, str):
+                for sep in ("\u2013", " to ", "-"):
+                    if sep in zone:
+                        vals = [v for v in (_pf(p) for p in zone.split(sep)) if v is not None]
+                        if len(vals) >= 2: return (vals[0] + vals[1]) / 2.0
+                        if len(vals) == 1: return vals[0]
+                return _pf(zone)
+            return None
+        _entry = _mid(plan.get("entry_zone"))
+        if _entry is None: _entry = _pf(plan.get("entry"))
+        if _entry is None: _entry = _pf(price)
+        _stopf = _pf(_stop)
+        _t1    = _pf(plan.get("target1"))
+        risk_pts = abs(_entry - _stopf) if (_entry is not None and _stopf is not None) else None
+        if _t1 is not None and _entry is not None:
+            reward_pts = abs(_t1 - _entry)
+        elif risk_pts is not None and rr is not None:
+            reward_pts = risk_pts * float(rr)
+        else:
+            reward_pts = None
+        rr_disp = ("1:%.1f" % float(rr)) if rr is not None else "—"
+        _base = conf if conf else max(prob_long, prob_short)
+        if stronger == "Neither":
+            p_tp1 = p_tp2 = 0
+        elif actionable:
+            p_tp1 = max(40, min(85, _base)); p_tp2 = max(20, min(70, _base - 20))
+        else:
+            p_tp1 = max(25, min(70, _base)); p_tp2 = max(12, min(55, _base - 20))
+        rrf = {
+            "reward":     (_f(reward_pts) + " pts") if reward_pts is not None else "—",
+            "risk":       (_f(risk_pts) + " pts") if risk_pts is not None else "—",
+            "expected_r": rr_disp,
+            "p_tp1":      int(p_tp1),
+            "p_tp2":      int(p_tp2),
+        }
+
+        # ── (9) One-line AI conclusion ───────────────────────────────────────
+        if stronger == "Neither":
+            conclusion = ("No clear edge right now — staying flat is the higher-probability "
+                          "decision until one side takes control.")
+        elif actionable:
+            conclusion = ("The %s setup is valid with acceptable risk, so this is an actionable "
+                          "entry rather than a wait." % stronger.lower())
+        elif chasing:
+            conclusion = ("The %s thesis remains valid, but price is too extended; waiting for a "
+                          "pullback into value offers a significantly higher-probability entry "
+                          "than chasing current price." % stronger.lower())
+        elif conflict:
+            conclusion = ("Both sides are still fighting for control, so the higher-probability "
+                          "play is to wait for the tape to resolve before committing to a %s."
+                          % stronger.lower())
+        else:
+            conclusion = ("The %s thesis is building but unconfirmed; waiting for the trigger is a "
+                          "higher-probability approach than anticipating it." % stronger.lower())
+
+        return {
+            "thesis":                 thesis,
+            "prob_long":              prob_long,
+            "prob_short":             prob_short,
+            "action":                 action,
+            "action_reason":          action_reason,
+            "next_expected_move":     {"moves": moves, "confidence": move_conf},
+            "invalidation":           inval,
+            "professional_game_plan": steps,
+            "scenario_tree":          scenarios,
+            "dynamic_confidence":     {"long": c_long, "short": c_short, "neutral": neutral},
+            "time_horizon":           horizon,
+            "risk_reward_forecast":   rrf,
+            "ai_conclusion":          conclusion,
+        }
+    except Exception:
+        return _analyst_game_plan_neutral()
+
+
 def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRADE"):
     """Fully-populated, safe Analyst block (fail-open fallback + market-closed stub).
     EVERY key the /status serializer and dashboard read MUST exist here so the
@@ -9884,6 +10196,7 @@ def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRA
         "what_needs_next":        [],
         "agrees_with_gate":       False,
         "veto_would_fire":        False,
+        "game_plan":              _analyst_game_plan_neutral(),
         "memory_review":          build_analyst_memory_review(None),
     }
 
@@ -10240,6 +10553,18 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
         "what_needs_next":        what_needs_next,
         "agrees_with_gate":       agrees,
         "veto_would_fire":        veto_would_fire,
+        # DISPLAY-ONLY pro-analyst trade plan (probabilities / scenarios / R:R /
+        # conclusion) derived purely from the locals computed above — never feeds
+        # the gate, scoring, sizing, dedupe or execution (fail-open helper).
+        "game_plan":              _analyst_game_plan({
+            "mode": TRADING_MODE, "final": final, "stronger": stronger,
+            "bull_score": bull_score, "bear_score": bear_score, "top": top, "margin": margin,
+            "confidence": confidence, "regime": regime, "conflict": conflict,
+            "risk": risk, "risk_ok": risk_ok, "rr": rr, "plan": plan,
+            "price": price, "vwap": vwap, "dem": dem, "sup": sup,
+            "reason_for_waiting": reason_for_waiting, "what_needs_next": what_needs_next,
+            "fmt": _f,
+        }),
         # Placeholder; full_analysis overwrites this with the SHARED memory review.
         "memory_review":          build_analyst_memory_review(None),
     }
@@ -20999,6 +21324,55 @@ def dashboard():
   </div>
   <div class="se-bias-h">Current Market Story</div>
   <div class="se-reason" id="an-story">—</div>
+
+  <!-- ── Professional Trade Plan (DISPLAY-ONLY pro-analyst layer; a.game_plan) ── -->
+  <div class="se-bias-h" style="color:#7aa2ff;margin-top:10px">Professional Trade Plan</div>
+  <div class="se-reason" id="gp-thesis">—</div>
+  <div style="margin-top:8px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+      <span style="color:#22c55e">Long <span id="gp-prob-long">—</span></span>
+      <span style="color:#ef4444"><span id="gp-prob-short">—</span> Short</span>
+    </div>
+    <div style="height:8px;border-radius:4px;background:#ef4444;overflow:hidden">
+      <div id="gp-prob-bar" style="height:100%;width:50%;background:#22c55e"></div>
+    </div>
+  </div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <div class="gstat"><div class="l">Action</div><div class="v" id="gp-action">—</div></div>
+    <div class="gstat"><div class="l">Move Confidence</div><div class="v" id="gp-next-conf">—</div></div>
+  </div>
+  <div class="se-reason" id="gp-action-reason" style="margin-top:6px">—</div>
+  <div class="se-bias-h">Dynamic Confidence</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l" style="color:#22c55e">Long</div><div class="v" id="gp-conf-long">—</div></div>
+    <div class="gstat"><div class="l" style="color:#ef4444">Short</div><div class="v" id="gp-conf-short">—</div></div>
+    <div class="gstat"><div class="l">Neutral</div><div class="v" id="gp-conf-neutral">—</div></div>
+  </div>
+  <div class="se-bias-h">Most Likely Next Move <span id="gp-next-badge" style="font-size:10px;color:#6b7280"></span></div>
+  <ul id="gp-next" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Scenario Tree</div>
+  <ul id="gp-scen" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Trade Invalidation</div>
+  <ul id="gp-inval" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Professional Game Plan</div>
+  <ul id="gp-plan" style="margin:4px 0;padding-left:16px;list-style:none"></ul>
+  <div class="se-bias-h">Time Horizon</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Move</div><div class="v" id="gp-th-move" style="font-size:13px">—</div></div>
+    <div class="gstat"><div class="l">Setup</div><div class="v" id="gp-th-setup" style="font-size:13px">—</div></div>
+    <div class="gstat"><div class="l">Expires</div><div class="v" id="gp-th-expires" style="font-size:13px">—</div></div>
+  </div>
+  <div class="se-bias-h">Risk vs Reward Forecast</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Reward</div><div class="v" id="gp-rr-reward">—</div></div>
+    <div class="gstat"><div class="l">Risk</div><div class="v" id="gp-rr-risk">—</div></div>
+    <div class="gstat"><div class="l">Expected R</div><div class="v" id="gp-rr-r">—</div></div>
+    <div class="gstat"><div class="l">P(TP1)</div><div class="v" id="gp-rr-tp1">—</div></div>
+    <div class="gstat"><div class="l">P(TP2)</div><div class="v" id="gp-rr-tp2">—</div></div>
+  </div>
+  <div class="se-bias-h" style="color:#f59e0b">AI Conclusion</div>
+  <div class="se-reason" id="gp-conclusion" style="font-style:italic;color:#e8e8f0">—</div>
+
   <div class="se-bias-h">Best Trade Idea</div>
   <div class="se-reason" id="an-idea">—</div>
   <div class="se-bias-h">Best Setup Forming</div>
@@ -22497,6 +22871,42 @@ function renderAnalystMode(d){
   _set('an-risk', rq, rq==='Good'?'#22c55e':rq==='Fair'?'#f59e0b':rq==='Poor'?'#ef4444':'#e8e8f0');
   _set('an-scores', (a.bull_score!=null?a.bull_score:0)+' / '+(a.bear_score!=null?a.bear_score:0), '#e8e8f0');
   _set('an-story', a.market_story, '#cfd0e0');
+  // Professional Trade Plan (DISPLAY-ONLY; consumes a.game_plan, fully fail-safe).
+  const gp=a.game_plan||{};
+  _set('gp-thesis', gp.thesis, '#cfd0e0');
+  const pl=Number(gp.prob_long||0), ps=Number(gp.prob_short||0);
+  _set('gp-prob-long', pl+'%', '#22c55e');
+  _set('gp-prob-short', ps+'%', '#ef4444');
+  const pbar=document.getElementById('gp-prob-bar');
+  if(pbar) pbar.style.width=Math.max(0,Math.min(100,pl))+'%';
+  const act=gp.action||'WAIT';
+  _set('gp-action', act, act.indexOf('ENTER')===0?(act.indexOf('LONG')>=0?'#22c55e':'#ef4444'):'#f59e0b');
+  _set('gp-action-reason', gp.action_reason, '#cfd0e0');
+  const nem=gp.next_expected_move||{};
+  _set('gp-next-conf', Number(nem.confidence||0)+'%', '#e8e8f0');
+  const nbadge=document.getElementById('gp-next-badge');
+  if(nbadge) nbadge.textContent=(nem.confidence!=null)?('· '+nem.confidence+'% confidence'):'';
+  _anFill('gp-next', nem.moves);
+  const dc=gp.dynamic_confidence||{};
+  _set('gp-conf-long', Number(dc.long||0)+'%', '#22c55e');
+  _set('gp-conf-short', Number(dc.short||0)+'%', '#ef4444');
+  _set('gp-conf-neutral', Number(dc.neutral||0)+'%', '#9aa');
+  _anFill('gp-scen', (gp.scenario_tree||[]).map(function(s){
+    return (s.label||'?')+' ('+(s.prob!=null?s.prob:'?')+'%) — '+(s.desc||'—');
+  }));
+  _anFill('gp-inval', gp.invalidation);
+  _anFill('gp-plan', (gp.professional_game_plan||[]).map(function(s){ return '✓ '+s; }));
+  const th=gp.time_horizon||{};
+  _set('gp-th-move', th.move, '#e8e8f0');
+  _set('gp-th-setup', th.setup, '#e8e8f0');
+  _set('gp-th-expires', th.expires, '#e8e8f0');
+  const rrf=gp.risk_reward_forecast||{};
+  _set('gp-rr-reward', rrf.reward, '#22c55e');
+  _set('gp-rr-risk', rrf.risk, '#ef4444');
+  _set('gp-rr-r', rrf.expected_r, '#e8e8f0');
+  _set('gp-rr-tp1', Number(rrf.p_tp1||0)+'%', '#e8e8f0');
+  _set('gp-rr-tp2', Number(rrf.p_tp2||0)+'%', '#e8e8f0');
+  _set('gp-conclusion', gp.ai_conclusion, '#e8e8f0');
   _set('an-idea', a.best_trade_idea, '#cfd0e0');
   _set('an-forming', a.best_setup_forming, '#cfd0e0');
   _anFill('an-bull', a.bull_case);
