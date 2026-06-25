@@ -355,6 +355,30 @@ _SHARED_ALERT_TYPES = {
     "BEARISH_SWEEP":           {"side": "dual_tf", "score": 0},
     "BULLISH SWEEP":           {"side": "dual_tf", "score": 0},
     "BEARISH SWEEP":           {"side": "dual_tf", "score": 0},
+    # ── Fast Entry Trigger seconds (1s/5s) micro-events (side "fast" => NEVER
+    #    scored; recognised + consumed only when FAST_ENTRY_TRIGGER is ON + SCALP,
+    #    via a dormant guard that mirrors the bare-sweep one so flag-OFF stays
+    #    byte-identical). Un-prefixed → require a `ticker` field (like the dual-TF
+    #    bare names). These ONLY improve ENTRY TIMING on an already-valid/nearly-
+    #    valid + aligned HTF strict setup; they never create or override a trade. ──
+    "SWEEP_RECLAIM_LONG":      {"side": "fast", "score": 0},
+    "SWEEP_RECLAIM_SHORT":     {"side": "fast", "score": 0},
+    "SWEEP RECLAIM LONG":      {"side": "fast", "score": 0},
+    "SWEEP RECLAIM SHORT":     {"side": "fast", "score": 0},
+    "DELTA_FLIP_BULLISH":      {"side": "fast", "score": 0},
+    "DELTA_FLIP_BEARISH":      {"side": "fast", "score": 0},
+    "DELTA FLIP BULLISH":      {"side": "fast", "score": 0},
+    "DELTA FLIP BEARISH":      {"side": "fast", "score": 0},
+    "MICRO_VWAP_RECLAIM":      {"side": "fast", "score": 0},
+    "MICRO_VWAP_LOSS":         {"side": "fast", "score": 0},
+    "MICRO VWAP RECLAIM":      {"side": "fast", "score": 0},
+    "MICRO VWAP LOSS":         {"side": "fast", "score": 0},
+    "MICRO_CHOCH_LONG":        {"side": "fast", "score": 0},
+    "MICRO_CHOCH_SHORT":       {"side": "fast", "score": 0},
+    "MICRO CHOCH LONG":        {"side": "fast", "score": 0},
+    "MICRO CHOCH SHORT":       {"side": "fast", "score": 0},
+    "FAST_SECONDS_BAR":        {"side": "fast", "score": 0},
+    "FAST SECONDS BAR":        {"side": "fast", "score": 0},
 }
 
 # Build the full table: prefixed-per-instrument first, then shared. Prefixed keys
@@ -458,6 +482,52 @@ _DUAL_TF_BULL_ZONE = (_per_inst_alert_set("NEW DEMAND ZONE")
                       | _per_inst_alert_set("DEMAND ZONE CONFIRMED"))
 _DUAL_TF_BEAR_ZONE = (_per_inst_alert_set("NEW SUPPLY ZONE")
                       | _per_inst_alert_set("SUPPLY ZONE CONFIRMED"))
+
+# ── Fast Entry Trigger (seconds-timing) layer ────────────────────────────────
+# A CONSERVATIVE, DISPLAY-FIRST seconds (1s/5s) timing overlay. Sub-minute micro
+# events (sweep+reclaim, delta/CVD flip, micro VWAP reclaim/loss, micro CHOCH)
+# ONLY improve ENTRY TIMING when the EXISTING higher-timeframe strict setup is
+# already valid / nearly-valid AND aligned with the micro direction. It NEVER
+# creates a trade on its own and NEVER overrides a failing HTF setup. Two
+# independent flags, both default OFF so prod + every golden stay byte-identical:
+#   • FAST_ENTRY_TRIGGER — the display / state / ingestion layer (no money path).
+#   • FAST_ENTRY_MONEY   — the early-entry money path; ALSO requires
+#     FAST_ENTRY_TRIGGER + TRADING_MODE=SCALP + NOT DUAL_TF_ENGINE (mutually
+#     exclusive with the dual-TF engine so the two can never double-fire).
+FAST_ENTRY_TRIGGER = os.environ.get("FAST_ENTRY_TRIGGER", "").strip().lower() in ("1", "true", "yes", "on")
+FAST_ENTRY_MONEY   = os.environ.get("FAST_ENTRY_MONEY", "").strip().lower() in ("1", "true", "yes", "on")
+# Each micro event is "fresh" for this many seconds — the co-occurrence window
+# within which a sweep+reclaim and its confirmations must land to confirm timing.
+FAST_ENTRY_WINDOW_SEC = int(os.environ.get("FAST_ENTRY_WINDOW_SEC", "20"))
+# A stored micro-event lazily expires after this TTL (read-time pruning).
+FAST_ENTRY_TTL_SEC    = int(os.environ.get("FAST_ENTRY_TTL_SEC", "45"))
+# How far (Edge points BELOW the READY threshold) the HTF setup may sit and still
+# count as "nearly valid" for a fast early entry. 0 ⇒ must already be at the
+# actionable floor. Conservative small band; structure must ALSO be confirmed.
+FAST_ENTRY_HTF_EDGE_BAND = int(os.environ.get("FAST_ENTRY_HTF_EDGE_BAND", "10"))
+FAST_ENTRY_LOCK = threading.Lock()
+# {inst: {category: {"direction": "Long"/"Short"/None, "ts": iso, ...}}}
+# categories: sweep_reclaim | delta_flip | micro_vwap | micro_choch | bar
+FAST_ENTRY_STATE_BY_TICKER = {}
+
+# Fast Entry seconds micro-event sets (side "fast" — never scored). Un-prefixed
+# forms carried by the seconds Pine script; the payload `ticker` field resolves
+# the instrument (mirrors the dual-TF bare-name convention).
+FAST_SWEEP_RECLAIM_LONG_TYPES  = {"SWEEP_RECLAIM_LONG", "SWEEP RECLAIM LONG"}
+FAST_SWEEP_RECLAIM_SHORT_TYPES = {"SWEEP_RECLAIM_SHORT", "SWEEP RECLAIM SHORT"}
+FAST_DELTA_FLIP_BULL_TYPES = {"DELTA_FLIP_BULLISH", "DELTA FLIP BULLISH"}
+FAST_DELTA_FLIP_BEAR_TYPES = {"DELTA_FLIP_BEARISH", "DELTA FLIP BEARISH"}
+FAST_MICRO_VWAP_RECLAIM_TYPES = {"MICRO_VWAP_RECLAIM", "MICRO VWAP RECLAIM"}
+FAST_MICRO_VWAP_LOSS_TYPES = {"MICRO_VWAP_LOSS", "MICRO VWAP LOSS"}
+FAST_MICRO_CHOCH_LONG_TYPES = {"MICRO_CHOCH_LONG", "MICRO CHOCH LONG"}
+FAST_MICRO_CHOCH_SHORT_TYPES = {"MICRO_CHOCH_SHORT", "MICRO CHOCH SHORT"}
+FAST_SECONDS_BAR_TYPES = {"FAST_SECONDS_BAR", "FAST SECONDS BAR"}
+# Every fast micro-event type — these ack fast and stay OUT of the scoring lane.
+FAST_ENTRY_TYPES = (FAST_SWEEP_RECLAIM_LONG_TYPES | FAST_SWEEP_RECLAIM_SHORT_TYPES
+                    | FAST_DELTA_FLIP_BULL_TYPES | FAST_DELTA_FLIP_BEAR_TYPES
+                    | FAST_MICRO_VWAP_RECLAIM_TYPES | FAST_MICRO_VWAP_LOSS_TYPES
+                    | FAST_MICRO_CHOCH_LONG_TYPES | FAST_MICRO_CHOCH_SHORT_TYPES
+                    | FAST_SECONDS_BAR_TYPES)
 
 # ---------------------------------------------------------------------------
 # Trading mode profiles — SCALP (fast, sensitive) vs SWING (slower, stricter)
@@ -12472,6 +12542,274 @@ def compute_entry_quality(result, strict=None, swing_ctx=None):
     }
 
 
+def _fast_entry_money_enabled():
+    """The Fast Entry MONEY path is live only when its own flag is on AND the
+    display layer is on AND we are SCALP AND the dual-TF engine is OFF (mutually
+    exclusive so the two seconds engines can never double-fire)."""
+    return bool(FAST_ENTRY_MONEY and FAST_ENTRY_TRIGGER
+                and TRADING_MODE == "SCALP" and not DUAL_TF_ENGINE)
+
+
+def _fast_entry_neutral(reason="Fast Entry Trigger disabled."):
+    """Inert Fast Entry block — early_entry_allowed=False so it can NEVER promote.
+    Used when the flag is off, the mode is wrong, the market is closed, or the
+    aggregator raised (fail-open). STABLE schema — the dashboard panel + the money
+    path read exactly these keys (the 9 user-facing fields + internal twins)."""
+    return {
+        "enabled":             FAST_ENTRY_TRIGGER,
+        "money_enabled":       _fast_entry_money_enabled(),
+        "available":           False,
+        "fast_entry_trigger":  False,
+        "seconds_bias":        None,
+        "micro_sweep":         None,
+        "micro_choch":         None,
+        "delta_flip":          None,
+        "micro_vwap_status":   None,
+        "early_entry_allowed": False,
+        "entry_confidence":    None,
+        "fast_entry_reason":   reason,
+        # Internal twins (NOT among the 9 fields) — the money path reads these.
+        "direction":           None,
+        "htf":                 None,
+    }
+
+
+def _fast_entry_record(normalized, inst, data):
+    """Record a seconds micro-event into FAST_ENTRY_STATE_BY_TICKER (DISPLAY / STATE
+    only). No-op unless FAST_ENTRY_TRIGGER + SCALP. FAIL-OPEN — never raises into the
+    webhook path. Each event stores its direction (where directional) + ts so the
+    aggregator can check freshness / co-occurrence. A FAST SECONDS BAR is
+    directionless and additionally carries hi/lo/vwap reference levels."""
+    if not (FAST_ENTRY_TRIGGER and TRADING_MODE == "SCALP") or not inst:
+        return
+    try:
+        cat, direction, extra = None, None, {}
+        if normalized in FAST_SWEEP_RECLAIM_LONG_TYPES:
+            cat, direction = "sweep_reclaim", "Long"
+        elif normalized in FAST_SWEEP_RECLAIM_SHORT_TYPES:
+            cat, direction = "sweep_reclaim", "Short"
+        elif normalized in FAST_DELTA_FLIP_BULL_TYPES:
+            cat, direction = "delta_flip", "Long"
+        elif normalized in FAST_DELTA_FLIP_BEAR_TYPES:
+            cat, direction = "delta_flip", "Short"
+        elif normalized in FAST_MICRO_VWAP_RECLAIM_TYPES:
+            cat, direction = "micro_vwap", "Long"
+        elif normalized in FAST_MICRO_VWAP_LOSS_TYPES:
+            cat, direction = "micro_vwap", "Short"
+        elif normalized in FAST_MICRO_CHOCH_LONG_TYPES:
+            cat, direction = "micro_choch", "Long"
+        elif normalized in FAST_MICRO_CHOCH_SHORT_TYPES:
+            cat, direction = "micro_choch", "Short"
+        elif normalized in FAST_SECONDS_BAR_TYPES:
+            cat = "bar"
+            for _src, _dst in (("high", "high"), ("hi", "high"), ("low", "low"),
+                               ("lo", "low"), ("vwap", "vwap"), ("price", "price")):
+                _v = data.get(_src)
+                if _v is not None and _dst not in extra:
+                    try:
+                        extra[_dst] = float(_v)
+                    except (ValueError, TypeError):
+                        pass
+        if cat is None:
+            return
+        rec = {"direction": direction, "ts": now_utc().isoformat()}
+        rec.update(extra)
+        with FAST_ENTRY_LOCK:
+            FAST_ENTRY_STATE_BY_TICKER.setdefault(inst, {})[cat] = rec
+        logger.info("Fast-entry micro-event: %s %s (dir=%s)", inst, cat, direction)
+    except Exception as exc:
+        logger.error("Fast-entry record error (non-fatal): %s", exc)
+
+
+def _fast_entry_snapshot(inst):
+    """Lazy-expired per-instrument micro-event snapshot for DISPLAY. Returns
+    {category: rec(+age seconds)} for events still within FAST_ENTRY_TTL_SEC and
+    drops the rest. Empty dict when the layer is off / no events."""
+    if not (FAST_ENTRY_TRIGGER and inst):
+        return {}
+    out = {}
+    now = now_utc()
+    with FAST_ENTRY_LOCK:
+        st = FAST_ENTRY_STATE_BY_TICKER.get(inst)
+        if not st:
+            return {}
+        for cat in list(st.keys()):
+            rec = st.get(cat) or {}
+            try:
+                age = (now - datetime.fromisoformat(rec.get("ts"))).total_seconds()
+            except Exception:
+                age = None
+            if age is None or age > FAST_ENTRY_TTL_SEC:
+                st.pop(cat, None)                       # lazy-expire
+            else:
+                out[cat] = dict(rec, age=age)
+    return out
+
+
+def _fast_entry_htf_gate(result, direction):
+    """Decide whether the EXISTING higher-timeframe strict setup is already valid or
+    NEARLY valid AND aligned with `direction`. Reads ONLY the already-computed strict
+    output (directions[dir].gate_debug / edge_score, dominant_direction,
+    strict_direction) — it NEVER recomputes or bypasses the gate. The fast layer may
+    improve TIMING only when (htf_ready OR htf_nearly) AND aligned; it can NEVER
+    manufacture a setup the gate did not already form."""
+    out = {"aligned": False, "htf_ready": False, "htf_nearly": False,
+           "structure_ok": False, "edge_score": None, "edge_gap": None,
+           "dominant": None, "reason": ""}
+    if direction not in ("Long", "Short"):
+        out["reason"] = "no micro direction"
+        return out
+    blk = ((result.get("directions") or {}).get(direction)) or {}
+    gd = blk.get("gate_debug") or {}
+    dominant = result.get("dominant_direction") or result.get("strict_direction")
+    out["dominant"] = dominant
+    out["aligned"] = (dominant == direction)
+    out["structure_ok"] = bool(gd.get("structure_confirmed"))
+    edge = blk.get("edge_score")
+    try:
+        edge = int(edge) if edge is not None else None
+    except (ValueError, TypeError):
+        edge = None
+    out["edge_score"] = edge
+    thr = int(cfg("EDGE_READY_THRESHOLD"))
+    if edge is not None:
+        out["edge_gap"] = thr - edge
+        if edge >= thr:
+            out["htf_ready"] = True
+        elif out["structure_ok"] and (thr - edge) <= FAST_ENTRY_HTF_EDGE_BAND:
+            out["htf_nearly"] = True
+    if not out["aligned"]:
+        out["reason"] = "micro %s vs HTF %s — not aligned" % (direction, dominant or "none")
+    elif out["htf_ready"]:
+        out["reason"] = "HTF %s setup READY + aligned" % direction
+    elif out["htf_nearly"]:
+        out["reason"] = "HTF nearly valid (edge %s, %s below) + aligned" % (edge, out["edge_gap"])
+    else:
+        out["reason"] = "HTF not valid for %s" % direction
+    return out
+
+
+def _compute_fast_entry_trigger(result, inst):
+    """DISPLAY-FIRST seconds-timing aggregator. Combines the fresh micro-event
+    snapshot with the EXISTING HTF strict gate (via _fast_entry_htf_gate) to decide
+    whether a fast EARLY entry is PERMITTED. It NEVER recomputes the gate and NEVER
+    allows when the HTF setup is missing or misaligned. FAIL-OPEN: any error / off /
+    closed returns the inert neutral block so the dashboard still renders and the
+    money path stays dormant."""
+    if not FAST_ENTRY_TRIGGER:
+        return _fast_entry_neutral("Fast Entry Trigger disabled.")
+    if TRADING_MODE != "SCALP":
+        return _fast_entry_neutral("Fast Entry Trigger is SCALP-only.")
+    if not result.get("market_open"):
+        return _fast_entry_neutral("Market closed — fast entry paused.")
+    try:
+        snap = _fast_entry_snapshot(inst)
+
+        # DISPLAY descriptors use the TTL-fresh snapshot (recent events).
+        def _desc(cat):
+            rec = snap.get(cat)
+            if not rec:
+                return None
+            d = rec.get("direction")
+            age = rec.get("age")
+            age_s = (" %.0fs ago" % age) if isinstance(age, (int, float)) else ""
+            return ("%s%s" % (d, age_s)) if d else ("seen%s" % age_s)
+        micro_sweep = _desc("sweep_reclaim")
+        micro_choch = _desc("micro_choch")
+        delta_flip  = _desc("delta_flip")
+        mv = snap.get("micro_vwap")
+        micro_vwap_status = None
+        if mv:
+            micro_vwap_status = ("Reclaimed" if mv.get("direction") == "Long"
+                                 else "Lost" if mv.get("direction") == "Short" else None)
+
+        # DECISION uses only events tight within FAST_ENTRY_WINDOW_SEC (co-occurrence).
+        def _fresh(cat):
+            rec = snap.get(cat)
+            if rec and isinstance(rec.get("age"), (int, float)) and rec["age"] <= FAST_ENTRY_WINDOW_SEC:
+                return rec
+            return None
+        votes = [_fresh(c).get("direction") for c in
+                 ("sweep_reclaim", "delta_flip", "micro_vwap", "micro_choch")
+                 if _fresh(c) and _fresh(c).get("direction")]
+        seconds_bias = None
+        if votes:
+            longs, shorts = votes.count("Long"), votes.count("Short")
+            if longs and not shorts:
+                seconds_bias = "Long"
+            elif shorts and not longs:
+                seconds_bias = "Short"
+            # mixed → None (no clean micro bias)
+
+        # Micro confirmation rule (mirrors the spec): a directional micro signal
+        # needs a sweep+reclaim AND >=1 agreeing confirm (delta flip OR micro VWAP
+        # reclaim/loss OR micro CHOCH) — all within the window, all same direction.
+        sweep_ok, confirms = False, 0
+        if seconds_bias:
+            _sw = _fresh("sweep_reclaim")
+            sweep_ok = bool(_sw and _sw.get("direction") == seconds_bias)
+            for c in ("delta_flip", "micro_vwap", "micro_choch"):
+                rec = _fresh(c)
+                if rec and rec.get("direction") == seconds_bias:
+                    confirms += 1
+        micro_ready = bool(seconds_bias and sweep_ok and confirms >= 1)
+
+        # HTF gate (existing strict output ONLY) for the micro direction.
+        htf = _fast_entry_htf_gate(result, seconds_bias) if seconds_bias else None
+        allowed = bool(micro_ready and htf and htf["aligned"]
+                       and (htf["htf_ready"] or htf["htf_nearly"]))
+
+        # Entry confidence (display 0-100): micro confirmations + HTF readiness.
+        conf = None
+        if seconds_bias:
+            conf = 0
+            if sweep_ok:
+                conf += 30
+            conf += min(confirms, 3) * 15
+            if htf and htf["aligned"]:
+                conf += 15
+            if htf and htf["htf_ready"]:
+                conf += 10
+            conf = min(conf, 100)
+
+        if not seconds_bias:
+            reason = "No clean seconds bias (need agreeing micro events)."
+        elif not sweep_ok:
+            reason = "Awaiting micro sweep+reclaim (%s)." % seconds_bias
+        elif confirms < 1:
+            reason = "Sweep seen; awaiting delta/VWAP/CHOCH confirm (%s)." % seconds_bias
+        elif not (htf and htf["aligned"]):
+            reason = "Micro %s but HTF favors %s — stand aside." % (
+                seconds_bias, (htf or {}).get("dominant") or "none")
+        elif not (htf["htf_ready"] or htf["htf_nearly"]):
+            reason = "Micro %s ready but HTF setup not valid — no early entry." % seconds_bias
+        elif allowed:
+            reason = "Fast %s entry: micro timing confirmed on a %s HTF setup." % (
+                seconds_bias, "READY" if htf["htf_ready"] else "nearly-valid")
+        else:
+            reason = "Holding."
+
+        return {
+            "enabled":             True,
+            "money_enabled":       _fast_entry_money_enabled(),
+            "available":           True,
+            "fast_entry_trigger":  micro_ready,
+            "seconds_bias":        seconds_bias,
+            "micro_sweep":         micro_sweep,
+            "micro_choch":         micro_choch,
+            "delta_flip":          delta_flip,
+            "micro_vwap_status":   micro_vwap_status,
+            "early_entry_allowed": allowed,
+            "entry_confidence":    conf,
+            "fast_entry_reason":   reason,
+            "direction":           seconds_bias if allowed else None,
+            "htf":                 htf,
+        }
+    except Exception as exc:
+        logger.error("Fast-entry compute error (non-fatal): %s", exc)
+        return _fast_entry_neutral("Fast entry unavailable (%s)." % exc)
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -13576,6 +13914,18 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     except Exception as _ar_exc:
         result["analyst_report"] = _analyst_report_neutral_block(
             "Analyst report unavailable (%s)." % _ar_exc)
+
+    # ── Fast Entry Trigger (seconds-timing) — DISPLAY-FIRST aggregator ────────
+    # SINGLE computation point AFTER every verdict override above (open / vetoed /
+    # closed paths all land here). CONSUMES ONLY the already-assembled strict output
+    # (never recomputes the gate) plus the fresh micro-event snapshot, and returns
+    # the inert neutral block while closed / off (so it never reads as tradeable).
+    # FAIL-OPEN. The optional money path is wired separately in the single-threaded
+    # webhook worker — this attach is display / state only.
+    try:
+        result["fast_entry"] = _compute_fast_entry_trigger(result, instrument_of(active_ticker))
+    except Exception as _fe_exc:
+        result["fast_entry"] = _fast_entry_neutral("Fast entry unavailable (%s)." % _fe_exc)
     return result
 
 
@@ -19453,6 +19803,13 @@ def webhook():
         except Exception as exc:
             logger.error("Dual-TF 5s record/enqueue error (non-fatal): %s", exc)
 
+    # ── Fast Entry Trigger seconds micro-event ingestion — DISPLAY / STATE only ──
+    #    Self-guards to a no-op unless FAST_ENTRY_TRIGGER + SCALP. Records the micro
+    #    event into FAST_ENTRY_STATE_BY_TICKER so the aggregator (full_analysis) and
+    #    the optional worker money path can read a fresh snapshot. It NEVER enqueues
+    #    or fires here — the money decision lives in the single-threaded worker.
+    _fast_entry_record(normalized, resolved_inst, data)
+
     # Data-only CVD / volume-spike ack (store written ABOVE, before the enqueue).
     if _data_only_resp is not None:
         return _data_only_resp
@@ -19462,6 +19819,13 @@ def webhook():
     # falls through to scoring even when the flag is OFF.
     if normalized in DUAL_TF_FAST_TYPES:
         return jsonify({"status": "dual_tf_signal", "alert_type": normalized,
+                        "ticker": resolved_inst, "price": parsed_price}), 200
+
+    # Fast Entry seconds micro-events ack fast — recorded above (display / state
+    # only), kept OUT of the scoring lane (no full_analysis, no money decision here;
+    # the optional money path is evaluated in the single-threaded webhook worker).
+    if normalized in FAST_ENTRY_TYPES:
+        return jsonify({"status": "fast_entry_signal", "alert_type": normalized,
                         "ticker": resolved_inst, "price": parsed_price}), 200
 
     # ── Data-only VWAP push — store already updated above; ack without scoring ──
@@ -20223,6 +20587,7 @@ def status():
         "trade_memory":        a.get("trade_memory"),
         "analyst_report":      a.get("analyst_report"),
         "entry_quality":       a.get("entry_quality"),
+        "fast_entry":          a.get("fast_entry"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
