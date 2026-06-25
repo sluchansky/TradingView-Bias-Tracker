@@ -1,0 +1,71 @@
+Upgrade the Entry Quality Display so it becomes actionable, not just diagnostic.
+
+Current issue:
+The bot correctly identifies poor trade location, but it only says “Poor Location” or “Overextended.” I need it to also explain where a better entry would be and what conditions would improve the score.
+
+Changes needed:
+
+1. Add “Better Entry Zone”
+When Entry Quality is below 70, show a better entry area.
+
+Use:
+- VWAP pullback zone
+- nearest demand/supply zone
+- 50% pullback of current impulse
+- prior breakout/retest level
+
+Example:
+Better Entry Zone: 4037.50 - 4039.00
+Reason: closer to VWAP and demand support.
+
+2. Add “What Improves This Trade”
+Show exactly what would raise the score.
+
+Example:
+Score now: 62/100
+
+Would improve if:
+- Price pulls back closer to VWAP: +12
+- Bullish candle confirms support: +8
+- CVD/order flow confirms buyers: +10
+- Liquidity sweep occurs first: +6
+
+Projected score if confirmed: 88/100
+
+3. Change ATR Extension scoring
+Right now ATR Extension goes straight to 0 when price is too extended. Make it graduated:
+
+0-1 ATR from VWAP = 12 points
+1-2 ATR = 10 points
+2-3 ATR = 7 points
+3-4 ATR = 4 points
+4-5 ATR = 2 points
+Over 5 ATR = 0 points
+
+4. Add “Chasing Warning”
+If price is more than 3 ATR from VWAP, display:
+
+CHASING WARNING:
+Price is extended from fair value. Do not enter unless there is a fresh pullback/retest or strong order-flow confirmation.
+
+5. Add “Entry Plan”
+Instead of only saying WAIT, show the next actionable step.
+
+Example:
+ENTRY PLAN:
+Wait for pullback into 4037.50 - 4039.00.
+Then require:
+- bullish rejection candle
+- CVD/Delta confirmation
+- stop below demand
+- target back toward recent high
+
+6. Keep Entry Quality separate from Edge Score
+A trade can have good direction but bad location.
+Do not let Entry Quality fully replace the main Edge Score.
+Use Entry Quality as a final execution filter.
+
+Rules:
+- Edge Score = setup quality
+- Entry Quality = whether the current price is a smart entry
+- If Edge is strong but Entry Quality is poor, verdict should be WAIT FOR BETTER ENTRY, not NO TRADE.

@@ -71,19 +71,41 @@ those sibling vetoes**.
   the existing demote-only veto, so all veto/flag-gating invariants are unchanged. The TRAP
   fixture in the smoke proves uncapped~77 → capped <70.
 
-## Display-only additions (raw / improvement plan / projection / plain-English)
-- `raw` (price/vwap/distance/atr/atr_timeframe/atr_extension/decision), `improvement_plan`,
-  `projected_low/high`, and `plain_english` are **display-only** and ride the existing
-  `result["entry_quality"]` (already `/status`-whitelisted, no new route).
-- `_projected(target)` only lifts the **waitable** components (`_improvable`) up to `target`;
-  a completed liquidity sweep is the one component that can't be waited into existence, so it
-  is excluded. Projection is clamped monotonic via `max(score, ...)` so it can never read
-  below the live score.
-  **How to apply:** keep `_improvable` keys in sync with `ENTRY_QUALITY_COMPONENTS` keys and
-  with whatever bullets the plan emits — if a plan bullet says "wait for X", X's component
-  should be in `_improvable` or the projected range won't reflect that advice.
-- The **neutral / no-candidate early return must include every new key** (raw={}, plan=[],
-  projected_*, plain_english, strong_reject) or the dashboard JS reads undefined.
+## Graduated ATR-extension component score (NOT linear)
+- The ATR-extension component is scored in **discrete bands**, not a linear ramp:
+  0–1 ATR=full, then stepping down by band to 0 once price is many ATR past VWAP
+  (the exact band points live in the code — read them, don't re-derive).
+  **Why:** a linear `1 - lin(ext, 0.5, 3.0)` punished a perfectly normal ~1 ATR push the
+  same way it rewarded a flat entry, and the cliff was too soft to flag real chasing. Bands
+  give a stable "good until ~1 ATR, then progressively worse" curve that matches how a
+  trader actually reads extension.
+  **How to apply:** the band boundaries are the contract the smoke pins (GOOD ext=0.2 →
+  unchanged); if you retune them, update the fixture expectations in lockstep.
+
+## Actionable display layer (verdict tiers / improvements+deltas / zone / chasing / plan)
+- All of these are **display-only**, ride the existing `result["entry_quality"]` (already
+  `/status`-whitelisted, no new route), and the **neutral / no-candidate early return must
+  include EVERY one of them** (mirror the keys, defaulting to None/[]) or the dashboard JS
+  reads undefined.
+- `verdict_label`/`verdict_tier` (ok / better_entry / caution / bad) are the user-facing
+  read of the SAME reject/override/strong_reject state the veto already computes — they do
+  NOT add a new decision. The durable rule: **a strong Edge (>=70) over a poor LOCATION is
+  "WAIT FOR BETTER ENTRY" (better_entry tier), not a hard NO-TRADE** — Entry Quality is the
+  execution-timing filter, not the setup-quality gate. The Edge>=`OVERRIDE_EDGE` case stays
+  its own override tier.
+- `improvements` is the structured form of `improvement_plan`: `[{text, points}]`, where
+  `points` is the per-condition delta from `_eq_weight`. `improvement_plan` (plain strings)
+  is kept for backward-compat; the JS falls back to it when `improvements` is absent.
+- `better_entry_zone {low, high, reasons}`, `chasing_warning` (string, fires only when
+  ext > 3 ATR), and `entry_plan {wait_for, then_require[], stop, target}` make a WAIT
+  actionable instead of a dead end. Numeric prices are coerced/escaped via `_eqEsc` in JS.
+- `_projected(target)` lifts only the **waitable** components (`_improvable`) up to `target`,
+  clamped monotonic via `max(score, ...)` so it never reads below the live score.
+  **`sweep_complete` IS now in `_improvable`** (a sweep can be *waited for* — the older note
+  that it was excluded is obsolete).
+  **How to apply:** keep `_improvable` keys in sync with `ENTRY_QUALITY_COMPONENTS` and with
+  whatever the plan/improvement bullets emit — if a bullet says "wait for X", X's component
+  must be in `_improvable` or the projected range won't reflect that advice.
 
 ## Testing
 - The strict-gate goldens snapshot the strict funcs ONLY (not `full_analysis`), so they
