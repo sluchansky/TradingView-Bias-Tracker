@@ -832,6 +832,46 @@ def set_learning_gate(value):
     return _learning_gate_enabled()
 
 
+# ── Entry Quality Engine flags (display ON by default; money-path veto OFF) ─────
+# Mirrors the Professional Review / Trade Debate / Learning flags. The Entry
+# Quality Engine scores WHETHER THIS IS A GOOD LOCATION TO ENTER (separate from the
+# strict IF-valid gate); it is a pre-READY DISPLAY layer by default. The WAIT veto
+# is OFF until the operator arms it (the runtime toggle wins over the env seed and
+# RESETS on restart — fail-safe bias toward NOT interfering with live trading).
+ENTRY_QUALITY_MIN_SCORE     = 70     # below this = poor entry location (Reject band)
+ENTRY_QUALITY_OVERRIDE_EDGE = 90     # Edge >= this = "extremely high confidence" → veto suppressed
+_ENTRY_QUALITY_GATE_OVERRIDE = None  # runtime dashboard toggle; None = follow env
+
+
+def _entry_quality_engine_enabled():
+    """Entry Quality DISPLAY layer — ON by default (fail-open). Env
+    ENTRY_QUALITY_ENGINE_ENABLED=0 hard-disables it as an emergency kill-switch; a
+    bug inside the engine is already swallowed into a neutral block by the caller."""
+    return os.environ.get("ENTRY_QUALITY_ENGINE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _entry_quality_gate_enabled():
+    """Entry Quality money-path VETO — OFF by default. When ON, a poor entry LOCATION
+    (score below the threshold) may only DEMOTE an actionable gate verdict to WAIT —
+    unless confidence is extremely high (Edge >= ENTRY_QUALITY_OVERRIDE_EDGE), which
+    suppresses the veto. It can NEVER promote / force a trade. The runtime dashboard
+    toggle (_ENTRY_QUALITY_GATE_OVERRIDE) wins over the env seed so live trading
+    stays byte-identical until the operator arms it."""
+    if _ENTRY_QUALITY_GATE_OVERRIDE is not None:
+        return bool(_ENTRY_QUALITY_GATE_OVERRIDE)
+    return os.environ.get("ENTRY_QUALITY_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_entry_quality_gate(value):
+    """Runtime override for the Entry Quality VETO (dashboard toggle). Passing None
+    restores env-seed behaviour. RESETS to None on restart (the module global
+    re-initialises), keeping the fail-safe bias toward NOT interfering with live
+    trading after a republish."""
+    global _ENTRY_QUALITY_GATE_OVERRIDE
+    _ENTRY_QUALITY_GATE_OVERRIDE = None if value is None else bool(value)
+    return _entry_quality_gate_enabled()
+
+
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
 # EARLY READY (SCALP Edge 50-59) is actionable but lower-conviction (half size)
 # than a full READY (Edge >= 60). Both end in the word "READY", so verdict.endswith(
@@ -11022,6 +11062,331 @@ def _analyst_report_update_prev(inst, report):
             ANALYST_REPORT_PREV_CONF[inst] = {"score": score, "components": comps, "ts": now}
 
 
+# ---------------------------------------------------------------------------
+# Entry Quality Engine (LOCATION-aware) — DISPLAY by default; flag-gated veto.
+# ---------------------------------------------------------------------------
+# Separate from the strict gate (which decides IF a setup is valid). This layer
+# answers WHETHER THIS IS A GOOD PLACE TO ENTER: distance to nearest resistance /
+# support, % of the current impulse already completed, ATR extension from the mean
+# (VWAP), pullback quality, momentum accel/decel, whether a liquidity sweep has
+# completed, and three location traps (chasing a breakout, buying near a swing
+# high, selling near a swing low). A technically-correct setup can still be
+# rejected for poor LOCATION. Score 0-100 (>=90 Excellent / >=80 Good / >=70
+# Acceptable / <70 Reject) — and a sub-70 reject only DEMOTES when the veto is
+# armed AND confidence is NOT extremely high (Edge >= ENTRY_QUALITY_OVERRIDE_EDGE).
+# Direction-aware; EVERY sub-score FAILS OPEN to a neutral fraction so missing
+# alert data can never manufacture a false reject.
+_EQ_NEUTRAL_FRAC = 0.70  # fail-open fraction when a sub-score's inputs are missing
+# (key, label, weight) — weights sum to 100. LOCATION-only; orthogonal to Edge.
+ENTRY_QUALITY_COMPONENTS = (
+    ("room_to_resistance",  "Room to Resistance", 12),
+    ("cushion_at_support",  "Cushion at Support", 12),
+    ("impulse_completed",   "Impulse Completed",  12),
+    ("atr_extension",       "ATR Extension",      12),
+    ("pullback_quality",    "Pullback Quality",   12),
+    ("momentum",            "Momentum",           10),
+    ("sweep_complete",      "Liquidity Sweep",    10),
+    ("not_chasing",         "Not Chasing",         8),
+    ("not_near_swing_high", "Not At Swing High",   6),
+    ("not_near_swing_low",  "Not At Swing Low",    6),
+)
+
+
+def _eq_grade(score):
+    if score is None:
+        return None
+    if score >= 90:
+        return "Excellent"
+    if score >= 80:
+        return "Good"
+    if score >= ENTRY_QUALITY_MIN_SCORE:
+        return "Acceptable"
+    return "Poor"
+
+
+def _eq_lin(x, lo, hi):
+    """0..1 as x sweeps lo..hi (clamped). Returns None if x is None."""
+    if x is None:
+        return None
+    if hi == lo:
+        return 1.0
+    return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+
+def _entry_quality_neutral_block(reason="Entry Quality engine disabled.", direction=None):
+    """Inert Entry Quality block — veto_would_fire=False so it can NEVER demote.
+    Used when the engine is disabled, the inputs are missing, the market is closed,
+    or compute_entry_quality raised (fail-open)."""
+    return {
+        "engine_enabled":   _entry_quality_engine_enabled(),
+        "gate_enabled":     _entry_quality_gate_enabled(),
+        "available":        False,
+        "direction":        direction,
+        "score":            None,
+        "grade":            None,
+        "components":       [],
+        "flags":            {},
+        "reject":           False,
+        "override_applied": False,
+        "veto_would_fire":  False,
+        "min_score":        ENTRY_QUALITY_MIN_SCORE,
+        "override_edge":    ENTRY_QUALITY_OVERRIDE_EDGE,
+        "edge_score":       None,
+        "summary":          reason,
+        "why_not_trade":    "",
+        "final_verdict":    None,
+    }
+
+
+def compute_entry_quality(result, strict=None, swing_ctx=None):
+    """LOCATION-aware entry-quality score (0-100) computed from the FINAL assembled
+    result. DISPLAY-ONLY here; the flag-gated veto is wired in full_analysis and can
+    only DEMOTE. Direction = the gate's strict_direction (or its forming candidate).
+    Every sub-score fails open to a neutral fraction, so missing data yields ~70
+    (Acceptable), never a false reject."""
+    direction = (result.get("strict_direction")
+                 or result.get("gate_candidate")
+                 or (strict.get("candidate") if isinstance(strict, dict) else None))
+    price = result.get("current_price")
+    if direction not in ("Long", "Short") or not price:
+        return _entry_quality_neutral_block(
+            "No directional candidate — entry location not evaluated.", direction=direction)
+    is_long = (direction == "Long")
+
+    vol = result.get("volatility") or {}
+    atr = vol.get("atr_pts")
+    unit = atr if (isinstance(atr, (int, float)) and atr > 0) else (price * 0.0015)
+
+    resistance = result.get("nearest_supply")   # level ABOVE price
+    support    = result.get("nearest_demand")   # level BELOW price
+    vwap       = result.get("vwap_value")
+
+    # Profit-direction ("target") and entry-side ("cushion") levels.
+    target_level = resistance if is_long else support
+    entry_level  = support    if is_long else resistance
+
+    fracs, details = {}, {}
+
+    # 1) Room to resistance/target — want room to run in the profit direction.
+    if target_level and unit:
+        room = (target_level - price) if is_long else (price - target_level)
+        if room <= 0:
+            fracs["room_to_resistance"] = 1.0   # broke past → open road (chasing scored below)
+            details["room_to_resistance"] = "clear (price beyond level)"
+        else:
+            fracs["room_to_resistance"] = _eq_lin(room / unit, 0.3, 2.0)
+            details["room_to_resistance"] = "%.2f ATR to target" % (room / unit)
+    else:
+        fracs["room_to_resistance"] = _EQ_NEUTRAL_FRAC
+        details["room_to_resistance"] = "no level"
+
+    # 2) Cushion at support — entering near the trade-side zone = tight risk.
+    if entry_level and unit:
+        dist = (price - entry_level) if is_long else (entry_level - price)
+        if dist < 0:
+            fracs["cushion_at_support"] = 0.20   # price beyond the zone (broken)
+            details["cushion_at_support"] = "beyond zone"
+        else:
+            fracs["cushion_at_support"] = 1.0 - (_eq_lin(dist / unit, 0.2, 2.5) or 0.0)
+            details["cushion_at_support"] = "%.2f ATR from zone" % (dist / unit)
+    else:
+        fracs["cushion_at_support"] = _EQ_NEUTRAL_FRAC
+        details["cushion_at_support"] = "no zone"
+
+    # 3) Impulse completed — early in the leg = good; late (>~80%) = poor.
+    impulse_pct = None
+    if entry_level and target_level and target_level != entry_level:
+        span = (target_level - entry_level) if is_long else (entry_level - target_level)
+        if span:
+            prog = ((price - entry_level) / span) if is_long else ((entry_level - price) / span)
+            prog = max(0.0, min(1.0, prog))
+            impulse_pct = int(round(prog * 100))
+            fracs["impulse_completed"] = 1.0 - (_eq_lin(prog, 0.45, 0.95) or 0.0)
+            details["impulse_completed"] = "%d%% of leg done" % impulse_pct
+        else:
+            fracs["impulse_completed"] = _EQ_NEUTRAL_FRAC
+            details["impulse_completed"] = "n/a"
+    else:
+        fracs["impulse_completed"] = _EQ_NEUTRAL_FRAC
+        details["impulse_completed"] = "no leg"
+
+    # 4) ATR extension from the mean (VWAP) — far beyond mean in trade dir = stretched.
+    ext = None
+    if vwap and unit:
+        ext = ((price - vwap) if is_long else (vwap - price)) / unit
+        if ext <= 0:
+            fracs["atr_extension"] = 1.0   # at/below the mean (for a long) = not extended
+            details["atr_extension"] = "%.2f ATR from VWAP" % ext
+        else:
+            fracs["atr_extension"] = 1.0 - (_eq_lin(ext, 0.5, 3.0) or 0.0)
+            details["atr_extension"] = "%.2f ATR beyond VWAP" % ext
+    else:
+        fracs["atr_extension"] = _EQ_NEUTRAL_FRAC
+        details["atr_extension"] = "no VWAP"
+
+    # 5) Pullback quality — entering on a controlled retrace (calmer side of VWAP,
+    #    near the zone), not at full extension.
+    if vwap and entry_level and unit:
+        below_mean = (price <= vwap) if is_long else (price >= vwap)
+        adist = abs(price - entry_level) / unit
+        frac = (0.60 if below_mean else 0.25) + 0.40 * (1.0 - (_eq_lin(adist, 0.2, 2.0) or 0.0))
+        fracs["pullback_quality"] = max(0.0, min(1.0, frac))
+        details["pullback_quality"] = "retraced toward zone" if below_mean else "above mean"
+    else:
+        fracs["pullback_quality"] = _EQ_NEUTRAL_FRAC
+        details["pullback_quality"] = "insufficient data"
+
+    # 6) Momentum accel/decel — heuristic (alert-driven, limited OHLC): CVD direction
+    #    alignment + RVOL + volume confirmation.
+    cvd_dir = (result.get("cvd_direction") or "").lower()
+    rvol = result.get("rvol_value")
+    volume_confirmed = bool(result.get("volume_confirmed"))
+    if cvd_dir in ("bullish", "bearish") or isinstance(rvol, (int, float)) or volume_confirmed:
+        m = 0.5
+        if cvd_dir == ("bullish" if is_long else "bearish"):
+            m += 0.25
+        elif cvd_dir == ("bearish" if is_long else "bullish"):
+            m -= 0.25
+        if isinstance(rvol, (int, float)) and rvol >= 1.3:
+            m += 0.15
+        if volume_confirmed:
+            m += 0.10
+        fracs["momentum"] = max(0.0, min(1.0, m))
+        details["momentum"] = "CVD %s%s%s" % (
+            cvd_dir or "?",
+            (" · RVOL %.1f" % rvol) if isinstance(rvol, (int, float)) else "",
+            " · vol✓" if volume_confirmed else "")
+    else:
+        fracs["momentum"] = _EQ_NEUTRAL_FRAC
+        details["momentum"] = "no order-flow"
+
+    # 7) Liquidity sweep complete — a swept stop run before entry is a PLUS.
+    conf = result.get("confluences")
+    sweep_present = None
+    if isinstance(conf, dict):
+        if "liquidity_sweep" in conf:
+            sweep_present = bool(conf.get("liquidity_sweep"))
+        else:
+            for _sub in conf.values():
+                if isinstance(_sub, dict) and _sub.get("liquidity_sweep"):
+                    sweep_present = True
+                    break
+    if sweep_present is True:
+        fracs["sweep_complete"] = 1.0
+        details["sweep_complete"] = "sweep confirmed"
+    elif sweep_present is False:
+        fracs["sweep_complete"] = 0.55
+        details["sweep_complete"] = "no sweep"
+    else:
+        fracs["sweep_complete"] = _EQ_NEUTRAL_FRAC
+        details["sweep_complete"] = "unknown"
+
+    # 8) Not chasing a breakout — price extended beyond the broken level / the mean.
+    chasing = False
+    if target_level and unit:
+        room = (target_level - price) if is_long else (price - target_level)
+        if room <= 0 and (abs(price - target_level) / unit) > 0.5:
+            chasing = True
+    if ext is not None and ext > 2.0:
+        chasing = True
+    fracs["not_chasing"] = 0.15 if chasing else 1.0
+    details["not_chasing"] = "chasing" if chasing else "ok"
+
+    # 9/10) Swing-high/low traps — buying near a swing high (long) or selling near a
+    #       swing low (short). The opposite trap is N/A for the active direction (full
+    #       marks). Uses swing_ctx extremes when present (SWING), else the nearest zone
+    #       as a proxy (SCALP).
+    near_high = near_low = False
+    highs = (swing_ctx or {}).get("swing_highs") if isinstance(swing_ctx, dict) else None
+    lows  = (swing_ctx or {}).get("swing_lows")  if isinstance(swing_ctx, dict) else None
+    if is_long:
+        ref_high = None
+        if highs:
+            above = [h for h in highs if h and h >= price]
+            ref_high = min(above) if above else None
+        if ref_high is None and resistance and resistance >= price:
+            ref_high = resistance
+        if ref_high and unit and 0 <= (ref_high - price) / unit < 0.4:
+            near_high = True
+        fracs["not_near_swing_high"] = 0.2 if near_high else 1.0
+        fracs["not_near_swing_low"]  = 1.0   # N/A for a long
+        details["not_near_swing_high"] = "at swing high" if near_high else "clear"
+        details["not_near_swing_low"]  = "n/a (long)"
+    else:
+        ref_low = None
+        if lows:
+            below = [l for l in lows if l and l <= price]
+            ref_low = max(below) if below else None
+        if ref_low is None and support and support <= price:
+            ref_low = support
+        if ref_low and unit and 0 <= (price - ref_low) / unit < 0.4:
+            near_low = True
+        fracs["not_near_swing_low"]  = 0.2 if near_low else 1.0
+        fracs["not_near_swing_high"] = 1.0   # N/A for a short
+        details["not_near_swing_low"]  = "at swing low" if near_low else "clear"
+        details["not_near_swing_high"] = "n/a (short)"
+
+    # ── Assemble the 0-100 location score from the weighted sub-scores. ──
+    components = []
+    total = 0.0
+    for key, label, weight in ENTRY_QUALITY_COMPONENTS:
+        frac = fracs.get(key)
+        if frac is None:
+            frac = _EQ_NEUTRAL_FRAC
+        pts = weight * frac
+        total += pts
+        components.append({
+            "key": key, "label": label, "max": weight,
+            "score": round(pts, 1), "detail": details.get(key, ""),
+        })
+    score = int(round(max(0.0, min(100.0, total))))
+    grade = _eq_grade(score)
+
+    edge_score = result.get("edge_score")
+    reject = score < ENTRY_QUALITY_MIN_SCORE
+    override_applied = bool(reject and isinstance(edge_score, (int, float))
+                           and edge_score >= ENTRY_QUALITY_OVERRIDE_EDGE)
+    veto_would_fire = bool(reject and not override_applied)
+
+    # Worst two LOCATION factors → the human "why not enter here" reason.
+    worst = sorted(components, key=lambda c: (c["score"] - c["max"]))[:2]
+    why = ""
+    if reject:
+        why = "Poor entry location — " + "; ".join(
+            "%s (%s)" % (c["label"].lower(), c["detail"]) for c in worst if c["detail"])
+        if override_applied:
+            why += " — overridden (Edge %s ≥ %d)." % (edge_score, ENTRY_QUALITY_OVERRIDE_EDGE)
+
+    flags = {
+        "chasing_breakout": bool(chasing),
+        "near_swing_high":  bool(near_high),
+        "near_swing_low":   bool(near_low),
+        "sweep_complete":   (bool(sweep_present) if sweep_present is not None else None),
+        "overextended":     bool(ext is not None and ext > 2.0),
+        "impulse_pct":      impulse_pct,
+    }
+
+    return {
+        "engine_enabled":   _entry_quality_engine_enabled(),
+        "gate_enabled":     _entry_quality_gate_enabled(),
+        "available":        True,
+        "direction":        direction,
+        "score":            score,
+        "grade":            grade,
+        "components":       components,
+        "flags":            flags,
+        "reject":           reject,
+        "override_applied": override_applied,
+        "veto_would_fire":  veto_would_fire,
+        "min_score":        ENTRY_QUALITY_MIN_SCORE,
+        "override_edge":    ENTRY_QUALITY_OVERRIDE_EDGE,
+        "edge_score":       edge_score,
+        "summary":          "Entry Quality %d/100 (%s) — %s" % (score, grade, direction),
+        "why_not_trade":    why,
+        "final_verdict":    None,
+    }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -11836,6 +12201,53 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             # it so every display surface agrees with the demoted WAIT verdict.
             result["decision_support"] = _decision_support(result)
             result["trade_debate"]["judge"]["final_verdict"] = "WAIT"
+        # ── Entry Quality Engine (LOCATION-aware): scores WHETHER this is a good
+        #    PLACE to enter (distance to S/R, impulse % completed, ATR extension,
+        #    pullback, momentum, sweep, chasing, swing-high/low). DISPLAY-ONLY here;
+        #    computed on the FINAL assembled result so it reflects every override
+        #    above. Mirrors the analyst / pro-review / debate layers. ──────────────
+        if _entry_quality_engine_enabled():
+            try:
+                result["entry_quality"] = compute_entry_quality(result, strict, swing_ctx)
+            except Exception as exc:   # FAIL-OPEN — a broken engine must never crash analysis.
+                result["entry_quality"] = _entry_quality_neutral_block(
+                    "Entry Quality unavailable (%s)." % exc)
+        else:
+            result["entry_quality"] = _entry_quality_neutral_block("Entry Quality engine disabled.")
+        # Fail-CLOSED veto (flag-gated, default OFF): only when explicitly armed AND
+        # the entry LOCATION is poor (veto_would_fire = score < threshold and NOT an
+        # extremely-high-confidence override) AND the gate verdict is still
+        # actionable. It can ONLY demote to WAIT — never promote. The neutral /
+        # disabled / market-closed stub sets veto_would_fire=False so it can NEVER
+        # demote. Mirrors the pro-review / trade-debate vetoes.
+        _eq = result.get("entry_quality") or {}
+        if (_entry_quality_gate_enabled() and _eq.get("veto_would_fire")
+                and is_actionable(result["verdict"])):
+            _eq_reason = ("Entry Quality veto: "
+                          + (_eq.get("why_not_trade")
+                             or ("entry location is poor (%s/100)." % _eq.get("score"))))
+            result["verdict"]       = "WAIT"
+            result["strict_label"]  = "WAIT"
+            result["strict_reason"] = _eq_reason
+            result["trade_plan"]    = {
+                "trade_plan": False, "reason": _eq_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": result.get("strict_direction"),
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
+            for _vd in ("Long", "Short"):
+                _vblk = (result.get("directions") or {}).get(_vd)
+                if _vblk:
+                    _vblk.update(ready=False, label="WAIT")
+            _ad = result.get("alert_diagnostics") or {}
+            _ad["ready_reason"]     = ""
+            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Entry Quality veto"]
+            result["alert_diagnostics"] = _ad
+            # Decision-support was computed earlier from the pre-veto plan — recompute
+            # it so every display surface agrees with the demoted WAIT verdict.
+            result["decision_support"] = _decision_support(result)
+            result["entry_quality"]["final_verdict"] = "WAIT"
 
     # ── Learning Engine v2 (display-only): Confidence Governor + Trade Memory.
     # Computed on the ASSEMBLED result AFTER pro_review/trade_debate so grade /
@@ -11999,6 +12411,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["confidence_governor"] = _governor_neutral_block(
             result, reason="Market closed — live alerts paused.")
         result["trade_memory"]        = _memory_neutral_block(
+            "Market closed — live alerts paused.")
+        result["entry_quality"]       = _entry_quality_neutral_block(
             "Market closed — live alerts paused.")
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
@@ -18348,6 +18762,7 @@ def status():
         "confidence_governor": a.get("confidence_governor"),
         "trade_memory":        a.get("trade_memory"),
         "analyst_report":      a.get("analyst_report"),
+        "entry_quality":       a.get("entry_quality"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -19926,6 +20341,29 @@ def dashboard():
   <div id="pr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
+<!-- Entry Quality Engine (LOCATION-aware: is this a GOOD place to enter? Distance to
+     S/R, impulse % done, ATR extension, pullback, momentum, sweep, chasing, swing
+     traps). DISPLAY by default; the money-path veto is flag-gated server-side,
+     default OFF. Hidden unless the engine is enabled. -->
+<div class="mod" id="mod-entryq" style="display:none">
+  <div class="mod-h">🎯 Entry Quality <span id="eq-badge" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
+    <span style="font-size:11px;color:#9aa">Location score — separate from the Edge gate</span>
+    <span id="eq-gate-toggle" role="button" tabindex="0" onclick="toggleEntryGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEntryGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Veto: off</span>
+  </div>
+  <div style="display:flex;align-items:baseline;gap:10px;margin:2px 0 6px">
+    <div id="eq-score" style="font-size:28px;font-weight:800">—</div>
+    <div id="eq-grade" style="font-size:14px;font-weight:700">—</div>
+    <div id="eq-dir" style="font-size:12px;color:#9aa"></div>
+  </div>
+  <div id="eq-bars"></div>
+  <div class="se-bias-h">Location Flags</div>
+  <div id="eq-flags" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+  <div class="se-bias-h">Assessment</div>
+  <div class="se-reason" id="eq-why">—</div>
+  <div id="eq-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
 <!-- Trade Debate Engine (Bull vs Bear vs Decision Judge; pre-READY internal debate.
      DISPLAY by default; the money-path veto is flag-gated server-side, default OFF.
      Hidden unless the engine is enabled.) -->
@@ -20454,6 +20892,7 @@ let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_liv
 let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
 let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
 let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
+let EQ_GATE_STATE = false;  // Entry Quality money-path veto, painted by renderEntryQuality() from /status
 let LEARNING_GATE_STATE = false;  // Learning-demotion money-path veto, painted by renderConfidenceGovernor() from /status
 async function loadAutoTrade(){
   try {
@@ -21103,6 +21542,9 @@ function renderModules(d){
   // ── Module 11b: Professional Review — pre-READY pro-trader grading (DISPLAY-ONLY) ──
   renderProReview(d);
 
+  // ── Module 11b2: Entry Quality — LOCATION-aware entry grading (DISPLAY-ONLY) ──
+  renderEntryQuality(d);
+
   // ── Module 11c: Trade Debate — pre-READY Bull vs Bear vs Judge (DISPLAY-ONLY) ──
   renderTradeDebate(d);
 
@@ -21397,6 +21839,81 @@ function toggleProGate(){
       toast(PRO_GATE_STATE ? 'Pro Review VETO ARMED — may demote to WAIT' : 'Pro Review veto off');
     })
     .catch(function(){ PRO_GATE_STATE=cur; toast('Pro Review veto update failed', false); });
+}
+
+// Entry Quality Engine — LOCATION-aware "is this a good place to enter?" grading.
+// DISPLAY-ONLY on the dashboard; the money-path veto is flag-gated server-side. Fed
+// by d.entry_quality. Dynamic webhook-derived text is written via textContent; the
+// component / flag chips are app-generated and HTML-escaped via _eqEsc.
+function _eqGradeColor(g){ return g==='Excellent'?'#22c55e':g==='Good'?'#84cc16':g==='Acceptable'?'#f59e0b':g==='Poor'?'#ef4444':'#6b7280'; }
+function _eqEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderEntryQuality(d){
+  const eq=(d && d.entry_quality) || null;
+  const mod=document.getElementById('mod-entryq');
+  if(!mod) return;
+  if(!eq || !eq.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id,txt,col){ const e=document.getElementById(id); if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; } };
+  EQ_GATE_STATE = !!eq.gate_enabled;
+  const badge=document.getElementById('eq-badge');
+  if(badge){ badge.textContent=eq.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=eq.gate_enabled?'#ef4444':'#6b7280'; }
+  const score=(eq.score!=null)?eq.score:null;
+  _set('eq-score', score!=null?score:'—', _eqGradeColor(eq.grade));
+  _set('eq-grade', eq.grade||'—', _eqGradeColor(eq.grade));
+  _set('eq-dir', eq.direction?('· '+eq.direction):(eq.available?'':'· no candidate'), '#9aa');
+  const bars=document.getElementById('eq-bars');
+  if(bars){
+    const comps=eq.components||[];
+    bars.innerHTML=comps.map(function(c){
+      const frac=c.max?Math.max(0,Math.min(1,c.score/c.max)):0;
+      const pct=Math.round(frac*100);
+      const col=frac>=0.8?'#22c55e':frac>=0.55?'#f59e0b':'#ef4444';
+      return '<div style="margin:3px 0">'
+        +'<div style="display:flex;justify-content:space-between;font-size:11px;color:#9aa">'
+        +'<span>'+_eqEsc(c.label)+'</span><span style="color:'+col+'">'+c.score+'/'+c.max+'</span></div>'
+        +'<div style="height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden">'
+        +'<div style="height:100%;width:'+pct+'%;background:'+col+'"></div></div>'
+        +(c.detail?'<div style="font-size:9px;color:#6b7280">'+_eqEsc(c.detail)+'</div>':'')
+        +'</div>';
+    }).join('');
+  }
+  const fl=document.getElementById('eq-flags');
+  if(fl){
+    const flags=eq.flags||{};
+    const chips=[];
+    const add=function(label,bad){ chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+(bad?'#ef4444':'#22c55e')+';background:'+(bad?'rgba(239,68,68,.12)':'rgba(34,197,94,.12)')+'">'+(bad?'⚠ ':'✓ ')+_eqEsc(label)+'</span>'); };
+    add('Chasing', !!flags.chasing_breakout);
+    if(eq.direction==='Long') add('At Swing High', !!flags.near_swing_high);
+    if(eq.direction==='Short') add('At Swing Low', !!flags.near_swing_low);
+    add('Overextended', !!flags.overextended);
+    if(flags.sweep_complete===true) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#22c55e;background:rgba(34,197,94,.12)">✓ Sweep Done</span>');
+    if(flags.impulse_pct!=null) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#9aa;background:rgba(148,163,184,.12)">Impulse '+flags.impulse_pct+'%</span>');
+    fl.innerHTML=chips.join('');
+  }
+  let assess=eq.why_not_trade||'';
+  if(!assess){
+    if(eq.available && score!=null){ assess=(score>=(eq.min_score!=null?eq.min_score:70))?('Good entry location ('+(eq.grade||'')+').'):'Poor entry location.'; }
+    else { assess=eq.summary||'Entry location not evaluated.'; }
+  }
+  _set('eq-why', assess);
+  const gt=document.getElementById('eq-gate-toggle');
+  if(gt){ gt.textContent=eq.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=eq.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=eq.gate_enabled?'#ef4444':'var(--border)'; }
+  _set('eq-foot', 'Reject < '+(eq.min_score!=null?eq.min_score:70)+'/100 unless Edge ≥ '+(eq.override_edge!=null?eq.override_edge:90)+(eq.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)')+(eq.override_applied?' · override active':''));
+}
+function toggleEntryGate(){
+  const cur=!!EQ_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Entry Quality VETO? While ARMED, a poor entry LOCATION (score below threshold) can DEMOTE an actionable setup to WAIT — unless confidence is extremely high (Edge override). It can NEVER force a trade. Affects AUTO-trades and READY alerts; manual ENTER is unaffected.')) return;
+  EQ_GATE_STATE=next;
+  const gt=document.getElementById('eq-gate-toggle');
+  if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/entry-quality', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ EQ_GATE_STATE=cur; toast('Entry Quality veto update failed', false); return; }
+      EQ_GATE_STATE=!!d.gate_enabled;
+      toast(EQ_GATE_STATE ? 'Entry Quality VETO ARMED — may demote to WAIT' : 'Entry Quality veto off');
+    })
+    .catch(function(){ EQ_GATE_STATE=cur; toast('Entry Quality veto update failed', false); });
 }
 
 // Trade Debate Engine — pre-READY Bull vs Bear vs Decision Judge, DERIVED from the
@@ -23379,6 +23896,51 @@ def pro_review_controls():
         "available_models": list(PRO_REVIEW_MODELS),
         "default_model":    _PRO_REVIEW_DEFAULT_MODEL,
         "models":           models,
+    }), 200
+
+
+@app.route("/entry-quality", methods=["GET", "POST"])
+def entry_quality_controls():
+    """Read or set the Entry Quality money-path VETO toggle.
+
+    The Entry Quality Engine scores WHETHER THIS IS A GOOD LOCATION to enter
+    (separate from the strict IF-valid gate). The VETO is OFF by default and, when
+    armed, only DEMOTES an actionable verdict to WAIT when the entry location is poor
+    (score < ENTRY_QUALITY_MIN_SCORE) AND confidence is not extremely high (Edge <
+    ENTRY_QUALITY_OVERRIDE_EDGE). It can never promote / force a trade. The runtime
+    toggle wins over the env seed and RESETS on restart (fail-safe toward NOT
+    interfering). NEVER affects manual ENTER trades, the base strict gate, or
+    scoring. Owner-only (Basic Auth + CSRF via the Express proxy; deliberately NOT
+    in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "gate_enabled" in data:
+            # Money-path toggle: parse strictly so a stray JSON string ("false") can
+            # never arm the live veto. Real booleans (the dashboard) pass straight
+            # through; recognised string/number tokens map explicitly; anything
+            # ambiguous (null / "maybe" / {}) is IGNORED, leaving the gate unchanged
+            # (fail-safe toward NOT interfering with live trading).
+            _raw = data.get("gate_enabled")
+            _parsed = None
+            if isinstance(_raw, bool):
+                _parsed = _raw
+            elif isinstance(_raw, (int, float)):
+                _parsed = bool(_raw)
+            elif isinstance(_raw, str):
+                _s = _raw.strip().lower()
+                if _s in ("1", "true", "yes", "on"):
+                    _parsed = True
+                elif _s in ("0", "false", "no", "off"):
+                    _parsed = False
+            if _parsed is not None:
+                set_entry_quality_gate(_parsed)
+                logger.info("Entry Quality VETO %s", "ARMED" if _entry_quality_gate_enabled() else "OFF")
+    return jsonify({
+        "status":         "ok",
+        "engine_enabled": _entry_quality_engine_enabled(),
+        "gate_enabled":   _entry_quality_gate_enabled(),
+        "min_score":      ENTRY_QUALITY_MIN_SCORE,
+        "override_edge":  ENTRY_QUALITY_OVERRIDE_EDGE,
     }), 200
 
 

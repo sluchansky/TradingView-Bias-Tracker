@@ -81,6 +81,7 @@ router.all(
     "/pro-review",
     "/trade-debate",
     "/learning",
+    "/entry-quality",
     "/journal",
     "/journal/",
     "/eod",
