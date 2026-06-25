@@ -7349,6 +7349,23 @@ GOV_HIST_CAP           = 12
 GOV_LIVE_CAP           = 8
 GOV_AI_CAP             = 8
 
+# ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────────
+# ONE cohesive thesis that CONSUMES the already-assembled analyst / trade_debate /
+# confidence_governor / trade_memory / volatility / news blocks (it never recomputes
+# them and has NO money-path veto of its own). The open-position loop pushes a fresh
+# thesis to the JOURNAL channel every ANALYST_REPORT_INTERVAL while a trade is live.
+ANALYST_REPORT_INTERVAL     = int(os.environ.get("ANALYST_REPORT_INTERVAL", 900))  # open-position thesis cadence (s)
+ANALYST_REPORT_CONF_EPS     = 1     # min |Δ| (pts) to call a confidence move non-flat
+ANALYST_REPORT_BASELINE_TTL = 600   # re-baseline the confidence delta after this many s
+ANALYST_REPORT_PREV_CONF    = {}    # inst -> {"score": int, "components": {name: score}, "ts": datetime}
+ANALYST_REPORT_LAST_SENT    = {}    # inst -> datetime of last journal push (loop thread only)
+ANALYST_REPORT_LOCK         = threading.Lock()
+_ANALYST_REPORT_DISCLAIMER  = (
+    "Unified read over the existing analyst, debate, governor, memory, volatility & "
+    "news engines. DISPLAY-ONLY — never places or changes a trade. Outcome "
+    "probabilities are a derived heuristic estimate."
+)
+
 # Opening-range + Opening-Drive window (Eastern Time, decimal hours).
 OPENING_RANGE_START_ET      = 8.0    # OR builds from 08:00 ET
 OPENING_RANGE_BUILD_MIN     = 30     # ...over the first 30 minutes
@@ -10588,6 +10605,335 @@ def compute_trade_debate(result, strict=None):
     }
 
 
+# ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────────
+# ONE cohesive thesis that CONSUMES the already-assembled sub-engines on `result`
+# (analyst / trade_debate / confidence_governor / trade_memory(_context) /
+# volatility / strategy_engine / news_filter) — it NEVER recomputes them and has NO
+# veto of its own. It answers, in one place: what's the trade, why it works, the
+# evidence for / against, what would raise confidence, what invalidates it / when to
+# bail early, and a 3-outcome probability estimate. Lives entirely on top of the
+# assembled result (after the authoritative verdict) so the strict gate, every
+# strategy/alert and all goldens are untouched. Pure builder + FAIL-OPEN.
+def _analyst_report_enabled():
+    """Unified Analyst Report DISPLAY layer — ON by default (fail-open). Env
+    ANALYST_REPORT_ENABLED=0 hard-disables it as an emergency kill-switch. There is
+    NO money-path veto for this layer (it only consumes other engines)."""
+    return os.environ.get("ANALYST_REPORT_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _ar_pct_split(cont, rng, rev):
+    """Normalise three non-negative raw scores to integer percentages summing to 100
+    (largest fractional parts absorb the rounding remainder). All-zero → near-even."""
+    vals = [max(0.0, float(cont or 0)), max(0.0, float(rng or 0)), max(0.0, float(rev or 0))]
+    s = sum(vals)
+    if s <= 0:
+        return [34, 33, 33]
+    pct = [v / s * 100.0 for v in vals]
+    floored = [int(p) for p in pct]
+    rem = 100 - sum(floored)
+    order = sorted(range(3), key=lambda i: pct[i] - floored[i], reverse=True)
+    for i in range(max(0, rem)):
+        floored[order[i % 3]] += 1
+    return floored
+
+
+def _analyst_report_neutral_block(reason="Analyst report unavailable."):
+    """Neutral Unified Analyst Report (fail-open / market-closed / disabled). STABLE
+    schema — every dashboard + Discord consumer reads exactly these keys."""
+    return {
+        "engine_enabled":            _analyst_report_enabled(),
+        "reviewed":                  False,
+        "headline":                  reason,
+        "bias":                      "Neutral",
+        "stance":                    "NO TRADE",
+        "favored_direction":         None,
+        "framed_on_position":        False,
+        "why_it_works":              [],
+        "evidence_for":              [],
+        "evidence_against":          [],
+        "what_increases_confidence": [],
+        "early_exit_triggers":       [],
+        "invalidation":              "—",
+        "probability": {"continuation": None, "range": None, "reversal": None,
+                        "favored_direction": None, "is_estimate": True, "basis": reason},
+        "confidence": {"score": None, "threshold": None, "change": None,
+                       "direction": "flat", "narrative": reason, "components": []},
+        "summary":                   reason,
+        "disclaimer":                _ANALYST_REPORT_DISCLAIMER,
+        "reason":                    reason,
+    }
+
+
+def compute_analyst_report(result, position_dir=None, prev_conf=None):
+    """Build the Unified Analyst Report from the assembled `result`. When
+    `position_dir` ("Long"/"Short") is given a live position is held and the thesis
+    is framed around THAT direction (continuation = the position keeps working);
+    otherwise it frames around the current favored side. `prev_conf` (a stored prior
+    confidence snapshot) drives the change narrative. Pure + FAIL-OPEN."""
+    if not _analyst_report_enabled():
+        return _analyst_report_neutral_block("Analyst report disabled.")
+    if not result.get("market_open", False):
+        return _analyst_report_neutral_block("Market closed — live analysis paused.")
+    try:
+        analyst  = result.get("analyst") or {}
+        debate   = result.get("trade_debate") or {}
+        governor = result.get("confidence_governor") or {}
+        mem      = result.get("trade_memory") or {}
+        mem_ctx  = result.get("trade_memory_context") or {}
+        vol      = result.get("volatility") or {}
+        se       = result.get("strategy_engine") or {}
+        news     = result.get("news_filter") or {}
+        dirs     = result.get("directions") or {}
+        verdict  = result.get("verdict") or ""
+        actionable = bool(is_actionable(verdict))
+
+        # ── Direction the thesis is framed around ────────────────────────────
+        pos_dir = position_dir if position_dir in ("Long", "Short") else None
+        if pos_dir:
+            fav = pos_dir
+        elif actionable and ready_direction(verdict) in ("Long", "Short"):
+            fav = ready_direction(verdict)
+        elif analyst.get("stronger_side") in ("Long", "Short"):
+            fav = analyst.get("stronger_side")
+        else:
+            le  = float((dirs.get("Long")  or {}).get("edge_score") or 0)
+            se_ = float((dirs.get("Short") or {}).get("edge_score") or 0)
+            fav = "Long" if le > se_ else "Short" if se_ > le else None
+        opp = "Short" if fav == "Long" else "Long" if fav == "Short" else None
+        fav_edge = float((dirs.get(fav) or {}).get("edge_score") or 0) if fav else 0.0
+        opp_edge = float((dirs.get(opp) or {}).get("edge_score") or 0) if opp else 0.0
+
+        # ── Stance / bias ────────────────────────────────────────────────────
+        if pos_dir:
+            stance = "MANAGING " + pos_dir.upper()
+        elif actionable and fav:
+            stance = "READY " + fav.upper()
+        elif fav:
+            stance = "WAIT"
+        else:
+            stance = "NO TRADE"
+        bias = "Bullish" if fav == "Long" else "Bearish" if fav == "Short" else "Neutral"
+
+        # ── Evidence for / against (framed around the favored side) ───────────
+        bull_case = list(analyst.get("bull_case") or [])
+        bear_case = list(analyst.get("bear_case") or [])
+        if fav == "Short":
+            evidence_for, evidence_against = bear_case[:], bull_case[:]
+        else:
+            evidence_for, evidence_against = bull_case[:], bear_case[:]
+        # Historical lens as evidence.
+        if mem.get("ready") and isinstance(mem.get("similar_win_rate"), (int, float)):
+            wr = mem["similar_win_rate"] * 100
+            n  = mem.get("similar_trades_found") or 0
+            if mem["similar_win_rate"] >= 0.60:
+                evidence_for.append("History favors it: %.0f%% weighted win across %d similar." % (wr, n))
+            elif mem["similar_win_rate"] <= 0.40:
+                evidence_against.append("History warns: similar setups won only %.0f%% (n=%d)." % (wr, n))
+        # Volatility risk.
+        vlabel = (vol.get("volatility_label") or "").strip().lower()
+        if vlabel == "extreme":
+            evidence_against.append("Volatility is extreme — wider stops and fakeouts more likely.")
+        # Imminent high-impact news.
+        nxt = news.get("next_event") if isinstance(news, dict) else None
+        if news.get("within_window") and isinstance(nxt, dict):
+            mu = nxt.get("minutes_until")
+            evidence_against.append(
+                "High-impact %s news (%s) in ~%s min — headline risk." % (
+                    nxt.get("country") or "USD", nxt.get("title") or "event",
+                    mu if mu is not None else "?"))
+        # Debate disagreement.
+        dj = debate.get("judge") or {}
+        ws = dj.get("winning_side")
+        if fav and ws in ("Bull", "Bear"):
+            opp_side = (fav == "Long" and ws == "Bear") or (fav == "Short" and ws == "Bull")
+            if opp_side and dj.get("confidence_gap"):
+                evidence_against.append(
+                    "Bull/Bear debate leans %s (gap %s) — momentum may be turning." % (
+                        ws, dj.get("confidence_gap")))
+
+        # ── What would raise confidence ──────────────────────────────────────
+        what_next = list(analyst.get("what_needs_next") or [])
+        score = governor.get("final_confidence_score")
+        thr   = governor.get("threshold")
+        if isinstance(score, (int, float)) and isinstance(thr, (int, float)) and score < thr and not actionable:
+            what_next.append("Lift unified confidence to %d (now %d)." % (int(thr), int(round(score))))
+
+        # ── Early-exit triggers (display-only management hints) ───────────────
+        triggers = []
+        vwap_v = result.get("vwap_value")
+        if fav and isinstance(vwap_v, (int, float)):
+            side = "below" if fav == "Long" else "above"
+            triggers.append("Price closes %s VWAP (%.2f) against the %s." % (side, vwap_v, fav))
+        if fav == "Long" and isinstance(result.get("nearest_supply"), (int, float)):
+            triggers.append("Price reaches supply (%.2f) — scale out / tighten." % result["nearest_supply"])
+        if fav == "Short" and isinstance(result.get("nearest_demand"), (int, float)):
+            triggers.append("Price reaches demand (%.2f) — scale out / tighten." % result["nearest_demand"])
+        if fav:
+            triggers.append("A 5-minute CHOCH or BOS prints against the %s." % fav)
+            cvd_s = (result.get("cvd_state") or "").strip().lower()
+            adverse_cvd = "bearish" if fav == "Long" else "bullish"
+            if cvd_s and cvd_s == adverse_cvd:
+                triggers.append("CVD flips %s (order flow turning against the %s)." % (adverse_cvd, fav))
+        if mem_ctx.get("ready"):
+            mae = mem_ctx.get("weighted_avg_mae")
+            hold = mem_ctx.get("weighted_avg_hold") or mem_ctx.get("weighted_avg_hold_min")
+            if isinstance(mae, (int, float)) and mae:
+                triggers.append("Drawdown beyond ~%.2fR (similar winners rarely gave back more)." % abs(mae))
+            if isinstance(hold, (int, float)) and hold:
+                triggers.append("No progress within ~%d min (similar winners resolved faster)." % int(hold))
+        triggers = triggers[:6]
+
+        # ── Invalidation ─────────────────────────────────────────────────────
+        inval = analyst.get("invalidation") or "—"
+
+        # ── 3-outcome probability (DERIVED HEURISTIC ESTIMATE) ───────────────
+        reg = (se.get("market_regime") or "").strip().lower()
+        cont_raw = fav_edge
+        rev_raw  = opp_edge
+        range_raw = max(0.0, 60.0 - abs(fav_edge - opp_edge)) * 0.8
+        if "range" in reg or "chop" in reg:
+            range_raw += 15.0
+            cont_raw = max(0.0, cont_raw - 5.0)
+        if "trend" in reg or "break" in reg or "drive" in reg:
+            cont_raw += 10.0
+        if vlabel == "extreme":
+            rev_raw += 10.0
+            range_raw += 5.0
+        if dj.get("too_balanced"):
+            range_raw += 10.0
+        if result.get("overextended"):
+            rev_raw += 10.0
+        if fav and ws in ("Bull", "Bear") and (
+                (fav == "Long" and ws == "Bear") or (fav == "Short" and ws == "Bull")):
+            rev_raw += 8.0
+        basis = "Live signal strength (favored vs opposing case, regime, volatility, debate)."
+        wwr = mem_ctx.get("weighted_win_rate") if mem_ctx.get("ready") else None
+        if isinstance(wwr, (int, float)):
+            hist_cont  = wwr * 100.0
+            hist_rev   = (1.0 - wwr) * 100.0 * 0.6
+            hist_range = (1.0 - wwr) * 100.0 * 0.4
+            wl, wh = 0.65, 0.35
+            cont_raw  = wl * cont_raw  + wh * hist_cont
+            rev_raw   = wl * rev_raw   + wh * hist_rev
+            range_raw = wl * range_raw + wh * hist_range
+            basis = ("Blend of live signal strength and historical outcomes "
+                     "(%.0f%% weighted win across %d similar trades)." % (
+                         wwr * 100, mem_ctx.get("matched") or 0))
+        cont_p, range_p, rev_p = _ar_pct_split(cont_raw, range_raw, rev_raw)
+        probability = {
+            "continuation": cont_p, "range": range_p, "reversal": rev_p,
+            "favored_direction": fav, "is_estimate": True, "basis": basis,
+        }
+
+        # ── Confidence + change narrative ────────────────────────────────────
+        comps = governor.get("confidence_components") or []
+        comp_scores = {c.get("name"): c.get("score") for c in comps if isinstance(c, dict)}
+        change, cdir = None, "flat"
+        if isinstance(score, (int, float)) and prev_conf and isinstance(prev_conf.get("score"), (int, float)):
+            change = int(round(score - prev_conf["score"]))
+            cdir = "up" if change >= ANALYST_REPORT_CONF_EPS else "down" if change <= -ANALYST_REPORT_CONF_EPS else "flat"
+        thr_txt = ("%d" % int(thr)) if isinstance(thr, (int, float)) else "—"
+        if not isinstance(score, (int, float)):
+            narrative = "Confidence unavailable."
+        elif change is None:
+            narrative = "Confidence %d (READY threshold %s). First read this session." % (int(round(score)), thr_txt)
+        elif cdir == "flat":
+            narrative = "Confidence steady at %d (threshold %s)." % (int(round(score)), thr_txt)
+        else:
+            moved, best = None, 0
+            prevc = (prev_conf or {}).get("components") or {}
+            for name, sc in comp_scores.items():
+                pv = prevc.get(name)
+                if isinstance(sc, (int, float)) and isinstance(pv, (int, float)):
+                    d = abs(sc - pv)
+                    if d > best:
+                        best, moved = d, name
+            lens_lbl = {"current_setup": "current setup", "live_market": "live market",
+                        "ai_reasoning": "AI reasoning", "historical": "historical"}
+            why = (" — led by the %s lens" % lens_lbl.get(moved, moved)) if moved else ""
+            verb = "rose" if cdir == "up" else "fell"
+            narrative = "Confidence %s %d pt%s to %d (threshold %s)%s." % (
+                verb, abs(change), "" if abs(change) == 1 else "s",
+                int(round(score)), thr_txt, why)
+        confidence = {
+            "score": int(round(score)) if isinstance(score, (int, float)) else None,
+            "threshold": int(thr) if isinstance(thr, (int, float)) else None,
+            "change": change, "direction": cdir, "narrative": narrative,
+            "components": comps,
+        }
+
+        # ── Headline / summary ───────────────────────────────────────────────
+        thesis = analyst.get("market_story") or analyst.get("best_trade_idea") or ""
+        if pos_dir:
+            headline = ("Managing the open %s — %d%% continuation / %d%% range / %d%% reversal. %s" % (
+                pos_dir, cont_p, range_p, rev_p, thesis)).strip()
+        elif actionable and fav:
+            headline = ("%s setup READY — %d%% continuation odds. %s" % (fav, cont_p, thesis)).strip()
+        elif fav:
+            headline = ("%s leaning but not confirmed. %s" % (
+                fav, analyst.get("reason_for_waiting") or thesis)).strip()
+        else:
+            headline = thesis or "No directional edge — stand aside."
+
+        return {
+            "engine_enabled":            True,
+            "reviewed":                  True,
+            "headline":                  headline,
+            "bias":                      bias,
+            "stance":                    stance,
+            "favored_direction":         fav,
+            "framed_on_position":        bool(pos_dir),
+            "why_it_works":              evidence_for[:4],
+            "evidence_for":              evidence_for,
+            "evidence_against":          evidence_against,
+            "what_increases_confidence": what_next,
+            "early_exit_triggers":       triggers,
+            "invalidation":              inval,
+            "probability":              probability,
+            "confidence":               confidence,
+            "summary":                   thesis or headline,
+            "disclaimer":                _ANALYST_REPORT_DISCLAIMER,
+            "reason":                    None,
+        }
+    except Exception as exc:
+        return _analyst_report_neutral_block("Analyst report error (%s)." % exc)
+
+
+def _analyst_report_prev(inst):
+    """Copy of the stored prior confidence snapshot for `inst` (drives the change
+    narrative), or None. Thread-safe."""
+    if not inst:
+        return None
+    with ANALYST_REPORT_LOCK:
+        snap = ANALYST_REPORT_PREV_CONF.get(inst)
+        return dict(snap) if snap else None
+
+
+def _analyst_report_update_prev(inst, report):
+    """Re-baseline the stored confidence snapshot for `inst` ONLY on a meaningful move
+    (|Δ| >= eps) or after the baseline TTL — so the high-frequency /status poll can't
+    reset the delta to ~0 every few seconds. Display-only side effect."""
+    if not inst or not isinstance(report, dict):
+        return
+    conf = report.get("confidence") or {}
+    score = conf.get("score")
+    if not isinstance(score, (int, float)):
+        return
+    comps = {c.get("name"): c.get("score")
+             for c in (conf.get("components") or []) if isinstance(c, dict)}
+    now = datetime.now(timezone.utc)
+    with ANALYST_REPORT_LOCK:
+        prev = ANALYST_REPORT_PREV_CONF.get(inst)
+        rebaseline = True
+        if prev and isinstance(prev.get("score"), (int, float)):
+            moved = abs(score - prev["score"]) >= ANALYST_REPORT_CONF_EPS
+            ts = prev.get("ts")
+            aged = (not ts) or ((now - ts).total_seconds() >= ANALYST_REPORT_BASELINE_TTL)
+            rebaseline = bool(moved or aged)
+        if rebaseline:
+            ANALYST_REPORT_PREV_CONF[inst] = {"score": score, "components": comps, "ts": now}
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -11612,6 +11958,27 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if _swing_htf_enabled():
         result["swing_context"] = swing_ctx if isinstance(swing_ctx, dict) else {
             "enabled": True, "complete": False, "stale": True, "error": "compute_failed"}
+
+    # ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────
+    # SINGLE computation point, AFTER every verdict override above (open, vetoed and
+    # closed paths all land here) so it always reflects the final result — this also
+    # preserves the single-return-path / hard-index invariant. It only CONSUMES the
+    # already-assembled analyst / debate / governor / memory / volatility / news
+    # blocks (never recomputes them) and has NO veto. Framed around the OPEN
+    # position's direction when one is held, else the favored side. The tiny
+    # prev-confidence store (per-instrument, re-baselined only on a real move) powers
+    # the change narrative — a display-only side effect; goldens never call
+    # full_analysis. FAIL-OPEN so a bug here can never break the gate's result.
+    try:
+        _ar_inst = instrument_of(active_ticker)
+        _ar_pos  = active_trade_for(_ar_inst)
+        _ar_dir  = _ar_pos.get("direction") if isinstance(_ar_pos, dict) else None
+        result["analyst_report"] = compute_analyst_report(
+            result, position_dir=_ar_dir, prev_conf=_analyst_report_prev(_ar_inst))
+        _analyst_report_update_prev(_ar_inst, result["analyst_report"])
+    except Exception as _ar_exc:
+        result["analyst_report"] = _analyst_report_neutral_block(
+            "Analyst report unavailable (%s)." % _ar_exc)
     return result
 
 
@@ -12679,6 +13046,95 @@ def _cross_market_loop():
         logger.warning("cross-market loop error: %s", exc)
     finally:
         threading.Timer(CROSS_MARKET_INTERVAL, _cross_market_loop).start()
+
+
+def _post_analyst_report_update(inst, trade, report):
+    """Post ONE Unified Analyst Report thesis update for an OPEN position to the
+    JOURNAL Discord channel. DISPLAY/NOTIFY ONLY — never places or changes a trade.
+    Returns True only on a 2xx send (so the loop arms its throttle on success)."""
+    if not DISCORD_JOURNAL_WEBHOOK_URL:
+        return False
+    rep  = report or {}
+    prob = rep.get("probability") or {}
+    conf = rep.get("confidence") or {}
+    direction = (trade or {}).get("direction") or rep.get("favored_direction") or "—"
+    emoji = "📈" if direction == "Long" else "📉" if direction == "Short" else "🧭"
+    cont, rng, rev = prob.get("continuation"), prob.get("range"), prob.get("reversal")
+    prob_txt = "Continuation %s%% · Range %s%% · Reversal %s%%" % (
+        cont if cont is not None else "—", rng if rng is not None else "—",
+        rev if rev is not None else "—")
+    cscore, cthr = conf.get("score"), conf.get("threshold")
+    conf_txt = "%s%s — %s" % (
+        cscore if cscore is not None else "—",
+        ("/%s" % cthr) if cthr is not None else "",
+        conf.get("narrative") or "—")
+    exits = rep.get("early_exit_triggers") or []
+    exit_txt = "\n".join("• " + str(t) for t in exits[:5]) or "—"
+    fields = [
+        {"name": "Outcome probability (heuristic estimate)", "value": prob_txt[:1024], "inline": False},
+        {"name": "Confidence",          "value": conf_txt[:1024], "inline": False},
+        {"name": "Early-exit triggers",  "value": exit_txt[:1024], "inline": False},
+        {"name": "Invalidation",         "value": str(rep.get("invalidation") or "—")[:1024], "inline": False},
+    ]
+    embed = {
+        "title":       ("%s Position Thesis Update — %s %s" % (emoji, inst, direction))[:256],
+        "description": str(rep.get("headline") or "Position update.")[:2048],
+        "color":       0x5865F2,
+        "fields":      fields,
+        "footer":      {"text": "Display/notify only — does not place or change any trade. "
+                                "Probabilities are a derived heuristic estimate."},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        resp = requests.post(DISCORD_JOURNAL_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        if resp.status_code in (200, 204):
+            logger.info("Analyst report update posted for %s", inst)
+            return True
+        logger.warning("Analyst report update non-2xx (%s) for %s", resp.status_code, inst)
+        return False
+    except Exception as exc:
+        logger.warning("Analyst report update post failed (%s): %s", inst, exc)
+        return False
+
+
+def _analyst_report_loop():
+    """Every ANALYST_REPORT_INTERVAL seconds, while a position is OPEN, post a fresh
+    Unified Analyst Report thesis update for that instrument to the JOURNAL channel —
+    the companion to _trade_ready_loop (which fires while FLAT). DISPLAY/NOTIFY only;
+    never touches the gate / money path. Started on the LIVE instance only (boot),
+    mute-aware, per-instrument throttled, self-rescheduling daemon Timer."""
+    try:
+        now = datetime.now(timezone.utc)
+        for inst in enabled_instruments():
+            if not active_trade_for(inst):
+                continue
+            last = ANALYST_REPORT_LAST_SENT.get(inst)
+            if last and (now - last).total_seconds() < ANALYST_REPORT_INTERVAL:
+                continue
+            if _alerts_muted(inst):
+                continue
+            try:
+                a = full_analysis(ticker_override=inst)
+            except Exception as exc:
+                logger.error("analyst-report loop analysis error (%s): %s", inst, exc)
+                continue
+            # No thesis updates while the market is closed (overnight holds).
+            if not a.get("market_open"):
+                continue
+            # Re-check the slot just before sending (it may have closed while
+            # full_analysis ran).
+            pos = active_trade_for(inst)
+            if not pos:
+                continue
+            rep = a.get("analyst_report")
+            if not isinstance(rep, dict) or not rep.get("engine_enabled"):
+                continue
+            if _post_analyst_report_update(inst, pos, rep):
+                ANALYST_REPORT_LAST_SENT[inst] = now
+    except Exception as exc:  # never let the loop die
+        logger.warning("analyst-report loop error: %s", exc)
+    finally:
+        threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()
 
 
 def _update_journal_outcome(new_outcome, pnl_dollars=None, symbol=None):
@@ -17803,6 +18259,7 @@ def status():
         "trade_debate":        a.get("trade_debate"),
         "confidence_governor": a.get("confidence_governor"),
         "trade_memory":        a.get("trade_memory"),
+        "analyst_report":      a.get("analyst_report"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -19244,6 +19701,39 @@ def dashboard():
      by default; the trade VETO is flag-gated server-side, default OFF). Hidden unless
      the analyst engine is enabled. FVG / Order Blocks ARE tracked (display-only
      analyst evidence); the footer shows their live state per instrument. -->
+<!-- Unified Analyst Report — executive synthesis that CONSUMES the analyst, debate,
+     governor, memory, volatility & news engines into ONE thesis. DISPLAY-ONLY (no
+     money-path veto). Hidden unless the engine is enabled. Fed by d.analyst_report. -->
+<div class="mod" id="mod-report" style="display:none">
+  <div class="mod-h">🧭 Unified Analyst Report <span id="ar-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY-ONLY</span></div>
+  <div class="se-bias-h">Thesis</div>
+  <div class="se-reason" id="ar-headline">—</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Stance</div><div class="v" id="ar-stance">—</div></div>
+    <div class="gstat"><div class="l">Bias</div><div class="v" id="ar-bias">—</div></div>
+    <div class="gstat"><div class="l">Favored</div><div class="v" id="ar-fav">—</div></div>
+  </div>
+  <div class="se-bias-h">Outcome Probability <span style="font-size:10px;color:#6b7280">· derived heuristic estimate</span></div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Continuation</div><div class="v" id="ar-p-cont">—</div></div>
+    <div class="gstat"><div class="l">Range</div><div class="v" id="ar-p-range">—</div></div>
+    <div class="gstat"><div class="l">Reversal</div><div class="v" id="ar-p-rev">—</div></div>
+  </div>
+  <div class="se-bias-h">Confidence</div>
+  <div class="se-reason" id="ar-conf">—</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+    <div><div class="se-bias-h" style="color:#22c55e">Why It Works</div><ul id="ar-for" style="margin:4px 0;padding-left:16px"></ul></div>
+    <div><div class="se-bias-h" style="color:#ef4444">Risks / Against</div><ul id="ar-against" style="margin:4px 0;padding-left:16px"></ul></div>
+  </div>
+  <div class="se-bias-h">What Would Increase Confidence</div>
+  <ul id="ar-next" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Early-Exit Triggers</div>
+  <ul id="ar-exit" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h">Invalidation</div>
+  <div class="se-reason" id="ar-inval">—</div>
+  <div id="ar-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
 <div class="mod" id="mod-analyst" style="display:none">
   <div class="mod-h">🧠 Analyst Mode <span id="an-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
   <div class="se-bias-h">Final Verdict</div>
@@ -20471,6 +20961,9 @@ function renderModules(d){
   // ── Module 10: News filter (economic calendar) — display-only ──
   renderNewsFilter(d);
 
+  // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
+  renderReportMode(d);
+
   // ── Module 11: Analyst Mode — professional-analyst reasoning (DISPLAY-ONLY) ──
   renderAnalystMode(d);
 
@@ -20610,6 +21103,41 @@ function renderAnalystMode(d){
     const _smcTxt=_smc.length ? _smc.join(' · ') : 'No FVG / Order Block in range';
     foot.textContent='Reasoning over existing signals · '+_smcTxt+(a.gate_enabled?'':' · veto OFF (display-only)');
   }
+}
+
+// Unified Analyst Report — ONE executive thesis that CONSUMES the analyst, debate,
+// governor, memory, volatility & news engines (no duplication, DISPLAY-ONLY, no
+// veto). Fed by d.analyst_report. All dynamic strings via textContent.
+function renderReportMode(d){
+  const r=(d && d.analyst_report) || null;
+  const mod=document.getElementById('mod-report');
+  if(!mod) return;
+  if(!r || !r.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  _set('ar-headline', r.headline, '#cfd0e0');
+  const st=r.stance||'—';
+  _set('ar-stance', st, _anVerdictColor(st));
+  _set('ar-bias', r.bias, r.bias==='Bullish'?'#22c55e':r.bias==='Bearish'?'#ef4444':'#9aa');
+  const fav=r.favored_direction||'—';
+  _set('ar-fav', fav, fav==='Long'?'#22c55e':fav==='Short'?'#ef4444':'#6b7280');
+  const p=r.probability||{};
+  _set('ar-p-cont', (p.continuation!=null?p.continuation+'%':'—'), '#22c55e');
+  _set('ar-p-range', (p.range!=null?p.range+'%':'—'), '#f59e0b');
+  _set('ar-p-rev', (p.reversal!=null?p.reversal+'%':'—'), '#ef4444');
+  const c=r.confidence||{};
+  const cc=(c.direction==='up')?'#22c55e':(c.direction==='down')?'#ef4444':'#cfd0e0';
+  _set('ar-conf', c.narrative, cc);
+  _anFill('ar-for', r.evidence_for);
+  _anFill('ar-against', r.evidence_against);
+  _anFill('ar-next', r.what_increases_confidence);
+  _anFill('ar-exit', r.early_exit_triggers);
+  _set('ar-inval', r.invalidation, '#cfd0e0');
+  const foot=document.getElementById('ar-foot');
+  if(foot){ foot.textContent = r.disclaimer || 'Consumes the existing analyst engines · display-only.'; }
 }
 
 // Professional Review — pre-READY pro-trader grading. TWO models (SCALP / SWING)
@@ -22825,6 +23353,7 @@ if __name__ == "__main__":
     if DISCORD_LIVE_ENABLED:
         threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()  # re-post READY card (mode-aware cadence)
+        threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()  # open-position unified-thesis updates → journal channel (DISPLAY/NOTIFY only)
         _schedule_eod()                               # schedule daily EOD summary
         _schedule_weekly_report()                     # schedule weekly report (Fri after close)
     else:
