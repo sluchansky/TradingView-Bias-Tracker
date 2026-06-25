@@ -1,0 +1,2921 @@
+  t.textContent = msg;
+  t.style.background = ok ? '#0d1f14' : '#1f0d0d';
+  t.style.borderLeft = '3px solid ' + (ok ? '#22c55e' : '#ef4444');
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2800);
+}
+
+async function api(path, body=null) {
+  const opts = { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'}, cache: 'no-store' };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(BASE+path, opts);
+  return r.json();
+}
+
+async function enterTrade() {
+  const body = {
+    alert_type: sym+' ENTER',
+    ticker: sym+'1!',
+    direction: dir,
+    profile: sym+' Standard',
+  };
+  const e = document.getElementById('f-entry').value;
+  const s = document.getElementById('f-stop').value;
+  const t1 = document.getElementById('f-t1').value;
+  const t2 = document.getElementById('f-t2').value;
+  const c  = document.getElementById('f-contracts').value;
+  if (e)  body.entry     = parseFloat(e);
+  if (s)  body.stop      = parseFloat(s);
+  if (t1) body.t1        = parseFloat(t1);
+  if (t2) body.t2        = parseFloat(t2);
+  if (c)  body.contracts = parseInt(c);
+
+  // Any typed-in price (entry / stop / targets) means a manual, server-unvalidated
+  // plan → tracking-only: the execution gateway deliberately refuses client-supplied
+  // prices. The gateway only acts on a READY setup for the selected side, using the
+  // server's own plan.
+  const manual = !!(e || s || t1 || t2);
+  const rd = lastRec ? jsReadyDir(lastRec.verdict) : null;
+  // Only engage the gateway when the loaded snapshot is for the CURRENTLY-selected
+  // instrument; a stale snapshot from just before a symbol toggle could otherwise
+  // target the wrong instrument (the server gate would still refuse, but we never
+  // rely on that for instrument selection).
+  const recInst = lastRec ? String(lastRec.active_ticker || '').replace('1!','') : '';
+  const gatewayEligible = !manual && !!lastRec && recInst === sym
+                          && !!lastRec.execution_enabled && rd === dir;
+  const mode  = lastRec ? (lastRec.execution_mode || 'manual_only') : 'manual_only';
+  const live  = !!(lastRec && lastRec.execution_live);
+  const label = (lastRec && lastRec.execution_provider_label) || 'broker';
+  const btn = document.getElementById('btn-enter');
+
+  if (gatewayEligible) {
+    const tp = lastRec.trade_plan || {};
+    const entry = _planMidEntry(tp, recInst || sym);
+    let q0 = parseInt(c || '1', 10); if (!q0 || q0 < 1) q0 = 1;
+    const head = live
+      ? '\u26a0 This places a REAL market order on your broker (' + label + ').'
+      : (mode === 'paper'
+          ? '🧪 This submits a SIMULATED (paper) order — no real broker is contacted.'
+          : '📋 Manual mode — this tracks the trade and shows the exact order to place yourself.');
+    const msg = head + '\\n\\n'
+      + sym + ' ' + dir.toUpperCase() + '  ·  ' + q0 + ' contract' + (q0>1?'s':'')
+      + '\\nEntry ~' + (entry!=null?entry:'market')
+      + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
+      + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (' + (tp.rr||'1:1') + ')'
+      + '\\n\\nProceed?';
+    if (!confirm(msg)) return;
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = gatewayEligible ? (live ? '⏳ Sending order…' : '⏳ Submitting…') : '⏳ Entering…'; }
+  try {
+    // 1) Run the execution gateway first. The server is authoritative on the READY
+    //    gate, sizing cap, duplicate guard, and routing per EXECUTION_MODE. For a
+    //    LIVE provider we abort tracking unless the send is confirmed, so no phantom
+    //    trade is recorded. Paper/manual never contact a broker.
+    if (gatewayEligible) {
+      let qty = parseInt(c || '1', 10); if (!qty || qty < 1) qty = 1;
+      let od;
+      try { od = await api('/traderspost', { ticker: sym+'1!', contracts: qty }); }
+      catch(err) { toast(live ? 'Execution failed — check your broker before retrying' : 'Execution failed — try again', false); return; }
+      const st = od && od.status;
+      if (st === 'sent')                 toast('🚀 Order sent to ' + (od.provider || label));
+      else if (st === 'simulated')       toast('🧪 Paper order simulated (no broker)');
+      else if (st === 'manual_required') toast('📋 ' + (od.message || 'Place this order manually on your broker'));
+      else { toast('Execution: ' + ((od && (od.reason||od.status)) || 'no response'), false); return; }
+    }
+    // 2) Record the local tracked trade (after a confirmed send/simulate/manual plan,
+    //    or tracking-only when the gateway wasn't engaged).
+    let d;
+    try { d = await api('/enter', body); }
+    catch(err) { toast('Tracking failed' + (live ? ' (broker order already sent)' : ''), false); return; }
+    if (d.status === 'entered') {
+      toast(gatewayEligible
+        ? (live ? '✅ Order sent + trade tracked'
+                : (mode === 'paper' ? '✅ Paper order + trade tracked' : '✅ Tracked — place the order manually'))
+        : '✅ Trade tracked (no broker order)');
+      refresh();
+    } else {
+      toast('Error: '+(d.reason||d.status), false);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; updateEnterBtn(); }
+  }
+}
+
+async function setVwap() {
+  const v = document.getElementById('f-vwap').value;
+  const p = document.getElementById('f-vwap-price').value;
+  if (!v) { toast('Enter a VWAP value first', false); return; }
+  const body = { alert_type: sym+' VWAP', ticker: sym+'1!', vwap: parseFloat(v) };
+  if (p) body.price = parseFloat(p);
+  try {
+    const d = await api('/webhook', body);
+    if (d.status === 'vwap_updated') { toast('✅ VWAP set for '+sym); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function closeTrade() {
+  try {
+    const d = await api('/close', {});
+    if (d.status === 'closed') { toast('🏁 Trade closed'); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function breakeven() {
+  try {
+    const d = await api('/breakeven', {});
+    if (d.status === 'breakeven_set') { toast('⚖️ Stop moved to breakeven'); refresh(); }
+    else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function sendEod() {
+  try {
+    await api('/eod', {});
+    toast('📊 EOD summary sent to Discord');
+  } catch(err) { toast('Request failed', false); }
+}
+
+function paintMode(m) {
+  const sc = document.getElementById('mode-scalp');
+  const sw = document.getElementById('mode-swing');
+  if (!sc || !sw) return;
+  sc.classList.toggle('active', m === 'SCALP');
+  sw.classList.toggle('active', m === 'SWING');
+}
+async function loadMode() {
+  try { const d = await api('/mode'); if (d.trading_mode) paintMode(d.trading_mode); } catch(e) {}
+}
+async function setMode(m) {
+  try {
+    const d = await api('/mode', { mode: m });
+    if (d.trading_mode) {
+      paintMode(d.trading_mode);
+      toast(m === 'SCALP' ? '⚡ SCALP — more sensitive' : '🎯 SWING — stricter');
+      refreshRec();
+    } else toast('Error: '+(d.reason||d.status), false);
+  } catch(e) { toast('Request failed', false); }
+}
+
+let lastRec = null;
+// Edge Score ceiling (server-injected; CVD Agreement can push a setup above 100).
+const EDGE_MAX = __EDGE_MAX__;
+function ckItem(label, ok) {
+  return '<div class="rec-item '+(ok?'ok':'no')+'"><span class="ck">'+(ok?'✅':'⬜')+'</span>'+label+'</div>';
+}
+
+// ── Verdict helpers (mirror the Python is_full_ready / is_early_ready / is_actionable
+//    / ready_direction so EARLY READY is treated as actionable but labelled). ──
+function jsIsFullReady(v){ return v==='LONG READY' || v==='SHORT READY'; }
+function jsIsEarlyReady(v){ return v==='LONG EARLY READY' || v==='SHORT EARLY READY'; }
+function jsIsActionable(v){ return jsIsFullReady(v) || jsIsEarlyReady(v); }
+function jsReadyDir(v){
+  if(!jsIsActionable(v)) return null;
+  return /LONG/.test(v) ? 'Long' : (/SHORT/.test(v) ? 'Short' : null);
+}
+// Score → quality band, mirroring the Python _score_tier + _decision_support quality
+// mapping so a per-side gauge reads the same wording as the authoritative header.
+function jsTierForScore(s){
+  s = Number(s)||0;
+  if(s>=70) return 'HIGH CONVICTION';
+  if(s>=50) return 'READY';
+  if(s>=35) return 'EARLY READY';
+  return null;
+}
+function jsQualityForScore(s){
+  return ({'HIGH CONVICTION':'HIGH','READY':'MODERATE','EARLY READY':'SPECULATIVE'})[jsTierForScore(s)] || 'LOW';
+}
+
+// ── Trade Probability Gauge (speedometer) ────────────────────────────────────
+// Semi-circle 0-100 with a needle, red 0-40 / yellow 41-69 / green 70-100 bands,
+// and a deep-green glow on a HIGH-QUALITY full READY. Reads /status fields only.
+function gaugeArc(v0, v1, r){
+  var cx=100, cy=100;
+  var a0=Math.PI*(1 - v0/100), a1=Math.PI*(1 - v1/100);
+  var x0=(cx + r*Math.cos(a0)).toFixed(2), y0=(cy - r*Math.sin(a0)).toFixed(2);
+  var x1=(cx + r*Math.cos(a1)).toFixed(2), y1=(cy - r*Math.sin(a1)).toFixed(2);
+  return 'M '+x0+' '+y0+' A '+r+' '+r+' 0 0 1 '+x1+' '+y1;
+}
+var gaugeBandsDrawn=false;
+function drawGaugeBands(){
+  if(gaugeBandsDrawn) return;
+  var R=80;
+  var r=document.getElementById('g-band-red');
+  var y=document.getElementById('g-band-yellow');
+  var g=document.getElementById('g-band-green');
+  if(!r||!y||!g) return;
+  r.setAttribute('d', gaugeArc(0,40,R));
+  y.setAttribute('d', gaugeArc(40,70,R));
+  g.setAttribute('d', gaugeArc(70,100,R));
+  gaugeBandsDrawn=true;
+}
+function renderGauge(d){
+  var wrap=document.getElementById('rec-gauge');
+  if(!wrap) return;
+  drawGaugeBands();
+  var ds=d.decision_support||{};
+  // Direction-aware: the meter reflects the SELECTED side (the Long/Short toggle).
+  // The favored side's per-side Edge equals the authoritative Edge (parity), so the
+  // dominant side reads exactly like the system header; the other side shows its OWN
+  // (typically lower) Edge instead of mirroring it. Falls back to the authoritative
+  // probability when per-side data is absent (older server / market closed).
+  var blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
+  var prob = (blk && blk.edge_score!=null) ? blk.edge_score
+           : (ds.probability!=null ? ds.probability : (d.edge_score!=null ? d.edge_score : 0));
+  prob = Math.max(0, Math.min(100, Number(prob)||0));
+  // Needle: value 0 -> -90deg (left), 50 -> 0deg (up), 100 -> +90deg (right).
+  var needle=document.getElementById('g-needle');
+  var deg=(prob/100)*180-90;
+  if(needle) needle.setAttribute('transform','rotate('+deg.toFixed(1)+' 100 100)');
+  var col = prob>=70?'#22c55e':(prob>=41?'#eab308':'#ef4444');
+  var probEl=document.getElementById('g-prob');
+  if(probEl){ probEl.textContent=Math.round(prob)+'%'; probEl.style.color=col; }
+  // Confidence label = the SELECTED side's quality band (derived from its Edge so it
+  // can't contradict the needle); favored side matches the header by parity. Falls
+  // back to authoritative quality / conviction tier when per-side data is absent.
+  var quality = (blk && blk.edge_score!=null) ? jsQualityForScore(blk.edge_score)
+              : (ds.quality || d.conviction_tier || '—');
+  var confEl=document.getElementById('g-conf');
+  if(confEl) confEl.textContent = quality;
+  // Direction indicator = the side you're viewing (the meter is per-side now).
+  var dirTxt='—', dirCol='#9aa0b5';
+  if(dir==='Long'){ dirTxt='📈 LONG'; dirCol='#22c55e'; }
+  else if(dir==='Short'){ dirTxt='📉 SHORT'; dirCol='#ef4444'; }
+  var dirEl=document.getElementById('g-dir');
+  if(dirEl){ dirEl.textContent=dirTxt; dirEl.style.color=dirCol; }
+  // Long / Short / Edge-difference / Dominant row — system context (both sides at
+  // once), independent of the selected toggle.
+  var ls=d.long_score, ss=d.short_score;
+  var diff=(ls!=null&&ss!=null)?Math.abs(ls-ss):(d.conflict_gap!=null?d.conflict_gap:null);
+  var _n=function(x){ return x!=null?x:'—'; };
+  var sc=document.getElementById('g-scores');
+  if(sc) sc.innerHTML='Long <b style="color:#e8e8f0">'+_n(ls)+'</b> · Short <b style="color:#e8e8f0">'+_n(ss)
+    +'</b><br>Δ Edge <b style="color:#e8e8f0">'+_n(diff)+'</b> · Dom <b style="color:#e8e8f0">'+_n(d.dominant_direction)+'</b>';
+  // Deep-green glow only when VIEWING the actionable side at high conviction (full
+  // READY + the ready direction + green band) — never on the non-favored side.
+  var hi = (quality==='HIGH');
+  wrap.classList.toggle('glow', !!(hi && jsIsFullReady(d.verdict) && jsReadyDir(d.verdict)===dir && prob>=70));
+}
+
+// ── Diagnostics modules (5) — all DISPLAY-ONLY, fed by alert_diagnostics ──────
+// Verdict helpers: reuse the authoritative ones already defined above.
+function isFullReady(v){ return jsIsFullReady(v); }
+function isEarlyReady(v){ return jsIsEarlyReady(v); }
+function isReadyVerdict(v){ return jsIsActionable(v); }
+function readySide(v){ return jsReadyDir(v); }
+function _modTxt(id,val){ const e=document.getElementById(id); if(e) e.textContent=val; }
+function _modW(id,val){ const e=document.getElementById(id); if(e) e.style.width=Math.max(0,Math.min(100,Number(val)||0))+'%'; }
+function _modEsc(s){ return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function _gPolar(r,deg){ const a=deg*Math.PI/180; return [110 + r*Math.cos(a), 110 - r*Math.sin(a)]; }
+function _gArc(r,vStart,vEnd){
+  const d0=180-1.8*vStart, d1=180-1.8*vEnd;
+  const p0=_gPolar(r,d0), p1=_gPolar(r,d1);
+  const large=Math.abs(d1-d0)>180?1:0;
+  return 'M'+p0[0].toFixed(2)+' '+p0[1].toFixed(2)+' A'+r+' '+r+' 0 '+large+' 1 '+p1[0].toFixed(2)+' '+p1[1].toFixed(2);
+}
+function gaugeColor(v,prob){
+  if (isFullReady(v))  return prob>=90 ? '#15803d' : '#22c55e';   // HQ deep-green / READY green
+  if (isEarlyReady(v)) return '#eab308';                          // EARLY yellow
+  return prob<40 ? '#ef4444' : '#eab308';                         // WAIT red/yellow
+}
+function renderModules(d){
+  if (!d) return;
+  const diag   = d.alert_diagnostics || {};
+  const v      = d.verdict || 'WAIT';
+  const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
+  const longS  = Number(diag.long_score||0);
+  const shortS = Number(diag.short_score||0);
+  const gap    = Number(diag.conflict_gap!=null?diag.conflict_gap:Math.abs(longS-shortS));
+  const dom    = diag.dominant_direction || (longS>shortS?'Long':shortS>longS?'Short':'Neutral');
+  const col    = gaugeColor(v, prob);
+  const hq     = isFullReady(v) && prob>=90;
+
+  // ── Module 1: speedometer / RPM gauge ──
+  const svg = document.getElementById('gauge-svg');
+  if (svg){
+    let s = '<defs><filter id="gglow" x="-60%" y="-60%" width="220%" height="220%">'
+          + '<feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/>'
+          + '<feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+    s += '<path d="'+_gArc(82,0,40)+'" stroke="#ef4444" stroke-width="16" fill="none" stroke-linecap="round" opacity="0.9"/>';
+    s += '<path d="'+_gArc(82,41,69)+'" stroke="#eab308" stroke-width="16" fill="none" opacity="0.9"/>';
+    s += '<path d="'+_gArc(82,70,100)+'" stroke="#22c55e" stroke-width="16" fill="none" stroke-linecap="round" opacity="0.9"/>';
+    [0,25,50,75,100].forEach(function(t){
+      const p=_gPolar(100, 180-1.8*t);
+      s += '<text x="'+p[0].toFixed(1)+'" y="'+(p[1]+3).toFixed(1)+'" fill="#6b7280" font-size="9" '
+         + 'text-anchor="middle" font-family="ui-monospace,monospace">'+t+'</text>';
+    });
+    const n=_gPolar(72, 180-1.8*prob);
+    s += '<line x1="110" y1="110" x2="'+n[0].toFixed(2)+'" y2="'+n[1].toFixed(2)+'" stroke="'+col+'" '
+       + 'stroke-width="3.5" stroke-linecap="round"'+(hq?' filter="url(#gglow)"':'')+'/>';
+    s += '<circle cx="110" cy="110" r="6.5" fill="'+col+'"'+(hq?' filter="url(#gglow)"':'')+'/>';
+    s += '<circle cx="110" cy="110" r="2.5" fill="#0d0d18"/>';
+    svg.innerHTML = s;
+  }
+  const probEl=document.getElementById('gauge-prob');
+  if (probEl){ probEl.textContent=Math.round(prob)+'%'; probEl.style.color=col; }
+  const subEl=document.getElementById('gauge-sub');
+  if (subEl){
+    const conf = prob>=70 ? 'HIGH' : prob>=41 ? 'MOD' : 'LOW';
+    const dirTxt = readySide(v) || (dom!=='Neutral'?dom:'—');
+    const stateTxt = isFullReady(v) ? (prob>=90?'HIGH QUALITY READY':'READY')
+                   : isEarlyReady(v) ? 'EARLY READY' : 'WAIT';
+    subEl.innerHTML = '<b style="color:'+col+'">'+stateTxt+'</b> · '+conf+' confidence · '+dirTxt;
+  }
+  _modTxt('gs-long', longS); _modTxt('gs-short', shortS); _modTxt('gs-gap', gap);
+  const domEl=document.getElementById('gs-dom');
+  if (domEl){ domEl.textContent=dom; domEl.style.color = dom==='Long'?'#22c55e':dom==='Short'?'#ef4444':'#6b7280'; }
+
+  // ── Module 2: Long vs Short score bars ──
+  _modW('sg-long-f', longS);  _modTxt('sg-long-n', longS);
+  _modW('sg-short-f', shortS); _modTxt('sg-short-n', shortS);
+
+  // ── Module 3: AI Trade Checklist (gate booleans of the dominant side) ──
+  const aiGd = (d.directions && dom!=='Neutral' && d.directions[dom] && d.directions[dom].gate_debug)
+             ? d.directions[dom].gate_debug : (d.gate_debug || {});
+  const reqd = Number(diag.required_score!=null?diag.required_score:(aiGd.ready_threshold!=null?aiGd.ready_threshold:50));
+  const edgeNow = Number(aiGd.edge_score!=null?aiGd.edge_score:prob);
+  const items = [
+    ['Structure (BOS/CHOCH)', !!aiGd.structure_confirmed],
+    ['Location (VWAP / zone)', !!aiGd.location_ok],
+    ['Volume confirming', !!aiGd.volume_confirmed],
+    ['VWAP confirming', !!aiGd.vwap_confirmed],
+    ['Liquidity sweep', !!aiGd.liquidity_sweep],
+    ['Edge \u2265 '+reqd, edgeNow>=reqd]
+  ];
+  const aiEl=document.getElementById('ai-ck');
+  if (aiEl) aiEl.innerHTML = items.map(function(it){
+    return '<div class="ai-item '+(it[1]?'ok':'no')+'"><span class="ic">'+(it[1]?'\u2713':'\u2717')
+         + '</span><span>'+it[0]+'</span></div>';
+  }).join('');
+
+  // ── Module 4: Setup Countdown (Edge points to the next trigger) ──
+  const cur = Number(diag.current_score!=null?diag.current_score:prob);
+  const cdBig=document.getElementById('cd-big'), cdSub=document.getElementById('cd-sub'), cdFill=document.getElementById('cd-fill');
+  if (cdBig){
+    const pct = Math.max(0, Math.min(100, reqd>0 ? cur/reqd*100 : 0));
+    if (isFullReady(v)){
+      cdBig.textContent='READY'; cdBig.style.color='#22c55e';
+      if (cdSub) cdSub.textContent='Setup is live — trade plan available';
+      if (cdFill){ cdFill.style.width='100%'; cdFill.style.background='#22c55e'; }
+    } else if (isEarlyReady(v)){
+      const togo=Math.max(0, reqd-cur);
+      cdBig.textContent='+'+togo+' pts'; cdBig.style.color='#eab308';
+      if (cdSub) cdSub.textContent='Early entry active — '+togo+' Edge pts to full READY ('+reqd+')';
+      if (cdFill){ cdFill.style.width=pct+'%'; cdFill.style.background='#eab308'; }
+    } else {
+      const togo=Math.max(0, reqd-cur);
+      cdBig.textContent='+'+togo+' pts'; cdBig.style.color='#f59e0b';
+      if (cdSub) cdSub.textContent=togo+' Edge pts to trigger (need '+reqd+', now '+cur+')';
+      if (cdFill){ cdFill.style.width=pct+'%'; cdFill.style.background = cur>=reqd?'#22c55e':'#f59e0b'; }
+    }
+  }
+
+  // ── Module 5: Why Not Ready ──
+  const wn=document.getElementById('wn-body');
+  if (wn){
+    if (isReadyVerdict(v)){
+      wn.innerHTML = '<div class="wn-ok">\u2705 <b>'+(isFullReady(v)?'All systems go':'Early entry active')+'</b>'
+                   + (diag.ready_reason ? '<br>'+_modEsc(diag.ready_reason) : '') + '</div>';
+    } else {
+      const rr = diag.rejected_reasons || [];
+      wn.innerHTML = rr.length
+        ? rr.map(function(r){ return '<div class="wn-item">\u26d4 <span>'+_modEsc(r)+'</span></div>'; }).join('')
+        : '<div class="wn-ok">No blocking gate reasons reported.</div>';
+    }
+  }
+
+  // ── Module: SCALP Diagnostics (req 7 — DISPLAY-ONLY; SCALP dynamic-exits only) ──
+  const sd = d.scalp_diagnostics || {};
+  const sdMod = document.getElementById('mod-scalpdiag');
+  if (sdMod){
+    if (!sd.enabled){
+      sdMod.style.display = 'none';
+    } else {
+      sdMod.style.display = '';
+      const _passCol = function(p){ return p===true?'#22c55e':p===false?'#ef4444':''; };
+      const _sdSet = function(id, txt, col){
+        const e=document.getElementById(id);
+        if(e){ e.textContent=txt; e.style.color = col || ''; }
+      };
+      const q = sd.setup_quality_score;
+      _sdSet('sd-quality', q==null?'—':(q+'/'+(sd.min_quality!=null?sd.min_quality:100)), _passCol(sd.quality_pass));
+      _sdSet('sd-room', sd.room_to_target_r==null?'—':(sd.room_to_target_r+'R'), _passCol(sd.room_pass));
+      _sdSet('sd-rr', sd.rr || '—', null);
+      let riskTxt='—';
+      if (sd.initial_risk_pts!=null){
+        riskTxt = sd.initial_risk_pts+' pts';
+        if (sd.initial_risk_dollars!=null) riskTxt += ' ($'+sd.initial_risk_dollars+')';
+      }
+      _sdSet('sd-risk', riskTxt, null);
+      let rewTxt = sd.planned_reward_pts==null?'—':(sd.planned_reward_pts+' pts');
+      if (sd.runner_enabled) rewTxt += ' +runner';
+      _sdSet('sd-reward', rewTxt, null);
+      _sdSet('sd-zone', sd.nearest_opposing_zone==null?'—':sd.nearest_opposing_zone, null);
+      const chop = sd.chop_status || 'unknown';
+      _sdSet('sd-chop', chop.charAt(0).toUpperCase()+chop.slice(1),
+             chop==='choppy'?'#ef4444':chop==='clear'?'#22c55e':'');
+      _sdSet('sd-be', sd.be_moved==null?'—':(sd.be_moved?'Yes':'No'),
+             sd.be_moved===true?'#22c55e':null);
+      _sdSet('sd-exit', sd.exit_reason?String(sd.exit_reason):'—', null);
+      const sdv=document.getElementById('sd-verdict');
+      if (sdv){
+        if (sd.overall_pass===true){ sdv.textContent='ALLOWED'; sdv.style.color='#22c55e'; }
+        else if (sd.overall_pass===false){ sdv.textContent='SKIPPED'; sdv.style.color='#ef4444'; }
+        else { sdv.textContent=''; }
+      }
+      const sdn=document.getElementById('sd-notes');
+      if (sdn){
+        const notes = sd.notes || [];
+        sdn.innerHTML = notes.length ? notes.map(function(n){ return '\u26a0 '+_modEsc(n); }).join('<br>') : '';
+      }
+    }
+  }
+
+  // ── Module: SWING Diagnostics (P7 / req 6 — DISPLAY-ONLY mirror of the HTF gate + per-trade thesis) ──
+  const swd = d.swing_diagnostics || {};
+  const swMod = document.getElementById('mod-swingdiag');
+  if (swMod){
+    if (!swd.enabled){
+      swMod.style.display = 'none';
+    } else {
+      swMod.style.display = '';
+      const _swSet = function(id, txt, col){
+        const e=document.getElementById(id);
+        if(e){ e.textContent = (txt==null||txt==='') ? '—' : txt; e.style.color = col || ''; }
+      };
+      const _swBias = function(id, b){
+        _swSet(id, b ? (b.charAt(0).toUpperCase()+b.slice(1)) : '—',
+               b==='bull'?'#22c55e':b==='bear'?'#ef4444':'');
+      };
+      _swSet('swd-mode', swd.mode || '—', '');
+      _swBias('swd-b1h', swd.bias_1h);
+      _swBias('swd-b4h', swd.bias_4h);
+      _swSet('swd-dlvl', swd.daily_level_nearby || '—', '');
+      _swSet('swd-curr', swd.current_r==null ? '—' : ((swd.current_r>0?'+':'')+swd.current_r+'R'),
+             swd.current_r>0?'#22c55e':swd.current_r<0?'#ef4444':'');
+      _swSet('swd-rr', swd.planned_rr==null ? '—' : ('1:'+swd.planned_rr), '');
+      _swSet('swd-tgt', swd.next_target==null ? '—' : swd.next_target, '');
+      _swSet('swd-inval', swd.invalidation_level==null ? '—' : swd.invalidation_level, '');
+      _swSet('swd-review', swd.last_review_decision || 'Pending', '');
+      const _swHtml = function(id, txt){
+        const e=document.getElementById(id);
+        if(e){ e.innerHTML = txt ? _modEsc(txt) : '—'; }
+      };
+      _swHtml('swd-thesis', swd.has_thesis ? swd.trade_thesis : 'No open SWING trade — live HTF bias only.');
+      _swHtml('swd-hold', swd.reason_to_hold);
+      _swHtml('swd-exit', swd.reason_to_exit);
+      const swst=document.getElementById('swd-status');
+      if (swst){
+        const st = swd.thesis_status;
+        swst.textContent = st || (swd.has_thesis ? '' : 'NO TRADE');
+        swst.style.color = st==='VALID'?'#22c55e':st==='WEAKENING'?'#f59e0b':st==='INVALID'?'#ef4444':'#6b7280';
+      }
+    }
+  }
+
+  // ── Module 6: Volume Delta (CVD) + Volume ── CVD is a HARD confirmation filter
+  //    (rejects a long on bearish delta / a short on bullish delta, fail-open when
+  //    unknown). Volume is a first-class +15 Edge component (a recent spike OR RVOL
+  //    >= threshold) and a fail-open READY gate. Display-only mirror of the gate. ──
+  const _setCvd = function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=txt; e.style.color = col || '#e8e8f0'; }
+  };
+  const cvdSt = diag.cvd_state;
+  _setCvd('cvd-state',
+    cvdSt==='bullish' ? 'Bullish' : cvdSt==='bearish' ? 'Bearish' : 'Unknown',
+    cvdSt==='bullish' ? '#22c55e' : cvdSt==='bearish' ? '#ef4444' : '#6b7280');
+  _setCvd('cvd-value',
+    diag.cvd_value!=null ? Number(diag.cvd_value).toLocaleString() : '—');
+  const cvdDir = diag.cvd_direction;
+  _setCvd('cvd-dir',
+    cvdDir==='rising' ? '\u25b2 Rising' : cvdDir==='falling' ? '\u25bc Falling' : '—',
+    cvdDir==='rising' ? '#22c55e' : cvdDir==='falling' ? '#ef4444' : '#6b7280');
+  const cvdAgree = diag.cvd_agreement || 'Unknown';
+  _setCvd('cvd-agree', cvdAgree,
+    cvdAgree==='Confirmed' ? '#22c55e' : cvdAgree==='Conflicting' ? '#ef4444' : '#6b7280');
+  // 2-candle flip confirmation in progress — the committed state above holds until
+  // the opposite direction confirms on 2 distinct 1-minute candles (then it flips).
+  const cvdPend = diag.cvd_pending;
+  const cvdOpp  = Number(diag.cvd_opposite_count || 0);
+  _setCvd('cvd-pending',
+    cvdPend==='bullish' ? '\u25b2 Bullish' : cvdPend==='bearish' ? '\u25bc Bearish' : 'None',
+    cvdPend==='bullish' ? '#22c55e' : cvdPend==='bearish' ? '#ef4444' : '#6b7280');
+  _setCvd('cvd-oppcount',
+    cvdPend ? (cvdOpp + '/2') : '\u2014',
+    cvdOpp>=1 ? '#f59e0b' : '#6b7280');
+  _setCvd('cvd-rvol',
+    diag.rvol_value!=null ? Number(diag.rvol_value).toFixed(2)+'\u00d7' : '—');
+  // Volume confirmation state (+15 Edge component, fail-open READY gate):
+  // confirmed (spike OR RVOL>=thr) / unconfirmed (data present, no spike) / no data.
+  const volSt = diag.volume_state;
+  _setCvd('cvd-volstate',
+    volSt==='confirmed' ? 'Confirmed' : volSt==='unconfirmed' ? 'Unconfirmed' : 'No data',
+    volSt==='confirmed' ? '#22c55e' : volSt==='unconfirmed' ? '#ef4444' : '#6b7280');
+
+  // ── Module 7: Multi-strategy engine (DISPLAY-ONLY in Phase 1) ──
+  renderStrategyEngine(d);
+
+  // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
+  renderLearningEngine(d);
+
+  // ── Module 8b: Performance report (every-25-trades review) — display-only ──
+  renderPerformanceReport(d);
+
+  // ── Module 8c: Confidence Governor (transparent Edge→confidence) — display-only ──
+  renderConfidenceGovernor(d);
+
+  // ── Module 8d: Trade Memory (similar-trades lookup) — display-only ──
+  renderTradeMemory(d);
+
+  // ── Module 9: Equity curve (today) — display-only, real closed trades ──
+  renderEquityCurve(d);
+
+  // ── Module 9b: Today's trades (per-trade list) — display-only ──
+  renderTodaysTrades(d);
+
+  // ── Module 10: News filter (economic calendar) — display-only ──
+  renderNewsFilter(d);
+
+  // ── Module 10c: Blocked Orders — locally-rejected invalid-payload orders (DISPLAY-ONLY) ──
+  renderExecRejections(d);
+
+  // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
+  renderReportMode(d);
+
+  // ── Module 11: Analyst Mode — professional-analyst reasoning (DISPLAY-ONLY) ──
+  renderAnalystMode(d);
+
+  // ── Module 11b: Professional Review — pre-READY pro-trader grading (DISPLAY-ONLY) ──
+  renderProReview(d);
+
+  // ── Module 11b2: Entry Quality — LOCATION-aware entry grading (DISPLAY-ONLY) ──
+  renderEntryQuality(d);
+
+  // ── Module 11c: Trade Debate — pre-READY Bull vs Bear vs Judge (DISPLAY-ONLY) ──
+  renderTradeDebate(d);
+
+  // ── Module 12: Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY/NOTIFY only ──
+  const xm = d.index_alignment || null;
+  const xmMod = document.getElementById('mod-xmarket');
+  if (xmMod){
+    const members = (xm && xm.members) || [];
+    if (!xm || members.length < 2){
+      xmMod.style.display = 'none';
+    } else {
+      xmMod.style.display = '';
+      const st  = xm.state || 'n/a';
+      const dir = xm.direction || null;
+      const stCol = st==='Aligned' ? (dir==='Long'?'#22c55e':dir==='Short'?'#ef4444':'#6b7280')
+                  : st==='Leaning' ? '#eab308' : '#6b7280';
+      const vEl = document.getElementById('xm-verdict');
+      if (vEl){
+        const dirTxt = dir ? (' '+(dir==='Long'?'BULLISH':'BEARISH')) : '';
+        vEl.textContent = st.toUpperCase()+dirTxt;
+        vEl.style.color = stCol;
+      }
+      const rowEl = document.getElementById('xm-row');
+      if (rowEl){
+        rowEl.innerHTML = members.map(function(m){
+          const md = m.direction;
+          const c  = md==='Long'?'#22c55e':md==='Short'?'#ef4444':'#6b7280';
+          const ar = md==='Long'?'↑':md==='Short'?'↓':'→';
+          const es = (m.edge_score!=null) ? (' · '+Math.round(Number(m.edge_score))) : '';
+          return '<div class="gstat"><div class="l">'+(m.name||m.instrument)+'</div>'
+               + '<div class="v" style="color:'+c+'">'+ar+' '+(m.bias||'—')+es+'</div></div>';
+        }).join('');
+      }
+      const sEl = document.getElementById('xm-summary');
+      if (sEl){
+        let msg;
+        if (st==='Aligned')      msg = 'All '+xm.total+' equity indexes agree — '+(dir==='Long'?'bullish':'bearish')+'. Cross-market confirmation for MES & MYM.';
+        else if (st==='Leaning') msg = xm.agree+' of '+xm.total+' indexes lean '+(dir==='Long'?'bullish':'bearish')+'. Partial confirmation.';
+        else                     msg = 'Indexes disagree — no cross-market confirmation.';
+        sEl.textContent = msg;
+        sEl.style.color = stCol;
+      }
+    }
+  }
+}
+
+// Analyst Mode — professional-analyst reasoning over the EXISTING signals
+// (Context -> Thesis -> Evidence -> Risk -> Verdict). DISPLAY-ONLY on the
+// dashboard; the money-path veto is flag-gated server-side. Fed by d.analyst.
+function _anFill(id, items){
+  const e=document.getElementById(id);
+  if(!e) return;
+  e.innerHTML='';
+  const arr=(items||[]);
+  if(!arr.length){
+    const li=document.createElement('li');
+    li.textContent='—'; li.style.color='#6b7280';
+    e.appendChild(li); return;
+  }
+  arr.forEach(function(t){
+    const li=document.createElement('li');
+    li.textContent=t; e.appendChild(li);
+  });
+}
+function _anVerdictColor(v){
+  v=v||'';
+  if(v.indexOf('READY')===0) return '#22c55e';
+  if(v==='WAIT') return '#f59e0b';
+  return '#6b7280';
+}
+// Blocked Orders — locally-rejected (never-sent) invalid-payload orders. Display-only.
+// Fed by d.execution_rejections; hidden when there are none. All strings via textContent.
+function renderExecRejections(d){
+  const mod=document.getElementById('mod-exec-reject');
+  if(!mod) return;
+  const rows=(d && d.execution_rejections) || [];
+  if(!rows.length){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const meta=document.getElementById('xr-meta');
+  if(meta) meta.textContent=rows.length+' blocked';
+  const st=document.getElementById('xr-status');
+  if(st) st.textContent='Blocked locally — NOT sent to your broker.';
+  _anFill('xr-list', rows.map(function(r){
+    return (r.time||'—')+' · '+(r.instrument||'?')+' · '+(r.reason||'—');
+  }));
+}
+function renderAnalystMode(d){
+  const a=(d && d.analyst) || null;
+  const mod=document.getElementById('mod-analyst');
+  if(!mod) return;
+  // The Advisor toggle (server truth via /status) controls visibility — OFF =>
+  // quiet/hidden. Keep the header pill in sync with the authoritative state.
+  if(d && typeof d.advisor_enabled === 'boolean' && d.advisor_enabled !== ADVISOR_STATE){
+    ADVISOR_STATE = d.advisor_enabled; renderAdvisorUI();
+  }
+  if(!d || !d.advisor_enabled){ mod.style.display='none'; return; }
+  if(!a || !a.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  const fv=a.final_verdict||'NO TRADE';
+  _set('an-verdict-big', fv, _anVerdictColor(fv));
+  const vbadge=document.getElementById('an-verdict');
+  if(vbadge){
+    vbadge.textContent=a.gate_enabled ? 'VETO ARMED' : 'DISPLAY';
+    vbadge.style.color=a.gate_enabled ? '#ef4444' : '#6b7280';
+  }
+  _set('an-bias', a.market_bias, '#e8e8f0');
+  const conf=Number(a.confidence||0);
+  _set('an-conf', conf+'%', conf>=70?'#22c55e':conf>=40?'#f59e0b':'#6b7280');
+  const side=a.stronger_side||'Neither';
+  _set('an-side', side, side==='Long'?'#22c55e':side==='Short'?'#ef4444':'#6b7280');
+  const lq=a.location_quality||'—';
+  _set('an-loc', lq, lq.indexOf('Good')===0?'#22c55e':lq.indexOf('Fair')===0?'#f59e0b':lq.indexOf('Poor')===0?'#ef4444':'#e8e8f0');
+  const rq=a.risk_quality||'—';
+  _set('an-risk', rq, rq==='Good'?'#22c55e':rq==='Fair'?'#f59e0b':rq==='Poor'?'#ef4444':'#e8e8f0');
+  _set('an-scores', (a.bull_score!=null?a.bull_score:0)+' / '+(a.bear_score!=null?a.bear_score:0), '#e8e8f0');
+  _set('an-story', a.market_story, '#cfd0e0');
+  _set('an-idea', a.best_trade_idea, '#cfd0e0');
+  _set('an-forming', a.best_setup_forming, '#cfd0e0');
+  _anFill('an-bull', a.bull_case);
+  _anFill('an-bear', a.bear_case);
+  _anFill('an-watch', a.professionals_watching);
+  _set('an-why', (a.why_not_trade && a.why_not_trade.length) ? a.why_not_trade : a.reason_for_waiting, '#cfd0e0');
+  _anFill('an-next', a.what_needs_next);
+  _set('an-inval', a.invalidation, '#cfd0e0');
+  const _blocks=(d && d.advisor_blocks) || [];
+  _anFill('an-blocks', _blocks.map(function(b){
+    return (b.time||'—')+' · '+(b.instrument||'?')+' · '+(b.reason||'—');
+  }));
+  const mr=a.memory_review||{};
+  _anFill('an-mem', [
+    'Seen before? '+(mr.seen_before||'—'),
+    'What happened: '+(mr.what_happened||'—'),
+    'Best exit: '+(mr.best_exit||'—'),
+    'Winners held: '+(mr.winners_hold||'—'),
+    'Best stop: '+(mr.best_stop||'—'),
+    'Why similar failed: '+(mr.failure_cause||'—'),
+  ]);
+  const foot=document.getElementById('an-foot');
+  if(foot){
+    const _smc=[];
+    if(a.fvg_active) _smc.push('FVG active');
+    if(a.ob_active)  _smc.push('Order block active');
+    const _smcTxt=_smc.length ? _smc.join(' · ') : 'No FVG / Order Block in range';
+    foot.textContent='Reasoning over existing signals · '+_smcTxt+(a.gate_enabled?'':' · veto OFF (display-only)');
+  }
+}
+
+// Unified Analyst Report — ONE executive thesis that CONSUMES the analyst, debate,
+// governor, memory, volatility & news engines (no duplication, DISPLAY-ONLY, no
+// veto). Fed by d.analyst_report. All dynamic strings via textContent.
+function renderReportMode(d){
+  const r=(d && d.analyst_report) || null;
+  const mod=document.getElementById('mod-report');
+  if(!mod) return;
+  if(!r || !r.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  _set('ar-headline', r.headline, '#cfd0e0');
+  const st=r.stance||'—';
+  _set('ar-stance', st, _anVerdictColor(st));
+  _set('ar-bias', r.bias, r.bias==='Bullish'?'#22c55e':r.bias==='Bearish'?'#ef4444':'#9aa');
+  const fav=r.favored_direction||'—';
+  _set('ar-fav', fav, fav==='Long'?'#22c55e':fav==='Short'?'#ef4444':'#6b7280');
+  const p=r.probability||{};
+  _set('ar-p-cont', (p.continuation!=null?p.continuation+'%':'—'), '#22c55e');
+  _set('ar-p-range', (p.range!=null?p.range+'%':'—'), '#f59e0b');
+  _set('ar-p-rev', (p.reversal!=null?p.reversal+'%':'—'), '#ef4444');
+  const c=r.confidence||{};
+  const cc=(c.direction==='up')?'#22c55e':(c.direction==='down')?'#ef4444':'#cfd0e0';
+  _set('ar-conf', c.narrative, cc);
+  _anFill('ar-for', r.evidence_for);
+  _anFill('ar-against', r.evidence_against);
+  _anFill('ar-next', r.what_increases_confidence);
+  _anFill('ar-exit', r.early_exit_triggers);
+  _set('ar-inval', r.invalidation, '#cfd0e0');
+  const foot=document.getElementById('ar-foot');
+  if(foot){ foot.textContent = r.disclaimer || 'Consumes the existing analyst engines · display-only.'; }
+}
+
+// Professional Review — pre-READY pro-trader grading. TWO models (SCALP / SWING)
+// scored from the FINAL assembled analysis and selected SEPARATELY per instrument.
+// DISPLAY-ONLY on the dashboard; the money-path veto is flag-gated server-side.
+// Fed by d.pro_review.
+function _prGradeColor(g){
+  if(g==='A+'||g==='A') return '#22c55e';
+  if(g==='B') return '#84cc16';
+  if(g==='C') return '#f59e0b';
+  if(g==='D') return '#ef4444';
+  return '#6b7280';
+}
+function _prDecisionColor(dec){
+  if(dec==='TAKE') return '#22c55e';
+  if(dec==='WAIT') return '#f59e0b';
+  if(dec==='PASS') return '#ef4444';
+  return '#6b7280';
+}
+function renderProReview(d){
+  const pr=(d && d.pro_review) || null;
+  const mod=document.getElementById('mod-pro');
+  if(!mod) return;
+  if(!pr || !pr.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  const act=pr.active||{};
+  const badge=document.getElementById('pr-badge');
+  if(badge){ badge.textContent=pr.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=pr.gate_enabled?'#ef4444':'#6b7280'; }
+  _set('pr-model', pr.selected_model, '#a78bfa');
+  const dec=act.professional_decision||'—';
+  _set('pr-decision', dec, _prDecisionColor(dec));
+  _set('pr-grade', act.grade, _prGradeColor(act.grade));
+  const eff=Number(act.entry_efficiency||0);
+  _set('pr-eff', eff+'/100', eff>=80?'#22c55e':eff>=65?'#f59e0b':'#ef4444');
+  _set('pr-quality', act.trade_quality);
+  _set('pr-mkt', act.market_type);
+  _set('pr-mom', act.momentum_strength);
+  const chase=act.chase_risk||'—';
+  _set('pr-chase', chase, chase==='Low'?'#22c55e':chase==='Medium'?'#f59e0b':chase==='High'?'#ef4444':'#6b7280');
+  const sess=act.session_quality||'—';
+  _set('pr-sess', sess, sess==='Prime'?'#22c55e':'#6b7280');
+  _set('pr-tl', (act.timing_score!=null?act.timing_score:'—')+' / '+(act.location_score!=null?act.location_score:'—'));
+  _set('pr-mr', (act.momentum_score!=null?act.momentum_score:'—')+' / '+(act.risk_score!=null?act.risk_score:'—'));
+  const cl=act.checklist||{};
+  const order=['not_late','not_chasing','tp1_room','momentum_increasing','volume_confirming','prime_session','pro_would_take'];
+  const labels={not_late:'Not Late',not_chasing:'Not Chasing',tp1_room:'TP1 Room',momentum_increasing:'Momentum',volume_confirming:'Volume',prime_session:'Prime',pro_would_take:'Pro Take'};
+  const cc=document.getElementById('pr-checklist');
+  if(cc){
+    cc.innerHTML=order.map(function(k){
+      const ok=!!cl[k];
+      const col=ok?'#22c55e':'#6b7280';
+      const bg=ok?'rgba(34,197,94,.12)':'rgba(107,114,128,.12)';
+      return '<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+col+';background:'+bg+'">'+(ok?'✓ ':'✗ ')+labels[k]+'</span>';
+    }).join('');
+  }
+  _set('pr-why', act.why_not_trade);
+  const both=document.getElementById('pr-both');
+  if(both){
+    const models=pr.models||{};
+    both.innerHTML=(pr.available_models||[]).map(function(m){
+      const b=models[m]||{};
+      const sel=(m===pr.selected_model);
+      const gc=_prGradeColor(b.grade);
+      const dc=_prDecisionColor(b.professional_decision);
+      return '<div class="gstat" style="'+(sel?'outline:1px solid #a78bfa;':'')+'">'
+        +'<div class="l">'+m+(sel?' (active)':'')+'</div>'
+        +'<div class="v" style="color:'+gc+'">'+(b.grade||'—')+' · '+(b.entry_efficiency!=null?b.entry_efficiency:'—')
+        +' · <span style="color:'+dc+'">'+(b.professional_decision||'—')+'</span></div></div>';
+    }).join('');
+  }
+  // ── Controls (owner): per-instrument model select + global veto toggle ──
+  PRO_GATE_STATE = !!pr.gate_enabled;
+  const _inst=(typeof sym!=='undefined' && sym) ? sym : '—';
+  _set('pr-inst', _inst, '#9aa');
+  ['SCALP','SWING'].forEach(function(m){
+    const b=document.getElementById('pr-m-'+m);
+    if(b){ const on=(m===pr.selected_model); b.style.background=on?'rgba(167,139,250,.18)':'transparent'; b.style.color=on?'#a78bfa':'#9aa'; b.style.borderColor=on?'#a78bfa':'var(--border)'; }
+  });
+  const gt=document.getElementById('pr-gate-toggle');
+  if(gt){ gt.textContent=pr.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=pr.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=pr.gate_enabled?'#ef4444':'var(--border)'; }
+  const foot=document.getElementById('pr-foot');
+  if(foot){ foot.textContent='Two models run separately per instrument · prime windows MGC 8-10pm / MNQ 9-11am ET'+(pr.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)'); }
+}
+function setProModel(m){
+  const inst=(typeof sym!=='undefined' && sym) ? sym : 'MGC';
+  api('/pro-review', { instrument: inst, model: m })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ toast('Pro Review model update failed', false); return; }
+      toast('Pro Review ['+inst+'] model → '+m);
+    })
+    .catch(function(){ toast('Pro Review model update failed', false); });
+}
+function toggleProGate(){
+  const cur=!!PRO_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Professional Review VETO?\\n\\nWhile ARMED, the active model can DEMOTE an actionable setup to WAIT (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
+  PRO_GATE_STATE=next;
+  const gt=document.getElementById('pr-gate-toggle');
+  if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/pro-review', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ PRO_GATE_STATE=cur; toast('Pro Review veto update failed', false); return; }
+      PRO_GATE_STATE=!!d.gate_enabled;
+      toast(PRO_GATE_STATE ? 'Pro Review VETO ARMED — may demote to WAIT' : 'Pro Review veto off');
+    })
+    .catch(function(){ PRO_GATE_STATE=cur; toast('Pro Review veto update failed', false); });
+}
+
+// Entry Quality Engine — LOCATION-aware "is this a good place to enter?" grading.
+// DISPLAY-ONLY on the dashboard; the money-path veto is flag-gated server-side. Fed
+// by d.entry_quality. Dynamic webhook-derived text is written via textContent; the
+// component / flag chips are app-generated and HTML-escaped via _eqEsc.
+function _eqGradeColor(g){ return g==='Excellent'?'#22c55e':g==='Good'?'#84cc16':g==='Acceptable'?'#f59e0b':g==='Poor'?'#ef4444':'#6b7280'; }
+function _eqEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderEntryQuality(d){
+  const eq=(d && d.entry_quality) || null;
+  const mod=document.getElementById('mod-entryq');
+  if(!mod) return;
+  if(!eq || !eq.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id,txt,col){ const e=document.getElementById(id); if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; } };
+  EQ_GATE_STATE = !!eq.gate_enabled;
+  const badge=document.getElementById('eq-badge');
+  if(badge){ badge.textContent=eq.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=eq.gate_enabled?'#ef4444':'#6b7280'; }
+  const score=(eq.score!=null)?eq.score:null;
+  _set('eq-score', score!=null?score:'—', _eqGradeColor(eq.grade));
+  _set('eq-grade', eq.grade||'—', _eqGradeColor(eq.grade));
+  _set('eq-dir', eq.direction?('· '+eq.direction):(eq.available?'':'· no candidate'), '#9aa');
+  const bars=document.getElementById('eq-bars');
+  if(bars){
+    const comps=eq.components||[];
+    bars.innerHTML=comps.map(function(c){
+      const frac=c.max?Math.max(0,Math.min(1,c.score/c.max)):0;
+      const pct=Math.round(frac*100);
+      const col=frac>=0.8?'#22c55e':frac>=0.55?'#f59e0b':'#ef4444';
+      return '<div style="margin:3px 0">'
+        +'<div style="display:flex;justify-content:space-between;font-size:11px;color:#9aa">'
+        +'<span>'+_eqEsc(c.label)+'</span><span style="color:'+col+'">'+c.score+'/'+c.max+'</span></div>'
+        +'<div style="height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden">'
+        +'<div style="height:100%;width:'+pct+'%;background:'+col+'"></div></div>'
+        +(c.detail?'<div style="font-size:9px;color:#6b7280">'+_eqEsc(c.detail)+'</div>':'')
+        +'</div>';
+    }).join('');
+  }
+  const fl=document.getElementById('eq-flags');
+  if(fl){
+    const flags=eq.flags||{};
+    const chips=[];
+    const add=function(label,bad){ chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+(bad?'#ef4444':'#22c55e')+';background:'+(bad?'rgba(239,68,68,.12)':'rgba(34,197,94,.12)')+'">'+(bad?'⚠ ':'✓ ')+_eqEsc(label)+'</span>'); };
+    add('Chasing', !!flags.chasing_breakout);
+    if(eq.direction==='Long') add('At Swing High', !!flags.near_swing_high);
+    if(eq.direction==='Short') add('At Swing Low', !!flags.near_swing_low);
+    add('Overextended', !!flags.overextended);
+    if(flags.sweep_complete===true) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#22c55e;background:rgba(34,197,94,.12)">✓ Sweep Done</span>');
+    if(flags.impulse_pct!=null) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#9aa;background:rgba(148,163,184,.12)">Impulse '+flags.impulse_pct+'%</span>');
+    fl.innerHTML=chips.join('');
+  }
+  let assess=eq.why_not_trade||'';
+  if(!assess){
+    if(eq.available && score!=null){ assess=(score>=(eq.min_score!=null?eq.min_score:70))?('Good entry location ('+(eq.grade||'')+').'):'Poor entry location.'; }
+    else { assess=eq.summary||'Entry location not evaluated.'; }
+  }
+  _set('eq-why', assess);
+  const gt=document.getElementById('eq-gate-toggle');
+  if(gt){ gt.textContent=eq.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=eq.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=eq.gate_enabled?'#ef4444':'var(--border)'; }
+  _set('eq-foot', 'Reject < '+(eq.min_score!=null?eq.min_score:70)+'/100 unless Edge ≥ '+(eq.override_edge!=null?eq.override_edge:90)+(eq.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)')+(eq.override_applied?' · override active':''));
+}
+function toggleEntryGate(){
+  const cur=!!EQ_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Entry Quality VETO? While ARMED, a poor entry LOCATION (score below threshold) can DEMOTE an actionable setup to WAIT — unless confidence is extremely high (Edge override). It can NEVER force a trade. Affects AUTO-trades and READY alerts; manual ENTER is unaffected.')) return;
+  EQ_GATE_STATE=next;
+  const gt=document.getElementById('eq-gate-toggle');
+  if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/entry-quality', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ EQ_GATE_STATE=cur; toast('Entry Quality veto update failed', false); return; }
+      EQ_GATE_STATE=!!d.gate_enabled;
+      toast(EQ_GATE_STATE ? 'Entry Quality VETO ARMED — may demote to WAIT' : 'Entry Quality veto off');
+    })
+    .catch(function(){ EQ_GATE_STATE=cur; toast('Entry Quality veto update failed', false); });
+}
+
+// Trade Debate Engine — pre-READY Bull vs Bear vs Decision Judge, DERIVED from the
+// per-direction Edge cards. DISPLAY-ONLY on the dashboard; the money-path veto is
+// flag-gated server-side. Fed by d.trade_debate. ALL dynamic strings are written via
+// textContent (never innerHTML) so webhook-derived reason text can't inject markup.
+function _tdVerdictColor(v){ return v==='TAKE'?'#22c55e':v==='WAIT'?'#f59e0b':'#6b7280'; }
+function renderTradeDebate(d){
+  const td=(d && d.trade_debate) || null;
+  const mod=document.getElementById('mod-debate');
+  if(!mod) return;
+  if(!td || !td.engine_enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id, txt, col){
+    const e=document.getElementById(id);
+    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
+  };
+  const jd=td.judge||{}, bull=td.bull||{}, bear=td.bear||{};
+  const badge=document.getElementById('td-badge');
+  if(badge){ badge.textContent=td.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=td.gate_enabled?'#ef4444':'#6b7280'; }
+  const ver=jd.final_verdict||'—';
+  _set('td-verdict', ver, _tdVerdictColor(ver));
+  const ws=jd.winning_side||'—';
+  _set('td-winner', ws, ws==='Bull'?'#22c55e':ws==='Bear'?'#ef4444':'#6b7280');
+  _set('td-gap', (jd.confidence_gap!=null?jd.confidence_gap:'—')+' pts');
+  _set('td-edge', jd.too_balanced?'Too balanced':jd.edge_significant?'Significant':'Slight', jd.too_balanced?'#f59e0b':jd.edge_significant?'#22c55e':'#6b7280');
+  _set('td-bull-conf', (bull.confidence!=null?bull.confidence:'—')+'/100'+(bull.grade&&bull.grade!=='—'?(' · '+bull.grade):''));
+  _set('td-bull-ev', bull.strongest_evidence);
+  _set('td-bull-risk', bull.biggest_risk);
+  _set('td-bull-reasons', (bull.reasons&&bull.reasons.length)?('• '+bull.reasons.join('   • ')):'');
+  _set('td-bear-conf', (bear.confidence!=null?bear.confidence:'—')+'/100'+(bear.grade&&bear.grade!=='—'?(' · '+bear.grade):''));
+  _set('td-bear-ev', bear.strongest_evidence);
+  _set('td-bear-risk', bear.biggest_risk);
+  _set('td-bear-reasons', (bear.reasons&&bear.reasons.length)?('• '+bear.reasons.join('   • ')):'');
+  _set('td-why-won', jd.reason_winner_won);
+  _set('td-why-lost', jd.reason_loser_lost);
+  DEBATE_GATE_STATE=!!td.gate_enabled;
+  const gt=document.getElementById('td-gate-toggle');
+  if(gt){ gt.textContent=td.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=td.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=td.gate_enabled?'#ef4444':'var(--border)'; }
+  const foot=document.getElementById('td-foot');
+  if(foot){ foot.textContent='Bull vs Bear judged on Edge case strength · WAIT if gap < 15 · decisive if gap > 20'+(td.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)'); }
+}
+function toggleDebateGate(){
+  const cur=!!DEBATE_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Trade Debate VETO?\\n\\nWhile ARMED, the Decision Judge can DEMOTE an actionable setup to WAIT when the debate is too balanced or opposes the trade direction (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
+  DEBATE_GATE_STATE=next;
+  const gt=document.getElementById('td-gate-toggle');
+  if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/trade-debate', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ DEBATE_GATE_STATE=cur; toast('Trade Debate veto update failed', false); return; }
+      DEBATE_GATE_STATE=!!d.gate_enabled;
+      toast(DEBATE_GATE_STATE ? 'Trade Debate VETO ARMED — may demote to WAIT' : 'Trade Debate veto off');
+    })
+    .catch(function(){ DEBATE_GATE_STATE=cur; toast('Trade Debate veto update failed', false); });
+}
+
+// Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
+// trades from Postgres; served from an in-memory cache, never per-request SQL).
+function _leColor(wr){ return wr>=55 ? '#22c55e' : wr>=45 ? '#eab308' : '#ef4444'; }
+function renderLearningEngine(d){
+  const le = (d && d.learning_engine) || null;
+  const metaEl = document.getElementById('le-meta');
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const clr  = function(id){ const e=document.getElementById(id); if(e) e.innerHTML=''; };
+  if (!le || le.enabled===false || !le.ready){
+    if (metaEl) metaEl.textContent = (le && le.enabled===false) ? '· OFFLINE' : '· AWAITING TRADES';
+    setT('le-total', le && le.total_trades!=null ? le.total_trades : '0');
+    setT('le-top','—'); setT('le-bottom','—'); setT('le-trend','—');
+    clr('le-rank'); clr('le-hours'); clr('le-cond');
+    const f=document.getElementById('le-fid');
+    if (f) f.textContent = (le && le.enabled===false)
+      ? 'No database configured — learning paused.'
+      : 'Logging trades. Rankings appear once outcomes accrue; weights apply at '
+        + ((le && le.min_sample) || 20) + ' trades per strategy.';
+    return;
+  }
+  if (metaEl){
+    const nx = le.next_recalc_in;
+    metaEl.textContent = '· ' + le.total_trades + ' TRADES'
+      + (nx!=null && nx>0 ? ' · recalc in '+nx : '');
+  }
+  setT('le-total', le.total_trades);
+
+  // Top / bottom strategy
+  const ts = le.top_strategy, bs = le.bottom_strategy;
+  const tEl=document.getElementById('le-top');
+  if (tEl){
+    if (ts){ tEl.textContent = (ts.strategy||ts.strategy_key)+' ('+ts.win_rate+'%)';
+             tEl.style.color = _leColor(ts.win_rate); }
+    else { tEl.textContent='—'; tEl.style.color='#6b7280'; }
+  }
+  const bEl=document.getElementById('le-bottom');
+  if (bEl){
+    if (bs && (!ts || bs.strategy_key!==ts.strategy_key)){
+      bEl.textContent = (bs.strategy||bs.strategy_key)+' ('+bs.win_rate+'%)';
+      bEl.style.color = _leColor(bs.win_rate);
+    } else { bEl.textContent='—'; bEl.style.color='#6b7280'; }
+  }
+
+  // Recent improvement trend
+  const tr = le.trend || {};
+  const trEl=document.getElementById('le-trend');
+  if (trEl){
+    trEl.textContent = tr.label || '—';
+    trEl.style.color = tr.label==='Improving' ? '#22c55e'
+                     : tr.label==='Declining' ? '#ef4444' : '#6b7280';
+  }
+
+  // Strategy performance ranking
+  const rankEl=document.getElementById('le-rank');
+  if (rankEl){
+    const rows = le.ranking || [];
+    rankEl.innerHTML = rows.length ? rows.map(function(r){
+      const wclr = _leColor(r.win_rate);
+      const tag  = r.n < (le.min_sample||20)
+        ? ' <span style="color:#6b7280;font-size:9px">('+r.n+' · sampling)</span>' : '';
+      return '<div class="le-row">'
+           + '<div class="nm">'+_modEsc(r.strategy||r.strategy_key)+tag+'</div>'
+           + '<div class="st" style="color:'+wclr+'">'+r.win_rate+'%</div>'
+           + '<div class="st">'+(r.avg_r>=0?'+':'')+r.avg_r+'R</div>'
+           + '<div class="st">PF '+r.profit_factor+'</div>'
+           + '<div class="st" style="color:'+(r.weight>1?'#22c55e':r.weight<1?'#ef4444':'#6b7280')+'">×'+r.weight+'</div>'
+           + '</div>';
+    }).join('') : '<div class="le-empty">No closed trades yet.</div>';
+  }
+
+  // Best hours (ET)
+  const hEl=document.getElementById('le-hours');
+  if (hEl){
+    const hrs = le.best_hours || [];
+    hEl.innerHTML = hrs.length ? hrs.map(function(h){
+      return '<div class="le-li"><span>'+_modEsc(h.label)+'</span>'
+           + '<span style="color:'+_leColor(h.win_rate)+'">'+h.win_rate+'% · '+h.n+'t</span></div>';
+    }).join('') : '<div class="le-empty">—</div>';
+  }
+
+  // Best market conditions (regime)
+  const cEl=document.getElementById('le-cond');
+  if (cEl){
+    const cs = le.best_conditions || [];
+    cEl.innerHTML = cs.length ? cs.map(function(c){
+      return '<div class="le-li"><span>'+_modEsc(c.regime)+'</span>'
+           + '<span style="color:'+_leColor(c.win_rate)+'">'+c.win_rate+'% · '+c.n+'t</span></div>';
+    }).join('') : '<div class="le-empty">—</div>';
+  }
+
+  const f=document.getElementById('le-fid');
+  if (f) f.textContent = 'Recomputed every '+(le.min_sample||20)
+       +' closed trades · weights bounded ×0.65–×1.35, never disable a strategy.';
+}
+
+// Performance Report panel — fed by d.learning_engine.report (generated every 25
+// closed trades; display-only). Awaiting state until the first report exists.
+function renderPerformanceReport(d){
+  const le  = (d && d.learning_engine) || null;
+  const rep = (le && le.report) || null;
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
+  const metaEl = document.getElementById('pr-meta');
+  if (!rep){
+    if (metaEl) metaEl.textContent = (le && le.enabled===false) ? '· OFFLINE' : '· AWAITING 25 TRADES';
+    setT('pr-wr','—'); setT('pr-avgr','—'); setT('pr-pf','—'); setT('pr-hold','—');
+    setH('pr-session',''); setH('pr-strategy',''); setH('pr-mistake',''); setH('pr-eff','');
+    setH('pr-recs','<div class="le-empty">First report generates at 25 closed trades.</div>');
+    const f0=document.getElementById('pr-fid'); if(f0) f0.textContent='';
+    return;
+  }
+  const o = rep.overall || {};
+  if (metaEl) metaEl.textContent = '· ' + (rep.trade_count||0) + ' TRADES';
+  const wr = (o.win_rate!=null) ? Math.round(o.win_rate*100) : null;
+  setT('pr-wr', wr!=null ? wr+'%' : '—');
+  const we=document.getElementById('pr-wr'); if(we && wr!=null) we.style.color=_leColor(wr);
+  setT('pr-avgr', o.avg_r!=null ? (o.avg_r>=0?'+':'')+o.avg_r+'R' : '—');
+  setT('pr-pf', o.profit_factor!=null ? o.profit_factor : '—');
+  const ah = rep.avg_hold || {};
+  setT('pr-hold', ah.all!=null ? ah.all+'m' : '—');
+
+  const liR = function(arrow, name, wrate, avgr, n){
+    return '<div class="le-li"><span>'+arrow+' '+_modEsc(name)+'</span>'
+         + '<span style="color:'+_leColor((wrate||0)*100)+'">'
+         + ((avgr>=0?'+':'')+avgr)+'R · '+n+'t</span></div>';
+  };
+
+  const bs=rep.best_session, ws=rep.worst_session;
+  let sH='';
+  if (bs) sH += liR('▲', bs.session, bs.win_rate, bs.avg_r, bs.n);
+  if (ws) sH += liR('▼', ws.session, ws.win_rate, ws.avg_r, ws.n);
+  setH('pr-session', sH || '<div class="le-empty">—</div>');
+
+  const bst=rep.best_strategy, wst=rep.worst_strategy;
+  let stH='';
+  if (bst) stH += liR('▲', bst.strategy, bst.win_rate, bst.avg_r, bst.n);
+  if (wst) stH += liR('▼', wst.strategy, wst.win_rate, wst.avg_r, wst.n);
+  setH('pr-strategy', stH || '<div class="le-empty">—</div>');
+
+  const cm=rep.common_mistake;
+  setH('pr-mistake', cm
+    ? '<div class="le-li"><span>'+_modEsc(cm.label)+'</span><span style="color:#ef4444">×'+cm.n+'</span></div>'
+    : '<div class="le-empty">—</div>');
+
+  const be=rep.best_efficiency_range, sc=rep.avg_score||{};
+  let eH='';
+  if (be) eH += '<div class="le-li"><span>Eff '+_modEsc(be.range)+'</span>'
+             + '<span style="color:'+_leColor((be.win_rate||0)*100)+'">'+(be.avg_r>=0?'+':'')+be.avg_r+'R</span></div>';
+  if (sc.winners!=null && sc.losers!=null)
+    eH += '<div class="le-li"><span>Edge W/L</span><span>'+sc.winners+' / '+sc.losers+'</span></div>';
+  setH('pr-eff', eH || '<div class="le-empty">—</div>');
+
+  const recs=rep.recommendations||[];
+  setH('pr-recs', recs.length
+    ? recs.map(function(r){ return '<div class="le-row"><div class="nm">• '+_modEsc(r)+'</div></div>'; }).join('')
+    : '<div class="le-empty">—</div>');
+
+  const f=document.getElementById('pr-fid');
+  if (f){
+    let when='';
+    try { when = new Date(rep.generated_at).toLocaleString(); } catch(e){}
+    f.textContent = 'Auto-generated every '+(rep.window||25)+' closed trades'+(when?' · last '+when:'')+'.';
+  }
+}
+
+// Learning-demotion VETO toggle (mirrors the Trade Debate veto). DISPLAY-ONLY until
+// armed; when ARMED the Confidence Governor demotes an actionable setup to WAIT if its
+// final confidence is below the READY threshold (it can NEVER force a trade). Painted
+// in both the awaiting and ready branches so the toggle is always operable.
+function _paintLearnGate(g){
+  LEARNING_GATE_STATE = !!(g && g.gate_enabled);
+  const gt=document.getElementById('cg-gate-toggle');
+  if(gt){ gt.textContent=LEARNING_GATE_STATE?'Demote: ARMED':'Demote: off';
+          gt.style.color=LEARNING_GATE_STATE?'#ef4444':'#9aa';
+          gt.style.borderColor=LEARNING_GATE_STATE?'#ef4444':'var(--border)'; }
+  const de=document.getElementById('cg-demote');
+  if(de){ de.textContent=(g && g.demotion_reason) ? ('⛔ '+g.demotion_reason) : ''; }
+}
+function toggleLearningGate(){
+  const cur=!!LEARNING_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Learning demotion VETO?\\n\\nWhile ARMED, the Confidence Governor can DEMOTE an actionable setup to WAIT when its final confidence (Edge + historical adjustments) is below the READY threshold (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
+  LEARNING_GATE_STATE=next;
+  const gt=document.getElementById('cg-gate-toggle');
+  if(gt){ gt.textContent=next?'Demote: ARMED':'Demote: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/learning', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); return; }
+      LEARNING_GATE_STATE=!!d.gate_enabled;
+      toast(LEARNING_GATE_STATE ? 'Learning VETO ARMED — may demote to WAIT' : 'Learning veto off');
+    })
+    .catch(function(){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); });
+}
+// Confidence Governor panel — fed by d.confidence_governor (base Edge Score + bounded,
+// explained historical adjustments => final confidence). DISPLAY-ONLY unless the
+// Learning demotion VETO above is armed. Awaiting state until trade history exists.
+function renderConfidenceGovernor(d){
+  const g = (d && d.confidence_governor) || null;
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
+  const metaEl = document.getElementById('cg-meta');
+  _paintLearnGate(g);
+  if (!g || !g.ready){
+    if (metaEl) metaEl.textContent = (g && g.reason && g.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· AWAITING TRADES';
+    setT('cg-base', (g && g.base_edge_score!=null) ? g.base_edge_score : '—');
+    setT('cg-final', (g && g.final_confidence_score!=null) ? g.final_confidence_score : '—');
+    setT('cg-adj','—');
+    setT('cg-thr', (g && g.threshold!=null) ? g.threshold : '—');
+    setH('cg-comps','<div class="le-empty">'+_modEsc((g && g.reason) || 'Awaiting trade history.')+'</div>');
+    const f0=document.getElementById('cg-fid'); if(f0) f0.textContent='Display-only — never changes the verdict.';
+    return;
+  }
+  if (metaEl) metaEl.textContent = '· '+(g.trade_count||0)+' TRADES';
+  setT('cg-base', g.base_edge_score);
+  const fe=document.getElementById('cg-final');
+  if (fe){ fe.textContent=g.final_confidence_score;
+           fe.style.color = g.final_confidence_score>=g.threshold ? '#22c55e' : '#f59e0b'; }
+  const ae=document.getElementById('cg-adj');
+  if (ae){ const t=g.total_adjustment||0; ae.textContent=(t>0?'+':'')+t;
+           ae.style.color = t>0?'#22c55e':t<0?'#ef4444':'#6b7280'; }
+  setT('cg-thr', g.threshold);
+  const comps=g.confidence_components||[];
+  setH('cg-comps', comps.length ? comps.map(function(c){
+    const sc=(c.score!=null)?c.score:'—';
+    const scc=(c.score!=null)?(c.score>=60?'#22c55e':c.score>=45?'#f59e0b':'#ef4444'):'#6b7280';
+    let tail='';
+    if(c.nudge!=null){
+      const nc=c.nudge>0?'#22c55e':c.nudge<0?'#ef4444':'#6b7280';
+      tail=' <span style="color:'+nc+'">('+(c.nudge>0?'+':'')+c.nudge+')</span>';
+    } else {
+      tail=' <span style="color:#6b7280">(anchor)</span>';
+    }
+    return '<div class="le-row">'
+         + '<div class="nm"><b>'+_modEsc(c.label||c.name)+'</b> · '+_modEsc(c.explanation||'')+'</div>'
+         + '<div class="st" style="color:'+scc+'">'+sc+tail+'</div>'
+         + '</div>';
+  }).join('') : '<div class="le-empty">No components.</div>');
+  const f=document.getElementById('cg-fid');
+  if (f){
+    let when='';
+    try { if(g.last_refreshed_at) when=new Date(g.last_refreshed_at).toLocaleString(); } catch(e){}
+    f.textContent='Current setup anchors; Live market, AI reasoning & History each nudge within caps. Display-only — never changes the verdict'+(when?' · refreshed '+when:'')+'.';
+  }
+}
+
+// Trade Memory panel — fed by d.trade_memory (in-memory similar-trades lookup over recent
+// closed trades). DISPLAY-ONLY. Awaiting / no-match states are explicit.
+function renderTradeMemory(d){
+  const m = (d && d.trade_memory) || null;
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
+  const metaEl = document.getElementById('tm-meta');
+  if (!m || !m.ready){
+    if (metaEl) metaEl.textContent = (m && m.reason && m.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· NO MATCHES';
+    setT('tm-n', (m && m.similar_trades_found!=null) ? m.similar_trades_found : '0');
+    setT('tm-wr','—'); setT('tm-avgr','—'); setT('tm-hold','—');
+    setH('tm-exc',''); setH('tm-fail','');
+    setH('tm-rec','<div class="le-empty">'+_modEsc((m && (m.memory_recommendation||m.reason)) || 'Awaiting comparable history.')+'</div>');
+    const f0=document.getElementById('tm-fid'); if(f0) f0.textContent='Similar = same instrument + direction + ≥1 matching context. Display-only.';
+    return;
+  }
+  if (metaEl) metaEl.textContent = '· '+(m.trade_count||0)+' IN MEMORY';
+  setT('tm-n', m.similar_trades_found);
+  const wr = (m.similar_win_rate!=null) ? Math.round(m.similar_win_rate*100) : null;
+  setT('tm-wr', wr!=null ? wr+'%' : '—');
+  const we=document.getElementById('tm-wr'); if(we && wr!=null) we.style.color=_leColor(wr);
+  setT('tm-avgr', m.average_r!=null ? (m.average_r>=0?'+':'')+m.average_r+'R' : '—');
+  setT('tm-hold', m.average_hold_time!=null ? m.average_hold_time+'m' : '—');
+  let eH='';
+  if (m.average_mfe!=null) eH += '<div class="le-li"><span>Avg MFE</span><span style="color:#22c55e">'+(m.average_mfe>=0?'+':'')+m.average_mfe+'R</span></div>';
+  if (m.average_mae!=null) eH += '<div class="le-li"><span>Avg MAE</span><span style="color:#ef4444">'+m.average_mae+'R</span></div>';
+  setH('tm-exc', eH || '<div class="le-empty">—</div>');
+  setH('tm-fail', m.most_common_failure
+    ? '<div class="le-li"><span>'+_modEsc(m.most_common_failure)+'</span></div>'
+    : '<div class="le-empty">—</div>');
+  setH('tm-rec', m.memory_recommendation
+    ? '<div class="le-row"><div class="nm">• '+_modEsc(m.memory_recommendation)+'</div></div>'
+    : '<div class="le-empty">—</div>');
+  const f=document.getElementById('tm-fid');
+  if (f){
+    let when='';
+    try { if(m.last_refreshed_at) when=new Date(m.last_refreshed_at).toLocaleString(); } catch(e){}
+    f.textContent='Similar = same instrument + direction + ≥1 matching context. Display-only'+(when?' · refreshed '+when:'')+'.';
+  }
+}
+
+// Equity curve (today) — fed by d.equity_curve_today (cumulative R of trades
+// CLOSED today in ET, from real strategy_trades). Display-only; honest empties.
+function renderEquityCurve(d){
+  const eq = (d && d.equity_curve_today) || null;
+  const setT=function(id,v){const e=document.getElementById(id);if(e)e.textContent=v;};
+  const svg=document.getElementById('eq-chart');
+  const emptyEl=document.getElementById('eq-empty');
+  const metaEl=document.getElementById('eq-meta');
+  const off=!!(eq && eq.available===false);
+  const pts=(eq&&eq.points)||[];
+  if (eq && !off){
+    const net=eq.total_r||0;
+    const nEl=document.getElementById('eq-net');
+    if(nEl){nEl.textContent=(net>=0?'+':'')+net.toFixed(2)+'R';
+            nEl.style.color=net>0?'#22c55e':net<0?'#ef4444':'#6b7280';}
+    setT('eq-count',eq.count!=null?eq.count:'0');
+    setT('eq-wins',eq.wins!=null?eq.wins:'0');
+    setT('eq-losses',eq.losses!=null?eq.losses:'0');
+  } else {
+    setT('eq-net','—');setT('eq-count','—');setT('eq-wins','—');setT('eq-losses','—');
+  }
+  if (metaEl) metaEl.textContent = off ? '· OFFLINE' : '';
+  if (!eq || !pts.length){
+    if(svg) svg.style.display='none';
+    if(emptyEl){
+      emptyEl.style.display='block';
+      emptyEl.textContent = off ? (eq.note || 'Trade history unavailable.')
+                                : ((eq && eq.note) || 'No closed trades today yet.');
+    }
+    return;
+  }
+  if(emptyEl) emptyEl.style.display='none';
+  if(!svg) return;
+  svg.style.display='block';
+  const W=320,H=120,pad=10;
+  const cum=pts.map(function(p){return p.cum;});
+  const series=[0].concat(cum);
+  let lo=Math.min.apply(null,series), hi=Math.max.apply(null,series);
+  if (lo===hi){lo-=1;hi+=1;}
+  const n=series.length;
+  const xFor=function(i){return pad + (W-2*pad)*(n===1?0.5:i/(n-1));};
+  const yFor=function(v){return pad + (H-2*pad)*(1-(v-lo)/(hi-lo));};
+  const yZero=yFor(0);
+  let dpath='';
+  for(let i=0;i<n;i++){dpath+=(i===0?'M':'L')+xFor(i).toFixed(1)+' '+yFor(series[i]).toFixed(1)+' ';}
+  const net=cum.length?cum[cum.length-1]:0;
+  const col=net>0?'#22c55e':net<0?'#ef4444':'#9aa6b2';
+  let s='';
+  s+='<line x1="'+pad+'" y1="'+yZero.toFixed(1)+'" x2="'+(W-pad)+'" y2="'+yZero.toFixed(1)+'" style="stroke:var(--border)" stroke-width="1" stroke-dasharray="3 3"/>';
+  const area=dpath+'L'+xFor(n-1).toFixed(1)+' '+yZero.toFixed(1)+' L'+xFor(0).toFixed(1)+' '+yZero.toFixed(1)+' Z';
+  s+='<path d="'+area+'" fill="'+col+'" opacity="0.12"/>';
+  s+='<path d="'+dpath+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+  for(let i=1;i<n;i++){
+    const dotcol=(pts[i-1].r>=0)?'#22c55e':'#ef4444';
+    s+='<circle cx="'+xFor(i).toFixed(1)+'" cy="'+yFor(cum[i-1]).toFixed(1)+'" r="2.4" fill="'+dotcol+'"/>';
+  }
+  svg.innerHTML=s;
+}
+
+// Today's trades — per-trade list fed by d.equity_curve_today.points (the same
+// real closed strategy_trades that drive the equity curve). Display-only; follows
+// the selected instrument; newest first; honest empty states.
+function renderTodaysTrades(d){
+  const body=document.getElementById('tt-body');
+  const metaEl=document.getElementById('tt-meta');
+  if(!body) return;
+  const eq=(d&&d.equity_curve_today)||null;
+  const inst=(d&&d.active_ticker)?String(d.active_ticker).replace('1!',''):sym;
+  if(metaEl) metaEl.textContent='· '+inst;
+  if(eq && eq.available===false){
+    body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'Trade history unavailable.')+'</div>';
+    return;
+  }
+  const pts=(eq&&eq.points)||[];
+  if(!pts.length){
+    body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'No closed trades today yet.')+'</div>';
+    return;
+  }
+  const esc=function(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});};
+  const rows=pts.slice().reverse().map(function(p){
+    const dl=String(p.dir||'').toLowerCase();
+    const isL=dl.indexOf('long')>=0||dl==='buy';
+    const dcl=isL?'tt-long':'tt-short';
+    const dlbl=p.dir?esc(String(p.dir).toUpperCase()):'—';
+    const win=(p.r!=null&&p.r>=0);
+    const r=(p.r!=null)?((p.r>=0?'+':'')+Number(p.r).toFixed(2)+'R'):'—';
+    const rcl=win?'tt-w':'tt-l';
+    const res=p.result?esc(p.result):((p.r!=null)?(win?'WIN':'LOSS'):'—');
+    const entry=(p.entry!=null)?fmtPrice(inst,p.entry):'—';
+    return '<tr><td>'+esc(p.t||'—')+'</td>'
+      +'<td class="'+dcl+'">'+dlbl+'</td>'
+      +'<td class="tt-strat">'+esc(p.strategy||'—')+'</td>'
+      +'<td>'+entry+'</td>'
+      +'<td class="'+rcl+'">'+r+'</td>'
+      +'<td class="'+rcl+'">'+res+'</td></tr>';
+  }).join('');
+  body.innerHTML='<table class="tt-tbl"><thead><tr><th>Time</th><th>Dir</th><th>Strategy</th><th>Entry</th><th>R</th><th>Result</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+
+// News filter — fed by d.news_filter (cached ForexFactory high-impact USD events).
+// DISPLAY-ONLY: surfaces an upcoming-news window; never gates trades.
+function renderNewsFilter(d){
+  const nf=(d&&d.news_filter)||null;
+  const statusEl=document.getElementById('nf-status');
+  const listEl=document.getElementById('nf-list');
+  const metaEl=document.getElementById('nf-meta');
+  if(metaEl) metaEl.textContent = (nf&&nf.as_of) ? ('· '+nf.as_of)
+                                  : ((nf&&nf.available===false) ? '· LOADING' : '');
+  if(!nf || nf.available===false){
+    if(statusEl){statusEl.className='nf-status';statusEl.textContent='Loading economic calendar…';}
+    if(listEl) listEl.innerHTML='';
+    return;
+  }
+  if(statusEl){
+    if(nf.within_window){
+      const ne=nf.next_event;
+      statusEl.className='nf-status warn';
+      statusEl.textContent='⚠ HIGH-IMPACT NEWS WINDOW'+(ne?(' · '+ne.title):'');
+    } else {
+      statusEl.className='nf-status clear';
+      statusEl.textContent='✓ No high-impact news within '+(nf.window_min||30)+' min';
+    }
+  }
+  if(listEl){
+    const ev=nf.upcoming||[];
+    const win=nf.window_min||30;
+    listEl.innerHTML = ev.length ? ev.map(function(e){
+      const m=e.minutes_until;
+      const when = (m<0) ? (Math.abs(m)+'m ago')
+                 : (m<60) ? ('in '+m+'m') : e.time_et;
+      const near = (m>=-15 && m<=win);
+      return '<div class="nf-row">'
+        + '<span class="nf-imp">'+_modEsc(e.country||'USD')+'</span>'
+        + '<span class="nf-ttl">'+_modEsc(e.title||'—')+'</span>'
+        + '<span class="nf-when"'+(near?' style="color:var(--warn)"':'')+'>'+_modEsc(when)+'</span>'
+        + '</div>';
+    }).join('') : '<div class="nf-empty">No upcoming high-impact USD events this week.</div>';
+  }
+}
+
+// Strategy engine panel — fed by d.strategy_engine (compute_strategy_engine in
+// Python). Phase 1 is display-only: it never changes the verdict/money path; the
+// existing gate above stays authoritative until STRATEGY_ENGINE_MODE=control.
+function _seQualityColor(q){
+  if (!q) return '#6b7280';
+  if (q.indexOf('A+')===0) return '#15803d';
+  if (q.charAt(0)==='A')   return '#22c55e';
+  if (q.charAt(0)==='B')   return '#eab308';
+  return '#ef4444';                              // Avoid
+}
+function _seBias(id, val){
+  const e=document.getElementById(id);
+  if (!e) return;
+  const t = val || 'Neutral';
+  e.textContent = t;
+  e.style.color = t==='Bullish' ? '#22c55e' : t==='Bearish' ? '#ef4444' : '#6b7280';
+}
+function renderStrategyEngine(d){
+  const se = (d && d.strategy_engine) || null;
+  const modeEl = document.getElementById('se-mode');
+  if (modeEl) modeEl.textContent = se && se.mode ? '· '+String(se.mode).toUpperCase() : '';
+  if (!se){
+    _modTxt('se-regime','—'); _modTxt('se-conf','—'); _modTxt('se-quality','—');
+    _modTxt('se-target','—'); _modTxt('se-active','—');
+    const r0=document.getElementById('se-reason'); if(r0) r0.textContent='';
+    const m0=document.getElementById('se-missing'); if(m0) m0.innerHTML='';
+    const l0=document.getElementById('se-list'); if(l0) l0.innerHTML='';
+    const f0=document.getElementById('se-fid'); if(f0) f0.textContent='';
+    return;
+  }
+
+  // Regime
+  const regEl=document.getElementById('se-regime');
+  if (regEl){
+    const reg = se.market_regime || '—';
+    regEl.textContent = reg;
+    regEl.style.color = reg==='TRENDING' ? '#22c55e'
+                      : reg==='VOLATILE' ? '#ef4444'
+                      : reg==='RANGING'  ? '#3b82f6'
+                      : reg==='CLOSED'   ? '#6b7280' : '#eab308';
+  }
+
+  // Confidence / Quality / Expected R
+  const conf = Number(se.confidence||0);
+  const confEl=document.getElementById('se-conf');
+  if (confEl){
+    confEl.textContent = Math.round(conf)+'%';
+    confEl.style.color = conf>=85 ? '#22c55e' : conf>=55 ? '#eab308' : '#6b7280';
+  }
+  const qEl=document.getElementById('se-quality');
+  if (qEl){ qEl.textContent = se.quality || '—'; qEl.style.color = _seQualityColor(se.quality); }
+  _modTxt('se-target', se.expected_target_r!=null ? Number(se.expected_target_r).toFixed(1)+'R' : '—');
+
+  // Selected strategy + direction
+  const actEl=document.getElementById('se-active');
+  if (actEl){
+    const nm = se.active_strategy || 'None';
+    if (se.direction && nm!=='None'){
+      const dc = se.direction==='Long' ? '#22c55e' : '#ef4444';
+      actEl.innerHTML = _modEsc(nm)+'<span class="dir" style="color:'+dc+'">'+_modEsc(se.direction)+'</span>';
+    } else {
+      actEl.textContent = nm;
+    }
+  }
+
+  // READY/ENTER reason
+  const reEl=document.getElementById('se-reason');
+  if (reEl) reEl.textContent = se.reason || '';
+
+  // Missing confirmations (chips)
+  const msEl=document.getElementById('se-missing');
+  if (msEl){
+    const miss = se.missing || [];
+    msEl.innerHTML = (se.ready && (!miss.length))
+      ? '<span class="se-chip" style="background:#0f2417;border-color:#1b3a26;color:#7fe9a3">\u2713 All confirmations met</span>'
+      : miss.map(function(m){ return '<span class="se-chip">'+_modEsc(m)+'</span>'; }).join('');
+  }
+
+  // Session bias
+  const sb = se.session_bias || {};
+  _seBias('se-bias-asia',   sb.Asia);
+  _seBias('se-bias-london', sb.London);
+  _seBias('se-bias-ny',     sb['New York']);
+
+  // Strategy completeness list (priority order, eligibility-aware)
+  const listEl=document.getElementById('se-list');
+  if (listEl){
+    const rows = se.strategies || [];
+    listEl.innerHTML = rows.map(function(s){
+      const isActive = se.active_key && s.key===se.active_key;
+      const cls = 'se-row' + (isActive?' active':'') + (s.eligible===false?' ineligible':'');
+      const pc  = Math.max(0, Math.min(100, Number(s.completeness||0)));
+      const tag = s.eligible===false ? ' <span style="color:#6b7280;font-size:10px">(off-window)</span>'
+                : s.fully_met ? ' <span style="color:#22c55e;font-size:10px">\u2713</span>' : '';
+      return '<div class="'+cls+'"><div class="nm">'+_modEsc(s.label||s.key)+tag+'</div>'
+           + '<div class="bar"><div class="fill" style="width:'+pc+'%"></div></div>'
+           + '<div class="pct">'+Math.round(pc)+'%</div></div>';
+    }).join('');
+  }
+
+  // Fidelity caveat — OHLC-derived confirmations are approximated from alerts/ticks.
+  const fidEl=document.getElementById('se-fid');
+  if (fidEl){
+    fidEl.textContent = se.market_regime==='CLOSED'
+      ? 'Market closed — engine paused.'
+      : 'Display-only. Candle confirmations approximated from alerts + price ticks; gate stays authoritative.';
+  }
+}
+
+async function refreshRec() {
+  try {
+    const d = await api('/status?ticker='+encodeURIComponent(sym));
+    lastRec = d;
+    if (d.trading_mode) paintMode(d.trading_mode);
+    const badge = document.getElementById('rec-badge');
+    const meta  = document.getElementById('rec-meta');
+    const card  = document.getElementById('rec-card');
+
+    // ── Authoritative header (the system's single call) — toggle-independent ──
+    const v = d.verdict || 'WAIT';
+
+    // Market closed (CME/COMEX hours) — show a paused banner instead of WAIT, and
+    // skip the live-setup rendering below. Live alerts resume on the next open.
+    if (d.market_open === false) {
+      badge.textContent = 'MARKET CLOSED';
+      badge.className = 'rec-badge wait';
+      card.style.borderColor = '#3a3a52';
+      const inst = d.active_ticker ? String(d.active_ticker).replace('1!','') : 'MNQ/MGC';
+      const no = d.next_open ? ' &nbsp;·&nbsp; Next open: <b style="color:#e8e8f0">'+d.next_open+'</b>' : '';
+      const lv = (d.last_valid_price!=null)
+        ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
+          + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
+        : '';
+      meta.innerHTML = '<b style="color:#ff5fb0">'+inst+'</b> &nbsp;·&nbsp; '
+        + '<b style="color:#f59e0b">🌙 Live alerts paused</b>' + no + lv;
+      const lb = document.querySelector('.dir-btn.long');
+      const sb = document.querySelector('.dir-btn.short');
+      if (lb) lb.classList.remove('rec');
+      if (sb) sb.classList.remove('rec');
+      renderGauge(d);
+      renderModules(d);
+      renderDirView();
+      markUpdated();
+      return;
+    }
+
+    badge.textContent = v;
+    badge.className = 'rec-badge ' + (
+      jsIsFullReady(v) ? (v==='LONG READY'?'ready-long':'ready-short')
+      : jsIsEarlyReady(v) ? (v==='LONG EARLY READY'?'early-long':'early-short')
+      : 'wait');
+    card.style.borderColor =
+      v==='LONG READY'?'#1b3a26':v==='SHORT READY'?'#3a1b1b'
+      : v==='LONG EARLY READY'?'#26301b':v==='SHORT EARLY READY'?'#301b1b'
+      : '#1e1e32';
+
+    const inst  = d.active_ticker ? String(d.active_ticker).replace('1!','') : '—';
+    const _pval = d.display_price!=null ? d.display_price
+                : (d.current_price!=null ? d.current_price : null);
+    const price = _pval!=null ? _pval : '—';
+    const psrc  = d.price_source==='auto'  ? ' <span style="color:#6b7280;font-size:11px">(auto)</span>'
+                : d.price_source==='stale' ? ' <span style="color:#6b7280;font-size:11px">(stale)</span>' : '';
+    const vsrc  = d.vwap_source==='chart' ? ' <span style="color:#6b7280;font-size:11px">(manual)</span>'
+                : d.vwap_source==='auto'  ? ' <span style="color:#6b7280;font-size:11px">(auto)</span>' : '';
+    const vwap  = (d.vwap_status==='ok' && d.vwap_value!=null)
+      ? fmtPrice(inst, d.vwap_value) + vsrc
+      : 'n/a ('+(d.vwap_status||'—')+')';
+    const sess = d.session_preferred
+      ? '<span style="color:#22c55e">● Preferred Session (+'+(d.session_bonus!=null?d.session_bonus:10)+')</span>'
+      : '<span style="color:#6b7280">○ Off-session</span>';
+    const vol = d.volatility || {};
+    let volTxt = '';
+    if (vol.status === 'ok') {
+      const vc = vol.blocked ? '#ef4444' : vol.caution ? '#f59e0b' : '#22c55e';
+      const vr = vol.ratio!=null ? ' <span style="color:#6b7280;font-size:11px">'+Number(vol.ratio).toFixed(2)+'×</span>' : '';
+      volTxt = ' &nbsp;·&nbsp; Vol <b style="color:'+vc+'">'+(vol.label||'—')+'</b>'+vr;
+    }
+    // Operational early-warning level (only meaningful pre-READY) + conviction tier
+    // (score band). Display-only — these never change the verdict above.
+    let lvlTxt = '';
+    if (!jsIsActionable(v) && d.alert_level) {
+      const lc = d.alert_level==='WATCH FOR ENTRY' ? '#3b82f6'
+               : d.alert_level==='ARMED' ? '#e67e22' : '#eab308';
+      lvlTxt = ' &nbsp;·&nbsp; <b style="color:'+lc+'">'+d.alert_level+'</b>';
+    }
+    let convTxt = '';
+    if (d.conviction_tier) {
+      const cc = d.conviction_tier==='HIGH CONVICTION' ? '#22c55e'
+               : d.conviction_tier==='READY' ? '#3b82f6'
+               : d.conviction_tier==='EARLY READY' ? '#a3e635' : '#eab308';
+      convTxt = ' &nbsp;·&nbsp; <span style="color:#6b7280;font-size:11px">Tier</span> <b style="color:'+cc+'">'+d.conviction_tier+'</b>';
+    }
+    meta.innerHTML = '<b style="color:#ff5fb0">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
+
+    // Trade probability gauge — fed by the authoritative /status fields.
+    renderGauge(d);
+    renderModules(d);
+
+    // Mark the recommended toggle button (the system's actionable side, incl. EARLY
+    // READY) — display-only hint, no auto-switch.
+    const readyDir = jsReadyDir(v);
+    const lb = document.querySelector('.dir-btn.long');
+    const sb = document.querySelector('.dir-btn.short');
+    if (lb) lb.classList.toggle('rec', readyDir==='Long');
+    if (sb) sb.classList.toggle('rec', readyDir==='Short');
+
+    // Loud, can't-miss alert the moment a setup flips to READY (fires once per
+    // FORMING -> READY transition, per instrument). Display/sound only — no trades.
+    maybeReadyAlert(inst, v);
+
+    // Per-direction body driven by the current toggle.
+    renderDirView();
+    markUpdated();
+  } catch(e) {}
+}
+
+// ── Live-anchored POTENTIAL preview (DISPLAY ONLY) ─────────────────────────
+// The server's potential_plan anchors Entry/Stop/T1/T2 to the setup ZONE, so the
+// numbers look frozen while price drifts. For the forming preview ONLY, re-anchor
+// those four prices to the LIVE price on a 30s heartbeat (they hold steady, then
+// jump every 30s) so they visibly track the market. The plan GEOMETRY (stop /
+// target distances, R:R, ATR, ticks, risk, zone width) is preserved verbatim from
+// the authoritative server plan — only the anchor point moves. This NEVER feeds the
+// broker path: Apply / Copy / Send stay hidden here and key off the top-level
+// trade_plan + actionable verdict, never this preview.
+let _ppAnchor = {};                 // "INST|DIR" -> { price, ts }
+const PP_REANCHOR_MS = 30000;       // re-anchor the preview to the live price every 30s
+function _liveAnchoredPotential(pp, dir, inst) {
+  const live = (lastRec && lastRec.display_price != null) ? lastRec.display_price
+             : (lastRec && lastRec.current_price != null) ? lastRec.current_price : null;
+  if (pp == null || live == null || isNaN(Number(live))) {
+    return { anchored: false, plan: pp, anchorTxt: '', secsLeft: null };
+  }
+  const key = inst + '|' + dir;
+  const now = Date.now();
+  let a = _ppAnchor[key];
+  if (!a || (now - a.ts) >= PP_REANCHOR_MS) { a = { price: Number(live), ts: now }; _ppAnchor[key] = a; }
+  const anchor = a.price;
+  const fmt  = (x) => fmtPrice(inst, x);   // per-instrument tick/decimals — single source of truth
+  // Geometry from the authoritative server plan: offsets relative to the entry mid.
+  const parts = String(pp.entry_zone == null ? '' : pp.entry_zone).split(/\s*[–—-]\s*/);
+  let lo = parseFloat(parts[0]); let hi = parts.length > 1 ? parseFloat(parts[1]) : lo;
+  if (isNaN(lo)) lo = anchor; if (isNaN(hi)) hi = lo;
+  const entryMid = (lo + hi) / 2;
+  const width = Math.abs(hi - lo);
+  const reanch = (t) => {
+    const n = (t == null) ? NaN : Number(t);
+    if (isNaN(n)) return t;                 // preserve unparseable values untouched
+    return fmt(anchor + (n - entryMid));    // same signed offset, new anchor
+  };
+  const plan = Object.assign({}, pp);
+  plan.entry_zone = width > 0 ? (fmt(anchor - width / 2) + '–' + fmt(anchor + width / 2)) : fmt(anchor);
+  plan.stop_loss  = reanch(pp.stop_loss);
+  plan.target1    = reanch(pp.target1);
+  plan.target2    = reanch(pp.target2);
+  const secsLeft  = Math.max(0, Math.ceil((PP_REANCHOR_MS - (now - a.ts)) / 1000));
+  return { anchored: true, plan: plan, anchorTxt: fmt(anchor), secsLeft: secsLeft };
+}
+
+// Render the checklist + edge score + plan/reason for the CURRENTLY SELECTED
+// direction (the Long/Short toggle). Reads lastRec.directions[dir]; falls back to
+// the authoritative favored block if directions is missing (older server).
+function renderDirView() {
+  if (!lastRec) return;
+  const d = lastRec;
+  const bar    = document.getElementById('rec-score-bar');
+  const num    = document.getElementById('rec-score-num');
+  const list   = document.getElementById('rec-checklist');
+  const planEl = document.getElementById('rec-plan');
+  const reason = document.getElementById('rec-reason');
+  const apply  = document.getElementById('btn-apply');
+  const copyBtn = document.getElementById('btn-copy');
+  const sendRow = document.getElementById('send-row');
+  if (!bar) return;
+
+  // Market closed — paused, neutral body (no checklist / score / plan / apply).
+  if (d.market_open === false) {
+    const no = d.next_open ? '<br>Next open: <b style="color:#e8e8f0">'+d.next_open+'</b>' : '';
+    const lv = (d.last_valid_price!=null)
+      ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
+        + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
+      : '';
+    if (list) list.innerHTML = '<div style="color:#6b7280;font-size:13px;line-height:1.6">'
+      + '🌙 <b style="color:#f59e0b">MARKET CLOSED</b> — MNQ/MGC live alerts paused.'
+      + no + lv + '</div>';
+    bar.style.width = '0%';
+    if (num) num.textContent = 'Paused';
+    if (planEl) planEl.style.display = 'none';
+    if (apply)  apply.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = 'none';
+    if (sendRow) sendRow.style.display = 'none';
+    if (reason) reason.textContent = d.strict_reason || 'Market closed — live alerts paused.';
+    return;
+  }
+
+  const isShort = dir === 'Short';
+  const blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
+
+  // Checklist for the selected side. The Edge threshold is mode-dependent (SCALP 55
+  // / SWING 80), so read it from gate_debug rather than hard-coding "80".
+  const ck = (blk && blk.checklist) ? blk.checklist : (d.confluences || {});
+  const _thr = (blk && blk.gate_debug && blk.gate_debug.ready_threshold!=null)
+             ? blk.gate_debug.ready_threshold : 80;
+  list.innerHTML =
+    ckItem((isShort?'Supply':'Demand')+' zone mitigated + reaction', !!ck.zone) +
+    ckItem('Structure '+(isShort?'(CHOCH/BOS/LH-LL)':'(CHOCH/BOS/HH-HL)'), !!ck.structure) +
+    ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap) +
+    ckItem('Edge Score \u2265 '+_thr, !!ck.edge);
+
+  // Raw gate debug — exact per-condition booleans driving the verdict.
+  const gd = (blk && blk.gate_debug) ? blk.gate_debug : null;
+  if (gd) {
+    const yn = v => v ? '\u2713' : '\u2717';
+    const fails = (gd.failed_conditions && gd.failed_conditions.length)
+                ? gd.failed_conditions.join(', ') : 'none';
+    list.innerHTML +=
+      '<div style="margin-top:8px;padding-top:6px;border-top:1px solid #1e1e32;' +
+      'font-size:11px;line-height:1.5;color:#6b7280;font-family:ui-monospace,monospace">' +
+      'debug · zone_valid '+yn(gd.zone_valid)+' · vwap_confirmed '+yn(gd.vwap_confirmed)+
+      ' · structure_confirmed '+yn(gd.structure_confirmed)+' · candle_confirmed '+yn(gd.candle_confirmed)+
+      '<br>edge_score '+(gd.edge_score!=null?gd.edge_score:0)+'/'+EDGE_MAX+' · failed_conditions: '+fails+'</div>';
+  }
+
+  // Per-direction Edge Score.
+  const score = blk && blk.edge_score!=null ? blk.edge_score
+              : (d.edge_score!=null ? d.edge_score : 0);
+  const grade = blk && blk.edge_grade ? ' · ' + blk.edge_grade
+              : (d.edge_grade ? ' · ' + d.edge_grade : '');
+  const label = blk ? (blk.label || 'WAIT') : (d.strict_label || 'WAIT');
+  const met   = blk && blk.met!=null ? ' · ' + blk.met + '/4' : '';
+  bar.style.width = Math.max(0, Math.min(100, score / EDGE_MAX * 100)) + '%';
+  bar.style.background = score>=85 ? '#2bf5a0' : score>=75 ? '#ff5fb0' : '#ffb14e';
+  num.textContent = dir + ' Edge ' + score + '/' + EDGE_MAX + grade + ' · ' + label + met;
+
+  // Edge component breakdown — appended right under the gate-light checklist so a
+  // green checklist that still isn't READY is self-explanatory: it shows exactly
+  // which SCORED confluences are contributing and which are missing, plus the gap
+  // to the (mode-dependent) READY threshold. Note zone & VWAP-location pass the
+  // gate but score 0 here — that's why "all gates green" can still sit below the
+  // threshold. Display-only; reads the same edge_breakdown the gate scored.
+  const eb = (blk && blk.edge_breakdown) ? blk.edge_breakdown
+           : (d.edge_breakdown || null);
+  if (eb && eb.components && eb.components.length){
+    const thr = (gd && gd.ready_threshold!=null) ? gd.ready_threshold : _thr;
+    const rows = eb.components.map(function(c){
+      const ok = !!c.present;
+      return '<div style="display:flex;justify-content:space-between;font-size:11px;line-height:1.7;'
+           + (ok?'color:#9fe7c0':'color:#6b7280')+'">'
+           + '<span>'+(ok?'\u2713':'\u2717')+' '+c.label+'</span>'
+           + '<span>'+(ok?('+'+c.points):('+'+c.points+' missing'))+'</span></div>';
+    }).join('');
+    const gap = Math.max(0, thr - score);
+    const missing = eb.components.filter(function(c){return !c.present;})
+                      .sort(function(a,b){return b.points-a.points;});
+    const hint = gap>0
+      ? ('\u26A0\uFE0F Short by '+gap+' \u2014 add '+(missing.length
+          ? missing.slice(0,2).map(function(m){return m.label;}).join(' or ')
+          : 'more confluence'))
+      : '\u2713 Threshold met';
+    list.innerHTML +=
+      '<details class="edge-bd"'+(gap>0?' open':'')+' style="margin-top:8px">'
+      + '<summary style="font-size:11px;color:#8a93a6;cursor:pointer;list-style:none">'
+      + '🧮 Edge components \u00B7 '+score+'/'+EDGE_MAX+' \u00B7 need '+thr+'</summary>'
+      + '<div style="margin-top:6px;padding:8px;border:1px solid #1e1e32;border-radius:4px;background:#0d0820">'
+      + rows
+      + '<div style="margin-top:6px;padding-top:6px;border-top:1px solid #1e1e32;font-size:11px;color:'
+      + (gap>0?'#ffb14e':'#9fe7c0')+'">'+hint+'</div>'
+      + '</div></details>';
+  }
+
+  // Trade plan + Apply only when the SELECTED side is the system's actionable side
+  // (full READY or EARLY READY).
+  const readyDir = jsReadyDir(d.verdict);
+  const tp = d.trade_plan || {};
+  const pp = (blk && blk.potential_plan) ? blk.potential_plan : null;
+  const planRow = (p) =>
+      'Entry <b>'+p.entry_zone+'</b> &nbsp;·&nbsp; Stop Loss <b>'+p.stop_loss+'</b><br>' +
+      'Take Profit <b>'+p.target1+'</b> &nbsp;·&nbsp; RR: <b>'+(p.rr!=null?p.rr:'1:1')+'</b>' +
+      (p.risk_points!=null ? '<br>Risk Distance <b>'+p.risk_points+'</b> pts' : '') +
+      (p.risk_dollars_per_contract!=null
+        ? ' &nbsp;·&nbsp; Dollar Risk <b>$'+p.risk_dollars_per_contract+'</b>/ct &nbsp;·&nbsp; Expected Profit <b>$'+p.risk_dollars_per_contract+'</b>/ct'
+        : '') +
+      (p.atr_pts!=null
+        ? '<br>ATR <b>'+p.atr_pts+'</b> × <b>'+p.atr_multiplier+'</b> &nbsp;·&nbsp; Calc Stop <b>'+(p.calculated_stop!=null?p.calculated_stop:p.stop_loss)+'</b> &nbsp;·&nbsp; Stop <b>'+p.stop_distance_ticks+'</b> ticks'
+        : '') +
+      (p.stop_valid===false
+        ? '<br><span style="color:#ef4444">⚠ Stop invalid: '+(p.stop_invalid_reason||'see verdict')+'</span>'
+        : (p.stop_valid===true ? ' &nbsp;·&nbsp; <span style="color:#22c55e">Stop ✓ valid</span>' : ''));
+  if (readyDir === dir && tp.trade_plan) {
+    // READY / EARLY READY for the selected side — live plan + broker actions.
+    planEl.style.display = 'block';
+    planEl.innerHTML = planRow(tp);
+    apply.style.display = 'block';
+    if (copyBtn) copyBtn.style.display = 'block';
+    // Send controls only when the snapshot is for the selected instrument — hides the
+    // button during the brief stale window right after a symbol toggle.
+    if (sendRow) {
+      const recInst = String(d.active_ticker || '').replace('1!','');
+      sendRow.style.display = (d.execution_enabled && recInst === sym) ? 'block' : 'none';
+    }
+  } else if (pp && pp.trade_plan) {
+    // POTENTIAL setup forming for the selected side — DISPLAY ONLY. The broker
+    // actions (Apply / Copy / Send) stay hidden: they are gated on the actionable
+    // verdict + the top-level trade_plan, never on this preview.
+    const miss = (blk && blk.missing && blk.missing.length) ? blk.missing.join(', ') : 'confirmation';
+    // Re-anchor the four preview prices to the LIVE price every 30s so they visibly
+    // track the market (the server plan is zone-anchored, so it otherwise looks
+    // frozen). Geometry is preserved; the broker path never reads this preview.
+    const ppInst = (d.active_ticker||'').toString().replace('1!','') || sym;
+    const la = _liveAnchoredPotential(pp, dir, ppInst);
+    const shown = la.anchored ? la.plan : pp;
+    const anchNote = la.anchored
+      ? '<div style="color:#22c55e;font-size:11px;margin-top:5px">⟳ Preview anchored to live price <b>'+la.anchorTxt+'</b> · updates every 30s'+(la.secsLeft!=null?' (next in '+la.secsLeft+'s)':'')+' · actual setup zone unchanged</div>'
+      : '';
+    planEl.style.display = 'block';
+    planEl.innerHTML =
+      '<div style="color:#f59e0b;font-weight:600;margin-bottom:4px">⏳ POTENTIAL '+dir.toUpperCase()+' — not yet READY</div>' +
+      planRow(shown) +
+      anchNote +
+      '<div style="color:#6b7280;font-size:11px;margin-top:5px">Preview only · waiting on: '+miss+' · no broker order until READY</div>';
+    apply.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = 'none';
+    if (sendRow) sendRow.style.display = 'none';
+  } else {
+    planEl.style.display = 'none';
+    apply.style.display = 'none';
+    if (copyBtn) copyBtn.style.display = 'none';
+    if (sendRow) sendRow.style.display = 'none';
+  }
+
+  // Reason for the selected side; nudge to the ready side when viewing the other.
+  let txt = (blk && blk.reason) ? blk.reason : (d.strict_reason || '');
+  if (readyDir && readyDir !== dir) {
+    txt = '↪ System says ' + d.verdict + ' — switch to ' + readyDir + ' for the live setup.  ' + txt;
+  }
+  reason.textContent = txt;
+}
+
+function applyRec() {
+  if (!lastRec) return;
+  const tp = lastRec.trade_plan || {};
+  const dirReady = jsReadyDir(lastRec.verdict);
+  if (!dirReady || !tp.trade_plan) { toast('No ready setup to apply', false); return; }
+  const inst = (lastRec.active_ticker||'').toString().replace('1!','');
+  if (INSTRUMENTS.indexOf(inst) !== -1) setSymbol(inst);
+  setDir(dirReady);
+  if (tp.entry_zone) {
+    const parts = String(tp.entry_zone).split('–');
+    if (parts.length===2) {
+      const mid = (parseFloat(parts[0]) + parseFloat(parts[1])) / 2;
+      if (!isNaN(mid)) document.getElementById('f-entry').value = fmtPrice(inst, mid);
+    }
+  }
+  if (tp.stop_loss!=null) document.getElementById('f-stop').value = tp.stop_loss;
+  if (tp.target1!=null)   document.getElementById('f-t1').value   = tp.target1;
+  if (tp.target2!=null)   document.getElementById('f-t2').value   = tp.target2;
+  document.querySelector('details').open = true;
+  toast('⬇️ Setup applied — review & ENTER');
+}
+
+// ── One-tap order copy + loud READY alert (prop-firm safe: NO broker calls) ──
+let _audioCtx = null;
+let soundOn = (localStorage.getItem('readySound') !== 'off');
+let _readyState = {};   // instrument -> was actionable on the previous poll
+let _lastTradeOpenedAt = null;   // opened_at of the last seen ACTIVE_TRADE (bell de-dupe)
+let _tradeBellInit = false;      // first /trade poll sets the baseline WITHOUT ringing
+
+function _ensureAudio() {
+  try {
+    if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  } catch(e) {}
+  return _audioCtx;
+}
+// One-time autoplay unlock: first user gesture primes the AudioContext so the
+// first READY bell is never swallowed by the browser's autoplay policy.
+try {
+  window.addEventListener('pointerdown', _ensureAudio, { once: true });
+  window.addEventListener('keydown', _ensureAudio, { once: true });
+} catch(e) {}
+
+// ── Stock-exchange opening bell: a real recording that rings ONCE when a NEW
+//    trade is taken (wired in refresh()). Inlined as a data URI so it needs no
+//    extra route / proxy whitelist / auth. Played through the SAME AudioContext
+//    the READY chime uses, so the existing autoplay-unlock primes it too; a cached
+//    HTMLAudio element is the fallback for the brief window before decode resolves.
+const BELL_DATA_URI = "__BELL_DATA_URI__";
+let _bellBuf = null, _bellEl = null;
+function _initBell() {
+  if (!BELL_DATA_URI) return;
+  if (!_bellEl) { try { _bellEl = new Audio(BELL_DATA_URI); _bellEl.preload = 'auto'; _bellEl.volume = 1.0; } catch(e) {} }
+  const ctx = _ensureAudio();
+  if (ctx && !_bellBuf) {
+    try {
+      const b64 = BELL_DATA_URI.split(',')[1] || '';
+      const bin = atob(b64), n = bin.length, bytes = new Uint8Array(n);
+      for (let i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+      ctx.decodeAudioData(bytes.buffer, function(b){ _bellBuf = b; }, function(){});
+    } catch(e) {}
+  }
+}
+try {
+  window.addEventListener('pointerdown', _initBell, { once: true });
+  window.addEventListener('keydown', _initBell, { once: true });
+} catch(e) {}
+function playExchangeBell() {
+  if (!soundOn || !BELL_DATA_URI) return;
+  _initBell();   // idempotent: ensure the HTMLAudio fallback exists + decode is kicked off
+  const ctx = _ensureAudio();
+  if (ctx && _bellBuf) {
+    try {
+      const s = ctx.createBufferSource(); s.buffer = _bellBuf;
+      const g = ctx.createGain(); g.gain.value = 1.0;
+      s.connect(g); g.connect(ctx.destination); s.start();
+      return;
+    } catch(e) {}
+  }
+  try { if (_bellEl) { _bellEl.currentTime = 0; _bellEl.play().catch(function(){}); } } catch(e) {}
+}
+function playReadyChime() {
+  if (!soundOn) return;
+  const ctx = _ensureAudio();
+  if (!ctx) return;
+  try {
+  const t0  = ctx.currentTime;
+  const dur = 2.8;
+
+  // Master output: loud strike, long sustain, short decay tail.
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0.0001, t0);
+  master.gain.exponentialRampToValueAtTime(0.85, t0 + 0.015);
+  master.gain.setValueAtTime(0.85, t0 + dur - 0.45);
+  master.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  master.connect(ctx.destination);
+
+  // Clapper: a square LFO hammers the bell ~22x/sec for the buzzy ring.
+  // gate.gain base 0.5 + LFO(+/-0.5) -> oscillates 0..1 (on/off).
+  const gate = ctx.createGain();
+  gate.gain.setValueAtTime(0.5, t0);
+  gate.connect(master);
+  const lfo = ctx.createOscillator(), lfoAmt = ctx.createGain();
+  lfo.type = 'square'; lfo.frequency.value = 22;
+  lfoAmt.gain.value = 0.5;
+  lfo.connect(lfoAmt); lfoAmt.connect(gate.gain);
+  lfo.start(t0); lfo.stop(t0 + dur);
+
+  // Bright metallic timbre: detuned inharmonic partials through a bandpass.
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass'; bp.frequency.value = 2000; bp.Q.value = 0.7;
+  bp.connect(gate);
+  [[640,0.50,'sawtooth'],[965,0.34,'sawtooth'],[1290,0.22,'square'],[2570,0.14,'square']]
+    .forEach(function(p){
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = p[2]; o.frequency.value = p[0];
+      o.detune.value = (Math.random()*16 - 8);
+      g.gain.value = p[1];
+      o.connect(g); g.connect(bp);
+      o.start(t0); o.stop(t0 + dur + 0.05);
+    });
+  } catch(e) {}
+}
+function paintSndToggle() {
+  const el = document.getElementById('snd-toggle');
+  if (el) el.textContent = soundOn ? '🔔 Setup bell: on' : '🔕 Setup bell: off';
+}
+function toggleSound() {
+  soundOn = !soundOn;
+  localStorage.setItem('readySound', soundOn ? 'on' : 'off');
+  paintSndToggle();
+  if (soundOn) { _ensureAudio(); playReadyChime(); toast('🔔 Setup bell on'); }
+  else toast('🔕 Setup bell off');
+}
+// ── Theme toggle: switch between vaporwave (default) and Retro Terminal Mode ──
+function paintThemeToggle() {
+  const el = document.getElementById('theme-toggle');
+  if (!el) return;
+  const on = (document.documentElement.dataset.theme === 'retro');
+  el.textContent = on ? '🖥️ Retro Mode: on' : '🖥️ Retro Mode: off';
+}
+function toggleTheme() {
+  const on = (document.documentElement.dataset.theme === 'retro');
+  if (on) { delete document.documentElement.dataset.theme; localStorage.setItem('dashboardTheme', 'vapor'); }
+  else { document.documentElement.dataset.theme = 'retro'; localStorage.setItem('dashboardTheme', 'retro'); }
+  paintThemeToggle();
+  toast(on ? '🌆 Vaporwave mode' : '🖥️ Retro terminal mode');
+}
+function notifyReady(title, body) {
+  try {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') { new Notification(title, { body: body }); }
+    else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then(function(p){ if (p === 'granted') new Notification(title, { body: body }); });
+    }
+  } catch(e) {}
+}
+function readyBanner(msg) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.style.background = '#16261b';
+  t.style.borderLeft = '4px solid #22c55e';
+  t.classList.add('show');
+  if (t._rt) clearTimeout(t._rt);
+  t._rt = setTimeout(function(){ t.classList.remove('show'); }, 9000);
+}
+function maybeReadyAlert(inst, v) {
+  const actionable = jsIsActionable(v);
+  const prev = _readyState[inst];
+  _readyState[inst] = actionable;
+  if (actionable && !prev) {
+    const rd = jsReadyDir(v) || '';
+    const tp = (lastRec && lastRec.trade_plan) || {};
+    const entry = tp.entry_zone ? (' · Entry ' + tp.entry_zone) : '';
+    readyBanner('🔔 ' + inst + ' ' + (rd ? rd.toUpperCase() + ' ' : '') + v + entry + ' — tap “Copy Order”');
+    playReadyChime();
+    notifyReady(inst + ' ' + v, 'Entry ' + (tp.entry_zone || '—') + '  ·  Stop ' + (tp.stop_loss != null ? tp.stop_loss : '—'));
+  }
+}
+
+function _planMidEntry(tp, inst) {
+  if (!tp || tp.entry_zone == null) return null;
+  const parts = String(tp.entry_zone).split('–');
+  if (parts.length === 2) {
+    const mid = (parseFloat(parts[0]) + parseFloat(parts[1])) / 2;
+    if (!isNaN(mid)) return fmtPrice(inst, mid);
+  }
+  const n = parseFloat(tp.entry_zone);
+  return isNaN(n) ? String(tp.entry_zone) : fmtPrice(inst, n);
+}
+function buildOrderText() {
+  if (!lastRec) return null;
+  const tp = lastRec.trade_plan || {};
+  const rd = jsReadyDir(lastRec.verdict);
+  if (!rd || !tp.trade_plan) return null;
+  const inst = (lastRec.active_ticker || '').toString().replace('1!','') || sym;
+  const entry = _planMidEntry(tp, inst);
+  const zone = (tp.entry_zone && String(tp.entry_zone).indexOf('–') >= 0) ? (' (zone ' + tp.entry_zone + ')') : '';
+  const lines = [
+    inst + ' ' + rd.toUpperCase(),
+    'Entry ' + (entry != null ? entry : (tp.entry_zone || '—')) + zone,
+    'Stop  ' + (tp.stop_loss != null ? tp.stop_loss : '—'),
+    'TP    ' + (tp.target1 != null ? tp.target1 : '—')
+  ];
+  if (tp.risk_points != null) lines.push('Risk  ' + tp.risk_points + ' pts');
+  lines.push('R:R   ' + (tp.rr != null ? tp.rr : '1:1'));
+  return lines.join('\\n');
+}
+async function copyOrder() {
+  const txt = buildOrderText();
+  if (!txt) { toast('No ready setup to copy', false); return; }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(txt);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+    }
+    toast('📋 Order copied — paste into your order ticket');
+  } catch(e) { toast('Copy failed — long-press to copy', false); }
+}
+
+// One-tap order via the configured execution gateway. Only visible when a setup is
+// READY for the selected side AND execution is enabled server-side. Sends just the
+// instrument + contract count; the server resolves the live plan, enforces the ready
+// guard, and routes per EXECUTION_MODE (manual plan / paper sim / live broker order).
+async function sendOrder() {
+  if (!lastRec) { toast('No ready setup', false); return; }
+  const tp = lastRec.trade_plan || {};
+  const rd = jsReadyDir(lastRec.verdict);
+  if (!rd || !tp.trade_plan) { toast('No ready setup to send', false); return; }
+  if (!lastRec.execution_enabled) { toast('Execution not configured', false); return; }
+  // The loaded snapshot MUST be for the currently-selected instrument — never act on
+  // a stale snapshot from just before a symbol toggle (mirrors enterTrade()).
+  const recInst = String(lastRec.active_ticker || '').replace('1!','');
+  if (recInst !== sym) { toast('Snapshot still updating — try again', false); return; }
+  const mode  = lastRec.execution_mode || 'manual_only';
+  const live  = !!lastRec.execution_live;
+  const label = lastRec.execution_provider_label || 'broker';
+  const inst = recInst || sym;
+  let qty = parseInt(document.getElementById('snd-qty').value, 10);
+  if (!qty || qty < 1) qty = 1;
+  const entry = _planMidEntry(tp, inst);
+  const head = live
+    ? 'Send LIVE market order to ' + label + '?'
+    : (mode === 'paper' ? 'Submit a SIMULATED (paper) order — no real broker?'
+                        : 'Manual mode — show the exact order to place yourself?');
+  const msg = head + '\\n\\n'
+    + inst + ' ' + rd.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
+    + '\\nEntry ~' + (entry!=null?entry:'market')
+    + '   Stop ' + (tp.stop_loss!=null?tp.stop_loss:'—')
+    + '   TP ' + (tp.target1!=null?tp.target1:'—') + ' (' + (tp.rr||'1:1') + ')';
+  if (!confirm(msg)) return;
+  const btn = document.getElementById('btn-send');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
+  try {
+    const d = await api('/traderspost', { ticker: inst+'1!', contracts: qty });
+    if (d.status === 'sent')                 toast('🚀 Order sent to ' + (d.provider || label));
+    else if (d.status === 'simulated')       toast('🧪 Paper order simulated (no broker)');
+    else if (d.status === 'manual_required') toast('📋 ' + (d.message || 'Place this order manually'));
+    else toast('Error: ' + (d.reason || d.status), false);
+  } catch(e) { toast('Request failed' + (live ? ' — check your broker' : ''), false); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send order to broker'; } }
+}
+
+let lastUpdateTs = 0;
+function markUpdated() {
+  lastUpdateTs = Date.now();
+  const el = document.getElementById('last-updated');
+  if (!el) return;
+  const t = new Date();
+  const p = n => String(n).padStart(2,'0');
+  el.textContent = 'Last updated ' + p(t.getHours()) + ':' + p(t.getMinutes()) + ':' + p(t.getSeconds());
+  el.classList.remove('stale');
+}
+function checkStale() {
+  const el = document.getElementById('last-updated');
+  if (!el || !lastUpdateTs) return;
+  const secs = Math.floor((Date.now() - lastUpdateTs) / 1000);
+  if (secs > 12) {
+    el.classList.add('stale');
+    el.textContent = '⚠ Not responding — last update ' + secs + 's ago';
+  }
+}
+
+async function refresh() {
+  try {
+    const d = await api('/trade');
+    // ── Stock-exchange bell on a NEWLY taken trade (unique opened_at). The first
+    //    poll sets the baseline silently so a trade already live when the dashboard
+    //    loads does NOT ring; only a fresh entry afterwards rings. ──
+    try {
+      const _curOpen = (d && d.status !== 'no_active_trade') ? (d.opened_at || null) : null;
+      if (!_tradeBellInit) { _tradeBellInit = true; _lastTradeOpenedAt = _curOpen; }
+      else if (_curOpen && _curOpen !== _lastTradeOpenedAt) { _lastTradeOpenedAt = _curOpen; playExchangeBell(); toast('🔔 Trade taken — ' + (d.direction || '') + ' ' + (d.symbol || '')); }
+      else { _lastTradeOpenedAt = _curOpen; }
+    } catch(e) {}
+    const card = document.getElementById('status-card');
+    const info = document.getElementById('trade-info');
+    const detail = document.getElementById('trade-detail');
+    const pnl = document.getElementById('pnl');
+    const btnClose = document.getElementById('btn-close');
+    const btnBe = document.getElementById('btn-be');
+
+    if (d.status === 'no_active_trade') {
+      activeTrade = null;
+      card.style.borderColor = '#3a2363';
+      info.textContent = 'No Active Trade';
+      info.style.color = '#9d86c4';
+      detail.textContent = '';
+      pnl.textContent = '';
+      btnClose.style.display = 'none';
+      btnBe.style.display = 'none';
+    } else {
+      activeTrade = d;
+      const isLong = d.direction === 'Long';
+      card.style.borderColor = isLong ? '#22c55e' : '#ef4444';
+      info.style.color = isLong ? '#22c55e' : '#ef4444';
+      info.textContent = (isLong?'📈':'📉') + ' ' + d.direction + ' — ' + (d.profile||'').split(' ')[0];
+      detail.innerHTML =
+        'Entry <b>'+d.entry_price+'</b> &nbsp;·&nbsp; Stop Loss <b>'+d.stop_loss+'</b><br>' +
+        'Take Profit <b>'+d.target1+'</b> &nbsp;·&nbsp; '+d.contracts+'x';
+      if (d.pnl_dollars !== undefined) {
+        const v = d.pnl_dollars;
+        const s = v >= 0 ? '+$'+Math.abs(v).toFixed(0) : '-$'+Math.abs(v).toFixed(0);
+        pnl.textContent = s;
+        pnl.className = 'pnl ' + (v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : 'pnl-flat');
+      }
+      btnClose.style.display = 'block';
+      btnBe.style.display = d.t1_hit ? 'block' : 'none';
+    }
+    markUpdated();
+  } catch(e) {}
+}
+
+// ══════════════════════ BACKTEST TAB (read-only; own poll, not /status) ══════════════════════
+let btResult = null, btRunId = null, btPollTimer = null, btSelDataset = null;
+const BT_STRAT_LABELS = {
+  OPENING_DRIVE:'Opening Drive', LIQUIDITY_SWEEP_REVERSAL:'Liquidity Sweep Reversal',
+  VWAP_TREND_CONTINUATION:'VWAP Trend Continuation', RANGE_EXPANSION_BREAKOUT:'Range Expansion Breakout',
+  EXHAUSTION_FADE:'Exhaustion Fade'
+};
+function btEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function btNum(v,d){ d=(d==null?2:d); return (v===null||v===undefined||v==='')?'—':(typeof v==='number'?v.toFixed(d):v); }
+function btP(v){ return (v===null||v===undefined)?'n/a':v+'%'; }
+function btFmtTs(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleString('en-US',{timeZone:'America/New_York',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}); }catch(e){ return iso; } }
+function btFmtDate(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString('en-US',{timeZone:'America/New_York',year:'numeric',month:'short',day:'2-digit'}); }catch(e){ return iso; } }
+
+function setView(v){
+  const isBt = (v==='backtest');
+  const isTz = (v==='tradezella');
+  const isLive = (!isBt && !isTz);
+  document.getElementById('view-live').style.display = isLive ? '' : 'none';
+  document.getElementById('view-backtest').style.display = isBt ? '' : 'none';
+  document.getElementById('view-tradezella').style.display = isTz ? '' : 'none';
+  document.getElementById('vb-live').classList.toggle('active', isLive);
+  document.getElementById('vb-bt').classList.toggle('active', isBt);
+  document.getElementById('vb-tz').classList.toggle('active', isTz);
+  if(isBt && btSelDataset===null) btLoadDatasets();
+  if(isTz) tzLoadAnalysis();
+}
+
+// ── TradeZella review (owner-only; on-demand, NEVER in the 3s /status poll) ──
+function tzFrac(v){ return (v===null||v===undefined)?'—':Math.round(v*100)+'%'; }
+function tzMoney(v){ return (v===null||v===undefined)?'—':((v<0?'-$':'$')+Math.abs(v).toFixed(2)); }
+function tzSet(id,val){ const el=document.getElementById(id); if(el) el.textContent=val; }
+function tzLabelWr(o){ if(!o||!o.label) return '—'; return o.label+' ('+tzFrac(o.win_rate)+', '+o.count+' trades)'; }
+function tzFlagLine(id,obj,flagKey){
+  const el=document.getElementById(id); if(!el) return;
+  if(!obj || !obj.available){ el.textContent='Needs more data.'; el.style.color='#6b7280'; return; }
+  const bad=!!obj[flagKey];
+  el.textContent=(bad?'⚠ ':'✓ ')+(obj.detail||'');
+  el.style.color=bad?'#f59e0b':'#22c55e';
+}
+function tzRenderFailure(obj){
+  const el=document.getElementById('tz-failure'); if(!el) return;
+  if(!obj || !obj.available){ el.textContent='Needs more data.'; el.style.color='#6b7280'; return; }
+  const parts=[];
+  if(obj.top_losing_setup && obj.top_losing_setup.setup) parts.push('Most losses from “'+obj.top_losing_setup.setup+'” ('+obj.top_losing_setup.count+')');
+  if(obj.top_mistake_keyword && obj.top_mistake_keyword.keyword) parts.push('Top tag “'+obj.top_mistake_keyword.keyword+'” ('+obj.top_mistake_keyword.count+')');
+  el.textContent = parts.length ? parts.join(' · ') : 'No clear pattern yet.';
+  el.style.color='#e5e7eb';
+}
+function tzRenderEmpty(msg){
+  const e=document.getElementById('tz-empty'); const r=document.getElementById('tz-review');
+  if(r) r.style.display='none';
+  if(e){ e.style.display=''; const m=document.getElementById('tz-empty-msg'); if(m) m.textContent=msg; }
+}
+function tzRenderReview(prefix, rv){
+  const vEl=document.getElementById('tz-'+prefix+'-verdict');
+  const hEl=document.getElementById('tz-'+prefix+'-headline');
+  const sEl=document.getElementById('tz-'+prefix+'-signals');
+  if(sEl) sEl.innerHTML='';
+  if(!rv){ if(vEl){ vEl.textContent='—'; } if(hEl){ hEl.textContent='Needs more data.'; } return; }
+  const col = rv.available ? (rv.flag ? '#f59e0b' : '#22c55e') : '#6b7280';
+  if(vEl){ vEl.textContent=rv.verdict||'—'; vEl.style.color=col; vEl.style.borderColor=col; }
+  if(hEl){ hEl.textContent=rv.headline||''; }
+  const sigs=rv.signals||[];
+  if(sEl){
+    for(let i=0;i<sigs.length;i++){
+      const li=document.createElement('li');
+      li.textContent=(rv.flag?'⚠ ':'• ')+sigs[i];
+      sEl.appendChild(li);
+    }
+  }
+}
+function tzRenderReviews(reviews){
+  const rv=reviews||{};
+  tzRenderReview('entry', rv.entry_review);
+  tzRenderReview('exit', rv.exit_review);
+}
+function tzRenderAnalysis(d){
+  const a=d.analysis||{}; const sum=d.import_summary||{};
+  if(!a.trade_count){ tzRenderEmpty('No imported trades yet. Upload a CSV above to see your review.'); return; }
+  document.getElementById('tz-empty').style.display='none';
+  document.getElementById('tz-review').style.display='';
+  let meta=(sum.imported_total||a.trade_count)+' trades imported';
+  if(sum.last_import_at) meta+=' · last import '+btFmtDate(sum.last_import_at);
+  tzSet('tz-meta', meta);
+  tzSet('tz-trade-count', a.trade_count);
+  tzSet('tz-winrate', tzFrac(a.win_rate));
+  tzSet('tz-pf', a.profit_factor_infinite ? '∞' : btNum(a.profit_factor,2));
+  tzSet('tz-expectancy', tzMoney(a.expectancy));
+  tzSet('tz-avgr', (a.avg_r==null?'—':btNum(a.avg_r,2)+'R'));
+  tzSet('tz-netpnl', tzMoney(a.net_pnl));
+  tzSet('tz-avgwin', tzMoney(a.avg_winner));
+  tzSet('tz-avgloss', tzMoney(a.avg_loser));
+  tzSet('tz-best-session', tzLabelWr(a.best_session));
+  tzSet('tz-worst-session', tzLabelWr(a.worst_session));
+  tzSet('tz-best-symbol', tzLabelWr(a.best_symbol));
+  tzSet('tz-worst-symbol', tzLabelWr(a.worst_symbol));
+  tzSet('tz-best-setup', tzLabelWr(a.best_setup));
+  tzSet('tz-worst-setup', tzLabelWr(a.worst_setup));
+  tzRenderFailure(a.common_failure_pattern);
+  tzFlagLine('tz-entries', a.entries_late, 'entries_late');
+  tzFlagLine('tz-stops', a.stops_assessment, 'stops_too_wide');
+  tzFlagLine('tz-targets', a.targets_assessment, 'targets_too_tight');
+  tzFlagLine('tz-smallwin', a.winners_too_small, 'flag');
+  tzRenderReviews(a.reviews);
+  tzSet('tz-reco', a.recommendation || '—');
+}
+async function tzLoadAnalysis(){
+  try{
+    const d = await api('/tradezella/analysis');
+    if(!d || !d.ok){ tzRenderEmpty((d && d.error) || 'Review unavailable.'); return; }
+    tzRenderAnalysis(d);
+  }catch(e){ tzRenderEmpty('Could not load review.'); }
+}
+async function tzDoUpload(){
+  const f=document.getElementById('tz-file').files[0];
+  const msg=document.getElementById('tz-up-msg');
+  if(!f){ msg.className='bt-msg err'; msg.textContent='Choose a CSV file first.'; return false; }
+  msg.className='bt-msg'; msg.textContent='Reading file…';
+  const text=await f.text();
+  const q=new URLSearchParams({ tz: document.getElementById('tz-tz').value, filename: f.name || '' });
+  const r=await fetch(BASE+'/tradezella/upload?'+q.toString(),
+    {method:'POST', headers:{'Content-Type':'text/csv'}, body:text, cache:'no-store'});
+  const d=await r.json();
+  if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Upload failed'); return false; }
+  let s='Imported '+d.imported+' of '+d.parsed_rows+' trade(s)';
+  if(d.skipped_dupes) s+=' · '+d.skipped_dupes+' duplicate(s) skipped';
+  if(d.parse_skipped) s+=' · '+d.parse_skipped+' unparseable row(s)';
+  if(d.warnings && d.warnings.length) s+='\\n⚠ '+d.warnings.join('\\n⚠ ');
+  msg.className='bt-msg ok'; msg.textContent='✓ '+s;
+  return true;
+}
+async function tzUpload(){
+  const btn=document.getElementById('tz-up-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Importing…';
+  try{ const ok=await tzDoUpload(); if(ok) await tzLoadAnalysis(); }
+  catch(e){ const m=document.getElementById('tz-up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
+}
+
+async function btDoUpload(){
+  // Uploads the chosen CSV, refreshes + selects the new dataset, and returns its
+  // id (or null on failure — the message is already shown to the user).
+  const f = document.getElementById('up-file').files[0];
+  const msg = document.getElementById('up-msg');
+  if(!f){ msg.className='bt-msg err'; msg.textContent='Choose a CSV file first.'; return null; }
+  msg.className='bt-msg'; msg.textContent='Reading file…';
+  const text = await f.text();
+  const q = new URLSearchParams({
+    symbol: document.getElementById('up-sym').value,
+    timeframe: document.getElementById('up-tf').value,
+    tz: document.getElementById('up-tz').value,
+    label: document.getElementById('up-label').value || '',
+    filename: f.name || ''
+  });
+  const r = await fetch(BASE+'/backtest/upload?'+q.toString(),
+    {method:'POST', headers:{'Content-Type':'text/csv'}, body:text, cache:'no-store'});
+  const d = await r.json();
+  if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Upload failed'); return null; }
+  let s = (d.reused?'Reused existing dataset':'Stored dataset')+' #'+d.dataset_id+
+          ' · '+btEsc(d.symbol||'?')+' '+btEsc(d.timeframe||'')+' · '+d.row_count+' rows';
+  const det=[]; if(d.detected_symbol) det.push('symbol'); if(d.detected_timeframe) det.push('timeframe');
+  if(det.length) s+=' · auto-detected '+det.join(' & ');
+  if(d.dup_removed) s+=' · '+d.dup_removed+' dupes removed';
+  if(d.skipped) s+=' · '+d.skipped+' skipped';
+  if(d.gap_count) s+=' · '+d.gap_count+' gaps';
+  if(d.warnings && d.warnings.length) s+='\\n⚠ '+d.warnings.join('\\n⚠ ');
+  msg.className='bt-msg ok'; msg.textContent='✓ '+s;
+  btSelDataset = d.dataset_id;
+  await btLoadDatasets();
+  return d.dataset_id;
+}
+async function btUpload(){
+  const btn=document.getElementById('up-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Uploading…';
+  try{ await btDoUpload(); }
+  catch(e){ const m=document.getElementById('up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
+}
+async function btUploadAndRun(){
+  const btn=document.getElementById('upr-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Uploading…';
+  try{
+    const id = await btDoUpload();
+    if(id===null) return;            // failure already surfaced
+    btn.textContent='Running…';
+    await btRun();                   // uses btSelDataset + the Run settings below
+    const sec=document.getElementById('rn-msg'); if(sec) sec.scrollIntoView({behavior:'smooth',block:'center'});
+  }catch(e){ const m=document.getElementById('up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
+}
+
+async function btLoadDatasets(){
+  const body = document.getElementById('ds-body');
+  try{
+    const d = await api('/backtest/datasets');
+    const rows = (d && d.datasets) || [];
+    if(!rows.length){ btSelDataset=null; body.innerHTML='<tr><td colspan="7" class="bt-mini">No datasets yet — upload a CSV above.</td></tr>'; return; }
+    if(btSelDataset===null || !rows.some(r=>r.id===btSelDataset)) btSelDataset = rows[0].id;
+    body.innerHTML = rows.map(r=>{
+      const sel=(btSelDataset===r.id);
+      const range=btFmtDate(r.first_ts)+' → '+btFmtDate(r.last_ts);
+      return '<tr class="'+(sel?'sel':'')+'">'+
+        '<td><input type="radio" name="ds" '+(sel?'checked':'')+' onclick="btSelectDataset('+r.id+')"></td>'+
+        '<td>'+btEsc(r.symbol)+'</td><td>'+btEsc(r.timeframe)+'</td><td>'+r.row_count+'</td>'+
+        '<td>'+range+'</td><td>'+btEsc(r.source_label||r.filename||'—')+'</td>'+
+        '<td><span class="bt-x" title="Delete" onclick="btDeleteDataset('+r.id+')">✕</span></td></tr>';
+    }).join('');
+  }catch(e){ body.innerHTML='<tr><td colspan="7" class="bt-msg err">'+btEsc(''+e)+'</td></tr>'; }
+}
+function btSelectDataset(id){ btSelDataset=id; btLoadDatasets(); }
+async function btDeleteDataset(id){
+  if(!confirm('Delete dataset #'+id+'? This removes its candles too.')) return;
+  try{
+    await fetch(BASE+'/backtest/datasets/'+id, {method:'DELETE', cache:'no-store'});
+    if(btSelDataset===id) btSelDataset=null;
+    btLoadDatasets();
+  }catch(e){ toast('Delete failed', false); }
+}
+
+async function btRun(){
+  const msg=document.getElementById('rn-msg');
+  if(btSelDataset===null){ msg.className='bt-msg err'; msg.textContent='Select a dataset first.'; return; }
+  const strat=document.getElementById('rn-strat').value;
+  const body={
+    dataset_id: btSelDataset,
+    mode: document.getElementById('rn-mode').value,
+    session: document.getElementById('rn-sess').value,
+    strategies: (strat==='all') ? null : [strat],
+    start: document.getElementById('rn-start').value || null,
+    end: document.getElementById('rn-end').value || null,
+    slippage_ticks: parseFloat(document.getElementById('rn-slip').value||'1'),
+    commission_per_side: parseFloat(document.getElementById('rn-comm').value||'0.62'),
+    min_target_r: parseFloat(document.getElementById('rn-minr').value||'1.0'),
+    max_trades_per_session: parseInt(document.getElementById('rn-maxt').value||'3', 10),
+    management: document.getElementById('rn-mgmt').value,
+  };
+  const btn=document.getElementById('rn-btn'); btn.disabled=true; btn.textContent='Running…';
+  msg.className='bt-msg'; msg.textContent='Submitting…';
+  document.getElementById('bt-results').style.display='none';
+  const prog=document.getElementById('rn-prog'); document.getElementById('rn-prog-f').style.width='5%';
+  prog.style.display='block';
+  try{
+    const d=await api('/backtest/run', body);
+    if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Run failed'); btRunDone(); prog.style.display='none'; return; }
+    btRunId=d.run_id; msg.textContent='Running #'+btRunId+'…';
+    btPollRun();
+  }catch(e){ msg.className='bt-msg err'; msg.textContent='✗ '+e; btRunDone(); prog.style.display='none'; }
+}
+function btRunDone(){ const btn=document.getElementById('rn-btn'); btn.disabled=false; btn.textContent='Run Backtest'; }
+function btPollRun(){
+  if(btPollTimer) clearTimeout(btPollTimer);
+  btPollTimer=setTimeout(async ()=>{
+    try{
+      const d=await api('/backtest/runs/'+btRunId);
+      const progF=document.getElementById('rn-prog-f');
+      const msg=document.getElementById('rn-msg');
+      if(!d || !d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+((d&&d.error)||'run lost'); btRunDone(); return; }
+      progF.style.width=Math.round((d.progress||0)*100)+'%';
+      if(d.status==='done'){ btResult=d.result; msg.className='bt-msg ok'; msg.textContent='✓ Completed run #'+btRunId; btRunDone(); btRenderResults(); return; }
+      if(d.status==='error'){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Backtest error'); btRunDone(); return; }
+      msg.textContent='Running #'+btRunId+'… ('+d.status+')';
+      btPollRun();
+    }catch(e){ btPollRun(); }
+  }, 1200);
+}
+
+function btRenderResults(){
+  const res=btResult; if(!res){ return; }
+  document.getElementById('bt-results').style.display='block';
+  document.getElementById('rk-cap').textContent =
+    res.symbol+' · '+res.mode+' · '+res.session+' · '+(res.timeframe||'')+' · '+res.total_trades+' trades';
+  // Ranking table
+  const rb=document.getElementById('rk-body');
+  const ranked=(res.ranking||[]).map(k=>res.strategies[k]).filter(Boolean);
+  rb.innerHTML = ranked.length ? ranked.map((m,idx)=>{
+    const npos=(m.net_r>=0), dpos=(m.net_pnl>=0);
+    const tradable=(m.tradable===true);
+    const tradeCell = m.total_trades>0
+      ? '<td class="'+(tradable?'bt-pos':'bt-neg')+'">'+(tradable?'✓ Yes':'✗ No')+'</td>'
+      : '<td class="bt-mini">—</td>';
+    return '<tr>'+
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+btEsc(m.label||m.key)+'</td>'+
+      tradeCell+
+      '<td>'+m.total_trades+'</td>'+
+      '<td>'+(m.win_rate===null?'—':m.win_rate+'%')+'</td>'+
+      '<td>'+(m.profit_factor===null?'—':m.profit_factor)+'</td>'+
+      '<td class="'+(dpos?'bt-pos':'bt-neg')+'">'+(dpos?'+':'−')+'$'+btNum(Math.abs(m.net_pnl),0)+'</td>'+
+      '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(m.net_r,2)+'R</td>'+
+      '<td>'+btNum(m.avg_r,2)+'</td>'+
+      '<td class="bt-pos">'+(m.avg_winner_r==null?'—':'+'+btNum(m.avg_winner_r,2))+'</td>'+
+      '<td class="bt-neg">'+(m.avg_loser_r==null?'—':btNum(m.avg_loser_r,2))+'</td>'+
+      '<td>'+btNum(m.max_drawdown_r,2)+'</td>'+
+      '<td>'+btEsc(m.best_hour_label||'—')+'</td>'+
+      '<td>'+btEsc(m.best_regime||'—')+'</td>'+
+      '<td>'+(m.avg_hold_minutes===null?'—':m.avg_hold_minutes+'m')+'</td>'+
+      '</tr>';
+  }).join('') : '<tr><td colspan="15" class="bt-mini">No trades generated for these filters.</td></tr>';
+  // Active filters caption
+  const fl=res.filters||{};
+  const fbits=[];
+  if(fl.management_label) fbits.push('Exit: '+fl.management_label);
+  if(fl.disabled_strategies&&fl.disabled_strategies.length) fbits.push('Disabled: '+fl.disabled_strategies.map(s=>BT_STRAT_LABELS[s]||s).join(', '));
+  if(fl.max_trades_per_session) fbits.push('Max '+fl.max_trades_per_session+' trades/session');
+  if(fl.min_target_r) fbits.push('Min target '+fl.min_target_r+'R');
+  if(fl.block_extreme_volatility) fbits.push('Extreme-volatility blocked');
+  if(fl.news_blackouts_et&&fl.news_blackouts_et.length) fbits.push(fl.news_blackouts_et.length+' news blackout(s)');
+  document.getElementById('rk-filters').textContent = fbits.length ? ('Filters — '+fbits.join(' · ')) : '';
+  // Loss-reason breakdown per strategy
+  const lr=document.getElementById('lr-body');
+  const lrParts=ranked.filter(m=>m.loss_reasons&&m.loss_reasons.length).map(m=>{
+    const items=m.loss_reasons.map(r=>btEsc(r.reason)+' ('+r.count+')').join(', ');
+    return '<div style="margin-bottom:4px"><b>'+btEsc(m.label||m.key)+'</b>: '+items+'</div>';
+  });
+  lr.innerHTML = lrParts.length ? lrParts.join('') : 'No losing trades in these results.';
+  // Equity series selector
+  const eqSel=document.getElementById('eq-sel');
+  let opts='<option value="__combined__">Combined (all selected)</option>';
+  ranked.forEach(m=>{ opts+='<option value="'+m.key+'">'+btEsc(m.label||m.key)+'</option>'; });
+  eqSel.innerHTML=opts; eqSel.value='__combined__';
+  btDrawEquity();
+  // Trade-log filter
+  const tlSel=document.getElementById('tl-sel');
+  let topts='<option value="all">All strategies</option>';
+  ranked.forEach(m=>{ topts+='<option value="'+m.key+'">'+btEsc(m.label||m.key)+'</option>'; });
+  tlSel.innerHTML=topts; tlSel.value='all';
+  btRenderTrades();
+  // Signal agreement
+  const ag=document.getElementById('ag-msg'); const sa=res.signal_agreement||{};
+  if(sa.available){
+    const mt=sa.match||{};
+    ag.className='bt-msg';
+    ag.textContent='Overall agreement: '+(sa.overall===null?'—':sa.overall+'%')+
+      '\\nBOS '+btP(mt.bos)+' · CHOCH '+btP(mt.choch)+' · Zone '+btP(mt.zone)+' · Sweep '+btP(mt.sweep)+
+      ((sa.diagnostics&&sa.diagnostics.length)? '\\n⚠ '+sa.diagnostics.join(' · '):'');
+  }else{
+    const rc=sa.reconstructed||{};
+    ag.className='bt-msg';
+    ag.textContent=(sa.message||'No captured live signals for this period.')+
+      '\\nReconstructed structure events — BOS '+(rc.bos||0)+' · CHOCH '+(rc.choch||0)+' · Zone '+(rc.zone||0)+' · Sweep '+(rc.sweep||0);
+  }
+}
+
+function btRenderTrades(){
+  const res=btResult; if(!res) return;
+  const f=document.getElementById('tl-sel').value;
+  let trades=(res.trades||[]).slice();
+  if(f!=='all') trades=trades.filter(t=>t.strategy===f);
+  trades.sort((a,b)=> (a.entry_ts<b.entry_ts?-1:(a.entry_ts>b.entry_ts?1:0)));
+  document.getElementById('tl-count').textContent='('+trades.length+' trades)';
+  const tb=document.getElementById('tl-body');
+  tb.innerHTML = trades.length ? trades.map((t,idx)=>{
+    const rpos=(t.r_multiple>=0), dpos=(t.pnl_dollars>=0);
+    return '<tr>'+
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+btEsc(BT_STRAT_LABELS[t.strategy]||t.strategy)+'</td>'+
+      '<td class="'+(t.direction==='Long'?'bt-pos':'bt-neg')+'">'+btEsc(t.direction)+'</td>'+
+      '<td>'+btFmtTs(t.entry_ts)+'</td>'+
+      '<td>'+btFmtTs(t.exit_ts)+'</td>'+
+      '<td>'+btEsc(t.regime||'—')+'</td>'+
+      '<td>'+btEsc(t.session||'—')+'</td>'+
+      '<td>'+btNum(t.entry,2)+'</td>'+
+      '<td>'+btNum(t.stop,2)+'</td>'+
+      '<td>'+btNum(t.exit,2)+'</td>'+
+      '<td class="'+(rpos?'bt-pos':'bt-neg')+'">'+(rpos?'+':'')+btNum(t.r_multiple,2)+'</td>'+
+      '<td class="'+(dpos?'bt-pos':'bt-neg')+'">'+(dpos?'+':'−')+'$'+btNum(Math.abs(t.pnl_dollars),0)+'</td>'+
+      '<td>'+(t.hold_minutes==null?'—':t.hold_minutes+'m')+'</td>'+
+      '<td>'+btEsc(t.entry_reason||'')+'</td>'+
+      '<td>'+btEsc(t.exit_reason||'')+'</td>'+
+      '</tr>';
+  }).join('') : '<tr><td colspan="15" class="bt-mini">No trades for this filter.</td></tr>';
+}
+
+function btDrawEquity(){
+  const res=btResult; if(!res) return;
+  const sel=document.getElementById('eq-sel').value;
+  const curve = (sel==='__combined__') ? (res.combined_equity_curve||[])
+                                       : (((res.strategies[sel]||{}).equity_curve)||[]);
+  const svg=document.getElementById('eq-svg'); const cap=document.getElementById('eq-cap');
+  const W=600,H=200,pad=10;
+  if(!curve.length){ svg.innerHTML='<text x="300" y="104" fill="#9d86c4" font-size="12" text-anchor="middle">No trades to chart</text>'; cap.textContent=''; return; }
+  let min=0,max=0;
+  curve.forEach(p=>{ if(p.cum_r<min)min=p.cum_r; if(p.cum_r>max)max=p.cum_r; });
+  if(max===min){ max+=1; min-=1; }
+  const n=curve.length;
+  const X=i=> pad + (n===1?0:(i/(n-1))*(W-2*pad));
+  const Y=v=> pad + (1-((v-min)/(max-min)))*(H-2*pad);
+  const pts=curve.map((p,i)=> X(i).toFixed(1)+','+Y(p.cum_r).toFixed(1)).join(' ');
+  const zeroY=Y(0).toFixed(1);
+  const last=curve[n-1].cum_r;
+  const color = last>=0 ? '#2bf5a0' : '#ff476b';
+  svg.innerHTML=
+    '<line x1="'+pad+'" y1="'+zeroY+'" x2="'+(W-pad)+'" y2="'+zeroY+'" stroke="#3a2363" stroke-width="1" stroke-dasharray="4 4"></line>'+
+    '<polyline fill="none" stroke="'+color+'" stroke-width="2" points="'+pts+'"></polyline>';
+  cap.textContent=n+' trades · final '+(last>=0?'+':'')+last.toFixed(2)+'R · peak '+max.toFixed(2)+'R · trough '+min.toFixed(2)+'R';
+}
+
+async function btExport(){
+  if(!btRunId){ toast('Run a backtest first', false); return; }
+  try{
+    const r=await fetch(BASE+'/backtest/export?run_id='+btRunId, {cache:'no-store'});
+    if(!r.ok){ toast('Export failed', false); return; }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='backtest_run_'+btRunId+'.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }catch(e){ toast('Export failed', false); }
+}
+
+// ══════════════════════ OPTIMIZATION STUDY (read-only research) ══════════════════════
+let optResult=null, optRunId=null, optPollTimer=null;
+function optL(kind,key){ const m=(optResult&&optResult.labels&&optResult.labels[kind])||{}; return m[key]||key; }
+function optPF(v){ return (v===null||v===undefined)?'—':(v==='inf'?'∞':v); }
+function optCombo(row){
+  return optL('strategy',row.strategy)+' · '+optL('mgmt',row.mgmt)+' · Score≥'+row.score+
+    ' · '+optL('grade',row.grade)+' · '+optL('session',row.session)+
+    ' · '+optL('trend',row.trend)+' · '+optL('volume',row.volume);
+}
+function optRow(row, cols){ return cols.map(c=>c(row)).join(''); }
+function optMetricCells(row){
+  const npos=(row.net_r>=0);
+  return '<td>'+row.trades+'</td>'+
+    '<td>'+(row.win_rate==null?'—':row.win_rate+'%')+'</td>'+
+    '<td>'+optPF(row.pf)+'</td>'+
+    '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(row.net_r,2)+'R</td>'+
+    '<td>'+btNum(row.avg_r,3)+'</td>'+
+    '<td>'+btNum(row.max_dd_r,2)+'</td>';
+}
+
+async function optRun(){
+  const msg=document.getElementById('opt-msg');
+  if(btSelDataset===null){ msg.className='bt-msg err'; msg.textContent='Select a dataset first (Datasets above).'; return; }
+  const strat=document.getElementById('rn-strat').value;
+  const body={
+    dataset_id: btSelDataset,
+    mode: document.getElementById('rn-mode').value,
+    strategies: (strat==='all'||strat==='EXHAUSTION_FADE') ? null : [strat],
+    start: document.getElementById('rn-start').value || null,
+    end: document.getElementById('rn-end').value || null,
+    slippage_ticks: parseFloat(document.getElementById('rn-slip').value||'1'),
+    commission_per_side: parseFloat(document.getElementById('rn-comm').value||'0.62'),
+    min_trades: parseInt(document.getElementById('opt-mintr').value||'10', 10),
+  };
+  const btn=document.getElementById('opt-btn'); btn.disabled=true; btn.textContent='Running…';
+  msg.className='bt-msg'; msg.textContent='Submitting…';
+  document.getElementById('opt-results').style.display='none';
+  const prog=document.getElementById('opt-prog'); document.getElementById('opt-prog-f').style.width='5%';
+  prog.style.display='block';
+  try{
+    const d=await api('/backtest/optimize', body);
+    if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Optimization failed'); optRunDone(); prog.style.display='none'; return; }
+    optRunId=d.run_id; msg.textContent='Running study #'+optRunId+'…';
+    optPoll();
+  }catch(e){ msg.className='bt-msg err'; msg.textContent='✗ '+e; optRunDone(); prog.style.display='none'; }
+}
+function optRunDone(){ const btn=document.getElementById('opt-btn'); btn.disabled=false; btn.textContent='Run Optimization Study'; }
+function optPoll(){
+  if(optPollTimer) clearTimeout(optPollTimer);
+  optPollTimer=setTimeout(async ()=>{
+    try{
+      const d=await api('/backtest/runs/'+optRunId);
+      const progF=document.getElementById('opt-prog-f');
+      const msg=document.getElementById('opt-msg');
+      if(!d || !d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+((d&&d.error)||'run lost'); optRunDone(); return; }
+      progF.style.width=Math.round((d.progress||0)*100)+'%';
+      if(d.status==='done'){ optResult=d.result; msg.className='bt-msg ok'; msg.textContent='✓ Completed study #'+optRunId; optRunDone(); optRender(); return; }
+      if(d.status==='error'){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Optimization error'); optRunDone(); return; }
+      msg.textContent='Running study #'+optRunId+'… ('+d.status+')';
+      optPoll();
+    }catch(e){ optPoll(); }
+  }, 1200);
+}
+
+function optCardHtml(label, row, best){
+  if(!row) return '';
+  const npos=(row.net_r>=0);
+  return '<div class="bt-card'+(best?' best':'')+'">'+
+    '<div class="bt-card-h">'+btEsc(label)+'</div>'+
+    '<div class="bt-card-t">'+btEsc(optL('strategy',row.strategy))+'</div>'+
+    '<div class="bt-card-m">'+
+      '<b>'+btEsc(optL('mgmt',row.mgmt))+'</b><br>'+
+      'Score≥'+row.score+' · '+btEsc(optL('grade',row.grade))+'<br>'+
+      btEsc(optL('session',row.session))+'<br>'+
+      btEsc(optL('trend',row.trend))+' · '+btEsc(optL('volume',row.volume))+'<br>'+
+      '<b class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(row.net_r,2)+'R</b>'+
+      ' · PF '+optPF(row.pf)+' · '+row.trades+' trades<br>'+
+      'Win '+(row.win_rate==null?'—':row.win_rate+'%')+' · Max DD '+btNum(row.max_dd_r,2)+'R'+
+    '</div></div>';
+}
+
+function optRender(){
+  const res=optResult; if(!res) return;
+  document.getElementById('opt-results').style.display='block';
+  document.getElementById('opt-cap').textContent =
+    res.symbol+' · '+res.mode+' · '+(res.timeframe||'')+' · '+res.bars+' bars · '+
+    res.total_combos+' combos ('+res.eligible_combos+' eligible)';
+  // Best-combination cards
+  const cards=[];
+  cards.push(optCardHtml('★ Best overall', res.best_overall, true));
+  const bs=res.best_by_strategy||{};
+  (res.strategies||[]).forEach(k=>{ if(bs[k]) cards.push(optCardHtml('Best · '+optL('strategy',k), bs[k], false)); });
+  document.getElementById('opt-cards').innerHTML = cards.filter(Boolean).join('') ||
+    '<div class="bt-mini">No combinations met the minimum trade count.</div>';
+  // Best per strategy
+  const sb=document.getElementById('opt-strat-body');
+  const stratRows=(res.strategies||[]).map(k=>bs[k]).filter(Boolean);
+  sb.innerHTML = stratRows.length ? stratRows.map(r=>'<tr>'+
+    '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+    '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+    '<td>'+r.score+'</td>'+
+    '<td>'+btEsc(optL('grade',r.grade))+'</td>'+
+    '<td>'+btEsc(optL('session',r.session))+'</td>'+
+    '<td>'+btEsc(optL('trend',r.trend))+'</td>'+
+    '<td>'+btEsc(optL('volume',r.volume))+'</td>'+
+    optMetricCells(r)+'</tr>').join('') :
+    '<tr><td colspan="13" class="bt-mini">No eligible combinations.</td></tr>';
+  // Best per session
+  const seb=document.getElementById('opt-sess-body');
+  const sessMap=res.best_by_session||{};
+  const sessKeys=Object.keys(sessMap);
+  seb.innerHTML = sessKeys.length ? sessKeys.map(k=>{ const r=sessMap[k]; return '<tr>'+
+    '<td>'+btEsc(optL('session',k))+'</td>'+
+    '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+    '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+    '<td>'+r.score+'</td>'+
+    '<td>'+btEsc(optL('grade',r.grade))+'</td>'+
+    '<td>'+btEsc(optL('trend',r.trend))+'</td>'+
+    '<td>'+btEsc(optL('volume',r.volume))+'</td>'+
+    '<td>'+r.trades+'</td>'+
+    '<td>'+(r.win_rate==null?'—':r.win_rate+'%')+'</td>'+
+    '<td>'+optPF(r.pf)+'</td>'+
+    '<td class="'+(r.net_r>=0?'bt-pos':'bt-neg')+'">'+(r.net_r>=0?'+':'')+btNum(r.net_r,2)+'R</td>'+
+    '<td>'+btNum(r.max_dd_r,2)+'</td></tr>'; }).join('') :
+    '<tr><td colspan="12" class="bt-mini">No eligible combinations.</td></tr>';
+  // Best per regime
+  const rgb=document.getElementById('opt-reg-body');
+  const regMap=res.best_by_regime||{};
+  const regKeys=Object.keys(regMap);
+  rgb.innerHTML = regKeys.length ? regKeys.map(k=>{ const r=regMap[k]; return '<tr>'+
+    '<td>'+btEsc(k)+'</td>'+
+    '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+    '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+    '<td>'+r.score+'</td>'+
+    optMetricCells(r)+'</tr>'; }).join('') :
+    '<tr><td colspan="10" class="bt-mini">No regime had enough trades.</td></tr>';
+  // Ranked-table strategy filter
+  const sel=document.getElementById('opt-rk-sel');
+  let opts='<option value="all">All strategies</option>';
+  (res.strategies||[]).forEach(k=>{ opts+='<option value="'+k+'">'+btEsc(optL('strategy',k))+'</option>'; });
+  sel.innerHTML=opts; sel.value='all';
+  optRenderTable();
+  // Worst to avoid
+  const w=document.getElementById('opt-worst'); const wr=res.worst_to_avoid;
+  if(wr){ w.className='bt-msg'; w.textContent='Lowest-ranked eligible combination: '+optCombo(wr)+
+    ' → Net '+btNum(wr.net_r,2)+'R · PF '+optPF(wr.pf)+' · '+wr.trades+' trades · Max DD '+btNum(wr.max_dd_r,2)+'R.'; }
+  else { w.className='bt-msg'; w.textContent='No eligible combination to flag.'; }
+  // Notes
+  const nb=document.getElementById('opt-notes');
+  nb.innerHTML=(res.notes||[]).map(n=>'<li>'+btEsc(n)+'</li>').join('');
+}
+
+function optRenderTable(){
+  const res=optResult; if(!res) return;
+  const f=document.getElementById('opt-rk-sel').value;
+  let rows=(res.table||[]).slice();
+  if(f!=='all') rows=rows.filter(r=>r.strategy===f);
+  document.getElementById('opt-rk-cap').textContent='(top '+rows.length+' of '+res.total_combos+' combos)';
+  const tb=document.getElementById('opt-rk-body');
+  tb.innerHTML = rows.length ? rows.map((r,idx)=>{
+    const npos=(r.net_r>=0); const elig=(r.trades>=res.min_trades);
+    return '<tr'+(elig?'':' style="opacity:.55"')+'>'+
+      '<td>'+(idx+1)+'</td>'+
+      '<td>'+btEsc(optL('strategy',r.strategy))+'</td>'+
+      '<td>'+btEsc(optL('mgmt',r.mgmt))+'</td>'+
+      '<td>'+r.score+'</td>'+
+      '<td>'+btEsc(optL('grade',r.grade))+'</td>'+
+      '<td>'+btEsc(optL('session',r.session))+'</td>'+
+      '<td>'+btEsc(optL('trend',r.trend))+'</td>'+
+      '<td>'+btEsc(optL('volume',r.volume))+'</td>'+
+      '<td>'+r.trades+'</td>'+
+      '<td>'+(r.win_rate==null?'—':r.win_rate+'%')+'</td>'+
+      '<td>'+optPF(r.pf)+'</td>'+
+      '<td class="'+(npos?'bt-pos':'bt-neg')+'">'+(npos?'+':'')+btNum(r.net_r,2)+'R</td>'+
+      '<td>'+btNum(r.avg_r,3)+'</td>'+
+      '<td>'+btNum(r.max_dd_r,2)+'</td>'+
+      '<td>'+btEsc(r.best_hour_label||'—')+'</td>'+
+      '</tr>';
+  }).join('') : '<tr><td colspan="15" class="bt-mini">No combinations for this filter.</td></tr>';
+}
+
+async function optExport(){
+  if(!optRunId){ toast('Run an optimization study first', false); return; }
+  try{
+    const r=await fetch(BASE+'/backtest/export?run_id='+optRunId, {cache:'no-store'});
+    if(!r.ok){ toast('Export failed', false); return; }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='optimization_run_'+optRunId+'.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }catch(e){ toast('Export failed', false); }
+}
+
+// ── Default to the best-probability setup on landing (DISPLAY-ONLY) ──────────
+// On page load, open straight to the instrument + direction with the strongest
+// setup. "Best" = an actionable setup (READY / EARLY) beats a non-actionable one;
+// within the same tier the higher Edge Score wins. Direction defaults to that
+// instrument's favored side. This only chooses the INITIAL tab/direction — once
+// you switch manually it never moves again, and it never touches the gate,
+// scoring, sizing or any money path. Fail-open: any error leaves the MGC / Long
+// default untouched. Hidden (focused-out) instruments are never auto-selected.
+async function autoSelectBestSetup(){
+  try {
+    if (userPickedSetup) return;                      // user already chose — never override
+    const num = function(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; };
+    let cands = INSTRUMENTS.filter(instrEnabled);   // respect display focus
+    if (!cands.length) cands = ['MGC'];
+    const recs = await Promise.all(cands.map(function(s){
+      return api('/status?ticker='+encodeURIComponent(s))
+               .then(function(d){ return { s:s, d:d }; })
+               .catch(function(){ return { s:s, d:null }; });
+    }));
+    let best = null;
+    recs.forEach(function(r){
+      if (!r.d) return;
+      const cand = {
+        s:    r.s,
+        d:    r.d,
+        act:  jsIsActionable(r.d.verdict) ? 1 : 0,
+        edge: num(r.d.edge_score)
+      };
+      if (!best){ best = cand; return; }
+      const better = (cand.act !== best.act) ? (cand.act > best.act)
+                                             : (cand.edge > best.edge);
+      if (better) best = cand;
+    });
+    if (!best) return;
+    let bdir = jsReadyDir(best.d.verdict);            // ready side when actionable
+    if (!bdir){                                       // else the higher per-side edge
+      bdir = (num(best.d.short_score) > num(best.d.long_score)) ? 'Short' : 'Long';
+    }
+    if (userPickedSetup) return;                      // re-check after await — manual pick wins
+    if (best.s !== sym) setSymbol(best.s);            // setSymbol() re-fetches analysis
+    if (bdir && bdir !== dir) setDir(bdir);
+  } catch(e){ /* fail-open: keep the MGC / Long default */ }
+}
+
+// Poll every 3 seconds
+paintSndToggle();
+paintThemeToggle();
+window.addEventListener('pointerdown', _ensureAudio, { once: true });
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor();
+autoSelectBestSetup();
+setInterval(() => { refresh(); refreshRec(); }, 3000);
+setInterval(checkStale, 2000);
+</script>
+</body>
+</html>"""
+    html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
+    html = html.replace("__BELL_DATA_URI__", BELL_DATA_URI)
+    return html, 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        # The dashboard is a live view whose inline JS changes on every deploy.
+        # Without this, a browser can serve a stale cached copy of the dashboard
+        # (old toggle/poll wiring) and appear "frozen" on pair/direction switch.
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+
+@app.route("/ping", methods=["GET", "POST", "HEAD"])
+def ping():
+    # Simple health/test endpoint — no alert logic. Used by UptimeRobot and for testing.
+    return jsonify({"status": "ok", "trading_mode": TRADING_MODE}), 200
+
+
+@app.route("/mode", methods=["GET", "POST"])
+def mode():
+    """Read or switch the active trading mode (SCALP / SWING) at runtime."""
+    global TRADING_MODE
+    if request.method == "POST":
+        data      = request.get_json(silent=True) or {}
+        requested = str(data.get("mode", "")).upper()
+        if requested not in MODES:
+            return jsonify({"status": "error",
+                            "reason": f"Unknown mode {requested!r}. Use one of {list(MODES)}."}), 400
+        TRADING_MODE = requested
+        logger.info("Trading mode switched to %s", TRADING_MODE)
+    return jsonify({
+        "status":          "ok",
+        "trading_mode":    TRADING_MODE,
+        "available_modes": list(MODES),
+        "thresholds":      MODES[TRADING_MODE],
+    }), 200
+
+
+@app.route("/alerts/mute", methods=["GET", "POST"])
+def alerts_mute():
+    """Read or set the per-instrument alert mute flags (MGC / MNQ).
+
+    Muting suppresses the Discord NEW-SETUP alerts for that instrument — the live
+    READY card (incl. @everyone + A+ mirror), the EARLY teaser, the tiered
+    WATCH/ARMED alerts, the new-entry journal embed and the zone-mitigated notice —
+    while the engine keeps EVALUATING it, writing the journal record, and recording
+    diagnostics/eval-metrics (no data gap). Active-position lifecycle / outcome /
+    execution alerts are NEVER muted. State is in-memory and resets to unmuted on
+    restart (fail-safe toward alerting). Owner-only (Basic Auth + CSRF via the
+    Express proxy; deliberately NOT in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        inst = _instrument_from_text(data.get("instrument") or data.get("inst"))
+        if inst is None:
+            return jsonify({"status": "error",
+                            "reason": "instrument must be exactly 'MGC' or 'MNQ'."}), 400
+        muted = bool(data.get("muted"))
+        with ALERTS_MUTED_LOCK:
+            ALERTS_MUTED[inst] = muted
+        logger.info("Alerts %s for %s", "MUTED" if muted else "UNMUTED", inst)
+    with ALERTS_MUTED_LOCK:
+        snapshot = dict(ALERTS_MUTED)
+    return jsonify({"status": "ok", "muted": snapshot}), 200
+
+
+
+@app.route("/auto-trade", methods=["GET", "POST"])
+def auto_trade_toggle():
+    """Read or set the per-instrument AUTO-TRADE flags (MGC / MNQ).
+
+    When ON, a brand-new READY setup automatically routes a server-authoritative
+    order through the SAME audited gateway as the manual button. OFF by default and
+    RESET TO OFF on restart/republish (fail-safe toward NOT trading). Live
+    (real-broker) auto execution additionally requires the live/prod instance.
+    Owner-only (Basic Auth + CSRF via the Express proxy; deliberately NOT in
+    OPEN_PATHS)."""
+    if request.method == "POST":
