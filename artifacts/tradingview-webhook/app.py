@@ -7323,6 +7323,31 @@ LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total
 GOVERNOR_STATS         = {"ready": False, "trade_count": 0, "last_refreshed_at": None}  # historical aggregates for the Confidence Governor
 MEMORY_TRADES          = []                         # capped rolling list of recent closed trades for the Professional Memory Engine
 MEMORY_TRADES_MAX      = 300                        # cap on the in-memory similar-trades cache
+# ── Shared Trade Memory weighting (display-only; governor + analyst single source).
+# STRATEGY_VERSION is bumped MANUALLY whenever the trade LOGIC (filters / indicators
+# / rules) changes; prior-version closed trades are then heavily down-weighted so
+# stale logic stops dragging current confidence. Stamped on every new closed trade.
+STRATEGY_VERSION       = 1
+# Recency tiers (rank 1 = most-recently closed). Newest block full weight, the next
+# ~100 half, everything older one-fifth — recent results dominate the lens.
+GOV_RECENCY_TIER1_N    = 25
+GOV_RECENCY_TIER1_W    = 1.0
+GOV_RECENCY_TIER2_N    = 125            # cumulative cutoff: ranks 26..125 == the "next 100"
+GOV_RECENCY_TIER2_W    = 0.5
+GOV_RECENCY_OLDER_W    = 0.2
+# Version factor: current-version trades full weight, prior-version heavily reduced.
+GOV_VERSION_CURRENT_W  = 1.0
+GOV_VERSION_PRIOR_W    = 0.2
+# Similarity gates: minimum scored-dimension matches per trade + minimum comparable
+# trades before the historical lens is "ready" (else it stays neutral / 50).
+GOV_SIM_MIN_SCORE      = 3
+GOV_SIM_MIN_MATCHES    = 5
+# Component nudge caps — the CURRENT-setup anchor dominates; Live / AI / Historical
+# can each only nudge it within these bounds, so history can NEVER single-handedly
+# drag a strong live setup below the READY threshold (non-domination floor).
+GOV_HIST_CAP           = 12
+GOV_LIVE_CAP           = 8
+GOV_AI_CAP             = 8
 
 # Opening-range + Opening-Drive window (Eastern Time, decimal hours).
 OPENING_RANGE_START_ET      = 8.0    # OR builds from 08:00 ET
@@ -8232,6 +8257,8 @@ def _record_strategy_trade(mt):
             outcome_tag,
             dow,
             ctx.get("volatility_type"),
+            TRADING_MODE,
+            STRATEGY_VERSION,
         )
         conn = _learning_conn()
         if conn is None:
@@ -8246,9 +8273,10 @@ def _record_strategy_trade(mt):
                         confidence, quality, edge_score, mode, indicators,
                         entry_efficiency, momentum_score, grade, scalper_grade,
                         mfe_r, mae_r, slippage, exit_price, entry_reason,
-                        outcome_reason, outcome_tag, day_of_week, volatility_type)
+                        outcome_reason, outcome_tag, day_of_week, volatility_type,
+                        trading_mode, strategy_version)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (managed_key) DO NOTHING
                    RETURNING id""",
                 row,
@@ -8381,7 +8409,8 @@ def _recompute_learning():
         cur.execute("""
             SELECT symbol, direction, market_regime, session, volatility_type,
                    entry_efficiency, strategy_key, strategy, result, r_multiple,
-                   mfe_r, mae_r, hold_minutes, outcome_tag, edge_score, indicators
+                   mfe_r, mae_r, hold_minutes, outcome_tag, edge_score, indicators,
+                   grade, trading_mode, strategy_version
             FROM strategy_trades
             WHERE closed_at IS NOT NULL
             ORDER BY closed_at DESC
@@ -8506,7 +8535,7 @@ def _recompute_learning():
             "last_refreshed_at": now_utc().isoformat(),
         }
         mem_cache = []
-        for r in (mem_rows or []):
+        for idx, r in enumerate(mem_rows or []):
             ind = r.get("indicators") or {}
             mem_cache.append({
                 "symbol":           instrument_of(r.get("symbol") or "") or (r.get("symbol") or ""),
@@ -8525,6 +8554,11 @@ def _recompute_learning():
                 "outcome_tag":      r.get("outcome_tag"),
                 "edge_score":       r.get("edge_score"),
                 "bias":             _norm_dir(ind.get("cvd_direction")),
+                "grade":            (r.get("grade") or None),
+                "trading_mode":     (r.get("trading_mode") or None),
+                "strategy_version": r.get("strategy_version"),
+                # rank 1 == most-recently closed (ORDER BY closed_at DESC) -> recency tier.
+                "rank":             idx + 1,
             })
 
         with LEARNING_LOCK:
@@ -8873,7 +8907,7 @@ def _norm_dir(token):
     return None
 
 
-def _eff_band(v):
+def _eff_band_RETIRED(v):
     """Bucket an entry-efficiency value into 'low'/'mid'/'high' (scale-agnostic:
     values <=1 are treated as a 0..1 fraction). None when absent."""
     try:
@@ -8889,6 +8923,244 @@ def _eff_band(v):
         return "high"
     except Exception:
         return None
+
+
+def _gov_recency_weight(rank):
+    """Map a recency rank (1 = most-recently closed) to its tier weight."""
+    try:
+        r = int(rank)
+    except Exception:
+        return GOV_RECENCY_OLDER_W
+    if r <= GOV_RECENCY_TIER1_N:
+        return GOV_RECENCY_TIER1_W
+    if r <= GOV_RECENCY_TIER2_N:
+        return GOV_RECENCY_TIER2_W
+    return GOV_RECENCY_OLDER_W
+
+
+def _gov_version_weight(v):
+    """Current-version trades full weight; any other (prior / unknown) version is
+    heavily down-weighted so stale trade-logic stops dragging current confidence."""
+    try:
+        vi = int(v) if v is not None else None
+    except Exception:
+        vi = None
+    return GOV_VERSION_CURRENT_W if vi == STRATEGY_VERSION else GOV_VERSION_PRIOR_W
+
+
+def _similar_neutral_block(reason="No comparable trade history yet.",
+                           trade_count=0, refreshed=None):
+    """Neutral SHARED Trade-Memory context (fail-open / under-sampled). STABLE schema:
+    every consumer (governor, analyst memory-review, memory panel) reads these keys,
+    so the not-ready branch must populate all of them."""
+    return {
+        "ready": False,
+        "matched": 0,
+        "total_considered": trade_count,
+        "effective_sample": 0.0,
+        "weighted_win_rate": None,
+        "raw_win_rate": None,
+        "weighted_avg_r": None,
+        "weighted_avg_hold": None,
+        "weighted_avg_mfe": None,
+        "weighted_avg_mae": None,
+        "winners_avg_hold": None,
+        "winners_avg_mae": None,
+        "winners_avg_r": None,
+        "best_exit_label": None,
+        "top_failure_label": None,
+        "matched_on": [],
+        "strategy_version": STRATEGY_VERSION,
+        "trade_count": trade_count,
+        "last_refreshed_at": refreshed,
+        "reason": reason,
+    }
+
+
+def find_similar_trades(result, ticker=None):
+    """SHARED Trade Memory — the SINGLE source of truth for the historical
+    similar-trade lookup. BOTH the Confidence Governor and the Analyst (AI Reasoning)
+    Engine read this EXACT object, so the two can never diverge. Reads ONLY the
+    in-memory MEMORY_TRADES cache (warmed at recompute; NEVER queries the DB).
+
+    Similar = same instrument (HARD core) + a known-mode match (a KNOWN opposite mode
+    -- SCALP vs SWING -- is excluded; legacy NULL-mode rows are allowed but lean on
+    the version weight) + at least GOV_SIM_MIN_SCORE of the scored dimensions
+    {mode, direction, strategy, session, regime, volatility, grade}. Each matched
+    trade is weighted by recency tier x version factor, so recent same-version
+    results dominate. Summarises weighted win-rate / R / hold / MFE / MAE plus the
+    winners' and losers' dominant outcome tags. DISPLAY-ONLY; fully FAIL-OPEN."""
+    with LEARNING_LOCK:
+        trades    = list(MEMORY_TRADES)
+        refreshed = GOVERNOR_STATS.get("last_refreshed_at")
+    if not trades:
+        return _similar_neutral_block("Awaiting trade history.", 0, refreshed)
+
+    se        = result.get("strategy_engine") or {}
+    sym       = instrument_of(ticker or result.get("active_ticker") or "") or ""
+    if not sym:
+        return _similar_neutral_block("No instrument context.", len(trades), refreshed)
+    cur_mode  = (TRADING_MODE or "").strip().upper() or None
+    cur_dir   = _norm_dir(result.get("strict_direction") or se.get("direction"))
+    cur_strat = se.get("active_key")
+    cur_sess  = _learning_session_name()
+    cur_reg   = se.get("market_regime")
+    cur_vol   = (result.get("volatility") or {}).get("volatility_label")
+    cur_grade = (((result.get("pro_review") or {}).get("active") or {}).get("grade")
+                 or "").strip().upper() or None
+
+    matched, dims = [], set()
+    for t in trades:
+        if (t.get("symbol") or "") != sym:
+            continue
+        t_mode = (t.get("trading_mode") or "").strip().upper() or None
+        # A KNOWN opposite mode is never comparable; legacy NULL-mode rows pass.
+        if t_mode and cur_mode and t_mode != cur_mode:
+            continue
+        row_dims = set()
+        if t_mode and cur_mode and t_mode == cur_mode:
+            row_dims.add("mode")
+        if cur_dir and _norm_dir(t.get("direction")) == cur_dir:
+            row_dims.add("direction")
+        if cur_strat and t.get("strategy_key") == cur_strat:
+            row_dims.add("strategy")
+        if cur_sess and t.get("session") == cur_sess:
+            row_dims.add("session")
+        if cur_reg and t.get("regime") == cur_reg:
+            row_dims.add("regime")
+        if cur_vol and t.get("volatility_type") == cur_vol:
+            row_dims.add("volatility")
+        if cur_grade and (t.get("grade") or "").strip().upper() == cur_grade:
+            row_dims.add("grade")
+        # matched_on reflects ONLY accepted (>= min-score) rows, so the explanation
+        # never advertises a dimension no comparable trade actually shared.
+        if len(row_dims) >= GOV_SIM_MIN_SCORE:
+            w = _gov_recency_weight(t.get("rank")) * _gov_version_weight(t.get("strategy_version"))
+            if w > 0:
+                matched.append((t, w))
+                dims |= row_dims
+
+    n = len(matched)
+    if n < GOV_SIM_MIN_MATCHES:
+        blk = _similar_neutral_block(
+            ("Only %d comparable trade(s) (<%d) — neutral." % (n, GOV_SIM_MIN_MATCHES))
+            if n else "No closely-comparable trades in memory.",
+            len(trades), refreshed)
+        blk["matched"]    = n
+        blk["matched_on"] = sorted(dims)
+        return blk
+
+    W = sum(w for _, w in matched)
+
+    def _wavg(key, rows=None):
+        rows = matched if rows is None else rows
+        num = den = 0.0
+        for t, w in rows:
+            v = t.get(key)
+            if v is None:
+                continue
+            try:
+                num += w * float(v); den += w
+            except Exception:
+                continue
+        return round(num / den, 2) if den > 0 else None
+
+    wins_w   = sum(w for t, w in matched if (t.get("result") or "") == "Win")
+    raw_wins = sum(1 for t, _ in matched if (t.get("result") or "") == "Win")
+    weighted_win_rate = round(wins_w / W, 3) if W > 0 else None
+    raw_win_rate      = round(raw_wins / n, 3) if n else None
+    winners = [(t, w) for t, w in matched if (t.get("result") or "") == "Win"]
+    losers  = [(t, w) for t, w in matched if (t.get("result") or "") != "Win"]
+
+    def _top_tag(rows):
+        counts = {}
+        for t, _ in rows:
+            tg = t.get("outcome_tag")
+            if tg:
+                counts[tg] = counts.get(tg, 0) + 1
+        if not counts:
+            return None
+        top = max(counts, key=counts.get)
+        return OUTCOME_TAG_LABELS.get(top, top)
+
+    return {
+        "ready": True,
+        "matched": n,
+        "total_considered": len(trades),
+        "effective_sample": round(W, 2),
+        "weighted_win_rate": weighted_win_rate,
+        "raw_win_rate": raw_win_rate,
+        "weighted_avg_r": _wavg("r_multiple"),
+        "weighted_avg_hold": _wavg("hold_minutes"),
+        "weighted_avg_mfe": _wavg("mfe_r"),
+        "weighted_avg_mae": _wavg("mae_r"),
+        "winners_avg_hold": _wavg("hold_minutes", winners),
+        "winners_avg_mae": _wavg("mae_r", winners),
+        "winners_avg_r": _wavg("r_multiple", winners),
+        "best_exit_label": _top_tag(winners),
+        "top_failure_label": _top_tag(losers),
+        "matched_on": sorted(dims),
+        "strategy_version": STRATEGY_VERSION,
+        "trade_count": len(trades),
+        "last_refreshed_at": refreshed,
+        "reason": None,
+    }
+
+
+def build_analyst_memory_review(ctx):
+    """Answer the trader's six historical questions from the SHARED Trade-Memory
+    context (find_similar_trades output): seen-before? usual outcome? best exit?
+    winners' hold time? best stop (winners' adverse excursion)? typical failure
+    cause? DISPLAY-ONLY strings for the Analyst / AI Reasoning panel; FAIL-OPEN
+    (neutral strings when under-sampled)."""
+    ctx = ctx or {}
+    if not ctx.get("ready"):
+        msg = ctx.get("reason") or "No comparable history yet."
+        return {
+            "ready": False,
+            "seen_before": "No closely-comparable trades on record yet.",
+            "what_happened": msg,
+            "best_exit": "Not enough history to say.",
+            "winners_hold": "Not enough history to say.",
+            "best_stop": "Not enough history to say.",
+            "failure_cause": "Not enough history to say.",
+            "matched_on": ctx.get("matched_on") or [],
+        }
+    n     = ctx.get("matched") or 0
+    wwr   = ctx.get("weighted_win_rate")
+    avg_r = ctx.get("weighted_avg_r")
+    dims  = ctx.get("matched_on") or []
+    dim_txt = (" matched on " + ", ".join(dims)) if dims else ""
+    seen  = "Yes — %d comparable past trade%s%s." % (n, "" if n == 1 else "s", dim_txt)
+    if wwr is not None:
+        outcome = ("mostly worked" if wwr >= 0.6 else
+                   "mostly failed" if wwr <= 0.4 else "were mixed")
+        happened = "Similar setups %s — %.0f%% recency-weighted win rate" % (outcome, wwr * 100)
+        happened += (" at %+.2fR average." % avg_r) if avg_r is not None else "."
+    else:
+        happened = "Outcome unclear from the comparable set."
+    best_exit = (("Winners most often closed via %s." % ctx["best_exit_label"])
+                 if ctx.get("best_exit_label") else "No dominant winning exit pattern.")
+    wh = ctx.get("winners_avg_hold")
+    winners_hold = ("Winners were typically held about %d minutes." % int(round(wh))
+                    if wh is not None else "Winner hold time unavailable.")
+    wm = ctx.get("winners_avg_mae")
+    best_stop = (("Winners gave back about %.2fR before working — a stop beyond that survived."
+                  % abs(wm)) if wm is not None else
+                 "Not enough data on winners' adverse excursion.")
+    fail = (("Similar losers usually failed via %s." % ctx["top_failure_label"])
+            if ctx.get("top_failure_label") else
+            "No single dominant failure mode in the comparable set.")
+    return {
+        "ready": True,
+        "seen_before": seen,
+        "what_happened": happened,
+        "best_exit": best_exit,
+        "winners_hold": winners_hold,
+        "best_stop": best_stop,
+        "failure_cause": fail,
+        "matched_on": dims,
+    }
 
 
 def _governor_neutral_block(result=None, reason="Insufficient history."):
@@ -8916,17 +9188,34 @@ def _governor_neutral_block(result=None, reason="Insufficient history."):
         "gate_enabled": _learning_gate_enabled(),
         "trade_count": 0,
         "last_refreshed_at": None,
+        # Schema parity with the full 4-lens compute path so fail-open / market-closed
+        # consumers see the same keys (neutral values).
+        "current_confidence_score": base,
+        "confidence_components": [],
+        "historical_signal": _similar_neutral_block(reason),
         "reason": reason,
     }
 
 
-def compute_confidence_governor(result, ticker=None):
-    """Transparent confidence score: base Edge Score + bounded, EXPLAINED historical
-    adjustments (each 0 when under-sampled / no data). Reads RAW historical win-rates
-    from the in-memory GOVERNOR_STATS cache + the CURRENT setup's grade — NEVER the
-    ±15 strategy weight folded into strategy_engine.base_confidence, so there is no
-    double-count. NEVER queries the DB. DISPLAY-ONLY (T003). The caller wraps this in
-    try/except -> _governor_neutral_block (fail-open)."""
+def compute_confidence_governor(result, ticker=None, memory_ctx=None):
+    """Four-lens confidence score. The CURRENT setup is the ANCHOR (base Edge Score +
+    setup-grade tilt); the Live-market, AI-reasoning and Historical lenses can each
+    only NUDGE it within a small cap, so HISTORY CAN NEVER single-handedly veto a
+    strong live setup (non-domination floor below). All four lenses are scored 0..100
+    and surfaced (confidence_components) so the dashboard can explain the number.
+
+    The Historical lens reads the SHARED Trade-Memory context (find_similar_trades) —
+    the SAME object the Analyst consumes — so the two engines can never disagree. The
+    context is computed once upstream and passed in; if absent (older callers / tests)
+    it is recomputed here. NEVER queries the DB. DISPLAY-ONLY unless the learning
+    demotion flag is armed. The caller wraps this -> _governor_neutral_block
+    (fail-open)."""
+    if memory_ctx is None:
+        try:
+            memory_ctx = find_similar_trades(result, ticker)
+        except Exception:
+            memory_ctx = _similar_neutral_block()
+    memory_ctx = memory_ctx or _similar_neutral_block()
     with LEARNING_LOCK:
         stats = dict(GOVERNOR_STATS)
     try:
@@ -8941,80 +9230,114 @@ def compute_confidence_governor(result, ticker=None):
         eligible = bool(is_actionable(result.get("verdict")))
     except Exception:
         eligible = False
-    if not stats.get("ready"):
-        blk = _governor_neutral_block(result, reason="Awaiting trade history.")
-        blk["eligible_actionable"] = eligible
-        return blk
 
-    se     = result.get("strategy_engine") or {}
-    min_n  = int(stats.get("min_sample") or LEARNING_MIN_SAMPLE)
-    comps  = []
+    def _clamp(x, lo=0, hi=100):
+        return max(lo, min(hi, int(round(x))))
 
-    def _adj(name, blk, pts, label):
-        """Bounded ±pts adjustment from a {n, win_rate} block; 0 when under-sampled."""
-        if not blk:
-            comps.append({"name": name, "value": 0, "explanation": "%s: no history." % label})
-            return 0
-        n = int(blk.get("n") or 0)
-        if n < min_n:
-            comps.append({"name": name, "value": 0,
-                          "explanation": "%s: only %d trades (<%d) — no adjustment." % (label, n, min_n)})
-            return 0
-        wr     = float(blk.get("win_rate") or 0.0)
-        scaled = max(-1.0, min(1.0, (wr - 0.5) / 0.5))
-        val    = int(round(scaled * pts))
-        comps.append({"name": name, "value": val,
-                      "explanation": "%s win rate %.0f%% over %d trades." % (label, wr * 100, n)})
-        return val
-
-    total  = 0
-    total += _adj("historical_win_rate",
-                  stats.get("by_strategy", {}).get(se.get("active_key")), 10, "Strategy")
-    sess   = _learning_session_name()
-    total += _adj("session_performance",
-                  stats.get("by_session", {}).get(sess), 5, "Session " + sess)
-    reg    = se.get("market_regime")
-    total += _adj("market_type",
-                  stats.get("by_regime", {}).get(reg), 5, "Regime " + (reg or "?"))
-
+    # ── 1) CURRENT SETUP (the anchor) = base Edge Score + setup-grade tilt ───────
     grade  = ((result.get("pro_review") or {}).get("active") or {}).get("grade")
     g      = (grade or "").strip().upper()
     g_val  = (8 if g in ("A+", "S") else 4 if g == "A" else 0 if g in ("B", "") else
               -4 if g == "C" else -8)
-    comps.append({"name": "setup_grade", "value": g_val,
-                  "explanation": ("Setup grade %s." % grade) if grade else "Setup grade: n/a."})
-    total += g_val
+    current_setup = _clamp(base + g_val)
+    setup_expl = ("Base Edge %d%s." %
+                  (base, (" · grade %s (%+d)" % (grade, g_val)) if grade else ""))
 
-    delta = stats.get("recent_trend_delta")
-    if delta is None:
-        comps.append({"name": "recent_performance", "value": 0,
-                      "explanation": "Recent trend: insufficient data."})
-        t_val = 0
+    # ── 2) LIVE MARKET = volatility class + regime favourability (0..100) ───────
+    vol     = result.get("volatility") or {}
+    vlabel  = (vol.get("volatility_label") or "").strip().lower()
+    vstatus = (vol.get("status") or "").strip().lower()
+    live    = 50
+    if vlabel == "normal":      live += 15
+    elif vlabel == "extreme":   live -= 15
+    if vstatus == "ok":         live += 5
+    elif vstatus in ("caution", "block", "blocked", "halt"): live -= 10
+    se      = result.get("strategy_engine") or {}
+    reg_raw = (se.get("market_regime") or "").strip().lower()
+    if reg_raw:
+        if "trend" in reg_raw or "break" in reg_raw or "drive" in reg_raw: live += 5
+        elif "range" in reg_raw or "chop" in reg_raw:                      live -= 5
+    live = _clamp(live)
+    live_expl = ("Volatility %s · %s regime." %
+                 (vol.get("volatility_label") or "n/a", se.get("market_regime") or "n/a"))
+
+    # ── 3) AI REASONING = Analyst confidence (fallback: grade-mapped) ───────────
+    analyst = result.get("analyst") or {}
+    if analyst.get("reviewed") and analyst.get("stronger_side") not in (None, "Neither"):
+        ai = _clamp(analyst.get("confidence") or 0)
+        ai_expl = "Analyst confidence %d%% (%s)." % (ai, analyst.get("final_verdict") or "—")
     else:
-        t_val = 5 if delta > 0.10 else -5 if delta < -0.10 else 0
-        comps.append({"name": "recent_performance", "value": t_val,
-                      "explanation": "Recent vs prior avg R delta %+.2f." % delta})
-    total += t_val
+        ai = (85 if g in ("A+", "S") else 72 if g == "A" else 55 if g in ("B", "") else
+              40 if g == "C" else 30)
+        ai_expl = "No analyst read — grade-mapped (%s)." % (grade or "n/a")
+    ai = _clamp(ai)
 
-    final = max(0, min(100, base + total))
+    # ── 4) HISTORICAL = SHARED Trade-Memory weighted win rate ───────────────────
+    if memory_ctx.get("ready") and memory_ctx.get("weighted_win_rate") is not None:
+        hist = _clamp(memory_ctx["weighted_win_rate"] * 100)
+        hist_expl = ("%.0f%% weighted win over %d similar (eff %s)." %
+                     (memory_ctx["weighted_win_rate"] * 100, memory_ctx.get("matched") or 0,
+                      memory_ctx.get("effective_sample")))
+    else:
+        hist = 50
+        hist_expl = memory_ctx.get("reason") or "Awaiting comparable history."
+
+    # ── Blend: anchor + capped nudges from the other three lenses ───────────────
+    def _nudge(score, cap):
+        return int(round(max(-cap, min(cap, (score - 50) / 50.0 * cap))))
+    live_nudge = _nudge(live, GOV_LIVE_CAP)
+    ai_nudge   = _nudge(ai,   GOV_AI_CAP)
+    hist_nudge = _nudge(hist, GOV_HIST_CAP)
+
+    current_confidence = _clamp(current_setup + live_nudge + ai_nudge)
+    final = _clamp(current_confidence + hist_nudge)
+    # NON-DOMINATION FLOOR: a strong current+live+AI setup is NEVER dragged below the
+    # READY threshold by weak history alone.
+    if current_confidence >= thr:
+        final = max(final, thr)
+    total = final - base
+
+    confidence_components = [
+        {"name": "current_setup", "label": "Current setup", "score": current_setup,
+         "nudge": None,       "explanation": setup_expl},
+        {"name": "live_market",  "label": "Live market",   "score": live,
+         "nudge": live_nudge, "explanation": live_expl},
+        {"name": "ai_reasoning", "label": "AI reasoning",  "score": ai,
+         "nudge": ai_nudge,   "explanation": ai_expl},
+        {"name": "historical",   "label": "Historical",    "score": hist,
+         "nudge": hist_nudge, "explanation": hist_expl},
+    ]
+    # Legacy `components` list (signed adjustments) kept for back-compat with any
+    # older consumer of the prior schema.
+    components = [
+        {"name": "setup_grade",        "value": g_val,
+         "explanation": ("Setup grade %s." % grade) if grade else "Setup grade: n/a."},
+        {"name": "live_market",        "value": live_nudge, "explanation": live_expl},
+        {"name": "ai_reasoning",       "value": ai_nudge,   "explanation": ai_expl},
+        {"name": "historical_win_rate","value": hist_nudge, "explanation": hist_expl},
+    ]
+
     return {
         "ready": True,
         "base_edge_score": base,
         "final_confidence_score": final,
+        "current_confidence_score": current_confidence,
         "total_adjustment": total,
-        "components": comps,
+        "components": components,
+        "confidence_components": confidence_components,
         "threshold": thr,
         "below_threshold": final < thr,
         "eligible_actionable": eligible,
-        # T004: a veto WOULD fire (if the demotion flag is armed) when the setup is
-        # actionable but the explained final confidence is below the READY threshold.
-        # Computed regardless of the flag (display intent); only ACTED ON by the
-        # flag-gated demotion hook in full_analysis (mirrors the analyst/debate veto).
-        "veto_would_fire": bool(eligible and final < thr),
+        # A veto WOULD fire (if armed) only when the setup is actionable AND the
+        # blended final is below threshold AND the current+live+AI confidence is
+        # ALSO weak — so history alone can NEVER trip it (non-domination). Acted on
+        # only by the flag-gated demotion hook in full_analysis.
+        "veto_would_fire": bool(eligible and final < thr and current_confidence < thr),
         "demotion_reason": None,
         "gate_enabled": _learning_gate_enabled(),
-        "trade_count": int(stats.get("trade_count") or 0),
-        "last_refreshed_at": stats.get("last_refreshed_at"),
+        "trade_count": int(memory_ctx.get("trade_count") or stats.get("trade_count") or 0),
+        "last_refreshed_at": memory_ctx.get("last_refreshed_at") or stats.get("last_refreshed_at"),
+        "historical_signal": memory_ctx,
         "reason": None,
     }
 
@@ -9038,85 +9361,49 @@ def _memory_neutral_block(reason="No comparable trade history yet."):
     }
 
 
-def compute_trade_memory(result, ticker=None):
-    """Professional Memory Engine: in-memory similar-trades lookup over the
-    MEMORY_TRADES cache (warmed at recompute; NEVER queries the DB here). Requires a
-    same-instrument + same-direction core match, then scores optional dimensions
-    (regime / session / volatility / entry-efficiency band / strategy / CVD bias) and
-    summarizes the outcomes of the close matches (score >= 3). DISPLAY-ONLY (T003).
-    The caller wraps this -> _memory_neutral_block (fail-open)."""
-    with LEARNING_LOCK:
-        trades    = list(MEMORY_TRADES)
-        refreshed = GOVERNOR_STATS.get("last_refreshed_at")
-    if not trades:
-        return _memory_neutral_block("Awaiting trade history.")
-    se      = result.get("strategy_engine") or {}
-    sym     = instrument_of(ticker or result.get("active_ticker") or "") or ""
-    cur_dir = _norm_dir(result.get("strict_direction") or se.get("direction"))
-    if not sym or not cur_dir:
-        return _memory_neutral_block("Setup not directional yet.")
-    cur_reg   = se.get("market_regime")
-    cur_sess  = _learning_session_name()
-    cur_vol   = (result.get("volatility") or {}).get("volatility_label")
-    cur_strat = se.get("active_key")
-    cur_band  = _eff_band(((result.get("pro_review") or {}).get("active") or {}).get("entry_efficiency"))
-    cur_bias  = _norm_dir(result.get("cvd_direction"))
+def compute_trade_memory(result, ticker=None, memory_ctx=None):
+    """Trade Memory panel — PRESENTS the SHARED find_similar_trades context (the
+    SINGLE source of truth, also consumed by the governor + analyst) in this panel's
+    existing output schema. The context is computed once upstream and passed in; if
+    absent (older callers / tests) it is recomputed here. DISPLAY-ONLY; FAIL-OPEN."""
+    if memory_ctx is None:
+        try:
+            memory_ctx = find_similar_trades(result, ticker)
+        except Exception:
+            memory_ctx = _similar_neutral_block()
+    ctx = memory_ctx or _similar_neutral_block()
+    if not ctx.get("ready"):
+        blk = _memory_neutral_block(ctx.get("reason") or "Awaiting trade history.")
+        blk["similar_trades_found"] = ctx.get("matched") or 0
+        blk["trade_count"]          = ctx.get("trade_count") or 0
+        blk["last_refreshed_at"]    = ctx.get("last_refreshed_at")
+        blk["matched_on"]           = ctx.get("matched_on") or []
+        return blk
 
-    matched = []
-    for t in trades:
-        if (t.get("symbol") or "") != sym:
-            continue
-        if _norm_dir(t.get("direction")) != cur_dir:
-            continue
-        score = 0
-        if cur_reg  and t.get("regime") == cur_reg:                              score += 1
-        if cur_sess and t.get("session") == cur_sess:                            score += 1
-        if cur_vol  and t.get("volatility_type") == cur_vol:                     score += 1
-        if cur_strat and t.get("strategy_key") == cur_strat:                     score += 1
-        if cur_band is not None and _eff_band(t.get("entry_efficiency")) == cur_band: score += 1
-        if cur_bias and t.get("bias") == cur_bias:                               score += 1
-        if score >= 3:
-            matched.append(t)
-    if not matched:
-        return _memory_neutral_block("No closely-comparable trades in memory.")
-
-    n    = len(matched)
-    wins = sum(1 for t in matched if (t.get("result") or "") == "Win")
-
-    def _avg(key):
-        vals = [t.get(key) for t in matched if t.get(key) is not None]
-        return round(sum(vals) / len(vals), 2) if vals else None
-
-    win_rate = round(wins / n, 3)
-    losers   = [t for t in matched if (t.get("result") or "") != "Win"]
-    tag_counts = {}
-    for t in losers:
-        tg = t.get("outcome_tag")
-        if tg:
-            tag_counts[tg] = tag_counts.get(tg, 0) + 1
-    top_tag       = max(tag_counts, key=tag_counts.get) if tag_counts else None
-    failure_label = OUTCOME_TAG_LABELS.get(top_tag, top_tag) if top_tag else None
-
-    if win_rate >= 0.60:
-        rec = "History favors this setup (%.0f%% win across %d similar)." % (win_rate * 100, n)
-    elif win_rate <= 0.40:
-        rec = "History warns: similar setups mostly lost (%.0f%% win across %d)." % (win_rate * 100, n)
+    wr = ctx.get("weighted_win_rate")
+    n  = ctx.get("matched") or 0
+    if wr is not None and wr >= 0.60:
+        rec = "History favors this setup (%.0f%% weighted win across %d similar)." % (wr * 100, n)
+    elif wr is not None and wr <= 0.40:
+        rec = "History warns: similar setups mostly lost (%.0f%% weighted win across %d)." % (wr * 100, n)
+    elif wr is not None:
+        rec = "Mixed history (%.0f%% weighted win across %d similar)." % (wr * 100, n)
     else:
-        rec = "Mixed history (%.0f%% win across %d similar)." % (win_rate * 100, n)
+        rec = "Comparable history found (%d similar)." % n
 
     return {
         "ready": True,
         "similar_trades_found": n,
-        "similar_win_rate": win_rate,
-        "average_r": _avg("r_multiple"),
-        "average_mfe": _avg("mfe_r"),
-        "average_mae": _avg("mae_r"),
-        "average_hold_time": _avg("hold_minutes"),
-        "most_common_failure": failure_label,
+        "similar_win_rate": wr,
+        "average_r": ctx.get("weighted_avg_r"),
+        "average_mfe": ctx.get("weighted_avg_mfe"),
+        "average_mae": ctx.get("weighted_avg_mae"),
+        "average_hold_time": ctx.get("weighted_avg_hold"),
+        "most_common_failure": ctx.get("top_failure_label"),
         "memory_recommendation": rec,
-        "matched_on": ["symbol", "direction"],
-        "trade_count": len(trades),
-        "last_refreshed_at": refreshed,
+        "matched_on": ctx.get("matched_on") or [],
+        "trade_count": ctx.get("trade_count") or 0,
+        "last_refreshed_at": ctx.get("last_refreshed_at"),
         "reason": None,
     }
 
@@ -9404,6 +9691,7 @@ def _analyst_neutral_block(reason="Analyst engine unavailable.", verdict="NO TRA
         "what_needs_next":        [],
         "agrees_with_gate":       False,
         "veto_would_fire":        False,
+        "memory_review":          build_analyst_memory_review(None),
     }
 
 
@@ -9759,6 +10047,8 @@ def compute_analyst_reasoning(result, strict, swing_ctx=None, market=None):
         "what_needs_next":        what_needs_next,
         "agrees_with_gate":       agrees,
         "veto_would_fire":        veto_would_fire,
+        # Placeholder; full_analysis overwrites this with the SHARED memory review.
+        "memory_review":          build_analyst_memory_review(None),
     }
 
 
@@ -11117,14 +11407,31 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # Computed on the ASSEMBLED result AFTER pro_review/trade_debate so grade /
     # entry-efficiency / strategy_engine are populated. Strictly FAIL-OPEN (neutral
     # block on any error) and mutate NOTHING — the flag-gated demotion is T004.
+    # SHARED Trade Memory — computed ONCE here (after pro_review / trade_debate so the
+    # grade is available) and fed to BOTH the governor and the memory panel AND the
+    # analyst, so all three read IDENTICAL historical data (single source of truth).
     try:
-        result["confidence_governor"] = compute_confidence_governor(result, active_ticker)
+        _memory_ctx = find_similar_trades(result, active_ticker)
+    except Exception:
+        _memory_ctx = _similar_neutral_block()
+    result["trade_memory_context"] = _memory_ctx
+    try:
+        result["confidence_governor"] = compute_confidence_governor(
+            result, active_ticker, memory_ctx=_memory_ctx)
     except Exception:
         result["confidence_governor"] = _governor_neutral_block(result)
     try:
-        result["trade_memory"] = compute_trade_memory(result, active_ticker)
+        result["trade_memory"] = compute_trade_memory(
+            result, active_ticker, memory_ctx=_memory_ctx)
     except Exception:
         result["trade_memory"] = _memory_neutral_block()
+    # Analyst (AI Reasoning) consumes the SAME shared memory to answer the trader's
+    # six historical questions. DISPLAY-ONLY — never touches the analyst veto above.
+    try:
+        if isinstance(result.get("analyst"), dict):
+            result["analyst"]["memory_review"] = build_analyst_memory_review(_memory_ctx)
+    except Exception:
+        pass
 
     # ── Learning Engine demotion (flag-gated, default OFF — mirrors the analyst /
     #    pro-review / trade-debate vetoes). When ARMED, a Confidence-Governor final
@@ -18969,6 +19276,8 @@ def dashboard():
   <div class="se-reason" id="an-inval">—</div>
   <div class="se-bias-h">Recently Blocked by Advisor</div>
   <ul id="an-blocks" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="se-bias-h" style="margin-top:8px">Memory Review (similar past trades)</div>
+  <ul id="an-mem" style="margin:4px 0;padding-left:16px"></ul>
   <div id="an-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
@@ -20284,6 +20593,15 @@ function renderAnalystMode(d){
   _anFill('an-blocks', _blocks.map(function(b){
     return (b.time||'—')+' · '+(b.instrument||'?')+' · '+(b.reason||'—');
   }));
+  const mr=a.memory_review||{};
+  _anFill('an-mem', [
+    'Seen before? '+(mr.seen_before||'—'),
+    'What happened: '+(mr.what_happened||'—'),
+    'Best exit: '+(mr.best_exit||'—'),
+    'Winners held: '+(mr.winners_hold||'—'),
+    'Best stop: '+(mr.best_stop||'—'),
+    'Why similar failed: '+(mr.failure_cause||'—'),
+  ]);
   const foot=document.getElementById('an-foot');
   if(foot){
     const _smc=[];
@@ -20681,20 +20999,27 @@ function renderConfidenceGovernor(d){
   if (ae){ const t=g.total_adjustment||0; ae.textContent=(t>0?'+':'')+t;
            ae.style.color = t>0?'#22c55e':t<0?'#ef4444':'#6b7280'; }
   setT('cg-thr', g.threshold);
-  const comps=g.components||[];
+  const comps=g.confidence_components||[];
   setH('cg-comps', comps.length ? comps.map(function(c){
-    const v=c.value||0;
-    const vc = v>0?'#22c55e':v<0?'#ef4444':'#6b7280';
+    const sc=(c.score!=null)?c.score:'—';
+    const scc=(c.score!=null)?(c.score>=60?'#22c55e':c.score>=45?'#f59e0b':'#ef4444'):'#6b7280';
+    let tail='';
+    if(c.nudge!=null){
+      const nc=c.nudge>0?'#22c55e':c.nudge<0?'#ef4444':'#6b7280';
+      tail=' <span style="color:'+nc+'">('+(c.nudge>0?'+':'')+c.nudge+')</span>';
+    } else {
+      tail=' <span style="color:#6b7280">(anchor)</span>';
+    }
     return '<div class="le-row">'
-         + '<div class="nm">'+_modEsc(c.explanation||c.name)+'</div>'
-         + '<div class="st" style="color:'+vc+'">'+(v>0?'+':'')+v+'</div>'
+         + '<div class="nm"><b>'+_modEsc(c.label||c.name)+'</b> · '+_modEsc(c.explanation||'')+'</div>'
+         + '<div class="st" style="color:'+scc+'">'+sc+tail+'</div>'
          + '</div>';
-  }).join('') : '<div class="le-empty">No adjustments.</div>');
+  }).join('') : '<div class="le-empty">No components.</div>');
   const f=document.getElementById('cg-fid');
   if (f){
     let when='';
     try { if(g.last_refreshed_at) when=new Date(g.last_refreshed_at).toLocaleString(); } catch(e){}
-    f.textContent='Base Edge + explained historical adjustments (each bounded). Display-only — never changes the verdict'+(when?' · refreshed '+when:'')+'.';
+    f.textContent='Current setup anchors; Live market, AI reasoning & History each nudge within caps. Display-only — never changes the verdict'+(when?' · refreshed '+when:'')+'.';
   }
 }
 
