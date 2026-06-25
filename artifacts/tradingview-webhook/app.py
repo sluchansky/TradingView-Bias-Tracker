@@ -21763,6 +21763,7 @@ def dashboard():
   .mute-pill{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:12px;font-weight:600;padding:4px 12px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--green)}
   .mute-pill.is-muted{color:var(--red);border-color:var(--red);opacity:.9}
   .mute-pill.is-armed{color:#04110b;border-color:var(--green);background:var(--green);opacity:1}
+  .mute-pill.is-blocked{color:#fff;border-color:var(--red);background:var(--red);opacity:1}
   .focus-chip input{accent-color:var(--amber);cursor:pointer;width:15px;height:15px;margin:0}
   .focus-chip span{font-weight:600;letter-spacing:.5px}
   /* Direction toggle */
@@ -22114,6 +22115,19 @@ def dashboard():
     <span id="auto-MES" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MES');}">MES: off</span>
     <span id="auto-MYM" class="mute-pill" role="button" tabindex="0" onclick="toggleAuto('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAuto('MYM');}">MYM: off</span>
     <span id="auto-mode-lbl" class="focus-lbl" style="opacity:.6">off by default - resets on restart</span>
+  </div>
+  <!-- Per-asset EXECUTION kill switch (server-side, MONEY-PATH). emergencyDisabled
+       blocks ALL orders (manual + auto) for that instrument via execute_trade_gateway
+       and _maybe_auto_execute. MES/MYM ship DISABLED and re-seed to DISABLED on every
+       restart/republish (fail-safe). Clearing it here is the ONLY dashboard path to
+       let MES/MYM trade once Auto-trade is armed and a setup goes READY. -->
+  <div class="focus-row">
+    <span class="focus-lbl">Execution</span>
+    <span id="emg-MGC" class="mute-pill" role="button" tabindex="0" onclick="toggleEmergency('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEmergency('MGC');}">MGC: -</span>
+    <span id="emg-MNQ" class="mute-pill" role="button" tabindex="0" onclick="toggleEmergency('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEmergency('MNQ');}">MNQ: -</span>
+    <span id="emg-MES" class="mute-pill" role="button" tabindex="0" onclick="toggleEmergency('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEmergency('MES');}">MES: -</span>
+    <span id="emg-MYM" class="mute-pill" role="button" tabindex="0" onclick="toggleEmergency('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEmergency('MYM');}">MYM: -</span>
+    <span class="focus-lbl" style="opacity:.6">kill switch - MES/MYM ship disabled - resets on restart</span>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
@@ -23092,6 +23106,7 @@ function toggleMute(inst){
 
 let AUTO_STATE = { MGC:false, MNQ:false, MES:false, MYM:false };
 let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_live:false, is_live_instance:false, max_per_day:0, contracts:1 };
+let SAFETY_STATE = { MGC:{}, MNQ:{}, MES:{}, MYM:{} };  // per-asset safety snapshot from /auto-trade (incl. emergencyDisabled), painted by renderEmergencyUI()
 let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
 let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
 let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
@@ -23101,9 +23116,11 @@ async function loadAutoTrade(){
   try {
     const d = await api('/auto-trade');
     if (d && d.enabled) AUTO_STATE = d.enabled;
+    if (d && d.safety) SAFETY_STATE = d.safety;
     if (d && d.status === 'ok') AUTO_META = { execution_provider_label:d.execution_provider_label, execution_mode:d.execution_mode, execution_live:d.execution_live, is_live_instance:d.is_live_instance, max_per_day:d.max_per_day, contracts:d.contracts };
   } catch(e){}
   renderAutoUI();
+  renderEmergencyUI();
 }
 function renderAutoUI(){
   INSTRUMENTS.forEach(function(inst){
@@ -23146,6 +23163,36 @@ function toggleAuto(inst){
       toast(next ? (inst + ' AUTO-TRADE armed') : (inst + ' auto-trade off'));
     })
     .catch(function(){ AUTO_STATE[inst] = !next; renderAutoUI(); toast('Auto-trade update failed', false); });
+}
+
+function renderEmergencyUI(){
+  INSTRUMENTS.forEach(function(inst){
+    const el = document.getElementById('emg-'+inst);
+    if (!el) return;
+    const s = SAFETY_STATE && SAFETY_STATE[inst];
+    const disabled = !!(s && s.emergencyDisabled);
+    el.textContent = (disabled ? '\U0001F534 ' : '\U0001F7E2 ') + inst + (disabled ? ': DISABLED' : ': enabled');
+    el.classList.toggle('is-blocked', disabled);
+    el.setAttribute('aria-pressed', disabled ? 'true' : 'false');
+  });
+}
+function toggleEmergency(inst){
+  const cur = !!(SAFETY_STATE && SAFETY_STATE[inst] && SAFETY_STATE[inst].emergencyDisabled);
+  const next = !cur;   // next emergencyDisabled value (true = blocked)
+  if (!next){
+    // Clearing the kill switch ENABLES the money path for this instrument - confirm.
+    if (!confirm('Enable EXECUTION for ' + inst + '?\\n\\nThis clears the per-asset emergency stop. Once you also arm Auto-trade and a setup goes READY, real orders can be placed for ' + inst + '.\\n\\nMES/MYM ship disabled and reset to disabled on every restart.')) return;
+  }
+  if (!SAFETY_STATE[inst]) SAFETY_STATE[inst] = {};
+  SAFETY_STATE[inst].emergencyDisabled = next; renderEmergencyUI();
+  api('/auto-trade', { instrument: inst, emergencyDisabled: next })
+    .then(function(d){
+      if (!d || d.status !== 'ok'){ SAFETY_STATE[inst].emergencyDisabled = cur; renderEmergencyUI(); toast('Execution update failed', false); return; }
+      if (d.safety) SAFETY_STATE = d.safety;
+      renderEmergencyUI();
+      toast(next ? (inst + ' EXECUTION disabled') : (inst + ' execution enabled'));
+    })
+    .catch(function(){ if (SAFETY_STATE[inst]) SAFETY_STATE[inst].emergencyDisabled = cur; renderEmergencyUI(); toast('Execution update failed', false); });
 }
 
 function renderAdvisorUI(){
