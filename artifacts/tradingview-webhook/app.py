@@ -801,6 +801,36 @@ def set_trade_debate_gate(value):
     return _trade_debate_gate_enabled()
 
 
+# ── Learning Engine demotion gate (Confidence Governor display ON always; the
+#    money-path VETO is OFF by default). Mirrors _trade_debate_gate: a runtime
+#    dashboard toggle wins over the env seed and RESETS to None on restart
+#    (fail-safe toward NOT interfering with live trading after a republish). When
+#    ON, it can ONLY DEMOTE an actionable gate verdict to WAIT (final confidence
+#    below the READY threshold) — never promote / force a trade / change geometry.
+_LEARNING_GATE_OVERRIDE = None   # runtime dashboard toggle; None = follow env
+
+
+def _learning_gate_enabled():
+    """Learning-demotion money-path VETO — OFF by default. When ON, a READY/EARLY
+    verdict whose Confidence-Governor final score is below the READY threshold is
+    demoted to WAIT. The runtime dashboard toggle (_LEARNING_GATE_OVERRIDE) wins
+    over the env seed so live trading stays byte-identical until the operator arms
+    it."""
+    if _LEARNING_GATE_OVERRIDE is not None:
+        return bool(_LEARNING_GATE_OVERRIDE)
+    return os.environ.get("LEARNING_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_learning_gate(value):
+    """Runtime override for the Learning-demotion VETO (dashboard toggle). Passing
+    None restores env-seed behaviour. RESETS to None on restart (the module global
+    re-initialises), keeping the fail-safe bias toward NOT interfering with live
+    trading after a republish."""
+    global _LEARNING_GATE_OVERRIDE
+    _LEARNING_GATE_OVERRIDE = None if value is None else bool(value)
+    return _learning_gate_enabled()
+
+
 # ── Verdict helpers (explicit — NEVER substring / endswith matching) ───────────
 # EARLY READY (SCALP Edge 50-59) is actionable but lower-conviction (half size)
 # than a full READY (Edge >= 60). Both end in the word "READY", so verdict.endswith(
@@ -7277,6 +7307,9 @@ LEARNING_LOCK          = threading.Lock()          # guards the in-memory caches
 LEARNING_RECOMPUTE_LOCK = threading.Lock()         # serializes recomputes so a slow run can't overwrite a newer cache
 LEARNING_MIN_SAMPLE    = 20                         # min closed trades before history weights a strategy
 LEARNING_RECALC_EVERY  = 20                         # recompute analytics every N closed trades
+REPORT_EVERY           = 25                         # generate a performance report every N closed trades (separate cadence from the weight recompute)
+LEARNING_REPORT_LOCK   = threading.Lock()          # guards LAST_PERFORMANCE_REPORT
+LAST_PERFORMANCE_REPORT = None                     # in-memory cache of the latest performance report (display-only)
 LEARNING_WEIGHT_FLOOR  = 0.65                       # weights nudge but NEVER disable a strategy
 LEARNING_WEIGHT_CEIL   = 1.35
 LEARNING_CONF_ADJ_CAP  = 15                         # max ± confidence points history may move
@@ -7285,6 +7318,11 @@ LAST_STRATEGY_SNAPSHOT_BY_INST = {}                 # inst -> entry-context snap
 STRATEGY_WEIGHTS       = {}                         # strategy_key -> weight (float)
 LEARNING_SAMPLE_BY_KEY = {}                         # strategy_key -> closed-trade count (int)
 LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total_trades": 0}
+# Learning Engine v2 (display-only) in-memory caches, warmed by _recompute_learning
+# (boot + every Nth close) under LEARNING_LOCK; NEVER read via per-request SQL.
+GOVERNOR_STATS         = {"ready": False, "trade_count": 0, "last_refreshed_at": None}  # historical aggregates for the Confidence Governor
+MEMORY_TRADES          = []                         # capped rolling list of recent closed trades for the Professional Memory Engine
+MEMORY_TRADES_MAX      = 300                        # cap on the in-memory similar-trades cache
 
 # Opening-range + Opening-Drive window (Eastern Time, decimal hours).
 OPENING_RANGE_START_ET      = 8.0    # OR builds from 08:00 ET
@@ -7978,6 +8016,23 @@ def _update_learning_snapshot(result, ticker_override=None):
         inst = instrument_of(ticker_override or result.get("active_ticker") or "")
         if not inst:
             return
+        # Pro-Review-derived entry-quality fields (display-only): fold the active
+        # model's grade / entry-efficiency / momentum into the entry snapshot so a
+        # closed trade can be tagged with its setup quality at registration.
+        # pro_review is already on `result` at the full_analysis capture site.
+        # Fail-open -> None / generic.
+        _pr      = result.get("pro_review") or {}
+        _pr_act  = _pr.get("active") or {}
+        _pr_mods = _pr.get("models") or {}
+        _vol     = result.get("volatility") or {}
+        _eb      = result.get("edge_breakdown") or {}
+        try:
+            _ereasons = [r for r in (_eb.get("reasons") or []) if r][:2]
+        except Exception:
+            _ereasons = []
+        _entry_reason = (" · ".join(_ereasons) if _ereasons
+                         else ("%s %s" % (se.get("active_strategy") or "Setup",
+                                          se.get("direction") or "")).strip())
         snap = {
             "ts": now_utc().isoformat(),
             "price": result.get("current_price"),
@@ -7989,6 +8044,12 @@ def _update_learning_snapshot(result, ticker_override=None):
             "confidence": se.get("base_confidence", se.get("confidence")),
             "quality": se.get("quality"),
             "edge_score": result.get("edge_score"),
+            "entry_efficiency": _pr_act.get("entry_efficiency"),
+            "momentum_score":   _pr_act.get("momentum_score"),
+            "grade":            _pr_act.get("grade"),
+            "scalper_grade":    (_pr_mods.get("SCALP") or _pr_act).get("grade"),
+            "volatility_type":  _vol.get("volatility_label"),
+            "entry_reason":     _entry_reason,
             "indicators": {
                 "vwap_value":            result.get("vwap_value"),
                 "vwap_status":           result.get("vwap_status"),
@@ -8030,6 +8091,55 @@ def _capture_learning_ctx(instrument):
         return None
 
 
+def _derive_trade_outcome(mt, ctx):
+    """Descriptive post-trade narrative + a single category tag. DISPLAY-ONLY and
+    DERIVED (never fabricated) from the trade result + its captured entry context.
+    Feeds the performance report + memory engine + dashboard; it NEVER reaches the
+    live gate unless the learning-demotion flag is explicitly armed (and even then
+    only via aggregate cached stats, never a one-trade anecdote). Fail-open ->
+    ('Outcome recorded.', 'normal')."""
+    try:
+        outcome = (mt.get("outcome") or "").strip()
+        ctx     = ctx or {}
+        if not outcome:
+            # Unknown/blank outcome -> stay neutral, never fabricate a loss.
+            return ("Outcome recorded.", "normal")
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+        r     = _f(mt.get("r_multiple")) or 0.0
+        mfe_r = _f(mt.get("mfe_r")) or 0.0
+        eff   = ctx.get("entry_efficiency")
+        try:
+            eff = int(eff) if eff is not None else None
+        except Exception:
+            eff = None
+        edge  = _f(ctx.get("edge_score"))
+        is_win = "Win" in outcome
+        if is_win:
+            if r >= 1.5 and (eff is None or eff >= 65):
+                return ("Clean win (+%.2fR) from an efficient entry — setup performed as modeled." % r,
+                        "strong_execution")
+            return ("Win booked (+%.2fR)." % r, "normal_win")
+        if outcome == "Breakeven":
+            return ("Scratched at breakeven — thesis neither confirmed nor invalidated.", "breakeven")
+        # Treat anything else (Loss / partial-then-stop loss) as a loss.
+        if mfe_r >= 0.8:
+            return ("Ran +%.2fR favorable before reversing to a loss — exit/management timing, not the entry." % mfe_r,
+                    "exit_timing")
+        if edge is not None and edge < 50:
+            return ("Loss on a thin-edge setup (edge %.0f) — low conviction at entry." % edge, "low_edge")
+        if eff is not None and eff < 50:
+            return ("Loss after a low-efficiency entry (eff %d) — likely chased / poor location." % eff,
+                    "chased_poor_entry")
+        return ("Loss with little favorable movement (MFE %.2fR) — thesis wrong from the start." % mfe_r,
+                "normal_loss")
+    except Exception:
+        return ("Outcome recorded.", "normal")
+
+
 def _record_strategy_trade(mt):
     """Persist one CLOSED managed trade for adaptive analytics. FAIL-OPEN and
     idempotent (managed_key UNIQUE + ON CONFLICT DO NOTHING so an idempotent
@@ -8064,6 +8174,29 @@ def _record_strategy_trade(mt):
             conf = int(round(float(conf))) if conf is not None else None
         except Exception:
             conf = None
+        # ── Enriched learning fields (display-only; all nullable / fail-open) ──
+        try:
+            dow = opened_dt.astimezone(ET_TZ).weekday() if opened_dt else None
+        except Exception:
+            dow = None
+        def _lnum(v):
+            try:
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+        mfe_r      = _lnum(mt.get("mfe_r"))
+        mae_r      = _lnum(mt.get("mae_r"))
+        exit_price = _lnum(mt.get("exit_price"))
+        _entry_px  = _lnum(mt.get("entry"))
+        _filled_px = _lnum(mt.get("filled_entry") or mt.get("fill_price"))
+        # Slippage is honest: only computed when a real broker fill price exists
+        # (none flows back today), else NULL. Never fabricated.
+        slippage   = (round(_filled_px - _entry_px, 4)
+                      if (_filled_px is not None and _entry_px is not None) else None)
+        try:
+            outcome_reason, outcome_tag = _derive_trade_outcome(mt, ctx)
+        except Exception:
+            outcome_reason, outcome_tag = None, None
         row = (
             managed_key,
             mt.get("journal_id"),
@@ -8086,6 +8219,19 @@ def _record_strategy_trade(mt):
             ctx.get("edge_score"),
             STRATEGY_ENGINE_MODE,
             psycopg2.extras.Json(ind),
+            ctx.get("entry_efficiency"),
+            ctx.get("momentum_score"),
+            ctx.get("grade"),
+            ctx.get("scalper_grade"),
+            mfe_r,
+            mae_r,
+            slippage,
+            exit_price,
+            ctx.get("entry_reason"),
+            outcome_reason,
+            outcome_tag,
+            dow,
+            ctx.get("volatility_type"),
         )
         conn = _learning_conn()
         if conn is None:
@@ -8097,8 +8243,12 @@ def _record_strategy_trade(mt):
                        (managed_key, journal_id, opened_at, closed_at, symbol,
                         strategy_key, strategy, market_regime, session, direction,
                         entry, stop, target, result, r_multiple, hold_minutes,
-                        confidence, quality, edge_score, mode, indicators)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        confidence, quality, edge_score, mode, indicators,
+                        entry_efficiency, momentum_score, grade, scalper_grade,
+                        mfe_r, mae_r, slippage, exit_price, entry_reason,
+                        outcome_reason, outcome_tag, day_of_week, volatility_type)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (managed_key) DO NOTHING
                    RETURNING id""",
                 row,
@@ -8108,6 +8258,7 @@ def _record_strategy_trade(mt):
             logger.info("strategy_trades recorded: %s %s %s (%sR)",
                         row[4], row[6], row[13], row[14])
             _maybe_recompute_learning()
+            _maybe_generate_learning_report()
     except Exception as exc:
         logger.warning("record_strategy_trade failed: %s", exc)
     finally:
@@ -8148,7 +8299,7 @@ def _recompute_learning():
     """Recompute per-strategy analytics + bounded weights from strategy_trades and
     swap the in-memory caches atomically. Also persists strategy_weights for
     continuity/inspection. FAIL-OPEN; runs at startup and every Nth close."""
-    global LEARNING_ANALYTICS
+    global LEARNING_ANALYTICS, GOVERNOR_STATS
     if not LEARNING_DB_ENABLED:
         return
     # Serialize: hold this across the whole read→compute→swap so an older/slower
@@ -8208,6 +8359,35 @@ def _recompute_learning():
             FROM recent
         """)
         trend_row = cur.fetchone() or {}
+        # ── Learning Engine v2 (display-only) aggregates: overall + by-session +
+        # a capped recent-trades cache. Same connection/cursor; fail-open with the
+        # rest of recompute. by-session uses the persisted ET 'session' label.
+        cur.execute("""
+            SELECT count(*) AS n,
+                   avg((result='Win')::int::float) AS win_rate
+            FROM strategy_trades WHERE result IS NOT NULL
+        """)
+        overall_row = cur.fetchone() or {}
+        cur.execute("""
+            SELECT session,
+                   count(*) AS n,
+                   avg((result='Win')::int::float) AS win_rate,
+                   avg(r_multiple) AS avg_r
+            FROM strategy_trades
+            WHERE session IS NOT NULL AND result IS NOT NULL
+            GROUP BY session
+        """)
+        session_rows = cur.fetchall()
+        cur.execute("""
+            SELECT symbol, direction, market_regime, session, volatility_type,
+                   entry_efficiency, strategy_key, strategy, result, r_multiple,
+                   mfe_r, mae_r, hold_minutes, outcome_tag, edge_score, indicators
+            FROM strategy_trades
+            WHERE closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT %s
+        """, (MEMORY_TRADES_MAX,))
+        mem_rows = cur.fetchall()
         cur.close()
 
         def _f(v, d=0.0):
@@ -8215,6 +8395,12 @@ def _recompute_learning():
                 return float(v) if v is not None else d
             except Exception:
                 return d
+
+        def _nf(v):
+            try:
+                return float(v) if v is not None else None
+            except Exception:
+                return None
 
         new_weights, new_samples, ranking = {}, {}, []
         for r in strat_rows:
@@ -8300,10 +8486,53 @@ def _recompute_learning():
         except Exception as exc:
             logger.debug("strategy_weights upsert skip: %s", exc)
 
+        # ── Learning Engine v2 (display-only) caches: governor aggregates + memory ──
+        gov_by_strategy = {r["strategy_key"]: {"n": int(r["n"] or 0), "win_rate": _f(r["win_rate"])}
+                           for r in strat_rows if r.get("strategy_key")}
+        gov_by_session  = {r["session"]: {"n": int(r["n"] or 0), "win_rate": _f(r["win_rate"])}
+                           for r in session_rows if r.get("session")}
+        gov_by_regime   = {r["regime"]: {"n": int(r["n"] or 0), "win_rate": _f(r["win_rate"])}
+                           for r in regime_rows if r.get("regime")}
+        _overall_n = int(overall_row.get("n") or 0)
+        governor_stats = {
+            "ready": _overall_n > 0,
+            "trade_count": _overall_n,
+            "overall_win_rate": _f(overall_row.get("win_rate")),
+            "by_strategy": gov_by_strategy,
+            "by_session": gov_by_session,
+            "by_regime": gov_by_regime,
+            "recent_trend_delta": trend["delta"],
+            "min_sample": LEARNING_MIN_SAMPLE,
+            "last_refreshed_at": now_utc().isoformat(),
+        }
+        mem_cache = []
+        for r in (mem_rows or []):
+            ind = r.get("indicators") or {}
+            mem_cache.append({
+                "symbol":           instrument_of(r.get("symbol") or "") or (r.get("symbol") or ""),
+                "direction":        r.get("direction"),
+                "regime":           r.get("market_regime"),
+                "session":          r.get("session"),
+                "volatility_type":  r.get("volatility_type"),
+                "entry_efficiency": _nf(r.get("entry_efficiency")),
+                "strategy_key":     r.get("strategy_key"),
+                "strategy":         r.get("strategy"),
+                "result":           r.get("result"),
+                "r_multiple":       _nf(r.get("r_multiple")),
+                "mfe_r":            _nf(r.get("mfe_r")),
+                "mae_r":            _nf(r.get("mae_r")),
+                "hold_minutes":     _nf(r.get("hold_minutes")),
+                "outcome_tag":      r.get("outcome_tag"),
+                "edge_score":       r.get("edge_score"),
+                "bias":             _norm_dir(ind.get("cvd_direction")),
+            })
+
         with LEARNING_LOCK:
             STRATEGY_WEIGHTS.clear();        STRATEGY_WEIGHTS.update(new_weights)
             LEARNING_SAMPLE_BY_KEY.clear();  LEARNING_SAMPLE_BY_KEY.update(new_samples)
             LEARNING_ANALYTICS = analytics
+            GOVERNOR_STATS = governor_stats
+            MEMORY_TRADES[:] = mem_cache
         logger.info("learning analytics recomputed: %s trades across %s strategies",
                     total, len(ranking))
     except Exception as exc:
@@ -8317,6 +8546,297 @@ def _recompute_learning():
         LEARNING_RECOMPUTE_LOCK.release()
 
 
+OUTCOME_TAG_LABELS = {
+    "strong_execution":  "Strong execution",
+    "normal_win":        "Standard win",
+    "breakeven":         "Breakeven scratch",
+    "exit_timing":       "Exit / management timing",
+    "low_edge":          "Thin-edge entries",
+    "chased_poor_entry": "Chased / poor location",
+    "normal_loss":       "Wrong-thesis loss",
+    "normal":            "Uncategorized",
+}
+
+
+def _report_post_discord(report):
+    """Post a compact performance-report summary to the live Discord channel. Gated
+    to the live instance (dev shares the secret and must never post). Fail-open."""
+    if not DISCORD_LIVE_ENABLED or not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        o    = report.get("overall") or {}
+        bs   = report.get("best_session") or {}
+        ws   = report.get("worst_session") or {}
+        cm   = report.get("common_mistake") or {}
+        recs = report.get("recommendations") or []
+        lines = [
+            "\U0001F4CA **Performance Report** — %d closed trades (%s)" % (
+                report.get("trade_count") or 0, report.get("mode") or "—"),
+            "Win rate %.0f%% · avg %s%.2fR · PF %.2f" % (
+                (o.get("win_rate") or 0) * 100,
+                "+" if (o.get("avg_r") or 0) >= 0 else "", o.get("avg_r") or 0,
+                o.get("profit_factor") or 0),
+        ]
+        if bs.get("session"):
+            lines.append("Best window: %s (%+.2fR) · Worst: %s (%+.2fR)" % (
+                bs.get("session"), bs.get("avg_r") or 0,
+                (ws.get("session") if ws else "—") or "—", (ws.get("avg_r") if ws else 0) or 0))
+        if cm.get("label"):
+            lines.append("Most common mistake: %s ×%d" % (cm.get("label"), cm.get("n") or 0))
+        for rec in recs[:3]:
+            lines.append("• " + rec)
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": "\n".join(lines)}, timeout=8)
+    except Exception as exc:
+        logger.debug("performance report discord skip: %s", exc)
+
+
+def _generate_learning_report(trade_count):
+    """Build + cache + persist a performance report every REPORT_EVERY closed trades.
+    DISPLAY-ONLY: aggregates real strategy_trades rows into best/worst session·
+    strategy·regime, hold-time splits, the most-profitable entry-efficiency band,
+    the most common mistake (top loser outcome_tag), winners-vs-losers average edge,
+    and rule-based recommendations. Separate from the weight recompute. FAIL-OPEN."""
+    global LAST_PERFORMANCE_REPORT
+    if not LEARNING_DB_ENABLED:
+        return None
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return None
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        def _f(v, d=0.0):
+            try:
+                return float(v) if v is not None else d
+            except Exception:
+                return d
+
+        cur.execute("""
+            SELECT count(*) n,
+                   avg((result='Win')::int::float) win_rate,
+                   avg(r_multiple) avg_r,
+                   sum(CASE WHEN r_multiple>0 THEN r_multiple ELSE 0 END)  gw,
+                   sum(CASE WHEN r_multiple<0 THEN -r_multiple ELSE 0 END) gl
+            FROM strategy_trades WHERE r_multiple IS NOT NULL
+        """)
+        o = cur.fetchone() or {}
+        gw, gl = _f(o.get("gw")), _f(o.get("gl"))
+        pf = (gw / gl) if gl > 0 else (3.0 if gw > 0 else 0.0)
+        overall = {
+            "n": int(o.get("n") or 0),
+            "win_rate": round(_f(o.get("win_rate")), 4),
+            "avg_r": round(_f(o.get("avg_r")), 2),
+            "profit_factor": round(min(pf, 3.0), 2),
+        }
+
+        def _dim(col):
+            # `col` is a hardcoded literal (never user input) -> safe to inline.
+            sql = ("SELECT {c} AS k, count(*) n, "
+                   "avg((result='Win')::int::float) win_rate, avg(r_multiple) avg_r "
+                   "FROM strategy_trades "
+                   "WHERE {c} IS NOT NULL AND r_multiple IS NOT NULL "
+                   "GROUP BY {c} ORDER BY avg_r DESC NULLS LAST").format(c=col)
+            cur.execute(sql)
+            return [{"k": r["k"], "n": int(r["n"]),
+                     "win_rate": round(_f(r["win_rate"]), 4),
+                     "avg_r": round(_f(r["avg_r"]), 2)} for r in cur.fetchall()]
+
+        def _bestworst(rows, label_key):
+            qual = [r for r in rows if r["n"] >= 1]
+            if not qual:
+                return None, None
+            b = qual[0]
+            best = {label_key: b["k"], "n": b["n"], "win_rate": b["win_rate"], "avg_r": b["avg_r"]}
+            worst = None
+            if len(qual) > 1:
+                w = qual[-1]
+                worst = {label_key: w["k"], "n": w["n"], "win_rate": w["win_rate"], "avg_r": w["avg_r"]}
+            return best, worst
+
+        best_session,  worst_session  = _bestworst(_dim("session"), "session")
+        best_strategy, worst_strategy = _bestworst(_dim("strategy"), "strategy")
+        best_regime,   worst_regime   = _bestworst(_dim("market_regime"), "regime")
+
+        cur.execute("""
+            SELECT avg(hold_minutes)                                  all_h,
+                   avg(hold_minutes) FILTER (WHERE result='Win')      win_h,
+                   avg(hold_minutes) FILTER (WHERE result='Loss')     loss_h
+            FROM strategy_trades WHERE hold_minutes IS NOT NULL
+        """)
+        h = cur.fetchone() or {}
+        avg_hold = {"all": round(_f(h.get("all_h")), 1),
+                    "win": round(_f(h.get("win_h")), 1),
+                    "loss": round(_f(h.get("loss_h")), 1)}
+
+        cur.execute("""
+            SELECT width_bucket(entry_efficiency, 0, 100, 5) b,
+                   count(*) n, avg((result='Win')::int::float) win_rate, avg(r_multiple) avg_r
+            FROM strategy_trades WHERE entry_efficiency IS NOT NULL AND r_multiple IS NOT NULL
+            GROUP BY b ORDER BY avg_r DESC NULLS LAST
+        """)
+        eff_rows = cur.fetchall()
+        best_eff = None
+        if eff_rows:
+            b  = eff_rows[0]
+            bi = int(b["b"] or 0)
+            lo = max(0, (bi - 1) * 20)
+            hi = min(100, bi * 20)
+            best_eff = {"range": "%d–%d" % (lo, hi), "n": int(b["n"]),
+                        "win_rate": round(_f(b["win_rate"]), 4),
+                        "avg_r": round(_f(b["avg_r"]), 2)}
+
+        cur.execute("""
+            SELECT outcome_tag, count(*) n FROM strategy_trades
+            WHERE result='Loss' AND outcome_tag IS NOT NULL
+            GROUP BY outcome_tag ORDER BY n DESC LIMIT 1
+        """)
+        cmrow = cur.fetchone()
+        common_mistake = None
+        if cmrow and cmrow.get("outcome_tag"):
+            common_mistake = {"tag": cmrow["outcome_tag"],
+                              "label": OUTCOME_TAG_LABELS.get(cmrow["outcome_tag"], cmrow["outcome_tag"]),
+                              "n": int(cmrow["n"])}
+
+        cur.execute("""
+            SELECT avg(edge_score) FILTER (WHERE result='Win')  ws,
+                   avg(edge_score) FILTER (WHERE result='Loss') ls
+            FROM strategy_trades WHERE edge_score IS NOT NULL
+        """)
+        sc = cur.fetchone() or {}
+        avg_score = {
+            "winners": round(_f(sc.get("ws")), 1) if sc.get("ws") is not None else None,
+            "losers":  round(_f(sc.get("ls")), 1) if sc.get("ls") is not None else None,
+        }
+        cur.close()
+
+        # ── rule-based recommendations (each guarded; never fabricated) ──
+        recs = []
+        if best_session and worst_session and (best_session["avg_r"] - worst_session["avg_r"]) >= 0.5:
+            recs.append("Trade more in %s (%+.2fR) and less in %s (%+.2fR)." % (
+                best_session["session"], best_session["avg_r"],
+                worst_session["session"], worst_session["avg_r"]))
+        if common_mistake:
+            tag = common_mistake["tag"]
+            if tag == "exit_timing":
+                recs.append("Most losses ran favorable first — tighten trail / exit management.")
+            elif tag == "chased_poor_entry":
+                recs.append("Most losses came from low-efficiency entries — wait for better location.")
+            elif tag == "low_edge":
+                recs.append("Most losses were thin-edge — raise the minimum edge you act on.")
+            elif tag == "normal_loss":
+                recs.append("Most losses were wrong from the start — demand stronger confirmation before entry.")
+        if best_eff:
+            recs.append("Entries with efficiency %s perform best (%+.2fR) — be patient for that zone." % (
+                best_eff["range"], best_eff["avg_r"]))
+        if (avg_score.get("winners") is not None and avg_score.get("losers") is not None
+                and (avg_score["winners"] - avg_score["losers"]) >= 8):
+            recs.append("Winners average %.0f edge vs %.0f for losers — a higher edge floor would help." % (
+                avg_score["winners"], avg_score["losers"]))
+        if best_strategy and worst_strategy and best_strategy["strategy"] != worst_strategy["strategy"]:
+            recs.append("%s is your strongest setup; %s is the weakest — weight accordingly." % (
+                best_strategy["strategy"], worst_strategy["strategy"]))
+        if not recs:
+            recs.append("Not enough signal yet — keep logging trades for sharper guidance.")
+
+        report = {
+            "generated_at": now_utc().isoformat(),
+            "trade_count": int(trade_count),
+            "window": REPORT_EVERY,
+            "mode": STRATEGY_ENGINE_MODE,
+            "overall": overall,
+            "best_session": best_session, "worst_session": worst_session,
+            "best_strategy": best_strategy, "worst_strategy": worst_strategy,
+            "best_regime": best_regime, "worst_regime": worst_regime,
+            "avg_hold": avg_hold,
+            "best_efficiency_range": best_eff,
+            "common_mistake": common_mistake,
+            "avg_score": avg_score,
+            "recommendations": recs,
+        }
+
+        try:
+            wconn = _learning_conn()
+            if wconn is not None:
+                with wconn.cursor() as wc:
+                    wc.execute(
+                        "INSERT INTO performance_reports (trade_count, mode, report) VALUES (%s,%s,%s)",
+                        (int(trade_count), STRATEGY_ENGINE_MODE, psycopg2.extras.Json(report)))
+                wconn.close()
+        except Exception as exc:
+            logger.debug("performance_reports persist skip: %s", exc)
+
+        with LEARNING_REPORT_LOCK:
+            LAST_PERFORMANCE_REPORT = report
+        logger.info("performance report generated at %d trades (%d recommendations)",
+                    int(trade_count), len(recs))
+        _report_post_discord(report)
+        return report
+    except Exception as exc:
+        logger.warning("generate_learning_report failed: %s", exc)
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _maybe_generate_learning_report():
+    """Fire a performance report every REPORT_EVERY closed trades on a background
+    thread (separate cadence from the weight recompute). FAIL-OPEN."""
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM strategy_trades")
+            n = cur.fetchone()[0]
+        if n and n % REPORT_EVERY == 0:
+            threading.Thread(target=_generate_learning_report, args=(n,),
+                             name="learning-report", daemon=True).start()
+    except Exception as exc:
+        logger.debug("learning report trigger skip: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _load_last_report():
+    """Warm LAST_PERFORMANCE_REPORT from the newest persisted row at boot so a
+    restart shows the last report instead of an empty panel. FAIL-OPEN."""
+    global LAST_PERFORMANCE_REPORT
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT report FROM performance_reports ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        if row and row.get("report"):
+            with LEARNING_REPORT_LOCK:
+                LAST_PERFORMANCE_REPORT = row["report"]
+    except Exception as exc:
+        logger.debug("load_last_report skip: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _learning_engine_view():
     """Snapshot of the cached analytics for /status + the dashboard (never per-request
     SQL). Returns a disabled stub when learning is off."""
@@ -8324,7 +8844,281 @@ def _learning_engine_view():
         return {"enabled": False, "ready": False, "total_trades": 0,
                 "reason": "No database configured."}
     with LEARNING_LOCK:
-        return dict(LEARNING_ANALYTICS)
+        out = dict(LEARNING_ANALYTICS)
+    with LEARNING_REPORT_LOCK:
+        out["report"] = dict(LAST_PERFORMANCE_REPORT) if LAST_PERFORMANCE_REPORT else None
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Learning Engine v2 — Confidence Governor + Professional Memory Engine.
+# Both are DISPLAY-ONLY in T003: they read the in-memory caches warmed by
+# _recompute_learning (NEVER per-request SQL), are strictly FAIL-OPEN (the caller
+# wraps them and falls back to a neutral block), and NEVER mutate the verdict /
+# trade_plan / decision_support. The flag-gated demotion that consumes the
+# governor's finalConfidenceScore is added in T004; the T004-readiness fields
+# (threshold / below_threshold / eligible_actionable / veto_would_fire /
+# demotion_reason) are present now but inert.
+# ════════════════════════════════════════════════════════════════════════════
+def _norm_dir(token):
+    """Coarse Long/Short normaliser ('long'/'short'/None) for a direction or a
+    CVD/bias token. No-data -> None so a missing dimension simply doesn't match."""
+    t = (token or "").strip().lower()
+    if not t:
+        return None
+    if "long" in t or "bull" in t or "buy" in t or t in ("up", "l", "positive", "+"):
+        return "long"
+    if "short" in t or "bear" in t or "sell" in t or t in ("down", "s", "negative", "-"):
+        return "short"
+    return None
+
+
+def _eff_band(v):
+    """Bucket an entry-efficiency value into 'low'/'mid'/'high' (scale-agnostic:
+    values <=1 are treated as a 0..1 fraction). None when absent."""
+    try:
+        if v is None:
+            return None
+        x = float(v)
+        if x <= 1.0:
+            x *= 100.0
+        if x < 40:
+            return "low"
+        if x < 70:
+            return "mid"
+        return "high"
+    except Exception:
+        return None
+
+
+def _governor_neutral_block(result=None, reason="Insufficient history."):
+    """Neutral Confidence-Governor block: finalConfidenceScore == base Edge Score
+    (no adjustments), nothing actionable. Used on fail-open + market-closed."""
+    try:
+        base = int(round(float((result or {}).get("edge_score") or 0)))
+    except Exception:
+        base = 0
+    try:
+        thr = int(cfg("EDGE_READY_THRESHOLD"))
+    except Exception:
+        thr = 50
+    return {
+        "ready": False,
+        "base_edge_score": base,
+        "final_confidence_score": base,
+        "total_adjustment": 0,
+        "components": [],
+        "threshold": thr,
+        "below_threshold": base < thr,
+        "eligible_actionable": False,
+        "veto_would_fire": False,
+        "demotion_reason": None,
+        "gate_enabled": _learning_gate_enabled(),
+        "trade_count": 0,
+        "last_refreshed_at": None,
+        "reason": reason,
+    }
+
+
+def compute_confidence_governor(result, ticker=None):
+    """Transparent confidence score: base Edge Score + bounded, EXPLAINED historical
+    adjustments (each 0 when under-sampled / no data). Reads RAW historical win-rates
+    from the in-memory GOVERNOR_STATS cache + the CURRENT setup's grade — NEVER the
+    ±15 strategy weight folded into strategy_engine.base_confidence, so there is no
+    double-count. NEVER queries the DB. DISPLAY-ONLY (T003). The caller wraps this in
+    try/except -> _governor_neutral_block (fail-open)."""
+    with LEARNING_LOCK:
+        stats = dict(GOVERNOR_STATS)
+    try:
+        thr = int(cfg("EDGE_READY_THRESHOLD"))
+    except Exception:
+        thr = 50
+    try:
+        base = int(round(float(result.get("edge_score") or 0)))
+    except Exception:
+        base = 0
+    try:
+        eligible = bool(is_actionable(result.get("verdict")))
+    except Exception:
+        eligible = False
+    if not stats.get("ready"):
+        blk = _governor_neutral_block(result, reason="Awaiting trade history.")
+        blk["eligible_actionable"] = eligible
+        return blk
+
+    se     = result.get("strategy_engine") or {}
+    min_n  = int(stats.get("min_sample") or LEARNING_MIN_SAMPLE)
+    comps  = []
+
+    def _adj(name, blk, pts, label):
+        """Bounded ±pts adjustment from a {n, win_rate} block; 0 when under-sampled."""
+        if not blk:
+            comps.append({"name": name, "value": 0, "explanation": "%s: no history." % label})
+            return 0
+        n = int(blk.get("n") or 0)
+        if n < min_n:
+            comps.append({"name": name, "value": 0,
+                          "explanation": "%s: only %d trades (<%d) — no adjustment." % (label, n, min_n)})
+            return 0
+        wr     = float(blk.get("win_rate") or 0.0)
+        scaled = max(-1.0, min(1.0, (wr - 0.5) / 0.5))
+        val    = int(round(scaled * pts))
+        comps.append({"name": name, "value": val,
+                      "explanation": "%s win rate %.0f%% over %d trades." % (label, wr * 100, n)})
+        return val
+
+    total  = 0
+    total += _adj("historical_win_rate",
+                  stats.get("by_strategy", {}).get(se.get("active_key")), 10, "Strategy")
+    sess   = _learning_session_name()
+    total += _adj("session_performance",
+                  stats.get("by_session", {}).get(sess), 5, "Session " + sess)
+    reg    = se.get("market_regime")
+    total += _adj("market_type",
+                  stats.get("by_regime", {}).get(reg), 5, "Regime " + (reg or "?"))
+
+    grade  = ((result.get("pro_review") or {}).get("active") or {}).get("grade")
+    g      = (grade or "").strip().upper()
+    g_val  = (8 if g in ("A+", "S") else 4 if g == "A" else 0 if g in ("B", "") else
+              -4 if g == "C" else -8)
+    comps.append({"name": "setup_grade", "value": g_val,
+                  "explanation": ("Setup grade %s." % grade) if grade else "Setup grade: n/a."})
+    total += g_val
+
+    delta = stats.get("recent_trend_delta")
+    if delta is None:
+        comps.append({"name": "recent_performance", "value": 0,
+                      "explanation": "Recent trend: insufficient data."})
+        t_val = 0
+    else:
+        t_val = 5 if delta > 0.10 else -5 if delta < -0.10 else 0
+        comps.append({"name": "recent_performance", "value": t_val,
+                      "explanation": "Recent vs prior avg R delta %+.2f." % delta})
+    total += t_val
+
+    final = max(0, min(100, base + total))
+    return {
+        "ready": True,
+        "base_edge_score": base,
+        "final_confidence_score": final,
+        "total_adjustment": total,
+        "components": comps,
+        "threshold": thr,
+        "below_threshold": final < thr,
+        "eligible_actionable": eligible,
+        # T004: a veto WOULD fire (if the demotion flag is armed) when the setup is
+        # actionable but the explained final confidence is below the READY threshold.
+        # Computed regardless of the flag (display intent); only ACTED ON by the
+        # flag-gated demotion hook in full_analysis (mirrors the analyst/debate veto).
+        "veto_would_fire": bool(eligible and final < thr),
+        "demotion_reason": None,
+        "gate_enabled": _learning_gate_enabled(),
+        "trade_count": int(stats.get("trade_count") or 0),
+        "last_refreshed_at": stats.get("last_refreshed_at"),
+        "reason": None,
+    }
+
+
+def _memory_neutral_block(reason="No comparable trade history yet."):
+    """Neutral Professional-Memory block (no matches / fail-open)."""
+    return {
+        "ready": False,
+        "similar_trades_found": 0,
+        "similar_win_rate": None,
+        "average_r": None,
+        "average_mfe": None,
+        "average_mae": None,
+        "average_hold_time": None,
+        "most_common_failure": None,
+        "memory_recommendation": reason,
+        "matched_on": [],
+        "trade_count": 0,
+        "last_refreshed_at": None,
+        "reason": reason,
+    }
+
+
+def compute_trade_memory(result, ticker=None):
+    """Professional Memory Engine: in-memory similar-trades lookup over the
+    MEMORY_TRADES cache (warmed at recompute; NEVER queries the DB here). Requires a
+    same-instrument + same-direction core match, then scores optional dimensions
+    (regime / session / volatility / entry-efficiency band / strategy / CVD bias) and
+    summarizes the outcomes of the close matches (score >= 3). DISPLAY-ONLY (T003).
+    The caller wraps this -> _memory_neutral_block (fail-open)."""
+    with LEARNING_LOCK:
+        trades    = list(MEMORY_TRADES)
+        refreshed = GOVERNOR_STATS.get("last_refreshed_at")
+    if not trades:
+        return _memory_neutral_block("Awaiting trade history.")
+    se      = result.get("strategy_engine") or {}
+    sym     = instrument_of(ticker or result.get("active_ticker") or "") or ""
+    cur_dir = _norm_dir(result.get("strict_direction") or se.get("direction"))
+    if not sym or not cur_dir:
+        return _memory_neutral_block("Setup not directional yet.")
+    cur_reg   = se.get("market_regime")
+    cur_sess  = _learning_session_name()
+    cur_vol   = (result.get("volatility") or {}).get("volatility_label")
+    cur_strat = se.get("active_key")
+    cur_band  = _eff_band(((result.get("pro_review") or {}).get("active") or {}).get("entry_efficiency"))
+    cur_bias  = _norm_dir(result.get("cvd_direction"))
+
+    matched = []
+    for t in trades:
+        if (t.get("symbol") or "") != sym:
+            continue
+        if _norm_dir(t.get("direction")) != cur_dir:
+            continue
+        score = 0
+        if cur_reg  and t.get("regime") == cur_reg:                              score += 1
+        if cur_sess and t.get("session") == cur_sess:                            score += 1
+        if cur_vol  and t.get("volatility_type") == cur_vol:                     score += 1
+        if cur_strat and t.get("strategy_key") == cur_strat:                     score += 1
+        if cur_band is not None and _eff_band(t.get("entry_efficiency")) == cur_band: score += 1
+        if cur_bias and t.get("bias") == cur_bias:                               score += 1
+        if score >= 3:
+            matched.append(t)
+    if not matched:
+        return _memory_neutral_block("No closely-comparable trades in memory.")
+
+    n    = len(matched)
+    wins = sum(1 for t in matched if (t.get("result") or "") == "Win")
+
+    def _avg(key):
+        vals = [t.get(key) for t in matched if t.get(key) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    win_rate = round(wins / n, 3)
+    losers   = [t for t in matched if (t.get("result") or "") != "Win"]
+    tag_counts = {}
+    for t in losers:
+        tg = t.get("outcome_tag")
+        if tg:
+            tag_counts[tg] = tag_counts.get(tg, 0) + 1
+    top_tag       = max(tag_counts, key=tag_counts.get) if tag_counts else None
+    failure_label = OUTCOME_TAG_LABELS.get(top_tag, top_tag) if top_tag else None
+
+    if win_rate >= 0.60:
+        rec = "History favors this setup (%.0f%% win across %d similar)." % (win_rate * 100, n)
+    elif win_rate <= 0.40:
+        rec = "History warns: similar setups mostly lost (%.0f%% win across %d)." % (win_rate * 100, n)
+    else:
+        rec = "Mixed history (%.0f%% win across %d similar)." % (win_rate * 100, n)
+
+    return {
+        "ready": True,
+        "similar_trades_found": n,
+        "similar_win_rate": win_rate,
+        "average_r": _avg("r_multiple"),
+        "average_mfe": _avg("mfe_r"),
+        "average_mae": _avg("mae_r"),
+        "average_hold_time": _avg("hold_minutes"),
+        "most_common_failure": failure_label,
+        "memory_recommendation": rec,
+        "matched_on": ["symbol", "direction"],
+        "trade_count": len(trades),
+        "last_refreshed_at": refreshed,
+        "reason": None,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -10318,6 +11112,59 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             # it so every display surface agrees with the demoted WAIT verdict.
             result["decision_support"] = _decision_support(result)
             result["trade_debate"]["judge"]["final_verdict"] = "WAIT"
+
+    # ── Learning Engine v2 (display-only): Confidence Governor + Trade Memory.
+    # Computed on the ASSEMBLED result AFTER pro_review/trade_debate so grade /
+    # entry-efficiency / strategy_engine are populated. Strictly FAIL-OPEN (neutral
+    # block on any error) and mutate NOTHING — the flag-gated demotion is T004.
+    try:
+        result["confidence_governor"] = compute_confidence_governor(result, active_ticker)
+    except Exception:
+        result["confidence_governor"] = _governor_neutral_block(result)
+    try:
+        result["trade_memory"] = compute_trade_memory(result, active_ticker)
+    except Exception:
+        result["trade_memory"] = _memory_neutral_block()
+
+    # ── Learning Engine demotion (flag-gated, default OFF — mirrors the analyst /
+    #    pro-review / trade-debate vetoes). When ARMED, a Confidence-Governor final
+    #    score below the READY threshold DEMOTES an actionable gate verdict to WAIT
+    #    (it can NEVER promote / force a trade / change geometry). The neutral /
+    #    fail-open / market-closed governor block sets veto_would_fire=False so it can
+    #    NEVER demote when there is no history or the market is closed. Guarded by
+    #    market["open"] so it never touches the closed-override verdict below. ──────
+    _cg = result.get("confidence_governor") or {}
+    if (market["open"] and _learning_gate_enabled() and _cg.get("veto_would_fire")
+            and is_actionable(result["verdict"])):
+        _lr_reason = ("Learning veto: final confidence %d below the %d READY "
+                      "threshold (historical edge for this setup is weak)." % (
+                          int(_cg.get("final_confidence_score") or 0),
+                          int(_cg.get("threshold") or 0)))
+        result["verdict"]       = "WAIT"
+        result["strict_label"]  = "WAIT"
+        result["strict_reason"] = _lr_reason
+        result["trade_plan"]    = {
+            "trade_plan": False, "reason": _lr_reason,
+            "entry_zone": None, "stop_loss": None,
+            "target1":    None, "target2":   None,
+            "rr":         None, "direction": result.get("strict_direction"),
+            "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+        }
+        for _vd in ("Long", "Short"):
+            _vblk = (result.get("directions") or {}).get(_vd)
+            if _vblk:
+                _vblk.update(ready=False, label="WAIT")
+        _ad = result.get("alert_diagnostics") or {}
+        _ad["ready_reason"]     = ""
+        _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Learning veto"]
+        result["alert_diagnostics"] = _ad
+        # Decision-support was computed earlier from the pre-veto plan — recompute
+        # it so every display surface agrees with the demoted WAIT verdict.
+        result["decision_support"] = _decision_support(result)
+        result["confidence_governor"]["demotion_reason"] = _lr_reason
+        logger.info("LEARNING VETO fired for %s: final=%s thr=%s — verdict -> WAIT",
+                    active_ticker, _cg.get("final_confidence_score"), _cg.get("threshold"))
+
     if not market["open"]:
         result["verdict"]         = "MARKET CLOSED"
         # strict_label is the JOURNALING label and must stay in
@@ -10407,6 +11254,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["pro_review"]         = _pro_review_neutral_block(
             "Market closed — live alerts paused.", inst=active_ticker)
         result["trade_debate"]       = _trade_debate_neutral_block(
+            "Market closed — live alerts paused.")
+        result["confidence_governor"] = _governor_neutral_block(
+            result, reason="Market closed — live alerts paused.")
+        result["trade_memory"]        = _memory_neutral_block(
             "Market closed — live alerts paused.")
         for _d in ("Long", "Short"):
             _blk = result["directions"].get(_d)
@@ -13375,6 +14226,11 @@ def _build_card_entry(a, ticker=None, record=None):
     # onto the card entry so the live card / journal mirror the dashboard. Defensive
     # .get → absent on a bare/legacy `a` (field simply omitted).
     entry["trade_debate"] = a.get("trade_debate")
+    # Learning Engine v2 (display-only): carry the Confidence Governor + Trade Memory
+    # blocks onto the card entry so the live card / journal mirror the dashboard.
+    # Defensive .get → absent on a bare/legacy `a` (field simply omitted).
+    entry["confidence_governor"] = a.get("confidence_governor")
+    entry["trade_memory"] = a.get("trade_memory")
     # SWING (flag-on) only: carry the P4-computed HTF context onto the entry so the
     # managed-trade register can build a per-trade thesis WITHOUT recomputing it
     # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
@@ -16638,6 +17494,8 @@ def status():
         "analyst":             a.get("analyst"),
         "pro_review":          a.get("pro_review"),
         "trade_debate":        a.get("trade_debate"),
+        "confidence_governor": a.get("confidence_governor"),
+        "trade_memory":        a.get("trade_memory"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -18268,6 +19126,79 @@ def dashboard():
   <div class="le-fid" id="le-fid"></div>
 </div>
 
+<!-- Performance Report — every-25-trades review + auto-recommendations (display-only) -->
+<div class="mod" id="mod-report">
+  <div class="mod-h">📊 Performance Report <span id="pr-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="le-top">
+    <div class="gstat"><div class="l">Win Rate</div><div class="v" id="pr-wr">—</div></div>
+    <div class="gstat"><div class="l">Avg R</div><div class="v" id="pr-avgr">—</div></div>
+    <div class="gstat"><div class="l">Profit Factor</div><div class="v" id="pr-pf">—</div></div>
+    <div class="gstat"><div class="l">Avg Hold</div><div class="v" id="pr-hold">—</div></div>
+  </div>
+  <div class="le-grid">
+    <div>
+      <div class="le-sub">Best / Worst Session</div>
+      <div class="le-list" id="pr-session"></div>
+    </div>
+    <div>
+      <div class="le-sub">Best / Worst Strategy</div>
+      <div class="le-list" id="pr-strategy"></div>
+    </div>
+  </div>
+  <div class="le-grid">
+    <div>
+      <div class="le-sub">Most Common Mistake</div>
+      <div class="le-list" id="pr-mistake"></div>
+    </div>
+    <div>
+      <div class="le-sub">Best Entry Efficiency</div>
+      <div class="le-list" id="pr-eff"></div>
+    </div>
+  </div>
+  <div class="le-sub">Recommendations</div>
+  <div class="le-rank" id="pr-recs"></div>
+  <div class="le-fid" id="pr-fid"></div>
+</div>
+
+<!-- Confidence Governor — transparent Edge→confidence breakdown (DISPLAY-ONLY) -->
+<div class="mod" id="mod-governor">
+  <div class="mod-h">🎯 Confidence Governor <span id="cg-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span id="cg-gate-toggle" role="button" tabindex="0" onclick="toggleLearningGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Demote: off</span></div>
+  <div class="le-top">
+    <div class="gstat"><div class="l">Base Edge</div><div class="v" id="cg-base">—</div></div>
+    <div class="gstat"><div class="l">Final Confidence</div><div class="v" id="cg-final">—</div></div>
+    <div class="gstat"><div class="l">Net Adjust</div><div class="v" id="cg-adj">—</div></div>
+    <div class="gstat"><div class="l">Threshold</div><div class="v" id="cg-thr">—</div></div>
+  </div>
+  <div class="le-sub">Adjustment Breakdown</div>
+  <div class="le-rank" id="cg-comps"></div>
+  <div class="le-fid" id="cg-demote" style="color:#ef4444"></div>
+  <div class="le-fid" id="cg-fid"></div>
+</div>
+
+<!-- Professional Memory — similar-trades lookup over recent closed trades (DISPLAY-ONLY) -->
+<div class="mod" id="mod-memory">
+  <div class="mod-h">🧩 Trade Memory <span id="tm-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="le-top">
+    <div class="gstat"><div class="l">Similar Trades</div><div class="v" id="tm-n">—</div></div>
+    <div class="gstat"><div class="l">Win Rate</div><div class="v" id="tm-wr">—</div></div>
+    <div class="gstat"><div class="l">Avg R</div><div class="v" id="tm-avgr">—</div></div>
+    <div class="gstat"><div class="l">Avg Hold</div><div class="v" id="tm-hold">—</div></div>
+  </div>
+  <div class="le-grid">
+    <div>
+      <div class="le-sub">Excursions (Avg)</div>
+      <div class="le-list" id="tm-exc"></div>
+    </div>
+    <div>
+      <div class="le-sub">Most Common Failure</div>
+      <div class="le-list" id="tm-fail"></div>
+    </div>
+  </div>
+  <div class="le-sub">Memory Read</div>
+  <div class="le-rank" id="tm-rec"></div>
+  <div class="le-fid" id="tm-fid"></div>
+</div>
+
 <!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
 <div class="mod" id="mod-equity">
   <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
@@ -18594,6 +19525,7 @@ let AUTO_META  = { execution_provider_label:'', execution_mode:'', execution_liv
 let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
 let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
 let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
+let LEARNING_GATE_STATE = false;  // Learning-demotion money-path veto, painted by renderConfidenceGovernor() from /status
 async function loadAutoTrade(){
   try {
     const d = await api('/auto-trade');
@@ -19212,6 +20144,15 @@ function renderModules(d){
   // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
   renderLearningEngine(d);
 
+  // ── Module 8b: Performance report (every-25-trades review) — display-only ──
+  renderPerformanceReport(d);
+
+  // ── Module 8c: Confidence Governor (transparent Edge→confidence) — display-only ──
+  renderConfidenceGovernor(d);
+
+  // ── Module 8d: Trade Memory (similar-trades lookup) — display-only ──
+  renderTradeMemory(d);
+
   // ── Module 9: Equity curve (today) — display-only, real closed trades ──
   renderEquityCurve(d);
 
@@ -19612,6 +20553,190 @@ function renderLearningEngine(d){
   const f=document.getElementById('le-fid');
   if (f) f.textContent = 'Recomputed every '+(le.min_sample||20)
        +' closed trades · weights bounded ×0.65–×1.35, never disable a strategy.';
+}
+
+// Performance Report panel — fed by d.learning_engine.report (generated every 25
+// closed trades; display-only). Awaiting state until the first report exists.
+function renderPerformanceReport(d){
+  const le  = (d && d.learning_engine) || null;
+  const rep = (le && le.report) || null;
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
+  const metaEl = document.getElementById('pr-meta');
+  if (!rep){
+    if (metaEl) metaEl.textContent = (le && le.enabled===false) ? '· OFFLINE' : '· AWAITING 25 TRADES';
+    setT('pr-wr','—'); setT('pr-avgr','—'); setT('pr-pf','—'); setT('pr-hold','—');
+    setH('pr-session',''); setH('pr-strategy',''); setH('pr-mistake',''); setH('pr-eff','');
+    setH('pr-recs','<div class="le-empty">First report generates at 25 closed trades.</div>');
+    const f0=document.getElementById('pr-fid'); if(f0) f0.textContent='';
+    return;
+  }
+  const o = rep.overall || {};
+  if (metaEl) metaEl.textContent = '· ' + (rep.trade_count||0) + ' TRADES';
+  const wr = (o.win_rate!=null) ? Math.round(o.win_rate*100) : null;
+  setT('pr-wr', wr!=null ? wr+'%' : '—');
+  const we=document.getElementById('pr-wr'); if(we && wr!=null) we.style.color=_leColor(wr);
+  setT('pr-avgr', o.avg_r!=null ? (o.avg_r>=0?'+':'')+o.avg_r+'R' : '—');
+  setT('pr-pf', o.profit_factor!=null ? o.profit_factor : '—');
+  const ah = rep.avg_hold || {};
+  setT('pr-hold', ah.all!=null ? ah.all+'m' : '—');
+
+  const liR = function(arrow, name, wrate, avgr, n){
+    return '<div class="le-li"><span>'+arrow+' '+_modEsc(name)+'</span>'
+         + '<span style="color:'+_leColor((wrate||0)*100)+'">'
+         + ((avgr>=0?'+':'')+avgr)+'R · '+n+'t</span></div>';
+  };
+
+  const bs=rep.best_session, ws=rep.worst_session;
+  let sH='';
+  if (bs) sH += liR('▲', bs.session, bs.win_rate, bs.avg_r, bs.n);
+  if (ws) sH += liR('▼', ws.session, ws.win_rate, ws.avg_r, ws.n);
+  setH('pr-session', sH || '<div class="le-empty">—</div>');
+
+  const bst=rep.best_strategy, wst=rep.worst_strategy;
+  let stH='';
+  if (bst) stH += liR('▲', bst.strategy, bst.win_rate, bst.avg_r, bst.n);
+  if (wst) stH += liR('▼', wst.strategy, wst.win_rate, wst.avg_r, wst.n);
+  setH('pr-strategy', stH || '<div class="le-empty">—</div>');
+
+  const cm=rep.common_mistake;
+  setH('pr-mistake', cm
+    ? '<div class="le-li"><span>'+_modEsc(cm.label)+'</span><span style="color:#ef4444">×'+cm.n+'</span></div>'
+    : '<div class="le-empty">—</div>');
+
+  const be=rep.best_efficiency_range, sc=rep.avg_score||{};
+  let eH='';
+  if (be) eH += '<div class="le-li"><span>Eff '+_modEsc(be.range)+'</span>'
+             + '<span style="color:'+_leColor((be.win_rate||0)*100)+'">'+(be.avg_r>=0?'+':'')+be.avg_r+'R</span></div>';
+  if (sc.winners!=null && sc.losers!=null)
+    eH += '<div class="le-li"><span>Edge W/L</span><span>'+sc.winners+' / '+sc.losers+'</span></div>';
+  setH('pr-eff', eH || '<div class="le-empty">—</div>');
+
+  const recs=rep.recommendations||[];
+  setH('pr-recs', recs.length
+    ? recs.map(function(r){ return '<div class="le-row"><div class="nm">• '+_modEsc(r)+'</div></div>'; }).join('')
+    : '<div class="le-empty">—</div>');
+
+  const f=document.getElementById('pr-fid');
+  if (f){
+    let when='';
+    try { when = new Date(rep.generated_at).toLocaleString(); } catch(e){}
+    f.textContent = 'Auto-generated every '+(rep.window||25)+' closed trades'+(when?' · last '+when:'')+'.';
+  }
+}
+
+// Learning-demotion VETO toggle (mirrors the Trade Debate veto). DISPLAY-ONLY until
+// armed; when ARMED the Confidence Governor demotes an actionable setup to WAIT if its
+// final confidence is below the READY threshold (it can NEVER force a trade). Painted
+// in both the awaiting and ready branches so the toggle is always operable.
+function _paintLearnGate(g){
+  LEARNING_GATE_STATE = !!(g && g.gate_enabled);
+  const gt=document.getElementById('cg-gate-toggle');
+  if(gt){ gt.textContent=LEARNING_GATE_STATE?'Demote: ARMED':'Demote: off';
+          gt.style.color=LEARNING_GATE_STATE?'#ef4444':'#9aa';
+          gt.style.borderColor=LEARNING_GATE_STATE?'#ef4444':'var(--border)'; }
+  const de=document.getElementById('cg-demote');
+  if(de){ de.textContent=(g && g.demotion_reason) ? ('⛔ '+g.demotion_reason) : ''; }
+}
+function toggleLearningGate(){
+  const cur=!!LEARNING_GATE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm the Learning demotion VETO?\\n\\nWhile ARMED, the Confidence Governor can DEMOTE an actionable setup to WAIT when its final confidence (Edge + historical adjustments) is below the READY threshold (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
+  LEARNING_GATE_STATE=next;
+  const gt=document.getElementById('cg-gate-toggle');
+  if(gt){ gt.textContent=next?'Demote: ARMED':'Demote: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  api('/learning', { gate_enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); return; }
+      LEARNING_GATE_STATE=!!d.gate_enabled;
+      toast(LEARNING_GATE_STATE ? 'Learning VETO ARMED — may demote to WAIT' : 'Learning veto off');
+    })
+    .catch(function(){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); });
+}
+// Confidence Governor panel — fed by d.confidence_governor (base Edge Score + bounded,
+// explained historical adjustments => final confidence). DISPLAY-ONLY unless the
+// Learning demotion VETO above is armed. Awaiting state until trade history exists.
+function renderConfidenceGovernor(d){
+  const g = (d && d.confidence_governor) || null;
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
+  const metaEl = document.getElementById('cg-meta');
+  _paintLearnGate(g);
+  if (!g || !g.ready){
+    if (metaEl) metaEl.textContent = (g && g.reason && g.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· AWAITING TRADES';
+    setT('cg-base', (g && g.base_edge_score!=null) ? g.base_edge_score : '—');
+    setT('cg-final', (g && g.final_confidence_score!=null) ? g.final_confidence_score : '—');
+    setT('cg-adj','—');
+    setT('cg-thr', (g && g.threshold!=null) ? g.threshold : '—');
+    setH('cg-comps','<div class="le-empty">'+_modEsc((g && g.reason) || 'Awaiting trade history.')+'</div>');
+    const f0=document.getElementById('cg-fid'); if(f0) f0.textContent='Display-only — never changes the verdict.';
+    return;
+  }
+  if (metaEl) metaEl.textContent = '· '+(g.trade_count||0)+' TRADES';
+  setT('cg-base', g.base_edge_score);
+  const fe=document.getElementById('cg-final');
+  if (fe){ fe.textContent=g.final_confidence_score;
+           fe.style.color = g.final_confidence_score>=g.threshold ? '#22c55e' : '#f59e0b'; }
+  const ae=document.getElementById('cg-adj');
+  if (ae){ const t=g.total_adjustment||0; ae.textContent=(t>0?'+':'')+t;
+           ae.style.color = t>0?'#22c55e':t<0?'#ef4444':'#6b7280'; }
+  setT('cg-thr', g.threshold);
+  const comps=g.components||[];
+  setH('cg-comps', comps.length ? comps.map(function(c){
+    const v=c.value||0;
+    const vc = v>0?'#22c55e':v<0?'#ef4444':'#6b7280';
+    return '<div class="le-row">'
+         + '<div class="nm">'+_modEsc(c.explanation||c.name)+'</div>'
+         + '<div class="st" style="color:'+vc+'">'+(v>0?'+':'')+v+'</div>'
+         + '</div>';
+  }).join('') : '<div class="le-empty">No adjustments.</div>');
+  const f=document.getElementById('cg-fid');
+  if (f){
+    let when='';
+    try { if(g.last_refreshed_at) when=new Date(g.last_refreshed_at).toLocaleString(); } catch(e){}
+    f.textContent='Base Edge + explained historical adjustments (each bounded). Display-only — never changes the verdict'+(when?' · refreshed '+when:'')+'.';
+  }
+}
+
+// Trade Memory panel — fed by d.trade_memory (in-memory similar-trades lookup over recent
+// closed trades). DISPLAY-ONLY. Awaiting / no-match states are explicit.
+function renderTradeMemory(d){
+  const m = (d && d.trade_memory) || null;
+  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
+  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
+  const metaEl = document.getElementById('tm-meta');
+  if (!m || !m.ready){
+    if (metaEl) metaEl.textContent = (m && m.reason && m.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· NO MATCHES';
+    setT('tm-n', (m && m.similar_trades_found!=null) ? m.similar_trades_found : '0');
+    setT('tm-wr','—'); setT('tm-avgr','—'); setT('tm-hold','—');
+    setH('tm-exc',''); setH('tm-fail','');
+    setH('tm-rec','<div class="le-empty">'+_modEsc((m && (m.memory_recommendation||m.reason)) || 'Awaiting comparable history.')+'</div>');
+    const f0=document.getElementById('tm-fid'); if(f0) f0.textContent='Similar = same instrument + direction + ≥1 matching context. Display-only.';
+    return;
+  }
+  if (metaEl) metaEl.textContent = '· '+(m.trade_count||0)+' IN MEMORY';
+  setT('tm-n', m.similar_trades_found);
+  const wr = (m.similar_win_rate!=null) ? Math.round(m.similar_win_rate*100) : null;
+  setT('tm-wr', wr!=null ? wr+'%' : '—');
+  const we=document.getElementById('tm-wr'); if(we && wr!=null) we.style.color=_leColor(wr);
+  setT('tm-avgr', m.average_r!=null ? (m.average_r>=0?'+':'')+m.average_r+'R' : '—');
+  setT('tm-hold', m.average_hold_time!=null ? m.average_hold_time+'m' : '—');
+  let eH='';
+  if (m.average_mfe!=null) eH += '<div class="le-li"><span>Avg MFE</span><span style="color:#22c55e">'+(m.average_mfe>=0?'+':'')+m.average_mfe+'R</span></div>';
+  if (m.average_mae!=null) eH += '<div class="le-li"><span>Avg MAE</span><span style="color:#ef4444">'+m.average_mae+'R</span></div>';
+  setH('tm-exc', eH || '<div class="le-empty">—</div>');
+  setH('tm-fail', m.most_common_failure
+    ? '<div class="le-li"><span>'+_modEsc(m.most_common_failure)+'</span></div>'
+    : '<div class="le-empty">—</div>');
+  setH('tm-rec', m.memory_recommendation
+    ? '<div class="le-row"><div class="nm">• '+_modEsc(m.memory_recommendation)+'</div></div>'
+    : '<div class="le-empty">—</div>');
+  const f=document.getElementById('tm-fid');
+  if (f){
+    let when='';
+    try { if(m.last_refreshed_at) when=new Date(m.last_refreshed_at).toLocaleString(); } catch(e){}
+    f.textContent='Similar = same instrument + direction + ≥1 matching context. Display-only'+(when?' · refreshed '+when:'')+'.';
+  }
 }
 
 // Equity curve (today) — fed by d.equity_curve_today (cumulative R of trades
@@ -21294,6 +22419,43 @@ def trade_debate_controls():
     }), 200
 
 
+@app.route("/learning", methods=["GET", "POST"])
+def learning_controls():
+    """Read or set the Learning-demotion money-path VETO toggle. OFF by default;
+    when ARMED the Confidence Governor DEMOTES an actionable verdict to WAIT when its
+    final confidence (base Edge + bounded historical adjustments) is below the READY
+    threshold (it can never promote / force a trade). The runtime toggle wins over
+    the env seed and RESETS on restart (fail-safe toward NOT interfering). NEVER
+    affects manual ENTER, the base strict gate, scoring, or geometry. Owner-only
+    (Basic Auth + CSRF via the Express proxy; NOT in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "gate_enabled" in data:
+            # Money-path toggle: parse strictly so a stray JSON string ("false") can
+            # never arm the live veto (mirror of /trade-debate). Real booleans pass
+            # through; recognised string/number tokens map explicitly; anything
+            # ambiguous (null / "maybe" / {}) is IGNORED, leaving the gate unchanged.
+            _raw = data.get("gate_enabled")
+            _parsed = None
+            if isinstance(_raw, bool):
+                _parsed = _raw
+            elif isinstance(_raw, (int, float)):
+                _parsed = bool(_raw)
+            elif isinstance(_raw, str):
+                _s = _raw.strip().lower()
+                if _s in ("1", "true", "yes", "on"):
+                    _parsed = True
+                elif _s in ("0", "false", "no", "off"):
+                    _parsed = False
+            if _parsed is not None:
+                set_learning_gate(_parsed)
+                logger.info("LEARNING demotion VETO %s", "ARMED" if _learning_gate_enabled() else "OFF")
+    return jsonify({
+        "status":       "ok",
+        "gate_enabled": _learning_gate_enabled(),
+    }), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
@@ -21332,6 +22494,7 @@ if __name__ == "__main__":
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:
         threading.Thread(target=_recompute_learning, daemon=True).start()  # warm the learning cache from Postgres at boot (display-only)
+        threading.Thread(target=_load_last_report, daemon=True).start()    # warm the last performance report from Postgres at boot (display-only)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:

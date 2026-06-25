@@ -80,6 +80,7 @@ router.all(
     "/advisor",
     "/pro-review",
     "/trade-debate",
+    "/learning",
     "/journal",
     "/journal/",
     "/eod",
