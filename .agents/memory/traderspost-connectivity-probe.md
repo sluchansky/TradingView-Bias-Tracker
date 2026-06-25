@@ -1,0 +1,33 @@
+---
+name: TradersPost webhook connectivity probe
+description: How to safely verify the TRADERSPOST_WEBHOOK_URL secret actually authenticates, and how to read the failure modes.
+---
+
+# TradersPost webhook connectivity probe
+
+When the user changes brokers / TradersPost accounts they hand over a new webhook URL of the form
+`https://webhooks.traderspost.io/trading/webhook/{webhook-id}/{password}`. The **last segment is a password**;
+a wrong/stale/truncated last segment is the usual breakage ("INVALID PASSWORD" in the TradersPost UI).
+
+## Safe no-trade probe
+The app's `/traderspost` send path issues REAL market orders (resolve_execution_mode → "traderspost" whenever
+the secret is set and no EXECUTION_MODE override). There is NO built-in dry run. To test connectivity WITHOUT
+placing an order, POST a payload that omits `action` and `ticker` — TradersPost can't build an order from it.
+
+## How to read the result (authoritative)
+- **HTTP 400 `{"messageCode":"invalid-payload", "...action and ticker fields are required"}`** = password is
+  **VALID**. Auth passed; it only rejected the deliberately-incomplete test payload. This is the success signal.
+- **`invalid-password` body** = the last URL segment is wrong → user must copy the full URL again or regenerate it.
+- **HTTP 000 from curl** = transient network blip OR (common) the secret has a **trailing newline/space** from the
+  paste. curl chokes on whitespace in the URL; the APP does not (it `.strip()`s the value), so 000 from a raw
+  curl probe is NOT proof the app is broken.
+
+**Why:** a stray newline made `len_raw` one byte longer than `len_trim`; raw probe = HTTP 000, but the stripped
+value probed HTTP 400 invalid-payload (valid). The app uses the stripped form, so it worked fine.
+
+## How to apply
+- Probe the **stripped** value (`tr -d '[:space:]'`) — that's what the app sees — and expect HTTP 400 invalid-payload.
+- Never print the secret. Redact the URL out of any body with `sed "s#$URL#[REDACTED]#g"`.
+- Host reachability sanity: `curl https://webhooks.traderspost.io/` returns **404** (reachable; root has no route).
+- Secrets can only be set via requestEnvVar (can't set directly). After saving, restart "TradingView Webhook Server".
+- Dev & prod SHARE secrets, so this same URL drives the live published instance once deployed.
