@@ -20311,6 +20311,18 @@ def dashboard():
   /* Diagnostics modules */
   .mod{background:var(--panel);border:1px solid var(--border);border-radius:2px;padding:16px;margin-bottom:14px;box-shadow:0 0 18px rgba(122,40,140,.14)}
   .mod-h{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--amber-dim);margin-bottom:12px;font-weight:700}
+  /* ── Collapsible + drag-reorder modules (display-only, per-device) ── */
+  #view-live .mod > .mod-h{display:flex;align-items:center;gap:8px}
+  .mod-grip{flex:0 0 auto;cursor:grab;color:var(--muted);opacity:.5;font-size:13px;line-height:1;letter-spacing:-1px}
+  .mod-grip:hover{opacity:1}
+  .mod-grip:active{cursor:grabbing}
+  .mod-cl{margin-left:auto;flex:0 0 auto;cursor:pointer;color:var(--muted);width:20px;height:20px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:3px;font-size:10px;transition:color .12s,border-color .12s}
+  .mod-cl:hover{color:var(--text);border-color:var(--border-lit)}
+  .mod.mod-min > .mod-h{margin-bottom:0}
+  .mod.mod-min > :not(.mod-h){display:none !important}
+  .mod.mod-dragging{opacity:.4}
+  .mod.mod-drop-before{box-shadow:0 -3px 0 0 var(--border-lit)}
+  .mod.mod-drop-after{box-shadow:0 3px 0 0 var(--border-lit)}
   .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
   .mgauge-center{position:absolute;left:0;right:0;bottom:24%;text-align:center;pointer-events:none}
   .mgauge-prob{font-size:21px;font-weight:800;line-height:1;letter-spacing:0;color:var(--amber)}
@@ -20479,6 +20491,7 @@ def dashboard():
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Setup bell: on</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
   <span id="advisor-toggle" role="button" tabindex="0" onclick="toggleAdvisor()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvisor();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🧠 Advisor: off</span>
+  <span id="layout-reset" role="button" tabindex="0" onclick="resetDashLayout()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();resetDashLayout();}" title="Restore the default panel order and un-minimize everything" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">↕️ Reset layout</span>
 </div>
 
 <!-- Live | Backtest top-level view toggle -->
@@ -24351,6 +24364,110 @@ paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor();
 autoSelectBestSetup();
+// ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
+// Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
+// front-end: persisted in localStorage, never touches the server / gate / scoring.
+(function(){
+  var ROOT = document.getElementById('view-live');
+  if(!ROOT) return;
+  var CKEY = 'dashCollapsed', OKEY = 'dashOrder';
+  function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
+  function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+  function key(m){ return m.id || ''; }
+  function mods(){ return Array.prototype.slice.call(ROOT.querySelectorAll('.mod')); }
+  function header(m){ return m.querySelector(':scope > .mod-h'); }
+
+  // Apply a saved order — only when one exists, so the default layout is untouched
+  // for anyone who has never reordered. Each panel stays inside its own parent.
+  function applyOrder(){
+    var ord = load(OKEY);
+    if(!ord || !Object.keys(ord).length) return;
+    var groups = {};
+    mods().forEach(function(m){
+      var p = m.parentNode, id = (p.id || 'p');
+      (groups[id] = groups[id] || {p:p, list:[]}).list.push(m);
+    });
+    Object.keys(groups).forEach(function(id){
+      var g = groups[id];
+      var sorted = g.list.slice().sort(function(a,b){
+        var ia = (key(a) in ord) ? ord[key(a)] : 1e9;
+        var ib = (key(b) in ord) ? ord[key(b)] : 1e9;
+        return ia - ib;
+      });
+      var sentinel = document.createComment('mod-order');
+      g.p.insertBefore(sentinel, g.list[0]);
+      sorted.forEach(function(m){ g.p.insertBefore(m, sentinel); });
+      g.p.removeChild(sentinel);
+    });
+  }
+  function saveOrder(){
+    var ord = {}, i = 0;
+    mods().forEach(function(m){ if(key(m)) ord[key(m)] = i++; });
+    save(OKEY, ord);
+  }
+
+  var collapsed = load(CKEY);
+  function setMin(m, on){
+    m.classList.toggle('mod-min', on);
+    var h = header(m), c = h && h.querySelector('.mod-cl');
+    if(c) c.textContent = on ? '\u25B8' : '\u25BE';
+    var k = key(m);
+    if(k){ if(on){ collapsed[k] = 1; } else { delete collapsed[k]; } save(CKEY, collapsed); }
+  }
+
+  var dragging = null;
+  function clearDrop(){ mods().forEach(function(m){ m.classList.remove('mod-drop-before','mod-drop-after'); }); }
+  function enhance(m){
+    var h = header(m);
+    if(!h || h.dataset.enh) return;
+    h.dataset.enh = '1';
+    var grip = document.createElement('span');
+    grip.className = 'mod-grip'; grip.textContent = '\u283F'; grip.title = 'Drag to reorder';
+    var caret = document.createElement('span');
+    caret.className = 'mod-cl'; caret.title = 'Minimize / expand';
+    h.insertBefore(grip, h.firstChild);
+    h.appendChild(caret);
+    h.addEventListener('click', function(e){
+      if(e.target === grip) return;
+      setMin(m, !m.classList.contains('mod-min'));
+    });
+    // Restrict native drag to the grip handle so text/buttons stay usable.
+    grip.addEventListener('mousedown', function(){ m.draggable = true; });
+    grip.addEventListener('mouseup', function(){ m.draggable = false; });
+    m.addEventListener('dragstart', function(e){
+      dragging = m; m.classList.add('mod-dragging');
+      try{ e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', key(m)); }catch(_){}
+    });
+    m.addEventListener('dragend', function(){
+      m.draggable = false; m.classList.remove('mod-dragging'); clearDrop(); dragging = null;
+    });
+    m.addEventListener('dragover', function(e){
+      if(!dragging || dragging === m || dragging.parentNode !== m.parentNode) return;
+      e.preventDefault();
+      var r = m.getBoundingClientRect(), after = (e.clientY - r.top) > r.height / 2;
+      m.classList.toggle('mod-drop-before', !after);
+      m.classList.toggle('mod-drop-after', after);
+    });
+    m.addEventListener('dragleave', function(){ m.classList.remove('mod-drop-before','mod-drop-after'); });
+    m.addEventListener('drop', function(e){
+      if(!dragging || dragging === m || dragging.parentNode !== m.parentNode) return;
+      e.preventDefault();
+      var r = m.getBoundingClientRect(), after = (e.clientY - r.top) > r.height / 2;
+      m.parentNode.insertBefore(dragging, after ? m.nextSibling : m);
+      clearDrop(); saveOrder();
+    });
+  }
+
+  applyOrder();
+  mods().forEach(function(m){
+    enhance(m);
+    if(key(m) && collapsed[key(m)]) setMin(m, true);
+  });
+  window.resetDashLayout = function(){
+    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); }catch(e){}
+    location.reload();
+  };
+})();
 // ── Potential Trade Idea Review (DISPLAY-ONLY; on-demand, NOT in the 3s poll) ──
 function riEsc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function riNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
