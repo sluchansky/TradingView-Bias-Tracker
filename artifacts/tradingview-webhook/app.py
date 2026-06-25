@@ -39,6 +39,15 @@ def _log_incoming_request():
     # Skip the dashboard's 3-second polling so the log stays readable.
     if request.path in ("/trade", "/status") and request.method == "GET":
         return
+    # Owner-only journal uploads carry trade notes / PnL / possible PII — never
+    # echo their body to the request log (only the byte count).
+    if request.path == "/tradezella/upload" and request.method == "POST":
+        try:
+            n = request.content_length or 0
+        except Exception:
+            n = 0
+        logger.info("INCOMING POST /tradezella/upload | BODY: <redacted CSV upload, %s bytes>", n)
+        return
     try:
         body = request.get_data(as_text=True)
     except Exception:
@@ -7451,6 +7460,7 @@ LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total
 GOVERNOR_STATS         = {"ready": False, "trade_count": 0, "last_refreshed_at": None}  # historical aggregates for the Confidence Governor
 MEMORY_TRADES          = []                         # capped rolling list of recent closed trades for the Professional Memory Engine
 MEMORY_TRADES_MAX      = 300                        # cap on the in-memory similar-trades cache
+TRADEZELLA_MEMORY_MAX  = 75                         # cap on imported-journal rows APPENDED after live trades (never evicts live)
 # ── Shared Trade Memory weighting (display-only; governor + analyst single source).
 # STRATEGY_VERSION is bumped MANUALLY whenever the trade LOGIC (filters / indicators
 # / rules) changes; prior-version closed trades are then heavily down-weighted so
@@ -7466,6 +7476,11 @@ GOV_RECENCY_OLDER_W    = 0.2
 # Version factor: current-version trades full weight, prior-version heavily reduced.
 GOV_VERSION_CURRENT_W  = 1.0
 GOV_VERSION_PRIOR_W    = 0.2
+# Source factor: the bot's OWN live trades carry full weight; imported TradeZella journal
+# trades are an external, DOWN-WEIGHTED source so historical journal data can NEVER dominate
+# the bot's own live history (stacks multiplicatively with the version factor for safety).
+GOV_SOURCE_LIVE_W       = 1.0
+GOV_SOURCE_TRADEZELLA_W = 0.25
 # Similarity gates: minimum scored-dimension matches per trade + minimum comparable
 # trades before the historical lens is "ready" (else it stays neutral / 50).
 GOV_SIM_MIN_SCORE      = 3
@@ -8702,9 +8717,23 @@ def _recompute_learning():
                 "grade":            (r.get("grade") or None),
                 "trading_mode":     (r.get("trading_mode") or None),
                 "strategy_version": r.get("strategy_version"),
+                # bot's own live trade -> full source weight (no-op vs prior behaviour).
+                "source":           "live",
                 # rank 1 == most-recently closed (ORDER BY closed_at DESC) -> recency tier.
                 "rank":             idx + 1,
             })
+
+        # ── TradeZella imported journal (DOWN-WEIGHTED 'tradezella' source) APPENDED
+        # AFTER the live trades so external history can never occupy the top recency
+        # tier ahead of the bot's own trades, nor evict them. Fully fail-open;
+        # display-only memory (governor floor + demote-only veto still protect the
+        # money path). Skipped silently when the table is absent/empty. ──
+        try:
+            tz_mem = _tz_memory_records(start_rank=len(mem_cache))
+            if tz_mem:
+                mem_cache.extend(tz_mem)
+        except Exception as exc:
+            logger.debug("tradezella memory load skip: %s", exc)
 
         with LEARNING_LOCK:
             STRATEGY_WEIGHTS.clear();        STRATEGY_WEIGHTS.update(new_weights)
@@ -9093,6 +9122,13 @@ def _gov_version_weight(v):
     return GOV_VERSION_CURRENT_W if vi == STRATEGY_VERSION else GOV_VERSION_PRIOR_W
 
 
+def _gov_source_weight(src):
+    """Source factor: the bot's OWN live trades carry full weight; imported TradeZella
+    journal trades are a DOWN-WEIGHTED external source so historical journal data can
+    NEVER dominate the bot's own live history. Unknown/missing source -> live (no-op)."""
+    return GOV_SOURCE_TRADEZELLA_W if src == "tradezella" else GOV_SOURCE_LIVE_W
+
+
 def _similar_neutral_block(reason="No comparable trade history yet.",
                            trade_count=0, refreshed=None):
     """Neutral SHARED Trade-Memory context (fail-open / under-sampled). STABLE schema:
@@ -9180,7 +9216,9 @@ def find_similar_trades(result, ticker=None):
         # matched_on reflects ONLY accepted (>= min-score) rows, so the explanation
         # never advertises a dimension no comparable trade actually shared.
         if len(row_dims) >= GOV_SIM_MIN_SCORE:
-            w = _gov_recency_weight(t.get("rank")) * _gov_version_weight(t.get("strategy_version"))
+            w = (_gov_recency_weight(t.get("rank"))
+                 * _gov_version_weight(t.get("strategy_version"))
+                 * _gov_source_weight(t.get("source")))
             if w > 0:
                 matched.append((t, w))
                 dims |= row_dims
@@ -17669,6 +17707,371 @@ def bt_export():
                              f'attachment; filename="backtest_run_{run_id}.csv"'})
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# TradeZella journal import + review (owner-only, REVIEW-ONLY)
+# ────────────────────────────────────────────────────────────────────────────
+# Upload a TradeZella (or generic broker) trades CSV, persist the parsed rows,
+# and surface a journal review (win rate, profit factor, expectancy, best/worst
+# session/symbol/setup, common failure pattern, entry/exit heuristics). Like the
+# backtest tools these routes are owner-gated by the Express dashboard auth (they
+# are NOT in OPEN_PATHS) and FAIL-OPEN. NOTHING here ever feeds the strict gate,
+# scoring, sizing, dedupe, Discord, or the /traderspost money path. App-side
+# INSERT/SELECT ONLY — the tables are created out-of-band (database tool in dev,
+# Publish schema-diff in prod), matching the journal / learning-engine convention.
+# ════════════════════════════════════════════════════════════════════════════
+try:
+    import tradezella_engine as tz
+    TRADEZELLA_AVAILABLE = True
+except Exception as _tz_import_exc:   # pragma: no cover - defensive
+    tz = None
+    TRADEZELLA_AVAILABLE = False
+    logger.warning("tradezella engine import failed (review disabled): %s", _tz_import_exc)
+
+TRADEZELLA_DB_READY = False
+
+
+def _check_tradezella_db_ready():
+    """Probe the tradezella_trades table (NO DDL) and set TRADEZELLA_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB leaves the flag False and the
+    review degrades to 'no data' (upload returns 503 rather than silently losing
+    rows)."""
+    global TRADEZELLA_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM tradezella_trades LIMIT 1")
+            cur.fetchone()
+        TRADEZELLA_DB_READY = True
+        logger.info("tradezella_trades table ready")
+    except Exception as exc:
+        logger.warning("tradezella table unavailable (import disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_tradezella_trades(trades, filename=None):
+    """Insert parsed TradeZella rows (ON CONFLICT DO NOTHING on dedupe_key) plus
+    a batch-metadata row. SYNCHRONOUS (owner on-demand action, not the hot
+    webhook path) so the upload response reports accurate imported/skipped counts
+    and the follow-up analysis reads fresh data. FAIL-OPEN."""
+    if not TRADEZELLA_DB_READY:
+        return {"ok": False, "error": "database not ready"}
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "error": "database unavailable"}
+    batch_id = uuid.uuid4().hex
+    imported = 0
+    try:
+        with conn.cursor() as cur:
+            for t in trades:
+                row = (
+                    batch_id, t.get("source") or "tradezella", t.get("dedupe_key"),
+                    t.get("symbol"), t.get("side"), t.get("entry_time"),
+                    t.get("exit_time"), t.get("entry_price"), t.get("exit_price"),
+                    t.get("quantity"), t.get("pnl"), t.get("fees"), t.get("setup"),
+                    t.get("mistake"), t.get("notes"), t.get("screenshots"),
+                    t.get("mfe"), t.get("mae"), t.get("r_multiple"), t.get("mode"),
+                    t.get("session_bucket"), t.get("session_day"), t.get("outcome"),
+                    psycopg2.extras.Json(t.get("raw_row") or {}),
+                )
+                cur.execute(
+                    "INSERT INTO tradezella_trades "
+                    "(import_batch_id, source, dedupe_key, symbol, side, "
+                    "entry_time, exit_time, entry_price, exit_price, quantity, "
+                    "pnl, fees, setup, mistake, notes, screenshots, mfe, mae, "
+                    "r_multiple, mode, session_bucket, session_day, outcome, "
+                    "raw_row_json) VALUES "
+                    "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (dedupe_key) DO NOTHING RETURNING id",
+                    row,
+                )
+                if cur.fetchone() is not None:
+                    imported += 1
+            skipped_dupes = len(trades) - imported
+            cur.execute(
+                "INSERT INTO tradezella_import_batches "
+                "(import_batch_id, filename, source, row_count, imported_count, "
+                "skipped_count) VALUES (%s,%s,%s,%s,%s,%s)",
+                (batch_id, filename, "tradezella", len(trades), imported,
+                 skipped_dupes),
+            )
+        return {"ok": True, "import_batch_id": batch_id, "imported": imported,
+                "skipped_dupes": skipped_dupes, "submitted": len(trades)}
+    except Exception as exc:
+        logger.warning("tradezella persist failed: %s", exc)
+        return {"ok": False, "error": "persist failed"}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _load_tradezella_trades(limit=5000):
+    """Load persisted TradeZella trades (newest-first) as canonical dicts for
+    analyze_journal. FAIL-OPEN -> [] on any error."""
+    if not TRADEZELLA_DB_READY:
+        return []
+    conn = _learning_conn()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol, side, entry_time, exit_time, entry_price, "
+                "exit_price, quantity, pnl, fees, setup, mistake, notes, "
+                "screenshots, mfe, mae, r_multiple, mode, session_bucket, "
+                "session_day, outcome FROM tradezella_trades "
+                "ORDER BY entry_time DESC NULLS LAST, id DESC LIMIT %s",
+                (int(limit),),
+            )
+            rows = cur.fetchall()
+        keys = ("symbol", "side", "entry_time", "exit_time", "entry_price",
+                "exit_price", "quantity", "pnl", "fees", "setup", "mistake",
+                "notes", "screenshots", "mfe", "mae", "r_multiple", "mode",
+                "session_bucket", "session_day", "outcome")
+        out = []
+        for r in rows:
+            d = dict(zip(keys, r))
+            for tk in ("entry_time", "exit_time", "session_day"):
+                if d.get(tk) is not None and hasattr(d[tk], "isoformat"):
+                    d[tk] = d[tk].isoformat()
+            out.append(d)
+        return out
+    except Exception as exc:
+        logger.warning("tradezella load failed: %s", exc)
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _tz_memory_records(max_rows=TRADEZELLA_MEMORY_MAX, start_rank=0):
+    """Map imported TradeZella journal trades into the find_similar_trades record shape
+    (DOWN-WEIGHTED 'tradezella' source). Decided (win/loss) trades only -- scratches are
+    excluded so the weighted win-rate stays meaningful. The 'session' dim is RE-DERIVED
+    with the LIVE _learning_session_name vocabulary (not the journal's display bucket) so
+    it can actually match a live setup. Dimensions the journal lacks (strategy_key/regime/
+    volatility/grade/edge/bias) stay None -> they simply never match. MFE/MAE are LEFT
+    None: the journal's raw mfe/mae columns are of unknown units and must not pollute the
+    R-based excursion averages. Ranks continue AFTER the live trades (start_rank) so the
+    journal can never occupy the top recency tier ahead of the bot's own trades. The caller
+    appends these AFTER the live cache, so they also never evict a live trade. FAIL-OPEN -> []."""
+    if not TRADEZELLA_DB_READY:
+        return []
+    try:
+        raw = _load_tradezella_trades(limit=max(int(max_rows) * 4, int(max_rows)))
+    except Exception:
+        return []
+
+    def _ff(v):
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    decided = []
+    for t in (raw or []):
+        if t.get("outcome") not in ("win", "loss"):
+            continue
+        sym = instrument_of(t.get("symbol") or "") or (t.get("symbol") or "")
+        if not sym:
+            continue
+        edt = xdt = None
+        try:
+            if t.get("entry_time"):
+                edt = datetime.fromisoformat(t["entry_time"])
+        except Exception:
+            edt = None
+        try:
+            if t.get("exit_time"):
+                xdt = datetime.fromisoformat(t["exit_time"])
+        except Exception:
+            xdt = None
+        sess = _learning_session_name(edt) if edt is not None else None
+        hold_min = None
+        if edt is not None and xdt is not None:
+            try:
+                hm = (xdt - edt).total_seconds() / 60.0
+                hold_min = round(hm, 1) if hm > 0 else None
+            except Exception:
+                hold_min = None
+        mode = (t.get("mode") or "").strip().upper() or None
+        rec = {
+            "symbol":           sym,
+            "direction":        _norm_dir(t.get("side")),
+            "regime":           None,
+            "session":          sess,
+            "volatility_type":  None,
+            "entry_efficiency": None,
+            "strategy_key":     None,                     # never creates a scored strategy match
+            "strategy":         t.get("setup"),           # display label only
+            "result":           "Win" if t.get("outcome") == "win" else "Loss",
+            "r_multiple":       _ff(t.get("r_multiple")),
+            "mfe_r":            None,                      # unknown units -> excluded from R averages
+            "mae_r":            None,
+            "hold_minutes":     hold_min,
+            "outcome_tag":      None,
+            "edge_score":       None,
+            "bias":             None,
+            "grade":            None,
+            "trading_mode":     mode if mode in ("SCALP", "SWING") else None,
+            "strategy_version": None,                     # unknown logic version -> version weight 0.2
+            "source":           "tradezella",             # external journal -> source weight 0.25
+            "rank":             0,                         # assigned below (after the live trades)
+        }
+        decided.append((xdt, rec))
+
+    def _key(p):
+        try:
+            return p[0].timestamp() if p[0] is not None else float("-inf")
+        except Exception:
+            return float("-inf")
+    decided.sort(key=_key, reverse=True)        # most-recently CLOSED first; undated sink last
+
+    out = []
+    for i, (_xdt, rec) in enumerate(decided[:int(max_rows)]):
+        rec["rank"] = int(start_rank) + i + 1
+        out.append(rec)
+    return out
+
+
+def _tradezella_import_summary():
+    """{imported_total, last_import_at, batch_count} from the batch table. FAIL-OPEN."""
+    summary = {"imported_total": 0, "last_import_at": None, "batch_count": 0}
+    if not TRADEZELLA_DB_READY:
+        return summary
+    conn = _learning_conn()
+    if conn is None:
+        return summary
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM tradezella_trades")
+            summary["imported_total"] = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*), MAX(created_at) FROM tradezella_import_batches")
+            row = cur.fetchone()
+            summary["batch_count"] = int(row[0] or 0)
+            summary["last_import_at"] = row[1].isoformat() if row and row[1] else None
+    except Exception as exc:
+        logger.warning("tradezella summary failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return summary
+
+
+def _tz_guard():
+    """None when TradeZella review is usable, else a (json, status) error tuple."""
+    if not TRADEZELLA_AVAILABLE:
+        return jsonify({"ok": False, "error": "TradeZella engine unavailable."}), 503
+    if not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "Database not configured — review disabled."}), 503
+    return None
+
+
+@app.route("/tradezella/upload", methods=["POST"])
+def tradezella_upload():
+    """Owner-only. Body = raw TradeZella trades CSV text; query: tz, filename."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False,
+                        "error": "TradeZella table not provisioned yet."}), 503
+    source_tz = request.args.get("tz") or "America/New_York"
+    filename = request.args.get("filename") or None
+    try:
+        source_zone = ZoneInfo(source_tz)
+    except Exception:
+        return jsonify({"ok": False, "error": f"unknown timezone '{source_tz}'"}), 400
+    raw = request.get_data(cache=False, as_text=True)
+    if not raw or not raw.strip():
+        return jsonify({"ok": False, "error": "empty upload body"}), 400
+    try:
+        parsed = tz.parse_tradezella_csv(raw, source_tz=source_zone)
+    except Exception as exc:
+        logger.warning("tradezella parse failed: %s", exc)
+        return jsonify({"ok": False, "error": "could not parse CSV"}), 400
+    if not parsed.get("ok"):
+        return jsonify({"ok": False, "error": parsed.get("error", "parse error")}), 400
+    if not parsed.get("trades"):
+        return jsonify({"ok": False,
+                        "error": "no usable trade rows found in CSV",
+                        "columns": parsed.get("columns", [])}), 400
+    stored = _persist_tradezella_trades(parsed["trades"], filename=filename)
+    if not stored.get("ok"):
+        return jsonify(stored), 500
+    return jsonify({
+        "ok": True,
+        "import_batch_id": stored["import_batch_id"],
+        "imported": stored["imported"],
+        "skipped_dupes": stored["skipped_dupes"],
+        "parsed_rows": parsed["row_count"],
+        "parse_skipped": parsed["skipped"],
+        "fields_present": parsed["fields_present"],
+        "warnings": parsed.get("warnings", []),
+    })
+
+
+@app.route("/tradezella/analysis", methods=["GET"])
+def tradezella_analysis():
+    """Owner-only. Returns the journal review over all imported trades."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    trades = _load_tradezella_trades()
+    try:
+        analysis = tz.analyze_journal(trades)
+    except Exception as exc:
+        logger.warning("tradezella analyze failed: %s", exc)
+        return jsonify({"ok": False, "error": "analysis failed"}), 500
+    # DISPLAY-ONLY entry-quality + exit-management reviews folded off the analysis
+    # (fail-open — a presenter error must never break the analysis payload).
+    try:
+        analysis["reviews"] = tz.build_reviews(analysis)
+    except Exception as exc:
+        logger.warning("tradezella reviews failed: %s", exc)
+    return jsonify({
+        "ok": True,
+        "db_ready": TRADEZELLA_DB_READY,
+        "import_summary": _tradezella_import_summary(),
+        "analysis": analysis,
+    })
+
+
+@app.route("/tradezella/trades", methods=["GET"])
+def tradezella_trades():
+    """Owner-only. Lists imported trades (newest-first, capped)."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    trades = _load_tradezella_trades(limit=limit)
+    return jsonify({"ok": True, "count": len(trades), "trades": trades})
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global CURRENT_PRICE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT, LAST_ALERT_AT
@@ -20018,6 +20421,10 @@ def dashboard():
   html[data-theme="retro"] #rec-card,
   html[data-theme="retro"] .mod{box-shadow:0 0 18px rgba(20,90,55,.22)}
   html[data-theme="retro"] .se-chip{background:#06281c;border-color:#0f5d3a;color:#9bffcb}
+  /* ── TradeZella bot-review badges + signal list ── */
+  .tz-vbadge{font-size:9.5px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;border:1px solid #6b7280;border-radius:2px;padding:1px 6px;margin-left:8px;color:#6b7280}
+  .tz-sig{list-style:none;margin:6px 0 0;padding:0}
+  .tz-sig li{font-size:11.5px;color:#cdd3e0;padding:3px 0 3px 2px;line-height:1.4}
   /* ── Backtest tab ── */
   #view-seg{display:flex;gap:8px;max-width:360px;margin:0 auto 16px}
   .view-btn{flex:1;padding:10px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:13px;font-weight:700;cursor:pointer;text-align:center;text-transform:uppercase;letter-spacing:1px;transition:all .15s}
@@ -20069,6 +20476,7 @@ def dashboard():
 <div id="view-seg">
   <div class="view-btn active" id="vb-live" onclick="setView('live')">📊 Live</div>
   <div class="view-btn" id="vb-bt" onclick="setView('backtest')">🧪 Backtest</div>
+  <div class="view-btn" id="vb-tz" onclick="setView('tradezella')">📒 TradeZella</div>
 </div>
 
 <div id="view-live">
@@ -20794,6 +21202,86 @@ def dashboard():
   </div>
 
 </div><!-- /#view-backtest -->
+
+<!-- ════════════════ TRADEZELLA REVIEW VIEW (owner-only journal import + review;
+     REVIEW-ONLY — never wired to /status poll, scoring, or the money path) ═══ -->
+<div id="view-tradezella" style="display:none">
+
+  <div class="mod">
+    <div class="mod-h">📥 Import TradeZella Trades (CSV)</div>
+    <div class="bt-mini" style="margin-bottom:8px">Export your trades from TradeZella (or any broker) as CSV and upload here. Columns are auto-matched (symbol, side, entry/exit time &amp; price, qty, P&amp;L, fees, setup, notes, MFE/MAE, R). This is a private review tool — it never touches live alerts, scoring, or the broker. Duplicate trades are skipped automatically.</div>
+    <div class="bt-grid">
+      <div class="bt-f"><label>Source timezone</label><select id="tz-tz"><option value="America/New_York" selected>Eastern (ET)</option><option value="America/Chicago">Central (CT)</option><option value="UTC">UTC</option></select></div>
+      <div class="bt-f"><label>CSV file</label><input id="tz-file" type="file" accept=".csv,text/csv"></div>
+    </div>
+    <button class="bt-btn" id="tz-up-btn" onclick="tzUpload()">📤 Import &amp; Analyze</button>
+    <button class="bt-btn alt" id="tz-refresh-btn" onclick="tzLoadAnalysis()">↻ Refresh review</button>
+    <div class="bt-msg" id="tz-up-msg"></div>
+  </div>
+
+  <div id="tz-empty" class="mod">
+    <div class="mod-h">📊 Journal Review</div>
+    <div class="bt-mini" id="tz-empty-msg">No imported trades yet. Upload a CSV above to see your review.</div>
+  </div>
+
+  <div id="tz-review" style="display:none">
+    <div class="mod">
+      <div class="mod-h">📊 Journal Review <span class="bt-mini" id="tz-meta"></span></div>
+      <div class="bt-grid">
+        <div class="bt-f"><label>Trades</label><div id="tz-trade-count" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Win rate</label><div id="tz-winrate" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Profit factor</label><div id="tz-pf" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Expectancy / trade</label><div id="tz-expectancy" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Avg R</label><div id="tz-avgr" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Net P&amp;L</label><div id="tz-netpnl" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Avg winner</label><div id="tz-avgwin" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+        <div class="bt-f"><label>Avg loser</label><div id="tz-avgloss" style="font-size:17px;font-weight:700;margin-top:2px">—</div></div>
+      </div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🏅 Best vs Worst</div>
+      <div class="bt-grid">
+        <div class="bt-f"><label>Best session</label><div class="bt-mini" id="tz-best-session">—</div></div>
+        <div class="bt-f"><label>Worst session</label><div class="bt-mini" id="tz-worst-session">—</div></div>
+        <div class="bt-f"><label>Best symbol</label><div class="bt-mini" id="tz-best-symbol">—</div></div>
+        <div class="bt-f"><label>Worst symbol</label><div class="bt-mini" id="tz-worst-symbol">—</div></div>
+        <div class="bt-f"><label>Best setup</label><div class="bt-mini" id="tz-best-setup">—</div></div>
+        <div class="bt-f"><label>Worst setup</label><div class="bt-mini" id="tz-worst-setup">—</div></div>
+      </div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🔍 Patterns &amp; Leaks</div>
+      <div class="se-bias-h">Common failure pattern</div>
+      <div class="bt-mini" id="tz-failure">—</div>
+      <div class="se-bias-h">Entry timing</div>
+      <div class="bt-mini" id="tz-entries">—</div>
+      <div class="se-bias-h">Stops</div>
+      <div class="bt-mini" id="tz-stops">—</div>
+      <div class="se-bias-h">Targets</div>
+      <div class="bt-mini" id="tz-targets">—</div>
+      <div class="se-bias-h">Winners too small?</div>
+      <div class="bt-mini" id="tz-smallwin">—</div>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🧭 Bot Review <span class="bt-mini">entry &amp; exit quality</span></div>
+      <div class="se-bias-h">Entry quality<span class="tz-vbadge" id="tz-entry-verdict">—</span></div>
+      <div class="bt-mini" id="tz-entry-headline">—</div>
+      <ul class="tz-sig" id="tz-entry-signals"></ul>
+      <div class="se-bias-h" style="margin-top:12px">Exit management<span class="tz-vbadge" id="tz-exit-verdict">—</span></div>
+      <div class="bt-mini" id="tz-exit-headline">—</div>
+      <ul class="tz-sig" id="tz-exit-signals"></ul>
+    </div>
+
+    <div class="mod">
+      <div class="mod-h">🤖 Bot Recommendation</div>
+      <div class="se-reason" id="tz-reco">—</div>
+    </div>
+  </div>
+
+</div><!-- /#view-tradezella -->
 
 <div id="toast"></div>
 
@@ -23188,12 +23676,128 @@ function btFmtTs(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocale
 function btFmtDate(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString('en-US',{timeZone:'America/New_York',year:'numeric',month:'short',day:'2-digit'}); }catch(e){ return iso; } }
 
 function setView(v){
-  const live = (v!=='backtest');
-  document.getElementById('view-live').style.display = live ? '' : 'none';
-  document.getElementById('view-backtest').style.display = live ? 'none' : '';
-  document.getElementById('vb-live').classList.toggle('active', live);
-  document.getElementById('vb-bt').classList.toggle('active', !live);
-  if(!live && btSelDataset===null) btLoadDatasets();
+  const isBt = (v==='backtest');
+  const isTz = (v==='tradezella');
+  const isLive = (!isBt && !isTz);
+  document.getElementById('view-live').style.display = isLive ? '' : 'none';
+  document.getElementById('view-backtest').style.display = isBt ? '' : 'none';
+  document.getElementById('view-tradezella').style.display = isTz ? '' : 'none';
+  document.getElementById('vb-live').classList.toggle('active', isLive);
+  document.getElementById('vb-bt').classList.toggle('active', isBt);
+  document.getElementById('vb-tz').classList.toggle('active', isTz);
+  if(isBt && btSelDataset===null) btLoadDatasets();
+  if(isTz) tzLoadAnalysis();
+}
+
+// ── TradeZella review (owner-only; on-demand, NEVER in the 3s /status poll) ──
+function tzFrac(v){ return (v===null||v===undefined)?'—':Math.round(v*100)+'%'; }
+function tzMoney(v){ return (v===null||v===undefined)?'—':((v<0?'-$':'$')+Math.abs(v).toFixed(2)); }
+function tzSet(id,val){ const el=document.getElementById(id); if(el) el.textContent=val; }
+function tzLabelWr(o){ if(!o||!o.label) return '—'; return o.label+' ('+tzFrac(o.win_rate)+', '+o.count+' trades)'; }
+function tzFlagLine(id,obj,flagKey){
+  const el=document.getElementById(id); if(!el) return;
+  if(!obj || !obj.available){ el.textContent='Needs more data.'; el.style.color='#6b7280'; return; }
+  const bad=!!obj[flagKey];
+  el.textContent=(bad?'⚠ ':'✓ ')+(obj.detail||'');
+  el.style.color=bad?'#f59e0b':'#22c55e';
+}
+function tzRenderFailure(obj){
+  const el=document.getElementById('tz-failure'); if(!el) return;
+  if(!obj || !obj.available){ el.textContent='Needs more data.'; el.style.color='#6b7280'; return; }
+  const parts=[];
+  if(obj.top_losing_setup && obj.top_losing_setup.setup) parts.push('Most losses from “'+obj.top_losing_setup.setup+'” ('+obj.top_losing_setup.count+')');
+  if(obj.top_mistake_keyword && obj.top_mistake_keyword.keyword) parts.push('Top tag “'+obj.top_mistake_keyword.keyword+'” ('+obj.top_mistake_keyword.count+')');
+  el.textContent = parts.length ? parts.join(' · ') : 'No clear pattern yet.';
+  el.style.color='#e5e7eb';
+}
+function tzRenderEmpty(msg){
+  const e=document.getElementById('tz-empty'); const r=document.getElementById('tz-review');
+  if(r) r.style.display='none';
+  if(e){ e.style.display=''; const m=document.getElementById('tz-empty-msg'); if(m) m.textContent=msg; }
+}
+function tzRenderReview(prefix, rv){
+  const vEl=document.getElementById('tz-'+prefix+'-verdict');
+  const hEl=document.getElementById('tz-'+prefix+'-headline');
+  const sEl=document.getElementById('tz-'+prefix+'-signals');
+  if(sEl) sEl.innerHTML='';
+  if(!rv){ if(vEl){ vEl.textContent='—'; } if(hEl){ hEl.textContent='Needs more data.'; } return; }
+  const col = rv.available ? (rv.flag ? '#f59e0b' : '#22c55e') : '#6b7280';
+  if(vEl){ vEl.textContent=rv.verdict||'—'; vEl.style.color=col; vEl.style.borderColor=col; }
+  if(hEl){ hEl.textContent=rv.headline||''; }
+  const sigs=rv.signals||[];
+  if(sEl){
+    for(let i=0;i<sigs.length;i++){
+      const li=document.createElement('li');
+      li.textContent=(rv.flag?'⚠ ':'• ')+sigs[i];
+      sEl.appendChild(li);
+    }
+  }
+}
+function tzRenderReviews(reviews){
+  const rv=reviews||{};
+  tzRenderReview('entry', rv.entry_review);
+  tzRenderReview('exit', rv.exit_review);
+}
+function tzRenderAnalysis(d){
+  const a=d.analysis||{}; const sum=d.import_summary||{};
+  if(!a.trade_count){ tzRenderEmpty('No imported trades yet. Upload a CSV above to see your review.'); return; }
+  document.getElementById('tz-empty').style.display='none';
+  document.getElementById('tz-review').style.display='';
+  let meta=(sum.imported_total||a.trade_count)+' trades imported';
+  if(sum.last_import_at) meta+=' · last import '+btFmtDate(sum.last_import_at);
+  tzSet('tz-meta', meta);
+  tzSet('tz-trade-count', a.trade_count);
+  tzSet('tz-winrate', tzFrac(a.win_rate));
+  tzSet('tz-pf', a.profit_factor_infinite ? '∞' : btNum(a.profit_factor,2));
+  tzSet('tz-expectancy', tzMoney(a.expectancy));
+  tzSet('tz-avgr', (a.avg_r==null?'—':btNum(a.avg_r,2)+'R'));
+  tzSet('tz-netpnl', tzMoney(a.net_pnl));
+  tzSet('tz-avgwin', tzMoney(a.avg_winner));
+  tzSet('tz-avgloss', tzMoney(a.avg_loser));
+  tzSet('tz-best-session', tzLabelWr(a.best_session));
+  tzSet('tz-worst-session', tzLabelWr(a.worst_session));
+  tzSet('tz-best-symbol', tzLabelWr(a.best_symbol));
+  tzSet('tz-worst-symbol', tzLabelWr(a.worst_symbol));
+  tzSet('tz-best-setup', tzLabelWr(a.best_setup));
+  tzSet('tz-worst-setup', tzLabelWr(a.worst_setup));
+  tzRenderFailure(a.common_failure_pattern);
+  tzFlagLine('tz-entries', a.entries_late, 'entries_late');
+  tzFlagLine('tz-stops', a.stops_assessment, 'stops_too_wide');
+  tzFlagLine('tz-targets', a.targets_assessment, 'targets_too_tight');
+  tzFlagLine('tz-smallwin', a.winners_too_small, 'flag');
+  tzRenderReviews(a.reviews);
+  tzSet('tz-reco', a.recommendation || '—');
+}
+async function tzLoadAnalysis(){
+  try{
+    const d = await api('/tradezella/analysis');
+    if(!d || !d.ok){ tzRenderEmpty((d && d.error) || 'Review unavailable.'); return; }
+    tzRenderAnalysis(d);
+  }catch(e){ tzRenderEmpty('Could not load review.'); }
+}
+async function tzDoUpload(){
+  const f=document.getElementById('tz-file').files[0];
+  const msg=document.getElementById('tz-up-msg');
+  if(!f){ msg.className='bt-msg err'; msg.textContent='Choose a CSV file first.'; return false; }
+  msg.className='bt-msg'; msg.textContent='Reading file…';
+  const text=await f.text();
+  const q=new URLSearchParams({ tz: document.getElementById('tz-tz').value, filename: f.name || '' });
+  const r=await fetch(BASE+'/tradezella/upload?'+q.toString(),
+    {method:'POST', headers:{'Content-Type':'text/csv'}, body:text, cache:'no-store'});
+  const d=await r.json();
+  if(!d.ok){ msg.className='bt-msg err'; msg.textContent='✗ '+(d.error||'Upload failed'); return false; }
+  let s='Imported '+d.imported+' of '+d.parsed_rows+' trade(s)';
+  if(d.skipped_dupes) s+=' · '+d.skipped_dupes+' duplicate(s) skipped';
+  if(d.parse_skipped) s+=' · '+d.parse_skipped+' unparseable row(s)';
+  if(d.warnings && d.warnings.length) s+='\\n⚠ '+d.warnings.join('\\n⚠ ');
+  msg.className='bt-msg ok'; msg.textContent='✓ '+s;
+  return true;
+}
+async function tzUpload(){
+  const btn=document.getElementById('tz-up-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Importing…';
+  try{ const ok=await tzDoUpload(); if(ok) await tzLoadAnalysis(); }
+  catch(e){ const m=document.getElementById('tz-up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
 }
 
 async function btDoUpload(){
@@ -24047,6 +24651,7 @@ if __name__ == "__main__":
     if LEARNING_DB_ENABLED:
         _check_journal_db_ready()                  # probe journal_entries (no DDL; table created via DB tool/publish diff)
         _load_journal_from_db()                    # restore today's journal so EOD survives restarts (BEFORE the worker)
+        _check_tradezella_db_ready()               # probe tradezella_trades (no DDL; owner-only review import, FAIL-OPEN)
         if _swing_htf_enabled():                   # SWING flag-on only — SCALP boot stays untouched
             _check_swing_thesis_db_ready()         # probe swing_theses (no DDL; table created via DB tool/publish diff)
             _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher

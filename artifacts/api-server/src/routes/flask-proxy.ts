@@ -98,6 +98,11 @@ router.all(
     "/backtest/optimize",
     "/backtest/runs/:id",
     "/backtest/export",
+    // TradeZella journal import + review (owner-only; NOT in dashboard-auth
+    // OPEN_PATHS). The raw body limit for the CSV upload is raised in app.ts.
+    "/tradezella/upload",
+    "/tradezella/analysis",
+    "/tradezella/trades",
   ],
   proxyToFlask,
 );
