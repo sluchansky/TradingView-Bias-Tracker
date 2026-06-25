@@ -7,6 +7,7 @@ import logging
 import threading
 import queue
 import contextlib
+import json
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
@@ -1372,6 +1373,93 @@ def _recent_advisor_blocks(limit=10):
     try:
         with ADVISOR_BLOCKS_LOCK:
             rows = list(ADVISOR_BLOCKS)[-limit:]
+    except Exception:
+        return []
+    out = []
+    for r in reversed(rows):
+        try:
+            when = fmt_et(datetime.fromtimestamp(r["ts"], tz=timezone.utc), "%m/%d %H:%M ET")
+        except Exception:
+            when = "—"
+        out.append({
+            "instrument": r.get("instrument"),
+            "time":       when,
+            "reason":     r.get("reason"),
+        })
+    return out
+
+
+# ── Execution payload guard (money-path; fail-closed) ────────────────────────
+# Before ANY live order is POSTed to a broker bridge we (1) log the EXACT JSON we
+# are about to send (secrets redacted — the destination URL, which carries the
+# provider secret, is NEVER logged) and (2) verify the provider's REQUIRED fields
+# are present and non-empty. A missing/null/empty ticker or action is exactly what
+# makes TradersPost answer "Both the action and ticker fields are required" — so we
+# reject LOCALLY and surface the reason on the dashboard instead of firing an
+# invalid order. In-memory only (the rejection log clears on restart).
+EXEC_REJECTIONS_MAX  = 25
+EXEC_REJECTIONS      = deque(maxlen=EXEC_REJECTIONS_MAX)
+EXEC_REJECTIONS_LOCK = threading.Lock()
+
+# Payload keys that must NEVER reach the logs (PickMyTrade carries its auth token /
+# account id in the body). The TradersPost payload has none of these, so its audit
+# log is the verbatim JSON.
+_SENSITIVE_PAYLOAD_KEYS = {"token", "account_id", "apiKey", "api_key", "password", "secret"}
+
+
+def _redact_payload_for_log(payload):
+    """Copy of the payload safe to log: sensitive values masked, everything else
+    (ticker/action/quantity/stop/target) left verbatim for the audit trail."""
+    try:
+        return {k: ("***" if k in _SENSITIVE_PAYLOAD_KEYS else v) for k, v in payload.items()}
+    except Exception:
+        return {}
+
+
+def _broker_required_fields(mode):
+    """The fields a SENDABLE order payload MUST carry, per provider."""
+    if mode == "traderspost":
+        return ("ticker", "action")
+    if mode == "pickmytrade":
+        return ("symbol", "data")
+    return ()
+
+
+def _validate_broker_payload(mode, payload):
+    """Return [(field, problem), ...] for every REQUIRED field that is missing,
+    null, or empty (blank/whitespace string). Empty list => safe to send."""
+    bad = []
+    for f in _broker_required_fields(mode):
+        if not isinstance(payload, dict) or f not in payload:
+            bad.append((f, "missing")); continue
+        v = payload.get(f)
+        if v is None:
+            bad.append((f, "null"))
+        elif isinstance(v, str) and not v.strip():
+            bad.append((f, "empty"))
+    return bad
+
+
+def _record_exec_rejection(inst, reason):
+    """Append a locally-blocked (never-sent) order to a display-only ring buffer,
+    surfaced in /status -> dashboard so a blocked invalid payload is never silent.
+    Best-effort; never raises."""
+    try:
+        with EXEC_REJECTIONS_LOCK:
+            EXEC_REJECTIONS.append({
+                "instrument": inst,
+                "ts":         time.time(),
+                "reason":     str(reason or "").strip() or "—",
+            })
+    except Exception:
+        pass
+
+
+def _recent_exec_rejections(limit=10):
+    """Most-recent-first serialized view (ET time strings) for the dashboard."""
+    try:
+        with EXEC_REJECTIONS_LOCK:
+            rows = list(EXEC_REJECTIONS)[-limit:]
     except Exception:
         return []
     out = []
@@ -18308,6 +18396,7 @@ def status():
         "execution_live":           execution_is_live() and execution_configured(),
         "execution_enabled":        execution_configured(),
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
+        "execution_rejections":     _recent_exec_rejections(),
         # ── Dual-timeframe (1m bias + 5s execution) engine — DISPLAY-ONLY ──
         "dualTfEngineEnabled": _dtf["dualTfEngineEnabled"],
         "biasDirection":       _dtf["biasDirection"],
@@ -18785,6 +18874,39 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     else:  # pickmytrade
         send_url = EXECUTION_WEBHOOK_URL
         payload  = adapt_pickmytrade(intent)
+
+    # ── Pre-send payload audit + REQUIRED-FIELD validation (money-path guard) ─────
+    # Log the EXACT JSON about to be transmitted (secrets redacted; the destination
+    # URL is NEVER logged) so every live order is auditable. Then verify the broker's
+    # required fields (TradersPost: ticker + action; PickMyTrade: symbol + data) are
+    # present and non-empty. A missing/null/empty required field is exactly what makes
+    # TradersPost reject with "Both the action and ticker fields are required" — so we
+    # reject LOCALLY, free the duplicate-guard slot, record the reason for the
+    # dashboard, and NEVER send an invalid order. Fail-closed, like the rest of this
+    # gate. The payload itself is NOT modified, so a VALID order stays byte-identical
+    # to the legacy send.
+    # Serialize ONCE, best-effort: for TradersPost this is the exact wire JSON (no
+    # redacted fields, default separators/order match requests' json=payload). A
+    # serialization hiccup must never turn a local block into a 500 (that would skip
+    # the dashboard record while still — correctly — not sending).
+    try:
+        _payload_json = json.dumps(_redact_payload_for_log(payload))
+    except Exception:
+        _payload_json = "<unserializable payload>"
+    logger.info("Execution payload audit (%s) before send: %s", mode, _payload_json)
+    _bad_fields = _validate_broker_payload(mode, payload)
+    if _bad_fields:
+        _release_slot()
+        _detail = ", ".join("%s (%s)" % (f, why) for f, why in _bad_fields)
+        _reason = ("Invalid %s payload — order BLOCKED locally (not sent): required "
+                   "field(s) %s." % (provider_label, _detail))
+        logger.error("BLOCKED invalid broker payload (%s) for %s: %s | payload=%s",
+                     mode, instrument, _detail, _payload_json)
+        _record_exec_rejection(instrument, _reason)
+        _record_diagnostic("%s | EXECUTION blocked — invalid %s payload (%s)"
+                           % (instrument, mode, _detail))
+        return {"status": "error", "reason": _reason,
+                "blocked_fields": [f for f, _ in _bad_fields]}, 400
 
     # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
     # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
@@ -20027,6 +20149,14 @@ def dashboard():
   <div class="nf-fid">High-impact USD events (ForexFactory). Display-only — does not block trades.</div>
 </div>
 
+<!-- Blocked Orders — orders rejected LOCALLY before any broker send (invalid-payload guard; DISPLAY-ONLY) -->
+<div class="mod" id="mod-exec-reject" style="display:none">
+  <div class="mod-h">🛑 Blocked Orders <span id="xr-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="nf-status" id="xr-status">—</div>
+  <ul id="xr-list" style="margin:4px 0;padding-left:16px"></ul>
+  <div class="nf-fid">Orders rejected locally (e.g. missing ticker/action) and NOT sent to your broker. Display-only — clears on restart.</div>
+</div>
+
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
 <div class="mod" id="mod-cvd">
   <div class="mod-h">📊 Volume Delta (CVD) &amp; RVOL</div>
@@ -20961,6 +21091,9 @@ function renderModules(d){
   // ── Module 10: News filter (economic calendar) — display-only ──
   renderNewsFilter(d);
 
+  // ── Module 10c: Blocked Orders — locally-rejected invalid-payload orders (DISPLAY-ONLY) ──
+  renderExecRejections(d);
+
   // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
   renderReportMode(d);
 
@@ -21039,6 +21172,22 @@ function _anVerdictColor(v){
   if(v.indexOf('READY')===0) return '#22c55e';
   if(v==='WAIT') return '#f59e0b';
   return '#6b7280';
+}
+// Blocked Orders — locally-rejected (never-sent) invalid-payload orders. Display-only.
+// Fed by d.execution_rejections; hidden when there are none. All strings via textContent.
+function renderExecRejections(d){
+  const mod=document.getElementById('mod-exec-reject');
+  if(!mod) return;
+  const rows=(d && d.execution_rejections) || [];
+  if(!rows.length){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const meta=document.getElementById('xr-meta');
+  if(meta) meta.textContent=rows.length+' blocked';
+  const st=document.getElementById('xr-status');
+  if(st) st.textContent='Blocked locally — NOT sent to your broker.';
+  _anFill('xr-list', rows.map(function(r){
+    return (r.time||'—')+' · '+(r.instrument||'?')+' · '+(r.reason||'—');
+  }));
 }
 function renderAnalystMode(d){
   const a=(d && d.analyst) || null;
