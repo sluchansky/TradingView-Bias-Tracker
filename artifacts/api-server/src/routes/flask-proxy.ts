@@ -82,6 +82,7 @@ router.all(
     "/trade-debate",
     "/learning",
     "/entry-quality",
+    "/review-idea",
     "/journal",
     "/journal/",
     "/eod",

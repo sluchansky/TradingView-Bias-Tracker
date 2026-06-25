@@ -48,6 +48,15 @@ def _log_incoming_request():
             n = 0
         logger.info("INCOMING POST /tradezella/upload | BODY: <redacted CSV upload, %s bytes>", n)
         return
+    # Trade-idea reviews carry a free-form chart link / screenshot URL that may embed
+    # a signed token — never echo the body to the request log (only the byte count).
+    if request.path == "/review-idea" and request.method == "POST":
+        try:
+            n = request.content_length or 0
+        except Exception:
+            n = 0
+        logger.info("INCOMING POST /review-idea | BODY: <redacted trade idea, %s bytes>", n)
+        return
     try:
         body = request.get_data(as_text=True)
     except Exception:
@@ -21049,6 +21058,33 @@ def dashboard():
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
 <a class="btn btn-eod" href="/api/diagnostics-live" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
 
+<!-- ════ Potential Trade Idea Review (DISPLAY-ONLY second opinion; review-only) ════ -->
+<div class="mod" id="mod-review">
+  <div class="mod-h">🔎 Trade Idea Review <span style="font-size:10px;color:#6b7280;letter-spacing:1px">ANALYST SECOND OPINION · REVIEW-ONLY</span></div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Type a trade you're considering. The bot grades it with its read-only engines — it never places this for you.</div>
+  <div class="fields">
+    <div class="field"><label>Symbol</label>
+      <select id="ri-sym"><option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option></select></div>
+    <div class="field"><label>Mode</label>
+      <select id="ri-mode"><option>SCALP</option><option>SWING</option></select></div>
+    <div class="field"><label>Direction</label>
+      <select id="ri-dir"><option>LONG</option><option>SHORT</option></select></div>
+    <div class="field"><label>Entry</label><input id="ri-entry" type="number" step="0.1"></div>
+    <div class="field"><label>Stop</label><input id="ri-stop" type="number" step="0.1"></div>
+    <div class="field"><label>Target 1</label><input id="ri-t1" type="number" step="0.1"></div>
+    <div class="field"><label>Target 2 (opt)</label><input id="ri-t2" type="number" step="0.1"></div>
+    <div class="field"><label>Target 3 (opt)</label><input id="ri-t3" type="number" step="0.1"></div>
+    <div class="field"><label>Timeframe (opt)</label><input id="ri-tf" type="text" placeholder="e.g. 5m"></div>
+    <div class="field"><label>Hold time (opt)</label><input id="ri-hold" type="text" placeholder="e.g. 30m"></div>
+  </div>
+  <div class="field" style="margin-top:6px"><label>Why this trade? (opt)</label>
+    <input id="ri-reason" type="text" placeholder="your thesis / trigger"></div>
+  <div class="field" style="margin-top:6px"><label>Chart link / note (opt)</label>
+    <input id="ri-shot" type="text" placeholder="optional — not stored or logged"></div>
+  <button class="btn" id="ri-btn" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560;margin-top:8px;width:100%" onclick="reviewIdea()">🔎 Review my idea</button>
+  <div id="ri-out" style="margin-top:10px"></div>
+</div>
+
 </div><!-- /#view-live -->
 
 <!-- ════════════════ BACKTEST VIEW (read-only research; not wired to /status) ════════════════ -->
@@ -24315,6 +24351,129 @@ paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor();
 autoSelectBestSetup();
+// ── Potential Trade Idea Review (DISPLAY-ONLY; on-demand, NOT in the 3s poll) ──
+function riEsc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function riNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
+function riN(x,d){ return (x==null||x===''||isNaN(x))?'—':Number(x).toFixed(d==null?2:d); }
+
+function riTicketText(ot){
+  if(!ot) return '';
+  var lines=[ (ot.symbol||'')+'  '+(ot.direction||''),
+              'Entry  '+(ot.entry==null?'—':ot.entry),
+              'Stop   '+(ot.stop==null?'—':ot.stop),
+              'T1     '+(ot.t1==null?'—':ot.t1) ];
+  if(ot.t2!=null) lines.push('T2     '+ot.t2);
+  if(ot.t3!=null) lines.push('T3     '+ot.t3);
+  lines.push('Size   '+(ot.contracts==null?'—':ot.contracts)+' contract'+((ot.contracts>1)?'s':''));
+  return lines.join('\\n');
+}
+
+function riCopyTicket(){
+  var el=document.getElementById('ri-ticket'); if(!el) return;
+  var txt=el.textContent||'';
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){ toast('Ticket copied'); }, function(){ toast('Copy failed', false); });
+  } else { toast('Copy not supported', false); }
+}
+
+async function reviewIdea(){
+  var btn=document.getElementById('ri-btn'); var out=document.getElementById('ri-out');
+  var body={
+    symbol: document.getElementById('ri-sym').value,
+    mode: document.getElementById('ri-mode').value,
+    direction: document.getElementById('ri-dir').value,
+    entry: riNum('ri-entry'), stop: riNum('ri-stop'),
+    t1: riNum('ri-t1'), t2: riNum('ri-t2'), t3: riNum('ri-t3'),
+    reason: document.getElementById('ri-reason').value,
+    timeframe: document.getElementById('ri-tf').value,
+    holdtime: document.getElementById('ri-hold').value,
+    screenshot: document.getElementById('ri-shot').value
+  };
+  if(body.entry==null||body.stop==null||body.t1==null){
+    out.innerHTML='<div style="color:#f59e0b">Enter at least Entry, Stop and Target 1.</div>'; return;
+  }
+  var prev=btn.textContent; btn.disabled=true; btn.textContent='⏳ Reviewing…';
+  try{ var r=await api('/review-idea', body); renderReview(r); }
+  catch(e){ out.innerHTML='<div style="color:#ef4444">Review failed — try again.</div>'; }
+  finally{ btn.disabled=false; btn.textContent=prev; }
+}
+
+function renderReview(r){
+  var out=document.getElementById('ri-out');
+  if(!r || r.ok===false){ out.innerHTML='<div style="color:#ef4444">'+riEsc(r&&r.error?r.error:'Review failed.')+'</div>'; return; }
+  var v=r.verdict||'—';
+  var vc = v==='APPROVE'?'#22c55e':(v==='REJECT'?'#ef4444':'#f59e0b');
+  var s=r.sections||{};
+  var rr=s.risk_reward||{}, ma=s.market_alignment||{}, eqs=s.entry_quality||{}, th=s.thesis||{}, mem=s.memory||{}, sb=s.score_breakdown||{}, bp=s.bot_plan||{};
+  var ot=r.order_ticket||{};
+  function li(arr){ if(!arr||!arr.length) return '<li style="color:#6b7280">—</li>'; return arr.map(function(x){return '<li>'+riEsc(x)+'</li>';}).join(''); }
+
+  var html = `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <div style="font-size:22px;font-weight:800;color:${vc}">${riEsc(v)}</div>
+    <div class="gstat"><div class="l">Confidence</div><div class="v">${riN(r.confidence_score,0)}/100</div></div>
+    <div class="gstat"><div class="l">Entry Quality</div><div class="v">${riN(r.entry_quality_score,0)}/100</div></div>
+  </div>
+  <div class="se-reason" style="margin:8px 0">${riEsc(r.final_recommendation||'')}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div><div class="se-bias-h" style="color:#22c55e">For</div><ul style="margin:4px 0;padding-left:16px">${li(r.reasons_for)}</ul></div>
+    <div><div class="se-bias-h" style="color:#ef4444">Against</div><ul style="margin:4px 0;padding-left:16px">${li(r.reasons_against)}</ul></div>
+  </div>`;
+  if(r.red_flags&&r.red_flags.length){
+    html += `<div class="se-bias-h" style="color:#ef4444">Red flags</div><ul style="margin:4px 0;padding-left:16px">${li(r.red_flags)}</ul>`;
+  }
+  html += `<div class="se-bias-h">Score Breakdown</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">
+    <div class="gstat"><div class="l">Risk/Reward</div><div class="v">${riN(sb.risk_reward,0)}/25</div></div>
+    <div class="gstat"><div class="l">Market</div><div class="v">${riN(sb.market_alignment,0)}/30</div></div>
+    <div class="gstat"><div class="l">Entry</div><div class="v">${riN(sb.entry_quality,0)}/25</div></div>
+    <div class="gstat"><div class="l">Memory</div><div class="v">${riN(sb.memory,0)}/10</div></div>
+    <div class="gstat"><div class="l">Conviction</div><div class="v">${riN(sb.conviction,0)}/10</div></div>
+  </div>
+  <div class="se-bias-h">Risk / Reward</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">
+    <div class="gstat"><div class="l">Risk (pts)</div><div class="v">${riN(rr.risk_points)}</div></div>
+    <div class="gstat"><div class="l">R:R T1</div><div class="v">${riN(rr.rr1)}</div></div>
+    <div class="gstat"><div class="l">R:R T2</div><div class="v">${rr.rr2==null?'—':riN(rr.rr2)}</div></div>
+    <div class="gstat"><div class="l">$ Risk/contract</div><div class="v">$${riN(rr.risk_per_contract)}</div></div>
+    <div class="gstat"><div class="l">Max safe size</div><div class="v">${rr.max_safe_size==null?'—':rr.max_safe_size}</div></div>
+    <div class="gstat"><div class="l">Suggested size</div><div class="v">${rr.suggested_size==null?'—':rr.suggested_size}</div></div>
+  </div>
+  <div class="se-bias-h">Market Alignment — ${riEsc(ma.agreement||'—')}</div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">
+    <div class="gstat"><div class="l">Bot Direction</div><div class="v">${riEsc(ma.bot_direction||'—')}</div></div>
+    <div class="gstat"><div class="l">VWAP side</div><div class="v">${riEsc(ma.vwap_side||'—')}</div></div>
+    <div class="gstat"><div class="l">Structure</div><div class="v">${riEsc(ma.structure_label||'—')}</div></div>
+    <div class="gstat"><div class="l">Volatility</div><div class="v">${riEsc(ma.volatility_label||'—')}</div></div>
+    <div class="gstat"><div class="l">Edge (side)</div><div class="v">${ma.edge_score==null?'—':ma.edge_score}</div></div>
+    <div class="gstat"><div class="l">Session</div><div class="v">${riEsc(ma.session_window||'—')}</div></div>
+  </div>
+  <div class="se-bias-h">Entry Quality — ${riEsc(eqs.timing||'—')}</div>
+  <div class="se-reason">Score ${riN(eqs.score,0)}/100 · ATR ${riN(eqs.atr_points)} pts${eqs.atr_approx?' (approx)':''} · ${eqs.chasing?'⚠ chasing price':'not chasing'}${eqs.zone_blocks_t1?' · ⚠ zone before T1':''}${eqs.room_ok?'':' · ⚠ limited room'}</div>`;
+  if(bp.available){
+    html += `<div class="se-bias-h">Bot's Suggested Plan (this side)</div>
+    <div class="se-reason">Zone ${riEsc(bp.best_entry_zone||'—')} · Stop ${riEsc(bp.suggested_stop)} · T1 ${riEsc(bp.suggested_target1)} · T2 ${riEsc(bp.suggested_target2)} · ${riEsc(bp.rr||'')}</div>`;
+  } else {
+    html += `<div class="se-bias-h">Bot's Suggested Plan (this side)</div><div class="se-reason" style="color:#6b7280">${riEsc(bp.note||'—')}</div>`;
+  }
+  html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px">
+    <div><div class="se-bias-h" style="color:#22c55e">Bull Case</div><ul style="margin:4px 0;padding-left:16px">${li(th.bull_case)}</ul></div>
+    <div><div class="se-bias-h" style="color:#ef4444">Bear Case</div><ul style="margin:4px 0;padding-left:16px">${li(th.bear_case)}</ul></div>
+  </div>
+  <div class="se-bias-h">What Needs To Happen</div><ul style="margin:4px 0;padding-left:16px">${li(th.what_next)}</ul>
+  <div class="se-bias-h">Invalidation</div><div class="se-reason">${riEsc(th.invalidation||'—')}</div>
+  <div class="se-bias-h">Trade Memory</div>`;
+  if(mem.ready){
+    html += `<div class="se-reason">Win rate ${mem.weighted_win_rate==null?'—':(Math.round(mem.weighted_win_rate*100)+'%')} · ${mem.matched==null?'—':mem.matched} matched · avg ${riN(mem.weighted_avg_r)}R</div>`;
+  } else {
+    html += `<div class="se-reason" style="color:#6b7280">${riEsc(mem.note||'Insufficient comparable history.')}</div>`;
+  }
+  html += `<div class="se-bias-h" style="margin-top:8px">📋 Manual Order Ticket</div>
+  <div class="se-reason" id="ri-ticket" style="white-space:pre-wrap;font-family:monospace;background:#08252b;border:1px solid #2a5560;border-radius:6px;padding:8px">${riEsc(riTicketText(ot))}</div>
+  <button class="btn" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560;margin-top:6px" onclick="riCopyTicket()">Copy ticket</button>
+  <div style="font-size:11px;color:#6b7280;margin-top:4px">${riEsc(ot.note||'Manual order — place this yourself. Nothing was sent to a broker.')}</div>`;
+  out.innerHTML = html;
+}
+
 setInterval(() => { refresh(); refreshRec(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
@@ -24501,6 +24660,533 @@ def pro_review_controls():
         "default_model":    _PRO_REVIEW_DEFAULT_MODEL,
         "models":           models,
     }), 200
+
+
+# ── Potential Trade Idea Review (DISPLAY-ONLY) ─────────────────────────────────
+# Grades a trade idea the trader typed in by hand, like a second-opinion analyst.
+# REVIEW-ONLY: reuses the read-only engines (full_analysis, find_similar_trades, the
+# per-direction Edge cards) and NEVER touches the strict gate / scoring / auto-execute
+# path, never contacts a broker, and never mutates TRADING_MODE or any state. The
+# dashboard "execute" action only hands the trader a manual order ticket to place
+# themselves (Option A) — there is deliberately NO broker transmit and NO /traderspost
+# call. Owner-only (Basic Auth + same-origin CSRF via the Express proxy; NOT in
+# OPEN_PATHS).
+def _review_idea_num(v):
+    """Parse a user-supplied price to a finite float, or None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _review_dir_norm(token):
+    """Map any direction-ish token to 'Long' / 'Short' / None (self-contained, so the
+    review never depends on another helper's exact casing)."""
+    s = str(token or "").strip().lower()
+    if "long" in s or "bull" in s or s == "buy":
+        return "Long"
+    if "short" in s or "bear" in s or s == "sell":
+        return "Short"
+    return None
+
+
+def _review_user_risk_cap(mode):
+    """Per-trade USD risk ceiling for the USER's reviewed mode (mirrors max_risk_cap()
+    but honors the reviewed mode rather than the live TRADING_MODE). Env override wins."""
+    env = os.environ.get("MAX_RISK_DOLLARS_PER_TRADE")
+    if env is not None:
+        try:
+            return max(1, int(env))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(MODES.get(mode, {}).get("MAX_RISK_DOLLARS", 100)))
+    except (TypeError, ValueError):
+        return 100
+
+
+def _review_trade_idea(payload):
+    payload = payload or {}
+
+    # ── 1) Validate ────────────────────────────────────────────────────────────
+    inst = _instrument_from_text(str(payload.get("symbol") or ""))
+    if not inst:
+        return {"ok": False, "error": "Unrecognized symbol — use MGC, MNQ, MES or MYM."}
+    mode = str(payload.get("mode") or "").strip().upper()
+    if mode not in ("SCALP", "SWING"):
+        return {"ok": False, "error": "Mode must be SCALP or SWING."}
+    direction = str(payload.get("direction") or "").strip().upper()
+    if direction not in ("LONG", "SHORT"):
+        return {"ok": False, "error": "Direction must be LONG or SHORT."}
+    is_long = direction == "LONG"
+    dir_cap = "Long" if is_long else "Short"
+
+    entry = _review_idea_num(payload.get("entry"))
+    stop  = _review_idea_num(payload.get("stop"))
+    t1    = _review_idea_num(payload.get("t1"))
+    t2    = _review_idea_num(payload.get("t2"))
+    t3    = _review_idea_num(payload.get("t3"))
+    if entry is None or stop is None or t1 is None:
+        return {"ok": False, "error": "Entry, Stop and Target 1 must be numbers."}
+
+    reason     = str(payload.get("reason") or "").strip()[:600]
+    timeframe  = str(payload.get("timeframe") or "").strip()[:60]
+    holdtime   = str(payload.get("holdtime") or "").strip()[:80]
+    # Chart note / screenshot URL: echoed for display but NEVER logged (may carry a token).
+    chart_note = str(payload.get("screenshot") or "").strip()[:500]
+
+    pv = spec_for(inst)["point_value"]
+
+    # ── 2) Risk / reward on the USER's own numbers ──────────────────────────────
+    if is_long:
+        risk = entry - stop
+        rwd1 = t1 - entry
+        rwd2 = (t2 - entry) if t2 is not None else None
+        rwd3 = (t3 - entry) if t3 is not None else None
+    else:
+        risk = stop - entry
+        rwd1 = entry - t1
+        rwd2 = (entry - t2) if t2 is not None else None
+        rwd3 = (entry - t3) if t3 is not None else None
+
+    # Optional targets entered on the wrong side of entry are surfaced as a visible
+    # warning (never silently dropped) — R:R then honestly falls back to Target 1.
+    t2_invalid = t2 is not None and rwd2 is not None and rwd2 <= 0
+    t3_invalid = t3 is not None and rwd3 is not None and rwd3 <= 0
+
+    idea = {"symbol": inst, "mode": mode, "direction": direction,
+            "entry": entry, "stop": stop, "t1": t1, "t2": t2, "t3": t3,
+            "reason": reason, "timeframe": timeframe, "holdtime": holdtime,
+            "chart_note": chart_note}
+
+    def _fatal(msg):
+        return {"ok": True, "fatal": True, "verdict": "REJECT",
+                "confidence_score": 0, "entry_quality_score": 0,
+                "idea": idea, "reasons_for": [], "reasons_against": [msg],
+                "red_flags": [msg], "final_recommendation": "REJECT — " + msg,
+                "sections": {}, "order_ticket": None}
+
+    if risk <= 0:
+        return _fatal("Stop is on the wrong side of entry — a %s stop must sit %s entry."
+                      % (direction, "below" if is_long else "above"))
+    if rwd1 is None or rwd1 <= 0:
+        return _fatal("Target 1 is on the wrong side of entry for a %s." % direction)
+
+    # ── 3) Market context (READ-ONLY) ───────────────────────────────────────────
+    result = full_analysis(ticker_override=inst)
+    cur = result.get("current_price")
+    if cur is None:
+        cur = result.get("display_price")
+    vwap = result.get("vwap_value")
+    bias = result.get("bias")
+    strict_dir = _review_dir_norm(result.get("strict_direction"))
+    dom_dir    = _review_dir_norm(result.get("dominant_direction"))
+    bias_dir   = _review_dir_norm(bias)
+    bot_dir    = strict_dir or dom_dir or bias_dir
+    structure_label = result.get("structure_label")
+    structure_class = (result.get("structure_class") or "").lower()
+    nearest_supply  = result.get("nearest_supply")
+    nearest_demand  = result.get("nearest_demand")
+    volblk      = result.get("volatility") or {}
+    vol_label   = volblk.get("label") or volblk.get("volatility_label")
+    vol_blocked = bool(volblk.get("blocked"))
+    session     = result.get("session") or {}
+    sess_pref   = bool(session.get("preferred"))
+    sess_window = session.get("window")
+    dirs = result.get("directions") or {}
+    dblk = dirs.get(dir_cap) or {}
+    user_edge       = dblk.get("edge_score")
+    user_edge_grade = dblk.get("edge_grade")
+    conflict_flag   = bool(dblk.get("conflict"))
+    bot_pp          = dblk.get("potential_plan") or None
+
+    # ATR for entry-quality geometry (fallback to the trade's own risk distance).
+    atrblk = get_volatility(inst) or {}
+    atr = atrblk.get("atr_pts")
+    atr_approx = False
+    if not atr or atr <= 0:
+        atr = abs(risk)
+        atr_approx = True
+
+    # ── 4) Entry quality ────────────────────────────────────────────────────────
+    chasing = False
+    dist_from_cur = None
+    if cur is not None:
+        if is_long:
+            dist_from_cur = entry - cur
+            chasing = entry > cur + 0.35 * atr
+        else:
+            dist_from_cur = cur - entry
+            chasing = entry < cur - 0.35 * atr
+
+    if is_long:
+        opp_zone = nearest_supply if (nearest_supply is not None and nearest_supply > entry) else None
+        sup_zone = nearest_demand
+    else:
+        opp_zone = nearest_demand if (nearest_demand is not None and nearest_demand < entry) else None
+        sup_zone = nearest_supply
+    dist_zone = None
+    zone_blocks_t1 = False
+    zone_too_close = False
+    if opp_zone is not None:
+        dist_zone = (opp_zone - entry) if is_long else (entry - opp_zone)
+        zone_blocks_t1 = (opp_zone < t1) if is_long else (opp_zone > t1)
+        zone_too_close = dist_zone < 0.30 * atr
+    near_support = sup_zone is not None and abs(entry - sup_zone) <= 0.25 * atr
+    near_vwap = vwap is not None and abs(entry - vwap) <= 0.25 * atr
+    room_ok = (dist_zone is None or dist_zone >= risk) and (rwd1 >= risk)
+
+    if chasing:
+        timing = "LATE"
+    elif zone_blocks_t1:
+        timing = "BLOCKED"
+    elif zone_too_close:
+        timing = "LATE"
+    elif near_support or near_vwap:
+        timing = "IDEAL"
+    elif cur is not None and ((is_long and cur < entry) or (not is_long and cur > entry)):
+        timing = "EARLY"
+    else:
+        timing = "FAIR"
+
+    eq = 100
+    if chasing:
+        eq -= 40
+    if zone_too_close:
+        eq -= 20
+    if zone_blocks_t1:
+        eq -= 50
+    if not room_ok:
+        eq -= 15
+    if cur is not None and abs(entry - cur) > 1.0 * atr:
+        eq -= 10
+    if cur is None:
+        eq -= 10
+    eq = max(0, min(100, eq))
+
+    # ── 5) Scoring (transparent; never fabricated) ───────────────────────────────
+    rr1 = (rwd1 / risk) if risk > 0 else 0.0
+    rr2 = (rwd2 / risk) if (rwd2 is not None and rwd2 > 0 and risk > 0) else None
+    rr3 = (rwd3 / risk) if (rwd3 is not None and rwd3 > 0 and risk > 0) else None
+    rr_score_val = rr2 if rr2 is not None else rr1
+    if rr_score_val >= 2.0:
+        rr_pts = 25
+    elif rr_score_val >= 1.5:
+        rr_pts = 20
+    elif rr_score_val >= 1.0:
+        rr_pts = 12
+    else:
+        rr_pts = 4
+
+    # Market alignment (30)
+    if bot_dir is None:
+        dir_pts = 6
+    elif bot_dir == dir_cap:
+        dir_pts = 12
+    else:
+        dir_pts = 0
+    if vwap is None or cur is None:
+        vwap_pts = 3
+    elif (is_long and cur > vwap) or (not is_long and cur < vwap):
+        vwap_pts = 6
+    else:
+        vwap_pts = 0
+    if "bull" in structure_class and is_long:
+        struct_pts = 6
+    elif "bear" in structure_class and not is_long:
+        struct_pts = 6
+    elif structure_class == "" or "neutral" in structure_class or "range" in structure_class:
+        struct_pts = 3
+    else:
+        struct_pts = 0
+    _vl = (vol_label or "").lower()
+    if vol_blocked or "extreme" in _vl:
+        vol_pts = 0
+    elif "elevated" in _vl or "high" in _vl:
+        vol_pts = 2
+    elif "normal" in _vl or "calm" in _vl or "low" in _vl:
+        vol_pts = 3
+    else:
+        vol_pts = 1.5
+    sess_pts = 3 if sess_pref else 1.5
+    market_pts = dir_pts + vwap_pts + struct_pts + vol_pts + sess_pts
+
+    entry_pts = round(eq / 100.0 * 25)
+
+    # Memory (10) — copy the result and force the user's direction. The mode dimension
+    # inside find_similar_trades still reflects the live engine mode; matched_on reports
+    # exactly which dimensions actually matched, so nothing is over-claimed.
+    _copy = dict(result)
+    _copy["strict_direction"] = dir_cap
+    _se = dict(_copy.get("strategy_engine") or {})
+    _se["direction"] = dir_cap
+    _copy["strategy_engine"] = _se
+    try:
+        sim = find_similar_trades(_copy, inst) or {}
+    except Exception:
+        sim = {}
+    mem_wr = sim.get("weighted_win_rate")
+    if not sim.get("ready") or mem_wr is None:
+        mem_pts = 5
+    elif mem_wr >= 0.6:
+        mem_pts = 10
+    elif mem_wr >= 0.5:
+        mem_pts = 8
+    elif mem_wr >= 0.4:
+        mem_pts = 6
+    elif mem_wr >= 0.3:
+        mem_pts = 4
+    else:
+        mem_pts = 2
+
+    # Conviction (10)
+    if conflict_flag:
+        conv_pts = 0
+    elif user_edge is not None:
+        try:
+            conv_pts = round(min(1.0, max(0.0, float(user_edge) / float(EDGE_SCORE_MAX))) * 10)
+        except (TypeError, ValueError, ZeroDivisionError):
+            conv_pts = 5
+    else:
+        conv_pts = 5
+
+    total = int(round(max(0, min(100, rr_pts + market_pts + entry_pts + mem_pts + conv_pts))))
+
+    # ── 6) Position size + red flags + verdict ──────────────────────────────────
+    risk_per_contract = risk * pv
+    cap = _review_user_risk_cap(mode)
+    if risk_per_contract > 0:
+        max_safe = int(cap // risk_per_contract)
+    else:
+        max_safe = 0
+    suggested_size = 1 if max_safe >= 1 else 0
+
+    severe_conflict = strict_dir is not None and strict_dir != dir_cap
+
+    red_flags = []
+    if max_safe < 1:
+        red_flags.append("1 contract risks $%.0f — over the $%d per-trade cap." % (risk_per_contract, cap))
+    if rr_score_val < 1.0:
+        red_flags.append("Reward:risk is below 1:1 (%.2f)." % rr_score_val)
+    if zone_blocks_t1:
+        red_flags.append("An opposing zone sits before Target 1.")
+    if severe_conflict:
+        red_flags.append("The bot's gate currently favors the opposite side (%s)." % strict_dir)
+
+    if max_safe < 1 or rr_score_val < 1.0 or zone_blocks_t1 or severe_conflict or total < 50:
+        verdict = "REJECT"
+    elif total >= 75 and eq >= 70 and rr_score_val >= 1.5 and max_safe >= 1 and not red_flags:
+        verdict = "APPROVE"
+    else:
+        verdict = "MODIFY"
+
+    # ── 7) Reasons ───────────────────────────────────────────────────────────────
+    reasons_for, reasons_against = [], []
+    _tgt = "T2" if rr2 is not None else "T1"
+    if rr_score_val >= 1.5:
+        reasons_for.append("Strong reward:risk of %.2f:1 to %s." % (rr_score_val, _tgt))
+    if dir_pts == 12:
+        reasons_for.append("Aligned with the bot's %s read." % dir_cap)
+    if vwap_pts == 6:
+        reasons_for.append("Price is on the correct side of VWAP.")
+    if struct_pts == 6 and structure_label:
+        reasons_for.append("Market structure agrees (%s)." % structure_label)
+    if timing == "IDEAL":
+        reasons_for.append("Entry is at a quality location (near support/VWAP, not chasing).")
+    elif timing == "EARLY":
+        reasons_for.append("Entering before the move — good location if your trigger confirms.")
+    if sim.get("ready") and mem_wr is not None and mem_wr >= 0.5:
+        reasons_for.append("Similar past trades won %d%% (%d matched)." % (round(mem_wr * 100), sim.get("matched") or 0))
+    if conv_pts >= 7 and user_edge is not None:
+        reasons_for.append("Bot conviction for this side is high (Edge %s)." % user_edge)
+
+    if severe_conflict:
+        reasons_against.append("Counter to the bot's current gate direction (%s)." % strict_dir)
+    elif dir_pts == 0 and bot_dir is not None:
+        reasons_against.append("Counter to the bot's %s lean." % bot_dir)
+    if chasing and dist_from_cur is not None:
+        reasons_against.append("Chasing — entry is %.1f pts beyond current price (> 0.35 ATR)." % abs(dist_from_cur))
+    if zone_too_close and dist_zone is not None:
+        reasons_against.append("Opposing zone only %.1f pts away (< 0.30 ATR)." % dist_zone)
+    if zone_blocks_t1:
+        reasons_against.append("Opposing zone sits before Target 1 — T1 may be hard to reach.")
+    if not room_ok:
+        reasons_against.append("Limited room — under 1R to the opposing zone or to Target 1.")
+    if rr_score_val < 1.0:
+        reasons_against.append("Reward:risk is below 1:1 (%.2f)." % rr_score_val)
+    if max_safe < 1:
+        reasons_against.append("1 contract risks $%.0f, above the $%d cap (size 0)." % (risk_per_contract, cap))
+    if vol_blocked or "extreme" in _vl:
+        reasons_against.append("Volatility is %s." % (vol_label or "extreme"))
+    if sim.get("ready") and mem_wr is not None and mem_wr < 0.4:
+        reasons_against.append("Similar past trades won only %d%%." % round(mem_wr * 100))
+    if t2_invalid:
+        reasons_against.append("Target 2 is on the wrong side of entry — ignored (R:R uses Target 1).")
+    if t3_invalid:
+        reasons_against.append("Target 3 is on the wrong side of entry — ignored.")
+
+    # ── 8) Final recommendation ──────────────────────────────────────────────────
+    if verdict == "APPROVE":
+        final_rec = ("APPROVE — a well-aligned %s %s idea (score %d/100). 1 contract risks "
+                     "$%.0f; suggested size %d (max safe %d)." %
+                     (mode, dir_cap, total, risk_per_contract, suggested_size, max_safe))
+    elif verdict == "REJECT":
+        primary = red_flags[0] if red_flags else ("Overall score %d/100 is below the 50 threshold." % total)
+        final_rec = "REJECT — " + primary
+    else:
+        fix = reasons_against[0] if reasons_against else "tighten the setup before entering."
+        final_rec = "MODIFY — workable, but: " + fix
+
+    # ── 9) Thesis (reuse the analyst engine; fail-open) ──────────────────────────
+    analyst = result.get("analyst") or {}
+    bull_case = list(analyst.get("bull_case") or [])[:6]
+    bear_case = list(analyst.get("bear_case") or [])[:6]
+    invalidation = analyst.get("invalidation") or "—"
+    what_next = list(analyst.get("what_next") or [])[:5] if isinstance(analyst.get("what_next"), list) else []
+    if not what_next:
+        _trig = reason or timeframe or "your stated trigger"
+        what_next = ["Wait for %s to confirm before entering." % _trig]
+    story = analyst.get("story") or result.get("opportunity_reason") or "—"
+
+    # ── 10) Sections ─────────────────────────────────────────────────────────────
+    sections = {
+        "risk_reward": {
+            "valid": True,
+            "risk_points": round(risk, 4),
+            "reward1_points": round(rwd1, 4),
+            "reward2_points": round(rwd2, 4) if rwd2 is not None else None,
+            "reward3_points": round(rwd3, 4) if rwd3 is not None else None,
+            "rr1": round(rr1, 2),
+            "rr2": round(rr2, 2) if rr2 is not None else None,
+            "rr3": round(rr3, 2) if rr3 is not None else None,
+            "point_value": pv,
+            "risk_per_contract": round(risk_per_contract, 2),
+            "reward1_dollars": round(rwd1 * pv, 2),
+            "reward2_dollars": round(rwd2 * pv, 2) if rwd2 is not None else None,
+            "risk_cap": cap,
+            "max_safe_size": max_safe,
+            "suggested_size": suggested_size,
+        },
+        "market_alignment": {
+            "user_direction": dir_cap,
+            "bot_direction": bot_dir,
+            "agreement": ("Aligned" if (bot_dir and bot_dir == dir_cap)
+                          else ("Counter" if bot_dir else "Neutral")),
+            "strict_direction": strict_dir,
+            "bias": bias,
+            "vwap_value": vwap,
+            "vwap_side": (None if (vwap is None or cur is None) else ("above" if cur > vwap else "below")),
+            "structure_label": structure_label,
+            "nearest_supply": nearest_supply,
+            "nearest_demand": nearest_demand,
+            "volatility_label": vol_label,
+            "volatility_blocked": vol_blocked,
+            "session_window": sess_window,
+            "session_preferred": sess_pref,
+            "edge_score": user_edge,
+            "edge_grade": user_edge_grade,
+            "current_price": cur,
+            "points": {"direction": dir_pts, "vwap": vwap_pts, "structure": struct_pts,
+                       "volatility": vol_pts, "session": sess_pts, "total": market_pts},
+        },
+        "entry_quality": {
+            "score": eq,
+            "timing": timing,
+            "chasing": chasing,
+            "atr_points": round(atr, 2),
+            "atr_approx": atr_approx,
+            "distance_to_current": round(dist_from_cur, 2) if dist_from_cur is not None else None,
+            "opposing_zone": opp_zone,
+            "distance_to_zone": round(dist_zone, 2) if dist_zone is not None else None,
+            "zone_blocks_t1": zone_blocks_t1,
+            "zone_too_close": zone_too_close,
+            "room_ok": room_ok,
+            "near_support": near_support,
+            "near_vwap": near_vwap,
+        },
+        "thesis": {
+            "bull_case": bull_case,
+            "bear_case": bear_case,
+            "invalidation": invalidation,
+            "what_next": what_next,
+            "story": story,
+        },
+        "memory": {
+            "ready": bool(sim.get("ready")),
+            "matched": sim.get("matched"),
+            "matched_on": sim.get("matched_on"),
+            "weighted_win_rate": mem_wr,
+            "weighted_avg_r": sim.get("weighted_avg_r"),
+            "top_failure_label": sim.get("top_failure_label"),
+            "best_exit_label": sim.get("best_exit_label"),
+            "note": sim.get("reason"),
+        },
+        "score_breakdown": {
+            "risk_reward": rr_pts, "market_alignment": market_pts,
+            "entry_quality": entry_pts, "memory": mem_pts, "conviction": conv_pts,
+            "total": total,
+        },
+    }
+
+    # Bot's OWN suggested plan for this side (display-only comparison; reuses the
+    # existing per-direction potential_plan — never recomputed here).
+    if bot_pp:
+        sections["bot_plan"] = {
+            "available": True,
+            "best_entry_zone": bot_pp.get("entry_zone"),
+            "suggested_stop": bot_pp.get("stop_loss"),
+            "suggested_target1": bot_pp.get("target1"),
+            "suggested_target2": bot_pp.get("target2"),
+            "rr": bot_pp.get("rr"),
+        }
+    else:
+        sections["bot_plan"] = {"available": False,
+                                "note": "No forming plan for this side right now."}
+
+    # Manual order ticket (Option A): the trader places this themselves. Nothing is
+    # ever sent to a broker and the /traderspost gateway is never called.
+    order_ticket = {
+        "symbol": inst, "direction": direction,
+        "entry": entry, "stop": stop, "t1": t1, "t2": t2, "t3": t3,
+        "contracts": suggested_size,
+        "note": "Manual order — place this yourself. Nothing was sent to a broker.",
+    }
+
+    # Audit log WITHOUT any free text or the chart note / screenshot URL.
+    logger.info("Trade idea review: %s %s %s entry=%s -> %s (score %d, entryQ %d)",
+                inst, mode, direction, entry, verdict, total, eq)
+
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "confidence_score": total,
+        "entry_quality_score": eq,
+        "reasons_for": reasons_for,
+        "reasons_against": reasons_against,
+        "red_flags": red_flags,
+        "final_recommendation": final_rec,
+        "idea": idea,
+        "sections": sections,
+        "order_ticket": order_ticket,
+    }
+
+
+@app.route("/review-idea", methods=["POST"])
+def review_idea():
+    """DISPLAY-ONLY analyst review of a trader-entered trade idea. REVIEW-ONLY: reuses
+    the read-only engines, NEVER touches the gate / scoring / auto-execute path, never
+    contacts a broker, and never mutates state. Owner-only (Basic Auth + same-origin
+    CSRF via the Express proxy; deliberately NOT in OPEN_PATHS)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        out = _review_trade_idea(data)
+    except Exception as e:
+        logger.exception("review-idea failed")
+        out = {"ok": False, "error": "Review failed: %s" % e}
+    return jsonify(out), 200
 
 
 @app.route("/entry-quality", methods=["GET", "POST"])
