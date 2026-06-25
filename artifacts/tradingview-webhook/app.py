@@ -18265,6 +18265,42 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             except Exception as exc:
                 logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
 
+    # -- Fast Entry early-entry money path (SCALP-only; additive + fail-open) ---
+    # Self-guards to a no-op unless FAST_ENTRY_MONEY + FAST_ENTRY_TRIGGER + SCALP +
+    # NOT DUAL_TF (via _fast_entry_money_enabled), so with the flags OFF this whole
+    # block never runs and the money path is byte-identical. It fires ONLY when the
+    # legacy Edge auto did NOT (strict verdict is WAIT) but the seconds layer permits
+    # an early entry on an aligned, nearly-valid HTF setup. The fire-once key is built
+    # to MATCH the key the later FULL-READY legacy auto would mint
+    # (instrument, direction, zone_low) so a fast early entry CLAIMS the setup and the
+    # HTF-READY block never double-enters the same zone. Routed through the SAME
+    # audited gateway (source="fast_entry"); ALL money safety (risk cap, daily cap,
+    # market/session, dedupe, confirmed-send-only) is shared there. DUAL_TF is
+    # mutually exclusive (its own engine owns auto), so the two seconds engines can
+    # never double-fire.
+    if (_fast_entry_money_enabled()
+            and not is_actionable(a.get("verdict"))
+            and auto_trade_enabled(resolved_inst)):
+        _fe = a.get("fast_entry") or {}
+        _fe_dir = _fe.get("direction")
+        if _fe.get("early_entry_allowed") and _fe_dir in ("Long", "Short"):
+            try:
+                _fz = str((a.get("trade_plan") or {}).get("entry_zone", ""))
+                _fz_low = round(float(_fz.split("–")[0]), 0) if _fz else 0.0
+            except (TypeError, ValueError):
+                _fz_low = 0.0
+            _fe_key = (instrument_of(resolved_inst), _fe_dir, _fz_low)
+            with AUTO_TRADE_LOCK:
+                _fe_already = _fe_key in AUTO_FIRED_KEYS
+            if not _fe_already:
+                try:
+                    if _maybe_auto_execute(resolved_inst, allow_stack=True,
+                                           setup_key=_fe_key, source="fast_entry"):
+                        with AUTO_TRADE_LOCK:
+                            AUTO_FIRED_KEYS.add(_fe_key)
+                except Exception as exc:
+                    logger.error("Fast-entry auto-execute error (non-fatal): %s", exc)
+
     # Tiered WATCH/ARMED early alert (SCALP only). Mutually exclusive with the READY
     # card above (alert_level is READY vs WATCH/ARMED) and throttled per instrument.
     # The throttle state is recorded synchronously but the Discord POST is offloaded
@@ -20976,6 +21012,64 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
                         "reason": ("Dual-TF: SCALP filter — "
                                    + "; ".join(m for _, m in _dveto) + ".")}, 409
         direction = dual_dir
+    elif source == "fast_entry":
+        # ── Fast Entry Trigger (seconds-timing EARLY entry; AUTHORITATIVE) ───────
+        # Improves TIMING only. It REUSES the existing strict HTF trade_plan for the
+        # aligned direction (NEVER builds a plan from seconds state) and bypasses
+        # ONLY the is_actionable / EARLY-tier check — EVERY other safety is shared
+        # below (market/session/holiday already enforced above; risk cap, daily cap,
+        # dedupe, fail-closed money path). Fail CLOSED: live only when the money flag
+        # is on AND the freshly-evaluated fast_entry block on THIS server-side
+        # full_analysis still permits the early entry for an aligned direction — a
+        # seconds signal can NEVER manufacture a setup the HTF gate did not form.
+        if not _fast_entry_money_enabled():
+            return {"status": "error", "reason": "Fast Entry money path disabled."}, 409
+        fe = a.get("fast_entry") or {}
+        if not fe.get("early_entry_allowed"):
+            return {"status": "error",
+                    "reason": "Fast Entry not permitted (%s)." % (
+                        fe.get("fast_entry_reason") or "no early entry")}, 409
+        fe_dir = fe.get("direction")
+        if fe_dir not in ("Long", "Short"):
+            return {"status": "error", "reason": "Fast Entry has no aligned direction."}, 409
+        # Opposite-direction Edge conflict veto (mirrors dual_tf): an actionable Edge
+        # READY the OTHER way stands the fast entry down. early_entry_allowed already
+        # requires HTF alignment, so this is defense-in-depth.
+        if is_actionable(verdict):
+            _edge_dir = ready_direction(verdict)
+            if _edge_dir is not None and _edge_dir.lower() != fe_dir.lower():
+                return {"status": "error",
+                        "reason": (f"Edge gate is {_edge_dir} READY — conflicts with "
+                                   f"fast-entry {fe_dir}; entry skipped.")}, 409
+        # REUSE the existing strict HTF plan (never seconds-derived). It must be valid
+        # AND for the aligned direction or we stand down (fail-closed).
+        tp = a["trade_plan"]
+        if not tp.get("trade_plan") or not tp.get("entry_zone"):
+            return {"status": "error",
+                    "reason": f"Fast Entry: no valid HTF trade plan ({tp.get('reason')})."}, 409
+        if str(tp.get("direction", "")).lower() != fe_dir.lower():
+            return {"status": "error",
+                    "reason": "Fast Entry: HTF plan direction mismatch — refusing to send."}, 409
+        # SCALP dynamic-exit entry vetoes apply here too: this path bypasses the Edge
+        # is_actionable check, so the full_analysis veto does NOT cover it. Re-run the
+        # SAME checks against THIS plan + direction and stand down (fail-closed).
+        if _scalp_dynamic_enabled():
+            _cp_fe = CURRENT_PRICE_BY_TICKER.get(instrument)
+            try:
+                _fsq = compute_scalp_quality(
+                    fe_dir, _cp_fe, a.get("vwap_value"), a.get("vwap_status"),
+                    a.get("nearest_supply"), a.get("nearest_demand"), tp,
+                    a.get("edge_score"), instrument,
+                    (a.get("volatility") or {}).get("atr_pts"),
+                )
+                _fveto = _scalp_entry_veto_reasons(_fsq)
+            except Exception as exc:   # FAIL-CLOSED
+                _fveto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
+            if _fveto:
+                return {"status": "error",
+                        "reason": ("Fast Entry: SCALP filter — "
+                                   + "; ".join(m for _, m in _fveto) + ".")}, 409
+        direction = fe_dir
     else:
         if not is_actionable(verdict):
             return {"status": "error",
@@ -21016,7 +21110,17 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     # conviction setups (BOS-only Attempt / EARLY tier) size down via _setup_risk_mult.
     # Dual-TF entries are full-size (1:1, $100-capped below); the Edge structure_class
     # reduced-size modifier applies only to the Edge-verdict auto/manual paths.
-    _size_mult = 1.0 if source == "dual_tf" else _setup_risk_mult(verdict, a.get("structure_class"))
+    if source == "dual_tf":
+        _size_mult = 1.0
+    elif source == "fast_entry":
+        # A fast early entry is sized DOWN like the EARLY tier (half-size) and never
+        # larger than the structure_class would allow — min() avoids quarter-sizing a
+        # setup that is both. verdict is WAIT here, so _setup_risk_mult does not apply
+        # the EARLY multiplier on its own; cap it explicitly with RISK_MULT_EARLY.
+        _size_mult = min(cfg("RISK_MULT_EARLY"),
+                         _setup_risk_mult(verdict, a.get("structure_class")))
+    else:
+        _size_mult = _setup_risk_mult(verdict, a.get("structure_class"))
     _sized = _risk_capped_contracts(abs(entry - stop), point_value_for(instrument),
                                     DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PCT,
                                     size_mult=_size_mult)
@@ -22085,6 +22189,28 @@ def dashboard():
 <div class="mod" id="mod-whynot">
   <div class="mod-h">🚦 Why Not Ready</div>
   <div id="wn-body"></div>
+</div>
+
+<!-- Fast Entry Trigger — seconds (1s/5s) timing layer. DISPLAY-FIRST: the money-path
+     early entry is flag-gated server-side (default OFF). Hidden unless FAST_ENTRY_TRIGGER
+     is on. Fed by d.fast_entry. Improves entry TIMING only on an aligned, valid /
+     nearly-valid HTF setup — it never creates a trade alone and never overrides a bad
+     setup. ALL dynamic strings are written via textContent (never innerHTML). -->
+<div class="mod" id="mod-fastentry" style="display:none">
+  <div class="mod-h">⚡ Fast Entry Trigger <span id="fe-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY</span></div>
+  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <div class="gstat"><div class="l">Seconds Bias</div><div class="v" id="fe-bias">—</div></div>
+    <div class="gstat"><div class="l">Micro Ready</div><div class="v" id="fe-ready">—</div></div>
+    <div class="gstat"><div class="l">Early Entry</div><div class="v" id="fe-early">—</div></div>
+    <div class="gstat"><div class="l">Sweep+Reclaim</div><div class="v" id="fe-sweep" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Micro CHOCH</div><div class="v" id="fe-choch" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Delta Flip</div><div class="v" id="fe-delta" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Micro VWAP</div><div class="v" id="fe-vwap" style="font-size:12px">—</div></div>
+    <div class="gstat"><div class="l">Confidence</div><div class="v" id="fe-conf">—</div></div>
+    <div class="gstat"><div class="l">Money Path</div><div class="v" id="fe-money" style="font-size:12px">—</div></div>
+  </div>
+  <div class="se-reason" id="fe-reason" style="margin-top:8px">—</div>
+  <div class="nf-fid">Seconds (1s/5s) timing only. Sharpens entry timing when the HTF setup is already valid / nearly-valid &amp; aligned — never creates or overrides a trade.</div>
 </div>
 
 <!-- Cross-market index alignment (Nasdaq/S&P/Dow agreement — DISPLAY + ALERTS only; never gates trades) -->
@@ -23622,6 +23748,9 @@ function renderModules(d){
   // ── Module 11b2: Entry Quality — LOCATION-aware entry grading (DISPLAY-ONLY) ──
   renderEntryQuality(d);
 
+  // ── Module 11b3: Fast Entry Trigger — seconds-timing layer (DISPLAY-FIRST) ──
+  renderFastEntry(d);
+
   // ── Module 11c: Trade Debate — pre-READY Bull vs Bear vs Judge (DISPLAY-ONLY) ──
   renderTradeDebate(d);
 
@@ -24143,6 +24272,32 @@ function toggleEntryGate(){
       toast(EQ_GATE_STATE ? 'Entry Quality VETO ARMED — may demote to WAIT' : 'Entry Quality veto off');
     })
     .catch(function(){ EQ_GATE_STATE=cur; toast('Entry Quality veto update failed', false); });
+}
+
+// Fast Entry Trigger — seconds (1s/5s) timing layer. DISPLAY-FIRST: the money-path
+// early entry is flag-gated server-side (default OFF). Fed by d.fast_entry. Hidden
+// unless the trigger layer is enabled. ALL dynamic strings are written via textContent
+// (never innerHTML) so webhook-derived micro-event text can't inject markup.
+function _feDirColor(dir){ return dir==='Long'?'#22c55e':dir==='Short'?'#ef4444':'#9aa'; }
+function renderFastEntry(d){
+  const fe=(d && d.fast_entry) || null;
+  const mod=document.getElementById('mod-fastentry');
+  if(!mod) return;
+  if(!fe || !fe.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id,txt,col){ const e=document.getElementById(id); if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; } };
+  const badge=document.getElementById('fe-badge');
+  if(badge){ badge.textContent=fe.money_enabled?'MONEY ARMED':'DISPLAY'; badge.style.color=fe.money_enabled?'#ef4444':'#6b7280'; }
+  _set('fe-bias', fe.seconds_bias||'—', _feDirColor(fe.seconds_bias));
+  _set('fe-ready', fe.fast_entry_trigger?'YES':'No', fe.fast_entry_trigger?'#22c55e':'#9aa');
+  _set('fe-early', fe.early_entry_allowed?'ALLOWED':'No', fe.early_entry_allowed?'#22c55e':'#9aa');
+  _set('fe-sweep', fe.micro_sweep||'—');
+  _set('fe-choch', fe.micro_choch||'—');
+  _set('fe-delta', fe.delta_flip||'—');
+  _set('fe-vwap', fe.micro_vwap_status||'—');
+  _set('fe-conf', (fe.entry_confidence!=null)?(fe.entry_confidence+'%'):'—');
+  _set('fe-money', fe.money_enabled?'Armed':'Off', fe.money_enabled?'#f59e0b':'#6b7280');
+  _set('fe-reason', fe.fast_entry_reason||'—');
 }
 
 // Trade Debate Engine — pre-READY Bull vs Bear vs Decision Judge, DERIVED from the
