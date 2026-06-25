@@ -29,3 +29,17 @@ unreachable") only when Express is UP but Flask is DOWN. A 502 (not 500), or 500
 persist/recur outside a boot window, is worth real investigation.
 **Don't "fix" the boot 500s:** startup health is correctly gated on `/api/healthz`
 (Express-only, no Flask dependency); the platform retries until ready by design.
+
+## 3. A cold-start 500 can occasionally FAIL the promote (re-publish, don't code-fix)
+**Why:** the platform also runs a service-root readiness probe at `/api` (proxy →
+Flask `/`). If the cold-start 500 window happens to exceed the startup-probe budget,
+the **promote** fails even though the build phase succeeded — the build shows `failed`
+and its (tiny, ~6-line) build log is stuck at `Waiting for deployment to be ready`,
+with runtime logs retaining only a single `healthcheck /api returned status 500`.
+**How to spot it:** the failed build differs from the previous *successful* build by
+nothing runtime-relevant (e.g. only a screenshots/docs commit), and the prior build
+keeps serving (`getDeploymentInfo` → `hasSuccessfulBuild: true`, prod endpoints 200).
+**Fix:** just re-publish — it is transient infra timing, not a code bug. Confirmed:
+one such failed promote was immediately followed by a green re-publish of effectively
+the same tree. Only chase code if the 500s persist across multiple re-publishes or a
+**502** appears (Express up, Flask down).
