@@ -22496,14 +22496,46 @@ def _load_bell_data_uri():
 BELL_DATA_URI = _load_bell_data_uri()
 
 
+# ── App icon (data URI) for iOS "Add to Home Screen" / PWA install ──
+# Same rationale as the bell: base64-inlined into the dashboard <head> so the
+# browser (and iOS when adding to the home screen) needs NO extra route /
+# proxy-whitelist / auth path to fetch it. Fail-open: missing asset → "" and the
+# dashboard simply falls back to no custom icon.
+def _load_icon_data_uri():
+    import base64 as _b64
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [
+        os.path.join(_here, "attached_assets", "generated_images", "app_icon.png"),
+        os.path.join(_here, "..", "..", "attached_assets", "generated_images", "app_icon.png"),
+        os.path.join(os.getcwd(), "attached_assets", "generated_images", "app_icon.png"),
+    ]
+    for _p in _candidates:
+        try:
+            with open(_p, "rb") as _f:
+                return "data:image/png;base64," + _b64.b64encode(_f.read()).decode("ascii")
+        except Exception:
+            continue
+    return ""
+
+
+APP_ICON_DATA_URI = _load_icon_data_uri()
+
+
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>AI Trading Partner</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="AI Trader">
+<meta name="theme-color" content="#0d0221">
+<link rel="apple-touch-icon" href="__APP_ICON_DATA_URI__">
+<link rel="icon" type="image/png" href="__APP_ICON_DATA_URI__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -27576,6 +27608,7 @@ setInterval(checkStale, 2000);
 </html>"""
     html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
     html = html.replace("__BELL_DATA_URI__", BELL_DATA_URI)
+    html = html.replace("__APP_ICON_DATA_URI__", APP_ICON_DATA_URI)
     return html, 200, {
         "Content-Type": "text/html; charset=utf-8",
         # The dashboard is a live view whose inline JS changes on every deploy.
