@@ -1,0 +1,31 @@
+kind = "video"
+previewPath = "/shawn-roast/"
+title = "BREAKING NEWS: Shawn"
+version = "1.0.0"
+id = "artifacts/shawn-roast"
+router = "path"
+
+[[integratedSkills]]
+name = "video-js"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/shawn-roast/" ]
+localPort = 19720
+
+[services.development]
+run = "pnpm --filter @workspace/shawn-roast run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/shawn-roast", "run", "build" ]
+publicDir = "artifacts/shawn-roast/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19720"
+BASE_PATH = "/shawn-roast/"

@@ -1,5 +1,10 @@
 uploads = []
-generated = []
+
+[[generated]]
+id = "6mxIu3QY4OInsDVBWoiXD"
+uri = "file://artifacts/shawn-roast/public/studio_bg.png"
+type = "image"
+title = "News studio background"
 
 [[outputs]]
 id = "iKR4nChLzaVjwKD04WKGt"
