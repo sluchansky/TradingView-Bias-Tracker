@@ -4823,6 +4823,11 @@ def _fetch_intraday_quote(symbol):
     # later key access raise. (Open-market payloads always include all OHLCV keys.)
     if quote.get("low") is None or quote.get("close") is None:
         return None, "incomplete quote payload"
+    # Expose the per-bar OPEN timestamps (epoch secs, index-aligned with the OHLC
+    # arrays) so callers can tell WHICH minute a bar belongs to — needed to stop a
+    # managed trade from being "filled" on a bar that opened before it entered.
+    # Additive: every existing consumer reads high/low/close/volume by key only.
+    quote["_timestamps"] = result.get("timestamp")
     return quote, None
 
 
@@ -15577,6 +15582,10 @@ def _register_managed_trade(entry, ticker=""):
         "runner_pct": mp.get("runner_pct"),
         "risk_points": mp.get("risk_points"), "point_value": mp.get("point_value"),
         "registered_at": datetime.now(timezone.utc).isoformat(),
+        # Epoch (secs) of entry. The same-bar fill guard in _watch_managed_trades
+        # only evaluates this trade against bars that OPENED strictly after it, so a
+        # trade can never be closed on a bar whose high/low predates the entry.
+        "entry_epoch": datetime.now(timezone.utc).timestamp(),
         "events_sent": set(), "updates": [],
         "mfe": 0.0, "mae": 0.0, "be_active": False, "closed": False,
         # S4 dynamic-lifecycle state (SCALP local/paper; inert for SWING / legacy
@@ -15681,9 +15690,17 @@ def _fetch_latest_bar(instrument):
         return None
     _log_feed_status("Latest-bar fetch", instrument, None)
     highs, lows, closes = quote["high"], quote["low"], quote["close"]
+    stamps = quote.get("_timestamps") or []
     for i in range(len(closes) - 1, -1, -1):
         if highs[i] is not None and lows[i] is not None and closes[i] is not None:
-            return {"high": float(highs[i]), "low": float(lows[i]), "close": float(closes[i])}
+            start = None
+            try:
+                if i < len(stamps) and stamps[i] is not None:
+                    start = int(stamps[i])
+            except (TypeError, ValueError):
+                start = None
+            return {"high": float(highs[i]), "low": float(lows[i]),
+                    "close": float(closes[i]), "start": start}
     return None
 
 
@@ -15700,6 +15717,18 @@ def _watch_managed_trades():
     for mt in active:
         bar = bars.get(mt["instrument"])
         if not bar:
+            continue
+        # ── Same-bar / pre-entry fill guard ────────────────────────────────────
+        # Never resolve a trade against a bar that OPENED at or before its entry:
+        # that bar's high/low can include price action from BEFORE the trade was
+        # entered, which would close it instantly (~0s hold) at the EXACT stop or
+        # target — a look-ahead artifact, not a real fill. Only evaluate bars that
+        # began strictly AFTER entry. FAIL-OPEN: if the bar has no open time or the
+        # trade no entry epoch, fall back to the prior (unguarded) behavior.
+        _bar_start   = bar.get("start")
+        _entry_epoch = mt.get("entry_epoch")
+        if (_bar_start is not None and _entry_epoch is not None
+                and _bar_start <= _entry_epoch):
             continue
         try:
             _evaluate_managed_trade_levels(mt, bar)
@@ -22870,6 +22899,10 @@ def dashboard():
   .eq-fid{font-size:10px;color:var(--muted);text-align:center;margin-top:10px;font-style:italic}
   /* Today's trades (per-trade list) */
   #tt-body{overflow-x:auto}
+  .tt-pairs{display:flex;gap:6px;margin:0 0 9px}
+  .tt-pair{flex:1;text-align:center;padding:6px 0;font-size:10.5px;font-weight:700;letter-spacing:1px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;user-select:none;transition:all .15s}
+  .tt-pair:hover{color:#e8e8f0}
+  .tt-pair.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep)}
   .tt-tbl{width:100%;border-collapse:collapse;font-size:11.5px}
   .tt-tbl th{text-align:left;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.5px;font-size:9.5px;padding:5px 6px;border-bottom:1px solid var(--border)}
   .tt-tbl td{padding:6px;border-bottom:1px solid var(--border);color:#e8e8f0;white-space:nowrap}
@@ -23636,6 +23669,12 @@ def dashboard():
 <!-- Today's Trades — per-trade list of trades closed today (display-only, from strategy_trades) -->
 <div class="mod" id="mod-trades">
   <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="tt-pairs" id="tt-pairs">
+    <span class="tt-pair active" id="tt-pair-MGC" role="button" tabindex="0" onclick="ttSelect('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MGC');}">MGC</span>
+    <span class="tt-pair" id="tt-pair-MNQ" role="button" tabindex="0" onclick="ttSelect('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MNQ');}">MNQ</span>
+    <span class="tt-pair" id="tt-pair-MES" role="button" tabindex="0" onclick="ttSelect('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MES');}">MES</span>
+    <span class="tt-pair" id="tt-pair-MYM" role="button" tabindex="0" onclick="ttSelect('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MYM');}">MYM</span>
+  </div>
   <div id="tt-body"></div>
   <div class="tt-fid">Each trade closed today (ET) for the selected instrument. Display-only — accrues live, no backfill.</div>
 </div>
@@ -25803,15 +25842,70 @@ function renderEquityCurve(d){
 }
 
 // Today's trades — per-trade list fed by d.equity_curve_today.points (the same
-// real closed strategy_trades that drive the equity curve). Display-only; follows
-// the selected instrument; newest first; honest empty states.
+// real closed strategy_trades that drive the equity curve). Display-only; newest
+// first; honest empty states.
+// ── Today's Trades pair switcher (DISPLAY-ONLY) ──────────────────────────────
+// A per-panel instrument selector for the trade log. Independent of the main
+// analysis tab: pin the log to any pair to review its closed trades without
+// leaving your current view. ttInst=null follows the main tab (default → no
+// behavior change). Pinning to a non-main pair costs one extra /status fetch per
+// poll tick, only while you are viewing it. Never touches the gate / money path.
+let ttInst = null;        // pinned instrument for the log, or null = follow the main tab
+let ttLastMainD = null;   // last /status payload rendered for the main instrument
+let ttFetching = false;   // in-flight guard for the override fetch
+
+function ttPaintButtons(){
+  const cur = ttInst || sym;
+  INSTRUMENTS.forEach(function(i){
+    const b = document.getElementById('tt-pair-'+i);
+    if (b) b.classList.toggle('active', i===cur);
+  });
+}
+function _ttMainInst(){
+  // Label the main payload by the instrument it was actually fetched for — the
+  // main tab (sym) may have just changed before the next poll refreshes the data.
+  return (ttLastMainD && ttLastMainD.active_ticker)
+    ? String(ttLastMainD.active_ticker).replace('1!','') : sym;
+}
+function ttSelect(inst){
+  ttInst = (ttInst===inst) ? null : inst;   // re-click un-pins → follow the main tab
+  ttPaintButtons();
+  if (ttInst && ttInst!==sym){ ttFetchOverride(); }
+  else { _renderTtFrom(ttLastMainD && ttLastMainD.equity_curve_today, _ttMainInst()); }
+}
+async function ttFetchOverride(){
+  if (ttFetching || !ttInst) return;
+  const reqInst = ttInst;   // snapshot: the selection can change during the await
+  ttFetching = true;
+  try {
+    const od = await api('/status?ticker='+encodeURIComponent(reqInst));
+    // Only paint if the user is still on the pair we fetched (no stale render
+    // under the wrong label); label with the fetched pair, never live ttInst.
+    if (ttInst===reqInst) _renderTtFrom(od && od.equity_curve_today, reqInst);
+  } catch(e){
+    /* leave the last-rendered log in place on a transient fetch error */
+  } finally {
+    ttFetching = false;
+    // Selection changed mid-flight → immediately fetch the current pick.
+    if (ttInst && ttInst!==reqInst) ttFetchOverride();
+  }
+}
+
 function renderTodaysTrades(d){
+  ttLastMainD = d;
+  ttPaintButtons();
+  const mainInst=(d&&d.active_ticker)?String(d.active_ticker).replace('1!',''):sym;
+  // Log pinned to a different pair than the main view → drive it from its own
+  // /status fetch and do NOT clobber it with the main payload.
+  if (ttInst && ttInst!==mainInst){ ttFetchOverride(); return; }
+  _renderTtFrom((d&&d.equity_curve_today)||null, mainInst);
+}
+
+function _renderTtFrom(eq, inst){
   const body=document.getElementById('tt-body');
   const metaEl=document.getElementById('tt-meta');
   if(!body) return;
-  const eq=(d&&d.equity_curve_today)||null;
-  const inst=(d&&d.active_ticker)?String(d.active_ticker).replace('1!',''):sym;
-  if(metaEl) metaEl.textContent='· '+inst;
+  if(metaEl) metaEl.textContent='· '+inst+(ttInst?' · pinned':'');
   if(eq && eq.available===false){
     body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'Trade history unavailable.')+'</div>';
     return;
