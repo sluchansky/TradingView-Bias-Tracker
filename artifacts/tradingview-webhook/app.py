@@ -4635,7 +4635,7 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
     if at_supply and bearish_dominant and has_choch_bos_supply:
         return (
             "Setup Forming",
-            "Wait for MGC Supply Zone Confirmed alert.",
+            "Wait for the Supply Zone Confirmed alert.",
             "Do not enter until zone is confirmed.",
             f"Close above nearest supply ({sup_str}).",
             "Short",
@@ -4645,7 +4645,7 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
     if at_demand and bullish_dominant and has_choch_bos_demand:
         return (
             "Setup Forming",
-            "Wait for MGC Demand Zone Confirmed alert.",
+            "Wait for the Demand Zone Confirmed alert.",
             "Do not enter until zone is confirmed.",
             f"Close below nearest demand ({dem_str}).",
             "Long",
@@ -9746,19 +9746,26 @@ def get_today_equity_curve(ticker):
         cur.execute(
             """
             SELECT closed_at, r_multiple, result, strategy_key, strategy, direction,
-                   entry, hold_minutes
+                   entry, hold_minutes, symbol
             FROM strategy_trades
-            WHERE symbol = %s
-              AND r_multiple IS NOT NULL
+            WHERE r_multiple IS NOT NULL
               AND closed_at IS NOT NULL
               AND (closed_at AT TIME ZONE 'America/New_York')::date
                   = (now() AT TIME ZONE 'America/New_York')::date
             ORDER BY closed_at ASC
             """,
-            (ticker,),
         )
         rows = cur.fetchall()
         cur.close()
+        # `symbol` is stored as the RAW TradingView ticker the trade came in on
+        # (e.g. 'MGC1!'), but the dashboard reads by canonical instrument ('MGC').
+        # Fold raw '1!' tickers (and any contract-month variants) onto the requested
+        # instrument so the panel isn't silently empty (it read 'MGC' while rows were
+        # stored 'MGC1!'). Use the STRICT resolver _instrument_from_text() for the row
+        # symbols: it returns None for blank/ambiguous/unknown, so a malformed row is
+        # SKIPPED rather than lenient-defaulted into the MGC curve. Display-only.
+        _want = instrument_of(ticker)
+        rows = [r for r in rows if _instrument_from_text(r.get("symbol")) == _want]
         points, cum, wins, losses = [], 0.0, 0, 0
         for r in rows:
             try:
