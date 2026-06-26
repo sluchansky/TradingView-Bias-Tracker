@@ -107,6 +107,41 @@ those sibling vetoes**.
   whatever the plan/improvement bullets emit — if a bullet says "wait for X", X's component
   must be in `_improvable` or the projected range won't reflect that advice.
 
+## Entry PLANNER (the 4-section dashboard upgrade)
+- A single nested `result["entry_quality"]["entry_planner"]` dict turns the pass/fail
+  scorer into a full planner. DISPLAY-ONLY / purely additive: it carries **no** veto/reject
+  field, so it is structurally incapable of touching the money path. Computed ONLY on the
+  `available=True` path; `_entry_quality_neutral_block` + every early/no-candidate return
+  mirror `"entry_planner": None` or the dashboard JS reads undefined.
+- Shape: `current_entry{score,grade,problems[]}`, `best_entry_zone{ideal,range_low,
+  range_high,aggressive,conservative,reasons}`, `what_needs_to_happen[]` ("Wait for X"),
+  `entry_triggers{conditions[],estimated_quality,estimated_confidence,confidence_basis,
+  suggested_entry,suggested_stop,suggested_target,risk_points,risk_basis,status}`.
+- **`estimated_quality` = `projected_low` (the realistic 0.80 "Good band" projection), NOT
+  `projected_high` (the perfect-confirm ceiling).** **Why:** the ceiling reads a suspiciously
+  clean 100 on a poor setup; the 0.80 projection ("if these conditions are met to a Good
+  standard") is the honest estimate the user expects (~80s).
+- **`estimated_confidence` = `round(0.45*projected_low + 0.55*edge)` capped 99**, with a
+  surfaced `confidence_basis` string; EQ-only fallback when Edge is unavailable. Never a
+  fabricated probability — the blend is always shown.
+- **Grounded stop: anchor 1×risk_unit beyond the DEEPEST pullback reference** (range_low for
+  a long, range_high for a short), NOT off `entry_level` alone. **Why:** the ideal entry is
+  VWAP-anchored and a demand/supply zone can sit on the *wrong side* of it (e.g. a demand
+  zone ABOVE a VWAP ideal when price is overextended), so an entry_level-anchored stop yields
+  NEGATIVE risk and nulls out. `risk_unit` = HTF ATR in SWING when available else the 1m unit
+  (same mode rule as ext_atr).
+- **Suggested target uses the structural `target_level` only when it yields a sensible
+  1–4R; otherwise a clean 2R projection.** **Why:** an overextended fixture can put resistance
+  ~20R away, which is not a realistic single-trade target.
+- `problems[]` are EVIDENCE-BACKED — real weighted points lost per failed component, sorted
+  by magnitude; fail-open/missing-data (0.70 neutral) artefacts are excluded so a data gap
+  never manufactures a phantom "problem".
+- Dashboard: the 4 sections render under `#eq-planner` (+ a `#eq-planner-h` heading), all 4
+  always shown when the planner is available (empty-state text for Best Entry Zone / What
+  Needs To Happen rather than hiding them). All dynamic values escaped via `_eqEsc`; built by
+  string concatenation with **no** `\n`/`\t` escape literals (the triple-quoted-string trap).
+  Guarded by the planner assertions in `entry_quality_smoke.py` (SCALP).
+
 ## Testing
 - The strict-gate goldens snapshot the strict funcs ONLY (not `full_analysis`), so they
   stay byte-identical for this purely additive layer and do NOT cover the veto wiring.
