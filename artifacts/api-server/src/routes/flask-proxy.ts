@@ -104,6 +104,10 @@ router.all(
     "/tradezella/upload",
     "/tradezella/analysis",
     "/tradezella/trades",
+    // Manual Trade Manager (ADVISORY / DISPLAY-ONLY; owner-only; NOT in dashboard-auth
+    // OPEN_PATHS). Never sends a broker order — monitors a manually-entered position.
+    "/manual-trade",
+    "/manual-trade/close",
   ],
   proxyToFlask,
 );

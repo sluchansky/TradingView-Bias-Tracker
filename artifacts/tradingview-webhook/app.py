@@ -57,6 +57,15 @@ def _log_incoming_request():
             n = 0
         logger.info("INCOMING POST /review-idea | BODY: <redacted trade idea, %s bytes>", n)
         return
+    # Manual Trade Manager entries carry a free-form reason / thesis plus live
+    # position details — never echo the body to the request log (only the byte count).
+    if request.path == "/manual-trade" and request.method == "POST":
+        try:
+            n = request.content_length or 0
+        except Exception:
+            n = 0
+        logger.info("INCOMING POST /manual-trade | BODY: <redacted manual trade, %s bytes>", n)
+        return
     try:
         body = request.get_data(as_text=True)
     except Exception:
@@ -17534,6 +17543,557 @@ def _load_swing_theses_from_db():
             pass
 
 
+# ── Manual Trade Manager (ADVISORY / DISPLAY-ONLY) ──────────────────────────────
+# The user enters a position they took MANUALLY in their own broker; the bot then
+# MONITORS it and returns management guidance (live P&L / R, distance to stop &
+# targets, thesis health, a HOLD / REDUCE / EXIT / MOVE-STOP recommendation,
+# early-exit warnings, what-would-improve / -invalidate and the next review time).
+#
+# It is STRICTLY ADVISORY: it NEVER sends a broker order, never feeds the strict
+# gate / scoring / sizing / dedupe / the /traderspost money path, and never opens or
+# closes a tracked ACTIVE_TRADE. "Close" here only stops our local monitoring of the
+# row. The existing money gateway can only OPEN a server-derived setup — it cannot
+# flatten an arbitrary manual position — so no broker exit path exists by design.
+#
+# Persistence mirrors the journal / swing-thesis convention: app-side INSERT/SELECT
+# (+ a status UPDATE on close) ONLY, NO in-app DDL — the manual_trades table is
+# created out-of-band (database tool in dev, Publish schema-diff in prod). FAIL-OPEN
+# throughout: when the table / DB is unavailable the manager runs in-memory only and
+# a restart simply clears the (display-only) monitor.
+MANUAL_TRADE_DB_READY = False
+MANUAL_TRADES         = {}                       # id -> trade dict (open working set)
+MANUAL_TRADES_LOCK    = threading.RLock()
+MANUAL_TRADE_MODES    = ("SCALP", "SWING")
+
+
+def _check_manual_trade_db_ready():
+    """Probe the manual_trades table (no DDL) and set MANUAL_TRADE_DB_READY. FAIL-OPEN:
+    a missing table / unavailable DB disables persistence (the monitor runs in-memory
+    only)."""
+    global MANUAL_TRADE_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM manual_trades LIMIT 1")
+            cur.fetchone()
+        MANUAL_TRADE_DB_READY = True
+        logger.info("manual_trades table ready")
+    except Exception as exc:
+        logger.warning("manual_trades table unavailable (manual-trade persistence disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_manual_trade(trade):
+    """Upsert a manual trade snapshot by id. FAIL-OPEN; the DB write is offloaded to
+    the slow-task worker so a stall never delays the dashboard. The snapshot is
+    captured synchronously so a later mutation can't corrupt this write. DISPLAY /
+    local-tracking ONLY — never the money path."""
+    if not MANUAL_TRADE_DB_READY or not trade or not trade.get("id"):
+        return
+    tid        = trade["id"]
+    snapshot   = {k: v for k, v in trade.items() if k not in ("min_r", "max_r")}
+    status     = trade.get("status", "open")
+    instrument = trade.get("symbol")
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO manual_trades (id, payload, status, instrument)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (id)
+                       DO UPDATE SET payload    = EXCLUDED.payload,
+                                     status     = EXCLUDED.status,
+                                     instrument = EXCLUDED.instrument,
+                                     updated_at = now()""",
+                    (tid, psycopg2.extras.Json(snapshot), status, instrument),
+                )
+        except Exception as exc:
+            logger.warning("manual trade persist failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _load_manual_trades_from_db():
+    """Rehydrate OPEN manual trades from Postgres at boot so the advisory monitor
+    survives a restart. FAIL-OPEN; INERT — only repopulates the in-memory cache (no
+    alert / journal / broker side-effect)."""
+    if not MANUAL_TRADE_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM manual_trades WHERE status = 'open' ORDER BY updated_at DESC")
+            rows = cur.fetchall()
+        restored = 0
+        with MANUAL_TRADES_LOCK:
+            for (payload,) in rows:
+                if isinstance(payload, dict) and payload.get("id"):
+                    MANUAL_TRADES[payload["id"]] = dict(payload)
+                    restored += 1
+        logger.info("Manual trades restored from DB: %d open", restored)
+    except Exception as exc:
+        logger.warning("manual trade load failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _manual_px(x):
+    """Format a price / points value for advisory text (2dp); '—' when missing."""
+    try:
+        return "%.2f" % float(x)
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _manual_coerce_float(v):
+    try:
+        f = float(v)
+        if math.isfinite(f):
+            return f
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _parse_manual_entry_time(value):
+    """Best-effort parse of a user-supplied entry time to a UTC ISO string. Accepts
+    ISO-8601 (tz-aware or naive) or a datetime-local 'YYYY-MM-DDTHH:MM'. A naive value
+    is treated as Eastern Time (the dashboard's display zone). Returns (iso|None, raw).
+    DISPLAY-ONLY — the entry time never drives the gate or money path."""
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return None, ""
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ET_TZ)
+        return dt.astimezone(timezone.utc).isoformat(), raw
+    except (ValueError, TypeError):
+        return None, raw
+
+
+def _build_manual_trade(data):
+    """Strictly validate a manual-trade creation payload. Returns (trade, None) on
+    success or (None, error_message). ADVISORY-ONLY input — never a money path, so
+    these prices are stored for monitoring and are never sent to a broker."""
+    symbol = _instrument_from_text(data.get("symbol"))
+    if symbol is None:
+        return None, "A valid symbol (MGC, MNQ, MES, or MYM) is required."
+
+    draw = str(data.get("direction", "")).strip().lower()
+    if draw.startswith("l"):
+        direction = "Long"
+    elif draw.startswith("s"):
+        direction = "Short"
+    else:
+        return None, "Direction must be LONG or SHORT."
+
+    entry = _manual_coerce_float(data.get("entry"))
+    stop  = _manual_coerce_float(data.get("stop"))
+    if entry is None or stop is None:
+        return None, "Entry and stop must be valid numbers."
+    if entry == stop:
+        return None, "Entry and stop cannot be equal."
+
+    t1 = _manual_coerce_float(data.get("target1"))
+    t2 = _manual_coerce_float(data.get("target2"))
+    if t1 is None or t2 is None:
+        return None, "Target 1 and Target 2 must be valid numbers."
+    t3 = _manual_coerce_float(data.get("target3"))   # optional
+
+    contracts_raw = _manual_coerce_float(data.get("contracts", 1))
+    if contracts_raw is None or contracts_raw != int(contracts_raw):
+        return None, "Contracts must be a whole number."   # reject 1.5 etc. (int() would silently truncate)
+    contracts = int(contracts_raw)
+    if contracts < 1 or contracts > 1000:
+        return None, "Contracts must be between 1 and 1000."
+
+    mode = str(data.get("mode", "")).strip().upper()
+    if mode not in MANUAL_TRADE_MODES:
+        return None, "Mode must be SCALP or SWING."
+
+    # Direction must agree with the stop & target placement (catches transposed inputs).
+    if direction == "Long":
+        if not (stop < entry):
+            return None, "For a LONG, the stop must be below the entry."
+        if not (t1 > entry and t2 > entry and (t3 is None or t3 > entry)):
+            return None, "For a LONG, targets must be above the entry."
+    else:
+        if not (stop > entry):
+            return None, "For a SHORT, the stop must be above the entry."
+        if not (t1 < entry and t2 < entry and (t3 is None or t3 < entry)):
+            return None, "For a SHORT, targets must be below the entry."
+
+    entry_iso, entry_raw = _parse_manual_entry_time(data.get("entry_time"))
+    reason = str(data.get("reason", "") or "").strip()[:500]
+
+    return {
+        "id":             "%s-%d-%s" % (symbol, int(time.time() * 1000), uuid.uuid4().hex[:6]),
+        "symbol":         symbol,
+        "direction":      direction,
+        "entry_price":    entry,
+        "stop_loss":      stop,
+        "target1":        t1,
+        "target2":        t2,
+        "target3":        t3,
+        "contracts":      contracts,
+        "mode":           mode,
+        "reason":         reason,
+        "entry_time":     entry_iso,
+        "entry_time_raw": entry_raw,
+        "opened_at":      now_utc().isoformat(),
+        "status":         "open",
+    }, None
+
+
+def _manual_next_review(mode, now=None):
+    """Next advisory review time. SCALP reviews at the next 5-minute boundary; SWING on
+    a ~30-minute cadence. DISPLAY-ONLY."""
+    now  = now or now_utc()
+    step = 5 if mode == "SCALP" else 30
+    nxt  = now.replace(second=0, microsecond=0)
+    minute = (now.minute // step + 1) * step
+    if minute >= 60:
+        nxt = (nxt + timedelta(hours=1)).replace(minute=minute - 60)
+    else:
+        nxt = nxt.replace(minute=minute)
+    return nxt
+
+
+def _stop_at_or_past_be(direction, stop, entry):
+    """True when the stop is already at / beyond breakeven (entry)."""
+    return (stop >= entry) if direction == "Long" else (stop <= entry)
+
+
+def compute_manual_trade_management(trade, analysis=None):
+    """ADVISORY-ONLY live management read for one manually-entered position.
+
+    Reuses the existing read-only engines (full_analysis, compute_pnl,
+    compute_distances) and NEVER mutates trading state, feeds the gate / sizing /
+    dedupe, or sends a broker order. Degrades gracefully: a missing / stale price (or
+    a zero-risk trade) yields a 'monitor unavailable' status rather than fabricated
+    guidance. The only field it writes back on `trade` is the observed min_r / max_r
+    (in-memory only) used for the honest 'poor entry but recovering' read."""
+    symbol    = trade.get("symbol")
+    direction = trade.get("direction", "Long")
+    entry     = trade.get("entry_price")
+    stop      = trade.get("stop_loss")
+    mode      = trade.get("mode", "SCALP")
+    is_long   = (direction == "Long")
+
+    out = {
+        "id":            trade.get("id"),
+        "symbol":        symbol,
+        "direction":     direction,
+        "mode":          mode,
+        "entry_price":   entry,
+        "stop_loss":     stop,
+        "target1":       trade.get("target1"),
+        "target2":       trade.get("target2"),
+        "target3":       trade.get("target3"),
+        "contracts":     trade.get("contracts"),
+        "reason":        trade.get("reason"),
+        "entry_time":    trade.get("entry_time"),
+        "entry_time_et": (fmt_et(trade.get("entry_time")) if trade.get("entry_time")
+                          else (trade.get("entry_time_raw") or "")),
+        "opened_at":     trade.get("opened_at"),
+        "opened_at_et":  fmt_et(trade.get("opened_at")),
+        "next_review_et": fmt_et(_manual_next_review(mode)),
+        "warnings":         [],
+        "what_improves":    [],
+        "what_invalidates": [],
+        "entry_assessment": None,
+        "advisory_only":    True,
+    }
+
+    # Live analysis (read-only). The caller may pass a shared instance so full_analysis
+    # is computed once per distinct symbol per poll and fanned out across its trades.
+    if analysis is None:
+        try:
+            analysis = full_analysis(ticker_override=symbol)
+        except Exception as exc:
+            analysis = None
+            logger.warning("manual-trade analysis failed for %s: %s", symbol, exc)
+    a = analysis or {}
+
+    # Current price (display source). No live price -> monitor unavailable.
+    price = a.get("display_price")
+    psrc  = a.get("price_source")
+    if price is None:
+        price, psrc = display_price_for(symbol)
+    out["current_price"] = price
+    out["price_source"]  = psrc
+
+    risk = abs(entry - stop) if (entry is not None and stop is not None) else None
+    if price is None or not risk:
+        out["status"]                = "unavailable"
+        out["thesis_status"]         = "UNKNOWN"
+        out["recommendation"]        = "MONITOR"
+        out["recommendation_reason"] = (
+            f"No live price for {symbol} right now — monitoring paused (no guidance fabricated)."
+            if price is None else "Entry and stop are equal — cannot compute risk."
+        )
+        return out
+
+    out["status"] = "ok"
+
+    # ── Live math (reuse the existing read-only helpers) ──
+    pnl_trade = {"direction": direction, "entry_price": entry,
+                 "contracts": trade.get("contracts", 1), "symbol": symbol}
+    dollar_pnl, pts_pnl = compute_pnl(pnl_trade, price)
+    fav       = (price - entry) if is_long else (entry - price)
+    current_r = fav / risk
+    out["unrealized_pnl"]    = round(dollar_pnl, 2)
+    out["unrealized_points"] = round(pts_pnl, 2)
+    out["current_r"]         = round(current_r, 2)
+    out["risk_points"]       = round(risk, 2)
+
+    dist_trade = {"direction": direction, "target1": trade.get("target1"),
+                  "target2": trade.get("target2"), "stop_loss": stop}
+    to_t1, to_t2, to_stop = compute_distances(dist_trade, price)
+    out["dist_to_stop"]    = round(to_stop, 2)
+    out["dist_to_target1"] = round(to_t1, 2)
+    out["dist_to_target2"] = round(to_t2, 2)
+    t3_val = trade.get("target3")
+    if t3_val is not None:
+        out["dist_to_target3"] = round((t3_val - price) if is_long else (price - t3_val), 2)
+
+    # Track observed extremes (in-memory only) for the 'recovering' read.
+    prev_min = trade.get("min_r")
+    prev_max = trade.get("max_r")
+    trade["min_r"] = current_r if prev_min is None else min(prev_min, current_r)
+    trade["max_r"] = current_r if prev_max is None else max(prev_max, current_r)
+
+    # Position vs stop / targets (inclusive — price can sit exactly on a level).
+    stop_breached = (price <= stop) if is_long else (price >= stop)
+    t1_hit = (price >= trade["target1"]) if is_long else (price <= trade["target1"])
+    t2_hit = bool(trade.get("target2") is not None and
+                  ((price >= trade["target2"]) if is_long else (price <= trade["target2"])))
+    t3_hit = bool(t3_val is not None and
+                  ((price >= t3_val) if is_long else (price <= t3_val)))
+    out["stop_breached"] = stop_breached
+    out["target1_hit"]   = t1_hit
+    out["target2_hit"]   = t2_hit
+    out["target3_hit"]   = t3_hit
+
+    # ── Live signal reads (all defensive / None-safe) ──
+    sc          = str(a.get("structure_class") or "").lower()
+    vwap_value  = a.get("vwap_value")
+    vwap_status = str(a.get("vwap_status") or "").lower()
+    nearest_supply = a.get("nearest_supply")
+    nearest_demand = a.get("nearest_demand")
+    market_open = a.get("market_open")
+    vol = a.get("volatility") or {}
+
+    structure_bullish = ("bullish" in sc)            # Bullish Trend / Bullish Attempt
+    structure_bearish = ("bearish" in sc)
+    confirmed_trend   = sc in ("bullish trend", "bearish trend")
+    # Only an opposite *confirmed* trend (CHOCH-level) is strong enough to invalidate;
+    # an Attempt (BOS-only) or a bias flip alone merely weakens the thesis.
+    opposite_confirmed = (confirmed_trend and
+                          ((is_long and structure_bearish) or ((not is_long) and structure_bullish)))
+    opposite_soft = (((is_long and structure_bearish) or ((not is_long) and structure_bullish))
+                     and not opposite_confirmed)
+
+    vwap_ok      = (vwap_status == "ok" and vwap_value is not None)
+    vwap_against = bool(vwap_ok and ((price < vwap_value) if is_long else (price > vwap_value)))
+    near_stop    = (not stop_breached) and (to_stop <= 0.25 * risk)
+
+    # Opposing zone sitting between price and the first target (resistance ahead of a
+    # long / support ahead of a short).
+    zone_ahead = None
+    tgt1 = trade.get("target1")
+    if is_long and nearest_supply is not None and tgt1 is not None \
+            and price < nearest_supply < tgt1:
+        zone_ahead = nearest_supply
+    if (not is_long) and nearest_demand is not None and tgt1 is not None \
+            and tgt1 < nearest_demand < price:
+        zone_ahead = nearest_demand
+
+    # ── Thesis status ──
+    if stop_breached or opposite_confirmed:
+        thesis = "INVALID"
+    elif (current_r < 0) or opposite_soft or vwap_against or near_stop or (zone_ahead is not None):
+        thesis = "WEAKENING"
+    else:
+        thesis = "VALID"
+
+    # ── Warnings ──
+    warnings = []
+    if stop_breached:
+        warnings.append(f"Price has reached or passed your stop at {_manual_px(stop)}.")
+    if opposite_confirmed:
+        warnings.append(f"Market structure flipped against you ({a.get('structure_class') or 'opposite trend'}).")
+    elif opposite_soft:
+        warnings.append(f"Early structure pressure against your direction ({a.get('structure_class') or '—'}).")
+    if vwap_against and not stop_breached:
+        warnings.append(f"Price is on the wrong side of VWAP ({_manual_px(vwap_value)}) for a {'long' if is_long else 'short'}.")
+    if near_stop:
+        warnings.append(f"Price is within {_manual_px(to_stop)} pts of your stop.")
+    if zone_ahead is not None:
+        warnings.append(f"An opposing {'supply' if is_long else 'demand'} zone at {_manual_px(zone_ahead)} sits before your first target.")
+    if vol.get("status") == "ok" and vol.get("blocked"):
+        warnings.append(f"Volatility is elevated ({vol.get('label') or 'high'}) — expect wider swings than normal.")
+    out["warnings"] = warnings
+
+    # ── Recommendation ──
+    if stop_breached:
+        rec, why = "EXIT", f"Your stop at {_manual_px(stop)} has been hit — the trade is invalidated; exit per your plan."
+    elif thesis == "INVALID":
+        rec = "EXIT"
+        why = ("Your thesis is broken but you're in profit — bank it rather than give it back."
+               if dollar_pnl > 0 else
+               "Your thesis is broken and the trade is offside — cut the loss.")
+    elif t3_hit or t2_hit:
+        rec, why = "REDUCE", "You've reached a deeper target — scale out and trail your stop to protect the win."
+    elif t1_hit:
+        rec, why = "MOVE STOP", f"First target reached — take partial profit and move your stop to breakeven ({_manual_px(entry)})."
+    elif current_r >= 1.0 and not _stop_at_or_past_be(direction, stop, entry):
+        rec, why = "MOVE STOP", f"You're up about {current_r:.1f}R — move your stop to breakeven ({_manual_px(entry)}) to make this risk-free."
+    elif thesis == "WEAKENING":
+        if near_stop or current_r <= -0.5:
+            rec, why = "REDUCE", "Momentum is against you and price is pressing your stop — consider trimming risk."
+        else:
+            rec, why = "HOLD", "Thesis is weakening but your stop is intact — hold and watch the listed risks closely."
+    else:
+        rec = "HOLD"
+        why = (f"Thesis intact and the trade is working ({current_r:.1f}R) — let it run toward your targets."
+               if current_r > 0 else
+               "Thesis intact — give the trade room to your stop; no action needed yet.")
+
+    # Market closed: pause and extend the review to the next open — never invalidate
+    # a held position just because the session is shut.
+    if market_open is False:
+        out["next_review_et"] = a.get("next_open") or out["next_review_et"]
+        if not stop_breached:
+            # A held position is PAUSED while the session is shut — never invalidated by
+            # (often stale) closed-market structure. Only a real stop-out keeps INVALID/EXIT.
+            rec, why = "HOLD", "Market is closed — monitoring paused; reassess at the next session open."
+            thesis = "PAUSED"
+
+    out["thesis_status"]         = thesis
+    out["recommendation"]        = rec
+    out["recommendation_reason"] = why
+
+    # ── What would improve / invalidate the thesis ──
+    improves, invalidates = [], []
+    if is_long:
+        if vwap_against:
+            improves.append(f"Reclaim and hold above VWAP ({_manual_px(vwap_value)}).")
+        improves.append("A bullish CHOCH / BOS confirming higher highs in your favor.")
+        improves.append(f"Volume expansion driving price toward {_manual_px(tgt1)}.")
+        invalidates.append(f"A decisive close below your stop at {_manual_px(stop)}.")
+        invalidates.append("A confirmed bearish CHOCH (structure flips down).")
+        if nearest_demand is not None:
+            invalidates.append(f"Price accepting below the demand zone at {_manual_px(nearest_demand)}.")
+    else:
+        if vwap_against:
+            improves.append(f"Lose and hold below VWAP ({_manual_px(vwap_value)}).")
+        improves.append("A bearish CHOCH / BOS confirming lower lows in your favor.")
+        improves.append(f"Volume expansion driving price toward {_manual_px(tgt1)}.")
+        invalidates.append(f"A decisive close above your stop at {_manual_px(stop)}.")
+        invalidates.append("A confirmed bullish CHOCH (structure flips up).")
+        if nearest_supply is not None:
+            invalidates.append(f"Price accepting above the supply zone at {_manual_px(nearest_supply)}.")
+    out["what_improves"]    = improves
+    out["what_invalidates"] = invalidates
+
+    # ── Entry-quality read (honest, derived from observed action since monitoring) ──
+    min_r = trade.get("min_r", current_r)
+    recovering = (min_r <= -0.4 and current_r > min_r + 0.3 and current_r > -0.1)
+    if recovering and current_r > 0:
+        out["entry_assessment"] = (f"This trade went against you (low {min_r:.1f}R) and has recovered to "
+                                   f"+{current_r:.1f}R — the entry was poorly timed; favor scaling out into "
+                                   f"strength over expecting a clean runner.")
+    elif recovering:
+        out["entry_assessment"] = (f"Down to {min_r:.1f}R earlier, now {current_r:.1f}R and recovering — the "
+                                   f"entry was early; manage risk tightly back toward breakeven.")
+    elif current_r < 0:
+        out["entry_assessment"] = (f"Currently offside at {current_r:.1f}R (worst {min_r:.1f}R). Hold only while "
+                                   f"your stop and thesis are intact.")
+    return out
+
+
+@app.route("/manual-trade", methods=["GET", "POST"])
+def manual_trade():
+    """ADVISORY-ONLY Manual Trade Manager. POST creates a monitored position; GET lists
+    every open position with live guidance. Owner-only (auth enforced at the Express
+    /api edge; NOT in dashboard-auth OPEN_PATHS). NEVER sends a broker order."""
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        trade, err = _build_manual_trade(data)
+        if err:
+            return jsonify({"status": "error", "reason": err}), 400
+        with MANUAL_TRADES_LOCK:
+            MANUAL_TRADES[trade["id"]] = trade
+        _persist_manual_trade(trade)
+        logger.info("Manual trade added (advisory-only): %s %s @ %.2f",
+                    trade["symbol"], trade["direction"], trade["entry_price"])
+        return jsonify({"status": "added", "id": trade["id"],
+                        "trade": compute_manual_trade_management(trade)}), 200
+
+    # GET — list open manual trades with live advisory guidance. full_analysis is
+    # computed ONCE per distinct symbol then fanned out across that symbol's trades.
+    analysis_cache = {}
+    items = []
+    with MANUAL_TRADES_LOCK:
+        trades = list(MANUAL_TRADES.values())
+        for t in trades:
+            sym = t.get("symbol")
+            if sym not in analysis_cache:
+                try:
+                    analysis_cache[sym] = full_analysis(ticker_override=sym)
+                except Exception as exc:
+                    logger.warning("manual-trade list analysis failed for %s: %s", sym, exc)
+                    analysis_cache[sym] = None
+            items.append(compute_manual_trade_management(t, analysis=analysis_cache[sym]))
+    items.sort(key=lambda x: x.get("opened_at") or "", reverse=True)
+    return jsonify({"status": "ok", "trades": items,
+                    "persisted": MANUAL_TRADE_DB_READY, "count": len(items)}), 200
+
+
+@app.route("/manual-trade/close", methods=["POST"])
+def manual_trade_close():
+    """Stop monitoring a manual trade. ADVISORY-ONLY — this only removes the row from
+    the local monitor (and marks it closed in our table); it NEVER sends a broker
+    order or touches a tracked ACTIVE_TRADE."""
+    data = request.get_json(force=True, silent=True) or {}
+    tid  = str(data.get("id", "")).strip()
+    if not tid:
+        return jsonify({"status": "error", "reason": "A trade id is required."}), 400
+    with MANUAL_TRADES_LOCK:
+        trade = MANUAL_TRADES.pop(tid, None)
+    if trade is None:
+        return jsonify({"status": "error", "reason": "No open manual trade with that id."}), 404
+    trade["status"]    = "closed"
+    trade["closed_at"] = now_utc().isoformat()
+    _persist_manual_trade(trade)
+    logger.info("Manual trade monitoring stopped: %s", tid)
+    return jsonify({"status": "closed", "id": tid}), 200
+
+
 def create_journal_entry(record, a, sizing, post_discord=True):
     """Auto-journal every Possible/Strong Trade recommendation, skipping duplicates.
 
@@ -23026,6 +23586,32 @@ def dashboard():
   <div id="ri-out" style="margin-top:10px"></div>
 </div>
 
+<!-- ════ Manual Trade Manager (ADVISORY / DISPLAY-ONLY; never places or closes a broker order) ════ -->
+<div class="mod" id="mod-manual">
+  <div class="mod-h">🧮 Manual Trade Manager <span style="font-size:10px;color:#6b7280;letter-spacing:1px">ADVISORY · NEVER PLACES ORDERS</span></div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Log a position you took yourself. The bot monitors it live and advises — it never sends or closes a broker order for you.</div>
+  <div class="fields">
+    <div class="field"><label>Symbol</label>
+      <select id="mt-symbol"><option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option></select></div>
+    <div class="field"><label>Direction</label>
+      <select id="mt-dir"><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></div>
+    <div class="field"><label>Mode</label>
+      <select id="mt-mode"><option>SCALP</option><option>SWING</option></select></div>
+    <div class="field"><label>Entry</label><input id="mt-entry" type="number" step="0.1"></div>
+    <div class="field"><label>Stop</label><input id="mt-stop" type="number" step="0.1"></div>
+    <div class="field"><label>Contracts</label><input id="mt-contracts" type="number" step="1" min="1" value="1"></div>
+    <div class="field"><label>Target 1</label><input id="mt-t1" type="number" step="0.1"></div>
+    <div class="field"><label>Target 2</label><input id="mt-t2" type="number" step="0.1"></div>
+    <div class="field"><label>Target 3 (opt)</label><input id="mt-t3" type="number" step="0.1"></div>
+    <div class="field"><label>Entry time (opt)</label><input id="mt-time" type="datetime-local"></div>
+  </div>
+  <div class="field" style="margin-top:6px"><label>Reason / thesis (opt)</label>
+    <input id="mt-reason" type="text" placeholder="why you took this trade"></div>
+  <button class="btn" id="mt-btn" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560;margin-top:8px;width:100%" onclick="addManualTrade()">➕ Monitor this trade</button>
+  <div id="mt-msg" style="font-size:11px;margin-top:6px"></div>
+  <div id="mt-list" style="margin-top:10px"></div>
+</div>
+
 </div><!-- /#view-live -->
 
 <!-- ════════════════ BACKTEST VIEW (read-only research; not wired to /status) ════════════════ -->
@@ -26581,7 +27167,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); refreshManual();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -26810,7 +27396,109 @@ function renderReview(r){
   out.innerHTML = html;
 }
 
-setInterval(() => { refresh(); refreshRec(); }, 3000);
+// ── Manual Trade Manager (ADVISORY / DISPLAY-ONLY) ──────────────────────────────
+// Posts a manually-taken position to /manual-trade and polls it for live advisory
+// guidance. It NEVER sends or closes a broker order — "Stop monitoring" only drops
+// the row from this display.
+function mtNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
+function mtThesisColor(t){ return t==='VALID'?'#22c55e':(t==='WEAKENING'?'#f59e0b':(t==='INVALID'?'#ef4444':'#9aa')); }
+function mtRecColor(r){ return r==='HOLD'?'#22c55e':(r==='MOVE STOP'?'#3b82f6':(r==='REDUCE'?'#f59e0b':(r==='EXIT'?'#ef4444':'#9aa'))); }
+
+async function addManualTrade(){
+  var btn=document.getElementById('mt-btn'); var msg=document.getElementById('mt-msg');
+  var body={
+    symbol: document.getElementById('mt-symbol').value,
+    direction: document.getElementById('mt-dir').value,
+    mode: document.getElementById('mt-mode').value,
+    entry: mtNum('mt-entry'), stop: mtNum('mt-stop'),
+    contracts: mtNum('mt-contracts'),
+    target1: mtNum('mt-t1'), target2: mtNum('mt-t2'), target3: mtNum('mt-t3'),
+    entry_time: document.getElementById('mt-time').value,
+    reason: document.getElementById('mt-reason').value
+  };
+  if(body.entry==null||body.stop==null||body.target1==null||body.target2==null){
+    msg.style.color='#f59e0b'; msg.textContent='Enter Entry, Stop, Target 1 and Target 2 (Symbol & Direction are picked above).'; return;
+  }
+  var prev=btn.textContent; btn.disabled=true; btn.textContent='⏳ Adding…';
+  try{
+    var r=await api('/manual-trade', body);
+    if(r && r.status==='added'){
+      msg.style.color='#22c55e'; msg.textContent='Added to monitor — advisory only, no order sent.';
+      ['mt-entry','mt-stop','mt-t1','mt-t2','mt-t3','mt-reason','mt-time'].forEach(function(id){document.getElementById(id).value='';});
+      document.getElementById('mt-contracts').value='1';
+      refreshManual();
+    } else {
+      msg.style.color='#ef4444'; msg.textContent=(r&&r.reason)?r.reason:'Could not add trade.';
+    }
+  } catch(e){ msg.style.color='#ef4444'; msg.textContent='Add failed — try again.'; }
+  finally{ btn.disabled=false; btn.textContent=prev; }
+}
+
+async function closeManualTrade(id){
+  try{ await api('/manual-trade/close', {id:id}); refreshManual(); } catch(e){}
+}
+
+async function refreshManual(){
+  try{ var d=await api('/manual-trade'); renderManual(d); } catch(e){}
+}
+
+function mtList(arr){
+  if(!arr||!arr.length) return '';
+  return '<ul style="margin:4px 0;padding-left:16px">'+arr.map(function(x){return '<li>'+_modEsc(x)+'</li>';}).join('')+'</ul>';
+}
+
+function mtCard(t){
+  var dirC = t.direction==='Long'?'#22c55e':'#ef4444';
+  var thC = mtThesisColor(t.thesis_status);
+  var recC = mtRecColor(t.recommendation);
+  var head = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+    <b style="color:${dirC};font-size:14px">${_modEsc(t.symbol)} ${t.direction==='Long'?'LONG':'SHORT'}</b>
+    <span style="font-size:10px;color:#9aa;border:1px solid var(--border);border-radius:10px;padding:1px 7px">${_modEsc(t.mode)}</span>
+    <span style="font-size:10px;color:#9aa">${_modEsc(t.contracts)} ct</span>
+    <span style="margin-left:auto;font-size:10px;color:#6b7280">ADVISORY ONLY</span>
+  </div>`;
+  if(t.status!=='ok'){
+    return `<div class="mt-card" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">${head}
+      <div style="color:#f59e0b;font-size:12px">${_modEsc(t.recommendation_reason||'Monitor unavailable.')}</div>
+      <button class="btn btn-eod" style="margin-top:8px;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button></div>`;
+  }
+  var pnl = (t.unrealized_pnl!=null)?('$'+Number(t.unrealized_pnl).toFixed(2)):'—';
+  var pnlC = (t.unrealized_pnl!=null && t.unrealized_pnl<0)?'#ef4444':'#22c55e';
+  var rtxt = (t.current_r!=null)?(Number(t.current_r).toFixed(2)+'R'):'—';
+  var px = (t.current_price!=null)?Number(t.current_price).toFixed(2):'—';
+  var stats = `<div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">
+    <div class="gstat"><div class="l">Price</div><div class="v">${px}</div></div>
+    <div class="gstat"><div class="l">Unreal. P&amp;L</div><div class="v" style="color:${pnlC}">${pnl}</div></div>
+    <div class="gstat"><div class="l">Current R</div><div class="v">${rtxt}</div></div>
+    <div class="gstat"><div class="l">To Stop</div><div class="v">${t.dist_to_stop!=null?Number(t.dist_to_stop).toFixed(2):'—'}</div></div>
+    <div class="gstat"><div class="l">To T1</div><div class="v">${t.dist_to_target1!=null?Number(t.dist_to_target1).toFixed(2):'—'}</div></div>
+    <div class="gstat"><div class="l">To T2</div><div class="v">${t.dist_to_target2!=null?Number(t.dist_to_target2).toFixed(2):'—'}</div></div>
+  </div>`;
+  var status = `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0">
+    <span style="font-size:12px;font-weight:800;color:${thC}">Thesis: ${_modEsc(t.thesis_status)}</span>
+    <span style="font-size:12px;font-weight:800;color:${recC};margin-left:auto">▶ ${_modEsc(t.recommendation)}</span>
+  </div>
+  <div class="se-reason" style="font-size:12px">${_modEsc(t.recommendation_reason||'')}</div>`;
+  var assess = t.entry_assessment ? `<div class="se-reason" style="font-size:11px;color:#9aa;margin-top:6px">${_modEsc(t.entry_assessment)}</div>` : '';
+  var warns = (t.warnings&&t.warnings.length) ? `<div class="se-bias-h" style="color:#f59e0b;margin-top:8px">⚠ Early-Exit Warnings</div>${mtList(t.warnings)}` : '';
+  var improve = (t.what_improves&&t.what_improves.length) ? `<div class="se-bias-h" style="color:#22c55e;margin-top:6px">What Would Improve</div>${mtList(t.what_improves)}` : '';
+  var inval = (t.what_invalidates&&t.what_invalidates.length) ? `<div class="se-bias-h" style="color:#ef4444;margin-top:6px">What Would Invalidate</div>${mtList(t.what_invalidates)}` : '';
+  var reason = t.reason ? `<div style="font-size:11px;color:#9aa;margin-top:6px">Your thesis: ${_modEsc(t.reason)}</div>` : '';
+  var foot = `<div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:10px;color:#6b7280">
+    <span>Entry ${_modEsc(t.entry_price)} · Stop ${_modEsc(t.stop_loss)} · Next review ${_modEsc(t.next_review_et||'—')}</span>
+    <button class="btn btn-eod" style="margin:0 0 0 auto;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button>
+  </div>`;
+  return `<div class="mt-card" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">${head}${stats}${status}${assess}${warns}${improve}${inval}${reason}${foot}</div>`;
+}
+
+function renderManual(d){
+  var box=document.getElementById('mt-list'); if(!box) return;
+  var trades=(d&&d.trades)?d.trades:[];
+  if(!trades.length){ box.innerHTML='<div style="color:#6b7280;font-size:12px;padding:6px 0">No monitored positions yet. Add one above to get live advisory guidance.</div>'; return; }
+  box.innerHTML = trades.map(function(t){ return mtCard(t); }).join('');
+}
+
+setInterval(() => { refresh(); refreshRec(); refreshManual(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
 </body>
@@ -27677,6 +28365,8 @@ if __name__ == "__main__":
         if _swing_htf_enabled():                   # SWING flag-on only — SCALP boot stays untouched
             _check_swing_thesis_db_ready()         # probe swing_theses (no DDL; table created via DB tool/publish diff)
             _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher
+        _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
+        _load_manual_trades_from_db()              # rehydrate open ADVISORY-ONLY manual positions (display monitor)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)

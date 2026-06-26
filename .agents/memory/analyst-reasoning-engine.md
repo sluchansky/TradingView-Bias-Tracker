@@ -88,5 +88,4 @@ strict path.
   (NOT `atr`/`atr_pts`/`htf_atr` — those keys don't exist in `compute_swing_context`'s schema, so
   reading them silently disabled the extension on every real SWING run). Helper is pure/fail-open,
   returns a positive float or None (extension "unavailable", never the wrong-TF ATR). Guarded by
-  `analyst_pro_smoke.py` section 6; whole feature guarded by `check_analyst_pro.sh` (not a workflow —
-  workflow slots are full at 11/10 — run it directly like the other check scripts).
+  `analyst_pro_smoke.py` section 6; whole feature guarded by `check_analyst_pro.sh` (run it directly).
