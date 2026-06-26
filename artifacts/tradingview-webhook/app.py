@@ -22900,6 +22900,7 @@ def dashboard():
   /* Today's trades (per-trade list) */
   #tt-body{overflow-x:auto}
   .tt-pairs{display:flex;gap:6px;margin:0 0 9px}
+  .tt-chart{width:100%;height:78px;display:block;margin:2px 0 9px}
   .tt-pair{flex:1;text-align:center;padding:6px 0;font-size:10.5px;font-weight:700;letter-spacing:1px;border-radius:2px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;user-select:none;transition:all .15s}
   .tt-pair:hover{color:#e8e8f0}
   .tt-pair.active{border-color:var(--amber);color:var(--amber);background:var(--amber-deep)}
@@ -23675,6 +23676,7 @@ def dashboard():
     <span class="tt-pair" id="tt-pair-MES" role="button" tabindex="0" onclick="ttSelect('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MES');}">MES</span>
     <span class="tt-pair" id="tt-pair-MYM" role="button" tabindex="0" onclick="ttSelect('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MYM');}">MYM</span>
   </div>
+  <svg id="tt-chart" class="tt-chart" viewBox="0 0 320 120" preserveAspectRatio="none" aria-hidden="true" style="display:none"></svg>
   <div id="tt-body"></div>
   <div class="tt-fid">Each trade closed today (ET) for the selected instrument. Display-only — accrues live, no backfill.</div>
 </div>
@@ -25782,6 +25784,40 @@ function renderTradeMemory(d){
   }
 }
 
+// Shared cumulative-R line/area chart for an inline SVG: a 0R baseline, a colored
+// area + line of running cumulative R, and a win/loss dot per trade. Hides the SVG
+// on an empty series. Used by BOTH the standalone equity-curve panel and the
+// Today's Trades daily block (so the daily-block graph tracks the pinned pair).
+// Display-only.
+function _drawEqCurve(svg, pts){
+  if(!svg) return;
+  if(!pts || !pts.length){ svg.style.display='none'; svg.innerHTML=''; return; }
+  svg.style.display='block';
+  const W=320,H=120,pad=10;
+  const cum=pts.map(function(p){return p.cum;});
+  const series=[0].concat(cum);
+  let lo=Math.min.apply(null,series), hi=Math.max.apply(null,series);
+  if (lo===hi){lo-=1;hi+=1;}
+  const n=series.length;
+  const xFor=function(i){return pad + (W-2*pad)*(n===1?0.5:i/(n-1));};
+  const yFor=function(v){return pad + (H-2*pad)*(1-(v-lo)/(hi-lo));};
+  const yZero=yFor(0);
+  let dpath='';
+  for(let i=0;i<n;i++){dpath+=(i===0?'M':'L')+xFor(i).toFixed(1)+' '+yFor(series[i]).toFixed(1)+' ';}
+  const net=cum.length?cum[cum.length-1]:0;
+  const col=net>0?'#22c55e':net<0?'#ef4444':'#9aa6b2';
+  let s='';
+  s+='<line x1="'+pad+'" y1="'+yZero.toFixed(1)+'" x2="'+(W-pad)+'" y2="'+yZero.toFixed(1)+'" style="stroke:var(--border)" stroke-width="1" stroke-dasharray="3 3"/>';
+  const area=dpath+'L'+xFor(n-1).toFixed(1)+' '+yZero.toFixed(1)+' L'+xFor(0).toFixed(1)+' '+yZero.toFixed(1)+' Z';
+  s+='<path d="'+area+'" fill="'+col+'" opacity="0.12"/>';
+  s+='<path d="'+dpath+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+  for(let i=1;i<n;i++){
+    const dotcol=(pts[i-1].r>=0)?'#22c55e':'#ef4444';
+    s+='<circle cx="'+xFor(i).toFixed(1)+'" cy="'+yFor(cum[i-1]).toFixed(1)+'" r="2.4" fill="'+dotcol+'"/>';
+  }
+  svg.innerHTML=s;
+}
+
 // Equity curve (today) — fed by d.equity_curve_today (cumulative R of trades
 // CLOSED today in ET, from real strategy_trades). Display-only; honest empties.
 function renderEquityCurve(d){
@@ -25814,31 +25850,7 @@ function renderEquityCurve(d){
     return;
   }
   if(emptyEl) emptyEl.style.display='none';
-  if(!svg) return;
-  svg.style.display='block';
-  const W=320,H=120,pad=10;
-  const cum=pts.map(function(p){return p.cum;});
-  const series=[0].concat(cum);
-  let lo=Math.min.apply(null,series), hi=Math.max.apply(null,series);
-  if (lo===hi){lo-=1;hi+=1;}
-  const n=series.length;
-  const xFor=function(i){return pad + (W-2*pad)*(n===1?0.5:i/(n-1));};
-  const yFor=function(v){return pad + (H-2*pad)*(1-(v-lo)/(hi-lo));};
-  const yZero=yFor(0);
-  let dpath='';
-  for(let i=0;i<n;i++){dpath+=(i===0?'M':'L')+xFor(i).toFixed(1)+' '+yFor(series[i]).toFixed(1)+' ';}
-  const net=cum.length?cum[cum.length-1]:0;
-  const col=net>0?'#22c55e':net<0?'#ef4444':'#9aa6b2';
-  let s='';
-  s+='<line x1="'+pad+'" y1="'+yZero.toFixed(1)+'" x2="'+(W-pad)+'" y2="'+yZero.toFixed(1)+'" style="stroke:var(--border)" stroke-width="1" stroke-dasharray="3 3"/>';
-  const area=dpath+'L'+xFor(n-1).toFixed(1)+' '+yZero.toFixed(1)+' L'+xFor(0).toFixed(1)+' '+yZero.toFixed(1)+' Z';
-  s+='<path d="'+area+'" fill="'+col+'" opacity="0.12"/>';
-  s+='<path d="'+dpath+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
-  for(let i=1;i<n;i++){
-    const dotcol=(pts[i-1].r>=0)?'#22c55e':'#ef4444';
-    s+='<circle cx="'+xFor(i).toFixed(1)+'" cy="'+yFor(cum[i-1]).toFixed(1)+'" r="2.4" fill="'+dotcol+'"/>';
-  }
-  svg.innerHTML=s;
+  _drawEqCurve(svg, pts);
 }
 
 // Today's trades — per-trade list fed by d.equity_curve_today.points (the same
@@ -25904,17 +25916,21 @@ function renderTodaysTrades(d){
 function _renderTtFrom(eq, inst){
   const body=document.getElementById('tt-body');
   const metaEl=document.getElementById('tt-meta');
+  const chart=document.getElementById('tt-chart');
   if(!body) return;
   if(metaEl) metaEl.textContent='· '+inst+(ttInst?' · pinned':'');
   if(eq && eq.available===false){
+    _drawEqCurve(chart, []);
     body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'Trade history unavailable.')+'</div>';
     return;
   }
   const pts=(eq&&eq.points)||[];
   if(!pts.length){
+    _drawEqCurve(chart, []);
     body.innerHTML='<div class="tt-empty">'+((eq&&eq.note)||'No closed trades today yet.')+'</div>';
     return;
   }
+  _drawEqCurve(chart, pts);
   const esc=function(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});};
   const rows=pts.slice().reverse().map(function(p){
     const dl=String(p.dir||'').toLowerCase();
