@@ -18061,6 +18061,59 @@ def compute_manual_trade_management(trade, analysis=None):
     return out
 
 
+def _bot_active_trade_monitor_items(analysis_cache):
+    """ADVISORY DISPLAY mirror of the bot's own OPEN positions (ACTIVE_TRADES_BY_INST),
+    rendered in the SAME shape as the manual monitor rows so a bot-executed order shows
+    up in the Trade Monitor box automatically.
+
+    READ-ONLY by construction: each row is built from a THROWAWAY copy of the tracked
+    trade (compute_manual_trade_management may write min_r/max_r back onto the dict it is
+    handed, so the live ACTIVE_TRADE object is never passed in), reuses the same read-only
+    full_analysis cache, and feeds NO gate / journal / learning / broker / dedupe path. A
+    row appears while the position is open and disappears on the next poll once the bot
+    closes it (clear_active_trade) — no open/close hooks and no duplicate storage. The
+    "Stop monitoring" control is hidden for these rows in the UI; even if its id were
+    POSTed to /manual-trade/close it only pops from MANUAL_TRADES (a no-op here) and can
+    never touch the real position. FAIL-OPEN: any error skips that instrument's mirror
+    rather than breaking the monitor list."""
+    items = []
+    for inst, at in active_trade_snapshot().items():
+        if not at:
+            continue
+        try:
+            opened = at.get("opened_at") or ""
+            mirror = {
+                "id":          "bot-%s-%s" % (inst, opened or uuid.uuid4().hex[:8]),
+                "symbol":      at.get("symbol") or inst,
+                "direction":   at.get("direction", "Long"),
+                "entry_price": at.get("entry_price"),
+                "stop_loss":   at.get("stop_loss"),
+                "target1":     at.get("target1"),
+                "target2":     at.get("target2"),
+                "target3":     at.get("target3"),
+                "contracts":   at.get("contracts"),
+                "mode":        at.get("mode") or TRADING_MODE,
+                "reason":      "",
+                "entry_time":  opened or None,
+                "opened_at":   opened or now_utc().isoformat(),
+                "status":      "open",
+            }
+            sym = mirror["symbol"]
+            if sym not in analysis_cache:
+                try:
+                    analysis_cache[sym] = full_analysis(ticker_override=sym)
+                except Exception as exc:
+                    logger.warning("bot-monitor analysis failed for %s: %s", sym, exc)
+                    analysis_cache[sym] = None
+            row = compute_manual_trade_management(mirror, analysis=analysis_cache[sym])
+            row["origin"]          = "bot"
+            row["advisory_mirror"] = True
+            items.append(row)
+        except Exception as exc:
+            logger.warning("bot-monitor mirror failed for %s: %s", inst, exc)
+    return items
+
+
 @app.route("/manual-trade", methods=["GET", "POST"])
 def manual_trade():
     """ADVISORY-ONLY Manual Trade Manager. POST creates a monitored position; GET lists
@@ -18093,7 +18146,17 @@ def manual_trade():
                 except Exception as exc:
                     logger.warning("manual-trade list analysis failed for %s: %s", sym, exc)
                     analysis_cache[sym] = None
-            items.append(compute_manual_trade_management(t, analysis=analysis_cache[sym]))
+            _row = compute_manual_trade_management(t, analysis=analysis_cache[sym])
+            _row["origin"] = "manual"
+            items.append(_row)
+    # ADVISORY DISPLAY-ONLY: also surface the bot's own OPEN positions so an
+    # auto-executed (or manually-entered) order shows up in this monitor box
+    # automatically. Read-only mirror — never a second order, never journaled or
+    # learned twice; it clears itself when the bot closes the position. FAIL-OPEN.
+    try:
+        items.extend(_bot_active_trade_monitor_items(analysis_cache))
+    except Exception as exc:
+        logger.warning("bot-monitor merge failed: %s", exc)
     items.sort(key=lambda x: x.get("opened_at") or "", reverse=True)
     return jsonify({"status": "ok", "trades": items,
                     "persisted": MANUAL_TRADE_DB_READY, "count": len(items)}), 200
@@ -23662,7 +23725,7 @@ def dashboard():
 <!-- ════ Manual Trade Manager (ADVISORY / DISPLAY-ONLY; never places or closes a broker order) ════ -->
 <div class="mod" id="mod-manual">
   <div class="mod-h">🧮 Manual Trade Manager <span style="font-size:10px;color:#6b7280;letter-spacing:1px">ADVISORY · NEVER PLACES ORDERS</span></div>
-  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Log a position you took yourself. The bot monitors it live and advises — it never sends or closes a broker order for you.</div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Log a position you took yourself — or just watch: the bot's own auto-executed trades now appear here automatically (marked 🤖 BOT). Advisory only — it never sends or closes a broker order for you.</div>
   <div class="fields">
     <div class="field"><label>Symbol</label>
       <select id="mt-symbol"><option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option></select></div>
@@ -27570,16 +27633,23 @@ function mtCard(t){
   var dirC = t.direction==='Long'?'#22c55e':'#ef4444';
   var thC = mtThesisColor(t.thesis_status);
   var recC = mtRecColor(t.recommendation);
+  var isBot = (t.origin==='bot');
+  var botBadge = isBot ? `<span style="font-size:9px;font-weight:800;letter-spacing:1px;color:#06121a;background:#7fe9f5;border-radius:10px;padding:1px 7px">🤖 BOT</span>` : '';
+  var rightTag = isBot ? 'AUTO-MANAGED · ADVISORY' : 'ADVISORY ONLY';
   var head = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
     <b style="color:${dirC};font-size:14px">${_modEsc(t.symbol)} ${t.direction==='Long'?'LONG':'SHORT'}</b>
+    ${botBadge}
     <span style="font-size:10px;color:#9aa;border:1px solid var(--border);border-radius:10px;padding:1px 7px">${_modEsc(t.mode)}</span>
     <span style="font-size:10px;color:#9aa">${_modEsc(t.contracts)} ct</span>
-    <span style="margin-left:auto;font-size:10px;color:#6b7280">ADVISORY ONLY</span>
+    <span style="margin-left:auto;font-size:10px;color:#6b7280">${rightTag}</span>
   </div>`;
   if(t.status!=='ok'){
+    var uAction = isBot
+      ? `<div style="margin-top:8px;font-size:10px;color:#6b7280">Managed by the bot — advisory monitor only.</div>`
+      : `<button class="btn btn-eod" style="margin-top:8px;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button>`;
     return `<div class="mt-card" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">${head}
       <div style="color:#f59e0b;font-size:12px">${_modEsc(t.recommendation_reason||'Monitor unavailable.')}</div>
-      <button class="btn btn-eod" style="margin-top:8px;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button></div>`;
+      ${uAction}</div>`;
   }
   var pnl = (t.unrealized_pnl!=null)?('$'+Number(t.unrealized_pnl).toFixed(2)):'—';
   var pnlC = (t.unrealized_pnl!=null && t.unrealized_pnl<0)?'#ef4444':'#22c55e';
@@ -27603,9 +27673,12 @@ function mtCard(t){
   var improve = (t.what_improves&&t.what_improves.length) ? `<div class="se-bias-h" style="color:#22c55e;margin-top:6px">What Would Improve</div>${mtList(t.what_improves)}` : '';
   var inval = (t.what_invalidates&&t.what_invalidates.length) ? `<div class="se-bias-h" style="color:#ef4444;margin-top:6px">What Would Invalidate</div>${mtList(t.what_invalidates)}` : '';
   var reason = t.reason ? `<div style="font-size:11px;color:#9aa;margin-top:6px">Your thesis: ${_modEsc(t.reason)}</div>` : '';
+  var footAction = isBot
+    ? `<span style="margin:0 0 0 auto;font-size:10px;color:#6b7280">Managed by the bot</span>`
+    : `<button class="btn btn-eod" style="margin:0 0 0 auto;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button>`;
   var foot = `<div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:10px;color:#6b7280">
     <span>Entry ${_modEsc(t.entry_price)} · Stop ${_modEsc(t.stop_loss)} · Next review ${_modEsc(t.next_review_et||'—')}</span>
-    <button class="btn btn-eod" style="margin:0 0 0 auto;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button>
+    ${footAction}
   </div>`;
   return `<div class="mt-card" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">${head}${stats}${status}${assess}${warns}${improve}${inval}${reason}${foot}</div>`;
 }
