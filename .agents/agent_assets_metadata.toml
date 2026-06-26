@@ -17,3 +17,9 @@ id = "kCTCcZS61fD2Alb9phZGD"
 uri = "file://attached_assets/generated_audio/exchange_bell.mp3"
 type = "audio"
 title = "stock exchange opening bell"
+
+[[outputs]]
+id = "MLkfHV4LBsgQTJ-EpTvv3"
+uri = "file://artifacts/shawn-roast/public/audio/bg_music.mp3"
+type = "audio"
+title = "breaking news background music"
