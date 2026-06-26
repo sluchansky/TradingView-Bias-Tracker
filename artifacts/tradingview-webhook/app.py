@@ -2341,6 +2341,7 @@ WEEKLY_REPORT_DAYS      = int(os.environ.get("WEEKLY_REPORT_DAYS", 7))  # lookba
 # wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that the auto value resumes.
 VWAP_FETCH_INTERVAL    = int(os.environ.get("VWAP_FETCH_INTERVAL", 60))   # seconds
 PRICE_FETCH_INTERVAL   = int(os.environ.get("PRICE_FETCH_INTERVAL", 10))  # seconds — DISPLAY-ONLY price refresh (faster than VWAP so the dashboard price stays near-live)
+MANAGED_WATCH_INTERVAL = max(5, int(os.environ.get("MANAGED_WATCH_INTERVAL", 15)))  # seconds — open-trade exit (stop/TP) watcher cadence; own fast timer, decoupled from the slower VWAP/HTF loop. No-op (zero fetches) while flat. Floored at 5s so a stray env value can't hot-loop the timer.
 VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # minutes
 # How long an alert/chart price stays the AUTHORITATIVE dashboard readout after it
 # arrives. While fresh, the dashboard shows the exact chart price; once it goes
@@ -5648,9 +5649,10 @@ def _ingest_htf_overlay(data, resolved_inst, normalized):
 
 
 def _vwap_autofetch_loop():
-    """Refresh VWAP for all tracked instruments, evaluate managed trades, then
-    reschedule. The managed-trade watch is additive and fail-open so it can
-    never disrupt the VWAP refresh or kill the loop."""
+    """Refresh VWAP / volatility / HTF context for all tracked instruments, then
+    reschedule. Open-trade exit detection now runs on its own faster, dedicated
+    timer (_managed_watch_loop / MANAGED_WATCH_INTERVAL) and is no longer driven
+    from this slower loop."""
     try:
         for instrument in VWAP_FEED_SYMBOL:
             _update_vwap_auto(instrument)
@@ -5667,10 +5669,6 @@ def _vwap_autofetch_loop():
         _refresh_htf_if_due()
     except Exception as exc:
         logger.warning("HTF auto-fetch loop error: %s", exc)
-    try:
-        _watch_managed_trades()
-    except Exception as exc:
-        logger.warning("Managed-trade watch error: %s", exc)
     finally:
         threading.Timer(VWAP_FETCH_INTERVAL, _vwap_autofetch_loop).start()
 
@@ -5687,6 +5685,23 @@ def _price_autofetch_loop():
         logger.warning("Price auto-fetch loop error: %s", exc)
     finally:
         threading.Timer(PRICE_FETCH_INTERVAL, _price_autofetch_loop).start()
+
+
+def _managed_watch_loop():
+    """Watch open managed trades for stop / take-profit hits on a fast, dedicated
+    cadence (MANAGED_WATCH_INTERVAL), decoupled from the slower VWAP/volatility/HTF
+    loop so live open-trade monitoring stays responsive. Best-effort and fail-open:
+    any error just skips this cycle. Costs nothing while flat — _watch_managed_trades
+    early-returns (zero market fetches) when there are no open managed trades, and it
+    only ever READS price to detect an exit; it never changes the gate, scoring, or
+    sizing. The exit logic is unchanged (idempotent level checks) — only how often it
+    is polled. Runs on dev + prod (LOCAL/paper lifecycle is identical in both)."""
+    try:
+        _watch_managed_trades()
+    except Exception as exc:  # never let the loop die
+        logger.warning("Managed-trade watch error: %s", exc)
+    finally:
+        threading.Timer(MANAGED_WATCH_INTERVAL, _managed_watch_loop).start()
 
 
 def _active_ticker():
@@ -15667,7 +15682,8 @@ def _fetch_latest_bar(instrument):
 
 def _watch_managed_trades():
     """Evaluate every open managed trade against the latest bar (one fetch per
-    instrument per cycle). Called from the VWAP auto-fetch loop."""
+    instrument per cycle). Called from _managed_watch_loop on its own fast timer
+    (MANAGED_WATCH_INTERVAL)."""
     active = [mt for mt in MANAGED_TRADES_BY_KEY.values() if not mt.get("closed")]
     if not active:
         return
@@ -28712,6 +28728,7 @@ if __name__ == "__main__":
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
+    threading.Timer(0, _managed_watch_loop).start()  # open-trade exit (stop/TP) watcher on its own fast timer (MANAGED_WATCH_INTERVAL); no-op while flat, never feeds the gate
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
