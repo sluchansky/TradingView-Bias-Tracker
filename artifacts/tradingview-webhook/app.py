@@ -66,6 +66,15 @@ def _log_incoming_request():
             n = 0
         logger.info("INCOMING POST /manual-trade | BODY: <redacted manual trade, %s bytes>", n)
         return
+    # AI assistant chat carries the owner's free-form questions — never echo the body
+    # to the request log (only the byte count).
+    if request.path == "/assistant" and request.method == "POST":
+        try:
+            n = request.content_length or 0
+        except Exception:
+            n = 0
+        logger.info("INCOMING POST /assistant | BODY: <redacted assistant query, %s bytes>", n)
+        return
     try:
         body = request.get_data(as_text=True)
     except Exception:
@@ -22948,6 +22957,22 @@ def dashboard():
     <div class="dir-btn long active" onclick="userPickedSetup=true; setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
     <div class="dir-btn short" onclick="userPickedSetup=true; setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
+  <!-- ════ AI Assistant (DISPLAY-ONLY; read-only Q&amp;A — live setup + general trading) ════ -->
+  <div class="mod" id="mod-assistant">
+    <div class="mod-h">💬 Ask the AI <span style="font-size:10px;color:#6b7280;letter-spacing:1px">READ-ONLY · LIVE + GENERAL Q&amp;A</span></div>
+    <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Ask about the current setup (why WAIT, explain the edge score, what's blocking a trade) or general trading questions. It reads your live data — it never places or changes a trade.</div>
+    <div id="ai-log" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:8px"></div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+      <button onclick="aiQuick('Why is the current setup on WAIT?')" style="background:#0b2330;color:#9fd9e6;border:1px solid #234a55;border-radius:14px;padding:4px 10px;font-size:11px;cursor:pointer">Why WAIT?</button>
+      <button onclick="aiQuick('Explain the current edge score and how it was calculated.')" style="background:#0b2330;color:#9fd9e6;border:1px solid #234a55;border-radius:14px;padding:4px 10px;font-size:11px;cursor:pointer">Explain edge score</button>
+      <button onclick="aiQuick('What needs to happen for a trade to trigger right now?')" style="background:#0b2330;color:#9fd9e6;border:1px solid #234a55;border-radius:14px;padding:4px 10px;font-size:11px;cursor:pointer">What is blocking a trade?</button>
+    </div>
+    <div style="display:flex;gap:6px">
+      <input id="ai-input" type="text" placeholder="Ask anything about your setup or trading…" autocomplete="off" onkeydown="if(event.key==='Enter'){aiSend();}" style="flex:1;background:#08252b;border:1px solid #2a5560;border-radius:6px;color:#e8f6f9;padding:8px;font-size:12px">
+      <button class="btn" id="ai-send" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560" onclick="aiSend()">Send</button>
+    </div>
+  </div>
+
   <!-- Long vs Short Score — moved up to sit directly under the Long/Short toggle. -->
   <div class="mod" id="mod-scores">
     <div class="mod-h">⚖️ Long vs Short Score</div>
@@ -27396,6 +27421,52 @@ function renderReview(r){
   out.innerHTML = html;
 }
 
+// ── AI Assistant (DISPLAY-ONLY; read-only Q&A; on-demand, NOT in the 3s poll) ──
+// Sends the owner's question + the selected instrument + recent turns to /assistant,
+// which grounds the answer on a read-only full_analysis snapshot. It never places,
+// sizes, or changes a trade.
+var aiHistory = [];   // [{role, content}] — trimmed client-side; the server also caps it
+function aiEsc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function aiRender(){
+  var log=document.getElementById('ai-log'); if(!log) return;
+  if(!aiHistory.length){
+    log.innerHTML='<div style="color:#6b7280;font-size:11px;padding:6px 2px">Ask a question to get started — try a chip above, or type anything.</div>';
+    return;
+  }
+  log.innerHTML = aiHistory.map(function(m){
+    var mine = m.role==='user';
+    var bg = mine ? '#0b2a33' : '#0e1b14';
+    var bd = mine ? '#2a5560' : '#1f3d2a';
+    var col = mine ? '#cdeef5' : '#d7f0dd';
+    var who = mine ? 'You' : 'AI';
+    return '<div style="align-self:'+(mine?'flex-end':'flex-start')+';max-width:92%;background:'+bg+';border:1px solid '+bd+';border-radius:8px;padding:7px 9px">'
+      + '<div style="font-size:9px;letter-spacing:1px;color:#6b7280;margin-bottom:2px">'+who+'</div>'
+      + '<div style="font-size:12px;color:'+col+';white-space:pre-wrap;line-height:1.45">'+aiEsc(m.content)+'</div></div>';
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+function aiQuick(q){ var i=document.getElementById('ai-input'); if(i){ i.value=q; } aiSend(); }
+async function aiSend(){
+  var inp=document.getElementById('ai-input'); var btn=document.getElementById('ai-send');
+  if(!inp||!btn) return;
+  var q=(inp.value||'').trim(); if(!q) return;
+  var priorHist = aiHistory.slice(-8).map(function(m){ return {role:m.role, content:m.content}; });
+  aiHistory.push({role:'user', content:q});
+  inp.value='';
+  aiHistory.push({role:'assistant', content:'…', _pending:true});
+  aiRender();
+  var prev=btn.textContent; btn.disabled=true; btn.textContent='…';
+  try{
+    var r=await api('/assistant', { question:q, ticker:sym, history:priorHist });
+    if(aiHistory.length && aiHistory[aiHistory.length-1]._pending) aiHistory.pop();
+    if(!r || r.ok===false){ aiHistory.push({role:'assistant', content:(r&&r.error)?r.error:'Sorry — something went wrong.'}); }
+    else { aiHistory.push({role:'assistant', content:(r.answer||'(no answer)')}); }
+  }catch(e){
+    if(aiHistory.length && aiHistory[aiHistory.length-1]._pending) aiHistory.pop();
+    aiHistory.push({role:'assistant', content:'Request failed — try again.'});
+  }finally{ btn.disabled=false; btn.textContent=prev; aiRender(); }
+}
+
 // ── Manual Trade Manager (ADVISORY / DISPLAY-ONLY) ──────────────────────────────
 // Posts a manually-taken position to /manual-trade and polls it for live advisory
 // guidance. It NEVER sends or closes a broker order — "Stop monitoring" only drops
@@ -28210,6 +28281,244 @@ def review_idea():
     except Exception as e:
         logger.exception("review-idea failed")
         out = {"ok": False, "error": "Review failed: %s" % e}
+    return jsonify(out), 200
+
+
+# ── AI Assistant (DISPLAY-ONLY chat; read-only Q&A over the live snapshot) ──────
+#    Reuses full_analysis (the same read the dashboard /status poll uses) to ground
+#    its answers. It NEVER touches the gate / scoring / auto-execute path, never
+#    contacts a broker, and never mutates state. Owner-only (Basic Auth + same-origin
+#    CSRF via the Express proxy; deliberately NOT in OPEN_PATHS). Powered by Replit AI
+#    Integrations (OpenAI) — keys auto-provisioned, no API key handling here.
+ASSISTANT_MODEL          = "gpt-5.4"
+ASSISTANT_MAX_TOKENS     = 900
+ASSISTANT_HISTORY_TURNS  = 8
+
+
+def _assistant_live_context(ticker_override=None):
+    """Build a compact, READ-ONLY snapshot of the current analysis for the assistant
+    to ground its answers. Pulls every field defensively so a missing key can never
+    break the chat. NEVER mutates state or touches the money path."""
+    def _one(tk):
+        a = full_analysis(ticker_override=tk)
+        return {
+            "instrument":         a.get("active_ticker"),
+            "trading_mode":       TRADING_MODE,
+            "verdict":            a.get("verdict"),
+            "recommendation":     a.get("recommendation"),
+            "why":                a.get("why"),
+            "strict_label":       a.get("strict_label"),
+            "strict_score":       a.get("strict_score"),
+            "strict_direction":   a.get("strict_direction"),
+            "strict_reason":      a.get("strict_reason"),
+            "strict_missing":     a.get("strict_missing"),
+            "gate_debug":         a.get("gate_debug"),
+            "edge_score":         a.get("edge_score"),
+            "edge_grade":         a.get("edge_grade"),
+            "edge_breakdown":     a.get("edge_breakdown"),
+            "long_score":         a.get("long_score"),
+            "short_score":        a.get("short_score"),
+            "conflict_gap":       a.get("conflict_gap"),
+            "dominant_direction": a.get("dominant_direction"),
+            "bias":               a.get("bias"),
+            "strength":           a.get("strength"),
+            "confidence":         a.get("confidence"),
+            "current_price":      a.get("current_price"),
+            "vwap_value":         a.get("vwap_value"),
+            "vwap_status":        a.get("vwap_status"),
+            "nearest_supply":     a.get("nearest_supply"),
+            "nearest_demand":     a.get("nearest_demand"),
+            "market_structure":   a.get("structure_label"),
+            "structure_detail":   a.get("structure_detail"),
+            "risk_zone":          a.get("risk_label"),
+            "risk_detail":        a.get("risk_detail"),
+            "overextended":       a.get("overextended"),
+            "volatility":         a.get("volatility"),
+            "current_atr":        a.get("current_atr"),
+            "trade_opportunity":  a.get("trade_opportunity"),
+            "opportunity_reason": a.get("opportunity_reason"),
+            "setup_stage":        a.get("setup_stage"),
+            "stage_next_step":    a.get("stage_next_step"),
+            "stage_entry_rule":   a.get("stage_entry_rule"),
+            "stage_invalidation": a.get("stage_invalidation"),
+            "trade_plan":         a.get("trade_plan"),
+            "alert_diagnostics":  a.get("alert_diagnostics"),
+            "session":            a.get("session"),
+            "market_open":        a.get("market_open"),
+            "market_status":      a.get("market_status"),
+            "market_reason":      a.get("market_reason"),
+            "alert_counts":       a.get("counts"),
+        }
+
+    primary = _one(ticker_override)
+    sel_inst = primary.get("instrument")
+    overview = [{
+        "instrument": sel_inst,
+        "verdict":    primary.get("verdict"),
+        "edge_score": primary.get("edge_score"),
+        "edge_grade": primary.get("edge_grade"),
+        "bias":       primary.get("bias"),
+    }]
+    try:
+        for tk in enabled_instruments():
+            if tk == sel_inst:
+                continue
+            try:
+                b = full_analysis(ticker_override=tk)
+                overview.append({
+                    "instrument": b.get("active_ticker") or tk,
+                    "verdict":    b.get("verdict"),
+                    "edge_score": b.get("edge_score"),
+                    "edge_grade": b.get("edge_grade"),
+                    "bias":       b.get("bias"),
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {"selected": primary, "all_instruments": overview}
+
+
+def _assistant_answer(data):
+    """Owner-only, DISPLAY-ONLY assistant. Answers questions about the live setup and
+    general trading using the read-only snapshot. NEVER touches the gate, scoring,
+    auto-execute, or any broker path; never mutates state."""
+    base = (os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL") or "").strip().rstrip("/")
+    key  = (os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY") or "").strip()
+    if not base or not key:
+        return {"ok": False, "error": "The AI assistant is not configured on this server yet."}
+
+    question = data.get("question")
+    if not isinstance(question, str):
+        question = "" if question is None else str(question)
+    question = question.strip()
+    if not question:
+        return {"ok": False, "error": "Ask a question first."}
+    if len(question) > 2000:
+        question = question[:2000]
+
+    raw_tk = data.get("ticker")
+    tk = _instrument_from_text(raw_tk.upper()) if isinstance(raw_tk, str) else None
+
+    try:
+        ctx = _assistant_live_context(tk)
+    except Exception as exc:
+        logger.warning("assistant context build failed (non-fatal): %s", exc)
+        ctx = {"selected": {}, "all_instruments": []}
+
+    # Sanitize optional multi-turn history from the client: only known roles + string
+    # content, length-capped, most-recent few turns. Defensive against a malformed body.
+    history_msgs = []
+    raw_hist = data.get("history")
+    if isinstance(raw_hist, list):
+        for item in raw_hist[-ASSISTANT_HISTORY_TURNS:]:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if role not in ("user", "assistant") or not isinstance(content, str):
+                continue
+            content = content.strip()
+            if not content:
+                continue
+            history_msgs.append({"role": role, "content": content[:1500]})
+
+    system_primer = (
+        "You are the built-in AI assistant for a private futures-trading dashboard "
+        "(the 'AI Trading Partner'). You help the dashboard's owner in two ways: "
+        "(1) explain the CURRENT live setup using the JSON snapshot provided each turn "
+        "(e.g. why the verdict is WAIT, what the Edge Score means and how it was built, "
+        "what is blocking a trade, what would need to happen for a setup to trigger); and "
+        "(2) answer general trading and market-education questions.\n\n"
+        "How this bot works (use this to explain its own readouts):\n"
+        "- Verdict: 'LONG READY' / 'SHORT READY' means an actionable setup for that side; "
+        "'WAIT' means no actionable setup. A setup can also be early/forming before it is ready.\n"
+        "- Modes: SCALP is more sensitive (faster, looser); SWING is stricter.\n"
+        "- Edge Score is a transparent points total (max ~110) from components such as market "
+        "structure (BOS / CHOCH), VWAP alignment, liquidity sweeps, volume / RVOL, CVD (order-flow "
+        "delta) and a session-timing bonus. Higher is better; rough grades are A+ / A / B and below "
+        "threshold is a WAIT. Read 'edge_breakdown' for the live per-component points.\n"
+        "- READY gate: a setup must pass hard requirements (e.g. VWAP and structure alignment, plus "
+        "a zone requirement in SWING) and clear the score threshold. 'gate_debug', 'strict_reason' "
+        "and 'strict_missing' name exactly which requirement failed.\n\n"
+        "STRICT RULES:\n"
+        "- You are READ-ONLY and advisory. You CANNOT place, modify, size, or close trades, and you "
+        "must never imply that you can or did. If asked to trade, explain that you only read and "
+        "explain — the owner acts manually.\n"
+        "- The JSON snapshot is the ONLY source of truth for live values. Never invent numbers, "
+        "prices, or signals. If a value is not in the snapshot, say it is not available.\n"
+        "- Be concise and practical, and use plain language. When giving an opinion on a specific "
+        "trade, add a brief reminder that this is not financial advice.\n"
+        "- If a question is general or educational and unrelated to the live snapshot, just answer it well."
+    )
+
+    snapshot_msg = (
+        "LIVE DASHBOARD SNAPSHOT (read-only, current as of this question). The user is "
+        "currently viewing instrument: %s, mode: %s.\n```json\n%s\n```"
+        % (
+            (ctx.get("selected") or {}).get("instrument") or "unknown",
+            TRADING_MODE,
+            json.dumps(ctx, default=str)[:12000],
+        )
+    )
+
+    messages = [{"role": "system", "content": system_primer}]
+    messages.extend(history_msgs)
+    messages.append({"role": "system", "content": snapshot_msg})
+    messages.append({"role": "user", "content": question})
+
+    payload = {
+        "model": ASSISTANT_MODEL,
+        "messages": messages,
+        "max_completion_tokens": ASSISTANT_MAX_TOKENS,
+    }
+    try:
+        resp = requests.post(
+            base + "/chat/completions",
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=60,
+        )
+    except Exception as exc:
+        logger.warning("assistant upstream request failed: %s", exc)
+        return {"ok": False, "error": "Could not reach the AI service. Try again in a moment."}
+
+    if resp.status_code != 200:
+        logger.warning("assistant upstream non-200: %s %s", resp.status_code, (resp.text or "")[:300])
+        return {"ok": False, "error": "AI request failed (HTTP %s)." % resp.status_code}
+
+    try:
+        j = resp.json()
+        answer = ((j.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        answer = answer.strip()
+    except Exception as exc:
+        logger.warning("assistant parse failed: %s", exc)
+        return {"ok": False, "error": "Could not parse the AI response."}
+
+    if not answer:
+        return {"ok": False, "error": "The AI returned an empty answer. Try rephrasing."}
+
+    return {
+        "ok": True,
+        "answer": answer,
+        "model": ASSISTANT_MODEL,
+        "instrument": (ctx.get("selected") or {}).get("instrument"),
+    }
+
+
+@app.route("/assistant", methods=["POST"])
+def assistant():
+    """DISPLAY-ONLY AI assistant chat. Answers questions about the live setup and
+    general trading using the read-only full_analysis snapshot. REVIEW-ONLY: it NEVER
+    touches the gate / scoring / auto-execute path, never contacts a broker, and never
+    mutates state. Owner-only (Basic Auth + same-origin CSRF via the Express proxy;
+    deliberately NOT in OPEN_PATHS)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        out = _assistant_answer(data)
+    except Exception as e:
+        logger.exception("assistant failed")
+        out = {"ok": False, "error": "Assistant error: %s" % e}
     return jsonify(out), 200
 
 

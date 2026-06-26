@@ -83,6 +83,9 @@ router.all(
     "/learning",
     "/entry-quality",
     "/review-idea",
+    // AI assistant chat (owner-only; DISPLAY/READ-ONLY; NOT in dashboard-auth
+    // OPEN_PATHS). Answers questions about the live setup + general trading.
+    "/assistant",
     "/journal",
     "/journal/",
     "/eod",
