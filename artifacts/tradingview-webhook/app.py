@@ -13082,6 +13082,261 @@ def _compute_fast_entry_trigger(result, inst):
         return _fast_entry_neutral("Fast entry unavailable (%s)." % exc)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN BRAIN — plain-English command-center synthesis (DISPLAY-ONLY)
+# ─────────────────────────────────────────────────────────────────────────────
+_MAIN_BRAIN_DISCLAIMER = ("Main Brain is a plain-English synthesis of the bot's own "
+                          "analysis — display only, not financial advice.")
+_MAIN_BRAIN_STATUSES = ("WATCHING", "BUILDING", "READY", "WAIT", "MANAGING", "INVALIDATED")
+
+
+def _mb_num(v):
+    """Coerce to float or None (never raises)."""
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mb_fmt(v, nd=2):
+    """Format a number to `nd` decimals, or None when not numeric."""
+    n = _mb_num(v)
+    return (f"{n:.{nd}f}") if n is not None else None
+
+
+def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
+    """Stable neutral schema (fail-open / market-closed / disabled). EVERY consumer
+    reads exactly these keys, so a bug here can never break the gate's result."""
+    return {
+        "status":            status,
+        "headline":          reason,
+        "summary":           reason,
+        "market_brain":      [],
+        "strategy_brain":    [],
+        "risk_brain":        [],
+        "trade_manager":     [],
+        "favored_direction": None,
+        "edge_score":        None,
+        "edge_grade":        None,
+        "what_now":          [],
+        "invalidation":      "—",
+        "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
+        "reason":            reason,
+    }
+
+
+def compute_main_brain(result):
+    """Plain-English 'Main Brain' synthesis (DISPLAY-ONLY).
+
+    Combines the already-assembled analyst / analyst_report / trade_debate /
+    entry_quality / volatility / structure / zone / VWAP / edge / verdict /
+    trade_plan blocks (and the live active position) into FOUR conversational
+    'brain' views — Market / Strategy / Risk / Trade Manager — plus one combined
+    summary and a status badge. It only READS `result`; it NEVER recomputes
+    anything and NEVER touches the gate, sizing, dedupe or the money path. Fail-open
+    to a stable neutral schema."""
+    try:
+        if not result.get("market_open", True):
+            nb = _main_brain_neutral(
+                "Market is closed — no live setups. I'll resume watching when it reopens.",
+                status="WAIT")
+            nb["summary"] = ("Market closed (%s). Standing down until the next session."
+                             % (result.get("market_status") or "paused"))
+            return nb
+
+        inst       = instrument_of(result.get("active_ticker"))
+        pos        = active_trade_for(inst) if inst else None
+        verdict    = result.get("verdict") or ""
+        actionable = is_actionable(verdict)
+
+        ar   = result.get("analyst_report") or {}
+        an   = result.get("analyst") or {}
+        eq   = result.get("entry_quality") or {}
+        vol  = result.get("volatility") or {}
+        plan = result.get("trade_plan") or {}
+
+        price  = result.get("current_price")
+        vwap   = result.get("vwap_value")
+        struct = result.get("structure_label") or "mixed"
+        bias   = result.get("bias") or "Neutral"
+        edge   = result.get("edge_score")
+        grade  = result.get("edge_grade")
+        n_dem  = result.get("nearest_demand")
+        n_sup  = result.get("nearest_supply")
+        cvd    = (result.get("cvd_state") or "").lower()
+        regime = (vol.get("regime") or "").lower()
+        atr_s  = _mb_fmt(vol.get("atr_pts"))
+
+        fav = (ar.get("favored_direction") or result.get("strict_direction")
+               or result.get("dominant_direction"))
+        if fav not in ("Long", "Short"):
+            fav = None
+
+        # ── Market Brain ─────────────────────────────────────────────────
+        market = []
+        p_s = _mb_fmt(price)
+        if p_s:
+            market.append("Price is at %s; structure reads %s (%s bias)."
+                          % (p_s, struct, str(bias).lower()))
+        else:
+            market.append("Structure reads %s (%s bias)." % (struct, str(bias).lower()))
+        # VWAP side is derived from price-vs-value (vwap_status is freshness, NOT direction).
+        v_s, pv, vv = _mb_fmt(vwap), _mb_num(price), _mb_num(vwap)
+        if v_s and pv is not None and vv is not None:
+            if pv >= vv:
+                market.append("Trading above VWAP (%s) — that supports longs." % v_s)
+            else:
+                market.append("Trading below VWAP (%s) — that favours shorts." % v_s)
+        elif v_s:
+            market.append("VWAP is at %s." % v_s)
+        d_s, s_s = _mb_fmt(n_dem), _mb_fmt(n_sup)
+        if d_s or s_s:
+            zbits = []
+            if d_s:
+                zbits.append("demand near %s" % d_s)
+            if s_s:
+                zbits.append("supply near %s" % s_s)
+            market.append("Key zones: " + ", ".join(zbits) + ".")
+        if cvd in ("bullish", "bearish"):
+            market.append("Order-flow (CVD) is %s right now." % cvd)
+        if regime:
+            tag = {"normal": "normal", "elevated": "elevated", "extreme": "risky / extreme",
+                   "low": "quiet", "quiet": "quiet"}.get(regime, regime)
+            market.append(("Volatility is %s (ATR ~%s)." % (tag, atr_s)) if atr_s
+                          else ("Volatility is %s." % tag))
+
+        # ── Strategy Brain ───────────────────────────────────────────────
+        strategy = []
+        if fav:
+            strategy.append(("A %s setup is READY and fits the playbook." % fav.lower())
+                            if actionable else
+                            ("A %s setup is forming, but it isn't ready yet." % fav.lower()))
+        else:
+            strategy.append("No clean directional setup yet — staying patient.")
+        eq_chase = eq.get("chasing_warning")
+        eq_label = eq.get("verdict_label") or eq.get("grade")
+        if eq_chase:
+            strategy.append("Entry timing: %s" % eq_chase)
+        elif eq_label:
+            strategy.append("Entry location looks %s." % str(eq_label).lower())
+        what_next = []
+        for src in (ar.get("what_increases_confidence"), an.get("what_needs_next")):
+            if isinstance(src, list):
+                for it in src:
+                    s = str(it).strip()
+                    if s and s not in what_next:
+                        what_next.append(s)
+        what_next = what_next[:4]
+        if not actionable:
+            if what_next:
+                strategy.append("Still missing: " + "; ".join(what_next) + ".")
+            else:
+                wr = result.get("strict_reason") or an.get("reason_for_waiting")
+                if wr:
+                    strategy.append("Waiting because: %s" % wr)
+
+        # ── Risk Brain ───────────────────────────────────────────────────
+        risk = []
+        risk_blk = an.get("risk") or {}
+        rr = plan.get("rr") or risk_blk.get("rr")
+        if rr:
+            risk.append("Risk/reward on the working idea is about %s." % rr)
+        stop_s = _mb_fmt(plan.get("stop_loss"))
+        if stop_s:
+            logical = risk_blk.get("stop_logical")
+            if logical is True:
+                risk.append("Stop at %s sits behind structure — sensible." % stop_s)
+            elif logical is False:
+                risk.append("Stop at %s — keep it behind the protecting zone." % stop_s)
+            else:
+                risk.append("Planned stop: %s." % stop_s)
+        if regime in ("elevated", "extreme"):
+            risk.append("Elevated volatility — size down and expect wider swings.")
+        elif regime in ("normal", "low", "quiet"):
+            risk.append("Volatility is contained — standard sizing is fine.")
+        if edge is not None:
+            risk.append("Edge Score is %s%s." % (edge, (" (%s)" % grade) if grade else ""))
+
+        # ── Trade Manager (only meaningful with an open position) ─────────
+        manager = []
+        managing = invalidated = False
+        if isinstance(pos, dict) and pos:
+            managing = True
+            pdir = pos.get("direction") or "?"
+            pen  = _mb_num(pos.get("entry_price") if pos.get("entry_price") is not None
+                           else pos.get("entry"))
+            pst  = _mb_num(pos.get("stop_loss") if pos.get("stop_loss") is not None
+                           else pos.get("stop"))
+            manager.append("Managing an open %s position%s."
+                           % (str(pdir).lower(),
+                              (" from %s" % _mb_fmt(pen)) if pen is not None else ""))
+            pv2 = _mb_num(price)
+            if pv2 is not None and pst is not None:
+                is_long = str(pdir).lower().startswith("l")
+                if (is_long and pv2 <= pst) or ((not is_long) and pv2 >= pst):
+                    invalidated = True
+                    manager.append("Price has reached the stop — thesis invalidated, protect capital.")
+            if pst is not None and not invalidated:
+                manager.append("Stop is at %s — hold while it's respected." % _mb_fmt(pst))
+        else:
+            manager.append("No open position — I'll take over the moment a trade is entered.")
+
+        # ── Status badge ─────────────────────────────────────────────────
+        if invalidated:
+            status = "INVALIDATED"
+        elif managing:
+            status = "MANAGING"
+        elif actionable:
+            status = "READY"
+        elif fav and isinstance(edge, (int, float)) and edge >= 50:
+            status = "BUILDING"
+        else:
+            status = "WATCHING"
+
+        # ── Combined Main Brain read ─────────────────────────────────────
+        if status == "READY" and fav:
+            summary = ("Everything lines up for a %s — entry, location and risk all check out. "
+                       "This is the one I've been building toward." % fav.lower())
+        elif status == "INVALIDATED":
+            summary = "The trade thesis just broke — protecting the position comes first."
+        elif status == "MANAGING":
+            summary = manager[0]
+        elif status == "BUILDING" and fav:
+            need = "; ".join(what_next) if what_next else (
+                result.get("strict_reason") or "confirmation")
+            summary = ("I'm building a %s case. Not in yet — I still want %s before I commit."
+                       % (fav.lower(), need))
+        else:
+            summary = ("Watching and waiting — no clean edge right now. I'd rather miss a "
+                       "trade than force a bad one.")
+
+        head_dir = (" %s" % fav) if (fav and status in ("BUILDING", "WATCHING", "READY")) else ""
+        return {
+            "status":            status,
+            "headline":          "%s%s" % (status, head_dir),
+            "summary":           summary,
+            "market_brain":      market,
+            "strategy_brain":    strategy,
+            "risk_brain":        risk,
+            "trade_manager":     manager,
+            "favored_direction": fav,
+            "edge_score":        edge,
+            "edge_grade":        grade,
+            "what_now":          what_next,
+            "invalidation":      ar.get("invalidation") or an.get("invalidation") or "—",
+            "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
+            "reason":            None,
+        }
+    except Exception as exc:
+        try:
+            logger.error("Main Brain compute error (non-fatal): %s", exc)
+        except Exception:
+            pass
+        return _main_brain_neutral("Main Brain unavailable (%s)." % exc)
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -14198,6 +14453,16 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["fast_entry"] = _compute_fast_entry_trigger(result, instrument_of(active_ticker))
     except Exception as _fe_exc:
         result["fast_entry"] = _fast_entry_neutral("Fast entry unavailable (%s)." % _fe_exc)
+
+    # ── Main Brain (DISPLAY-ONLY) ────────────────────────────────────────────
+    # FINAL synthesis: runs last so it sees every verdict override above (open /
+    # vetoed / closed). It only CONSUMES the assembled blocks (analyst, debate,
+    # entry_quality, volatility, structure, zones, VWAP, edge, trade_plan) plus the
+    # live position — never recomputes, never touches the gate. FAIL-OPEN.
+    try:
+        result["main_brain"] = compute_main_brain(result)
+    except Exception as _mb_exc:
+        result["main_brain"] = _main_brain_neutral("Main Brain unavailable (%s)." % _mb_exc)
     return result
 
 
@@ -21581,6 +21846,7 @@ def status():
         "analyst_report":      a.get("analyst_report"),
         "entry_quality":       a.get("entry_quality"),
         "fast_entry":          a.get("fast_entry"),
+        "main_brain":          a.get("main_brain"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -22830,6 +23096,28 @@ def dashboard():
   .mod.mod-dragging{opacity:.4}
   .mod.mod-drop-before{box-shadow:0 -3px 0 0 var(--border-lit)}
   .mod.mod-drop-after{box-shadow:0 3px 0 0 var(--border-lit)}
+  /* ── Main Brain command center (DISPLAY-ONLY) ── */
+  #mod-brain{border-color:#3a2363;box-shadow:0 0 22px rgba(122,40,140,.20)}
+  /* Panels consolidated into Main Brain — hidden with !important so the existing
+     render JS (which toggles inline display) can stay intact and still stay hidden. */
+  .mb-hidden{display:none !important}
+  .mb-badge{font-size:10px;font-weight:800;letter-spacing:1px;color:#0b0b12;padding:2px 9px;border-radius:999px;background:#6b7280}
+  .mb-summary{font-size:14px;line-height:1.55;color:#e8e8f0;margin:4px 0 12px;font-weight:600}
+  .mb-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
+  .mb-col{background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:10px}
+  .mb-col-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:6px}
+  .mb-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+  .mb-list li{font-size:12px;line-height:1.45;color:#cfd0e0;padding-left:12px;position:relative}
+  .mb-list li:before{content:"›";position:absolute;left:0;color:var(--amber-dim)}
+  .mb-feed-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:6px}
+  .mb-feed{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:10px}
+  .mb-feed-empty{font-size:12px;color:#6b7280;font-style:italic}
+  .mb-feed-row{display:flex;gap:8px;align-items:baseline;font-size:12px;line-height:1.4}
+  .mb-feed-t{flex:0 0 auto;color:#6b7280;font-family:ui-monospace,monospace;font-size:11px}
+  .mb-feed-badge{flex:0 0 auto;font-weight:800;font-size:10px;letter-spacing:.5px}
+  .mb-feed-tx{flex:1 1 auto;color:#cfd0e0}
+  .mb-foot{font-size:10px;color:#6b7280;margin-top:8px;font-style:italic}
+  @media(max-width:720px){.mb-grid{grid-template-columns:1fr}}
   .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
   .mgauge-center{position:absolute;left:0;right:0;bottom:24%;text-align:center;pointer-events:none}
   .mgauge-prob{font-size:21px;font-weight:800;line-height:1;letter-spacing:0;color:var(--amber)}
@@ -23155,8 +23443,27 @@ def dashboard():
     <div class="dir-btn long active" onclick="userPickedSetup=true; setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
     <div class="dir-btn short" onclick="userPickedSetup=true; setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
+  <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
+       same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
+       panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
+  <div class="mod" id="mod-brain">
+    <div class="mod-h">🧠 Main Brain
+      <span id="mb-badge" class="mb-badge">…</span>
+      <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">LIVE READ · DISPLAY-ONLY</span>
+    </div>
+    <div id="mb-summary" class="mb-summary">Loading…</div>
+    <div class="mb-grid">
+      <div class="mb-col"><div class="mb-col-h">📡 What I see</div><ul id="mb-market" class="mb-list"></ul></div>
+      <div class="mb-col"><div class="mb-col-h">♟ What I'm thinking</div><ul id="mb-strategy" class="mb-list"></ul></div>
+      <div class="mb-col"><div class="mb-col-h">🛡 What I'm watching for</div><ul id="mb-risk" class="mb-list"></ul></div>
+      <div class="mb-col"><div class="mb-col-h">🎯 The plan</div><ul id="mb-tm" class="mb-list"></ul></div>
+    </div>
+    <div class="mb-feed-h">Live conversation</div>
+    <div id="mb-feed" class="mb-feed"></div>
+    <div id="mb-foot" class="mb-foot"></div>
+  </div>
   <!-- ════ AI Assistant (DISPLAY-ONLY; read-only Q&amp;A — live setup + general trading) ════ -->
-  <div class="mod" id="mod-assistant">
+  <div class="mod mb-hidden" id="mod-assistant">
     <div class="mod-h">💬 Ask the AI <span style="font-size:10px;color:#6b7280;letter-spacing:1px">READ-ONLY · LIVE + GENERAL Q&amp;A</span></div>
     <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Ask about the current setup (why WAIT, explain the edge score, what's blocking a trade) or general trading questions. It reads your live data — it never places or changes a trade.</div>
     <div id="ai-log" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:8px"></div>
@@ -23217,7 +23524,7 @@ def dashboard():
   </div>
 </div>
 
-<div class="mod" id="mod-checklist">
+<div class="mod mb-hidden" id="mod-checklist">
   <div class="mod-h">🤖 AI Trade Checklist</div>
   <div class="ai-ck" id="ai-ck"></div>
 </div>
@@ -23229,7 +23536,7 @@ def dashboard():
   <div class="cd-track"><div class="cd-fill" id="cd-fill" style="width:0%"></div></div>
 </div>
 
-<div class="mod" id="mod-whynot">
+<div class="mod mb-hidden" id="mod-whynot">
   <div class="mod-h">🚦 Why Not Ready</div>
   <div id="wn-body"></div>
 </div>
@@ -23271,7 +23578,7 @@ def dashboard():
 <!-- Unified Analyst Report — executive synthesis that CONSUMES the analyst, debate,
      governor, memory, volatility & news engines into ONE thesis. DISPLAY-ONLY (no
      money-path veto). Hidden unless the engine is enabled. Fed by d.analyst_report. -->
-<div class="mod" id="mod-report" style="display:none">
+<div class="mod mb-hidden" id="mod-report" style="display:none">
   <div class="mod-h">🧭 Unified Analyst Report <span id="ar-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY-ONLY</span></div>
   <div class="se-bias-h">Thesis</div>
   <div class="se-reason" id="ar-headline">—</div>
@@ -23301,7 +23608,7 @@ def dashboard():
   <div id="ar-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
-<div class="mod" id="mod-analyst" style="display:none">
+<div class="mod mb-hidden" id="mod-analyst" style="display:none">
   <div class="mod-h">🧠 Analyst Mode <span id="an-verdict" style="font-size:10px;letter-spacing:1px"></span></div>
   <div class="se-bias-h">Final Verdict</div>
   <div id="an-verdict-big" style="font-size:20px;font-weight:800;margin:2px 0 6px">—</div>
@@ -23439,7 +23746,7 @@ def dashboard():
 <!-- Professional Review (pre-READY pro-trader grading; TWO models SCALP/SWING run
      SEPARATELY per instrument. DISPLAY by default; the money-path veto is
      flag-gated server-side, default OFF). Hidden unless the engine is enabled. -->
-<div class="mod" id="mod-pro" style="display:none">
+<div class="mod mb-hidden" id="mod-pro" style="display:none">
   <div class="mod-h">🎓 Professional Review <span id="pr-badge" style="font-size:10px;letter-spacing:1px"></span></div>
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
     <span style="font-size:11px;color:#9aa">Model (<span id="pr-inst">—</span>):</span>
@@ -23473,7 +23780,7 @@ def dashboard():
      S/R, impulse % done, ATR extension, pullback, momentum, sweep, chasing, swing
      traps). DISPLAY by default; the money-path veto is flag-gated server-side,
      default OFF. Hidden unless the engine is enabled. -->
-<div class="mod" id="mod-entryq" style="display:none">
+<div class="mod mb-hidden" id="mod-entryq" style="display:none">
   <div class="mod-h">🎯 Entry Quality <span id="eq-badge" style="font-size:10px;letter-spacing:1px"></span></div>
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
     <span style="font-size:11px;color:#9aa">Location score — separate from the Edge gate</span>
@@ -23508,7 +23815,7 @@ def dashboard():
 <!-- Trade Debate Engine (Bull vs Bear vs Decision Judge; pre-READY internal debate.
      DISPLAY by default; the money-path veto is flag-gated server-side, default OFF.
      Hidden unless the engine is enabled.) -->
-<div class="mod" id="mod-debate" style="display:none">
+<div class="mod mb-hidden" id="mod-debate" style="display:none">
   <div class="mod-h">🧠 Trade Debate <span id="td-badge" style="font-size:10px;letter-spacing:1px"></span></div>
   <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
     <span style="font-size:11px;color:#9aa">Bull vs Bear → Decision Judge</span>
@@ -24588,6 +24895,7 @@ function gaugeColor(v,prob){
 }
 function renderModules(d){
   if (!d) return;
+  renderMainBrain(d);
   const diag   = d.alert_diagnostics || {};
   const v      = d.verdict || 'WAIT';
   const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
@@ -24932,6 +25240,77 @@ function _anVerdictColor(v){
   if(v.indexOf('READY')===0) return '#22c55e';
   if(v==='WAIT') return '#f59e0b';
   return '#6b7280';
+}
+// ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY) ════
+// Consumes the server-computed d.main_brain block (built in compute_main_brain
+// from the SAME analyst/debate/pro/entry-quality/volatility/edge engines the
+// hidden panels used). NEVER recomputes, NEVER touches the money path. Every
+// dynamic string is rendered via textContent / _anFill (escaped). The live
+// conversation is in-memory per-device, per-symbol, deduped and capped.
+const MB_BADGE_COLORS = { WATCHING:'#6b7280', BUILDING:'#3b82f6', READY:'#22c55e', WAIT:'#f59e0b', MANAGING:'#a855f7', INVALIDATED:'#ef4444' };
+const MB_FEED_MAX = 40;
+let mbFeeds = {};     // { SYM: [ {t, status, text} ] }
+let mbLastKey = {};   // { SYM: "status|summary" }  — dedup last appended entry
+let mbCurSym = null;  // last symbol whose transcript was painted
+function mbNowET(){
+  try { return new Date().toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
+  catch(e){ return ''; }
+}
+function mbRenderFeed(symKey, scrollToEnd){
+  const feed = document.getElementById('mb-feed');
+  if(!feed) return;
+  const arr = mbFeeds[symKey] || [];
+  feed.innerHTML = '';
+  if(!arr.length){
+    const e = document.createElement('div');
+    e.className = 'mb-feed-empty';
+    e.textContent = 'Narration will appear here as the read changes…';
+    feed.appendChild(e);
+    return;
+  }
+  arr.forEach(function(item){
+    const row = document.createElement('div'); row.className = 'mb-feed-row';
+    const ts = document.createElement('span'); ts.className = 'mb-feed-t'; ts.textContent = item.t;
+    const bd = document.createElement('span'); bd.className = 'mb-feed-badge'; bd.textContent = item.status;
+    bd.style.color = MB_BADGE_COLORS[item.status] || '#6b7280';
+    const tx = document.createElement('span'); tx.className = 'mb-feed-tx'; tx.textContent = item.text;
+    row.appendChild(ts); row.appendChild(bd); row.appendChild(tx);
+    feed.appendChild(row);
+  });
+  if(scrollToEnd) feed.scrollTop = feed.scrollHeight;
+}
+function renderMainBrain(d){
+  const mod = document.getElementById('mod-brain');
+  if(!mod) return;
+  const mb = (d && d.main_brain) || null;
+  const symKey = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : (sym || '—');
+  const status = (mb && mb.status) || 'WATCHING';
+  const badge = document.getElementById('mb-badge');
+  if(badge){ badge.textContent = status; badge.style.background = MB_BADGE_COLORS[status] || '#6b7280'; }
+  const summary = (mb && mb.summary) || 'Waiting for live data…';
+  const sumEl = document.getElementById('mb-summary');
+  if(sumEl) sumEl.textContent = summary;
+  _anFill('mb-market',   (mb && mb.market_brain)   || []);
+  _anFill('mb-strategy', (mb && mb.strategy_brain) || []);
+  _anFill('mb-risk',     (mb && mb.risk_brain)     || []);
+  _anFill('mb-tm',       (mb && mb.trade_manager)  || []);
+  const foot = document.getElementById('mb-foot');
+  if(foot) foot.textContent = (mb && mb.disclaimer) || '';
+  // Live conversation — append only when the read meaningfully changes (dedup by
+  // status+summary), per symbol. Auto-scroll to newest only on a fresh entry or a
+  // tab switch (so reading scroll-back history is not yanked every poll).
+  const key = status + '|' + summary;
+  if(!mbFeeds[symKey]) mbFeeds[symKey] = [];
+  let appended = false;
+  if(mbLastKey[symKey] !== key){
+    mbLastKey[symKey] = key;
+    mbFeeds[symKey].push({ t: mbNowET(), status: status, text: summary });
+    if(mbFeeds[symKey].length > MB_FEED_MAX) mbFeeds[symKey].splice(0, mbFeeds[symKey].length - MB_FEED_MAX);
+    appended = true;
+  }
+  const switched = (mbCurSym !== symKey);
+  mbCurSym = symKey;
+  mbRenderFeed(symKey, appended || switched);
 }
 // Blocked Orders — locally-rejected (never-sent) invalid-payload orders. Display-only.
 // Fed by d.execution_rejections; hidden when there are none. All strings via textContent.
@@ -27491,6 +27870,11 @@ autoSelectBestSetup();
   var ROOT = document.getElementById('view-live');
   if(!ROOT) return;
   var CKEY = 'dashCollapsed', OKEY = 'dashOrder';
+  // One-time layout reset when the panel set changes (Main Brain added) so existing
+  // users fall back to the default order with Main Brain on top. Any later manual
+  // reorder/collapse persists again under the new version marker.
+  var VKEY = 'dashLayoutVer', VER = 'main-brain-2026-06';
+  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
   function key(m){ return m.id || ''; }
