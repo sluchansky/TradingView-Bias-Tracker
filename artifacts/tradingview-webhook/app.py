@@ -20169,6 +20169,33 @@ def _persist_tradezella_trades(trades, filename=None):
             pass
 
 
+def _reset_tradezella_trades():
+    """Delete ALL imported TradeZella journal rows + their import-batch metadata so
+    the owner can start a clean review. REVIEW-ONLY DML: these are the app's OWN
+    private journal tables, never live trading tables, so clearing them only affects
+    the display review + the down-weighted 'tradezella' memory source (it never
+    touches live trades, scoring, sizing, or the broker). Autocommit conn. FAIL-OPEN."""
+    if not TRADEZELLA_DB_READY:
+        return {"ok": False, "error": "database not ready"}
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "error": "database unavailable"}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tradezella_trades")
+            deleted = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+            cur.execute("DELETE FROM tradezella_import_batches")
+        return {"ok": True, "deleted": deleted}
+    except Exception as exc:
+        logger.warning("tradezella reset failed: %s", exc)
+        return {"ok": False, "error": "reset failed"}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _load_tradezella_trades(limit=5000):
     """Load persisted TradeZella trades (newest-first) as canonical dicts for
     analyze_journal. FAIL-OPEN -> [] on any error."""
@@ -20424,6 +20451,25 @@ def tradezella_trades():
     limit = max(1, min(limit, 2000))
     trades = _load_tradezella_trades(limit=limit)
     return jsonify({"ok": True, "count": len(trades), "trades": trades})
+
+
+@app.route("/tradezella/reset", methods=["POST"])
+def tradezella_reset():
+    """Owner-only. Clears ALL imported TradeZella trades so the review can be reset
+    to empty. REVIEW-ONLY: deletes the app's own private journal rows; never touches
+    live trades, scoring, sizing, or the broker."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False,
+                        "error": "TradeZella table not provisioned yet."}), 503
+    result = _reset_tradezella_trades()
+    if not result.get("ok"):
+        return jsonify(result), 500
+    return jsonify(result)
 
 
 @app.route("/webhook", methods=["POST"])
@@ -23963,6 +24009,7 @@ def dashboard():
     </div>
     <button class="bt-btn" id="tz-up-btn" onclick="tzUpload()">📤 Import &amp; Analyze</button>
     <button class="bt-btn alt" id="tz-refresh-btn" onclick="tzLoadAnalysis()">↻ Refresh review</button>
+    <button class="bt-btn alt" id="tz-reset-btn" onclick="tzReset()">🗑 Reset review</button>
     <div class="bt-msg" id="tz-up-msg"></div>
   </div>
 
@@ -26904,6 +26951,21 @@ async function tzUpload(){
   const btn=document.getElementById('tz-up-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Importing…';
   try{ const ok=await tzDoUpload(); if(ok) await tzLoadAnalysis(); }
   catch(e){ const m=document.getElementById('tz-up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
+  finally{ btn.disabled=false; btn.textContent=t; }
+}
+
+async function tzReset(){
+  if(!confirm('Clear ALL imported TradeZella trades? This resets the review and cannot be undone.')) return;
+  const btn=document.getElementById('tz-reset-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Resetting…';
+  const msg=document.getElementById('tz-up-msg');
+  try{
+    const r=await fetch(BASE+'/tradezella/reset',{method:'POST',cache:'no-store'});
+    const d=await r.json();
+    if(!d || !d.ok){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ '+((d&&d.error)||'Reset failed'); } return; }
+    if(msg){ msg.className='bt-msg ok'; msg.textContent='✓ Cleared '+(d.deleted||0)+' trade(s). Review reset.'; }
+    const fi=document.getElementById('tz-file'); if(fi) fi.value='';
+    tzRenderEmpty('No imported trades yet. Upload a CSV above to see your review.');
+  }catch(e){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ '+e; } }
   finally{ btn.disabled=false; btn.textContent=t; }
 }
 

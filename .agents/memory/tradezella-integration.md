@@ -16,8 +16,13 @@ External TradeZella CSV journal trades are imported (owner-only `/tradezella/upl
 **Why:** holding `LEARNING_LOCK` across slow DB I/O is the real anti-pattern (blocks request-path readers). The T201 spec said "DB read under LEARNING_LOCK" but the actual invariant that matters is "loaded only during recompute, never via per-request SQL" + "atomic swap under lock." TZ deliberately mirrors the existing live-memory load.
 **How to apply:** if a future review flags that the TZ read isn't literally inside the lock, that's expected — leave the read outside, keep only the swap inside. Match the live path; never wrap DB I/O in the lock.
 
+## Reset / clear the review
+- Owner-only `POST /tradezella/reset` (`_reset_tradezella_trades()`) wipes the review: `DELETE FROM tradezella_trades` then `DELETE FROM tradezella_import_batches` (child-before-parent), returns `{ok, deleted}`. Dashboard "🗑 Reset review" button → `tzReset()` → resets UI via the existing `tzRenderEmpty()`.
+- **DELETE on these tables is allowed and is NOT a violation of "INSERT/SELECT only".** That rule = no runtime DDL + no mutation of LIVE tables; a feature's own UPDATE/DELETE on its OWN review tables is fine (same latitude as the backtest engine). Imports are append-only with ON CONFLICT DO NOTHING, so reset is the only way to start clean.
+- Autocommit `_learning_conn()` ⇒ the two deletes are NOT atomic (acceptable, fail-open). Concurrency with `find_similar_trades` is safe under MVCC (reader sees pre- or post-reset rows).
+
 ## Invariants any change must keep
-- App does INSERT/SELECT only — no runtime DDL (table created out-of-band in dev, Publish schema-diff in prod), like the learning engine.
+- App does INSERT/SELECT only — no runtime DDL (table created out-of-band in dev, Publish schema-diff in prod), like the learning engine. DELETE on the app's OWN review tables (tradezella_trades/_import_batches) is permitted; LIVE/money-path tables stay untouched.
 - Routes are owner-only (not in OPEN_PATHS) and must be on the Express `/api` proxy whitelist.
 - `/tradezella/upload` body log is redacted (notes/PnL/PII must not leak to logs).
 - Adding more TradeZella influence beyond the down-weighted shared-memory path requires a NEW non-domination smoke before it ships.
