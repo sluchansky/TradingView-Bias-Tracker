@@ -48,3 +48,18 @@ so everyone falls back to default DOM order (Main Brain on top) exactly once;
 later manual reorders persist again.
 **How to apply:** when you add/remove a panel that should change default order,
 bump `VER` deliberately.
+
+## Main Brain is INTERACTIVE (chat lives inside the panel)
+
+The Main Brain panel embeds an "Ask the brain" chat (`mb-chat-*` ids, `mbAsk`/
+`mbChatSend`/`mbChatRender`, own `mbChatHistory`) + the owner's quick-action
+buttons. It does NOT have its own backend — it reuses the existing read-only
+`/assistant` endpoint (see `ai-assistant-chat.md`). New ids/fns deliberately do
+NOT reuse the legacy assistant panel's `ai-*` ids (that panel is hidden via
+`mb-hidden` but still in the DOM, so reusing its ids would collide).
+**Why:** the grounded Q&A capability already existed inside the now-hidden
+assistant panel; surfacing it in Main Brain is the partner experience.
+**How to apply:** the chat is rendered ONCE on init (`mbChatRender()` in the load
+sequence), NEVER from the 3s poll/`renderMainBrain` — the poll touches only the
+specific child ids (badge/summary/lists/feed/foot), never the chat log, so chat
+state survives polls. Keep model output rendered via `textContent` (XSS-safe).

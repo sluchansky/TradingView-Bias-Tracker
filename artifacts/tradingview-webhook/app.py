@@ -23101,6 +23101,20 @@ def dashboard():
   /* Panels consolidated into Main Brain — hidden with !important so the existing
      render JS (which toggles inline display) can stay intact and still stay hidden. */
   .mb-hidden{display:none !important}
+  /* Interactive "Ask the brain" chat inside the Main Brain panel (DISPLAY-ONLY). */
+  .mb-chat-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim,#caa14a);font-weight:700;margin:14px 0 6px;display:flex;align-items:center;gap:8px}
+  .mb-chat-log{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto;margin-bottom:8px}
+  .mb-msg{max-width:92%;border-radius:8px;padding:7px 9px;font-size:12px;line-height:1.45;white-space:pre-wrap}
+  .mb-msg-u{align-self:flex-end;background:#241a3a;border:1px solid #3a2363;color:#e7dcff}
+  .mb-msg-a{align-self:flex-start;background:#101826;border:1px solid #243349;color:#d7e3f0}
+  .mb-msg .mb-msg-who{font-size:9px;letter-spacing:1px;color:#6b7280;margin-bottom:2px}
+  .mb-chat-empty{font-size:11px;color:#6b7280;padding:6px 2px}
+  .mb-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+  .mb-chip{background:#1a1230;color:#cbb6ff;border:1px solid #3a2363;border-radius:14px;padding:4px 10px;font-size:10px;font-weight:700;letter-spacing:.5px;cursor:pointer}
+  .mb-chip:hover{background:#241a3a}
+  .mb-chat-row{display:flex;gap:6px}
+  .mb-chat-row input{flex:1;background:#0c0a18;border:1px solid #3a2363;border-radius:6px;color:#efe9ff;padding:8px;font-size:12px}
+  #mb-chat-send{background:#241a3a;color:#cbb6ff;border:1px solid #3a2363}
   .mb-badge{font-size:10px;font-weight:800;letter-spacing:1px;color:#0b0b12;padding:2px 9px;border-radius:999px;background:#6b7280}
   .mb-summary{font-size:14px;line-height:1.55;color:#e8e8f0;margin:4px 0 12px;font-weight:600}
   .mb-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
@@ -23461,6 +23475,24 @@ def dashboard():
     <div class="mb-feed-h">Live conversation</div>
     <div id="mb-feed" class="mb-feed"></div>
     <div id="mb-foot" class="mb-foot"></div>
+    <!-- Interactive partner — ask the brain live questions. Reuses the read-only
+         /assistant backend (grounded on the same snapshot + open trades + risk rules).
+         DISPLAY-ONLY: it NEVER places, sizes, or changes a trade. -->
+    <div class="mb-chat-h">💬 Ask the brain <span style="font-size:9px;color:#6b7280;letter-spacing:1px">READ-ONLY · LIVE STATE</span></div>
+    <div id="mb-chat-log" class="mb-chat-log"></div>
+    <div class="mb-chips">
+      <button type="button" class="mb-chip" onclick="mbAsk('Why are you waiting? What is keeping the current setup from being READY right now?')">WHY WAIT?</button>
+      <button type="button" class="mb-chip" onclick="mbAsk('What exactly would make this setup READY? List what still needs to happen.')">WHAT'S MISSING?</button>
+      <button type="button" class="mb-chip" onclick="mbAsk('Is this a good entry right now or is it late and extended? Where is price relative to VWAP, structure and the nearest zones?')">ENTRY OK?</button>
+      <button type="button" class="mb-chip" onclick="mbAsk('I am managing a position right now — where should my stop go and should I take partials? Use my open trade if there is one.')">MANAGE TRADE</button>
+      <button type="button" class="mb-chip" onclick="mbAsk('What would invalidate this trade or setup, and at what point should I stand aside?')">INVALIDATION?</button>
+      <button type="button" class="mb-chip" onclick="mbAsk('Is this a scalp or a swing setup right now, and why?')">SCALP OR SWING?</button>
+      <button type="button" class="mb-chip" onclick="mbAsk('Give me a risk check: my risk rules, daily limits, contracts used, profit and loss today, and whether it is safe to take another trade right now.')">RISK CHECK</button>
+    </div>
+    <div class="mb-chat-row">
+      <input id="mb-chat-input" type="text" placeholder="Ask anything — e.g. would you long or short here? what are you watching next?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
+      <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Send</button>
+    </div>
   </div>
   <!-- ════ AI Assistant (DISPLAY-ONLY; read-only Q&amp;A — live setup + general trading) ════ -->
   <div class="mod mb-hidden" id="mod-assistant">
@@ -25311,6 +25343,68 @@ function renderMainBrain(d){
   const switched = (mbCurSym !== symKey);
   mbCurSym = symKey;
   mbRenderFeed(symKey, appended || switched);
+}
+
+// ── Ask the brain — interactive chat inside Main Brain (DISPLAY-ONLY, read-only) ──
+// Reuses the existing /assistant backend (grounded on a read-only full_analysis
+// snapshot + open trades + risk rules). It NEVER places, sizes, or changes a trade.
+// Own state/ids (mb-*) so it never collides with the legacy assistant panel. All
+// model output is rendered via textContent (XSS-safe), never innerHTML.
+let mbChatHistory = [];   // [{role, content}] — trimmed client-side; server also caps it
+let mbChatBusy = false;   // one /assistant request in flight at a time (no overlap/misorder)
+function mbChatRender(){
+  const log = document.getElementById('mb-chat-log');
+  if(!log) return;
+  log.innerHTML = '';
+  if(!mbChatHistory.length){
+    const e = document.createElement('div');
+    e.className = 'mb-chat-empty';
+    e.textContent = 'Ask me anything about the live read — tap a button above or type a question.';
+    log.appendChild(e);
+    return;
+  }
+  mbChatHistory.forEach(function(m){
+    const mine = (m.role === 'user');
+    const wrap = document.createElement('div');
+    wrap.className = 'mb-msg ' + (mine ? 'mb-msg-u' : 'mb-msg-a');
+    const who = document.createElement('div');
+    who.className = 'mb-msg-who';
+    who.textContent = mine ? 'You' : 'Main Brain';
+    const body = document.createElement('div');
+    body.textContent = m.content;
+    wrap.appendChild(who); wrap.appendChild(body);
+    log.appendChild(wrap);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+function mbAsk(q){
+  const i = document.getElementById('mb-chat-input');
+  if(i){ i.value = q; }
+  mbChatSend();
+}
+async function mbChatSend(){
+  const inp = document.getElementById('mb-chat-input');
+  const btn = document.getElementById('mb-chat-send');
+  if(!inp || !btn) return;
+  const q = (inp.value || '').trim();
+  if(!q) return;
+  if(mbChatBusy) return;   // ignore rapid double-taps while a request is pending
+  mbChatBusy = true;
+  const priorHist = mbChatHistory.slice(-8).map(function(m){ return {role:m.role, content:m.content}; });
+  mbChatHistory.push({ role:'user', content:q });
+  inp.value = '';
+  mbChatHistory.push({ role:'assistant', content:'…', _pending:true });
+  mbChatRender();
+  const prev = btn.textContent; btn.disabled = true; btn.textContent = '…';
+  try{
+    const r = await api('/assistant', { question:q, ticker:sym, history:priorHist });
+    if(mbChatHistory.length && mbChatHistory[mbChatHistory.length-1]._pending) mbChatHistory.pop();
+    if(!r || r.ok === false){ mbChatHistory.push({ role:'assistant', content:(r && r.error) ? r.error : 'Sorry — something went wrong.' }); }
+    else { mbChatHistory.push({ role:'assistant', content:(r.answer || '(no answer)') }); }
+  }catch(e){
+    if(mbChatHistory.length && mbChatHistory[mbChatHistory.length-1]._pending) mbChatHistory.pop();
+    mbChatHistory.push({ role:'assistant', content:'Request failed — try again.' });
+  }finally{ mbChatBusy = false; btn.disabled = false; btn.textContent = prev; mbChatRender(); }
 }
 // Blocked Orders — locally-rejected (never-sent) invalid-payload orders. Display-only.
 // Fed by d.execution_rejections; hidden when there are none. All strings via textContent.
@@ -27861,7 +27955,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); refreshManual();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); refreshManual(); mbChatRender();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -29033,6 +29127,7 @@ def _assistant_live_context(ticker_override=None):
             "market_status":      a.get("market_status"),
             "market_reason":      a.get("market_reason"),
             "alert_counts":       a.get("counts"),
+            "main_brain":         a.get("main_brain"),
         }
 
     primary = _one(ticker_override)
@@ -29061,7 +29156,62 @@ def _assistant_live_context(ticker_override=None):
                 continue
     except Exception:
         pass
-    return {"selected": primary, "all_instruments": overview}
+    # Open positions the owner is actively managing — READ-ONLY mirror so the
+    # assistant can answer "manage my trade", "where's my stop", "take partials".
+    # compute_manual_trade_management MUTATES the dict it is handed, so we pass COPIES
+    # only. Manual (hand-entered) + bot (auto-managed) rows, exactly like the monitor
+    # box. On-demand only (not the 3s poll); fully fail-open.
+    open_trades = []
+    _trade_keys = ("symbol", "direction", "mode", "contracts", "entry_price",
+                   "stop_loss", "current_price", "current_r", "unrealized_pnl",
+                   "thesis_status", "recommendation", "recommendation_reason",
+                   "entry_assessment", "warnings", "what_improves",
+                   "what_invalidates", "origin")
+    try:
+        with MANUAL_TRADES_LOCK:
+            _mts = [dict(t) for t in MANUAL_TRADES.values()]
+        _acache = {}
+        for _t in _mts:
+            _s = _t.get("symbol")
+            if _s not in _acache:
+                try:
+                    _acache[_s] = full_analysis(ticker_override=_s)
+                except Exception:
+                    _acache[_s] = None
+            try:
+                _row = compute_manual_trade_management(_t, analysis=_acache.get(_s))
+                _row["origin"] = "manual"
+                open_trades.append({k: _row.get(k) for k in _trade_keys})
+            except Exception:
+                continue
+        try:
+            for _row in _bot_active_trade_monitor_items(_acache):
+                open_trades.append({k: _row.get(k) for k in _trade_keys})
+        except Exception:
+            pass
+    except Exception:
+        open_trades = []
+
+    # Per-asset risk rules / daily limits — READ-ONLY, for "risk check" questions.
+    risk_rules = {}
+    try:
+        if sel_inst:
+            risk_rules[sel_inst] = _safety_snapshot(sel_inst)
+    except Exception:
+        pass
+    try:
+        for tk in enabled_instruments():
+            if tk == sel_inst or tk in risk_rules:
+                continue
+            try:
+                risk_rules[tk] = _safety_snapshot(tk)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return {"selected": primary, "all_instruments": overview,
+            "open_trades": open_trades, "risk_rules": risk_rules}
 
 
 def _assistant_answer(data):
@@ -29126,6 +29276,19 @@ def _assistant_answer(data):
         "- READY gate: a setup must pass hard requirements (e.g. VWAP and structure alignment, plus "
         "a zone requirement in SWING) and clear the score threshold. 'gate_debug', 'strict_reason' "
         "and 'strict_missing' name exactly which requirement failed.\n\n"
+        "The snapshot also includes: 'main_brain' (the same plain-English command-center "
+        "read the owner sees on the dashboard — a status of WATCHING/BUILDING/READY/WAIT/"
+        "MANAGING/INVALIDATED plus four views: what I see, what I'm thinking, what I'm "
+        "watching for, and the plan); 'open_trades' (positions the owner is managing right "
+        "now, each with entry, stop, current price, current R, unrealized P/L, a "
+        "recommendation and what would invalidate it — origin 'manual' is hand-entered, "
+        "'bot' is an auto-managed position; an empty list means no open position); and "
+        "'risk_rules' (per-instrument daily limits: max trades/day vs taken today, max "
+        "contracts, max open trades, max daily loss vs P/L today, cooldowns, and whether an "
+        "emergency stop is active). Use 'open_trades' to answer stop / partials / trade-"
+        "management questions, and 'risk_rules' for risk checks. If 'open_trades' is empty "
+        "and the owner asks to manage a trade, say there is no open position and explain "
+        "what you'd do if one were taken on the current setup.\n\n"
         "STRICT RULES:\n"
         "- You are READ-ONLY and advisory. You CANNOT place, modify, size, or close trades, and you "
         "must never imply that you can or did. If asked to trade, explain that you only read and "

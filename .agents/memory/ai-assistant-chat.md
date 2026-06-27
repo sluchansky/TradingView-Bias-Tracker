@@ -27,3 +27,15 @@ code).
 **Why:** consistency with the strict money-path isolation every other display-only
 engine here follows; an un-escaped model answer or an `OPEN_PATHS` slip are the two
 ways this otherwise-safe feature could become a security hole.
+
+**Context grounding (`_assistant_live_context`):** the read-only snapshot the model
+sees includes (besides the per-instrument analysis) `main_brain` (same command-center
+read the owner sees), `open_trades` (manual + bot positions — built from COPIES since
+`compute_manual_trade_management` MUTATES its input; reuses `_bot_active_trade_monitor_items`),
+and `risk_rules` (`_safety_snapshot` per instrument). All ADDITIVE and fail-open. This is
+what lets the chat answer "manage my trade / where's my stop / take partials / risk check"
+from live state. The primer documents these keys so the model uses them.
+
+**Two surfaces, one backend:** the live chat now lives INSIDE the Main Brain panel
+(`mb-chat-*` ids — see `main-brain-dashboard.md`). The legacy `mod-assistant` panel
+(`ai-*` ids) is hidden but still in the DOM; never reuse its ids.
