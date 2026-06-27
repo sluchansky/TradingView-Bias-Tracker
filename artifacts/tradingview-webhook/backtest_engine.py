@@ -986,29 +986,54 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
         stop = plan["stop"]
         risk = plan["risk_points"]
         tp1d, tp2d, tp3d = spec["tp1"], spec["tp2"], spec["tp3"]
-        # Reject trades where the stop is wider than the first target (stop > target).
-        if risk > tp1d:
-            i += 1
-            continue
-        # Minimum reward:risk on the first (expectancy-critical) target.
-        if min_target_r and (tp1d / risk) < min_target_r:
-            i += 1
-            continue
-        # SWING legacy runner-RR gate (unchanged).
-        if mk["enforce_min_rr"] and (tp2d / risk) < 2.0:
-            i += 1
-            continue
+        # ── Entry-eligibility gates ───────────────────────────────────────
+        # The fixed spec TP1/TP2 points are the LEGACY model's literal profit
+        # levels, so the "stop wider than first target" / runner-RR gates apply
+        # ONLY to BT_MGMT_LEGACY (partial_tp3). The R-based models derive their
+        # target from `risk` (target = N x risk), so a fixed-point TP reference
+        # is meaningless for them and — for higher-priced instruments like MNQ,
+        # whose ATR-based risk (median ~80 pts) dwarfs the fixed 20-pt TP1 —
+        # would reject 100% of signals. R-based entry instead uses a single
+        # management-MODEL-INDEPENDENT, live-consistent 1.0R reference so every
+        # R-based model shares the SAME eligibility gate (realized trade lists can
+        # still differ via exit timing + the one-position loop): min_target_r <=
+        # 1.0 admits trades; a min_target_r above 1.0 intentionally filters them
+        # all by design (the live edge is 1:1).
+        if management == BT_MGMT_LEGACY:
+            # Reject trades where the stop is wider than the first target.
+            if risk > tp1d:
+                i += 1
+                continue
+            # Minimum reward:risk on the first (expectancy-critical) target.
+            if min_target_r and (tp1d / risk) < min_target_r:
+                i += 1
+                continue
+            # SWING legacy runner-RR gate (unchanged).
+            if mk["enforce_min_rr"] and (tp2d / risk) < 2.0:
+                i += 1
+                continue
+        else:
+            # R-based entry reference: live fixed 1:1 baseline, independent of
+            # the selected R exit model (keeps entry parity across R models).
+            entry_ref_r = 1.0
+            if min_target_r and entry_ref_r < min_target_r:
+                i += 1
+                continue
         if direction == "Long":
             tp1, tp3 = entry + tp1d, entry + tp3d
         else:
             tp1, tp3 = entry - tp1d, entry - tp3d
 
         # ── Walk forward to resolve the trade under the chosen management ──
-        # Entry selection above is identical for every management model; only the
-        # EXIT differs. The legacy model banks 50% at spec TP1 and trails the
-        # runner to spec TP3 with a breakeven stop; the R-based models (default)
-        # let the position run to a fixed/partial R target so winners are not
-        # capped at breakeven. All paths keep worst-case same-bar fills.
+        # The entry-eligibility GATE above is identical across all R-based models
+        # (and the LEGACY model keeps its own fixed-TP gates); only the EXIT
+        # differs. Realized trade LISTS can still differ between R-based models
+        # because a different exit moves the close bar and the one-position-per-
+        # strategy loop then skips a different set of overlapping signals. The
+        # legacy model banks 50% at spec TP1 and trails the runner to spec TP3
+        # with a breakeven stop; the R-based models (default) let the position run
+        # to a fixed/partial R target so winners are not capped at breakeven. All
+        # paths keep worst-case same-bar fills.
         commission = commission_per_side * 2.0
         if management == BT_MGMT_LEGACY:
             (exit_price, exit_bar, exit_reason,

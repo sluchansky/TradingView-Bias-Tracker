@@ -75,9 +75,11 @@ disabled and excluded even when explicitly requested in `strategies=[...]`),
 CAUSAL: evaluated AFTER signal detection but BEFORE next-bar entry, reading only
 signal-bar state (`s["et"]`, `s["atr_ratio"]`, `s["session"]`) — never a future bar.
 **Design decisions a future agent might second-guess:**
-- `min_target_r` and the `risk > tp1d` (stop>target) reject both key off **TP1, not
-  TP3** — because 50% scales at TP1 and the runner moves to BE, so TP1's RR is the
-  expectancy-critical one.
+- `min_target_r` and the `risk > tp1d` (stop>target) reject key off the fixed spec
+  TP1 **only under BT_MGMT_LEGACY** (where 50% banks at TP1). R-based models bypass
+  these fixed-TP gates for a 1.0R eligibility reference — keying fixed tp1=20 for ALL
+  models was the MNQ 0-trades bug (ATR risk ≫ 20 → every signal rejected). See the
+  single-run-management memory.
 - `tradable` = raw PF>1 (or `inf` for all-winners) AND avg R>0, computed from the
   **raw numeric pf BEFORE** it's converted to the "∞"/None display string. Never
   compare the display string.
@@ -86,13 +88,13 @@ signal-bar state (`s["et"]`, `s["atr_ratio"]`, `s["session"]`) — never a futur
   exposed beyond that route, clamp inside the engine too.
 - Empty-trades metrics dict must carry the same new keys (`tradable=False`,
   `avg_winner_r`/`avg_loser_r=None`, `loss_reasons=[]`) for serialization parity.
-- **MGC zeroes out at the default 1.5R min target — this is correct, not a bug.**
-  MGC's first target (`tp1=5.0`) equals its minimum stop (`min_stop_ticks 50 ×
-  tick 0.1 = 5.0`), so every MGC trade is at best **1.0R at TP1** and can never
-  satisfy `min_target_r=1.5` → 0 trades. MNQ passes (tp1=20 vs ~10–13pt stops ≈
-  1.5–2R). The dashboard exposes Min Target R / Max Trades-per-session inputs
-  (default 1.5 / 3) so MGC can be explored at 1.0R; the form caption states this.
-  Don't "fix" by silently lowering the default or by moving the gate to TP3.
+- **min_target_r > 1.0 zeroes ALL R-based trades — by design, not a bug.** R-based
+  models compare min_target_r against a 1.0R eligibility reference; the dashboard
+  `rn-minr` + engine MIN_TARGET_R both default to 1.0 so the default run trades, and
+  anything >1.0 filters everything. (STALE prior note claimed only MGC zeroed at 1.5
+  and "MNQ passes tp1=20 vs 10–13pt stops" — wrong: MNQ stops are ~25–1005pt and
+  under the old fixed-tp1 gate MNQ zeroed in EVERY config.) Legacy partial_tp3 still
+  uses the fixed tp1/risk gate. Don't "fix" by faking fills or moving the gate.
 
 ## CSV auto-detect (symbol/timeframe) + GC/NQ aliases
 `parse_candles_csv` accepts symbol/timeframe = "auto"/None/"" and the upload route
