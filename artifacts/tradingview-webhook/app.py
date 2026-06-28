@@ -8565,6 +8565,7 @@ def _record_strategy_trade(mt):
                         row[4], row[6], row[13], row[14])
             _maybe_recompute_learning()
             _maybe_generate_learning_report()
+            _emit_trade_closed_event(mt, ctx, outcome_reason, outcome_tag)  # Main Brain learning loop (display-only, fail-open)
     except Exception as exc:
         logger.warning("record_strategy_trade failed: %s", exc)
     finally:
@@ -13133,6 +13134,8 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "bull_case":         [],
         "bear_case":         [],
         "management_read":   None,
+        "performance_review": _main_brain_review_snapshot(),
+        "lessons":           [],
         "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
         "reason":            reason,
     }
@@ -13432,6 +13435,14 @@ def compute_main_brain(result):
             "invalidated": bool(invalidated),
         }
 
+        # ── Performance Review & deterministic lessons (DISPLAY-ONLY) ─────────
+        # A trimmed snapshot of the cached resolved-event review plus plain-English
+        # lessons for THIS exact (instrument | mode | setup). Drawn entirely from
+        # history; never feeds the gate / sizing / dedupe / money path. Fail-open.
+        performance_review = _main_brain_review_snapshot()
+        lessons            = _main_brain_lessons(inst, TRADING_MODE,
+                                                 result.get("market_regime"), fav)
+
         head_dir = (" %s" % fav) if (fav and status in ("BUILDING", "WATCHING", "READY")) else ""
         return {
             "status":            status,
@@ -13457,6 +13468,8 @@ def compute_main_brain(result):
             "bull_case":         bull_case,
             "bear_case":         bear_case,
             "management_read":   management_read,
+            "performance_review": performance_review,
+            "lessons":           lessons,
             "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
             "reason":            None,
         }
@@ -14594,6 +14607,13 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["main_brain"] = compute_main_brain(result)
     except Exception as _mb_exc:
         result["main_brain"] = _main_brain_neutral("Main Brain unavailable (%s)." % _mb_exc)
+    # Main Brain learning loop: capture a NON-actionable (WAIT) setup as a pending
+    # would-have-worked hypothesis. Pure side-effect — never mutates `result`,
+    # gated on the events table being ready, fail-open (no-op in the goldens).
+    try:
+        _maybe_capture_main_brain_snapshot(result)
+    except Exception:
+        pass
     return result
 
 
@@ -18000,6 +18020,837 @@ def _load_swing_theses_from_db():
             pass
 
 
+# ── Main Brain Performance Review & Learning Loop (OBSERVABILITY / DISPLAY-ONLY) ─
+# Captures trade & rejected-setup EVENTS (READY taken/skipped, manual entered, WAIT
+# would-have-worked/failed, TP1→BE, late entry, quick invalidation), reviews their
+# outcomes, and surfaces plain-English lessons. STRICTLY display-only: it NEVER
+# touches the strict READY gate, scoring, sizing, dedupe or the /traderspost money
+# path, and the 4 goldens stay byte-identical (capture lives at/after the
+# full_analysis seam + the close/watcher paths, never inside the strict funcs).
+# Persistence mirrors the journal / swing-thesis convention: app-side INSERT/SELECT
+# ONLY (+ a status UPDATE when a pending WAIT hypothesis resolves), NO in-app DDL —
+# the main_brain_events table is created out-of-band (database tool in dev, Publish
+# schema-diff in prod). FAIL-OPEN throughout: a missing table / DB degrades to "no
+# history" and never blocks a trade, a close, or full_analysis.
+MAIN_BRAIN_EVENTS_DB_READY = False
+MAIN_BRAIN_REVIEW_LOCK     = threading.Lock()     # guards the BRIEF cache-swap below (held only microseconds, never during DB work)
+MAIN_BRAIN_RECALC_LOCK     = threading.Lock()     # ensures only ONE recompute runs at a time; DB work holds NO review lock so a slow/down DB can never stall a display read
+MAIN_BRAIN_REVIEW          = {                     # in-memory review cache; read by /status + dashboard, never per-request SQL
+    "enabled": LEARNING_DB_ENABLED, "ready": False, "total_events": 0,
+    "decided_trades": 0, "wins": 0, "losses": 0, "scratches": 0,
+    "win_rate": None, "avg_r": None,
+    "best_setup": None, "worst_setup": None,
+    "common_rejection": None, "common_loss": None,
+    "best_window": None, "worst_window": None,
+    "wait_accuracy": None, "by_key": {}, "updated_at": None,
+}
+MAIN_BRAIN_REVIEW_RECALC_EVERY = 5                 # recompute the review cache every N resolved events
+MB_MIN_SETUP_SAMPLE = 3                            # min decided trades before a setup_type can rank best/worst
+MB_MIN_HOUR_SAMPLE  = 3                            # min decided trades before an ET hour can rank best/worst window
+MB_BYKEY_CAP        = 24                           # per (instrument|mode|setup) recent-outcome history kept for lessons
+MB_HYP_TTL_MIN_SCALP   = 60                        # WAIT-hypothesis resolution window (minutes) — SCALP
+MB_HYP_TTL_MIN_SWING   = 360                       # WAIT-hypothesis resolution window (minutes) — SWING
+MB_RESOLVER_INTERVAL_SECS = 20                     # how often the background resolver samples live price
+MB_LESSON_MIN_SAMPLE   = 4                          # min decided outcomes in a (inst|mode|setup) bucket before a lesson is surfaced
+_MAIN_BRAIN_EVENT_SEEN      = {}                   # (instrument,event_type,fingerprint,state) -> ts; throttles re-writes
+_MAIN_BRAIN_EVENT_SEEN_LOCK = threading.Lock()
+
+
+def _check_main_brain_events_db_ready():
+    """Probe the main_brain_events table (no DDL) and set MAIN_BRAIN_EVENTS_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB disables event capture (the rest of
+    the bot is unaffected)."""
+    global MAIN_BRAIN_EVENTS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM main_brain_events LIMIT 1")
+            cur.fetchone()
+        MAIN_BRAIN_EVENTS_DB_READY = True
+        logger.info("main_brain_events table ready")
+    except Exception as exc:
+        logger.warning("main_brain_events table unavailable (Main Brain learning loop disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _mb_event_throttled(instrument, event_type, fingerprint, state, ttl_secs=900):
+    """True iff an identical (instrument,event_type,fingerprint,state) event was seen
+    within ttl_secs, so repeated 3s polls / webhook reposts don't write the same event
+    over and over. Records the stamp on a miss. In-memory + bounded. FAIL-OPEN: any
+    error returns False (allow capture)."""
+    try:
+        key = (str(instrument or ""), str(event_type or ""),
+               str(fingerprint or ""), str(state or ""))
+        nowts = time.time()
+        with _MAIN_BRAIN_EVENT_SEEN_LOCK:
+            last = _MAIN_BRAIN_EVENT_SEEN.get(key)
+            if last is not None and (nowts - last) < ttl_secs:
+                return True
+            _MAIN_BRAIN_EVENT_SEEN[key] = nowts
+            if len(_MAIN_BRAIN_EVENT_SEEN) > 4000:        # bound the dict
+                cutoff = nowts - max(ttl_secs, 3600)
+                for k in [k for k, t in _MAIN_BRAIN_EVENT_SEEN.items() if t < cutoff]:
+                    _MAIN_BRAIN_EVENT_SEEN.pop(k, None)
+        return False
+    except Exception:
+        return False
+
+
+def _record_main_brain_event(event):
+    """INSERT one Main Brain event (ON CONFLICT (idempotency_key) DO NOTHING). The
+    offload to the slow-task worker keeps DB latency off the trade/watcher path.
+    FAIL-OPEN: no table / no DB ⇒ no-op. The narrative blocks (entry_idea / bull_case
+    / bear_case / watching / missing / hypothesis) are stored as JSONB."""
+    if not MAIN_BRAIN_EVENTS_DB_READY or not isinstance(event, dict):
+        return
+    ev   = dict(event)
+    idem = ev.get("idempotency_key")
+    if not idem:
+        return
+    ev_id = ev.get("id") or uuid.uuid4().hex
+    inst  = ev.get("instrument") or _instrument_from_text(ev.get("symbol_raw"))
+
+    def _jb(v):
+        try:
+            return psycopg2.extras.Json(_swing_json_safe(v)) if v is not None else None
+        except Exception:
+            return None
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO main_brain_events
+                         (id, idempotency_key, event_type, symbol_raw, instrument,
+                          event_ts, setup_type, mode, direction, entry_idea, verdict,
+                          confidence, bull_case, bear_case, watching, missing, outcome,
+                          r_multiple, rejection_reason, loss_reason, lesson, hypothesis,
+                          status, resolved_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (idempotency_key) DO NOTHING
+                       RETURNING id""",
+                    (ev_id, idem, ev.get("event_type"), ev.get("symbol_raw"), inst,
+                     ev.get("event_ts") or now_utc(), ev.get("setup_type"), ev.get("mode"),
+                     ev.get("direction"), _jb(ev.get("entry_idea")), ev.get("verdict"),
+                     ev.get("confidence"), _jb(ev.get("bull_case")), _jb(ev.get("bear_case")),
+                     _jb(ev.get("watching")), _jb(ev.get("missing")), ev.get("outcome"),
+                     ev.get("r_multiple"), ev.get("rejection_reason"), ev.get("loss_reason"),
+                     ev.get("lesson"), _jb(ev.get("hypothesis")),
+                     ev.get("status") or "resolved", ev.get("resolved_at")),
+                )
+                inserted = cur.fetchone()
+            if inserted and (ev.get("status") or "resolved") == "resolved":
+                _maybe_recompute_main_brain_review()
+        except Exception as exc:
+            logger.warning("record_main_brain_event failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _maybe_recompute_main_brain_review():
+    """Launch a background review recompute when the resolved-event total crosses a
+    multiple of MAIN_BRAIN_REVIEW_RECALC_EVERY. FAIL-OPEN."""
+    if not MAIN_BRAIN_EVENTS_DB_READY:
+        return
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM main_brain_events WHERE status = 'resolved'")
+            n = cur.fetchone()[0]
+        if n and n % MAIN_BRAIN_REVIEW_RECALC_EVERY == 0:
+            threading.Thread(target=_recompute_main_brain_review,
+                             name="main-brain-review", daemon=True).start()
+    except Exception as exc:
+        logger.debug("main brain review trigger skip: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _recompute_main_brain_review():
+    """Recompute the Performance Review aggregates from RESOLVED main_brain_events and
+    swap the in-memory cache atomically. Computes win rate, avg R, best/worst setup
+    type, most-common rejection & loss reason, best/worst ET time window, a would-have
+    -worked accuracy summary, and a per-(instrument|mode|setup) recent-outcome index
+    that feeds the deterministic Main Brain lessons. DISPLAY-ONLY; FAIL-OPEN; serialized
+    so a slow run can't clobber a newer snapshot. The DB connection + query +
+    aggregation run with NO review lock held; MAIN_BRAIN_REVIEW_LOCK is taken only for
+    the brief atomic cache swap, so a slow/unavailable learning DB can never stall a
+    display read (/status, full_analysis)."""
+    global MAIN_BRAIN_REVIEW
+    if not MAIN_BRAIN_EVENTS_DB_READY:
+        return
+    if not MAIN_BRAIN_RECALC_LOCK.acquire(blocking=False):
+        return                                       # another recompute is already running
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT instrument, symbol_raw, event_type, setup_type, mode, direction,
+                   outcome, r_multiple, rejection_reason, loss_reason, missing, event_ts
+              FROM main_brain_events
+             WHERE status = 'resolved'
+             ORDER BY event_ts DESC
+             LIMIT 3000
+        """)
+        rows = cur.fetchall() or []
+
+        WIN     = {"win", "would_have_worked"}
+        LOSS    = {"loss", "would_have_failed", "invalidated"}
+        DECIDED = {"win", "loss", "breakeven"}       # actually-taken trades feed win rate / avg R
+
+        wins = losses = scratches = 0
+        r_vals = []
+        by_setup = {}        # setup_type -> {"n","wins","losses","r":[...]}
+        by_hour  = {}        # et_hour    -> {"n","wins","losses","r":[...]}
+        rej_counts, loss_counts = {}, {}
+        wait_total = wait_worked = 0
+        by_key = {}
+
+        def _reason_of(row):
+            r = row.get("loss_reason") or row.get("rejection_reason")
+            if r:
+                return str(r)
+            miss = row.get("missing")
+            if isinstance(miss, list) and miss:
+                return str(miss[0])
+            if isinstance(miss, str) and miss.strip():
+                return miss.strip()
+            return None
+
+        for row in rows:
+            outcome = (row.get("outcome") or "").strip().lower()
+            r_mult  = row.get("r_multiple")
+            setup   = (row.get("setup_type") or "").strip() or None
+            inst    = row.get("instrument") or _instrument_from_text(row.get("symbol_raw"))
+
+            if outcome in DECIDED:
+                if   outcome == "win":  wins += 1
+                elif outcome == "loss": losses += 1
+                else:                   scratches += 1
+                if r_mult is not None:
+                    r_vals.append(float(r_mult))
+                if setup:
+                    s = by_setup.setdefault(setup, {"n": 0, "wins": 0, "losses": 0, "r": []})
+                    s["n"] += 1
+                    if   outcome == "win":  s["wins"] += 1
+                    elif outcome == "loss": s["losses"] += 1
+                    if r_mult is not None:  s["r"].append(float(r_mult))
+                try:
+                    h  = row["event_ts"].astimezone(ET_TZ).hour
+                    hh = by_hour.setdefault(h, {"n": 0, "wins": 0, "losses": 0, "r": []})
+                    hh["n"] += 1
+                    if   outcome == "win":  hh["wins"] += 1
+                    elif outcome == "loss": hh["losses"] += 1
+                    if r_mult is not None:  hh["r"].append(float(r_mult))
+                except Exception:
+                    pass
+
+            rr = row.get("rejection_reason")
+            if rr:
+                rej_counts[str(rr)] = rej_counts.get(str(rr), 0) + 1
+            lr = row.get("loss_reason")
+            if lr:
+                loss_counts[str(lr)] = loss_counts.get(str(lr), 0) + 1
+
+            if outcome in ("would_have_worked", "would_have_failed"):
+                wait_total += 1
+                if outcome == "would_have_worked":
+                    wait_worked += 1
+
+            if inst and setup:
+                key = "%s|%s|%s" % (inst, ((row.get("mode") or "").upper() or "?"), setup)
+                won = True if outcome in WIN else (False if outcome in LOSS else None)
+                lst = by_key.setdefault(key, [])
+                if len(lst) < MB_BYKEY_CAP:
+                    lst.append({"outcome": outcome or None, "won": won,
+                                "reason": _reason_of(row),
+                                "r": (float(r_mult) if r_mult is not None else None)})
+
+        decided  = wins + losses + scratches
+        denom    = wins + losses
+        win_rate = round(100.0 * wins / denom, 1) if denom else None
+        avg_r    = round(sum(r_vals) / len(r_vals), 2) if r_vals else None
+
+        def _setup_card(name, d):
+            wd = d["wins"] + d["losses"]
+            return {"setup_type": name, "n": d["n"],
+                    "win_rate": round(100.0 * d["wins"] / wd, 1) if wd else None,
+                    "avg_r": round(sum(d["r"]) / len(d["r"]), 2) if d["r"] else None}
+        ranked_setups = [_setup_card(k, v) for k, v in by_setup.items() if v["n"] >= MB_MIN_SETUP_SAMPLE]
+        ranked_setups = [s for s in ranked_setups if s["win_rate"] is not None]
+        ranked_setups.sort(key=lambda s: (s["win_rate"], s["avg_r"] if s["avg_r"] is not None else -99.0), reverse=True)
+        best_setup  = ranked_setups[0]  if ranked_setups else None
+        worst_setup = ranked_setups[-1] if len(ranked_setups) > 1 else None
+
+        def _hour_card(h, d):
+            wd = d["wins"] + d["losses"]
+            return {"hour_et": int(h), "label": _fmt_hour_et(int(h)), "n": d["n"],
+                    "win_rate": round(100.0 * d["wins"] / wd, 1) if wd else None,
+                    "avg_r": round(sum(d["r"]) / len(d["r"]), 2) if d["r"] else None}
+        ranked_hours = [_hour_card(h, v) for h, v in by_hour.items() if v["n"] >= MB_MIN_HOUR_SAMPLE]
+        ranked_hours = [hh for hh in ranked_hours if hh["avg_r"] is not None]
+        ranked_hours.sort(key=lambda hh: hh["avg_r"], reverse=True)
+        best_window  = ranked_hours[0]  if ranked_hours else None
+        worst_window = ranked_hours[-1] if len(ranked_hours) > 1 else None
+
+        def _top_reason(counts):
+            if not counts:
+                return None
+            k = max(counts.items(), key=lambda kv: kv[1])
+            return {"reason": k[0], "n": k[1]}
+
+        wait_acc = None
+        if wait_total > 0:
+            wait_acc = {"n": wait_total, "would_have_worked": wait_worked,
+                        "hit_rate": round(100.0 * wait_worked / wait_total, 1)}
+
+        new_review = {
+            "enabled": True, "ready": len(rows) > 0, "total_events": len(rows),
+            "decided_trades": decided, "wins": wins, "losses": losses, "scratches": scratches,
+            "win_rate": win_rate, "avg_r": avg_r,
+            "best_setup": best_setup, "worst_setup": worst_setup,
+            "common_rejection": _top_reason(rej_counts), "common_loss": _top_reason(loss_counts),
+            "best_window": best_window, "worst_window": worst_window,
+            "wait_accuracy": wait_acc, "by_key": by_key,
+            "updated_at": now_utc().isoformat(),
+        }
+        with MAIN_BRAIN_REVIEW_LOCK:                  # brief atomic swap ONLY — never held during DB work
+            MAIN_BRAIN_REVIEW = new_review
+        logger.info("main_brain_events review recomputed: %d events, %d decided", len(rows), decided)
+    except Exception as exc:
+        logger.warning("main brain review recompute failed: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            MAIN_BRAIN_RECALC_LOCK.release()
+        except Exception:
+            pass
+
+
+def _main_brain_review_snapshot():
+    """JSON-safe PUBLIC view of the cached Performance Review for /status + the dashboard.
+    Excludes the heavy internal by_key index (that feeds _main_brain_lessons only).
+    DISPLAY-ONLY; FAIL-OPEN -> a minimal disabled stub."""
+    try:
+        if MAIN_BRAIN_REVIEW_LOCK.acquire(timeout=0.5):  # the swap is microseconds; never block a display path
+            try:
+                r = dict(MAIN_BRAIN_REVIEW)
+            finally:
+                MAIN_BRAIN_REVIEW_LOCK.release()
+        else:
+            r = dict(MAIN_BRAIN_REVIEW)                   # fail-open: atomic-rebind read, swap can't tear the dict
+        r.pop("by_key", None)
+        return r
+    except Exception:
+        return {"enabled": False, "ready": False, "total_events": 0}
+
+
+def _main_brain_lessons(inst, mode, setup_type, direction=None, limit=3):
+    """Deterministic, plain-English lessons for the CURRENT (instrument | mode | setup),
+    drawn from the cached review's recent-outcome index (by_key). DISPLAY-ONLY — it never
+    touches the gate / sizing / dedupe / money path. Returns a list of {"text","kind","n"}
+    (most decisive first); needs >= MB_LESSON_MIN_SAMPLE decided outcomes before it speaks.
+    FAIL-OPEN -> []."""
+    out = []
+    try:
+        st = (setup_type or "").strip()
+        if not inst or not st:
+            return out
+        if MAIN_BRAIN_REVIEW_LOCK.acquire(timeout=0.5):
+            try:
+                by_key = dict(MAIN_BRAIN_REVIEW.get("by_key") or {})
+            finally:
+                MAIN_BRAIN_REVIEW_LOCK.release()
+        else:
+            by_key = dict(MAIN_BRAIN_REVIEW.get("by_key") or {})  # fail-open read; never block a display path
+        key = "%s|%s|%s" % (inst, (mode or "").upper() or "?", st)
+        lst = by_key.get(key) or []
+        decided = [e for e in lst if e.get("won") in (True, False)]
+        n = len(decided)
+        if n < MB_LESSON_MIN_SAMPLE:
+            return out
+        wins   = sum(1 for e in decided if e.get("won") is True)
+        losses = n - wins
+
+        def _top(counts):
+            return max(counts.items(), key=lambda kv: (kv[1], kv[0])) if counts else None
+
+        loss_reasons, all_reasons = {}, {}
+        for e in decided:
+            r = e.get("reason")
+            if not r:
+                continue
+            r = str(r)
+            all_reasons[r] = all_reasons.get(r, 0) + 1
+            if e.get("won") is False:
+                loss_reasons[r] = loss_reasons.get(r, 0) + 1
+
+        if losses > wins and losses >= 2:
+            txt = "Similar %s setups failed %d of the last %d" % (st, losses, n)
+            tr = _top(loss_reasons)
+            if tr:
+                txt += " because %s" % tr[0]
+            out.append({"text": txt + ".", "kind": "caution", "n": n})
+        elif wins > losses and wins >= 2:
+            out.append({"text": "Similar %s setups worked %d of the last %d." % (st, wins, n),
+                        "kind": "support", "n": n})
+        else:
+            out.append({"text": "Similar %s setups are mixed — %d win / %d loss of the last %d."
+                        % (st, wins, losses, n), "kind": "neutral", "n": n})
+
+        tr_all = _top(all_reasons)
+        if tr_all and tr_all[1] >= 2:
+            already = out[0]["text"] if out else ""
+            if tr_all[0] not in already:
+                out.append({"text": "Most common blocker on these: %s (%d of %d)."
+                            % (tr_all[0], tr_all[1], n), "kind": "info", "n": n})
+        return out[:limit]
+    except Exception:
+        return []
+
+
+def _mb_coerce_float(v):
+    """Best-effort float from a plan field that may already be a number or a
+    formatted string (e.g. '21,512.5' or a '21.5–21.7' zone). Returns None on miss."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            return float(v)
+        except Exception:
+            return None
+    try:
+        import re as _re
+        m = _re.search(r"-?\d+(?:\.\d+)?", str(v).replace(",", "").strip())
+        return float(m.group(0)) if m else None
+    except Exception:
+        return None
+
+
+def _build_main_brain_event_snapshot(result, event_type=None, **extra):
+    """Build the NARRATIVE base for a Main Brain event by READING already-assembled
+    full_analysis fields (result['main_brain'] + top-level verdict / edge / trade_plan
+    / regime). DISPLAY-ONLY and FAIL-OPEN: any error returns a minimal stub. NEVER
+    called from evaluate_strict_setup / build_strict_trade_plan (the goldens drive
+    those directly) — only the full_analysis return seam + the close / watcher /
+    manual paths call this. Callers merge in outcome / idempotency_key / status /
+    rejection_reason / loss_reason / hypothesis before handing to _record_main_brain_event."""
+    try:
+        result = result or {}
+        mb   = result.get("main_brain") or {}
+        plan = result.get("trade_plan") or {}
+
+        symbol_raw = result.get("active_ticker")
+        inst       = instrument_of(symbol_raw) or _instrument_from_text(symbol_raw)
+        direction  = (mb.get("favored_direction") or result.get("strict_direction")
+                      or result.get("dominant_direction"))
+        if direction not in ("Long", "Short"):
+            direction = None
+
+        entry  = _mb_coerce_float(plan.get("entry") or plan.get("entry_zone"))
+        stop   = _mb_coerce_float(plan.get("stop_loss"))
+        target = _mb_coerce_float(plan.get("target1") or plan.get("take_profit") or plan.get("target"))
+
+        entry_idea = {
+            "current_price": _mb_coerce_float(result.get("current_price")),
+            "vwap":          _mb_coerce_float(result.get("vwap_value")),
+            "structure":     result.get("structure_label"),
+            "bias":          result.get("bias"),
+            "cvd":           result.get("cvd_state"),
+            "regime":        result.get("market_regime"),
+            "edge_score":    (mb.get("edge_score") if mb.get("edge_score") is not None
+                              else result.get("edge_score")),
+            "edge_grade":    mb.get("edge_grade") or result.get("edge_grade"),
+            "plan": {"entry": entry, "stop": stop, "target": target,
+                     "rr": plan.get("rr"), "rr_num": plan.get("rr_num"),
+                     "direction": plan.get("direction") or direction},
+        }
+
+        snap = {
+            "event_type":  event_type,
+            "symbol_raw":  symbol_raw,
+            "instrument":  inst,
+            "setup_type":  (result.get("market_regime") or "").strip() or None,
+            "mode":        TRADING_MODE,
+            "direction":   direction,
+            "verdict":     result.get("verdict"),
+            "confidence":  mb.get("confidence_pct"),
+            "entry_idea":  entry_idea,
+            "bull_case":   [str(x).strip() for x in (mb.get("bull_case") or []) if str(x).strip()][:6],
+            "bear_case":   [str(x).strip() for x in (mb.get("bear_case") or []) if str(x).strip()][:6],
+            "watching":    [str(x).strip() for x in (mb.get("mission") or []) if str(x).strip()][:6],
+            "missing":     [str(x).strip() for x in (mb.get("what_now") or []) if str(x).strip()][:6],
+            "event_ts":    now_utc(),
+            "status":      "resolved",
+        }
+        # When the brain didn't surface a "what's next" list, the strict-gate reason is
+        # the most useful rejection signal for the lessons keyed on (inst|mode|setup).
+        if not snap["missing"]:
+            wr = result.get("strict_reason")
+            if wr:
+                snap["missing"] = [str(wr)]
+        if extra:
+            snap.update(extra)
+        return snap
+    except Exception as exc:
+        try:
+            logger.debug("main brain snapshot build skip: %s", exc)
+        except Exception:
+            pass
+        return {"event_type": event_type, "symbol_raw": (result or {}).get("active_ticker"),
+                "instrument": None, "event_ts": now_utc(), "status": "resolved"}
+
+
+def _emit_trade_closed_event(mt, ctx=None, outcome_reason=None, outcome_tag=None):
+    """Record a resolved 'trade_closed' Main Brain event from a CLOSED managed trade.
+    Called ONLY from the existing _record_strategy_trade close seam (already display-
+    only / fail-open / idempotent) — never from the gate or a broker path. One event
+    per actually-recorded trade (idempotency_key keyed on managed_key)."""
+    if not MAIN_BRAIN_EVENTS_DB_READY or not isinstance(mt, dict):
+        return
+    try:
+        ctx = ctx or mt.get("learning_ctx") or {}
+        try:
+            managed_key = "|".join(str(x) for x in (mt.get("key") or ()))
+        except Exception:
+            managed_key = None
+        if not managed_key:
+            return
+        raw = (mt.get("outcome") or "").strip()
+        if not raw:
+            return
+        if "Win" in raw:
+            outcome = "win"
+        elif raw.lower().startswith("breakeven"):
+            outcome = "breakeven"
+        else:
+            outcome = "loss"
+
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+
+        symbol_raw = mt.get("symbol") or mt.get("instrument")
+        inst       = _instrument_from_text(symbol_raw) or _instrument_from_text(mt.get("instrument"))
+        direction  = mt.get("direction") if mt.get("direction") in ("Long", "Short") else None
+        setup_type = (ctx.get("regime") or ctx.get("strategy") or "").strip() or None
+        mode       = (mt.get("mode") or ctx.get("mode") or TRADING_MODE)
+        try:
+            conf = int(round(float(ctx.get("confidence")))) if ctx.get("confidence") is not None else None
+        except Exception:
+            conf = None
+        try:
+            ev_ts = datetime.fromisoformat(mt.get("closed_at")) if mt.get("closed_at") else None
+        except Exception:
+            ev_ts = None
+
+        ev = {
+            "idempotency_key": "trade_closed|%s" % managed_key,
+            "event_type":      "trade_closed",
+            "symbol_raw":      symbol_raw,
+            "instrument":      inst,
+            "setup_type":      setup_type,
+            "mode":            mode,
+            "direction":       direction,
+            "verdict":         "READY",
+            "confidence":      conf,
+            "entry_idea":      {"entry": _f(mt.get("entry")), "stop": _f(mt.get("stop")),
+                                "target": _f(mt.get("tp1")), "exit_price": _f(mt.get("exit_price")),
+                                "edge_score": ctx.get("edge_score"), "grade": ctx.get("grade"),
+                                "strategy": ctx.get("strategy"), "regime": ctx.get("regime"),
+                                "mfe_r": _f(mt.get("mfe_r")), "mae_r": _f(mt.get("mae_r")),
+                                "outcome_tag": outcome_tag},
+            "outcome":         outcome,
+            "r_multiple":      _f(mt.get("r_multiple")),
+            "loss_reason":     (outcome_reason if outcome == "loss" else None),
+            "lesson":          outcome_reason,
+            "status":          "resolved",
+            "resolved_at":     now_utc(),
+            "event_ts":        ev_ts or now_utc(),
+        }
+        _record_main_brain_event(ev)
+    except Exception as exc:
+        try:
+            logger.debug("main brain trade_closed emit skip: %s", exc)
+        except Exception:
+            pass
+
+
+def _emit_manual_entered_event(trade):
+    """Record a resolved 'manual_entered' Main Brain event when the user logs a manual
+    position via POST /manual-trade. DISPLAY-ONLY / informational (no outcome yet);
+    keyed on the manual trade id so a repost can't double-count. FAIL-OPEN."""
+    if not MAIN_BRAIN_EVENTS_DB_READY or not isinstance(trade, dict):
+        return
+    try:
+        tid = str(trade.get("id") or "").strip()
+        if not tid:
+            return
+        symbol_raw = trade.get("symbol")
+        inst       = _instrument_from_text(symbol_raw)
+        direction  = trade.get("direction") if trade.get("direction") in ("Long", "Short") else None
+        mode       = (trade.get("mode") or TRADING_MODE)
+
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+
+        ev = {
+            "idempotency_key": "manual_entered|%s" % tid,
+            "event_type":      "manual_entered",
+            "symbol_raw":      symbol_raw,
+            "instrument":      inst,
+            "setup_type":      None,
+            "mode":            mode,
+            "direction":       direction,
+            "verdict":         "MANUAL",
+            "entry_idea":      {"entry": _f(trade.get("entry_price") or trade.get("entry")),
+                                "stop":  _f(trade.get("stop_loss") or trade.get("stop")),
+                                "target": _f(trade.get("target1") or trade.get("target") or trade.get("take_profit")),
+                                "contracts": trade.get("contracts")},
+            "status":          "resolved",
+            "event_ts":        now_utc(),
+        }
+        _record_main_brain_event(ev)
+    except Exception as exc:
+        try:
+            logger.debug("main brain manual_entered emit skip: %s", exc)
+        except Exception:
+            pass
+
+
+def _mb_hypothesis_from_result(result, snap):
+    """Derive a concrete (entry, stop, target) for a WAIT hypothesis from the ALREADY-
+    assembled plan / ATR / zone — HONEST (never fabricated): returns None when no risk
+    distance can be established. 1:1 R unless the plan carries its own target. The stop
+    side is checked first at resolution time, so a synthesized 1:1 is conservative."""
+    try:
+        direction = snap.get("direction")
+        ei   = (snap.get("entry_idea") or {})
+        plan = (ei.get("plan") or {})
+        cur  = _mb_coerce_float(result.get("current_price"))
+        entry = _mb_coerce_float(plan.get("entry"))
+        if entry is None:
+            entry = cur
+        if entry is None or direction not in ("Long", "Short"):
+            return None
+        stop   = _mb_coerce_float(plan.get("stop"))
+        target = _mb_coerce_float(plan.get("target"))
+        risk = abs(entry - stop) if stop is not None else None
+        if not risk or risk <= 0:                                  # ATR fallback
+            atr = _mb_coerce_float(result.get("atr_pts"))
+            risk = atr if (atr and atr > 0) else None
+        if not risk or risk <= 0:                                  # zone fallback
+            zone = (result.get("nearest_demand") if direction == "Long"
+                    else result.get("nearest_supply"))
+            zlvl = _mb_coerce_float(zone)
+            if zlvl is not None and abs(entry - zlvl) > 0:
+                risk = abs(entry - zlvl)
+        if not risk or risk <= 0:
+            return None                                            # no honest risk -> no hypothesis
+        if stop is None:
+            stop = (entry - risk) if direction == "Long" else (entry + risk)
+        if target is None:
+            target = (entry + risk) if direction == "Long" else (entry - risk)
+        # geometry sanity: profit side above/below entry, stop on the loss side
+        if direction == "Long"  and not (target > entry > stop):
+            return None
+        if direction == "Short" and not (target < entry < stop):
+            return None
+        mode = (snap.get("mode") or TRADING_MODE)
+        return {"direction": direction, "entry": round(entry, 4),
+                "stop": round(stop, 4), "target": round(target, 4),
+                "risk_pts": round(risk, 4), "captured_price": cur,
+                "captured_ts": now_utc().isoformat(),
+                "max_favorable": 0.0, "max_adverse": 0.0,
+                "ttl_min": (MB_HYP_TTL_MIN_SWING if mode == "SWING" else MB_HYP_TTL_MIN_SCALP)}
+    except Exception:
+        return None
+
+
+def _maybe_capture_main_brain_snapshot(result):
+    """At the full_analysis return seam, capture a NON-actionable (WAIT) setup that has a
+    directional bias + a derivable plan as a PENDING would-have-worked hypothesis. NEVER
+    mutates `result`, NEVER runs inside the strict gate (only called here after assembly),
+    FAIL-OPEN, and throttled so 3s polls / webhook reposts don't rewrite the same setup."""
+    if not MAIN_BRAIN_EVENTS_DB_READY or not isinstance(result, dict):
+        return
+    try:
+        if is_actionable(result.get("verdict")):
+            return                                       # READY/EARLY taken is captured via trade_closed
+        if (result.get("market_regime") or "").upper() == "CLOSED":
+            return
+        snap = _build_main_brain_event_snapshot(result, event_type="wait_hypothesis")
+        inst      = snap.get("instrument")
+        direction = snap.get("direction")
+        if not inst or direction not in ("Long", "Short"):
+            return
+        try:
+            if ACTIVE_TRADES_BY_INST.get(inst):          # don't shadow an open position
+                return
+        except Exception:
+            pass
+        hyp = _mb_hypothesis_from_result(result, snap)
+        if not hyp:
+            return
+        mode  = snap.get("mode") or TRADING_MODE
+        setup = snap.get("setup_type") or "?"
+        fp    = "%s|%s|%.2f" % (direction, setup, round(float(hyp["entry"]), 2))
+        if _mb_event_throttled(inst, "wait_hypothesis", fp, "pending", ttl_secs=900):
+            return
+        bucket = int(time.time() // 900)                 # one pending row per 15-min bucket
+        snap["idempotency_key"] = "wait|%s|%s|%s|%d" % (inst, mode, fp, bucket)
+        snap["event_type"]      = "wait_hypothesis"
+        snap["status"]          = "pending"
+        snap["hypothesis"]      = hyp
+        miss = snap.get("missing") or []
+        snap["rejection_reason"] = (str(miss[0]) if miss else (result.get("strict_reason") or None))
+        snap["event_ts"] = now_utc()
+        _record_main_brain_event(snap)
+    except Exception as exc:
+        try:
+            logger.debug("main brain snapshot capture skip: %s", exc)
+        except Exception:
+            pass
+
+
+def _mb_update_event(conn, ev_id, outcome, hypothesis=None):
+    """UPDATE one pending main_brain_events row to resolved (own table only). FAIL-OPEN."""
+    try:
+        hb = None
+        if hypothesis is not None:
+            try:
+                hb = psycopg2.extras.Json(_swing_json_safe(hypothesis))
+            except Exception:
+                hb = None
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE main_brain_events "
+                "   SET status='resolved', outcome=%s, resolved_at=%s, "
+                "       hypothesis=COALESCE(%s, hypothesis) "
+                " WHERE id=%s AND status='pending'",
+                (outcome, now_utc(), hb, ev_id))
+    except Exception as exc:
+        try:
+            logger.debug("main brain event update skip: %s", exc)
+        except Exception:
+            pass
+
+
+def _mb_resolve_pending_once():
+    """One pass: resolve PENDING WAIT hypotheses against the live per-instrument price
+    (CURRENT_PRICE_BY_TICKER). Checks the STOP side FIRST (conservative on a fast move),
+    then target; expires past each hypothesis' TTL; un-resolvable rows are expired so they
+    can't linger forever. DISPLAY-ONLY, FAIL-OPEN; SELECT/UPDATE on the OWN table only."""
+    if not MAIN_BRAIN_EVENTS_DB_READY:
+        return
+    conn = None
+    resolved_any = False
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT id, instrument, symbol_raw, direction, hypothesis, event_ts
+              FROM main_brain_events
+             WHERE status = 'pending' AND event_type = 'wait_hypothesis'
+             ORDER BY event_ts ASC
+             LIMIT 500
+        """)
+        rows = cur.fetchall() or []
+        now = now_utc()
+        for row in rows:
+            hyp = row.get("hypothesis") if isinstance(row.get("hypothesis"), dict) else {}
+            inst = row.get("instrument") or _instrument_from_text(row.get("symbol_raw"))
+            direction = row.get("direction") or hyp.get("direction")
+            entry  = _mb_coerce_float(hyp.get("entry"))
+            stop   = _mb_coerce_float(hyp.get("stop"))
+            target = _mb_coerce_float(hyp.get("target"))
+            ttl_min = hyp.get("ttl_min") or MB_HYP_TTL_MIN_SCALP
+            if not inst or direction not in ("Long", "Short") or None in (entry, stop, target):
+                _mb_update_event(conn, row["id"], "expired", hyp); resolved_any = True; continue
+            try:
+                age_min = (now - row["event_ts"]).total_seconds() / 60.0
+            except Exception:
+                age_min = None
+            px = CURRENT_PRICE_BY_TICKER.get(inst)
+            if px is not None:
+                fav = (px - entry) if direction == "Long" else (entry - px)
+                adv = (entry - px) if direction == "Long" else (px - entry)
+                hyp["max_favorable"] = round(max(_mb_coerce_float(hyp.get("max_favorable")) or 0.0, fav), 4)
+                hyp["max_adverse"]   = round(max(_mb_coerce_float(hyp.get("max_adverse")) or 0.0, adv), 4)
+                stop_hit   = (px <= stop)   if direction == "Long" else (px >= stop)
+                target_hit = (px >= target) if direction == "Long" else (px <= target)
+                if stop_hit:                                  # STOP first = conservative
+                    _mb_update_event(conn, row["id"], "would_have_failed", hyp); resolved_any = True; continue
+                if target_hit:
+                    _mb_update_event(conn, row["id"], "would_have_worked", hyp); resolved_any = True; continue
+            if age_min is not None and age_min >= float(ttl_min):
+                _mb_update_event(conn, row["id"], "expired", hyp); resolved_any = True; continue
+    except Exception as exc:
+        logger.debug("main brain pending resolve skip: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if resolved_any:
+        try:
+            _maybe_recompute_main_brain_review()
+        except Exception:
+            pass
+
+
+def _main_brain_resolver_loop():
+    """Background watcher that periodically resolves PENDING WAIT hypotheses. DISPLAY-ONLY
+    and FAIL-OPEN — it only ever reads live price + UPDATEs its own table."""
+    while True:
+        try:
+            _mb_resolve_pending_once()
+        except Exception as exc:
+            try:
+                logger.debug("main brain resolver loop skip: %s", exc)
+            except Exception:
+                pass
+        time.sleep(MB_RESOLVER_INTERVAL_SECS)
+
+
 # ── Manual Trade Manager (ADVISORY / DISPLAY-ONLY) ──────────────────────────────
 # The user enters a position they took MANUALLY in their own broker; the bot then
 # MONITORS it and returns management guidance (live P&L / R, distance to stop &
@@ -18708,6 +19559,7 @@ def manual_trade():
             # copilot log starts the moment the trade is logged (display-only).
             _update_manual_trade_timeline(trade, {})
         _persist_manual_trade(trade)
+        _emit_manual_entered_event(trade)              # Main Brain learning loop (display-only, fail-open)
         logger.info("Manual trade added (advisory-only): %s %s @ %.2f",
                     trade["symbol"], trade["direction"], trade["entry_price"])
         _added_row = compute_manual_trade_management(trade)
@@ -23450,6 +24302,19 @@ def dashboard():
   .mb-tl-list{list-style:none;margin:0;padding:0;max-height:220px;overflow-y:auto}
   .mb-tl-list li{font-size:12px;color:#d7d7e2;line-height:1.5;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04)}
   .mb-tl-t{display:inline-block;min-width:42px;color:#7fe9b0;font-weight:700;font-variant-numeric:tabular-nums}
+  .mb-review{background:var(--inset);border:1px solid var(--border);border-left:2px solid #38bdf8;border-radius:4px;padding:10px;margin-bottom:12px}
+  .mb-review-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#bae6fd;font-weight:700;margin-bottom:8px}
+  .mb-review-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:6px 10px;margin-bottom:8px}
+  .mb-rv-cell{display:flex;flex-direction:column}
+  .mb-rv-l{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--amber-dim);font-weight:700}
+  .mb-rv-v{font-size:12px;color:#e8e8f0;font-weight:600;font-variant-numeric:tabular-nums}
+  .mb-lessons li{font-size:12px;line-height:1.5;color:#d7d7e2;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+  .mb-lesson-dot{display:inline-block;min-width:14px;font-weight:700}
+  .mb-lesson-caution .mb-lesson-dot{color:#fca5a5}
+  .mb-lesson-support .mb-lesson-dot{color:#86efac}
+  .mb-lesson-info .mb-lesson-dot{color:#93c5fd}
+  .mb-review-note{font-size:11px;color:#8b8ba0;font-style:italic;margin-top:4px}
+  @media(max-width:720px){.mb-review-stats{grid-template-columns:1fr}}
   @media(max-width:720px){.mb-mt-grid{grid-template-columns:1fr 1fr}}
   .mb-think{display:inline-flex;gap:3px;align-items:center}
   .mb-think span{width:5px;height:5px;border-radius:50%;background:#cbb6ff;display:inline-block;animation:mbBlink 1.4s infinite both}
@@ -23861,6 +24726,12 @@ def dashboard():
     <div class="mb-tl" id="mb-tl" style="display:none">
       <div class="mb-tl-h">🕒 Trade timeline</div>
       <ul class="mb-tl-list" id="mb-tl-list"></ul>
+    </div>
+    <div class="mb-review" id="mb-review" style="display:none">
+      <div class="mb-review-h">🧠 Performance review &amp; lessons</div>
+      <div class="mb-review-stats" id="mb-review-stats"></div>
+      <ul class="mb-list mb-lessons" id="mb-lessons"></ul>
+      <div class="mb-review-note" id="mb-review-note"></div>
     </div>
     <div class="mb-feed-h">Live conversation</div>
     <div id="mb-feed" class="mb-feed"></div>
@@ -25864,6 +26735,64 @@ function renderMainBrain(d){
       });
     } else {
       tlWrap.style.display = 'none';
+    }
+  }
+  // Performance Review & deterministic lessons (display-only readout of resolved
+  // event history — never alters the gate / sizing / money path).
+  const pr = (mb && mb.performance_review) || null;
+  const lessons = (mb && mb.lessons) || [];
+  const rvWrap = document.getElementById('mb-review');
+  const rvStats = document.getElementById('mb-review-stats');
+  const rvList = document.getElementById('mb-lessons');
+  const rvNote = document.getElementById('mb-review-note');
+  if(rvWrap){
+    const hasReview = !!(pr && pr.ready && (pr.total_events || 0) > 0);
+    if(hasReview || lessons.length){
+      rvWrap.style.display = '';
+      if(rvStats){
+        while(rvStats.firstChild) rvStats.removeChild(rvStats.firstChild);
+        const mkStat = function(label, val){
+          const cell = document.createElement('div'); cell.className = 'mb-rv-cell';
+          const l = document.createElement('div'); l.className = 'mb-rv-l'; l.textContent = label;
+          const v = document.createElement('div'); v.className = 'mb-rv-v'; v.textContent = val;
+          cell.appendChild(l); cell.appendChild(v); return cell;
+        };
+        if(pr){
+          const wr = (pr.win_rate!=null) ? (pr.win_rate + '%') : '—';
+          rvStats.appendChild(mkStat('Win rate', wr + ' (' + (pr.wins||0) + 'W / ' + (pr.losses||0) + 'L)'));
+          rvStats.appendChild(mkStat('Avg R', (pr.avg_r!=null ? pr.avg_r : '—')));
+          rvStats.appendChild(mkStat('Events', (pr.total_events!=null ? pr.total_events : 0)));
+          const wa = pr.wait_accuracy;
+          if(wa && wa.n){
+            rvStats.appendChild(mkStat('WAIT calls', (wa.hit_rate!=null ? (wa.hit_rate + '%') : '—') + ' worked (' + wa.n + ')'));
+          }
+          const bs = pr.best_setup, ws2 = pr.worst_setup;
+          if(bs && bs.setup_type) rvStats.appendChild(mkStat('Best setup', bs.setup_type + (bs.win_rate!=null ? (' ' + bs.win_rate + '%') : '')));
+          if(ws2 && ws2.setup_type) rvStats.appendChild(mkStat('Worst setup', ws2.setup_type + (ws2.win_rate!=null ? (' ' + ws2.win_rate + '%') : '')));
+          const cr = pr.common_rejection, cl = pr.common_loss;
+          if(cr && cr.reason) rvStats.appendChild(mkStat('Top WAIT reason', cr.reason + ' (' + (cr.n||0) + ')'));
+          if(cl && cl.reason) rvStats.appendChild(mkStat('Top loss reason', cl.reason + ' (' + (cl.n||0) + ')'));
+          const bw = pr.best_window, ww = pr.worst_window;
+          if(bw && bw.label) rvStats.appendChild(mkStat('Best hour', bw.label + (bw.avg_r!=null ? (' ' + bw.avg_r + 'R') : '')));
+          if(ww && ww.label) rvStats.appendChild(mkStat('Worst hour', ww.label + (ww.avg_r!=null ? (' ' + ww.avg_r + 'R') : '')));
+        }
+      }
+      if(rvList){
+        while(rvList.firstChild) rvList.removeChild(rvList.firstChild);
+        lessons.forEach(function(ls){
+          const li = document.createElement('li');
+          li.className = 'mb-lesson mb-lesson-' + ((ls && ls.kind) || 'info');
+          const dot = document.createElement('span'); dot.className = 'mb-lesson-dot';
+          dot.textContent = (ls && ls.kind === 'caution') ? '⚠' : ((ls && ls.kind === 'support') ? '✓' : '•');
+          const tx = document.createElement('span'); tx.textContent = ' ' + ((ls && ls.text) || '');
+          li.appendChild(dot); li.appendChild(tx); rvList.appendChild(li);
+        });
+      }
+      if(rvNote){
+        rvNote.textContent = lessons.length ? '' : 'Collecting outcomes — lessons appear once enough similar setups resolve.';
+      }
+    } else {
+      rvWrap.style.display = 'none';
     }
   }
   const foot = document.getElementById('mb-foot');
@@ -30132,6 +31061,7 @@ if __name__ == "__main__":
             _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher
         _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
         _load_manual_trades_from_db()              # rehydrate open ADVISORY-ONLY manual positions (display monitor)
+        _check_main_brain_events_db_ready()        # probe main_brain_events (no DDL; created via DB tool/publish diff)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
@@ -30142,6 +31072,8 @@ if __name__ == "__main__":
     if LEARNING_DB_ENABLED:
         threading.Thread(target=_recompute_learning, daemon=True).start()  # warm the learning cache from Postgres at boot (display-only)
         threading.Thread(target=_load_last_report, daemon=True).start()    # warm the last performance report from Postgres at boot (display-only)
+        threading.Thread(target=_recompute_main_brain_review, daemon=True).start()  # warm the Main Brain review cache from Postgres at boot (display-only)
+        threading.Thread(target=_main_brain_resolver_loop, name="main-brain-resolver", daemon=True).start()  # resolve pending WAIT hypotheses (display-only)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
