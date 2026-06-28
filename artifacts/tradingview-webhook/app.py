@@ -26290,32 +26290,6 @@ def dashboard():
   <div id="ri-out" style="margin-top:10px"></div>
 </div>
 
-<!-- ════ Manual Trade Manager (ADVISORY / DISPLAY-ONLY; never places or closes a broker order) ════ -->
-<div class="mod" id="mod-manual">
-  <div class="mod-h">🧮 Manual Trade Manager <span style="font-size:10px;color:#6b7280;letter-spacing:1px">ADVISORY · NEVER PLACES ORDERS</span></div>
-  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Log a position you took yourself — or just watch: the bot's own auto-executed trades now appear here automatically (marked 🤖 BOT). Advisory only — it never sends or closes a broker order for you.</div>
-  <div class="fields">
-    <div class="field"><label>Symbol</label>
-      <select id="mt-symbol"><option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option></select></div>
-    <div class="field"><label>Direction</label>
-      <select id="mt-dir"><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></div>
-    <div class="field"><label>Mode</label>
-      <select id="mt-mode"><option>SCALP</option><option>SWING</option></select></div>
-    <div class="field"><label>Entry</label><input id="mt-entry" type="number" step="0.1"></div>
-    <div class="field"><label>Stop</label><input id="mt-stop" type="number" step="0.1"></div>
-    <div class="field"><label>Contracts</label><input id="mt-contracts" type="number" step="1" min="1" value="1"></div>
-    <div class="field"><label>Target 1</label><input id="mt-t1" type="number" step="0.1"></div>
-    <div class="field"><label>Target 2</label><input id="mt-t2" type="number" step="0.1"></div>
-    <div class="field"><label>Target 3 (opt)</label><input id="mt-t3" type="number" step="0.1"></div>
-    <div class="field"><label>Entry time (opt)</label><input id="mt-time" type="datetime-local"></div>
-  </div>
-  <div class="field" style="margin-top:6px"><label>Reason / thesis (opt)</label>
-    <input id="mt-reason" type="text" placeholder="why you took this trade"></div>
-  <button class="btn" id="mt-btn" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560;margin-top:8px;width:100%" onclick="addManualTrade()">➕ Monitor this trade</button>
-  <div id="mt-msg" style="font-size:11px;margin-top:6px"></div>
-  <div id="mt-list" style="margin-top:10px"></div>
-</div>
-
 </div><!-- /#view-live -->
 
 <!-- ════════════════ BACKTEST VIEW (read-only research; not wired to /status) ════════════════ -->
@@ -30550,7 +30524,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); refreshManual(); mbChatRender(); loadPropAccounts(); loadPropDecisions();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -30830,13 +30804,6 @@ async function aiSend(){
   }finally{ btn.disabled=false; btn.textContent=prev; aiRender(); }
 }
 
-// ── Manual Trade Manager (ADVISORY / DISPLAY-ONLY) ──────────────────────────────
-// Posts a manually-taken position to /manual-trade and polls it for live advisory
-// guidance. It NEVER sends or closes a broker order — "Stop monitoring" only drops
-// the row from this display.
-function mtNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
-function mtThesisColor(t){ return t==='VALID'?'#22c55e':(t==='WEAKENING'?'#f59e0b':(t==='INVALID'?'#ef4444':'#9aa')); }
-function mtRecColor(r){ return r==='HOLD'?'#22c55e':(r==='MOVE STOP'?'#3b82f6':(r==='REDUCE'?'#f59e0b':(r==='EXIT'?'#ef4444':'#9aa'))); }
 
 // ── Manual Trade Management Mode (inside Main Brain) ──────────────────────────
 // Advisory / display-only: posts to the SAME read-only /manual-trade endpoint, then
@@ -30878,7 +30845,6 @@ async function mbmtAdd(){
       var cc=document.getElementById('mbmt-contracts'); if(cc) cc.value='1';
       userPickedSetup=true;
       setSymbol(body.symbol);   // flip the active tab to the managed instrument
-      refreshManual();          // refresh the legacy monitor list too
     } else if(msg){
       msg.style.color='#ef4444'; msg.textContent=(r&&r.reason)?r.reason:'Could not add trade.';
     }
@@ -30886,111 +30852,7 @@ async function mbmtAdd(){
   finally{ if(btn){ btn.disabled=false; btn.textContent=prev; } }
 }
 
-async function addManualTrade(){
-  var btn=document.getElementById('mt-btn'); var msg=document.getElementById('mt-msg');
-  var body={
-    symbol: document.getElementById('mt-symbol').value,
-    direction: document.getElementById('mt-dir').value,
-    mode: document.getElementById('mt-mode').value,
-    entry: mtNum('mt-entry'), stop: mtNum('mt-stop'),
-    contracts: mtNum('mt-contracts'),
-    target1: mtNum('mt-t1'), target2: mtNum('mt-t2'), target3: mtNum('mt-t3'),
-    entry_time: document.getElementById('mt-time').value,
-    reason: document.getElementById('mt-reason').value
-  };
-  if(body.entry==null||body.stop==null||body.target1==null||body.target2==null){
-    msg.style.color='#f59e0b'; msg.textContent='Enter Entry, Stop, Target 1 and Target 2 (Symbol & Direction are picked above).'; return;
-  }
-  var prev=btn.textContent; btn.disabled=true; btn.textContent='⏳ Adding…';
-  try{
-    var r=await api('/manual-trade', body);
-    if(r && r.status==='added'){
-      msg.style.color='#22c55e'; msg.textContent='Added to monitor — advisory only, no order sent.';
-      ['mt-entry','mt-stop','mt-t1','mt-t2','mt-t3','mt-reason','mt-time'].forEach(function(id){document.getElementById(id).value='';});
-      document.getElementById('mt-contracts').value='1';
-      refreshManual();
-    } else {
-      msg.style.color='#ef4444'; msg.textContent=(r&&r.reason)?r.reason:'Could not add trade.';
-    }
-  } catch(e){ msg.style.color='#ef4444'; msg.textContent='Add failed — try again.'; }
-  finally{ btn.disabled=false; btn.textContent=prev; }
-}
-
-async function closeManualTrade(id){
-  try{ await api('/manual-trade/close', {id:id}); refreshManual(); } catch(e){}
-}
-
-async function refreshManual(){
-  try{ var d=await api('/manual-trade'); renderManual(d); } catch(e){}
-}
-
-function mtList(arr){
-  if(!arr||!arr.length) return '';
-  return '<ul style="margin:4px 0;padding-left:16px">'+arr.map(function(x){return '<li>'+_modEsc(x)+'</li>';}).join('')+'</ul>';
-}
-
-function mtCard(t){
-  var dirC = t.direction==='Long'?'#22c55e':'#ef4444';
-  var thC = mtThesisColor(t.thesis_status);
-  var recC = mtRecColor(t.recommendation);
-  var isBot = (t.origin==='bot');
-  var botBadge = isBot ? `<span style="font-size:9px;font-weight:800;letter-spacing:1px;color:#06121a;background:#7fe9f5;border-radius:10px;padding:1px 7px">🤖 BOT</span>` : '';
-  var rightTag = isBot ? 'AUTO-MANAGED · ADVISORY' : 'ADVISORY ONLY';
-  var head = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-    <b style="color:${dirC};font-size:14px">${_modEsc(t.symbol)} ${t.direction==='Long'?'LONG':'SHORT'}</b>
-    ${botBadge}
-    <span style="font-size:10px;color:#9aa;border:1px solid var(--border);border-radius:10px;padding:1px 7px">${_modEsc(t.mode)}</span>
-    <span style="font-size:10px;color:#9aa">${_modEsc(t.contracts)} ct</span>
-    <span style="margin-left:auto;font-size:10px;color:#6b7280">${rightTag}</span>
-  </div>`;
-  if(t.status!=='ok'){
-    var uAction = isBot
-      ? `<div style="margin-top:8px;font-size:10px;color:#6b7280">Managed by the bot — advisory monitor only.</div>`
-      : `<button class="btn btn-eod" style="margin-top:8px;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button>`;
-    return `<div class="mt-card" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">${head}
-      <div style="color:#f59e0b;font-size:12px">${_modEsc(t.recommendation_reason||'Monitor unavailable.')}</div>
-      ${uAction}</div>`;
-  }
-  var pnl = (t.unrealized_pnl!=null)?('$'+Number(t.unrealized_pnl).toFixed(2)):'—';
-  var pnlC = (t.unrealized_pnl!=null && t.unrealized_pnl<0)?'#ef4444':'#22c55e';
-  var rtxt = (t.current_r!=null)?(Number(t.current_r).toFixed(2)+'R'):'—';
-  var px = (t.current_price!=null)?Number(t.current_price).toFixed(2):'—';
-  var stats = `<div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">
-    <div class="gstat"><div class="l">Price</div><div class="v">${px}</div></div>
-    <div class="gstat"><div class="l">Unreal. P&amp;L</div><div class="v" style="color:${pnlC}">${pnl}</div></div>
-    <div class="gstat"><div class="l">Current R</div><div class="v">${rtxt}</div></div>
-    <div class="gstat"><div class="l">To Stop</div><div class="v">${t.dist_to_stop!=null?Number(t.dist_to_stop).toFixed(2):'—'}</div></div>
-    <div class="gstat"><div class="l">To T1</div><div class="v">${t.dist_to_target1!=null?Number(t.dist_to_target1).toFixed(2):'—'}</div></div>
-    <div class="gstat"><div class="l">To T2</div><div class="v">${t.dist_to_target2!=null?Number(t.dist_to_target2).toFixed(2):'—'}</div></div>
-  </div>`;
-  var status = `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0">
-    <span style="font-size:12px;font-weight:800;color:${thC}">Thesis: ${_modEsc(t.thesis_status)}</span>
-    <span style="font-size:12px;font-weight:800;color:${recC};margin-left:auto">▶ ${_modEsc(t.recommendation)}</span>
-  </div>
-  <div class="se-reason" style="font-size:12px">${_modEsc(t.recommendation_reason||'')}</div>`;
-  var assess = t.entry_assessment ? `<div class="se-reason" style="font-size:11px;color:#9aa;margin-top:6px">${_modEsc(t.entry_assessment)}</div>` : '';
-  var warns = (t.warnings&&t.warnings.length) ? `<div class="se-bias-h" style="color:#f59e0b;margin-top:8px">⚠ Early-Exit Warnings</div>${mtList(t.warnings)}` : '';
-  var improve = (t.what_improves&&t.what_improves.length) ? `<div class="se-bias-h" style="color:#22c55e;margin-top:6px">What Would Improve</div>${mtList(t.what_improves)}` : '';
-  var inval = (t.what_invalidates&&t.what_invalidates.length) ? `<div class="se-bias-h" style="color:#ef4444;margin-top:6px">What Would Invalidate</div>${mtList(t.what_invalidates)}` : '';
-  var reason = t.reason ? `<div style="font-size:11px;color:#9aa;margin-top:6px">Your thesis: ${_modEsc(t.reason)}</div>` : '';
-  var footAction = isBot
-    ? `<span style="margin:0 0 0 auto;font-size:10px;color:#6b7280">Managed by the bot</span>`
-    : `<button class="btn btn-eod" style="margin:0 0 0 auto;width:auto;padding:6px 10px" onclick="closeManualTrade('${_modEsc(t.id)}')">Stop monitoring</button>`;
-  var foot = `<div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:10px;color:#6b7280">
-    <span>Entry ${_modEsc(t.entry_price)} · Stop ${_modEsc(t.stop_loss)} · Next review ${_modEsc(t.next_review_et||'—')}</span>
-    ${footAction}
-  </div>`;
-  return `<div class="mt-card" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">${head}${stats}${status}${assess}${warns}${improve}${inval}${reason}${foot}</div>`;
-}
-
-function renderManual(d){
-  var box=document.getElementById('mt-list'); if(!box) return;
-  var trades=(d&&d.trades)?d.trades:[];
-  if(!trades.length){ box.innerHTML='<div style="color:#6b7280;font-size:12px;padding:6px 0">No monitored positions yet. Add one above to get live advisory guidance.</div>'; return; }
-  box.innerHTML = trades.map(function(t){ return mtCard(t); }).join('');
-}
-
-setInterval(() => { refresh(); refreshRec(); refreshManual(); loadPropDecisions(); }, 3000);
+setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
 </body>
