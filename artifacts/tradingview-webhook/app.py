@@ -13136,6 +13136,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "management_read":   None,
         "performance_review": _main_brain_review_snapshot(),
         "lessons":           [],
+        "prop_rule":         _prop_main_brain_line(),
         "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
         "reason":            reason,
     }
@@ -13470,6 +13471,7 @@ def compute_main_brain(result):
             "management_read":   management_read,
             "performance_review": performance_review,
             "lessons":           lessons,
+            "prop_rule":         _prop_main_brain_line(),
             "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
             "reason":            None,
         }
@@ -23038,6 +23040,7 @@ def status():
         "execution_enabled":        execution_configured(),
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
         "execution_rejections":     _recent_exec_rejections(),
+        "prop_firm":                prop_firm_status_view(),
         # ── Dual-timeframe (1m bias + 5s execution) engine — DISPLAY-ONLY ──
         "dualTfEngineEnabled": _dtf["dualTfEngineEnabled"],
         "biasDirection":       _dtf["biasDirection"],
@@ -23236,6 +23239,703 @@ def traderspost_order():
 
     result, code = execute_trade_gateway(instrument, contracts, source="manual")
     return jsonify(result), code
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Prop Firm Protection (Task #15) — OPTIONAL, NON-DESTRUCTIVE money-path guard
+# ════════════════════════════════════════════════════════════════════════════
+# When PROP_PROTECTION_ENABLED is ON, every order is validated against the ACTIVE
+# prop account's rules as the FINAL fail-CLOSED layer inside the single execution
+# gateway. Enforcement (a hard 409 block) applies ONLY to LIVE broker modes; the
+# manual_only / paper modes still receive their plan but carry a display-only
+# "would-block" preview. When OFF the guard is a COMPLETE no-op — it returns before
+# ANY DB / journal / news / active-trade read — so the gate, scoring, goldens and
+# the gateway stay byte-identical to today.
+#
+# Accounts are entered MANUALLY (no prop firm exposes a live rules/balance API) and
+# PERSISTED in Postgres (prop_accounts; INSERT / SELECT / UPDATE / DELETE only — the
+# table is created out-of-band via the database tool in dev + the Publish schema-diff
+# in prod, matching the learning-engine no-in-app-DDL convention). The ON/OFF toggle
+# is in-memory and resets OFF on every restart (fail-safe toward NOT enforcing).
+#
+# Phase 1 (this change) enforces the rules reliably computable from existing data:
+# allowed instruments, max contracts (per-order + aggregate open), the daily-loss
+# buffer (today's realized journal P&L + this order's worst-case stop), a CONSERVATIVE
+# STATIC drawdown floor, the trading-hours window, news proximity (warn/block) and
+# overnight / flatten-before-close. Default-BLOCK whenever a configured rule is
+# missing the data needed to verify it. True TRAILING drawdown / high-water-mark
+# tracking is Phase 2 (labelled "not armed until Phase 2" — never faked).
+
+PROP_PROTECTION_ENABLED = False              # in-memory ON/OFF; resets OFF on restart (fail-safe)
+PROP_LOCK               = threading.Lock()   # guards ONLY the in-memory state below.
+#   NEVER nest PROP_LOCK under AUTO_TRADE_LOCK / SAFETY_LOCK / _TRADERSPOST_LOCK /
+#   ACTIVE_TRADES_LOCK. Callers SNAPSHOT under PROP_LOCK, release, then read DB /
+#   journal / news / active-trades OUTSIDE the lock.
+PROP_ACCOUNTS_CACHE     = []                 # list[account dict] mirror of prop_accounts rows
+PROP_ACTIVE_ID          = None               # id of the active account (mirror of is_active row)
+PROP_ACCOUNTS_DB_READY  = False
+PROP_DECISIONS_MAX      = 50
+PROP_DECISIONS          = deque(maxlen=PROP_DECISIONS_MAX)   # display-only ring of guard decisions
+
+# Apex Trader Funding presets by account size. Contract limits are expressed in
+# MICRO contracts (1 full = 10 micros; this bot trades micros). EDITABLE by the user
+# after they pick a preset — sensible defaults, not the contract. Apex has NO daily-
+# loss limit and a TRAILING drawdown (Phase 2); Phase 1 enforces the contract /
+# instrument / time rules and shows the trailing drawdown as "not armed until Phase 2".
+PROP_APEX_PRESETS = {
+    25000:  {"max_contracts_full": 4,  "max_drawdown": 1500,  "profit_target": 1500},
+    50000:  {"max_contracts_full": 10, "max_drawdown": 2500,  "profit_target": 3000},
+    75000:  {"max_contracts_full": 12, "max_drawdown": 2750,  "profit_target": 4250},
+    100000: {"max_contracts_full": 14, "max_drawdown": 3000,  "profit_target": 6000},
+    150000: {"max_contracts_full": 17, "max_drawdown": 5000,  "profit_target": 9000},
+    250000: {"max_contracts_full": 27, "max_drawdown": 6500,  "profit_target": 15000},
+    300000: {"max_contracts_full": 35, "max_drawdown": 7500,  "profit_target": 20000},
+}
+PROP_FIRMS = ("Apex",)   # presets currently supplied for Apex; other firms entered manually
+
+
+def _prop_default_account(firm="Apex", account_size=50000, name=None):
+    """Build a fully-populated account dict from a preset (currently Apex). Every
+    field is EDITABLE afterwards. Unknown sizes fall back to the nearest defined
+    preset so the account is never half-formed. Never raises."""
+    try:
+        size = int(float(account_size))
+    except Exception:
+        size = 50000
+    preset = PROP_APEX_PRESETS.get(size)
+    if preset is None:
+        nearest = min(PROP_APEX_PRESETS, key=lambda s: abs(s - size))
+        preset  = PROP_APEX_PRESETS[nearest]
+    return {
+        "id":                       uuid.uuid4().hex,
+        "name":                     (name or ("%s %dK" % (firm or "Apex", int(round(size / 1000))))),
+        "firm":                     firm or "Apex",
+        "account_size":             size,
+        "current_balance":          None,   # MANUAL: user syncs for STATIC-drawdown enforcement
+        "max_contracts":            int(preset["max_contracts_full"]) * 10,   # micros
+        "daily_loss_limit":         None,    # Apex: none. Other firms: positive USD magnitude
+        "daily_loss_buffer":        0,
+        "max_drawdown":             int(preset["max_drawdown"]),
+        "drawdown_type":            "trailing",   # trailing|static|eod (trailing/eod = Phase 2 display-only)
+        "drawdown_buffer":          100,
+        "allowed_instruments":      [],      # [] => all enabled instruments allowed
+        "trading_start_et":         "",      # "HH:MM" ET; "" => no restriction
+        "trading_end_et":           "",
+        "news_block_minutes":       0,       # 0 => off
+        "news_action":              "warn",  # warn|block
+        "flatten_before_close_min": 0,       # 0 => off
+        "allow_overnight":          True,
+        "allow_weekend":            True,
+        "profit_target":            int(preset["profit_target"]),
+        "min_trading_days":         0,
+        "consistency_pct":          0,
+    }
+
+
+def _prop_normalize_account(raw, base=None):
+    """Coerce a user-submitted account dict into the canonical schema. Unknown / blank
+    fields fall back to `base` (for edits) or sane defaults. Never raises."""
+    r = raw or {}
+    if base is None:
+        base = _prop_default_account(firm=str(r.get("firm") or "Apex"),
+                                     account_size=r.get("account_size") or 50000,
+                                     name=r.get("name"))
+    out = dict(base)
+
+    def _s(key):
+        if key in r and r[key] is not None:
+            out[key] = str(r[key]).strip()
+
+    def _i(key):
+        if key in r and r[key] not in (None, ""):
+            try: out[key] = int(float(r[key]))
+            except Exception: pass
+
+    def _b(key):
+        if key in r and r[key] is not None:
+            v = r[key]
+            out[key] = (v.strip().lower() in ("1", "true", "yes", "on")) if isinstance(v, str) else bool(v)
+
+    _s("name"); _s("firm"); _s("trading_start_et"); _s("trading_end_et")
+    for k in ("account_size", "max_contracts", "max_drawdown", "drawdown_buffer",
+              "daily_loss_buffer", "news_block_minutes", "flatten_before_close_min",
+              "profit_target", "min_trading_days", "consistency_pct"):
+        _i(k)
+    for k in ("daily_loss_limit", "current_balance"):     # nullable: blank clears the rule
+        if k in r:
+            if r[k] in (None, ""):
+                out[k] = None
+            else:
+                try: out[k] = float(r[k])
+                except Exception: pass
+    if "drawdown_type" in r:
+        dt = str(r["drawdown_type"]).strip().lower()
+        out["drawdown_type"] = dt if dt in ("trailing", "static", "eod") else "trailing"
+    if "news_action" in r:
+        na = str(r["news_action"]).strip().lower()
+        out["news_action"] = na if na in ("warn", "block") else "warn"
+    _b("allow_overnight"); _b("allow_weekend")
+    if "allowed_instruments" in r:
+        ai = r["allowed_instruments"]
+        if isinstance(ai, str):
+            ai = [x for x in re.split(r"[,\s]+", ai) if x]
+        if isinstance(ai, list):
+            valid = set(enabled_instruments())
+            out["allowed_instruments"] = sorted({instrument_of(x) for x in ai
+                                                 if instrument_of(x) in valid})
+        else:
+            out["allowed_instruments"] = []
+    if r.get("id"):
+        out["id"] = str(r["id"])
+    return out
+
+
+# ── In-memory state access (snapshot-under-lock; read DB/journal OUTSIDE the lock) ──
+def _prop_state_snapshot():
+    """Copy the in-memory prop state under PROP_LOCK, then release. Callers read DB /
+    journal / news / active-trades OUTSIDE the lock using this snapshot."""
+    with PROP_LOCK:
+        return {
+            "enabled":   PROP_PROTECTION_ENABLED,
+            "active_id": PROP_ACTIVE_ID,
+            "accounts":  [dict(a) for a in PROP_ACCOUNTS_CACHE],
+        }
+
+
+def _prop_active_account(snapshot=None):
+    snap = snapshot or _prop_state_snapshot()
+    aid  = snap.get("active_id")
+    if not aid:
+        return None
+    for a in (snap.get("accounts") or []):
+        if a.get("id") == aid:
+            return a
+    return None
+
+
+def _record_prop_decision(entry):
+    """Append one guard decision to the display-only ring. Best-effort; never raises."""
+    try:
+        with PROP_LOCK:
+            PROP_DECISIONS.append(entry)
+    except Exception:
+        pass
+
+
+def _recent_prop_decisions(limit=20):
+    with PROP_LOCK:
+        items = list(PROP_DECISIONS)[-limit:]
+    items.reverse()
+    return items
+
+
+# ── Postgres persistence (INSERT/SELECT/UPDATE/DELETE only; table created out-of-band) ──
+def _check_prop_accounts_db_ready():
+    """Probe prop_accounts (SELECT 1; NO DDL). Sets PROP_ACCOUNTS_DB_READY. Mirrors the
+    journal / learning readiness probes. Never raises."""
+    global PROP_ACCOUNTS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        PROP_ACCOUNTS_DB_READY = False
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        PROP_ACCOUNTS_DB_READY = False
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM prop_accounts LIMIT 1")
+            cur.fetchone()
+        PROP_ACCOUNTS_DB_READY = True
+    except Exception as exc:
+        logger.warning("prop_accounts not ready (no account persistence): %s", exc)
+        PROP_ACCOUNTS_DB_READY = False
+    finally:
+        try: conn.close()
+        except Exception: pass
+    return PROP_ACCOUNTS_DB_READY
+
+
+def _load_prop_accounts_from_db():
+    """Refresh the in-memory cache from Postgres. Best-effort; on any error the cache
+    is left UNCHANGED (so a transient DB hiccup never silently empties the guard)."""
+    global PROP_ACCOUNTS_CACHE, PROP_ACTIVE_ID
+    if not PROP_ACCOUNTS_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, account, is_active FROM prop_accounts ORDER BY created_at ASC")
+            for _id, acct, is_active in cur.fetchall():
+                a = dict(acct or {})
+                a["id"] = _id
+                rows.append((a, bool(is_active)))
+    except Exception as exc:
+        logger.warning("prop_accounts load failed: %s", exc)
+        return
+    finally:
+        try: conn.close()
+        except Exception: pass
+    active_id, accts = None, []
+    for a, act in rows:
+        if act:
+            active_id = a["id"]
+        accts.append(a)
+    with PROP_LOCK:
+        PROP_ACCOUNTS_CACHE = accts
+        PROP_ACTIVE_ID = active_id
+
+
+def _prop_upsert_account(account):
+    """INSERT or UPDATE one account (by id), preserving its is_active flag, then
+    refresh the cache. Returns (ok, error)."""
+    if not PROP_ACCOUNTS_DB_READY:
+        return False, "accounts database unavailable"
+    conn = _learning_conn()
+    if conn is None:
+        return False, "accounts database unavailable"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO prop_accounts (id, account, is_active, updated_at) "
+                "VALUES (%s, %s, COALESCE((SELECT is_active FROM prop_accounts WHERE id=%s), FALSE), now()) "
+                "ON CONFLICT (id) DO UPDATE SET account = EXCLUDED.account, updated_at = now()",
+                (account["id"], psycopg2.extras.Json(account), account["id"]))
+    except Exception as exc:
+        logger.warning("prop_accounts upsert failed: %s", exc)
+        try: conn.close()
+        except Exception: pass
+        return False, "save failed"
+    try: conn.close()
+    except Exception: pass
+    _load_prop_accounts_from_db()
+    return True, None
+
+
+def _prop_delete_account(account_id):
+    if not PROP_ACCOUNTS_DB_READY:
+        return False, "accounts database unavailable"
+    conn = _learning_conn()
+    if conn is None:
+        return False, "accounts database unavailable"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM prop_accounts WHERE id=%s", (account_id,))
+    except Exception as exc:
+        logger.warning("prop_accounts delete failed: %s", exc)
+        try: conn.close()
+        except Exception: pass
+        return False, "delete failed"
+    try: conn.close()
+    except Exception: pass
+    _load_prop_accounts_from_db()
+    return True, None
+
+
+def _prop_set_active(account_id):
+    """Mark exactly one account active (or clear all when account_id is None)."""
+    if not PROP_ACCOUNTS_DB_READY:
+        return False, "accounts database unavailable"
+    conn = _learning_conn()
+    if conn is None:
+        return False, "accounts database unavailable"
+    try:
+        with conn.cursor() as cur:
+            if account_id is None:
+                cur.execute("UPDATE prop_accounts SET is_active = FALSE, updated_at = now()")
+            else:
+                cur.execute("UPDATE prop_accounts SET is_active = (id = %s), updated_at = now()",
+                            (account_id,))
+    except Exception as exc:
+        logger.warning("prop_accounts set-active failed: %s", exc)
+        try: conn.close()
+        except Exception: pass
+        return False, "update failed"
+    try: conn.close()
+    except Exception: pass
+    _load_prop_accounts_from_db()
+    return True, None
+
+
+# ── Per-order guard (the money-path decision) ─────────────────────────────────
+def _prop_parse_hhmm(s):
+    try:
+        h, m = str(s).strip().split(":")
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except Exception:
+        pass
+    return None
+
+
+def _prop_minutes_to_daily_close_et(now=None):
+    """Minutes until the next daily futures maintenance close (17:00 ET). Returns None
+    when market-hours are disabled (cannot reason about the close) or once past today's
+    close. Coarse Phase-1 helper for flatten-before-close / overnight checks only."""
+    if not MARKET_HOURS_ENABLED:
+        return None
+    try:
+        et    = (now or now_utc()).astimezone(ET_TZ)
+        close = et.replace(hour=MARKET_CLOSE_HOUR_ET, minute=0, second=0, microsecond=0)
+        if et >= close:
+            return None
+        return int((close - et).total_seconds() // 60)
+    except Exception:
+        return None
+
+
+def _prop_account_summary(acct):
+    """Compact, display-safe view of an account for status / log / panel."""
+    if not isinstance(acct, dict):
+        return None
+    return {
+        "id":               acct.get("id"),
+        "name":             acct.get("name"),
+        "firm":             acct.get("firm"),
+        "account_size":     acct.get("account_size"),
+        "max_contracts":    acct.get("max_contracts"),
+        "daily_loss_limit": acct.get("daily_loss_limit"),
+        "max_drawdown":     acct.get("max_drawdown"),
+        "drawdown_type":    acct.get("drawdown_type"),
+        "current_balance":  acct.get("current_balance"),
+    }
+
+
+def _prop_block_result(live, reasons, warnings=None, account=None, checks=None, phase2=None):
+    return {
+        "enabled": True, "evaluated": True, "decision": "block", "blocked": True,
+        "enforced": bool(live), "reasons": list(reasons or []),
+        "warnings": list(warnings or []), "checks": list(checks or []),
+        "account": account, "phase2": list(phase2 or []),
+    }
+
+
+def _prop_eval_rules(acct, instrument, direction, contracts, entry, stop, live, now=None):
+    """Evaluate every configured Phase-1 rule for ONE order. Returns the structured
+    guard dict (allow / warn / block). Default-BLOCK when a configured rule is missing
+    the data it needs to be verified."""
+    now      = now or now_utc()
+    checks, reasons, warnings, phase2 = [], [], [], []
+    inst = instrument_of(instrument) if instrument else None
+
+    def add(name, status, detail):
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    # 1. Allowed instruments
+    allowed = acct.get("allowed_instruments") or []
+    if allowed:
+        if inst is None:
+            reasons.append("Cannot determine the instrument (allowed-list configured).")
+            add("Allowed instruments", "block", "instrument unknown")
+        elif inst not in allowed:
+            reasons.append("%s is not in this account's allowed instruments (%s)."
+                           % (inst, ", ".join(allowed)))
+            add("Allowed instruments", "block", "%s not allowed" % inst)
+        else:
+            add("Allowed instruments", "pass", "%s allowed" % inst)
+    else:
+        add("Allowed instruments", "skip", "all instruments allowed")
+
+    # 2. Max contracts (per-order + aggregate open)
+    maxc = acct.get("max_contracts")
+    try:
+        order_c = int(contracts) if contracts is not None else None
+    except Exception:
+        order_c = None
+    if isinstance(maxc, (int, float)) and maxc > 0:
+        if order_c is None:
+            reasons.append("Order size is unknown (a contract limit is set).")
+            add("Max contracts", "block", "order size unknown")
+        else:
+            open_c = 0
+            for t in active_trade_snapshot().values():
+                try: open_c += int(t.get("contracts") or 0)
+                except Exception: pass
+            if order_c > maxc:
+                reasons.append("Order is %d contracts; account max is %d." % (order_c, int(maxc)))
+                add("Max contracts", "block", "%d > %d per order" % (order_c, int(maxc)))
+            elif (open_c + order_c) > maxc:
+                reasons.append("%d open + %d new exceeds the %d-contract account max."
+                               % (open_c, order_c, int(maxc)))
+                add("Max contracts", "block", "%d+%d > %d aggregate" % (open_c, order_c, int(maxc)))
+            else:
+                add("Max contracts", "pass", "%d (+%d open) <= %d" % (order_c, open_c, int(maxc)))
+    else:
+        add("Max contracts", "skip", "no contract limit set")
+
+    # worst-case loss (USD) for THIS order
+    worst = None
+    if inst is not None and entry is not None and stop is not None and order_c:
+        try:
+            worst = abs(float(entry) - float(stop)) * float(point_value_for(inst)) * float(order_c)
+        except Exception:
+            worst = None
+
+    # 3. Daily-loss limit (today's realized + this order's worst case)
+    dll = acct.get("daily_loss_limit")
+    if isinstance(dll, (int, float)) and dll > 0:
+        buf = acct.get("daily_loss_buffer") or 0
+        try:
+            realized = 0.0
+            for ei in enabled_instruments():
+                realized += _realized_pnl_today(ei)
+        except Exception:
+            realized = None
+        if realized is None or worst is None:
+            reasons.append("Cannot verify the daily-loss limit (missing today's P&L or order risk).")
+            add("Daily loss limit", "block", "data unavailable")
+        else:
+            used      = max(0.0, -realized)
+            remaining = float(dll) - float(buf) - used
+            if worst > remaining:
+                reasons.append("This order risks $%.0f but only $%.0f of the $%.0f daily-loss buffer remains."
+                               % (worst, max(0.0, remaining), float(dll)))
+                add("Daily loss limit", "block",
+                    "risk $%.0f > $%.0f left" % (worst, max(0.0, remaining)))
+            else:
+                add("Daily loss limit", "pass", "$%.0f risk <= $%.0f left" % (worst, remaining))
+    else:
+        add("Daily loss limit", "skip", "no daily-loss limit set")
+
+    # 4. Drawdown (static enforced; trailing/eod = Phase 2 display-only)
+    mdd   = acct.get("max_drawdown")
+    dtype = (acct.get("drawdown_type") or "trailing").lower()
+    if isinstance(mdd, (int, float)) and mdd > 0:
+        if dtype == "static":
+            cur_bal = acct.get("current_balance")
+            size    = acct.get("account_size")
+            ddbuf   = acct.get("drawdown_buffer") or 0
+            if not isinstance(cur_bal, (int, float)) or not isinstance(size, (int, float)):
+                reasons.append("Static drawdown is configured but the current balance is not set "
+                               "(enter it to arm this rule).")
+                add("Static drawdown", "block", "current balance missing")
+            elif worst is None:
+                reasons.append("Cannot verify the drawdown floor (order risk unknown).")
+                add("Static drawdown", "block", "order risk unknown")
+            else:
+                floor     = float(size) - float(mdd) + float(ddbuf)
+                projected = float(cur_bal) - float(worst)
+                if projected < floor:
+                    reasons.append("Worst-case balance $%.0f would breach the drawdown floor $%.0f."
+                                   % (projected, floor))
+                    add("Static drawdown", "block", "$%.0f < $%.0f" % (projected, floor))
+                else:
+                    add("Static drawdown", "pass", "$%.0f >= $%.0f" % (projected, floor))
+        else:
+            phase2.append("%s drawdown ($%d) — not armed until Phase 2 (needs live equity / "
+                          "high-water-mark tracking)." % (dtype.title(), int(mdd)))
+            add("Trailing drawdown", "skip", "Phase 2 — not enforced yet")
+    else:
+        add("Drawdown", "skip", "no drawdown set")
+
+    # 5. Trading-hours window (ET)
+    tstart = (acct.get("trading_start_et") or "").strip()
+    tend   = (acct.get("trading_end_et") or "").strip()
+    if tstart or tend:
+        cur_min = _prop_parse_hhmm(fmt_et(now, "%H:%M"))
+        smin    = _prop_parse_hhmm(tstart) if tstart else None
+        emin    = _prop_parse_hhmm(tend) if tend else None
+        if cur_min is None or (tstart and smin is None) or (tend and emin is None):
+            reasons.append("The trading-hours window is configured but unreadable.")
+            add("Trading hours", "block", "window unreadable")
+        else:
+            within = True
+            if smin is not None and cur_min < smin: within = False
+            if emin is not None and cur_min > emin: within = False
+            cur_lbl = fmt_et(now, "%H:%M")
+            if within:
+                add("Trading hours", "pass",
+                    "%s ET within %s-%s" % (cur_lbl, tstart or "—", tend or "—"))
+            else:
+                reasons.append("Now %s ET is outside the allowed window %s-%s ET."
+                               % (cur_lbl, tstart or "—", tend or "—"))
+                add("Trading hours", "block", "outside window")
+    else:
+        add("Trading hours", "skip", "no hours window set")
+
+    # 6. News proximity
+    nbm = acct.get("news_block_minutes")
+    if isinstance(nbm, (int, float)) and nbm > 0:
+        action = (acct.get("news_action") or "warn").lower()
+        try: nf = get_news_filter()
+        except Exception: nf = None
+        if not nf or not nf.get("available"):
+            if action == "block":
+                reasons.append("High-impact news status is unavailable (news rule set to block).")
+                add("News proximity", "block", "feed unavailable")
+            else:
+                warnings.append("High-impact news status is unavailable — proceed with caution.")
+                add("News proximity", "warn", "feed unavailable")
+        else:
+            nxt  = nf.get("next_event")
+            mins = abs(nxt.get("minutes_until")) if (nxt and nxt.get("minutes_until") is not None) else None
+            if mins is not None and mins <= nbm:
+                msg = "High-impact news (%s) within %d min." % (nxt.get("title", "event"), int(mins))
+                if action == "block":
+                    reasons.append(msg + " Blocked.")
+                    add("News proximity", "block", msg)
+                else:
+                    warnings.append(msg)
+                    add("News proximity", "warn", msg)
+            else:
+                add("News proximity", "pass", "no high-impact news in window")
+    else:
+        add("News proximity", "skip", "no news rule set")
+
+    # 7. Overnight / flatten-before-close
+    allow_on = acct.get("allow_overnight", True)
+    allow_we = acct.get("allow_weekend", True)
+    fbc      = acct.get("flatten_before_close_min")
+    if (not allow_on) or (not allow_we) or (isinstance(fbc, (int, float)) and fbc > 0):
+        mtc = _prop_minutes_to_daily_close_et(now)
+        win = int(fbc) if isinstance(fbc, (int, float)) and fbc > 0 else 0
+        et  = now.astimezone(ET_TZ)
+        triggered, why = False, ""
+        if mtc is not None and win > 0 and 0 <= mtc <= win:
+            triggered = True
+            why = "%d min to the %d:00 ET close (flatten window %d min)" % (mtc, MARKET_CLOSE_HOUR_ET, win)
+        if (not allow_we) and et.weekday() == 4 and mtc is not None and win > 0 and 0 <= mtc <= win:
+            triggered = True
+            why = "would hold over the weekend (no weekend holds allowed)"
+        if triggered:
+            if (not allow_on) or (not allow_we):
+                reasons.append("Overnight/weekend hold not allowed — %s." % why)
+                add("Overnight / flatten", "block", why)
+            else:
+                warnings.append("Close approaching — %s." % why)
+                add("Overnight / flatten", "warn", why)
+        else:
+            add("Overnight / flatten", "pass", "not near the close")
+    else:
+        add("Overnight / flatten", "skip", "no overnight/flatten rule set")
+
+    decision = "block" if reasons else ("warn" if warnings else "allow")
+    return {
+        "enabled": True, "evaluated": True, "decision": decision,
+        "blocked": (decision == "block"),
+        "enforced": bool(live and decision == "block"),
+        "reasons": reasons, "warnings": warnings, "checks": checks,
+        "account": _prop_account_summary(acct), "phase2": phase2,
+    }
+
+
+def evaluate_prop_guard(instrument, direction, contracts, entry, stop, mode, source="manual", now=None):
+    """FINAL fail-CLOSED prop-firm rule check for ONE order (the money-path decision).
+
+    Returns a STABLE dict (keys: enabled, evaluated, decision[off|allow|warn|block],
+    blocked, enforced, reasons, warnings, checks, account, phase2). When Protection is
+    OFF it returns IMMEDIATELY with decision "off" and does NO DB / journal / news /
+    active-trade read (so the gateway + goldens stay byte-identical). When ON it
+    snapshots the in-memory state under PROP_LOCK, releases, then reads everything
+    else OUTSIDE the lock. `enforced` is True only when a block will actually 409 —
+    i.e. on a LIVE broker mode. Never raises (any internal error => block on live)."""
+    snap = _prop_state_snapshot()
+    if not snap["enabled"]:
+        return {"enabled": False, "evaluated": False, "decision": "off", "blocked": False,
+                "enforced": False, "reasons": [], "warnings": [], "checks": [],
+                "account": None, "phase2": []}
+    live = bool(execution_is_live(mode))
+    acct = None
+    try:
+        acct = _prop_active_account(snap)
+        if acct is None:
+            return _prop_block_result(
+                live,
+                ["No active prop account configured — add one and set it active, or turn Protection OFF."],
+                account=None)
+        return _prop_eval_rules(acct, instrument, direction, contracts, entry, stop, live, now)
+    except Exception as exc:
+        try: logger.error("prop guard error (fail-closed): %s", exc)
+        except Exception: pass
+        return _prop_block_result(live,
+                                  ["Prop guard internal error — blocking to protect the account."],
+                                  account=_prop_account_summary(acct) if isinstance(acct, dict) else None)
+
+
+def prop_firm_status_view():
+    """DISPLAY-ONLY prop-firm snapshot for /status, the dashboard panel and Main Brain.
+    Reads in-memory state (snapshot under PROP_LOCK) + journal OUTSIDE the lock. Never
+    raises; never affects the gate / scoring / money path. When Protection is OFF it
+    reports enabled=False and enforces nothing."""
+    try:
+        snap = _prop_state_snapshot()
+    except Exception:
+        snap = {"enabled": False, "active_id": None, "accounts": []}
+    enabled = bool(snap.get("enabled"))
+    try:
+        acct = _prop_active_account(snap)
+    except Exception:
+        acct = None
+    accounts = [{"id": a.get("id"), "name": a.get("name"), "firm": a.get("firm"),
+                 "account_size": a.get("account_size"), "active": a.get("id") == snap.get("active_id")}
+                for a in (snap.get("accounts") or [])]
+    last = _recent_prop_decisions(1)
+    base = {
+        "enabled": enabled, "db_ready": bool(PROP_ACCOUNTS_DB_READY), "phase": 1,
+        "accounts": accounts, "account": (_prop_account_summary(acct) if acct else None),
+        "headline": "", "metrics": {}, "phase2": [],
+        "last_decision": (last[0] if last else None),
+    }
+    if not enabled:
+        base["headline"] = ("Prop Firm Protection is OFF — rules are not enforced."
+                            + ((" (configured: %s)" % acct.get("name")) if acct else ""))
+        return base
+    if acct is None:
+        base["headline"] = "Protection ON but NO active account — every LIVE order will be blocked."
+        return base
+    try:
+        realized = 0.0
+        for ei in enabled_instruments():
+            realized += _realized_pnl_today(ei)
+    except Exception:
+        realized = None
+    metrics = {"pnl_today": realized, "max_contracts": acct.get("max_contracts")}
+    dll = acct.get("daily_loss_limit")
+    if isinstance(dll, (int, float)) and dll > 0 and realized is not None:
+        used = max(0.0, -realized)
+        metrics["daily_loss_limit"]     = dll
+        metrics["daily_loss_remaining"] = max(0.0, float(dll) - float(acct.get("daily_loss_buffer") or 0) - used)
+    mdd   = acct.get("max_drawdown")
+    dtype = (acct.get("drawdown_type") or "trailing").lower()
+    if isinstance(mdd, (int, float)) and mdd > 0:
+        if dtype == "static":
+            cur_bal = acct.get("current_balance")
+            size    = acct.get("account_size")
+            if isinstance(cur_bal, (int, float)) and isinstance(size, (int, float)):
+                floor = float(size) - float(mdd) + float(acct.get("drawdown_buffer") or 0)
+                metrics["drawdown_floor"]     = floor
+                metrics["drawdown_remaining"] = float(cur_bal) - floor
+            else:
+                base["phase2"].append("Static drawdown set but current balance missing — "
+                                      "LIVE orders block until you enter it.")
+        else:
+            base["phase2"].append("%s drawdown ($%d) — display only; not armed until Phase 2."
+                                  % (dtype.title(), int(mdd)))
+    open_c = 0
+    try:
+        for t in active_trade_snapshot().values():
+            open_c += int(t.get("contracts") or 0)
+    except Exception:
+        open_c = 0
+    metrics["open_contracts"] = open_c
+    base["metrics"]  = metrics
+    base["headline"] = "Protection ON — %s (%s)." % (acct.get("name"), acct.get("firm"))
+    return base
+
+
+def _prop_main_brain_line():
+    """One-line prop-rule status for the Main Brain panel (DISPLAY-ONLY, fail-open)."""
+    try:
+        v = prop_firm_status_view()
+    except Exception:
+        return {"enabled": False, "line": "Prop Firm Protection unavailable.", "account": None}
+    if not v.get("enabled"):
+        return {"enabled": False, "line": "Prop Firm Protection OFF — rules not enforced.", "account": None}
+    return {"enabled": True, "line": (v.get("headline") or "Prop Firm Protection ON."),
+            "account": (v.get("account") or {}).get("name")}
 
 
 def execute_trade_gateway(instrument, contracts, source="manual"):
@@ -23521,6 +24221,39 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         "entry": intent["entry"], "stopLoss": intent["stop"],
         "takeProfit": intent["target1"], "target2": intent["target2"],
     }
+
+    # ── Prop Firm Protection (Task #15) — FINAL fail-CLOSED layer ────────────────
+    # Runs AFTER the server-authoritative plan is built but BEFORE the duplicate-send
+    # reservation, so a block never has a slot to release. When Protection is OFF the
+    # guard returns instantly (decision "off") having touched nothing — the byte-
+    # identical no-op. When ON it validates this exact order against the active prop
+    # account. A block ENFORCES (409) only on a LIVE broker mode; manual_only / paper
+    # still return their plan but carry the "would-block" preview so the owner sees it.
+    prop_guard = evaluate_prop_guard(instrument, direction, contracts, entry, stop, mode, source=source)
+    if prop_guard.get("evaluated"):
+        plan_public["prop_guard"] = prop_guard
+        try:
+            _record_prop_decision({
+                "ts":          time.time(),
+                "instrument":  instrument_of(instrument),
+                "direction":   direction,
+                "contracts":   contracts,
+                "mode":        mode,
+                "source":      source,
+                "decision":    prop_guard.get("decision"),
+                "enforced":    bool(prop_guard.get("enforced")),
+                "reasons":     list(prop_guard.get("reasons") or []),
+                "warnings":    list(prop_guard.get("warnings") or []),
+            })
+        except Exception:
+            pass
+        if prop_guard.get("enforced"):
+            _reason = ("Prop Firm Protection blocked this order: "
+                       + " ".join(prop_guard.get("reasons") or ["rule violation"]))
+            logger.warning("Prop guard BLOCKED live %s order: %s", instrument, _reason)
+            try: _record_diagnostic("%s | PROP guard blocked live order — %s" % (instrument, _reason))
+            except Exception: pass
+            return {"status": "error", "reason": _reason, "prop_guard": prop_guard}, 409
 
     # ── manual_only: NEVER contacts a broker. Returns the exact server-authoritative
     #    plan so the owner can place it by hand (the safe default when nothing is set).
@@ -25405,6 +26138,40 @@ def dashboard():
   <div class="nf-fid">Orders rejected locally (e.g. missing ticker/action) and NOT sent to your broker. Display-only — clears on restart.</div>
 </div>
 
+<!-- Prop Firm Protection (Task #15) — owner-only; FINAL fail-closed guard layer -->
+<div class="mod" id="mod-prop">
+  <div class="mod-h">
+    <span id="prop-dot" style="color:#6b7280">&#9679;</span> Prop Firm Protection
+    <span id="prop-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span>
+    <button id="prop-toggle" class="mute-pill" onclick="toggleProp()" style="float:right;font-size:11px" aria-pressed="false">Protection: off</button>
+  </div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Validates every order against your ACTIVE prop account before a live order is sent. OFF = no effect. A rule violation BLOCKS live orders; manual / paper modes show a would-block preview but still return the plan. Default-BLOCK when a configured rule's data is missing.</div>
+  <div class="nf-status" id="prop-headline">—</div>
+  <div class="cvd-stats" id="prop-metrics" style="margin:6px 0"></div>
+  <ul id="prop-phase2" style="margin:4px 0;padding-left:16px;color:var(--amber-dim);font-size:11px"></ul>
+  <div id="prop-db-warn" style="display:none;font-size:11px;color:#ff8a8a;margin:4px 0">Accounts database unavailable — accounts cannot be saved or loaded.</div>
+
+  <div class="mod-h" style="margin-top:10px;font-size:12px">Accounts &amp; Rules</div>
+  <div id="prop-accounts-list" style="margin:4px 0"></div>
+  <div class="fields" style="margin-top:6px">
+    <div class="field"><label>Add Apex preset</label>
+      <select id="prop-preset-size">
+        <option value="25000">25K</option><option value="50000" selected>50K</option>
+        <option value="75000">75K</option><option value="100000">100K</option>
+        <option value="150000">150K</option><option value="250000">250K</option>
+        <option value="300000">300K</option>
+      </select></div>
+    <div class="field" style="align-self:flex-end">
+      <button class="btn" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560" onclick="addPropPreset()">+ Add account</button></div>
+  </div>
+  <div id="prop-editor" style="display:none;margin-top:8px"></div>
+  <div id="prop-msg" style="font-size:11px;margin-top:6px"></div>
+
+  <div class="mod-h" style="margin-top:10px;font-size:12px">Recent guard decisions</div>
+  <ul id="prop-decisions" style="margin:4px 0;padding-left:16px;font-size:11px"></ul>
+  <div class="nf-fid">Owner-only. The toggle &amp; decision log are in-memory and reset on restart; accounts persist in the database.</div>
+</div>
+
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
 <div class="mod" id="mod-cvd">
   <div class="mod-h">📊 Volume Delta (CVD) &amp; RVOL</div>
@@ -26510,6 +27277,7 @@ function renderModules(d){
 
   // ── Module 10c: Blocked Orders — locally-rejected invalid-payload orders (DISPLAY-ONLY) ──
   renderExecRejections(d);
+  renderProp(d);
 
   // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
   renderReportMode(d);
@@ -26968,6 +27736,221 @@ function renderExecRejections(d){
     return (r.time||'—')+' · '+(r.instrument||'?')+' · '+(r.reason||'—');
   }));
 }
+
+// ── Prop Firm Protection (Task #15) — owner-only display + account manager ──
+let PROP_VIEW = null;       // last /status prop_firm view (toggle + headline + metrics)
+let PROP_ACCOUNTS = null;   // last /prop-accounts payload (full editable accounts + presets)
+let PROP_EDIT_ID = null;    // account id currently open in the editor (null = closed)
+
+function propAttr(s){ return aiEsc(s).replace(/"/g,'&quot;'); }
+
+function renderProp(d){
+  const mod=document.getElementById('mod-prop'); if(!mod) return;
+  const v=(d && d.prop_firm) || PROP_VIEW || null;
+  PROP_VIEW=v;
+  const on=!!(v && v.enabled);
+  const btn=document.getElementById('prop-toggle');
+  if(btn){ btn.textContent='Protection: '+(on?'ON':'off'); btn.classList.toggle('is-armed',on); btn.setAttribute('aria-pressed',on?'true':'false'); }
+  const dot=document.getElementById('prop-dot');
+  if(dot) dot.style.color = on ? 'var(--green)' : '#6b7280';
+  const meta=document.getElementById('prop-meta');
+  if(meta) meta.textContent = on ? 'ENFORCING LIVE ORDERS' : 'off';
+  const hl=document.getElementById('prop-headline');
+  if(hl) hl.textContent=(v && v.headline) || '—';
+  const m=(v && v.metrics) || {};
+  const money=function(x){ return (x==null||isNaN(x))?'—':('$'+Math.round(x).toLocaleString()); };
+  const cells=[];
+  function cell(l,val){ cells.push(`<div class="gstat"><div class="l">${l}</div><div class="v">${val}</div></div>`); }
+  if(on){
+    cell('P&amp;L today', m.pnl_today==null?'—':money(m.pnl_today));
+    cell('Open contracts', m.open_contracts==null?'—':m.open_contracts);
+    if(m.max_contracts!=null) cell('Max contracts', m.max_contracts);
+    if(m.daily_loss_remaining!=null) cell('Daily-loss left', money(m.daily_loss_remaining));
+    if(m.drawdown_remaining!=null) cell('Drawdown left', money(m.drawdown_remaining));
+  }
+  const mc=document.getElementById('prop-metrics');
+  if(mc) mc.innerHTML=cells.join('');
+  _anFill('prop-phase2', (v && v.phase2) || []);
+  const warn=document.getElementById('prop-db-warn');
+  if(warn) warn.style.display = (v && v.db_ready===false) ? '' : 'none';
+}
+
+function setPropMsg(msg, err){
+  const e=document.getElementById('prop-msg'); if(!e) return;
+  e.textContent=msg||''; e.style.color=err?'#ff8a8a':'#6b7280';
+}
+
+function toggleProp(){
+  const cur=!!(PROP_VIEW && PROP_VIEW.enabled);
+  const next=!cur;
+  if(next && !confirm('Turn Prop Firm Protection ON?\\n\\nWhile ON, every order is validated against your ACTIVE prop account. A rule violation BLOCKS live orders (manual / paper modes show a would-block preview). With no active account set, every live order is blocked.')) return;
+  api('/prop-protection', { enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ toast('Protection update failed', false); return; }
+      renderProp(d);
+      toast(next?'Prop Firm Protection ON':'Prop Firm Protection off');
+    })
+    .catch(function(){ toast('Protection update failed', false); });
+}
+
+async function loadPropAccounts(){
+  try{ const d=await api('/prop-accounts'); if(d && d.status==='ok'){ PROP_ACCOUNTS=d; renderPropAccounts(); } }
+  catch(e){ /* fail-open: keep last painted state */ }
+}
+
+function renderPropAccounts(){
+  const wrap=document.getElementById('prop-accounts-list'); if(!wrap) return;
+  const d=PROP_ACCOUNTS;
+  const warn=document.getElementById('prop-db-warn');
+  if(warn && d) warn.style.display = d.db_ready ? 'none' : '';
+  const accts=(d && d.accounts) || [];
+  if(!accts.length){ wrap.innerHTML='<div style="color:#6b7280;font-size:11px">No accounts yet — add an Apex preset below, then set it active.</div>'; return; }
+  wrap.innerHTML = accts.map(function(a){
+    const active = a.id===d.active_id;
+    const sz = a.account_size?('$'+Number(a.account_size).toLocaleString()):'';
+    const actCtl = active
+      ? `<span class="btn" style="padding:2px 8px;font-size:11px;background:#0d1f14;color:#22c55e;border:1px solid #22c55e;cursor:default">ACTIVE</span>`
+      : `<button class="btn" style="padding:2px 8px;font-size:11px" onclick="activateProp('${aiEsc(a.id)}')">Set active</button>`;
+    return `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">`
+      +actCtl
+      +`<span style="flex:1;font-size:12px">${aiEsc(a.name||'(account)')} <span style="color:#6b7280">${aiEsc(a.firm||'')} ${sz}</span></span>`
+      +`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="editProp('${aiEsc(a.id)}')">Edit</button>`
+      +`<button class="btn" style="padding:2px 8px;font-size:11px;color:#ff8a8a" onclick="deleteProp('${aiEsc(a.id)}')">Del</button>`
+      +`</div>`;
+  }).join('');
+}
+
+function addPropPreset(){
+  const sizeEl=document.getElementById('prop-preset-size');
+  const size=sizeEl?parseInt(sizeEl.value,10):50000;
+  setPropMsg('Adding account…');
+  api('/prop-accounts', { action:'preset', firm:'Apex', account_size:size })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ setPropMsg(d&&d.reason?d.reason:'Add failed', true); return; }
+      PROP_ACCOUNTS=d; renderPropAccounts(); setPropMsg('Account added — edit its rules below.');
+      const accts=d.accounts||[]; if(accts.length) editProp(accts[accts.length-1].id);
+    })
+    .catch(function(){ setPropMsg('Add failed', true); });
+}
+
+function propField(label,type,id,val){
+  return `<div class="field"><label>${label}</label><input id="${id}" type="${type}"${type==='number'?' step="any"':''} value="${propAttr(val==null?'':val)}"></div>`;
+}
+function propSelectField(label,id,opts,cur){
+  const o=opts.map(function(p){ return `<option value="${p[0]}"${p[0]===cur?' selected':''}>${aiEsc(p[1])}</option>`; }).join('');
+  return `<div class="field"><label>${label}</label><select id="${id}">${o}</select></div>`;
+}
+
+function editProp(id){
+  if(!PROP_ACCOUNTS) return;
+  const a=(PROP_ACCOUNTS.accounts||[]).find(function(x){ return x.id===id; });
+  if(!a) return;
+  PROP_EDIT_ID=id;
+  renderPropEditor(a);
+}
+
+function renderPropEditor(a){
+  const box=document.getElementById('prop-editor'); if(!box) return;
+  const ai=(a.allowed_instruments||[]).join(', ');
+  box.style.display='';
+  box.innerHTML =
+    `<div class="mod-h" style="font-size:12px">Edit rules: ${aiEsc(a.name||'account')}</div>`
+   +`<div class="fields">`
+   +propField('Name','text','pe-name',a.name)
+   +propField('Firm','text','pe-firm',a.firm)
+   +propField('Account size ($)','number','pe-size',a.account_size)
+   +propField('Current balance ($, for static DD)','number','pe-bal',a.current_balance)
+   +propField('Max contracts (micros)','number','pe-maxc',a.max_contracts)
+   +propField('Daily loss limit ($, blank=none)','number','pe-dll',a.daily_loss_limit)
+   +propField('Daily loss buffer ($)','number','pe-dlb',a.daily_loss_buffer)
+   +propField('Max drawdown ($)','number','pe-mdd',a.max_drawdown)
+   +propSelectField('Drawdown type','pe-ddt',[['trailing','trailing (Phase 2)'],['static','static (enforced)'],['eod','eod (Phase 2)']],(a.drawdown_type||'trailing'))
+   +propField('Drawdown buffer ($)','number','pe-ddb',a.drawdown_buffer)
+   +propField('Allowed instruments (blank=all)','text','pe-ai',ai)
+   +propField('Trading start ET (HH:MM)','text','pe-ts',a.trading_start_et)
+   +propField('Trading end ET (HH:MM)','text','pe-te',a.trading_end_et)
+   +propField('News block minutes (0=off)','number','pe-nbm',a.news_block_minutes)
+   +propSelectField('On news','pe-na',[['warn','warn only'],['block','block']],(a.news_action||'warn'))
+   +propField('Flatten before close min (0=off)','number','pe-fbc',a.flatten_before_close_min)
+   +propField('Profit target ($)','number','pe-pt',a.profit_target)
+   +propSelectField('Allow overnight','pe-aon',[['1','yes'],['0','no']],(a.allow_overnight===false?'0':'1'))
+   +propSelectField('Allow weekend','pe-awe',[['1','yes'],['0','no']],(a.allow_weekend===false?'0':'1'))
+   +`</div>`
+   +`<div style="margin-top:8px;display:flex;gap:6px">`
+   +`<button class="btn" style="background:#0d1f14;color:#22c55e;border:1px solid #22c55e;flex:1" onclick="savePropEdit()">Save rules</button>`
+   +`<button class="btn" style="flex:1" onclick="cancelPropEdit()">Cancel</button>`
+   +`</div>`;
+}
+
+function savePropEdit(){
+  if(PROP_EDIT_ID==null) return;
+  const g=function(id){ const e=document.getElementById(id); return e?String(e.value).trim():''; };
+  const acct={
+    id: PROP_EDIT_ID,
+    name: g('pe-name'), firm: g('pe-firm'),
+    account_size: g('pe-size'), current_balance: g('pe-bal'),
+    max_contracts: g('pe-maxc'),
+    daily_loss_limit: g('pe-dll'), daily_loss_buffer: g('pe-dlb'),
+    max_drawdown: g('pe-mdd'), drawdown_type: g('pe-ddt'), drawdown_buffer: g('pe-ddb'),
+    allowed_instruments: g('pe-ai'),
+    trading_start_et: g('pe-ts'), trading_end_et: g('pe-te'),
+    news_block_minutes: g('pe-nbm'), news_action: g('pe-na'),
+    flatten_before_close_min: g('pe-fbc'), profit_target: g('pe-pt'),
+    allow_overnight: g('pe-aon')==='1', allow_weekend: g('pe-awe')==='1'
+  };
+  setPropMsg('Saving…');
+  api('/prop-accounts', { action:'save', account:acct })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ setPropMsg(d&&d.reason?d.reason:'Save failed', true); return; }
+      PROP_ACCOUNTS=d; cancelPropEdit(); renderPropAccounts(); setPropMsg('Rules saved.');
+    })
+    .catch(function(){ setPropMsg('Save failed', true); });
+}
+
+function cancelPropEdit(){
+  PROP_EDIT_ID=null;
+  const box=document.getElementById('prop-editor'); if(box){ box.style.display='none'; box.innerHTML=''; }
+}
+
+function deleteProp(id){
+  if(!confirm('Delete this prop account? This cannot be undone.')) return;
+  setPropMsg('Deleting…');
+  api('/prop-accounts', { action:'delete', id:id })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ setPropMsg(d&&d.reason?d.reason:'Delete failed', true); return; }
+      PROP_ACCOUNTS=d; if(PROP_EDIT_ID===id) cancelPropEdit();
+      renderPropAccounts(); setPropMsg('Account deleted.');
+    })
+    .catch(function(){ setPropMsg('Delete failed', true); });
+}
+
+function activateProp(id){
+  setPropMsg('Updating active account…');
+  api('/prop-accounts', { action:'activate', id:id })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ setPropMsg(d&&d.reason?d.reason:'Update failed', true); return; }
+      PROP_ACCOUNTS=d; renderPropAccounts(); setPropMsg('Active account updated.');
+    })
+    .catch(function(){ setPropMsg('Update failed', true); });
+}
+
+async function loadPropDecisions(){
+  try{ const d=await api('/prop-decisions'); if(d && d.status==='ok') renderPropDecisions(d.decisions||[]); }
+  catch(e){ /* keep last painted state */ }
+}
+
+function renderPropDecisions(rows){
+  const items=(rows||[]).map(function(r){
+    const t=r.ts?new Date(r.ts*1000).toLocaleTimeString():'—';
+    const dec=(r.decision||'?').toString().toUpperCase();
+    const tag=r.enforced?'BLOCKED (live)':(dec==='BLOCK'?'would-block':dec.toLowerCase());
+    const why=(r.reasons&&r.reasons.length)?(' · '+r.reasons[0]):'';
+    const cnt=(r.contracts==null?'?':r.contracts);
+    return `${t} · ${r.instrument||'?'} ${r.direction||''} x${cnt} · ${tag}${why}`;
+  });
+  _anFill('prop-decisions', items);
+}
+
 function renderAnalystMode(d){
   const a=(d && d.analyst) || null;
   const mod=document.getElementById('mod-analyst');
@@ -29501,7 +30484,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); refreshManual(); mbChatRender();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); refreshManual(); mbChatRender(); loadPropAccounts(); loadPropDecisions();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -29941,7 +30924,7 @@ function renderManual(d){
   box.innerHTML = trades.map(function(t){ return mtCard(t); }).join('');
 }
 
-setInterval(() => { refresh(); refreshRec(); refreshManual(); }, 3000);
+setInterval(() => { refresh(); refreshRec(); refreshManual(); loadPropDecisions(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
 </body>
@@ -30057,6 +31040,80 @@ def auto_trade_toggle():
         "max_per_day":              AUTO_TRADE_MAX_PER_DAY,
         "contracts":                AUTO_TRADE_CONTRACTS,
     }), 200
+
+
+@app.route("/prop-protection", methods=["GET", "POST"])
+def prop_protection_toggle():
+    """Read or set the in-memory Prop Firm Protection ON/OFF toggle (owner-only).
+
+    POST {enabled: bool}. The toggle is in-memory and resets OFF on every restart
+    (fail-safe toward NOT enforcing). When OFF the gateway guard is a complete
+    no-op. Returns the full display status view either way."""
+    global PROP_PROTECTION_ENABLED
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "enabled" in data:
+            with PROP_LOCK:
+                PROP_PROTECTION_ENABLED = bool(data.get("enabled"))
+            logger.info("Prop Firm Protection %s",
+                        "ENABLED" if PROP_PROTECTION_ENABLED else "DISABLED")
+    return jsonify({"status": "ok", "prop_firm": prop_firm_status_view()}), 200
+
+
+@app.route("/prop-accounts", methods=["GET", "POST"])
+def prop_accounts():
+    """Owner-only CRUD for prop accounts, persisted in Postgres (INSERT/SELECT/UPDATE/
+    DELETE; NO DDL). GET lists every account (full schema) + presets + enabled
+    instruments. POST {action}: preset | save | delete | activate."""
+    if not PROP_ACCOUNTS_DB_READY:
+        # (Re)probe in case the table appeared after boot (e.g. a publish schema-diff).
+        _check_prop_accounts_db_ready()
+        if PROP_ACCOUNTS_DB_READY:
+            _load_prop_accounts_from_db()
+    if request.method == "POST":
+        if not PROP_ACCOUNTS_DB_READY:
+            return jsonify({"status": "error", "reason": "accounts database unavailable"}), 503
+        data   = request.get_json(silent=True) or {}
+        action = str(data.get("action") or "").strip().lower()
+        if action == "preset":
+            acct = _prop_default_account(firm=str(data.get("firm") or "Apex"),
+                                         account_size=data.get("account_size") or 50000,
+                                         name=data.get("name"))
+            ok, err = _prop_upsert_account(acct)
+        elif action == "save":
+            raw, base = (data.get("account") or {}), None
+            if raw.get("id"):
+                for a in (_prop_state_snapshot().get("accounts") or []):
+                    if a.get("id") == raw["id"]:
+                        base = dict(a)
+                        break
+            acct = _prop_normalize_account(raw, base=base)
+            ok, err = _prop_upsert_account(acct)
+        elif action == "delete":
+            ok, err = _prop_delete_account(str(data.get("id") or ""))
+        elif action == "activate":
+            aid = data.get("id")
+            ok, err = _prop_set_active(str(aid) if aid else None)
+        else:
+            return jsonify({"status": "error", "reason": "unknown action"}), 400
+        if not ok:
+            return jsonify({"status": "error", "reason": err or "operation failed"}), 400
+    snap = _prop_state_snapshot()
+    return jsonify({
+        "status":      "ok",
+        "db_ready":    bool(PROP_ACCOUNTS_DB_READY),
+        "accounts":    snap.get("accounts") or [],
+        "active_id":   snap.get("active_id"),
+        "presets":     {"firms": list(PROP_FIRMS), "apex_sizes": sorted(PROP_APEX_PRESETS.keys())},
+        "instruments": enabled_instruments(),
+        "prop_firm":   prop_firm_status_view(),
+    }), 200
+
+
+@app.route("/prop-decisions", methods=["GET"])
+def prop_decisions():
+    """Owner-only DISPLAY-ONLY log of the most recent prop-guard decisions."""
+    return jsonify({"status": "ok", "decisions": _recent_prop_decisions(50)}), 200
 
 
 @app.route("/advisor", methods=["GET", "POST"])
@@ -31124,6 +32181,8 @@ if __name__ == "__main__":
         _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
         _load_manual_trades_from_db()              # rehydrate open ADVISORY-ONLY manual positions (display monitor)
         _check_main_brain_events_db_ready()        # probe main_brain_events (no DDL; created via DB tool/publish diff)
+        _check_prop_accounts_db_ready()            # probe prop_accounts (no DDL; created via DB tool/publish diff) — Prop Firm Protection
+        _load_prop_accounts_from_db()              # warm the prop-account cache (display + guard reads); Protection stays OFF until toggled
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)

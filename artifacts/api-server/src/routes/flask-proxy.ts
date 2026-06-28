@@ -112,6 +112,11 @@ router.all(
     // OPEN_PATHS). Never sends a broker order — monitors a manually-entered position.
     "/manual-trade",
     "/manual-trade/close",
+    // Prop Firm Protection (owner-only; NOT in dashboard-auth OPEN_PATHS). Toggle +
+    // account/rules CRUD + decision log. The gateway guard is the money-path layer.
+    "/prop-protection",
+    "/prop-accounts",
+    "/prop-decisions",
   ],
   proxyToFlask,
 );
