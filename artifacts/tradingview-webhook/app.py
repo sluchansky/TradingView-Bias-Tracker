@@ -13122,6 +13122,17 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "edge_grade":        None,
         "what_now":          [],
         "invalidation":      "—",
+        "mission":           [],
+        "mission_progress":  0,
+        "signals":           {},
+        "confidence_pct":    None,
+        "long_bias_pct":     None,
+        "short_bias_pct":    None,
+        "trade_quality":     None,
+        "risk_level":        None,
+        "bull_case":         [],
+        "bear_case":         [],
+        "management_read":   None,
         "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
         "reason":            reason,
     }
@@ -13312,6 +13323,103 @@ def compute_main_brain(result):
             summary = ("Watching and waiting — no clean edge right now. I'd rather miss a "
                        "trade than force a bad one.")
 
+        # ── Confidence / Bias / Quality / Risk — READ existing blocks only ──
+        dirs = result.get("directions") or {}
+        le = _mb_num((dirs.get("Long")  or {}).get("edge_score"))
+        se = _mb_num((dirs.get("Short") or {}).get("edge_score"))
+        long_pct = short_pct = None
+        if le is not None and se is not None and (le + se) > 0:
+            long_pct  = int(round(le / (le + se) * 100))
+            short_pct = 100 - long_pct
+        conf_pct = _mb_num(an.get("confidence"))
+        if conf_pct is None:
+            _arc = ar.get("confidence")
+            if isinstance(_arc, dict):
+                conf_pct = _mb_num(_arc.get("score"))
+        if conf_pct is None and edge is not None:
+            conf_pct = _mb_num(edge)
+        conf_pct = int(round(conf_pct)) if conf_pct is not None else None
+        quality = grade or eq.get("grade") or eq.get("verdict_label")
+        stop_logical = (an.get("risk") or {}).get("stop_logical")
+        if regime in ("elevated", "extreme") or stop_logical is False:
+            risk_level = "High"
+        elif regime in ("normal", "low", "quiet") and not eq.get("chasing_warning"):
+            risk_level = "Low"
+        else:
+            risk_level = "Medium"
+        bull_case = [str(x).strip() for x in (an.get("bull_case") or []) if str(x).strip()][:5]
+        bear_case = [str(x).strip() for x in (an.get("bear_case") or []) if str(x).strip()][:5]
+
+        # ── Management read (advisory) — only when a position is open. Pass a COPY
+        #    (compute_manual_trade_management writes min_r/max_r back onto the dict it is
+        #    handed) and the already-assembled `result` as the analysis so it NEVER
+        #    recomputes full_analysis (which would re-enter this function). Display-only;
+        #    fail-open; touches no gate / sizing / dedupe / broker path. ──
+        management_read = None
+        if managing and isinstance(pos, dict):
+            try:
+                _mr_mirror = {
+                    "id":          "mb-%s" % (inst or "pos"),
+                    "symbol":      pos.get("symbol") or inst,
+                    "direction":   pos.get("direction", "Long"),
+                    "entry_price": (pos.get("entry_price") if pos.get("entry_price") is not None
+                                    else pos.get("entry")),
+                    "stop_loss":   (pos.get("stop_loss") if pos.get("stop_loss") is not None
+                                    else pos.get("stop")),
+                    "target1":     pos.get("target1"),
+                    "target2":     pos.get("target2"),
+                    "target3":     pos.get("target3"),
+                    "contracts":   pos.get("contracts"),
+                    "mode":        pos.get("mode") or TRADING_MODE,
+                    "reason":      "",
+                    "entry_time":  pos.get("opened_at") or None,
+                    "opened_at":   pos.get("opened_at") or now_utc().isoformat(),
+                    "status":      "open",
+                }
+                management_read = compute_manual_trade_management(_mr_mirror, analysis=result)
+            except Exception:
+                management_read = None
+
+        # ── Current Mission — conditions before READY (derived from reads only) ──
+        mission = []
+        if fav:
+            is_long = (fav == "Long")
+            if pv is not None and vv is not None:
+                mission.append({"label": ("Above VWAP" if is_long else "Below VWAP"),
+                                "done": bool((pv >= vv) if is_long else (pv <= vv))})
+            _zone = n_dem if is_long else n_sup
+            mission.append({"label": ("Demand zone in play" if is_long else "Supply zone in play"),
+                            "done": _zone is not None})
+            _sl = (struct or "").lower()
+            mission.append({"label": ("Bullish structure (CHOCH/BOS)" if is_long
+                                      else "Bearish structure (CHOCH/BOS)"),
+                            "done": ("bull" in _sl) if is_long else ("bear" in _sl)})
+            mission.append({"label": ("CVD supporting longs" if is_long else "CVD supporting shorts"),
+                            "done": (cvd == "bullish") if is_long else (cvd == "bearish")})
+            _eqlbl = str(eq.get("verdict_label") or eq.get("grade") or "").lower()
+            mission.append({"label": "Clean entry (not chasing)",
+                            "done": bool((not eq.get("chasing_warning"))
+                                         and _eqlbl not in ("avoid", "poor"))})
+        mission_progress = (int(round(sum(1 for m in mission if m["done"]) / len(mission) * 100))
+                            if mission else 0)
+
+        # ── Signals snapshot — the FRONTEND diffs this for the What-Changed feed ──
+        signals = {
+            "status":      status,
+            "favored":     fav or "none",
+            "vwap_side":   ("above" if (pv is not None and vv is not None and pv >= vv)
+                            else "below" if (pv is not None and vv is not None) else "unknown"),
+            "cvd":         cvd or "unknown",
+            "structure":   struct,
+            "zone":        ("demand" if (fav == "Long" and n_dem is not None)
+                            else "supply" if (fav == "Short" and n_sup is not None) else "none"),
+            "rr":          (str(rr) if rr else None),
+            "confidence":  conf_pct,
+            "edge":        (int(edge) if isinstance(edge, (int, float)) else None),
+            "risk":        risk_level,
+            "invalidated": bool(invalidated),
+        }
+
         head_dir = (" %s" % fav) if (fav and status in ("BUILDING", "WATCHING", "READY")) else ""
         return {
             "status":            status,
@@ -13326,6 +13434,17 @@ def compute_main_brain(result):
             "edge_grade":        grade,
             "what_now":          what_next,
             "invalidation":      ar.get("invalidation") or an.get("invalidation") or "—",
+            "mission":           mission,
+            "mission_progress":  mission_progress,
+            "signals":           signals,
+            "confidence_pct":    conf_pct,
+            "long_bias_pct":     long_pct,
+            "short_bias_pct":    short_pct,
+            "trade_quality":     quality,
+            "risk_level":        risk_level,
+            "bull_case":         bull_case,
+            "bear_case":         bear_case,
+            "management_read":   management_read,
             "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
             "reason":            None,
         }
@@ -23117,6 +23236,41 @@ def dashboard():
   #mb-chat-send{background:#241a3a;color:#cbb6ff;border:1px solid #3a2363}
   .mb-badge{font-size:10px;font-weight:800;letter-spacing:1px;color:#0b0b12;padding:2px 9px;border-radius:999px;background:#6b7280}
   .mb-summary{font-size:14px;line-height:1.55;color:#e8e8f0;margin:4px 0 12px;font-weight:600}
+  .mb-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:0 0 12px}
+  .mb-stat{background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:8px 10px}
+  .mb-stat-l{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700;margin-bottom:4px}
+  .mb-stat-v{font-size:16px;font-weight:800;color:#e8e8f0}
+  .mb-lean{height:8px;border-radius:999px;overflow:hidden;display:flex;background:#210d0d;margin-top:6px}
+  .mb-lean-long{background:var(--green);height:100%}
+  .mb-lean-short{background:var(--red);height:100%}
+  .mb-mission{background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:12px}
+  .mb-mission-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+  .mb-mission-pct{color:var(--green);font-weight:800}
+  .mb-mission-list{list-style:none;margin:0 0 8px;padding:0;display:grid;grid-template-columns:1fr 1fr;gap:4px}
+  .mb-mission-item{font-size:12px;color:var(--muted);display:flex;align-items:flex-start;gap:5px;line-height:1.5}
+  .mb-mission-item.done{color:#bfe6c8}
+  .mb-mission-box{font-size:13px;flex:0 0 auto}
+  .mb-mission-track{height:6px;background:#0c0a18;border-radius:999px;overflow:hidden}
+  .mb-mission-fill{height:100%;background:var(--green);width:0;transition:width .4s}
+  .mb-cases{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+  .mb-case{background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:10px}
+  .mb-case-bull{border-left:2px solid var(--green)}
+  .mb-case-bear{border-left:2px solid var(--red)}
+  .mb-case-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:700;margin-bottom:6px}
+  .mb-case-bull .mb-case-h{color:#bfe6c8}
+  .mb-case-bear .mb-case-h{color:#f5b5b5}
+  .mb-manage{background:var(--inset);border:1px solid var(--border);border-left:2px solid #a855f7;border-radius:4px;padding:10px;margin-bottom:12px}
+  .mb-manage-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#cbb6ff;font-weight:700;margin-bottom:8px}
+  .mb-manage-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px}
+  .mb-mc-l{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700;margin-bottom:3px}
+  .mb-mc-v{font-size:13px;font-weight:700;color:#e8e8f0}
+  .mb-mg-rec{font-size:12px;color:#e8e8f0;margin:2px 0 6px;line-height:1.5;font-weight:600}
+  .mb-think{display:inline-flex;gap:3px;align-items:center}
+  .mb-think span{width:5px;height:5px;border-radius:50%;background:#cbb6ff;display:inline-block;animation:mbBlink 1.4s infinite both}
+  .mb-think span:nth-child(2){animation-delay:.2s}
+  .mb-think span:nth-child(3){animation-delay:.4s}
+  @keyframes mbBlink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+  @media(max-width:720px){.mb-stats{grid-template-columns:repeat(2,1fr)}.mb-mission-list{grid-template-columns:1fr}.mb-cases{grid-template-columns:1fr}.mb-manage-grid{grid-template-columns:1fr 1fr}}
   .mb-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
   .mb-col{background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:10px}
   .mb-col-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:6px}
@@ -23466,11 +23620,37 @@ def dashboard():
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">LIVE READ · DISPLAY-ONLY</span>
     </div>
     <div id="mb-summary" class="mb-summary">Loading…</div>
+    <div class="mb-stats" id="mb-stats">
+      <div class="mb-stat"><div class="mb-stat-l">Confidence</div><div class="mb-stat-v" id="mb-conf">—</div></div>
+      <div class="mb-stat"><div class="mb-stat-l">Lean</div><div class="mb-stat-v" id="mb-lean-txt" style="font-size:12px">—</div><div class="mb-lean"><div class="mb-lean-long" id="mb-lean-long" style="width:50%"></div><div class="mb-lean-short" id="mb-lean-short" style="width:50%"></div></div></div>
+      <div class="mb-stat"><div class="mb-stat-l">Quality</div><div class="mb-stat-v" id="mb-quality">—</div></div>
+      <div class="mb-stat"><div class="mb-stat-l">Risk</div><div class="mb-stat-v" id="mb-risk-level">—</div></div>
+    </div>
+    <div class="mb-mission" id="mb-mission-wrap" style="display:none">
+      <div class="mb-mission-h"><span>🎯 Current Mission</span><span class="mb-mission-pct" id="mb-mission-pct"></span></div>
+      <ul class="mb-mission-list" id="mb-mission"></ul>
+      <div class="mb-mission-track"><div class="mb-mission-fill" id="mb-mission-fill"></div></div>
+    </div>
     <div class="mb-grid">
       <div class="mb-col"><div class="mb-col-h">📡 What I see</div><ul id="mb-market" class="mb-list"></ul></div>
       <div class="mb-col"><div class="mb-col-h">♟ What I'm thinking</div><ul id="mb-strategy" class="mb-list"></ul></div>
       <div class="mb-col"><div class="mb-col-h">🛡 What I'm watching for</div><ul id="mb-risk" class="mb-list"></ul></div>
       <div class="mb-col"><div class="mb-col-h">🎯 The plan</div><ul id="mb-tm" class="mb-list"></ul></div>
+    </div>
+    <div class="mb-cases" id="mb-cases" style="display:none">
+      <div class="mb-case mb-case-bull"><div class="mb-case-h">🐂 Bull Case</div><ul id="mb-bull" class="mb-list"></ul></div>
+      <div class="mb-case mb-case-bear"><div class="mb-case-h">🐻 Bear Case</div><ul id="mb-bear" class="mb-list"></ul></div>
+    </div>
+    <div class="mb-manage" id="mb-manage" style="display:none">
+      <div class="mb-manage-h">📍 Managing position</div>
+      <div class="mb-manage-grid">
+        <div><div class="mb-mc-l">Position</div><div class="mb-mc-v" id="mb-mg-pos">—</div></div>
+        <div><div class="mb-mc-l">Open R</div><div class="mb-mc-v" id="mb-mg-r">—</div></div>
+        <div><div class="mb-mc-l">Unrealized</div><div class="mb-mc-v" id="mb-mg-pnl">—</div></div>
+        <div><div class="mb-mc-l">To stop / T1</div><div class="mb-mc-v" id="mb-mg-dist">—</div></div>
+      </div>
+      <div class="mb-mg-rec" id="mb-mg-rec"></div>
+      <ul class="mb-list" id="mb-mg-watch"></ul>
     </div>
     <div class="mb-feed-h">Live conversation</div>
     <div id="mb-feed" class="mb-feed"></div>
@@ -25280,9 +25460,10 @@ function _anVerdictColor(v){
 // dynamic string is rendered via textContent / _anFill (escaped). The live
 // conversation is in-memory per-device, per-symbol, deduped and capped.
 const MB_BADGE_COLORS = { WATCHING:'#6b7280', BUILDING:'#3b82f6', READY:'#22c55e', WAIT:'#f59e0b', MANAGING:'#a855f7', INVALIDATED:'#ef4444' };
+const MB_RISK_COLORS = { Low:'#22c55e', Medium:'#f59e0b', High:'#ef4444' };
 const MB_FEED_MAX = 40;
 let mbFeeds = {};     // { SYM: [ {t, status, text} ] }
-let mbLastKey = {};   // { SYM: "status|summary" }  — dedup last appended entry
+let mbLastSignals = {};   // { SYM: <last signals snapshot> } — diffed for the What-Changed feed
 let mbCurSym = null;  // last symbol whose transcript was painted
 function mbNowET(){
   try { return new Date().toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
@@ -25311,6 +25492,51 @@ function mbRenderFeed(symKey, scrollToEnd){
   });
   if(scrollToEnd) feed.scrollTop = feed.scrollHeight;
 }
+// Diff two server signals snapshots → human "what changed" lines. Display-only;
+// the feed appends a line ONLY on a real transition (never every poll).
+function mbChangeMessages(prev, sig){
+  if(!sig) return [];
+  const m = [];
+  const fav = sig.favored;
+  if(prev.status !== sig.status){
+    if(sig.status === 'READY') m.push('Setup is READY' + (fav && fav !== 'none' ? ' — ' + fav : '') + '.');
+    else if(sig.status === 'INVALIDATED') m.push('Setup invalidated — thesis broke, protect capital.');
+    else if(sig.status === 'MANAGING') m.push('Now managing an open position.');
+    else if(sig.status === 'BUILDING') m.push('A setup is building' + (fav && fav !== 'none' ? ' (' + fav + ')' : '') + '.');
+    else if(sig.status === 'WATCHING') m.push('Back to watching — no clean edge yet.');
+    else if(sig.status === 'WAIT') m.push('Standing down — waiting on confirmation.');
+  }
+  if(prev.favored !== sig.favored && prev.favored && sig.favored && sig.favored !== 'none'){
+    m.push('Bias flipped to ' + sig.favored + '.');
+  }
+  if(prev.vwap_side !== sig.vwap_side && sig.vwap_side !== 'unknown'){
+    if(sig.vwap_side === 'above') m.push('VWAP reclaimed — now trading above it.');
+    else m.push('Lost VWAP — now trading below it.');
+  }
+  if(prev.cvd !== sig.cvd && (sig.cvd === 'bullish' || sig.cvd === 'bearish')){
+    m.push('Order-flow (CVD) turned ' + sig.cvd + '.');
+  }
+  if(prev.structure !== sig.structure && sig.structure){
+    m.push('Structure now reads ' + sig.structure + '.');
+  }
+  if(prev.zone !== sig.zone){
+    if(sig.zone === 'demand') m.push('Demand zone now in play.');
+    else if(sig.zone === 'supply') m.push('Supply zone now in play.');
+    else if(sig.zone === 'none' && prev.zone && prev.zone !== 'none') m.push('Trade-side zone no longer in play.');
+  }
+  if(prev.rr !== sig.rr && sig.rr){
+    m.push('Risk/reward now ' + sig.rr + '.');
+  }
+  if(typeof sig.confidence === 'number' && typeof prev.confidence === 'number'){
+    const a = Math.round(prev.confidence / 10), b = Math.round(sig.confidence / 10);
+    if(b > a) m.push('Confidence improved to ' + sig.confidence + '%.');
+    else if(b < a) m.push('Confidence slipped to ' + sig.confidence + '%.');
+  }
+  if(prev.risk !== sig.risk && sig.risk){
+    m.push('Risk level now ' + sig.risk + '.');
+  }
+  return m;
+}
 function renderMainBrain(d){
   const mod = document.getElementById('mod-brain');
   if(!mod) return;
@@ -25326,20 +25552,93 @@ function renderMainBrain(d){
   _anFill('mb-strategy', (mb && mb.strategy_brain) || []);
   _anFill('mb-risk',     (mb && mb.risk_brain)     || []);
   _anFill('mb-tm',       (mb && mb.trade_manager)  || []);
+  // Confidence / bias / quality / risk strip (display-only reads of main_brain).
+  const _cf = (mb && mb.confidence_pct);
+  const cfEl = document.getElementById('mb-conf');
+  if(cfEl) cfEl.textContent = (_cf===0 || _cf) ? (_cf + '%') : '—';
+  const _lp = (mb && mb.long_bias_pct), _sp = (mb && mb.short_bias_pct);
+  const lLong = document.getElementById('mb-lean-long'), lShort = document.getElementById('mb-lean-short'), lTxt = document.getElementById('mb-lean-txt');
+  if(lLong && lShort){
+    if((_lp || _lp===0) && (_sp || _sp===0)){
+      lLong.style.width = _lp + '%'; lShort.style.width = _sp + '%';
+      if(lTxt) lTxt.textContent = _lp + '%L / ' + _sp + '%S';
+    } else {
+      lLong.style.width = '50%'; lShort.style.width = '50%';
+      if(lTxt) lTxt.textContent = '—';
+    }
+  }
+  const qEl = document.getElementById('mb-quality');
+  if(qEl) qEl.textContent = (mb && mb.trade_quality) || '—';
+  const rEl = document.getElementById('mb-risk-level');
+  if(rEl){ const _rl = (mb && mb.risk_level) || '—'; rEl.textContent = _rl; rEl.style.color = MB_RISK_COLORS[_rl] || '#e8e8f0'; }
+  // Current Mission checklist + progress.
+  const mission = (mb && mb.mission) || [];
+  const mWrap = document.getElementById('mb-mission-wrap');
+  const mList = document.getElementById('mb-mission');
+  if(mWrap) mWrap.style.display = mission.length ? '' : 'none';
+  if(mList){
+    mList.innerHTML = '';
+    mission.forEach(function(m){
+      const li = document.createElement('li');
+      li.className = 'mb-mission-item' + (m && m.done ? ' done' : '');
+      const bx = document.createElement('span'); bx.className = 'mb-mission-box';
+      bx.textContent = (m && m.done) ? '☑' : '☐';
+      const tx = document.createElement('span'); tx.textContent = (m && m.label) ? m.label : '';
+      li.appendChild(bx); li.appendChild(tx); mList.appendChild(li);
+    });
+  }
+  const _mp = (mb && (mb.mission_progress || mb.mission_progress===0)) ? mb.mission_progress : null;
+  const mFill = document.getElementById('mb-mission-fill'), mPctEl = document.getElementById('mb-mission-pct');
+  if(mFill) mFill.style.width = ((_mp===null ? 0 : _mp)) + '%';
+  if(mPctEl) mPctEl.textContent = (mission.length && _mp!==null) ? (_mp + '%') : '';
+  // Bull / Bear case (read straight from analyst.bull_case / bear_case).
+  const _bull = (mb && mb.bull_case) || [], _bear = (mb && mb.bear_case) || [];
+  _anFill('mb-bull', _bull);
+  _anFill('mb-bear', _bear);
+  const casesEl = document.getElementById('mb-cases');
+  if(casesEl) casesEl.style.display = (_bull.length || _bear.length) ? '' : 'none';
+  // Managing position — richer advisory read (display-only) when a trade is open.
+  const mr = (mb && mb.management_read) || null;
+  const mgWrap = document.getElementById('mb-manage');
+  if(mgWrap){
+    if(mr && mr.status === 'ok'){
+      mgWrap.style.display = '';
+      const _mt = function(id, v){ const e = document.getElementById(id); if(e) e.textContent = v; };
+      _mt('mb-mg-pos', (mr.direction || '?') + ' ' + (mr.contracts!=null ? mr.contracts : '') + ' @ ' + (mr.entry_price!=null ? mr.entry_price : '—'));
+      _mt('mb-mg-r', (mr.current_r!=null ? (mr.current_r + 'R') : '—'));
+      const pnlEl = document.getElementById('mb-mg-pnl');
+      if(pnlEl){
+        pnlEl.textContent = (mr.unrealized_pnl!=null ? ('$' + mr.unrealized_pnl) : '—');
+        if(mr.unrealized_pnl!=null) pnlEl.style.color = (mr.unrealized_pnl >= 0 ? 'var(--green)' : 'var(--red)');
+      }
+      _mt('mb-mg-dist', (mr.dist_to_stop!=null ? mr.dist_to_stop : '—') + ' / ' + (mr.dist_to_target1!=null ? mr.dist_to_target1 : '—'));
+      const recEl = document.getElementById('mb-mg-rec');
+      if(recEl) recEl.textContent = (mr.recommendation ? (mr.recommendation + ' — ') : '') + (mr.recommendation_reason || '');
+      _anFill('mb-mg-watch', (mr.what_invalidates || []).slice(0, 3));
+    } else {
+      mgWrap.style.display = 'none';
+    }
+  }
   const foot = document.getElementById('mb-foot');
   if(foot) foot.textContent = (mb && mb.disclaimer) || '';
-  // Live conversation — append only when the read meaningfully changes (dedup by
-  // status+summary), per symbol. Auto-scroll to newest only on a fresh entry or a
-  // tab switch (so reading scroll-back history is not yanked every poll).
-  const key = status + '|' + summary;
+  // Live conversation — the "What Changed" feed. Diff the server's signals snapshot
+  // per symbol and append a line ONLY when something meaningful transitions (never
+  // the same message every poll). Seed one baseline line on first observation.
   if(!mbFeeds[symKey]) mbFeeds[symKey] = [];
+  const sig = (mb && mb.signals) || {};
+  const prevSig = mbLastSignals[symKey];
   let appended = false;
-  if(mbLastKey[symKey] !== key){
-    mbLastKey[symKey] = key;
+  if(prevSig === undefined){
     mbFeeds[symKey].push({ t: mbNowET(), status: status, text: summary });
-    if(mbFeeds[symKey].length > MB_FEED_MAX) mbFeeds[symKey].splice(0, mbFeeds[symKey].length - MB_FEED_MAX);
     appended = true;
+  } else {
+    mbChangeMessages(prevSig, sig).forEach(function(msg){
+      mbFeeds[symKey].push({ t: mbNowET(), status: status, text: msg });
+      appended = true;
+    });
   }
+  mbLastSignals[symKey] = sig;
+  if(mbFeeds[symKey].length > MB_FEED_MAX) mbFeeds[symKey].splice(0, mbFeeds[symKey].length - MB_FEED_MAX);
   const switched = (mbCurSym !== symKey);
   mbCurSym = symKey;
   mbRenderFeed(symKey, appended || switched);
@@ -25371,7 +25670,16 @@ function mbChatRender(){
     who.className = 'mb-msg-who';
     who.textContent = mine ? 'You' : 'Main Brain';
     const body = document.createElement('div');
-    body.textContent = m.content;
+    if(m._pending){
+      const th = document.createElement('span');
+      th.className = 'mb-think';
+      th.appendChild(document.createElement('span'));
+      th.appendChild(document.createElement('span'));
+      th.appendChild(document.createElement('span'));
+      body.appendChild(th);
+    } else {
+      body.textContent = m.content;
+    }
     wrap.appendChild(who); wrap.appendChild(body);
     log.appendChild(wrap);
   });
@@ -29297,7 +29605,12 @@ def _assistant_answer(data):
         "prices, or signals. If a value is not in the snapshot, say it is not available.\n"
         "- Be concise and practical, and use plain language. When giving an opinion on a specific "
         "trade, add a brief reminder that this is not financial advice.\n"
-        "- If a question is general or educational and unrelated to the live snapshot, just answer it well."
+        "- When you assess the CURRENT live setup or a specific trade, structure your reply with these "
+        "labels, each on its own line: 'Answer:' (your direct call in 1-2 sentences), 'Why:' (the key "
+        "evidence from the snapshot), 'What I need next:' (what would confirm or change the read), and "
+        "'Risk:' (the single biggest thing that would invalidate it).\n"
+        "- If a question is general or educational and unrelated to the live snapshot, just answer it "
+        "well and skip the labelled format."
     )
 
     snapshot_msg = (

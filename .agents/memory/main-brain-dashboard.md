@@ -63,3 +63,41 @@ assistant panel; surfacing it in Main Brain is the partner experience.
 sequence), NEVER from the 3s poll/`renderMainBrain` — the poll touches only the
 specific child ids (badge/summary/lists/feed/foot), never the chat log, so chat
 state survives polls. Keep model output rendered via `textContent` (XSS-safe).
+
+## Command-center upgrade (mission / bias / cases / What-Changed / MANAGING)
+
+The panel was extended into a command center, still STRICTLY display-only. New
+`compute_main_brain` keys are ALL derived from already-assembled reads (never
+recomputed): `mission[]`+`mission_progress` (booleans from vwap side / zone
+presence / structure_label / cvd_state / entry_quality), `confidence_pct`,
+`long_bias_pct`/`short_bias_pct` (lean from `result["directions"][L/S].edge_score`),
+`trade_quality`, `risk_level`, `bull_case[]`/`bear_case[]` (from analyst), and
+`management_read`. EVERY new key must be mirrored in BOTH `_main_brain_neutral()`
+and the main return, or a fail-open/closed-market poll yields `undefined` on the
+wire. The "What-Changed" feed is a CLIENT-side diff of the server `signals{}`
+snapshot — append a line ONLY on a transition; never re-emit on an unchanged poll.
+
+## management_read re-entrancy + mutation rule (the sharp edge)
+
+`compute_main_brain` runs INSIDE `full_analysis`. `management_read` is built by
+calling `compute_manual_trade_management(mirror, analysis=result)`. TWO things
+make this safe and BOTH are mandatory:
+1. **Pass `analysis=result`** — that helper calls `full_analysis()` only when
+   `analysis is None`; omitting it would recurse full_analysis→compute_main_brain
+   →full_analysis.
+2. **Pass a fresh COPY mirror dict**, never the object from `active_trade_for()` —
+   the helper writes `min_r`/`max_r` back onto the dict it's handed; mutating the
+   live `ACTIVE_TRADES_BY_INST` entry would corrupt active-trade state.
+The whole block is wrapped in its own try/except → `management_read=None`, inside
+the outer fail-open that returns `_main_brain_neutral()`.
+**Why:** display-only must never alter live trade state or risk a state-dependent
+500 on the single-return path.
+
+## Known limitation (intentional, not a bug)
+
+The market-closed early return in `compute_main_brain` runs BEFORE the
+active-position check, so a position HELD through the daily halt / weekend shows
+WAIT (closed-market neutral) instead of MANAGING/PAUSED. Left as-is to avoid
+touching the closed-market neutralising override. To change: move the
+active-position management branch ahead of the market-closed early return (and
+lean on compute_manual_trade_management's own `market_open=False`→PAUSED path).

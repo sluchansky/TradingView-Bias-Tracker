@@ -1,0 +1,124 @@
+Direct path:
+
+Do not redesign the dashboard again.
+
+Upgrade the existing Main Brain in this order:
+
+1. Remove “display-only”
+Make Ask the Brain interactive.
+The user should be able to type a question and get an answer using the current live market state.
+
+2. Connect existing outputs
+Do not rebuild logic.
+Feed existing analyst outputs into Main Brain:
+- verdict
+- reason
+- checklist
+- why not ready
+- entry quality
+- trade debate
+- professional review
+- risk notes
+- active trade data
+
+3. Add Current Mission
+Show what the bot is waiting for before READY.
+
+Example:
+Current Mission:
+☑ Above VWAP
+☑ Demand holding
+☐ CHOCH confirmation
+☐ CVD support
+☐ Clean pullback
+
+Mission Progress: 40%
+
+4. Add What Changed
+Only add a new live conversation message when something changes.
+
+Examples:
+- VWAP reclaimed
+- CVD improved
+- Structure flipped bullish
+- Zone mitigated
+- Risk/reward improved
+- Confidence increased
+- Setup invalidated
+
+Do not repeat the same message every refresh.
+
+5. Add confidence and bias
+Show:
+- confidence %
+- long bias %
+- short bias %
+- trade quality grade
+- risk level
+
+Example:
+Confidence: 68%
+Lean: 65% long / 35% short
+Quality: B+
+Risk: Medium
+
+6. Add Bull Case / Bear Case
+Show both sides before any trade decision.
+
+Bull Case:
+- Above VWAP
+- Demand holding
+- CVD improving
+
+Bear Case:
+- Near resistance
+- No BOS yet
+- Volume weak
+
+7. Improve Ask the Brain answers
+When user asks a question, answer in this structure:
+
+Answer:
+Direct answer first.
+
+Why:
+Use live bot data.
+
+What I need next:
+List the exact missing confirmation.
+
+Risk:
+Mention stop/invalidation if relevant.
+
+8. Add manual trade management mode
+When user enters a manual trade, switch Main Brain status to MANAGING.
+
+It should answer:
+- Is my entry good or late?
+- Is my stop logical?
+- Should I hold, reduce, or exit?
+- When should I take partials?
+- When should I move stop to breakeven?
+- What invalidates the trade?
+
+9. Keep supporting panels only
+Final dashboard should mainly have:
+- Main Brain
+- Final Verdict
+- Entry / Stop / Targets
+- Active Trade Management
+- Edge Score
+- Recent Alerts / Journal
+
+Remove or hide duplicate boxes once their info feeds the Main Brain.
+
+Priority order:
+1. Interactive Ask the Brain
+2. Current Mission
+3. What Changed feed
+4. Confidence / Bias
+5. Bull Case / Bear Case
+6. Manual Trade Management
+
+Goal:
+Make the Main Brain the central operating system of the bot, using existing logic, not duplicate logic.

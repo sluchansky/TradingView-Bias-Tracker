@@ -1,0 +1,104 @@
+I want the bot to build deep instrument knowledge for MNQ, MYM, MGC, and MES.
+
+Do not treat all futures the same. Each instrument should have its own personality profile.
+
+Create an Instrument Knowledge Base for each symbol:
+
+1. Contract specs
+- tick size
+- tick value
+- point value
+- normal spread
+- margin info if available
+- session hours
+
+2. Behavior profile
+Track how each instrument usually moves:
+- average ATR
+- average candle size
+- normal pullback size
+- normal breakout size
+- normal stop size
+- best time windows
+- worst time windows
+- choppy periods
+- trend days vs range days
+
+3. Setup performance by symbol
+Track which setups work best for each:
+- VWAP reclaim
+- liquidity sweep
+- CHOCH/BOS
+- FVG retrace
+- supply/demand rejection
+- CVD confirmation
+- opening drive
+- pullback continuation
+- reversal setup
+
+4. Risk model per instrument
+Each symbol needs its own risk rules:
+- minimum realistic stop
+- max stop size
+- preferred R/R
+- ideal target distance
+- ATR-based stop multiplier
+- when to reduce size
+- when to avoid trades
+
+5. Time-of-day behavior
+Track performance separately for:
+- 5:00 AM - 8:00 AM ET
+- 8:00 AM - 11:00 AM ET
+- 8:00 PM - 11:00 PM ET
+- market open
+- lunch chop
+- power hour
+- overnight session
+
+6. Learning from outcomes
+After every trade or rejected setup, save the outcome by symbol.
+
+The bot should learn things like:
+- MNQ needs wider stops than MES
+- MGC respects liquidity sweeps differently
+- MYM may move slower and cleaner
+- MES may confirm broader market direction
+- MNQ may give earlier but noisier signals
+- MGC may need different ATR and volatility thresholds
+
+7. Cross-market awareness
+The bot should compare related markets:
+- MNQ vs MES
+- MYM vs MES
+- MNQ vs MYM
+- MGC independent behavior
+
+Example:
+“If MNQ is bullish but MES is flat and MYM is weak, confidence should be reduced.”
+
+Example:
+“If MES confirms MNQ direction, confidence should increase.”
+
+8. Instrument-specific Main Brain commentary
+Main Brain should explain the symbol differently.
+
+Example:
+“MNQ is moving fast and needs wider risk.”
+“MGC is rejecting supply but gold volatility is elevated.”
+“MYM is cleaner but slower, waiting for confirmation.”
+“MES confirms the broader equity move.”
+
+9. Start with static knowledge, then learn live
+First load known contract specs and default behavior assumptions.
+Then update the profiles using actual alerts, trades, backtests, and journal results.
+
+Important:
+The bot should not blindly overwrite rules.
+It should collect evidence and show recommendations first.
+
+Example:
+“Over the last 20 MNQ trades, stops under 12 points failed 70% of the time. Recommend increasing MNQ minimum stop logic.”
+
+Goal:
+Make the bot treat MNQ, MYM, MGC, and MES like four different markets with different personalities, risk behavior, and setup quality.
