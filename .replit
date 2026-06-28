@@ -172,6 +172,8 @@ channel = "stable-25_05"
 
 [userenv.shared]
 TRADOVATE_ENV = "demo"
+AUTO_TRADE_CONTRACTS = "2"
+MAX_RISK_DOLLARS_PER_TRADE = "100"
 
 [userenv.production]
 DUAL_TF_ENGINE = "0"
