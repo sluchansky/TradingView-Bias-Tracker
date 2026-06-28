@@ -23280,8 +23280,9 @@ PROP_DECISIONS          = deque(maxlen=PROP_DECISIONS_MAX)   # display-only ring
 # Apex Trader Funding presets by account size. Contract limits are expressed in
 # MICRO contracts (1 full = 10 micros; this bot trades micros). EDITABLE by the user
 # after they pick a preset — sensible defaults, not the contract. Apex has NO daily-
-# loss limit and a TRAILING drawdown (Phase 2); Phase 1 enforces the contract /
-# instrument / time rules and shows the trailing drawdown as "not armed until Phase 2".
+# loss limit and a TRAILING drawdown; the guard enforces the contract / instrument /
+# time rules plus static + EOD (end-of-day) trailing drawdown. Intraday trailing stays
+# display-only — the bot has no broker equity feed (only the manual current_balance).
 PROP_APEX_PRESETS = {
     25000:  {"max_contracts_full": 4,  "max_drawdown": 1500,  "profit_target": 1500},
     50000:  {"max_contracts_full": 10, "max_drawdown": 2500,  "profit_target": 3000},
@@ -23316,8 +23317,10 @@ def _prop_default_account(firm="Apex", account_size=50000, name=None):
         "daily_loss_limit":         None,    # Apex: none. Other firms: positive USD magnitude
         "daily_loss_buffer":        0,
         "max_drawdown":             int(preset["max_drawdown"]),
-        "drawdown_type":            "trailing",   # trailing|static|eod (trailing/eod = Phase 2 display-only)
+        "drawdown_type":            "trailing",   # trailing|static|eod (static & EOD enforced; intraday trailing display-only — no broker feed)
         "drawdown_buffer":          100,
+        "eod_high_water":           None,         # bot-managed: highest end-of-day balance seen (EOD trailing floor); never user-edited
+        "eod_hwm_date":             None,         # bot-managed: ET session date ("YYYY-MM-DD") of the last EOD high-water commit
         "allowed_instruments":      [],      # [] => all enabled instruments allowed
         "trading_start_et":         "",      # "HH:MM" ET; "" => no restriction
         "trading_end_et":           "",
@@ -23587,6 +23590,104 @@ def _prop_minutes_to_daily_close_et(now=None):
         return None
 
 
+def _prop_eod_session_key(now=None):
+    """ET date ("YYYY-MM-DD") of the most recently COMPLETED daily futures close
+    (MARKET_CLOSE_HOUR_ET :00 ET). At/after today's close -> today; before it ->
+    yesterday. Used to roll the EOD high-water-mark at most ONCE per trading day.
+    Never raises (returns None on error -> the roll is skipped, leaving the stored
+    value untouched)."""
+    try:
+        et    = (now or now_utc()).astimezone(ET_TZ)
+        close = et.replace(hour=MARKET_CLOSE_HOUR_ET, minute=0, second=0, microsecond=0)
+        if et >= close:
+            return et.strftime("%Y-%m-%d")
+        return (et - timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _prop_apply_eod_roll(acct, now=None):
+    """PURE (no persistence / side-effects): return the EFFECTIVE
+    (eod_high_water, eod_hwm_date) for EOD trailing drawdown.
+
+    The high-water-mark rolls UP at most once per completed trading day — it commits
+    the balance carried into the new session — and NEVER drops. So it tracks the
+    end-of-day peak only, with NO intraday peak (a higher balance saved mid-session
+    does not raise the floor until the session rolls). For non-EOD accounts, or when
+    the balance / size is unknown, it returns the STORED values unchanged. The guard
+    and display both recompute this on the fly, so correctness never depends on the
+    separate persistence helper having run. Never raises."""
+    try:
+        if not isinstance(acct, dict):
+            return (None, None)
+        stored_hwm  = acct.get("eod_high_water")
+        stored_date = acct.get("eod_hwm_date")
+        if (acct.get("drawdown_type") or "").lower() != "eod":
+            return (stored_hwm, stored_date)
+        cur_bal = acct.get("current_balance")
+        size    = acct.get("account_size")
+        if not isinstance(cur_bal, (int, float)) or not isinstance(size, (int, float)):
+            return (stored_hwm, stored_date)
+        sess = _prop_eod_session_key(now)
+        if sess is None:
+            return (stored_hwm, stored_date)
+        if stored_date is None:
+            return (max(float(size), float(cur_bal)), sess)          # arm
+        if stored_date != sess:                                      # roll once per session
+            base_hwm = stored_hwm if isinstance(stored_hwm, (int, float)) else size
+            return (max(float(base_hwm), float(cur_bal)), sess)
+        return (stored_hwm, stored_date)                            # same session => no change
+    except Exception:
+        return (acct.get("eod_high_water") if isinstance(acct, dict) else None,
+                acct.get("eod_hwm_date") if isinstance(acct, dict) else None)
+
+
+def _prop_persist_eod_roll_if_changed(account_id, now=None):
+    """Best-effort DAILY persistence of the EOD high-water roll for ONE account.
+    LIVE instance only (dev must never mutate the shared prop DB). Row-locks the
+    account (SELECT ... FOR UPDATE inside a real transaction — _learning_conn is
+    autocommit, so we flip it OFF here), recomputes the roll from the freshly-locked
+    JSON, and PATCHES only the two bot-managed keys via a jsonb merge (`account ||
+    patch`) so a concurrent user edit of other fields is never clobbered. Idempotent:
+    writes nothing when the roll does not change. The order guard NEVER calls this and
+    never depends on it. Never raises. Lock discipline: takes NO PROP_LOCK itself;
+    _load_prop_accounts_from_db() (which does) runs only AFTER this connection closes."""
+    if not DISCORD_LIVE_ENABLED or not PROP_ACCOUNTS_DB_READY or not account_id:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    changed = False
+    try:
+        conn.autocommit = False                       # need one txn to hold the row lock
+        with conn:                                    # commit on success / rollback on error
+            with conn.cursor() as cur:
+                cur.execute("SELECT account FROM prop_accounts WHERE id=%s FOR UPDATE", (account_id,))
+                row = cur.fetchone()
+                if row:
+                    acct = dict(row[0] or {})
+                    if (acct.get("drawdown_type") or "").lower() == "eod":
+                        eff_hwm, eff_date = _prop_apply_eod_roll(acct, now)
+                        if eff_hwm is not None and not (
+                                eff_hwm  == acct.get("eod_high_water")
+                                and eff_date == acct.get("eod_hwm_date")):
+                            cur.execute(
+                                "UPDATE prop_accounts SET account = account || %s::jsonb, "
+                                "updated_at = now() WHERE id=%s",
+                                (psycopg2.extras.Json({"eod_high_water": eff_hwm,
+                                                       "eod_hwm_date":   eff_date}), account_id))
+                            changed = True
+    except Exception as exc:
+        try: logger.warning("prop EOD HWM persist failed: %s", exc)
+        except Exception: pass
+    finally:
+        try: conn.close()
+        except Exception: pass
+    if changed:
+        try: _load_prop_accounts_from_db()
+        except Exception: pass
+
+
 def _prop_account_summary(acct):
     """Compact, display-safe view of an account for status / log / panel."""
     if not isinstance(acct, dict):
@@ -23700,7 +23801,7 @@ def _prop_eval_rules(acct, instrument, direction, contracts, entry, stop, live, 
     else:
         add("Daily loss limit", "skip", "no daily-loss limit set")
 
-    # 4. Drawdown (static enforced; trailing/eod = Phase 2 display-only)
+    # 4. Drawdown (static + EOD enforced; intraday trailing = display-only, no broker feed)
     mdd   = acct.get("max_drawdown")
     dtype = (acct.get("drawdown_type") or "trailing").lower()
     if isinstance(mdd, (int, float)) and mdd > 0:
@@ -23724,10 +23825,32 @@ def _prop_eval_rules(acct, instrument, direction, contracts, entry, stop, live, 
                     add("Static drawdown", "block", "$%.0f < $%.0f" % (projected, floor))
                 else:
                     add("Static drawdown", "pass", "$%.0f >= $%.0f" % (projected, floor))
+        elif dtype == "eod":
+            cur_bal = acct.get("current_balance")
+            size    = acct.get("account_size")
+            ddbuf   = acct.get("drawdown_buffer") or 0
+            if not isinstance(cur_bal, (int, float)) or not isinstance(size, (int, float)):
+                reasons.append("EOD trailing drawdown is configured but the current balance is not set "
+                               "(enter it to arm this rule).")
+                add("EOD drawdown", "block", "current balance missing")
+            elif worst is None:
+                reasons.append("Cannot verify the EOD drawdown floor (order risk unknown).")
+                add("EOD drawdown", "block", "order risk unknown")
+            else:
+                eff_hwm, _ = _prop_apply_eod_roll(acct, now)
+                hwm       = float(eff_hwm if eff_hwm is not None else size)
+                floor     = min(hwm - float(mdd), float(size)) + float(ddbuf)
+                projected = float(cur_bal) - float(worst)
+                if projected < floor:
+                    reasons.append("Worst-case balance $%.0f would breach the EOD trailing floor $%.0f "
+                                   "(end-of-day peak $%.0f)." % (projected, floor, hwm))
+                    add("EOD drawdown", "block", "$%.0f < $%.0f" % (projected, floor))
+                else:
+                    add("EOD drawdown", "pass", "$%.0f >= $%.0f (peak $%.0f)" % (projected, floor, hwm))
         else:
-            phase2.append("%s drawdown ($%d) — not armed until Phase 2 (needs live equity / "
-                          "high-water-mark tracking)." % (dtype.title(), int(mdd)))
-            add("Trailing drawdown", "skip", "Phase 2 — not enforced yet")
+            phase2.append("Intraday trailing drawdown ($%d) — needs a live broker equity feed; "
+                          "switch this account to EOD to arm a daily trailing floor." % int(mdd))
+            add("Trailing drawdown", "skip", "intraday needs live feed — use EOD")
     else:
         add("Drawdown", "skip", "no drawdown set")
 
@@ -23923,6 +24046,13 @@ def prop_firm_status_view():
     if acct is None:
         base["headline"] = "Protection ON but NO active account — every LIVE order will be blocked."
         return base
+    # Daily EOD high-water roll (LIVE instance only; idempotent + best-effort). The
+    # guard always recomputes the effective HWM on the fly, so this only PERSISTS the
+    # roll across restarts — it never affects the money-path decision.
+    try:
+        _prop_persist_eod_roll_if_changed(acct.get("id"), now_utc())
+    except Exception:
+        pass
     try:
         realized = 0.0
         for ei in enabled_instruments():
@@ -23948,9 +24078,23 @@ def prop_firm_status_view():
             else:
                 base["phase2"].append("Static drawdown set but current balance missing — "
                                       "LIVE orders block until you enter it.")
+        elif dtype == "eod":
+            cur_bal = acct.get("current_balance")
+            size    = acct.get("account_size")
+            if isinstance(cur_bal, (int, float)) and isinstance(size, (int, float)):
+                eff_hwm, _ = _prop_apply_eod_roll(acct, now_utc())
+                hwm   = float(eff_hwm if eff_hwm is not None else size)
+                floor = min(hwm - float(mdd), float(size)) + float(acct.get("drawdown_buffer") or 0)
+                metrics["drawdown_floor"]     = floor
+                metrics["drawdown_remaining"] = float(cur_bal) - floor
+                metrics["eod_high_water"]     = hwm
+            else:
+                base["phase2"].append("EOD trailing drawdown set but current balance missing — "
+                                      "LIVE orders block until you enter it.")
         else:
-            base["phase2"].append("%s drawdown ($%d) — display only; not armed until Phase 2."
-                                  % (dtype.title(), int(mdd)))
+            base["phase2"].append("Intraday trailing drawdown ($%d) — display only; needs a live "
+                                  "broker feed. Switch this account to EOD to arm a daily floor."
+                                  % int(mdd))
     open_c = 0
     try:
         for t in active_trade_snapshot().values():
@@ -27911,12 +28055,12 @@ function renderPropEditor(a){
    +propField('Name','text','pe-name',a.name)
    +propField('Firm','text','pe-firm',a.firm)
    +propField('Account size ($)','number','pe-size',a.account_size)
-   +propField('Current balance ($, for static DD)','number','pe-bal',a.current_balance)
+   +propField('Current balance ($, for static / EOD DD)','number','pe-bal',a.current_balance)
    +propField('Max contracts (micros)','number','pe-maxc',a.max_contracts)
    +propField('Daily loss limit ($, blank=none)','number','pe-dll',a.daily_loss_limit)
    +propField('Daily loss buffer ($)','number','pe-dlb',a.daily_loss_buffer)
    +propField('Max drawdown ($)','number','pe-mdd',a.max_drawdown)
-   +propSelectField('Drawdown type','pe-ddt',[['trailing','trailing (Phase 2)'],['static','static (enforced)'],['eod','eod (Phase 2)']],(a.drawdown_type||'trailing'))
+   +propSelectField('Drawdown type','pe-ddt',[['trailing','trailing (intraday — needs live feed)'],['static','static (enforced)'],['eod','eod (end-of-day — enforced)']],(a.drawdown_type||'trailing'))
    +propField('Drawdown buffer ($)','number','pe-ddb',a.drawdown_buffer)
    +propField('Allowed instruments (blank=all)','text','pe-ai',ai)
    +propField('Trading start ET (HH:MM)','text','pe-ts',a.trading_start_et)
