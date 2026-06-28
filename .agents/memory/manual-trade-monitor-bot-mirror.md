@@ -32,3 +32,12 @@ are unchanged (`ORIG_UNMUTATED`).
 **Known gap:** SCALP paper-dynamic trades live in `MANAGED_TRADES_BY_KEY` and
 skip `ACTIVE_TRADE`, so they are NOT mirrored here yet (acceptable; mirror them
 the same copy-first way if needed).
+
+**Where it surfaces now:** the standalone bottom "Manual Trade Manager" box was
+removed; the bot-position mirror is re-homed into the Main Brain panel as a
+display-only "Bot's live positions" section (`#mb-bot`) that simply re-reads the
+SAME `GET /manual-trade` (filtering rows to `origin==='bot' || advisory_mirror`)
+on the existing 3s dashboard poll. No backend change was needed to re-home it —
+the endpoint already returns the bot rows. **Lesson:** "show the bot's live
+positions somewhere" is a pure frontend re-read of `/manual-trade`; never build a
+parallel bot-position feed (it would duplicate state / risk a second money path).

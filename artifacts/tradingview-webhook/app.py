@@ -25069,6 +25069,14 @@ def dashboard():
   .mb-mc-v{font-size:13px;font-weight:700;color:#e8e8f0}
   .mb-mg-rec{font-size:12px;color:#e8e8f0;margin:2px 0 6px;line-height:1.5;font-weight:600}
   .mb-act-pill{display:inline-block;font-size:10px;font-weight:800;letter-spacing:.5px;color:#0b0b14;padding:2px 8px;border-radius:10px;margin-right:6px;vertical-align:middle}
+  .mb-bot{background:var(--inset);border:1px solid var(--border);border-left:2px solid #38bdf8;border-radius:4px;padding:10px;margin-bottom:12px}
+  .mb-bot-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#9fd8ff;font-weight:700;margin-bottom:8px}
+  .mb-bot-card{border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;margin-bottom:8px}
+  .mb-bot-card:last-child{margin-bottom:0}
+  .mb-bot-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:7px}
+  .mb-bot-badge{font-size:9px;font-weight:800;letter-spacing:1px;background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560;border-radius:3px;padding:1px 6px}
+  .mb-bot-sym{font-size:13px;font-weight:700;color:#e8e8f0}
+  .mb-bot-dir{font-size:11px;font-weight:700}
   .mb-mt{background:var(--inset);border:1px solid var(--border);border-left:2px solid #38bdf8;border-radius:4px;margin-bottom:12px}
   .mb-mt-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#9fd8ff;font-weight:700;padding:9px 10px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
   .mb-mt-body{padding:0 10px 10px}
@@ -25557,6 +25565,10 @@ def dashboard():
       </div>
       <div class="mb-mg-rec" id="mb-mg-rec"></div>
       <ul class="mb-list" id="mb-mg-watch"></ul>
+    </div>
+    <div class="mb-bot" id="mb-bot" style="display:none">
+      <div class="mb-bot-h">🤖 Bot's live positions</div>
+      <div id="mb-bot-list"></div>
     </div>
     <div class="mb-tl" id="mb-tl" style="display:none">
       <div class="mb-tl-h">🕒 Trade timeline</div>
@@ -30524,7 +30536,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -30814,6 +30826,61 @@ function mbActColor(a, inv){
   if(a==='MOVE STOP TO BE' || a==='MOVE STOP') return '#3b82f6';
   return '#22c55e';
 }
+// Bot's live positions (display-only). Reuses the read-only /manual-trade GET, which
+// already mirrors the bot's OWN open auto-executed positions as advisory rows tagged
+// origin:'bot' (advisory_mirror). NEVER a money path: no order, no journal, no learning,
+// no dedupe — a row appears while a position is open and clears once the bot closes it.
+function _botCell(label, val){
+  return '<div><div class="mb-mc-l">' + aiEsc(label) + '</div><div class="mb-mc-v">' + aiEsc(val) + '</div></div>';
+}
+function renderBotPositions(rows){
+  var wrap = document.getElementById('mb-bot');
+  var list = document.getElementById('mb-bot-list');
+  if(!wrap || !list) return;
+  rows = rows || [];
+  if(!rows.length){ wrap.style.display = 'none'; list.innerHTML = ''; return; }
+  wrap.style.display = '';
+  list.innerHTML = rows.map(function(r){
+    var dir = r.direction || '?';
+    var isLong = String(dir).toLowerCase().charAt(0) === 'l';
+    var dirCol = isLong ? 'var(--green)' : 'var(--red)';
+    var ct = (r.contracts != null) ? r.contracts : '';
+    var entry = (r.entry_price != null) ? r.entry_price : '—';
+    var rv = (r.current_r != null) ? (r.current_r + 'R') : '—';
+    var pnl = (r.unrealized_pnl != null) ? ('$' + r.unrealized_pnl) : '—';
+    var pnlCol = (r.unrealized_pnl != null && r.unrealized_pnl < 0) ? 'var(--red)' : 'var(--green)';
+    var stop = (r.stop_loss != null) ? r.stop_loss : '—';
+    var t1 = (r.target1 != null) ? r.target1 : '—';
+    var act = r.action || r.recommendation || '';
+    var why = r.recommendation_reason || '';
+    var head = '<div class="mb-bot-top">'
+      + '<span class="mb-bot-badge">🤖 BOT</span>'
+      + '<span class="mb-bot-sym">' + aiEsc(r.symbol || '—') + '</span>'
+      + '<span class="mb-bot-dir" style="color:' + dirCol + '">' + aiEsc(dir) + ' ' + aiEsc(ct) + ' @ ' + aiEsc(entry) + '</span>'
+      + '</div>';
+    var grid = '<div class="mb-manage-grid">'
+      + _botCell('Open R', rv)
+      + '<div><div class="mb-mc-l">Unrealized</div><div class="mb-mc-v" style="color:' + pnlCol + '">' + aiEsc(pnl) + '</div></div>'
+      + _botCell('Stop', stop)
+      + _botCell('Target 1', t1)
+      + '</div>';
+    var rec = '';
+    if(act){
+      rec = '<div class="mb-mg-rec"><span class="mb-act-pill" style="background:' + mbActColor(act, r.invalidated) + '">' + aiEsc(act) + '</span>' + aiEsc(why) + '</div>';
+    } else if(why){
+      rec = '<div class="mb-mg-rec">' + aiEsc(why) + '</div>';
+    }
+    return '<div class="mb-bot-card">' + head + grid + rec + '</div>';
+  }).join('');
+}
+async function loadBotPositions(){
+  try{
+    var d = await api('/manual-trade');
+    var rows = (d && d.trades) || [];
+    var bots = rows.filter(function(r){ return r && (r.origin === 'bot' || r.advisory_mirror); });
+    renderBotPositions(bots);
+  }catch(e){ /* fail-open: keep last painted state */ }
+}
 function mbmtToggle(){
   var b=document.getElementById('mbmt-body'), c=document.getElementById('mbmt-caret');
   if(!b) return;
@@ -30852,7 +30919,7 @@ async function mbmtAdd(){
   finally{ if(btn){ btn.disabled=false; btn.textContent=prev; } }
 }
 
-setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); }, 3000);
+setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); }, 3000);
 setInterval(checkStale, 2000);
 </script>
 </body>
