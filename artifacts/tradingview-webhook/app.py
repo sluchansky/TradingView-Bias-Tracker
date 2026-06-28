@@ -23785,32 +23785,69 @@ def _prop_eval_rules(acct, instrument, direction, contracts, entry, stop, live, 
     else:
         add("News proximity", "skip", "no news rule set")
 
-    # 7. Overnight / flatten-before-close
+    # 7a. Overnight / weekend holding prohibition (fail-CLOSED).
+    # This bot has NO auto-flatten / broker exit executor (exits are manual or via the
+    # broker's own TP/SL — see the "no broker exit path exists by design" note), so
+    # when the active account forbids overnight or weekend holds the guard CANNOT
+    # silently assume a new live position will be flat before the session boundary. The
+    # previous logic only ever blocked when a flatten window was set (fbc > 0), so
+    # disabling overnight holds while leaving the window at 0 — a valid config in this
+    # UI — passed every order (false safety). The prohibition is now enforced
+    # INDEPENDENT of the flatten window:
+    #   • restricted + no flatten window configured  -> BLOCK (required bound missing)
+    #   • restricted + past the daily close / market-hours disabled (mtc is None, i.e.
+    #     the Globex evening/overnight session)       -> BLOCK (entry would hold over)
+    #   • restricted + inside the flatten window      -> BLOCK (too late to open fresh)
+    #   • restricted + intraday, outside the window   -> pass (the user-declared flatten
+    #     discipline bounds the risk; an actual auto-flatten executor is Phase 2)
+    # Weekend restriction applies to Friday entries (would carry over the weekend);
+    # overnight restriction applies to every session.
     allow_on = acct.get("allow_overnight", True)
     allow_we = acct.get("allow_weekend", True)
     fbc      = acct.get("flatten_before_close_min")
-    if (not allow_on) or (not allow_we) or (isinstance(fbc, (int, float)) and fbc > 0):
+    win      = int(fbc) if isinstance(fbc, (int, float)) and fbc > 0 else 0
+    et       = now.astimezone(ET_TZ)
+    restrict_on = (not allow_on)
+    restrict_we = (not allow_we) and et.weekday() == 4   # Fri entry would hold the weekend
+    if restrict_on or restrict_we:
+        scope = ("Overnight holds not allowed" if restrict_on
+                 else "Weekend holds not allowed (Friday entry)")
         mtc = _prop_minutes_to_daily_close_et(now)
-        win = int(fbc) if isinstance(fbc, (int, float)) and fbc > 0 else 0
-        et  = now.astimezone(ET_TZ)
-        triggered, why = False, ""
-        if mtc is not None and win > 0 and 0 <= mtc <= win:
-            triggered = True
-            why = "%d min to the %d:00 ET close (flatten window %d min)" % (mtc, MARKET_CLOSE_HOUR_ET, win)
-        if (not allow_we) and et.weekday() == 4 and mtc is not None and win > 0 and 0 <= mtc <= win:
-            triggered = True
-            why = "would hold over the weekend (no weekend holds allowed)"
-        if triggered:
-            if (not allow_on) or (not allow_we):
-                reasons.append("Overnight/weekend hold not allowed — %s." % why)
-                add("Overnight / flatten", "block", why)
-            else:
-                warnings.append("Close approaching — %s." % why)
-                add("Overnight / flatten", "warn", why)
+        if win <= 0:
+            reasons.append("%s and no flatten-before-close window is set to bound the "
+                           "risk — blocked (fail-closed)." % scope)
+            add("Overnight / weekend", "block", "%s; no flatten window set" % scope)
+        elif mtc is None:
+            reasons.append("%s and the daily close has passed (overnight session) — a "
+                           "new entry would be held over; blocked." % scope)
+            add("Overnight / weekend", "block", "%s; past the daily close" % scope)
+        elif 0 <= mtc <= win:
+            why = "%d min to the %d:00 ET close (inside the %d-min flatten window)" % (
+                mtc, MARKET_CLOSE_HOUR_ET, win)
+            reasons.append("%s — %s; blocked." % (scope, why))
+            add("Overnight / weekend", "block", why)
         else:
-            add("Overnight / flatten", "pass", "not near the close")
+            add("Overnight / weekend", "pass",
+                "intraday, outside the %d-min flatten window" % win)
     else:
-        add("Overnight / flatten", "skip", "no overnight/flatten rule set")
+        add("Overnight / weekend", "skip", "overnight & weekend holds allowed")
+
+    # 7b. Flatten-before-close near-close guard (independent additive rule). Applies
+    # only when overnight/weekend holds ARE allowed (otherwise 7a already owns the
+    # window semantics): a configured flatten window warns as the daily close
+    # approaches so the operator can manage the open position.
+    if not (restrict_on or restrict_we):
+        if win > 0:
+            mtc = _prop_minutes_to_daily_close_et(now)
+            if mtc is not None and 0 <= mtc <= win:
+                why = "%d min to the %d:00 ET close (flatten window %d min)" % (
+                    mtc, MARKET_CLOSE_HOUR_ET, win)
+                warnings.append("Close approaching — %s." % why)
+                add("Flatten before close", "warn", why)
+            else:
+                add("Flatten before close", "pass", "not near the close")
+        else:
+            add("Flatten before close", "skip", "no flatten-before-close window set")
 
     decision = "block" if reasons else ("warn" if warnings else "allow")
     return {
