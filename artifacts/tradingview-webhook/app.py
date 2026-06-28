@@ -13158,7 +13158,12 @@ def compute_main_brain(result):
             return nb
 
         inst       = instrument_of(result.get("active_ticker"))
-        pos        = active_trade_for(inst) if inst else None
+        # A user-entered manual trade takes priority over the bot's own active trade
+        # for this instrument: it is the explicit position the user asked the copilot
+        # to manage. Falls back to the bot's live position when none exists.
+        manual_pos = _newest_manual_trade_for(inst) if inst else None
+        pos        = manual_pos or (active_trade_for(inst) if inst else None)
+        pos_is_manual = manual_pos is not None
         verdict    = result.get("verdict") or ""
         actionable = is_actionable(verdict)
 
@@ -13359,7 +13364,7 @@ def compute_main_brain(result):
         if managing and isinstance(pos, dict):
             try:
                 _mr_mirror = {
-                    "id":          "mb-%s" % (inst or "pos"),
+                    "id":          pos.get("id") or ("mb-%s" % (inst or "pos")),
                     "symbol":      pos.get("symbol") or inst,
                     "direction":   pos.get("direction", "Long"),
                     "entry_price": (pos.get("entry_price") if pos.get("entry_price") is not None
@@ -13371,12 +13376,19 @@ def compute_main_brain(result):
                     "target3":     pos.get("target3"),
                     "contracts":   pos.get("contracts"),
                     "mode":        pos.get("mode") or TRADING_MODE,
-                    "reason":      "",
-                    "entry_time":  pos.get("opened_at") or None,
+                    "reason":      (pos.get("reason") or "") if pos_is_manual else "",
+                    "entry_time":  ((pos.get("entry_time") or pos.get("opened_at"))
+                                    if pos_is_manual else pos.get("opened_at")) or None,
                     "opened_at":   pos.get("opened_at") or now_utc().isoformat(),
                     "status":      "open",
                 }
                 management_read = compute_manual_trade_management(_mr_mirror, analysis=result)
+                if management_read is not None:
+                    # Tag the source so the UI can label a user trade vs the bot's own,
+                    # and surface the stored copilot timeline for a manual position.
+                    management_read["origin"] = "manual" if pos_is_manual else "bot"
+                    if pos_is_manual:
+                        management_read["timeline"] = list(pos.get("timeline") or [])
             except Exception:
                 management_read = None
 
@@ -18296,6 +18308,8 @@ def compute_manual_trade_management(trade, analysis=None):
         out["status"]                = "unavailable"
         out["thesis_status"]         = "UNKNOWN"
         out["recommendation"]        = "MONITOR"
+        out["action"]                = "MONITOR"
+        out["invalidated"]           = False
         out["recommendation_reason"] = (
             f"No live price for {symbol} right now — monitoring paused (no guidance fabricated)."
             if price is None else "Entry and stop are equal — cannot compute risk."
@@ -18442,6 +18456,31 @@ def compute_manual_trade_management(trade, analysis=None):
     out["recommendation"]        = rec
     out["recommendation_reason"] = why
 
+    # ── Canonical advisory ACTION (display-only copilot verb) ──────────────────
+    # Maps the existing state booleans onto the fixed action vocabulary the Main Brain
+    # copilot surfaces: HOLD / REDUCE / TAKE PARTIAL / MOVE STOP TO BE / EXIT. This is
+    # ADDITIVE — `recommendation` / `recommendation_reason` above are left untouched so
+    # the legacy Manual Trade Manager card stays byte-stable. `invalidated` is True only
+    # when the thesis is broken (stop hit or confirmed structure flip); a market-closed
+    # PAUSE never invalidates a held position.
+    at_be = _stop_at_or_past_be(direction, stop, entry)
+    if thesis == "PAUSED":
+        action_v, invalid_v = "HOLD", False
+    elif stop_breached or opposite_confirmed:
+        action_v, invalid_v = "EXIT", True
+    elif t3_hit or t2_hit:
+        action_v, invalid_v = "REDUCE", False
+    elif t1_hit and not at_be:
+        action_v, invalid_v = "TAKE PARTIAL", False
+    elif current_r >= 1.0 and not at_be:
+        action_v, invalid_v = "MOVE STOP TO BE", False
+    elif thesis == "WEAKENING" and (near_stop or current_r <= -0.5):
+        action_v, invalid_v = "REDUCE", False
+    else:
+        action_v, invalid_v = "HOLD", False
+    out["action"]      = action_v
+    out["invalidated"] = invalid_v
+
     # ── What would improve / invalidate the thesis ──
     improves, invalidates = [], []
     if is_long:
@@ -18479,6 +18518,125 @@ def compute_manual_trade_management(trade, analysis=None):
         out["entry_assessment"] = (f"Currently offside at {current_r:.1f}R (worst {min_r:.1f}R). Hold only while "
                                    f"your stop and thesis are intact.")
     return out
+
+
+# ── Manual-trade management TIMELINE (advisory / display-only) ────────────────
+# A timestamped copilot log stored INSIDE the trade's JSONB payload (trade["timeline"]
+# + trade["_tl_flags"] for idempotency) — NO schema change, NO DDL. Each milestone
+# fires exactly once. This NEVER touches the gate / sizing / dedupe / broker path; it
+# only annotates a manually-entered position. SINGLE WRITER: only call the updater on
+# the STORED MANUAL_TRADES object under MANUAL_TRADES_LOCK (never a throwaway copy),
+# and persist only when it reports a change.
+_MANUAL_TIMELINE_MAX = 80
+
+def _manual_tl_event(trade, code, text, fire_once=True):
+    """Append one timeline event to `trade` IN PLACE. Idempotent per `code` when
+    fire_once. Returns True iff a new event was appended. DISPLAY-ONLY."""
+    if not isinstance(trade, dict):
+        return False
+    flags = trade.setdefault("_tl_flags", {})
+    if fire_once and flags.get(code):
+        return False
+    tl  = trade.setdefault("timeline", [])
+    now = now_utc()
+    tl.append({
+        "t":    now.isoformat(),
+        "t_et": fmt_et(now.isoformat(), fmt="%H:%M"),
+        "code": code,
+        "text": text,
+    })
+    if len(tl) > _MANUAL_TIMELINE_MAX:
+        del tl[:len(tl) - _MANUAL_TIMELINE_MAX]
+    if fire_once:
+        flags[code] = True
+    return True
+
+def _update_manual_trade_timeline(trade, mgmt):
+    """Append milestone events (entry, +R moves, TP1/2/3, move-to-BE, weakening,
+    invalidated) to a manual trade's timeline, each ONCE, from a management read.
+    Returns True iff anything changed (so the caller persists only on change). Must be
+    called on the STORED trade under MANUAL_TRADES_LOCK. DISPLAY-ONLY / fail-open."""
+    if not isinstance(trade, dict) or not isinstance(mgmt, dict):
+        return False
+    changed  = False
+    sym      = trade.get("symbol") or "?"
+    dir_word = (trade.get("direction") or "").lower() or "trade"
+
+    # 1) Entry — always the first line of the log.
+    if not trade.get("timeline"):
+        ep = trade.get("entry_price")
+        changed |= _manual_tl_event(
+            trade, "entered",
+            "Entered %s %s at %s" % (dir_word, sym, _manual_px(ep)))
+
+    if mgmt.get("status") != "ok":
+        return changed
+
+    cr  = mgmt.get("current_r")
+    pts = mgmt.get("unrealized_points")
+
+    # 2) Favorable R milestones (each fires once) + one adverse pullback marker.
+    if isinstance(cr, (int, float)):
+        for thr, code in ((0.5, "r_up_0_5"), (1.0, "r_up_1"),
+                          (2.0, "r_up_2"), (3.0, "r_up_3")):
+            if cr >= thr:
+                ptxt = ((" (+%s pts)" % _manual_px(pts))
+                        if isinstance(pts, (int, float)) and pts > 0 else "")
+                changed |= _manual_tl_event(
+                    trade, code, "Price moved +%.1fR in your favor%s" % (thr, ptxt))
+        if cr <= -0.5:
+            changed |= _manual_tl_event(
+                trade, "r_dn_0_5", "Price pulled back to -0.5R against you")
+
+    # 3) Target / breakeven milestones.
+    if mgmt.get("target1_hit"):
+        changed |= _manual_tl_event(trade, "tp1", "TP1 reached — take partial")
+    if mgmt.get("target2_hit"):
+        changed |= _manual_tl_event(trade, "tp2", "TP2 reached — scale out / trail stop")
+    if mgmt.get("target3_hit"):
+        changed |= _manual_tl_event(trade, "tp3", "TP3 reached — final target")
+    if (isinstance(cr, (int, float)) and cr >= 1.0
+            and not _stop_at_or_past_be(trade.get("direction") or "Long",
+                                        trade.get("stop_loss"),
+                                        trade.get("entry_price"))):
+        changed |= _manual_tl_event(trade, "move_be", "Up 1R — move stop to breakeven")
+
+    # 4) Thesis transitions.
+    th = mgmt.get("thesis_status")
+    if th == "WEAKENING":
+        changed |= _manual_tl_event(
+            trade, "weakening", "Momentum weakening — consider reducing risk")
+    if mgmt.get("invalidated") or th == "INVALID" or mgmt.get("stop_breached"):
+        changed |= _manual_tl_event(
+            trade, "invalidated", "Thesis invalidated — exit per your plan")
+
+    return changed
+
+
+def _newest_manual_trade_for(inst):
+    """Return a COPY of the newest OPEN manually-entered trade for `inst` (or None).
+
+    Used by the Main Brain so a user-entered position turns the brain into a live
+    copilot. Returns a shallow copy so callers never mutate the stored trade (the
+    shared `timeline` list is read-only at the call site). DISPLAY-ONLY / fail-open."""
+    if not inst:
+        return None
+    best = None
+    try:
+        with MANUAL_TRADES_LOCK:
+            for t in MANUAL_TRADES.values():
+                if instrument_of(t.get("symbol")) != inst:
+                    continue
+                status = t.get("status")
+                if status and status != "open":
+                    continue
+                if best is None or (t.get("opened_at") or "") > (best.get("opened_at") or ""):
+                    best = t
+            if best is not None:
+                best = dict(best)
+    except Exception:
+        best = None
+    return best
 
 
 def _bot_active_trade_monitor_items(analysis_cache):
@@ -18546,11 +18704,16 @@ def manual_trade():
             return jsonify({"status": "error", "reason": err}), 400
         with MANUAL_TRADES_LOCK:
             MANUAL_TRADES[trade["id"]] = trade
+            # Seed the management timeline with the entry event immediately so the
+            # copilot log starts the moment the trade is logged (display-only).
+            _update_manual_trade_timeline(trade, {})
         _persist_manual_trade(trade)
         logger.info("Manual trade added (advisory-only): %s %s @ %.2f",
                     trade["symbol"], trade["direction"], trade["entry_price"])
+        _added_row = compute_manual_trade_management(trade)
+        _added_row["timeline"] = list(trade.get("timeline") or [])
         return jsonify({"status": "added", "id": trade["id"],
-                        "trade": compute_manual_trade_management(trade)}), 200
+                        "trade": _added_row}), 200
 
     # GET — list open manual trades with live advisory guidance. full_analysis is
     # computed ONCE per distinct symbol then fanned out across that symbol's trades.
@@ -18568,6 +18731,14 @@ def manual_trade():
                     analysis_cache[sym] = None
             _row = compute_manual_trade_management(t, analysis=analysis_cache[sym])
             _row["origin"] = "manual"
+            # Advance the copilot timeline on the STORED trade (single writer, under
+            # lock) and persist only when a new milestone fired. Display-only.
+            try:
+                if _update_manual_trade_timeline(t, _row):
+                    _persist_manual_trade(t)
+            except Exception as exc:
+                logger.warning("manual-trade timeline update failed for %s: %s", sym, exc)
+            _row["timeline"] = list(t.get("timeline") or [])
             items.append(_row)
     # ADVISORY DISPLAY-ONLY: also surface the bot's own OPEN positions so an
     # auto-executed (or manually-entered) order shows up in this monitor box
@@ -23265,6 +23436,21 @@ def dashboard():
   .mb-mc-l{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700;margin-bottom:3px}
   .mb-mc-v{font-size:13px;font-weight:700;color:#e8e8f0}
   .mb-mg-rec{font-size:12px;color:#e8e8f0;margin:2px 0 6px;line-height:1.5;font-weight:600}
+  .mb-act-pill{display:inline-block;font-size:10px;font-weight:800;letter-spacing:.5px;color:#0b0b14;padding:2px 8px;border-radius:10px;margin-right:6px;vertical-align:middle}
+  .mb-mt{background:var(--inset);border:1px solid var(--border);border-left:2px solid #38bdf8;border-radius:4px;margin-bottom:12px}
+  .mb-mt-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#9fd8ff;font-weight:700;padding:9px 10px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+  .mb-mt-body{padding:0 10px 10px}
+  .mb-mt-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:7px}
+  .mb-mt-f label{display:block;font-size:9px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:700;margin-bottom:2px}
+  .mb-mt-f input,.mb-mt-f select{width:100%;box-sizing:border-box;background:#0d0d18;border:1px solid var(--border);border-radius:3px;color:#e8e8f0;font-size:12px;padding:4px 6px}
+  .mb-mt-btn{width:100%;margin-top:8px;background:#06303d;color:#7fe9f5;border:1px solid #2a5560;border-radius:4px;padding:7px;font-size:12px;font-weight:700;cursor:pointer}
+  .mb-mt-msg{font-size:11px;margin-top:6px;min-height:14px}
+  .mb-tl{background:var(--inset);border:1px solid var(--border);border-left:2px solid #22c55e;border-radius:4px;padding:10px;margin-bottom:12px}
+  .mb-tl-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#9ff0c2;font-weight:700;margin-bottom:8px}
+  .mb-tl-list{list-style:none;margin:0;padding:0;max-height:220px;overflow-y:auto}
+  .mb-tl-list li{font-size:12px;color:#d7d7e2;line-height:1.5;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+  .mb-tl-t{display:inline-block;min-width:42px;color:#7fe9b0;font-weight:700;font-variant-numeric:tabular-nums}
+  @media(max-width:720px){.mb-mt-grid{grid-template-columns:1fr 1fr}}
   .mb-think{display:inline-flex;gap:3px;align-items:center}
   .mb-think span{width:5px;height:5px;border-radius:50%;background:#cbb6ff;display:inline-block;animation:mbBlink 1.4s infinite both}
   .mb-think span:nth-child(2){animation-delay:.2s}
@@ -23641,6 +23827,26 @@ def dashboard():
       <div class="mb-case mb-case-bull"><div class="mb-case-h">🐂 Bull Case</div><ul id="mb-bull" class="mb-list"></ul></div>
       <div class="mb-case mb-case-bear"><div class="mb-case-h">🐻 Bear Case</div><ul id="mb-bear" class="mb-list"></ul></div>
     </div>
+    <!-- Manual Trade Management Mode — log a trade and the brain becomes your live
+         copilot. ADVISORY / DISPLAY-ONLY: never sends or closes a broker order. -->
+    <div class="mb-mt" id="mb-mt">
+      <div class="mb-mt-h" onclick="mbmtToggle()"><span>🧭 Manage a manual trade — advisory, never places orders</span><span id="mbmt-caret">▸</span></div>
+      <div class="mb-mt-body" id="mbmt-body" style="display:none">
+        <div class="mb-mt-grid">
+          <div class="mb-mt-f"><label>Symbol</label><select id="mbmt-symbol"><option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option></select></div>
+          <div class="mb-mt-f"><label>Direction</label><select id="mbmt-dir"><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></div>
+          <div class="mb-mt-f"><label>Mode</label><select id="mbmt-mode"><option>SCALP</option><option>SWING</option></select></div>
+          <div class="mb-mt-f"><label>Position size</label><input id="mbmt-contracts" type="number" step="1" min="1" value="1"></div>
+          <div class="mb-mt-f"><label>Entry</label><input id="mbmt-entry" type="number" step="0.1"></div>
+          <div class="mb-mt-f"><label>Stop</label><input id="mbmt-stop" type="number" step="0.1"></div>
+          <div class="mb-mt-f"><label>TP1</label><input id="mbmt-t1" type="number" step="0.1"></div>
+          <div class="mb-mt-f"><label>TP2</label><input id="mbmt-t2" type="number" step="0.1"></div>
+        </div>
+        <div class="mb-mt-f"><label>Trade reason / thesis (opt)</label><input id="mbmt-reason" type="text" placeholder="why you took this trade"></div>
+        <button class="mb-mt-btn" id="mbmt-btn" onclick="mbmtAdd()">🧠 Manage this trade</button>
+        <div class="mb-mt-msg" id="mbmt-msg"></div>
+      </div>
+    </div>
     <div class="mb-manage" id="mb-manage" style="display:none">
       <div class="mb-manage-h">📍 Managing position</div>
       <div class="mb-manage-grid">
@@ -23651,6 +23857,10 @@ def dashboard():
       </div>
       <div class="mb-mg-rec" id="mb-mg-rec"></div>
       <ul class="mb-list" id="mb-mg-watch"></ul>
+    </div>
+    <div class="mb-tl" id="mb-tl" style="display:none">
+      <div class="mb-tl-h">🕒 Trade timeline</div>
+      <ul class="mb-tl-list" id="mb-tl-list"></ul>
     </div>
     <div class="mb-feed-h">Live conversation</div>
     <div id="mb-feed" class="mb-feed"></div>
@@ -25613,10 +25823,47 @@ function renderMainBrain(d){
       }
       _mt('mb-mg-dist', (mr.dist_to_stop!=null ? mr.dist_to_stop : '—') + ' / ' + (mr.dist_to_target1!=null ? mr.dist_to_target1 : '—'));
       const recEl = document.getElementById('mb-mg-rec');
-      if(recEl) recEl.textContent = (mr.recommendation ? (mr.recommendation + ' — ') : '') + (mr.recommendation_reason || '');
+      if(recEl){
+        while(recEl.firstChild) recEl.removeChild(recEl.firstChild);
+        const act = mr.action || mr.recommendation;
+        if(act){
+          const pill = document.createElement('span');
+          pill.className = 'mb-act-pill';
+          pill.textContent = act;
+          pill.style.background = mbActColor(act, mr.invalidated);
+          recEl.appendChild(pill);
+        }
+        const why = document.createElement('span');
+        why.textContent = mr.recommendation_reason || '';
+        recEl.appendChild(why);
+      }
       _anFill('mb-mg-watch', (mr.what_invalidates || []).slice(0, 3));
     } else {
       mgWrap.style.display = 'none';
+    }
+  }
+  // Trade-management timeline (manual positions only — the server attaches it to the
+  // management read). Display-only copilot log; chronological, newest last.
+  const tlWrap = document.getElementById('mb-tl');
+  const tlList = document.getElementById('mb-tl-list');
+  const tl = (mr && mr.timeline) || [];
+  if(tlWrap && tlList){
+    if(mr && mr.status === 'ok' && tl.length){
+      tlWrap.style.display = '';
+      while(tlList.firstChild) tlList.removeChild(tlList.firstChild);
+      tl.slice(-30).forEach(function(ev){
+        const li = document.createElement('li');
+        const ts = document.createElement('span');
+        ts.className = 'mb-tl-t';
+        ts.textContent = (ev && ev.t_et) || '';
+        const tx = document.createElement('span');
+        tx.textContent = ' ' + ((ev && ev.text) || '');
+        li.appendChild(ts);
+        li.appendChild(tx);
+        tlList.appendChild(li);
+      });
+    } else {
+      tlWrap.style.display = 'none';
     }
   }
   const foot = document.getElementById('mb-foot');
@@ -28550,6 +28797,54 @@ async function aiSend(){
 function mtNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
 function mtThesisColor(t){ return t==='VALID'?'#22c55e':(t==='WEAKENING'?'#f59e0b':(t==='INVALID'?'#ef4444':'#9aa')); }
 function mtRecColor(r){ return r==='HOLD'?'#22c55e':(r==='MOVE STOP'?'#3b82f6':(r==='REDUCE'?'#f59e0b':(r==='EXIT'?'#ef4444':'#9aa'))); }
+
+// ── Manual Trade Management Mode (inside Main Brain) ──────────────────────────
+// Advisory / display-only: posts to the SAME read-only /manual-trade endpoint, then
+// flips the Main Brain to MANAGING for the entered instrument. Never sends an order.
+function mbActColor(a, inv){
+  if(inv || a==='EXIT' || a==='INVALIDATED') return '#ef4444';
+  if(a==='REDUCE' || a==='TAKE PARTIAL') return '#f59e0b';
+  if(a==='MOVE STOP TO BE' || a==='MOVE STOP') return '#3b82f6';
+  return '#22c55e';
+}
+function mbmtToggle(){
+  var b=document.getElementById('mbmt-body'), c=document.getElementById('mbmt-caret');
+  if(!b) return;
+  var open=(b.style.display==='none'||b.style.display==='');
+  b.style.display=open?'block':'none';
+  if(c) c.textContent=open?'▾':'▸';
+}
+function mbmtNum(id){ var e=document.getElementById(id); if(!e) return null; var v=e.value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
+async function mbmtAdd(){
+  var btn=document.getElementById('mbmt-btn'), msg=document.getElementById('mbmt-msg');
+  var body={
+    symbol: document.getElementById('mbmt-symbol').value,
+    direction: document.getElementById('mbmt-dir').value,
+    mode: document.getElementById('mbmt-mode').value,
+    entry: mbmtNum('mbmt-entry'), stop: mbmtNum('mbmt-stop'),
+    contracts: mbmtNum('mbmt-contracts'),
+    target1: mbmtNum('mbmt-t1'), target2: mbmtNum('mbmt-t2'),
+    reason: document.getElementById('mbmt-reason').value
+  };
+  if(body.entry==null||body.stop==null||body.target1==null||body.target2==null){
+    if(msg){ msg.style.color='#f59e0b'; msg.textContent='Enter Entry, Stop, TP1 and TP2.'; } return;
+  }
+  var prev=btn?btn.textContent:''; if(btn){ btn.disabled=true; btn.textContent='⏳ Adding…'; }
+  try{
+    var r=await api('/manual-trade', body);
+    if(r && r.status==='added'){
+      if(msg){ msg.style.color='#22c55e'; msg.textContent='Managing — advisory only, no order sent.'; }
+      ['mbmt-entry','mbmt-stop','mbmt-t1','mbmt-t2','mbmt-reason'].forEach(function(id){ var e=document.getElementById(id); if(e) e.value=''; });
+      var cc=document.getElementById('mbmt-contracts'); if(cc) cc.value='1';
+      userPickedSetup=true;
+      setSymbol(body.symbol);   // flip the active tab to the managed instrument
+      refreshManual();          // refresh the legacy monitor list too
+    } else if(msg){
+      msg.style.color='#ef4444'; msg.textContent=(r&&r.reason)?r.reason:'Could not add trade.';
+    }
+  } catch(e){ if(msg){ msg.style.color='#ef4444'; msg.textContent='Add failed — try again.'; } }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=prev; } }
+}
 
 async function addManualTrade(){
   var btn=document.getElementById('mt-btn'); var msg=document.getElementById('mt-msg');

@@ -93,6 +93,30 @@ the outer fail-open that returns `_main_brain_neutral()`.
 **Why:** display-only must never alter live trade state or risk a state-dependent
 500 on the single-return path.
 
+## Manual Trade Management Mode (manual position priority + timeline)
+
+The Main Brain can manage a USER-entered trade, not just the bot's own position.
+`_newest_manual_trade_for(inst)` (newest OPEN manual trade, returns a COPY) takes
+PRIORITY over `active_trade_for(inst)`; `pos_is_manual` then makes the mirror use
+the user's real reason/entry_time/id/targets, and `management_read["origin"]` is
+`manual|bot`. Same COPY+`analysis=result` re-entrancy rules as above apply — the
+mirror is always freshly built so the helper's `min_r/max_r` writeback never
+touches the stored manual trade either.
+
+`compute_manual_trade_management` exposes a canonical `out["action"]`
+(HOLD/REDUCE/TAKE PARTIAL/MOVE STOP TO BE/EXIT, MONITOR on the early `unavailable`
+return) + `out["invalidated"]`, derived PURELY from the existing recommendation
+booleans — `recommendation`/`recommendation_reason` stay byte-stable so the legacy
+mtCard is untouched. The UI colors a pill off `action`/`invalidated` (`mbActColor`).
+
+**Timeline is a single-writer in-payload log, NOT a new table.** Events live in
+`trade["timeline"]` (cap 80) with fire-once dedupe via `trade["_tl_flags"]`;
+`_update_manual_trade_timeline(trade,mgmt)->bool` is the ONLY advancer and runs on
+the stored object under `MANUAL_TRADES_LOCK` in GET /manual-trade (persist only on
+change). POST seeds the "entered" event. `management_read["timeline"]` is attached
+ONLY for a manual position. No DDL (INSERT/SELECT convention).
+**Why:** keeps the copilot log durable in the existing JSONB row, money-path-free.
+
 ## Known limitation (intentional, not a bug)
 
 The market-closed early return in `compute_main_brain` runs BEFORE the
