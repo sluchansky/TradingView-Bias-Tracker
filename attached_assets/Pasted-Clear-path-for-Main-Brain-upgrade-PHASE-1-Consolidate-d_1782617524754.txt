@@ -1,0 +1,112 @@
+Clear path for Main Brain upgrade:
+
+PHASE 1 — Consolidate, do not rebuild
+Use the existing dashboard logic and outputs.
+Do not create duplicate trade logic.
+Take the current analysis from:
+- Ask the AI
+- Unified Analyst Report
+- Analyst Mode
+- Trade Debate
+- Professional Review
+- Entry Quality
+- Why Not Ready
+- AI Trade Checklist
+
+Feed those into one central Main Brain system.
+
+PHASE 2 — Make Main Brain interactive
+Remove “display only” and make Ask the Brain actually interactive.
+
+I want to type questions like:
+- Why wait?
+- What’s missing?
+- Is this entry late?
+- Where is invalidation?
+- Should I manage this trade?
+- Scalp or swing?
+
+The answer must use the live bot state, not generic advice.
+
+PHASE 3 — Improve Main Brain layout
+Main Brain should show:
+
+1. What I See
+Current market facts.
+
+2. What I’m Thinking
+Plain-English reasoning.
+
+3. What I’m Watching For
+The next conditions needed.
+
+4. The Plan
+What the bot intends to do if conditions confirm.
+
+5. Current Mission
+A checklist showing what must happen before READY.
+
+Example:
+Current Mission:
+☑ Above VWAP
+☑ Demand holding
+☐ Bullish CHOCH
+☐ Delta confirmation
+☐ Clean pullback
+
+Mission Progress: 40%
+
+PHASE 4 — Add confidence and bias
+Show:
+
+- Current Status: WATCHING / BUILDING / READY / WAIT / MANAGING / INVALIDATED
+- Confidence %
+- Trade Quality grade
+- Bull Case
+- Bear Case
+- Current Lean
+
+Example:
+Bull Case:
+Above VWAP, demand holding, CVD improving.
+
+Bear Case:
+Near resistance, no BOS yet, volume weak.
+
+Current Lean:
+65% long / 35% short
+
+PHASE 5 — Make the conversation alive
+The Live Conversation should be chronological and explain what changed.
+
+Example:
+09:31 Price reclaimed VWAP.
+09:33 Demand is still holding.
+09:35 CVD improved.
+09:36 Still waiting for candle confirmation.
+09:38 No entry yet. Risk/reward is not clean.
+
+Avoid repeating the same message unless something changed.
+
+PHASE 6 — Add thinking animation
+When I ask the brain a question, show a short reasoning sequence:
+
+Thinking...
+Checking structure...
+Checking VWAP...
+Checking CVD...
+Checking risk...
+
+Then give a direct answer.
+
+PHASE 7 — Manual trade mode
+When I enter a manual trade, Main Brain should switch to MANAGING mode and explain:
+- Whether my entry is good or late
+- Whether my stop makes sense
+- When to take partials
+- When to move stop to break even
+- Whether to hold, reduce, or exit
+- What invalidates the trade
+
+Final goal:
+The dashboard should feel like one intelligent trading partner explaining the market in real time, not a bunch of disconnected analysis boxes.
