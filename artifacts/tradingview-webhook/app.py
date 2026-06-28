@@ -25116,6 +25116,9 @@ def dashboard():
   .mb-feed-badge{flex:0 0 auto;font-weight:800;font-size:10px;letter-spacing:.5px}
   .mb-feed-tx{flex:1 1 auto;color:#cfd0e0}
   .mb-foot{font-size:10px;color:#6b7280;margin-top:8px;font-style:italic}
+  .mb-prop{font-size:11px;color:#a8a8c0;margin-top:8px;padding-top:7px;border-top:1px solid var(--border)}
+  .mb-prop-dot{margin-right:6px;font-size:11px}
+  .mb-prop-acct{color:#6b7280;margin-left:6px}
   @media(max-width:720px){.mb-grid{grid-template-columns:1fr}}
   .gauge-wrap{position:relative;width:100%;max-width:320px;margin:0 auto}
   .mgauge-center{position:absolute;left:0;right:0;bottom:24%;text-align:center;pointer-events:none}
@@ -25567,6 +25570,11 @@ def dashboard():
     </div>
     <div class="mb-feed-h">Live conversation</div>
     <div id="mb-feed" class="mb-feed"></div>
+    <!-- Prop Firm Protection — one-line guard status (display-only read of
+         main_brain.prop_rule; the guard itself lives in execute_trade_gateway). -->
+    <div id="mb-prop" class="mb-prop" style="display:none">
+      <span class="mb-prop-dot" id="mb-prop-dot"></span><span id="mb-prop-line"></span><span class="mb-prop-acct" id="mb-prop-acct"></span>
+    </div>
     <div id="mb-foot" class="mb-foot"></div>
     <!-- Interactive partner — ask the brain live questions. Reuses the read-only
          /assistant backend (grounded on the same snapshot + open trades + risk rules).
@@ -27660,6 +27668,27 @@ function renderMainBrain(d){
       }
     } else {
       rvWrap.style.display = 'none';
+    }
+  }
+  // Prop Firm Protection — one-line guard status (display-only read of
+  // main_brain.prop_rule; ● green = ON/enforced, ○ grey = OFF). Hidden only when
+  // the server could not produce a line at all (fail-open).
+  const pq = (mb && mb.prop_rule) || null;
+  const pqWrap = document.getElementById('mb-prop');
+  if(pqWrap){
+    const pqLine = document.getElementById('mb-prop-line');
+    const pqDot = document.getElementById('mb-prop-dot');
+    const pqAcct = document.getElementById('mb-prop-acct');
+    if(pq && pq.line){
+      pqWrap.style.display = '';
+      if(pqLine) pqLine.textContent = pq.line;
+      if(pqDot){
+        pqDot.textContent = pq.enabled ? '●' : '○';
+        pqDot.style.color = pq.enabled ? 'var(--green)' : '#6b7280';
+      }
+      if(pqAcct) pqAcct.textContent = (pq.enabled && pq.account) ? ('· ' + pq.account) : '';
+    } else {
+      pqWrap.style.display = 'none';
     }
   }
   const foot = document.getElementById('mb-foot');
