@@ -23511,7 +23511,7 @@ def dashboard():
   </div>
 
   <!-- Long vs Short Score — moved up to sit directly under the Long/Short toggle. -->
-  <div class="mod" id="mod-scores">
+  <div class="mod mb-hidden" id="mod-scores">
     <div class="mod-h">⚖️ Long vs Short Score</div>
     <div class="sg-row">
       <div class="sg-top"><span>📈 Long</span><span id="sg-long-n">0</span></div>
@@ -23539,7 +23539,7 @@ def dashboard():
 </div>
 
 <!-- Diagnostics modules (feed off alert_diagnostics) -->
-<div class="mod" id="mod-prob">
+<div class="mod mb-hidden" id="mod-prob">
   <div class="mod-h">⏱ Trade Probability Meter</div>
   <div class="gauge-wrap">
     <svg id="gauge-svg" viewBox="0 0 220 132" style="width:100%;display:block"></svg>
@@ -23561,7 +23561,7 @@ def dashboard():
   <div class="ai-ck" id="ai-ck"></div>
 </div>
 
-<div class="mod" id="mod-countdown">
+<div class="mod mb-hidden" id="mod-countdown">
   <div class="mod-h">🎯 Setup Countdown</div>
   <div class="cd-big" id="cd-big">—</div>
   <div class="cd-sub" id="cd-sub"></div>
@@ -23920,7 +23920,7 @@ def dashboard():
 </div>
 
 <!-- Multi-strategy engine (Phase 1 — display-only; existing gate stays authoritative) -->
-<div class="mod" id="mod-strategy">
+<div class="mod mb-hidden" id="mod-strategy">
   <div class="mod-h">🎛️ Strategy Engine <span id="se-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
   <div class="se-top">
     <div class="gstat"><div class="l">Market Regime</div><div class="v" id="se-regime">—</div></div>
@@ -23942,7 +23942,7 @@ def dashboard():
 </div>
 
 <!-- Adaptive Learning Engine — per-strategy analytics from closed trades (Postgres) -->
-<div class="mod" id="mod-learning">
+<div class="mod mb-hidden" id="mod-learning">
   <div class="mod-h">🧠 Adaptive Learning <span id="le-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
   <div class="le-top">
     <div class="gstat"><div class="l">Trades Logged</div><div class="v" id="le-total">—</div></div>
@@ -23966,7 +23966,7 @@ def dashboard():
 </div>
 
 <!-- Performance Report — every-25-trades review + auto-recommendations (display-only) -->
-<div class="mod" id="mod-report">
+<div class="mod mb-hidden" id="mod-report">
   <div class="mod-h">📊 Performance Report <span id="pr-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
   <div class="le-top">
     <div class="gstat"><div class="l">Win Rate</div><div class="v" id="pr-wr">—</div></div>
@@ -24000,7 +24000,7 @@ def dashboard():
 </div>
 
 <!-- Confidence Governor — transparent Edge→confidence breakdown (DISPLAY-ONLY) -->
-<div class="mod" id="mod-governor">
+<div class="mod mb-hidden" id="mod-governor">
   <div class="mod-h">🎯 Confidence Governor <span id="cg-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span id="cg-gate-toggle" role="button" tabindex="0" onclick="toggleLearningGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Demote: off</span></div>
   <div class="le-top">
     <div class="gstat"><div class="l">Base Edge</div><div class="v" id="cg-base">—</div></div>
@@ -24015,7 +24015,7 @@ def dashboard():
 </div>
 
 <!-- Professional Memory — similar-trades lookup over recent closed trades (DISPLAY-ONLY) -->
-<div class="mod" id="mod-memory">
+<div class="mod mb-hidden" id="mod-memory">
   <div class="mod-h">🧩 Trade Memory <span id="tm-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
   <div class="le-top">
     <div class="gstat"><div class="l">Similar Trades</div><div class="v" id="tm-n">—</div></div>
