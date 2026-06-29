@@ -117,6 +117,9 @@ router.all(
     "/prop-protection",
     "/prop-accounts",
     "/prop-decisions",
+    // LIVE 2-contract runner arming (owner-only; NOT in dashboard-auth OPEN_PATHS).
+    // In-memory armed flag over the existing fail-closed gateway; resets on restart.
+    "/live-runner",
   ],
   proxyToFlask,
 );

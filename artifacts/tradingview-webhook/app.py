@@ -1513,6 +1513,78 @@ LIVE_RUNNER_QTY     = max(1, int(os.environ.get("LIVE_RUNNER_QTY", "1")))
 LIVE_RUNNER_REQUIRE_TRADERSPOST = os.environ.get("LIVE_RUNNER_REQUIRE_TRADERSPOST", "1").strip().lower() not in ("0", "false", "no", "off")
 # How often the live-runner watch loop re-evaluates open runner legs (seconds).
 LIVE_RUNNER_WATCH_INTERVAL_SEC  = max(2, int(os.environ.get("LIVE_RUNNER_WATCH_INTERVAL_SEC", "5")))
+# How the watcher flattens the runner leg on a discretionary exit signal.
+#   "manual" (DEFAULT, fail-closed) — NEVER sends a broker reduce; it marks the
+#            runner reduce_state="manual_required" and ALERTS the owner to flatten
+#            by hand. A blind opposite-side market order could over-fill and FLIP
+#            into a reversed position, so auto-reduce stays opt-in.
+#   "exit"  — sends a NON-REVERSING TradersPost {action:"exit"} flatten for the
+#            symbol (cannot reverse). Operator opts in only after confirming their
+#            TradersPost strategy treats "exit" as a position flatten.
+LIVE_RUNNER_REDUCE_MODE = os.environ.get("LIVE_RUNNER_REDUCE_MODE", "manual").strip().lower()
+# Discretionary runner-exit tuning (watcher reads RAW stores only; never the gate).
+LIVE_RUNNER_TRAIL_ATR_MULT = max(0.1, float(os.environ.get("LIVE_RUNNER_TRAIL_ATR_MULT", "1.5")))
+LIVE_RUNNER_MAX_HOLD_MIN   = max(1, int(os.environ.get("LIVE_RUNNER_MAX_HOLD_MIN", "240")))
+# Gateway-owned live-runner state (Option A): the runner leg is tracked HERE, not on
+# ACTIVE_TRADES_BY_INST, because the manual /traderspost route (and Option A in
+# general) never registers an ACTIVE_TRADE — only _maybe_auto_execute / /enter do.
+# One open runner record per instrument. RESTART WIPES this in-memory store while the
+# broker leg stays live, which is why every runner leg ALWAYS carries its own broker
+# stop (hard backstop) and /status loudly reconciles a wiped runner. LIVE_RUNNERS_LOCK
+# is a plain Lock and MUST NEVER nest under a money lock.
+LIVE_RUNNERS_BY_INST = {}
+LIVE_RUNNERS_LOCK    = threading.Lock()
+
+
+def _live_runner_get(inst):
+    """Return a COPY of the open runner record for inst (None if none). Copy so a
+    caller can read fields without holding the lock."""
+    try:
+        with LIVE_RUNNERS_LOCK:
+            rec = LIVE_RUNNERS_BY_INST.get(inst)
+            return dict(rec) if rec else None
+    except Exception:
+        return None
+
+
+def _live_runner_set(inst, rec):
+    """Store/replace the open runner record for inst (one slot per instrument)."""
+    with LIVE_RUNNERS_LOCK:
+        LIVE_RUNNERS_BY_INST[inst] = dict(rec)
+
+
+def _live_runner_update(inst, runner_id, **fields):
+    """Patch fields on the open runner record IFF it still matches runner_id (the
+    record may have been cleared/replaced by a restart or a newer leg). Returns the
+    updated COPY, or None when no matching record exists. Fail-closed: a mismatched
+    id never mutates a different runner."""
+    with LIVE_RUNNERS_LOCK:
+        rec = LIVE_RUNNERS_BY_INST.get(inst)
+        if not rec or (runner_id is not None and rec.get("runner_id") != runner_id):
+            return None
+        rec.update(fields)
+        return dict(rec)
+
+
+def _live_runner_clear(inst, runner_id=None):
+    """Remove the open runner record for inst. When runner_id is given, only clears
+    when it matches (so a stale clear can't wipe a newer runner)."""
+    with LIVE_RUNNERS_LOCK:
+        rec = LIVE_RUNNERS_BY_INST.get(inst)
+        if not rec:
+            return
+        if runner_id is not None and rec.get("runner_id") != runner_id:
+            return
+        LIVE_RUNNERS_BY_INST.pop(inst, None)
+
+
+def _live_runner_snapshot():
+    """Most-recent COPY of every open runner record (for the watcher + /status)."""
+    try:
+        with LIVE_RUNNERS_LOCK:
+            return {k: dict(v) for k, v in LIVE_RUNNERS_BY_INST.items()}
+    except Exception:
+        return {}
 
 # ── Advisor review (Analyst Reasoning as an AUTO-TRADE gate) ──────────────────
 # Global runtime toggle. When ON, the analyst reviews every setup before an
@@ -16294,6 +16366,77 @@ def _finalize_dynamic_close(mt, exit_price, exit_reason):
     _close_managed_trade(mt, outcome, f"{outcome} ({reason_label})", exit_price)
 
 
+def _mt_to_runner_rec(mt):
+    """Adapt a paper managed-trade record to the shape _runner_exit_signal reads
+    (instrument / direction / entry / opened_epoch / peak_price / trough_price). The
+    high/low-water marks live on the mt under cp_peak / cp_trough, tracked by the
+    conditional-runner walk ONLY (absent on the flag-off path, so a flag-off mt is
+    never mutated by this feature)."""
+    return {
+        "instrument":   mt.get("instrument"),
+        "direction":    mt.get("direction"),
+        "entry":        mt.get("entry"),
+        "opened_epoch": mt.get("entry_epoch"),
+        "peak_price":   mt.get("cp_peak"),
+        "trough_price": mt.get("cp_trough"),
+    }
+
+
+def _evaluate_conditional_paper_runner(mt, bar):
+    """Flag-gated (RUNNER_CONDITIONAL_PAPER_ENABLED) paper exit walk: book 50% at TP1,
+    then ride the remaining 50% until the SHARED _runner_exit_signal fires (the very
+    same discretionary logic the LIVE runner uses), booking the remainder at the
+    current price. Local/paper ONLY; the caller has already ruled out the stop for this
+    bar, and the (BE-aware) stop-first check still runs every bar as the hard floor, so
+    the remainder can never give back more than the break-even stop allows. Display /
+    journal effect only — never a broker send."""
+    high, low = bar["high"], bar["low"]
+    entry   = mt.get("entry")
+    risk    = mt.get("risk_points") or 0.0
+    is_long = mt["direction"] == "Long"
+
+    # ── TP1: book exactly 50% once, then arm the delayed break-even. ──
+    if not mt.get("tp1_hit"):
+        tp1 = mt.get("tp1")
+        if tp1 is not None and ((high >= tp1) if is_long else (low <= tp1)):
+            mt["tp1_hit"] = True
+            pct   = 0.5
+            leg_r = _dynamic_leg_r(tp1, entry, risk, is_long)
+            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+            mt["remaining_pct"] = round(max(0.0, (mt.get("remaining_pct") or 0.0) - pct), 4)
+            _send_management_update(mt, "TP1 hit",
+                                    f"Booked 50% at {tp1} (+{leg_r:.2f}R). "
+                                    f"Remainder rides the runner signal.")
+            _maybe_move_be_to_entry(mt, bar)
+
+    # ── Remainder: discretionary exit via the shared runner-exit signal (now-based). ──
+    if mt.get("tp1_hit") and (mt.get("remaining_pct") or 0.0) > 1e-9:
+        inst = mt.get("instrument")
+        try:
+            price_now = current_price_for(inst)
+        except Exception:
+            price_now = None
+        # Track the high/low-water mark on the SAME price basis the signal reads,
+        # so the ATR trail inside _runner_exit_signal has a meaningful anchor.
+        if price_now is not None:
+            mt["cp_peak"]   = max(mt.get("cp_peak")   or entry or price_now, price_now)
+            mt["cp_trough"] = min(mt.get("cp_trough") or entry or price_now, price_now)
+        should_exit, reason = _runner_exit_signal(_mt_to_runner_rec(mt))
+        if should_exit:
+            exit_px = price_now if price_now is not None else bar.get(
+                "close", high if is_long else low)
+            pct   = mt.get("remaining_pct") or 0.0
+            leg_r = _dynamic_leg_r(exit_px, entry, risk, is_long)
+            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+            mt["remaining_pct"] = 0.0
+            mt["runner_hit"]    = True
+            _send_management_update(mt, "Runner exit",
+                                    f"Signal exit ({reason}) — booked final "
+                                    f"{round(pct * 100)}% at {exit_px} (+{leg_r:.2f}R).")
+            _finalize_dynamic_close(mt, exit_px, "runner")
+            return
+
+
 def _evaluate_dynamic_managed_levels(mt, bar):
     """SCALP dynamic multi-leg exit walk for ONE OHLC bar (local/paper only; caller
     has already gated on _scalp_dynamic_lifecycle_enabled).
@@ -16321,6 +16464,14 @@ def _evaluate_dynamic_managed_levels(mt, bar):
             reason = "breakeven_stop" if (mt.get("be_moved") and abs(leg_r) < 1e-9) else "stop"
             _finalize_dynamic_close(mt, stop, reason)
             return
+
+    # ── Conditional paper runner (flag-gated): with the stop ruled out for this bar,
+    #    book 50% at TP1 then ride the remainder on the SHARED _runner_exit_signal.
+    #    Flag OFF => skipped entirely, so the legacy TP1/TP2/runner price walk below
+    #    stays byte-identical. ──
+    if RUNNER_CONDITIONAL_PAPER_ENABLED:
+        _evaluate_conditional_paper_runner(mt, bar)
+        return
 
     # ── 2) TP1 partial + delayed break-even ──
     if not mt.get("tp1_hit"):
@@ -16827,6 +16978,18 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
         _compute_trade_mgmt_metrics(mt)
     except Exception as exc:
         logger.warning("trade mgmt metrics error: %s", exc)
+
+    # Session-quality grade sidecar (DISPLAY/ANALYTICS; flag-gated). Recompute today's
+    # aggregate from the persisted metrics and upsert it (INSERT/SELECT + fail-open via
+    # the slow worker). Fully inert when SESSION_QUALITY is OFF, so the outcome card
+    # below + all goldens stay byte-identical. Never gates / sizes / dedupes.
+    if SESSION_QUALITY_ENABLED:
+        try:
+            _grade = _compute_session_quality_grade()
+            if _grade and _grade.get("status") == "ok":
+                _persist_session_quality_grade(_grade)
+        except Exception as exc:
+            logger.warning("session quality grade error: %s", exc)
 
     _send_outcome_update(mt)
     _apply_outcome_to_journal(mt)
@@ -18521,6 +18684,154 @@ def _load_session_quality_grades(date_et=None, limit=50):
     return mem[:int(limit)]
 
 
+def _session_grade_letter(score):
+    """Letter grade for a 0-100 session-quality score (DISPLAY-only)."""
+    try:
+        s = float(score)
+    except Exception:
+        return "F"
+    if s >= 90: return "A+"
+    if s >= 80: return "A"
+    if s >= 70: return "B"
+    if s >= 60: return "C"
+    if s >= 50: return "D"
+    return "F"
+
+
+def _compute_session_quality_grade(rows=None, date_et=None):
+    """Aggregate TODAY's CLOSED-trade management metrics into a six-component session
+    quality grade — entry quality, risk control, holding winners, cutting losers,
+    overtrading, commission efficiency — plus an overall score / letter grade.
+
+    PURE COMPUTE: reads only already-persisted trade-management metric rows (the same
+    sidecar T2 writes); never recomputes a close, never persists here, and NEVER touches
+    the gate / scoring / sizing / dedupe / money path. Returns None when SESSION_QUALITY
+    is OFF; an explicit 'insufficient' block when there are no closed trades today, so an
+    OFF deployment is unchanged and the goldens stay byte-identical. FAIL-OPEN -> None."""
+    if not SESSION_QUALITY_ENABLED:
+        return None
+    try:
+        if date_et is None:
+            date_et = now_utc().astimezone(ET_TZ).date()
+        if rows is None:
+            rows = _load_recent_trade_mgmt_metrics(limit=200)
+
+        def _f(v, d=0.0):
+            try:
+                return float(v) if v is not None else d
+            except Exception:
+                return d
+
+        def _is_today(r):
+            ca = r.get("closed_at")
+            if not ca:
+                return False
+            try:
+                return datetime.fromisoformat(str(ca)).astimezone(ET_TZ).date() == date_et
+            except Exception:
+                return False
+
+        today = [r for r in (rows or []) if _is_today(r)]
+        n = len(today)
+        if n == 0:
+            return {"enabled": True, "status": "insufficient", "trade_count": 0,
+                    "session_date_et": str(date_et), "session_name": "ALL", "symbol": "ALL",
+                    "message": "No closed trades today yet.",
+                    "updated_at": now_utc().isoformat()}
+
+        winners = [r for r in today if _f(r.get("r_multiple")) > 0]
+        losers  = [r for r in today if _f(r.get("r_multiple")) < 0]
+        comps = {}
+
+        # 1) Entry quality — average favorable excursion (MFE in R, capped at 1R).
+        mfes = [min(1.0, max(0.0, _f(r.get("mfe_r")))) for r in today if r.get("mfe_r") is not None]
+        if mfes:
+            comps["entry_quality"] = round(100.0 * sum(mfes) / len(mfes), 1)
+
+        # 2) Risk control — oversized-loss rate + average loss beyond the planned 1R.
+        oversized = sum(1 for r in today if r.get("oversized_loss_violation"))
+        if losers:
+            avg_loss_r = sum(-_f(r.get("r_multiple")) for r in losers) / len(losers)   # > 0
+            loss_disc  = max(0.0, min(1.0, avg_loss_r - 1.0))                           # 0 @<=1R, 1 @>=2R
+        else:
+            loss_disc = 0.0
+        comps["risk_control"] = round(max(0.0, min(100.0,
+            100.0 * (1.0 - oversized / n) - 30.0 * loss_disc)), 1)
+
+        # 3) Holding winners — captured R as a fraction of peak favorable (MFE) on winners.
+        held = []
+        for r in winners:
+            cap = _f(r.get("r_multiple"))
+            mfe = _f(r.get("mfe_r"), cap)
+            denom = max(cap, mfe, 1e-9)
+            held.append(min(1.0, cap / denom))
+        if held:
+            comps["holding_winners"] = round(100.0 * sum(held) / len(held), 1)
+
+        # 4) Cutting losers — losers held no worse than the planned 1R (score 1/|R|).
+        cut = [min(1.0, 1.0 / max(-_f(r.get("r_multiple")), 1.0)) for r in losers]
+        if cut:
+            comps["cutting_losers"] = round(100.0 * sum(cut) / len(cut), 1)
+
+        # 5) Overtrading — <=6 trades is ideal (100); decays linearly to 0 at >=20.
+        if n <= 6:
+            ot = 100.0
+        elif n >= 20:
+            ot = 0.0
+        else:
+            ot = 100.0 * (20 - n) / 14.0
+        comps["overtrading"] = round(ot, 1)
+
+        # 6) Commission efficiency — fees as a fraction of |gross| (lower is better).
+        tot_fees  = sum(_f(r.get("fees")) for r in today)
+        tot_gross = sum(abs(_f(r.get("gross_pnl"))) for r in today)
+        if tot_gross > 1e-9:
+            comps["commission_efficiency"] = round(
+                100.0 * (1.0 - min(1.0, tot_fees / tot_gross)), 1)
+
+        avail = [v for v in comps.values() if v is not None]
+        overall = round(sum(avail) / len(avail), 1) if avail else 0.0
+        return {
+            "enabled":               True,
+            "status":                "ok",
+            "session_date_et":       str(date_et),
+            "session_name":          "ALL",
+            "symbol":                "ALL",
+            "trade_count":           n,
+            "wins":                  len(winners),
+            "losses":                len(losers),
+            "entry_quality":         comps.get("entry_quality"),
+            "risk_control":          comps.get("risk_control"),
+            "holding_winners":       comps.get("holding_winners"),
+            "cutting_losers":        comps.get("cutting_losers"),
+            "overtrading":           comps.get("overtrading"),
+            "commission_efficiency": comps.get("commission_efficiency"),
+            "overall_score":         overall,
+            "overall_grade":         _session_grade_letter(overall),
+            "oversized_loss_count":  oversized,
+            "total_gross":           round(sum(_f(r.get("gross_pnl")) for r in today), 2),
+            "total_fees":            round(tot_fees, 2),
+            "total_net":             round(sum(_f(r.get("net_pnl")) for r in today), 2),
+            "components":            comps,
+            "updated_at":            now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("session quality grade failed: %s", exc)
+        return None
+
+
+def _session_quality_status_block():
+    """DISPLAY-only /status presenter: today's live session-quality grade. Returns None
+    when SESSION_QUALITY is OFF, so the /status key stays null. FAIL-OPEN -> None."""
+    if not SESSION_QUALITY_ENABLED:
+        return None
+    try:
+        return _compute_session_quality_grade()
+    except Exception as exc:
+        logger.warning("session quality status block error: %s", exc)
+        return None
+
+
 # ── Main Brain Performance Review & Learning Loop (OBSERVABILITY / DISPLAY-ONLY) ─
 # Captures trade & rejected-setup EVENTS (READY taken/skipped, manual entered, WAIT
 # would-have-worked/failed, TP1→BE, late entry, quick invalidation), reviews their
@@ -20042,6 +20353,190 @@ def _bot_active_trade_monitor_items(analysis_cache):
         except Exception as exc:
             logger.warning("bot-monitor mirror failed for %s: %s", inst, exc)
     return items
+
+
+def _bot_hold_verdict(score):
+    """Map a 0-100 bot-hold conviction score to the advisory verdict vocabulary."""
+    if score >= 65:
+        return "HOLD"
+    if score >= 45:
+        return "SCALE OUT"
+    return "EXIT"
+
+
+def _compute_bot_hold_score(at, analysis=None):
+    """ADVISORY (DISPLAY-only) hold-conviction score for ONE open bot position.
+
+    Blends read-only live signals — VWAP alignment, CVD-delta, structure, volume,
+    ATR exhaustion, distance-to-liquidity, time-in-trade and trade progress — into a
+    0-100 score + a HOLD / SCALE OUT / EXIT verdict with a per-component breakdown.
+    Each component is included only when its data is available (FAIL-OPEN: a missing
+    signal is skipped, never guessed). Reads RAW stores (current price, VWAP / CVD)
+    plus an OPTIONAL full_analysis snapshot for structure / liquidity / volume.
+
+    STRICTLY advisory: NEVER mutates trading state, gates, scores, sizes, dedupes or
+    sends a broker order. Returns None when BOT_HOLD_SCORE is OFF or no usable price."""
+    if not BOT_HOLD_SCORE_ENABLED:
+        return None
+    try:
+        direction = at.get("direction", "Long")
+        is_long   = (direction == "Long")
+        symbol    = at.get("symbol")
+        entry     = at.get("entry_price")
+        stop      = at.get("stop_loss")
+        inst      = _instrument_from_text(symbol) or symbol
+        if entry is None or stop is None:
+            return None
+        price = current_price_for(inst)
+        if price is None:
+            return None
+        risk = abs(entry - stop)
+        if not risk:
+            return None
+        fav       = (price - entry) if is_long else (entry - price)
+        current_r = fav / risk
+        stop_breached = (price <= stop) if is_long else (price >= stop)
+
+        comps = {}   # name -> (0..1 conviction, human detail)
+
+        # 1) VWAP alignment (RAW store).
+        vwap = (VWAP_BY_TICKER.get(inst) or {}).get("value")
+        if vwap is not None:
+            on_side = (price >= vwap) if is_long else (price <= vwap)
+            comps["vwap"] = (1.0 if on_side else 0.0,
+                             "price %s VWAP" % ("above" if price >= vwap else "below"))
+
+        # 2) CVD-delta alignment (RAW store).
+        cstate = str((CVD_BY_TICKER.get(inst) or {}).get("state") or "").lower()
+        if cstate in ("bullish", "bearish"):
+            comps["cvd"] = (1.0 if ((cstate == "bullish") == is_long) else 0.0,
+                            "CVD %s" % cstate)
+
+        a = analysis or {}
+        # 3) Structure alignment (optional full_analysis snapshot).
+        sc = str(a.get("structure_class") or "").lower()
+        if sc:
+            s_bull, s_bear = ("bullish" in sc), ("bearish" in sc)
+            confirmed = sc in ("bullish trend", "bearish trend")
+            if (s_bull and is_long) or (s_bear and not is_long):
+                comps["structure"] = (1.0 if confirmed else 0.7, a.get("structure_class"))
+            elif (s_bear and is_long) or (s_bull and not is_long):
+                comps["structure"] = (0.0 if confirmed else 0.3, a.get("structure_class"))
+            else:
+                comps["structure"] = (0.5, a.get("structure_class"))
+
+        # 4) Volume support (optional full_analysis snapshot).
+        vstate = str(a.get("volume_state") or "").lower()
+        if vstate:
+            comps["volume"] = (1.0 if vstate == "confirmed" else 0.5, vstate)
+
+        # 5) ATR exhaustion (volatility regime; extreme / dead = scale-out pressure).
+        vol = get_volatility(inst) or {}
+        if vol.get("status") == "ok":
+            if vol.get("blocked"):
+                comps["atr"] = (0.2, vol.get("label"))
+            elif vol.get("caution"):
+                comps["atr"] = (0.6, vol.get("label"))
+            else:
+                comps["atr"] = (1.0, vol.get("label"))
+
+        # 6) Distance-to-liquidity — an opposing zone ahead caps the remaining room.
+        opp = a.get("nearest_supply") if is_long else a.get("nearest_demand")
+        if opp is not None:
+            gap = (opp - price) if is_long else (price - opp)
+            if gap <= 0:
+                comps["liquidity"] = (0.3, "opposing zone at/through price")
+            else:
+                room_r = gap / risk
+                comps["liquidity"] = (max(0.0, min(1.0, room_r)),
+                                      "%.2fR to %s" % (room_r, "supply" if is_long else "demand"))
+
+        # 7) Time-in-trade — conviction decays as a position ages toward the max hold.
+        opened = at.get("opened_at")
+        held_min = None
+        try:
+            if opened:
+                ot = datetime.fromisoformat(str(opened))
+                if ot.tzinfo is None:
+                    ot = ot.replace(tzinfo=timezone.utc)
+                held_min = max(0.0, (now_utc() - ot).total_seconds() / 60.0)
+        except Exception:
+            held_min = None
+        if held_min is not None:
+            max_hold = float(LIVE_RUNNER_MAX_HOLD_MIN or 240) or 240.0
+            comps["time"] = (max(0.0, 1.0 - min(1.0, held_min / max_hold)),
+                             "%.0f min held" % held_min)
+
+        # 8) Trade progress — in profit & off the stop strengthens the hold.
+        comps["progress"] = (max(0.0, min(1.0, 0.5 + max(-0.5, min(0.5, current_r / 2.0)))),
+                             "%.2fR" % current_r)
+
+        if not comps:
+            return None
+        score = round(100.0 * sum(v[0] for v in comps.values()) / len(comps), 1)
+        verdict = "EXIT" if stop_breached else _bot_hold_verdict(score)
+        return {
+            "instrument":    inst,
+            "symbol":        symbol,
+            "direction":     direction,
+            "entry":         entry,
+            "stop":          stop,
+            "price":         price,
+            "current_r":     round(current_r, 2),
+            "score":         score,
+            "verdict":       verdict,
+            "stop_breached": bool(stop_breached),
+            "opened_at":     opened,
+            "held_minutes":  round(held_min, 1) if held_min is not None else None,
+            "components":    {k: {"score": round(v[0] * 100.0, 0), "detail": v[1]}
+                              for k, v in comps.items()},
+            "advisory_only": True,
+            "updated_at":    now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("bot hold score failed: %s", exc)
+        return None
+
+
+def _bot_hold_status_block(seed_analysis=None, seed_ticker=None):
+    """DISPLAY-only /status presenter: a Bot Hold Score for every OPEN bot position.
+    Reuses ONE read-only full_analysis per distinct symbol (seeded with the caller's
+    already-computed snapshot to avoid a duplicate compute). Returns None when the flag
+    is OFF or there are no open positions, so the /status key stays null. FAIL-OPEN."""
+    if not BOT_HOLD_SCORE_ENABLED:
+        return None
+    try:
+        snap = active_trade_snapshot()
+        if not snap:
+            return None
+        cache = {}
+        if seed_ticker and seed_analysis is not None:
+            cache[seed_ticker] = seed_analysis
+        rows = []
+        for inst, at in snap.items():
+            if not at:
+                continue
+            sym = at.get("symbol") or inst
+            if sym not in cache:
+                try:
+                    cache[sym] = full_analysis(ticker_override=sym)
+                except Exception as exc:
+                    logger.warning("bot-hold analysis failed for %s: %s", sym, exc)
+                    cache[sym] = None
+            sc = _compute_bot_hold_score(at, analysis=cache.get(sym))
+            if sc:
+                rows.append(sc)
+        if not rows:
+            return None
+        return {
+            "enabled":    True,
+            "count":      len(rows),
+            "positions":  rows,
+            "updated_at": now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("bot hold status block error: %s", exc)
+        return None
 
 
 @app.route("/manual-trade", methods=["GET", "POST"])
@@ -23606,6 +24101,11 @@ def status():
         # Trade-management analytics (MFE/MAE booleans + commission + oversized-loss);
         # null when every analytics flag is OFF (display-only).
         "trade_management":         _trade_mgmt_status_block(a.get("active_ticker")),
+        "session_quality":          _session_quality_status_block(),
+        "bot_hold_score":           _bot_hold_status_block(a, a.get("active_ticker")),
+        # LIVE 2-contract runner (Option B) arming + eligibility; "enabled" is false
+        # unless LIVE_RUNNER_ENABLED (env) is set, so the panel stays hidden by default.
+        "live_runner":              live_runner_status_view(),
         "prop_firm":                prop_firm_status_view(),
         # ── Dual-timeframe (1m bias + 5s execution) engine — DISPLAY-ONLY ──
         "dualTfEngineEnabled": _dtf["dualTfEngineEnabled"],
@@ -24771,6 +25271,457 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
                                    "check your broker before retrying.")}, 502
 
 
+def _live_runner_eligible(mode, instrument, contracts):
+    """True ONLY when the LIVE 2-contract runner may engage for THIS order. ALL of:
+      1. LIVE_RUNNER_ENABLED (deploy-time env flag).
+      2. LIVE_RUNNER_ARMED (owner-armed at runtime; resets OFF every restart).
+      3. mode == 'traderspost' (the only broker whose partial-reduce is confirmed)
+         — also honours LIVE_RUNNER_REQUIRE_TRADERSPOST.
+      4. DISCORD_LIVE_ENABLED (the published/live instance only — a dev process
+         never splits a manual ENTER into a real two-leg order).
+      5. contracts >= 2 (need at least one primary + one runner contract).
+    Any False -> the gateway falls through to the single-order path BYTE-IDENTICAL
+    to today. Fail-closed: any error answers False (single order)."""
+    try:
+        if not LIVE_RUNNER_ENABLED:
+            return False
+        if LIVE_RUNNER_REQUIRE_TRADERSPOST and mode != "traderspost":
+            return False
+        if mode != "traderspost":
+            return False
+        if not DISCORD_LIVE_ENABLED:
+            return False
+        if int(contracts) < 2:
+            return False
+        with LIVE_RUNNER_LOCK:
+            if not LIVE_RUNNER_ARMED:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def live_runner_status_view():
+    """DISPLAY/CONTROL status for the LIVE 2-contract runner (Option B).
+
+    Surfaces every GLOBAL eligibility precondition the gateway checks in
+    _live_runner_eligible (engine flag, owner-armed flag, execution mode, live
+    instance) so the operator can see EXACTLY why a split is or isn't live, plus the
+    in-memory armed flag, the runner knobs, and any open runner legs. The per-setup
+    contracts>=2 requirement is surfaced as a note (it depends on the live setup, not
+    a global). READ-ONLY: never arms, never sends. FAIL-OPEN -> minimal dict."""
+    try:
+        mode = resolve_execution_mode()
+    except Exception:
+        mode = "manual"
+    try:
+        with LIVE_RUNNER_LOCK:
+            armed = bool(LIVE_RUNNER_ARMED)
+    except Exception:
+        armed = False
+    try:
+        runners = _live_runner_snapshot() or {}
+    except Exception:
+        runners = {}
+    mode_ok = (mode == "traderspost")
+    checks = [
+        {"label": "Engine enabled (env)",         "ok": bool(LIVE_RUNNER_ENABLED)},
+        {"label": "Armed (owner, this run)",       "ok": armed},
+        {"label": "Execution mode = traderspost",  "ok": mode_ok},
+        {"label": "Live / published instance",     "ok": bool(DISCORD_LIVE_ENABLED)},
+    ]
+    eligible = all(c["ok"] for c in checks)
+    return {
+        "enabled":             bool(LIVE_RUNNER_ENABLED),
+        "armed":               armed,
+        "eligible":            eligible,
+        "checks":              checks,
+        "mode":                mode,
+        "mode_ok":             mode_ok,
+        "is_live_instance":    bool(DISCORD_LIVE_ENABLED),
+        "require_traderspost": bool(LIVE_RUNNER_REQUIRE_TRADERSPOST),
+        "runner_qty":          int(LIVE_RUNNER_QTY),
+        "reduce_mode":         LIVE_RUNNER_REDUCE_MODE,
+        "trail_atr_mult":      LIVE_RUNNER_TRAIL_ATR_MULT,
+        "max_hold_min":        LIVE_RUNNER_MAX_HOLD_MIN,
+        "watch_interval_sec":  LIVE_RUNNER_WATCH_INTERVAL_SEC,
+        "needs_two_contracts": True,
+        "active_runners":      runners,
+        "active_count":        len(runners),
+        "updated_at":          now_utc().isoformat(),
+    }
+
+
+def adapt_traderspost_reduce(broker_symbol):
+    """Canonical intent -> a NON-REVERSING TradersPost flatten for the runner leg.
+    action='exit' closes the OPEN position for the symbol; unlike a blind
+    opposite-side market order it can NEVER over-fill into a reversed position. No
+    stopLoss/takeProfit bracket belongs on an exit. ticker+action satisfy the
+    required-field validator."""
+    return {
+        "ticker":    broker_symbol,
+        "action":    "exit",
+        "signal":    "AI Trading Partner RUNNER EXIT",
+    }
+
+
+def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_public,
+                                tp, direction, action, tp_symbol, entry, stop, t1, t2,
+                                contracts, source, release_slot, fingerprint, now):
+    """LIVE 2-contract runner entry (Option A; traderspost-only; gated by
+    _live_runner_eligible). Splits the order into a PRIMARY leg (qty = contracts -
+    runner_qty, stop + 1R TP — the existing bracket) and a RUNNER leg (qty =
+    runner_qty, stop ONLY, NO take-profit, left to trail via _live_runner_watch_loop).
+
+    Leg ordering is fail-closed:
+      • PRIMARY sent first. If it does NOT land (local block / 4xx / ambiguous) the
+        helper already released-or-held the dedupe slot inside _send_broker_order;
+        NO runner leg is attempted and the primary outcome is returned unchanged.
+      • RUNNER sent ONLY after a confirmed primary 2xx, and NEVER releases the dedupe
+        slot (a real primary fill exists). On any runner non-2xx the runner is
+        DISARMED and we degrade to a tracked primary-only position.
+
+    The returned plan tracks ONLY primary_qty so the existing stop/TP lifecycle
+    manages the primary; the runner is tracked in LIVE_RUNNERS_BY_INST and managed by
+    the watcher (its broker stop is the hard backstop). Returns (result, code)."""
+    send_url    = TRADERSPOST_WEBHOOK_URL
+    runner_qty  = max(1, min(LIVE_RUNNER_QTY, contracts - 1))
+    primary_qty = contracts - runner_qty                       # >= 1
+    primary_intent = dict(intent); primary_intent["quantity"] = primary_qty
+    runner_intent  = dict(intent); runner_intent["quantity"]  = runner_qty
+    primary_payload = adapt_traderspost(primary_intent)        # stop + 1R TP (bracket)
+    runner_payload  = adapt_traderspost(runner_intent)
+    runner_payload.pop("takeProfit", None)                     # runner: stop ONLY, no TP
+
+    primary_plan = dict(plan_public); primary_plan["quantity"] = primary_qty
+    runner_id    = f"{instrument}:{int(now)}"
+    _disc        = None
+    try:
+        _disc = _discord_url(instrument)
+    except Exception:
+        _disc = None
+
+    def _notify(msg):
+        if not _disc:
+            return
+        try:
+            requests.post(_disc, json={"content": msg}, timeout=5)
+        except requests.RequestException:
+            pass
+
+    # ── PRIMARY leg ────────────────────────────────────────────────────────────
+    p_res, p_code = _send_broker_order(mode, provider_label, instrument, primary_payload,
+                                       send_url, release_slot=release_slot,
+                                       order_kind="entry_primary")
+    if p_res is not None:
+        # Nothing usable was placed (local block / 4xx released the slot, ambiguous
+        # held it). No runner. Return the primary failure exactly as the single-order
+        # path would.
+        return p_res, p_code
+
+    # ── RUNNER leg (primary confirmed live) ────────────────────────────────────
+    # release_slot=None: a real primary fill exists, so the dedupe cooldown must
+    # NEVER be freed by the runner outcome.
+    r_res, r_code = _send_broker_order(mode, provider_label, instrument, runner_payload,
+                                       send_url, release_slot=None,
+                                       order_kind="entry_runner")
+
+    if r_res is None:
+        # Both legs live. Track the runner; the existing lifecycle tracks the primary.
+        _live_runner_set(instrument, {
+            "runner_id": runner_id, "instrument": instrument,
+            "direction": direction, "action": action,
+            "broker_symbol": intent["broker_symbol"],
+            "entry": entry, "stop": stop, "t1": t1, "t2": t2,
+            "runner_qty": runner_qty, "primary_qty": primary_qty,
+            "opened_at": now_utc().isoformat(), "opened_epoch": now,
+            "peak_price": entry, "trough_price": entry,
+            "state": "open", "reduce_state": "idle", "reduce_reason": None,
+            "fingerprint": fingerprint, "source": source,
+        })
+        logger.info("LIVE RUNNER entry %s %s: primary x%d (stop+TP) + runner x%d (stop only) sent.",
+                    instrument, direction, primary_qty, runner_qty)
+        _notify(f"🚀 **ORDER SENT (2-LEG RUNNER) → {provider_label} — {direction.upper()}**\n"
+                f"{tp_symbol} · {action.upper()} primary `{primary_qty}` (TP `{t1:.2f}`) + "
+                f"runner `{runner_qty}` (no TP, trailing)  ·  Stop `{stop:.2f}` ({tp.get('rr','1:1')})")
+        return {
+            "status": "sent",
+            "provider": provider_label, "mode": mode, "broker_verify_required": False,
+            "partial_fill": False, "runner_status": "sent", "runner_qty": runner_qty,
+            "plan": primary_plan,
+            "order": {"ticker": tp_symbol, "action": action, "quantity": primary_qty,
+                      "direction": direction, "type": "market",
+                      "stopLoss": stop, "takeProfit": t1, "target2": t2},
+            "runner": {"runner_id": runner_id, "quantity": runner_qty,
+                       "stopLoss": stop, "takeProfit": None, "state": "open"},
+        }, 200
+
+    # Runner did NOT land. The primary IS live regardless, so the caller must TRACK
+    # the primary (status 'sent') and never re-fire. Disarm the runner so we don't
+    # keep splitting orders until re-armed.
+    with LIVE_RUNNER_LOCK:
+        globals()["LIVE_RUNNER_ARMED"] = False
+    _ambiguous = bool((r_res or {}).get("broker_verify_required"))
+    if _ambiguous:
+        # Runner MAY be live — record it as verify_required (the watcher will not
+        # auto-reduce an unverified runner) and make the owner check the broker.
+        _live_runner_set(instrument, {
+            "runner_id": runner_id, "instrument": instrument,
+            "direction": direction, "action": action,
+            "broker_symbol": intent["broker_symbol"],
+            "entry": entry, "stop": stop, "t1": t1, "t2": t2,
+            "runner_qty": runner_qty, "primary_qty": primary_qty,
+            "opened_at": now_utc().isoformat(), "opened_epoch": now,
+            "peak_price": entry, "trough_price": entry,
+            "state": "verify_required", "reduce_state": "idle", "reduce_reason": None,
+            "fingerprint": fingerprint, "source": source,
+        })
+        logger.warning("LIVE RUNNER %s: primary x%d LIVE, runner x%d UNCONFIRMED — "
+                       "verify at broker; runner disarmed.", instrument, primary_qty, runner_qty)
+        _notify(f"⚠️ **RUNNER UNCONFIRMED → {provider_label} — {direction.upper()}**\n"
+                f"Primary `{primary_qty}` is LIVE (stop+TP). Runner `{runner_qty}` send was NOT "
+                f"confirmed — **verify at your broker**. Runner DISARMED.")
+        return {
+            "status": "sent",
+            "provider": provider_label, "mode": mode, "broker_verify_required": True,
+            "partial_fill": True, "runner_status": "verify_required", "runner_qty": runner_qty,
+            "plan": primary_plan,
+            "order": {"ticker": tp_symbol, "action": action, "quantity": primary_qty,
+                      "direction": direction, "type": "market",
+                      "stopLoss": stop, "takeProfit": t1, "target2": t2},
+            "reason": (r_res or {}).get("reason"),
+        }, 502
+
+    # Runner DEFINITELY rejected (4xx) — no runner position exists. Primary-only.
+    logger.warning("LIVE RUNNER %s: primary x%d LIVE, runner x%d REJECTED (no runner "
+                   "position); single-leg, runner disarmed.", instrument, primary_qty, runner_qty)
+    _notify(f"⚠️ **PARTIAL FILL → {provider_label} — {direction.upper()}**\n"
+            f"Primary `{primary_qty}` is LIVE (stop+TP). Runner `{runner_qty}` was REJECTED by "
+            f"the broker — single-leg only. Runner DISARMED.")
+    return {
+        "status": "sent",
+        "provider": provider_label, "mode": mode, "broker_verify_required": False,
+        "partial_fill": True, "runner_status": "rejected", "runner_qty": runner_qty,
+        "plan": primary_plan,
+        "order": {"ticker": tp_symbol, "action": action, "quantity": primary_qty,
+                  "direction": direction, "type": "market",
+                  "stopLoss": stop, "takeProfit": t1, "target2": t2},
+        "reason": (r_res or {}).get("reason"),
+    }, 200
+
+
+def _execute_live_runner_reduce(instrument, runner_id=None, reason=""):
+    """Flatten the live runner leg on a discretionary exit signal. FAIL-CLOSED:
+    defaults to 'manual_required' (alert only, NO broker send) unless
+    LIVE_RUNNER_REDUCE_MODE == 'exit', in which case it sends a NON-REVERSING
+    {action:'exit'} flatten through the SAME audited _send_broker_order sink. The
+    reduce_state machine is the idempotency guard — only an 'open'/'idle' runner is
+    acted on, so the watcher can call this every cycle without double-sending.
+    Returns the reduce_state it left the runner in (or None when no runner matched)."""
+    rec = _live_runner_get(instrument)
+    if not rec:
+        return None
+    if runner_id is not None and rec.get("runner_id") != runner_id:
+        return None
+    if rec.get("state") != "open" or rec.get("reduce_state") != "idle":
+        return rec.get("reduce_state")        # already handled / not reducible
+
+    rid       = rec.get("runner_id")
+    direction = rec.get("direction")
+    qty       = rec.get("runner_qty")
+    reason    = (reason or "exit signal").strip()
+    _disc     = None
+    try:
+        _disc = _discord_url(instrument)
+    except Exception:
+        _disc = None
+
+    def _notify(msg):
+        if not _disc:
+            return
+        try:
+            requests.post(_disc, json={"content": msg}, timeout=5)
+        except requests.RequestException:
+            pass
+
+    # ── Fail-closed default: alert the owner to flatten by hand; never auto-send.
+    if LIVE_RUNNER_REDUCE_MODE != "exit":
+        _live_runner_update(instrument, rid, reduce_state="manual_required", reduce_reason=reason)
+        logger.warning("LIVE RUNNER %s: exit signal (%s) — auto-reduce OFF; manual flatten required.",
+                       instrument, reason)
+        _notify(f"🛑 **RUNNER EXIT SIGNAL ({reason}) — {instrument} {str(direction).upper()}**\n"
+                f"Flatten the runner leg `{qty}` MANUALLY at your broker (auto-reduce is OFF).")
+        return "manual_required"
+
+    # ── Opt-in auto flatten via the audited send sink. Mark pending BEFORE the POST
+    #    so a concurrent watch cycle sees it in-flight and skips.
+    _live_runner_update(instrument, rid, reduce_state="pending", reduce_reason=reason)
+    mode = resolve_execution_mode()
+    if mode != "traderspost":
+        # Runner is traderspost-only; defensively refuse anything else.
+        _live_runner_update(instrument, rid, reduce_state="manual_required", reduce_reason=reason)
+        _notify(f"🛑 **RUNNER EXIT ({reason}) — {instrument}**: non-traderspost mode; flatten manually.")
+        return "manual_required"
+    provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
+    payload = adapt_traderspost_reduce(rec.get("broker_symbol"))
+    res, _code = _send_broker_order(mode, provider_label, instrument, payload,
+                                    TRADERSPOST_WEBHOOK_URL, release_slot=None,
+                                    order_kind="runner_reduce")
+    if res is None:
+        _live_runner_update(instrument, rid, reduce_state="done", reduce_reason=reason)
+        _live_runner_clear(instrument, rid)
+        logger.info("LIVE RUNNER %s flattened (%s): exit confirmed.", instrument, reason)
+        _notify(f"✅ **RUNNER FLATTENED ({reason}) — {instrument} {str(direction).upper()}**\n"
+                f"Exit `{qty}` sent and confirmed by {provider_label}.")
+        return "done"
+    if (res or {}).get("broker_verify_required"):
+        _live_runner_update(instrument, rid, reduce_state="verify_required", reduce_reason=reason)
+        with LIVE_RUNNER_LOCK:
+            globals()["LIVE_RUNNER_ARMED"] = False
+        logger.warning("LIVE RUNNER %s reduce UNCONFIRMED (%s) — verify at broker; disarmed.",
+                       instrument, reason)
+        _notify(f"⚠️ **RUNNER REDUCE UNCONFIRMED ({reason}) — {instrument}**\n"
+                f"Exit MAY have sent — **verify at your broker**. Runner DISARMED.")
+        return "verify_required"
+    # Definite 4xx — runner still live; do not auto-retry (fail-closed → manual).
+    _live_runner_update(instrument, rid, reduce_state="failed", reduce_reason=reason)
+    logger.warning("LIVE RUNNER %s reduce REJECTED (%s) — runner still live; manual flatten.",
+                   instrument, reason)
+    _notify(f"⚠️ **RUNNER REDUCE REJECTED ({reason}) — {instrument}**\n"
+            f"Broker rejected the exit. Runner `{qty}` is STILL LIVE — flatten manually.")
+    return "failed"
+
+
+def _runner_exit_signal(rec):
+    """Discretionary runner-exit decision from RAW per-instrument stores ONLY (never
+    full_analysis — that recomputes the gate and has side effects). Returns
+    (exit: bool, reason: str). Every signal is independent and the runner ALSO carries
+    its own broker stop as the hard backstop, so a missing / stale store simply yields
+    NO discretionary exit (fail-open: let the broker stop manage it). Signals:
+    market-closed / session time-stop, VWAP loss, CVD-delta flip against the position,
+    and an ATR trail from the high-water mark."""
+    inst      = rec.get("instrument")
+    direction = (rec.get("direction") or "").lower()
+    is_long   = direction in ("long", "buy", "bull", "bullish")
+    is_short  = direction in ("short", "sell", "bear", "bearish")
+    if not (is_long or is_short):
+        return False, ""
+
+    # 1) Market closed / session time-stop.
+    try:
+        if not market_session_status().get("open", True):
+            return True, "market closed"
+    except Exception:
+        pass
+    try:
+        opened = float(rec.get("opened_epoch") or 0)
+        if opened:
+            held_min = (time.time() - opened) / 60.0
+            if held_min >= LIVE_RUNNER_MAX_HOLD_MIN:
+                return True, f"time-stop {int(held_min)}m"
+    except Exception:
+        pass
+
+    try:
+        price = current_price_for(inst)
+    except Exception:
+        price = None
+    if price is None:
+        return False, ""      # no price -> defer to the broker stop
+
+    # 2) VWAP loss (momentum gone): long below VWAP / short above VWAP.
+    try:
+        v = (VWAP_BY_TICKER.get(inst) or {}).get("value")
+        if v is not None:
+            if is_long and price < float(v):
+                return True, "VWAP loss"
+            if is_short and price > float(v):
+                return True, "VWAP loss"
+    except Exception:
+        pass
+
+    # 3) CVD-delta flip against the position.
+    try:
+        st = (CVD_BY_TICKER.get(inst) or {}).get("state")
+        if is_long and st == "bearish":
+            return True, "CVD flip"
+        if is_short and st == "bullish":
+            return True, "CVD flip"
+    except Exception:
+        pass
+
+    # 4) ATR trail from the high-water mark (only once the runner is in profit).
+    try:
+        atr = (get_volatility(inst) or {}).get("atr_pts")
+        if atr and float(atr) > 0:
+            band  = LIVE_RUNNER_TRAIL_ATR_MULT * float(atr)
+            entry = float(rec.get("entry") or price)
+            if is_long:
+                peak = max(float(rec.get("peak_price") or price), price)
+                if peak > entry and price <= peak - band:
+                    return True, "ATR trail"
+            else:
+                trough = min(float(rec.get("trough_price") or price), price)
+                if trough < entry and price >= trough + band:
+                    return True, "ATR trail"
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def _watch_live_runners():
+    """One sweep of the open live-runner legs. INERT unless LIVE_RUNNER_ENABLED AND
+    armed (a disarmed runner is left entirely to its broker stop). Updates each open
+    runner's high/low-water mark from raw price, then flattens via the fail-closed
+    _execute_live_runner_reduce on a discretionary exit signal. Read-only on the gate;
+    never touches scoring/sizing/dedupe. Best-effort and fail-open per runner."""
+    if not LIVE_RUNNER_ENABLED:
+        return
+    with LIVE_RUNNER_LOCK:
+        armed = LIVE_RUNNER_ARMED
+    if not armed:
+        return
+    snap = _live_runner_snapshot()
+    if not snap:
+        return
+    for inst, rec in snap.items():
+        try:
+            if rec.get("state") != "open" or rec.get("reduce_state") != "idle":
+                continue
+            rid = rec.get("runner_id")
+            try:
+                price = current_price_for(inst)
+            except Exception:
+                price = None
+            if price is not None:
+                new_peak   = max(float(rec.get("peak_price")   or price), price)
+                new_trough = min(float(rec.get("trough_price") or price), price)
+                if new_peak != rec.get("peak_price") or new_trough != rec.get("trough_price"):
+                    updated = _live_runner_update(inst, rid, peak_price=new_peak,
+                                                  trough_price=new_trough)
+                    if updated:
+                        rec = updated
+            should_exit, reason = _runner_exit_signal(rec)
+            if should_exit:
+                _execute_live_runner_reduce(inst, rid, reason)
+        except Exception as exc:
+            logger.warning("Live-runner watch (%s) error: %s", inst, exc)
+
+
+def _live_runner_watch_loop():
+    """Dedicated live-runner watch timer (LIVE_RUNNER_WATCH_INTERVAL_SEC), separate
+    from the paper managed-trade lifecycle. Self-reschedules; never dies. Only started
+    at boot when LIVE_RUNNER_ENABLED, and _watch_live_runners is itself inert unless
+    enabled + armed, so this is a true no-op when the feature is off."""
+    try:
+        _watch_live_runners()
+    except Exception as exc:
+        logger.warning("Live-runner watch loop error: %s", exc)
+    finally:
+        threading.Timer(LIVE_RUNNER_WATCH_INTERVAL_SEC, _live_runner_watch_loop).start()
+
+
 def execute_trade_gateway(instrument, contracts, source="manual"):
     """Shared, server-authoritative execution gate behind /traderspost AND the
     auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
@@ -25149,6 +26100,17 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
     else:  # pickmytrade
         send_url = EXECUTION_WEBHOOK_URL
         payload  = adapt_pickmytrade(intent)
+
+    # LIVE 2-contract runner (Option A): when ENABLED + ARMED + traderspost + >=2
+    # contracts on the live instance, split this into a primary (stop+1R TP) leg and a
+    # runner (stop-only, trailing) leg via the SAME audited send sink. When any
+    # condition is false, _live_runner_eligible returns False and we fall through to
+    # the byte-identical single-order send below.
+    if _live_runner_eligible(mode, instrument, contracts):
+        return _execute_live_two_leg_entry(
+            mode, provider_label, instrument, intent, plan_public, tp,
+            direction, action, tp_symbol, entry, stop, t1, t2,
+            contracts, source, _release_slot, fingerprint, now)
 
     # Audited send sink (shared with the LIVE 2-contract runner legs / reduce in
     # Phase 3b). Byte-identical for the single-order path: it logs the redacted
@@ -26977,6 +27939,71 @@ def dashboard():
   <div class="nf-fid">Owner-only. The toggle &amp; decision log are in-memory and reset on restart; accounts persist in the database.</div>
 </div>
 
+<!-- Trade-management analytics (MFE/MAE booleans + commission + oversized-loss).
+     DISPLAY-ONLY; hidden unless TRADE_MGMT/COMMISSION/OVERSIZED analytics are on. -->
+<div class="mod" id="mod-trademgmt" style="display:none">
+  <div class="mod-h">📐 Trade Management <span id="tmg-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY</span></div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 6px">Most recent closed trade</div>
+  <div class="cvd-stats">
+    <div class="gstat"><div class="l">Outcome</div><div class="v" id="tmg-outcome">—</div></div>
+    <div class="gstat"><div class="l">R Multiple</div><div class="v" id="tmg-r">—</div></div>
+    <div class="gstat"><div class="l">MFE</div><div class="v" id="tmg-mfe">—</div></div>
+    <div class="gstat"><div class="l">MAE</div><div class="v" id="tmg-mae">—</div></div>
+  </div>
+  <div class="cvd-stats">
+    <div class="gstat"><div class="l">Gross</div><div class="v" id="tmg-gross">—</div></div>
+    <div class="gstat"><div class="l">Fees</div><div class="v" id="tmg-fees">—</div></div>
+    <div class="gstat"><div class="l">Net</div><div class="v" id="tmg-net">—</div></div>
+    <div class="gstat"><div class="l">Fee % Gross</div><div class="v" id="tmg-feepct">—</div></div>
+  </div>
+  <div class="se-bias-h">Session aggregate</div>
+  <div id="tmg-flags" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+  <div class="se-reason" id="tmg-note" style="margin-top:6px">—</div>
+  <div id="tmg-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
+<!-- Session Quality — today's live trading-session report card (6 components).
+     DISPLAY-ONLY; hidden unless SESSION_QUALITY_ENABLED. -->
+<div class="mod" id="mod-sessionq" style="display:none">
+  <div class="mod-h">🎓 Session Quality <span style="font-size:10px;letter-spacing:1px;color:#6b7280">TODAY · DISPLAY</span></div>
+  <div style="display:flex;align-items:baseline;gap:12px;margin:2px 0 6px;flex-wrap:wrap">
+    <div id="sq-grade" style="font-size:30px;font-weight:800">—</div>
+    <div id="sq-score" style="font-size:12px;color:#9aa"></div>
+  </div>
+  <div id="sq-bars"></div>
+  <div id="sq-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
+<!-- Bot Hold Score — advisory HOLD/SCALE OUT/EXIT conviction for OPEN bot positions.
+     DISPLAY-ONLY; hidden unless BOT_HOLD_SCORE_ENABLED and a position is open. -->
+<div class="mod" id="mod-bothold" style="display:none">
+  <div class="mod-h">🤖 Bot Hold Score <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span></div>
+  <div id="bh-list"></div>
+  <div id="bh-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
+<!-- LIVE 2-contract runner (Option B) — arming control + eligibility. Owner-only.
+     Hidden unless LIVE_RUNNER_ENABLED (env). The armed flag is in-memory and RESETS
+     OFF on every restart/publish. Arming never bypasses the fail-closed gateway. -->
+<div class="mod" id="mod-liverunner" style="display:none">
+  <div class="mod-h">🏃 LIVE Runner <span id="lr-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">OPTION B</span></div>
+  <div class="focus-row">
+    <span class="focus-lbl">Arm split-runner</span>
+    <span id="lr-arm" class="mute-pill" role="button" tabindex="0" onclick="toggleLiveRunner()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLiveRunner();}">off</span>
+    <span id="lr-eligible" class="focus-lbl" style="opacity:.8"></span>
+  </div>
+  <div class="se-bias-h">Eligibility (all required)</div>
+  <div id="lr-checks" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+  <div class="cvd-stats" style="margin-top:6px">
+    <div class="gstat"><div class="l">Mode</div><div class="v" id="lr-mode">—</div></div>
+    <div class="gstat"><div class="l">Runner Qty</div><div class="v" id="lr-qty">—</div></div>
+    <div class="gstat"><div class="l">Reduce</div><div class="v" id="lr-reduce">—</div></div>
+    <div class="gstat"><div class="l">Open Runners</div><div class="v" id="lr-active">—</div></div>
+  </div>
+  <div class="se-reason" id="lr-note" style="margin-top:6px">Also needs a ≥2-contract setup AND TradersPost "Use signal quantity" turned ON. Splits a READY entry into a 1R primary + a trailed runner. Real orders. Resets OFF on restart.</div>
+  <div id="lr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
 <div class="mod" id="mod-cvd">
   <div class="mod-h">📊 Volume Delta (CVD) &amp; RVOL</div>
@@ -28057,6 +29084,13 @@ function renderModules(d){
   // ── Module 10c: Blocked Orders — locally-rejected invalid-payload orders (DISPLAY-ONLY) ──
   renderExecRejections(d);
   renderProp(d);
+
+  // ── Trade-management analytics + session quality + bot hold + LIVE runner arming
+  //    (all DISPLAY/CONTROL; each panel hides itself unless its flag/data is present) ──
+  renderTradeMgmt(d);
+  renderSessionQuality(d);
+  renderBotHold(d);
+  renderLiveRunner(d);
 
   // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
   renderReportMode(d);
@@ -31581,6 +32615,164 @@ function mbActColor(a, inv){
 function _botCell(label, val){
   return '<div><div class="mb-mc-l">' + aiEsc(label) + '</div><div class="mb-mc-v">' + aiEsc(val) + '</div></div>';
 }
+function renderTradeMgmt(d){
+  const tm=(d && d.trade_management) || null;
+  const mod=document.getElementById('mod-trademgmt');
+  if(!mod) return;
+  if(!tm || !tm.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id,txt,col){ const e=document.getElementById(id); if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; } };
+  const badge=document.getElementById('tmg-badge');
+  if(badge){
+    const parts=[];
+    if(tm.analytics_enabled) parts.push('MFE/MAE');
+    if(tm.commission_enabled) parts.push('FEES');
+    if(tm.oversized_loss_enabled) parts.push('LOSS-CAP');
+    badge.textContent=parts.length?parts.join(' · '):'DISPLAY';
+  }
+  const recent=tm.recent||[];
+  const last=recent.length?recent[0]:null;
+  const ids=['tmg-outcome','tmg-r','tmg-mfe','tmg-mae','tmg-gross','tmg-fees','tmg-net','tmg-feepct'];
+  if(last){
+    const r=(last.r_multiple!=null)?last.r_multiple:null;
+    _set('tmg-outcome', (last.symbol||'—')+' '+(last.direction||'')+' · '+(last.exit_reason||'closed'));
+    _set('tmg-r', r!=null?(r+'R'):'—', r!=null?(r>=0?'var(--green)':'var(--red)'):'');
+    _set('tmg-mfe', (last.mfe_r!=null)?(last.mfe_r+'R'):'—');
+    _set('tmg-mae', (last.mae_r!=null)?(last.mae_r+'R'):'—');
+    _set('tmg-gross', (last.gross_pnl!=null)?('$'+last.gross_pnl):'—');
+    _set('tmg-fees', (last.fees!=null)?('$'+last.fees):'—');
+    _set('tmg-net', (last.net_pnl!=null)?('$'+last.net_pnl):'—', (last.net_pnl!=null)?(last.net_pnl>=0?'var(--green)':'var(--red)'):'');
+    _set('tmg-feepct', (last.fee_pct_gross_profit!=null)?(last.fee_pct_gross_profit+'%'):'—', last.fee_warn?'var(--red)':'');
+  } else {
+    ids.forEach(function(id){ _set(id,'—',''); });
+  }
+  const fl=document.getElementById('tmg-flags');
+  if(fl){
+    const chip=function(label,val,bad){ return '<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+(bad?'#ef4444':'#9aa')+';background:rgba(148,163,184,.12)">'+aiEsc(label)+': '+aiEsc(val)+'</span>'; };
+    fl.innerHTML=[
+      chip('Trades', tm.count, false),
+      chip('W/L', (tm.wins+'/'+tm.losses), false),
+      chip('Target-first', tm.target_first, false),
+      chip('Stop-first', tm.stop_first, false),
+      chip('Oversized losses', tm.oversized_loss_count, tm.oversized_loss_count>0)
+    ].join('');
+  }
+  _set('tmg-note', 'Last '+(tm.count||0)+': gross $'+tm.total_gross+' · fees $'+tm.total_fees+' · net $'+tm.total_net+(tm.db_ready?'':' · (in-memory)'));
+  _set('tmg-foot', 'Fee/contract round-trip $'+tm.fee_per_contract_round_trip+' · oversized > '+tm.oversized_loss_mult+'x risk · display-only, never sizes/gates · updated '+(tm.updated_at? new Date(tm.updated_at).toLocaleTimeString():'—'));
+}
+function _sqGradeColor(g){ g=String(g||''); if(g.charAt(0)==='A') return 'var(--green)'; if(g.charAt(0)==='B') return '#38bdf8'; if(g.charAt(0)==='C') return '#f59e0b'; return 'var(--red)'; }
+function renderSessionQuality(d){
+  const sq=(d && d.session_quality) || null;
+  const mod=document.getElementById('mod-sessionq');
+  if(!mod) return;
+  if(!sq || !sq.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id,txt,col){ const e=document.getElementById(id); if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; } };
+  const bars=document.getElementById('sq-bars');
+  if(sq.status!=='ok'){
+    _set('sq-grade','—','');
+    _set('sq-score', sq.message||'No closed trades today yet.','#9aa');
+    if(bars) bars.innerHTML='';
+    _set('sq-foot','Session '+(sq.session_date_et||'')+' · display-only');
+    return;
+  }
+  _set('sq-grade', sq.overall_grade||'—', _sqGradeColor(sq.overall_grade));
+  _set('sq-score', (sq.overall_score!=null?sq.overall_score:'—')+' · '+(sq.trade_count||0)+' trades ('+(sq.wins||0)+'W/'+(sq.losses||0)+'L)','#9aa');
+  if(bars){
+    const defs=[['Entry quality','entry_quality'],['Risk control','risk_control'],['Holding winners','holding_winners'],['Cutting losers','cutting_losers'],['Overtrading','overtrading'],['Commission eff.','commission_efficiency']];
+    bars.innerHTML=defs.map(function(p){
+      const v=sq[p[1]];
+      if(v==null) return '<div style="margin:3px 0;font-size:11px;color:#6b7280;display:flex;justify-content:space-between"><span>'+aiEsc(p[0])+'</span><span>n/a</span></div>';
+      const pct=Math.max(0,Math.min(100,v));
+      const col=pct>=80?'#22c55e':pct>=60?'#f59e0b':'#ef4444';
+      return '<div style="margin:3px 0">'
+        +'<div style="display:flex;justify-content:space-between;font-size:11px;color:#9aa"><span>'+aiEsc(p[0])+'</span><span style="color:'+col+'">'+v+'</span></div>'
+        +'<div style="height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+col+'"></div></div>'
+        +'</div>';
+    }).join('');
+  }
+  _set('sq-foot', 'Net $'+sq.total_net+' · fees $'+sq.total_fees+' · oversized '+(sq.oversized_loss_count||0)+' · display-only · '+(sq.session_date_et||''));
+}
+function _bhVerdictColor(v){ v=String(v||''); if(v==='HOLD') return 'var(--green)'; if(v==='SCALE OUT') return '#f59e0b'; return 'var(--red)'; }
+function renderBotHold(d){
+  const bh=(d && d.bot_hold_score) || null;
+  const mod=document.getElementById('mod-bothold');
+  if(!mod) return;
+  if(!bh || !bh.enabled || !(bh.positions && bh.positions.length)){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const list=document.getElementById('bh-list');
+  if(list){
+    list.innerHTML=(bh.positions||[]).map(function(p){
+      const isLong=String(p.direction||'').toLowerCase().charAt(0)==='l';
+      const dirCol=isLong?'var(--green)':'var(--red)';
+      const comps=p.components||{};
+      const cbars=Object.keys(comps).map(function(k){
+        const c=comps[k]||{}; const v=(c.score!=null)?c.score:0;
+        const pct=Math.max(0,Math.min(100,v));
+        const col=pct>=65?'#22c55e':pct>=45?'#f59e0b':'#ef4444';
+        return '<div style="margin:2px 0">'
+          +'<div style="display:flex;justify-content:space-between;font-size:10px;color:#9aa"><span>'+aiEsc(k)+'</span><span style="color:'+col+'">'+v+'</span></div>'
+          +'<div style="height:4px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+col+'"></div></div>'
+          +(c.detail?'<div style="font-size:9px;color:#6b7280">'+aiEsc(c.detail)+'</div>':'')
+          +'</div>';
+      }).join('');
+      const head='<div class="mb-bot-top">'
+        +'<span class="mb-bot-badge">🤖 '+aiEsc(p.score!=null?p.score:'')+'</span>'
+        +'<span class="mb-bot-sym">'+aiEsc(p.symbol||'—')+'</span>'
+        +'<span class="mb-bot-dir" style="color:'+dirCol+'">'+aiEsc(p.direction||'')+' @ '+aiEsc(p.entry!=null?p.entry:'—')+' · '+aiEsc(p.current_r!=null?(p.current_r+'R'):'—')+'</span>'
+        +'<span style="margin-left:auto;font-weight:800;color:'+_bhVerdictColor(p.verdict)+'">'+aiEsc(p.verdict||'')+'</span>'
+        +'</div>';
+      const meta='<div style="font-size:10px;color:#6b7280;margin:2px 0">stop '+aiEsc(p.stop!=null?p.stop:'—')+' · held '+aiEsc(p.held_minutes!=null?(p.held_minutes+'m'):'—')+(p.stop_breached?' · ⚠ STOP BREACHED':'')+'</div>';
+      return '<div class="mb-bot-card">'+head+meta+cbars+'</div>';
+    }).join('');
+  }
+  const foot=document.getElementById('bh-foot');
+  if(foot) foot.textContent='Advisory only — never closes a position · '+(bh.count||0)+' open · updated '+(bh.updated_at? new Date(bh.updated_at).toLocaleTimeString():'—');
+}
+function renderLiveRunner(d){
+  const lr=(d && d.live_runner) || null;
+  const mod=document.getElementById('mod-liverunner');
+  if(!mod) return;
+  if(!lr || !lr.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const _set=function(id,txt){ const e=document.getElementById(id); if(e) e.textContent=(txt==null||txt==='')?'—':txt; };
+  const armEl=document.getElementById('lr-arm');
+  if(armEl){
+    const on=!!lr.armed;
+    armEl.textContent=on?'ARMED':'off';
+    armEl.classList.toggle('is-armed', on);
+    armEl.setAttribute('aria-pressed', on?'true':'false');
+  }
+  const elig=document.getElementById('lr-eligible');
+  if(elig){ elig.textContent=lr.eligible?'eligible now':'not eligible'; elig.style.color=lr.eligible?'var(--green)':'#f59e0b'; }
+  const ch=document.getElementById('lr-checks');
+  if(ch){
+    ch.innerHTML=(lr.checks||[]).map(function(c){
+      const ok=!!c.ok;
+      return '<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+(ok?'#22c55e':'#ef4444')+';background:'+(ok?'rgba(34,197,94,.12)':'rgba(239,68,68,.12)')+'">'+(ok?'✓ ':'✗ ')+aiEsc(c.label)+'</span>';
+    }).join('');
+  }
+  _set('lr-mode', (lr.mode||'—')+(lr.mode_ok?'':' (needs traderspost)'));
+  _set('lr-qty', lr.runner_qty);
+  _set('lr-reduce', lr.reduce_mode);
+  _set('lr-active', lr.active_count);
+  _set('lr-foot', 'Trail x'+(lr.trail_atr_mult)+' ATR · max hold '+(lr.max_hold_min)+'m · watch '+(lr.watch_interval_sec)+'s · updated '+(lr.updated_at? new Date(lr.updated_at).toLocaleTimeString():'—'));
+}
+function toggleLiveRunner(){
+  const armEl=document.getElementById('lr-arm');
+  const cur=!!(armEl && armEl.classList.contains('is-armed'));
+  const next=!cur;
+  if(next){
+    if(!confirm('ARM the LIVE 2-contract runner?\\n\\nWhen armed AND a >=2-contract setup goes READY on the live traderspost instance, the entry is SPLIT into a primary (1R bracket) + a runner (stop only, trailed). This places REAL orders.\\n\\nRequires TradersPost "Use signal quantity" ON. Resets OFF on restart.')) return;
+  }
+  api('/live-runner', { armed: next })
+    .then(function(r){
+      if(!r || r.status!=='ok'){ toast('Live-runner update failed', false); return; }
+      renderLiveRunner({ live_runner: r.live_runner });
+      toast(next ? 'LIVE runner ARMED' : 'LIVE runner disarmed');
+    })
+    .catch(function(){ toast('Live-runner update failed', false); });
+}
 function renderBotPositions(rows){
   var wrap = document.getElementById('mb-bot');
   var list = document.getElementById('mb-bot-list');
@@ -31783,6 +32975,28 @@ def auto_trade_toggle():
         "max_per_day":              AUTO_TRADE_MAX_PER_DAY,
         "contracts":                AUTO_TRADE_CONTRACTS,
     }), 200
+
+
+@app.route("/live-runner", methods=["GET", "POST"])
+def live_runner_toggle():
+    """Read or ARM/DISARM the LIVE 2-contract runner (Option B).
+
+    POST {armed: bool} flips the in-memory LIVE_RUNNER_ARMED flag. Owner-only (Basic
+    Auth + CSRF via the Express proxy; deliberately NOT in OPEN_PATHS). The flag is
+    in-memory and RESETS OFF on every restart/republish (fail-safe toward the single-
+    order path). Arming is purely a CONTROL over the EXISTING fail-closed gateway: it
+    never bypasses _live_runner_eligible, so the split stays inert unless the engine is
+    enabled on the live traderspost instance with a >=2-contract setup. Returns the
+    full status view either way (GET is a pure read)."""
+    global LIVE_RUNNER_ARMED
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "armed" in data:
+            want = bool(data.get("armed"))
+            with LIVE_RUNNER_LOCK:
+                LIVE_RUNNER_ARMED = want
+            logger.info("LIVE runner %s", "ARMED" if want else "DISARMED")
+    return jsonify({"status": "ok", "live_runner": live_runner_status_view()}), 200
 
 
 @app.route("/prop-protection", methods=["GET", "POST"])
@@ -32932,6 +34146,8 @@ if __name__ == "__main__":
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
     threading.Timer(0, _managed_watch_loop).start()  # open-trade exit (stop/TP) watcher on its own fast timer (MANAGED_WATCH_INTERVAL); no-op while flat, never feeds the gate
+    if LIVE_RUNNER_ENABLED:
+        threading.Timer(0, _live_runner_watch_loop).start()  # LIVE 2-contract runner watcher (own timer); only started when the feature is enabled, and itself inert unless armed
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
