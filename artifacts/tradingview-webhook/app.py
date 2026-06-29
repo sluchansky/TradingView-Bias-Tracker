@@ -23819,6 +23819,293 @@ def bt_export():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Scalping Strategy Research Engine (RESEARCH / SIMULATION / DISPLAY-ONLY)
+# ────────────────────────────────────────────────────────────────────────────
+# Continuously researches, stores and backtests NEW scalp strategies WITHOUT ever
+# touching the live money path. Backed by scalp_research.py, which imports ONLY the
+# PURE helpers from backtest_engine — it never registers a detector into the live
+# engine, gate, auto-trade, scoring, sizing, dedupe, Discord or /traderspost. New
+# strategies live in live_status ∈ {watch, simulation, recommended} ONLY; promotion
+# is advisory TEXT, a manual human decision made OUTSIDE this feature.
+#
+# Persistence is the same convention as everything else here: app-side INSERT/SELECT/
+# UPSERT ONLY, NO in-app DDL — the two tables (scalp_strategy_library +
+# scalp_strategy_research) are created out-of-band (database tool in dev + the Publish
+# schema-diff in prod). This code probes for them, FAIL-OPEN (a missing table / down DB
+# simply disables the research panels and never affects the rest of the bot). The
+# recompute is single-flight, throttled, gated to the live instance at boot, and NEVER
+# runs in the webhook / gate path.
+# ════════════════════════════════════════════════════════════════════════════
+SCALP_RESEARCH_DB_READY          = False
+SCALP_RESEARCH_LIBRARY_SEEDED    = False
+SCALP_RESEARCH_CACHE             = None              # last computed view dict (display)
+SCALP_RESEARCH_GENERATED_AT      = None
+SCALP_RESEARCH_CACHE_LOCK        = threading.Lock()  # brief atomic cache-swap ONLY
+SCALP_RESEARCH_RECALC_LOCK       = threading.Lock()  # single-flight: only ONE recompute at a time
+SCALP_RESEARCH_LAST_RUN_MONO     = 0.0               # monotonic throttle clock
+SCALP_RESEARCH_MIN_INTERVAL_SECS = 1800             # never auto-recompute more than every 30 min
+
+_SCALP_LIB_COLS = ("strategy_key", "strategy_name", "source_type", "market_type",
+                   "timeframe", "setup_rules", "entry_trigger", "stop_logic",
+                   "target_logic", "required_confirmations", "avoid_conditions",
+                   "example_chart_pattern", "confidence_level", "backtest_status")
+
+_SCALP_RESEARCH_ROW_COLS = ("strategy_key", "symbol", "dataset_id", "mode", "management",
+                            "total_trades", "win_rate", "avg_r", "net_r", "profit_factor",
+                            "max_drawdown_r", "best_session", "best_hour_label",
+                            "expectancy", "tradable", "sample_window")
+
+
+def _check_scalp_research_db_ready():
+    """Probe scalp_strategy_library + scalp_strategy_research (no DDL) and set
+    SCALP_RESEARCH_DB_READY. FAIL-OPEN: a missing table / unavailable DB disables the
+    research engine and never touches the rest of the bot."""
+    global SCALP_RESEARCH_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM scalp_strategy_library LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM scalp_strategy_research LIMIT 1")
+            cur.fetchone()
+        SCALP_RESEARCH_DB_READY = True
+        logger.info("scalp strategy research tables ready")
+    except Exception as exc:
+        logger.warning("scalp research tables unavailable (research engine disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _seed_scalp_library():
+    """Idempotent catalog seed. INSERT every STRATEGY_LIBRARY row ON CONFLICT
+    (strategy_key) DO UPDATE the DESCRIPTIVE fields only — NEVER live_status (so a
+    recompute-assigned simulation/recommended status survives reseeds). FAIL-OPEN."""
+    global SCALP_RESEARCH_LIBRARY_SEEDED
+    if not SCALP_RESEARCH_DB_READY:
+        return
+    try:
+        import scalp_research as sr
+    except Exception as exc:
+        logger.warning("scalp_research import failed (seed skipped): %s", exc)
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in _SCALP_LIB_COLS
+                               if c != "strategy_key")
+        placeholders = ", ".join(["%s"] * len(_SCALP_LIB_COLS))
+        sql = (f"INSERT INTO scalp_strategy_library ({', '.join(_SCALP_LIB_COLS)}) "
+               f"VALUES ({placeholders}) "
+               f"ON CONFLICT (strategy_key) DO UPDATE SET {set_clause}, updated_at = now()")
+        with conn.cursor() as cur:
+            for e in sr.STRATEGY_LIBRARY:
+                cur.execute(sql, tuple(e.get(c) for c in _SCALP_LIB_COLS))
+        conn.commit()
+        SCALP_RESEARCH_LIBRARY_SEEDED = True
+        logger.info("scalp_strategy_library seeded/refreshed (%d strategies)",
+                    len(sr.STRATEGY_LIBRARY))
+    except Exception as exc:
+        logger.warning("scalp library seed failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _scalp_research_datasets():
+    """Build the research dataset list from the backtest candle store: pick the LARGEST
+    5m dataset per symbol (don't hardcode ids — prod has different ids). Returns []
+    fail-open when the candle store is unavailable."""
+    out = []
+    try:
+        metas = _bt_list_datasets()
+    except Exception as exc:
+        logger.warning("scalp research dataset list failed: %s", exc)
+        return out
+    best_by_symbol = {}
+    for m in metas or []:
+        if (m.get("timeframe") or "").lower() not in ("5m", "5"):
+            continue
+        sym = m.get("symbol")
+        if not sym:
+            continue
+        cur = best_by_symbol.get(sym)
+        if cur is None or (m.get("row_count") or 0) > (cur.get("row_count") or 0):
+            best_by_symbol[sym] = m
+    for sym, m in best_by_symbol.items():
+        try:
+            candles = _bt_load_candles(m["id"])
+        except Exception:
+            candles = []
+        if len(candles) < 50:
+            continue
+        out.append({"symbol": sym, "dataset_id": m["id"], "candles": candles,
+                    "window": f"{sym} {m.get('timeframe')} ({len(candles)} bars)"})
+    return out
+
+
+def _persist_scalp_research(rows, live_status_map):
+    """UPSERT per-strategy research rows + refresh the catalog's ADVISORY live_status
+    from the freshly-computed view. live_status here is ADVISORY ONLY
+    (watch/simulation/recommended) — never an actionable/live value. FAIL-OPEN."""
+    if not SCALP_RESEARCH_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        set_clause = ", ".join(
+            f"{c} = EXCLUDED.{c}" for c in _SCALP_RESEARCH_ROW_COLS
+            if c not in ("strategy_key", "symbol", "dataset_id", "management"))
+        placeholders = ", ".join(["%s"] * len(_SCALP_RESEARCH_ROW_COLS))
+        sql = (f"INSERT INTO scalp_strategy_research ({', '.join(_SCALP_RESEARCH_ROW_COLS)}) "
+               f"VALUES ({placeholders}) "
+               f"ON CONFLICT (strategy_key, symbol, dataset_id, management) DO UPDATE SET "
+               f"{set_clause}, run_at = now()")
+        with conn.cursor() as cur:
+            for r in rows:
+                cur.execute(sql, tuple(r.get(c) for c in _SCALP_RESEARCH_ROW_COLS))
+            for key, status in (live_status_map or {}).items():
+                if status not in ("watch", "simulation", "recommended"):
+                    continue  # belt-and-suspenders: never persist a live/actionable value here
+                cur.execute(
+                    "UPDATE scalp_strategy_library SET live_status = %s, updated_at = now() "
+                    "WHERE strategy_key = %s",
+                    (status, key))
+        conn.commit()
+    except Exception as exc:
+        logger.warning("scalp research persist failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _recompute_scalp_research(force=False):
+    """Single-flight, throttled research recompute. Loads candle datasets, runs the
+    PURE research engine, UPSERTs the rows, refreshes advisory catalog status, and swaps
+    the display cache. NEVER called from the webhook / gate path. FAIL-OPEN."""
+    global SCALP_RESEARCH_CACHE, SCALP_RESEARCH_GENERATED_AT, SCALP_RESEARCH_LAST_RUN_MONO
+    if not SCALP_RESEARCH_DB_READY:
+        return
+    if not SCALP_RESEARCH_RECALC_LOCK.acquire(blocking=False):
+        return  # a recompute is already running — single-flight
+    try:
+        now_mono = time.monotonic()
+        if (not force) and SCALP_RESEARCH_LAST_RUN_MONO and \
+                (now_mono - SCALP_RESEARCH_LAST_RUN_MONO) < SCALP_RESEARCH_MIN_INTERVAL_SECS:
+            return  # throttled
+        try:
+            import scalp_research as sr
+        except Exception as exc:
+            logger.warning("scalp_research import failed (recompute skipped): %s", exc)
+            return
+        datasets = _scalp_research_datasets()
+        if not datasets:
+            logger.info("scalp research recompute skipped: no candle datasets available")
+            return
+        try:
+            result = sr.run_research(datasets)
+        except Exception as exc:
+            logger.warning("scalp research run failed: %s", exc)
+            return
+        view = result.get("view") or {}
+        _persist_scalp_research(result.get("rows") or [], view.get("live_status_map") or {})
+        with SCALP_RESEARCH_CACHE_LOCK:                # brief atomic swap ONLY
+            SCALP_RESEARCH_CACHE        = view
+            SCALP_RESEARCH_GENERATED_AT = result.get("generated_at")
+        SCALP_RESEARCH_LAST_RUN_MONO = now_mono
+        logger.info("scalp research recomputed: %d strategies, %d rows, %d datasets",
+                    (view.get("counts") or {}).get("total", 0),
+                    len(result.get("rows") or []), len(datasets))
+    finally:
+        SCALP_RESEARCH_RECALC_LOCK.release()
+
+
+def _scalp_research_library_only():
+    """Catalog (library) snapshot straight from the DB for the not-yet-computed state,
+    so the dashboard can show the 19 strategies before the first run. FAIL-OPEN."""
+    if not SCALP_RESEARCH_DB_READY:
+        return []
+    conn = _learning_conn()
+    if conn is None:
+        return []
+    try:
+        cols = list(_SCALP_LIB_COLS) + ["live_status"]
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {', '.join(cols)} FROM scalp_strategy_library ORDER BY id ASC")
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("scalp library read failed: %s", exc)
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/scalp-research", methods=["GET"])
+def scalp_research_get():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS). Returns the cached
+    research view, or {ready:False, library:[...]} before the first recompute.
+    DISPLAY-ONLY — reading this never triggers a (potentially slow) recompute."""
+    if not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "ready": False,
+                        "error": "Database not configured — research engine disabled."}), 503
+    if not SCALP_RESEARCH_DB_READY:
+        _check_scalp_research_db_ready()
+    if not SCALP_RESEARCH_DB_READY:
+        return jsonify({"ok": False, "ready": False,
+                        "error": "Scalp research tables not provisioned yet."}), 503
+    with SCALP_RESEARCH_CACHE_LOCK:
+        view = SCALP_RESEARCH_CACHE
+    if view is None:
+        return jsonify({"ok": True, "ready": False,
+                        "library": _scalp_research_library_only(),
+                        "safety_note": "Research/simulation only. New strategies never "
+                                       "auto-trade live; promotion is a manual human decision.",
+                        "hint": "No research run yet — use Run research to compute stats."})
+    return jsonify({"ok": True, **view})
+
+
+@app.route("/scalp-research", methods=["POST"])
+def scalp_research_post():
+    """Owner-only. Triggers a research recompute in the BACKGROUND (single-flight) and
+    returns immediately — never blocks the request on the simulation. Manual triggers
+    force past the throttle; concurrent triggers are deduped by the single-flight lock."""
+    if not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "Database not configured."}), 503
+    if not SCALP_RESEARCH_DB_READY:
+        _check_scalp_research_db_ready()
+    if not SCALP_RESEARCH_DB_READY:
+        return jsonify({"ok": False, "error": "Scalp research tables not provisioned yet."}), 503
+    threading.Thread(target=_recompute_scalp_research, kwargs={"force": True},
+                     name="scalp-research-recompute", daemon=True).start()
+    return jsonify({"ok": True, "started": True,
+                    "note": "Research recompute started in the background. "
+                            "Poll GET /scalp-research for the result."})
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # TradeZella journal import + review (owner-only, REVIEW-ONLY)
 # ────────────────────────────────────────────────────────────────────────────
 # Upload a TradeZella (or generic broker) trades CSV, persist the parsed rows,
@@ -28694,6 +28981,7 @@ def dashboard():
   <div class="view-btn active" id="vb-live" onclick="setView('live')">📊 Live</div>
   <div class="view-btn" id="vb-bt" onclick="setView('backtest')">🧪 Backtest</div>
   <div class="view-btn" id="vb-tz" onclick="setView('tradezella')">📒 TradeZella</div>
+  <div class="view-btn" id="vb-sr" onclick="setView('research')">🔬 Research</div>
 </div>
 
 <div id="view-live">
@@ -29989,6 +30277,46 @@ def dashboard():
   </div>
 
 </div><!-- /#view-tradezella -->
+
+<div id="view-research" style="display:none">
+
+  <div class="mod">
+    <div class="mod-h">🔬 Scalping Strategy Research <span class="bt-mini" id="sr-status">Not run yet.</span></div>
+    <div class="bt-mini" id="sr-safety">Research &amp; simulation only. New strategies never auto-trade live — promotion is a manual human decision.</div>
+    <div class="bt-mini" id="sr-meta" style="margin-top:6px"></div>
+    <button class="bt-btn" id="sr-run" onclick="srRun()">🔄 Run research</button>
+    <div class="bt-msg" id="sr-msg"></div>
+  </div>
+
+  <div class="mod" id="mod-sr-new">
+    <div class="mod-h">🆕 New Strategies Found <span class="bt-mini" id="sr-new-cap"></span></div>
+    <div class="bt-mini" style="margin-bottom:6px">The research catalog — scalp strategies discovered &amp; defined for study. Status is advisory only.</div>
+    <div class="bt-scroll" id="sr-new"></div>
+  </div>
+
+  <div class="mod" id="mod-sr-tested">
+    <div class="mod-h">🧪 Strategies Being Tested <span class="bt-mini" id="sr-tested-cap"></span></div>
+    <div class="bt-mini" style="margin-bottom:6px">Simulated on historical candles (1:1 R, live-consistent). Stats are out-of-sample research, not live results.</div>
+    <div class="bt-scroll" id="sr-tested"></div>
+  </div>
+
+  <div class="mod" id="mod-sr-best">
+    <div class="mod-h">🏆 Best Performing <span class="bt-mini">research + live, ranked by net R</span></div>
+    <div class="bt-scroll" id="sr-best"></div>
+  </div>
+
+  <div class="mod" id="mod-sr-worst">
+    <div class="mod-h">🥀 Worst Performing <span class="bt-mini">research + live, ranked by net R</span></div>
+    <div class="bt-scroll" id="sr-worst"></div>
+  </div>
+
+  <div class="mod" id="mod-sr-promo">
+    <div class="mod-h">📈 Promotion Recommendations <span class="bt-mini" id="sr-promo-cap"></span></div>
+    <div class="bt-mini" style="margin-bottom:6px">Advisory only. A human promotes manually — this engine never promotes a strategy to live trading.</div>
+    <div class="bt-scroll" id="sr-promo"></div>
+  </div>
+
+</div><!-- /#view-research -->
 
 <div id="toast"></div>
 
@@ -33576,15 +33904,98 @@ function btFmtDate(iso){ if(!iso) return '—'; try{ return new Date(iso).toLoca
 function setView(v){
   const isBt = (v==='backtest');
   const isTz = (v==='tradezella');
-  const isLive = (!isBt && !isTz);
+  const isSr = (v==='research');
+  const isLive = (!isBt && !isTz && !isSr);
   document.getElementById('view-live').style.display = isLive ? '' : 'none';
   document.getElementById('view-backtest').style.display = isBt ? '' : 'none';
   document.getElementById('view-tradezella').style.display = isTz ? '' : 'none';
+  document.getElementById('view-research').style.display = isSr ? '' : 'none';
   document.getElementById('vb-live').classList.toggle('active', isLive);
   document.getElementById('vb-bt').classList.toggle('active', isBt);
   document.getElementById('vb-tz').classList.toggle('active', isTz);
+  document.getElementById('vb-sr').classList.toggle('active', isSr);
   if(isBt && btSelDataset===null) btLoadDatasets();
   if(isTz) tzLoadAnalysis();
+  if(isSr) srLoad();
+}
+
+// ── Scalp Strategy Research (owner-only; on-demand, NEVER in the 3s /status poll) ──
+function srNum(v,d){ if(v===null||v===undefined) return '—'; return (typeof v==='number')?v.toFixed(d):String(v); }
+function srPct(v){ if(v===null||v===undefined) return '—'; return srNum(v,1)+'%'; }
+function srCell(text){ const td=document.createElement('td'); td.textContent=(text===null||text===undefined||text==='')?'—':text; return td; }
+function srTable(headers, rows){
+  const tbl=document.createElement('table'); tbl.className='bt-tbl';
+  const thead=document.createElement('thead'), htr=document.createElement('tr');
+  headers.forEach(function(h){ const th=document.createElement('th'); th.textContent=h; htr.appendChild(th); });
+  thead.appendChild(htr); tbl.appendChild(thead);
+  const tb=document.createElement('tbody');
+  if(!rows.length){ const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=headers.length; td.className='bt-mini'; td.textContent='None yet.'; tr.appendChild(td); tb.appendChild(tr); }
+  rows.forEach(function(cells){ const tr=document.createElement('tr'); cells.forEach(function(c){ tr.appendChild(srCell(c)); }); tb.appendChild(tr); });
+  tbl.appendChild(tb); return tbl;
+}
+function srMount(id, node){ const el=document.getElementById(id); if(!el) return; el.textContent=''; el.appendChild(node); }
+function srSet(id, text){ const el=document.getElementById(id); if(el) el.textContent=text; }
+function srComb(c){ return c || {}; }
+function srRender(j){
+  if(!j || !j.ok){ srSet('sr-status', (j&&j.error)||'Unavailable.'); return; }
+  if(j.safety_note) srSet('sr-safety', j.safety_note);
+  const lib=j.library||[];
+  srSet('sr-new-cap', lib.length? (lib.length+' strategies') : '');
+  srMount('sr-new', srTable(['Strategy','Type','Confidence','Backtest','Status'],
+    lib.map(function(e){ return [e.strategy_name, e.source_type, e.confidence_level, e.backtest_status, e.live_status]; })));
+  if(!j.ready){
+    srSet('sr-status', 'No research run yet.');
+    srSet('sr-meta', j.hint || 'Click “Run research” to simulate the testable strategies on historical candles.');
+    srMount('sr-tested', srTable(['Strategy','Trades','Win%','Avg R','Net R','PF','Max DD (R)','Best session','Backtest'], []));
+    srMount('sr-best', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], []));
+    srMount('sr-worst', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], []));
+    srMount('sr-promo', srTable(['Strategy','Recommendation','Reason'], []));
+    return;
+  }
+  const cn=j.counts||{};
+  srSet('sr-status', 'Updated '+(j.generated_at? new Date(j.generated_at).toLocaleString() : '—'));
+  const ds=(j.datasets||[]).map(function(d){ return d.symbol+' '+(d.bars||d.row_count||'?')+' bars'; }).join(' · ');
+  srSet('sr-meta', (cn.total||0)+' total · '+(cn.testable||0)+' testable · '+(cn.in_simulation||0)+' in simulation · '+(cn.recommended||0)+' recommended · '+(cn.pending||0)+' pending'+(ds? ('   ['+ds+']') : ''));
+  const tested=j.tested||[];
+  srSet('sr-tested-cap', tested.length+' with detectors');
+  srMount('sr-tested', srTable(['Strategy','Trades','Win%','Avg R','Net R','PF','Max DD (R)','Best session','Backtest'],
+    tested.map(function(t){ const c=srComb(t.combined);
+      return [t.strategy_name, c.total_trades, srPct(c.win_rate), srNum(c.avg_r,3), srNum(c.net_r,2), srNum(c.profit_factor,2), srNum(c.max_drawdown_r,2), c.best_session, t.backtest_status]; })));
+  function rankRows(arr){ return (arr||[]).map(function(b){ const c=srComb(b.combined);
+    return [b.strategy_name, (b.is_live?'LIVE':'research'), c.total_trades, srPct(c.win_rate), srNum(c.net_r,2), srNum(c.avg_r,3), srNum(c.profit_factor,2)]; }); }
+  srMount('sr-best', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], rankRows(j.best)));
+  srMount('sr-worst', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], rankRows(j.worst)));
+  const promo=j.promotions||[];
+  srSet('sr-promo-cap', promo.length? (promo.length+' candidate(s)') : 'none yet');
+  srMount('sr-promo', srTable(['Strategy','Recommendation','Reason'],
+    promo.map(function(p){ return [p.strategy_name, p.recommendation, p.reason]; })));
+}
+function srLoad(){
+  api('/scalp-research').then(srRender).catch(function(){ srSet('sr-status','Could not load research.'); });
+}
+function srRun(){
+  // POST triggers a BACKGROUND single-flight recompute and returns immediately, so we
+  // capture the prior generated_at, fire the trigger, then poll GET until it changes.
+  const btn=document.getElementById('sr-run'); const msg=document.getElementById('sr-msg');
+  if(btn) btn.disabled=true; if(msg){ msg.className='bt-msg'; msg.textContent='Running research… this can take ~10-30s.'; }
+  api('/scalp-research').then(function(j0){
+    const prevGen=(j0&&j0.generated_at)||null;
+    return api('/scalp-research', {trigger:1}).then(function(j){
+      if(!(j&&j.ok)) throw new Error((j&&j.error)||'failed');
+      return prevGen;
+    });
+  }).then(function(prevGen){
+    let tries=0;
+    (function poll(){
+      tries++;
+      api('/scalp-research').then(function(jj){
+        const gen=(jj&&jj.generated_at)||null;
+        if(jj && jj.ready && gen && gen!==prevGen){ srRender(jj); if(msg){ msg.className='bt-msg ok'; msg.textContent='✓ Research updated.'; } if(btn) btn.disabled=false; return; }
+        if(tries>=12){ srRender(jj); if(msg){ msg.className='bt-msg'; msg.textContent='Still computing — showing the latest available.'; } if(btn) btn.disabled=false; return; }
+        setTimeout(poll, 2500);
+      }).catch(function(){ if(tries>=12){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ Could not refresh.'; } if(btn) btn.disabled=false; return; } setTimeout(poll, 2500); });
+    })();
+  }).catch(function(e){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ '+((e&&e.message)||'Request failed.'); } if(btn) btn.disabled=false; });
 }
 
 // ── TradeZella review (owner-only; on-demand, NEVER in the 3s /status poll) ──
@@ -36160,6 +36571,8 @@ if __name__ == "__main__":
         _load_prop_accounts_from_db()              # warm the prop-account cache (display + guard reads); Protection stays OFF until toggled
         _check_trade_mgmt_db_ready()               # probe trade_management_metrics (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
         _check_session_quality_db_ready()          # probe session_quality_grades (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
+        _check_scalp_research_db_ready()           # probe scalp_strategy_library/research (no DDL; created via DB tool/publish diff) — RESEARCH/DISPLAY-ONLY
+        _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
@@ -36174,6 +36587,8 @@ if __name__ == "__main__":
         threading.Thread(target=_load_last_report, daemon=True).start()    # warm the last performance report from Postgres at boot (display-only)
         threading.Thread(target=_recompute_main_brain_review, daemon=True).start()  # warm the Main Brain review cache from Postgres at boot (display-only)
         threading.Thread(target=_main_brain_resolver_loop, name="main-brain-resolver", daemon=True).start()  # resolve pending WAIT hypotheses (display-only)
+        if DISCORD_LIVE_ENABLED and SCALP_RESEARCH_DB_READY:
+            threading.Thread(target=_recompute_scalp_research, name="scalp-research-warm", daemon=True).start()  # warm the research cache (LIVE instance only; single-flight, throttled, never in the gate path)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:

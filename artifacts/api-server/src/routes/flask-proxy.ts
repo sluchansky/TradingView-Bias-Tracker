@@ -121,6 +121,10 @@ router.all(
     // LIVE 2-contract runner arming (owner-only; NOT in dashboard-auth OPEN_PATHS).
     // In-memory armed flag over the existing fail-closed gateway; resets on restart.
     "/live-runner",
+    // Scalping Strategy Research Engine (owner-only; RESEARCH/DISPLAY-ONLY; NOT in
+    // dashboard-auth OPEN_PATHS). GET = cached research view; POST = trigger recompute.
+    // Walled off from the live money path — new strategies never auto-trade live.
+    "/scalp-research",
   ],
   proxyToFlask,
 );
