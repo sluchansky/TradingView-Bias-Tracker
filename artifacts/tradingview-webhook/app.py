@@ -18535,7 +18535,41 @@ def _analysis_edge_breakdown(a):
         "verdict":            a.get("verdict"),
         "edge_modifiers":     _gd.get("edge_modifiers") or [],
     }
-    return compute_edge_breakdown(a, edge_entry)
+    eb = compute_edge_breakdown(a, edge_entry)
+    # ── Task #18: fold the bounded learning-score delta into THE single Edge Score.
+    #    The READY gate already computed, bounded (±LEARNING_SCORE_MAX_DELTA) and
+    #    direction-matched this delta for the SAME candidate direction this breakdown
+    #    scores (shared gate_debug). Folding it HERE — the one canonical Edge Score
+    #    computation — is the single source of truth, so result["edge_score"], the
+    #    conviction tier, the per-direction cards, the card/journal Edge block AND the
+    #    money-path Entry-Quality override (which reads result["edge_score"]) all see
+    #    the SAME adjusted number — never a stale raw score. Inert when the master flag
+    #    is OFF (delta 0) or gate_debug is absent → byte-identical to legacy. HARD-BLOCK
+    #    SAFETY: we fold ONLY when the breakdown itself scored > 0. compute_edge_breakdown
+    #    force-zeros a zone-broken/consumed setup (SWING), but the gate's delta was
+    #    derived from the additive base (zone no longer scores), so it can be positive
+    #    on that same setup — folding it would RESURRECT a zeroed Edge Score. The
+    #    score>0 guard makes that impossible (a 0 stays 0) while still allowing a
+    #    negative delta to push a low-but-positive score toward 0. FAIL-OPEN: any bad
+    #    metadata leaves the raw score untouched. ──
+    try:
+        _ls_delta = int(_gd.get("learning_score_delta") or 0)
+    except (TypeError, ValueError):
+        _ls_delta = 0
+    if _ls_delta and int(eb.get("score") or 0) > 0:
+        _adj = max(0, min(EDGE_SCORE_MAX, int(eb.get("score") or 0) + _ls_delta))
+        eb["score"] = _adj
+        eb["grade"] = _grade_for_score(_adj)
+        try:
+            _wf = float(_gd.get("learning_weight") or 1.0)
+        except (TypeError, ValueError):
+            _wf = 1.0
+        # Surface the adjustment as a breakdown line so the visible Score Breakdown
+        # still sums to the (adjusted) headline Edge Score.
+        _line = {"label": "Learning Adjustment (weight %.2f)" % _wf, "points": _ls_delta}
+        eb["score_breakdown"] = list(eb.get("score_breakdown") or []) + [_line]
+        eb["reasons"] = [it["label"] for it in eb["score_breakdown"]]
+    return eb
 
 
 def _render_edge_block_field(eb):
