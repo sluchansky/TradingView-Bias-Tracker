@@ -81,6 +81,7 @@ router.all(
     "/pro-review",
     "/trade-debate",
     "/learning",
+    "/learning-score",
     "/entry-quality",
     "/review-idea",
     // AI assistant chat (owner-only; DISPLAY/READ-ONLY; NOT in dashboard-auth

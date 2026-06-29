@@ -938,6 +938,38 @@ def set_learning_gate(value):
     return _learning_gate_enabled()
 
 
+# ── Learning-influences-SCORING gate (Task #18). Distinct from the demotion VETO
+#    above: when ON, the learning engine's BOUNDED per-strategy weight adjusts the
+#    authoritative Edge Score (UP *and* DOWN, hard-capped to ±LEARNING_SCORE_MAX_DELTA)
+#    INSIDE evaluate_strict_setup, BEFORE the READY gate compares score >= threshold.
+#    All downstream money-path safety still runs on the adjusted verdict. OFF by
+#    default → byte-identical. Mirrors the demotion gate: a runtime dashboard toggle
+#    wins over the env seed and RESETS to None on restart (fail-safe toward NOT
+#    influencing live trading after a republish). FAIL-CLOSED: any error resolving or
+#    applying the adjustment falls back to the unmodified base score.
+_LEARNING_SCORE_GATE_OVERRIDE = None   # runtime dashboard toggle; None = follow env
+
+
+def _learning_score_gate_enabled():
+    """Learning-influences-SCORING master flag — OFF by default. When ON, the
+    per-strategy learning weight nudges the Edge Score before the gate decides. The
+    runtime dashboard toggle (_LEARNING_SCORE_GATE_OVERRIDE) wins over the env seed so
+    live scoring stays byte-identical until the operator arms it."""
+    if _LEARNING_SCORE_GATE_OVERRIDE is not None:
+        return bool(_LEARNING_SCORE_GATE_OVERRIDE)
+    return os.environ.get("LEARNING_SCORE_INFLUENCE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_learning_score_gate(value):
+    """Runtime override for the Learning-influences-SCORING flag (dashboard toggle).
+    Passing None restores env-seed behaviour. RESETS to None on restart (the module
+    global re-initialises), keeping the fail-safe bias toward NOT influencing live
+    scoring after a republish."""
+    global _LEARNING_SCORE_GATE_OVERRIDE
+    _LEARNING_SCORE_GATE_OVERRIDE = None if value is None else bool(value)
+    return _learning_score_gate_enabled()
+
+
 # ── Entry Quality Engine flags (display ON by default; money-path veto OFF) ─────
 # Mirrors the Professional Review / Trade Debate / Learning flags. The Entry
 # Quality Engine scores WHETHER THIS IS A GOOD LOCATION TO ENTER (separate from the
@@ -5949,8 +5981,18 @@ def compute_trade_edge_components(signals, modifiers=None):
 def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                           nearest_supply, nearest_demand,
                           bullish, bearish, confidence, alert_history,
-                          volatility=None, session=None, cooldown_active=False):
+                          volatility=None, session=None, cooldown_active=False,
+                          learning_score_influence=None):
     """Strict checklist recommendation.
+
+    `learning_score_influence` (Task #18, OFF by default / None): optional per-direction
+    learning-weight metadata, shaped {"Long": {"weight": float|None, "strategy_key":
+    str|None, "sample": int}, "Short": {...}}. When supplied AND the master flag is on,
+    the per-direction Edge Score is nudged UP/DOWN by the BOUNDED learning weight (hard-
+    capped to ±LEARNING_SCORE_MAX_DELTA) INSIDE _edge_for — so the gate, conflict
+    resolution, readiness bands, confluences and diagnostics all read the SAME adjusted
+    score. None (default; goldens + flag-off never pass it) → byte-identical raw scoring.
+    FAIL-CLOSED: any error applying the adjustment falls back to the unmodified base.
 
     A trade is recommended ONLY when ALL of:
         LONG : BOS Demand + Bullish CHOCH + 5m bullish confirmation + price > VWAP
@@ -6228,9 +6270,58 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             mods.append({"label": "Cooldown (repeat signal)", "points": -5})
         return mods
 
-    def _edge_for(direction):
+    def _edge_raw(direction):
         # Additive component sum + SOFT modifiers (SCALP); SWING passes [] → pure sum.
         return compute_trade_edge_components(_signals(direction), _edge_modifiers(direction))
+
+    def _learning_meta(direction):
+        """Per-direction learning-weight Edge-Score adjustment metadata (Task #18).
+        FAIL-CLOSED: any problem (or no influence supplied) returns a NEUTRAL no-op —
+        delta 0, adjusted == base — so the gate always falls back to the unmodified
+        base score. The effective `delta` already folds in BOTH the
+        ±LEARNING_SCORE_MAX_DELTA cap AND the [0, EDGE_SCORE_MAX] clamp, so
+        adjusted == base + delta always holds for every consumer."""
+        raw, _bd = _edge_raw(direction)
+        base = int(raw)
+        meta = {"enabled": bool(learning_score_influence), "base": base, "delta": 0,
+                "adjusted": base, "weight": 1.0, "strategy_key": None, "sample": 0,
+                "capped": False, "reason": "off"}
+        try:
+            if not learning_score_influence:
+                return meta
+            infl = learning_score_influence.get(direction) or {}
+            meta["strategy_key"] = infl.get("strategy_key")
+            meta["sample"]       = int(infl.get("sample") or 0)
+            w = infl.get("weight")
+            if w is None:
+                meta["reason"] = "no active learning weight for this direction"
+                return meta
+            w = max(LEARNING_WEIGHT_FLOOR, min(LEARNING_WEIGHT_CEIL, float(w)))
+            meta["weight"] = round(w, 3)
+            raw_delta = int(round(base * (w - 1.0)))
+            capped    = max(-LEARNING_SCORE_MAX_DELTA, min(LEARNING_SCORE_MAX_DELTA, raw_delta))
+            adjusted  = max(0, min(EDGE_SCORE_MAX, base + capped))
+            meta["capped"]   = bool(capped != raw_delta)
+            meta["adjusted"] = adjusted
+            meta["delta"]    = adjusted - base
+            meta["reason"]   = ("learning weight %.2f (%s, n=%d) -> %+d" % (
+                w, meta["strategy_key"] or "strategy", meta["sample"], meta["delta"]))
+            return meta
+        except Exception as exc:   # FAIL-CLOSED — a broken adjustment must use the base score.
+            return {"enabled": bool(learning_score_influence), "base": base, "delta": 0,
+                    "adjusted": base, "weight": 1.0, "strategy_key": None, "sample": 0,
+                    "capped": False, "reason": "error: using base score (%s)" % exc}
+
+    def _edge_for(direction):
+        # Additive component sum + SOFT modifiers (SCALP); SWING passes [] → pure sum.
+        # Task #18: when learning-score influence is supplied AND the master flag armed
+        # it, the BOUNDED learning weight nudges the score here (FAIL-CLOSED inside
+        # _learning_meta). None (goldens / flag-off) → byte-identical raw tuple, so the
+        # gate, conflict, readiness, confluences & diagnostics all stay unchanged.
+        raw, breakdown = _edge_raw(direction)
+        if not learning_score_influence:
+            return raw, breakdown
+        return _learning_meta(direction)["adjusted"], breakdown
 
     # ── Score-aware conflict resolution (single source for the gate AND the
     #    diagnostics block). `opposing_present` (above) = opposing structure on both
@@ -6267,6 +6358,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     def _gate_debug(direction):
         sig = _signals(direction)
         score, _bd = _edge_for(direction)
+        # Task #18 observability: the learning-weight adjustment metadata for THIS
+        # direction (neutral no-op when the master flag is off → additive only).
+        _lm = _learning_meta(direction)
         # Granular per-gate signals (for the /diagnostics breakdown). Structure is
         # ANY ONE of BOS/CHOCH/swing — these individual flags are shown for
         # visibility; "structure_confirmed" is the actual gate.
@@ -6359,6 +6453,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "volatility_block":      vol_block,
             "edge_score":            score,
             "edge_ok":               bool(score >= ready_threshold),
+            # ── Learning-influences-scoring observability (Task #18; additive). When
+            #    the master flag is OFF these are inert: edge_score_base == edge_score,
+            #    delta 0, weight 1.0 — the gate is byte-identical. When ON, edge_score
+            #    above is the ADJUSTED score and these show how it moved + why. ──
+            "edge_score_base":        _lm["base"],
+            "learning_score_delta":   _lm["delta"],
+            "learning_weight":        _lm["weight"],
+            "learning_strategy_key":  _lm["strategy_key"],
+            "learning_sample":        _lm["sample"],
+            "learning_capped":        _lm["capped"],
+            "learning_reason":        _lm["reason"],
+            "learning_score_enabled": bool(learning_score_influence),
             "failed_conditions":     [],
         }
 
@@ -7713,6 +7819,7 @@ LAST_PERFORMANCE_REPORT = None                     # in-memory cache of the late
 LEARNING_WEIGHT_FLOOR  = 0.65                       # weights nudge but NEVER disable a strategy
 LEARNING_WEIGHT_CEIL   = 1.35
 LEARNING_CONF_ADJ_CAP  = 15                         # max ± confidence points history may move
+LEARNING_SCORE_MAX_DELTA = 15                       # max ± Edge-Score points the learning weight may move the gate score (Task #18); hard-capped so learning can never overpower more than one major Edge component
 LEARNING_SNAPSHOT_MAX_AGE = 180                     # secs: entry snapshot considered "fresh"
 LAST_STRATEGY_SNAPSHOT_BY_INST = {}                 # inst -> entry-context snapshot (for trade tagging)
 STRATEGY_WEIGHTS       = {}                         # strategy_key -> weight (float)
@@ -8452,6 +8559,46 @@ def _strategy_weight_for(key):
         return (1.0, 0)
     with LEARNING_LOCK:
         return (STRATEGY_WEIGHTS.get(key, 1.0), LEARNING_SAMPLE_BY_KEY.get(key, 0))
+
+
+def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_status, volatility):
+    """Task #18 — build the per-direction learning-weight metadata that
+    evaluate_strict_setup uses to nudge the Edge Score, BUT ONLY when the master flag
+    (_learning_score_gate_enabled) is armed. Returns None otherwise so live scoring is
+    byte-identical.
+
+    Edge-INDEPENDENT + pre-gate: compute_strategy_engine selects the active strategy +
+    direction from regime/completeness (edge_score is passed 0 and only affects the
+    DISPLAY confidence — never active_key/direction), so the weight is known before the
+    gate compares score >= threshold. The bounded per-strategy learning weight is
+    attributed to the active strategy's direction ONLY, and only once that strategy has
+    >= LEARNING_MIN_SAMPLE closed trades. FAIL-OPEN: any error (or no qualifying weight)
+    returns None → the gate falls back to the unmodified base score.
+
+    Shape: {"Long": {"weight": float|None, "strategy_key": str|None, "sample": int},
+            "Short": {...}, "meta": {...}}  — only the active direction carries a weight.
+    """
+    if not _learning_score_gate_enabled():
+        return None
+    try:
+        engine    = compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, volatility, 0)
+        key       = engine.get("active_key")
+        direction = engine.get("direction")
+        if not key or direction not in ("Long", "Short"):
+            return None
+        weight, sample = _strategy_weight_for(key)
+        if sample < LEARNING_MIN_SAMPLE:
+            return None
+        infl = {"Long":  {"weight": None, "strategy_key": None, "sample": 0},
+                "Short": {"weight": None, "strategy_key": None, "sample": 0}}
+        infl[direction] = {"weight": float(weight), "strategy_key": key, "sample": int(sample)}
+        infl["meta"] = {"active_strategy": engine.get("active_strategy"),
+                        "active_key": key, "direction": direction,
+                        "weight": round(float(weight), 3), "sample": int(sample)}
+        return infl
+    except Exception as exc:   # FAIL-OPEN — never let learning resolution crash the gate.
+        logger.warning("learning-score influence resolve failed (fail-open): %s", exc)
+        return None
 
 
 def _update_learning_snapshot(result, ticker_override=None):
@@ -14245,11 +14392,17 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # all result keys still exist (single-return-path invariant) and the gate is
     # paused — not deleted — while the market is closed.
     market = market_session_status()
+    # Task #18 — learning-influences-scoring: resolve the per-direction learning-weight
+    # metadata ONLY when the master flag is armed (else None → byte-identical scoring).
+    # Edge-independent + FAIL-OPEN, so it is safe to compute before the gate decides.
+    learning_score_influence = _resolve_learning_score_influence(
+        active_ticker, current_price, vwap_value, vwap_status, volatility)
     with _timed("scoringMs"):
         strict = evaluate_strict_setup(
             current_price, active_ticker, vwap_value, vwap_status,
             nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
             volatility=volatility, session=session_state, cooldown_active=cooldown_active,
+            learning_score_influence=learning_score_influence,
         )
     strict_label     = strict["label"]
     strict_score     = strict["score"]
@@ -14546,6 +14699,32 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     result["gate_debug"] = strict.get("gate_debug")
     # Candidate direction the gate evaluated (Long/Short/None) — for /diagnostics.
     result["gate_candidate"] = strict.get("candidate")
+
+    # ── Task #18: learning-influences-scoring summary (display + diagnostics). Always
+    #    present (single-return-path parity); inert when the master flag is OFF
+    #    (enabled False, armed False, every delta 0). Built FROM the per-direction
+    #    gate_debug so the base->adjusted numbers shown match EXACTLY what the gate
+    #    decided on — no recompute, no drift. ──
+    def _ls_dir_summary(_d):
+        gd = ((strict.get("directions") or {}).get(_d) or {}).get("gate_debug") or {}
+        return {
+            "base":         gd.get("edge_score_base"),
+            "adjusted":     gd.get("edge_score"),
+            "delta":        gd.get("learning_score_delta", 0),
+            "weight":       gd.get("learning_weight", 1.0),
+            "strategy_key": gd.get("learning_strategy_key"),
+            "sample":       gd.get("learning_sample", 0),
+            "capped":       bool(gd.get("learning_capped")),
+            "reason":       gd.get("learning_reason", "off"),
+        }
+    result["learning_score_influence"] = {
+        "enabled":   bool(_learning_score_gate_enabled()),
+        "armed":     bool(learning_score_influence is not None),
+        "max_delta": LEARNING_SCORE_MAX_DELTA,
+        "meta":      (learning_score_influence or {}).get("meta") if learning_score_influence else None,
+        "Long":      _ls_dir_summary("Long"),
+        "Short":     _ls_dir_summary("Short"),
+    }
 
     # ── Tiered alert level (SCALP early-warning ladder) — additive, DISPLAY-ONLY.
     #    Computed independently of the verdict; it NEVER alters verdict / score /
@@ -15156,6 +15335,21 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["dominant_direction"] = None
         result["ready_reason"]       = result["strict_reason"]
         result["rejected_reasons"]   = ["market_closed"]
+        # Task #18 — neutralise the learning-score summary while the market is closed
+        # (the gate is PAUSED, not deleted): keep the flag/cap visible but null out the
+        # per-direction numbers so a stale closed-tape delta can't read as a live nudge.
+        _ls_closed = result.get("learning_score_influence") or {}
+        _ls_neutral_dir = {"base": None, "adjusted": None, "delta": 0, "weight": 1.0,
+                           "strategy_key": None, "sample": 0, "capped": False,
+                           "reason": "market closed"}
+        result["learning_score_influence"] = {
+            "enabled":   bool(_ls_closed.get("enabled", _learning_score_gate_enabled())),
+            "armed":     False,
+            "max_delta": LEARNING_SCORE_MAX_DELTA,
+            "meta":      None,
+            "Long":      dict(_ls_neutral_dir),
+            "Short":     dict(_ls_neutral_dir),
+        }
         # Neutralise the CVD / RVOL / volume stamps too — there is no live tape closed.
         result["cvd_state"]          = None
         result["cvd_value"]          = None
@@ -21890,8 +22084,15 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
         "  Volatility ............ %s" % _vol_diag_summary(gd, vol),
     ]
     lines.extend(_vol_diag_detail(vol))
+    lines.append("  Edge Score ............ %d / %d" % (gd.get("edge_score", 0), gd.get("ready_threshold", EDGE_READY_THRESHOLD)))
+    # Task #18: surface the learning-weight Edge nudge ONLY when the master flag armed
+    # this evaluation (display-only; edge_score above is already the adjusted value).
+    if gd.get("learning_score_enabled"):
+        lines.append("  Learning influence .... base %s -> %s (%+d, w=%.2f, %s)" % (
+            gd.get("edge_score_base"), gd.get("edge_score"),
+            gd.get("learning_score_delta", 0), gd.get("learning_weight") or 1.0,
+            gd.get("learning_strategy_key") or "strategy"))
     lines.extend([
-        "  Edge Score ............ %d / %d" % (gd.get("edge_score", 0), gd.get("ready_threshold", EDGE_READY_THRESHOLD)),
         "",
         "  FINAL READY DECISION: %s" % ("PASS" if ready else "FAIL"),
     ])
@@ -24879,6 +25080,7 @@ def status():
         "strict_reason":       a.get("strict_reason"),
         "strict_missing":      a.get("strict_missing"),
         "gate_debug":          a.get("gate_debug"),
+        "learning_score_influence": a.get("learning_score_influence"),
         "confluences":         a.get("confluences"),
         "directions":          a.get("directions"),
         "vwap_value":          a.get("vwap_value"),
@@ -28926,7 +29128,7 @@ def dashboard():
 
 <!-- Confidence Governor — transparent Edge→confidence breakdown (DISPLAY-ONLY) -->
 <div class="mod mb-hidden" id="mod-governor">
-  <div class="mod-h">🎯 Confidence Governor <span id="cg-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span id="cg-gate-toggle" role="button" tabindex="0" onclick="toggleLearningGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Demote: off</span></div>
+  <div class="mod-h">🎯 Confidence Governor <span id="cg-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span id="cg-gate-toggle" role="button" tabindex="0" onclick="toggleLearningGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Demote: off</span><span id="cg-score-toggle" role="button" tabindex="0" onclick="toggleLearningScoreGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningScoreGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:6px">Score: off</span></div>
   <div class="le-top">
     <div class="gstat"><div class="l">Base Edge</div><div class="v" id="cg-base">—</div></div>
     <div class="gstat"><div class="l">Final Confidence</div><div class="v" id="cg-final">—</div></div>
@@ -28936,6 +29138,7 @@ def dashboard():
   <div class="le-sub">Adjustment Breakdown</div>
   <div class="le-rank" id="cg-comps"></div>
   <div class="le-fid" id="cg-demote" style="color:#ef4444"></div>
+  <div class="le-fid" id="cg-lscore"></div>
   <div class="le-fid" id="cg-fid"></div>
 </div>
 
@@ -29514,6 +29717,7 @@ let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by 
 let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
 let EQ_GATE_STATE = false;  // Entry Quality money-path veto, painted by renderEntryQuality() from /status
 let LEARNING_GATE_STATE = false;  // Learning-demotion money-path veto, painted by renderConfidenceGovernor() from /status
+let LEARNING_SCORE_STATE = false;  // Learning-influences-SCORING flag (Task #18), painted by _paintLearnScoreGate() from /status
 async function loadAutoTrade(){
   try {
     const d = await api('/auto-trade');
@@ -31846,6 +32050,49 @@ function _paintLearnGate(g){
   const de=document.getElementById('cg-demote');
   if(de){ de.textContent=(g && g.demotion_reason) ? ('⛔ '+g.demotion_reason) : ''; }
 }
+// Learning-influences-SCORING (Task #18) — paints the Score toggle + the base->adjusted
+// Edge nudge line from d.learning_score_influence. Distinct from the Demote veto above:
+// this moves the Edge Score itself (up AND down, capped) BEFORE the gate decides.
+function _paintLearnScoreGate(d){
+  const ls = (d && d.learning_score_influence) || null;
+  LEARNING_SCORE_STATE = !!(ls && ls.enabled);
+  const gt=document.getElementById('cg-score-toggle');
+  if(gt){ gt.textContent=LEARNING_SCORE_STATE?'Score: ARMED':'Score: off';
+          gt.style.color=LEARNING_SCORE_STATE?'#f59e0b':'#9aa';
+          gt.style.borderColor=LEARNING_SCORE_STATE?'#f59e0b':'var(--border)'; }
+  const el=document.getElementById('cg-lscore');
+  if(!el) return;
+  if(!LEARNING_SCORE_STATE){ el.textContent='Learning -> Score: off — Edge Score unchanged.'; el.style.color='#6b7280'; return; }
+  const cap=(ls && ls.max_delta!=null)?ls.max_delta:15;
+  const fmtDir=function(name,o){
+    if(!o) return '';
+    const base=(o.base!=null)?o.base:'—', adj=(o.adjusted!=null)?o.adjusted:'—';
+    const dl=o.delta||0, w=(o.weight!=null)?o.weight:1;
+    if(dl===0) return name+' '+base+' (no change)';
+    return name+' '+base+'->'+adj+' ('+(dl>0?'+':'')+dl+', w='+w+(o.strategy_key?(', '+o.strategy_key):'')+(o.capped?', capped':'')+')';
+  };
+  const parts=[];
+  const L=fmtDir('L', ls.Long), S=fmtDir('S', ls.Short);
+  if(L) parts.push(L);
+  if(S) parts.push(S);
+  el.innerHTML='⚖ Learning -> Score ARMED (±'+cap+'): '+_modEsc(parts.join('   ·   ') || 'no active learning weight');
+  el.style.color='#f59e0b';
+}
+function toggleLearningScoreGate(){
+  const cur=!!LEARNING_SCORE_STATE;
+  const next=!cur;
+  if(next && !confirm('Arm Learning -> Score influence?\\n\\nWhile ARMED, the bounded per-strategy learning weight ADJUSTS the Edge Score (up AND down, capped at ±15) BEFORE the READY gate decides — so it can move a setup INTO or OUT of READY. Affects AUTO-trades + READY alerts; manual ENTER is unaffected. Fail-closed: any error uses the unmodified base score.')) return;
+  LEARNING_SCORE_STATE=next;
+  const gt=document.getElementById('cg-score-toggle');
+  if(gt){ gt.textContent=next?'Score: ARMED':'Score: off'; gt.style.color=next?'#f59e0b':'#9aa'; gt.style.borderColor=next?'#f59e0b':'var(--border)'; }
+  api('/learning-score', { enabled: next })
+    .then(function(d){
+      if(!d || d.status!=='ok'){ LEARNING_SCORE_STATE=cur; toast('Learning score update failed', false); return; }
+      LEARNING_SCORE_STATE=!!d.enabled;
+      toast(LEARNING_SCORE_STATE ? ('Learning -> Score ARMED — Edge nudged ±'+(d.max_delta!=null?d.max_delta:15)) : 'Learning -> Score off');
+    })
+    .catch(function(){ LEARNING_SCORE_STATE=cur; toast('Learning score update failed', false); });
+}
 function toggleLearningGate(){
   const cur=!!LEARNING_GATE_STATE;
   const next=!cur;
@@ -31870,6 +32117,7 @@ function renderConfidenceGovernor(d){
   const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
   const metaEl = document.getElementById('cg-meta');
   _paintLearnGate(g);
+  _paintLearnScoreGate(d);
   if (!g || !g.ready){
     if (metaEl) metaEl.textContent = (g && g.reason && g.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· AWAITING TRADES';
     setT('cg-base', (g && g.base_edge_score!=null) ? g.base_edge_score : '—');
@@ -34989,6 +35237,7 @@ def _assistant_live_context(ticker_override=None):
             "strict_reason":      a.get("strict_reason"),
             "strict_missing":     a.get("strict_missing"),
             "gate_debug":         a.get("gate_debug"),
+            "learning_score_influence": a.get("learning_score_influence"),
             "edge_score":         a.get("edge_score"),
             "edge_grade":         a.get("edge_grade"),
             "edge_breakdown":     a.get("edge_breakdown"),
@@ -35390,6 +35639,48 @@ def learning_controls():
     return jsonify({
         "status":       "ok",
         "gate_enabled": _learning_gate_enabled(),
+    }), 200
+
+
+@app.route("/learning-score", methods=["GET", "POST"])
+def learning_score_controls():
+    """Read or set the Learning-influences-SCORING master flag (Task #18). OFF by
+    default; when ARMED the learning engine's BOUNDED per-strategy weight adjusts the
+    authoritative Edge Score (UP *and* DOWN, hard-capped to ±LEARNING_SCORE_MAX_DELTA)
+    INSIDE the strict gate, BEFORE the READY threshold is compared — so it can move a
+    setup INTO or OUT of READY. Distinct from /learning (which only DEMOTES an
+    already-actionable verdict). All downstream money-path safety still runs on the
+    adjusted verdict. FAIL-CLOSED: any error falls back to the unmodified base score.
+    The runtime toggle wins over the env seed and RESETS on restart (fail-safe toward
+    NOT influencing live scoring). Owner-only (Basic Auth + CSRF via the Express
+    proxy; NOT in OPEN_PATHS)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "enabled" in data:
+            # Money-path toggle: parse strictly so a stray JSON string ("false") can
+            # never arm live scoring influence (mirror of /learning). Real booleans
+            # pass through; recognised string/number tokens map explicitly; anything
+            # ambiguous (null / "maybe" / {}) is IGNORED, leaving the flag unchanged.
+            _raw = data.get("enabled")
+            _parsed = None
+            if isinstance(_raw, bool):
+                _parsed = _raw
+            elif isinstance(_raw, (int, float)):
+                _parsed = bool(_raw)
+            elif isinstance(_raw, str):
+                _s = _raw.strip().lower()
+                if _s in ("1", "true", "yes", "on"):
+                    _parsed = True
+                elif _s in ("0", "false", "no", "off"):
+                    _parsed = False
+            if _parsed is not None:
+                set_learning_score_gate(_parsed)
+                logger.info("LEARNING score INFLUENCE %s",
+                            "ARMED" if _learning_score_gate_enabled() else "OFF")
+    return jsonify({
+        "status":    "ok",
+        "enabled":   _learning_score_gate_enabled(),
+        "max_delta": LEARNING_SCORE_MAX_DELTA,
     }), 200
 
 

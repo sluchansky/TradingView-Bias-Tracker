@@ -48,6 +48,10 @@ args = "fvg_ob"
 task = "workflow.run"
 args = "cross_market"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "learning_score_golden"
+
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
 author = "agent"
@@ -133,6 +137,17 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "bash .local/state/check_cross_market.sh"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "learning_score_golden"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_learning_score_golden.sh"
 
 [workflows.workflow.metadata]
 isValidation = true
