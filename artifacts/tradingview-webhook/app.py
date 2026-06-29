@@ -1469,6 +1469,51 @@ _AUTO_TRADE_COUNT = {}   # (et_date_str, instrument) -> entries today
 # is also reset OFF), so the fail-safe is always toward NOT re-entering.
 AUTO_FIRED_KEYS = set()
 
+# ── Trade-management + analytics upgrades (TradeZella-driven) ─────────────────
+# Every flag below defaults OFF / inert so prod and ALL goldens stay byte-identical
+# (OFF == today's behaviour exactly). The operator enables each layer explicitly.
+# The first group is pure DISPLAY/ANALYTICS — it never touches the gate, scoring,
+# sizing, or dedupe; it only measures closed trades and advises on open ones.
+TRADE_MGMT_ANALYTICS_ENABLED      = os.environ.get("TRADE_MGMT_ANALYTICS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+COMMISSION_MODEL_ENABLED          = os.environ.get("COMMISSION_MODEL_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# Round-trip (in + out) broker + exchange fee per contract, in dollars. Display-only.
+COMMISSION_PER_CONTRACT_ROUND_TRIP = max(0.0, float(os.environ.get("COMMISSION_PER_CONTRACT_ROUND_TRIP", "0") or 0))
+OVERSIZED_LOSS_PROTECTION_ENABLED = os.environ.get("OVERSIZED_LOSS_PROTECTION_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# A realized loss larger than this multiple of planned risk is flagged as an
+# oversized-loss / risk-control violation (display + persisted; never gates).
+OVERSIZED_LOSS_MULT               = max(1.0, float(os.environ.get("OVERSIZED_LOSS_MULT", "1.5") or 1.5))
+SESSION_QUALITY_ENABLED           = os.environ.get("SESSION_QUALITY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+BOT_HOLD_SCORE_ENABLED            = os.environ.get("BOT_HOLD_SCORE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+# PAPER conditional-runner lifecycle (simulated; NO broker). When ON, a SCALP
+# managed *paper* trade books contract 1 at ~1R and lets the remainder run until a
+# conditional runner-exit signal (structure break / VWAP loss / CVD-delta flip /
+# ATR trail / session time-stop) instead of the fixed 1.5R/2R legs. Paper only.
+RUNNER_CONDITIONAL_PAPER_ENABLED  = os.environ.get("RUNNER_CONDITIONAL_PAPER_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+# ── LIVE 2-contract runner (REAL broker partial-flatten money path) ───────────
+# DANGER: the ONLY feature here that sends REAL exit/reduce orders. Gated by THREE
+# independent conditions so it can never engage by accident:
+#   1. LIVE_RUNNER_ENABLED  — env flag, default OFF (deploy-time enable).
+#   2. LIVE_RUNNER_ARMED    — in-memory, owner-armed at runtime, RESETS OFF on every
+#                             restart/republish (like AUTO arming) — a fresh process
+#                             never auto-sends runner exits.
+#   3. execution mode == traderspost (the only broker whose partial-reduce is
+#      confirmed) AND the auto order is >= 2 contracts.
+# When ANY condition is false the gateway is byte-identical to today (single 1R
+# bracket flattening the whole position). Operator prerequisite: the TradersPost
+# strategy must have "Use signal quantity" ENABLED for partial reduces to honour
+# the quantity field.
+LIVE_RUNNER_ENABLED = os.environ.get("LIVE_RUNNER_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+LIVE_RUNNER_ARMED   = False              # in-memory; armed via owner endpoint; reset on restart
+LIVE_RUNNER_LOCK    = threading.Lock()   # guards LIVE_RUNNER_ARMED only (never nested under money locks)
+# Contracts held back as the runner leg (the rest exit at 1R as contract 1).
+LIVE_RUNNER_QTY     = max(1, int(os.environ.get("LIVE_RUNNER_QTY", "1")))
+# Require traderspost mode for the live runner (PickMyTrade partial-reduce unconfirmed).
+LIVE_RUNNER_REQUIRE_TRADERSPOST = os.environ.get("LIVE_RUNNER_REQUIRE_TRADERSPOST", "1").strip().lower() not in ("0", "false", "no", "off")
+# How often the live-runner watch loop re-evaluates open runner legs (seconds).
+LIVE_RUNNER_WATCH_INTERVAL_SEC  = max(2, int(os.environ.get("LIVE_RUNNER_WATCH_INTERVAL_SEC", "5")))
+
 # ── Advisor review (Analyst Reasoning as an AUTO-TRADE gate) ──────────────────
 # Global runtime toggle. When ON, the analyst reviews every setup before an
 # auto-trade fires and BLOCKS the auto entry when it explicitly disagrees
@@ -16581,6 +16626,163 @@ def _evaluate_managed_trade_levels(mt, bar):
             return
 
 
+def _trade_mgmt_outcome_booleans(mt):
+    """Conservative (stop-first) outcome booleans for a CLOSED managed trade, DERIVED
+    from already-tracked state (exit_reason / tp1_hit / outcome / result_label) — never
+    recomputed off price — so the byte-identical close paths stay untouched.
+      target_reached_before_reversal : the trade actually booked a profit target
+                                       (TP1/TP2/runner, or a Win exit).
+      stop_hit_before_target         : the trade closed at its stop WITHOUT first
+                                       reaching any target (a clean stop-out)."""
+    tp1_hit     = bool(mt.get("tp1_hit"))
+    exit_reason = mt.get("exit_reason")
+    outcome     = mt.get("outcome") or ""
+    label       = (mt.get("result_label") or "").lower()
+    reached_target = bool(tp1_hit or ("Win" in outcome)
+                          or exit_reason in ("tp1", "tp2", "runner"))
+    stopped = bool(exit_reason in ("stop", "breakeven_stop") or ("stop hit" in label))
+    return (bool(stopped and not reached_target), reached_target)
+
+
+def _trade_mgmt_session_name(dt_utc=None):
+    """Coarse ET trading-session bucket for grouping closed trades (DISPLAY only)."""
+    try:
+        if isinstance(dt_utc, str):
+            dt_utc = datetime.fromisoformat(dt_utc)
+        if dt_utc is None:
+            dt_utc = now_utc()
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        et = dt_utc.astimezone(ET_TZ)
+        m = et.hour * 60 + et.minute
+        if m < 4 * 60:               # 00:00–04:00 ET
+            return "Overnight"
+        if m < 9 * 60 + 30:          # 04:00–09:30 ET
+            return "Pre-Market"
+        if m < 11 * 60:              # 09:30–11:00 ET
+            return "Open"
+        if m < 14 * 60:              # 11:00–14:00 ET
+            return "Midday"
+        if m < 16 * 60:              # 14:00–16:00 ET
+            return "Afternoon"
+        return "After-Hours"
+    except Exception:
+        return "Other"
+
+
+def _compute_trade_mgmt_metrics(mt):
+    """Build + persist the sidecar trade-management analytics record for a CLOSED
+    managed trade: MFE/MAE booleans, commission impact (gross/fees/net, fee% of gross,
+    warn>30%), and the oversized-loss flag (realized loss > OVERSIZED_LOSS_MULT × planned
+    risk). Stores the result on mt['trade_mgmt'] for the outcome card + /status.
+
+    STRICTLY DISPLAY/ANALYTICS: reads only already-finalised mt fields, never recomputes
+    the close, never touches the gate / scoring / sizing / dedupe / money path. FAIL-OPEN.
+    Returns None (fully inert — no record, no mt mutation, no card fields) when EVERY
+    analytics flag is OFF, so OFF == today exactly and the goldens stay byte-identical."""
+    if not (TRADE_MGMT_ANALYTICS_ENABLED or COMMISSION_MODEL_ENABLED
+            or OVERSIZED_LOSS_PROTECTION_ENABLED):
+        return None
+    try:
+        try:
+            managed_key = "|".join(str(x) for x in (mt.get("key") or ()))
+        except Exception:
+            managed_key = None
+        if not managed_key:
+            return None
+
+        risk = mt.get("risk_points") or 0.0
+        pv   = mt.get("point_value") or 0.0
+        try:
+            contracts = max(1, int(mt.get("contracts") or 1))
+        except Exception:
+            contracts = 1
+        try:
+            r_mult = float(mt.get("r_multiple")) if mt.get("r_multiple") is not None else 0.0
+        except Exception:
+            r_mult = 0.0
+
+        mode_str = "SWING" if mt.get("is_swing") else "SCALP"
+        gross_pnl = round((mt.get("pnl_dollars") or 0.0) * contracts, 2)
+        planned_risk_pts     = round(risk, 4)
+        planned_risk_dollars = round(risk * pv * contracts, 2)
+        stop_first, target_first = _trade_mgmt_outcome_booleans(mt)
+
+        # ── Commission model (display-only; only charges when the flag is ON) ──
+        fee_per = COMMISSION_PER_CONTRACT_ROUND_TRIP if COMMISSION_MODEL_ENABLED else 0.0
+        fees    = round(fee_per * contracts, 2)
+        net_pnl = round(gross_pnl - fees, 2)
+        fee_pct_gross = None
+        if COMMISSION_MODEL_ENABLED and gross_pnl > 0:
+            fee_pct_gross = round((fees / gross_pnl) * 100.0, 1)
+        fee_warn = bool(fee_pct_gross is not None and fee_pct_gross > 30.0)
+
+        # ── Oversized-loss flag (display-only) ──
+        actual_loss      = round(-gross_pnl, 2) if gross_pnl < 0 else 0.0
+        oversized        = False
+        oversized_reason = None
+        slippage_dollars = 0.0
+        if r_mult < 0:
+            loss_r = -r_mult
+            # Realized loss beyond the planned 1R stop (DERIVED from the booked result
+            # vs plan — NOT an entry-fill delta, which never flows back). 0 in paper
+            # (exit == stop); only positive when a recorded loss exceeded 1R.
+            slippage_dollars = round(max(0.0, (loss_r - 1.0) * risk * pv * contracts), 2)
+            if loss_r >= OVERSIZED_LOSS_MULT:
+                oversized = True
+                oversized_reason = ("Realized loss %.2fR exceeded %.1f× planned risk (1R) "
+                                    "on %d contract(s)." % (loss_r, OVERSIZED_LOSS_MULT, contracts))
+
+        rec = {
+            "managed_key": managed_key,
+            "symbol":      mt.get("symbol") or mt.get("instrument"),
+            "instrument":  mt.get("instrument"),
+            "direction":   mt.get("direction"),
+            "mode":        mode_str,
+            "trading_mode": mode_str,
+            "opened_at":   mt.get("registered_at"),
+            "closed_at":   mt.get("closed_at"),
+            "entry":       mt.get("entry"),
+            "stop":        mt.get("stop"),
+            "target":      mt.get("tp1"),
+            "exit_price":  mt.get("exit_price"),
+            "contracts":   contracts,
+            "planned_risk_points":  planned_risk_pts,
+            "planned_risk_dollars": planned_risk_dollars,
+            "mfe_points":  mt.get("mfe"),
+            "mae_points":  mt.get("mae"),
+            "mfe_r":       mt.get("mfe_r"),
+            "mae_r":       mt.get("mae_r"),
+            "r_multiple":  round(r_mult, 2),
+            "stop_hit_before_target":         stop_first,
+            "target_reached_before_reversal": target_first,
+            "gross_pnl":   gross_pnl,
+            "fee_per_contract_round_trip": round(fee_per, 2),
+            "fees":        fees,
+            "net_pnl":     net_pnl,
+            "fee_pct_gross_profit": fee_pct_gross,
+            "actual_loss": actual_loss,
+            "slippage":    slippage_dollars,
+            "oversized_loss_violation": bool(oversized),
+            "oversized_loss_reason":    oversized_reason,
+            "exit_reason": mt.get("exit_reason") or mt.get("result_label"),
+            "session":     _trade_mgmt_session_name(mt.get("closed_at")),
+            "runner_exit_signal": mt.get("runner_exit_signal"),
+            # Display-only extras (NOT persisted columns):
+            "fee_warn":    fee_warn,
+            "oversized":   oversized,
+        }
+        mt["trade_mgmt"] = rec
+        try:
+            _persist_trade_mgmt_metrics(rec)
+        except Exception as exc:
+            logger.warning("trade mgmt metrics persist dispatch failed: %s", exc)
+        return rec
+    except Exception as exc:
+        logger.warning("trade mgmt metrics compute failed: %s", exc)
+        return None
+
+
 def _close_managed_trade(mt, outcome, result_label, exit_price):
     """Finalise a managed trade: compute R / MFE / MAE / PnL, post the outcome
     card, and write the result back to the linked journal entry."""
@@ -16615,6 +16817,16 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
         mt["r_multiple"]  = round(pnl_points / risk, 2) if risk else 0.0
     mt["mfe_r"]       = round(mt["mfe"] / risk, 2) if risk else 0.0
     mt["mae_r"]       = round(mt["mae"] / risk, 2) if risk else 0.0
+
+    # ── Trade-management analytics sidecar (DISPLAY/ANALYTICS; flag-gated) ──
+    # Computes MFE/MAE booleans + commission impact + the oversized-loss flag from the
+    # already-finalised result and persists a metrics row (INSERT/SELECT only, fail-open
+    # to in-memory). Returns None (fully inert) when every analytics flag is OFF, so the
+    # outcome card below + all goldens stay byte-identical. Never gates / sizes / dedupes.
+    try:
+        _compute_trade_mgmt_metrics(mt)
+    except Exception as exc:
+        logger.warning("trade mgmt metrics error: %s", exc)
 
     _send_outcome_update(mt)
     _apply_outcome_to_journal(mt)
@@ -16707,6 +16919,34 @@ def _send_outcome_update(mt):
         embed["fields"].append({"name": "Management Path",
                                 "value": "\n".join(f"• {u}" for u in updates)[:1024],
                                 "inline": False})
+    # ── Trade-management analytics (DISPLAY-only; only present when a flag is ON, so
+    # an OFF deployment posts the byte-identical legacy card). Each sub-field is gated
+    # on its own flag. ──
+    tm = mt.get("trade_mgmt")
+    if isinstance(tm, dict):
+        if TRADE_MGMT_ANALYTICS_ENABLED:
+            embed["fields"].append({
+                "name": "Targets / Stop",
+                "value": ("Reached target first: %s · Stopped first: %s"
+                          % ("yes" if tm.get("target_reached_before_reversal") else "no",
+                             "yes" if tm.get("stop_hit_before_target") else "no")),
+                "inline": False})
+        if COMMISSION_MODEL_ENABLED:
+            cv = ("Gross ${:,.2f} · Fees ${:,.2f} · Net ${:,.2f}".format(
+                      tm.get("gross_pnl") or 0.0, tm.get("fees") or 0.0, tm.get("net_pnl") or 0.0))
+            fp = tm.get("fee_pct_gross_profit")
+            if fp is not None:
+                cv += " · Fees {:.1f}% of gross".format(fp)
+                if tm.get("fee_warn"):
+                    cv += " ⚠"
+            cv += "  ({}× @ ${:,.2f} round-trip)".format(
+                      tm.get("contracts") or 1, tm.get("fee_per_contract_round_trip") or 0.0)
+            embed["fields"].append({"name": "Commission", "value": cv[:1024], "inline": False})
+        if OVERSIZED_LOSS_PROTECTION_ENABLED and tm.get("oversized_loss_violation"):
+            embed["fields"].append({
+                "name": "⚠ Oversized Loss",
+                "value": str(tm.get("oversized_loss_reason") or "Loss exceeded planned risk.")[:1024],
+                "inline": False})
     for url in {_discord_url(mt.get("symbol") or mt.get("instrument")), DISCORD_JOURNAL_WEBHOOK_URL}:
         if not url:
             continue
@@ -18020,6 +18260,265 @@ def _load_swing_theses_from_db():
             conn.close()
         except Exception:
             pass
+
+
+# ── Trade-management metrics + session-quality persistence (DISPLAY/ANALYTICS) ──
+# Sidecar analytics for CLOSED managed trades (MFE/MAE, stop-before-target booleans,
+# commission impact, oversized-loss flags) and per-session quality grades. Same
+# convention as the journal / swing-thesis / main-brain stores: app-side INSERT/SELECT
+# ONLY, NO in-app DDL (trade_management_metrics + session_quality_grades are created
+# via the database tool in dev + the Publish schema-diff in prod). STRICTLY
+# DISPLAY/ANALYTICS — never feeds the strict gate, scoring, sizing, dedupe, or the
+# /traderspost money path. FAIL-OPEN: a missing table / unavailable DB degrades to an
+# in-memory ring buffer (recent metrics only) and never raises into the close /
+# outcome / analysis paths.
+TRADE_MGMT_DB_READY         = False
+SESSION_QUALITY_DB_READY    = False
+TRADE_MGMT_METRICS_MEM      = deque(maxlen=400)   # in-memory fallback / fast read cache (newest appended)
+TRADE_MGMT_METRICS_MEM_LOCK = threading.Lock()
+SESSION_QUALITY_MEM         = {}                  # (date_et, session, symbol) -> grade dict (fallback)
+SESSION_QUALITY_MEM_LOCK    = threading.Lock()
+
+# Whitelisted, ordered columns for the metrics row (keeps INSERT explicit; these are
+# fixed identifiers, never user input, so interpolating them into SQL is safe).
+_TRADE_MGMT_COLS = (
+    "managed_key", "symbol", "instrument", "direction", "mode", "trading_mode",
+    "opened_at", "closed_at", "entry", "stop", "target", "exit_price", "contracts",
+    "planned_risk_points", "planned_risk_dollars", "mfe_points", "mae_points",
+    "mfe_r", "mae_r", "r_multiple", "stop_hit_before_target",
+    "target_reached_before_reversal", "gross_pnl", "fee_per_contract_round_trip",
+    "fees", "net_pnl", "fee_pct_gross_profit", "actual_loss", "slippage",
+    "oversized_loss_violation", "oversized_loss_reason", "exit_reason",
+    "session", "runner_exit_signal",
+)
+
+
+def _check_trade_mgmt_db_ready():
+    """Probe trade_management_metrics (no DDL) and set TRADE_MGMT_DB_READY. FAIL-OPEN:
+    a missing table / unavailable DB keeps metrics in-memory only."""
+    global TRADE_MGMT_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM trade_management_metrics LIMIT 1")
+            cur.fetchone()
+        TRADE_MGMT_DB_READY = True
+        logger.info("trade_management_metrics table ready")
+    except Exception as exc:
+        logger.warning("trade_management_metrics unavailable (in-memory only): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _check_session_quality_db_ready():
+    """Probe session_quality_grades (no DDL) and set SESSION_QUALITY_DB_READY. FAIL-OPEN."""
+    global SESSION_QUALITY_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM session_quality_grades LIMIT 1")
+            cur.fetchone()
+        SESSION_QUALITY_DB_READY = True
+        logger.info("session_quality_grades table ready")
+    except Exception as exc:
+        logger.warning("session_quality_grades unavailable (in-memory only): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_trade_mgmt_metrics(record):
+    """Upsert ONE closed-trade metrics row by managed_key. Updates the in-memory ring
+    buffer first (so display works without a DB), then offloads the DB write to the
+    slow-task worker. FAIL-OPEN; DISPLAY/ANALYTICS only."""
+    if not isinstance(record, dict) or not record.get("managed_key"):
+        return
+    row = {k: record.get(k) for k in _TRADE_MGMT_COLS}
+    mk = row.get("managed_key")
+    with TRADE_MGMT_METRICS_MEM_LOCK:
+        for r in [r for r in TRADE_MGMT_METRICS_MEM if r.get("managed_key") == mk]:
+            try:
+                TRADE_MGMT_METRICS_MEM.remove(r)
+            except ValueError:
+                pass
+        TRADE_MGMT_METRICS_MEM.append(dict(row))
+    if not TRADE_MGMT_DB_READY:
+        return
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            cols = list(_TRADE_MGMT_COLS)
+            placeholders = ", ".join(["%s"] * len(cols))
+            updates = ", ".join("%s = EXCLUDED.%s" % (c, c) for c in cols if c != "managed_key")
+            vals = []
+            for c in cols:
+                v = row.get(c)
+                if c == "runner_exit_signal":
+                    v = psycopg2.extras.Json(v) if v is not None else None
+                vals.append(v)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO trade_management_metrics (%s) VALUES (%s) "
+                    "ON CONFLICT (managed_key) DO UPDATE SET %s"
+                    % (", ".join(cols), placeholders, updates),
+                    vals,
+                )
+        except Exception as exc:
+            logger.warning("trade mgmt metrics persist failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _load_recent_trade_mgmt_metrics(limit=200, symbol=None):
+    """Return recent metrics rows (newest-first) as dicts. Prefers the DB; falls back
+    to the in-memory ring buffer. FAIL-OPEN -> in-memory (or [])."""
+    if TRADE_MGMT_DB_READY:
+        conn = _learning_conn()
+        if conn is not None:
+            try:
+                cols = list(_TRADE_MGMT_COLS) + ["created_at"]
+                q = "SELECT %s FROM trade_management_metrics" % ", ".join(cols)
+                params = []
+                if symbol:
+                    q += " WHERE symbol = %s"
+                    params.append(symbol)
+                q += " ORDER BY closed_at DESC NULLS LAST, created_at DESC LIMIT %s"
+                params.append(int(limit))
+                with conn.cursor() as cur:
+                    cur.execute(q, params)
+                    rows = cur.fetchall()
+                return [{c: r[i] for i, c in enumerate(cols)} for r in rows]
+            except Exception as exc:
+                logger.warning("trade mgmt metrics load failed: %s", exc)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    with TRADE_MGMT_METRICS_MEM_LOCK:
+        mem = list(TRADE_MGMT_METRICS_MEM)
+    mem.reverse()
+    if symbol:
+        mem = [r for r in mem if r.get("symbol") == symbol]
+    return mem[:int(limit)]
+
+
+def _persist_session_quality_grade(record):
+    """Upsert a session-quality grade by (session_date_et, session_name, symbol).
+    In-memory cache first, then DB via the slow worker. FAIL-OPEN; DISPLAY-only."""
+    if not isinstance(record, dict):
+        return
+    date_et = record.get("session_date_et")
+    session = record.get("session_name")
+    symbol  = record.get("symbol") or ""
+    if not date_et or not session:
+        return
+    rec = dict(record)
+    rec["symbol"] = symbol
+    with SESSION_QUALITY_MEM_LOCK:
+        SESSION_QUALITY_MEM[(str(date_et), session, symbol)] = rec
+    if not SESSION_QUALITY_DB_READY:
+        return
+    comp = rec.get("components")
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO session_quality_grades
+                         (session_date_et, session_name, symbol, trade_count,
+                          entry_quality, risk_control, holding_winners, cutting_losers,
+                          overtrading, commission_efficiency, overall_score,
+                          overall_grade, components, updated_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                       ON CONFLICT (session_date_et, session_name, symbol)
+                       DO UPDATE SET trade_count           = EXCLUDED.trade_count,
+                                     entry_quality         = EXCLUDED.entry_quality,
+                                     risk_control          = EXCLUDED.risk_control,
+                                     holding_winners       = EXCLUDED.holding_winners,
+                                     cutting_losers        = EXCLUDED.cutting_losers,
+                                     overtrading           = EXCLUDED.overtrading,
+                                     commission_efficiency = EXCLUDED.commission_efficiency,
+                                     overall_score         = EXCLUDED.overall_score,
+                                     overall_grade         = EXCLUDED.overall_grade,
+                                     components            = EXCLUDED.components,
+                                     updated_at            = now()""",
+                    (date_et, session, symbol, rec.get("trade_count"),
+                     rec.get("entry_quality"), rec.get("risk_control"),
+                     rec.get("holding_winners"), rec.get("cutting_losers"),
+                     rec.get("overtrading"), rec.get("commission_efficiency"),
+                     rec.get("overall_score"), rec.get("overall_grade"),
+                     psycopg2.extras.Json(comp) if comp is not None else None),
+                )
+        except Exception as exc:
+            logger.warning("session quality persist failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _load_session_quality_grades(date_et=None, limit=50):
+    """Return session-quality grades (newest-first). Prefers the DB; falls back to the
+    in-memory cache. FAIL-OPEN -> in-memory (or [])."""
+    cols = ["session_date_et", "session_name", "symbol", "trade_count",
+            "entry_quality", "risk_control", "holding_winners", "cutting_losers",
+            "overtrading", "commission_efficiency", "overall_score", "overall_grade",
+            "components", "updated_at"]
+    if SESSION_QUALITY_DB_READY:
+        conn = _learning_conn()
+        if conn is not None:
+            try:
+                q = "SELECT %s FROM session_quality_grades" % ", ".join(cols)
+                params = []
+                if date_et:
+                    q += " WHERE session_date_et = %s"
+                    params.append(date_et)
+                q += " ORDER BY session_date_et DESC, session_name LIMIT %s"
+                params.append(int(limit))
+                with conn.cursor() as cur:
+                    cur.execute(q, params)
+                    rows = cur.fetchall()
+                return [{c: r[i] for i, c in enumerate(cols)} for r in rows]
+            except Exception as exc:
+                logger.warning("session quality load failed: %s", exc)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    with SESSION_QUALITY_MEM_LOCK:
+        mem = list(SESSION_QUALITY_MEM.values())
+    if date_et:
+        mem = [r for r in mem if str(r.get("session_date_et")) == str(date_et)]
+    return mem[:int(limit)]
 
 
 # ── Main Brain Performance Review & Learning Loop (OBSERVABILITY / DISPLAY-ONLY) ─
@@ -22919,6 +23418,70 @@ def price_context():
     }), 200
 
 
+def _trade_mgmt_status_block(ticker=None):
+    """DISPLAY-only /status presenter: recent CLOSED-trade management metrics + a
+    lightweight aggregate (win/loss, target-first vs stop-first counts, fee totals,
+    oversized-loss count). Returns None (the /status key stays null) when EVERY
+    analytics flag is OFF, so an OFF deployment is unchanged. FAIL-OPEN -> None.
+    Never gates / sizes / dedupes — pure read of the persisted metrics."""
+    if not (TRADE_MGMT_ANALYTICS_ENABLED or COMMISSION_MODEL_ENABLED
+            or OVERSIZED_LOSS_PROTECTION_ENABLED):
+        return None
+    try:
+        rows = _load_recent_trade_mgmt_metrics(limit=50)
+
+        def _fnum(v):
+            try:
+                return float(v) if v is not None else 0.0
+            except Exception:
+                return 0.0
+
+        wins         = sum(1 for r in rows if _fnum(r.get("r_multiple")) > 0)
+        losses       = sum(1 for r in rows if _fnum(r.get("r_multiple")) < 0)
+        target_first = sum(1 for r in rows if r.get("target_reached_before_reversal"))
+        stop_first   = sum(1 for r in rows if r.get("stop_hit_before_target"))
+        oversized    = sum(1 for r in rows if r.get("oversized_loss_violation"))
+        total_gross  = round(sum(_fnum(r.get("gross_pnl")) for r in rows), 2)
+        total_fees   = round(sum(_fnum(r.get("fees")) for r in rows), 2)
+        total_net    = round(sum(_fnum(r.get("net_pnl")) for r in rows), 2)
+
+        def _present(r):
+            out = {k: r.get(k) for k in (
+                "managed_key", "symbol", "instrument", "direction", "mode",
+                "closed_at", "entry", "exit_price", "contracts", "r_multiple",
+                "mfe_r", "mae_r", "stop_hit_before_target",
+                "target_reached_before_reversal", "gross_pnl", "fees", "net_pnl",
+                "fee_pct_gross_profit", "actual_loss", "slippage",
+                "oversized_loss_violation", "oversized_loss_reason", "exit_reason",
+                "session")}
+            out["fee_warn"] = bool(_fnum(r.get("fee_pct_gross_profit")) > 30.0)
+            return out
+
+        return {
+            "enabled":                     True,
+            "analytics_enabled":           TRADE_MGMT_ANALYTICS_ENABLED,
+            "commission_enabled":          COMMISSION_MODEL_ENABLED,
+            "oversized_loss_enabled":      OVERSIZED_LOSS_PROTECTION_ENABLED,
+            "fee_per_contract_round_trip": round(COMMISSION_PER_CONTRACT_ROUND_TRIP, 2),
+            "oversized_loss_mult":         OVERSIZED_LOSS_MULT,
+            "db_ready":                    TRADE_MGMT_DB_READY,
+            "count":                       len(rows),
+            "wins":                        wins,
+            "losses":                      losses,
+            "target_first":               target_first,
+            "stop_first":                  stop_first,
+            "oversized_loss_count":        oversized,
+            "total_gross":                 total_gross,
+            "total_fees":                  total_fees,
+            "total_net":                   total_net,
+            "recent":                      [_present(r) for r in rows[:15]],
+            "updated_at":                  now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("trade mgmt status block error: %s", exc)
+        return None
+
+
 @app.route("/status", methods=["GET"])
 def status():
     # The dashboard's MGC/MNQ tab passes ?ticker= so the view follows the selected
@@ -23040,6 +23603,9 @@ def status():
         "execution_enabled":        execution_configured(),
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
         "execution_rejections":     _recent_exec_rejections(),
+        # Trade-management analytics (MFE/MAE booleans + commission + oversized-loss);
+        # null when every analytics flag is OFF (display-only).
+        "trade_management":         _trade_mgmt_status_block(a.get("active_ticker")),
         "prop_firm":                prop_firm_status_view(),
         # ── Dual-timeframe (1m bias + 5s execution) engine — DISPLAY-ONLY ──
         "dualTfEngineEnabled": _dtf["dualTfEngineEnabled"],
@@ -24119,6 +24685,92 @@ def _prop_main_brain_line():
             "account": (v.get("account") or {}).get("name")}
 
 
+def _send_broker_order(mode, provider_label, instrument, payload, send_url,
+                       *, release_slot=None, order_kind="entry"):
+    """Audited broker-send sink shared by the single-order gateway AND the LIVE
+    2-contract runner (entry legs + runner reduce). Owns ONLY the money-path SEND
+    discipline: the redacted pre-send audit log (the destination URL is NEVER
+    logged), required-field validation -> local 400 block (no send) recording the
+    dashboard rejection + diagnostic, the single requests.post, and the fail-CLOSED
+    result mapping (RequestException / 3xx / 5xx -> 502 broker_verify_required with
+    the duplicate-guard cooldown HELD; a definite 4xx -> release the slot + 502
+    rejected; 2xx -> success). It does NOT build/mutate the payload, reserve the
+    dedupe slot, send Discord, or build the success response -- the CALLER owns
+    those so the legacy single-order path stays byte-identical. release_slot
+    (optional) is the caller's cooldown-rollback closure, invoked ONLY on a local
+    validation block or a definite broker 4xx (the two outcomes that prove nothing
+    was placed). order_kind labels the runner legs (entry_primary / entry_runner /
+    runner_reduce) for the caller's dedupe; it never changes the audit/validation
+    strings. Returns (result_or_None, code_or_None): (None, None) means the send
+    landed (2xx) and the caller continues to its OWN success path; a non-None
+    (result, code) is terminal -- return it as-is."""
+    def _release():
+        if release_slot is not None:
+            try:
+                release_slot()
+            except Exception:
+                pass
+    # ── Pre-send payload audit + REQUIRED-FIELD validation (money-path guard) ─────
+    # Log the EXACT JSON about to be transmitted (secrets redacted; the destination
+    # URL is NEVER logged) so every live order is auditable. Then verify the broker's
+    # required fields (TradersPost: ticker + action; PickMyTrade: symbol + data) are
+    # present and non-empty. A missing/null/empty required field is exactly what makes
+    # TradersPost reject with "Both the action and ticker fields are required" — so we
+    # reject LOCALLY, free the duplicate-guard slot, record the reason for the
+    # dashboard, and NEVER send an invalid order. Fail-closed, like the rest of this
+    # gate. The payload itself is NOT modified, so a VALID order stays byte-identical
+    # to the legacy send.
+    # Serialize ONCE, best-effort: for TradersPost this is the exact wire JSON (no
+    # redacted fields, default separators/order match requests' json=payload). A
+    # serialization hiccup must never turn a local block into a 500 (that would skip
+    # the dashboard record while still — correctly — not sending).
+    try:
+        _payload_json = json.dumps(_redact_payload_for_log(payload))
+    except Exception:
+        _payload_json = "<unserializable payload>"
+    logger.info("Execution payload audit (%s) before send: %s", mode, _payload_json)
+    _bad_fields = _validate_broker_payload(mode, payload)
+    if _bad_fields:
+        _release()
+        _detail = ", ".join("%s (%s)" % (f, why) for f, why in _bad_fields)
+        _reason = ("Invalid %s payload — order BLOCKED locally (not sent): required "
+                   "field(s) %s." % (provider_label, _detail))
+        logger.error("BLOCKED invalid broker payload (%s) for %s: %s | payload=%s",
+                     mode, instrument, _detail, _payload_json)
+        _record_exec_rejection(instrument, _reason)
+        _record_diagnostic("%s | EXECUTION blocked — invalid %s payload (%s)"
+                           % (instrument, mode, _detail))
+        return {"status": "error", "reason": _reason,
+                "blocked_fields": [f for f, _ in _bad_fields]}, 400
+
+    # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
+    # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
+    # send-side exception (timeout / read error / connection reset / refused) and every
+    # 5xx/3xx is AMBIGUOUS — we can't prove the bytes never reached the provider, so the
+    # order may already be live — so we keep the cooldown and make the owner verify at
+    # the broker. Never silently allow a duplicate live order.
+    try:
+        resp = requests.post(send_url, json=payload, timeout=10)
+    except requests.RequestException as exc:
+        logger.warning("%s ambiguous send error — cooldown held: %s", provider_label, exc)
+        return {"status": "error", "broker_verify_required": True,
+                        "reason": (f"{provider_label} did not confirm ({exc}). The order MAY have been placed — "
+                                   "check your broker before retrying.")}, 502
+
+    if 200 <= resp.status_code < 300:
+        return None, None  # success -- caller continues to its own confirmation path
+    elif 400 <= resp.status_code < 500:
+        _release()
+        logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
+        return {"status": "error",
+                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}, 502
+    else:
+        logger.warning("%s ambiguous response — cooldown held: %s %s", provider_label, resp.status_code, resp.text[:300])
+        return {"status": "error", "broker_verify_required": True,
+                        "reason": (f"{provider_label} returned {resp.status_code}. The order MAY have been placed — "
+                                   "check your broker before retrying.")}, 502
+
+
 def execute_trade_gateway(instrument, contracts, source="manual"):
     """Shared, server-authoritative execution gate behind /traderspost AND the
     auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
@@ -24498,65 +25150,17 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         send_url = EXECUTION_WEBHOOK_URL
         payload  = adapt_pickmytrade(intent)
 
-    # ── Pre-send payload audit + REQUIRED-FIELD validation (money-path guard) ─────
-    # Log the EXACT JSON about to be transmitted (secrets redacted; the destination
-    # URL is NEVER logged) so every live order is auditable. Then verify the broker's
-    # required fields (TradersPost: ticker + action; PickMyTrade: symbol + data) are
-    # present and non-empty. A missing/null/empty required field is exactly what makes
-    # TradersPost reject with "Both the action and ticker fields are required" — so we
-    # reject LOCALLY, free the duplicate-guard slot, record the reason for the
-    # dashboard, and NEVER send an invalid order. Fail-closed, like the rest of this
-    # gate. The payload itself is NOT modified, so a VALID order stays byte-identical
-    # to the legacy send.
-    # Serialize ONCE, best-effort: for TradersPost this is the exact wire JSON (no
-    # redacted fields, default separators/order match requests' json=payload). A
-    # serialization hiccup must never turn a local block into a 500 (that would skip
-    # the dashboard record while still — correctly — not sending).
-    try:
-        _payload_json = json.dumps(_redact_payload_for_log(payload))
-    except Exception:
-        _payload_json = "<unserializable payload>"
-    logger.info("Execution payload audit (%s) before send: %s", mode, _payload_json)
-    _bad_fields = _validate_broker_payload(mode, payload)
-    if _bad_fields:
-        _release_slot()
-        _detail = ", ".join("%s (%s)" % (f, why) for f, why in _bad_fields)
-        _reason = ("Invalid %s payload — order BLOCKED locally (not sent): required "
-                   "field(s) %s." % (provider_label, _detail))
-        logger.error("BLOCKED invalid broker payload (%s) for %s: %s | payload=%s",
-                     mode, instrument, _detail, _payload_json)
-        _record_exec_rejection(instrument, _reason)
-        _record_diagnostic("%s | EXECUTION blocked — invalid %s payload (%s)"
-                           % (instrument, mode, _detail))
-        return {"status": "error", "reason": _reason,
-                "blocked_fields": [f for f, _ in _bad_fields]}, 400
-
-    # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
-    # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
-    # send-side exception (timeout / read error / connection reset / refused) and every
-    # 5xx/3xx is AMBIGUOUS — we can't prove the bytes never reached the provider, so the
-    # order may already be live — so we keep the cooldown and make the owner verify at
-    # the broker. Never silently allow a duplicate live order.
-    try:
-        resp = requests.post(send_url, json=payload, timeout=10)
-    except requests.RequestException as exc:
-        logger.warning("%s ambiguous send error — cooldown held: %s", provider_label, exc)
-        return {"status": "error", "broker_verify_required": True,
-                        "reason": (f"{provider_label} did not confirm ({exc}). The order MAY have been placed — "
-                                   "check your broker before retrying.")}, 502
-
-    if 200 <= resp.status_code < 300:
-        pass  # success — fall through to confirmation
-    elif 400 <= resp.status_code < 500:
-        _release_slot()
-        logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
-        return {"status": "error",
-                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}, 502
-    else:
-        logger.warning("%s ambiguous response — cooldown held: %s %s", provider_label, resp.status_code, resp.text[:300])
-        return {"status": "error", "broker_verify_required": True,
-                        "reason": (f"{provider_label} returned {resp.status_code}. The order MAY have been placed — "
-                                   "check your broker before retrying.")}, 502
+    # Audited send sink (shared with the LIVE 2-contract runner legs / reduce in
+    # Phase 3b). Byte-identical for the single-order path: it logs the redacted
+    # payload, validates required fields (local 400 block), POSTs, and maps the
+    # result fail-closed. (None, None) => 2xx landed -- fall through to the Discord
+    # confirmation + success response below. _release_slot frees the duplicate-guard
+    # cooldown ONLY on a local validation block or a definite broker 4xx.
+    _send_res, _send_code = _send_broker_order(
+        mode, provider_label, instrument, payload, send_url,
+        release_slot=_release_slot, order_kind="entry")
+    if _send_res is not None:
+        return _send_res, _send_code
 
     content = (
         f"🚀 **ORDER SENT → {provider_label} — {direction.upper()}**\n"
@@ -32322,6 +32926,8 @@ if __name__ == "__main__":
         _check_main_brain_events_db_ready()        # probe main_brain_events (no DDL; created via DB tool/publish diff)
         _check_prop_accounts_db_ready()            # probe prop_accounts (no DDL; created via DB tool/publish diff) — Prop Firm Protection
         _load_prop_accounts_from_db()              # warm the prop-account cache (display + guard reads); Protection stays OFF until toggled
+        _check_trade_mgmt_db_ready()               # probe trade_management_metrics (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
+        _check_session_quality_db_ready()          # probe session_quality_grades (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
