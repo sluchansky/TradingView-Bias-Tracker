@@ -13,8 +13,12 @@ those sibling vetoes**.
 
 ## Shape
 - Display-first: always computed, written ONLY to `result["entry_quality"]`. When the
-  gate flag is OFF (the default) it can never touch verdict / trade_plan / directions /
-  execution. Engine ON, veto OFF by default; runtime toggle resets OFF on restart.
+  gate flag is OFF it can never touch verdict / trade_plan / directions / execution.
+  Engine ON; **the veto now DEFAULTS ON (live-loss-reduction; was OFF)** — env
+  `ENTRY_QUALITY_GATE_ENABLED=0` or the `/entry-quality` dashboard toggle disables it,
+  and the runtime toggle still resets to the env-seed default on restart. Because the
+  strict goldens don't call `full_analysis`, they stay byte-identical despite the flip;
+  `entry_quality_smoke.py` is what pins the new default-ON contract.
 - Veto is flag-gated, DEMOTE-ONLY: when armed it can only turn an actionable verdict
   into WAIT (null plan, directions ready=False/WAIT, re-run decision_support,
   entry_quality.final_verdict=WAIT). It can never promote/force a trade.

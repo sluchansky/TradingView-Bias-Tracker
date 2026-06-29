@@ -437,6 +437,56 @@ CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
 # execution gateway. Entirely behind DUAL_TF_ENGINE (default OFF => byte-identical
 # no-op) and SCALP-only. The SWING money path is never touched.
 DUAL_TF_ENGINE = os.environ.get("DUAL_TF_ENGINE", "").strip().lower() in ("1", "true", "yes", "on")
+
+# ── Live-loss-reduction money-path flags (2026-06-29) ─────────────────────────
+# Four reversible, DEFAULT-ON protections added after sustained real-account
+# underperformance (PF 0.54, ~23% win rate). Each has an env kill-switch (set to
+# 0/false/no/off to restore the exact legacy behaviour); the SCALP-affecting ones
+# are ALSO pinned OFF in the scoring goldens so the regression baseline stays
+# byte-identical. Defaults apply on the next republish (env unset => protection ON).
+def _env_flag_on(name, default_on=True):
+    """Env boolean that DEFAULTS ON unless EXPLICITLY disabled (0/false/no/off)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return bool(default_on)
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name, default):
+    """Env float with a safe fallback (blank / unparseable => default)."""
+    try:
+        raw = (os.environ.get(name) or "").strip()
+        return float(raw) if raw else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int_or_none(name, default):
+    """Int env that also honors a legacy/unlimited sentinel so a default-ON cap
+    stays fully reversible. 'none'/'off'/'legacy'/'unlimited'/'-1' => None (no cap);
+    blank => default; otherwise a non-negative int."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("none", "off", "legacy", "unlimited", "-1"):
+        return None
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+# T2 — SCALP volatility brake: demote READY->WAIT when the ATR ratio is EXTREME
+#      (> threshold). SCALP-only (SWING already hard-gates volatility via VOL_HARD_GATE).
+SCALP_VOL_BRAKE_ENABLED   = _env_flag_on("SCALP_VOL_BRAKE_ENABLED")
+SCALP_VOL_BRAKE_THRESHOLD = _env_float("SCALP_VOL_BRAKE_THRESHOLD", 3.0)
+# T3 — SCALP 1:2 reward upgrade: lift the SCALP primary/first target from 1R to 2R,
+#      with the staged exit multiples moving in lockstep (TP2 2.5R, runner 3R) so the
+#      broker TP, management geometry, dashboard quality and entry veto all agree.
+SCALP_RR2_ENABLED   = _env_flag_on("SCALP_RR2_ENABLED")
+SCALP_RR2_PRIMARY_R = _env_float("SCALP_RR2_PRIMARY_R", 2.0)
+SCALP_RR2_TP2_R     = _env_float("SCALP_RR2_TP2_R", 2.5)
+SCALP_RR2_RUNNER_R  = _env_float("SCALP_RR2_RUNNER_R", 3.0)
 DUAL_TF_BIAS_TTL_SEC    = 600   # 10 min: a standing bias expires if no entry fires
 # Convergence window: each of the >=2 confirmations must be this fresh (seconds) to
 # count, so an entry fires only when they all land within this window of NOW (=> within
@@ -804,6 +854,31 @@ def cfg_for(mode, key):
     return MODES.get(mode, MODES.get(TRADING_MODE, MODES["SCALP"]))[key]
 
 
+def _scalp_primary_rr(mode=None):
+    """Primary/first-target R-multiple for the SCALP 1:2 reward upgrade (T3).
+
+    Returns None when the upgrade does NOT apply — the env kill-switch
+    SCALP_RR2_ENABLED=0 (pinned OFF in the scalp golden) or any non-SCALP mode (incl.
+    flag-off SWING) — so the caller keeps the byte-identical legacy 1:1 literals.
+    Returns the configured primary R (default 2.0) when it DOES apply (SCALP, flag on)."""
+    m = mode or TRADING_MODE
+    if SCALP_RR2_ENABLED and m == "SCALP":
+        return float(SCALP_RR2_PRIMARY_R)
+    return None
+
+
+def _scalp_rr_targets(mode=None):
+    """Effective (TP1, TP2, runner) R-multiples for the SCALP staged exits. With the
+    1:2 upgrade ON they move in lockstep (2.0 / 2.5 / 3.0) so the broker primary, the
+    staged management geometry, the dashboard quality preview and the loss-vs-first-
+    target veto all agree. OFF / non-SCALP returns the legacy cfg values (1.0 / 1.5 /
+    2.0) unchanged => byte-identical."""
+    m = mode or TRADING_MODE
+    if SCALP_RR2_ENABLED and m == "SCALP":
+        return (float(SCALP_RR2_PRIMARY_R), float(SCALP_RR2_TP2_R), float(SCALP_RR2_RUNNER_R))
+    return (cfg_for(m, "SCALP_TP1_R"), cfg_for(m, "SCALP_TP2_R"), cfg_for(m, "SCALP_RUNNER_R"))
+
+
 def _swing_htf_enabled(mode=None):
     """Single master gate for the SWING higher-timeframe overhaul.
 
@@ -990,7 +1065,7 @@ def _entry_quality_engine_enabled():
 
 
 def _entry_quality_gate_enabled():
-    """Entry Quality money-path VETO — OFF by default. When ON, a poor entry LOCATION
+    """Entry Quality money-path VETO — DEFAULT ON (live-loss-reduction). When ON, a poor entry LOCATION
     (score below the threshold) may only DEMOTE an actionable gate verdict to WAIT —
     unless confidence is extremely high (Edge >= ENTRY_QUALITY_OVERRIDE_EDGE), which
     suppresses the veto. It can NEVER promote / force a trade. The runtime dashboard
@@ -998,7 +1073,10 @@ def _entry_quality_gate_enabled():
     stays byte-identical until the operator arms it."""
     if _ENTRY_QUALITY_GATE_OVERRIDE is not None:
         return bool(_ENTRY_QUALITY_GATE_OVERRIDE)
-    return os.environ.get("ENTRY_QUALITY_GATE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+    # Live-loss-reduction (2026-06-29): DEFAULT ON. The runtime dashboard override
+    # still wins; env ENTRY_QUALITY_GATE_ENABLED=0 is the kill-switch (and is pinned
+    # OFF in the goldens that exercise full_analysis so they stay byte-identical).
+    return os.environ.get("ENTRY_QUALITY_GATE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def set_entry_quality_gate(value):
@@ -1822,18 +1900,27 @@ def _auto_trade_bump_count(inst):
 
 
 # ── Per-asset safety controls (money path) ───────────────────────────────────
-# Every asset gets independently-enforced safety limits. The DEFAULTS below equal
-# today's global behaviour, so MGC/MNQ (which declare no per-asset overrides) stay
-# byte-identical: maxTradesPerDay == the global auto cap, maxContracts == the global
-# server contract ceiling, and every other control defaults to OFF (None / 0 /
-# False). MES/MYM ship emergency-disabled (registry seed) until the operator arms
-# them. All money-path helpers take a STRICT (already-resolved) instrument and fail
-# CLOSED on anything unknown — never the lenient instrument_of() default.
+# Every asset gets independently-enforced safety limits. maxContracts still mirrors
+# the global server ceiling (per-trade size is unchanged). Live-loss-reduction
+# (2026-06-29): the per-day AUTO cap and the open-position cap now DEFAULT to tight
+# protective values (5 trades/day, 1 open position) instead of the old wide-open
+# behaviour — both env-tunable kill-switches. MGC/MNQ inherit these defaults (no
+# per-asset overrides); MES/MYM ship emergency-disabled (registry seed) until the
+# operator arms them. All money-path helpers take a STRICT (already-resolved)
+# instrument and fail CLOSED on anything unknown — never the lenient instrument_of().
+SAFETY_MAX_TRADES_PER_DAY = int(_env_float("SAFETY_MAX_TRADES_PER_DAY", 5))   # per-day AUTO entry cap
+SAFETY_MAX_OPEN_TRADES    = _env_int_or_none("SAFETY_MAX_OPEN_TRADES", 1)     # concurrent open positions (None => legacy unlimited)
+# Force the one-position guard ON even for SCALP (allow_stack requests are demoted)
+# so concurrent stacking can't compound a losing streak. NOTE: a live position is
+# blocked by BOTH this gate AND the maxOpenTrades=1 cap above (belt-and-suspenders).
+# To FULLY restore legacy SCALP stacking set DISABLE_STACKING_GATE=0 *and*
+# SAFETY_MAX_OPEN_TRADES=none (either one alone still blocks a stacked entry).
+DISABLE_STACKING_GATE = _env_flag_on("DISABLE_STACKING_GATE")
 SAFETY_DEFAULTS = {
-    "maxTradesPerDay":   AUTO_TRADE_MAX_PER_DAY,   # per-day AUTO entry cap (ET day)
+    "maxTradesPerDay":   SAFETY_MAX_TRADES_PER_DAY,# per-day AUTO entry cap (ET day)
     "maxContracts":      TRADERSPOST_MAX_CONTRACTS,# hard server contract ceiling
     "maxDailyLoss":      None,                     # USD; None => no daily-loss cap
-    "maxOpenTrades":     None,                     # None => legacy one-slot behaviour
+    "maxOpenTrades":     SAFETY_MAX_OPEN_TRADES,   # concurrent open positions (1 => one-slot)
     "cooldownAfterLoss": 0,                        # seconds; 0 => no post-loss cooldown
     "cooldownAfterWin":  0,                        # seconds; 0 => no post-win cooldown
     "emergencyDisable":  False,                    # per-asset money-path kill switch
@@ -6151,6 +6238,20 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     vol       = volatility or {}
     vol_block = bool(vol.get("blocked")) and bool(cfg("VOL_HARD_GATE"))
     vol_adj   = int(vol.get("score_adj") or 0)
+    # ── SCALP volatility brake (live-loss-reduction, flag-gated default ON). In SCALP
+    #    volatility is NOT a hard gate (VOL_HARD_GATE False), so a wild-ATR regime can
+    #    still go READY and whipsaw the entry. This brake demotes READY->WAIT only when
+    #    the ATR ratio is EXTREME (> SCALP_VOL_BRAKE_THRESHOLD), well beyond the normal
+    #    Elevated band. SCALP-only (never when VOL_HARD_GATE, i.e. SWING is untouched),
+    #    FAIL-OPEN (unknown/unparseable ratio => no brake), env kill-switch
+    #    SCALP_VOL_BRAKE_ENABLED=0. SWING keeps its existing vol_block hard gate. ──
+    scalp_vol_brake = False
+    if SCALP_VOL_BRAKE_ENABLED and not bool(cfg("VOL_HARD_GATE")):
+        try:
+            _vr = vol.get("ratio")
+            scalp_vol_brake = bool(_vr is not None and float(_vr) > SCALP_VOL_BRAKE_THRESHOLD)
+        except (TypeError, ValueError):
+            scalp_vol_brake = False
 
     # ── CVD (Cumulative Volume Delta) — HARD confirmation filter, FAIL-OPEN. ──
     #    Reject a LONG when CVD is bearish (delta < 0) and a SHORT when CVD is
@@ -6523,7 +6624,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         score  = gd["edge_score"]
         cvd_ok = cvd_long_ok if direction == "Long" else cvd_short_ok
         gates_ok = bool(
-            not true_conflict and not vol_block
+            not true_conflict and not vol_block and not scalp_vol_brake
             and (not require_zone or gd["zone_valid"])
             and (not require_vwap or gd["vwap_confirmed"])
             and (not require_structure or gd["structure_confirmed"])
@@ -6619,6 +6720,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
             reason = (f"{direction} on hold — market {held}: "
                       f"{vol.get('display', 'volatility out of range')}.")
+        elif scalp_vol_brake:
+            reason = (f"{direction} WAIT — volatility brake: ATR ratio "
+                      f"{vol.get('ratio')}x over the SCALP limit ({SCALP_VOL_BRAKE_THRESHOLD:g}x).")
         else:
             reason = (f"{direction} WAIT — failed gate(s): "
                       f"{', '.join(fails) if fails else 'confluence'}.")
@@ -6742,6 +6846,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     # the building floor is None (SWING) — so SWING falls straight through to WAIT.
     _bgd = blk["gate_debug"]
     if (setup_building_threshold is not None and not true_conflict and not vol_block
+            and not scalp_vol_brake
             and _bgd.get("zone_valid") and _bgd.get("structure_confirmed")
             and setup_building_threshold <= blk["score"] < ready_threshold):
         return _ret({
@@ -6764,6 +6869,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         held = "too volatile" if vol.get("regime") == "HIGH_BLOCK" else "too quiet"
         reason = (f"{candidate} on hold — market {held}: "
                   f"{vol.get('display', 'volatility out of range')}.")
+    elif scalp_vol_brake:
+        reason = (f"{candidate} WAIT — volatility brake: ATR ratio "
+                  f"{vol.get('ratio')}x exceeds the SCALP limit ({SCALP_VOL_BRAKE_THRESHOLD:g}x); "
+                  f"standing aside until volatility normalises.")
     else:
         reason = (f"{candidate} WAIT — failed gate(s): "
                   f"{', '.join(fails) if fails else 'confluence'}.")
@@ -7044,11 +7153,23 @@ def build_strict_trade_plan(direction, ticker, current_price,
         rr_str = f"{rr_num_val:g}:1"
         swing_target_label = _lvl.get("label")
     else:
-        take_profit = (entry + risk) if direction == "Long" else (entry - risk)
-        reward      = risk
-        rr_num_val  = 1.0
-        rr_str      = "1:1"
-    risk_dollars = round(risk * pv, 2)   # per contract risk (== profit at 1:1)
+        # SCALP 1:2 reward upgrade (T3, flag-gated default ON). _scalp_primary_rr returns
+        # None on the legacy path (flag off OR non-SCALP, incl. flag-off SWING) so the
+        # exact 1:1 literals below are preserved byte-identically; it returns the primary
+        # R (default 2.0) for SCALP when armed. The ORB 1:4 override downstream recomputes
+        # its target purely from risk, so a 2R base never leaks into it.
+        _rr2_pr = _scalp_primary_rr(mode)
+        if _rr2_pr is None:
+            take_profit = (entry + risk) if direction == "Long" else (entry - risk)
+            reward      = risk
+            rr_num_val  = 1.0
+            rr_str      = "1:1"
+        else:
+            take_profit = (entry + _rr2_pr * risk) if direction == "Long" else (entry - _rr2_pr * risk)
+            reward      = _rr2_pr * risk
+            rr_num_val  = float(_rr2_pr)
+            rr_str      = f"1:{_rr2_pr:g}"
+    risk_dollars = round(risk * pv, 2)   # per contract risk (1R)
 
     zone_word = "demand" if direction == "Long" else "supply"
     side_word = "below" if direction == "Long" else "above"
@@ -7056,6 +7177,9 @@ def build_strict_trade_plan(direction, ticker, current_price,
     if swing_htf_plan:
         plan_reason = (f"{inst} {direction} — SWING {rr_str} R:R to "
                        f"{swing_target_label or 'HTF level'}, ATR/structure stop "
+                       f"({risk:.1f} pts), {anchor_word}-anchored.")
+    elif (not swing_htf_plan) and (_rr2_pr is not None):
+        plan_reason = (f"{inst} {direction} — fixed {rr_str} R:R, ATR/structure stop "
                        f"({risk:.1f} pts), {anchor_word}-anchored.")
     else:
         plan_reason = (f"{inst} {direction} — fixed 1:1 R:R, ATR/structure stop "
@@ -7133,9 +7257,9 @@ def build_strict_trade_plan(direction, ticker, current_price,
     # helper the dashboard diagnostics use, so the plan and
     # result["scalp_quality"].targets can never drift.
     if _scalp_dynamic_enabled(mode):
-        t1r = cfg_for(mode, "SCALP_TP1_R")
-        t2r = cfg_for(mode, "SCALP_TP2_R")
-        rnr = cfg_for(mode, "SCALP_RUNNER_R")
+        # T3: effective staged-exit multiples (2.0/2.5/3.0 when the SCALP 1:2 upgrade is
+        # armed, else the legacy 1.0/1.5/2.0) — kept in lockstep with the primary target.
+        t1r, t2r, rnr = _scalp_rr_targets(mode)
         pcts = (cfg_for(mode, "SCALP_TP1_PCT"),
                 cfg_for(mode, "SCALP_TP2_PCT"),
                 cfg_for(mode, "SCALP_RUNNER_PCT"))
@@ -7315,9 +7439,7 @@ def _scalp_dynamic_targets(direction, entry, risk, edge_score, mode=None):
     no I/O. The runner is offered only when Edge >= SCALP_RUNNER_MIN_EDGE; when it is
     absent its scale-out share folds into TP2 (the final exit)."""
     m     = mode or TRADING_MODE
-    tp1_r = cfg_for(m, "SCALP_TP1_R")
-    tp2_r = cfg_for(m, "SCALP_TP2_R")
-    run_r = cfg_for(m, "SCALP_RUNNER_R")
+    tp1_r, tp2_r, run_r = _scalp_rr_targets(m)   # T3: effective (lockstep) exit multiples
     runner_enabled = bool(isinstance(edge_score, (int, float))
                           and edge_score >= cfg_for(m, "SCALP_RUNNER_MIN_EDGE"))
 
@@ -7481,7 +7603,7 @@ def compute_scalp_quality(direction, current_price, vwap_value, vwap_status,
             # Target geometry comes from the SHARED helper so the dashboard diagnostics
             # and the money-path plan (build_strict_trade_plan) can never drift (req 3).
             geo   = _scalp_dynamic_targets(direction, entry, risk, edge_score)
-            tp1_r = cfg("SCALP_TP1_R")
+            tp1_r = _scalp_rr_targets(None)[0]   # T3: effective first-target R (matches geo/plan)
             out["runner_enabled"]   = geo["runner_enabled"]
             out["initial_risk_pts"] = round(risk, 2)
             if pv:
@@ -15811,8 +15933,29 @@ def _build_trade_card_embed(entry, footer_text):
             mgmt_lines.append(f"🏃 Runner: {entry['runner_target']}")
         rdc = entry.get("risk_dollars_per_contract")
         if rdc is not None:
-            # Fixed 1:1 R:R → expected profit per contract == dollar risk per contract.
-            mgmt_lines.append(f"⚖️ R:R 1:1 · Dollar Risk ${rdc}/ct · Expected Profit ${rdc}/ct")
+            # Expected profit per contract == dollar risk × planned R:R (1:1 legacy,
+            # 1:2 SCALP RR2, 1:4 ORB). Derive from the plan so the card never drifts
+            # from the real broker target. The 1:1 branch is byte-identical to before.
+            _card_rr_valid = True
+            try:
+                _card_rr = float(entry.get("rr_num"))
+            except (TypeError, ValueError):
+                _card_rr = 1.0
+                _card_rr_valid = False
+            if _card_rr <= 0:
+                _card_rr = 1.0
+                _card_rr_valid = False
+            # On a bad rr_num fail open to a coherent 1:1 (label + profit together),
+            # never a stale non-1:1 label paired with a 1R profit.
+            _card_rr_lbl = (entry.get("rr") or f"1:{_card_rr:g}") if _card_rr_valid else "1:1"
+            if _card_rr == 1.0:
+                _card_profit = rdc
+            else:
+                try:
+                    _card_profit = round(float(rdc) * _card_rr, 2)
+                except (TypeError, ValueError):
+                    _card_profit = rdc
+            mgmt_lines.append(f"⚖️ R:R {_card_rr_lbl} · Dollar Risk ${rdc}/ct · Expected Profit ${_card_profit}/ct")
         if entry.get("atr_pts") is not None:
             mgmt_lines.append(
                 f"📏 ATR Stop: {entry.get('atr_pts')} pts × {entry.get('atr_multiplier')} "
@@ -27570,7 +27713,13 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
                 pass
             return False
     with _AUTO_EXEC_LOCK:
-        if active_trade_for(inst) and not allow_stack:
+        # Live-loss-reduction: when the stacking gate is armed (default), demote any
+        # allow_stack=True request so a live position always blocks a new entry. Env
+        # kill-switch DISABLE_STACKING_GATE=0 lifts THIS gate, but the maxOpenTrades=1
+        # cap below also blocks a stacked entry — restoring legacy stacking needs both
+        # DISABLE_STACKING_GATE=0 and SAFETY_MAX_OPEN_TRADES=none.
+        effective_allow_stack = allow_stack and not DISABLE_STACKING_GATE
+        if active_trade_for(inst) and not effective_allow_stack:
             return False
         # Per-asset open-position cap (None => legacy unlimited; default for all
         # assets, so this is a no-op unless explicitly configured). A configured 0

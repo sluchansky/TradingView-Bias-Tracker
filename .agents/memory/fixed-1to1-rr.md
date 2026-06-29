@@ -3,13 +3,23 @@ name: Fixed 1:1 R:R trade-plan model
 description: All live trade plans use a fixed 1:1 risk:reward; the tick-grid serialization + stop-side direction invariants that keep it exact through the broker gateway.
 ---
 
-# Fixed 1:1 R:R model
+# R:R trade-plan model (SWING 1:1, SCALP default 1:2)
 
-All live trade plans are **fixed 1:1 R:R** (the older tiered TP1/TP2/TP3 / MNQ 20·40·60 /
-MGC 5·10·15 ladder is retired for the *plan*) — **EXCEPT the one sanctioned ORB 1:4 exception
-below**. Stop is computed first (ATR/structure/zone), snapped UP to whole ticks;
-`RiskDistance = abs(entry - stop)`; `TP = entry ± RiskDistance`. `build_strict_trade_plan` sets
-`target1 == target2`, `rr = "1:1"`, `rr_num = 1.0`; `_decision_support` reward reads `"1:1 (fixed)"`.
+**SWING** live plans are **fixed 1:1 R:R**. **SCALP** now defaults to **1:2** via
+`SCALP_RR2_ENABLED` (default ON, live-loss-reduction): the SCALP primary target/reward/
+`rr_num`/`rr` and the staged management exits (TP1 2R, TP2 2.5R, runner 3R) all scale in
+lockstep through shared helpers `_scalp_primary_rr` / `_scalp_rr_targets`, and the entry veto
+`loss_le_first_target` uses the same helper so the geometry stays coherent. Env kill-switch
+`SCALP_RR2_ENABLED=0` restores legacy SCALP 1:1 (TP1 1R / TP2 1.5R) — which is why the SCALP
+golden pins the flag OFF and stays byte-identical. The older tiered TP1/TP2/TP3 ladder is
+retired for the *plan*. The sanctioned ORB 1:4 exception below still overrides AFTER plan
+construction (SCALP or SWING). Stop is computed first (ATR/structure/zone), snapped UP to whole
+ticks; `RiskDistance = abs(entry - stop)`; legacy `TP = entry ± RiskDistance`.
+
+**RR-display surfaces MUST derive from the plan's `rr_num`/`rr`, never hardcode "1:1".**
+A hardcoded "R:R 1:1 · Expected Profit $risk" Discord-card line silently mislabels every
+1:2 / 1:4 plan; read `entry["rr_num"]` / `entry["rr"]` and compute profit = risk × rr_num
+(keep the `rr_num == 1.0` branch byte-identical to the old string).
 
 ## Min-stop is MODE-SPLIT: SWING hard-rejects, SCALP WIDENS to a floor
 The minimum-distance guard in `_dynamic_stop_plan` is mode-split — and the two modes resolve a

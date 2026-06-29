@@ -15,11 +15,22 @@ Both the manual `/traderspost` path and the auto path flow through the single
 path and without changing MGC/MNQ behaviour.
 
 ## Invariants any change MUST keep
-- **MGC/MNQ byte-identity:** every new control's default is a no-op — emergency
-  False, max_daily_loss None (off), cooldown 0, max_open_trades None (legacy
-  unlimited), max_trades_per_day = legacy global, max_contracts = legacy global.
-  At defaults every new branch must short-circuit so the gateway behaves exactly
-  as before. The registry parity harness must stay IDENTICAL vs golden.
+- **Defaults are now TIGHT-PROTECTIVE, not no-ops (live-loss-reduction).** The global
+  defaults are `maxTradesPerDay=5` and `maxOpenTrades=1` (was 50 / None-unlimited);
+  emergency False, max_daily_loss None, cooldown 0, max_contracts = server ceiling
+  stay as before. These are REAL money-path caps — they only stay golden-safe because
+  the parity/golden harnesses snapshot the strict funcs (build_strict_trade_plan /
+  evaluate_strict_setup) and never exercise the gateway/auto-exec path. If you add a
+  NEW control, still make ITS default a no-op so existing-asset behaviour is unchanged.
+- **Every cap with a legacy-unlimited meaning must stay env-reversible.** Such caps
+  parse via `_env_int_or_none`: `none/off/legacy/unlimited/-1` → `None` (legacy
+  unlimited), blank → default, else a non-negative int (`0` = hard block). A plain
+  `int(_env_float(...))` can NEVER express None and silently breaks the kill-switch
+  contract — don't regress a legacy-unlimited cap back to it.
+- **Stacking is belt-and-suspenders.** A live SCALP position is blocked by BOTH
+  `DISABLE_STACKING_GATE` (demotes `allow_stack`) AND `maxOpenTrades=1`. Restoring
+  legacy stacking needs `DISABLE_STACKING_GATE=0` *and* `SAFETY_MAX_OPEN_TRADES=none`
+  — either alone still blocks. Keep both in-code comments saying so.
 - **Fail-CLOSED for unknown/typo instruments:** never default an unknown to MGC on
   the money path. Use strict resolution (`inst if inst in ASSETS else
   _instrument_from_text(inst)`, None on unknown), NEVER lenient `instrument_of()`
