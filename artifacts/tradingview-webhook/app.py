@@ -1439,6 +1439,18 @@ TRADERSPOST_COOLDOWN_SEC  = max(0, int(os.environ.get("TRADERSPOST_COOLDOWN_SEC"
 _TRADERSPOST_LOCK = threading.Lock()
 _TRADERSPOST_LAST = {}   # instrument -> (fingerprint, epoch_sent); duplicate-send guard
 
+# Opposite-side reversal spacing (TradersPost): minimum seconds between an opposing
+# buy<->sell LIVE send for the SAME instrument. TradersPost rejects a reversal whose
+# opposing order arrives too soon after the previous one, so when a buy follows a
+# sell (or vice versa) within this window we HOLD the second order just long enough
+# (sleeping ONLY the remaining time), then send it so the broker accepts it. 0
+# (default) DISABLES the buffer entirely -> byte-identical to today. Per-instrument;
+# flatten/exit sends are NEVER delayed (a protective close must always go instantly),
+# and same-direction repeats are never delayed (only an actual buy<->sell flip is).
+BROKER_OPPOSITE_SIDE_BUFFER_SEC = max(0, int(os.environ.get("BROKER_OPPOSITE_SIDE_BUFFER_SEC", 0)))
+_BROKER_SIDE_LOCK = threading.Lock()
+_BROKER_LAST_SIDE = {}   # instrument -> (side, epoch_sent) for the last buy/sell LIVE send
+
 
 # -- Auto-trade (hands-free execution) state ----------------------------------
 # When ON for an instrument, a brand-new READY setup automatically routes a
@@ -25201,6 +25213,61 @@ def _prop_main_brain_line():
             "account": (v.get("account") or {}).get("name")}
 
 
+def _broker_payload_side(mode, payload):
+    """'buy' or 'sell' for a directional ENTRY payload, else None. None covers a
+    flatten/exit ('exit') and anything non-directional, which are NEVER buffered (a
+    protective close must always go instantly). TradersPost carries the side in
+    payload['action']; PickMyTrade in payload['data']. Fail-open -> None."""
+    try:
+        if mode == "traderspost":
+            a = str((payload or {}).get("action") or "").strip().lower()
+        else:  # pickmytrade
+            a = str((payload or {}).get("data") or "").strip().lower()
+    except Exception:
+        return None
+    return a if a in ("buy", "sell") else None
+
+
+def _apply_opposite_side_buffer(instrument, mode, payload):
+    """Enforce BROKER_OPPOSITE_SIDE_BUFFER_SEC: a minimum gap between an opposite-side
+    LIVE send and the previous one for THIS instrument so TradersPost accepts the
+    reversal. TradersPost-only (the too-soon-reversal rejection is a TradersPost
+    behaviour); other modes are inert. Concurrency-safe by RESERVATION: under
+    _BROKER_SIDE_LOCK we compute an absolute send time (>= the previous reservation +
+    buf for an actual buy<->sell flip, else >= the previous reservation) and store it
+    BEFORE releasing the lock, then sleep (outside the lock) until that time. Reserving
+    inside the lock is what stops two same-instrument requests from interleaving and
+    POSTing opposite sides closer than buf — a plain read-sleep-record would let a
+    second order slip through while the first sleeps. A flatten/exit (side None) is
+    never delayed and never touches the tracker; a same-direction repeat is never
+    delayed (gap 0). No-op when the knob is 0 (default) or mode != "traderspost" ->
+    byte-identical to today. Fail-OPEN: any error skips the buffer entirely (a buffer
+    hiccup must never block or delay a live order)."""
+    try:
+        buf = BROKER_OPPOSITE_SIDE_BUFFER_SEC
+        if buf <= 0 or mode != "traderspost":
+            return
+        side = _broker_payload_side(mode, payload)
+        if side is None:
+            return
+        now = time.time()
+        with _BROKER_SIDE_LOCK:
+            prev = _BROKER_LAST_SIDE.get(instrument)
+            if prev:
+                gap = buf if prev[0] != side else 0.0
+                send_at = max(now, prev[1] + gap)
+            else:
+                send_at = now
+            _BROKER_LAST_SIDE[instrument] = (side, send_at)
+        wait = send_at - time.time()
+        if wait > 0:
+            logger.info("Opposite-side buffer: holding %s %s order %.1fs (TradersPost "
+                        "reversal spacing).", instrument, side, wait)
+            time.sleep(wait)
+    except Exception:
+        pass
+
+
 def _send_broker_order(mode, provider_label, instrument, payload, send_url,
                        *, release_slot=None, order_kind="entry"):
     """Audited broker-send sink shared by the single-order gateway AND the LIVE
@@ -25258,6 +25325,13 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
                            % (instrument, mode, _detail))
         return {"status": "error", "reason": _reason,
                 "blocked_fields": [f for f, _ in _bad_fields]}, 400
+
+    # Opposite-side reversal spacing (TradersPost): if enabled, hold an opposing
+    # buy/sell just long enough after the previous opposite send for THIS instrument
+    # so the broker accepts the reversal. No-op when BROKER_OPPOSITE_SIDE_BUFFER_SEC
+    # is 0 (default) or for a flatten/exit (never delayed). Runs AFTER validation (we
+    # never sleep for an order we're about to block) and BEFORE the POST.
+    _apply_opposite_side_buffer(instrument, mode, payload)
 
     # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
     # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
