@@ -13962,7 +13962,7 @@ def compute_main_brain(result):
                                                  result.get("market_regime"), fav)
 
         head_dir = (" %s" % fav) if (fav and status in ("BUILDING", "WATCHING", "READY")) else ""
-        return {
+        mb_out = {
             "status":            status,
             "headline":          "%s%s" % (status, head_dir),
             "summary":           summary,
@@ -13992,6 +13992,15 @@ def compute_main_brain(result):
             "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
             "reason":            None,
         }
+        # Fold in the scalp-strategy advisory ONLY when it's present + enabled (flag ON);
+        # otherwise the Main Brain dict stays byte-identical to today. DISPLAY-ONLY.
+        _adv = result.get("scalp_strategy_advisory")
+        if isinstance(_adv, dict) and _adv.get("enabled"):
+            try:
+                mb_out["potential_trades"] = _mb_potential_trades_summary(_adv)
+            except Exception:
+                pass
+        return mb_out
     except Exception as exc:
         try:
             logger.error("Main Brain compute error (non-fatal): %s", exc)
@@ -15727,6 +15736,20 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["fast_entry"] = _compute_fast_entry_trigger(result, instrument_of(active_ticker))
     except Exception as _fe_exc:
         result["fast_entry"] = _fast_entry_neutral("Fast entry unavailable (%s)." % _fe_exc)
+
+    # ── Scalp-Strategy Advisory ("potential trades") — DISPLAY/ADVISORY-ONLY ──
+    # ANALYZES all research scalp strategies as *potential* trades (never auto-fires).
+    # Attached ONLY when SCALP_MAIN_BRAIN_ADVISORY_ENABLED is on, so flag-OFF leaves
+    # full_analysis byte-identical (the key is simply absent — goldens/smokes that call
+    # full_analysis are unaffected). Runs BEFORE compute_main_brain so the Main Brain can
+    # fold in a compact "potential_trades" summary. FAIL-OPEN.
+    if SCALP_MAIN_BRAIN_ADVISORY_ENABLED:
+        try:
+            result["scalp_strategy_advisory"] = compute_scalp_strategy_advisory(result)
+        except Exception as _adv_exc:
+            result["scalp_strategy_advisory"] = _scalp_strategy_advisory_neutral(
+                "Strategy advisory unavailable (%s)." % _adv_exc,
+                instrument_of(active_ticker), enabled=True)
 
     # ── Main Brain (DISPLAY-ONLY) ────────────────────────────────────────────
     # FINAL synthesis: runs last so it sees every verdict override above (open /
@@ -24150,6 +24173,31 @@ SCALP_SIM_WATCH_LOCK      = threading.Lock()   # single-flight: one watcher cycl
 SCALP_SIM_WATCH_INTERVAL  = max(10, int(os.environ.get("SCALP_SIM_WATCH_INTERVAL", 15)))
 SCALP_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("SCALP_SIM_COOLDOWN_SECS", 300)))
 SCALP_SIM_MAX_HOLD_HOURS  = max(1, int(os.environ.get("SCALP_SIM_MAX_HOLD_HOURS", 8)))
+
+# ════════════════════════════════════════════════════════════════════════════
+# SCALP-STRATEGY ADVISORY (Main Brain "potential trades") — DISPLAY/ADVISORY ONLY
+# ════════════════════════════════════════════════════════════════════════════
+# The user asked for all 16 research scalp strategies to be "analyzed for potential
+# trades" in the Main Brain — explicitly NOT auto-fired every time a strategy appears.
+# This layer runs the PURE scalp_live_sim detectors over the CURRENT live context and
+# ANALYZES each detected setup as a *candidate*, deriving a confluence read ONLY from
+# fields already on `result` (edge, VWAP side, CVD, RVOL, dominant direction, regime,
+# HTF). It NEVER opens, sizes, scores the gate, dedupes, persists, or touches the money
+# path (no STRATEGY_SCORERS, no evaluate_strict_setup mutation, no _maybe_auto_execute /
+# execute_trade_gateway / _execute_traderspost / AUTO_FIRED_KEYS, no strategy_trades /
+# learning / scalp_strategy_sim_trades writes). Gated behind a default-OFF flag so
+# flag-OFF == byte-identical (the result key is simply never attached). FAIL-OPEN.
+SCALP_MAIN_BRAIN_ADVISORY_ENABLED = os.environ.get(
+    "SCALP_MAIN_BRAIN_ADVISORY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Heuristic regime-fit tagging (DISPLAY ONLY): which of the 16 detectors are
+# mean-reversion (favor ranges) vs continuation (favor trends). Used only to add/remove
+# a single display "fits regime" tag — never affects detection, sizing or the gate.
+_ADVISORY_MEAN_REVERSION_KEYS = {
+    "vwap_reclaim_fail", "opening_range_fakeout", "liquidity_sweep_reversal",
+    "failed_breakdown_breakout", "prior_high_low_sweep", "session_high_low_reclaim",
+    "volume_climax_reversal", "cvd_divergence_scalp", "range_edge_mean_reversion",
+}
 SCALP_SIM_MIN_LIVE_PROMO  = max(1, int(os.environ.get("SCALP_SIM_MIN_LIVE_PROMO", 30)))
 _SCALP_SIM_COOLDOWN       = {}                  # (strategy_key,inst,direction) -> monotonic ts
 _SCALP_SIM_COOLDOWN_LOCK  = threading.Lock()
@@ -24212,6 +24260,249 @@ def _scalp_sim_live_ctx(result):
         return l
     except Exception:
         return None
+
+
+def _scalp_strategy_advisory_neutral(reason="Strategy advisory disabled.",
+                                     instrument=None, enabled=False):
+    """Stable neutral block — the schema contract for the advisory layer. Never raises."""
+    return {
+        "enabled":      bool(enabled),
+        "available":    False,
+        "instrument":   instrument,
+        "generated_at": now_utc().isoformat(),
+        "summary":      reason,
+        "candidates":   [],
+    }
+
+
+def _strategy_pretty_name(key):
+    """'vwap_pullback_continuation' -> 'Vwap Pullback Continuation' (display only)."""
+    try:
+        return str(key).replace("_", " ").title()
+    except Exception:
+        return str(key)
+
+
+def _advisory_dir_from_bias(bias):
+    """Map a textual bias to 'Long'/'Short'/None — DISPLAY only, never raises."""
+    try:
+        b = (bias or "").lower()
+    except Exception:
+        return None
+    if "bull" in b or "long" in b:
+        return "Long"
+    if "bear" in b or "short" in b:
+        return "Short"
+    return None
+
+
+def _analyze_advisory_candidate(cand, result, regime):
+    """Derive a DISPLAY-ONLY confluence read for ONE detector candidate, purely from
+    fields already computed on `result` (no new scorer, no gate, no money path). Returns
+    the candidate enriched with quality/recommendation/confluence/conflicts. The caller
+    also guards, but this never raises on missing/None fields."""
+    direction = cand.get("direction")
+    confluence, conflicts = [], []
+    score = 30
+
+    # Favored / dominant direction from the authoritative strict output (read-only).
+    favored = result.get("dominant_direction") or _advisory_dir_from_bias(result.get("bias"))
+    strict_aligned = bool(favored and direction and favored == direction)
+    if strict_aligned:
+        confluence.append("Aligned with main bias")
+        score += 18
+    elif favored and direction and favored != direction:
+        conflicts.append("Against main bias (%s)" % favored)
+        score -= 16
+
+    # VWAP side (vwap_status is freshness, NOT direction — derive side from price).
+    price = result.get("current_price")
+    vwap  = result.get("vwap_value")
+    if price is not None and vwap is not None:
+        try:
+            vwap_dir = "Long" if float(price) >= float(vwap) else "Short"
+            if vwap_dir == direction:
+                confluence.append("Price on VWAP side")
+                score += 12
+            else:
+                conflicts.append("Against VWAP")
+                score -= 12
+        except Exception:
+            pass
+
+    # CVD agreement (read-only directional confirm).
+    cvd = result.get("cvd_direction")
+    if cvd in ("Long", "Short") and direction in ("Long", "Short"):
+        if cvd == direction:
+            confluence.append("CVD agrees")
+            score += 12
+        else:
+            conflicts.append("CVD opposes")
+            score -= 16
+
+    # Volume participation (RVOL >= 1.5).
+    rvol = result.get("rvol_value")
+    try:
+        if rvol is not None and float(rvol) >= 1.5:
+            confluence.append("Volume surge (RVOL %.1f)" % float(rvol))
+            score += 8
+    except Exception:
+        pass
+
+    # Overall Edge Score (read-only; counts only when not pointing the other way).
+    edge = result.get("edge_score")
+    try:
+        if edge is not None and float(edge) >= 70 and (not favored or favored == direction):
+            confluence.append("Strong Edge Score (%d)" % int(float(edge)))
+            score += 12
+    except Exception:
+        pass
+
+    # Regime fit (continuation likes trends; mean-reversion likes ranges).
+    rkey = regime.upper() if isinstance(regime, str) else ""
+    skey = cand.get("strategy_key") or ""
+    mean_rev = skey in _ADVISORY_MEAN_REVERSION_KEYS
+    if rkey:
+        if "TREND" in rkey and not mean_rev:
+            confluence.append("Fits trending regime")
+            score += 8
+        elif ("RANGE" in rkey or "CHOP" in rkey) and mean_rev:
+            confluence.append("Fits ranging regime")
+            score += 8
+        elif "TREND" in rkey and mean_rev:
+            conflicts.append("Mean-reversion in a trend")
+            score -= 8
+
+    # HTF alignment (SWING context, when present — display only).
+    htf_alignment = None
+    sc = result.get("swing_context")
+    if isinstance(sc, dict):
+        htf_bias = _advisory_dir_from_bias(sc.get("bias") or sc.get("htf_bias"))
+        if htf_bias and direction:
+            if htf_bias == direction:
+                htf_alignment = "aligned"
+                confluence.append("HTF bias aligned")
+                score += 10
+            else:
+                htf_alignment = "against"
+                conflicts.append("Against HTF bias")
+                score -= 10
+
+    score = max(0, min(100, score))
+    if score >= 75:
+        label = "Strong"
+    elif score >= 55:
+        label = "Moderate"
+    elif score >= 40:
+        label = "Marginal"
+    else:
+        label = "Low"
+
+    if conflicts and score < 40:
+        rec = "Skip"
+    elif score >= 70 and strict_aligned:
+        rec = "Consider"
+    elif score >= 55:
+        rec = "Watch"
+    else:
+        rec = "Monitor"
+
+    return {
+        "strategy_key":     skey,
+        "name":             _strategy_pretty_name(skey),
+        "direction":        direction,
+        "entry_reason":     cand.get("entry_reason"),
+        "fidelity":         cand.get("fidelity"),
+        "entry":            cand.get("entry"),
+        "stop":             cand.get("stop"),
+        "target":           cand.get("target"),
+        "risk":             cand.get("risk"),
+        "rr":               cand.get("rr"),
+        "quality_label":    label,
+        "quality_score":    score,
+        "recommendation":   rec,
+        "confluence":       confluence,
+        "conflicts":        conflicts,
+        "regime":           regime,
+        "htf_alignment":    htf_alignment,
+        "strict_alignment": strict_aligned,
+    }
+
+
+def compute_scalp_strategy_advisory(result):
+    """DISPLAY/ADVISORY-ONLY 'potential trades' analysis across all research scalp
+    strategies (see the section header for the money-path wall). Reuses the PURE
+    scalp_live_sim detectors + the same read-only live context the paper sim uses, and
+    ANALYZES (never executes) each detected setup. FAIL-OPEN; the caller only attaches
+    this when the flag is ON, so flag-OFF full_analysis stays byte-identical."""
+    inst = None
+    try:
+        inst = instrument_of(result.get("active_ticker") or "") or None
+    except Exception:
+        inst = None
+    if not SCALP_MAIN_BRAIN_ADVISORY_ENABLED:
+        return _scalp_strategy_advisory_neutral("Strategy advisory disabled.", inst, enabled=False)
+    try:
+        lctx = _scalp_sim_live_ctx(result)
+        if not lctx:
+            return _scalp_strategy_advisory_neutral(
+                "No live context yet (waiting on price / ATR).", inst, enabled=True)
+        import scalp_live_sim as sls
+        raw = sls.build_candidates(lctx) or []
+        regime = lctx.get("regime")
+        analyzed = []
+        for cand in raw:
+            try:
+                analyzed.append(_analyze_advisory_candidate(cand, result, regime))
+            except Exception:
+                continue
+        # Rank: strict-aligned first, then quality, clean fidelity, R:R, key.
+        analyzed.sort(key=lambda c: (
+            0 if c.get("strict_alignment") else 1,
+            -(c.get("quality_score") or 0),
+            0 if c.get("fidelity") == "clean" else 1,
+            -(c.get("rr") or 0),
+            c.get("strategy_key") or "",
+        ))
+        if analyzed:
+            top = analyzed[0]
+            summary = "%d potential setup%s analyzed — top: %s (%s, %s)" % (
+                len(analyzed), "" if len(analyzed) == 1 else "s",
+                top.get("name"), top.get("direction"), top.get("quality_label"))
+        else:
+            summary = "No strategy setups detected on the current tape."
+        return {
+            "enabled":      True,
+            "available":    True,
+            "instrument":   inst,
+            "generated_at": now_utc().isoformat(),
+            "summary":      summary,
+            "candidates":   analyzed,
+        }
+    except Exception as exc:
+        return _scalp_strategy_advisory_neutral(
+            "Strategy advisory unavailable (%s)." % exc, inst, enabled=True)
+
+
+def _mb_potential_trades_summary(adv):
+    """Compact Main-Brain view of the scalp-strategy advisory block (display-only).
+    Never raises — the compute_main_brain caller also guards."""
+    cands = (adv.get("candidates") or []) if isinstance(adv, dict) else []
+    top = []
+    for c in cands[:3]:
+        top.append({
+            "name":           c.get("name"),
+            "direction":      c.get("direction"),
+            "quality_label":  c.get("quality_label"),
+            "quality_score":  c.get("quality_score"),
+            "recommendation": c.get("recommendation"),
+        })
+    return {
+        "available": bool(adv.get("available")) if isinstance(adv, dict) else False,
+        "count":     len(cands),
+        "summary":   adv.get("summary") if isinstance(adv, dict) else None,
+        "top":       top,
+    }
 
 
 def _scalp_sim_open_insert(sim_key, setup_anchor, strategy_key, inst, direction,
@@ -26305,6 +26596,10 @@ def status():
         "dualTfReason":        _dtf["dualTfReason"],
         # ── Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY-ONLY ──
         "index_alignment":     _cross_market_snapshot(),
+        # ── Scalp-Strategy Advisory ("potential trades") — DISPLAY/ADVISORY-ONLY ──
+        # Added ONLY when the flag is on, so the OFF payload is byte-identical to today.
+        **({"scalp_strategy_advisory": a.get("scalp_strategy_advisory")}
+           if SCALP_MAIN_BRAIN_ADVISORY_ENABLED else {}),
     }), 200
 
 
@@ -29831,6 +30126,17 @@ def dashboard():
   <ul id="mbl-list" class="mb-list" style="margin-top:8px"></ul>
 </div>
 
+<!-- Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades
+     (display/advisory only; it ranks ideas, it never places or changes a trade). Hidden
+     unless SCALP_MAIN_BRAIN_ADVISORY_ENABLED is on (fed by d.scalp_strategy_advisory).
+     ALL dynamic strings are written via textContent (XSS-safe), never innerHTML. -->
+<div class="mod" id="mod-scalp-advisory" style="display:none">
+  <div class="mod-h">🧠 Strategy Radar — Potential Trades <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">ADVISORY-ONLY</span></div>
+  <div id="ssa-summary" class="mb-summary" style="margin-bottom:6px">—</div>
+  <div id="ssa-list"></div>
+  <div class="nf-fid">All 16 research scalp strategies, analyzed for trade potential from the current tape. Advisory only — it ranks ideas, it never places or changes a trade.</div>
+</div>
+
 <div class="mod mb-hidden" id="mod-countdown">
   <div class="mod-h">🎯 Setup Countdown</div>
   <div class="cd-big" id="cd-big">—</div>
@@ -32148,6 +32454,54 @@ function renderMBLearning(d){
     }
   }
 }
+// Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades.
+// DISPLAY/ADVISORY-ONLY: it ranks ideas, it never places or changes a trade. Hidden
+// unless the server attaches d.scalp_strategy_advisory (flag SCALP_MAIN_BRAIN_ADVISORY_
+// ENABLED). Every dynamic string goes through textContent (XSS-safe), never innerHTML.
+function renderScalpAdvisory(d){
+  const mod=document.getElementById('mod-scalp-advisory'); if(!mod) return;
+  const a=(d&&d.scalp_strategy_advisory)||null;
+  if(!a||!a.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  _mbSetText('ssa-summary', a.summary);
+  const wrap=document.getElementById('ssa-list'); if(!wrap) return;
+  wrap.innerHTML='';
+  const arr=(a.candidates)||[];
+  if(!arr.length){
+    const e=document.createElement('div'); e.style.cssText='color:#6b7280;font-size:12px';
+    e.textContent='No strategy setups on the current tape.'; wrap.appendChild(e); return;
+  }
+  const fmt=function(x){ return (typeof x==='number')?x.toFixed(2):'—'; };
+  arr.slice(0,6).forEach(function(c){
+    const row=document.createElement('div');
+    row.style.cssText='border-top:1px solid #1f2030;padding:7px 0';
+    const top=document.createElement('div');
+    top.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px';
+    const left=document.createElement('span'); left.style.fontWeight='600';
+    const dir=(c.direction||'');
+    left.textContent=(c.name||c.strategy_key||'—')+' · '+dir;
+    left.style.color=(dir==='Short')?'#ef4444':((dir==='Long')?'#22c55e':'#e8e8f0');
+    const right=document.createElement('span'); right.style.cssText='font-size:11px;color:#9aa3b2';
+    const q=(typeof c.quality_score==='number')?(' '+c.quality_score):'';
+    right.textContent=(c.recommendation||'—')+' · '+(c.quality_label||'—')+q;
+    top.appendChild(left); top.appendChild(right); row.appendChild(top);
+    const plan=document.createElement('div'); plan.style.cssText='font-size:11px;color:#9aa3b2;margin-top:3px';
+    plan.textContent='Entry '+fmt(c.entry)+'  Stop '+fmt(c.stop)+'  Target '+fmt(c.target)+'  R:R '+((c.rr!=null)?c.rr:'—');
+    row.appendChild(plan);
+    if(c.entry_reason){
+      const rs=document.createElement('div'); rs.style.cssText='font-size:10px;color:#6b7280;margin-top:2px';
+      rs.textContent=c.entry_reason; row.appendChild(rs);
+    }
+    const tags=[];
+    (c.confluence||[]).forEach(function(t){ tags.push('+ '+t); });
+    (c.conflicts||[]).forEach(function(t){ tags.push('! '+t); });
+    if(tags.length){
+      const tg=document.createElement('div'); tg.style.cssText='font-size:10px;color:#6b7280;margin-top:2px';
+      tg.textContent=tags.join('   '); row.appendChild(tg);
+    }
+    wrap.appendChild(row);
+  });
+}
 function renderMainBrainCognitive(d){
   try{ renderMBVoice(d); }catch(e){}
   try{ renderMBPredictions(d); }catch(e){}
@@ -32156,6 +32510,7 @@ function renderMainBrainCognitive(d){
   try{ renderMBEvents(d); }catch(e){}
   try{ renderMBDayType(d); }catch(e){}
   try{ renderMBLearning(d); }catch(e){}
+  try{ renderScalpAdvisory(d); }catch(e){}
 }
 
 // ── Ask the brain — interactive chat inside Main Brain (DISPLAY-ONLY, read-only) ──

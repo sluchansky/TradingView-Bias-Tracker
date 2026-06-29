@@ -19,10 +19,10 @@ results.
   target/stop. So every recorded row exits at *exactly* target (Win) or *exactly*
   stop (Loss), ±1.00R, zero slippage — the tell-tale fingerprint of simulation.
 
-**Why this matters:** the dashboard can show ~70% wins while the real account is deep
-red. Observed 2026-06-29: bot DB booked the morning as mostly wins; the TradeZella
-export of the same window was 6W/20L, −$365, full of 0-second instant-reversal churn
-trades the bot never recorded.
+**Why this matters:** the dashboard can show a high win-rate while the real account is
+deep red. Observed divergence: the bot DB booked a session as mostly wins while the
+broker (TradeZella) export of the same window was a net loser, full of 0-second
+instant-reversal churn trades the bot never recorded.
 
 **How to apply:**
 - NEVER treat the bot's own DB / dashboard scoreboard as real performance. To judge

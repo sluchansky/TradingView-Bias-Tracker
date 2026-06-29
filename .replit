@@ -52,6 +52,10 @@ args = "cross_market"
 task = "workflow.run"
 args = "learning_score_golden"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "scalp_advisory"
+
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
 author = "agent"
@@ -148,6 +152,17 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "bash .local/state/check_learning_score_golden.sh"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "scalp_advisory"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_scalp_advisory.sh"
 
 [workflows.workflow.metadata]
 isValidation = true
