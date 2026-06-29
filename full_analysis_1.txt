@@ -1,0 +1,1000 @@
+14566:def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
+14567-    # Which instrument this analysis is for: an explicit override (dashboard tab)
+14568-    # wins; otherwise fall back to the most-recently-alerted instrument.
+14569-    active_ticker = instrument_of(ticker_override) if ticker_override else _active_ticker()
+14570-
+14571-    score_window = cfg("SCORE_WINDOW_MIN")
+14572-    if score_window:
+14573-        bullish, bearish, counts = score_alerts(alerts_in_window(score_window))
+14574-    else:
+14575-        bullish, bearish, counts = calculate_scores()
+14576-    bias, strength           = calculate_bias(bullish, bearish)
+14577-    confidence               = calculate_confidence(bullish, bearish)
+14578-    quality                  = calculate_trade_quality(bias, confidence, bullish, bearish)
+14579-    edge_score               = calculate_edge_score(bias, confidence, strength)
+14580-
+14581-    with _timed("indicatorCalcMs"):
+14582-        last_price_by_type, all_supply, all_demand = get_price_context(active_ticker)
+14583-    current_price = current_price_override if current_price_override is not None else current_price_for(active_ticker)
+14584-    nearest_supply, nearest_demand = get_nearest_levels(current_price, all_supply, all_demand)
+14585-
+14586-    structure_label, structure_detail = get_market_structure(current_price, last_price_by_type)
+14587-    risk_label, risk_detail, overextended = get_risk_zone(
+14588-        bias, current_price, nearest_supply, nearest_demand
+14589-    )
+14590-
+14591-    recommendation, verdict, structure_class, reasoning_chain = decision_engine(
+14592-        structure_label, risk_label, overextended,
+14593-        bias, bullish, bearish, confidence
+14594-    )
+14595-
+14596-    market_direction = get_market_direction(structure_label)
+14597-    trade_opportunity, opportunity_reason, entry_trigger, invalidation = get_trade_opportunity(
+14598-        market_direction, structure_label, risk_label,
+14599-        overextended, bullish, bearish, nearest_supply, nearest_demand, last_price_by_type
+14600-    )
+14601-
+14602-    # ── Strict recommendation ruleset — AUTHORITATIVE verdict ────────────────
+14603-    # A trade is recommended ONLY when BOS + CHOCH + 5m confirmation candle + the
+14604-    # price-vs-VWAP filter all align on one side. Score 0-100 → Strong/Possible/WAIT.
+14605-    # active_ticker resolved at the top (honours the dashboard's instrument tab).
+14606-    with _timed("indicatorCalcMs"):
+14607-        vwap_value, vwap_status = get_vwap(active_ticker)
+14608-    with _timed("volatilityCalcMs"):
+14609-        volatility = get_volatility(active_ticker)
+14610-    # Preferred-session state (ET) computed ONCE here and threaded through the gate
+14611-    # AND stored on the result, so the +10 Session Bonus the gate credits and the
+14612-    # Session block on the card/status are derived from the same instant.
+14613-    session_state = get_session_state()
+14614-    # Market-session state (CME/COMEX hours, shared by MNQ & MGC). Computed once
+14615-    # here and applied as a single neutralising override right before `return`, so
+14616-    # all result keys still exist (single-return-path invariant) and the gate is
+14617-    # paused — not deleted — while the market is closed.
+14618-    market = market_session_status()
+14619-    # Task #18 — learning-influences-scoring: resolve the per-direction learning-weight
+14620-    # metadata ONLY when the master flag is armed (else None → byte-identical scoring).
+14621-    # Edge-independent + FAIL-OPEN, so it is safe to compute before the gate decides.
+14622-    learning_score_influence = _resolve_learning_score_influence(
+14623-        active_ticker, current_price, vwap_value, vwap_status, volatility)
+14624-    with _timed("scoringMs"):
+14625-        strict = evaluate_strict_setup(
+14626-            current_price, active_ticker, vwap_value, vwap_status,
+14627-            nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
+14628-            volatility=volatility, session=session_state, cooldown_active=cooldown_active,
+14629-            learning_score_influence=learning_score_influence,
+14630-        )
+14631-    strict_label     = strict["label"]
+14632-    strict_score     = strict["score"]
+14633-    strict_direction = strict["direction"]
+14634-    confluences      = strict["confluences"]
+14635-    strict_reason    = strict.get("reason", "")
+14636-    strict_missing   = strict.get("missing", [])
+14637-
+14638-    # SWING higher-timeframe context — computed ONCE here (only under SWING + flag-on)
+14639-    # and REUSED by the plan builder (target geometry), the P4 entry veto, the
+14640-    # potential-plan preview, and the display attach below, so the gate and every
+14641-    # surface read the SAME context (no drift). None in SCALP / flag-off → the builder
+14642-    # falls through to its byte-identical 1:1 path and the veto block never runs.
+14643-    swing_ctx = None
+14644-    if _swing_htf_enabled(TRADING_MODE):
+14645-        try:
+14646-            swing_ctx = compute_swing_context(active_ticker, current_price)
+14647-        except Exception:
+14648-            swing_ctx = None
+14649-
+14650-    if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
+14651-        trade_plan = build_strict_trade_plan(
+14652-            strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
+14653-            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value, edge_score=edge_score,
+14654-            swing_context=swing_ctx,
+14655-        )
+14656-        if trade_plan["trade_plan"]:
+14657-            # EARLY READY (SCALP Edge 50-59) is actionable but half size / lower
+14658-            # conviction; a full READY is Edge >= the full-READY floor (60). Both still
+14659-            # require a valid trade plan (R:R + an anchor — a trade-side zone OR
+14660-            # VWAP), so an EARLY setup that can't form a real plan still falls
+14661-            # through to WAIT below.
+14662-            _early = strict.get("readiness") == "EARLY"
+14663-            if strict_direction == "Long":
+14664-                verdict = "LONG EARLY READY" if _early else "LONG READY"
+14665-            else:
+14666-                verdict = "SHORT EARLY READY" if _early else "SHORT READY"
+14667-        else:
+14668-            # Fixed targets can't meet the 1:2 R:R (or no zone/VWAP anchor) → no trade.
+14669-            verdict        = "WAIT"
+14670-            strict_label   = "WAIT"
+14671-            strict_reason  = trade_plan.get("reason", strict_reason)
+14672-    elif strict_label == "Setup Building" and strict.get("candidate"):
+14673-        # SETUP BUILDING (informational, NON-actionable). Like MARKET CLOSED, the
+14674-        # journaling label is forced to WAIT so the journal + live-card paths skip it;
+14675-        # the building state is surfaced via the verdict + diagnostics ONLY. NO trade
+14676-        # plan is built, so the broker path (is_actionable + top-level trade_plan)
+14677-        # can never light up for a building setup.
+14678-        verdict       = "SETUP BUILDING"
+14679-        strict_label  = "WAIT"
+14680-        trade_plan = {
+14681-            "trade_plan": False,
+14682-            "reason":     strict_reason or "Setup building — not yet READY.",
+14683-            "entry_zone": None, "stop_loss": None,
+14684-            "target1":    None, "target2":   None,
+14685-            "rr":         None, "direction": strict.get("candidate"),
+14686-            "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+14687-        }
+14688-    else:
+14689-        verdict    = "WAIT"
+14690-        trade_plan = {
+14691-            "trade_plan": False,
+14692-            "reason":     strict_reason or "Strict conditions not met.",
+14693-            "entry_zone": None, "stop_loss": None,
+14694-            "target1":    None, "target2":   None,
+14695-            "rr":         None, "direction": strict_direction,
+14696-            "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+14697-        }
+14698-
+14699-    # ── SCALP dynamic-exit ENTRY VETOES (Phase S2, MONEY-PATH) ───────────────────
+14700-    # SCALP-only + master-flag-gated. Turns the S1 diagnostics into real entry
+14701-    # filters: an Edge-actionable setup (READY or EARLY) that fails setup-quality,
+14702-    # room-to-target, opposing-zone, chop, or loss-size becomes WAIT with a precise
+14703-    # reason and NO trade plan — so neither the live card nor the execution gateway
+14704-    # (which re-checks is_actionable from THIS verdict) can act on it. Computed once
+14705-    # from the REAL plan just built and reused for the display block below, so the
+14706-    # gate and the dashboard can never drift. FAIL-CLOSED: if the check can't run the
+14707-    # setup is vetoed. SWING / flag-off skip this entirely → byte-identical.
+14708-    scalp_quality_block = None
+14709-    if _scalp_dynamic_enabled() and is_actionable(verdict) and strict_direction:
+14710-        try:
+14711-            _sq = compute_scalp_quality(
+14712-                strict_direction, current_price, vwap_value, vwap_status,
+14713-                nearest_supply, nearest_demand, trade_plan, edge_score,
+14714-                instrument_of(active_ticker),
+14715-                (volatility or {}).get("atr_pts"),
+14716-            )
+14717-            _veto = _scalp_entry_veto_reasons(_sq)
+14718-        except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
+14719-            _sq   = None
+14720-            _veto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
+14721-        if _veto:
+14722-            verdict       = "WAIT"
+14723-            strict_label  = "WAIT"
+14724-            strict_reason = "SCALP filter: " + "; ".join(m for _, m in _veto) + "."
+14725-            trade_plan = {
+14726-                "trade_plan": False,
+14727-                "reason":     strict_reason,
+14728-                "entry_zone": None, "stop_loss": None,
+14729-                "target1":    None, "target2":   None,
+14730-                "rr":         None, "direction": strict_direction,
+14731-                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+14732-            }
+14733-            if isinstance(_sq, dict):
+14734-                _sq["overall_pass"] = False
+14735-                # Reuse this block for display so the dashboard keeps the REJECTED
+14736-                # setup's geometry + failing checks (recomputing after the plan is
+14737-                # dropped below would read the nulled plan and lose them).
+14738-                scalp_quality_block = _sq
+14739-
+14740-    # ── SWING entry MONEY-PATH vetoes (P4) ───────────────────────────────────────
+14741-    # SWING-only + master-flag-gated, mirroring the SCALP veto block above. An
+14742-    # Edge-/strict-actionable setup that fails higher-timeframe confirmation (1H+4H
+14743-    # bias agreement, a daily key level with a valid pullback, fresh HTF data) becomes
+14744-    # WAIT with a precise reason and NO trade plan — so neither the live card nor the
+14745-    # execution gateway (which re-checks is_actionable from THIS verdict) can act on
+14746-    # it. The ≥SWING_MIN_RR target + trade-side-zone requirements are already enforced
+14747-    # inside build_strict_trade_plan (a failure there drops the plan → WAIT BEFORE this
+14748-    # point, so is_actionable is already False); this block adds the HTF-confirmation
+14749-    # gate the builder does not check and re-validates the rest defensively.
+14750-    # FAIL-CLOSED: a broken check vetoes. SCALP / flag-off never enter (mutually
+14751-    # exclusive modes), so those paths stay byte-identical.
+14752-    if _swing_htf_enabled() and is_actionable(verdict) and strict_direction:
+14753-        try:
+14754-            _sv = _swing_entry_veto_reasons(swing_ctx, trade_plan, strict_direction)
+14755-        except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
+14756-            _sv = [("unavailable", f"SWING entry checks unavailable ({exc})")]
+14757-        if _sv:
+14758-            verdict       = "WAIT"
+14759-            strict_label  = "WAIT"
+14760-            strict_reason = "SWING filter: " + "; ".join(m for _, m in _sv) + "."
+14761-            trade_plan = {
+14762-                "trade_plan": False,
+14763-                "reason":     strict_reason,
+14764-                "entry_zone": None, "stop_loss": None,
+14765-                "target1":    None, "target2":   None,
+14766-                "rr":         None, "direction": strict_direction,
+14767-                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+14768-            }
+14769-
+14770-    # get_setup_stage retained for lifecycle display context in the embed.
+14771-    setup_stage, stage_next_step, stage_entry_rule, stage_invalidation, stage_direction = get_setup_stage(
+14772-        current_price, nearest_supply, nearest_demand, bullish, bearish, ALERT_HISTORY
+14773-    )
+14774-
+14775-    # Align the displayed lifecycle stage with the authoritative strict verdict.
+14776-    if is_actionable(verdict):
+14777-        setup_stage      = "Trade Ready"
+14778-        stage_direction  = strict_direction
+14779-        if is_early_ready(verdict):
+14780-            stage_next_step  = strict_reason or (
+14781-                "Early setup — enter aggressive (reduced size) or wait for the "
+14782-                "confirmation candle.")
+14783-            stage_entry_rule = (
+14784-                f"Enter {strict_direction.lower()} early at reduced size, "
+14785-                "or wait for a confirmation candle.")
+14786-        else:
+14787-            stage_next_step  = strict_reason or "All strict conditions met — enter now."
+14788-            stage_entry_rule = f"Enter {strict_direction.lower()} per strict checklist."
+14789-
+14790-    # ── Zone Broken: cancel setup, reduce confidence, mark structure invalidated ──
+14791-    # Scoped to the analyzed instrument: a broken MGC zone must not invalidate a
+14792-    # valid MNQ setup (and vice versa). Untagged (legacy) breaks apply globally.
+14793-    zone_broken_active = (
+14794-        ZONE_BROKEN_AT is not None
+14795-        and ZONE_BROKEN_AT.get("instrument") in (None, instrument_of(active_ticker))
+14796-    )
+14797-    # SWING hard-gates on zone (GATE_REQUIRE_ZONE True): a broken or consumed zone is
+14798-    # a full WAIT override. SCALP demotes zone to a confirmation, so a broken/consumed
+14799-    # zone only updates the zone STATE for display and NEVER overrides a
+14800-    # structure+VWAP+Edge READY. cfg() reads the active mode so SWING stays unchanged.
+14801-    zone_hard_gate = bool(cfg("GATE_REQUIRE_ZONE"))
+14802-    if zone_broken_active and zone_hard_gate:
+14803-        confidence         = max(0, confidence - 30)
+14804-        setup_stage        = "Watching"
+14805-        stage_direction    = None
+14806-        stage_next_step    = "Wait for structure to rebuild after zone break"
+14807-        stage_entry_rule   = "—"
+14808-        stage_invalidation = "Structure invalidated — zone broken"
+14809-        verdict            = "WAIT"
+14810-        strict_label       = "WAIT"
+14811-        strict_score       = 0
+14812-        strict_reason      = "Structure invalidated — zone broken."
+14813-        trade_plan         = {
+14814-            "trade_plan": False,
+14815-            "reason":     "Structure invalidated — zone broken.",
+14816-            "entry_zone": None, "stop_loss": None,
+14817-            "target1":    None, "target2": None,
+14818-            "rr":         None, "direction": None,
+14819-            "stop_valid": False,
+14820-            "stop_invalid_reason": "Structure invalidated — zone broken.",
+14821-        }
+14822-
+14823-    # ── Zone Mitigated: a consumed zone blocks entries UNLESS the mitigation is
+14824-    # a confirmed bullish reaction (handled as a LONG via the strict gate). ──
+14825-    mitig_confirmed = bool(confluences.get("zone_mitigated"))
+14826-    _mit_inst = instrument_of(active_ticker)
+14827-    near_sup_mz, mz_sup_price = is_near_mitigated_zone(nearest_supply, _mit_inst)
+14828-    near_dem_mz, mz_dem_price = is_near_mitigated_zone(nearest_demand, _mit_inst)
+14829-    # Block only when THIS instrument's mitigation is active (flag not yet cleared
+14830-    # by a same-instrument structure reset, entries not yet TTL-expired) AND its
+14831-    # nearest zone actually sits on a mitigated price. State is instrument-scoped
+14832-    # so a mitigated MGC zone can neither WAIT-block nor arm an unrelated MNQ
+14833-    # alert (and vice-versa).
+14834-    zone_mitigated_near = (
+14835-        MITIGATED_FLAG_BY_TICKER.get(_mit_inst) and (near_sup_mz or near_dem_mz)
+14836-        and not zone_broken_active
+14837-        and not mitig_confirmed
+14838-    )
+14839-    _mit_records = MITIGATED_PRICES_BY_TICKER.get(_mit_inst)
+14840-    mitigated_zone_price = (
+14841-        mz_sup_price or mz_dem_price
+14842-        or (_mit_records[-1]["price"] if _mit_records else None)
+14843-    )
+14844-    if zone_mitigated_near and zone_hard_gate:
+14845-        # Full override — zone mitigation supersedes ALL scores, setups, and plans
+14846-        confidence         = max(0, confidence - 15)
+14847-        verdict            = "WAIT"
+14848-        recommendation     = "WAIT"
+14849-        trade_opportunity  = "None"
+14850-        opportunity_reason = "Zone already reacted and is no longer valid for entry."
+14851-        entry_trigger      = None
+14852-        invalidation       = None
+14853-        trade_plan         = {
+14854-            "trade_plan": False,
+14855-            "reason":     "Zone consumed — wait for fresh supply or demand zone.",
+14856-            "entry_zone": None, "stop_loss": None,
+14857-            "target1":    None, "target2": None,
+14858-            "rr":         None, "direction": None,
+14859-            "stop_valid": False,
+14860-            "stop_invalid_reason": "Zone consumed — wait for fresh supply or demand zone.",
+14861-        }
+14862-        setup_stage        = "Watching"
+14863-        stage_direction    = None
+14864-        stage_next_step    = "Zone consumed — wait for fresh supply or demand zone."
+14865-        stage_entry_rule   = "No entry from consumed zone."
+14866-        stage_invalidation = (
+14867-            f"Zone previously mitigated at {mitigated_zone_price:.1f} — invalid entry."
+14868-        )
+14869-        strict_label       = "WAIT"
+14870-        strict_reason      = "Zone consumed — wait for fresh supply or demand zone."
+14871-
+14872-    why  = build_why(bias, confidence, bullish, bearish, counts,
+14873-                     verdict, overextended, risk_label)
+14874-    plan = build_trade_plan(bias, strength, bullish, bearish, counts)
+14875-
+14876-    # Dashboard price readout (DISPLAY-ONLY; the gate above uses `current_price`).
+14877-    # An explicit price override is echoed as-is; otherwise show the fresh alert
+14878-    # price, falling back to the auto-fetched market price so the readout never
+14879-    # goes blank after a restart / quiet market.
+14880-    if current_price_override is not None:
+14881-        display_price, price_source = current_price, "alert"
+14882-    else:
+14883-        display_price, price_source = display_price_for(active_ticker)
+14884-
+14885-    result = dict(
+14886-        bullish=bullish, bearish=bearish, counts=counts,
+14887-        bias=bias, strength=strength, confidence=confidence,
+14888-        quality=quality, edge_score=edge_score,
+14889-        recommendation=recommendation, verdict=verdict,
+14890-        reasoning_chain=reasoning_chain, why=why, plan=plan,
+14891-        setup_stage=setup_stage, stage_next_step=stage_next_step,
+14892-        stage_entry_rule=stage_entry_rule, stage_invalidation=stage_invalidation,
+14893-        stage_direction=stage_direction,
+14894-        market_direction=market_direction,
+14895-        trade_opportunity=trade_opportunity,
+14896-        opportunity_reason=opportunity_reason,
+14897-        entry_trigger=entry_trigger,
+14898-        invalidation=invalidation,
+14899-        trade_plan=trade_plan,
+14900-        current_price=current_price,
+14901-        display_price=display_price, price_source=price_source,
+14902-        last_price_by_type=last_price_by_type,
+14903-        nearest_supply=nearest_supply, nearest_demand=nearest_demand,
+14904-        structure_label=structure_label, structure_class=structure_class,
+14905-        structure_detail=structure_detail,
+14906-        risk_label=risk_label, risk_detail=risk_detail, overextended=overextended,
+14907-        zone_broken_active=zone_broken_active,
+14908-        zone_mitigated_near=zone_mitigated_near,
+14909-        mitigated_zone_price=mitigated_zone_price,
+14910-        strict_label=strict_label, strict_score=strict_score,
+14911-        strict_direction=strict_direction, strict_reason=strict_reason,
+14912-        strict_missing=strict_missing, confluences=confluences,
+14913-        vwap_value=vwap_value, vwap_status=vwap_status,
+14914-        volatility=volatility,
+14915-        active_ticker=active_ticker,
+14916-    )
+14917-
+14918-    # Preferred-session state (Eastern Time) — drives the +10 Session Bonus in the
+14919-    # Edge Score and the Session block on /status, /why and the trade card. Reuses
+14920-    # the SAME instant threaded into the gate so the bonus stays consistent.
+14921-    result["session"] = session_state
+14922-    # Per-gate WAIT debug (which READY gate failed) — surfaced on /status + logs.
+14923-    result["gate_debug"] = strict.get("gate_debug")
+14924-    # Candidate direction the gate evaluated (Long/Short/None) — for /diagnostics.
+14925-    result["gate_candidate"] = strict.get("candidate")
+14926-
+14927-    # ── Task #18: learning-influences-scoring summary (display + diagnostics). Always
+14928-    #    present (single-return-path parity); inert when the master flag is OFF
+14929-    #    (enabled False, armed False, every delta 0). Built FROM the per-direction
+14930-    #    gate_debug so the base->adjusted numbers shown match EXACTLY what the gate
+14931-    #    decided on — no recompute, no drift. ──
+14932-    def _ls_dir_summary(_d):
+14933-        gd = ((strict.get("directions") or {}).get(_d) or {}).get("gate_debug") or {}
+14934-        return {
+14935-            "base":         gd.get("edge_score_base"),
+14936-            "adjusted":     gd.get("edge_score"),
+14937-            "delta":        gd.get("learning_score_delta", 0),
+14938-            "weight":       gd.get("learning_weight", 1.0),
+14939-            "strategy_key": gd.get("learning_strategy_key"),
+14940-            "sample":       gd.get("learning_sample", 0),
+14941-            "capped":       bool(gd.get("learning_capped")),
+14942-            "reason":       gd.get("learning_reason", "off"),
+14943-        }
+14944-    result["learning_score_influence"] = {
+14945-        "enabled":   bool(_learning_score_gate_enabled()),
+14946-        "armed":     bool(learning_score_influence is not None),
+14947-        "max_delta": LEARNING_SCORE_MAX_DELTA,
+14948-        "meta":      (learning_score_influence or {}).get("meta") if learning_score_influence else None,
+14949-        "Long":      _ls_dir_summary("Long"),
+14950-        "Short":     _ls_dir_summary("Short"),
+14951-    }
+14952-
+14953-    # ── Tiered alert level (SCALP early-warning ladder) — additive, DISPLAY-ONLY.
+14954-    #    Computed independently of the verdict; it NEVER alters verdict / score /
+14955-    #    direction / trade plan, so SWING decisions stay byte-for-byte identical.
+14956-    #      WATCH           = price is at a fresh trade-side zone (within WATCH_PCT)
+14957-    #      ARMED           = at the zone AND >= 1 real confirmation present
+14958-    #      WATCH FOR ENTRY = at the zone, confirmations satisfied AND Edge >= 50 but
+14959-    #                        the full READY gate has not passed yet — one decisive
+14960-    #                        trigger (BOS/CHOCH/rejection candle/VWAP) tips it READY
+14961-    #      READY           = the full READY gate passed (verdict LONG/SHORT READY)
+14962-    #      None            = no candidate side, zone consumed/broken, price away
+14963-    #    The trade-side zone is demand for Long / supply for Short. A consumed
+14964-    #    (mitigated-near) or broken zone yields None — we never WATCH a dead zone. ──
+14965-    alert_level = None
+14966-    _cand   = result.get("gate_candidate")
+14967-    _gd_lvl = result.get("gate_debug") or {}
+14968-    # Actionable verdicts (full READY *and* EARLY READY) own the signal — mark the
+14969-    # operational level READY so the tiered ladder defers (no redundant WATCH/ARMED).
+14970-    if is_actionable(result["verdict"]):
+14971-        alert_level = "READY"
+14972-    # SETUP BUILDING is informational (NON-actionable): surface its own operational
+14973-    # level so the dedicated dispatcher can post it, and the tiered WATCH/ARMED ladder
+14974-    # is bypassed (the building heads-up owns the level). Never an actionable signal.
+14975-    elif result["verdict"] == "SETUP BUILDING":
+14976-        alert_level = "SETUP BUILDING"
+14977-    # The "dead zone → never WATCH" rule is a ZONE HARD-GATE behaviour: it holds in
+14978-    # SWING (cfg on) but is bypassed in SCALP (zone demoted), so a consumed/broken
+14979-    # zone no longer mutes the tiered WATCH/ARMED teaser ladder. The ladder still
+14980-    # only fires near an existing zone (the inner proximity test below).
+14981-    elif (_cand in ("Long", "Short")
+14982-          and (not cfg("GATE_REQUIRE_ZONE")
+14983-               or (not zone_broken_active and not zone_mitigated_near))):
+14984-        _zone = nearest_demand if _cand == "Long" else nearest_supply
+14985-        if (_zone and current_price
+14986-                and abs(current_price - _zone) / _zone <= cfg("WATCH_PCT")):
+14987-            _confs = int(_gd_lvl.get("confirmations_passed") or 0)
+14988-            _need  = int(_gd_lvl.get("confirmations_needed") or 0)
+14989-            _edge  = int(_gd_lvl.get("edge_score") or 0)
+14990-            if _confs >= _need and _edge >= 50:
+14991-                alert_level = "WATCH FOR ENTRY"
+14992-            elif _confs >= 1:
+14993-                alert_level = "ARMED"
+14994-            else:
+14995-                alert_level = "WATCH"
+14996-    result["alert_level"] = alert_level
+14997-
+14998-    # ── CVD / RVOL state (per-instrument; from the strict gate). Stamped onto the
+14999-    #    result BEFORE the Edge breakdown so compute_edge_breakdown reads the SAME
+15000-    #    rvol_adj the gate used (display == gate). cvd_* are display-only here; the
+15001-    #    +10 CVD-agreement bonus is already carried in the confluences. ──
+15002-    result["cvd_state"]     = strict.get("cvd_state")
+15003-    result["cvd_value"]     = strict.get("cvd_value")
+15004-    result["cvd_direction"] = strict.get("cvd_direction")
+15005-    result["rvol_value"]    = strict.get("rvol_value")
+15006-    result["rvol_adj"]      = strict.get("rvol_adj")
+15007-    # Volume confirmation (directionless) — stamped BEFORE the Edge breakdown so
+15008-    # compute_edge_breakdown reads the SAME volume_confirmed the gate scored.
+15009-    result["volume_confirmed"]    = strict.get("volume_confirmed")
+15010-    result["volume_data_present"] = strict.get("volume_data_present")
+15011-    result["volume_state"]        = strict.get("volume_state")
+15012-
+15013-    # ── Unified Edge Score (single source of truth) ──────────────────────────
+15014-    # The transparent, confluence-based Edge Score replaces the legacy bias-derived
+15015-    # score on EVERY user-facing surface (status, why, alerts, journal, recaps,
+15016-    # dashboard, trade management). The legacy value is kept internal-only as a
+15017-    # last-resort ranking fallback for old/manual journal entries; never displayed.
+15018-    eb = _analysis_edge_breakdown(result)
+15019-    result["legacy_edge_score"] = edge_score
+15020-    result["edge_breakdown"]    = eb
+15021-    result["edge_score"]        = eb["score"]
+15022-    result["edge_grade"]        = eb["grade"]
+15023-    # ── Conviction tier (display-only, score-banded) — distinct from alert_level
+15024-    #    (operational dispatch state). HIGH CONVICTION >=70 / READY 50-69 / EARLY
+15025-    #    READY 35-49 / None. Names the STRENGTH of the Edge Score; never gates. ──
+15026-    result["conviction_tier"]   = _score_tier(result["edge_score"])
+15027-
+15028-    # ── Gate diagnostics (additive, display-only) — surfaced on every alert,
+15029-    #    /status and the dashboard probability gauge. These are the SAME numbers
+15030-    #    the gate used to decide READY / WAIT / conflict (sourced from `strict`),
+15031-    #    plus the single volatility read, so the displayed values can never diverge
+15032-    #    from the decision. All keys ALWAYS set (single-return-path invariant). ──
+15033-    result["long_score"]            = strict.get("long_score")
+15034-    result["short_score"]           = strict.get("short_score")
+15035-    result["conflict_gap"]          = strict.get("conflict_gap")
+15036-    result["dominant_direction"]    = strict.get("dominant_direction")
+15037-    result["current_atr"]           = volatility.get("atr_pts")
+15038-    result["volatility_multiplier"] = volatility.get("ratio")
+15039-    result["ready_reason"]          = strict_reason
+15040-    result["rejected_reasons"]      = strict_missing
+15041-    # ── Alert diagnostics (additive, DISPLAY/observability ONLY) ─────────────
+15042-    # One transparent snapshot bundling the two per-direction scores, the unified
+15043-    # Edge Score, the conflict gap, the live ATR / volatility multiplier, plus the
+15044-    # human READY reason and the humanised rejected gate reasons. Attached to every
+15045-    # alert + /status + the dashboard diagnostics modules. NEVER feeds the trade
+15046-    # decision, so SWING is byte-for-byte unchanged. The market-closed override
+15047-    # below zeros it so a paused market can't present a stale "why".
+15048-    _diag_gd    = result.get("gate_debug") or {}
+15049-    _diag_long  = int(strict.get("long_score",  _diag_gd.get("long_score",  0)) or 0)
+15050-    _diag_short = int(strict.get("short_score", _diag_gd.get("short_score", 0)) or 0)
+15051-    _diag_gap   = int(strict.get("conflict_gap", _diag_gd.get("conflict_gap", 0)) or 0)
+15052-    if _diag_long > _diag_short:
+15053-        _diag_dom = "Long"
+15054-    elif _diag_short > _diag_long:
+15055-        _diag_dom = "Short"
+15056-    else:
+15057-        _diag_dom = "Neutral"
+15058-    _diag_ready = is_actionable(result["verdict"])
+15059-    # CVD agreement relative to the dominant side (display-only). "Confirmed" when
+15060-    # the delta agrees, "Conflicting" when it opposes, the raw bias when there is no
+15061-    # dominant side, and "Unknown" when CVD has not been reported for this instrument.
+15062-    _cvd_st = strict.get("cvd_state")
+15063-    _cvd_live = CVD_BY_TICKER.get(active_ticker) or {}
+15064-    if not _cvd_st:
+15065-        _cvd_agree = "Unknown"
+15066-    elif _diag_dom == "Neutral":
+15067-        _cvd_agree = "Bullish" if _cvd_st == "bullish" else "Bearish"
+15068-    elif (_diag_dom == "Long" and _cvd_st == "bullish") or (_diag_dom == "Short" and _cvd_st == "bearish"):
+15069-        _cvd_agree = "Confirmed"
+15070-    else:
+15071-        _cvd_agree = "Conflicting"
+15072-    # Per-setup score diagnostics (the authoritative breakdown for the favored side).
+15073-    _diag_eb       = result.get("edge_breakdown") or {}
+15074-    _diag_blockers = list(_diag_gd.get("failed_conditions") or [])
+15075-    # ── camelCase diagnostics (dashboard modules) — additive, observability-only ──
+15076-    _req_edge = int(cfg("EDGE_READY_THRESHOLD"))
+15077-    _strong   = cfg("EDGE_STRONG_THRESHOLD")
+15078-    _edge_now = int(result.get("edge_score") or 0)
+15079-    # readyStrength: only meaningful on an actionable verdict — "Strong" at/above the
+15080-    # strong threshold, else "Standard". None when not READY (incl. SETUP BUILDING/WAIT).
+15081-    if _diag_ready:
+15082-        _ready_strength = "Strong" if (_strong is not None and _edge_now >= int(_strong)) else "Standard"
+15083-    else:
+15084-        _ready_strength = None
+15085-    # vwapDistance: absolute points between price and the live VWAP (None-safe).
+15086-    try:
+15087-        _vwap_dist = (abs(float(current_price) - float(vwap_value))
+15088-                      if (current_price is not None and vwap_value is not None) else None)
+15089-    except (TypeError, ValueError):
+15090-        _vwap_dist = None
+15091-    if _vwap_dist is not None:
+15092-        _vwap_dist = round(_vwap_dist, 2)
+15093-    # zoneAge: best-effort minutes since the latest zone-FORMING alert for this
+15094-    # instrument (NEW/CONFIRMED demand/supply). None when none found or unparseable.
+15095-    _zone_age = None
+15096-    try:
+15097-        _inst_age = instrument_of(active_ticker)
+15098-        for _al in reversed(ALERT_HISTORY):
+15099-            _at = str(_al.get("alert_type") or "").upper()
+15100-            if "ZONE" not in _at or "BROKEN" in _at or "MITIGATED" in _at:
+15101-                continue
+15102-            _ai = _al.get("instrument") or instrument_of(_al.get("ticker") or "")
+15103-            if _inst_age and _ai and _ai != _inst_age:
+15104-                continue
+15105-            _zone_age = int((now_utc() - datetime.fromisoformat(_al["timestamp"])).total_seconds() // 60)
+15106-            break
+15107-    except Exception:
+15108-        _zone_age = None
+15109-    result["alert_diagnostics"] = {
+15110-        "long_score":            _diag_long,
+15111-        "short_score":           _diag_short,
+15112-        "edge_score":            int(result.get("edge_score") or 0),
+15113-        "conflict_gap":          _diag_gap,
+15114-        "dominant_direction":    _diag_dom,
+15115-        "current_atr":           (volatility or {}).get("atr_pts"),
+15116-        "volatility_multiplier": (volatility or {}).get("ratio"),
+15117-        "ready_reason":          (strict_reason if _diag_ready else ""),
+15118-        "rejected_reasons":      _humanize_gate_rejections(_diag_gd),
+15119-        "current_score":         int(result.get("edge_score") or 0),
+15120-        "required_score":        int(cfg("EDGE_READY_THRESHOLD")),
+15121-        # Per-setup Edge breakdown (display/observability): the credited components,
+15122-        # the confirmations that did NOT fire, the gates blocking READY, and the
+15123-        # honest raw-vs-clamped accounting.
+15124-        "score_breakdown":       _diag_eb.get("score_breakdown") or [],
+15125-        "components":            _diag_eb.get("components") or [],
+15126-        "failed_confirmations":  _diag_eb.get("failed_confirmations") or [],
+15127-        "ready_blockers":        _diag_blockers,
+15128-        "raw_score":             int(_diag_eb.get("raw_score") or 0),
+15129-        "max_score":             EDGE_SCORE_MAX,
+15130-        "cap_applied":           bool(_diag_eb.get("cap_applied")),
+15131-        # Volume confirmation (+15 component, fail-open READY gate) + location gate.
+15132-        "volume_state":          _diag_gd.get("volume_state"),
+15133-        "volume_confirmed":      bool(_diag_gd.get("volume_confirmed")),
+15134-        "volume_data_present":   bool(_diag_gd.get("volume_data_present")),
+15135-        "location_ok":           bool(_diag_gd.get("location_ok")),
+15136-        "near_vwap":             bool(_diag_gd.get("near_vwap")),
+15137-        # CVD hard-filter + RVOL soft-modifier diagnostics (display-only).
+15138-        # cvd_state is the COMMITTED direction (what the gate vetoes on); cvd_pending
+15139-        # + cvd_opposite_count expose the 2-candle flip confirmation in progress.
+15140-        "cvd_state":             _cvd_st,
+15141-        "cvd_pending":           _cvd_live.get("pending_dir"),
+15142-        "cvd_opposite_count":    int(_cvd_live.get("opposite_count") or 0),
+15143-        "cvd_value":             strict.get("cvd_value"),
+15144-        "cvd_direction":         strict.get("cvd_direction"),
+15145-        "cvd_agreement":         _cvd_agree,
+15146-        "rvol_value":            strict.get("rvol_value"),
+15147-        "rvol_adj":              int(strict.get("rvol_adj") or 0),
+15148-        # ── camelCase diagnostics consumed by the dashboard modules (additive,
+15149-        #    display-only). edgeScore/requiredEdgeScore/failedGates/scoreBreakdown
+15150-        #    mirror the snake_case fields above; zoneAge/zoneConsumed/vwapDistance/
+15151-        #    cvdState/readyStrength are new heads-up signals for the SCALP redesign. ──
+15152-        "edgeScore":             _edge_now,
+15153-        "requiredEdgeScore":     _req_edge,
+15154-        "failedGates":           _diag_blockers,
+15155-        "scoreBreakdown":        _diag_eb.get("score_breakdown") or [],
+15156-        "zoneAge":               _zone_age,
+15157-        "zoneConsumed":          bool(result.get("zone_mitigated_near")),
+15158-        "vwapDistance":          _vwap_dist,
+15159-        "cvdState":              _cvd_st,
+15160-        "readyStrength":         _ready_strength,
+15161-    }
+15162-    # Decision-support header (Quality/Probability/Risk/Reward/Window/Recommendation)
+15163-    # — all real-derived from the fields set above.
+15164-    result["decision_support"]      = _decision_support(result)
+15165-
+15166-    # ── Per-direction Edge Scores (additive, display-only) ───────────────────
+15167-    # The dashboard Long/Short toggle shows the bull case AND the bear case. The
+15168-    # favored side REUSES the authoritative breakdown verbatim (guaranteed parity
+15169-    # with edge_score above); the other side is scored from its own confluences
+15170-    # with a WAIT state so it is never floored at 75. A conflict or a hard blocker
+15171-    # (zone broken / consumed) zeros both sides — neither is tradeable.
+15172-    dirs_raw = strict.get("directions") or {}
+15173-    auth_dir = (result.get("confluences") or {}).get("direction")
+15174-    # Zone is a hard blocker only in SWING (GATE_REQUIRE_ZONE). In SCALP a broken/
+15175-    # consumed zone is non-blocking, so it must not zero the direction cards either.
+15176-    blockers = bool(cfg("GATE_REQUIRE_ZONE")
+15177-                    and (result.get("zone_broken_active") or result.get("zone_mitigated_near")))
+15178-    out_dirs = {}
+15179-    for _d in ("Long", "Short"):
+15180-        block = dict(dirs_raw.get(_d) or {})
+15181-        if block.get("conflict"):
+15182-            block.update(
+15183-                ready=False, label="WAIT", score=0,
+15184-                edge_score=0, edge_grade=_grade_for_score(0),
+15185-                edge_breakdown={
+15186-                    "score": 0, "grade": _grade_for_score(0),
+15187-                    "score_breakdown": [],
+15188-                    "risk_adjustments": [{"label": "Conflicting structure — stand aside", "points": None}],
+15189-                    "reasons": [], "risks": ["Conflicting structure — stand aside"],
+15190-                },
+15191-            )
+15192-        elif _d == auth_dir:
+15193-            # Mirror the authoritative final decision so the favored side is identical.
+15194-            ready_dir = is_actionable(result["verdict"])
+15195-            block.update(
+15196-                ready=bool(ready_dir),
+15197-                label="READY" if ready_dir else "WAIT",
+15198-                score=0 if blockers else result["strict_score"],
+15199-                reason=result.get("strict_reason") or block.get("reason"),
+15200-                edge_score=result["edge_score"],
+15201-                edge_grade=result["edge_grade"],
+15202-                edge_breakdown=result["edge_breakdown"],
+15203-            )
+15204-        else:
+15205-            a_copy = dict(result)
+15206-            a_copy["confluences"]      = block.get("confluences") or {}
+15207-            a_copy["strict_direction"] = _d
+15208-            a_copy["strict_label"]     = "WAIT"
+15209-            a_copy["verdict"]          = "WAIT"
+15210-            # Read THIS side's own stamped soft modifiers (not the candidate's) so the
+15211-            # non-favored Edge Score keeps gate↔display parity for its own direction.
+15212-            a_copy["gate_debug"]       = block.get("gate_debug") or {}
+15213-            eb_d = _analysis_edge_breakdown(a_copy)
+15214-            block.update(edge_score=eb_d["score"], edge_grade=eb_d["grade"], edge_breakdown=eb_d)
+15215-            if blockers:
+15216-                block.update(ready=False, label="WAIT", score=0)
+15217-
+15218-        # ── Potential trade plan (DISPLAY-ONLY; NEVER broker-eligible) ──────────
+15219-        # As soon as a structural setup is FORMING for this side, surface the
+15220-        # would-be entry / stop / targets / R:R so the user can pre-plan BEFORE a
+15221-        # full READY. The real-order path keys off the actionable verdict + the
+15222-        # top-level result["trade_plan"] only, so this nested per-direction preview
+15223-        # can never light up the Apply / Copy / Send broker actions. Suppressed on
+15224-        # conflict, a hard blocker (zone broken/consumed), a missing price, a closed
+15225-        # session, or before any structural alert exists — and kept as None in all
+15226-        # those cases for single-return-path reader parity.
+15227-        potential_plan = None
+15228-        _gd = block.get("gate_debug") or {}
+15229-        if (current_price is not None and market["open"]
+15230-                and not block.get("conflict") and not blockers
+15231-                and _gd.get("structure_confirmed")):
+15232-            _pp = build_strict_trade_plan(
+15233-                _d, active_ticker, current_price, nearest_supply, nearest_demand,
+15234-                volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+15235-                swing_context=swing_ctx,
+15236-            )
+15237-            if _pp.get("trade_plan"):
+15238-                potential_plan = _pp
+15239-        block["potential_plan"] = potential_plan
+15240-        out_dirs[_d] = block
+15241-    result["directions"] = out_dirs
+15242-
+15243-    # ── Multi-strategy engine (Phase 1 — DISPLAY-ONLY detection) ─────────────
+15244-    # Regime + session bias + scored strategies + best-fit selection. Does NOT
+15245-    # touch verdict / directions / trade_plan (those stay owned by the strict
+15246-    # gate). The market-closed override below replaces it with a paused snapshot.
+15247-    result["strategy_engine"] = compute_strategy_engine(
+15248-        active_ticker, current_price, vwap_value, vwap_status, volatility,
+15249-        result.get("edge_score"),
+15250-    )
+15251-    # ORB-only exception to the fixed-1:1 rule: a real, actionable Opening-Range-
+15252-    # Breakout setup retargets to 1:4 (rewrites the authoritative trade_plan in place;
+15253-    # all other strategies remain 1:1). Runs while the market is open; the closed
+15254-    # override below independently neutralizes the verdict so no closed-market send.
+15255-    _apply_orb_target_override(result)
+15256-
+15257-    # ── Display-only feeds (READ-ONLY; never touch the gate / money path) ─────
+15258-    result["equity_curve_today"] = get_today_equity_curve(active_ticker)
+15259-    result["news_filter"]        = get_news_filter()
+15260-
+15261-    # ── Market-session awareness (additive; single neutralising override) ────
+15262-    # MNQ/MGC share the CME/COMEX schedule. While the market is CLOSED there is no
+15263-    # live tape, so reporting WAIT (or counting "failed" evals) is misleading. We
+15264-    # always surface the closed state, the next open, and the last valid price/time;
+15265-    # and when closed we PAUSE the trade decision (no READY/ARMED, no edge/confirm/
+15266-    # session scoring presented as a live read). All keys still exist, so every
+15267-    # hard-indexed consumer is safe (single-return-path invariant).
+15268-    result["market_open"]   = market["open"]
+15269-    result["market_status"] = market["status"]
+15270-    result["next_open"]     = market["next_open_et"]
+15271-    result["next_open_utc"] = market["next_open"].isoformat() if market["next_open"] else None
+15272-    result["market_reason"] = market["reason"]
+15273-    _lv_price, _lv_ts, _lv_src = last_valid_data_for(active_ticker)
+15274-    result["last_valid_price"]  = _lv_price
+15275-    result["last_valid_time"]   = fmt_et(_lv_ts, "%b %-d, %-I:%M %p ET") if _lv_ts else None
+15276-    result["last_valid_source"] = _lv_src
+15277-
+15278-    # ── Analyst Reasoning Engine (Context -> Thesis -> Evidence -> Risk ->
+15279-    #    Verdict). DISPLAY by default; the flag-gated, fail-CLOSED veto can ONLY
+15280-    #    demote an actionable gate verdict to WAIT (never promote). Computed from the
+15281-    #    FINAL assembled result so it reflects every override above. The market-closed
+15282-    #    override below replaces it with a paused stub (single-return-path parity). ──
+15283-    if market["open"]:
+15284-        if _analyst_engine_enabled():
+15285-            try:
+15286-                _analyst = compute_analyst_reasoning(result, strict, swing_ctx, market)
+15287-            except Exception as exc:   # FAIL-OPEN — a broken analyst must never crash analysis.
+15288-                _analyst = _analyst_neutral_block(f"Analyst engine unavailable ({exc}).")
+15289-        else:
+15290-            _analyst = _analyst_neutral_block("Analyst engine disabled.")
+15291-        # Fail-CLOSED veto: only when explicitly enabled AND the analyst disagrees
+15292-        # with an actionable gate verdict. It can ONLY demote to WAIT — never promote.
+15293-        if (_analyst_gate_enabled() and _analyst.get("veto_would_fire")
+15294-                and is_actionable(result["verdict"])):
+15295-            _veto_reason = ("Analyst veto: "
+15296-                            + (_analyst.get("why_not_trade")
+15297-                               or "analyst reasoning does not support the trade."))
+15298-            result["verdict"]       = "WAIT"
+15299-            result["strict_label"]  = "WAIT"
+15300-            result["strict_reason"] = _veto_reason
+15301-            result["trade_plan"]    = {
+15302-                "trade_plan": False, "reason": _veto_reason,
+15303-                "entry_zone": None, "stop_loss": None,
+15304-                "target1":    None, "target2":   None,
+15305-                "rr":         None, "direction": result.get("strict_direction"),
+15306-                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+15307-            }
+15308-            for _vd in ("Long", "Short"):
+15309-                _vblk = (result.get("directions") or {}).get(_vd)
+15310-                if _vblk:
+15311-                    _vblk.update(ready=False, label="WAIT")
+15312-            _ad = result.get("alert_diagnostics") or {}
+15313-            _ad["ready_reason"]     = ""
+15314-            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Analyst veto"]
+15315-            result["alert_diagnostics"] = _ad
+15316-            # Decision-support was computed earlier from the pre-veto plan — recompute
+15317-            # it so every display surface agrees with the demoted WAIT verdict.
+15318-            result["decision_support"] = _decision_support(result)
+15319-            _analyst["final_verdict"] = "WAIT"
+15320-        result["analyst"] = _analyst
+15321-        # ── Professional Review (DISPLAY-ONLY here; the flag-gated veto is wired
+15322-        #    in just below, mirroring the analyst layer). Computed from the FINAL
+15323-        #    assembled result so it reflects every override above. ──────────────
+15324-        if _pro_review_engine_enabled():
+15325-            try:
+15326-                result["pro_review"] = compute_pro_review(
+15327-                    result, strict, swing_ctx, market, active_ticker)
+15328-            except Exception as exc:   # FAIL-OPEN — a broken review must never crash analysis.
+15329-                result["pro_review"] = _pro_review_neutral_block(
+15330-                    "Pro review unavailable (%s)." % exc, inst=active_ticker)
+15331-        else:
+15332-            result["pro_review"] = _pro_review_neutral_block(
+15333-                "Pro review disabled.", inst=active_ticker)
+15334-        # Fail-CLOSED veto (flag-gated, default OFF): only when explicitly enabled
+15335-        # AND the ACTIVE model would not take the trade (veto_would_fire) AND the
+15336-        # gate verdict is still actionable. It can ONLY demote to WAIT — never
+15337-        # promote. The neutral / disabled / market-closed stub sets
+15338-        # veto_would_fire=False so it can NEVER demote. Mirrors the analyst veto.
+15339-        _pr      = result.get("pro_review") or {}
+15340-        _pr_act  = _pr.get("active") or {}
+15341-        if (_pro_review_gate_enabled() and _pr_act.get("veto_would_fire")
+15342-                and is_actionable(result["verdict"])):
+15343-            _pr_reason = ("Pro Review veto: "
+15344-                          + (_pr_act.get("why_not_trade")
+15345-                             or "professional review does not support the trade."))
+15346-            result["verdict"]       = "WAIT"
+15347-            result["strict_label"]  = "WAIT"
+15348-            result["strict_reason"] = _pr_reason
+15349-            result["trade_plan"]    = {
+15350-                "trade_plan": False, "reason": _pr_reason,
+15351-                "entry_zone": None, "stop_loss": None,
+15352-                "target1":    None, "target2":   None,
+15353-                "rr":         None, "direction": result.get("strict_direction"),
+15354-                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+15355-            }
+15356-            for _vd in ("Long", "Short"):
+15357-                _vblk = (result.get("directions") or {}).get(_vd)
+15358-                if _vblk:
+15359-                    _vblk.update(ready=False, label="WAIT")
+15360-            _ad = result.get("alert_diagnostics") or {}
+15361-            _ad["ready_reason"]     = ""
+15362-            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Pro Review veto"]
+15363-            result["alert_diagnostics"] = _ad
+15364-            # Decision-support was computed earlier from the pre-veto plan — recompute
+15365-            # it so every display surface agrees with the demoted WAIT verdict.
+15366-            result["decision_support"] = _decision_support(result)
+15367-        # ── Trade Debate Engine (Bull vs Bear vs Decision Judge). DISPLAY-ONLY
+15368-        #    here; the flag-gated veto is wired in just below, mirroring the pro
+15369-        #    review / analyst layers. Computed from the FINAL assembled result so it
+15370-        #    reflects every override above (Analyst -> Pro Review -> Debate). ──────
+15371-        if _trade_debate_engine_enabled():
+15372-            try:
+15373-                result["trade_debate"] = compute_trade_debate(result, strict)
+15374-            except Exception as exc:   # FAIL-OPEN — a broken debate must never crash analysis.
+15375-                result["trade_debate"] = _trade_debate_neutral_block(
+15376-                    "Trade debate unavailable (%s)." % exc)
+15377-        else:
+15378-            result["trade_debate"] = _trade_debate_neutral_block("Trade debate disabled.")
+15379-        # Fail-CLOSED veto (flag-gated, default OFF): only when explicitly enabled
+15380-        # AND the Judge would not decisively + alignedly support the trade
+15381-        # (veto_would_fire) AND the gate verdict is still actionable. It can ONLY
+15382-        # demote to WAIT — never promote. The neutral / disabled / market-closed stub
+15383-        # sets veto_would_fire=False so it can NEVER demote. Mirrors the pro-review veto.
+15384-        _td = result.get("trade_debate") or {}
+15385-        if (_trade_debate_gate_enabled() and _td.get("veto_would_fire")
+15386-                and is_actionable(result["verdict"])):
+15387-            _td_reason = ("Trade Debate veto: "
+15388-                          + (_td.get("summary")
+15389-                             or "the market is too balanced to trade."))
+15390-            result["verdict"]       = "WAIT"
+15391-            result["strict_label"]  = "WAIT"
+15392-            result["strict_reason"] = _td_reason
+15393-            result["trade_plan"]    = {
+15394-                "trade_plan": False, "reason": _td_reason,
+15395-                "entry_zone": None, "stop_loss": None,
+15396-                "target1":    None, "target2":   None,
+15397-                "rr":         None, "direction": result.get("strict_direction"),
+15398-                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+15399-            }
+15400-            for _vd in ("Long", "Short"):
+15401-                _vblk = (result.get("directions") or {}).get(_vd)
+15402-                if _vblk:
+15403-                    _vblk.update(ready=False, label="WAIT")
+15404-            _ad = result.get("alert_diagnostics") or {}
+15405-            _ad["ready_reason"]     = ""
+15406-            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Trade Debate veto"]
+15407-            result["alert_diagnostics"] = _ad
+15408-            # Decision-support was computed earlier from the pre-veto plan — recompute
+15409-            # it so every display surface agrees with the demoted WAIT verdict.
+15410-            result["decision_support"] = _decision_support(result)
+15411-            result["trade_debate"]["judge"]["final_verdict"] = "WAIT"
+15412-        # ── Entry Quality Engine (LOCATION-aware): scores WHETHER this is a good
+15413-        #    PLACE to enter (distance to S/R, impulse % completed, ATR extension,
+15414-        #    pullback, momentum, sweep, chasing, swing-high/low). DISPLAY-ONLY here;
+15415-        #    computed on the FINAL assembled result so it reflects every override
+15416-        #    above. Mirrors the analyst / pro-review / debate layers. ──────────────
+15417-        if _entry_quality_engine_enabled():
+15418-            try:
+15419-                result["entry_quality"] = compute_entry_quality(result, strict, swing_ctx)
+15420-            except Exception as exc:   # FAIL-OPEN — a broken engine must never crash analysis.
+15421-                result["entry_quality"] = _entry_quality_neutral_block(
+15422-                    "Entry Quality unavailable (%s)." % exc)
+15423-        else:
+15424-            result["entry_quality"] = _entry_quality_neutral_block("Entry Quality engine disabled.")
+15425-        # Fail-CLOSED veto (flag-gated, default OFF): only when explicitly armed AND
+15426-        # the entry LOCATION is poor (veto_would_fire = score < threshold and NOT an
+15427-        # extremely-high-confidence override) AND the gate verdict is still
+15428-        # actionable. It can ONLY demote to WAIT — never promote. The neutral /
+15429-        # disabled / market-closed stub sets veto_would_fire=False so it can NEVER
+15430-        # demote. Mirrors the pro-review / trade-debate vetoes.
+15431-        _eq = result.get("entry_quality") or {}
+15432-        if (_entry_quality_gate_enabled() and _eq.get("veto_would_fire")
+15433-                and is_actionable(result["verdict"])):
+15434-            _eq_reason = ("Entry Quality veto: "
+15435-                          + (_eq.get("why_not_trade")
+15436-                             or ("entry location is poor (%s/100)." % _eq.get("score"))))
+15437-            result["verdict"]       = "WAIT"
+15438-            result["strict_label"]  = "WAIT"
+15439-            result["strict_reason"] = _eq_reason
+15440-            result["trade_plan"]    = {
+15441-                "trade_plan": False, "reason": _eq_reason,
+15442-                "entry_zone": None, "stop_loss": None,
+15443-                "target1":    None, "target2":   None,
+15444-                "rr":         None, "direction": result.get("strict_direction"),
+15445-                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+15446-            }
+15447-            for _vd in ("Long", "Short"):
+15448-                _vblk = (result.get("directions") or {}).get(_vd)
+15449-                if _vblk:
+15450-                    _vblk.update(ready=False, label="WAIT")
+15451-            _ad = result.get("alert_diagnostics") or {}
+15452-            _ad["ready_reason"]     = ""
+15453-            _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Entry Quality veto"]
+15454-            result["alert_diagnostics"] = _ad
+15455-            # Decision-support was computed earlier from the pre-veto plan — recompute
+15456-            # it so every display surface agrees with the demoted WAIT verdict.
+15457-            result["decision_support"] = _decision_support(result)
+15458-            result["entry_quality"]["final_verdict"] = "WAIT"
+15459-
+15460-    # ── Learning Engine v2 (display-only): Confidence Governor + Trade Memory.
+15461-    # Computed on the ASSEMBLED result AFTER pro_review/trade_debate so grade /
+15462-    # entry-efficiency / strategy_engine are populated. Strictly FAIL-OPEN (neutral
+15463-    # block on any error) and mutate NOTHING — the flag-gated demotion is T004.
+15464-    # SHARED Trade Memory — computed ONCE here (after pro_review / trade_debate so the
+15465-    # grade is available) and fed to BOTH the governor and the memory panel AND the
+15466-    # analyst, so all three read IDENTICAL historical data (single source of truth).
+15467-    try:
+15468-        _memory_ctx = find_similar_trades(result, active_ticker)
+15469-    except Exception:
+15470-        _memory_ctx = _similar_neutral_block()
+15471-    result["trade_memory_context"] = _memory_ctx
+15472-    try:
+15473-        result["confidence_governor"] = compute_confidence_governor(
+15474-            result, active_ticker, memory_ctx=_memory_ctx)
+15475-    except Exception:
+15476-        result["confidence_governor"] = _governor_neutral_block(result)
+15477-    try:
+15478-        result["trade_memory"] = compute_trade_memory(
+15479-            result, active_ticker, memory_ctx=_memory_ctx)
+15480-    except Exception:
+15481-        result["trade_memory"] = _memory_neutral_block()
+15482-    # Analyst (AI Reasoning) consumes the SAME shared memory to answer the trader's
+15483-    # six historical questions. DISPLAY-ONLY — never touches the analyst veto above.
+15484-    try:
+15485-        if isinstance(result.get("analyst"), dict):
+15486-            result["analyst"]["memory_review"] = build_analyst_memory_review(_memory_ctx)
+15487-    except Exception:
+15488-        pass
+15489-    # Entry Probability is a FORWARD projection over the Entry Quality block, which is
+15490-    # computed AFTER the analyst (ordering), so it is attached post-hoc here — exactly
+15491-    # like the shared memory review above. DISPLAY-ONLY + fail-open; the guard means the
+15492-    # market-closed / no-analyst branches keep the neutral placeholder.
+15493-    try:
+15494-        if isinstance(result.get("analyst"), dict):
+15495-            result["analyst"]["entry_probability"] = _analyst_entry_probability(
+15496-                result.get("entry_quality"), result["analyst"], result, TRADING_MODE)
+15497-    except Exception:
+15498-        pass
+15499-
+15500-    # ── Learning Engine demotion (flag-gated, default OFF — mirrors the analyst /
+15501-    #    pro-review / trade-debate vetoes). When ARMED, a Confidence-Governor final
+15502-    #    score below the READY threshold DEMOTES an actionable gate verdict to WAIT
+15503-    #    (it can NEVER promote / force a trade / change geometry). The neutral /
+15504-    #    fail-open / market-closed governor block sets veto_would_fire=False so it can
+15505-    #    NEVER demote when there is no history or the market is closed. Guarded by
+15506-    #    market["open"] so it never touches the closed-override verdict below. ──────
+15507-    _cg = result.get("confidence_governor") or {}
+15508-    if (market["open"] and _learning_gate_enabled() and _cg.get("veto_would_fire")
+15509-            and is_actionable(result["verdict"])):
+15510-        _lr_reason = ("Learning veto: final confidence %d below the %d READY "
+15511-                      "threshold (historical edge for this setup is weak)." % (
+15512-                          int(_cg.get("final_confidence_score") or 0),
+15513-                          int(_cg.get("threshold") or 0)))
+15514-        result["verdict"]       = "WAIT"
+15515-        result["strict_label"]  = "WAIT"
+15516-        result["strict_reason"] = _lr_reason
+15517-        result["trade_plan"]    = {
+15518-            "trade_plan": False, "reason": _lr_reason,
+15519-            "entry_zone": None, "stop_loss": None,
+15520-            "target1":    None, "target2":   None,
+15521-            "rr":         None, "direction": result.get("strict_direction"),
+15522-            "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+15523-        }
+15524-        for _vd in ("Long", "Short"):
+15525-            _vblk = (result.get("directions") or {}).get(_vd)
+15526-            if _vblk:
+15527-                _vblk.update(ready=False, label="WAIT")
+15528-        _ad = result.get("alert_diagnostics") or {}
+15529-        _ad["ready_reason"]     = ""
+15530-        _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["Learning veto"]
+15531-        result["alert_diagnostics"] = _ad
+15532-        # Decision-support was computed earlier from the pre-veto plan — recompute
+15533-        # it so every display surface agrees with the demoted WAIT verdict.
+15534-        result["decision_support"] = _decision_support(result)
+15535-        result["confidence_governor"]["demotion_reason"] = _lr_reason
+15536-        logger.info("LEARNING VETO fired for %s: final=%s thr=%s — verdict -> WAIT",
+15537-                    active_ticker, _cg.get("final_confidence_score"), _cg.get("threshold"))
+15538-
+15539-    if not market["open"]:
+15540-        result["verdict"]         = "MARKET CLOSED"
+15541-        # strict_label is the JOURNALING label and must stay in
+15542-        # {Strong Trade, Possible Trade, WAIT}; the closed state is surfaced via
+15543-        # verdict + market_status + strict_reason instead (the dashboard badge reads
+15544-        # those, not strict_label), so closed evals never journal as a tradeable setup.
+15545-        result["strict_label"]    = "WAIT"
+15546-        result["strict_reason"]   = (
+15547-            "Market closed — live alerts paused"
+15548-            + (f". Next open: {market['next_open_et']}." if market["next_open_et"] else ".")
+15549-        )
+15550-        result["alert_level"]     = None
+15551-        result["conviction_tier"] = None
+15552-        result["edge_score"]      = 0
+15553-        result["edge_grade"]      = None
+15554-        # Neutralise the live diagnostics too — there is no live tape when closed,
+15555-        # so stale per-direction scores must not read as a tradeable signal.
+15556-        result["long_score"]         = None
+15557-        result["short_score"]        = None
+15558-        result["conflict_gap"]       = None
+15559-        result["dominant_direction"] = None
+15560-        result["ready_reason"]       = result["strict_reason"]
+15561-        result["rejected_reasons"]   = ["market_closed"]
+15562-        # Task #18 — neutralise the learning-score summary while the market is closed
+15563-        # (the gate is PAUSED, not deleted): keep the flag/cap visible but null out the
+15564-        # per-direction numbers so a stale closed-tape delta can't read as a live nudge.
+15565-        _ls_closed = result.get("learning_score_influence") or {}

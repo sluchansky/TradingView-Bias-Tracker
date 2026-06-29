@@ -7,6 +7,7 @@ import logging
 import threading
 import queue
 import contextlib
+import copy
 import json
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
@@ -23061,6 +23062,16 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     except Exception as exc:
         logger.error("Setup-state update failed: %s", exc)
 
+    # ── LIVE strategy simulation observer (PAPER, RESEARCH/DISPLAY-ONLY) ─────────
+    # Default OFF (SCALP_LIVE_SIM_ENABLED). Runs AFTER the verdict + dispatch +
+    # setup-state, on the webhook path ONLY. Opens paper trades for testable
+    # research strategies into a SEPARATE table; never reads back into the gate and
+    # never touches the verdict / trade_plan / edge_score / money path. Fail-open.
+    try:
+        _maybe_observe_scalp_live_sim(a, source="webhook")
+    except Exception as exc:
+        logger.error("Scalp live-sim observe failed: %s", exc)
+
 
 # ── Asynchronous webhook processing ──────────────────────────────────────────
 # TradingView aborts a webhook if the server does not respond quickly ("request
@@ -24079,12 +24090,19 @@ def scalp_research_get():
     with SCALP_RESEARCH_CACHE_LOCK:
         view = SCALP_RESEARCH_CACHE
     if view is None:
-        return jsonify({"ok": True, "ready": False,
-                        "library": _scalp_research_library_only(),
-                        "safety_note": "Research/simulation only. New strategies never "
-                                       "auto-trade live; promotion is a manual human decision.",
-                        "hint": "No research run yet — use Run research to compute stats."})
-    return jsonify({"ok": True, **view})
+        payload = {"ok": True, "ready": False,
+                   "library": _scalp_research_library_only(),
+                   "safety_note": "Research/simulation only. New strategies never "
+                                  "auto-trade live; promotion is a manual human decision.",
+                   "hint": "No research run yet — use Run research to compute stats."}
+        return jsonify(_augment_scalp_view_live(payload))
+    # Deep-copy the collections the live-sim augmenter mutates so the cached research
+    # view is never altered in place (the overlay is display-only and per-request).
+    payload = {"ok": True, **view}
+    for _coll in ("tested", "library", "best", "worst", "promotions"):
+        if _coll in payload:
+            payload[_coll] = copy.deepcopy(payload[_coll])
+    return jsonify(_augment_scalp_view_live(payload))
 
 
 @app.route("/scalp-research", methods=["POST"])
@@ -24103,6 +24121,470 @@ def scalp_research_post():
     return jsonify({"ok": True, "started": True,
                     "note": "Research recompute started in the background. "
                             "Poll GET /scalp-research for the result."})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LIVE STRATEGY SIMULATION (PAPER) — RESEARCH / DISPLAY-ONLY, default-OFF
+# ────────────────────────────────────────────────────────────────────────────
+# Watches the LIVE webhook analysis stream for the TESTABLE research-library scalp
+# strategies (scalp_live_sim.py), opens PAPER trades into a SEPARATE table
+# (scalp_strategy_sim_trades), and a parallel paper watcher resolves each one
+# stop-first / target (±R) to accumulate live win% / avgR per strategy. The point
+# of OPTION 3: prove a strategy on the live tape BEFORE any human promotes it.
+#
+# FULLY walled off from the money path. This layer NEVER:
+#   • writes strategy_trades / calls _record_strategy_trade / _close_managed_trade
+#   • touches MANAGED_TRADES / ACTIVE_TRADE(S) / the learning engine
+#   • registers a strategy into STRATEGY_SCORERS / priority / control
+#   • sends an order to /traderspost / auto-trade, or touches the gate / verdict /
+#     trade_plan / edge_score.
+# Gated behind SCALP_LIVE_SIM_ENABLED (default 0) → flag OFF == byte-identical to
+# today. App-side INSERT/SELECT ONLY — the table is created out-of-band (database
+# tool in dev, Publish schema-diff in prod), matching the research / learning
+# convention. Everything here is FAIL-OPEN.
+# ════════════════════════════════════════════════════════════════════════════
+SCALP_LIVE_SIM_ENABLED = os.environ.get("SCALP_LIVE_SIM_ENABLED", "0").strip().lower() \
+    in ("1", "true", "yes", "on")
+SCALP_SIM_DB_READY        = False
+SCALP_SIM_WATCH_LOCK      = threading.Lock()   # single-flight: one watcher cycle at a time
+SCALP_SIM_WATCH_INTERVAL  = max(10, int(os.environ.get("SCALP_SIM_WATCH_INTERVAL", 15)))
+SCALP_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("SCALP_SIM_COOLDOWN_SECS", 300)))
+SCALP_SIM_MAX_HOLD_HOURS  = max(1, int(os.environ.get("SCALP_SIM_MAX_HOLD_HOURS", 8)))
+SCALP_SIM_MIN_LIVE_PROMO  = max(1, int(os.environ.get("SCALP_SIM_MIN_LIVE_PROMO", 30)))
+_SCALP_SIM_COOLDOWN       = {}                  # (strategy_key,inst,direction) -> monotonic ts
+_SCALP_SIM_COOLDOWN_LOCK  = threading.Lock()
+
+
+def _check_scalp_sim_db_ready():
+    """Probe scalp_strategy_sim_trades (no DDL) and set SCALP_SIM_DB_READY. FAIL-
+    OPEN: a missing table / unavailable DB disables the live-sim layer and never
+    touches the rest of the bot."""
+    global SCALP_SIM_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM scalp_strategy_sim_trades LIMIT 1")
+            cur.fetchone()
+        SCALP_SIM_DB_READY = True
+        logger.info("scalp live-sim table ready")
+    except Exception as exc:
+        logger.warning("scalp live-sim table unavailable (live sim disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _scalp_sim_live_ctx(result):
+    """Normalize a full_analysis `result` (+ the same live helpers the gate uses)
+    into the flat live-context dict the PURE scalp_live_sim detectors consume.
+    Read-only; FAIL-OPEN (returns None if the essentials are missing). Never
+    mutates `result`."""
+    try:
+        inst = instrument_of(result.get("active_ticker") or "")
+        if not inst:
+            return None
+        price = result.get("current_price")
+        ctx = build_strategy_context(inst, price, result.get("vwap_value"),
+                                     result.get("vwap_status"),
+                                     result.get("volatility") or {})
+        if not isinstance(ctx, dict):
+            return None
+        try:
+            regime = (detect_market_regime(ctx) or {}).get("regime")
+        except Exception:
+            regime = None
+        l = dict(ctx)
+        l["atr"]             = ctx.get("atr_pts")
+        l["rvol"]            = ctx.get("rvol_value")
+        l["regime"]          = regime
+        l["price"]           = price if price is not None else ctx.get("price")
+        l["nearest_demand"]  = result.get("nearest_demand")
+        l["nearest_supply"]  = result.get("nearest_supply")
+        l["inst"]            = inst
+        l["session"]         = result.get("session")
+        l["edge_score"]      = result.get("edge_score")
+        return l
+    except Exception:
+        return None
+
+
+def _scalp_sim_open_insert(sim_key, setup_anchor, strategy_key, inst, direction,
+                           cand, session, regime, edge):
+    """Idempotent INSERT of an OPEN paper trade. Skips if (a) an identical sim_key
+    already exists (duplicate webhook), or (b) a paper trade for this strategy /
+    instrument / direction is already open/resolving (one paper position at a
+    time). FAIL-OPEN (returns False on any error). INSERT/SELECT ONLY — no DDL, no
+    money path."""
+    if not SCALP_SIM_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        ctx_json = psycopg2.extras.Json({
+            "entry_reason": cand.get("entry_reason"), "risk": cand.get("risk"),
+            "fidelity": cand.get("fidelity"), "session": session,
+            "market_regime": regime, "edge_score": edge})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM scalp_strategy_sim_trades "
+                "WHERE strategy_key=%s AND symbol=%s AND direction=%s "
+                "AND status IN ('open','resolving') LIMIT 1",
+                (strategy_key, inst, direction))
+            if cur.fetchone():
+                return False
+            cur.execute(
+                "INSERT INTO scalp_strategy_sim_trades "
+                "(sim_key, strategy_key, symbol, direction, status, entry, stop, target, rr, "
+                " session, market_regime, edge_score, fidelity, setup_anchor, opened_at, "
+                " entry_epoch, context) "
+                "VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), %s, %s) "
+                "ON CONFLICT (sim_key) DO NOTHING",
+                (sim_key, strategy_key, inst, direction, cand["entry"], cand["stop"],
+                 cand["target"], cand["rr"], session, regime, edge, cand["fidelity"],
+                 setup_anchor, now_utc().timestamp(), ctx_json))
+            inserted = (cur.rowcount == 1)
+        conn.commit()
+        return inserted
+    except Exception as exc:
+        logger.warning("scalp live-sim open insert failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _maybe_observe_scalp_live_sim(result, source="webhook"):
+    """DISPLAY / RESEARCH-ONLY paper-trade observer. Default OFF. Runs ONLY from
+    the webhook analysis path (never the read-only /status or dashboard polls).
+    Detects testable research-library scalp setups in the LIVE context and
+    idempotently INSERTs an OPEN paper trade. FAIL-OPEN and side-effect-isolated:
+    never mutates `result`, never touches the gate / verdict / trade_plan /
+    edge_score / money path. Returns the number of paper trades opened (for tests)."""
+    if not SCALP_LIVE_SIM_ENABLED or source != "webhook" or not SCALP_SIM_DB_READY:
+        return 0
+    # Never open paper trades while the futures session is closed.
+    try:
+        if not market_session_status().get("open", True):
+            return 0
+    except Exception:
+        pass
+    try:
+        import scalp_live_sim as sls
+    except Exception:
+        return 0
+    l = _scalp_sim_live_ctx(result)
+    if not l or not l.get("inst"):
+        return 0
+    try:
+        candidates = sls.build_candidates(l)
+    except Exception:
+        return 0
+    if not candidates:
+        return 0
+    inst    = l["inst"]
+    atr     = l.get("atr") or 0.0
+    session = l.get("session")
+    regime  = l.get("regime")
+    edge    = result.get("edge_score")
+    now_mono = time.monotonic()
+    et_day   = now_utc().astimezone(ET_TZ).strftime("%Y%m%d")
+    bucket   = int(now_utc().timestamp() // 300)   # 5-min idempotency bucket
+    opened = 0
+    for cand in candidates:
+        key = cand["strategy_key"]
+        direction = cand["direction"]
+        ckey = (key, inst, direction)
+        # in-memory cooldown (soft anti-spam; the DB guards are authoritative)
+        with _SCALP_SIM_COOLDOWN_LOCK:
+            last = _SCALP_SIM_COOLDOWN.get(ckey)
+            if last is not None and (now_mono - last) < SCALP_SIM_OPEN_COOLDOWN_SECS:
+                continue
+        price_bucket = (int(round(cand["entry"] / (0.5 * atr))) if atr
+                        else int(round(cand["entry"])))
+        setup_anchor = "%s:%d:%d" % (et_day, bucket, price_bucket)
+        sim_key = "%s|%s|%s|%s" % (key, inst, direction, setup_anchor)
+        if _scalp_sim_open_insert(sim_key, setup_anchor, key, inst, direction,
+                                  cand, session, regime, edge):
+            opened += 1
+            with _SCALP_SIM_COOLDOWN_LOCK:
+                _SCALP_SIM_COOLDOWN[ckey] = now_mono
+    if opened:
+        logger.info("scalp live-sim: opened %d paper trade(s) on %s", opened, inst)
+    return opened
+
+
+def _scalp_sim_outcome(row, bar):
+    """Pure stop-first / then target resolver for ONE open paper trade against the
+    latest bar. Returns (result_label, exit_price, r_multiple) or None (no level
+    hit). Stop is checked before target (worst-case fill), exactly like the live
+    managed watcher's idempotent level checks."""
+    high, low = bar.get("high"), bar.get("low")
+    entry, stop, target = row.get("entry"), row.get("stop"), row.get("target")
+    if None in (high, low, entry, stop, target):
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    if row.get("direction") == "Long":
+        if low <= stop:
+            return ("loss", stop, round((stop - entry) / risk, 4))
+        if high >= target:
+            return ("win", target, round((target - entry) / risk, 4))
+    else:
+        # SHORT: stop is ABOVE entry (loss) and target BELOW entry (win), so R is
+        # measured as (entry - exit)/risk to keep losses negative and wins positive.
+        if high >= stop:
+            return ("loss", stop, round((entry - stop) / risk, 4))
+        if low <= target:
+            return ("win", target, round((entry - target) / risk, 4))
+    return None
+
+
+def _scalp_sim_close(row_id, result_label, exit_price, r_multiple):
+    """Atomically resolve one open paper trade. The conditional `WHERE status IN
+    ('open','resolving')` IS the cross-instance status claim — only the first
+    writer (dev OR prod) closes it; a concurrent watcher's UPDATE matches 0 rows
+    and no-ops. Writes ONLY to scalp_strategy_sim_trades. FAIL-OPEN."""
+    if not SCALP_SIM_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE scalp_strategy_sim_trades "
+                "SET status='closed', result=%s, exit_price=%s, r_multiple=%s, closed_at=now() "
+                "WHERE id=%s AND status IN ('open','resolving')",
+                (result_label, exit_price, r_multiple, row_id))
+            claimed = (cur.rowcount == 1)
+        conn.commit()
+        return claimed
+    except Exception as exc:
+        logger.warning("scalp live-sim close failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _watch_scalp_sim_trades():
+    """Resolve OPEN paper trades against the latest 1-minute bar (one fetch per
+    instrument per cycle) — stop-first then target, ±R only, with the SAME-BAR
+    guard (skip a bar that opened at/before entry so a fresh trade can't "instantly
+    fill" off its own bar). A stranded trade past SCALP_SIM_MAX_HOLD_HOURS is
+    resolved at the latest close as 'expired'. Writes ONLY to
+    scalp_strategy_sim_trades — never MANAGED_TRADES, strategy_trades,
+    _record_strategy_trade, or the money path. FAIL-OPEN."""
+    if not SCALP_SIM_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    open_rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, symbol, direction, entry, stop, target, rr, entry_epoch, opened_at "
+                "FROM scalp_strategy_sim_trades WHERE status IN ('open','resolving') "
+                "ORDER BY id ASC LIMIT 500")
+            for r in cur.fetchall():
+                open_rows.append({
+                    "id": r[0], "symbol": r[1], "direction": r[2],
+                    "entry": float(r[3]) if r[3] is not None else None,
+                    "stop": float(r[4]) if r[4] is not None else None,
+                    "target": float(r[5]) if r[5] is not None else None,
+                    "rr": float(r[6]) if r[6] is not None else 1.0,
+                    "entry_epoch": float(r[7]) if r[7] is not None else None,
+                    "opened_at": r[8]})
+    except Exception as exc:
+        logger.warning("scalp live-sim watcher read failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not open_rows:
+        return
+    bars = {}
+    for inst in {r["symbol"] for r in open_rows}:
+        try:
+            bars[inst] = _fetch_latest_bar(inst)
+        except Exception:
+            bars[inst] = None
+    for row in open_rows:
+        bar = bars.get(row["symbol"])
+        if not bar:
+            continue
+        bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
+        if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
+            continue                       # same-bar guard (no look-ahead self-fill)
+        outcome = _scalp_sim_outcome(row, bar)
+        if outcome is None:
+            # max-hold expiry — resolve a stranded paper trade at the latest close.
+            opened_at, cl = row.get("opened_at"), bar.get("close")
+            if opened_at is not None and cl is not None and row.get("stop") is not None:
+                try:
+                    oa = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
+                    aged = (now_utc() - oa).total_seconds() > SCALP_SIM_MAX_HOLD_HOURS * 3600
+                except Exception:
+                    aged = False
+                risk = abs(row["entry"] - row["stop"])
+                if aged and risk > 0:
+                    r = ((cl - row["entry"]) / risk if row["direction"] == "Long"
+                         else (row["entry"] - cl) / risk)
+                    outcome = ("expired", round(cl, 4), round(r, 4))
+        if outcome is None:
+            continue
+        _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2])
+
+
+def _scalp_sim_watch_loop():
+    """Parallel PAPER watcher on its own timer. Gated to the LIVE instance
+    (DISCORD_LIVE_ENABLED) + flag ON + DB ready, single-flight via
+    SCALP_SIM_WATCH_LOCK. FAIL-OPEN — any error just skips this cycle. Never
+    touches the money path."""
+    try:
+        if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
+            if SCALP_SIM_WATCH_LOCK.acquire(blocking=False):
+                try:
+                    _watch_scalp_sim_trades()
+                finally:
+                    SCALP_SIM_WATCH_LOCK.release()
+    except Exception as exc:
+        logger.warning("scalp live-sim watch loop error: %s", exc)
+    finally:
+        threading.Timer(SCALP_SIM_WATCH_INTERVAL, _scalp_sim_watch_loop).start()
+
+
+def _scalp_sim_stats():
+    """Per-strategy LIVE paper-sim stats from scalp_strategy_sim_trades. DISPLAY-
+    ONLY, FAIL-OPEN (returns {} on any error). Win-rate / avgR are over CLOSED
+    win|loss trades; an 'expired' (max-hold) trade counts toward net_r but not the
+    win-rate denominator. Max-DD is the worst running trough across closed R."""
+    out = {}
+    if not SCALP_SIM_DB_READY:
+        _check_scalp_sim_db_ready()
+    if not SCALP_SIM_DB_READY:
+        return out
+    conn = _learning_conn()
+    if conn is None:
+        return out
+    rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT strategy_key, status, result, r_multiple, fidelity, closed_at "
+                "FROM scalp_strategy_sim_trades "
+                "ORDER BY closed_at ASC NULLS LAST, id ASC")
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning("scalp live-sim stats read failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    agg = {}
+    for strategy_key, status, result_label, r_mult, fidelity, closed_at in rows:
+        a = agg.setdefault(strategy_key, {"open": 0, "closed": 0, "wins": 0,
+                                          "losses": 0, "r_list": [], "fidelity": None,
+                                          "last_at": None})
+        if fidelity and not a["fidelity"]:
+            a["fidelity"] = fidelity
+        if status in ("open", "resolving"):
+            a["open"] += 1
+            continue
+        a["closed"] += 1
+        if r_mult is not None:
+            a["r_list"].append(float(r_mult))
+        if result_label == "win":
+            a["wins"] += 1
+        elif result_label == "loss":
+            a["losses"] += 1
+        if closed_at is not None:
+            iso = closed_at.isoformat() if hasattr(closed_at, "isoformat") else str(closed_at)
+            if a["last_at"] is None or iso > a["last_at"]:
+                a["last_at"] = iso
+    for key, a in agg.items():
+        decided = a["wins"] + a["losses"]
+        win_rate = round(100.0 * a["wins"] / decided, 1) if decided else None
+        avg_r = round(sum(a["r_list"]) / len(a["r_list"]), 3) if a["r_list"] else None
+        net_r = round(sum(a["r_list"]), 2) if a["r_list"] else (0.0 if a["closed"] else None)
+        dd = None
+        if a["r_list"]:
+            cum = peak = 0.0
+            mdd = 0.0
+            for r in a["r_list"]:
+                cum += r
+                peak = max(peak, cum)
+                mdd = min(mdd, cum - peak)
+            dd = round(mdd, 2)
+        out[key] = {"live_trades": a["closed"], "live_open": a["open"],
+                    "live_win_rate": win_rate, "live_avg_r": avg_r,
+                    "live_net_r": net_r, "live_max_dd_r": dd,
+                    "live_last_at": a["last_at"], "live_fidelity": a["fidelity"]}
+    return out
+
+
+def _augment_scalp_view_live(payload):
+    """Fold LIVE paper-sim stats into the /scalp-research response (DISPLAY-ONLY).
+    Adds a per-strategy `live_sim` block to tested / library / best / worst entries
+    and gates the promotion recommendation on LIVE PROOF (>= SCALP_SIM_MIN_LIVE_PROMO
+    closed live trades with positive expectancy). FAIL-OPEN: any error leaves the
+    payload untouched. Mutates only the deep-copied collections in `payload`, never
+    the cached research view."""
+    try:
+        payload["live_sim_enabled"]      = bool(SCALP_LIVE_SIM_ENABLED)
+        payload["live_sim_min_promote"]  = SCALP_SIM_MIN_LIVE_PROMO
+        stats = _scalp_sim_stats()
+        payload["live_sim_ready"] = bool(stats)
+        if not stats:
+            return payload
+        for coll in ("tested", "library", "best", "worst"):
+            for e in (payload.get(coll) or []):
+                k = e.get("strategy_key")
+                if k and k in stats:
+                    e["live_sim"] = stats[k]
+        promos = payload.get("promotions")
+        if isinstance(promos, list):
+            for p in promos:
+                ls = stats.get(p.get("strategy_key")) or {}
+                lt   = ls.get("live_trades") or 0
+                lwin = ls.get("live_win_rate")
+                lavg = ls.get("live_avg_r")
+                proven = (lt >= SCALP_SIM_MIN_LIVE_PROMO
+                          and (lavg or 0) > 0 and (lwin or 0) >= 50)
+                p["live_sim"]     = ls
+                p["live_proven"]  = bool(proven)
+                if not proven:
+                    need = max(0, SCALP_SIM_MIN_LIVE_PROMO - lt)
+                    p["recommendation"] = "KEEP SIMULATING \u2014 needs live proof"
+                    p["reason"] = ("Research looks promising, but live paper proof is "
+                                   "required before a human promotes it (%d live trades, "
+                                   "need %d more)." % (lt, need))
+    except Exception as exc:
+        logger.warning("scalp live-sim view augment failed: %s", exc)
+    return payload
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -33946,29 +34428,32 @@ function srRender(j){
   if(!j.ready){
     srSet('sr-status', 'No research run yet.');
     srSet('sr-meta', j.hint || 'Click “Run research” to simulate the testable strategies on historical candles.');
-    srMount('sr-tested', srTable(['Strategy','Trades','Win%','Avg R','Net R','PF','Max DD (R)','Best session','Backtest'], []));
+    srMount('sr-tested', srTable(['Strategy','Trades','Win%','Avg R','Net R','PF','Max DD (R)','Best session','Backtest','Live Trades','Live Win%','Live Avg R','Fidelity'], []));
     srMount('sr-best', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], []));
     srMount('sr-worst', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], []));
-    srMount('sr-promo', srTable(['Strategy','Recommendation','Reason'], []));
+    srMount('sr-promo', srTable(['Strategy','Recommendation','Reason','Live Trades','Live Win%','Live Net R','Proven?'], []));
     return;
   }
   const cn=j.counts||{};
   srSet('sr-status', 'Updated '+(j.generated_at? new Date(j.generated_at).toLocaleString() : '—'));
   const ds=(j.datasets||[]).map(function(d){ return d.symbol+' '+(d.bars||d.row_count||'?')+' bars'; }).join(' · ');
-  srSet('sr-meta', (cn.total||0)+' total · '+(cn.testable||0)+' testable · '+(cn.in_simulation||0)+' in simulation · '+(cn.recommended||0)+' recommended · '+(cn.pending||0)+' pending'+(ds? ('   ['+ds+']') : ''));
+  var liveTag=(j.live_sim_enabled? 'live-sim ON' : 'live-sim OFF')+(j.live_sim_ready? '' : ' (no live trades yet)');
+  srSet('sr-meta', (cn.total||0)+' total · '+(cn.testable||0)+' testable · '+(cn.in_simulation||0)+' in simulation · '+(cn.recommended||0)+' recommended · '+(cn.pending||0)+' pending · '+liveTag+(ds? ('   ['+ds+']') : ''));
   const tested=j.tested||[];
   srSet('sr-tested-cap', tested.length+' with detectors');
-  srMount('sr-tested', srTable(['Strategy','Trades','Win%','Avg R','Net R','PF','Max DD (R)','Best session','Backtest'],
-    tested.map(function(t){ const c=srComb(t.combined);
-      return [t.strategy_name, c.total_trades, srPct(c.win_rate), srNum(c.avg_r,3), srNum(c.net_r,2), srNum(c.profit_factor,2), srNum(c.max_drawdown_r,2), c.best_session, t.backtest_status]; })));
+  srMount('sr-tested', srTable(['Strategy','Trades','Win%','Avg R','Net R','PF','Max DD (R)','Best session','Backtest','Live Trades','Live Win%','Live Avg R','Fidelity'],
+    tested.map(function(t){ const c=srComb(t.combined); const ls=t.live_sim||{};
+      return [t.strategy_name, c.total_trades, srPct(c.win_rate), srNum(c.avg_r,3), srNum(c.net_r,2), srNum(c.profit_factor,2), srNum(c.max_drawdown_r,2), c.best_session, t.backtest_status,
+              (ls.live_trades||0), srPct(ls.live_win_rate), srNum(ls.live_avg_r,3), ls.live_fidelity]; })));
   function rankRows(arr){ return (arr||[]).map(function(b){ const c=srComb(b.combined);
     return [b.strategy_name, (b.is_live?'LIVE':'research'), c.total_trades, srPct(c.win_rate), srNum(c.net_r,2), srNum(c.avg_r,3), srNum(c.profit_factor,2)]; }); }
   srMount('sr-best', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], rankRows(j.best)));
   srMount('sr-worst', srTable(['Strategy','Source','Trades','Win%','Net R','Avg R','PF'], rankRows(j.worst)));
   const promo=j.promotions||[];
   srSet('sr-promo-cap', promo.length? (promo.length+' candidate(s)') : 'none yet');
-  srMount('sr-promo', srTable(['Strategy','Recommendation','Reason'],
-    promo.map(function(p){ return [p.strategy_name, p.recommendation, p.reason]; })));
+  srMount('sr-promo', srTable(['Strategy','Recommendation','Reason','Live Trades','Live Win%','Live Net R','Proven?'],
+    promo.map(function(p){ var ls=p.live_sim||{};
+      return [p.strategy_name, p.recommendation, p.reason, (ls.live_trades||0), srPct(ls.live_win_rate), srNum(ls.live_net_r,2), (p.live_proven?'YES':'no')]; })));
 }
 function srLoad(){
   api('/scalp-research').then(srRender).catch(function(){ srSet('sr-status','Could not load research.'); });
@@ -36573,6 +37058,7 @@ if __name__ == "__main__":
         _check_session_quality_db_ready()          # probe session_quality_grades (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
         _check_scalp_research_db_ready()           # probe scalp_strategy_library/research (no DDL; created via DB tool/publish diff) — RESEARCH/DISPLAY-ONLY
         _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
+        _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
@@ -36589,6 +37075,8 @@ if __name__ == "__main__":
         threading.Thread(target=_main_brain_resolver_loop, name="main-brain-resolver", daemon=True).start()  # resolve pending WAIT hypotheses (display-only)
         if DISCORD_LIVE_ENABLED and SCALP_RESEARCH_DB_READY:
             threading.Thread(target=_recompute_scalp_research, name="scalp-research-warm", daemon=True).start()  # warm the research cache (LIVE instance only; single-flight, throttled, never in the gate path)
+        if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
+            threading.Timer(0, _scalp_sim_watch_loop).start()  # PAPER live-sim watcher (LIVE instance only; default-OFF flag; resolves paper trades into a SEPARATE table, never the money path)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:

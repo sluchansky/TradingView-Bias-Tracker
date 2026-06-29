@@ -1,0 +1,1000 @@
+16567-        return
+16568-    try:
+16569-        payload = {"embeds": [embed]}
+16570-        if ping and DISCORD_ALERT_MENTION:
+16571-            payload["content"] = DISCORD_ALERT_MENTION
+16572-            payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
+16573-        resp = requests.post(url, json=payload, timeout=10)
+16574-        if resp.status_code not in (200, 204):
+16575-            logger.warning("EARLY %s alert post failed (%s): %s %s",
+16576-                           direction, inst, resp.status_code, resp.text[:200])
+16577-    except Exception as exc:
+16578-        logger.error("EARLY %s alert post error (%s): %s", direction, inst, exc)
+16579-
+16580-
+16581-def _store_early_times(inst, direction, times):
+16582-    """Persist the latest EARLY event timestamps (ISO) per instrument for the
+16583-    Diagnostics page. Preserves earlyAlertTime (set only when EARLY actually fires)."""
+16584-    if not inst:
+16585-        return
+16586-    slot = EARLY_EVENT_TIMES.setdefault(inst, {})
+16587-    if direction is None:
+16588-        slot["direction"]        = None
+16589-        slot["eventStartTime"]   = None
+16590-        slot["sweepTime"]        = None
+16591-        slot["chochTime"]        = None
+16592-        slot["displacementTime"] = None
+16593-        return
+16594-    t = times[direction]
+16595-    def iso(x):
+16596-        return x.isoformat() if x else None
+16597-    slot["direction"]        = direction
+16598-    slot["eventStartTime"]   = iso(t.get("event_start"))
+16599-    slot["sweepTime"]        = iso(t.get("sweep"))
+16600-    slot["chochTime"]        = iso(t.get("choch"))
+16601-    slot["displacementTime"] = iso(t.get("displacement"))
+16602-
+16603-
+16604-def _maybe_dispatch_early_alert(a, record):
+16605-    """Fire an ⚡ EARLY LONG/SHORT the instant a sweep + structure shift appear
+16606-    together, BEFORE the strict candle-close confirmation. PURELY ADDITIVE and
+16607-    fail-open: never touches evaluate_strict_setup, the READY verdict/score, SWING
+16608-    parity, the journal, or managed trades. Fires ONCE per active setup (per-
+16609-    direction dedupe that resets when the setup goes inactive). Skipped when the
+16610-    verdict is already READY (the confirmed card owns it), the zone is broken, or a
+16611-    trade is active. Returns True iff an EARLY embed was enqueued. Refreshes
+16612-    EARLY_EVENT_TIMES (for the Diagnostics page) on every call."""
+16613-    if not EARLY_ALERTS_ENABLED:
+16614-        return False
+16615-    if (a or {}).get("market_open") is False:
+16616-        return False   # market closed — EARLY heads-up is paused with the gate
+16617-    inst = instrument_of(record.get("ticker") or record.get("instrument")
+16618-                         or a.get("active_ticker") or "")
+16619-    if not inst:
+16620-        return False
+16621-    times = _early_event_times(inst, ALERT_HISTORY)
+16622-    active = [d for d in ("Short", "Long")
+16623-              if times[d]["sweep"] and times[d]["structure"]]
+16624-    chosen = active[0] if len(active) == 1 else None  # ambiguous (both) → stand aside
+16625-    _store_early_times(inst, chosen, times)
+16626-    if not active:
+16627-        # Setup fully inactive → reset per-setup dedupe so the next clean setup
+16628-        # re-fires, and clear the stale early-alert stamp for the Diagnostics row.
+16629-        LAST_EARLY_ANCHOR.pop((inst, "Short"), None)
+16630-        LAST_EARLY_ANCHOR.pop((inst, "Long"), None)
+16631-        EARLY_EVENT_TIMES.get(inst, {}).pop("earlyAlertTime", None)
+16632-        return False
+16633-    if chosen is None:
+16634-        # Ambiguous (both sides active) → stand aside, but PRESERVE the dedupe
+16635-        # anchors: a side that already EARLY-fired must not be re-armed and re-fire
+16636-        # when the ambiguity later resolves back to that same side in-window.
+16637-        return False
+16638-    key = (inst, chosen)
+16639-    # An actionable verdict (full READY *or* EARLY READY) already owns the signal —
+16640-    # never post the intrabar ⚡EARLY teaser at/after it; mark dedupe so a late EARLY
+16641-    # can't fire after the verdict card for this setup.
+16642-    if is_actionable(a.get("verdict")):
+16643-        LAST_EARLY_ANCHOR[key] = "ready"
+16644-        return False
+16645-    # Honour the same hard invalidations the gate uses (display-side only). The
+16646-    # broken-zone skip is a ZONE HARD-GATE behaviour: it holds in SWING (cfg on) and
+16647-    # is bypassed in SCALP (zone demoted), so a broken zone no longer mutes the EARLY
+16648-    # teaser. An active trade still suppresses the teaser in EVERY mode.
+16649-    if (cfg("GATE_REQUIRE_ZONE") and a.get("zone_broken_active")) or active_trade_for(inst):
+16650-        return False
+16651-    if LAST_EARLY_ANCHOR.get(key):     # already EARLY-alerted this active setup
+16652-        return False
+16653-    now = datetime.now(timezone.utc)
+16654-    last_at = LAST_EARLY_AT.get(key)
+16655-    if last_at and (now - last_at).total_seconds() < EARLY_ALERT_COOLDOWN_SEC:
+16656-        return False
+16657-    url = _early_alert_url(inst)
+16658-    if not url:
+16659-        return False
+16660-    # Build the embed BEFORE committing any dedupe / diagnostics state, so a build
+16661-    # failure can't leave the setup stuck-deduped or falsely stamp earlyAlertTime.
+16662-    try:
+16663-        embed = _build_early_embed(a, inst, chosen, times[chosen])
+16664-    except Exception as exc:
+16665-        logger.error("EARLY alert build error (%s/%s): %s", inst, chosen, exc)
+16666-        return False
+16667-    anchor = times[chosen]["structure"]
+16668-    LAST_EARLY_ANCHOR[key] = anchor.isoformat() if anchor else now.isoformat()
+16669-    LAST_EARLY_AT[key]     = now
+16670-    EARLY_EVENT_TIMES.setdefault(inst, {})["earlyAlertTime"] = now.isoformat()
+16671-    _enqueue_slow(lambda u=url, e=embed, i=inst, d=chosen, p=EARLY_ALERT_PING:
+16672-                  _post_early_embed(u, e, i, d, p))
+16673-    logger.info("EARLY %s alert enqueued (%s) — sweep+structure before confirmation", chosen, inst)
+16674-    return True
+16675-
+16676-
+16677-def _trade_ready_loop():
+16678-    """Every TRADE_READY_INTERVAL seconds, re-evaluate each instrument and re-post
+16679-    the clean trade-card to the live alert channel while a setup stays READY.
+16680-
+16681-    This is the recurring "update every 5 min" companion to the instant alert
+16682-    fired from the webhook. It posts only on READY verdicts and stays silent
+16683-    while a trade is already active (lifecycle alerts cover that case).
+16684-    """
+16685-    try:
+16686-        now = datetime.now(timezone.utc)
+16687-        for inst in enabled_instruments():
+16688-            # Per-instrument isolation: an open position on ONE asset must not
+16689-            # silence READY reposts for the others (only this asset's own live
+16690-            # position suppresses its repost — lifecycle alerts cover that case).
+16691-            if active_trade_for(inst):
+16692-                continue
+16693-            # Throttle: skip if a card (instant or periodic) was sent for this
+16694-            # instrument within the last TRADE_READY_INTERVAL seconds.
+16695-            last = LAST_LIVE_CARD_AT.get(inst)
+16696-            if last and (now - last).total_seconds() < trade_ready_interval():
+16697-                continue
+16698-            try:
+16699-                a = full_analysis(ticker_override=inst)
+16700-            except Exception as exc:
+16701-                logger.error("trade-ready loop analysis error (%s): %s", inst, exc)
+16702-                continue
+16703-            # Re-check this instrument's slot just before sending (it may have
+16704-            # changed while full_analysis ran).
+16705-            if not active_trade_for(inst) and is_actionable(a.get("verdict")):
+16706-                entry = _build_card_entry(a, ticker=f"{inst}1!")
+16707-                send_live_ready_card(entry, inst)
+16708-    except Exception as exc:  # never let the loop die
+16709-        logger.warning("trade-ready loop error: %s", exc)
+16710-    finally:
+16711-        threading.Timer(trade_ready_interval(), _trade_ready_loop).start()
+16712-
+16713-
+16714-# ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
+16715-# Reads each enabled equity-index micro's AUTHORITATIVE per-tab bias (the same
+16716-# calculate_bias() value the dashboard shows when you switch tabs) and reports
+16717-# whether Nasdaq/S&P/Dow agree on direction. This is a pure read layered on top of
+16718-# full_analysis — it NEVER feeds the gate / scoring / sizing / dedupe / broker path.
+16719-_INDEX_DISPLAY_NAMES = {"MNQ": "Nasdaq", "MES": "S&P 500", "MYM": "Dow"}
+16720-
+16721-
+16722-def compute_index_alignment():
+16723-    """Cross-market directional agreement across the enabled equity-index micros
+16724-    (MNQ/MES/MYM). Built from each instrument's authoritative bias
+16725-    (calculate_bias → "Bullish"/"Bearish"/"Choppy" via full_analysis). Returns a
+16726-    snapshot dict; DISPLAY + NOTIFY only — never read by any trade decision."""
+16727-    enabled = set(enabled_instruments())
+16728-    insts = [i for i in INDEX_ALIGNMENT_INSTRUMENTS if i in enabled]
+16729-    members = []
+16730-    for inst in insts:
+16731-        try:
+16732-            a = full_analysis(ticker_override=inst)
+16733-        except Exception as exc:
+16734-            logger.warning("index-alignment analysis error (%s): %s", inst, exc)
+16735-            continue
+16736-        bias = a.get("bias")
+16737-        direction = ("Long" if bias == "Bullish"
+16738-                     else "Short" if bias == "Bearish"
+16739-                     else None)
+16740-        members.append({
+16741-            "instrument": inst,
+16742-            "name":       _INDEX_DISPLAY_NAMES.get(inst, inst),
+16743-            "bias":       bias,            # Bullish / Bearish / Choppy
+16744-            "direction":  direction,       # Long / Short / None (Choppy)
+16745-            "edge_score": a.get("edge_score"),
+16746-            "edge_grade": a.get("edge_grade"),
+16747-            "verdict":    a.get("verdict"),
+16748-        })
+16749-    longs  = [m for m in members if m["direction"] == "Long"]
+16750-    shorts = [m for m in members if m["direction"] == "Short"]
+16751-    total  = len(members)
+16752-    state, direction, agree = "n/a", None, 0
+16753-    if total >= 2:
+16754-        if longs and not shorts and len(longs) == total:
+16755-            state, direction, agree = "Aligned", "Long", len(longs)
+16756-        elif shorts and not longs and len(shorts) == total:
+16757-            state, direction, agree = "Aligned", "Short", len(shorts)
+16758-        elif len(longs) >= 2 and len(longs) > len(shorts):
+16759-            state, direction, agree = "Leaning", "Long", len(longs)
+16760-        elif len(shorts) >= 2 and len(shorts) > len(longs):
+16761-            state, direction, agree = "Leaning", "Short", len(shorts)
+16762-        else:
+16763-            state, direction, agree = "Mixed", None, max(len(longs), len(shorts))
+16764-    return {
+16765-        "state":     state,        # Aligned / Leaning / Mixed / n/a
+16766-        "direction": direction,    # Long / Short / None
+16767-        "agree":     agree,        # indexes agreeing in the dominant direction
+16768-        "total":     total,        # indexes evaluated
+16769-        "members":   members,      # per-index detail (display)
+16770-        "ts":        datetime.now(timezone.utc).isoformat(),
+16771-    }
+16772-
+16773-
+16774-def _cross_market_snapshot():
+16775-    """Thread-safe shallow copy of the latest cross-market alignment snapshot for
+16776-    /status (DISPLAY-ONLY). Empty dict until the first loop pass populates it."""
+16777-    with CROSS_MARKET_LOCK:
+16778-        return dict(CROSS_MARKET_STATE)
+16779-
+16780-
+16781-def _maybe_send_cross_market_alert(snap):
+16782-    """Fire the dedicated MES/MYM cross-market confirmation Discord alert when the
+16783-    equity indexes are newly Aligned. Transition-deduped (direction change) and
+16784-    cooldown-throttled, mute-respecting, called ONLY when DISCORD_LIVE_ENABLED.
+16785-    DISPLAY/NOTIFY only — never affects whether a trade is taken. Runs on the single
+16786-    cross-market loop thread, so CROSS_MARKET_LAST_ALERT needs no extra lock."""
+16787-    if snap.get("state") != "Aligned":
+16788-        return
+16789-    direction = snap.get("direction")
+16790-    if direction not in ("Long", "Short"):
+16791-        return
+16792-    now = datetime.now(timezone.utc)
+16793-    with CROSS_MARKET_LOCK:
+16794-        last_dir = CROSS_MARKET_LAST_ALERT.get("direction")
+16795-        last_ts  = CROSS_MARKET_LAST_ALERT.get("ts")
+16796-    # Only fire when the aligned direction CHANGED, or after the cooldown elapsed
+16797-    # for the same direction (a long-running alignment re-pings at most once per
+16798-    # cooldown, never every loop tick).
+16799-    if (direction == last_dir and last_ts
+16800-            and (now - last_ts).total_seconds() < CROSS_MARKET_ALERT_COOLDOWN):
+16801-        return
+16802-    # Targets: the non-Nasdaq index micros (MNQ already has its own READY-card flow).
+16803-    # Respect per-instrument mute (fail-safe toward alerting) and only enabled ones.
+16804-    enabled = set(enabled_instruments())
+16805-    targets = [i for i in ("MES", "MYM") if i in enabled and not _alerts_muted(i)]
+16806-    if not targets:
+16807-        return
+16808-    # Group by resolved channel so MES+MYM sharing the main channel post ONE
+16809-    # combined message (no double-post); dedicated channels later each get their own.
+16810-    by_url = {}
+16811-    for inst in targets:
+16812-        url = _asset_discord_url(inst)
+16813-        if url:
+16814-            by_url.setdefault(url, []).append(inst)
+16815-    if not by_url:
+16816-        return
+16817-    arrow = "📈" if direction == "Long" else "📉"
+16818-    word  = "BULLISH" if direction == "Long" else "BEARISH"
+16819-    lines = []
+16820-    for m in (snap.get("members") or []):
+16821-        dot = ("🟢" if m.get("direction") == "Long"
+16822-               else "🔴" if m.get("direction") == "Short" else "⚪")
+16823-        es  = m.get("edge_score")
+16824-        es_txt = f" · Edge {es}" if isinstance(es, (int, float)) else ""
+16825-        lines.append(f"{dot} **{m.get('name') or m.get('instrument')}** {m.get('bias') or '—'}{es_txt}")
+16826-    detail = "\n".join(lines)
+16827-    sent_any = False
+16828-    for url, insts in by_url.items():
+16829-        names = " & ".join(insts)
+16830-        content = (
+16831-            f"{arrow} **Cross-Market Confirmation — {word}**\n"
+16832-            f"All {snap.get('total')} equity indexes agree on direction.\n"
+16833-            f"{detail}\n"
+16834-            f"_Context for {names}. Display/notify only — does not place or change any trade._"
+16835-        )
+16836-        try:
+16837-            resp = requests.post(url, json={"content": content}, timeout=5)
+16838-            # Only a real 2xx counts as sent; a non-2xx must NOT arm the cooldown,
+16839-            # so a failed post is retried on the next loop pass instead of being
+16840-            # silently suppressed for CROSS_MARKET_ALERT_COOLDOWN seconds.
+16841-            if getattr(resp, "status_code", 0) < 300:
+16842-                sent_any = True
+16843-            else:
+16844-                logger.warning("cross-market alert non-2xx (%s) — not arming cooldown",
+16845-                               getattr(resp, "status_code", "?"))
+16846-        except Exception as exc:
+16847-            logger.warning("cross-market alert post failed: %s", exc)
+16848-    if sent_any:
+16849-        with CROSS_MARKET_LOCK:
+16850-            CROSS_MARKET_LAST_ALERT["direction"] = direction
+16851-            CROSS_MARKET_LAST_ALERT["ts"] = now
+16852-        logger.info("Cross-market alert sent: %s (%d indexes aligned)",
+16853-                    direction, snap.get("agree"))
+16854-
+16855-
+16856-def _cross_market_loop():
+16857-    """Refresh the cross-market index-alignment snapshot (DISPLAY) and, on the LIVE
+16858-    instance only, fire the dedicated MES/MYM cross-confirmation alert when the
+16859-    equity indexes newly agree. Mirrors _trade_ready_loop: a self-rescheduling
+16860-    daemon Timer. Runs on dev + prod (the dashboard needs the snapshot); the Discord
+16861-    SEND is gated to DISCORD_LIVE_ENABLED so dev can't post to the shared live
+16862-    channel. NEVER touches the gate / money path."""
+16863-    try:
+16864-        snap = compute_index_alignment()
+16865-        with CROSS_MARKET_LOCK:
+16866-            CROSS_MARKET_STATE.clear()
+16867-            CROSS_MARKET_STATE.update(snap)
+16868-        if DISCORD_LIVE_ENABLED:
+16869-            _maybe_send_cross_market_alert(snap)
+16870-    except Exception as exc:  # never let the loop die
+16871-        logger.warning("cross-market loop error: %s", exc)
+16872-    finally:
+16873-        threading.Timer(CROSS_MARKET_INTERVAL, _cross_market_loop).start()
+16874-
+16875-
+16876-def _post_analyst_report_update(inst, trade, report):
+16877-    """Post ONE Unified Analyst Report thesis update for an OPEN position to the
+16878-    JOURNAL Discord channel. DISPLAY/NOTIFY ONLY — never places or changes a trade.
+16879-    Returns True only on a 2xx send (so the loop arms its throttle on success)."""
+16880-    if not DISCORD_JOURNAL_WEBHOOK_URL:
+16881-        return False
+16882-    rep  = report or {}
+16883-    prob = rep.get("probability") or {}
+16884-    conf = rep.get("confidence") or {}
+16885-    direction = (trade or {}).get("direction") or rep.get("favored_direction") or "—"
+16886-    emoji = "📈" if direction == "Long" else "📉" if direction == "Short" else "🧭"
+16887-    cont, rng, rev = prob.get("continuation"), prob.get("range"), prob.get("reversal")
+16888-    prob_txt = "Continuation %s%% · Range %s%% · Reversal %s%%" % (
+16889-        cont if cont is not None else "—", rng if rng is not None else "—",
+16890-        rev if rev is not None else "—")
+16891-    cscore, cthr = conf.get("score"), conf.get("threshold")
+16892-    conf_txt = "%s%s — %s" % (
+16893-        cscore if cscore is not None else "—",
+16894-        ("/%s" % cthr) if cthr is not None else "",
+16895-        conf.get("narrative") or "—")
+16896-    exits = rep.get("early_exit_triggers") or []
+16897-    exit_txt = "\n".join("• " + str(t) for t in exits[:5]) or "—"
+16898-    fields = [
+16899-        {"name": "Outcome probability (heuristic estimate)", "value": prob_txt[:1024], "inline": False},
+16900-        {"name": "Confidence",          "value": conf_txt[:1024], "inline": False},
+16901-        {"name": "Early-exit triggers",  "value": exit_txt[:1024], "inline": False},
+16902-        {"name": "Invalidation",         "value": str(rep.get("invalidation") or "—")[:1024], "inline": False},
+16903-    ]
+16904-    embed = {
+16905-        "title":       ("%s Position Thesis Update — %s %s" % (emoji, inst, direction))[:256],
+16906-        "description": str(rep.get("headline") or "Position update.")[:2048],
+16907-        "color":       0x5865F2,
+16908-        "fields":      fields,
+16909-        "footer":      {"text": "Display/notify only — does not place or change any trade. "
+16910-                                "Probabilities are a derived heuristic estimate."},
+16911-        "timestamp":   datetime.now(timezone.utc).isoformat(),
+16912-    }
+16913-    try:
+16914-        resp = requests.post(DISCORD_JOURNAL_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+16915-        if resp.status_code in (200, 204):
+16916-            logger.info("Analyst report update posted for %s", inst)
+16917-            return True
+16918-        logger.warning("Analyst report update non-2xx (%s) for %s", resp.status_code, inst)
+16919-        return False
+16920-    except Exception as exc:
+16921-        logger.warning("Analyst report update post failed (%s): %s", inst, exc)
+16922-        return False
+16923-
+16924-
+16925-def _analyst_report_loop():
+16926-    """Every ANALYST_REPORT_INTERVAL seconds, while a position is OPEN, post a fresh
+16927-    Unified Analyst Report thesis update for that instrument to the JOURNAL channel —
+16928-    the companion to _trade_ready_loop (which fires while FLAT). DISPLAY/NOTIFY only;
+16929-    never touches the gate / money path. Started on the LIVE instance only (boot),
+16930-    mute-aware, per-instrument throttled, self-rescheduling daemon Timer."""
+16931-    try:
+16932-        now = datetime.now(timezone.utc)
+16933-        for inst in enabled_instruments():
+16934-            if not active_trade_for(inst):
+16935-                continue
+16936-            last = ANALYST_REPORT_LAST_SENT.get(inst)
+16937-            if last and (now - last).total_seconds() < ANALYST_REPORT_INTERVAL:
+16938-                continue
+16939-            if _alerts_muted(inst):
+16940-                continue
+16941-            try:
+16942-                a = full_analysis(ticker_override=inst)
+16943-            except Exception as exc:
+16944-                logger.error("analyst-report loop analysis error (%s): %s", inst, exc)
+16945-                continue
+16946-            # No thesis updates while the market is closed (overnight holds).
+16947-            if not a.get("market_open"):
+16948-                continue
+16949-            # Re-check the slot just before sending (it may have closed while
+16950-            # full_analysis ran).
+16951-            pos = active_trade_for(inst)
+16952-            if not pos:
+16953-                continue
+16954-            rep = a.get("analyst_report")
+16955-            if not isinstance(rep, dict) or not rep.get("engine_enabled"):
+16956-                continue
+16957-            if _post_analyst_report_update(inst, pos, rep):
+16958-                ANALYST_REPORT_LAST_SENT[inst] = now
+16959-    except Exception as exc:  # never let the loop die
+16960-        logger.warning("analyst-report loop error: %s", exc)
+16961-    finally:
+16962-        threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()
+16963-
+16964-
+16965-def _update_journal_outcome(new_outcome, pnl_dollars=None, symbol=None):
+16966-    """Update the most recent journal entry that is still Pending or at T1.
+16967-
+16968-    Matches the first entry whose outcome is 'Pending' or starts with 'T1 Hit'.
+16969-    When `symbol` (an instrument code) is given, only entries for THAT instrument
+16970-    are eligible — so closing one asset's position can't mark another asset's
+16971-    still-open journal entry (per-asset isolation). Posts a brief update line to
+16972-    the journal Discord channel. Returns the updated entry or None if nothing matched.
+16973-    """
+16974-    _want_inst = instrument_of(symbol) if symbol else None
+16975-    for entry in JOURNAL:
+16976-        o = entry.get("outcome", "")
+16977-        if _want_inst is not None and instrument_of(entry.get("symbol", "")) != _want_inst:
+16978-            continue
+16979-        if o == "Pending" or o.startswith("T1 Hit"):
+16980-            entry["outcome"] = new_outcome
+16981-            if pnl_dollars is not None:
+16982-                entry["pnl_dollars"] = round(pnl_dollars, 2)
+16983-            _persist_journal_entry(entry)  # fail-open: mirror the outcome update to Postgres
+16984-            logger.info("Journal #%d outcome → %s", entry["id"], new_outcome)
+16985-            # Post a short update line to the journal channel
+16986-            if DISCORD_JOURNAL_WEBHOOK_URL:
+16987-                _outcome_emoji = "✅" if "Win" in new_outcome else ("⚠️" if "T1" in new_outcome else "❌")
+16988-                content = (
+16989-                    f"{_outcome_emoji} **Journal #{entry['id']} updated**\n"
+16990-                    f"{entry.get('symbol','—')} {entry.get('direction','—')}  ·  "
+16991-                    f"Outcome: **{new_outcome}**"
+16992-                )
+16993-                try:
+16994-                    requests.post(
+16995-                        DISCORD_JOURNAL_WEBHOOK_URL,
+16996-                        json={"content": content},
+16997-                        timeout=5,
+16998-                    )
+16999-                except Exception:
+17000-                    pass
+17001-            # Performance analytics: fire once per entry on a terminal outcome
+17002-            # (Win / Loss / Breakeven). Intermediate states (Pending / T1 Hit)
+17003-            # do not trigger. Deduped via entry["analytics_posted"].
+17004-            state = _outcome_state(new_outcome, entry.get("pnl_dollars"))
+17005-            if state in ("win", "loss", "breakeven") and not entry.get("analytics_posted"):
+17006-                entry["analytics_posted"] = True
+17007-                post_performance_stats(
+17008-                    reason=f"After {entry.get('symbol','—')} "
+17009-                           f"{entry.get('direction','—')} closed: {new_outcome}"
+17010-                )
+17011-            return entry
+17012-    return None
+17013-
+17014-
+17015-# ───────────────────────────────────────────────────────────────────────────
+17016-# Trade-management watcher (Features 1-3, fully additive).
+17017-#
+17018-# When a setup goes READY and its clean card posts, the setup is registered as a
+17019-# *managed trade* keyed by (instrument, direction, entry-zone low, UTC date). A
+17020-# background pass — piggybacking the VWAP auto-fetch loop — pulls the latest
+17021-# 1-minute bar (high/low/close) from the same public feed and walks the trade
+17022-# to its first terminal level: TP1 reached = Win, stop breached = Loss (the stop
+17023-# is checked first so an ambiguous bar resolves against the trade). The terminal
+17024-# exit posts an outcome card and writes Result / R / MFE / MAE to the journal.
+17025-#
+17026-# This NEVER touches the manual ACTIVE_TRADE flow, the READY gate, throttling,
+17027-# or the existing cards. Every entry point is wrapped in try/except so a feed
+17028-# hiccup can never block an alert.
+17029-# ───────────────────────────────────────────────────────────────────────────
+17030-
+17031-def _managed_trade_key(instrument, direction, entry_lo):
+17032-    """Dedup key — same setup on the same UTC day maps to one managed trade."""
+17033-    try:
+17034-        lo_key = round(float(entry_lo), 0)
+17035-    except (TypeError, ValueError):
+17036-        lo_key = 0.0
+17037-    return (instrument, direction, lo_key,
+17038-            datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+17039-
+17040-
+17041-def _build_swing_thesis(entry, mp, swing_ctx):
+17042-    """Build the per-trade SWING thesis (DISPLAY / local-tracking ONLY — it never
+17043-    feeds the strict gate, sizing, dedupe, or the /traderspost money path).
+17044-
+17045-    Sourced from the already-computed plan (mp) + the P4 swing_context so it can
+17046-    never drift from what the gate actually saw. Fail-open: returns a stable-schema
+17047-    dict even when swing_ctx is missing. Caller gates on _swing_htf_enabled().
+17048-    """
+17049-    ctx        = swing_ctx if isinstance(swing_ctx, dict) else {}
+17050-    direction  = entry.get("direction") or (mp or {}).get("direction") or "Long"
+17051-    instrument = entry.get("instrument") or "—"
+17052-    stop       = (mp or {}).get("stop")
+17053-    target     = (mp or {}).get("tp1")
+17054-    planned_rr = entry.get("rr_num")
+17055-    bias_1h    = ctx.get("bias_1h")
+17056-    bias_4h    = ctx.get("bias_4h")
+17057-    bias_daily = ctx.get("bias_daily")
+17058-    lvl        = ctx.get("daily_level_nearby") if isinstance(ctx.get("daily_level_nearby"), dict) else {}
+17059-    lvl_label  = lvl.get("label") if lvl else None
+17060-    review_min = int(cfg_for("SWING", "SWING_REVIEW_INTERVAL_MIN"))
+17061-    rr_str     = f"{planned_rr:.2f}" if isinstance(planned_rr, (int, float)) else "—"
+17062-    thesis_text = (
+17063-        f"{direction} {instrument} on HTF alignment "
+17064-        f"(1H {bias_1h or '—'} / 4H {bias_4h or '—'} / Daily {bias_daily or '—'}); "
+17065-        f"entry on pullback to {lvl_label or 'HTF structure'}, "
+17066-        f"target {target if target is not None else '—'}, "
+17067-        f"invalidation {stop if stop is not None else '—'}."
+17068-    )
+17069-    reason = (
+17070-        f"1H+4H bias aligned {str(direction).lower()}; daily level "
+17071-        f"{lvl_label or 'n/a'} respected; planned RR {rr_str}."
+17072-    )
+17073-    return {
+17074-        "original_thesis":      thesis_text,
+17075-        "status":               "VALID",
+17076-        "reason":               reason,
+17077-        "invalidation_level":   stop,
+17078-        "next_target":          target,
+17079-        "planned_rr":           planned_rr,
+17080-        "current_r":            0.0,
+17081-        "next_review_at":       (now_utc() + timedelta(minutes=review_min)).isoformat(),
+17082-        "last_review_decision": None,
+17083-        # HTF summary for the dashboard (display-only):
+17084-        "bias_1h":              bias_1h,
+17085-        "bias_4h":              bias_4h,
+17086-        "bias_daily":           bias_daily,
+17087-        "daily_level_nearby":   lvl_label,
+17088-        "created_at":           now_utc().isoformat(),
+17089-    }
+17090-
+17091-
+17092-def _find_open_swing_managed_trade(instrument, direction, entry_lo):
+17093-    """SWING (flag-on) cross-UTC-day dedup. _managed_trade_key embeds today's UTC
+17094-    date, so a SWING setup reposted on a LATER day would mint a new key and spawn a
+17095-    duplicate managed trade. Return an existing OPEN managed trade for the same
+17096-    instrument+direction whose entry sits within ~1 risk-unit, so a multi-day hold
+17097-    refreshes the SAME trade. Returns None when there is no close match (the caller
+17098-    then registers a fresh trade)."""
+17099-    try:
+17100-        target_lo = float(entry_lo)
+17101-    except (TypeError, ValueError):
+17102-        return None
+17103-    best, best_dist = None, None
+17104-    for mt in MANAGED_TRADES_BY_KEY.values():
+17105-        if mt.get("closed"):
+17106-            continue
+17107-        # Strictly SWING-local: never let a SWING repost reuse a non-SWING managed
+17108-        # trade if mode/flag state shifts within one process.
+17109-        if not mt.get("is_swing"):
+17110-            continue
+17111-        if mt.get("instrument") != instrument or mt.get("direction") != direction:
+17112-            continue
+17113-        me = mt.get("entry_lo")
+17114-        if me is None:
+17115-            continue
+17116-        try:
+17117-            dist = abs(float(me) - target_lo)
+17118-        except (TypeError, ValueError):
+17119-            continue
+17120-        if best is None or dist < best_dist:
+17121-            best, best_dist = mt, dist
+17122-    if best is None:
+17123-        return None
+17124-    tol = best.get("risk_points") or (abs(target_lo) * 0.01) or 1.0
+17125-    if best_dist is not None and best_dist > tol:
+17126-        return None
+17127-    return best
+17128-
+17129-
+17130-def _register_managed_trade(entry, ticker=""):
+17131-    """Register (or refresh) a READY setup with the trade-management watcher.
+17132-
+17133-    Idempotent: a repost of the same setup refreshes the plan levels but keeps
+17134-    any events already sent and the running MFE/MAE. A closed trade is never
+17135-    re-opened by a later repost on the same key/day.
+17136-    """
+17137-    mp = entry.get("management_plan")
+17138-    if not mp:
+17139-        return None  # no numeric plan (e.g. legacy/no-plan entry) — nothing to track
+17140-
+17141-    instrument = entry.get("instrument") or instrument_of(ticker or entry.get("symbol", ""))
+17142-    direction  = entry.get("direction") or mp.get("direction") or "Long"
+17143-    key = _managed_trade_key(instrument, direction, mp.get("entry_lo"))
+17144-
+17145-    # SWING (flag-on): a multi-day hold reposted on a LATER UTC day would otherwise
+17146-    # mint a new date-stamped key and duplicate the trade — reuse the existing open
+17147-    # SWING managed trade instead so its thesis + progress carry forward.
+17148-    if _swing_htf_enabled() and key not in MANAGED_TRADES_BY_KEY:
+17149-        _open_swing = _find_open_swing_managed_trade(instrument, direction, mp.get("entry_lo"))
+17150-        if _open_swing is not None:
+17151-            key = _open_swing["key"]
+17152-
+17153-    # Light housekeeping: drop closed trades from previous UTC days.
+17154-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+17155-    for k in [k for k, v in MANAGED_TRADES_BY_KEY.items()
+17156-              if v.get("closed") and k[3] != today]:
+17157-        MANAGED_TRADES_BY_KEY.pop(k, None)
+17158-
+17159-    existing = MANAGED_TRADES_BY_KEY.get(key)
+17160-    if existing is not None:
+17161-        if not existing.get("closed"):
+17162-            # A SCALP-dynamic trade that has begun PROGRESSING (a partial booked or
+17163-            # the stop moved to BE) FREEZES its plan: refreshing levels/pcts/stop
+17164-            # mid-walk would clobber a moved stop or re-base already-booked partial R.
+17165-            # A trade that hasn't triggered anything refreshes its plan numbers as
+17166-            # before (legacy never sets these flags -> byte-identical full refresh).
+17167-            started = bool(existing.get("tp1_hit") or existing.get("be_moved"))
+17168-            if not started:
+17169-                # Refresh plan numbers, preserve progress (events/MFE/MAE/be_active).
+17170-                existing.update({k: mp.get(k) for k in
+17171-                                 ("entry", "entry_lo", "entry_hi", "stop", "tp1", "tp2",
+17172-                                  "tp3", "be_level", "partial", "runner", "risk_points",
+17173-                                  "point_value", "tp1_pct", "tp2_pct", "runner_pct")})
+17174-                existing["initial_stop"] = mp.get("stop")
+17175-        # SWING (flag-on): keep the persisted snapshot current after a same-setup
+17176-        # repost refresh (display / local-tracking only — no money-path effect).
+17177-        if _swing_htf_enabled() and existing.get("is_swing"):
+17178-            _persist_swing_thesis(existing)
+17179-        return existing
+17180-
+17181-    mt = {
+17182-        "key": key, "instrument": instrument, "direction": direction,
+17183-        "symbol": entry.get("symbol") or instrument,
+17184-        "entry": mp.get("entry"), "entry_lo": mp.get("entry_lo"), "entry_hi": mp.get("entry_hi"),
+17185-        "stop": mp.get("stop"), "tp1": mp.get("tp1"), "tp2": mp.get("tp2"), "tp3": mp.get("tp3"),
+17186-        "be_level": mp.get("be_level"), "partial": mp.get("partial"), "runner": mp.get("runner"),
+17187-        "tp1_pct": mp.get("tp1_pct"), "tp2_pct": mp.get("tp2_pct"),
+17188-        "runner_pct": mp.get("runner_pct"),
+17189-        "risk_points": mp.get("risk_points"), "point_value": mp.get("point_value"),
+17190-        "registered_at": datetime.now(timezone.utc).isoformat(),
+17191-        # Epoch (secs) of entry. The same-bar fill guard in _watch_managed_trades
+17192-        # only evaluates this trade against bars that OPENED strictly after it, so a
+17193-        # trade can never be closed on a bar whose high/low predates the entry.
+17194-        "entry_epoch": datetime.now(timezone.utc).timestamp(),
+17195-        "events_sent": set(), "updates": [],
+17196-        "mfe": 0.0, "mae": 0.0, "be_active": False, "closed": False,
+17197-        # S4 dynamic-lifecycle state (SCALP local/paper; inert for SWING / legacy
+17198-        # single-TP / live-broker paths — exit_reason stays None there).
+17199-        "initial_stop": mp.get("stop"),
+17200-        "remaining_pct": 1.0, "realized_r": 0.0,
+17201-        "tp1_hit": False, "tp2_hit": False, "runner_hit": False,
+17202-        "be_moved": False, "exit_reason": None,
+17203-        "trade_strength": entry.get("trade_strength"),
+17204-        "edge_score": entry.get("edge_score"),
+17205-        "journal_id": entry.get("id"),
+17206-        # Adaptive-learning: freeze the entry-time engine/indicator context so the
+17207-        # trade can be tagged with its regime/strategy/session/indicators at close.
+17208-        "learning_ctx": _capture_learning_ctx(instrument),
+17209-    }
+17210-    # SWING (flag-on) only: attach the per-trade thesis (DISPLAY / local-tracking
+17211-    # only — never feeds the gate, sizing, dedupe, or the /traderspost money path)
+17212-    # and persist the trade so a multi-day hold survives a restart. SCALP / flag-off
+17213-    # add NOTHING here → the mt dict stays byte-identical.
+17214-    if _swing_htf_enabled():
+17215-        try:
+17216-            mt["is_swing"]     = True
+17217-            mt["thesis_key"]   = uuid.uuid4().hex
+17218-            mt["swing_thesis"] = _build_swing_thesis(entry, mp, entry.get("_swing_context"))
+17219-        except Exception as exc:
+17220-            logger.warning("SWING thesis build failed: %s", exc)
+17221-    MANAGED_TRADES_BY_KEY[key] = mt
+17222-    logger.info("Managed trade registered: %s %s entry≈%s", instrument, direction, mp.get("entry"))
+17223-    if _swing_htf_enabled() and mt.get("is_swing"):
+17224-        _persist_swing_thesis(mt)
+17225-    return mt
+17226-
+17227-
+17228-def _tag_dynamic_paper_managed_trade(inst, plan, setup_key):
+17229-    """Option C (S4): for a SCALP dynamic PAPER (simulated, non-live) AUTO entry,
+17230-    let the MANAGED_TRADES dynamic lifecycle be the SOLE tracker/authority for the
+17231-    journal / outcome / learning instead of creating a 1-slot ACTIVE_TRADE.
+17232-
+17233-    Why: an ACTIVE_TRADE would be finalised by check_trade_events at a flat 1:1 the
+17234-    instant TP1 prints, racing — and overwriting — the managed trade's BLENDED-R
+17235-    close (a paper trade forced back to 1:1, the exact S4 bug). MANAGED_TRADES is
+17236-    1:N (it already supports stacked SCALP setups) whereas ACTIVE_TRADES is one slot
+17237-    per instrument, so making the managed trade authoritative also sidesteps the
+17238-    1:N "which managed close clears the single active slot" ambiguity.
+17239-
+17240-    Matches the just-registered open managed trade for this setup (registered by
+17241-    send_live_ready_card BEFORE auto-exec on the SAME webhook) by instrument +
+17242-    direction + nearest entry within tolerance, and tags it with the auto-exec
+17243-    context so its close can re-arm / cooldown like the legacy ACTIVE_TRADE path.
+17244-
+17245-    Returns True only when a matching open managed trade was tagged. False (no
+17246-    match) tells the caller to FALL BACK to legacy ACTIVE_TRADE tracking, so a
+17247-    missing managed trade can never leave the paper position untracked (fail-closed).
+17248-    """
+17249-    try:
+17250-        direction = plan.get("direction")
+17251-        entry = float(plan.get("entry"))
+17252-    except (TypeError, ValueError):
+17253-        return False
+17254-    if not direction:
+17255-        return False
+17256-    best, best_dist = None, None
+17257-    for mt in MANAGED_TRADES_BY_KEY.values():
+17258-        if mt.get("closed"):
+17259-            continue
+17260-        if mt.get("instrument") != inst or mt.get("direction") != direction:
+17261-            continue
+17262-        me = mt.get("entry")
+17263-        if me is None:
+17264-            continue
+17265-        try:
+17266-            dist = abs(float(me) - entry)
+17267-        except (TypeError, ValueError):
+17268-            continue
+17269-        if best is None or dist < best_dist:
+17270-            best, best_dist = mt, dist
+17271-    if best is None:
+17272-        return False
+17273-    # Guard against tagging a DIFFERENT (older, stacked) setup: the freshly
+17274-    # registered managed trade shares this plan's entry, so the match must be close.
+17275-    tol = best.get("risk_points") or (abs(entry) * 0.01)
+17276-    if best_dist is not None and best_dist > (tol or 0.0):
+17277-        return False
+17278-    best["auto_setup_key"]   = setup_key
+17279-    best["auto_exec_status"] = "simulated"
+17280-    best["auto_opened_at"]   = now_utc().isoformat()
+17281-    return True
+17282-
+17283-
+17284-def _fetch_latest_bar(instrument):
+17285-    """Return {'high','low','close'} of the most recent 1-minute bar, or None.
+17286-
+17287-    Uses the same public feed as the VWAP fetch (MGC≈GC=F, MNQ≈NQ=F). Best-effort
+17288-    — any error returns None so the watcher simply skips this cycle.
+17289-    """
+17290-    symbol = VWAP_FEED_SYMBOL.get(instrument)
+17291-    if not symbol:
+17292-        return None
+17293-    quote, err = _fetch_intraday_quote(symbol)
+17294-    if err:
+17295-        _log_feed_status("Latest-bar fetch", instrument, err)
+17296-        return None
+17297-    _log_feed_status("Latest-bar fetch", instrument, None)
+17298-    highs, lows, closes = quote["high"], quote["low"], quote["close"]
+17299-    stamps = quote.get("_timestamps") or []
+17300-    for i in range(len(closes) - 1, -1, -1):
+17301-        if highs[i] is not None and lows[i] is not None and closes[i] is not None:
+17302-            start = None
+17303-            try:
+17304-                if i < len(stamps) and stamps[i] is not None:
+17305-                    start = int(stamps[i])
+17306-            except (TypeError, ValueError):
+17307-                start = None
+17308-            return {"high": float(highs[i]), "low": float(lows[i]),
+17309-                    "close": float(closes[i]), "start": start}
+17310-    return None
+17311-
+17312-
+17313-def _watch_managed_trades():
+17314-    """Evaluate every open managed trade against the latest bar (one fetch per
+17315-    instrument per cycle). Called from _managed_watch_loop on its own fast timer
+17316-    (MANAGED_WATCH_INTERVAL)."""
+17317-    active = [mt for mt in MANAGED_TRADES_BY_KEY.values() if not mt.get("closed")]
+17318-    if not active:
+17319-        return
+17320-    bars = {}
+17321-    for inst in {mt["instrument"] for mt in active}:
+17322-        bars[inst] = _fetch_latest_bar(inst)
+17323-    for mt in active:
+17324-        bar = bars.get(mt["instrument"])
+17325-        if not bar:
+17326-            continue
+17327-        # ── Same-bar / pre-entry fill guard ────────────────────────────────────
+17328-        # Never resolve a trade against a bar that OPENED at or before its entry:
+17329-        # that bar's high/low can include price action from BEFORE the trade was
+17330-        # entered, which would close it instantly (~0s hold) at the EXACT stop or
+17331-        # target — a look-ahead artifact, not a real fill. Only evaluate bars that
+17332-        # began strictly AFTER entry. FAIL-OPEN: if the bar has no open time or the
+17333-        # trade no entry epoch, fall back to the prior (unguarded) behavior.
+17334-        _bar_start   = bar.get("start")
+17335-        _entry_epoch = mt.get("entry_epoch")
+17336-        if (_bar_start is not None and _entry_epoch is not None
+17337-                and _bar_start <= _entry_epoch):
+17338-            continue
+17339-        try:
+17340-            _evaluate_managed_trade_levels(mt, bar)
+17341-        except Exception as exc:
+17342-            logger.error("Managed-trade eval error (%s): %s", mt.get("key"), exc)
+17343-
+17344-
+17345-def _scalp_dynamic_lifecycle_enabled(mt):
+17346-    """True only when the SCALP dynamic multi-leg exit lifecycle should drive THIS
+17347-    managed trade LOCALLY (journal / alerts / dashboard). ALL three gates fail-closed:
+17348-
+17349-      1) SCALP + master flag on (_scalp_dynamic_enabled, keyed on TRADING_MODE) so
+17350-         SWING / flag-off walks the byte-identical legacy single-TP path below.
+17351-      2) execution NOT live. A real broker (traderspost / pickmytrade) sends ONE TP
+17352-         = intent.target1 and flattens the WHOLE position there; a local multi-leg /
+17353-         runner walk would book partial + runner R the broker never held (desync). In
+17354-         live modes we collapse to the legacy broker-owned single exit.
+17355-      3) the trade actually carries the staged dynamic geometry (tp1/tp2 + a usable
+17356-         entry/stop/risk basis).
+17357-    """
+17358-    try:
+17359-        if not _scalp_dynamic_enabled():
+17360-            return False
+17361-        if execution_is_live(resolve_execution_mode()):
+17362-            return False
+17363-        if not mt:
+17364-            return False
+17365-        if mt.get("entry") is None or mt.get("tp1") is None or mt.get("tp2") is None:
+17366-            return False
+17367-        if mt.get("stop") is None or not mt.get("risk_points"):
+17368-            return False
+17369-        return True
+17370-    except Exception:
+17371-        return False
+17372-
+17373-
+17374-def _dynamic_leg_r(price, entry, risk, is_long):
+17375-    """Signed R of an exit at `price` vs `entry` on the ORIGINAL risk basis, so a
+17376-    BE-moved stop books ~0R rather than a re-based number."""
+17377-    if price is None or entry is None or not risk:
+17378-        return 0.0
+17379-    pts = (price - entry) if is_long else (entry - price)
+17380-    return pts / risk
+17381-
+17382-
+17383-def _maybe_move_be_to_entry(mt, bar):
+17384-    """Delayed break-even (req 4): after TP1, move the stop to entry only when the
+17385-    configured condition holds (favorable close OR price reached 1R). Idempotent;
+17386-    mirrors the move onto the ACTIVE_TRADES tracker best-effort. Caller is already
+17387-    gated to the SCALP dynamic lifecycle, so cfg() resolves SCALP knobs."""
+17388-    if mt.get("be_moved"):
+17389-        return
+17390-    if cfg("SCALP_BE_AFTER_TP1_ONLY") and not mt.get("tp1_hit"):
+17391-        return
+17392-    entry = mt.get("entry")
+17393-    if entry is None:
+17394-        return
+17395-    is_long = mt["direction"] == "Long"
+17396-    if cfg("SCALP_BE_REQUIRE_FAVOR_CLOSE_OR_1R"):
+17397-        close = bar.get("close")
+17398-        tp1   = mt.get("tp1")
+17399-        favor_close = close is not None and ((close > entry) if is_long else (close < entry))
+17400-        reached_1r  = tp1 is not None and ((bar["high"] >= tp1) if is_long else (bar["low"] <= tp1))
+17401-        if not (favor_close or reached_1r):
+17402-            return
+17403-    mt["stop"]      = entry
+17404-    mt["be_moved"]  = True
+17405-    mt["be_active"] = True
+17406-    _send_management_update(mt, "Stop \u2192 break-even",
+17407-                            f"Stop moved to entry ({entry}) after TP1.")
+17408-    # Best-effort mirror onto the broker/dashboard tracker so manual views agree.
+17409-    try:
+17410-        _at = active_trade_for(mt.get("instrument"))
+17411-        if (_at and _at.get("status") != "closed"
+17412-                and _at.get("direction") == mt.get("direction")):
+17413-            _at["stop_loss"] = entry
+17414-    except Exception:
+17415-        pass
+17416-
+17417-
+17418-def _finalize_dynamic_close(mt, exit_price, exit_reason):
+17419-    """Close a SCALP-dynamic managed trade on its BLENDED realized R. Outcome is
+17420-    derived from realized_r (Win>0 / Loss<0 / Breakeven==0) so a TP1-then-BE-stop
+17421-    books the partial profit rather than a flat loss."""
+17422-    realized = mt.get("realized_r") or 0.0
+17423-    if realized > 1e-9:
+17424-        outcome = "Win"
+17425-    elif realized < -1e-9:
+17426-        outcome = "Loss"
+17427-    else:
+17428-        outcome = "Breakeven"
+17429-    reason_label = {
+17430-        "stop":           "stop hit",
+17431-        "breakeven_stop": "break-even stop",
+17432-        "tp1":            "TP1",
+17433-        "tp2":            "TP2",
+17434-        "runner":         "runner",
+17435-    }.get(exit_reason, exit_reason or "closed")
+17436-    mt["exit_reason"] = exit_reason
+17437-    _close_managed_trade(mt, outcome, f"{outcome} ({reason_label})", exit_price)
+17438-
+17439-
+17440-def _mt_to_runner_rec(mt):
+17441-    """Adapt a paper managed-trade record to the shape _runner_exit_signal reads
+17442-    (instrument / direction / entry / opened_epoch / peak_price / trough_price). The
+17443-    high/low-water marks live on the mt under cp_peak / cp_trough, tracked by the
+17444-    conditional-runner walk ONLY (absent on the flag-off path, so a flag-off mt is
+17445-    never mutated by this feature)."""
+17446-    return {
+17447-        "instrument":   mt.get("instrument"),
+17448-        "direction":    mt.get("direction"),
+17449-        "entry":        mt.get("entry"),
+17450-        "opened_epoch": mt.get("entry_epoch"),
+17451-        "peak_price":   mt.get("cp_peak"),
+17452-        "trough_price": mt.get("cp_trough"),
+17453-    }
+17454-
+17455-
+17456-def _evaluate_conditional_paper_runner(mt, bar):
+17457-    """Flag-gated (RUNNER_CONDITIONAL_PAPER_ENABLED) paper exit walk: book 50% at TP1,
+17458-    then ride the remaining 50% until the SHARED _runner_exit_signal fires (the very
+17459-    same discretionary logic the LIVE runner uses), booking the remainder at the
+17460-    current price. Local/paper ONLY; the caller has already ruled out the stop for this
+17461-    bar, and the (BE-aware) stop-first check still runs every bar as the hard floor, so
+17462-    the remainder can never give back more than the break-even stop allows. Display /
+17463-    journal effect only — never a broker send."""
+17464-    high, low = bar["high"], bar["low"]
+17465-    entry   = mt.get("entry")
+17466-    risk    = mt.get("risk_points") or 0.0
+17467-    is_long = mt["direction"] == "Long"
+17468-
+17469-    # ── TP1: book exactly 50% once, then arm the delayed break-even. ──
+17470-    if not mt.get("tp1_hit"):
+17471-        tp1 = mt.get("tp1")
+17472-        if tp1 is not None and ((high >= tp1) if is_long else (low <= tp1)):
+17473-            mt["tp1_hit"] = True
+17474-            pct   = 0.5
+17475-            leg_r = _dynamic_leg_r(tp1, entry, risk, is_long)
+17476-            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+17477-            mt["remaining_pct"] = round(max(0.0, (mt.get("remaining_pct") or 0.0) - pct), 4)
+17478-            _send_management_update(mt, "TP1 hit",
+17479-                                    f"Booked 50% at {tp1} (+{leg_r:.2f}R). "
+17480-                                    f"Remainder rides the runner signal.")
+17481-            _maybe_move_be_to_entry(mt, bar)
+17482-
+17483-    # ── Remainder: discretionary exit via the shared runner-exit signal (now-based). ──
+17484-    if mt.get("tp1_hit") and (mt.get("remaining_pct") or 0.0) > 1e-9:
+17485-        inst = mt.get("instrument")
+17486-        try:
+17487-            price_now = current_price_for(inst)
+17488-        except Exception:
+17489-            price_now = None
+17490-        # Track the high/low-water mark on the SAME price basis the signal reads,
+17491-        # so the ATR trail inside _runner_exit_signal has a meaningful anchor.
+17492-        if price_now is not None:
+17493-            mt["cp_peak"]   = max(mt.get("cp_peak")   or entry or price_now, price_now)
+17494-            mt["cp_trough"] = min(mt.get("cp_trough") or entry or price_now, price_now)
+17495-        should_exit, reason = _runner_exit_signal(_mt_to_runner_rec(mt))
+17496-        if should_exit:
+17497-            exit_px = price_now if price_now is not None else bar.get(
+17498-                "close", high if is_long else low)
+17499-            pct   = mt.get("remaining_pct") or 0.0
+17500-            leg_r = _dynamic_leg_r(exit_px, entry, risk, is_long)
+17501-            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+17502-            mt["remaining_pct"] = 0.0
+17503-            mt["runner_hit"]    = True
+17504-            _send_management_update(mt, "Runner exit",
+17505-                                    f"Signal exit ({reason}) — booked final "
+17506-                                    f"{round(pct * 100)}% at {exit_px} (+{leg_r:.2f}R).")
+17507-            _finalize_dynamic_close(mt, exit_px, "runner")
+17508-            return
+17509-
+17510-
+17511-def _evaluate_dynamic_managed_levels(mt, bar):
+17512-    """SCALP dynamic multi-leg exit walk for ONE OHLC bar (local/paper only; caller
+17513-    has already gated on _scalp_dynamic_lifecycle_enabled).
+17514-
+17515-    Conservative ordering, stop FIRST: the (possibly BE-moved) stop is tested before
+17516-    any favorable level so an ambiguous bar resolves against the trade. With the stop
+17517-    ruled out for this bar, favorable legs are walked in ascending order
+17518-    TP1 -> [delayed BE] -> TP2 -> runner; a single large bar may fill several. Each
+17519-    leg books leg_pct * leg_R into realized_r exactly once, decrements remaining_pct,
+17520-    and the final leg (runner, or TP2 when no runner) closes the trade."""
+17521-    high, low = bar["high"], bar["low"]
+17522-    entry   = mt.get("entry")
+17523-    risk    = mt.get("risk_points") or 0.0
+17524-    is_long = mt["direction"] == "Long"
+17525-
+17526-    # ── 1) Stop first (BE-aware). Books the remaining position at the stop's R. ──
+17527-    stop = mt.get("stop")
+17528-    if stop is not None:
+17529-        breached = (low <= stop) if is_long else (high >= stop)
+17530-        if breached:
+17531-            leg_r = _dynamic_leg_r(stop, entry, risk, is_long)
+17532-            mt["realized_r"]    = round((mt.get("realized_r") or 0.0)
+17533-                                        + (mt.get("remaining_pct") or 0.0) * leg_r, 4)
+17534-            mt["remaining_pct"] = 0.0
+17535-            reason = "breakeven_stop" if (mt.get("be_moved") and abs(leg_r) < 1e-9) else "stop"
+17536-            _finalize_dynamic_close(mt, stop, reason)
+17537-            return
+17538-
+17539-    # ── Conditional paper runner (flag-gated): with the stop ruled out for this bar,
+17540-    #    book 50% at TP1 then ride the remainder on the SHARED _runner_exit_signal.
+17541-    #    Flag OFF => skipped entirely, so the legacy TP1/TP2/runner price walk below
+17542-    #    stays byte-identical. ──
+17543-    if RUNNER_CONDITIONAL_PAPER_ENABLED:
+17544-        _evaluate_conditional_paper_runner(mt, bar)
+17545-        return
+17546-
+17547-    # ── 2) TP1 partial + delayed break-even ──
+17548-    if not mt.get("tp1_hit"):
+17549-        tp1 = mt.get("tp1")
+17550-        if tp1 is not None and ((high >= tp1) if is_long else (low <= tp1)):
+17551-            mt["tp1_hit"] = True
+17552-            pct   = mt.get("tp1_pct") or 0.0
+17553-            leg_r = _dynamic_leg_r(tp1, entry, risk, is_long)
+17554-            mt["realized_r"]    = round((mt.get("realized_r") or 0.0) + pct * leg_r, 4)
+17555-            mt["remaining_pct"] = round(max(0.0, (mt.get("remaining_pct") or 0.0) - pct), 4)
+17556-            _send_management_update(mt, "TP1 hit",
+17557-                                    f"Booked {round(pct * 100)}% at {tp1} (+{leg_r:.2f}R).")
+17558-            _maybe_move_be_to_entry(mt, bar)
+17559-
+17560-    # ── 3) TP2 ──
+17561-    if mt.get("tp1_hit") and not mt.get("tp2_hit"):
+17562-        tp2 = mt.get("tp2")
+17563-        if tp2 is not None and ((high >= tp2) if is_long else (low <= tp2)):
+17564-            mt["tp2_hit"] = True
+17565-            has_runner = mt.get("runner") is not None and (mt.get("runner_pct") or 0.0) > 0.0
+17566-            pct   = (mt.get("tp2_pct") or 0.0) if has_runner else (mt.get("remaining_pct") or 0.0)

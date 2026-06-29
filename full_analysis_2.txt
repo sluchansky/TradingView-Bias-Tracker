@@ -1,0 +1,1000 @@
+15567-                           "strategy_key": None, "sample": 0, "capped": False,
+15568-                           "reason": "market closed"}
+15569-        result["learning_score_influence"] = {
+15570-            "enabled":   bool(_ls_closed.get("enabled", _learning_score_gate_enabled())),
+15571-            "armed":     False,
+15572-            "max_delta": LEARNING_SCORE_MAX_DELTA,
+15573-            "meta":      None,
+15574-            "Long":      dict(_ls_neutral_dir),
+15575-            "Short":     dict(_ls_neutral_dir),
+15576-        }
+15577-        # Neutralise the CVD / RVOL / volume stamps too — there is no live tape closed.
+15578-        result["cvd_state"]          = None
+15579-        result["cvd_value"]          = None
+15580-        result["cvd_direction"]      = None
+15581-        result["rvol_value"]         = None
+15582-        result["rvol_adj"]           = 0
+15583-        result["volume_confirmed"]    = False
+15584-        result["volume_data_present"] = False
+15585-        result["volume_state"]        = None
+15586-        result["alert_diagnostics"] = {
+15587-            "long_score":            0,
+15588-            "short_score":           0,
+15589-            "edge_score":            0,
+15590-            "conflict_gap":          0,
+15591-            "dominant_direction":    "Neutral",
+15592-            "current_atr":           None,
+15593-            "volatility_multiplier": None,
+15594-            "ready_reason":          "",
+15595-            "rejected_reasons":      ["Market closed — live alerts paused"],
+15596-            "current_score":         0,
+15597-            "required_score":        int(cfg("EDGE_READY_THRESHOLD")),
+15598-            # Per-setup Edge breakdown — neutralised while the market is closed.
+15599-            "score_breakdown":       [],
+15600-            "components":            [],
+15601-            "failed_confirmations":  [],
+15602-            "ready_blockers":        ["market_closed"],
+15603-            "raw_score":             0,
+15604-            "max_score":             EDGE_SCORE_MAX,
+15605-            "cap_applied":           False,
+15606-            "volume_state":          None,
+15607-            "volume_confirmed":      False,
+15608-            "volume_data_present":   False,
+15609-            "location_ok":           False,
+15610-            "near_vwap":             False,
+15611-            "cvd_state":             None,
+15612-            "cvd_pending":           None,
+15613-            "cvd_opposite_count":    0,
+15614-            "cvd_value":             None,
+15615-            "cvd_direction":         None,
+15616-            "cvd_agreement":         "Unknown",
+15617-            "rvol_value":            None,
+15618-            "rvol_adj":              0,
+15619-            # camelCase diagnostics — neutralised while the market is closed.
+15620-            "edgeScore":             0,
+15621-            "requiredEdgeScore":     int(cfg("EDGE_READY_THRESHOLD")),
+15622-            "failedGates":           ["market_closed"],
+15623-            "scoreBreakdown":        [],
+15624-            "zoneAge":               None,
+15625-            "zoneConsumed":          False,
+15626-            "vwapDistance":          None,
+15627-            "cvdState":              None,
+15628-            "readyStrength":         None,
+15629-        }
+15630-        result["decision_support"]   = _decision_support(result)
+15631-        # Strategy engine paused while the market is closed (no live tape).
+15632-        result["strategy_engine"]    = _closed_strategy_engine()
+15633-        # Display-only feeds stay present for parity with the open path.
+15634-        result["equity_curve_today"] = get_today_equity_curve(active_ticker)
+15635-        result["news_filter"]        = get_news_filter()
+15636-        # Analyst Reasoning paused while the market is closed (no live tape) — a
+15637-        # fully-populated stub keeps the single-return-path / hard-index invariant.
+15638-        result["analyst"]            = _analyst_neutral_block(
+15639-            "Market closed — live alerts paused.", verdict="NO TRADE")
+15640-        result["pro_review"]         = _pro_review_neutral_block(
+15641-            "Market closed — live alerts paused.", inst=active_ticker)
+15642-        result["trade_debate"]       = _trade_debate_neutral_block(
+15643-            "Market closed — live alerts paused.")
+15644-        result["confidence_governor"] = _governor_neutral_block(
+15645-            result, reason="Market closed — live alerts paused.")
+15646-        result["trade_memory"]        = _memory_neutral_block(
+15647-            "Market closed — live alerts paused.")
+15648-        result["entry_quality"]       = _entry_quality_neutral_block(
+15649-            "Market closed — live alerts paused.")
+15650-        for _d in ("Long", "Short"):
+15651-            _blk = result["directions"].get(_d)
+15652-            if _blk:
+15653-                _blk.update(ready=False, label="WAIT")
+15654-    # ── SCALP dynamic-exit DIAGNOSTICS (Phase S1 = DISPLAY-ONLY) ──────────────
+15655-    # Computed from the FINAL post-override result so it reflects every WAIT/closed
+15656-    # override above. SCALP-only + flag-gated inside the helper (SWING / disabled →
+15657-    # an inert block, no behaviour change). Direction is the authoritative strict
+15658-    # direction (or the gate's candidate while forming); neutral while closed.
+15659-    _sq_dir = result.get("strict_direction")
+15660-    if not _sq_dir and result.get("market_open"):
+15661-        _sq_dir = strict.get("candidate")
+15662-    if not result.get("market_open"):
+15663-        _sq_dir = None
+15664-    if scalp_quality_block is not None and result.get("market_open"):
+15665-        # A SCALP entry veto fired above and dropped the trade plan; reuse the block
+15666-        # computed from the REAL (pre-veto) plan so the dashboard still shows the
+15667-        # rejected setup's geometry + failing checks.
+15668-        result["scalp_quality"] = scalp_quality_block
+15669-    else:
+15670-        result["scalp_quality"] = compute_scalp_quality(
+15671-            _sq_dir, result.get("current_price"), result.get("vwap_value"),
+15672-            result.get("vwap_status"), result.get("nearest_supply"),
+15673-            result.get("nearest_demand"), result.get("trade_plan"),
+15674-            result.get("edge_score"), instrument_of(active_ticker),
+15675-            (result.get("volatility") or {}).get("atr_pts"),
+15676-        )
+15677-
+15678-    # Adaptive-learning: cache the freshest engine+indicator snapshot per instrument
+15679-    # so a setup that registers right after this can be tagged with its entry context.
+15680-    try:
+15681-        _update_learning_snapshot(result, ticker_override)
+15682-    except Exception:
+15683-        pass
+15684-
+15685-    # ── SWING higher-timeframe context (P2 = DISPLAY-ONLY) ────────────────────
+15686-    # Attached only under SWING + flag (SCALP / flag-off → key absent, byte-identical
+15687-    # to today). REUSES the single `swing_ctx` computed once above so the gate (P4),
+15688-    # the plan target geometry, the preview, and this display surface all read the
+15689-    # SAME context (no drift, no redundant fetch). FAIL-OPEN for display: if the
+15690-    # one-time precompute raised (swing_ctx is None), fall back to a stable schema so
+15691-    # the dashboard still renders. Curated /status whitelisting + the dashboard
+15692-    # module land in P7.
+15693-    if _swing_htf_enabled():
+15694-        result["swing_context"] = swing_ctx if isinstance(swing_ctx, dict) else {
+15695-            "enabled": True, "complete": False, "stale": True, "error": "compute_failed"}
+15696-
+15697-    # ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────
+15698-    # SINGLE computation point, AFTER every verdict override above (open, vetoed and
+15699-    # closed paths all land here) so it always reflects the final result — this also
+15700-    # preserves the single-return-path / hard-index invariant. It only CONSUMES the
+15701-    # already-assembled analyst / debate / governor / memory / volatility / news
+15702-    # blocks (never recomputes them) and has NO veto. Framed around the OPEN
+15703-    # position's direction when one is held, else the favored side. The tiny
+15704-    # prev-confidence store (per-instrument, re-baselined only on a real move) powers
+15705-    # the change narrative — a display-only side effect; goldens never call
+15706-    # full_analysis. FAIL-OPEN so a bug here can never break the gate's result.
+15707-    try:
+15708-        _ar_inst = instrument_of(active_ticker)
+15709-        _ar_pos  = active_trade_for(_ar_inst)
+15710-        _ar_dir  = _ar_pos.get("direction") if isinstance(_ar_pos, dict) else None
+15711-        result["analyst_report"] = compute_analyst_report(
+15712-            result, position_dir=_ar_dir, prev_conf=_analyst_report_prev(_ar_inst))
+15713-        _analyst_report_update_prev(_ar_inst, result["analyst_report"])
+15714-    except Exception as _ar_exc:
+15715-        result["analyst_report"] = _analyst_report_neutral_block(
+15716-            "Analyst report unavailable (%s)." % _ar_exc)
+15717-
+15718-    # ── Fast Entry Trigger (seconds-timing) — DISPLAY-FIRST aggregator ────────
+15719-    # SINGLE computation point AFTER every verdict override above (open / vetoed /
+15720-    # closed paths all land here). CONSUMES ONLY the already-assembled strict output
+15721-    # (never recomputes the gate) plus the fresh micro-event snapshot, and returns
+15722-    # the inert neutral block while closed / off (so it never reads as tradeable).
+15723-    # FAIL-OPEN. The optional money path is wired separately in the single-threaded
+15724-    # webhook worker — this attach is display / state only.
+15725-    try:
+15726-        result["fast_entry"] = _compute_fast_entry_trigger(result, instrument_of(active_ticker))
+15727-    except Exception as _fe_exc:
+15728-        result["fast_entry"] = _fast_entry_neutral("Fast entry unavailable (%s)." % _fe_exc)
+15729-
+15730-    # ── Main Brain (DISPLAY-ONLY) ────────────────────────────────────────────
+15731-    # FINAL synthesis: runs last so it sees every verdict override above (open /
+15732-    # vetoed / closed). It only CONSUMES the assembled blocks (analyst, debate,
+15733-    # entry_quality, volatility, structure, zones, VWAP, edge, trade_plan) plus the
+15734-    # live position — never recomputes, never touches the gate. FAIL-OPEN.
+15735-    try:
+15736-        result["main_brain"] = compute_main_brain(result)
+15737-    except Exception as _mb_exc:
+15738-        result["main_brain"] = _main_brain_neutral("Main Brain unavailable (%s)." % _mb_exc)
+15739-
+15740-    # ── Main Brain Cognitive Upgrade (DISPLAY-ONLY) ──────────────────────────
+15741-    # Continuous-analyst layer, attached AFTER compute_main_brain so it sees the
+15742-    # final verdict + the Main Brain block. Each helper is pure + FAIL-OPEN (its own
+15743-    # try/except → a stable neutral block) and state-aware (neutral / limited when the
+15744-    # market is closed), so attaching the family ONCE here covers the open / vetoed /
+15745-    # closed states without a separate mirror. They only CONSUME the assembled result
+15746-    # (+ cached, capped history SELECTs) — never recompute, never write, never touch
+15747-    # the gate, scoring, sizing, dedupe or the money path. Order matters only for
+15748-    # display cross-references (predictions → narrative; confidence trend → voice).
+15749-    _mb_inst = result.get("active_ticker")
+15750-    try:
+15751-        result["main_brain_predictions"] = compute_main_brain_predictions(result)
+15752-    except Exception as _e:
+15753-        result["main_brain_predictions"] = _main_brain_predictions_neutral("unavailable (%s)" % _e)
+15754-    try:
+15755-        result["confidence_timeline"] = compute_confidence_timeline(_mb_inst)
+15756-    except Exception:
+15757-        result["confidence_timeline"] = _confidence_timeline_neutral()
+15758-    try:
+15759-        result["market_events_timeline"] = compute_market_events_timeline(_mb_inst)
+15760-    except Exception:
+15761-        result["market_events_timeline"] = {"available": False, "events": [], "reason": "unavailable"}
+15762-    try:
+15763-        result["market_narrative"] = compute_market_narrative(result, _mb_inst)
+15764-    except Exception:
+15765-        result["market_narrative"] = _market_narrative_neutral()
+15766-    try:
+15767-        result["session_day_type"] = compute_session_day_type(result)
+15768-    except Exception:
+15769-        result["session_day_type"] = _session_day_type_neutral()
+15770-    try:
+15771-        result["main_brain_learning_stats"] = compute_main_brain_learning_stats()
+15772-    except Exception:
+15773-        result["main_brain_learning_stats"] = {"available": False, "reason": "unavailable"}
+15774-    try:
+15775-        result["main_brain_voice"] = compute_main_brain_voice(result)
+15776-    except Exception:
+15777-        result["main_brain_voice"] = _main_brain_voice_neutral()
+15778-
+15779-    # Main Brain learning loop: capture a NON-actionable (WAIT) setup as a pending
+15780-    # would-have-worked hypothesis. Pure side-effect — never mutates `result`,
+15781-    # gated on the events table being ready, fail-open (no-op in the goldens).
+15782-    try:
+15783-        _maybe_capture_main_brain_snapshot(result)
+15784-    except Exception:
+15785-        pass
+15786-    return result
+15787-
+15788-
+15789-# ---------------------------------------------------------------------------
+15790-# Trade Management v12
+15791-# ---------------------------------------------------------------------------
+15792-
+15793-def compute_pnl(trade, current_price):
+15794-    """Returns (dollar_pnl, points_pnl) for the active trade.
+15795-
+15796-    Uses the trade instrument's OWN point value (MGC $10, MNQ $2, MES $5, MYM
+15797-    $0.50) so PnL is correct per asset. MGC is unchanged (its spec point value IS
+15798-    MGC_POINT_VALUE); MNQ/MES/MYM now book PnL at their real contract multiplier
+15799-    instead of gold's. Falls back to MGC_POINT_VALUE for an unknown symbol.
+15800-    DISPLAY / JOURNAL only — never feeds the gate, sizing, or the broker order.
+15801-    """
+15802-    direction = trade["direction"]
+15803-    entry     = trade["entry_price"]
+15804-    contracts = trade["contracts"]
+15805-    pts = (entry - current_price) if direction == "Short" else (current_price - entry)
+15806-    try:
+15807-        pv = point_value_for(trade.get("symbol") or trade.get("profile") or DEFAULT_INSTRUMENT)
+15808-    except Exception:
+15809-        pv = MGC_POINT_VALUE
+15810-    dollars = pts * pv * contracts
+15811-    return dollars, pts
+15812-
+15813-
+15814-def compute_distances(trade, current_price):
+15815-    """Returns (to_t1, to_t2, to_stop) as positive point distances remaining."""
+15816-    direction = trade["direction"]
+15817-    if direction == "Short":
+15818-        to_t1   = current_price - trade["target1"]
+15819-        to_t2   = current_price - trade["target2"]
+15820-        to_stop = trade["stop_loss"] - current_price
+15821-    else:
+15822-        to_t1   = trade["target1"] - current_price
+15823-        to_t2   = trade["target2"] - current_price
+15824-        to_stop = current_price - trade["stop_loss"]
+15825-    return to_t1, to_t2, to_stop
+15826-
+15827-
+15828-def check_trade_events(trade, current_price):
+15829-    """Returns list of new events: 'T1_HIT', 'T2_HIT', 'STOP_HIT'. Fires each once."""
+15830-    direction = trade["direction"]
+15831-    if direction == "Short":
+15832-        t1_hit   = current_price <= trade["target1"]
+15833-        t2_hit   = current_price <= trade["target2"]
+15834-        stop_hit = current_price >= trade["stop_loss"]
+15835-    else:
+15836-        t1_hit   = current_price >= trade["target1"]
+15837-        t2_hit   = current_price >= trade["target2"]
+15838-        stop_hit = current_price <= trade["stop_loss"]
+15839-
+15840-    events = []
+15841-    if stop_hit:
+15842-        events.append("STOP_HIT")
+15843-    else:
+15844-        # At a fixed 1:1 R:R, target2 mirrors target1 (single exit). Only emit a
+15845-        # distinct T2 event when the plan carries a genuinely deeper second target,
+15846-        # so a 1:1 close books one WIN (T1) instead of double-firing T1 + T2.
+15847-        distinct_t2 = trade.get("target2") != trade.get("target1")
+15848-        if t2_hit and distinct_t2 and not trade.get("t2_hit"):
+15849-            events.append("T2_HIT")
+15850-        if t1_hit and not trade.get("t1_hit"):
+15851-            events.append("T1_HIT")
+15852-    return events
+15853-
+15854-
+15855-def send_trade_event_message(event_type, trade, current_price):
+15856-    """Send a standalone Discord plain-text alert for a trade event."""
+15857-    _url = _discord_url(trade.get("profile", ""))
+15858-    if not _url:
+15859-        return
+15860-    dollar_pnl, pts_pnl = compute_pnl(trade, current_price)
+15861-    pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
+15862-    msgs = {
+15863-        "T1_HIT":   (f"✅ **T1 HIT — WIN**\n"
+15864-                     f"Trade Closed\n"
+15865-                     f"{pnl_str}"),
+15866-        "T2_HIT":   (f"🎯🎯 **T2 HIT**\n"
+15867-                     f"Trade Closed\n"
+15868-                     f"{pnl_str}"),
+15869-        "STOP_HIT": (f"❌ **STOP HIT**\n"
+15870-                     f"Trade Closed\n"
+15871-                     f"{pnl_str}"),
+15872-    }
+15873-    content = msgs.get(event_type, f"Trade event: {event_type}")
+15874-    try:
+15875-        requests.post(_url, json={"content": content}, timeout=5)
+15876-        logger.info("Trade event sent: %s", event_type)
+15877-    except requests.RequestException as exc:
+15878-        logger.error("Trade event Discord send failed: %s", exc)
+15879-
+15880-
+15881-def send_journal_discord_embed(entry):
+15882-    """Post a journal entry to the dedicated trading-journal Discord channel."""
+15883-    if not DISCORD_JOURNAL_WEBHOOK_URL:
+15884-        logger.warning("DISCORD_JOURNAL_WEBHOOK_URL not set — journal Discord post skipped")
+15885-        return
+15886-    # Muted: skip the Discord embed only. The journal RECORD is created separately
+15887-    # (create_journal_entry, post_discord=False), so the dashboard/DB keep it.
+15888-    if _alerts_muted(entry.get("symbol") or entry.get("instrument")):
+15889-        return
+15890-
+15891-    embed = _build_trade_card_embed(entry, f"Journal Entry #{entry['id']}")
+15892-
+15893-    try:
+15894-        resp = requests.post(
+15895-            DISCORD_JOURNAL_WEBHOOK_URL,
+15896-            json={"embeds": [embed]},
+15897-            timeout=10,
+15898-        )
+15899-        if resp.status_code not in (200, 204):
+15900-            logger.warning("Journal Discord post failed: %s %s", resp.status_code, resp.text[:200])
+15901-    except Exception as exc:
+15902-        logger.error("Journal Discord post error: %s", exc)
+15903-
+15904-
+15905-def _build_trade_card_embed(entry, footer_text):
+15906-    """Build the clean trade-card embed shared by the journal channel and the
+15907-    live alert channel. `entry` is the dict produced by _build_card_entry()."""
+15908-    direction_emoji = "📈" if entry["direction"] == "Long" else "📉"
+15909-    # Strength label is driven by the Edge Score (Possible 75-79 / Strong 80-84 / A+ >= 85),
+15910-    # falling back to the strict gate label for legacy entries without one.
+15911-    strength        = entry.get("trade_strength") or entry.get("strict_label", "Possible Trade")
+15912-    strength_disp   = _strength_display(strength)
+15913-    if strength == "A+ Setup":
+15914-        color = 0xFF4500
+15915-    elif strength == "Strong Trade":
+15916-        color = 0x2ECC71
+15917-    else:
+15918-        color = 0xF1C40F
+15919-
+15920-    def _val(v):
+15921-        return str(v) if v not in (None, "") else "—"
+15922-
+15923-    def _lvl(v):
+15924-        try:
+15925-            return f"{float(v):.2f}"
+15926-        except (TypeError, ValueError):
+15927-            return "—"
+15928-
+15929-    def _typed(t, lvl):
+15930-        lvl_str = _lvl(lvl)
+15931-        if t and lvl_str != "—":
+15932-            return f"{t} @ {lvl_str}"
+15933-        return _val(t) if t else lvl_str
+15934-
+15935-    score = entry.get("strict_score")
+15936-    conf_score = f"{score}/{EDGE_SCORE_MAX}" if score not in (None, "") else _val(entry.get("confidence"))
+15937-    why_text = entry.get("why_qualifies") or entry.get("why") or "—"
+15938-    if len(why_text) > 1000:
+15939-        why_text = why_text[:1000] + "…"
+15940-
+15941-    notes_text = entry.get("setup_notes") or "—"
+15942-    if len(notes_text) > 1000:
+15943-        notes_text = notes_text[:1000] + "…"
+15944-
+15945-    # Session focus + next-step lines for the card (Feature: Session Focus).
+15946-    if entry.get("session_preferred"):
+15947-        session_line = (f"✅ Preferred Trading Window: YES "
+15948-                        f"({entry.get('session_window', '—')})\n"
+15949-                        f"Session Bonus: +{entry.get('session_bonus', SESSION_BONUS_POINTS)}")
+15950-    else:
+15951-        session_line = "❌ Preferred Trading Window: NO\nSession Bonus: 0"
+15952-    next_step = entry.get("next_step") or entry.get("stage_next_step") or "—"
+15953-
+15954-    vol      = entry.get("volatility") or {}
+15955-    vol_disp = vol.get("display") if vol.get("status") == "ok" else "—"
+15956-
+15957-    # Display-only Edge Score / Grade / Reasons / Risk block replaces the free-text
+15958-    # AI Analysis field on READY cards; fall back to notes when no breakdown exists.
+15959-    eb = entry.get("edge_breakdown")
+15960-    if eb and (eb.get("reasons") or eb.get("risks") or eb.get("score")):
+15961-        analysis_field = _render_edge_block_field(eb)
+15962-    else:
+15963-        analysis_field = {"name": "🤖 AI Analysis", "value": notes_text, "inline": False}
+15964-
+15965-    tier = entry.get("conviction_tier")
+15966-    tier_disp = f"  ·  Tier: **{tier}**" if tier else ""
+15967-
+15968-    # ── Decision-support header (all real-derived; never fabricated) ──────────
+15969-    ds = entry.get("decision_support") or _decision_support(entry)
+15970-    ds_field = {
+15971-        "name": "🧭 Decision Support",
+15972-        "value": (
+15973-            f"⭐ **Quality:** {ds['quality']}\n"
+15974-            f"🎯 **Probability:** {ds['probability']}%\n"
+15975-            f"⚠️ **Risk:** {ds['risk']}\n"
+15976-            f"💰 **Reward:** {ds['reward']}\n"
+15977-            f"🪟 **Trade Window:** {ds['trade_window']}\n"
+15978-            f"✅ **Recommendation:** {ds['recommendation']}"
+15979-        ),
+15980-        "inline": False,
+15981-    }
+15982-    # ── Per-direction gate diagnostics (the SAME numbers that drove the gate) ──
+15983-    diag_field = {
+15984-        "name": "🔬 Diagnostics",
+15985-        "value": (
+15986-            f"Long {_val(entry.get('long_score'))} · Short {_val(entry.get('short_score'))} · "
+15987-            f"Gap {_val(entry.get('conflict_gap'))} · Dominant {_val(entry.get('dominant_direction'))}\n"
+15988-            f"Edge {_val(entry.get('edge_score'))} · ATR {_val(entry.get('current_atr'))} · "
+15989-            f"Vol× {_val(entry.get('volatility_multiplier'))}"
+15990-        ),
+15991-        "inline": False,
+15992-    }
+15993-    embed = {
+15994-        "author":      {"name": f"{BOT_NAME} · {strength_disp} Detected"},
+15995-        "title":       f"📓 {entry['symbol']} {direction_emoji} {entry['direction']}",
+15996-        "description": f"**{strength_disp}**  ·  Verdict: **{entry['verdict']}**{tier_disp}",
+15997-        "color":       color,
+15998-        "timestamp":   entry["datetime"],
+15999-        "fields": [
+16000-            ds_field,
+16001-            diag_field,
+16002-            {"name": "📊 Instrument",          "value": _val(entry.get("symbol")),    "inline": True},
+16003-            {"name": "🕐 Time",                "value": fmt_et(entry["datetime"], "%Y-%m-%d %H:%M:%S ET"), "inline": True},
+16004-            {"name": "🧭 Direction",           "value": f"{direction_emoji} {entry['direction']}", "inline": True},
+16005-            {"name": "🏗️ BOS Type",            "value": _typed(entry.get("bos_type"), entry.get("bos_level")), "inline": True},
+16006-            {"name": "🔀 CHOCH Type",          "value": _typed(entry.get("choch_type"), entry.get("choch_level")), "inline": True},
+16007-            {"name": "📐 Entry",               "value": _val(entry.get("entry_zone")), "inline": True},
+16008-            {"name": "🛑 Stop Loss",           "value": _val(entry.get("stop_loss")),  "inline": True},
+16009-            {"name": "🎯 Take Profit",         "value": _val(entry.get("target1")),    "inline": True},
+16010-            {"name": "📏 Risk Distance",       "value": (f"{entry.get('risk_points')} pts" if entry.get('risk_points') is not None else "—"), "inline": True},
+16011-            {"name": "💯 Confidence Score",    "value": conf_score,                   "inline": True},
+16012-            {"name": "📈 VWAP",                "value": _val(entry.get("vwap_position")), "inline": True},
+16013-            {"name": "🧱 Zone",                "value": _val(entry.get("supply_demand_zone")), "inline": True},
+16014-            {"name": "📉 Volatility",          "value": _val(vol_disp),              "inline": True},
+16015-            {"name": "🗓️ Session",            "value": session_line,                "inline": False},
+16016-            analysis_field,
+16017-            {"name": "📝 Setup Notes",         "value": notes_text,                  "inline": False},
+16018-            {"name": "💬 Why the Trade Qualifies", "value": why_text,                 "inline": False},
+16019-            {"name": "➡️ Next Step",           "value": next_step,                   "inline": False},
+16020-        ],
+16021-        "footer": {"text": footer_text},
+16022-    }
+16023-
+16024-    # ── Additive: 📋 Trade Management block (Feature 1). Built defensively so a
+16025-    # missing plan simply omits the field and never breaks the existing card. ──
+16026-    try:
+16027-        mgmt_lines = []
+16028-        if entry.get("target3") not in (None, ""):
+16029-            mgmt_lines.append(f"🎯 TP3: {entry['target3']}")
+16030-        if entry.get("be_level") not in (None, ""):
+16031-            mgmt_lines.append(f"🟰 Move stop to BE: {entry['be_level']}")
+16032-        if entry.get("partial_level") not in (None, ""):
+16033-            mgmt_lines.append(f"💰 Partial: {entry['partial_level']}")
+16034-        if entry.get("runner_target") not in (None, ""):
+16035-            mgmt_lines.append(f"🏃 Runner: {entry['runner_target']}")
+16036-        rdc = entry.get("risk_dollars_per_contract")
+16037-        if rdc is not None:
+16038-            # Expected profit per contract == dollar risk × planned R:R (1:1 legacy,
+16039-            # 1:2 SCALP RR2, 1:4 ORB). Derive from the plan so the card never drifts
+16040-            # from the real broker target. The 1:1 branch is byte-identical to before.
+16041-            _card_rr_valid = True
+16042-            try:
+16043-                _card_rr = float(entry.get("rr_num"))
+16044-            except (TypeError, ValueError):
+16045-                _card_rr = 1.0
+16046-                _card_rr_valid = False
+16047-            if _card_rr <= 0:
+16048-                _card_rr = 1.0
+16049-                _card_rr_valid = False
+16050-            # On a bad rr_num fail open to a coherent 1:1 (label + profit together),
+16051-            # never a stale non-1:1 label paired with a 1R profit.
+16052-            _card_rr_lbl = (entry.get("rr") or f"1:{_card_rr:g}") if _card_rr_valid else "1:1"
+16053-            if _card_rr == 1.0:
+16054-                _card_profit = rdc
+16055-            else:
+16056-                try:
+16057-                    _card_profit = round(float(rdc) * _card_rr, 2)
+16058-                except (TypeError, ValueError):
+16059-                    _card_profit = rdc
+16060-            mgmt_lines.append(f"⚖️ R:R {_card_rr_lbl} · Dollar Risk ${rdc}/ct · Expected Profit ${_card_profit}/ct")
+16061-        if entry.get("atr_pts") is not None:
+16062-            mgmt_lines.append(
+16063-                f"📏 ATR Stop: {entry.get('atr_pts')} pts × {entry.get('atr_multiplier')} "
+16064-                f"→ {entry.get('stop_distance_ticks')} ticks "
+16065-                f"(${entry.get('risk_dollars_per_contract')}/contract)")
+16066-        if entry.get("max_invalidation"):
+16067-            mgmt_lines.append(f"🚫 Invalidation: {entry['max_invalidation']}")
+16068-        if mgmt_lines:
+16069-            embed["fields"].append({"name": "📋 Trade Management",
+16070-                                    "value": "\n".join(mgmt_lines)[:1024],
+16071-                                    "inline": False})
+16072-    except Exception as exc:
+16073-        logger.error("Trade-management card block error: %s", exc)
+16074-
+16075-    # ── Additive: 🎓 Professional Review field (display-only; pre-READY pro grade).
+16076-    # Mirrors the dashboard's ACTIVE model verdict on the live card. Built
+16077-    # defensively so a missing/neutral block simply omits the field. ──
+16078-    try:
+16079-        pr = entry.get("pro_review") or {}
+16080-        if pr.get("engine_enabled"):
+16081-            act = pr.get("active") or {}
+16082-            grade = act.get("grade")
+16083-            if grade and grade != "—":
+16084-                hard = act.get("hard_fails") or []
+16085-                pr_lines = [
+16086-                    f"🧠 Model: **{pr.get('selected_model', '—')}**  ·  "
+16087-                    f"Grade: **{grade}**  ·  Eff: **{act.get('entry_efficiency', '—')}/100**",
+16088-                    f"🌐 Market: {act.get('market_type', '—')}  ·  "
+16089-                    f"Chase Risk: {act.get('chase_risk', '—')}  ·  "
+16090-                    f"Decision: {act.get('professional_decision', '—')}",
+16091-                ]
+16092-                if hard:
+16093-                    pr_lines.append("⛔ Hard fails: " + "; ".join(str(h) for h in hard[:3]))
+16094-                gate_note = "VETO ARMED" if pr.get("gate_enabled") else "display-only"
+16095-                pr_lines.append(f"_Pro Review · {gate_note}_")
+16096-                embed["fields"].append({"name": "🎓 Professional Review",
+16097-                                        "value": "\n".join(pr_lines)[:1024],
+16098-                                        "inline": False})
+16099-    except Exception as exc:
+16100-        logger.error("Pro-review card block error: %s", exc)
+16101-
+16102-    # ── Additive: 🧠 Trade Debate field (display-only; Bull vs Bear vs Judge).
+16103-    # Summarizes the pre-READY debate on the live card BEFORE issuing READY. Built
+16104-    # defensively so a missing / neutral / disabled block simply omits the field. ──
+16105-    try:
+16106-        td = entry.get("trade_debate") or {}
+16107-        if td.get("engine_enabled"):
+16108-            jd   = td.get("judge") or {}
+16109-            bull = td.get("bull") or {}
+16110-            bear = td.get("bear") or {}
+16111-            td_lines = [
+16112-                "🟢 Bull **%s** vs 🔴 Bear **%s**  ·  Winner: **%s** (gap %s)"
+16113-                % (bull.get("confidence", "—"), bear.get("confidence", "—"),
+16114-                   jd.get("winning_side", "—"), jd.get("confidence_gap", "—")),
+16115-                "⚖️ Judge: **%s**  ·  %s"
+16116-                % (jd.get("final_verdict", "—"), jd.get("reason_winner_won", "")),
+16117-            ]
+16118-            gate_note = "VETO ARMED" if td.get("gate_enabled") else "display-only"
+16119-            td_lines.append("_Trade Debate · %s_" % gate_note)
+16120-            embed["fields"].append({"name": "🧠 Trade Debate",
+16121-                                    "value": "\n".join(td_lines)[:1024],
+16122-                                    "inline": False})
+16123-    except Exception as exc:
+16124-        logger.error("Trade-debate card block error: %s", exc)
+16125-
+16126-    # Attach the chart screenshot when a validated public URL is present.
+16127-    shot = entry.get("screenshot_url")
+16128-    if shot:
+16129-        embed["image"] = {"url": shot}
+16130-
+16131-    return embed
+16132-
+16133-
+16134-def send_live_ready_card(entry, ticker="", notify=False):
+16135-    """Post the clean trade-card to the LIVE alert channel when a setup is READY.
+16136-    Routed per-instrument via _discord_url() (MNQ → MNQ channel, else default).
+16137-
+16138-    notify=True prepends DISCORD_ALERT_MENTION (e.g. @everyone) so the message
+16139-    pings phones set to "Only @mentions". Used ONLY for the instant first post of
+16140-    a fresh setup; the 5-min re-post loop calls with notify=False so a standing
+16141-    READY setup buzzes the phone once, not every interval.
+16142-
+16143-    Returns True iff the main live-card Discord POST was actually DISPATCHED (the
+16144-    URL is set AND the instrument is not muted), so callers count only a real alert
+16145-    (alert_sent_at / alerts_sent). When the instrument is muted the two Discord
+16146-    POSTs are skipped but every TRACKING side-effect still runs — throttle stamps,
+16147-    _register_managed_trade and the LAST_READY snapshot — so a muted instrument is
+16148-    evaluated and tracked exactly like an un-muted one, just silently."""
+16149-    url = _discord_url(ticker or entry.get("symbol", ""))
+16150-    if not url:
+16151-        logger.warning("DISCORD_WEBHOOK_URL not set — live ready card skipped")
+16152-        return False
+16153-    # Checked at SEND time (most up-to-date) — suppresses ONLY the two Discord
+16154-    # POSTs below, never the tracking that follows.
+16155-    muted = _alerts_muted(ticker or entry.get("symbol", ""))
+16156-    footer = f"Live Signal · {entry.get('symbol') or ticker or '—'}"
+16157-    # Record the send time per-instrument so the periodic loop throttles against it
+16158-    # (prevents an instant card and a periodic card landing seconds apart).
+16159-    LAST_LIVE_CARD_AT[instrument_of(ticker or entry.get("symbol", ""))] = datetime.now(timezone.utc)
+16160-    # Additive: record the READY send time per-instrument for the Diagnostics
+16161-    # readyAlertTime / waitedForCandleClose fields (display-only; never gates).
+16162-    LAST_READY_SENT_AT[instrument_of(ticker or entry.get("symbol", ""))] = datetime.now(timezone.utc)
+16163-    # Build + post inside the guard so a render failure (e.g. an unforeseen new
+16164-    # card field) can never raise into the caller — the alert path stays fail-open.
+16165-    embed = None
+16166-    dispatched = False
+16167-    if not muted:
+16168-        try:
+16169-            embed = _build_trade_card_embed(entry, footer)
+16170-            payload = {"embeds": [embed]}
+16171-            if notify and DISCORD_ALERT_MENTION:
+16172-                # The single phone-pinging message: prepend the mention and allow it
+16173-                # so a "Only @mentions" device buzzes exactly on a fresh READY setup.
+16174-                payload["content"] = DISCORD_ALERT_MENTION
+16175-                payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
+16176-            resp = requests.post(url, json=payload, timeout=10)
+16177-            dispatched = True
+16178-            if resp.status_code not in (200, 204):
+16179-                logger.warning("Live ready card post failed: %s %s", resp.status_code, resp.text[:200])
+16180-        except Exception as exc:
+16181-            logger.error("Live ready card build/post error: %s", exc)
+16182-        # Optionally mirror 🔥 A+ setups to a dedicated channel (additive — the card
+16183-        # already posted to the normal channel above, so this never blocks/relocates
+16184-        # Possible/Strong/A+ alerts). Skipped entirely when no A+ channel is set.
+16185-        try:
+16186-            if (embed is not None and entry.get("trade_strength") == "A+ Setup"
+16187-                    and DISCORD_APLUS_WEBHOOK_URL and DISCORD_APLUS_WEBHOOK_URL != url):
+16188-                requests.post(DISCORD_APLUS_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+16189-        except Exception as exc:
+16190-            logger.error("A+ channel mirror error: %s", exc)
+16191-    else:
+16192-        logger.info("Live ready card suppressed (alerts muted): %s",
+16193-                    instrument_of(ticker or entry.get("symbol", "")))
+16194-    # ── Additive: register the setup with the trade-management watcher and store
+16195-    # the latest READY snapshot (for /why). Both fail-open so a hiccup here can
+16196-    # never block the alert that already posted above. These run REGARDLESS of mute
+16197-    # so a muted instrument stays fully tracked (no data gap). ──
+16198-    try:
+16199-        _register_managed_trade(entry, ticker)
+16200-    except Exception as exc:
+16201-        logger.error("Managed-trade register error: %s", exc)
+16202-    try:
+16203-        LAST_READY_BY_TICKER[instrument_of(ticker or entry.get("symbol", ""))] = entry
+16204-    except Exception as exc:
+16205-        logger.error("LAST_READY snapshot error: %s", exc)
+16206-    return dispatched
+16207-
+16208-
+16209-# ── Tiered WATCH/ARMED early alerts (SCALP) ───────────────────────────────────
+16210-# Per-instrument throttle state: the last tier level we dispatched/observed and
+16211-# when the last WATCH/ARMED post went out. A level fires once on TRANSITION (the
+16212-# level changed) and then at most once per WATCH_ARMED_COOLDOWN_SEC while it
+16213-# persists, so a standing WATCH/ARMED never spams on every webhook.
+16214-LAST_TIER_LEVEL = {}   # instrument -> last alert_level seen ("WATCH"/"ARMED"/"READY")
+16215-LAST_TIER_AT    = {}   # instrument -> datetime (UTC) of last WATCH/ARMED post attempt
+16216-
+16217-# SETUP BUILDING throttle state (SCALP only): the informational "setup building"
+16218-# heads-up posts once when an instrument ENTERS the building band and then at most
+16219-# once per SETUP_BUILDING_COOLDOWN_SEC while it persists, so it never spams.
+16220-LAST_BUILDING_AT = {}  # instrument -> datetime (UTC) of last SETUP BUILDING post attempt
+16221-
+16222-# ── EARLY pre-READY alert runtime state (additive, display-only) ──────────────
+16223-LAST_EARLY_ANCHOR  = {}  # (instrument, direction) -> structure-anchor ISO already EARLY-alerted (per-setup dedupe)
+16224-LAST_EARLY_AT      = {}  # (instrument, direction) -> datetime (UTC) of last EARLY post (cooldown guard)
+16225-EARLY_EVENT_TIMES  = {}  # instrument -> latest event/alert timestamps (ISO) for the Diagnostics page
+16226-LAST_READY_SENT_AT = {}  # instrument -> datetime (UTC) the READY card last fired (Diagnostics readyAlertTime)
+16227-
+16228-
+16229-def _tiered_alert_url(inst):
+16230-    """Resolve the Discord channel for WATCH/ARMED early alerts. DEFAULT routes to
+16231-    the journal channel so the main signal channel stays READY-only; switchable via
+16232-    TIERED_ALERT_CHANNEL = journal (default) | main | none (none disables posting).
+16233-    Falls back to the instrument's main channel if the journal URL is unset."""
+16234-    channel = os.environ.get("TIERED_ALERT_CHANNEL", "journal").strip().lower()
+16235-    if channel == "none":
+16236-        return None
+16237-    if channel == "main":
+16238-        return _discord_url(inst)
+16239-    return DISCORD_JOURNAL_WEBHOOK_URL or _discord_url(inst)
+16240-
+16241-
+16242-def _build_tiered_embed(a, inst, level):
+16243-    """Compact WATCH/ARMED early-alert embed. DISPLAY-ONLY — it announces that price
+16244-    has reached a fresh trade-side zone (WATCH) and is gathering confirmations
+16245-    (ARMED) BEFORE a full READY, so the strict trade card stays the single READY
+16246-    signal. Everything shown is read from the analysis `a` (never fabricated)."""
+16247-    cand   = a.get("gate_candidate") or "—"
+16248-    gd     = a.get("gate_debug") or {}
+16249-    price  = a.get("current_price")
+16250-    zone   = a.get("nearest_demand") if cand == "Long" else a.get("nearest_supply")
+16251-    confs  = int(gd.get("confirmations_passed") or 0)
+16252-    needed = int(gd.get("confirmations_needed") or 0)
+16253-    edge   = a.get("edge_score", 0)
+16254-    grade  = a.get("edge_grade", "")
+16255-    side_word = "demand" if cand == "Long" else "supply"
+16256-    title_emoji, color = {
+16257-        "WATCH":           ("👀 WATCH", 0xF1C40F),
+16258-        "ARMED":           ("🎯 ARMED", 0xE67E22),
+16259-        "WATCH FOR ENTRY": ("⚡ WATCH FOR ENTRY", 0x3498DB),
+16260-    }.get(level, ("👀 WATCH", 0xF1C40F))
+16261-    # What still blocks READY (the gate's own failed conditions), conflict aside.
+16262-    missing = [m for m in (a.get("strict_missing") or []) if m != "conflicting_structure"]
+16263-    fields = [
+16264-        {"name": "Setup",         "value": f"{cand} · at {side_word} zone", "inline": True},
+16265-        {"name": "Edge",          "value": f"{edge}/{EDGE_SCORE_MAX}{(' · ' + grade) if grade else ''}", "inline": True},
+16266-        {"name": "Confirmations", "value": f"{confs}/{needed}", "inline": True},
+16267-    ]
+16268-    if price is not None:
+16269-        fields.append({"name": "Price", "value": f"{price:,.2f}", "inline": True})
+16270-    if zone:
+16271-        fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
+16272-    if missing:
+16273-        fields.append({"name": "Still needs", "value": ", ".join(missing[:4]), "inline": False})
+16274-    # Per-direction gate diagnostics (real numbers; display-only) so the early
+16275-    # alert carries the same transparency as the READY card.
+16276-    _dv = lambda v: v if v not in (None, "") else "—"
+16277-    fields.append({
+16278-        "name": "Diagnostics",
+16279-        "value": (f"L {_dv(a.get('long_score'))} · S {_dv(a.get('short_score'))} · "
+16280-                  f"Gap {_dv(a.get('conflict_gap'))} · Edge {edge} · "
+16281-                  f"ATR {_dv(a.get('current_atr'))} · Vol× {_dv(a.get('volatility_multiplier'))}"),
+16282-        "inline": False,
+16283-    })
+16284-    tail = {
+16285-        "WATCH FOR ENTRY": "confirmations in — waiting on one decisive trigger (BOS/CHOCH/rejection candle/VWAP) to go READY.",
+16286-        "ARMED":           "gathering confirmations.",
+16287-    }.get(level, "watching for confirmation.")
+16288-    return {
+16289-        "title":       f"{title_emoji} · {inst}",
+16290-        "description": f"Price is at a fresh {side_word} zone — {tail}",
+16291-        "color":       color,
+16292-        "fields":      fields,
+16293-        "footer":      {"text": f"Early Signal · {inst}"},
+16294-        "timestamp":   datetime.now(timezone.utc).isoformat(),
+16295-    }
+16296-
+16297-
+16298-def _post_tiered_embed(url, embed, inst, level):
+16299-    """Slow-task worker body: POST a prebuilt WATCH/ARMED embed to Discord. Runs OFF
+16300-    the webhook worker (via _enqueue_slow) so a slow or timing-out Discord call can
+16301-    never delay the decision, the READY card, the journal enqueue, or the next
+16302-    webhook evaluation. Best-effort — logs and swallows any failure."""
+16303-    # Muted-instrument choke point (covers WATCH/ARMED + SETUP BUILDING enqueues).
+16304-    if _alerts_muted(inst):
+16305-        return
+16306-    try:
+16307-        resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
+16308-        if resp.status_code not in (200, 204):
+16309-            logger.warning("Tiered %s alert post failed (%s): %s %s",
+16310-                           level, inst, resp.status_code, resp.text[:200])
+16311-    except Exception as exc:
+16312-        logger.error("Tiered %s alert post error (%s): %s", level, inst, exc)
+16313-
+16314-
+16315-def _maybe_send_tiered_alert(a, record):
+16316-    """Fire a WATCH/ARMED early alert (SCALP only, ENABLE_TIERED_ALERTS) for the
+16317-    analysis `a`. Throttled per instrument: a level posts on transition (changed
+16318-    from the last level) OR after WATCH_ARMED_COOLDOWN_SEC while it persists.
+16319-    READY is NOT posted here (the live card owns it) but is recorded so a later
+16320-    retreat to ARMED/WATCH counts as a fresh transition.
+16321-
+16322-    The throttle state and embed are computed synchronously, but the Discord POST
+16323-    is OFFLOADED to the slow-task worker, so this never blocks the webhook worker.
+16324-    Returns True iff a WATCH/ARMED embed was enqueued for posting. Fail-open: never
+16325-    raises into the webhook tail."""
+16326-    if not cfg("ENABLE_TIERED_ALERTS"):
+16327-        return False
+16328-    level = a.get("alert_level")
+16329-    inst  = instrument_of(record.get("ticker") or record.get("instrument")
+16330-                          or a.get("active_ticker") or "")
+16331-    if not inst:
+16332-        return False
+16333-    # Muted: skip the tiered WATCH/ARMED early alert entirely — no enqueue and not
+16334-    # counted as sent (tiered_sent stays False). The instrument was still evaluated
+16335-    # above; only the Discord teaser is suppressed.
+16336-    if _alerts_muted(inst):
+16337-        return False
+16338-
+16339-    # READY: record (so a later ARMED/WATCH is a transition) but let the live card post it.
+16340-    if level == "READY":
+16341-        LAST_TIER_LEVEL[inst] = "READY"
+16342-        return False
+16343-    # No tier: forget the standing level so the next early alert fires immediately.
+16344-    if level not in ("WATCH", "ARMED", "WATCH FOR ENTRY"):
+16345-        LAST_TIER_LEVEL.pop(inst, None)
+16346-        LAST_TIER_AT.pop(inst, None)
+16347-        return False
+16348-
+16349-    now           = datetime.now(timezone.utc)
+16350-    last_at       = LAST_TIER_AT.get(inst)
+16351-    cooldown      = int(cfg("WATCH_ARMED_COOLDOWN_SEC"))
+16352-    is_transition = (level != LAST_TIER_LEVEL.get(inst))
+16353-    cooled_down   = (last_at is None or (now - last_at).total_seconds() >= cooldown)
+16354-    if not (is_transition or cooled_down):
+16355-        return False
+16356-
+16357-    # Record the attempt up-front (level + time) so a transient post failure can't
+16358-    # turn into a per-webhook retry storm; the next attempt waits for the cooldown.
+16359-    LAST_TIER_LEVEL[inst] = level
+16360-    LAST_TIER_AT[inst]    = now
+16361-    url = _tiered_alert_url(inst)
+16362-    if not url:
+16363-        return False
+16364-    # Build the embed synchronously (fast, in-memory) but hand the Discord POST to
+16365-    # the slow-task worker so a slow/timing-out call can't block this worker.
+16366-    try:
+16367-        embed = _build_tiered_embed(a, inst, level)
+16368-    except Exception as exc:
+16369-        logger.error("Tiered alert build error (%s/%s): %s", inst, level, exc)
+16370-        return False
+16371-    _enqueue_slow(lambda u=url, e=embed, i=inst, lv=level: _post_tiered_embed(u, e, i, lv))
+16372-    return True
+16373-
+16374-
+16375-def _build_setup_building_embed(a, inst):
+16376-    """Compact informational SETUP BUILDING embed (SCALP only). NON-actionable — it
+16377-    announces that a valid fresh zone + confirming structure are present and the Edge
+16378-    is climbing toward the READY floor, BEFORE a tradeable setup exists. Everything
+16379-    shown is read from the analysis `a` (never fabricated); there is NO trade plan."""
+16380-    cand   = a.get("gate_candidate") or "—"
+16381-    gd     = a.get("gate_debug") or {}
+16382-    price  = a.get("current_price")
+16383-    zone   = a.get("nearest_demand") if cand == "Long" else a.get("nearest_supply")
+16384-    edge   = a.get("edge_score", 0)
+16385-    need   = int(gd.get("ready_threshold") or cfg("EDGE_READY_THRESHOLD") or 0)
+16386-    side_word = "demand" if cand == "Long" else "supply"
+16387-    missing = [m for m in (a.get("strict_missing") or []) if m != "conflicting_structure"]
+16388-    fields = [
+16389-        {"name": "Setup",     "value": f"{cand} · at {side_word} zone", "inline": True},
+16390-        {"name": "Edge",      "value": f"{edge}/{EDGE_SCORE_MAX} (need ≥ {need})", "inline": True},
+16391-    ]
+16392-    if price is not None:
+16393-        fields.append({"name": "Price", "value": f"{price:,.2f}", "inline": True})
+16394-    if zone:
+16395-        fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
+16396-    if missing:
+16397-        fields.append({"name": "Still needs", "value": ", ".join(missing[:4]), "inline": False})
+16398-    return {
+16399-        "title":       f"🏗️ SETUP BUILDING · {inst}",
+16400-        "description": (f"A {cand} setup is forming at a fresh {side_word} zone — Edge is "
+16401-                       f"climbing toward READY. Informational only — **not a trade yet.**"),
+16402-        "color":       0x95A5A6,
+16403-        "fields":      fields,
+16404-        "footer":      {"text": f"Setup Building · {inst} · non-actionable"},
+16405-        "timestamp":   datetime.now(timezone.utc).isoformat(),
+16406-    }
+16407-
+16408-
+16409-def _maybe_send_setup_building_alert(a, record):
+16410-    """Fire the informational SETUP BUILDING heads-up (SCALP only) for analysis `a`.
+16411-    Throttled per instrument: posts once when the instrument ENTERS the building band
+16412-    and then at most once per SETUP_BUILDING_INTERVAL while it persists; the standing
+16413-    state is cleared the moment the verdict leaves SETUP BUILDING, so the next build
+16414-    fires immediately.
+16415-
+16416-    NON-actionable: this never builds a trade plan, never touches the verdict, the
+16417-    journal, or managed trades — purely a display heads-up. The Discord POST is
+16418-    OFFLOADED to the slow-task worker so it never blocks the webhook worker. Returns
+16419-    True iff an embed was enqueued. Fail-open: never raises into the webhook tail."""
+16420-    inst = instrument_of(record.get("ticker") or record.get("instrument")
+16421-                         or a.get("active_ticker") or "")
+16422-    if not inst:
+16423-        return False
+16424-    # Only the SCALP-only informational verdict fires here. Any other verdict clears
+16425-    # the standing throttle so a later build is treated as a fresh entry.
+16426-    if a.get("verdict") != "SETUP BUILDING":
+16427-        LAST_BUILDING_AT.pop(inst, None)
+16428-        return False
+16429-    now      = datetime.now(timezone.utc)
+16430-    last_at  = LAST_BUILDING_AT.get(inst)
+16431-    cooled   = (last_at is None or (now - last_at).total_seconds() >= SETUP_BUILDING_INTERVAL)
+16432-    if not cooled:
+16433-        return False
+16434-    # Record the attempt up-front so a transient post failure can't turn into a
+16435-    # per-webhook retry storm; the next attempt waits for the interval.
+16436-    LAST_BUILDING_AT[inst] = now
+16437-    url = _tiered_alert_url(inst)
+16438-    if not url:
+16439-        return False
+16440-    try:
+16441-        embed = _build_setup_building_embed(a, inst)
+16442-    except Exception as exc:
+16443-        logger.error("Setup-building alert build error (%s): %s", inst, exc)
+16444-        return False
+16445-    _enqueue_slow(lambda u=url, e=embed, i=inst: _post_tiered_embed(u, e, i, "SETUP BUILDING"))
+16446-    return True
+16447-
+16448-
+16449-# ── EARLY intrabar pre-READY alerts (additive, DISPLAY-ONLY) ──────────────────
+16450-def _early_latest_ts(alert_history, alert_type, inst, ticker_scoped, cutoff):
+16451-    """Most recent UTC timestamp of `alert_type` for `inst` at/after `cutoff`, using
+16452-    the SAME instrument-scoping as evaluate_strict_setup._latest_ts (un-prefixed
+16453-    CHOCH/BOS/HH.. are scoped by the instrument resolved at ingestion; sweep types
+16454-    embed the instrument in their name). None if absent. Read-only."""
+16455-    latest = None
+16456-    for a in alert_history:
+16457-        if a.get("alert_type") != alert_type:
+16458-            continue
+16459-        if not ticker_scoped:
+16460-            a_inst = (a.get("instrument")
+16461-                      or _instrument_from_text(a.get("ticker"))
+16462-                      or _instrument_from_text(a.get("alert_type")))
+16463-            if a_inst != inst:
+16464-                continue
+16465-        try:
+16466-            ts = datetime.fromisoformat(a["timestamp"])
+16467-        except (KeyError, ValueError):
+16468-            continue
+16469-        if ts < cutoff:
+16470-            continue
+16471-        if latest is None or ts > latest:
+16472-            latest = ts
+16473-    return latest
+16474-
+16475-
+16476-def _early_event_times(inst, alert_history):
+16477-    """Scan ALERT_HISTORY (within EARLY_WINDOW_MIN) for the EARLY building blocks of
+16478-    each direction: a liquidity sweep + a structure shift. 'displacement' maps to
+16479-    impulsive structure (BOS / HH-HL-LH-LL) and 'choch' to CHOCH; 'structure' is
+16480-    the latest of the two. event_start is the first of (sweep, structure). All
+16481-    times are server-ingestion timestamps (no bar time is in the payload). Pure /
+16482-    read-only — never feeds the gate."""
+16483-    cutoff = now_utc() - timedelta(minutes=EARLY_WINDOW_MIN)
+16484-    def lt(t, scoped=False):
+16485-        return _early_latest_ts(alert_history, t, inst, scoped, cutoff)
+16486-    def _max(*xs):
+16487-        xs = [x for x in xs if x]
+16488-        return max(xs) if xs else None
+16489-    def _min(*xs):
+16490-        xs = [x for x in xs if x]
+16491-        return min(xs) if xs else None
+16492-    bear_sweep   = lt(f"{inst} BEARISH SWEEP", True)
+16493-    choch_sup    = lt("CHOCH SUPPLY")
+16494-    short_disp   = _max(lt("BOS SUPPLY"), lt("LH"), lt("LL"))
+16495-    short_struct = _max(choch_sup, short_disp)
+16496-    bull_sweep   = lt(f"{inst} BULLISH SWEEP", True)
+16497-    choch_dem    = lt("CHOCH DEMAND")
+16498-    long_disp    = _max(lt("BOS DEMAND"), lt("HH"), lt("HL"))
+16499-    long_struct  = _max(choch_dem, long_disp)
+16500-    return {
+16501-        "Short": {"sweep": bear_sweep, "choch": choch_sup, "displacement": short_disp,
+16502-                  "structure": short_struct, "event_start": _min(bear_sweep, short_struct)},
+16503-        "Long":  {"sweep": bull_sweep, "choch": choch_dem, "displacement": long_disp,
+16504-                  "structure": long_struct, "event_start": _min(bull_sweep, long_struct)},
+16505-    }
+16506-
+16507-
+16508-def _early_alert_url(inst):
+16509-    """Resolve the Discord channel for EARLY alerts. EARLY_ALERT_CHANNEL =
+16510-    main (default, the live signal channel) | journal | none (disables)."""
+16511-    if EARLY_ALERT_CHANNEL == "none":
+16512-        return None
+16513-    if EARLY_ALERT_CHANNEL == "journal":
+16514-        return DISCORD_JOURNAL_WEBHOOK_URL or _discord_url(inst)
+16515-    return _discord_url(inst)
+16516-
+16517-
+16518-def _build_early_embed(a, inst, direction, t):
+16519-    """Compact ⚡ EARLY LONG/SHORT embed. DISPLAY-ONLY — announces an early,
+16520-    UNCONFIRMED entry (sweep + structure shift) that fired before the candle close,
+16521-    with the confirmed READY card still to follow. Everything is read from the
+16522-    analysis `a` / event times `t`, never fabricated."""
+16523-    price     = a.get("current_price")
+16524-    side_word = "supply" if direction == "Short" else "demand"
+16525-    zone      = a.get("nearest_supply") if direction == "Short" else a.get("nearest_demand")
+16526-    bias_word = "bearish" if direction == "Short" else "bullish"
+16527-    title, color = (("⚡ EARLY SHORT", 0xE74C3C) if direction == "Short"
+16528-                    else ("⚡ EARLY LONG", 0x2ECC71))
+16529-    def et(ts):
+16530-        return fmt_et(ts, "%H:%M:%S ET") if ts else "—"
+16531-    fields = [
+16532-        {"name": "Trigger", "value": f"Liquidity sweep + {bias_word} structure (CHOCH/displacement)", "inline": False},
+16533-    ]
+16534-    if price is not None:
+16535-        fields.append({"name": "Price", "value": f"{price:,.2f}", "inline": True})
+16536-    if zone:
+16537-        fields.append({"name": f"{side_word.title()} zone", "value": f"{zone:,.2f}", "inline": True})
+16538-    fields.append({"name": "Sweep",     "value": et(t.get("sweep")),     "inline": True})
+16539-    fields.append({"name": "Structure", "value": et(t.get("structure")), "inline": True})
+16540-    # Per-direction gate diagnostics (real numbers; display-only).
+16541-    _dv = lambda v: v if v not in (None, "") else "—"
+16542-    fields.append({
+16543-        "name": "Diagnostics",
+16544-        "value": (f"L {_dv(a.get('long_score'))} · S {_dv(a.get('short_score'))} · "
+16545-                  f"Gap {_dv(a.get('conflict_gap'))} · Edge {_dv(a.get('edge_score'))} · "
+16546-                  f"ATR {_dv(a.get('current_atr'))} · Vol× {_dv(a.get('volatility_multiplier'))}"),
+16547-        "inline": False,
+16548-    })
+16549-    return {
+16550-        "title":       f"{title} · {inst}",
+16551-        "description": "Early, *unconfirmed* entry — fired before the candle close. "
+16552-                       "The confirmed READY card follows if it holds.",
+16553-        "color":       color,
+16554-        "fields":      fields,
+16555-        "footer":      {"text": f"Early Signal · {inst} · not a confirmed READY"},
+16556-        "timestamp":   datetime.now(timezone.utc).isoformat(),
+16557-    }
+16558-
+16559-
+16560-def _post_early_embed(url, embed, inst, direction, ping):
+16561-    """Slow-task worker body: POST a prebuilt EARLY embed to Discord, OFF the
+16562-    webhook worker (via _enqueue_slow) so a slow/timing-out call can never delay the
+16563-    decision, the READY card, or the next webhook. Best-effort — swallows failures."""
+16564-    # Muted: suppress the EARLY teaser send (dedupe/diagnostics state already set
+16565-    # at enqueue time is preserved, so tracking is unaffected).
+16566-    if _alerts_muted(inst):
