@@ -13628,6 +13628,570 @@ def compute_main_brain(result):
         return _main_brain_neutral("Main Brain unavailable (%s)." % exc)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN BRAIN COGNITIVE UPGRADE — continuous-analyst READ layer (DISPLAY-ONLY)
+# ══════════════════════════════════════════════════════════════════════════════
+# A family of pure, FAIL-OPEN synthesizers that turn the per-poll Main Brain into a
+# continuous analyst: a forward PREDICTION engine, a natural conversational VOICE,
+# CONFIDENCE-over-time, a continuous session NARRATIVE + events TIMELINE, and a
+# session/day-type + learning-stats read. Every helper:
+#   • only CONSUMES the already-assembled `result` (+ the confidence/event history via
+#     capped, short-TTL-cached SELECTs) — it NEVER recomputes an engine, NEVER writes,
+#     and NEVER touches the strict gate, scoring, sizing, dedupe or /traderspost path;
+#   • has a fully-populated neutral block (the schema contract) and a try/except that
+#     degrades to it, so the 4 goldens stay byte-identical and the money path is safe;
+#   • is state-aware (neutral / limited when the market is closed) so attaching the
+#     whole family ONCE at the final full_analysis seam covers open / vetoed / closed
+#     without a separate mirror.
+_MB_PRED_NOTE = "Estimated odds — a heuristic read of the current tape, not a guarantee."
+
+
+def _mb_pf(x):
+    """Parse to float or None. Never raises."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mb_pi(x):
+    """Parse to int or 0. Never raises."""
+    try:
+        return int(round(float(x)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mb_clamp_odds(x):
+    """Round to the nearest 5% and clamp to [5, 85] — honest, low-precision odds."""
+    try:
+        v = int(round(float(x) / 5.0)) * 5
+        return max(5, min(85, v))
+    except (TypeError, ValueError):
+        return 35
+
+
+def _mb_downsample(pts, n):
+    """Evenly thin a [(t, v), ...] series to <= n points, always keeping the last."""
+    if not pts or len(pts) <= n:
+        return pts
+    step = len(pts) / float(n)
+    out = [pts[int(i * step)] for i in range(n)]
+    if out and out[-1] != pts[-1]:
+        out[-1] = pts[-1]
+    return out
+
+
+def _mb_segment_for(dt_utc):
+    """Map an instant to its ET narrative segment (Overnight / London / NY Open /
+    NY Session). Display grouping only — never raises."""
+    try:
+        h = (dt_utc or now_utc()).astimezone(ET_TZ).hour
+        if 8 <= h < 11:
+            return "NY Open"
+        if 11 <= h < 16:
+            return "NY Session"
+        if 2 <= h < 8:
+            return "London"
+        return "Overnight"
+    except Exception:
+        return "Overnight"
+
+
+# Tiny TTL cache so the DB-backed reads (confidence timeline / narrative / events)
+# never run per-3s-poll SQL: a ~10-15s memo per (block, instrument) bounds DB load
+# while staying fresher than the ~60s write cadence. In-memory + bounded + fail-open.
+_MB_READ_CACHE      = {}
+_MB_READ_CACHE_LOCK = threading.Lock()
+
+
+def _mb_cached(key, ttl_secs, producer):
+    nowts = time.time()
+    try:
+        with _MB_READ_CACHE_LOCK:
+            ent = _MB_READ_CACHE.get(key)
+            if ent and (nowts - ent[0]) < ttl_secs:
+                return ent[1]
+        val = producer()
+        with _MB_READ_CACHE_LOCK:
+            _MB_READ_CACHE[key] = (nowts, val)
+            if len(_MB_READ_CACHE) > 200:
+                for k in sorted(_MB_READ_CACHE, key=lambda kk: _MB_READ_CACHE[kk][0])[:50]:
+                    _MB_READ_CACHE.pop(k, None)
+        return val
+    except Exception:
+        try:
+            return producer()
+        except Exception:
+            return None
+
+
+# ── (1) Prediction engine ─────────────────────────────────────────────────────
+def _main_brain_predictions_neutral(reason="Predictions unavailable."):
+    return {
+        "available":         False,
+        "favored_direction": "Neither",
+        "horizon":           "—",
+        "predictions":       [],
+        "note":              _MB_PRED_NOTE,
+        "reason":            reason,
+    }
+
+
+def compute_main_brain_predictions(result):
+    """Forward, HEURISTIC odds for the next few candles (bullish/bearish break,
+    VWAP reclaim/hold, liquidity sweep, favored-side continuation). Anchored to the
+    analyst's OWN scenario probabilities + market phase, nudged by live structure /
+    CVD / VWAP location, then clamped to honest 5-85% / 5%-rounded bands. Pure +
+    FAIL-OPEN; DISPLAY-ONLY."""
+    try:
+        if not result.get("market_open", True):
+            return _main_brain_predictions_neutral("Market closed — no live tape to project.")
+        analyst   = result.get("analyst") if isinstance(result.get("analyst"), dict) else {}
+        gp        = analyst.get("game_plan") if isinstance(analyst.get("game_plan"), dict) else {}
+        phase_blk = analyst.get("market_phase") if isinstance(analyst.get("market_phase"), dict) else {}
+        p_long    = _mb_pi(gp.get("prob_long"))
+        p_short   = _mb_pi(gp.get("prob_short"))
+        nem       = gp.get("next_expected_move") if isinstance(gp.get("next_expected_move"), dict) else {}
+        move_conf = _mb_pi(nem.get("confidence"))
+        phase     = str(phase_blk.get("phase") or "—")
+        dirs      = result.get("directions") if isinstance(result.get("directions"), dict) else {}
+        d_long    = _mb_pi((dirs.get("Long")  or {}).get("edge_score"))
+        d_short   = _mb_pi((dirs.get("Short") or {}).get("edge_score"))
+        cvd_dir   = str(result.get("cvd_direction") or "").lower()
+        struct    = str(result.get("structure_label") or "").lower()
+        price     = _mb_pf(result.get("display_price"))
+        if price is None:
+            price = _mb_pf(result.get("current_price"))
+        vwap       = _mb_pf(result.get("vwap_value"))
+        above_vwap = (price is not None and vwap is not None and price >= vwap)
+        below_vwap = (price is not None and vwap is not None and price < vwap)
+        favored = "Long" if p_long > p_short else ("Short" if p_short > p_long else "Neither")
+        trend_phases = ("Trend Beginning", "Trend Developing", "Breakout")
+
+        preds = []
+
+        # 1) Bullish break / continuation up
+        b = []
+        odds = p_long if p_long else 35
+        if "bull" in cvd_dir:
+            odds += 6; b.append("CVD bullish")
+        if "bull" in struct or "uptrend" in struct:
+            odds += 5; b.append("structure bullish")
+        if phase in trend_phases and favored == "Long":
+            odds += 5; b.append("phase: %s" % phase)
+        if below_vwap:
+            odds -= 6; b.append("price below VWAP (headwind)")
+        if d_long:
+            b.append("Long edge %d" % d_long)
+        preds.append({"event": "Bullish break / continuation up", "direction": "Long",
+                      "odds_pct": _mb_clamp_odds(odds), "basis": b[:4]})
+
+        # 2) Bearish break / continuation down
+        b = []
+        odds = p_short if p_short else 35
+        if "bear" in cvd_dir:
+            odds += 6; b.append("CVD bearish")
+        if "bear" in struct or "downtrend" in struct:
+            odds += 5; b.append("structure bearish")
+        if phase in trend_phases and favored == "Short":
+            odds += 5; b.append("phase: %s" % phase)
+        if above_vwap:
+            odds -= 6; b.append("price above VWAP (headwind)")
+        if d_short:
+            b.append("Short edge %d" % d_short)
+        preds.append({"event": "Bearish break / continuation down", "direction": "Short",
+                      "odds_pct": _mb_clamp_odds(odds), "basis": b[:4]})
+
+        # 3) VWAP interaction (side-aware)
+        if vwap is not None and price is not None:
+            if below_vwap:
+                b = ["price below VWAP"]
+                odds = (p_long if p_long else 40) - 5
+                if "bull" in cvd_dir:
+                    odds += 6; b.append("CVD bullish")
+                preds.append({"event": "Reclaim VWAP from below", "direction": "Long",
+                              "odds_pct": _mb_clamp_odds(odds), "basis": b[:4]})
+            else:
+                b = ["price above VWAP"]
+                odds = (p_long if p_long else 45)
+                if favored == "Long":
+                    odds += 5; b.append("buyers in control")
+                preds.append({"event": "Hold above VWAP (shallow pullback)", "direction": "Long",
+                              "odds_pct": _mb_clamp_odds(odds), "basis": b[:4]})
+
+        # 4) Liquidity sweep of a near-side level
+        b = []
+        if phase in ("Consolidation", "Reversal Watch"):
+            odds = 50; b.append("phase favours a sweep")
+        else:
+            odds = 35; b.append("trending — sweep less likely")
+        preds.append({"event": "Liquidity sweep of a near-side level", "direction": "Either",
+                      "odds_pct": _mb_clamp_odds(odds), "basis": b[:3]})
+
+        # 5) Favored-side continuation toward target (analyst's own next-move read)
+        if favored != "Neither":
+            b = []
+            odds = move_conf if move_conf else max(p_long, p_short)
+            if move_conf:
+                b.append("analyst next-move confidence %d" % move_conf)
+            mv = (nem.get("moves") or [])
+            if mv:
+                b.append(str(mv[-1]))
+            preds.append({"event": "%s continuation toward target" % favored, "direction": favored,
+                          "odds_pct": _mb_clamp_odds(odds), "basis": b[:3]})
+
+        horizon = (gp.get("time_horizon") or {}).get("setup") or "the next few candles"
+        return {"available": True, "favored_direction": favored, "horizon": horizon,
+                "predictions": preds, "note": _MB_PRED_NOTE, "reason": None}
+    except Exception:
+        return _main_brain_predictions_neutral()
+
+
+# ── (2) Conversational analyst voice ──────────────────────────────────────────
+def _main_brain_voice_neutral(reason="Watching the tape — no clear read yet."):
+    return {"available": False, "headline": "Watching", "narration": reason, "reason": reason}
+
+
+def compute_main_brain_voice(result):
+    """One natural, evolving paragraph — what I see / what changed / why / what I'm
+    waiting for / what invalidates it — synthesized from the already-assembled blocks
+    (Main Brain, analyst phase/outlook, edge, confidence trend). Pure + FAIL-OPEN."""
+    try:
+        mb      = result.get("main_brain") if isinstance(result.get("main_brain"), dict) else {}
+        analyst = result.get("analyst") if isinstance(result.get("analyst"), dict) else {}
+        inst    = result.get("active_ticker") or "the market"
+        verdict = str(result.get("verdict") or "")
+        if not result.get("market_open", True):
+            return {"available": True, "headline": "Market closed",
+                    "narration": ("The market's closed for %s right now, so I'm standing down. "
+                                  "I'll pick the read back up when it reopens." % inst),
+                    "reason": None}
+        phase    = str(((analyst.get("market_phase") or {}).get("phase")) or "—")
+        outlook  = analyst.get("analyst_outlook") if isinstance(analyst.get("analyst_outlook"), dict) else {}
+        control  = str(outlook.get("control") or "")
+        fav      = str(mb.get("favored_direction") or "Neither")
+        edge     = _mb_pi(mb.get("edge_score") or result.get("edge_score"))
+        grade    = str(result.get("edge_grade") or mb.get("edge_grade") or "")
+        what_now = mb.get("what_now") if isinstance(mb.get("what_now"), list) else []
+        inval    = str(mb.get("invalidation") or "")
+        ct       = result.get("confidence_timeline") if isinstance(result.get("confidence_timeline"), dict) else {}
+        trend    = str(ct.get("trend") or "")
+
+        parts = []
+        see = "Right now on %s I'm reading %s" % (inst, (phase.lower() if phase != "—" else "a developing tape"))
+        if control:
+            see += " — %s" % control.rstrip(".").lower()
+        parts.append(see + ".")
+
+        if edge:
+            c = "My edge score sits at %d%s" % (edge, (" (%s)" % grade if grade else ""))
+            if fav and fav != "Neither":
+                c += ", leaning %s" % fav.lower()
+            if trend in ("rising", "falling"):
+                c += ", and confidence has been %s" % trend
+            parts.append(c + ".")
+
+        if is_actionable(verdict):
+            parts.append("The pieces line up here, so I'd treat this as actionable.")
+        elif what_now:
+            nx = what_now[0] if isinstance(what_now[0], str) else str(what_now[0])
+            parts.append("Before I'd act, I want %s." % nx.rstrip("."))
+        else:
+            parts.append("There's no clean trigger yet, so I'd stay patient.")
+
+        if inval and inval != "—":
+            parts.append("I'm wrong on this if %s." % inval.rstrip(".").lower())
+
+        narration = " ".join(p for p in parts if p)
+        if edge:
+            headline = "%s · edge %d%s" % ((fav if fav != "Neither" else "Neutral"), edge,
+                                           (" %s" % grade if grade else ""))
+        else:
+            headline = (fav if fav and fav != "Neither" else "Watching")
+        return {"available": True, "headline": headline, "narration": narration, "reason": None}
+    except Exception:
+        return _main_brain_voice_neutral()
+
+
+# ── (3) Confidence over time ──────────────────────────────────────────────────
+def _confidence_timeline_neutral(reason="No confidence history yet today."):
+    return {"available": False, "current": None, "grade": None, "verdict": None,
+            "direction": None, "high": None, "low": None, "trend": "flat",
+            "delta": None, "samples": 0, "series": [], "reason": reason}
+
+
+def compute_confidence_timeline(inst):
+    """Per-instrument Edge-Score time series for the CURRENT ET session-day:
+    current / high / low / trend (+ a thinned series for a sparkline). Capped,
+    short-TTL-cached SELECT. Pure + FAIL-OPEN; DISPLAY-ONLY."""
+    def _produce():
+        if not CONFIDENCE_SNAPSHOTS_DB_READY or not inst:
+            return _confidence_timeline_neutral("Confidence history unavailable.")
+        conn = _learning_conn()
+        if conn is None:
+            return _confidence_timeline_neutral("Confidence history unavailable.")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT edge_score, grade, verdict, direction, snapshot_at
+                       FROM confidence_snapshots
+                       WHERE instrument=%s
+                         AND (snapshot_at AT TIME ZONE 'America/New_York')::date
+                             = (now() AT TIME ZONE 'America/New_York')::date
+                       ORDER BY snapshot_at ASC LIMIT 500""", (inst,))
+                rows = cur.fetchall()
+            edges = [(float(r[0]), r) for r in rows if r[0] is not None]
+            if not edges:
+                return _confidence_timeline_neutral()
+            vals    = [e for e, _r in edges]
+            current = vals[-1]
+            hi      = max(vals)
+            lo      = min(vals)
+            latest  = edges[-1][1]
+            base    = vals[max(0, len(vals) - 10)] if len(vals) >= 4 else vals[0]
+            delta   = current - base
+            trend   = "rising" if delta >= 5 else ("falling" if delta <= -5 else "flat")
+            series  = _mb_downsample([(r[4].isoformat(), e) for e, r in edges], 40)
+            return {"available": True, "current": round(current, 1),
+                    "grade": latest[1], "verdict": latest[2], "direction": latest[3],
+                    "high": round(hi, 1), "low": round(lo, 1), "trend": trend,
+                    "delta": round(delta, 1), "samples": len(vals),
+                    "series": [{"t": t, "edge": round(e, 1)} for t, e in series],
+                    "reason": None}
+        except Exception as exc:
+            return _confidence_timeline_neutral("Confidence history unavailable (%s)." % exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    res = _mb_cached(("conf_tl", inst), 12.0, _produce)
+    return res if isinstance(res, dict) else _confidence_timeline_neutral("Confidence history unavailable.")
+
+
+# ── (4) Continuous session narrative + events timeline ────────────────────────
+def _market_narrative_neutral(reason="No session story yet."):
+    return {"available": False, "segments": [], "current": reason,
+            "expectation": "—", "reason": reason}
+
+
+def _mb_segment_summary(seg, evs):
+    """One-line plain-English summary of a segment's events (kind counts + edge range)."""
+    try:
+        from collections import Counter
+        c     = Counter(k for (k, _h, _t, _e) in evs)
+        edges = [float(e) for (_k, _h, _t, e) in evs if e is not None]
+        label = {"vwap_reclaim": "VWAP reclaim", "vwap_loss": "VWAP loss",
+                 "cvd_flip": "CVD flip", "sweep": "liquidity sweep",
+                 "structure": "structure break", "phase": "phase shift",
+                 "edge_move": "edge swing"}
+        bits = []
+        for kind, cnt in c.most_common():
+            nm = label.get(kind, kind)
+            bits.append(("%d× %s" % (cnt, nm)) if cnt > 1 else nm)
+        s = ", ".join(bits[:4])
+        if edges:
+            s += "; edge %d–%d" % (int(min(edges)), int(max(edges)))
+        return s or "quiet"
+    except Exception:
+        return "—"
+
+
+def _mb_narrative_current(result, inst):
+    try:
+        if not result.get("market_open", True):
+            return "Market closed — session paused."
+        analyst = result.get("analyst") or {}
+        phase   = str(((analyst.get("market_phase") or {}).get("phase")) or "developing")
+        mb      = result.get("main_brain") or {}
+        fav     = str(mb.get("favored_direction") or "Neither")
+        edge    = _mb_pi(mb.get("edge_score") or result.get("edge_score"))
+        grade   = str(result.get("edge_grade") or "")
+        verdict = str(result.get("verdict") or "")
+        s = "%s now reading %s" % (inst, phase.lower())
+        if edge:
+            s += ", edge %d%s" % (edge, (" %s" % grade if grade else ""))
+        if fav and fav != "Neither":
+            s += " leaning %s" % fav.lower()
+        if verdict:
+            s += " — %s" % verdict
+        return s + "."
+    except Exception:
+        return "—"
+
+
+def _mb_narrative_expectation(result):
+    try:
+        preds = result.get("main_brain_predictions") or {}
+        plist = preds.get("predictions") or []
+        if plist:
+            top = max(plist, key=lambda p: p.get("odds_pct") or 0)
+            return "Most likely next: %s (~%d%%)." % (top.get("event", "—"),
+                                                      int(top.get("odds_pct") or 0))
+        analyst = result.get("analyst") or {}
+        nem     = ((analyst.get("game_plan") or {}).get("next_expected_move")) or {}
+        moves   = nem.get("moves") or []
+        if moves:
+            return "Expecting: %s." % moves[0]
+        return "Waiting for the tape to commit."
+    except Exception:
+        return "—"
+
+
+def compute_market_narrative(result, inst):
+    """Synthesize the session story at READ time from persisted market_events grouped
+    Overnight / London / NY Open / NY Session, plus a live Current + Expectation line.
+    Facts persisted, prose generated here. Capped, short-TTL-cached. Pure + FAIL-OPEN."""
+    def _produce():
+        segments = []
+        if MARKET_EVENTS_DB_READY and inst:
+            conn = _learning_conn()
+            if conn is not None:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT segment, kind, headline, event_ts, edge_score
+                               FROM market_events
+                               WHERE instrument=%s
+                                 AND (event_ts AT TIME ZONE 'America/New_York')::date
+                                     = (now() AT TIME ZONE 'America/New_York')::date
+                               ORDER BY event_ts ASC LIMIT 300""", (inst,))
+                        rows = cur.fetchall()
+                    grouped = {}
+                    for seg, kind, headline, ts, edge in rows:
+                        grouped.setdefault(seg or "Overnight", []).append((kind, headline, ts, edge))
+                    for seg in ("Overnight", "London", "NY Open", "NY Session"):
+                        evs = grouped.get(seg)
+                        if not evs:
+                            continue
+                        heads = [h for (_k, h, _t, _e) in evs][-6:]
+                        segments.append({"segment": seg,
+                                         "summary": _mb_segment_summary(seg, evs),
+                                         "events": heads})
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        current     = _mb_narrative_current(result, inst)
+        expectation = _mb_narrative_expectation(result)
+        avail       = bool(segments) or bool(result.get("market_open", True))
+        return {"available": avail, "segments": segments, "current": current,
+                "expectation": expectation,
+                "reason": None if avail else "No session story yet."}
+    res = _mb_cached(("narr", inst), 12.0, _produce)
+    return res if isinstance(res, dict) else _market_narrative_neutral()
+
+
+def compute_market_events_timeline(inst):
+    """Recent curated tape events (newest first) for the events feed. Capped,
+    short-TTL-cached SELECT. Pure + FAIL-OPEN; DISPLAY-ONLY."""
+    def _produce():
+        if not MARKET_EVENTS_DB_READY or not inst:
+            return {"available": False, "events": [], "reason": "Events unavailable."}
+        conn = _learning_conn()
+        if conn is None:
+            return {"available": False, "events": [], "reason": "Events unavailable."}
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT event_ts, segment, kind, headline, edge_score
+                       FROM market_events WHERE instrument=%s
+                       ORDER BY event_ts DESC LIMIT 25""", (inst,))
+                rows = cur.fetchall()
+            evs = [{"t": (r[0].isoformat() if r[0] else None), "segment": r[1],
+                    "kind": r[2], "headline": r[3],
+                    "edge_score": (round(float(r[4]), 1) if r[4] is not None else None)}
+                   for r in rows]
+            return {"available": bool(evs), "events": evs,
+                    "reason": None if evs else "No events recorded yet."}
+        except Exception as exc:
+            return {"available": False, "events": [], "reason": "Events unavailable (%s)." % exc}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    res = _mb_cached(("evts", inst), 10.0, _produce)
+    return res if isinstance(res, dict) else {"available": False, "events": [], "reason": "Events unavailable."}
+
+
+# ── (5) Session / day-type classifier + learning stats ────────────────────────
+def _session_day_type_neutral(reason="Day type forming."):
+    return {"available": False, "day_type": "—", "confidence": 0, "reasons": [], "reason": reason}
+
+
+def compute_session_day_type(result):
+    """Classify today's character (Trending / Range-bound / Two-sided / Volatile)
+    from the live phase + volatility read. Pure + FAIL-OPEN; DISPLAY-ONLY."""
+    try:
+        if not result.get("market_open", True):
+            return _session_day_type_neutral("Market closed.")
+        analyst = result.get("analyst") or {}
+        phase   = str(((analyst.get("market_phase") or {}).get("phase")) or "")
+        vol     = result.get("volatility") if isinstance(result.get("volatility"), dict) else {}
+        vol_lbl = str((vol.get("label") if isinstance(vol, dict) else "") or "")
+        mult    = _mb_pf(result.get("volatility_multiplier"))
+        reasons = []
+        if phase in ("Trend Developing", "Trend Mature", "Breakout", "Trend Beginning"):
+            day = "Trending"; reasons.append("Phase: %s" % phase)
+        elif phase == "Consolidation":
+            day = "Range-bound"; reasons.append("Phase: consolidation / rotation")
+        elif phase in ("Reversal Watch", "Trend Exhausted"):
+            day = "Two-sided / reversal-prone"; reasons.append("Phase: %s" % phase)
+        else:
+            day = "Developing"
+        if mult is not None and mult >= 1.3:
+            if day in ("Trending", "Developing"):
+                day = "Volatile"
+            reasons.append("Volatility %.1f× baseline" % mult)
+        elif mult is not None and mult <= 0.7:
+            reasons.append("Below-average volatility")
+        if vol_lbl:
+            reasons.append("Volatility: %s" % vol_lbl)
+        conf = 55
+        if phase and phase != "—":
+            conf += 10
+        if mult is not None:
+            conf += 5
+        conf = max(30, min(85, conf))
+        return {"available": True, "day_type": day, "confidence": conf,
+                "reasons": reasons[:4], "reason": None}
+    except Exception:
+        return _session_day_type_neutral()
+
+
+def compute_main_brain_learning_stats():
+    """Curated deeper learning stats (most common losing pattern, most common skip
+    reason, best setup / best+worst windows, win-rate, avg-R) sourced from the
+    IN-MEMORY Performance Review cache — no per-request SQL. Pure + FAIL-OPEN."""
+    base = {"available": False, "reason": "Not enough trade history yet.",
+            "win_rate": None, "avg_r": None, "sample": 0, "losing_pattern": None,
+            "losing_pattern_n": None, "skip_pattern": None, "best_setup": None,
+            "best_window": None, "worst_window": None}
+    try:
+        r = _main_brain_review_snapshot()
+        if not r or not r.get("ready"):
+            return base
+        cl = r.get("common_loss") or {}
+        cr = r.get("common_rejection") or {}
+        return {"available": True, "reason": None,
+                "win_rate": r.get("win_rate"), "avg_r": r.get("avg_r"),
+                "sample": r.get("decided_trades") or 0,
+                "losing_pattern": (cl.get("reason") if cl else None),
+                "losing_pattern_n": (cl.get("n") if cl else None),
+                "skip_pattern": (cr.get("reason") if cr else None),
+                "best_setup": r.get("best_setup"),
+                "best_window": r.get("best_window"),
+                "worst_window": r.get("worst_window")}
+    except Exception:
+        base["reason"] = "Learning stats unavailable."
+        return base
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -14754,6 +15318,46 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["main_brain"] = compute_main_brain(result)
     except Exception as _mb_exc:
         result["main_brain"] = _main_brain_neutral("Main Brain unavailable (%s)." % _mb_exc)
+
+    # ── Main Brain Cognitive Upgrade (DISPLAY-ONLY) ──────────────────────────
+    # Continuous-analyst layer, attached AFTER compute_main_brain so it sees the
+    # final verdict + the Main Brain block. Each helper is pure + FAIL-OPEN (its own
+    # try/except → a stable neutral block) and state-aware (neutral / limited when the
+    # market is closed), so attaching the family ONCE here covers the open / vetoed /
+    # closed states without a separate mirror. They only CONSUME the assembled result
+    # (+ cached, capped history SELECTs) — never recompute, never write, never touch
+    # the gate, scoring, sizing, dedupe or the money path. Order matters only for
+    # display cross-references (predictions → narrative; confidence trend → voice).
+    _mb_inst = result.get("active_ticker")
+    try:
+        result["main_brain_predictions"] = compute_main_brain_predictions(result)
+    except Exception as _e:
+        result["main_brain_predictions"] = _main_brain_predictions_neutral("unavailable (%s)" % _e)
+    try:
+        result["confidence_timeline"] = compute_confidence_timeline(_mb_inst)
+    except Exception:
+        result["confidence_timeline"] = _confidence_timeline_neutral()
+    try:
+        result["market_events_timeline"] = compute_market_events_timeline(_mb_inst)
+    except Exception:
+        result["market_events_timeline"] = {"available": False, "events": [], "reason": "unavailable"}
+    try:
+        result["market_narrative"] = compute_market_narrative(result, _mb_inst)
+    except Exception:
+        result["market_narrative"] = _market_narrative_neutral()
+    try:
+        result["session_day_type"] = compute_session_day_type(result)
+    except Exception:
+        result["session_day_type"] = _session_day_type_neutral()
+    try:
+        result["main_brain_learning_stats"] = compute_main_brain_learning_stats()
+    except Exception:
+        result["main_brain_learning_stats"] = {"available": False, "reason": "unavailable"}
+    try:
+        result["main_brain_voice"] = compute_main_brain_voice(result)
+    except Exception:
+        result["main_brain_voice"] = _main_brain_voice_neutral()
+
     # Main Brain learning loop: capture a NON-actionable (WAIT) setup as a pending
     # would-have-worked hypothesis. Pure side-effect — never mutates `result`,
     # gated on the events table being ready, fail-open (no-op in the goldens).
@@ -18921,6 +19525,244 @@ def _check_main_brain_events_db_ready():
             pass
 
 
+# ── Main Brain Cognitive Upgrade — persistence (OBSERVABILITY / DISPLAY-ONLY) ───
+# Two purpose-built tables back the "continuous analyst" upgrade. They are kept
+# SEPARATE from main_brain_events (whose resolver tallies trade win/loss) so generic
+# tape observations never pollute that performance review:
+#   • confidence_snapshots — a per-instrument Edge-Score time series ("confidence
+#     over time"); written by the market-open heartbeat ONLY (never the /status poll).
+#   • market_events        — curated tape events (VWAP reclaim/loss, sweeps, BOS/CHOCH,
+#     CVD flips, volume spikes, notable edge moves) that the session NARRATIVE and the
+#     events TIMELINE are synthesized FROM at read time (facts persisted, not prose).
+# Same convention as every other table here: app-side INSERT/SELECT ONLY, NO in-app
+# DDL (tables created via the database tool in dev + the Publish schema-diff in prod).
+# FAIL-OPEN throughout — a missing table / down DB degrades to "no history" and never
+# touches the gate, scoring, sizing, dedupe or the /traderspost money path.
+CONFIDENCE_SNAPSHOTS_DB_READY = False
+MARKET_EVENTS_DB_READY        = False
+
+
+def _check_confidence_snapshots_db_ready():
+    """Probe confidence_snapshots (no DDL) and set CONFIDENCE_SNAPSHOTS_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB disables the confidence time series
+    (the rest of the bot is unaffected)."""
+    global CONFIDENCE_SNAPSHOTS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM confidence_snapshots LIMIT 1")
+            cur.fetchone()
+        CONFIDENCE_SNAPSHOTS_DB_READY = True
+        logger.info("confidence_snapshots table ready")
+    except Exception as exc:
+        logger.warning("confidence_snapshots table unavailable (confidence-over-time disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _check_market_events_db_ready():
+    """Probe market_events (no DDL) and set MARKET_EVENTS_DB_READY. FAIL-OPEN: a
+    missing table / unavailable DB disables the session narrative + events timeline
+    (the rest of the bot is unaffected)."""
+    global MARKET_EVENTS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM market_events LIMIT 1")
+            cur.fetchone()
+        MARKET_EVENTS_DB_READY = True
+        logger.info("market_events table ready")
+    except Exception as exc:
+        logger.warning("market_events table unavailable (Main Brain narrative disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Main Brain Cognitive Upgrade — writers / detectors (DISPLAY-ONLY) ──────────
+# The market-open HEARTBEAT (never the /status poll) calls _mb_capture_cognitive():
+# it persists a throttled per-instrument confidence snapshot and detects notable tape
+# TRANSITIONS (VWAP reclaim/loss, CVD flip, phase change, big edge swing) into
+# market_events. All writes are offloaded to the slow-task worker, throttled in
+# memory, and strictly INSERT-only — they NEVER mutate `result`, the gate, sizing,
+# dedupe or the money path, and a missing table / down DB degrades to a clean no-op.
+_MB_DETECT_STATE = {}
+_MB_DETECT_LOCK  = threading.Lock()
+
+
+def _record_confidence_snapshot(result):
+    """INSERT one per-instrument Edge-Score snapshot (throttled to ~1/min). FAIL-OPEN."""
+    if not CONFIDENCE_SNAPSHOTS_DB_READY or not isinstance(result, dict):
+        return
+    inst = result.get("active_ticker")
+    if not inst or not result.get("market_open", True):
+        return
+    if _mb_event_throttled(inst, "confidence_snapshot", "tick", "", ttl_secs=55):
+        return
+    edge      = _mb_pf(result.get("edge_score"))
+    grade     = result.get("edge_grade")
+    verdict   = result.get("verdict")
+    direction = result.get("dominant_direction") or result.get("strict_direction")
+    breakdown = result.get("edge_breakdown")
+    snap_at   = now_utc()
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO confidence_snapshots
+                         (id, instrument, snapshot_at, edge_score, grade, verdict,
+                          direction, breakdown)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (uuid.uuid4().hex, inst, snap_at, edge, grade, verdict, direction,
+                     (psycopg2.extras.Json(_swing_json_safe(breakdown))
+                      if breakdown is not None else None)))
+        except Exception as exc:
+            logger.warning("record_confidence_snapshot failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _record_market_event(inst, kind, headline, detail=None, edge_score=None,
+                         state="", ttl_secs=900, event_ts=None):
+    """INSERT one curated tape event (ON CONFLICT (idempotency_key) DO NOTHING),
+    throttled + offloaded to the slow-task worker. FAIL-OPEN: no table / no DB ⇒ no-op."""
+    if not MARKET_EVENTS_DB_READY or not inst or not kind or not headline:
+        return
+    ev_ts  = event_ts or now_utc()
+    seg    = _mb_segment_for(ev_ts)
+    bucket = ev_ts.strftime("%Y%m%d%H%M")
+    idem   = "|".join([str(inst), str(kind), str(seg), bucket, str(state)])
+    if _mb_event_throttled(inst, "market_event:" + str(kind), str(headline), str(state),
+                           ttl_secs=ttl_secs):
+        return
+    edge = _mb_pf(edge_score)
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO market_events
+                         (id, idempotency_key, instrument, event_ts, segment, kind,
+                          headline, detail, edge_score)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (idempotency_key) DO NOTHING""",
+                    (uuid.uuid4().hex, idem, inst, ev_ts, seg, kind, headline,
+                     (psycopg2.extras.Json(_swing_json_safe(detail))
+                      if detail is not None else None), edge))
+        except Exception as exc:
+            logger.warning("record_market_event failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _detect_market_events(result):
+    """Detect notable tape TRANSITIONS vs the last in-memory state per instrument and
+    record them. DISPLAY-ONLY side-effect — never mutates `result`, never the gate."""
+    try:
+        if not MARKET_EVENTS_DB_READY or not isinstance(result, dict):
+            return
+        if not result.get("market_open", True):
+            return
+        inst = result.get("active_ticker")
+        if not inst:
+            return
+        price = _mb_pf(result.get("display_price"))
+        if price is None:
+            price = _mb_pf(result.get("current_price"))
+        vwap    = _mb_pf(result.get("vwap_value"))
+        cvd_dir = (str(result.get("cvd_direction") or "").lower() or None)
+        analyst = result.get("analyst") or {}
+        phase   = str(((analyst.get("market_phase") or {}).get("phase")) or "")
+        edge    = _mb_pf(result.get("edge_score"))
+        with _MB_DETECT_LOCK:
+            prev = dict(_MB_DETECT_STATE.get(inst) or {})
+
+        if price is not None and vwap is not None:
+            side      = "above" if price >= vwap else "below"
+            prev_side = prev.get("vwap_side")
+            if prev_side and prev_side != side:
+                if side == "above":
+                    _record_market_event(inst, "vwap_reclaim", "Price reclaimed VWAP (back above)",
+                                         {"price": price, "vwap": vwap}, edge, state=side)
+                else:
+                    _record_market_event(inst, "vwap_loss", "Price lost VWAP (back below)",
+                                         {"price": price, "vwap": vwap}, edge, state=side)
+            prev["vwap_side"] = side
+
+        if cvd_dir in ("bullish", "bearish"):
+            prev_cvd = prev.get("cvd_dir")
+            if prev_cvd and prev_cvd != cvd_dir:
+                _record_market_event(inst, "cvd_flip", "CVD flipped %s" % cvd_dir,
+                                     {"cvd": cvd_dir}, edge, state=cvd_dir)
+            prev["cvd_dir"] = cvd_dir
+
+        if phase and phase != "—":
+            prev_phase = prev.get("phase")
+            if prev_phase and prev_phase != phase:
+                _record_market_event(inst, "phase", "Market phase: %s" % phase,
+                                     {"phase": phase, "from": prev_phase}, edge, state=phase)
+            prev["phase"] = phase
+
+        if edge is not None:
+            prev_edge = prev.get("edge_anchor")
+            if prev_edge is None:
+                prev["edge_anchor"] = edge
+            elif abs(edge - prev_edge) >= 20:
+                verb = "jumped to" if edge > prev_edge else "dropped to"
+                _record_market_event(inst, "edge_move", "Edge %s %d" % (verb, int(edge)),
+                                     {"from": prev_edge, "to": edge}, edge,
+                                     state=str(int(edge // 10)))
+                prev["edge_anchor"] = edge
+
+        with _MB_DETECT_LOCK:
+            _MB_DETECT_STATE[inst] = prev
+    except Exception as exc:
+        logger.warning("detect_market_events failed: %s", exc)
+
+
+def _mb_capture_cognitive(result):
+    """Heartbeat entry point: persist the confidence snapshot + detect market events.
+    DISPLAY-ONLY, fail-open; market-open gating lives in the callees."""
+    try:
+        _record_confidence_snapshot(result)
+    except Exception:
+        pass
+    try:
+        _detect_market_events(result)
+    except Exception:
+        pass
+
+
 def _mb_event_throttled(instrument, event_type, fingerprint, state, ttl_secs=900):
     """True iff an identical (instrument,event_type,fingerprint,state) event was seen
     within ttl_secs, so repeated 3s polls / webhook reposts don't write the same event
@@ -21859,6 +22701,10 @@ def _run_heartbeat_evaluations():
                 _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False)
             except Exception as exc:
                 logger.error("Heartbeat setup-state update failed for %s: %s", inst, exc)
+            try:                       # Main Brain Cognitive Upgrade — persist confidence + detect events (DISPLAY-ONLY)
+                _mb_capture_cognitive(a)
+            except Exception as exc:
+                logger.error("Heartbeat cognitive capture failed for %s: %s", inst, exc)
         except Exception as exc:
             logger.error("Heartbeat evaluation failed for %s: %s", inst, exc)
 
@@ -24077,6 +24923,13 @@ def status():
         "entry_quality":       a.get("entry_quality"),
         "fast_entry":          a.get("fast_entry"),
         "main_brain":          a.get("main_brain"),
+        "main_brain_predictions":    a.get("main_brain_predictions"),
+        "main_brain_voice":          a.get("main_brain_voice"),
+        "confidence_timeline":       a.get("confidence_timeline"),
+        "market_narrative":          a.get("market_narrative"),
+        "market_events_timeline":    a.get("market_events_timeline"),
+        "session_day_type":          a.get("session_day_type"),
+        "main_brain_learning_stats": a.get("main_brain_learning_stats"),
         "advisor_enabled":     _advisor_enabled(),
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
@@ -27575,6 +28428,64 @@ def dashboard():
   <div class="ai-ck" id="ai-ck"></div>
 </div>
 
+<!-- ══ Main Brain Cognitive Upgrade — continuous-analyst panels (DISPLAY-ONLY) ══
+     Fed by /status keys (main_brain_voice / _predictions / confidence_timeline /
+     market_narrative / market_events_timeline / session_day_type /
+     main_brain_learning_stats). NEVER touch the gate, scoring, sizing or broker.
+     Every dynamic string is written via textContent / _anFill (escaped). -->
+<div class="mod" id="mod-mb-voice">
+  <div class="mod-h">🗣 Analyst Voice <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">DISPLAY-ONLY</span></div>
+  <div id="mbv-headline" class="mb-summary" style="font-weight:600">—</div>
+  <div id="mbv-narration" class="mb-summary" style="color:#cdcde0">Watching the tape…</div>
+</div>
+
+<div class="mod" id="mod-mb-predictions">
+  <div class="mod-h">🔮 Forward Odds <span id="mbp-fav" style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">—</span></div>
+  <div id="mbp-horizon" style="font-size:11px;color:#6b7280;margin-bottom:6px">—</div>
+  <div id="mbp-list"></div>
+  <div id="mbp-note" style="font-size:10px;color:#6b7280;margin-top:6px;font-style:italic"></div>
+</div>
+
+<div class="mod" id="mod-mb-confidence">
+  <div class="mod-h">📈 Confidence Over Time</div>
+  <div class="mb-stats">
+    <div class="mb-stat"><div class="mb-stat-l">Current</div><div class="mb-stat-v" id="mbc-current">—</div></div>
+    <div class="mb-stat"><div class="mb-stat-l">High</div><div class="mb-stat-v" id="mbc-high">—</div></div>
+    <div class="mb-stat"><div class="mb-stat-l">Low</div><div class="mb-stat-v" id="mbc-low">—</div></div>
+    <div class="mb-stat"><div class="mb-stat-l">Trend</div><div class="mb-stat-v" id="mbc-trend" style="font-size:12px">—</div></div>
+  </div>
+  <div id="mbc-spark" style="display:flex;align-items:flex-end;gap:2px;height:42px;margin-top:8px"></div>
+  <div id="mbc-why" style="font-size:11px;color:#6b7280;margin-top:6px">—</div>
+</div>
+
+<div class="mod" id="mod-mb-narrative">
+  <div class="mod-h">📖 Session Story</div>
+  <div id="mbn-current" class="mb-summary">—</div>
+  <div id="mbn-expect" style="font-size:11px;color:#9aa3b2;margin-bottom:6px">—</div>
+  <div id="mbn-segments"></div>
+</div>
+
+<div class="mod" id="mod-mb-events">
+  <div class="mod-h">🗂 Events Timeline</div>
+  <ul id="mbe-list" class="mb-list"></ul>
+</div>
+
+<div class="mod" id="mod-mb-daytype">
+  <div class="mod-h">🗓 Day Type <span id="mbd-conf" style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">—</span></div>
+  <div id="mbd-type" class="mb-stat-v" style="font-size:18px;margin-bottom:6px">—</div>
+  <ul id="mbd-reasons" class="mb-list"></ul>
+</div>
+
+<div class="mod" id="mod-mb-learning">
+  <div class="mod-h">🎓 Learning Stats</div>
+  <div class="mb-stats">
+    <div class="mb-stat"><div class="mb-stat-l">Win rate</div><div class="mb-stat-v" id="mbl-wr">—</div></div>
+    <div class="mb-stat"><div class="mb-stat-l">Avg R</div><div class="mb-stat-v" id="mbl-avgr">—</div></div>
+    <div class="mb-stat"><div class="mb-stat-l">Sample</div><div class="mb-stat-v" id="mbl-sample">—</div></div>
+  </div>
+  <ul id="mbl-list" class="mb-list" style="margin-top:8px"></ul>
+</div>
+
 <div class="mod mb-hidden" id="mod-countdown">
   <div class="mod-h">🎯 Setup Countdown</div>
   <div class="cd-big" id="cd-big">—</div>
@@ -29015,6 +29926,7 @@ function gaugeColor(v,prob){
 function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
+  renderMainBrainCognitive(d);
   const diag   = d.alert_diagnostics || {};
   const v      = d.verdict || 'WAIT';
   const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
@@ -29673,6 +30585,190 @@ function renderMainBrain(d){
   const switched = (mbCurSym !== symKey);
   mbCurSym = symKey;
   mbRenderFeed(symKey, appended || switched);
+}
+
+// ════ Main Brain Cognitive Upgrade — continuous-analyst panels (DISPLAY-ONLY) ════
+// Reads the server-computed cognitive blocks straight off /status (never recomputes,
+// never touches the money path). Every dynamic string is written via textContent /
+// _anFill (escaped). Each renderer is independently fail-open.
+function _mbTrendColor(t){ return t==='rising' ? '#22c55e' : (t==='falling' ? '#ef4444' : '#6b7280'); }
+function _mbSetText(id, v){ const e=document.getElementById(id); if(e) e.textContent=(v==null||v==='')?'—':v; }
+function _mbEvT(iso){
+  if(!iso) return '';
+  try{ return new Date(iso).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}); }
+  catch(e){ return ''; }
+}
+function renderMBVoice(d){
+  const mod=document.getElementById('mod-mb-voice'); if(!mod) return;
+  const v=(d&&d.main_brain_voice)||null;
+  _mbSetText('mbv-headline', v&&v.headline);
+  const n=document.getElementById('mbv-narration');
+  if(n) n.textContent=(v&&v.narration)||'Watching the tape — no clear read yet.';
+}
+function renderMBPredictions(d){
+  const mod=document.getElementById('mod-mb-predictions'); if(!mod) return;
+  const p=(d&&d.main_brain_predictions)||null;
+  const favEl=document.getElementById('mbp-fav');
+  if(favEl) favEl.textContent=(p&&p.favored_direction)?('Favored: '+p.favored_direction):'—';
+  _mbSetText('mbp-horizon', (p&&p.horizon)?('Horizon: '+p.horizon):'—');
+  const wrap=document.getElementById('mbp-list');
+  if(wrap){
+    wrap.innerHTML='';
+    const arr=(p&&p.predictions)||[];
+    if(!arr.length){
+      const e=document.createElement('div'); e.style.cssText='color:#6b7280;font-size:12px';
+      e.textContent=(p&&p.reason)||'No live projections right now.'; wrap.appendChild(e);
+    } else {
+      arr.forEach(function(it){
+        const row=document.createElement('div'); row.style.cssText='margin-bottom:7px';
+        const top=document.createElement('div');
+        top.style.cssText='display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px';
+        const nm=document.createElement('span'); nm.textContent=(it.event||'—');
+        const odds=(typeof it.odds_pct==='number')?it.odds_pct:null;
+        const od=document.createElement('span'); od.style.fontWeight='600';
+        od.textContent=(odds==null)?'—':(odds+'%');
+        od.style.color=(odds!=null&&odds>=60)?'#22c55e':((odds!=null&&odds<=35)?'#ef4444':'#e8e8f0');
+        top.appendChild(nm); top.appendChild(od);
+        const track=document.createElement('div'); track.style.cssText='height:5px;border-radius:3px;background:#1f2030;overflow:hidden';
+        const fill=document.createElement('div'); fill.style.cssText='height:100%;border-radius:3px';
+        fill.style.width=((odds==null?0:odds))+'%';
+        fill.style.background=(it.direction==='Short')?'#ef4444':((it.direction==='Long')?'#22c55e':'#6b7280');
+        track.appendChild(fill);
+        row.appendChild(top); row.appendChild(track);
+        const basis=(it.basis||[]);
+        if(basis.length){
+          const b=document.createElement('div'); b.style.cssText='font-size:10px;color:#6b7280;margin-top:2px';
+          b.textContent=basis.join(' · '); row.appendChild(b);
+        }
+        wrap.appendChild(row);
+      });
+    }
+  }
+  _mbSetText('mbp-note', p&&p.note);
+}
+function renderMBConfidence(d){
+  const mod=document.getElementById('mod-mb-confidence'); if(!mod) return;
+  const c=(d&&d.confidence_timeline)||null;
+  _mbSetText('mbc-current', (c&&c.current!=null)?c.current:null);
+  _mbSetText('mbc-high', (c&&c.high!=null)?c.high:null);
+  _mbSetText('mbc-low', (c&&c.low!=null)?c.low:null);
+  const tEl=document.getElementById('mbc-trend');
+  if(tEl){ const t=(c&&c.trend)||'flat'; tEl.textContent=t; tEl.style.color=_mbTrendColor(t); }
+  const sp=document.getElementById('mbc-spark');
+  if(sp){
+    sp.innerHTML='';
+    const series=(c&&c.series)||[];
+    if(!series.length){
+      const e=document.createElement('span'); e.style.cssText='color:#6b7280;font-size:11px';
+      e.textContent='No history yet today.'; sp.appendChild(e);
+    } else {
+      const vals=series.map(function(s){ return (typeof s.edge==='number')?s.edge:0; });
+      const mx=Math.max.apply(null, vals.concat([1]));
+      series.forEach(function(s){
+        const ev=(typeof s.edge==='number')?s.edge:0;
+        const bar=document.createElement('div');
+        const h=Math.max(2, Math.round((ev/mx)*40));
+        bar.style.cssText='flex:1;min-width:2px;border-radius:1px;background:#3b82f6;height:'+h+'px';
+        sp.appendChild(bar);
+      });
+    }
+  }
+  const why=document.getElementById('mbc-why');
+  if(why){
+    if(c&&c.available){
+      let txt='';
+      if(c.delta!=null){ const sign=(c.delta>0)?'+':''; txt='Δ '+sign+c.delta+' over '+(c.samples||0)+' reads today'; }
+      if(c.verdict) txt+=(txt?' · ':'')+c.verdict;
+      if(c.grade) txt+=' ('+c.grade+')';
+      why.textContent=txt||'—';
+    } else {
+      why.textContent=(c&&c.reason)||'No confidence history yet today.';
+    }
+  }
+}
+function renderMBNarrative(d){
+  const mod=document.getElementById('mod-mb-narrative'); if(!mod) return;
+  const n=(d&&d.market_narrative)||null;
+  _mbSetText('mbn-current', n&&n.current);
+  _mbSetText('mbn-expect', n&&n.expectation);
+  const wrap=document.getElementById('mbn-segments');
+  if(wrap){
+    wrap.innerHTML='';
+    const segs=(n&&n.segments)||[];
+    segs.forEach(function(s){
+      const blk=document.createElement('div'); blk.style.cssText='margin-top:8px';
+      const h=document.createElement('div'); h.className='mb-col-h'; h.textContent=(s.segment||'—');
+      blk.appendChild(h);
+      const sm=document.createElement('div'); sm.style.cssText='font-size:11px;color:#cdcde0;margin:2px 0';
+      sm.textContent=(s.summary||''); blk.appendChild(sm);
+      const ul=document.createElement('ul'); ul.className='mb-list';
+      (s.events||[]).forEach(function(evt){ const li=document.createElement('li'); li.textContent=evt; ul.appendChild(li); });
+      blk.appendChild(ul);
+      wrap.appendChild(blk);
+    });
+  }
+}
+function renderMBEvents(d){
+  const mod=document.getElementById('mod-mb-events'); if(!mod) return;
+  const e=(d&&d.market_events_timeline)||null;
+  const list=document.getElementById('mbe-list'); if(!list) return;
+  list.innerHTML='';
+  const evs=(e&&e.events)||[];
+  if(!evs.length){
+    const li=document.createElement('li'); li.style.color='#6b7280';
+    li.textContent=(e&&e.reason)||'No events recorded yet.'; list.appendChild(li); return;
+  }
+  evs.forEach(function(ev){
+    const li=document.createElement('li');
+    const t=document.createElement('span'); t.style.cssText='color:#6b7280;margin-right:6px';
+    t.textContent=_mbEvT(ev.t); li.appendChild(t);
+    if(ev.segment){ const sg=document.createElement('span'); sg.style.cssText='color:#9aa3b2;margin-right:6px;font-size:10px'; sg.textContent=ev.segment; li.appendChild(sg); }
+    const h=document.createElement('span'); h.textContent=(ev.headline||ev.kind||'—'); li.appendChild(h);
+    if(ev.edge_score!=null){ const es=document.createElement('span'); es.style.cssText='color:#6b7280;margin-left:6px;font-size:10px'; es.textContent='edge '+ev.edge_score; li.appendChild(es); }
+    list.appendChild(li);
+  });
+}
+function renderMBDayType(d){
+  const mod=document.getElementById('mod-mb-daytype'); if(!mod) return;
+  const s=(d&&d.session_day_type)||null;
+  _mbSetText('mbd-type', s&&s.day_type);
+  const cf=document.getElementById('mbd-conf');
+  if(cf) cf.textContent=(s&&typeof s.confidence==='number'&&s.confidence)?(s.confidence+'% conf'):'—';
+  _anFill('mbd-reasons', (s&&s.reasons)||[]);
+}
+function renderMBLearning(d){
+  const mod=document.getElementById('mod-mb-learning'); if(!mod) return;
+  const s=(d&&d.main_brain_learning_stats)||null;
+  _mbSetText('mbl-wr', (s&&s.win_rate!=null)?(s.win_rate+'%'):null);
+  _mbSetText('mbl-avgr', (s&&s.avg_r!=null)?(s.avg_r+'R'):null);
+  _mbSetText('mbl-sample', (s&&s.sample!=null)?s.sample:null);
+  const list=document.getElementById('mbl-list');
+  if(list){
+    list.innerHTML='';
+    const rows=[];
+    if(s&&s.available){
+      if(s.best_setup) rows.push('Best setup: '+s.best_setup);
+      if(s.best_window) rows.push('Best window: '+s.best_window);
+      if(s.worst_window) rows.push('Worst window: '+s.worst_window);
+      if(s.losing_pattern) rows.push('Top loss: '+s.losing_pattern+(s.losing_pattern_n?(' ('+s.losing_pattern_n+')'):''));
+      if(s.skip_pattern) rows.push('Top skip: '+s.skip_pattern);
+    }
+    if(!rows.length){
+      const li=document.createElement('li'); li.style.color='#6b7280';
+      li.textContent=(s&&s.reason)||'Not enough trade history yet.'; list.appendChild(li);
+    } else {
+      rows.forEach(function(t){ const li=document.createElement('li'); li.textContent=t; list.appendChild(li); });
+    }
+  }
+}
+function renderMainBrainCognitive(d){
+  try{ renderMBVoice(d); }catch(e){}
+  try{ renderMBPredictions(d); }catch(e){}
+  try{ renderMBConfidence(d); }catch(e){}
+  try{ renderMBNarrative(d); }catch(e){}
+  try{ renderMBEvents(d); }catch(e){}
+  try{ renderMBDayType(d); }catch(e){}
+  try{ renderMBLearning(d); }catch(e){}
 }
 
 // ── Ask the brain — interactive chat inside Main Brain (DISPLAY-ONLY, read-only) ──
@@ -32521,7 +33617,7 @@ autoSelectBestSetup();
   // One-time layout reset when the panel set changes (Main Brain added) so existing
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
-  var VKEY = 'dashLayoutVer', VER = 'main-brain-2026-06';
+  var VKEY = 'dashLayoutVer', VER = 'main-brain-cognitive-2026-06';
   try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
@@ -34331,6 +35427,8 @@ if __name__ == "__main__":
         _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
         _load_manual_trades_from_db()              # rehydrate open ADVISORY-ONLY manual positions (display monitor)
         _check_main_brain_events_db_ready()        # probe main_brain_events (no DDL; created via DB tool/publish diff)
+        _check_confidence_snapshots_db_ready()     # probe confidence_snapshots (no DDL; created via DB tool/publish diff) — Main Brain confidence-over-time
+        _check_market_events_db_ready()            # probe market_events (no DDL; created via DB tool/publish diff) — Main Brain narrative + events timeline
         _check_prop_accounts_db_ready()            # probe prop_accounts (no DDL; created via DB tool/publish diff) — Prop Firm Protection
         _load_prop_accounts_from_db()              # warm the prop-account cache (display + guard reads); Protection stays OFF until toggled
         _check_trade_mgmt_db_ready()               # probe trade_management_metrics (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
