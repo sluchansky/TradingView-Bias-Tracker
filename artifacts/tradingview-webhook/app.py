@@ -1525,6 +1525,22 @@ LIVE_RUNNER_REDUCE_MODE = os.environ.get("LIVE_RUNNER_REDUCE_MODE", "manual").st
 # Discretionary runner-exit tuning (watcher reads RAW stores only; never the gate).
 LIVE_RUNNER_TRAIL_ATR_MULT = max(0.1, float(os.environ.get("LIVE_RUNNER_TRAIL_ATR_MULT", "1.5")))
 LIVE_RUNNER_MAX_HOLD_MIN   = max(1, int(os.environ.get("LIVE_RUNNER_MAX_HOLD_MIN", "240")))
+# Runner-leg management style (how the SECOND contract is handled after entry):
+#   "trail" (DEFAULT) — runner leg is sent stop-ONLY (no take-profit) and exited
+#            discretionarily by the watcher (VWAP loss / CVD flip / ATR trail /
+#            time-stop / market-closed). BYTE-IDENTICAL to the original launch.
+#   "be_2r" — runner leg carries a REAL 2R take-profit at the broker; once contract 1
+#            banks 1R the watcher arms a synthetic BREAK-EVEN (flattens the runner if
+#            price returns to entry). No discretionary trailing — the runner only ever
+#            exits at its 2R broker TP, the BE flatten, the original broker stop, or
+#            market close. The 2R TP is broker-resident (reliable); the BE flatten is
+#            bot-managed, so if the bot/connection hiccups the runner simply keeps its
+#            ORIGINAL stop — never worse than the trade's planned risk (fail-safe).
+#   NOTE: fully-automatic BE requires LIVE_RUNNER_REDUCE_MODE="exit"; with the default
+#         "manual" the BE trigger only ALERTS the owner to flatten by hand.
+LIVE_RUNNER_RUNNER_MODE = os.environ.get("LIVE_RUNNER_RUNNER_MODE", "trail").strip().lower()
+if LIVE_RUNNER_RUNNER_MODE not in ("trail", "be_2r"):
+    LIVE_RUNNER_RUNNER_MODE = "trail"
 # Gateway-owned live-runner state (Option A): the runner leg is tracked HERE, not on
 # ACTIVE_TRADES_BY_INST, because the manual /traderspost route (and Option A in
 # general) never registers an ACTIVE_TRADE — only _maybe_auto_execute / /enter do.
@@ -25342,6 +25358,7 @@ def live_runner_status_view():
         "require_traderspost": bool(LIVE_RUNNER_REQUIRE_TRADERSPOST),
         "runner_qty":          int(LIVE_RUNNER_QTY),
         "reduce_mode":         LIVE_RUNNER_REDUCE_MODE,
+        "runner_mode":         LIVE_RUNNER_RUNNER_MODE,
         "trail_atr_mult":      LIVE_RUNNER_TRAIL_ATR_MULT,
         "max_hold_min":        LIVE_RUNNER_MAX_HOLD_MIN,
         "watch_interval_sec":  LIVE_RUNNER_WATCH_INTERVAL_SEC,
@@ -25363,6 +25380,26 @@ def adapt_traderspost_reduce(broker_symbol):
         "action":    "exit",
         "signal":    "AI Trading Partner RUNNER EXIT",
     }
+
+
+def _live_runner_be_2r_levels(entry, stop, direction):
+    """Derive (break-even arm price, 2R target) for a be_2r runner leg from the LIVE
+    entry/stop — independent of the displayed plan target so the sanctioned ORB 1:4
+    override on t1 can never distort it. be_arm_price = entry ± 1R (where contract 1
+    banks its 1R take-profit); runner_target = entry ± 2R. Long arms/targets ABOVE
+    entry, short BELOW. Returns (None, None) when risk is non-positive so the caller
+    falls back to a stop-only runner."""
+    try:
+        e = float(entry); s = float(stop)
+    except (TypeError, ValueError):
+        return None, None
+    risk = abs(e - s)
+    if risk <= 0:
+        return None, None
+    is_long = str(direction).lower() in ("long", "buy", "bull", "bullish")
+    if is_long:
+        return round(e + risk, 2), round(e + 2.0 * risk, 2)
+    return round(e - risk, 2), round(e - 2.0 * risk, 2)
 
 
 def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_public,
@@ -25391,9 +25428,28 @@ def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_p
     runner_intent  = dict(intent); runner_intent["quantity"]  = runner_qty
     primary_payload = adapt_traderspost(primary_intent)        # stop + 1R TP (bracket)
     runner_payload  = adapt_traderspost(runner_intent)
-    runner_payload.pop("takeProfit", None)                     # runner: stop ONLY, no TP
+    # Runner-leg management style. "trail" (default) = stop ONLY, no TP (byte-identical
+    # to launch). "be_2r" = a REAL 2R take-profit at the broker + a synthetic break-even
+    # the watcher arms once contract 1 banks 1R. Degrade to "trail" if 2R is underivable.
+    runner_mode  = LIVE_RUNNER_RUNNER_MODE
+    be_arm_price = runner_target = None
+    if runner_mode == "be_2r":
+        be_arm_price, runner_target = _live_runner_be_2r_levels(entry, stop, direction)
+    if runner_mode == "be_2r" and runner_target is not None:
+        runner_payload["takeProfit"] = {"limitPrice": runner_target}  # broker-resident 2R
+    else:
+        runner_payload.pop("takeProfit", None)                 # trail / no-risk: stop ONLY
+        runner_mode = "trail"
 
     primary_plan = dict(plan_public); primary_plan["quantity"] = primary_qty
+    if runner_mode == "be_2r":
+        # Contract 1 banks at EXACTLY 1R: override the displayed/ORB plan target so a
+        # sanctioned 1:4 t1 can never push the first contract past 1R, and the runner's
+        # break-even arms off the SAME 1R level contract 1 books. (be_arm_price is
+        # guaranteed non-None here: the else-branch above demotes to "trail" otherwise.)
+        primary_payload["takeProfit"] = {"limitPrice": be_arm_price}
+        primary_plan["takeProfit"]    = be_arm_price
+        t1 = be_arm_price
     runner_id    = f"{instrument}:{int(now)}"
     _disc        = None
     try:
@@ -25434,16 +25490,22 @@ def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_p
             "broker_symbol": intent["broker_symbol"],
             "entry": entry, "stop": stop, "t1": t1, "t2": t2,
             "runner_qty": runner_qty, "primary_qty": primary_qty,
+            "runner_mode": runner_mode, "be_arm_price": be_arm_price,
+            "runner_target": runner_target,
             "opened_at": now_utc().isoformat(), "opened_epoch": now,
             "peak_price": entry, "trough_price": entry,
             "state": "open", "reduce_state": "idle", "reduce_reason": None,
             "fingerprint": fingerprint, "source": source,
         })
-        logger.info("LIVE RUNNER entry %s %s: primary x%d (stop+TP) + runner x%d (stop only) sent.",
-                    instrument, direction, primary_qty, runner_qty)
+        if runner_mode == "be_2r":
+            _runner_desc = f"runner `{runner_qty}` (TP `{runner_target:.2f}` 2R, BE after 1R)"
+        else:
+            _runner_desc = f"runner `{runner_qty}` (no TP, trailing)"
+        logger.info("LIVE RUNNER entry %s %s: primary x%d (stop+TP) + runner x%d (%s) sent.",
+                    instrument, direction, primary_qty, runner_qty, runner_mode)
         _notify(f"🚀 **ORDER SENT (2-LEG RUNNER) → {provider_label} — {direction.upper()}**\n"
                 f"{tp_symbol} · {action.upper()} primary `{primary_qty}` (TP `{t1:.2f}`) + "
-                f"runner `{runner_qty}` (no TP, trailing)  ·  Stop `{stop:.2f}` ({tp.get('rr','1:1')})")
+                f"{_runner_desc}  ·  Stop `{stop:.2f}` ({tp.get('rr','1:1')})")
         return {
             "status": "sent",
             "provider": provider_label, "mode": mode, "broker_verify_required": False,
@@ -25453,7 +25515,8 @@ def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_p
                       "direction": direction, "type": "market",
                       "stopLoss": stop, "takeProfit": t1, "target2": t2},
             "runner": {"runner_id": runner_id, "quantity": runner_qty,
-                       "stopLoss": stop, "takeProfit": None, "state": "open"},
+                       "stopLoss": stop, "takeProfit": runner_target, "state": "open",
+                       "runner_mode": runner_mode, "be_arm_price": be_arm_price},
         }, 200
 
     # Runner did NOT land. The primary IS live regardless, so the caller must TRACK
@@ -25471,6 +25534,8 @@ def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_p
             "broker_symbol": intent["broker_symbol"],
             "entry": entry, "stop": stop, "t1": t1, "t2": t2,
             "runner_qty": runner_qty, "primary_qty": primary_qty,
+            "runner_mode": runner_mode, "be_arm_price": be_arm_price,
+            "runner_target": runner_target,
             "opened_at": now_utc().isoformat(), "opened_epoch": now,
             "peak_price": entry, "trough_price": entry,
             "state": "verify_required", "reduce_state": "idle", "reduce_reason": None,
@@ -25592,6 +25657,55 @@ def _execute_live_runner_reduce(instrument, runner_id=None, reason=""):
     return "failed"
 
 
+def _runner_exit_signal_be_2r(rec):
+    """Runner-exit decision for the be_2r management style. The runner already carries a
+    REAL 2R take-profit at the broker AND its ORIGINAL broker stop, so this layer ONLY
+    adds: (1) a mandatory market-closed / session flatten (safety), and (2) a synthetic
+    BREAK-EVEN — once contract 1 banks 1R (the high-water mark reaches be_arm_price)
+    flatten the runner if price gives the move back to entry. NO discretionary trailing
+    (VWAP/CVD/ATR/time-stop): the runner is meant to ride to 2R or BE. Fail-open: any
+    missing price/level yields NO exit, leaving the broker's 2R TP and stop in charge.
+    Returns (exit: bool, reason: str)."""
+    inst      = rec.get("instrument")
+    direction = (rec.get("direction") or "").lower()
+    is_long   = direction in ("long", "buy", "bull", "bullish")
+    is_short  = direction in ("short", "sell", "bear", "bearish")
+    if not (is_long or is_short):
+        return False, ""
+
+    # 1) Mandatory session safety (same as trail mode).
+    try:
+        if not market_session_status().get("open", True):
+            return True, "market closed"
+    except Exception:
+        pass
+
+    try:
+        price = current_price_for(inst)
+    except Exception:
+        price = None
+    if price is None:
+        return False, ""      # no price -> defer to the broker 2R TP / stop
+
+    try:
+        entry  = float(rec.get("entry"))
+        be_arm = float(rec.get("be_arm_price"))
+    except (TypeError, ValueError):
+        return False, ""      # missing levels -> broker bracket manages it
+
+    # 2) Synthetic break-even: arm once the high-water mark reaches 1R (contract 1's TP),
+    #    then flatten the runner if price returns to entry.
+    if is_long:
+        peak = max(float(rec.get("peak_price") or price), price)
+        if peak >= be_arm and price <= entry:
+            return True, "breakeven"
+    else:
+        trough = min(float(rec.get("trough_price") or price), price)
+        if trough <= be_arm and price >= entry:
+            return True, "breakeven"
+    return False, ""
+
+
 def _runner_exit_signal(rec):
     """Discretionary runner-exit decision from RAW per-instrument stores ONLY (never
     full_analysis — that recomputes the gate and has side effects). Returns
@@ -25599,7 +25713,10 @@ def _runner_exit_signal(rec):
     its own broker stop as the hard backstop, so a missing / stale store simply yields
     NO discretionary exit (fail-open: let the broker stop manage it). Signals:
     market-closed / session time-stop, VWAP loss, CVD-delta flip against the position,
-    and an ATR trail from the high-water mark."""
+    and an ATR trail from the high-water mark. The be_2r management style delegates to
+    _runner_exit_signal_be_2r (BE-or-2R only; no discretionary trailing)."""
+    if (rec.get("runner_mode") or "trail") == "be_2r":
+        return _runner_exit_signal_be_2r(rec)
     inst      = rec.get("instrument")
     direction = (rec.get("direction") or "").lower()
     is_long   = direction in ("long", "buy", "bull", "bullish")
@@ -32756,14 +32873,16 @@ function renderLiveRunner(d){
   _set('lr-qty', lr.runner_qty);
   _set('lr-reduce', lr.reduce_mode);
   _set('lr-active', lr.active_count);
-  _set('lr-foot', 'Trail x'+(lr.trail_atr_mult)+' ATR · max hold '+(lr.max_hold_min)+'m · watch '+(lr.watch_interval_sec)+'s · updated '+(lr.updated_at? new Date(lr.updated_at).toLocaleTimeString():'—'));
+  var _rmode=(lr.runner_mode==='be_2r')?'2R target + BE after 1R':'trail (stop-only)';
+  var _rnote=(lr.runner_mode==='be_2r' && lr.reduce_mode!=='exit')?' · auto-BE needs reduce_mode=exit (now alert-only)':'';
+  _set('lr-foot', 'Runner: '+_rmode+_rnote+' · trail x'+(lr.trail_atr_mult)+' ATR · max hold '+(lr.max_hold_min)+'m · watch '+(lr.watch_interval_sec)+'s · updated '+(lr.updated_at? new Date(lr.updated_at).toLocaleTimeString():'—'));
 }
 function toggleLiveRunner(){
   const armEl=document.getElementById('lr-arm');
   const cur=!!(armEl && armEl.classList.contains('is-armed'));
   const next=!cur;
   if(next){
-    if(!confirm('ARM the LIVE 2-contract runner?\\n\\nWhen armed AND a >=2-contract setup goes READY on the live traderspost instance, the entry is SPLIT into a primary (1R bracket) + a runner (stop only, trailed). This places REAL orders.\\n\\nRequires TradersPost "Use signal quantity" ON. Resets OFF on restart.')) return;
+    if(!confirm('ARM the LIVE 2-contract runner?\\n\\nWhen armed AND a >=2-contract setup goes READY on the live traderspost instance, the entry is SPLIT into a primary (1R bracket) + a runner. In trail mode the runner is stop-only and trailed; in be_2r mode it carries a real 2R take-profit and moves to break-even after contract 1 banks 1R. This places REAL orders.\\n\\nRequires TradersPost "Use signal quantity" ON (and reduce_mode=exit for automatic break-even). Resets OFF on restart.')) return;
   }
   api('/live-runner', { armed: next })
     .then(function(r){
