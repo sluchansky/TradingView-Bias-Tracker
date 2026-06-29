@@ -44,3 +44,25 @@ it is provably advisory — a single stray call into the execution path would tu
   `node --check` on the served `<script>` (py_compile can't catch inline-JS breakage).
 - Distinct from [scalp-live-sim](scalp-live-sim.md): that is the paper-sim *observer*
   (persists sim trades to its own table); this advisory layer persists nothing.
+
+## Reasoning layer — the full 16-strategy vote roster (transparency extension)
+The panel also shows WHY each strategy is/ isn't a candidate. Same display-only / fail-open
+/ flag-OFF-byte-identical rules above still hold.
+- **Votes are the single source of truth from the PURE detectors:**
+  `scalp_live_sim.diagnose_strategies(lctx)` returns ALL 16 with pass/fail/direction/
+  reason authoritative from the real detector functions; `_missing_confirmations(key,lctx)`
+  gives best-effort "why not" hints. `scalp_live_sim.py` must stay pure (no app import,
+  no live state). `_advisory_strategy_votes()` wraps this and reuses the SAME confluence
+  scorer as the ranked candidates for a passed vote's confidence (so the number matches
+  its card); a passed detector with no candidate falls back to a display-only score and
+  does NOT create a trade card. Failed votes are Neutral / confidence 0 / carry a hint.
+- **Consensus (`_advisory_consensus`)** counts ONLY passed directional votes:
+  neutral = total − bullish − bearish; bias by count, confidence-sum tiebreak, else Neutral.
+- **Candidate cards** carry display-only `status` (REJECTED if rec Skip / READY if rec
+  Consider / else WATCHING) + `invalidation` text (off the stop, NOT a money signal).
+- **Neutral block must still carry the schema:** `_scalp_strategy_advisory_neutral`
+  returns `votes: []` + a neutral `consensus` (total 0, bias "Neutral") so the OFF/error
+  path doesn't KeyError the renderer. The smoke asserts this OFF-path schema too.
+- Render rebuilds `#mod-scalp-advisory` into 5 sections (status / votes / consensus /
+  candidate cards / safety notice) via `renderScalpAdvisory(d)` using `textContent` only
+  (XSS-safe); `innerHTML` only clears containers.

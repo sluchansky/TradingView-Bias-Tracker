@@ -24272,6 +24272,11 @@ def _scalp_strategy_advisory_neutral(reason="Strategy advisory disabled.",
         "generated_at": now_utc().isoformat(),
         "summary":      reason,
         "candidates":   [],
+        "votes":        [],
+        "consensus":    {
+            "bullish": 0, "bearish": 0, "neutral": 0, "total": 0,
+            "strongest_long": None, "strongest_short": None, "bias": "Neutral",
+        },
     }
 
 
@@ -24407,6 +24412,26 @@ def _analyze_advisory_candidate(cand, result, regime):
     else:
         rec = "Monitor"
 
+    # Display-only status + invalidation (advisory; never a money-path signal).
+    if rec == "Skip":
+        status = "REJECTED"
+    elif rec == "Consider":
+        status = "READY"
+    else:
+        status = "WATCHING"
+    invalidation = None
+    try:
+        _stop = cand.get("stop")
+        if _stop is not None:
+            _side = "below" if direction == "Long" else "above"
+            invalidation = "Invalid on a decisive move %s %.2f (stop)" % (_side, float(_stop))
+        elif favored and direction and favored != direction:
+            invalidation = "Invalid while the main bias stays %s" % favored
+        else:
+            invalidation = "Invalid if structure flips against %s" % (direction or "the setup")
+    except Exception:
+        invalidation = None
+
     return {
         "strategy_key":     skey,
         "name":             _strategy_pretty_name(skey),
@@ -24426,6 +24451,89 @@ def _analyze_advisory_candidate(cand, result, regime):
         "regime":           regime,
         "htf_alignment":    htf_alignment,
         "strict_alignment": strict_aligned,
+        "status":           status,
+        "invalidation":     invalidation,
+    }
+
+
+def _advisory_strategy_votes(lctx, analyzed, result, regime):
+    """DISPLAY-ONLY: the full 16-strategy vote roster. Pass/fail/direction/reason come
+    from the PURE detectors (sls.diagnose_strategies); confidence reuses the same
+    confluence scorer as the ranked candidates so a passed strategy's number matches
+    its card. Failed strategies vote Neutral with confidence 0 + a 'missing' hint.
+    FAIL-OPEN — never raises, never touches the money path."""
+    try:
+        import scalp_live_sim as sls
+        raw = sls.diagnose_strategies(lctx) or []
+    except Exception:
+        raw = []
+    score_by_key = {}
+    for c in (analyzed or []):
+        k = c.get("strategy_key")
+        if k is not None:
+            score_by_key[k] = c.get("quality_score")
+    votes = []
+    for v in raw:
+        key = v.get("strategy_key")
+        passed = bool(v.get("passed"))
+        direction = v.get("direction") or "Neutral"
+        if passed:
+            conf = score_by_key.get(key)
+            if conf is None:
+                try:
+                    conf = _analyze_advisory_candidate(
+                        {"strategy_key": key, "direction": direction}, result, regime
+                    ).get("quality_score", 0)
+                except Exception:
+                    conf = 0
+        else:
+            conf = 0
+        votes.append({
+            "strategy_key": key,
+            "name":         _strategy_pretty_name(key),
+            "direction":    direction if passed else "Neutral",
+            "passed":       passed,
+            "confidence":   conf,
+            "reason":       v.get("reason"),
+            "missing":      v.get("missing") or [],
+            "fidelity":     v.get("fidelity"),
+        })
+    return votes
+
+
+def _advisory_consensus(votes):
+    """DISPLAY-ONLY consensus across the strategy votes: bullish / bearish / neutral
+    counts, the strongest setup on each side, and an overall advisory bias. Never
+    raises; counts ONLY passed (firing) votes as directional."""
+    votes = votes or []
+    bull = [v for v in votes if v.get("passed") and v.get("direction") == "Long"]
+    bear = [v for v in votes if v.get("passed") and v.get("direction") == "Short"]
+    total = len(votes)
+    neutral = total - len(bull) - len(bear)
+
+    def _strongest(group):
+        if not group:
+            return None
+        best = max(group, key=lambda v: (v.get("confidence") or 0))
+        return {"name": best.get("name"), "direction": best.get("direction"),
+                "confidence": best.get("confidence")}
+
+    if len(bull) > len(bear):
+        bias = "Long"
+    elif len(bear) > len(bull):
+        bias = "Short"
+    else:
+        sb = sum((v.get("confidence") or 0) for v in bull)
+        ss = sum((v.get("confidence") or 0) for v in bear)
+        bias = "Long" if sb > ss else ("Short" if ss > sb else "Neutral")
+    return {
+        "bullish":         len(bull),
+        "bearish":         len(bear),
+        "neutral":         neutral,
+        "total":           total,
+        "strongest_long":  _strongest(bull),
+        "strongest_short": _strongest(bear),
+        "bias":            bias,
     }
 
 
@@ -24471,6 +24579,11 @@ def compute_scalp_strategy_advisory(result):
                 top.get("name"), top.get("direction"), top.get("quality_label"))
         else:
             summary = "No strategy setups detected on the current tape."
+        # Full 16-strategy vote roster + consensus (DISPLAY-ONLY). Pass/fail/direction
+        # come from the REAL detectors (single source of truth); confidence reuses the
+        # same confluence scorer as the ranked candidates so the numbers agree.
+        votes = _advisory_strategy_votes(lctx, analyzed, result, regime)
+        consensus = _advisory_consensus(votes)
         return {
             "enabled":      True,
             "available":    True,
@@ -24478,6 +24591,8 @@ def compute_scalp_strategy_advisory(result):
             "generated_at": now_utc().isoformat(),
             "summary":      summary,
             "candidates":   analyzed,
+            "votes":        votes,
+            "consensus":    consensus,
         }
     except Exception as exc:
         return _scalp_strategy_advisory_neutral(
@@ -30131,10 +30246,17 @@ def dashboard():
      unless SCALP_MAIN_BRAIN_ADVISORY_ENABLED is on (fed by d.scalp_strategy_advisory).
      ALL dynamic strings are written via textContent (XSS-safe), never innerHTML. -->
 <div class="mod" id="mod-scalp-advisory" style="display:none">
-  <div class="mod-h">🧠 Strategy Radar — Potential Trades <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">ADVISORY-ONLY</span></div>
-  <div id="ssa-summary" class="mb-summary" style="margin-bottom:6px">—</div>
+  <div class="mod-h">🧠 Strategy Advisory Reasoning <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">ADVISORY-ONLY</span></div>
+  <div id="ssa-status" class="sd-grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px"></div>
+  <div id="ssa-summary" class="mb-summary" style="margin:8px 0">—</div>
+  <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:10px 0 4px;letter-spacing:.3px">Consensus</div>
+  <div id="ssa-consensus" class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
+  <div id="ssa-consensus2" style="font-size:11px;color:#9aa3b2;margin-top:6px"></div>
+  <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:12px 0 4px;letter-spacing:.3px">Strategy Votes <span style="color:#6b7280;font-weight:400">(all 16)</span></div>
+  <div id="ssa-votes"></div>
+  <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:12px 0 4px;letter-spacing:.3px">Candidate Trade Cards</div>
   <div id="ssa-list"></div>
-  <div class="nf-fid">All 16 research scalp strategies, analyzed for trade potential from the current tape. Advisory only — it ranks ideas, it never places or changes a trade.</div>
+  <div class="nf-fid" id="ssa-safety">Advisory layer is display-only and does not place or influence live trades.</div>
 </div>
 
 <div class="mod mb-hidden" id="mod-countdown">
@@ -32463,43 +32585,122 @@ function renderScalpAdvisory(d){
   const a=(d&&d.scalp_strategy_advisory)||null;
   if(!a||!a.enabled){ mod.style.display='none'; return; }
   mod.style.display='';
+  const fmt=function(x){ return (typeof x==='number')?x.toFixed(2):'—'; };
+  const dirColor=function(dir){ return (dir==='Short')?'#ef4444':((dir==='Long')?'#22c55e':'#9aa3b2'); };
+  const mkTile=function(label,value,color){
+    const t=document.createElement('div'); t.className='gstat';
+    const l=document.createElement('div'); l.className='l'; l.textContent=label;
+    const v=document.createElement('div'); v.className='v'; v.textContent=value;
+    if(color){ v.style.color=color; }
+    t.appendChild(l); t.appendChild(v); return t;
+  };
+  const cands=(a.candidates)||[];
+  // 1. Advisory Status.
+  const st=document.getElementById('ssa-status');
+  if(st){
+    st.innerHTML='';
+    st.appendChild(mkTile('Enabled', a.enabled?'Yes':'No', a.enabled?'#22c55e':'#9aa3b2'));
+    st.appendChild(mkTile('Available', a.available?'Yes':'No', a.available?'#22c55e':'#ef4444'));
+    st.appendChild(mkTile('Candidates', String(cands.length), cands.length?'#22c55e':'#9aa3b2'));
+    st.appendChild(mkTile('State', cands.length?'Active':'Waiting', '#e8e8f0'));
+  }
   _mbSetText('ssa-summary', a.summary);
+  // 3. Consensus Summary.
+  const cons=(a.consensus)||{};
+  const cw=document.getElementById('ssa-consensus');
+  if(cw){
+    cw.innerHTML='';
+    cw.appendChild(mkTile('Bullish', String(cons.bullish||0), '#22c55e'));
+    cw.appendChild(mkTile('Bearish', String(cons.bearish||0), '#ef4444'));
+    cw.appendChild(mkTile('Neutral', String(cons.neutral||0), '#9aa3b2'));
+  }
+  const cw2=document.getElementById('ssa-consensus2');
+  if(cw2){
+    cw2.innerHTML='';
+    const bdir=(cons.bias||'Neutral');
+    const bias=document.createElement('div');
+    bias.textContent='Overall bias: '+bdir;
+    bias.style.color=dirColor(bdir); bias.style.fontWeight='600';
+    cw2.appendChild(bias);
+    const sl=cons.strongest_long, ss=cons.strongest_short;
+    const slL=document.createElement('div'); slL.style.color='#9aa3b2';
+    slL.textContent='Strongest long: '+(sl?(sl.name+' ('+((sl.confidence!=null)?sl.confidence:'—')+')'):'none');
+    const ssL=document.createElement('div'); ssL.style.color='#9aa3b2';
+    ssL.textContent='Strongest short: '+(ss?(ss.name+' ('+((ss.confidence!=null)?ss.confidence:'—')+')'):'none');
+    cw2.appendChild(slL); cw2.appendChild(ssL);
+  }
+  // 2. Strategy Votes — all 16.
+  const vw=document.getElementById('ssa-votes');
+  if(vw){
+    vw.innerHTML='';
+    const votes=(a.votes)||[];
+    if(!votes.length){
+      const e=document.createElement('div'); e.style.cssText='color:#6b7280;font-size:12px';
+      e.textContent='No strategy votes available.'; vw.appendChild(e);
+    } else {
+      votes.forEach(function(v){
+        const row=document.createElement('div');
+        row.style.cssText='display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:2px 0';
+        const left=document.createElement('span'); left.style.cssText='font-size:11px;color:#cdd3e0';
+        left.textContent=(v.name||v.strategy_key||'—');
+        const right=document.createElement('span'); right.style.cssText='font-size:11px;font-weight:600;white-space:nowrap';
+        const dir=v.passed?(v.direction||'—'):'NEUTRAL';
+        right.textContent=String(dir).toUpperCase()+' · '+((v.confidence!=null)?v.confidence:'—');
+        right.style.color=v.passed?dirColor(v.direction):'#6b7280';
+        row.appendChild(left); row.appendChild(right); vw.appendChild(row);
+        const note=document.createElement('div'); note.style.cssText='font-size:10px;margin:0 0 4px';
+        if(v.passed){
+          note.style.color='#7a8699'; note.textContent='✓ '+((v.reason)||'Triggered');
+        } else {
+          note.style.color='#6b7280';
+          const miss=(v.missing&&v.missing.length)?('needs '+v.missing.join(', ')):((v.reason)||'conditions not met');
+          note.textContent='✗ '+miss;
+        }
+        vw.appendChild(note);
+      });
+    }
+  }
+  // 4. Candidate Trade Cards.
   const wrap=document.getElementById('ssa-list'); if(!wrap) return;
   wrap.innerHTML='';
-  const arr=(a.candidates)||[];
-  if(!arr.length){
+  if(!cands.length){
     const e=document.createElement('div'); e.style.cssText='color:#6b7280;font-size:12px';
-    e.textContent='No strategy setups on the current tape.'; wrap.appendChild(e); return;
+    e.textContent='No qualifying candidates on the current tape.'; wrap.appendChild(e); return;
   }
-  const fmt=function(x){ return (typeof x==='number')?x.toFixed(2):'—'; };
-  arr.slice(0,6).forEach(function(c){
-    const row=document.createElement('div');
-    row.style.cssText='border-top:1px solid #1f2030;padding:7px 0';
+  cands.slice(0,8).forEach(function(c){
+    const card=document.createElement('div');
+    card.style.cssText='border:1px solid #1f2030;border-radius:8px;padding:8px;margin-top:6px';
     const top=document.createElement('div');
     top.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px';
     const left=document.createElement('span'); left.style.fontWeight='600';
     const dir=(c.direction||'');
     left.textContent=(c.name||c.strategy_key||'—')+' · '+dir;
-    left.style.color=(dir==='Short')?'#ef4444':((dir==='Long')?'#22c55e':'#e8e8f0');
-    const right=document.createElement('span'); right.style.cssText='font-size:11px;color:#9aa3b2';
-    const q=(typeof c.quality_score==='number')?(' '+c.quality_score):'';
-    right.textContent=(c.recommendation||'—')+' · '+(c.quality_label||'—')+q;
-    top.appendChild(left); top.appendChild(right); row.appendChild(top);
-    const plan=document.createElement('div'); plan.style.cssText='font-size:11px;color:#9aa3b2;margin-top:3px';
-    plan.textContent='Entry '+fmt(c.entry)+'  Stop '+fmt(c.stop)+'  Target '+fmt(c.target)+'  R:R '+((c.rr!=null)?c.rr:'—');
-    row.appendChild(plan);
+    left.style.color=dirColor(dir);
+    const status=(c.status||'WATCHING');
+    const sc=(status==='READY')?'#22c55e':((status==='REJECTED')?'#ef4444':'#f59e0b');
+    const badge=document.createElement('span');
+    badge.style.cssText='font-size:10px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:4px;color:'+sc+';border:1px solid '+sc;
+    badge.textContent=status;
+    top.appendChild(left); top.appendChild(badge); card.appendChild(top);
+    const plan=document.createElement('div'); plan.style.cssText='font-size:11px;color:#9aa3b2;margin-top:4px';
+    plan.textContent='Entry '+fmt(c.entry)+'  Stop '+fmt(c.stop)+'  Target '+fmt(c.target)+'  R:R '+((c.rr!=null)?c.rr:'—')+'  Conf '+((c.quality_score!=null)?c.quality_score:'—');
+    card.appendChild(plan);
     if(c.entry_reason){
-      const rs=document.createElement('div'); rs.style.cssText='font-size:10px;color:#6b7280;margin-top:2px';
-      rs.textContent=c.entry_reason; row.appendChild(rs);
+      const rs=document.createElement('div'); rs.style.cssText='font-size:10px;color:#7a8699;margin-top:3px';
+      rs.textContent=c.entry_reason; card.appendChild(rs);
     }
     const tags=[];
     (c.confluence||[]).forEach(function(t){ tags.push('+ '+t); });
     (c.conflicts||[]).forEach(function(t){ tags.push('! '+t); });
     if(tags.length){
-      const tg=document.createElement('div'); tg.style.cssText='font-size:10px;color:#6b7280;margin-top:2px';
-      tg.textContent=tags.join('   '); row.appendChild(tg);
+      const tg=document.createElement('div'); tg.style.cssText='font-size:10px;color:#6b7280;margin-top:3px';
+      tg.textContent=tags.join('   '); card.appendChild(tg);
     }
-    wrap.appendChild(row);
+    if(c.invalidation){
+      const iv=document.createElement('div'); iv.style.cssText='font-size:10px;color:#9a6b6b;margin-top:3px';
+      iv.textContent='Invalidation: '+c.invalidation; card.appendChild(iv);
+    }
+    wrap.appendChild(card);
   });
 }
 function renderMainBrainCognitive(d){

@@ -291,6 +291,122 @@ LIVE_SIM_DETECTORS = {
 }
 
 
+def _missing_confirmations(key, l):
+    """Best-effort, DISPLAY-ONLY hints for why a strategy did NOT fire, derived from
+    the same live-context flags its detector reads. Returns a list of short human
+    strings. PURE + never raises. This is a diagnostic aid only — the authoritative
+    pass/fail/direction/reason always come from the real detector."""
+    if not isinstance(l, dict):
+        return ["live context"]
+    g = l.get
+    atr = g("atr")
+    vwap_ok = g("vwap_ok"); near = g("near_vwap")
+    above = g("price_above_vwap"); below = g("price_below_vwap")
+    sl = g("structure_long"); ss = g("structure_short")
+    bullc = g("has_bull_confirm"); bearc = g("has_bear_confirm")
+    bulls = g("has_bull_sweep"); bears = g("has_bear_sweep")
+    vol = g("volume_ok"); rvol = g("rvol"); regime = g("regime")
+    dem = g("nearest_demand"); sup = g("nearest_supply")
+    m = []
+    if key == "vwap_pullback_continuation":
+        if not vwap_ok: m.append("VWAP data")
+        if not near: m.append("pullback to VWAP")
+        if not (sl or ss): m.append("trend structure")
+        if not (bullc or bearc): m.append("entry confirmation")
+    elif key == "vwap_reclaim_fail":
+        if not vwap_ok: m.append("VWAP data")
+        if not vol: m.append("volume")
+        if not (g("has_choch_demand") or g("has_choch_supply")): m.append("CHOCH across VWAP")
+    elif key == "opening_range_breakout":
+        if not g("or_complete"): m.append("opening range")
+        if not vwap_ok: m.append("VWAP data")
+        if not vol: m.append("breakout volume")
+        m.append("price beyond OR high/low on the VWAP side")
+    elif key == "opening_range_fakeout":
+        if not g("in_opening_window"): m.append("opening window")
+        if not g("or_complete"): m.append("opening range")
+        if not (bulls or bears): m.append("OR sweep + reversal")
+    elif key == "liquidity_sweep_reversal":
+        if not vwap_ok: m.append("VWAP data")
+        if not (bulls or bears): m.append("liquidity sweep")
+    elif key == "failed_breakdown_breakout":
+        if not (bulls or bears): m.append("range sweep")
+        if not (sl or ss): m.append("structure reclaim")
+    elif key == "micro_pullback_scalp":
+        if rvol is None or rvol < 1.5: m.append("RVOL >= 1.5")
+        if not (sl or ss): m.append("trend structure")
+        if not (bullc or bearc): m.append("entry confirmation")
+    elif key == "ema_9_20_continuation":
+        if regime != "TRENDING": m.append("trending regime")
+        if not near: m.append("VWAP pullback")
+        if not (sl or ss): m.append("trend structure")
+    elif key == "fvg_continuation":
+        if not atr: m.append("ATR")
+        if dem is None and sup is None: m.append("imbalance / FVG zone")
+        if not (bullc or bearc): m.append("hold confirmation")
+    elif key == "order_block_rejection":
+        if not atr: m.append("ATR")
+        if dem is None and sup is None: m.append("order-block zone")
+        m.append("price tagging the zone")
+    elif key == "prior_high_low_sweep":
+        if not (bulls or bears): m.append("swing sweep")
+        if not (sl or ss): m.append("aligned structure")
+    elif key == "session_high_low_reclaim":
+        if not (bulls or bears): m.append("session sweep")
+        if not (above or below): m.append("VWAP-side reclaim")
+    elif key == "volume_climax_reversal":
+        if rvol is None or rvol < 2.5: m.append("RVOL >= 2.5 climax")
+        if not (bulls or bears): m.append("absorption sweep")
+    elif key == "cvd_divergence_scalp":
+        if g("cvd_state") not in ("bullish", "bearish"): m.append("CVD divergence")
+        if not (above or below): m.append("price vs VWAP stretch")
+    elif key == "range_edge_mean_reversion":
+        if not atr: m.append("ATR")
+        if regime != "RANGING": m.append("ranging regime")
+        m.append("price at a range edge")
+    elif key == "compression_breakout":
+        if not g("range_tight"): m.append("tight compression")
+        if not vol: m.append("breakout volume")
+        if not (g("broke_range_high") or g("broke_range_low")): m.append("range break")
+    if not m:
+        m.append("setup trigger")
+    return m
+
+
+def diagnose_strategies(lctx):
+    """DISPLAY-ONLY: run EVERY testable detector and return the full 16-strategy vote
+    roster. Pass/fail/direction/reason come from the REAL detector (single source of
+    truth); a strategy that did not fire gets a best-effort 'missing confirmations'
+    hint from the same live-context flags. PURE + FAIL-OPEN: a detector that raises is
+    treated as 'no signal', never propagated. Opens / sizes / sends nothing."""
+    votes = []
+    if not isinstance(lctx, dict):
+        lctx = {}
+    for key, fn in LIVE_SIM_DETECTORS.items():
+        try:
+            sig = fn(lctx)
+        except Exception:
+            sig = None
+        if sig:
+            direction, reason = sig
+            votes.append({
+                "strategy_key": key, "direction": direction, "passed": True,
+                "reason": reason, "missing": [],
+                "fidelity": FIDELITY.get(key, "approximate"),
+            })
+        else:
+            try:
+                missing = _missing_confirmations(key, lctx)
+            except Exception:
+                missing = []
+            votes.append({
+                "strategy_key": key, "direction": "Neutral", "passed": False,
+                "reason": "Trigger conditions not met", "missing": missing,
+                "fidelity": FIDELITY.get(key, "approximate"),
+            })
+    return votes
+
+
 def _geometry(direction, price, atr, dem, sup):
     """Pure entry/stop/target geometry for a detected candidate. Entry = current
     price (market paper fill); stop = a nearby structural zone if one sits within
@@ -391,6 +507,18 @@ if __name__ == "__main__":
     assert build_candidates({"price": 2000.0, "vwap_ok": True, "near_vwap": True,
                              "price_above_vwap": True, "structure_long": True,
                              "has_bull_confirm": True}) == []
+
+    # diagnose_strategies: full 16-vote roster, pass/fail authoritative from detectors.
+    votes = diagnose_strategies(long_ctx)
+    assert len(votes) == 16, len(votes)
+    assert all({"strategy_key", "direction", "passed", "reason", "missing"} <= set(v)
+               for v in votes), votes
+    assert any(v["passed"] for v in votes), "no passing votes on the long context"
+    assert all(isinstance(v["missing"], list) for v in votes if not v["passed"])
+    # An empty context fires nothing → 16 failed votes, each with a missing hint.
+    empty_votes = diagnose_strategies({})
+    assert len(empty_votes) == 16 and not any(v["passed"] for v in empty_votes)
+    assert all(v["missing"] for v in empty_votes), "failed votes must carry a hint"
 
     print("scalp_live_sim self-test OK — %d detectors, sample candidates=%d"
           % (len(LIVE_SIM_DETECTORS), len(cands)))
