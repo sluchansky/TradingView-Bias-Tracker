@@ -1,0 +1,279 @@
+# Overnight Development Sprint — Main Brain Cognitive Upgrade
+
+The dashboard has reached a point where it has enough indicators and data. I do not want to continue adding more indicators unless they provide a significant edge.
+
+The next phase is improving how the AI thinks.
+
+The goal is to evolve the Main Brain from a signal processor into a professional market analyst that continuously observes, reasons, predicts, explains, and learns.
+
+## Overall Objective
+
+Instead of asking:
+
+"Is there a trade?"
+
+The AI should continuously ask:
+
+* What is the market trying to do?
+* Who currently controls the market?
+* Has anything changed?
+* What is most likely to happen next?
+* How confident am I?
+* What evidence supports that opinion?
+* What evidence contradicts it?
+* What would change my opinion?
+
+The Main Brain should maintain an internal understanding of the market throughout the session.
+
+---
+
+# 1. Continuous Market Narrative
+
+Maintain a live narrative that updates throughout the trading session.
+
+Example:
+
+Overnight:
+Buyers defended demand.
+
+London:
+Liquidity above highs was swept.
+
+New York Open:
+VWAP rejected.
+
+Current:
+Sellers remain in control.
+
+Expectation:
+Bearish continuation unless VWAP is reclaimed.
+
+Every new alert should update this story rather than starting over.
+
+---
+
+# 2. Market Memory
+
+The AI should remember recent market events.
+
+Examples:
+
+* Previous VWAP tests
+* Previous liquidity sweeps
+* Previous BOS
+* Previous CHOCH
+* Previous CVD flips
+* Previous volume spikes
+* Previous Edge Scores
+
+Recent context should influence current decisions.
+
+---
+
+# 3. Confidence Engine
+
+Confidence should change continuously.
+
+Display:
+
+Current Confidence
+
+Highest Today
+
+Lowest Today
+
+Trend
+
+Most importantly explain WHY.
+
+Example:
+
++5 VWAP rejection
+
++4 CVD confirmation
+
++3 Volume confirmation
+
+-2 Nearby support
+
+Confidence should never appear random.
+
+---
+
+# 4. Self Debate
+
+Every decision should include opposing viewpoints.
+
+Bull Thesis
+
+Bear Thesis
+
+Each receives a probability.
+
+The Main Brain then explains why one side currently has the advantage.
+
+---
+
+# 5. Prediction Engine
+
+Instead of only reacting, estimate likely future events.
+
+Example:
+
+Probability bearish BOS forms within next three candles.
+
+Probability VWAP reclaim.
+
+Probability liquidity sweep.
+
+Probability trend continuation.
+
+The AI should begin anticipating market behavior.
+
+---
+
+# 6. Trade Health
+
+Once in a trade the analysis should continue.
+
+Show:
+
+Trade Health
+
+Momentum
+
+Structure
+
+VWAP
+
+Order Flow
+
+Risk
+
+Exit Confidence
+
+Hold Confidence
+
+Scale Out Recommendation
+
+The AI should actively manage positions.
+
+---
+
+# 7. Explain Every Decision
+
+Every recommendation should answer:
+
+What do I see?
+
+What changed?
+
+Why does it matter?
+
+What am I waiting for?
+
+What would invalidate this idea?
+
+---
+
+# 8. Session Awareness
+
+The AI should understand where the market is within the trading day.
+
+Examples:
+
+Pre-market
+
+Open
+
+Opening drive
+
+Trend day
+
+Range day
+
+Lunch
+
+Power Hour
+
+Overnight
+
+Different sessions should influence confidence and trade selection.
+
+---
+
+# 9. Continuous Learning
+
+Every completed trade becomes feedback.
+
+Track:
+
+Highest expectancy setup
+
+Lowest expectancy setup
+
+Most common losing pattern
+
+Most profitable confirmation combinations
+
+Best trading hours
+
+Worst trading hours
+
+Most common exit mistake
+
+Allow these statistics to gradually influence confidence scoring.
+
+---
+
+# 10. Explain Confidence
+
+Every confidence score should be decomposed.
+
+Example:
+
+Edge Score 84
+
++20 Structure
+
++15 VWAP
+
++15 Order Flow
+
++12 Volume
+
++10 Liquidity
+
++8 Session Context
+
++4 Index Alignment
+
+-5 Nearby Resistance
+
+Nothing should feel like a black box.
+
+---
+
+# 11. Human Conversation
+
+The Main Brain should feel like an analyst sitting beside me.
+
+Instead of only saying:
+
+"WAIT"
+
+It should say:
+
+"I've seen two failed attempts to reclaim VWAP. Seller delta remains strong and all three equity indexes are aligned bearish. However, structure has not confirmed with a bearish BOS yet. I'm waiting because entering now increases the chance of getting caught in a pullback."
+
+The reasoning should sound natural and evolve throughout the session.
+
+---
+
+# Final Goal
+
+The objective is not to create more indicators.
+
+The objective is to create an AI that continuously observes, reasons, predicts, explains its thinking, critiques its own decisions, learns from completed trades, and gradually behaves more like an experienced discretionary futures trader than a collection of independent trading rules.
+
+Every module in the dashboard should contribute to one continuously evolving market understanding instead of acting as isolated indicators.
