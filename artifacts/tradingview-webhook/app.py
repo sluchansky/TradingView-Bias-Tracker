@@ -1607,6 +1607,25 @@ OVERSIZED_LOSS_MULT               = max(1.0, float(os.environ.get("OVERSIZED_LOS
 SESSION_QUALITY_ENABLED           = os.environ.get("SESSION_QUALITY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 BOT_HOLD_SCORE_ENABLED            = os.environ.get("BOT_HOLD_SCORE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
+# ── Simulation realism overlay (DISPLAY-ONLY, default ON) ─────────────────────
+# The dashboard scoreboard is a proxy-feed SIMULATION with idealized fills (exits
+# land exactly at target/stop and cost nothing), so it reads far rosier than the
+# real account. When ON (default), the SIMULATED display surfaces (equity curve,
+# win rate, Today's Trades) subtract a realistic round-trip commission + per-side
+# slippage — expressed in R against each trade's OWN risk — so a 1:1 micro that
+# breaks even on the proxy correctly reads as a NET loser. Kill-switch:
+# SIM_REALISM_ENABLED=0/off. This NEVER mutates stored strategy_trades rows,
+# journal pnl_dollars, compute_pnl, the gate / sizing / dedupe / broker, or the
+# daily-loss safety gate (all stay byte-identical). The Real Account Results panel
+# (TradeZella import) remains the ONLY source of real P&L. Goldens are unaffected
+# (they exercise scoring, not the equity display) and pin this OFF for insurance.
+SIM_REALISM_ENABLED               = _env_flag_on("SIM_REALISM_ENABLED")
+# Commission charged per side (entry + exit), in USD per contract. _env_float
+# fails safe to the default on a malformed value so a bad env can't crash boot.
+SIM_REALISM_COMMISSION_PER_SIDE   = max(0.0, _env_float("SIM_REALISM_COMMISSION_PER_SIDE", 0.62))
+# Worst-case slippage per side, in TICKS (applied on both entry and exit).
+SIM_REALISM_SLIPPAGE_TICKS        = max(0.0, _env_float("SIM_REALISM_SLIPPAGE_TICKS", 1.0))
+
 # PAPER conditional-runner lifecycle (simulated; NO broker). When ON, a SCALP
 # managed *paper* trade books contract 1 at ~1R and lets the remainder run until a
 # conditional runner-exit signal (structure break / VWAP loss / CVD-delta flip /
@@ -10142,6 +10161,72 @@ def _empty_equity_curve(ticker, available=True, note=None):
     }
 
 
+def _sim_realism_cfg():
+    """(enabled, commission_per_side, slippage_ticks) for the DISPLAY-ONLY
+    simulation-realism overlay. Read from module config so an env kill-switch /
+    tuning takes effect on the next restart."""
+    return (SIM_REALISM_ENABLED,
+            SIM_REALISM_COMMISSION_PER_SIDE,
+            SIM_REALISM_SLIPPAGE_TICKS)
+
+
+def _sim_realism_cost_r(symbol, entry, stop):
+    """Estimated round-trip trading COST for a simulated trade, expressed in R
+    (risk multiples), using the instrument's tick size + point value:
+
+        cost_$ per contract = commission_per_side*2  +  slippage_ticks*tick*pv*2
+        risk_$ per contract = |entry - stop| * pv
+        cost_R              = cost_$ / risk_$   (contracts cancel — R is per-contract)
+
+    Direction-independent (cost is always adverse). Returns a non-negative float,
+    or None when it cannot be computed (overlay OFF, missing/invalid entry|stop,
+    zero risk, unknown instrument) so every caller FAILS OPEN to the raw R.
+    DISPLAY-ONLY — never read by the gate, sizing, dedupe, broker, or daily-loss."""
+    enabled, comm_side, slip_ticks = _sim_realism_cfg()
+    if not enabled:
+        return None
+    try:
+        e = float(entry)
+        s = float(stop)
+    except (TypeError, ValueError):
+        return None
+    if e <= 0 or s <= 0 or e == s:
+        return None
+    # Resolve the instrument STRICTLY (no lenient MGC default) so an unknown /
+    # ambiguous symbol fails open to the raw R instead of borrowing MGC's specs.
+    inst = _instrument_from_text(symbol)
+    if not inst or inst not in INSTRUMENT_SPECS:
+        return None
+    try:
+        spec = INSTRUMENT_SPECS[inst]
+        pv   = float(spec.get("point_value") or 0)
+        tick = float(spec.get("tick_size") or 0)
+    except Exception:
+        return None
+    if pv <= 0 or tick <= 0:
+        return None
+    risk_dollars = abs(e - s) * pv
+    if risk_dollars <= 0:
+        return None
+    commission = comm_side * 2.0
+    slippage   = slip_ticks * tick * pv * 2.0
+    return (commission + slippage) / risk_dollars
+
+
+def _sim_realism_net_r(symbol, entry, stop, raw_r):
+    """raw R minus the estimated cost-in-R. Returns (net_r, applied). Fails OPEN
+    (raw_r, False) whenever the cost can't be computed, so a row missing entry/
+    stop keeps its raw R untouched."""
+    try:
+        raw = float(raw_r)
+    except (TypeError, ValueError):
+        return raw_r, False
+    cost_r = _sim_realism_cost_r(symbol, entry, stop)
+    if cost_r is None:
+        return raw, False
+    return raw - cost_r, True
+
+
 def get_today_equity_curve(ticker):
     """Cumulative-R points for trades CLOSED today (ET) for `ticker`, built from
     real strategy_trades rows. Display-only; short-cached; FAIL-OPEN (returns an
@@ -10166,7 +10251,7 @@ def get_today_equity_curve(ticker):
         cur.execute(
             """
             SELECT closed_at, r_multiple, result, strategy_key, strategy, direction,
-                   entry, hold_minutes, symbol
+                   entry, stop, hold_minutes, symbol
             FROM strategy_trades
             WHERE r_multiple IS NOT NULL
               AND closed_at IS NOT NULL
@@ -10187,15 +10272,25 @@ def get_today_equity_curve(ticker):
         _want = instrument_of(ticker)
         rows = [r for r in rows if _instrument_from_text(r.get("symbol")) == _want]
         points, cum, wins, losses = [], 0.0, 0, 0
+        realism_used = False
         for r in rows:
             try:
                 rm = float(r["r_multiple"])
             except Exception:
                 continue
-            cum += rm
-            if rm > 0:
+            # DISPLAY-ONLY realism overlay: subtract estimated commission +
+            # slippage (in R) so the SIMULATED scoreboard tracks the real account
+            # — a marginal proxy "win" can flip to a NET loss. The stored row and
+            # the entire money path are untouched; raw_r/raw_result are preserved.
+            net_rm, applied = _sim_realism_net_r(
+                r.get("symbol"), r.get("entry"), r.get("stop"), rm)
+            disp_rm = net_rm if applied else rm
+            if applied:
+                realism_used = True
+            cum += disp_rm
+            if disp_rm > 0:
                 wins += 1
-            elif rm < 0:
+            elif disp_rm < 0:
                 losses += 1
             try:
                 _entry = float(r["entry"]) if r.get("entry") is not None else None
@@ -10205,20 +10300,27 @@ def get_today_equity_curve(ticker):
                 _hold = int(r["hold_minutes"]) if r.get("hold_minutes") is not None else None
             except Exception:
                 _hold = None
+            _disp_result = r.get("result")
+            if applied:
+                _disp_result = ("Win" if disp_rm > 0
+                                else "Loss" if disp_rm < 0 else r.get("result"))
             points.append({
-                "t":        fmt_et(r["closed_at"], "%H:%M"),
-                "r":        round(rm, 2),
-                "cum":      round(cum, 2),
-                "result":   r.get("result"),
-                "strategy": r.get("strategy") or r.get("strategy_key"),
-                "dir":      r.get("direction"),
-                "entry":    _entry,
-                "hold":     _hold,
+                "t":          fmt_et(r["closed_at"], "%H:%M"),
+                "r":          round(disp_rm, 2),
+                "raw_r":      round(rm, 2),
+                "cum":        round(cum, 2),
+                "result":     _disp_result,
+                "raw_result": r.get("result"),
+                "strategy":   r.get("strategy") or r.get("strategy_key"),
+                "dir":        r.get("direction"),
+                "entry":      _entry,
+                "hold":       _hold,
             })
         out = {
             "available": True, "symbol": ticker, "points": points,
             "count": len(points), "wins": wins, "losses": losses,
             "total_r": round(cum, 2),
+            "realism_applied": bool(realism_used),
             "note": None if points else "No closed trades today",
         }
         with _EQUITY_LOCK:
@@ -29439,7 +29541,7 @@ def dashboard():
 
 <!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
 <div class="mod" id="mod-equity">
-  <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcome simulated from a price proxy — not your real broker fills. See Real Account Results above for actual P&amp;L." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
+  <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcome simulated from a price proxy — not your real broker fills, and shown NET of estimated commission &amp; slippage. See Real Account Results above for actual P&amp;L." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED · NET</span></div>
   <div class="eq-top">
     <div class="gstat"><div class="l">Net R</div><div class="v" id="eq-net">—</div></div>
     <div class="gstat"><div class="l">Trades</div><div class="v" id="eq-count">—</div></div>
@@ -29453,7 +29555,7 @@ def dashboard():
 
 <!-- Today's Trades — per-trade list of trades closed today (display-only, from strategy_trades) -->
 <div class="mod" id="mod-trades">
-  <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcomes simulated from a price proxy — not your real broker fills. See Real Account Results above for actual trades." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
+  <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcomes simulated from a price proxy — not your real broker fills, and shown NET of estimated commission &amp; slippage. See Real Account Results above for actual trades." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED · NET</span></div>
   <div class="tt-pairs" id="tt-pairs">
     <span class="tt-pair active" id="tt-pair-MGC" role="button" tabindex="0" onclick="ttSelect('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MGC');}">MGC</span>
     <span class="tt-pair" id="tt-pair-MNQ" role="button" tabindex="0" onclick="ttSelect('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MNQ');}">MNQ</span>
