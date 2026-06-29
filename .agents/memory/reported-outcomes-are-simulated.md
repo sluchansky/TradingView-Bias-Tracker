@@ -35,3 +35,8 @@ trades the bot never recorded.
   fees+slippage.
 - Any future "the bot is winning" claim sourced from `strategy_trades` is a simulation
   claim until reconciled with real fills.
+- The dashboard now makes this explicit: a **Real Account Results** panel
+  (`#mod-real-results`) renders the `scoreboard` from `/tradezella/analysis` (real
+  broker fills imported via TradeZella CSV), and the equity/today's-trades/learning
+  panels carry an amber **SIMULATED** badge. Real P&L = that scoreboard ONLY; don't
+  "fix" the simulated panels to look real, and never wire the sim into a money decision.

@@ -23865,6 +23865,60 @@ def _tradezella_import_summary():
     return summary
 
 
+def _tradezella_scoreboard(trades):
+    """Compact REAL-account scoreboard from imported TradeZella / broker trades for the
+    dashboard 'Real Account Results' panel. DISPLAY-ONLY / fail-open -> safe empty shape.
+    'today' is keyed on the ET session day. Decided (win/loss) rows drive win-rate; net
+    P&L sums every row's net pnl. NEVER touches the gate, sizing, dedupe or the broker."""
+    def _blank():
+        return {"count": 0, "decided": 0, "wins": 0, "losses": 0,
+                "win_rate": None, "net_pnl": 0.0}
+    out = {"all_time": _blank(), "today": _blank(),
+           "by_instrument": [], "today_et": None}
+    try:
+        today_et = now_utc().astimezone(ET_TZ).date().isoformat()
+        out["today_et"] = today_et
+
+        def _accum(bucket, t):
+            bucket["count"] += 1
+            pnl = t.get("pnl")
+            try:
+                bucket["net_pnl"] += float(pnl) if pnl is not None else 0.0
+            except (TypeError, ValueError):
+                pass
+            oc = (t.get("outcome") or "").strip().lower()
+            if oc == "win":
+                bucket["decided"] += 1
+                bucket["wins"] += 1
+            elif oc == "loss":
+                bucket["decided"] += 1
+                bucket["losses"] += 1
+
+        per = {}
+        for t in (trades or []):
+            if not isinstance(t, dict):
+                continue
+            _accum(out["all_time"], t)
+            sd = str(t.get("session_day") or "")[:10]
+            if sd and sd == today_et:
+                _accum(out["today"], t)
+            sym = ((t.get("symbol") or "?").strip().upper()) or "?"
+            g = per.get(sym)
+            if g is None:
+                g = _blank()
+                g["symbol"] = sym
+                per[sym] = g
+            _accum(g, t)
+
+        for b in [out["all_time"], out["today"]] + list(per.values()):
+            b["win_rate"] = (b["wins"] / b["decided"]) if b["decided"] else None
+            b["net_pnl"] = round(b["net_pnl"], 2)
+        out["by_instrument"] = sorted(per.values(), key=lambda g: g["net_pnl"])
+    except Exception as exc:
+        logger.warning("tradezella scoreboard failed: %s", exc)
+    return out
+
+
 def _tz_guard():
     """None when TradeZella review is usable, else a (json, status) error tuple."""
     if not TRADEZELLA_AVAILABLE:
@@ -23944,6 +23998,7 @@ def tradezella_analysis():
         "ok": True,
         "db_ready": TRADEZELLA_DB_READY,
         "import_summary": _tradezella_import_summary(),
+        "scoreboard": _tradezella_scoreboard(trades),
         "analysis": analysis,
     })
 
@@ -28495,6 +28550,39 @@ def dashboard():
     <div class="dir-btn long active" onclick="userPickedSetup=true; setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
     <div class="dir-btn short" onclick="userPickedSetup=true; setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
+  <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
+       TradeZella / broker CSV. This is the source of truth for P&L and win-rate.
+       The proxy-feed panels below (Equity Curve, Today's Trades, Learning Stats)
+       are SIMULATIONS off a price proxy and are labelled SIMULATED. DISPLAY-ONLY —
+       this panel never touches the gate, scoring, sizing or the broker. ════ -->
+  <div class="mod" id="mod-real-results">
+    <div class="mod-h">💰 Real Account Results
+      <span style="font-size:10px;color:#22c55e;letter-spacing:1.5px">BROKER FILLS</span>
+      <span id="rr-asof" style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">—</span>
+    </div>
+    <div id="rr-empty" style="display:none;color:#9ca3af;font-size:13px;line-height:1.55">
+      No real trades imported yet — the numbers in the panels below are <b>simulated</b> from a
+      price proxy, not your broker fills. Import your TradeZella / broker CSV to see your real
+      account here.
+      <div style="margin-top:10px"><span role="button" tabindex="0" onclick="setView('tradezella')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();setView('tradezella');}" style="display:inline-block;padding:6px 12px;border:1px solid #22c55e;border-radius:6px;color:#22c55e;cursor:pointer;font-size:12px;letter-spacing:.5px">📥 Import trades</span></div>
+    </div>
+    <div id="rr-body" style="display:none">
+      <div style="display:flex;gap:6px;margin-bottom:10px">
+        <span class="tt-pair active" id="rr-scope-today" role="button" tabindex="0" onclick="rrSetScope('today')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();rrSetScope('today');}">Today</span>
+        <span class="tt-pair" id="rr-scope-all" role="button" tabindex="0" onclick="rrSetScope('all')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();rrSetScope('all');}">All imported</span>
+      </div>
+      <div class="eq-top">
+        <div class="gstat"><div class="l">Net P&amp;L</div><div class="v" id="rr-pnl">—</div></div>
+        <div class="gstat"><div class="l">Win Rate</div><div class="v" id="rr-wr">—</div></div>
+        <div class="gstat"><div class="l">Trades</div><div class="v" id="rr-count">—</div></div>
+        <div class="gstat"><div class="l">W / L</div><div class="v" id="rr-wl">—</div></div>
+      </div>
+      <div class="le-sub">Per-instrument · net P&amp;L</div>
+      <div id="rr-byinst"></div>
+      <div class="eq-fid">Real broker outcomes from your last TradeZella / broker import. Re-import in the 📒 TradeZella tab to refresh.</div>
+    </div>
+  </div>
+
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
@@ -28713,7 +28801,7 @@ def dashboard():
 </div>
 
 <div class="mod" id="mod-mb-learning">
-  <div class="mod-h">🎓 Learning Stats</div>
+  <div class="mod-h">🎓 Learning Stats<span title="Computed from simulated proxy-feed outcomes — not your real broker fills. See Real Account Results above." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
   <div class="mb-stats">
     <div class="mb-stat"><div class="mb-stat-l">Win rate</div><div class="mb-stat-v" id="mbl-wr">—</div></div>
     <div class="mb-stat"><div class="mb-stat-l">Avg R</div><div class="mb-stat-v" id="mbl-avgr">—</div></div>
@@ -29104,7 +29192,7 @@ def dashboard():
 
 <!-- Adaptive Learning Engine — per-strategy analytics from closed trades (Postgres) -->
 <div class="mod mb-hidden" id="mod-learning">
-  <div class="mod-h">🧠 Adaptive Learning <span id="le-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="mod-h">🧠 Adaptive Learning <span id="le-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Trained on simulated proxy-feed outcomes — not your real broker fills. See Real Account Results above." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
   <div class="le-top">
     <div class="gstat"><div class="l">Trades Logged</div><div class="v" id="le-total">—</div></div>
     <div class="gstat"><div class="l">Top Strategy</div><div class="v" id="le-top">—</div></div>
@@ -29202,7 +29290,7 @@ def dashboard():
 
 <!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
 <div class="mod" id="mod-equity">
-  <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcome simulated from a price proxy — not your real broker fills. See Real Account Results above for actual P&amp;L." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
   <div class="eq-top">
     <div class="gstat"><div class="l">Net R</div><div class="v" id="eq-net">—</div></div>
     <div class="gstat"><div class="l">Trades</div><div class="v" id="eq-count">—</div></div>
@@ -29216,7 +29304,7 @@ def dashboard():
 
 <!-- Today's Trades — per-trade list of trades closed today (display-only, from strategy_trades) -->
 <div class="mod" id="mod-trades">
-  <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcomes simulated from a price proxy — not your real broker fills. See Real Account Results above for actual trades." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
   <div class="tt-pairs" id="tt-pairs">
     <span class="tt-pair active" id="tt-pair-MGC" role="button" tabindex="0" onclick="ttSelect('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MGC');}">MGC</span>
     <span class="tt-pair" id="tt-pair-MNQ" role="button" tabindex="0" onclick="ttSelect('MNQ')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MNQ');}">MNQ</span>
@@ -33354,7 +33442,7 @@ async function tzDoUpload(){
 }
 async function tzUpload(){
   const btn=document.getElementById('tz-up-btn'); const t=btn.textContent; btn.disabled=true; btn.textContent='Importing…';
-  try{ const ok=await tzDoUpload(); if(ok) await tzLoadAnalysis(); }
+  try{ const ok=await tzDoUpload(); if(ok){ await tzLoadAnalysis(); loadRealResults(); } }
   catch(e){ const m=document.getElementById('tz-up-msg'); m.className='bt-msg err'; m.textContent='✗ '+e; }
   finally{ btn.disabled=false; btn.textContent=t; }
 }
@@ -33370,8 +33458,71 @@ async function tzReset(){
     if(msg){ msg.className='bt-msg ok'; msg.textContent='✓ Cleared '+(d.deleted||0)+' trade(s). Review reset.'; }
     const fi=document.getElementById('tz-file'); if(fi) fi.value='';
     tzRenderEmpty('No imported trades yet. Upload a CSV above to see your review.');
+    loadRealResults();
   }catch(e){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ '+e; } }
   finally{ btn.disabled=false; btn.textContent=t; }
+}
+
+// ── Real Account Results (broker fills imported via TradeZella; DISPLAY-ONLY) ──
+// Reads the owner-only /tradezella/analysis scoreboard and renders the real broker
+// P&L / win-rate. NEVER polled in the 3s loop, NEVER touches the gate or broker.
+var rrScope = 'today';
+var rrData = null;
+function rrSetScope(s){
+  rrScope = (s==='all') ? 'all' : 'today';
+  var bt=document.getElementById('rr-scope-today'), ba=document.getElementById('rr-scope-all');
+  if(bt) bt.classList.toggle('active', rrScope==='today');
+  if(ba) ba.classList.toggle('active', rrScope==='all');
+  rrRender();
+}
+function rrPnlColor(v){ return (v>0?'#22c55e':(v<0?'#ef4444':'#e5e7eb')); }
+function rrRender(){
+  var empty=document.getElementById('rr-empty'), body=document.getElementById('rr-body');
+  var sb = rrData && rrData.scoreboard;
+  var hasAny = sb && sb.all_time && sb.all_time.count > 0;
+  if(!hasAny){ var as0=document.getElementById('rr-asof'); if(as0) as0.textContent=''; if(empty) empty.style.display=''; if(body) body.style.display='none'; return; }
+  if(empty) empty.style.display='none';
+  if(body) body.style.display='';
+  var asof=document.getElementById('rr-asof');
+  var sum=(rrData && rrData.import_summary) || {};
+  if(asof){
+    var a = sum.last_import_at ? ('as of '+btFmtDate(sum.last_import_at)) : 'imported';
+    if(sum.imported_total) a += ' · '+sum.imported_total+' trades';
+    asof.textContent = a;
+  }
+  var t = (rrScope==='all') ? sb.all_time : sb.today;
+  tzSet('rr-pnl', tzMoney(t.net_pnl));
+  var pe=document.getElementById('rr-pnl'); if(pe) pe.style.color = rrPnlColor(t.net_pnl);
+  tzSet('rr-wr', t.decided ? tzFrac(t.win_rate) : '—');
+  tzSet('rr-count', t.count);
+  tzSet('rr-wl', t.wins+' / '+t.losses);
+  var box=document.getElementById('rr-byinst');
+  if(box){
+    box.innerHTML='';
+    var rows=(sb.by_instrument||[]);
+    if(!rows.length){ box.innerHTML='<div style="color:#6b7280;font-size:12px">No instruments yet.</div>'; }
+    for(var i=0;i<rows.length;i++){
+      var g=rows[i];
+      var row=document.createElement('div');
+      row.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:13px';
+      var left=document.createElement('span');
+      left.textContent=g.symbol+'  ('+g.wins+'W / '+g.losses+'L'+(g.decided?(', '+tzFrac(g.win_rate)):'')+')';
+      left.style.color='#cbd5e1';
+      var right=document.createElement('span');
+      right.textContent=tzMoney(g.net_pnl);
+      right.style.color=rrPnlColor(g.net_pnl);
+      right.style.fontWeight='700';
+      row.appendChild(left); row.appendChild(right);
+      box.appendChild(row);
+    }
+  }
+}
+async function loadRealResults(){
+  try{
+    var d = await api('/tradezella/analysis');
+    rrData = (d && d.ok) ? d : null;
+  }catch(e){ rrData = null; }
+  rrRender();
 }
 
 async function btDoUpload(){
@@ -33887,7 +34038,7 @@ async function autoSelectBestSetup(){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -33899,7 +34050,7 @@ autoSelectBestSetup();
   // One-time layout reset when the panel set changes (Main Brain added) so existing
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
-  var VKEY = 'dashLayoutVer', VER = 'main-brain-cognitive-2026-06';
+  var VKEY = 'dashLayoutVer', VER = 'real-account-results-2026-06';
   try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
