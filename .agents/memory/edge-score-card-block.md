@@ -72,3 +72,23 @@ zone confirmed, sweeps), plus Volume and CVD, arrive as TradingView webhook aler
 edge signal the chart sees but the server cannot compute must be added as a NEW alert
 type (e.g. `{MGC,MNQ} {BULLISH,BEARISH} SWEEP`, volume/CVD alerts) — never faked from a
 loosely-related existing flag.
+
+## "Why is it only firing longs (or only shorts)?" — diagnose, don't assume a bug
+
+Trade direction is 100% a function of inbound structure scores: bullish structure
+(CHOCH/BOS DEMAND, HH, HL, demand zones) vs bearish (CHOCH/BOS SUPPLY, LH, LL, supply
+zones). The gate goes Short ONLY when `bearish > bullish` (`trend_short`, ~line 6609);
+**Long wins ties** (`dominant_direction = "Long" if long_score >= short_score`, ~6710).
+So a one-directional day is the EXPECTED output of a one-directional alert stream, not a
+stuck flag.
+**Why:** the engine is symmetric — an all-long (or all-short) session usually just means
+the tape only printed that side's structure that day.
+**How to apply:** before suspecting a bug, query `strategy_trades` (PROD) for the
+Long/Short split — overall AND per ET day (`opened_at AT TIME ZONE 'America/New_York'`).
+If the other side appears on other days, the engine is fine (confirmed: all-time ~26%
+shorts; some days are short-dominant) and today was simply one-way. Per-trade
+`indicators` JSON records `structure_label`/`cvd_state` — an all-"Bullish Structure"
+day with bearish score 0 is the signature. `/webhook` is on the request-logger allowlist,
+so inbound alert types do NOT appear in deployment logs — use the DB, not the logs. If the
+chart clearly broke the other way but the bot saw nothing, THEN look upstream at the
+TradingView Pine alert config for that side, not at the gate.
