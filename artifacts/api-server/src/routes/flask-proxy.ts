@@ -130,6 +130,23 @@ router.all(
     // paper-graded performance of recorded suggestions.
     "/training/status",
     "/training/metrics",
+    // TRADING ACADEMY / AI Trading Library (owner-only; LEARNING-ONLY; NOT in
+    // dashboard-auth OPEN_PATHS). Knowledge sources + AI extraction + strategy
+    // playbook + validation lifecycle + honest backtest links + Q&A. Walled off
+    // from the live money path — nothing here can place or modify a trade.
+    "/academy/sources",
+    "/academy/sources/:id",
+    "/academy/sources/:id/extract",
+    "/academy/sources/:id/status",
+    "/academy/strategies",
+    "/academy/strategies/:id",
+    "/academy/strategies/:id/status",
+    "/academy/strategies/:id/backtest",
+    "/academy/rules",
+    "/academy/rules/:id",
+    "/academy/rules/:id/status",
+    "/academy/metrics",
+    "/academy/ask",
   ],
   proxyToFlask,
 );

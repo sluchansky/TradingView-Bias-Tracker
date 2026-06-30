@@ -24,6 +24,8 @@ _Replace the heading above with the project's name, and this line with one sente
 
 _Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
 
+- **Trading Academy / AI Trading Library** (learning-only knowledge module): backend in `artifacts/tradingview-webhook/app.py` (`/academy/*` routes + `_academy_*` helpers); dashboard `#view-academy` tab in the same file's `/dashboard` HTML; proxy whitelist in `artifacts/api-server/src/routes/flask-proxy.ts`. Safety smoke: `.local/state/academy_smoke.py` via `bash .local/state/check_academy.sh`.
+
 ## Architecture decisions
 
 _Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
@@ -39,6 +41,8 @@ _Populate as you build — explicit user instructions worth remembering across s
 ## Gotchas
 
 _Populate as you build — sharp edges, "always run X before Y" rules._
+
+- **Trading Academy is learning-only — never wire it into live trading.** The `/academy/*` module (sources → AI-extracted lessons → strategy cards → rules → validation → Q&A) is fully walled off from the gate/scoring/auto-execute/broker/sizing path, like `/backtest` and `/scalp-research`. Setting a strategy `APPROVED`/`active` records intent only; it does NOT place trades. Any change must keep the four strict goldens + parity byte-identical and pass `bash .local/state/check_academy.sh` (the money-path tripwire). Academy routes are owner-only: whitelisted in `flask-proxy.ts`, NEVER added to `dashboard-auth.ts` OPEN_PATHS.
 
 ## Pointers
 

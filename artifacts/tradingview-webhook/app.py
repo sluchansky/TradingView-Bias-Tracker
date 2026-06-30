@@ -76,6 +76,15 @@ def _log_incoming_request():
             n = 0
         logger.info("INCOMING POST /assistant | BODY: <redacted assistant query, %s bytes>", n)
         return
+    # Trading Academy writes carry free-form notes / transcripts / questions that may be
+    # large or contain PII — never echo their body to the request log (only the byte count).
+    if request.path.startswith("/academy/") and request.method in ("POST", "PUT", "PATCH"):
+        try:
+            n = request.content_length or 0
+        except Exception:
+            n = 0
+        logger.info("INCOMING %s %s | BODY: <redacted academy payload, %s bytes>", request.method, request.path, n)
+        return
     try:
         body = request.get_data(as_text=True)
     except Exception:
@@ -30851,6 +30860,7 @@ def dashboard():
   <div class="view-btn" id="vb-bt" onclick="setView('backtest')">🧪 Backtest</div>
   <div class="view-btn" id="vb-tz" onclick="setView('tradezella')">📒 TradeZella</div>
   <div class="view-btn" id="vb-sr" onclick="setView('research')">🔬 Research</div>
+  <div class="view-btn" id="vb-ac" onclick="setView('academy')">🎓 Academy</div>
 </div>
 
 <div id="view-live">
@@ -32257,6 +32267,99 @@ def dashboard():
   </div>
 
 </div><!-- /#view-research -->
+
+<div id="view-academy" style="display:none">
+
+  <div class="mod">
+    <div class="mod-h">🎓 Trading Academy <span class="bt-mini" id="ac-status">Knowledge library</span></div>
+    <div class="bt-mini">A private trading knowledge library. AI extracts structured rules and professional-trader thinking from your sources (videos, books, articles, recaps, screenshots, backtests). <b>Learning-only — nothing here ever touches live trading, scoring, sizing, dedupe, or the broker.</b> A lesson can influence live trading only after you deliberately wire an APPROVED, active strategy in yourself (out of scope here).</div>
+    <div class="bt-mini" id="ac-counts" style="margin-top:8px"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">➕ Add Knowledge Source</div>
+    <div class="bt-grid">
+      <div class="bt-f"><label>Title</label><input id="ac-s-title" type="text" placeholder="e.g. Demand-zone bounce — YouTube"></div>
+      <div class="bt-f"><label>Type</label><select id="ac-s-kind">
+        <option value="article" selected>article</option><option value="youtube">youtube</option><option value="book">book</option><option value="recap">recap</option><option value="screenshot">screenshot</option><option value="backtest">backtest</option><option value="tradezella">tradezella</option><option value="other">other</option>
+      </select></div>
+      <div class="bt-f"><label>Author / channel</label><input id="ac-s-author" type="text"></div>
+      <div class="bt-f"><label>Link (optional)</label><input id="ac-s-link" type="text"></div>
+      <div class="bt-f"><label>Market</label><input id="ac-s-market" type="text" placeholder="MGC / MNQ / both"></div>
+      <div class="bt-f"><label>Strategy type</label><input id="ac-s-stype" type="text" placeholder="scalp / swing / reversal"></div>
+      <div class="bt-f"><label>Trust (0-5)</label><input id="ac-s-trust" type="number" min="0" max="5" value="3"></div>
+    </div>
+    <div class="bt-f" style="margin-top:8px"><label>Notes / transcript</label><textarea id="ac-s-notes" rows="5" placeholder="Paste the transcript, book notes, article text, or trade recap here..." style="background:var(--inset);border:1px solid var(--border);border-radius:2px;color:var(--text);padding:8px;font-family:var(--mono);font-size:13px;width:100%;resize:vertical"></textarea></div>
+    <label style="display:flex;gap:8px;align-items:center;margin:10px 0 0;font-size:13px;color:var(--muted)"><input type="checkbox" id="ac-s-extract" checked> Run AI extraction now (one AI call)</label>
+    <button class="bt-btn" id="ac-s-add" onclick="acAddSource()">🧠 Add &amp; Extract</button>
+    <div class="bt-msg" id="ac-s-msg"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">📚 Knowledge Library <span class="bt-mini" id="ac-lib-cap"></span></div>
+    <div class="bt-grid" style="margin-bottom:8px">
+      <div class="bt-f"><label>Search</label><input id="ac-f-q" type="text" placeholder="title / author / market"></div>
+      <div class="bt-f"><label>Status</label><select id="ac-f-status">
+        <option value="">All statuses</option><option value="UNTESTED">UNTESTED</option><option value="BACKTESTING">BACKTESTING</option><option value="PAPER_TESTING">PAPER_TESTING</option><option value="APPROVED">APPROVED</option><option value="REJECTED">REJECTED</option>
+      </select></div>
+      <div class="bt-f"><label>Kind</label><select id="ac-f-kind">
+        <option value="">All kinds</option><option value="youtube">youtube</option><option value="book">book</option><option value="article">article</option><option value="recap">recap</option><option value="screenshot">screenshot</option><option value="backtest">backtest</option><option value="tradezella">tradezella</option><option value="other">other</option>
+      </select></div>
+      <div class="bt-f" style="justify-content:flex-end"><button class="bt-btn alt" onclick="acLoadSources()">🔎 Filter</button></div>
+    </div>
+    <div class="bt-scroll" id="ac-sources"></div>
+    <div id="ac-source-detail" class="se-reason" style="display:none;text-align:left;margin-top:10px"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">🧩 Strategy Playbook <span class="bt-mini" id="ac-strat-cap"></span></div>
+    <div class="bt-mini" style="margin-bottom:6px">Reusable strategy cards. Status is advisory only and never auto-trades.</div>
+    <div class="bt-grid">
+      <div class="bt-f"><label>Name</label><input id="ac-st-name" type="text"></div>
+      <div class="bt-f"><label>Setup type</label><input id="ac-st-setup" type="text"></div>
+      <div class="bt-f"><label>Applies to</label><select id="ac-st-applies"><option value="both" selected>both</option><option value="scalp">scalp</option><option value="swing">swing</option></select></div>
+      <div class="bt-f"><label>Confidence (0-100)</label><input id="ac-st-conf" type="number" min="0" max="100" value="50"></div>
+    </div>
+    <button class="bt-btn" onclick="acAddStrategy()">➕ Add strategy card</button>
+    <div class="bt-msg" id="ac-st-msg"></div>
+    <div class="bt-scroll" id="ac-strats" style="margin-top:10px"></div>
+    <div id="ac-strat-detail" class="se-reason" style="display:none;text-align:left;margin-top:10px"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">🛡 Trade-Management Rules <span class="bt-mini">advisory / display-only</span></div>
+    <div class="bt-grid" style="margin-bottom:8px">
+      <div class="bt-f"><label>Rule</label><input id="ac-r-text" type="text" placeholder="e.g. Move stop to break-even at 1R"></div>
+      <div class="bt-f"><label>Applies to</label><select id="ac-r-applies"><option value="both" selected>both</option><option value="scalp">scalp</option><option value="swing">swing</option></select></div>
+      <div class="bt-f" style="justify-content:flex-end"><button class="bt-btn" onclick="acAddRule()">➕ Add rule</button></div>
+    </div>
+    <div class="bt-msg" id="ac-r-msg"></div>
+    <div class="bt-scroll" id="ac-rules"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">🏆 Best Lessons <span class="bt-mini">ranked by status &amp; confidence</span></div>
+    <div class="bt-scroll" id="ac-best"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">🗑 Rejected Lessons <span class="bt-mini">what we discarded</span></div>
+    <div class="bt-scroll" id="ac-rejected"></div>
+  </div>
+
+  <div class="mod">
+    <div class="mod-h">💬 Ask the Library <span class="bt-mini">read-only · grounded on your stored notes</span></div>
+    <div class="bt-f"><label>Question</label><textarea id="ac-q" rows="2" placeholder="What did we learn? How would this apply to MGC/MNQ? Should this affect live trading and why?" style="background:var(--inset);border:1px solid var(--border);border-radius:2px;color:var(--text);padding:8px;font-family:var(--mono);font-size:13px;width:100%;resize:vertical"></textarea></div>
+    <div class="bt-grid" style="margin-top:6px">
+      <div class="bt-f"><label>About source # (optional)</label><input id="ac-q-src" type="number" min="1"></div>
+      <div class="bt-f"><label>About strategy # (optional)</label><input id="ac-q-strat" type="number" min="1"></div>
+    </div>
+    <button class="bt-btn" id="ac-ask-btn" onclick="acAsk()">💬 Ask</button>
+    <div class="bt-msg" id="ac-q-msg"></div>
+    <div id="ac-answer" class="se-reason" style="display:none;text-align:left;white-space:pre-wrap;margin-top:8px"></div>
+  </div>
+
+</div><!-- /#view-academy -->
 
 <div id="toast"></div>
 
@@ -36039,18 +36142,22 @@ function setView(v){
   const isBt = (v==='backtest');
   const isTz = (v==='tradezella');
   const isSr = (v==='research');
-  const isLive = (!isBt && !isTz && !isSr);
+  const isAc = (v==='academy');
+  const isLive = (!isBt && !isTz && !isSr && !isAc);
   document.getElementById('view-live').style.display = isLive ? '' : 'none';
   document.getElementById('view-backtest').style.display = isBt ? '' : 'none';
   document.getElementById('view-tradezella').style.display = isTz ? '' : 'none';
   document.getElementById('view-research').style.display = isSr ? '' : 'none';
+  document.getElementById('view-academy').style.display = isAc ? '' : 'none';
   document.getElementById('vb-live').classList.toggle('active', isLive);
   document.getElementById('vb-bt').classList.toggle('active', isBt);
   document.getElementById('vb-tz').classList.toggle('active', isTz);
   document.getElementById('vb-sr').classList.toggle('active', isSr);
+  document.getElementById('vb-ac').classList.toggle('active', isAc);
   if(isBt && btSelDataset===null) btLoadDatasets();
   if(isTz) tzLoadAnalysis();
   if(isSr) srLoad();
+  if(isAc) acLoad();
 }
 
 // ── Scalp Strategy Research (owner-only; on-demand, NEVER in the 3s /status poll) ──
@@ -36133,6 +36240,325 @@ function srRun(){
       }).catch(function(){ if(tries>=12){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ Could not refresh.'; } if(btn) btn.disabled=false; return; } setTimeout(poll, 2500); });
     })();
   }).catch(function(e){ if(msg){ msg.className='bt-msg err'; msg.textContent='✗ '+((e&&e.message)||'Request failed.'); } if(btn) btn.disabled=false; });
+}
+
+// ── Trading Academy (owner-only; on-demand, learning-only, NEVER in the 3s /status poll) ──
+function acSet(id, text){ const el=document.getElementById(id); if(el) el.textContent=(text==null?'':text); }
+function acMsg(id, text, cls){ const el=document.getElementById(id); if(!el) return; el.className='bt-msg'+(cls?(' '+cls):''); el.textContent=text||''; }
+function acFmtDate(s){ if(!s) return '—'; try { return new Date(s).toLocaleString(); } catch(e){ return s; } }
+function acMount(id, node){ const el=document.getElementById(id); if(!el) return; el.textContent=''; el.appendChild(node); }
+function acIntId(v){ if(v==null) return null; const t=String(v).trim(); if(t==='') return null; const n=parseInt(t,10); return (isFinite(n)&&n>=1)?n:null; }
+function acNumOrNull(v){ if(v==null) return null; const t=String(v).trim(); if(t==='') return null; const n=Number(t); return isFinite(n)?n:null; }
+function acCellNode(c){
+  const td=document.createElement('td');
+  if(c && c.nodeType===1){ td.appendChild(c); }
+  else { td.textContent=(c===null||c===undefined||c==='')?'—':String(c); }
+  return td;
+}
+function acTable(headers, rows){
+  const tbl=document.createElement('table'); tbl.className='bt-tbl';
+  const thead=document.createElement('thead'), htr=document.createElement('tr');
+  headers.forEach(function(h){ const th=document.createElement('th'); th.textContent=h; htr.appendChild(th); });
+  thead.appendChild(htr); tbl.appendChild(thead);
+  const tb=document.createElement('tbody');
+  if(!rows.length){ const tr=document.createElement('tr'), td=document.createElement('td'); td.colSpan=headers.length; td.className='bt-mini'; td.textContent='None yet.'; tr.appendChild(td); tb.appendChild(tr); }
+  rows.forEach(function(cells){ const tr=document.createElement('tr'); cells.forEach(function(c){ tr.appendChild(acCellNode(c)); }); tb.appendChild(tr); });
+  tbl.appendChild(tb); return tbl;
+}
+function acBtn(label, fn, danger){
+  const b=document.createElement('button'); b.className='bt-btn alt';
+  b.style.width='auto'; b.style.margin='0 4px 0 0'; b.style.padding='3px 9px'; b.style.fontSize='11px'; b.style.letterSpacing='.5px';
+  if(danger){ b.style.borderColor='var(--red)'; b.style.color='var(--red)'; b.style.background='transparent'; }
+  b.textContent=label; b.onclick=fn; return b;
+}
+const AC_STATUSES = ['UNTESTED','BACKTESTING','PAPER_TESTING','APPROVED','REJECTED'];
+function acStatusSelect(cur, onChange){
+  const sel=document.createElement('select'); sel.style.fontSize='11px'; sel.style.padding='3px';
+  AC_STATUSES.forEach(function(s){ const op=document.createElement('option'); op.value=s; op.textContent=s; if(s===cur) op.selected=true; sel.appendChild(op); });
+  sel.onchange=function(){ onChange(sel.value); };
+  return sel;
+}
+function acRenderKV(parent, label, val){
+  if(val==null || val==='' || (Array.isArray(val) && !val.length)) return;
+  const h=document.createElement('div'); h.className='se-bias-h'; h.textContent=label; parent.appendChild(h);
+  if(Array.isArray(val)){
+    const ul=document.createElement('ul'); ul.style.margin='4px 0 4px 18px';
+    val.forEach(function(x){ const li=document.createElement('li'); li.textContent=x; ul.appendChild(li); });
+    parent.appendChild(ul);
+  } else {
+    const d=document.createElement('div'); d.className='bt-mini'; d.textContent=val; parent.appendChild(d);
+  }
+}
+
+function acLoad(){ acLoadMetrics(); acLoadSources(); acLoadStrategies(); acLoadRules(); }
+
+function acLoadMetrics(){
+  api('/academy/metrics').then(function(j){
+    if(!j || !j.ok){ acSet('ac-counts', (j&&j.error)||'Unavailable.'); return; }
+    const c=j.counts||{};
+    function line(label,o){ o=o||{}; return label+' — '+AC_STATUSES.map(function(s){ return (o[s]||0)+' '+s.toLowerCase(); }).join(' · '); }
+    acSet('ac-counts', line('Sources',c.sources)+'     '+line('Strategies',c.strategies)+'     '+line('Rules',c.rules));
+    const best=j.best_lessons||[];
+    acMount('ac-best', acTable(['#','Strategy','Applies','Conf','Status','Lifecycle','BT Win%','PF'],
+      best.map(function(b){ const bt=b.backtest||{};
+        return [b.id, b.name, b.applies_to, b.confidence, b.status, b.lifecycle,
+                (bt.win_rate==null?'—':bt.win_rate+'%'), (bt.profit_factor==null?'—':bt.profit_factor)]; })));
+    const rej=j.rejected||[];
+    acMount('ac-rejected', acTable(['Kind','#','Title','Status','When'],
+      rej.map(function(r){ return [r.kind, r.id, r.title, r.status, acFmtDate(r.updated_at)]; })));
+  }).catch(function(){ acSet('ac-counts','Could not load metrics.'); });
+}
+
+function acLoadSources(){
+  const q=document.getElementById('ac-f-q'), st=document.getElementById('ac-f-status'), kd=document.getElementById('ac-f-kind');
+  const params=[];
+  if(q && q.value.trim()) params.push('q='+encodeURIComponent(q.value.trim()));
+  if(st && st.value) params.push('status='+encodeURIComponent(st.value));
+  if(kd && kd.value) params.push('source_kind='+encodeURIComponent(kd.value));
+  const path='/academy/sources'+(params.length?('?'+params.join('&')):'');
+  api(path).then(function(j){
+    if(!j || !j.ok){ acMount('ac-sources', acTable(['Source'],[])); acSet('ac-lib-cap',''); return; }
+    const list=j.sources||[];
+    const rows=list.map(function(s){
+      const actions=document.createElement('div');
+      actions.appendChild(acBtn('View', function(){ acViewSource(s.id); }));
+      actions.appendChild(acBtn('Re-extract', function(){ acExtract(s.id); }));
+      actions.appendChild(acStatusSelect(s.status, function(v){ acSetStatus('sources', s.id, v); }));
+      actions.appendChild(acBtn('✕', function(){ acDelete('sources', s.id); }, true));
+      const ai=(s.extracted_at? '✓' : (s.last_error? '⚠' : '—'));
+      return [s.id, s.title, s.source_kind, s.status, (s.trust_rating==null?'—':s.trust_rating), ai, actions];
+    });
+    acSet('ac-lib-cap', list.length+' sources');
+    acMount('ac-sources', acTable(['#','Title','Kind','Status','Trust','AI','Actions'], rows));
+  }).catch(function(){ acMount('ac-sources', acTable(['Source'],[])); });
+}
+
+function acViewSource(id){
+  const box=document.getElementById('ac-source-detail'); if(!box) return;
+  box.style.display=''; box.textContent='Loading…';
+  api('/academy/sources/'+id).then(function(j){
+    box.textContent='';
+    if(!j || !j.ok){ box.textContent=(j&&j.error)||'Not found.'; return; }
+    const s=j.source||{};
+    const head=document.createElement('div'); head.className='mod-h'; head.style.marginBottom='6px';
+    head.textContent='📄 '+(s.title||('Source #'+id)); box.appendChild(head);
+    const meta=document.createElement('div'); meta.className='bt-mini';
+    meta.textContent=[s.source_kind, s.author, s.market_type, s.strategy_type, 'trust '+(s.trust_rating==null?'—':s.trust_rating), s.status].filter(Boolean).join(' · ');
+    box.appendChild(meta);
+    if(s.link){ const a=document.createElement('a'); a.href=s.link; a.target='_blank'; a.rel='noopener noreferrer'; a.className='bt-mini'; a.style.display='block'; a.textContent=s.link; box.appendChild(a); }
+    if(s.last_error){ const e=document.createElement('div'); e.className='bt-msg err'; e.textContent='Extraction error: '+s.last_error; box.appendChild(e); }
+    if(s.ai_summary) acRenderKV(box,'Summary',s.ai_summary);
+    const ex=s.extraction;
+    if(ex && typeof ex==='object'){
+      acRenderKV(box,'Core concept',ex.core_concept);
+      acRenderKV(box,'Market condition',ex.market_condition);
+      acRenderKV(box,'Entry rules',ex.entry_rules);
+      acRenderKV(box,'Exit rules',ex.exit_rules);
+      acRenderKV(box,'Stop rules',ex.stop_rules);
+      acRenderKV(box,'Trade management',ex.trade_management);
+      acRenderKV(box,'Best session',ex.best_session);
+      acRenderKV(box,'When to avoid',ex.when_to_avoid);
+      acRenderKV(box,'Failure signs',ex.failure_signs);
+      acRenderKV(box,'Example setup',ex.example_setup);
+      acRenderKV(box,'Applies to MGC/MNQ',ex.applies_to_mgc_mnq);
+      acRenderKV(box,'Applicability',ex.applicability);
+      const pt=ex.professional_thinking;
+      if(pt && typeof pt==='object'){
+        const ph=document.createElement('div'); ph.className='mod-h'; ph.style.margin='10px 0 4px'; ph.textContent='🧠 Professional trader thinking'; box.appendChild(ph);
+        acRenderKV(box,'Market intent',pt.market_intent);
+        acRenderKV(box,'Liquidity',pt.liquidity);
+        acRenderKV(box,'Who is trapped',pt.who_is_trapped);
+        acRenderKV(box,'Best location',pt.best_location);
+        acRenderKV(box,'Confirms',pt.confirms);
+        acRenderKV(box,'Invalidates',pt.invalidates);
+        acRenderKV(box,'Management',pt.management);
+      }
+    } else {
+      const d=document.createElement('div'); d.className='bt-mini'; d.textContent='No extraction yet — click “Re-extract”.'; box.appendChild(d);
+    }
+    const close=acBtn('Close', function(){ box.style.display='none'; }); box.appendChild(document.createElement('br')); box.appendChild(close);
+  }).catch(function(){ box.textContent='Could not load source.'; });
+}
+
+function acExtract(id){
+  acMsg('ac-s-msg','Extracting… (one AI call, ~5-15s)');
+  api('/academy/sources/'+id+'/extract', {}).then(function(j){
+    if(j && j.ok) acMsg('ac-s-msg','✓ Extracted.','ok');
+    else acMsg('ac-s-msg','⚠ '+((j&&j.error)||'Extraction failed.'),'err');
+    acLoadSources();
+  }).catch(function(){ acMsg('ac-s-msg','✗ Request failed.','err'); });
+}
+
+function acAddSource(){
+  const title=(document.getElementById('ac-s-title').value||'').trim();
+  if(!title){ acMsg('ac-s-msg','A title is required.','err'); return; }
+  const body={
+    title:title,
+    source_kind:document.getElementById('ac-s-kind').value,
+    author:document.getElementById('ac-s-author').value,
+    link:document.getElementById('ac-s-link').value,
+    market_type:document.getElementById('ac-s-market').value,
+    strategy_type:document.getElementById('ac-s-stype').value,
+    trust_rating:parseInt(document.getElementById('ac-s-trust').value||'0',10),
+    raw_notes:document.getElementById('ac-s-notes').value,
+    extract:document.getElementById('ac-s-extract').checked
+  };
+  const btn=document.getElementById('ac-s-add'); if(btn) btn.disabled=true;
+  acMsg('ac-s-msg', body.extract? 'Saving + extracting… (one AI call, ~5-15s)':'Saving…');
+  api('/academy/sources', body).then(function(j){
+    if(btn) btn.disabled=false;
+    if(j && j.ok){
+      const warn=(j.source && j.source.last_error)? (' (extraction warning: '+j.source.last_error+')') : '';
+      acMsg('ac-s-msg','✓ Added.'+warn, warn?'':'ok');
+      ['ac-s-title','ac-s-author','ac-s-link','ac-s-market','ac-s-stype','ac-s-notes'].forEach(function(id){ const el=document.getElementById(id); if(el) el.value=''; });
+      acLoadSources(); acLoadMetrics();
+    } else { acMsg('ac-s-msg','⚠ '+((j&&j.error)||'Could not save.'),'err'); }
+  }).catch(function(){ if(btn) btn.disabled=false; acMsg('ac-s-msg','✗ Request failed.','err'); });
+}
+
+function acAddStrategy(){
+  const name=(document.getElementById('ac-st-name').value||'').trim();
+  if(!name){ acMsg('ac-st-msg','A name is required.','err'); return; }
+  const body={ name:name, setup_type:document.getElementById('ac-st-setup').value,
+    applies_to:document.getElementById('ac-st-applies').value, confidence:parseInt(document.getElementById('ac-st-conf').value||'0',10) };
+  api('/academy/strategies', body).then(function(j){
+    if(j && j.ok){ acMsg('ac-st-msg','✓ Strategy card added.','ok');
+      document.getElementById('ac-st-name').value=''; document.getElementById('ac-st-setup').value='';
+      acLoadStrategies(); acLoadMetrics();
+    } else { acMsg('ac-st-msg','⚠ '+((j&&j.error)||'Could not save.'),'err'); }
+  }).catch(function(){ acMsg('ac-st-msg','✗ Request failed.','err'); });
+}
+
+function acLoadStrategies(){
+  api('/academy/strategies').then(function(j){
+    if(!j || !j.ok){ acMount('ac-strats', acTable(['Strategy'],[])); acSet('ac-strat-cap',''); return; }
+    const list=j.strategies||[];
+    const rows=list.map(function(s){ const bt=s.backtest||{};
+      const actions=document.createElement('div');
+      actions.appendChild(acBtn('View', function(){ acViewStrategy(s.id); }));
+      actions.appendChild(acStatusSelect(s.status, function(v){ acSetStatus('strategies', s.id, v); }));
+      actions.appendChild(acBtn('✕', function(){ acDelete('strategies', s.id); }, true));
+      return [s.id, s.name, s.applies_to, s.confidence, s.status, s.lifecycle, (bt.win_rate==null?'—':bt.win_rate+'%'), actions];
+    });
+    acSet('ac-strat-cap', list.length+' cards');
+    acMount('ac-strats', acTable(['#','Name','Applies','Conf','Status','Lifecycle','BT Win%','Actions'], rows));
+  }).catch(function(){ acMount('ac-strats', acTable(['Strategy'],[])); });
+}
+
+function acViewStrategy(id){
+  const box=document.getElementById('ac-strat-detail'); if(!box) return;
+  box.style.display=''; box.textContent='Loading…';
+  api('/academy/strategies/'+id).then(function(j){
+    box.textContent='';
+    if(!j || !j.ok){ box.textContent=(j&&j.error)||'Not found.'; return; }
+    const s=j.strategy||{};
+    const head=document.createElement('div'); head.className='mod-h'; head.style.marginBottom='6px';
+    head.textContent='🧩 '+(s.name||('Strategy #'+id)); box.appendChild(head);
+    const meta=document.createElement('div'); meta.className='bt-mini';
+    meta.textContent=[s.setup_type, 'applies '+s.applies_to, 'conf '+s.confidence, s.status, s.lifecycle].filter(Boolean).join(' · ');
+    box.appendChild(meta);
+    acRenderKV(box,'Entry trigger',s.entry_trigger);
+    acRenderKV(box,'Confirmations',s.confirmations);
+    acRenderKV(box,'Long rules',s.long_rules);
+    acRenderKV(box,'Short rules',s.short_rules);
+    acRenderKV(box,'Stop placement',s.stop_placement);
+    acRenderKV(box,'Target logic',s.target_logic);
+    acRenderKV(box,'Early exit',s.early_exit);
+    acRenderKV(box,'Invalid conditions',s.invalid_conditions);
+    acRenderKV(box,'Risk notes',s.risk_notes);
+    const srcs=s.sources||[];
+    if(srcs.length) acRenderKV(box,'Linked sources', srcs.map(function(x){ return '#'+x.id+' '+x.title+' ('+x.status+')'; }));
+    const bt=s.backtest;
+    if(bt && typeof bt==='object'){
+      const bh=document.createElement('div'); bh.className='mod-h'; bh.style.margin='10px 0 4px'; bh.textContent='🧪 Backtest evidence'; box.appendChild(bh);
+      acRenderKV(box,'Linked run',bt.linked_run_id);
+      acRenderKV(box,'Detector',bt.detector);
+      acRenderKV(box,'Win rate',bt.win_rate==null?null:bt.win_rate+'%');
+      acRenderKV(box,'Profit factor',bt.profit_factor);
+      acRenderKV(box,'Avg win',bt.avg_win);
+      acRenderKV(box,'Avg loss',bt.avg_loss);
+      acRenderKV(box,'Max drawdown',bt.max_drawdown);
+      acRenderKV(box,'Best market',bt.best_market);
+      acRenderKV(box,'Worst market',bt.worst_market);
+      acRenderKV(box,'Best window',bt.best_window);
+      acRenderKV(box,'Common failure',bt.common_failure);
+      acRenderKV(box,'Notes',bt.notes);
+    }
+    const ah=document.createElement('div'); ah.className='se-bias-h'; ah.textContent='Attach / update backtest evidence (honest, manual)'; box.appendChild(ah);
+    const grid=document.createElement('div'); grid.className='bt-grid';
+    function f(labelTxt, key, ph){
+      const w=document.createElement('div'); w.className='bt-f';
+      const l=document.createElement('label'); l.textContent=labelTxt;
+      const i=document.createElement('input'); i.type='text'; i.id='ac-bt-'+key; if(ph) i.placeholder=ph;
+      w.appendChild(l); w.appendChild(i); grid.appendChild(w);
+    }
+    f('Linked /backtest run id','linked_run_id'); f('Detector','detector'); f('Win rate %','win_rate'); f('Profit factor','profit_factor');
+    f('Avg win','avg_win'); f('Avg loss','avg_loss'); f('Max drawdown','max_drawdown');
+    f('Best market','best_market'); f('Worst market','worst_market'); f('Best window','best_window'); f('Common failure','common_failure');
+    box.appendChild(grid);
+    box.appendChild(acBtn('💾 Save backtest', function(){ acAttachBacktest(id); }));
+    box.appendChild(acBtn('Close', function(){ box.style.display='none'; }));
+  }).catch(function(){ box.textContent='Could not load strategy.'; });
+}
+
+function acAttachBacktest(id){
+  function val(key){ const el=document.getElementById('ac-bt-'+key); return el?el.value:''; }
+  const body={ linked_run_id:val('linked_run_id'), detector:val('detector'),
+    win_rate:acNumOrNull(val('win_rate')), profit_factor:acNumOrNull(val('profit_factor')),
+    avg_win:acNumOrNull(val('avg_win')), avg_loss:acNumOrNull(val('avg_loss')), max_drawdown:acNumOrNull(val('max_drawdown')),
+    best_market:val('best_market'), worst_market:val('worst_market'), best_window:val('best_window'), common_failure:val('common_failure') };
+  api('/academy/strategies/'+id+'/backtest', body).then(function(j){
+    if(j && j.ok){ acViewStrategy(id); acLoadStrategies(); acLoadMetrics(); }
+  }).catch(function(){});
+}
+
+function acAddRule(){
+  const text=(document.getElementById('ac-r-text').value||'').trim();
+  if(!text){ acMsg('ac-r-msg','Rule text is required.','err'); return; }
+  api('/academy/rules', { rule_text:text, applies_to:document.getElementById('ac-r-applies').value }).then(function(j){
+    if(j && j.ok){ acMsg('ac-r-msg','✓ Rule added.','ok'); document.getElementById('ac-r-text').value=''; acLoadRules(); acLoadMetrics(); }
+    else { acMsg('ac-r-msg','⚠ '+((j&&j.error)||'Could not save.'),'err'); }
+  }).catch(function(){ acMsg('ac-r-msg','✗ Request failed.','err'); });
+}
+
+function acLoadRules(){
+  api('/academy/rules').then(function(j){
+    if(!j || !j.ok){ acMount('ac-rules', acTable(['Rule'],[])); return; }
+    const rows=(j.rules||[]).map(function(r){
+      const actions=document.createElement('div');
+      actions.appendChild(acStatusSelect(r.status, function(v){ acSetStatus('rules', r.id, v); }));
+      actions.appendChild(acBtn('✕', function(){ acDelete('rules', r.id); }, true));
+      return [r.id, r.rule_text, r.applies_to, r.status, actions];
+    });
+    acMount('ac-rules', acTable(['#','Rule','Applies','Status','Actions'], rows));
+  }).catch(function(){ acMount('ac-rules', acTable(['Rule'],[])); });
+}
+
+function acAfter(kind){ acLoadMetrics(); if(kind==='sources') acLoadSources(); else if(kind==='strategies') acLoadStrategies(); else acLoadRules(); }
+function acSetStatus(kind, id, status){
+  api('/academy/'+kind+'/'+id+'/status', { status:status }).then(function(){ acAfter(kind); }).catch(function(){});
+}
+function acDelete(kind, id){
+  const single=(kind==='strategies')?'strategy':kind.replace(/s$/,'');
+  if(!confirm('Delete this '+single+'? This cannot be undone.')) return;
+  fetch(BASE+'/academy/'+kind+'/'+id, { method:'DELETE', headers:{'Content-Type':'application/json'}, cache:'no-store' })
+    .then(function(r){ return r.json(); }).then(function(){ acAfter(kind); }).catch(function(){});
+}
+
+function acAsk(){
+  const q=(document.getElementById('ac-q').value||'').trim();
+  if(!q){ acMsg('ac-q-msg','Type a question first.','err'); return; }
+  const body={ question:q };
+  const sid=acIntId(document.getElementById('ac-q-src').value); if(sid) body.source_id=sid;
+  const stid=acIntId(document.getElementById('ac-q-strat').value); if(stid) body.strategy_id=stid;
+  const btn=document.getElementById('ac-ask-btn'); if(btn) btn.disabled=true;
+  acMsg('ac-q-msg','Thinking…');
+  const ans=document.getElementById('ac-answer'); if(ans){ ans.style.display='none'; ans.textContent=''; }
+  api('/academy/ask', body).then(function(j){
+    if(btn) btn.disabled=false;
+    if(j && j.ok){ acMsg('ac-q-msg',''); if(ans){ ans.style.display=''; ans.textContent=j.answer||''; } }
+    else { acMsg('ac-q-msg','⚠ '+((j&&j.error)||'No answer.'),'err'); }
+  }).catch(function(){ if(btn) btn.disabled=false; acMsg('ac-q-msg','✗ Request failed.','err'); });
 }
 
 // ── TradeZella review (owner-only; on-demand, NEVER in the 3s /status poll) ──
@@ -38822,6 +39248,15 @@ def _academy_enum(v, allowed, default):
     return s if s in allowed else default
 
 
+def _academy_status(v, default=""):
+    """Status enums are UPPERCASE — must NOT be lowercased like the other enums."""
+    try:
+        s = str(v).strip().upper()
+    except Exception:
+        return default
+    return s if s in ACADEMY_STATUSES else default
+
+
 def _academy_str_list(v, max_items=12, item_len=400):
     out = []
     if isinstance(v, str):
@@ -39125,7 +39560,7 @@ def academy_sources():
         return jsonify({"ok": True, "source": out}), 200
 
     # GET list
-    status = _academy_enum(request.args.get("status"), ACADEMY_STATUSES, "")
+    status = _academy_status(request.args.get("status"))
     kind   = _academy_enum(request.args.get("source_kind"), ACADEMY_SOURCE_KINDS, "")
     q      = _academy_clip(request.args.get("q"), 120)
     where, params = [], []
@@ -39298,7 +39733,7 @@ def academy_strategies():
             except Exception: pass
 
     # GET list
-    status   = _academy_enum(request.args.get("status"), ACADEMY_STATUSES, "")
+    status   = _academy_status(request.args.get("status"))
     lifecycle = _academy_enum(request.args.get("lifecycle"), ACADEMY_LIFECYCLES, "")
     applies  = _academy_enum(request.args.get("applies_to"), ACADEMY_APPLIES, "")
     q        = _academy_clip(request.args.get("q"), 120)
@@ -39482,7 +39917,7 @@ def academy_rules():
             try: conn.close()
             except Exception: pass
 
-    status  = _academy_enum(request.args.get("status"), ACADEMY_STATUSES, "")
+    status  = _academy_status(request.args.get("status"))
     applies = _academy_enum(request.args.get("applies_to"), ACADEMY_APPLIES, "")
     where, params = [], []
     if status:
@@ -39564,7 +39999,7 @@ def _academy_set_status(entity_type, table, eid, allow_lifecycle=False):
     if table not in ("academy_sources", "academy_strategies", "academy_management_rules"):
         return jsonify({"ok": False, "error": "Invalid entity."}), 400      # belt-and-suspenders allowlist
     d = request.get_json(silent=True) or {}
-    new_status = _academy_enum(d.get("status"), ACADEMY_STATUSES, "")
+    new_status = _academy_status(d.get("status"))
     new_life   = _academy_enum(d.get("lifecycle"), ACADEMY_LIFECYCLES, "") if allow_lifecycle else ""
     reason     = _academy_clip(d.get("reason"), 800)
     if not new_status and not new_life:
@@ -39742,6 +40177,7 @@ if __name__ == "__main__":
         _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
+        _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
