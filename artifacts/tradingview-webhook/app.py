@@ -15777,6 +15777,29 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 "Strategy advisory unavailable (%s)." % _adv_exc,
                 instrument_of(active_ticker), enabled=True)
 
+    # ── Advisory overlays (DISPLAY-ONLY, attached ABOVE the strict engine) ────
+    # Stalk Mode (pre-entry observation) + Active Trade Thinking (in-trade reasoning).
+    # Attached ONLY when their flag is on, so flag-OFF leaves full_analysis byte-identical
+    # (the key is simply absent — goldens/parity, which snapshot the strict core, are
+    # unaffected). Each compute fn is state-aware (neutral when the market is closed), so
+    # this single attach covers the open / vetoed / closed states without a separate
+    # mirror — mirroring the scalp-advisory / main-brain pattern. FAIL-OPEN: a broken
+    # overlay degrades to a neutral block and can NEVER crash analysis or touch the gate.
+    if STALK_MODE_ENABLED:
+        try:
+            result["stalk_mode"] = compute_stalk_mode(result)
+        except Exception as _sk_exc:
+            result["stalk_mode"] = _stalk_mode_neutral(
+                "Stalk Mode unavailable (%s)." % _sk_exc,
+                instrument_of(active_ticker), enabled=True)
+    if ACTIVE_THINKING_ENABLED:
+        try:
+            result["active_trade_thinking"] = compute_active_trade_thinking(result)
+        except Exception as _att_exc:
+            result["active_trade_thinking"] = _active_trade_thinking_neutral(
+                "Active Trade Thinking unavailable (%s)." % _att_exc,
+                instrument_of(active_ticker), enabled=True)
+
     # ── Main Brain (DISPLAY-ONLY) ────────────────────────────────────────────
     # FINAL synthesis: runs last so it sees every verdict override above (open /
     # vetoed / closed). It only CONSUMES the assembled blocks (analyst, debate,
@@ -24447,6 +24470,19 @@ SCALP_SIM_MAX_HOLD_HOURS  = max(1, int(os.environ.get("SCALP_SIM_MAX_HOLD_HOURS"
 SCALP_MAIN_BRAIN_ADVISORY_ENABLED = os.environ.get(
     "SCALP_MAIN_BRAIN_ADVISORY_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# ── Advisory overlays: Stalk Mode (pre-entry) + Active Trade Thinking (in-trade) ──
+# Two DISPLAY/ADVISORY-ONLY layers that sit AROUND the decision engine, never inside it.
+# They only CONSUME the already-assembled full_analysis result (zones, VWAP, potential
+# plans, analyst reasoning, the live position) and NEVER touch the gate / edge scoring /
+# sizing / dedupe / auto-trade / broker / live-management. Default ON for DISPLAY; the
+# kill-switches below make the bot behave exactly as it does today (the keys are simply
+# absent, so every golden/parity snapshot is unaffected). There is NO money-path veto and
+# NO auto-exit — the recommendations are advisory only.
+STALK_MODE_ENABLED = os.environ.get(
+    "STALK_MODE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+ACTIVE_THINKING_ENABLED = os.environ.get(
+    "ACTIVE_THINKING_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+
 # Heuristic regime-fit tagging (DISPLAY ONLY): which of the 16 detectors are
 # mean-reversion (favor ranges) vs continuation (favor trends). Used only to add/remove
 # a single display "fits regime" tag — never affects detection, sizing or the gate.
@@ -24792,6 +24828,397 @@ def _advisory_consensus(votes):
         "strongest_short": _strongest(bear),
         "bias":            bias,
     }
+
+
+# ===========================================================================
+# Advisory overlay 1/2 — STALK MODE (pre-entry observation)
+# ===========================================================================
+# DISPLAY/ADVISORY-ONLY. OBSERVES a forming setup BEFORE the strict engine reaches an
+# entry and packages what it is watching. It only CONSUMES values already computed on
+# the assembled `result` (per-direction potential_plan, the analyst game-plan / outlook,
+# strict_reason, zones, VWAP) — it never recomputes the gate, never scores, never sizes,
+# never trades, never affects the Edge Score. Wall identical to the scalp-advisory layer.
+# ---------------------------------------------------------------------------
+
+def _stalk_mode_neutral(reason="Stalk Mode disabled.", instrument=None, enabled=False):
+    """Stable neutral schema for the Stalk Mode overlay. Never raises."""
+    return {
+        "enabled":           bool(enabled),
+        "available":         False,
+        "instrument":        instrument,
+        "generated_at":      now_utc().isoformat(),
+        "state":             "idle",
+        "watching":          False,
+        "summary":           reason,
+        "direction":         None,
+        "bias":              "Neutral",
+        "ideal_entry_zone":  None,
+        "pullback_area":     None,
+        "liquidity_target":  None,
+        "stop_reference":    None,
+        "target_reference":  None,
+        "rr":                None,
+        "why_waiting":       [],
+        "extension_warning": {"active": False, "label": None, "detail": None,
+                              "vwap_extension_atr": None},
+        "advisory_only":     True,
+    }
+
+
+def compute_stalk_mode(result):
+    """Pre-entry 'stalk' overlay — see the section header for the money-path wall.
+
+    Reports the potential direction, ideal entry zone, expected pullback, liquidity
+    target, why the bot is still waiting and an extension warning for a setup that is
+    forming but has NOT yet triggered. CONSUMES the assembled `result` only. FAIL-OPEN
+    (its caller wraps this in try/except -> neutral block)."""
+    inst_label = result.get("active_ticker") or result.get("instrument")
+    out = _stalk_mode_neutral("", inst_label, enabled=True)
+
+    # Market closed -> nothing to stalk (paused, quiet).
+    if not result.get("market_open"):
+        out["state"]   = "market_closed"
+        out["summary"] = ("Market closed — nothing to stalk; will resume watching at "
+                          "the next session open.")
+        return out
+
+    # A position is already open -> Active Trade Thinking owns this phase.
+    _inst = instrument_of(inst_label) if inst_label else None
+    if _inst and active_trade_for(_inst):
+        out["state"]     = "in_trade"
+        out["available"] = True
+        out["summary"]   = ("A position is open — see Active Trade Thinking for live "
+                            "management. Stalk Mode resumes once it is closed.")
+        return out
+
+    verdict = result.get("verdict") or "WAIT"
+
+    # Favored direction (purely OBSERVED — never decided here): the strict direction if
+    # one is forming, else the dominant live read, else the analyst's next-opportunity
+    # bias. Falls through to "idle" when there is no directional edge to watch.
+    favored = result.get("strict_direction")
+    if favored not in ("Long", "Short"):
+        dom = result.get("dominant_direction")
+        favored = dom if dom in ("Long", "Short") else None
+    analyst = result.get("analyst") if isinstance(result.get("analyst"), dict) else {}
+    game_plan = analyst.get("game_plan") if isinstance(analyst.get("game_plan"), dict) else {}
+    next_opp  = game_plan.get("next_opportunity") if isinstance(game_plan.get("next_opportunity"), dict) else {}
+    if favored not in ("Long", "Short"):
+        favored = _advisory_dir_from_bias(next_opp.get("bias"))
+
+    directions = result.get("directions") if isinstance(result.get("directions"), dict) else {}
+    blk = directions.get(favored) if (favored and isinstance(directions.get(favored), dict)) else {}
+    pp  = blk.get("potential_plan") if isinstance(blk.get("potential_plan"), dict) else {}
+
+    nd = result.get("nearest_demand")
+    ns = result.get("nearest_supply")
+
+    out["direction"]       = favored
+    out["bias"]            = ("Bullish" if favored == "Long"
+                              else "Bearish" if favored == "Short" else "Neutral")
+    out["ideal_entry_zone"] = pp.get("entry_zone")
+    out["stop_reference"]   = pp.get("stop_loss")
+    out["target_reference"] = pp.get("target1")
+    out["rr"]               = pp.get("rr")
+    if favored == "Long":
+        out["pullback_area"]    = pp.get("entry_zone") if pp.get("entry_zone") is not None else nd
+        out["liquidity_target"] = pp.get("target1") if pp.get("target1") is not None else ns
+    elif favored == "Short":
+        out["pullback_area"]    = pp.get("entry_zone") if pp.get("entry_zone") is not None else ns
+        out["liquidity_target"] = pp.get("target1") if pp.get("target1") is not None else nd
+
+    # Why the bot is still waiting — the strict reason plus any analyst color.
+    reasons = []
+    sr = result.get("strict_reason")
+    if sr:
+        reasons.append(str(sr))
+    outlook = analyst.get("outlook") if isinstance(analyst.get("outlook"), dict) else {}
+    wr = outlook.get("wait_reasoning")
+    if isinstance(wr, (list, tuple)):
+        reasons.extend([str(x) for x in wr if x])
+    elif wr:
+        reasons.append(str(wr))
+    wf = next_opp.get("waiting_for")
+    if isinstance(wf, (list, tuple)):
+        reasons.extend([str(x) for x in wf if x])
+    elif wf:
+        reasons.append(str(wf))
+    _seen, _dedup = set(), []
+    for r in reasons:
+        if r and r not in _seen:
+            _seen.add(r)
+            _dedup.append(r)
+    out["why_waiting"] = _dedup[:6]
+
+    # Extension warning — reuse the existing risk-zone read (+ the analyst's VWAP
+    # extension in ATRs when present). DISPLAY only, never gates.
+    bias_word = ("Bullish" if favored == "Long"
+                 else "Bearish" if favored == "Short" else "Neutral")
+    try:
+        rz_label, rz_detail, rz_warn = get_risk_zone(
+            bias_word, result.get("current_price"), ns, nd)
+    except Exception:
+        rz_label, rz_detail, rz_warn = None, None, False
+    phase = analyst.get("market_phase") if isinstance(analyst.get("market_phase"), dict) else {}
+    ext_atr = phase.get("vwap_extension_atr")
+    ext_atr = ext_atr if isinstance(ext_atr, (int, float)) else None
+    out["extension_warning"] = {
+        "active":  bool(rz_warn) or (ext_atr is not None and ext_atr >= 2.0),
+        "label":   rz_label,
+        "detail":  rz_detail,
+        "vwap_extension_atr": ext_atr,
+    }
+
+    # State + summary.
+    if is_actionable(verdict):
+        out["state"]     = "engine_entering"
+        out["available"] = True
+        out["summary"]   = ("Engine has reached an entry (%s) — stalk complete; the strict "
+                            "engine is acting on it." % (favored or "—"))
+    elif favored and (out["ideal_entry_zone"] is not None or out["pullback_area"] is not None):
+        out["state"]     = "stalking"
+        out["watching"]  = True
+        out["available"] = True
+        out["summary"]   = ("Stalking a potential %s — waiting for price to pull back into "
+                            "the entry zone and the gate to confirm before any trade." % favored)
+    else:
+        out["state"]     = "idle"
+        out["available"] = True
+        out["summary"]   = "No setup forming yet — no directional edge to stalk."
+    return out
+
+
+# ===========================================================================
+# Advisory overlay 2/2 — ACTIVE TRADE THINKING (in-trade reasoning)
+# ===========================================================================
+# DISPLAY/ADVISORY-ONLY. Once a position is open it continuously re-grades the original
+# thesis and recommends an action — but it NEVER exits, sizes, scores the gate, dedupes
+# or sends an order. It REUSES the proven read-only compute_manual_trade_management
+# engine on a COPY of the live position (so ACTIVE_TRADES_BY_INST is never mutated) and
+# CONSUMES the current analysis `result`. NO auto-exit (a future, separate step).
+# ---------------------------------------------------------------------------
+
+ATT_PEAK_BY_KEY = {}                 # display-only running R extremes per open position
+ATT_PEAK_LOCK   = threading.Lock()
+
+
+def _att_trade_key(inst, trade):
+    return "%s|%s" % (inst, (trade or {}).get("opened_at") or "")
+
+
+def _active_trade_thinking_neutral(reason="Active Trade Thinking disabled.",
+                                   instrument=None, enabled=False):
+    """Stable neutral schema for the Active Trade Thinking overlay. Never raises."""
+    return {
+        "enabled":            bool(enabled),
+        "available":          False,
+        "instrument":         instrument,
+        "generated_at":       now_utc().isoformat(),
+        "state":              "none",
+        "has_trade":          False,
+        "summary":            reason,
+        "direction":          None,
+        "thesis_status":      "NONE",
+        "thesis_strength":    {"label": "—", "score": 0},
+        "trade_health_score": None,
+        "momentum":           "neutral",
+        "runner_potential":   "low",
+        "exit_warning":       {"active": False, "reason": None},
+        "scratch_warning":    {"active": False, "reason": None},
+        "recommendation":     "HOLD",
+        "recommendation_reason": "",
+        "reasons":            [],
+        "current_r":          None,
+        "mfe_r":              None,
+        "mae_r":              None,
+        "unrealized_pnl":     None,
+        "entry_price":        None,
+        "stop_loss":          None,
+        "target1":            None,
+        "target2":            None,
+        "advisory_only":      True,
+        "auto_exit":          False,
+    }
+
+
+def compute_active_trade_thinking(result):
+    """In-trade 'thinking' overlay — see the section header for the money-path wall.
+
+    Grades thesis strength, a 0-100 trade-health score, momentum (improving / fading),
+    runner potential, plus exit / scratch warnings, and maps them to ONE advisory verb:
+    HOLD / TAKE PARTIAL / MOVE STOP / WATCH CLOSELY / CONSIDER EXIT. Advisory only — it
+    NEVER exits the trade. FAIL-OPEN (its caller wraps this in try/except -> neutral)."""
+    inst_label = result.get("active_ticker") or result.get("instrument")
+    inst = instrument_of(inst_label) if inst_label else None
+    out = _active_trade_thinking_neutral("", inst_label, enabled=True)
+
+    trade = active_trade_for(inst) if inst else None
+    if not trade:
+        out["state"]     = "no_trade"
+        out["available"] = True
+        out["summary"]   = ("No open position — nothing to manage. Stalk Mode is watching "
+                            "for the next setup.")
+        return out
+
+    # Work on a COPY — compute_manual_trade_management writes min_r/max_r back onto its
+    # input, and the live ACTIVE_TRADES_BY_INST slot must never be mutated by this
+    # display overlay. The trade dict is flat (floats/strings/bools), so a shallow copy
+    # is enough. Pass analysis=result so the helper does NOT recompute full_analysis.
+    tcopy = dict(trade)
+    tcopy.setdefault("symbol", inst_label)
+    tcopy.setdefault("mode", result.get("mode") or trade.get("mode") or "SCALP")
+    try:
+        mtm = compute_manual_trade_management(tcopy, analysis=result)
+    except Exception as exc:
+        out["has_trade"] = True
+        out["state"]     = "unavailable"
+        out["summary"]   = "Live management read unavailable (%s)." % exc
+        return out
+
+    out["has_trade"]  = True
+    out["available"]  = True
+    out["direction"]  = mtm.get("direction")
+    out["entry_price"] = mtm.get("entry_price")
+    out["stop_loss"]   = mtm.get("stop_loss")
+    out["target1"]     = mtm.get("target1")
+    out["target2"]     = mtm.get("target2")
+    thesis = mtm.get("thesis_status") or "VALID"
+    out["thesis_status"] = thesis
+
+    if mtm.get("status") != "ok":
+        out["state"]   = "monitoring"
+        out["summary"] = mtm.get("recommendation_reason") or "Live management read unavailable."
+        return out
+
+    out["state"] = "managing"
+    cur_r = mtm.get("current_r")
+    out["current_r"]      = cur_r
+    out["unrealized_pnl"] = mtm.get("unrealized_pnl")
+
+    # Persistent (display-only) running R extremes for the momentum / runner reads.
+    key = _att_trade_key(inst, trade)
+    peak = trough = None
+    with ATT_PEAK_LOCK:
+        prev = ATT_PEAK_BY_KEY.get(key) or {}
+        peak, trough = prev.get("peak_r"), prev.get("trough_r")
+        if isinstance(cur_r, (int, float)):
+            peak   = cur_r if peak   is None else max(peak, cur_r)
+            trough = cur_r if trough is None else min(trough, cur_r)
+        ATT_PEAK_BY_KEY[key] = {"peak_r": peak, "trough_r": trough}
+        if len(ATT_PEAK_BY_KEY) > 32:                  # keep the dict small
+            for _k in list(ATT_PEAK_BY_KEY.keys())[:-32]:
+                ATT_PEAK_BY_KEY.pop(_k, None)
+    out["mfe_r"] = round(peak, 2) if isinstance(peak, (int, float)) else None
+    out["mae_r"] = round(trough, 2) if isinstance(trough, (int, float)) else None
+
+    # Structure agreement (display read).
+    sc = str(result.get("structure_class") or "").lower()
+    is_long = (out["direction"] == "Long")
+    struct_with    = ("bullish" in sc and is_long) or ("bearish" in sc and not is_long)
+    struct_against = ("bearish" in sc and is_long) or ("bullish" in sc and not is_long)
+
+    # Momentum: improving when holding near the running R peak, fading when it has given
+    # back from the peak (or structure has turned while the thesis is slipping).
+    momentum = "neutral"
+    if isinstance(cur_r, (int, float)) and isinstance(peak, (int, float)):
+        if cur_r >= peak - 0.10 and cur_r > 0:
+            momentum = "improving"
+        elif cur_r <= peak - 0.30:
+            momentum = "fading"
+    if momentum == "neutral" and struct_with and isinstance(cur_r, (int, float)) and cur_r > 0:
+        momentum = "improving"
+    if struct_against and thesis in ("WEAKENING", "INVALID"):
+        momentum = "fading"
+    out["momentum"] = momentum
+
+    # Trade-health score (0-100) — a composite of thesis, open R, momentum & structure.
+    score = 50
+    if thesis == "VALID":
+        score += 20
+    elif thesis == "WEAKENING":
+        score -= 15
+    elif thesis == "INVALID":
+        score -= 40
+    if isinstance(cur_r, (int, float)):
+        score += max(-20, min(20, int(round(cur_r * 10))))
+    if momentum == "improving":
+        score += 10
+    elif momentum == "fading":
+        score -= 10
+    if struct_with:
+        score += 5
+    if struct_against:
+        score -= 10
+    if mtm.get("stop_breached"):
+        score = min(score, 5)
+    score = max(0, min(100, score))
+    out["trade_health_score"] = score
+
+    # Thesis strength label.
+    if thesis == "INVALID" or mtm.get("stop_breached"):
+        ts_label = "BROKEN"
+    elif score >= 75:
+        ts_label = "STRONG"
+    elif score >= 50:
+        ts_label = "MODERATE"
+    else:
+        ts_label = "WEAK"
+    out["thesis_strength"] = {"label": ts_label, "score": score}
+
+    # Runner potential.
+    runner = "low"
+    if isinstance(cur_r, (int, float)):
+        if cur_r >= 1.5 and momentum == "improving" and thesis == "VALID" and struct_with:
+            runner = "increasing"
+        elif cur_r >= 0.8 and thesis == "VALID":
+            runner = "steady"
+    out["runner_potential"] = runner
+
+    # Exit / scratch warnings (advisory only — never auto-acted).
+    exit_active = bool(mtm.get("stop_breached") or thesis == "INVALID")
+    out["exit_warning"] = {
+        "active": exit_active,
+        "reason": (mtm.get("recommendation_reason") if exit_active else None),
+    }
+    scratch_active, scratch_reason = False, None
+    if not exit_active and isinstance(cur_r, (int, float)):
+        if thesis == "WEAKENING" and momentum == "fading" and cur_r <= 0.3:
+            scratch_active = True
+            scratch_reason = ("Thesis is weakening and momentum is fading while the trade is "
+                              "near entry — consider scratching for a small result rather than "
+                              "risking the full stop.")
+        elif struct_against and cur_r <= 0.0:
+            scratch_active = True
+            scratch_reason = ("Structure has turned against you and the trade is offside, but "
+                              "the stop is still intact — consider scratching.")
+    out["scratch_warning"] = {"active": scratch_active, "reason": scratch_reason}
+
+    # Recommendation — map the proven manual-management action onto the advisory verbs.
+    action = str(mtm.get("action") or mtm.get("recommendation") or "HOLD").upper()
+    rec = {
+        "EXIT":            "CONSIDER EXIT",
+        "REDUCE":          "TAKE PARTIAL",
+        "TAKE PARTIAL":    "TAKE PARTIAL",
+        "MOVE STOP TO BE": "MOVE STOP",
+        "MOVE STOP":       "MOVE STOP",
+        "HOLD":            "HOLD",
+        "MONITOR":         "WATCH CLOSELY",
+    }.get(action, "HOLD")
+    if rec == "HOLD" and (thesis == "WEAKENING" or scratch_active or momentum == "fading"):
+        rec = "WATCH CLOSELY"
+    out["recommendation"]        = rec
+    out["recommendation_reason"] = mtm.get("recommendation_reason") or ""
+
+    reasons = list(mtm.get("warnings") or [])
+    if scratch_active and scratch_reason:
+        reasons.append(scratch_reason)
+    out["reasons"] = reasons[:8]
+
+    _rtxt = ("%.2fR" % cur_r) if isinstance(cur_r, (int, float)) else "—"
+    out["summary"] = ("%s %s — thesis %s (health %d/100), momentum %s, at %s. Advisory: %s."
+                      % (out["direction"] or "—", inst_label or "", str(thesis).title(),
+                         score, momentum, _rtxt, rec))
+    return out
 
 
 def compute_scalp_strategy_advisory(result):
@@ -26973,6 +27400,11 @@ def status():
         # Added ONLY when the flag is on, so the OFF payload is byte-identical to today.
         **({"scalp_strategy_advisory": a.get("scalp_strategy_advisory")}
            if SCALP_MAIN_BRAIN_ADVISORY_ENABLED else {}),
+        # ── Advisory overlays (Stalk Mode + Active Trade Thinking) — DISPLAY-ONLY ──
+        # Added ONLY when their flag is on, so the OFF payload is byte-identical to today.
+        **({"stalk_mode": a.get("stalk_mode")} if STALK_MODE_ENABLED else {}),
+        **({"active_trade_thinking": a.get("active_trade_thinking")}
+           if ACTIVE_THINKING_ENABLED else {}),
     }), 200
 
 
@@ -31246,6 +31678,27 @@ def dashboard():
   <div class="nf-fid" id="ssa-safety">Advisory layer is display-only and does not place or influence live trades.</div>
 </div>
 
+<div class="mod" id="mod-stalk-mode" style="display:none">
+  <div class="mod-h">🦉 Stalk Mode <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">PRE-ENTRY · ADVISORY-ONLY</span></div>
+  <div id="stk-summary" class="mb-summary" style="margin:8px 0">—</div>
+  <div id="stk-grid" class="sd-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px"></div>
+  <div id="stk-ext" style="font-size:11px;margin-top:8px;display:none"></div>
+  <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:12px 0 4px;letter-spacing:.3px">Why Waiting</div>
+  <div id="stk-why" style="font-size:11px;color:#9aa3b2">—</div>
+  <div class="nf-fid">Pre-entry observation only — never places, sizes, or influences a trade.</div>
+</div>
+
+<div class="mod" id="mod-active-thinking" style="display:none">
+  <div class="mod-h">🧭 Active Trade Thinking <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">IN-TRADE · ADVISORY-ONLY</span></div>
+  <div id="att-rec" style="font-size:15px;font-weight:800;letter-spacing:.4px;margin:6px 0">—</div>
+  <div id="att-summary" class="mb-summary" style="margin:8px 0">—</div>
+  <div id="att-grid" class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
+  <div id="att-warn" style="font-size:11px;margin-top:8px;display:none"></div>
+  <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:12px 0 4px;letter-spacing:.3px">Notes</div>
+  <div id="att-reasons" style="font-size:11px;color:#9aa3b2">—</div>
+  <div class="nf-fid">Advisory only — recommendations are never auto-executed; no auto-exit.</div>
+</div>
+
 <div class="mod mb-hidden" id="mod-countdown">
   <div class="mod-h">🎯 Setup Countdown</div>
   <div class="cd-big" id="cd-big">—</div>
@@ -32875,6 +33328,8 @@ function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
   renderMainBrainCognitive(d);
+  try{ renderStalkMode(d); }catch(e){}
+  try{ renderActiveThinking(d); }catch(e){}
   const diag   = d.alert_diagnostics || {};
   const v      = d.verdict || 'WAIT';
   const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
@@ -33836,6 +34291,109 @@ function renderScalpAdvisory(d){
     }
     wrap.appendChild(card);
   });
+}
+// ── Stalk Mode (pre-entry observation) — DISPLAY-ONLY, textContent only ──
+function renderStalkMode(d){
+  const m = document.getElementById('mod-stalk-mode');
+  if(!m) return;
+  const s = d.stalk_mode;
+  if(!s || !s.enabled){ m.style.display='none'; return; }
+  m.style.display='';
+  const sm = document.getElementById('stk-summary');
+  if(sm) sm.textContent = s.summary || '—';
+  const grid = document.getElementById('stk-grid');
+  if(grid){
+    grid.innerHTML='';
+    const cell=function(label,val){
+      const c=document.createElement('div');
+      c.style.cssText='background:var(--panel2,#11161f);border:1px solid var(--bd,#222b3a);border-radius:8px;padding:8px';
+      const l=document.createElement('div'); l.style.cssText='font-size:9px;letter-spacing:1px;color:#6b7280;text-transform:uppercase';
+      l.textContent=label; c.appendChild(l);
+      const v=document.createElement('div'); v.style.cssText='font-size:13px;font-weight:700;color:#cdd3e0;margin-top:2px';
+      v.textContent=(val===null||val===undefined||val==='')?'—':String(val); c.appendChild(v);
+      grid.appendChild(c);
+    };
+    cell('Direction', s.direction || '—');
+    cell('Bias', s.bias || '—');
+    cell('Ideal Entry', s.ideal_entry_zone);
+    cell('Pullback Area', s.pullback_area);
+    cell('Liquidity Target', s.liquidity_target);
+    cell('R:R', s.rr);
+  }
+  const ext = document.getElementById('stk-ext');
+  if(ext){
+    const ew = s.extension_warning || {};
+    if(ew.active){
+      ext.style.display='';
+      ext.style.color='#d8a25a';
+      let t = '⚠ ' + (ew.label || 'Extended');
+      if(ew.detail) t += ' — ' + ew.detail;
+      if(ew.vwap_extension_atr!=null) t += ' (' + ew.vwap_extension_atr + ' ATR from VWAP)';
+      ext.textContent = t;
+    } else { ext.style.display='none'; ext.textContent=''; }
+  }
+  const why = document.getElementById('stk-why');
+  if(why){
+    const arr = s.why_waiting || [];
+    why.textContent = arr.length ? arr.join('  •  ') : 'No blocking reasons reported.';
+  }
+}
+// ── Active Trade Thinking (in-trade reasoning) — DISPLAY-ONLY, textContent only ──
+function renderActiveThinking(d){
+  const m = document.getElementById('mod-active-thinking');
+  if(!m) return;
+  const a = d.active_trade_thinking;
+  if(!a || !a.enabled){ m.style.display='none'; return; }
+  m.style.display='';
+  const rec = document.getElementById('att-rec');
+  if(rec){
+    if(a.has_trade){
+      rec.style.display='';
+      const colors={'CONSIDER EXIT':'#e06b6b','TAKE PARTIAL':'#d8a25a','MOVE STOP':'#d8a25a','WATCH CLOSELY':'#cdd3e0','HOLD':'#5fb87a'};
+      rec.textContent = '▸ ' + (a.recommendation || 'HOLD');
+      rec.style.color = colors[a.recommendation] || '#cdd3e0';
+    } else { rec.style.display='none'; rec.textContent=''; }
+  }
+  const sm = document.getElementById('att-summary');
+  if(sm) sm.textContent = a.summary || '—';
+  const grid = document.getElementById('att-grid');
+  if(grid){
+    grid.innerHTML='';
+    const cell=function(label,val){
+      const c=document.createElement('div');
+      c.style.cssText='background:var(--panel2,#11161f);border:1px solid var(--bd,#222b3a);border-radius:8px;padding:8px';
+      const l=document.createElement('div'); l.style.cssText='font-size:9px;letter-spacing:1px;color:#6b7280;text-transform:uppercase';
+      l.textContent=label; c.appendChild(l);
+      const v=document.createElement('div'); v.style.cssText='font-size:13px;font-weight:700;color:#cdd3e0;margin-top:2px';
+      v.textContent=(val===null||val===undefined||val==='')?'—':String(val); c.appendChild(v);
+      grid.appendChild(c);
+    };
+    if(a.has_trade){
+      const ts = a.thesis_strength || {};
+      cell('Direction', a.direction || '—');
+      cell('Thesis', a.thesis_status || '—');
+      cell('Strength', (ts.label||'—') + (ts.score!=null?(' '+ts.score):''));
+      cell('Health', a.trade_health_score!=null ? (a.trade_health_score + '/100') : '—');
+      cell('Momentum', a.momentum || '—');
+      cell('Runner', a.runner_potential || '—');
+      cell('Open R', a.current_r!=null ? (a.current_r + 'R') : '—');
+      cell('MFE', a.mfe_r!=null ? (a.mfe_r + 'R') : '—');
+      cell('MAE', a.mae_r!=null ? (a.mae_r + 'R') : '—');
+    }
+  }
+  const warn = document.getElementById('att-warn');
+  if(warn){
+    const parts=[];
+    if(a.exit_warning && a.exit_warning.active) parts.push('⛔ Exit risk: ' + (a.exit_warning.reason||'thesis broken'));
+    if(a.scratch_warning && a.scratch_warning.active) parts.push('✂ Scratch: ' + (a.scratch_warning.reason||''));
+    if(parts.length){ warn.style.display=''; warn.style.color='#e06b6b'; warn.textContent=parts.join('   '); }
+    else { warn.style.display='none'; warn.textContent=''; }
+  }
+  const reasons = document.getElementById('att-reasons');
+  if(reasons){
+    const arr = a.reasons || [];
+    reasons.textContent = arr.length ? arr.join('  •  ') : (a.recommendation_reason || '—');
+  }
 }
 function renderMainBrainCognitive(d){
   try{ renderMBVoice(d); }catch(e){}

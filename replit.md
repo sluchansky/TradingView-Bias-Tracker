@@ -44,6 +44,8 @@ _Populate as you build — sharp edges, "always run X before Y" rules._
 
 - **Trading Academy is learning-only — never wire it into live trading.** The `/academy/*` module (sources → AI-extracted lessons → strategy cards → rules → validation → Q&A) is fully walled off from the gate/scoring/auto-execute/broker/sizing path, like `/backtest` and `/scalp-research`. Setting a strategy `APPROVED`/`active` records intent only; it does NOT place trades. Any change must keep the four strict goldens + parity byte-identical and pass `bash .local/state/check_academy.sh` (the money-path tripwire). Academy routes are owner-only: whitelisted in `flask-proxy.ts`, NEVER added to `dashboard-auth.ts` OPEN_PATHS.
 
+- **Advisory overlays (Stalk Mode + Active Trade Thinking) are display-only — never let them touch the gate.** Two flag-gated layers (`STALK_MODE_ENABLED` / `ACTIVE_THINKING_ENABLED`, default ON) attach ABOVE the strict engine at the single `full_analysis` seam; flag-OFF the key is simply absent so the bot behaves exactly as today. Stalk Mode observes a forming setup pre-entry; Active Trade Thinking grades an open position and recommends one of HOLD / TAKE PARTIAL / MOVE STOP / WATCH CLOSELY / CONSIDER EXIT — **advisory only, no auto-exit**. Active Trade Thinking reuses `compute_manual_trade_management` (which mutates `min_r`/`max_r` on its input) so it MUST run on a `dict(trade)` copy and never mutate `ACTIVE_TRADES_BY_INST`. The strict goldens don't exercise overlay-ON; run `bash .local/state/check_stalk_active.sh` (money-path tripwire + no-mutation + node --check of the served dashboard script) after any change here.
+
 ## Pointers
 
 - See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
