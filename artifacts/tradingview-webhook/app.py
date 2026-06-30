@@ -8071,6 +8071,29 @@ STRAT_MOVE_THRESH_PCT    = 0.0015  # +/-0.15% session move == directional sessio
 RANGE_LOOKBACK_MIN       = 30      # rolling window for the consolidation range
 BREAKOUT_RECENT_SEC      = 180     # exclude the last 3 min so a breakout tick isn't in its own range
 
+# ── 9:30 ET Breakout Mode (DISPLAY-ONLY advisory) ────────────────────────────
+# A professional opening-range breakout model anchored to the 09:30 ET EQUITY cash
+# open — deliberately SEPARATE from the 08:00 strategy-engine opening range above
+# (which is left untouched so the goldens stay byte-identical). FLAG-GATED,
+# DEFAULT-OFF: when OFF nothing is tracked and result["breakout_mode"] is never set.
+# It NEVER touches the strict gate, verdict, directions, sizing or money path.
+BREAKOUT_MODE_ENABLED   = _env_flag_on("BREAKOUT_MODE_ENABLED", default_on=False)
+BREAKOUT_OR_START_ET    = 9.5     # opening range builds from 09:30 ET (equity cash open)
+BREAKOUT_OR_BUILD_MIN   = 15      # ...over the first 15 minutes (09:30–09:45 ET)
+BREAKOUT_WATCH_END_ET   = 11.0    # stop hunting fresh breakouts after 11:00 ET
+BREAKOUT_QUALITY_READY  = 70      # min breakout-quality score (0–100) to call a side READY
+BREAKOUT_BUFFER_ATR     = 0.05    # price must clear the OR edge by this * ATR to count as a break
+BREAKOUT_EXT_ATR        = 1.5     # > this many ATR beyond the OR edge == overextended (no chase)
+BREAKOUT_WALL_ATR       = 1.0     # an opposing S/D level within this * ATR == a wall directly in front
+BREAKOUT_OR_LOCK        = threading.Lock()
+BREAKOUT_OR_BY_TICKER   = {}
+_BREAKOUT_DISCLAIMER    = (
+    "9:30 ET opening-range breakout advisory. DISPLAY-ONLY — it never places, sizes or "
+    "changes a trade; the strict gate stays authoritative. Targets are a dynamic R:R "
+    "estimate; prop / daily-loss limits are enforced by the existing safety controls."
+)
+
+
 # Per-instrument intraday tracker (opening range + per-session OHLC + rolling
 # ticks). Detection-only; guarded by a lock since it's written from the webhook
 # worker and read from request threads.
@@ -8183,6 +8206,59 @@ def _intraday_or(inst):
             return {"high": None, "low": None, "complete": False}
         return {"high": rec.get("or_high"), "low": rec.get("or_low"),
                 "complete": bool(rec.get("or_complete"))}
+
+
+def _update_breakout_or_tracker(inst, price, ts=None):
+    """Feed one price tick into the DEDICATED 09:30 ET breakout opening-range tracker.
+    Builds the OR over 09:30–09:45 ET, then records the post-build extremes (used for
+    liquidity-sweep / overextension detection). Resets per ET day. FAIL-OPEN: a flag-OFF
+    call is a no-op and nothing here ever raises into the webhook path."""
+    if not BREAKOUT_MODE_ENABLED:
+        return
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return
+    try:
+        now = ts or now_utc()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        et       = now.astimezone(ET_TZ)
+        et_date  = et.date().isoformat()
+        h        = et.hour + et.minute / 60.0
+        or_start = BREAKOUT_OR_START_ET
+        or_end   = BREAKOUT_OR_START_ET + BREAKOUT_OR_BUILD_MIN / 60.0
+        with BREAKOUT_OR_LOCK:
+            rec = BREAKOUT_OR_BY_TICKER.get(inst)
+            if rec is None or rec.get("or_date") != et_date:
+                rec = {"or_date": et_date, "or_high": None, "or_low": None,
+                       "or_complete": False, "post_high": None, "post_low": None,
+                       "ticks": deque(maxlen=400)}
+                BREAKOUT_OR_BY_TICKER[inst] = rec
+            if or_start <= h < or_end:
+                rec["or_high"] = price if rec["or_high"] is None else max(rec["or_high"], price)
+                rec["or_low"]  = price if rec["or_low"]  is None else min(rec["or_low"],  price)
+                rec["or_complete"] = False
+            elif h >= or_end and rec["or_high"] is not None and rec["or_low"] is not None:
+                rec["or_complete"] = True
+                rec["post_high"] = price if rec["post_high"] is None else max(rec["post_high"], price)
+                rec["post_low"]  = price if rec["post_low"]  is None else min(rec["post_low"],  price)
+            rec["ticks"].append((now.isoformat(), price))
+    except Exception:
+        return
+
+
+def _breakout_or(inst):
+    """Read-only snapshot of the 09:30 ET breakout opening range. FAIL-OPEN."""
+    with BREAKOUT_OR_LOCK:
+        rec = BREAKOUT_OR_BY_TICKER.get(inst)
+        if not rec:
+            return {"high": None, "low": None, "complete": False,
+                    "post_high": None, "post_low": None, "ticks": []}
+        return {"high": rec.get("or_high"), "low": rec.get("or_low"),
+                "complete": bool(rec.get("or_complete")),
+                "post_high": rec.get("post_high"), "post_low": rec.get("post_low"),
+                "ticks": list(rec.get("ticks") or [])}
 
 
 def _intraday_range(inst):
@@ -8669,6 +8745,264 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
         out["regime_reason"] = "Engine unavailable — defaulting safe"
         out["reason"]        = "Strategy engine unavailable."
         return out
+
+
+def _breakout_neutral_block(reason, inst=None, active=False):
+    """A fully-populated INACTIVE breakout-mode block. Used for the closed-market
+    override (key parity with the open path) and the fail-open fallback. Same schema
+    compute_breakout_mode returns."""
+    return {
+        "enabled": True, "active": bool(active), "instrument": inst,
+        "primary": bool(inst in ("MNQ", "MES", "MYM")) if inst else False,
+        "window": "09:30–09:45 ET opening range · breakout watch to 11:00 ET",
+        "in_build": False, "or_high": None, "or_low": None, "or_width": None,
+        "or_complete": False, "break_direction": "None", "setup_kind": "None",
+        "quality_score": 0, "long_target_potential": None, "short_target_potential": None,
+        "entry_status": "WAIT", "reason": reason, "confirmations": [],
+        "plan": None, "failure_level": "None", "failure_reasons": [],
+        "management": [], "note": _BREAKOUT_DISCLAIMER,
+    }
+
+
+def compute_breakout_mode(ticker, current_price, vwap_value, vwap_status, volatility,
+                          nearest_supply=None, nearest_demand=None):
+    """9:30 ET opening-range breakout advisory. DISPLAY-ONLY — never touches the gate,
+    verdict, directions, sizing or money path. Returns None when the feature flag is OFF
+    (so the result key is absent and the goldens stay byte-identical); returns a populated
+    or neutral block when ON. FAIL-OPEN: any error degrades to a safe neutral block."""
+    if not BREAKOUT_MODE_ENABLED:
+        return None
+    try:
+        inst    = instrument_of(ticker)
+        primary = inst in ("MNQ", "MES", "MYM")     # the 9:30 cash open is native to index futures
+        et_now  = now_utc().astimezone(ET_TZ)
+        et_hour = et_now.hour + et_now.minute / 60.0
+        build_end  = BREAKOUT_OR_START_ET + BREAKOUT_OR_BUILD_MIN / 60.0
+        in_build   = bool(BREAKOUT_OR_START_ET <= et_hour < build_end)
+        in_watch   = bool(BREAKOUT_OR_START_ET <= et_hour < BREAKOUT_WATCH_END_ET)
+        window_lbl = "09:30–09:45 ET opening range · breakout watch to 11:00 ET"
+
+        ortrk     = _breakout_or(inst)
+        or_high   = ortrk["high"];      or_low = ortrk["low"]
+        or_complete = ortrk["complete"]
+        post_high = ortrk["post_high"]; post_low = ortrk["post_low"]
+        or_width  = (or_high - or_low) if (or_high is not None and or_low is not None) else None
+
+        price = current_price
+        snap  = _strategy_signal_snapshot(inst)
+        vol   = volatility or {}
+        atr_pts   = vol.get("atr_pts")
+        atr_ratio = vol.get("ratio")
+
+        vwap_ok = bool(vwap_status == "ok" and vwap_value is not None and price is not None)
+        price_above_vwap = bool(vwap_ok and price > vwap_value)
+        price_below_vwap = bool(vwap_ok and price < vwap_value)
+
+        try:
+            rvol_val = float(snap["rvol_value"]) if snap["rvol_value"] is not None else None
+        except (TypeError, ValueError):
+            rvol_val = None
+        rvol_thr  = float(cfg("RVOL_CONFIRM_THRESHOLD"))
+        rvol_ok   = bool(rvol_val is not None and rvol_val >= rvol_thr)
+        volume_ok = bool(snap["volume_spike_fresh"] or rvol_ok)
+        atr_stretched = bool(atr_ratio is not None and atr_ratio >= cfg("VOL_HIGH_CAUTION"))
+
+        # ── break / sweep classification (requires a COMPLETED opening range) ──
+        buffer_pts = (atr_pts * BREAKOUT_BUFFER_ATR) if atr_pts else 0.0
+        broke_high = bool(or_complete and or_high is not None and price is not None and price > or_high + buffer_pts)
+        broke_low  = bool(or_complete and or_low  is not None and price is not None and price < or_low  - buffer_pts)
+        swept_high = bool(or_complete and or_high is not None and post_high is not None and post_high > or_high + buffer_pts)
+        swept_low  = bool(or_complete and or_low  is not None and post_low  is not None and post_low  < or_low  - buffer_pts)
+        reclaim_short = bool(swept_high and price is not None and or_high is not None and price < or_high)
+        reclaim_long  = bool(swept_low  and price is not None and or_low  is not None and price > or_low)
+
+        direction = None; setup_kind = "None"
+        if broke_high and not broke_low:
+            direction, setup_kind = "Long", "Breakout"
+        elif broke_low and not broke_high:
+            direction, setup_kind = "Short", "Breakout"
+        elif reclaim_short and not reclaim_long:
+            direction, setup_kind = "Short", "Sweep Reversal"
+        elif reclaim_long and not reclaim_short:
+            direction, setup_kind = "Long", "Sweep Reversal"
+
+        def _confirms(d):
+            up   = (d == "Long")
+            edge = or_high if up else or_low
+            if setup_kind == "Sweep Reversal":
+                close_beyond = bool((d == "Short" and reclaim_short) or (d == "Long" and reclaim_long))
+            else:
+                close_beyond = bool((up and broke_high) or (not up and broke_low))
+            vwap_aligned      = price_above_vwap if up else price_below_vwap
+            structure_aligned = bool(snap["structure_long"] if up else snap["structure_short"])
+            wall = False
+            if atr_pts and price is not None:
+                if up and nearest_supply is not None:
+                    wall = bool(0 <= (nearest_supply - price) <= BREAKOUT_WALL_ATR * atr_pts)
+                elif (not up) and nearest_demand is not None:
+                    wall = bool(0 <= (price - nearest_demand) <= BREAKOUT_WALL_ATR * atr_pts)
+            no_wall = not wall
+            overext = False
+            if atr_pts and edge is not None and price is not None:
+                dist = (price - edge) if up else (edge - price)
+                overext = bool(dist > BREAKOUT_EXT_ATR * atr_pts)
+            not_overext = not overext
+            checks = [
+                ("Close beyond range",            close_beyond),
+                ("Volume / RVOL confirms",        volume_ok),
+                ("Price on correct VWAP side",    bool(vwap_aligned)),
+                ("BOS / CHOCH structure aligned", structure_aligned),
+                ("No S/D wall in front",          no_wall),
+                ("Not overextended",              not_overext),
+            ]
+            return checks, close_beyond, no_wall, not_overext, overext
+
+        WEIGHTS = {
+            "Close beyond range": 25, "Volume / RVOL confirms": 20,
+            "Price on correct VWAP side": 20, "BOS / CHOCH structure aligned": 20,
+            "No S/D wall in front": 7.5, "Not overextended": 7.5,
+        }
+        confirmations = []
+        quality = 0
+        ready   = False
+        favored = direction
+        close_beyond = no_wall = not_overext = overext = False
+        if favored:
+            confirmations, close_beyond, no_wall, not_overext, overext = _confirms(favored)
+            quality = int(round(sum(WEIGHTS[l] for l, m in confirmations if m)))
+            hard    = all(m for l, m in confirmations)
+            ready   = bool(in_watch and or_complete and hard and quality >= BREAKOUT_QUALITY_READY)
+
+        def _rr_potential(d):
+            up = (d == "Long")
+            vwap_aligned      = price_above_vwap if up else price_below_vwap
+            structure_aligned = bool(snap["structure_long"] if up else snap["structure_short"])
+            if not (vwap_aligned and structure_aligned):
+                return None
+            rr = 2
+            if volume_ok:
+                rr = 3
+            _chk, _cb, nowall, notext, _ov = _confirms(d)
+            if rr >= 3 and atr_stretched and nowall and notext:
+                rr = 4
+            strong_rvol = bool(rvol_val is not None and rvol_val >= rvol_thr * 1.5)
+            if rr >= 4 and atr_stretched and strong_rvol and nowall and notext:
+                rr = 5
+            return rr
+        long_rr  = _rr_potential("Long")
+        short_rr = _rr_potential("Short")
+
+        # ── suggested plan for the favored side (DISPLAY-ONLY; opening range = risk) ──
+        plan = None
+        if favored and or_complete and or_high is not None and or_low is not None and price is not None:
+            up    = (favored == "Long")
+            entry = float(price)
+            stop  = float(or_low if up else or_high)
+            risk  = abs(entry - stop)
+            if risk <= 0 and atr_pts:
+                risk = float(atr_pts)
+            if risk > 0:
+                rr_runner = float((long_rr if up else short_rr) or 2)
+                tp1_r = 2.0 if atr_stretched else 1.0
+                if rr_runner <= tp1_r:
+                    tp2_r = rr_runner
+                else:
+                    tp2_r = min(rr_runner, max(tp1_r + 1.0, round((tp1_r + rr_runner) / 2.0)))
+                sgn = 1.0 if up else -1.0
+                plan = {
+                    "direction": favored,
+                    "entry":  round(entry, 2),
+                    "stop":   round(stop, 2),
+                    "tp1":    round(entry + sgn * tp1_r * risk, 2),
+                    "tp2":    round(entry + sgn * tp2_r * risk, 2),
+                    "runner": round(entry + sgn * rr_runner * risk, 2),
+                    "risk_points": round(risk, 2),
+                    "tp1_r": tp1_r, "tp2_r": float(tp2_r), "runner_r": rr_runner,
+                    "rr": "1:%d" % int(rr_runner),
+                }
+
+        # ── failure rules (advisory rejection reasons) ──
+        failure_reasons = []
+        if favored:
+            if not no_wall:
+                failure_reasons.append("Breaking directly into a major supply/demand wall.")
+            if overext:
+                failure_reasons.append("Already overextended beyond the range — no chase.")
+            if not volume_ok:
+                failure_reasons.append("Volume / RVOL does not confirm the break.")
+            if setup_kind == "Breakout" and atr_pts:
+                ext = post_high if favored == "Long" else post_low
+                if ext is not None and price is not None:
+                    wick = (ext - price) if favored == "Long" else (price - ext)
+                    if wick > BREAKOUT_EXT_ATR * atr_pts:
+                        failure_reasons.append("Large wick rejection at the breakout edge.")
+        if (swept_high and reclaim_short and favored != "Short") or \
+           (swept_low and reclaim_long and favored != "Long"):
+            failure_reasons.append("Breakout closed back inside the range (failed break).")
+        n_fail = len(failure_reasons)
+        failure_level = ("None" if n_fail == 0 else "Low" if n_fail == 1
+                         else "Elevated" if n_fail == 2 else "High")
+
+        # ── entry status + human reason ──
+        if ready and favored == "Long":
+            entry_status = "READY LONG"
+        elif ready and favored == "Short":
+            entry_status = "READY SHORT"
+        else:
+            entry_status = "WAIT"
+
+        if not in_watch:
+            reason = "Outside the 09:30–11:00 ET breakout window."
+        elif in_build:
+            reason = "Building the 09:30 opening range (09:30–09:45 ET)…"
+        elif not or_complete:
+            reason = "Waiting for the opening range to complete."
+        elif ready:
+            reason = "%s confirmed %s — close beyond range with volume, VWAP & structure aligned." % (
+                setup_kind, favored)
+        elif favored:
+            missing = [l for l, m in confirmations if not m]
+            reason = "Forming %s %s: missing %s." % (
+                favored, setup_kind, ", ".join(missing) if missing else "final confirmation")
+        else:
+            reason = "Inside the opening range — no clean break yet (WAIT)."
+
+        management = []
+        if favored:
+            management = [
+                "Take partial at TP1 (%.0fR), then scale toward the %s runner." % (
+                    (plan or {}).get("tp1_r", 1.0), (plan or {}).get("rr", "1:2")),
+                "Move stop to breakeven only AFTER structure confirms continuation "
+                "(new HL long / LH short) — not immediately.",
+                "Trail the runner behind higher-lows (long) / lower-highs (short).",
+                "Exit early if price closes back inside the opening range.",
+                "Exit early if VWAP is reclaimed against the position.",
+                "Exit early if volume dies and candles stall.",
+                "Let the runner work while momentum stays clean.",
+            ]
+
+        return {
+            "enabled": True, "active": bool(in_watch), "instrument": inst, "primary": bool(primary),
+            "window": window_lbl, "in_build": bool(in_build),
+            "or_high":  round(or_high, 2) if or_high is not None else None,
+            "or_low":   round(or_low, 2) if or_low is not None else None,
+            "or_width": round(or_width, 2) if or_width is not None else None,
+            "or_complete": bool(or_complete),
+            "break_direction": direction or "None", "setup_kind": setup_kind,
+            "quality_score": int(quality),
+            "long_target_potential": long_rr, "short_target_potential": short_rr,
+            "entry_status": entry_status, "reason": reason,
+            "confirmations": [{"label": l, "met": bool(m)} for l, m in confirmations],
+            "plan": plan, "failure_level": failure_level, "failure_reasons": failure_reasons,
+            "management": management, "note": _BREAKOUT_DISCLAIMER,
+        }
+    except Exception as exc:
+        logger.warning("breakout mode error: %s", exc)
+        try:
+            inst = instrument_of(ticker) if ticker else None
+        except Exception:
+            inst = None
+        return _breakout_neutral_block("Breakout mode unavailable — defaulting safe.", inst=inst)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -15505,6 +15839,16 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # override below independently neutralizes the verdict so no closed-market send.
     _apply_orb_target_override(result)
 
+    # ── 9:30 ET Breakout Mode (DISPLAY-ONLY advisory; flag-gated, default OFF) ──
+    # Grades upside/downside breaks + liquidity-sweep reversals off a DEDICATED 09:30
+    # opening range. NEVER touches verdict / directions / trade_plan. When the flag is
+    # OFF the key is absent (goldens byte-identical); the closed override mirrors it.
+    if BREAKOUT_MODE_ENABLED:
+        result["breakout_mode"] = compute_breakout_mode(
+            active_ticker, current_price, vwap_value, vwap_status, volatility,
+            result.get("nearest_supply"), result.get("nearest_demand"),
+        )
+
     # ── Display-only feeds (READ-ONLY; never touch the gate / money path) ─────
     result["equity_curve_today"] = get_today_equity_curve(active_ticker)
     result["news_filter"]        = get_news_filter()
@@ -15881,6 +16225,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["decision_support"]   = _decision_support(result)
         # Strategy engine paused while the market is closed (no live tape).
         result["strategy_engine"]    = _closed_strategy_engine()
+        # 9:30 Breakout Mode paused while the market is closed (key parity w/ open path).
+        if BREAKOUT_MODE_ENABLED:
+            result["breakout_mode"]  = _breakout_neutral_block(
+                "Market closed — breakout mode paused.", inst=active_ticker)
         # Display-only feeds stay present for parity with the open path.
         result["equity_curve_today"] = get_today_equity_curve(active_ticker)
         result["news_filter"]        = get_news_filter()
@@ -27087,6 +27435,9 @@ def webhook():
         # Feed the intraday tracker (opening range + per-session OHLC) for the
         # multi-strategy engine. FAIL-OPEN — never disrupts the webhook path.
         _update_intraday_tracker(resolved_inst, parsed_price)
+        # Feed the DEDICATED 09:30 ET breakout opening-range tracker (flag-gated; a
+        # no-op when BREAKOUT_MODE_ENABLED is OFF). FAIL-OPEN.
+        _update_breakout_or_tracker(resolved_inst, parsed_price)
 
     # ── VWAP ingestion (required input for the strict price-vs-VWAP filter) ──
     raw_vwap = data.get("vwap")
@@ -28135,6 +28486,7 @@ def status():
         "swing_diagnostics":   _swing_diag_block(a),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
+        "breakout_mode":       a.get("breakout_mode"),
         "equity_curve_today":  a.get("equity_curve_today"),
         "news_filter":         a.get("news_filter"),
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
@@ -33028,6 +33380,39 @@ def dashboard():
   <div class="se-fid" id="se-fid"></div>
 </div>
 
+<!-- 9:30 ET Breakout Mode (display-only advisory; flag-gated). Fed by d.breakout_mode;
+     the renderer hides this whole panel when the block is absent (flag OFF). -->
+<div class="mod" id="mod-breakout" style="display:none">
+  <div class="mod-h">🚀 9:30 Breakout Mode <span id="bo-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="se-top">
+    <div class="gstat"><div class="l">Entry Status</div><div class="v" id="bo-status">—</div></div>
+    <div class="gstat"><div class="l">Break</div><div class="v" id="bo-dir">—</div></div>
+    <div class="gstat"><div class="l">Quality</div><div class="v" id="bo-quality">—</div></div>
+    <div class="gstat"><div class="l">Setup</div><div class="v" id="bo-kind">—</div></div>
+  </div>
+  <div class="se-top">
+    <div class="gstat"><div class="l">OR High</div><div class="v" id="bo-orhigh">—</div></div>
+    <div class="gstat"><div class="l">OR Low</div><div class="v" id="bo-orlow">—</div></div>
+    <div class="gstat"><div class="l">Long Target</div><div class="v" id="bo-longrr">—</div></div>
+    <div class="gstat"><div class="l">Short Target</div><div class="v" id="bo-shortrr">—</div></div>
+  </div>
+  <div class="se-reason" id="bo-reason"></div>
+  <div class="se-missing" id="bo-confirms"></div>
+  <div class="se-bias-h">Suggested Plan</div>
+  <div class="se-bias">
+    <div class="gstat"><div class="l">Entry</div><div class="v" id="bo-entry">—</div></div>
+    <div class="gstat"><div class="l">Stop</div><div class="v" id="bo-stop">—</div></div>
+    <div class="gstat"><div class="l">TP1</div><div class="v" id="bo-tp1">—</div></div>
+    <div class="gstat"><div class="l">TP2</div><div class="v" id="bo-tp2">—</div></div>
+    <div class="gstat"><div class="l">Runner</div><div class="v" id="bo-runner">—</div></div>
+  </div>
+  <div class="se-bias-h">Failure Risk <span id="bo-faillevel" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div class="se-missing" id="bo-failreasons"></div>
+  <div class="se-bias-h">Trade Management</div>
+  <div class="se-list" id="bo-mgmt"></div>
+  <div class="se-fid" id="bo-fid"></div>
+</div>
+
 <!-- Adaptive Learning Engine — per-strategy analytics from closed trades (Postgres) -->
 <div class="mod mb-hidden" id="mod-learning">
   <div class="mod-h">🧠 Adaptive Learning <span id="le-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Trained on simulated proxy-feed outcomes — not your real broker fills. See Real Account Results above." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
@@ -34521,6 +34906,9 @@ function renderModules(d){
 
   // ── Module 7: Multi-strategy engine (DISPLAY-ONLY in Phase 1) ──
   renderStrategyEngine(d);
+
+  // ── Module 7b: 9:30 ET Breakout Mode (DISPLAY-ONLY advisory) ──
+  renderBreakoutMode(d);
 
   // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
   renderLearningEngine(d);
@@ -37132,6 +37520,95 @@ function renderStrategyEngine(d){
       ? 'Market closed — engine paused.'
       : 'Display-only. Candle confirmations approximated from alerts + price ticks; gate stays authoritative.';
   }
+}
+
+// 9:30 ET Breakout Mode panel — fed by d.breakout_mode (compute_breakout_mode).
+// DISPLAY-ONLY; the whole panel is hidden when the block is absent (flag OFF).
+function renderBreakoutMode(d){
+  const mod = document.getElementById('mod-breakout');
+  if (!mod) return;
+  const bo = (d && d.breakout_mode) || null;
+  if (!bo){ mod.style.display='none'; return; }
+  mod.style.display='';
+
+  const modeEl = document.getElementById('bo-mode');
+  if (modeEl) modeEl.textContent = bo.active ? '· ACTIVE' : '· INACTIVE';
+
+  // Entry status
+  const stEl=document.getElementById('bo-status');
+  if (stEl){
+    const st = bo.entry_status || 'WAIT';
+    stEl.textContent = st;
+    stEl.style.color = st.indexOf('READY')===0 ? (st.indexOf('LONG')>=0 ? '#22c55e' : '#ef4444') : '#eab308';
+  }
+  // Break direction
+  const dirEl=document.getElementById('bo-dir');
+  if (dirEl){
+    const dr = bo.break_direction || 'None';
+    dirEl.textContent = dr;
+    dirEl.style.color = dr==='Long' ? '#22c55e' : dr==='Short' ? '#ef4444' : '#6b7280';
+  }
+  // Quality
+  const qEl=document.getElementById('bo-quality');
+  if (qEl){
+    const q = Number(bo.quality_score||0);
+    qEl.textContent = q ? (q+'/100') : '—';
+    qEl.style.color = q>=70 ? '#22c55e' : q>=50 ? '#eab308' : '#6b7280';
+  }
+  _modTxt('bo-kind', (bo.setup_kind && bo.setup_kind!=='None') ? bo.setup_kind : '—');
+  _modTxt('bo-orhigh', bo.or_high!=null ? Number(bo.or_high).toFixed(2) : '—');
+  _modTxt('bo-orlow',  bo.or_low!=null  ? Number(bo.or_low).toFixed(2)  : '—');
+  function rrTxt(v){ return v!=null ? ('1:'+v) : '—'; }
+  _modTxt('bo-longrr',  rrTxt(bo.long_target_potential));
+  _modTxt('bo-shortrr', rrTxt(bo.short_target_potential));
+
+  // Reason
+  const reEl=document.getElementById('bo-reason'); if (reEl) reEl.textContent = bo.reason || '';
+
+  // Confirmation chips
+  const cEl=document.getElementById('bo-confirms');
+  if (cEl){
+    const cs = bo.confirmations || [];
+    cEl.innerHTML = cs.map(function(c){
+      const ok = !!c.met;
+      const col = ok ? 'background:#0f2417;border-color:#1b3a26;color:#7fe9a3' : '';
+      return '<span class="se-chip" style="'+col+'">'+(ok?'\u2713 ':'\u2717 ')+_modEsc(c.label)+'</span>';
+    }).join('');
+  }
+
+  // Suggested plan
+  const pl = bo.plan || null;
+  _modTxt('bo-entry',  pl && pl.entry!=null  ? Number(pl.entry).toFixed(2)  : '—');
+  _modTxt('bo-stop',   pl && pl.stop!=null   ? Number(pl.stop).toFixed(2)   : '—');
+  _modTxt('bo-tp1',    pl && pl.tp1!=null    ? Number(pl.tp1).toFixed(2)    : '—');
+  _modTxt('bo-tp2',    pl && pl.tp2!=null    ? Number(pl.tp2).toFixed(2)    : '—');
+  _modTxt('bo-runner', pl && pl.runner!=null ? Number(pl.runner).toFixed(2) : '—');
+
+  // Failure level + reasons
+  const flEl=document.getElementById('bo-faillevel');
+  if (flEl){
+    const fl = bo.failure_level || 'None';
+    flEl.textContent = '· '+fl;
+    flEl.style.color = fl==='High' ? '#ef4444' : fl==='Elevated' ? '#f59e0b' : fl==='Low' ? '#eab308' : '#6b7280';
+  }
+  const frEl=document.getElementById('bo-failreasons');
+  if (frEl){
+    const fr = bo.failure_reasons || [];
+    frEl.innerHTML = fr.length
+      ? fr.map(function(x){ return '<span class="se-chip" style="border-color:#5b2330;color:#f4a3b0">'+_modEsc(x)+'</span>'; }).join('')
+      : '<span class="se-chip" style="background:#0f2417;border-color:#1b3a26;color:#7fe9a3">\u2713 No failure flags</span>';
+  }
+
+  // Management
+  const mEl=document.getElementById('bo-mgmt');
+  if (mEl){
+    const mg = bo.management || [];
+    mEl.innerHTML = mg.map(function(x){ return '<div class="se-row"><div class="nm">'+_modEsc(x)+'</div></div>'; }).join('');
+  }
+
+  // Fidelity caveat
+  const fdEl=document.getElementById('bo-fid');
+  if (fdEl) fdEl.textContent = bo.note || 'Display-only. Opening range from price ticks; gate stays authoritative.';
 }
 
 async function refreshRec() {

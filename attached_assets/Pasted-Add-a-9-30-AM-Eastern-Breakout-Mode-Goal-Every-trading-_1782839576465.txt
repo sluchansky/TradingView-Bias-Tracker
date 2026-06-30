@@ -1,0 +1,80 @@
+Add a 9:30 AM Eastern Breakout Mode.
+
+Goal:
+Every trading day at 9:30 AM ET, the bot should prepare for a clean upside or downside breakout and target large asymmetric reward when the setup is strong.
+
+Core idea:
+At the 9:30 AM ET market open, the bot should not instantly enter. It should observe the opening range, identify whether price is breaking upside or downside, then only trade if the breakout has confirmation.
+
+Breakout Mode Rules:
+
+1. Time Trigger
+- Activate at 9:30 AM ET.
+- Focus on the first 5–15 minutes after open.
+- Build an opening range from the first 1m, 3m, 5m, and 15m candles.
+- Track opening high, opening low, VWAP, volume, candle strength, wick rejection, and liquidity sweeps.
+
+2. Direction Detection
+The bot should look for:
+- Break above opening range high = possible long.
+- Break below opening range low = possible short.
+- Liquidity sweep above/below followed by reversal = possible trap/reversal trade.
+- No clean break = WAIT.
+
+3. Entry Confirmation
+Only take trade if:
+- Breakout candle closes beyond range.
+- Volume/RVOL supports the move.
+- Price is on correct side of VWAP.
+- Structure confirms direction with BOS/CHOCH.
+- No immediate supply/demand wall directly in front of entry.
+- Candle does not enter after an extended push.
+- Entry is not at the very top/bottom of the move.
+
+4. Risk/Reward Logic
+This mode should search for trades with potential up to 1:5 reward/risk.
+
+Acceptable target plans:
+- 1:2 minimum for normal setups.
+- 1:3 preferred.
+- 1:4 strong setup.
+- 1:5 only for clean trend expansion days.
+
+The bot does not need to force 1:5. It should dynamically decide if the market realistically supports 1:2, 1:3, 1:4, or 1:5.
+
+5. Trade Management
+- TP1 at 1R or 2R depending on volatility.
+- Move stop to breakeven only after structure confirms continuation, not immediately.
+- Trail runners behind higher lows for longs or lower highs for shorts.
+- Exit early if breakout fails back inside opening range.
+- Exit early if VWAP is reclaimed against the trade.
+- Exit early if volume dies and candles stall.
+- Let runners work when momentum is clean.
+
+6. Failure Rules
+Reject trade if:
+- Breakout candle has huge wick rejection.
+- Break happens directly into major supply/demand.
+- Price is already overextended.
+- Volume does not confirm.
+- Breakout immediately closes back inside range.
+- Spread/slippage is too high.
+- Daily loss cap or prop rules are close to being hit.
+
+7. Dashboard Output
+Show:
+- 9:30 Breakout Mode: ACTIVE / INACTIVE
+- Opening Range High
+- Opening Range Low
+- Current Break Direction
+- Breakout Quality Score
+- Long Target Potential: 1:2 / 1:3 / 1:4 / 1:5
+- Short Target Potential: 1:2 / 1:3 / 1:4 / 1:5
+- Entry Status: WAIT / READY LONG / READY SHORT
+- Reason for entry or rejection
+- Suggested entry, stop, TP1, TP2, runner target
+- Failure level
+- Trade management instructions
+
+Important:
+This should be a professional breakout model, not a blind 9:30 entry. The bot should wait for confirmation, avoid chasing, and only take trades where the reward potential is clearly larger than the risk.
