@@ -13685,6 +13685,192 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
     }
 
 
+def _main_brain_judge_neutral(reason, threshold=None):
+    """Stable neutral schema for the Main Brain Judge (DISPLAY-ONLY)."""
+    thr = threshold if threshold is not None else EDGE_READY_THRESHOLD
+    return {
+        "available":             False,
+        "final_label":           "WAIT",
+        "final_reason":          reason,
+        "direction":             None,
+        "hierarchy":             [],
+        "score":                 {"current": 0, "threshold": thr, "max": EDGE_SCORE_MAX,
+                                  "points_needed": thr, "components": []},
+        "missing_confirmations": [],
+        "source_verdict":        None,
+        "source_status":         None,
+    }
+
+
+def compute_main_brain_judge(result):
+    """The 'Judge' — ONE consolidated, DISPLAY-ONLY verdict view.
+
+    Resolves the already-assembled blocks on `result` into a single explained
+    decision: (1) one final label (READY LONG / READY SHORT / WAIT / SKIP /
+    MANAGE OPEN TRADE), (2) the evidence hierarchy with each layer's current
+    reading, (3) the weighted Edge Score breakdown, and (4) which confirmations are
+    still missing and how many points each adds. It ONLY READS `result` (plus the
+    read-only cross-market snapshot); it NEVER recomputes a decision and NEVER
+    touches the gate, scoring, sizing, dedupe or the money path. The final label
+    MIRRORS the bot's authoritative `verdict` + direction + live position, so it can
+    never diverge from what the bot actually does. FAIL-OPEN to a neutral schema."""
+    try:
+        thr = int(cfg("EDGE_READY_THRESHOLD"))
+    except Exception:
+        thr = EDGE_READY_THRESHOLD
+    try:
+        market_open = (result.get("market_open") is not False)
+        verdict     = result.get("verdict") or ""
+        actionable  = is_actionable(verdict)
+        tp          = result.get("trade_plan") or {}
+        direction   = (result.get("strict_direction") or tp.get("direction")
+                       or result.get("dominant_direction"))
+        bias        = result.get("bias")
+        gd          = result.get("gate_debug") or {}
+        mb          = result.get("main_brain") or {}
+
+        # Live / manual position for this instrument → MANAGE (same precedence the
+        # Main Brain uses: a user-entered manual trade wins over the bot's own).
+        # Resolved BEFORE the closed-market check so an OPEN position is still shown as
+        # MANAGE OPEN TRADE while the market is paused — never hidden behind SKIP.
+        inst       = instrument_of(result.get("active_ticker"))
+        manual_pos = _newest_manual_trade_for(inst) if inst else None
+        pos        = manual_pos or (active_trade_for(inst) if inst else None)
+
+        # ── Weighted Edge Score breakdown (THE canonical display computation) ──
+        # _analysis_edge_breakdown is the SAME read-only helper that produced
+        # result["edge_score"], so the Judge's number always matches the rest of the
+        # dashboard. We surface the real scoring components (EDGE_COMPONENTS); zone /
+        # FVG / OB / index / room / RR / news / prop deliberately do NOT score, so they
+        # are presented as filters in the hierarchy, never as fabricated points. While
+        # the market is CLOSED the live tape is paused (result["edge_score"] is 0), so
+        # we mirror that exactly: score 0 with every confluence absent.
+        if not market_open:
+            cur        = 0
+            components = [{"key": k, "label": l, "points": p, "present": False}
+                         for k, l, p in EDGE_COMPONENTS]
+            missing    = [{"label": l, "points": p} for k, l, p in EDGE_COMPONENTS]
+        else:
+            try:
+                eb = _analysis_edge_breakdown(result)
+            except Exception:
+                eb = {}
+            cur = int(eb.get("score") or 0)
+            earned_labels = {it.get("label") for it in (eb.get("score_breakdown") or []) if it.get("label")}
+            components, missing = [], []
+            for key, label, pts in EDGE_COMPONENTS:
+                present = label in earned_labels
+                components.append({"key": key, "label": label, "points": pts, "present": present})
+                if not present:
+                    missing.append({"label": label, "points": pts})
+        score_blk = {"current": cur, "threshold": thr, "max": EDGE_SCORE_MAX,
+                     "points_needed": max(0, thr - cur), "components": components}
+
+        # ── Decision hierarchy: each evidence layer's current reading ──
+        hierarchy = []
+        if bias == "Bullish":
+            hierarchy.append({"layer": "Market structure", "reading": "Bullish", "state": "bullish"})
+        elif bias == "Bearish":
+            hierarchy.append({"layer": "Market structure", "reading": "Bearish", "state": "bearish"})
+        else:
+            hierarchy.append({"layer": "Market structure", "reading": "Neutral / unclear", "state": "neutral"})
+
+        cvd_state = result.get("cvd_state")
+        cvd_dir   = result.get("cvd_direction")
+        if cvd_state == "bullish":
+            hierarchy.append({"layer": "Short-term order flow",
+                              "reading": "Bullish" + ((" (%s)" % cvd_dir) if cvd_dir else ""),
+                              "state": "bullish"})
+        elif cvd_state == "bearish":
+            hierarchy.append({"layer": "Short-term order flow",
+                              "reading": "Bearish" + ((" (%s)" % cvd_dir) if cvd_dir else ""),
+                              "state": "bearish"})
+        else:
+            hierarchy.append({"layer": "Short-term order flow", "reading": "No clear delta", "state": "neutral"})
+
+        adv   = result.get("scalp_strategy_advisory") or {}
+        votes = adv.get("votes") or adv.get("strategies") or []
+        if votes:
+            longs  = sum(1 for v in votes if str(v.get("direction") or v.get("signal") or "").lower().startswith("long"))
+            shorts = sum(1 for v in votes if str(v.get("direction") or v.get("signal") or "").lower().startswith("short"))
+            st = "bullish" if longs > shorts else "bearish" if shorts > longs else "neutral"
+            hierarchy.append({"layer": "Strategy signals",
+                              "reading": "%d long / %d short" % (longs, shorts), "state": st})
+        else:
+            hierarchy.append({"layer": "Strategy signals", "reading": "n/a", "state": "na"})
+
+        risk_bits = []
+        if gd.get("volatility_block") is None:
+            risk_bits.append("Volatility: unknown"); risk_state = "na"
+        elif gd.get("volatility_block"):
+            risk_bits.append("Volatility: blocked"); risk_state = "fail"
+        else:
+            risk_bits.append("Volatility: OK"); risk_state = "pass"
+        eq       = result.get("entry_quality") or {}
+        eq_grade = eq.get("grade") or eq.get("label")
+        if eq_grade:
+            risk_bits.append("Location: %s" % eq_grade)
+            _eqs = eq.get("score")
+            if risk_state == "pass" and isinstance(_eqs, (int, float)) and _eqs < 70:
+                risk_state = "warn"
+        hierarchy.append({"layer": "Risk filters", "reading": " \u00b7 ".join(risk_bits), "state": risk_state})
+
+        try:
+            xm = _cross_market_snapshot() or {}
+        except Exception:
+            xm = {}
+        xstate, xdir = xm.get("state"), xm.get("direction")
+        if xstate == "Aligned" and xdir in ("Long", "Short"):
+            hierarchy.append({"layer": "Cross-market alignment", "reading": "Aligned %s" % xdir,
+                              "state": "bullish" if xdir == "Long" else "bearish"})
+        elif xstate:
+            hierarchy.append({"layer": "Cross-market alignment", "reading": str(xstate), "state": "neutral"})
+        else:
+            hierarchy.append({"layer": "Cross-market alignment", "reading": "n/a", "state": "na"})
+
+        # ── Final label: MIRROR the authoritative verdict + live position ──
+        # Precedence: an open position (MANAGE) outranks everything; then a closed
+        # market (SKIP); then the live READY / SKIP / WAIT verdict.
+        if pos:
+            label  = "MANAGE OPEN TRADE"
+            fdir   = (pos.get("direction") or pos.get("side") if isinstance(pos, dict) else None) or direction
+            reason = "A position is open — managing it, not seeking new entries."
+        elif not market_open:
+            label  = "SKIP"
+            fdir   = direction
+            reason = "Market closed — no live setups until it reopens."
+        elif actionable and direction in ("Long", "Short"):
+            label  = "READY LONG" if direction == "Long" else "READY SHORT"
+            fdir   = direction
+            reason = "Setup is READY: %s confluence at Edge %d/%d." % (direction.lower(), cur, EDGE_SCORE_MAX)
+        elif bool(gd.get("volatility_block")):
+            label  = "SKIP"
+            fdir   = direction
+            reason = "Volatility regime blocks new trades right now."
+        else:
+            label = "WAIT"
+            fdir  = direction
+            need  = max(0, thr - cur)
+            if need > 0 and missing:
+                reason = "Building — need +%d Edge (e.g. %s) to reach READY (%d)." % (need, missing[0]["label"], thr)
+            else:
+                reason = "Waiting for a clean, aligned setup."
+
+        return {
+            "available":             True,
+            "final_label":           label,
+            "final_reason":          reason,
+            "direction":             fdir,
+            "hierarchy":             hierarchy,
+            "score":                 score_blk,
+            "missing_confirmations": missing,
+            "source_verdict":        verdict,
+            "source_status":         mb.get("status"),
+        }
+    except Exception as exc:
+        return _main_brain_judge_neutral("Judge unavailable (%s)." % exc, threshold=thr)
+
+
 def compute_main_brain(result):
     """Plain-English 'Main Brain' synthesis (DISPLAY-ONLY).
 
@@ -15809,6 +15995,17 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["main_brain"] = compute_main_brain(result)
     except Exception as _mb_exc:
         result["main_brain"] = _main_brain_neutral("Main Brain unavailable (%s)." % _mb_exc)
+
+    # ── Main Brain Judge (DISPLAY-ONLY) ──────────────────────────────────────
+    # Consolidates the assembled blocks into ONE explained verdict (final label +
+    # decision hierarchy + weighted Edge breakdown + missing confirmations). Runs
+    # right after compute_main_brain so it sees the final verdict in every state
+    # (open / vetoed / closed — this seam is reached in all three, same as the
+    # cognitive family below). Pure read-only + FAIL-OPEN; never touches the gate.
+    try:
+        result["main_brain_judge"] = compute_main_brain_judge(result)
+    except Exception as _mbj_exc:
+        result["main_brain_judge"] = _main_brain_judge_neutral("Judge unavailable (%s)." % _mbj_exc)
 
     # ── Main Brain Cognitive Upgrade (DISPLAY-ONLY) ──────────────────────────
     # Continuous-analyst layer, attached AFTER compute_main_brain so it sees the
@@ -27409,6 +27606,8 @@ def status():
         "dualTfReason":        _dtf["dualTfReason"],
         # ── Cross-market index alignment (Nasdaq/S&P/Dow) — DISPLAY-ONLY ──
         "index_alignment":     _cross_market_snapshot(),
+        # ── Main Brain Judge (consolidated verdict view) — DISPLAY-ONLY ──
+        "main_brain_judge":    a.get("main_brain_judge"),
         # ── Scalp-Strategy Advisory ("potential trades") — DISPLAY/ADVISORY-ONLY ──
         # Added ONLY when the flag is on, so the OFF payload is byte-identical to today.
         **({"scalp_strategy_advisory": a.get("scalp_strategy_advisory")}
@@ -31198,6 +31397,29 @@ def dashboard():
   html[data-theme="retro"] #status-card,
   html[data-theme="retro"] #rec-card,
   html[data-theme="retro"] .mod{background:var(--panel)}
+  .mb-judge{margin:14px 0 4px;padding:14px 14px 10px;border:1px solid rgba(125,140,255,.22);border-radius:14px;background:rgba(125,140,255,.06)}
+  .mb-judge-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .mb-judge-label{font-weight:800;font-size:13px;letter-spacing:.04em;padding:5px 14px;border-radius:999px;color:#fff}
+  .mb-judge-reason{font-size:12px;color:var(--muted,#9aa3c0);flex:1 1 200px;min-width:0}
+  .mb-judge-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  .mb-judge-col{min-width:0}
+  .mb-judge-h{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted,#9aa3c0);margin-bottom:7px;font-weight:700}
+  .mb-judge-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+  .mbj-row{display:flex;align-items:baseline;gap:7px;font-size:12px;line-height:1.35}
+  .mbj-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;align-self:center}
+  .mbj-lay{color:var(--muted,#9aa3c0)}
+  .mbj-rd{font-weight:600}
+  .mbj-score-top{font-size:12px;font-weight:700;margin-bottom:7px}
+  .mbj-bar{position:relative;height:8px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin-bottom:10px}
+  .mbj-bar-fill{height:100%;border-radius:999px}
+  .mbj-bar-tick{position:absolute;top:-3px;width:2px;height:14px;background:rgba(255,255,255,.75)}
+  .mbj-comp{display:flex;gap:6px;font-size:12px;color:var(--muted,#9aa3c0);opacity:.55}
+  .mbj-comp.on{opacity:1;color:#e8e8f0}
+  .mbj-comp-bx{font-family:ui-monospace,Menlo,monospace}
+  .mbj-miss{font-size:12px;color:#f0b36b}
+  @media(max-width:760px){.mb-judge-grid{grid-template-columns:1fr}}
+  html[data-theme="retro"] .mb-judge{border-color:var(--border-lit);background:rgba(20,90,55,.10)}
+  html[data-theme="retro"] .mbj-bar{background:rgba(255,255,255,.10)}
   html[data-theme="retro"] #mod-brain{background:var(--panel);border-color:var(--border-lit);box-shadow:0 0 22px rgba(20,90,55,.22)}
   html[data-theme="retro"] #mod-brain::before{display:none}
   html[data-theme="retro"] #mod-brain::after{background:linear-gradient(90deg,transparent,var(--green),transparent)}
@@ -31455,6 +31677,17 @@ def dashboard():
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">LIVE READ · DISPLAY-ONLY</span>
     </div>
     <div id="mb-summary" class="mb-summary">Loading…</div>
+    <div class="mb-judge" id="mb-judge" style="display:none">
+      <div class="mb-judge-head">
+        <span class="mb-judge-label" id="mbj-label">—</span>
+        <span class="mb-judge-reason" id="mbj-reason"></span>
+      </div>
+      <div class="mb-judge-grid">
+        <div class="mb-judge-col"><div class="mb-judge-h">Decision hierarchy</div><ul class="mb-judge-list" id="mbj-hierarchy"></ul></div>
+        <div class="mb-judge-col"><div class="mb-judge-h">Score breakdown</div><div class="mbj-score" id="mbj-score"></div><ul class="mb-judge-list" id="mbj-components"></ul></div>
+        <div class="mb-judge-col"><div class="mb-judge-h">Missing for READY</div><ul class="mb-judge-list" id="mbj-missing"></ul></div>
+      </div>
+    </div>
     <div class="mb-stats" id="mb-stats">
       <div class="mb-stat"><div class="mb-stat-l">Confidence</div><div class="mb-stat-v" id="mb-conf">—</div></div>
       <div class="mb-stat"><div class="mb-stat-l">Lean</div><div class="mb-stat-v" id="mb-lean-txt" style="font-size:12px">—</div><div class="mb-lean"><div class="mb-lean-long" id="mb-lean-long" style="width:50%"></div><div class="mb-lean-short" id="mb-lean-short" style="width:50%"></div></div></div>
@@ -33705,6 +33938,59 @@ function _anVerdictColor(v){
 // conversation is in-memory per-device, per-symbol, deduped and capped.
 const MB_BADGE_COLORS = { WATCHING:'#6b7280', BUILDING:'#3b82f6', READY:'#22c55e', WAIT:'#f59e0b', MANAGING:'#a855f7', INVALIDATED:'#ef4444' };
 const MB_RISK_COLORS = { Low:'#22c55e', Medium:'#f59e0b', High:'#ef4444' };
+const MBJ_LABEL_COLORS = { 'READY LONG':'#16a34a', 'READY SHORT':'#dc2626', 'WAIT':'#6b7280', 'SKIP':'#475569', 'MANAGE OPEN TRADE':'#2563eb' };
+const MBJ_STATE_COLORS = { bullish:'#22c55e', bearish:'#ef4444', neutral:'#9aa3c0', pass:'#22c55e', warn:'#f0b36b', fail:'#ef4444', na:'#6b7280' };
+function renderMBJudge(d){
+  var el = document.getElementById('mb-judge'); if(!el) return;
+  var j = (d && d.main_brain_judge) || null;
+  if(!j || !j.available){ el.style.display='none'; return; }
+  el.style.display='';
+  var lab = document.getElementById('mbj-label');
+  if(lab){ lab.textContent = j.final_label || '—'; lab.style.background = MBJ_LABEL_COLORS[j.final_label] || '#6b7280'; }
+  var rs = document.getElementById('mbj-reason');
+  if(rs) rs.textContent = j.final_reason || '';
+  var hl = document.getElementById('mbj-hierarchy');
+  if(hl){ hl.innerHTML='';
+    (j.hierarchy||[]).forEach(function(h){
+      var li=document.createElement('li'); li.className='mbj-row';
+      var dot=document.createElement('span'); dot.className='mbj-dot'; dot.style.background=MBJ_STATE_COLORS[h.state]||'#6b7280';
+      var lay=document.createElement('span'); lay.className='mbj-lay'; lay.textContent=(h.layer||'')+':';
+      var rd=document.createElement('span'); rd.className='mbj-rd'; rd.textContent=h.reading||'';
+      li.appendChild(dot); li.appendChild(lay); li.appendChild(rd); hl.appendChild(li);
+    });
+  }
+  var sc = j.score || {};
+  var scEl = document.getElementById('mbj-score');
+  if(scEl){ scEl.innerHTML='';
+    var cur=(sc.current!=null?sc.current:0), thr=(sc.threshold!=null?sc.threshold:0), mx=(sc.max!=null?sc.max:110), need=(sc.points_needed!=null?sc.points_needed:0);
+    var top=document.createElement('div'); top.className='mbj-score-top';
+    top.textContent = cur+' / '+mx+'  (need '+thr+(need>0?(' \u00b7 +'+need+' to READY'):' \u00b7 met')+')';
+    scEl.appendChild(top);
+    var bar=document.createElement('div'); bar.className='mbj-bar';
+    var fill=document.createElement('div'); fill.className='mbj-bar-fill';
+    var pct = mx? Math.max(0, Math.min(100, Math.round(cur*100/mx))) : 0;
+    fill.style.width = pct+'%'; fill.style.background = (need<=0)?'#22c55e':'#7d8cff';
+    bar.appendChild(fill);
+    var tick=document.createElement('div'); tick.className='mbj-bar-tick';
+    tick.style.left = (mx? Math.max(0, Math.min(100, Math.round(thr*100/mx))) : 0)+'%';
+    bar.appendChild(tick); scEl.appendChild(bar);
+  }
+  var cmp = document.getElementById('mbj-components');
+  if(cmp){ cmp.innerHTML='';
+    (sc.components||[]).forEach(function(c){
+      var li=document.createElement('li'); li.className='mbj-comp'+(c.present?' on':'');
+      var bx=document.createElement('span'); bx.className='mbj-comp-bx'; bx.textContent=c.present?'\u2611':'\u2610';
+      var tx=document.createElement('span'); tx.textContent='+'+c.points+' '+c.label;
+      li.appendChild(bx); li.appendChild(tx); cmp.appendChild(li);
+    });
+  }
+  var ms = document.getElementById('mbj-missing');
+  if(ms){ ms.innerHTML='';
+    var miss=j.missing_confirmations||[];
+    if(!miss.length){ var li0=document.createElement('li'); li0.className='mbj-miss'; li0.style.color='#22c55e'; li0.textContent='All confluences present \u2713'; ms.appendChild(li0); }
+    else miss.forEach(function(m){ var li=document.createElement('li'); li.className='mbj-miss'; li.textContent='+'+m.points+' '+m.label; ms.appendChild(li); });
+  }
+}
 const MB_FEED_MAX = 40;
 let mbFeeds = {};     // { SYM: [ {t, status, text} ] }
 let mbLastSignals = {};   // { SYM: <last signals snapshot> } — diffed for the What-Changed feed
@@ -33792,6 +34078,7 @@ function renderMainBrain(d){
   const summary = (mb && mb.summary) || 'Waiting for live data…';
   const sumEl = document.getElementById('mb-summary');
   if(sumEl) sumEl.textContent = summary;
+  renderMBJudge(d);
   _anFill('mb-market',   (mb && mb.market_brain)   || []);
   _anFill('mb-strategy', (mb && mb.strategy_brain) || []);
   _anFill('mb-risk',     (mb && mb.risk_brain)     || []);
