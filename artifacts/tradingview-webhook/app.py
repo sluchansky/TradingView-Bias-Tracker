@@ -32905,6 +32905,7 @@ def dashboard():
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
   <span id="advisor-toggle" role="button" tabindex="0" onclick="toggleAdvisor()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvisor();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🧠 Advisor: off</span>
   <span id="layout-reset" role="button" tabindex="0" onclick="resetDashLayout()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();resetDashLayout();}" title="Restore the default panel order and un-minimize everything" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">↕️ Reset layout</span>
+  <a id="bot-switch" href="/api2/dashboard" title="Open the analysis-only bot's dashboard. It mirrors this engine but cannot place trades or post to Discord — the live bot keeps running untouched." style="text-decoration:none;cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔬 Analysis Bot &rarr;</a>
 </div>
 
 <!-- Live | Backtest top-level view toggle -->

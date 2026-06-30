@@ -12071,6 +12071,8 @@ def dashboard():
 <div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 READY alerts: on</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
+  <a id="bot-switch" href="/api/dashboard" title="Return to the LIVE trading bot dashboard." style="text-decoration:none;cursor:pointer;user-select:none;color:#ffb454;border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">&larr; Live Bot</a>
+  <span id="ab-badge" title="This is the analysis-only twin. It mirrors the engine but cannot place trades or post to Discord." style="user-select:none;color:#6fae7a;border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔬 Analysis-only</span>
 </div>
 
 <!-- Live | Backtest top-level view toggle -->
