@@ -1,7 +1,7 @@
 import express, { type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
-import router from "./routes";
+import router, { api2Router } from "./routes";
 import { logger } from "./lib/logger";
 
 const app: Express = express();
@@ -42,11 +42,12 @@ app.use(cors());
 // consumed, so the tight global parser below is a no-op on the upload paths (no
 // double read). Webhook payloads remain tiny.
 app.use(
-  ["/api/backtest/upload", "/api/tradezella/upload"],
+  ["/api/backtest/upload", "/api/tradezella/upload", "/api2/backtest/upload"],
   express.raw({ type: () => true, limit: "32mb" }),
 );
 app.use(express.raw({ type: () => true, limit: "1mb" }));
 
 app.use("/api", router);
+app.use("/api2", api2Router);
 
 export default app;

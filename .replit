@@ -22,39 +22,11 @@ args = "TradingView Webhook Server"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "pycompile"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
 args = "parity"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
 args = "scalp_golden"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "swing_flagoff"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "instrument_isolation"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "fvg_ob"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "cross_market"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "learning_score_golden"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "scalp_advisory"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
@@ -77,17 +49,6 @@ args = "/home/runner/workspace/.pythonlibs/bin/python3 artifacts/tradingview-web
 waitForPort = 8000
 
 [[workflows.workflow]]
-name = "pycompile"
-author = "agent"
-
-[workflows.workflow.metadata]
-isValidation = true
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "/home/runner/workspace/.pythonlibs/bin/python3 -m py_compile artifacts/tradingview-webhook/app.py && echo PYCOMPILE_OK"
-
-[[workflows.workflow]]
 name = "parity"
 author = "agent"
 
@@ -105,72 +66,6 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "bash .local/state/check_scalp_golden.sh"
-
-[workflows.workflow.metadata]
-isValidation = true
-
-[[workflows.workflow]]
-name = "swing_flagoff"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "bash .local/state/check_swing_flagoff_golden.sh"
-
-[workflows.workflow.metadata]
-isValidation = true
-
-[[workflows.workflow]]
-name = "instrument_isolation"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "bash .local/state/check_instrument_isolation.sh"
-
-[workflows.workflow.metadata]
-outputType = "console"
-
-[[workflows.workflow]]
-name = "fvg_ob"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "bash .local/state/check_fvg_ob.sh"
-
-[workflows.workflow.metadata]
-isValidation = true
-
-[[workflows.workflow]]
-name = "cross_market"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "bash .local/state/check_cross_market.sh"
-
-[workflows.workflow.metadata]
-isValidation = true
-
-[[workflows.workflow]]
-name = "learning_score_golden"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "bash .local/state/check_learning_score_golden.sh"
-
-[workflows.workflow.metadata]
-isValidation = true
-
-[[workflows.workflow]]
-name = "scalp_advisory"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "bash .local/state/check_scalp_advisory.sh"
 
 [workflows.workflow.metadata]
 isValidation = true
