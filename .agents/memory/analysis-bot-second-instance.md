@@ -41,10 +41,11 @@ stays at `/api`.
   `/api2 -> localhost:8001` behaves exactly like `/api -> localhost:8000`. The
   analysis bot runs in its OWN respawn loop EXCLUDED from `wait -n`, so a bot2 crash
   can never bounce the live bot.
-- **DEV cannot host bot2 as a workflow** when the session's workflow counter is
-  frozen at the limit: `configureWorkflow` ADD *and* UPDATE both fail "Workflow limit
-  exceeded (N/10)" regardless of the real count (`listWorkflows` showed 9), and
-  `.replit` can't be hand-edited. Don't keep retrying — it's a session-level block.
+- **DEV may be unable to host bot2 as a new workflow:** if the session's workflow
+  counter is frozen, `configureWorkflow` ADD *and* UPDATE can both fail "Workflow
+  limit exceeded" even when the real count is under the cap, and `.replit` can't be
+  hand-edited. Don't keep retrying — it's a session-level block, not a real limit;
+  add the workflow via the UI instead.
 - **A bash-spawned process is in a DIFFERENT network namespace than the Express
   workflow**, so Express returns 502 to `localhost:8001` even though
   `curl localhost:8001` from the same bash call returns 200. This is NOT a proxy-code
