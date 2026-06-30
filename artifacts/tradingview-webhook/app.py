@@ -27295,6 +27295,70 @@ def tradezella_reset():
     return jsonify(result)
 
 
+# ── ANALYSIS-BOT webhook mirror (opt-in; DEFAULT-OFF) ─────────────────────────
+# When ANALYSIS_BOT_FORWARD_URL is set (only on the production VM), every inbound
+# /webhook payload is mirrored verbatim to the separate ANALYSIS-ONLY bot so it
+# can score the identical alert stream. UNSET (the default — all dev workspaces and
+# every golden/parity check) => the mirror block inside webhook() is skipped
+# entirely and this live bot is byte-identical to before this feature existed. The
+# analysis bot has no forwarder of its own, so no loop is possible; the
+# self-forward guard is a belt-and-suspenders backstop against a misconfigured
+# loopback URL.
+ANALYSIS_BOT_FORWARD_URL = (os.environ.get("ANALYSIS_BOT_FORWARD_URL") or "").strip()
+
+
+def _is_self_forward(url):
+    """True if `url` would route back to THIS live bot (a webhook->webhook loop).
+    Catches BOTH the direct case (loopback host + our own PORT) and the proxied
+    case (any host whose path is `/api/webhook`, the Express route that always
+    proxies to this live bot). The legitimate analysis-bot targets —
+    `localhost:8001/webhook` (direct) or `/api2/webhook` (via Express) — are never
+    matched. Fail-open: on any parse error return False (treat as not-self) so a
+    valid external target is never dropped."""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        path = (u.path or "").rstrip("/").lower()
+        # Proxied loop: the Express '/api/webhook' route always proxies to THIS bot,
+        # so any host pointing at that path (loopback, the Express port, or the public
+        # deployment host) is a loop. '/webhook' and '/api2/webhook' are NOT matched.
+        if path == "/api/webhook":
+            return True
+        target_port = u.port or (443 if u.scheme == "https" else 80)
+        my_port = int(os.environ.get("PORT", 8000))
+        # Direct loop: same loopback host hitting our own listen port.
+        return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") and target_port == my_port
+    except Exception:
+        return False
+
+
+def _forward_to_analysis_bot(raw_body, content_type):
+    """Fire-and-forget daemon-thread mirror of a raw webhook to the analysis bot.
+    Best-effort and FULLY exception-isolated: it must NEVER block, delay, or alter
+    the live webhook response. The caller guards on ANALYSIS_BOT_FORWARD_URL, so
+    this is a no-op when the feature is off."""
+    url = ANALYSIS_BOT_FORWARD_URL
+    if not url or _is_self_forward(url):
+        return
+
+    def _task():
+        try:
+            requests.post(
+                url,
+                data=(raw_body if raw_body is not None else b""),
+                headers={"Content-Type": content_type or "application/json"},
+                timeout=5,
+            )
+        except Exception:
+            pass   # the analysis mirror is best-effort; never surface to the live path
+
+    try:
+        threading.Thread(target=_task, daemon=True, name="analysis-fwd").start()
+    except Exception:
+        pass
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global CURRENT_PRICE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT, LAST_ALERT_AT
@@ -27304,6 +27368,18 @@ def webhook():
     with COUNTERS_LOCK:
         COUNTERS["webhooks_received"] += 1
         _WEBHOOK_TS.append(webhook_received_at)   # rolling last-hour window
+
+    # ── ANALYSIS-BOT MIRROR (opt-in; DEFAULT-OFF) ────────────────────────────
+    # Fire-and-forget a verbatim copy (raw bytes + original content-type) of this
+    # inbound webhook to the separate ANALYSIS-ONLY bot. With ANALYSIS_BOT_FORWARD_URL
+    # UNSET (the default) this whole block is skipped, so the live path is
+    # byte-identical. The mirror runs on a daemon thread and is fully exception-
+    # isolated — it can never block or change the response returned below.
+    if ANALYSIS_BOT_FORWARD_URL:
+        try:
+            _forward_to_analysis_bot(request.get_data(), request.headers.get("Content-Type"))
+        except Exception:
+            pass
 
     try:
         data = request.get_json(force=True, silent=True) or {}

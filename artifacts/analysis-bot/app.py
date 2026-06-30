@@ -23,10 +23,12 @@ logger = logging.getLogger(__name__)
 # exact same trading-analysis engine but MUST be physically incapable of (a)
 # placing any real/paper broker order or (b) posting to Discord. The project-wide
 # broker + Discord secrets are visible to this process, so suppression is enforced
-# in code — never by relying on an unset secret. Enabled by ANALYSIS_ONLY=1 (set
-# only on the analysis bot's launch). With the flag unset this file behaves
-# byte-for-byte like the original.
-ANALYSIS_ONLY = os.environ.get("ANALYSIS_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+# in code — never by relying on an unset secret. FAIL-CLOSED: this directory IS the
+# analysis bot, so analysis-only mode is the DEFAULT and is disabled ONLY by an
+# explicit, deliberate off-value (0/false/no/off). A missing or typo'd ANALYSIS_ONLY
+# therefore leaves the broker + Discord kill-switch and schema isolation ENGAGED.
+_ANALYSIS_ONLY_RAW = (os.environ.get("ANALYSIS_ONLY", "1") or "1").strip().lower()
+ANALYSIS_ONLY = _ANALYSIS_ONLY_RAW not in ("0", "false", "no", "off")
 
 # DB connection kwargs. ANALYSIS_ONLY confines EVERY connection to its own
 # Postgres schema (search_path with NO `public` fallback) so it can never read or
