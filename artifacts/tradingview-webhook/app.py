@@ -36166,6 +36166,14 @@ function _liveAnchoredPotential(pp, dir, inst) {
   return { anchored: true, plan: plan, anchorTxt: fmt(anchor), secsLeft: secsLeft };
 }
 
+// The Edge-components <details> is rebuilt on every poll (rec-checklist innerHTML is
+// regenerated each refresh). Without persisting the user's open/closed choice it would
+// snap back to its default (open when the score is below threshold) every few seconds,
+// so a manual collapse never sticks. Remember the choice per-device (display-only):
+// '1' = user collapsed, '0' = user expanded, absent = default (gap>0).
+function _edgeBdPref(){ try{ return localStorage.getItem('edgeBdCollapsed'); }catch(e){ return null; } }
+function onEdgeBdToggle(el){ try{ localStorage.setItem('edgeBdCollapsed', el.open ? '0' : '1'); }catch(e){} }
+
 // Render the checklist + edge score + plan/reason for the CURRENTLY SELECTED
 // direction (the Long/Short toggle). Reads lastRec.directions[dir]; falls back to
 // the authoritative favored block if directions is missing (older server).
@@ -36266,8 +36274,10 @@ function renderDirView() {
           ? missing.slice(0,2).map(function(m){return m.label;}).join(' or ')
           : 'more confluence'))
       : '\u2713 Threshold met';
+    const _edgePref = _edgeBdPref();
+    const _edgeOpen = (_edgePref===null) ? (gap>0) : (_edgePref!=='1');
     list.innerHTML +=
-      '<details class="edge-bd"'+(gap>0?' open':'')+' style="margin-top:8px">'
+      '<details class="edge-bd"'+(_edgeOpen?' open':'')+' ontoggle="onEdgeBdToggle(this)" style="margin-top:8px">'
       + '<summary style="font-size:11px;color:#8a93a6;cursor:pointer;list-style:none">'
       + '🧮 Edge components \u00B7 '+score+'/'+EDGE_MAX+' \u00B7 need '+thr+'</summary>'
       + '<div style="margin-top:6px;padding:8px;border:1px solid #1e1e32;border-radius:4px;background:#0d0820">'
