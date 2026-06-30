@@ -32178,6 +32178,10 @@ def dashboard():
   .btn:active{transform:scale(.97)}
   .btn-enter{background:var(--green);color:#04140a}
   .btn-enter.short{background:var(--red);color:#1f0404}
+  .cleanest-row{display:flex;justify-content:center;margin:2px 0 12px}
+  .cleanest-btn{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-family:var(--sans);font-size:13px;font-weight:800;letter-spacing:.5px;padding:10px 20px;border-radius:12px;border:1px solid var(--green);background:rgba(52,227,164,.10);color:var(--green);transition:all .16s}
+  .cleanest-btn:hover{background:var(--green);color:#04140a;box-shadow:0 0 14px rgba(52,227,164,.45)}
+  .cleanest-btn:disabled{opacity:.6;cursor:default;box-shadow:none}
   .btn-close{background:var(--warn);color:#1a1304}
   .btn-be{background:var(--amber-deep);color:var(--amber);border:1px solid var(--amber);font-size:14px;padding:14px}
   .btn-eod{background:var(--inset);color:var(--muted);border:1px solid var(--border);font-size:12px;padding:12px;margin-top:6px}
@@ -32731,6 +32735,13 @@ def dashboard():
     <span id="emg-MES" class="mute-pill" role="button" tabindex="0" onclick="toggleEmergency('MES')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEmergency('MES');}">MES: -</span>
     <span id="emg-MYM" class="mute-pill" role="button" tabindex="0" onclick="toggleEmergency('MYM')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEmergency('MYM');}">MYM: -</span>
     <span class="focus-lbl" style="opacity:.6">kill switch - MES/MYM ship disabled - resets on restart</span>
+  </div>
+  <!-- One-tap jump to the single cleanest trade across all (focused) instruments.
+       DISPLAY-ONLY: re-runs the same best-setup scan as the landing auto-select and
+       switches the dashboard to that instrument + favored direction. Never touches
+       the gate, scoring, sizing or any money path. -->
+  <div class="cleanest-row">
+    <button type="button" id="btn-cleanest" class="cleanest-btn" onclick="findCleanestTrade(this)">✨ Cleanest trade available</button>
   </div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
@@ -39462,9 +39473,13 @@ async function optExport(){
 // you switch manually it never moves again, and it never touches the gate,
 // scoring, sizing or any money path. Fail-open: any error leaves the MGC / Long
 // default untouched. Hidden (focused-out) instruments are never auto-selected.
-async function autoSelectBestSetup(){
+async function pickCleanestSetup(force){
+  // Shared best-setup scan. force=true (the manual "Cleanest trade" button) bypasses
+  // the userPickedSetup guard; force=false (landing auto-select) respects a manual
+  // pick. Returns the chosen candidate (or null). DISPLAY-ONLY — only switches the
+  // viewed tab/direction; never touches the gate, scoring, sizing or any money path.
   try {
-    if (userPickedSetup) return;                      // user already chose — never override
+    if (!force && userPickedSetup) return null;       // landing mode: manual pick wins
     const num = function(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; };
     let cands = INSTRUMENTS.filter(instrEnabled);   // respect display focus
     if (!cands.length) cands = ['MGC'];
@@ -39487,15 +39502,31 @@ async function autoSelectBestSetup(){
                                              : (cand.edge > best.edge);
       if (better) best = cand;
     });
-    if (!best) return;
+    if (!best) return null;
     let bdir = jsReadyDir(best.d.verdict);            // ready side when actionable
     if (!bdir){                                       // else the higher per-side edge
       bdir = (num(best.d.short_score) > num(best.d.long_score)) ? 'Short' : 'Long';
     }
-    if (userPickedSetup) return;                      // re-check after await — manual pick wins
+    if (!force && userPickedSetup) return null;       // re-check after await — manual pick wins
     if (best.s !== sym) setSymbol(best.s);            // setSymbol() re-fetches analysis
     if (bdir && bdir !== dir) setDir(bdir);
-  } catch(e){ /* fail-open: keep the MGC / Long default */ }
+    return best;
+  } catch(e){ return null; }                          // fail-open: keep current view
+}
+
+// Landing auto-select (once on load) — respects a manual pick.
+async function autoSelectBestSetup(){ return pickCleanestSetup(false); }
+
+// Manual "Cleanest trade available" button — an explicit user request, so it always
+// re-scans and jumps to the best setup even after a manual tab / direction pick.
+async function findCleanestTrade(btn){
+  try {
+    if (btn){ btn.disabled = true; btn.dataset.orig = btn.dataset.orig || btn.textContent; btn.textContent = '🔎 Scanning…'; }
+    await pickCleanestSetup(true);
+  } catch(e){ /* fail-open */ }
+  finally {
+    if (btn){ setTimeout(function(){ btn.disabled = false; btn.textContent = btn.dataset.orig || '✨ Cleanest trade available'; }, 800); }
+  }
 }
 
 // Poll every 3 seconds
