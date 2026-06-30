@@ -56,6 +56,10 @@ args = "learning_score_golden"
 task = "workflow.run"
 args = "scalp_advisory"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "dual_sim"
+
 [[workflows.workflow]]
 name = "TradingView Webhook Server"
 author = "agent"
@@ -163,6 +167,17 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "bash .local/state/check_scalp_advisory.sh"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "dual_sim"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "bash .local/state/check_dual_sim.sh"
 
 [workflows.workflow.metadata]
 isValidation = true

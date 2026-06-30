@@ -5022,7 +5022,7 @@ def _handle_zone_mitigated(price, ticker):
                 price, inst, len(MITIGATED_PRICES_BY_TICKER[inst]))
 
 
-def is_near_mitigated_zone(price, ticker):
+def is_near_mitigated_zone(price, ticker, mode=None, prune=True):
     """Return (True, consumed_price) if `price` is within the instrument's
     consumed-zone proximity band of any of THIS instrument's mitigated zones that
     are still fresh.
@@ -5038,7 +5038,10 @@ def is_near_mitigated_zone(price, ticker):
     records = MITIGATED_PRICES_BY_TICKER.get(inst)
     if price is None or not records:
         return False, None
-    ttl_min = cfg("MITIGATED_TTL_MIN")
+    # `mode` (None → live TRADING_MODE) selects whose MITIGATED_TTL_MIN governs
+    # expiry; `prune=False` makes this READ-ONLY (no in-place pruning) for the pure
+    # dual-mode shadow replay. Default (mode=None, prune=True) is byte-identical.
+    ttl_min = cfg("MITIGATED_TTL_MIN") if mode is None else cfg_for(mode, "MITIGATED_TTL_MIN")
     if ttl_min is not None:
         cutoff = now_utc() - timedelta(minutes=ttl_min)
         fresh  = []
@@ -5049,7 +5052,7 @@ def is_near_mitigated_zone(price, ticker):
                 keep = True   # fail-open: never drop an un-parseable record
             if keep:
                 fresh.append(mz)
-        if len(fresh) != len(records):
+        if len(fresh) != len(records) and prune:
             MITIGATED_PRICES_BY_TICKER[inst] = fresh
         records = fresh
         if not records:
@@ -6115,7 +6118,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                           nearest_supply, nearest_demand,
                           bullish, bearish, confidence, alert_history,
                           volatility=None, session=None, cooldown_active=False,
-                          learning_score_influence=None):
+                          learning_score_influence=None, mode=None):
     """Strict checklist recommendation.
 
     `learning_score_influence` (Task #18, OFF by default / None): optional per-direction
@@ -6137,6 +6140,15 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     journal/embed), reason (human-readable), and missing (list of unmet conditions).
     """
     inst = instrument_of(ticker)
+
+    # Mode-parameterized threshold reads: route EVERY cfg(...) in this function (and
+    # its nested closures) through the EXPLICIT mode `m`. Default mode=None -> m == the
+    # global TRADING_MODE -> cfg_for(TRADING_MODE, k) == cfg(k), so the LIVE gate stays
+    # BYTE-IDENTICAL (goldens prove it). The dual-mode shadow simulator passes the OTHER
+    # mode to faithfully re-derive that mode's READY/WAIT decision from the same logic.
+    m = mode or TRADING_MODE
+    def cfg(key):
+        return cfg_for(m, key)
 
     # ── Recent alerts within the active window (mode-dependent), ticker-aware ──
     stage_window = cfg("STAGE_WINDOW_MIN")
@@ -14989,6 +15001,23 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 "instrument": active_ticker, "point_value": point_value_for(active_ticker),
             }
 
+    # ── Dual-mode shadow simulator: snapshot the EXACT gate inputs HERE, BEFORE the
+    # zone-broken / mitigated overrides below mutate `confidence`, so the webhook
+    # observer replays each rulebook's verdict with the same values the gate used.
+    # Flag OFF → stays None → never attached to `result` → byte-identical. Pure data;
+    # never read by the money path. (See _maybe_observe_dual_mode_sim.)
+    _dual_sim_inputs = None
+    if DUAL_MODE_SHADOW_SIM_ENABLED:
+        _dual_sim_inputs = {
+            "current_price": current_price, "active_ticker": active_ticker,
+            "vwap_value": vwap_value, "vwap_status": vwap_status,
+            "nearest_supply": nearest_supply, "nearest_demand": nearest_demand,
+            "bullish": bullish, "bearish": bearish, "confidence": confidence,
+            "volatility": volatility, "session_state": session_state,
+            "edge_score": edge_score, "learning_score_influence": learning_score_influence,
+            "cooldown_active": cooldown_active,
+        }
+
     # get_setup_stage retained for lifecycle display context in the embed.
     setup_stage, stage_next_step, stage_entry_rule, stage_invalidation, stage_direction = get_setup_stage(
         current_price, nearest_supply, nearest_demand, bullish, bearish, ALERT_HISTORY
@@ -16053,6 +16082,21 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         _maybe_capture_main_brain_snapshot(result)
     except Exception:
         pass
+
+    # Dual-mode shadow simulator: attach the snapshotted gate inputs (flag-on only)
+    # so the webhook observer can replay BOTH rulebooks' verdicts. Flag OFF → the
+    # local is None → key never added → byte-identical result dict.
+    if _dual_sim_inputs is not None:
+        result["_dual_sim_inputs"] = _dual_sim_inputs
+        # Snapshot the LIVE mode that produced THIS result so the observer can identify
+        # the active rulebook from the analysis, not from the global TRADING_MODE at
+        # observer time. Without this, a /mode flip between full_analysis() and the
+        # observer would let the real live mode be re-derived via the gate-level shadow
+        # (which does NOT mirror the default-ON Entry Quality veto / ORB), allowing a
+        # shadow open even when the live verdict was demoted to WAIT. Sibling key (not
+        # inside _dual_sim_inputs) so the **inp splat into _shadow_strict_verdict stays
+        # signature-exact. Flag OFF → never attached → byte-identical.
+        result["_dual_sim_live_mode"] = TRADING_MODE
     return result
 
 
@@ -23572,6 +23616,15 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     except Exception as exc:
         logger.error("Scalp live-sim observe failed: %s", exc)
 
+    # ── DUAL-MODE shadow simulator observer (PAPER, DISPLAY-ONLY, default OFF) ────
+    # Passive ALWAYS-ON: replays BOTH rulebooks' REAL verdict from the SAME gate
+    # inputs and opens shadow paper trades into dual_sim_trades. Never reads back
+    # into the gate / verdict / trade_plan / edge_score / money path. Fail-open.
+    try:
+        _maybe_observe_dual_mode_sim(a, source="webhook")
+    except Exception as exc:
+        logger.error("Dual-mode sim observe failed: %s", exc)
+
 
 # ── Asynchronous webhook processing ──────────────────────────────────────────
 # TradingView aborts a webhook if the server does not respond quickly ("request
@@ -25763,6 +25816,547 @@ def _scalp_sim_watch_loop():
         threading.Timer(SCALP_SIM_WATCH_INTERVAL, _scalp_sim_watch_loop).start()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# DUAL-MODE SHADOW SIMULATOR — passive, ALWAYS-ON paper sim of BOTH rulebooks
+# ════════════════════════════════════════════════════════════════════════════
+# Faithfully replays the bot's REAL gate verdict for BOTH the SCALP and SWING
+# rulebooks at once — regardless of the live TRADING_MODE / arming — and paper-
+# trades each into its OWN ledger (dual_sim_trades) for a side-by-side comparison.
+# It reuses the SAME mode-parameterized building blocks the live gate uses
+# (evaluate_strict_setup(mode=) -> compute_swing_context -> build_strict_trade_plan(mode=)
+# -> SCALP/SWING entry vetoes -> zone-broken/mitigated overrides), so a shadow
+# verdict is byte-faithful to what the LIVE gate would decide in that mode.
+#
+# FULLY walled off from the money path: it NEVER sends a broker order, never calls
+# the execution gateway / auto-trade, never writes strategy_trades / MANAGED_TRADES /
+# learning, and never mutates the verdict / trade_plan / edge_score. App-side
+# INSERT/SELECT ONLY (the table is created out-of-band — DB tool in dev, Publish
+# schema-diff in prod). Gated behind DUAL_MODE_SHADOW_SIM_ENABLED (default 0) →
+# flag OFF == byte-identical (the result key is never attached and the observer /
+# watcher early-return). Everything is FAIL-OPEN except the verdict replay, which
+# is FAIL-CLOSED to WAIT so a broken shadow can never fabricate a paper entry.
+DUAL_MODE_SHADOW_SIM_ENABLED = os.environ.get(
+    "DUAL_MODE_SHADOW_SIM_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+DUAL_SIM_DB_READY           = False
+DUAL_SIM_WATCH_LOCK         = threading.Lock()   # single-flight: one watcher cycle at a time
+DUAL_SIM_WATCH_INTERVAL     = max(10, int(os.environ.get("DUAL_SIM_WATCH_INTERVAL", 15)))
+DUAL_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("DUAL_SIM_COOLDOWN_SECS", 300)))
+DUAL_SIM_MAX_HOLD_HOURS     = max(1, int(os.environ.get("DUAL_SIM_MAX_HOLD_HOURS", 12)))
+DUAL_SIM_MODES              = ("SCALP", "SWING")
+_DUAL_SIM_COOLDOWN          = {}                  # (mode,inst,direction) -> monotonic ts
+_DUAL_SIM_COOLDOWN_LOCK     = threading.Lock()
+
+
+def _check_dual_sim_db_ready():
+    """Probe dual_sim_trades (no DDL) and set DUAL_SIM_DB_READY. FAIL-OPEN: a
+    missing table / unavailable DB disables the dual-sim layer and never touches
+    the rest of the bot."""
+    global DUAL_SIM_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM dual_sim_trades LIMIT 1")
+            cur.fetchone()
+        DUAL_SIM_DB_READY = True
+        logger.info("dual-mode shadow sim table ready")
+    except Exception as exc:
+        logger.warning("dual-mode shadow sim table unavailable (dual sim disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _shadow_strict_verdict(mode, *, current_price, active_ticker, vwap_value,
+                           vwap_status, nearest_supply, nearest_demand, bullish,
+                           bearish, confidence, volatility, session_state, edge_score,
+                           learning_score_influence, cooldown_active):
+    """PURE, side-effect-free replay of full_analysis's verdict pipeline for an
+    EXPLICIT `mode`. Mirrors the live gate (strict setup -> swing_ctx -> trade plan
+    -> SCALP veto -> SWING veto -> zone-broken/mitigated overrides), routed through
+    the already-mode-parameterized building blocks so the shadow decision is faithful
+    to what the live gate would decide in that mode. Reads only module globals
+    (ALERT_HISTORY, ZONE_BROKEN_AT, MITIGATED_FLAG_BY_TICKER) and NEVER mutates
+    anything. FAIL-CLOSED to WAIT on any error so a broken shadow can't fabricate an
+    entry. Returns {verdict, direction, label, score, edge_score, reason, trade_plan,
+    actionable}."""
+    try:
+        strict = evaluate_strict_setup(
+            current_price, active_ticker, vwap_value, vwap_status,
+            nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
+            volatility=volatility, session=session_state, cooldown_active=cooldown_active,
+            learning_score_influence=learning_score_influence, mode=mode,
+        )
+        strict_label     = strict["label"]
+        strict_direction = strict["direction"]
+        strict_score     = strict["score"]
+        strict_reason    = strict.get("reason", "")
+        confluences      = strict.get("confluences", {}) or {}
+
+        # SWING higher-timeframe context — only under this mode + flag-on (None in
+        # SCALP/flag-off → the plan builder falls through to its 1:1 path and the SWING
+        # veto never runs), exactly like the live gate.
+        swing_ctx = None
+        if _swing_htf_enabled(mode):
+            try:
+                swing_ctx = compute_swing_context(active_ticker, current_price)
+            except Exception:
+                swing_ctx = None
+
+        verdict = "WAIT"
+        trade_plan = {"trade_plan": False, "reason": strict_reason, "direction": strict_direction}
+        if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
+            tp = build_strict_trade_plan(
+                strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
+                volatility=volatility, mode=mode, vwap=vwap_value, edge_score=edge_score,
+                swing_context=swing_ctx,
+            )
+            if tp.get("trade_plan"):
+                trade_plan = tp
+                _early = strict.get("readiness") == "EARLY"
+                if strict_direction == "Long":
+                    verdict = "LONG EARLY READY" if _early else "LONG READY"
+                else:
+                    verdict = "SHORT EARLY READY" if _early else "SHORT READY"
+            else:
+                verdict       = "WAIT"
+                strict_reason = tp.get("reason", strict_reason)
+        elif strict_label == "Setup Building" and strict.get("candidate"):
+            verdict = "SETUP BUILDING"     # informational, NON-actionable
+
+        # ── SCALP dynamic-exit ENTRY VETOES (mode-scoped) ─────────────────────────
+        if _scalp_dynamic_enabled(mode) and is_actionable(verdict) and strict_direction:
+            try:
+                _sq = compute_scalp_quality(
+                    strict_direction, current_price, vwap_value, vwap_status,
+                    nearest_supply, nearest_demand, trade_plan, edge_score,
+                    instrument_of(active_ticker), (volatility or {}).get("atr_pts"))
+                _veto = _scalp_entry_veto_reasons(_sq)
+            except Exception as exc:       # FAIL-CLOSED
+                _veto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
+            if _veto:
+                verdict       = "WAIT"
+                strict_reason = "SCALP filter: " + "; ".join(m for _, m in _veto) + "."
+                trade_plan    = {"trade_plan": False, "reason": strict_reason,
+                                 "direction": strict_direction}
+
+        # ── SWING entry MONEY-PATH vetoes (mode-scoped) ───────────────────────────
+        if _swing_htf_enabled(mode) and is_actionable(verdict) and strict_direction:
+            try:
+                _sv = _swing_entry_veto_reasons(swing_ctx, trade_plan, strict_direction)
+            except Exception as exc:       # FAIL-CLOSED
+                _sv = [("unavailable", f"SWING entry checks unavailable ({exc})")]
+            if _sv:
+                verdict       = "WAIT"
+                strict_reason = "SWING filter: " + "; ".join(m for _, m in _sv) + "."
+                trade_plan    = {"trade_plan": False, "reason": strict_reason,
+                                 "direction": strict_direction}
+
+        # ── Zone-broken / zone-mitigated overrides (mode-aware via GATE_REQUIRE_ZONE)
+        # Pure read-only mirror of the live overrides so the shadow matches the live
+        # verdict during a zone-broken/mitigated window. SWING hard-gates on zone;
+        # SCALP demotes zone (GATE_REQUIRE_ZONE False) so this never fires there.
+        if bool(cfg_for(mode, "GATE_REQUIRE_ZONE")) and is_actionable(verdict):
+            inst = instrument_of(active_ticker)
+            zone_broken_active = (
+                ZONE_BROKEN_AT is not None
+                and ZONE_BROKEN_AT.get("instrument") in (None, inst))
+            if zone_broken_active:
+                verdict       = "WAIT"
+                strict_reason = "Structure invalidated — zone broken."
+                trade_plan    = {"trade_plan": False, "reason": strict_reason, "direction": None}
+            else:
+                mitig_confirmed = bool(confluences.get("zone_mitigated"))
+                near_sup_mz, _  = is_near_mitigated_zone(nearest_supply, inst, mode=mode, prune=False)
+                near_dem_mz, _  = is_near_mitigated_zone(nearest_demand, inst, mode=mode, prune=False)
+                if (MITIGATED_FLAG_BY_TICKER.get(inst) and (near_sup_mz or near_dem_mz)
+                        and not mitig_confirmed):
+                    verdict       = "WAIT"
+                    strict_reason = "Zone consumed — wait for fresh supply or demand zone."
+                    trade_plan    = {"trade_plan": False, "reason": strict_reason, "direction": None}
+
+        actionable = bool(is_actionable(verdict))
+        return {
+            "verdict":    verdict,
+            "direction":  strict_direction if actionable else trade_plan.get("direction"),
+            "label":      strict_label,
+            "score":      strict_score,
+            "edge_score": edge_score,
+            "reason":     strict_reason,
+            "trade_plan": trade_plan,
+            "actionable": actionable,
+        }
+    except Exception as exc:
+        logger.warning("dual-sim shadow verdict (%s) failed: %s", mode, exc)
+        return {"verdict": "WAIT", "direction": None, "label": "WAIT", "score": 0,
+                "edge_score": edge_score, "reason": f"shadow error ({exc})",
+                "trade_plan": {"trade_plan": False}, "actionable": False}
+
+
+def _dual_sim_open_insert(sim_key, setup_anchor, mode, inst, direction, verdict,
+                          entry, stop, target, rr, session, regime, edge):
+    """Idempotent INSERT of an OPEN shadow paper trade. Skips a duplicate sim_key
+    (same setup re-fired) or an already open/resolving trade for this
+    (mode,inst,direction) — one shadow position per rulebook/instrument/direction at
+    a time. Writes ONLY dual_sim_trades. INSERT/SELECT ONLY, FAIL-OPEN (returns False
+    on any error)."""
+    if not DUAL_SIM_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        ctx_json = psycopg2.extras.Json({
+            "verdict": verdict, "session": session,
+            "market_regime": regime, "edge_score": edge})
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM dual_sim_trades "
+                "WHERE mode=%s AND symbol=%s AND direction=%s "
+                "AND status IN ('open','resolving') LIMIT 1",
+                (mode, inst, direction))
+            if cur.fetchone():
+                return False
+            cur.execute(
+                "INSERT INTO dual_sim_trades "
+                "(sim_key, mode, symbol, direction, status, entry, stop, target, rr, "
+                " verdict, session, market_regime, edge_score, setup_anchor, opened_at, "
+                " entry_epoch, context) "
+                "VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), %s, %s) "
+                "ON CONFLICT (sim_key) DO NOTHING",
+                (sim_key, mode, inst, direction, entry, stop, target, rr, verdict,
+                 session, regime, edge, setup_anchor, now_utc().timestamp(), ctx_json))
+            inserted = (cur.rowcount == 1)
+        conn.commit()
+        return inserted
+    except Exception as exc:
+        logger.warning("dual-sim open insert failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _maybe_observe_dual_mode_sim(result, source="webhook"):
+    """Passive ALWAYS-ON dual shadow observer. Opens ONE idempotent paper trade per
+    (mode,inst,direction) for BOTH rulebooks whenever that mode is actionable with a
+    real plan. The ACTIVE (live) mode replays the REAL FINAL decision verbatim from
+    `result` (verdict + trade_plan), so it inherits every post-assembly live layer —
+    the default-ON Entry Quality veto AND the sanctioned ORB 1:4 retarget — and can
+    NEVER diverge from what the bot actually decided. The OTHER (non-live) mode is a
+    pure gate-level "what-if" replay via _shadow_strict_verdict from the stashed
+    inputs; the display-assembled layers (Entry Quality / ORB) are intentionally NOT
+    mirrored there since they require a fully-assembled per-mode result that only the
+    live path produces. Writes ONLY dual_sim_trades. NEVER touches the gate / verdict /
+    trade_plan / edge_score / strategy_trades / MANAGED_TRADES / broker / auto-execute.
+    Default OFF → flag OFF == byte-identical. FAIL-OPEN. Returns trades opened (tests)."""
+    if not DUAL_MODE_SHADOW_SIM_ENABLED or source != "webhook" or not DUAL_SIM_DB_READY:
+        return 0
+    # Never open shadow trades while the futures session is closed.
+    try:
+        if not market_session_status().get("open", True):
+            return 0
+    except Exception:
+        pass
+    inp = result.get("_dual_sim_inputs")
+    if not isinstance(inp, dict):
+        return 0
+    inst = instrument_of(inp.get("active_ticker") or "")
+    if not inst:
+        return 0
+    now_mono = time.monotonic()
+    et_day   = now_utc().astimezone(ET_TZ).strftime("%Y%m%d")
+    bucket   = int(now_utc().timestamp() // 300)   # 5-min idempotency bucket
+    atr      = (inp.get("volatility") or {}).get("atr_pts") or 0.0
+    opened    = 0
+    # Use the mode snapshotted at analysis time (falls back to the live global for
+    # safety) so a /mode flip between full_analysis() and here can't misroute the
+    # active rulebook through the gate-level shadow and bypass the live EQ/ORB layers.
+    live_mode = result.get("_dual_sim_live_mode") or TRADING_MODE
+    for mode in DUAL_SIM_MODES:
+        try:
+            if mode == live_mode:
+                # ACTIVE (live) mode: replay the REAL, FINAL decision verbatim. This is
+                # the authoritative post-assembly verdict (inherits the default-ON Entry
+                # Quality veto AND the sanctioned ORB 1:4 retarget), so the active-mode
+                # ledger can NEVER diverge from what the bot actually decided live.
+                verdict   = result.get("verdict")
+                tp        = result.get("trade_plan") or {}
+                direction = result.get("strict_direction") or tp.get("direction")
+                edge_sc   = result.get("edge_score")
+            else:
+                # OTHER ("what-if") mode: pure gate-level replay (strict -> plan -> SCALP
+                # veto -> SWING veto -> zone overrides). The display-assembled layers
+                # (Entry Quality veto / ORB retarget) are intentionally NOT mirrored here
+                # — they require the fully-assembled per-mode result, which exists only on
+                # the live path. This is the non-live rulebook's gate verdict, never a
+                # live decision.
+                sv        = _shadow_strict_verdict(mode, **inp)
+                verdict   = sv.get("verdict")
+                tp        = sv.get("trade_plan") or {}
+                direction = sv.get("direction")
+                edge_sc   = sv.get("edge_score")
+        except Exception:
+            continue
+        if not is_actionable(verdict):
+            continue
+        mgmt = tp.get("management") or {}
+        entry  = mgmt.get("entry")
+        stop   = mgmt.get("stop")
+        target = mgmt.get("tp1")
+        if not (direction and entry is not None and stop is not None and target is not None):
+            continue
+        rr = tp.get("rr_num")
+        ckey = (mode, inst, direction)
+        with _DUAL_SIM_COOLDOWN_LOCK:
+            last = _DUAL_SIM_COOLDOWN.get(ckey)
+            if last is not None and (now_mono - last) < DUAL_SIM_OPEN_COOLDOWN_SECS:
+                continue
+        price_bucket = (int(round(entry / (0.5 * atr))) if atr else int(round(entry)))
+        setup_anchor = "%s:%d:%d" % (et_day, bucket, price_bucket)
+        sim_key = "%s|%s|%s|%s" % (mode, inst, direction, setup_anchor)
+        if _dual_sim_open_insert(sim_key, setup_anchor, mode, inst, direction,
+                                 verdict, entry, stop, target, rr,
+                                 inp.get("session_state"), None, edge_sc):
+            opened += 1
+            with _DUAL_SIM_COOLDOWN_LOCK:
+                _DUAL_SIM_COOLDOWN[ckey] = now_mono
+    if opened:
+        logger.info("dual-mode sim: opened %d shadow paper trade(s) on %s", opened, inst)
+    return opened
+
+
+def _dual_sim_outcome(row, bar):
+    """Pure stop-first / then-target resolver for ONE open shadow trade against the
+    latest bar. Returns (result_label, exit_price, r_multiple) or None. Worst-case
+    fill (stop before target), identical to the scalp live-sim resolver."""
+    high, low = bar.get("high"), bar.get("low")
+    entry, stop, target = row.get("entry"), row.get("stop"), row.get("target")
+    if None in (high, low, entry, stop, target):
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    if row.get("direction") == "Long":
+        if low <= stop:
+            return ("loss", stop, round((stop - entry) / risk, 4))
+        if high >= target:
+            return ("win", target, round((target - entry) / risk, 4))
+    else:
+        if high >= stop:
+            return ("loss", stop, round((entry - stop) / risk, 4))
+        if low <= target:
+            return ("win", target, round((entry - target) / risk, 4))
+    return None
+
+
+def _dual_sim_close(row_id, result_label, exit_price, r_multiple):
+    """Atomically resolve one open shadow trade. The conditional `WHERE status IN
+    ('open','resolving')` IS the cross-instance status claim — only the first writer
+    closes it. Writes ONLY dual_sim_trades. FAIL-OPEN."""
+    if not DUAL_SIM_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE dual_sim_trades "
+                "SET status='closed', result=%s, exit_price=%s, r_multiple=%s, closed_at=now() "
+                "WHERE id=%s AND status IN ('open','resolving')",
+                (result_label, exit_price, r_multiple, row_id))
+            claimed = (cur.rowcount == 1)
+        conn.commit()
+        return claimed
+    except Exception as exc:
+        logger.warning("dual-sim close failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _watch_dual_sim_trades():
+    """Resolve OPEN shadow trades against the latest 1-minute bar (one fetch per
+    instrument per cycle) — stop-first then target, ±R only, with the SAME-BAR guard
+    (skip a bar opened at/before entry so a fresh trade can't self-fill). A trade past
+    DUAL_SIM_MAX_HOLD_HOURS resolves at the latest close as 'expired'. Writes ONLY
+    dual_sim_trades — never MANAGED_TRADES, strategy_trades, or the money path.
+    FAIL-OPEN."""
+    if not DUAL_SIM_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    open_rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, symbol, direction, entry, stop, target, rr, entry_epoch, opened_at "
+                "FROM dual_sim_trades WHERE status IN ('open','resolving') "
+                "ORDER BY id ASC LIMIT 500")
+            for r in cur.fetchall():
+                open_rows.append({
+                    "id": r[0], "symbol": r[1], "direction": r[2],
+                    "entry": float(r[3]) if r[3] is not None else None,
+                    "stop": float(r[4]) if r[4] is not None else None,
+                    "target": float(r[5]) if r[5] is not None else None,
+                    "rr": float(r[6]) if r[6] is not None else 1.0,
+                    "entry_epoch": float(r[7]) if r[7] is not None else None,
+                    "opened_at": r[8]})
+    except Exception as exc:
+        logger.warning("dual-sim watcher read failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not open_rows:
+        return
+    bars = {}
+    for inst in {r["symbol"] for r in open_rows}:
+        try:
+            bars[inst] = _fetch_latest_bar(inst)
+        except Exception:
+            bars[inst] = None
+    for row in open_rows:
+        bar = bars.get(row["symbol"])
+        if not bar:
+            continue
+        bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
+        if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
+            continue                       # same-bar guard (no look-ahead self-fill)
+        outcome = _dual_sim_outcome(row, bar)
+        if outcome is None:
+            # max-hold expiry — resolve a stranded shadow trade at the latest close.
+            opened_at, cl = row.get("opened_at"), bar.get("close")
+            if opened_at is not None and cl is not None and row.get("stop") is not None:
+                try:
+                    oa = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
+                    aged = (now_utc() - oa).total_seconds() > DUAL_SIM_MAX_HOLD_HOURS * 3600
+                except Exception:
+                    aged = False
+                risk = abs(row["entry"] - row["stop"])
+                if aged and risk > 0:
+                    r = ((cl - row["entry"]) / risk if row["direction"] == "Long"
+                         else (row["entry"] - cl) / risk)
+                    outcome = ("expired", round(cl, 4), round(r, 4))
+        if outcome is None:
+            continue
+        _dual_sim_close(row["id"], outcome[0], outcome[1], outcome[2])
+
+
+def _dual_sim_watch_loop():
+    """Parallel shadow watcher on its own timer. Gated to the LIVE instance
+    (DISCORD_LIVE_ENABLED) + flag ON + DB ready, single-flight via DUAL_SIM_WATCH_LOCK.
+    FAIL-OPEN — any error just skips this cycle. Never touches the money path."""
+    try:
+        if DUAL_MODE_SHADOW_SIM_ENABLED and DISCORD_LIVE_ENABLED and DUAL_SIM_DB_READY:
+            if DUAL_SIM_WATCH_LOCK.acquire(blocking=False):
+                try:
+                    _watch_dual_sim_trades()
+                finally:
+                    DUAL_SIM_WATCH_LOCK.release()
+    except Exception as exc:
+        logger.warning("dual-sim watch loop error: %s", exc)
+    finally:
+        threading.Timer(DUAL_SIM_WATCH_INTERVAL, _dual_sim_watch_loop).start()
+
+
+def _dual_sim_stats():
+    """Per-mode shadow paper-sim stats from dual_sim_trades. DISPLAY-ONLY, FAIL-OPEN
+    (returns {} on any error). Win-rate / avgR are over CLOSED win|loss trades; an
+    'expired' (max-hold) trade counts toward net_r but not the win-rate denominator.
+    Max-DD is the worst running trough across closed R. Includes a per-(mode,symbol)
+    split so the dashboard can compare SCALP vs SWING per instrument."""
+    out = {}
+    if not DUAL_SIM_DB_READY:
+        _check_dual_sim_db_ready()
+    if not DUAL_SIM_DB_READY:
+        return out
+    conn = _learning_conn()
+    if conn is None:
+        return out
+    rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT mode, symbol, status, result, r_multiple, closed_at "
+                "FROM dual_sim_trades "
+                "ORDER BY closed_at ASC NULLS LAST, id ASC")
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning("dual-sim stats read failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _blank():
+        return {"open": 0, "closed": 0, "wins": 0, "losses": 0, "r_list": [], "last_at": None}
+
+    agg = {}      # mode -> bucket
+    per_sym = {}  # (mode,symbol) -> bucket
+    for mode, symbol, status, result_label, r_mult, closed_at in rows:
+        for bkt in (agg.setdefault(mode, _blank()), per_sym.setdefault((mode, symbol), _blank())):
+            if status in ("open", "resolving"):
+                bkt["open"] += 1
+                continue
+            bkt["closed"] += 1
+            if r_mult is not None:
+                bkt["r_list"].append(float(r_mult))
+            if result_label == "win":
+                bkt["wins"] += 1
+            elif result_label == "loss":
+                bkt["losses"] += 1
+            if closed_at is not None:
+                iso = closed_at.isoformat() if hasattr(closed_at, "isoformat") else str(closed_at)
+                if bkt["last_at"] is None or iso > bkt["last_at"]:
+                    bkt["last_at"] = iso
+
+    def _summ(a):
+        decided  = a["wins"] + a["losses"]
+        win_rate = round(100.0 * a["wins"] / decided, 1) if decided else None
+        avg_r    = round(sum(a["r_list"]) / len(a["r_list"]), 3) if a["r_list"] else None
+        net_r    = round(sum(a["r_list"]), 2) if a["r_list"] else (0.0 if a["closed"] else None)
+        dd = None
+        if a["r_list"]:
+            cum = peak = mdd = 0.0
+            for r in a["r_list"]:
+                cum += r
+                peak = max(peak, cum)
+                mdd = min(mdd, cum - peak)
+            dd = round(mdd, 2)
+        return {"trades": a["closed"], "open": a["open"], "win_rate": win_rate,
+                "avg_r": avg_r, "net_r": net_r, "max_dd_r": dd, "last_at": a["last_at"]}
+
+    for mode in DUAL_SIM_MODES:
+        d = _summ(agg.get(mode) or _blank())
+        d["by_symbol"] = {sym: _summ(s) for (mo, sym), s in per_sym.items() if mo == mode}
+        out[mode] = d
+    out["enabled"] = bool(DUAL_MODE_SHADOW_SIM_ENABLED)
+    return out
+
+
 def _scalp_sim_stats():
     """Per-strategy LIVE paper-sim stats from scalp_strategy_sim_trades. DISPLAY-
     ONLY, FAIL-OPEN (returns {} on any error). Win-rate / avgR are over CLOSED
@@ -27543,6 +28137,7 @@ def status():
         "strategy_engine":     a.get("strategy_engine"),
         "equity_curve_today":  a.get("equity_curve_today"),
         "news_filter":         a.get("news_filter"),
+        "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
         "learning_engine":     _learning_engine_view(),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
@@ -31993,6 +32588,27 @@ def dashboard():
   <ul id="mbl-list" class="mb-list" style="margin-top:8px"></ul>
 </div>
 
+<!-- Dual Shadow Simulator — passive ALWAYS-ON paper sim that replays the bot's REAL
+     READY decisions under BOTH the SCALP and SWING rulebooks at once, into a separate
+     ledger (dual_sim_trades). DISPLAY-ONLY: never sends to a broker, never writes
+     strategy_trades / MANAGED_TRADES, never changes the live verdict. Hidden unless the
+     server attaches d.dual_sim (flag DUAL_MODE_SHADOW_SIM_ENABLED). Every dynamic string
+     goes through textContent (XSS-safe), never innerHTML. -->
+<div class="mod" id="mod-dual-sim" style="display:none">
+  <div class="mod-h">🔬 Dual Shadow Simulator<span title="Passive paper simulation of BOTH rulebooks side by side — not your real broker fills, and it never affects the live bot." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
+  <div id="dual-sim-meta" style="font-size:11px;color:#6b7280;margin-bottom:6px"></div>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead>
+      <tr>
+        <th style="text-align:left;color:#6b7280;font-weight:600;padding:3px 6px">Metric</th>
+        <th style="text-align:right;color:#22c55e;font-weight:600;padding:3px 6px">SCALP</th>
+        <th style="text-align:right;color:#3b82f6;font-weight:600;padding:3px 6px">SWING</th>
+      </tr>
+    </thead>
+    <tbody id="dual-sim-body"></tbody>
+  </table>
+</div>
+
 <!-- Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades
      (display/advisory only; it ranks ideas, it never places or changes a trade). Hidden
      unless SCALP_MAIN_BRAIN_ADVISORY_ENABLED is on (fed by d.scalp_strategy_advisory).
@@ -34582,6 +35198,42 @@ function renderMBLearning(d){
     }
   }
 }
+// Dual Shadow Simulator — passive paper sim comparing the SCALP vs SWING rulebooks side
+// by side, fed by d.dual_sim (server-whitelisted from _dual_sim_stats). DISPLAY-ONLY: it
+// never sends to a broker and never changes the live bot. Hidden unless the flag is on.
+// All dynamic strings go through textContent (XSS-safe); the table is built with
+// createElement, never an innerHTML string (avoids the inline-JS escape trap).
+function _dsFmt(v, suffix){ return (v==null) ? '\u2014' : (v + (suffix||'')); }
+function renderDualSim(d){
+  const mod=document.getElementById('mod-dual-sim'); if(!mod) return;
+  const ds=(d&&d.dual_sim)||null;
+  if(!ds || !ds.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const sc=ds.SCALP||{}; const sw=ds.SWING||{};
+  const meta=document.getElementById('dual-sim-meta');
+  if(meta){
+    const so=(sc.open!=null?sc.open:0), wo=(sw.open!=null?sw.open:0);
+    meta.textContent='Open now: '+so+' SCALP / '+wo+' SWING \u00b7 paper-only, replays the live READY decision for each rulebook.';
+  }
+  const body=document.getElementById('dual-sim-body'); if(!body) return;
+  body.innerHTML='';
+  const rows=[
+    ['Trades',   _dsFmt(sc.trades),            _dsFmt(sw.trades)],
+    ['Win rate', _dsFmt(sc.win_rate,'%'),      _dsFmt(sw.win_rate,'%')],
+    ['Avg R',    _dsFmt(sc.avg_r,'R'),         _dsFmt(sw.avg_r,'R')],
+    ['Net R',    _dsFmt(sc.net_r,'R'),         _dsFmt(sw.net_r,'R')],
+    ['Max DD',   _dsFmt(sc.max_dd_r,'R'),      _dsFmt(sw.max_dd_r,'R')],
+    ['Open',     _dsFmt(sc.open),              _dsFmt(sw.open)]
+  ];
+  rows.forEach(function(r){
+    const tr=document.createElement('tr');
+    const td0=document.createElement('td'); td0.style.cssText='text-align:left;color:#9ca3af;padding:3px 6px'; td0.textContent=r[0];
+    const td1=document.createElement('td'); td1.style.cssText='text-align:right;padding:3px 6px;font-variant-numeric:tabular-nums'; td1.textContent=r[1];
+    const td2=document.createElement('td'); td2.style.cssText='text-align:right;padding:3px 6px;font-variant-numeric:tabular-nums'; td2.textContent=r[2];
+    tr.appendChild(td0); tr.appendChild(td1); tr.appendChild(td2);
+    body.appendChild(tr);
+  });
+}
 // Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades.
 // DISPLAY/ADVISORY-ONLY: it ranks ideas, it never places or changes a trade. Hidden
 // unless the server attaches d.scalp_strategy_advisory (flag SCALP_MAIN_BRAIN_ADVISORY_
@@ -34820,6 +35472,7 @@ function renderMainBrainCognitive(d){
   try{ renderMBEvents(d); }catch(e){}
   try{ renderMBDayType(d); }catch(e){}
   try{ renderMBLearning(d); }catch(e){}
+  try{ renderDualSim(d); }catch(e){}
   try{ renderScalpAdvisory(d); }catch(e){}
 }
 
@@ -41209,6 +41862,7 @@ if __name__ == "__main__":
         _check_scalp_research_db_ready()           # probe scalp_strategy_library/research (no DDL; created via DB tool/publish diff) — RESEARCH/DISPLAY-ONLY
         _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
+        _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
@@ -41229,6 +41883,8 @@ if __name__ == "__main__":
             threading.Thread(target=_recompute_scalp_research, name="scalp-research-warm", daemon=True).start()  # warm the research cache (LIVE instance only; single-flight, throttled, never in the gate path)
         if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
             threading.Timer(0, _scalp_sim_watch_loop).start()  # PAPER live-sim watcher (LIVE instance only; default-OFF flag; resolves paper trades into a SEPARATE table, never the money path)
+        if DUAL_MODE_SHADOW_SIM_ENABLED and DISCORD_LIVE_ENABLED and DUAL_SIM_DB_READY:
+            threading.Timer(0, _dual_sim_watch_loop).start()  # DUAL-MODE shadow-sim watcher (LIVE instance only; default-OFF flag; resolves shadow paper trades into dual_sim_trades, never the money path)
         if training_mode_enabled():
             threading.Timer(0, _training_grade_watch_loop).start()  # BOT TRAINING grade watcher (flag-on/prod only; self-gated on DB-ready; resolves the training ledger via stop-first sim, never the money path)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
