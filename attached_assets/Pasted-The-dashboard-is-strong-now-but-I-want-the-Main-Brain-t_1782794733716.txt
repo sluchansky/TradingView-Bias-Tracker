@@ -1,0 +1,125 @@
+The dashboard is strong now, but I want the Main Brain to become the single final decision engine.
+
+Right now multiple panels can disagree:
+- Main Brain says building long case
+- Structure says bearish
+- Index alignment says bearish
+- Strategy Radar shows long setups
+- Live recommendation says WAIT
+
+That is okay, but the dashboard must explain how those conflicts combine into one final decision.
+
+Please build a “Main Brain Judge” layer at the top of the dashboard.
+
+It should show:
+
+1. FINAL DECISION
+- READY LONG
+- READY SHORT
+- WAIT
+- SKIP
+- MANAGE OPEN TRADE
+
+2. Decision hierarchy
+Example:
+Market structure: Bearish
+Short-term order flow: Bullish
+Strategy signals: 2 long setups
+Risk filters: poor room to zone
+Cross-market alignment: bearish
+Final decision: WAIT
+
+3. Weighted score breakdown
+Show every factor and its point impact:
+- Trend
+- VWAP
+- Demand/Supply zone
+- FVG
+- Order block
+- CHOCH/BOS
+- CVD/Delta
+- RVOL/Volume
+- Index alignment
+- Room to opposing zone
+- Risk/reward
+- News filter
+- Prop firm protection
+
+Example:
+VWAP +12
+Demand +14
+FVG +8
+CHOCH 0
+CVD -8
+Index alignment -12
+Room to zone -18
+Total 55/100
+Decision WAIT
+
+4. Missing confirmations
+Show exactly what is missing and how many points each item would add.
+
+Example:
+Missing:
+CHOCH +25
+CVD agreement +15
+Liquidity sweep +10
+Room to zone +20
+
+Current score: 63
+Ready threshold: 80
+Needed: +17
+
+5. Strategy trust scores
+Each of the 16 strategies should have:
+- Current signal: LONG / SHORT / NEUTRAL
+- Confidence
+- Historical win rate
+- Average R
+- Sample size
+- Trust score
+- Whether the Main Brain accepted or overruled it
+
+Do not treat every strategy equally. Weight strategies higher if they have performed better in similar market conditions.
+
+6. Decision quality tracking
+Track whether WAIT, READY, SKIP, and MANAGE decisions were correct after price develops.
+
+Example:
+Decision: WAIT
+Result: price reversed
+Outcome: correct wait
+
+Decision: WAIT
+Result: price rallied 40 points
+Outcome: missed opportunity
+Lesson: CHOCH threshold may be too strict
+
+7. Fix data consistency
+All panels must use the same source of truth for:
+- price
+- VWAP
+- structure
+- CVD/delta
+- index alignment
+- active instrument
+- current bias
+- final verdict
+
+If CVD is Unknown in one panel, no other panel should claim CVD confirmation unless it explains the fallback/proxy being used.
+
+8. Fix object rendering bug
+Learning Stats currently shows:
+Best setup: [object Object]
+Best window: [object Object]
+Worst window: [object Object]
+
+Render the actual fields instead:
+- name
+- win rate
+- avg R
+- sample size
+- time window
+
+Goal:
+The Main Brain should not just list signals. It should act like a judge/investment committee that weighs all evidence, resolves conflicts, explains why it is waiting or ready, and shows exactly what would change the decision.

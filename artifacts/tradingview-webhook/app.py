@@ -34153,6 +34153,29 @@ function renderMBDayType(d){
   if(cf) cf.textContent=(s&&typeof s.confidence==='number'&&s.confidence)?(s.confidence+'% conf'):'—';
   _anFill('mbd-reasons', (s&&s.reasons)||[]);
 }
+// best_setup/worst_setup are objects {setup_type,win_rate,avg_r,n}; best_window/
+// worst_window are {label,avg_r,win_rate,n}. Render their fields (string-concatenating
+// the object itself printed "[object Object]"). Tolerate a plain string too.
+function _mbSetupStr(x){
+  if(!x) return null;
+  if(typeof x==='string') return x;
+  var t=x.setup_type||x.name||'setup';
+  var bits=[];
+  if(x.win_rate!=null) bits.push(x.win_rate+'%');
+  if(x.avg_r!=null) bits.push(x.avg_r+'R');
+  if(x.n!=null) bits.push('n='+x.n);
+  return t+(bits.length?(' \u00B7 '+bits.join(' \u00B7 ')):'');
+}
+function _mbWindowStr(x){
+  if(!x) return null;
+  if(typeof x==='string') return x;
+  var t=x.label||x.window||'window';
+  var bits=[];
+  if(x.avg_r!=null) bits.push(x.avg_r+'R');
+  if(x.win_rate!=null) bits.push(x.win_rate+'%');
+  if(x.n!=null) bits.push('n='+x.n);
+  return t+(bits.length?(' \u00B7 '+bits.join(' \u00B7 ')):'');
+}
 function renderMBLearning(d){
   const mod=document.getElementById('mod-mb-learning'); if(!mod) return;
   const s=(d&&d.main_brain_learning_stats)||null;
@@ -34164,9 +34187,9 @@ function renderMBLearning(d){
     list.innerHTML='';
     const rows=[];
     if(s&&s.available){
-      if(s.best_setup) rows.push('Best setup: '+s.best_setup);
-      if(s.best_window) rows.push('Best window: '+s.best_window);
-      if(s.worst_window) rows.push('Worst window: '+s.worst_window);
+      var _bs=_mbSetupStr(s.best_setup); if(_bs) rows.push('Best setup: '+_bs);
+      var _bw=_mbWindowStr(s.best_window); if(_bw) rows.push('Best window: '+_bw);
+      var _ww=_mbWindowStr(s.worst_window); if(_ww) rows.push('Worst window: '+_ww);
       if(s.losing_pattern) rows.push('Top loss: '+s.losing_pattern+(s.losing_pattern_n?(' ('+s.losing_pattern_n+')'):''));
       if(s.skip_pattern) rows.push('Top skip: '+s.skip_pattern);
     }
