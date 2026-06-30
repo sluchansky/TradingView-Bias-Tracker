@@ -130,6 +130,11 @@ router.all(
     // paper-graded performance of recorded suggestions.
     "/training/status",
     "/training/metrics",
+    // BOT TRAINING MODE stage control (owner-only; the ONE mutating training route;
+    // NOT in dashboard-auth OPEN_PATHS). POST sets bot_training_state.stage (1-4):
+    // Stage 4 lets live orders reach the broker; 1-3 are suggest-only. Owner-only via
+    // Basic Auth + CSRF here; it only sets the value the existing gate already reads.
+    "/training/stage",
     // TRADING ACADEMY / AI Trading Library (owner-only; LEARNING-ONLY; NOT in
     // dashboard-auth OPEN_PATHS). Knowledge sources + AI extraction + strategy
     // playbook + validation lifecycle + honest backtest links + Q&A. Walled off

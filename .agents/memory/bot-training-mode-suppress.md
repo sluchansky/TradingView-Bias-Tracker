@@ -33,3 +33,10 @@ TWO top causes — check both.
 **To actually trade live (money-path change — confirm with operator first):** either
 advance `bot_training_state.stage` to 4, or remove/zero the `TRAINING_MODE_ENABLED`
 prod env var (gate never called ⇒ legacy live path). Both start placing REAL orders.
+
+**Operator control surface:** the Bot Training panel on the dashboard has a Go-LIVE /
+back-to-Training toggle that sets the stage via `POST /training/stage` (stage 4 vs 1,
+owner-only, browser confirm before each flip, DB-persisted so it survives republish —
+unlike auto-trade arming). Stage<4 demote does NOT close already-open positions. Like
+every dashboard write, the route needs BOTH the Flask handler AND the Express
+`flask-proxy.ts` whitelist (see `proxy-route-whitelist.md`) or the POST 404s.

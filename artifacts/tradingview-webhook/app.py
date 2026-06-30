@@ -30084,6 +30084,7 @@ def training_status():
         "enabled":           enabled,
         "db_ready":          bool(BOT_TRAINING_DB_READY),
         "stage":             stage,
+        "live":              stage >= 4,
         "stage_label":       _TRAINING_STAGE_LABELS.get(stage, "?"),
         "stage_description": _TRAINING_STAGE_DESC.get(stage, ""),
         "desired_market":    (row.get("desired_market") or "MGC"),
@@ -30100,6 +30101,92 @@ def training_metrics():
     """Owner-only, READ-ONLY paper-graded performance of the recorded suggestions
     (overall + per stage/market, best conditions, promotion readiness)."""
     return jsonify(_training_compute_metrics()), 200
+
+
+def _training_set_stage_db(stage, note):
+    """Persist the singleton bot_training_state stage (1..4). NO DDL — UPDATEs the
+    id=1 row and INSERTs it only if missing (so it works regardless of any UNIQUE
+    constraint). Writes ONLY bot_training_state. Returns True on success, False on any
+    DB problem (the caller surfaces the failure; it never silently claims success)."""
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE bot_training_state "
+                "SET stage=%s, updated_at=now(), notes=%s WHERE id=1",
+                (stage, note))
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO bot_training_state (id, stage, updated_at, notes) "
+                    "VALUES (1, %s, now(), %s)",
+                    (stage, note))
+        conn.commit()
+        return True
+    except Exception as exc:
+        logger.error("training stage write failed: %s", exc)
+        try: conn.rollback()
+        except Exception: pass
+        return False
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+@app.route("/training/stage", methods=["POST"])
+def training_set_stage():
+    """Owner-only: manually set the BOT TRAINING stage (1..4) from the dashboard.
+
+    This is the SINGLE runtime control over whether the bot trades live while training
+    mode is on: Stage 4 = Full auto (orders reach the broker through the SAME audited
+    gateway as everything else); Stages 1-3 = suggest-only (every setup is logged/paper
+    graded but NO live order is ever sent). It only sets the value the existing
+    `_training_gate` already reads — it does NOT change the gate logic, scoring, or any
+    safety control. The stage is DB-backed, so unlike auto-trade arming it PERSISTS
+    across restarts/republish; live auto execution still ALSO requires the instrument
+    armed on the live instance. Owner-only (Basic Auth + CSRF via the Express proxy;
+    deliberately NOT in OPEN_PATHS). Fail-closed: a DB failure returns an error and
+    changes nothing."""
+    if not training_mode_enabled():
+        return jsonify({"status": "error",
+            "reason": "Bot Training Mode is not enabled (TRAINING_MODE_ENABLED is unset), "
+                      "so the bot already runs the normal live path — there is no stage to set."}), 400
+    if not BOT_TRAINING_DB_READY:
+        _ensure_bot_training_probe()
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return jsonify({"status": "error",
+            "reason": "Training-state database is unavailable — cannot change the stage."}), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        stage = int(data.get("stage"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "reason": "stage must be an integer 1-4."}), 400
+    if not (1 <= stage <= 4):
+        return jsonify({"status": "error", "reason": "stage must be between 1 and 4."}), 400
+    label = _TRAINING_STAGE_LABELS.get(stage, "?")
+    note  = "Set to Stage %d (%s) from dashboard" % (stage, label)
+    if not _training_set_stage_db(stage, note):
+        return jsonify({"status": "error",
+                        "reason": "Failed to persist the stage change."}), 500
+    _training_state(force=True)  # bust the brief cache so reads reflect immediately
+    logger.warning("BOT TRAINING stage manually set to %d (%s) via dashboard — %s.",
+                   stage, label,
+                   "LIVE orders ENABLED" if stage >= 4 else "suggest-only (no live orders)")
+    try:
+        _record_diagnostic("BOT TRAINING stage set to %d (%s) — %s" % (
+            stage, label,
+            "LIVE orders ENABLED" if stage >= 4 else "suggest-only (no live orders)"))
+    except Exception:
+        pass
+    return jsonify({
+        "status":      "ok",
+        "stage":       stage,
+        "stage_label": label,
+        "live":        stage >= 4,
+    }), 200
 
 
 def execute_trade_gateway(instrument, contracts, source="manual"):
@@ -32508,9 +32595,16 @@ def dashboard():
     <span id="tr-dot" style="color:#6b7280">&#9679;</span> Bot Training Mode
     <span id="tr-stage-badge" style="font-size:10px;color:#6b7280;letter-spacing:1px;float:right"></span>
   </div>
-  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Staged path to autonomy. Every setup is logged and paper-graded; the bot only sends live orders at the stage you have unlocked. DISPLAY-ONLY — promotion is manual.</div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Staged path to autonomy. Every setup is logged and paper-graded; the bot only sends live orders at Stage 4. Use the switch below to go live (Stage 4) or back to suggest-only (Stage 1).</div>
   <div class="nf-status" id="tr-stage-line">—</div>
   <div style="font-size:11px;color:#9aa;margin:4px 0" id="tr-stage-desc"></div>
+  <div id="tr-live-box" style="display:flex;align-items:center;gap:10px;margin:8px 0;padding:8px 10px;border:1px solid var(--line);border-radius:8px">
+    <div style="flex:1;min-width:0">
+      <div style="font-size:12px;font-weight:600" id="tr-live-label">—</div>
+      <div style="font-size:10px;color:#9aa">Stage 4 = real broker orders · Stages 1–3 = suggest-only (no live orders)</div>
+    </div>
+    <button id="tr-live-btn" onclick="toggleTrainingLive()" style="padding:6px 12px;border:none;border-radius:6px;font-weight:700;font-size:12px;cursor:pointer;color:#fff;background:#374151;white-space:nowrap">—</button>
+  </div>
   <div class="cvd-stats" style="margin:6px 0">
     <div class="gstat"><div class="l">Logged</div><div class="v" id="tr-total">—</div></div>
     <div class="gstat"><div class="l">Graded</div><div class="v" id="tr-graded">—</div></div>
@@ -32541,7 +32635,7 @@ def dashboard():
   <div class="nf-status" id="tr-elig">—</div>
   <ul id="tr-elig-list" style="margin:4px 0;padding-left:16px;font-size:11px;color:var(--amber-dim)"></ul>
   <div id="tr-db-warn" style="display:none;font-size:11px;color:#ff8a8a;margin:4px 0">Training database unavailable — metrics paused.</div>
-  <div class="nf-fid">Owner-only · display-only. Stage changes &amp; promotion are manual; nothing here sends or sizes a live order.</div>
+  <div class="nf-fid">Owner-only. Stage changes are manual. At Stage 4 the bot sends REAL broker orders for any armed instrument; Stages 1–3 only log paper suggestions. Live auto execution still also requires the instrument armed on the live instance.</div>
 </div>
 
 <!-- Trade-management analytics (MFE/MAE booleans + commission + oversized-loss).
@@ -35054,12 +35148,60 @@ async function loadTraining(){
   }catch(e){ /* fail-open: keep last painted state */ }
 }
 
+var TR_STAGE = 1;
+function renderTrainingLive(stage){
+  var live = stage>=4;
+  TR_STAGE = stage;
+  var lab=document.getElementById('tr-live-label');
+  if(lab){
+    lab.textContent = live ? '🔴 LIVE — sending real orders' : '🎓 Training — suggest-only (no live orders)';
+    lab.style.color = live ? '#ef4444' : '#7fe9f5';
+  }
+  var box=document.getElementById('tr-live-box');
+  if(box) box.style.borderColor = live ? 'rgba(239,68,68,.5)' : 'var(--line)';
+  var btn=document.getElementById('tr-live-btn');
+  if(btn && !btn.disabled){
+    btn.textContent = live ? 'Switch to Training' : 'Go LIVE (Stage 4)';
+    btn.style.background = live ? '#374151' : '#166534';
+  }
+}
+
+async function toggleTrainingLive(){
+  var goLive = !(TR_STAGE>=4);
+  if(goLive){
+    if(!confirm('Enable LIVE trading (Stage 4)? The bot will place REAL broker orders on every READY setup for any armed instrument. Continue?')) return;
+  } else {
+    if(!confirm('Switch back to Training (Stage 1, suggest-only)? The bot will stop placing live orders and only log paper suggestions.')) return;
+  }
+  var btn=document.getElementById('tr-live-btn');
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{
+    var r=await api('/training/stage', { stage: goLive?4:1 });
+    if(r && r.status==='ok'){
+      toast(r.live ? '🔴 LIVE trading enabled (Stage 4)' : '🎓 Training mode — suggest-only (Stage 1)');
+      if(btn) btn.disabled=false;
+      renderTrainingLive(r.stage);
+      loadTraining();
+    } else {
+      if(btn) btn.disabled=false;
+      toast((r && r.reason) || 'Failed to change mode', false);
+      loadTraining();
+    }
+  }catch(e){
+    if(btn) btn.disabled=false;
+    toast('Failed to change mode', false);
+    loadTraining();
+  }
+}
+
 function renderTraining(s, m){
   var stage=s.stage||1;
-  _trSet('tr-stage-badge', 'STAGE '+stage+' · DISPLAY', '#6b7280');
+  _trSet('tr-stage-badge', stage>=4?'STAGE 4 · LIVE':('STAGE '+stage+' · TRAINING'),
+         stage>=4?'#ef4444':'#6b7280');
   _trSet('tr-stage-line', 'Stage '+stage+' — '+(s.stage_label||'?'),
          stage>=4?'#22c55e':(stage===3?'#f59e0b':'#7fe9f5'));
   _trSet('tr-stage-desc', s.stage_description||'');
+  renderTrainingLive(stage);
   var dot=document.getElementById('tr-dot');
   if(dot) dot.style.color = stage>=4?'#22c55e':(stage>=2?'#f59e0b':'#6b7280');
   var c=s.counts||{};
