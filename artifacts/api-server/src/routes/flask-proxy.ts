@@ -95,6 +95,10 @@ export const BOT1_ROUTES = [
   "/mode",
   "/alerts/mute",
   "/auto-trade",
+  // Live SWING strategy library selector (owner-only money-path control; NOT in
+  // dashboard-auth OPEN_PATHS). DEMOTE-ONLY filter — only narrows which already-READY
+  // SWING setups are taken; never creates a trade or loosens the gate.
+  "/swing-strategy",
   "/advisor",
   "/pro-review",
   "/trade-debate",

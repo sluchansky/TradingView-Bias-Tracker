@@ -497,6 +497,14 @@ SCALP_RR2_ENABLED   = _env_flag_on("SCALP_RR2_ENABLED")
 SCALP_RR2_PRIMARY_R = _env_float("SCALP_RR2_PRIMARY_R", 2.0)
 SCALP_RR2_TP2_R     = _env_float("SCALP_RR2_TP2_R", 2.5)
 SCALP_RR2_RUNNER_R  = _env_float("SCALP_RR2_RUNNER_R", 3.0)
+# Live SWING strategy library (money-path, DEMOTE-ONLY). When ON *and* the bot is in
+# SWING mode (_swing_htf_enabled()) *and* the operator has SELECTED a strategy for an
+# instrument, an Edge-/strict-actionable SWING setup whose pattern does NOT match the
+# selected strategy is demoted READY->WAIT (plan dropped, precise reason). Default OFF
+# => the whole feature is dormant and every path is byte-identical to today (goldens
+# green). It can NEVER create a trade, loosen the gate, or alter stops/targets/sizing
+# — it only NARROWS which already-READY setups are taken. FAIL-CLOSED on any error.
+SWING_STRATEGY_FILTER_ENABLED = _env_flag_on("SWING_STRATEGY_FILTER_ENABLED", default_on=False)
 DUAL_TF_BIAS_TTL_SEC    = 600   # 10 min: a standing bias expires if no entry fires
 # Convergence window: each of the >=2 confirmations must be this fresh (seconds) to
 # count, so an entry fires only when they all land within this window of NOW (=> within
@@ -5851,6 +5859,214 @@ def _swing_entry_veto_reasons(ctx, plan, direction):
         return vetoes
     except Exception as exc:   # FAIL-CLOSED — a broken check must never let a trade through.
         return [("unavailable", f"SWING entry checks errored ({exc})")]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Live SWING strategy library (money-path, DEMOTE-ONLY filter)
+# ───────────────────────────────────────────────────────────────────────────
+# A small registry of well-known SWING entry archetypes. Each `match(ctx, plan,
+# direction)` is a PURE read of the already-computed compute_swing_context fields
+# (1H/4H alignment, daily bias, the nearest daily key level) plus the trade
+# direction — it NEVER fetches data, mutates state, or decides sizing. When the
+# operator selects one (and SWING_STRATEGY_FILTER_ENABLED + SWING mode are on), an
+# actionable setup that does NOT match the selected archetype is demoted to WAIT.
+# Because the filter only ever DEMOTES an already-READY verdict, a buggy predicate
+# can at worst do nothing (leave the base gate's verdict) — it can never create a
+# trade or loosen the gate. The state is in-memory and resets on restart (fail-safe
+# toward NO filtering), mirroring the auto-trade arming domain.
+SWING_STRATEGY_LOCK = threading.Lock()
+SELECTED_SWING_STRATEGY_BY_INST = {}   # {inst: strategy_key}; resets on restart
+
+
+def _swing_nearby_level(ctx):
+    """(side, within_tolerance) for the nearest daily key level, or (None, False)."""
+    nearer = ctx.get("daily_level_nearby") if isinstance(ctx, dict) else None
+    if not isinstance(nearer, dict):
+        return (None, False)
+    return (nearer.get("side"), bool(nearer.get("within_tolerance")))
+
+
+def _swing_match_htf_trend(ctx, plan, direction):
+    """Trade ONLY with the 1H+4H trend (continuation)."""
+    if direction == "Long":
+        return bool(ctx.get("aligned_long"))
+    if direction == "Short":
+        return bool(ctx.get("aligned_short"))
+    return False
+
+
+def _swing_match_trend_pullback(ctx, plan, direction):
+    """Aligned 1H+4H trend AND price pulled back to a daily level on the trade side
+    (long into support, short into resistance)."""
+    side, within = _swing_nearby_level(ctx)
+    if not within:
+        return False
+    if direction == "Long":
+        return bool(ctx.get("aligned_long")) and side == "support"
+    if direction == "Short":
+        return bool(ctx.get("aligned_short")) and side == "resistance"
+    return False
+
+
+def _swing_match_level_reversal(ctx, plan, direction):
+    """Reversal off a daily key level (long at support, short at resistance),
+    trend-agnostic mean reversion."""
+    side, within = _swing_nearby_level(ctx)
+    if not within:
+        return False
+    if direction == "Long":
+        return side == "support"
+    if direction == "Short":
+        return side == "resistance"
+    return False
+
+
+def _swing_match_range_fade(ctx, plan, direction):
+    """Daily bias undecided (neutral) AND fading a daily level (long at support,
+    short at resistance) — range-bound conditions only."""
+    if ctx.get("bias_daily") != "neutral":
+        return False
+    side, within = _swing_nearby_level(ctx)
+    if not within:
+        return False
+    if direction == "Long":
+        return side == "support"
+    if direction == "Short":
+        return side == "resistance"
+    return False
+
+
+def _swing_match_breakout(ctx, plan, direction):
+    """Strong aligned 1H+4H trend with room to run — no OPPOSING daily level sitting
+    within pullback tolerance to block the move."""
+    side, within = _swing_nearby_level(ctx)
+    if direction == "Long":
+        blocked = within and side == "resistance"
+        return bool(ctx.get("aligned_long")) and not blocked
+    if direction == "Short":
+        blocked = within and side == "support"
+        return bool(ctx.get("aligned_short")) and not blocked
+    return False
+
+
+# Ordered registry (insertion order = dashboard display order). Keys are the wire
+# contract for /swing-strategy; labels/descriptions are display-only.
+SWING_STRATEGY_DEFS = {
+    "htf_trend": {
+        "label": "HTF Trend Continuation",
+        "description": "Only take setups aligned with the 1H and 4H trend.",
+        "match": _swing_match_htf_trend,
+    },
+    "trend_pullback": {
+        "label": "Trend Pullback",
+        "description": "Aligned 1H/4H trend, entering on a pullback to a daily level "
+                       "on the trade side.",
+        "match": _swing_match_trend_pullback,
+    },
+    "level_reversal": {
+        "label": "Daily Level Reversal",
+        "description": "Reversal off a daily key level (long at support, short at "
+                       "resistance), regardless of trend.",
+        "match": _swing_match_level_reversal,
+    },
+    "range_fade": {
+        "label": "Range Fade",
+        "description": "Daily bias undecided — fade a daily level back into the range.",
+        "match": _swing_match_range_fade,
+    },
+    "breakout": {
+        "label": "Trend Breakout",
+        "description": "Strong aligned 1H/4H trend with clear room to run (no opposing "
+                       "daily level in the way).",
+        "match": _swing_match_breakout,
+    },
+}
+
+
+def _swing_strategy_filter_enabled():
+    """Master kill-switch for the live SWING strategy library (env, default OFF)."""
+    return bool(SWING_STRATEGY_FILTER_ENABLED)
+
+
+def _swing_strategy_selection(inst):
+    """The currently-selected strategy key for an instrument, or None."""
+    inst = instrument_of(inst) if inst else None
+    if not inst:
+        return None
+    with SWING_STRATEGY_LOCK:
+        return SELECTED_SWING_STRATEGY_BY_INST.get(inst)
+
+
+def _set_swing_strategy_selection(inst, key):
+    """Set (or clear, key=None) the selected strategy for an instrument. Returns the
+    resulting selection. Caller validates `key` against SWING_STRATEGY_DEFS."""
+    inst = instrument_of(inst) if inst else None
+    if not inst:
+        return None
+    with SWING_STRATEGY_LOCK:
+        if key is None:
+            SELECTED_SWING_STRATEGY_BY_INST.pop(inst, None)
+        else:
+            SELECTED_SWING_STRATEGY_BY_INST[inst] = key
+        return SELECTED_SWING_STRATEGY_BY_INST.get(inst)
+
+
+def _swing_strategy_library():
+    """Static, display-safe registry view (key/label/description; no callables)."""
+    return [{"key": k, "label": v["label"], "description": v["description"]}
+            for k, v in SWING_STRATEGY_DEFS.items()]
+
+
+def _empty_swing_strategy_filter_block():
+    """Stable display block (key parity) when the filter is inert."""
+    return {
+        "enabled":        _swing_strategy_filter_enabled(),
+        "armed":          False,
+        "selected_key":   None,
+        "selected_label": None,
+        "matched":        None,
+        "reason":         None,
+        "available":      _swing_strategy_library(),
+    }
+
+
+def _swing_strategy_status(inst):
+    """Display block reflecting only the current SELECTION (no match evaluation) —
+    used for non-actionable / no-selection / market-closed display."""
+    blk = _empty_swing_strategy_filter_block()
+    sel = _swing_strategy_selection(inst)
+    if sel and sel in SWING_STRATEGY_DEFS:
+        blk["armed"]          = True
+        blk["selected_key"]   = sel
+        blk["selected_label"] = SWING_STRATEGY_DEFS[sel]["label"]
+    return blk
+
+
+def _apply_swing_strategy_filter(ctx, plan, direction, inst):
+    """DEMOTE-ONLY money-path filter. Returns (display_block, vetoed_bool). `vetoed`
+    True means: a strategy IS selected and the setup does NOT match it (or the match
+    predicate errored => FAIL-CLOSED demote). No selection => (block, False) =
+    pass-through (no filtering). Never raises."""
+    blk = _empty_swing_strategy_filter_block()
+    sel = _swing_strategy_selection(inst)
+    if not sel or sel not in SWING_STRATEGY_DEFS:
+        return blk, False
+    defn = SWING_STRATEGY_DEFS[sel]
+    blk["armed"]          = True
+    blk["selected_key"]   = sel
+    blk["selected_label"] = defn["label"]
+    try:
+        matched = bool(defn["match"](ctx, plan, direction))
+    except Exception as exc:   # FAIL-CLOSED — a broken predicate must not let a trade through.
+        blk["matched"] = False
+        blk["reason"]  = f"strategy check unavailable ({exc})"
+        return blk, True
+    blk["matched"] = matched
+    if matched:
+        blk["reason"] = f"setup matches '{defn['label']}'"
+        return blk, False
+    blk["reason"] = f"setup does not match the selected strategy '{defn['label']}'"
+    return blk, True
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -15335,6 +15551,46 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 "instrument": active_ticker, "point_value": point_value_for(active_ticker),
             }
 
+    # ── Live SWING strategy library filter (MONEY-PATH, DEMOTE-ONLY) ─────────────
+    # When the operator has SELECTED a swing strategy for this instrument (and the
+    # master flag + SWING mode are on), an actionable setup whose pattern does NOT
+    # match the selected strategy is demoted to WAIT with a precise reason and NO
+    # trade plan — mirroring the SWING veto above so neither the live card nor the
+    # execution gateway (which re-checks is_actionable from THIS verdict) can act on
+    # it. DEMOTE-ONLY: it can never create a trade, loosen the gate, or alter the
+    # geometry/sizing. Gated behind _swing_htf_enabled() AND the flag (default OFF)
+    # so SCALP / flag-off SWING stay byte-identical; FAIL-CLOSED on any error. The
+    # display block is built whenever the gates are on (armed/selection info for the
+    # dashboard) even when no demotion happens.
+    swing_strategy_filter = None
+    if _swing_htf_enabled() and _swing_strategy_filter_enabled():
+        if (is_actionable(verdict) and strict_direction
+                and _swing_strategy_selection(active_ticker)):
+            try:
+                swing_strategy_filter, _ss_veto = _apply_swing_strategy_filter(
+                    swing_ctx, trade_plan, strict_direction, active_ticker)
+            except Exception as exc:   # FAIL-CLOSED — never let a trade through on error.
+                swing_strategy_filter = _empty_swing_strategy_filter_block()
+                swing_strategy_filter["reason"] = f"strategy filter unavailable ({exc})"
+                _ss_veto = True
+            if _ss_veto:
+                verdict       = "WAIT"
+                strict_label  = "WAIT"
+                strict_reason = ("SWING strategy filter: "
+                                 + (swing_strategy_filter.get("reason") or "no match") + ".")
+                trade_plan = {
+                    "trade_plan": False,
+                    "reason":     strict_reason,
+                    "entry_zone": None, "stop_loss": None,
+                    "target1":    None, "target2":   None,
+                    "rr":         None, "direction": strict_direction,
+                    "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+                }
+        else:
+            # Gates on, but nothing to evaluate (not actionable / no selection) — still
+            # surface the armed/selection state for the dashboard.
+            swing_strategy_filter = _swing_strategy_status(active_ticker)
+
     # ── Dual-mode shadow simulator: snapshot the EXACT gate inputs HERE, BEFORE the
     # zone-broken / mitigated overrides below mutate `confidence`, so the webhook
     # observer replays each rulebook's verdict with the same values the gate used.
@@ -16225,6 +16481,11 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["decision_support"]   = _decision_support(result)
         # Strategy engine paused while the market is closed (no live tape).
         result["strategy_engine"]    = _closed_strategy_engine()
+        # SWING strategy library filter neutralised while the market is closed (the
+        # gate is PAUSED, not deleted): show only the armed/selection state, never a
+        # stale "demoted" reason. Gated on the same flags as the open-path attach.
+        if _swing_htf_enabled() and _swing_strategy_filter_enabled():
+            swing_strategy_filter = _swing_strategy_status(active_ticker)
         # 9:30 Breakout Mode paused while the market is closed (key parity w/ open path).
         if BREAKOUT_MODE_ENABLED:
             result["breakout_mode"]  = _breakout_neutral_block(
@@ -16292,6 +16553,16 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if _swing_htf_enabled():
         result["swing_context"] = swing_ctx if isinstance(swing_ctx, dict) else {
             "enabled": True, "complete": False, "stale": True, "error": "compute_failed"}
+
+    # ── Live SWING strategy library filter (DISPLAY surface) ─────────────────
+    # Attached only under SWING + the filter flag (else the key is absent =>
+    # byte-identical). Reuses the block computed once at the seam above (open + closed
+    # paths both land here); falls back to a stable status block if that precompute
+    # did not run (e.g. a verdict path that skipped the seam).
+    if _swing_htf_enabled() and _swing_strategy_filter_enabled():
+        result["swing_strategy_filter"] = (
+            swing_strategy_filter if isinstance(swing_strategy_filter, dict)
+            else _swing_strategy_status(active_ticker))
 
     # ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────
     # SINGLE computation point, AFTER every verdict override above (open, vetoed and
@@ -28560,6 +28831,7 @@ def status():
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
         "swing_diagnostics":   _swing_diag_block(a),
+        "swing_strategy_filter": a.get("swing_strategy_filter"),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
         "breakout_mode":       a.get("breakout_mode"),
@@ -33445,6 +33717,21 @@ def dashboard():
   <div class="se-reason" id="swd-exit"></div>
 </div>
 
+<!-- Live SWING Strategy library selector (money-path DEMOTE-ONLY; hidden unless SWING + SWING_STRATEGY_FILTER_ENABLED) -->
+<div class="mod" id="mod-swingstrat" style="display:none">
+  <div class="mod-h">🎯 SWING Strategy <span id="sws-status" style="font-size:10px;letter-spacing:1px"></span></div>
+  <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Only take SWING setups matching the selected strategy. Demote-only — it narrows which READY setups are taken; never creates a trade, loosens the gate, or changes stops/targets/size.</div>
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span style="font-size:11px;color:#6b7280" id="sws-inst-lbl">—</span>
+    <select id="sws-select" onchange="setSwingStrategy(this.value)" style="flex:1;min-width:160px;background:#15151f;color:#e8e8f0;border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:12px">
+      <option value="">Any (no filter)</option>
+    </select>
+  </div>
+  <div class="se-bias-h">Match Status</div>
+  <div class="se-reason" id="sws-reason">—</div>
+  <div id="sws-desc" style="font-size:11px;color:#6b7280;margin-top:6px"></div>
+</div>
+
 <!-- Multi-strategy engine (Phase 1 — display-only; existing gate stays authoritative) -->
 <div class="mod mb-hidden" id="mod-strategy">
   <div class="mod-h">🎛️ Strategy Engine <span id="se-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
@@ -34426,6 +34713,21 @@ function toggleEmergency(inst){
     .catch(function(){ if (SAFETY_STATE[inst]) SAFETY_STATE[inst].emergencyDisabled = cur; renderEmergencyUI(); toast('Execution update failed', false); });
 }
 
+// Live SWING strategy selector for the CURRENTLY-VIEWED instrument (sym). Posts the
+// per-instrument selection to /swing-strategy; empty value clears it (= no filter).
+// DEMOTE-ONLY on the server — this can only narrow which READY SWING setups are
+// taken, never create a trade or loosen the gate.
+function setSwingStrategy(value){
+  const inst = sym;
+  api('/swing-strategy', { instrument: inst, strategy: value || null })
+    .then(function(d){
+      if (!d || d.status !== 'ok'){ toast('SWING strategy update failed', false); return; }
+      toast(value ? (inst + ' SWING strategy set') : (inst + ' SWING strategy cleared'));
+      refreshRec();   // repaint immediately with the new selection's match status
+    })
+    .catch(function(){ toast('SWING strategy update failed', false); });
+}
+
 function renderAdvisorUI(){
   const el = document.getElementById('advisor-toggle');
   if(!el) return;
@@ -34947,6 +35249,63 @@ function renderModules(d){
         const st = swd.thesis_status;
         swst.textContent = st || (swd.has_thesis ? '' : 'NO TRADE');
         swst.style.color = st==='VALID'?'#22c55e':st==='WEAKENING'?'#f59e0b':st==='INVALID'?'#ef4444':'#6b7280';
+      }
+    }
+  }
+
+  // ── Module: Live SWING Strategy library selector (MONEY-PATH, DEMOTE-ONLY) ──
+  //    Hidden unless SWING + SWING_STRATEGY_FILTER_ENABLED (the result key is then
+  //    absent). The dropdown is populated from the library carried in /status; the
+  //    match status reflects the gate's own evaluation for the viewed instrument.
+  const swf = d.swing_strategy_filter || null;
+  const swfMod = document.getElementById('mod-swingstrat');
+  if (swfMod){
+    if (!swf || !swf.enabled){
+      swfMod.style.display = 'none';
+    } else {
+      swfMod.style.display = '';
+      const sel = document.getElementById('sws-select');
+      if (sel){
+        const avail = swf.available || [];
+        const sig = avail.map(function(o){ return o.key; }).join(',');
+        if (sel.getAttribute('data-sig') !== sig){
+          let html = '<option value="">Any (no filter)</option>';
+          avail.forEach(function(o){
+            html += '<option value="'+_modEsc(o.key)+'">'+_modEsc(o.label)+'</option>';
+          });
+          sel.innerHTML = html;
+          sel.setAttribute('data-sig', sig);
+        }
+        // Reflect the server's current selection, but never clobber the dropdown
+        // while the user is actively interacting with it.
+        if (document.activeElement !== sel){ sel.value = swf.selected_key || ''; }
+      }
+      const instLbl = document.getElementById('sws-inst-lbl');
+      if (instLbl) instLbl.textContent =
+        (d.active_ticker ? String(d.active_ticker).replace('1!','') : sym) + ':';
+      const st = document.getElementById('sws-status');
+      if (st){
+        if (swf.armed){
+          const m = swf.matched;
+          st.textContent = m===true ? 'MATCH' : m===false ? 'FILTERED' : 'ARMED';
+          st.style.color  = m===true ? '#22c55e' : m===false ? '#ef4444' : '#f59e0b';
+        } else {
+          st.textContent = 'OFF';
+          st.style.color  = '#6b7280';
+        }
+      }
+      const rEl = document.getElementById('sws-reason');
+      if (rEl) rEl.innerHTML = swf.reason
+        ? _modEsc(swf.reason)
+        : (swf.armed ? '—' : 'No strategy selected — all READY SWING setups are taken.');
+      const dEl = document.getElementById('sws-desc');
+      if (dEl){
+        let desc = '';
+        if (swf.selected_key){
+          const found = (swf.available||[]).find(function(o){ return o.key===swf.selected_key; });
+          if (found) desc = found.description || '';
+        }
+        dEl.textContent = desc;
       }
     }
   }
@@ -40231,6 +40590,56 @@ def auto_trade_toggle():
         "is_live_instance":         DISCORD_LIVE_ENABLED,
         "max_per_day":              AUTO_TRADE_MAX_PER_DAY,
         "contracts":                AUTO_TRADE_CONTRACTS,
+    }), 200
+
+
+@app.route("/swing-strategy", methods=["GET", "POST"])
+def swing_strategy_select():
+    """Read or set the per-instrument LIVE SWING strategy selection (MGC / MNQ / …).
+
+    When the master flag (SWING_STRATEGY_FILTER_ENABLED) is ON and the bot is in
+    SWING mode, selecting a strategy makes the gate DEMOTE any already-actionable
+    SWING setup whose pattern does NOT match the selected strategy (READY -> WAIT,
+    trade_plan dropped). This NEVER creates a trade, loosens the gate, or alters
+    stops/targets/sizing — it only narrows which READY setups are taken. Selection is
+    in-memory per-instrument and RESETS on restart/republish (fail-safe toward the
+    unfiltered legacy behaviour). Owner-only (Basic Auth + CSRF via the Express
+    proxy; deliberately NOT in OPEN_PATHS).
+
+    POST {instrument|inst|ticker, strategy|key}: `strategy` must be a key of
+    SWING_STRATEGY_DEFS, or one of null/""/none/off/clear to CLEAR the selection.
+    GET (and POST) return the full status view (enabled flag, library, selections)."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        inst = _instrument_from_text(
+            data.get("instrument") or data.get("inst") or data.get("ticker"))
+        if inst is None:
+            return jsonify({"status": "error",
+                            "reason": "instrument must be one of MGC, MNQ, MES, or MYM."}), 400
+        raw = data.get("strategy")
+        if raw is None:
+            raw = data.get("key")
+        key = None
+        if raw is not None:
+            s = str(raw).strip().lower()
+            if s in ("", "none", "null", "off", "clear", "any", "all"):
+                key = None
+            elif s in SWING_STRATEGY_DEFS:
+                key = s
+            else:
+                return jsonify({
+                    "status": "error",
+                    "reason": "strategy must be one of "
+                              + ", ".join(SWING_STRATEGY_DEFS.keys())
+                              + " (or null/none/off/clear to clear).",
+                }), 400
+        _set_swing_strategy_selection(inst, key)
+        logger.info("SWING strategy for %s set to %s", inst, key or "(cleared)")
+    return jsonify({
+        "status":   "ok",
+        "enabled":  _swing_strategy_filter_enabled(),
+        "library":  _swing_strategy_library(),
+        "selected": {i: _swing_strategy_selection(i) for i in enabled_instruments()},
     }), 200
 
 
