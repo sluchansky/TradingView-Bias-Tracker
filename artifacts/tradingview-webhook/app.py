@@ -28481,6 +28481,276 @@ def _live_runner_watch_loop():
         threading.Timer(LIVE_RUNNER_WATCH_INTERVAL_SEC, _live_runner_watch_loop).start()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# BOT TRAINING MODE — staged validation toward autonomy (safety gate + ledger)
+# ════════════════════════════════════════════════════════════════════════════
+# Purpose: TRAIN / VALIDATE the bot through four staged gates rather than freeze it.
+#   Stage 1  Suggest-only   — bot makes calls, NO live order; record would-be hits.
+#   Stage 2  Approval req.   — order prepared, owner must approve before it sends.
+#   Stage 3  Limited auto    — one market, capped risk, few trades/session, halt on losses.
+#   Stage 4  Full auto       — unlocked only after the recorded data proves out.
+#
+# The ONLY money-path effect is _training_gate() inside execute_trade_gateway: it can
+# SUPPRESS a send (stages 1-3) or, later, BLOCK an over-limit send (stage 3). It NEVER
+# creates, resizes, or reroutes an order, and it shares the single gateway (no parallel
+# money path). FLAG-OFF (TRAINING_MODE_ENABLED unset) => the gate is never called =>
+# behaviour is byte-identical to legacy (goldens/parity unaffected). FAIL-CLOSED while
+# enabled: if the DB-backed stage can't be read, the gateway refuses to send (treated
+# as Stage 1 suggest-only). The bot_training_state / bot_training_trades tables are
+# created OUT-OF-BAND (database tool in dev, Publish schema-diff in prod) — NO app-side
+# DDL, matching the learning-engine convention.
+TRAINING_MODE_ENABLED_RAW = os.environ.get("TRAINING_MODE_ENABLED", "").strip().lower()
+TRAINING_REC_DEDUP_SEC    = _env_float("TRAINING_REC_DEDUP_SEC", 120)  # collapse re-evaluated suggestions
+BOT_TRAINING_DB_READY     = False
+_TRAINING_STATE_TTL       = 5.0          # seconds; promotion is rare, a short cache is plenty
+_TRAINING_STATE_LOCK      = threading.Lock()
+_TRAINING_STATE_CACHE     = {"row": None, "ts": 0.0}
+_TRAINING_REC_LOCK        = threading.Lock()
+_TRAINING_REC_LAST        = {}           # inst -> (fingerprint, monotonic ts)
+
+
+def training_mode_enabled():
+    """Master flag. DEFAULT OFF (unset => legacy, byte-identical). Set
+    TRAINING_MODE_ENABLED=1 in production to put the bot into staged training."""
+    return TRAINING_MODE_ENABLED_RAW in ("1", "true", "yes", "on")
+
+
+def _check_bot_training_db_ready():
+    """Probe bot_training_state / bot_training_trades (NO DDL). FAIL-OPEN for the
+    readiness flag itself; the money-path caller treats 'enabled but not ready' as
+    fail-CLOSED (suppress the send)."""
+    global BOT_TRAINING_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM bot_training_state LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM bot_training_trades LIMIT 1")
+            cur.fetchone()
+        BOT_TRAINING_DB_READY = True
+        logger.info("bot_training_* tables ready")
+    except Exception as exc:
+        logger.warning("bot_training tables unavailable (training persistence disabled): %s", exc)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+_BOT_TRAINING_PROBE_LOCK      = threading.Lock()
+_BOT_TRAINING_PROBE_TS        = 0.0
+_BOT_TRAINING_PROBE_RETRY_SEC = 30.0
+
+
+def _ensure_bot_training_probe():
+    """Lazily run the readiness probe if boot didn't (the boot probes live under
+    `if __name__ == '__main__'`, so a production launch that imports app as a module
+    — e.g. a WSGI server — would never set BOT_TRAINING_DB_READY and the ledger would
+    capture nothing even though the gate still fails CLOSED). Cheap + idempotent;
+    throttled so a genuinely-missing table doesn't re-probe on every webhook. Only
+    ever reached from _training_gate (i.e. when training_mode_enabled())."""
+    global _BOT_TRAINING_PROBE_TS
+    if BOT_TRAINING_DB_READY:
+        return
+    nowm = time.monotonic()
+    with _BOT_TRAINING_PROBE_LOCK:
+        if BOT_TRAINING_DB_READY:
+            return
+        if (nowm - _BOT_TRAINING_PROBE_TS) < _BOT_TRAINING_PROBE_RETRY_SEC:
+            return
+        _BOT_TRAINING_PROBE_TS = nowm
+    _check_bot_training_db_ready()
+
+
+def _training_state(force=False):
+    """Singleton bot_training_state row as a dict (briefly cached). Returns None on
+    any DB failure so money-path callers fail CLOSED."""
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return None
+    nowm = time.monotonic()
+    with _TRAINING_STATE_LOCK:
+        cached = _TRAINING_STATE_CACHE["row"]
+        if (not force) and cached is not None and (nowm - _TRAINING_STATE_CACHE["ts"]) < _TRAINING_STATE_TTL:
+            return dict(cached)
+    conn = _learning_conn()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id, stage, desired_market, promoted_by, promoted_at, "
+                        "updated_at, notes FROM bot_training_state WHERE id = 1")
+            row = cur.fetchone()
+        if row is not None:
+            row = dict(row)
+            with _TRAINING_STATE_LOCK:
+                _TRAINING_STATE_CACHE["row"] = dict(row)
+                _TRAINING_STATE_CACHE["ts"]  = nowm
+        return row
+    except Exception as exc:
+        logger.warning("training state read failed: %s", exc)
+        return None
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+def training_stage():
+    """Active stage 1..4. FAIL-CLOSED: any DB / parse problem => Stage 1 (the safest
+    stage — suggest-only, never sends)."""
+    row = _training_state()
+    if not row:
+        return 1
+    try:
+        s = int(row.get("stage") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return s if 1 <= s <= 4 else 1
+
+
+def training_desired_market():
+    """Stage-3 single allowed market, resolved STRICTLY to a known instrument.
+    Defaults to MGC; returns None on an unrecognised value (caller fails closed)."""
+    row = _training_state() or {}
+    raw = (row.get("desired_market") or "MGC")
+    if raw in ASSETS:
+        return raw
+    return _instrument_from_text(str(raw))
+
+
+def _training_fingerprint(inst, intent):
+    """Stable per-setup key so the same suggestion re-evaluated on every webhook is
+    collapsed into one ledger row (within TRAINING_REC_DEDUP_SEC)."""
+    try:
+        return "%s:%s:%.1f:%.1f:%.1f" % (
+            inst, (intent.get("action") or "?"),
+            float(intent.get("entry") or 0.0),
+            float(intent.get("stop") or 0.0),
+            float(intent.get("target1") or 0.0))
+    except Exception:
+        return "%s:%s" % (inst, (intent.get("action") or "?"))
+
+
+def _record_training_call(inst, intent, plan_public, source, stage, status, fingerprint=None):
+    """Append ONE row to bot_training_trades. FAIL-OPEN: a logging failure NEVER
+    blocks or alters the safety decision. Offloaded to the slow-task worker so a DB
+    stall never delays a trade decision."""
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return
+    try:
+        risk_pts = abs(float(intent.get("entry")) - float(intent.get("stop")))
+        risk_dollars = round(risk_pts * point_value_for(inst) * int(intent.get("quantity") or 1), 2)
+    except Exception:
+        risk_dollars = None
+    snap = {
+        "ts":           now_utc().isoformat(),
+        "stage":        int(stage),
+        "session_key":  fmt_et(now_utc(), "%Y-%m-%d"),
+        "market":       inst,
+        "source":       source,
+        "direction":    intent.get("direction"),
+        "entry":        intent.get("entry"),
+        "stop":         intent.get("stop"),
+        "target":       intent.get("target1"),
+        "target2":      intent.get("target2"),
+        "contracts":    intent.get("quantity"),
+        "planned_risk_dollars": risk_dollars,
+        "status":       status,
+        "fingerprint":  fingerprint,
+    }
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO bot_training_trades
+                       (ts, stage, session_key, market, source, direction,
+                        entry, stop, target, target2, contracts,
+                        planned_risk_dollars, status, fingerprint)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (snap["ts"], snap["stage"], snap["session_key"], snap["market"],
+                     snap["source"], snap["direction"], snap["entry"], snap["stop"],
+                     snap["target"], snap["target2"], snap["contracts"],
+                     snap["planned_risk_dollars"], snap["status"], snap["fingerprint"]),
+                )
+        except Exception as exc:
+            logger.warning("training trade record failed: %s", exc)
+        finally:
+            try: conn.close()
+            except Exception: pass
+
+    _enqueue_slow(_task)
+
+
+def _training_record_once(inst, intent, plan_public, source, stage, status):
+    """Record a training call, deduped per-instrument within TRAINING_REC_DEDUP_SEC so
+    Stage-1/2 re-evaluation on every inbound webhook doesn't spam the ledger."""
+    fp = _training_fingerprint(inst, intent)
+    nowm = time.monotonic()
+    with _TRAINING_REC_LOCK:
+        prev = _TRAINING_REC_LAST.get(inst)
+        if prev and prev[0] == fp and (nowm - prev[1]) < TRAINING_REC_DEDUP_SEC:
+            return False
+        _TRAINING_REC_LAST[inst] = (fp, nowm)
+    _record_training_call(inst, intent, plan_public, source, stage, status, fingerprint=fp)
+    return True
+
+
+def _training_suppressed_result(intent, plan_public, stage, reason):
+    """The canonical 'no live order placed' gateway result for a suppressed training
+    suggestion. status 'manual_required' so the auto path treats it as a clean no-op
+    (no ACTIVE_TRADE, no broker contact) and the manual route shows the suggestion."""
+    return {
+        "status":  "manual_required",
+        "provider": (intent or {}).get("provider"),
+        "mode":     (intent or {}).get("mode"),
+        "broker_verify_required": False,
+        "training": {"enabled": True, "stage": stage, "action": "suppressed", "reason": reason},
+        "message":  "BOT TRAINING (Stage %s): suggestion logged, NO live order placed." % stage,
+        "plan":     plan_public,
+    }, 200
+
+
+def _training_gate(intent, plan_public, instrument, direction, source):
+    """Single money-path training chokepoint, invoked inside execute_trade_gateway
+    AFTER the server-authoritative plan is built and BEFORE any broker send / dedupe
+    reservation. Only called when training_mode_enabled().
+
+    Returns (result_dict, http_code) to SHORT-CIRCUIT the gateway (suppress the send),
+    or None to FALL THROUGH to the normal send path.
+
+    FAIL-CLOSED: if the DB-backed stage is unreadable, suppress (treat as Stage 1).
+    Phase 1 scope: stages 1/2/3 all SUPPRESS (suggest-only); stage 4 falls through to
+    the existing full-auto money path. The real Stage-2 approval flow and Stage-3 caps
+    are layered on in later tasks; until then the bot never sends below Stage 4."""
+    # Boot may not have run the readiness probe (it lives under __main__); probe lazily.
+    if not BOT_TRAINING_DB_READY:
+        _ensure_bot_training_probe()
+
+    # Fail-closed when the ledger/state is unavailable.
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        logger.warning("TRAINING: state DB unavailable — suppressing send (fail-closed, Stage 1).")
+        return _training_suppressed_result(intent, plan_public, 1,
+            "training state unavailable — suggest-only (fail-closed)")
+
+    stage = training_stage()
+
+    if stage >= 4:
+        # Full auto: record the call, then fall through to the unchanged money path.
+        _training_record_once(instrument, intent, plan_public, source, stage, "auto_passthrough")
+        return None
+
+    # Stages 1/2/3 (Phase 1): suggest-only — record the would-be trade, never send.
+    _training_record_once(instrument, intent, plan_public, source, stage, "suggested")
+    return _training_suppressed_result(intent, plan_public, stage,
+        "Stage %d: suggest-only — no live order placed." % stage)
+
+
 def execute_trade_gateway(instrument, contracts, source="manual"):
     """Shared, server-authoritative execution gate behind /traderspost AND the
     auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
@@ -28797,6 +29067,15 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
             try: _record_diagnostic("%s | PROP guard blocked live order — %s" % (instrument, _reason))
             except Exception: pass
             return {"status": "error", "reason": _reason, "prop_guard": prop_guard}, 409
+
+    # ── BOT TRAINING MODE gate (single money-path chokepoint) ────────────────────
+    # When training is enabled this can SUPPRESS the send (stages 1-3) before any
+    # broker contact or dedupe reservation; it never creates, resizes, or reroutes an
+    # order. OFF (TRAINING_MODE_ENABLED unset) => never called => byte-identical.
+    if training_mode_enabled():
+        _tg = _training_gate(intent, plan_public, instrument, direction, source)
+        if _tg is not None:
+            return _tg
 
     # ── manual_only: NEVER contacts a broker. Returns the exact server-authoritative
     #    plan so the owner can place it by hand (the safe default when nothing is set).
@@ -37615,6 +37894,7 @@ if __name__ == "__main__":
         _check_scalp_research_db_ready()           # probe scalp_strategy_library/research (no DDL; created via DB tool/publish diff) — RESEARCH/DISPLAY-ONLY
         _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
+        _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
