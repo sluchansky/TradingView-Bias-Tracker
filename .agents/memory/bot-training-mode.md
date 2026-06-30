@@ -47,3 +47,50 @@ smoke that simulates "DB down" by setting `BOT_TRAINING_DB_READY=False` must als
 ## Max-loss policy
 Keep the existing tighter $100/trade default; clamp the training cap to <= $200
 (`TRAINING_MAX_RISK_DOLLARS`). Never raise the live default.
+
+## Grading watcher (T003) — DISPLAY/ANALYTICS-ONLY
+- `_watch_training_trades` resolves recorded suggestions into the ledger; it writes
+  ONLY the grading columns of `bot_training_trades` (sim_outcome, *_hit_at, grade_json)
+  and NEVER touches MANAGED_TRADES / strategy_trades / the money path. Own timer
+  (`_training_grade_watch_loop`), self-gated on `training_mode_enabled()` + DB-ready +
+  single-flight, so dev / flag-off never grade → byte-identical (the boot timer is only
+  registered when the flag is on; goldens never run the boot block anyway).
+- `_training_grade_call` reuses `_scalp_sim_outcome` STOP-FIRST (worst-case) and models
+  the suggestion as a MARKET fill at `entry` (so entry_hit is always true; entry_hit_at
+  = COALESCE(entry_hit_at, ts)). Past `TRAINING_GRADE_MAX_HOLD_HOURS` with no level hit →
+  `expired` at the close, timing early(favorable)/late(unfavorable).
+- **There is NO `r_multiple` column** — R + exit_price + timing + direction_correct live
+  inside `grade_json` (jsonb via `psycopg2.extras.Json`); only the label goes in
+  `sim_outcome`.
+- The UPDATE's `WHERE sim_outcome IS NULL` IS the cross-instance claim (dev+prod share
+  the DB) — first writer wins, racer no-ops. Same-bar guard skips a bar that opened
+  at/before `ts` (no look-ahead self-fill), mirroring the scalp sim. FAIL-OPEN.
+
+## Proof metrics + read endpoints (T004) — DISPLAY/READ-ONLY
+- `GET /training/status` (controller state: enabled, stage + label/description,
+  desired_market, db_ready, counts {total,graded,pending}) and `GET /training/metrics`
+  (paper-graded performance) are owner-only and whitelisted in BOTH `flask-proxy.ts`
+  AND mounted under `/api` (so the live URL is `/api/training/status`); they are NOT in
+  dashboard-auth `OPEN_PATHS` (auth required). Raw `curl $REPLIT_DEV_DOMAIN/...` returns
+  `000` — the preview proxy is mTLS, so verify endpoints via the Flask test client, not curl.
+- Math lives in pure helpers so it is unit-testable without a DB: `_tr_grade` coerces
+  `grade_json` whether it arrives as a dict OR a JSON string (DB vs. test); `_training_agg`
+  computes win_rate over DECIDED (win+loss, excludes expired), but PF / expectancy /
+  maxDD / avg-win / avg-loss / direction_accuracy over ALL numeric R (expired included).
+  PF of a loss-only group is `0.0`; PF is `None` ONLY when there is zero R data; a
+  no-loss group caps PF at `99.0`.
+- `_training_compute_metrics` runs ONE SELECT of graded rows ordered by
+  `COALESCE(entry_hit_at, ts)`, then buckets overall + per_stage + per_market, and ranks
+  best/worst setup + best market + best ET-hour window. Ranking groups must clear
+  `TRAINING_MIN_GROUP_N` (default 3) or they are excluded (so one lucky trade can't be
+  "best"); a too-small group → that ranking key is `None`.
+- Promotion thresholds are env-tunable via `_training_promotion_thresholds()`
+  (`TRAINING_PROMOTE_MIN_TRADES`=20 / `_MIN_WIN_RATE`=50 / `_MIN_PF`=1.3 / `_MAX_DD_R`=6);
+  eligibility returns 4 labelled pass/fail checks + an `eligible` bool. T004 only
+  COMPUTES eligibility (display); actual promotion is T006.
+- Dashboard `#mod-training` panel is hidden (`display:none`) until `/training/status`
+  reports `enabled` — populated by `loadTraining()` (registered in the 3s poll + one
+  immediate call), render is `textContent`/`_anFill` only (no innerHTML). Verified by
+  `check_training_metrics.sh` (training_metrics_smoke.py 40 checks INCL a money-path
+  tripwire that fails if either endpoint calls `_send_broker_order`, + a node --check of
+  the SERVED dashboard `<script>`).

@@ -125,6 +125,11 @@ router.all(
     // dashboard-auth OPEN_PATHS). GET = cached research view; POST = trigger recompute.
     // Walled off from the live money path — new strategies never auto-trade live.
     "/scalp-research",
+    // BOT TRAINING MODE proof metrics (owner-only; DISPLAY/READ-ONLY; NOT in
+    // dashboard-auth OPEN_PATHS). Never sends or mutates — staged-controller state +
+    // paper-graded performance of recorded suggestions.
+    "/training/status",
+    "/training/metrics",
   ],
   proxyToFlask,
 );

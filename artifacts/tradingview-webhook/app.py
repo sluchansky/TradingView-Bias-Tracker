@@ -1608,6 +1608,23 @@ OVERSIZED_LOSS_MULT               = max(1.0, float(os.environ.get("OVERSIZED_LOS
 SESSION_QUALITY_ENABLED           = os.environ.get("SESSION_QUALITY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 BOT_HOLD_SCORE_ENABLED            = os.environ.get("BOT_HOLD_SCORE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
+# ── Active Trade Management (ADVISORY / DISPLAY-ONLY, default ON) ──────────────
+# After the bot enters/suggests a trade, continuously re-evaluate the OPEN position
+# on the dashboard's /status poll and surface a 0-100 health score + thesis status
+# (VALID/WEAKENING/INVALID) + hold reason + exit-warning + a suggested action
+# (HOLD / MOVE STOP / EXIT EARLY / TAKE PARTIAL) so a stalled or invalidated trade
+# can be scratched early instead of waiting for the full stop. STRICTLY advisory:
+# it NEVER closes a position, sends a broker order, or touches the gate / sizing /
+# dedupe / money path (the user closes trades themselves). Kill-switch:
+# ACTIVE_TRADE_MGMT_ENABLED=0/off. Goldens are unaffected (display-only).
+ACTIVE_TRADE_MGMT_ENABLED         = os.environ.get("ACTIVE_TRADE_MGMT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+# Stall proxy: an open position held at least this many minutes while sitting within
+# ACTIVE_TRADE_STALL_R of entry (no meaningful progress) is flagged STALLED. True
+# candle-by-candle progress needs per-position history we don't keep, so this is an
+# honest held-time + current-R proxy (suppressed while the market is closed/paused).
+ACTIVE_TRADE_STALL_MIN            = max(1, int(os.environ.get("ACTIVE_TRADE_STALL_MIN", "20")))
+ACTIVE_TRADE_STALL_R              = max(0.01, float(os.environ.get("ACTIVE_TRADE_STALL_R", "0.25") or 0.25))
+
 # ── Simulation realism overlay (DISPLAY-ONLY, default ON) ─────────────────────
 # The dashboard scoreboard is a proxy-feed SIMULATION with idealized fills (exits
 # land exactly at target/stop and cost nothing), so it reads far rosier than the
@@ -21359,12 +21376,18 @@ def compute_manual_trade_management(trade, analysis=None):
     out["current_r"]         = round(current_r, 2)
     out["risk_points"]       = round(risk, 2)
 
+    # compute_distances needs a non-None target2; bot positions (SWING 1:1, or a SCALP
+    # before TP2 is set) can carry target2=None. Fall back to target1 for the DISTANCE
+    # math only — t2_hit below still reads the real (possibly None) target2, so an
+    # absent TP2 honestly reports dist_to_target2=None and target2_hit=False.
+    _t2_dist = trade.get("target2")
     dist_trade = {"direction": direction, "target1": trade.get("target1"),
-                  "target2": trade.get("target2"), "stop_loss": stop}
+                  "target2": _t2_dist if _t2_dist is not None else trade.get("target1"),
+                  "stop_loss": stop}
     to_t1, to_t2, to_stop = compute_distances(dist_trade, price)
     out["dist_to_stop"]    = round(to_stop, 2)
     out["dist_to_target1"] = round(to_t1, 2)
-    out["dist_to_target2"] = round(to_t2, 2)
+    out["dist_to_target2"] = round(to_t2, 2) if _t2_dist is not None else None
     t3_val = trade.get("target3")
     if t3_val is not None:
         out["dist_to_target3"] = round((t3_val - price) if is_long else (price - t3_val), 2)
@@ -21669,6 +21692,31 @@ def _newest_manual_trade_for(inst):
     return best
 
 
+def _bot_trade_mgmt_mirror(inst, at):
+    """Throwaway manual-trade-shaped COPY of ONE tracked bot position, for the read-only
+    manual-management engine (compute_manual_trade_management writes min_r/max_r back
+    onto the dict it is handed). NEVER pass the live ACTIVE_TRADE object in — always this
+    copy. DISPLAY-ONLY: shared by the Trade Monitor mirror and the Active Trade Mgmt
+    advisory so both feed identical field names."""
+    opened = at.get("opened_at") or ""
+    return {
+        "id":          "bot-%s-%s" % (inst, opened or uuid.uuid4().hex[:8]),
+        "symbol":      at.get("symbol") or inst,
+        "direction":   at.get("direction", "Long"),
+        "entry_price": at.get("entry_price"),
+        "stop_loss":   at.get("stop_loss"),
+        "target1":     at.get("target1"),
+        "target2":     at.get("target2"),
+        "target3":     at.get("target3"),
+        "contracts":   at.get("contracts"),
+        "mode":        at.get("mode") or TRADING_MODE,
+        "reason":      "",
+        "entry_time":  opened or None,
+        "opened_at":   opened or now_utc().isoformat(),
+        "status":      "open",
+    }
+
+
 def _bot_active_trade_monitor_items(analysis_cache):
     """ADVISORY DISPLAY mirror of the bot's own OPEN positions (ACTIVE_TRADES_BY_INST),
     rendered in the SAME shape as the manual monitor rows so a bot-executed order shows
@@ -21689,23 +21737,7 @@ def _bot_active_trade_monitor_items(analysis_cache):
         if not at:
             continue
         try:
-            opened = at.get("opened_at") or ""
-            mirror = {
-                "id":          "bot-%s-%s" % (inst, opened or uuid.uuid4().hex[:8]),
-                "symbol":      at.get("symbol") or inst,
-                "direction":   at.get("direction", "Long"),
-                "entry_price": at.get("entry_price"),
-                "stop_loss":   at.get("stop_loss"),
-                "target1":     at.get("target1"),
-                "target2":     at.get("target2"),
-                "target3":     at.get("target3"),
-                "contracts":   at.get("contracts"),
-                "mode":        at.get("mode") or TRADING_MODE,
-                "reason":      "",
-                "entry_time":  opened or None,
-                "opened_at":   opened or now_utc().isoformat(),
-                "status":      "open",
-            }
+            mirror = _bot_trade_mgmt_mirror(inst, at)
             sym = mirror["symbol"]
             if sym not in analysis_cache:
                 try:
@@ -21732,6 +21764,16 @@ def _bot_hold_verdict(score):
 
 
 def _compute_bot_hold_score(at, analysis=None):
+    """Flag-gated public wrapper around _bot_hold_score_core(). Returns None when
+    BOT_HOLD_SCORE_ENABLED is OFF; otherwise the read-only hold-conviction score.
+    Kept as a thin wrapper so the Active Trade Management advisory can reuse the SAME
+    health blend (_bot_hold_score_core) without requiring the BOT_HOLD_SCORE flag."""
+    if not BOT_HOLD_SCORE_ENABLED:
+        return None
+    return _bot_hold_score_core(at, analysis=analysis)
+
+
+def _bot_hold_score_core(at, analysis=None):
     """ADVISORY (DISPLAY-only) hold-conviction score for ONE open bot position.
 
     Blends read-only live signals — VWAP alignment, CVD-delta, structure, volume,
@@ -21742,9 +21784,8 @@ def _compute_bot_hold_score(at, analysis=None):
     plus an OPTIONAL full_analysis snapshot for structure / liquidity / volume.
 
     STRICTLY advisory: NEVER mutates trading state, gates, scores, sizes, dedupes or
-    sends a broker order. Returns None when BOT_HOLD_SCORE is OFF or no usable price."""
-    if not BOT_HOLD_SCORE_ENABLED:
-        return None
+    sends a broker order. Returns None when there is no usable price. NO flag check —
+    callers gate as needed (the public _compute_bot_hold_score wrapper checks it)."""
     try:
         direction = at.get("direction", "Long")
         is_long   = (direction == "Long")
@@ -21903,6 +21944,213 @@ def _bot_hold_status_block(seed_analysis=None, seed_ticker=None):
         }
     except Exception as exc:
         logger.warning("bot hold status block error: %s", exc)
+        return None
+
+
+def _active_trade_advisory(inst, at, analysis=None):
+    """DISPLAY-ONLY active-trade management advisory for ONE open bot position.
+
+    Combines the read-only bot-hold HEALTH score (_bot_hold_score_core) with the
+    manual-manager THESIS read (compute_manual_trade_management on a THROWAWAY copy)
+    and adds a stateless time-stall / no-progress proxy, mapped to the operator
+    vocabulary: thesis_status (VALID/WEAKENING/INVALID/PAUSED/UNKNOWN), suggested_action
+    (HOLD / MOVE STOP / EXIT EARLY / TAKE PARTIAL / MONITOR), hold_reason, exit_warning,
+    and a per-signal `checks` breakdown. STRICTLY advisory: NEVER mutates trading state,
+    gates, scores, sizes, dedupes, or sends a broker order. FAIL-OPEN -> None."""
+    try:
+        symbol    = at.get("symbol") or inst
+        direction = at.get("direction", "Long")
+
+        # Health (flag-independent core) + manual-style thesis read on a COPY —
+        # compute_manual_trade_management writes min_r/max_r back onto the dict.
+        health = _bot_hold_score_core(at, analysis=analysis)
+        mirror = _bot_trade_mgmt_mirror(inst, at)
+        mgmt   = compute_manual_trade_management(mirror, analysis=analysis) or {}
+
+        # Held-minutes (computed locally so the stall proxy works even if health is None).
+        held_minutes = None
+        opened = at.get("opened_at")
+        try:
+            if opened:
+                ot = datetime.fromisoformat(str(opened))
+                if ot.tzinfo is None:
+                    ot = ot.replace(tzinfo=timezone.utc)
+                held_minutes = max(0.0, (now_utc() - ot).total_seconds() / 60.0)
+        except Exception:
+            held_minutes = None
+
+        health_score = (health or {}).get("score")
+
+        # Monitor unavailable (no live price / zero risk): honest, no fabricated guidance.
+        if mgmt.get("status") != "ok":
+            return {
+                "instrument":       inst,
+                "symbol":           symbol,
+                "direction":        direction,
+                "thesis_status":    mgmt.get("thesis_status") or "UNKNOWN",
+                "suggested_action": "MONITOR",
+                "health_score":     health_score,
+                "hold_reason":      mgmt.get("recommendation_reason")
+                                    or "Live monitor unavailable right now — no guidance fabricated.",
+                "exit_warning":     None,
+                "checks":           [],
+                "fired_triggers":   [],
+                "current_r":        mgmt.get("current_r"),
+                "held_minutes":     round(held_minutes, 1) if held_minutes is not None else None,
+                "stop_breached":    bool(mgmt.get("stop_breached")),
+                "advisory_only":    True,
+                "updated_at":       now_utc().isoformat(),
+            }
+
+        current_r     = mgmt.get("current_r")
+        thesis        = mgmt.get("thesis_status") or "VALID"
+        mgmt_action   = mgmt.get("action") or "HOLD"
+        warnings      = list(mgmt.get("warnings") or [])
+        stop_breached = bool(mgmt.get("stop_breached"))
+        t1_hit        = bool(mgmt.get("target1_hit"))
+        paused        = (thesis == "PAUSED")
+
+        # ── Stateless STALL / time-limit proxy (display-only) ──
+        # True candle-by-candle progress needs per-position history we do not keep, so
+        # this is an honest held-time + current-R proxy. Suppressed while paused/closed.
+        stall = time_limit = False
+        if (not paused and held_minutes is not None and isinstance(current_r, (int, float))
+                and not stop_breached and not t1_hit):
+            if held_minutes >= ACTIVE_TRADE_STALL_MIN and abs(current_r) < ACTIVE_TRADE_STALL_R:
+                stall = True
+            if held_minutes >= LIVE_RUNNER_MAX_HOLD_MIN and current_r <= 0:
+                time_limit = True
+
+        # ── Fired exit / weakening triggers (human strings) ──
+        fired = list(warnings)
+        if stall:
+            fired.append("No progress for ~%.0f min (sitting near entry at %.2fR) — the setup has stalled."
+                         % (held_minutes, current_r))
+        if time_limit:
+            fired.append("Open ~%.0f min with no progress — past the time limit; scratch it and free the risk."
+                         % held_minutes)
+
+        # ── Thesis escalation from the supplemental triggers (display-only) ──
+        if (stall or time_limit) and thesis == "VALID":
+            thesis = "WEAKENING"
+
+        # ── Suggested action -> operator vocabulary ──
+        _amap = {
+            "EXIT":            "EXIT EARLY",
+            "REDUCE":          "TAKE PARTIAL",
+            "TAKE PARTIAL":    "TAKE PARTIAL",
+            "MOVE STOP TO BE": "MOVE STOP",
+            "HOLD":            "HOLD",
+            "MONITOR":         "MONITOR",
+        }
+        suggested = _amap.get(mgmt_action, mgmt_action)
+        if time_limit and suggested == "HOLD" and (not isinstance(current_r, (int, float)) or current_r <= 0):
+            suggested = "EXIT EARLY"
+
+        hold_reason  = mgmt.get("recommendation_reason")
+        exit_warning = "; ".join(fired) if fired else None
+
+        # ── Per-signal checks (answers each tracked question) ──
+        comps = (health or {}).get("components") or {}
+        def _cs(name):
+            c = comps.get(name)
+            return (c or {}).get("score") if c else None
+        def _cd(name):
+            c = comps.get(name)
+            return (c or {}).get("detail") if c else None
+        def _chk(key, label, value, detail):
+            return {"key": key, "label": label, "value": bool(value),
+                    "detail": detail if detail is not None else "—"}
+
+        vwap_against   = (_cs("vwap") is not None and _cs("vwap") < 50)
+        struct_against = (_cs("structure") is not None and _cs("structure") < 50)
+        cvd_against    = (_cs("cvd") is not None and _cs("cvd") < 50)
+        vol_fading     = (_cs("volume") is not None and _cs("volume") < 100)
+        liq_score      = _cs("liquidity")
+        opp_zone       = (liq_score is not None and liq_score <= 30)
+        toward         = isinstance(current_r, (int, float)) and current_r > 0.1
+        rejecting      = bool(vwap_against or struct_against or cvd_against)
+
+        checks = [
+            _chk("toward_target", "Moving toward target", toward,
+                 ("%.2fR" % current_r) if isinstance(current_r, (int, float)) else "—"),
+            _chk("rejecting_entry", "Rejecting entry direction", rejecting,
+                 "momentum against position" if rejecting else "no rejection"),
+            _chk("vwap_against", "VWAP against position", vwap_against, _cd("vwap")),
+            _chk("structure_against", "Structure breaking against", struct_against, _cd("structure")),
+            _chk("cvd_against", "CVD flipped against", cvd_against, _cd("cvd")),
+            _chk("volume_fading", "Volume fading", vol_fading, _cd("volume")),
+            _chk("stalled", "Stalled / no progress", (stall or time_limit),
+                 ("%.0f min, %.2fR" % (held_minutes, current_r)) if (stall or time_limit) else "progressing"),
+            _chk("opposing_zone_near", "Opposing zone ahead", opp_zone, _cd("liquidity")),
+            _chk("thesis_invalidated", "Thesis invalidated", thesis == "INVALID",
+                 hold_reason if thesis == "INVALID" else "thesis intact"),
+        ]
+
+        return {
+            "instrument":       inst,
+            "symbol":           mgmt.get("symbol") or symbol,
+            "direction":        mgmt.get("direction", direction),
+            "entry":            mgmt.get("entry_price"),
+            "stop":             mgmt.get("stop_loss"),
+            "price":            mgmt.get("current_price"),
+            "current_r":        current_r,
+            "health_score":     health_score,
+            "thesis_status":    thesis,
+            "suggested_action": suggested,
+            "hold_reason":      hold_reason,
+            "exit_warning":     exit_warning,
+            "checks":           checks,
+            "fired_triggers":   fired,
+            "stop_breached":    stop_breached,
+            "held_minutes":     round(held_minutes, 1) if held_minutes is not None else None,
+            "advisory_only":    True,
+            "updated_at":       now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("active-trade advisory failed for %s: %s", inst, exc)
+        return None
+
+
+def _active_trade_mgmt_block(seed_analysis=None, seed_ticker=None):
+    """DISPLAY-only /status presenter: an Active Trade Management advisory for every
+    OPEN bot position. Reuses ONE read-only full_analysis per distinct symbol (seeded
+    with the caller's already-computed snapshot to avoid a duplicate compute). Returns
+    None when ACTIVE_TRADE_MGMT_ENABLED is OFF or there are no open positions, so the
+    /status key stays null and the panel hides. STRICTLY advisory / FAIL-OPEN."""
+    if not ACTIVE_TRADE_MGMT_ENABLED:
+        return None
+    try:
+        snap = active_trade_snapshot()
+        if not snap:
+            return None
+        cache = {}
+        if seed_ticker and seed_analysis is not None:
+            cache[seed_ticker] = seed_analysis
+        rows = []
+        for inst, at in snap.items():
+            if not at:
+                continue
+            sym = at.get("symbol") or inst
+            if sym not in cache:
+                try:
+                    cache[sym] = full_analysis(ticker_override=sym)
+                except Exception as exc:
+                    logger.warning("active-trade-mgmt analysis failed for %s: %s", sym, exc)
+                    cache[sym] = None
+            adv = _active_trade_advisory(inst, at, analysis=cache.get(sym))
+            if adv:
+                rows.append(adv)
+        if not rows:
+            return None
+        return {
+            "enabled":    True,
+            "count":      len(rows),
+            "positions":  rows,
+            "updated_at": now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("active-trade-mgmt status block error: %s", exc)
         return None
 
 
@@ -26695,6 +26943,7 @@ def status():
         "trade_management":         _trade_mgmt_status_block(a.get("active_ticker")),
         "session_quality":          _session_quality_status_block(),
         "bot_hold_score":           _bot_hold_status_block(a, a.get("active_ticker")),
+        "active_trade_mgmt":        _active_trade_mgmt_block(a, a.get("active_ticker")),
         # LIVE 2-contract runner (Option B) arming + eligibility; "enabled" is false
         # unless LIVE_RUNNER_ENABLED (env) is set, so the panel stays hidden by default.
         "live_runner":              live_runner_status_view(),
@@ -28507,6 +28756,12 @@ _TRAINING_STATE_LOCK      = threading.Lock()
 _TRAINING_STATE_CACHE     = {"row": None, "ts": 0.0}
 _TRAINING_REC_LOCK        = threading.Lock()
 _TRAINING_REC_LAST        = {}           # inst -> (fingerprint, monotonic ts)
+# T003 — grade watcher: resolve each recorded suggestion into the ledger using the
+# SAME stop-first paper-sim logic as the live scalp sim. DISPLAY/ANALYTICS-ONLY — it
+# only writes the grading columns of bot_training_trades, never the money path.
+TRAINING_GRADE_WATCH_INTERVAL = max(10, int(os.environ.get("TRAINING_GRADE_WATCH_INTERVAL", "30")))
+TRAINING_GRADE_MAX_HOLD_HOURS = max(1, int(os.environ.get("TRAINING_GRADE_MAX_HOLD_HOURS", "8")))
+_TRAINING_GRADE_WATCH_LOCK    = threading.Lock()   # single-flight: one grade cycle at a time
 
 
 def training_mode_enabled():
@@ -28749,6 +29004,449 @@ def _training_gate(intent, plan_public, instrument, direction, source):
     _training_record_once(instrument, intent, plan_public, source, stage, "suggested")
     return _training_suppressed_result(intent, plan_public, stage,
         "Stage %d: suggest-only — no live order placed." % stage)
+
+
+# ── BOT TRAINING MODE — tracking + grading watcher (T003) ─────────────────────────
+# Resolves every recorded suggestion in bot_training_trades into an outcome + grade
+# using the SAME stop-first paper-sim logic the live scalp sim uses (_scalp_sim_outcome).
+# This is DISPLAY/ANALYTICS-ONLY: it only writes the grading columns of
+# bot_training_trades and NEVER touches MANAGED_TRADES / strategy_trades / the money
+# path. It runs on its own timer, self-gated to training-enabled + DB-ready, so dev /
+# flag-off never grades and stays byte-identical. FAIL-OPEN throughout.
+def _training_grade_call(row, bar):
+    """Grade ONE recorded training suggestion against the latest 1-minute bar.
+
+    The suggestion is modelled as a MARKET fill at `entry` (the server-authoritative
+    price at suggestion time), then resolved stop-first / target-first EXACTLY like the
+    live paper-sim watcher (worst-case fill: stop is checked before target). Returns a
+    grade dict (sim_outcome 'win'/'loss'/'expired', exit_price, r_multiple, hit_col,
+    target_first, stop_first, direction_correct, timing) or None when no level is hit
+    yet AND the call is not past max-hold (leave it open for a later cycle)."""
+    entry, stop, target = row.get("entry"), row.get("stop"), row.get("target")
+    direction = row.get("direction")
+    if None in (entry, stop, target) or direction not in ("Long", "Short"):
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+
+    # Stop-first / target-first resolution — reuse the live sim's exact logic.
+    outcome = _scalp_sim_outcome(
+        {"entry": entry, "stop": stop, "target": target, "direction": direction}, bar)
+    if outcome is not None:
+        label, exit_price, r_mult = outcome           # ("win"/"loss", price, R)
+        win = (label == "win")
+        return {
+            "sim_outcome":       label,
+            "exit_price":        exit_price,
+            "r_multiple":        r_mult,
+            "hit_col":           "target_hit_at" if win else "stop_hit_at",
+            "entry_hit":         True,
+            "target_first":      win,
+            "stop_first":        (not win),
+            "direction_correct": win,
+            "timing":            "good" if win else "wrong",
+        }
+
+    # No level hit — only resolve once the suggestion is past max-hold; otherwise leave
+    # it open so a later bar can still hit the stop/target.
+    ts, cl = row.get("ts"), bar.get("close")
+    if ts is None or cl is None:
+        return None
+    try:
+        oa   = ts if getattr(ts, "tzinfo", None) else ts.replace(tzinfo=timezone.utc)
+        aged = (now_utc() - oa).total_seconds() > TRAINING_GRADE_MAX_HOLD_HOURS * 3600
+    except Exception:
+        aged = False
+    if not aged:
+        return None
+    fav_pts = (cl - entry) if direction == "Long" else (entry - cl)
+    return {
+        "sim_outcome":       "expired",
+        "exit_price":        round(cl, 4),
+        "r_multiple":        round(fav_pts / risk, 4),
+        "hit_col":           None,
+        "entry_hit":         True,
+        "target_first":      False,
+        "stop_first":        False,
+        "direction_correct": fav_pts > 0,
+        "timing":            "early" if fav_pts > 0 else "late",
+    }
+
+
+def _training_grade_update(row_id, grade):
+    """Atomically write ONE training grade. The conditional `WHERE sim_outcome IS NULL`
+    IS the cross-instance claim — only the first writer (dev OR prod) resolves a row; a
+    racing watcher's UPDATE matches 0 rows and no-ops. Writes ONLY to
+    bot_training_trades. FAIL-OPEN — returns False on any problem."""
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    # Whitelist the dynamic hit-column name (never interpolate anything into SQL).
+    hit_col = grade.get("hit_col")
+    set_hit = (", %s = now()" % hit_col) if hit_col in ("target_hit_at", "stop_hit_at") else ""
+    payload = {
+        "sim_outcome":       grade.get("sim_outcome"),
+        "exit_price":        grade.get("exit_price"),
+        "r_multiple":        grade.get("r_multiple"),
+        "entry_hit":         grade.get("entry_hit"),
+        "target_first":      grade.get("target_first"),
+        "stop_first":        grade.get("stop_first"),
+        "direction_correct": grade.get("direction_correct"),
+        "timing":            grade.get("timing"),
+        "entry_model":       "market_at_suggestion",
+        "graded_at":         now_utc().isoformat(),
+    }
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE bot_training_trades "
+                "SET sim_outcome=%s, entry_hit_at=COALESCE(entry_hit_at, ts), "
+                "    grade_json=%s, updated_at=now()" + set_hit + " "
+                "WHERE id=%s AND sim_outcome IS NULL",
+                (grade.get("sim_outcome"), psycopg2.extras.Json(payload), row_id))
+            claimed = (cur.rowcount == 1)
+        conn.commit()
+        return claimed
+    except Exception as exc:
+        logger.warning("training grade update failed: %s", exc)
+        try: conn.rollback()
+        except Exception: pass
+        return False
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+def _watch_training_trades():
+    """Resolve un-graded BOT TRAINING suggestions against the latest 1-minute bar (one
+    fetch per market per cycle), with the SAME same-bar guard as the live sim (skip a
+    bar that opened at/before the suggestion so its range can't look-ahead self-fill).
+    Writes ONLY to bot_training_trades via the idempotent conditional UPDATE. FAIL-OPEN."""
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    open_rows = []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, ts, market, direction, entry, stop, target "
+                "FROM bot_training_trades "
+                "WHERE sim_outcome IS NULL AND status IN ('suggested','auto_passthrough') "
+                "ORDER BY id ASC LIMIT 500")
+            open_rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("training grade watcher read failed: %s", exc)
+    finally:
+        try: conn.close()
+        except Exception: pass
+    if not open_rows:
+        return
+    bars = {}
+    for inst in {r.get("market") for r in open_rows if r.get("market")}:
+        try:
+            bars[inst] = _fetch_latest_bar(inst)
+        except Exception:
+            bars[inst] = None
+    for row in open_rows:
+        bar = bars.get(row.get("market"))
+        if not bar:
+            continue
+        # Same-bar / pre-suggestion guard (no look-ahead self-fill).
+        ts, bar_start = row.get("ts"), bar.get("start")
+        if bar_start is not None and ts is not None:
+            try:
+                if bar_start <= ts.timestamp():
+                    continue
+            except Exception:
+                pass
+        for k in ("entry", "stop", "target"):
+            if row.get(k) is not None:
+                try: row[k] = float(row[k])
+                except (TypeError, ValueError): row[k] = None
+        grade = _training_grade_call(row, bar)
+        if not grade:
+            continue
+        _training_grade_update(row["id"], grade)
+
+
+def _training_grade_watch_loop():
+    """BOT TRAINING grade watcher on its own timer. Self-gated to training-enabled +
+    DB-ready (so dev / flag-off never grades) and single-flight via
+    _TRAINING_GRADE_WATCH_LOCK. FAIL-OPEN — any error just skips this cycle. Never
+    touches the money path; writes ONLY to bot_training_trades."""
+    try:
+        if training_mode_enabled() and BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED:
+            if _TRAINING_GRADE_WATCH_LOCK.acquire(blocking=False):
+                try:
+                    _watch_training_trades()
+                finally:
+                    _TRAINING_GRADE_WATCH_LOCK.release()
+    except Exception as exc:
+        logger.warning("training grade watch loop error: %s", exc)
+    finally:
+        threading.Timer(TRAINING_GRADE_WATCH_INTERVAL, _training_grade_watch_loop).start()
+
+
+# ── BOT TRAINING MODE — proof metrics + read endpoints (T004) ─────────────────────
+# DISPLAY/READ-ONLY: surfaces the staged controller's state and the paper-graded
+# performance of the recorded suggestions. These endpoints NEVER touch the money path
+# and NEVER mutate the ledger. Owner-only (password-gated at the Express edge; NOT in
+# the dashboard-auth OPEN_PATHS).
+_TRAINING_STAGE_LABELS = {
+    1: "Suggest-only",
+    2: "Approval-required",
+    3: "Limited auto",
+    4: "Full auto",
+}
+_TRAINING_STAGE_DESC = {
+    1: "Logs every setup as a paper suggestion. No live orders are ever sent.",
+    2: "Each setup waits for your approval before any live order is sent.",
+    3: "Auto-trades one market with tight caps (per-trade risk, trades/session, halt after losses).",
+    4: "Full auto using the standard safety controls.",
+}
+
+
+def _training_promotion_thresholds():
+    """Env-tunable, display-first promotion bar. Pure so /training/metrics and the
+    Stage-promotion gate (added later) agree on the same numbers."""
+    def _f(name, default):
+        try: return float(os.environ.get(name, default))
+        except (TypeError, ValueError): return float(default)
+    def _i(name, default):
+        try: return int(os.environ.get(name, default))
+        except (TypeError, ValueError): return int(default)
+    return {
+        "min_trades":        _i("TRAINING_PROMOTE_MIN_TRADES", 20),
+        "min_win_rate":      _f("TRAINING_PROMOTE_MIN_WIN_RATE", 50.0),
+        "min_profit_factor": _f("TRAINING_PROMOTE_MIN_PF", 1.3),
+        "max_drawdown_r":    _f("TRAINING_PROMOTE_MAX_DD_R", 6.0),
+    }
+
+
+def _tr_grade(row):
+    """grade_json as a dict regardless of whether psycopg2 returns jsonb pre-parsed
+    (the default) or as a raw string. Always returns a dict."""
+    g = row.get("grade_json")
+    if isinstance(g, str):
+        try: g = json.loads(g)
+        except Exception: g = {}
+    return g if isinstance(g, dict) else {}
+
+
+def _training_agg(rows):
+    """Aggregate graded ledger rows into a metrics block. Pure. `rows` must already be
+    in chronological order for the drawdown walk. win_rate is over DECIDED rows
+    (win+loss); profit factor / expectancy / drawdown use every numeric r_multiple
+    (expired rows carry a small signed R)."""
+    wins = losses = expired = 0
+    r_vals, dir_flags = [], []
+    for r in rows:
+        oc = (r.get("sim_outcome") or "").lower()
+        if   oc == "win":     wins += 1
+        elif oc == "loss":    losses += 1
+        elif oc == "expired": expired += 1
+        g = _tr_grade(r)
+        rv = g.get("r_multiple")
+        if isinstance(rv, (int, float)) and not isinstance(rv, bool):
+            r_vals.append(float(rv))
+        dc = g.get("direction_correct")
+        if isinstance(dc, bool):
+            dir_flags.append(1 if dc else 0)
+    n = wins + losses + expired
+    decided = wins + losses
+    win_rate = round(100.0 * wins / decided, 1) if decided else None
+    gross_win  = sum(x for x in r_vals if x > 0)
+    gross_loss = -sum(x for x in r_vals if x < 0)
+    if gross_loss > 0:
+        pf = round(min(gross_win / gross_loss, 99.0), 2)
+    elif gross_win > 0:
+        pf = 99.0                                   # no losses yet (capped, JSON-safe)
+    else:
+        pf = None
+    win_r  = [x for x in r_vals if x > 0]
+    loss_r = [x for x in r_vals if x < 0]
+    avg_win_r    = round(sum(win_r) / len(win_r), 2) if win_r else None
+    avg_loss_r   = round(sum(loss_r) / len(loss_r), 2) if loss_r else None
+    expectancy_r = round(sum(r_vals) / len(r_vals), 2) if r_vals else None
+    cum = peak = max_dd = 0.0
+    for x in r_vals:
+        cum += x
+        if cum > peak: peak = cum
+        if (peak - cum) > max_dd: max_dd = peak - cum
+    max_dd_r = round(max_dd, 2) if r_vals else None
+    dir_acc = round(100.0 * sum(dir_flags) / len(dir_flags), 1) if dir_flags else None
+    return {
+        "n": n, "wins": wins, "losses": losses, "expired": expired,
+        "win_rate": win_rate, "profit_factor": pf,
+        "avg_win_r": avg_win_r, "avg_loss_r": avg_loss_r,
+        "expectancy_r": expectancy_r, "max_drawdown_r": max_dd_r,
+        "direction_accuracy": dir_acc,
+    }
+
+
+def _training_counts():
+    """(total, graded, pending) recorded suggestions. FAIL-OPEN → zeros."""
+    zero = {"total": 0, "graded": 0, "pending": 0}
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return zero
+    conn = _learning_conn()
+    if conn is None:
+        return zero
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*), count(sim_outcome) FROM bot_training_trades")
+            total, graded = cur.fetchone()
+        total, graded = int(total or 0), int(graded or 0)
+        return {"total": total, "graded": graded, "pending": max(0, total - graded)}
+    except Exception as exc:
+        logger.warning("training counts read failed: %s", exc)
+        return zero
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+def _training_compute_metrics():
+    """Paper-graded performance of every recorded suggestion, plus best-conditions and
+    a display-only promotion-readiness summary. READ-ONLY; FAIL-OPEN (returns the empty
+    shape with available=False when the ledger is unavailable)."""
+    thresholds = _training_promotion_thresholds()
+    base = {
+        "available":        False,
+        "overall":          _training_agg([]),
+        "per_stage":        {},
+        "per_market":       {},
+        "best_market":      None,
+        "best_setup":       None,
+        "worst_setup":      None,
+        "best_time_window": None,
+        "thresholds":       thresholds,
+        "eligibility":      {"eligible": False, "checks": []},
+    }
+    if not (BOT_TRAINING_DB_READY and LEARNING_DB_ENABLED):
+        return base
+    conn = _learning_conn()
+    if conn is None:
+        return base
+    rows = []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT stage, market, setup, direction, sim_outcome, grade_json, "
+                "       ts, entry_hit_at "
+                "FROM bot_training_trades "
+                "WHERE sim_outcome IS NOT NULL "
+                "ORDER BY COALESCE(entry_hit_at, ts) ASC")
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("training metrics read failed: %s", exc)
+        return base
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    base["available"] = True
+    base["overall"]   = _training_agg(rows)
+
+    by_stage, by_market, by_setup, by_hour = {}, {}, {}, {}
+    for r in rows:
+        st = r.get("stage")
+        if st is not None:
+            try: by_stage.setdefault(int(st), []).append(r)
+            except (TypeError, ValueError): pass
+        mk = r.get("market")
+        if mk:
+            by_market.setdefault(str(mk), []).append(r)
+        su = r.get("setup")
+        if su:
+            by_setup.setdefault(str(su), []).append(r)
+        tsv = r.get("entry_hit_at") or r.get("ts")
+        try:
+            by_hour.setdefault(tsv.astimezone(ET_TZ).hour, []).append(r)
+        except Exception:
+            pass
+    base["per_stage"]  = {str(k): _training_agg(v) for k, v in sorted(by_stage.items())}
+    base["per_market"] = {k: _training_agg(v) for k, v in by_market.items()}
+
+    min_group = max(1, _env_int_or_none("TRAINING_MIN_GROUP_N", 3) or 3)
+
+    def _rank(groups, fmt_key=lambda k: k, want="max"):
+        cards = []
+        for k, v in groups.items():
+            agg = _training_agg(v)
+            if agg["n"] < min_group or agg["expectancy_r"] is None:
+                continue
+            cards.append({"key": fmt_key(k), "n": agg["n"],
+                          "win_rate": agg["win_rate"],
+                          "expectancy_r": agg["expectancy_r"]})
+        if not cards:
+            return None
+        cards.sort(key=lambda c: c["expectancy_r"], reverse=(want == "max"))
+        return cards[0]
+
+    base["best_market"]      = _rank(by_market)
+    base["best_setup"]       = _rank(by_setup)
+    base["worst_setup"]      = _rank(by_setup, want="min")
+    base["best_time_window"] = _rank(by_hour, fmt_key=lambda h: "%02d:00 ET" % int(h))
+
+    o = base["overall"]
+    checks = [
+        {"label": "Sample size >= %d (have %d)" % (thresholds["min_trades"], o["n"]),
+         "pass":  o["n"] >= thresholds["min_trades"]},
+        {"label": "Win rate >= %.0f%% (have %s)" % (
+            thresholds["min_win_rate"],
+            "n/a" if o["win_rate"] is None else "%.0f%%" % o["win_rate"]),
+         "pass":  o["win_rate"] is not None and o["win_rate"] >= thresholds["min_win_rate"]},
+        {"label": "Profit factor >= %.2f (have %s)" % (
+            thresholds["min_profit_factor"],
+            "n/a" if o["profit_factor"] is None else "%.2f" % o["profit_factor"]),
+         "pass":  o["profit_factor"] is not None and o["profit_factor"] >= thresholds["min_profit_factor"]},
+        {"label": "Max drawdown <= %.1fR (have %s)" % (
+            thresholds["max_drawdown_r"],
+            "n/a" if o["max_drawdown_r"] is None else "%.2fR" % o["max_drawdown_r"]),
+         "pass":  o["max_drawdown_r"] is not None and o["max_drawdown_r"] <= thresholds["max_drawdown_r"]},
+    ]
+    base["eligibility"] = {"eligible": all(c["pass"] for c in checks), "checks": checks}
+    return base
+
+
+@app.route("/training/status", methods=["GET"])
+def training_status():
+    """Owner-only, READ-ONLY snapshot of the BOT TRAINING controller: master flag,
+    active stage + human label, the Stage-3 desired market, promotion provenance and
+    the recorded/graded/pending counts. Never sends or mutates anything."""
+    enabled = training_mode_enabled()
+    if enabled and not BOT_TRAINING_DB_READY:
+        _ensure_bot_training_probe()
+    stage = training_stage() if enabled else 1
+    row   = (_training_state() or {}) if enabled else {}
+    promoted_at = row.get("promoted_at")
+    updated_at  = row.get("updated_at")
+    return jsonify({
+        "enabled":           enabled,
+        "db_ready":          bool(BOT_TRAINING_DB_READY),
+        "stage":             stage,
+        "stage_label":       _TRAINING_STAGE_LABELS.get(stage, "?"),
+        "stage_description": _TRAINING_STAGE_DESC.get(stage, ""),
+        "desired_market":    (row.get("desired_market") or "MGC"),
+        "promoted_by":       row.get("promoted_by"),
+        "promoted_at":       promoted_at.isoformat() if hasattr(promoted_at, "isoformat") else promoted_at,
+        "updated_at":        updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+        "notes":             row.get("notes"),
+        "counts":            _training_counts() if enabled else {"total": 0, "graded": 0, "pending": 0},
+    }), 200
+
+
+@app.route("/training/metrics", methods=["GET"])
+def training_metrics():
+    """Owner-only, READ-ONLY paper-graded performance of the recorded suggestions
+    (overall + per stage/market, best conditions, promotion readiness)."""
+    return jsonify(_training_compute_metrics()), 200
 
 
 def execute_trade_gateway(instrument, contracts, source="manual"):
@@ -31094,6 +31792,49 @@ def dashboard():
   <div class="nf-fid">Owner-only. The toggle &amp; decision log are in-memory and reset on restart; accounts persist in the database.</div>
 </div>
 
+<!-- BOT TRAINING MODE — staged path to autonomy. DISPLAY/READ-ONLY; hidden unless
+     /training/status reports enabled. Nothing here sends or sizes a live order. -->
+<div class="mod" id="mod-training" style="display:none">
+  <div class="mod-h">
+    <span id="tr-dot" style="color:#6b7280">&#9679;</span> Bot Training Mode
+    <span id="tr-stage-badge" style="font-size:10px;color:#6b7280;letter-spacing:1px;float:right"></span>
+  </div>
+  <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Staged path to autonomy. Every setup is logged and paper-graded; the bot only sends live orders at the stage you have unlocked. DISPLAY-ONLY — promotion is manual.</div>
+  <div class="nf-status" id="tr-stage-line">—</div>
+  <div style="font-size:11px;color:#9aa;margin:4px 0" id="tr-stage-desc"></div>
+  <div class="cvd-stats" style="margin:6px 0">
+    <div class="gstat"><div class="l">Logged</div><div class="v" id="tr-total">—</div></div>
+    <div class="gstat"><div class="l">Graded</div><div class="v" id="tr-graded">—</div></div>
+    <div class="gstat"><div class="l">Pending</div><div class="v" id="tr-pending">—</div></div>
+    <div class="gstat"><div class="l">Market</div><div class="v" id="tr-market">—</div></div>
+  </div>
+  <div class="mod-h" style="margin-top:10px;font-size:12px">Paper-graded performance (all stages)</div>
+  <div class="cvd-stats" style="margin:6px 0">
+    <div class="gstat"><div class="l">Win rate</div><div class="v" id="tr-winrate">—</div></div>
+    <div class="gstat"><div class="l">Profit factor</div><div class="v" id="tr-pf">—</div></div>
+    <div class="gstat"><div class="l">Expectancy</div><div class="v" id="tr-exp">—</div></div>
+    <div class="gstat"><div class="l">Max DD</div><div class="v" id="tr-dd">—</div></div>
+  </div>
+  <div class="cvd-stats" style="margin:6px 0">
+    <div class="gstat"><div class="l">Avg win</div><div class="v" id="tr-avgwin">—</div></div>
+    <div class="gstat"><div class="l">Avg loss</div><div class="v" id="tr-avgloss">—</div></div>
+    <div class="gstat"><div class="l">Dir. accuracy</div><div class="v" id="tr-diracc">—</div></div>
+    <div class="gstat"><div class="l">W / L / Exp</div><div class="v" id="tr-wle">—</div></div>
+  </div>
+  <div class="se-bias-h">Best conditions</div>
+  <div class="cvd-stats" style="margin:6px 0">
+    <div class="gstat"><div class="l">Best market</div><div class="v" id="tr-bestmkt">—</div></div>
+    <div class="gstat"><div class="l">Best setup</div><div class="v" id="tr-bestsetup">—</div></div>
+    <div class="gstat"><div class="l">Best hour</div><div class="v" id="tr-besthour">—</div></div>
+    <div class="gstat"><div class="l">Worst setup</div><div class="v" id="tr-worstsetup">—</div></div>
+  </div>
+  <div class="se-bias-h">Promotion readiness</div>
+  <div class="nf-status" id="tr-elig">—</div>
+  <ul id="tr-elig-list" style="margin:4px 0;padding-left:16px;font-size:11px;color:var(--amber-dim)"></ul>
+  <div id="tr-db-warn" style="display:none;font-size:11px;color:#ff8a8a;margin:4px 0">Training database unavailable — metrics paused.</div>
+  <div class="nf-fid">Owner-only · display-only. Stage changes &amp; promotion are manual; nothing here sends or sizes a live order.</div>
+</div>
+
 <!-- Trade-management analytics (MFE/MAE booleans + commission + oversized-loss).
      DISPLAY-ONLY; hidden unless TRADE_MGMT/COMMISSION/OVERSIZED analytics are on. -->
 <div class="mod" id="mod-trademgmt" style="display:none">
@@ -31135,6 +31876,16 @@ def dashboard():
   <div class="mod-h">🤖 Bot Hold Score <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span></div>
   <div id="bh-list"></div>
   <div id="bh-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
+<!-- Active Trade Management — advisory open-position monitor: health score, thesis
+     status (VALID/WEAKENING/INVALID), hold reason, exit-warning + suggested action
+     for every OPEN bot position. DISPLAY-ONLY; never closes a position. Hidden unless
+     ACTIVE_TRADE_MGMT_ENABLED and a position is open. -->
+<div class="mod" id="mod-atm" style="display:none">
+  <div class="mod-h">🛡️ Active Trade Management <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span></div>
+  <div id="atm-list"></div>
+  <div id="atm-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
 <!-- LIVE 2-contract runner (Option B) — arming control + eligibility. Owner-only.
@@ -32287,6 +33038,7 @@ function renderModules(d){
   renderTradeMgmt(d);
   renderSessionQuality(d);
   renderBotHold(d);
+  renderActiveTradeMgmt(d);
   renderLiveRunner(d);
 
   // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
@@ -33292,6 +34044,71 @@ function renderPropDecisions(rows){
     return `${t} · ${r.instrument||'?'} ${r.direction||''} x${cnt} · ${tag}${why}`;
   });
   _anFill('prop-decisions', items);
+}
+
+// ── BOT TRAINING MODE panel (DISPLAY/READ-ONLY) ──────────────────────────────
+function _trSet(id, txt, col){
+  var e=document.getElementById(id);
+  if(!e) return;
+  e.textContent=(txt==null||txt==='')?'—':txt;
+  if(col!==undefined) e.style.color=col;
+}
+function _trPct(x){ return (x==null)?'—':(Number(x).toFixed(0)+'%'); }
+function _trR(x){ return (x==null)?'—':((x>=0?'+':'')+Number(x).toFixed(2)+'R'); }
+function _trBest(c){ return (c && c.key!=null)?(c.key+' ('+_trR(c.expectancy_r)+')'):'—'; }
+
+async function loadTraining(){
+  var mod=document.getElementById('mod-training');
+  if(!mod) return;
+  try{
+    var s=await api('/training/status');
+    if(!s || !s.enabled){ mod.style.display='none'; return; }
+    mod.style.display='';
+    renderTraining(s, null);
+    var m=await api('/training/metrics');
+    renderTraining(s, m);
+  }catch(e){ /* fail-open: keep last painted state */ }
+}
+
+function renderTraining(s, m){
+  var stage=s.stage||1;
+  _trSet('tr-stage-badge', 'STAGE '+stage+' · DISPLAY', '#6b7280');
+  _trSet('tr-stage-line', 'Stage '+stage+' — '+(s.stage_label||'?'),
+         stage>=4?'#22c55e':(stage===3?'#f59e0b':'#7fe9f5'));
+  _trSet('tr-stage-desc', s.stage_description||'');
+  var dot=document.getElementById('tr-dot');
+  if(dot) dot.style.color = stage>=4?'#22c55e':(stage>=2?'#f59e0b':'#6b7280');
+  var c=s.counts||{};
+  _trSet('tr-total', c.total==null?'—':c.total);
+  _trSet('tr-graded', c.graded==null?'—':c.graded);
+  _trSet('tr-pending', c.pending==null?'—':c.pending);
+  _trSet('tr-market', s.desired_market||'—');
+  var warn=document.getElementById('tr-db-warn');
+  if(warn) warn.style.display = s.db_ready ? 'none' : 'block';
+  if(!m) return;
+  if(m.available===false){ if(warn) warn.style.display='block'; }
+  var o=m.overall||{};
+  _trSet('tr-winrate', _trPct(o.win_rate),
+         (o.win_rate==null)?'#e8e8f0':(o.win_rate>=50?'#22c55e':'#ef4444'));
+  _trSet('tr-pf', (o.profit_factor==null)?'—':Number(o.profit_factor).toFixed(2),
+         (o.profit_factor==null)?'#e8e8f0':(o.profit_factor>=1.3?'#22c55e':(o.profit_factor>=1?'#f59e0b':'#ef4444')));
+  _trSet('tr-exp', _trR(o.expectancy_r),
+         (o.expectancy_r==null)?'#e8e8f0':(o.expectancy_r>=0?'#22c55e':'#ef4444'));
+  _trSet('tr-dd', (o.max_drawdown_r==null)?'—':('-'+Number(o.max_drawdown_r).toFixed(2)+'R'), '#e8e8f0');
+  _trSet('tr-avgwin', _trR(o.avg_win_r), '#22c55e');
+  _trSet('tr-avgloss', _trR(o.avg_loss_r), '#ef4444');
+  _trSet('tr-diracc', _trPct(o.direction_accuracy));
+  _trSet('tr-wle', (o.wins||0)+' / '+(o.losses||0)+' / '+(o.expired||0));
+  _trSet('tr-bestmkt', _trBest(m.best_market));
+  _trSet('tr-bestsetup', _trBest(m.best_setup));
+  _trSet('tr-besthour', _trBest(m.best_time_window));
+  _trSet('tr-worstsetup', _trBest(m.worst_setup));
+  var el=m.eligibility||{};
+  var nextStage=Math.min(4, stage+1);
+  _trSet('tr-elig', el.eligible?('Ready to promote to Stage '+nextStage):'Not yet — keep training',
+         el.eligible?'#22c55e':'#f59e0b');
+  var items=(el.checks||[]).map(function(ch){ return (ch.pass?'✓ ':'✗ ')+ch.label; });
+  _anFill('tr-elig-list', items);
 }
 
 function renderAnalystMode(d){
@@ -36431,6 +37248,45 @@ function renderBotHold(d){
   const foot=document.getElementById('bh-foot');
   if(foot) foot.textContent='Advisory only — never closes a position · '+(bh.count||0)+' open · updated '+(bh.updated_at? new Date(bh.updated_at).toLocaleTimeString():'—');
 }
+function _atmThesisColor(t){ t=String(t||''); if(t==='VALID') return '#22c55e'; if(t==='WEAKENING') return '#f59e0b'; if(t==='INVALID') return '#ef4444'; return '#6b7280'; }
+function _atmActionColor(a){ a=String(a||''); if(a==='HOLD') return '#22c55e'; if(a==='MOVE STOP') return '#38bdf8'; if(a==='TAKE PARTIAL') return '#f59e0b'; if(a==='EXIT EARLY') return '#ef4444'; return '#6b7280'; }
+function renderActiveTradeMgmt(d){
+  const atm=(d && d.active_trade_mgmt) || null;
+  const mod=document.getElementById('mod-atm');
+  if(!mod) return;
+  if(!atm || !atm.enabled || !(atm.positions && atm.positions.length)){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const list=document.getElementById('atm-list');
+  if(list){
+    list.innerHTML=(atm.positions||[]).map(function(p){
+      const isLong=String(p.direction||'').toLowerCase().charAt(0)==='l';
+      const dirCol=isLong?'#22c55e':'#ef4444';
+      const hs=(p.health_score!=null)?p.health_score:'—';
+      const hsCol=(p.health_score==null)?'#6b7280':(p.health_score>=65?'#22c55e':p.health_score>=45?'#f59e0b':'#ef4444');
+      const checks=(p.checks||[]).map(function(c){
+        const good=(c.key==='toward_target')?!!c.value:!c.value;
+        const col=good?'#22c55e':'#ef4444';
+        const mark=good?'✓ ':'✗ ';
+        const bg=good?'rgba(34,197,94,.10)':'rgba(239,68,68,.10)';
+        return '<span title="'+aiEsc(c.detail||'')+'" style="font-size:10px;padding:2px 7px;border-radius:10px;color:'+col+';background:'+bg+'">'+mark+aiEsc(c.label)+'</span>';
+      }).join('');
+      const head='<div class="mb-bot-top">'
+        +'<span class="mb-bot-badge" style="color:'+hsCol+'">'+aiEsc(hs)+'</span>'
+        +'<span class="mb-bot-sym">'+aiEsc(p.symbol||'—')+'</span>'
+        +'<span class="mb-bot-dir" style="color:'+dirCol+'">'+aiEsc(p.direction||'')+' @ '+aiEsc(p.entry!=null?p.entry:'—')+' · '+aiEsc(p.current_r!=null?(p.current_r+'R'):'—')+'</span>'
+        +'<span style="margin-left:auto;font-weight:800;color:'+_atmActionColor(p.suggested_action)+'">'+aiEsc(p.suggested_action||'')+'</span>'
+        +'</div>';
+      const thesis='<div style="margin:4px 0;font-size:11px">Thesis: <b style="color:'+_atmThesisColor(p.thesis_status)+'">'+aiEsc(p.thesis_status||'—')+'</b>'
+        +'<span style="color:#6b7280"> · stop '+aiEsc(p.stop!=null?p.stop:'—')+' · held '+aiEsc(p.held_minutes!=null?(p.held_minutes+'m'):'—')+(p.stop_breached?' · ⚠ STOP BREACHED':'')+'</span></div>';
+      const hold=p.hold_reason?('<div style="font-size:11px;color:#cbd5e1;margin:2px 0">📋 '+aiEsc(p.hold_reason)+'</div>'):'';
+      const warn=p.exit_warning?('<div style="font-size:11px;color:#fca5a5;margin:2px 0">⚠ '+aiEsc(p.exit_warning)+'</div>'):'';
+      const chkwrap=checks?('<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:5px">'+checks+'</div>'):'';
+      return '<div class="mb-bot-card">'+head+thesis+hold+warn+chkwrap+'</div>';
+    }).join('');
+  }
+  const foot=document.getElementById('atm-foot');
+  if(foot) foot.textContent='Advisory only — never closes a position · '+(atm.count||0)+' open · updated '+(atm.updated_at? new Date(atm.updated_at).toLocaleTimeString():'—');
+}
 function renderLiveRunner(d){
   const lr=(d && d.live_runner) || null;
   const mod=document.getElementById('mod-liverunner');
@@ -36563,8 +37419,9 @@ async function mbmtAdd(){
   finally{ if(btn){ btn.disabled=false; btn.textContent=prev; } }
 }
 
-setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); }, 3000);
+setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); loadTraining(); }, 3000);
 setInterval(checkStale, 2000);
+loadTraining();
 </script>
 </body>
 </html>"""
@@ -37913,6 +38770,8 @@ if __name__ == "__main__":
             threading.Thread(target=_recompute_scalp_research, name="scalp-research-warm", daemon=True).start()  # warm the research cache (LIVE instance only; single-flight, throttled, never in the gate path)
         if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
             threading.Timer(0, _scalp_sim_watch_loop).start()  # PAPER live-sim watcher (LIVE instance only; default-OFF flag; resolves paper trades into a SEPARATE table, never the money path)
+        if training_mode_enabled():
+            threading.Timer(0, _training_grade_watch_loop).start()  # BOT TRAINING grade watcher (flag-on/prod only; self-gated on DB-ready; resolves the training ledger via stop-first sim, never the money path)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
