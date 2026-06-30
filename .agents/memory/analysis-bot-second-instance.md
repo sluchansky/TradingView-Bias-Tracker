@@ -58,6 +58,13 @@ stays at `/api`.
   - **To run `/api2` live in dev:** add the workflow via the UI (no counter bug):
     `ANALYSIS_ONLY=1 PORT=8001 ... python3 artifacts/analysis-bot/app.py`, console
     output, no `waitForPort` (8001 is not a supported preview port).
+- **Any cross-bot dashboard link must degrade gracefully** (e.g. the live dashboard's
+  "Analysis Bot ->" pill, the analysis dashboard's "Live Bot" pill). A plain
+  `<a href>` to the *other* bot 502s in the dev preview because dev runs only ONE bot,
+  so the link must `fetch('/api2/ping')` (or `/api/ping`) first and only navigate on a
+  2xx, else show a "only runs in the published app" message. Keep the real `href` as a
+  no-JS fallback. **Why:** users test in the dev preview and a raw 502 reads as "the
+  feature is broken" when it actually works in prod.
 
 ## Editing note
 Both `app.py` files are huge; the `read` tool caps `tradingview-webhook/app.py` at
