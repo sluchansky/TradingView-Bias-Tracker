@@ -25978,7 +25978,7 @@ def _tradezella_scoreboard(trades):
         return {"count": 0, "decided": 0, "wins": 0, "losses": 0,
                 "win_rate": None, "net_pnl": 0.0}
     out = {"all_time": _blank(), "today": _blank(),
-           "by_instrument": [], "today_et": None}
+           "by_instrument": [], "by_instrument_today": [], "today_et": None}
     try:
         today_et = now_utc().astimezone(ET_TZ).date().isoformat()
         out["today_et"] = today_et
@@ -25998,14 +25998,15 @@ def _tradezella_scoreboard(trades):
                 bucket["decided"] += 1
                 bucket["losses"] += 1
 
+        # Per-instrument breakdown is built for BOTH scopes (all-time + today) so the
+        # dashboard's Today / All-imported toggle switches the per-instrument list too,
+        # not just the four summary stats. DISPLAY-ONLY.
         per = {}
+        per_today = {}
         for t in (trades or []):
             if not isinstance(t, dict):
                 continue
             _accum(out["all_time"], t)
-            sd = str(t.get("session_day") or "")[:10]
-            if sd and sd == today_et:
-                _accum(out["today"], t)
             sym = ((t.get("symbol") or "?").strip().upper()) or "?"
             g = per.get(sym)
             if g is None:
@@ -26013,11 +26014,23 @@ def _tradezella_scoreboard(trades):
                 g["symbol"] = sym
                 per[sym] = g
             _accum(g, t)
+            sd = str(t.get("session_day") or "")[:10]
+            if sd and sd == today_et:
+                _accum(out["today"], t)
+                gt = per_today.get(sym)
+                if gt is None:
+                    gt = _blank()
+                    gt["symbol"] = sym
+                    per_today[sym] = gt
+                _accum(gt, t)
 
-        for b in [out["all_time"], out["today"]] + list(per.values()):
+        for b in ([out["all_time"], out["today"]]
+                  + list(per.values()) + list(per_today.values())):
             b["win_rate"] = (b["wins"] / b["decided"]) if b["decided"] else None
             b["net_pnl"] = round(b["net_pnl"], 2)
         out["by_instrument"] = sorted(per.values(), key=lambda g: g["net_pnl"])
+        out["by_instrument_today"] = sorted(
+            per_today.values(), key=lambda g: g["net_pnl"])
     except Exception as exc:
         logger.warning("tradezella scoreboard failed: %s", exc)
     return out
@@ -37292,7 +37305,7 @@ function rrRender(){
   var box=document.getElementById('rr-byinst');
   if(box){
     box.innerHTML='';
-    var rows=(sb.by_instrument||[]);
+    var rows=(rrScope==='all') ? (sb.by_instrument||[]) : (sb.by_instrument_today||[]);
     if(!rows.length){ box.innerHTML='<div style="color:#6b7280;font-size:12px">No instruments yet.</div>'; }
     for(var i=0;i<rows.length;i++){
       var g=rows[i];
