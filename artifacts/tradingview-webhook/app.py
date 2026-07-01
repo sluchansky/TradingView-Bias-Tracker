@@ -505,6 +505,52 @@ SCALP_RR2_RUNNER_R  = _env_float("SCALP_RR2_RUNNER_R", 3.0)
 # green). It can NEVER create a trade, loosen the gate, or alter stops/targets/sizing
 # — it only NARROWS which already-READY setups are taken. FAIL-CLOSED on any error.
 SWING_STRATEGY_FILTER_ENABLED = _env_flag_on("SWING_STRATEGY_FILTER_ENABLED", default_on=False)
+
+# ── Market Intelligence layer (2026-06-30) ───────────────────────────────────
+# A directional market-state + Long/Short directional-confidence + trend-memory
+# layer that sits ABOVE the strict gate (display-first). Three reversible flags,
+# DEFAULT-ON (user chose rollout C: intelligence influences trades from day one),
+# each with an env kill-switch (set to 0/false/no/off to restore legacy behaviour).
+# The scoring goldens pin all three OFF so the regression baseline stays
+# byte-identical. NONE of these may weaken a risk/safety gate — they only sharpen
+# the intelligence BEFORE the READY gate; every money-path effect is FAIL-CLOSED.
+#   • MARKET_INTELLIGENCE_ENABLED  — compute + attach result["market_intelligence"]
+#     (also lets the HTF auto-fetch run in SCALP so confidence sees real 1H/4H/1D).
+#   • MI_STRUCTURE_FALLBACK_ENABLED — money-path: a STRONG, persistent, multi-confirm
+#     one-sided directional confidence may SATISFY the structure boolean so the bot
+#     can short a clearly-bearish tape (or long a bullish one) with NO BOS/CHOCH
+#     alert. Awards ZERO structure edge points; still must clear VWAP + edge + EVERY
+#     safety gate + the CVD hard veto. FAIL-CLOSED on any stale/unknown input.
+#   • MI_STRATEGY_FILTER_ENABLED   — money-path (DEMOTE-ONLY): block an already-READY
+#     setup whose strategy fights the current market state. Never creates/upgrades.
+MARKET_INTELLIGENCE_ENABLED   = _env_flag_on("MARKET_INTELLIGENCE_ENABLED")
+MI_STRUCTURE_FALLBACK_ENABLED = _env_flag_on("MI_STRUCTURE_FALLBACK_ENABLED")
+MI_STRATEGY_FILTER_ENABLED    = _env_flag_on("MI_STRATEGY_FILTER_ENABLED")
+# ── Market Intelligence — optional future TV alerts (sharper confidence) ──────
+# v1 derives direction from HTF 1H/4H/1D + alert-derived 1m structure + RVOL/CVD/
+# ATR. The directional-confidence + market-state read would sharpen materially if
+# the TradingView side added the following (ALL optional — absence degrades
+# gracefully and must NEVER break the gate; add each to the Pine source scripts,
+# see the pine-webhook-source-scripts memory, then fold into
+# compute_directional_confidence / compute_market_state as extra FRESH confirmations,
+# never as a newly-REQUIRED input without an explicit money-path decision):
+#   • EMA alignment (e.g. 9/21/50 stacked) per 1m/5m/15m — trend quality + pullbacks.
+#   • True 15m and 5m BOS/CHOCH structure alerts (today only 1m structure arrives).
+#   • Second-by-second price velocity / momentum burst (sub-bar acceleration).
+# Per-instrument trend memory + confidence persistence (hysteresis state). Mutated
+# from full_analysis (single eval thread) and read by the gate; guarded by a plain
+# Lock that NEVER nests under a money lock. DISPLAY / intelligence state only.
+MARKET_INTELLIGENCE_STATE_BY_INST = {}
+MARKET_INTELLIGENCE_LOCK = threading.Lock()
+# Confidence tuning constants (transparent, component-summed — see compute_directional_confidence).
+MI_CONF_FLOOR                = 85    # min dominant-side confidence for the structure fallback
+MI_CONF_OPPOSITE_MAX         = 55    # opposite side must be at/below this (one-sided tape)
+MI_CONF_MARGIN_MIN           = 25    # dominant - opposite must be at/above this
+MI_PERSIST_MIN_EVALS         = 2     # consecutive aligned evals required ...
+MI_PERSIST_MIN_SECONDS       = 60    # ... OR this many seconds of a standing aligned bias
+MI_TREND_FLIP_CONF           = 70    # hysteresis: opposite side must reach this to FLIP the trend
+MI_CONF_DECAY_FULL_SEC       = 120   # SCALP: confidence fully decays this long after the last confirm
+MI_CONF_DECAY_FULL_SEC_SWING = 900   # SWING decays much slower (HTF context persists)
 DUAL_TF_BIAS_TTL_SEC    = 600   # 10 min: a standing bias expires if no entry fires
 # Convergence window: each of the >=2 confirmations must be this fresh (seconds) to
 # count, so an entry fires only when they all land within this window of NOW (=> within
@@ -5631,8 +5677,12 @@ def _update_htf_auto(instrument):
 
 def _refresh_htf_if_due(force=False):
     """Throttled HTF refresh for all instruments (every HTF_FETCH_INTERVAL). Called
-    from the VWAP loop; only does work when _swing_htf_enabled(). Fail-open."""
-    if not _swing_htf_enabled():
+    from the VWAP loop. Runs when _swing_htf_enabled() OR when the Market
+    Intelligence layer is on (it needs real 1H/4H/1D context in SCALP too, where
+    SWING HTF is otherwise never fetched). Populating HTF_STATE_BY_INST is INERT
+    for the SCALP money path (every SWING consumer still gates on _swing_htf_enabled);
+    only the display-first MI layer reads it via compute_swing_context. Fail-open."""
+    if not (_swing_htf_enabled() or MARKET_INTELLIGENCE_ENABLED):
         return
     nowm = time.monotonic()
     if not force and (nowm - _HTF_LAST_REFRESH_TS[0]) < HTF_FETCH_INTERVAL:
@@ -6457,6 +6507,101 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     structure_long  = bool(has_bos_demand or has_choch_demand or hh_ts or hl_ts)
     structure_short = bool(has_bos_supply or has_choch_supply or lh_ts or ll_ts)
 
+    # ── Market Intelligence structure fallback (T003; flag-gated, FAIL-CLOSED) ──
+    # A STRONG, persistent, multi-confirmation one-sided directional confidence MAY
+    # satisfy the structure boolean so the bot can short a clearly-bearish tape (or
+    # long a bullish one) with NO BOS/CHOCH/swing alert. It satisfies ONLY the
+    # structure gate: it awards ZERO BOS/CHOCH edge points (the Edge Score reads the
+    # alert flags has_bos_*/has_choch_*/swings, NEVER structure_*), and EVERY other
+    # gate (VWAP, the Edge thresholds, the CVD directional check, conflict, volume,
+    # location, volatility, and all downstream safety) still applies unchanged — and
+    # the fallback ITSELF requires a fresh, AGREEING CVD + a fresh RVOL/volume spike,
+    # so it can never open a CVD-conflicting or stale-input trade. SCALP-only and
+    # live-mode-only (SWING's 80 Edge floor is unreachable without real structure
+    # anyway; build_strategy_context reads the global cfg(), so the gate mode must be
+    # the live TRADING_MODE). When the flag is OFF both fallbacks are False,
+    # structure_gate_* == structure_*, no new key is emitted, and the gate is
+    # BYTE-IDENTICAL to legacy (goldens prove it). FAIL-CLOSED: any stale/unknown
+    # required input — or any error — yields NO fallback.
+    structure_fallback_long = structure_fallback_short = False
+    if (MARKET_INTELLIGENCE_ENABLED and MI_STRUCTURE_FALLBACK_ENABLED
+            and str(m).upper() == "SCALP" and m == TRADING_MODE):
+        try:
+            _mi_ctx = build_strategy_context(ticker, current_price, vwap, vwap_status, volatility)
+            try:
+                _mi_swing = compute_swing_context(inst, current_price)
+            except Exception:
+                _mi_swing = None
+            _mi_conf = compute_directional_confidence(_mi_ctx, _mi_swing)
+            # Read-only (persist=False) view of the STANDING trend memory the display
+            # path persists — the gate NEVER mutates the hysteresis state.
+            _mi_mem  = update_trend_memory(inst, _mi_conf, _mi_ctx, _mi_swing, m, persist=False)
+            # Fresh-CVD guard: CVD_BY_TICKER persists indefinitely, so "cvd" being in
+            # the fresh-confirmation set is not enough — require a CVD update within
+            # the active stage window before it can count toward the fallback.
+            _cvd_rec = CVD_BY_TICKER.get(inst) or {}
+            _cvd_fresh = False
+            try:
+                _cvd_ts = _cvd_rec.get("ts")
+                if _cvd_ts and stage_window:
+                    _cvd_age = (now_utc() - datetime.fromisoformat(_cvd_ts)).total_seconds()
+                    _cvd_fresh = bool(0 <= _cvd_age <= stage_window * 60)
+            except (TypeError, ValueError):
+                _cvd_fresh = False
+            # Fresh-RVOL/volume guard: snap["rvol_value"] is read from RVOL_BY_TICKER
+            # WITHOUT a TTL check, so a stale RVOL >= threshold could otherwise count as
+            # a "volume" confirmation. Require a FRESH volume spike, or an RVOL value
+            # >= threshold whose record is within the stage window (fail-closed).
+            _vol_fresh = False
+            try:
+                if _volume_spike_fresh(inst):
+                    _vol_fresh = True
+                else:
+                    _rvol_rec = RVOL_BY_TICKER.get(inst) or {}
+                    _rvol_val = _rvol_rec.get("value")
+                    _rvol_ts  = _rvol_rec.get("ts")
+                    if (_rvol_val is not None and _rvol_ts and stage_window
+                            and float(_rvol_val) >= float(cfg("RVOL_CONFIRM_THRESHOLD"))):
+                        _rvol_age = (now_utc() - datetime.fromisoformat(_rvol_ts)).total_seconds()
+                        _vol_fresh = bool(0 <= _rvol_age <= stage_window * 60)
+            except (TypeError, ValueError):
+                _vol_fresh = False
+            _mi_core = {"vwap", "htf"}   # volume + CVD required too, via the fresh guards below
+            def _mi_fallback_ok(side):
+                fresh = set(_mi_conf["short_fresh"] if side == "short" else _mi_conf["long_fresh"])
+                dom_c = _mi_conf["short"] if side == "short" else _mi_conf["long"]
+                opp_c = _mi_conf["long"]  if side == "short" else _mi_conf["short"]
+                want_dom     = "down" if side == "short" else "up"
+                forbid_trend = "up"   if side == "short" else "down"
+                return bool(
+                    dom_c >= MI_CONF_FLOOR
+                    and opp_c <= MI_CONF_OPPOSITE_MAX
+                    and _mi_conf["margin"] >= MI_CONF_MARGIN_MIN
+                    and _mi_mem.get("persistence_ok")
+                    and _mi_mem.get("dominant_side") == want_dom
+                    and _mi_mem.get("currentTrend") != forbid_trend
+                    and _mi_core.issubset(fresh)
+                    and "volume" in fresh and _vol_fresh
+                    and "cvd" in fresh and _cvd_fresh
+                )
+            structure_fallback_short = _mi_fallback_ok("short")
+            structure_fallback_long  = _mi_fallback_ok("long")
+        except Exception as _mi_exc:
+            logger.warning("MI structure fallback error (fail-closed): %s", _mi_exc)
+            structure_fallback_long = structure_fallback_short = False
+    # Gate-side structure boolean (native OR confidence fallback) + a per-side source
+    # tag for /status + the trade card. The native structure_long/short vars stay
+    # UNTOUCHED so the Edge Score, conflict timestamps, trend-memory scoring and the
+    # MI component display all keep reading real structure only.
+    structure_gate_long  = bool(structure_long  or structure_fallback_long)
+    structure_gate_short = bool(structure_short or structure_fallback_short)
+    structure_source_long  = ("confidence_fallback"
+                              if (structure_fallback_long and not structure_long)
+                              else "native_structure")
+    structure_source_short = ("confidence_fallback"
+                              if (structure_fallback_short and not structure_short)
+                              else "native_structure")
+
     # ── Zone-valid (required gate): the trade-side zone must have been MITIGATED
     #    AND then REACTED to. Mitigation alone is the old "consumed / stand-aside"
     #    state; pairing it with a same-direction reaction (5m confirmation candle,
@@ -6748,7 +6893,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             _zone_valid  = zone_valid_long
             _zone_state_str  = zone_state_long
             _zone_valid_soft = zone_valid_soft_long
-            _structure   = structure_long
+            _structure   = structure_gate_long
+            _struct_src  = structure_source_long
             _candle      = has_bull_confirm
             _location    = location_long
         else:
@@ -6760,7 +6906,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             _zone_valid  = zone_valid_short
             _zone_state_str  = zone_state_short
             _zone_valid_soft = zone_valid_soft_short
-            _structure   = structure_short
+            _structure   = structure_gate_short
+            _struct_src  = structure_source_short
             _candle      = has_bear_confirm
             _location    = location_short
         return {
@@ -6788,6 +6935,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "edgeScore":             int(score),
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
             "structure_confirmed":   bool(_structure),
+            # T003: when the confidence fallback satisfied structure (vs a real
+            # BOS/CHOCH/swing alert), tag the source. Flag-gated so the OFF gate_debug
+            # is byte-identical to legacy.
+            **({"structure_source": _struct_src} if MI_STRUCTURE_FALLBACK_ENABLED else {}),
             "candle_confirmed":      bool(_candle),
             "liquidity_sweep":       bool(sig["liquidity_sweep"]),
             "trend_aligned":         bool(trend_long if direction == "Long" else trend_short),
@@ -6930,7 +7081,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "direction":           "Short",
                 "bos":                 bool(has_bos_supply),
                 "choch":               bool(has_choch_supply),
-                "structure_confirmed": structure_short,
+                "structure_confirmed": structure_gate_short,
                 "confirmation":        bool(has_bear_confirm or zone_valid_short),
                 "confirmation_candle": bool(has_bear_confirm),
                 "vwap":                price_below,
@@ -6948,7 +7099,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "direction":           "Long" if direction == "Long" else None,
             "bos":                 bool(has_bos_demand),
             "choch":               bool(has_choch_demand),
-            "structure_confirmed": structure_long,
+            "structure_confirmed": structure_gate_long,
             "confirmation":        bool(has_bull_confirm or zone_valid_long),
             "confirmation_candle": bool(has_bull_confirm),
             "vwap":                price_above,
@@ -8961,6 +9112,442 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
         out["regime_reason"] = "Engine unavailable — defaulting safe"
         out["reason"]        = "Strategy engine unavailable."
         return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Market Intelligence layer (display-first). Built ON TOP of the existing strategy
+# machinery (build_strategy_context + detect_market_regime + compute_swing_context)
+# — NOT a parallel brain. Every function is PURE / FAIL-OPEN and returns a stable
+# schema. The money-path effects (confidence-as-structure fallback, demote-only
+# strategy filter) live behind their own flags elsewhere; this block only computes
+# and explains. See the MARKET_INTELLIGENCE_* constants above for the tuning.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Transparent Long/Short directional-confidence components. Each contributes its
+# points to a 0-100 score for ONE side when its condition is present AND fresh.
+# Native structure scores only 10 so a confidence-only (no BOS/CHOCH) tape must
+# stack VWAP + CVD + HTF + Volume + Sweep to clear MI_CONF_FLOOR — the structure
+# fallback can never fire on a thin signal.
+MI_CONF_COMPONENTS = {
+    "htf":       25,   # 1H AND 4H higher-timeframe bias agree with the side, not stale
+    "vwap":      20,   # price on the trade side of a fresh VWAP
+    "cvd":       20,   # CVD state agrees with the side (fresh, non-conflicting)
+    "volume":    15,   # RVOL >= confirm threshold OR a fresh volume spike
+    "sweep":     10,   # a same-side liquidity sweep is present
+    "structure": 10,   # native BOS/CHOCH/HH-HL (long) or BOS/CHOCH/LH-LL (short)
+}
+
+
+def _mi_side_components(ctx, swing_ctx, side):
+    """Return (score, components, fresh_confirmation_codes) for ONE side ('long' /
+    'short') from the already-assembled strategy ctx + HTF context. FAIL-OPEN: a
+    missing / unknown input simply contributes 0 (never raises, never negative).
+
+    `fresh_confirmation_codes` is the set of INDEPENDENT, FRESH confirmations the
+    money-path fallback consumes — a subset of the scored components that EXCLUDES
+    native structure (the fallback exists precisely for the no-structure case)."""
+    is_long = (side == "long")
+    comps, fresh, score = [], set(), 0
+
+    # HTF 1H+4H alignment (never stale). compute_swing_context populates bias even
+    # in SCALP once the MI-driven auto-fetch has run; fail-closed when stale/missing.
+    htf_aligned = False
+    if isinstance(swing_ctx, dict) and not swing_ctx.get("stale"):
+        htf_aligned = bool(swing_ctx.get("aligned_long") if is_long else swing_ctx.get("aligned_short"))
+    if htf_aligned:
+        score += MI_CONF_COMPONENTS["htf"]; fresh.add("htf")
+    comps.append({"label": "HTF 1H+4H aligned", "met": htf_aligned,
+                  "points": MI_CONF_COMPONENTS["htf"] if htf_aligned else 0})
+
+    # VWAP side — build_strategy_context only sets price_above/below when vwap is OK.
+    vwap_side = bool(ctx.get("price_above_vwap") if is_long else ctx.get("price_below_vwap"))
+    if vwap_side:
+        score += MI_CONF_COMPONENTS["vwap"]; fresh.add("vwap")
+    comps.append({"label": "Price on trade side of VWAP", "met": vwap_side,
+                  "points": MI_CONF_COMPONENTS["vwap"] if vwap_side else 0})
+
+    # CVD agreement (fresh, non-conflicting). A conflict scores 0 here AND the gate's
+    # CVD hard veto independently blocks the trade, so the fallback can never oppose CVD.
+    cvd_agree = bool(ctx.get("cvd_state") == ("bullish" if is_long else "bearish"))
+    if cvd_agree:
+        score += MI_CONF_COMPONENTS["cvd"]; fresh.add("cvd")
+    comps.append({"label": "CVD agrees", "met": cvd_agree,
+                  "points": MI_CONF_COMPONENTS["cvd"] if cvd_agree else 0})
+
+    # Volume (RVOL >= threshold OR a fresh volume spike) — already combined in ctx.
+    vol_ok = bool(ctx.get("volume_ok"))
+    if vol_ok:
+        score += MI_CONF_COMPONENTS["volume"]; fresh.add("volume")
+    comps.append({"label": "Volume confirms (RVOL/spike)", "met": vol_ok,
+                  "points": MI_CONF_COMPONENTS["volume"] if vol_ok else 0})
+
+    # Same-side liquidity sweep.
+    sweep = bool(ctx.get("has_bull_sweep") if is_long else ctx.get("has_bear_sweep"))
+    if sweep:
+        score += MI_CONF_COMPONENTS["sweep"]; fresh.add("sweep")
+    comps.append({"label": "Liquidity sweep (same side)", "met": sweep,
+                  "points": MI_CONF_COMPONENTS["sweep"] if sweep else 0})
+
+    # Native structure (scored for display, but NOT a fallback confirmation).
+    structure = bool(ctx.get("structure_long") if is_long else ctx.get("structure_short"))
+    if structure:
+        score += MI_CONF_COMPONENTS["structure"]
+    comps.append({"label": "Native structure (BOS/CHOCH/swings)", "met": structure,
+                  "points": MI_CONF_COMPONENTS["structure"] if structure else 0})
+
+    return min(100, score), comps, fresh
+
+
+def compute_directional_confidence(ctx, swing_ctx):
+    """Transparent 0-100 Long & Short directional confidence + the fresh-confirmation
+    sets the money-path fallback consumes. PURE / FAIL-OPEN."""
+    long_score, long_comps, long_fresh    = _mi_side_components(ctx, swing_ctx, "long")
+    short_score, short_comps, short_fresh = _mi_side_components(ctx, swing_ctx, "short")
+    if long_score > short_score:
+        bias = "Long"
+    elif short_score > long_score:
+        bias = "Short"
+    else:
+        bias = "Neutral"
+    return {
+        "long": int(long_score), "short": int(short_score), "bias": bias,
+        "margin": int(abs(long_score - short_score)),
+        "long_components": long_comps, "short_components": short_comps,
+        "long_fresh": sorted(long_fresh), "short_fresh": sorted(short_fresh),
+    }
+
+
+def compute_market_state(ctx, swing_ctx, regime, conf):
+    """Classify the tape into ONE of nine display states. Priority cascade, FAIL-OPEN
+    to RANGE. DISPLAY-ONLY — the strict gate never reads this."""
+    def res(state, label, reason):
+        return {"state": state, "label": label, "reason": reason}
+    try:
+        bias = conf["bias"]
+        long_c, short_c = conf["long"], conf["short"]
+        # 1. Breakout — price cleared the intraday range on the dominant side.
+        if ctx.get("broke_range_high") and long_c >= short_c:
+            return res("BREAKOUT", "Breakout (up)", "Price broke the intraday range high")
+        if ctx.get("broke_range_low") and short_c >= long_c:
+            return res("BREAKOUT", "Breakout (down)", "Price broke the intraday range low")
+        # 2. Liquidity hunt — a sweep with no same-side follow-through yet (stop run).
+        if ctx.get("has_bear_sweep") and not ctx.get("has_bear_confirm") and not ctx.get("broke_range_low"):
+            return res("LIQUIDITY_HUNT", "Liquidity hunt", "Sell-side sweep without follow-through")
+        if ctx.get("has_bull_sweep") and not ctx.get("has_bull_confirm") and not ctx.get("broke_range_high"):
+            return res("LIQUIDITY_HUNT", "Liquidity hunt", "Buy-side sweep without follow-through")
+        # 3. Reversal — CHOCH against the prior direction aligned with the new bias.
+        if ctx.get("has_choch_supply") and bias == "Short":
+            return res("REVERSAL", "Reversal (down)", "CHOCH supply flipped structure lower")
+        if ctx.get("has_choch_demand") and bias == "Long":
+            return res("REVERSAL", "Reversal (up)", "CHOCH demand flipped structure higher")
+        # 4. Compression / expansion regimes from ATR.
+        if ctx.get("atr_contraction") or ctx.get("range_tight"):
+            return res("COMPRESSION", "Compression", "ATR contraction / tight range — coiling")
+        if ctx.get("atr_stretched") or (regime or {}).get("regime") == "VOLATILE":
+            if bias == "Long" and long_c >= MI_CONF_FLOOR:
+                return res("TREND_UP", "Trend up (expanding)", "Strong upside confidence with expanding range")
+            if bias == "Short" and short_c >= MI_CONF_FLOOR:
+                return res("TREND_DOWN", "Trend down (expanding)", "Strong downside confidence with expanding range")
+            return res("EXPANSION", "Expansion", "Volatility expanding without a clear side")
+        # 5. Established trends (+ pullback when retracing to VWAP).
+        if bias == "Long" and long_c >= 60:
+            if ctx.get("near_vwap"):
+                return res("PULLBACK", "Pullback (in uptrend)", "Uptrend pulling back toward VWAP")
+            return res("TREND_UP", "Trend up", "Upside has control")
+        if bias == "Short" and short_c >= 60:
+            if ctx.get("near_vwap"):
+                return res("PULLBACK", "Pullback (in downtrend)", "Downtrend pulling back toward VWAP")
+            return res("TREND_DOWN", "Trend down", "Downside has control")
+        # 6. Default — rotational / balanced.
+        return res("RANGE", "Range / balanced", "No side in control — rotational")
+    except Exception:
+        return res("RANGE", "Range / balanced", "State unavailable — defaulting safe")
+
+
+def update_trend_memory(inst, conf, ctx, swing_ctx, mode, persist=True):
+    """Per-instrument hysteresis trend memory + confidence persistence. Mutates
+    MARKET_INTELLIGENCE_STATE_BY_INST under lock when persist=True; otherwise a
+    read-only derived view of the stored state. FAIL-OPEN.
+
+    Hysteresis: the standing trend only FLIPS when the opposite side reaches
+    MI_TREND_FLIP_CONF with >= MI_CONF_MARGIN_MIN margin, so a single weak counter
+    read never whipsaws it. Persistence is satisfied by >= MI_PERSIST_MIN_EVALS
+    consecutive aligned evals OR >= MI_PERSIST_MIN_SECONDS of a standing bias."""
+    nowdt = now_utc(); now_iso = nowdt.isoformat(); now_ts = nowdt.timestamp()
+    long_c, short_c, margin = conf["long"], conf["short"], conf["margin"]
+    if long_c > short_c:
+        dom = "up"
+    elif short_c > long_c:
+        dom = "down"
+    else:
+        dom = "neutral"
+    structure_side_now = bool(ctx.get("structure_long") if dom == "up"
+                              else ctx.get("structure_short") if dom == "down" else False)
+    with MARKET_INTELLIGENCE_LOCK:
+        st = dict(MARKET_INTELLIGENCE_STATE_BY_INST.get(inst) or {})
+        cur_trend     = st.get("currentTrend", "neutral")
+        dom_since     = st.get("dominant_since_ts")
+        eval_count    = int(st.get("eval_count", 0))
+        last_update   = st.get("last_update_ts")
+        trend_started = st.get("trendStartedAt")
+        last_struct   = st.get("lastConfirmedStructure")
+        if persist:
+            # Advance persistence at most ~2x/sec so bursty peer/webhook re-evals of the
+            # SAME instrument don't inflate the consecutive-eval counter.
+            advance = (last_update is None) or ((now_ts - float(last_update)) >= 0.5)
+            if advance:
+                if dom != "neutral" and dom == st.get("dominant_side"):
+                    eval_count += 1
+                else:
+                    eval_count = 1 if dom != "neutral" else 0
+                    dom_since  = now_ts if dom != "neutral" else None
+                last_update = now_ts
+            # Hysteresis trend flip (neutral reads never flip — the trend persists).
+            if dom == "up" and cur_trend != "up" and long_c >= MI_TREND_FLIP_CONF and margin >= MI_CONF_MARGIN_MIN:
+                cur_trend, trend_started = "up", now_iso
+            elif dom == "down" and cur_trend != "down" and short_c >= MI_TREND_FLIP_CONF and margin >= MI_CONF_MARGIN_MIN:
+                cur_trend, trend_started = "down", now_iso
+            if structure_side_now:
+                last_struct = now_iso
+            st.update(currentTrend=cur_trend, dominant_side=dom, dominant_since_ts=dom_since,
+                      eval_count=eval_count, last_update_ts=last_update,
+                      trendStartedAt=trend_started, lastConfirmedStructure=last_struct)
+            MARKET_INTELLIGENCE_STATE_BY_INST[inst] = st
+        # Derived (read) view.
+        trend_conf = long_c if cur_trend == "up" else short_c if cur_trend == "down" else max(long_c, short_c)
+        opp_conf   = short_c if cur_trend == "up" else long_c if cur_trend == "down" else min(long_c, short_c)
+        strength   = "strong" if trend_conf >= 85 else "moderate" if trend_conf >= 70 else "weak"
+        weakening  = bool(cur_trend != "neutral" and opp_conf >= MI_CONF_OPPOSITE_MAX)
+        age_seconds = (now_ts - float(dom_since)) if dom_since else None
+        persistence_ok = bool((eval_count >= MI_PERSIST_MIN_EVALS)
+                              or (age_seconds is not None and age_seconds >= MI_PERSIST_MIN_SECONDS))
+        inval = None
+        if isinstance(swing_ctx, dict):
+            if cur_trend == "up":
+                inval = (swing_ctx.get("nearest_support") or {}).get("value")
+            elif cur_trend == "down":
+                inval = (swing_ctx.get("nearest_resistance") or {}).get("value")
+        return {
+            "currentTrend": cur_trend, "dominant_side": dom,
+            "trendConfidence": int(trend_conf), "oppositeConfidence": int(opp_conf),
+            "trendStartedAt": trend_started, "lastConfirmedStructure": last_struct,
+            "trendStrength": strength, "trendWeakening": weakening,
+            "invalidationLevel": inval, "persistence_ok": persistence_ok,
+            "eval_count": int(eval_count),
+            "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+        }
+
+
+def compute_momentum_state(ctx):
+    """Coarse momentum read proxied from CVD direction + ATR expansion + volume
+    (no second-by-second price velocity feed yet). PURE / FAIL-OPEN."""
+    cvd_dir = (ctx.get("cvd_direction") or "").lower()
+    rising, falling = cvd_dir == "rising", cvd_dir == "falling"
+    atr_stretched   = bool(ctx.get("atr_stretched"))
+    atr_contraction = bool(ctx.get("atr_contraction"))
+    vol_ok          = bool(ctx.get("volume_ok"))
+    if atr_stretched and (rising or falling) and vol_ok:
+        state = "accelerating"
+    elif atr_contraction or (not vol_ok and not (rising or falling)):
+        state = "fading"
+    else:
+        state = "stable"
+    return {
+        "state": state, "cvd_direction": ctx.get("cvd_direction"),
+        "atr_expanding": atr_stretched, "atr_contracting": atr_contraction,
+        "volume_confirms": vol_ok,
+        "note": "Velocity is proxied from CVD direction + ATR expansion + volume "
+                "(no second-by-second price-velocity feed yet).",
+    }
+
+
+def apply_confidence_decay(score, age_seconds, mode):
+    """Linearly decay a confidence score toward 0 as the dominant signal ages without
+    a fresh confirmation. SCALP decays fast, SWING slow. Returns (decayed, factor)."""
+    if score is None:
+        return None, 0.0
+    full = MI_CONF_DECAY_FULL_SEC_SWING if str(mode).upper() == "SWING" else MI_CONF_DECAY_FULL_SEC
+    try:
+        age = max(0.0, float(age_seconds or 0.0))
+    except (TypeError, ValueError):
+        age = 0.0
+    if full <= 0:
+        return int(score), 1.0
+    factor = max(0.0, 1.0 - age / full)
+    return int(round(score * factor)), round(factor, 3)
+
+
+def _market_intelligence_neutral_block(reason, inst=None):
+    """Stable neutral schema for the closed-market override + the fail-open path so
+    /status + the dashboard always see every key."""
+    return {
+        "enabled": bool(MARKET_INTELLIGENCE_ENABLED),
+        "instrument": (instrument_of(inst) if inst else None), "mode": TRADING_MODE,
+        "market_state": {"state": "UNKNOWN", "label": "Unavailable", "reason": reason},
+        "directional_confidence": {"long": 0, "short": 0, "bias": "Neutral", "margin": 0,
+                                   "long_components": [], "short_components": [],
+                                   "long_fresh": [], "short_fresh": []},
+        "trend_memory": {"currentTrend": "neutral", "dominant_side": "neutral",
+                         "trendConfidence": 0, "oppositeConfidence": 0,
+                         "trendStartedAt": None, "lastConfirmedStructure": None,
+                         "trendStrength": "weak", "trendWeakening": False,
+                         "invalidationLevel": None, "persistence_ok": False,
+                         "eval_count": 0, "age_seconds": None},
+        "momentum": {"state": "unknown", "cvd_direction": None, "atr_expanding": False,
+                     "atr_contracting": False, "volume_confirms": False, "note": reason},
+        "confidence_decay": {"dominant_side": "Neutral", "raw": 0, "decayed": 0,
+                             "factor": 0.0, "age_seconds": None},
+        "htf": {"available": False, "stale": True, "aligned_long": False, "aligned_short": False,
+                "bias_1h": None, "bias_4h": None, "bias_daily": None},
+        "regime": {"regime": "CLOSED", "reason": reason},
+        "structure_source": None, "strategy_permissions": None,
+        "accepted_rejected_reason": reason, "as_of": now_utc().isoformat(),
+    }
+
+
+# ── Market-Intelligence strategy filter (T004) ───────────────────────────────
+# A market state has a trend-CONTINUATION side it favors (or None when the tape is
+# ambiguous / transitional). This ONE helper feeds BOTH the display permissions and
+# the flag-gated money-path direction filter, so the dashboard and the veto can never
+# disagree. Pure + fail-open (returns None on anything unclear → the filter never
+# demotes). DISPLAY presence is gated on MARKET_INTELLIGENCE_ENABLED; the actual WAIT
+# veto is separately gated on MI_STRATEGY_FILTER_ENABLED at the full_analysis seam.
+def _mi_state_favored_side(state_block):
+    try:
+        st  = (state_block or {}).get("state")
+        lbl = ((state_block or {}).get("label") or "").lower()
+    except Exception:
+        return None
+    if st == "TREND_UP":
+        return "long"
+    if st == "TREND_DOWN":
+        return "short"
+    # BREAKOUT / PULLBACK carry the side in the label ("(up)" / "(in uptrend)" etc).
+    if st in ("BREAKOUT", "PULLBACK"):
+        if "up" in lbl and "down" not in lbl:
+            return "long"
+        if "down" in lbl and "up" not in lbl:
+            return "short"
+    # RANGE / COMPRESSION / EXPANSION / LIQUIDITY_HUNT / REVERSAL / UNKNOWN / missing
+    # are ambiguous → no favored side → the filter NEVER demotes (fail-open).
+    return None
+
+
+def _mi_strategy_permissions(state_block, filter_active):
+    """DISPLAY-ONLY allowed/blocked DIRECTION map for the dashboard MI panel. Mirrors
+    the money-path filter's logic (same _mi_state_favored_side source) so what the user
+    sees matches what the gate does. When the filter is OFF the favored side is shown as
+    informational only — NO red 'blocked' chip — so it never implies a block that is not
+    actually happening. FAIL-OPEN: returns None on any error (panel shows 'inactive')."""
+    try:
+        side  = _mi_state_favored_side(state_block)
+        label = (state_block or {}).get("label") or "the current state"
+        if side is None:
+            return {"active": bool(filter_active), "allowed": [], "blocked": []}
+        favored, counter = (("Long", "Short") if side == "long" else ("Short", "Long"))
+        if filter_active:
+            return {
+                "active": True,
+                "allowed": ["%s setups (with trend)" % favored],
+                "blocked": [{"name": "%s setups" % counter,
+                             "reason": "%s — counter-trend" % label}],
+            }
+        return {"active": False,
+                "allowed": ["%s favored (with trend)" % favored], "blocked": []}
+    except Exception:
+        return None
+
+
+def _mi_permission_reason(state_block, filter_active):
+    """One-line 'why this read' for the dashboard MI panel. Honest about whether the
+    filter is actually armed. FAIL-OPEN: None on error."""
+    try:
+        side  = _mi_state_favored_side(state_block)
+        label = (state_block or {}).get("label") or "the current state"
+        if side is None:
+            return "No directional constraint — %s." % label
+        favored, counter = (("long", "short") if side == "long" else ("short", "long"))
+        if filter_active:
+            return ("Market is %s — counter-trend %ss are filtered (demoted to WAIT)."
+                    % (label, counter))
+        return "Market is %s — favors %ss (counter-trend filter inactive)." % (label, favored)
+    except Exception:
+        return None
+
+
+def _mi_strategy_filter_veto(result):
+    """DEMOTE-ONLY money-path filter. Returns (veto: bool, reason: str). Fires ONLY when
+    an actionable setup's strict DIRECTION opposes an UNAMBIGUOUS market state (e.g. a
+    Short while the tape is TREND_UP). It can NEVER promote a trade. FAIL-OPEN: any error,
+    an ambiguous / unknown state, or a missing direction returns (False, "")."""
+    try:
+        mi   = result.get("market_intelligence") or {}
+        side = _mi_state_favored_side(mi.get("market_state"))
+        if side is None:
+            return (False, "")
+        direction = result.get("strict_direction")
+        if direction not in ("Long", "Short"):
+            return (False, "")
+        favored_dir = "Long" if side == "long" else "Short"
+        if direction == favored_dir:
+            return (False, "")     # with-trend setup — never demote
+        label = (mi.get("market_state") or {}).get("label") or "the current market state"
+        return (True, "%s setup fights the market state (%s)." % (direction, label))
+    except Exception:
+        return (False, "")
+
+
+def compute_market_intelligence(ticker, mode, current_price, vwap_value, vwap_status,
+                                volatility, edge_score, persist=True):
+    """Assemble the display-first Market Intelligence block on the SAME machinery as
+    the strategy engine. Mutates only the per-instrument trend-memory store (under
+    lock, when persist=True). FAIL-OPEN: any error degrades to a neutral block so the
+    analysis pipeline can never crash on it."""
+    inst = instrument_of(ticker)
+    try:
+        ctx    = build_strategy_context(ticker, current_price, vwap_value, vwap_status, volatility)
+        regime = detect_market_regime(ctx)
+        try:
+            swing_ctx = compute_swing_context(inst, current_price)
+        except Exception:
+            swing_ctx = None
+        conf  = compute_directional_confidence(ctx, swing_ctx)
+        state = compute_market_state(ctx, swing_ctx, regime, conf)
+        mem   = update_trend_memory(inst, conf, ctx, swing_ctx, mode, persist=persist)
+        mom   = compute_momentum_state(ctx)
+        dom_side  = conf["bias"]
+        dom_score = (conf["long"] if dom_side == "Long"
+                     else conf["short"] if dom_side == "Short"
+                     else max(conf["long"], conf["short"]))
+        age = mem.get("age_seconds")
+        decayed, factor = apply_confidence_decay(dom_score, age, mode)
+        decay = {"dominant_side": dom_side, "raw": int(dom_score), "decayed": decayed,
+                 "factor": factor, "age_seconds": age}
+        htf = {
+            "available": bool(isinstance(swing_ctx, dict) and not swing_ctx.get("stale")),
+            "stale": bool(swing_ctx.get("stale")) if isinstance(swing_ctx, dict) else True,
+            "aligned_long": bool(swing_ctx.get("aligned_long")) if isinstance(swing_ctx, dict) else False,
+            "aligned_short": bool(swing_ctx.get("aligned_short")) if isinstance(swing_ctx, dict) else False,
+            "bias_1h": (swing_ctx or {}).get("bias_1h"), "bias_4h": (swing_ctx or {}).get("bias_4h"),
+            "bias_daily": (swing_ctx or {}).get("bias_daily"),
+        }
+        return {
+            "enabled": True, "instrument": inst, "mode": mode,
+            "market_state": state, "directional_confidence": conf,
+            "trend_memory": mem, "momentum": mom, "confidence_decay": decay,
+            "htf": htf, "regime": regime,
+            # structure_source is stamped by the money path (T003). strategy_permissions
+            # + accepted_rejected_reason are the DISPLAY read of the strategy filter
+            # (T004) — present whenever MI is on; the actual WAIT veto is separately
+            # gated on MI_STRATEGY_FILTER_ENABLED at the full_analysis veto seam.
+            "structure_source": None,
+            "strategy_permissions": _mi_strategy_permissions(state, MI_STRATEGY_FILTER_ENABLED),
+            "accepted_rejected_reason": _mi_permission_reason(state, MI_STRATEGY_FILTER_ENABLED),
+            "as_of": now_utc().isoformat(),
+        }
+    except Exception as exc:
+        logger.warning("market intelligence error: %s", exc)
+        return _market_intelligence_neutral_block("Intelligence unavailable — defaulting safe.", inst=inst)
 
 
 def _breakout_neutral_block(reason, inst=None, active=False):
@@ -16095,6 +16682,27 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # override below independently neutralizes the verdict so no closed-market send.
     _apply_orb_target_override(result)
 
+    # ── Market Intelligence (display-first) ────────────────────────────────────
+    # Directional market-state + Long/Short confidence + trend memory, built on the
+    # same machinery as the strategy engine above. DISPLAY-ONLY here — the money-path
+    # effects live behind MI_STRUCTURE_FALLBACK_ENABLED / MI_STRATEGY_FILTER_ENABLED.
+    # When the master flag is OFF the key is absent (goldens byte-identical); the
+    # closed-market override below mirrors it. Trend memory only PERSISTS while the
+    # market is open (a closed tape must not advance the hysteresis state).
+    if MARKET_INTELLIGENCE_ENABLED:
+        result["market_intelligence"] = compute_market_intelligence(
+            active_ticker, TRADING_MODE, current_price, vwap_value, vwap_status,
+            volatility, result.get("edge_score"), persist=bool(market.get("open")),
+        )
+        # Surface the structure-source tag the gate stamped on the CANDIDATE direction
+        # (native BOS/CHOCH vs the T003 confidence fallback) so /status, the dashboard
+        # MI panel and the trade card can show WHEN a setup's structure requirement was
+        # satisfied by directional confidence rather than a structure alert. Display-
+        # only; the closed-market override below resets market_intelligence to neutral.
+        _mi_struct_src = (result.get("gate_debug") or {}).get("structure_source")
+        if _mi_struct_src and isinstance(result.get("market_intelligence"), dict):
+            result["market_intelligence"]["structure_source"] = _mi_struct_src
+
     # ── 9:30 ET Breakout Mode (DISPLAY-ONLY advisory; flag-gated, default OFF) ──
     # Grades upside/downside breaks + liquidity-sweep reversals off a DEDICATED 09:30
     # opening range. NEVER touches verdict / directions / trade_plan. When the flag is
@@ -16307,6 +16915,46 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             # it so every display surface agrees with the demoted WAIT verdict.
             result["decision_support"] = _decision_support(result)
             result["entry_quality"]["final_verdict"] = "WAIT"
+        # ── MI Strategy Filter (DEMOTE-ONLY money path; flag-gated, default OFF):
+        #    block an actionable setup whose strict DIRECTION fights an UNAMBIGUOUS
+        #    market state (e.g. a Short while the tape is TREND_UP, or a Long into a
+        #    TREND_DOWN). SCALP-only (mirrors the T003 scope; SWING already needs real
+        #    structure + its own HTF veto) and fail-OPEN — an ambiguous / unknown /
+        #    missing state, or a with-trend setup, NEVER demotes. It can ONLY demote to
+        #    WAIT, never promote. Reads the MI block computed above; mirrors the analyst
+        #    / pro-review / trade-debate / entry-quality veto template exactly. The ORB
+        #    1:4 retarget ran earlier — overwriting trade_plan to False here leaves no
+        #    stale plan, and the now-WAIT verdict stops every later actionable consumer.
+        if (MI_STRATEGY_FILTER_ENABLED and MARKET_INTELLIGENCE_ENABLED
+                and str(TRADING_MODE).upper() == "SCALP"
+                and is_actionable(result["verdict"])):
+            _msf_veto, _msf_why = _mi_strategy_filter_veto(result)
+            if _msf_veto:
+                _msf_reason = "MI Strategy Filter veto: " + _msf_why
+                result["verdict"]       = "WAIT"
+                result["strict_label"]  = "WAIT"
+                result["strict_reason"] = _msf_reason
+                result["trade_plan"]    = {
+                    "trade_plan": False, "reason": _msf_reason,
+                    "entry_zone": None, "stop_loss": None,
+                    "target1":    None, "target2":   None,
+                    "rr":         None, "direction": result.get("strict_direction"),
+                    "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+                }
+                for _vd in ("Long", "Short"):
+                    _vblk = (result.get("directions") or {}).get(_vd)
+                    if _vblk:
+                        _vblk.update(ready=False, label="WAIT")
+                _ad = result.get("alert_diagnostics") or {}
+                _ad["ready_reason"]     = ""
+                _ad["rejected_reasons"] = list(_ad.get("rejected_reasons") or []) + ["MI Strategy Filter veto"]
+                result["alert_diagnostics"] = _ad
+                # Recompute decision-support so every display surface agrees with the WAIT.
+                result["decision_support"] = _decision_support(result)
+                # Reflect the demotion in the MI panel's 'why this read'.
+                _msf_mi = result.get("market_intelligence")
+                if isinstance(_msf_mi, dict):
+                    _msf_mi["accepted_rejected_reason"] = _msf_reason
 
     # ── Learning Engine v2 (display-only): Confidence Governor + Trade Memory.
     # Computed on the ASSEMBLED result AFTER pro_review/trade_debate so grade /
@@ -16481,6 +17129,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["decision_support"]   = _decision_support(result)
         # Strategy engine paused while the market is closed (no live tape).
         result["strategy_engine"]    = _closed_strategy_engine()
+        # Market Intelligence paused while the market is closed (key parity w/ open path).
+        if MARKET_INTELLIGENCE_ENABLED:
+            result["market_intelligence"] = _market_intelligence_neutral_block(
+                "Market closed — intelligence paused.", inst=active_ticker)
         # SWING strategy library filter neutralised while the market is closed (the
         # gate is PAUSED, not deleted): show only the armed/selection state, never a
         # stale "demoted" reason. Gated on the same flags as the open-path attach.
@@ -17055,6 +17707,40 @@ def _build_trade_card_embed(entry, footer_text):
                                     "inline": False})
     except Exception as exc:
         logger.error("Trade-debate card block error: %s", exc)
+
+    # ── Additive: 🧭 Market Intelligence field (display-only; market state + Long/
+    # Short Directional Confidence + trend memory + HTF alignment). Mirrors the
+    # dashboard panel on the live card. Built defensively so a missing/disabled
+    # block simply omits the field (master flag OFF → enabled=False → no field). ──
+    try:
+        mi = entry.get("market_intelligence") or {}
+        if mi.get("enabled"):
+            ms  = mi.get("market_state") or {}
+            dc  = mi.get("directional_confidence") or {}
+            tm  = mi.get("trend_memory") or {}
+            htf = mi.get("htf") or {}
+            def _mi_v(v):
+                return v if v not in (None, "") else "—"
+            mi_lines = [
+                "📊 State: **%s**" % _mi_v(ms.get("label")),
+                "🎮 Control: **%s**  ·  Long %s%% · Short %s%%"
+                % (_mi_v(dc.get("bias")), _mi_v(dc.get("long")), _mi_v(dc.get("short"))),
+                "🧠 Trend: %s · %s (%s%%)"
+                % (_mi_v(tm.get("currentTrend")), _mi_v(tm.get("trendStrength")),
+                   _mi_v(tm.get("trendConfidence"))),
+                "🌐 HTF: 1H %s · 4H %s · 1D %s"
+                % (_mi_v(htf.get("bias_1h")), _mi_v(htf.get("bias_4h")), _mi_v(htf.get("bias_daily"))),
+            ]
+            if mi.get("structure_source") == "confidence_fallback":
+                mi_lines.append("⚡ Structure satisfied by Directional Confidence (no BOS/CHOCH alert)")
+            why = mi.get("accepted_rejected_reason")
+            if why:
+                mi_lines.append("_%s_" % str(why)[:200])
+            embed["fields"].append({"name": "🧭 Market Intelligence",
+                                    "value": "\n".join(mi_lines)[:1024],
+                                    "inline": False})
+    except Exception as exc:
+        logger.error("Market-intelligence card block error: %s", exc)
 
     # Attach the chart screenshot when a validated public URL is present.
     shot = entry.get("screenshot_url")
@@ -20097,6 +20783,11 @@ def _build_card_entry(a, ticker=None, record=None):
     # Defensive .get → absent on a bare/legacy `a` (field simply omitted).
     entry["confidence_governor"] = a.get("confidence_governor")
     entry["trade_memory"] = a.get("trade_memory")
+    # Market Intelligence (display-only): carry the state + Long/Short Directional
+    # Confidence + trend-memory + HTF block onto the card entry so the live card /
+    # journal mirror the dashboard. Defensive .get → absent on a bare/legacy `a`
+    # (field simply omitted); neutral block carries enabled=False when the flag is off.
+    entry["market_intelligence"] = a.get("market_intelligence")
     # SWING (flag-on) only: carry the P4-computed HTF context onto the entry so the
     # managed-trade register can build a per-trade thesis WITHOUT recomputing it
     # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
@@ -28834,6 +29525,7 @@ def status():
         "swing_strategy_filter": a.get("swing_strategy_filter"),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
+        "market_intelligence": a.get("market_intelligence"),
         "breakout_mode":       a.get("breakout_mode"),
         "equity_curve_today":  a.get("equity_curve_today"),
         "news_filter":         a.get("news_filter"),
@@ -33175,6 +33867,60 @@ def dashboard():
       <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Send</button>
     </div>
   </div>
+  <!-- ════ Market Intelligence (DISPLAY-FIRST; fed by d.market_intelligence). Classifies the
+       tape into a market state, scores Long/Short Directional Confidence, holds trend memory
+       with hysteresis, momentum + confidence decay, and (once the money-path flags are on)
+       surfaces allowed/blocked strategies and why a trade was accepted/rejected. The renderer
+       hides the whole panel when the block is absent (master flag OFF). ════ -->
+  <div class="mod" id="mod-mi" style="display:none">
+    <div class="mod-h">🧭 Market Intelligence <span id="mi-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+    <div class="se-top">
+      <div class="gstat"><div class="l">Market State</div><div class="v" id="mi-state">—</div></div>
+      <div class="gstat"><div class="l">Who's in control</div><div class="v" id="mi-bias">—</div></div>
+      <div class="gstat"><div class="l">Long Conf</div><div class="v" id="mi-long">—</div></div>
+      <div class="gstat"><div class="l">Short Conf</div><div class="v" id="mi-short">—</div></div>
+    </div>
+    <div class="se-reason" id="mi-state-reason"></div>
+    <div class="se-bias-h">Confidence Breakdown</div>
+    <div class="le-grid">
+      <div>
+        <div class="le-sub">📈 Long</div>
+        <div class="se-missing" id="mi-long-comps"></div>
+      </div>
+      <div>
+        <div class="le-sub">📉 Short</div>
+        <div class="se-missing" id="mi-short-comps"></div>
+      </div>
+    </div>
+    <div class="se-bias-h">Trend Memory</div>
+    <div class="se-bias">
+      <div class="gstat"><div class="l">Current Trend</div><div class="v" id="mi-trend">—</div></div>
+      <div class="gstat"><div class="l">Strength</div><div class="v" id="mi-strength">—</div></div>
+      <div class="gstat"><div class="l">Trend Conf</div><div class="v" id="mi-trendconf">—</div></div>
+      <div class="gstat"><div class="l">Opposite</div><div class="v" id="mi-oppconf">—</div></div>
+    </div>
+    <div class="se-missing" id="mi-trend-flags"></div>
+    <div class="se-bias-h">Higher-Timeframe Alignment</div>
+    <div class="se-bias">
+      <div class="gstat"><div class="l">1H</div><div class="v" id="mi-h1">—</div></div>
+      <div class="gstat"><div class="l">4H</div><div class="v" id="mi-h4">—</div></div>
+      <div class="gstat"><div class="l">Daily</div><div class="v" id="mi-hd">—</div></div>
+      <div class="gstat"><div class="l">Aligned</div><div class="v" id="mi-htf-al">—</div></div>
+    </div>
+    <div class="se-bias-h">Momentum &amp; Confidence Decay</div>
+    <div class="se-bias">
+      <div class="gstat"><div class="l">Momentum</div><div class="v" id="mi-mom">—</div></div>
+      <div class="gstat"><div class="l">CVD</div><div class="v" id="mi-cvd">—</div></div>
+      <div class="gstat"><div class="l">Decay</div><div class="v" id="mi-decay">—</div></div>
+      <div class="gstat"><div class="l">Decayed Conf</div><div class="v" id="mi-decayed">—</div></div>
+    </div>
+    <div class="se-bias-h">Allowed / Blocked Strategies</div>
+    <div class="se-missing" id="mi-perms"></div>
+    <div class="se-bias-h">Why this read</div>
+    <div class="se-reason" id="mi-why"></div>
+    <div class="se-fid" id="mi-fid"></div>
+  </div>
+
   <!-- ════ AI Assistant (DISPLAY-ONLY; read-only Q&amp;A — live setup + general trading) ════ -->
   <div class="mod mb-hidden" id="mod-assistant">
     <div class="mod-h">💬 Ask the AI <span style="font-size:10px;color:#6b7280;letter-spacing:1px">READ-ONLY · LIVE + GENERAL Q&amp;A</span></div>
@@ -35356,6 +36102,9 @@ function renderModules(d){
 
   // ── Module 7b: 9:30 ET Breakout Mode (DISPLAY-ONLY advisory) ──
   renderBreakoutMode(d);
+
+  // ── Module 7c: Market Intelligence (state + Long/Short confidence + trend memory) ──
+  renderMarketIntelligence(d);
 
   // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
   renderLearningEngine(d);
@@ -38058,6 +38807,125 @@ function renderBreakoutMode(d){
   if (fdEl) fdEl.textContent = bo.note || 'Display-only. Opening range from price ticks; gate stays authoritative.';
 }
 
+// Market Intelligence panel — fed by d.market_intelligence (compute_market_intelligence).
+// DISPLAY-ONLY; the whole panel is hidden when the block is absent (master flag OFF).
+function _miConfColor(n){ n=Number(n||0); return n>=85?'#22c55e':n>=55?'#eab308':'#6b7280'; }
+function _miSideColor(s){ s=String(s||'').toLowerCase();
+  return (s==='long'||s==='up'||s==='bullish') ? '#22c55e'
+       : (s==='short'||s==='down'||s==='bearish') ? '#ef4444' : '#6b7280'; }
+function _miCompChips(comps){
+  if(!comps || !comps.length) return '<span class="se-chip">No data</span>';
+  return comps.map(function(c){
+    const ok=!!c.met;
+    const col= ok ? 'background:#0f2417;border-color:#1b3a26;color:#7fe9a3' : '';
+    const pts= (c.points!=null && Number(c.points)>0) ? (' +'+c.points) : '';
+    return '<span class="se-chip" style="'+col+'">'+(ok?'✓ ':'✗ ')+_modEsc(c.label)+pts+'</span>';
+  }).join('');
+}
+function renderMarketIntelligence(d){
+  const mod=document.getElementById('mod-mi');
+  if(!mod) return;
+  const mi=(d && d.market_intelligence) || null;
+  if(!mi){ mod.style.display='none'; return; }
+  mod.style.display='';
+
+  const modeEl=document.getElementById('mi-mode');
+  if(modeEl) modeEl.textContent = mi.mode ? '· '+String(mi.mode).toUpperCase() : '';
+
+  // Market state + reason
+  const stt=mi.market_state||{};
+  const stEl=document.getElementById('mi-state');
+  if(stEl){
+    stEl.textContent = stt.label || '—';
+    const lab=String(stt.label||'').toLowerCase();
+    stEl.style.color = lab.indexOf('up')>=0 ? '#22c55e'
+                     : lab.indexOf('down')>=0 ? '#ef4444'
+                     : (stt.state==='RANGE'||stt.state==='COMPRESSION') ? '#3b82f6'
+                     : stt.state==='UNKNOWN' ? '#6b7280' : '#eab308';
+  }
+  const reEl=document.getElementById('mi-state-reason');
+  if(reEl) reEl.textContent = stt.reason || '';
+
+  // Directional confidence
+  const conf=mi.directional_confidence||{};
+  const biEl=document.getElementById('mi-bias');
+  if(biEl){ biEl.textContent = conf.bias || '—'; biEl.style.color=_miSideColor(conf.bias); }
+  const lEl=document.getElementById('mi-long');
+  if(lEl){ lEl.textContent = (conf.long!=null?conf.long+'%':'—'); lEl.style.color=_miConfColor(conf.long); }
+  const sEl=document.getElementById('mi-short');
+  if(sEl){ sEl.textContent = (conf.short!=null?conf.short+'%':'—'); sEl.style.color=_miConfColor(conf.short); }
+  const lcEl=document.getElementById('mi-long-comps'); if(lcEl) lcEl.innerHTML=_miCompChips(conf.long_components);
+  const scEl=document.getElementById('mi-short-comps'); if(scEl) scEl.innerHTML=_miCompChips(conf.short_components);
+
+  // Trend memory
+  const tm=mi.trend_memory||{};
+  const trEl=document.getElementById('mi-trend');
+  if(trEl){ trEl.textContent = tm.currentTrend||'neutral'; trEl.style.color=_miSideColor(tm.currentTrend); }
+  _modTxt('mi-strength', tm.trendStrength || '—');
+  const tcEl=document.getElementById('mi-trendconf');
+  if(tcEl){ tcEl.textContent=(tm.trendConfidence!=null?tm.trendConfidence+'%':'—'); tcEl.style.color=_miConfColor(tm.trendConfidence); }
+  const ocEl=document.getElementById('mi-oppconf');
+  if(ocEl){ ocEl.textContent=(tm.oppositeConfidence!=null?tm.oppositeConfidence+'%':'—'); ocEl.style.color=Number(tm.oppositeConfidence||0)>=55?'#ef4444':'#6b7280'; }
+  const tfEl=document.getElementById('mi-trend-flags');
+  if(tfEl){
+    const chips=[];
+    chips.push('<span class="se-chip" style="'+(tm.persistence_ok?'background:#0f2417;border-color:#1b3a26;color:#7fe9a3':'')+'">'+(tm.persistence_ok?'✓ ':'✗ ')+'Persistence ('+(tm.eval_count||0)+' evals)</span>');
+    if(tm.trendWeakening) chips.push('<span class="se-chip" style="border-color:#5b2330;color:#f4a3b0">⚠ Trend weakening</span>');
+    if(tm.invalidationLevel!=null) chips.push('<span class="se-chip">Invalidation '+Number(tm.invalidationLevel).toFixed(2)+'</span>');
+    tfEl.innerHTML=chips.join('');
+  }
+
+  // Higher-timeframe alignment
+  const htf=mi.htf||{};
+  function biasTxt(id,v){ const e=document.getElementById(id); if(!e) return; e.textContent=v||'—'; e.style.color=_miSideColor(v); }
+  biasTxt('mi-h1', htf.bias_1h); biasTxt('mi-h4', htf.bias_4h); biasTxt('mi-hd', htf.bias_daily);
+  const alEl=document.getElementById('mi-htf-al');
+  if(alEl){
+    const al = htf.stale ? 'Stale' : htf.aligned_long ? 'Long' : htf.aligned_short ? 'Short' : 'None';
+    alEl.textContent=al;
+    alEl.style.color = htf.stale ? '#6b7280' : al==='Long'?'#22c55e':al==='Short'?'#ef4444':'#6b7280';
+  }
+
+  // Momentum + confidence decay
+  const mom=mi.momentum||{};
+  const moEl=document.getElementById('mi-mom');
+  if(moEl){
+    moEl.textContent = mom.state || '—';
+    moEl.style.color = mom.state==='accelerating'?'#22c55e':mom.state==='fading'?'#ef4444':mom.state==='stable'?'#eab308':'#6b7280';
+  }
+  _modTxt('mi-cvd', mom.cvd_direction || '—');
+  const dec=mi.confidence_decay||{};
+  const dEl=document.getElementById('mi-decay');
+  if(dEl){
+    const f=(dec.factor!=null)?Math.round(Number(dec.factor)*100):null;
+    dEl.textContent = f!=null ? (f+'%') : '—';
+    dEl.style.color = f==null?'#6b7280':f>=80?'#22c55e':f>=50?'#eab308':'#ef4444';
+  }
+  _modTxt('mi-decayed', dec.decayed!=null ? (dec.decayed+'%') : '—');
+
+  // Allowed / blocked strategies (populated by the strategy filter; inactive until then)
+  const pmEl=document.getElementById('mi-perms');
+  if(pmEl){
+    const perms=mi.strategy_permissions;
+    if(!perms){ pmEl.innerHTML='<span class="se-chip">Strategy filtering inactive</span>'; }
+    else {
+      const allowed=(perms.allowed||[]).map(function(a){ const nm=(typeof a==='string')?a:(a.name||a.label||''); return '<span class="se-chip" style="background:#0f2417;border-color:#1b3a26;color:#7fe9a3">✓ '+_modEsc(nm)+'</span>'; });
+      const blocked=(perms.blocked||[]).map(function(b){ const nm=(typeof b==='string')?b:(b.name||b.label||''); const rs=(b&&b.reason)?(' — '+b.reason):''; return '<span class="se-chip" style="border-color:#5b2330;color:#f4a3b0">✗ '+_modEsc(nm+rs)+'</span>'; });
+      pmEl.innerHTML = (allowed.concat(blocked)).join('') || '<span class="se-chip">No constraints</span>';
+    }
+  }
+
+  // Why this read
+  const whyEl=document.getElementById('mi-why');
+  if(whyEl) whyEl.textContent = mi.accepted_rejected_reason || stt.reason || '';
+
+  // Fidelity caveat
+  const fidEl=document.getElementById('mi-fid');
+  if(fidEl) fidEl.textContent = (mi.market_state && mi.market_state.state==='UNKNOWN')
+    ? 'Market closed or intelligence paused.'
+    : 'Display-only read of the live tape. HTF from 1H/4H/1D; momentum proxied from CVD + ATR + volume. The strict gate stays authoritative.';
+}
+
 async function refreshRec() {
   try {
     const d = await api('/status?ticker='+encodeURIComponent(sym));
@@ -39905,7 +40773,7 @@ autoSelectBestSetup();
   // One-time layout reset when the panel set changes (Main Brain added) so existing
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
-  var VKEY = 'dashLayoutVer', VER = 'real-account-results-2026-06';
+  var VKEY = 'dashLayoutVer', VER = 'market-intelligence-2026-06';
   try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
