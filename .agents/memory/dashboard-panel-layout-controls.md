@@ -34,3 +34,21 @@ panels — but only if the panel follows the `.mod` > `.mod-h` + id convention.
 - Don't rebuild `.mod-h` via innerHTML in any render path — that would wipe the
   injected grip/caret. Existing render code only updates inner-id spans, so it's
   safe; keep it that way.
+
+## Advanced-panels declutter gate (second display-only layer)
+
+On top of collapse/reorder there is a **default-clean** gate: an `#adv-row`
+toggle flips a `data-adv` attribute on `<html>` (persisted per-device in
+`localStorage('dashAdv')`, default OFF). One CSS rule does the hiding:
+`html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-news):not(#mod-prop):not(.mb-hidden){display:none!important}`.
+
+**GOTCHA — the core allowlist is a `:not()` chain, not a class.** When Advanced
+is OFF, *every* `#view-live .mod` is hidden EXCEPT the four ids in that chain.
+So a NEW panel you intend to be always-visible will silently vanish unless you
+add its id to the `:not(...)` allowlist. A panel meant to live under "Advanced"
+needs nothing — it's hidden by default automatically.
+**Why:** chosen over tagging ~20 panels with a class (fewer edits, no FOUC —
+the selector matches when `data-adv` is absent, so the clean default paints with
+no flash). `mb-hidden` panels stay hidden regardless (Main-Brain consolidation
+is authoritative). Simulated/advisory panels are hidden-by-default but RE-appear
+when Advanced is ON — they are not permanently removed.

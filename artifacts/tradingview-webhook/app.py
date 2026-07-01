@@ -33206,6 +33206,14 @@ def dashboard():
   /* Panels consolidated into Main Brain — hidden with !important so the existing
      render JS (which toggles inline display) can stay intact and still stay hidden. */
   .mb-hidden{display:none !important}
+  /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
+     Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
+  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-news):not(#mod-prop):not(.mb-hidden){display:none !important}
+  #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
+  #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
+  #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
+  #adv-toggle.on{color:#7fe9f5;border-color:#39d7e6;background:rgba(57,215,230,.08)}
+  .adv-hint{font-size:11px;color:var(--muted);opacity:.7}
   /* Interactive "Ask the brain" chat inside the Main Brain panel (DISPLAY-ONLY). */
   .mb-chat-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim,#caa14a);font-weight:700;margin:14px 0 6px;display:flex;align-items:center;gap:8px}
   .mb-chat-log{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto;margin-bottom:8px}
@@ -33618,6 +33626,14 @@ def dashboard():
     <div class="mode-btn" id="mode-scalp" onclick="setMode('SCALP')">SCALP · Sensitive</div>
     <div class="mode-btn" id="mode-swing" onclick="setMode('SWING')">SWING · Strict</div>
   </div>
+</div>
+
+<!-- Declutter: Advanced-panels toggle (DISPLAY-ONLY, per-device). Hides all
+     non-core analysis + simulated panels behind one switch for a cleaner default
+     view. Persisted in localStorage('dashAdv'); never touches the money path. -->
+<div id="adv-row">
+  <span id="adv-toggle" role="button" tabindex="0" onclick="toggleAdvPanels()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvPanels();}">🔧 Advanced panels: off</span>
+  <span class="adv-hint">extra analysis &amp; simulated panels are hidden — flip on to see everything</span>
 </div>
 
 <!-- Status card -->
@@ -40923,6 +40939,21 @@ autoSelectBestSetup();
     location.reload();
   };
 })();
+// ── Declutter: Advanced-panels toggle (DISPLAY-ONLY, this device) ──
+// Hides every non-core live-view panel (extra analysis + simulated modules)
+// behind one switch via a data-adv attribute on <html>. Persisted in
+// localStorage; never touches the gate, scoring, sizing or any money path.
+function _advApply(on){
+  try{ document.documentElement.setAttribute('data-adv', on ? '1' : '0'); }catch(e){}
+  var t = document.getElementById('adv-toggle');
+  if(t){ t.textContent = '🔧 Advanced panels: ' + (on ? 'on' : 'off'); t.classList.toggle('on', on); }
+}
+function toggleAdvPanels(){
+  var on = document.documentElement.getAttribute('data-adv') !== '1';
+  try{ localStorage.setItem('dashAdv', on ? '1' : '0'); }catch(e){}
+  _advApply(on);
+}
+(function(){ var on=false; try{ on = localStorage.getItem('dashAdv')==='1'; }catch(e){} _advApply(on); })();
 // ── Potential Trade Idea Review (DISPLAY-ONLY; on-demand, NOT in the 3s poll) ──
 function riEsc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function riNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
