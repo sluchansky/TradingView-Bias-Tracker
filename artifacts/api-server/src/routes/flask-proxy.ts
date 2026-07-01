@@ -90,6 +90,9 @@ export const BOT1_ROUTES = [
   // OPEN_PATHS). Flag-gated (MANUAL_ORDER_ENABLED); fires a discretionary market
   // order regardless of setup state through the SAME audited execution gateway.
   "/manual-order",
+  // Owner-only notification test: fires a real Discord push (phone) + returns a
+  // diagnostic. Pure notification test — never touches the gate or any broker path.
+  "/notify-test",
   "/breakeven",
   "/close",
   "/trade",

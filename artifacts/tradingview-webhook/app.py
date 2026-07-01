@@ -34184,6 +34184,7 @@ def dashboard():
 </div>
 <div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:none;gap:8px;justify-content:center;flex-wrap:wrap">
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Setup bell: on</span>
+  <span id="test-alert-btn" onclick="testAlert()" title="Ring this dashboard now AND send a test push to your phone via Discord" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Test alert</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
   <span id="advisor-toggle" role="button" tabindex="0" onclick="toggleAdvisor()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvisor();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🧠 Advisor: off</span>
   <span id="layout-reset" role="button" tabindex="0" onclick="resetDashLayout()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();resetDashLayout();}" title="Restore the default panel order and un-minimize everything" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">↕️ Reset layout</span>
@@ -40104,6 +40105,25 @@ function toggleSound() {
   if (soundOn) { _ensureAudio(); playReadyChime(); toast('🔔 Setup bell on'); }
   else toast('🔕 Setup bell off');
 }
+// ── Test alert: ring THIS dashboard right now (real exchange bell + browser
+//    notification) AND send a real push to the phone via Discord, so the operator
+//    can confirm both channels work without waiting for a live READY setup. This is
+//    a pure notification test — it never touches the gate, scoring or any broker.
+async function testAlert() {
+  // Ring locally regardless of the Setup-bell toggle — the whole point is to hear it.
+  try { _ensureAudio(); _initBell(); playExchangeBell(); } catch(e) {}
+  try { notifyReady('🔔 Test alert', 'This is what a READY setup alert looks like.'); } catch(e) {}
+  toast('🔔 Ringing dashboard — sending phone push…');
+  try {
+    const d = await api('/notify-test', { instrument: sym });
+    if (d && d.sent) {
+      toast('📲 Phone push sent for ' + (d.instrument || sym) + ' — check Discord'
+            + (d.muted_note ? ' (muted for real setups, test still sent)' : ''));
+    } else {
+      toast('Phone push not sent: ' + ((d && d.reason) || 'unknown'), false);
+    }
+  } catch(e) { toast('Phone push failed — check your connection', false); }
+}
 // ── Theme toggle: switch between vaporwave (default) and Retro Terminal Mode ──
 function paintThemeToggle() {
   const el = document.getElementById('theme-toggle');
@@ -42195,6 +42215,61 @@ loadTraining();
 def ping():
     # Simple health/test endpoint — no alert logic. Used by UptimeRobot and for testing.
     return jsonify({"status": "ok", "trading_mode": TRADING_MODE}), 200
+
+
+@app.route("/notify-test", methods=["POST"])
+def notify_test():
+    """Owner-only test of the READY phone-notification path.
+
+    Fires a REAL Discord push (with the @everyone mention, so a phone set to "Only
+    @mentions" still buzzes) to the exact channel this instrument's live READY card
+    would use — letting the operator confirm end-to-end that the phone rings even
+    when no setup is currently READY. Returns a clear diagnostic (sent / why-not) so
+    a silent phone can be triaged: channel-not-configured vs muted vs delivered.
+
+    Pure notification test: NEVER touches the gate, scoring, sizing, journaling,
+    tracking or ANY broker/execution path. Owner-only (Basic Auth + CSRF via the
+    Express proxy; deliberately NOT in OPEN_PATHS). Fail-open — a send failure is
+    reported as {sent: false, reason}, never a 500."""
+    data = request.get_json(silent=True) or {}
+    inst = (_instrument_from_text(data.get("instrument") or data.get("inst")
+                                  or data.get("ticker")) or "MGC")
+    url = _discord_url(inst)
+    if not url:
+        return jsonify({"ok": False, "sent": False, "instrument": inst,
+                        "reason": "No Discord webhook is configured for this "
+                                  "instrument (set DISCORD_WEBHOOK_URL)."}), 200
+    muted = _alerts_muted(inst)
+    embed = {
+        "title":       "🔔 Test Alert — notifications are working",
+        "description": ("This is a **test** of your READY-setup phone alert for "
+                        "**%s**. It is NOT a trade signal. If this reached your "
+                        "phone, real READY alerts will too." % inst),
+        "color":       0x22C55E,
+        "footer":      {"text": "Manual test · %s · not a trade signal" % inst},
+        "timestamp":   now_utc().isoformat(),
+    }
+    payload = {"embeds": [embed]}
+    if DISCORD_ALERT_MENTION:
+        payload["content"]          = DISCORD_ALERT_MENTION
+        payload["allowed_mentions"] = {"parse": ["everyone", "users", "roles"]}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        ok   = resp.status_code in (200, 204)
+        return jsonify({
+            "ok":         ok,
+            "sent":       ok,
+            "instrument": inst,
+            "muted_note": (bool(muted) or None),
+            "reason":     (None if ok else "Discord returned HTTP %s" % resp.status_code),
+        }), 200
+    except Exception as exc:
+        # Never surface str(exc): a requests/urllib3 error can embed the full Discord
+        # webhook URL (which carries the bearer token). Log the class only, and keep
+        # the browser-facing reason generic so the secret can't leak via logs OR API.
+        logger.error("notify-test send error (%s): %s", inst, type(exc).__name__)
+        return jsonify({"ok": False, "sent": False, "instrument": inst,
+                        "reason": "Send failed — check server logs."}), 200
 
 
 @app.route("/mode", methods=["GET", "POST"])
