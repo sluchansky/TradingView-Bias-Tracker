@@ -506,6 +506,17 @@ SCALP_RR2_RUNNER_R  = _env_float("SCALP_RR2_RUNNER_R", 3.0)
 # — it only NARROWS which already-READY setups are taken. FAIL-CLOSED on any error.
 SWING_STRATEGY_FILTER_ENABLED = _env_flag_on("SWING_STRATEGY_FILTER_ENABLED", default_on=False)
 
+# Manual Order Desk (money-path; DISCRETIONARY operator override). When ON, the
+# owner-only /manual-order route can fire a REAL market order on demand REGARDLESS of
+# setup state (the Edge gate may be WAIT) — the explicit operator override of the
+# signal engine. It bypasses ONLY the is_actionable READY check + the SCALP/SWING
+# setup-quality entry vetoes; EVERY hard safety (market hours, per-asset caps, absolute
+# risk cap, prop guard, training gate, dedupe, fail-closed live send) is still enforced
+# via the SAME single audited gateway. Prices are ALWAYS server-authoritative (entry =
+# fresh live price, ATR-based protective stop/target — never a client price). Default
+# OFF => the whole feature is dormant and every path is byte-identical to today.
+MANUAL_ORDER_ENABLED = _env_flag_on("MANUAL_ORDER_ENABLED", default_on=False)
+
 # ── Market Intelligence layer (2026-06-30) ───────────────────────────────────
 # A directional market-state + Long/Short directional-confidence + trend-memory
 # layer that sits ABOVE the strict gate (display-first). Three reversible flags,
@@ -29990,6 +30001,99 @@ def take_preview_trade():
                     "trade": _trade, "plan": plan, "message": result.get("message")}), 200
 
 
+@app.route("/manual-order", methods=["POST"])
+def manual_desk_order():
+    """Owner-only (dashboard auth enforced at the Express /api edge; NOT in
+    OPEN_PATHS). Fire a DISCRETIONARY market order from the dashboard REGARDLESS of
+    setup state, through the SAME single audited execution gateway as /traderspost.
+    This is the explicit operator override of the signal engine: the Edge gate may be
+    WAIT, but the operator wants in NOW.
+
+    Server-authoritative: the client sends only ticker + direction + contracts. The
+    gateway anchors the entry at the FRESH server-side price, builds an ATR-based
+    protective bracket (never client prices) and applies EVERY safety layer (market
+    hours, per-asset caps, absolute risk cap, prop guard, training gate, dedupe,
+    fail-closed money path). Flag-gated behind MANUAL_ORDER_ENABLED (default OFF). On a
+    confirmed LIVE send / paper simulate it starts LOCAL dashboard tracking tagged
+    source=MANUAL_DESK so the position is managed + counted separately; manual_only
+    (plan-only) never tracks — nothing was placed, so a phantom position must not block
+    the single-slot guard."""
+    if not MANUAL_ORDER_ENABLED:
+        return jsonify({"status": "error",
+                        "reason": "Manual order desk is disabled (MANUAL_ORDER_ENABLED is off)."}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    instrument = _instrument_from_text(data.get("ticker"))
+    if instrument is None:
+        return jsonify({"status": "error",
+                        "reason": "A valid instrument ticker (MGC, MNQ, MES, or MYM) is required."}), 400
+    direction = str(data.get("direction", "")).strip().capitalize()
+    if direction not in ("Long", "Short"):
+        return jsonify({"status": "error", "reason": "direction must be Long or Short."}), 400
+    try:
+        contracts = int(data.get("contracts", 1))
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "reason": "contracts must be a whole number."}), 400
+    _max_contracts = max_contracts(instrument)
+    if contracts < 1 or contracts > _max_contracts:
+        return jsonify({"status": "error",
+                        "reason": f"contracts must be between 1 and {_max_contracts}."}), 400
+
+    result, code = execute_trade_gateway(instrument, contracts,
+                                         source="manual_desk", direction=direction)
+    # Send-before-track: only start LOCAL tracking after a CONFIRMED LIVE send or PAPER
+    # simulate. manual_only (manual_required) placed nothing, so it never tracks — else
+    # a phantom position would block the single-slot guard on the next real order.
+    if code != 200 or (result or {}).get("status") not in ("sent", "simulated"):
+        return jsonify(result), code
+
+    plan = result.get("plan") or {}
+    try:
+        _entry = float(plan["entry"]); _stop = float(plan["stopLoss"])
+        _t1 = float(plan["takeProfit"]); _t2 = float(plan.get("target2", plan["takeProfit"]))
+        _qty = int(plan.get("quantity", contracts))
+        _dir = str(plan.get("direction", direction))
+    except (KeyError, ValueError, TypeError) as exc:
+        # The order already went out — report success but flag the tracking gap so the
+        # operator verifies the broker rather than assuming nothing happened.
+        logger.error("manual-order tracking parse failed after send: %s", exc)
+        return jsonify({"status": result.get("status"), "execution_status": result.get("status"),
+                        "tracking": "failed", "plan": plan,
+                        "message": result.get("message")}), 200
+
+    _trade = {
+        "direction":        _dir,
+        "entry_price":      _entry,
+        "stop_loss":        _stop,
+        "target1":          _t1,
+        "target2":          _t2,
+        "contracts":        _qty,
+        "profile":          instrument,
+        "symbol":           instrument,
+        "opened_at":        now_utc().isoformat(),
+        "t1_hit":           False,
+        "t2_hit":           False,
+        "status":           "active",
+        "source":           "MANUAL_DESK",
+        "notes":            "Discretionary manual market order (operator override, any setup state)",
+        "execution_status": result.get("status"),
+    }
+    set_active_trade(instrument, _trade)
+
+    try:
+        _url = _discord_url(instrument)
+        if _url:
+            requests.post(_url, json={"content": (
+                f"🖐️ **MANUAL DESK ORDER — {_dir.upper()}**\n"
+                f"{instrument} · {_qty} @ market · Stop `{_stop:.2f}` · TP `{_t1:.2f}`\n"
+                f"_Discretionary operator override · counted separately (MANUAL_DESK)_")}, timeout=5)
+    except requests.RequestException:
+        pass
+
+    logger.info("Manual desk order: %s %s x%d entry≈%.2f (exec=%s)",
+                instrument, _dir, _qty, _entry, result.get("status"))
+    return jsonify(result), code
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Prop Firm Protection (Task #15) — OPTIONAL, NON-DESTRUCTIVE money-path guard
 # ════════════════════════════════════════════════════════════════════════════
@@ -32393,6 +32497,107 @@ def preview_max_contracts():
     return v if v >= 1 else 1
 
 
+def _build_manual_market_plan(instrument, direction, a):
+    """Server-authoritative bracket for a DISCRETIONARY manual market order.
+
+    The operator is overriding the signal engine (fire regardless of setup state), so
+    this NEVER reads the Edge verdict, a zone, or a setup plan. It anchors the entry at
+    the FRESH alert-driven current price and builds a protective stop/target around it
+    using the SAME tick grid + risk model the strict planner uses:
+      • entry  = latest CURRENT_PRICE_BY_TICKER (fail-closed if missing OR stale; never
+                 AUTO_PRICE_BY_TICKER, which is display-only), snapped to the tick grid.
+      • stop   = pure ATR stop via _dynamic_stop_plan (no structure), mode-aware min-stop
+                 floor, tick-snapped + side-safety checked. If ATR is unavailable it
+                 falls back to the instrument's minimum-stop distance (conservative,
+                 tick-aligned) so a discretionary order is never sized on a phantom stop.
+      • target = mode primary R (SCALP 1:2 when armed, else 1:1) from the stop distance.
+
+    Returns the minimal plan dict the gateway tail consumes (entry_zone / stop_loss /
+    target1 / target2 / rr / direction). Client prices are NEVER trusted. On any failure
+    returns {"trade_plan": False, "reason": ...} so the gateway can 409 with the reason."""
+    inst = instrument_of(instrument)
+    if direction not in ("Long", "Short"):
+        return {"trade_plan": False,
+                "reason": "Manual order requires an explicit Long or Short direction."}
+    spec = spec_for(inst)
+    tick = spec["tick_size"]
+    pv   = spec["point_value"]
+
+    # Anchor on the FRESH alert-driven price only.
+    entry = CURRENT_PRICE_BY_TICKER.get(inst)
+    ts    = CURRENT_PRICE_TS_BY_TICKER.get(inst)
+    if entry is None:
+        return {"trade_plan": False,
+                "reason": f"No live {inst} price to anchor a market order — wait for a price alert."}
+    fresh = False
+    if ts:
+        try:
+            age_min = (now_utc() - datetime.fromisoformat(ts)).total_seconds() / 60.0
+            fresh = age_min <= PRICE_FRESH_MIN
+        except (ValueError, TypeError):
+            fresh = False   # FAIL-CLOSED: unparseable ts => treat as stale on the money path
+    if not fresh:
+        return {"trade_plan": False,
+                "reason": (f"{inst} price is stale (older than {PRICE_FRESH_MIN:g} min) — "
+                           "refusing a market order on stale data.")}
+    try:
+        entry = float(entry)
+    except (TypeError, ValueError):
+        return {"trade_plan": False, "reason": f"{inst} price is unreadable — order blocked."}
+
+    def _snap(p):
+        return round(round(p / tick) * tick, 6) if tick else round(p, 6)
+
+    entry = _snap(entry)
+
+    # Protective stop: pure ATR (no structure). Fail-closed helper => fixed fallback.
+    stop = None
+    sp = _dynamic_stop_plan(direction, entry, None, None, inst,
+                            a.get("volatility"), mode=TRADING_MODE)
+    if sp.get("ok"):
+        try:
+            stop = float(sp["final_stop"])
+        except (TypeError, ValueError, KeyError):
+            stop = None
+    if stop is None:
+        # ATR unavailable => conservative fixed fallback = the instrument minimum stop.
+        min_ticks = int(spec.get("min_stop_ticks") or 0)
+        fb_dist   = (min_ticks * tick) if min_ticks > 0 else (spec.get("stop_buf") or tick)
+        if not fb_dist or fb_dist <= 0:
+            return {"trade_plan": False, "reason": f"Cannot size a stop for {inst} — order blocked."}
+        stop = _snap(entry - fb_dist) if direction == "Long" else _snap(entry + fb_dist)
+
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return {"trade_plan": False, "reason": "Computed a zero-width stop — order blocked."}
+    # Side safety (defense-in-depth; _dynamic_stop_plan already checks on the ATR path).
+    if direction == "Long" and not (stop < entry):
+        return {"trade_plan": False, "reason": "Stop is not below entry (Long) — order blocked."}
+    if direction == "Short" and not (stop > entry):
+        return {"trade_plan": False, "reason": "Stop is not above entry (Short) — order blocked."}
+
+    rr_num = _scalp_primary_rr(TRADING_MODE) or 1.0
+    if direction == "Long":
+        t1 = _snap(entry + rr_num * risk)
+        t2 = _snap(entry + 2.0 * rr_num * risk)
+    else:
+        t1 = _snap(entry - rr_num * risk)
+        t2 = _snap(entry - 2.0 * rr_num * risk)
+
+    return {
+        "trade_plan":  True,
+        "reason":      None,
+        "direction":   direction,
+        "instrument":  inst,
+        "point_value": pv,
+        "entry_zone":  f"{entry:.2f}–{entry:.2f}",
+        "stop_loss":   round(stop, 2),
+        "target1":     round(t1, 2),
+        "target2":     round(t2, 2),
+        "rr":          f"1:{rr_num:g}",
+    }
+
+
 def execute_trade_gateway(instrument, contracts, source="manual", direction=None, expected_stop=None):
     """Shared, server-authoritative execution gate behind /traderspost AND the
     auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
@@ -32691,6 +32896,37 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
                         "reason": ("Preview: SWING filter — "
                                    + "; ".join(m for _, m in _psv) + ".")}, 409
         direction = pv_dir
+    elif source == "manual_desk":
+        # ── Manual Desk market order (DISCRETIONARY; operator override) ───────────
+        # The operator explicitly chose to fire a market order REGARDLESS of setup
+        # state (the Edge gate may be WAIT). This branch bypasses ONLY the
+        # is_actionable READY check AND the SCALP/SWING setup-quality entry vetoes —
+        # the operator is overriding the signal engine on purpose. EVERY hard safety
+        # is still enforced: market/session/holiday + emergency + daily-loss +
+        # cooldown + max-open + contract cap already ran above; the absolute risk cap,
+        # prop guard, training gate, dedupe and the fail-closed money path all run
+        # below. Flag-gated (MANUAL_ORDER_ENABLED) + OFF by default => dormant until
+        # armed. The plan is built SERVER-SIDE from the fresh price (never client data).
+        if not MANUAL_ORDER_ENABLED:
+            return {"status": "error",
+                    "reason": "Manual order desk is disabled (MANUAL_ORDER_ENABLED is off)."}, 409
+        md_dir = direction if direction in ("Long", "Short") else None
+        if md_dir is None:
+            return {"status": "error",
+                    "reason": "Manual order requires an explicit Long or Short direction."}, 400
+        # Single-slot guard (FAIL-CLOSED, unconditional — mirrors user_approved_preview):
+        # never overwrite / stack on an already-tracked position for this instrument
+        # (set_active_trade overwrites by default and max_open_trades() above only blocks
+        # when a per-asset cap is configured, so enforce it here regardless of config).
+        if active_trade_for(instrument) is not None:
+            return {"status": "error",
+                    "reason": (f"{instrument} already has an open tracked position — "
+                               "close it before sending a manual order.")}, 409
+        tp = _build_manual_market_plan(instrument, md_dir, a)
+        if not tp.get("trade_plan") or not tp.get("entry_zone"):
+            return {"status": "error",
+                    "reason": (tp.get("reason") or "Could not build a manual market order plan.")}, 409
+        direction = md_dir
     else:
         if not is_actionable(verdict):
             return {"status": "error",
@@ -32746,6 +32982,11 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
         # multiplier on its own; apply RISK_MULT_EARLY explicitly (then hard-capped to
         # PREVIEW_MAX_CONTRACTS after the risk-cap sizing below).
         _size_mult = cfg("RISK_MULT_EARLY")
+    elif source == "manual_desk":
+        # Discretionary manual order → full 1.0 size. The verdict is typically WAIT
+        # here, so a verdict-derived multiplier is meaningless; the operator sizes via
+        # the contract count and the absolute risk cap + per-asset ceiling still bind.
+        _size_mult = 1.0
     else:
         _size_mult = _setup_risk_mult(verdict, a.get("structure_class"))
     _sized = _risk_capped_contracts(abs(entry - stop), point_value_for(instrument),
@@ -34096,6 +34337,27 @@ def dashboard():
       Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #3a2363;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
       <span style="color:#6b7280">· one-tap market order</span>
     </div>
+  </div>
+  <!-- ════ Manual Market Order — DISCRETIONARY operator override. Fires a REAL market
+       order on demand REGARDLESS of setup state (the Edge gate may be WAIT). This is
+       always visible (a plain div, not a .mod) so it can never be collapsed away.
+       Server-authoritative: the browser sends only direction + contracts; the server
+       anchors the entry at the fresh live price, builds an ATR stop/target and runs
+       EVERY safety layer. Owner-only (/manual-order, not an open path); dormant unless
+       MANUAL_ORDER_ENABLED is set on the server. ════ -->
+  <div id="manual-order-box" style="margin-top:10px;padding:10px;border:1px solid #b45309;border-radius:6px;background:#1a1206">
+    <div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#f59e0b;margin-bottom:8px">🖐️ MANUAL MARKET ORDER
+      <span style="font-size:10px;color:#9a6a12;font-weight:400;letter-spacing:1px">· fires regardless of setup</span>
+    </div>
+    <div class="dir-row" style="margin:0 0 8px">
+      <div id="mo-dir-long" class="dir-btn long active" onclick="setManualDir('Long')">📈 LONG</div>
+      <div id="mo-dir-short" class="dir-btn short" onclick="setManualDir('Short')">📉 SHORT</div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:8px;color:#c9a66b;font-size:12px;margin-bottom:8px">
+      Contracts <input id="mo-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #6b4a12;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
+    </div>
+    <button class="btn" id="mo-send" style="width:100%;background:#7c2d12;border:1px solid #f59e0b;color:#ffedd5;font-weight:700" onclick="sendManualOrder()">🚀 Send Market Order</button>
+    <div style="margin-top:6px;color:#9a6a12;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
   </div>
   <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
        TradeZella / broker CSV. This is the source of truth for P&L and win-rate.
@@ -40017,6 +40279,50 @@ async function sendOrder() {
     else toast('Error: ' + (d.reason || d.status), false);
   } catch(e) { toast('Request failed' + (live ? ' — check your broker' : ''), false); }
   finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send order to broker'; } }
+}
+
+// ── Manual Market Order (DISCRETIONARY operator override) ─────────────────────
+// Fires a REAL market order for the CURRENTLY-selected instrument (sym) regardless
+// of setup state — the server anchors the entry/stop/target and runs every safety
+// layer. The browser sends only direction + contracts (never a price). Its own
+// direction toggle is independent of the setup dir-row so the operator can fire the
+// opposite side of whatever the analysis shows.
+let manualOrderDir = 'Long';
+function setManualDir(d){
+  manualOrderDir = (d === 'Short') ? 'Short' : 'Long';
+  const l = document.getElementById('mo-dir-long');
+  const s = document.getElementById('mo-dir-short');
+  if (l) l.classList.toggle('active', manualOrderDir === 'Long');
+  if (s) s.classList.toggle('active', manualOrderDir === 'Short');
+}
+async function sendManualOrder() {
+  const inst  = sym;
+  const mdir  = manualOrderDir;
+  let qty = parseInt(document.getElementById('mo-qty').value, 10);
+  if (!qty || qty < 1) qty = 1;
+  // execution_mode / live / label come from the loaded snapshot; the SERVER is the
+  // authority, this only shapes the confirm wording.
+  const mode  = lastRec ? (lastRec.execution_mode || 'manual_only') : 'manual_only';
+  const live  = !!(lastRec && lastRec.execution_live);
+  const label = (lastRec && lastRec.execution_provider_label) || 'broker';
+  const head = live
+    ? '\u26a0\ufe0f REAL MARKET ORDER — this fires a LIVE order on ' + label + ' NOW, ignoring the setup gate.'
+    : (mode === 'paper' ? '🧪 Paper (simulated) market order — no real broker is contacted.'
+                        : '📋 Manual mode — shows the exact order to place yourself (no broker contacted).');
+  const msg = head + '\\n\\n' + inst + ' ' + mdir.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
+    + '\\n\\nThe server sets entry (market), stop and target. Continue?';
+  if (!confirm(msg)) return;
+  if (live && !confirm('FINAL CONFIRM — send a LIVE ' + inst + ' ' + mdir.toUpperCase() + ' market order right now?')) return;
+  const btn = document.getElementById('mo-send');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
+  try {
+    const d = await api('/manual-order', { ticker: inst+'1!', direction: mdir, contracts: qty });
+    if (d.status === 'sent')                 toast('🚀 Manual order sent to ' + (d.provider || label));
+    else if (d.status === 'simulated')       toast('🧪 Paper order simulated (no broker)');
+    else if (d.status === 'manual_required') toast('📋 ' + (d.message || 'Place this order manually'));
+    else toast('Error: ' + (d.reason || d.status), false);
+  } catch(e) { toast('Request failed' + (live ? ' — check your broker' : ''), false); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send Market Order'; } }
 }
 
 let lastUpdateTs = 0;

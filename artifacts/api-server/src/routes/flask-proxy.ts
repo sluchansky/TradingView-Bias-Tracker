@@ -86,6 +86,10 @@ export const BOT1_ROUTES = [
   // dashboard-auth OPEN_PATHS). Flag-gated (USER_APPROVED_PREVIEW_ENABLED); routes
   // through the SAME audited execution gateway as /traderspost.
   "/take-preview",
+  // Manual Desk market order (owner-only money path; NOT in dashboard-auth
+  // OPEN_PATHS). Flag-gated (MANUAL_ORDER_ENABLED); fires a discretionary market
+  // order regardless of setup state through the SAME audited execution gateway.
+  "/manual-order",
   "/breakeven",
   "/close",
   "/trade",
