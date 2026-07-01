@@ -25,6 +25,15 @@ placing an order, POST a payload that omits `action` and `ticker` — TradersPos
 **Why:** a stray newline made `len_raw` one byte longer than `len_trim`; raw probe = HTTP 000, but the stripped
 value probed HTTP 400 invalid-payload (valid). The app uses the stripped form, so it worked fine.
 
+## Stale boot-snapshot gotcha
+The `<available_secrets>` list in the session boot snapshot can be STALE — it once listed
+`TRADERSPOST_WEBHOOK_URL` (and `DISCORD_BOT_TOKEN`) that were actually **absent** at runtime.
+A missing `TRADERSPOST_WEBHOOK_URL` makes `resolve_execution_mode` silently fall back to
+`manual_only` (no live orders anywhere), which looks identical to "bot won't execute" bugs.
+Always confirm secret existence with `viewEnvVars({type:"secret"})` before assuming it's set;
+never trust the snapshot. Secrets can only be saved via `requestEnvVar` (or the Secrets tab),
+never `setEnvVars`. After saving, restart dev + **republish** so the live deployment rebinds it.
+
 ## How to apply
 - Probe the **stripped** value (`tr -d '[:space:]'`) — that's what the app sees — and expect HTTP 400 invalid-payload.
 - Never print the secret. Redact the URL out of any body with `sed "s#$URL#[REDACTED]#g"`.
