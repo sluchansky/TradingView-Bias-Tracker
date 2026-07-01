@@ -5677,12 +5677,13 @@ def _update_htf_auto(instrument):
 
 def _refresh_htf_if_due(force=False):
     """Throttled HTF refresh for all instruments (every HTF_FETCH_INTERVAL). Called
-    from the VWAP loop. Runs when _swing_htf_enabled() OR when the Market
-    Intelligence layer is on (it needs real 1H/4H/1D context in SCALP too, where
-    SWING HTF is otherwise never fetched). Populating HTF_STATE_BY_INST is INERT
-    for the SCALP money path (every SWING consumer still gates on _swing_htf_enabled);
-    only the display-first MI layer reads it via compute_swing_context. Fail-open."""
-    if not (_swing_htf_enabled() or MARKET_INTELLIGENCE_ENABLED):
+    from the VWAP loop. Runs when _swing_htf_enabled(), when the Market Intelligence
+    layer is on, OR when the trend brake is armed (TREND_BRAKE_ENABLED) — each needs
+    real 1H/4H/1D context in SCALP too, where SWING HTF is otherwise never fetched.
+    Populating HTF_STATE_BY_INST is INERT for the SCALP money path unless the trend
+    brake is armed (every SWING consumer still gates on _swing_htf_enabled); the
+    display-first MI layer and the brake read it via compute_swing_context. Fail-open."""
+    if not (_swing_htf_enabled() or MARKET_INTELLIGENCE_ENABLED or _trend_brake_enabled()):
         return
     nowm = time.monotonic()
     if not force and (nowm - _HTF_LAST_REFRESH_TS[0]) < HTF_FETCH_INTERVAL:
@@ -5823,6 +5824,66 @@ def compute_swing_context(instrument, price):
     except Exception as exc:  # display must never break on bad data
         logger.warning("compute_swing_context error for %s: %s", instrument, exc)
     return ctx
+
+
+def _trend_brake_enabled():
+    """'Don't fight the trend' brake master flag. DEFAULT OFF so the strict-gate
+    goldens stay byte-identical; env TREND_BRAKE_ENABLED=1 arms it."""
+    return _env_flag_on("TREND_BRAKE_ENABLED", default_on=False)
+
+
+def _trend_brake_reason(direction, current_price, vwap_value, vwap_status, swing_ctx):
+    """PURE + FAIL-OPEN. Returns a human reason string when an actionable setup is
+    fighting BOTH independent REAL-PRICE trend signals — higher-timeframe 1H+4H bias
+    AND price-vs-VWAP — else None (no veto).
+
+    Both signals are derived from real price (the auto HTF bar fetch that fills
+    HTF_STATE_BY_INST with source="auto", and the auto VWAP feed), NOT from the inbound
+    TradingView alert stream, so a one-sided (e.g. all-demand / all-long) alert feed
+    cannot blind the brake. The 1H/4H bias is trusted ONLY when it is auto-sourced AND
+    fresh — a chart/alert-tagged HTF overlay or a stale reading is ignored (fail open),
+    preserving that independence. Requiring BOTH signals to oppose the trade keeps the
+    brake conservative: a healthy pullback long (price briefly below VWAP in a bullish
+    HTF trend) is NOT blocked, only a setup on the clearly wrong side of the trend. Any
+    missing / undecided / non-auto / stale signal returns None, so the brake fails OPEN
+    and never fires on incomplete data."""
+    d = (direction or "").upper()
+    if d not in ("LONG", "SHORT"):
+        return None
+    ctx = swing_ctx if isinstance(swing_ctx, dict) else {}
+    fresh = ctx.get("freshness") or {}
+    v1 = fresh.get("1H") or {}
+    v4 = fresh.get("4H") or {}
+
+    def _htf_auto_fresh(v):
+        # Trust a higher-timeframe bias ONLY when it is auto-fetched (real price) and
+        # not stale — never a chart/alert overlay — so the brake stays independent of
+        # the inbound alert stream and never acts on outdated trend data.
+        return v.get("source") == "auto" and not v.get("stale", True)
+
+    if not (_htf_auto_fresh(v1) and _htf_auto_fresh(v4)):
+        return None
+    # Read the bias from the SAME freshness records we source/stale-validated above so
+    # the gated direction can never drift from the validated reading.
+    bias_1h = v1.get("bias")
+    bias_4h = v4.get("bias")
+    # Real-price VWAP direction, only trusted when the reading is fresh ("ok").
+    vwap_dir = None
+    try:
+        if vwap_status == "ok" and vwap_value is not None and current_price is not None:
+            if float(current_price) < float(vwap_value):
+                vwap_dir = "down"
+            elif float(current_price) > float(vwap_value):
+                vwap_dir = "up"
+    except (TypeError, ValueError):
+        vwap_dir = None
+    if d == "LONG":
+        if bias_1h == "bear" and bias_4h == "bear" and vwap_dir == "down":
+            return "LONG against a bearish trend (1H+4H bias bear and price below VWAP)"
+    else:  # SHORT
+        if bias_1h == "bull" and bias_4h == "bull" and vwap_dir == "up":
+            return "SHORT against a bullish trend (1H+4H bias bull and price above VWAP)"
+    return None
 
 
 def _swing_entry_veto_reasons(ctx, plan, direction):
@@ -16177,6 +16238,49 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             # Gates on, but nothing to evaluate (not actionable / no selection) — still
             # surface the armed/selection state for the dashboard.
             swing_strategy_filter = _swing_strategy_status(active_ticker)
+
+    # ── "Don't fight the trend" brake (MONEY-PATH, DEMOTE-ONLY) ──────────────────
+    # Flag-gated (TREND_BRAKE_ENABLED, default OFF → byte-identical goldens). An
+    # Edge-/strict-actionable setup whose direction fights BOTH independent REAL-PRICE
+    # trend signals — higher-timeframe 1H+4H bias AND price-vs-VWAP — is demoted to
+    # WAIT with a precise reason and NO trade plan, so neither the live card nor the
+    # execution gateway (which re-checks is_actionable from THIS verdict) can act on
+    # it. DEMOTE-ONLY: never creates a trade, loosens the gate, or alters geometry.
+    # The signals come from the auto HTF bar fetch + auto VWAP feed (real price), NOT
+    # the inbound alert stream, so a one-sided (all-long) alert feed cannot blind it.
+    # FAIL-OPEN: any missing/undecided signal → no veto (this is an additive safety
+    # net that complements, never replaces, the mode vetoes above). Both SCALP and
+    # SWING honour it.
+    if _trend_brake_enabled() and is_actionable(verdict) and strict_direction:
+        # SWING already built swing_ctx; SCALP leaves it None, so compute a
+        # brake-specific real-price HTF context on demand (compute_swing_context is
+        # PURE + fail-open and reads the same auto-fetched HTF_STATE_BY_INST). This is
+        # what lets the brake protect SCALP — the mode most exposed to the one-sided
+        # all-long feed — not just SWING. HTF auto-refresh is enabled whenever the
+        # brake flag is on (see _refresh_htf_if_due).
+        _brake_ctx = swing_ctx if isinstance(swing_ctx, dict) else None
+        if _brake_ctx is None:
+            try:
+                _brake_ctx = compute_swing_context(active_ticker, current_price)
+            except Exception:
+                _brake_ctx = None
+        try:
+            _brake_why = _trend_brake_reason(
+                strict_direction, current_price, vwap_value, vwap_status, _brake_ctx)
+        except Exception:   # a broken brake must NEVER block a trade — fail OPEN.
+            _brake_why = None
+        if _brake_why:
+            verdict       = "WAIT"
+            strict_label  = "WAIT"
+            strict_reason = "Trend brake: " + _brake_why + "."
+            trade_plan = {
+                "trade_plan": False,
+                "reason":     strict_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": strict_direction,
+                "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
 
     # ── Dual-mode shadow simulator: snapshot the EXACT gate inputs HERE, BEFORE the
     # zone-broken / mitigated overrides below mutate `confidence`, so the webhook
