@@ -33721,6 +33721,11 @@ def dashboard():
     <div class="dir-btn long active" onclick="userPickedSetup=true; setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
     <div class="dir-btn short" onclick="userPickedSetup=true; setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
+  <!-- Recommendation output (Edge score · checklist · POTENTIAL / live trade plan ·
+       reason · actions) — intentionally placed directly under the dial + direction
+       toggle so the potential trade levels sit next to the dial without scrolling
+       past the analysis panels below. Display-only: every element is targeted by id
+       in renderDirView()/applyRec(), so its position is independent of the JS. -->
   <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
   <div id="rec-score-num"></div>
   <div id="rec-checklist" class="rec-checklist"></div>
