@@ -33721,6 +33721,20 @@ def dashboard():
     <div class="dir-btn long active" onclick="userPickedSetup=true; setDir('Long')">📈 LONG<span class="rec-tag">✓ READY</span></div>
     <div class="dir-btn short" onclick="userPickedSetup=true; setDir('Short')">📉 SHORT<span class="rec-tag">✓ READY</span></div>
   </div>
+  <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
+  <div id="rec-score-num"></div>
+  <div id="rec-checklist" class="rec-checklist"></div>
+  <div id="rec-plan" class="rec-plan"></div>
+  <div id="rec-reason" class="rec-reason"></div>
+  <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
+  <button class="btn btn-apply" id="btn-copy" style="display:none;margin-top:6px" onclick="copyOrder()">📋 Copy Order</button>
+  <div id="send-row" style="display:none;margin-top:6px">
+    <button class="btn btn-apply" id="btn-send" style="background:#08252b;border:1px solid #39d7e6;color:#7fe9f5" onclick="sendOrder()">🚀 Send order to broker</button>
+    <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px;color:#8a93a6;font-size:12px">
+      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #3a2363;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
+      <span style="color:#6b7280">· one-tap market order</span>
+    </div>
+  </div>
   <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
        TradeZella / broker CSV. This is the source of truth for P&L and win-rate.
        The proxy-feed panels below (Equity Curve, Today's Trades, Learning Stats)
@@ -33947,20 +33961,6 @@ def dashboard():
     <div class="sg-row">
       <div class="sg-top"><span>📉 Short</span><span id="sg-short-n">0</span></div>
       <div class="sg-track"><div class="sg-fill short" id="sg-short-f" style="width:0%"></div></div>
-    </div>
-  </div>
-  <div class="rec-score-wrap"><div id="rec-score-bar"></div></div>
-  <div id="rec-score-num"></div>
-  <div id="rec-checklist" class="rec-checklist"></div>
-  <div id="rec-plan" class="rec-plan"></div>
-  <div id="rec-reason" class="rec-reason"></div>
-  <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
-  <button class="btn btn-apply" id="btn-copy" style="display:none;margin-top:6px" onclick="copyOrder()">📋 Copy Order</button>
-  <div id="send-row" style="display:none;margin-top:6px">
-    <button class="btn btn-apply" id="btn-send" style="background:#08252b;border:1px solid #39d7e6;color:#7fe9f5" onclick="sendOrder()">🚀 Send order to broker</button>
-    <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px;color:#8a93a6;font-size:12px">
-      Contracts <input id="snd-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #3a2363;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
-      <span style="color:#6b7280">· one-tap market order</span>
     </div>
   </div>
 </div>
