@@ -34,3 +34,18 @@ DB again (this project: dev tables exist but are empty; prod replica has the rea
 - Correlate timestamps: if the last successful writes (max(ts)/max(created_at)) predate
   a suspected culprit deploy, that deploy did NOT cause the break. Here writes stopped
   ~mid-day UTC well before a later unrelated publish.
+- A plain re-publish only creates tables the publish's prod *reference* sees as MISSING
+  (i.e. recently-added ones — observed: `bot_training_*` finally became "tables ready"
+  on the live deployment after a publish, un-sticking the training panel). It will NOT
+  create a long-existing table that the reference still lists as present but the
+  deployment's actual runtime DB lacks (observed: `strategy_trades` kept logging "does
+  not exist" through multiple publishes while every other probe was healthy). So do NOT
+  keep recommending plain re-publishes for a single persistently-missing old table — the
+  diff will keep skipping it. Levers that actually force it: the Publish UI **"Overwrite
+  data"** option (pushes dev schema wholesale, bypassing the diff) or Replit support
+  realigning the deployment's DB binding (support route can also preserve stranded data).
+- The app has NO `CREATE TABLE` anywhere (grep-confirmed) — every table is created
+  out-of-band (database tool in dev) + Publish diff to prod. So a missing prod table is
+  ALWAYS a publish/binding issue, never a code fix. `strategy_trades` gaps only break the
+  SIMULATED analytics displays (equity curve, Today's-Trades log, learning recompute) —
+  not alerts/analysis/training/money path.
