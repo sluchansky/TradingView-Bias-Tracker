@@ -33936,7 +33936,12 @@ def dashboard():
 <div class="vw-bg" aria-hidden="true"></div>
 <h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
-<div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+<!-- Top controls collapsed into a single menu (DISPLAY-ONLY, per-device; persisted
+     in localStorage('dashTopMenu')). Never touches the money path. -->
+<div id="menu-ctl" style="margin:2px 0 8px;text-align:center">
+  <span id="menu-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="alert-ctl" onclick="toggleTopMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleTopMenu();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 14px;background:var(--panel)">☰ Menu</span>
+</div>
+<div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:none;gap:8px;justify-content:center;flex-wrap:wrap">
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Setup bell: on</span>
   <span id="theme-toggle" onclick="toggleTheme()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🖥️ Retro Mode: off</span>
   <span id="advisor-toggle" role="button" tabindex="0" onclick="toggleAdvisor()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvisor();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🧠 Advisor: off</span>
@@ -41372,6 +41377,23 @@ function toggleAdvPanels(){
   _advApply(on);
 }
 (function(){ var on=false; try{ on = localStorage.getItem('dashAdv')==='1'; }catch(e){} _advApply(on); })();
+// ── Top controls collapsed into a single menu (DISPLAY-ONLY, this device) ──
+// Shows/hides the top utility pill row (#alert-ctl) behind one ☰ Menu button.
+// Persisted in localStorage('dashTopMenu'); default collapsed; never touches the
+// money path.
+function _menuApply(open){
+  var box = document.getElementById('alert-ctl');
+  if(box){ box.style.display = open ? 'flex' : 'none'; }
+  var t = document.getElementById('menu-toggle');
+  if(t){ t.textContent = open ? '✕ Close menu' : '☰ Menu'; t.setAttribute('aria-expanded', open ? 'true' : 'false'); }
+}
+function toggleTopMenu(){
+  var open=false; try{ open = localStorage.getItem('dashTopMenu')==='1'; }catch(e){}
+  open = !open;
+  try{ localStorage.setItem('dashTopMenu', open ? '1' : '0'); }catch(e){}
+  _menuApply(open);
+}
+(function(){ var open=false; try{ open = localStorage.getItem('dashTopMenu')==='1'; }catch(e){} _menuApply(open); })();
 // ── Potential Trade Idea Review (DISPLAY-ONLY; on-demand, NOT in the 3s poll) ──
 function riEsc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function riNum(id){ var v=document.getElementById(id).value; if(v===''||v==null) return null; var f=parseFloat(v); return isNaN(f)?null:f; }
