@@ -34,6 +34,14 @@ Always confirm secret existence with `viewEnvVars({type:"secret"})` before assum
 never trust the snapshot. Secrets can only be saved via `requestEnvVar` (or the Secrets tab),
 never `setEnvVars`. After saving, restart dev + **republish** so the live deployment rebinds it.
 
+## Regenerate/rotate nuance
+Regenerating a TradersPost webhook rotates ONLY the password (last URL segment); the webhook-id
+(2nd-to-last segment) stays the same. Observed: after a rotate, the OLD url STILL probed HTTP 400
+invalid-payload (i.e. looked valid) — likely a grace/propagation window or the old secret not being
+hard-revoked. So the no-order probe canNOT prove an old exposed URL is dead. Confirm revocation in the
+TradersPost UI, not via the probe. To tell "same vs different URL saved" without printing the secret:
+compare `$TRADERSPOST_WEBHOOK_URL` (stripped) to the known literal and diff the `awk -F/ '{print $(NF-1)}'` id segment.
+
 ## How to apply
 - Probe the **stripped** value (`tr -d '[:space:]'`) — that's what the app sees — and expect HTTP 400 invalid-payload.
 - Never print the secret. Redact the URL out of any body with `sed "s#$URL#[REDACTED]#g"`.
