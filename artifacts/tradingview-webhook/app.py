@@ -39031,7 +39031,6 @@ async function refreshRec() {
     // Loud, can't-miss alert the moment a setup flips to READY (fires once per
     // FORMING -> READY transition, per instrument). Display/sound only — no trades.
     maybeReadyAlert(inst, v);
-    maybeEdgeBell(inst, d);
 
     // Per-direction body driven by the current toggle.
     renderDirView();
@@ -39299,8 +39298,9 @@ let soundOn = (localStorage.getItem('readySound') !== 'off');
 let _readyState = {};   // instrument -> was actionable on the previous poll
 let _lastTradeOpenedAt = null;   // opened_at of the last seen ACTIVE_TRADE (bell de-dupe)
 let _tradeBellInit = false;      // first /trade poll sets the baseline WITHOUT ringing
-const EDGE_BELL_THRESHOLD = 80;  // ring the bell when the dial probability reaches this %
-let _edgeBellState = {};         // (inst|dir) -> was the dial >= threshold on the previous poll
+const EDGE_BELL_THRESHOLD = 80;  // ring the bell when a setup's dial probability reaches this %
+let _edgeBellState = {};         // (inst|dir) -> was that side's dial >= threshold on the previous scan
+let _edgeBellInit = true;        // first cross-instrument scan sets baselines WITHOUT ringing
 
 function _ensureAudio() {
   try {
@@ -39454,29 +39454,45 @@ function maybeReadyAlert(inst, v) {
   }
 }
 
-// Ring the stock-exchange bell the moment the dial (probability gauge) reaches the
-// threshold (default 80%), fires once per rising crossing per instrument+direction.
-// Mirrors the gauge's own value (selected side's per-side Edge, else authoritative)
-// so it matches exactly what the needle shows. The first observation only sets the
-// baseline (no ring), so loading onto — or toggling to — an already-hot side stays
-// silent; it rings only on a genuine climb from below the threshold. Display/sound
-// only, gated by the same Setup-bell toggle (playExchangeBell checks soundOn).
-function maybeEdgeBell(inst, d) {
+// Ring the stock-exchange bell whenever ANY instrument's setup (either direction)
+// climbs into the threshold band (>=80% on the dial) — regardless of which tab or
+// direction you're currently viewing. Runs as its own background scan across every
+// instrument so a hot setup you're NOT looking at still alerts. Mirrors the dial's
+// per-side Edge Score exactly. Fires once per rising crossing per instrument+
+// direction (re-arms after the value drops back below). The first scan only records
+// baselines (no ring), so setups already hot on load stay silent. Gated by the
+// Setup-bell toggle — skips entirely (no sound, no polling) when muted. Pure
+// display/sound: never touches the gate, scoring, sizing or any broker path.
+async function scanEdgeBells() {
   try {
-    if (!d) return;
-    const blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
-    const ds  = d.decision_support || {};
-    let prob = (blk && blk.edge_score != null) ? blk.edge_score
-             : (ds.probability != null ? ds.probability
-             : (d.edge_score != null ? d.edge_score : 0));
-    prob = Math.max(0, Math.min(100, Number(prob) || 0));
-    const key = inst + '|' + dir;
-    const was = _edgeBellState[key];
-    const now = prob >= EDGE_BELL_THRESHOLD;
-    _edgeBellState[key] = now;
-    if (now && was === false) {
+    if (!soundOn) return;   // no sound wanted -> skip the scan and its network churn
+    const insts = (typeof INSTRUMENTS !== 'undefined' && INSTRUMENTS.length) ? INSTRUMENTS : ['MGC'];
+    const results = await Promise.all(insts.map(function(s){
+      return api('/status?ticker='+encodeURIComponent(s))
+               .then(function(d){ return { s:s, d:d }; })
+               .catch(function(){ return { s:s, d:null }; });
+    }));
+    const baseline = _edgeBellInit;   // snapshot: first scan only sets baselines
+    let hit = null;                   // first fresh crossing this scan (one bell per scan)
+    results.forEach(function(r){
+      if (!r.d || !r.d.directions) return;
+      ['Long','Short'].forEach(function(sd){
+        const blk = r.d.directions[sd];
+        if (!blk || blk.edge_score == null) return;
+        const prob = Math.max(0, Math.min(100, Number(blk.edge_score) || 0));
+        const key = r.s + '|' + sd;
+        const was = _edgeBellState[key];
+        const now = prob >= EDGE_BELL_THRESHOLD;
+        _edgeBellState[key] = now;
+        if (!baseline && now && was === false && hit === null) {
+          hit = { s:r.s, sd:sd, prob:prob };
+        }
+      });
+    });
+    if (baseline) { _edgeBellInit = false; return; }   // baseline pass: never rings
+    if (hit) {
       playExchangeBell();
-      toast('🔔 ' + inst + ' ' + dir + ' — Edge ' + Math.round(prob) + '%');
+      toast('🔔 ' + hit.s + ' ' + hit.sd + ' setup — Edge ' + Math.round(hit.prob) + '%');
     }
   } catch(e) {}
 }
@@ -40796,7 +40812,7 @@ async function findCleanestTrade(btn){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults();
+refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
@@ -41378,7 +41394,7 @@ async function mbmtAdd(){
   finally{ if(btn){ btn.disabled=false; btn.textContent=prev; } }
 }
 
-setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); loadTraining(); }, 3000);
+setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); loadTraining(); scanEdgeBells(); }, 3000);
 setInterval(checkStale, 2000);
 loadTraining();
 </script>
