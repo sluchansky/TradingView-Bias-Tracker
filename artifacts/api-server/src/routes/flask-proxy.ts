@@ -82,6 +82,10 @@ export const BOT1_ROUTES = [
   "/webhook",
   "/enter",
   "/traderspost",
+  // Manual pre-READY "TAKE THIS TRADE" preview entry (owner-only money path; NOT in
+  // dashboard-auth OPEN_PATHS). Flag-gated (USER_APPROVED_PREVIEW_ENABLED); routes
+  // through the SAME audited execution gateway as /traderspost.
+  "/take-preview",
   "/breakeven",
   "/close",
   "/trade",

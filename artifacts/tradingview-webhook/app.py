@@ -29674,6 +29674,9 @@ def status():
         "execution_live":           execution_is_live() and execution_configured(),
         "execution_enabled":        execution_configured(),
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
+        # Manual pre-READY "TAKE THIS TRADE" preview path — gates the dashboard button
+        # (default OFF => key is False => button hidden => today's UI byte-identical).
+        "user_preview_enabled":     _user_preview_take_enabled(),
         "execution_rejections":     _recent_exec_rejections(),
         # Trade-management analytics (MFE/MAE booleans + commission + oversized-loss);
         # null when every analytics flag is OFF (display-only).
@@ -29894,6 +29897,97 @@ def traderspost_order():
 
     result, code = execute_trade_gateway(instrument, contracts, source="manual")
     return jsonify(result), code
+
+
+@app.route("/take-preview", methods=["POST"])
+def take_preview_trade():
+    """Owner-only (dashboard auth enforced at the Express /api edge; NOT in
+    OPEN_PATHS). Manually TAKE a FORMING preview setup (verdict POTENTIAL Long/Short)
+    BEFORE it reaches READY, through the SAME single audited execution gateway. This
+    is the explicit, user-confirmed exception to the display-only potential_plan rule.
+
+    Server-authoritative: the client sends only ticker + contracts + the viewed
+    direction (+ an optional expected_stop for the drift guard). The gateway rebuilds
+    the plan from the CURRENT server-side directions[dir].potential_plan (never client
+    prices) and applies every safety layer (risk cap, per-asset caps, prop, training,
+    dedupe, fail-closed money path). On a confirmed send / simulate / manual plan it
+    starts LOCAL dashboard tracking tagged source=USER_APPROVED_PREVIEW so it is
+    counted SEPARATELY from bot-auto entries and is never recorded to strategy_trades.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    instrument = _instrument_from_text(data.get("ticker"))
+    if instrument is None:
+        return jsonify({"status": "error",
+                        "reason": "A valid instrument ticker (MGC, MNQ, MES, or MYM) is required."}), 400
+    direction = str(data.get("direction", "")).strip().capitalize()
+    if direction not in ("Long", "Short"):
+        return jsonify({"status": "error", "reason": "direction must be Long or Short."}), 400
+    try:
+        contracts = int(data.get("contracts", 1))
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "reason": "contracts must be a whole number."}), 400
+    _max_contracts = max_contracts(instrument)
+    if contracts < 1 or contracts > _max_contracts:
+        return jsonify({"status": "error",
+                        "reason": f"contracts must be between 1 and {_max_contracts}."}), 400
+    expected_stop = data.get("expected_stop")
+
+    result, code = execute_trade_gateway(instrument, contracts,
+                                         source="user_approved_preview",
+                                         direction=direction, expected_stop=expected_stop)
+    # Send-before-track: only start LOCAL tracking after a CONFIRMED send / simulate /
+    # manual plan. Any error (or unexpected status) is returned as-is; no ACTIVE_TRADE
+    # is written so a rejected preview never shows a phantom position.
+    if code != 200 or (result or {}).get("status") not in ("sent", "simulated", "manual_required"):
+        return jsonify(result), code
+
+    plan = result.get("plan") or {}
+    try:
+        _entry = float(plan["entry"]); _stop = float(plan["stopLoss"])
+        _t1 = float(plan["takeProfit"]); _t2 = float(plan.get("target2", plan["takeProfit"]))
+        _qty = int(plan.get("quantity", contracts))
+        _dir = str(plan.get("direction", direction))
+    except (KeyError, ValueError, TypeError) as exc:
+        # The order already went out — report success but flag the tracking gap so the
+        # operator verifies the broker rather than assuming nothing happened.
+        logger.error("take-preview tracking parse failed after send: %s", exc)
+        return jsonify({"status": "entered", "execution_status": result.get("status"),
+                        "tracking": "failed", "plan": plan,
+                        "message": result.get("message")}), 200
+
+    _trade = {
+        "direction":        _dir,
+        "entry_price":      _entry,
+        "stop_loss":        _stop,
+        "target1":          _t1,
+        "target2":          _t2,
+        "contracts":        _qty,
+        "profile":          instrument,
+        "symbol":           instrument,
+        "opened_at":        now_utc().isoformat(),
+        "t1_hit":           False,
+        "t2_hit":           False,
+        "status":           "active",
+        "source":           "USER_APPROVED_PREVIEW",
+        "notes":            "Taken early from preview setup (pre-READY, user-approved)",
+        "execution_status": result.get("status"),
+    }
+    set_active_trade(instrument, _trade)
+
+    try:
+        _url = _discord_url(instrument)
+        if _url:
+            requests.post(_url, json={"content": (
+                f"⚡ **PREVIEW TRADE TAKEN (pre-READY) — {_dir.upper()}**\n"
+                f"{instrument} · {_qty} @ market · Stop `{_stop:.2f}` · TP `{_t1:.2f}`\n"
+                f"_User-approved preview · counted separately (USER_APPROVED_PREVIEW)_")}, timeout=5)
+    except requests.RequestException:
+        pass
+
+    logger.info("Preview trade taken: %s %s x%d entry≈%.2f (exec=%s)",
+                instrument, _dir, _qty, _entry, result.get("status"))
+    return jsonify({"status": "entered", "execution_status": result.get("status"),
+                    "trade": _trade, "plan": plan, "message": result.get("message")}), 200
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -32280,7 +32374,26 @@ def training_set_stage():
     }), 200
 
 
-def execute_trade_gateway(instrument, contracts, source="manual"):
+def _user_preview_take_enabled():
+    """Money flag for the manual pre-READY 'TAKE THIS TRADE' preview path. DEFAULT
+    OFF (byte-identical): the dashboard button stays hidden and this gateway branch
+    refuses until USER_APPROVED_PREVIEW_ENABLED is explicitly set on the intended
+    live deployment."""
+    return _env_flag_on("USER_APPROVED_PREVIEW_ENABLED", default_on=False)
+
+
+def preview_max_contracts():
+    """Conservative hard ceiling on a single pre-READY preview take (applied ON TOP
+    of the per-trade risk cap + per-asset contract ceiling). Default 1; raise via
+    the PREVIEW_MAX_CONTRACTS env var."""
+    try:
+        v = int((os.environ.get("PREVIEW_MAX_CONTRACTS") or "1").strip())
+    except (ValueError, TypeError):
+        return 1
+    return v if v >= 1 else 1
+
+
+def execute_trade_gateway(instrument, contracts, source="manual", direction=None, expected_stop=None):
     """Shared, server-authoritative execution gate behind /traderspost AND the
     auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
     auto path reads result["plan"] to track ACTIVE_TRADE. Server-authoritative on
@@ -32477,6 +32590,107 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
                         "reason": ("Fast Entry: SCALP filter — "
                                    + "; ".join(m for _, m in _fveto) + ".")}, 409
         direction = fe_dir
+    elif source == "user_approved_preview":
+        # ── Manual USER-APPROVED PREVIEW entry (taken BEFORE READY) ──────────────
+        # DELIBERATE, explicitly user-confirmed exception to the display-only
+        # potential_plan rule (see the dashboard POTENTIAL branch). The operator
+        # chose to take a FORMING setup before it reached READY. The plan is rebuilt
+        # SERVER-SIDE from the SAME directions[dir].potential_plan the dashboard
+        # shows — NEVER from client-supplied prices — and this branch bypasses ONLY
+        # the is_actionable / Edge-verdict check. EVERY other safety is shared:
+        # market/session/holiday enforced above; risk cap, prop, training, dedupe and
+        # the fail-closed money path below. Sized DOWN + hard-capped (PREVIEW cap).
+        if not _user_preview_take_enabled():
+            return {"status": "error",
+                    "reason": "Preview-take is disabled (USER_APPROVED_PREVIEW_ENABLED is off)."}, 409
+        # Local-flatness gate (FAIL-CLOSED, unconditional): the operator confirms the
+        # account is FLAT before taking a preview, so never overwrite / stack on an
+        # already-tracked slot (a bot-AUTO entry or an earlier preview). set_active_trade
+        # overwrites by default and max_open_trades() above only blocks when a per-asset
+        # cap is configured (default None), so enforce single-slot here regardless of
+        # config — a second entry would silently lose management of the open trade.
+        if active_trade_for(instrument) is not None:
+            return {"status": "error",
+                    "reason": (f"{instrument} already has an open tracked position — "
+                               "close it before taking a preview trade.")}, 409
+        pv_dir = direction if direction in ("Long", "Short") else None
+        if pv_dir is None:
+            return {"status": "error",
+                    "reason": "Preview-take requires an explicit Long or Short direction."}, 400
+        _pv_blk = (a.get("directions") or {}).get(pv_dir) or {}
+        tp = _pv_blk.get("potential_plan") or {}
+        if not tp.get("trade_plan") or not tp.get("entry_zone"):
+            return {"status": "error",
+                    "reason": (f"No forming {pv_dir} preview setup right now — refresh "
+                               "once a POTENTIAL setup is showing and retry.")}, 409
+        if tp.get("stop_valid") is False:
+            return {"status": "error",
+                    "reason": ("Preview stop is invalid: "
+                               + str(tp.get("stop_invalid_reason") or "see setup") + ".")}, 409
+        # Opposite-direction Edge conflict veto (mirrors dual_tf / fast_entry): if the
+        # Edge gate is actionable the OTHER way, stand the preview-take down.
+        if is_actionable(verdict):
+            _edge_dir = ready_direction(verdict)
+            if _edge_dir is not None and _edge_dir.lower() != pv_dir.lower():
+                return {"status": "error",
+                        "reason": (f"Edge gate is {_edge_dir} READY — conflicts with the "
+                                   f"{pv_dir} preview; entry skipped.")}, 409
+        # Server-plan drift guard: the dashboard shows a LIVE-anchored preview copy
+        # that can differ from the server's zone-anchored plan. If the operator sent
+        # the stop they SAW and the server plan has since moved materially (a new
+        # structure alert reshaped the setup), refuse so they re-confirm the CURRENT
+        # plan. Optional (skipped when no expected_stop is sent); tolerant of rounding.
+        if expected_stop is not None:
+            try:
+                _exp = float(expected_stop)
+                _srv_stop = float(tp["stop_loss"])
+                _z = str(tp["entry_zone"])
+                if "–" in _z:
+                    _lo_s, _hi_s = _z.split("–")
+                    _mid = (float(_lo_s) + float(_hi_s)) / 2
+                else:
+                    _mid = float(_z)
+                _risk = abs(_mid - _srv_stop) or 1.0
+                if abs(_srv_stop - _exp) > 0.5 * _risk:
+                    return {"status": "error",
+                            "reason": ("The preview setup moved since you viewed it — "
+                                       "refresh and re-confirm the current plan.")}, 409
+            except (ValueError, TypeError, KeyError):
+                pass  # unparseable => stay lenient; the server plan is still authoritative
+        # Non-shared ENTRY VETOES (MONEY-PATH, FAIL-CLOSED): the full_analysis SCALP
+        # (S2) and SWING (P4) entry vetoes only run when is_actionable(verdict) is
+        # True, so a FORMING (WAIT) potential_plan never went through them. Since this
+        # branch bypasses is_actionable, re-run the SAME checks against tp / pv_dir —
+        # exactly as dual_tf / fast_entry do — and stand down on any failure. Each is
+        # gated on its own mode enabler (mutually exclusive), so the inactive mode is a
+        # no-op and flag-off stays byte-identical.
+        _cp_pv = CURRENT_PRICE_BY_TICKER.get(instrument)
+        if _scalp_dynamic_enabled():
+            try:
+                _psq = compute_scalp_quality(
+                    pv_dir, _cp_pv, a.get("vwap_value"), a.get("vwap_status"),
+                    a.get("nearest_supply"), a.get("nearest_demand"), tp,
+                    a.get("edge_score"), instrument,
+                    (a.get("volatility") or {}).get("atr_pts"),
+                )
+                _pveto = _scalp_entry_veto_reasons(_psq)
+            except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
+                _pveto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
+            if _pveto:
+                return {"status": "error",
+                        "reason": ("Preview: SCALP filter — "
+                                   + "; ".join(m for _, m in _pveto) + ".")}, 409
+        if _swing_htf_enabled():
+            try:
+                _pv_swing_ctx = compute_swing_context(instrument, _cp_pv)
+                _psv = _swing_entry_veto_reasons(_pv_swing_ctx, tp, pv_dir)
+            except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
+                _psv = [("unavailable", f"SWING entry checks unavailable ({exc})")]
+            if _psv:
+                return {"status": "error",
+                        "reason": ("Preview: SWING filter — "
+                                   + "; ".join(m for _, m in _psv) + ".")}, 409
+        direction = pv_dir
     else:
         if not is_actionable(verdict):
             return {"status": "error",
@@ -32526,6 +32740,12 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
         # the EARLY multiplier on its own; cap it explicitly with RISK_MULT_EARLY.
         _size_mult = min(cfg("RISK_MULT_EARLY"),
                          _setup_risk_mult(verdict, a.get("structure_class")))
+    elif source == "user_approved_preview":
+        # Pre-READY discretionary take → sized DOWN like the EARLY tier (half-size).
+        # verdict is typically WAIT here, so _setup_risk_mult wouldn't apply the EARLY
+        # multiplier on its own; apply RISK_MULT_EARLY explicitly (then hard-capped to
+        # PREVIEW_MAX_CONTRACTS after the risk-cap sizing below).
+        _size_mult = cfg("RISK_MULT_EARLY")
     else:
         _size_mult = _setup_risk_mult(verdict, a.get("structure_class"))
     _sized = _risk_capped_contracts(abs(entry - stop), point_value_for(instrument),
@@ -32536,6 +32756,10 @@ def execute_trade_gateway(instrument, contracts, source="manual"):
                 "reason": (f"Single-contract risk ${_sized['risk_per_contract']:,.0f} exceeds the "
                            f"${max_risk_cap():,.0f} per-trade cap — order skipped.")}, 409
     contracts = max(1, min(int(contracts), _sized["contracts"]))
+    # Pre-READY preview takes carry extra size discipline: hard-cap at
+    # PREVIEW_MAX_CONTRACTS (default 1) ON TOP of the risk cap + per-asset ceiling.
+    if source == "user_approved_preview":
+        contracts = max(1, min(contracts, preview_max_contracts()))
 
     tp_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
     action    = "buy" if direction.lower().startswith("l") else "sell"
@@ -32802,6 +33026,14 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
                 pass
             return False
     with _AUTO_EXEC_LOCK:
+        # A still-open USER-APPROVED PREVIEW take holds this instrument's slot by the
+        # operator's own hand — never let a bot-AUTO entry stack on top of it, even in
+        # SCALP allow_stack mode. Byte-identical until a preview take exists (no other
+        # tracked ACTIVE_TRADE carries this source).
+        _pv_open = active_trade_for(inst)
+        if _pv_open and _pv_open.get("source") == "USER_APPROVED_PREVIEW":
+            logger.info("Auto-trade skipped for %s - a user-approved preview take is still open.", inst)
+            return False
         # Live-loss-reduction: when the stacking gate is armed (default), demote any
         # allow_stack=True request so a live position always blocks a new entry. Env
         # kill-switch DISABLE_STACKING_GATE=0 lifts THIS gate, but the maxOpenTrades=1
@@ -39353,9 +39585,12 @@ function renderDirView() {
       sendRow.style.display = (d.execution_enabled && recInst === sym) ? 'block' : 'none';
     }
   } else if (pp && pp.trade_plan) {
-    // POTENTIAL setup forming for the selected side — DISPLAY ONLY. The broker
-    // actions (Apply / Copy / Send) stay hidden: they are gated on the actionable
-    // verdict + the top-level trade_plan, never on this preview.
+    // POTENTIAL setup forming for the selected side — preview plan is DISPLAY ONLY.
+    // The standard broker actions (Apply / Copy / Send) stay hidden: they are gated
+    // on the actionable verdict + the top-level trade_plan, never on this preview.
+    // The ONE sanctioned exception is the flag-gated "TAKE THIS TRADE (preview)"
+    // button below (user_preview_enabled) — a deliberate, double-confirmed manual
+    // override that routes through the SAME audited /take-preview -> gateway path.
     const miss = (blk && blk.missing && blk.missing.length) ? blk.missing.join(', ') : 'confirmation';
     // Re-anchor the four preview prices to the LIVE price every 30s so they visibly
     // track the market (the server plan is zone-anchored, so it otherwise looks
@@ -39367,11 +39602,27 @@ function renderDirView() {
       ? '<div style="color:#22c55e;font-size:11px;margin-top:5px">⟳ Preview anchored to live price <b>'+la.anchorTxt+'</b> · updates every 30s'+(la.secsLeft!=null?' (next in '+la.secsLeft+'s)':'')+' · actual setup zone unchanged</div>'
       : '';
     planEl.style.display = 'block';
+    // Flag-gated manual override: allow TAKING this forming preview BEFORE READY when
+    // the deployment enabled it, execution is configured, and the snapshot is for the
+    // instrument on screen. Sends the SERVER pp stop (not the live-anchored copy) for
+    // the drift guard. Hidden by default (user_preview_enabled=false).
+    const _recInstP = String(d.active_ticker || '').replace('1!','');
+    const _canTake = !!(d.user_preview_enabled && d.execution_enabled && _recInstP === sym
+                        && pp.stop_loss!=null && pp.target1!=null && pp.stop_valid!==false);
+    const _takeBtn = _canTake
+      ? '<button id="take-preview-btn" onclick="takePreviewTrade()" '
+        + 'style="margin-top:9px;width:100%;padding:9px 10px;border:0;border-radius:6px;'
+        + 'cursor:pointer;font-weight:800;font-size:12px;color:#1a1200;background:#f59e0b">'
+        + '⚡ TAKE THIS TRADE (preview · pre-READY)</button>'
+        + '<div style="color:#6b7280;font-size:10px;margin-top:3px;text-align:center">'
+        + 'Manual override · sends via your configured broker · counted separately</div>'
+      : '';
     planEl.innerHTML =
       '<div style="color:#f59e0b;font-weight:600;margin-bottom:4px">⏳ POTENTIAL '+dir.toUpperCase()+' — not yet READY</div>' +
       planRow(shown) +
       anchNote +
-      '<div style="color:#6b7280;font-size:11px;margin-top:5px">Preview only · waiting on: '+miss+' · no broker order until READY</div>';
+      '<div style="color:#6b7280;font-size:11px;margin-top:5px">Preview only · waiting on: '+miss+' · no broker order until READY</div>' +
+      _takeBtn;
     apply.style.display = 'none';
     if (copyBtn) copyBtn.style.display = 'none';
     if (sendRow) sendRow.style.display = 'none';
@@ -39410,6 +39661,65 @@ function applyRec() {
   if (tp.target2!=null)   document.getElementById('f-t2').value   = tp.target2;
   document.querySelector('details').open = true;
   toast('⬇️ Setup applied — review & ENTER');
+}
+
+// ── Manual pre-READY "TAKE THIS TRADE" (preview) — flag-gated money path ──
+// Deliberate, double-confirmed override of the display-only preview rule. Reads the
+// currently-viewed side (global dir) + instrument (global sym) exactly like applyRec,
+// sends the SERVER potential_plan stop for the drift guard, and lets the server
+// (/take-preview -> gateway) rebuild + validate + size the order. On a confirmed
+// send/simulate/manual it tracks locally as USER_APPROVED_PREVIEW (counted separately).
+async function takePreviewTrade() {
+  if (!lastRec) { toast('No snapshot yet — wait for refresh', false); return; }
+  if (!lastRec.user_preview_enabled) { toast('Preview-take is disabled on this deployment', false); return; }
+  if (!lastRec.execution_enabled) { toast('Execution is not configured', false); return; }
+  const recInst = String(lastRec.active_ticker || '').replace('1!','');
+  if (recInst !== sym) { toast('Snapshot is for '+recInst+', not '+sym+' — wait for refresh', false); return; }
+  const blk = (lastRec.directions && lastRec.directions[dir]) || {};
+  const pp = blk.potential_plan;
+  if (!pp || !pp.trade_plan) { toast('No forming '+dir+' preview to take', false); return; }
+  if (pp.stop_loss==null || pp.target1==null) { toast('Preview stop/target not ready', false); return; }
+  if (pp.stop_valid===false) { toast('Preview stop is invalid — cannot take', false); return; }
+  let qty = parseInt((document.getElementById('f-contracts')||{}).value || '1', 10);
+  if (!qty || qty < 1) qty = 1;
+  const mode  = lastRec.execution_mode || 'manual_only';
+  const live  = !!lastRec.execution_live;
+  const label = lastRec.execution_provider_label || 'your broker';
+  const head  = live
+    ? '⚠ This places a REAL market order on ' + label + '.'
+    : (mode==='paper'
+        ? 'This submits a SIMULATED (paper) order — no real broker is contacted.'
+        : 'Manual mode — this shows the exact order to place yourself.');
+  const c1 = 'You are taking a PREVIEW trade BEFORE READY confirmation.\\n\\n'
+    + sym + ' ' + dir.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
+    + '\\nEntry ~' + (pp.entry_zone||'market') + '   Stop ' + pp.stop_loss + '   TP ' + pp.target1
+    + ' (' + (pp.rr!=null?pp.rr:'') + ')'
+    + '\\n\\n' + head + '\\n\\nThis setup is NOT yet READY. Continue?';
+  if (!confirm(c1)) return;
+  if (!confirm('Confirm your broker account is FLAT for ' + sym
+      + ' (no open position or conflicting orders) before taking this preview trade.')) return;
+  const btn = document.getElementById('take-preview-btn');
+  if (btn) { btn.disabled = true; btn.textContent = live ? '⏳ Sending…' : '⏳ Submitting…'; }
+  try {
+    let od;
+    try {
+      od = await api('/take-preview', { ticker: sym + '1!', contracts: qty, direction: dir, expected_stop: pp.stop_loss });
+    } catch(e) {
+      toast(live ? 'Execution failed — check your broker' : 'Preview take failed — try again', false);
+      return;
+    }
+    const st = od && od.status;
+    if (st === 'entered' || st === 'sent' || st === 'simulated' || st === 'manual_required') {
+      toast(live ? '🚀 Preview trade sent + tracked'
+                 : (mode==='paper' ? '🧪 Paper preview taken + tracked'
+                                   : '📋 Preview tracked — place the order manually'));
+      refresh();
+    } else {
+      toast('Preview take: ' + ((od && (od.reason || od.status)) || 'no response'), false);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ TAKE THIS TRADE (preview · pre-READY)'; }
+  }
 }
 
 // ── One-tap order copy + loud READY alert (prop-firm safe: NO broker calls) ──
@@ -39760,7 +40070,11 @@ async function refresh() {
       info.textContent = (isLong?'📈':'📉') + ' ' + d.direction + ' — ' + (d.profile||'').split(' ')[0];
       detail.innerHTML =
         'Entry <b>'+d.entry_price+'</b> &nbsp;·&nbsp; Stop Loss <b>'+d.stop_loss+'</b><br>' +
-        'Take Profit <b>'+d.target1+'</b> &nbsp;·&nbsp; '+d.contracts+'x';
+        'Take Profit <b>'+d.target1+'</b> &nbsp;·&nbsp; '+d.contracts+'x' +
+        (d.source==='USER_APPROVED_PREVIEW'
+          ? '<br><span style="color:#f59e0b;font-size:11px">⚡ Preview take (pre-READY, user-approved)'
+            + (d.notes ? ' · '+d.notes : '') + '</span>'
+          : (d.notes ? '<br><span style="color:#9d86c4;font-size:11px">'+d.notes+'</span>' : ''));
       if (d.pnl_dollars !== undefined) {
         const v = d.pnl_dollars;
         const s = v >= 0 ? '+$'+Math.abs(v).toFixed(0) : '-$'+Math.abs(v).toFixed(0);
