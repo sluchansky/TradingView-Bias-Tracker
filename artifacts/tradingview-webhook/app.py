@@ -39031,6 +39031,7 @@ async function refreshRec() {
     // Loud, can't-miss alert the moment a setup flips to READY (fires once per
     // FORMING -> READY transition, per instrument). Display/sound only — no trades.
     maybeReadyAlert(inst, v);
+    maybeEdgeBell(inst, d);
 
     // Per-direction body driven by the current toggle.
     renderDirView();
@@ -39298,6 +39299,8 @@ let soundOn = (localStorage.getItem('readySound') !== 'off');
 let _readyState = {};   // instrument -> was actionable on the previous poll
 let _lastTradeOpenedAt = null;   // opened_at of the last seen ACTIVE_TRADE (bell de-dupe)
 let _tradeBellInit = false;      // first /trade poll sets the baseline WITHOUT ringing
+const EDGE_BELL_THRESHOLD = 80;  // ring the bell when the dial probability reaches this %
+let _edgeBellState = {};         // (inst|dir) -> was the dial >= threshold on the previous poll
 
 function _ensureAudio() {
   try {
@@ -39449,6 +39452,33 @@ function maybeReadyAlert(inst, v) {
     playReadyChime();
     notifyReady(inst + ' ' + v, 'Entry ' + (tp.entry_zone || '—') + '  ·  Stop ' + (tp.stop_loss != null ? tp.stop_loss : '—'));
   }
+}
+
+// Ring the stock-exchange bell the moment the dial (probability gauge) reaches the
+// threshold (default 80%), fires once per rising crossing per instrument+direction.
+// Mirrors the gauge's own value (selected side's per-side Edge, else authoritative)
+// so it matches exactly what the needle shows. The first observation only sets the
+// baseline (no ring), so loading onto — or toggling to — an already-hot side stays
+// silent; it rings only on a genuine climb from below the threshold. Display/sound
+// only, gated by the same Setup-bell toggle (playExchangeBell checks soundOn).
+function maybeEdgeBell(inst, d) {
+  try {
+    if (!d) return;
+    const blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
+    const ds  = d.decision_support || {};
+    let prob = (blk && blk.edge_score != null) ? blk.edge_score
+             : (ds.probability != null ? ds.probability
+             : (d.edge_score != null ? d.edge_score : 0));
+    prob = Math.max(0, Math.min(100, Number(prob) || 0));
+    const key = inst + '|' + dir;
+    const was = _edgeBellState[key];
+    const now = prob >= EDGE_BELL_THRESHOLD;
+    _edgeBellState[key] = now;
+    if (now && was === false) {
+      playExchangeBell();
+      toast('🔔 ' + inst + ' ' + dir + ' — Edge ' + Math.round(prob) + '%');
+    }
+  } catch(e) {}
 }
 
 function _planMidEntry(tp, inst) {
