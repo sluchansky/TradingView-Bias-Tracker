@@ -490,6 +490,13 @@ def _env_int_or_none(name, default):
 #      (> threshold). SCALP-only (SWING already hard-gates volatility via VOL_HARD_GATE).
 SCALP_VOL_BRAKE_ENABLED   = _env_flag_on("SCALP_VOL_BRAKE_ENABLED")
 SCALP_VOL_BRAKE_THRESHOLD = _env_float("SCALP_VOL_BRAKE_THRESHOLD", 3.0)
+# Structure-reversal demote (SCALP-only, MONEY PATH, default OFF). When a FRESH
+# opposite-direction structure event (BOS/CHOCH/swing) lands CLEARLY later than the
+# other side's newest structure (gap beyond the true-conflict window), the STALE
+# opposite side's structure credit is nulled so the dominant direction flips on the
+# reversal instead of clinging to stale +20 credit. Default OFF => byte-identical to
+# today (goldens green); SCALP-only (SWING never affected). Env kill switch =0.
+STRUCTURE_REVERSAL_DEMOTE_ENABLED = _env_flag_on("STRUCTURE_REVERSAL_DEMOTE_ENABLED", default_on=False)
 # T3 — SCALP 1:2 reward upgrade: lift the SCALP primary/first target from 1R to 2R,
 #      with the staged exit multiples moving in lockstep (TP2 2.5R, runner 3R) so the
 #      broker TP, management geometry, dashboard quality and entry veto all agree.
@@ -6576,6 +6583,37 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     #    direction now satisfies the structure gate (no longer BOS *and* CHOCH). ──
     hh_ts = _latest_ts("HH"); hl_ts = _latest_ts("HL")
     lh_ts = _latest_ts("LH"); ll_ts = _latest_ts("LL")
+    # ── Structure-reversal demote (SCALP-only, flag-gated, MONEY PATH) ──────────
+    #    A stale opposite-direction structure event keeps feeding the losing side its
+    #    +20 structure credit long after a FRESH opposite reversal, so the dominant
+    #    direction flips slowly (e.g. a BOS DEMAND ~50 min ago keeps Long dominant
+    #    even after a CHOCH SUPPLY now). When BOTH sides carry structure AND one side
+    #    is CLEARLY newer (gap > CONFLICT_WINDOW_MIN — beyond the true-conflict window
+    #    that opposing_present/true_conflict already own), NULL the older side's
+    #    structure timestamps + flags + its anchored confirmation so structure_long/
+    #    short, opposing_present, the per-direction Edge Score, _confirmations and
+    #    gate_debug all consistently read the reversal. This ONLY removes eligibility
+    #    from the stale side (fail-safe: never adds to the fresh side, never creates a
+    #    trade). SCALP-only (not VOL_HARD_GATE) so SWING is byte-identical; env kill
+    #    switch STRUCTURE_REVERSAL_DEMOTE_ENABLED=0 (default OFF) => block skipped.
+    structure_demoted = None
+    if STRUCTURE_REVERSAL_DEMOTE_ENABLED and not bool(cfg("VOL_HARD_GATE")):
+        _dem_struct_ts = max([t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None)
+        _sup_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts, lh_ts, ll_ts) if t], default=None)
+        if (_dem_struct_ts and _sup_struct_ts
+                and abs((_dem_struct_ts - _sup_struct_ts).total_seconds()) > CONFLICT_WINDOW_MIN * 60):
+            if _sup_struct_ts > _dem_struct_ts:
+                # Fresh SUPPLY reversal → demote the STALE demand (long) structure.
+                bos_dem_ts = choch_dem_ts = hh_ts = hl_ts = None
+                has_bos_demand = has_choch_demand = False
+                has_bull_confirm = False
+                structure_demoted = "demand"
+            else:
+                # Fresh DEMAND reversal → demote the STALE supply (short) structure.
+                bos_sup_ts = choch_sup_ts = lh_ts = ll_ts = None
+                has_bos_supply = has_choch_supply = False
+                has_bear_confirm = False
+                structure_demoted = "supply"
     structure_long  = bool(has_bos_demand or has_choch_demand or hh_ts or hl_ts)
     structure_short = bool(has_bos_supply or has_choch_supply or lh_ts or ll_ts)
 
@@ -7011,6 +7049,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             # BOS/CHOCH/swing alert), tag the source. Flag-gated so the OFF gate_debug
             # is byte-identical to legacy.
             **({"structure_source": _struct_src} if MI_STRUCTURE_FALLBACK_ENABLED else {}),
+            # Structure-reversal demote observability (flag-gated so the OFF gate_debug
+            # is byte-identical to legacy). None = no demote this eval; "demand"/
+            # "supply" = that (stale) side's structure credit was nulled by a reversal.
+            **({"structure_demoted": structure_demoted} if STRUCTURE_REVERSAL_DEMOTE_ENABLED else {}),
             "candle_confirmed":      bool(_candle),
             "liquidity_sweep":       bool(sig["liquidity_sweep"]),
             "trend_aligned":         bool(trend_long if direction == "Long" else trend_short),
