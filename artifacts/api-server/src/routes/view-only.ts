@@ -88,10 +88,16 @@ function esc(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function pageShell(title: string, inner: string): string {
+// referrer defaults to no-referrer (keeps the ?t=<token> URL out of the Referer
+// header). The LOGIN page overrides this to "same-origin": a form POST from a
+// document under "no-referrer" makes browsers send Origin: null, which the
+// sameOrigin() CSRF check rejects — locking every legitimate viewer out. With
+// "same-origin" the browser still sends a real Origin for our own POST (so login
+// works) while suppressing it cross-origin (so CSRF protection is unaffected).
+function pageShell(title: string, inner: string, referrer: string = "no-referrer"): string {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer"><title>${esc(title)}</title>
+<meta name="referrer" content="${referrer}"><title>${esc(title)}</title>
 <style>
   :root{color-scheme:dark}
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -124,6 +130,7 @@ function loginPage(token: string, error: string | null): string {
   ${error ? `<div class="err">${esc(error)}</div>` : ""}
 </form>
 <div class="muted">Access expires automatically.</div>`,
+    "same-origin",
   );
 }
 

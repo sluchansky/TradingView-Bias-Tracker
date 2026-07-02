@@ -11,7 +11,10 @@ name = "API Server"
 # are served by this same Express process, so the deployment path router must
 # forward BOTH prefixes here. Without /api2 listed, /api2/* falls through to the
 # static `home` site and renders its SPA 404 page.
-paths = ["/api", "/api2"]
+# /view is the watch-only, expiring, password-protected shareable dashboard link
+# (also served by this Express process at app.use("/view", ...)); it must be
+# listed here too or /view/* falls through to the static `home` SPA.
+paths = ["/api", "/api2", "/view"]
 
 [services.development]
 run = "pnpm --filter @workspace/api-server run dev"

@@ -11,6 +11,10 @@ import { createHash, createHmac, timingSafeEqual, randomBytes } from "node:crypt
 // is required and rotating the admin password invalidates every outstanding link
 // (the only revocation lever). Distinct subkey labels + a `typ` field make a URL
 // token unusable as a cookie and vice-versa.
+// SECURITY NOTE: because the signing keys are derived from DASHBOARD_PASSWORD via
+// a single unsalted sha256, anyone holding a shared link token possesses material
+// for an OFFLINE dictionary attack against the admin password. This is acceptable
+// only while DASHBOARD_PASSWORD is strong/high-entropy — keep it long and random.
 
 const DEV = process.env.NODE_ENV === "development";
 
