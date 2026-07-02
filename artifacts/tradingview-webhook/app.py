@@ -524,6 +524,18 @@ SWING_STRATEGY_FILTER_ENABLED = _env_flag_on("SWING_STRATEGY_FILTER_ENABLED", de
 # OFF => the whole feature is dormant and every path is byte-identical to today.
 MANUAL_ORDER_ENABLED = _env_flag_on("MANUAL_ORDER_ENABLED", default_on=False)
 
+# ── Liquidity Sweep Focus (DISPLAY/ADVISORY-ONLY) ────────────────────────────
+# A flag-gated Main-Brain overlay that reads liquidity sweeps (prior/current session
+# H/L, equal H/L, previous swing H/L, opening-range H/L, VWAP, supply/demand zones) and
+# reports a sweep STATE + a plain-English "trader read" + an ADVISORY-ONLY confidence
+# delta. It is pure DISPLAY: the delta lives ONLY inside the display block and is NEVER
+# added to the Edge Score, the gate, strategy votes, risk rules or execution. Default
+# OFF => the block is never attached and full_analysis / main_brain stay byte-identical.
+LIQUIDITY_SWEEP_FOCUS_ENABLED = _env_flag_on("LIQUIDITY_SWEEP_FOCUS_ENABLED", default_on=False)
+# Only sweeps newer than this (minutes) count — a stale sweep alert must decay to
+# "NO SWEEP" rather than reading as CONFIRMED forever. DISPLAY-ONLY tuning knob.
+LIQ_SWEEP_RECENCY_MIN = _env_float("LIQ_SWEEP_RECENCY_MIN", 20.0)
+
 # ── Market Intelligence layer (2026-06-30) ───────────────────────────────────
 # A directional market-state + Long/Short directional-confidence + trend-memory
 # layer that sits ABOVE the strict gate (display-first). Three reversible flags,
@@ -17453,6 +17465,23 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     except Exception as _mb_exc:
         result["main_brain"] = _main_brain_neutral("Main Brain unavailable (%s)." % _mb_exc)
 
+    # ── Liquidity Sweep Focus (DISPLAY/ADVISORY-ONLY) ────────────────────────
+    # Nested INTO main_brain so /status (which forwards main_brain wholesale) carries it
+    # to the dashboard with no extra whitelist. Attached ONLY when the flag is on, so
+    # flag-OFF leaves full_analysis + main_brain byte-identical (the key is simply
+    # absent). State-aware (neutral when closed) so this single attach covers the open /
+    # vetoed / closed states. The advisory delta it carries is DISPLAY ONLY — nothing
+    # downstream reads it into the Edge Score, the gate, votes, risk or execution. The
+    # Judge / Voice / snapshots below only read NAMED main_brain keys, so an extra key is
+    # inert. FAIL-OPEN.
+    if LIQUIDITY_SWEEP_FOCUS_ENABLED and isinstance(result.get("main_brain"), dict):
+        try:
+            result["main_brain"]["liquidity_focus"] = compute_liquidity_sweep_focus(result)
+        except Exception as _lsf_exc:
+            result["main_brain"]["liquidity_focus"] = _liquidity_sweep_focus_neutral(
+                "Liquidity Sweep Focus unavailable (%s)." % _lsf_exc,
+                instrument_of(active_ticker), enabled=True)
+
     # ── Main Brain Judge (DISPLAY-ONLY) ──────────────────────────────────────
     # Consolidates the assembled blocks into ONE explained verdict (final label +
     # decision hierarchy + weighted Edge breakdown + missing confirmations). Runs
@@ -26548,6 +26577,357 @@ def _advisory_consensus(votes):
 
 
 # ===========================================================================
+# LIQUIDITY SWEEP FOCUS (DISPLAY/ADVISORY-ONLY)
+# ===========================================================================
+# Flag-gated Main-Brain overlay (see the flag comment for the money-path wall). It
+# CONSUMES the assembled `result` plus pure read-only helpers (get_price_context,
+# _intraday_or, the intraday session tracker) and reports where liquidity sits, whether
+# it was recently swept, and how to read that sweep. It NEVER recomputes the gate, never
+# scores the Edge, never sizes, never trades. The advisory_confidence_delta is DISPLAY
+# ONLY and is never fed anywhere. FAIL-OPEN (its caller also wraps it -> neutral).
+# ---------------------------------------------------------------------------
+
+def _liquidity_sweep_focus_neutral(reason="Liquidity Sweep Focus disabled.",
+                                   instrument=None, enabled=False):
+    """Stable neutral schema for the Liquidity Sweep Focus overlay. Never raises."""
+    return {
+        "enabled":                   bool(enabled),
+        "available":                 False,
+        "instrument":                instrument,
+        "generated_at":              now_utc().isoformat(),
+        "state":                     "NO SWEEP",
+        "state_key":                 "none",
+        "direction":                 None,
+        "sweep_type":                None,
+        "swept":                     False,
+        "reclaim":                   False,
+        "rejection":                 False,
+        "into_opposing_zone":        False,
+        "cvd_state":                 None,
+        "cvd_confirming":            None,
+        "nearby_liquidity":          None,
+        "nearby_liquidity_text":     "None nearby",
+        "levels":                    [],
+        "advisory_confidence_delta": 0,
+        "advisory_reasons":          [],
+        "warning":                   False,
+        "trader_read":               "No liquidity swept yet",
+        "questions": {
+            "nearby_liquidity":           "None nearby",
+            "swept":                      False,
+            "rejection_after_sweep":      False,
+            "reclaim":                    False,
+            "cvd_confirming":             None,
+            "true_sweep_vs_continuation": "undecided",
+        },
+        "voice":                     reason,
+        "summary":                   reason,
+        "advisory_only":             True,
+    }
+
+
+def compute_liquidity_sweep_focus(result):
+    """Liquidity Sweep Focus overlay — see the section header for the money-path wall.
+
+    Builds the nearby liquidity map (session / opening-range / VWAP / zone / swing /
+    equal H-L), scans ALERT_HISTORY for a RECENT instrument-scoped sweep, and derives a
+    sweep state in {NO SWEEP, SWEEP FORMING, SWEEP CONFIRMED, SWEEP FAILED, CONTINUATION
+    THROUGH LIQUIDITY} plus a trader read, a Main-Brain voice line and an ADVISORY-ONLY
+    confidence delta. CONSUMES `result` + pure read-only helpers only. FAIL-OPEN."""
+    inst_label = result.get("active_ticker") or result.get("instrument")
+    out = _liquidity_sweep_focus_neutral("", inst_label, enabled=True)
+
+    # Market closed -> nothing live to read; stay neutral (state-aware, so the single
+    # attach at the return seam covers open / vetoed / closed with no separate mirror).
+    if not result.get("market_open"):
+        out["available"]   = True
+        out["state"]       = "NO SWEEP"
+        out["trader_read"] = "Market closed"
+        out["voice"]       = ("Market closed — no live liquidity to track; will resume at "
+                              "the next session open.")
+        out["summary"]     = out["voice"]
+        return out
+
+    inst = instrument_of(inst_label) if inst_label else None
+    price = result.get("current_price")
+    try:
+        price = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price = None
+    vwap = result.get("vwap_value")
+    ns   = result.get("nearest_supply")
+    nd   = result.get("nearest_demand")
+    cvd  = str(result.get("cvd_state") or "").lower()
+    cvd  = cvd if cvd in ("bullish", "bearish") else None
+    out["cvd_state"] = cvd
+
+    # ── Nearby liquidity map (every read is pure / side-effect-free) ─────────
+    levels = []
+    def _add(label, px):
+        try:
+            pxf = float(px)
+        except (TypeError, ValueError):
+            return
+        if price is None:
+            side = None
+        elif pxf > price:
+            side = "above"
+        elif pxf < price:
+            side = "below"
+        else:
+            side = "at"
+        levels.append({"label": label, "price": round(pxf, 2), "side": side})
+
+    # Per-session highs/lows (current + prior), read under the intraday lock.
+    try:
+        with INTRADAY_LOCK:
+            rec = INTRADAY_BY_TICKER.get(inst) or {}
+            sessions = {k: dict(v) for k, v in (rec.get("sessions") or {}).items()
+                        if isinstance(v, dict)}
+        cur_name, _cur_id = _bias_session_for(now_utc().astimezone(ET_TZ))
+        for name, s in sessions.items():
+            tag = "current" if name == cur_name else "prior"
+            _add("%s session high (%s)" % (name, tag), s.get("high"))
+            _add("%s session low (%s)"  % (name, tag), s.get("low"))
+    except Exception:
+        pass
+
+    # Opening range (08:00 ET) high/low.
+    try:
+        orb = _intraday_or(inst)
+        _add("Opening range high", orb.get("high"))
+        _add("Opening range low",  orb.get("low"))
+    except Exception:
+        pass
+
+    # VWAP + nearest supply/demand zones.
+    _add("VWAP", vwap)
+    _add("Supply zone", ns)
+    _add("Demand zone", nd)
+
+    # Previous swing highs/lows from structure (BOS / CHOCH last prices).
+    lpt = result.get("last_price_by_type") or {}
+    _add("Swing high (BOS supply)",   lpt.get("BOS SUPPLY"))
+    _add("Swing low (BOS demand)",    lpt.get("BOS DEMAND"))
+    _add("Swing high (CHOCH supply)", lpt.get("CHOCH SUPPLY"))
+    _add("Swing low (CHOCH demand)",  lpt.get("CHOCH DEMAND"))
+
+    # Equal highs / lows — a cluster of >=2 near-equal zone prices is a liquidity pool.
+    try:
+        _lpt2, sup_prices, dem_prices = get_price_context(inst)
+    except Exception:
+        sup_prices, dem_prices = [], []
+    def _equal_cluster(prices, label, tol_pct=0.0007):
+        try:
+            ps = sorted({round(float(p), 2) for p in prices if p is not None})
+        except (TypeError, ValueError):
+            return
+        for i in range(len(ps)):
+            grp = [ps[i]]
+            for j in range(i + 1, len(ps)):
+                if ps[i] and abs(ps[j] - ps[i]) / ps[i] <= tol_pct:
+                    grp.append(ps[j])
+            if len(grp) >= 2:
+                _add(label, sum(grp) / len(grp))
+                return
+    _equal_cluster(sup_prices, "Equal highs")
+    _equal_cluster(dem_prices, "Equal lows")
+
+    out["levels"] = levels[:12]
+
+    # Nearest liquidity level to price.
+    nearby = None
+    if price is not None:
+        priced = [L for L in levels if isinstance(L.get("price"), (int, float))]
+        if priced:
+            nearby = min(priced, key=lambda L: abs(L["price"] - price))
+            nearby = dict(nearby, distance=round(abs(nearby["price"] - price), 2))
+    out["nearby_liquidity"] = nearby
+
+    def _fmt(p):
+        return ("%.2f" % p) if isinstance(p, (int, float)) else "—"
+    nearby_txt = ("%s @ %s" % (nearby["label"], _fmt(nearby["price"]))) if nearby else "None nearby"
+    out["nearby_liquidity_text"] = nearby_txt
+
+    # ── Recent, instrument-scoped sweep scan (NEVER trust stale key presence) ─
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=LIQ_SWEEP_RECENCY_MIN)
+
+    def _recent_sweep(side_word):
+        want = "%s %s SWEEP" % (inst, side_word)
+        for a in reversed(list(ALERT_HISTORY)):
+            if a.get("alert_type") != want:
+                continue
+            a_inst = (a.get("instrument")
+                      or _instrument_from_text(a.get("ticker"))
+                      or _instrument_from_text(a.get("alert_type")))
+            if a_inst != inst:
+                continue
+            try:
+                ts = datetime.fromisoformat(a["timestamp"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if ts < cutoff:
+                continue
+            px = a.get("price")
+            try:
+                px = float(px) if px is not None else None
+            except (TypeError, ValueError):
+                px = None
+            return ts, px
+        return None, None
+
+    bull_ts, bull_px = (_recent_sweep("BULLISH") if inst else (None, None))
+    bear_ts, bear_px = (_recent_sweep("BEARISH") if inst else (None, None))
+
+    sweep_type = sweep_px = sweep_ts = None
+    if bull_ts and bear_ts:
+        if bull_ts >= bear_ts:
+            sweep_type, sweep_px, sweep_ts = "bullish", bull_px, bull_ts
+        else:
+            sweep_type, sweep_px, sweep_ts = "bearish", bear_px, bear_ts
+    elif bull_ts:
+        sweep_type, sweep_px, sweep_ts = "bullish", bull_px, bull_ts
+    elif bear_ts:
+        sweep_type, sweep_px, sweep_ts = "bearish", bear_px, bear_ts
+
+    swept = sweep_type is not None
+    reclaim = rejection = into_opposing = False
+    cvd_confirming = None
+    direction = None
+    state, state_key = "NO SWEEP", "none"
+
+    if swept:
+        if sweep_type == "bullish":
+            # Lows swept (stops below taken) -> expect an UP reversal.
+            direction = "Long"
+            cvd_confirming = (cvd == "bullish") if cvd else None
+            if price is not None and sweep_px is not None:
+                reclaim = price > sweep_px
+                rejection = reclaim
+            if nd is not None and sweep_px:
+                try:
+                    into_opposing = abs(sweep_px - float(nd)) / float(nd) <= 0.0015
+                except (TypeError, ValueError, ZeroDivisionError):
+                    into_opposing = False
+        else:
+            # Highs swept (stops above taken) -> expect a DOWN reversal.
+            direction = "Short"
+            cvd_confirming = (cvd == "bearish") if cvd else None
+            if price is not None and sweep_px is not None:
+                reclaim = price < sweep_px
+                rejection = reclaim
+            if ns is not None and sweep_px:
+                try:
+                    into_opposing = abs(sweep_px - float(ns)) / float(ns) <= 0.0015
+                except (TypeError, ValueError, ZeroDivisionError):
+                    into_opposing = False
+
+        if reclaim and cvd_confirming is True:
+            state, state_key = "SWEEP CONFIRMED", "confirmed"
+        elif reclaim:
+            # Reclaimed the swept level but CVD is not yet confirming (or unknown) ->
+            # forming, NOT confirmed (fail-open must never read as fail-confirmed).
+            state, state_key = "SWEEP FORMING", "forming"
+        else:
+            # No reclaim -> price stayed beyond the swept level. Continuation if CVD
+            # agrees with the BREAK direction, else a failed sweep.
+            if sweep_type == "bullish":
+                cont = (cvd == "bearish")
+            else:
+                cont = (cvd == "bullish")
+            if cont:
+                state, state_key = "CONTINUATION THROUGH LIQUIDITY", "continuation"
+            else:
+                state, state_key = "SWEEP FAILED", "failed"
+    else:
+        # No recent sweep alert. If price is pressed right up against a level, stops may
+        # be about to get taken -> forming; otherwise nothing to anticipate.
+        if nearby is not None and price and isinstance(nearby.get("price"), (int, float)):
+            if abs(nearby["price"] - price) / price <= 0.0008:
+                state, state_key = "SWEEP FORMING", "forming"
+
+    out["direction"]          = direction
+    out["sweep_type"]         = sweep_type
+    out["swept"]              = bool(swept)
+    out["reclaim"]            = bool(reclaim)
+    out["rejection"]          = bool(rejection)
+    out["into_opposing_zone"] = bool(into_opposing)
+    out["cvd_confirming"]     = cvd_confirming
+    out["state"]              = state
+    out["state_key"]          = state_key
+    out["available"]          = True
+
+    # ── ADVISORY-ONLY confidence delta (DISPLAY ONLY — NEVER fed to edge/gate) ─
+    delta = 0
+    reasons = []
+    warning = False
+    if state == "SWEEP CONFIRMED" and reclaim:
+        delta += 10
+        reasons.append("Sweep confirmed with reclaim (+10 advisory)")
+    if swept and rejection and into_opposing:
+        delta += 10
+        reasons.append("Sweep into opposing zone with rejection (+10 advisory)")
+    if state in ("SWEEP FAILED", "CONTINUATION THROUGH LIQUIDITY"):
+        warning = True
+        if delta == 0:
+            delta = -10
+        reasons.append("Price ran through liquidity without a reversal — do not fade (warning)")
+    out["advisory_confidence_delta"] = delta
+    out["advisory_reasons"]          = reasons
+    out["warning"]                   = warning
+
+    # Trader read.
+    if state == "SWEEP CONFIRMED":
+        out["trader_read"] = "Stops taken — reversal confirming"
+    elif state == "SWEEP FORMING":
+        out["trader_read"] = "No confirmation yet"
+    elif state in ("SWEEP FAILED", "CONTINUATION THROUGH LIQUIDITY"):
+        out["trader_read"] = "Continuation risk"
+    else:
+        out["trader_read"] = "No liquidity swept yet"
+
+    # Main-Brain voice line.
+    if state == "SWEEP CONFIRMED":
+        side_word = "below" if sweep_type == "bullish" else "above"
+        need = "bullish" if direction == "Long" else "bearish"
+        voice = ("Liquidity %s %s was swept and reclaimed — %s idea improves and %s CVD is "
+                 "confirming; still want structure to hold before entry."
+                 % (side_word, _fmt(sweep_px), direction or "this", need))
+    elif state == "SWEEP FORMING" and swept:
+        side_word = "below" if sweep_type == "bullish" else "above"
+        need = "bullish" if sweep_type == "bullish" else "bearish"
+        voice = ("Liquidity %s %s was swept — watching for a clean reclaim and %s CVD before "
+                 "trusting the reversal." % (side_word, _fmt(sweep_px), need))
+    elif state == "SWEEP FORMING":
+        voice = ("Price is pressing into liquidity (%s) — watch for a stop-run before "
+                 "committing." % nearby_txt)
+    elif state in ("SWEEP FAILED", "CONTINUATION THROUGH LIQUIDITY"):
+        side_word = ("below" if sweep_type == "bullish"
+                     else "above" if sweep_type == "bearish" else "at")
+        voice = ("Price pushed through liquidity %s %s and kept going — this reads as "
+                 "continuation, not a reversal; do not fade it."
+                 % (side_word, _fmt(sweep_px)))
+    else:
+        voice = "No liquidity has been swept near price — nothing to anticipate yet."
+    out["voice"]   = voice
+    out["summary"] = voice
+
+    # The 6 trader-read questions.
+    out["questions"] = {
+        "nearby_liquidity":           nearby_txt,
+        "swept":                      bool(swept),
+        "rejection_after_sweep":      bool(rejection),
+        "reclaim":                    bool(reclaim),
+        "cvd_confirming":             cvd_confirming,
+        "true_sweep_vs_continuation": ("sweep" if state in ("SWEEP CONFIRMED", "SWEEP FORMING") and swept
+                                       else "continuation" if state == "CONTINUATION THROUGH LIQUIDITY"
+                                       else "undecided"),
+    }
+    return out
+
+
+# ===========================================================================
 # Advisory overlay 1/2 — STALK MODE (pre-entry observation)
 # ===========================================================================
 # DISPLAY/ADVISORY-ONLY. OBSERVES a forming setup BEFORE the strict engine reaches an
@@ -34486,6 +34866,19 @@ def dashboard():
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">LIVE READ · DISPLAY-ONLY</span>
     </div>
     <div id="mb-summary" class="mb-summary">Loading…</div>
+    <!-- Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (fed by
+         main_brain.liquidity_focus). Hidden unless the flag is on and the block is
+         present; it never affects the gate, Edge Score or execution. -->
+    <div id="mb-liq" style="display:none;margin:8px 0;padding:8px 10px;border:1px solid var(--border,#2a2a3a);border-radius:8px;font-size:11px;line-height:1.55">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="color:#6b7280;letter-spacing:.5px;font-size:10px">💧 LIQUIDITY FOCUS</span>
+        <span id="mb-liq-state" style="font-weight:600">—</span>
+        <span id="mb-liq-delta" style="font-size:10px;color:#6b7280"></span>
+      </div>
+      <div><span style="color:#6b7280">Nearby liquidity:</span> <span id="mb-liq-near">—</span></div>
+      <div><span style="color:#6b7280">Trader read:</span> <span id="mb-liq-read">—</span></div>
+      <div id="mb-liq-voice" style="color:#9ca3af;margin-top:2px"></div>
+    </div>
     <div class="mb-judge" id="mb-judge" style="display:none">
       <div class="mb-judge-head">
         <span class="mb-judge-label" id="mbj-label">—</span>
@@ -36941,6 +37334,7 @@ function _anVerdictColor(v){
 // conversation is in-memory per-device, per-symbol, deduped and capped.
 const MB_BADGE_COLORS = { WATCHING:'#6b7280', BUILDING:'#3b82f6', READY:'#22c55e', WAIT:'#f59e0b', MANAGING:'#a855f7', INVALIDATED:'#ef4444' };
 const MB_RISK_COLORS = { Low:'#22c55e', Medium:'#f59e0b', High:'#ef4444' };
+const LIQ_STATE_COLORS = { none:'#9ca3af', forming:'#3b82f6', confirmed:'#22c55e', failed:'#f59e0b', continuation:'#ef4444' };
 const MBJ_LABEL_COLORS = { 'READY LONG':'#16a34a', 'READY SHORT':'#dc2626', 'WAIT':'#6b7280', 'SKIP':'#475569', 'MANAGE OPEN TRADE':'#2563eb' };
 const MBJ_STATE_COLORS = { bullish:'#22c55e', bearish:'#ef4444', neutral:'#9aa3c0', pass:'#22c55e', warn:'#f0b36b', fail:'#ef4444', na:'#6b7280' };
 function renderMBJudge(d){
@@ -37081,6 +37475,30 @@ function renderMainBrain(d){
   const summary = (mb && mb.summary) || 'Waiting for live data…';
   const sumEl = document.getElementById('mb-summary');
   if(sumEl) sumEl.textContent = summary;
+  // Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (main_brain.liquidity_focus).
+  (function(){
+    const box = document.getElementById('mb-liq');
+    if(!box) return;
+    const lf = mb && mb.liquidity_focus;
+    if(!lf || !lf.enabled){ box.style.display = 'none'; return; }
+    box.style.display = '';
+    const stEl = document.getElementById('mb-liq-state');
+    if(stEl){ stEl.textContent = lf.state || 'NO SWEEP'; stEl.style.color = LIQ_STATE_COLORS[lf.state_key] || '#e8e8f0'; }
+    const dEl = document.getElementById('mb-liq-delta');
+    if(dEl){
+      const dv = lf.advisory_confidence_delta;
+      if(typeof dv === 'number' && dv !== 0){
+        dEl.textContent = (dv>0?'+':'') + dv + ' advisory';
+        dEl.style.color = dv>0 ? 'var(--green,#22c55e)' : 'var(--warn,#f59e0b)';
+      } else { dEl.textContent = ''; }
+    }
+    const nEl = document.getElementById('mb-liq-near');
+    if(nEl) nEl.textContent = lf.nearby_liquidity_text || '—';
+    const rEl = document.getElementById('mb-liq-read');
+    if(rEl) rEl.textContent = lf.trader_read || '—';
+    const vEl = document.getElementById('mb-liq-voice');
+    if(vEl) vEl.textContent = lf.voice || '';
+  })();
   renderMBJudge(d);
   _anFill('mb-market',   (mb && mb.market_brain)   || []);
   _anFill('mb-strategy', (mb && mb.strategy_brain) || []);

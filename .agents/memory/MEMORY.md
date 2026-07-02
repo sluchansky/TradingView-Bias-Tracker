@@ -122,3 +122,5 @@
 - [Structure-reversal demote](structure-reversal-demote.md) — SCALP-only flag-gated money path: a fresh opposite BOS/CHOCH >CONFLICT_WINDOW_MIN newer NULLs the STALE side's structure credit (demote-only, single write point, shares the 10-min window w/ opposing_present); default OFF byte-identical, own smoke not goldens.
 
 - [USER_APPROVED_PREVIEW preview-take](user-approved-preview-take.md) — owner-only manual "take this FORMING setup" money path; FORMING skips full_analysis is_actionable vetoes so the branch RE-RUNS mode-correct SCALP/SWING vetoes fail-closed + an unconditional local-flatness gate (max_open is env-reversible to None); flag default OFF, PREVIEW_MAX_CONTRACTS=1, counted via source tag, goldens byte-identical.
+
+- [Liquidity Sweep Focus overlay](liquidity-sweep-focus.md) — flag-gated DISPLAY/ADVISORY-ONLY sweep-state read nested in main_brain ONLY; advisory delta never feeds edge/gate; recency re-scan of ALERT_HISTORY (never trust stale key presence) + instrument-prefixed match; flag-OFF byte-identical, own smoke.
