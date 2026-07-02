@@ -34934,6 +34934,27 @@ def dashboard():
       <span style="color:#6b7280">· one-tap market order</span>
     </div>
   </div>
+  <!-- ════ Manual Market Order — DISCRETIONARY operator override. Fires a REAL market
+       order on demand REGARDLESS of setup state (the Edge gate may be WAIT). This is
+       always visible (a plain div, not a .mod) so it can never be collapsed away.
+       Server-authoritative: the browser sends only direction + contracts; the server
+       anchors the entry at the fresh live price, builds an ATR stop/target and runs
+       EVERY safety layer. Owner-only (/manual-order, not an open path); dormant unless
+       MANUAL_ORDER_ENABLED is set on the server. ════ -->
+  <div id="manual-order-box" style="margin-top:10px;padding:10px;border:1px solid #b45309;border-radius:6px;background:#1a1206">
+    <div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#f59e0b;margin-bottom:8px">🖐️ MANUAL MARKET ORDER
+      <span style="font-size:10px;color:#9a6a12;font-weight:400;letter-spacing:1px">· fires regardless of setup</span>
+    </div>
+    <div class="dir-row" style="margin:0 0 8px">
+      <div id="mo-dir-long" class="dir-btn long active" onclick="setManualDir('Long')">📈 LONG</div>
+      <div id="mo-dir-short" class="dir-btn short" onclick="setManualDir('Short')">📉 SHORT</div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:8px;color:#c9a66b;font-size:12px;margin-bottom:8px">
+      Contracts <input id="mo-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #6b4a12;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
+    </div>
+    <button class="btn" id="mo-send" style="width:100%;background:#7c2d12;border:1px solid #f59e0b;color:#ffedd5;font-weight:700" onclick="sendManualOrder()">🚀 Send Market Order</button>
+    <div style="margin-top:6px;color:#9a6a12;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
+  </div>
   <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
        TradeZella / broker CSV. This is the source of truth for P&L and win-rate.
        The proxy-feed panels below (Equity Curve, Today's Trades, Learning Stats)
@@ -40967,6 +40988,50 @@ async function sendOrder() {
     else toast('Error: ' + (d.reason || d.status), false);
   } catch(e) { toast('Request failed' + (live ? ' — check your broker' : ''), false); }
   finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send order to broker'; } }
+}
+
+
+// Fires a REAL market order for the CURRENTLY-selected instrument (sym) regardless
+// of setup state — the server anchors the entry/stop/target and runs every safety
+// layer. The browser sends only direction + contracts (never a price). Its own
+// direction toggle is independent of the setup dir-row so the operator can fire the
+// opposite side of whatever the analysis shows.
+let manualOrderDir = 'Long';
+function setManualDir(d){
+  manualOrderDir = (d === 'Short') ? 'Short' : 'Long';
+  const l = document.getElementById('mo-dir-long');
+  const s = document.getElementById('mo-dir-short');
+  if (l) l.classList.toggle('active', manualOrderDir === 'Long');
+  if (s) s.classList.toggle('active', manualOrderDir === 'Short');
+}
+async function sendManualOrder() {
+  const inst  = sym;
+  const mdir  = manualOrderDir;
+  let qty = parseInt(document.getElementById('mo-qty').value, 10);
+  if (!qty || qty < 1) qty = 1;
+  // execution_mode / live / label come from the loaded snapshot; the SERVER is the
+  // authority, this only shapes the confirm wording.
+  const mode  = lastRec ? (lastRec.execution_mode || 'manual_only') : 'manual_only';
+  const live  = !!(lastRec && lastRec.execution_live);
+  const label = (lastRec && lastRec.execution_provider_label) || 'broker';
+  const head = live
+    ? '\u26a0\ufe0f REAL MARKET ORDER — this fires a LIVE order on ' + label + ' NOW, ignoring the setup gate.'
+    : (mode === 'paper' ? '🧪 Paper (simulated) market order — no real broker is contacted.'
+                        : '📋 Manual mode — shows the exact order to place yourself (no broker contacted).');
+  const msg = head + '\\n\\n' + inst + ' ' + mdir.toUpperCase() + '  ·  ' + qty + ' contract' + (qty>1?'s':'')
+    + '\\n\\nThe server sets entry (market), stop and target. Continue?';
+  if (!confirm(msg)) return;
+  if (live && !confirm('FINAL CONFIRM — send a LIVE ' + inst + ' ' + mdir.toUpperCase() + ' market order right now?')) return;
+  const btn = document.getElementById('mo-send');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending…'; }
+  try {
+    const d = await api('/manual-order', { ticker: inst+'1!', direction: mdir, contracts: qty });
+    if (d.status === 'sent')                 toast('🚀 Manual order sent to ' + (d.provider || label));
+    else if (d.status === 'simulated')       toast('🧪 Paper order simulated (no broker)');
+    else if (d.status === 'manual_required') toast('📋 ' + (d.message || 'Place this order manually'));
+    else toast('Error: ' + (d.reason || d.status), false);
+  } catch(e) { toast('Request failed' + (live ? ' — check your broker' : ''), false); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '🚀 Send Market Order'; } }
 }
 
 

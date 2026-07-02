@@ -35,10 +35,17 @@ sat at WAIT, so the existing READY-gated buttons never fired.
   slot on the next real order (send-before-track).
 - **Owner-only:** `/manual-order` is in `BOT1_ROUTES` (Express `/api` proxy whitelist)
   and is NOT in `OPEN_PATHS`.
-- **Dashboard UI REMOVED (endpoint kept):** the orange `#manual-order-box` div + its
-  JS (`sendManualOrder`/`setManualDir`/`manualOrderDir`) were deleted per user request —
-  they wanted trade entry to live INSIDE the potential-plan preview box (entry/stop/TP)
-  via the `/take-preview` button, not a separate fire-regardless box. The `/manual-order`
-  route + `manual_desk` gateway branch remain (double-gated fail-closed 409 when
-  `MANUAL_ORDER_ENABLED` off), so re-enabling is UI-only. **Do NOT re-add the box**
-  thinking it went missing. `MANUAL_ORDER_ENABLED` env var was removed (→ default OFF).
+- **Dashboard UI PRESENT again (re-added from git history):** the orange
+  `#manual-order-box` div (own Long/Short toggle + contracts + "Send Market Order",
+  plain div so it can't be collapsed) + its JS (`sendManualOrder`/`setManualDir`/
+  `manualOrderDir`) were restored — commit `e275f03` removed them, so `git show
+  e275f03^:artifacts/tradingview-webhook/app.py` is the faithful source. The box is
+  ALWAYS rendered; the flag only gates whether `/manual-order` acts (double-gated
+  fail-closed 409 when off). An earlier session had removed the box (preferring the
+  preview-take box); that decision is now **SUPERSEDED** — the user again explicitly
+  asked to force real trades at WAIT, so the force box and the `/take-preview` button
+  now coexist. If asked to remove it again, remove the div + the 3 JS symbols above.
+- **Enable via SHARED env, not a code-default flip.** Turn the feature on by setting
+  `MANUAL_ORDER_ENABLED=1` in the **shared** environment (dev+prod). Do NOT change the
+  `default_on` in code — that would flip the flag ON inside the goldens and break their
+  byte-identity. Dev picks up the env on a workflow restart; **prod needs a republish**.
