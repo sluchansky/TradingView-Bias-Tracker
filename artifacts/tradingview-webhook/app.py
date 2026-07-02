@@ -34293,6 +34293,8 @@ def dashboard():
   .field input:focus{border-color:var(--border-lit);box-shadow:0 0 0 3px rgba(110,125,255,.16)}
   /* Buttons */
   .btn{width:100%;padding:16px;border-radius:13px;border:none;font-family:var(--sans);font-size:16px;font-weight:800;cursor:pointer;margin-bottom:10px;transition:transform .12s,box-shadow .2s,filter .2s;letter-spacing:.6px;text-transform:uppercase;box-shadow:0 6px 18px rgba(0,0,0,.3)}
+  /* Share view-only link: keep it small + unobtrusive (not a full-width primary button). */
+  #btn-share-view{width:auto;padding:5px 11px;font-size:10.5px;font-weight:700;letter-spacing:.3px;margin:2px 0 10px;border-radius:9px;box-shadow:none;opacity:.85}
   .btn:hover{filter:brightness(1.06);box-shadow:0 10px 26px rgba(0,0,0,.36)}
   .btn:active{transform:scale(.97)}
   .btn-enter{background:var(--green);color:#04140a}
@@ -42278,6 +42280,15 @@ paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); resetInstrumentFocusOnce(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells();
 autoSelectBestSetup();
+// Re-follow the best available setup every 30s (user request): keeps the probability
+// dial pointed at the highest-quality trade across the focused instruments. DISPLAY-
+// ONLY — only switches the viewed tab/direction; never touches the gate, scoring,
+// sizing or any money path. Right after a manual tab/direction pick we skip one cycle
+// (so the view isn't yanked while you're looking), then resume auto-following.
+setInterval(function(){
+  if (userPickedSetup){ userPickedSetup = false; return; }  // one-cycle grace after a manual pick
+  pickCleanestSetup(true);                                   // force: re-follow the best setup
+}, 30000);
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
 // front-end: persisted in localStorage, never touches the server / gate / scoring.

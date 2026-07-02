@@ -43,3 +43,16 @@ keeps serving (`getDeploymentInfo` → `hasSuccessfulBuild: true`, prod endpoint
 one such failed promote was immediately followed by a green re-publish of effectively
 the same tree. Only chase code if the 500s persist across multiple re-publishes or a
 **502** appears (Express up, Flask down).
+
+## 4. `Unrecognized alert type: 'X'` for a type the CURRENT registry covers = stale build
+**Why:** the running deployment can lag the source. PROD logging
+`WARNING: Unrecognized alert type: 'MES VOLUME SPIKE'` / `'MNQ BEARISH OB'` for an
+instrument×suffix that the current `_PER_INSTRUMENT_ALERT_TEMPLATE` × `_ALERT_INSTRUMENTS`
+build DOES cover means the live instance predates that add — NOT a code bug, and editing
+the registry won't help.
+**How to spot it:** reconstruct `ALERT_TYPES` from current source (exec the
+`_ALERT_INSTRUMENTS` → `ALERT_TYPES.update(_SHARED_ALERT_TYPES)` block; ~152 entries) and
+check membership; `git show <deployed-commit>:…app.py | grep _ALERT_INSTRUMENTS` for the
+deployed side. If current source registers it → **re-publish**, don't touch the registry.
+A scored `Alert: MES … → WAIT` line next to the "unrecognized" one is the diagnostic
+HEARTBEAT re-eval off stored state — it does NOT mean the webhook itself was accepted.
