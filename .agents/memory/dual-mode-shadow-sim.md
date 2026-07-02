@@ -74,3 +74,29 @@ opened modes are unchanged.
   takes `mode=None, prune=True` (default = byte-identical); the shadow calls it
   `mode=mode, prune=False` (read-only, mode-correct TTL). Any other money-path helper the
   shadow reuses must be audited the same way: read-only + mode-explicit, or it leaks.
+
+## TEST trigger: open on Edge Score alone (`DUAL_SIM_TEST_EDGE_MIN`)
+- Env-tuned floor `DUAL_SIM_TEST_EDGE_MIN` (default **0 = OFF**). When `>0`, the observer
+  opens a shadow paper trade for any mode that is **NOT** actionable but whose Edge Score
+  `>= floor` — i.e. it deliberately BYPASSES the strict structure/VWAP/zone gate so the
+  simulator "takes trades" purely on edge, for testing/demo. Set to `80` for the
+  "take trades at 80%" request. **This is the ONLY thing that opens a shadow trade on a
+  non-actionable verdict** — normal opens still require actionable + real plan.
+- **Why it's still isolated:** the trigger only calls read-only helpers
+  (`build_strict_trade_plan`, `compute_swing_context`, `_swing_htf_enabled`) + the same
+  `_dual_sim_open_insert` into `dual_sim_trades`. It NEVER touches the gate / verdict /
+  trade_plan / edge_score / broker / auto-execute — the sim stays display-only.
+- **How to apply / gotchas:** default 0 ⇒ branch unreachable ⇒ byte-identical (the strict
+  goldens never reach the observer anyway). `check_dual_sim.sh` **exports
+  `DUAL_SIM_TEST_EDGE_MIN=0`** so the golden always runs the OFF baseline regardless of the
+  shared env (which is set to 80); `dual_sim_smoke.py` section 7 pins the ON path
+  (opens-when-WAIT, money-path untouched, result unchanged, below-floor no-op). Direction
+  is derived from `strict_direction`/shadow `direction`, else unambiguous bullish XOR
+  bearish; a failed `build_strict_trade_plan` fails closed (no open). Test opens SHARE the
+  normal (mode,inst,dir) 300s cooldown + 5-min-bucket dedup, so a test open can throttle a
+  later REAL actionable open of the same key (harmless — display-only ledger).
+- **dev vs prod:** the observer only fires on real `source=="webhook"` events, so the dev
+  instance won't show test trades (no live TradingView feed) — it takes effect on the
+  PUBLISHED instance after a republish (picks up code + shared env; Publish schema-diff must
+  ensure `dual_sim_trades` exists in prod). Remember to reset `DUAL_SIM_TEST_EDGE_MIN=0`
+  after testing or it opens a paper trade on essentially every high-edge WAIT.

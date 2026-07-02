@@ -27268,6 +27268,12 @@ DUAL_SIM_WATCH_INTERVAL     = max(10, int(os.environ.get("DUAL_SIM_WATCH_INTERVA
 DUAL_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("DUAL_SIM_COOLDOWN_SECS", 300)))
 DUAL_SIM_MAX_HOLD_HOURS     = max(1, int(os.environ.get("DUAL_SIM_MAX_HOLD_HOURS", 12)))
 DUAL_SIM_MODES              = ("SCALP", "SWING")
+# TEST trigger (default 0 == OFF ⇒ byte-identical). When > 0, the shadow observer ALSO
+# opens a paper trade for a mode whenever that mode's Edge Score clears this threshold,
+# even if the live gate said WAIT (structure/VWAP/zone not fully aligned). Purely for
+# generating test entries in the SIMULATOR — it shares NO code with the live money path
+# (the only DB write is still _dual_sim_open_insert into dual_sim_trades).
+DUAL_SIM_TEST_EDGE_MIN     = max(0, int(os.environ.get("DUAL_SIM_TEST_EDGE_MIN", 0)))
 _DUAL_SIM_COOLDOWN          = {}                  # (mode,inst,direction) -> monotonic ts
 _DUAL_SIM_COOLDOWN_LOCK     = threading.Lock()
 
@@ -27534,15 +27540,57 @@ def _maybe_observe_dual_mode_sim(result, source="webhook"):
                 edge_sc   = sv.get("edge_score")
         except Exception:
             continue
-        if not is_actionable(verdict):
-            continue
         mgmt = tp.get("management") or {}
         entry  = mgmt.get("entry")
         stop   = mgmt.get("stop")
         target = mgmt.get("tp1")
-        if not (direction and entry is not None and stop is not None and target is not None):
-            continue
         rr = tp.get("rr_num")
+
+        should_open = bool(
+            is_actionable(verdict) and direction
+            and entry is not None and stop is not None and target is not None)
+
+        # ── TEST trigger (flag-gated, default OFF ⇒ byte-identical) ────────────────
+        # Open a paper trade whenever this mode's Edge Score clears the test threshold,
+        # even if the live gate said WAIT. Build entry/stop/target from the setup's own
+        # direction (via the same plan builder the gate uses) so the sim has a real plan
+        # to track. DISPLAY-ONLY: the only write is still _dual_sim_open_insert below.
+        if (not should_open) and DUAL_SIM_TEST_EDGE_MIN > 0 \
+                and not is_actionable(verdict) and (edge_sc or 0) >= DUAL_SIM_TEST_EDGE_MIN:
+            test_dir = direction
+            if not test_dir:
+                if inp.get("bullish") and not inp.get("bearish"):
+                    test_dir = "Long"
+                elif inp.get("bearish") and not inp.get("bullish"):
+                    test_dir = "Short"
+            if test_dir:
+                try:
+                    _sctx = None
+                    if _swing_htf_enabled(mode):
+                        try:
+                            _sctx = compute_swing_context(
+                                inp.get("active_ticker"), inp.get("current_price"))
+                        except Exception:
+                            _sctx = None
+                    _tp = build_strict_trade_plan(
+                        test_dir, inp.get("active_ticker"), inp.get("current_price"),
+                        inp.get("nearest_supply"), inp.get("nearest_demand"),
+                        volatility=inp.get("volatility"), mode=mode,
+                        vwap=inp.get("vwap_value"), edge_score=edge_sc,
+                        swing_context=_sctx)
+                except Exception:
+                    _tp = None
+                _m = (_tp.get("management") or {}) if isinstance(_tp, dict) else {}
+                if _tp and _tp.get("trade_plan") and _m.get("entry") is not None \
+                        and _m.get("stop") is not None and _m.get("tp1") is not None:
+                    direction = test_dir
+                    entry, stop, target = _m["entry"], _m["stop"], _m["tp1"]
+                    rr = _tp.get("rr_num")
+                    verdict = "%s READY" % test_dir.upper()
+                    should_open = True
+
+        if not should_open:
+            continue
         ckey = (mode, inst, direction)
         with _DUAL_SIM_COOLDOWN_LOCK:
             last = _DUAL_SIM_COOLDOWN.get(ckey)
