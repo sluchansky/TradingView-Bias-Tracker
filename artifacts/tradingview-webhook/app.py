@@ -33959,6 +33959,97 @@ def close_trade():
     return jsonify({"status": "closed", "trade": closed}), 200
 
 
+@app.route("/stop-managing", methods=["POST"])
+def stop_managing():
+    """Owner-only. Flush ALL of the bot's LOCAL position tracking so a stale
+    "still managing" entry can always be cleared from the dashboard. For the
+    resolved instrument it clears three separate stores: the tracked ACTIVE_TRADE,
+    any open managed-trade lifecycle entry (SCALP paper / SWING thesis), and any
+    open manual-monitor row.
+
+    TRACKING-ONLY — it NEVER sends a broker order and never closes a real position;
+    use it when the trade was already closed elsewhere (e.g. at the broker) but the
+    bot still shows it open. FAIL-CLOSED on an unknown/ambiguous ticker (never
+    touches the wrong instrument). No ticker (or {"all": true}) clears every
+    instrument. Owner-only (auth enforced at the Express /api edge; NOT in
+    dashboard-auth OPEN_PATHS)."""
+    data      = request.get_json(force=True, silent=True) or {}
+    clear_all = bool(data.get("all"))
+    raw       = str(data.get("ticker", "")).strip()
+
+    targets = None  # None => every instrument
+    if raw and not clear_all:
+        inst = _instrument_from_text(raw)
+        if not inst:
+            return jsonify({"status": "error",
+                            "reason": f"Unknown or ambiguous ticker {raw!r}."}), 400
+        targets = {inst}
+
+    def _in_scope(sym):
+        if targets is None:
+            return True
+        return (_instrument_from_text(sym or "") or sym) in targets
+
+    cleared = {"active": 0, "managed": 0, "manual": 0}
+    details = []
+
+    # 1) Tracked ACTIVE_TRADE — one slot per instrument (compare-and-clear safe).
+    for a_inst in list(active_trade_snapshot().keys()):
+        if targets is not None and a_inst not in targets:
+            continue
+        if clear_active_trade(a_inst) is not None:
+            cleared["active"] += 1
+            details.append(f"{a_inst} tracked trade")
+
+    # 2) Managed-trade lifecycle (SCALP paper / SWING thesis). Mark closed WITHOUT
+    #    popping — matching _close_managed_trade — so the lock-free watcher's live
+    #    iteration never sees the dict change size (housekeeping drops it later).
+    #    No synthetic outcome is recorded: the real trade was closed elsewhere.
+    for _k, mt in list(MANAGED_TRADES_BY_KEY.items()):
+        if mt.get("closed"):
+            continue
+        if not _in_scope(mt.get("instrument") or mt.get("symbol")):
+            continue
+        mt["closed"]      = True
+        mt["exit_reason"] = mt.get("exit_reason") or "stopped_by_user"
+        # SWING (flag-on) theses persist to swing_theses and rehydrate on boot
+        # WHERE closed = FALSE — mirror _close_managed_trade and persist the closed
+        # flag so a stopped SWING trade is NOT resurrected as OPEN on the next
+        # restart/republish (SCALP / legacy carry no is_swing → byte-identical). FAIL-OPEN.
+        if mt.get("is_swing"):
+            try:
+                _persist_swing_thesis(mt)
+            except Exception as exc:
+                logger.warning("stop-managing swing thesis close-persist error: %s", exc)
+        cleared["managed"] += 1
+        details.append(f"{mt.get('instrument') or mt.get('symbol') or '?'} managed lifecycle")
+
+    # 3) Open manual-monitor rows — pop under lock + persist closed, exactly like
+    #    /manual-trade/close. Advisory-only rows; never a broker order.
+    with MANUAL_TRADES_LOCK:
+        _ids = [tid for tid, t in MANUAL_TRADES.items()
+                if t.get("status") != "closed" and _in_scope(t.get("symbol"))]
+        _popped = [MANUAL_TRADES.pop(tid, None) for tid in _ids]
+    for t in _popped:
+        if t is None:
+            continue
+        t["status"]    = "closed"
+        t["closed_at"] = now_utc().isoformat()
+        try:
+            _persist_manual_trade(t)
+        except Exception as exc:
+            logger.warning("stop-managing manual persist failed: %s", exc)
+        cleared["manual"] += 1
+        details.append(f"{t.get('symbol') or '?'} monitored trade")
+
+    total = cleared["active"] + cleared["managed"] + cleared["manual"]
+    logger.info("Stop-managing: cleared %d local tracking item(s) for %s (%s)",
+                total, (", ".join(sorted(targets)) if targets else "ALL"), cleared)
+    return jsonify({"status": "ok", "cleared": total, "breakdown": cleared,
+                    "details": details,
+                    "scope": (sorted(targets) if targets else "all")}), 200
+
+
 @app.route("/trade", methods=["GET"])
 def get_trade():
     _inst, _at, _err = _resolve_active_trade(request.args.get("ticker"))
@@ -34211,6 +34302,7 @@ def dashboard():
   .cleanest-btn:hover{background:var(--green);color:#04140a;box-shadow:0 0 14px rgba(52,227,164,.45)}
   .cleanest-btn:disabled{opacity:.6;cursor:default;box-shadow:none}
   .btn-close{background:var(--warn);color:#1a1304}
+  .btn-stop{background:var(--red);color:#fff}
   .btn-be{background:var(--amber-deep);color:var(--amber);border:1px solid var(--amber);font-size:14px;padding:14px}
   .btn-eod{background:var(--inset);color:var(--muted);border:1px solid var(--border);font-size:12px;padding:12px;margin-top:6px}
   .btn:disabled{opacity:.4;cursor:not-allowed}
@@ -35997,6 +36089,8 @@ def dashboard():
 <div style="font-size:11px;color:#6b7280;margin:-6px 0 8px;text-align:center">On a READY setup this routes a one-tap order through your configured execution mode and tracks it. Typing your own entry/stop = tracking only, no broker order.</div>
 <button class="btn btn-close" id="btn-close" style="display:none" onclick="closeTrade()">🏁 CLOSE TRADE</button>
 <button class="btn btn-be" id="btn-be" style="display:none" onclick="breakeven()">⚖️ Move Stop to Breakeven</button>
+<button class="btn btn-stop" id="btn-stop-managing" onclick="stopManaging()">🛑 Stop Managing This Trade</button>
+<div style="font-size:11px;color:#6b7280;margin:-6px 0 8px;text-align:center">Clears the bot's local tracking (active / paper / monitored) for the selected pair if it is stuck showing a trade you already closed. Never sends a broker order.</div>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
 <a class="btn btn-eod" href="/api/diagnostics-live" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
 
@@ -36776,6 +36870,21 @@ async function closeTrade() {
     const d = await api('/close', {});
     if (d.status === 'closed') { toast('🏁 Trade closed'); refresh(); }
     else toast('Error: '+(d.reason||d.status), false);
+  } catch(err) { toast('Request failed', false); }
+}
+
+async function stopManaging() {
+  var s = (typeof sym !== 'undefined' && sym) ? sym : 'MGC';
+  if (!confirm('Stop managing ' + s + '?\\n\\nThis clears the bot local tracking of any open or managed position for ' + s + ' \u2014 the tracked trade, the paper/managed lifecycle, and any monitored manual trade.\\n\\nTRACKING ONLY: it does NOT send any order to your broker and does NOT close a real position. Use this when you already closed the trade yourself but the bot still shows it as managing.')) return;
+  try {
+    const d = await api('/stop-managing', { ticker: s });
+    if (d && d.status === 'ok') {
+      if (d.cleared > 0) toast('🛑 Stopped managing ' + s + ' — cleared ' + d.cleared + ' item(s)');
+      else toast('Nothing was being managed for ' + s + '.');
+      refresh(); loadBotPositions();
+    } else {
+      toast('Error: ' + ((d && (d.reason || d.status)) || 'failed'), false);
+    }
   } catch(err) { toast('Request failed', false); }
 }
 
