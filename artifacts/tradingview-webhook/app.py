@@ -34792,6 +34792,7 @@ def dashboard():
     <div class="view-btn" id="vb-sr" role="menuitem" onclick="setView('research')">🔬 Research</div>
     <div class="view-btn" id="vb-ac" role="menuitem" onclick="setView('academy')">🎓 Academy</div>
   </div>
+  <button type="button" class="btn" id="btn-share-view" onclick="shareViewLink()">🔗 Share view-only link</button>
 </div>
 
 <div id="view-live">
@@ -36760,6 +36761,29 @@ async function api(path, body=null) {
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(BASE+path, opts);
   return r.json();
+}
+
+// Owner-only: mint a WATCH-ONLY, expiring, password-protected link that lets other
+// people view this dashboard read-only. Handled by Express (POST /api/view-link);
+// never touches the money path. Hidden entirely in the read-only view.
+async function shareViewLink() {
+  const hrs = prompt('View-only link \u2014 hours until it expires:', '24');
+  if (hrs === null) return;
+  const h = parseFloat(hrs);
+  if (!(h > 0)) { alert('Please enter a positive number of hours.'); return; }
+  let pw = prompt('Password for this link (at least 4 characters; leave blank to auto-generate):', '');
+  if (pw === null) return;
+  const body = { ttlSeconds: Math.round(h * 3600) };
+  if (pw) { if (pw.length < 4) { alert('Password must be at least 4 characters (or leave blank).'); return; } body.password = pw; }
+  let r;
+  try { r = await api('/view-link', body); } catch (e) { r = null; }
+  if (!r || !r.url) { alert('Could not create the link. Please try again.'); return; }
+  const when = new Date(r.expiresAt).toLocaleString();
+  try { await navigator.clipboard.writeText(r.url + '\\n\\nPassword: ' + r.password); } catch (e) {}
+  alert('VIEW-ONLY LINK (watch only \u2014 no controls)\\n\\nLink:\\n' + r.url +
+        '\\n\\nPassword:\\n' + r.password +
+        '\\n\\nExpires: ' + when +
+        '\\n\\nShare BOTH the link and the password. Anyone who has them can watch your dashboard (read-only) until it expires.\\n\\n(Copied to clipboard.)');
 }
 
 async function enterTrade() {

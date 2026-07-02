@@ -25,7 +25,7 @@ function safeEqual(a: string, b: string): boolean {
 // Host is rejected upstream. Both are therefore proxy-controlled and cannot be
 // spoofed by a malicious page, so we accept a match against either — robust to
 // whichever header carries the public host in dev vs. prod, with no hardcoding.
-function candidateHosts(req: { headers: Record<string, unknown> }): Set<string> {
+export function candidateHosts(req: { headers: Record<string, unknown> }): Set<string> {
   const out = new Set<string>();
   const add = (v: unknown) => {
     if (!v) return;
@@ -43,7 +43,7 @@ function candidateHosts(req: { headers: Record<string, unknown> }): Set<string> 
 // (or Referer) host matches the host the request was sent to. A malicious
 // site forging a request from the owner's browser carries its own origin,
 // which will not match — so it is rejected.
-function sameOrigin(req: { headers: Record<string, unknown> }): boolean {
+export function sameOrigin(req: { headers: Record<string, unknown> }): boolean {
   const hosts = candidateHosts(req);
   if (hosts.size === 0) return false;
   const src = (req.headers.origin ?? req.headers.referer) as string | undefined;

@@ -2,6 +2,7 @@ import express, { type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
 import router, { api2Router } from "./routes";
+import { createViewOnlyRouter } from "./routes/view-only";
 import { logger } from "./lib/logger";
 
 const app: Express = express();
@@ -49,5 +50,11 @@ app.use(express.raw({ type: () => true, limit: "1mb" }));
 
 app.use("/api", router);
 app.use("/api2", api2Router);
+
+// Watch-only, expiring, password-protected shareable dashboard link. Self-contained
+// auth (signed link token + view session cookie); deliberately NOT behind
+// dashboardAuth. The only reachable data path is GET /view/api/status; everything
+// else under /view/api is 403 fail-closed.
+app.use("/view", createViewOnlyRouter());
 
 export default app;
