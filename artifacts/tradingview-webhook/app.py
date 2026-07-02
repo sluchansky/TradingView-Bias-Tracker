@@ -34094,8 +34094,15 @@ def dashboard():
   .tz-sig{list-style:none;margin:6px 0 0;padding:0}
   .tz-sig li{font-size:11.5px;color:#cdd3e0;padding:3px 0 3px 2px;line-height:1.4}
   /* ── Backtest tab ── */
-  #view-seg{display:flex;gap:4px;width:fit-content;max-width:100%;margin:0 auto 18px;padding:5px;border-radius:14px;border:1px solid var(--border);background:rgba(12,17,30,.5);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);box-shadow:var(--glass-shadow)}
-  .view-btn{padding:9px 20px;border-radius:10px;border:1px solid transparent;background:transparent;color:var(--muted);font-family:var(--sans);font-size:13px;font-weight:700;cursor:pointer;text-align:center;letter-spacing:.5px;transition:all .18s}
+  /* Top-level view selector collapsed into a single dropdown menu */
+  #view-nav{position:relative;width:fit-content;max-width:100%;margin:0 auto 18px;z-index:60}
+  #view-dd-btn{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:200px;padding:10px 16px;border-radius:12px;border:1px solid var(--border);background:rgba(12,17,30,.5);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);box-shadow:var(--glass-shadow);color:var(--cyan);font-family:var(--sans);font-size:13.5px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:all .18s}
+  #view-dd-btn:hover{border-color:rgba(82,224,255,.4)}
+  .view-dd-caret{color:var(--muted);font-size:11px;transition:transform .18s}
+  #view-nav.open .view-dd-caret{transform:rotate(180deg)}
+  #view-seg{display:none;flex-direction:column;gap:4px;position:absolute;top:calc(100% + 6px);left:0;right:0;min-width:200px;padding:6px;border-radius:14px;border:1px solid var(--border);background:var(--panel);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);box-shadow:var(--glass-shadow)}
+  #view-nav.open #view-seg{display:flex}
+  .view-btn{padding:9px 16px;border-radius:10px;border:1px solid transparent;background:transparent;color:var(--muted);font-family:var(--sans);font-size:13px;font-weight:700;cursor:pointer;text-align:left;letter-spacing:.5px;transition:all .18s}
   .view-btn:hover{color:var(--text)}
   .view-btn.active{border-color:rgba(82,224,255,.4);color:var(--cyan);background:var(--cyan-deep);box-shadow:inset 0 0 0 1px rgba(82,224,255,.18)}
   .bt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
@@ -34163,8 +34170,9 @@ def dashboard():
     h1{font-size:18px}
     .mod,#status-card,#rec-card{padding:14px;border-radius:14px}
     #mod-brain{padding:16px 14px;border-radius:16px}
-    #view-seg{width:100%}
-    .view-btn{flex:1 1 0;padding:9px 10px}
+    #view-nav{width:100%}
+    #view-dd-btn{width:100%}
+    .view-btn{padding:9px 12px}
     #mode-row{flex-wrap:wrap}
     .fields,.bt-grid{grid-template-columns:1fr}
     .tab{min-width:0;flex:1 1 44%}
@@ -34191,13 +34199,20 @@ def dashboard():
   <a id="bot-switch" href="/api2/dashboard" onclick="event.preventDefault();var t=this;t.style.opacity='0.5';fetch('/api2/ping',{cache:'no-store'}).then(function(r){t.style.opacity='1';if(r.ok){location.href='/api2/dashboard';}else{alert('The Analysis Bot is only running in the published app. Open your deployed site to use it.');}}).catch(function(){t.style.opacity='1';alert('The Analysis Bot is only running in the published app. Open your deployed site to use it.');});return false;" title="Open the analysis-only bot's dashboard. It mirrors this engine but cannot place trades or post to Discord — the live bot keeps running untouched." style="text-decoration:none;cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔬 Analysis Bot &rarr;</a>
 </div>
 
-<!-- Live | Backtest top-level view toggle -->
-<div id="view-seg">
-  <div class="view-btn active" id="vb-live" onclick="setView('live')">📊 Live</div>
-  <div class="view-btn" id="vb-bt" onclick="setView('backtest')">🧪 Backtest</div>
-  <div class="view-btn" id="vb-tz" onclick="setView('tradezella')">📒 TradeZella</div>
-  <div class="view-btn" id="vb-sr" onclick="setView('research')">🔬 Research</div>
-  <div class="view-btn" id="vb-ac" onclick="setView('academy')">🎓 Academy</div>
+<!-- Top-level view selector — collapsed into a single dropdown menu (DISPLAY-ONLY,
+     per-device). setView() still owns the actual view switch + .active state; this
+     just wraps the five options in a menu. Never touches the money path. -->
+<div id="view-nav">
+  <button type="button" id="view-dd-btn" aria-haspopup="true" aria-expanded="false" onclick="toggleViewMenu(event)">
+    <span id="view-dd-label">📊 Live</span><span class="view-dd-caret">▾</span>
+  </button>
+  <div id="view-seg" role="menu">
+    <div class="view-btn active" id="vb-live" role="menuitem" onclick="setView('live')">📊 Live</div>
+    <div class="view-btn" id="vb-bt" role="menuitem" onclick="setView('backtest')">🧪 Backtest</div>
+    <div class="view-btn" id="vb-tz" role="menuitem" onclick="setView('tradezella')">📒 TradeZella</div>
+    <div class="view-btn" id="vb-sr" role="menuitem" onclick="setView('research')">🔬 Research</div>
+    <div class="view-btn" id="vb-ac" role="menuitem" onclick="setView('academy')">🎓 Academy</div>
+  </div>
 </div>
 
 <div id="view-live">
@@ -40452,7 +40467,16 @@ function setView(v){
   if(isTz) tzLoadAnalysis();
   if(isSr) srLoad();
   if(isAc) acLoad();
+  var _vl={live:'📊 Live',backtest:'🧪 Backtest',tradezella:'📒 TradeZella',research:'🔬 Research',academy:'🎓 Academy'};
+  var _vlab=document.getElementById('view-dd-label'); if(_vlab) _vlab.textContent=_vl[v]||_vl.live;
+  closeViewMenu();
 }
+
+// ── Top-level view dropdown (DISPLAY-ONLY; wraps the Live/Backtest/TradeZella/
+//    Research/Academy options behind one menu button). Never touches the money path.
+function toggleViewMenu(e){ if(e&&e.stopPropagation) e.stopPropagation(); var n=document.getElementById('view-nav'); if(!n) return; var open=n.classList.toggle('open'); var b=document.getElementById('view-dd-btn'); if(b) b.setAttribute('aria-expanded', open?'true':'false'); }
+function closeViewMenu(){ var n=document.getElementById('view-nav'); if(!n) return; n.classList.remove('open'); var b=document.getElementById('view-dd-btn'); if(b) b.setAttribute('aria-expanded','false'); }
+document.addEventListener('click', function(e){ var n=document.getElementById('view-nav'); if(n && !n.contains(e.target)) closeViewMenu(); });
 
 // ── Scalp Strategy Research (owner-only; on-demand, NEVER in the 3s /status poll) ──
 function srNum(v,d){ if(v===null||v===undefined) return '—'; return (typeof v==='number')?v.toFixed(d):String(v); }
