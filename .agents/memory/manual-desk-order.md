@@ -35,7 +35,10 @@ sat at WAIT, so the existing READY-gated buttons never fired.
   slot on the next real order (send-before-track).
 - **Owner-only:** `/manual-order` is in `BOT1_ROUTES` (Express `/api` proxy whitelist)
   and is NOT in `OPEN_PATHS`.
-- **Dashboard panel** `#manual-order-box` is a plain always-visible div (NOT a `.mod`)
-  so the collapse/reorder layer can't hide it; it has its own direction toggle so the
-  operator can fire the opposite side of whatever the analysis shows. Live sends
-  double-confirm.
+- **Dashboard UI REMOVED (endpoint kept):** the orange `#manual-order-box` div + its
+  JS (`sendManualOrder`/`setManualDir`/`manualOrderDir`) were deleted per user request —
+  they wanted trade entry to live INSIDE the potential-plan preview box (entry/stop/TP)
+  via the `/take-preview` button, not a separate fire-regardless box. The `/manual-order`
+  route + `manual_desk` gateway branch remain (double-gated fail-closed 409 when
+  `MANUAL_ORDER_ENABLED` off), so re-enabling is UI-only. **Do NOT re-add the box**
+  thinking it went missing. `MANUAL_ORDER_ENABLED` env var was removed (→ default OFF).
