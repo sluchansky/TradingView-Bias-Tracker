@@ -36410,6 +36410,16 @@ function setSymbol(s) {
 // paint cache reconciled by loadAlertMutes() on boot. A restart/republish resets
 // the server to unmuted (fail-safe toward alerting).
 function instrEnabled(inst){ try { return localStorage.getItem('focus_'+inst) !== '0'; } catch(e){ return true; } }
+// One-time per-device migration: clear any previously-saved hidden state so
+// every instrument (including MYM) defaults back to visible. After this runs,
+// hiding an instrument requires an explicit confirm (see toggleInstrument).
+function resetInstrumentFocusOnce(){
+  try {
+    if (localStorage.getItem('focus_reset_v1') === '1') return;
+    INSTRUMENTS.forEach(function(inst){ localStorage.removeItem('focus_'+inst); });
+    localStorage.setItem('focus_reset_v1','1');
+  } catch(e){}
+}
 function applyInstrumentFocus(){
   const on = {};
   INSTRUMENTS.forEach(function(inst){ on[inst] = instrEnabled(inst); });
@@ -36429,6 +36439,12 @@ function toggleInstrument(inst, on){
     const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = true;
     toast('Keep at least one instrument showing', false);
     return;
+  }
+  if (!on){   // confirm before hiding so an accidental tap can't remove a tab
+    if (!confirm('Hide ' + inst + ' from this device?\\n\\nOnly its picker tab disappears here. Alerts, tracking and execution keep running. Re-check the Focus box to bring it back.')){
+      const cb = document.getElementById('foc-'+inst); if (cb) cb.checked = true;
+      return;
+    }
   }
   // Focus is DISPLAY-ONLY (this device): show/hide a pair's tab. It no longer
   // touches the server-side alert mute — muting is its own explicit control
@@ -42045,7 +42061,7 @@ async function findCleanestTrade(btn){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells();
+refresh(); resetInstrumentFocusOnce(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells();
 autoSelectBestSetup();
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
