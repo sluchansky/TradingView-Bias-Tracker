@@ -126,3 +126,5 @@
 - [USER_APPROVED_PREVIEW preview-take](user-approved-preview-take.md) — owner-only manual "take this FORMING setup" money path; FORMING skips full_analysis is_actionable vetoes so the branch RE-RUNS mode-correct SCALP/SWING vetoes fail-closed + an unconditional local-flatness gate (max_open is env-reversible to None); flag default OFF, PREVIEW_MAX_CONTRACTS=1, counted via source tag, goldens byte-identical.
 
 - [Liquidity Sweep Focus overlay](liquidity-sweep-focus.md) — flag-gated DISPLAY/ADVISORY-ONLY sweep-state read nested in main_brain ONLY; advisory delta never feeds edge/gate; recency re-scan of ALERT_HISTORY (never trust stale key presence) + instrument-prefixed match; flag-OFF byte-identical, own smoke.
+
+- [View-only share link](view-only-share-link.md) — Express-only watch-only dashboard link under /view; two traps: a new route prefix must be added to artifact.toml proxy `paths` (else falls through to the home SPA), and a login page under `no-referrer` sends `Origin: null` → strict sameOrigin CSRF 403s every real browser (use `same-origin`); curl masks it.
