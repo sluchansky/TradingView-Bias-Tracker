@@ -3563,7 +3563,10 @@ def market_session_status(now=None):
 def alerts_in_window(minutes):
     cutoff = now_utc() - timedelta(minutes=minutes)
     out = []
-    for alert in ALERT_HISTORY:
+    # Snapshot the shared deque: the webhook worker thread appends concurrently, so a
+    # live for-loop can raise "deque mutated during iteration". list() is atomic under
+    # the GIL and byte-identical in content/order.
+    for alert in list(ALERT_HISTORY):
         try:
             if datetime.fromisoformat(alert["timestamp"]) >= cutoff:
                 out.append(alert)
@@ -3659,7 +3662,7 @@ def get_price_context(inst=None):
     last_price_by_type = {}
     all_supply_prices  = []
     all_demand_prices  = []
-    for alert in ALERT_HISTORY:
+    for alert in list(ALERT_HISTORY):   # snapshot: webhook thread appends concurrently
         t = alert.get("alert_type", "")
         p = alert.get("price")
         if t not in ALERT_TYPES or p is None:
@@ -4921,6 +4924,11 @@ def get_setup_stage(current_price, nearest_supply, nearest_demand,
     if current_price is None:
         return ("Watching", "Waiting for price data.", "No entry.", "N/A", None)
 
+    # Snapshot the shared deque once: the webhook worker thread appends concurrently,
+    # so a live for-loop over it can raise "deque mutated during iteration". list() is
+    # atomic under the GIL and byte-identical in content/order.
+    alert_history = list(alert_history)
+
     # ── Recent alerts: a time window in SCALP mode, else the last 5 alerts ──
     stage_window = cfg("STAGE_WINDOW_MIN")
     if stage_window:
@@ -5088,6 +5096,10 @@ def _handle_zone_broken(price, instrument=None):
     kept.reverse()
     # Also re-add the ZONE BROKEN record at the end
     kept.append(history_list[-1])
+    # clear()+extend() leaves a brief window where a concurrent reader snapshot sees a
+    # partial/empty history (wrong for one eval tick, never a crash). This runs in the
+    # webhook request path (single-writer in practice), so we intentionally do NOT add a
+    # lock here — snapshotting readers + the GIL already prevent the deque-mutated crash.
     ALERT_HISTORY.clear()
     ALERT_HISTORY.extend(kept)
     logger.info("Zone broken at %.1f — cancelled %d directional alerts", price, cancelled)
@@ -6381,7 +6393,7 @@ def _managed_watch_loop():
 
 def _active_ticker():
     """Best-effort active instrument from the most recent resolved alert."""
-    for rec in reversed(ALERT_HISTORY):
+    for rec in reversed(list(ALERT_HISTORY)):
         if rec.get("instrument"):
             return rec["instrument"]
         if rec.get("ticker"):
@@ -6496,6 +6508,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     ("Long"|"Short"|None), score (0-100), confluences (per-condition detail for
     journal/embed), reason (human-readable), and missing (list of unmet conditions).
     """
+    # Snapshot the shared deque once: the webhook worker thread appends concurrently,
+    # so a live for-loop over it can raise "deque mutated during iteration". list() is
+    # atomic under the GIL and byte-identical in content/order (goldens prove it).
+    alert_history = list(alert_history)
     inst = instrument_of(ticker)
 
     # Mode-parameterized threshold reads: route EVERY cfg(...) in this function (and
@@ -16692,7 +16708,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     _zone_age = None
     try:
         _inst_age = instrument_of(active_ticker)
-        for _al in reversed(ALERT_HISTORY):
+        for _al in reversed(list(ALERT_HISTORY)):
             _at = str(_al.get("alert_type") or "").upper()
             if "ZONE" not in _at or "BROKEN" in _at or "MITIGATED" in _at:
                 continue
@@ -18285,6 +18301,7 @@ def _early_event_times(inst, alert_history):
     the latest of the two. event_start is the first of (sweep, structure). All
     times are server-ingestion timestamps (no bar time is in the payload). Pure /
     read-only — never feeds the gate."""
+    alert_history = list(alert_history)   # snapshot: webhook thread appends concurrently
     cutoff = now_utc() - timedelta(minutes=EARLY_WINDOW_MIN)
     def lt(t, scoped=False):
         return _early_latest_ts(alert_history, t, inst, scoped, cutoff)

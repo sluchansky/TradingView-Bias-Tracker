@@ -33,3 +33,14 @@ labeled control and no way to hide a pair locally without muting it for everyone
   response is authoritative (re-assign `MUTE_STATE` from `d.muted`).
 - POST `/alerts/mute` is owner-only (Basic Auth) + same-origin CSRF — a bare curl
   POST without an `Origin`/`Referer` matching Host is correctly 403'd; GET isn't.
+
+## Diagnostic: "instrument missing from dashboard/mobile" is usually stale focus
+An instrument (e.g. MYM) reported "missing" from the dashboard/mobile is almost always
+a stale per-device `focus_<inst>='0'` in `localStorage` hiding the tab — NOT missing
+data or a broken endpoint. `/status?ticker=<inst>` returns 200 and the pair is in the
+registry; only the local Focus toggle hid it. Fix pattern used: a one-time
+`localStorage`-flagged migration (`resetInstrumentFocusOnce`, keyed on
+`focus_reset_v1`) that clears stale `focus_<inst>` flags on boot BEFORE
+`applyInstrumentFocus`, plus a `confirm()` guard in `toggleInstrument` so hiding a pair
+is deliberate. All display-only JS; no server/money-path change. Check the local Focus
+state before hunting for a data bug.
