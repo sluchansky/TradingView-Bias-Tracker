@@ -3362,9 +3362,14 @@ EARLY_CLOSE_HOUR_ET  = 13   # holiday half-day early close (~1:00 PM ET)
 # Dates are computed algorithmically per year (no annual maintenance) with the
 # federal Sat→Fri / Sun→Mon observance rule for the fixed-date holidays. Add to or
 # override the calendar with MARKET_HOLIDAYS_EXTRA — a comma list of "YYYY-MM-DD"
-# (full) or "YYYY-MM-DD:early". The whole calendar is gated by MARKET_HOURS_ENABLED,
-# so MARKET_HOURS_ENABLED=0 disables holidays too (always OPEN).
+# (full) or "YYYY-MM-DD:early". Conversely, FORCE a generated holiday back OPEN with
+# MARKET_HOLIDAYS_SKIP — a comma list of "YYYY-MM-DD" that is REMOVED from the calendar
+# (used when the desk chooses to trade a US-holiday session that still has London/Tokyo
+# liquidity). SKIP is applied last, so it also wins over an EXTRA-added date. The whole
+# calendar is gated by MARKET_HOURS_ENABLED, so MARKET_HOURS_ENABLED=0 disables holidays
+# too (always OPEN). Weekend + daily-maintenance closes are unaffected by either knob.
 MARKET_HOLIDAYS_EXTRA = os.environ.get("MARKET_HOLIDAYS_EXTRA", "").strip()
+MARKET_HOLIDAYS_SKIP  = os.environ.get("MARKET_HOLIDAYS_SKIP", "").strip()
 _HOLIDAY_CACHE = {}
 
 
@@ -3431,6 +3436,26 @@ def _holiday_env_overrides(year):
     return out
 
 
+def _holiday_env_skips(year):
+    """Parse MARKET_HOLIDAYS_SKIP into a set of dates (for `year`) to FORCE OPEN —
+    generated/overridden holidays whose closure the desk is deliberately waiving
+    (e.g. trading a US holiday session on London/Tokyo liquidity)."""
+    out = set()
+    if not MARKET_HOLIDAYS_SKIP:
+        return out
+    for tok in MARKET_HOLIDAYS_SKIP.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            d = date.fromisoformat(tok)
+        except ValueError:
+            continue
+        if d.year == year:
+            out.add(d)
+    return out
+
+
 def _holiday_calendar(year):
     """{date: (kind, name)} of CME/COMEX market holidays for a calendar year."""
     cached = _HOLIDAY_CACHE.get(year)
@@ -3461,6 +3486,8 @@ def _holiday_calendar(year):
         cal[d] = ("early", name)
     for d, kind, name in _holiday_env_overrides(year):
         cal[d] = (kind, name)
+    for d in _holiday_env_skips(year):        # desk override: force a generated holiday OPEN
+        cal.pop(d, None)
     _HOLIDAY_CACHE[year] = cal
     return cal
 
