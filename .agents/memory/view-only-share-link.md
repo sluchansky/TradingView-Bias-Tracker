@@ -42,6 +42,26 @@ also sends `Origin: null`.
 (c) a cross-site Origin — all must 403 — and (d) the real same-origin Origin → pass.
 For the actual browser behavior, verify the served page's referrer meta value.
 
+## Gotcha 3 — in-app browsers send NEITHER Origin NOR Referer (strict CSRF locks them out)
+**Rule:** setting referrer-policy `same-origin` (Gotcha 2) is necessary but NOT
+sufficient. Facebook Messenger / Instagram / other WKWebView in-app browsers omit
+BOTH `Origin` and `Referer` on a same-origin top-level form POST regardless of the
+referrer meta. A strict `sameOrigin()` (which needs one of them present) then 403s
+every legitimate viewer ("Cross-origin request rejected", blank page). For a
+LOW-VALUE POST like a read-only login (success only sets a harmless view cookie —
+no trades, no state, no owner data), relax to "verify origin only if present":
+`const src = origin ?? referer; if (src && !sameOrigin(req)) reject;`. A real
+cross-site attack (evil.com) ALWAYS carries its own `Origin`, so this still blocks
+it; only the header-less case is allowed through. Do NOT apply this relaxation to
+the money-path `dashboard-auth.ts` gate — that stays strict.
+**Why:** the symptom appeared only on the custom domain in Messenger; curl with an
+explicit Origin passed, hiding it. Probe method: the CSRF check runs BEFORE token
+verification, so POST a DUMMY token to prod and read the status — 403 = origin
+rejected, 200 (login/expired page) = origin accepted — no valid token needed.
+**How to apply:** when a browser-only auth POST "keeps getting rejected" but curl
+works, curl the endpoint with NO Origin and NO Referer at all; if that 403s, an
+in-app browser will too.
+
 ## Residual security property (documented, accepted)
 Link signatures are HMAC keys = unsalted `sha256(DASHBOARD_PASSWORD + ":" + label)`,
 so any link holder has material for an OFFLINE dictionary attack on the admin

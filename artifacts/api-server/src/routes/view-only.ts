@@ -270,7 +270,18 @@ export function createViewOnlyRouter(): Router {
       res.status(503).json({ error: "not configured" });
       return;
     }
-    if (!sameOrigin(req)) {
+    // CSRF for a READ-ONLY login: reject only when a cross-origin Origin/Referer
+    // is actually PRESENT and mismatches. A genuine evil.com auto-submit always
+    // carries its own Origin, so this still blocks it. But many in-app browsers
+    // (Messenger / Instagram / WKWebView) send NEITHER Origin nor Referer on a
+    // same-origin form POST — strict sameOrigin() then 403s every legitimate
+    // viewer ("Cross-origin request rejected"). Since a successful login here only
+    // sets a harmless read-only view cookie (no trades, no state changes, no owner
+    // data ever reachable), allowing the header-less case is the correct,
+    // proportionate tradeoff. Do NOT copy this relaxation into dashboard-auth.ts —
+    // that gate protects the money path and must stay strict.
+    const csrfSrc = (req.headers.origin ?? req.headers.referer) as string | undefined;
+    if (csrfSrc && !sameOrigin(req)) {
       res.status(403).send("Cross-origin request rejected");
       return;
     }
