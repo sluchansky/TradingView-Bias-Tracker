@@ -42245,11 +42245,13 @@ async function optExport(){
 // you switch manually it never moves again, and it never touches the gate,
 // scoring, sizing or any money path. Fail-open: any error leaves the MGC / Long
 // default untouched. Hidden (focused-out) instruments are never auto-selected.
-async function pickCleanestSetup(force){
+async function pickCleanestSetup(force, actionableOnly){
   // Shared best-setup scan. force=true (the manual "Cleanest trade" button) bypasses
-  // the userPickedSetup guard; force=false (landing auto-select) respects a manual
-  // pick. Returns the chosen candidate (or null). DISPLAY-ONLY — only switches the
-  // viewed tab/direction; never touches the gate, scoring, sizing or any money path.
+  // the userPickedSetup guard; force=false (landing auto-select / 30s auto-follow)
+  // respects a manual pick. actionableOnly=true (30s auto-follow) only switches when
+  // the best candidate is a READY/EARLY setup — never hops between WAITs. Returns the
+  // chosen candidate (or null). DISPLAY-ONLY — only switches the viewed tab/direction;
+  // never touches the gate, scoring, sizing or any money path.
   try {
     if (!force && userPickedSetup) return null;       // landing mode: manual pick wins
     const num = function(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; };
@@ -42275,6 +42277,10 @@ async function pickCleanestSetup(force){
       if (better) best = cand;
     });
     if (!best) return null;
+    // 30s auto-follow: only jump to an actionable (READY/EARLY) setup. When nothing is
+    // actionable (all WAIT) leave the current view put instead of hopping between WAITs.
+    // The manual button (actionableOnly falsy) still jumps to the best of whatever exists.
+    if (actionableOnly && !best.act) return null;
     let bdir = jsReadyDir(best.d.verdict);            // ready side when actionable
     if (!bdir){                                       // else the higher per-side edge
       bdir = (num(best.d.short_score) > num(best.d.long_score)) ? 'Short' : 'Long';
@@ -42293,6 +42299,7 @@ async function autoSelectBestSetup(){ return pickCleanestSetup(false); }
 // re-scans and jumps to the best setup even after a manual tab / direction pick.
 async function findCleanestTrade(btn){
   try {
+    userPickedSetup = false;   // explicit request → un-pin and resume 30s auto-following
     if (btn){ btn.disabled = true; btn.dataset.orig = btn.dataset.orig || btn.textContent; btn.textContent = '🔎 Scanning…'; }
     await pickCleanestSetup(true);
   } catch(e){ /* fail-open */ }
@@ -42307,14 +42314,15 @@ paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
 refresh(); resetInstrumentFocusOnce(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells();
 autoSelectBestSetup();
-// Re-follow the best available setup every 30s (user request): keeps the probability
+// Auto-follow the best available setup every 30s (user request): keeps the probability
 // dial pointed at the highest-quality trade across the focused instruments. DISPLAY-
 // ONLY — only switches the viewed tab/direction; never touches the gate, scoring,
-// sizing or any money path. Right after a manual tab/direction pick we skip one cycle
-// (so the view isn't yanked while you're looking), then resume auto-following.
+// sizing or any money path. Two guards keep it calm: (1) a manual tab/direction pick is
+// STICKY — the view is never yanked until you press the "Cleanest trade" button again;
+// (2) it ONLY jumps to an actionable (READY/EARLY) setup, so it never hops between WAITs.
 setInterval(function(){
-  if (userPickedSetup){ userPickedSetup = false; return; }  // one-cycle grace after a manual pick
-  pickCleanestSetup(true);                                   // force: re-follow the best setup
+  if (userPickedSetup) return;              // sticky: respect the manual pick until the button re-arms it
+  pickCleanestSetup(false, true);           // auto-follow, actionable-only (never hop between WAITs)
 }, 30000);
 // ── Collapsible + drag-reorder dashboard panels (DISPLAY-ONLY, this device) ──
 // Lets the trader minimize panels they don't need and drag-reorder the rest. Pure
