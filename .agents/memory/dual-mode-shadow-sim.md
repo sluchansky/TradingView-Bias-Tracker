@@ -79,8 +79,9 @@ opened modes are unchanged.
 - Env-tuned floor `DUAL_SIM_TEST_EDGE_MIN` (default **0 = OFF**). When `>0`, the observer
   opens a shadow paper trade for any mode that is **NOT** actionable but whose Edge Score
   `>= floor` — i.e. it deliberately BYPASSES the strict structure/VWAP/zone gate so the
-  simulator "takes trades" purely on edge, for testing/demo. Set to `80` for the
-  "take trades at 80%" request. **This is the ONLY thing that opens a shadow trade on a
+  simulator "takes trades" purely on edge, for testing/demo. Now set to `70` (shared env)
+  so the ledger captures the full 70+ range for the 70/80/90 display-tier comparison (see
+  "Display Edge tiers" below). **This is the ONLY thing that opens a shadow trade on a
   non-actionable verdict** — normal opens still require actionable + real plan.
 - **Why it's still isolated:** the trigger only calls read-only helpers
   (`build_strict_trade_plan`, `compute_swing_context`, `_swing_htf_enabled`) + the same
@@ -98,5 +99,23 @@ opened modes are unchanged.
 - **dev vs prod:** the observer only fires on real `source=="webhook"` events, so the dev
   instance won't show test trades (no live TradingView feed) — it takes effect on the
   PUBLISHED instance after a republish (picks up code + shared env; Publish schema-diff must
-  ensure `dual_sim_trades` exists in prod). Remember to reset `DUAL_SIM_TEST_EDGE_MIN=0`
-  after testing or it opens a paper trade on essentially every high-edge WAIT.
+  ensure `dual_sim_trades` exists in prod). The floor is intentionally kept at `70` for the
+  ongoing 70/80/90 tier comparison; reset `DUAL_SIM_TEST_EDGE_MIN=0` only when done, or it
+  keeps opening a paper trade on essentially every 70+ WAIT.
+
+## Display Edge tiers (70/80/90) — `DUAL_SIM_DISPLAY_TIERS`
+- The dashboard shows three NESTED/OVERLAPPING cohorts (≥70 / ≥80 / ≥90) computed in
+  `_dual_sim_stats` by filtering the SAME closed shadow trades on the `edge_score` stored at
+  open (a 92-edge trade counts in all three tiers). Output gains
+  `out[mode]["by_threshold"]={"70":..,"80":..,"90":..}` + top-level `out["thresholds"]`;
+  purely additive/display-only, so the smoke's `isinstance(dict)` check and the strict
+  goldens are unaffected. Renderer `renderDualSim` builds one table per tier via
+  createElement/textContent (no innerHTML strings → no inline-JS escape trap).
+- **Not exactly three independent sims.** `_dual_sim_open_insert` allows only ONE open trade
+  per (mode,inst,dir) + a 300s cooldown, so with the floor at 70 an open 72-edge trade can
+  BLOCK a later 95-edge setup on the same key from ever opening — a true standalone ≥90 sim
+  would have taken it. Per-trade OUTCOMES within a tier are unbiased, but higher tiers
+  UNDERCOUNT trades vs a real ≥80/≥90-floor sim. Present it as "the same paper trades
+  re-bucketed by Edge quality," NOT as three separate simulations.
+  **Why:** avoids opening 3× overlapping paper trades (which would clutter the ledger for
+  zero extra outcome info) at the cost of higher-tier trade-count fidelity.

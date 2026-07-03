@@ -27740,6 +27740,12 @@ DUAL_SIM_MODES              = ("SCALP", "SWING")
 # generating test entries in the SIMULATOR — it shares NO code with the live money path
 # (the only DB write is still _dual_sim_open_insert into dual_sim_trades).
 DUAL_SIM_TEST_EDGE_MIN     = max(0, int(os.environ.get("DUAL_SIM_TEST_EDGE_MIN", 0)))
+# DISPLAY-ONLY Edge-quality tiers for the dashboard: each tier RE-BUCKETS the SAME
+# shadow paper trades by the edge_score stored at open (a >=90 setup also counts in
+# the >=80 and >=70 cohorts), so the operator can compare how trades taken at each
+# quality cutoff would perform. Nested/overlapping cohorts — NOT extra trades, NOT a
+# schema change, NOT a money-path change. Only populated up to DUAL_SIM_TEST_EDGE_MIN.
+DUAL_SIM_DISPLAY_TIERS     = (70, 80, 90)
 _DUAL_SIM_COOLDOWN          = {}                  # (mode,inst,direction) -> monotonic ts
 _DUAL_SIM_COOLDOWN_LOCK     = threading.Lock()
 
@@ -28238,7 +28244,7 @@ def _dual_sim_stats():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT mode, symbol, status, result, r_multiple, closed_at "
+                "SELECT mode, symbol, status, result, r_multiple, closed_at, edge_score "
                 "FROM dual_sim_trades "
                 "ORDER BY closed_at ASC NULLS LAST, id ASC")
             rows = cur.fetchall()
@@ -28255,8 +28261,16 @@ def _dual_sim_stats():
 
     agg = {}      # mode -> bucket
     per_sym = {}  # (mode,symbol) -> bucket
-    for mode, symbol, status, result_label, r_mult, closed_at in rows:
-        for bkt in (agg.setdefault(mode, _blank()), per_sym.setdefault((mode, symbol), _blank())):
+    per_tier = {} # (mode,tier) -> bucket (edge-quality cohorts; overlapping/nested, display-only)
+    for mode, symbol, status, result_label, r_mult, closed_at, edge_score in rows:
+        try:
+            es = float(edge_score) if edge_score is not None else None
+        except (TypeError, ValueError):
+            es = None
+        tier_buckets = [per_tier.setdefault((mode, t), _blank())
+                        for t in DUAL_SIM_DISPLAY_TIERS if es is not None and es >= t]
+        for bkt in [agg.setdefault(mode, _blank()),
+                    per_sym.setdefault((mode, symbol), _blank())] + tier_buckets:
             if status in ("open", "resolving"):
                 bkt["open"] += 1
                 continue
@@ -28291,8 +28305,11 @@ def _dual_sim_stats():
     for mode in DUAL_SIM_MODES:
         d = _summ(agg.get(mode) or _blank())
         d["by_symbol"] = {sym: _summ(s) for (mo, sym), s in per_sym.items() if mo == mode}
+        d["by_threshold"] = {str(t): _summ(per_tier.get((mode, t)) or _blank())
+                             for t in DUAL_SIM_DISPLAY_TIERS}
         out[mode] = d
     out["enabled"] = bool(DUAL_MODE_SHADOW_SIM_ENABLED)
+    out["thresholds"] = list(DUAL_SIM_DISPLAY_TIERS)
     return out
 
 
@@ -35317,16 +35334,7 @@ def dashboard():
 <div class="mod" id="mod-dual-sim" style="display:none">
   <div class="mod-h">🔬 Dual Shadow Simulator<span title="Passive paper simulation of BOTH rulebooks side by side — not your real broker fills, and it never affects the live bot." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
   <div id="dual-sim-meta" style="font-size:11px;color:#6b7280;margin-bottom:6px"></div>
-  <table style="width:100%;border-collapse:collapse;font-size:12px">
-    <thead>
-      <tr>
-        <th style="text-align:left;color:#6b7280;font-weight:600;padding:3px 6px">Metric</th>
-        <th style="text-align:right;color:#22c55e;font-weight:600;padding:3px 6px">SCALP</th>
-        <th style="text-align:right;color:#3b82f6;font-weight:600;padding:3px 6px">SWING</th>
-      </tr>
-    </thead>
-    <tbody id="dual-sim-body"></tbody>
-  </table>
+  <div id="dual-sim-tables"></div>
 </div>
 
 <!-- Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades
@@ -38131,26 +38139,29 @@ function renderMBLearning(d){
 // All dynamic strings go through textContent (XSS-safe); the table is built with
 // createElement, never an innerHTML string (avoids the inline-JS escape trap).
 function _dsFmt(v, suffix){ return (v==null) ? '\u2014' : (v + (suffix||'')); }
-function renderDualSim(d){
-  const mod=document.getElementById('mod-dual-sim'); if(!mod) return;
-  const ds=(d&&d.dual_sim)||null;
-  if(!ds || !ds.enabled){ mod.style.display='none'; return; }
-  mod.style.display='';
-  const sc=ds.SCALP||{}; const sw=ds.SWING||{};
-  const meta=document.getElementById('dual-sim-meta');
-  if(meta){
-    const so=(sc.open!=null?sc.open:0), wo=(sw.open!=null?sw.open:0);
-    meta.textContent='Open now: '+so+' SCALP / '+wo+' SWING \u00b7 paper-only, replays the live READY decision for each rulebook.';
-  }
-  const body=document.getElementById('dual-sim-body'); if(!body) return;
-  body.innerHTML='';
+function _dsTierTable(title, sc, sw){
+  const wrap=document.createElement('div'); wrap.style.cssText='margin-top:8px';
+  const h=document.createElement('div');
+  h.style.cssText='font-size:11px;font-weight:700;color:#e8e8f0;margin-bottom:2px';
+  h.textContent=title; wrap.appendChild(h);
+  const tbl=document.createElement('table');
+  tbl.style.cssText='width:100%;border-collapse:collapse;font-size:12px';
+  const thead=document.createElement('thead'); const htr=document.createElement('tr');
+  const mkTh=function(txt,align,color){ const th=document.createElement('th');
+    th.style.cssText='text-align:'+align+';color:'+color+';font-weight:600;padding:3px 6px';
+    th.textContent=txt; return th; };
+  htr.appendChild(mkTh('Metric','left','#6b7280'));
+  htr.appendChild(mkTh('SCALP','right','#22c55e'));
+  htr.appendChild(mkTh('SWING','right','#3b82f6'));
+  thead.appendChild(htr); tbl.appendChild(thead);
+  const tb=document.createElement('tbody');
   const rows=[
-    ['Trades',   _dsFmt(sc.trades),            _dsFmt(sw.trades)],
-    ['Win rate', _dsFmt(sc.win_rate,'%'),      _dsFmt(sw.win_rate,'%')],
-    ['Avg R',    _dsFmt(sc.avg_r,'R'),         _dsFmt(sw.avg_r,'R')],
-    ['Net R',    _dsFmt(sc.net_r,'R'),         _dsFmt(sw.net_r,'R')],
-    ['Max DD',   _dsFmt(sc.max_dd_r,'R'),      _dsFmt(sw.max_dd_r,'R')],
-    ['Open',     _dsFmt(sc.open),              _dsFmt(sw.open)]
+    ['Trades',   _dsFmt(sc.trades),       _dsFmt(sw.trades)],
+    ['Win rate', _dsFmt(sc.win_rate,'%'), _dsFmt(sw.win_rate,'%')],
+    ['Avg R',    _dsFmt(sc.avg_r,'R'),    _dsFmt(sw.avg_r,'R')],
+    ['Net R',    _dsFmt(sc.net_r,'R'),    _dsFmt(sw.net_r,'R')],
+    ['Max DD',   _dsFmt(sc.max_dd_r,'R'), _dsFmt(sw.max_dd_r,'R')],
+    ['Open',     _dsFmt(sc.open),         _dsFmt(sw.open)]
   ];
   rows.forEach(function(r){
     const tr=document.createElement('tr');
@@ -38158,7 +38169,28 @@ function renderDualSim(d){
     const td1=document.createElement('td'); td1.style.cssText='text-align:right;padding:3px 6px;font-variant-numeric:tabular-nums'; td1.textContent=r[1];
     const td2=document.createElement('td'); td2.style.cssText='text-align:right;padding:3px 6px;font-variant-numeric:tabular-nums'; td2.textContent=r[2];
     tr.appendChild(td0); tr.appendChild(td1); tr.appendChild(td2);
-    body.appendChild(tr);
+    tb.appendChild(tr);
+  });
+  tbl.appendChild(tb); wrap.appendChild(tbl); return wrap;
+}
+function renderDualSim(d){
+  const mod=document.getElementById('mod-dual-sim'); if(!mod) return;
+  const ds=(d&&d.dual_sim)||null;
+  if(!ds || !ds.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const sc=ds.SCALP||{}; const sw=ds.SWING||{};
+  const scT=sc.by_threshold||{}; const swT=sw.by_threshold||{};
+  const meta=document.getElementById('dual-sim-meta');
+  if(meta){
+    const so=(sc.open!=null?sc.open:0), wo=(sw.open!=null?sw.open:0);
+    meta.textContent='Open now: '+so+' SCALP / '+wo+' SWING \u00b7 paper-only. Each Edge tier re-buckets the SAME trades by quality cutoff (a \u226590 setup also counts in \u226580 and \u226570) so you can see which cutoff performs best.';
+  }
+  const host=document.getElementById('dual-sim-tables'); if(!host) return;
+  host.innerHTML='';
+  const tiers=(ds.thresholds&&ds.thresholds.length)?ds.thresholds:[70,80,90];
+  tiers.forEach(function(t){
+    const k=String(t);
+    host.appendChild(_dsTierTable('\u2265'+t+'% Edge', scT[k]||{}, swT[k]||{}));
   });
 }
 // Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades.
