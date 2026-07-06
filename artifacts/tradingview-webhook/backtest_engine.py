@@ -70,7 +70,11 @@ BT_MODES = {
               "vol_high_caution": 1.6, "vol_high_block": 2.5,
               "vol_quiet_caution": 0.55, "vol_quiet_block": 0.35,
               "rvol_confirm": 1.5, "near_pct": 0.006, "extended_pct": 0.016},
-    "SWING": {"stop_mult": 1.5, "stop_mult_high": 2.0, "enforce_min_rr": True,
+    # SWING stop multipliers MIRROR LIVE flag-on SWING (app.py SWING_STOP_ATR_MULT 2.25 /
+    # _HIGH 2.75) so backtest SWING stop geometry stays in lock-step with production SWING
+    # (guarded by test_backtest_stop_parity). enforce_min_rr here drives the backtest's own
+    # R-based target sweep — it is NOT live's 1:4 structure target (intentionally decoupled).
+    "SWING": {"stop_mult": 2.25, "stop_mult_high": 2.75, "enforce_min_rr": True,
               "vol_high_caution": 1.8, "vol_high_block": 3.0,
               "vol_quiet_caution": 0.50, "vol_quiet_block": 0.30,
               "rvol_confirm": 1.5, "near_pct": 0.005, "extended_pct": 0.010},

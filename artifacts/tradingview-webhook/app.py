@@ -822,6 +822,11 @@ MODES = {
         # value. Mirrored here only so a shared cfg() read never KeyErrors.
         "SWING_HTF_ENABLED":                  False,
         "SWING_MIN_RR":                       2.0,
+        # SWING-only WIDER ATR-stop multipliers (flag-on SWING). Inert mirror in SCALP —
+        # read only under _swing_htf_enabled() (False here) — present so a shared cfg()
+        # read never KeyErrors.
+        "SWING_STOP_ATR_MULT":                1.5,
+        "SWING_STOP_ATR_MULT_HIGH":           2.0,
         "SWING_REVIEW_INTERVAL_MIN":          15,
         "SWING_REQUIRE_1H_4H_ALIGN":          True,
         "SWING_REQUIRE_DAILY_LEVEL":          True,
@@ -879,12 +884,21 @@ MODES = {
         "WATCH_ARMED_COOLDOWN_SEC": 900,
         # SWING keeps the original strict "TP2 must be >= 1:2 R:R or no trade" veto.
         "ENFORCE_MIN_RR":           True,
-        # SWING keeps the historical stop multipliers (1.5 normal / 2.0 elevated), the
-        # original $100 per-trade ceiling and the 5-min READY cadence. These keys exist
-        # only so the mode-aware readers resolve to SWING's pre-existing behaviour.
+        # LEGACY / flag-off SWING keeps the historical stop multipliers (1.5 normal /
+        # 2.0 elevated) — read ONLY when _swing_htf_enabled() is False (the
+        # SWING_HTF_ENABLED=0 kill-switch / flag-off golden), so flipping the kill-switch
+        # fully restores legacy SWING stop geometry. The 5-min READY cadence is shared.
         "STOP_ATR_MULT":            1.5,
         "STOP_ATR_MULT_HIGH":       2.0,
-        "MAX_RISK_DOLLARS":         100,
+        # Flag-on (LIVE) SWING uses WIDER ATR stops — 2.25x normal / 2.75x elevated —
+        # selected in _dynamic_stop_plan via _swing_htf_enabled(). Sized so all four
+        # instruments stay tradeable under the $250 per-trade risk ceiling below.
+        "SWING_STOP_ATR_MULT":      2.25,
+        "SWING_STOP_ATR_MULT_HIGH": 2.75,
+        # $250 per-trade dollar ceiling (raised from $100; env MAX_RISK_DOLLARS_PER_TRADE
+        # still overrides). Caps sizing — an over-cap single-contract setup is SKIPPED,
+        # never forced through past the cap.
+        "MAX_RISK_DOLLARS":         250,
         "TRADE_READY_INTERVAL_SEC": 300,
         "RISK_MULT_EARLY":          1.0,
         # ── SCALP dynamic-exit overhaul knobs — INERT in SWING ────────────────────
@@ -917,10 +931,10 @@ MODES = {
         # _swing_htf_enabled(); with the flag OFF behavior is byte-identical to
         # legacy SWING.
         "SWING_HTF_ENABLED":                  True,
-        # >=1:2 RR (no forced 1:1); 15-min thesis-review cadence; 1H/4H alignment +
+        # >=1:4 RR (no forced 1:1); 15-min thesis-review cadence; 1H/4H alignment +
         # daily-level entry gates; inbound chart-push grace window; per-TF staleness
         # (fail-closed when exceeded); valid-pullback tolerance (in ATR multiples).
-        "SWING_MIN_RR":                       2.0,
+        "SWING_MIN_RR":                       4.0,
         "SWING_REVIEW_INTERVAL_MIN":          15,
         "SWING_REQUIRE_1H_4H_ALIGN":          True,
         "SWING_REQUIRE_DAILY_LEVEL":          True,
@@ -1334,11 +1348,13 @@ ASSETS = {
         "profiles":     {"Conservative": 0.005, "Standard": 0.010},
         "index_confirm": True,                 # MES participates in cross-market index confirmation
         # Per-asset safety policy SEED (the runtime EMERGENCY_DISABLED map is seeded
-        # from this on every boot). MES/MYM ship emergency-disabled until the operator
-        # explicitly arms them; all other limits fall back to SAFETY_DEFAULTS (legacy
-        # globals). All keys: maxTradesPerDay, maxContracts, maxDailyLoss, maxOpenTrades,
-        # cooldownAfterLoss, cooldownAfterWin, emergencyDisable.
-        "safety": {"emergencyDisable": True},
+        # from this on every boot). MES/MYM are now ARMED (no emergency-disable seed) —
+        # they still require per-instrument AUTO arming after each restart/publish AND
+        # TradingView actually streaming their alerts before they trade. All other limits
+        # fall back to SAFETY_DEFAULTS (legacy globals). All keys: maxTradesPerDay,
+        # maxContracts, maxDailyLoss, maxOpenTrades, cooldownAfterLoss, cooldownAfterWin,
+        # emergencyDisable.
+        "safety": {},
         "specs": {
             # CME Micro E-mini S&P 500: $5/point, 0.25 tick. tp1/2/3 are vestigial
             # display fallbacks (live plans compute their own 1:1 targets).
@@ -1365,9 +1381,9 @@ ASSETS = {
         "account_size": 100_000,               # mirrors MNQ (index micro); per-asset risk tuning later
         "profiles":     {"Conservative": 0.005, "Standard": 0.010},
         "index_confirm": True,                 # MYM participates in cross-market index confirmation
-        # Per-asset safety policy SEED — see MES above. MYM ships emergency-disabled
-        # until the operator arms it; other limits fall back to SAFETY_DEFAULTS.
-        "safety": {"emergencyDisable": True},
+        # Per-asset safety policy SEED — see MES above. MYM is now ARMED (no
+        # emergency-disable seed); other limits fall back to SAFETY_DEFAULTS.
+        "safety": {},
         "specs": {
             # CME Micro E-mini Dow: $0.50/point, 1.0 tick. tp1/2/3 are vestigial
             # display fallbacks (live plans compute their own 1:1 targets).
@@ -1626,11 +1642,11 @@ TRADERSPOST_MAX_CONTRACTS = max(1, int(os.environ.get("TRADERSPOST_MAX_CONTRACTS
 # Absolute per-trade risk ceiling (USD). BOTH the displayed sizing and the (only)
 # money-moving path cap risk at this; a setup whose SINGLE-contract risk already
 # exceeds it (stop too wide for the account) is SKIPPED, never forced through at one
-# contract over the cap. Mode-aware: SCALP $50 / SWING $100 on the $50k account; env
+# contract over the cap. Mode-aware: SCALP $50 / SWING $250 on the $50k account; env
 # MAX_RISK_DOLLARS_PER_TRADE overrides both.
 def max_risk_cap():
     """Absolute per-trade risk ceiling (USD). Env MAX_RISK_DOLLARS_PER_TRADE wins;
-    otherwise the active mode's MAX_RISK_DOLLARS (SCALP 50 / SWING 100). BOTH the
+    otherwise the active mode's MAX_RISK_DOLLARS (SCALP 50 / SWING 250). BOTH the
     displayed sizing and the money path read this, so they never diverge."""
     _env = os.environ.get("MAX_RISK_DOLLARS_PER_TRADE")
     if _env is not None:
@@ -5825,6 +5841,60 @@ def _nearest_levels(price, levels):
     return support, resistance
 
 
+def _swing_rr_target(direction, entry, risk, min_rr, levels, tick):
+    """Structure-anchored SWING target at >= SWING_MIN_RR.
+
+    Scans the SAME daily key levels as _nearest_levels (prior day H/L/C, swing
+    highs/lows, operator-pushed chart levels) and returns the NEAREST OPPOSING level
+    that sits at least `min_rr * risk` beyond entry — i.e. the first REAL structure
+    that clears the R:R minimum, never an empty-space target. Each level is snapped
+    onto the tick grid first, and the reward is derived FROM the snapped price so the
+    displayed R:R and the broker price can never drift. Returns
+    (take_profit, label, rr_ratio) or None when no opposing level clears the minimum.
+
+    Faithful to the historical 'target the opposing HTF level' design, but scanning
+    ALL levels (not only the single nearest) so a 1:4 minimum still finds a valid
+    deeper target instead of dropping almost every SWING setup to no-trade.
+    """
+    try:
+        if not levels or entry is None or risk is None or float(risk) <= 0:
+            return None
+        need = float(min_rr) * float(risk)
+    except (TypeError, ValueError):
+        return None
+    candidates = []
+    for key in ("prior_high", "prior_low", "prior_close"):
+        v = levels.get(key)
+        if v is not None:
+            candidates.append((v, {"prior_high": "Prior day high",
+                                   "prior_low": "Prior day low",
+                                   "prior_close": "Prior day close"}[key]))
+    for v in levels.get("swing_highs", []):
+        candidates.append((v, "Swing high (buy-side liquidity)"))
+    for v in levels.get("swing_lows", []):
+        candidates.append((v, "Swing low (sell-side liquidity)"))
+    for v in levels.get("chart_levels", []):
+        candidates.append((v, "Operator-pushed level"))
+    best = None
+    for v, label in candidates:
+        try:
+            snapped = round(round(float(v) / tick) * tick, 10) if tick else float(v)
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        reward = (snapped - entry) if direction == "Long" else (entry - snapped)
+        if reward < need:      # wrong side (reward<=0) OR too close (< min_rr) — skip
+            continue
+        if best is None or reward < best[2]:
+            best = (snapped, label, reward)
+    if best is None:
+        return None
+    take_profit, label, reward = best
+    try:
+        return take_profit, label, (reward / float(risk))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def compute_swing_context(instrument, price):
     """PURE, FAIL-OPEN read of the current SWING higher-timeframe context for an
     instrument. Returns a STABLE schema regardless of data availability so every
@@ -7542,10 +7612,14 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
     #    can tighten its stops while SWING keeps the historical 1.5 / 2.0. ──
     regime = vol.get("regime")
     mode   = (mode or TRADING_MODE)
-    if regime in ("HIGH_CAUTION", "HIGH_BLOCK"):
-        mult = float(cfg_for(mode, "STOP_ATR_MULT_HIGH"))
+    _high  = regime in ("HIGH_CAUTION", "HIGH_BLOCK")
+    # Flag-on (LIVE) SWING uses the WIDER SWING_STOP_ATR_MULT[_HIGH]; SCALP and flag-off
+    # SWING (the SWING_HTF_ENABLED=0 kill-switch) keep the legacy STOP_ATR_MULT[_HIGH],
+    # so the flag-off SWING + SCALP goldens stay byte-identical.
+    if _swing_htf_enabled(mode):
+        mult = float(cfg_for(mode, "SWING_STOP_ATR_MULT_HIGH" if _high else "SWING_STOP_ATR_MULT"))
     else:
-        mult = float(cfg_for(mode, "STOP_ATR_MULT"))
+        mult = float(cfg_for(mode, "STOP_ATR_MULT_HIGH" if _high else "STOP_ATR_MULT"))
 
     atr_dist = atr * mult
     if direction == "Long":
@@ -7728,24 +7802,27 @@ def build_strict_trade_plan(direction, ticker, current_price,
         if anchored_on_vwap:
             return no_plan("SWING requires a trade-side supply/demand zone (no VWAP-only entry).")
         min_rr = float(cfg_for(mode, "SWING_MIN_RR"))
-        _lvl = (swing_context.get("nearest_resistance") if direction == "Long"
-                else swing_context.get("nearest_support"))
-        if not _lvl or _lvl.get("value") is None:
-            return no_plan("SWING target unavailable — no opposing higher-timeframe level.")
-        # Snap the HTF target onto the tick grid, then derive reward FROM the snapped
-        # value so the displayed R:R and the broker price can never drift.
-        take_profit = round(round(float(_lvl["value"]) / tick) * tick, 10)
+        # Structure-anchored SWING target at >= SWING_MIN_RR: scan ALL opposing daily
+        # key levels and take the NEAREST one sitting >= min_rr*risk beyond entry (the
+        # first REAL structure that clears the minimum — never an empty-space target).
+        # Targeting only the single nearest opposing level (the legacy behaviour) almost
+        # never cleared a 1:4 minimum, which would drop nearly every SWING setup to
+        # no-trade; scanning finds a valid deeper target when one exists.
+        _tgt = _swing_rr_target(direction, entry, risk, min_rr,
+                                (swing_context.get("daily_levels") or {}), tick)
+        if _tgt is None:
+            _near = (swing_context.get("nearest_resistance") if direction == "Long"
+                     else swing_context.get("nearest_support"))
+            if not _near or _near.get("value") is None:
+                return no_plan("SWING target unavailable — no opposing higher-timeframe level.")
+            return no_plan(f"SWING target too close — no opposing higher-timeframe "
+                           f"level sits {min_rr:.0f}:1 beyond entry.")
+        take_profit, swing_target_label, rr_ratio = _tgt
+        # Derive reward FROM the snapped take-profit so the displayed R:R and the broker
+        # price can never drift.
         reward = (take_profit - entry) if direction == "Long" else (entry - take_profit)
-        if reward <= 0:
-            return no_plan("SWING target level is on the wrong side of entry.")
-        rr_ratio = reward / risk
-        if rr_ratio < min_rr:
-            return no_plan(
-                f"SWING target too close — {rr_ratio:.2f}:1 to the "
-                f"{_lvl.get('label', 'HTF level')}, below the {min_rr:.0f}:1 minimum.")
         rr_num_val = round(rr_ratio, 2)
         rr_str = f"{rr_num_val:g}:1"
-        swing_target_label = _lvl.get("label")
     else:
         # SCALP 1:2 reward upgrade (T3, flag-gated default ON). _scalp_primary_rr returns
         # None on the legacy path (flag off OR non-SCALP, incl. flag-off SWING) so the

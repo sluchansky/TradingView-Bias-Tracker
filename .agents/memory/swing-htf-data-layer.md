@@ -11,8 +11,15 @@ timeframe (1H/4H/Daily) confirmation. The data layer that feeds it is
 veto + target geometry) is the thing that fails **CLOSED**. Keep that split.
 
 ## Master gate
-- Single helper `_swing_htf_enabled(mode=None)` = TRADING_MODE is SWING **and**
-  cfg("SWING_HTF_ENABLED") **and** env kill-switch `SWING_HTF_ENABLED` != "0".
+- Single helper `_swing_htf_enabled(mode=None)` = the mode (given ARG else global
+  TRADING_MODE) is SWING **and** cfg("SWING_HTF_ENABLED") **and** env kill-switch
+  `SWING_HTF_ENABLED` != "0".
+- **Gotcha (cost test-debugging time):** it keys off the PASSED `mode` arg, so
+  `_swing_htf_enabled("SWING")` returns True even when global `TRADING_MODE`
+  defaults to SCALP (dev/tests). Any unit test calling `_dynamic_stop_plan(...,
+  mode="SWING")` therefore exercises FLAG-ON SWING geometry (2.25× stops), NOT
+  legacy — the flag-off legacy path is only reachable via the `SWING_HTF_ENABLED=0`
+  kill-switch (what the flag-off golden sets).
 - EVERY piece of new SWING behavior is gated on this. SCALP and flag-off SWING
   must be byte-identical to legacy — proven by the goldens (see below).
 
@@ -80,7 +87,7 @@ veto + target geometry) is the thing that fails **CLOSED**. Keep that split.
   and rebuilds from scratch (chart_levels naturally drop) — same as VWAP.
 - SCALP / flag-off: `_ingest_htf_overlay` returns before any write (byte-identical).
 
-## P4 money path: entry veto + ≥2R target geometry
+## P4 money path: entry veto + 1:4 (≥SWING_MIN_RR) target geometry
 - One read, many consumers: `full_analysis` computes the swing context ONCE
   (flag-on only, try/except→None) and threads the SAME object into the main plan
   builder, the preview builder, the entry veto, and the display attach. Never
@@ -90,10 +97,15 @@ veto + target geometry) is the thing that fails **CLOSED**. Keep that split.
   (missing ctx/plan → veto) and lives at the full_analysis seam right AFTER the
   SCALP veto block, mirroring it. Vetoed → WAIT + precise reason + drop plan.
 - Target geometry: `build_strict_trade_plan(..., swing_context=...)`. Flag-on
-  SWING replaces fixed-1:1 with the nearest opposing HTF level (resistance for
-  Long / support for Short, snapped to tick) and REJECTS (no_plan) when context
-  is missing, VWAP-only, wrong-side, or rr < `SWING_MIN_RR`. SCALP/flag-off keep
-  fixed-1:1 byte-identical.
+  SWING replaces fixed-1:1 with `_swing_rr_target()` — it scans ALL `daily_levels`
+  for the NEAREST opposing level (resistance for Long / support for Short) whose
+  tick-SNAPPED reward is ≥ `SWING_MIN_RR` × risk (now **4.0** → 1:4), derives
+  reward/`rr_num`/`rr` from the SNAPPED price (so display == broker), and fails
+  SAFE to None → no_plan. REJECTS (no_plan) when context is missing, VWAP-only,
+  wrong-side, or no qualifying level exists. Paired with the WIDE stop (2.25× ATR),
+  a 1:4 target needs a daily level ~9× ATR out, so **fewer, higher-quality SWING
+  setups are expected — "quiet" is correct, not broken** (read `swing_diagnostics`
+  to tell them apart). SCALP/flag-off keep fixed-1:1 byte-identical.
 - **ORB-override hazard (non-obvious, cost a review cycle):** the one sanctioned
   exception to 1:1 — `_apply_orb_target_override` (rewrites a ready ORB plan to
   ~1:4) — is mode-agnostic and runs AFTER the SWING veto, so it WILL clobber a

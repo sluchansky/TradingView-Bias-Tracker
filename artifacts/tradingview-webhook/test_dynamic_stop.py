@@ -9,10 +9,10 @@ MGC/MNQ/MES/MYM symmetry, risk-dollar math, ATR-unavailable -> no plan (WAIT), a
 FIXED 1:1 R:R model (every plan is exactly 1:1; the legacy "<1:2 on TP2 -> no trade"
 veto no longer fires in either mode — ENFORCE_MIN_RR is retained config but unused).
 
-Mode profiles under test (SCALP is the retuned "cut losers fast" profile; SWING is
-unchanged / byte-for-byte):
+Mode profiles under test (SCALP is the retuned "cut losers fast" profile; SWING now uses
+WIDER flag-on ATR stops — the legacy 1.5/2.0 is exercised by the flag-off SWING golden):
   • SCALP: multiplier 1.5 / 2.0; per-instrument min-stop FLOOR (MGC 3 / MNQ 12 / MES 3 / MYM 20 pts) — too-tight stops WIDENED.
-  • SWING: multiplier 1.5  / 2.0 ; MGC 5 pts/50t; MNQ 20 pts/40t; MES 4 pts/16t; MYM 30 pts/30t (reject).
+  • SWING: multiplier 2.25 / 2.75 (flag-on); MGC 5 pts/50t; MNQ 20 pts/40t; MES 4 pts/16t; MYM 30 pts/30t (reject).
 
 Runnable two ways:
   • pytest test_dynamic_stop.py
@@ -59,9 +59,10 @@ def test_atr_zero_or_negative_rejected():
 
 def test_multiplier_volatility_wins_over_mode():
     # Elevated regime forces the mode's HIGH multiplier (volatility wins over mode):
-    # SCALP 2.0, SWING 2.0 — each larger than that mode's base multiplier. (atr=10
-    # keeps the resulting stop above both modes' MGC minimums so it isn't widened/rejected.)
-    expected = {"SCALP": 2.0, "SWING": 2.0}
+    # SCALP 2.0 (legacy), SWING 2.75 (flag-on WIDE stops) — each larger than that mode's
+    # base multiplier. (atr=10 keeps the resulting stop above both modes' MGC minimums so
+    # it isn't widened/rejected.)
+    expected = {"SCALP": 2.0, "SWING": 2.75}
     for regime in ("HIGH_CAUTION", "HIGH_BLOCK"):
         for mode in ("SCALP", "SWING"):
             r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
@@ -77,11 +78,12 @@ def test_multiplier_scalp_normal_is_1_5():
     assert r["multiplier"] == 1.5
 
 
-def test_multiplier_swing_normal_is_1_5():
+def test_multiplier_swing_normal_is_2_25():
+    # Flag-on SWING uses WIDER ATR stops (SWING_STOP_ATR_MULT 2.25) vs the legacy 1.5.
     r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                _vol(atr=10.0, regime="NORMAL"), "SWING")
     assert r["ok"] is True
-    assert r["multiplier"] == 1.5
+    assert r["multiplier"] == 2.25
 
 
 def test_structure_wider_than_atr_wins_long():
@@ -215,15 +217,16 @@ def test_symmetry_specs_mgc_mnq():
     assert (rq["min_stop_ticks"], rq["tick_size"]) == (48, 0.25)
 
 
-def test_swing_specs_unchanged():
-    # SWING parity guard (must stay byte-for-byte): MGC 50-tick floor, MNQ 40-tick
-    # floor, base multiplier 1.5. ATRs chosen to clear each SWING minimum.
+def test_swing_specs_wide_stops():
+    # Flag-on SWING geometry: MGC 50-tick floor, MNQ 40-tick floor (UNCHANGED), base
+    # multiplier now 2.25 (WIDE stops — was 1.5 legacy). ATRs chosen to clear each SWING
+    # minimum. (The legacy 1.5x is exercised by the flag-off SWING golden, not here.)
     rg = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                 _vol(atr=10.0), "SWING")
     rq = app._dynamic_stop_plan("Long", 20000.0, None, None, "MNQ",
                                 _vol(atr=30.0), "SWING")
-    assert (rg["min_stop_ticks"], rg["multiplier"]) == (50, 1.5)
-    assert (rq["min_stop_ticks"], rq["multiplier"]) == (40, 1.5)
+    assert (rg["min_stop_ticks"], rg["multiplier"]) == (50, 2.25)
+    assert (rq["min_stop_ticks"], rq["multiplier"]) == (40, 2.25)
 
 
 def test_risk_dollars_uses_point_value():
@@ -284,13 +287,14 @@ def test_symmetry_specs_mes_mym():
 
 
 def test_swing_specs_mes_mym():
-    # SWING floor metadata: MES 16-tick / MYM 30-tick, base multiplier 1.5.
+    # SWING floor metadata: MES 16-tick / MYM 30-tick (UNCHANGED); base multiplier now
+    # 2.25 (flag-on WIDE stops — was 1.5 legacy).
     rm = app._dynamic_stop_plan("Long", 5800.0, None, None, "MES",
                                 _vol(atr=10.0), "SWING")
     ry = app._dynamic_stop_plan("Long", 43000.0, None, None, "MYM",
                                 _vol(atr=30.0), "SWING")
-    assert (rm["min_stop_ticks"], rm["multiplier"]) == (16, 1.5)
-    assert (ry["min_stop_ticks"], ry["multiplier"]) == (30, 1.5)
+    assert (rm["min_stop_ticks"], rm["multiplier"]) == (16, 2.25)
+    assert (ry["min_stop_ticks"], ry["multiplier"]) == (30, 2.25)
 
 
 def test_risk_dollars_uses_point_value_mes_mym():

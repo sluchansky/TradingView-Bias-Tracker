@@ -1,11 +1,16 @@
 ---
 name: Fixed 1:1 R:R trade-plan model
-description: All live trade plans use a fixed 1:1 risk:reward; the tick-grid serialization + stop-side direction invariants that keep it exact through the broker gateway.
+description: Per-mode R:R model (flag-on SWING 1:4 wide-stop, SCALP 1:2, flag-off SWING legacy 1:1, ORB 1:4); the tick-grid serialization + stop-side direction invariants that keep every plan exact through the broker gateway.
 ---
 
-# R:R trade-plan model (SWING 1:1, SCALP default 1:2)
+# R:R trade-plan model (flag-on SWING 1:4 wide-stop, SCALP default 1:2)
 
-**SWING** live plans are **fixed 1:1 R:R**. **SCALP** now defaults to **1:2** via
+**SWING is MODE-SPLIT by the HTF flag.** Flag-ON SWING (production runs `TRADING_MODE=SWING`)
+targets **1:4** via a daily-structure scan (`_swing_rr_target`, see swing-htf-data-layer.md P4)
+with **WIDE stops (2.25× ATR base / 2.75× elevated, `SWING_STOP_ATR_MULT`/`_HIGH`)**,
+`SWING_MIN_RR=4.0`, and a **$250** per-trade risk cap. Flag-OFF SWING (env `SWING_HTF_ENABLED=0`
+kill-switch, and dev which defaults to SCALP) stays **legacy 1:1 R:R with 1.5×/2.0× stops and the
+$100 cap** — the immutable flag-off golden. **SCALP** now defaults to **1:2** via
 `SCALP_RR2_ENABLED` (default ON, live-loss-reduction): the SCALP primary target/reward/
 `rr_num`/`rr` and the staged management exits (TP1 2R, TP2 2.5R, runner 3R) all scale in
 lockstep through shared helpers `_scalp_primary_rr` / `_scalp_rr_targets`, and the entry veto
@@ -25,7 +30,9 @@ A hardcoded "R:R 1:1 · Expected Profit $risk" Discord-card line silently mislab
 The minimum-distance guard in `_dynamic_stop_plan` is mode-split — and the two modes resolve a
 too-tight stop in **opposite** directions:
 - **SWING** still HARD-REJECTS (no trade) when the calculated stop is below `min_stop_pts`
-  (MGC<5 / MNQ<20 pts, env-tunable via `*_MIN_STOP_PTS`). Byte-for-byte unchanged.
+  (MGC<5 / MNQ<20 / MES<4 / MYM<30 pts, env-tunable via `*_MIN_STOP_PTS`). The reject LOGIC is
+  unchanged; only the ATR multiplier feeding the distance widened for **flag-on** SWING
+  (2.25×/2.75× via `SWING_STOP_ATR_MULT`). Flag-off SWING keeps 1.5×/2.0× (byte-identical golden).
 - **SCALP** now **WIDENS** a too-tight stop UP to a per-instrument floor instead of rejecting it:
   if `scalp_min_stop_pts > 0` and the raw distance < floor, SCALP sets distance = floor, recomputes
   the stop (entry − dist for Long, entry + dist for Short), then ceil-snaps to the tick grid and
@@ -40,7 +47,10 @@ SCALP setup tradeable while guaranteeing a survivable stop; risk/size still flow
 wider) distance so exact 1:1 holds. Floors stay non-env-tunable so a stale legacy
 `*_SCALP_MIN_STOP_*` secret can never silently change them in the live prop account.
 **How to apply:** any stop change — live OR the copied backtest `bt_stop_plan` — must keep this
-split (SWING reject, SCALP widen-to-floor) AND keep live/backtest parity (see backtest-engine.md).
+split (SWING reject, SCALP widen-to-floor) AND keep live/backtest STOP parity (the parity test
+checks STOP geometry ONLY — mult/ticks/risk/stop price; backtest TARGETS are an intentionally-
+decoupled R-based sweep, `BT_MODES[mode]["stop_mult"]` must match live `SWING_STOP_ATR_MULT`, see
+backtest-engine.md).
 Do NOT "restore" the old SCALP no-minimum behavior, and do NOT re-add an env read for the SCALP
 floor. SCALP rejections are still only: invalid/missing stop, wrong side of entry, zero/negative
 distance, size>risk cap (sizing/gateway), zone consumed/mitigated.
@@ -62,14 +72,20 @@ broker order AND in local tracking — gateway parses `target1`; `_maybe_auto_ex
 `plan.takeProfit`; both local ENTER paths re-derive `t1 = entry ± rr_num*risk` (rr_num lifted from
 the plan, default 1.0). Non-ORB is byte-identical 1:1 because base plan emits `rr_num=1.0`.
 
-## $100/trade risk ceiling ($50,000 account)
-`MAX_RISK_DOLLARS_PER_TRADE` (default 100, env-overridable) is a CEILING — clamp DOWN only, never
-up. Pure helper `_risk_capped_contracts(stop_dist, point_value, account, risk_pct)`:
-`budget = min(account*pct, hard_cap)`, `contracts = budget // (stop_dist*pv)`, clamped to broker
-max; `over_cap` true when result < 1 (one contract already risks > $100 → stop too wide).
+## Per-trade risk ceiling — MODE-SPLIT (SCALP $50 / flag-on SWING $250), $50,000 account
+`max_risk_cap()` resolves the ceiling: env `MAX_RISK_DOLLARS_PER_TRADE` WINS if set, else the active
+mode's profile `MAX_RISK_DOLLARS` (SCALP 50 / SWING 250 — SWING raised from 100). It is a CEILING —
+clamp DOWN only, never up. **Operator gotcha:** a stale `MAX_RISK_DOLLARS_PER_TRADE` env/secret
+silently overrides BOTH modes, making the SWING $250 raise dead config — verify that env is UNSET in
+prod after this kind of change. Pure helper `_risk_capped_contracts(stop_dist, point_value, account,
+risk_pct)`: `budget = min(account*pct, max_risk_cap())`, `contracts = budget // (stop_dist*pv)`,
+clamped to broker max; `over_cap` true when result < 1 (one contract already risks > the cap → stop
+too wide — expect this MORE often now that flag-on SWING stops are 2.25× ATR).
 `execute_trade_gateway` (the single money choke for BOTH manual `/traderspost` and
 `_maybe_auto_execute`) returns **409 SKIP** when over_cap — it NEVER silently sends 1 contract over
 the ceiling. `calculate_position_sizing` exposes `over_risk_cap/risk_cap/note` and shows 0 honestly.
+The display-only Trade Idea Review uses a parallel `_review_user_risk_cap(mode)` (same env override,
+own fallback) — keep it in sync if the profile cap changes.
 
 ## Invariant 1 — serialize EVERY plan price with `:.2f`, never `:.1f`
 **Why:** MNQ tick is **0.25**. `:.1f` rounds a valid quarter-tick (e.g. `30022.75`) to
