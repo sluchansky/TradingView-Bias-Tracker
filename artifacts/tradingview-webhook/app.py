@@ -500,7 +500,15 @@ STRUCTURE_REVERSAL_DEMOTE_ENABLED = _env_flag_on("STRUCTURE_REVERSAL_DEMOTE_ENAB
 # T3 — SCALP 1:2 reward upgrade: lift the SCALP primary/first target from 1R to 2R,
 #      with the staged exit multiples moving in lockstep (TP2 2.5R, runner 3R) so the
 #      broker TP, management geometry, dashboard quality and entry veto all agree.
-SCALP_RR2_ENABLED   = _env_flag_on("SCALP_RR2_ENABLED")
+#      DEFAULT OFF (2025 revert): the LIVE broker order is a SINGLE bracket (one entry,
+#      one -1R stop, one take-profit) — the staged ladder + delayed break-even only run
+#      in the local/paper sim, NOT on the real account (unless the 2-contract LIVE_RUNNER
+#      is armed). With the upgrade ON the single real target sat at 2R (~3x ATR) behind a
+#      -1R stop with no break-even until +2R, so almost every trade that went green then
+#      pulled back booked a FULL stop-out. Reverting the SCALP primary to a reachable 1R
+#      (this default) restores the pre-upgrade design where the single broker target is
+#      hit far more often. Set SCALP_RR2_ENABLED=1 to restore the 2R/2.5R/3R ladder.
+SCALP_RR2_ENABLED   = _env_flag_on("SCALP_RR2_ENABLED", default_on=False)
 SCALP_RR2_PRIMARY_R = _env_float("SCALP_RR2_PRIMARY_R", 2.0)
 SCALP_RR2_TP2_R     = _env_float("SCALP_RR2_TP2_R", 2.5)
 SCALP_RR2_RUNNER_R  = _env_float("SCALP_RR2_RUNNER_R", 3.0)
@@ -7829,11 +7837,13 @@ def build_strict_trade_plan(direction, ticker, current_price,
         rr_num_val = round(rr_ratio, 2)
         rr_str = f"{rr_num_val:g}:1"
     else:
-        # SCALP 1:2 reward upgrade (T3, flag-gated default ON). _scalp_primary_rr returns
-        # None on the legacy path (flag off OR non-SCALP, incl. flag-off SWING) so the
+        # SCALP 1:2 reward upgrade (T3, flag-gated DEFAULT OFF — reverted; see the
+        # SCALP_RR2_ENABLED block above). _scalp_primary_rr returns None on the legacy
+        # path (flag off [now the default] OR non-SCALP, incl. flag-off SWING) so the
         # exact 1:1 literals below are preserved byte-identically; it returns the primary
-        # R (default 2.0) for SCALP when armed. The ORB 1:4 override downstream recomputes
-        # its target purely from risk, so a 2R base never leaks into it.
+        # R (default 2.0) for SCALP only when SCALP_RR2_ENABLED=1 is set. The ORB 1:4
+        # override downstream recomputes its target purely from risk, so a 2R base (when
+        # armed) never leaks into it.
         _rr2_pr = _scalp_primary_rr(mode)
         if _rr2_pr is None:
             take_profit = (entry + risk) if direction == "Long" else (entry - risk)

@@ -1,9 +1,9 @@
 ---
 name: Per-mode R:R trade-plan model
-description: Per-mode R:R model (flag-on SWING 1:3 wide-stop, SCALP 1:2, flag-off SWING legacy 1:1, ORB 1:4); the tick-grid serialization + stop-side direction invariants that keep every plan exact through the broker gateway.
+description: Per-mode R:R model (flag-on SWING 1:3 wide-stop, SCALP default 1:1 (2R upgrade default-OFF), flag-off SWING legacy 1:1, ORB 1:4); the tick-grid serialization + stop-side direction invariants that keep every plan exact through the broker gateway.
 ---
 
-# R:R trade-plan model (flag-on SWING 1:3 wide-stop, SCALP default 1:2)
+# R:R trade-plan model (flag-on SWING 1:3 wide-stop, SCALP default 1:1 — 2R upgrade OFF)
 
 **SWING is MODE-SPLIT by the HTF flag.** Flag-ON SWING (production runs `TRADING_MODE=SWING`)
 targets **1:3** via a daily-structure scan (`_swing_rr_target`, see swing-htf-data-layer.md P4)
@@ -13,13 +13,21 @@ trade-frequency lever** (lowered 4.0→3.0 to lift trade count while keeping big
 intraday-or-longer holds — at 1:4 the daily target sits ~9×ATR out and rarely qualifies, at
 1:3 ~6.75×ATR). Flag-OFF SWING (env `SWING_HTF_ENABLED=0`
 kill-switch, and dev which defaults to SCALP) stays **legacy 1:1 R:R with 1.5×/2.0× stops and the
-$100 cap** — the immutable flag-off golden. **SCALP** now defaults to **1:2** via
-`SCALP_RR2_ENABLED` (default ON, live-loss-reduction): the SCALP primary target/reward/
-`rr_num`/`rr` and the staged management exits (TP1 2R, TP2 2.5R, runner 3R) all scale in
-lockstep through shared helpers `_scalp_primary_rr` / `_scalp_rr_targets`, and the entry veto
-`loss_le_first_target` uses the same helper so the geometry stays coherent. Env kill-switch
-`SCALP_RR2_ENABLED=0` restores legacy SCALP 1:1 (TP1 1R / TP2 1.5R) — which is why the SCALP
-golden pins the flag OFF and stays byte-identical. The older tiered TP1/TP2/TP3 ladder is
+$100 cap** — the immutable flag-off golden. **SCALP** defaults to **1:1** — the
+`SCALP_RR2_ENABLED` 1:2 upgrade is **DEFAULT OFF** (reverted).
+**Why the revert:** the LIVE broker order is a SINGLE bracket (one entry, one −1R stop, one
+take-profit). The staged TP1/TP2/runner ladder + delayed break-even (`_maybe_move_be_to_entry`)
+only run in the LOCAL/paper sim, NOT on the real account — unless the 2-contract `LIVE_RUNNER`
+(be_2r) is armed. So with the upgrade ON, the single REAL target sat at **2R (~3× ATR)** behind a
+−1R stop with **no break-even until +2R**; almost every trade that went green then pulled back
+booked a FULL stop-out (user report: "stopped out of almost every trade, some 95-100% ready" —
+95% is CONFIDENCE, not entry location). Reverting the SCALP primary to a reachable **1R** makes the
+single broker target hit far more often. Helpers unchanged: `_scalp_primary_rr` returns None when
+OFF (→ 1R literals), `_scalp_rr_targets` returns cfg `(1.0, 1.5, 2.0)` for the local sim (BE after
+TP1 = 1R); the `loss_le_first_target` entry veto reads the same helper so geometry stays coherent.
+Env `SCALP_RR2_ENABLED=1` restores the 2R/2.5R/3R ladder. A single-contract "bank-half + runner"
+is IMPOSSIBLE — it needs ≥2 contracts via `LIVE_RUNNER` be_2r (~2× risk), a separate opt-in. The
+SCALP golden pins the flag OFF, so this default is byte-identical to it. The older tiered TP1/TP2/TP3 ladder is
 retired for the *plan*. The sanctioned ORB 1:4 exception below still overrides AFTER plan
 construction (SCALP or SWING). Stop is computed first (ATR/structure/zone), snapped UP to whole
 ticks; `RiskDistance = abs(entry - stop)`; legacy `TP = entry ± RiskDistance`.
