@@ -1,14 +1,17 @@
 ---
-name: Fixed 1:1 R:R trade-plan model
-description: Per-mode R:R model (flag-on SWING 1:4 wide-stop, SCALP 1:2, flag-off SWING legacy 1:1, ORB 1:4); the tick-grid serialization + stop-side direction invariants that keep every plan exact through the broker gateway.
+name: Per-mode R:R trade-plan model
+description: Per-mode R:R model (flag-on SWING 1:3 wide-stop, SCALP 1:2, flag-off SWING legacy 1:1, ORB 1:4); the tick-grid serialization + stop-side direction invariants that keep every plan exact through the broker gateway.
 ---
 
-# R:R trade-plan model (flag-on SWING 1:4 wide-stop, SCALP default 1:2)
+# R:R trade-plan model (flag-on SWING 1:3 wide-stop, SCALP default 1:2)
 
 **SWING is MODE-SPLIT by the HTF flag.** Flag-ON SWING (production runs `TRADING_MODE=SWING`)
-targets **1:4** via a daily-structure scan (`_swing_rr_target`, see swing-htf-data-layer.md P4)
+targets **1:3** via a daily-structure scan (`_swing_rr_target`, see swing-htf-data-layer.md P4)
 with **WIDE stops (2.25× ATR base / 2.75× elevated, `SWING_STOP_ATR_MULT`/`_HIGH`)**,
-`SWING_MIN_RR=4.0`, and a **$250** per-trade risk cap. Flag-OFF SWING (env `SWING_HTF_ENABLED=0`
+`SWING_MIN_RR=3.0`, and a **$250** per-trade risk cap. **`SWING_MIN_RR` is the PRIMARY
+trade-frequency lever** (lowered 4.0→3.0 to lift trade count while keeping bigger-reward,
+intraday-or-longer holds — at 1:4 the daily target sits ~9×ATR out and rarely qualifies, at
+1:3 ~6.75×ATR). Flag-OFF SWING (env `SWING_HTF_ENABLED=0`
 kill-switch, and dev which defaults to SCALP) stays **legacy 1:1 R:R with 1.5×/2.0× stops and the
 $100 cap** — the immutable flag-off golden. **SCALP** now defaults to **1:2** via
 `SCALP_RR2_ENABLED` (default ON, live-loss-reduction): the SCALP primary target/reward/

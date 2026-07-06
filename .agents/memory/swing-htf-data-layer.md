@@ -87,7 +87,7 @@ veto + target geometry) is the thing that fails **CLOSED**. Keep that split.
   and rebuilds from scratch (chart_levels naturally drop) — same as VWAP.
 - SCALP / flag-off: `_ingest_htf_overlay` returns before any write (byte-identical).
 
-## P4 money path: entry veto + 1:4 (≥SWING_MIN_RR) target geometry
+## P4 money path: entry veto + 1:3 (≥SWING_MIN_RR) target geometry
 - One read, many consumers: `full_analysis` computes the swing context ONCE
   (flag-on only, try/except→None) and threads the SAME object into the main plan
   builder, the preview builder, the entry veto, and the display attach. Never
@@ -99,13 +99,19 @@ veto + target geometry) is the thing that fails **CLOSED**. Keep that split.
 - Target geometry: `build_strict_trade_plan(..., swing_context=...)`. Flag-on
   SWING replaces fixed-1:1 with `_swing_rr_target()` — it scans ALL `daily_levels`
   for the NEAREST opposing level (resistance for Long / support for Short) whose
-  tick-SNAPPED reward is ≥ `SWING_MIN_RR` × risk (now **4.0** → 1:4), derives
+  tick-SNAPPED reward is ≥ `SWING_MIN_RR` × risk (now **3.0** → 1:3), derives
   reward/`rr_num`/`rr` from the SNAPPED price (so display == broker), and fails
   SAFE to None → no_plan. REJECTS (no_plan) when context is missing, VWAP-only,
-  wrong-side, or no qualifying level exists. Paired with the WIDE stop (2.25× ATR),
-  a 1:4 target needs a daily level ~9× ATR out, so **fewer, higher-quality SWING
-  setups are expected — "quiet" is correct, not broken** (read `swing_diagnostics`
-  to tell them apart). SCALP/flag-off keep fixed-1:1 byte-identical.
+  wrong-side, or no qualifying level exists. **`SWING_MIN_RR` is the PRIMARY
+  trade-frequency lever:** with the WIDE stop (2.25× ATR), a 1:4 target needs a daily
+  level ~9× ATR out (rare); 1:3 ~6.75× ATR. The pullback tolerance
+  `SWING_PULLBACK_ZONE_ATR` (widened 0.75→1.0) is the secondary lever — it lets
+  entries fire NEAR (not dead-on) the daily level / trade-side zone. Both preserve
+  hold-duration and reward size; loosening the READY gate (edge≥80 / zone / 1H+4H
+  align) is the aggressive lever that trades away quality. Expect **fewer, higher-
+  quality SWING setups than SCALP — "quiet" is often correct, not broken** (read
+  `swing_diagnostics` for the failed gate; if it's HTF incomplete/stale, loosening
+  RR does nothing). SCALP/flag-off keep fixed-1:1 byte-identical.
 - **ORB-override hazard (non-obvious, cost a review cycle):** the one sanctioned
   exception to 1:1 — `_apply_orb_target_override` (rewrites a ready ORB plan to
   ~1:4) — is mode-agnostic and runs AFTER the SWING veto, so it WILL clobber a
