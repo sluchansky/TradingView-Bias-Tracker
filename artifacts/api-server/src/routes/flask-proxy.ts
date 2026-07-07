@@ -106,6 +106,10 @@ export const BOT1_ROUTES = [
   "/alerts",
   "/diagnostics",
   "/diagnostics-live",
+  // Auto-Trade Settings page + its JSON API (owner-only runtime per-asset safety
+  // controls; NOT in dashboard-auth OPEN_PATHS so Basic Auth + CSRF apply).
+  "/auto-trade-settings",
+  "/safety-settings",
   "/eval-metrics",
   "/status",
   "/mode",

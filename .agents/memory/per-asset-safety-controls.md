@@ -7,7 +7,8 @@ description: How per-asset money-path safety limits layer and the fail-closed/by
 
 Per-asset execution limits (emergency kill switch, max trades/day, max contracts,
 max open trades, max daily loss, post-loss/win cooldown) layer through ONE resolver:
-`safety_cfg(inst, key)` → asset-mode override → asset default → `SAFETY_DEFAULTS`.
+`safety_cfg(inst, key)` → RUNTIME override (`SAFETY_RUNTIME`, DB-backed) →
+asset-mode override → asset default → `SAFETY_DEFAULTS`.
 Both the manual `/traderspost` path and the auto path flow through the single
 `execute_trade_gateway`, so safety is enforced once and authoritatively.
 
@@ -49,6 +50,25 @@ path and without changing MGC/MNQ behaviour.
   (`_auto_trade_count_today`, cooldown helpers). `SAFETY_LOCK` must NEVER nest under
   `AUTO_TRADE_LOCK`. Post-outcome cooldown is set OUTSIDE `AUTO_TRADE_LOCK` in the
   price watcher (STOP_HIT→loss, T1/T2→win).
+
+## Runtime overrides layer (Auto Trade Settings page)
+- `SAFETY_RUNTIME` is a per-instrument dict of validated overrides persisted in the
+  `safety_overrides` table (INSERT/SELECT only — table created via DB tool in dev,
+  Publish schema-diff in prod, NO in-app DDL). Boot load is strictly fail-OPEN
+  (DB down → registry values, `SAFETY_LOAD_FAILED` flag for display only).
+- **Readers stay lock-free:** writers replace per-instrument dicts wholesale
+  (copy-on-write) under `SAFETY_LOCK`; `safety_cfg` does a plain GIL-atomic `.get()`.
+  Never mutate a nested dict in place.
+- **POST /safety-settings is FULL-REPLACE** `{inst, overrides}` with whitelist +
+  fail-closed 400 validation (maxContracts ≤ server ceiling; null only for
+  maxOpenTrades/maxDailyLoss = unlimited). It also resyncs `EMERGENCY_DISABLED`,
+  so a save that OMITS `emergencyDisable` clears a set kill switch (fails toward
+  trading). The settings page always re-sends the switch from its snapshot —
+  raw API clients must do the same. `/auto-trade emergencyDisabled` writes through
+  to the table so the kill switch survives restarts.
+- Owner-only page `/auto-trade-settings` + `/safety-settings` follow the
+  diagnostics-live pattern and must stay on the Express proxy whitelist + behind
+  dashboard auth (never in OPEN_PATHS).
 
 **How to apply:** when touching the gateway, `_maybe_auto_execute`, `/traderspost`,
 `/auto-trade`, or the watcher outcome paths, re-run the parity harness (must be

@@ -1333,7 +1333,9 @@ ASSETS = {
         "account_size": 100_000,
         "profiles":     {"Conservative": 0.005, "Standard": 0.010},
         "index_confirm": True,                 # MNQ participates in cross-market index confirmation
-        "safety": {},
+        # Operator-raised AUTO day cap (2026-07-07): MNQ trades 10/day instead of the
+        # tight global default 5. Runtime /safety-settings overrides layer on top.
+        "safety": {"maxTradesPerDay": 10},
         "specs": {
             "tp1": 20.0, "tp2": 40.0, "tp3": 60.0, "stop_buf": 5.0, "point_value": 2.0,
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40),
@@ -2100,11 +2102,30 @@ EMERGENCY_DISABLED = {
 SAFETY_LOCK = threading.Lock()
 _OUTCOME_COOLDOWN = {}
 
+# ── Runtime safety overrides (operator-set via /safety-settings) ─────────────
+# {inst: {key: value}} — the HIGHEST layer of the safety lookup (runtime →
+# registry → defaults). Reads are LOCK-FREE: each per-inst dict is swapped
+# wholesale (copy-on-write) so a plain .get() is atomic under the GIL and
+# safety_cfg never takes a lock (it runs throughout the money path). SAFETY_LOCK
+# serializes WRITERS only and must never nest under AUTO_TRADE_LOCK. Persisted
+# in the safety_overrides table (INSERT/SELECT + own-table UPSERT — no in-app
+# DDL; table created via the DB tool in dev / Publish schema-diff in prod).
+# Loaded at boot FAIL-OPEN: a DB error keeps the TIGHT protective defaults
+# (never looser) and raises the load-failed flag surfaced on /safety-settings.
+SAFETY_RUNTIME = {}
+SAFETY_OVERRIDES_DB_READY = False
+SAFETY_OVERRIDES_LOAD_FAILED = False
+
 
 def safety_cfg(inst, key):
     """STRICT per-asset safety read for the money path. `inst` MUST be a canonical
-    registry key (callers pre-resolve). Layer: per-asset ASSETS[inst]['safety'][key]
-    -> SAFETY_DEFAULTS[key]. Unknown key -> None."""
+    registry key (callers pre-resolve). Layer: runtime override (operator-set via
+    /safety-settings) -> per-asset ASSETS[inst]['safety'][key] ->
+    SAFETY_DEFAULTS[key]. Unknown key -> None. LOCK-FREE by design (see
+    SAFETY_RUNTIME above): never add a lock here — it runs inside the money path."""
+    ro = SAFETY_RUNTIME.get(inst)
+    if ro is not None and key in ro:
+        return ro[key]
     sd = (ASSETS.get(inst) or {}).get("safety") or {}
     if key in sd:
         return sd[key]
@@ -2266,6 +2287,182 @@ def _safety_snapshot(inst):
         "cooldownRemaining": cd_rem,
         "cooldownReason":    cd_reason,
     }
+
+
+# ── Runtime safety-override validation + persistence (/safety-settings) ──────
+_SAFETY_OVERRIDE_KEYS = ("maxTradesPerDay", "maxContracts", "maxDailyLoss",
+                         "maxOpenTrades", "cooldownAfterLoss", "cooldownAfterWin",
+                         "emergencyDisable")
+_SAFETY_NULLABLE_KEYS = ("maxDailyLoss", "maxOpenTrades")
+
+
+def _validate_safety_overrides(raw):
+    """FAIL-CLOSED validation of an operator-sent overrides dict. Returns
+    (clean, None) or (None, error). Bounds are sanity ceilings; maxContracts is
+    additionally capped at the hard server ceiling (TRADERSPOST_MAX_CONTRACTS)."""
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return None, "overrides must be an object"
+    clean = {}
+    for k, v in raw.items():
+        if k not in _SAFETY_OVERRIDE_KEYS:
+            return None, "unknown key: %s" % k
+        if v is None:
+            if k in _SAFETY_NULLABLE_KEYS:
+                clean[k] = None
+                continue
+            return None, "%s cannot be null" % k
+        if k == "emergencyDisable":
+            if not isinstance(v, bool):
+                return None, "emergencyDisable must be true/false"
+            clean[k] = v
+            continue
+        if isinstance(v, bool):
+            return None, "%s must be a number" % k
+        try:
+            num = float(v)
+        except (TypeError, ValueError):
+            return None, "%s must be a number" % k
+        if num != num or num in (float("inf"), float("-inf")):
+            return None, "%s must be finite" % k
+        if k == "maxTradesPerDay":
+            iv = int(num)
+            if iv != num or not (0 <= iv <= 200):
+                return None, "maxTradesPerDay must be a whole number 0-200"
+            clean[k] = iv
+        elif k == "maxContracts":
+            iv = int(num)
+            ceil_ = max(1, int(TRADERSPOST_MAX_CONTRACTS))
+            if iv != num or not (1 <= iv <= ceil_):
+                return None, "maxContracts must be a whole number 1-%d (server ceiling)" % ceil_
+            clean[k] = iv
+        elif k == "maxOpenTrades":
+            iv = int(num)
+            if iv != num or not (0 <= iv <= 10):
+                return None, "maxOpenTrades must be a whole number 0-10, or empty for unlimited"
+            clean[k] = iv
+        elif k == "maxDailyLoss":
+            if not (0 < num <= 1_000_000):
+                return None, "maxDailyLoss must be a positive dollar amount (or empty for no cap)"
+            clean[k] = round(num, 2)
+        else:  # cooldownAfterLoss / cooldownAfterWin
+            iv = int(num)
+            if iv != num or not (0 <= iv <= 86_400):
+                return None, "%s must be whole seconds 0-86400" % k
+            clean[k] = iv
+    return clean, None
+
+
+def _check_safety_overrides_db_ready():
+    """Probe safety_overrides (no DDL) and set SAFETY_OVERRIDES_DB_READY. FAIL-OPEN:
+    a missing table / unavailable DB only disables persistence — the in-memory
+    runtime layer (and the tight protective defaults) keep working."""
+    global SAFETY_OVERRIDES_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM safety_overrides LIMIT 1")
+            cur.fetchone()
+        SAFETY_OVERRIDES_DB_READY = True
+        logger.info("safety overrides table ready")
+    except Exception as exc:
+        logger.warning("safety overrides table unavailable (runtime-only settings): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _load_safety_overrides_from_db():
+    """Boot / lazy (re)load of persisted overrides. FAIL-OPEN: any error leaves the
+    current in-memory layer untouched (tight protective defaults stay) and sets
+    the load-failed flag surfaced on /safety-settings. A persisted emergencyDisable
+    also seeds the EMERGENCY_DISABLED map so a kill-switch survives restarts
+    (fail-safe toward NOT trading; AUTO arming stays intentionally non-persistent)."""
+    global SAFETY_OVERRIDES_LOAD_FAILED
+    if not (LEARNING_DB_ENABLED and SAFETY_OVERRIDES_DB_READY):
+        return
+    conn = _learning_conn()
+    if conn is None:
+        SAFETY_OVERRIDES_LOAD_FAILED = True
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT inst, overrides FROM safety_overrides")
+            rows = cur.fetchall() or []
+        loaded = {}
+        for inst, ov in rows:
+            if inst not in ASSETS or not isinstance(ov, dict):
+                continue
+            clean, err = _validate_safety_overrides(ov)
+            if err:
+                logger.warning("safety override row for %s rejected (%s) - ignored", inst, err)
+                continue
+            if clean:
+                loaded[inst] = clean
+        with SAFETY_LOCK:
+            for inst in list(SAFETY_RUNTIME.keys()):
+                if inst not in loaded:
+                    SAFETY_RUNTIME.pop(inst, None)
+            for inst, clean in loaded.items():
+                SAFETY_RUNTIME[inst] = clean
+        # Seed the runtime kill-switch map OUTSIDE SAFETY_LOCK (lock order: never
+        # nest AUTO_TRADE_LOCK and SAFETY_LOCK either way around).
+        for inst, clean in loaded.items():
+            if "emergencyDisable" in clean:
+                with AUTO_TRADE_LOCK:
+                    EMERGENCY_DISABLED[inst] = bool(clean["emergencyDisable"])
+        SAFETY_OVERRIDES_LOAD_FAILED = False
+        if loaded:
+            logger.info("safety overrides loaded: %s",
+                        {i: sorted(loaded[i]) for i in loaded})
+    except Exception as exc:
+        SAFETY_OVERRIDES_LOAD_FAILED = True
+        logger.warning("safety overrides load failed (tight defaults stay): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_safety_overrides(inst, clean):
+    """UPSERT one instrument's overrides (own-table write; no DDL). Returns True on
+    success. FAIL-OPEN: the in-memory layer applies regardless — the caller
+    surfaces persisted=False so the operator knows it won't survive a restart."""
+    if not (LEARNING_DB_ENABLED and SAFETY_OVERRIDES_DB_READY):
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO safety_overrides (inst, overrides, updated_at) "
+                "VALUES (%s, %s, now()) "
+                "ON CONFLICT (inst) DO UPDATE SET overrides = EXCLUDED.overrides, "
+                "updated_at = now()",
+                (inst, psycopg2.extras.Json(clean)))
+        conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning("safety overrides persist failed for %s: %s", inst, exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _auto_setup_key(a, inst):
@@ -29944,6 +30141,182 @@ def diagnostics_live():
     return Response(DIAGNOSTICS_LIVE_HTML, mimetype="text/html")
 
 
+# ── Auto-Trade Settings page (owner-only; served at /auto-trade-settings) ────
+# Static HTML (diagnostics-live pattern): fetches /api/safety-settings +
+# POSTs /api/safety-settings + /api/auto-trade client-side. PLAIN string (NOT an
+# f-string) and NO backslash escape sequences inside the inline <script> — a
+# single stray escape breaks the whole served script (dashboard escape bug).
+AUTO_TRADE_SETTINGS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto-Trade Settings - AI Trading Partner</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0a0f;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;max-width:1100px;margin:0 auto}
+  a.back{color:#a0a8ff;text-decoration:none;font-size:13px}
+  h1{font-size:18px;font-weight:700;color:#a0a8ff;letter-spacing:.5px;margin:8px 0 2px}
+  .sub{font-size:12px;color:#666;margin-bottom:14px}
+  .banner{display:none;background:#2a1a06;border:1px solid #7c5f1d;color:#f59e0b;border-radius:10px;padding:10px 12px;font-size:12px;margin-bottom:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+  .card{background:#12121e;border:1px solid #1e1e32;border-radius:12px;padding:14px}
+  .card h2{font-size:15px;margin-bottom:8px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .chip{font-size:10px;padding:3px 8px;border-radius:999px;border:1px solid #2a2a44;color:#99a;background:#161628}
+  .chip.on{color:#22c55e;border-color:#14532d}
+  .chip.off{color:#777}
+  .chip.bad{color:#ef4444;border-color:#7f1d1d}
+  .chip.warn{color:#f59e0b;border-color:#7c5f1d}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .row label{flex:1;font-size:12px;color:#99a}
+  .row .src{font-size:9px;color:#556;text-transform:uppercase;letter-spacing:.5px;width:56px;text-align:right}
+  .row .src.runtime{color:#a0a8ff}
+  .row input{width:110px;background:#0d0d18;border:1px solid #26264a;border-radius:8px;color:#e8e8f0;padding:6px 8px;font-size:13px}
+  .row input:focus{outline:none;border-color:#a0a8ff}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  button{cursor:pointer;border-radius:8px;border:1px solid #2a2a44;background:#1a1a2e;color:#e8e8f0;padding:8px 12px;font-size:12px;font-weight:600}
+  button:hover{border-color:#a0a8ff}
+  button.save{background:#14281c;border-color:#14532d;color:#22c55e}
+  button.danger{background:#2a1212;border-color:#7f1d1d;color:#ef4444}
+  button.arm{background:#101a2e;border-color:#1d3a6e;color:#60a5fa}
+  .msg{font-size:11px;margin-top:8px;min-height:14px}
+  .msg.ok{color:#22c55e}.msg.err{color:#ef4444}
+  .note{font-size:11px;color:#889;background:#10101c;border:1px solid #1e1e32;border-radius:10px;padding:10px 12px;margin:14px 0 0;line-height:1.6}
+  .muted{color:#666}
+</style>
+</head>
+<body>
+<a class="back" href="/api/dashboard">&larr; Back to dashboard</a>
+<h1>&#9881; Auto-Trade Settings</h1>
+<div class="sub">Per-instrument safety limits for AUTO execution &middot; saved limits persist across restarts &amp; republish &middot; <span id="updated" class="muted"></span></div>
+<div class="banner" id="banner"></div>
+<div class="grid" id="cards"><div class="muted" style="font-size:12px">Loading&hellip;</div></div>
+<div class="note" id="note"></div>
+<script>
+var STATE = null;
+var DIRTY = false;
+function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+var FIELDS = [
+  ['maxTradesPerDay','Max trades / day','whole number 0-200'],
+  ['maxOpenTrades','Max open trades','0-10, or none = unlimited'],
+  ['maxContracts','Max contracts / order','1 up to the server ceiling'],
+  ['maxDailyLoss','Max daily loss (USD)','dollars, or none = no cap'],
+  ['cooldownAfterLoss','Cooldown after loss (sec)','seconds 0-86400'],
+  ['cooldownAfterWin','Cooldown after win (sec)','seconds 0-86400']
+];
+function fmtVal(v){ if(v===null) return 'unlimited'; if(v===undefined) return ''; return String(v); }
+function setMsg(i, txt, isErr){ var m=document.getElementById('msg-'+i); if(m){ m.textContent=txt; m.className='msg '+(isErr?'err':'ok'); } }
+function render(){
+  if(!STATE || !STATE.instruments) return;
+  var html = '';
+  Object.keys(STATE.instruments).forEach(function(i){
+    var d = STATE.instruments[i], eff = d.effective||{}, src = d.source||{}, ov = d.overrides||{}, sn = d.snapshot||{};
+    html += '<div class="card"><h2>' + esc(i) + '</h2><div class="chips">';
+    html += '<span class="chip ' + (sn.armed?'on':'off') + '">AUTO ' + (sn.armed?'ARMED':'off') + '</span>';
+    html += '<span class="chip ' + (sn.emergencyDisabled?'bad':'off') + '">kill switch ' + (sn.emergencyDisabled?'ON':'off') + '</span>';
+    html += '<span class="chip">today ' + esc(sn.tradesToday) + ' / ' + esc(sn.maxTradesPerDay) + '</span>';
+    html += '<span class="chip">open ' + esc(sn.openTrades) + (sn.maxOpenTrades==null?'':' / ' + esc(sn.maxOpenTrades)) + '</span>';
+    if(sn.pnlToday!=null) html += '<span class="chip ' + (sn.pnlToday<0?'warn':'') + '">PnL today $' + esc(sn.pnlToday) + '</span>';
+    html += '</div>';
+    FIELDS.forEach(function(f){
+      var k = f[0];
+      html += '<div class="row"><label>' + esc(f[1]) + '</label>'
+           + '<span class="src ' + esc(src[k]) + '">' + esc(src[k]) + '</span>'
+           + '<input id="in-' + esc(i) + '-' + k + '" value="' + ((k in ov)?esc(fmtVal(ov[k])):'') + '" placeholder="' + esc(fmtVal(eff[k])) + '" title="' + esc(f[2]) + '">'
+           + '</div>';
+    });
+    html += '<div class="btns">'
+         + '<button class="save" onclick="saveInst(&quot;' + esc(i) + '&quot;)">&#128190; Save limits</button>'
+         + '<button onclick="resetInst(&quot;' + esc(i) + '&quot;)">Reset to defaults</button>'
+         + '<button class="arm" onclick="toggleArm(&quot;' + esc(i) + '&quot;,' + (sn.armed?'false':'true') + ')">' + (sn.armed?'Disarm AUTO':'Arm AUTO') + '</button>'
+         + '<button class="danger" onclick="toggleKill(&quot;' + esc(i) + '&quot;,' + (sn.emergencyDisabled?'false':'true') + ')">' + (sn.emergencyDisabled?'Clear kill switch':'KILL SWITCH') + '</button>'
+         + '</div><div class="msg" id="msg-' + esc(i) + '"></div></div>';
+  });
+  document.getElementById('cards').innerHTML = html;
+  DIRTY = false;
+  var warn = [];
+  if(STATE.load_failed) warn.push('Saved settings could not be loaded from the database - the tight built-in defaults are active. Loading retries automatically.');
+  if(!STATE.db_ready) warn.push('Settings database unavailable - changes apply immediately but will NOT survive a restart.');
+  var b = document.getElementById('banner');
+  if(warn.length){ b.style.display='block'; b.textContent = warn.join(' '); } else { b.style.display='none'; }
+  document.getElementById('note').innerHTML = 'Blank field = use the default shown in grey. Type <b>none</b> for unlimited (open trades / daily loss only). Limits apply to AUTO execution through the audited gateway. Arming always resets OFF after a restart or republish (by design - re-arm here or on the dashboard). Execution mode: <b>' + esc(STATE.execution_mode) + '</b>' + (STATE.is_live_instance?' &middot; LIVE instance':' &middot; dev instance') + ' &middot; contract ceiling ' + esc(STATE.contracts_ceiling);
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+function parseField(k, txt){
+  var t = String(txt||'').trim().toLowerCase();
+  if(t==='') return {skip:true};
+  if(t==='none'||t==='unlimited'||t==='off'){
+    if(k==='maxOpenTrades'||k==='maxDailyLoss') return {val:null};
+    return {err:'none is only valid for max open trades / max daily loss'};
+  }
+  var n = Number(t);
+  if(isNaN(n)) return {err:'not a number: ' + txt};
+  return {val:n};
+}
+function saveInst(i){
+  var d = STATE.instruments[i];
+  var ov = {};
+  for(var x=0;x<FIELDS.length;x++){
+    var k = FIELDS[x][0];
+    var el = document.getElementById('in-' + i + '-' + k);
+    var r = parseField(k, el ? el.value : '');
+    if(r.err){ setMsg(i, r.err, true); return; }
+    if(!r.skip) ov[k] = r.val;
+  }
+  if(d && d.snapshot && d.snapshot.emergencyDisabled) ov.emergencyDisable = true;
+  postSettings(i, ov);
+}
+function resetInst(i){
+  if(!confirm('Reset ' + i + ' to its built-in defaults? This also clears a persisted kill switch.')) return;
+  postSettings(i, {});
+}
+function postSettings(i, ov){
+  fetch('/api/safety-settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({inst:i, overrides:ov})})
+  .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+  .then(function(x){
+    if(!x.ok){ setMsg(i, (x.j && x.j.reason) || 'save failed', true); return; }
+    STATE = x.j; render();
+    if(x.j.persisted===false){ setMsg(i, 'Applied - but NOT persisted (database unavailable), so it resets on restart', true); }
+    else { setMsg(i, 'Saved - active now and survives restarts', false); }
+  })
+  .catch(function(){ setMsg(i, 'network error', true); });
+}
+function toggleArm(i, v){
+  fetch('/api/auto-trade', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({inst:i, enabled:v})})
+  .then(function(){ loadState(); }).catch(function(){ setMsg(i, 'network error', true); });
+}
+function toggleKill(i, v){
+  if(v && !confirm('KILL SWITCH for ' + i + ': blocks ALL new auto-trades for this instrument and persists across restarts. Continue?')) return;
+  if(!v && !confirm('Clear the kill switch for ' + i + '? Auto-trades can fire again once armed.')) return;
+  fetch('/api/auto-trade', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({inst:i, emergencyDisabled:v})})
+  .then(function(){ loadState(); }).catch(function(){ setMsg(i, 'network error', true); });
+}
+function loadState(){
+  fetch('/api/safety-settings').then(function(r){ return r.json(); }).then(function(j){ STATE = j; render(); }).catch(function(){});
+}
+document.addEventListener('input', function(){ DIRTY = true; });
+loadState();
+setInterval(function(){
+  if(DIRTY) return;
+  var a = document.activeElement;
+  if(a && a.tagName === 'INPUT') return;
+  loadState();
+}, 10000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/auto-trade-settings", methods=["GET"])
+def auto_trade_settings_page():
+    """Owner-only (dashboard password, enforced by the Express proxy) Auto-Trade
+    Settings page: runtime per-instrument safety limits + arming / kill switch,
+    backed by GET/POST /safety-settings and POST /auto-trade."""
+    return Response(AUTO_TRADE_SETTINGS_HTML, mimetype="text/html")
+
+
 @app.route("/journal", methods=["GET"])
 def get_journal():
     return jsonify({"entries": JOURNAL, "count": len(JOURNAL)}), 200
@@ -34488,6 +34861,13 @@ def dashboard():
   .mod-cl:hover{color:var(--text);border-color:var(--border-lit)}
   .mod.mod-min > .mod-h{margin-bottom:0}
   .mod.mod-min > :not(.mod-h){display:none !important}
+  /* Per-panel HIDE (display-only, this device; restore via the chip row). */
+  .mod.mod-hidden{display:none !important}
+  .mod-x{flex:0 0 auto;cursor:pointer;color:var(--muted);width:20px;height:20px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:3px;font-size:10px;margin-left:6px;transition:color .12s,border-color .12s}
+  .mod-x:hover{color:#ef4444;border-color:#ef4444}
+  #hidden-restore{display:none;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0 0;font-size:11px;color:var(--muted)}
+  #hidden-restore .hr-chip{cursor:pointer;border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:10px;color:var(--muted)}
+  #hidden-restore .hr-chip:hover{color:#ef4444;border-color:#ef4444}
   .mod.mod-dragging{opacity:.4}
   #view-live .mod.mod-drop-before{box-shadow:0 -3px 0 0 var(--border-lit)}
   #view-live .mod.mod-drop-after{box-shadow:0 3px 0 0 var(--border-lit)}
@@ -36244,6 +36624,7 @@ def dashboard():
 <div style="font-size:11px;color:#6b7280;margin:-6px 0 8px;text-align:center">Clears the bot's local tracking (active / paper / monitored) for the selected pair if it is stuck showing a trade you already closed. Never sends a broker order.</div>
 <button class="btn btn-eod" onclick="sendEod()">📊 Send EOD Summary Now</button>
 <a class="btn btn-eod" href="/api/diagnostics-live" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">🩺 Diagnostics (live metrics)</a>
+<a class="btn btn-eod" href="/api/auto-trade-settings" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">⚙️ Auto-Trade Settings (limits &amp; kill switch)</a>
 
 <!-- ════ Potential Trade Idea Review (DISPLAY-ONLY second opinion; review-only) ════ -->
 <div class="mod" id="mod-review">
@@ -42454,7 +42835,7 @@ setInterval(function(){
 (function(){
   var ROOT = document.getElementById('view-live');
   if(!ROOT) return;
-  var CKEY = 'dashCollapsed', OKEY = 'dashOrder';
+  var CKEY = 'dashCollapsed', OKEY = 'dashOrder', HKEY = 'dashHidden';
   // One-time layout reset when the panel set changes (Main Brain added) so existing
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
@@ -42504,6 +42885,60 @@ setInterval(function(){
     if(k){ if(on){ collapsed[k] = 1; } else { delete collapsed[k]; } save(CKEY, collapsed); }
   }
 
+  // ── Per-panel HIDE (display-only, this device) ──
+  // The ✕ in a panel header hides the panel entirely; hidden panels are listed
+  // as restore chips in a row injected next to the Advanced toggle. Persisted in
+  // localStorage('dashHidden'); never touches the server / gate / money path.
+  var hiddenMap = load(HKEY);
+  var hrBox = null;
+  function titleOf(m){
+    var h = header(m);
+    var t = h ? h.textContent : '';
+    t = t.replace('\u283F','').replace('\u25B8','').replace('\u25BE','').replace('\u2715','');
+    t = t.trim();
+    return t.slice(0, 40) || (key(m) || 'panel');
+  }
+  function ensureHrBox(){
+    if(hrBox) return hrBox;
+    hrBox = document.createElement('div');
+    hrBox.id = 'hidden-restore';
+    var anchor = document.getElementById('adv-toggle');
+    if(anchor && anchor.parentNode && anchor.parentNode.parentNode){
+      anchor.parentNode.parentNode.insertBefore(hrBox, anchor.parentNode.nextSibling);
+    } else {
+      ROOT.insertBefore(hrBox, ROOT.firstChild);
+    }
+    return hrBox;
+  }
+  function renderHiddenChips(){
+    var box = ensureHrBox();
+    var ids = Object.keys(hiddenMap || {});
+    box.innerHTML = '';
+    if(!ids.length){ box.style.display = 'none'; return; }
+    box.style.display = 'flex';
+    var lab = document.createElement('span');
+    lab.textContent = 'Hidden panels (tap to restore):';
+    box.appendChild(lab);
+    ids.forEach(function(id){
+      var m = document.getElementById(id);
+      var chip = document.createElement('span');
+      chip.className = 'hr-chip';
+      chip.textContent = m ? titleOf(m) : id;
+      chip.title = 'Restore this panel';
+      chip.addEventListener('click', function(){
+        if(m){ setHidden(m, false); }
+        else { delete hiddenMap[id]; save(HKEY, hiddenMap); renderHiddenChips(); }
+      });
+      box.appendChild(chip);
+    });
+  }
+  function setHidden(m, on){
+    m.classList.toggle('mod-hidden', on);
+    var k = key(m);
+    if(k){ if(on){ hiddenMap[k] = 1; } else { delete hiddenMap[k]; } save(HKEY, hiddenMap); }
+    renderHiddenChips();
+  }
+
   var dragging = null;
   function clearDrop(){ mods().forEach(function(m){ m.classList.remove('mod-drop-before','mod-drop-after'); }); }
   function enhance(m){
@@ -42516,6 +42951,10 @@ setInterval(function(){
     caret.className = 'mod-cl'; caret.title = 'Minimize / expand';
     h.insertBefore(grip, h.firstChild);
     h.appendChild(caret);
+    var hx = document.createElement('span');
+    hx.className = 'mod-x'; hx.textContent = '\u2715'; hx.title = 'Hide this panel (restore from the chip row by the Advanced toggle)';
+    h.appendChild(hx);
+    hx.addEventListener('click', function(e){ e.stopPropagation(); setHidden(m, true); });
     h.addEventListener('click', function(e){
       if(e.target === grip) return;
       setMin(m, !m.classList.contains('mod-min'));
@@ -42551,9 +42990,11 @@ setInterval(function(){
   mods().forEach(function(m){
     enhance(m);
     if(key(m) && collapsed[key(m)]) setMin(m, true);
+    if(key(m) && hiddenMap[key(m)]) m.classList.add('mod-hidden');
   });
+  renderHiddenChips();
   window.resetDashLayout = function(){
-    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); }catch(e){}
+    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); }catch(e){}
     location.reload();
   };
 })();
@@ -43217,6 +43658,15 @@ def auto_trade_toggle():
             ed = bool(data.get("emergencyDisabled"))
             with AUTO_TRADE_LOCK:
                 EMERGENCY_DISABLED[inst] = ed
+            # Write-through to the persisted runtime overrides so a kill-switch
+            # press survives restart/republish (fail-safe toward NOT trading).
+            # FAIL-OPEN on DB error (the in-memory flip stands). Lock order:
+            # SAFETY_LOCK taken AFTER (never inside) AUTO_TRADE_LOCK.
+            with SAFETY_LOCK:
+                _ov = dict(SAFETY_RUNTIME.get(inst) or {})
+                _ov["emergencyDisable"] = ed
+                SAFETY_RUNTIME[inst] = _ov
+            _persist_safety_overrides(inst, _ov)
             logger.info("Emergency-disable %s for %s", "SET" if ed else "CLEARED", inst)
     with AUTO_TRADE_LOCK:
         snapshot = dict(AUTO_TRADE)
@@ -43232,6 +43682,75 @@ def auto_trade_toggle():
         "max_per_day":              AUTO_TRADE_MAX_PER_DAY,
         "contracts":                AUTO_TRADE_CONTRACTS,
     }), 200
+
+
+@app.route("/safety-settings", methods=["GET", "POST"])
+def safety_settings():
+    """Owner-only runtime per-asset safety controls (Basic Auth + CSRF via the
+    Express proxy; deliberately NOT in OPEN_PATHS). GET returns each enabled
+    instrument's EFFECTIVE safety config + which layer every value comes from
+    (runtime override / registry / default) + a live status snapshot. POST
+    {inst, overrides:{...}} FULL-REPLACES that instrument's runtime overrides
+    (validated FAIL-CLOSED; absent key = no override; explicit null = unlimited,
+    nullable keys only), then persists them (FAIL-OPEN: a DB error keeps the
+    in-memory change and reports persisted=false). The gate keeps reading
+    lock-free through safety_cfg — this endpoint never touches trade logic."""
+    persisted = None
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        inst = _instrument_from_text(data.get("instrument") or data.get("inst"))
+        if inst is None:
+            return jsonify({"status": "error",
+                            "reason": "instrument must be one of MGC, MNQ, MES, or MYM."}), 400
+        clean, err = _validate_safety_overrides(data.get("overrides"))
+        if err:
+            return jsonify({"status": "error", "reason": err}), 400
+        with SAFETY_LOCK:
+            if clean:
+                SAFETY_RUNTIME[inst] = clean
+            else:
+                SAFETY_RUNTIME.pop(inst, None)
+        persisted = _persist_safety_overrides(inst, clean)
+        # Keep the runtime kill-switch map in lockstep with the EFFECTIVE value
+        # (override if present, else the registry seed). Lock order: AUTO_TRADE_LOCK
+        # taken AFTER SAFETY_LOCK is released, never nested.
+        _seed = bool((ASSETS[inst].get("safety") or {}).get("emergencyDisable", False))
+        with AUTO_TRADE_LOCK:
+            EMERGENCY_DISABLED[inst] = bool(clean.get("emergencyDisable", _seed))
+        logger.info("Safety overrides for %s replaced with %s (persisted=%s)",
+                    inst, clean, persisted)
+    elif SAFETY_OVERRIDES_LOAD_FAILED:
+        # Lazy retry after a failed boot load (fail-open; never blocks the request).
+        _check_safety_overrides_db_ready()
+        _load_safety_overrides_from_db()
+    out = {}
+    for i in enabled_instruments():
+        ro = dict(SAFETY_RUNTIME.get(i) or {})
+        reg = dict(ASSETS[i].get("safety") or {})
+        eff, src = {}, {}
+        for k in _SAFETY_OVERRIDE_KEYS:
+            if k in ro:
+                eff[k], src[k] = ro[k], "runtime"
+            elif k in reg:
+                eff[k], src[k] = reg[k], "registry"
+            else:
+                eff[k], src[k] = SAFETY_DEFAULTS.get(k), "default"
+        out[i] = {"effective": eff, "source": src, "overrides": ro,
+                  "snapshot": _safety_snapshot(i)}
+    mode = resolve_execution_mode()
+    resp = {
+        "status":            "ok",
+        "instruments":       out,
+        "defaults":          {k: SAFETY_DEFAULTS.get(k) for k in _SAFETY_OVERRIDE_KEYS},
+        "contracts_ceiling": TRADERSPOST_MAX_CONTRACTS,
+        "db_ready":          SAFETY_OVERRIDES_DB_READY,
+        "load_failed":       SAFETY_OVERRIDES_LOAD_FAILED,
+        "execution_mode":    mode,
+        "is_live_instance":  DISCORD_LIVE_ENABLED,
+    }
+    if persisted is not None:
+        resp["persisted"] = persisted
+    return jsonify(resp), 200
 
 
 @app.route("/swing-strategy", methods=["GET", "POST"])
@@ -45499,6 +46018,8 @@ if __name__ == "__main__":
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
+        _check_safety_overrides_db_ready()         # probe safety_overrides (no DDL; created via DB tool/publish diff) — runtime per-asset safety controls
+        _load_safety_overrides_from_db()           # load operator safety overrides (FAIL-OPEN: a DB error keeps the tight protective defaults)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
