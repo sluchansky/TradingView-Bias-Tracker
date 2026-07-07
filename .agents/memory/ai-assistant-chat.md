@@ -36,6 +36,10 @@ and `risk_rules` (`_safety_snapshot` per instrument). All ADDITIVE and fail-open
 what lets the chat answer "manage my trade / where's my stop / take partials / risk check"
 from live state. The primer documents these keys so the model uses them.
 
-**Two surfaces, one backend:** the live chat now lives INSIDE the Main Brain panel
-(`mb-chat-*` ids — see `main-brain-dashboard.md`). The legacy `mod-assistant` panel
-(`ai-*` ids) is hidden but still in the DOM; never reuse its ids.
+**Three surfaces, one backend:** the live chat lives INSIDE the Main Brain panel
+(`mb-chat-*` ids — see `main-brain-dashboard.md`), and the /auto-trade-settings page
+has its own chat card (`chat-*` ids, textContent-only, no ticker sent → backend
+grounds on all instruments + risk_rules). The legacy `mod-assistant` panel
+(`ai-*` ids) is hidden but still in the DOM; never reuse its ids. On the settings
+page the DIRTY auto-refresh guard must IGNORE `#chat-input` input events or chatting
+permanently freezes the 10s settings refresh.

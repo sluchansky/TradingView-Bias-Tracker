@@ -30184,6 +30184,20 @@ AUTO_TRADE_SETTINGS_HTML = """<!DOCTYPE html>
   .msg.ok{color:#22c55e}.msg.err{color:#ef4444}
   .note{font-size:11px;color:#889;background:#10101c;border:1px solid #1e1e32;border-radius:10px;padding:10px 12px;margin:14px 0 0;line-height:1.6}
   .muted{color:#666}
+  .chat-card{background:#12121e;border:1px solid #1e1e32;border-radius:12px;padding:14px;margin-top:14px}
+  .chat-card h2{font-size:15px;margin-bottom:2px}
+  .chat-sub{font-size:11px;color:#667;margin-bottom:10px}
+  .chat-quick{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .chat-quick button{font-size:11px;padding:5px 10px;border-radius:999px;font-weight:500}
+  #chat-log{max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+  .cmsg{border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-width:92%}
+  .cmsg-u{align-self:flex-end;background:#1a1a34;border:1px solid #2a2a54;color:#c8ccff}
+  .cmsg-a{align-self:flex-start;background:#10101c;border:1px solid #1e1e32;color:#dde}
+  .cmsg .who{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:#667;margin-bottom:3px}
+  .chat-empty{font-size:11px;color:#556;padding:4px 2px}
+  .chat-row{display:flex;gap:8px}
+  .chat-row input{flex:1;background:#0d0d18;border:1px solid #26264a;border-radius:8px;color:#e8e8f0;padding:8px 10px;font-size:13px}
+  .chat-row input:focus{outline:none;border-color:#a0a8ff}
 </style>
 </head>
 <body>
@@ -30192,6 +30206,20 @@ AUTO_TRADE_SETTINGS_HTML = """<!DOCTYPE html>
 <div class="sub">Per-instrument safety limits for AUTO execution &middot; saved limits persist across restarts &amp; republish &middot; <span id="updated" class="muted"></span></div>
 <div class="banner" id="banner"></div>
 <div class="grid" id="cards"><div class="muted" style="font-size:12px">Loading&hellip;</div></div>
+<div class="chat-card">
+  <h2>&#128172; Ask the assistant</h2>
+  <div class="chat-sub">Read-only Q&amp;A about these safety limits, arming and the live bot. It explains and suggests &mdash; it never changes settings or places trades. To apply anything, use the forms above.</div>
+  <div class="chat-quick">
+    <button onclick="chatAsk('What does each of these safety limits do?')">What do these limits do?</button>
+    <button onclick="chatAsk('Review my current per-instrument risk limits and suggest safer values if anything looks loose.')">Review my limits</button>
+    <button onclick="chatAsk('Why is the bot not taking trades right now?')">Why no trades?</button>
+  </div>
+  <div id="chat-log"><div class="chat-empty">Ask a question or tap a suggestion above.</div></div>
+  <div class="chat-row">
+    <input id="chat-input" placeholder="e.g. Is a $300 daily loss cap reasonable for MNQ?" maxlength="2000">
+    <button class="save" id="chat-send" onclick="chatSend()">Send</button>
+  </div>
+</div>
 <div class="note" id="note"></div>
 <script>
 var STATE = null;
@@ -30295,7 +30323,69 @@ function toggleKill(i, v){
 function loadState(){
   fetch('/api/safety-settings').then(function(r){ return r.json(); }).then(function(j){ STATE = j; render(); }).catch(function(){});
 }
-document.addEventListener('input', function(){ DIRTY = true; });
+var chatHistory = [];
+var chatBusy = false;
+function chatRender(){
+  var log = document.getElementById('chat-log');
+  if(!log) return;
+  log.innerHTML = '';
+  if(!chatHistory.length){
+    var e = document.createElement('div');
+    e.className = 'chat-empty';
+    e.textContent = 'Ask a question or tap a suggestion above.';
+    log.appendChild(e);
+    return;
+  }
+  chatHistory.forEach(function(m){
+    var mine = (m.role === 'user');
+    var wrap = document.createElement('div');
+    wrap.className = 'cmsg ' + (mine ? 'cmsg-u' : 'cmsg-a');
+    var who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = mine ? 'You' : 'Assistant';
+    var body = document.createElement('div');
+    body.textContent = m._pending ? 'Thinking\u2026' : m.content;
+    wrap.appendChild(who); wrap.appendChild(body);
+    log.appendChild(wrap);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+function chatAsk(q){
+  var i = document.getElementById('chat-input');
+  if(i){ i.value = q; }
+  chatSend();
+}
+function chatSend(){
+  var inp = document.getElementById('chat-input');
+  var btn = document.getElementById('chat-send');
+  if(!inp || !btn) return;
+  var q = (inp.value || '').trim();
+  if(!q || chatBusy) return;
+  chatBusy = true;
+  var priorHist = chatHistory.slice(-8).map(function(m){ return {role:m.role, content:m.content}; });
+  chatHistory.push({ role:'user', content:q });
+  inp.value = '';
+  chatHistory.push({ role:'assistant', content:'\u2026', _pending:true });
+  chatRender();
+  btn.disabled = true;
+  fetch('/api/assistant', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q, history:priorHist})})
+  .then(function(r){ return r.json(); })
+  .then(function(j){
+    if(chatHistory.length && chatHistory[chatHistory.length-1]._pending) chatHistory.pop();
+    if(!j || j.ok === false){ chatHistory.push({ role:'assistant', content:(j && j.error) ? j.error : 'Sorry - something went wrong.' }); }
+    else { chatHistory.push({ role:'assistant', content:(j.answer || '(no answer)') }); }
+  })
+  .catch(function(){
+    if(chatHistory.length && chatHistory[chatHistory.length-1]._pending) chatHistory.pop();
+    chatHistory.push({ role:'assistant', content:'Request failed - try again.' });
+  })
+  .then(function(){ chatBusy = false; btn.disabled = false; chatRender(); });
+}
+document.getElementById('chat-input').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ chatSend(); } });
+document.addEventListener('input', function(e){
+  if(e.target && e.target.id === 'chat-input') return;
+  DIRTY = true;
+});
 loadState();
 setInterval(function(){
   if(DIRTY) return;
