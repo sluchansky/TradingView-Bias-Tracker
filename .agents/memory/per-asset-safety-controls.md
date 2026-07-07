@@ -5,8 +5,8 @@ description: How per-asset money-path safety limits layer and the fail-closed/by
 
 # Per-asset safety controls (money path)
 
-Per-asset execution limits (emergency kill switch, max trades/day, max contracts,
-max open trades, max daily loss, post-loss/win cooldown) layer through ONE resolver:
+Per-asset execution limits (emergency kill switch, max trades/day, max losses/day,
+max contracts, max open trades, max daily loss, post-loss/win cooldown) layer through ONE resolver:
 `safety_cfg(inst, key)` → RUNTIME override (`SAFETY_RUNTIME`, DB-backed) →
 asset-mode override → asset default → `SAFETY_DEFAULTS`.
 Both the manual `/traderspost` path and the auto path flow through the single
@@ -22,7 +22,14 @@ path and without changing MGC/MNQ behaviour.
   stay as before. These are REAL money-path caps — they only stay golden-safe because
   the parity/golden harnesses snapshot the strict funcs (build_strict_trade_plan /
   evaluate_strict_setup) and never exercise the gateway/auto-exec path. If you add a
-  NEW control, still make ITS default a no-op so existing-asset behaviour is unchanged.
+  NEW control, still make ITS default a no-op so existing-asset behaviour is unchanged
+  — the TWO sanctioned exceptions (both user-requested) are the tight defaults above
+  and `maxLossesPerDay=5` (2026-07-07): a cap on REALIZED losing trades per ET day
+  (wins/breakeven NEVER counted → winners unlimited), nullable (null = unlimited),
+  env-reversible via `SAFETY_MAX_LOSSES_PER_DAY` (`none/off` → None). `_losses_today`
+  counts JOURNAL closed entries `pnl_dollars < 0` — same source/ET-day key as
+  `_realized_pnl_today`, so it inherits the same semantics: only CLOSED trades count
+  and the count is the SIM's proxy outcomes, not broker fills.
 - **Every cap with a legacy-unlimited meaning must stay env-reversible.** Such caps
   parse via `_env_int_or_none`: `none/off/legacy/unlimited/-1` → `None` (legacy
   unlimited), blank → default, else a non-negative int (`0` = hard block). A plain
@@ -44,7 +51,9 @@ path and without changing MGC/MNQ behaviour.
 - **Daily-loss cap fails CLOSED:** if realized P&L can't be computed while a cap is
   set, block (409) rather than risk trading past the limit. `_realized_pnl_today`
   uses the same ET trading-day key as `_auto_trade_count_today`, and a malformed
-  P&L must raise into the gateway (not be swallowed to 0).
+  P&L must raise into the gateway (not be swallowed to 0). `maxLossesPerDay` /
+  `_losses_today` mirror this exactly (uncomputable count while a cap is set → 409;
+  helper raises, never returns a guess; unknown inst → 0 = any loss trips it).
 - **Lock order:** `AUTO_TRADE_LOCK` is a plain `Lock` (NOT RLock). `_safety_snapshot`
   must release it before calling helpers that take their own locks
   (`_auto_trade_count_today`, cooldown helpers). `SAFETY_LOCK` must NEVER nest under
@@ -61,7 +70,7 @@ path and without changing MGC/MNQ behaviour.
   Never mutate a nested dict in place.
 - **POST /safety-settings is FULL-REPLACE** `{inst, overrides}` with whitelist +
   fail-closed 400 validation (maxContracts ≤ server ceiling; null only for
-  maxOpenTrades/maxDailyLoss = unlimited). It also resyncs `EMERGENCY_DISABLED`,
+  maxOpenTrades/maxDailyLoss/maxLossesPerDay = unlimited). It also resyncs `EMERGENCY_DISABLED`,
   so a save that OMITS `emergencyDisable` clears a set kill switch (fails toward
   trading). The settings page always re-sends the switch from its snapshot —
   raw API clients must do the same. `/auto-trade emergencyDisabled` writes through

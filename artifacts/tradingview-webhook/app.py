@@ -1367,8 +1367,8 @@ ASSETS = {
         # they still require per-instrument AUTO arming after each restart/publish AND
         # TradingView actually streaming their alerts before they trade. All other limits
         # fall back to SAFETY_DEFAULTS (legacy globals). All keys: maxTradesPerDay,
-        # maxContracts, maxDailyLoss, maxOpenTrades, cooldownAfterLoss, cooldownAfterWin,
-        # emergencyDisable.
+        # maxLossesPerDay, maxContracts, maxDailyLoss, maxOpenTrades, cooldownAfterLoss,
+        # cooldownAfterWin, emergencyDisable.
         "safety": {},
         "specs": {
             # CME Micro E-mini S&P 500: $5/point, 0.25 tick. tp1/2/3 are vestigial
@@ -2070,6 +2070,7 @@ def _auto_trade_bump_count(inst):
 # operator arms them. All money-path helpers take a STRICT (already-resolved)
 # instrument and fail CLOSED on anything unknown — never the lenient instrument_of().
 SAFETY_MAX_TRADES_PER_DAY = int(_env_float("SAFETY_MAX_TRADES_PER_DAY", 5))   # per-day AUTO entry cap
+SAFETY_MAX_LOSSES_PER_DAY = _env_int_or_none("SAFETY_MAX_LOSSES_PER_DAY", 5)  # per-day realized-LOSS cap (wins NEVER counted; none => unlimited)
 SAFETY_MAX_OPEN_TRADES    = _env_int_or_none("SAFETY_MAX_OPEN_TRADES", 1)     # concurrent open positions (None => legacy unlimited)
 # Force the one-position guard ON even for SCALP (allow_stack requests are demoted)
 # so concurrent stacking can't compound a losing streak. NOTE: a live position is
@@ -2079,6 +2080,7 @@ SAFETY_MAX_OPEN_TRADES    = _env_int_or_none("SAFETY_MAX_OPEN_TRADES", 1)     # 
 DISABLE_STACKING_GATE = _env_flag_on("DISABLE_STACKING_GATE")
 SAFETY_DEFAULTS = {
     "maxTradesPerDay":   SAFETY_MAX_TRADES_PER_DAY,# per-day AUTO entry cap (ET day)
+    "maxLossesPerDay":   SAFETY_MAX_LOSSES_PER_DAY,# per-day realized losing-trade cap (wins uncounted; None => unlimited)
     "maxContracts":      TRADERSPOST_MAX_CONTRACTS,# hard server contract ceiling
     "maxDailyLoss":      None,                     # USD; None => no daily-loss cap
     "maxOpenTrades":     SAFETY_MAX_OPEN_TRADES,   # concurrent open positions (1 => one-slot)
@@ -2192,6 +2194,21 @@ def max_daily_loss(inst):
         return 0.0
 
 
+def max_losses_per_day(inst):
+    """Per-asset cap on REALIZED losing trades per ET day (wins and breakeven are
+    NEVER counted, so winners stay unlimited). None => unlimited. Unknown
+    instrument -> 0 (any loss trips it => fail-closed)."""
+    if inst not in ASSETS:
+        return 0
+    v = safety_cfg(inst, "maxLossesPerDay")
+    if v is None:
+        return None
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
 def cooldown_after_loss(inst):
     """Per-asset post-loss cooldown (seconds). Unknown instrument -> 0."""
     if inst not in ASSETS:
@@ -2261,6 +2278,27 @@ def _realized_pnl_today(inst):
     return total
 
 
+def _losses_today(inst):
+    """Count of CLOSED losing trades (pnl_dollars < 0) for `inst` on TODAY's ET
+    trading day. Same JOURNAL source and ET-day key as _realized_pnl_today, so the
+    loss cap resets together with the other per-day controls and survives a restart
+    (JOURNAL is rebuilt from Postgres on boot). Wins/breakeven are NEVER counted.
+    Raises on a genuinely unexpected JOURNAL shape so the money-path caller can
+    fail CLOSED."""
+    today_et = fmt_et(now_utc(), "%Y-%m-%d")
+    n = 0
+    for e in list(JOURNAL):
+        if "pnl_dollars" not in e:
+            continue
+        if instrument_of(e.get("symbol", "")) != inst:
+            continue
+        if fmt_et(e.get("datetime", ""), "%Y-%m-%d") != today_et:
+            continue
+        if float(e["pnl_dollars"]) < 0:
+            n += 1
+    return n
+
+
 def _safety_snapshot(inst):
     """Per-asset safety + runtime state for the /auto-trade surface (DISPLAY-only;
     never feeds the gate)."""
@@ -2272,11 +2310,17 @@ def _safety_snapshot(inst):
         pnl_today = _realized_pnl_today(inst)
     except Exception:
         pnl_today = None
+    try:
+        losses_today = _losses_today(inst)
+    except Exception:
+        losses_today = None
     return {
         "armed":             armed,
         "emergencyDisabled": ed,
         "maxTradesPerDay":   max_trades_per_day(inst),
         "tradesToday":       _auto_trade_count_today(inst),
+        "maxLossesPerDay":   max_losses_per_day(inst),
+        "lossesToday":       losses_today,
         "maxContracts":      max_contracts(inst),
         "maxOpenTrades":     max_open_trades(inst),
         "openTrades":        1 if active_trade_for(inst) else 0,
@@ -2290,10 +2334,10 @@ def _safety_snapshot(inst):
 
 
 # ── Runtime safety-override validation + persistence (/safety-settings) ──────
-_SAFETY_OVERRIDE_KEYS = ("maxTradesPerDay", "maxContracts", "maxDailyLoss",
-                         "maxOpenTrades", "cooldownAfterLoss", "cooldownAfterWin",
-                         "emergencyDisable")
-_SAFETY_NULLABLE_KEYS = ("maxDailyLoss", "maxOpenTrades")
+_SAFETY_OVERRIDE_KEYS = ("maxTradesPerDay", "maxLossesPerDay", "maxContracts",
+                         "maxDailyLoss", "maxOpenTrades", "cooldownAfterLoss",
+                         "cooldownAfterWin", "emergencyDisable")
+_SAFETY_NULLABLE_KEYS = ("maxDailyLoss", "maxOpenTrades", "maxLossesPerDay")
 
 
 def _validate_safety_overrides(raw):
@@ -2330,6 +2374,11 @@ def _validate_safety_overrides(raw):
             iv = int(num)
             if iv != num or not (0 <= iv <= 200):
                 return None, "maxTradesPerDay must be a whole number 0-200"
+            clean[k] = iv
+        elif k == "maxLossesPerDay":
+            iv = int(num)
+            if iv != num or not (0 <= iv <= 200):
+                return None, "maxLossesPerDay must be a whole number 0-200, or empty for unlimited"
             clean[k] = iv
         elif k == "maxContracts":
             iv = int(num)
@@ -30227,6 +30276,7 @@ var DIRTY = false;
 function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 var FIELDS = [
   ['maxTradesPerDay','Max trades / day','whole number 0-200'],
+  ['maxLossesPerDay','Max losses / day (wins unlimited)','0-200, or none = unlimited'],
   ['maxOpenTrades','Max open trades','0-10, or none = unlimited'],
   ['maxContracts','Max contracts / order','1 up to the server ceiling'],
   ['maxDailyLoss','Max daily loss (USD)','dollars, or none = no cap'],
@@ -30244,6 +30294,7 @@ function render(){
     html += '<span class="chip ' + (sn.armed?'on':'off') + '">AUTO ' + (sn.armed?'ARMED':'off') + '</span>';
     html += '<span class="chip ' + (sn.emergencyDisabled?'bad':'off') + '">kill switch ' + (sn.emergencyDisabled?'ON':'off') + '</span>';
     html += '<span class="chip">today ' + esc(sn.tradesToday) + ' / ' + esc(sn.maxTradesPerDay) + '</span>';
+    if(sn.maxLossesPerDay!=null) html += '<span class="chip ' + ((sn.lossesToday!=null && sn.lossesToday>=sn.maxLossesPerDay)?'bad':'') + '">losses ' + esc(sn.lossesToday==null?'?':sn.lossesToday) + ' / ' + esc(sn.maxLossesPerDay) + '</span>';
     html += '<span class="chip">open ' + esc(sn.openTrades) + (sn.maxOpenTrades==null?'':' / ' + esc(sn.maxOpenTrades)) + '</span>';
     if(sn.pnlToday!=null) html += '<span class="chip ' + (sn.pnlToday<0?'warn':'') + '">PnL today $' + esc(sn.pnlToday) + '</span>';
     html += '</div>';
@@ -30275,8 +30326,8 @@ function parseField(k, txt){
   var t = String(txt||'').trim().toLowerCase();
   if(t==='') return {skip:true};
   if(t==='none'||t==='unlimited'||t==='off'){
-    if(k==='maxOpenTrades'||k==='maxDailyLoss') return {val:null};
-    return {err:'none is only valid for max open trades / max daily loss'};
+    if(k==='maxOpenTrades'||k==='maxDailyLoss'||k==='maxLossesPerDay') return {val:null};
+    return {err:'none is only valid for max open trades / max daily loss / max losses per day'};
   }
   var n = Number(t);
   if(isNaN(n)) return {err:'not a number: ' + txt};
@@ -33728,6 +33779,21 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
             return {"status": "error",
                     "reason": (f"{instrument} hit its ${_daily_loss_cap:,.0f} daily-loss limit "
                                f"(realized ${_pnl_today:,.0f} today) - paused.")}, 409
+    # Per-asset realized losing-trade cap (wins/breakeven NEVER counted, so winners
+    # stay unlimited; None => unlimited). Fail CLOSED: if losses can't be counted
+    # while a cap is configured, block rather than risk trading past the limit.
+    _loss_cap = max_losses_per_day(instrument)
+    if _loss_cap is not None:
+        try:
+            _losses = _losses_today(instrument)
+        except Exception as exc:
+            logger.error("Loss-count check failed for %s (blocking, fail-closed): %s", instrument, exc)
+            return {"status": "error",
+                    "reason": f"{instrument} loss-count check unavailable - order blocked for safety."}, 409
+        if _losses >= _loss_cap:
+            return {"status": "error",
+                    "reason": (f"{instrument} hit its {_loss_cap} losses/day limit "
+                               f"({_losses} losing trades today) - paused until the next trading day.")}, 409
     # Per-asset post-outcome cooldown (after a loss/win; 0 => off, the default).
     _cool_rem, _cool_reason = _outcome_cooldown_remaining(instrument)
     if _cool_rem > 0:
