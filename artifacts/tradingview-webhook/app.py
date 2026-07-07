@@ -28165,7 +28165,7 @@ def _maybe_observe_dual_mode_sim(result, source="webhook"):
         sim_key = "%s|%s|%s|%s" % (mode, inst, direction, setup_anchor)
         if _dual_sim_open_insert(sim_key, setup_anchor, mode, inst, direction,
                                  verdict, entry, stop, target, rr,
-                                 inp.get("session_state"), None, edge_sc):
+                                 _learning_session_name(), None, edge_sc):
             opened += 1
             with _DUAL_SIM_COOLDOWN_LOCK:
                 _DUAL_SIM_COOLDOWN[ckey] = now_mono

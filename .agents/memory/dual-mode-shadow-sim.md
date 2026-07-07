@@ -119,3 +119,16 @@ opened modes are unchanged.
   re-bucketed by Edge quality," NOT as three separate simulations.
   **Why:** avoids opening 3× overlapping paper trades (which would clutter the ledger for
   zero extra outcome info) at the cost of higher-tier trade-count fidelity.
+
+## Insert-column gotcha (fixed Jul 2026)
+- `dual_sim_trades.session` is a TEXT column and must receive the
+  `_learning_session_name()` STRING ("New York"/"London"/"Asia"/"Off-hours" — same
+  convention as `strategy_trades.session`). `session_state` from `get_session_state()`
+  is a DICT (`{preferred,bonus,window}`) and passing it made psycopg2 fail with
+  "can't adapt type 'dict'" on EVERY open-insert.
+- **Why it stayed invisible:** the insert is FAIL-OPEN (warning log + return False),
+  so the sim silently recorded NOTHING forever while the dashboard showed a healthy
+  zero-stats block. The smoke suite can't catch it (no real Postgres adapt path).
+- **How to diagnose:** empty `dual_sim_trades` despite READY fires ⇒ grep prod logs
+  for `dual-sim open insert failed`. Only `context` may be a dict (it's wrapped in
+  `psycopg2.extras.Json`); every other insert param must be scalar.
