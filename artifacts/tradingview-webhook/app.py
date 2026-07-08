@@ -30719,14 +30719,27 @@ def _trade_mgmt_status_block(ticker=None):
         return None
 
 
-@app.route("/status", methods=["GET"])
-def status():
-    # The dashboard's MGC/MNQ tab passes ?ticker= so the view follows the selected
-    # instrument; ignore junk values and fall back to the active instrument.
-    _raw = (request.args.get("ticker") or "").upper()
-    # Registry-driven: recognizes every enabled instrument (MGC/MNQ/MES/MYM);
-    # junk/empty/ambiguous → None → full_analysis falls back to the active instrument.
-    _tk  = _instrument_from_text(_raw)
+# ── /status response cache — DISPLAY-ONLY single-flight (poll-storm collapse) ──
+# The dashboard polls /status?ticker= every ~3s from EVERY open device (TV, phone,
+# extra tabs), and each call used to run a FULL analysis pass inline. With a
+# prod-sized ALERT_HISTORY (maxlen=1000, full in prod, empty in dev) one pass costs
+# many seconds, so pollers piled up faster than they completed (70-110s responses,
+# aborted requests) and the dashboard froze. This cache collapses all pollers onto
+# ONE build per instrument per TTL and serves the last snapshot instantly while a
+# rebuild is in flight (stale-while-revalidate — never blocks a poller).
+# MONEY PATH UNTOUCHED: the webhook worker, watchers, heartbeat, /enter and
+# /traderspost all call full_analysis() / their own server-side checks directly and
+# NEVER read this cache. Display staleness is bounded by TTL + one build time,
+# which is no worse than the poll cadence the dashboard already tolerated.
+# STATUS_CACHE_TTL_SEC=0 disables the cache entirely (byte-identical behavior).
+STATUS_CACHE_TTL_SEC = _env_float("STATUS_CACHE_TTL_SEC", 3.0)
+_STATUS_CACHE      = {}   # key ("MGC"/"MNQ"/.../"__active__") -> (built_epoch, payload dict)
+_STATUS_BUILDING   = {}   # key -> True while a build is running (single-flight marker)
+_STATUS_CACHE_LOCK = threading.Lock()   # guards the two dicts only — never held during a build
+
+
+def _build_status_payload(_tk):
+    """Build the full /status payload dict for one instrument (display-only)."""
     a = full_analysis(ticker_override=_tk)
     windows = {}
     for label, minutes in TIME_WINDOWS.items():
@@ -30736,7 +30749,7 @@ def status():
                           "bullish_score": w_bull, "bearish_score": w_bear}
     # Dual-timeframe engine display (DISPLAY-ONLY; lazy-expires; all-None when flag OFF).
     _dtf = _dual_tf_snapshot(a.get("active_ticker"))
-    return jsonify({
+    return {
         "status":              "running",
         "version":             "11.0",
         "trading_mode":        TRADING_MODE,
@@ -30888,7 +30901,43 @@ def status():
         **({"stalk_mode": a.get("stalk_mode")} if STALK_MODE_ENABLED else {}),
         **({"active_trade_thinking": a.get("active_trade_thinking")}
            if ACTIVE_THINKING_ENABLED else {}),
-    }), 200
+    }
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    # The dashboard's MGC/MNQ tab passes ?ticker= so the view follows the selected
+    # instrument; ignore junk values and fall back to the active instrument.
+    _raw = (request.args.get("ticker") or "").upper()
+    # Registry-driven: recognizes every enabled instrument (MGC/MNQ/MES/MYM);
+    # junk/empty/ambiguous → None → full_analysis falls back to the active instrument.
+    _tk  = _instrument_from_text(_raw)
+    if STATUS_CACHE_TTL_SEC <= 0:
+        # Cache disabled — legacy inline build, byte-identical behavior.
+        return jsonify(_build_status_payload(_tk)), 200
+    key    = _tk or "__active__"
+    now_ts = time.time()
+    with _STATUS_CACHE_LOCK:
+        ent = _STATUS_CACHE.get(key)
+        if ent is not None and (now_ts - ent[0]) < STATUS_CACHE_TTL_SEC:
+            return jsonify(ent[1]), 200                    # fresh — serve cached
+        if _STATUS_BUILDING.get(key):
+            if ent is not None:
+                return jsonify(ent[1]), 200                # rebuild in flight — serve stale
+            # Cold cache + build already in flight (right after a restart): tell the
+            # dashboard to retry instead of piling a SECOND expensive build on top —
+            # a burst of concurrent cold builds is exactly the pre-fix freeze pattern.
+            return jsonify({"status": "warming",
+                            "detail": "analysis warming up — retry shortly"}), 503
+        _STATUS_BUILDING[key] = True                       # this request becomes the builder
+    try:
+        payload = _build_status_payload(_tk)
+        with _STATUS_CACHE_LOCK:
+            _STATUS_CACHE[key] = (time.time(), payload)
+    finally:
+        with _STATUS_CACHE_LOCK:
+            _STATUS_BUILDING[key] = False
+    return jsonify(payload), 200
 
 
 @app.route("/enter", methods=["POST"])
@@ -37692,8 +37741,17 @@ function toast(msg, ok=true) {
 async function api(path, body=null) {
   const opts = { method: body ? 'POST' : 'GET', headers: {'Content-Type':'application/json'}, cache: 'no-store' };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(BASE+path, opts);
-  return r.json();
+  // 15s hard timeout: with the in-flight poll guard, ONE hung request would stall
+  // every poller until the browser network timeout — cap it so polling recovers.
+  const ctl = new AbortController();
+  const tmr = setTimeout(() => ctl.abort(), 15000);
+  opts.signal = ctl.signal;
+  try {
+    const r = await fetch(BASE+path, opts);
+    return await r.json();
+  } finally {
+    clearTimeout(tmr);
+  }
 }
 
 // Owner-only: mint a WATCH-ONLY, expiring, password-protected link that lets other
@@ -43954,7 +44012,19 @@ async function mbmtAdd(){
   finally{ if(btn){ btn.disabled=false; btn.textContent=prev; } }
 }
 
-setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); loadTraining(); scanEdgeBells(); }, 3000);
+// In-flight guard: if a poll cycle is still waiting on the server (slow network,
+// busy backend), SKIP the next tick instead of stacking a second set of requests
+// on top — stacked polls are what snowballed into a frozen dashboard. Display-only.
+let _pollBusy = false;
+setInterval(async () => {
+  if (_pollBusy) return;
+  _pollBusy = true;
+  try {
+    await Promise.allSettled([refresh(), refreshRec(), loadPropDecisions(), loadBotPositions(), loadTraining(), scanEdgeBells()]);
+  } finally {
+    _pollBusy = false;
+  }
+}, 3000);
 setInterval(loadAutoExit, 30000); // Auto Early-Exit status (arm state + invalid-streak) — light owner-only read
 setInterval(checkStale, 2000);
 loadTraining();

@@ -1,5 +1,7 @@
 # Memory Index
 
+- [/status poll cache](status-poll-cache.md) — prod froze from 3s polls × 16s inline full_analysis; /status now single-flight TTL cache + client tick guard; money path NEVER reads the cache; dev-empty history hides this bug class.
+
 - [BOT TRAINING MODE](bot-training-mode.md) — flag-gated 4-stage fail-closed gate; stages 1-3 suggest-only, >=4 passthrough; boot probe is __main__-only so the gate lazy-probes; flag-OFF byte-identical.
 
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404 before reaching Flask; how to debug 404s on this stack.
