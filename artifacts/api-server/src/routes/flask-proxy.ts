@@ -163,6 +163,10 @@ export const BOT1_ROUTES = [
   // LIVE 2-contract runner arming (owner-only; NOT in dashboard-auth OPEN_PATHS).
   // In-memory armed flag over the existing fail-closed gateway; resets on restart.
   "/live-runner",
+  // AUTO EARLY-EXIT arming (owner-only; NOT in dashboard-auth OPEN_PATHS).
+  // In-memory armed flag; when armed the watcher flattens a bot position whose
+  // thesis is confirmed-invalid via a NON-REVERSING exit. Resets OFF on restart.
+  "/auto-exit",
   // Scalping Strategy Research Engine (owner-only; RESEARCH/DISPLAY-ONLY; NOT in
   // dashboard-auth OPEN_PATHS). GET = cached research view; POST = trigger recompute.
   // Walled off from the live money path — new strategies never auto-trade live.

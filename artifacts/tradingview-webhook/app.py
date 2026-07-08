@@ -1824,6 +1824,35 @@ LIVE_RUNNER_MAX_HOLD_MIN   = max(1, int(os.environ.get("LIVE_RUNNER_MAX_HOLD_MIN
 LIVE_RUNNER_RUNNER_MODE = os.environ.get("LIVE_RUNNER_RUNNER_MODE", "trail").strip().lower()
 if LIVE_RUNNER_RUNNER_MODE not in ("trail", "be_2r"):
     LIVE_RUNNER_RUNNER_MODE = "trail"
+
+# ── AUTO EARLY-EXIT (thesis-invalidated flatten — REAL broker exit money path) ─
+# Lets the bot ACT on its own Active Trade Management advisory: when an OPEN bot
+# position's thesis is CONFIRMED invalid (opposite structure flip — deliberately
+# NOT a mere stop-breach: the broker bracket owns the stop and the STOP_HIT
+# webhook path owns that bookkeeping) for AUTO_EXIT_CONFIRM_READS consecutive
+# watch reads, the watcher flattens the position with a NON-REVERSING TradersPost
+# {action:"exit"} through the SAME audited _send_broker_order sink (it can never
+# reverse or open exposure). Three independent conditions gate every real send
+# (mirrors the LIVE runner):
+#   1. AUTO_EXIT_ENABLED — env kill switch (=0 removes the watcher entirely).
+#   2. AUTO_EXIT_ARMED   — in-memory, owner-armed at runtime via /auto-exit,
+#                          RESETS OFF on every restart/republish (a fresh process
+#                          never auto-flattens).
+#   3. execution mode traderspost AND the LIVE instance (dev shares the
+#      TradersPost URL and must NEVER auto-send) — or paper mode, where the
+#      "exit" is a LOCAL tracked close only (the dev/paper test path).
+# Disarmed/disabled, the advisory stays exactly what it is today: display-only.
+AUTO_EXIT_ENABLED = os.environ.get("AUTO_EXIT_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+AUTO_EXIT_ARMED   = False              # in-memory; armed via owner endpoint; reset on restart
+AUTO_EXIT_LOCK    = threading.Lock()   # guards AUTO_EXIT_ARMED only (never nested under money locks)
+# Consecutive confirmed-invalid reads required before firing (>=1) + watch cadence.
+AUTO_EXIT_CONFIRM_READS      = max(1, int(os.environ.get("AUTO_EXIT_CONFIRM_READS", "2")))
+AUTO_EXIT_WATCH_INTERVAL_SEC = max(10, int(os.environ.get("AUTO_EXIT_WATCH_INTERVAL_SEC", "60")))
+# Watcher-thread-only strike/fired stores (single writer; status view reads copies).
+AUTO_EXIT_STRIKES = {}     # inst -> {"opened_at": ..., "count": n}
+AUTO_EXIT_FIRED   = set()  # {(inst, opened_at)} — fire-once per tracked position
+AUTO_EXIT_LAST    = {}     # inst -> display-only last-read summary (status view)
+
 # Gateway-owned live-runner state (Option A): the runner leg is tracked HERE, not on
 # ACTIVE_TRADES_BY_INST, because the manual /traderspost route (and Option A in
 # general) never registers an ACTIVE_TRADE — only _maybe_auto_execute / /enter do.
@@ -32810,6 +32839,206 @@ def _live_runner_watch_loop():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# AUTO EARLY-EXIT — the bot acts on its own Active Trade Management advice
+# ════════════════════════════════════════════════════════════════════════════
+# When ARMED, a tracked bot position whose thesis is CONFIRMED invalid (opposite
+# structure flip — never a bare stop-touch) for AUTO_EXIT_CONFIRM_READS straight
+# watch reads is flattened via a NON-REVERSING {action:"exit"} through the SAME
+# audited _send_broker_order sink. See the config block for the three gates.
+def _auto_exit_status_view():
+    """Owner-facing status snapshot for /auto-exit + the dashboard panel. Pure read."""
+    with AUTO_EXIT_LOCK:
+        armed = bool(AUTO_EXIT_ARMED)
+    mode        = resolve_execution_mode()
+    live_send   = (mode == "traderspost" and DISCORD_LIVE_ENABLED)
+    paper_close = (mode == "paper")
+    return {
+        "enabled":            AUTO_EXIT_ENABLED,
+        "armed":              armed,
+        "mode":               mode,
+        "live_instance":      bool(DISCORD_LIVE_ENABLED),
+        "can_act":            bool(AUTO_EXIT_ENABLED and armed and (live_send or paper_close)),
+        "confirm_reads":      AUTO_EXIT_CONFIRM_READS,
+        "watch_interval_sec": AUTO_EXIT_WATCH_INTERVAL_SEC,
+        "strikes":            {i: dict(v) for i, v in list(AUTO_EXIT_STRIKES.items())},
+        "last":               {i: dict(v) for i, v in list(AUTO_EXIT_LAST.items())},
+        "updated_at":         now_utc().isoformat(),
+    }
+
+
+def _auto_exit_scan():
+    """One AUTO EARLY-EXIT sweep. INERT unless enabled + armed (both checked INSIDE
+    the loop so arming never needs a restart). Reads the SAME advisory the dashboard
+    shows (compute_manual_trade_management on a THROWAWAY _bot_trade_mgmt_mirror
+    copy — the engine writes min_r/max_r back onto the dict it is handed) and counts
+    CONSECUTIVE confirmed-invalid reads per tracked position. A read error resets
+    nothing and NEVER advances a strike — an error can never cause an exit.
+
+    Trigger is opposite_confirmed-only: `invalidated and not stop_breached`. The
+    broker bracket owns the stop and the STOP_HIT webhook path owns that
+    bookkeeping (_update_journal_outcome marks the FIRST pending entry for the
+    instrument, so a duplicate close would mismark a different entry)."""
+    if not AUTO_EXIT_ENABLED:
+        return
+    with AUTO_EXIT_LOCK:
+        armed = bool(AUTO_EXIT_ARMED)
+    if not armed:
+        if AUTO_EXIT_STRIKES:
+            AUTO_EXIT_STRIKES.clear()
+        return
+    mode        = resolve_execution_mode()
+    live_send   = (mode == "traderspost" and DISCORD_LIVE_ENABLED)
+    paper_close = (mode == "paper")
+    if not (live_send or paper_close):
+        # manual_only, or traderspost on the DEV instance (dev shares the
+        # TradersPost URL — never auto-send from dev): advisory stays display-only.
+        return
+    snap = active_trade_snapshot()
+    # Prune fired/strike state for positions no longer tracked (allows a clean
+    # re-arm on the NEXT position while never re-firing on the same one).
+    open_keys = {(i, (t or {}).get("opened_at")) for i, t in snap.items() if t}
+    for k in list(AUTO_EXIT_FIRED):
+        if k not in open_keys:
+            AUTO_EXIT_FIRED.discard(k)
+    for i in list(AUTO_EXIT_STRIKES):
+        if i not in snap or not snap.get(i):
+            AUTO_EXIT_STRIKES.pop(i, None)
+            AUTO_EXIT_LAST.pop(i, None)
+    analysis_cache = {}
+    for inst, at in snap.items():
+        if not at:
+            continue
+        opened = at.get("opened_at")
+        try:
+            mirror = _bot_trade_mgmt_mirror(inst, at)   # COPY — never the live dict
+            sym    = mirror["symbol"]
+            if sym not in analysis_cache:
+                try:
+                    analysis_cache[sym] = full_analysis(ticker_override=sym)
+                except Exception as exc:
+                    logger.warning("AUTO-EXIT %s: analysis failed (%s) — read degraded.", inst, exc)
+                    analysis_cache[sym] = None
+            mgmt = compute_manual_trade_management(mirror, analysis=analysis_cache[sym]) or {}
+        except Exception as exc:
+            logger.warning("AUTO-EXIT %s: management read failed (%s) — no strike.", inst, exc)
+            continue
+        invalid = (mgmt.get("status") == "ok"
+                   and bool(mgmt.get("invalidated"))
+                   and not mgmt.get("stop_breached"))
+        rec = AUTO_EXIT_STRIKES.get(inst)
+        if rec is None or rec.get("opened_at") != opened:
+            rec = {"opened_at": opened, "count": 0}
+            AUTO_EXIT_STRIKES[inst] = rec
+        rec["count"] = (rec["count"] + 1) if invalid else 0
+        AUTO_EXIT_LAST[inst] = {
+            "thesis":     mgmt.get("thesis_status"),
+            "invalid":    bool(invalid),
+            "count":      rec["count"],
+            "checked_at": now_utc().isoformat(),
+        }
+        if rec["count"] >= AUTO_EXIT_CONFIRM_READS and (inst, opened) not in AUTO_EXIT_FIRED:
+            AUTO_EXIT_FIRED.add((inst, opened))         # idempotency mark FIRST
+            _auto_exit_fire(inst, at, mgmt, mode, live_send)
+
+
+def _auto_exit_fire(inst, at, mgmt, mode, live_send):
+    """Flatten ONE bot position on a CONFIRMED-invalid thesis. Ordering is the
+    reviewed double-journal guard: (fired-mark done by the caller) → non-reversing
+    broker flatten FIRST (a safe no-op at TradersPost if the position already
+    closed) → compare-and-clear pop of the tracked slot → journal + Discord ONLY
+    when the pop returned the trade (a None pop means STOP_HIT / T1 / manual close
+    got there first and already owns the bookkeeping — never double-journal).
+
+    A failed/ambiguous broker send DISARMS auto-exit and alerts for a manual
+    flatten; local tracking is kept so the position stays visible."""
+    direction = str(at.get("direction", "?"))
+    opened    = at.get("opened_at")
+    why       = (mgmt.get("recommendation_reason")
+                 or "Thesis invalidated — structure confirmed against the position.").strip()
+    # Last-instant identity recheck (reviewer-required): the sweep's snapshot/advisory
+    # read can be tens of seconds old. If THIS position closed and a NEW same-instrument
+    # position opened meanwhile, a broker {action:"exit"} would flatten the NEW one —
+    # compare-and-clear only protects local state, not the broker. Never fire on a
+    # trade whose opened_at no longer matches the one the strikes were counted on.
+    with ACTIVE_TRADES_LOCK:
+        _cur = ACTIVE_TRADES_BY_INST.get(inst)
+    if _cur is None or _cur.get("opened_at") != opened:
+        logger.info("AUTO-EXIT %s: position closed/replaced since the sweep read — fire aborted.", inst)
+        return
+    if live_send:
+        tp_symbol = TRADERSPOST_TICKER.get(inst, inst)
+        payload   = adapt_traderspost_reduce(tp_symbol)
+        payload["signal"] = "AI Trading Partner AUTO EARLY-EXIT"
+        provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
+        res, _code = _send_broker_order(mode, provider_label, inst, payload,
+                                        TRADERSPOST_WEBHOOK_URL, release_slot=None,
+                                        order_kind="auto_exit")
+        if res is not None:
+            with AUTO_EXIT_LOCK:
+                globals()["AUTO_EXIT_ARMED"] = False
+            logger.warning("AUTO-EXIT %s: flatten NOT confirmed — DISARMED; manual flatten required.", inst)
+            try:
+                url = _discord_url(at.get("profile", "") or inst)
+                if url:
+                    requests.post(url, json={"content":
+                        f"🛑 **AUTO EARLY-EXIT FAILED — {inst} {direction.upper()}**\n"
+                        f"The thesis is invalid but the exit order was NOT confirmed by the broker. "
+                        f"Flatten MANUALLY at your broker now. Auto Early-Exit has been DISARMED."},
+                        timeout=5)
+            except requests.RequestException:
+                pass
+            return
+    popped = clear_active_trade(inst, opened_at=opened)
+    if popped is None:
+        logger.info("AUTO-EXIT %s: position already closed by another path — no journal write.", inst)
+        return
+    exit_price, _src = display_price_for(inst)
+    dollar_pnl = None
+    pnl_str    = ""
+    if exit_price is not None:
+        try:
+            dollar_pnl, _pts = compute_pnl(popped, exit_price)
+        except Exception:
+            dollar_pnl = None
+    if dollar_pnl is not None:
+        pnl_str = f"+${dollar_pnl:,.0f}" if dollar_pnl >= 0 else f"-${abs(dollar_pnl):,.0f}"
+        outcome_str = (f"Win — Auto Exit {pnl_str} ✅" if dollar_pnl >= 0
+                       else f"Loss — Auto Exit {pnl_str} ❌")
+        _update_journal_outcome(outcome_str, pnl_dollars=dollar_pnl, symbol=inst)
+    else:
+        _update_journal_outcome("Closed — Auto Exit (thesis invalid)", symbol=inst)
+    label = "sent to the broker" if live_send else "paper close (tracked locally)"
+    try:
+        # Discord card gated to the LIVE instance (dev shares the webhook secrets —
+        # a dev paper-mode close must never post to the shared live channel).
+        url = _discord_url(popped.get("profile", "") or inst) if DISCORD_LIVE_ENABLED else ""
+        if url:
+            entry_px = popped.get("entry_price")
+            requests.post(url, json={"content":
+                f"🤖 **AUTO EARLY-EXIT — {inst} {direction.upper()} flattened**\n"
+                f"Thesis invalidated: {why}\n"
+                f"Entry `{entry_px}` · Exit `{exit_price if exit_price is not None else '—'}`"
+                + (f" · PnL **{pnl_str}**" if pnl_str else "")
+                + f"\nNon-reversing exit {label}."}, timeout=5)
+    except requests.RequestException:
+        pass
+    logger.info("AUTO-EXIT %s %s: flattened on confirmed-invalid thesis (%s).", inst, direction, why)
+
+
+def _auto_exit_watch_loop():
+    """AUTO EARLY-EXIT watch timer (AUTO_EXIT_WATCH_INTERVAL_SEC). Self-reschedules;
+    never dies. Only started at boot when AUTO_EXIT_ENABLED, and _auto_exit_scan is
+    itself inert unless owner-ARMED (armed/live gates INSIDE the loop body), so this
+    is a true no-op by default."""
+    try:
+        _auto_exit_scan()
+    except Exception as exc:
+        logger.warning("Auto-exit watch loop error: %s", exc)
+    finally:
+        threading.Timer(AUTO_EXIT_WATCH_INTERVAL_SEC, _auto_exit_watch_loop).start()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # BOT TRAINING MODE — staged validation toward autonomy (safety gate + ledger)
 # ════════════════════════════════════════════════════════════════════════════
 # Purpose: TRAIN / VALIDATE the bot through four staged gates rather than freeze it.
@@ -35038,7 +35267,7 @@ def dashboard():
   .mb-hidden{display:none !important}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-news):not(#mod-prop):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(.mb-hidden){display:none !important}
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
   #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
@@ -36731,6 +36960,23 @@ def dashboard():
   </div>
   <div class="se-reason" id="lr-note" style="margin-top:6px">Also needs a ≥2-contract setup AND TradersPost "Use signal quantity" turned ON. Splits a READY entry into a 1R primary + a trailed runner. Real orders. Resets OFF on restart.</div>
   <div id="lr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
+</div>
+
+<!-- AUTO EARLY-EXIT — the bot acts on its own Active Trade Management advice.
+     Owner-only arming control. Hidden unless AUTO_EXIT_ENABLED (env). The armed
+     flag is in-memory and RESETS OFF on every restart/publish. When armed, a
+     CONFIRMED-invalid thesis (structure flipped against an open bot position for
+     N consecutive checks — never a bare stop-touch) flattens that position with a
+     NON-REVERSING exit through the audited broker sink. -->
+<div class="mod" id="mod-autoexit" style="display:none">
+  <div class="mod-h">🤖 Auto Early-Exit <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ACTS ON ITS OWN ADVICE</span></div>
+  <div class="focus-row">
+    <span class="focus-lbl">Arm auto-exit</span>
+    <span id="ae-arm" class="mute-pill" role="button" tabindex="0" onclick="toggleAutoExit()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAutoExit();}">off</span>
+    <span id="ae-state" class="focus-lbl" style="opacity:.8"></span>
+  </div>
+  <div class="se-reason" id="ae-note" style="margin-top:6px">When the Active Trade Management thesis on an OPEN bot position turns INVALID (market structure confirmed against it — a stop-touch alone never triggers) for consecutive checks, the bot flattens that position with a non-reversing exit. Live orders send only on the published TradersPost instance; paper mode closes the tracked trade locally. Resets OFF on restart.</div>
+  <div id="ae-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
@@ -42973,7 +43219,7 @@ async function findCleanestTrade(btn){
 paintSndToggle();
 paintThemeToggle();
 window.addEventListener('pointerdown', _ensureAudio, { once: true });
-refresh(); resetInstrumentFocusOnce(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells();
+refresh(); resetInstrumentFocusOnce(); applyInstrumentFocus(); refreshRec(); loadMode(); loadAlertMutes(); loadAutoTrade(); loadAdvisor(); mbChatRender(); loadPropAccounts(); loadPropDecisions(); loadBotPositions(); loadRealResults(); scanEdgeBells(); loadAutoExit();
 autoSelectBestSetup();
 // Auto-follow the best available setup every 30s (user request): keeps the probability
 // dial pointed at the highest-quality trade across the focused instruments. DISPLAY-
@@ -43571,6 +43817,57 @@ function toggleLiveRunner(){
     })
     .catch(function(){ toast('Live-runner update failed', false); });
 }
+function renderAutoExit(ae){
+  const mod=document.getElementById('mod-autoexit');
+  if(!mod) return;
+  if(!ae || !ae.enabled){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const armEl=document.getElementById('ae-arm');
+  const on=!!ae.armed;
+  if(armEl){
+    armEl.textContent=on?'ARMED':'off';
+    armEl.classList.toggle('is-armed', on);
+    armEl.style.background=on?'rgba(239,68,68,.15)':'';
+    armEl.style.color=on?'#ef4444':'';
+    armEl.setAttribute('aria-pressed', on?'true':'false');
+  }
+  const st=document.getElementById('ae-state');
+  if(st){
+    if(!on){ st.textContent=''; }
+    else if(ae.can_act){ st.textContent='active — flattens on confirmed-invalid thesis'; st.style.color='var(--green)'; }
+    else {
+      var whyNot=(ae.mode==='traderspost' && !ae.live_instance)?'needs the published instance':('mode '+(ae.mode||'—')+' — needs traderspost or paper');
+      st.textContent='armed but inactive ('+whyNot+')'; st.style.color='#f59e0b';
+    }
+  }
+  const foot=document.getElementById('ae-foot');
+  if(foot){
+    var strikes=ae.strikes||{};
+    var sTxt=Object.keys(strikes).map(function(k){ return k+' '+(strikes[k].count||0)+'/'+ae.confirm_reads; }).join(' · ');
+    foot.textContent='Confirm '+ae.confirm_reads+' reads · check every '+ae.watch_interval_sec+'s · mode '+(ae.mode||'—')+(sTxt?(' · invalid streak: '+sTxt):'')+' · updated '+(ae.updated_at? new Date(ae.updated_at).toLocaleTimeString():'—');
+  }
+}
+async function loadAutoExit(){
+  try{
+    var r=await api('/auto-exit');
+    if(r && r.status==='ok') renderAutoExit(r.auto_exit);
+  }catch(e){ /* fail-open: keep last painted state */ }
+}
+function toggleAutoExit(){
+  const armEl=document.getElementById('ae-arm');
+  const cur=!!(armEl && armEl.classList.contains('is-armed'));
+  const next=!cur;
+  if(next){
+    if(!confirm('ARM Auto Early-Exit?\\n\\nWhen armed, if the thesis on an OPEN bot position turns INVALID (market structure confirmed against it) for consecutive checks, the bot FLATTENS that position automatically with a non-reversing exit order.\\n\\nA stop-touch alone never triggers it — your broker stop already covers that. Live orders send only on the published TradersPost instance; paper mode closes the tracked trade locally. Resets OFF on restart.')) return;
+  }
+  api('/auto-exit', { armed: next })
+    .then(function(r){
+      if(!r || r.status!=='ok'){ toast('Auto-exit update failed', false); return; }
+      renderAutoExit(r.auto_exit);
+      toast(next ? 'Auto Early-Exit ARMED' : 'Auto Early-Exit disarmed');
+    })
+    .catch(function(){ toast('Auto-exit update failed', false); });
+}
 function renderBotPositions(rows){
   var wrap = document.getElementById('mb-bot');
   var list = document.getElementById('mb-bot-list');
@@ -43658,6 +43955,7 @@ async function mbmtAdd(){
 }
 
 setInterval(() => { refresh(); refreshRec(); loadPropDecisions(); loadBotPositions(); loadTraining(); scanEdgeBells(); }, 3000);
+setInterval(loadAutoExit, 30000); // Auto Early-Exit status (arm state + invalid-streak) — light owner-only read
 setInterval(checkStale, 2000);
 loadTraining();
 </script>
@@ -43979,6 +44277,26 @@ def live_runner_toggle():
                 LIVE_RUNNER_ARMED = want
             logger.info("LIVE runner %s", "ARMED" if want else "DISARMED")
     return jsonify({"status": "ok", "live_runner": live_runner_status_view()}), 200
+
+
+@app.route("/auto-exit", methods=["GET", "POST"])
+def auto_exit_toggle():
+    """Read or ARM/DISARM AUTO EARLY-EXIT (the bot acting on its own Active Trade
+    Management advice). POST {armed: bool} flips the in-memory AUTO_EXIT_ARMED flag.
+    Owner-only (Basic Auth + CSRF via the Express proxy; deliberately NOT in
+    OPEN_PATHS). The flag RESETS OFF on every restart/republish (fail-safe toward
+    advisory-only). Arming never touches the entry gateway, gate, scoring or
+    sizing — it only allows the watcher's non-reversing flatten. Returns the full
+    status view either way (GET is a pure read)."""
+    global AUTO_EXIT_ARMED
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "armed" in data:
+            want = bool(data.get("armed"))
+            with AUTO_EXIT_LOCK:
+                AUTO_EXIT_ARMED = want
+            logger.info("AUTO EARLY-EXIT %s", "ARMED" if want else "DISARMED")
+    return jsonify({"status": "ok", "auto_exit": _auto_exit_status_view()}), 200
 
 
 @app.route("/prop-protection", methods=["GET", "POST"])
@@ -46182,6 +46500,8 @@ if __name__ == "__main__":
     threading.Timer(0, _managed_watch_loop).start()  # open-trade exit (stop/TP) watcher on its own fast timer (MANAGED_WATCH_INTERVAL); no-op while flat, never feeds the gate
     if LIVE_RUNNER_ENABLED:
         threading.Timer(0, _live_runner_watch_loop).start()  # LIVE 2-contract runner watcher (own timer); only started when the feature is enabled, and itself inert unless armed
+    if AUTO_EXIT_ENABLED:
+        threading.Timer(0, _auto_exit_watch_loop).start()  # AUTO EARLY-EXIT watcher (own timer); inert unless owner-ARMED via /auto-exit (arm resets OFF each restart); live sends only on the LIVE traderspost instance, paper closes locally
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
