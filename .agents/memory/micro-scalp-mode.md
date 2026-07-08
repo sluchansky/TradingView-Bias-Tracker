@@ -53,6 +53,20 @@ is the ONLY writer), keep the observer webhook-source-only, keep the single-exit
 rule, and keep all DB work INSERT/SELECT/UPDATE on its own table (no DDL — prod
 table arrives via Publish schema-diff).
 
+**Real-order ledger (`micro_scalp_live_orders`):** every gateway outcome for
+`source="micro_scalp"` is INSERTed display-only + fail-open — status `sent`
+(live), `simulated` (paper), AND `verify_required` (ambiguous broker response —
+never let the scariest case be invisible). Read TTL-cached into
+`micro_scalp.live_orders` (`{db_ready, orders, total, total_sent}`) for the
+dashboard "REAL ORDERS SENT" section; headline counts only `total_sent`
+(live), paper/other named separately. Fills/P&L never flow back from the
+broker — the ledger records what was TRANSMITTED, it must never fabricate an
+outcome. Readiness probe RE-TRIES whenever not-ready (ghost convention; a
+probe-once flag would let one DB blip silently disable the ledger until
+restart). Table has NO in-app DDL — dev via database tool, prod via Publish
+schema-diff (orders sent before the next republish are log-only, not in the
+ledger).
+
 **Gotchas learned:**
 - `/status` has a 3s payload cache (`STATUS_CACHE_TTL_SEC`) — a toggle can look
   "ignored" for up to ~3s; smokes must zero the TTL, not poll-and-pray.

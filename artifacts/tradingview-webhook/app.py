@@ -28465,6 +28465,134 @@ def _micro_ghost_stats(inst=None):
     return out
 
 
+MICRO_LIVE_DB_READY = False
+_MICRO_LIVE_ORDERS_CACHE = {}
+_MICRO_LIVE_ORDERS_LOCK = threading.Lock()
+MICRO_LIVE_ORDERS_TTL = 45.0
+
+
+def _check_micro_live_db_ready():
+    """No-DDL readiness probe for micro_scalp_live_orders (mirrors the ghost-table
+    convention: the table is created by the database tool in dev and arrives in prod
+    via the Publish schema-diff — the app NEVER runs CREATE TABLE)."""
+    global MICRO_LIVE_DB_READY
+    conn = _learning_conn()
+    if conn is None:
+        MICRO_LIVE_DB_READY = False
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM micro_scalp_live_orders LIMIT 1")
+            cur.fetchall()
+        MICRO_LIVE_DB_READY = True
+    except Exception as exc:
+        MICRO_LIVE_DB_READY = False
+        logger.warning("micro live-order table not ready: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _record_micro_live_order(inst, plan, provider, status):
+    """Persist ONE row for a REAL micro-scalp order the gateway just transmitted
+    (or paper-simulated). Display-only ledger — INSERT/SELECT only, FAIL-OPEN:
+    a ledger failure never touches the send, tracking or dedupe (the order is
+    already on its way when this runs)."""
+    if not MICRO_LIVE_DB_READY:
+        _check_micro_live_db_ready()
+    if not MICRO_LIVE_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO micro_scalp_live_orders "
+                "(instrument, direction, quantity, entry, stop, target, provider, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (inst, plan.get("direction"),
+                 int(plan.get("quantity")) if plan.get("quantity") is not None else None,
+                 _f(plan.get("entry")), _f(plan.get("stopLoss")),
+                 _f(plan.get("takeProfit")), provider, status))
+        with _MICRO_LIVE_ORDERS_LOCK:
+            _MICRO_LIVE_ORDERS_CACHE.clear()
+        logger.info("Micro live-order ledger recorded: %s %s x%s (%s)",
+                    inst, plan.get("direction"), plan.get("quantity"), status)
+    except Exception as exc:
+        logger.warning("micro live-order ledger insert failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _micro_live_orders(inst=None):
+    """REAL-ORDER ledger read for the dashboard (TTL-cached, fail-open). Returns
+    the newest orders actually handed to the broker for this instrument — the
+    honest counterpart to the ghost ledger. Fills/outcomes settle at the broker;
+    this app never receives them, so no outcome is fabricated here."""
+    key = inst or "__ALL__"
+    now_mono = time.monotonic()
+    with _MICRO_LIVE_ORDERS_LOCK:
+        hit = _MICRO_LIVE_ORDERS_CACHE.get(key)
+        if hit and (now_mono - hit["ts"]) < MICRO_LIVE_ORDERS_TTL:
+            return hit["data"]
+    out = {"db_ready": False, "orders": [], "total": 0, "total_sent": 0}
+    if not MICRO_LIVE_DB_READY:
+        _check_micro_live_db_ready()
+    out["db_ready"] = bool(MICRO_LIVE_DB_READY)
+    if not MICRO_LIVE_DB_READY:
+        with _MICRO_LIVE_ORDERS_LOCK:
+            _MICRO_LIVE_ORDERS_CACHE[key] = {"ts": now_mono, "data": out}
+        return out
+    conn = _learning_conn()
+    if conn is None:
+        return out
+    try:
+        with conn.cursor() as cur:
+            where = "WHERE instrument = %s" if inst else ""
+            args  = (inst,) if inst else ()
+            cur.execute(
+                "SELECT instrument, direction, quantity, entry, stop, target, "
+                "provider, status, sent_at "
+                "FROM micro_scalp_live_orders %s "
+                "ORDER BY id DESC LIMIT 8" % where, args)
+            for r in cur.fetchall():
+                out["orders"].append({
+                    "instrument": r[0], "direction": r[1],
+                    "quantity": r[2],
+                    "entry": float(r[3]) if r[3] is not None else None,
+                    "stop": float(r[4]) if r[4] is not None else None,
+                    "target": float(r[5]) if r[5] is not None else None,
+                    "provider": r[6], "status": r[7],
+                    "sent_at": fmt_et(r[8]) if r[8] is not None else None})
+            cur.execute("SELECT COUNT(*), "
+                        "COUNT(*) FILTER (WHERE status = 'sent') "
+                        "FROM micro_scalp_live_orders %s" % where, args)
+            _tot, _sent = cur.fetchone()
+            out["total"] = int(_tot)
+            out["total_sent"] = int(_sent)
+    except Exception as exc:
+        logger.warning("micro live-order ledger read failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    with _MICRO_LIVE_ORDERS_LOCK:
+        _MICRO_LIVE_ORDERS_CACHE[key] = {"ts": now_mono, "data": out}
+    return out
+
+
 def compute_micro_scalp(result):
     """Full Micro Scalp Brain block for the CURRENT result — pure-engine read +
     ghost ledger summary. DISPLAY-ONLY; FAIL-OPEN to the neutral schema."""
@@ -28486,6 +28614,10 @@ def compute_micro_scalp(result):
         block["ghost"] = _micro_ghost_stats(inst)
     except Exception:
         block["ghost"] = {"db_ready": False, "open": [], "recent": [], "stats": {}}
+    try:
+        block["live_orders"] = _micro_live_orders(inst)
+    except Exception:
+        block["live_orders"] = {"db_ready": False, "orders": [], "total": 0, "total_sent": 0}
     return block
 
 
@@ -35461,6 +35593,15 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
             plan = result.get("plan") or {}
+            if source == "micro_scalp":
+                # REAL-ORDER ledger (display-only): remember exactly what was just
+                # transmitted for the dashboard "real orders" list. FAIL-OPEN —
+                # the order is already sent; a ledger hiccup changes nothing.
+                try:
+                    _record_micro_live_order(inst, plan,
+                                             (result or {}).get("provider"), status)
+                except Exception:
+                    pass
             # Option C (S4): a SCALP dynamic PAPER (simulated, non-live) auto entry is
             # tracked SOLELY by the MANAGED_TRADES dynamic lifecycle (blended-R journal
             # / outcome / learning). Creating a 1-slot ACTIVE_TRADE here would let
@@ -35509,6 +35650,15 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
             # tracking write above failed (the position is real; verify manually).
             return True
         elif (result or {}).get("broker_verify_required"):
+            if source == "micro_scalp":
+                # The order MAY be live — record it in the real-order ledger as
+                # verify_required so the ambiguous case is never invisible. Fail-open.
+                try:
+                    _record_micro_live_order(inst, (result or {}).get("plan") or {},
+                                             (result or {}).get("provider"),
+                                             "verify_required")
+                except Exception:
+                    pass
             # Ambiguous live send - the order MAY be live. Disarm the CALLER'S
             # arm toggle so it can't keep firing into an uncertain broker state;
             # require manual re-enable + broker verification. disarm_cb (micro
@@ -37029,6 +37179,9 @@ def dashboard():
     <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:10px 0 4px">Ghost ledger <span style="color:#6b7280;font-weight:400">(what it WOULD have done &mdash; simulated, not broker fills)</span></div>
     <div id="msc-ghost-stats" style="font-size:11px;color:#9ca3af">&mdash;</div>
     <div id="msc-ghost-rows" style="font-size:10px;margin-top:4px"></div>
+    <div style="font-size:10px;letter-spacing:1px;color:#f87171;margin-top:8px;font-weight:600">REAL ORDERS SENT (this market)</div>
+    <div id="msc-live-stats" style="font-size:11px;color:#9ca3af">&mdash;</div>
+    <div id="msc-live-rows" style="font-size:10px;margin-top:4px"></div>
   </div>
   <div class="nf-fid">Micro Scalp Mode is fully separate from your SCALP/SWING bot &mdash; display &amp; ghost logging only; it never places, blocks or resizes real trades.</div>
 </div>
@@ -40003,6 +40156,40 @@ function renderMicroScalp(d){
       c.style.cssText = 'color:#6b7280;margin-left:auto';
       line.appendChild(a); line.appendChild(b); line.appendChild(c);
       rows.appendChild(line);
+    });
+  }
+  const lo = ms.live_orders || null;
+  const ls = document.getElementById('msc-live-stats');
+  if(ls){
+    if(lo && lo.db_ready && lo.orders && lo.orders.length){
+      const sent = lo.total_sent || 0, other = (lo.total || 0) - sent;
+      ls.textContent = (sent ? sent + ' LIVE order' + (sent === 1 ? '' : 's') + ' sent to the broker' : 'No LIVE orders yet') +
+        (other > 0 ? ' \u00b7 ' + other + ' paper/other' : '') +
+        ' \u00b7 fills & P/L settle at the broker';
+    } else if(lo && !lo.db_ready){
+      ls.textContent = 'Real-order ledger unavailable (table not ready) \u2014 sends still work & are logged.';
+    } else {
+      ls.textContent = 'No real orders yet \u2014 the moment LIVE fires one, it appears here.';
+    }
+  }
+  const lrows = document.getElementById('msc-live-rows');
+  if(lrows){
+    lrows.replaceChildren();
+    ((lo && lo.orders) || []).slice(0, 6).forEach(function(o){
+      const line = document.createElement('div');
+      line.style.cssText = 'padding:3px 0;border-top:1px solid var(--border,#2a2a3a);display:flex;gap:8px;flex-wrap:wrap';
+      const a = document.createElement('span');
+      a.textContent = (o.instrument || '?') + ' ' + (o.direction || '') + ' x' + (o.quantity != null ? o.quantity : '?');
+      a.style.cssText = 'font-weight:600;color:#fca5a5';
+      const b = document.createElement('span');
+      b.textContent = (o.status === 'sent' ? 'SENT' : String(o.status || '').toUpperCase()) +
+        (o.provider ? ' via ' + o.provider : '') +
+        ' \u00b7 entry ' + o.entry + ' \u00b7 stop ' + o.stop + ' \u00b7 TP ' + o.target;
+      const c = document.createElement('span');
+      c.textContent = o.sent_at || '';
+      c.style.cssText = 'color:#6b7280;margin-left:auto';
+      line.appendChild(a); line.appendChild(b); line.appendChild(c);
+      lrows.appendChild(line);
     });
   }
 }
