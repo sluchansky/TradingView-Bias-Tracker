@@ -36049,9 +36049,11 @@ def dashboard():
   /* Panels consolidated into Main Brain — hidden with !important so the existing
      render JS (which toggles inline display) can stay intact and still stay hidden. */
   .mb-hidden{display:none !important}
+  .cp-btn{font-size:11px;padding:4px 10px;border-radius:6px;border:1px solid var(--border,#2a2a3a);background:#1f2430;color:#e8e8f0;cursor:pointer;letter-spacing:.5px}
+  .cp-btn.active{background:#2563eb;border-color:#2563eb;color:#fff}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(.mb-hidden){display:none !important}
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
   #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
@@ -36800,6 +36802,30 @@ def dashboard():
       <input id="mb-chat-input" type="text" placeholder="Ask anything — e.g. would you long or short here? what are you watching next?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
       <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Send</button>
     </div>
+  </div>
+  <!-- ════ Live Chart Preview — TradingView Advanced Chart embed (DISPLAY-ONLY).
+       Pure view layer for visual confirmation next to the bot's verdict. It never
+       reads into or feeds the gate, alerts, tracking, ENTER eligibility or any
+       webhook/broker logic. Symbol/timeframe persist per device (localStorage). ════ -->
+  <div class="mod" id="mod-chartprev">
+    <div class="mod-h">📈 Live Chart Preview
+      <span id="cp-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:6px">&mdash;</span>
+      <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">VIEW-ONLY</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+      <button type="button" id="cp-sym-MNQ" class="cp-btn" onclick="cpSetSym('MNQ')">MNQ</button>
+      <button type="button" id="cp-sym-MGC" class="cp-btn" onclick="cpSetSym('MGC')">MGC</button>
+      <span style="width:8px"></span>
+      <button type="button" id="cp-tf-1" class="cp-btn" onclick="cpSetTf('1')">1m</button>
+      <button type="button" id="cp-tf-5" class="cp-btn" onclick="cpSetTf('5')">5m</button>
+      <button type="button" id="cp-tf-15" class="cp-btn" onclick="cpSetTf('15')">15m</button>
+      <button type="button" id="cp-tf-60" class="cp-btn" onclick="cpSetTf('60')">1h</button>
+      <button type="button" id="cp-follow" class="cp-btn" onclick="cpToggleFollow()" title="When ON, the chart snaps to the instrument the bot has a live trade idea on (READY verdict). Clicking a symbol button turns follow off so your pick sticks.">FOLLOW: ON</button>
+    </div>
+    <div style="position:relative;width:100%;height:420px;border:1px solid var(--border,#2a2a3a);border-radius:8px;overflow:hidden;background:#0d1117">
+      <iframe id="cp-frame" title="TradingView chart" style="position:absolute;inset:0;width:100%;height:100%;border:0" allowfullscreen loading="lazy" referrerpolicy="no-referrer"></iframe>
+    </div>
+    <div class="nf-fid">View-only TradingView embed for visual confirmation &mdash; it never affects alerts, tracking or order logic.</div>
   </div>
   <!-- ════ Market Intelligence (DISPLAY-FIRST; fed by d.market_intelligence). Classifies the
        tape into a market state, scores Long/Short Directional Confidence, holds trend memory
@@ -39145,6 +39171,9 @@ function renderModules(d){
 
   // ── Module 9b: Today's trades (per-trade list) — display-only ──
   renderTodaysTrades(d);
+
+  // ── Live Chart Preview (view-only TradingView embed; follows live trade ideas) ──
+  renderChartPreview(d);
 
   // ── Module 10: News filter (economic calendar) — display-only ──
   renderNewsFilter(d);
@@ -41736,6 +41765,62 @@ async function ttFetchOverride(){
     if (ttInst && ttInst!==reqInst) ttFetchOverride();
   }
 }
+
+// ── Live Chart Preview — TradingView embed (DISPLAY-ONLY view layer) ────────
+// Pure UI: renders an external TradingView chart for visual confirmation only.
+// It reads d.verdict/d.active_ticker to auto-follow live trade ideas and NEVER
+// feeds anything back into alerts, tracking, ENTER eligibility or webhooks.
+const CP_TV_SYMBOLS = { MNQ:'CME_MINI:MNQ1!', MGC:'COMEX:MGC1!', MES:'CME_MINI:MES1!', MYM:'CBOT_MINI:MYM1!' };
+const CP_TFS = ['1','5','15','60'];
+let cpSym='MNQ', cpTf='5', cpFollow=true, cpLoadedKey=null;
+try {
+  const cs=localStorage.getItem('cpSym'); if (cs && CP_TV_SYMBOLS[cs]) cpSym=cs;
+  const ct=localStorage.getItem('cpTf');  if (ct && CP_TFS.indexOf(ct)>=0) cpTf=ct;
+  cpFollow = localStorage.getItem('cpFollow') !== '0';
+} catch(e){}
+function cpBuildSrc(){
+  const tvs = CP_TV_SYMBOLS[cpSym] || CP_TV_SYMBOLS.MNQ;
+  return 'https://s.tradingview.com/widgetembed/?symbol='+encodeURIComponent(tvs)
+    + '&interval='+encodeURIComponent(cpTf)
+    + '&theme=dark&style=1&locale=en&timezone=America%2FNew_York'
+    + '&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&withdateranges=0';
+}
+function cpApply(){
+  const f=document.getElementById('cp-frame');
+  if (f){
+    const key=cpSym+'|'+cpTf;
+    // Only (re)load the iframe on a REAL symbol/timeframe change — the 3s
+    // /status poll calls through here and must never reload the chart.
+    if (key!==cpLoadedKey){ f.src=cpBuildSrc(); cpLoadedKey=key; }
+  }
+  Object.keys(CP_TV_SYMBOLS).forEach(function(s){
+    const b=document.getElementById('cp-sym-'+s); if (b) b.classList.toggle('active', s===cpSym);
+  });
+  CP_TFS.forEach(function(t){
+    const b=document.getElementById('cp-tf-'+t); if (b) b.classList.toggle('active', t===cpTf);
+  });
+  const fb=document.getElementById('cp-follow');
+  if (fb){ fb.textContent='FOLLOW: '+(cpFollow?'ON':'OFF'); fb.classList.toggle('active', cpFollow); }
+  const meta=document.getElementById('cp-meta');
+  if (meta) meta.textContent='\u00b7 '+(CP_TV_SYMBOLS[cpSym]||cpSym)+' \u00b7 '+(cpTf==='60'?'1h':cpTf+'m');
+  try {
+    localStorage.setItem('cpSym',cpSym); localStorage.setItem('cpTf',cpTf);
+    localStorage.setItem('cpFollow', cpFollow?'1':'0');
+  } catch(e){}
+}
+function cpSetSym(s){ cpFollow=false; cpSym=s; cpApply(); }
+function cpSetTf(t){ cpTf=t; cpApply(); }
+function cpToggleFollow(){ cpFollow=!cpFollow; cpApply(); }
+function renderChartPreview(d){
+  try {
+    if (cpFollow && d && jsIsActionable(d.verdict)){
+      const inst=String(d.active_ticker||'').replace('1!','');
+      if (inst && CP_TV_SYMBOLS[inst]) cpSym=inst;
+    }
+  } catch(e){}
+  cpApply();
+}
+cpApply();
 
 function renderTodaysTrades(d){
   ttLastMainD = d;
