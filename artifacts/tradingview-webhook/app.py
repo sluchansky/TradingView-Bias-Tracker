@@ -37162,10 +37162,18 @@ def dashboard():
      while OFF). ALL dynamic strings rendered via textContent (XSS-safe). -->
 <div class="mod" id="mod-microscalp">
   <div class="mod-h">⚡ Micro Scalp Brain <span id="msc-badge" style="font-size:10px;padding:1px 8px;border-radius:8px;background:#6b7280;color:#fff;margin-left:6px">OFF</span><span id="msc-ghostonly" style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto" title="Ghost mode: it logs the trades it WOULD take. Arm LIVE to let a TAKE also place a real order.">GHOST ONLY</span></div>
-  <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+  <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px;flex-wrap:wrap">
     <button id="msc-toggle" onclick="toggleMicroScalp()" style="font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid var(--border,#2a2a3a);background:#1f2430;color:#e8e8f0;cursor:pointer">Turn ON</button>
     <button id="msc-live-btn" onclick="toggleMicroLive()" style="display:none;font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid #7f1d1d;background:#2a1215;color:#fca5a5;cursor:pointer;font-weight:700" title="When armed, a TAKE fires a REAL broker order through the same safety-checked gateway as the main bot. Resets to disarmed on every restart.">ARM LIVE</button>
     <span style="font-size:10px;color:#6b7280">Hunts liquidity sweeps &amp; trapped traders for quick 5&ndash;10 pt moves. Ghost trades always log; LIVE only fires when you arm it.</span>
+  </div>
+  <div style="display:flex;gap:4px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+    <span style="font-size:10px;color:#6b7280;margin-right:2px">Market:</span>
+    <button class="msc-ip" data-inst="MGC" onclick="switchMscInst('MGC')" style="font-size:10px;padding:2px 9px;border-radius:10px;border:1px solid #2a2a3a;background:#1a1f2e;color:#6b7280;cursor:pointer">MGC</button>
+    <button class="msc-ip" data-inst="MNQ" onclick="switchMscInst('MNQ')" style="font-size:10px;padding:2px 9px;border-radius:10px;border:1px solid #2a2a3a;background:#1a1f2e;color:#6b7280;cursor:pointer">MNQ</button>
+    <button class="msc-ip" data-inst="MES" onclick="switchMscInst('MES')" style="font-size:10px;padding:2px 9px;border-radius:10px;border:1px solid #2a2a3a;background:#1a1f2e;color:#6b7280;cursor:pointer">MES</button>
+    <button class="msc-ip" data-inst="MYM" onclick="switchMscInst('MYM')" style="font-size:10px;padding:2px 9px;border-radius:10px;border:1px solid #2a2a3a;background:#1a1f2e;color:#6b7280;cursor:pointer">MYM</button>
+    <span id="msc-inst-note" style="font-size:10px;color:#6b7280;margin-left:2px">(follows page tab)</span>
   </div>
   <div id="msc-body" style="display:none">
     <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
@@ -39006,7 +39014,10 @@ function gaugeColor(v,prob){
 function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
-  renderMicroScalp(d);
+  window._mscPageData = d;
+  var _mscMainInst = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '';
+  renderMscInstPills(_mscMainInst);
+  if (mscInst && mscInst !== _mscMainInst) { refreshMscPanel(); } else { renderMicroScalp(d); }
   renderMainBrainCognitive(d);
   try{ renderStalkMode(d); }catch(e){}
   try{ renderActiveThinking(d); }catch(e){}
@@ -40057,6 +40068,8 @@ function _dsTierTable(title, sc, sw){
 // is ABSENT while the mode is OFF. Toggle posts /micro-scalp (owner-only via the
 // Express proxy). All dynamic strings go through textContent (XSS-safe).
 let mscEnabled = false, mscBusy = false, mscLive = false, mscLiveBusy = false;
+let mscInst = (function(){ try{ return localStorage.getItem('mscInst') || null; }catch(e){ return null; } })();
+let mscPanelFetching = false, mscPanelTs = 0;
 function renderMicroScalp(d){
   const mod = document.getElementById('mod-microscalp'); if(!mod) return;
   const ms = (d && d.main_brain) ? d.main_brain.micro_scalp : null;
@@ -40192,6 +40205,40 @@ function renderMicroScalp(d){
       lrows.appendChild(line);
     });
   }
+}
+function renderMscInstPills(pageInst){
+  const eff = mscInst || pageInst;
+  document.querySelectorAll('.msc-ip').forEach(function(b){
+    const on = b.dataset.inst === eff;
+    b.style.background = on ? '#1e3a5f' : '#1a1f2e';
+    b.style.color = on ? '#93c5fd' : '#6b7280';
+    b.style.borderColor = on ? '#3b82f6' : '#2a2a3a';
+    b.style.fontWeight = on ? '700' : '400';
+  });
+  var note = document.getElementById('msc-inst-note');
+  if(note) note.textContent = (mscInst && mscInst !== pageInst) ? '(pinned — click again to unpin)' : '(follows page tab)';
+}
+async function refreshMscPanel(){
+  if(mscPanelFetching || !mscInst) return;
+  var now = Date.now();
+  if(now - mscPanelTs < 2800) return;
+  mscPanelFetching = true;
+  mscPanelTs = now;
+  var reqInst = mscInst;
+  try{
+    var od = await api('/status?ticker=' + reqInst);
+    if(mscInst === reqInst) renderMicroScalp(od);
+  } catch(e){}
+  mscPanelFetching = false;
+}
+function switchMscInst(inst){
+  var pageInst = (window._mscPageData && window._mscPageData.active_ticker)
+    ? String(window._mscPageData.active_ticker).replace('1!','') : '';
+  mscInst = (mscInst === inst) ? null : inst;
+  try{ if(mscInst) localStorage.setItem('mscInst', mscInst); else localStorage.removeItem('mscInst'); }catch(e){}
+  renderMscInstPills(pageInst);
+  if(mscInst && mscInst !== pageInst){ mscPanelTs = 0; refreshMscPanel(); }
+  else if(!mscInst && window._mscPageData) renderMicroScalp(window._mscPageData);
 }
 async function toggleMicroScalp(){
   if(mscBusy) return;
