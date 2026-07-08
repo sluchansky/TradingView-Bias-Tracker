@@ -36815,6 +36815,8 @@ def dashboard():
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
       <button type="button" id="cp-sym-MNQ" class="cp-btn" onclick="cpSetSym('MNQ')">MNQ</button>
       <button type="button" id="cp-sym-MGC" class="cp-btn" onclick="cpSetSym('MGC')">MGC</button>
+      <button type="button" id="cp-sym-MES" class="cp-btn" onclick="cpSetSym('MES')">MES</button>
+      <button type="button" id="cp-sym-MYM" class="cp-btn" onclick="cpSetSym('MYM')">MYM</button>
       <span style="width:8px"></span>
       <button type="button" id="cp-tf-1" class="cp-btn" onclick="cpSetTf('1')">1m</button>
       <button type="button" id="cp-tf-5" class="cp-btn" onclick="cpSetTf('5')">5m</button>
