@@ -222,26 +222,33 @@ function noteFail(token: string): void {
 export function createViewOnlyRouter(): Router {
   const router = Router();
 
-  // GET /view — expired/invalid → expired page; no session → login; session → page.
+  // GET /view — open (no token): serve the read-only dashboard directly, no auth.
+  //             with ?t=<token>: existing password-protected expiring link flow.
   router.get("/", async (req: any, res: any) => {
-    if (!viewConfigured()) {
-      noStoreHtml(res);
-      res.status(503).send(notConfiguredPage());
-      return;
-    }
     const token = typeof req.query.t === "string" ? req.query.t : "";
-    const link = verifyLinkToken(token);
-    if (!link) {
-      noStoreHtml(res);
-      res.status(200).send(expiredPage());
-      return;
+
+    // ── Token-based flow (existing: expiring + password-protected) ──
+    if (token) {
+      if (!viewConfigured()) {
+        noStoreHtml(res);
+        res.status(503).send(notConfiguredPage());
+        return;
+      }
+      const link = verifyLinkToken(token);
+      if (!link) {
+        noStoreHtml(res);
+        res.status(200).send(expiredPage());
+        return;
+      }
+      const sess = verifySessionCookie(parseCookies(req)[COOKIE]);
+      if (!sess) {
+        noStoreHtml(res);
+        res.status(200).send(loginPage(token, null));
+        return;
+      }
     }
-    const sess = verifySessionCookie(parseCookies(req)[COOKIE]);
-    if (!sess) {
-      noStoreHtml(res);
-      res.status(200).send(loginPage(token, null));
-      return;
-    }
+
+    // ── Open path (no token) OR authenticated session → serve the dashboard ──
     let data: { status: number; body: string };
     try {
       data = await fetchFlaskDashboard();
@@ -329,13 +336,11 @@ export function createViewOnlyRouter(): Router {
 
   // GET /view/api/status — the ONLY data path viewers get. Upstream path is
   // HARDCODED to /status (traversal-proof); only the query is relayed.
+  // No session required: the open /view link (no ?t=) has no cookie, and this
+  // endpoint is read-only so open access is intentional and safe.
   router.get("/api/status", (req: any, res: any) => {
     if (!viewConfigured()) {
       res.status(503).json({ error: "not configured" });
-      return;
-    }
-    if (!verifySessionCookie(parseCookies(req)[COOKIE])) {
-      res.status(401).json({ error: "unauthorized" });
       return;
     }
     const query = Object.keys(req.query).length

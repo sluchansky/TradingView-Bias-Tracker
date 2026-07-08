@@ -5,13 +5,24 @@ description: Express-only watch-only dashboard link; the no-referrer vs Origin:n
 
 # View-only shareable dashboard link
 
-A watch-only, expiring, password-protected link that lets non-owners VIEW the
-live dashboard read-only. It is **Express-only** (Flask `app.py` left
-byte-identical except one additive Share button). Lives entirely under `/view`
-on the api-server. Stateless HMAC tokens (keys derived from DASHBOARD_PASSWORD);
-the ONLY data path a viewer can reach is `GET /view/api/status` (upstream path
+Two access modes both live under `/view` on the api-server:
+1. **Open (no-password):** `GET /view` with no `?t=` param → dashboard served
+   immediately, no auth, no cookie. `/view/api/status` also requires no session
+   cookie — intentionally open (read-only data). Share button copies the bare
+   `/view` URL.
+2. **Token-based (legacy):** `GET /view?t=<token>` → existing password-protected
+   expiring flow (still works unchanged).
+
+The ONLY data path any viewer can reach is `GET /view/api/status` (upstream path
 hardcoded to `/status`, only the query relayed) — every other method/path under
-`/view/api` is 403 fail-closed.
+`/view/api` is 403 fail-closed. Flask `app.py` has one additive Share button.
+
+**JS escape trap in dashboard strings:** `\n` (single backslash-n) in a Python
+triple-quoted string = raw newline at render time → JS single-quoted string
+syntax error (node-check catches it). Either use `\\n` in Python source (→ `\n`
+in file → newline char in runtime string → STILL a raw newline in the served JS)
+OR simply avoid escape sequences entirely. The safe rule: use no `\n`/`\t`/`\r`
+in dashboard JS string literals; use space or em-dash separators instead.
 
 ## Gotcha 1 — a new Express route path must be added to the proxy `paths`
 **Rule:** adding an `app.use("/newprefix", …)` in the api-server is NOT enough.
