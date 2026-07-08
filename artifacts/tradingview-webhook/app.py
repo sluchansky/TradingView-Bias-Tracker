@@ -8914,6 +8914,12 @@ GOVERNOR_STATS         = {"ready": False, "trade_count": 0, "last_refreshed_at":
 MEMORY_TRADES          = []                         # capped rolling list of recent closed trades for the Professional Memory Engine
 MEMORY_TRADES_MAX      = 300                        # cap on the in-memory similar-trades cache
 TRADEZELLA_MEMORY_MAX  = 75                         # cap on imported-journal rows APPENDED after live trades (never evicts live)
+LEARNING_LIVE_MIN_SAMPLE      = int(os.environ.get("LEARNING_LIVE_MIN_SAMPLE", "50"))  # min trades before instrument is live-eligible
+LEARNING_SETUP_DISABLE_MIN_N  = 15    # min trades before a setup can be auto-disabled
+LEARNING_SETUP_DISABLE_MAX_WR = 0.25  # win-rate ceiling for "repeatedly failing" detection
+LEARNING_SETUP_DISABLE_MAX_EXP = -0.5  # expectancy ceiling for "repeatedly failing" detection
+LEARNING_ELIGIBILITY          = {}    # instrument -> Rule Engine verdict (in-memory; DB-backed after recompute)
+LEARNING_ELIGIBILITY_LOCK     = threading.Lock()
 # ── Shared Trade Memory weighting (display-only; governor + analyst single source).
 # STRATEGY_VERSION is bumped MANUALLY whenever the trade LOGIC (filters / indicators
 # / rules) changes; prior-version closed trades are then heavily down-weighted so
@@ -10588,6 +10594,56 @@ def _derive_trade_outcome(mt, ctx):
         return ("Outcome recorded.", "normal")
 
 
+def _derive_trade_label(mt, ctx):
+    """11-label failure classifier stored as trade_label in strategy_trades.
+    DISPLAY + Rule Engine diagnostics; never gates. Fail-open -> 'UNCATEGORIZED'."""
+    try:
+        outcome = (mt.get("outcome") or "").strip()
+        if not outcome:
+            return "UNCATEGORIZED"
+        def _f(v):
+            try: return float(v) if v is not None else None
+            except Exception: return None
+        r     = _f(mt.get("r_multiple")) or 0.0
+        mfe_r = _f(mt.get("mfe_r"))    or 0.0
+        mae_r = _f(mt.get("mae_r"))    or 0.0
+        ctx   = ctx or {}
+        eff   = None
+        try: eff = int(ctx.get("entry_efficiency") if ctx.get("entry_efficiency") is not None else -1)
+        except Exception: pass
+        edge  = _f(ctx.get("edge_score"))
+        sess  = (ctx.get("session") or mt.get("session") or "").upper()
+        is_win = "Win" in outcome
+        is_be  = outcome == "Breakeven" or (-0.15 < r < 0.15)
+        if is_win:
+            if mfe_r >= 0.8 and r < 0.4:
+                return "TP1_THEN_BE"
+            return "WIN"
+        if is_be:
+            if mfe_r >= 0.8:
+                return "TP1_THEN_BE"
+            return "BREAKEVEN"
+        if mfe_r >= 0.8:
+            return "TP1_THEN_BE"
+        if eff is not None and eff >= 0 and eff < 45:
+            return "LATE_ENTRY"
+        if eff is not None and eff >= 0 and eff > 85 and r < 0:
+            return "EARLY_ENTRY"
+        if abs(mae_r) < 0.3 and mfe_r < 0.3:
+            return "STOPPED_BEFORE_MOVE"
+        if mae_r < -0.8 and mfe_r > abs(mae_r) * 0.5:
+            return "STOP_TOO_TIGHT"
+        if edge is not None and edge < 45:
+            return "BAD_SETUP"
+        if sess and any(s in sess for s in ("LUNCH", "MIDDAY", "OVERNIGHT")):
+            return "BAD_SESSION"
+        if mfe_r < 0.25:
+            return "NO_FOLLOW_THROUGH"
+        return "LOSS"
+    except Exception:
+        return "UNCATEGORIZED"
+
+
 def _record_strategy_trade(mt):
     """Persist one CLOSED managed trade for adaptive analytics. FAIL-OPEN and
     idempotent (managed_key UNIQUE + ON CONFLICT DO NOTHING so an idempotent
@@ -10645,6 +10701,10 @@ def _record_strategy_trade(mt):
             outcome_reason, outcome_tag = _derive_trade_outcome(mt, ctx)
         except Exception:
             outcome_reason, outcome_tag = None, None
+        try:
+            trade_label = _derive_trade_label(mt, ctx)
+        except Exception:
+            trade_label = None
         row = (
             managed_key,
             mt.get("journal_id"),
@@ -10682,6 +10742,7 @@ def _record_strategy_trade(mt):
             ctx.get("volatility_type"),
             TRADING_MODE,
             STRATEGY_VERSION,
+            trade_label,
         )
         conn = _learning_conn()
         if conn is None:
@@ -10697,9 +10758,9 @@ def _record_strategy_trade(mt):
                         entry_efficiency, momentum_score, grade, scalper_grade,
                         mfe_r, mae_r, slippage, exit_price, entry_reason,
                         outcome_reason, outcome_tag, day_of_week, volatility_type,
-                        trading_mode, strategy_version)
+                        trading_mode, strategy_version, trade_label)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (managed_key) DO NOTHING
                    RETURNING id""",
                 row,
@@ -10745,6 +10806,182 @@ def _maybe_recompute_learning():
                 conn.close()
             except Exception:
                 pass
+
+
+def _check_learning_eligibility(instrument):
+    """Return (status, rule_reason) from the in-memory LEARNING_ELIGIBILITY cache.
+    FAIL-OPEN: no data (DB off, 0 trades computed) -> ('LIVE_ELIGIBLE', None).
+    GHOST_ONLY means: demote live mode to paper (trade still fires, builds evidence).
+    DISABLED means: block this instrument entirely (repeated setup failures)."""
+    if not LEARNING_DB_ENABLED:
+        return "LIVE_ELIGIBLE", None
+    with LEARNING_ELIGIBILITY_LOCK:
+        elig = LEARNING_ELIGIBILITY.get(instrument)
+    if not elig:
+        return "LIVE_ELIGIBLE", None  # no recompute yet: fail-open
+    return elig.get("status", "LIVE_ELIGIBLE"), elig.get("rule_triggered")
+
+
+def _recompute_learning_eligibility(conn):
+    """Compute per-instrument live-eligibility from strategy_trades and persist to
+    learning_eligibility. Swaps LEARNING_ELIGIBILITY cache atomically. Called from
+    _recompute_learning (same connection reused for reads; FAIL-OPEN)."""
+    global LEARNING_ELIGIBILITY
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Per-instrument aggregate stats
+        cur.execute("""
+            SELECT
+                symbol,
+                count(*) AS n,
+                avg(r_multiple) AS expectancy,
+                avg((result='Win')::int::float) AS win_rate,
+                avg((r_multiple >= 0.9)::int::float) AS tp1_hit_rate
+            FROM strategy_trades
+            WHERE symbol IS NOT NULL AND result IS NOT NULL
+            GROUP BY symbol
+        """)
+        inst_rows = {r["symbol"]: r for r in (cur.fetchall() or [])}
+        # Last-20 avg R per instrument
+        cur.execute("""
+            WITH ranked AS (
+                SELECT symbol, r_multiple,
+                       row_number() OVER (PARTITION BY symbol ORDER BY closed_at DESC NULLS LAST) AS rn
+                FROM strategy_trades
+                WHERE symbol IS NOT NULL AND closed_at IS NOT NULL
+            )
+            SELECT symbol, avg(r_multiple) AS last_20_avg_r
+            FROM ranked WHERE rn <= 20
+            GROUP BY symbol
+        """)
+        last20 = {}
+        for r in (cur.fetchall() or []):
+            try: last20[r["symbol"]] = float(r["last_20_avg_r"])
+            except Exception: pass
+        # Per-instrument+setup: detect repeatedly-failing strategies
+        cur.execute("""
+            SELECT symbol, strategy_key,
+                   count(*) AS n,
+                   avg((result='Win')::int::float) AS win_rate,
+                   avg(r_multiple) AS expectancy
+            FROM strategy_trades
+            WHERE symbol IS NOT NULL AND strategy_key IS NOT NULL AND result IS NOT NULL
+            GROUP BY symbol, strategy_key
+            HAVING count(*) >= %s
+        """, (LEARNING_SETUP_DISABLE_MIN_N,))
+        setup_rows = cur.fetchall() or []
+        # Today's trade labels (for dashboard "what I learned today")
+        cur.execute("""
+            SELECT trade_label, count(*) AS cnt
+            FROM strategy_trades
+            WHERE trade_label IS NOT NULL
+              AND opened_at >= (now() AT TIME ZONE 'America/New_York')::date
+            GROUP BY trade_label
+        """)
+        today_label_rows = cur.fetchall() or []
+        cur.close()
+
+        def _ff(v, d=0.0):
+            try: return float(v) if v is not None else d
+            except Exception: return d
+
+        new_elig = {}
+        for instrument in list(ASSETS.keys()):
+            row = inst_rows.get(instrument) or inst_rows.get(instrument + "1!") or {}
+            n    = int(row.get("n") or 0)
+            exp  = _ff(row.get("expectancy"))
+            wr   = _ff(row.get("win_rate"))
+            tp1h = _ff(row.get("tp1_hit_rate"))
+            l20  = last20.get(instrument) or last20.get(instrument + "1!")
+            if n < LEARNING_LIVE_MIN_SAMPLE:
+                status = "GHOST_ONLY"
+                rule   = "under_%d_samples (%d recorded)" % (LEARNING_LIVE_MIN_SAMPLE, n)
+            elif exp < 0:
+                status = "GHOST_ONLY"
+                rule   = "negative_expectancy (%+.2fR avg)" % exp
+            elif l20 is not None and l20 < 0:
+                status = "GHOST_ONLY"
+                rule   = "last_20_trades_negative (%+.2fR avg)" % l20
+            else:
+                status = "LIVE_ELIGIBLE"
+                rule   = "positive_expectancy (%+.2fR, %.0f%% WR, n=%d)" % (exp, wr * 100, n)
+            new_elig[instrument] = {
+                "status":        status,
+                "rule_triggered": rule,
+                "sample_size":   n,
+                "expectancy":    round(exp, 3),
+                "last_20_avg_r": round(l20, 3) if l20 is not None else None,
+                "win_rate":      round(wr, 3),
+                "tp1_hit_rate":  round(tp1h, 3),
+                "updated_at":    now_utc().isoformat(),
+            }
+
+        # Collect disabled setups
+        disabled_by_inst = {}
+        for r in setup_rows:
+            inst = instrument_of(r["symbol"] or "") or r["symbol"]
+            rwr  = _ff(r["win_rate"])
+            rexp = _ff(r["expectancy"])
+            if rwr < LEARNING_SETUP_DISABLE_MAX_WR and rexp < LEARNING_SETUP_DISABLE_MAX_EXP:
+                disabled_by_inst.setdefault(inst, []).append({
+                    "setup_key":   r["strategy_key"],
+                    "win_rate":    round(rwr, 3),
+                    "expectancy":  round(rexp, 3),
+                    "sample_size": int(r["n"] or 0),
+                })
+        for inst, setups in disabled_by_inst.items():
+            if inst in new_elig:
+                new_elig[inst]["disabled_setups"] = setups
+
+        today_labels = {}
+        for r in today_label_rows:
+            if r.get("trade_label"):
+                today_labels[r["trade_label"]] = int(r.get("cnt") or 0)
+
+        # Persist to learning_eligibility
+        try:
+            wconn = _learning_conn()
+            if wconn is not None:
+                with wconn.cursor() as wc:
+                    for inst, e in new_elig.items():
+                        wc.execute(
+                            """INSERT INTO learning_eligibility
+                                   (instrument, status, rule_triggered, sample_size,
+                                    expectancy, last_20_avg_r, win_rate, tp1_hit_rate, last_updated)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                               ON CONFLICT (instrument) DO UPDATE SET
+                                   status=EXCLUDED.status, rule_triggered=EXCLUDED.rule_triggered,
+                                   sample_size=EXCLUDED.sample_size, expectancy=EXCLUDED.expectancy,
+                                   last_20_avg_r=EXCLUDED.last_20_avg_r, win_rate=EXCLUDED.win_rate,
+                                   tp1_hit_rate=EXCLUDED.tp1_hit_rate, last_updated=NOW()""",
+                            (inst, e["status"], e["rule_triggered"], e["sample_size"],
+                             e["expectancy"], e["last_20_avg_r"], e["win_rate"], e["tp1_hit_rate"]))
+                    for inst, setups in disabled_by_inst.items():
+                        for s in setups:
+                            wc.execute(
+                                """INSERT INTO learning_setup_rules
+                                       (instrument, setup_key, status, rule_reason,
+                                        sample_size, win_rate, expectancy, last_updated)
+                                   VALUES (%s,%s,'DISABLED',%s,%s,%s,%s,NOW())
+                                   ON CONFLICT (instrument, setup_key) DO UPDATE SET
+                                       status='DISABLED', rule_reason=EXCLUDED.rule_reason,
+                                       sample_size=EXCLUDED.sample_size, win_rate=EXCLUDED.win_rate,
+                                       expectancy=EXCLUDED.expectancy, last_updated=NOW()""",
+                                (inst, s["setup_key"],
+                                 "WR=%.0f%% Exp=%+.2fR n=%d" % (s["win_rate"]*100, s["expectancy"], s["sample_size"]),
+                                 s["sample_size"], s["win_rate"], s["expectancy"]))
+                wconn.commit()
+                wconn.close()
+        except Exception as exc:
+            logger.debug("learning_eligibility persist skip: %s", exc)
+
+        with LEARNING_ELIGIBILITY_LOCK:
+            LEARNING_ELIGIBILITY.clear()
+            LEARNING_ELIGIBILITY.update(new_elig)
+            LEARNING_ELIGIBILITY["__today_labels__"] = today_labels
+        logger.info("learning_eligibility recomputed: %s instruments", len(new_elig))
+    except Exception as exc:
+        logger.warning("_recompute_learning_eligibility failed: %s", exc)
 
 
 def _recompute_learning():
@@ -10998,6 +11235,12 @@ def _recompute_learning():
                 mem_cache.extend(tz_mem)
         except Exception as exc:
             logger.debug("tradezella memory load skip: %s", exc)
+
+        # ── Rule Engine: per-instrument live-eligibility (reads same conn; fail-open) ──
+        try:
+            _recompute_learning_eligibility(conn)
+        except Exception as _le_exc:
+            logger.warning("learning_eligibility recompute skip: %s", _le_exc)
 
         with LEARNING_LOCK:
             STRATEGY_WEIGHTS.clear();        STRATEGY_WEIGHTS.update(new_weights)
@@ -11320,6 +11563,47 @@ def _learning_engine_view():
     with LEARNING_REPORT_LOCK:
         out["report"] = dict(LAST_PERFORMANCE_REPORT) if LAST_PERFORMANCE_REPORT else None
     return out
+
+
+def _learning_rule_engine_view():
+    """Return the per-instrument Rule Engine status from LEARNING_ELIGIBILITY cache
+    for the /status endpoint. FAIL-OPEN: returns a disabled stub when DB is off."""
+    if not LEARNING_DB_ENABLED:
+        return {"enabled": False, "db_connected": False}
+    with LEARNING_ELIGIBILITY_LOCK:
+        snap = dict(LEARNING_ELIGIBILITY)
+    today_labels = snap.pop("__today_labels__", {})
+    instruments  = {}
+    for inst, elig in snap.items():
+        if inst in ASSETS:
+            instruments[inst] = {
+                "status":        elig.get("status", "GHOST_ONLY"),
+                "rule_triggered": elig.get("rule_triggered"),
+                "sample_size":   elig.get("sample_size", 0),
+                "expectancy":    elig.get("expectancy"),
+                "last_20_avg_r": elig.get("last_20_avg_r"),
+                "win_rate":      elig.get("win_rate"),
+                "tp1_hit_rate":  elig.get("tp1_hit_rate"),
+                "disabled_setups": elig.get("disabled_setups", []),
+                "updated_at":    elig.get("updated_at"),
+            }
+    # If no instruments computed yet, populate defaults so the UI has something to show
+    if not instruments:
+        for inst in ASSETS:
+            instruments[inst] = {
+                "status": "GHOST_ONLY",
+                "rule_triggered": "under_%d_samples (0 recorded)" % LEARNING_LIVE_MIN_SAMPLE,
+                "sample_size": 0, "expectancy": None, "last_20_avg_r": None,
+                "win_rate": None, "tp1_hit_rate": None, "disabled_setups": [],
+                "updated_at": None,
+            }
+    return {
+        "enabled":      True,
+        "db_connected": True,
+        "instruments":  instruments,
+        "today_labels": today_labels,
+        "min_sample":   LEARNING_LIVE_MIN_SAMPLE,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -31624,6 +31908,7 @@ def _build_status_payload(_tk):
         "news_filter":         a.get("news_filter"),
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
         "learning_engine":     _learning_engine_view(),
+        "learning_rule_engine": _learning_rule_engine_view(),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
@@ -35226,6 +35511,25 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
             return {"status": "error",
                             "reason": "Setup direction is ambiguous — refusing to send."}, 409
 
+    # ── Learning Rule Engine gate (FAIL-OPEN: no data = no effect) ───────────────────────
+    # Check per-instrument eligibility from the in-memory LEARNING_ELIGIBILITY cache
+    # (warmed by _recompute_learning every Nth close + boot). DISABLED = hard 409.
+    # GHOST_ONLY = demote live order to paper so the trade still fires + builds data.
+    # No data yet (DB off / under-sampled) = FAIL-OPEN (pass through, unchanged).
+    try:
+        _lre_status, _lre_rule = _check_learning_eligibility(instrument)
+        if _lre_status == "DISABLED":
+            logger.warning("LearningRuleGate: %s DISABLED (%s) → blocking", instrument, _lre_rule)
+            return {"status": "error",
+                    "reason": "Learning Rule Engine: %s is blocked (%s). "
+                              "This setup repeatedly fails — pausing live orders." % (instrument, _lre_rule)}, 409
+        if _lre_status == "GHOST_ONLY" and execution_is_live(mode):
+            logger.info("LearningRuleGate: %s GHOST_ONLY (%s) → demoting to paper ghost trade",
+                        instrument, _lre_rule)
+            mode = "paper"
+    except Exception as _lre_exc:
+        logger.debug("LearningRuleGate check failed (fail-open): %s", _lre_exc)
+
     try:
         zone = str(tp["entry_zone"])
         if "–" in zone:
@@ -37661,6 +37965,18 @@ def dashboard():
   <div class="se-fid" id="bo-fid"></div>
 </div>
 
+<!-- Learning Rule Engine — REAL evidence-based ghost/live eligibility per instrument -->
+<div class="mod" id="mod-rule-engine">
+  <div class="mod-h">⚡ Learning Rule Engine <span id="lre-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div style="font-size:11px;color:#9ca3af;margin-bottom:10px">Observes every closed trade. Automatically switches instruments between GHOST and LIVE based on real performance evidence.</div>
+  <div id="lre-instruments"></div>
+  <div class="le-sub" id="lre-today-sub" style="display:none;margin-top:12px">Today’s Trade Labels</div>
+  <div id="lre-today"></div>
+  <div class="le-sub" id="lre-disabled-sub" style="display:none;margin-top:12px;color:#ef4444">Blocked Setups</div>
+  <div id="lre-disabled"></div>
+  <div class="le-fid" id="lre-fid"></div>
+</div>
+
 <!-- Adaptive Learning Engine — per-strategy analytics from closed trades (Postgres) -->
 <div class="mod mb-hidden" id="mod-learning">
   <div class="mod-h">🧠 Adaptive Learning <span id="le-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Trained on simulated proxy-feed outcomes — not your real broker fills. See Real Account Results above." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
@@ -39308,6 +39624,7 @@ function renderModules(d){
 
   // ── Module 8: Adaptive Learning engine (per-strategy analytics) ──
   renderLearningEngine(d);
+  renderRuleEngine(d);
 
   // ── Module 8b: Performance report (every-25-trades review) — display-only ──
   renderPerformanceReport(d);
@@ -41542,6 +41859,87 @@ function toggleDebateGate(){
 // Adaptive Learning panel — fed by d.learning_engine (recomputed every 20 closed
 // trades from Postgres; served from an in-memory cache, never per-request SQL).
 function _leColor(wr){ return wr>=55 ? '#22c55e' : wr>=45 ? '#eab308' : '#ef4444'; }
+function renderRuleEngine(d){
+  var re=(d&&d.learning_rule_engine)||null;
+  var fid=document.getElementById('lre-fid');
+  if(!re||!re.enabled){
+    if(fid) fid.textContent='DB not connected \u2014 learning engine offline.';
+    return;
+  }
+  var meta=document.getElementById('lre-meta');
+  if(meta){
+    var anyLive=re.instruments&&Object.values(re.instruments).some(function(e){return e.status==='LIVE_ELIGIBLE';});
+    meta.textContent='\xb7 '+(anyLive?'LIVE ELIGIBLE':'GHOST ONLY')+' \xb7 need '+re.min_sample+' trades';
+    meta.style.color=anyLive?'#22c55e':'#f59e0b';
+  }
+  if(fid) fid.textContent=re.db_connected?'':'DB not connected.';
+  var ic=document.getElementById('lre-instruments');
+  if(ic&&re.instruments){
+    var h='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:4px">';
+    Object.keys(re.instruments).forEach(function(inst){
+      var e=re.instruments[inst];
+      var live=e.status==='LIVE_ELIGIBLE';
+      var col=live?'#22c55e':'#f59e0b';
+      var badge=live?'LIVE':'GHOST ONLY';
+      h+='<div style="background:var(--card-bg,#0f172a);border:1px solid var(--border);border-radius:8px;padding:10px">';
+      h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">';
+      h+='<span style="font-size:14px;font-weight:700">'+inst+'</span>';
+      h+='<span style="font-size:10px;padding:2px 8px;border-radius:999px;background:'+col+'20;color:'+col+';font-weight:700">'+badge+'</span>';
+      h+='</div>';
+      h+='<div style="font-size:10px;color:#9ca3af;margin-bottom:6px;line-height:1.5">'+aiEsc(e.rule_triggered||'no data')+'</div>';
+      h+='<div style="display:flex;gap:10px;font-size:11px;color:#e2e8f0">';
+      h+='<span>n='+e.sample_size+'</span>';
+      if(e.expectancy!=null) h+='<span>Exp '+(e.expectancy>=0?'+':'')+e.expectancy.toFixed(2)+'R</span>';
+      if(e.win_rate!=null) h+='<span>WR '+Math.round(e.win_rate*100)+'%</span>';
+      h+='</div>';
+      if(e.last_20_avg_r!=null){
+        var c=e.last_20_avg_r>=0?'#22c55e':'#ef4444';
+        h+='<div style="font-size:10px;margin-top:4px;color:'+c+'">Last 20: '+(e.last_20_avg_r>=0?'+':'')+e.last_20_avg_r.toFixed(2)+'R avg</div>';
+      }
+      h+='</div>';
+    });
+    h+='</div>';
+    ic.innerHTML=h;
+  }
+  var ts=document.getElementById('lre-today-sub'),tc=document.getElementById('lre-today');
+  if(re.today_labels&&Object.keys(re.today_labels).length>0){
+    if(ts) ts.style.display='';
+    if(tc){
+      var lh='<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">';
+      var pairs=Object.keys(re.today_labels).map(function(k){return[k,re.today_labels[k]];});
+      pairs.sort(function(a,b){return b[1]-a[1];});
+      pairs.forEach(function(p){
+        var label=p[0],cnt=p[1];
+        var lc=label==='WIN'?'#22c55e':label==='LOSS'?'#ef4444':label==='BREAKEVEN'?'#6b7280':'#f59e0b';
+        lh+='<span style="font-size:10px;padding:2px 8px;border-radius:999px;background:'+lc+'20;color:'+lc+';border:1px solid '+lc+'40">'+label.replace(/_/g,' ')+' \xd7'+cnt+'</span>';
+      });
+      lh+='</div>';
+      tc.innerHTML=lh;
+    }
+  } else {
+    if(ts) ts.style.display='none';
+    if(tc) tc.innerHTML='';
+  }
+  var ds=document.getElementById('lre-disabled-sub'),dc=document.getElementById('lre-disabled');
+  var anyDis=re.instruments&&Object.values(re.instruments).some(function(e){return e.disabled_setups&&e.disabled_setups.length>0;});
+  if(anyDis){
+    if(ds) ds.style.display='';
+    if(dc){
+      var dh='';
+      Object.keys(re.instruments).forEach(function(inst){
+        var setups=re.instruments[inst].disabled_setups||[];
+        setups.forEach(function(s){
+          dh+='<div style="font-size:11px;color:#ef4444;margin-top:4px">'+inst+' / '+aiEsc(s.setup_key)+' \u2014 WR '+Math.round(s.win_rate*100)+'%, Exp '+s.expectancy.toFixed(2)+'R (n='+s.sample_size+')</div>';
+        });
+      });
+      dc.innerHTML=dh;
+    }
+  } else {
+    if(ds) ds.style.display='none';
+    if(dc) dc.innerHTML='';
+  }
+}
+
 function renderLearningEngine(d){
   const le = (d && d.learning_engine) || null;
   const metaEl = document.getElementById('le-meta');

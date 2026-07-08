@@ -132,3 +132,4 @@
 
 - [View-only share link](view-only-share-link.md) — Express-only watch-only dashboard link under /view; two traps: a new route prefix must be added to artifact.toml proxy `paths` (else falls through to the home SPA), and a login page under `no-referrer` sends `Origin: null` → strict sameOrigin CSRF 403s every real browser (use `same-origin`); curl masks it.
 - [Micro Scalp Mode](micro-scalp-mode.md) — sweep→trap→trigger engine: ghost ledger always + separate restart-resetting LIVE arm via the shared gateway; SINGLE EXIT target1==target2; smokes must force _EXECUTION_MODE_RAW + stub sends.
+- [Real Learning Rule Engine](learning-rule-engine.md) — GHOST_ONLY/LIVE_ELIGIBLE per-instrument gate in execute_trade_gateway; demote-only FAIL-OPEN; 50-sample threshold; recomputed on every Nth close + boot.
