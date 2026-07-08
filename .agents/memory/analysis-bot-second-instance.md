@@ -69,3 +69,23 @@ stays at `/api`.
 ## Editing note
 Both `app.py` files are huge; the `read` tool caps `tradingview-webhook/app.py` at
 ~line 20380. Use `sed -n`/`rg` to view or anchor edits beyond that line.
+
+## Keeping the mirror's alert vocabulary in sync (2026-07-08)
+- **bot2 is a STALE SNAPSHOT of the live engine — new instruments/alert types on the
+  live bot do NOT reach it automatically.** When the live bot gains an instrument
+  (MES/MYM) or alert family (FVG/OB), every forwarded alert of that kind is rejected
+  by the mirror as "Unrecognized alert type" (prod-log noise; the mirror's second
+  opinion silently loses coverage). The live bot is unaffected.
+  - **How to apply:** the mirror now uses the live bot's registry-driven pattern
+    (`_ALERT_INSTRUMENTS` × `_PER_INSTRUMENT_ALERT_TEMPLATE` + `_per_inst_alert_set`).
+    A new instrument = add it to the mirror's `_ALERT_INSTRUMENTS` + `INSTRUMENT_SPECS`
+    + `VWAP_FEED_SYMBOL`; the dispatch sets (`_COMMAND_TYPES`, `_DATA_ONLY_TYPES`,
+    zone-broken/mitigated, `_STRUCTURE_RESET`) and CVD/volume sets are all registry-
+    driven so they follow automatically. Dual-TF/fast vocab deliberately NOT ported
+    (mirror has no consumers).
+- **Analyst-side (FVG/OB) entries need the get_price_context exclusion** (`t not in
+  ANALYST_TYPES` on the demand branch). The classifier's else-branch is
+  "everything not supply/sweep = demand", so recognizing a priced analyst alert
+  WITHOUT that exclusion silently turns FVG/OB prints into phantom demand levels
+  (corrupts nearest_supply/demand → setup stage/plan anchors). The live bot always
+  had the exclusion; the snapshot predated it.

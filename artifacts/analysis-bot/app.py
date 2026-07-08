@@ -217,23 +217,56 @@ RVOL_BY_TICKER      = {}
 # {"MNQ": {"ts": iso}, "MGC": {"ts": iso}}
 VOLUME_SPIKE_BY_TICKER = {}
 
-ALERT_TYPES = {
-    # ── MGC alert types ────────────────────────────────────────────────────────
-    "MGC NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
-    "MGC SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
-    "MGC NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
-    "MGC DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
-    # ── MNQ alert types ────────────────────────────────────────────────────────
-    "MNQ NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
-    "MNQ SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
-    "MNQ NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
-    "MNQ DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
-    # ── Shared structure alerts (apply to whichever symbol is active) ──────────
+# ── Alert vocabulary (registry-driven, mirrors the live bot) ────────────────
+# The mirror must RECOGNIZE every instrument the live bot streams (MGC/MNQ/MES/
+# MYM) or forwarded MES/MYM alerts are rejected as "Unrecognized alert type".
+_ALERT_INSTRUMENTS = ("MGC", "MNQ", "MES", "MYM")
+
+# Per-instrument alert template: suffix -> {side, score}. Suffixes and their
+# side/score are byte-identical to the original hand-written MGC/MNQ entries.
+_PER_INSTRUMENT_ALERT_TEMPLATE = {
+    # Zones (the only per-instrument entries that score bias)
+    "NEW SUPPLY ZONE":        {"side": "bearish", "score": 1},
+    "SUPPLY ZONE CONFIRMED":  {"side": "bearish", "score": 2},
+    "NEW DEMAND ZONE":        {"side": "bullish", "score": 1},
+    "DEMAND ZONE CONFIRMED":  {"side": "bullish", "score": 2},
+    # Zone state (neutral — side effects only, no score)
+    "ZONE BROKEN":            {"side": "neutral", "score": 0},
+    "ZONE MITIGATED":         {"side": "neutral", "score": 0},
+    # Stage-4 confirmation candle closed (neutral, no score)
+    "BULLISH CONFIRMATION":   {"side": "neutral", "score": 0},
+    "BEARISH CONFIRMATION":   {"side": "neutral", "score": 0},
+    # Liquidity sweeps (display/edge only, no score)
+    "BULLISH SWEEP":          {"side": "sweep", "score": 0},
+    "BEARISH SWEEP":          {"side": "sweep", "score": 0},
+    # Smart-money structure pushed by pine/fvg_ob.pine. side "analyst" keeps
+    # them OUT of bias scoring, the supply/demand level builder and the strict
+    # gate — recognized so they are no longer rejected, but display-only.
+    "BULLISH FVG":            {"side": "analyst", "score": 0},
+    "BEARISH FVG":            {"side": "analyst", "score": 0},
+    "BULLISH OB":             {"side": "analyst", "score": 0},
+    "BEARISH OB":             {"side": "analyst", "score": 0},
+    # Trade lifecycle commands (sent directly from the TradingView strategy)
+    "ENTER":                  {"side": "command", "score": 0},
+    "CLOSE":                  {"side": "command", "score": 0},
+    # Data-only VWAP push (updates the VWAP store; no scoring)
+    "VWAP":                   {"side": "data", "score": 0},
+    # CVD confirmation (data-only — sets per-instrument CVD state, never bias scoring)
+    "CVD BULLISH":            {"side": "data", "score": 0},
+    "CVD BEARISH":            {"side": "data", "score": 0},
+    # Volume-spike confirmation (data-only)
+    "VOLUME SPIKE":           {"side": "data", "score": 0},
+}
+
+# Shared, un-prefixed alert types — apply to whichever instrument the payload's
+# `ticker` field names. Byte-identical to the original hand-written entries.
+_SHARED_ALERT_TYPES = {
+    # ── Shared structure alerts (scored) ──
     "CHOCH SUPPLY":               {"side": "bearish", "score": 3},
     "BOS SUPPLY":                 {"side": "bearish", "score": 2},
     "CHOCH DEMAND":               {"side": "bullish", "score": 3},
     "BOS DEMAND":                 {"side": "bullish", "score": 2},
-    # ── Shared swing-structure alerts (HH/HL bullish, LH/LL bearish) ───────────
+    # ── Shared swing-structure alerts (HH/HL bullish, LH/LL bearish) ──
     #    side "structure" keeps them OUT of bias scoring (score_alerts) and the
     #    supply/demand level builder; the READY structure gate detects them by
     #    name in evaluate_strict_setup. Un-prefixed → require a `ticker` field.
@@ -241,59 +274,43 @@ ALERT_TYPES = {
     "HL":                         {"side": "structure", "score": 0},
     "LH":                         {"side": "structure", "score": 0},
     "LL":                         {"side": "structure", "score": 0},
-    # ── Zone state alerts (neutral — side effects only, no score contribution) ─
-    "MGC ZONE BROKEN":            {"side": "neutral", "score": 0},
-    "MGC ZONE MITIGATED":         {"side": "neutral", "score": 0},
-    "MNQ ZONE BROKEN":            {"side": "neutral", "score": 0},
-    "MNQ ZONE MITIGATED":         {"side": "neutral", "score": 0},
-    # Stage 4 triggers — 5m confirmation candle closed (neutral, no score)
-    "MGC BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    "MGC BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    "MNQ BULLISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    "MNQ BEARISH CONFIRMATION":  {"side": "neutral", "score": 0},
-    # ── Liquidity sweep alerts (stop-hunt then reversal; display/edge only, no score) ─
-    "MGC BULLISH SWEEP":  {"side": "sweep", "score": 0},
-    "MGC BEARISH SWEEP":  {"side": "sweep", "score": 0},
-    "MNQ BULLISH SWEEP":  {"side": "sweep", "score": 0},
-    "MNQ BEARISH SWEEP":  {"side": "sweep", "score": 0},
-    # ── Trade lifecycle commands (sent directly from TradingView strategy) ───────
-    "MGC ENTER":  {"side": "command", "score": 0},
-    "MNQ ENTER":  {"side": "command", "score": 0},
-    "MGC CLOSE":  {"side": "command", "score": 0},
-    "MNQ CLOSE":  {"side": "command", "score": 0},
-    # ── Data-only VWAP push (updates the VWAP store; no scoring) ─────────────────
-    "MGC VWAP":   {"side": "data", "score": 0},
-    "MNQ VWAP":   {"side": "data", "score": 0},
-    # ── CVD (Cumulative Volume Delta) confirmation alerts (data-only — they set the
-    #    per-instrument CVD state read by the strict gate, never bias scoring). The
-    #    unprefixed forms require a `ticker` field; prefixed forms self-resolve. Both
-    #    underscore (TradingView default) and spaced spellings are accepted. ──
+    # ── CVD (data-only) — underscore (TradingView default) + spaced un-prefixed ──
     "CVD_BULLISH":     {"side": "data", "score": 0},
     "CVD_BEARISH":     {"side": "data", "score": 0},
     "CVD BULLISH":     {"side": "data", "score": 0},
     "CVD BEARISH":     {"side": "data", "score": 0},
-    "MGC CVD BULLISH": {"side": "data", "score": 0},
-    "MGC CVD BEARISH": {"side": "data", "score": 0},
-    "MNQ CVD BULLISH": {"side": "data", "score": 0},
-    "MNQ CVD BEARISH": {"side": "data", "score": 0},
-    # ── Volume-spike alerts (data-only — set the per-instrument volume-spike state
-    #    read by the strict gate as one half of the +15 volume confirmation, never
-    #    bias scoring). Unprefixed forms require a `ticker` field; prefixed forms
-    #    self-resolve. Underscore and spaced spellings are both accepted. ──
+    # ── Volume-spike (data-only) — un-prefixed forms ──
     "VOLUME_SPIKE":     {"side": "data", "score": 0},
     "VOLUME SPIKE":     {"side": "data", "score": 0},
-    "MGC VOLUME SPIKE": {"side": "data", "score": 0},
-    "MNQ VOLUME SPIKE": {"side": "data", "score": 0},
 }
+
+# Build the full table: prefixed-per-instrument first, then shared. Prefixed keys
+# always carry an instrument token so they can never collide with the un-prefixed
+# shared keys.
+ALERT_TYPES = {}
+for _alert_inst in _ALERT_INSTRUMENTS:
+    for _alert_suffix, _alert_meta in _PER_INSTRUMENT_ALERT_TEMPLATE.items():
+        ALERT_TYPES["%s %s" % (_alert_inst, _alert_suffix)] = dict(_alert_meta)
+ALERT_TYPES.update(_SHARED_ALERT_TYPES)
+
+
+def _per_inst_alert_set(suffix):
+    """All prefixed alert names for `suffix` across _ALERT_INSTRUMENTS, e.g.
+    _per_inst_alert_set("CVD BULLISH") -> {"MGC CVD BULLISH", "MNQ CVD BULLISH", …}."""
+    return {"%s %s" % (i, suffix) for i in _ALERT_INSTRUMENTS}
 
 SUPPLY_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bearish"}
 DEMAND_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "bullish"}
 SWEEP_TYPES  = {k for k, v in ALERT_TYPES.items() if v["side"] == "sweep"}
+# Analyst-only smart-money signals (FVG / Order Blocks). DISPLAY-ONLY evidence:
+# kept out of supply/demand level building and bias scoring.
+ANALYST_TYPES = {k for k, v in ALERT_TYPES.items() if v["side"] == "analyst"}
 # CVD confirmation alert sets (data-only — store per-instrument state, never score).
-CVD_BULLISH_TYPES = {"CVD_BULLISH", "CVD BULLISH", "MGC CVD BULLISH", "MNQ CVD BULLISH"}
-CVD_BEARISH_TYPES = {"CVD_BEARISH", "CVD BEARISH", "MGC CVD BEARISH", "MNQ CVD BEARISH"}
+# Registry-driven: the prefixed forms cover every alert instrument automatically.
+CVD_BULLISH_TYPES = {"CVD_BULLISH", "CVD BULLISH"} | _per_inst_alert_set("CVD BULLISH")
+CVD_BEARISH_TYPES = {"CVD_BEARISH", "CVD BEARISH"} | _per_inst_alert_set("CVD BEARISH")
 # Volume-spike alert set (data-only — store per-instrument spike timestamp, never score).
-VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE", "MGC VOLUME SPIKE", "MNQ VOLUME SPIKE"}
+VOLUME_SPIKE_TYPES = {"VOLUME_SPIKE", "VOLUME SPIKE"} | _per_inst_alert_set("VOLUME SPIKE")
 CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
 
 # ---------------------------------------------------------------------------
@@ -492,27 +509,36 @@ INSTRUMENT_SPECS = {
             "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MNQ_MIN_STOP_TICKS", 40)},
     "MGC": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 1.0, "point_value": 10.0,
             "tick_size": 0.1,  "min_stop_ticks": _spec_int_env("MGC_MIN_STOP_TICKS", 50)},
+    # CME Micro E-mini S&P 500: $5/point, 0.25 tick (values mirror the live bot).
+    "MES": {"tp1": 5.0,  "tp2": 10.0, "tp3": 15.0, "stop_buf": 2.0, "point_value": 5.0,
+            "tick_size": 0.25, "min_stop_ticks": _spec_int_env("MES_MIN_STOP_TICKS", 16)},
+    # CME Micro E-mini Dow: $0.50/point, 1.0 tick (values mirror the live bot).
+    "MYM": {"tp1": 40.0, "tp2": 80.0, "tp3": 120.0, "stop_buf": 8.0, "point_value": 0.5,
+            "tick_size": 1.0,  "min_stop_ticks": _spec_int_env("MYM_MIN_STOP_TICKS", 30)},
 }
 
 def instrument_of(ticker):
     """Normalize any raw ticker (e.g. 'MNQ1!', 'MGC') to 'MNQ' or 'MGC'.
 
     NOTE: this is the *lenient* legacy normalizer — anything that does not
-    contain 'MNQ' (including None/empty/unknown) silently becomes 'MGC'. It is
-    safe only for display/legacy fallbacks. For ingesting a TradingView alert
-    use resolve_instrument(), which is ticker-first and never silently defaults.
+    contain a known instrument token (including None/empty/unknown) silently
+    becomes 'MGC'. It is safe only for display/legacy fallbacks. For ingesting
+    a TradingView alert use resolve_instrument(), which is ticker-first and
+    never silently defaults.
     """
-    return "MNQ" if "MNQ" in str(ticker or "").upper() else "MGC"
+    s = str(ticker or "").upper()
+    for inst in _ALERT_INSTRUMENTS:
+        if inst != "MGC" and inst in s:
+            return inst
+    return "MGC"
 
 def _instrument_from_text(value):
-    """Return 'MNQ'/'MGC' iff `value` unambiguously names exactly one of them,
-    else None (neither present, or — defensively — both present)."""
+    """Return the instrument iff `value` unambiguously names exactly one of
+    _ALERT_INSTRUMENTS, else None (none present, or — defensively — several)."""
     s = str(value or "").upper()
-    has_mnq, has_mgc = "MNQ" in s, "MGC" in s
-    if has_mnq and not has_mgc:
-        return "MNQ"
-    if has_mgc and not has_mnq:
-        return "MGC"
+    found = [inst for inst in _ALERT_INSTRUMENTS if inst in s]
+    if len(found) == 1:
+        return found[0]
     return None
 
 def resolve_instrument(ticker_field, alert_type):
@@ -870,7 +896,7 @@ VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # 
 # keeps moving. Display-only — never affects the gate.
 PRICE_FRESH_MIN = float(os.environ.get("PRICE_FRESH_MIN", 5))  # minutes
 # MGC (micro gold) ≈ GC=F, MNQ (micro Nasdaq) ≈ NQ=F — same price, so same VWAP.
-VWAP_FEED_SYMBOL = {"MGC": "GC=F", "MNQ": "NQ=F"}
+VWAP_FEED_SYMBOL = {"MGC": "GC=F", "MNQ": "NQ=F", "MES": "ES=F", "MYM": "YM=F"}
 
 
 def _send_heartbeat():
@@ -1754,7 +1780,9 @@ def get_price_context(inst=None):
         # existing supply-vs-demand classification.
         if t in SUPPLY_TYPES:
             all_supply_prices.append(price)
-        elif t not in SWEEP_TYPES:
+        elif t not in SWEEP_TYPES and t not in ANALYST_TYPES:
+            # ANALYST_TYPES (FVG / Order Blocks) are display-only evidence and must
+            # never become supply/demand levels (that would feed the gate).
             all_demand_prices.append(price)
     return last_price_by_type, all_supply_prices, all_demand_prices
 
@@ -7321,7 +7349,7 @@ def _trade_ready_loop():
     try:
         if not ACTIVE_TRADE:
             now = datetime.now(timezone.utc)
-            for inst in ("MGC", "MNQ"):
+            for inst in _ALERT_INSTRUMENTS:
                 # Throttle: skip if a card (instant or periodic) was sent for this
                 # instrument within the last TRADE_READY_INTERVAL seconds.
                 last = LAST_LIVE_CARD_AT.get(inst)
@@ -8726,8 +8754,13 @@ def active_trade_field(trade, current_price):
     return {"name": "📊  ACTIVE TRADE MANAGEMENT", "value": value, "inline": False}
 
 
-_COMMAND_TYPES = {"MGC ENTER", "MNQ ENTER", "MGC CLOSE", "MNQ CLOSE"}
-_DATA_ONLY_TYPES = {"MGC VWAP", "MNQ VWAP"}
+# Registry-driven so every alert instrument's commands route to the command
+# handler instead of falling through to scoring (MGC/MNQ membership unchanged —
+# same sets plus MES/MYM).
+_COMMAND_TYPES = {f"{inst} {act}"
+                  for inst in _ALERT_INSTRUMENTS
+                  for act in ("ENTER", "CLOSE")}
+_DATA_ONLY_TYPES = _per_inst_alert_set("VWAP")
 
 
 def _handle_command_alert(normalized, data, parsed_price, resolved_inst):
@@ -9656,7 +9689,7 @@ def _enqueue_slow(fn):
 # never alter a READY/WAIT verdict or post a duplicate alert. Fail-open per
 # instrument, and strictly less frequent than the existing /status polling that
 # already calls full_analysis, so it adds no new concurrency risk.
-_HEARTBEAT_INSTRUMENTS = ("MGC", "MNQ")
+_HEARTBEAT_INSTRUMENTS = _ALERT_INSTRUMENTS
 
 
 def _run_heartbeat_evaluations():
@@ -10586,14 +10619,18 @@ def webhook():
     ALERT_HISTORY.append(record)
 
     # ── Zone event side-effects ──
-    _zone_neutral = ("MGC ZONE BROKEN", "MNQ ZONE BROKEN", "MGC ZONE MITIGATED", "MNQ ZONE MITIGATED")
-    if normalized in ("MGC ZONE BROKEN", "MNQ ZONE BROKEN"):
+    #    Registry-driven sets so every alert instrument's zone events are handled
+    #    (MGC/MNQ membership unchanged — same set plus MES/MYM).
+    _zone_broken_set = _per_inst_alert_set("ZONE BROKEN")
+    _zone_mitig_set  = _per_inst_alert_set("ZONE MITIGATED")
+    _zone_neutral    = _zone_broken_set | _zone_mitig_set
+    if normalized in _zone_broken_set:
         _zb_instrument = _instrument_from_text(normalized)
         if parsed_price is not None:
             _handle_zone_broken(parsed_price, _zb_instrument)
         else:
             ZONE_BROKEN_AT = {"price": None, "alerts_since": 0, "instrument": _zb_instrument}
-    elif normalized in ("MGC ZONE MITIGATED", "MNQ ZONE MITIGATED"):
+    elif normalized in _zone_mitig_set:
         if parsed_price is not None:
             _handle_zone_mitigated(parsed_price, resolved_inst)
     elif ZONE_BROKEN_AT is not None and normalized not in _zone_neutral:
@@ -10608,11 +10645,11 @@ def webhook():
                 logger.info("Zone broken state expired after %d alerts", ZONE_BROKEN_EXPIRY)
 
     # ── Zone Mitigation: clear flag when fresh structure forms ──────────────────
-    _STRUCTURE_RESET = frozenset((
-        "CHOCH SUPPLY", "CHOCH DEMAND", "BOS SUPPLY", "BOS DEMAND",
-        "MGC NEW SUPPLY ZONE", "MGC NEW DEMAND ZONE",
-        "MNQ NEW SUPPLY ZONE", "MNQ NEW DEMAND ZONE",
-    ))
+    _STRUCTURE_RESET = (
+        frozenset(("CHOCH SUPPLY", "CHOCH DEMAND", "BOS SUPPLY", "BOS DEMAND"))
+        | _per_inst_alert_set("NEW SUPPLY ZONE")
+        | _per_inst_alert_set("NEW DEMAND ZONE")
+    )
     if normalized in _STRUCTURE_RESET and MITIGATED_FLAG_BY_TICKER.get(resolved_inst):
         MITIGATED_FLAG_BY_TICKER[resolved_inst] = False
         logger.info("Zone mitigation cleared (%s) — new structure alert: %s",
