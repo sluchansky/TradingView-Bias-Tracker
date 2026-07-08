@@ -36813,10 +36813,10 @@ def dashboard():
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">VIEW-ONLY</span>
     </div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
-      <button type="button" id="cp-sym-MNQ" class="cp-btn" onclick="cpSetSym('MNQ')">MNQ</button>
-      <button type="button" id="cp-sym-MGC" class="cp-btn" onclick="cpSetSym('MGC')">MGC</button>
-      <button type="button" id="cp-sym-MES" class="cp-btn" onclick="cpSetSym('MES')">MES</button>
-      <button type="button" id="cp-sym-MYM" class="cp-btn" onclick="cpSetSym('MYM')" title="Charts a 24h US30 (Dow) CFD feed &mdash; TradingView&rsquo;s free embed doesn&rsquo;t license CBOT micro futures (MYM1!), and this proxy tracks it tick-for-tick.">MYM</button>
+      <button type="button" id="cp-sym-MNQ" class="cp-btn" onclick="cpSetSym('MNQ')" title="24h Nasdaq-100 CFD proxy &mdash; tracks MNQ tick-for-tick.">MNQ</button>
+      <button type="button" id="cp-sym-MGC" class="cp-btn" onclick="cpSetSym('MGC')" title="24h spot-gold feed &mdash; tracks MGC price action (small fixed basis offset).">MGC</button>
+      <button type="button" id="cp-sym-MES" class="cp-btn" onclick="cpSetSym('MES')" title="24h S&amp;P 500 CFD proxy &mdash; tracks MES tick-for-tick.">MES</button>
+      <button type="button" id="cp-sym-MYM" class="cp-btn" onclick="cpSetSym('MYM')" title="24h Dow CFD proxy &mdash; tracks MYM tick-for-tick.">MYM</button>
       <span style="width:8px"></span>
       <button type="button" id="cp-tf-1" class="cp-btn" onclick="cpSetTf('1')">1m</button>
       <button type="button" id="cp-tf-5" class="cp-btn" onclick="cpSetTf('5')">5m</button>
@@ -36827,7 +36827,7 @@ def dashboard():
     <div style="position:relative;width:100%;height:420px;border:1px solid var(--border,#2a2a3a);border-radius:8px;overflow:hidden;background:#0d1117">
       <iframe id="cp-frame" title="TradingView chart" style="position:absolute;inset:0;width:100%;height:100%;border:0" allowfullscreen loading="lazy" referrerpolicy="no-referrer"></iframe>
     </div>
-    <div class="nf-fid">View-only TradingView embed for visual confirmation &mdash; it never affects alerts, tracking or order logic.</div>
+    <div class="nf-fid">View-only TradingView embed. TradingView&rsquo;s free embed doesn&rsquo;t license live futures data, so each button shows a 24h proxy feed that moves with your contract (Nasdaq&rarr;MNQ &middot; Gold spot&rarr;MGC &middot; S&amp;P&rarr;MES &middot; Dow&rarr;MYM). Prices differ from the futures quote by a small basis offset, but the candles/levels move together. It never affects alerts, tracking or order logic.</div>
   </div>
   <!-- ════ Market Intelligence (DISPLAY-FIRST; fed by d.market_intelligence). Classifies the
        tape into a market state, scores Long/Short Directional Confidence, holds trend memory
@@ -41772,10 +41772,12 @@ async function ttFetchOverride(){
 // Pure UI: renders an external TradingView chart for visual confirmation only.
 // It reads d.verdict/d.active_ticker to auto-follow live trade ideas and NEVER
 // feeds anything back into alerts, tracking, ENTER eligibility or webhooks.
-// MYM note: TradingView's FREE embed widget has no CBOT micro futures data
-// (CBOT_MINI:MYM1! pops "only available on TradingView"), so MYM charts a
-// 24h US30 CFD proxy that tracks the Dow / MYM price action tick-for-tick.
-const CP_TV_SYMBOLS = { MNQ:'CME_MINI:MNQ1!', MGC:'COMEX:MGC1!', MES:'CME_MINI:MES1!', MYM:'OANDA:US30USD' };
+// TradingView's FREE embed widget does NOT license real futures data — every
+// continuous contract (MNQ1!/MGC1!/MES1!/MYM1!) pops "This symbol is only
+// available on TradingView". Each button therefore charts a 24h proxy feed
+// that moves tick-for-tick with the contract (Nasdaq/Gold spot/S&P/Dow CFDs).
+const CP_TV_SYMBOLS = { MNQ:'OANDA:NAS100USD', MGC:'OANDA:XAUUSD', MES:'OANDA:SPX500USD', MYM:'OANDA:US30USD' };
+const CP_SYM_NOTE = { MNQ:'Nasdaq proxy for MNQ', MGC:'Gold spot proxy for MGC', MES:'S&P proxy for MES', MYM:'Dow proxy for MYM' };
 const CP_TFS = ['1','5','15','60'];
 let cpSym='MNQ', cpTf='5', cpFollow=true, cpLoadedKey=null;
 try {
@@ -41807,7 +41809,7 @@ function cpApply(){
   const fb=document.getElementById('cp-follow');
   if (fb){ fb.textContent='FOLLOW: '+(cpFollow?'ON':'OFF'); fb.classList.toggle('active', cpFollow); }
   const meta=document.getElementById('cp-meta');
-  if (meta) meta.textContent='\u00b7 '+(CP_TV_SYMBOLS[cpSym]||cpSym)+' \u00b7 '+(cpTf==='60'?'1h':cpTf+'m')+(cpSym==='MYM'?' \u00b7 Dow proxy for MYM':'');
+  if (meta) meta.textContent='\u00b7 '+(CP_TV_SYMBOLS[cpSym]||cpSym)+' \u00b7 '+(cpTf==='60'?'1h':cpTf+'m')+(CP_SYM_NOTE[cpSym]?' \u00b7 '+CP_SYM_NOTE[cpSym]:'');
   try {
     localStorage.setItem('cpSym',cpSym); localStorage.setItem('cpTf',cpTf);
     localStorage.setItem('cpFollow', cpFollow?'1':'0');
