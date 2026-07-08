@@ -115,6 +115,9 @@ export const BOT1_ROUTES = [
   "/mode",
   "/alerts/mute",
   "/auto-trade",
+  // MICRO SCALP MODE toggle + ghost ledger (owner-only, DISPLAY/GHOST ONLY —
+  // never places orders; NOT in dashboard-auth OPEN_PATHS).
+  "/micro-scalp",
   // Live SWING strategy library selector (owner-only money-path control; NOT in
   // dashboard-auth OPEN_PATHS). DEMOTE-ONLY filter — only narrows which already-READY
   // SWING setups are taken; never creates a trade or loosens the gate.

@@ -17892,6 +17892,24 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 "Liquidity Sweep Focus unavailable (%s)." % _lsf_exc,
                 instrument_of(active_ticker), enabled=True)
 
+    # ── MICRO SCALP MODE (DISPLAY + GHOST ONLY, toggle-gated) ────────────────
+    # Separate liquidity-moment engine (sweep → trap → absorption → micro
+    # trigger). Nested in main_brain ONLY (closed-override key parity is
+    # automatic). Toggle OFF ⇒ the key is NEVER attached (byte-identical).
+    # NEVER feeds the gate / verdict / edge score / money path — ghost trades go
+    # to their own table via the webhook-path observer, no orders ever.
+    if _micro_scalp_on() and isinstance(result.get("main_brain"), dict):
+        try:
+            result["main_brain"]["micro_scalp"] = compute_micro_scalp(result)
+        except Exception as _msc_exc:
+            try:
+                import micro_scalp as _msc_mod
+                result["main_brain"]["micro_scalp"] = _msc_mod.neutral(
+                    "Micro Scalp unavailable (%s)." % _msc_exc,
+                    active_ticker, enabled=True)
+            except Exception:
+                pass
+
     # ── Main Brain Judge (DISPLAY-ONLY) ──────────────────────────────────────
     # Consolidates the assembled blocks into ONE explained verdict (final label +
     # decision hierarchy + weighted Edge breakdown + missing confirmations). Runs
@@ -25523,6 +25541,15 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     except Exception as exc:
         logger.error("Scalp live-sim observe failed: %s", exc)
 
+    # ── MICRO SCALP ghost observer (DISPLAY/GHOST-ONLY, toggle-gated) ────────────
+    # Runs AFTER the verdict + dispatch on the webhook path ONLY. A TAKE verdict
+    # from the Micro Scalp engine opens a GHOST row in micro_scalp_ghost_trades —
+    # NO order is ever sent. Never reads back into the gate / money path. Fail-open.
+    try:
+        _maybe_open_micro_ghost(a, source="webhook")
+    except Exception as exc:
+        logger.error("Micro scalp ghost observe failed: %s", exc)
+
     # ── DUAL-MODE shadow simulator observer (PAPER, DISPLAY-ONLY, default OFF) ────
     # Passive ALWAYS-ON: replays BOTH rulebooks' REAL verdict from the SAME gate
     # inputs and opens shadow paper trades into dual_sim_trades. Never reads back
@@ -28075,6 +28102,577 @@ def _scalp_sim_watch_loop():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# MICRO SCALP MODE — liquidity-moment hunter (DISPLAY + GHOST TRADING ONLY)
+# ════════════════════════════════════════════════════════════════════════════
+# Separate, ISOLATED overlay that hunts short-term liquidity "moments" (sweep →
+# trap → absorption → micro trigger) instead of full strategy confirmations. The
+# detection engine is the PURE module micro_scalp.py (imports nothing from here).
+#
+# HARD WALLS (identical to the proven scalp_live_sim pattern):
+#   * NEVER sends a broker order — verdict TAKE only opens a GHOST row in its own
+#     table (micro_scalp_ghost_trades) so the operator can see what it WOULD do.
+#   * Never touches the gate / verdict / trade_plan / edge_score / money path.
+#   * App-side INSERT/SELECT ONLY — the table is created out-of-band (DB tool in
+#     dev, Publish schema-diff in prod); a missing table just disables ghosts.
+#   * Toggle OFF (the default) == byte-identical: the main_brain key is never
+#     attached, the recorder / observer / watcher all early-return.
+# The toggle is IN-MEMORY (resets OFF on restart — fail-safe) with an optional
+# MICRO_SCALP_ENABLED env override for a durable prod default.
+MICRO_SCALP_MODE       = os.environ.get("MICRO_SCALP_ENABLED", "0").strip().lower() \
+                             in ("1", "true", "yes", "on")
+MICRO_SCALP_LOCK       = threading.Lock()
+MICRO_GHOST_DB_READY   = False
+MICRO_GHOST_WATCH_LOCK = threading.Lock()   # single-flight watcher cycles
+MICRO_GHOST_WATCH_INTERVAL     = max(10, int(os.environ.get("MICRO_GHOST_WATCH_INTERVAL", 30)))
+MICRO_GHOST_MAX_HOLD_MIN       = max(10, int(os.environ.get("MICRO_GHOST_MAX_HOLD_MIN", 120)))
+MICRO_GHOST_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("MICRO_GHOST_COOLDOWN_SECS", 600)))
+_MICRO_GHOST_COOLDOWN      = {}             # (inst, direction) -> monotonic ts
+_MICRO_GHOST_COOLDOWN_LOCK = threading.Lock()
+
+# Per-instrument micro geometry (points; explicit config — user-tunable later).
+# MNQ values are the user's spec (TP1 +5 / TP2 +10 / stop capped 8); the other
+# instruments are scaled from the same ~25% of the live tp1 spec, tick-rounded.
+MICRO_SPECS = {
+    "MNQ": {"tp1": 5.0,  "tp2": 10.0, "runner": 20.0, "stop_min": 3.0, "stop_max": 8.0,  "tick": 0.25},
+    "MGC": {"tp1": 2.0,  "tp2": 4.0,  "runner": 8.0,  "stop_min": 1.0, "stop_max": 3.0,  "tick": 0.1},
+    "MES": {"tp1": 1.5,  "tp2": 3.0,  "runner": 6.0,  "stop_min": 1.0, "stop_max": 2.5,  "tick": 0.25},
+    "MYM": {"tp1": 15.0, "tp2": 30.0, "runner": 60.0, "stop_min": 8.0, "stop_max": 25.0, "tick": 1.0},
+}
+
+# SEPARATE micro-event + price-trail stores. The Fast Entry Trigger store
+# (FAST_ENTRY_STATE_BY_TICKER) is gated on FAST_ENTRY_TRIGGER + SCALP, so it can
+# be EMPTY when this mode runs — never read it here (confirmed prod gap).
+MICRO_EVENTS_BY_INST = {}   # inst -> deque({"cat","direction","epoch"})
+MICRO_TRAIL_BY_INST  = {}   # inst -> deque({"price","epoch"})
+MICRO_STORE_LOCK     = threading.Lock()
+
+
+def _micro_scalp_on():
+    with MICRO_SCALP_LOCK:
+        return bool(MICRO_SCALP_MODE)
+
+
+def _check_micro_ghost_db_ready():
+    """Probe micro_scalp_ghost_trades (no DDL) and set MICRO_GHOST_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB disables ghost logging only —
+    the Micro Scalp Brain display still works."""
+    global MICRO_GHOST_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM micro_scalp_ghost_trades LIMIT 1")
+            cur.fetchone()
+        MICRO_GHOST_DB_READY = True
+        logger.info("micro scalp ghost table ready")
+    except Exception as exc:
+        logger.warning("micro scalp ghost table unavailable (ghost logging disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _micro_scalp_record_event(normalized, inst, price):
+    """Webhook-seam recorder for the Micro Scalp price trail + micro events.
+    NO-OP unless the mode toggle is ON (flag-OFF byte-identical). DISPLAY/STATE
+    only — never scores, never gates, never raises into the webhook path."""
+    if not inst or not _micro_scalp_on():
+        return
+    try:
+        now_ep = time.time()
+        cat = direction = None
+        if normalized in FAST_MICRO_CHOCH_LONG_TYPES:
+            cat, direction = "micro CHOCH", "Long"
+        elif normalized in FAST_MICRO_CHOCH_SHORT_TYPES:
+            cat, direction = "micro CHOCH", "Short"
+        elif normalized in FAST_MICRO_VWAP_RECLAIM_TYPES:
+            cat, direction = "micro VWAP reclaim", "Long"
+        elif normalized in FAST_MICRO_VWAP_LOSS_TYPES:
+            cat, direction = "micro VWAP loss", "Short"
+        elif normalized in FAST_DELTA_FLIP_BULL_TYPES:
+            cat, direction = "delta flip", "Long"
+        elif normalized in FAST_DELTA_FLIP_BEAR_TYPES:
+            cat, direction = "delta flip", "Short"
+        elif normalized in FAST_SWEEP_RECLAIM_LONG_TYPES:
+            cat, direction = "sweep reclaim", "Long"
+        elif normalized in FAST_SWEEP_RECLAIM_SHORT_TYPES:
+            cat, direction = "sweep reclaim", "Short"
+        with MICRO_STORE_LOCK:
+            if price is not None:
+                try:
+                    MICRO_TRAIL_BY_INST.setdefault(inst, deque(maxlen=240)).append(
+                        {"price": float(price), "epoch": now_ep})
+                except (TypeError, ValueError):
+                    pass
+            if cat:
+                MICRO_EVENTS_BY_INST.setdefault(inst, deque(maxlen=60)).append(
+                    {"cat": cat, "direction": direction, "epoch": now_ep})
+    except Exception:
+        pass
+
+
+def _micro_scalp_live_ctx(result):
+    """Normalize a full_analysis `result` + the live read-only stores into the flat
+    context dict the PURE micro_scalp engine consumes. Read-only; FAIL-OPEN
+    (returns None if the essentials are missing). Never mutates `result`."""
+    try:
+        inst = instrument_of(result.get("active_ticker") or "")
+        if not inst:
+            return None
+        now = now_utc()
+        now_ep = now.timestamp()
+        l = {
+            "inst":         inst,
+            "generated_at": now.isoformat(),
+            "now_epoch":    now_ep,
+            "market_open":  bool(result.get("market_open")),
+            "price":        result.get("current_price"),
+            "vwap":         result.get("vwap_value"),
+            "atr_pts":      (result.get("volatility") or {}).get("atr_pts"),
+            "specs":        MICRO_SPECS.get(inst) or {},
+        }
+        # Recent instrument-scoped SWEEP alerts (list() snapshot — never the live
+        # deque). "BULLISH SWEEP" = lows swept; "BEARISH SWEEP" = highs swept.
+        sweeps = []
+        for a in reversed(list(ALERT_HISTORY)):
+            at = a.get("alert_type") or ""
+            if "SWEEP" not in at or "RECLAIM" in at:
+                continue
+            a_inst = (a.get("instrument")
+                      or _instrument_from_text(a.get("ticker"))
+                      or _instrument_from_text(at))
+            if a_inst != inst:
+                continue
+            try:
+                ts = datetime.fromisoformat(a["timestamp"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            age = (now - ts).total_seconds()
+            if age < 0 or age > 900:
+                continue
+            d = "low" if "BULLISH" in at else ("high" if "BEARISH" in at else None)
+            if d is None:
+                continue
+            try:
+                px = float(a.get("price")) if a.get("price") is not None else None
+            except (TypeError, ValueError):
+                px = None
+            sweeps.append({"direction": d, "price": px, "age_sec": age})
+            if len(sweeps) >= 6:
+                break
+        l["sweeps"] = sweeps
+        # Recent range reference: current-session high/low, else opening range.
+        rh = rl = None
+        try:
+            with INTRADAY_LOCK:
+                rec = INTRADAY_BY_TICKER.get(inst) or {}
+                sessions = {k: dict(v) for k, v in (rec.get("sessions") or {}).items()
+                            if isinstance(v, dict)}
+            cur_name, _cur_id = _bias_session_for(now.astimezone(ET_TZ))
+            s = sessions.get(cur_name) or {}
+            rh, rl = s.get("high"), s.get("low")
+        except Exception:
+            pass
+        if rh is None or rl is None:
+            try:
+                orb = _intraday_or(inst) or {}
+                rh = rh if rh is not None else orb.get("high")
+                rl = rl if rl is not None else orb.get("low")
+            except Exception:
+                pass
+        l["range_high"], l["range_low"] = rh, rl
+        # CVD / volume-spike / RVOL snapshots (ts-aged — set-membership != fresh).
+        def _iso_age(iso):
+            try:
+                return max(0.0, (now - datetime.fromisoformat(iso)).total_seconds())
+            except (TypeError, ValueError):
+                return None
+        cvd = CVD_BY_TICKER.get(inst) or {}
+        l["cvd_state"]   = cvd.get("state")
+        l["cvd_age_sec"] = _iso_age(cvd.get("ts"))
+        vs = VOLUME_SPIKE_BY_TICKER.get(inst) or {}
+        l["volume_spike_age_sec"] = _iso_age(vs.get("ts"))
+        rv = RVOL_BY_TICKER.get(inst) or {}
+        l["rvol"] = rv.get("value")
+        # Micro events + price trail (snapshots under the store lock).
+        with MICRO_STORE_LOCK:
+            evs   = list(MICRO_EVENTS_BY_INST.get(inst) or ())
+            trail = list(MICRO_TRAIL_BY_INST.get(inst) or ())
+        l["micro_events"] = [{"cat": e.get("cat"), "direction": e.get("direction"),
+                              "age_sec": max(0.0, now_ep - (e.get("epoch") or 0))}
+                             for e in evs]
+        l["price_trail"] = trail
+        return l
+    except Exception:
+        return None
+
+
+_MICRO_GHOST_STATS_CACHE = {}   # inst-or-"ALL" -> {"ts": monotonic, "data": {...}}
+_MICRO_GHOST_STATS_LOCK  = threading.Lock()
+MICRO_GHOST_STATS_TTL    = 60
+
+
+def _micro_ghost_stats(inst=None):
+    """Ghost ledger read for the dashboard (recent trades + aggregate). DISPLAY-
+    ONLY, FAIL-OPEN, TTL-cached so the /status poll never hammers Postgres."""
+    global MICRO_GHOST_DB_READY
+    key = inst or "ALL"
+    now_mono = time.monotonic()
+    with _MICRO_GHOST_STATS_LOCK:
+        c = _MICRO_GHOST_STATS_CACHE.get(key)
+        if c and (now_mono - c["ts"]) < MICRO_GHOST_STATS_TTL:
+            return c["data"]
+    out = {"db_ready": bool(MICRO_GHOST_DB_READY), "open": [], "recent": [],
+           "stats": {"trades": 0, "wins": 0, "losses": 0, "breakeven": 0,
+                     "expired": 0, "win_rate": None, "net_r": 0.0,
+                     "avg_time_to_tp1_sec": None}}
+    if not MICRO_GHOST_DB_READY:
+        _check_micro_ghost_db_ready()
+        out["db_ready"] = bool(MICRO_GHOST_DB_READY)
+    if not MICRO_GHOST_DB_READY:
+        with _MICRO_GHOST_STATS_LOCK:
+            _MICRO_GHOST_STATS_CACHE[key] = {"ts": now_mono, "data": out}
+        return out
+    conn = _learning_conn()
+    if conn is None:
+        return out
+    try:
+        with conn.cursor() as cur:
+            where = "WHERE symbol = %s" if inst else ""
+            args  = (inst,) if inst else ()
+            cur.execute(
+                "SELECT symbol, direction, setup_type, entry, stop, tp1, tp2, status, "
+                "tp1_hit, mfe_points, mae_points, outcome, outcome_reason, result_r, "
+                "time_to_tp1_sec, time_to_exit_sec, opened_at, closed_at "
+                "FROM micro_scalp_ghost_trades %s "
+                "ORDER BY id DESC LIMIT 10" % where, args)
+            for r in cur.fetchall():
+                rec = {"symbol": r[0], "direction": r[1], "setup_type": r[2],
+                       "entry": float(r[3]) if r[3] is not None else None,
+                       "stop": float(r[4]) if r[4] is not None else None,
+                       "tp1": float(r[5]) if r[5] is not None else None,
+                       "tp2": float(r[6]) if r[6] is not None else None,
+                       "status": r[7], "tp1_hit": bool(r[8]),
+                       "mfe_points": float(r[9]) if r[9] is not None else None,
+                       "mae_points": float(r[10]) if r[10] is not None else None,
+                       "outcome": r[11], "outcome_reason": r[12],
+                       "result_r": float(r[13]) if r[13] is not None else None,
+                       "time_to_tp1_sec": r[14], "time_to_exit_sec": r[15],
+                       "opened_at": fmt_et(r[16]) if r[16] is not None else None,
+                       "closed_at": fmt_et(r[17]) if r[17] is not None else None}
+                (out["open"] if r[7] == "open" else out["recent"]).append(rec)
+            cur.execute(
+                "SELECT outcome, COUNT(*), COALESCE(SUM(result_r),0), "
+                "AVG(time_to_tp1_sec) "
+                "FROM micro_scalp_ghost_trades %s%s GROUP BY outcome"
+                % (where, (" AND" if inst else " WHERE") + " status='closed'"), args)
+            tt_tp1 = []
+            for oc, n, net_r, avg_tp1 in cur.fetchall():
+                out["stats"]["trades"] += int(n)
+                out["stats"]["net_r"]  = round(out["stats"]["net_r"] + float(net_r), 2)
+                if oc == "win":
+                    out["stats"]["wins"] += int(n)
+                elif oc == "loss":
+                    out["stats"]["losses"] += int(n)
+                elif oc == "breakeven":
+                    out["stats"]["breakeven"] += int(n)
+                elif oc == "expired":
+                    out["stats"]["expired"] += int(n)
+                if avg_tp1 is not None:
+                    tt_tp1.append(float(avg_tp1))
+            wl = out["stats"]["wins"] + out["stats"]["losses"]
+            if wl:
+                out["stats"]["win_rate"] = round(100.0 * out["stats"]["wins"] / wl, 1)
+            if tt_tp1:
+                out["stats"]["avg_time_to_tp1_sec"] = int(sum(tt_tp1) / len(tt_tp1))
+    except Exception as exc:
+        logger.warning("micro ghost stats read failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    with _MICRO_GHOST_STATS_LOCK:
+        _MICRO_GHOST_STATS_CACHE[key] = {"ts": now_mono, "data": out}
+    return out
+
+
+def compute_micro_scalp(result):
+    """Full Micro Scalp Brain block for the CURRENT result — pure-engine read +
+    ghost ledger summary. DISPLAY-ONLY; FAIL-OPEN to the neutral schema."""
+    inst_label = result.get("active_ticker") or result.get("instrument")
+    inst = instrument_of(inst_label) if inst_label else None
+    try:
+        import micro_scalp as ms
+    except Exception as exc:
+        return {"enabled": True, "available": False, "instrument": inst_label,
+                "verdict": "NO TRADE", "evidence": [],
+                "summary": "Micro Scalp engine unavailable (%s)." % exc}
+    l = _micro_scalp_live_ctx(result)
+    if l is None:
+        block = ms.neutral("Micro Scalp context unavailable.", inst_label,
+                           enabled=True, generated_at=now_utc().isoformat())
+    else:
+        block = ms.evaluate(l)
+    try:
+        block["ghost"] = _micro_ghost_stats(inst)
+    except Exception:
+        block["ghost"] = {"db_ready": False, "open": [], "recent": [], "stats": {}}
+    return block
+
+
+def _micro_ghost_open_insert(sim_key, inst, block):
+    """Idempotently INSERT one OPEN ghost trade (ON CONFLICT sim_key DO NOTHING)
+    with a one-open-per-instrument guard. Writes ONLY to micro_scalp_ghost_trades.
+    Returns True if a row was actually opened."""
+    if not MICRO_GHOST_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        entry = float(block["suggested_entry"])
+        stop  = float(block["suggested_stop"])
+        risk  = abs(entry - stop)
+        if risk <= 0:
+            return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM micro_scalp_ghost_trades "
+                        "WHERE symbol=%s AND status='open' LIMIT 1", (inst,))
+            if cur.fetchone():
+                return False
+            cur.execute(
+                "INSERT INTO micro_scalp_ghost_trades "
+                "(sim_key, symbol, direction, setup_type, entry, stop, tp1, tp2, "
+                " runner_target, risk_points, entry_reason, entry_epoch) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (sim_key) DO NOTHING",
+                (sim_key, inst, block.get("direction"), block.get("setup_type"),
+                 entry, stop, float(block["tp1"]), float(block["tp2"]),
+                 (float(block["runner_target"]) if block.get("runner_target")
+                  is not None else None),
+                 risk, (block.get("entry_reason") or "")[:500],
+                 int(now_utc().timestamp())))
+            opened = (cur.rowcount == 1)
+        conn.commit()
+        return opened
+    except Exception as exc:
+        logger.warning("micro ghost open failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _maybe_open_micro_ghost(result, source="webhook"):
+    """GHOST observer — logs the trade the Micro Scalp engine WOULD take. Runs
+    ONLY from the webhook analysis path, only while the toggle is ON, only on a
+    TAKE verdict. NEVER sends an order; the only side effect is an idempotent
+    INSERT into micro_scalp_ghost_trades. Returns 1 if a ghost was opened."""
+    if source != "webhook" or not _micro_scalp_on() or not MICRO_GHOST_DB_READY:
+        return 0
+    block = (result.get("main_brain") or {}).get("micro_scalp")
+    if not isinstance(block, dict) or block.get("verdict") != "TAKE":
+        return 0
+    inst = instrument_of(result.get("active_ticker") or "")
+    direction = block.get("direction")
+    if not inst or direction not in ("Long", "Short"):
+        return 0
+    if any(block.get(k) is None for k in
+           ("suggested_entry", "suggested_stop", "tp1", "tp2")):
+        return 0
+    try:
+        if not market_session_status().get("open", True):
+            return 0
+    except Exception:
+        pass
+    now_mono = time.monotonic()
+    ckey = (inst, direction)
+    with _MICRO_GHOST_COOLDOWN_LOCK:
+        last = _MICRO_GHOST_COOLDOWN.get(ckey)
+        if last is not None and (now_mono - last) < MICRO_GHOST_OPEN_COOLDOWN_SECS:
+            return 0
+    et_day = now_utc().astimezone(ET_TZ).strftime("%Y%m%d")
+    bucket = int(now_utc().timestamp() // 300)   # 5-min idempotency bucket
+    try:
+        anchor_px = int(round(float(block["suggested_entry"])))
+    except (TypeError, ValueError, KeyError):
+        anchor_px = 0
+    sim_key = "micro|%s|%s|%s:%d:%d" % (inst, direction, et_day, bucket, anchor_px)
+    if _micro_ghost_open_insert(sim_key, inst, block):
+        with _MICRO_GHOST_COOLDOWN_LOCK:
+            _MICRO_GHOST_COOLDOWN[ckey] = now_mono
+        logger.info("micro scalp GHOST opened: %s %s @ %s (no order — ghost only)",
+                    inst, direction, block.get("suggested_entry"))
+        return 1
+    return 0
+
+
+def _watch_micro_ghost_trades():
+    """Resolve OPEN ghost trades against the latest 1-minute bar (one fetch per
+    instrument per cycle) using the PURE micro_scalp.ghost_bar_update resolver:
+    stop-first worst-case, TP1 → BE, TP2 win, MFE/MAE tracking, max-hold expiry,
+    SAME-BAR guard. Writes ONLY to micro_scalp_ghost_trades."""
+    if not MICRO_GHOST_DB_READY:
+        return
+    try:
+        import micro_scalp as ms
+    except Exception:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    open_rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, symbol, direction, entry, stop, tp1, tp2, risk_points, "
+                "tp1_hit, mfe_points, mae_points, entry_epoch, opened_at "
+                "FROM micro_scalp_ghost_trades WHERE status='open' "
+                "ORDER BY id ASC LIMIT 200")
+            for r in cur.fetchall():
+                open_rows.append({
+                    "id": r[0], "symbol": r[1], "direction": r[2],
+                    "entry": float(r[3]) if r[3] is not None else None,
+                    "stop": float(r[4]) if r[4] is not None else None,
+                    "tp1": float(r[5]) if r[5] is not None else None,
+                    "tp2": float(r[6]) if r[6] is not None else None,
+                    "risk_points": float(r[7]) if r[7] is not None else None,
+                    "tp1_hit": bool(r[8]),
+                    "mfe_points": float(r[9]) if r[9] is not None else 0.0,
+                    "mae_points": float(r[10]) if r[10] is not None else 0.0,
+                    "entry_epoch": float(r[11]) if r[11] is not None else None,
+                    "opened_at": r[12]})
+    except Exception as exc:
+        logger.warning("micro ghost watcher read failed: %s", exc)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    finally:
+        if not open_rows:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if not open_rows:
+        return
+    bars = {}
+    for inst in {r["symbol"] for r in open_rows}:
+        try:
+            bars[inst] = _fetch_latest_bar(inst)
+        except Exception:
+            bars[inst] = None
+    try:
+        for row in open_rows:
+            bar = bars.get(row["symbol"])
+            if not bar:
+                continue
+            bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
+            if bar_start is not None and entry_epoch is not None \
+                    and bar_start <= entry_epoch:
+                continue                   # same-bar guard (no look-ahead self-fill)
+            upd = ms.ghost_bar_update(row, bar)
+            if upd is None:
+                continue
+            outcome = upd.get("outcome")
+            if outcome is None:
+                # Max-hold expiry: resolve a stranded ghost at the latest close.
+                opened_at, cl = row.get("opened_at"), bar.get("close")
+                risk = row.get("risk_points") or 0
+                if opened_at is not None and cl is not None and risk > 0:
+                    try:
+                        oa = opened_at if opened_at.tzinfo else \
+                            opened_at.replace(tzinfo=timezone.utc)
+                        aged = ((now_utc() - oa).total_seconds()
+                                > MICRO_GHOST_MAX_HOLD_MIN * 60)
+                    except Exception:
+                        aged = False
+                    if aged:
+                        r_mult = ((cl - row["entry"]) / risk
+                                  if row["direction"] == "Long"
+                                  else (row["entry"] - cl) / risk)
+                        upd.update({"outcome": "expired",
+                                    "exit_price": round(cl, 4),
+                                    "result_r": round(r_mult, 4)})
+                        outcome = "expired"
+            with conn.cursor() as cur:
+                if outcome is not None:
+                    reason = {"win": "TP2 hit",
+                              "loss": "Stopped out before TP1",
+                              "breakeven": "BE stop hit after TP1 banked",
+                              "expired": "Max hold reached — closed at market"}.get(
+                                  outcome, outcome)
+                    cur.execute(
+                        "UPDATE micro_scalp_ghost_trades SET status='closed', "
+                        "outcome=%s, outcome_reason=%s, result_r=%s, "
+                        "mfe_points=%s, mae_points=%s, closed_at=now(), "
+                        "time_to_exit_sec=GREATEST(0, EXTRACT(EPOCH FROM "
+                        "(now()-opened_at)))::int "
+                        "WHERE id=%s AND status='open'",
+                        (outcome, reason, upd.get("result_r"),
+                         upd["mfe_points"], upd["mae_points"], row["id"]))
+                elif upd.get("tp1_hit") and not row.get("tp1_hit"):
+                    cur.execute(
+                        "UPDATE micro_scalp_ghost_trades SET tp1_hit=TRUE, "
+                        "tp1_at=now(), be_armed=TRUE, stop=%s, "
+                        "mfe_points=%s, mae_points=%s, "
+                        "time_to_tp1_sec=GREATEST(0, EXTRACT(EPOCH FROM "
+                        "(now()-opened_at)))::int "
+                        "WHERE id=%s AND status='open'",
+                        (upd.get("new_stop"), upd["mfe_points"],
+                         upd["mae_points"], row["id"]))
+                else:
+                    if (upd["mfe_points"] != row["mfe_points"]
+                            or upd["mae_points"] != row["mae_points"]):
+                        cur.execute(
+                            "UPDATE micro_scalp_ghost_trades SET mfe_points=%s, "
+                            "mae_points=%s WHERE id=%s AND status='open'",
+                            (upd["mfe_points"], upd["mae_points"], row["id"]))
+            conn.commit()
+    except Exception as exc:
+        logger.warning("micro ghost watcher update failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _micro_ghost_watch_loop():
+    """Ghost watcher on its own timer. Gated INSIDE the loop to the LIVE instance
+    (DISCORD_LIVE_ENABLED) + DB ready — NOT on the toggle, so ghosts opened before
+    a toggle-off still resolve. Single-flight; FAIL-OPEN; never the money path."""
+    try:
+        if MICRO_GHOST_DB_READY and DISCORD_LIVE_ENABLED:
+            if MICRO_GHOST_WATCH_LOCK.acquire(blocking=False):
+                try:
+                    _watch_micro_ghost_trades()
+                finally:
+                    MICRO_GHOST_WATCH_LOCK.release()
+    except Exception as exc:
+        logger.warning("micro ghost watch loop error: %s", exc)
+    finally:
+        threading.Timer(MICRO_GHOST_WATCH_INTERVAL, _micro_ghost_watch_loop).start()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # DUAL-MODE SHADOW SIMULATOR — passive, ALWAYS-ON paper sim of BOTH rulebooks
 # ════════════════════════════════════════════════════════════════════════════
 # Faithfully replays the bot's REAL gate verdict for BOTH the SCALP and SWING
@@ -29679,6 +30277,12 @@ def webhook():
     #    the optional worker money path can read a fresh snapshot. It NEVER enqueues
     #    or fires here — the money decision lives in the single-threaded worker.
     _fast_entry_record(normalized, resolved_inst, data)
+
+    # ── MICRO SCALP price-trail + micro-event recorder (DISPLAY/STATE only) ──
+    #    Self-guards to a no-op unless the Micro Scalp toggle is ON. Separate
+    #    store from Fast Entry (whose gate leaves it empty in prod). Never
+    #    scores, never gates, never raises into the webhook path.
+    _micro_scalp_record_event(normalized, resolved_inst, parsed_price)
 
     # Data-only CVD / volume-spike ack (store written ABOVE, before the enqueue).
     if _data_only_resp is not None:
@@ -35316,7 +35920,7 @@ def dashboard():
   .mb-hidden{display:none !important}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(.mb-hidden){display:none !important}
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
   #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
@@ -36241,6 +36845,32 @@ def dashboard():
   <div class="mod-h">🔬 Dual Shadow Simulator<span title="Passive paper simulation of BOTH rulebooks side by side — not your real broker fills, and it never affects the live bot." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
   <div id="dual-sim-meta" style="font-size:11px;color:#6b7280;margin-bottom:6px"></div>
   <div id="dual-sim-tables"></div>
+</div>
+
+<!-- MICRO SCALP MODE — separate liquidity-moment engine (sweep -> trap -> absorption
+     -> micro trigger). DISPLAY + GHOST ONLY: the toggle never arms a real order path;
+     a TAKE verdict only logs a ghost trade. Fed by main_brain.micro_scalp (key absent
+     while OFF). ALL dynamic strings rendered via textContent (XSS-safe). -->
+<div class="mod" id="mod-microscalp">
+  <div class="mod-h">⚡ Micro Scalp Brain <span id="msc-badge" style="font-size:10px;padding:1px 8px;border-radius:8px;background:#6b7280;color:#fff;margin-left:6px">OFF</span><span style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto" title="Ghost mode: it logs the trades it WOULD take. It never places real orders.">GHOST ONLY</span></div>
+  <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+    <button id="msc-toggle" onclick="toggleMicroScalp()" style="font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid var(--border,#2a2a3a);background:#1f2430;color:#e8e8f0;cursor:pointer">Turn ON</button>
+    <span style="font-size:10px;color:#6b7280">Hunts liquidity sweeps &amp; trapped traders for quick 5&ndash;10 pt moves. Ghost trades only &mdash; it never places real orders.</span>
+  </div>
+  <div id="msc-body" style="display:none">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <span id="msc-verdict" style="font-weight:700;font-size:14px">&mdash;</span>
+      <span id="msc-dir" style="font-size:11px;color:#9ca3af"></span>
+    </div>
+    <div id="msc-summary" style="font-size:11px;color:#9ca3af;margin:4px 0 8px"></div>
+    <div id="msc-steps" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:10px"></div>
+    <div id="msc-plan" style="font-size:11px;margin-top:8px;color:#cdd3e0"></div>
+    <div id="msc-evidence" style="font-size:10px;color:#9aa3b2;margin-top:6px;line-height:1.5"></div>
+    <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:10px 0 4px">Ghost ledger <span style="color:#6b7280;font-weight:400">(what it WOULD have done &mdash; simulated, not broker fills)</span></div>
+    <div id="msc-ghost-stats" style="font-size:11px;color:#9ca3af">&mdash;</div>
+    <div id="msc-ghost-rows" style="font-size:10px;margin-top:4px"></div>
+  </div>
+  <div class="nf-fid">Micro Scalp Mode is fully separate from your SCALP/SWING bot &mdash; display &amp; ghost logging only; it never places, blocks or resizes real trades.</div>
 </div>
 
 <!-- Scalp-Strategy Advisory — all 16 research strategies ANALYZED as potential trades
@@ -38063,6 +38693,7 @@ function gaugeColor(v,prob){
 function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
+  renderMicroScalp(d);
   renderMainBrainCognitive(d);
   try{ renderStalkMode(d); }catch(e){}
   try{ renderActiveThinking(d); }catch(e){}
@@ -39106,6 +39737,112 @@ function _dsTierTable(title, sc, sw){
   });
   tbl.appendChild(tb); wrap.appendChild(tbl); return wrap;
 }
+// MICRO SCALP panel (DISPLAY + GHOST ONLY). Fed by main_brain.micro_scalp; the key
+// is ABSENT while the mode is OFF. Toggle posts /micro-scalp (owner-only via the
+// Express proxy). All dynamic strings go through textContent (XSS-safe).
+let mscEnabled = false, mscBusy = false;
+function renderMicroScalp(d){
+  const mod = document.getElementById('mod-microscalp'); if(!mod) return;
+  const ms = (d && d.main_brain) ? d.main_brain.micro_scalp : null;
+  mscEnabled = !!(ms && ms.enabled);
+  const badge = document.getElementById('msc-badge');
+  if(badge){ badge.textContent = mscEnabled ? 'ON' : 'OFF'; badge.style.background = mscEnabled ? 'var(--green,#22c55e)' : '#6b7280'; }
+  const btn = document.getElementById('msc-toggle');
+  if(btn && !mscBusy) btn.textContent = mscEnabled ? 'Turn OFF' : 'Turn ON';
+  const body = document.getElementById('msc-body');
+  if(!ms || !ms.enabled){ if(body) body.style.display = 'none'; return; }
+  if(body) body.style.display = '';
+  const vEl = document.getElementById('msc-verdict');
+  if(vEl){
+    const v = ms.verdict || 'NO TRADE';
+    vEl.textContent = v;
+    vEl.style.color = (v === 'TAKE') ? 'var(--green,#22c55e)' : (v === 'WAIT' ? 'var(--warn,#f59e0b)' : '#6b7280');
+  }
+  const dEl = document.getElementById('msc-dir');
+  if(dEl) dEl.textContent = ms.direction ? (ms.direction + (ms.setup_type ? (' \u00b7 ' + String(ms.setup_type).replace(/_/g,' ').toLowerCase()) : '')) : '';
+  const sEl = document.getElementById('msc-summary');
+  if(sEl) sEl.textContent = ms.summary || '';
+  const steps = document.getElementById('msc-steps');
+  if(steps){
+    steps.replaceChildren();
+    [['Sweep', !!ms.liquidity_event, ms.sweep_direction && ms.sweep_direction !== 'NONE' ? ms.sweep_direction.toLowerCase() : ''],
+     ['Trap', ms.trapped_side && ms.trapped_side !== 'NONE', ms.trapped_side && ms.trapped_side !== 'NONE' ? (ms.trapped_side.toLowerCase() + ' stuck') : ''],
+     ['Absorption', !!ms.absorption, ''],
+     ['Trigger', !!ms.micro_trigger, ms.trigger_reason || '']].forEach(function(t){
+      const cell = document.createElement('div');
+      cell.style.cssText = 'padding:6px;border:1px solid var(--border,#2a2a3a);border-radius:6px;text-align:center';
+      const top = document.createElement('div');
+      top.textContent = (t[1] ? '\u2713 ' : '\u2014 ') + t[0];
+      top.style.cssText = 'font-weight:600;color:' + (t[1] ? 'var(--green,#22c55e)' : '#6b7280');
+      cell.appendChild(top);
+      if(t[2]){ const sub = document.createElement('div'); sub.textContent = t[2]; sub.style.cssText = 'color:#9aa3b2;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'; sub.title = t[2]; cell.appendChild(sub); }
+      steps.appendChild(cell);
+    });
+  }
+  const plan = document.getElementById('msc-plan');
+  if(plan){
+    if(ms.suggested_entry != null && ms.suggested_stop != null){
+      plan.textContent = 'Plan: entry ' + ms.suggested_entry + ' \u00b7 stop ' + ms.suggested_stop +
+        (ms.stop_points != null ? ' (' + ms.stop_points + ' pts)' : '') +
+        ' \u00b7 TP1 ' + ms.tp1 + ' \u00b7 TP2 ' + ms.tp2 +
+        (ms.runner_target != null ? ' \u00b7 runner ' + ms.runner_target : '') + ' \u00b7 BE after TP1';
+    } else { plan.textContent = ''; }
+  }
+  const ev = document.getElementById('msc-evidence');
+  if(ev) ev.textContent = (ms.evidence && ms.evidence.length) ? ms.evidence.join(' \u00b7 ') : '';
+  const g = ms.ghost || null;
+  const gs = document.getElementById('msc-ghost-stats');
+  if(gs){
+    if(g && g.db_ready && g.stats && g.stats.trades > 0){
+      const st = g.stats;
+      gs.textContent = st.trades + ' ghost trades \u00b7 ' + (st.win_rate != null ? st.win_rate + '% win' : 'no wins/losses yet') +
+        ' \u00b7 net ' + (st.net_r > 0 ? '+' : '') + st.net_r + 'R' +
+        (st.avg_time_to_tp1_sec != null ? ' \u00b7 avg ' + Math.round(st.avg_time_to_tp1_sec/60) + 'm to TP1' : '');
+    } else if(g && !g.db_ready){
+      gs.textContent = 'Ghost ledger unavailable (table not ready) \u2014 detection still runs.';
+    } else {
+      gs.textContent = 'No ghost trades yet \u2014 waiting for the first TAKE moment.';
+    }
+  }
+  const rows = document.getElementById('msc-ghost-rows');
+  if(rows){
+    rows.replaceChildren();
+    const all = ((g && g.open) || []).concat((g && g.recent) || []).slice(0, 6);
+    all.forEach(function(t){
+      const line = document.createElement('div');
+      line.style.cssText = 'padding:3px 0;border-top:1px solid var(--border,#2a2a3a);display:flex;gap:8px;flex-wrap:wrap';
+      const a = document.createElement('span');
+      a.textContent = (t.symbol || '?') + ' ' + (t.direction || '');
+      a.style.fontWeight = '600';
+      const b = document.createElement('span');
+      if(t.status === 'open'){
+        b.textContent = 'OPEN' + (t.tp1_hit ? ' \u00b7 TP1 banked, stop at BE' : '') + ' @ ' + t.entry;
+        b.style.color = 'var(--warn,#f59e0b)';
+      } else {
+        b.textContent = (t.outcome || 'closed') + (t.result_r != null ? ' ' + (t.result_r > 0 ? '+' : '') + t.result_r + 'R' : '') + (t.outcome_reason ? ' \u00b7 ' + t.outcome_reason : '');
+        b.style.color = (t.result_r > 0) ? 'var(--green,#22c55e)' : (t.result_r < 0 ? 'var(--red,#ef4444)' : '#9ca3af');
+      }
+      const c = document.createElement('span');
+      c.textContent = t.closed_at || t.opened_at || '';
+      c.style.cssText = 'color:#6b7280;margin-left:auto';
+      line.appendChild(a); line.appendChild(b); line.appendChild(c);
+      rows.appendChild(line);
+    });
+  }
+}
+async function toggleMicroScalp(){
+  if(mscBusy) return;
+  mscBusy = true;
+  const btn = document.getElementById('msc-toggle');
+  if(btn){ btn.disabled = true; btn.textContent = '\u2026'; }
+  try {
+    const r = await api('/micro-scalp', { enabled: !mscEnabled });
+    mscEnabled = !!(r && r.enabled);
+  } catch(e) {}
+  mscBusy = false;
+  if(btn){ btn.disabled = false; btn.textContent = mscEnabled ? 'Turn OFF' : 'Turn ON'; }
+}
+
 function renderDualSim(d){
   const mod=document.getElementById('mod-dual-sim'); if(!mod) return;
   const ds=(d&&d.dual_sim)||null;
@@ -44154,6 +44891,33 @@ def alerts_mute():
 
 
 
+@app.route("/micro-scalp", methods=["GET", "POST"])
+def micro_scalp_toggle():
+    """Read or set the MICRO SCALP MODE toggle + read the ghost ledger.
+
+    DISPLAY + GHOST ONLY: turning this ON never arms an order path — a TAKE
+    verdict only writes a ghost row into micro_scalp_ghost_trades (analysis +
+    logging, zero broker sends). State is in-memory and resets to the
+    MICRO_SCALP_ENABLED env default (normally OFF) on restart — fail-safe.
+    Owner-only (Basic Auth + CSRF via the Express proxy; NOT in OPEN_PATHS)."""
+    global MICRO_SCALP_MODE
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        enabled = bool(data.get("enabled"))
+        with MICRO_SCALP_LOCK:
+            MICRO_SCALP_MODE = enabled
+        if enabled and not MICRO_GHOST_DB_READY:
+            _check_micro_ghost_db_ready()      # lazy no-DDL probe on first arm
+        logger.info("MICRO SCALP MODE %s (display + ghost only, no orders)",
+                    "ENABLED" if enabled else "DISABLED")
+    return jsonify({
+        "status":   "ok",
+        "enabled":  _micro_scalp_on(),
+        "db_ready": bool(MICRO_GHOST_DB_READY),
+        "ghost":    _micro_ghost_stats(None),
+    }), 200
+
+
 @app.route("/auto-trade", methods=["GET", "POST"])
 def auto_trade_toggle():
     """Read or set the per-instrument AUTO-TRADE flags (MGC / MNQ).
@@ -46560,6 +47324,7 @@ if __name__ == "__main__":
         _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
+        _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
         _check_safety_overrides_db_ready()         # probe safety_overrides (no DDL; created via DB tool/publish diff) — runtime per-asset safety controls
@@ -46573,6 +47338,7 @@ if __name__ == "__main__":
     if AUTO_EXIT_ENABLED:
         threading.Timer(0, _auto_exit_watch_loop).start()  # AUTO EARLY-EXIT watcher (own timer); inert unless owner-ARMED via /auto-exit (arm resets OFF each restart); live sends only on the LIVE traderspost instance, paper closes locally
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
+    threading.Timer(0, _micro_ghost_watch_loop).start()  # MICRO SCALP ghost watcher — started UNCONDITIONALLY; the loop self-gates on MICRO_GHOST_DB_READY + DISCORD_LIVE_ENABLED inside, so a lazy DB-ready flip (POST /micro-scalp) still gets its ghosts resolved without a restart. Resolves ghost rows only — never the money path.
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:
@@ -46585,7 +47351,7 @@ if __name__ == "__main__":
         if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
             threading.Timer(0, _scalp_sim_watch_loop).start()  # PAPER live-sim watcher (LIVE instance only; default-OFF flag; resolves paper trades into a SEPARATE table, never the money path)
         if DUAL_MODE_SHADOW_SIM_ENABLED and DISCORD_LIVE_ENABLED and DUAL_SIM_DB_READY:
-            threading.Timer(0, _dual_sim_watch_loop).start()  # DUAL-MODE shadow-sim watcher (LIVE instance only; default-OFF flag; resolves shadow paper trades into dual_sim_trades, never the money path)
+            threading.Timer(0, _dual_sim_watch_loop).start()
         if training_mode_enabled():
             threading.Timer(0, _training_grade_watch_loop).start()  # BOT TRAINING grade watcher (flag-on/prod only; self-gated on DB-ready; resolves the training ledger via stop-first sim, never the money path)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.

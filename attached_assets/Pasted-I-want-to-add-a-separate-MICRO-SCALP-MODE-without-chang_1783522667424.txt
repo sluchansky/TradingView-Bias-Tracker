@@ -1,0 +1,114 @@
+I want to add a separate MICRO SCALP MODE without changing or breaking the existing SCALP and SWING modes.
+
+This mode should focus on fast liquidity-based setups, not normal strategy confirmation.
+
+Build it as a separate toggle on the dashboard:
+
+MICRO SCALP MODE: ON / OFF
+
+Core idea:
+The bot should hunt for short-term “moments,” not full trades. It should look for liquidity sweeps, trapped traders, absorption, and fast reclaim/rejection setups.
+
+Micro Scalp Mode logic:
+
+1. Liquidity Sweep Detection
+    Look for:
+
+* price sweeping prior high or prior low
+* stop run above/below recent range
+* fast candle expansion
+* volume spike
+* delta/CVD imbalance if available
+* wick rejection after sweep
+
+2. Trap Detection
+    Bot should ask:
+
+* who is trapped?
+* did longs get trapped above highs?
+* did shorts get trapped below lows?
+* did price fail to continue after the sweep?
+
+If no trapped traders are detected, verdict should be NO TRADE.
+
+3. Absorption Detection
+    Look for:
+
+* strong buying/selling pressure but price stops moving
+* delta disagrees with price
+* high volume but limited price progress
+* wick rejection
+* failed breakout or failed breakdown
+
+4. Micro Trigger
+    Use fast confirmation, not slow 5-minute confirmation.
+
+Use available:
+
+* seconds data if available
+* 15 second / 1 minute logic
+* micro CHOCH
+* reclaim of failed breakdown/breakout level
+* VWAP reclaim or VWAP rejection
+* candle close back inside range after sweep
+
+5. Trade Management
+    This mode should aim for quick scalps.
+
+For MNQ defaults:
+
+* TP1: +5 points
+* TP2: +10 points
+* optional runner after TP2
+* stop should be structure-based, not random
+* suggested max stop: 5–8 points unless volatility says otherwise
+* move to breakeven only after TP1 or after structure confirms
+
+6. Ghost Trading Mode
+    Before allowing live execution, add ghost tracking.
+
+The bot should log trades it WOULD have taken without sending orders.
+
+Track:
+
+* timestamp
+* symbol
+* direction
+* setup type
+* entry
+* stop
+* TP1
+* TP2
+* max favorable move
+* max adverse move
+* win/loss
+* time to TP1
+* time to stop
+* reason for entry
+* reason for failure or success
+
+7. Dashboard Output
+    Add a Micro Scalp Brain panel showing:
+
+* Liquidity Event: YES / NO
+* Sweep Direction: HIGH SWEEP / LOW SWEEP / NONE
+* Trapped Side: LONGS / SHORTS / NONE
+* Absorption: YES / NO
+* Micro Trigger: YES / NO
+* Verdict: TAKE / WAIT / NO TRADE
+* Entry Reason
+* Invalidation Level
+* Suggested Entry
+* Suggested Stop
+* TP1 / TP2 / Runner
+* Ghost Result after trade completes
+
+8. Safety Rule
+    This mode must not interfere with existing SCALP or SWING logic.
+
+It should be isolated as its own module and only active when MICRO SCALP MODE is turned on.
+
+Do not let it send live orders yet unless I manually enable execution later.
+
+For now:
+MICRO SCALP MODE = analysis + ghost trading only.
