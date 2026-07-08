@@ -131,4 +131,4 @@
 - [Liquidity Sweep Focus overlay](liquidity-sweep-focus.md) — flag-gated DISPLAY/ADVISORY-ONLY sweep-state read nested in main_brain ONLY; advisory delta never feeds edge/gate; recency re-scan of ALERT_HISTORY (never trust stale key presence) + instrument-prefixed match; flag-OFF byte-identical, own smoke.
 
 - [View-only share link](view-only-share-link.md) — Express-only watch-only dashboard link under /view; two traps: a new route prefix must be added to artifact.toml proxy `paths` (else falls through to the home SPA), and a login page under `no-referrer` sends `Origin: null` → strict sameOrigin CSRF 403s every real browser (use `same-origin`); curl masks it.
-- [Micro Scalp Mode](micro-scalp-mode.md) — toggle-gated sweep→trap→trigger GHOST engine; OFF=key absent (byte-identical); observer webhook-only; watcher boots UNCONDITIONALLY (self-gates in-loop).
+- [Micro Scalp Mode](micro-scalp-mode.md) — sweep→trap→trigger engine: ghost ledger always + separate restart-resetting LIVE arm via the shared gateway; SINGLE EXIT target1==target2; smokes must force _EXECUTION_MODE_RAW + stub sends.

@@ -17900,13 +17900,17 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # to their own table via the webhook-path observer, no orders ever.
     if _micro_scalp_on() and isinstance(result.get("main_brain"), dict):
         try:
-            result["main_brain"]["micro_scalp"] = compute_micro_scalp(result)
+            _msc_blk = compute_micro_scalp(result)
+            _msc_blk["live_armed"] = _micro_live_armed()   # display field (dashboard badge)
+            result["main_brain"]["micro_scalp"] = _msc_blk
         except Exception as _msc_exc:
             try:
                 import micro_scalp as _msc_mod
-                result["main_brain"]["micro_scalp"] = _msc_mod.neutral(
+                _msc_blk = _msc_mod.neutral(
                     "Micro Scalp unavailable (%s)." % _msc_exc,
                     active_ticker, enabled=True)
+                _msc_blk["live_armed"] = _micro_live_armed()
+                result["main_brain"]["micro_scalp"] = _msc_blk
             except Exception:
                 pass
 
@@ -25546,9 +25550,33 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # from the Micro Scalp engine opens a GHOST row in micro_scalp_ghost_trades —
     # NO order is ever sent. Never reads back into the gate / money path. Fail-open.
     try:
-        _maybe_open_micro_ghost(a, source="webhook")
+        _msc_ghost_opened = _maybe_open_micro_ghost(a, source="webhook")
     except Exception as exc:
+        _msc_ghost_opened = 0
         logger.error("Micro scalp ghost observe failed: %s", exc)
+
+    # ── MICRO SCALP LIVE fire (MONEY PATH; double-gated, default OFF) ────────────
+    # Fires ONLY when the ghost INSERT above actually opened a row — the ghost's
+    # idempotent sim_key + per-(inst,direction) cooldown IS the fire-once key, so a
+    # skipped/blocked gateway call never retries (errs toward NOT trading) — AND the
+    # operator has ARMED LIVE. Routed through the SAME parametrized auto-execute
+    # wrapper → audited gateway (source="micro_scalp"): live-instance gate,
+    # emergency stop, advisor, cooldowns, stacking gate, daily caps, risk cap, prop
+    # guard and the fail-closed send path are ALL shared. The ghost ledger keeps
+    # recording every TAKE regardless, so live results always have a ghost mirror.
+    if _msc_ghost_opened and _micro_live_armed():
+        try:
+            _msc_inst = instrument_of(a.get("active_ticker") or "")
+            if _msc_inst and not _maybe_auto_execute(
+                    _msc_inst, allow_stack=MICRO_LIVE_ALLOW_STACK,
+                    source="micro_scalp",
+                    contracts_override=MICRO_LIVE_CONTRACTS,
+                    disarm_cb=_micro_live_disarm):
+                logger.warning("MICRO LIVE armed + ghost opened for %s but NO live "
+                               "entry was sent (gateway skipped/blocked — see log above).",
+                               _msc_inst)
+        except Exception as exc:
+            logger.error("Micro live fire failed (non-fatal, no retry): %s", exc)
 
     # ── DUAL-MODE shadow simulator observer (PAPER, DISPLAY-ONLY, default OFF) ────
     # Passive ALWAYS-ON: replays BOTH rulebooks' REAL verdict from the SAME gate
@@ -28128,6 +28156,41 @@ MICRO_GHOST_MAX_HOLD_MIN       = max(10, int(os.environ.get("MICRO_GHOST_MAX_HOL
 MICRO_GHOST_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("MICRO_GHOST_COOLDOWN_SECS", 600)))
 _MICRO_GHOST_COOLDOWN      = {}             # (inst, direction) -> monotonic ts
 _MICRO_GHOST_COOLDOWN_LOCK = threading.Lock()
+
+# ── MICRO SCALP LIVE ARM (MONEY PATH; separate second toggle, default OFF) ───
+# Arming LIVE makes a micro TAKE fire a REAL order through the SAME audited
+# execute_trade_gateway (source="micro_scalp") the main bot uses — every shared
+# safety layer applies (live-instance gate, emergency stop, daily caps, risk
+# cap, prop guard, training gate, fail-closed send). IN-MEMORY and RESET OFF on
+# every restart/republish (fail-safe toward NOT trading, same convention as the
+# per-instrument AUTO arm). Arming requires the mode toggle ON; toggling the
+# mode OFF force-disarms. Fire-once key = the ghost INSERT (idempotent sim_key
+# + per-(inst,dir) cooldown): a skipped/blocked gateway call never retries.
+MICRO_LIVE_ARMED     = False
+MICRO_LIVE_CONTRACTS = max(1, int(os.environ.get("MICRO_LIVE_CONTRACTS", 1)))
+MICRO_LIVE_TARGET    = os.environ.get("MICRO_LIVE_TARGET", "tp1").strip().lower()
+if MICRO_LIVE_TARGET not in ("tp1", "tp2"):
+    MICRO_LIVE_TARGET = "tp1"
+# Default: NEVER stack a micro live entry on an already-tracked open position.
+MICRO_LIVE_ALLOW_STACK = os.environ.get("MICRO_LIVE_ALLOW_STACK", "0").strip().lower() \
+                             in ("1", "true", "yes", "on")
+
+
+def _micro_live_armed():
+    """True only while BOTH the mode toggle and the LIVE arm are ON."""
+    with MICRO_SCALP_LOCK:
+        return bool(MICRO_LIVE_ARMED and MICRO_SCALP_MODE)
+
+
+def _micro_live_disarm(reason=""):
+    """Force-disarm LIVE (fail-safe). Used by the gateway wrapper on an
+    ambiguous broker response so micro can't keep firing into an uncertain
+    broker state — mirrors the AUTO_TRADE disarm convention."""
+    global MICRO_LIVE_ARMED
+    with MICRO_SCALP_LOCK:
+        MICRO_LIVE_ARMED = False
+    logger.warning("MICRO SCALP LIVE disarmed%s",
+                   (" — " + reason) if reason else "")
 
 # Per-instrument micro geometry (points; explicit config — user-tunable later).
 # MNQ values are the user's spec (TP1 +5 / TP2 +10 / stop capped 8); the other
@@ -34930,6 +34993,57 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
                         "reason": ("Preview: SWING filter — "
                                    + "; ".join(m for _, m in _psv) + ".")}, 409
         direction = pv_dir
+    elif source == "micro_scalp":
+        # ── MICRO SCALP LIVE entry (liquidity-moment engine; AUTHORITATIVE) ──────
+        # Fires ONLY while the mode toggle AND the separate LIVE arm are BOTH ON —
+        # each re-checked HERE fail-closed (the seam caller is never trusted). The
+        # plan is read from THIS gateway call's own full_analysis() micro block
+        # (server-authoritative recompute; never client/caller data), so a verdict
+        # that flipped since the webhook seam 409s — it can miss an entry, never
+        # fire a stale one. Bypasses ONLY the Edge is_actionable check; EVERY other
+        # safety is shared (market/session/holiday above; risk cap, prop guard,
+        # training gate, per-asset caps, fail-closed send path below).
+        if not _micro_live_armed():
+            return {"status": "error",
+                    "reason": "Micro Scalp live trading is not armed."}, 409
+        _mblk = (a.get("main_brain") or {}).get("micro_scalp")
+        if not isinstance(_mblk, dict) or _mblk.get("verdict") != "TAKE":
+            return {"status": "error",
+                    "reason": "Micro Scalp is no longer TAKE — entry skipped."}, 409
+        _mdir = _mblk.get("direction")
+        if _mdir not in ("Long", "Short"):
+            return {"status": "error",
+                    "reason": "Micro Scalp has no clear direction — entry skipped."}, 409
+        if any(_mblk.get(k) is None
+               for k in ("suggested_entry", "suggested_stop", "tp1", "tp2")):
+            return {"status": "error",
+                    "reason": "Micro Scalp plan is incomplete — entry skipped."}, 409
+        # Opposite-direction Edge conflict veto (mirrors dual_tf / fast_entry): if
+        # the main Edge gate is READY the OTHER way, stand down.
+        if is_actionable(verdict):
+            _edge_dir = ready_direction(verdict)
+            if _edge_dir is not None and _edge_dir.lower() != _mdir.lower():
+                return {"status": "error",
+                        "reason": (f"Edge gate is {_edge_dir} READY — conflicts with "
+                                   f"micro {_mdir}; entry skipped.")}, 409
+        # Never stack on an already-tracked open position (defense-in-depth; the
+        # auto-execute wrapper also blocks). MICRO_LIVE_ALLOW_STACK=1 lifts this.
+        if not MICRO_LIVE_ALLOW_STACK and active_trade_for(instrument) is not None:
+            return {"status": "error",
+                    "reason": (f"{instrument} already has an open tracked position — "
+                               "micro entry skipped (no stacking).")}, 409
+        # SINGLE EXIT (critical): the broker order carries ONE takeProfit and
+        # check_trade_events books the win + frees the slot the instant target1
+        # prints — so target1 MUST EQUAL target2. A distinct deeper target2 would
+        # leave a live untracked position after the tracker closed at target1 (and
+        # contracts>=2 could route into the two-leg runner split). MICRO_LIVE_TARGET
+        # picks WHICH micro target the single exit uses (tp1 +5 default / tp2 +10).
+        _mtgt = _mblk["tp2"] if MICRO_LIVE_TARGET == "tp2" else _mblk["tp1"]
+        tp = {"entry_zone": str(_mblk["suggested_entry"]),
+              "stop_loss":  _mblk["suggested_stop"],
+              "target1":    _mtgt,
+              "target2":    _mtgt}
+        direction = _mdir
     elif source == "manual_desk":
         # ── Manual Desk market order (DISCRETIONARY; operator override) ───────────
         # The operator explicitly chose to fire a market order REGARDLESS of setup
@@ -35020,6 +35134,11 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
         # Discretionary manual order → full 1.0 size. The verdict is typically WAIT
         # here, so a verdict-derived multiplier is meaningless; the operator sizes via
         # the contract count and the absolute risk cap + per-asset ceiling still bind.
+        _size_mult = 1.0
+    elif source == "micro_scalp":
+        # Micro stops are tight (3–8 pts MNQ) → full 1.0 size; MICRO_LIVE_CONTRACTS,
+        # the absolute per-trade risk cap and the per-asset ceiling bound the size.
+        # The Edge verdict is WAIT here, so a verdict-derived multiplier is meaningless.
         _size_mult = 1.0
     else:
         _size_mult = _setup_risk_mult(verdict, a.get("structure_class"))
@@ -35241,7 +35360,8 @@ def _advisor_blocks_auto_trade(inst):
         return True, "advisor review error — blocking auto-trade."
 
 
-def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
+def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
+                        contracts_override=None, disarm_cb=None):
     """Fire the audited execution gateway for a brand-new READY setup when AUTO is
     ON for inst. Fail-open: any problem logs and returns without trading. Sets
     ACTIVE_TRADE only AFTER a confirmed send/simulate, using the gateway's
@@ -35333,7 +35453,11 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
         if _auto_trade_count_today(inst) >= _max_pd:
             logger.warning("Auto-trade daily cap (%d) reached for %s - skipping.", _max_pd, inst)
             return False
-        result, code = execute_trade_gateway(inst, AUTO_TRADE_CONTRACTS, source=source)
+        # contracts_override lets a non-Edge caller (micro scalp) size its own
+        # entry; None (every legacy caller) keeps the exact legacy behaviour.
+        _gw_contracts = AUTO_TRADE_CONTRACTS if contracts_override is None \
+            else int(contracts_override)
+        result, code = execute_trade_gateway(inst, _gw_contracts, source=source)
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
             plan = result.get("plan") or {}
@@ -35385,11 +35509,18 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto"):
             # tracking write above failed (the position is real; verify manually).
             return True
         elif (result or {}).get("broker_verify_required"):
-            # Ambiguous live send - the order MAY be live. Disarm this instrument's
-            # auto toggle so it can't keep firing into an uncertain broker state;
-            # require manual re-enable + broker verification.
-            with AUTO_TRADE_LOCK:
-                AUTO_TRADE[inst] = False
+            # Ambiguous live send - the order MAY be live. Disarm the CALLER'S
+            # arm toggle so it can't keep firing into an uncertain broker state;
+            # require manual re-enable + broker verification. disarm_cb (micro
+            # scalp) disarms ITS toggle; None (legacy) disarms AUTO_TRADE[inst].
+            if disarm_cb is not None:
+                try:
+                    disarm_cb("ambiguous broker response — verify the broker manually")
+                except Exception:
+                    pass
+            else:
+                with AUTO_TRADE_LOCK:
+                    AUTO_TRADE[inst] = False
             logger.warning("Auto-trade DISARMED for %s - ambiguous broker response: %s",
                            inst, (result or {}).get("reason"))
             try:
@@ -36852,10 +36983,11 @@ def dashboard():
      a TAKE verdict only logs a ghost trade. Fed by main_brain.micro_scalp (key absent
      while OFF). ALL dynamic strings rendered via textContent (XSS-safe). -->
 <div class="mod" id="mod-microscalp">
-  <div class="mod-h">⚡ Micro Scalp Brain <span id="msc-badge" style="font-size:10px;padding:1px 8px;border-radius:8px;background:#6b7280;color:#fff;margin-left:6px">OFF</span><span style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto" title="Ghost mode: it logs the trades it WOULD take. It never places real orders.">GHOST ONLY</span></div>
+  <div class="mod-h">⚡ Micro Scalp Brain <span id="msc-badge" style="font-size:10px;padding:1px 8px;border-radius:8px;background:#6b7280;color:#fff;margin-left:6px">OFF</span><span id="msc-ghostonly" style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto" title="Ghost mode: it logs the trades it WOULD take. Arm LIVE to let a TAKE also place a real order.">GHOST ONLY</span></div>
   <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
     <button id="msc-toggle" onclick="toggleMicroScalp()" style="font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid var(--border,#2a2a3a);background:#1f2430;color:#e8e8f0;cursor:pointer">Turn ON</button>
-    <span style="font-size:10px;color:#6b7280">Hunts liquidity sweeps &amp; trapped traders for quick 5&ndash;10 pt moves. Ghost trades only &mdash; it never places real orders.</span>
+    <button id="msc-live-btn" onclick="toggleMicroLive()" style="display:none;font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid #7f1d1d;background:#2a1215;color:#fca5a5;cursor:pointer;font-weight:700" title="When armed, a TAKE fires a REAL broker order through the same safety-checked gateway as the main bot. Resets to disarmed on every restart.">ARM LIVE</button>
+    <span style="font-size:10px;color:#6b7280">Hunts liquidity sweeps &amp; trapped traders for quick 5&ndash;10 pt moves. Ghost trades always log; LIVE only fires when you arm it.</span>
   </div>
   <div id="msc-body" style="display:none">
     <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
@@ -39740,7 +39872,7 @@ function _dsTierTable(title, sc, sw){
 // MICRO SCALP panel (DISPLAY + GHOST ONLY). Fed by main_brain.micro_scalp; the key
 // is ABSENT while the mode is OFF. Toggle posts /micro-scalp (owner-only via the
 // Express proxy). All dynamic strings go through textContent (XSS-safe).
-let mscEnabled = false, mscBusy = false;
+let mscEnabled = false, mscBusy = false, mscLive = false, mscLiveBusy = false;
 function renderMicroScalp(d){
   const mod = document.getElementById('mod-microscalp'); if(!mod) return;
   const ms = (d && d.main_brain) ? d.main_brain.micro_scalp : null;
@@ -39749,6 +39881,19 @@ function renderMicroScalp(d){
   if(badge){ badge.textContent = mscEnabled ? 'ON' : 'OFF'; badge.style.background = mscEnabled ? 'var(--green,#22c55e)' : '#6b7280'; }
   const btn = document.getElementById('msc-toggle');
   if(btn && !mscBusy) btn.textContent = mscEnabled ? 'Turn OFF' : 'Turn ON';
+  mscLive = !!(ms && ms.live_armed);
+  const go = document.getElementById('msc-ghostonly');
+  if(go){
+    go.textContent = mscLive ? 'LIVE ARMED' : 'GHOST ONLY';
+    go.style.color = mscLive ? '#ef4444' : '#f59e0b';
+  }
+  const lbtn = document.getElementById('msc-live-btn');
+  if(lbtn && !mscLiveBusy){
+    lbtn.style.display = mscEnabled ? '' : 'none';
+    lbtn.textContent = mscLive ? 'DISARM LIVE' : 'ARM LIVE';
+    lbtn.style.background = mscLive ? '#7f1d1d' : '#2a1215';
+    lbtn.style.color = mscLive ? '#fff' : '#fca5a5';
+  }
   const body = document.getElementById('msc-body');
   if(!ms || !ms.enabled){ if(body) body.style.display = 'none'; return; }
   if(body) body.style.display = '';
@@ -39841,6 +39986,34 @@ async function toggleMicroScalp(){
   } catch(e) {}
   mscBusy = false;
   if(btn){ btn.disabled = false; btn.textContent = mscEnabled ? 'Turn OFF' : 'Turn ON'; }
+  if(!mscEnabled){
+    mscLive = false;
+    const lb = document.getElementById('msc-live-btn');
+    if(lb){ lb.style.display = 'none'; }
+  }
+}
+async function toggleMicroLive(){
+  if(mscLiveBusy || !mscEnabled) return;
+  if(!mscLive && !window.confirm('Arm LIVE trading? Micro Scalp will place a REAL broker order (with stop + target) every time it fires a TAKE. It stays armed until you disarm it or the app restarts. Ghost logging continues either way.')) return;
+  mscLiveBusy = true;
+  const b = document.getElementById('msc-live-btn');
+  if(b){ b.disabled = true; b.textContent = '\u2026'; }
+  try {
+    const r = await api('/micro-scalp', { live: !mscLive });
+    mscLive = !!(r && r.live_armed);
+  } catch(e) {}
+  mscLiveBusy = false;
+  if(b){
+    b.disabled = false;
+    b.textContent = mscLive ? 'DISARM LIVE' : 'ARM LIVE';
+    b.style.background = mscLive ? '#7f1d1d' : '#2a1215';
+    b.style.color = mscLive ? '#fff' : '#fca5a5';
+  }
+  const go = document.getElementById('msc-ghostonly');
+  if(go){
+    go.textContent = mscLive ? 'LIVE ARMED' : 'GHOST ONLY';
+    go.style.color = mscLive ? '#ef4444' : '#f59e0b';
+  }
 }
 
 function renderDualSim(d){
@@ -44893,28 +45066,49 @@ def alerts_mute():
 
 @app.route("/micro-scalp", methods=["GET", "POST"])
 def micro_scalp_toggle():
-    """Read or set the MICRO SCALP MODE toggle + read the ghost ledger.
+    """Read or set the MICRO SCALP MODE toggle + the LIVE arm + the ghost ledger.
 
-    DISPLAY + GHOST ONLY: turning this ON never arms an order path — a TAKE
-    verdict only writes a ghost row into micro_scalp_ghost_trades (analysis +
-    logging, zero broker sends). State is in-memory and resets to the
-    MICRO_SCALP_ENABLED env default (normally OFF) on restart — fail-safe.
+    Two independent switches, both in-memory and RESET OFF on restart (fail-safe):
+      • "enabled" — the mode toggle. ON = the brain analyzes + logs GHOST trades.
+      • "live"    — the LIVE arm (separate, explicit). ON = a TAKE additionally
+        fires a REAL order through the SAME audited execute_trade_gateway
+        (source="micro_scalp") the main bot uses; every shared safety layer
+        applies. Arming requires the mode toggle ON; toggling the mode OFF
+        force-disarms LIVE. Ghost logging continues regardless, so live results
+        always have a ghost mirror.
     Owner-only (Basic Auth + CSRF via the Express proxy; NOT in OPEN_PATHS)."""
-    global MICRO_SCALP_MODE
+    global MICRO_SCALP_MODE, MICRO_LIVE_ARMED
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
-        enabled = bool(data.get("enabled"))
-        with MICRO_SCALP_LOCK:
-            MICRO_SCALP_MODE = enabled
-        if enabled and not MICRO_GHOST_DB_READY:
-            _check_micro_ghost_db_ready()      # lazy no-DDL probe on first arm
-        logger.info("MICRO SCALP MODE %s (display + ghost only, no orders)",
-                    "ENABLED" if enabled else "DISABLED")
+        if "enabled" in data:
+            enabled = bool(data.get("enabled"))
+            with MICRO_SCALP_LOCK:
+                MICRO_SCALP_MODE = enabled
+                if not enabled:
+                    MICRO_LIVE_ARMED = False   # mode OFF force-disarms LIVE (fail-safe)
+            if enabled and not MICRO_GHOST_DB_READY:
+                _check_micro_ghost_db_ready()  # lazy no-DDL probe on first arm
+            logger.info("MICRO SCALP MODE %s",
+                        "ENABLED" if enabled else "DISABLED (LIVE force-disarmed)")
+        if "live" in data:
+            want = bool(data.get("live"))
+            with MICRO_SCALP_LOCK:
+                if want and not MICRO_SCALP_MODE:
+                    want = False               # can't arm LIVE while the mode is OFF
+                MICRO_LIVE_ARMED = want
+            logger.warning("MICRO SCALP LIVE %s — real broker orders %s fire on TAKE "
+                           "(%d contract(s), single %s exit).",
+                           "ARMED" if want else "DISARMED",
+                           "WILL" if want else "will NOT",
+                           MICRO_LIVE_CONTRACTS, MICRO_LIVE_TARGET)
     return jsonify({
-        "status":   "ok",
-        "enabled":  _micro_scalp_on(),
-        "db_ready": bool(MICRO_GHOST_DB_READY),
-        "ghost":    _micro_ghost_stats(None),
+        "status":         "ok",
+        "enabled":        _micro_scalp_on(),
+        "live_armed":     _micro_live_armed(),
+        "live_contracts": MICRO_LIVE_CONTRACTS,
+        "live_target":    MICRO_LIVE_TARGET,
+        "db_ready":       bool(MICRO_GHOST_DB_READY),
+        "ghost":          _micro_ghost_stats(None),
     }), 200
 
 
