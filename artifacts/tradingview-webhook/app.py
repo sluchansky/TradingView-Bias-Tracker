@@ -36816,7 +36816,7 @@ def dashboard():
       <button type="button" id="cp-sym-MNQ" class="cp-btn" onclick="cpSetSym('MNQ')">MNQ</button>
       <button type="button" id="cp-sym-MGC" class="cp-btn" onclick="cpSetSym('MGC')">MGC</button>
       <button type="button" id="cp-sym-MES" class="cp-btn" onclick="cpSetSym('MES')">MES</button>
-      <button type="button" id="cp-sym-MYM" class="cp-btn" onclick="cpSetSym('MYM')">MYM</button>
+      <button type="button" id="cp-sym-MYM" class="cp-btn" onclick="cpSetSym('MYM')" title="Charts a 24h US30 (Dow) CFD feed &mdash; TradingView&rsquo;s free embed doesn&rsquo;t license CBOT micro futures (MYM1!), and this proxy tracks it tick-for-tick.">MYM</button>
       <span style="width:8px"></span>
       <button type="button" id="cp-tf-1" class="cp-btn" onclick="cpSetTf('1')">1m</button>
       <button type="button" id="cp-tf-5" class="cp-btn" onclick="cpSetTf('5')">5m</button>
@@ -41772,7 +41772,10 @@ async function ttFetchOverride(){
 // Pure UI: renders an external TradingView chart for visual confirmation only.
 // It reads d.verdict/d.active_ticker to auto-follow live trade ideas and NEVER
 // feeds anything back into alerts, tracking, ENTER eligibility or webhooks.
-const CP_TV_SYMBOLS = { MNQ:'CME_MINI:MNQ1!', MGC:'COMEX:MGC1!', MES:'CME_MINI:MES1!', MYM:'CBOT_MINI:MYM1!' };
+// MYM note: TradingView's FREE embed widget has no CBOT micro futures data
+// (CBOT_MINI:MYM1! pops "only available on TradingView"), so MYM charts a
+// 24h US30 CFD proxy that tracks the Dow / MYM price action tick-for-tick.
+const CP_TV_SYMBOLS = { MNQ:'CME_MINI:MNQ1!', MGC:'COMEX:MGC1!', MES:'CME_MINI:MES1!', MYM:'OANDA:US30USD' };
 const CP_TFS = ['1','5','15','60'];
 let cpSym='MNQ', cpTf='5', cpFollow=true, cpLoadedKey=null;
 try {
@@ -41804,7 +41807,7 @@ function cpApply(){
   const fb=document.getElementById('cp-follow');
   if (fb){ fb.textContent='FOLLOW: '+(cpFollow?'ON':'OFF'); fb.classList.toggle('active', cpFollow); }
   const meta=document.getElementById('cp-meta');
-  if (meta) meta.textContent='\u00b7 '+(CP_TV_SYMBOLS[cpSym]||cpSym)+' \u00b7 '+(cpTf==='60'?'1h':cpTf+'m');
+  if (meta) meta.textContent='\u00b7 '+(CP_TV_SYMBOLS[cpSym]||cpSym)+' \u00b7 '+(cpTf==='60'?'1h':cpTf+'m')+(cpSym==='MYM'?' \u00b7 Dow proxy for MYM':'');
   try {
     localStorage.setItem('cpSym',cpSym); localStorage.setItem('cpTf',cpTf);
     localStorage.setItem('cpFollow', cpFollow?'1':'0');
