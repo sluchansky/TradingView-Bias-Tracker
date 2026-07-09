@@ -5574,7 +5574,35 @@ def _fetch_intraday_quote(symbol):
     # managed trade from being "filled" on a bar that opened before it entered.
     # Additive: every existing consumer reads high/low/close/volume by key only.
     quote["_timestamps"] = result.get("timestamp")
+    # Expose the meta block (regularMarketPrice/Volume/DayHigh/DayLow/chartPreviousClose).
+    # Additive — existing consumers never read "_meta".
+    quote["_meta"] = result.get("meta") or {}
     return quote, None
+
+
+def _fetch_quote_snapshot(symbol):
+    """Fetch a quick quote snapshot (bid/ask, day stats, volume) from Yahoo Finance
+    v7 quote API. Returns a dict of fields or None. DISPLAY-ONLY, fail-open —
+    any failure leaves AUTO_PRICE_BY_TICKER unchanged for those sub-fields."""
+    if not symbol:
+        return None
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    try:
+        resp = requests.get(
+            url,
+            params={"symbols": symbol,
+                    "fields": ("bid,ask,regularMarketPrice,regularMarketVolume,"
+                               "regularMarketDayHigh,regularMarketDayLow,"
+                               "regularMarketOpen,regularMarketPreviousClose")},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        result = resp.json().get("quoteResponse", {}).get("result") or []
+        return result[0] if result else None
+    except Exception:
+        return None
 
 
 def _log_feed_status(label, instrument, err):
@@ -5661,14 +5689,58 @@ def _update_vwap_auto(instrument):
 
 
 def _update_price_auto(instrument):
-    """Refresh the DISPLAY-ONLY fallback price for one instrument from the market
-    feed (same source as VWAP: MGC≈GC=F, MNQ≈NQ=F). Best-effort — any failure just
-    leaves the previous value in place. Never feeds the gate / scoring."""
-    bar = _fetch_latest_bar(instrument)
-    if bar and bar.get("close") is not None:
-        AUTO_PRICE_BY_TICKER[instrument] = {
-            "value": round(float(bar["close"]), 4), "ts": now_utc().isoformat(),
-        }
+    """Refresh the DISPLAY-ONLY market data snapshot for one instrument.
+    Uses a single _fetch_intraday_quote call (same request that VWAP already
+    makes) to extract:
+      - latest 1-minute bar OHLCV
+      - meta block: regularMarketVolume / DayHigh / DayLow / chartPreviousClose
+    Zero extra HTTP calls vs the old price-only fetch.  NEVER feeds the gate /
+    scoring / sizing / broker path."""
+    symbol = VWAP_FEED_SYMBOL.get(instrument)
+    if not symbol:
+        return
+    quote, err = _fetch_intraday_quote(symbol)
+    if err or not quote:
+        _log_feed_status("Price auto-fetch", instrument, err or "empty quote")
+        return
+    _log_feed_status("Price auto-fetch", instrument, None)
+    # ── Latest bar ────────────────────────────────────────────────────────
+    highs, lows, closes = quote["high"], quote["low"], quote["close"]
+    close = None
+    bar_high = bar_low = None
+    for i in range(len(closes) - 1, -1, -1):
+        if closes[i] is not None and highs[i] is not None and lows[i] is not None:
+            close    = round(float(closes[i]), 4)
+            bar_high = round(float(highs[i]),  4)
+            bar_low  = round(float(lows[i]),   4)
+            break
+    if close is None:
+        return
+    # ── Meta block (day stats) ────────────────────────────────────────────
+    meta = quote.get("_meta") or {}
+    def _mf(k):
+        v = meta.get(k)
+        return round(float(v), 4) if v is not None else None
+    volumes = quote.get("volume") or []
+    bar_vol = None
+    for i in range(len(volumes) - 1, -1, -1):
+        if volumes[i] is not None:
+            bar_vol = int(volumes[i])
+            break
+    AUTO_PRICE_BY_TICKER[instrument] = {
+        "value":      close,
+        "ts":         now_utc().isoformat(),
+        "source":     "yfinance",
+        "bar_high":   bar_high,
+        "bar_low":    bar_low,
+        "bar_close":  close,
+        "bar_volume": bar_vol,
+        # Day-level stats from the meta block
+        "volume":     meta.get("regularMarketVolume"),
+        "day_high":   _mf("regularMarketDayHigh"),
+        "day_low":    _mf("regularMarketDayLow"),
+        "prev_close": _mf("chartPreviousClose"),   # most reliably populated
+    }
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -23083,6 +23155,18 @@ def compute_data_feed_status(instrument=None):
                 "last_alert_type": last_a.get("alert_type"),
                 "last_price":      CURRENT_PRICE_BY_TICKER.get(inst),
                 "alert_count_1h":  count_1h_by_inst.get(inst, 0),
+                # Enhanced yfinance snapshot fields (additive, may be None)
+                "auto_price":      auto_d.get("value"),
+                "bid":             auto_d.get("bid"),
+                "ask":             auto_d.get("ask"),
+                "volume":          auto_d.get("volume"),
+                "day_high":        auto_d.get("day_high"),
+                "day_low":         auto_d.get("day_low"),
+                "day_open":        auto_d.get("day_open"),
+                "prev_close":      auto_d.get("prev_close"),
+                "bar_high":        auto_d.get("bar_high"),
+                "bar_low":         auto_d.get("bar_low"),
+                "source":          auto_d.get("source", "yfinance"),
             }
 
         ages = [v["alert_age_secs"] for v in per_inst.values()
@@ -23093,19 +23177,47 @@ def compute_data_feed_status(instrument=None):
         elif worst < 900:     overall = "STALE"
         else:                 overall = "OFFLINE"
 
+        # Data mode label: upgrade from ALERT-ONLY when yfinance is producing fresh data
+        auto_fresh = any(
+            v.get("auto_age_secs") is not None and v["auto_age_secs"] < 60
+            for v in per_inst.values()
+        )
+        has_quotes = any(
+            v.get("volume") is not None for v in per_inst.values()
+        )
+        if auto_fresh and has_quotes:
+            data_mode = "TV + yfinance · vol/range"
+            disclaimer = (
+                "Prices auto-fetched from Yahoo Finance every %ds (yfinance). "
+                "Bid/ask/volume/day stats included. "
+                "TradingView alerts continue to drive gate decisions. "
+                "yfinance data is ~15s delayed — display only, never gates trades."
+                % PRICE_FETCH_INTERVAL
+            )
+        elif auto_fresh:
+            data_mode = "TV + yfinance (%ds)" % PRICE_FETCH_INTERVAL
+            disclaimer = (
+                "Prices auto-fetched from Yahoo Finance every %ds (yfinance). "
+                "TradingView alerts continue to drive gate decisions. "
+                "yfinance data is ~15s delayed — display only, never gates trades."
+                % PRICE_FETCH_INTERVAL
+            )
+        else:
+            data_mode = "ALERT-ONLY"
+            disclaimer = (
+                "All prices come from TradingView alert webhooks. "
+                "No independent real-time market data feed is connected. "
+                "Prices may lag the actual tape by the alert delivery latency."
+            )
         return {
-            "data_mode":              "ALERT-ONLY",
-            "provider":               "TradingView",
+            "data_mode":              data_mode,
+            "provider":               "TradingView + yfinance",
             "overall_freshness":      overall,
             "instruments":            per_inst,
             "total_alerts_1h":        sum(count_1h_by_inst.values()),
             "staleness_gate_enabled": DATA_STALENESS_GATE_ENABLED,
             "stale_threshold_mins":   DATA_STALE_THRESHOLD_MINS,
-            "disclaimer": (
-                "All prices come from TradingView alert webhooks. "
-                "No independent real-time market data feed is connected. "
-                "Prices may lag the actual tape by the alert delivery latency."
-            ),
+            "disclaimer":             disclaimer,
         }
     except Exception as exc:
         return {"data_mode": "ALERT-ONLY", "provider": "TradingView",
@@ -37816,28 +37928,24 @@ def dashboard():
     <button class="btn" id="mo-send" style="width:100%;background:#7c2d12;border:1px solid #f59e0b;color:#ffedd5;font-weight:700" onclick="sendManualOrder()">🚀 Send Market Order</button>
     <div style="margin-top:6px;color:#9a6a12;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
   </div>
-  <!-- ════ Data Feed Status — shows data source, alert age, staleness warning
+  <!-- ════ Data Feed Status — alert timing + yfinance bid/ask/volume/day stats
        (DISPLAY-ONLY; never gates trades unless DATA_STALENESS_GATE_ENABLED=1). ════ -->
   <div class="mod" id="mod-data-feed">
     <div class="mod-h">📡 Data Feed
-      <span id="dfs-mode-badge" style="font-size:10px;font-weight:700;letter-spacing:1.5px;padding:2px 8px;border-radius:8px;background:#451a03;color:#f59e0b;margin-left:6px">ALERT-ONLY</span>
+      <span id="dfs-mode-badge" style="font-size:10px;font-weight:700;letter-spacing:1.2px;padding:2px 8px;border-radius:8px;background:#14532d;color:#22c55e;margin-left:6px">LOADING…</span>
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">DATA MODE</span>
     </div>
     <!-- Disclaimer -->
     <div id="dfs-disclaimer" style="font-size:11px;color:#9ca3af;margin-bottom:8px;line-height:1.5;background:#0f1621;border:1px solid #1e2535;border-radius:6px;padding:7px 10px">—</div>
-    <!-- Per-instrument rows -->
-    <div id="dfs-instruments" style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px"></div>
-    <!-- Global stats row -->
-    <div style="display:flex;gap:14px;margin-bottom:6px">
-      <div><div style="font-size:10px;color:#6b7280">Total alerts/hr</div><div style="font-size:12px;color:#e2e8f0;font-weight:700" id="dfs-count-1h">—</div></div>
+    <!-- Per-instrument grid -->
+    <div id="dfs-instruments" style="display:flex;flex-direction:column;gap:6px;margin-bottom:6px"></div>
+    <!-- Stats footer -->
+    <div style="display:flex;gap:14px;margin-bottom:6px;flex-wrap:wrap">
+      <div><div style="font-size:10px;color:#6b7280">Alerts / hr</div><div style="font-size:12px;color:#e2e8f0;font-weight:700" id="dfs-count-1h">—</div></div>
       <div><div style="font-size:10px;color:#6b7280">Staleness gate</div><div style="font-size:12px;font-weight:700" id="dfs-gate-status">—</div></div>
     </div>
     <!-- Stale warning banner -->
     <div id="dfs-stale-warn" style="display:none;background:#7f1d1d;border:1px solid #ef4444;border-radius:6px;padding:8px;font-size:11px;color:#fca5a5;line-height:1.5">—</div>
-    <!-- Phase 2 teaser -->
-    <div style="margin-top:8px;font-size:10px;color:#374151;border-top:1px solid #1e2535;padding-top:6px">
-      Phase 2: Live market data provider (Databento) coming soon — will replace ALERT-ONLY with tick-level feed.
-    </div>
   </div>
 
   <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
@@ -41199,74 +41307,136 @@ function renderDataFeed(d){
   const df=(d&&d.data_feed)||null;
   if(!df) return;
 
-  // Mode badge
+  // ── Mode badge ─────────────────────────────────────────────────────────────
   const badge=document.getElementById('dfs-mode-badge');
-  if(badge){ badge.textContent=df.data_mode||'ALERT-ONLY'; }
+  if(badge){
+    badge.textContent=df.data_mode||'ALERT-ONLY';
+    const isLive=df.data_mode&&df.data_mode.indexOf('yfinance')>=0;
+    badge.style.background=isLive?'#14532d':'#451a03';
+    badge.style.color=isLive?'#22c55e':'#f59e0b';
+  }
 
-  // Disclaimer
+  // ── Disclaimer ─────────────────────────────────────────────────────────────
   const disc=document.getElementById('dfs-disclaimer');
   if(disc) disc.textContent=df.disclaimer||'';
 
-  // Stats row
+  // ── Stats footer ───────────────────────────────────────────────────────────
   const c1h=document.getElementById('dfs-count-1h');
   if(c1h) c1h.textContent=(df.total_alerts_1h!=null)?df.total_alerts_1h:'—';
   const gst=document.getElementById('dfs-gate-status');
   if(gst){
-    gst.textContent=df.staleness_gate_enabled?('ON — '+df.stale_threshold_mins+'m threshold'):'OFF';
-    gst.style.color=df.staleness_gate_enabled?'#f59e0b':'#6b7280';
+    gst.textContent=df.staleness_gate_enabled?('ON \u00b7 '+df.stale_threshold_mins+'m'):'OFF';
+    gst.style.color=df.staleness_gate_enabled?'#f59e0b':'#4b5563';
   }
 
-  // Per-instrument rows
+  // ── Per-instrument cards ───────────────────────────────────────────────────
   const instEl=document.getElementById('dfs-instruments');
   if(instEl){
     instEl.innerHTML='';
     const insts=df.instruments||{};
     Object.keys(insts).sort().forEach(function(inst){
       const info=insts[inst];
-      const row=document.createElement('div');
-      row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;background:#0f1621;border:1px solid #1e2535';
+      const fc=info.freshness==='LIVE'?'#22c55e':info.freshness==='STALE'?'#f59e0b':'#4b5563';
+      const ac=info.alert_age_secs!=null&&info.alert_age_secs<300?'#22c55e':
+               info.alert_age_secs!=null&&info.alert_age_secs<900?'#f59e0b':'#4b5563';
 
-      // Symbol
+      const card=document.createElement('div');
+      card.style.cssText='background:#0f1621;border:1px solid #1e2535;border-radius:8px;padding:8px 10px';
+
+      // ── Top row: symbol + freshness + alert age ──
+      const top=document.createElement('div');
+      top.style.cssText='display:flex;align-items:center;gap:8px;margin-bottom:5px';
+
       const sym=document.createElement('span');
-      sym.style.cssText='font-weight:700;font-size:12px;color:#e2e8f0;min-width:38px';
+      sym.style.cssText='font-weight:700;font-size:13px;color:#e2e8f0;min-width:42px';
       sym.textContent=inst;
 
-      // Freshness dot
-      const fc=info.freshness==='LIVE'?'#22c55e':info.freshness==='STALE'?'#f59e0b':'#6b7280';
       const dot=document.createElement('span');
       dot.style.cssText='width:8px;height:8px;border-radius:50%;background:'+fc+';flex-shrink:0';
 
-      // Freshness label
       const fl=document.createElement('span');
       fl.style.cssText='font-size:11px;font-weight:700;color:'+fc;
       fl.textContent=info.freshness||'—';
 
-      // Age
+      // Alert age
       const age=document.createElement('span');
-      age.style.cssText='font-size:10px;color:#6b7280';
+      age.style.cssText='font-size:10px;color:'+ac+';margin-left:4px';
       if(info.alert_age_secs!=null){
-        const m=Math.floor(info.alert_age_secs/60);
-        const s=info.alert_age_secs%60;
-        age.textContent=m>0?(m+'m '+s+'s ago'):(s+'s ago');
-      } else { age.textContent='no data'; }
+        const m=Math.floor(info.alert_age_secs/60), s=info.alert_age_secs%60;
+        age.textContent='alert '+(m>0?m+'m ':'')+s+'s ago';
+      } else { age.textContent='no TV alert yet'; }
 
-      // Last alert type
-      const lat=document.createElement('span');
-      lat.style.cssText='font-size:10px;color:#9ca3af;margin-left:auto;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-      lat.textContent=info.last_alert_type||'—';
+      // Auto-fetch age
+      const aage=document.createElement('span');
+      aage.style.cssText='font-size:10px;color:#6b7280;margin-left:auto';
+      if(info.auto_age_secs!=null){
+        aage.textContent='feed '+info.auto_age_secs+'s ago';
+      }
 
-      // Count/hr
-      const cnt=document.createElement('span');
-      cnt.style.cssText='font-size:10px;color:#6b7280';
-      cnt.textContent=(info.alert_count_1h||0)+'/hr';
+      top.appendChild(sym); top.appendChild(dot); top.appendChild(fl);
+      top.appendChild(age); top.appendChild(aage);
 
-      row.appendChild(sym); row.appendChild(dot); row.appendChild(fl);
-      row.appendChild(age); row.appendChild(lat); row.appendChild(cnt);
-      instEl.appendChild(row);
+      // ── Mid row: price + bid/ask ──
+      const mid=document.createElement('div');
+      mid.style.cssText='display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:3px';
+
+      const px=info.auto_price||info.last_price;
+      if(px!=null){
+        const pxEl=document.createElement('span');
+        pxEl.style.cssText='font-size:13px;font-weight:700;color:#e2e8f0';
+        pxEl.textContent=px.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+        mid.appendChild(pxEl);
+      }
+
+
+      // ── Bottom row: volume + day range ──
+      const bot=document.createElement('div');
+      bot.style.cssText='display:flex;gap:10px;flex-wrap:wrap';
+
+      if(info.volume!=null){
+        const volEl=document.createElement('span');
+        volEl.style.cssText='font-size:10px;color:#6b7280';
+        const vk=info.volume>=1000?Math.round(info.volume/1000)+'k':info.volume;
+        volEl.textContent='Vol: '+vk;
+        bot.appendChild(volEl);
+      }
+      if(info.day_high!=null&&info.day_low!=null){
+        const rngEl=document.createElement('span');
+        rngEl.style.cssText='font-size:10px;color:#6b7280';
+        rngEl.textContent='Range: '+info.day_low.toFixed(2)+' \u2013 '+info.day_high.toFixed(2);
+        bot.appendChild(rngEl);
+      }
+      if(info.day_open!=null){
+        const opEl=document.createElement('span');
+        opEl.style.cssText='font-size:10px;color:#6b7280';
+        opEl.textContent='Open: '+info.day_open.toFixed(2);
+        bot.appendChild(opEl);
+      }
+      if(info.prev_close!=null&&info.auto_price!=null){
+        const chg=parseFloat((info.auto_price-info.prev_close).toFixed(2));
+        const pct=parseFloat(((chg/info.prev_close)*100).toFixed(2));
+        const chEl=document.createElement('span');
+        chEl.style.cssText='font-size:10px;font-weight:600;color:'+(chg>=0?'#22c55e':'#ef4444');
+        chEl.textContent=(chg>=0?'+':'')+chg.toFixed(2)+' ('+pct.toFixed(2)+'%)';
+        bot.appendChild(chEl);
+      }
+
+      // Last alert type chip
+      if(info.last_alert_type){
+        const latEl=document.createElement('span');
+        latEl.style.cssText='font-size:10px;color:#6b7280;margin-left:auto';
+        latEl.textContent='Last: '+info.last_alert_type;
+        bot.appendChild(latEl);
+      }
+
+      card.appendChild(top);
+      if(mid.children.length) card.appendChild(mid);
+      if(bot.children.length) card.appendChild(bot);
+      instEl.appendChild(card);
     });
   }
 
-  // Stale warning banner
+  // ── Stale warning banner ────────────────────────────────────────────────────
   const warn=document.getElementById('dfs-stale-warn');
   if(warn){
     const insts=df.instruments||{};
@@ -41278,16 +41448,17 @@ function renderDataFeed(d){
       const msgs=staleInsts.map(function(k){
         const i=insts[k];
         const m=i.alert_age_secs!=null?Math.floor(i.alert_age_secs/60):null;
-        return k+': '+i.freshness+(m!=null?' ('+m+'m old)':'');
+        return k+': '+i.freshness+(m!=null?' ('+m+'m)':'');
       });
-      warn.textContent='\u26a0\ufe0f Data stale: '+msgs.join(' \u00b7 ')+
-        (df.staleness_gate_enabled?' \u2014 Gate ON: READY demoted to WAIT.':
-         ' \u2014 Staleness gate OFF (gate not enforcing).');
+      warn.textContent='\u26a0\ufe0f TV alerts stale: '+msgs.join(' \u00b7 ')+
+        (df.staleness_gate_enabled?' \u2014 Gate ON: READY \u2192 WAIT':
+         ' \u2014 Gate is OFF (not enforcing).');
     } else {
       warn.style.display='none';
     }
   }
 }
+
 function renderThesisTracker(d){
   const mod=document.getElementById('mod-mb-thesis'); if(!mod) return;
   const tt=(d&&d.thesis_tracker)||null;

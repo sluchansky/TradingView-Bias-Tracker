@@ -1,48 +1,42 @@
 ---
 name: Market Data Engine
-description: Multi-phase plan to add real futures market data alongside TradingView alerts. Phase 1 done; Phase 2 pending Databento API key.
+description: Phase 1-5 build of the live data feed layer. Covers data source choices, yfinance integration approach, and what fields are available.
 ---
 
-## Phase status
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | Data Feed Status display panel + Phase 5 staleness gate | DONE |
-| 2 | Databento live tick feed | BLOCKED — needs DATABENTO_API_KEY |
-| 3 | MarketDataProvider abstraction layer | Follows Phase 2 |
-| 4 | Keep execution unchanged | Invariant (always) |
-| 5 | Stale data → WAIT safety gate | Infrastructure DONE (default OFF); arms after Phase 2 live |
+# Market Data Engine
 
-## Phase 1 — what was built
-- `compute_data_feed_status(instrument=None)` — reads CURRENT_PRICE_TS_BY_TICKER,
-  AUTO_PRICE_BY_TICKER, ALERT_HISTORY → per-instrument freshness (LIVE/STALE/OFFLINE)
-- Whitelisted in `/status` as `"data_feed"`
-- Dashboard panel `mod-data-feed` with `renderDataFeed(d)` JS in render loop
-- DATA MODE: ALERT-ONLY badge
+## Phase 1 — Data Feed Status panel (DONE)
+- `compute_data_feed_status()` reads CURRENT_PRICE_TS_BY_TICKER + AUTO_PRICE_BY_TICKER + ALERT_HISTORY → per-instrument freshness (LIVE/STALE/OFFLINE)
+- Whitelisted in /status as "data_feed"
+- `mod-data-feed` HTML panel + `renderDataFeed` JS
 
-## Phase 5 — data staleness gate (default OFF)
-- `DATA_STALENESS_GATE_ENABLED=1` arms it (env flag)
-- `DATA_STALE_THRESHOLD_MINS` (default 15) — age threshold for alert price
-- `data_stale_brake` — fail-open demote-only READY→WAIT
-- Only fires when BOTH alert price AND auto-fetch price are stale + market open
-- Wired into `_dir_block` alongside `scalp_vol_brake`
+## Phase 2 — Enhanced yfinance (DONE)
+- **TradingView has NO data API** (even paid plans). Only webhooks.
+- **Databento rejected** (costs money).
+- **Yahoo Finance v7 quote endpoint is 401** — not usable for bid/ask.
+- **Solution**: piggyback on the existing `_fetch_intraday_quote` v8/finance/chart call (already running for VWAP/volatility). The `meta` block in the v8 response contains: `regularMarketVolume`, `regularMarketDayHigh`, `regularMarketDayLow`, `chartPreviousClose`, `regularMarketPrice`.
+- **Zero extra HTTP calls** — just added `quote["_meta"] = result.get("meta") or {}` in `_fetch_intraday_quote`.
+- `AUTO_PRICE_BY_TICKER` now stores: `{value, ts, source, bar_high, bar_low, bar_close, bar_volume, volume, day_high, day_low, prev_close}`.
+- DATA MODE badge: "TV + yfinance · vol/range" when data is fresh + volume present.
+- Dashboard shows: price, volume, day range, prev close, % change per instrument.
 
-## Phase 2 — Databento plan (pending)
-- `databento` package available: `pip install databento` (v0.81.0 in index)
-- Dataset: `GLBX.MDP3` (CME Globex) for MNQ, MES, MYM; `XNAS.ITCH` for equities
-- MGC is on COMEX which is also under GLBX.MDP3
-- Symbol format: continuous front-month e.g. `MNQM5` or continuous `MNQ.c.0`
-- Live streaming via `databento.Live` client (WebSocket)
-- Needs: `DATABENTO_API_KEY` secret
+## Phase 5 — Staleness gate (DONE, default OFF)
+- `DATA_STALENESS_GATE_ENABLED` env flag
+- `data_stale_brake` demote-only in `_dir_block` alongside `scalp_vol_brake`
+- Arms when BOTH alert + auto-fetch price stale + market open
 
-## Key invariants for Phase 2 implementation
-- Execution path (TradersPost → Tradovate) must NOT change
-- Live data is ONLY for: display, faster entries, stale detection, learning
-- Databento price feeds AUTO_PRICE_BY_TICKER (display-only layer) — never CURRENT_PRICE_BY_TICKER (alert-only gate layer)
-- Phase 5 gate activates automatically once Databento provides fresh data
-- New data provider must be fail-open: Databento down → ALERT-ONLY mode gracefully
+## What yfinance provides for CME futures (v8 chart meta)
+- ✅ `regularMarketVolume` — cumulative session volume
+- ✅ `regularMarketDayHigh` / `regularMarketDayLow` — day range
+- ✅ `chartPreviousClose` — prev session close (more reliable than regularMarketPreviousClose)
+- ✅ `regularMarketPrice` — last price (~15s delayed)
+- ❌ `bid` / `ask` — always None for futures via this endpoint
+- ❌ `regularMarketOpen` — sometimes None
 
-## Needed symbols (Databento)
-- MNQ → `MNQ.c.0` (Micro E-mini Nasdaq, continuous, GLBX)
-- MES → `MES.c.0` (Micro E-mini S&P, GLBX)
-- MGC → `MGC.c.0` (Micro Gold, GLBX/COMEX)
-- MYM → `MYM.c.0` (Micro Dow, CBOT = GLBX)
+**Why:** The v8/finance/chart endpoint is Yahoo's public chart API that still works without auth. The v7/finance/quote endpoint (which would have bid/ask) now requires auth (HTTP 401).
+
+## Key invariants
+- All data is DISPLAY-ONLY — never feeds gate/scoring/sizing/broker path
+- `_update_price_auto` calls `_fetch_intraday_quote` (not `_fetch_latest_bar`) to get meta in one call
+- `_fetch_latest_bar` still used by managed trade watcher (unchanged)
+- Adding new fields to AUTO_PRICE_BY_TICKER is additive — existing consumers only read ["value"] and ["ts"]
