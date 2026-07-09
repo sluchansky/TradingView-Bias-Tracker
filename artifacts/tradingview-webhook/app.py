@@ -490,6 +490,12 @@ def _env_int_or_none(name, default):
 #      (> threshold). SCALP-only (SWING already hard-gates volatility via VOL_HARD_GATE).
 SCALP_VOL_BRAKE_ENABLED   = _env_flag_on("SCALP_VOL_BRAKE_ENABLED")
 SCALP_VOL_BRAKE_THRESHOLD = _env_float("SCALP_VOL_BRAKE_THRESHOLD", 3.0)
+# ── Data Staleness Gate (Phase 5 safety rule, MONEY PATH, default OFF) ─────────
+# When enabled: if the last TradingView alert is older than DATA_STALE_THRESHOLD_MINS
+# AND the auto-fetched price is also stale, the verdict is demoted READY->WAIT.
+# Fail-open. Only active while market is open. Arm with DATA_STALENESS_GATE_ENABLED=1.
+DATA_STALENESS_GATE_ENABLED = os.environ.get("DATA_STALENESS_GATE_ENABLED", "0") == "1"
+DATA_STALE_THRESHOLD_MINS   = int(os.environ.get("DATA_STALE_THRESHOLD_MINS", "15"))
 # Structure-reversal demote (SCALP-only, MONEY PATH, default OFF). When a FRESH
 # opposite-direction structure event (BOS/CHOCH/swing) lands CLEARLY later than the
 # other side's newest structure (gap beyond the true-conflict window), the STALE
@@ -7195,6 +7201,34 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         except (TypeError, ValueError):
             scalp_vol_brake = False
 
+    # ── Data staleness brake (Phase 5, default OFF) — demote READY->WAIT when ──
+    #    BOTH the alert-driven price AND the auto-fetched price are stale.  The
+    #    gate is fail-open (error → no brake) and only fires while market is open.
+    data_stale_brake      = False
+    data_stale_age_mins   = None
+    if DATA_STALENESS_GATE_ENABLED and result.get("market_open", True):
+        try:
+            _now_dt   = datetime.now(timezone.utc)
+            _thresh_s = DATA_STALE_THRESHOLD_MINS * 60
+            _alert_ts = CURRENT_PRICE_TS_BY_TICKER.get(instrument)
+            _auto_d   = AUTO_PRICE_BY_TICKER.get(instrument) or {}
+            _auto_ts  = _auto_d.get("ts")
+            def _is_stale(ts_str, threshold_s):
+                if not ts_str: return True
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                return (_now_dt - ts).total_seconds() > threshold_s
+            alert_stale = _is_stale(_alert_ts, _thresh_s)
+            auto_stale  = _is_stale(_auto_ts,  120)   # auto-fetch runs every 10 s
+            if alert_stale and auto_stale:
+                data_stale_brake = True
+                if _alert_ts:
+                    ts = datetime.fromisoformat(_alert_ts)
+                    if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                    data_stale_age_mins = int((_now_dt - ts).total_seconds() // 60)
+        except Exception:
+            data_stale_brake = False   # fail-open
+
     # ── CVD (Cumulative Volume Delta) — HARD confirmation filter, FAIL-OPEN. ──
     #    Reject a LONG when CVD is bearish (delta < 0) and a SHORT when CVD is
     #    bullish (delta > 0). When CVD is unknown for this instrument, both sides
@@ -7577,6 +7611,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         cvd_ok = cvd_long_ok if direction == "Long" else cvd_short_ok
         gates_ok = bool(
             not true_conflict and not vol_block and not scalp_vol_brake
+            and not data_stale_brake
             and (not require_zone or gd["zone_valid"])
             and (not require_vwap or gd["vwap_confirmed"])
             and (not require_structure or gd["structure_confirmed"])
@@ -7675,6 +7710,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         elif scalp_vol_brake:
             reason = (f"{direction} WAIT — volatility brake: ATR ratio "
                       f"{vol.get('ratio')}x over the SCALP limit ({SCALP_VOL_BRAKE_THRESHOLD:g}x).")
+        elif data_stale_brake:
+            age_str = f"{data_stale_age_mins}m" if data_stale_age_mins is not None else "unknown"
+            reason = (f"{direction} WAIT — market data stale: "
+                      f"no TradingView alerts received for {age_str} (threshold: "
+                      f"{DATA_STALE_THRESHOLD_MINS}m). Waiting for fresh data.")
         else:
             reason = (f"{direction} WAIT — failed gate(s): "
                       f"{', '.join(fails) if fails else 'confluence'}.")
@@ -7688,9 +7728,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "label":       "READY" if ready else "WAIT",
             "missing":     fails,
             "reason":      reason,
-            "conflict":    true_conflict,
-            "gate_debug":  gd,
-            "confluences": _confluences(direction),
+            "conflict":          true_conflict,
+            "gate_debug":        gd,
+            "confluences":       _confluences(direction),
+            "data_stale_brake":  data_stale_brake,
+            "data_stale_age_m":  data_stale_age_mins,
         }
 
     directions = {"Long": _dir_block("Long"), "Short": _dir_block("Short")}
@@ -18439,6 +18481,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             result["thesis_tracker"] = compute_thesis_tracker(_mb_inst, result)
         except Exception:
             result["thesis_tracker"] = {"available": False, "snapshots": [], "pattern": None}
+        result["data_feed"] = compute_data_feed_status(_mb_inst)
     except Exception:
         result["market_narrative"] = _market_narrative_neutral()
     try:
@@ -22977,6 +23020,98 @@ def _mb_capture_cognitive(result):
         _resolve_open_theses(result, result.get('active_ticker'))
     except Exception:
         pass
+
+
+
+# ══ Data Feed Status — Phase 1: alert-driven data feed monitoring (DISPLAY-ONLY) ══
+# Surfaces per-instrument alert/price freshness so the dashboard clearly shows
+# DATA MODE: ALERT-ONLY and warns when data is stale.  Never touches gate/scoring.
+
+def compute_data_feed_status(instrument=None):
+    """Build per-instrument data feed status from alert/price timestamps. FAIL-OPEN."""
+    try:
+        now_dt = datetime.now(timezone.utc)
+        hist   = list(ALERT_HISTORY)          # atomic GIL snapshot
+
+        # Most recent alert per instrument
+        last_by_inst = {}
+        for a in reversed(hist):
+            inst = a.get("instrument")
+            if inst and inst not in last_by_inst:
+                last_by_inst[inst] = a
+
+        # Per-instrument alert counts in the last hour
+        cutoff_1h = now_dt - timedelta(hours=1)
+        count_1h_by_inst = {}
+        for a in hist:
+            try:
+                ts = datetime.fromisoformat(a.get("timestamp", ""))
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                if ts >= cutoff_1h:
+                    k = a.get("instrument", "?")
+                    count_1h_by_inst[k] = count_1h_by_inst.get(k, 0) + 1
+            except Exception:
+                pass
+
+        def _age_secs(ts_str):
+            if not ts_str:
+                return None
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                return max(0, int((now_dt - ts).total_seconds()))
+            except Exception:
+                return None
+
+        instruments = list(ASSETS.keys())
+        per_inst = {}
+        for inst in instruments:
+            alert_age = _age_secs(CURRENT_PRICE_TS_BY_TICKER.get(inst))
+            auto_d    = AUTO_PRICE_BY_TICKER.get(inst) or {}
+            auto_age  = _age_secs(auto_d.get("ts"))
+            if alert_age is None:      freshness = "OFFLINE"
+            elif alert_age < 300:      freshness = "LIVE"
+            elif alert_age < 900:      freshness = "STALE"
+            else:                      freshness = "OFFLINE"
+            last_a = last_by_inst.get(inst) or {}
+            per_inst[inst] = {
+                "last_alert_ts":   CURRENT_PRICE_TS_BY_TICKER.get(inst),
+                "alert_age_secs":  alert_age,
+                "last_auto_ts":    auto_d.get("ts"),
+                "auto_age_secs":   auto_age,
+                "freshness":       freshness,
+                "last_alert_type": last_a.get("alert_type"),
+                "last_price":      CURRENT_PRICE_BY_TICKER.get(inst),
+                "alert_count_1h":  count_1h_by_inst.get(inst, 0),
+            }
+
+        ages = [v["alert_age_secs"] for v in per_inst.values()
+                if v["alert_age_secs"] is not None]
+        worst = max(ages) if ages else None
+        if worst is None:     overall = "OFFLINE"
+        elif worst < 300:     overall = "LIVE"
+        elif worst < 900:     overall = "STALE"
+        else:                 overall = "OFFLINE"
+
+        return {
+            "data_mode":              "ALERT-ONLY",
+            "provider":               "TradingView",
+            "overall_freshness":      overall,
+            "instruments":            per_inst,
+            "total_alerts_1h":        sum(count_1h_by_inst.values()),
+            "staleness_gate_enabled": DATA_STALENESS_GATE_ENABLED,
+            "stale_threshold_mins":   DATA_STALE_THRESHOLD_MINS,
+            "disclaimer": (
+                "All prices come from TradingView alert webhooks. "
+                "No independent real-time market data feed is connected. "
+                "Prices may lag the actual tape by the alert delivery latency."
+            ),
+        }
+    except Exception as exc:
+        return {"data_mode": "ALERT-ONLY", "provider": "TradingView",
+                "overall_freshness": "UNKNOWN", "instruments": {},
+                "total_alerts_1h": 0, "staleness_gate_enabled": False,
+                "disclaimer": "Status unavailable: %s" % exc}
 
 
 # ── Thesis Tracker — outcome-based learning / analyst memory ──────────────────
@@ -32458,6 +32593,7 @@ def _build_status_payload(_tk):
         "confidence_timeline":       a.get("confidence_timeline"),
         "market_narrative":          a.get("market_narrative"),
         "thesis_tracker":            a.get("thesis_tracker"),
+        "data_feed":                 a.get("data_feed"),
         "market_events_timeline":    a.get("market_events_timeline"),
         "session_day_type":          a.get("session_day_type"),
         "main_brain_learning_stats": a.get("main_brain_learning_stats"),
@@ -37680,6 +37816,30 @@ def dashboard():
     <button class="btn" id="mo-send" style="width:100%;background:#7c2d12;border:1px solid #f59e0b;color:#ffedd5;font-weight:700" onclick="sendManualOrder()">🚀 Send Market Order</button>
     <div style="margin-top:6px;color:#9a6a12;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
   </div>
+  <!-- ════ Data Feed Status — shows data source, alert age, staleness warning
+       (DISPLAY-ONLY; never gates trades unless DATA_STALENESS_GATE_ENABLED=1). ════ -->
+  <div class="mod" id="mod-data-feed">
+    <div class="mod-h">📡 Data Feed
+      <span id="dfs-mode-badge" style="font-size:10px;font-weight:700;letter-spacing:1.5px;padding:2px 8px;border-radius:8px;background:#451a03;color:#f59e0b;margin-left:6px">ALERT-ONLY</span>
+      <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">DATA MODE</span>
+    </div>
+    <!-- Disclaimer -->
+    <div id="dfs-disclaimer" style="font-size:11px;color:#9ca3af;margin-bottom:8px;line-height:1.5;background:#0f1621;border:1px solid #1e2535;border-radius:6px;padding:7px 10px">—</div>
+    <!-- Per-instrument rows -->
+    <div id="dfs-instruments" style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px"></div>
+    <!-- Global stats row -->
+    <div style="display:flex;gap:14px;margin-bottom:6px">
+      <div><div style="font-size:10px;color:#6b7280">Total alerts/hr</div><div style="font-size:12px;color:#e2e8f0;font-weight:700" id="dfs-count-1h">—</div></div>
+      <div><div style="font-size:10px;color:#6b7280">Staleness gate</div><div style="font-size:12px;font-weight:700" id="dfs-gate-status">—</div></div>
+    </div>
+    <!-- Stale warning banner -->
+    <div id="dfs-stale-warn" style="display:none;background:#7f1d1d;border:1px solid #ef4444;border-radius:6px;padding:8px;font-size:11px;color:#fca5a5;line-height:1.5">—</div>
+    <!-- Phase 2 teaser -->
+    <div style="margin-top:8px;font-size:10px;color:#374151;border-top:1px solid #1e2535;padding-top:6px">
+      Phase 2: Live market data provider (Databento) coming soon — will replace ALERT-ONLY with tick-level feed.
+    </div>
+  </div>
+
   <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
        TradeZella / broker CSV. This is the source of truth for P&L and win-rate.
        The proxy-feed panels below (Equity Curve, Today's Trades, Learning Stats)
@@ -41034,6 +41194,100 @@ function renderMBNarrative(d){
     noteEl.textContent=note?('Analyst Note: '+note):'\u2014';
   }
 }
+function renderDataFeed(d){
+  const mod=document.getElementById('mod-data-feed'); if(!mod) return;
+  const df=(d&&d.data_feed)||null;
+  if(!df) return;
+
+  // Mode badge
+  const badge=document.getElementById('dfs-mode-badge');
+  if(badge){ badge.textContent=df.data_mode||'ALERT-ONLY'; }
+
+  // Disclaimer
+  const disc=document.getElementById('dfs-disclaimer');
+  if(disc) disc.textContent=df.disclaimer||'';
+
+  // Stats row
+  const c1h=document.getElementById('dfs-count-1h');
+  if(c1h) c1h.textContent=(df.total_alerts_1h!=null)?df.total_alerts_1h:'—';
+  const gst=document.getElementById('dfs-gate-status');
+  if(gst){
+    gst.textContent=df.staleness_gate_enabled?('ON — '+df.stale_threshold_mins+'m threshold'):'OFF';
+    gst.style.color=df.staleness_gate_enabled?'#f59e0b':'#6b7280';
+  }
+
+  // Per-instrument rows
+  const instEl=document.getElementById('dfs-instruments');
+  if(instEl){
+    instEl.innerHTML='';
+    const insts=df.instruments||{};
+    Object.keys(insts).sort().forEach(function(inst){
+      const info=insts[inst];
+      const row=document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;background:#0f1621;border:1px solid #1e2535';
+
+      // Symbol
+      const sym=document.createElement('span');
+      sym.style.cssText='font-weight:700;font-size:12px;color:#e2e8f0;min-width:38px';
+      sym.textContent=inst;
+
+      // Freshness dot
+      const fc=info.freshness==='LIVE'?'#22c55e':info.freshness==='STALE'?'#f59e0b':'#6b7280';
+      const dot=document.createElement('span');
+      dot.style.cssText='width:8px;height:8px;border-radius:50%;background:'+fc+';flex-shrink:0';
+
+      // Freshness label
+      const fl=document.createElement('span');
+      fl.style.cssText='font-size:11px;font-weight:700;color:'+fc;
+      fl.textContent=info.freshness||'—';
+
+      // Age
+      const age=document.createElement('span');
+      age.style.cssText='font-size:10px;color:#6b7280';
+      if(info.alert_age_secs!=null){
+        const m=Math.floor(info.alert_age_secs/60);
+        const s=info.alert_age_secs%60;
+        age.textContent=m>0?(m+'m '+s+'s ago'):(s+'s ago');
+      } else { age.textContent='no data'; }
+
+      // Last alert type
+      const lat=document.createElement('span');
+      lat.style.cssText='font-size:10px;color:#9ca3af;margin-left:auto;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      lat.textContent=info.last_alert_type||'—';
+
+      // Count/hr
+      const cnt=document.createElement('span');
+      cnt.style.cssText='font-size:10px;color:#6b7280';
+      cnt.textContent=(info.alert_count_1h||0)+'/hr';
+
+      row.appendChild(sym); row.appendChild(dot); row.appendChild(fl);
+      row.appendChild(age); row.appendChild(lat); row.appendChild(cnt);
+      instEl.appendChild(row);
+    });
+  }
+
+  // Stale warning banner
+  const warn=document.getElementById('dfs-stale-warn');
+  if(warn){
+    const insts=df.instruments||{};
+    const staleInsts=Object.keys(insts).filter(function(k){
+      return insts[k].freshness!=='LIVE';
+    });
+    if(staleInsts.length){
+      warn.style.display='block';
+      const msgs=staleInsts.map(function(k){
+        const i=insts[k];
+        const m=i.alert_age_secs!=null?Math.floor(i.alert_age_secs/60):null;
+        return k+': '+i.freshness+(m!=null?' ('+m+'m old)':'');
+      });
+      warn.textContent='\u26a0\ufe0f Data stale: '+msgs.join(' \u00b7 ')+
+        (df.staleness_gate_enabled?' \u2014 Gate ON: READY demoted to WAIT.':
+         ' \u2014 Staleness gate OFF (gate not enforcing).');
+    } else {
+      warn.style.display='none';
+    }
+  }
+}
 function renderThesisTracker(d){
   const mod=document.getElementById('mod-mb-thesis'); if(!mod) return;
   const tt=(d&&d.thesis_tracker)||null;
@@ -41751,6 +42005,7 @@ function renderMainBrainCognitive(d){
   try{ renderMBConfidence(d); }catch(e){}
   try{ renderMBNarrative(d); }catch(e){}
   try{ renderMBEvents(d); }catch(e){}
+  try{ renderDataFeed(d); }catch(e){}
   try{ renderThesisTracker(d); }catch(e){}
   try{ renderMBDayType(d); }catch(e){}
   try{ renderMBLearning(d); }catch(e){}
