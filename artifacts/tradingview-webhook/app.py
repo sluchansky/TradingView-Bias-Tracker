@@ -43625,12 +43625,12 @@ function renderAutoSearch(data){
       html += '<div style="font-size:10px;color:#9ca3af;font-style:italic;margin-bottom:4px;">' + esc(h.custom_note) + '</div>';
     }
     if(h.status === 'validated'){
-      html += '<button onclick="asPromote(\''+esc(h.hyp_key)+'\')" ' +
+      html += '<button data-hk="' + esc(h.hyp_key) + '" onclick="asPromote(this.dataset.hk)" ' +
         'style="font-size:11px;background:#14532d;border:1px solid #22c55e;color:#86efac;' +
         'border-radius:5px;padding:3px 12px;cursor:pointer;margin-top:4px;">\u2605 Promote to Brain</button> ';
     }
     if(h.status !== 'promoted'){
-      html += '<button onclick="asReject(\''+esc(h.hyp_key)+'\')" ' +
+      html += '<button data-hk="' + esc(h.hyp_key) + '" onclick="asReject(this.dataset.hk)" ' +
         'style="font-size:10px;background:#1f2937;border:1px solid #374151;color:#6b7280;' +
         'border-radius:5px;padding:2px 8px;cursor:pointer;margin-top:4px;">Reject</button>';
     }
