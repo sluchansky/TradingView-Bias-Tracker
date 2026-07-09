@@ -18435,6 +18435,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["market_events_timeline"] = {"available": False, "events": [], "reason": "unavailable"}
     try:
         result["market_narrative"] = compute_market_narrative(result, _mb_inst)
+        try:
+            result["thesis_tracker"] = compute_thesis_tracker(_mb_inst, result)
+        except Exception:
+            result["thesis_tracker"] = {"available": False, "snapshots": [], "pattern": None}
     except Exception:
         result["market_narrative"] = _market_narrative_neutral()
     try:
@@ -22963,6 +22967,365 @@ def _mb_capture_cognitive(result):
         _detect_market_events(result)
     except Exception:
         pass
+    try:
+        _inst = result.get('active_ticker')
+        _nb   = (result.get('market_narrative') or {}).get('notebook') or {}
+        _save_thesis_snapshot(result, _inst, _nb)
+    except Exception:
+        pass
+    try:
+        _resolve_open_theses(result, result.get('active_ticker'))
+    except Exception:
+        pass
+
+
+# ── Thesis Tracker — outcome-based learning / analyst memory ──────────────────
+# Saves a directional thesis snapshot when direction changes or 25 min elapses.
+# 25-75 min later resolves the outcome vs actual market state and writes a lesson.
+# Feeds a Pattern Memory query that surfaces historical win/loss for the current
+# market fingerprint.  DISPLAY-ONLY; never touches gate / sizing / broker.
+
+THESIS_TRACKER_DB_READY = False
+
+
+def _check_thesis_tracker_db_ready():
+    """Probe thesis_snapshots (no DDL). FAIL-OPEN."""
+    global THESIS_TRACKER_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM thesis_snapshots LIMIT 1")
+            cur.fetchone()
+        THESIS_TRACKER_DB_READY = True
+        logger.info("thesis_snapshots table ready")
+    except Exception as exc:
+        logger.warning("thesis_snapshots table unavailable (Thesis Tracker disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+_THESIS_SAVE_STATE   = {}
+_THESIS_SAVE_LOCK    = threading.Lock()
+_THESIS_RESOLVE_LOCK = threading.Lock()
+_THESIS_SAVE_INTERVAL_S  = 25 * 60   # min seconds between saves for same direction
+_THESIS_RESOLVE_MIN_S    = 25 * 60   # min age before resolving
+_THESIS_RESOLVE_MAX_S    = 75 * 60   # abandon resolution after this
+
+
+def _save_thesis_snapshot(result, inst, notebook):
+    """INSERT a thesis snapshot when direction changes or 25 min elapsed. FAIL-OPEN."""
+    if not THESIS_TRACKER_DB_READY or not inst or not isinstance(notebook, dict):
+        return
+    try:
+        bias      = notebook.get("bias") or {}
+        direction = str(bias.get("direction") or "Neutral")
+        confidence = int(bias.get("probability") or 0)
+        edge = _mb_pf(result.get("edge_score"))
+        if edge is None or edge <= 0:
+            return
+        if not result.get("market_open", True):
+            return
+        now_t = time.time()
+        with _THESIS_SAVE_LOCK:
+            prev = _THESIS_SAVE_STATE.get(inst) or {}
+            last_dir = prev.get("last_dir")
+            last_at  = float(prev.get("last_at") or 0)
+            dir_changed  = (last_dir is not None and last_dir != direction)
+            should_save  = dir_changed or ((now_t - last_at) >= _THESIS_SAVE_INTERVAL_S)
+            if not should_save:
+                return
+            _THESIS_SAVE_STATE[inst] = {"last_dir": direction, "last_at": now_t}
+        analyst   = result.get("analyst") or {}
+        outlook   = analyst.get("analyst_outlook") or {}
+        game_plan = analyst.get("game_plan") or {}
+        mc        = notebook.get("market_character") or {}
+        phase     = str(mc.get("phase") or "Developing")
+        thesis    = str(notebook.get("thesis") or "")[:500]
+        moves     = ((game_plan.get("next_expected_move") or {}).get("moves") or [])
+        expected  = str(moves[0] if moves else "")[:200]
+        invalid   = str(outlook.get("invalidates") or "")[:200]
+        reasons   = list(notebook.get("key_memory") or [])[:5]
+        cur_p     = _mb_pf(result.get("current_price")) or 0
+        cur_v     = _mb_pf(result.get("vwap_value"))    or 0
+        vwap_side = "above" if cur_p >= cur_v else "below"
+        cvd_dir   = (str(result.get("cvd_direction") or "")[:20]) or None
+        struct    = (str((result.get("structure") or {}).get("bias") or "")[:20]) or None
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO thesis_snapshots
+                       (instrument, phase, direction, confidence, edge_score,
+                        thesis_text, expected_move, invalidation_text,
+                        reasons, vwap_side, cvd_dir, structure_bias)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (inst, phase, direction, confidence, edge, thesis, expected,
+                     invalid, psycopg2.extras.Json(reasons),
+                     vwap_side, cvd_dir, struct))
+            conn.commit()
+            logger.debug("thesis_snapshot saved: %s %s %d%%", inst, direction, confidence)
+        except Exception as exc:
+            logger.debug("thesis_snapshot insert fail-open: %s", exc)
+            try: conn.rollback()
+            except Exception: pass
+        finally:
+            try: conn.close()
+            except Exception: pass
+    except Exception as exc:
+        logger.debug("_save_thesis_snapshot fail-open: %s", exc)
+
+
+def _resolve_open_theses(result, inst):
+    """Resolve theses 25-75 min old for this instrument vs current market. FAIL-OPEN."""
+    if not THESIS_TRACKER_DB_READY or not inst:
+        return
+    with _THESIS_RESOLVE_LOCK:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, direction, phase, confidence, edge_score,
+                              vwap_side, cvd_dir, expected_move
+                       FROM thesis_snapshots
+                       WHERE instrument=%s AND resolved=FALSE
+                         AND created_at <= now() - interval '25 minutes'
+                         AND created_at >= now() - interval '75 minutes'
+                       ORDER BY created_at ASC LIMIT 3""", (inst,))
+                rows = cur.fetchall()
+            if not rows:
+                return
+            mb      = result.get("main_brain") or {}
+            analyst = result.get("analyst") or {}
+            cur_dir   = str(mb.get("favored_direction") or "Neither")
+            cur_phase = str((analyst.get("market_phase") or {}).get("phase") or "")
+            cur_edge  = float(_mb_pf(result.get("edge_score")) or 0)
+            cur_p     = float(_mb_pf(result.get("current_price")) or 0)
+            cur_v     = float(_mb_pf(result.get("vwap_value"))    or 0)
+            cur_vwap_s = "above" if cur_p >= cur_v else "below"
+            cur_cvd   = str(result.get("cvd_direction") or "").lower()
+
+            for row in rows:
+                row_id, th_dir, th_phase, th_conf, th_edge, th_vwap, th_cvd, th_expected = row
+                th_edge_f = float(th_edge) if th_edge is not None else cur_edge
+
+                if th_dir == "Neutral":
+                    _thesis_commit_update(conn, row_id, "N/A",
+                        ["Neutral thesis — no directional call to validate."],
+                        "Neutral bias resolved with no directional expectation.", {})
+                    continue
+
+                pts_for, pts_against, signals = 0, 0, []
+                if th_dir == "Bullish":
+                    if cur_dir == "Long":    pts_for     += 3
+                    elif cur_dir == "Short": pts_against += 3
+                    if cur_vwap_s == th_vwap and th_vwap == "above": pts_for  += 2
+                    elif th_vwap == "above" and cur_vwap_s == "below":
+                        pts_against += 2; signals.append("Lost VWAP after reclaim")
+                    if cur_cvd == "bullish":  pts_for     += 1
+                    elif cur_cvd == "bearish": pts_against += 1
+                    if cur_edge > th_edge_f + 10:  pts_for     += 2
+                    elif cur_edge < th_edge_f - 15: pts_against += 2
+                    if cur_phase in ("Reversal Watch", "Trend Exhausted"):
+                        pts_against += 1; signals.append("Phase shifted to %s" % cur_phase)
+                else:  # Bearish
+                    if cur_dir == "Short":   pts_for     += 3
+                    elif cur_dir == "Long":  pts_against += 3
+                    if cur_vwap_s == th_vwap and th_vwap == "below": pts_for  += 2
+                    elif th_vwap == "below" and cur_vwap_s == "above":
+                        pts_against += 2; signals.append("Price reclaimed VWAP against short thesis")
+                    if cur_cvd == "bearish":  pts_for     += 1
+                    elif cur_cvd == "bullish": pts_against += 1
+                    if cur_edge > th_edge_f + 10:  pts_for     += 2
+                    elif cur_edge < th_edge_f - 15: pts_against += 2
+                    if cur_phase in ("Reversal Watch",):
+                        pts_against += 1; signals.append("Phase shifted to Reversal Watch")
+
+                if   pts_for >= 5:            outcome = "SUCCESS"
+                elif pts_against >= 5:        outcome = "FAILED"
+                elif pts_against > pts_for:   outcome = "PARTIAL"
+                else:                         outcome = "PARTIAL"
+
+                lesson = _build_thesis_lesson(outcome, th_dir, th_phase, cur_phase,
+                                              th_vwap, cur_vwap_s, pts_for, pts_against,
+                                              cur_cvd, signals)
+                reflection = _build_thesis_reflection(outcome, signals, pts_for, pts_against)
+                _thesis_commit_update(conn, row_id, outcome, signals, lesson, reflection)
+            conn.commit()
+            logger.debug("thesis_resolve: %d rows for %s", len(rows), inst)
+        except Exception as exc:
+            logger.debug("_resolve_open_theses fail-open: %s", exc)
+            try: conn.rollback()
+            except Exception: pass
+        finally:
+            try: conn.close()
+            except Exception: pass
+
+
+def _thesis_commit_update(conn, row_id, outcome, signals, lesson, reflection):
+    """Write outcome columns for one thesis row."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE thesis_snapshots
+                   SET resolved=TRUE, resolved_at=now(), outcome=%s,
+                       outcome_reason=%s, lesson=%s, reflection=%s
+                   WHERE id=%s""",
+                (outcome, psycopg2.extras.Json(signals),
+                 str(lesson)[:600], psycopg2.extras.Json(reflection), row_id))
+    except Exception as exc:
+        logger.debug("_thesis_commit_update fail: %s", exc)
+
+
+def _build_thesis_lesson(outcome, th_dir, th_phase, cur_phase,
+                         th_vwap, cur_vwap_s, pts_for, pts_against, cur_cvd, signals):
+    """Generate a concise lesson from outcome conditions."""
+    if outcome == "SUCCESS":
+        bits = []
+        if th_vwap == cur_vwap_s:   bits.append("VWAP held")
+        if cur_cvd in ("bullish","bearish"): bits.append("delta agreed")
+        if pts_for >= 6:             bits.append("strong confirmation")
+        sig = " + ".join(bits) if bits else "conditions persisted"
+        lesson = "%s %s thesis confirmed. %s. %s phase held direction." % (
+            th_dir, "continuation" if th_phase not in ("Reversal Watch",) else "reversal",
+            sig.capitalize(), cur_phase or th_phase or "Market")
+        if th_phase == "Pullback":
+            lesson += " Pullback entries continue to outperform."
+    elif outcome == "FAILED":
+        if signals:
+            lesson = "Thesis failed: " + "; ".join(signals[:3]) + "."
+        else:
+            lesson = "Thesis failed — market moved opposite to the %s expectation." % th_dir.lower()
+        if th_vwap == "above" and cur_vwap_s == "below" and th_dir == "Bullish":
+            lesson += " Do not trust VWAP reclaims without volume confirmation."
+        if th_phase in ("Trend Exhausted", "Trend Mature") and th_dir == "Bullish":
+            lesson += " Avoid buying into exhausted trends — wait for a pullback first."
+        if th_phase in ("Trend Exhausted", "Trend Mature") and th_dir == "Bearish":
+            lesson += " Late-trend shorts carried higher reversal risk."
+    else:
+        lesson = ("Partial outcome — %s thesis partially correct. "
+                  "Pts for: %d, against: %d. Review conditions before repeating."
+                  % (th_dir.lower(), pts_for, pts_against))
+    return lesson
+
+
+def _build_thesis_reflection(outcome, signals, pts_for, pts_against):
+    """Generate 6-question AI reflection answers from outcome data."""
+    correct_flag = (outcome == "SUCCESS")
+    partial_flag = (outcome == "PARTIAL")
+    return {
+        "market_read":   ("Correct" if correct_flag else
+                          "Partially correct" if partial_flag else "Incorrect"),
+        "timing":        ("On time" if correct_flag else
+                          "Premature — conditions shifted before the move materialized"),
+        "entry_too_early": ("No — setup confirmed before the call" if correct_flag else
+                            "Possibly — thesis was not yet fully confirmed when saved"),
+        "ignored_signals": ("None — thesis was well-supported" if correct_flag else
+                             ("Opposing signals present: " + "; ".join(signals[:2])) if signals
+                             else "Review conditions at time of thesis"),
+        "most_impactful":  ("VWAP hold + delta agreement" if pts_for >= 4 else
+                            "Structure direction" if pts_for >= 2 else "No clear edge"),
+        "noise":           ("Phase label alone" if outcome == "FAILED" else
+                            "None identified" if correct_flag else "Review CVD timing"),
+    }
+
+
+def compute_thesis_tracker(inst, result):
+    """SELECT last thesis snapshots + pattern memory for current conditions. FAIL-OPEN."""
+    def _produce():
+        if not THESIS_TRACKER_DB_READY or not inst:
+            return {"available": False, "snapshots": [], "pattern": None, "reason": "unavailable"}
+        conn = _learning_conn()
+        if conn is None:
+            return {"available": False, "snapshots": [], "pattern": None, "reason": "no DB"}
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, created_at, direction, confidence, phase,
+                              edge_score, thesis_text, expected_move,
+                              resolved, outcome, resolved_at, lesson,
+                              reflection, outcome_reason
+                       FROM thesis_snapshots
+                       WHERE instrument=%s
+                         AND created_at >= now() - interval '12 hours'
+                       ORDER BY created_at DESC LIMIT 8""", (inst,))
+                rows = cur.fetchall()
+            snaps = []
+            for row in rows:
+                sid, created, direction, conf, phase, edge, thesis, expected, \
+                    resolved, outcome, resolved_at, lesson, refl, out_r = row
+                snaps.append({
+                    "id":           sid,
+                    "created":      created.isoformat() if created else None,
+                    "direction":    direction,
+                    "confidence":   int(conf) if conf is not None else None,
+                    "phase":        phase,
+                    "edge":         round(float(edge), 1) if edge is not None else None,
+                    "thesis":       (thesis or "")[:300],
+                    "expected":     expected or "",
+                    "resolved":     resolved,
+                    "outcome":      outcome,
+                    "resolved_at":  resolved_at.isoformat() if resolved_at else None,
+                    "lesson":       lesson or "",
+                    "reflection":   dict(refl) if refl else {},
+                    "outcome_reason": list(out_r) if out_r else [],
+                })
+            # Pattern memory
+            nb   = (result.get("market_narrative") or {}).get("notebook") or {}
+            bias_d = (nb.get("bias") or {}).get("direction") or "Neutral"
+            ph_d   = (nb.get("market_character") or {}).get("phase") or ""
+            cur_p  = _mb_pf(result.get("current_price")) or 0
+            cur_v  = _mb_pf(result.get("vwap_value"))    or 0
+            vws    = "above" if cur_p >= cur_v else "below"
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT
+                         COUNT(*) FILTER (WHERE outcome='SUCCESS') as wins,
+                         COUNT(*) FILTER (WHERE outcome IN ('FAILED','PARTIAL')) as losses,
+                         COUNT(*) as total
+                       FROM thesis_snapshots
+                       WHERE instrument=%s AND direction=%s AND phase=%s
+                         AND vwap_side=%s AND resolved=TRUE
+                         AND created_at > now() - interval '60 days'""",
+                    (inst, bias_d, ph_d, vws))
+                prow = cur.fetchone()
+            pattern = None
+            if prow and prow[2] and int(prow[2]) >= 3:
+                wins, losses, total = int(prow[0] or 0), int(prow[1] or 0), int(prow[2])
+                wr = int(round(wins / total * 100)) if total > 0 else 0
+                if wr >= 65:
+                    action = "Historically profitable pattern \u2014 look for entry on confirmation."
+                elif wr <= 33:
+                    action = "This pattern has struggled historically \u2014 require stronger confirmation."
+                else:
+                    action = "Mixed historical results \u2014 focus on cleaner setups within this pattern."
+                pattern = {"wins": wins, "losses": losses, "total": total,
+                           "win_rate": wr, "action": action,
+                           "description": ("Current setup resembles %d previous situation%s "
+                                           "(%s, %s, VWAP %s)."
+                                           % (total, "s" if total != 1 else "",
+                                              bias_d, ph_d or "\u2014", vws))}
+            return {"available": True, "snapshots": snaps, "pattern": pattern, "reason": None}
+        except Exception as exc:
+            return {"available": False, "snapshots": [], "pattern": None,
+                    "reason": "query error: %s" % exc}
+        finally:
+            try: conn.close()
+            except Exception: pass
+    res = _mb_cached(("thesis_trk", inst), 15.0, _produce)
+    return res if isinstance(res, dict) else {"available": False, "snapshots": [], "pattern": None}
+
+
 
 
 def _mb_event_throttled(instrument, event_type, fingerprint, state, ttl_secs=900):
@@ -32094,6 +32457,7 @@ def _build_status_payload(_tk):
         "main_brain_voice":          a.get("main_brain_voice"),
         "confidence_timeline":       a.get("confidence_timeline"),
         "market_narrative":          a.get("market_narrative"),
+        "thesis_tracker":            a.get("thesis_tracker"),
         "market_events_timeline":    a.get("market_events_timeline"),
         "session_day_type":          a.get("session_day_type"),
         "main_brain_learning_stats": a.get("main_brain_learning_stats"),
@@ -37675,6 +38039,52 @@ def dashboard():
   <ul id="mbe-list" class="mb-list"></ul>
 </div>
 
+<!-- ══ Thesis Tracker — analyst memory / outcome-based learning (DISPLAY-ONLY)
+     Saves a directional thesis snapshot every time the AI generates a bias.
+     25–75 min later resolves the outcome vs actual tape and writes a lesson.
+     Also surfaces a Pattern Memory: historical win/loss for the current fingerprint.
+     Never touches gate / scoring / sizing / broker. All strings via textContent. -->
+<div class="mod" id="mod-mb-thesis">
+  <div class="mod-h">🧠 Thesis Tracker <span style="font-size:10px;letter-spacing:1.5px;color:#6b7280;margin-left:auto">ANALYST MEMORY</span></div>
+
+  <!-- Pattern Memory -->
+  <div id="mbt-pattern" style="display:none;background:#0f1621;border:1px solid #1e2535;border-radius:8px;padding:10px;margin-bottom:10px">
+    <div style="font-size:10px;font-weight:700;letter-spacing:1.5px;color:#6b7280;margin-bottom:4px">PATTERN MEMORY</div>
+    <div id="mbt-pattern-desc" style="font-size:11px;color:#cdcde0;margin-bottom:6px">—</div>
+    <div style="display:flex;gap:14px;margin-bottom:6px">
+      <div><div style="font-size:10px;color:#22c55e;font-weight:700" id="mbt-wins">0</div><div style="font-size:9px;color:#6b7280">Winners</div></div>
+      <div><div style="font-size:10px;color:#ef4444;font-weight:700" id="mbt-losses">0</div><div style="font-size:9px;color:#6b7280">Losers</div></div>
+      <div><div style="font-size:10px;color:#e2e8f0;font-weight:700" id="mbt-wr">0%</div><div style="font-size:9px;color:#6b7280">Win rate</div></div>
+    </div>
+    <div id="mbt-pattern-action" style="font-size:11px;color:#f59e0b;font-style:italic">—</div>
+  </div>
+
+  <!-- Last Thesis Outcome -->
+  <div id="mbt-last" style="display:none;margin-bottom:10px">
+    <div class="mb-col-h" style="margin-bottom:4px">Previous Thesis</div>
+    <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:3px">
+      <span id="mbt-last-time" style="font-size:10px;color:#6b7280">—</span>
+      <span id="mbt-last-dir" style="font-size:13px;font-weight:700">—</span>
+      <span id="mbt-last-conf" style="font-size:11px;color:#9ca3af">—</span>
+      <span id="mbt-last-outcome" style="font-size:11px;font-weight:700;padding:1px 8px;border-radius:8px">—</span>
+    </div>
+    <div id="mbt-last-why" style="font-size:11px;color:#9ca3af;margin-bottom:4px">—</div>
+    <div id="mbt-last-lesson" style="font-size:11px;color:#cdcde0;background:#0f1621;border-left:3px solid #3b82f6;padding:6px 8px;border-radius:0 4px 4px 0;line-height:1.5">—</div>
+  </div>
+
+  <!-- AI Reflection -->
+  <div id="mbt-reflection" style="display:none;margin-bottom:10px">
+    <div class="mb-col-h" style="margin-bottom:4px">AI Reflection</div>
+    <div id="mbt-reflection-rows" style="font-size:11px;display:flex;flex-direction:column;gap:4px"></div>
+  </div>
+
+  <!-- Thesis History -->
+  <div class="mb-col-h" style="margin-bottom:4px">Thesis History</div>
+  <div id="mbt-history" style="display:flex;flex-direction:column;gap:4px"></div>
+
+  <div class="nf-fid">Thesis Tracker is display-only — it learns from what the analyst predicted and what actually happened. It never changes how trades are taken.</div>
+</div>
+
 <div class="mod" id="mod-mb-daytype">
   <div class="mod-h">🗓 Day Type <span id="mbd-conf" style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">—</span></div>
   <div id="mbd-type" class="mb-stat-v" style="font-size:18px;margin-bottom:6px">—</div>
@@ -40624,6 +41034,134 @@ function renderMBNarrative(d){
     noteEl.textContent=note?('Analyst Note: '+note):'\u2014';
   }
 }
+function renderThesisTracker(d){
+  const mod=document.getElementById('mod-mb-thesis'); if(!mod) return;
+  const tt=(d&&d.thesis_tracker)||null;
+  const snaps=(tt&&tt.snapshots)||[];
+  const pat=(tt&&tt.pattern)||null;
+
+  // ── Pattern Memory ─────────────────────────────────────────────────────────
+  const patEl=document.getElementById('mbt-pattern');
+  if(patEl){
+    if(pat&&pat.total>=3){
+      patEl.style.display='block';
+      const wc=pat.win_rate>=65?'#22c55e':pat.win_rate<=33?'#ef4444':'#f59e0b';
+      const descEl=document.getElementById('mbt-pattern-desc');
+      if(descEl) descEl.textContent=pat.description||'\u2014';
+      const wEl=document.getElementById('mbt-wins'); if(wEl) wEl.textContent=pat.wins;
+      const lEl=document.getElementById('mbt-losses'); if(lEl) lEl.textContent=pat.losses;
+      const wrEl=document.getElementById('mbt-wr'); if(wrEl){ wrEl.textContent=pat.win_rate+'%'; wrEl.style.color=wc; }
+      const actEl=document.getElementById('mbt-pattern-action');
+      if(actEl) actEl.textContent=pat.action||'\u2014';
+    } else { patEl.style.display='none'; }
+  }
+
+  // ── Last resolved thesis ───────────────────────────────────────────────────
+  const resolved=snaps.filter(function(s){ return s.resolved&&s.outcome&&s.outcome!=='N/A'; });
+  const lastEl=document.getElementById('mbt-last');
+  if(lastEl){
+    const last=resolved.length?resolved[0]:null;
+    if(last){
+      lastEl.style.display='block';
+      const dc=last.direction==='Bullish'?'#22c55e':last.direction==='Bearish'?'#ef4444':'#9ca3af';
+      const oc=last.outcome==='SUCCESS'?'#22c55e':last.outcome==='FAILED'?'#ef4444':'#f59e0b';
+      const tEl=document.getElementById('mbt-last-time');
+      if(tEl) tEl.textContent=last.created?_mbEvT(last.created):'';
+      const dEl=document.getElementById('mbt-last-dir');
+      if(dEl){ dEl.textContent=(last.direction||'\u2014')+(last.confidence?(' '+last.confidence+'%'):''); dEl.style.color=dc; }
+      const cfEl=document.getElementById('mbt-last-conf');
+      if(cfEl) cfEl.textContent=last.phase||'';
+      const outEl=document.getElementById('mbt-last-outcome');
+      if(outEl){
+        outEl.textContent=last.outcome||'\u2014';
+        outEl.style.background=last.outcome==='SUCCESS'?'#14532d':last.outcome==='FAILED'?'#7f1d1d':'#451a03';
+        outEl.style.color=oc;
+      }
+      const whyEl=document.getElementById('mbt-last-why');
+      if(whyEl){
+        const reasons=(last.outcome_reason||[]).slice(0,3).join('; ');
+        whyEl.textContent=reasons||'\u2014';
+      }
+      const lsnEl=document.getElementById('mbt-last-lesson');
+      if(lsnEl) lsnEl.textContent=last.lesson||'\u2014';
+
+      // ── AI Reflection ─────────────────────────────────────────────────────
+      const refl=document.getElementById('mbt-reflection');
+      const reflRows=document.getElementById('mbt-reflection-rows');
+      if(refl&&reflRows&&last.reflection&&Object.keys(last.reflection).length){
+        refl.style.display='block';
+        reflRows.innerHTML='';
+        const _qs=[
+          ['Was my market read correct?',    'market_read'],
+          ['Was my timing correct?',          'timing'],
+          ['Did I enter too early?',          'entry_too_early'],
+          ['Did I ignore conflicting signals?','ignored_signals'],
+          ['Which signal mattered most?',     'most_impactful'],
+          ['Which signal was noise?',         'noise'],
+        ];
+        _qs.forEach(function(q){
+          const row=document.createElement('div');
+          row.style.cssText='display:flex;gap:8px;align-items:baseline;border-bottom:1px solid #1e2535;padding:3px 0';
+          const ql=document.createElement('span');
+          ql.style.cssText='color:#6b7280;font-size:10px;min-width:200px;flex-shrink:0';
+          ql.textContent=q[0];
+          const av=document.createElement('span');
+          av.style.cssText='color:#cdcde0;font-size:11px';
+          av.textContent=last.reflection[q[1]]||'\u2014';
+          row.appendChild(ql); row.appendChild(av);
+          reflRows.appendChild(row);
+        });
+      } else if(refl){ refl.style.display='none'; }
+    } else {
+      lastEl.style.display='none';
+      const refl=document.getElementById('mbt-reflection');
+      if(refl) refl.style.display='none';
+    }
+  }
+
+  // ── Thesis History ────────────────────────────────────────────────────────
+  const histEl=document.getElementById('mbt-history');
+  if(histEl){
+    histEl.innerHTML='';
+    if(!snaps.length){
+      const p=document.createElement('div'); p.style.cssText='font-size:11px;color:#6b7280';
+      p.textContent='No thesis snapshots yet \u2014 tracking begins on the next directional read.';
+      histEl.appendChild(p);
+    } else {
+      snaps.slice(0,6).forEach(function(s){
+        const row=document.createElement('div');
+        row.style.cssText='display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #1e2535;flex-wrap:wrap';
+        const dc=s.direction==='Bullish'?'#22c55e':s.direction==='Bearish'?'#ef4444':'#9ca3af';
+        const tsp=document.createElement('span'); tsp.style.cssText='color:#6b7280;font-size:10px;min-width:42px';
+        tsp.textContent=s.created?_mbEvT(s.created):'';
+        const dsp=document.createElement('span'); dsp.style.cssText='font-weight:700;font-size:11px;color:'+dc;
+        dsp.textContent=(s.direction||'\u2014')+(s.confidence?(' '+s.confidence+'%'):'');
+        const psp=document.createElement('span'); psp.style.cssText='font-size:10px;color:#9ca3af';
+        psp.textContent=s.phase||'';
+        row.appendChild(tsp); row.appendChild(dsp); row.appendChild(psp);
+        if(s.resolved&&s.outcome){
+          const oc=s.outcome==='SUCCESS'?'#22c55e':s.outcome==='FAILED'?'#ef4444':'#f59e0b';
+          const osp=document.createElement('span');
+          osp.style.cssText='font-size:10px;font-weight:700;padding:1px 6px;border-radius:8px;margin-left:auto;color:'+oc+';background:'+(s.outcome==='SUCCESS'?'#14532d':s.outcome==='FAILED'?'#7f1d1d':'#451a03');
+          osp.textContent=s.outcome;
+          row.appendChild(osp);
+        } else {
+          const pnd=document.createElement('span');
+          pnd.style.cssText='font-size:10px;color:#6b7280;margin-left:auto';
+          pnd.textContent='\u23f3 Pending';
+          row.appendChild(pnd);
+        }
+        histEl.appendChild(row);
+        if(s.lesson&&s.resolved){
+          const lrow=document.createElement('div');
+          lrow.style.cssText='font-size:10px;color:#9aa3b2;padding:2px 0 4px 8px;border-bottom:1px solid #1e2535;line-height:1.4';
+          lrow.textContent=s.lesson;
+          histEl.appendChild(lrow);
+        }
+      });
+    }
+  }
+}
 function renderMBEvents(d){
   const mod=document.getElementById('mod-mb-events'); if(!mod) return;
   const e=(d&&d.market_events_timeline)||null;
@@ -41213,6 +41751,7 @@ function renderMainBrainCognitive(d){
   try{ renderMBConfidence(d); }catch(e){}
   try{ renderMBNarrative(d); }catch(e){}
   try{ renderMBEvents(d); }catch(e){}
+  try{ renderThesisTracker(d); }catch(e){}
   try{ renderMBDayType(d); }catch(e){}
   try{ renderMBLearning(d); }catch(e){}
   try{ renderDualSim(d); }catch(e){}
@@ -48618,6 +49157,7 @@ if __name__ == "__main__":
         _check_main_brain_events_db_ready()        # probe main_brain_events (no DDL; created via DB tool/publish diff)
         _check_confidence_snapshots_db_ready()     # probe confidence_snapshots (no DDL; created via DB tool/publish diff) — Main Brain confidence-over-time
         _check_market_events_db_ready()            # probe market_events (no DDL; created via DB tool/publish diff) — Main Brain narrative + events timeline
+        _check_thesis_tracker_db_ready()           # probe thesis_snapshots (no DDL; created via DB tool/publish diff) — Thesis Tracker analyst memory
         _check_prop_accounts_db_ready()            # probe prop_accounts (no DDL; created via DB tool/publish diff) — Prop Firm Protection
         _load_prop_accounts_from_db()              # warm the prop-account cache (display + guard reads); Protection stays OFF until toggled
         _check_trade_mgmt_db_ready()               # probe trade_management_metrics (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
