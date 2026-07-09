@@ -1153,7 +1153,7 @@ def _learning_score_gate_enabled():
     live scoring stays byte-identical until the operator arms it."""
     if _LEARNING_SCORE_GATE_OVERRIDE is not None:
         return bool(_LEARNING_SCORE_GATE_OVERRIDE)
-    return os.environ.get("LEARNING_SCORE_INFLUENCE", "").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get("LEARNING_SCORE_INFLUENCE", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def set_learning_score_gate(value):
@@ -35529,6 +35529,22 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
             mode = "paper"
     except Exception as _lre_exc:
         logger.debug("LearningRuleGate check failed (fail-open): %s", _lre_exc)
+    # Per-setup rule: if THIS specific strategy pattern has been flagged as repeatedly
+    # failing for this instrument, demote to ghost so evidence keeps accumulating but
+    # live orders pause until the pattern turns around. FAIL-OPEN.
+    try:
+        _lre_sk = ((a.get("learning_score_influence") or {}).get("meta") or {}).get("active_key") or \
+                  (a.get("strategy_engine") or {}).get("active_key")
+        if _lre_sk and execution_is_live(mode):
+            with LEARNING_ELIGIBILITY_LOCK:
+                _lre_dis_set = {s["setup_key"] for s in
+                                LEARNING_ELIGIBILITY.get(instrument, {}).get("disabled_setups", [])}
+            if _lre_sk in _lre_dis_set:
+                logger.warning("LearningRuleGate: %s setup '%s' repeatedly fails → demoting to ghost",
+                               instrument, _lre_sk)
+                mode = "paper"
+    except Exception as _lre_sk_exc:
+        logger.debug("LearningRuleGate setup check failed (fail-open): %s", _lre_sk_exc)
 
     try:
         zone = str(tp["entry_zone"])
@@ -37968,11 +37984,12 @@ def dashboard():
 <!-- Learning Rule Engine — REAL evidence-based ghost/live eligibility per instrument -->
 <div class="mod" id="mod-rule-engine">
   <div class="mod-h">⚡ Learning Rule Engine <span id="lre-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
-  <div style="font-size:11px;color:#9ca3af;margin-bottom:10px">Observes every closed trade. Automatically switches instruments between GHOST and LIVE based on real performance evidence.</div>
+  <div style="font-size:11px;color:#9ca3af;margin-bottom:10px">Observes every closed trade. Blocks proven-failing setup patterns. Nudges the Edge Score based on strategy track record (±15 pts max).</div>
   <div id="lre-instruments"></div>
+  <div id="lre-score-info" style="margin-top:8px"></div>
   <div class="le-sub" id="lre-today-sub" style="display:none;margin-top:12px">Today’s Trade Labels</div>
   <div id="lre-today"></div>
-  <div class="le-sub" id="lre-disabled-sub" style="display:none;margin-top:12px;color:#ef4444">Blocked Setups</div>
+  <div class="le-sub" id="lre-disabled-sub" style="display:none;margin-top:12px;color:#ef4444">Blocked Setup Patterns</div>
   <div id="lre-disabled"></div>
   <div class="le-fid" id="lre-fid"></div>
 </div>
@@ -41900,6 +41917,31 @@ function renderRuleEngine(d){
     });
     h+='</div>';
     ic.innerHTML=h;
+  }
+  // Score influence indicator
+  var si=document.getElementById('lre-score-info');
+  if(si){
+    var lsi=(d&&d.learning_score_influence)||null;
+    if(lsi&&lsi.armed){
+      var dk=lsi.direction_key||(d&&d.direction)||null;
+      var sm=(lsi.meta)||{};
+      var sdelta=lsi.score_delta!=null?lsi.score_delta:(sm.delta!=null?sm.delta:null);
+      var sw=sm.weight!=null?sm.weight:null;
+      var skey=sm.active_key||sm.strategy_key||null;
+      var sn=sm.sample||0;
+      var dc2=sdelta!=null?(sdelta>0?'#22c55e':sdelta<0?'#ef4444':'#6b7280'):'#6b7280';
+      var dtxt=sdelta!=null?(sdelta>=0?'+':'')+sdelta+' pts':'—';
+      si.innerHTML='<div style="display:flex;gap:12px;align-items:center;padding:6px 10px;background:var(--card-bg,#0f172a);border:1px solid var(--border);border-radius:6px;font-size:11px">'
+        +'<span style="color:#9ca3af">Score Nudge</span>'
+        +'<span style="color:'+dc2+';font-weight:700">'+dtxt+'</span>'
+        +(skey?'<span style="color:#9ca3af">'+aiEsc(skey)+(sn?'&nbsp;(n='+sn+')':'')+'</span>':'')
+        +(sw!=null?'<span style="color:#6b7280">wt '+sw.toFixed(2)+'</span>':'')
+        +'</div>';
+    } else if(lsi&&lsi.enabled){
+      si.innerHTML='<div style="font-size:10px;color:#6b7280;padding:4px 0">Score nudge armed — no qualifying strategy weight yet (need '+((d&&d.learning_engine&&d.learning_engine.min_sample)||20)+' trades per strategy)</div>';
+    } else {
+      si.innerHTML='';
+    }
   }
   var ts=document.getElementById('lre-today-sub'),tc=document.getElementById('lre-today');
   if(re.today_labels&&Object.keys(re.today_labels).length>0){

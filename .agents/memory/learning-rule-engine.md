@@ -40,3 +40,17 @@ description: Per-instrument ghost/live eligibility gate in execute_trade_gateway
 
 Panel `mod-rule-engine` (always visible, not mb-hidden). `renderRuleEngine(d)` reads `d.learning_rule_engine`
 from `/status`. `_learning_rule_engine_view()` reads LEARNING_ELIGIBILITY cache.
+
+## Update: Per-Setup Gate + Score Influence Default ON
+
+### Per-setup disabled gate (G1)
+After the instrument-level LRE check in `execute_trade_gateway`, a second fail-open block reads
+`strategy_key` from `a.get("learning_score_influence",{}).get("meta",{}).get("active_key")` or
+`a.get("strategy_engine",{}).get("active_key")`, then checks it against `disabled_setups` cached
+in `LEARNING_ELIGIBILITY[instrument]`. Match → demote to `mode="paper"` (ghost). Not a hard 409
+— trade still fires so evidence accumulates.
+
+### Learning score influence default ON (G2)
+`_learning_score_gate_enabled()` now defaults to ON. To disable: `LEARNING_SCORE_INFLUENCE=0`.
+Safe with 0 trades: weight=1.0 → delta=0 → score unchanged → goldens byte-identical.
+The ±15 nudge system was already fully built (Task #18) — it just wasn't armed.
