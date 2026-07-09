@@ -174,6 +174,16 @@ export const BOT1_ROUTES = [
   // dashboard-auth OPEN_PATHS). GET = cached research view; POST = trigger recompute.
   // Walled off from the live money path — new strategies never auto-trade live.
   "/scalp-research",
+  // AutoSearch — Karpathy-style hypothesis training loop (owner-only;
+  // RESEARCH/DISPLAY-ONLY; NOT in dashboard-auth OPEN_PATHS). Generate hypotheses
+  // from trade history, score historically, ghost-validate forward, manually promote
+  // validated insights to the Main Brain. Never trades or modifies the gate.
+  "/autosearch",
+  "/autosearch/generate",
+  "/autosearch/rescore",
+  "/autosearch/add",
+  "/autosearch/promote/:hyp_key",
+  "/autosearch/reject/:hyp_key",
   // BOT TRAINING MODE proof metrics (owner-only; DISPLAY/READ-ONLY; NOT in
   // dashboard-auth OPEN_PATHS). Never sends or mutates — staged-controller state +
   // paper-graded performance of recorded suggestions.

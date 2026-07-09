@@ -21268,6 +21268,15 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
     except Exception as exc:
         logger.warning("strategy-trade persist error: %s", exc)
 
+    # ── AutoSearch ghost validation observer — non-blocking, FAIL-OPEN ──
+    # Records the closed trade against any 'ghost_validating' hypotheses that match.
+    # Pure INSERT/SELECT, no gate/money-path effect. Defined later in the AutoSearch
+    # section; forward reference is safe because this path is never reached at import.
+    try:
+        _as_observe_close(mt, "strategy_trades")
+    except Exception as exc:
+        logger.warning("autosearch ghost observe error: %s", exc)
+
     # ── SWING (flag-on) multi-day persistence: mark the thesis row closed so a
     # stopped/TP'd SWING trade is NOT resurrected as OPEN on the next boot (the
     # rehydrate query selects WHERE closed = FALSE). Gated on is_swing (set only on
@@ -28113,6 +28122,724 @@ SCALP_SIM_WATCH_LOCK      = threading.Lock()   # single-flight: one watcher cycl
 SCALP_SIM_WATCH_INTERVAL  = max(10, int(os.environ.get("SCALP_SIM_WATCH_INTERVAL", 15)))
 SCALP_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("SCALP_SIM_COOLDOWN_SECS", 300)))
 SCALP_SIM_MAX_HOLD_HOURS  = max(1, int(os.environ.get("SCALP_SIM_MAX_HOLD_HOURS", 8)))
+
+# ════════════════════════════════════════════════════════════════════════════
+# AUTOSEARCH — KARPATHY-STYLE HYPOTHESIS TRAINING LOOP (RESEARCH / DISPLAY-ONLY)
+# ────────────────────────────────────────────────────────────────────────────
+# Iterative hypothesis generation, historical scoring, ghost forward-validation,
+# and MANUAL-ONLY promotion to the Main Brain. FULLY walled off from money path:
+#
+#   • Never gates / sizes / dedupes / executes orders
+#   • Reads strategy_trades / micro_scalp_ghost_trades (never writes them)
+#   • INSERT/SELECT only on its own 3 tables (created out-of-band via DB tool)
+#   • Ghost observer is a non-blocking side-call from _close_managed_trade
+#   • AUTOSEARCH_ENABLED default 0 → flag-OFF == byte-identical to today
+#     (ghost observer self-guards with `if not AUTOSEARCH_DB_READY: return`)
+#   • Promotion is MANUAL-ONLY: owner POST /autosearch/promote/<key>
+#
+# Pipeline: Hypothesis → Historical Score → Ghost Validation (≥20 samples)
+#           → Validated badge → Manual approval → Main Brain annotation
+#
+# Auto-generation enumerates instrument × direction × session × regime × grade ×
+# trading_mode combos from strategy_trades with ≥15 samples. Manual hypotheses
+# added via dashboard form. Both sources flow through the same scoring + ghost
+# pipeline before surfacing as promotion candidates.
+# ════════════════════════════════════════════════════════════════════════════
+AUTOSEARCH_ENABLED     = os.environ.get("AUTOSEARCH_ENABLED", "0").strip().lower() \
+    in ("1", "true", "yes", "on")
+AUTOSEARCH_DB_READY    = False
+AUTOSEARCH_CACHE       = None
+AUTOSEARCH_CACHE_LOCK  = threading.Lock()
+AUTOSEARCH_RECALC_LOCK = threading.Lock()
+
+_AS_MIN_HIST_SAMPLES     = 15
+_AS_EDGE_LIFT_THRESHOLD  = 0.04
+_AS_EXP_LIFT_THRESHOLD   = 0.05
+_AS_GHOST_MIN_SAMPLES    = 20
+_AS_GHOST_WIN_RATE_FLOOR = 0.45
+_AS_GHOST_EXP_FLOOR      = 0.0
+
+
+def _check_autosearch_db_ready():
+    """Probe all 3 AutoSearch tables (no DDL). FAIL-OPEN."""
+    global AUTOSEARCH_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM autosearch_hypotheses LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM autosearch_historical_scores LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM autosearch_ghost_samples LIMIT 1")
+            cur.fetchone()
+        AUTOSEARCH_DB_READY = True
+        logger.info("autosearch tables ready")
+    except Exception as exc:
+        logger.warning("autosearch tables unavailable (autosearch disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _as_generate_hypotheses():
+    """Auto-generate dimension-combo hypotheses from historical trade data.
+    INSERT ON CONFLICT DO NOTHING (idempotent). FAIL-OPEN."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return {"ok": False, "error": "AutoSearch DB unavailable"}
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "error": "DB connection failed"}
+    generated = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT symbol, direction, session, market_regime, grade,
+                       mode AS trading_mode, count(*) AS n
+                FROM strategy_trades
+                WHERE symbol IS NOT NULL AND direction IS NOT NULL
+                  AND result IN ('Win','Loss','BE','Break Even')
+                GROUP BY symbol, direction, session, market_regime, grade, mode
+                HAVING count(*) >= %s
+                ORDER BY n DESC
+            """, (_AS_MIN_HIST_SAMPLES,))
+            rows = cur.fetchall()
+        for row in rows:
+            inst, direc, sess, regime, grade, tmode, n = row
+            parts = [p for p in [inst, direc, sess, regime, grade, tmode] if p]
+            hyp_key = ("auto-" + "-".join(parts).replace(" ", "_").replace("/", "_"))[:72]
+            title_parts = [p for p in [
+                inst, direc,
+                f"session={sess}"  if sess   else None,
+                f"regime={regime}" if regime else None,
+                f"grade={grade}"   if grade  else None,
+                tmode,
+            ] if p]
+            title = " | ".join(title_parts) + f"  ({n} trades)"
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO autosearch_hypotheses
+                        (hyp_key, title, source, instrument, direction,
+                         session, market_regime, grade_band, trading_mode,
+                         data_source)
+                    VALUES (%s,%s,'auto',%s,%s,%s,%s,%s,%s,'strategy_trades')
+                    ON CONFLICT (hyp_key) DO NOTHING
+                """, (hyp_key, title, inst, direc, sess, regime, grade, tmode))
+            generated += 1
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT instrument, direction, count(*) AS n
+                FROM micro_scalp_ghost_trades
+                WHERE instrument IS NOT NULL AND direction IS NOT NULL
+                GROUP BY instrument, direction
+                HAVING count(*) >= %s
+            """, (_AS_MIN_HIST_SAMPLES,))
+            micro_rows = cur.fetchall()
+        for row in micro_rows:
+            inst, direc, n = row
+            hyp_key = f"auto-micro-{inst}-{direc}-ghost"
+            title   = f"{inst} {direc} Micro Scalp Ghost  ({n} samples)"
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO autosearch_hypotheses
+                        (hyp_key, title, source, instrument, direction,
+                         trading_mode, data_source)
+                    VALUES (%s,%s,'auto',%s,%s,'SCALP','micro_scalp_ghost')
+                    ON CONFLICT (hyp_key) DO NOTHING
+                """, (hyp_key, title, inst, direc))
+            generated += 1
+        conn.commit()
+        logger.info("autosearch: generated/checked %d hypothesis combos", generated)
+        return {"ok": True, "generated": generated}
+    except Exception as exc:
+        logger.warning("autosearch generate failed: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _as_score_one(hyp_key, conn):
+    """Score one hypothesis historically. Returns score dict or None.
+    Does NOT close the connection."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT hyp_key, instrument, direction, session, market_regime,
+                       grade_band, trading_mode, data_source, status
+                FROM autosearch_hypotheses WHERE hyp_key = %s
+            """, (hyp_key,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        _, inst, direc, sess, regime, grade, tmode, data_src, status = row
+
+        if data_src == "micro_scalp_ghost":
+            conds  = ["1=1"]
+            params = []
+            if inst:  conds.append("instrument=%s"); params.append(inst)
+            if direc: conds.append("direction=%s");  params.append(direc)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT result_r FROM micro_scalp_ghost_trades "
+                    "WHERE " + " AND ".join(conds) + " AND result_r IS NOT NULL",
+                    params)
+                rr_list = [float(r[0]) for r in cur.fetchall()]
+            if len(rr_list) < _AS_MIN_HIST_SAMPLES:
+                return None
+            n     = len(rr_list)
+            wins  = [r for r in rr_list if r >= 1.0]
+            wr    = round(len(wins) / n, 3)
+            avgr  = round(sum(rr_list) / n, 3)
+            exp   = round(wr * avgr - (1 - wr) * 1.0, 3)
+            tp1   = round(len([r for r in rr_list if r >= 1.0]) / n, 3)
+            tp2   = round(len([r for r in rr_list if r >= 2.0]) / n, 3)
+            bef   = round(len([r for r in rr_list if -0.2 <= r <= 0.3]) / n, 3)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT result_r FROM micro_scalp_ghost_trades "
+                    "WHERE result_r IS NOT NULL AND instrument=%s", (inst,))
+                bl = [float(r[0]) for r in cur.fetchall()]
+            bl_n  = len(bl)
+            bl_wr = round(len([r for r in bl if r >= 1.0]) / bl_n, 3) if bl_n else 0.0
+            bl_ar = round(sum(bl) / bl_n, 3) if bl_n else 0.0
+            bl_ex = round(bl_wr * bl_ar - (1 - bl_wr) * 1.0, 3) if bl_n else 0.0
+            avg_mfe = avg_mae = None
+        else:
+            conds  = ["result IN ('Win','Loss','BE','Break Even')"]
+            params = []
+            if inst:   conds.append("symbol=%s");        params.append(inst)
+            if direc:  conds.append("direction=%s");     params.append(direc)
+            if sess:   conds.append("session=%s");       params.append(sess)
+            if regime: conds.append("market_regime=%s"); params.append(regime)
+            if grade:  conds.append("grade=%s");         params.append(grade)
+            if tmode:  conds.append("mode=%s");          params.append(tmode)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT r_multiple, mfe_r, mae_r FROM strategy_trades "
+                    "WHERE " + " AND ".join(conds) + " AND r_multiple IS NOT NULL "
+                    "ORDER BY closed_at DESC LIMIT 500", params)
+                rows = cur.fetchall()
+            if len(rows) < _AS_MIN_HIST_SAMPLES:
+                return None
+            n     = len(rows)
+            rr_list = [float(r[0]) for r in rows]
+            mfe_v   = [float(r[1]) for r in rows if r[1] is not None]
+            mae_v   = [float(r[2]) for r in rows if r[2] is not None]
+            wins    = [r for r in rr_list if r >= 0.8]
+            wr      = round(len(wins) / n, 3)
+            avgr    = round(sum(rr_list) / n, 3)
+            exp     = round(wr * avgr - (1 - wr) * 1.0, 3)
+            avg_mfe = round(sum(mfe_v) / len(mfe_v), 3) if mfe_v else None
+            avg_mae = round(sum(mae_v) / len(mae_v), 3) if mae_v else None
+            tp1     = round(len([r for r in rr_list if r >= 1.0]) / n, 3)
+            tp2     = round(len([r for r in rr_list if r >= 2.0]) / n, 3)
+            bef     = round(len([r for r in rr_list if -0.2 <= r <= 0.3]) / n, 3)
+            bl_conds  = ["result IN ('Win','Loss','BE','Break Even')"]
+            bl_params = []
+            if inst:  bl_conds.append("symbol=%s");    bl_params.append(inst)
+            if direc: bl_conds.append("direction=%s"); bl_params.append(direc)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT r_multiple FROM strategy_trades "
+                    "WHERE " + " AND ".join(bl_conds) + " AND r_multiple IS NOT NULL",
+                    bl_params)
+                bl = [float(r[0]) for r in cur.fetchall()]
+            bl_n  = len(bl)
+            bl_wr = round(len([r for r in bl if r >= 0.8]) / bl_n, 3) if bl_n else 0.0
+            bl_ar = round(sum(bl) / bl_n, 3) if bl_n else 0.0
+            bl_ex = round(bl_wr * bl_ar - (1 - bl_wr) * 1.0, 3) if bl_n else 0.0
+
+        edge_lift = round(wr - bl_wr, 3)
+        exp_lift  = round(exp - bl_ex, 3)
+        passes    = (n >= _AS_MIN_HIST_SAMPLES
+                     and edge_lift >= _AS_EDGE_LIFT_THRESHOLD
+                     and exp_lift  >= _AS_EXP_LIFT_THRESHOLD)
+        reason    = ("Passes threshold" if passes else
+                     f"n={n} edge_lift={edge_lift:+.3f} exp_lift={exp_lift:+.3f}")
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO autosearch_historical_scores
+                    (hyp_key, sample_count, win_rate, avg_r, expectancy,
+                     avg_mfe_r, avg_mae_r, tp1_rate, tp2_rate, be_fail_rate,
+                     baseline_win_rate, baseline_expectancy, baseline_sample_count,
+                     edge_lift, expectancy_lift, passes_threshold, threshold_reason)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (hyp_key, n, wr, avgr, exp, avg_mfe, avg_mae,
+                  tp1, tp2, bef, bl_wr, bl_ex, bl_n,
+                  edge_lift, exp_lift, passes, reason))
+        if passes and status == "testing":
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE autosearch_hypotheses
+                    SET status='ghost_validating', updated_at=now()
+                    WHERE hyp_key=%s AND status='testing'
+                """, (hyp_key,))
+        return {"hyp_key": hyp_key, "n": n, "win_rate": wr, "avg_r": avgr,
+                "expectancy": exp, "tp1_rate": tp1, "tp2_rate": tp2,
+                "be_fail_rate": bef, "edge_lift": edge_lift,
+                "exp_lift": exp_lift, "passes": passes, "reason": reason}
+    except Exception as exc:
+        logger.warning("autosearch score_one %s: %s", hyp_key, exc)
+        return None
+
+
+def _as_run_scoring_pass():
+    """Score all 'testing' hypotheses. Single-flight. FAIL-OPEN."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return {"ok": False, "error": "DB unavailable"}
+    if not AUTOSEARCH_RECALC_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "Recompute already running"}
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return {"ok": False, "error": "DB connection failed"}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT hyp_key FROM autosearch_hypotheses
+                    WHERE status='testing' ORDER BY created_at ASC LIMIT 100
+                """)
+                keys = [r[0] for r in cur.fetchall()]
+            scored = 0
+            for hk in keys:
+                if _as_score_one(hk, conn):
+                    scored += 1
+            conn.commit()
+            _as_rebuild_cache()
+            logger.info("autosearch scoring pass: %d scored", scored)
+            return {"ok": True, "scored": scored}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    finally:
+        AUTOSEARCH_RECALC_LOCK.release()
+
+
+def _as_observe_close(mt, trade_source="strategy_trades"):
+    """Ghost validation observer. Called from _close_managed_trade (non-blocking).
+    Matches the closed trade against ghost_validating hypotheses and records
+    outcomes. FAIL-OPEN — never touches the gate or money path."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        r_mult = mt.get("r_multiple")
+        if r_mult is None:
+            return
+        r_mult  = float(r_mult)
+        ctx     = mt.get("learning_ctx") or {}
+        inst    = mt.get("symbol") or mt.get("instrument")
+        direc   = mt.get("direction")
+        sess    = ctx.get("session")
+        regime  = ctx.get("regime")
+        grade   = ctx.get("grade")
+        tmode   = mt.get("trading_mode") or TRADING_MODE
+        mfe_r   = float(mt.get("mfe_r") or 0)
+        mae_r   = float(mt.get("mae_r") or 0)
+        tp1_hit = r_mult >= 1.0
+        tp2_hit = r_mult >= 2.0
+        be_fail = -0.2 <= r_mult <= 0.3
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT hyp_key, instrument, direction, session, market_regime,
+                       grade_band, trading_mode, data_source
+                FROM autosearch_hypotheses WHERE status='ghost_validating'
+            """)
+            hyps = cur.fetchall()
+
+        matched = []
+        for row in hyps:
+            hk, h_inst, h_dir, h_ses, h_reg, h_grd, h_tm, h_src = row
+            if h_src != trade_source:
+                continue
+            if h_inst and h_inst != inst:   continue
+            if h_dir  and h_dir  != direc:  continue
+            if h_ses  and h_ses  != sess:   continue
+            if h_reg  and h_reg  != regime: continue
+            if h_grd  and h_grd  != grade:  continue
+            if h_tm   and h_tm   != tmode:  continue
+            matched.append(hk)
+
+        if not matched:
+            return
+
+        mkey = None
+        try:
+            mkey = "|".join(str(x) for x in (mt.get("key") or ()))
+        except Exception:
+            pass
+
+        for hk in matched:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO autosearch_ghost_samples
+                        (hyp_key, trade_source, trade_ref, instrument, direction,
+                         session, market_regime, result_r, mfe_r, mae_r,
+                         tp1_hit, tp2_hit, be_fail)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (hk, trade_source, mkey, inst, direc,
+                      sess, regime, r_mult, mfe_r, mae_r,
+                      tp1_hit, tp2_hit, be_fail))
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+        for hk in matched:
+            try:
+                _as_evaluate_ghost(hk, conn)
+            except Exception as exc:
+                logger.warning("autosearch ghost eval %s: %s", hk, exc)
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+        _as_rebuild_cache()
+    except Exception as exc:
+        logger.warning("autosearch observe_close: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _as_evaluate_ghost(hyp_key, conn):
+    """Evaluate accumulated ghost samples. Moves hypothesis to validated/rejected
+    once >= _AS_GHOST_MIN_SAMPLES accumulated. Does NOT close the connection."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT result_r FROM autosearch_ghost_samples
+            WHERE hyp_key=%s AND result_r IS NOT NULL
+        """, (hyp_key,))
+        samples = [float(r[0]) for r in cur.fetchall()]
+    n     = len(samples)
+    wins  = [r for r in samples if r >= 0.8]
+    wr    = round(len(wins) / n, 3) if n else None
+    avgr  = round(sum(samples) / n, 3) if n else None
+    exp   = (round(wr * avgr - (1 - wr) * 1.0, 3)
+             if (wr is not None and avgr is not None) else None)
+    if n < _AS_GHOST_MIN_SAMPLES:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE autosearch_hypotheses
+                SET ghost_sample_count=%s, ghost_win_rate=%s,
+                    ghost_expectancy=%s, updated_at=now()
+                WHERE hyp_key=%s
+            """, (n, wr, exp, hyp_key))
+        return
+    validated  = (wr is not None and exp is not None
+                  and wr  >= _AS_GHOST_WIN_RATE_FLOOR
+                  and exp >= _AS_GHOST_EXP_FLOOR)
+    new_status = "validated" if validated else "rejected"
+    rej_reason = (None if validated else
+                  f"ghost n={n} wr={wr:.1%} exp={exp:+.2f}R — below threshold")
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE autosearch_hypotheses
+            SET status=%s, ghost_sample_count=%s, ghost_win_rate=%s,
+                ghost_expectancy=%s, updated_at=now(),
+                rejected_reason=CASE WHEN %s='rejected' THEN %s
+                                     ELSE rejected_reason END
+            WHERE hyp_key=%s
+        """, (new_status, n, wr, exp, new_status, rej_reason, hyp_key))
+    logger.info("autosearch ghost eval %s -> %s (n=%d)", hyp_key, new_status, n)
+
+
+def _as_rebuild_cache():
+    """Rebuild the AutoSearch display cache from DB. FAIL-OPEN."""
+    global AUTOSEARCH_CACHE
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT h.hyp_key, h.title, h.source, h.instrument, h.direction,
+                       h.session, h.market_regime, h.grade_band, h.trading_mode,
+                       h.data_source, h.status, h.created_at, h.updated_at,
+                       h.custom_note, h.ghost_sample_count, h.ghost_win_rate,
+                       h.ghost_expectancy, h.promoted_at, h.rejected_reason,
+                       s.sample_count, s.win_rate, s.avg_r, s.expectancy,
+                       s.avg_mfe_r, s.avg_mae_r, s.tp1_rate, s.tp2_rate,
+                       s.be_fail_rate, s.baseline_win_rate, s.baseline_expectancy,
+                       s.baseline_sample_count, s.edge_lift, s.expectancy_lift,
+                       s.passes_threshold, s.threshold_reason, s.scored_at
+                FROM autosearch_hypotheses h
+                LEFT JOIN LATERAL (
+                    SELECT * FROM autosearch_historical_scores
+                    WHERE hyp_key = h.hyp_key
+                    ORDER BY scored_at DESC LIMIT 1
+                ) s ON TRUE
+                ORDER BY h.updated_at DESC LIMIT 300
+            """)
+            rows = cur.fetchall()
+        cols = ("hyp_key","title","source","instrument","direction","session",
+                "market_regime","grade_band","trading_mode","data_source","status",
+                "created_at","updated_at","custom_note","ghost_sample_count",
+                "ghost_win_rate","ghost_expectancy","promoted_at","rejected_reason",
+                "n","win_rate","avg_r","expectancy","avg_mfe_r","avg_mae_r",
+                "tp1_rate","tp2_rate","be_fail_rate","baseline_win_rate",
+                "baseline_expectancy","baseline_n","edge_lift","expectancy_lift",
+                "passes_threshold","threshold_reason","scored_at")
+        hyps = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            for k in ("created_at","updated_at","promoted_at","scored_at"):
+                if d.get(k) and hasattr(d[k], "isoformat"):
+                    d[k] = d[k].isoformat()
+            for k in ("win_rate","avg_r","expectancy","avg_mfe_r","avg_mae_r",
+                      "tp1_rate","tp2_rate","be_fail_rate","baseline_win_rate",
+                      "baseline_expectancy","edge_lift","expectancy_lift",
+                      "ghost_win_rate","ghost_expectancy"):
+                if d.get(k) is not None:
+                    d[k] = float(d[k])
+            hyps.append(d)
+        by_status = {}
+        for h in hyps:
+            by_status.setdefault(h["status"], []).append(h)
+        cache = {
+            "ok": True, "available": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "total": len(hyps),
+            "by_status": {
+                "testing":          len(by_status.get("testing", [])),
+                "ghost_validating": len(by_status.get("ghost_validating", [])),
+                "validated":        len(by_status.get("validated", [])),
+                "promoted":         len(by_status.get("promoted", [])),
+                "rejected":         len(by_status.get("rejected", [])),
+            },
+            "hypotheses": hyps,
+        }
+        with AUTOSEARCH_CACHE_LOCK:
+            AUTOSEARCH_CACHE = cache
+    except Exception as exc:
+        logger.warning("autosearch rebuild_cache: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _as_get_cache():
+    """Return the cached AutoSearch view, or a stub."""
+    with AUTOSEARCH_CACHE_LOCK:
+        c = AUTOSEARCH_CACHE
+    if c:
+        return c
+    return {"ok": True, "available": AUTOSEARCH_DB_READY,
+            "total": 0, "by_status": {}, "hypotheses": [],
+            "generated_at": None}
+
+
+def _score_manual_hyp_bg(hyp_key):
+    """Score a freshly-added manual hypothesis in the background. FAIL-OPEN."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        _as_score_one(hyp_key, conn)
+        conn.commit()
+        _as_rebuild_cache()
+    except Exception as exc:
+        logger.warning("autosearch manual score %s: %s", hyp_key, exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/autosearch", methods=["GET"])
+def autosearch_get():
+    """Return cached AutoSearch hypothesis list. Owner-only (dashboard auth)."""
+    return jsonify(_as_get_cache())
+
+
+@app.route("/autosearch/generate", methods=["POST"])
+def autosearch_generate():
+    """Auto-generate hypotheses from trade history then kick off scoring."""
+    result = _as_generate_hypotheses()
+    if result.get("ok"):
+        threading.Thread(target=_as_run_scoring_pass, daemon=True,
+                         name="autosearch-score").start()
+    return jsonify(result)
+
+
+@app.route("/autosearch/rescore", methods=["POST"])
+def autosearch_rescore():
+    """Rescore all testing hypotheses in the background."""
+    threading.Thread(target=_as_run_scoring_pass, daemon=True,
+                     name="autosearch-rescore").start()
+    return jsonify({"ok": True, "message": "Rescore started in background"})
+
+
+@app.route("/autosearch/add", methods=["POST"])
+def autosearch_add():
+    """Add a manual hypothesis. Owner-only."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "AutoSearch DB unavailable"}), 503
+    body = {}
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        pass
+    title = (body.get("title") or "").strip()
+    if not title:
+        return jsonify({"ok": False, "error": "title required"}), 400
+    inst     = (body.get("instrument") or "").strip() or None
+    direc    = (body.get("direction") or "").strip() or None
+    sess     = (body.get("session") or "").strip() or None
+    regime   = (body.get("market_regime") or "").strip() or None
+    grade    = (body.get("grade_band") or "").strip() or None
+    tmode    = (body.get("trading_mode") or "").strip() or None
+    note     = (body.get("note") or "").strip() or None
+    data_src = (body.get("data_source") or "strategy_trades").strip()
+    import hashlib as _hl
+    slug    = _hl.sha256(
+        (title + (inst or "") + (direc or "")).encode()).hexdigest()[:12]
+    hyp_key = f"manual-{slug}"
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "DB connection failed"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO autosearch_hypotheses
+                    (hyp_key, title, source, instrument, direction, session,
+                     market_regime, grade_band, trading_mode, data_source,
+                     custom_note)
+                VALUES (%s,%s,'manual',%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (hyp_key) DO UPDATE SET
+                    title=EXCLUDED.title, updated_at=now()
+            """, (hyp_key, title, inst, direc, sess, regime, grade,
+                  tmode, data_src, note))
+        conn.commit()
+        threading.Thread(target=_score_manual_hyp_bg, args=(hyp_key,),
+                         daemon=True, name="autosearch-manual-score").start()
+        return jsonify({"ok": True, "hyp_key": hyp_key})
+    except Exception as exc:
+        logger.warning("autosearch add: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/autosearch/promote/<hyp_key>", methods=["POST"])
+def autosearch_promote(hyp_key):
+    """Manually promote a validated hypothesis. Owner-only."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "AutoSearch DB unavailable"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "DB connection failed"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE autosearch_hypotheses
+                SET status='promoted', promoted_at=now(), updated_at=now()
+                WHERE hyp_key=%s AND status='validated'
+                RETURNING hyp_key, title
+            """, (hyp_key,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False,
+                            "error": "Not found or not in validated state"}), 400
+        conn.commit()
+        _as_rebuild_cache()
+        logger.info("autosearch: promoted %s (%s)", row[0], row[1])
+        return jsonify({"ok": True, "hyp_key": row[0], "title": row[1]})
+    except Exception as exc:
+        logger.warning("autosearch promote: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/autosearch/reject/<hyp_key>", methods=["POST"])
+def autosearch_reject(hyp_key):
+    """Manually reject a hypothesis. Owner-only."""
+    if not AUTOSEARCH_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "AutoSearch DB unavailable"}), 503
+    body = {}
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        pass
+    reason = (body.get("reason") or "manually rejected").strip()
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "DB connection failed"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE autosearch_hypotheses
+                SET status='rejected', rejected_reason=%s, updated_at=now()
+                WHERE hyp_key=%s RETURNING hyp_key
+            """, (reason, hyp_key))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "Hypothesis not found"}), 404
+        conn.commit()
+        _as_rebuild_cache()
+        return jsonify({"ok": True, "hyp_key": row[0]})
+    except Exception as exc:
+        logger.warning("autosearch reject: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # SCALP-STRATEGY ADVISORY (Main Brain "potential trades") — DISPLAY/ADVISORY ONLY
@@ -38627,6 +39354,47 @@ def dashboard():
 .ul-tab-active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:700}
 </style>
 
+<div class="mod" id="mod-autosearch">
+  <div class="mod-h">&#128300; AutoSearch <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">HYPOTHESIS TRAINING LOOP</span></div>
+  <div id="as-summary" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
+  <div id="as-tabs" style="display:flex;gap:6px;margin-bottom:10px">
+    <button id="as-tab-active" class="as-tab as-tab-active" onclick="asSetTab('active')">Active</button>
+    <button id="as-tab-validated" class="as-tab" onclick="asSetTab('validated')">Validated</button>
+    <button id="as-tab-promoted" class="as-tab" onclick="asSetTab('promoted')">Promoted</button>
+    <button id="as-tab-rejected" class="as-tab" onclick="asSetTab('rejected')">Rejected</button>
+  </div>
+  <div id="as-list"></div>
+  <div id="as-add-form" style="margin-top:12px;padding:10px;background:#0d1117;border-radius:8px;border:1px solid #1f2937">
+    <div style="font-size:11px;color:#6b7280;margin-bottom:8px;font-weight:600;letter-spacing:1px">ADD MANUAL HYPOTHESIS</div>
+    <input id="as-title" placeholder="Hypothesis title (e.g. MNQ SHORT after sweep + VWAP rejection)…" style="width:100%;box-sizing:border-box;background:#111827;border:1px solid #374151;border-radius:6px;padding:6px 10px;color:#e5e7eb;font-size:12px;margin-bottom:6px">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:6px">
+      <select id="as-inst" style="background:#111827;border:1px solid #374151;border-radius:6px;padding:5px 8px;color:#e5e7eb;font-size:11px">
+        <option value="">Any instrument</option>
+        <option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option>
+      </select>
+      <select id="as-dir" style="background:#111827;border:1px solid #374151;border-radius:6px;padding:5px 8px;color:#e5e7eb;font-size:11px">
+        <option value="">Any direction</option>
+        <option>Long</option><option>Short</option>
+      </select>
+      <select id="as-tmode" style="background:#111827;border:1px solid #374151;border-radius:6px;padding:5px 8px;color:#e5e7eb;font-size:11px">
+        <option value="">Any mode</option>
+        <option value="SCALP">SCALP</option><option value="SWING">SWING</option>
+      </select>
+    </div>
+    <textarea id="as-note" placeholder="Extra conditions / notes (optional)…" rows="2" style="width:100%;box-sizing:border-box;background:#111827;border:1px solid #374151;border-radius:6px;padding:6px 10px;color:#e5e7eb;font-size:12px;margin-bottom:6px;resize:vertical"></textarea>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button onclick="asAddHyp()" style="background:#1e3a5f;border:1px solid #3b82f6;color:#93c5fd;border-radius:6px;padding:5px 14px;font-size:12px;cursor:pointer">Add Hypothesis</button>
+      <button onclick="asGenerate()" style="background:#14532d;border:1px solid #22c55e;color:#86efac;border-radius:6px;padding:5px 14px;font-size:12px;cursor:pointer">Generate from History</button>
+      <button onclick="asRescore()" style="background:#1f2937;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:5px 14px;font-size:12px;cursor:pointer">Re-score All</button>
+    </div>
+    <div id="as-form-msg" style="font-size:11px;color:#9ca3af;margin-top:6px"></div>
+  </div>
+</div>
+<style>
+.as-tab{background:#1f2937;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer}
+.as-tab-active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:700}
+</style>
+
 <div class="mod" id="mod-mb-voice">
   <div class="mod-h">🗣 Analyst Voice <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">DISPLAY-ONLY</span></div>
   <div id="mbv-headline" class="mb-summary" style="font-weight:600">—</div>
@@ -42555,6 +43323,7 @@ function renderActiveThinking(d){
 function renderMainBrainCognitive(d){
   try{ renderPlaybookSelector(d); }catch(e){}
   try{ renderUnifiedLearning(d); }catch(e){}
+  try{ renderAutoSearchSummary(); }catch(e){}
   try{ renderMBVoice(d); }catch(e){}
   try{ renderMBPredictions(d); }catch(e){}
   try{ renderMBConfidence(d); }catch(e){}
@@ -42725,6 +43494,227 @@ function renderUnifiedLearning(d){
   }
   content.innerHTML = html;
 }
+
+// ── AutoSearch (HYPOTHESIS TRAINING LOOP — DISPLAY-ONLY) ────────────────────
+// Fetches from /autosearch (separate 120s poll; not part of the /status hot path).
+// All dynamic content written via innerHTML but passed through aiEsc() / esc().
+let _asActiveTab = 'active';
+let _asData = null;
+function asSetTab(tab){
+  _asActiveTab = tab;
+  ['active','validated','promoted','rejected'].forEach(function(t){
+    const el = document.getElementById('as-tab-' + t);
+    if(el) el.className = (t===tab ? 'as-tab as-tab-active' : 'as-tab');
+  });
+  if(_asData) try{ renderAutoSearch(_asData); }catch(e){}
+}
+function renderAutoSearchSummary(){
+  if(_asData) try{ renderAutoSearch(_asData); }catch(e){}
+}
+function renderAutoSearch(data){
+  _asData = data;
+  const mod = document.getElementById('mod-autosearch');
+  if(!mod) return;
+  if(!data || !data.available){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const bs = data.by_status || {};
+  const summary = document.getElementById('as-summary');
+  if(summary){
+    const counts = [
+      ['testing',          bs.testing          ||0, '#6b7280', 'Testing'],
+      ['ghost_validating', bs.ghost_validating  ||0, '#fbbf24', 'Ghost'],
+      ['validated',        bs.validated         ||0, '#34d399', 'Validated'],
+      ['promoted',         bs.promoted          ||0, '#93c5fd', 'Promoted'],
+      ['rejected',         bs.rejected          ||0, '#f87171', 'Rejected'],
+    ];
+    summary.innerHTML = '';
+    counts.forEach(function(c){
+      const chip = document.createElement('div');
+      chip.style.cssText = 'padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700;' +
+        'background:#0d1117;border:1px solid ' + c[2] + ';color:' + c[2] + ';cursor:pointer';
+      chip.textContent = c[3] + ': ' + c[1];
+      summary.appendChild(chip);
+    });
+  }
+  const tabMap = {
+    'active':    ['testing','ghost_validating'],
+    'validated': ['validated'],
+    'promoted':  ['promoted'],
+    'rejected':  ['rejected']
+  };
+  const allowed  = tabMap[_asActiveTab] || ['testing','ghost_validating'];
+  const filtered = (data.hypotheses || []).filter(function(h){
+    return allowed.indexOf(h.status) !== -1;
+  });
+  const list = document.getElementById('as-list');
+  if(!list) return;
+  list.innerHTML = '';
+  if(!filtered.length){
+    list.innerHTML = '<div style="font-size:12px;color:#6b7280;padding:8px 0">No hypotheses in this tab yet.</div>';
+    return;
+  }
+  filtered.forEach(function(h){
+    const card = document.createElement('div');
+    card.style.cssText = 'border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:11px;line-height:1.6;' +
+      (h.status === 'validated'       ? 'border:2px solid #34d399;background:#0a1f14;' :
+       h.status === 'promoted'        ? 'border:2px solid #3b82f6;background:#0a1525;' :
+       h.status === 'ghost_validating'? 'border:1px solid #fbbf24;background:#1a1400;' :
+       h.status === 'rejected'        ? 'border:1px solid #374151;background:#0d0d0d;opacity:.75;' :
+                                        'border:1px solid #1f2937;background:#0d1117;');
+    const statusColors = {testing:'#6b7280',ghost_validating:'#fbbf24',
+                          validated:'#34d399',promoted:'#93c5fd',rejected:'#f87171'};
+    const statusLabel  = {testing:'TESTING',ghost_validating:'GHOST VALIDATING',
+                          validated:'\u2713 VALIDATED',promoted:'\u2605 PROMOTED',rejected:'REJECTED'};
+    const sc = statusColors[h.status] || '#9ca3af';
+    const sl = statusLabel[h.status]  || h.status.toUpperCase();
+    let html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">';
+    html += '<span style="font-size:12px;font-weight:700;color:#e5e7eb;flex:1;min-width:0;">' + esc(h.title) + '</span>';
+    html += '<span style="font-size:10px;font-weight:700;color:' + sc +
+            ';white-space:nowrap;border:1px solid ' + sc + ';border-radius:4px;padding:1px 6px;">' + sl + '</span>';
+    if(h.source === 'manual'){
+      html += '<span style="font-size:9px;background:#2a1f00;color:#fbbf24;border-radius:3px;padding:1px 5px;">MANUAL</span>';
+    }
+    html += '</div>';
+    if(h.n){
+      const liftColor = (h.edge_lift != null && h.edge_lift >= 0.04) ? '#34d399' : '#f87171';
+      html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:6px;">';
+      const cells = [
+        ['Samples',    h.n],
+        ['Win Rate',   h.win_rate   != null ? (h.win_rate  *100).toFixed(1)+'%'                           : '\u2014'],
+        ['Expectancy', h.expectancy != null ? (h.expectancy>=0?'+':'')+h.expectancy.toFixed(3)+'R'        : '\u2014'],
+        ['Avg R',      h.avg_r      != null ? (h.avg_r     >=0?'+':'')+h.avg_r.toFixed(3)                 : '\u2014'],
+        ['TP1 Rate',   h.tp1_rate   != null ? (h.tp1_rate  *100).toFixed(0)+'%'                           : '\u2014'],
+        ['TP2 Rate',   h.tp2_rate   != null ? (h.tp2_rate  *100).toFixed(0)+'%'                           : '\u2014'],
+        ['BE Fail',    h.be_fail_rate!=null  ? (h.be_fail_rate*100).toFixed(0)+'%'                        : '\u2014'],
+        ['Edge Lift',  h.edge_lift  != null
+                       ? '<span style="color:'+liftColor+'">'+(h.edge_lift>=0?'+':'')+(h.edge_lift*100).toFixed(1)+'pp</span>'
+                       : '\u2014'],
+      ];
+      cells.forEach(function(c){
+        html += '<div style="background:#111827;border-radius:4px;padding:4px 6px;">';
+        html += '<div style="font-size:9px;color:#6b7280;">' + c[0] + '</div>';
+        html += '<div style="color:#d1d5db;font-weight:600;">' + c[1] + '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+      if(h.baseline_win_rate != null){
+        html += '<div style="font-size:10px;color:#6b7280;margin-bottom:4px;">vs baseline: WR ' +
+          (h.baseline_win_rate*100).toFixed(1) + '% | Exp ' +
+          (h.baseline_expectancy>=0?'+':'') + (h.baseline_expectancy||0).toFixed(3) + 'R' +
+          ' (' + (h.baseline_n||0) + ' trades)</div>';
+      }
+    }
+    if(h.status === 'ghost_validating' || (h.ghost_sample_count && h.ghost_sample_count > 0)){
+      const gn  = h.ghost_sample_count || 0;
+      const pct = Math.min(100, Math.round(gn / 20 * 100));
+      html += '<div style="margin-bottom:6px;">';
+      html += '<div style="display:flex;justify-content:space-between;font-size:10px;color:#fbbf24;margin-bottom:3px;">';
+      html += '<span>Ghost validation: ' + gn + '/20 samples</span>';
+      if(h.ghost_win_rate != null){
+        html += '<span>WR ' + (h.ghost_win_rate*100).toFixed(1) + '%';
+        if(h.ghost_expectancy != null)
+          html += ' | Exp ' + (h.ghost_expectancy>=0?'+':'') + h.ghost_expectancy.toFixed(2) + 'R';
+        html += '</span>';
+      }
+      html += '</div>';
+      html += '<div style="height:4px;background:#1f2937;border-radius:2px;overflow:hidden;">';
+      html += '<div style="height:4px;width:'+pct+'%;background:#fbbf24;border-radius:2px;transition:width .4s;"></div>';
+      html += '</div></div>';
+    }
+    if(h.custom_note){
+      html += '<div style="font-size:10px;color:#9ca3af;font-style:italic;margin-bottom:4px;">' + esc(h.custom_note) + '</div>';
+    }
+    if(h.status === 'validated'){
+      html += '<button onclick="asPromote(\''+esc(h.hyp_key)+'\')" ' +
+        'style="font-size:11px;background:#14532d;border:1px solid #22c55e;color:#86efac;' +
+        'border-radius:5px;padding:3px 12px;cursor:pointer;margin-top:4px;">\u2605 Promote to Brain</button> ';
+    }
+    if(h.status !== 'promoted'){
+      html += '<button onclick="asReject(\''+esc(h.hyp_key)+'\')" ' +
+        'style="font-size:10px;background:#1f2937;border:1px solid #374151;color:#6b7280;' +
+        'border-radius:5px;padding:2px 8px;cursor:pointer;margin-top:4px;">Reject</button>';
+    }
+    card.innerHTML = html;
+    list.appendChild(card);
+  });
+}
+function _asFetch(){
+  fetch(BASE_URL + 'autosearch').then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(d){ if(d) try{ renderAutoSearch(d); }catch(e){} })
+    .catch(function(){});
+}
+function asGenerate(){
+  const msg = document.getElementById('as-form-msg');
+  if(msg) msg.textContent = 'Generating\u2026';
+  fetch(BASE_URL + 'autosearch/generate', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(msg) msg.textContent = d.ok
+        ? 'Generated ' + (d.generated||0) + ' combos. Scoring in background\u2026'
+        : (d.error || 'Error');
+      if(d.ok) setTimeout(_asFetch, 3000);
+    }).catch(function(){ if(msg) msg.textContent = 'Network error'; });
+}
+function asRescore(){
+  const msg = document.getElementById('as-form-msg');
+  if(msg) msg.textContent = 'Rescoring\u2026';
+  fetch(BASE_URL + 'autosearch/rescore', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(msg) msg.textContent = d.ok ? 'Rescoring started in background.' : (d.error||'Error');
+      if(d.ok) setTimeout(_asFetch, 3000);
+    }).catch(function(){ if(msg) msg.textContent = 'Network error'; });
+}
+function asAddHyp(){
+  const titleEl = document.getElementById('as-title');
+  const msg     = document.getElementById('as-form-msg');
+  const title   = (titleEl && titleEl.value || '').trim();
+  if(!title){ if(msg) msg.textContent = 'Title is required.'; return; }
+  const body = {
+    title:        title,
+    instrument:   ((document.getElementById('as-inst')  ||{}).value||'')||null,
+    direction:    ((document.getElementById('as-dir')   ||{}).value||'')||null,
+    trading_mode: ((document.getElementById('as-tmode') ||{}).value||'')||null,
+    note:         ((document.getElementById('as-note')  ||{}).value||'')||null,
+  };
+  if(msg) msg.textContent = 'Adding\u2026';
+  fetch(BASE_URL + 'autosearch/add', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d.ok){
+        if(msg) msg.textContent = 'Added! Scoring in background\u2026';
+        if(titleEl) titleEl.value = '';
+        const nt = document.getElementById('as-note'); if(nt) nt.value = '';
+        setTimeout(_asFetch, 2000);
+      } else {
+        if(msg) msg.textContent = d.error || 'Error';
+      }
+    }).catch(function(){ if(msg) msg.textContent = 'Network error'; });
+}
+function asPromote(hyp_key){
+  if(!confirm('Promote this hypothesis to the Main Brain as a validated insight?')) return;
+  fetch(BASE_URL + 'autosearch/promote/' + encodeURIComponent(hyp_key), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d.ok){ alert('Promoted: ' + (d.title||hyp_key)); asSetTab('promoted'); _asFetch(); }
+      else alert('Error: ' + (d.error||'unknown'));
+    }).catch(function(){ alert('Network error'); });
+}
+function asReject(hyp_key){
+  if(!confirm('Reject this hypothesis?')) return;
+  fetch(BASE_URL + 'autosearch/reject/' + encodeURIComponent(hyp_key), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({reason:'manually rejected'})
+  }).then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d.ok) _asFetch();
+      else alert('Error: ' + (d.error||'unknown'));
+    }).catch(function(){ alert('Network error'); });
+}
+_asFetch();
+setInterval(_asFetch, 120000);
 
 // ── Ask the brain — interactive chat inside Main Brain (DISPLAY-ONLY, read-only) ──
 // Reuses the existing /assistant backend (grounded on a read-only full_analysis
@@ -50131,6 +51121,7 @@ if __name__ == "__main__":
         _check_trade_mgmt_db_ready()               # probe trade_management_metrics (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
         _check_session_quality_db_ready()          # probe session_quality_grades (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
         _check_scalp_research_db_ready()           # probe scalp_strategy_library/research (no DDL; created via DB tool/publish diff) — RESEARCH/DISPLAY-ONLY
+        _check_autosearch_db_ready()               # probe autosearch_hypotheses/historical_scores/ghost_samples (no DDL; created via DB tool) — AUTOSEARCH RESEARCH, DISPLAY-ONLY
         _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
