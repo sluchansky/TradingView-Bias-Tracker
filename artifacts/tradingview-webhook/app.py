@@ -9034,6 +9034,7 @@ LEARNING_SETUP_DISABLE_MAX_WR = 0.25  # win-rate ceiling for "repeatedly failing
 LEARNING_SETUP_DISABLE_MAX_EXP = -0.5  # expectancy ceiling for "repeatedly failing" detection
 LEARNING_ELIGIBILITY          = {}    # instrument -> Rule Engine verdict (in-memory; DB-backed after recompute)
 LEARNING_ELIGIBILITY_LOCK     = threading.Lock()
+PER_MODE_STATS                = {}    # (inst, mode) -> {n, win_rate, avg_r, expectancy, top_failure} — playbook selector
 # ── Shared Trade Memory weighting (display-only; governor + analyst single source).
 # STRATEGY_VERSION is bumped MANUALLY whenever the trade LOGIC (filters / indicators
 # / rules) changes; prior-version closed trades are then heavily down-weighted so
@@ -11102,7 +11103,7 @@ def _recompute_learning():
     """Recompute per-strategy analytics + bounded weights from strategy_trades and
     swap the in-memory caches atomically. Also persists strategy_weights for
     continuity/inspection. FAIL-OPEN; runs at startup and every Nth close."""
-    global LEARNING_ANALYTICS, GOVERNOR_STATS
+    global LEARNING_ANALYTICS, GOVERNOR_STATS, PER_MODE_STATS
     if not LEARNING_DB_ENABLED:
         return
     # Serialize: hold this across the whole read→compute→swap so an older/slower
@@ -11356,12 +11357,61 @@ def _recompute_learning():
         except Exception as _le_exc:
             logger.warning("learning_eligibility recompute skip: %s", _le_exc)
 
+        # ── Per-mode stats for Playbook Selector (DISPLAY-ONLY) ──────────────
+        new_per_mode = {}
+        try:
+            _pm_cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            _pm_cur.execute("""
+                SELECT instrument,
+                       UPPER(COALESCE(trading_mode, 'SCALP')) AS mode,
+                       COUNT(*)                                                       AS n,
+                       AVG((result='Win')::int::float)                               AS win_rate,
+                       AVG(r_multiple)                                               AS avg_r,
+                       SUM(CASE WHEN r_multiple>0 THEN 1 ELSE 0 END)                AS wins,
+                       SUM(CASE WHEN r_multiple<0 THEN 1 ELSE 0 END)                AS losses
+                FROM strategy_trades
+                WHERE result IS NOT NULL AND instrument IS NOT NULL
+                GROUP BY instrument, UPPER(COALESCE(trading_mode, 'SCALP'))
+            """)
+            _pm_rows = _pm_cur.fetchall()
+            _pm_cur.execute("""
+                SELECT instrument,
+                       UPPER(COALESCE(trading_mode, 'SCALP')) AS mode,
+                       outcome_tag,
+                       COUNT(*) AS cnt
+                FROM strategy_trades
+                WHERE result='Loss' AND instrument IS NOT NULL AND outcome_tag IS NOT NULL
+                GROUP BY instrument, UPPER(COALESCE(trading_mode, 'SCALP')), outcome_tag
+            """)
+            _fail_rows = _pm_cur.fetchall()
+            _pm_cur.close()
+            _fail_best = {}
+            for _fr in (_fail_rows or []):
+                _k = (_fr["instrument"], _fr["mode"])
+                if _k not in _fail_best or int(_fr["cnt"]) > int(_fail_best[_k][1]):
+                    _fail_best[_k] = (_fr["outcome_tag"], int(_fr["cnt"]))
+            for _r in (_pm_rows or []):
+                _ik = _r["instrument"]; _mk = _r["mode"]
+                _n  = int(_r["n"] or 0)
+                _wr = float(_r["win_rate"]) if _r["win_rate"] is not None else None
+                _ar = float(_r["avg_r"])    if _r["avg_r"]   is not None else None
+                _tf, _tfn = _fail_best.get((_ik, _mk), (None, 0))
+                new_per_mode[(_ik, _mk)] = {
+                    "n": _n, "win_rate": _wr, "avg_r": _ar, "expectancy": _ar,
+                    "wins": int(_r["wins"] or 0), "losses": int(_r["losses"] or 0),
+                    "top_failure": OUTCOME_TAG_LABELS.get(_tf, _tf) if _tf else None,
+                    "top_failure_key": _tf, "top_failure_n": _tfn,
+                }
+        except Exception as _pm_exc:
+            logger.debug("per_mode_stats recompute skip: %s", _pm_exc)
+
         with LEARNING_LOCK:
             STRATEGY_WEIGHTS.clear();        STRATEGY_WEIGHTS.update(new_weights)
             LEARNING_SAMPLE_BY_KEY.clear();  LEARNING_SAMPLE_BY_KEY.update(new_samples)
             LEARNING_ANALYTICS = analytics
             GOVERNOR_STATS = governor_stats
             MEMORY_TRADES[:] = mem_cache
+            PER_MODE_STATS.clear();          PER_MODE_STATS.update(new_per_mode)
         logger.info("learning analytics recomputed: %s trades across %s strategies",
                     total, len(ranking))
     except Exception as exc:
@@ -16997,6 +17047,300 @@ def compute_market_events_timeline(inst):
     return res if isinstance(res, dict) else {"available": False, "events": [], "reason": "Events unavailable."}
 
 
+# ── (5a) Unified Learning Brain — Playbook Selector + Learning Memory ─────────
+# DISPLAY-ONLY: evaluates all playbooks (Scalp / Swing / Micro Scalp) against
+# the current market snapshot + per-mode historical stats from strategy_trades.
+# NEVER touches the gate, scoring, sizing, or broker path. All helpers are
+# FAIL-OPEN. The actual trade execution still uses TRADING_MODE unchanged.
+
+def _playbook_selector_neutral(reason="Playbook analysis unavailable."):
+    return {"available": False, "selected_mode": None, "why": reason,
+            "rejected": [], "final_decision": None,
+            "active_live_mode": TRADING_MODE, "playbooks": {}}
+
+def _unified_learning_neutral(reason="Learning memory unavailable."):
+    return {"available": False, "reason": reason, "playbooks": {}, "selected_mode": None}
+
+def _pb_expectancy_label(exp):
+    if exp is None:        return "No data"
+    if exp >= 0.5:         return "+%.2fR (strong)" % exp
+    if exp >= 0.1:         return "+%.2fR (positive)" % exp
+    if exp >= -0.1:        return "%.2fR (neutral)" % exp
+    return "%.2fR (negative)" % exp
+
+def _pb_lre_factor(lre_status):
+    return 1.0 if lre_status == "LIVE_ELIGIBLE" else 0.6 if lre_status == "GHOST_ONLY" else 0.0
+
+def _pb_score(exp, wr, n, lre_status, rr, actionable):
+    try:
+        base = float(exp or 0.0) * float(wr or 0.5) * float(rr or 1.0)
+        base *= _pb_lre_factor(lre_status)
+        if not actionable:
+            base *= 0.3
+        if (n or 0) < 10:
+            base *= 0.7
+        return round(base, 4)
+    except Exception:
+        return 0.0
+
+def compute_playbook_selector(result):
+    """Evaluate all available playbooks (SCALP / SWING / MICRO SCALP) against
+    the current market snapshot. Returns: selected mode, why, rejected playbooks
+    with reasons, and consolidated final decision. DISPLAY-ONLY, FAIL-OPEN."""
+    inst = result.get("active_ticker") or result.get("ticker")
+    if not inst:
+        return _playbook_selector_neutral("No instrument.")
+    verdict    = result.get("verdict") or ""
+    edge_score = int(round(float(result.get("edge_score") or 0)))
+    trade_plan = result.get("trade_plan") or {}
+    rr_num     = float(trade_plan.get("rr_num") or 1.0)
+    live_open  = bool(result.get("open_trade"))
+    prop_ok    = not bool((result.get("prop_firm") or {}).get("blocked"))
+    with LEARNING_LOCK:
+        per_mode = dict(PER_MODE_STATS)
+    with LEARNING_ELIGIBILITY_LOCK:
+        elig_snap = dict(LEARNING_ELIGIBILITY)
+
+    playbooks = {}
+
+    # ── SCALP playbook ────────────────────────────────────────────────────────
+    scalp_s    = per_mode.get((inst, "SCALP")) or {}
+    scalp_lre  = (elig_snap.get(inst) or {}).get("status", "GHOST_ONLY")
+    scalp_act  = TRADING_MODE == "SCALP" and is_actionable(verdict)
+    scalp_exp  = scalp_s.get("expectancy")
+    scalp_wr   = scalp_s.get("win_rate")
+    scalp_n    = scalp_s.get("n", 0)
+    scalp_rr   = rr_num if TRADING_MODE == "SCALP" else 1.0
+    sr = []
+    if TRADING_MODE == "SCALP" and not scalp_act:
+        sr.append("No READY setup (verdict: %s)" % (verdict or "WAIT"))
+    if scalp_exp is not None and scalp_exp < -0.1:
+        sr.append("Negative historical expectancy (%s)" % _pb_expectancy_label(scalp_exp))
+    if scalp_n < 5:
+        sr.append("Only %d historical samples" % scalp_n)
+    if live_open:
+        sr.append("Position already open")
+    playbooks["SCALP"] = {
+        "label": "Scalp", "active": TRADING_MODE == "SCALP",
+        "verdict": verdict if TRADING_MODE == "SCALP" else "—",
+        "actionable": scalp_act,
+        "edge_score": edge_score if TRADING_MODE == "SCALP" else None,
+        "rr": scalp_rr, "n": scalp_n,
+        "win_rate": round(scalp_wr * 100, 1) if scalp_wr is not None else None,
+        "expectancy": round(scalp_exp, 2) if scalp_exp is not None else None,
+        "lre_status": scalp_lre, "top_failure": scalp_s.get("top_failure"),
+        "score": _pb_score(scalp_exp, scalp_wr, scalp_n, scalp_lre, scalp_rr, scalp_act),
+        "reject_reasons": sr,
+    }
+
+    # ── SWING playbook ────────────────────────────────────────────────────────
+    swing_s    = per_mode.get((inst, "SWING")) or {}
+    swing_lre  = (elig_snap.get(inst) or {}).get("status", "GHOST_ONLY")
+    swing_act  = TRADING_MODE == "SWING" and is_actionable(verdict)
+    swing_exp  = swing_s.get("expectancy")
+    swing_wr   = swing_s.get("win_rate")
+    swing_n    = swing_s.get("n", 0)
+    swing_rr   = rr_num if TRADING_MODE == "SWING" else 3.0
+    _ds_stats  = {}
+    if DUAL_MODE_SHADOW_SIM_ENABLED:
+        try:
+            _ds_all = _dual_sim_stats()
+            _ds_stats = (_ds_all or {}).get("SWING", {}) if isinstance(_ds_all, dict) else {}
+        except Exception:
+            pass
+    ds_shadow_n  = int((_ds_stats.get("closed") or 0))
+    ds_shadow_wr = _ds_stats.get("win_rate")   # percentage (0-100)
+    ds_shadow_ar = _ds_stats.get("avg_r")
+    eff_n   = swing_n if swing_n >= 5 else ds_shadow_n
+    eff_wr  = swing_wr if swing_wr is not None else (
+              ds_shadow_wr / 100.0 if ds_shadow_wr is not None else None)
+    eff_exp = swing_exp if swing_exp is not None else ds_shadow_ar
+    vr = []
+    if TRADING_MODE == "SWING" and not swing_act:
+        vr.append("No READY setup (verdict: %s)" % (verdict or "WAIT"))
+    if TRADING_MODE != "SWING":
+        htf = result.get("swing_context") or {}
+        if not htf.get("htf_enabled"):
+            vr.append("HTF data not available in current mode")
+        elif not htf.get("trend_aligned", True):
+            vr.append("No higher-timeframe trend alignment")
+    if eff_exp is not None and eff_exp < -0.1:
+        vr.append("Negative expectancy (%s)" % _pb_expectancy_label(eff_exp))
+    if eff_n < 5:
+        vr.append("Only %d samples (including shadow sim)" % eff_n)
+    if live_open:
+        vr.append("Position already open")
+    swing_shadow_label = "Shadow: %d trades" % ds_shadow_n if (ds_shadow_n and TRADING_MODE != "SWING") else None
+    playbooks["SWING"] = {
+        "label": "Swing", "active": TRADING_MODE == "SWING",
+        "verdict": verdict if TRADING_MODE == "SWING" else (swing_shadow_label or "Not evaluated"),
+        "actionable": swing_act,
+        "edge_score": edge_score if TRADING_MODE == "SWING" else None,
+        "rr": swing_rr, "n": eff_n,
+        "win_rate": round(eff_wr * 100, 1) if eff_wr is not None else None,
+        "expectancy": round(eff_exp, 2) if eff_exp is not None else None,
+        "lre_status": swing_lre, "top_failure": swing_s.get("top_failure"),
+        "score": _pb_score(eff_exp, eff_wr, eff_n, swing_lre, swing_rr, swing_act),
+        "reject_reasons": vr,
+    }
+
+    # ── MICRO SCALP playbook ──────────────────────────────────────────────────
+    msc_on     = _micro_scalp_on()
+    msc_block  = (result.get("main_brain") or {}).get("micro_scalp") or {}
+    msc_v      = (msc_block.get("verdict") or "OFF") if msc_on else "OFF"
+    msc_act    = msc_on and msc_v not in ("OFF", "WAIT", "NO SIGNAL", "—", "", None)
+    msc_ghost  = _micro_ghost_stats(inst)
+    msc_st     = msc_ghost.get("stats") or {}
+    msc_trades = int(msc_st.get("trades") or 0)
+    msc_wins   = int(msc_st.get("wins")   or 0)
+    msc_losses = int(msc_st.get("losses") or 0)
+    msc_net_r  = float(msc_st.get("net_r") or 0)
+    msc_dec    = msc_wins + msc_losses
+    msc_wr_raw = (msc_wins / msc_dec) if msc_dec > 0 else None
+    msc_exp_v  = (msc_net_r / msc_trades) if msc_trades > 0 else None
+    msc_rr_num = float((msc_block.get("trade_plan") or {}).get("rr") or 1.0)
+    msc_lre    = "LIVE_ELIGIBLE" if _micro_live_armed() else "GHOST_ONLY"
+    mr = []
+    if not msc_on:
+        mr.append("Micro Scalp engine is OFF")
+    elif not msc_act:
+        mr.append("No sweep/trap signal detected")
+    if msc_exp_v is not None and msc_exp_v < -0.1:
+        mr.append("Ghost expectancy negative (%s)" % _pb_expectancy_label(msc_exp_v))
+    if msc_trades < 5:
+        mr.append("Only %d ghost trades logged" % msc_trades)
+    if live_open:
+        mr.append("Position already open")
+    playbooks["MICRO_SCALP"] = {
+        "label": "Micro Scalp", "active": False, "verdict": msc_v,
+        "actionable": msc_act,
+        "edge_score": None, "rr": msc_rr_num or 1.0, "n": msc_trades,
+        "win_rate": round(msc_wr_raw * 100, 1) if msc_wr_raw is not None else None,
+        "expectancy": round(msc_exp_v, 2) if msc_exp_v is not None else None,
+        "lre_status": msc_lre, "top_failure": None,
+        "score": _pb_score(msc_exp_v, msc_wr_raw, msc_trades, msc_lre, msc_rr_num or 1.0, msc_act),
+        "reject_reasons": mr,
+    }
+
+    # ── Selection logic ────────────────────────────────────────────────────────
+    candidates = {m: pb for m, pb in playbooks.items()
+                  if pb["actionable"] and not pb["reject_reasons"]}
+    if not candidates:
+        candidates = {m: pb for m, pb in playbooks.items() if pb["actionable"]}
+    selected = None
+    why = "No actionable setup across any playbook right now."
+    rejected_list = []
+    if candidates:
+        best_mode = max(candidates, key=lambda m: playbooks[m]["score"])
+        selected  = best_mode
+        pb = playbooks[best_mode]
+        parts = [pb["label"] + " selected"]
+        if pb.get("edge_score") is not None:
+            parts.append("Edge %d" % pb["edge_score"])
+        if pb.get("rr"):
+            parts.append("%.1f:1 R:R" % pb["rr"])
+        if pb["n"]:
+            parts.append("%d samples · %s" % (pb["n"], _pb_expectancy_label(pb.get("expectancy"))))
+        parts.append("LIVE eligible" if pb["lre_status"] == "LIVE_ELIGIBLE" else "ghost mode")
+        why = " · ".join(parts) + "."
+        for m, rpb in playbooks.items():
+            if m == selected:
+                continue
+            reasons = rpb["reject_reasons"] or ["Lower expected value than %s" % pb["label"]]
+            rejected_list.append({"mode": rpb["label"], "reasons": reasons})
+    else:
+        for m, rpb in playbooks.items():
+            rejected_list.append({"mode": rpb["label"],
+                                  "reasons": rpb["reject_reasons"] or ["No actionable signal"]})
+
+    # ── Final decision ─────────────────────────────────────────────────────────
+    if live_open:
+        fd = "MANAGING"
+    elif selected is None:
+        fd = "WAIT"
+    elif not prop_ok:
+        fd = "REJECT (prop rule)"
+    elif playbooks[selected]["lre_status"] != "LIVE_ELIGIBLE":
+        fd = "GHOST"
+    else:
+        fd = "LIVE"
+
+    return {
+        "available": True, "selected_mode": selected, "why": why,
+        "rejected": rejected_list, "final_decision": fd,
+        "active_live_mode": TRADING_MODE, "playbooks": playbooks,
+    }
+
+
+def compute_unified_learning(result, inst):
+    """One consolidated Learning Memory panel: per-playbook stats (Scalp / Swing /
+    Micro Scalp) from strategy_trades and the ghost ledger. DISPLAY-ONLY, FAIL-OPEN."""
+    if not inst:
+        return _unified_learning_neutral("No instrument.")
+    with LEARNING_LOCK:
+        per_mode = dict(PER_MODE_STATS)
+    with LEARNING_ELIGIBILITY_LOCK:
+        elig_snap = dict(LEARNING_ELIGIBILITY)
+
+    mem_ctx = result.get("trade_memory_context") or {}
+
+    def _mode_block(mode_key, label, stats, lre_dict):
+        n   = stats.get("n", 0)
+        wr  = stats.get("win_rate")
+        exp = stats.get("expectancy")
+        lre_status = (lre_dict or {}).get("status", "GHOST_ONLY")
+        if n >= 50 and (exp or 0) >= 0.1 and (wr or 0) >= 0.5:
+            lv = "LIVE eligible"
+        elif n >= 10:
+            lv = "Building history"
+        elif n > 0:
+            lv = "Early data only"
+        else:
+            lv = "No data yet"
+        return {
+            "mode": mode_key, "label": label, "n": n,
+            "win_rate": round(wr * 100, 1) if wr is not None else None,
+            "avg_r": round(exp, 2) if exp is not None else None,
+            "expectancy_label": _pb_expectancy_label(exp),
+            "top_failure": stats.get("top_failure"),
+            "lre_status": lre_status,
+            "learning_verdict": lv,
+        }
+
+    lre_inst  = elig_snap.get(inst) or {}
+    scalp_blk = _mode_block("SCALP", "Scalp", per_mode.get((inst, "SCALP")) or {}, lre_inst)
+    swing_blk = _mode_block("SWING", "Swing", per_mode.get((inst, "SWING")) or {}, lre_inst)
+
+    msc_ghost = _micro_ghost_stats(inst)
+    msc_st    = msc_ghost.get("stats") or {}
+    msc_n     = int(msc_st.get("trades") or 0)
+    msc_wins  = int(msc_st.get("wins")   or 0)
+    msc_ded   = msc_wins + int(msc_st.get("losses") or 0)
+    msc_wr    = (msc_wins / msc_ded) if msc_ded > 0 else None
+    msc_exp   = float(msc_st.get("net_r") or 0) / msc_n if msc_n > 0 else None
+    msc_blk   = _mode_block("MICRO_SCALP", "Micro Scalp",
+                             {"n": msc_n, "win_rate": msc_wr, "expectancy": msc_exp}, None)
+    msc_blk["lre_status"] = "LIVE_ELIGIBLE" if _micro_live_armed() else "GHOST_ONLY"
+    msc_blk["learning_verdict"] = (
+        "LIVE armed" if _micro_live_armed() else
+        ("Ghost history" if msc_n >= 5 else "Building ghost history"))
+
+    sel_mode = (result.get("playbook_selector") or {}).get("selected_mode")
+    similar  = {
+        "matched": mem_ctx.get("matched", 0),
+        "win_rate": round(float(mem_ctx.get("weighted_win_rate") or 0) * 100, 1) if mem_ctx.get("weighted_win_rate") is not None else None,
+        "avg_r": round(float(mem_ctx.get("weighted_avg_r") or 0), 2) if mem_ctx.get("weighted_avg_r") is not None else None,
+        "top_failure": mem_ctx.get("top_failure_label"),
+        "matched_on": mem_ctx.get("matched_on") or [],
+        "ready": mem_ctx.get("ready", False),
+    }
+    return {
+        "available": True, "instrument": inst, "selected_mode": sel_mode,
+        "playbooks": {"SCALP": scalp_blk, "SWING": swing_blk, "MICRO_SCALP": msc_blk},
+        "similar": similar,
+    }
+
+
 # ── (5) Session / day-type classifier + learning stats ────────────────────────
 def _session_day_type_neutral(reason="Day type forming."):
     return {"available": False, "day_type": "—", "confidence": 0, "reasons": [], "reason": reason}
@@ -18568,6 +18912,14 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["main_brain_voice"] = compute_main_brain_voice(result)
     except Exception:
         result["main_brain_voice"] = _main_brain_voice_neutral()
+    try:
+        result["playbook_selector"] = compute_playbook_selector(result)
+    except Exception:
+        result["playbook_selector"] = _playbook_selector_neutral()
+    try:
+        result["unified_learning"] = compute_unified_learning(result, _mb_inst)
+    except Exception:
+        result["unified_learning"] = _unified_learning_neutral()
 
     # Main Brain learning loop: capture a NON-actionable (WAIT) setup as a pending
     # would-have-worked hypothesis. Pure side-effect — never mutates `result`,
@@ -32723,6 +33075,8 @@ def _build_status_payload(_tk):
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
         "learning_engine":     _learning_engine_view(),
         "learning_rule_engine": _learning_rule_engine_view(),
+        "playbook_selector":   a.get("playbook_selector"),
+        "unified_learning":    a.get("unified_learning"),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
@@ -38245,6 +38599,34 @@ def dashboard():
      market_narrative / market_events_timeline / session_day_type /
      main_brain_learning_stats). NEVER touch the gate, scoring, sizing or broker.
      Every dynamic string is written via textContent / _anFill (escaped). -->
+
+<div class="mod" id="mod-playbook-selector">
+  <div class="mod-h">&#127302; Playbook Selector <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">ADVISORY ONLY</span></div>
+  <div id="pbs-mode-row" style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+    <span style="font-size:11px;color:#9ca3af">MODE SELECTED</span>
+    <span id="pbs-mode-badge" style="font-size:12px;font-weight:700;padding:2px 10px;border-radius:9px;background:#1e3a5f;color:#93c5fd">—</span>
+    <span id="pbs-fd-badge" style="font-size:12px;font-weight:700;padding:2px 10px;border-radius:9px;background:#1a2a1a;color:#86efac;margin-left:auto">—</span>
+  </div>
+  <div id="pbs-why" style="font-size:12px;color:#d1d5db;margin-bottom:8px;line-height:1.5">Evaluating playbooks…</div>
+  <div id="pbs-playbooks" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px"></div>
+  <div id="pbs-rejected" style="font-size:11px;color:#6b7280"></div>
+</div>
+
+<div class="mod" id="mod-unified-learning">
+  <div class="mod-h">&#129504; Unified Learning Memory <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">DISPLAY-ONLY</span></div>
+  <div id="ul-tabs" style="display:flex;gap:6px;margin-bottom:10px">
+    <button id="ul-tab-scalp" class="ul-tab ul-tab-active" onclick="ulSetTab('SCALP')">Scalp</button>
+    <button id="ul-tab-swing" class="ul-tab" onclick="ulSetTab('SWING')">Swing</button>
+    <button id="ul-tab-micro" class="ul-tab" onclick="ulSetTab('MICRO_SCALP')">Micro</button>
+    <span id="ul-similar-note" style="margin-left:auto;font-size:10px;color:#6b7280;align-self:center"></span>
+  </div>
+  <div id="ul-content"></div>
+</div>
+<style>
+.ul-tab{background:#1f2937;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer}
+.ul-tab-active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:700}
+</style>
+
 <div class="mod" id="mod-mb-voice">
   <div class="mod-h">🗣 Analyst Voice <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">DISPLAY-ONLY</span></div>
   <div id="mbv-headline" class="mb-summary" style="font-weight:600">—</div>
@@ -42171,6 +42553,8 @@ function renderActiveThinking(d){
   }
 }
 function renderMainBrainCognitive(d){
+  try{ renderPlaybookSelector(d); }catch(e){}
+  try{ renderUnifiedLearning(d); }catch(e){}
   try{ renderMBVoice(d); }catch(e){}
   try{ renderMBPredictions(d); }catch(e){}
   try{ renderMBConfidence(d); }catch(e){}
@@ -42182,6 +42566,164 @@ function renderMainBrainCognitive(d){
   try{ renderMBLearning(d); }catch(e){}
   try{ renderDualSim(d); }catch(e){}
   try{ renderScalpAdvisory(d); }catch(e){}
+}
+
+// ── Playbook Selector (DISPLAY-ONLY) ─────────────────────────────────────────
+function renderPlaybookSelector(d){
+  const ps = d.playbook_selector;
+  const mod = document.getElementById('mod-playbook-selector');
+  if(!mod) return;
+  if(!ps || !ps.available){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const modeBadge = document.getElementById('pbs-mode-badge');
+  const fdBadge   = document.getElementById('pbs-fd-badge');
+  const whyEl     = document.getElementById('pbs-why');
+  const pbsEl     = document.getElementById('pbs-playbooks');
+  const rejEl     = document.getElementById('pbs-rejected');
+  if(modeBadge){
+    const mLabel = ps.selected_mode ? {'SCALP':'Scalp','SWING':'Swing','MICRO_SCALP':'Micro Scalp'}[ps.selected_mode]||ps.selected_mode : 'NONE';
+    modeBadge.textContent = mLabel;
+    modeBadge.style.background = ps.selected_mode ? '#1e3a5f' : '#2a1a1a';
+    modeBadge.style.color      = ps.selected_mode ? '#93c5fd' : '#f87171';
+  }
+  if(fdBadge){
+    const fd = ps.final_decision || '—';
+    const fdColors = {LIVE:['#14532d','#86efac'],GHOST:['#2a1f00','#fbbf24'],WAIT:['#1f2937','#9ca3af'],MANAGING:['#1a2550','#93c5fd']};
+    const fc = fdColors[fd] || ['#2a1a1a','#f87171'];
+    fdBadge.textContent = fd;
+    fdBadge.style.background = fc[0];
+    fdBadge.style.color      = fc[1];
+  }
+  if(whyEl) whyEl.textContent = ps.why || '—';
+  if(pbsEl){
+    pbsEl.innerHTML = '';
+    const pbs = ps.playbooks || {};
+    const order = ['SCALP','SWING','MICRO_SCALP'];
+    order.forEach(function(m){
+      const pb = pbs[m]; if(!pb) return;
+      const isSelected = (ps.selected_mode === m);
+      const isActive   = pb.active;
+      const card = document.createElement('div');
+      card.style.cssText = 'flex:1;min-width:120px;border-radius:8px;padding:8px 10px;font-size:11px;line-height:1.6;' +
+        (isSelected ? 'border:2px solid #3b82f6;background:#0f1f3a;' : 'border:1px solid #374151;background:#111827;');
+      const titleRow = document.createElement('div');
+      titleRow.style.cssText = 'font-weight:700;font-size:12px;margin-bottom:4px;display:flex;align-items:center;gap:6px;';
+      const lbl = document.createElement('span');
+      lbl.textContent = pb.label + (isActive ? ' (LIVE)' : '');
+      lbl.style.color = isSelected ? '#93c5fd' : (isActive ? '#60a5fa' : '#9ca3af');
+      titleRow.appendChild(lbl);
+      if(isSelected){
+        const sel = document.createElement('span');
+        sel.textContent = 'SELECTED';
+        sel.style.cssText = 'font-size:9px;background:#1e3a5f;color:#93c5fd;border-radius:4px;padding:1px 5px;';
+        titleRow.appendChild(sel);
+      }
+      card.appendChild(titleRow);
+      const rows = [
+        ['Samples', pb.n != null ? pb.n : '—'],
+        ['Win Rate', pb.win_rate != null ? pb.win_rate+'%' : '—'],
+        ['Expectancy', pb.expectancy != null ? (pb.expectancy >= 0 ? '+' : '')+pb.expectancy+'R' : '—'],
+        ['R:R', pb.rr != null ? pb.rr.toFixed(1)+':1' : '—'],
+        ['Mode', pb.lre_status === 'LIVE_ELIGIBLE' ? 'LIVE eligible' : 'Ghost mode'],
+      ];
+      if(pb.edge_score != null) rows.splice(1, 0, ['Edge', pb.edge_score]);
+      rows.forEach(function(r){
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;justify-content:space-between;gap:8px;color:#9ca3af;';
+        const kEl = document.createElement('span'); kEl.textContent = r[0];
+        const vEl = document.createElement('span');
+        vEl.textContent = String(r[1]);
+        vEl.style.color = '#d1d5db';
+        row.appendChild(kEl); row.appendChild(vEl);
+        card.appendChild(row);
+      });
+      if(pb.top_failure){
+        const tf = document.createElement('div');
+        tf.style.cssText = 'margin-top:4px;font-size:10px;color:#f87171;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        tf.textContent = 'Top fail: ' + pb.top_failure;
+        card.appendChild(tf);
+      }
+      pbsEl.appendChild(card);
+    });
+  }
+  if(rejEl){
+    const rej = ps.rejected || [];
+    if(!rej.length){ rejEl.textContent=''; return; }
+    rejEl.textContent = '';
+    rej.forEach(function(r){
+      const line = document.createElement('div');
+      line.style.cssText = 'margin-top:2px;';
+      const reasons = (r.reasons || []).slice(0,2).join('; ');
+      line.textContent = r.mode + ': ' + reasons;
+      rejEl.appendChild(line);
+    });
+  }
+}
+
+// ── Unified Learning Memory (DISPLAY-ONLY) ────────────────────────────────────
+let _ulActiveTab = 'SCALP';
+function ulSetTab(tab){
+  _ulActiveTab = tab;
+  const tabs = ['SCALP','SWING','MICRO_SCALP'];
+  const ids  = {'SCALP':'ul-tab-scalp','SWING':'ul-tab-swing','MICRO_SCALP':'ul-tab-micro'};
+  tabs.forEach(function(t){
+    const el = document.getElementById(ids[t]);
+    if(el){ el.className = t===tab ? 'ul-tab ul-tab-active' : 'ul-tab'; }
+  });
+  const d = window._lastStatusData;
+  if(d) try{ renderUnifiedLearning(d); }catch(e){}
+}
+function renderUnifiedLearning(d){
+  const ul = d.unified_learning;
+  const mod = document.getElementById('mod-unified-learning');
+  if(!mod) return;
+  if(!ul || !ul.available){ mod.style.display='none'; return; }
+  mod.style.display='';
+  window._lastStatusData = d;
+  const content = document.getElementById('ul-content');
+  const simNote = document.getElementById('ul-similar-note');
+  const pb = (ul.playbooks || {})[_ulActiveTab];
+  if(!pb){ if(content) content.textContent = 'No data for this mode.'; return; }
+  if(simNote && ul.similar){
+    const s = ul.similar;
+    simNote.textContent = s.matched ? (s.matched + ' similar trades in memory') : 'No similar trades found';
+  }
+  if(!content) return;
+  const lreColors = {'LIVE_ELIGIBLE':['#14532d','#86efac'],'GHOST_ONLY':['#2a1f00','#fbbf24']};
+  const lc = lreColors[pb.lre_status] || ['#1f2937','#9ca3af'];
+  const lreLabel = pb.lre_status === 'LIVE_ELIGIBLE' ? 'LIVE eligible' :
+                   pb.lre_status === 'GHOST_ONLY' ? 'Ghost mode' : pb.lre_status;
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px;">';
+  function stat(k,v,color){
+    const c = color || '#d1d5db';
+    html += '<div style="background:#0d1117;border-radius:6px;padding:6px 10px;">' +
+            '<div style="font-size:10px;color:#6b7280;">'+k+'</div>' +
+            '<div style="font-size:14px;font-weight:700;color:'+c+';">'+v+'</div></div>';
+  }
+  stat('Samples', pb.n != null ? pb.n : '—');
+  stat('Win Rate', pb.win_rate != null ? pb.win_rate+'%' : '—', pb.win_rate>=55?'#86efac':pb.win_rate<45?'#f87171':'#d1d5db');
+  stat('Expectancy (avg R)', pb.avg_r != null ? (pb.avg_r>=0?'+':'')+pb.avg_r+'R' : '—', pb.avg_r>0?'#86efac':pb.avg_r<0?'#f87171':'#d1d5db');
+  stat('Learning Verdict', pb.learning_verdict || '—');
+  html += '</div>';
+  html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">' +
+          '<span style="font-size:11px;color:#6b7280;">Eligibility:</span>' +
+          '<span style="background:'+lc[0]+';color:'+lc[1]+';border-radius:6px;padding:2px 10px;font-size:11px;font-weight:700;">'+lreLabel+'</span>' +
+          '</div>';
+  if(pb.top_failure){
+    html += '<div style="background:#2a1a1a;border-radius:6px;padding:6px 10px;font-size:11px;color:#f87171;margin-bottom:8px;">' +
+            '<span style="color:#9ca3af;">Top failure: </span>' + esc(pb.top_failure) + '</div>';
+  }
+  const s = ul.similar;
+  if(s && s.ready && s.matched){
+    html += '<div style="background:#0f1f0f;border-radius:6px;padding:8px 10px;font-size:11px;margin-bottom:6px;">' +
+            '<div style="font-weight:700;color:#86efac;margin-bottom:4px;">Similar Trade Memory</div>';
+    if(s.win_rate != null) html += '<div style="color:#9ca3af;">Win rate: <span style="color:#d1d5db;">'+s.win_rate+'%</span></div>';
+    if(s.avg_r != null)    html += '<div style="color:#9ca3af;">Avg R: <span style="color:#d1d5db;">'+(s.avg_r>=0?'+':'')+s.avg_r+'R</span></div>';
+    if(s.top_failure)      html += '<div style="color:#9ca3af;">Common mistake: <span style="color:#f87171;">'+esc(s.top_failure)+'</span></div>';
+    if(s.matched_on && s.matched_on.length) html += '<div style="color:#6b7280;font-size:10px;margin-top:2px;">Matched on: '+esc(s.matched_on.join(', '))+'</div>';
+    html += '</div>';
+  }
+  content.innerHTML = html;
 }
 
 // ── Ask the brain — interactive chat inside Main Brain (DISPLAY-ONLY, read-only) ──

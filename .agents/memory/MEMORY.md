@@ -123,6 +123,7 @@
 - [READY notification path](ready-notification-path.md) — dashboard bell + phone @everyone push are ALREADY built/on-by-default; quiet=WAIT setups (or the user's Discord app settings), NOT a bug; the prod "ANALYSIS_ONLY/DISCORD_LIVE=False" logs are bot2 not the live sender; verify via owner-only /notify-test + the "Test alert" button (its except must never leak str(exc)=webhook token).
 - [Auto Early-Exit](auto-early-exit.md) — armed watcher flattens the bot's OWN position on CONFIRMED-invalid thesis (opposite_confirmed only, never stop_breached); fire-once + opened_at recheck + pop-guarded journal; arm resets OFF on restart.
 - [Manual Desk order](manual-desk-order.md) — flag-gated (MANUAL_ORDER_ENABLED default OFF) discretionary override firing a REAL order regardless of setup via source=manual_desk gateway; server-built ATR bracket, fail-closed, single-slot, owner-only.
+- [Unified Learning Brain](unified-learning-brain.md) — PER_MODE_STATS global (inst,mode key) feeds compute_playbook_selector + compute_unified_learning; display-only cognitive seam; goldens byte-identical.
 
 - [Structure-reversal demote](structure-reversal-demote.md) — SCALP-only flag-gated money path: a fresh opposite BOS/CHOCH >CONFLICT_WINDOW_MIN newer NULLs the STALE side's structure credit (demote-only, single write point, shares the 10-min window w/ opposing_present); default OFF byte-identical, own smoke not goldens.
 
