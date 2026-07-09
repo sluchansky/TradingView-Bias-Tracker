@@ -1,0 +1,120 @@
+Upgrade the Session Story panel from a simple event log into a true AI Market Memory / Analyst Notebook.
+
+Right now the panel lists events like:
+- Edge jumped to 73
+- Price lost VWAP
+- Market phase: Trend Exhausted
+- Edge dropped to 40
+
+That is useful, but I want it to explain what those events mean and how they affect the current trade thesis.
+
+Build the Session Story as a professional analyst-style summary with these sections:
+
+1. Current Bias
+Show:
+- Bullish / Bearish / Neutral
+- Probability estimate
+- Why the bias exists
+
+Example:
+Current Bias: Bearish 62%
+Reason: Price lost VWAP, trend is mature/exhausted, rallies are failing, sellers are still in short-term control.
+
+2. Market Character
+Show the current market state:
+- Consolidation
+- Pullback
+- Trend Mature
+- Trend Exhausted
+- Breakout Attempt
+- Failed Breakout
+- Liquidity Sweep
+- Mean Reversion
+- Continuation
+
+Do not just log the phase. Explain what it means.
+
+Example:
+Market Character: Trend Exhausted
+Meaning: The move has already traveled far enough that chasing short entries is lower quality. Wait for a clean pullback, liquidity sweep, or fresh CHOCH before entering.
+
+3. Current Thesis
+Create a plain-English thesis.
+
+Example:
+The market is leaning short, but the short is not clean enough yet. Sellers are in control, but price is extended. The bot should wait for a liquidity sweep, failed VWAP reclaim, or CHOCH before taking action.
+
+4. Most Likely Next Move
+Show probabilities:
+- Bearish continuation %
+- Range / chop %
+- Bullish reversal %
+
+Example:
+Most Likely Next:
+Bearish continuation: 60%
+Range/chop: 28%
+Bullish reversal: 12%
+
+5. Key Memory From Today
+Instead of only logging events, summarize what the bot has learned today.
+
+Examples:
+- Every VWAP reclaim has failed so far.
+- Long continuation attempts have been weak.
+- Sellers controlled NY open.
+- The best shorts came after failed rallies, not after chasing lows.
+- Liquidity sweeps are producing better setups than breakout entries.
+
+6. Trade Instructions
+At the bottom, show exactly what the bot is waiting for.
+
+Example:
+Decision: WAIT
+
+Do not short weakness.
+
+Wait for:
+- Liquidity sweep above a prior high
+- Failed VWAP reclaim
+- Bearish CHOCH
+- Delta weakening
+- Clean stop location
+
+Invalid if:
+- Price closes above VWAP
+- Delta expands bullish
+- Structure flips higher high / higher low
+
+7. Event Timeline
+Keep the timeline, but make each event explain impact.
+
+Instead of:
+Edge jumped to 73
+
+Say:
+08:47 - Edge jumped to 73 because price reclaimed VWAP and momentum improved. This briefly supported a long thesis.
+
+Instead of:
+Edge dropped to 40
+
+Say:
+09:18 - Edge dropped to 40 because VWAP reclaim failed and momentum weakened. Long thesis is no longer trusted.
+
+8. Bot Self-Reflection
+Add a short “Analyst Note” line.
+
+Example:
+Analyst Note:
+I am leaning short, but I do not want to chase a mature move. I need either a pullback into resistance or a fresh liquidity sweep before this becomes tradeable.
+
+Important:
+This should not add new trade entries by itself. It should only improve explanation, memory, and decision clarity.
+
+Goal:
+Make Session Story feel like an analyst sitting next to me explaining:
+- What happened
+- What it means
+- What the bot learned
+- What it is waiting for
+- What would invalidate the idea

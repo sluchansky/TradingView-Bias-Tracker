@@ -16601,12 +16601,211 @@ def _mb_narrative_expectation(result):
         return "—"
 
 
+_PHASE_ANALYST_MEANINGS = {
+    "Trend Mature":     "The trend is established but extended. Continuation entries carry more risk from here — prefer pullbacks into VWAP or structure for better R:R.",
+    "Trend Exhausted":  "The move has already traveled far enough that chasing entries is low quality. Wait for a clean pullback, liquidity sweep, or CHOCH before entering.",
+    "Trend Beginning":  "A fresh directional move is starting. Structure has broken and the trade is early — better R:R is available now than later.",
+    "Trend Developing": "A directional lean is building but not yet fully confirmed. The setup is forming — watch for structure + volume agreement.",
+    "Consolidation":    "Price is compressing with no clear directional edge. The market is building energy before a breakout or breakdown — wait for a decisive move.",
+    "Pullback":         "The market is pulling back against the primary trend. This is often the highest-quality entry zone — look for absorption and a directional hold.",
+    "Reversal Watch":   "A liquidity sweep with change of character suggests the prior move may be ending. Caution on continuation — watch for the new direction to confirm.",
+    "Breakout":         "Price is expanding structure with volume. Trade the follow-through, not the anticipation.",
+    "Ranging":          "Price is oscillating between defined levels with no trend. Fade the extremes; avoid breakout entries without strong volume confirmation.",
+    "Mean Reversion":   "Price has extended and is snapping back to value. Aggressive trend entries are lower probability here.",
+    "Developing":       "The session is still establishing its character. Patterns are not yet clear enough to commit to a strong directional bias.",
+}
+
+
+def _mb_analyst_notebook(result, inst, all_rows=None):
+    """Generate the 8-section AI Analyst Notebook from the assembled result.
+    DISPLAY-ONLY + FAIL-OPEN: returns an empty dict on any error so the panel
+    simply shows its defaults. Never touches the gate / scoring / sizing."""
+    try:
+        analyst   = result.get("analyst")   or {}
+        phase_blk = analyst.get("market_phase") or {}
+        outlook   = analyst.get("analyst_outlook") or {}
+        game_plan = analyst.get("game_plan") or {}
+        mb        = result.get("main_brain") or {}
+        preds_blk = result.get("main_brain_predictions") or {}
+
+        # ── 1. Current Bias ──────────────────────────────────────────────────────────────
+        fav  = str(mb.get("favored_direction") or "Neither")
+        dyn  = game_plan.get("dynamic_confidence") or {}
+        def _pc(k):
+            try:    return max(0, min(100, int(round(float(dyn.get(k) or 0)))))
+            except: return 0
+        c_long, c_short, c_neut = _pc("long"), _pc("short"), _pc("neutral")
+        total_dyn = c_long + c_short + c_neut
+        if total_dyn <= 0:
+            c_long = c_short = c_neut = 33
+            total_dyn = 99
+        # Derive bias direction; clamp probability so a lean shows >=30%
+        control   = str(outlook.get("control") or "").strip()
+        if fav == "Long":
+            bias_dir = "Bullish"
+            bias_pct = max(30, int(round(c_long * 100 / total_dyn))) if c_long > 0 else 50
+        elif fav == "Short":
+            bias_dir = "Bearish"
+            bias_pct = max(30, int(round(c_short * 100 / total_dyn))) if c_short > 0 else 50
+        else:
+            if "buyers" in control.lower():
+                bias_dir = "Bullish"; bias_pct = max(30, int(round(c_long * 100 / total_dyn)))
+            elif "sellers" in control.lower():
+                bias_dir = "Bearish"; bias_pct = max(30, int(round(c_short * 100 / total_dyn)))
+            else:
+                bias_dir = "Neutral"; bias_pct = 50
+        wait_list  = list(outlook.get("wait_reasoning") or [])
+        bias_parts = [control] + [w for w in wait_list[:2] if w and not w.lower().startswith("wait")]
+        bias_reason = " ".join(p for p in bias_parts if p).strip() or "Building a directional case."
+
+        # ── 2. Market Character ────────────────────────────────────────────────────────
+        phase        = str(phase_blk.get("phase") or "Developing")
+        phase_detail = "; ".join((phase_blk.get("reasons") or [])[:3])
+        phase_meaning = _PHASE_ANALYST_MEANINGS.get(
+            phase, "The market is establishing its character — observe before acting.")
+
+        # ── 3. Current Thesis ─────────────────────────────────────────────────────────
+        thesis = str(game_plan.get("thesis") or "").strip()
+        if not thesis:
+            intent = str(outlook.get("market_intent") or "").strip()
+            cvr    = str(outlook.get("continuation_vs_reversal") or "").strip()
+            thesis = " ".join(filter(None, [intent, cvr])).strip() or "Thesis developing."
+
+        # ── 4. Most Likely Next Move ──────────────────────────────────────────────────
+        pred_list = list(preds_blk.get("predictions") or [])
+        if pred_list:
+            next_moves = [{"label": str(p.get("event", "—")),
+                           "pct":   int(p.get("odds_pct") or 0)}
+                          for p in sorted(pred_list, key=lambda x: -(x.get("odds_pct") or 0))[:3]]
+        else:
+            pct_l = int(round(c_long  * 100 / total_dyn))
+            pct_s = int(round(c_short * 100 / total_dyn))
+            pct_n = 100 - pct_l - pct_s
+            if fav == "Long":
+                next_moves = [{"label": "Bullish continuation", "pct": pct_l},
+                              {"label": "Range / chop",         "pct": pct_n},
+                              {"label": "Bearish reversal",     "pct": pct_s}]
+            elif fav == "Short":
+                next_moves = [{"label": "Bearish continuation", "pct": pct_s},
+                              {"label": "Range / chop",          "pct": pct_n},
+                              {"label": "Bullish reversal",      "pct": pct_l}]
+            else:
+                next_moves = [{"label": "Bullish breakout",  "pct": pct_l},
+                              {"label": "Range / chop",       "pct": pct_n},
+                              {"label": "Bearish breakdown",  "pct": pct_s}]
+
+        # ── 5. Key Memory From Today ─────────────────────────────────────────────────────
+        key_memory = []
+        if all_rows:
+            try:
+                from collections import Counter, defaultdict as _dd
+                kinds = Counter(r[0] for r in all_rows)
+                edges_for = _dd(list)
+                for kind, _h, _t, edge in all_rows:
+                    if edge is not None:
+                        try: edges_for[kind].append(float(edge))
+                        except Exception: pass
+                vr, vl = kinds.get("vwap_reclaim", 0), kinds.get("vwap_loss", 0)
+                if vr > 0 and vl > 0:
+                    if vl > vr:
+                        key_memory.append("VWAP reclaims have failed %d time%s today — buyers keep losing the level." % (vl, "s" if vl > 1 else ""))
+                    else:
+                        key_memory.append("Buyers have reclaimed VWAP %d time%s — the level is being defended." % (vr, "s" if vr > 1 else ""))
+                elif vl > 1:
+                    key_memory.append("Price has lost VWAP %d times today — sellers keep pushing back in." % vl)
+                elif vr > 1:
+                    key_memory.append("Multiple VWAP reclaims today — buyers are consistently defending the level.")
+                cf = kinds.get("cvd_flip", 0)
+                if cf >= 2:
+                    key_memory.append("Delta has flipped %d times — two-sided activity; avoid heavy directional bias." % cf)
+                ph = kinds.get("phase", 0)
+                if ph >= 2:
+                    key_memory.append("Market character has shifted %d times — not a clean trending session." % ph)
+                em_vals = edges_for.get("edge_move", [])
+                if len(em_vals) >= 2:
+                    avg_em = sum(em_vals) / len(em_vals)
+                    if avg_em > 60:
+                        key_memory.append("Edge has been building strength today — momentum is accumulating.")
+                    elif avg_em < 40:
+                        key_memory.append("Edge has been declining today — setups are not cleanly developing.")
+                all_edges = [float(e) for (_k, _h, _t, e) in all_rows if e is not None]
+                if len(all_edges) >= 4:
+                    mx, mn = max(all_edges), min(all_edges)
+                    if mx - mn > 35:
+                        key_memory.append("Edge has swung widely today (%.0f–%.0f) — volatile setup quality." % (mn, mx))
+            except Exception:
+                pass
+        if not key_memory:
+            key_memory = ["Session is early — not enough history to extract clear lessons yet."]
+
+        # ── 6. Trade Instructions ──────────────────────────────────────────────────────────
+        verdict_str = str(result.get("verdict") or "WAIT").upper()
+        is_ready    = verdict_str.startswith("READY")
+        nhe         = str(outlook.get("next_high_probability_entry") or "").strip()
+        gp_wait     = list((game_plan.get("next_opportunity") or {}).get("waiting_for") or [])
+        wait_for    = []
+        if not is_ready:
+            if nhe:
+                wait_for.append(nhe)
+            for w in gp_wait[:3]:
+                if w and w not in wait_for:
+                    wait_for.append(str(w))
+        invalid_raw = str(outlook.get("invalidates") or game_plan.get("invalidation") or "").strip()
+        cancels     = str(outlook.get("cancels_setup") or "").strip()
+        invalid_if  = []
+        if invalid_raw and invalid_raw not in ("—", ""):
+            invalid_if.append(invalid_raw)
+        if cancels and cancels not in invalid_if:
+            invalid_if.append(cancels)
+        if is_ready:
+            instruction = "Setup is active — the edge qualifies for entry now."
+        elif fav == "Long":
+            instruction = "Do not chase the long. Wait for price to pull back to value."
+        elif fav == "Short":
+            instruction = "Do not short weakness. Wait for a rally into resistance."
+        else:
+            instruction = "Stay flat. Wait for one side to take clear control."
+
+        # ── 8. Analyst Note (first-person) ──────────────────────────────────────────────────
+        cvr    = str(outlook.get("continuation_vs_reversal") or "").strip()
+        wait_r = str(wait_list[0]) if wait_list else ""
+        if is_ready:
+            note = "The setup meets my criteria. I am ready to act with the plan."
+        elif fav == "Long":
+            note = "I am leaning long but I need a better entry. " + (wait_r or "Patience improves entry quality.")
+        elif fav == "Short":
+            note = "I am leaning short but I do not want to chase a mature move. " + (wait_r or "Patience improves entry quality.")
+        else:
+            note = "No clear directional edge yet. " + (cvr or "I am watching for one side to take control.")
+
+        return {
+            "bias":               {"direction": bias_dir, "probability": bias_pct, "reason": bias_reason},
+            "market_character":   {"phase": phase, "meaning": phase_meaning, "detail": phase_detail},
+            "thesis":             thesis,
+            "next_moves":         next_moves,
+            "key_memory":         key_memory,
+            "trade_instructions": {
+                "verdict":     verdict_str,
+                "is_ready":    is_ready,
+                "instruction": instruction,
+                "wait_for":    wait_for[:5],
+                "invalid_if":  invalid_if[:3],
+            },
+            "analyst_note": note.strip(),
+        }
+    except Exception as exc:
+        logger.debug("_mb_analyst_notebook failed (fail-open): %s", exc)
+        return {}
+
+
+
 def compute_market_narrative(result, inst):
     """Synthesize the session story at READ time from persisted market_events grouped
     Overnight / London / NY Open / NY Session, plus a live Current + Expectation line.
     Facts persisted, prose generated here. Capped, short-TTL-cached. Pure + FAIL-OPEN."""
     def _produce():
         segments = []
+        all_rows_for_nb = []
         if MARKET_EVENTS_DB_READY and inst:
             conn = _learning_conn()
             if conn is not None:
@@ -16621,6 +16820,8 @@ def compute_market_narrative(result, inst):
                                ORDER BY event_ts ASC LIMIT 300""", (inst,))
                         rows = cur.fetchall()
                     grouped = {}
+                    all_rows_for_nb = [(kind, headline, ts, edge)
+                                       for _seg, kind, headline, ts, edge in rows]
                     for seg, kind, headline, ts, edge in rows:
                         grouped.setdefault(seg or "Overnight", []).append((kind, headline, ts, edge))
                     for seg in ("Overnight", "London", "NY Open", "NY Session"):
@@ -16641,8 +16842,9 @@ def compute_market_narrative(result, inst):
         current     = _mb_narrative_current(result, inst)
         expectation = _mb_narrative_expectation(result)
         avail       = bool(segments) or bool(result.get("market_open", True))
+        notebook    = _mb_analyst_notebook(result, inst, all_rows=all_rows_for_nb)
         return {"available": avail, "segments": segments, "current": current,
-                "expectation": expectation,
+                "expectation": expectation, "notebook": notebook,
                 "reason": None if avail else "No session story yet."}
     res = _mb_cached(("narr", inst), 12.0, _produce)
     return res if isinstance(res, dict) else _market_narrative_neutral()
@@ -37437,10 +37639,35 @@ def dashboard():
 </div>
 
 <div class="mod" id="mod-mb-narrative">
-  <div class="mod-h">📖 Session Story</div>
-  <div id="mbn-current" class="mb-summary">—</div>
-  <div id="mbn-expect" style="font-size:11px;color:#9aa3b2;margin-bottom:6px">—</div>
-  <div id="mbn-segments"></div>
+  <div class="mod-h">📖 Session Story <span style="font-size:10px;letter-spacing:1.5px;color:#6b7280;margin-left:auto">ANALYST NOTEBOOK</span></div>
+
+  <div class="mb-col-h" style="margin-top:2px;margin-bottom:3px">1 — Current Bias</div>
+  <div id="mbn-bias-row" style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:3px">
+    <span id="mbn-bias-dir" style="font-size:15px;font-weight:700">—</span>
+    <span id="mbn-bias-pct" style="font-size:12px;color:#9ca3af">—</span>
+  </div>
+  <div id="mbn-bias-reason" style="font-size:11px;color:#cdcde0;margin-bottom:10px;line-height:1.5">—</div>
+
+  <div class="mb-col-h" style="margin-bottom:3px">2 — Market Character</div>
+  <div id="mbn-phase" style="font-size:13px;font-weight:700;margin-bottom:3px">—</div>
+  <div id="mbn-phase-meaning" style="font-size:11px;color:#9ca3af;margin-bottom:10px;line-height:1.5">—</div>
+
+  <div class="mb-col-h" style="margin-bottom:3px">3 — Current Thesis</div>
+  <div id="mbn-thesis" style="font-size:11px;color:#cdcde0;margin-bottom:10px;line-height:1.6">—</div>
+
+  <div class="mb-col-h" style="margin-bottom:3px">4 — Most Likely Next Move</div>
+  <div id="mbn-next" style="margin-bottom:10px"></div>
+
+  <div class="mb-col-h" style="margin-bottom:3px">5 — Key Memory From Today</div>
+  <ul id="mbn-memory" class="mb-list" style="margin-bottom:10px"></ul>
+
+  <div class="mb-col-h" style="margin-bottom:3px">6 — Trade Instructions</div>
+  <div id="mbn-instructions" style="margin-bottom:10px"></div>
+
+  <div class="mb-col-h" style="margin-bottom:3px">7 — Event Timeline</div>
+  <ul id="mbn-timeline" class="mb-list" style="margin-bottom:8px"></ul>
+
+  <div id="mbn-analyst-note" style="font-size:11px;color:#9aa3b2;font-style:italic;border-top:1px solid var(--border,#1e2535);padding-top:8px;margin-top:2px">—</div>
 </div>
 
 <div class="mod" id="mod-mb-events">
@@ -40249,23 +40476,152 @@ function renderMBConfidence(d){
 function renderMBNarrative(d){
   const mod=document.getElementById('mod-mb-narrative'); if(!mod) return;
   const n=(d&&d.market_narrative)||null;
-  _mbSetText('mbn-current', n&&n.current);
-  _mbSetText('mbn-expect', n&&n.expectation);
-  const wrap=document.getElementById('mbn-segments');
-  if(wrap){
-    wrap.innerHTML='';
-    const segs=(n&&n.segments)||[];
-    segs.forEach(function(s){
-      const blk=document.createElement('div'); blk.style.cssText='margin-top:8px';
-      const h=document.createElement('div'); h.className='mb-col-h'; h.textContent=(s.segment||'—');
-      blk.appendChild(h);
-      const sm=document.createElement('div'); sm.style.cssText='font-size:11px;color:#cdcde0;margin:2px 0';
-      sm.textContent=(s.summary||''); blk.appendChild(sm);
-      const ul=document.createElement('ul'); ul.className='mb-list';
-      (s.events||[]).forEach(function(evt){ const li=document.createElement('li'); li.textContent=evt; ul.appendChild(li); });
-      blk.appendChild(ul);
-      wrap.appendChild(blk);
-    });
+  const nb=(n&&n.notebook)||null;
+  const evts=(d&&d.market_events_timeline&&d.market_events_timeline.events)||[];
+
+  // ── 1. Current Bias ────────────────────────────────────────────────────────
+  const bias=(nb&&nb.bias)||null;
+  const dirEl=document.getElementById('mbn-bias-dir');
+  const pctEl=document.getElementById('mbn-bias-pct');
+  const reaEl=document.getElementById('mbn-bias-reason');
+  if(bias){
+    const dc=bias.direction==='Bullish'?'#22c55e':bias.direction==='Bearish'?'#ef4444':'#9ca3af';
+    if(dirEl){ dirEl.textContent=bias.direction||'\u2014'; dirEl.style.color=dc; }
+    if(pctEl) pctEl.textContent=(bias.probability!=null?bias.probability+'\u202f%':'\u2014');
+    if(reaEl) reaEl.textContent=bias.reason||'\u2014';
+  } else {
+    if(dirEl) dirEl.textContent=(n&&n.current)||'\u2014';
+    if(pctEl) pctEl.textContent='';
+    if(reaEl) reaEl.textContent='';
+  }
+
+  // ── 2. Market Character ───────────────────────────────────────────────────
+  const mc=(nb&&nb.market_character)||null;
+  const phEl=document.getElementById('mbn-phase');
+  const pmEl=document.getElementById('mbn-phase-meaning');
+  if(mc){
+    if(phEl){
+      phEl.textContent=mc.phase||'\u2014';
+      const ph=mc.phase||'';
+      phEl.style.color=ph.includes('Exhausted')?'#f59e0b':
+                       ph.includes('Reversal')?'#a78bfa':
+                       (ph.includes('Beginning')||ph.includes('Pullback')||ph.includes('Continuation'))?'#22c55e':
+                       (ph.includes('Consolidation')||ph.includes('Ranging'))?'#6b7280':'#e2e8f0';
+    }
+    if(pmEl) pmEl.textContent=mc.meaning||'\u2014';
+  } else {
+    if(phEl) phEl.textContent='\u2014';
+    if(pmEl) pmEl.textContent='\u2014';
+  }
+
+  // ── 3. Current Thesis ─────────────────────────────────────────────────────
+  const thEl=document.getElementById('mbn-thesis');
+  if(thEl) thEl.textContent=(nb&&nb.thesis)||(n&&n.current)||'\u2014';
+
+  // ── 4. Most Likely Next Move ──────────────────────────────────────────────
+  const nextEl=document.getElementById('mbn-next');
+  if(nextEl){
+    const moves=(nb&&nb.next_moves)||[];
+    if(moves.length){
+      let h='<div style="display:flex;flex-direction:column;gap:5px">';
+      moves.forEach(function(m){
+        const pct=m.pct||0;
+        const col=pct>=50?'#22c55e':pct>=30?'#f59e0b':'#9ca3af';
+        h+='<div style="display:flex;align-items:center;gap:8px">';
+        h+='<span style="font-size:11px;color:#cdcde0;min-width:155px">'+aiEsc(m.label||'')+'</span>';
+        h+='<div style="flex:1;height:6px;background:#1e2535;border-radius:3px">'
+         +'<div style="width:'+pct+'%;height:100%;background:'+col+';border-radius:3px"></div></div>';
+        h+='<span style="font-size:11px;color:'+col+';font-weight:700;min-width:32px;text-align:right">'+pct+'%</span>';
+        h+='</div>';
+      });
+      h+='</div>';
+      nextEl.innerHTML=h;
+    } else {
+      nextEl.innerHTML='<span style="color:#6b7280;font-size:11px">Calculating\u2026</span>';
+    }
+  }
+
+  // ── 5. Key Memory From Today ──────────────────────────────────────────────
+  const memEl=document.getElementById('mbn-memory');
+  if(memEl){
+    memEl.innerHTML='';
+    const mems=(nb&&nb.key_memory)||[];
+    if(mems.length){
+      mems.forEach(function(m){
+        const li=document.createElement('li'); li.textContent=m; memEl.appendChild(li);
+      });
+    } else {
+      const li=document.createElement('li'); li.style.color='#6b7280';
+      li.textContent='Session is early \u2014 no lessons extracted yet.'; memEl.appendChild(li);
+    }
+  }
+
+  // ── 6. Trade Instructions ─────────────────────────────────────────────────
+  const instEl=document.getElementById('mbn-instructions');
+  if(instEl&&nb&&nb.trade_instructions){
+    const ti=nb.trade_instructions;
+    const isReady=!!ti.is_ready;
+    const vc=isReady?'#22c55e':'#f59e0b';
+    let h='<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">'
+         +'<span style="font-size:13px;font-weight:700;color:'+vc+'">Decision: '+aiEsc(ti.verdict||'WAIT')+'</span>'
+         +'</div>';
+    h+='<div style="font-size:11px;color:#cdcde0;margin-bottom:6px">'+aiEsc(ti.instruction||'')+'</div>';
+    if(!isReady&&ti.wait_for&&ti.wait_for.length){
+      h+='<div style="font-size:10px;color:#9ca3af;margin-bottom:2px;font-weight:600;letter-spacing:1px">Wait for:</div>';
+      h+='<ul style="margin:0 0 6px 14px;padding:0">';
+      ti.wait_for.forEach(function(w){ h+='<li style="font-size:11px;color:#cdcde0;margin-bottom:2px">'+aiEsc(w)+'</li>'; });
+      h+='</ul>';
+    }
+    if(ti.invalid_if&&ti.invalid_if.length){
+      h+='<div style="font-size:10px;color:#ef4444;margin-bottom:2px;font-weight:600;letter-spacing:1px">Invalid if:</div>';
+      h+='<ul style="margin:0 0 0 14px;padding:0">';
+      ti.invalid_if.forEach(function(w){ h+='<li style="font-size:11px;color:#fca5a5;margin-bottom:2px">'+aiEsc(w)+'</li>'; });
+      h+='</ul>';
+    }
+    instEl.innerHTML=h;
+  }
+
+  // ── 7. Event Timeline (enriched with impact) ─────────────────────────────
+  const tlEl=document.getElementById('mbn-timeline');
+  if(tlEl){
+    tlEl.innerHTML='';
+    const _impact={
+      'vwap_reclaim':'Price reclaimed VWAP, shifting near-term context bullish.',
+      'vwap_loss':   'Price lost VWAP, shifting near-term context bearish.',
+      'cvd_flip':    'Order flow reversed \u2014 institutional footprint changed direction.',
+      'phase':       'Market character shifted, changing which setup types are now valid.',
+    };
+    if(!evts.length){
+      const li=document.createElement('li'); li.style.color='#6b7280';
+      li.textContent='No events recorded yet.'; tlEl.appendChild(li);
+    } else {
+      evts.slice(0,12).forEach(function(ev){
+        const li=document.createElement('li'); li.style.marginBottom='6px';
+        const t=document.createElement('span'); t.style.cssText='color:#6b7280;margin-right:6px;font-size:10px';
+        t.textContent=_mbEvT(ev.t); li.appendChild(t);
+        const hd=document.createElement('span'); hd.style.fontWeight='600';
+        hd.textContent=(ev.headline||ev.kind||'\u2014'); li.appendChild(hd);
+        let impact=_impact[ev.kind]||null;
+        if(ev.kind==='edge_move'){
+          const up=(ev.headline&&ev.headline.toLowerCase().indexOf('jumped')>=0);
+          impact=(up?'Edge improved \u2014 setup quality strengthened.':'Edge declined \u2014 setup quality weakened.')
+                +(ev.edge_score!=null?' Edge: '+ev.edge_score+'.':'');
+        }
+        if(impact){
+          const imp=document.createElement('div');
+          imp.style.cssText='font-size:10px;color:#9aa3b2;margin-top:2px;line-height:1.4';
+          imp.textContent=impact; li.appendChild(imp);
+        }
+        tlEl.appendChild(li);
+      });
+    }
+  }
+
+  // ── 8. Analyst Note ───────────────────────────────────────────────────────
+  const noteEl=document.getElementById('mbn-analyst-note');
+  if(noteEl){
+    const note=(nb&&nb.analyst_note)||(n&&n.expectation)||null;
+    noteEl.textContent=note?('Analyst Note: '+note):'\u2014';
   }
 }
 function renderMBEvents(d){
