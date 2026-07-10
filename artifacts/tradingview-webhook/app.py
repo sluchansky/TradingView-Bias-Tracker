@@ -38868,6 +38868,175 @@ def dashboard():
   <span class="adv-hint">extra analysis &amp; simulated panels are hidden — flip on to see everything</span>
 </div>
 
+<style>
+/* ════ COCKPIT MODE (display-only; never touches money path) ════════════ */
+#cp-mode-row{display:flex;gap:6px;justify-content:center;margin:0 0 12px}
+.cp-mode-btn{background:var(--panel);border:1px solid var(--border);color:#6b7280;border-radius:999px;padding:5px 20px;font-size:12px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:all .15s}
+.cp-mode-btn:hover{border-color:rgba(99,102,241,.4);color:#a5b4fc}
+.cp-mode-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
+/* cockpit panel hidden by default; shown when view-live has cp-cockpit class */
+#view-cockpit{display:none}
+#view-live.cp-cockpit #view-cockpit{display:block}
+/* in cockpit mode, hide all engineering panels */
+#view-live.cp-cockpit>*:not(#cp-mode-row):not(#view-cockpit){display:none!important}
+
+/* Mission bar */
+#cp-mission{display:flex;gap:0;flex-wrap:wrap;background:rgba(8,12,24,.75);border:1px solid rgba(99,102,241,.22);border-radius:16px;padding:12px 18px;margin-bottom:14px;align-items:center;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);box-shadow:0 8px 32px rgba(0,0,0,.4)}
+#cp-m-brand{font-size:13px;font-weight:700;color:var(--cyan);letter-spacing:.3px;padding-right:16px;white-space:nowrap}
+.cp-m-sep{width:1px;background:rgba(255,255,255,.07);align-self:stretch;margin:0 14px;flex-shrink:0}
+.cp-mission-item{display:flex;flex-direction:column;gap:2px;padding:2px 0}
+.cp-m-lbl{font-size:9px;letter-spacing:1.5px;color:#4b5563;text-transform:uppercase;font-weight:600}
+.cp-m-val{font-size:14px;font-weight:800;color:#e5e7eb;line-height:1.2}
+@media(max-width:640px){#cp-mission{gap:10px;padding:10px 14px}.cp-m-sep{display:none}}
+
+/* Cards */
+.cp-card{background:rgba(8,12,24,.7);border:1px solid rgba(255,255,255,.06);border-radius:16px;padding:20px 24px;margin-bottom:14px;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px)}
+.cp-card-h{font-size:10px;font-weight:800;letter-spacing:2.5px;color:#4b5563;text-transform:uppercase;margin-bottom:14px}
+.cp-prose{font-size:14px;color:#c9d1e0;line-height:1.85;white-space:pre-wrap;font-family:var(--sans)}
+
+/* Brain card */
+#cp-brain{border:1px solid rgba(99,102,241,.25);background:rgba(6,8,20,.8);min-height:55vh;display:flex;flex-direction:column}
+.cp-brain-section{flex:1;margin-bottom:20px}
+.cp-brain-label{display:inline-flex;align-items:center;gap:8px;font-size:11px;font-weight:800;letter-spacing:2px;color:#6366f1;text-transform:uppercase;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid rgba(99,102,241,.15);width:100%}
+.cp-change-table{width:100%;border-collapse:collapse;margin-top:6px}
+.cp-change-table td{padding:9px 12px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:top}
+.cp-change-table td:first-child{color:#4b5563;white-space:nowrap;width:54px;font-weight:700;font-size:11px;letter-spacing:.5px;padding-top:11px}
+.cp-change-table td:last-child{color:#d1d5db;line-height:1.55}
+
+/* Trade map + learning row */
+#cp-row2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:680px){#cp-row2{grid-template-columns:1fr}}
+.cp-playbook-lbl{font-size:12px;font-weight:700;color:#818cf8;margin-bottom:12px;letter-spacing:.3px}
+.cp-sub{font-size:9px;letter-spacing:1.5px;color:#374151;text-transform:uppercase;font-weight:700;margin-bottom:10px}
+.cp-step{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:13px}
+.cp-step-check{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0}
+.cp-step-done{background:#14532d;color:#86efac}
+.cp-step-pend{background:#1f2937;color:#374151}
+.cp-step-name{flex:1;color:#c9d1e0}
+.cp-step-status{font-size:10px;font-weight:700}
+
+/* Timeline */
+.cp-tl{display:flex;flex-direction:column;gap:0}
+.cp-tl-item{display:flex;align-items:flex-start;gap:10px;padding:7px 0;font-size:12px;border-bottom:1px solid rgba(255,255,255,.04)}
+.cp-tl-time{color:#374151;min-width:36px;flex-shrink:0;padding-top:1px;font-variant-numeric:tabular-nums}
+.cp-tl-icon{width:20px;text-align:center;flex-shrink:0;font-size:14px}
+.cp-tl-msg{color:#9ca3af;line-height:1.4}
+
+/* Ask Brain */
+.cp-ask-btn{background:#111827;border:1px solid #1f2937;color:#6b7280;border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.cp-ask-btn:hover{border-color:#6366f1;color:#a5b4fc;background:#0f172a}
+#cp-chat-log{max-height:240px;overflow-y:auto;padding:4px 0}
+#cp-chat-input{background:#0d1117;border:1px solid #1f2937;border-radius:8px;padding:8px 14px;color:#e5e7eb;font-size:13px;font-family:var(--sans);outline:none;transition:border-color .15s}
+#cp-chat-input:focus{border-color:#6366f1}
+</style>
+
+<!-- COCKPIT / ENGINEERING MODE TOGGLE -->
+<div id="cp-mode-row">
+  <button id="cp-btn-cockpit" class="cp-mode-btn active" onclick="setCpMode('cockpit')">&#127919; Cockpit</button>
+  <button id="cp-btn-eng"     class="cp-mode-btn"        onclick="setCpMode('engineering')">&#9881; Engineering</button>
+</div>
+
+<!-- COCKPIT VIEW (shown only when #view-live has class cp-cockpit) -->
+<div id="view-cockpit">
+
+  <!-- MISSION CONTROL BAR -->
+  <div id="cp-mission">
+    <div id="cp-m-brand">&#129302; AI Trading Partner</div>
+    <div class="cp-m-sep"></div>
+    <div class="cp-mission-item">
+      <div class="cp-m-lbl">Market</div>
+      <div class="cp-m-val" id="cp-m-market">&#8212;</div>
+    </div>
+    <div class="cp-m-sep"></div>
+    <div class="cp-mission-item">
+      <div class="cp-m-lbl">Current Mission</div>
+      <div class="cp-m-val" id="cp-m-mission">&#8212;</div>
+    </div>
+    <div class="cp-m-sep"></div>
+    <div class="cp-mission-item">
+      <div class="cp-m-lbl">Brain State</div>
+      <div class="cp-m-val" id="cp-m-brainstate">&#8212;</div>
+    </div>
+    <div class="cp-m-sep"></div>
+    <div class="cp-mission-item">
+      <div class="cp-m-lbl">Confidence</div>
+      <div class="cp-m-val" id="cp-m-conf">&#8212;</div>
+    </div>
+    <div class="cp-m-sep"></div>
+    <div class="cp-mission-item">
+      <div class="cp-m-lbl">Live</div>
+      <div class="cp-m-val" id="cp-m-live">&#8212;</div>
+    </div>
+    <div class="cp-m-sep"></div>
+    <div class="cp-mission-item">
+      <div class="cp-m-lbl">Risk</div>
+      <div class="cp-m-val" id="cp-m-risk">&#8212;</div>
+    </div>
+  </div>
+
+  <!-- AI BRAIN CARD (60% of screen) -->
+  <div class="cp-card" id="cp-brain">
+    <div class="cp-brain-section">
+      <div class="cp-brain-label">&#129504; What I See</div>
+      <div class="cp-prose" id="cp-see">Loading…</div>
+    </div>
+    <div class="cp-brain-section">
+      <div class="cp-brain-label">&#129504; What I'm Doing</div>
+      <div class="cp-prose" id="cp-doing">Loading…</div>
+    </div>
+    <div class="cp-brain-section" style="margin-bottom:0">
+      <div class="cp-brain-label">&#129504; What Would Change My Mind</div>
+      <table class="cp-change-table">
+        <tr><td>Exit</td><td id="cp-exit-cond">&#8212;</td></tr>
+        <tr><td>Add</td><td id="cp-add-cond">&#8212;</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- TRADE MAP + LEARNING MEMORY (side by side) -->
+  <div id="cp-row2">
+    <!-- Trade Map -->
+    <div class="cp-card" id="cp-trademap">
+      <div class="cp-card-h">&#128203; Trade Map</div>
+      <div class="cp-sub">Current Playbook</div>
+      <div class="cp-playbook-lbl" id="cp-playbook">&#8212;</div>
+      <div class="cp-sub">Progress</div>
+      <div id="cp-progress-list"></div>
+    </div>
+    <!-- Learning Memory -->
+    <div class="cp-card" id="cp-learning-card">
+      <div class="cp-card-h">&#129516; Learning Memory</div>
+      <div class="cp-prose" id="cp-learning-prose">Loading…</div>
+    </div>
+  </div>
+
+  <!-- TIMELINE (event log) -->
+  <div class="cp-card" id="cp-timeline-card">
+    <div class="cp-card-h">&#9201; Timeline</div>
+    <div class="cp-tl" id="cp-timeline-list">
+      <div style="font-size:12px;color:#374151;padding:6px 0">Timeline builds as the market moves…</div>
+    </div>
+  </div>
+
+  <!-- ASK MY BRAIN -->
+  <div class="cp-card" id="cp-ask">
+    <div class="cp-card-h">&#128172; Ask My Brain</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+      <button class="cp-ask-btn" onclick="cpAsk('Why are you waiting?')">Why wait?</button>
+      <button class="cp-ask-btn" onclick="cpAsk('What are you seeing right now in the market?')">What are you seeing?</button>
+      <button class="cp-ask-btn" onclick="cpAsk('What would invalidate this setup?')">What invalidates?</button>
+      <button class="cp-ask-btn" onclick="cpAsk('Show me the learning proof for this setup type')">Show learning proof</button>
+      <button class="cp-ask-btn" onclick="cpAsk('Should I manually intervene with your current position?')">Should I interfere?</button>
+    </div>
+    <div id="cp-chat-log"></div>
+    <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+      <input id="cp-chat-input" type="text" placeholder="Ask anything about the current setup…" style="flex:1" onkeydown="if(event.key==='Enter')cpAsk()">
+      <button class="cp-ask-btn" onclick="cpAsk()" style="padding:8px 18px;flex-shrink:0">Send</button>
+    </div>
+  </div>
+
+</div><!-- /#view-cockpit -->
+
 <!-- Status card -->
 <div id="status-card">
   <div id="status-label">Current Status</div>
@@ -41387,6 +41556,7 @@ function gaugeColor(v,prob){
 }
 function renderModules(d){
   if (!d) return;
+  try{ renderCockpit(d); }catch(e){}
   renderMainBrain(d);
   window._mscPageData = d;
   var _mscMainInst = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '';
@@ -43715,6 +43885,385 @@ function asReject(hyp_key){
 }
 _asFetch();
 setInterval(_asFetch, 120000);
+
+// ══════════════════ COCKPIT MODE (display-only AI summary view) ═══════════
+// Reads from lastRec (same 3s poll as engineering mode). Never touches the
+// money path, gate, scoring, or broker. All prose is derived client-side from
+// existing /status keys — no new backend endpoints required.
+// Invariants: fail-silently (wrapped in try/catch in renderModules), never
+// mutates lastRec, no innerHTML from server text (textContent only).
+
+let _cpMode = (function(){ try{ return localStorage.getItem('cpMode')||'cockpit'; }catch(e){ return 'cockpit'; } })();
+let _cpTimeline = [];
+let _cpLastVerdict = null;
+let _cpLastHasAt   = null;
+let _cpLastEdge    = null;
+let _cpChatBusy    = false;
+
+// ── Cockpit mode toggle (persisted per-device, display-only) ──────────────
+function setCpMode(mode){
+  _cpMode = mode;
+  try{ localStorage.setItem('cpMode', mode); }catch(e){}
+  var vl = document.getElementById('view-live');
+  if(vl){ if(mode==='cockpit') vl.classList.add('cp-cockpit'); else vl.classList.remove('cp-cockpit'); }
+  var bc = document.getElementById('cp-btn-cockpit');
+  var be = document.getElementById('cp-btn-eng');
+  if(bc) bc.classList.toggle('active', mode==='cockpit');
+  if(be) be.classList.toggle('active', mode!=='cockpit');
+}
+// Apply saved mode on page load (script is at bottom — DOM is ready)
+(function(){
+  var vl = document.getElementById('view-live');
+  if(_cpMode==='cockpit'&&vl) vl.classList.add('cp-cockpit');
+  var bc = document.getElementById('cp-btn-cockpit');
+  var be = document.getElementById('cp-btn-eng');
+  if(bc) bc.classList.toggle('active', _cpMode==='cockpit');
+  if(be) be.classList.toggle('active', _cpMode!=='cockpit');
+  // Seed the timeline with a startup event
+  _cpTimeline.push({time:(function(){ return new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}); })(), icon:'&#128300;', msg:'Dashboard loaded — watching the tape'});
+})();
+
+// ── Natural-language interpretation helpers ───────────────────────────────
+function _cpBrainState(d){
+  var at = d.active_trade;
+  if(at){
+    var r = parseFloat(at.r_multiple||0);
+    if(r>1.0)  return 'ATTACKING';
+    if(r<-0.5) return 'DEFENDING';
+    return 'MANAGING';
+  }
+  var v = (d.verdict||'').toUpperCase();
+  if(v.indexOf('READY')>=0) return 'ATTACKING';
+  if((d.edge_score||0)>=55) return 'HUNTING';
+  return 'PATIENT';
+}
+function _cpBrainStateColor(s){
+  return {PATIENT:'#6b7280',HUNTING:'#fbbf24',ATTACKING:'#22c55e',MANAGING:'#60a5fa',DEFENDING:'#f87171'}[s]||'#9ca3af';
+}
+function _cpMission(d){
+  var at = d.active_trade;
+  if(at) return 'MANAGING '+(at.direction||'').toUpperCase();
+  var v = (d.verdict||'').toUpperCase();
+  if(v.indexOf('READY')>=0){
+    var dirs=d.directions||{};
+    var longA=dirs.Long&&dirs.Long.is_actionable;
+    var shortA=dirs.Short&&dirs.Short.is_actionable;
+    return 'READY TO ENTER '+(longA?'LONG':shortA?'SHORT':'');
+  }
+  return 'MONITORING';
+}
+function _cpEdgeNarr(d){
+  var score  = d.edge_score||0;
+  var reason = (d.strict_reason||d.gate_debug||'').toLowerCase();
+  if(score>=85) return 'All key factors aligned — strong edge.';
+  if(score>=70) return 'Good edge. Most confirmations in place.';
+  if(score>=55) return 'Edge is building. A few more confirmations needed.';
+  if(reason.indexOf('zone')>=0)    return 'Edge is low — no demand or supply zone is currently active.';
+  if(reason.indexOf('struct')>=0||reason.indexOf('bos')>=0||reason.indexOf('choch')>=0)
+                                   return 'Edge is low — structure confirmation (BOS/CHOCH) is missing.';
+  if(reason.indexOf('vwap')>=0)    return 'Edge is low — price not favorably positioned vs VWAP.';
+  if(reason.indexOf('cvd')>=0)     return 'Edge is low — order flow not confirming the direction.';
+  if(reason.indexOf('conflict')>=0)return 'Long and short signals are conflicting — staying flat.';
+  if(score>=40) return 'Edge is low. Key setup conditions have not aligned.';
+  return 'No trade setup present. Waiting for conditions to develop.';
+}
+function _cpVwapNarr(d){
+  var price=parseFloat(d.price||0), vwap=parseFloat(d.vwap_value||0);
+  if(!price||!vwap) return '';
+  if(price>vwap+0.5)  return 'Price is trading above VWAP — buyers in control.';
+  if(price<vwap-0.5)  return 'Price is trading below VWAP — sellers in control.';
+  return 'Price is sitting at VWAP — a critical decision zone.';
+}
+function _cpCvdNarr(d){
+  var diag=d.alert_diagnostics||{};
+  var cb=diag.cvd_bias||d.cvd_bias||'';
+  if(cb==='bullish') return 'Buyers are in control of order flow.';
+  if(cb==='bearish') return 'Sellers are becoming more aggressive.';
+  return 'Order flow is neutral — no clear directional pressure.';
+}
+function _cpVolNarr(d){
+  var diag=d.alert_diagnostics||{};
+  var r=diag.volatility_regime||d.volatility_regime||'';
+  if(r==='high'||r==='extreme') return 'High volatility — wider swings expected.';
+  if(r==='low')                  return 'Low volatility — tight price action.';
+  return 'Normal volatility environment.';
+}
+function _cpWhatISee(d){
+  var at=d.active_trade;
+  var ticker=String(d.active_ticker||d.ticker||'the market').replace('1!','');
+  var parts=[];
+  if(at){
+    var dir=(at.direction||'').toLowerCase();
+    var entry=at.entry||at.opened_price;
+    var es=entry?' from '+parseFloat(entry).toFixed(1):'';
+    parts.push('I am managing a '+ticker+' '+dir+' position'+es+'.');
+    parts.push('');
+  }
+  var analyst=d.analyst||{};
+  var reasoning=(analyst.reasoning||analyst.outlook||analyst.market_bias_reasoning||'').trim();
+  if(reasoning.length>20){
+    parts.push(reasoning.length>300?reasoning.slice(0,300)+'...':reasoning);
+  } else {
+    var vn=_cpVwapNarr(d); if(vn) parts.push(vn);
+    parts.push(_cpEdgeNarr(d));
+    var cn=_cpCvdNarr(d); if(cn&&cn.indexOf('neutral')<0) parts.push(cn);
+    parts.push(_cpVolNarr(d));
+  }
+  return parts.filter(Boolean).join('\\n');
+}
+function _cpWhatImDoing(d){
+  var at=d.active_trade;
+  var v=(d.verdict||'').toUpperCase();
+  if(at){
+    var r=parseFloat(at.r_multiple||0);
+    var lines=[];
+    if(r>0.5)       lines.push('Holding. Letting the trade run.');
+    else if(r<-0.5) lines.push('Defending. Monitoring the position closely.');
+    else            lines.push('Holding. Position is near entry — watching for confirmation.');
+    var analyst=d.analyst||{};
+    var gameplan=analyst.game_plan||{};
+    var rec=(gameplan.recommendation||'').trim();
+    if(rec&&rec.length>5&&rec.length<200){ lines.push(''); lines.push(rec); }
+    return lines.join('\\n');
+  }
+  if(v.indexOf('READY')>=0){
+    var dirs=d.directions||{};
+    var longA=dirs.Long&&dirs.Long.is_actionable;
+    var shortA=dirs.Short&&dirs.Short.is_actionable;
+    var side=longA?'long':shortA?'short':'';
+    return 'Ready to enter'+(side?' '+side:'')+'.\\n\\nAll required conditions are met.';
+  }
+  var reason=(d.strict_reason||d.gate_debug||'').toLowerCase();
+  var lines=['Waiting.',''];
+  if(reason.indexOf('zone')>=0)           lines.push('No active demand or supply zone present.');
+  else if(reason.indexOf('struct')>=0||reason.indexOf('bos')>=0||reason.indexOf('choch')>=0)
+                                          lines.push('Waiting for structure confirmation (BOS or CHOCH).');
+  else if(reason.indexOf('vwap')>=0)      lines.push('Price position vs VWAP does not confirm the direction.');
+  else if(reason.indexOf('cvd')>=0)       lines.push('Order flow is not aligned with the trade direction.');
+  else if(reason.indexOf('conflict')>=0)  lines.push('Long and short signals are conflicting — staying neutral.');
+  else                                    lines.push('Monitoring. No setup has met all required conditions.');
+  return lines.join('\\n');
+}
+function _cpChangeMind(d){
+  var at=d.active_trade, tp=d.trade_plan||{};
+  var exitC='Opposite BOS/CHOCH confirming a reversal';
+  var addC='All gate conditions confirmed simultaneously';
+  if(at&&at.stop){
+    var isShort=(at.direction||'').toLowerCase()==='short';
+    exitC=(isShort?'Break above ':'Break below ')+parseFloat(at.stop).toFixed(1);
+  } else if(tp.stop){
+    exitC='Price reaches stop at '+parseFloat(tp.stop).toFixed(1);
+  }
+  var reason=(d.strict_reason||d.gate_debug||'').toLowerCase();
+  if(at){
+    addC='Confirmed structure + volume return to the zone';
+  } else if(reason.indexOf('struct')>=0||reason.indexOf('bos')>=0||reason.indexOf('choch')>=0){
+    addC='Bullish BOS or CHOCH + volume confirmation';
+  } else if(reason.indexOf('zone')>=0){
+    addC='Price returns to the demand or supply zone';
+  } else if(reason.indexOf('cvd')>=0){
+    addC='CVD aligns with the trade direction';
+  }
+  return {exit:exitC, add:addC};
+}
+function _cpPlaybook(d){
+  var diag=d.alert_diagnostics||{}, dirs=d.directions||{};
+  var dom=diag.dominant_direction||'Long';
+  var dirD=dirs[dom]||{};
+  var confls=((dirD.confluences||[]).concat(d.confluences||[])).join(' ').toLowerCase();
+  var analyst=d.analyst||{}, mb=d.main_brain||{};
+  var name=(analyst.strategy_name||mb.active_strategy||d.strategy_name||'Liquidity Sweep Reversal').replace(/_/g,' ');
+  var ul=d.unified_learning||{}, mode=d.trading_mode||'SCALP';
+  var pb=(ul.playbooks||{})[mode]||{};
+  var steps=[
+    {name:'Liquidity',done:confls.indexOf('sweep')>=0||confls.indexOf('liquidit')>=0||!!diag.sweep_present},
+    {name:'Structure',done:confls.indexOf('bos')>=0||confls.indexOf('choch')>=0||confls.indexOf('structure')>=0||(d.structure||'').indexOf('Y')>=0},
+    {name:'Retest',   done:confls.indexOf('retest')>=0||confls.indexOf('zone')>=0||confls.indexOf('demand')>=0||confls.indexOf('supply')>=0},
+    {name:'Trigger',  done:!!d.is_actionable||(d.verdict||'').toUpperCase().indexOf('READY')>=0},
+    {name:'Learning', done:pb.win_rate!=null&&pb.win_rate>=50},
+  ];
+  return {name:name, steps:steps};
+}
+function _cpLearningProse(d){
+  var ul=d.unified_learning;
+  if(!ul||!ul.available) return 'Learning data not yet available.\\n\\nAs the bot takes more trades, patterns will emerge here.';
+  var mode=d.trading_mode||'SCALP';
+  var pb=(ul.playbooks||{})[mode]||{};
+  var n=pb.n||0;
+  if(!n) return 'Not enough trade history to form a learning model yet.';
+  var similar=ul.similar||{};
+  var lines=[];
+  if(similar.matched>0){
+    lines.push('I found '+similar.matched+' similar '+mode.toLowerCase()+' setups in my memory.');
+  } else {
+    lines.push('Analyzing '+n+' historical '+mode.toLowerCase()+' trades.');
+  }
+  if(pb.win_rate!=null) lines.push('Win rate: '+pb.win_rate+'%');
+  if(pb.avg_r!=null)    lines.push('Expectancy: '+(pb.avg_r>=0?'+':'')+pb.avg_r+'R');
+  if(pb.top_failure){ lines.push(''); lines.push('Biggest lesson:'); lines.push(pb.top_failure); }
+  return lines.join('\\n');
+}
+
+// ── Timeline (client-side event log from status transitions) ─────────────
+function _cpFmtNow(){ return new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}); }
+function _cpTick(icon,msg){ _cpTimeline.unshift({time:_cpFmtNow(),icon:icon,msg:msg}); if(_cpTimeline.length>20) _cpTimeline.length=20; }
+function _cpUpdateTimeline(d){
+  var verdict=(d.verdict||'WAIT').toUpperCase();
+  var hasAt=!!d.active_trade;
+  var edge=Math.round(d.edge_score||0);
+  if(_cpLastVerdict!==null&&_cpLastVerdict!==verdict){
+    if(verdict.indexOf('READY')>=0)              _cpTick('&#128994;','Setup became READY — all conditions met');
+    else if(_cpLastVerdict.indexOf('READY')>=0)  _cpTick('&#128993;','Setup stepped back — conditions changed');
+  }
+  if(_cpLastHasAt!==null){
+    if(hasAt&&!_cpLastHasAt){
+      var at=d.active_trade;
+      var dir=at?(at.direction||''):'';
+      var sym=String(d.active_ticker||'').replace('1!','');
+      _cpTick('&#128994;','Trade opened — '+sym+' '+dir);
+    } else if(!hasAt&&_cpLastHasAt){
+      _cpTick('&#9744;','Position closed');
+    }
+  }
+  if(_cpLastEdge!==null&&_cpLastVerdict===verdict){
+    if(edge-_cpLastEdge>=12) _cpTick('&#128993;','Confidence improved to '+edge+'%');
+    else if(_cpLastEdge-edge>=12) _cpTick('&#128992;','Confidence dropped to '+edge+'%');
+  }
+  _cpLastVerdict=verdict; _cpLastHasAt=hasAt; _cpLastEdge=edge;
+}
+
+// ── Main cockpit renderer (called from renderModules via try/catch) ────────
+function renderCockpit(d){
+  if(!d) return;
+  var vl=document.getElementById('view-live');
+  // Only do full render when cockpit mode is visible (saves compute)
+  if(!vl||!vl.classList.contains('cp-cockpit')) return;
+
+  _cpUpdateTimeline(d);
+
+  // Mission bar helpers
+  var ticker=String(d.active_ticker||d.ticker||'MGC').replace('1!','');
+  var brainState=_cpBrainState(d);
+  var bsColor=_cpBrainStateColor(brainState);
+  var mission=_cpMission(d);
+  var edge=Math.round(d.edge_score||0);
+  var isLive=!!(d.execution_live);
+  var autoMap=d.auto_trade_map||{};
+  var isArmed=isLive&&Object.keys(autoMap).some(function(k){return autoMap[k];});
+  var verdict=(d.verdict||'').toUpperCase();
+  var isReady=verdict.indexOf('READY')>=0;
+  var isManage=!!d.active_trade;
+  var missionColor=isReady?'#22c55e':isManage?'#60a5fa':'#9ca3af';
+  var edgeColor=edge>=70?'#22c55e':edge>=50?'#fbbf24':'#f87171';
+
+  function _sv(id,html){ var el=document.getElementById(id); if(el) el.innerHTML=html; }
+
+  _sv('cp-m-market','<span style="color:#60a5fa;font-weight:800">'+esc(ticker)+'</span>');
+  _sv('cp-m-mission','<span style="color:'+missionColor+';font-weight:800">'+esc(mission)+'</span>');
+  _sv('cp-m-brainstate','<span style="color:'+bsColor+';font-weight:800">'+esc(brainState)+'</span>');
+  _sv('cp-m-conf','<span style="color:'+edgeColor+';font-weight:800">'+edge+'%</span>');
+  _sv('cp-m-live','<span style="color:'+(isLive?'#22c55e':'#6b7280')+';font-weight:700">'+(isLive?(isArmed?'ARMED':'LIVE'):'OFF')+'</span>');
+  var riskOk=!(d.prop_firm_blocked);
+  _sv('cp-m-risk','<span style="color:'+(riskOk?'#22c55e':'#f87171')+';font-weight:700">'+(riskOk?'SAFE':'BLOCKED')+'</span>');
+
+  // AI Brain card — textContent only (never innerHTML from server data)
+  var seeEl=document.getElementById('cp-see');
+  var doEl=document.getElementById('cp-doing');
+  var exitEl=document.getElementById('cp-exit-cond');
+  var addEl=document.getElementById('cp-add-cond');
+  if(seeEl)  seeEl.textContent=_cpWhatISee(d);
+  if(doEl)   doEl.textContent=_cpWhatImDoing(d);
+  var cm=_cpChangeMind(d);
+  if(exitEl) exitEl.textContent=cm.exit;
+  if(addEl)  addEl.textContent=cm.add;
+
+  // Playbook progress
+  var pb=_cpPlaybook(d);
+  var pbEl=document.getElementById('cp-playbook');
+  if(pbEl) pbEl.textContent=pb.name;
+  var pList=document.getElementById('cp-progress-list');
+  if(pList){
+    pList.innerHTML='';
+    pb.steps.forEach(function(s){
+      var row=document.createElement('div');
+      row.className='cp-step';
+      var check=document.createElement('div');
+      check.className='cp-step-check '+(s.done?'cp-step-done':'cp-step-pend');
+      check.innerHTML=s.done?'&#10003;':'&#183;';
+      var name=document.createElement('div');
+      name.className='cp-step-name';
+      name.textContent=s.name;
+      var stat=document.createElement('div');
+      stat.className='cp-step-status';
+      stat.style.color=s.done?'#86efac':'#fbbf24';
+      stat.textContent=s.done?'done':'pending';
+      row.appendChild(check); row.appendChild(name); row.appendChild(stat);
+      pList.appendChild(row);
+    });
+  }
+
+  // Learning Memory
+  var lEl=document.getElementById('cp-learning-prose');
+  if(lEl) lEl.textContent=_cpLearningProse(d);
+
+  // Timeline
+  var tList=document.getElementById('cp-timeline-list');
+  if(tList){
+    tList.innerHTML='';
+    if(!_cpTimeline.length){
+      var ph=document.createElement('div');
+      ph.style.cssText='font-size:12px;color:#374151;padding:6px 0';
+      ph.textContent='Timeline builds as the market moves…';
+      tList.appendChild(ph);
+    } else {
+      _cpTimeline.slice(0,12).forEach(function(ev){
+        var row=document.createElement('div');
+        row.className='cp-tl-item';
+        var tEl=document.createElement('div'); tEl.className='cp-tl-time'; tEl.textContent=ev.time;
+        var iEl=document.createElement('div'); iEl.className='cp-tl-icon'; iEl.innerHTML=ev.icon;
+        var mEl=document.createElement('div'); mEl.className='cp-tl-msg'; mEl.textContent=ev.msg;
+        row.appendChild(tEl); row.appendChild(iEl); row.appendChild(mEl);
+        tList.appendChild(row);
+      });
+    }
+  }
+}
+
+// ── Ask My Brain — cockpit chat (Display-only; reuses /assistant backend) ─
+// Cockpit-scoped: ids cp-chat-log / cp-chat-input / cp-ai-loading.
+// textContent only for AI replies (XSS-safe). Never touches money path.
+function cpAsk(preset){
+  var input=document.getElementById('cp-chat-input');
+  var msg=preset||(input&&input.value.trim())||'';
+  if(!msg||_cpChatBusy) return;
+  if(input) input.value='';
+  _cpChatBusy=true;
+  var log=document.getElementById('cp-chat-log');
+  if(log){
+    var ub=document.createElement('div');
+    ub.style.cssText='background:#1e3a5f;border-radius:10px 10px 2px 10px;padding:8px 12px;margin-bottom:8px;font-size:13px;color:#e5e7eb;text-align:right;line-height:1.5';
+    ub.textContent=msg; log.appendChild(ub);
+    var lb=document.createElement('div');
+    lb.id='cp-ai-loading';
+    lb.style.cssText='color:#6b7280;font-size:12px;padding:4px 0;font-style:italic';
+    lb.textContent='Thinking\u2026'; log.appendChild(lb);
+    log.scrollTop=log.scrollHeight;
+  }
+  fetch(BASE+'assistant',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({messages:[{role:'user',content:msg}]})})
+  .then(function(r){return r.json();})
+  .then(function(data){
+    var lb=document.getElementById('cp-ai-loading'); if(lb) lb.remove();
+    if(log&&data&&data.response){
+      var ab=document.createElement('div');
+      ab.style.cssText='background:#0d1117;border:1px solid #1f2937;border-radius:2px 10px 10px 10px;padding:10px 14px;margin-bottom:10px;font-size:13px;color:#d1d5db;line-height:1.65';
+      ab.textContent=data.response; log.appendChild(ab); log.scrollTop=log.scrollHeight;
+    }
+  })
+  .catch(function(){ var lb=document.getElementById('cp-ai-loading'); if(lb) lb.remove(); })
+  .finally(function(){ _cpChatBusy=false; });
+}
+// ══════════════════ END COCKPIT MODE ══════════════════════════════════════
 
 // ── Ask the brain — interactive chat inside Main Brain (DISPLAY-ONLY, read-only) ──
 // Reuses the existing /assistant backend (grounded on a read-only full_analysis

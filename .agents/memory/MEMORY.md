@@ -136,3 +136,4 @@
 - [Real Learning Rule Engine](learning-rule-engine.md) — GHOST_ONLY/LIVE_ELIGIBLE per-instrument gate in execute_trade_gateway; demote-only FAIL-OPEN; 50-sample threshold; recomputed on every Nth close + boot.
 - [Thesis Tracker system](thesis-tracker.md) — outcome-based analyst memory; snapshot→25-75min resolve→lesson+reflection; pattern memory SQL (≥3 samples); DISPLAY-ONLY/fail-open; _mb_capture_cognitive is the heartbeat hook.
 - [Market Data Engine phases](market-data-engine.md) — Phase 1 done (ALERT-ONLY status panel + Phase 5 staleness gate default-OFF); Phase 2 = Databento (pip available, needs API key); Phases 3-5 follow.
+- [Cockpit Mode \n escape bug](cockpit-mode-escape-bug.md) — JS string literals in Python triple-quoted strings: `\n` (0x5C+0x6E in file) → real newline at Flask render time → JS SyntaxError; fix requires double-backslash `\\n` in source (use byte-level Python replace, NOT the edit tool).
