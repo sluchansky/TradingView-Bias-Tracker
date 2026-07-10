@@ -144,6 +144,37 @@ function fmtTime(ev: TimelineEvent) {
   return "";
 }
 
+function playChihuahuaBark(): void {
+  try {
+    type WinAudio = Window & { webkitAudioContext?: typeof AudioContext };
+    const AudioCtx = window.AudioContext ?? (window as WinAudio).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const bark = (t: number) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sawtooth";
+      o.frequency.setValueAtTime(1100, t);
+      o.frequency.exponentialRampToValueAtTime(680, t + 0.09);
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.22, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+      o.connect(g); g.connect(ctx.destination); o.start(t); o.stop(t + 0.14);
+
+      const o2 = ctx.createOscillator(), g2 = ctx.createGain();
+      o2.type = "square";
+      o2.frequency.setValueAtTime(2200, t);
+      o2.frequency.exponentialRampToValueAtTime(1400, t + 0.07);
+      g2.gain.setValueAtTime(0, t);
+      g2.gain.linearRampToValueAtTime(0.07, t + 0.005);
+      g2.gain.exponentialRampToValueAtTime(0.001, t + 0.10);
+      o2.connect(g2); g2.connect(ctx.destination); o2.start(t); o2.stop(t + 0.11);
+    };
+    const now = ctx.currentTime;
+    bark(now); bark(now + 0.2); bark(now + 0.4);
+    setTimeout(() => ctx.close(), 1000);
+  } catch { /* unsupported */ }
+}
+
 export default function Cockpit() {
   const [activeTicker, setActiveTicker] = useState("MNQ");
   const [drawerOpen, setDrawerOpen]   = useState(false);
@@ -160,9 +191,20 @@ export default function Cockpit() {
   const pwdRef = useRef(pwd);
   pwdRef.current = pwd;
   const loginAttempted = useRef(false);
+  const prevVerdictRef = useRef<string>("");
+  const [barkMuted, setBarkMuted] = useState<boolean>(() => {
+    try { return localStorage.getItem("cockpit_bark_muted") === "1"; } catch { return false; }
+  });
+  const barkMutedRef = useRef(barkMuted);
+  barkMutedRef.current = barkMuted;
 
   const applyData = useCallback((json: StatusData, ticker: string) => {
     if (ticker === activeRef.current) {
+      const newVerdict = json.verdict ?? "";
+      if (newVerdict.includes("READY") && !prevVerdictRef.current.includes("READY") && !barkMutedRef.current) {
+        playChihuahuaBark();
+      }
+      prevVerdictRef.current = newVerdict;
       setData(json);
       setFetchError(null);
     }
@@ -644,6 +686,24 @@ export default function Cockpit() {
         gridColumn: "1 / -1", background: "#090912", borderTop: `1px solid ${C.border}`,
         display: "flex", alignItems: "center", overflowX: "auto", overflowY: "hidden", paddingLeft: "8px",
       }}>
+        {/* Bark mute toggle */}
+        <button
+          onClick={() => setBarkMuted(m => {
+            const next = !m;
+            try { localStorage.setItem("cockpit_bark_muted", next ? "1" : "0"); } catch { /* ignore */ }
+            return next;
+          })}
+          title={barkMuted ? "Unmute chihuahua bark on READY" : "Mute chihuahua bark on READY"}
+          style={{
+            flexShrink: 0, background: "none", border: `1px solid ${C.border}`,
+            borderRadius: "6px", padding: "2px 9px", cursor: "pointer",
+            fontSize: "11px", color: barkMuted ? C.textFaint : C.textDim,
+            marginRight: "8px", whiteSpace: "nowrap",
+          }}
+        >
+          {barkMuted ? "🔇" : "🐕"} {barkMuted ? "bark: off" : "bark: on"}
+        </button>
+
         {timeline.length === 0 ? (
           <span style={{ fontSize: "12px", color: C.textFaint, padding: "0 24px" }}>
             {data ? "No timeline events yet." : "Loading timeline..."}
