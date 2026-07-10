@@ -127,6 +127,7 @@ export default function Cockpit() {
   activeRef.current = activeTicker;
   const pwdRef = useRef(pwd);
   pwdRef.current = pwd;
+  const loginAttempted = useRef(false);
 
   const applyData = useCallback((json: StatusData, ticker: string) => {
     if (ticker === activeRef.current) {
@@ -150,8 +151,11 @@ export default function Cockpit() {
       if (p) headers["Authorization"] = `Basic ${btoa(":" + p)}`;
       const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
       if (res.status === 401) {
+        const hadPwd = !!pwdRef.current;
         setPwd("");
         try { sessionStorage.removeItem("cockpit_pwd"); } catch { /* ignore */ }
+        if (hadPwd && loginAttempted.current) setLoginErr(true);
+        loginAttempted.current = false;
         setShowLogin(true);
         return;
       }
@@ -172,6 +176,7 @@ export default function Cockpit() {
     if (!p) return;
     setPwd(p);
     pwdRef.current = p;
+    loginAttempted.current = true;
     try { sessionStorage.setItem("cockpit_pwd", p); } catch { /* ignore */ }
     setShowLogin(false);
     setLoginInput("");
@@ -337,6 +342,14 @@ export default function Cockpit() {
             <span style={{ fontSize: "8px", color: C.textFaint, letterSpacing: "0.5px" }}>{item.label}</span>
           </button>
         ))}
+        <a href="/api/dashboard" title="Back to dashboard" style={{
+          width: "44px", height: "42px", background: "transparent", border: "none",
+          borderRadius: "10px", cursor: "pointer", textDecoration: "none",
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px",
+        }}>
+          <span style={{ fontSize: "15px", lineHeight: 1 }}>◀</span>
+          <span style={{ fontSize: "7px", color: C.textFaint, letterSpacing: "0.5px" }}>Dash</span>
+        </a>
       </nav>
 
       {/* MAIN BRAIN */}
@@ -575,7 +588,7 @@ export default function Cockpit() {
               <button onClick={() => setDrawerOpen(false)} style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: "20px", color: C.textDim, lineHeight: 1, padding: "0 2px" }}>×</button>
             </div>
             <div style={{ padding: "16px 24px", display: "flex", flexDirection: "column", gap: "8px" }}>
-              <Label>Gate breakdown — {activeTicker}</Label>
+              <Label>{`Gate breakdown — ${activeTicker}`}</Label>
               <div style={{ height: "12px" }} />
               {diagItems.length === 0 ? (
                 <div style={{ fontSize: "12px", color: C.textFaint }}>{data ? "No gate data." : "Loading..."}</div>
@@ -643,6 +656,39 @@ export default function Cockpit() {
                 Cancel
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* LOGIN OVERLAY */}
+      {showLogin && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(7,7,13,0.96)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)" }}>
+          <div style={{ background: C.surface, border: `1px solid ${C.borderMid}`, borderRadius: "20px", padding: "40px 36px", width: "320px", display: "flex", flexDirection: "column", gap: "0px" }}>
+            <div style={{ fontSize: "26px", fontWeight: 800, color: C.textPrimary, letterSpacing: "-0.5px", marginBottom: "6px" }}>🤖 AI Cockpit</div>
+            <div style={{ fontSize: "13px", color: C.textDim, marginBottom: "28px" }}>Enter your dashboard password to connect.</div>
+            <form onSubmit={handleLogin} style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+              <input
+                type="password"
+                autoFocus
+                placeholder="Dashboard password"
+                value={loginInput}
+                onChange={e => { setLoginInput(e.target.value); setLoginErr(false); }}
+                style={{
+                  padding: "13px 16px", background: "rgba(255,255,255,0.04)", border: `1px solid ${loginErr ? "#f87171" : C.borderMid}`,
+                  borderRadius: "12px", color: C.textPrimary, fontSize: "15px", outline: "none",
+                  fontFamily: "inherit", width: "100%", boxSizing: "border-box" as const,
+                }}
+              />
+              {loginErr && <div style={{ fontSize: "12px", color: "#f87171" }}>Incorrect password — try again.</div>}
+              <button type="submit" style={{
+                padding: "13px", background: "linear-gradient(135deg, #6366f1, #818cf8)",
+                border: "none", borderRadius: "12px", cursor: "pointer", fontSize: "14px", fontWeight: 700,
+                color: "#fff", letterSpacing: "0.3px", marginTop: "4px",
+              }}>Connect</button>
+            </form>
+            <a href="/api/dashboard" style={{ marginTop: "20px", fontSize: "12px", color: C.textFaint, textAlign: "center" as const, textDecoration: "none" }}>
+              ← Back to full dashboard
+            </a>
           </div>
         </div>
       )}
