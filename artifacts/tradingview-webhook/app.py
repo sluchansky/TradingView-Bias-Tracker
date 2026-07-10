@@ -37526,6 +37526,23 @@ def dashboard():
   @keyframes mbLivePulse{0%,100%{opacity:1}50%{opacity:.2}}
   .mb-msg-a .mb-msg-who{color:#9d99ff;letter-spacing:.5px}
   .mb-msg-u .mb-msg-who{color:#6b7280}
+  /* ── Main Brain Avatar identity header ── */
+  .mb-av-handle{padding:7px 14px 5px;border-bottom:1px solid rgba(255,255,255,.06);min-height:0;cursor:move;display:flex;align-items:center;gap:8px}
+  .mb-av-handle-lbl{font-size:10px;letter-spacing:2.5px;color:#4b5563;font-weight:700;text-transform:uppercase}
+  .mb-av{text-align:center;padding:20px 16px 14px}
+  .mb-orb{position:relative;width:96px;height:96px;margin:0 auto 14px}
+  .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#3730a3) 42%,var(--orb-c2,#1e1b4b) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(129,140,248,.4)),0 0 72px var(--orb-soft,rgba(129,140,248,.12));animation:orbBreath 3s ease-in-out infinite}
+  .mb-orb-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid var(--orb-glow,rgba(129,140,248,.38));animation:orbRing 3s ease-out infinite;opacity:0}
+  .mb-orb-ring:nth-child(2){animation-delay:1s}
+  .mb-orb-ring:nth-child(3){animation-delay:2s}
+  @keyframes orbBreath{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.07);filter:brightness(1.2)}}
+  @keyframes orbRing{0%{transform:scale(.82);opacity:.8}100%{transform:scale(2.1);opacity:0}}
+  .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:10px;transition:color .5s;text-shadow:0 0 24px currentColor}
+  .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+  .mb-av-sep{color:#2d2d40;font-size:14px}
+  .mb-av-foot{font-size:10px;letter-spacing:.5px;margin-top:10px;display:flex;align-items:center;justify-content:center;gap:10px;color:#4b5563}
+  .mb-av-live{color:#22c55e;animation:mbLivePulse 2.2s ease-in-out infinite}
+  .mb-av #mb-summary{text-align:center;border-left:none;padding:10px 14px;background:rgba(14,12,28,.55);border:1px solid rgba(142,162,255,.12);border-radius:8px;margin-bottom:0;font-size:13px}
   .mb-foot{font-size:10px;color:#6b7280;margin-top:8px;font-style:italic}
   .mb-prop{font-size:11px;color:#a8a8c0;margin-top:8px;padding-top:7px;border-top:1px solid var(--border)}
   .mb-prop-dot{margin-right:6px;font-size:11px}
@@ -38069,11 +38086,21 @@ def dashboard():
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
   <div class="mod" id="mod-brain">
-    <div class="mod-h">🧠 Main Brain
-      <span id="mb-badge" class="mb-badge">…</span>
-      <span style="font-size:11px;color:#22c55e;letter-spacing:1px;margin-left:auto;animation:mbLivePulse 2.2s ease-in-out infinite">● LIVE</span>
+    <div class="mod-h mb-av-handle"><span class="mb-av-handle-lbl">🧠 Main Brain</span><span id="mb-badge" class="mb-badge" style="display:none">…</span></div>
+    <div class="mb-av" id="mb-av">
+      <div class="mb-orb" id="mb-orb">
+        <div class="mb-orb-ring"></div>
+        <div class="mb-orb-ring"></div>
+        <div class="mb-orb-ring"></div>
+        <div class="mb-orb-core"></div>
+      </div>
+      <div class="mb-av-state" id="mb-av-state">OBSERVING</div>
+      <div class="mb-av-meta">
+        <span id="mb-av-market">—</span><span class="mb-av-sep">·</span><span id="mb-av-mode">—</span><span class="mb-av-sep">·</span>Verdict:&nbsp;<span id="mb-av-verdict" style="font-weight:800">—</span>
+      </div>
+      <div id="mb-summary" class="mb-summary">Loading…</div>
+      <div class="mb-av-foot"><span class="mb-av-live">● LIVE</span> <span id="mb-av-age"></span></div>
     </div>
-    <div id="mb-summary" class="mb-summary">Loading…</div>
     <!-- Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (fed by
          main_brain.liquidity_focus). Hidden unless the flag is on and the block is
          present; it never affects the gate, Edge Score or execution. -->
@@ -40764,6 +40791,75 @@ function _anVerdictColor(v){
 // hidden panels used). NEVER recomputes, NEVER touches the money path. Every
 // dynamic string is rendered via textContent / _anFill (escaped). The live
 // conversation is in-memory per-device, per-symbol, deduped and capped.
+// ── Main Brain Avatar — state derivation + orb renderer (DISPLAY-ONLY) ──
+const MB_STATE_PALETTE = {
+  READY:     {c1:'#1a4b2a',c2:'#052e16',glow:'rgba(34,197,94,.58)',soft:'rgba(34,197,94,.16)'},
+  HUNTING:   {c1:'#92400e',c2:'#451a03',glow:'rgba(245,158,11,.58)',soft:'rgba(245,158,11,.17)'},
+  WAITING:   {c1:'#3730a3',c2:'#1e1b4b',glow:'rgba(99,102,241,.44)',soft:'rgba(99,102,241,.12)'},
+  MANAGING:  {c1:'#075985',c2:'#082f49',glow:'rgba(56,189,248,.55)',soft:'rgba(56,189,248,.18)'},
+  DEFENDING: {c1:'#7f1d1d',c2:'#450a0a',glow:'rgba(239,68,68,.65)', soft:'rgba(239,68,68,.22)'},
+  OBSERVING: {c1:'#312e81',c2:'#1e1b4b',glow:'rgba(129,140,248,.38)',soft:'rgba(129,140,248,.10)'},
+  BLOCKED:   {c1:'#1e293b',c2:'#0f172a',glow:'rgba(148,163,184,.28)',soft:'rgba(148,163,184,.07)'},
+};
+const MB_STATE_COLOR = {
+  READY:'#22c55e',HUNTING:'#f59e0b',WAITING:'#818cf8',
+  MANAGING:'#38bdf8',DEFENDING:'#ef4444',OBSERVING:'#6366f1',BLOCKED:'#94a3b8',
+};
+function mbDeriveState(mb){
+  const mr = (mb && mb.management_read) || null;
+  const status = (mb && mb.status) || 'WATCHING';
+  if(mr && mr.status === 'ok'){
+    const r = parseFloat(String(mr.current_r || '0').replace('R','')) || 0;
+    return r < -0.5 ? 'DEFENDING' : 'MANAGING';
+  }
+  if(status === 'READY' || status === 'EARLY') return 'READY';
+  if(status === 'INVALIDATED') return 'BLOCKED';
+  if(status === 'BUILDING') return 'HUNTING';
+  if(status === 'WAIT'){
+    const prog = typeof (mb && mb.mission_progress) === 'number' ? mb.mission_progress : null;
+    return (prog !== null && prog >= 40) ? 'HUNTING' : 'WAITING';
+  }
+  return 'OBSERVING';
+}
+function mbGetMode(){
+  const ms = document.getElementById('mode-micro');
+  if(ms && ms.classList.contains('active')) return 'Micro Scalp';
+  const sc = document.getElementById('mode-scalp');
+  if(sc && sc.classList.contains('active')) return 'Scalp';
+  const sw = document.getElementById('mode-swing');
+  if(sw && sw.classList.contains('active')) return 'Swing';
+  return '—';
+}
+function renderMBAvatar(mb, d){
+  const sk = mbDeriveState(mb);
+  const pal = MB_STATE_PALETTE[sk] || MB_STATE_PALETTE.OBSERVING;
+  const stColor = MB_STATE_COLOR[sk] || '#818cf8';
+  const orb = document.getElementById('mb-orb');
+  if(orb){
+    orb.style.setProperty('--orb-c1', pal.c1);
+    orb.style.setProperty('--orb-c2', pal.c2);
+    orb.style.setProperty('--orb-glow', pal.glow);
+    orb.style.setProperty('--orb-soft', pal.soft);
+  }
+  const stEl = document.getElementById('mb-av-state');
+  if(stEl){ stEl.textContent = sk; stEl.style.color = stColor; }
+  const mktEl = document.getElementById('mb-av-market');
+  if(mktEl) mktEl.textContent = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : (sym || '—');
+  const modeEl = document.getElementById('mb-av-mode');
+  if(modeEl) modeEl.textContent = mbGetMode();
+  const verdEl = document.getElementById('mb-av-verdict');
+  if(verdEl){
+    const vs = (mb && mb.status) || '—';
+    verdEl.textContent = vs;
+    verdEl.style.color = MB_BADGE_COLORS[vs] || '#e8e8f0';
+  }
+  const ageEl = document.getElementById('mb-av-age');
+  if(ageEl){
+    const lu = d && (d.last_updated_et || d.as_of_et || d.last_updated);
+    ageEl.textContent = lu ? ('updated ' + lu) : '';
+    ageEl.style.color = '#4b5563';
+  }
+}
 const MB_BADGE_COLORS = { WATCHING:'#6b7280', BUILDING:'#3b82f6', READY:'#22c55e', WAIT:'#f59e0b', MANAGING:'#a855f7', INVALIDATED:'#ef4444' };
 const MB_RISK_COLORS = { Low:'#22c55e', Medium:'#f59e0b', High:'#ef4444' };
 const LIQ_STATE_COLORS = { none:'#9ca3af', forming:'#3b82f6', confirmed:'#22c55e', failed:'#f59e0b', continuation:'#ef4444' };
@@ -40904,6 +41000,7 @@ function renderMainBrain(d){
   const status = (mb && mb.status) || 'WATCHING';
   const badge = document.getElementById('mb-badge');
   if(badge){ badge.textContent = status; badge.style.background = MB_BADGE_COLORS[status] || '#6b7280'; }
+  renderMBAvatar(mb, d);
   const summary = (mb && mb.summary) || 'Waiting for live data…';
   const sumEl = document.getElementById('mb-summary');
   if(sumEl) sumEl.textContent = summary;
