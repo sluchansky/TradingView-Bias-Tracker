@@ -43917,6 +43917,10 @@ function setCpMode(mode){
   var be = document.getElementById('cp-btn-eng');
   if(bc) bc.classList.toggle('active', mode==='cockpit');
   if(be) be.classList.toggle('active', mode!=='cockpit');
+  // Engineering mode: auto-reveal all panels so the full data grid is visible.
+  // Cockpit mode: collapse back to focused view (turn Advanced off).
+  if(mode==='engineering') _advApply(true);
+  else _advApply(false);
 }
 // Apply saved mode on page load (script is at bottom — DOM is ready)
 (function(){
