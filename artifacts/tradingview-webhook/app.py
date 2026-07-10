@@ -38849,24 +38849,6 @@ def dashboard():
   <button type="button" class="btn" id="btn-share-view" onclick="shareViewLink()">🔗 Share view-only link</button>
 </div>
 
-<div id="view-live">
-
-<!-- Sensitivity (trading mode) -->
-<div id="mode-row">
-  <span id="mode-cap">Sensitivity</span>
-  <div class="mode-seg">
-    <div class="mode-btn" id="mode-scalp" onclick="setMode('SCALP')">SCALP · Sensitive</div>
-    <div class="mode-btn" id="mode-swing" onclick="setMode('SWING')">SWING · Strict</div>
-  </div>
-</div>
-
-<!-- Declutter: Advanced-panels toggle (DISPLAY-ONLY, per-device). Hides all
-     non-core analysis + simulated panels behind one switch for a cleaner default
-     view. Persisted in localStorage('dashAdv'); never touches the money path. -->
-<div id="adv-row">
-  <span id="adv-toggle" role="button" tabindex="0" onclick="toggleAdvPanels()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvPanels();}">🔧 Advanced panels: off</span>
-  <span class="adv-hint">extra analysis &amp; simulated panels are hidden — flip on to see everything</span>
-</div>
 
 <style>
 /* ════ COCKPIT MODE (display-only; never touches money path) ════════════ */
@@ -38929,6 +38911,25 @@ def dashboard():
 #cp-chat-input{background:#0d1117;border:1px solid #1f2937;border-radius:8px;padding:8px 14px;color:#e5e7eb;font-size:13px;font-family:var(--sans);outline:none;transition:border-color .15s}
 #cp-chat-input:focus{border-color:#6366f1}
 </style>
+
+<div id="view-live">
+
+<!-- Sensitivity (trading mode) -->
+<div id="mode-row">
+  <span id="mode-cap">Sensitivity</span>
+  <div class="mode-seg">
+    <div class="mode-btn" id="mode-scalp" onclick="setMode('SCALP')">SCALP · Sensitive</div>
+    <div class="mode-btn" id="mode-swing" onclick="setMode('SWING')">SWING · Strict</div>
+  </div>
+</div>
+
+<!-- Declutter: Advanced-panels toggle (DISPLAY-ONLY, per-device). Hides all
+     non-core analysis + simulated panels behind one switch for a cleaner default
+     view. Persisted in localStorage('dashAdv'); never touches the money path. -->
+<div id="adv-row">
+  <span id="adv-toggle" role="button" tabindex="0" onclick="toggleAdvPanels()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvPanels();}">🔧 Advanced panels: off</span>
+  <span class="adv-hint">extra analysis &amp; simulated panels are hidden — flip on to see everything</span>
+</div>
 
 <!-- COCKPIT / ENGINEERING MODE TOGGLE -->
 <div id="cp-mode-row">
@@ -39379,7 +39380,7 @@ def dashboard():
       <button type="button" id="cp-follow" class="cp-btn" onclick="cpToggleFollow()" title="When ON, the chart snaps to the instrument the bot has a live trade idea on (READY verdict). Clicking a symbol button turns follow off so your pick sticks.">FOLLOW: ON</button>
     </div>
     <div style="position:relative;width:100%;height:420px;border:1px solid var(--border,#2a2a3a);border-radius:8px;overflow:hidden;background:#0d1117">
-      <iframe id="cp-frame" title="TradingView chart" style="position:absolute;inset:0;width:100%;height:100%;border:0" allowfullscreen loading="lazy" referrerpolicy="no-referrer"></iframe>
+      <iframe id="cp-frame" title="TradingView chart" style="position:absolute;inset:0;width:100%;height:100%;border:0" allowfullscreen loading="eager" referrerpolicy="no-referrer"></iframe>
     </div>
     <div class="nf-fid">View-only TradingView embed. TradingView&rsquo;s free embed doesn&rsquo;t license live futures data, so each button shows a 24h proxy feed that moves with your contract (Nasdaq&rarr;MNQ &middot; Gold spot&rarr;MGC &middot; S&amp;P&rarr;MES &middot; Dow&rarr;MYM). Prices differ from the futures quote by a small basis offset, but the candles/levels move together. It never affects alerts, tracking or order logic.</div>
   </div>
