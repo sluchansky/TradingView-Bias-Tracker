@@ -264,7 +264,7 @@ export function CockpitV3() {
           padding: "36px 48px 28px",
           display: "flex",
           flexDirection: "column",
-          overflow: "hidden",
+          overflowY: "auto",
         }}
       >
         {/* ── Top bar ── */}
@@ -456,11 +456,57 @@ export function CockpitV3() {
           ))}
         </div>
 
+        {/* ── Suggested Levels strip ── */}
+        <div style={{ marginTop: "24px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
+            <Label>Suggested levels</Label>
+            <div style={{
+              fontSize: "10px", color: "#f59e0b", fontWeight: 600,
+              background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.18)",
+              borderRadius: "20px", padding: "1px 8px", letterSpacing: "0.5px",
+            }}>
+              FORMING · not yet READY
+            </div>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "10px" }}>
+            {[
+              { label: "Entry Zone", value: "21,318", sub: "– 21,325", color: "#e8e8f0", bg: "rgba(255,255,255,0.03)", accent: "rgba(255,255,255,0.08)" },
+              { label: "Stop Loss", value: "21,280", sub: "–38 pts", color: "#f87171", bg: "rgba(239,68,68,0.05)", accent: "rgba(239,68,68,0.15)" },
+              { label: "Target 1", value: "21,380", sub: "+62 pts", color: "#60a5fa", bg: "rgba(96,165,250,0.05)", accent: "rgba(96,165,250,0.15)" },
+              { label: "R : R", value: "1 : 1.6", sub: "ATR-based", color: "#a5b4fc", bg: "rgba(165,180,252,0.05)", accent: "rgba(165,180,252,0.15)" },
+            ].map((tile) => (
+              <div key={tile.label} style={{
+                padding: "14px 16px",
+                background: tile.bg,
+                border: `1px solid ${tile.accent}`,
+                borderRadius: "12px",
+                position: "relative" as const,
+                overflow: "hidden",
+              }}>
+                <div style={{
+                  position: "absolute", top: 0, left: 0, right: 0, height: "2px",
+                  background: tile.accent,
+                }} />
+                <Label>{tile.label}</Label>
+                <div style={{
+                  fontSize: "20px", fontWeight: 800, color: tile.color,
+                  letterSpacing: "-0.5px", marginTop: "7px", lineHeight: 1,
+                }}>
+                  {tile.value}
+                </div>
+                <div style={{ fontSize: "11px", color: C.textDim, marginTop: "4px" }}>
+                  {tile.sub}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
         {/* ── Action row ── */}
         <div
           style={{
             marginTop: "auto",
-            paddingTop: "24px",
+            paddingTop: "20px",
             display: "flex",
             gap: "10px",
             alignItems: "center",
