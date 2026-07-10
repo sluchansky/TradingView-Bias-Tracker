@@ -38935,6 +38935,7 @@ def dashboard():
 <div id="cp-mode-row">
   <button id="cp-btn-cockpit" class="cp-mode-btn active" onclick="setCpMode('cockpit')">&#127919; Cockpit</button>
   <button id="cp-btn-eng"     class="cp-mode-btn"        onclick="setCpMode('engineering')">&#9881; Engineering</button>
+  <a href="/cockpit" target="_blank" style="margin-left:10px;padding:4px 12px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.35);border-radius:20px;font-size:11px;font-weight:700;color:#a5b4fc;text-decoration:none;letter-spacing:0.5px;display:inline-flex;align-items:center;gap:5px;">&#10024; Cockpit v3</a>
 </div>
 
 <!-- COCKPIT VIEW (shown only when #view-live has class cp-cockpit) -->
