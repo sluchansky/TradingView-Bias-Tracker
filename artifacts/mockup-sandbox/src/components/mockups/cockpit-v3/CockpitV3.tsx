@@ -1,64 +1,67 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
-const MOCK = {
-  ticker: "MNQ",
-  mode: "SCALP",
-  verdict: "WAIT",
-  edge: 58,
-  reason:
-    "No confirmed structure on MNQ. Watching for a BOS above 21,340 to validate the demand setup that formed at the open.",
-  nextRequirement: "BOS or CHOCH on the 5m timeframe above the prior high at 21,340",
-  invalidation:
-    "Price breaks below 21,280 — the demand zone would be considered consumed",
-  learning:
-    "73% win rate across 19 similar demand-zone SCALP setups this week. Avg win: +1.4R",
-  actionLabel: "Enter manually when structure confirms",
-  price: "21,318.50",
-  change: "+12.25",
-  instruments: [
-    { name: "MNQ", state: "WAIT", mode: "SCALP", edge: 58 },
-    { name: "MGC", state: "WAIT", mode: "SCALP", edge: 41 },
-    { name: "MES", state: "READY", mode: "SWING", edge: 76 },
-    { name: "MYM", state: "WAIT", mode: "SCALP", edge: 33 },
-  ],
-  account: {
-    balance: "$48,240",
-    dailyPnl: "+$380",
-    riskUsed: 32,
-    maxLoss: "$500",
-    remaining: "$380 left",
-    trades: 2,
-    wins: 2,
-  },
-  activeTrade: {
-    ticker: "MES",
-    dir: "Long",
-    entry: "5,012.00",
-    unrealized: "+0.8R",
-  },
-  timeline: [
-    { time: "09:42", icon: "📍", event: "Demand zone confirmed at 21,290", kind: "setup" },
-    { time: "09:38", icon: "🔵", event: "VWAP updated: 21,305.20", kind: "data" },
-    { time: "09:31", icon: "⚡", event: "Session open — market scan active", kind: "system" },
-    { time: "09:28", icon: "✅", event: "MES LONG entered at 5,012", kind: "trade" },
-    { time: "09:15", icon: "🗺️", event: "Pre-market structure mapped", kind: "system" },
-    { time: "09:02", icon: "🔵", event: "VWAP seeded: 21,298.40", kind: "data" },
-  ],
-  diagnostics: [
-    { label: "Edge score", value: "58 / 100", sub: "B grade · 8 pts below READY threshold" },
-    { label: "BOS / CHOCH", value: "Not detected", sub: "Structure gate: FAIL — blocking trade" },
-    { label: "VWAP", value: "21,305.20", sub: "Price below VWAP — bearish lean on 5m" },
-    { label: "Zone", value: "Demand 21,290–21,300", sub: "Intact · not yet mitigated" },
-    { label: "CVD", value: "Bearish", sub: "Net selling pressure — directional veto active" },
-    { label: "Volume", value: "0.9× avg", sub: "Below 1.5× threshold — Volume component: 0 pts" },
-  ],
-  ticket: {
-    entryZone: "21,318–21,325",
-    stop: "21,280",
-    target1: "21,380",
-    rr: "1:1.6",
-  },
+// ─── Types ────────────────────────────────────────────────────────────────────
+type TradePlan = {
+  trade_plan?: boolean;
+  direction?: string;
+  entry_zone?: string;
+  stop_loss?: string | number;
+  target1?: string | number;
+  rr?: string;
+  rr_num?: number;
 };
+
+type ActiveTradeMgmt = {
+  active?: boolean;
+  status?: string;
+  direction?: string;
+  entry_price?: number;
+  symbol?: string;
+  unrealized_r?: number;
+  current_r?: number;
+};
+
+type TimelineEvent = {
+  event?: string;
+  category?: string;
+  time?: string;
+  ts?: string;
+  icon?: string;
+};
+
+type StatusData = {
+  verdict: string;
+  edge_score: number;
+  edge_grade?: string;
+  strict_reason?: string;
+  strict_direction?: string;
+  stage_next_step?: string;
+  stage_invalidation?: string;
+  current_price?: number;
+  display_price?: string;
+  trading_mode?: string;
+  active_ticker?: string;
+  trade_plan?: TradePlan;
+  market_events_timeline?: TimelineEvent[];
+  gate_debug?: Record<string, unknown>;
+  alert_diagnostics?: Record<string, unknown>;
+  vwap_value?: number;
+  vwap_status?: string;
+  nearest_demand?: unknown;
+  nearest_supply?: unknown;
+  active_trade_mgmt?: ActiveTradeMgmt;
+  prop_firm?: { safe?: boolean; status?: string; reason?: string };
+  trade_memory?: { summary_text?: string };
+  analyst?: { memory_review?: string };
+  confidence_governor?: { summary?: string };
+  main_brain_voice?: string;
+  status?: string;
+};
+
+type InstSnap = { state: string; edge: number; mode: string };
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const INSTRUMENTS = ["MNQ", "MGC", "MES", "MYM"];
 
 const C = {
   bg: "#07070d",
@@ -103,16 +106,218 @@ function Divider() {
   );
 }
 
+// ─── Timeline icon + colour helpers ──────────────────────────────────────────
+function timelineIcon(category?: string): string {
+  switch (category) {
+    case "trade": return "✅";
+    case "setup": return "📍";
+    case "data":  return "🔵";
+    case "system": return "⚡";
+    default: return "◎";
+  }
+}
+function timelineColor(category?: string): string {
+  switch (category) {
+    case "trade": return "#4ade80";
+    case "setup": return C.indigo;
+    default: return C.textDim;
+  }
+}
+
+// ─── Format a ts/time string into HH:MM display ──────────────────────────────
+function fmtTime(ev: TimelineEvent): string {
+  if (ev.time) return ev.time;
+  if (ev.ts) {
+    try {
+      const d = new Date(ev.ts);
+      return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+    } catch { /* fall through */ }
+  }
+  return "";
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
 export function CockpitV3() {
   const [activeTicker, setActiveTicker] = useState("MNQ");
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [tradeOpen, setTradeOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen]   = useState(false);
+  const [tradeOpen, setTradeOpen]     = useState(false);
+  const [data, setData]               = useState<StatusData | null>(null);
+  const [instSnaps, setInstSnaps]     = useState<Record<string, InstSnap>>({});
+  const [fetchError, setFetchError]   = useState<string | null>(null);
+  const activeRef = useRef(activeTicker);
+  activeRef.current = activeTicker;
 
-  const verdict = MOCK.verdict;
-  const isReady = verdict.includes("READY");
+  const applyData = useCallback((json: StatusData, ticker: string) => {
+    if (ticker === activeRef.current) {
+      setData(json);
+      setFetchError(null);
+    }
+    setInstSnaps(prev => ({
+      ...prev,
+      [ticker]: {
+        state: (json.verdict ?? "").includes("READY") ? "READY" : "WAIT",
+        edge:  json.edge_score ?? 0,
+        mode:  json.trading_mode ?? "SCALP",
+      },
+    }));
+  }, []);
+
+  const fetchStatus = useCallback(async (ticker: string) => {
+    try {
+      const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include" });
+      if (res.status === 503) return;
+      if (!res.ok) { setFetchError(`HTTP ${res.status}`); return; }
+      const json: StatusData = await res.json();
+      if (json.status === "warming") return;
+      applyData(json, ticker);
+    } catch {
+      setFetchError("Network error");
+    }
+  }, [applyData]);
+
+  // Boot: fetch all instruments for nav dot colours
+  useEffect(() => {
+    INSTRUMENTS.forEach(inst => fetchStatus(inst));
+  }, [fetchStatus]);
+
+  // Poll active ticker every 3 s
+  useEffect(() => {
+    fetchStatus(activeTicker);
+    const id = setInterval(() => fetchStatus(activeTicker), 3000);
+    return () => clearInterval(id);
+  }, [activeTicker, fetchStatus]);
+
+  // ── Derived display values ──────────────────────────────────────────────────
+  const verdict  = data?.verdict ?? "—";
+  const isReady  = verdict.includes("READY");
+  const edge     = data?.edge_score ?? 0;
+  const mode     = data?.trading_mode ?? "—";
+
+  const displayPrice = data?.display_price
+    ?? (data?.current_price
+        ? data.current_price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        : "—");
+
+  const reason = data?.strict_reason
+    ?? data?.main_brain_voice
+    ?? (data ? "Analysis ready — no specific wait reason." : "Connecting to bot...");
+
+  const nextReq      = data?.stage_next_step    ?? (data ? "No requirement pending." : "—");
+  const invalidation = data?.stage_invalidation ?? (data ? "No invalidation defined." : "—");
+  const learningText = data?.trade_memory?.summary_text
+    ?? data?.analyst?.memory_review
+    ?? data?.confidence_governor?.summary
+    ?? (data ? "No matching setups in learning memory yet." : "—");
+
+  // Trade plan / suggested levels
+  const tp          = data?.trade_plan;
+  const hasPlan     = !!tp?.trade_plan && !!tp?.entry_zone;
+  const entryZoneStr = tp?.entry_zone ?? "—";
+  const stopLossStr  = tp?.stop_loss   != null ? Number(tp.stop_loss).toFixed(2)  : "—";
+  const target1Str   = tp?.target1     != null ? Number(tp.target1).toFixed(2)    : "—";
+  const rrStr        = tp?.rr ?? "—";
+
+  // Point-delta sub-labels
+  const { midEntry } = (() => {
+    if (!hasPlan || !tp?.entry_zone) return { midEntry: null };
+    const z = tp.entry_zone!;
+    if (z.includes("–")) {
+      const [lo, hi] = z.split("–").map(s => parseFloat(s.replace(/,/g, "")));
+      return { midEntry: (lo + hi) / 2 };
+    }
+    return { midEntry: parseFloat(z.replace(/,/g, "")) };
+  })();
+  const stopDelta = midEntry != null && stopLossStr !== "—"
+    ? `${(Number(stopLossStr) - midEntry).toFixed(0)} pts` : "";
+  const t1Delta   = midEntry != null && target1Str !== "—"
+    ? `+${(Number(target1Str) - midEntry).toFixed(0)} pts` : "";
+
+  // Levels badge
+  const levelsBadgeText   = isReady && hasPlan ? "ACTIVE PLAN" : "FORMING · not yet READY";
+  const levelsBadgeColor  = isReady && hasPlan ? C.green        : "#f59e0b";
+  const levelsBadgeBg     = isReady && hasPlan ? "rgba(34,197,94,0.08)"   : "rgba(245,158,11,0.08)";
+  const levelsBadgeBorder = isReady && hasPlan ? "rgba(34,197,94,0.18)"   : "rgba(245,158,11,0.18)";
+
+  // Active trade
+  const atm           = data?.active_trade_mgmt;
+  const hasActiveTrade = (atm?.active === true) || atm?.status === "active";
+  const atDir         = atm?.direction ?? "Long";
+  const atEntry       = atm?.entry_price != null ? atm.entry_price.toFixed(2) : "—";
+  const atSymbol      = atm?.symbol ?? activeTicker;
+  const atUnrealized  = atm?.current_r != null
+    ? `${atm.current_r > 0 ? "+" : ""}${atm.current_r.toFixed(2)}R`
+    : (atm?.unrealized_r != null
+        ? `${atm.unrealized_r > 0 ? "+" : ""}${atm.unrealized_r.toFixed(2)}R`
+        : "—");
+
+  // Prop firm
+  const propSafe = data?.prop_firm?.safe ?? (data ? true : true);
+
+  // Timeline
+  const timeline: TimelineEvent[] = Array.isArray(data?.market_events_timeline)
+    ? (data!.market_events_timeline!).slice(0, 12)
+    : [];
+
+  // Instrument nav tiles
+  const instruments = INSTRUMENTS.map(name => ({
+    name,
+    state: instSnaps[name]?.state ?? "—",
+    edge:  instSnaps[name]?.edge  ?? 0,
+    mode:  instSnaps[name]?.mode  ?? "—",
+  }));
+
+  // Diagnostics: build from live gate_debug + vwap + edge
+  const gateDebug = (data?.gate_debug && typeof data.gate_debug === "object")
+    ? data.gate_debug : null;
+  const ad = (data?.alert_diagnostics && typeof data.alert_diagnostics === "object")
+    ? data.alert_diagnostics as Record<string, unknown> : null;
+
+  const diagItems: { label: string; value: string; sub: string }[] = (() => {
+    if (!data) return [];
+    const items: { label: string; value: string; sub: string }[] = [];
+
+    items.push({
+      label: "Edge score",
+      value: `${edge} / 100`,
+      sub:   data.edge_grade ? `${data.edge_grade} grade` : "",
+    });
+
+    if (data.vwap_value) {
+      const dir = (data.current_price ?? 0) > data.vwap_value ? "above" : "below";
+      items.push({
+        label: "VWAP",
+        value: data.vwap_value.toFixed(2),
+        sub:   `Price ${dir} VWAP — ${dir === "above" ? "bullish" : "bearish"} lean`,
+      });
+    }
+
+    if (gateDebug) {
+      const keyLabels: Record<string, string> = {
+        zone: "Zone", vwap: "VWAP gate", structure: "BOS / CHOCH",
+        cvd: "CVD", volume: "Volume", volatility: "Volatility",
+        entry_quality: "Entry quality",
+      };
+      for (const [k, v] of Object.entries(gateDebug)) {
+        if (k === "blocked_by" || k === "reason") continue;
+        const lbl = keyLabels[k] ?? k.replace(/_/g, " ");
+        const valStr = v === true ? "PASS" : v === false ? "FAIL" : String(v);
+        items.push({ label: lbl, value: valStr, sub: "" });
+      }
+    }
+
+    if (ad?.cvd_direction) {
+      items.push({
+        label: "CVD",
+        value: String(ad.cvd_direction),
+        sub:   String(ad.cvd_status ?? ""),
+      });
+    }
+
+    return items;
+  })();
 
   const verdictColor = isReady ? C.green : "#a5b4fc";
-  const verdictGlow = isReady
+  const verdictGlow  = isReady
     ? "0 0 100px rgba(34,197,94,0.12)"
     : "0 0 100px rgba(165,180,252,0.07)";
 
@@ -167,14 +372,12 @@ export function CockpitV3() {
         </div>
 
         {/* Instrument selector tiles */}
-        {MOCK.instruments.map((inst) => {
+        {instruments.map((inst) => {
           const active = inst.name === activeTicker;
           const dotColor =
-            inst.state === "READY"
-              ? C.green
-              : inst.state === "WAIT"
-              ? "#2a2a44"
-              : "#f59e0b";
+            inst.state === "READY" ? C.green
+            : inst.state === "WAIT" ? "#2a2a44"
+            : "#1e1e32";
           return (
             <button
               key={inst.name}
@@ -209,10 +412,7 @@ export function CockpitV3() {
                   height: "5px",
                   borderRadius: "50%",
                   background: dotColor,
-                  boxShadow:
-                    inst.state === "READY"
-                      ? "0 0 6px rgba(34,197,94,0.6)"
-                      : "none",
+                  boxShadow: inst.state === "READY" ? "0 0 6px rgba(34,197,94,0.6)" : "none",
                 }}
               />
             </button>
@@ -247,9 +447,7 @@ export function CockpitV3() {
             }}
           >
             <span style={{ fontSize: "15px", lineHeight: 1 }}>{item.emoji}</span>
-            <span
-              style={{ fontSize: "8px", color: C.textFaint, letterSpacing: "0.5px" }}
-            >
+            <span style={{ fontSize: "8px", color: C.textFaint, letterSpacing: "0.5px" }}>
               {item.label}
             </span>
           </button>
@@ -300,8 +498,13 @@ export function CockpitV3() {
                 letterSpacing: "1px",
               }}
             >
-              SCALP
+              {mode || "—"}
             </div>
+            {fetchError && (
+              <span style={{ fontSize: "10px", color: "#f87171", letterSpacing: "0.5px" }}>
+                ⚠ {fetchError}
+              </span>
+            )}
           </div>
           <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
             <span
@@ -312,12 +515,7 @@ export function CockpitV3() {
                 letterSpacing: "-0.5px",
               }}
             >
-              {MOCK.price}
-            </span>
-            <span
-              style={{ fontSize: "13px", color: C.green, fontWeight: 600 }}
-            >
-              {MOCK.change}
+              {displayPrice}
             </span>
           </div>
         </div>
@@ -359,9 +557,10 @@ export function CockpitV3() {
               <div
                 style={{
                   height: "100%",
-                  width: `${MOCK.edge}%`,
+                  width: `${edge}%`,
                   background: `linear-gradient(90deg, ${C.accent}, ${verdictColor})`,
                   borderRadius: "2px",
+                  transition: "width 0.6s ease",
                 }}
               />
             </div>
@@ -374,7 +573,7 @@ export function CockpitV3() {
                 whiteSpace: "nowrap",
               }}
             >
-              {MOCK.edge} / 100
+              {edge} / 100
             </span>
           </div>
 
@@ -389,31 +588,16 @@ export function CockpitV3() {
               margin: 0,
             }}
           >
-            {MOCK.reason}
+            {reason}
           </p>
         </div>
 
         {/* ── Three key rows ── */}
         <div style={{ display: "flex", flexDirection: "column" }}>
           {[
-            {
-              label: "Next requirement",
-              value: MOCK.nextRequirement,
-              accent: C.indigo,
-              symbol: "→",
-            },
-            {
-              label: "Invalidation",
-              value: MOCK.invalidation,
-              accent: C.orange,
-              symbol: "✕",
-            },
-            {
-              label: "Learning memory",
-              value: MOCK.learning,
-              accent: C.teal,
-              symbol: "◎",
-            },
+            { label: "Next requirement", value: nextReq,       accent: C.indigo,  symbol: "→" },
+            { label: "Invalidation",     value: invalidation,  accent: C.orange,  symbol: "✕" },
+            { label: "Learning memory",  value: learningText,  accent: C.teal,    symbol: "◎" },
           ].map((row, i) => (
             <div key={row.label}>
               <div
@@ -461,19 +645,47 @@ export function CockpitV3() {
           <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
             <Label>Suggested levels</Label>
             <div style={{
-              fontSize: "10px", color: "#f59e0b", fontWeight: 600,
-              background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.18)",
+              fontSize: "10px", color: levelsBadgeColor, fontWeight: 600,
+              background: levelsBadgeBg, border: `1px solid ${levelsBadgeBorder}`,
               borderRadius: "20px", padding: "1px 8px", letterSpacing: "0.5px",
             }}>
-              FORMING · not yet READY
+              {levelsBadgeText}
             </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "10px" }}>
             {[
-              { label: "Entry Zone", value: "21,318", sub: "– 21,325", color: "#e8e8f0", bg: "rgba(255,255,255,0.03)", accent: "rgba(255,255,255,0.08)" },
-              { label: "Stop Loss", value: "21,280", sub: "–38 pts", color: "#f87171", bg: "rgba(239,68,68,0.05)", accent: "rgba(239,68,68,0.15)" },
-              { label: "Target 1", value: "21,380", sub: "+62 pts", color: "#60a5fa", bg: "rgba(96,165,250,0.05)", accent: "rgba(96,165,250,0.15)" },
-              { label: "R : R", value: "1 : 1.6", sub: "ATR-based", color: "#a5b4fc", bg: "rgba(165,180,252,0.05)", accent: "rgba(165,180,252,0.15)" },
+              {
+                label: "Entry Zone",
+                value: entryZoneStr,
+                sub: entryZoneStr.includes("–") ? "zone range" : "",
+                color: "#e8e8f0",
+                bg: "rgba(255,255,255,0.03)",
+                accent: "rgba(255,255,255,0.08)",
+              },
+              {
+                label: "Stop Loss",
+                value: stopLossStr,
+                sub: stopDelta,
+                color: "#f87171",
+                bg: "rgba(239,68,68,0.05)",
+                accent: "rgba(239,68,68,0.15)",
+              },
+              {
+                label: "Target 1",
+                value: target1Str,
+                sub: t1Delta,
+                color: "#60a5fa",
+                bg: "rgba(96,165,250,0.05)",
+                accent: "rgba(96,165,250,0.15)",
+              },
+              {
+                label: "R : R",
+                value: rrStr,
+                sub: "ATR-based",
+                color: "#a5b4fc",
+                bg: "rgba(165,180,252,0.05)",
+                accent: "rgba(165,180,252,0.15)",
+              },
             ].map((tile) => (
               <div key={tile.label} style={{
                 padding: "14px 16px",
@@ -494,9 +706,11 @@ export function CockpitV3() {
                 }}>
                   {tile.value}
                 </div>
-                <div style={{ fontSize: "11px", color: C.textDim, marginTop: "4px" }}>
-                  {tile.sub}
-                </div>
+                {tile.sub && (
+                  <div style={{ fontSize: "11px", color: C.textDim, marginTop: "4px" }}>
+                    {tile.sub}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -563,7 +777,7 @@ export function CockpitV3() {
       >
         <Label>Account</Label>
 
-        {/* Balance block */}
+        {/* Balance block — kept as contextual placeholder */}
         <div style={{ marginTop: "14px", marginBottom: "20px" }}>
           <div
             style={{
@@ -573,21 +787,21 @@ export function CockpitV3() {
               letterSpacing: "-0.8px",
             }}
           >
-            {MOCK.account.balance}
+            {data ? "See broker" : "—"}
           </div>
           <div
             style={{
               fontSize: "12px",
-              color: C.green,
+              color: C.textSecondary,
               fontWeight: 600,
               marginTop: "3px",
             }}
           >
-            {MOCK.account.dailyPnl} today
+            {data?.active_ticker ?? activeTicker} · {mode}
           </div>
         </div>
 
-        {/* Risk meter */}
+        {/* Edge meter (replaces "risk used" for now) */}
         <div style={{ marginBottom: "18px" }}>
           <div
             style={{
@@ -596,13 +810,9 @@ export function CockpitV3() {
               marginBottom: "7px",
             }}
           >
-            <span style={{ fontSize: "11px", color: C.textDim }}>
-              Daily risk used
-            </span>
-            <span
-              style={{ fontSize: "11px", color: C.textSecondary, fontWeight: 600 }}
-            >
-              {MOCK.account.riskUsed}%
+            <span style={{ fontSize: "11px", color: C.textDim }}>Edge score</span>
+            <span style={{ fontSize: "11px", color: C.textSecondary, fontWeight: 600 }}>
+              {edge}%
             </span>
           </div>
           <div
@@ -615,9 +825,10 @@ export function CockpitV3() {
             <div
               style={{
                 height: "100%",
-                width: `${MOCK.account.riskUsed}%`,
-                background: `linear-gradient(90deg, ${C.green}, #a3e635)`,
+                width: `${edge}%`,
+                background: `linear-gradient(90deg, ${C.accent}, ${verdictColor})`,
                 borderRadius: "2px",
+                transition: "width 0.6s ease",
               }}
             />
           </div>
@@ -628,10 +839,10 @@ export function CockpitV3() {
         {/* Stats */}
         <div style={{ marginTop: "4px" }}>
           {[
-            { label: "Max loss", value: MOCK.account.maxLoss },
-            { label: "Remaining", value: MOCK.account.remaining },
-            { label: "Trades today", value: String(MOCK.account.trades) },
-            { label: "Wins", value: `${MOCK.account.wins} of ${MOCK.account.trades}` },
+            { label: "Grade",      value: data?.edge_grade ?? "—" },
+            { label: "Direction",  value: data?.strict_direction ?? "—" },
+            { label: "VWAP",       value: data?.vwap_value ? data.vwap_value.toFixed(2) : "—" },
+            { label: "VWAP status", value: data?.vwap_status ?? "—" },
           ].map((stat) => (
             <div
               key={stat.label}
@@ -643,16 +854,8 @@ export function CockpitV3() {
                 borderBottom: `1px solid ${C.border}`,
               }}
             >
-              <span style={{ fontSize: "12px", color: C.textDim }}>
-                {stat.label}
-              </span>
-              <span
-                style={{
-                  fontSize: "12px",
-                  fontWeight: 600,
-                  color: C.textSecondary,
-                }}
-              >
+              <span style={{ fontSize: "12px", color: C.textDim }}>{stat.label}</span>
+              <span style={{ fontSize: "12px", fontWeight: 600, color: C.textSecondary }}>
                 {stat.value}
               </span>
             </div>
@@ -662,56 +865,62 @@ export function CockpitV3() {
         <div style={{ flex: 1 }} />
 
         {/* Active trade indicator */}
-        <div
-          style={{
-            padding: "12px 14px",
-            background: C.greenBg,
-            border: `1px solid ${C.greenBorder}`,
-            borderRadius: "10px",
-            marginBottom: "10px",
-          }}
-        >
+        {hasActiveTrade ? (
           <div
             style={{
-              fontSize: "10px",
-              fontWeight: 700,
-              color: "#166534",
-              letterSpacing: "1.2px",
-              marginBottom: "5px",
-              textTransform: "uppercase",
+              padding: "12px 14px",
+              background: C.greenBg,
+              border: `1px solid ${C.greenBorder}`,
+              borderRadius: "10px",
+              marginBottom: "10px",
             }}
           >
-            Active · {MOCK.activeTrade.ticker}
+            <div
+              style={{
+                fontSize: "10px",
+                fontWeight: 700,
+                color: "#166534",
+                letterSpacing: "1.2px",
+                marginBottom: "5px",
+                textTransform: "uppercase",
+              }}
+            >
+              Active · {atSymbol}
+            </div>
+            <div style={{ fontSize: "12px", color: "#4ade80" }}>
+              {atDir} @ {atEntry}
+            </div>
+            <div style={{ fontSize: "11px", color: "#166534", marginTop: "2px" }}>
+              {atUnrealized} unrealized
+            </div>
           </div>
-          <div style={{ fontSize: "12px", color: "#4ade80" }}>
-            {MOCK.activeTrade.dir} @ {MOCK.activeTrade.entry}
-          </div>
+        ) : data ? (
           <div
-            style={{ fontSize: "11px", color: "#166534", marginTop: "2px" }}
+            style={{
+              padding: "10px 14px",
+              background: "rgba(255,255,255,0.02)",
+              border: `1px solid ${C.border}`,
+              borderRadius: "10px",
+              marginBottom: "10px",
+            }}
           >
-            {MOCK.activeTrade.unrealized} unrealized
+            <span style={{ fontSize: "11px", color: C.textFaint }}>No active trade</span>
           </div>
-        </div>
+        ) : null}
 
         {/* Prop safety */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "7px",
-          }}
-        >
+        <div style={{ display: "flex", alignItems: "center", gap: "7px" }}>
           <div
             style={{
               width: "6px",
               height: "6px",
-              background: C.green,
+              background: propSafe ? C.green : "#f87171",
               borderRadius: "50%",
-              boxShadow: "0 0 6px rgba(34,197,94,0.5)",
+              boxShadow: propSafe ? "0 0 6px rgba(34,197,94,0.5)" : "none",
             }}
           />
-          <span style={{ fontSize: "11px", color: "#16a34a", fontWeight: 600 }}>
-            Prop rules safe
+          <span style={{ fontSize: "11px", color: propSafe ? "#16a34a" : "#f87171", fontWeight: 600 }}>
+            {data?.prop_firm?.status ?? (propSafe ? "Prop rules safe" : "Check prop rules")}
           </span>
         </div>
       </aside>
@@ -731,46 +940,47 @@ export function CockpitV3() {
           paddingLeft: "8px",
         }}
       >
-        {MOCK.timeline.map((ev, i) => (
-          <div
-            key={i}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "10px",
-              padding: "0 24px",
-              height: "100%",
-              borderRight: `1px solid ${C.border}`,
-              flexShrink: 0,
-            }}
-          >
-            <span
+        {timeline.length === 0 ? (
+          <span style={{ fontSize: "12px", color: C.textFaint, padding: "0 24px" }}>
+            {data ? "No timeline events yet." : "Loading timeline..."}
+          </span>
+        ) : (
+          timeline.map((ev, i) => (
+            <div
+              key={i}
               style={{
-                fontSize: "10px",
-                color: C.textFaint,
-                fontWeight: 600,
-                fontVariantNumeric: "tabular-nums",
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                padding: "0 24px",
+                height: "100%",
+                borderRight: `1px solid ${C.border}`,
+                flexShrink: 0,
               }}
             >
-              {ev.time}
-            </span>
-            <span style={{ fontSize: "13px" }}>{ev.icon}</span>
-            <span
-              style={{
-                fontSize: "12px",
-                color:
-                  ev.kind === "trade"
-                    ? "#4ade80"
-                    : ev.kind === "setup"
-                    ? C.indigo
-                    : C.textDim,
-                whiteSpace: "nowrap",
-              }}
-            >
-              {ev.event}
-            </span>
-          </div>
-        ))}
+              <span
+                style={{
+                  fontSize: "10px",
+                  color: C.textFaint,
+                  fontWeight: 600,
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                {fmtTime(ev)}
+              </span>
+              <span style={{ fontSize: "13px" }}>{ev.icon ?? timelineIcon(ev.category)}</span>
+              <span
+                style={{
+                  fontSize: "12px",
+                  color: timelineColor(ev.category),
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {ev.event ?? ""}
+              </span>
+            </div>
+          ))
+        )}
       </footer>
 
       {/* ═══════════════════════════════════════════════════
@@ -817,13 +1027,7 @@ export function CockpitV3() {
                 background: C.surfaceHigh,
               }}
             >
-              <span
-                style={{
-                  fontSize: "13px",
-                  fontWeight: 700,
-                  color: C.textPrimary,
-                }}
-              >
+              <span style={{ fontSize: "13px", fontWeight: 700, color: C.textPrimary }}>
                 Diagnostics
               </span>
               <button
@@ -853,47 +1057,52 @@ export function CockpitV3() {
             >
               <Label>Gate breakdown — {activeTicker}</Label>
               <div style={{ height: "12px" }} />
-              {MOCK.diagnostics.map((item) => {
-                const isFail =
-                  item.sub.toLowerCase().includes("fail") ||
-                  item.sub.toLowerCase().includes("block") ||
-                  item.sub.toLowerCase().includes("below");
-                return (
-                  <div
-                    key={item.label}
-                    style={{
-                      padding: "13px 16px",
-                      background: "rgba(255,255,255,0.02)",
-                      border: `1px solid ${C.border}`,
-                      borderRadius: "10px",
-                    }}
-                  >
+              {diagItems.length === 0 ? (
+                <div style={{ fontSize: "12px", color: C.textFaint }}>
+                  {data ? "No diagnostic data available." : "Loading..."}
+                </div>
+              ) : (
+                diagItems.map((item) => {
+                  const isFail =
+                    item.value === "FAIL" ||
+                    item.value === "false" ||
+                    item.sub.toLowerCase().includes("fail") ||
+                    item.sub.toLowerCase().includes("block");
+                  return (
                     <div
+                      key={item.label}
                       style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        marginBottom: "5px",
+                        padding: "13px 16px",
+                        background: "rgba(255,255,255,0.02)",
+                        border: `1px solid ${C.border}`,
+                        borderRadius: "10px",
                       }}
                     >
-                      <span style={{ fontSize: "12px", color: C.textDim }}>
-                        {item.label}
-                      </span>
-                      <span
+                      <div
                         style={{
-                          fontSize: "12px",
-                          fontWeight: 600,
-                          color: isFail ? "#f87171" : C.textSecondary,
+                          display: "flex",
+                          justifyContent: "space-between",
+                          marginBottom: "5px",
                         }}
                       >
-                        {item.value}
-                      </span>
+                        <span style={{ fontSize: "12px", color: C.textDim }}>{item.label}</span>
+                        <span
+                          style={{
+                            fontSize: "12px",
+                            fontWeight: 600,
+                            color: isFail ? "#f87171" : C.textSecondary,
+                          }}
+                        >
+                          {item.value}
+                        </span>
+                      </div>
+                      {item.sub && (
+                        <span style={{ fontSize: "11px", color: C.textFaint }}>{item.sub}</span>
+                      )}
                     </div>
-                    <span style={{ fontSize: "11px", color: C.textFaint }}>
-                      {item.sub}
-                    </span>
-                  </div>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
 
             {/* Drawer footer */}
@@ -979,7 +1188,7 @@ export function CockpitV3() {
                     marginLeft: "10px",
                   }}
                 >
-                  {activeTicker} · Mock data — not connected
+                  {activeTicker} · {isReady ? "READY — all safety layers apply on send" : "WAIT — manual override only"}
                 </span>
               </div>
               <div
@@ -990,10 +1199,10 @@ export function CockpitV3() {
                 }}
               >
                 {[
-                  { label: "Entry Zone", value: MOCK.ticket.entryZone, color: C.textSecondary },
-                  { label: "Stop Loss", value: MOCK.ticket.stop, color: "#f87171" },
-                  { label: "Target 1", value: MOCK.ticket.target1, color: "#60a5fa" },
-                  { label: "R:R", value: MOCK.ticket.rr, color: C.indigo },
+                  { label: "Entry Zone", value: entryZoneStr, color: C.textSecondary },
+                  { label: "Stop Loss",  value: stopLossStr,  color: "#f87171" },
+                  { label: "Target 1",  value: target1Str,   color: "#60a5fa" },
+                  { label: "R:R",        value: rrStr,         color: C.indigo },
                 ].map((f) => (
                   <div
                     key={f.label}
@@ -1019,14 +1228,10 @@ export function CockpitV3() {
                   </div>
                 ))}
               </div>
-              <div
-                style={{
-                  marginTop: "12px",
-                  fontSize: "11px",
-                  color: C.textFaint,
-                }}
-              >
-                Setup is WAIT — manual override only. All safety layers apply on send.
+              <div style={{ marginTop: "12px", fontSize: "11px", color: C.textFaint }}>
+                {hasPlan
+                  ? `${tp?.direction ?? ""} setup · levels are bot-suggested, not a guarantee`
+                  : "No active plan — levels will populate when a setup forms"}
               </div>
             </div>
 
@@ -1040,19 +1245,20 @@ export function CockpitV3() {
               }}
             >
               <button
+                onClick={() => setTradeOpen(false)}
                 style={{
                   padding: "12px 36px",
-                  background: C.green,
-                  border: "none",
+                  background: isReady ? C.green : "rgba(99,102,241,0.15)",
+                  border: isReady ? "none" : `1px solid ${C.accentBorder}`,
                   borderRadius: "10px",
                   cursor: "pointer",
                   fontSize: "14px",
                   fontWeight: 800,
-                  color: "#030d06",
+                  color: isReady ? "#030d06" : "#9090d0",
                   letterSpacing: "0.2px",
                 }}
               >
-                Enter Long
+                {isReady ? `Enter ${tp?.direction ?? "Trade"}` : "Watching..."}
               </button>
               <button
                 onClick={() => setTradeOpen(false)}
