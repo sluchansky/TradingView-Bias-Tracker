@@ -204,9 +204,12 @@ export function CockpitV3() {
 
   const nextReq      = data?.stage_next_step    ?? (data ? "No requirement pending." : "—");
   const invalidation = data?.stage_invalidation ?? (data ? "No invalidation defined." : "—");
-  const learningText = data?.trade_memory?.summary_text
-    ?? data?.analyst?.memory_review
-    ?? data?.confidence_governor?.summary
+  const safeStr = (v: unknown): string | null =>
+    typeof v === "string" && v.length > 0 ? v : null;
+
+  const learningText = safeStr(data?.trade_memory?.summary_text)
+    ?? safeStr(data?.analyst?.memory_review)
+    ?? safeStr(data?.confidence_governor?.summary)
     ?? (data ? "No matching setups in learning memory yet." : "—");
 
   // Trade plan / suggested levels
