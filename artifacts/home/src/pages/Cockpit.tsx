@@ -120,7 +120,7 @@ export default function Cockpit() {
   const [instSnaps, setInstSnaps]     = useState<Record<string, InstSnap>>({});
   const [fetchError, setFetchError]   = useState<string | null>(null);
   const [pwd, setPwd]                 = useState<string>(() => { try { return sessionStorage.getItem("cockpit_pwd") ?? ""; } catch { return ""; } });
-  const [showLogin, setShowLogin]     = useState(false);
+  const [showLogin, setShowLogin]     = useState<boolean>(() => { try { return !sessionStorage.getItem("cockpit_pwd"); } catch { return true; } });
   const [loginInput, setLoginInput]   = useState("");
   const [loginErr, setLoginErr]       = useState(false);
   const activeRef = useRef(activeTicker);
