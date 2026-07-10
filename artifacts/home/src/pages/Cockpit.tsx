@@ -60,6 +60,31 @@ type StatusData = {
   confidence_governor?: { summary?: unknown };
   main_brain_voice?: string;
   status?: string;
+  bias?: string;
+  biasDirection?: string | null;
+  conviction_tier?: string | null;
+  alert_level?: string | null;
+  bullish_score?: number;
+  bearish_score?: number;
+  current_atr?: number;
+  confluences?: {
+    bos?: boolean;
+    choch?: boolean;
+    vwap?: boolean;
+    vwap_value?: number;
+    vwap_status?: string;
+    direction?: string;
+    cvd_confirmed?: boolean;
+    volume_confirmed?: boolean;
+    zone_confirmed?: boolean;
+    liquidity_sweep?: boolean;
+    structure_confirmed?: boolean;
+  };
+  data_feed?: {
+    overall_freshness?: string;
+    provider?: string;
+    instruments?: Record<string, { freshness?: string; auto_age_secs?: number }>;
+  };
 };
 
 type InstSnap = { state: string; edge: number; mode: string };
@@ -256,6 +281,28 @@ export default function Cockpit() {
   const propEnabled = data?.prop_firm?.enabled ?? false;
   const propHasAccount = data?.prop_firm?.account != null;
   const propSafe = !propEnabled || propHasAccount;
+
+  const bias       = safeStr(data?.bias) ?? "—";
+  const vwapVal    = data?.confluences?.vwap_value ?? data?.vwap_value;
+  const price      = data?.current_price;
+  const aboveVwap  = vwapVal != null && price != null ? price > vwapVal : null;
+  const vwapCtx    = vwapVal != null
+    ? `${vwapVal.toFixed(2)} · ${aboveVwap === true ? "price above" : aboveVwap === false ? "price below" : ""}`
+    : "—";
+  const atrStr     = data?.current_atr != null ? `${data.current_atr.toFixed(2)} pts` : "—";
+  const freshness  = safeStr(data?.data_feed?.overall_freshness) ?? "—";
+  const execMode   = safeStr(data?.execution_mode)?.replace(/_/g, " ") ?? "—";
+
+  const gateItems = [
+    { label: "BOS",    ok: data?.confluences?.bos },
+    { label: "CHOCH",  ok: data?.confluences?.choch },
+    { label: "VWAP",   ok: data?.confluences?.vwap },
+    { label: "CVD",    ok: data?.confluences?.cvd_confirmed },
+    { label: "Volume", ok: data?.confluences?.volume_confirmed },
+    { label: "Zone",   ok: data?.confluences?.zone_confirmed },
+    { label: "Sweep",  ok: data?.confluences?.liquidity_sweep },
+  ];
+
   const timeline: TimelineEvent[] = Array.isArray(data?.market_events_timeline)
     ? data!.market_events_timeline!.slice(0, 12) : [];
 
@@ -404,6 +451,28 @@ export default function Cockpit() {
             </span>
           </div>
 
+          {/* Info strip */}
+          {data && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "18px" }}>
+              {[
+                { label: "Bias",  value: bias },
+                { label: "VWAP",  value: vwapCtx },
+                { label: "ATR",   value: atrStr },
+                { label: "Exec",  value: execMode },
+                { label: "Feed",  value: freshness },
+              ].map(chip => (
+                <div key={chip.label} style={{
+                  display: "flex", alignItems: "center", gap: "5px",
+                  background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
+                  borderRadius: "8px", padding: "4px 10px", fontSize: "11px",
+                }}>
+                  <span style={{ color: C.textDim, fontWeight: 700, letterSpacing: "0.5px" }}>{chip.label}</span>
+                  <span style={{ color: C.textSecondary }}>{chip.value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
           <p style={{ fontSize: "17px", fontWeight: 400, color: C.textSecondary, lineHeight: 1.65, maxWidth: "620px", margin: 0 }}>
             {reason}
           </p>
@@ -489,47 +558,48 @@ export default function Cockpit() {
         background: C.surface, borderLeft: `1px solid ${C.border}`,
         padding: "24px 20px", display: "flex", flexDirection: "column", overflow: "hidden",
       }}>
-        <Label>Bot status</Label>
-        <div style={{ marginTop: "14px", marginBottom: "20px" }}>
-          <div style={{ fontSize: "22px", fontWeight: 800, color: verdictColor, letterSpacing: "-0.5px" }}>
-            {data?.verdict ?? "—"}
-          </div>
-          <div style={{ fontSize: "12px", color: C.textSecondary, fontWeight: 600, marginTop: "3px" }}>
-            {activeTicker} · {mode} · {safeStr(data?.execution_mode as string)?.replace(/_/g, " ") ?? "—"}
-          </div>
-        </div>
-
-        <div style={{ marginBottom: "18px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "7px" }}>
-            <span style={{ fontSize: "11px", color: C.textDim }}>Edge score</span>
-            <span style={{ fontSize: "11px", color: C.textSecondary, fontWeight: 600 }}>{edge}%</span>
-          </div>
-          <div style={{ height: "4px", background: "rgba(255,255,255,0.04)", borderRadius: "2px" }}>
-            <div style={{
-              height: "100%", width: `${edge}%`,
-              background: `linear-gradient(90deg, ${C.accent}, ${verdictColor})`,
-              borderRadius: "2px", transition: "width 0.6s ease",
-            }} />
-          </div>
-        </div>
-
-        <Divider />
-        <div style={{ marginTop: "4px" }}>
+        <Label>Market context</Label>
+        <div style={{ marginTop: "8px", marginBottom: "14px" }}>
           {[
-            { label: "Grade",       value: data?.edge_grade ?? "—" },
-            { label: "Direction",   value: data?.strict_direction ?? "—" },
-            { label: "VWAP",        value: data?.vwap_value ? data.vwap_value.toFixed(2) : "—" },
-            { label: "VWAP status", value: safeStr(data?.vwap_status) ?? "—" },
+            { label: "VWAP",       value: vwapCtx },
+            { label: "Bias",       value: bias },
+            { label: "ATR",        value: atrStr },
+            { label: "Grade",      value: data?.edge_grade ?? "—" },
+            { label: "Direction",  value: data?.strict_direction ?? "—" },
+            { label: "Bull / Bear",value: data ? `${data?.bullish_score ?? 0} / ${data?.bearish_score ?? 0}` : "—" },
+            { label: "Feed",       value: freshness },
+            { label: "Exec mode",  value: execMode },
           ].map(stat => (
             <div key={stat.label} style={{
               display: "flex", justifyContent: "space-between", alignItems: "center",
-              padding: "10px 0", borderBottom: `1px solid ${C.border}`,
+              padding: "7px 0", borderBottom: `1px solid ${C.border}`,
             }}>
-              <span style={{ fontSize: "12px", color: C.textDim }}>{stat.label}</span>
-              <span style={{ fontSize: "12px", fontWeight: 600, color: C.textSecondary }}>{stat.value}</span>
+              <span style={{ fontSize: "11px", color: C.textDim }}>{stat.label}</span>
+              <span style={{ fontSize: "11px", fontWeight: 600, color: C.textSecondary,
+                textAlign: "right", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
+              }}>{stat.value}</span>
             </div>
           ))}
         </div>
+
+        <Label>Gate checklist</Label>
+        <div style={{ marginTop: "8px", marginBottom: "14px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
+          {gateItems.map(g => (
+            <div key={g.label} style={{
+              display: "flex", alignItems: "center", gap: "3px",
+              fontSize: "10px", fontWeight: 700, letterSpacing: "0.3px",
+              padding: "3px 7px", borderRadius: "6px",
+              background: g.ok === true ? "rgba(34,197,94,0.08)" : g.ok === false ? "rgba(239,68,68,0.06)" : "rgba(255,255,255,0.02)",
+              border: `1px solid ${g.ok === true ? "rgba(34,197,94,0.2)" : g.ok === false ? "rgba(239,68,68,0.15)" : C.border}`,
+              color: g.ok === true ? C.green : g.ok === false ? "#f87171" : C.textDim,
+            }}>
+              <span>{g.ok === true ? "✓" : g.ok === false ? "✗" : "·"}</span>
+              <span>{g.label}</span>
+            </div>
+          ))}
+        </div>
+
+        <Divider />
 
         <div style={{ flex: 1 }} />
 
