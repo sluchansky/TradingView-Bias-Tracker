@@ -1998,6 +1998,9 @@ def _recent_advisor_blocks(limit=10):
 EXEC_REJECTIONS_MAX  = 25
 EXEC_REJECTIONS      = deque(maxlen=EXEC_REJECTIONS_MAX)
 EXEC_REJECTIONS_LOCK = threading.Lock()
+BROKER_SEND_LOG_MAX  = 20
+BROKER_SEND_LOG      = deque(maxlen=BROKER_SEND_LOG_MAX)
+BROKER_SEND_LOG_LOCK = threading.Lock()
 
 # Payload keys that must NEVER reach the logs (PickMyTrade carries its auth token /
 # account id in the body). The TradersPost payload has none of these, so its audit
@@ -2025,7 +2028,9 @@ def _broker_required_fields(mode):
 
 def _validate_broker_payload(mode, payload):
     """Return [(field, problem), ...] for every REQUIRED field that is missing,
-    null, or empty (blank/whitespace string). Empty list => safe to send."""
+    null, or empty (blank/whitespace string). Also validates that ENTRY signals
+    never carry sentiment='flat' and EXIT signals never carry sentiment='long'/'short'.
+    Empty list => safe to send."""
     bad = []
     for f in _broker_required_fields(mode):
         if not isinstance(payload, dict) or f not in payload:
@@ -2035,6 +2040,17 @@ def _validate_broker_payload(mode, payload):
             bad.append((f, "null"))
         elif isinstance(v, str) and not v.strip():
             bad.append((f, "empty"))
+    if mode == "traderspost" and isinstance(payload, dict):
+        action    = str(payload.get("action", "")).strip().lower()
+        sentiment = str(payload.get("sentiment", "")).strip().lower()
+        if action in ("buy", "sell") and sentiment == "flat":
+            bad.append(("sentiment",
+                        "ENTRY signal (action=%r) must not carry sentiment='flat' — "
+                        "TradersPost interprets 'flat' as close-only; use 'long' or 'short'" % action))
+        if action == "exit" and sentiment in ("long", "short"):
+            bad.append(("sentiment",
+                        "EXIT signal (action='exit') must not carry sentiment=%r — "
+                        "send action='exit' with no sentiment for a clean flatten" % sentiment))
     return bad
 
 
@@ -2070,6 +2086,63 @@ def _recent_exec_rejections(limit=10):
             "instrument": r.get("instrument"),
             "time":       when,
             "reason":     r.get("reason"),
+        })
+    return out
+
+
+def _record_broker_send(inst, order_kind, payload, status_code, response_text):
+    """Append every attempted broker POST (success or rejection) to a display-only
+    ring buffer, surfaced in /status → dashboard Broker Send Log. Never raises."""
+    try:
+        action     = str(payload.get("action", "") if isinstance(payload, dict) else "").strip().lower()
+        signal_type = "EXIT" if action == "exit" or "reduce" in str(order_kind) else "ENTRY"
+        direction   = {"buy": "Long", "sell": "Short", "exit": "—"}.get(action, "—")
+        with BROKER_SEND_LOG_LOCK:
+            BROKER_SEND_LOG.append({
+                "instrument":   inst,
+                "ts":           time.time(),
+                "signal_type":  signal_type,
+                "direction":    direction,
+                "order_kind":   order_kind,
+                "action":       action,
+                "sentiment":    str(payload.get("sentiment", "") if isinstance(payload, dict) else "").strip() or "—",
+                "ticker":       str(payload.get("ticker", "") if isinstance(payload, dict) else ""),
+                "quantity":     (payload.get("quantity") if isinstance(payload, dict) else None),
+                "payload":      _redact_payload_for_log(payload),
+                "status_code":  status_code,
+                "response":     str(response_text or "")[:300].strip(),
+                "ok":           200 <= int(status_code or 0) < 300,
+            })
+    except Exception:
+        pass
+
+
+def _recent_broker_sends(limit=10):
+    """Most-recent-first serialized view of broker send attempts for the dashboard."""
+    try:
+        with BROKER_SEND_LOG_LOCK:
+            rows = list(BROKER_SEND_LOG)[-limit:]
+    except Exception:
+        return []
+    out = []
+    for r in reversed(rows):
+        try:
+            when = fmt_et(datetime.fromtimestamp(r["ts"], tz=timezone.utc), "%m/%d %H:%M:%S ET")
+        except Exception:
+            when = "—"
+        out.append({
+            "instrument":  r.get("instrument"),
+            "time":        when,
+            "signal_type": r.get("signal_type"),
+            "direction":   r.get("direction"),
+            "action":      r.get("action"),
+            "sentiment":   r.get("sentiment"),
+            "ticker":      r.get("ticker"),
+            "quantity":    r.get("quantity"),
+            "payload":     r.get("payload"),
+            "status_code": r.get("status_code"),
+            "response":    r.get("response"),
+            "ok":          r.get("ok"),
         })
     return out
 
@@ -2887,7 +2960,7 @@ def adapt_traderspost(intent):
         "ticker":     intent["broker_symbol"],
         "action":     intent["action"],
         "quantity":   intent["quantity"],
-        "sentiment":  "bullish" if intent["action"] == "buy" else "bearish",
+        "sentiment":  "long" if intent["action"] == "buy" else "short",
         "signal":     "AI Trading Partner READY",
         "stopLoss":   {"type": "stop", "stopPrice": intent["stop"]},
         "takeProfit": {"limitPrice": intent["target1"]},
@@ -32766,6 +32839,7 @@ def _build_status_payload(_tk):
         # (default OFF => key is False => button hidden => today's UI byte-identical).
         "user_preview_enabled":     _user_preview_take_enabled(),
         "execution_rejections":     _recent_exec_rejections(),
+        "broker_send_log":          _recent_broker_sends(),
         # Trade-management analytics (MFE/MAE booleans + commission + oversized-loss);
         # null when every analytics flag is OFF (display-only).
         "trade_management":         _trade_mgmt_status_block(a.get("active_ticker")),
@@ -34220,13 +34294,16 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
                                    "check your broker before retrying.")}, 502
 
     if 200 <= resp.status_code < 300:
+        _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
         return None, None  # success -- caller continues to its own confirmation path
     elif 400 <= resp.status_code < 500:
         _release()
+        _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
         logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
         return {"status": "error",
                         "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}, 502
     else:
+        _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
         logger.warning("%s ambiguous response — cooldown held: %s %s", provider_label, resp.status_code, resp.text[:300])
         return {"status": "error", "broker_verify_required": True,
                         "reason": (f"{provider_label} returned {resp.status_code}. The order MAY have been placed — "
@@ -39042,6 +39119,13 @@ def dashboard():
   <div class="nf-fid">Orders rejected locally (e.g. missing ticker/action) and NOT sent to your broker. Display-only — clears on restart.</div>
 </div>
 
+<!-- Broker Send Log — every attempted POST to TradersPost with signal type, direction, and response (DISPLAY-ONLY) -->
+<div class="mod" id="mod-broker-send-log" style="display:none">
+  <div class="mod-h">📡 Broker Send Log <span id="bsl-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
+  <div class="nf-fid">Every order sent (or attempted) to TradersPost — signal type, direction, action, sentiment, HTTP status, and broker response. Display-only — clears on restart.</div>
+  <div style="overflow-x:auto;margin-top:6px"><table id="bsl-table" style="width:100%;border-collapse:collapse;font-size:11px"></table></div>
+</div>
+
 <!-- Prop Firm Protection (Task #15) — owner-only; FINAL fail-closed guard layer -->
 <div class="mod" id="mod-prop">
   <div class="mod-h">
@@ -40572,6 +40656,7 @@ function renderModules(d){
 
   // ── Module 10c: Blocked Orders — locally-rejected invalid-payload orders (DISPLAY-ONLY) ──
   renderExecRejections(d);
+  renderBrokerSendLog(d);
   renderProp(d);
 
   // ── Trade-management analytics + session quality + bot hold + LIVE runner arming
@@ -42270,6 +42355,50 @@ function renderExecRejections(d){
   _anFill('xr-list', rows.map(function(r){
     return (r.time||'—')+' · '+(r.instrument||'?')+' · '+(r.reason||'—');
   }));
+}
+
+// Broker Send Log — every attempted TradersPost POST with signal type, direction,
+// action, sentiment, HTTP status, and broker response. Display-only.
+function renderBrokerSendLog(d){
+  const mod=document.getElementById('mod-broker-send-log');
+  if(!mod) return;
+  const rows=(d && d.broker_send_log) || [];
+  if(!rows.length){ mod.style.display='none'; return; }
+  mod.style.display='';
+  const meta=document.getElementById('bsl-meta');
+  if(meta) meta.textContent=rows.length+' sends';
+  const tbl=document.getElementById('bsl-table');
+  if(!tbl) return;
+  var hdr='<tr style="color:#6b7280;font-size:10px;border-bottom:1px solid #334155">'
+    +'<th style="text-align:left;padding:2px 6px;font-weight:600">Time</th>'
+    +'<th style="padding:2px 4px;font-weight:600">Inst</th>'
+    +'<th style="padding:2px 4px;font-weight:600">Type</th>'
+    +'<th style="padding:2px 4px;font-weight:600">Dir</th>'
+    +'<th style="padding:2px 4px;font-weight:600">Action</th>'
+    +'<th style="padding:2px 4px;font-weight:600">Sentiment</th>'
+    +'<th style="padding:2px 4px;font-weight:600">Qty</th>'
+    +'<th style="padding:2px 4px;font-weight:600">HTTP</th>'
+    +'<th style="text-align:left;padding:2px 6px;font-weight:600">Response</th>'
+    +'</tr>';
+  var body='';
+  rows.forEach(function(r){
+    var ok=r.ok;
+    var sc=String(r.status_code||'—');
+    var scCol=ok?'#22c55e':'#ef4444';
+    var typeCol=r.signal_type==='ENTRY'?'#6ee7b7':r.signal_type==='EXIT'?'#fca5a5':'#9ca3af';
+    body+='<tr style="border-top:1px solid #1e293b">'
+      +'<td style="padding:3px 6px;color:#6b7280">'+aiEsc(r.time||'—')+'</td>'
+      +'<td style="padding:3px 4px;text-align:center">'+aiEsc(r.instrument||'?')+'</td>'
+      +'<td style="padding:3px 4px;text-align:center;font-weight:700;color:'+typeCol+'">'+aiEsc(r.signal_type||'?')+'</td>'
+      +'<td style="padding:3px 4px;text-align:center">'+aiEsc(r.direction||'—')+'</td>'
+      +'<td style="padding:3px 4px;text-align:center;font-family:monospace">'+aiEsc(r.action||'—')+'</td>'
+      +'<td style="padding:3px 4px;text-align:center;font-family:monospace">'+aiEsc(r.sentiment||'—')+'</td>'
+      +'<td style="padding:3px 4px;text-align:center">'+aiEsc(String(r.quantity!=null?r.quantity:'—'))+'</td>'
+      +'<td style="padding:3px 4px;text-align:center;font-weight:700;color:'+scCol+'">'+aiEsc(sc)+'</td>'
+      +'<td style="padding:3px 6px;color:#9ca3af;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+aiEsc(r.response||'—')+'</td>'
+      +'</tr>';
+  });
+  tbl.innerHTML=hdr+body;
 }
 
 // ── Prop Firm Protection (Task #15) — owner-only display + account manager ──
