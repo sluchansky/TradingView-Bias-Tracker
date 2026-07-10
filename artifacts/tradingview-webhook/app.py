@@ -44242,6 +44242,7 @@ function cpAsk(preset){
   var log=document.getElementById('cp-chat-log');
   if(log){
     var ub=document.createElement('div');
+    ub.dataset.role='user';
     ub.style.cssText='background:#1e3a5f;border-radius:10px 10px 2px 10px;padding:8px 12px;margin-bottom:8px;font-size:13px;color:#e5e7eb;text-align:right;line-height:1.5';
     ub.textContent=msg; log.appendChild(ub);
     var lb=document.createElement('div');
@@ -44250,15 +44251,22 @@ function cpAsk(preset){
     lb.textContent='Thinking\u2026'; log.appendChild(lb);
     log.scrollTop=log.scrollHeight;
   }
-  fetch(BASE+'assistant',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({messages:[{role:'user',content:msg}]})})
+  var _cpPriorHist=[];
+  if(log) Array.from(log.children).forEach(function(el){
+    var role=el.dataset.role; var txt=el.textContent||'';
+    if(role==='user'||role==='assistant') _cpPriorHist.push({role:role,content:txt.trim()});
+  });
+  fetch(BASE+'/assistant',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({question:msg, ticker:sym||null, history:_cpPriorHist.slice(-6)})})
   .then(function(r){return r.json();})
   .then(function(data){
     var lb=document.getElementById('cp-ai-loading'); if(lb) lb.remove();
-    if(log&&data&&data.response){
+    var reply=(data&&(data.response||data.answer))||null;
+    if(log&&reply){
       var ab=document.createElement('div');
+      ab.dataset.role='assistant';
       ab.style.cssText='background:#0d1117;border:1px solid #1f2937;border-radius:2px 10px 10px 10px;padding:10px 14px;margin-bottom:10px;font-size:13px;color:#d1d5db;line-height:1.65';
-      ab.textContent=data.response; log.appendChild(ab); log.scrollTop=log.scrollHeight;
+      ab.textContent=reply; log.appendChild(ab); log.scrollTop=log.scrollHeight;
     }
   })
   .catch(function(){ var lb=document.getElementById('cp-ai-loading'); if(lb) lb.remove(); })
