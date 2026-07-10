@@ -119,8 +119,14 @@ export default function Cockpit() {
   const [data, setData]               = useState<StatusData | null>(null);
   const [instSnaps, setInstSnaps]     = useState<Record<string, InstSnap>>({});
   const [fetchError, setFetchError]   = useState<string | null>(null);
+  const [pwd, setPwd]                 = useState<string>(() => { try { return sessionStorage.getItem("cockpit_pwd") ?? ""; } catch { return ""; } });
+  const [showLogin, setShowLogin]     = useState(false);
+  const [loginInput, setLoginInput]   = useState("");
+  const [loginErr, setLoginErr]       = useState(false);
   const activeRef = useRef(activeTicker);
   activeRef.current = activeTicker;
+  const pwdRef = useRef(pwd);
+  pwdRef.current = pwd;
 
   const applyData = useCallback((json: StatusData, ticker: string) => {
     if (ticker === activeRef.current) {
@@ -139,7 +145,16 @@ export default function Cockpit() {
 
   const fetchStatus = useCallback(async (ticker: string) => {
     try {
-      const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include" });
+      const headers: Record<string, string> = {};
+      const p = pwdRef.current;
+      if (p) headers["Authorization"] = `Basic ${btoa(":" + p)}`;
+      const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
+      if (res.status === 401) {
+        setPwd("");
+        try { sessionStorage.removeItem("cockpit_pwd"); } catch { /* ignore */ }
+        setShowLogin(true);
+        return;
+      }
       if (res.status === 503) return;
       if (!res.ok) { setFetchError(`HTTP ${res.status}`); return; }
       const json: StatusData = await res.json();
@@ -149,6 +164,19 @@ export default function Cockpit() {
       setFetchError("Network error");
     }
   }, [applyData]);
+
+  const handleLogin = useCallback((e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginErr(false);
+    const p = loginInput.trim();
+    if (!p) return;
+    setPwd(p);
+    pwdRef.current = p;
+    try { sessionStorage.setItem("cockpit_pwd", p); } catch { /* ignore */ }
+    setShowLogin(false);
+    setLoginInput("");
+    INSTRUMENTS.forEach(inst => fetchStatus(inst));
+  }, [loginInput, fetchStatus]);
 
   useEffect(() => { INSTRUMENTS.forEach(inst => fetchStatus(inst)); }, [fetchStatus]);
 
