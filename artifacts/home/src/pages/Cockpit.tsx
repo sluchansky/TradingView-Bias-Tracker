@@ -39,6 +39,7 @@ type StatusData = {
   current_price?: number;
   display_price?: string;
   trading_mode?: string;
+  execution_mode?: string;
   active_ticker?: string;
   trade_plan?: TradePlan;
   market_events_timeline?: TimelineEvent[];
@@ -488,13 +489,13 @@ export default function Cockpit() {
         background: C.surface, borderLeft: `1px solid ${C.border}`,
         padding: "24px 20px", display: "flex", flexDirection: "column", overflow: "hidden",
       }}>
-        <Label>Account</Label>
+        <Label>Bot status</Label>
         <div style={{ marginTop: "14px", marginBottom: "20px" }}>
-          <div style={{ fontSize: "26px", fontWeight: 800, color: C.textPrimary, letterSpacing: "-0.8px" }}>
-            {data ? "See broker" : "—"}
+          <div style={{ fontSize: "22px", fontWeight: 800, color: verdictColor, letterSpacing: "-0.5px" }}>
+            {data?.verdict ?? "—"}
           </div>
           <div style={{ fontSize: "12px", color: C.textSecondary, fontWeight: 600, marginTop: "3px" }}>
-            {activeTicker} · {mode}
+            {activeTicker} · {mode} · {safeStr(data?.execution_mode as string)?.replace(/_/g, " ") ?? "—"}
           </div>
         </div>
 
