@@ -37422,20 +37422,22 @@ def dashboard():
   .adv-hint{font-size:11px;color:var(--muted);opacity:.7}
   /* Interactive "Ask the brain" chat inside the Main Brain panel (DISPLAY-ONLY). */
   .mb-chat-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim,#caa14a);font-weight:700;margin:14px 0 6px;display:flex;align-items:center;gap:8px}
-  .mb-chat-log{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto;margin-bottom:8px}
+  .mb-chat-log{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto;margin-bottom:8px}
   .mb-msg{max-width:92%;border-radius:8px;padding:7px 9px;font-size:12px;line-height:1.45;white-space:pre-wrap}
-  .mb-msg-u{align-self:flex-end;background:#241a3a;border:1px solid #3a2363;color:#e7dcff}
-  .mb-msg-a{align-self:flex-start;background:#101826;border:1px solid #243349;color:#d7e3f0}
+  .mb-msg-u{align-self:flex-end;background:#1e1430;border:1px solid #3a2363;color:#e7dcff;border-radius:8px}
+  .mb-msg-a{align-self:flex-start;background:#0c1422;border:1px solid #243349;border-left:3px solid rgba(125,140,255,.55);color:#d7e3f0;border-radius:8px}
   .mb-msg .mb-msg-who{font-size:9px;letter-spacing:1px;color:#6b7280;margin-bottom:2px}
   .mb-chat-empty{font-size:11px;color:#6b7280;padding:6px 2px}
   .mb-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-  .mb-chip{background:#1a1230;color:#cbb6ff;border:1px solid #3a2363;border-radius:14px;padding:4px 10px;font-size:10px;font-weight:700;letter-spacing:.5px;cursor:pointer}
-  .mb-chip:hover{background:#241a3a}
+  .mb-chip{background:#1a1230;color:#cbb6ff;border:1px solid #3a2363;border-radius:14px;padding:5px 12px;font-size:11px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:background .15s,border-color .15s,color .15s}
+  .mb-chip:hover{background:#241a3a;border-color:rgba(142,162,255,.5);color:#ddd4ff}
   .mb-chat-row{display:flex;gap:6px}
-  .mb-chat-row input{flex:1;background:#0c0a18;border:1px solid #3a2363;border-radius:6px;color:#efe9ff;padding:8px;font-size:12px}
-  #mb-chat-send{background:#241a3a;color:#cbb6ff;border:1px solid #3a2363}
+  .mb-chat-row input{flex:1;background:#0a0817;border:1px solid #3a2363;border-radius:8px;color:#efe9ff;padding:11px 13px;font-size:13px;transition:border-color .18s,box-shadow .18s}
+  .mb-chat-row input:focus{outline:none;border-color:rgba(142,162,255,.65);box-shadow:0 0 0 3px rgba(125,140,255,.12)}
+  #mb-chat-send{background:#241a3a;color:#cbb6ff;border:1px solid #3a2363;padding:0 20px;border-radius:8px;font-weight:700;letter-spacing:.4px;transition:background .15s,border-color .15s;white-space:nowrap}
+  #mb-chat-send:hover:not(:disabled){background:#2d1a52;border-color:rgba(142,162,255,.5)}
   .mb-badge{font-size:10px;font-weight:800;letter-spacing:1px;color:#0b0b12;padding:2px 9px;border-radius:999px;background:#6b7280}
-  .mb-summary{font-size:14px;line-height:1.55;color:#e8e8f0;margin:4px 0 12px;font-weight:600}
+  .mb-summary{font-size:15px;line-height:1.6;color:#f0efff;margin:4px 0 14px;font-weight:600;border-left:3px solid rgba(142,162,255,.65);padding-left:12px;font-style:italic;letter-spacing:.01em}
   .mb-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:0 0 12px}
   .mb-stat{background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:8px 10px}
   .mb-stat-l{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:700;margin-bottom:4px}
@@ -37514,12 +37516,16 @@ def dashboard():
   .mb-list li{font-size:12px;line-height:1.45;color:#cfd0e0;padding-left:12px;position:relative}
   .mb-list li:before{content:"›";position:absolute;left:0;color:var(--amber-dim)}
   .mb-feed-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:6px}
-  .mb-feed{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:var(--inset);border:1px solid var(--border);border-radius:4px;padding:10px}
+  .mb-feed{max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:#060911;border:1px solid rgba(56,200,255,.18);border-radius:6px;padding:10px;font-family:ui-monospace,monospace}
   .mb-feed-empty{font-size:12px;color:#6b7280;font-style:italic}
   .mb-feed-row{display:flex;gap:8px;align-items:baseline;font-size:12px;line-height:1.4}
   .mb-feed-t{flex:0 0 auto;color:#6b7280;font-family:ui-monospace,monospace;font-size:11px}
   .mb-feed-badge{flex:0 0 auto;font-weight:800;font-size:10px;letter-spacing:.5px}
-  .mb-feed-tx{flex:1 1 auto;color:#cfd0e0}
+  .mb-feed-tx{flex:1 1 auto;color:#c8d0e8}
+  .mb-feed-h::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle;animation:mbLivePulse 2.2s ease-in-out infinite}
+  @keyframes mbLivePulse{0%,100%{opacity:1}50%{opacity:.2}}
+  .mb-msg-a .mb-msg-who{color:#9d99ff;letter-spacing:.5px}
+  .mb-msg-u .mb-msg-who{color:#6b7280}
   .mb-foot{font-size:10px;color:#6b7280;margin-top:8px;font-style:italic}
   .mb-prop{font-size:11px;color:#a8a8c0;margin-top:8px;padding-top:7px;border-top:1px solid var(--border)}
   .mb-prop-dot{margin-right:6px;font-size:11px}
@@ -37769,7 +37775,7 @@ def dashboard():
   .mb-stat{background:linear-gradient(165deg,rgba(255,255,255,.05),rgba(255,255,255,.013));padding:11px 12px}
   .mb-col{background:linear-gradient(165deg,rgba(255,255,255,.042),rgba(255,255,255,.01));padding:13px 14px}
   .mb-stats{gap:11px}.mb-grid,.mb-cases{gap:12px}
-  .mb-summary{font-family:var(--sans);font-size:14.5px;line-height:1.6}
+  .mb-summary{font-family:var(--sans)}
   .mb-stat-v,.cd-big,.gauge-prob,.mgauge-prob,.gstat .v{font-family:var(--sans)}
   #status-label,.focus-lbl,.tab,.view-btn,.mode-btn,.dir-btn,.rec-badge,.mb-badge,.mb-act-pill,.mb-stat-l,.mb-col-h,.mb-mission-h,.mb-mc-l,.mb-rv-l,.mod-h{font-family:var(--sans)}
   #alert-ctl span{transition:all .16s;-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
@@ -38065,7 +38071,7 @@ def dashboard():
   <div class="mod" id="mod-brain">
     <div class="mod-h">🧠 Main Brain
       <span id="mb-badge" class="mb-badge">…</span>
-      <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">LIVE READ · DISPLAY-ONLY</span>
+      <span style="font-size:11px;color:#22c55e;letter-spacing:1px;margin-left:auto;animation:mbLivePulse 2.2s ease-in-out infinite">● LIVE</span>
     </div>
     <div id="mb-summary" class="mb-summary">Loading…</div>
     <!-- Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (fed by
@@ -38158,7 +38164,7 @@ def dashboard():
       <ul class="mb-list mb-lessons" id="mb-lessons"></ul>
       <div class="mb-review-note" id="mb-review-note"></div>
     </div>
-    <div class="mb-feed-h">Live conversation</div>
+    <div class="mb-feed-h">Live thinking</div>
     <div id="mb-feed" class="mb-feed"></div>
     <!-- Prop Firm Protection — one-line guard status (display-only read of
          main_brain.prop_rule; the guard itself lives in execute_trade_gateway). -->
@@ -38169,7 +38175,7 @@ def dashboard():
     <!-- Interactive partner — ask the brain live questions. Reuses the read-only
          /assistant backend (grounded on the same snapshot + open trades + risk rules).
          DISPLAY-ONLY: it NEVER places, sizes, or changes a trade. -->
-    <div class="mb-chat-h">💬 Ask the brain <span style="font-size:9px;color:#6b7280;letter-spacing:1px">READ-ONLY · LIVE STATE</span></div>
+    <div class="mb-chat-h">💬 Talk to your partner <span style="font-size:9px;color:#6b7280;letter-spacing:1px">LIVE STATE · READ-ONLY</span></div>
     <div id="mb-chat-log" class="mb-chat-log"></div>
     <div class="mb-chips">
       <button type="button" class="mb-chip" onclick="mbAsk('Why are you waiting? What is keeping the current setup from being READY right now?')">WHY WAIT?</button>
@@ -38181,8 +38187,8 @@ def dashboard():
       <button type="button" class="mb-chip" onclick="mbAsk('Give me a risk check: my risk rules, daily limits, contracts used, profit and loss today, and whether it is safe to take another trade right now.')">RISK CHECK</button>
     </div>
     <div class="mb-chat-row">
-      <input id="mb-chat-input" type="text" placeholder="Ask anything — e.g. would you long or short here? what are you watching next?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
-      <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Send</button>
+      <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
+      <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask →</button>
     </div>
   </div>
   <!-- ════ Live Chart Preview — TradingView Advanced Chart embed (DISPLAY-ONLY).
