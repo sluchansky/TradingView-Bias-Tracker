@@ -47,13 +47,7 @@ type StatusData = {
   vwap_value?: number;
   vwap_status?: string;
   active_trade_mgmt?: ActiveTradeMgmt;
-  prop_firm?: {
-    enabled?: boolean;
-    db_ready?: boolean;
-    headline?: string;
-    account?: { name?: string; firm?: string } | null;
-    phase2?: string[];
-  };
+  prop_firm?: { safe?: boolean; status?: string };
   trade_memory?: { summary_text?: string };
   analyst?: { memory_review?: unknown };
   confidence_governor?: { summary?: unknown };
@@ -126,7 +120,7 @@ export default function Cockpit() {
   const [instSnaps, setInstSnaps]     = useState<Record<string, InstSnap>>({});
   const [fetchError, setFetchError]   = useState<string | null>(null);
   const [pwd, setPwd]                 = useState<string>(() => { try { return sessionStorage.getItem("cockpit_pwd") ?? ""; } catch { return ""; } });
-  const [showLogin, setShowLogin]     = useState<boolean>(() => { try { return !sessionStorage.getItem("cockpit_pwd"); } catch { return true; } });
+  const [showLogin, setShowLogin]     = useState(false);
   const [loginInput, setLoginInput]   = useState("");
   const [loginErr, setLoginErr]       = useState(false);
   const activeRef = useRef(activeTicker);
@@ -252,9 +246,7 @@ export default function Cockpit() {
   const atR            = atm?.current_r ?? atm?.unrealized_r;
   const atUnrealized   = atR != null ? `${atR > 0 ? "+" : ""}${atR.toFixed(2)}R` : "—";
 
-  const propEnabled = data?.prop_firm?.enabled ?? false;
-  const propHasAccount = data?.prop_firm?.account != null;
-  const propSafe = !propEnabled || propHasAccount;
+  const propSafe  = data?.prop_firm?.safe ?? true;
   const timeline: TimelineEvent[] = Array.isArray(data?.market_events_timeline)
     ? data!.market_events_timeline!.slice(0, 12) : [];
 
@@ -552,18 +544,11 @@ export default function Cockpit() {
         <div style={{ display: "flex", alignItems: "center", gap: "7px" }}>
           <div style={{
             width: "6px", height: "6px", borderRadius: "50%",
-            background: !propEnabled ? "#4b5563" : propSafe ? C.green : "#f97316",
-            boxShadow: propEnabled && propSafe ? "0 0 6px rgba(34,197,94,0.5)" : "none",
+            background: propSafe ? C.green : "#f87171",
+            boxShadow: propSafe ? "0 0 6px rgba(34,197,94,0.5)" : "none",
           }} />
-          <span style={{ fontSize: "11px", fontWeight: 600,
-            color: !propEnabled ? C.textDim : propSafe ? "#16a34a" : "#f97316",
-          }}>
-            {!data ? "—" :
-             !propEnabled ? "Prop rules off" :
-             !propHasAccount ? "No account set" :
-             safeStr(data?.prop_firm?.account?.name)
-               ? `${data!.prop_firm!.account!.name} · ON`
-               : "Protection ON"}
+          <span style={{ fontSize: "11px", color: propSafe ? "#16a34a" : "#f87171", fontWeight: 600 }}>
+            {safeStr(data?.prop_firm?.status) ?? (propSafe ? "Prop rules safe" : "Check prop rules")}
           </span>
         </div>
       </aside>

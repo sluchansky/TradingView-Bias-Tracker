@@ -39386,7 +39386,7 @@ def dashboard():
       <button type="button" id="cp-follow" class="cp-btn" onclick="cpToggleFollow()" title="When ON, the chart snaps to the instrument the bot has a live trade idea on (READY verdict). Clicking a symbol button turns follow off so your pick sticks.">FOLLOW: ON</button>
     </div>
     <div style="position:relative;width:100%;height:420px;border:1px solid var(--border,#2a2a3a);border-radius:8px;overflow:hidden;background:#0d1117">
-      <div id="cp-frame" style="position:absolute;inset:0;width:100%;height:100%"></div>
+      <iframe id="cp-frame" title="TradingView chart" style="position:absolute;inset:0;width:100%;height:100%;border:0" allowfullscreen loading="eager" referrerpolicy="no-referrer"></iframe>
     </div>
     <div class="nf-fid">View-only TradingView embed. TradingView&rsquo;s free embed doesn&rsquo;t license live futures data, so each button shows a 24h proxy feed that moves with your contract (Nasdaq&rarr;MNQ &middot; Gold spot&rarr;MGC &middot; S&amp;P&rarr;MES &middot; Dow&rarr;MYM). Prices differ from the futures quote by a small basis offset, but the candles/levels move together. It never affects alerts, tracking or order logic.</div>
   </div>
@@ -43917,10 +43917,6 @@ function setCpMode(mode){
   var be = document.getElementById('cp-btn-eng');
   if(bc) bc.classList.toggle('active', mode==='cockpit');
   if(be) be.classList.toggle('active', mode!=='cockpit');
-  // Engineering mode: auto-reveal all panels so the full data grid is visible.
-  // Cockpit mode: collapse back to focused view (turn Advanced off).
-  if(mode==='engineering') _advApply(true);
-  else _advApply(false);
 }
 // Apply saved mode on page load (script is at bottom — DOM is ready)
 (function(){
@@ -45928,47 +45924,21 @@ try {
   const ct=localStorage.getItem('cpTf');  if (ct && CP_TFS.indexOf(ct)>=0) cpTf=ct;
   cpFollow = localStorage.getItem('cpFollow') !== '0';
 } catch(e){}
-// Build the TradingView JS widget in the container div.
-// Reads the LIVE cpSym/cpTf at call-time so concurrent async callbacks
-// always land on the latest user selection and never double-build.
-function _cpBuildWidget(){
-  const key=cpSym+'|'+cpTf;
-  if(key===cpLoadedKey) return;
-  const wrap=document.getElementById('cp-frame');
-  if(!wrap) return;
-  cpLoadedKey=key;
-  wrap.innerHTML='';
-  const cid='tv'+Math.random().toString(36).slice(2,9);
-  const inner=document.createElement('div');
-  inner.id=cid; inner.style.cssText='width:100%;height:100%';
-  wrap.appendChild(inner);
-  const tvs=CP_TV_SYMBOLS[cpSym]||CP_TV_SYMBOLS.MNQ;
-  try{
-    new TradingView.widget({container_id:cid, autosize:true, symbol:tvs,
-      interval:cpTf, timezone:'America/New_York', theme:'dark',
-      style:'1', locale:'en', hide_side_toolbar:true,
-      allow_symbol_change:false, save_image:false});
-  }catch(e){}
-}
-// Lazy-load s3.tradingview.com/tv.js once; call cb immediately if already ready.
-function _cpEnsureTv(cb){
-  if(typeof TradingView!=='undefined'&&TradingView.widget){ cb(); return; }
-  var sc=document.getElementById('_cptvsc');
-  if(!sc){
-    sc=document.createElement('script'); sc.id='_cptvsc';
-    sc.src='https://s3.tradingview.com/tv.js';
-    sc.onload=function(){ cb(); };
-    document.head.appendChild(sc);
-  } else {
-    sc.addEventListener('load',function(){ cb(); },{once:true});
-  }
+function cpBuildSrc(){
+  const tvs = CP_TV_SYMBOLS[cpSym] || CP_TV_SYMBOLS.MNQ;
+  return 'https://s.tradingview.com/widgetembed/?symbol='+encodeURIComponent(tvs)
+    + '&interval='+encodeURIComponent(cpTf)
+    + '&theme=dark&style=1&locale=en&timezone=America%2FNew_York'
+    + '&hide_side_toolbar=1&allow_symbol_change=0&save_image=0&withdateranges=0';
 }
 function cpApply(){
-  const key=cpSym+'|'+cpTf;
-  const wrap=document.getElementById('cp-frame');
-  // Only (re)build the widget on a REAL symbol/timeframe change — the 3s
-  // /status poll calls through here and must never reload the chart.
-  if(wrap&&key!==cpLoadedKey){ _cpEnsureTv(function(){ _cpBuildWidget(); }); }
+  const f=document.getElementById('cp-frame');
+  if (f){
+    const key=cpSym+'|'+cpTf;
+    // Only (re)load the iframe on a REAL symbol/timeframe change — the 3s
+    // /status poll calls through here and must never reload the chart.
+    if (key!==cpLoadedKey){ f.src=cpBuildSrc(); cpLoadedKey=key; }
+  }
   Object.keys(CP_TV_SYMBOLS).forEach(function(s){
     const b=document.getElementById('cp-sym-'+s); if (b) b.classList.toggle('active', s===cpSym);
   });
