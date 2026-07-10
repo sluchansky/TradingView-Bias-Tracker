@@ -39003,6 +39003,11 @@ def dashboard():
       <div class="cp-playbook-lbl" id="cp-playbook">&#8212;</div>
       <div class="cp-sub">Progress</div>
       <div id="cp-progress-list"></div>
+      <div id="cp-levels-wrap" style="display:none;margin-top:14px">
+        <div class="cp-sub">Suggested Levels</div>
+        <div id="cp-levels"></div>
+        <button id="cp-enter-btn" onclick="cpEnter()" style="margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;cursor:pointer;font-weight:800;font-size:13px;letter-spacing:.5px">&#128200; ENTER</button>
+      </div>
     </div>
     <!-- Learning Memory -->
     <div class="cp-card" id="cp-learning-card">
@@ -44203,6 +44208,41 @@ function renderCockpit(d){
     });
   }
 
+  // Suggested Levels — trade_plan (READY) takes priority, else potential_plan (forming)
+  var levWrap=document.getElementById('cp-levels-wrap');
+  var levEl=document.getElementById('cp-levels');
+  var levBtn=document.getElementById('cp-enter-btn');
+  var cpDir=dir||'Long';
+  var tp=d.trade_plan||{};
+  var dirBlk=((d.directions||{})[cpDir])||{};
+  var pp=(dirBlk.potential_plan&&dirBlk.potential_plan.trade_plan)?dirBlk.potential_plan:null;
+  var plan=tp.trade_plan?tp:(pp||null);
+  if(levWrap&&levEl){
+    if(plan){
+      levWrap.style.display='block';
+      var isReadyPlan=!!(tp.trade_plan);
+      var planDir=plan.direction||cpDir;
+      var isShortPlan=(planDir||'').toLowerCase().indexOf('short')>=0;
+      levEl.innerHTML=
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">'+
+          '<div style="background:#0a1f12;border-radius:6px;padding:8px"><div style="color:#6b7280;font-size:10px;letter-spacing:1px;margin-bottom:2px">ENTRY ZONE</div><div style="color:#22c55e;font-weight:700">'+esc(plan.entry_zone||'\u2014')+'</div></div>'+
+          '<div style="background:#1a0909;border-radius:6px;padding:8px"><div style="color:#6b7280;font-size:10px;letter-spacing:1px;margin-bottom:2px">STOP LOSS</div><div style="color:#f87171;font-weight:700">'+esc(plan.stop_loss!=null?String(plan.stop_loss):'\u2014')+'</div></div>'+
+          '<div style="background:#080f1f;border-radius:6px;padding:8px"><div style="color:#6b7280;font-size:10px;letter-spacing:1px;margin-bottom:2px">TARGET 1</div><div style="color:#60a5fa;font-weight:700">'+esc(plan.target1!=null?String(plan.target1):'\u2014')+'</div></div>'+
+          '<div style="background:#120b20;border-radius:6px;padding:8px"><div style="color:#6b7280;font-size:10px;letter-spacing:1px;margin-bottom:2px">R:R</div><div style="color:#a78bfa;font-weight:700">'+esc(plan.rr||'1:1')+'</div></div>'+
+        '</div>'+
+        (plan.risk_points!=null?'<div style="color:#9ca3af;font-size:11px;margin-top:5px">Risk distance <b style="color:#e5e7eb">'+esc(String(plan.risk_points))+'</b> pts</div>':'')+
+        (!isReadyPlan?'<div style="color:#f59e0b;font-size:10px;margin-top:6px">\u23f3 Forming \u00b7 not yet READY \u00b7 no auto-order sent</div>':'');
+      if(levBtn){
+        levBtn.style.display='block';
+        levBtn.textContent=(isShortPlan?'ENTER SHORT':'ENTER LONG');
+        levBtn.style.background=isShortPlan?'#dc2626':'#16a34a';
+        levBtn.style.color='#fff';
+      }
+    } else {
+      levWrap.style.display='none';
+    }
+  }
+
   // Learning Memory
   var lEl=document.getElementById('cp-learning-prose');
   if(lEl) lEl.textContent=_cpLearningProse(d);
@@ -44271,6 +44311,33 @@ function cpAsk(preset){
   })
   .catch(function(){ var lb=document.getElementById('cp-ai-loading'); if(lb) lb.remove(); })
   .finally(function(){ _cpChatBusy=false; });
+}
+// ── Cockpit ENTER — pre-fills engineering form from current plan then calls enterTrade()
+// Routes through the same audited gateway path as the engineering ENTER button.
+// Display-only pre-fill; all safety layers (sizing, prop guard, kill switch) run server-side.
+function cpEnter(){
+  if(!lastRec){ toast('No snapshot yet — wait for refresh',false); return; }
+  var tp=lastRec.trade_plan||{};
+  var cpDir2=dir||'Long';
+  var dirBlk2=((lastRec.directions||{})[cpDir2])||{};
+  var pp2=(dirBlk2.potential_plan&&dirBlk2.potential_plan.trade_plan)?dirBlk2.potential_plan:null;
+  var plan2=tp.trade_plan?tp:(pp2||null);
+  if(plan2){
+    var parts2=String(plan2.entry_zone||'').split('\u2013').concat(String(plan2.entry_zone||'').split('-'));
+    // entry_zone format is "lo–hi" (en-dash) or "lo-hi"
+    var lo2=parseFloat(parts2[0]), hi2=parseFloat(parts2[1]);
+    if(!isNaN(lo2)&&!isNaN(hi2)){
+      var mid2=(lo2+hi2)/2;
+      var fe=document.getElementById('f-entry'); if(fe) fe.value=fmtPrice(sym,mid2);
+    }
+    var fs=document.getElementById('f-stop');   if(fs&&plan2.stop_loss!=null)  fs.value=plan2.stop_loss;
+    var ft1=document.getElementById('f-t1');    if(ft1&&plan2.target1!=null)   ft1.value=plan2.target1;
+    var ft2=document.getElementById('f-t2');    if(ft2&&plan2.target2!=null)   ft2.value=plan2.target2;
+    // Sync direction selector to the plan direction so enterTrade() reads the right side
+    var planDir2=(plan2.direction||cpDir2).indexOf('Short')>=0?'Short':'Long';
+    setDir(planDir2);
+  }
+  enterTrade();
 }
 // ══════════════════ END COCKPIT MODE ══════════════════════════════════════
 
