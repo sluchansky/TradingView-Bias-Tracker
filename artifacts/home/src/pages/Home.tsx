@@ -128,7 +128,9 @@ function useTTS() {
   return { voices, voiceName, setVoice, muted, setMuted, speaking, speak };
 }
 
-// ── Full digital face — all features in 1s & 0s ──────────────────────────────
+// ── Digital portrait — 3D-lit face emerging from 1s & 0s ─────────────────────
+// Approach: Lambertian lighting on an ellipsoid face, Gaussian features (eye
+// socket shadows, nose/cheekbone highlights, jaw shadows), dense 6×8 grid.
 function BrainFace({ speaking, color, glow, status }: {
   speaking: boolean; color: string; glow: string; status: string;
 }) {
@@ -141,57 +143,97 @@ function BrainFace({ speaking, color, glow, status }: {
     if (!cv) return;
     const ctx = cv.getContext('2d')!;
 
-    // 28 cols × 20 rows at 9×11 px → 252×220 canvas
-    const COLS = 28, ROWS = 20, CW = 9, CH = 11;
+    // 40 cols × 42 rows at 6×8 px → 240×336 portrait canvas
+    const COLS = 40, ROWS = 42, CW = 6, CH = 8;
 
     const grid: string[][] = Array.from({ length: ROWS }, () =>
       Array.from({ length: COLS }, () => (Math.random() < 0.5 ? '0' : '1'))
     );
 
-    // ── Geometry (all in cell-centre coords: col+0.5, row+0.5) ───────────────
-    const FCX = 14, FCY = 10, FRX = 12.5, FRY = 8.8;                     // face
-    const LBX = 8.5, RBX = 19.5, BY_B = 4.2, BWH = 2.3, BARCH = 0.7;    // brows
-    const LEX = 8.5, REX = 19.5, EY = 6.8;                                // eyes (shared Y)
-    const ERX = 2.5, ERY_F = 1.35, IRS_X = 1.45, IRS_Y = 1.15, PR = 0.73; // eye radii
-    const NX = 14, NBY1 = 9.5, NBY2 = 12.5;                               // nose bridge
-    const NLX = 12.5, NRX = 15.5, NNY = 12.8, NNR = 0.82;                // nostrils
-    const MX = 14, M_UY = 15.5, M_LY = 16.9, MHW = 4.5, M_OPEN = 1.9;  // mouth
+    // ── Face geometry (cell-centre coords) ────────────────────────────────────
+    const FCX = 20, FCY = 22, FRX = 15.5, FRY = 18;  // main face ellipse
+    const LEX = 14, REX = 26, EY  = 19;               // eye centres (shared Y)
+    const ERX = 3.5, ERY_F = 2.2;                      // eye ellipse half-radii
+    const IRS_X = 2.0, IRS_Y = 1.6, PR = 1.05;        // iris / pupil
+    const MX = 20, MY = 29, MHW = 5.8, M_OPEN = 2.8; // mouth
 
-    const ell = (px: number, py: number, cx: number, cy: number, rx: number, ry: number) =>
-      ry > 0.01 && ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 <= 1;
+    // sq avoids unary-minus-before-** parse errors
+    const sq = (x: number) => x * x;
+    const gauss = (cx: number, cy: number, gx: number, gy: number, srx: number, sry: number, amp: number) =>
+      amp * Math.exp(-(sq((cx - gx) / srx) + sq((cy - gy) / sry)));
+    const ell = (cx: number, cy: number, ex: number, ey: number, rx: number, ry: number) =>
+      ry > 0.01 && sq((cx - ex) / rx) + sq((cy - ey) / ry) <= 1;
 
-    // Eyebrow Y at column cx (parabolic arch, raises with expression)
-    const browY = (cx: number, bx: number, raise: number) => {
-      const t = (cx - bx) / BWH;
-      return BY_B + raise - BARCH * Math.max(0, 1 - t * t);
-    };
+    // ── 3D brightness model ────────────────────────────────────────────────────
+    // Returns -1 for background, 0.0-1.0 for face (driven by lighting + Gaussians)
+    function brightness(cx: number, cy: number, smile: number, browRaise: number, mouthOpen: number): number {
+      const dx = (cx - FCX) / FRX, dy = (cy - FCY) / FRY;
+      const r2 = sq(dx) + sq(dy);
+      if (r2 > 1.05) return -1;  // background
 
-    // Upper lip: Cupid's bow via two Gaussians (M-shape)
+      // Ellipsoid surface normal (paraboloid approx)
+      const nz   = Math.sqrt(Math.max(0, 1 - sq(dx) * 0.55 - sq(dy) * 0.55));
+      const nxF  = -dx * 0.65;
+      const nyF  = -dy * 0.65;
+      // Key light: upper-left, forward-facing
+      const lx   = -0.40, ly = -0.50, lz = 0.77;
+      const diff = Math.max(0, nxF * lx + nyF * ly + nz * lz);
+      // Rim: subtle from opposite side
+      const rim  = 0.08 * Math.max(0, -nxF * lx - nyF * ly + nz * 0.9);
+
+      let b = 0.13 + diff * 0.67 + rim;
+
+      // ── Highlight Gaussians ──────────────────────────────────────────────
+      b += gauss(cx, cy, FCX, FCY - 1, 1.3, 5.5, 0.20);    // nose bridge
+      b += gauss(cx, cy, FCX, FCY + 4, 2.0, 2.2, 0.14);    // nose tip
+      b += gauss(cx, cy, 9,   FCY - 1, 4.5, 3.5, 0.11);    // L cheekbone
+      b += gauss(cx, cy, 31,  FCY - 1, 4.5, 3.5, 0.11);    // R cheekbone
+      b += gauss(cx, cy, 19,  FCY-13,  5.0, 4.0, 0.09);    // forehead (key-lit)
+      b += gauss(cx, cy, FCX, MY - 0.8, 5.5, 1.1, 0.07 + smile * 0.05); // upper lip
+      b += gauss(cx, cy, FCX, MY + 1.8, 4.5, 1.0, 0.05 + smile * 0.04); // lower lip
+
+      // ── Shadow Gaussians ─────────────────────────────────────────────────
+      b -= gauss(cx, cy, LEX, EY, 4.2, 3.0, 0.40);                       // L eye socket
+      b -= gauss(cx, cy, REX, EY, 4.2, 3.0, 0.40);                       // R eye socket
+      b -= gauss(cx, cy, LEX, EY - 2.5 + browRaise, 3.5, 1.5, 0.14);    // L sub-brow
+      b -= gauss(cx, cy, REX, EY - 2.5 + browRaise, 3.5, 1.5, 0.14);    // R sub-brow
+      b -= gauss(cx, cy, 17,  FCY + 3,  1.5, 3.0, 0.10);                 // L nasolabial
+      b -= gauss(cx, cy, 23,  FCY + 3,  1.5, 3.0, 0.10);                 // R nasolabial
+      b -= gauss(cx, cy, FCX, MY - 2.5, 2.2, 2.0, 0.11);                // philtrum/under-nose
+      b -= gauss(cx, cy, FCX, MY + 4.0, 3.5, 1.5, 0.09);                // under-lip shadow
+      b -= gauss(cx, cy, 6,   FCY + 5,  3.0, 7.0, 0.22);                 // L jaw shadow
+      b -= gauss(cx, cy, 34,  FCY + 5,  3.0, 7.0, 0.22);                 // R jaw shadow
+      b -= gauss(cx, cy, 5,   EY,       2.5, 4.5, 0.16);                 // L temple
+      b -= gauss(cx, cy, 35,  EY,       2.5, 4.5, 0.16);                 // R temple
+      b -= gauss(cx, cy, FCX, FCY + 17, 4.0, 2.5, 0.10);                // chin shadow
+      b -= gauss(cx, cy, FCX, FCY - 15, 9.0, 3.5, 0.38);                // hair / top shadow
+
+      // Speaking: subtle mouth-region brightness pulse
+      if (mouthOpen > 0.1) b += gauss(cx, cy, FCX, MY, 5.0, 1.5, mouthOpen * 0.06);
+
+      return Math.max(0.02, Math.min(1.0, b));
+    }
+
+    // Upper lip: Cupid's bow via two Gaussians
     const upperLipY = (cx: number, smile: number) => {
-      const g1 = 0.45 * Math.exp(-(((cx - (MX - 1.9)) / 1.5) ** 2));
-      const g2 = 0.45 * Math.exp(-(((cx - (MX + 1.9)) / 1.5) ** 2));
-      const sm = smile * 0.42 * ((cx - MX) / MHW) ** 2;  // corners curve up
-      return M_UY - (g1 + g2) - sm;
+      const g1 = 0.65 * Math.exp(-sq((cx - (MX - 2.6)) / 2.1));
+      const g2 = 0.65 * Math.exp(-sq((cx - (MX + 2.6)) / 2.1));
+      const sm = smile * 0.50 * sq((cx - MX) / MHW);
+      return MY - (g1 + g2) - sm;
     };
-
-    // Lower lip: fuller arc, drops when mouth opens, corners rise with smile
     const lowerLipY = (cx: number, mo: number, smile: number) => {
       const t  = (cx - MX) / (MHW - 0.5);
-      const sm = smile * 0.32 * ((cx - MX) / MHW) ** 2;
-      return M_LY + mo * M_OPEN + 0.52 * Math.max(0, 1 - t * t) - sm;
+      const sm = smile * 0.38 * sq((cx - MX) / MHW);
+      return MY + 1.9 + mo * M_OPEN + 0.75 * Math.max(0, 1 - sq(t)) - sm;
     };
 
     // ── Animation state ───────────────────────────────────────────────────────
     let blinkAmt = 0;
     let blinkPhase: 'open'|'closing'|'closed'|'opening' = 'open';
     let blinkWait = 2.5 + Math.random() * 4;
-    let mouthOpen  = 0;
-    let smile      = 0.2;
-    let browRaise  = 0;
+    let mouthOpen = 0, smile = 0.22, browRaise = 0;
     let eox = 0, eoy = 0, tex = 0, tey = 0, ewait = 2;
-    let cflip = 0;
-    let last  = performance.now();
-    let raf   = 0;
+    let cflip = 0, last = performance.now(), raf = 0;
 
     function frame(now: number) {
       const dt = Math.min((now - last) / 1000, 0.05);
@@ -203,43 +245,43 @@ function BrainFace({ speaking, color, glow, status }: {
         blinkWait -= dt;
         if (blinkWait <= 0) blinkPhase = 'closing';
       } else if (blinkPhase === 'closing') {
-        blinkAmt = Math.min(1, blinkAmt + dt * 12);
-        if (blinkAmt >= 1) { blinkPhase = 'closed'; blinkWait = 0.06; }
+        blinkAmt = Math.min(1, blinkAmt + dt * 13);
+        if (blinkAmt >= 1) { blinkPhase = 'closed'; blinkWait = 0.07; }
       } else if (blinkPhase === 'closed') {
         blinkWait -= dt;
         if (blinkWait <= 0) blinkPhase = 'opening';
       } else {
-        blinkAmt = Math.max(0, blinkAmt - dt * 12);
-        if (blinkAmt <= 0) { blinkPhase = 'open'; blinkWait = 3.5 + Math.random() * 5; }
+        blinkAmt = Math.max(0, blinkAmt - dt * 13);
+        if (blinkAmt <= 0) { blinkPhase = 'open'; blinkWait = 3.5 + Math.random() * 5.5; }
       }
-      const eyeRY     = ERY_F * (1 - blinkAmt * 0.97);
-      const pupilRY   = PR * 0.88 * (1 - blinkAmt * 0.96);
+      const eyeRY   = ERY_F * (1 - blinkAmt * 0.97);
+      const pupilRY = PR * (1 - blinkAmt * 0.96);
 
       // Pupil drift
       ewait -= dt;
       if (ewait <= 0) {
-        tex = (Math.random() - 0.5) * 1.3;
-        tey = (Math.random() - 0.5) * 0.5;
-        ewait = 2 + Math.random() * 3.5;
+        tex = (Math.random() - 0.5) * 2.0;
+        tey = (Math.random() - 0.5) * 0.8;
+        ewait = 2.5 + Math.random() * 4;
       }
       eox += (tex - eox) * dt * 2.5;
       eoy += (tey - eoy) * dt * 2.5;
 
-      // Mouth (oscillate fast when speaking)
-      const tMouth = spk ? (0.35 + 0.65 * Math.abs(Math.sin(now * 0.012))) : 0;
+      // Mouth
+      const tMouth = spk ? (0.38 + 0.62 * Math.abs(Math.sin(now * 0.013))) : 0;
       mouthOpen   += (tMouth - mouthOpen) * Math.min(1, dt * 14);
 
-      // Expression per status (lerped)
-      const tSmile = st === 'READY' ? 0.85 : st === 'MANAGING' ? 0.1 : 0.22;
-      const tBrow  = st === 'READY' ? -0.38 : st === 'MANAGING' ? 0.38 : st === 'BUILDING' ? -0.22 : 0;
+      // Expression
+      const tSmile = st === 'READY' ? 0.88 : st === 'MANAGING' ? 0.06 : 0.22;
+      const tBrow  = st === 'READY' ? -0.55 : st === 'MANAGING' ? 0.55 : st === 'BUILDING' ? -0.28 : 0;
       smile     += (tSmile - smile)     * dt * 1.2;
       browRaise += (tBrow  - browRaise) * dt * 1.2;
 
       // Char shuffle
       cflip -= dt;
       if (cflip <= 0) {
-        cflip = 0.07;
-        for (let k = 0; k < 6; k++) {
+        cflip = 0.055;
+        for (let k = 0; k < 8; k++) {
           const r = Math.floor(Math.random() * ROWS);
           const c = Math.floor(Math.random() * COLS);
           grid[r][c] = grid[r][c] === '0' ? '1' : '0';
@@ -248,7 +290,7 @@ function BrainFace({ speaking, color, glow, status }: {
 
       // ── Draw ─────────────────────────────────────────────────────────────
       ctx.clearRect(0, 0, cv.width, cv.height);
-      ctx.font         = 'bold 8px monospace';
+      ctx.font         = 'bold 6px monospace';
       ctx.textAlign    = 'center';
       ctx.textBaseline = 'middle';
 
@@ -259,81 +301,60 @@ function BrainFace({ speaking, color, glow, status }: {
           const px  = c   * CW + CW / 2;
           const py  = row * CH + CH / 2;
 
-          const inFace = ell(cx, cy, FCX, FCY, FRX, FRY);
+          const b = brightness(cx, cy, smile, browRaise, mouthOpen);
 
-          // Eyebrows
-          const lBrowY  = browY(cx, LBX, browRaise);
-          const rBrowY  = browY(cx, RBX, browRaise);
-          const inLBrow = Math.abs(cx - LBX) <= BWH + 0.5 && Math.abs(cy - lBrowY) < 0.53;
-          const inRBrow = Math.abs(cx - RBX) <= BWH + 0.5 && Math.abs(cy - rBrowY) < 0.53;
+          // ── Background ───────────────────────────────────────────────────
+          if (b < 0) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.022 + Math.random() * 0.006;
+            ctx.fillText(ch, px, py);
+            continue;
+          }
 
-          // Eyes (whites → iris → pupil)
+          // ── Eye feature zones ────────────────────────────────────────────
           const inLE    = ell(cx, cy, LEX, EY, ERX, eyeRY);
           const inRE    = ell(cx, cy, REX, EY, ERX, eyeRY);
           const inLI    = ell(cx, cy, LEX, EY, IRS_X, IRS_Y * (eyeRY / ERY_F));
           const inRI    = ell(cx, cy, REX, EY, IRS_X, IRS_Y * (eyeRY / ERY_F));
           const inLP    = ell(cx, cy, LEX + eox, EY + eoy, PR, pupilRY);
           const inRP    = ell(cx, cy, REX + eox, EY + eoy, PR, pupilRY);
-          // Eyelid line (appears when eye is mostly closed)
-          const closedL = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.63 && Math.abs(cx - LEX) <= ERX;
-          const closedR = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.63 && Math.abs(cx - REX) <= ERX;
+          const closedL = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.9 && Math.abs(cx - LEX) <= ERX;
+          const closedR = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.9 && Math.abs(cx - REX) <= ERX;
 
-          // Nose
-          const inBridge   = Math.abs(cx - NX) < 0.62 && cy >= NBY1 && cy <= NBY2;
-          const inLNostril = ell(cx, cy, NLX, NNY, NNR, 0.65);
-          const inRNostril = ell(cx, cy, NRX, NNY, NNR, 0.65);
+          // ── Mouth zones ──────────────────────────────────────────────────
+          const uLY       = upperLipY(cx, smile);
+          const lLY       = lowerLipY(cx, mouthOpen, smile);
+          const inULip    = Math.abs(cx - MX) <= MHW && Math.abs(cy - uLY) < 0.75;
+          const inLLip    = Math.abs(cx - MX) <= MHW - 0.4 && Math.abs(cy - lLY) < 0.80;
+          const inMouthIn = mouthOpen > 0.08 && Math.abs(cx - MX) < MHW - 1.4
+                            && cy > uLY + 0.6 && cy < lLY - 0.4;
+          const inTeeth   = inMouthIn && mouthOpen > 0.3 && cy < uLY + mouthOpen * 1.2;
 
-          // Mouth
-          const uLY        = upperLipY(cx, smile);
-          const lLY        = lowerLipY(cx, mouthOpen, smile);
-          const inULip     = Math.abs(cx - MX) <= MHW       && Math.abs(cy - uLY) < 0.55;
-          const inLLip     = Math.abs(cx - MX) <= MHW - 0.4 && Math.abs(cy - lLY) < 0.60;
-          const inMouthInt = mouthOpen > 0.08 && Math.abs(cx - MX) < MHW - 0.9
-                             && cy > uLY + 0.4 && cy < lLY - 0.3;
-          const inTeeth    = inMouthInt && mouthOpen > 0.28
-                             && cy < uLY + mouthOpen * 0.9;
-
-          // ── Render (priority: pupil > eyelid > iris > white > brow > teeth > interior > lip > nose > face > bg)
+          // ── Render (priority order) ───────────────────────────────────────
           ctx.globalAlpha = 1;
-
           if (inLP || inRP) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.95;
+            ctx.fillStyle = col;          ctx.globalAlpha = 0.96;
             ctx.fillText('1', px, py);
           } else if (closedL || closedR) {
-            ctx.fillStyle = col; ctx.globalAlpha = Math.min(0.58, blinkAmt * 0.7);
+            ctx.fillStyle = col;          ctx.globalAlpha = Math.min(0.65, blinkAmt * 0.78);
             ctx.fillText('-', px, py);
           } else if (inLI || inRI) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.55;
+            ctx.fillStyle = col;          ctx.globalAlpha = 0.60;
             ctx.fillText(ch, px, py);
           } else if (inLE || inRE) {
-            ctx.fillStyle = '#e4e4e7'; ctx.globalAlpha = 0.56;
+            ctx.fillStyle = '#e8e8ec';    ctx.globalAlpha = 0.58;
             ctx.fillText(ch, px, py);
-          } else if (inLBrow || inRBrow) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.60;
-            ctx.fillText('1', px, py);
           } else if (inTeeth) {
-            ctx.fillStyle = '#d4d4d8'; ctx.globalAlpha = 0.52 * mouthOpen;
+            ctx.fillStyle = '#d0d0d8';    ctx.globalAlpha = 0.52 * mouthOpen;
             ctx.fillText('1', px, py);
-          } else if (inMouthInt) {
-            ctx.fillStyle = '#000000'; ctx.globalAlpha = 0.72 * mouthOpen;
+          } else if (inMouthIn) {
+            ctx.fillStyle = '#060606';    ctx.globalAlpha = 0.78 * mouthOpen;
             ctx.fillText('0', px, py);
-          } else if (inULip) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.48;
-            ctx.fillText(ch, px, py);
-          } else if (inLLip) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.52;
-            ctx.fillText(ch, px, py);
-          } else if (inBridge) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.16;
-            ctx.fillText(ch, px, py);
-          } else if (inLNostril || inRNostril) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.30;
-            ctx.fillText('0', px, py);
-          } else if (inFace) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.08 + (Math.random() < 0.003 ? 0.10 : 0);
+          } else if (inULip || inLLip) {
+            ctx.fillStyle = col;          ctx.globalAlpha = Math.min(0.98, b * 1.5);
             ctx.fillText(ch, px, py);
           } else {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.026;
+            // Face — brightness-driven opacity
+            ctx.fillStyle = col;          ctx.globalAlpha = Math.max(0.03, b * 0.90);
             ctx.fillText(ch, px, py);
           }
         }
@@ -347,8 +368,8 @@ function BrainFace({ speaking, color, glow, status }: {
   }, []);
 
   return (
-    <div style={{ filter: `drop-shadow(0 0 32px ${glow})` }}>
-      <canvas ref={canvasRef} width={28 * 9} height={20 * 11} style={{ display: 'block' }} />
+    <div style={{ filter: `drop-shadow(0 0 38px ${glow})` }}>
+      <canvas ref={canvasRef} width={40 * 6} height={42 * 8} style={{ display: 'block' }} />
     </div>
   );
 }
