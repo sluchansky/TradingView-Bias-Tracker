@@ -15919,6 +15919,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "prop_rule":         _prop_main_brain_line(),
         "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
         "observations":      [],
+        "synthesis":         None,
         "reason":            reason,
     }
 
@@ -16583,6 +16584,323 @@ def _mb_build_structured_observations(result):
     return obs
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Brain SYNTHESIS — structured HUNTING/READY/MANAGING narrative
+# ─────────────────────────────────────────────────────────────────────────────
+_MB_SYNTHESIS_NOTE = "Main Brain synthesis — display only, not financial advice."
+
+
+def _mb_synthesis_neutral(reason="Synthesis unavailable."):
+    """Stable neutral schema for the synthesis report. Every key must exist here
+    so downstream consumers never raise on a missing key."""
+    return {
+        "available":         False,
+        "status_headline":   "WATCHING",
+        "instrument":        None,
+        "direction":         None,
+        "opening_line":      reason,
+        "what_happened":     [],
+        "what_supports":     [],
+        "why_not_entering":  [],
+        "what_happens_next": [],
+        "what_cancels":      [],
+        "learning_memory":   None,
+        "decision":          "WAIT",
+        "next_action":       "Continue monitoring.",
+        "note":              _MB_SYNTHESIS_NOTE,
+        "reason":            reason,
+    }
+
+
+def _mb_synthesis_report(result, observations):
+    """Produce a structured HUNTING/READY/MANAGING narrative from the specialist
+    observation bus and assembled result.  Pure + fail-open (every section
+    individually guarded).  DISPLAY-ONLY — never reads the gate or money path."""
+    try:
+        # Index observations by source for O(1) lookup.
+        obs_by_src = {}
+        for _o in (observations or []):
+            if isinstance(_o, dict) and _o.get("source"):
+                obs_by_src[_o["source"]] = _o
+
+        inst       = result.get("active_ticker") or result.get("instrument") or ""
+        verdict    = str(result.get("verdict") or "WAIT")
+        dirn       = ready_direction(verdict) or result.get("strict_direction")
+        mode       = TRADING_MODE
+        mode_label = mode.replace("_", " ").title() if mode else "trade"
+        an         = result.get("analyst") or {}
+        sm         = result.get("stalk_mode") or {}
+        lsf        = result.get("liquidity_sweep_focus") or {}
+        mem        = result.get("trade_memory") or {}
+        pos        = result.get("active_trade") or result.get("managed_trade")
+
+        # ── Status headline ───────────────────────────────────────────────────
+        if pos is not None:
+            status_headline = "MANAGING"
+        elif "READY" in verdict:
+            status_headline = "READY"
+        elif "BUILDING" in verdict:
+            status_headline = "BUILDING"
+        elif "INVALIDAT" in verdict.upper():
+            status_headline = "INVALIDATED"
+        else:
+            has_thesis = dirn in ("Long", "Short") and (
+                sm.get("state") in ("stalking", "engine_entering") or
+                obs_by_src.get("analyst_reasoning", {}).get("observation") in
+                    ("bullish_thesis", "bearish_thesis") or
+                obs_by_src.get("stalk_mode", {}).get("observation") in
+                    ("stalking_long", "stalking_short", "engine_entering")
+            )
+            status_headline = "HUNTING" if has_thesis else "WATCHING"
+
+        # ── Opening line ──────────────────────────────────────────────────────
+        opening_line = "Monitoring %s for a %s opportunity." % (inst, mode_label)
+        try:
+            dirn_label = dirn if dirn in ("Long", "Short") else None
+            if status_headline == "MANAGING":
+                side = (pos or {}).get("direction") or dirn_label or ""
+                opening_line = "I am managing an open %s %s position." % (mode_label, side)
+            elif status_headline == "READY":
+                opening_line = "Setup is READY — a %s %s is in play." % (
+                    mode_label, (dirn_label or ""))
+            elif status_headline == "HUNTING":
+                opening_line = "I am watching %s for a %s %s." % (
+                    inst, mode_label, (dirn_label or "trade"))
+            elif status_headline == "BUILDING":
+                opening_line = "A %s setup is building on %s — no entry yet." % (
+                    mode_label, inst)
+            elif status_headline == "INVALIDATED":
+                opening_line = "The prior setup on %s has been invalidated." % inst
+        except Exception:
+            pass
+
+        # ── What happened ─────────────────────────────────────────────────────
+        what_happened = []
+        try:
+            lsf_code = obs_by_src.get("liquidity_sweep_focus", {}).get("observation", "")
+            voice    = lsf.get("voice") or lsf.get("trader_read")
+            if lsf_code == "sweep_confirmed" and voice:
+                what_happened.append(str(voice))
+            elif lsf_code == "sweep_forming":
+                what_happened.append("Liquidity sweep forming — watching for confirmation.")
+            elif lsf_code == "sweep_failed":
+                what_happened.append("Sweep failed — price reclaimed against the expected move.")
+            elif lsf_code == "continuation":
+                what_happened.append("Price is continuing through liquidity, not reversing.")
+            bm_code = obs_by_src.get("breakout_mode", {}).get("observation", "")
+            if bm_code in ("breakout_long", "breakout_short"):
+                what_happened.append("Opening-range breakout in play.")
+            elif bm_code in ("sweep_reversal_long", "sweep_reversal_short"):
+                what_happened.append("Opening-range sweep reversal detected.")
+            elif bm_code == "building_range":
+                what_happened.append("Building the opening range.")
+        except Exception:
+            pass
+        if not what_happened:
+            try:
+                mi_code = obs_by_src.get("market_intelligence", {}).get("observation", "")
+                if mi_code == "trending_bullish":
+                    what_happened.append("Market is showing bullish directional bias.")
+                elif mi_code == "trending_bearish":
+                    what_happened.append("Market is showing bearish directional bias.")
+                else:
+                    what_happened.append("Market is ranging without a clear directional bias.")
+            except Exception:
+                what_happened.append("Monitoring market conditions.")
+
+        # ── What supports the idea ────────────────────────────────────────────
+        what_supports = []
+        try:
+            lsf_code = obs_by_src.get("liquidity_sweep_focus", {}).get("observation", "")
+            if lsf_code == "sweep_confirmed":
+                what_supports.append("Liquidity sweep confirmed.")
+                nearby = lsf.get("nearby_liquidity") or {}
+                if isinstance(nearby, dict):
+                    if nearby.get("side") == "above" and dirn == "Long":
+                        what_supports.append("Price is above the reclaimed level.")
+                    elif nearby.get("side") == "below" and dirn == "Short":
+                        what_supports.append("Price is below the reclaimed level.")
+            case_key = ("bear_case" if dirn == "Short" else
+                        "bull_case" if dirn == "Long" else None)
+            if case_key:
+                for line in (an.get(case_key) or [])[:3]:
+                    s = str(line).strip()
+                    if s and s != "—":
+                        what_supports.append(s)
+            if mem.get("ready"):
+                ar = mem.get("average_r")
+                n  = int(mem.get("similar_trades_found") or 0)
+                if ar is not None and n >= 5:
+                    ar_val = float(ar)
+                    sign   = "+" if ar_val >= 0 else ""
+                    what_supports.append(
+                        "Similar %s %s %ss have %s expectancy (%s%.2fR, %d samples)." % (
+                            inst, mode_label, (dirn or "trade"),
+                            "positive" if ar_val >= 0 else "negative",
+                            sign, ar_val, n))
+            cvd_dir = str(result.get("cvd_direction") or result.get("cvd_state") or "").lower()
+            if (cvd_dir == "bullish" and dirn == "Long") or \
+               (cvd_dir == "bearish" and dirn == "Short"):
+                what_supports.append("CVD order flow agrees with the thesis.")
+        except Exception:
+            pass
+        if not what_supports:
+            what_supports.append("No strong supporting evidence yet — monitoring.")
+
+        # ── Why not entering ──────────────────────────────────────────────────
+        why_not = []
+        try:
+            if status_headline not in ("MANAGING", "READY"):
+                for w in (sm.get("why_waiting") or [])[:3]:
+                    s = str(w).strip()
+                    if s:
+                        why_not.append(s)
+                if not why_not:
+                    sr = str(result.get("strict_reason") or "")
+                    if sr and sr.lower() not in ("none", "wait", ""):
+                        for chunk in sr.replace(";", "|").replace(",", "|").split("|"):
+                            chunk = chunk.strip()
+                            if len(chunk) > 8 and "WAIT" not in chunk.upper():
+                                why_not.append(chunk.rstrip(".") + ".")
+                            if len(why_not) >= 3:
+                                break
+                cvd_dir = str(result.get("cvd_direction") or
+                              result.get("cvd_state") or "").lower()
+                if (cvd_dir == "bearish" and dirn == "Long") or \
+                   (cvd_dir == "bullish" and dirn == "Short"):
+                    why_not.append("Order flow (CVD) has not turned in the required direction.")
+        except Exception:
+            pass
+        if not why_not and status_headline in ("HUNTING", "WATCHING", "BUILDING"):
+            why_not.append("Waiting for all gate conditions to align.")
+
+        # ── What happens next ─────────────────────────────────────────────────
+        what_next = []
+        try:
+            gp       = an.get("game_plan") or {}
+            next_opp = gp.get("next_opportunity") or {}
+            if isinstance(next_opp, dict):
+                for wf in (next_opp.get("waiting_for") or [])[:3]:
+                    s = str(wf).strip()
+                    if s:
+                        what_next.append(s)
+                trig = next_opp.get("label") or next_opp.get("trigger")
+                if trig and str(trig) not in what_next:
+                    what_next.append(str(trig))
+            elif isinstance(next_opp, str) and next_opp.strip():
+                what_next.append(next_opp.strip())
+            if not what_next:
+                for w in (sm.get("why_waiting") or [])[:2]:
+                    s = str(w).strip()
+                    if s and s not in what_next:
+                        what_next.append(s)
+        except Exception:
+            pass
+        if not what_next:
+            what_next.append("Continue monitoring for a clean setup confirmation.")
+
+        # ── What cancels it ───────────────────────────────────────────────────
+        what_cancels = []
+        try:
+            inv = str(an.get("invalidation") or "")
+            if not inv or inv in ("—", "None", ""):
+                gp      = an.get("game_plan") or {}
+                outlook = an.get("analyst_outlook") or {}
+                inv = str(outlook.get("invalidates") or gp.get("invalidation") or "")
+            if inv and inv not in ("—", "None", ""):
+                what_cancels.append(inv)
+            if dirn == "Short":
+                sup = result.get("nearest_supply")
+                if sup is not None:
+                    try:
+                        what_cancels.append(
+                            "A sustained reclaim above %.2f." % float(sup))
+                    except (TypeError, ValueError):
+                        pass
+            elif dirn == "Long":
+                dem = result.get("nearest_demand")
+                if dem is not None:
+                    try:
+                        what_cancels.append(
+                            "A sustained break below %.2f." % float(dem))
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+        if not what_cancels:
+            what_cancels.append("Sustained price action against the setup thesis.")
+
+        # ── Learning memory ───────────────────────────────────────────────────
+        learning_memory = None
+        try:
+            if mem and isinstance(mem, dict) and mem.get("ready"):
+                n  = int(mem.get("similar_trades_found") or 0)
+                wr = mem.get("similar_win_rate")
+                ar = mem.get("average_r")
+                cf = mem.get("most_common_failure")
+                if n > 0:
+                    learning_memory = {
+                        "similar_samples":     n,
+                        "expectancy_r":        round(float(ar), 2) if ar is not None else None,
+                        "win_rate_pct":        (int(round(float(wr) * 100))
+                                                if wr is not None else None),
+                        "most_common_failure": str(cf) if cf else None,
+                        "recommendation":      str(mem.get("memory_recommendation") or ""),
+                    }
+        except Exception:
+            pass
+
+        # ── Decision & next action ────────────────────────────────────────────
+        if status_headline == "MANAGING":
+            decision = "MANAGE"
+        elif status_headline == "READY":
+            decision = "TAKE" if dirn in ("Long", "Short") else "READY"
+        elif status_headline == "INVALIDATED":
+            decision = "STAND ASIDE"
+        else:
+            decision = "WAIT"
+
+        next_action = "Continue monitoring."
+        try:
+            if status_headline == "HUNTING":
+                next_action = "Continue stalking; do not chase."
+            elif status_headline == "READY":
+                next_action = "Execute %s %s per trade plan." % (
+                    (dirn or ""), mode_label)
+            elif status_headline == "MANAGING":
+                next_action = "Manage the open position; protect capital first."
+            elif status_headline == "BUILDING":
+                next_action = "Monitor for breakout or breakdown signal."
+            elif status_headline == "INVALIDATED":
+                next_action = "Stand aside — thesis invalidated; reset and wait."
+        except Exception:
+            pass
+
+        return {
+            "available":         True,
+            "status_headline":   status_headline,
+            "instrument":        inst or None,
+            "direction":         dirn if dirn in ("Long", "Short") else None,
+            "opening_line":      opening_line,
+            "what_happened":     [s for s in what_happened  if s][:5],
+            "what_supports":     [s for s in what_supports  if s][:6],
+            "why_not_entering":  [s for s in why_not        if s][:4],
+            "what_happens_next": [s for s in what_next      if s][:4],
+            "what_cancels":      [s for s in what_cancels   if s][:3],
+            "learning_memory":   learning_memory,
+            "decision":          decision,
+            "next_action":       next_action,
+            "note":              _MB_SYNTHESIS_NOTE,
+            "reason":            None,
+        }
+    except Exception as exc:
+        try:
+            logger.debug("mb_synthesis_report error (non-fatal): %s", exc)
+        except Exception:
+            pass
+        return _mb_synthesis_neutral("Synthesis error: %s" % exc)
+
+
 def _mb_reconcile(observations, result):
     """Weighted vote across all engine observations -> ONE recommendation + ONE narrative.
     Stored at result['main_brain']['unified']. DISPLAY-ONLY; fail-open."""
@@ -17059,6 +17377,11 @@ def compute_main_brain(result):
             mb_out["observations"] = _mb_build_structured_observations(result)
         except Exception:
             mb_out["observations"] = []
+        try:
+            mb_out["synthesis"] = _mb_synthesis_report(
+                result, mb_out.get("observations") or [])
+        except Exception:
+            mb_out["synthesis"] = _mb_synthesis_neutral("Synthesis unavailable.")
         return mb_out
     except Exception as exc:
         try:

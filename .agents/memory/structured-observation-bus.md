@@ -34,6 +34,13 @@ market_intelligence, strategy_engine, stalk_mode, breakout_mode, entry_quality, 
 - scalp_quality: scalp_pass / scalp_caution / scalp_fail
 - liquidity_sweep_focus: sweep_confirmed / sweep_forming / sweep_failed / continuation / no_sweep
 
+## Synthesis layer (_mb_synthesis_report)
+Takes `result` + `observations` list, produces HUNTING/READY/MANAGING narrative:
+- `status_headline`: MANAGING > READY > BUILDING > INVALIDATED > HUNTING (WAIT+thesis) > WATCHING
+- Sections: opening_line, what_happened, what_supports, why_not_entering, what_happens_next, what_cancels, learning_memory, decision, next_action
+- Wired at `mb_out["synthesis"]` in its own fail-open try/except inside `compute_main_brain`
+- `_mb_synthesis_neutral()` = stable schema; `_main_brain_neutral` has `"synthesis": None`
+
 **Why:** Main Brain must be the sole author of prose; specialists must emit structured facts. Separating the two allows the synthesis logic to evolve without touching 11 specialist engines.
 
-**How to apply:** New specialists follow the same pattern — add a try/except block to `_mb_build_structured_observations`, derive an `obs_code` from the block's fields, call `_emit_observation`, append to `obs`. NO specialist function editing needed.
+**How to apply:** New specialists — add a try/except block to `_mb_build_structured_observations`, derive an `obs_code`, call `_emit_observation`, append to `obs`. Synthesis section reads from `obs_by_src[source].observation` and the raw `result` block.
