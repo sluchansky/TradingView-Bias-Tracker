@@ -16027,6 +16027,262 @@ def compute_main_brain_judge(result):
         return _main_brain_judge_neutral("Judge unavailable (%s)." % exc, threshold=thr)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIFIED LEARNING BRAIN — observation bus + reconciliation layer
+# ══════════════════════════════════════════════════════════════════════════════
+# Every specialist engine produces a normalised observation (stance / confidence /
+# key_finding / veto / weight).  _mb_reconcile() performs weighted voting,
+# detects conflicts, names the active playbook and emits ONE recommendation +
+# ONE narrative.  DISPLAY-ONLY; fail-open at every stage; never touches the gate,
+# sizing, dedupe or the money path.
+
+def _mb_observe(engine, stance, confidence, key_finding, veto=False, weight=1.0):
+    """Normalise any engine output to a standard observation dict."""
+    return {
+        "engine":      engine,
+        "stance":      stance,      # "bullish"|"bearish"|"neutral"|"caution"
+        "confidence":  min(100.0, max(0.0, float(confidence or 0))),
+        "key_finding": str(key_finding or "")[:200],
+        "veto":        bool(veto),
+        "weight":      float(weight or 1.0),
+    }
+
+
+def _mb_collect_observations(result):
+    """Read every specialist engine block in *result* and return a normalised
+    observation list.  Never recomputes anything; fail-open per engine."""
+    obs    = []
+    verdict = str(result.get("verdict") or "")
+    is_act  = bool(result.get("is_actionable"))
+    edge    = float(result.get("edge_score") or 0)
+    strict  = str(result.get("strict_reason") or "")
+    dirn    = str(result.get("direction") or result.get("dominant_direction") or "")
+
+    # 1. Authoritative gate (weight 2x — ground truth for the reconciler)
+    if is_act:
+        g_stance = ("bullish" if "LONG" in verdict else
+                    "bearish" if "SHORT" in verdict else "neutral")
+        g_find   = verdict
+    else:
+        g_stance = "neutral"
+        g_find   = ("WAIT — " + strict) if strict else "WAIT"
+    obs.append(_mb_observe("gate", g_stance, min(edge, 100), g_find, weight=2.0))
+
+    # 2. Analyst reasoning engine
+    try:
+        an = result.get("analyst") or {}
+        if an and isinstance(an, dict):
+            ep    = an.get("entry_probability") or {}
+            prob  = float(ep.get("probability", 50)) if isinstance(ep, dict) else 50.0
+            veto  = bool(an.get("veto_would_fire"))
+            ph    = an.get("market_phase") or {}
+            phase = str(ph.get("phase") if isinstance(ph, dict) else ph or "")
+            out   = an.get("analyst_outlook") or {}
+            ctrl  = str(out.get("control") if isinstance(out, dict) else out or "")
+            lo    = ctrl.lower()
+            stance = ("bullish" if ("bullish" in lo or ("long" in lo and "long-term" not in lo))
+                      else "bearish" if ("bearish" in lo or "short" in lo)
+                      else "caution"  if veto else "neutral")
+            obs.append(_mb_observe("analyst", stance, prob,
+                                   phase or ctrl[:100], veto=veto, weight=0.8))
+    except Exception:
+        pass
+
+    # 3. Trade debate engine  (stored as "trade_debate" in full_analysis result)
+    try:
+        td = result.get("trade_debate") or {}
+        if td and isinstance(td, dict):
+            fv   = str(td.get("final_verdict") or "WAIT")
+            conf = float(td.get("confidence") or 50)
+            summ = str(td.get("judge_summary") or td.get("reasoning") or fv)[:120]
+            veto = bool(td.get("veto_would_fire") or (fv == "WAIT" and is_act))
+            stance = ("bullish" if fv == "TAKE" and "LONG"  in dirn else
+                      "bearish" if fv == "TAKE" and "SHORT" in dirn else
+                      "caution" if veto else "neutral")
+            obs.append(_mb_observe("debate", stance, conf, summ, veto=veto, weight=0.9))
+    except Exception:
+        pass
+
+    # 4. Professional review
+    try:
+        pr = result.get("pro_review") or {}
+        if pr and isinstance(pr, dict):
+            score = float(pr.get("score") or 50)
+            grade = str(pr.get("grade") or "C")
+            veto  = bool(pr.get("veto_would_fire"))
+            summ  = str(pr.get("summary") or pr.get("reasoning") or ("Grade " + grade))[:120]
+            stance = ("bullish" if grade in ("A+", "A") and not veto else
+                      "neutral" if grade in ("B+", "B") else "caution")
+            obs.append(_mb_observe("pro_review", stance, score, summ, veto=veto, weight=0.7))
+    except Exception:
+        pass
+
+    # 5. Confidence governor  (stored as "confidence_governor" in full_analysis result)
+    try:
+        gov = result.get("confidence_governor") or {}
+        if gov and isinstance(gov, dict):
+            allow = gov.get("allow_trade", True)
+            adj   = float(gov.get("confidence_adjustment") or 0)
+            rsn   = str(gov.get("reasoning") or gov.get("primary_lesson") or "")[:120]
+            veto  = bool(gov.get("veto_would_fire") or (not allow and is_act))
+            obs.append(_mb_observe("governor",
+                                   "neutral" if allow else "caution",
+                                   min(100, max(0, 50 + adj)),
+                                   rsn or ("Allow: %s" % allow),
+                                   veto=veto, weight=0.6))
+    except Exception:
+        pass
+
+    # 6. Entry quality
+    try:
+        eq = result.get("entry_quality") or {}
+        if eq and isinstance(eq, dict):
+            sc    = float(eq.get("score") or 0)
+            veto  = bool(eq.get("veto_would_fire"))
+            lbl   = str(eq.get("location_label") or eq.get("verdict_label")
+                        or eq.get("grade") or ("Score %d" % int(sc)))[:100]
+            chase = bool(eq.get("chasing_warning"))
+            stance = ("bullish" if sc >= 75 and not veto and not chase else
+                      "caution" if veto or chase or sc < 50 else "neutral")
+            obs.append(_mb_observe("entry_quality", stance, sc, lbl,
+                                   veto=veto, weight=0.7))
+    except Exception:
+        pass
+
+    # 7. Volatility / regime
+    try:
+        vol = result.get("volatility") or {}
+        if vol and isinstance(vol, dict):
+            regime = str(vol.get("regime") or "normal").lower()
+            block  = bool(vol.get("blocks_trade") or vol.get("brake_applied")
+                          or vol.get("blocked"))
+            stance = "neutral" if regime in ("normal", "low", "quiet") else "caution"
+            obs.append(_mb_observe("volatility", stance, 50,
+                                   "Regime: %s" % regime, veto=block, weight=0.5))
+    except Exception:
+        pass
+
+    return obs
+
+
+def _mb_reconcile(observations, result):
+    """Weighted vote across all engine observations -> ONE recommendation + ONE narrative.
+    Stored at result['main_brain']['unified']. DISPLAY-ONLY; fail-open."""
+    try:
+        if not observations:
+            return {"available": False, "recommendation": "WAIT", "confidence": 0,
+                    "narrative": "No engine observations.", "conflicts": [],
+                    "playbook": None, "supporting_engines": [], "opposing_engines": [],
+                    "engine_count": 0, "veto_count": 0}
+
+        verdict  = str(result.get("verdict") or "")
+        is_act   = bool(result.get("is_actionable"))
+        dirn     = str(result.get("direction") or result.get("dominant_direction") or "")
+        edge     = float(result.get("edge_score") or 0)
+        ticker   = str(result.get("active_ticker") or result.get("ticker") or "")
+        strict_r = str(result.get("strict_reason") or "")
+
+        vetoes     = [o for o in observations if o["veto"]]
+        supporters = [o for o in observations if not o["veto"]]
+        non_gate   = [o for o in observations if o["engine"] != "gate"]
+
+        def _ws(stance):
+            return sum(o["weight"] * o["confidence"] / 100.0
+                       for o in supporters if o["stance"] == stance)
+
+        bull_w = _ws("bullish")
+        bear_w = _ws("bearish")
+
+        # Conflict detection
+        conflicts  = []
+        ng_stances = set(o["stance"] for o in non_gate if o["stance"] != "neutral")
+        if "bullish" in ng_stances and "bearish" in ng_stances:
+            conflicts.append("Direction disagreement between advisory engines")
+        if vetoes:
+            conflicts.append("%d veto(s): %s"
+                             % (len(vetoes), ", ".join(o["engine"] for o in vetoes)))
+        if is_act and len([o for o in non_gate if o["veto"]]) >= 2:
+            gate_dir = ("bullish" if "LONG" in dirn else "bearish" if "SHORT" in dirn else None)
+            if gate_dir:
+                conflicts.append("Gate %s but advisors block" % gate_dir)
+
+        # Recommendation
+        if vetoes:
+            recommendation = "WAIT"
+            confidence     = max(10, 40 - len(vetoes) * 8)
+            why = "Blocked by %s" % ", ".join(o["engine"] for o in vetoes[:2])
+        elif is_act and not conflicts:
+            recommendation = "TAKE"
+            confidence     = min(95, int(edge * 0.55 + (bull_w + bear_w) * 22))
+            n_sup = len([o for o in non_gate if o["stance"] in ("bullish", "bearish")])
+            why = ("All %d advisory engine(s) aligned" % n_sup) if n_sup else "Gate signal met"
+        elif is_act and conflicts:
+            recommendation = "CAUTION"
+            confidence     = max(20, int(edge * 0.35))
+            why = "; ".join(conflicts[:2])
+        else:
+            recommendation = "WAIT"
+            confidence     = max(10, int(edge * 0.25))
+            why = strict_r or "Gate conditions not met"
+
+        # Active playbook — read from strategy_engine (display-only)
+        playbook = None
+        try:
+            se = result.get("strategy_engine") or {}
+            if isinstance(se, dict):
+                playbook = se.get("active_strategy") or se.get("strategy")
+            if not playbook:
+                le = result.get("learning_engine") or {}
+                if isinstance(le, dict):
+                    playbook = (le.get("selected_playbook") or
+                                le.get("recommended_strategy") or
+                                le.get("best_strategy"))
+        except Exception:
+            pass
+
+        # One narrative
+        sym = ticker.replace("1!", "") if ticker else "this instrument"
+        n   = len(observations)
+        if recommendation == "TAKE":
+            narrative = ("%d engines consulted \u2014 aligned on %s %s. %s."
+                         % (n, dirn.lower() or "the", sym, why))
+        elif recommendation == "CAUTION":
+            narrative = ("%d engines consulted \u2014 gate signals %s but conflicts detected. %s."
+                         % (n, dirn.lower() or "a setup", why))
+        elif vetoes:
+            narrative = ("%d engines consulted \u2014 %d veto(s): %s."
+                         % (n, len(vetoes), why))
+        else:
+            narrative = ("%d engines consulted \u2014 standing aside. %s."
+                         % (n, why))
+
+        return {
+            "available":          True,
+            "recommendation":     recommendation,
+            "confidence":         confidence,
+            "narrative":          narrative,
+            "conflicts":          conflicts,
+            "why":                why,
+            "playbook":           playbook,
+            "supporting_engines": [o["engine"] for o in supporters
+                                   if o["stance"] in ("bullish", "bearish")
+                                   and o["engine"] != "gate"],
+            "opposing_engines":   [o["engine"] for o in vetoes],
+            "all_observations":   [{"engine": o["engine"], "stance": o["stance"],
+                                    "veto": o["veto"], "finding": o["key_finding"][:80]}
+                                   for o in observations],
+            "engine_count":       len(observations),
+            "veto_count":         len(vetoes),
+            "bull_weight":        round(bull_w, 2),
+            "bear_weight":        round(bear_w, 2),
+        }
+    except Exception:
+        return {"available": False, "recommendation": "WAIT", "confidence": 0,
+                "narrative": "Reconciliation unavailable.", "conflicts": [],
+                "playbook": None, "supporting_engines": [], "opposing_engines": [],
+                "engine_count": 0, "veto_count": 0}
+
+
 def compute_main_brain(result):
     """Plain-English 'Main Brain' synthesis (DISPLAY-ONLY).
 
@@ -16368,6 +16624,19 @@ def compute_main_brain(result):
                 mb_out["potential_trades"] = _mb_potential_trades_summary(_adv)
             except Exception:
                 pass
+        # ── Unified Learning Brain reconciliation (DISPLAY-ONLY; fail-open) ──
+        # Collect normalised observations from every specialist engine, vote,
+        # detect conflicts and emit ONE recommendation + ONE narrative.  The
+        # reconciled narrative replaces the text-assembled summary so the user
+        # reads one coherent message instead of scanning every sub-panel.
+        try:
+            _obs     = _mb_collect_observations(result)
+            _unified = _mb_reconcile(_obs, result)
+            mb_out["unified"] = _unified
+            if _unified.get("available") and _unified.get("narrative"):
+                mb_out["summary"] = _unified["narrative"]
+        except Exception:
+            mb_out["unified"] = {"available": False}
         return mb_out
     except Exception as exc:
         try:
@@ -38235,6 +38504,20 @@ def dashboard():
       <div id="mb-summary" class="mb-summary">Loading…</div>
       <div class="mb-av-foot"><span class="mb-av-live">● LIVE</span> <span id="mb-av-age"></span></div>
     </div>
+    <!-- Unified Learning Brain — ONE reconciled verdict from all specialist engines.
+         Display-only; populated by _mb_reconcile() in compute_main_brain.
+         Never feeds the gate, sizing, dedupe or any money path. -->
+    <div id="mb-unified" style="display:none;margin:8px 0 4px;padding:9px 12px;border-radius:10px;border:1px solid rgba(125,140,255,.22);background:rgba(24,30,58,.7)">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
+        <span style="font-size:9px;letter-spacing:1.2px;color:#6b7280;font-weight:600">UNIFIED DECISION</span>
+        <span id="mb-u-rec" style="font-weight:700;font-size:13px;letter-spacing:.4px"></span>
+        <span id="mb-u-conf" style="font-size:11px;color:#9ca3af"></span>
+        <span id="mb-u-playbook" style="font-size:10px;color:#818cf8;margin-left:auto;white-space:nowrap"></span>
+      </div>
+      <div id="mb-u-narrative" style="font-size:12px;color:#c8cce8;line-height:1.55;margin-bottom:4px"></div>
+      <div id="mb-u-engines" style="font-size:10px;color:#6b7280;display:flex;gap:5px;flex-wrap:wrap;align-items:center"></div>
+      <div id="mb-u-conflicts" style="display:none;font-size:10px;color:#f59e0b;margin-top:3px">&#9888; <span id="mb-u-conflict-text"></span></div>
+    </div>
     <!-- Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (fed by
          main_brain.liquidity_focus). Hidden unless the flag is on and the block is
          present; it never affects the gate, Edge Score or execution. -->
@@ -41453,6 +41736,43 @@ function renderMainBrain(d){
   const summary = (mb && mb.summary) || 'Waiting for live data…';
   const sumEl = document.getElementById('mb-summary');
   if(sumEl) sumEl.textContent = summary;
+  // ── Unified Learning Brain: ONE reconciled decision from all engines ──────
+  (function(){
+    var u = mb && mb.unified;
+    var box = document.getElementById('mb-unified');
+    if(!box) return;
+    if(!u || !u.available){ box.style.display = 'none'; return; }
+    box.style.display = '';
+    var REC_COLORS = {TAKE:'#22c55e', CAUTION:'#f59e0b', WAIT:'#6b7280'};
+    var rEl = document.getElementById('mb-u-rec');
+    if(rEl){ rEl.textContent = u.recommendation || '\u2014'; rEl.style.color = REC_COLORS[u.recommendation] || '#e8e8f0'; }
+    var cEl = document.getElementById('mb-u-conf');
+    if(cEl) cEl.textContent = (u.confidence != null) ? (u.confidence + '% confidence') : '';
+    var nEl = document.getElementById('mb-u-narrative');
+    if(nEl) nEl.textContent = u.narrative || '';
+    var pEl = document.getElementById('mb-u-playbook');
+    if(pEl) pEl.textContent = u.playbook ? ('\u25b8 ' + u.playbook) : '';
+    var eEl = document.getElementById('mb-u-engines');
+    if(eEl){
+      while(eEl.firstChild) eEl.removeChild(eEl.firstChild);
+      var chips = [];
+      if(u.engine_count) chips.push({t: u.engine_count + ' engines', c: '#6b7280'});
+      var sc = (u.supporting_engines || []).length;
+      if(sc) chips.push({t: sc + ' supporting', c: '#22c55e'});
+      if(u.veto_count) chips.push({t: u.veto_count + ' veto', c: '#ef4444'});
+      chips.forEach(function(ch, i){
+        var s = document.createElement('span');
+        s.textContent = ch.t; s.style.color = ch.c;
+        eEl.appendChild(s);
+        if(i < chips.length - 1){ var sep = document.createElement('span'); sep.textContent = '\u00b7'; sep.style.color = '#374151'; sep.style.margin = '0 2px'; eEl.appendChild(sep); }
+      });
+    }
+    var cfEl = document.getElementById('mb-u-conflicts');
+    var cfTxt = document.getElementById('mb-u-conflict-text');
+    var cflicts = u.conflicts || [];
+    if(cfEl) cfEl.style.display = cflicts.length ? '' : 'none';
+    if(cfTxt && cflicts.length) cfTxt.textContent = cflicts[0];
+  })();
   // Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (main_brain.liquidity_focus).
   (function(){
     const box = document.getElementById('mb-liq');

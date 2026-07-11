@@ -1,30 +1,53 @@
 ---
 name: Unified Learning Brain
-description: Per-mode (Scalp/Swing/Micro Scalp) learning stats + Playbook Selector + Unified Learning Memory panels; display-only cognitive seam.
+description: Observation bus + reconciliation layer that collects all specialist engines into ONE recommendation + ONE narrative. Plus per-mode learning stats and playbook selector panels.
 ---
 
-## What was built
-One central brain that evaluates all three playbooks (Scalp / Swing / Micro Scalp) and surfaces which mode is best for the current setup, why, what was rejected, and a consolidated learning memory.
+## Architecture (current)
 
-## Key globals
-- `PER_MODE_STATS = {}` — keyed by `(instrument, mode_upper)` → `{n, win_rate, avg_r, expectancy, wins, losses, top_failure, top_failure_key, top_failure_n}`
-- Populated inside `_recompute_learning()` via a new `GROUP BY instrument, UPPER(COALESCE(trading_mode,'SCALP'))` query on `strategy_trades`
-- Cleared + swapped under `LEARNING_LOCK` in the same atomic swap as `LEARNING_ANALYTICS`
+### Observation bus layer (added on top of original)
+Three new pure functions inserted BEFORE `compute_main_brain`:
+- `_mb_observe(engine, stance, confidence, key_finding, veto, weight)` — normalises any engine output to a standard dict
+- `_mb_collect_observations(result)` — reads gate + analyst + trade_debate + pro_review + confidence_governor + entry_quality + volatility; fail-open per engine
+- `_mb_reconcile(observations, result)` — weighted vote → ONE `recommendation` (TAKE/CAUTION/WAIT) + ONE `narrative` + `conflicts` + `playbook` + `supporting_engines` + `opposing_engines`
 
-## New functions (display-only, fail-open)
-- `compute_playbook_selector(result)` — reads PER_MODE_STATS + LEARNING_ELIGIBILITY + _micro_ghost_stats() + _dual_sim_stats() (for shadow SWING data when live=SCALP); scores each playbook; picks best; returns selected_mode / why / rejected[] / final_decision
-- `compute_unified_learning(result, inst)` — per-playbook stats grid + similar trade memory summary from result["trade_memory_context"]
-- Both wired into `full_analysis` cognitive seam after `main_brain_voice` (display-only, never gate/score/broker)
-- Both whitelisted in `/status` response
+Called at the end of `compute_main_brain` (after scalp_strategy_advisory fold-in):
+```python
+_obs = _mb_collect_observations(result)
+_unified = _mb_reconcile(_obs, result)
+mb_out["unified"] = _unified
+if _unified.get("available") and _unified.get("narrative"):
+    mb_out["summary"] = _unified["narrative"]   # replaces text-assembled summary
+```
 
-## Dashboard panels
-- `mod-playbook-selector` — mode selected badge + final decision badge (LIVE/GHOST/WAIT/MANAGING) + why text + per-playbook cards + rejected reasons
-- `mod-unified-learning` — tabbed (Scalp/Swing/Micro) stats grid + eligibility badge + top failure + Similar Trade Memory block; tab state in `_ulActiveTab`; re-renders via `window._lastStatusData` on tab click
+### Key engine key names in `result` dict
+- `result["analyst"]` — analyst reasoning
+- `result["trade_debate"]` — NOT "debate"; has `final_verdict`, `judge_summary`, `veto_would_fire`
+- `result["confidence_governor"]` — NOT "governor"; has `allow_trade`, `confidence_adjustment`
+- `result["pro_review"]` — professional review; has `score`, `grade`, `veto_would_fire`
+- `result["entry_quality"]` — has `score`, `location_label`, `veto_would_fire`, `chasing_warning`
+- `result["volatility"]` — has `regime`, `brake_applied`, `blocked`
+- `result["strategy_engine"]` — has `active_strategy` for playbook naming
 
-## Safety invariants
-- All DISPLAY-ONLY; `compute_playbook_selector` never changes TRADING_MODE or the execution path
-- `_micro_ghost_stats(inst)` is already TTL-cached (safe to call in the /status path)
-- `_dual_sim_stats()` is a separate DB read — only called when DUAL_MODE_SHADOW_SIM_ENABLED
-- Goldens are byte-identical (new code is after the gate/score/exec path)
+### Dashboard display
+- `#mb-unified` div in `#mod-brain` (just below avatar section, above liquidity focus)
+- JS in `renderMainBrain`: reads `mb.unified`, shows recommendation + confidence + narrative + engine vote chips + conflict alert
+- `mb.unified` is already in the `/status` whitelist via the wholesale `main_brain` pass
 
-**Why:** User wanted ONE brain that shows per-playbook learning history and explains which mode it recommends and why, instead of 5+ scattered learning panels.
+### Recommendation values
+TAKE=#22c55e, CAUTION=#f59e0b, WAIT=#6b7280 (same as gate colours for consistency)
+
+### Safety invariants
+- DISPLAY-ONLY; fail-open at every stage (try/except around every engine block)
+- Gate observation is weight=2.0 (ground truth); advisory engines 0.5–0.9
+- `veto_would_fire` from ANY engine → recommendation becomes WAIT regardless of gate
+- Never touches gate, sizing, dedupe, traderspost, or any money path
+- Goldens byte-identical (all new code is after the gate/score/exec path)
+
+## Original per-mode learning layer (unchanged)
+- `PER_MODE_STATS` global keyed by `(instrument, mode_upper)` from strategy_trades
+- `compute_playbook_selector(result)` — scores SCALP/SWING/MICRO playbooks; display-only
+- `compute_unified_learning(result, inst)` — per-playbook stats grid; display-only
+- Dashboard panels: `mod-playbook-selector`, `mod-unified-learning`
+
+**Why:** User wanted one brain that consults every engine and tells ONE story instead of making them read 6+ sub-panels. Reconciliation is purely additive to the existing architecture.

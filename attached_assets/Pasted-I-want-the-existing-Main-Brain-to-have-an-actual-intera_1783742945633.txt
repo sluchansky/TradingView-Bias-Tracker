@@ -1,0 +1,158 @@
+I want the existing Main Brain to have an actual interactive character or face.
+
+Do not create a separate AI brain.
+
+The character must be the visual and conversational embodiment of the existing Main Brain, using the same live data, learning memory, AutoResearch findings, risk status, trade state, and question feed.
+
+Goal:
+Make it feel like I am talking directly to an AI trading partner.
+
+CHARACTER EXPERIENCE
+
+The center of the dashboard should show a real animated character from the chest or shoulders up.
+
+The character should:
+- look toward the user while speaking
+- blink naturally
+- move its head slightly
+- change facial expression based on state
+- animate its mouth while speaking
+- react when a question is asked
+- pause and appear to think before answering
+- display listening, thinking, speaking, warning, and idle states
+
+Use a polished futuristic human-like AI character.
+The style should feel:
+- Starlink
+- Meta AI
+- Tesla
+- modern
+- calm
+- intelligent
+- professional
+- not cartoonish
+- not creepy
+- not overly robotic
+
+MAIN STATES
+
+OBSERVING:
+neutral expression, slow eye movement, calm idle animation
+
+HUNTING:
+focused eyes, slight forward posture, subtle scanning motion
+
+THINKING:
+brief pause, eyes shift slightly, animated processing indicator
+
+READY:
+confident expression, brighter lighting, trade plan visible
+
+MANAGING:
+focused expression, open-position details visible
+
+DEFENDING:
+serious expression, risk warning present
+
+BLOCKED:
+concerned expression, clearly explains what blocked the trade
+
+SPEAKING:
+mouth animation synced to generated speech
+
+LISTENING:
+microphone active, attentive expression
+
+CONVERSATION LAYOUT
+
+Center:
+large character
+
+Below character:
+live captions of exactly what the Main Brain is saying
+
+Bottom:
+existing text input
+microphone button
+send button
+suggested questions
+
+Right side:
+compact current state:
+- market
+- mode
+- verdict
+- confidence
+- active trade
+- risk
+- data freshness
+
+The character should answer questions like:
+- What are you seeing?
+- Why are you waiting?
+- What would make you enter?
+- What does learning remember?
+- What did AutoResearch find?
+- Why is this ghost only?
+- Is the trade still valid?
+- What would make you exit?
+- Which market has the strongest edge?
+
+VOICE
+
+Add optional text-to-speech so the Main Brain can speak answers aloud.
+
+Voice style:
+- calm
+- analytical
+- confident
+- concise
+- professional
+- never dramatic or emotional
+
+Always show text captions even when audio is enabled.
+
+IMPORTANT ARCHITECTURE
+
+Do not let the avatar invent responses.
+
+Every response must come from:
+- current BrainState
+- active market
+- selected playbook
+- live trade state
+- Learning Engine
+- AutoResearch
+- Risk Engine
+- Prop Rules
+- recent events
+
+The avatar is only the visual and voice layer.
+
+Main Brain remains the intelligence.
+
+SAFETY
+
+The character may explain and recommend.
+
+It must not submit, modify, or close a live order without explicit user confirmation.
+
+Any live trading action must pass through the existing deterministic execution and validation system.
+
+IMPLEMENTATION PLAN
+
+Phase 1:
+Create the character shell with idle, listening, thinking, speaking, warning, and ready animations.
+
+Phase 2:
+Connect the existing Main Brain text response to captions and character state changes.
+
+Phase 3:
+Add voice input and text-to-speech.
+
+Phase 4:
+Add lip sync and more advanced facial reactions.
+
+Do not redesign the whole dashboard again.
+
+Replace the current Main Brain center panel with the character experience and keep diagnostics in side drawers.
