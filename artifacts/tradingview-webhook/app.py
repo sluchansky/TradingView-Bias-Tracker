@@ -37811,7 +37811,7 @@ def dashboard():
   .mb-av-handle{padding:7px 14px 5px;border-bottom:1px solid rgba(255,255,255,.06);min-height:0;cursor:move;display:flex;align-items:center;gap:8px}
   .mb-av-handle-lbl{font-size:10px;letter-spacing:2.5px;color:#4b5563;font-weight:700;text-transform:uppercase}
   .mb-av{text-align:center;padding:20px 16px 14px}
-  .mb-orb{position:relative;width:96px;height:96px;margin:0 auto 14px}
+  .mb-orb{position:relative;width:194px;height:246px;margin:0 auto 10px}
   .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#3730a3) 42%,var(--orb-c2,#1e1b4b) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(129,140,248,.4)),0 0 72px var(--orb-soft,rgba(129,140,248,.12));animation:orbIdle 4.5s ease-in-out infinite}
   .mb-orb-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid var(--orb-glow,rgba(129,140,248,.38));animation:orbRing 4.5s ease-out infinite;opacity:0}
   .mb-orb-ring:nth-child(2){animation-delay:1.5s}
@@ -37837,6 +37837,33 @@ def dashboard():
   @keyframes orbWarn{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.07);filter:brightness(1.6) saturate(2.2)}}
   @keyframes orbDim{0%,100%{transform:scale(1)}50%{transform:scale(1.01)}}
   @keyframes orbRing{0%{transform:scale(.82);opacity:.8}100%{transform:scale(2.1);opacity:0}}
+  /* ── AI Character: animated face replaces orb core — DISPLAY-ONLY ── */
+  .mb-char-svg{position:absolute;top:50%;left:50%;transform:translate(-50%,-52%);overflow:visible;animation:charBreathe 5.5s ease-in-out infinite}
+  .mb-char-iris{transition:fill .6s}
+  .char-lid{animation:charBlink 4.2s ease-in-out infinite}
+  .char-iris-grp{animation:irisFloat 7s ease-in-out infinite}
+  .mb-caption{min-height:24px;font-size:11px;color:#94a3b8;line-height:1.45;text-align:center;padding:2px 8px 0;font-style:italic;transition:color .5s;max-width:290px;margin:0 auto}
+  .mb-caption.cap-ready{color:#22c55e}
+  .mb-caption.cap-defend{color:#ef4444}
+  .mb-caption.cap-hunt{color:#f59e0b}
+  .mb-tts-btn{background:none;border:1px solid rgba(129,140,248,.3);border-radius:6px;color:#818cf8;font-size:12px;padding:4px 10px;cursor:pointer;transition:all .2s;white-space:nowrap}
+  .mb-tts-btn:hover{background:rgba(129,140,248,.15)}
+  .mb-tts-btn.tts-on{color:#22c55e;border-color:rgba(34,197,94,.4)}
+  @keyframes charBreathe{0%,100%{transform:translate(-50%,-52%) scale(1)}50%{transform:translate(-50%,-53%) scale(1.014)}}
+  @keyframes charBlink{0%,87%,100%{transform:translateY(0)}90%,94%{transform:translateY(10px)}}
+  @keyframes irisFloat{0%,100%{transform:translate(0,0)}25%{transform:translate(1.2px,.3px)}55%{transform:translate(-.9px,-.4px)}80%{transform:translate(.6px,.5px)}}
+  @keyframes charPoise{0%,100%{transform:translate(-50%,-52%) scale(1)}50%{transform:translate(-50%,-54%) scale(1.022)}}
+  @keyframes charHunt{0%,100%{transform:translate(-50%,-52%)}30%{transform:translate(-51.5%,-52.5%)}70%{transform:translate(-48.5%,-52.5%)}}
+  @keyframes charAlert{0%,100%{transform:translate(-50%,-52%) scale(1)}50%{transform:translate(-50%,-53%) scale(1.01)}}
+  @keyframes irisHunt{0%,100%{transform:translate(0,0)}30%{transform:translate(1.5px,0)}70%{transform:translate(-1.5px,0)}}
+  .orb-ready .mb-char-svg{animation:charPoise 2.4s ease-in-out infinite}
+  .orb-hunt .mb-char-svg{animation:charHunt 3s ease-in-out infinite}
+  .orb-hunt .char-iris-grp{animation:irisHunt 2.2s ease-in-out infinite}
+  .orb-defend .mb-char-svg{animation:charAlert 1.4s ease-in-out infinite}
+  .orb-manage .mb-char-svg{animation:charBreathe 3.2s ease-in-out infinite}
+  .orb-block .mb-char-svg{animation:charBreathe 7s ease-in-out infinite;filter:brightness(.7) saturate(.4)}
+  .orb-ready .char-lid{animation-duration:3.5s}
+  .orb-defend .char-lid{animation-duration:2s}
   .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:5px;transition:color .5s;text-shadow:0 0 24px currentColor}
   .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
   /* ── Brain-first 3-column layout: LEFT (controls) · CENTER (Main Brain) · RIGHT (compact state) ── */
@@ -38494,9 +38521,43 @@ def dashboard():
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
-        <div class="mb-orb-core"></div>
+        <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="mbHG" cx="50%" cy="38%" r="58%"><stop offset="0%" stop-color="#253249"/><stop offset="100%" stop-color="#0c1422"/></radialGradient>
+            <radialGradient id="mbIG" cx="38%" cy="33%" r="62%"><stop offset="0%" stop-color="#7dd3fc"/><stop offset="100%" stop-color="#0284c7"/></radialGradient>
+            <filter id="mbGlw" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+            <filter id="mbSft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur in="SourceGraphic" stdDeviation="0.8"/></filter>
+          </defs>
+          <rect x="52" y="120" width="16" height="36" rx="5" fill="#111c30"/>
+          <path d="M0,158 Q28,130 52,120 L68,120 Q92,130 120,158 Z" fill="#0c1625"/>
+          <rect id="mbHead" x="18" y="16" width="84" height="108" rx="30" fill="url(#mbHG)"/>
+          <ellipse cx="60" cy="27" rx="24" ry="9" fill="rgba(255,255,255,.03)"/>
+          <ellipse cx="23" cy="72" rx="7" ry="15" fill="rgba(255,255,255,.02)"/>
+          <ellipse cx="97" cy="72" rx="7" ry="15" fill="rgba(255,255,255,.02)"/>
+          <ellipse cx="40" cy="61" rx="14.5" ry="10.5" fill="rgba(3,7,18,.65)"/>
+          <ellipse cx="80" cy="61" rx="14.5" ry="10.5" fill="rgba(3,7,18,.65)"/>
+          <ellipse cx="40" cy="61" rx="12.5" ry="9" fill="#071325"/>
+          <ellipse cx="80" cy="61" rx="12.5" ry="9" fill="#071325"/>
+          <g id="mbIrisGrp" class="char-iris-grp">
+            <circle class="mb-char-iris" cx="40" cy="61" r="6" fill="#0ea5e9" filter="url(#mbSft)"/>
+            <circle cx="40" cy="61" r="3" fill="#020c1c"/>
+            <circle cx="38.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+            <circle class="mb-char-iris" cx="80" cy="61" r="6" fill="#0ea5e9" filter="url(#mbSft)"/>
+            <circle cx="80" cy="61" r="3" fill="#020c1c"/>
+            <circle cx="78.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+          </g>
+          <ellipse id="mbLidL" class="char-lid" cx="40" cy="51" rx="13" ry="9.5" fill="#1b2740" style="transform-box:fill-box;transform-origin:50% 0%"/>
+          <ellipse id="mbLidR" class="char-lid" cx="80" cy="51" rx="13" ry="9.5" fill="#1b2740" style="transform-box:fill-box;transform-origin:50% 0%;animation-delay:.07s"/>
+          <path id="mbBrowL" d="M28,47 Q40,43 52,47" stroke="rgba(120,140,200,.55)" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+          <path id="mbBrowR" d="M68,47 Q80,43 92,47" stroke="rgba(120,140,200,.55)" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+          <path d="M57,67 L55,77 Q60,80 65,77 L63,67" stroke="rgba(255,255,255,.04)" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+          <path id="mbMouth" d="M46,94 Q60,97 74,94" stroke="rgba(80,120,200,.6)" stroke-width="2" fill="none" stroke-linecap="round"/>
+          <ellipse cx="60" cy="118" rx="14" ry="3.5" fill="rgba(255,255,255,.02)"/>
+          <circle id="mbIndicator" cx="60" cy="19" r="2.8" fill="#0ea5e9" opacity=".85" filter="url(#mbGlw)"/>
+        </svg>
       </div>
       <div class="mb-av-state" id="mb-av-state">OBSERVING</div>
+      <div id="mb-caption" class="mb-caption"></div>
       <div id="mb-av-ctx" class="mb-av-ctx"></div>
       <div class="mb-av-meta">
         <span id="mb-av-market">—</span><span class="mb-av-sep">·</span><span id="mb-av-mode">—</span><span class="mb-av-sep">·</span>Verdict:&nbsp;<span id="mb-av-verdict" style="font-weight:800">—</span>
@@ -38624,6 +38685,7 @@ def dashboard():
     <div id="mb-quick-q" class="mb-chips"></div>
     <div class="mb-chat-row">
       <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
+      <button type="button" class="mb-tts-btn" id="mb-tts-btn" onclick="mbTtsToggle()" title="Toggle voice narration">&#9835; Voice</button>
       <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask →</button>
     </div>
   </div><!-- /#mod-brain -->
@@ -41290,6 +41352,99 @@ function mbGetMode(){
   if(sw && sw.classList.contains('active')) return 'Swing';
   return '—';
 }
+// ══════════════════════════════════════════════════════════════════════════════
+// AI CHARACTER — visual + voice layer for the Main Brain (DISPLAY-ONLY)
+// All responses come from existing Brain data; character never invents.
+// Never touches gate, sizing, dedupe or any money path.
+// ══════════════════════════════════════════════════════════════════════════════
+var _charSpeakTimer = null, _charSpeaking = false, _charMouthIdx = 0;
+var _charMouthPaths = ['M46,94 Q60,99 74,94','M46,94 Q60,104 74,94','M46,94 Q60,97 74,94','M47,92 Q60,101 73,92'];
+var _ttsMuted = true, _ttsLastNarr = '', _captionLast = '';
+var _CHAR_STATE_IRIS = {
+  OBSERVING:'#0ea5e9', HUNTING:'#f59e0b', WAITING:'#818cf8',
+  READY:'#22c55e', MANAGING:'#38bdf8', DEFENDING:'#ef4444', BLOCKED:'#6b7280'
+};
+var _CHAR_BROWS = {
+  OBSERVING:['M28,47 Q40,43 52,47','M68,47 Q80,43 92,47'],
+  HUNTING:  ['M28,48 Q40,46 52,49','M68,49 Q80,46 92,48'],
+  READY:    ['M28,45 Q40,42 52,46','M68,46 Q80,42 92,45'],
+  MANAGING: ['M28,47 Q40,44 52,48','M68,48 Q80,44 92,47'],
+  DEFENDING:['M28,44 Q40,41 52,45','M68,45 Q80,41 92,44'],
+  BLOCKED:  ['M28,44 Q40,42 52,45','M68,45 Q80,42 92,44'],
+  WAITING:  ['M28,47 Q40,43 52,47','M68,47 Q80,43 92,47']
+};
+var _CHAR_MOUTHS = {
+  OBSERVING:'M46,94 Q60,97 74,94', HUNTING:'M46,94 Q60,96 74,94',
+  READY:'M46,94 Q60,91 74,94',     MANAGING:'M46,94 Q60,96 74,94',
+  DEFENDING:'M46,95 Q60,101 74,95', BLOCKED:'M46,95 Q60,101 74,95',
+  WAITING:'M46,94 Q60,97 74,94'
+};
+var _CHAR_BROW_COLORS = {
+  READY:'rgba(120,200,140,.6)', DEFENDING:'rgba(200,140,140,.65)',
+  BLOCKED:'rgba(200,140,140,.65)', HUNTING:'rgba(220,180,80,.5)'
+};
+function updateCharacter(sk){
+  var irisColor = _CHAR_STATE_IRIS[sk] || '#0ea5e9';
+  document.querySelectorAll('.mb-char-iris').forEach(function(el){ el.setAttribute('fill', irisColor); });
+  var dot = document.getElementById('mbIndicator'); if(dot) dot.setAttribute('fill', irisColor);
+  var brows = _CHAR_BROWS[sk] || _CHAR_BROWS.OBSERVING;
+  var bl = document.getElementById('mbBrowL'), br = document.getElementById('mbBrowR');
+  if(bl){ bl.setAttribute('d', brows[0]); bl.setAttribute('stroke', _CHAR_BROW_COLORS[sk] || 'rgba(120,140,200,.55)'); }
+  if(br){ br.setAttribute('d', brows[1]); br.setAttribute('stroke', _CHAR_BROW_COLORS[sk] || 'rgba(120,140,200,.55)'); }
+  if(!_charSpeaking){
+    var mth = document.getElementById('mbMouth');
+    if(mth) mth.setAttribute('d', _CHAR_MOUTHS[sk] || _CHAR_MOUTHS.OBSERVING);
+  }
+}
+function _updateCaption(text, state){
+  var el = document.getElementById('mb-caption');
+  if(!el || !text || text === _captionLast) return;
+  _captionLast = text;
+  var display = text.length > 118 ? text.slice(0, 117) + '\u2026' : text;
+  el.textContent = display;
+  el.className = 'mb-caption'
+    + (state === 'READY'    ? ' cap-ready'  : '')
+    + (state === 'DEFENDING'? ' cap-defend' : '')
+    + (state === 'HUNTING'  ? ' cap-hunt'   : '');
+}
+function _startSpeakAnim(){
+  if(_charSpeaking) return; _charSpeaking = true;
+  _charSpeakTimer = setInterval(function(){
+    var el = document.getElementById('mbMouth');
+    if(el){ el.setAttribute('d', _charMouthPaths[_charMouthIdx % _charMouthPaths.length]); _charMouthIdx++; }
+  }, 145);
+}
+function _stopSpeakAnim(){
+  if(_charSpeakTimer){ clearInterval(_charSpeakTimer); _charSpeakTimer = null; }
+  _charSpeaking = false; _charMouthIdx = 0;
+  var el = document.getElementById('mbMouth');
+  if(el) el.setAttribute('d', 'M46,94 Q60,97 74,94');
+}
+function mbTtsToggle(){
+  _ttsMuted = !_ttsMuted;
+  var btn = document.getElementById('mb-tts-btn');
+  if(btn){ btn.textContent = _ttsMuted ? '\u266b Voice' : '\u266b Live'; btn.className = 'mb-tts-btn' + (_ttsMuted ? '' : ' tts-on'); }
+  if(_ttsMuted && 'speechSynthesis' in window){ window.speechSynthesis.cancel(); _stopSpeakAnim(); }
+}
+function mbSpeak(text){
+  if(_ttsMuted || !text || text === _ttsLastNarr || !('speechSynthesis' in window)) return;
+  _ttsLastNarr = text;
+  window.speechSynthesis.cancel(); _stopSpeakAnim();
+  var utt = new SpeechSynthesisUtterance(text);
+  utt.rate = 0.92; utt.pitch = 0.88; utt.volume = 0.9;
+  try{
+    var voices = window.speechSynthesis.getVoices();
+    var pref = voices.find(function(v){
+      return v.lang.startsWith('en') && (v.name.indexOf('Daniel') >= 0 || v.name.indexOf('Alex') >= 0 || (v.name.indexOf('Google') >= 0 && v.name.indexOf('US') >= 0));
+    });
+    if(pref) utt.voice = pref;
+  }catch(ignore){}
+  utt.onstart = function(){ _startSpeakAnim(); };
+  utt.onend = utt.onerror = function(){ _stopSpeakAnim(); };
+  window.speechSynthesis.speak(utt);
+}
+if('speechSynthesis' in window){ try{ window.speechSynthesis.getVoices(); }catch(ignore){} }
+
 // Avatar state → orb animation class mapping. DISPLAY-ONLY; never touches gate/scoring.
 const ORB_STATE_CLASSES = ['orb-obs','orb-wait','orb-hunt','orb-ready','orb-manage','orb-defend','orb-block'];
 const ORB_CLASS_MAP = {
@@ -41391,6 +41546,11 @@ function renderMBAvatar(mb, d){
     ageEl.textContent = lu ? ('updated ' + lu) : '';
     ageEl.style.color = '#4b5563';
   }
+  // ── AI Character: update face + caption + optional TTS ──
+  updateCharacter(sk);
+  var _cap = (mb && mb.unified && mb.unified.narrative) || (mb && mb.summary) || '';
+  _updateCaption(_cap, sk);
+  mbSpeak(_cap);
 }
 const MB_BADGE_COLORS = { WATCHING:'#6b7280', BUILDING:'#3b82f6', READY:'#22c55e', WAIT:'#f59e0b', MANAGING:'#a855f7', INVALIDATED:'#ef4444' };
 const MB_RISK_COLORS = { Low:'#22c55e', Medium:'#f59e0b', High:'#ef4444' };
