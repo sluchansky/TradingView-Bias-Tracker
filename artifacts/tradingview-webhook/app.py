@@ -37525,6 +37525,10 @@ def dashboard():
   .mb-feed-tx{font-size:12.5px;color:#c8d0e8;line-height:1.55}
   .fk-question{--fk:#c084fc}.fk-answer{--fk:#818cf8}.fk-trade{--fk:#34d399}
   .fk-thesis{--fk:#fbbf24}.fk-risk{--fk:#f87171}.fk-thought{--fk:#4f5585}.fk-memory{--fk:#2dd4bf}
+  .mb-brief-card{--fk:#4f5585;gap:5px!important}
+  .mb-brief-row{display:flex;gap:10px;align-items:baseline}
+  .mb-brief-label{font-size:9.5px;font-weight:800;letter-spacing:.8px;color:#6b7280;flex:0 0 110px;text-transform:uppercase;padding-top:1px}
+  .mb-brief-val{font-size:12.5px;color:#c8d0e8;line-height:1.55;font-style:italic}
   .mb-feed-h::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle;animation:mbLivePulse 2.2s ease-in-out infinite}
   @keyframes mbLivePulse{0%,100%{opacity:1}50%{opacity:.2}}
   .mb-msg-a .mb-msg-who{color:#9d99ff;letter-spacing:.5px}
@@ -40937,6 +40941,74 @@ function mbNowET(){
   try{ return new Date().toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}); }
   catch(e){ return ''; }
 }
+// Build a 5-part intelligence brief from the current main_brain + signals snapshot.
+// DISPLAY-ONLY — reads existing computed fields, never touches the money path.
+function mbBuildBrief(mb, sig){
+  sig = sig || {};
+  const status  = sig.status    || (mb && mb.status) || 'WATCHING';
+  const favored = sig.favored   || 'none';
+  const cvd     = sig.cvd       || 'unknown';
+  const zone    = sig.zone      || 'none';
+  const conf    = (typeof sig.confidence === 'number') ? sig.confidence : null;
+  const mr      = (mb && mb.management_read && mb.management_read.status==='ok') ? mb.management_read : null;
+  const mission = (mb && mb.mission) || [];
+  const pending = mission.filter(function(m){ return m && !m.done; });
+  const bullCase= (mb && mb.bull_case  && mb.bull_case.length)  ? mb.bull_case  : [];
+  const bearCase= (mb && mb.bear_case  && mb.bear_case.length)  ? mb.bear_case  : [];
+  const fc = (favored==='short') ? bearCase : bullCase;
+  const oc = (favored==='short') ? bullCase : bearCase;
+  // What I see — the observable fact (server already writes this in plain language)
+  var see = (mb && mb.summary) || 'Observing market conditions.';
+  // What it means — interpretation derived from the favored case or order flow
+  var means;
+  if(mr){
+    const r = parseFloat(String(mr.current_r||'0').replace('R',''))||0;
+    means = r>=1.0 ? 'The trade is working — in profit territory.'
+          : r<-0.5 ? 'The position is under pressure — defending the stop.'
+          :           'The position is near breakeven — monitoring closely.';
+  } else if(fc.length){ means = fc[0]; }
+  else if(status==='READY'){
+    means = 'All required conditions are met'+(favored!=='none'?' for a '+favored+' entry':'')+'.';
+  } else if(conf!==null && conf>=50){ means = 'A setup is building — '+conf+'% of conditions in place.'; }
+  else if(cvd==='bullish'){  means = 'Order flow is net-long — buyers are in control.'; }
+  else if(cvd==='bearish'){  means = 'Order flow is net-short — sellers are in control.'; }
+  else { means = 'No clear edge yet. Watching for confluence.'; }
+  // What I need next — first unmet mission condition, or a structural trigger
+  var next;
+  if(mr){
+    const d2t = mr.dist_to_target1!=null ? mr.dist_to_target1+' pts to TP' : null;
+    const d2s = mr.dist_to_stop   !=null ? mr.dist_to_stop+' pts to stop'  : null;
+    next = [d2t,d2s].filter(Boolean).join(', ')||'TP or stop to be reached.';
+  } else if(pending.length){
+    next = pending[0].label+(pending.length>1?' — then '+pending[1].label:'')+'.';
+  } else if(status==='READY'){
+    next = 'The entry trigger to fire.';
+  } else if(favored!=='none'){
+    next = 'A '+(favored==='short'?'bearish':'bullish')+' BOS or CHOCH to confirm direction.';
+  } else { next = 'Structure and order flow to align.'; }
+  // What invalidates it — opposite case first bullet, or constructed from signals
+  var invalidates;
+  if(mr){
+    const dir=(mr.direction||'').toLowerCase();
+    invalidates = dir==='short' ? 'Price reclaims above entry and holds.'
+                                : 'Price breaks below entry and holds.';
+  } else if(oc.length){ invalidates = oc[0]; }
+  else if(zone==='demand'){  invalidates = 'A sustained close below the demand zone.'; }
+  else if(zone==='supply'){  invalidates = 'A sustained close above the supply zone.'; }
+  else if(favored==='long'){ invalidates = 'Loss of VWAP and a bearish BOS below the last swing low.'; }
+  else if(favored==='short'){ invalidates = 'A VWAP reclaim and a bullish BOS above the last swing high.'; }
+  else { invalidates = 'A strong trend move without a clean setup forming.'; }
+  // What I am doing — current stance in plain first-person language
+  var doing;
+  if(mr){
+    const rec=(mr.recommendation||mr.action||'').toLowerCase();
+    doing = rec ? 'Managing the position — '+rec+'.' : 'Holding. Monitoring the open trade.';
+  } else if(status==='READY'){       doing = 'Ready. Waiting for the entry trigger.'; }
+  else if(status==='INVALIDATED'){   doing = 'Stepped aside. The thesis is broken — not entering.'; }
+  else if(status==='BUILDING'){      doing = 'Watching. I am not entering early.'; }
+  else { doing = 'Watching. Not entering until conditions are fully aligned.'; }
+  return {see:see, means:means, next:next, invalidates:invalidates, doing:doing};
+}
 // Collapse repeated confidence fluctuations into one running narrative sentence.
 // Finds and REPLACES the last confKey entry rather than appending a new one.
 function mbMergeConf(symKey, fromVal, toVal){
@@ -40960,6 +41032,8 @@ function mbMergeConf(symKey, fromVal, toVal){
   else { feed.push({t:mbNowET(), kind:'thought', text:text, confKey:true}); }
 }
 // Render the feed as a typed conversational transcript — one card per entry.
+// Brief cards (kind:'brief') render the 5-part intelligence format; all others render as a
+// single-line entry. Both are DISPLAY-ONLY; all strings written via textContent (no innerHTML).
 function mbRenderFeed(symKey, scrollToEnd){
   const feed = document.getElementById('mb-feed');
   if(!feed) return;
@@ -40973,6 +41047,35 @@ function mbRenderFeed(symKey, scrollToEnd){
     return;
   }
   arr.forEach(function(item){
+    // ── Brief card — 5-part intelligence format ──
+    if(item.kind === 'brief' && item.brief){
+      const B = item.brief;
+      const row = document.createElement('div');
+      row.className = 'mb-feed-row mb-brief-card fk-thought';
+      const meta = document.createElement('div'); meta.className = 'mb-feed-meta';
+      const bd = document.createElement('span'); bd.className = 'mb-feed-badge';
+      bd.textContent = 'BRAIN'; bd.style.color = '#818cf8';
+      const ts = document.createElement('span'); ts.className = 'mb-feed-t'; ts.textContent = item.t;
+      meta.appendChild(bd); meta.appendChild(ts);
+      row.appendChild(meta);
+      [['What I see',      B.see],
+       ['What it means',   B.means],
+       ['What I need',     B.next],
+       ['What invalidates',B.invalidates],
+       ['What I am doing', B.doing]].forEach(function(pair){
+        if(!pair[1]) return;
+        const brow = document.createElement('div'); brow.className = 'mb-brief-row';
+        const lbl  = document.createElement('span'); lbl.className = 'mb-brief-label';
+        lbl.textContent = pair[0];
+        const val  = document.createElement('span'); val.className = 'mb-brief-val';
+        val.textContent = pair[1];
+        brow.appendChild(lbl); brow.appendChild(val);
+        row.appendChild(brow);
+      });
+      feed.appendChild(row);
+      return;
+    }
+    // ── Standard single-line entry ──
     const cfg = MB_FEED_KINDS[item.kind] || MB_FEED_KINDS.thought;
     const row = document.createElement('div');
     row.className = 'mb-feed-row fk-' + (item.kind || 'thought');
@@ -41265,17 +41368,25 @@ function renderMainBrain(d){
   const prevSig = mbLastSignals[symKey];
   let appended = false;
   if(prevSig === undefined){
-    // First observation — seed the transcript with a brain thought
-    mbFeeds[symKey].push({t:mbNowET(), kind:'thought', text:summary});
+    // First observation — emit the full 5-part brief as the opening entry
+    mbFeeds[symKey].push({t:mbNowET(), kind:'brief', brief:mbBuildBrief(mb, sig)});
     appended = true;
   } else {
-    mbChangeMessages(prevSig, sig).forEach(function(item){
-      if(item.kind === '_conf'){
+    const changes = mbChangeMessages(prevSig, sig);
+    // Regime change (status / bias / structure) → emit a fresh brief instead of individual lines
+    const isRegime = changes.some(function(x){ return x.kind==='trade'||x.kind==='thesis'; });
+    if(isRegime){
+      delete mbConfArc[symKey];  // reset confidence arc — new episode, new baseline
+      mbFeeds[symKey].push({t:mbNowET(), kind:'brief', brief:mbBuildBrief(mb, sig)});
+      appended = true;
+    }
+    // Micro-changes (VWAP, CVD, zone, confidence, risk) emit as individual lines
+    changes.forEach(function(item){
+      if(item.kind==='trade'||item.kind==='thesis') return;  // already in the brief
+      if(item.kind==='_conf'){
         mbMergeConf(symKey, item.confFrom, item.confTo);
         appended = true;
       } else {
-        // Reset the confidence arc on regime changes so the next arc has a fresh baseline
-        if(item.kind === 'trade' || item.kind === 'thesis') delete mbConfArc[symKey];
         mbFeeds[symKey].push({t:mbNowET(), kind:item.kind, text:item.text});
         appended = true;
       }
