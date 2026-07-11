@@ -511,7 +511,7 @@ function EvidenceDrawer({ data, status }: { data: any; status: string }) {
   const val: React.CSSProperties = { fontSize:11.5, fontFamily:'monospace', fontWeight:600 };
 
   return (
-    <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:16 }}>
+    <div className="ev-grid" style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:16 }}>
       {/* Key Levels */}
       <div>
         <div style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', letterSpacing:'0.10em', textTransform:'uppercase', marginBottom:8 }}>Key Levels</div>
@@ -728,6 +728,23 @@ export default function Home() {
     .action-btn:hover:not(:disabled) { filter:brightness(1.15); }
     .sidebar-panel { animation:slideIn 0.18s ease-out; }
     @media(max-width:760px){.sidebar-l{display:none!important;}}
+    @media(max-width:640px){
+      .hdr-logo-name{display:none!important;}
+      .hdr-clock{display:none!important;}
+      .hdr-eng{display:none!important;}
+      .ticker-btn{padding:3px 7px!important;font-size:10px!important;}
+      .main-center{padding:14px 12px 20px!important;}
+      .mb-row{flex-direction:column!important;min-height:unset!important;gap:14px!important;align-items:center!important;}
+      .mb-brain{min-width:0!important;width:100%!important;align-items:flex-start!important;}
+      .verdict-big{font-size:26px!important;letter-spacing:-0.01em!important;}
+      .verdict-sub{font-size:15px!important;}
+      .edge-wrap{max-width:100%!important;}
+      .narration{font-size:14px!important;max-width:100%!important;min-height:unset!important;}
+      .wait-box{max-width:100%!important;}
+      .ev-grid{grid-template-columns:1fr!important;}
+      .chart-hdr-extra{display:none!important;}
+      .quick-chips{gap:5px!important;}
+    }
   `;
 
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
@@ -749,7 +766,7 @@ export default function Home() {
             <div style={{ width:26, height:26, borderRadius:7, background:'rgba(59,130,246,0.18)',
               border:'1px solid rgba(59,130,246,0.32)', display:'flex', alignItems:'center', justifyContent:'center',
               fontSize:12, fontWeight:800, color:'#93c5fd', boxShadow:`0 0 12px ${eyeColor}44` }}>A</div>
-            <span style={{ fontSize:12.5, fontWeight:700, color:'rgba(255,255,255,0.75)', letterSpacing:'-0.01em' }}>AI Trading Partner</span>
+            <span className="hdr-logo-name" style={{ fontSize:12.5, fontWeight:700, color:'rgba(255,255,255,0.75)', letterSpacing:'-0.01em' }}>AI Trading Partner</span>
           </div>
           <div style={{ display:'flex', gap:1 }}>
             {(['MNQ','MGC','MES','MYM'] as const).map(t => (
@@ -765,7 +782,7 @@ export default function Home() {
         </div>
         {/* Center: clock + market */}
         <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-          <span style={{ fontSize:11.5, color:'rgba(255,255,255,0.38)', fontFamily:'monospace' }}>{clock}</span>
+          <span className="hdr-clock" style={{ fontSize:11.5, color:'rgba(255,255,255,0.38)', fontFamily:'monospace' }}>{clock}</span>
           <div style={{ display:'flex', alignItems:'center', gap:5, padding:'3px 9px', borderRadius:16,
             border:`1px solid ${isOpen ? 'rgba(34,197,94,0.28)' : 'rgba(107,114,128,0.25)'}`,
             background: isOpen ? 'rgba(34,197,94,0.06)' : 'rgba(107,114,128,0.06)' }}>
@@ -789,7 +806,7 @@ export default function Home() {
             fontSize:15, color: muted ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.45)', padding:'3px' }}>
             {muted ? '🔇' : '🔊'}
           </button>
-          <a href="/api/dashboard" style={{ fontSize:10.5, color:'rgba(255,255,255,0.15)', textDecoration:'none', fontFamily:'monospace' }}
+          <a className="hdr-eng" href="/api/dashboard" style={{ fontSize:10.5, color:'rgba(255,255,255,0.15)', textDecoration:'none', fontFamily:'monospace' }}
             onMouseEnter={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.45)')}
             onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.15)')}>ENG ↗</a>
         </div>
@@ -907,10 +924,10 @@ export default function Home() {
         )}
 
         {/* ── MAIN CENTER ──────────────────────────────────────────────────── */}
-        <div style={{ flex:1, overflowY:'auto', overflowX:'hidden', padding:'24px 28px 24px', display:'flex', flexDirection:'column', gap:0, minWidth:0 }}>
+        <div className="main-center" style={{ flex:1, overflowY:'auto', overflowX:'hidden', padding:'24px 28px 24px', display:'flex', flexDirection:'column', gap:0, minWidth:0 }}>
 
           {/* ── MAIN BRAIN COMMAND CENTER ───────────────────────────────── */}
-          <div style={{ display:'flex', gap:28, marginBottom:20, minHeight:320 }}>
+          <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:320 }}>
 
             {/* Avatar section */}
             <div style={{ flexShrink:0, display:'flex', flexDirection:'column', alignItems:'center', gap:0 }}>
@@ -932,21 +949,21 @@ export default function Home() {
             </div>
 
             {/* Brain content */}
-            <div style={{ flex:1, display:'flex', flexDirection:'column', gap:14, justifyContent:'center', minWidth:0 }}>
+            <div className="mb-brain" style={{ flex:1, display:'flex', flexDirection:'column', gap:14, justifyContent:'center', minWidth:0 }}>
 
               {/* BIG VERDICT */}
               <div>
-                <div style={{ fontSize:38, fontWeight:900, lineHeight:1, color:verdictColor,
+                <div className="verdict-big" style={{ fontSize:38, fontWeight:900, lineHeight:1, color:verdictColor,
                   letterSpacing:'-0.02em', textShadow:`0 0 30px ${verdictColor}44` }}>
                   {verdictLabel}
                 </div>
-                <div style={{ fontSize:20, fontWeight:700, color:'rgba(255,255,255,0.55)', marginTop:4, letterSpacing:'-0.01em' }}>
+                <div className="verdict-sub" style={{ fontSize:20, fontWeight:700, color:'rgba(255,255,255,0.55)', marginTop:4, letterSpacing:'-0.01em' }}>
                   {ticker} <span style={{ color:'rgba(255,255,255,0.22)' }}>·</span> {price > 0 ? fmt(price, 2) : '—'}
                 </div>
               </div>
 
               {/* Edge score */}
-              <div style={{ maxWidth:320 }}>
+              <div className="edge-wrap" style={{ maxWidth:320 }}>
                 <div style={{ display:'flex', justifyContent:'space-between', marginBottom:5 }}>
                   <span style={{ fontSize:10, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', letterSpacing:'0.10em', textTransform:'uppercase' }}>Edge Score</span>
                   {grade && <span style={{ fontSize:10, fontFamily:'monospace', color:verdictColor, fontWeight:700, letterSpacing:'0.08em' }}>{grade}</span>}
@@ -955,14 +972,14 @@ export default function Home() {
               </div>
 
               {/* Spoken message — large */}
-              <div style={{ fontSize:16, lineHeight:1.65, color:'rgba(255,255,255,0.78)', maxWidth:560, minHeight:52,
+              <div className="narration" style={{ fontSize:16, lineHeight:1.65, color:'rgba(255,255,255,0.78)', maxWidth:560, minHeight:52,
                 letterSpacing:'0.01em' }}>
                 {displayed || (loading ? '' : '…')}{streaming && <span style={{ opacity:0.4, animation:'bDot 0.8s infinite' }}>▌</span>}
               </div>
 
               {/* Wait reason */}
               {strictR && status === 'WAIT' && (
-                <div style={{ padding:'8px 12px', borderRadius:7, background:'rgba(245,158,11,0.07)',
+                <div className="wait-box" style={{ padding:'8px 12px', borderRadius:7, background:'rgba(245,158,11,0.07)',
                   border:'1px solid rgba(245,158,11,0.18)', fontSize:12, color:AMB, fontFamily:'monospace',
                   maxWidth:480 }}>
                   {strictR}
@@ -1022,7 +1039,7 @@ export default function Home() {
           </div>
 
           {/* ── QUICK CHIPS ─────────────────────────────────────────────── */}
-          <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:16 }}>
+          <div className="quick-chips" style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:16 }}>
             {chips.map(c => (
               <button key={c} className="chip-btn" onClick={() => ask(c)} disabled={asking} style={{
                 padding:'5px 13px', borderRadius:16, border:'1px solid rgba(255,255,255,0.09)',
@@ -1087,9 +1104,9 @@ export default function Home() {
               color:'rgba(255,255,255,0.40)', fontSize:11, fontFamily:'monospace', letterSpacing:'0.08em' }}>
               <span style={{ textTransform:'uppercase', fontWeight:700 }}>{ticker} Chart · 1m</span>
               <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                {data?.vwap_value && <span style={{ color:'#60a5fa', fontSize:10.5 }}>VWAP {fmt(data.vwap_value)}</span>}
-                {data?.nearest_demand && <span style={{ color:BULL, fontSize:10.5 }}>D {fmt(data.nearest_demand)}</span>}
-                {data?.nearest_supply && <span style={{ color:BEAR, fontSize:10.5 }}>S {fmt(data.nearest_supply)}</span>}
+                {data?.vwap_value && <span className="chart-hdr-extra" style={{ color:'#60a5fa', fontSize:10.5 }}>VWAP {fmt(data.vwap_value)}</span>}
+                {data?.nearest_demand && <span className="chart-hdr-extra" style={{ color:BULL, fontSize:10.5 }}>D {fmt(data.nearest_demand)}</span>}
+                {data?.nearest_supply && <span className="chart-hdr-extra" style={{ color:BEAR, fontSize:10.5 }}>S {fmt(data.nearest_supply)}</span>}
                 <span style={{ fontSize:13, color:'rgba(255,255,255,0.25)' }}>{chartOpen ? '▲' : '▼'}</span>
               </div>
             </button>
