@@ -75,6 +75,59 @@ function useStream(target: string, msPerChar = 14) {
   return { text, live };
 }
 
+// ── Text-to-speech hook ───────────────────────────────────────────────────────
+function useTTS() {
+  const [voices, setVoices]    = useState<SpeechSynthesisVoice[]>([]);
+  const [voiceName, setVoiceN] = useState<string>(() => {
+    try { return localStorage.getItem('brain_voice') ?? ''; } catch { return ''; }
+  });
+  const [muted, setMutedState] = useState<boolean>(() => {
+    try { return localStorage.getItem('brain_muted') !== '0'; } catch { return true; }
+  });
+  const [speaking, setSpeaking] = useState(false);
+
+  useEffect(() => {
+    const ss = window.speechSynthesis;
+    if (!ss) return;
+    const load = () => {
+      const all = ss.getVoices();
+      const en  = all.filter(v => v.lang.startsWith('en'));
+      setVoices(en.length ? en : all.slice(0, 30));
+    };
+    load();
+    ss.addEventListener('voiceschanged', load);
+    return () => ss.removeEventListener('voiceschanged', load);
+  }, []);
+
+  const setVoice = useCallback((name: string) => {
+    try { localStorage.setItem('brain_voice', name); } catch { /* */ }
+    setVoiceN(name);
+  }, []);
+
+  const setMuted = useCallback((m: boolean) => {
+    try { localStorage.setItem('brain_muted', m ? '1' : '0'); } catch { /* */ }
+    if (m) { window.speechSynthesis?.cancel(); setSpeaking(false); }
+    setMutedState(m);
+  }, []);
+
+  const speak = useCallback((text: string) => {
+    const ss = window.speechSynthesis;
+    if (!text || muted || !ss) return;
+    ss.cancel();
+    const utt   = new SpeechSynthesisUtterance(text.slice(0, 400));
+    const voice = voices.find(v => v.name === voiceName) ?? voices[0];
+    if (voice) utt.voice = voice;
+    utt.rate  = 0.92;
+    utt.pitch = 1.05;
+    utt.onstart = () => setSpeaking(true);
+    utt.onend   = () => setSpeaking(false);
+    utt.onerror = () => setSpeaking(false);
+    ss.speak(utt);
+  }, [voices, voiceName, muted]);
+
+  return { voices, voiceName, setVoice, muted, setMuted, speaking, speak };
+}
+
 // ── Full digital face — all features in 1s & 0s ──────────────────────────────
 function BrainFace({ speaking, color, glow, status }: {
   speaking: boolean; color: string; glow: string; status: string;
@@ -458,6 +511,19 @@ export default function Home() {
   const microText  = useTicker(microItems, 3000);
   const { text: displayed, live: streaming } = useStream(narration, 14);
 
+  // TTS — muted by default; user opts in via voice controls
+  const { voices, voiceName, setVoice, muted, setMuted, speaking: ttsSpeaking, speak } = useTTS();
+  const speakRef      = useRef(speak);
+  const lastSpokenRef = useRef('');
+  useEffect(() => { speakRef.current = speak; }, [speak]);
+  // Auto-speak new narration when it changes
+  useEffect(() => {
+    if (narration && narration !== lastSpokenRef.current) {
+      lastSpokenRef.current = narration;
+      speakRef.current(narration);
+    }
+  }, [narration]);
+
   // Ask the Brain via /api/assistant
   const ask = useCallback(async (q?: string) => {
     const question = (q ?? input).trim();
@@ -477,7 +543,9 @@ export default function Home() {
         setMsgs(m => [...m, mkMsg('brain', 'Session expired — please re-enter your password.')]);
       } else {
         const j = await r.json();
-        setMsgs(m => [...m, mkMsg('brain', j.answer || j.error || 'No response.')]);
+        const answer = j.answer || j.error || 'No response.';
+        speakRef.current(answer);
+        setMsgs(m => [...m, mkMsg('brain', answer)]);
       }
     } catch {
       setMsgs(m => [...m, mkMsg('brain', 'Connection error — please try again.')]);
@@ -562,7 +630,28 @@ export default function Home() {
         {/* Avatar + narration section */}
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 24, flex: 1, justifyContent: 'center', width: '100%' }}>
 
-          <BrainFace speaking={streaming || asking} color={pal.dot} glow={pal.glow} status={status} />
+          <BrainFace speaking={streaming || asking || ttsSpeaking} color={pal.dot} glow={pal.glow} status={status} />
+
+          {/* Voice controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              onClick={() => setMuted(!muted)}
+              style={{ background: 'none', border: `1px solid ${muted ? 'rgba(255,255,255,0.07)' : pal.dot + '55'}`, borderRadius: 20, padding: '4px 12px', color: muted ? 'rgba(255,255,255,0.2)' : ttsSpeaking ? pal.dot : 'rgba(255,255,255,0.42)', cursor: 'pointer', fontSize: 11, fontFamily: 'monospace', letterSpacing: '0.06em', transition: 'all 0.25s', whiteSpace: 'nowrap' }}>
+              {muted ? '○ voice off' : ttsSpeaking ? '◼ speaking' : '◆ voice on'}
+            </button>
+            {!muted && voices.length > 0 && (
+              <select
+                value={voiceName || (voices[0]?.name ?? '')}
+                onChange={e => setVoice(e.target.value)}
+                style={{ background: '#0a0a0a', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 20, padding: '4px 12px', color: 'rgba(255,255,255,0.35)', fontSize: 11, fontFamily: 'monospace', cursor: 'pointer', outline: 'none', maxWidth: 220, letterSpacing: '0.03em' }}>
+                {voices.map(v => (
+                  <option key={v.name} value={v.name} style={{ background: '#111', color: '#ccc' }}>
+                    {v.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
 
           {/* Status · instrument · edge · direction */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, fontFamily: 'monospace', letterSpacing: '0.08em' }}>
