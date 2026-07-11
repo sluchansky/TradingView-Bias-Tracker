@@ -37543,13 +37543,33 @@ def dashboard():
   .mb-av-handle-lbl{font-size:10px;letter-spacing:2.5px;color:#4b5563;font-weight:700;text-transform:uppercase}
   .mb-av{text-align:center;padding:20px 16px 14px}
   .mb-orb{position:relative;width:96px;height:96px;margin:0 auto 14px}
-  .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#3730a3) 42%,var(--orb-c2,#1e1b4b) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(129,140,248,.4)),0 0 72px var(--orb-soft,rgba(129,140,248,.12));animation:orbBreath 3s ease-in-out infinite}
-  .mb-orb-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid var(--orb-glow,rgba(129,140,248,.38));animation:orbRing 3s ease-out infinite;opacity:0}
-  .mb-orb-ring:nth-child(2){animation-delay:1s}
-  .mb-orb-ring:nth-child(3){animation-delay:2s}
-  @keyframes orbBreath{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.07);filter:brightness(1.2)}}
+  .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#3730a3) 42%,var(--orb-c2,#1e1b4b) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(129,140,248,.4)),0 0 72px var(--orb-soft,rgba(129,140,248,.12));animation:orbIdle 4.5s ease-in-out infinite}
+  .mb-orb-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid var(--orb-glow,rgba(129,140,248,.38));animation:orbRing 4.5s ease-out infinite;opacity:0}
+  .mb-orb-ring:nth-child(2){animation-delay:1.5s}
+  .mb-orb-ring:nth-child(3){animation-delay:3s}
+  /* ── Per-state animation overrides via class on #mb-orb ── */
+  .orb-obs  .mb-orb-core{animation:orbIdle   4.5s ease-in-out infinite}
+  .orb-wait .mb-orb-core{animation:orbIdle   4.5s ease-in-out infinite}
+  .orb-hunt .mb-orb-core{animation:orbScan   2.4s ease-in-out infinite}
+  .orb-ready .mb-orb-core{animation:orbReady  1.4s ease-in-out infinite}
+  .orb-manage .mb-orb-core{animation:orbPulse  1.9s ease-in-out infinite}
+  .orb-defend .mb-orb-core{animation:orbWarn   0.75s ease-in-out infinite}
+  .orb-block .mb-orb-core{animation:orbDim    6s ease-in-out infinite;filter:brightness(.65) saturate(.35)}
+  .orb-obs  .mb-orb-ring,.orb-wait .mb-orb-ring{animation-duration:5s}
+  .orb-hunt .mb-orb-ring{animation-duration:2.4s}
+  .orb-ready .mb-orb-ring{animation-duration:1.2s}
+  .orb-manage .mb-orb-ring{animation-duration:2s}
+  .orb-defend .mb-orb-ring{animation-duration:0.65s;border-width:2.5px}
+  .orb-block .mb-orb-ring{animation:none!important;opacity:0!important}
+  @keyframes orbIdle{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.04);filter:brightness(1.07)}}
+  @keyframes orbScan{0%,100%{transform:scale(1) translateX(0);filter:brightness(1)}20%{transform:scale(1.04) translateX(-3px);filter:brightness(1.18)}60%{transform:scale(1.04) translateX(3px);filter:brightness(1.15)}80%{transform:scale(1.02) translateX(0);filter:brightness(1.08)}}
+  @keyframes orbReady{0%,100%{transform:scale(1);filter:brightness(1.1)}45%{transform:scale(1.13);filter:brightness(1.45)}80%{transform:scale(1.07);filter:brightness(1.2)}}
+  @keyframes orbPulse{0%,100%{transform:scale(1);filter:brightness(1)}18%{transform:scale(1.11);filter:brightness(1.38)}32%{transform:scale(1.03);filter:brightness(1.08)}48%{transform:scale(1.09);filter:brightness(1.28)}65%{transform:scale(1);filter:brightness(1)}}
+  @keyframes orbWarn{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.07);filter:brightness(1.6) saturate(2.2)}}
+  @keyframes orbDim{0%,100%{transform:scale(1)}50%{transform:scale(1.01)}}
   @keyframes orbRing{0%{transform:scale(.82);opacity:.8}100%{transform:scale(2.1);opacity:0}}
-  .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:10px;transition:color .5s;text-shadow:0 0 24px currentColor}
+  .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:5px;transition:color .5s;text-shadow:0 0 24px currentColor}
+  .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
   .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
   .mb-av-sep{color:#2d2d40;font-size:14px}
   .mb-av-foot{font-size:10px;letter-spacing:.5px;margin-top:10px;display:flex;align-items:center;justify-content:center;gap:10px;color:#4b5563}
@@ -38107,6 +38127,7 @@ def dashboard():
         <div class="mb-orb-core"></div>
       </div>
       <div class="mb-av-state" id="mb-av-state">OBSERVING</div>
+      <div id="mb-av-ctx" class="mb-av-ctx"></div>
       <div class="mb-av-meta">
         <span id="mb-av-market">—</span><span class="mb-av-sep">·</span><span id="mb-av-mode">—</span><span class="mb-av-sep">·</span>Verdict:&nbsp;<span id="mb-av-verdict" style="font-weight:800">—</span>
       </div>
@@ -40834,19 +40855,91 @@ function mbGetMode(){
   if(sw && sw.classList.contains('active')) return 'Swing';
   return '—';
 }
+// Avatar state → orb animation class mapping. DISPLAY-ONLY; never touches gate/scoring.
+const ORB_STATE_CLASSES = ['orb-obs','orb-wait','orb-hunt','orb-ready','orb-manage','orb-defend','orb-block'];
+const ORB_CLASS_MAP = {
+  OBSERVING:'orb-obs', WAITING:'orb-wait', HUNTING:'orb-hunt',
+  READY:'orb-ready',   MANAGING:'orb-manage', DEFENDING:'orb-defend', BLOCKED:'orb-block',
+};
 function renderMBAvatar(mb, d){
   const sk = mbDeriveState(mb);
   const pal = MB_STATE_PALETTE[sk] || MB_STATE_PALETTE.OBSERVING;
   const stColor = MB_STATE_COLOR[sk] || '#818cf8';
+
+  // ── Orb: color vars + per-state animation class ──
   const orb = document.getElementById('mb-orb');
   if(orb){
-    orb.style.setProperty('--orb-c1', pal.c1);
-    orb.style.setProperty('--orb-c2', pal.c2);
+    orb.style.setProperty('--orb-c1',   pal.c1);
+    orb.style.setProperty('--orb-c2',   pal.c2);
     orb.style.setProperty('--orb-glow', pal.glow);
     orb.style.setProperty('--orb-soft', pal.soft);
+    ORB_STATE_CLASSES.forEach(function(c){ orb.classList.remove(c); });
+    if(ORB_CLASS_MAP[sk]) orb.classList.add(ORB_CLASS_MAP[sk]);
   }
+
+  // ── State label ──
   const stEl = document.getElementById('mb-av-state');
   if(stEl){ stEl.textContent = sk; stEl.style.color = stColor; }
+
+  // ── State context line: one line of live data relevant to the current state ──
+  const ctxEl = document.getElementById('mb-av-ctx');
+  if(ctxEl){
+    var ctxText = '', ctxColor = '#6b7280';
+    var tp       = d && d.trade_plan;
+    var miss     = (d && d.strict_missing) || '';
+    var reason   = (d && d.strict_reason)  || '';
+    var prog     = mb && (mb.setup_progress != null ? mb.setup_progress : null);
+    var sess     = (d && d.session) || '';
+    var bias     = (d && d.bias)    || '';
+
+    if(sk === 'READY'){
+      ctxColor = '#22c55e';
+      if(tp && tp.entry != null)
+        ctxText = 'Entry ' + tp.entry + ' · Stop ' + tp.stop + (tp.target1 != null ? ' · T1 ' + tp.target1 : '');
+      else ctxText = (d && d.verdict) ? d.verdict : 'Setup confirmed';
+
+    } else if(sk === 'MANAGING'){
+      ctxColor = '#38bdf8';
+      var atR = null;
+      try{
+        var at = (d && d.active_trade) || (d && d.managed_trade) || null;
+        if(at && at.current_r != null) atR = parseFloat(at.current_r);
+      }catch(e){}
+      ctxText = atR != null
+        ? 'Position open · ' + (atR >= 0 ? '+' : '') + atR.toFixed(2) + 'R'
+        : 'Managing open position';
+
+    } else if(sk === 'DEFENDING'){
+      ctxColor = '#ef4444';
+      var firstSentence = reason ? reason.split('.')[0] : '';
+      ctxText = firstSentence || 'Thesis under pressure — watching closely';
+
+    } else if(sk === 'BLOCKED'){
+      ctxColor = '#94a3b8';
+      ctxText = miss ? ('Blocked: ' + miss)
+              : (reason ? reason.split('.')[0] : 'Setup invalidated');
+
+    } else if(sk === 'HUNTING'){
+      ctxColor = '#f59e0b';
+      if(prog != null) ctxText = 'Setup ' + prog + '% · building';
+      else if(d && d.stage_next_step) ctxText = d.stage_next_step;
+      else ctxText = 'Scanning for entry…';
+
+    } else if(sk === 'WAITING'){
+      ctxColor = '#818cf8';
+      ctxText = miss ? miss : (reason ? reason.split('.')[0] : '');
+
+    } else { // OBSERVING
+      if(sess && bias && bias !== 'NEUTRAL')
+        ctxText = sess + ' · Bias: ' + bias;
+      else if(sess) ctxText = sess;
+      else if(d && d.market_status) ctxText = d.market_status;
+    }
+    ctxEl.textContent = ctxText;
+    ctxEl.style.color  = ctxColor;
+  }
+
+  // ── Footer meta ──
   const mktEl = document.getElementById('mb-av-market');
   if(mktEl) mktEl.textContent = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : (sym || '—');
   const modeEl = document.getElementById('mb-av-mode');
