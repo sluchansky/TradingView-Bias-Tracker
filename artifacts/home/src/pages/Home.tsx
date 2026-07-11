@@ -607,6 +607,18 @@ function EdgeBar({ score, max = 110, color = BLUE }: { score: number; max?: numb
   );
 }
 
+// ── Satellite intelligence panel ───────────────────────────────────────────────
+function SatPanel({ label, children, style }: { label: string; children: React.ReactNode; style?: React.CSSProperties }) {
+  return (
+    <div style={{ padding:'8px 10px', borderRadius:7, background:'rgba(255,255,255,0.022)', border:'1px solid rgba(255,255,255,0.055)', ...style }}>
+      <div style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.24)', letterSpacing:'0.14em', textTransform:'uppercase', marginBottom:6 }}>
+        {label}
+      </div>
+      {children}
+    </div>
+  );
+}
+
 // ── Evidence drawer content ────────────────────────────────────────────────────
 function EvidenceDrawer({ data, status }: { data: any; status: string }) {
   const sClr = statusClr(status);
@@ -952,6 +964,12 @@ export default function Home() {
   const isActionable = data?.is_actionable === true || status === 'READY';
   const isManaging = !!(data?.active_trade || data?.managing_trade);
 
+  // Intelligence panel shortcuts
+  const sig = (mb.signals              || {}) as Record<string,any>;
+  const ad  = (data?.alert_diagnostics || {}) as Record<string,any>;
+  const gd  = (data?.gate_debug        || {}) as Record<string,any>;
+  const eb  = (data?.edge_breakdown    || mb.edge_breakdown || {}) as Record<string,any>;
+
   const narration = (
     voice_d.narration ||
     (mb.synthesis as any)?.narrative ||
@@ -1116,6 +1134,9 @@ export default function Home() {
       .chart-hdr-extra{display:none!important;}
       .quick-chips{gap:5px!important;}
     }
+    @media(max-width:1000px){.sat-col{display:none!important;}.avtr-col{justify-content:center;}}
+    @media(max-width:760px){.intel-strip{flex-wrap:wrap!important;}.intel-strip>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
+    @media(max-width:500px){.intel-strip{display:none!important;}}
   `;
 
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
@@ -1300,23 +1321,130 @@ export default function Home() {
           {/* ── MAIN BRAIN COMMAND CENTER ───────────────────────────────── */}
           <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:320 }}>
 
-            {/* Avatar section */}
-            <div style={{ flexShrink:0, display:'flex', flexDirection:'column', alignItems:'center', gap:0 }}>
-              <div style={{ position:'relative' }}>
-                {/* Aura ring behind canvas */}
-                <div style={{ position:'absolute', inset:-14, borderRadius:'50%',
-                  background:`radial-gradient(ellipse at center, ${auraColor}14 0%, transparent 70%)`,
-                  animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none' }} />
-                <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+            {/* Avatar command center — avatar flanked by live intelligence panels */}
+            <div className="avtr-col" style={{ flexShrink:0, display:'flex', flexDirection:'row', gap:10, alignItems:'flex-start' }}>
+
+              {/* ── LEFT PANELS ─────────────────────────────────────────────── */}
+              <div className="sat-col" style={{ width:128, display:'flex', flexDirection:'column', gap:7, paddingTop:6 }}>
+
+                <SatPanel label="Market Bias">
+                  {(() => {
+                    const b = String(sig.bias || '').toLowerCase();
+                    const col = /bull/.test(b) ? BULL : /bear/.test(b) ? BEAR : MUTED;
+                    return (
+                      <>
+                        <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace', color:col, letterSpacing:'0.03em' }}>
+                          {/bull/.test(b) ? 'BULLISH' : /bear/.test(b) ? 'BEARISH' : 'NEUTRAL'}
+                        </div>
+                        {dirn && <div style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', marginTop:3 }}>
+                          FAVORING {String(dirn).toUpperCase()}
+                        </div>}
+                      </>
+                    );
+                  })()}
+                </SatPanel>
+
+                <SatPanel label="Key Levels">
+                  {[['VWAP', data?.vwap_value, '#60a5fa'], ['SUPPORT', data?.nearest_demand, BULL], ['RESIST', data?.nearest_supply, BEAR]].map(([l,v,c]) => (
+                    <div key={l as string} style={{ display:'flex', justifyContent:'space-between', marginBottom:3 }}>
+                      <span style={{ fontSize:8, color:'rgba(255,255,255,0.28)', fontFamily:'monospace' }}>{l}</span>
+                      <span style={{ fontSize:10, color:c as string, fontFamily:'monospace', fontWeight:700 }}>
+                        {v ? fmt(Number(v)) : '—'}
+                      </span>
+                    </div>
+                  ))}
+                </SatPanel>
+
+                <SatPanel label="Signal Flow">
+                  {(() => {
+                    const c = String(sig.cvd || ad.cvd || '').toLowerCase();
+                    const v = String(ad.volume || '').toLowerCase();
+                    const cvdCol = /bull|pos/.test(c) ? BULL : /bear|neg/.test(c) ? BEAR : MUTED;
+                    const cvdLbl = /bull|pos/.test(c) ? 'BULL DELTA' : /bear|neg/.test(c) ? 'BEAR DELTA' : 'NEUTRAL';
+                    const volLbl = /strong|high|incr/.test(v) ? 'HIGH VOL' : /low|thin|decr/.test(v) ? 'THIN' : 'NORMAL';
+                    const volCol = /strong|high|incr/.test(v) ? BULL : /low|thin|decr/.test(v) ? '#f97316' : MUTED;
+                    return (
+                      <>
+                        <div style={{ fontSize:11, fontWeight:700, color:cvdCol, fontFamily:'monospace' }}>{cvdLbl}</div>
+                        <div style={{ fontSize:9, color:volCol, fontFamily:'monospace', marginTop:3 }}>{volLbl}</div>
+                      </>
+                    );
+                  })()}
+                </SatPanel>
+
               </div>
-              {/* State label below avatar */}
-              <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:7 }}>
-                <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor, boxShadow:`0 0 6px ${verdictColor}` }} />
-                <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
-                  color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>
-                  {avState === 'ACTIVE' ? 'MANAGING' : avState === 'READY_LONG' ? 'LONG SETUP' : avState === 'READY_SHORT' ? 'SHORT SETUP' : avState === 'NO_EDGE' ? 'NO EDGE' : 'WATCHING'}
-                </span>
+
+              {/* ── AVATAR CENTER ────────────────────────────────────────────── */}
+              <div style={{ display:'flex', flexDirection:'column', alignItems:'center' }}>
+                <div style={{ position:'relative' }}>
+                  <div style={{ position:'absolute', inset:-14, borderRadius:'50%',
+                    background:`radial-gradient(ellipse at center, ${auraColor}14 0%, transparent 70%)`,
+                    animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none' }} />
+                  <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+                </div>
+                <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:7 }}>
+                  <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor, boxShadow:`0 0 6px ${verdictColor}` }} />
+                  <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
+                    color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>
+                    {avState === 'ACTIVE' ? 'MANAGING' : avState === 'READY_LONG' ? 'LONG SETUP' : avState === 'READY_SHORT' ? 'SHORT SETUP' : avState === 'NO_EDGE' ? 'NO EDGE' : 'WATCHING'}
+                  </span>
+                </div>
               </div>
+
+              {/* ── RIGHT PANELS ─────────────────────────────────────────────── */}
+              <div className="sat-col" style={{ width:128, display:'flex', flexDirection:'column', gap:7, paddingTop:6 }}>
+
+                <SatPanel label="Structure">
+                  {(() => {
+                    const sc = !!(gd.structure_confirmed);
+                    const zv = !!(gd.zone_valid);
+                    return (
+                      <>
+                        <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4 }}>
+                          <div style={{ width:5, height:5, borderRadius:'50%', flexShrink:0, background: sc ? BULL : 'rgba(255,255,255,0.12)' }} />
+                          <span style={{ fontSize:9, fontFamily:'monospace', color: sc ? BULL : MUTED }}>{sc ? 'BOS CONFIRMED' : 'NO BOS/CHOCH'}</span>
+                        </div>
+                        <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+                          <div style={{ width:5, height:5, borderRadius:'50%', flexShrink:0, background: zv ? '#f97316' : 'rgba(255,255,255,0.12)' }} />
+                          <span style={{ fontSize:9, fontFamily:'monospace', color: zv ? '#f97316' : MUTED }}>{zv ? 'ZONE ACTIVE' : 'NO ZONE'}</span>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </SatPanel>
+
+                <SatPanel label="Edge Breakdown">
+                  {[['BOS', eb.bos20 ?? eb.choch20 ?? null, 20], ['VWAP', eb.vwap15 ?? null, 15], ['SWEEP', eb.sweep15 ?? null, 15], ['VOL', eb.volume15 ?? null, 15]].map(([n,s,m]) => {
+                    const sc2 = s != null ? Math.round(Number(s)) : null;
+                    const col2 = sc2 == null ? MUTED : sc2 >= Number(m)*0.6 ? BULL : sc2 > 0 ? AMB : MUTED;
+                    return (
+                      <div key={n as string} style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
+                        <span style={{ fontSize:8, color:'rgba(255,255,255,0.28)', fontFamily:'monospace' }}>{n}</span>
+                        <span style={{ fontSize:9.5, color:col2, fontFamily:'monospace', fontWeight:700 }}>{sc2 != null ? `${sc2}/${m}` : '—'}</span>
+                      </div>
+                    );
+                  })}
+                </SatPanel>
+
+                <SatPanel label="Trade Plan">
+                  {(() => {
+                    const has = tp.entry && Number(tp.entry) > 0;
+                    if (!has) return <div style={{ fontSize:9.5, color:MUTED, fontFamily:'monospace' }}>No active plan</div>;
+                    return (
+                      <>
+                        {[['ENTRY', tp.entry, AMB], ['STOP', tp.stop, BEAR], ['TARGET', tp.target1, BULL]].map(([l,v,c]) => (
+                          <div key={l as string} style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
+                            <span style={{ fontSize:8, color:'rgba(255,255,255,0.28)', fontFamily:'monospace' }}>{l}</span>
+                            <span style={{ fontSize:9.5, color:c as string, fontFamily:'monospace', fontWeight:700 }}>{v ? fmt(Number(v)) : '—'}</span>
+                          </div>
+                        ))}
+                      </>
+                    );
+                  })()}
+                </SatPanel>
+
+              </div>
+
             </div>
 
             {/* Brain content */}
@@ -1407,6 +1535,64 @@ export default function Home() {
                 </button>
               </div>
             </div>
+          </div>
+
+          {/* ── INTELLIGENCE STRIP ──────────────────────────────────────── */}
+          <div className="intel-strip" style={{ display:'flex', gap:8, marginBottom:16, flexWrap:'nowrap', minWidth:0 }}>
+
+            {/* TODAY'S OBJECTIVE */}
+            <SatPanel label="Today's Objective" style={{ flex:'1.6 1 0', minWidth:0 }}>
+              {(() => {
+                let obj = '';
+                if (!data || loading)              obj = 'Connecting to market feed...';
+                else if (status === 'READY')        obj = `Execute ${/long|bull/i.test(dirn)?'LONG':'SHORT'} near ${tp.entry?fmt(Number(tp.entry)):'entry'}.`;
+                else if (status === 'MANAGING')     obj = `Manage position. Target ${tp.target1?fmt(Number(tp.target1)):'T1'}, stop protected.`;
+                else if (status === 'BUILDING')     obj = `Score ${Math.round(edge)}. ${!gd.structure_confirmed?'BOS/CHOCH needed.':!gd.zone_valid?'Zone forming.':'Setup finalizing.'}`;
+                else if (!gd.structure_confirmed)  obj = 'Waiting for structural break — BOS or CHOCH needed.';
+                else if (!gd.zone_valid)            obj = 'Structure confirmed. Waiting for demand or supply zone.';
+                else if (edge < 40)                obj = 'Building edge. Multiple confirmations required.';
+                else                               obj = `Edge ${Math.round(edge)}/70. Final confirmation pending.`;
+                return <div style={{ fontSize:11.5, color:'rgba(255,255,255,0.68)', lineHeight:1.5, fontFamily:'monospace' }}>{obj}</div>;
+              })()}
+            </SatPanel>
+
+            {/* AI REASONING — backend synthesis / voice narration */}
+            <SatPanel label="AI Reasoning" style={{ flex:'2.2 1 0', minWidth:0 }}>
+              <div style={{ fontSize:11.5, color:'rgba(255,255,255,0.58)', lineHeight:1.5, fontFamily:'monospace', fontStyle:'italic' }}>
+                {narration ? narration.slice(0, 130) + (narration.length > 130 ? '...' : '') : 'Analyzing market conditions...'}
+              </div>
+            </SatPanel>
+
+            {/* VOLATILITY */}
+            <SatPanel label="Volatility" style={{ flex:'1 1 0', minWidth:0 }}>
+              {(() => {
+                const vr = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
+                const col = /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : /low|quiet/.test(vr) ? MUTED : AMB;
+                const lbl = /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'ELEVATED' : /low|quiet/.test(vr) ? 'QUIET' : isOpen ? 'NORMAL' : '—';
+                return (
+                  <>
+                    <div style={{ fontSize:13, fontWeight:800, color:col, fontFamily:'monospace', letterSpacing:'0.02em' }}>{lbl}</div>
+                    <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:2 }}>ATR REGIME</div>
+                  </>
+                );
+              })()}
+            </SatPanel>
+
+            {/* NEXT ECONOMIC EVENT (only if news data available) */}
+            {Array.isArray(data?.news) && data.news.length > 0 && (() => {
+              const nxt = data.news.find((n: any) => n && (n.impact === 'HIGH' || n.impact === 'MEDIUM'));
+              if (!nxt) return null;
+              const evTitle = String(nxt.title || nxt.event || '').slice(0, 22);
+              const imp = String(nxt.impact || '').toUpperCase();
+              const impCol = imp === 'HIGH' ? BEAR : '#f97316';
+              return (
+                <SatPanel key="news" label="Next Event" style={{ flex:'1 1 0', minWidth:0 }}>
+                  <div style={{ fontSize:10.5, fontWeight:700, color:'rgba(255,255,255,0.72)', fontFamily:'monospace', marginBottom:3 }}>{evTitle}</div>
+                  <div style={{ fontSize:8.5, color:impCol, fontFamily:'monospace' }}>{imp} IMPACT</div>
+                </SatPanel>
+              );
+            })()}
+
           </div>
 
           {/* ── QUICK CHIPS ─────────────────────────────────────────────── */}
