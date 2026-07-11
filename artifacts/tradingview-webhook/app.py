@@ -17412,6 +17412,241 @@ def compute_main_brain_learning_stats():
         return base
 
 
+# ── BrainState: unified structured snapshot per instrument (DISPLAY-ONLY) ───────────
+# Assembled at the end of full_analysis() from ALL specialist engine outputs.
+# Consumed by the AI character, chat assistant, and any dashboard panel.
+# NEVER recomputes — pure assembly/reshape. FAIL-OPEN (try/except wraps everything).
+# Never touches gate / scoring / sizing / dedup / traderspost / money path.
+
+_BRAIN_STATE_EVENTS = {}   # inst -> list[dict] newest-first, max 20 entries
+_BRAIN_STATE_LAST   = {}   # inst -> snapshot dict for meaningful-change detection
+
+def _bs_get(d, *keys, default=None):
+    """Safe nested dict accessor: returns default if any key absent or value non-dict."""
+    for k in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k)
+        if d is None:
+            return default
+    return d
+
+def _bs_record_events(inst, result):
+    """Diff current brain snapshot against last; append only meaningful state changes."""
+    cur = {
+        "verdict":  result.get("verdict"),
+        "bias":     result.get("bias"),
+        "struct":   result.get("structure_class"),
+        "has_pos":  bool(result.get("active_trade")),
+        "rec":      _bs_get(result, "unified", "recommendation"),
+        "missing":  result.get("strict_missing"),
+    }
+    prev = _BRAIN_STATE_LAST.get(inst, {})
+    if inst not in _BRAIN_STATE_EVENTS:
+        _BRAIN_STATE_EVENTS[inst] = []
+    try:
+        import datetime as _dtime
+        _ts = _dtime.datetime.utcnow().strftime("%H:%M")
+    except Exception:
+        _ts = ""
+
+    def _evt(kind, detail):
+        _BRAIN_STATE_EVENTS[inst].insert(0, {"kind": kind, "detail": detail, "ts": _ts})
+        if len(_BRAIN_STATE_EVENTS[inst]) > 20:
+            _BRAIN_STATE_EVENTS[inst] = _BRAIN_STATE_EVENTS[inst][:20]
+
+    if prev.get("verdict") and cur["verdict"] != prev["verdict"]:
+        _evt("verdict_change", "%s → %s" % (prev["verdict"], cur["verdict"]))
+    if prev.get("bias") and cur["bias"] and cur["bias"] != prev["bias"]:
+        _evt("bias_flip", "%s → %s" % (prev["bias"], cur["bias"]))
+    if prev.get("struct") and cur["struct"] and cur["struct"] != prev["struct"]:
+        _evt("structure_flip", "%s → %s" % (prev["struct"], cur["struct"]))
+    if prev.get("has_pos") is not None and cur["has_pos"] != prev["has_pos"]:
+        _evt("position_opened" if cur["has_pos"] else "position_closed",
+             result.get("verdict", ""))
+    if cur["missing"] and cur["missing"] != prev.get("missing"):
+        _evt("blocker_changed", str(cur["missing"]))
+    _BRAIN_STATE_LAST[inst] = cur
+
+def _build_brain_state(result):
+    """Assemble the full BrainState snapshot from full_analysis output (DISPLAY-ONLY)."""
+    try:
+        inst = result.get("active_ticker") or "MGC"
+
+        # ── Learning eligibility ──────────────────────────────────────────
+        try:
+            _elig_status, _elig_reason = _resolve_learning_eligibility(inst)
+        except Exception:
+            _elig_status, _elig_reason = "LIVE_ELIGIBLE", None
+
+        # ── Record meaningful state changes ───────────────────────────────
+        _bs_record_events(inst, result)
+
+        # ── Veto sources (engines that would block a live trade) ──────────
+        _veto_srcs = []
+        if _bs_get(result, "trade_debate",        "veto_would_fire"): _veto_srcs.append("Trade Debate")
+        if _bs_get(result, "analyst",             "veto_would_fire"): _veto_srcs.append("Analyst")
+        if _bs_get(result, "pro_review",          "veto_would_fire"): _veto_srcs.append("Pro Review")
+        if _bs_get(result, "confidence_governor", "allow_trade") is False: _veto_srcs.append("Confidence")
+        if _bs_get(result, "entry_quality",       "veto_would_fire"): _veto_srcs.append("Entry Quality")
+        if _bs_get(result, "volatility",          "blocked"):         _veto_srcs.append("Volatility")
+
+        # ── Active position summary ───────────────────────────────────────
+        _at = result.get("active_trade") or result.get("managed_trade")
+        _pos = None
+        if _at:
+            _r = _at.get("current_r")
+            _pos = {
+                "direction": _at.get("direction"),
+                "entry":     _at.get("entry"),
+                "current_r": _r,
+                "pnl_label": ("%s%.2fR" % ("+" if (_r or 0) >= 0 else "", _r)) if _r is not None else None,
+                "opened_at": _at.get("opened_at_et") or _at.get("opened_at"),
+            }
+
+        # ── Trade plan summary ────────────────────────────────────────────
+        _tp = result.get("trade_plan") or {}
+        _plan = None
+        if _tp.get("trade_plan"):
+            _plan = {
+                "direction":  _tp.get("direction"),
+                "entry_zone": _tp.get("entry_zone"),
+                "stop_loss":  _tp.get("stop_loss"),
+                "target1":    _tp.get("target1"),
+                "rr":         _tp.get("rr"),
+                "invalidation": _tp.get("invalidation"),
+            }
+
+        # ── VWAP state string ─────────────────────────────────────────────
+        _price = result.get("current_price") or 0
+        _vwap  = result.get("vwap_value") or 0
+        _side  = "above" if _price > _vwap > 0 else "below" if _price < _vwap > 0 else "at"
+        _fresh = result.get("vwap_status") != "stale"
+        _vwap_str = "%s VWAP (%s)%s" % (_side, _vwap, "" if _fresh else " [stale]")
+
+        # ── Order flow string ─────────────────────────────────────────────
+        _ad   = result.get("alert_diagnostics") or {}
+        _cvd  = _ad.get("cvd_state") or "unknown"
+        _rvol = _ad.get("rvol_value")
+        _of_str = "CVD %s" % _cvd + (" · RVOL %.1fx" % _rvol if isinstance(_rvol, (int, float)) else "")
+
+        # ── Volatility string ─────────────────────────────────────────────
+        _vol = result.get("volatility") or {}
+        _vreg = _vol.get("regime") or "Normal"
+        _vrat = _vol.get("atr_ratio")
+        _vol_str = _vreg + (" (%.2fx)" % _vrat if isinstance(_vrat, (int, float)) else "")
+
+        # ── Entry quality string ──────────────────────────────────────────
+        _eq = result.get("entry_quality") or {}
+        _eq_str = ("%s (%s/100)" % (_eq.get("location_label", ""), _eq.get("score", 0))
+                   if _eq.get("available") else None)
+
+        # ── Prop firm status ──────────────────────────────────────────────
+        try:
+            _prop = prop_firm_status_view()
+            _prop_str = "Violation" if _prop.get("violation") else "Protected" if _prop.get("enabled") else "Off"
+        except Exception:
+            _prop_str = "Unknown"
+
+        # ── Important zones ───────────────────────────────────────────────
+        _zones = []
+        if result.get("nearest_demand"):
+            _zones.append({"type": "demand", "level": result["nearest_demand"]})
+        if result.get("nearest_supply"):
+            _zones.append({"type": "supply", "level": result["nearest_supply"]})
+
+        # ── Recent events snapshot (display-only, newest first) ───────────
+        _events = list(_BRAIN_STATE_EVENTS.get(inst, []))[:10]
+
+        return {
+            "available": True,
+            "identity": {
+                "market":         inst,
+                "timestamp":      result.get("as_of_et") or result.get("last_updated"),
+                "data_freshness": _bs_get(result, "data_feed", "freshness_label"),
+                "session":        _bs_get(result, "session", "window") or result.get("session_window"),
+                "market_open":    result.get("market_open", True),
+            },
+            "market_read": {
+                "phase":           _bs_get(result, "market_narrative", "phase") or _bs_get(result, "analyst", "market_phase"),
+                "structure":       result.get("structure_label"),
+                "structure_class": result.get("structure_class"),
+                "trend":           result.get("bias"),
+                "liquidity_state": _bs_get(result, "main_brain", "liquidity_focus", "state"),
+                "vwap_state":      _vwap_str,
+                "vwap_value":      _vwap or None,
+                "price":           _price or None,
+                "order_flow":      _of_str,
+                "volatility":      _vol_str,
+                "important_zones": _zones,
+                "market_character": _bs_get(result, "session_day_type", "day_type"),
+            },
+            "playbooks": {
+                "swing_opinion":        _bs_get(result, "dual_sim",     "swing", "verdict"),
+                "scalp_opinion":        _bs_get(result, "dual_sim",     "scalp", "verdict"),
+                "micro_scalp_opinion":  _bs_get(result, "main_brain",   "micro_scalp", "phase"),
+                "selected_playbook":    TRADING_MODE,
+                "rejected_playbooks":   _bs_get(result, "playbook_selector", "rejected") or [],
+                "reason_selected":      _bs_get(result, "playbook_selector", "why"),
+                "final_decision":       _bs_get(result, "playbook_selector", "final_decision"),
+            },
+            "setup": {
+                "direction":          result.get("stage_direction") or result.get("strict_direction"),
+                "setup_fingerprint":  result.get("setup_stage"),
+                "detected_strategy":  _bs_get(result, "strategy_engine", "active_strategy"),
+                "trigger_status":     result.get("alert_level"),
+                "missing_conditions": result.get("strict_missing"),
+                "invalidation":       result.get("stage_invalidation"),
+                "target_liquidity":   _bs_get(result, "main_brain", "liquidity_focus", "target"),
+                "entry_quality":      _eq_str,
+                "entry_quality_score": _eq.get("score") if _eq.get("available") else None,
+                "chase_risk":         _bs_get(result, "entry_quality", "chasing_warning"),
+            },
+            "learning": {
+                "similar_samples":        _bs_get(result, "trade_memory",             "sample_count"),
+                "expectancy":             _bs_get(result, "main_brain_learning_stats", "expectancy"),
+                "win_rate":               _bs_get(result, "main_brain_learning_stats", "win_rate"),
+                "average_r":              _bs_get(result, "main_brain_learning_stats", "avg_r"),
+                "common_failure":         _bs_get(result, "main_brain_learning_stats", "top_failure"),
+                "active_learning_rules":  _elig_status,
+                "blocked_rules":          _elig_reason,
+                "validated_findings":     _bs_get(result, "scalp_strategy_advisory",   "consensus"),
+                "confidence_adjustment":  _bs_get(result, "confidence_governor",        "confidence_adjustment"),
+                "sample_quality":         _bs_get(result, "confidence_governor",        "sample_quality"),
+            },
+            "execution": {
+                "live_eligibility":  _elig_status == "LIVE_ELIGIBLE",
+                "ghost_eligibility": _elig_status == "GHOST_ONLY",
+                "armed_status":      AUTO_TRADE.get(inst, False),
+                "broker_status":     resolve_execution_mode(),
+                "open_position":     _pos,
+                "trade_plan":        _plan,
+                "management_recommendation": _bs_get(result, "active_trade_thinking", "recommendation"),
+            },
+            "safety": {
+                "risk_status":     result.get("risk_label"),
+                "prop_status":     _prop_str,
+                "daily_loss_room": None,
+                "blocker":         result.get("strict_reason"),
+                "veto_source":     _veto_srcs or None,
+            },
+            "decision": {
+                "brain_state":          _bs_get(result, "main_brain", "status"),
+                "verdict":              result.get("verdict"),
+                "is_actionable":        result.get("is_actionable", False),
+                "confidence":           _bs_get(result, "unified", "confidence"),
+                "edge_score":           result.get("edge_score"),
+                "plain_english_reason": (_bs_get(result, "unified", "narrative") or result.get("strict_reason")),
+                "next_requirement":     result.get("stage_next_step"),
+                "invalidation":         result.get("stage_invalidation"),
+                "recommended_action":   _bs_get(result, "unified", "recommendation"),
+            },
+            "recent_events": _events,
+        }
+    except Exception as _bse:
+        return {"available": False, "reason": str(_bse)}
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -18933,6 +19168,14 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         # inside _dual_sim_inputs) so the **inp splat into _shadow_strict_verdict stays
         # signature-exact. Flag OFF → never attached → byte-identical.
         result["_dual_sim_live_mode"] = TRADING_MODE
+    # ── BrainState: structured per-instrument snapshot (DISPLAY-ONLY) ────
+    # Assembles all specialist engine outputs into one unified object.
+    # Called last so it sees every override (open / vetoed / closed states).
+    # FAIL-OPEN — never raises, never touches the money path.
+    try:
+        result["brain_state"] = _build_brain_state(result)
+    except Exception:
+        result["brain_state"] = {"available": False, "reason": "unavailable"}
     return result
 
 
@@ -33142,6 +33385,8 @@ def _build_status_payload(_tk):
         **({"stalk_mode": a.get("stalk_mode")} if STALK_MODE_ENABLED else {}),
         **({"active_trade_thinking": a.get("active_trade_thinking")}
            if ACTIVE_THINKING_ENABLED else {}),
+        # ── BrainState: unified per-instrument snapshot — DISPLAY-ONLY ──
+        "brain_state": a.get("brain_state"),
     }
 
 
@@ -41548,7 +41793,10 @@ function renderMBAvatar(mb, d){
   }
   // ── AI Character: update face + caption + optional TTS ──
   updateCharacter(sk);
-  var _cap = (mb && mb.unified && mb.unified.narrative) || (mb && mb.summary) || '';
+  var _bs = d && d.brain_state;
+  var _cap = (mb && mb.unified && mb.unified.narrative)
+    || (_bs && _bs.decision && _bs.decision.plain_english_reason)
+    || (mb && mb.summary) || '';
   _updateCaption(_cap, sk);
   mbSpeak(_cap);
 }
