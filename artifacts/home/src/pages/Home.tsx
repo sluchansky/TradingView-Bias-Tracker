@@ -236,58 +236,125 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
       cheekLine(CX - RX + 5, CY + 22, CX - 38, CY + 12);
       cheekLine(CX + 38, CY + 12, CX + RX - 5, CY + 22);
 
-      // ── Eyes ──────────────────────────────────────────────────────────────────
-      const eyes = [{ x: CX - 27, y: CY - 20 }, { x: CX + 27, y: CY - 20 }];
+      // ── Brow lines (focused, inward-tilted for intelligence) ──────────────────
+      const drawBrow = (p1x: number, p1y: number, pcx: number, pcy: number, p2x: number, p2y: number) => {
+        ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.mesh, 0.22 * cfg.dim);
+        ctx.beginPath();
+        ctx.moveTo(p1x, p1y + bob);
+        ctx.quadraticCurveTo(pcx, pcy + bob, p2x, p2y + bob);
+        ctx.strokeStyle = rc(cfg.mesh, 0.45 * cfg.dim);
+        ctx.lineWidth = 1.2; ctx.stroke();
+        ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+      };
+      // Left brow: outer end sits lower, arcs up to medial peak, then drops inward
+      drawBrow(CX - 46, CY - 37, CX - 27, CY - 48, CX - 11, CY - 43);
+      // Right brow (mirror)
+      drawBrow(CX + 11, CY - 43, CX + 27, CY - 48, CX + 46, CY - 37);
+
+      // ── Eyes (almond-shaped, intelligent) ────────────────────────────────────
+      const eyes = [
+        { x: CX - 27, y: CY - 20, tilt: -0.07 },
+        { x: CX + 27, y: CY - 20, tilt:  0.07 },
+      ];
       eyes.forEach(eye => {
-        const eyeY = eye.y + bob;
-        const ry = 9 * (1 - blinkPct * 0.92);
+        const eyeY  = eye.y + bob;
+        const eyeRY = 7.5 * (1 - blinkPct * 0.94);
+        const tilt  = eye.tilt;
 
-        ctx.shadowBlur = 22; ctx.shadowColor = rc(cfg.eye, 0.85);
+        ctx.shadowBlur = 20; ctx.shadowColor = rc(cfg.eye, 0.82);
 
-        // Eye rim
-        ctx.beginPath(); ctx.ellipse(eye.x, eyeY, 16, Math.max(0.5, ry), 0, 0, Math.PI * 2);
-        ctx.strokeStyle = rc(cfg.eye, 0.92); ctx.lineWidth = 1.5; ctx.stroke();
+        // Outer glow halo (soft, wide)
+        ctx.beginPath();
+        ctx.ellipse(eye.x, eyeY, 17.5, Math.max(0.5, eyeRY + 2.5), tilt, 0, Math.PI * 2);
+        ctx.strokeStyle = rc(cfg.eye, 0.16); ctx.lineWidth = 3.5; ctx.stroke();
+
+        // Main eye rim
+        ctx.beginPath();
+        ctx.ellipse(eye.x, eyeY, 15, Math.max(0.5, eyeRY), tilt, 0, Math.PI * 2);
+        ctx.strokeStyle = rc(cfg.eye, 0.88); ctx.lineWidth = 1.2; ctx.stroke();
 
         if (blinkPct < 0.8) {
-          // Iris gradient
-          const ig = ctx.createRadialGradient(eye.x, eyeY, 0, eye.x, eyeY, 11);
-          ig.addColorStop(0, rc(cfg.eye, 0.65)); ig.addColorStop(1, rc(cfg.mesh, 0.12));
-          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, 10.5, Math.max(0.5, ry * 0.82), 0, 0, Math.PI * 2);
+          // Upper eyelid emphasis: top arc drawn heavier (defines the sharp AI look)
+          ctx.beginPath();
+          ctx.ellipse(eye.x, eyeY, 15, Math.max(0.5, eyeRY), tilt, Math.PI, Math.PI * 2);
+          ctx.strokeStyle = rc(cfg.eye, 0.62); ctx.lineWidth = 1.9; ctx.stroke();
+
+          ctx.shadowBlur = 0; // clear glow before fill ops
+
+          // Iris: radial gradient — bright center fading to deep edge
+          const ig = ctx.createRadialGradient(eye.x - 1, eyeY - 1, 0, eye.x, eyeY, 10);
+          ig.addColorStop(0,    rc(cfg.eye,  0.74));
+          ig.addColorStop(0.52, rc(cfg.mesh, 0.38));
+          ig.addColorStop(1,    'rgba(0,4,14,0.58)');
+          ctx.beginPath();
+          ctx.ellipse(eye.x, eyeY, 10, Math.max(0.5, eyeRY * 0.85), tilt, 0, Math.PI * 2);
           ctx.fillStyle = ig; ctx.fill();
 
-          // Pupil
-          ctx.beginPath(); ctx.arc(eye.x, eyeY, Math.max(0.5, ry * 0.40), 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(0,5,18,0.94)'; ctx.fill();
+          // Inner iris ring (synthetic depth detail)
+          ctx.beginPath();
+          ctx.ellipse(eye.x, eyeY, 6.5, Math.max(0.3, eyeRY * 0.54), tilt, 0, Math.PI * 2);
+          ctx.strokeStyle = rc(cfg.eye, 0.26); ctx.lineWidth = 0.7; ctx.stroke();
 
-          // Highlight
-          ctx.shadowBlur = 0;
-          ctx.beginPath(); ctx.arc(eye.x - 3.5, eyeY - 2.5, 2.4, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(255,255,255,0.72)'; ctx.fill();
+          // Pupil (slightly elongated on tilt axis — AI look)
+          ctx.beginPath();
+          ctx.ellipse(eye.x, eyeY, 3.8, Math.max(0.3, eyeRY * 0.47), tilt, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(0,3,12,0.97)'; ctx.fill();
+
+          // Primary specular — upper-left, precise and small
+          ctx.beginPath();
+          ctx.arc(eye.x - 4, eyeY - eyeRY * 0.52, 1.7, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.82)'; ctx.fill();
+          // Secondary micro-glint
+          ctx.beginPath();
+          ctx.arc(eye.x + 3.2, eyeY + eyeRY * 0.28, 0.8, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fill();
         }
         ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       });
 
-      // Nose dots
-      [CX - 6, CX + 6].forEach(nx => {
-        ctx.beginPath(); ctx.arc(nx, CY + 20 + bob, 1.5, 0, Math.PI * 2);
-        ctx.fillStyle = rc(cfg.mesh, 0.28 * cfg.dim); ctx.fill();
+      // ── Nose bridge + nostril wings ───────────────────────────────────────────
+      // Subtle shadow lines flanking the nose centerline (bridge structure)
+      const noseBridge = (dx: number) => {
+        ctx.beginPath();
+        ctx.moveTo(CX + dx * 0.4, CY - 8 + bob);
+        ctx.lineTo(CX + dx, CY + 17 + bob);
+        ctx.strokeStyle = rc(cfg.mesh, 0.12 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
+      };
+      noseBridge(-4); noseBridge(4);
+      // Nostril wing arcs (lower arc = nostril curve, not full circles)
+      const drawNostril = (side: number) => {
+        ctx.beginPath();
+        ctx.arc(CX + side * 7.5, CY + 21 + bob, 3.8, Math.PI * 0.12, Math.PI * 0.88);
+        ctx.strokeStyle = rc(cfg.mesh, 0.20 * cfg.dim); ctx.lineWidth = 0.9; ctx.stroke();
+      };
+      drawNostril(-1); drawNostril(1);
+
+      // ── Jaw angle markers (structural accents) ────────────────────────────────
+      [-1, 1].forEach(side => {
+        ctx.beginPath();
+        ctx.moveTo(CX + side * 60, CY + 44 + bob);
+        ctx.lineTo(CX + side * 51, CY + 63 + bob);
+        ctx.strokeStyle = rc(cfg.mesh, 0.09 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
       });
 
-      // ── Mouth (state expressions) ────────────────────────────────────────────
-      ctx.shadowBlur = 7; ctx.shadowColor = rc(cfg.eye, 0.45);
+      // ── Mouth (minimal, calm, serious) ───────────────────────────────────────
+      ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.30);
       ctx.beginPath();
-      const my = CY + 54 + bob;
+      const my = CY + 57 + bob;
       if (s === 'READY_LONG') {
-        ctx.moveTo(CX - 22, my); ctx.quadraticCurveTo(CX, my + 13, CX + 22, my);
+        // Barely perceptible upturn — confidence, not a smile
+        ctx.moveTo(CX - 17, my); ctx.quadraticCurveTo(CX, my + 4, CX + 17, my);
       } else if (s === 'READY_SHORT') {
-        ctx.moveTo(CX - 20, my + 2); ctx.quadraticCurveTo(CX, my + 6, CX + 20, my + 2);
+        // Flat, tight, intensity
+        ctx.moveTo(CX - 15, my + 1); ctx.lineTo(CX + 15, my + 1);
       } else if (s === 'ACTIVE') {
-        ctx.moveTo(CX - 18, my + 3); ctx.lineTo(CX + 18, my + 3);
+        // Narrow, locked-in
+        ctx.moveTo(CX - 13, my); ctx.lineTo(CX + 13, my);
       } else {
-        // calm neutral
-        ctx.moveTo(CX - 21, my + 1); ctx.quadraticCurveTo(CX, my + 7, CX + 21, my + 1);
+        // Neutral/WAIT: nearly flat, imperceptible center pull
+        ctx.moveTo(CX - 17, my); ctx.quadraticCurveTo(CX, my + 2, CX + 17, my);
       }
-      ctx.strokeStyle = rc(cfg.eye, 0.55 * cfg.dim); ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.strokeStyle = rc(cfg.eye, 0.38 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
 
       // ── Orbiting particles ───────────────────────────────────────────────────
