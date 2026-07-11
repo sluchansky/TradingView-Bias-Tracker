@@ -142,3 +142,4 @@
 - [Cockpit Mode \n escape bug](cockpit-mode-escape-bug.md) — JS string literals in Python triple-quoted strings: `\n` (0x5C+0x6E in file) → real newline at Flask render time → JS SyntaxError; fix requires double-backslash `\\n` in source (use byte-level Python replace, NOT the edit tool).
 - [Brain Conflict Resolver](brain-conflict-resolver.md) — 10-priority display-only conflict engine; BLOCK on hard vetoes, WAIT/ALLOW on soft penalty accumulation; wired at mb_out["conflict_resolver"].
 - [Verdict Board](verdict-board.md) — 4-bucket plain-English classifier (supports/opposes/missing/vetoes); reads observations+BCR+result; mb_out["verdict_board"]; never feeds money path.
+- [Main Brain architecture](main-brain-architecture.md) — 3-layer rule: orchestrate(_mb_orchestrate)+learning(_mb_learning_snapshot)+sole-speaker(compute_main_brain); never collapse layers.

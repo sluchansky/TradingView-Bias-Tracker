@@ -15922,6 +15922,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "synthesis":         None,
         "conflict_resolver": None,
         "verdict_board":     None,
+        "learning_memory":   None,
         "reason":            reason,
     }
 
@@ -17753,6 +17754,159 @@ def _mb_reconcile(observations, result):
                 "engine_count": 0, "veto_count": 0}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED LEARNING MEMORY — one source of truth for all historical signals
+#
+# Every consumer inside compute_main_brain reads from _mb_learning_snapshot();
+# none of them access trade_memory / confidence_governor / learning_rule_engine
+# / learning_engine independently. This prevents the four learning blocks from
+# being read in different ways by different parts of the Main Brain.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mb_learning_snapshot_neutral():
+    """Stable neutral schema for the shared learning memory."""
+    return {
+        "available":           False,
+        "similar_samples":     0,
+        "avg_r":               None,
+        "win_rate_pct":        None,
+        "most_common_failure": None,
+        "recommendation":      None,
+        "confidence":          None,
+        "allow":               True,
+        "governor_veto":       False,
+        "eligibility":         "UNKNOWN",
+        "disabled_setups":     [],
+        "le_today":            None,
+        "note":                None,
+    }
+
+
+def _mb_learning_snapshot(result):
+    """Single source of truth for all historical learning signals.
+
+    Reads trade_memory, confidence_governor, learning_rule_engine, and
+    learning_engine exactly ONCE and folds them into ONE block. Every Main
+    Brain consumer reads from here; none of them access the source blocks
+    directly. DISPLAY-ONLY; fail-open; never raises."""
+    try:
+        inst = str(result.get("active_ticker") or result.get("instrument") or "")
+
+        # ── Trade memory (historical pattern performance) ─────────────────────
+        tm      = result.get("trade_memory") or {}
+        similar = int(tm.get("similar_samples") or tm.get("similar_count") or 0)
+        avg_r   = _mb_num(tm.get("expectancy_r"))
+        wr_pct  = _mb_num(tm.get("win_rate_pct"))
+        failure = str(tm.get("most_common_failure") or "") or None
+        mem_rec = str(tm.get("recommendation") or "") or None
+
+        # ── Confidence governor (historical win-rate driven confidence) ────────
+        gov      = result.get("confidence_governor") or {}
+        allow    = bool(gov.get("allow_trade", True))
+        gov_conf = _mb_num(gov.get("confidence") or gov.get("confidence_score"))
+        gov_veto = bool(gov.get("veto_would_fire"))
+
+        # ── Learning rule engine (live-eligibility per instrument) ─────────────
+        lre             = result.get("learning_rule_engine") or {}
+        lre_enabled     = bool(lre.get("enabled"))
+        instruments_map = lre.get("instruments") or {}
+        inst_data       = (instruments_map.get(inst) or {}) if lre_enabled else {}
+        eligibility     = inst_data.get("status", "UNKNOWN")
+        disabled_setups = inst_data.get("disabled_setups") or []
+        rule_triggered  = str(inst_data.get("rule_triggered") or "") or None
+
+        # ── Learning engine (today's session stats; optional) ─────────────────
+        le       = result.get("learning_engine") or {}
+        le_today = le.get("today") if isinstance(le, dict) else None
+
+        # ── One-sentence memory note ──────────────────────────────────────────
+        note = None
+        if similar >= 3 and avg_r is not None and wr_pct is not None:
+            if avg_r > 0.3:
+                note = ("Last %d similar setups: %.1fR average, %.0f%% wins."
+                        % (similar, avg_r, wr_pct))
+            elif avg_r < -0.1:
+                note = ("Last %d similar setups averaged a loss (%.1fR, %.0f%% wins) "
+                        "— proceed with extra caution." % (similar, avg_r, wr_pct))
+            else:
+                note = ("Last %d similar setups: breakeven (%.1fR, %.0f%% wins)."
+                        % (similar, avg_r, wr_pct))
+        elif lre_enabled and eligibility == "GHOST_ONLY":
+            note = ("Setup historically disabled for live execution on "
+                    "%s" % (inst or "this instrument"))
+            if rule_triggered:
+                note += ": %s." % rule_triggered
+
+        return {
+            "available":           True,
+            "similar_samples":     similar,
+            "avg_r":               avg_r,
+            "win_rate_pct":        wr_pct,
+            "most_common_failure": failure,
+            "recommendation":      mem_rec,
+            "confidence":          gov_conf,
+            "allow":               allow,
+            "governor_veto":       gov_veto,
+            "eligibility":         eligibility,
+            "disabled_setups":     disabled_setups,
+            "le_today":            le_today,
+            "note":                note,
+        }
+    except Exception as exc:
+        try:
+            logger.debug("mb_learning_snapshot error (non-fatal): %s", exc)
+        except Exception:
+            pass
+        return _mb_learning_snapshot_neutral()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORCHESTRATION LAYER — reads every engine once; returns pure structured data
+#
+# The Main Brain calls _mb_orchestrate() exactly once per poll. It never
+# synthesises, never produces user-facing text, and never calls any engine
+# more than once. Every specialist result flows through this single gateway.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mb_orchestrate(result):
+    """Read every specialist engine once and return a unified structured packet.
+
+    Returns:
+      observations     — list of _emit_observation dicts (one per engine)
+      conflict_resolver — BCR 10-priority verdict block
+      verdict_board    — 4-bucket Supports/Opposes/Missing/Vetoes block
+      learning_memory  — unified learning snapshot (one read of all 4 sources)
+
+    No synthesis, no scoring, no user-facing text produced here.
+    Each engine read is individually fail-open. Never raises."""
+    obs = []
+    bcr = _bcr_neutral("Orchestration initialising.")
+    vb  = _vb_neutral("Orchestration initialising.")
+    lm  = _mb_learning_snapshot_neutral()
+    try:
+        obs = _mb_build_structured_observations(result)
+    except Exception:
+        pass
+    try:
+        bcr = compute_brain_conflict_resolver(result)
+    except Exception:
+        pass
+    try:
+        vb = compute_verdict_board(result, obs, bcr)
+    except Exception:
+        pass
+    try:
+        lm = _mb_learning_snapshot(result)
+    except Exception:
+        pass
+    return {
+        "observations":      obs,
+        "conflict_resolver": bcr,
+        "verdict_board":     vb,
+        "learning_memory":   lm,
+    }
+
+
 def compute_main_brain(result):
     """Plain-English 'Main Brain' synthesis (DISPLAY-ONLY).
 
@@ -18094,11 +18248,22 @@ def compute_main_brain(result):
                 mb_out["potential_trades"] = _mb_potential_trades_summary(_adv)
             except Exception:
                 pass
-        # ── Unified Learning Brain reconciliation (DISPLAY-ONLY; fail-open) ──
-        # Collect normalised observations from every specialist engine, vote,
-        # detect conflicts and emit ONE recommendation + ONE narrative.  The
-        # reconciled narrative replaces the text-assembled summary so the user
-        # reads one coherent message instead of scanning every sub-panel.
+        # ── Orchestration: one call reads every engine → pure structured packet ──
+        # No engine is read more than once. No synthesis happens here.
+        _packet                    = _mb_orchestrate(result)
+        mb_out["observations"]     = _packet["observations"]
+        mb_out["conflict_resolver"] = _packet["conflict_resolver"]
+        mb_out["verdict_board"]    = _packet["verdict_board"]
+        mb_out["learning_memory"]  = _packet["learning_memory"]
+
+        # ── Synthesis: Main Brain is the sole author of user-facing narrative ─
+        try:
+            mb_out["synthesis"] = _mb_synthesis_report(
+                result, mb_out.get("observations") or [])
+        except Exception:
+            mb_out["synthesis"] = _mb_synthesis_neutral("Synthesis unavailable.")
+
+        # ── Unified reconcile (legacy weighted vote; backward-compatible) ──────
         try:
             _obs     = _mb_collect_observations(result)
             _unified = _mb_reconcile(_obs, result)
@@ -18107,26 +18272,6 @@ def compute_main_brain(result):
                 mb_out["summary"] = _unified["narrative"]
         except Exception:
             mb_out["unified"] = {"available": False}
-        try:
-            mb_out["observations"] = _mb_build_structured_observations(result)
-        except Exception:
-            mb_out["observations"] = []
-        try:
-            mb_out["synthesis"] = _mb_synthesis_report(
-                result, mb_out.get("observations") or [])
-        except Exception:
-            mb_out["synthesis"] = _mb_synthesis_neutral("Synthesis unavailable.")
-        try:
-            mb_out["conflict_resolver"] = compute_brain_conflict_resolver(result)
-        except Exception:
-            mb_out["conflict_resolver"] = _bcr_neutral("Conflict resolver unavailable.")
-        try:
-            mb_out["verdict_board"] = compute_verdict_board(
-                result,
-                mb_out.get("observations") or [],
-                mb_out.get("conflict_resolver"))
-        except Exception:
-            mb_out["verdict_board"] = _vb_neutral("Verdict board unavailable.")
         return mb_out
     except Exception as exc:
         try:
