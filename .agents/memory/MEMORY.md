@@ -1,5 +1,7 @@
 # Memory Index
 
+- [Structured observation bus](structured-observation-bus.md) — _emit_observation schema + _mb_build_structured_observations reads 11 specialist blocks centrally; NO specialist functions edited; mb_out["observations"] + neutral []; goldens byte-identical.
+
 - [/status poll cache](status-poll-cache.md) — prod froze from 3s polls × 16s inline full_analysis; /status now single-flight TTL cache + client tick guard; money path NEVER reads the cache; dev-empty history hides this bug class.
 
 - [BOT TRAINING MODE](bot-training-mode.md) — flag-gated 4-stage fail-closed gate; stages 1-3 suggest-only, >=4 passthrough; boot probe is __main__-only so the gate lazy-probes; flag-OFF byte-identical.

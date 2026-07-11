@@ -15918,6 +15918,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "lessons":           [],
         "prop_rule":         _prop_main_brain_line(),
         "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
+        "observations":      [],
         "reason":            reason,
     }
 
@@ -16129,6 +16130,32 @@ def _mb_observe(engine, stance, confidence, key_finding, veto=False, weight=1.0)
     }
 
 
+def _emit_observation(source, market, mode, observation, direction, confidence, evidence):
+    """Structured specialist observation for the Main Brain bus.
+
+    Every specialist engine emits ONE of these per poll; the Main Brain collects them all
+    and uses them as the single source of truth for its user-facing synthesis.
+
+    source      — engine name (e.g. 'stalk_mode')
+    market      — instrument symbol (e.g. 'MES')
+    mode        — TRADING_MODE at emit time (e.g. 'MICRO_SCALP')
+    observation — machine-readable state code (e.g. 'high_sweep_detected')
+    direction   — 'Long' / 'Short' / None
+    confidence  — 0.0..1.0 scalar
+    evidence    — list of ≤8 human-readable supporting facts (strings)
+    """
+    return {
+        "source":      str(source),
+        "market":      str(market or ""),
+        "mode":        str(mode or ""),
+        "observation": str(observation),
+        "direction":   direction if direction in ("Long", "Short") else None,
+        "confidence":  round(min(1.0, max(0.0, float(confidence or 0))), 3),
+        "evidence":    [str(e) for e in (evidence or [])][:8],
+        "timestamp":   now_utc().isoformat(),
+    }
+
+
 def _mb_collect_observations(result):
     """Read every specialist engine block in *result* and return a normalised
     observation list.  Never recomputes anything; fail-open per engine."""
@@ -16240,6 +16267,316 @@ def _mb_collect_observations(result):
             stance = "neutral" if regime in ("normal", "low", "quiet") else "caution"
             obs.append(_mb_observe("volatility", stance, 50,
                                    "Regime: %s" % regime, veto=block, weight=0.5))
+    except Exception:
+        pass
+
+    return obs
+
+
+def _mb_build_structured_observations(result):
+    """Collect ONE structured _emit_observation per specialist engine.
+
+    This is the Main Brain's structured observation bus: each specialist emits a
+    machine-readable {source, market, mode, observation, direction, confidence,
+    evidence, timestamp} dict and the Main Brain is the sole author of all
+    user-facing prose. Pure read, FAIL-OPEN per engine, DISPLAY-ONLY."""
+    obs   = []
+    inst  = result.get("active_ticker") or result.get("instrument") or ""
+    mkt   = instrument_of(inst) if inst else ""
+    mode  = TRADING_MODE
+
+    # ── 1. Market Intelligence ────────────────────────────────────────────────
+    try:
+        mi = result.get("market_intelligence") or {}
+        if mi and isinstance(mi, dict):
+            conf_raw = mi.get("directional_confidence") or {}
+            bias     = str(conf_raw.get("bias") or "Neutral")
+            dom_l    = float(conf_raw.get("long")  or 0)
+            dom_s    = float(conf_raw.get("short") or 0)
+            dom_score = dom_l if bias == "Long" else dom_s if bias == "Short" else max(dom_l, dom_s)
+            decay    = mi.get("confidence_decay") or {}
+            decayed  = float(decay.get("decayed") or dom_score)
+            regime   = mi.get("regime") or {}
+            rname    = str(regime.get("regime") if isinstance(regime, dict) else regime or "")
+            if bias == "Long":
+                obs_code = "trending_bullish"
+            elif bias == "Short":
+                obs_code = "trending_bearish"
+            else:
+                obs_code = "ranging"
+            dirn = "Long" if bias == "Long" else "Short" if bias == "Short" else None
+            ev   = []
+            if rname:
+                ev.append("regime: %s" % rname)
+            htf = mi.get("htf") or {}
+            if htf.get("aligned_long"):
+                ev.append("htf: aligned long")
+            elif htf.get("aligned_short"):
+                ev.append("htf: aligned short")
+            mom = mi.get("momentum") or {}
+            if isinstance(mom, dict):
+                mst = mom.get("state") or mom.get("direction")
+                if mst:
+                    ev.append("momentum: %s" % mst)
+            obs.append(_emit_observation("market_intelligence", mkt, mode, obs_code, dirn,
+                                         decayed / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 2. Strategy Engine ────────────────────────────────────────────────────
+    try:
+        se = result.get("strategy_engine") or {}
+        if se and isinstance(se, dict):
+            ready = bool(se.get("ready"))
+            dirn  = se.get("direction")
+            strat = str(se.get("active_strategy") or "None")
+            conf  = float(se.get("confidence") or 0)
+            if ready and dirn == "Long":
+                obs_code = "strategy_ready_long"
+            elif ready and dirn == "Short":
+                obs_code = "strategy_ready_short"
+            elif strat != "None" and dirn:
+                obs_code = "strategy_forming"
+            else:
+                obs_code = "no_strategy"
+            ev = [strat]
+            for m in (se.get("missing") or [])[:3]:
+                ev.append("missing: %s" % m)
+            obs.append(_emit_observation("strategy_engine", mkt, mode, obs_code,
+                                         dirn if ready else None, conf / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 3. Stalk Mode ─────────────────────────────────────────────────────────
+    try:
+        sm = result.get("stalk_mode") or {}
+        if sm and isinstance(sm, dict):
+            state = str(sm.get("state") or "idle")
+            dirn  = sm.get("direction")
+            if state == "stalking" and dirn == "Long":
+                obs_code = "stalking_long"
+            elif state == "stalking" and dirn == "Short":
+                obs_code = "stalking_short"
+            elif state == "engine_entering":
+                obs_code = "engine_entering"
+            elif state == "in_trade":
+                obs_code = "in_trade"
+            elif state == "market_closed":
+                obs_code = "market_closed"
+            else:
+                obs_code = "idle"
+            conf = 0.55 if state in ("stalking", "engine_entering") else 0.25
+            ev   = []
+            for w in (sm.get("why_waiting") or [])[:2]:
+                ev.append(str(w))
+            iz = sm.get("ideal_entry_zone")
+            if iz is not None:
+                try:
+                    ev.append("entry_zone: %.2f" % float(iz))
+                except (TypeError, ValueError):
+                    pass
+            obs.append(_emit_observation("stalk_mode", mkt, mode, obs_code, dirn, conf, ev))
+    except Exception:
+        pass
+
+    # ── 4. Breakout Mode ──────────────────────────────────────────────────────
+    try:
+        bm = result.get("breakout_mode") or {}
+        if bm and isinstance(bm, dict) and bm.get("enabled"):
+            entry_status = str(bm.get("entry_status") or "WAIT")
+            setup_kind   = str(bm.get("setup_kind")   or "None")
+            qs   = float(bm.get("quality_score") or 0)
+            if entry_status == "READY LONG":
+                obs_code = "breakout_long" if setup_kind == "Breakout" else "sweep_reversal_long"
+                dirn     = "Long"
+            elif entry_status == "READY SHORT":
+                obs_code = "breakout_short" if setup_kind == "Breakout" else "sweep_reversal_short"
+                dirn     = "Short"
+            elif bm.get("in_build"):
+                obs_code = "building_range";  dirn = None
+            elif bm.get("active"):
+                obs_code = "watching";        dirn = None
+            else:
+                obs_code = "off";             dirn = None
+            ev = [setup_kind]
+            for c in (bm.get("confirmations") or [])[:4]:
+                if isinstance(c, dict):
+                    ev.append("%s: %s" % (c.get("label", ""), "yes" if c.get("met") else "no"))
+            obs.append(_emit_observation("breakout_mode", mkt, mode, obs_code, dirn,
+                                         qs / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 5. Entry Quality ──────────────────────────────────────────────────────
+    try:
+        eq = result.get("entry_quality") or {}
+        if eq and isinstance(eq, dict):
+            score = float(eq.get("score") or 0)
+            chase = bool(eq.get("chasing_warning"))
+            veto  = bool(eq.get("veto_would_fire"))
+            if chase:
+                obs_code = "chasing"
+            elif score >= 75:
+                obs_code = "clean_location"
+            elif score >= 55:
+                obs_code = "good_location"
+            else:
+                obs_code = "poor_location"
+            dirn = result.get("strict_direction")
+            ev   = [str(eq.get("location_label") or eq.get("verdict_label")
+                        or ("score: %d" % int(score)))]
+            if veto:
+                ev.append("veto: active")
+            obs.append(_emit_observation("entry_quality", mkt, mode, obs_code,
+                                         dirn if dirn in ("Long", "Short") else None,
+                                         score / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 6. Analyst Reasoning ──────────────────────────────────────────────────
+    try:
+        an = result.get("analyst") or {}
+        if an and isinstance(an, dict):
+            stronger = an.get("stronger_side") or an.get("final_direction")
+            conf     = float(an.get("confidence") or 50)
+            veto     = bool(an.get("veto_would_fire"))
+            if veto:
+                obs_code = "veto_active"
+            elif stronger == "Long":
+                obs_code = "bullish_thesis"
+            elif stronger == "Short":
+                obs_code = "bearish_thesis"
+            else:
+                obs_code = "neutral_thesis"
+            dirn = stronger if stronger in ("Long", "Short") else None
+            ev   = [str(b) for b in (an.get("bull_case") or [])[:2] if b]
+            ph   = an.get("market_phase") or {}
+            if isinstance(ph, dict) and ph.get("phase"):
+                ev.append("phase: %s" % ph["phase"])
+            obs.append(_emit_observation("analyst_reasoning", mkt, mode, obs_code, dirn,
+                                         conf / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 7. Trade Debate ───────────────────────────────────────────────────────
+    try:
+        td = result.get("trade_debate") or {}
+        if td and isinstance(td, dict):
+            judge    = td.get("judge") or {}
+            ws       = str(judge.get("winning_side") or "Balanced")
+            fv       = str(judge.get("final_verdict") or td.get("final_verdict") or "WAIT")
+            too_bal  = bool(judge.get("too_balanced"))
+            veto     = bool(td.get("veto_would_fire"))
+            gap      = float(judge.get("confidence_gap") or 0)
+            if too_bal:
+                obs_code = "balanced"
+            elif ws == "Bull" and fv == "TAKE":
+                obs_code = "decisive_bull"
+            elif ws == "Bear" and fv == "TAKE":
+                obs_code = "decisive_bear"
+            elif veto:
+                obs_code = "veto_active"
+            else:
+                obs_code = "balanced"
+            dirn = "Long" if ws == "Bull" else "Short" if ws == "Bear" else None
+            ev   = [str(judge.get("reason_winner_won") or ("gap: %d" % int(gap)))]
+            obs.append(_emit_observation("trade_debate", mkt, mode, obs_code, dirn,
+                                         min(1.0, gap / 100.0), ev))
+    except Exception:
+        pass
+
+    # ── 8. Professional Review ────────────────────────────────────────────────
+    try:
+        pr = result.get("pro_review") or {}
+        if pr and isinstance(pr, dict):
+            active = pr.get("active") or {}
+            if isinstance(active, dict):
+                grade    = str(active.get("grade") or "—")
+                decision = str(active.get("professional_decision") or "WAIT")
+                eff      = float(active.get("entry_efficiency") or 0)
+                if grade in ("A+", "S"):
+                    obs_code = "grade_excellent"
+                elif grade == "A":
+                    obs_code = "grade_good"
+                elif grade == "B":
+                    obs_code = "grade_fair"
+                else:
+                    obs_code = "grade_poor"
+                dirn = result.get("strict_direction")
+                ev   = ["grade: %s" % grade, "decision: %s" % decision,
+                        "efficiency: %d" % int(eff)]
+                obs.append(_emit_observation("pro_review", mkt, mode, obs_code,
+                                             dirn if dirn in ("Long", "Short") else None,
+                                             eff / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 9. Confidence Governor ────────────────────────────────────────────────
+    try:
+        gov = result.get("confidence_governor") or {}
+        if gov and isinstance(gov, dict):
+            allow      = bool(gov.get("allow_trade", True))
+            final_conf = float(gov.get("confidence") or gov.get("confidence_score") or 50)
+            veto       = bool(gov.get("veto_would_fire"))
+            if not allow or veto:
+                obs_code = "confidence_block"
+            elif final_conf >= 70:
+                obs_code = "confidence_allow"
+            else:
+                obs_code = "confidence_caution"
+            ev = []
+            for comp in (gov.get("confidence_components") or [])[:4]:
+                if isinstance(comp, dict):
+                    ev.append("%s: %d" % (comp.get("label") or comp.get("name") or "?",
+                                          int(comp.get("score") or 0)))
+            obs.append(_emit_observation("confidence_governor", mkt, mode, obs_code,
+                                         None, final_conf / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 10. Scalp Quality ─────────────────────────────────────────────────────
+    try:
+        sq = result.get("scalp_quality") or {}
+        if sq and isinstance(sq, dict) and sq.get("enabled"):
+            overall = sq.get("overall_pass")
+            qscore  = float(sq.get("setup_quality_score") or 0)
+            if overall is True:
+                obs_code = "scalp_pass"
+            elif overall is False:
+                obs_code = "scalp_fail"
+            else:
+                obs_code = "scalp_caution"
+            dirn = sq.get("direction")
+            ev   = ["quality_score: %d" % int(qscore)]
+            ev.extend([str(n) for n in (sq.get("notes") or [])[:2]])
+            obs.append(_emit_observation("scalp_quality", mkt, mode, obs_code,
+                                         dirn if dirn in ("Long", "Short") else None,
+                                         qscore / 100.0, ev))
+    except Exception:
+        pass
+
+    # ── 11. Liquidity Sweep Focus ─────────────────────────────────────────────
+    try:
+        lsf = result.get("liquidity_sweep_focus") or {}
+        if lsf and isinstance(lsf, dict) and lsf.get("enabled"):
+            state = str(lsf.get("state") or "NO SWEEP")
+            cdelta = float(lsf.get("confidence_delta") or 0)
+            dirn   = lsf.get("sweep_direction")
+            state_map = {
+                "SWEEP CONFIRMED":             "sweep_confirmed",
+                "SWEEP FORMING":               "sweep_forming",
+                "SWEEP FAILED":                "sweep_failed",
+                "CONTINUATION THROUGH LIQUIDITY": "continuation",
+                "NO SWEEP":                    "no_sweep",
+            }
+            obs_code = state_map.get(state, "no_sweep")
+            ev = []
+            voice = lsf.get("voice") or lsf.get("trader_read")
+            if voice:
+                ev.append(str(voice)[:80])
+            obs.append(_emit_observation("liquidity_sweep_focus", mkt, mode, obs_code,
+                                         dirn if dirn in ("Long", "Short") else None,
+                                         max(0.0, min(1.0, 0.5 + cdelta / 100.0)), ev))
     except Exception:
         pass
 
@@ -16718,6 +17055,10 @@ def compute_main_brain(result):
                 mb_out["summary"] = _unified["narrative"]
         except Exception:
             mb_out["unified"] = {"available": False}
+        try:
+            mb_out["observations"] = _mb_build_structured_observations(result)
+        except Exception:
+            mb_out["observations"] = []
         return mb_out
     except Exception as exc:
         try:
