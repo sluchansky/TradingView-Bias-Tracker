@@ -120,7 +120,8 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
   const stateRef  = useRef(avState);
   const speakRef  = useRef(speaking);
   const nodesRef  = useRef<{ x: number; y: number; phase: number }[]>([]);
-  const partRef   = useRef<{ angle: number; r: number; speed: number; sz: number; phase: number }[]>([]);
+  const partRef      = useRef<{ angle: number; r: number; speed: number; sz: number; phase: number }[]>([]);
+  const nextBlinkRef = useRef(3);   // seconds from t0 until next blink fires
 
   useEffect(() => { stateRef.current = avState; }, [avState]);
   useEffect(() => { speakRef.current = speaking; }, [speaking]);
@@ -152,6 +153,9 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
       phase: Math.random() * Math.PI * 2,
     }));
 
+    // First blink fires 2.5–5s after start
+    nextBlinkRef.current = 2.5 + Math.random() * 2.5;
+
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext('2d'); if (!ctx) return;
     const rc = (c: [number,number,number], a: number) =>
@@ -160,28 +164,91 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
 
     const draw = () => {
       const elapsed = Date.now() - t0;
-      const s = stateRef.current;
-      const cfg = AV_CFG[s] || AV_CFG.WAIT;
-      const spk = speakRef.current;
+      const sec     = elapsed / 1000;
+      const s       = stateRef.current;
+      const cfg     = AV_CFG[s] || AV_CFG.WAIT;
+      const spk     = speakRef.current;
 
-      // Blink every ~6.5s, duration 0.22s
-      const bt = (elapsed / 1000) % 6.5;
-      const blinkPct = bt > 6.28 ? Math.sin(((bt - 6.28) / 0.22) * Math.PI) : 0;
+      // ── Derived per-state parameters ─────────────────────────────────────────
+      const isReady  = s === 'READY_LONG' || s === 'READY_SHORT';
+      const isActive = s === 'ACTIVE';
+      const isWait   = s === 'WAIT';
+      const isNoEdge = s === 'NO_EDGE';
 
-      // Speaking bob
-      const bob = spk ? Math.sin(elapsed * 0.006) * 2 : 0;
-      const pulse = 0.5 + 0.5 * Math.sin(elapsed * 0.0018);
-      const pulse2 = 0.5 + 0.5 * Math.sin(elapsed * 0.0022 + 1.1);
+      // Pulse speeds: ACTIVE fastest, NO_EDGE slowest
+      const pulseSpeed1 = isActive ? 0.0032 : isReady ? 0.0025 : 0.0018;
+      const pulseSpeed2 = isActive ? 0.0038 : isReady ? 0.0030 : 0.0022;
+      const pulse  = 0.5 + 0.5 * Math.sin(elapsed * pulseSpeed1);
+      const pulse2 = 0.5 + 0.5 * Math.sin(elapsed * pulseSpeed2 + 1.1);
+
+      // Mesh node pulse speed (ACTIVE thinks fastest)
+      const meshSpeed = isActive ? 0.0038 : isReady ? 0.0028 : 0.0019;
+
+      // Particle speed multiplier
+      const partMult = isActive ? 1.80 : isReady ? 1.40 : isNoEdge ? 0.38 : 0.68;
+
+      // ── Random blink (2.5–8s interval, 0.20s duration) ───────────────────────
+      let blinkPct = 0;
+      if (sec >= nextBlinkRef.current) {
+        const bd = sec - nextBlinkRef.current;
+        if (bd < 0.20) {
+          blinkPct = Math.sin((bd / 0.20) * Math.PI);
+        } else {
+          // Schedule next blink: shorter interval when ACTIVE (alert), longer when WAIT
+          const minGap = isActive ? 2.0 : isWait ? 3.5 : 2.5;
+          const maxGap = isActive ? 5.0 : isWait ? 8.5 : 6.5;
+          nextBlinkRef.current = sec + minGap + Math.random() * (maxGap - minGap);
+        }
+      }
+
+      // ── Breathing (slow sinusoidal Y bob, period varies by state) ────────────
+      const breatheSpeed = isWait   ? 0.00078 :
+                           isNoEdge ? 0.00058 :
+                           isActive ? 0.00115 : 0.00095;
+      const breatheAmp   = isWait ? 2.6 : isNoEdge ? 1.8 : 1.5;
+      const breatheY     = Math.sin(elapsed * breatheSpeed) * breatheAmp;
+
+      // READY: lean-forward (+4px down = face tilts toward viewer)
+      const leanY = isReady ? 4 : 0;
+
+      // Speaking: fast jaw bob blended with breathing
+      const bob = spk
+        ? breatheY * 0.4 + Math.sin(elapsed * 0.006) * 2 + leanY
+        : breatheY + leanY;
+
+      // ── Eye scan (pupil drift) ────────────────────────────────────────────────
+      // ACTIVE: clear left-right market-monitoring sweep
+      // WAIT:   very slow, dreamlike drift
+      // READY:  barely moves, locked-in gaze
+      // NO_EDGE: slow gentle drift
+      const scanSpeed = isActive  ? 0.00115 :
+                        isWait    ? 0.00028 :
+                        isNoEdge  ? 0.00018 : 0.00048;
+      const scanAmpX  = isActive  ? 3.5 : isWait ? 1.5 : 0.8;
+      const scanAmpY  = isActive  ? 1.2 : isWait ? 0.6 : 0.3;
+      const eyeOffX   = Math.sin(elapsed * scanSpeed) * scanAmpX;
+      const eyeOffY   = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY;
+
+      // ── Brow offset per state ─────────────────────────────────────────────────
+      // READY: raised slightly (alert, confident)
+      // ACTIVE: very slight furrow (concentrated)
+      const browLift = isReady ? -2 : isActive ? 1 : 0;
+
+      // ── Ambient glow intensity ────────────────────────────────────────────────
+      const bgAlpha = isActive ? 0.17 : isReady ? 0.14 : isNoEdge ? 0.05 : 0.11;
+
+      // ── Eye glow brightness ───────────────────────────────────────────────────
+      const eyeGlow = isActive ? 28 : isReady ? 24 : 20;
 
       ctx.clearRect(0, 0, W, H);
 
-      // Ambient bg glow behind face
+      // Ambient bg radial glow (breathes with face)
       const bg = ctx.createRadialGradient(CX, CY + bob, 8, CX, CY + bob, 155);
-      bg.addColorStop(0, rc(cfg.mesh, 0.11));
+      bg.addColorStop(0, rc(cfg.mesh, bgAlpha));
       bg.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
 
-      // Outer pulse rings
+      // Outer pulse rings (speed + size tied to state activity)
       ctx.beginPath();
       ctx.ellipse(CX, CY + bob, RX + 14 + pulse * 5, RY + 18 + pulse * 6, 0, 0, Math.PI * 2);
       ctx.strokeStyle = rc(cfg.mesh, (0.10 + pulse * 0.07) * cfg.dim);
@@ -198,7 +265,7 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
         for (let j = i + 1; j < ns.length; j++) {
           const dx = ns[i].x - ns[j].x;
           const dy = ns[i].y - ns[j].y;
-          const d = Math.sqrt(dx * dx + dy * dy);
+          const d  = Math.sqrt(dx * dx + dy * dy);
           if (d < 58) {
             ctx.beginPath();
             ctx.moveTo(ns[i].x, ns[i].y + bob);
@@ -209,9 +276,9 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
         }
       }
 
-      // Neural nodes
+      // Neural nodes (pulse speed tied to state)
       ns.forEach(n => {
-        const p = 0.35 + 0.65 * Math.sin(elapsed * 0.0019 + n.phase);
+        const p = 0.35 + 0.65 * Math.sin(elapsed * meshSpeed + n.phase);
         ctx.beginPath(); ctx.arc(n.x, n.y + bob, 1.5, 0, Math.PI * 2);
         ctx.fillStyle = rc(cfg.mesh, p * 0.65 * cfg.dim); ctx.fill();
       });
@@ -220,13 +287,16 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
       ctx.beginPath(); ctx.ellipse(CX, CY + bob, RX, RY, 0, 0, Math.PI * 2);
       ctx.strokeStyle = rc(cfg.mesh, 0.50 * cfg.dim); ctx.lineWidth = 1.5; ctx.stroke();
 
-      // Decorative forehead scan lines
-      const scanLine = (y: number, a: number) => {
+      // Forehead scan lines (animated for ACTIVE — sweeping data-read effect)
+      const scanBaseAlpha = isActive
+        ? 0.06 + 0.09 * Math.abs(Math.sin(elapsed * 0.0028))
+        : isNoEdge ? 0.04 : 0.09;
+      const scanLine = (y: number, mul: number) => {
         const hw = Math.sqrt(Math.max(0, RX * RX * (1 - ((y - CY) * (y - CY)) / (RY * RY))));
         ctx.beginPath(); ctx.moveTo(CX - hw * 0.8, y + bob); ctx.lineTo(CX + hw * 0.8, y + bob);
-        ctx.strokeStyle = rc(cfg.mesh, a * cfg.dim); ctx.lineWidth = 0.4; ctx.stroke();
+        ctx.strokeStyle = rc(cfg.mesh, scanBaseAlpha * mul * cfg.dim); ctx.lineWidth = 0.4; ctx.stroke();
       };
-      scanLine(CY - 68, 0.09); scanLine(CY - 60, 0.07); scanLine(CY - 52, 0.05);
+      scanLine(CY - 68, 1.0); scanLine(CY - 60, 0.78); scanLine(CY - 52, 0.56);
 
       // Cheekbone lines
       const cheekLine = (x1: number, y1: number, x2: number, y2: number) => {
@@ -236,34 +306,36 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
       cheekLine(CX - RX + 5, CY + 22, CX - 38, CY + 12);
       cheekLine(CX + 38, CY + 12, CX + RX - 5, CY + 22);
 
-      // ── Brow lines (focused, inward-tilted for intelligence) ──────────────────
+      // ── Brow lines (lift/furrow per state) ──────────────────────────────────
       const drawBrow = (p1x: number, p1y: number, pcx: number, pcy: number, p2x: number, p2y: number) => {
         ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.mesh, 0.22 * cfg.dim);
         ctx.beginPath();
-        ctx.moveTo(p1x, p1y + bob);
-        ctx.quadraticCurveTo(pcx, pcy + bob, p2x, p2y + bob);
+        ctx.moveTo(p1x, p1y + bob + browLift);
+        ctx.quadraticCurveTo(pcx, pcy + bob + browLift, p2x, p2y + bob + browLift);
         ctx.strokeStyle = rc(cfg.mesh, 0.45 * cfg.dim);
         ctx.lineWidth = 1.2; ctx.stroke();
         ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       };
-      // Left brow: outer end sits lower, arcs up to medial peak, then drops inward
       drawBrow(CX - 46, CY - 37, CX - 27, CY - 48, CX - 11, CY - 43);
-      // Right brow (mirror)
       drawBrow(CX + 11, CY - 43, CX + 27, CY - 48, CX + 46, CY - 37);
 
-      // ── Eyes (almond-shaped, intelligent) ────────────────────────────────────
-      const eyes = [
+      // ── Eyes (almond-shaped, with live pupil scan drift) ─────────────────────
+      const eyeDefs = [
         { x: CX - 27, y: CY - 20, tilt: -0.07 },
         { x: CX + 27, y: CY - 20, tilt:  0.07 },
       ];
-      eyes.forEach(eye => {
+      eyeDefs.forEach(eye => {
         const eyeY  = eye.y + bob;
         const eyeRY = 7.5 * (1 - blinkPct * 0.94);
         const tilt  = eye.tilt;
 
-        ctx.shadowBlur = 20; ctx.shadowColor = rc(cfg.eye, 0.82);
+        // Iris/pupil center drifts with scan offset (rim stays fixed)
+        const px = eye.x + eyeOffX;
+        const py = eyeY   + eyeOffY;
 
-        // Outer glow halo (soft, wide)
+        ctx.shadowBlur = eyeGlow; ctx.shadowColor = rc(cfg.eye, 0.82);
+
+        // Outer glow halo
         ctx.beginPath();
         ctx.ellipse(eye.x, eyeY, 17.5, Math.max(0.5, eyeRY + 2.5), tilt, 0, Math.PI * 2);
         ctx.strokeStyle = rc(cfg.eye, 0.16); ctx.lineWidth = 3.5; ctx.stroke();
@@ -274,46 +346,44 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
         ctx.strokeStyle = rc(cfg.eye, 0.88); ctx.lineWidth = 1.2; ctx.stroke();
 
         if (blinkPct < 0.8) {
-          // Upper eyelid emphasis: top arc drawn heavier (defines the sharp AI look)
+          // Upper eyelid emphasis
           ctx.beginPath();
           ctx.ellipse(eye.x, eyeY, 15, Math.max(0.5, eyeRY), tilt, Math.PI, Math.PI * 2);
           ctx.strokeStyle = rc(cfg.eye, 0.62); ctx.lineWidth = 1.9; ctx.stroke();
 
-          ctx.shadowBlur = 0; // clear glow before fill ops
+          ctx.shadowBlur = 0; // clear glow before fills
 
-          // Iris: radial gradient — bright center fading to deep edge
-          const ig = ctx.createRadialGradient(eye.x - 1, eyeY - 1, 0, eye.x, eyeY, 10);
+          // Iris gradient (centered on scan position)
+          const ig = ctx.createRadialGradient(px - 1, py - 1, 0, px, py, 10);
           ig.addColorStop(0,    rc(cfg.eye,  0.74));
           ig.addColorStop(0.52, rc(cfg.mesh, 0.38));
           ig.addColorStop(1,    'rgba(0,4,14,0.58)');
           ctx.beginPath();
-          ctx.ellipse(eye.x, eyeY, 10, Math.max(0.5, eyeRY * 0.85), tilt, 0, Math.PI * 2);
+          ctx.ellipse(px, py, 10, Math.max(0.5, eyeRY * 0.85), tilt, 0, Math.PI * 2);
           ctx.fillStyle = ig; ctx.fill();
 
-          // Inner iris ring (synthetic depth detail)
+          // Inner iris ring
           ctx.beginPath();
-          ctx.ellipse(eye.x, eyeY, 6.5, Math.max(0.3, eyeRY * 0.54), tilt, 0, Math.PI * 2);
+          ctx.ellipse(px, py, 6.5, Math.max(0.3, eyeRY * 0.54), tilt, 0, Math.PI * 2);
           ctx.strokeStyle = rc(cfg.eye, 0.26); ctx.lineWidth = 0.7; ctx.stroke();
 
-          // Pupil (slightly elongated on tilt axis — AI look)
+          // Pupil (follows scan position)
           ctx.beginPath();
-          ctx.ellipse(eye.x, eyeY, 3.8, Math.max(0.3, eyeRY * 0.47), tilt, 0, Math.PI * 2);
+          ctx.ellipse(px, py, 3.8, Math.max(0.3, eyeRY * 0.47), tilt, 0, Math.PI * 2);
           ctx.fillStyle = 'rgba(0,3,12,0.97)'; ctx.fill();
 
-          // Primary specular — upper-left, precise and small
+          // Specular highlight (follows iris)
           ctx.beginPath();
-          ctx.arc(eye.x - 4, eyeY - eyeRY * 0.52, 1.7, 0, Math.PI * 2);
+          ctx.arc(px - 4, py - eyeRY * 0.52, 1.7, 0, Math.PI * 2);
           ctx.fillStyle = 'rgba(255,255,255,0.82)'; ctx.fill();
-          // Secondary micro-glint
           ctx.beginPath();
-          ctx.arc(eye.x + 3.2, eyeY + eyeRY * 0.28, 0.8, 0, Math.PI * 2);
+          ctx.arc(px + 3.2, py + eyeRY * 0.28, 0.8, 0, Math.PI * 2);
           ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fill();
         }
         ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       });
 
       // ── Nose bridge + nostril wings ───────────────────────────────────────────
-      // Subtle shadow lines flanking the nose centerline (bridge structure)
       const noseBridge = (dx: number) => {
         ctx.beginPath();
         ctx.moveTo(CX + dx * 0.4, CY - 8 + bob);
@@ -321,7 +391,6 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
         ctx.strokeStyle = rc(cfg.mesh, 0.12 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
       };
       noseBridge(-4); noseBridge(4);
-      // Nostril wing arcs (lower arc = nostril curve, not full circles)
       const drawNostril = (side: number) => {
         ctx.beginPath();
         ctx.arc(CX + side * 7.5, CY + 21 + bob, 3.8, Math.PI * 0.12, Math.PI * 0.88);
@@ -329,7 +398,7 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
       };
       drawNostril(-1); drawNostril(1);
 
-      // ── Jaw angle markers (structural accents) ────────────────────────────────
+      // ── Jaw angle markers ─────────────────────────────────────────────────────
       [-1, 1].forEach(side => {
         ctx.beginPath();
         ctx.moveTo(CX + side * 60, CY + 44 + bob);
@@ -337,33 +406,29 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
         ctx.strokeStyle = rc(cfg.mesh, 0.09 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
       });
 
-      // ── Mouth (minimal, calm, serious) ───────────────────────────────────────
+      // ── Mouth ────────────────────────────────────────────────────────────────
       ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.30);
       ctx.beginPath();
       const my = CY + 57 + bob;
       if (s === 'READY_LONG') {
-        // Barely perceptible upturn — confidence, not a smile
         ctx.moveTo(CX - 17, my); ctx.quadraticCurveTo(CX, my + 4, CX + 17, my);
       } else if (s === 'READY_SHORT') {
-        // Flat, tight, intensity
         ctx.moveTo(CX - 15, my + 1); ctx.lineTo(CX + 15, my + 1);
       } else if (s === 'ACTIVE') {
-        // Narrow, locked-in
         ctx.moveTo(CX - 13, my); ctx.lineTo(CX + 13, my);
       } else {
-        // Neutral/WAIT: nearly flat, imperceptible center pull
         ctx.moveTo(CX - 17, my); ctx.quadraticCurveTo(CX, my + 2, CX + 17, my);
       }
       ctx.strokeStyle = rc(cfg.eye, 0.38 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
 
-      // ── Orbiting particles ───────────────────────────────────────────────────
+      // ── Orbiting particles (speed tied to state energy) ───────────────────────
       partRef.current.forEach(p => {
-        p.angle += p.speed * 0.008;
-        const px = CX + Math.cos(p.angle) * p.r;
-        const py = CY + Math.sin(p.angle) * p.r * 0.72 + bob;
-        const a = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim;
-        ctx.beginPath(); ctx.arc(px, py, p.sz, 0, Math.PI * 2);
+        p.angle += p.speed * 0.008 * partMult;
+        const qx = CX + Math.cos(p.angle) * p.r;
+        const qy = CY + Math.sin(p.angle) * p.r * 0.72 + bob;
+        const a  = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim;
+        ctx.beginPath(); ctx.arc(qx, qy, p.sz, 0, Math.PI * 2);
         ctx.fillStyle = rc(cfg.mesh, a); ctx.fill();
       });
 
