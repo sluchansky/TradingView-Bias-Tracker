@@ -1,0 +1,445 @@
+# AI Trading Partner Dashboard Redesign
+
+Use the attached reference image as the primary design target.
+
+Do NOT simply reorganize the existing dashboard. This should be a complete frontend redesign while preserving all existing backend functionality, APIs, Brain logic, TradersPost integration, Discord integration, chart data, and trading engine.
+
+The goal is to make the application feel like a premium AI trading command center rather than a collection of widgets.
+
+--------------------------------------------------
+PRIMARY GOAL
+--------------------------------------------------
+
+The AI Trading Partner should feel like a professional analyst sitting beside me.
+
+The dashboard should revolve around a realistic AI avatar that continuously explains what it is seeing, why it is waiting, and why it recommends trades.
+
+The avatar should become the centerpiece of the application.
+
+--------------------------------------------------
+REMOVE
+--------------------------------------------------
+
+Completely remove:
+
+• Particle face
+• Dot matrix face
+• Wireframe face
+• Floating blue dots
+• Robotic mask
+• Cartoon appearance
+• Uncanny AI face
+
+Replace it with a realistic cinematic AI analyst.
+
+--------------------------------------------------
+AVATAR REQUIREMENTS
+--------------------------------------------------
+
+The avatar should be:
+
+• Realistic human
+• Male
+• Professional
+• Calm
+• Intelligent
+• High quality
+• Symmetrical
+• Slight blue cinematic lighting
+• Looking directly toward the user
+• Chest-up framing
+• Premium AAA quality
+
+Animation should include only:
+
+• Blinking
+• Small eye movement
+• Subtle breathing
+• Small head movement
+• Mouth movement while speaking
+• Lighting reacts to confidence level
+
+The avatar should never feel distracting.
+
+--------------------------------------------------
+LAYOUT
+--------------------------------------------------
+
+Top Navigation
+
+• AI Trading Partner logo
+• Symbol selector (MNQ / MGC / MES / MYM)
+• Current market time
+• Market Open / Closed
+• Voice toggle
+• Settings
+
+--------------------------------------------------
+CENTER SECTION
+--------------------------------------------------
+
+The realistic AI avatar should dominate the page.
+
+Below or slightly overlapping the avatar should be the Brain conversation panel.
+
+The Brain panel should continuously explain what it is thinking.
+
+Example:
+
+AI Trading Partner
+
+THINKING...
+
+Watching liquidity build above overnight high...
+
+✓ Price above VWAP
+
+✓ Structure bullish
+
+✓ Delta improving
+
+✓ Buyers defending
+
+✕ Waiting for confirmation candle
+
+Confidence
+
+42 → 51 → 63
+
+Need a 1-minute bullish close above resistance.
+
+The Brain should continuously narrate the market.
+
+Even when waiting.
+
+--------------------------------------------------
+LEFT PANELS
+--------------------------------------------------
+
+Market Context
+
+• Trend
+• Structure
+• Momentum
+• Volatility
+• Volume
+
+Key Levels
+
+• VWAP
+• Overnight High
+• Overnight Low
+• Resistance
+• Support
+• Liquidity Levels
+
+Position
+
+• Direction
+• Contracts
+• Average Entry
+• Open P&L
+• Daily P&L
+• Daily Loss Limit
+• Drawdown
+
+Confidence Meter
+
+• Edge Score
+• Win Probability
+• Risk / Reward
+• Setup Quality
+
+--------------------------------------------------
+RIGHT PANELS
+--------------------------------------------------
+
+Current Analysis
+
+• Bias
+• Setup
+• Timeframe
+• Status
+• Valid Until
+
+Evidence Score
+
+Show circular score.
+
+Breakdown:
+
+• Structure
+• Liquidity
+• VWAP
+• Delta
+• Volume
+• Momentum
+• Volatility
+
+Recent Setups
+
+Show:
+
+Time
+
+Direction
+
+Result
+
+R Multiple
+
+Voice Status
+
+Listening
+
+Speaking
+
+Waveform
+
+Voice Enabled
+
+--------------------------------------------------
+BOTTOM
+--------------------------------------------------
+
+Large chart.
+
+Chart should include:
+
+• Candlesticks
+
+• VWAP
+
+• Supply Zones
+
+• Demand Zones
+
+• Liquidity Sweeps
+
+• Entries
+
+• Stops
+
+• Targets
+
+• Structure Breaks
+
+When the Brain references something...
+
+Highlight it visually.
+
+Example:
+
+Brain:
+
+"Demand zone being tested."
+
+Demand zone briefly glows.
+
+--------------------------------------------------
+TRADE PLAN PANEL
+--------------------------------------------------
+
+Direction
+
+Entry
+
+Stop
+
+Target 1
+
+Target 2
+
+Risk %
+
+Contracts
+
+Risk / Reward
+
+Setup Expiration
+
+Buttons
+
+Ready to Trade
+
+Simulate Trade
+
+Reject Setup
+
+Send to TradersPost
+
+Require confirmation before sending live orders.
+
+--------------------------------------------------
+BRAIN PERSONALITY
+--------------------------------------------------
+
+The Brain should sound like an elite professional futures trader.
+
+Instead of saying:
+
+WAIT
+
+It should say:
+
+"No edge. Buyers aren't defending. Capital preservation comes first."
+
+Instead of saying:
+
+READY
+
+It should say:
+
+"This is the strongest setup I've seen in the last 90 minutes. Risk-to-reward meets our requirements. I recommend entry."
+
+--------------------------------------------------
+MAKE THE BRAIN FEEL ALIVE
+--------------------------------------------------
+
+The Brain should never appear idle.
+
+Continuously explain:
+
+Watching overnight liquidity...
+
+Delta improving...
+
+Volume increasing...
+
+Testing VWAP...
+
+Momentum slowing...
+
+No edge...
+
+Structure weakening...
+
+Waiting...
+
+Confidence increasing...
+
+Watching buyers...
+
+Watching sellers...
+
+--------------------------------------------------
+AVATAR STATES
+--------------------------------------------------
+
+Offline
+
+Dim lighting
+
+Neutral expression
+
+Watching
+
+Soft blue lighting
+
+Interested
+
+Focused eyes
+
+Warning
+
+Amber lighting
+
+Serious expression
+
+Ready
+
+Brighter blue lighting
+
+Confident eye contact
+
+Managing Trade
+
+Focused
+
+Risk Blocked
+
+Red lighting
+
+Warning message
+
+--------------------------------------------------
+VISUAL STYLE
+--------------------------------------------------
+
+Near-black background
+
+Dark glass panels
+
+Blue accent lighting
+
+Soft shadows
+
+Minimal borders
+
+Professional typography
+
+Premium spacing
+
+High-end command center appearance
+
+No clutter
+
+No oversized cards
+
+No excessive empty space
+
+No cartoon graphics
+
+No glowing particle faces
+
+--------------------------------------------------
+IMPLEMENTATION REQUIREMENTS
+--------------------------------------------------
+
+DO NOT rebuild the backend.
+
+Keep all existing:
+
+Brain logic
+
+Trading engine
+
+Alert processing
+
+Database
+
+Voice system
+
+Charts
+
+Discord
+
+TradersPost
+
+Webhooks
+
+API routes
+
+Learning engine
+
+Only replace the presentation layer.
+
+--------------------------------------------------
+FIRST STEP
+--------------------------------------------------
+
+Before changing anything:
+
+1. Inspect the current frontend architecture.
+
+2. Identify reusable components.
+
+3. Identify existing APIs.
+
+4. Keep all backend functionality.
+
+5. Replace only the UI.
+
+6. Present a short implementation plan.
+
+Then begin rebuilding the dashboard to match the attached reference image as closely as possible while preserving every existing feature.

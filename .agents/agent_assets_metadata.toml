@@ -6,6 +6,12 @@ uri = "file://artifacts/shawn-roast/public/studio_bg.png"
 type = "image"
 title = "News studio background"
 
+[[generated]]
+id = "dslc8mELSont62Kh7QAL9"
+uri = "file://attached_assets/ai-analyst-portrait.png"
+type = "image"
+title = "ai-analyst-portrait"
+
 [[outputs]]
 id = "iKR4nChLzaVjwKD04WKGt"
 uri = "file://artifacts/tradingview-webhook/ARCHITECTURE.md"
