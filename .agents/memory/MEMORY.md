@@ -143,3 +143,4 @@
 - [Brain Conflict Resolver](brain-conflict-resolver.md) — 10-priority display-only conflict engine; BLOCK on hard vetoes, WAIT/ALLOW on soft penalty accumulation; wired at mb_out["conflict_resolver"].
 - [Verdict Board](verdict-board.md) — 4-bucket plain-English classifier (supports/opposes/missing/vetoes); reads observations+BCR+result; mb_out["verdict_board"]; never feeds money path.
 - [Main Brain architecture](main-brain-architecture.md) — 3-layer rule: orchestrate(_mb_orchestrate)+learning(_mb_learning_snapshot)+sole-speaker(compute_main_brain); never collapse layers.
+- [Operator Mode UI](operator-mode-ui.md) — conversational Brain interface at `/`; auth=localStorage Basic Auth; narration=main_brain_voice; chat=/assistant; Engineering=/api/dashboard.
