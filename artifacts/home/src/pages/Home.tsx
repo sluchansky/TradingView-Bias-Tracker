@@ -75,27 +75,165 @@ function useStream(target: string, msPerChar = 14) {
   return { text, live };
 }
 
-// ── Animated brain orb ────────────────────────────────────────────────────────
-function Orb({ status }: { status: string }) {
-  const p      = PAL[status] || DEF_PAL;
-  const active = status === 'READY' || status === 'MANAGING';
+// ── Digital face — 1s & 0s with blinking eyes and speaking mouth ─────────────
+function BrainFace({ speaking, color, glow }: {
+  speaking: boolean; color: string; glow: string;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const spkRef    = useRef(speaking);
+  const colRef    = useRef(color);
+  useEffect(() => { spkRef.current = speaking; }, [speaking]);
+  useEffect(() => { colRef.current = color; },   [color]);
+
+  useEffect(() => {
+    const cv = canvasRef.current;
+    if (!cv) return;
+    const ctx = cv.getContext('2d')!;
+
+    // Grid: 22 cols × 16 rows, each cell 9×11 px → canvas 198×176
+    const COLS = 22, ROWS = 16, CW = 9, CH = 11;
+
+    // Initialise random 1/0 character grid
+    const grid: string[][] = Array.from({ length: ROWS }, () =>
+      Array.from({ length: COLS }, () => (Math.random() < 0.5 ? '0' : '1'))
+    );
+
+    // All geometry in cell-centre coordinates (col+0.5, row+0.5)
+    const FCX = 11,   FCY = 8,    FRX = 9.2,  FRY = 6.8;   // face ellipse
+    const LEX = 6.5,  LEY = 5.5,  ERX = 2.1,  ERY_F = 1.25; // left eye
+    const REX = 15.5, REY = 5.5;                              // right eye
+    const PR  = 0.72;                                          // pupil radius
+    const MX  = 11,   MY  = 11.5, MHW = 3.4,  MRY_MAX = 1.7; // mouth
+
+    function ell(px: number, py: number, cx: number, cy: number, rx: number, ry: number) {
+      return ry > 0.01 && ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 <= 1;
+    }
+
+    // Animation state
+    let blinkAmt = 0;
+    let blinkPhase: 'open' | 'closing' | 'closed' | 'opening' = 'open';
+    let blinkWait = 2.5 + Math.random() * 4;
+    let mouthOpen = 0;
+    let eox = 0, eoy = 0, tex = 0, tey = 0, ewait = 2;
+    let cflip = 0;
+    let last = performance.now();
+    let raf = 0;
+
+    function frame(now: number) {
+      const dt  = Math.min((now - last) / 1000, 0.05);
+      last      = now;
+      const spk = spkRef.current;
+      const col = colRef.current;
+
+      // Blink cycle
+      if (blinkPhase === 'open') {
+        blinkWait -= dt;
+        if (blinkWait <= 0) blinkPhase = 'closing';
+      } else if (blinkPhase === 'closing') {
+        blinkAmt = Math.min(1, blinkAmt + dt * 11);
+        if (blinkAmt >= 1) { blinkPhase = 'closed'; blinkWait = 0.06; }
+      } else if (blinkPhase === 'closed') {
+        blinkWait -= dt;
+        if (blinkWait <= 0) blinkPhase = 'opening';
+      } else {
+        blinkAmt = Math.max(0, blinkAmt - dt * 11);
+        if (blinkAmt <= 0) { blinkPhase = 'open'; blinkWait = 3.5 + Math.random() * 5; }
+      }
+      const eyeRY = ERY_F * (1 - blinkAmt * 0.97);
+
+      // Eye drift (pupils wander gently)
+      ewait -= dt;
+      if (ewait <= 0) {
+        tex = (Math.random() - 0.5) * 1.1;
+        tey = (Math.random() - 0.5) * 0.45;
+        ewait = 2 + Math.random() * 3;
+      }
+      eox += (tex - eox) * dt * 2.5;
+      eoy += (tey - eoy) * dt * 2.5;
+
+      // Mouth: oscillate when speaking, close silently
+      const tMouth = spk ? (0.4 + 0.6 * Math.abs(Math.sin(now * 0.011))) : 0;
+      mouthOpen   += (tMouth - mouthOpen) * Math.min(1, dt * 13);
+
+      // Slow char shuffle for ambient noise
+      cflip -= dt;
+      if (cflip <= 0) {
+        cflip = 0.075;
+        for (let k = 0; k < 5; k++) {
+          const r = Math.floor(Math.random() * ROWS);
+          const c = Math.floor(Math.random() * COLS);
+          grid[r][c] = grid[r][c] === '0' ? '1' : '0';
+        }
+      }
+
+      // Draw frame
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.font         = 'bold 8px monospace';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      const mRY = mouthOpen * MRY_MAX;
+
+      for (let row = 0; row < ROWS; row++) {
+        for (let c = 0; c < COLS; c++) {
+          const cx = c + 0.5, cy = row + 0.5;
+          const ch = grid[row][c];
+          const px = c  * CW + CW / 2;
+          const py = row * CH + CH / 2;
+
+          const inFace       = ell(cx, cy, FCX, FCY, FRX, FRY);
+          const inLE         = ell(cx, cy, LEX, LEY, ERX, eyeRY);
+          const inRE         = ell(cx, cy, REX, REY, ERX, eyeRY);
+          const inLP         = ell(cx, cy, LEX + eox, LEY + eoy, PR, PR * 0.9);
+          const inRP         = ell(cx, cy, REX + eox, REY + eoy, PR, PR * 0.9);
+          const closedL      = blinkAmt > 0.3 && Math.abs(cy - LEY) < 0.6 && Math.abs(cx - LEX) <= ERX;
+          const closedR      = blinkAmt > 0.3 && Math.abs(cy - REY) < 0.6 && Math.abs(cx - REX) <= ERX;
+          const inMouthOpen  = mouthOpen > 0.12 && cy >= MY - mRY * 0.4 && ell(cx, cy, MX, MY, MHW, mRY);
+          const inMouthLine  = mouthOpen <= 0.12 && Math.abs(cy - MY) < 0.58 && Math.abs(cx - MX) <= MHW;
+
+          ctx.globalAlpha = 1;
+
+          if (inLP || inRP) {
+            ctx.fillStyle   = col;
+            ctx.globalAlpha = 0.92;
+            ctx.fillText('1', px, py);
+          } else if (closedL || closedR) {
+            ctx.fillStyle   = col;
+            ctx.globalAlpha = Math.min(0.55, blinkAmt * 0.65);
+            ctx.fillText('-', px, py);
+          } else if (inLE || inRE) {
+            ctx.fillStyle   = '#e4e4e7';
+            ctx.globalAlpha = 0.60;
+            ctx.fillText(ch, px, py);
+          } else if (inMouthOpen) {
+            ctx.fillStyle   = col;
+            ctx.globalAlpha = 0.68 * mouthOpen;
+            ctx.fillText('0', px, py);
+          } else if (inMouthLine) {
+            ctx.fillStyle   = col;
+            ctx.globalAlpha = 0.22;
+            ctx.fillText('-', px, py);
+          } else if (inFace) {
+            ctx.fillStyle   = col;
+            ctx.globalAlpha = 0.09 + (Math.random() < 0.003 ? 0.11 : 0);
+            ctx.fillText(ch, px, py);
+          } else {
+            ctx.fillStyle   = col;
+            ctx.globalAlpha = 0.027;
+            ctx.fillText(ch, px, py);
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+      raf = requestAnimationFrame(frame);
+    }
+
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   return (
-    <div style={{ position: 'relative', width: 128, height: 128, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: `1px solid ${p.ring}`, opacity: 0.12, animation: 'b-ping 3.5s ease-in-out infinite' }} />
-      <div style={{ position: 'absolute', inset: 14, borderRadius: '50%', border: `1px solid ${p.ring}`, opacity: 0.22, animation: 'b-pulse 2.8s ease-in-out infinite' }} />
-      <div style={{
-        position: 'relative', width: 76, height: 76, borderRadius: '50%',
-        border: `1px solid ${p.ring}`,
-        background: 'radial-gradient(circle at 35% 35%, rgba(255,255,255,0.07), rgba(0,0,0,0.7))',
-        boxShadow: `0 0 40px ${p.glow}, 0 0 10px ${p.glow}`,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}>
-        <div style={{
-          width: 10, height: 10, borderRadius: '50%', background: p.dot,
-          boxShadow: `0 0 10px ${p.dot}`,
-          animation: active ? 'b-dot 1.3s ease-in-out infinite' : 'b-breathe 3s ease-in-out infinite',
-        }} />
-      </div>
+    <div style={{ filter: `drop-shadow(0 0 22px ${glow})` }}>
+      <canvas ref={canvasRef} width={22 * 9} height={16 * 11} style={{ display: 'block' }} />
     </div>
   );
 }
@@ -188,7 +326,7 @@ function LoginOverlay({ onSubmit }: { onSubmit: (pwd: string) => void }) {
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 export default function Home() {
-  const [ticker, setTicker]   = useState<'MGC' | 'MNQ'>('MNQ');
+  const [ticker, setTicker]   = useState<'MGC' | 'MNQ' | 'MES' | 'MYM'>('MNQ');
   const [data,   setData]     = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [msgs,   setMsgs]     = useState<Msg[]>([]);
@@ -329,7 +467,7 @@ export default function Home() {
       {/* ── Header ───────────────────────────────────────────────────────── */}
       <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 28px', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          {(['MGC', 'MNQ'] as const).map(t => (
+          {(['MGC', 'MNQ', 'MES', 'MYM'] as const).map(t => (
             <button key={t} onClick={() => setTicker(t)} style={{
               padding: '6px 18px', borderRadius: 20, border: 'none', cursor: 'pointer',
               fontSize: 12, fontWeight: 700, fontFamily: 'monospace', letterSpacing: '0.08em',
@@ -362,7 +500,7 @@ export default function Home() {
         {/* Avatar + narration section */}
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 24, flex: 1, justifyContent: 'center', width: '100%' }}>
 
-          <Orb status={status} />
+          <BrainFace speaking={streaming} color={pal.dot} glow={pal.glow} />
 
           {/* Status · instrument · edge · direction */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, fontFamily: 'monospace', letterSpacing: '0.08em' }}>
