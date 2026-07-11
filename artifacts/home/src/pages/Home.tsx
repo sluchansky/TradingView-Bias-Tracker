@@ -114,12 +114,17 @@ function getBrainChecklist(data: any): Array<{ text: string; st: 'pass' | 'fail'
 }
 
 // ── Synthetic AI face canvas ───────────────────────────────────────────────────
-const AvatarCanvas = React.memo(({ avState, speaking, ringColor }: { avState: AvatarState; speaking: boolean; ringColor: string }) => {
+type GazeEvt = { dx: number; dy: number; widen: boolean; dur: number; id: number };
+
+const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
+  avState: AvatarState; speaking: boolean; ringColor: string; gazeEvent: GazeEvt;
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef   = useRef(0);
   const stateRef  = useRef(avState);
   const speakRef  = useRef(speaking);
   const ringRef   = useRef(ringColor);
+  const gazeRef   = useRef<{ dx:number; dy:number; widen:boolean; t0:number; dur:number }>({ dx:0, dy:0, widen:false, t0:0, dur:0 });
   const nodesRef  = useRef<{ x: number; y: number; phase: number }[]>([]);
   const partRef      = useRef<{ angle: number; r: number; speed: number; sz: number; phase: number }[]>([]);
   const nextBlinkRef = useRef(3);   // seconds from t0 until next blink fires
@@ -127,6 +132,12 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor }: { avState: Av
   useEffect(() => { stateRef.current = avState; }, [avState]);
   useEffect(() => { speakRef.current = speaking; }, [speaking]);
   useEffect(() => { ringRef.current = ringColor; }, [ringColor]);
+  // On a new gaze event, arm the ref — the draw loop reads it each frame
+  useEffect(() => {
+    if (gazeEvent.dur > 0) {
+      gazeRef.current = { dx: gazeEvent.dx, dy: gazeEvent.dy, widen: gazeEvent.widen, t0: Date.now(), dur: gazeEvent.dur };
+    }
+  }, [gazeEvent.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const W = 240, H = 320;
@@ -231,6 +242,25 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor }: { avState: Av
       const eyeOffX   = Math.sin(elapsed * scanSpeed) * scanAmpX;
       const eyeOffY   = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY;
 
+      // ── Market-event gaze blend ───────────────────────────────────────────────
+      // When a notable event fires (structure, sweep, READY, edge spike) the eyes
+      // saccade toward a target direction, hold, then smoothly return to idle scan.
+      const gz     = gazeRef.current;
+      const gzAge  = Date.now() - gz.t0;
+      const rampT  = 150;                      // ms — saccade rise time
+      const holdT  = gz.dur * 0.55;            // hold at target
+      const decayT = Math.max(1, gz.dur * 0.45); // ease back to scan
+      let gazeLerp = 0;
+      if (gz.dur > 0) {
+        if (gzAge < rampT)               gazeLerp = gzAge / rampT;
+        else if (gzAge < rampT + holdT)  gazeLerp = 1.0;
+        else                             gazeLerp = Math.max(0, 1 - (gzAge - rampT - holdT) / decayT);
+      }
+      // Blend scan offset with gaze target; widenFactor expands eyeRY briefly
+      const finalOffX   = eyeOffX * (1 - gazeLerp) + gz.dx * gazeLerp;
+      const finalOffY   = eyeOffY * (1 - gazeLerp) + gz.dy * gazeLerp;
+      const widenFactor = gz.widen && gazeLerp > 0.05 ? 1 + 0.28 * gazeLerp : 1.0;
+
       // ── Brow offset per state ─────────────────────────────────────────────────
       // READY: raised slightly (alert, confident)
       // ACTIVE: very slight furrow (concentrated)
@@ -328,12 +358,13 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor }: { avState: Av
       ];
       eyeDefs.forEach(eye => {
         const eyeY  = eye.y + bob;
-        const eyeRY = 7.5 * (1 - blinkPct * 0.94);
+        // widenFactor briefly expands the eye opening on volatility / zone events
+        const eyeRY = 7.5 * widenFactor * (1 - blinkPct * 0.94);
         const tilt  = eye.tilt;
 
-        // Iris/pupil center drifts with scan offset (rim stays fixed)
-        const px = eye.x + eyeOffX;
-        const py = eyeY   + eyeOffY;
+        // Iris/pupil center: idle scan blended with market-event gaze target
+        const px = eye.x + finalOffX;
+        const py = eyeY   + finalOffY;
 
         ctx.shadowBlur = eyeGlow; ctx.shadowColor = rc(cfg.eye, 0.82);
 
@@ -860,13 +891,19 @@ export default function Home() {
   const [leftOpen,     setLeftOpen]     = useState(false);
   const [confirming,   setConfirming]   = useState(false);
   const [tradeSent,    setTradeSent]    = useState<string | null>(null);
+  const [gazeEvent,    setGazeEvent]    = useState<GazeEvt>({ dx:0, dy:0, widen:false, dur:0, id:0 });
 
   const chatRef  = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const candlesRef   = useRef<Candle[]>([]);
-  const priceBaseRef = useRef<number>(0);
-  const speakRef     = useRef<(t: string) => void>(() => {});
+  const candlesRef    = useRef<Candle[]>([]);
+  const priceBaseRef  = useRef<number>(0);
+  const speakRef      = useRef<(t: string) => void>(() => {});
   const lastSpokenRef = useRef('');
+  // Gaze event detection — track previous poll values to detect transitions
+  const prevStatusRef = useRef('');
+  const prevEdgeRef   = useRef(0);
+  const prevStructRef = useRef(false);
+  const prevZoneRef   = useRef(false);
 
   const clock = useClock();
   const { voices, voiceName, setVoice, muted, setMuted, speaking, speak } = useTTS();
@@ -958,6 +995,38 @@ export default function Home() {
   useEffect(() => {
     if (narration && narration !== lastSpokenRef.current) { lastSpokenRef.current = narration; speakRef.current(narration); }
   }, [narration]);
+
+  // Detect market events → fire a gaze direction that drives eye movement
+  useEffect(() => {
+    if (!data) return;
+    const structNow = !!(data.gate_debug?.structure_confirmed);
+    const zoneNow   = !!(data.gate_debug?.zone_valid);
+    let next: Omit<GazeEvt,'id'> | null = null;
+
+    if (status === 'READY' && prevStatusRef.current && prevStatusRef.current !== 'READY') {
+      // Trade ready — eyes snap forward to look directly at the user
+      next = { dx: 0, dy: -1.5, widen: false, dur: 4200 };
+    } else if (status === 'MANAGING' && prevStatusRef.current && prevStatusRef.current !== 'MANAGING') {
+      // Position opened — eyes settle downward in focused monitoring mode
+      next = { dx: 0.4, dy: 2.2, widen: false, dur: 3000 };
+    } else if (structNow && !prevStructRef.current) {
+      // Structure break confirmed — glance upper-left toward analysis panels
+      next = { dx: -4.2, dy: -1.2, widen: false, dur: 2500 };
+    } else if (zoneNow && !prevZoneRef.current) {
+      // Zone / liquidity sweep detected — eyes shift right-down toward evidence, widen briefly
+      next = { dx: 3.8, dy: 2.8, widen: true, dur: 2200 };
+    } else if (edge - prevEdgeRef.current >= 12) {
+      // Edge spike — glance upper-left at structure readings
+      next = { dx: -3.5, dy: -0.9, widen: false, dur: 2000 };
+    }
+
+    prevStatusRef.current = status;
+    prevEdgeRef.current   = edge;
+    prevStructRef.current = structNow;
+    prevZoneRef.current   = zoneNow;
+
+    if (next) setGazeEvent(g => ({ ...next!, id: g.id + 1 }));
+  }, [data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const verdictLabel =
     status === 'READY' && /long|bull/i.test(dirn)  ? 'READY — LONG' :
@@ -1238,7 +1307,7 @@ export default function Home() {
                 <div style={{ position:'absolute', inset:-14, borderRadius:'50%',
                   background:`radial-gradient(ellipse at center, ${auraColor}14 0%, transparent 70%)`,
                   animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none' }} />
-                <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} />
+                <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
               </div>
               {/* State label below avatar */}
               <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:7 }}>
