@@ -1,0 +1,182 @@
+I don't want a generic AI face anymore.
+
+I want the avatar to become the identity of the AI Trading Partner.
+
+Think less "robot."
+
+Think more "living digital intelligence."
+
+Overall style
+Minimal like OpenAI Voice Mode.
+Premium like Apple Vision Pro.
+Futuristic like Starlink or Neuralink.
+Calm instead of flashy.
+Dark background with subtle animated particles.
+The avatar should feel alive even when it's silent.
+Avatar design
+
+The face should not look like a human.
+
+It should be made from thousands of tiny moving particles, dots, and flowing light.
+
+The particles should constantly reorganize themselves as if the AI is thinking.
+
+No hard edges.
+
+No stock-photo human.
+
+No cheesy sci-fi robot.
+
+The face should appear to exist inside a cloud of floating data.
+
+Almost holographic.
+
+Almost transparent.
+
+Idle animation
+
+When nothing is happening:
+
+slow breathing
+subtle head movement
+particles drifting
+eyes softly glowing
+occasional blink
+tiny ripple effects through the face
+
+The AI should never look frozen.
+
+Thinking animation
+
+When analyzing:
+
+The particles should become more active.
+
+Small streams of light should travel across the face.
+
+The eyes become slightly brighter.
+
+A soft pulse radiates outward every few seconds.
+
+The face subtly leans forward.
+
+Speaking animation
+
+When speaking:
+
+The mouth should not lip-sync.
+
+Instead:
+
+particle movement increases
+jaw area slightly reshapes
+eyes animate
+subtle facial expression changes
+light pulses with speech
+
+It should feel like an intelligence communicating—not an animated cartoon.
+
+Listening mode
+
+When I am talking:
+
+The avatar focuses on me.
+
+Eyes brighten.
+
+Very slight head tilt.
+
+Small ring of particles rotates around the head.
+
+The status changes to:
+
+Listening...
+
+Confidence visualization
+
+Instead of showing numbers everywhere,
+
+the avatar itself reflects confidence.
+
+Low confidence
+
+dim glow
+slower particles
+cooler blue
+
+Medium confidence
+
+brighter
+more organized particles
+
+High confidence
+
+confident gaze
+brighter white/blue glow
+stable particle structure
+
+READY
+
+The entire avatar becomes more solid.
+
+Particle movement locks together.
+
+Eyes brighten.
+
+Small pulse radiates behind the head.
+
+Emotion system
+
+The AI should subtly express market confidence.
+
+Not cartoon emotions.
+
+Professional emotions.
+
+Examples:
+
+Watching
+
+Thinking
+
+Interested
+
+Confident
+
+Concerned
+
+Cautious
+
+Excited
+
+Ready
+
+Managing Position
+
+Reviewing Learning
+
+The face should communicate these through posture, lighting, particle speed, and eye intensity—not exaggerated expressions.
+
+Background
+
+The background should never be empty.
+
+Very subtle animated particles.
+
+Tiny moving stars.
+
+Floating data.
+
+Occasional network lines.
+
+Almost invisible.
+
+Think SpaceX mission control.
+
+Goal
+
+I don't want users to feel like they're looking at a dashboard.
+
+I want them to feel like they're sitting across from an intelligent trading analyst that is constantly watching the market and explaining its thoughts.
+
+The avatar should become the personality of the AI Trading Partner and the central focus of the entire application.
