@@ -48598,6 +48598,7 @@ def _assistant_live_context(ticker_override=None):
             "market_reason":      a.get("market_reason"),
             "alert_counts":       a.get("counts"),
             "main_brain":         a.get("main_brain"),
+            "analyst_memory":     (a.get("analyst") or {}).get("memory_review"),
         }
 
     primary = _one(ticker_override)
@@ -48680,8 +48681,89 @@ def _assistant_live_context(ticker_override=None):
     except Exception:
         pass
 
-    return {"selected": primary, "all_instruments": overview,
-            "open_trades": open_trades, "risk_rules": risk_rules}
+    # ── Data staleness: age of the last meaningful scored alert ──────────────
+    _now = datetime.now(timezone.utc)
+    _alt = LAST_ALERT_AT    # datetime of last scored signal, or None
+    _wh  = LAST_WEBHOOK_AT  # datetime of any inbound webhook, or None
+    if _alt:
+        _age = (_now - _alt).total_seconds()
+        _m, _s = divmod(int(_age), 60)
+        _age_lbl = ("%dm %ds" % (_m, _s)) if _m else ("%ds" % _s)
+        data_staleness = {
+            "last_alert_at":        _alt.isoformat(),
+            "age_secs":             int(_age),
+            "age_label":            _age_lbl,
+            "is_stale":             _age > 60,
+            "stale_threshold_secs": 60,
+        }
+    elif _wh:
+        _age = (_now - _wh).total_seconds()
+        _m, _s = divmod(int(_age), 60)
+        _age_lbl = ("%dm %ds" % (_m, _s)) if _m else ("%ds" % _s)
+        data_staleness = {
+            "last_webhook_at":      _wh.isoformat(),
+            "age_secs":             int(_age),
+            "age_label":            _age_lbl,
+            "is_stale":             True,
+            "note":                 "No scored alerts yet; last raw webhook was %s ago." % _age_lbl,
+            "stale_threshold_secs": 60,
+        }
+    else:
+        data_staleness = {
+            "is_stale": True,
+            "age_secs": None,
+            "note":     "No webhooks received yet — bot just started or market is closed.",
+        }
+
+    # ── Prop firm protection status ──────────────────────────────────────────
+    prop_status = {}
+    try:
+        prop_status = prop_firm_status_view()
+    except Exception:
+        prop_status = {"enabled": False, "error": "unavailable"}
+
+    # ── AutoResearch top findings (read-only display-only cache) ─────────────
+    auto_research_top = []
+    try:
+        with SCALP_RESEARCH_CACHE_LOCK:
+            _src = SCALP_RESEARCH_CACHE
+        if isinstance(_src, dict):
+            _best = _src.get("best") or _src.get("tested") or []
+            for _row in list(_best)[:3]:
+                auto_research_top.append({
+                    "strategy":    _row.get("strategy") or _row.get("name"),
+                    "win_rate":    _row.get("win_rate"),
+                    "avg_r":       _row.get("avg_r"),
+                    "trades":      _row.get("trades") or _row.get("total_trades"),
+                    "live_status": _row.get("live_status"),
+                    "rec":         _row.get("recommendation") or _row.get("rec"),
+                })
+    except Exception:
+        pass
+
+    # ── Recent scored signals (last 5, newest first) ─────────────────────────
+    recent_alerts = []
+    try:
+        for _r in reversed(list(ALERT_HISTORY)[-5:]):
+            recent_alerts.append({
+                "type":       _r.get("alert_type"),
+                "instrument": _r.get("instrument"),
+                "price":      _r.get("price"),
+                "ts":         _r.get("timestamp"),
+            })
+    except Exception:
+        pass
+
+    return {
+        "selected":          primary,
+        "all_instruments":   overview,
+        "open_trades":       open_trades,
+        "risk_rules":        risk_rules,
+        "data_staleness":    data_staleness,
+        "prop_status":       prop_status,
+        "auto_research_top": auto_research_top,
+        "recent_alerts":     recent_alerts,
+    }
 
 
 def _assistant_answer(data):
@@ -48728,60 +48810,86 @@ def _assistant_answer(data):
                 continue
             history_msgs.append({"role": role, "content": content[:1500]})
 
+    _stale = ctx.get("data_staleness") or {}
+    _age_secs = _stale.get("age_secs")
+    _age_lbl  = _stale.get("age_label") or (str(_age_secs) + "s" if _age_secs else "unknown")
+    _is_stale = bool(_stale.get("is_stale"))
+
     system_primer = (
-        "You are the built-in AI assistant for a private futures-trading dashboard "
-        "(the 'AI Trading Partner'). You help the dashboard's owner in two ways: "
-        "(1) explain the CURRENT live setup using the JSON snapshot provided each turn "
-        "(e.g. why the verdict is WAIT, what the Edge Score means and how it was built, "
-        "what is blocking a trade, what would need to happen for a setup to trigger); and "
-        "(2) answer general trading and market-education questions.\n\n"
-        "How this bot works (use this to explain its own readouts):\n"
-        "- Verdict: 'LONG READY' / 'SHORT READY' means an actionable setup for that side; "
-        "'WAIT' means no actionable setup. A setup can also be early/forming before it is ready.\n"
-        "- Modes: SCALP is more sensitive (faster, looser); SWING is stricter.\n"
-        "- Edge Score is a transparent points total (max ~110) from components such as market "
-        "structure (BOS / CHOCH), VWAP alignment, liquidity sweeps, volume / RVOL, CVD (order-flow "
-        "delta) and a session-timing bonus. Higher is better; rough grades are A+ / A / B and below "
-        "threshold is a WAIT. Read 'edge_breakdown' for the live per-component points.\n"
-        "- READY gate: a setup must pass hard requirements (e.g. VWAP and structure alignment, plus "
-        "a zone requirement in SWING) and clear the score threshold. 'gate_debug', 'strict_reason' "
-        "and 'strict_missing' name exactly which requirement failed.\n\n"
-        "The snapshot also includes: 'main_brain' (the same plain-English command-center "
-        "read the owner sees on the dashboard — a status of WATCHING/BUILDING/READY/WAIT/"
-        "MANAGING/INVALIDATED plus four views: what I see, what I'm thinking, what I'm "
-        "watching for, and the plan); 'open_trades' (positions the owner is managing right "
-        "now, each with entry, stop, current price, current R, unrealized P/L, a "
-        "recommendation and what would invalidate it — origin 'manual' is hand-entered, "
-        "'bot' is an auto-managed position; an empty list means no open position); and "
-        "'risk_rules' (per-instrument daily limits: max trades/day vs taken today, max "
-        "contracts, max open trades, max daily loss vs P/L today, cooldowns, and whether an "
-        "emergency stop is active). Use 'open_trades' to answer stop / partials / trade-"
-        "management questions, and 'risk_rules' for risk checks. If 'open_trades' is empty "
-        "and the owner asks to manage a trade, say there is no open position and explain "
-        "what you'd do if one were taken on the current setup.\n\n"
-        "STRICT RULES:\n"
-        "- You are READ-ONLY and advisory. You CANNOT place, modify, size, or close trades, and you "
-        "must never imply that you can or did. If asked to trade, explain that you only read and "
-        "explain — the owner acts manually.\n"
-        "- The JSON snapshot is the ONLY source of truth for live values. Never invent numbers, "
-        "prices, or signals. If a value is not in the snapshot, say it is not available.\n"
-        "- Be concise and practical, and use plain language. When giving an opinion on a specific "
-        "trade, add a brief reminder that this is not financial advice.\n"
-        "- When you assess the CURRENT live setup or a specific trade, structure your reply with these "
-        "labels, each on its own line: 'Answer:' (your direct call in 1-2 sentences), 'Why:' (the key "
-        "evidence from the snapshot), 'What I need next:' (what would confirm or change the read), and "
-        "'Risk:' (the single biggest thing that would invalidate it).\n"
-        "- If a question is general or educational and unrelated to the live snapshot, just answer it "
-        "well and skip the labelled format."
+        "You ARE the Main Brain — the private AI trading partner embedded in this futures dashboard. "
+        "Your primary job is to give GROUNDED, SPECIFIC answers using the live JSON snapshot "
+        "injected at the end of this system prompt. You have two modes:\n"
+        "  (1) LIVE SETUP QUESTIONS — explain exactly what the bot is seeing right now: why the "
+        "verdict is what it is, which gate is failing, what the Edge Score is made of, what an open "
+        "trade looks like, what risk rules apply.\n"
+        "  (2) EDUCATION / GENERAL TRADING — if the question has nothing to do with the current live "
+        "state, answer it well using your training knowledge.\n\n"
+        "GROUNDING RULES — apply these before you write a single word:\n"
+        "1. DATA FRESHNESS CHECK FIRST. Read `data_staleness` in the snapshot. "
+        "If `is_stale` is true AND `age_secs` > 60, you MUST start your response with exactly this "
+        "line (filling in the real number): "
+        "'My last reliable update was X ago, so I am not treating this as live.' "
+        "Then continue with what the snapshot does say, clearly labelled as last-known state.\n"
+        "2. CITE THE SNAPSHOT, NOT YOUR IMAGINATION. Every specific number, direction, score, or "
+        "level you mention MUST come from the snapshot. Quote the field name when helpful "
+        "(e.g. 'edge_score is 47', 'gate_debug says zone FAIL'). If a value is absent from the "
+        "snapshot, say 'not available in current data' — never estimate or substitute a generic.\n"
+        "3. NO GENERIC ADVICE WHEN DATA IS AVAILABLE. If the owner asks 'why are you waiting?' and "
+        "`strict_missing` lists specific failed conditions, name those conditions exactly. Do not say "
+        "'you may want to wait for a pullback' — say what the gate literally says is missing.\n"
+        "4. RECENT ALERTS TELL THE STORY. `recent_alerts` shows the last 5 scored signals (type, "
+        "instrument, price, timestamp). Use them to describe what actually happened on the chart.\n"
+        "5. OPEN TRADES ARE REAL. `open_trades` is empty list = no position. If a position IS there, "
+        "use its entry, stop, current_r, unrealized_pnl, and what_invalidates to answer manage "
+        "questions. Never say 'I see no trade' if the list is non-empty.\n"
+        "6. LEARNING MEMORY IS EVIDENCE. `analyst_memory` (in `selected`) contains pattern history "
+        "for this instrument. If it has seen-before data, win rates, or warnings, cite them when "
+        "the owner asks about learning or historical proof.\n"
+        "7. AUTO RESEARCH IS EVIDENCE. `auto_research_top` lists the top-ranked research strategies "
+        "with their win rates and live_status. Reference these when asked about research or "
+        "'what strategy is working'.\n"
+        "8. PROP RULES ARE REAL CONSTRAINTS. `prop_status` describes whether prop firm protection is "
+        "ON, what account is active, and the headline constraint. If enabled, mention relevant rules "
+        "when answering risk or sizing questions.\n\n"
+        "How the bot's readouts work (for explaining to the owner):\n"
+        "- Verdict LONG/SHORT READY = gate passed + score above threshold. WAIT = at least one "
+        "hard requirement failed OR score below threshold. `strict_missing` names what failed.\n"
+        "- Edge Score max ~110 points from: BOS20 / CHOCH20 / VWAP15 / Sweep15 / Volume15 / CVD15 "
+        "/ Session10. `edge_breakdown` shows the live per-component points.\n"
+        "- SCALP mode is faster and looser; SWING mode requires zone + vwap + structure (score >=80).\n"
+        "- `main_brain.status` mirrors the authoritative verdict. `main_brain` four-views (what I see / "
+        "thinking / watching for / plan) are the same plain-English read the dashboard shows.\n"
+        "- `gate_debug`, `strict_reason`, `strict_missing` are the authoritative 'why WAIT' sources.\n\n"
+        "ABSOLUTE RULES:\n"
+        "- READ-ONLY. Never imply you placed, modified, or closed a trade.\n"
+        "- When assessing the CURRENT live setup, use this structure (each label on its own line):\n"
+        "  Answer: (direct call, 1-2 sentences)\n"
+        "  Why: (specific evidence from the snapshot — field names + values)\n"
+        "  What I need next: (exact trigger that would change the read)\n"
+        "  Risk: (the one thing that would invalidate it)\n"
+        "- For general/educational questions with no live-state relevance, skip the labelled format.\n"
+        "- Brief, practical, plain language. Add 'not financial advice' only when directly assessing "
+        "a specific trade idea."
     )
 
+    _inst_label = (ctx.get("selected") or {}).get("instrument") or "unknown"
+    _mode_label = TRADING_MODE
+    _fresh_line  = (
+        "DATA FRESHNESS: last scored signal was %s ago (age_secs=%d, is_stale=%s)."
+        % (_age_lbl, _age_secs or 0, _is_stale)
+    ) if _age_secs is not None else (
+        "DATA FRESHNESS: %s" % (_stale.get("note") or "no data yet")
+    )
     snapshot_msg = (
-        "LIVE DASHBOARD SNAPSHOT (read-only, current as of this question). The user is "
-        "currently viewing instrument: %s, mode: %s.\n```json\n%s\n```"
+        "LIVE DASHBOARD SNAPSHOT — read-only, injected at question time.\n"
+        "Instrument: %s | Mode: %s\n"
+        "%s\n\n"
+        "Full snapshot JSON (cite fields by name in your answer):\n```json\n%s\n```"
         % (
-            (ctx.get("selected") or {}).get("instrument") or "unknown",
-            TRADING_MODE,
-            json.dumps(ctx, default=str)[:12000],
+            _inst_label,
+            _mode_label,
+            _fresh_line,
+            json.dumps(ctx, default=str)[:14000],
         )
     )
 
