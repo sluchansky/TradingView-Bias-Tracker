@@ -1,0 +1,53 @@
+Refine the current AI Trading Partner screen.
+
+The face is now more recognizable, which is good, but it went too far toward a realistic human headshot. It should NOT look like a real person, stock photo, or normal human avatar.
+
+Change the avatar into a futuristic AI trading entity:
+- semi-human, not fully human
+- holographic / neural / synthetic
+- blue glowing accents
+- subtle particle structure
+- visible intelligence and emotion
+- clear face shape, but not photorealistic
+- no realistic skin texture
+- no normal portrait lighting
+- no stock-photo look
+
+Keep:
+- clear eyes
+- clear face silhouette
+- calm focused expression
+- professional trading assistant feel
+
+Add back:
+- subtle neural mesh lines
+- particle glow around the face
+- blue data-light accents
+- animated pulse
+- state-based expressions
+
+Avatar states:
+- WAIT = calm, dim, patient
+- READY LONG = brighter eyes, alert
+- READY SHORT = sharper, more intense
+- NO EDGE = quiet, low-energy
+- TRADE ACTIVE = focused, locked-in
+
+Important:
+The avatar should feel like the AI’s identity, not a random man’s face.
+
+Layout fixes:
+1. Stop making the page feel like three separate dashboards.
+2. Remove or collapse the left and right clutter panels unless they are inside an evidence drawer.
+3. The center Main Brain should be the dominant focus.
+4. The face, verdict, message, evidence, and action buttons should all belong to one unified MainBrainCommandCenter.
+5. Make the spoken message larger and easier to read.
+6. Make WAIT / symbol / edge score larger.
+7. Reduce the massive empty chart space unless the chart is actually loaded and useful.
+8. Do not use visible scrollbars inside small side panels unless absolutely necessary.
+9. Keep the evidence available, but put it in a clean Evidence Snapshot or drawer.
+10. Preserve all backend logic, alerts, Discord, TradersPost, journal, voice, and market data behavior.
+
+The final design should feel like:
+a futuristic AI trading cockpit with one central synthetic intelligence,
+not a normal dashboard with a human profile picture.
