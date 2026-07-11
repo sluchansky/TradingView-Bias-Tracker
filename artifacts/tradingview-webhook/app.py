@@ -15920,6 +15920,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "disclaimer":        _MAIN_BRAIN_DISCLAIMER,
         "observations":      [],
         "synthesis":         None,
+        "conflict_resolver": None,
         "reason":            reason,
     }
 
@@ -16901,6 +16902,343 @@ def _mb_synthesis_report(result, observations):
         return _mb_synthesis_neutral("Synthesis error: %s" % exc)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BRAIN CONFLICT RESOLVER — priority-ordered conflict analysis (DISPLAY-ONLY)
+#
+# Checks 10 priority layers in strict order. Hard vetoes immediately produce a
+# BLOCK verdict. Soft disagreements accumulate confidence penalties — they reduce
+# confidence or produce WAIT, but never split the conclusion into competing
+# alternatives. Pure reads from the assembled result dict; each layer is
+# individually guarded so one bad key never cascades. Fail-open throughout.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bcr_neutral(reason="Conflict resolver unavailable."):
+    """Stable neutral schema — used as the fail-open fallback."""
+    return {
+        "available":          False,
+        "verdict":            "ALLOW",
+        "hard_vetoes":        [],
+        "soft_disagreements": [],
+        "confidence_adj":     0.0,
+        "priority_trace":     [],
+        "reason":             reason,
+    }
+
+
+def compute_brain_conflict_resolver(result):
+    """Priority-ordered conflict resolver for the Main Brain (DISPLAY-ONLY).
+
+    Ten priority layers checked in strict order:
+      1  Data freshness        — stale VWAP / market data  → hard veto
+      2  Market-open status    — closed market             → no-trade (soft WAIT)
+      3  Broker / exec health  — live mode unreachable     → hard veto
+      4  Risk veto             — kill switch / loss limit  → hard veto
+      5  Prop-rule veto        — prop account misconfigured→ hard veto
+      6  Open-position state   — invalid position          → hard veto
+      7  Learning eligibility  — GHOST_ONLY instrument     → hard veto
+      8  Mode-specific rules   — strategy-engine gate      → soft WAIT
+      9  Market evidence       — CVD vs structure / LTF vs HTF → soft penalty
+     10  Research suggestions  — SCALP vs MICRO_SCALP dir → soft penalty
+
+    Soft disagreements reduce confidence (confidence_adj < 0) or produce WAIT
+    when they exceed the 30-pt threshold. They never create competing conclusions.
+    Hard vetoes drive a BLOCK; the highest-priority (lowest number) veto wins.
+
+    Never touches gate / sizing / dedupe / money path. Never raises."""
+    try:
+        hard_vetoes        = []
+        soft_disagreements = []
+        confidence_penalty = 0.0
+        priority_trace     = []
+
+        def _layer(priority, key, passed, veto_type=None, reason="", penalty=0.0):
+            """Append one layer to the trace; accumulate vetoes / penalties."""
+            entry = {"priority": priority, "layer": key,
+                     "passed": bool(passed), "reason": reason}
+            if not passed:
+                if veto_type == "hard":
+                    entry["veto_type"] = "hard"
+                    hard_vetoes.append({"priority": priority,
+                                        "layer": key, "reason": reason})
+                elif veto_type == "soft":
+                    entry["veto_type"] = "soft"
+                    entry["penalty"]   = penalty
+                    soft_disagreements.append({"priority": priority, "layer": key,
+                                               "reason": reason, "penalty": penalty})
+            priority_trace.append(entry)
+
+        inst = str(result.get("active_ticker") or result.get("instrument") or "")
+
+        # ── Priority 1: Data freshness ─────────────────────────────────────────
+        try:
+            vwap_status = str(result.get("vwap_status") or "").lower()
+            vwap_val    = result.get("vwap_value")
+            stale = "stale" in vwap_status or "unavailable" in vwap_status
+            if not stale and vwap_val is None:
+                stale = True
+            md = result.get("market_data") or {}
+            if isinstance(md, dict) and md.get("stale"):
+                stale = True
+            _layer(1, "data_freshness", not stale,
+                   veto_type="hard" if stale else None,
+                   reason=("Critical data is stale or unavailable — cannot assess setup."
+                           if stale else "Data fresh."))
+        except Exception:
+            _layer(1, "data_freshness", True, reason="Freshness check skipped (non-fatal).")
+
+        # ── Priority 2: Market-open status ────────────────────────────────────
+        try:
+            mkt_open = bool(result.get("market_open", True))
+            _layer(2, "market_open", mkt_open,
+                   reason=("Market is closed — no new entries." if not mkt_open
+                           else "Market is open."))
+        except Exception:
+            _layer(2, "market_open", True, reason="Market status check skipped.")
+
+        # ── Priority 3: Broker and execution health ───────────────────────────
+        try:
+            exec_mode    = str(result.get("execution_mode") or "").lower()
+            exec_enabled = result.get("execution_enabled", True)
+            exec_live    = result.get("execution_live", True)
+            live_modes   = ("traderspost", "pickmytrade")
+            broker_ok    = True
+            broker_reason = "Execution healthy (%s)." % (exec_mode or "manual_only")
+            if exec_mode in live_modes and exec_enabled and not exec_live:
+                broker_ok     = False
+                broker_reason = ("Broker mode is '%s' but live execution is not "
+                                 "reachable — no orders can be sent." % exec_mode)
+            _layer(3, "broker_health", broker_ok,
+                   veto_type="hard" if not broker_ok else None,
+                   reason=broker_reason)
+        except Exception:
+            _layer(3, "broker_health", True, reason="Broker health check skipped.")
+
+        # ── Priority 4: Risk veto ─────────────────────────────────────────────
+        try:
+            risk_block  = False
+            risk_reason = "Risk within limits."
+            try:
+                sc = get_safety_cfg(inst)
+                if isinstance(sc, dict) and sc.get("kill_switch"):
+                    risk_block  = True
+                    risk_reason = "Kill switch is active — all execution halted."
+            except Exception:
+                pass
+            if not risk_block:
+                l_ok = result.get("longs_allowed", True)
+                s_ok = result.get("shorts_allowed", True)
+                if l_ok is False and s_ok is False:
+                    risk_block  = True
+                    risk_reason = ("Both directions are blocked — daily risk limit "
+                                   "likely reached.")
+            _layer(4, "risk_veto", not risk_block,
+                   veto_type="hard" if risk_block else None,
+                   reason=risk_reason)
+        except Exception:
+            _layer(4, "risk_veto", True, reason="Risk check skipped.")
+
+        # ── Priority 5: Prop-rule veto ────────────────────────────────────────
+        try:
+            prop         = result.get("prop_firm") or {}
+            prop_enabled = isinstance(prop, dict) and bool(prop.get("enabled"))
+            prop_blocked = False
+            prop_reason  = ("Prop rules satisfied (protection %s)."
+                            % ("active" if prop_enabled else "off"))
+            if prop_enabled:
+                aid   = prop.get("active_id")
+                accts = prop.get("accounts") or []
+                if aid and accts:
+                    active = next((a for a in accts if a.get("id") == aid), None)
+                    if active is None:
+                        prop_blocked = True
+                        prop_reason  = ("Prop active account '%s' not found in "
+                                        "account list." % aid)
+            _layer(5, "prop_veto", not prop_blocked,
+                   veto_type="hard" if prop_blocked else None,
+                   reason=prop_reason)
+        except Exception:
+            _layer(5, "prop_veto", True, reason="Prop check skipped.")
+
+        # ── Priority 6: Open-position management ──────────────────────────────
+        try:
+            pos        = result.get("active_trade") or result.get("managed_trade")
+            pos_bad    = False
+            pos_reason = "No open position conflicts."
+            if isinstance(pos, dict):
+                ps = str(pos.get("status") or "open").lower()
+                if ps in ("error", "invalid", "orphaned"):
+                    pos_bad    = True
+                    pos_reason = ("Open position is in an invalid state (%s) — "
+                                  "manual review required." % ps)
+                else:
+                    pos_reason = "Open position tracked normally (status: %s)." % ps
+            _layer(6, "position_state", not pos_bad,
+                   veto_type="hard" if pos_bad else None,
+                   reason=pos_reason)
+        except Exception:
+            _layer(6, "position_state", True, reason="Position state check skipped.")
+
+        # ── Priority 7: Learning eligibility ──────────────────────────────────
+        try:
+            lre        = result.get("learning_rule_engine") or {}
+            ghost_only = False
+            lre_reason = "Learning rule engine not active — no eligibility constraint."
+            if isinstance(lre, dict) and lre.get("enabled"):
+                instruments_map = lre.get("instruments") or {}
+                inst_data       = instruments_map.get(inst) or {}
+                inst_status     = inst_data.get("status", "GHOST_ONLY")
+                disabled        = inst_data.get("disabled_setups") or []
+                rule_triggered  = str(inst_data.get("rule_triggered") or "")
+                if inst_status == "GHOST_ONLY":
+                    ghost_only = True
+                    lre_reason = ("Setup historically disabled for live execution "
+                                  "on %s: %s." % (
+                                      inst or "this instrument",
+                                      rule_triggered or "insufficient sample size"))
+                elif disabled:
+                    ghost_only = True
+                    lre_reason = ("Some setups disabled on %s: %s." % (
+                        inst, ", ".join(str(d) for d in disabled[:3])))
+                else:
+                    lre_reason = ("Learning rule engine: %s is LIVE_ELIGIBLE." % inst)
+            _layer(7, "learning_eligibility", not ghost_only,
+                   veto_type="hard" if ghost_only else None,
+                   reason=lre_reason)
+        except Exception:
+            _layer(7, "learning_eligibility", True,
+                   reason="Learning eligibility check skipped.")
+
+        # ── Priority 8: Mode-specific setup rules ─────────────────────────────
+        # Not a hard veto — an incomplete mode setup produces WAIT, not BLOCK.
+        try:
+            se          = result.get("strategy_engine") or {}
+            mode_ok     = True
+            mode_reason = "Mode-specific setup rules satisfied."
+            if isinstance(se, dict) and se.get("enabled") and se.get("ready") is False:
+                missing = [str(m) for m in (se.get("missing") or [])[:3] if m]
+                if missing:
+                    mode_ok     = False
+                    mode_reason = "Mode gate not met: %s." % "; ".join(missing)
+                else:
+                    mode_ok     = False
+                    mode_reason = "Mode-specific setup requirements not met."
+            _layer(8, "mode_setup_rules", mode_ok,
+                   reason=mode_reason)
+        except Exception:
+            _layer(8, "mode_setup_rules", True, reason="Mode rules check skipped.")
+
+        # ── Priority 9: Market evidence (soft disagreements) ──────────────────
+        try:
+            cvd_dir  = str(result.get("cvd_direction") or
+                           result.get("cvd_state") or "").lower()
+            strict_d = str(result.get("strict_direction") or "").lower()
+
+            # 9a. CVD vs structure conflict
+            cvd_norm = ("long"  if "bull" in cvd_dir else
+                        "short" if "bear" in cvd_dir else None)
+            if cvd_norm and strict_d in ("long", "short"):
+                if cvd_norm != strict_d:
+                    _layer(9, "cvd_vs_structure", False, veto_type="soft",
+                           reason=("CVD is %s but structure favors %s — "
+                                   "order flow / structure conflict." % (
+                                       cvd_dir, strict_d)),
+                           penalty=15.0)
+                else:
+                    _layer(9, "cvd_vs_structure", True,
+                           reason="CVD and structure agree (%s)." % strict_d)
+            else:
+                _layer(9, "cvd_vs_structure", True,
+                       reason="CVD alignment check skipped (insufficient data).")
+
+            # 9b. LTF vs HTF directional conflict (via analyst context)
+            htf_ctx  = ((result.get("analyst") or {}).get("context") or {})
+            htf_bias = str(htf_ctx.get("htf_bias") or "").lower()
+            htf_norm = ("long"  if "bull" in htf_bias else
+                        "short" if "bear" in htf_bias else None)
+            if htf_norm and strict_d in ("long", "short") and htf_norm != strict_d:
+                _layer(9, "ltf_vs_htf", False, veto_type="soft",
+                       reason=("Setup is %s but higher-timeframe bias is %s — "
+                               "fighting the trend." % (strict_d, htf_bias)),
+                       penalty=20.0)
+            else:
+                _layer(9, "ltf_vs_htf", True,
+                       reason="LTF/HTF alignment: %s / %s." % (
+                           strict_d or "none", htf_norm or "none"))
+        except Exception:
+            _layer(9, "market_evidence", True, reason="Market evidence check skipped.")
+
+        # ── Priority 10: Research suggestions (soft) ──────────────────────────
+        try:
+            if TRADING_MODE == "MICRO_SCALP":
+                ms_dirn = strict_d if "strict_d" in dir() else str(
+                    result.get("strict_direction") or "").lower()
+                dual    = result.get("dual_tf") or {}
+                sc_bias = str(
+                    dual.get("bias") or dual.get("scalp_direction") or "").lower()
+                if (ms_dirn and sc_bias and
+                        ms_dirn != sc_bias and
+                        sc_bias not in ("", "neutral", "none")):
+                    _layer(10, "scalp_vs_micro_conflict", False, veto_type="soft",
+                           reason=("Micro Scalp prefers %s but broader Scalp "
+                                   "framework leans %s." % (ms_dirn, sc_bias)),
+                           penalty=10.0)
+                else:
+                    _layer(10, "scalp_vs_micro_conflict", True,
+                           reason="Scalp and Micro Scalp directional agreement "
+                                  "(%s)." % (ms_dirn or "undetermined"))
+            else:
+                _layer(10, "research_suggestions", True,
+                       reason="Research layer: no cross-mode conflict in "
+                              "%s mode." % TRADING_MODE)
+        except Exception:
+            _layer(10, "research_suggestions", True,
+                   reason="Research suggestions check skipped.")
+
+        # ── Final verdict ──────────────────────────────────────────────────────
+        # Hard vetoes: the highest-priority (lowest priority number) hard veto wins.
+        # Soft disagreements: accumulated penalty → WAIT at >= 30 pts, else ALLOW
+        # with confidence_adj reflecting the total reduction.
+        if hard_vetoes:
+            top       = min(hard_vetoes, key=lambda v: v["priority"])
+            verdict   = "BLOCK"
+            final_rsn = ("Hard veto at priority %d [%s]: %s" % (
+                top["priority"], top["layer"], top["reason"]))
+        elif soft_disagreements:
+            total_penalty      = sum(d.get("penalty", 0.0)
+                                     for d in soft_disagreements)
+            confidence_penalty = round(total_penalty, 1)
+            mkt_open           = bool(result.get("market_open", True))
+            if confidence_penalty >= 30.0 or not mkt_open:
+                verdict   = "WAIT"
+                final_rsn = ("Soft disagreements exceed confidence threshold "
+                             "(%.0f pts penalty) — WAIT for alignment."
+                             % total_penalty)
+            else:
+                verdict   = "ALLOW"
+                final_rsn = ("Soft disagreements noted; confidence reduced by "
+                             "%.0f pts — proceed with caution." % total_penalty)
+        else:
+            confidence_penalty = 0.0
+            verdict   = "ALLOW"
+            final_rsn = "All priority layers passed — no conflicts detected."
+
+        return {
+            "available":          True,
+            "verdict":            verdict,
+            "hard_vetoes":        hard_vetoes,
+            "soft_disagreements": soft_disagreements,
+            "confidence_adj":     -round(confidence_penalty, 1),
+            "priority_trace":     priority_trace,
+            "reason":             final_rsn,
+        }
+    except Exception as exc:
+        try:
+            logger.debug("brain_conflict_resolver error (non-fatal): %s", exc)
+        except Exception:
+            pass
+        return _bcr_neutral("Conflict resolver error: %s" % exc)
+
+
 def _mb_reconcile(observations, result):
     """Weighted vote across all engine observations -> ONE recommendation + ONE narrative.
     Stored at result['main_brain']['unified']. DISPLAY-ONLY; fail-open."""
@@ -17382,6 +17720,10 @@ def compute_main_brain(result):
                 result, mb_out.get("observations") or [])
         except Exception:
             mb_out["synthesis"] = _mb_synthesis_neutral("Synthesis unavailable.")
+        try:
+            mb_out["conflict_resolver"] = compute_brain_conflict_resolver(result)
+        except Exception:
+            mb_out["conflict_resolver"] = _bcr_neutral("Conflict resolver unavailable.")
         return mb_out
     except Exception as exc:
         try:
