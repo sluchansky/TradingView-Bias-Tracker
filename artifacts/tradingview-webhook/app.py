@@ -15921,6 +15921,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "observations":      [],
         "synthesis":         None,
         "conflict_resolver": None,
+        "verdict_board":     None,
         "reason":            reason,
     }
 
@@ -17239,6 +17240,401 @@ def compute_brain_conflict_resolver(result):
         return _bcr_neutral("Conflict resolver error: %s" % exc)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# VERDICT BOARD — every important fact in one of four plain-English buckets
+#
+# The operator should never need to combine two panels to understand the
+# decision. compute_verdict_board() reads observations from the structured bus,
+# hard vetoes from the conflict resolver, gate signals from result, and
+# expresses every measurement as one of:
+#   supports  — evidence for the trade
+#   opposes   — evidence against the trade
+#   missing   — condition not yet present
+#   vetoes    — hard block (entry cannot happen regardless of signals)
+#
+# Every item is a single plain-English sentence. DISPLAY-ONLY; fail-open per
+# section; never touches gate / sizing / dedupe / money path.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _vb_neutral(reason="Verdict board unavailable."):
+    """Stable neutral schema — fail-open fallback."""
+    return {
+        "available":  False,
+        "supports":   [],
+        "opposes":    [],
+        "missing":    [],
+        "vetoes":     [],
+        "direction":  None,
+        "summary":    reason,
+        "reason":     reason,
+    }
+
+
+def compute_verdict_board(result, observations=None, conflict_resolver=None):
+    """Classify every important measurement into one of four plain-English buckets.
+
+    Supports   — evidence that favors entering this trade right now.
+    Opposes    — evidence working against this trade.
+    Missing    — conditions not yet present that would tip the balance.
+    Vetoes     — hard blocks; entry cannot happen regardless of other signals.
+
+    The direction of the current setup (long / short) is used to classify
+    directional signals — e.g. a bullish CVD supports a long and opposes a
+    short. When direction is unknown every directional signal becomes Missing.
+
+    DISPLAY-ONLY; fail-open per section; never touches money path. Never raises.
+    """
+    try:
+        supports  = []
+        opposes   = []
+        missing   = []
+        vetoes    = []
+
+        direction = str(result.get("strict_direction") or "").lower()
+        is_long   = (direction == "long")
+        is_short  = (direction == "short")
+        dir_known = (direction in ("long", "short"))
+
+        def _dir(long_favored, long_text, short_text, neutral_text=None):
+            """Classify one directional measurement into the right bucket."""
+            if not dir_known:
+                missing.append(neutral_text or long_text)
+                return
+            if long_favored:
+                (supports if is_long  else opposes).append(
+                    long_text  if is_long  else short_text)
+            else:
+                (supports if is_short else opposes).append(
+                    short_text if is_short else long_text)
+
+        # ── Section 1: Hard vetoes from the conflict resolver ─────────────────
+        try:
+            cr = conflict_resolver or {}
+            for hv in (cr.get("hard_vetoes") or []):
+                r = str(hv.get("reason") or "A hard condition blocks this setup.")
+                vetoes.append(r)
+        except Exception:
+            pass
+
+        # ── Section 2: Edge score (the single most important gate number) ─────
+        try:
+            edge     = float(result.get("edge_score") or 0)
+            thr      = float(EDGE_READY_THRESHOLD)
+            edge_max = float(EDGE_SCORE_MAX)
+            needed   = max(0, int(thr - edge))
+            if edge >= thr:
+                supports.append(
+                    "Edge score is %d/%d — the entry threshold of %d has been cleared."
+                    % (int(edge), int(edge_max), int(thr)))
+            elif edge >= thr * 0.65:
+                missing.append(
+                    "Edge score is %d/%d — %d more points needed to reach the entry "
+                    "threshold of %d."
+                    % (int(edge), int(edge_max), needed, int(thr)))
+            else:
+                opposes.append(
+                    "Edge score is %d/%d — well below the %d-point threshold. Multiple "
+                    "confirmations are absent."
+                    % (int(edge), int(edge_max), int(thr)))
+        except Exception:
+            pass
+
+        # ── Section 3: Classify specialist observations ───────────────────────
+        # Each observation emits one sentence into exactly one bucket.
+        try:
+            for obs in (observations or []):
+                code = str(obs.get("observation") or "").lower()
+                src  = str(obs.get("source")      or "")
+
+                # ── market_intelligence ───────────────────────────────────────
+                if src == "market_intelligence":
+                    if code == "trending_bullish":
+                        _dir(True,
+                             "Market regime is bullish — aligns with the long setup.",
+                             "Market regime is bullish — works against the short.")
+                    elif code == "trending_bearish":
+                        _dir(False,
+                             "Market regime is bearish — works against the long.",
+                             "Market regime is bearish — aligns with the short setup.")
+                    elif code == "ranging":
+                        missing.append(
+                            "Market is ranging without a clear trend — directional "
+                            "bias is not yet established.")
+
+                # ── strategy_engine ───────────────────────────────────────────
+                elif src == "strategy_engine":
+                    if code == "strategy_ready_long":
+                        _dir(True,
+                             "Strategy engine has a complete long setup ready.",
+                             "Strategy engine is set up long — conflicts with the "
+                             "current short.")
+                    elif code == "strategy_ready_short":
+                        _dir(False,
+                             "Strategy engine is set up short — conflicts with the "
+                             "current long.",
+                             "Strategy engine has a complete short setup ready.")
+                    elif code == "strategy_forming":
+                        missing.append(
+                            "A strategy pattern is forming but has not yet completed "
+                            "all its conditions.")
+                    elif code == "no_strategy":
+                        missing.append(
+                            "No active strategy pattern detected at current price.")
+
+                # ── stalk_mode ────────────────────────────────────────────────
+                elif src == "stalk_mode":
+                    if code == "stalking_long":
+                        _dir(True,
+                             "System is actively stalking for a long entry.",
+                             "System is stalking long — opposite to the current "
+                             "short bias.")
+                    elif code == "stalking_short":
+                        _dir(False,
+                             "System is stalking short — opposite to the current "
+                             "long bias.",
+                             "System is actively stalking for a short entry.")
+                    elif code == "engine_entering":
+                        supports.append(
+                            "Entry trigger just fired — the system is entering now.")
+                    elif code == "idle":
+                        missing.append(
+                            "System is idle — no setup is actively being stalked.")
+                    # in_trade / market_closed handled by other sections
+
+                # ── breakout_mode ─────────────────────────────────────────────
+                elif src == "breakout_mode":
+                    if code == "breakout_long":
+                        _dir(True,
+                             "Opening-range breakout signal is long.",
+                             "Opening-range breakout is long — conflicts with the "
+                             "short.")
+                    elif code == "sweep_reversal_long":
+                        _dir(True,
+                             "Sweep-reversal breakout signal is long.",
+                             "Sweep-reversal is long — conflicts with the short.")
+                    elif code == "breakout_short":
+                        _dir(False,
+                             "Opening-range breakout is short — conflicts with the "
+                             "long.",
+                             "Opening-range breakout signal is short.")
+                    elif code == "sweep_reversal_short":
+                        _dir(False,
+                             "Sweep-reversal is short — conflicts with the long.",
+                             "Sweep-reversal breakout signal is short.")
+                    elif code == "building_range":
+                        missing.append(
+                            "Opening range is still building — no breakout signal "
+                            "has printed yet.")
+                    # watching / off: not surfaced (breakout mode passive)
+
+                # ── entry_quality ─────────────────────────────────────────────
+                elif src == "entry_quality":
+                    if code == "clean_location":
+                        supports.append(
+                            "Entry location is ideal — price is at a key level with "
+                            "strong risk/reward.")
+                    elif code == "good_location":
+                        supports.append(
+                            "Entry location is good — price has a solid setup point.")
+                    elif code == "poor_location":
+                        opposes.append(
+                            "Entry location is poor — price is in the middle of "
+                            "range with limited reward potential.")
+                    elif code == "chasing":
+                        opposes.append(
+                            "Entry would be chasing — price has already extended "
+                            "significantly from the ideal entry point.")
+
+                # ── analyst_reasoning ─────────────────────────────────────────
+                elif src == "analyst_reasoning":
+                    if code == "bullish_thesis":
+                        _dir(True,
+                             "Analyst reasoning confirms a bullish thesis.",
+                             "Analyst sees a bullish thesis — conflicts with the "
+                             "short.")
+                    elif code == "bearish_thesis":
+                        _dir(False,
+                             "Analyst sees a bearish thesis — conflicts with the "
+                             "long.",
+                             "Analyst reasoning confirms a bearish thesis.")
+                    elif code == "neutral_thesis":
+                        missing.append(
+                            "Analyst sees no clear directional edge — thesis is "
+                            "neutral.")
+                    elif code == "veto_active":
+                        opposes.append(
+                            "Analyst reasoning has rejected this setup.")
+
+                # ── trade_debate ──────────────────────────────────────────────
+                elif src == "trade_debate":
+                    if code == "decisive_bull":
+                        _dir(True,
+                             "Bull vs. Bear debate: bulls have the decisive edge.",
+                             "Bull vs. Bear debate leans bullish — conflicts with "
+                             "the short.")
+                    elif code == "decisive_bear":
+                        _dir(False,
+                             "Bull vs. Bear debate leans bearish — conflicts with "
+                             "the long.",
+                             "Bull vs. Bear debate: bears have the decisive edge.")
+                    elif code == "balanced":
+                        missing.append(
+                            "Bull vs. Bear debate is balanced — no clear winner yet.")
+                    elif code == "veto_active":
+                        opposes.append(
+                            "The trade debate judge has vetoed this setup.")
+
+                # ── pro_review ────────────────────────────────────────────────
+                elif src == "pro_review":
+                    if code == "grade_excellent":
+                        supports.append(
+                            "Professional review: A+ — this is a high-quality setup.")
+                    elif code == "grade_good":
+                        supports.append(
+                            "Professional review: A — setup meets professional "
+                            "entry criteria.")
+                    elif code == "grade_fair":
+                        missing.append(
+                            "Professional review: B — setup is marginal and not yet "
+                            "a high-conviction entry.")
+                    elif code == "grade_poor":
+                        opposes.append(
+                            "Professional review: failing grade — this setup does "
+                            "not meet the entry standard.")
+
+                # ── confidence_governor ───────────────────────────────────────
+                elif src == "confidence_governor":
+                    if code == "confidence_allow":
+                        supports.append(
+                            "Historical pattern: similar setups have performed well "
+                            "— confidence is high.")
+                    elif code == "confidence_caution":
+                        opposes.append(
+                            "Historical pattern: similar setups have needed caution "
+                            "— the edge here is marginal.")
+                    elif code == "confidence_block":
+                        vetoes.append(
+                            "Confidence governor is blocking this setup — the "
+                            "historical edge for this setup type is too poor to "
+                            "enter.")
+
+                # ── scalp_quality ─────────────────────────────────────────────
+                elif src == "scalp_quality":
+                    if code == "scalp_pass":
+                        supports.append(
+                            "Scalp quality check passed — intraday conditions meet "
+                            "the quality bar.")
+                    elif code == "scalp_caution":
+                        missing.append(
+                            "Scalp quality is borderline — one or more intraday "
+                            "filters are not fully met.")
+                    elif code == "scalp_fail":
+                        opposes.append(
+                            "Scalp quality check failed — intraday conditions do "
+                            "not support a clean entry right now.")
+
+                # ── liquidity_sweep_focus ─────────────────────────────────────
+                elif src == "liquidity_sweep_focus":
+                    if code == "sweep_confirmed":
+                        supports.append(
+                            "Liquidity sweep confirmed — trapped traders are fueling "
+                            "the move.")
+                    elif code == "sweep_forming":
+                        supports.append(
+                            "Liquidity sweep is forming — a potential reversal is "
+                            "building as stops are hunted.")
+                    elif code == "sweep_failed":
+                        opposes.append(
+                            "Liquidity sweep failed — institutional order flow did "
+                            "not follow through.")
+                    elif code == "continuation":
+                        supports.append(
+                            "Price is continuing through liquidity — momentum is "
+                            "genuine, not a fake-out.")
+                    elif code == "no_sweep":
+                        missing.append(
+                            "No liquidity sweep detected — the move lacks the "
+                            "stop-hunt catalyst typically seen before a strong move.")
+        except Exception:
+            pass
+
+        # ── Section 4: Soft disagreements from conflict resolver → Opposes ────
+        try:
+            cr = conflict_resolver or {}
+            for sd in (cr.get("soft_disagreements") or []):
+                r = str(sd.get("reason") or "")
+                if r:
+                    opposes.append(r)
+        except Exception:
+            pass
+
+        # ── Section 5: Gate waiting reason → Missing ──────────────────────────
+        try:
+            verdict  = str(result.get("verdict") or "")
+            strict_r = str(result.get("strict_reason") or "")
+            if "READY" not in verdict.upper() and strict_r:
+                missing.append("Gate is waiting: %s" % strict_r)
+        except Exception:
+            pass
+
+        # ── Section 6: Market closed informational ────────────────────────────
+        try:
+            if result.get("market_open") is False:
+                already = any("closed" in v.lower() or "market" in v.lower()
+                              for v in vetoes)
+                if not already:
+                    missing.append(
+                        "Market is currently closed — signals will resume at "
+                        "the next open.")
+        except Exception:
+            pass
+
+        # ── Summary sentence ──────────────────────────────────────────────────
+        try:
+            nv = len(vetoes)
+            ns = len(supports)
+            no = len(opposes)
+            nm = len(missing)
+            if nv:
+                summary = ("%d hard veto%s block%s this trade."
+                           % (nv, "s" if nv > 1 else "",
+                              "" if nv > 1 else "s"))
+            elif ns == 0 and no == 0:
+                summary = ("%d condition%s still missing — gathering signals."
+                           % (nm, "s" if nm != 1 else ""))
+            elif no > ns:
+                summary = ("%d signal%s oppose this trade vs. %d in support."
+                           % (no, "s" if no != 1 else "", ns))
+            elif ns > 0 and no == 0 and nm == 0:
+                summary = ("All %d signal%s support this trade — no opposition."
+                           % (ns, "s" if ns != 1 else ""))
+            elif ns > 0 and no > 0:
+                summary = ("%d signal%s support, %d oppose, %d missing."
+                           % (ns, "s" if ns != 1 else "", no, nm))
+            else:
+                summary = ("%d supporting, %d opposing, %d missing."
+                           % (ns, no, nm))
+        except Exception:
+            summary = "Verdict board computed."
+
+        return {
+            "available":  True,
+            "supports":   supports,
+            "opposes":    opposes,
+            "missing":    missing,
+            "vetoes":     vetoes,
+            "direction":  direction or None,
+            "summary":    summary,
+            "reason":     "ok",
+        }
+    except Exception as exc:
+        try:
+            logger.debug("verdict_board error (non-fatal): %s", exc)
+        except Exception:
+            pass
+        return _vb_neutral("Verdict board error: %s" % exc)
+
+
 def _mb_reconcile(observations, result):
     """Weighted vote across all engine observations -> ONE recommendation + ONE narrative.
     Stored at result['main_brain']['unified']. DISPLAY-ONLY; fail-open."""
@@ -17724,6 +18120,13 @@ def compute_main_brain(result):
             mb_out["conflict_resolver"] = compute_brain_conflict_resolver(result)
         except Exception:
             mb_out["conflict_resolver"] = _bcr_neutral("Conflict resolver unavailable.")
+        try:
+            mb_out["verdict_board"] = compute_verdict_board(
+                result,
+                mb_out.get("observations") or [],
+                mb_out.get("conflict_resolver"))
+        except Exception:
+            mb_out["verdict_board"] = _vb_neutral("Verdict board unavailable.")
         return mb_out
     except Exception as exc:
         try:

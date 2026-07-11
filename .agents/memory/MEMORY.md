@@ -141,3 +141,4 @@
 - [Market Data Engine phases](market-data-engine.md) — Phase 1 done (ALERT-ONLY status panel + Phase 5 staleness gate default-OFF); Phase 2 = Databento (pip available, needs API key); Phases 3-5 follow.
 - [Cockpit Mode \n escape bug](cockpit-mode-escape-bug.md) — JS string literals in Python triple-quoted strings: `\n` (0x5C+0x6E in file) → real newline at Flask render time → JS SyntaxError; fix requires double-backslash `\\n` in source (use byte-level Python replace, NOT the edit tool).
 - [Brain Conflict Resolver](brain-conflict-resolver.md) — 10-priority display-only conflict engine; BLOCK on hard vetoes, WAIT/ALLOW on soft penalty accumulation; wired at mb_out["conflict_resolver"].
+- [Verdict Board](verdict-board.md) — 4-bucket plain-English classifier (supports/opposes/missing/vetoes); reads observations+BCR+result; mb_out["verdict_board"]; never feeds money path.
