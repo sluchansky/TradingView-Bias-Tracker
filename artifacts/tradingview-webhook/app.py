@@ -9092,8 +9092,9 @@ LEARNING_CONF_ADJ_CAP  = 15                         # max ± confidence points h
 LEARNING_SCORE_MAX_DELTA = 15                       # max ± Edge-Score points the learning weight may move the gate score (Task #18); hard-capped so learning can never overpower more than one major Edge component
 LEARNING_SNAPSHOT_MAX_AGE = 180                     # secs: entry snapshot considered "fresh"
 LAST_STRATEGY_SNAPSHOT_BY_INST = {}                 # inst -> entry-context snapshot (for trade tagging)
-STRATEGY_WEIGHTS       = {}                         # strategy_key -> weight (float)
-LEARNING_SAMPLE_BY_KEY = {}                         # strategy_key -> closed-trade count (int)
+STRATEGY_WEIGHTS       = {}                         # "{mode}::{strategy_key}" → weight (float); bare key as warm-up fallback
+LEARNING_SAMPLE_BY_KEY = {}                         # "{mode}::{strategy_key}" → closed-trade count (int)
+PER_MODE_STATS         = {}                         # mode key → per-mode aggregate stats (win_rate/avg_r/n/top_setup)
 LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total_trades": 0}
 # Learning Engine v2 (display-only) in-memory caches, warmed by _recompute_learning
 # (boot + every Nth close) under LEARNING_LOCK; NEVER read via per-request SQL.
@@ -10598,13 +10599,42 @@ def _learning_weight(win_rate, profit_factor, avg_r, n):
     return _c(1.0 + 0.35 * perf * sample, LEARNING_WEIGHT_FLOOR, LEARNING_WEIGHT_CEIL)
 
 
-def _strategy_weight_for(key):
-    """(weight, sample_size) for a strategy_key from the in-memory cache. Neutral
-    (1.0, 0) when unknown so callers never special-case 'no history'."""
+# ── Learning namespace helpers ─────────────────────────────────────────────
+# Used by every cache that must stay isolated per-mode (weights, eligibility).
+# SWING / SCALP / MICRO_SCALP results NEVER share a cache slot.
+_VALID_LEARNING_MODES = frozenset({"SWING", "SCALP", "MICRO_SCALP"})
+
+def _make_learning_ns(symbol, mode, setup_type, direction, session,
+                      vol_regime, struct_ctx, trigger):
+    """8-field composite namespace key stamped on every strategy_trades row.
+    Format: {symbol}::{mode}::{setup_type}::{direction}::{session}::{vol_regime}::{struct_ctx}::{trigger}
+    All fields normalised to UPPER_SNAKE_CASE; None/blank → UNKNOWN."""
+    def _s(v): return str(v or "UNKNOWN").strip().upper().replace(" ", "_")
+    return "%s::%s::%s::%s::%s::%s::%s::%s" % (
+        _s(symbol), _s(mode), _s(setup_type), _s(direction),
+        _s(session), _s(vol_regime), _s(struct_ctx), _s(trigger))
+
+def _ns_learning_key(base_key, mode):
+    """Namespace a cache key as '{mode}::{base_key}'.
+    Returns bare key when mode is absent/unrecognised so warm-up lookups
+    still hit the pre-namespace weights during the first recompute cycle."""
+    if not base_key:
+        return base_key
+    if mode and mode in _VALID_LEARNING_MODES:
+        return "%s::%s" % (mode, base_key)
+    return base_key
+
+
+def _strategy_weight_for(key, mode=None):
+    """(weight, sample_size) for a strategy_key — mode-namespaced key tried first,
+    bare key as warm-up fallback. Neutral (1.0, 0) when missing; NEVER 0."""
     if not key:
         return (1.0, 0)
+    ns = _ns_learning_key(key, mode)
     with LEARNING_LOCK:
-        return (STRATEGY_WEIGHTS.get(key, 1.0), LEARNING_SAMPLE_BY_KEY.get(key, 0))
+        w = STRATEGY_WEIGHTS.get(ns, STRATEGY_WEIGHTS.get(key, 1.0))
+        n = LEARNING_SAMPLE_BY_KEY.get(ns, LEARNING_SAMPLE_BY_KEY.get(key, 0))
+    return (w, n)
 
 
 def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_status, volatility):
@@ -10632,7 +10662,7 @@ def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_st
         direction = engine.get("direction")
         if not key or direction not in ("Long", "Short"):
             return None
-        weight, sample = _strategy_weight_for(key)
+        weight, sample = _strategy_weight_for(key, mode=TRADING_MODE)
         if sample < LEARNING_MIN_SAMPLE:
             return None
         infl = {"Long":  {"weight": None, "strategy_key": None, "sample": 0},
@@ -10892,6 +10922,23 @@ def _record_strategy_trade(mt):
             trade_label = _derive_trade_label(mt, ctx)
         except Exception:
             trade_label = None
+        # ── 8-field learning namespace key (enforces SWING/SCALP/MICRO_SCALP isolation) ──
+        try:
+            _ctx_sk      = ctx.get("strategy_key") or ""
+            _sk_parts    = [p for p in _ctx_sk.split("_") if p]
+            # strip symbol prefix + direction (first 2 parts) → setup pattern remains
+            _setup_type  = "_".join(_sk_parts[2:]) if len(_sk_parts) > 2 else (_ctx_sk or "UNKNOWN")
+            _trigger_type = _sk_parts[-1] if _sk_parts else "UNKNOWN"
+            _sym          = (mt.get("symbol") or mt.get("instrument") or "").upper()
+            _sess_ns      = ctx.get("session") or _learning_session_name(opened_dt) or "UNKNOWN"
+            _vol_ns       = ctx.get("volatility_type") or "UNKNOWN"
+            _struct_ns    = ctx.get("regime") or "UNKNOWN"
+            _dir_ns       = mt.get("direction") or "UNKNOWN"
+            _learning_ns  = _make_learning_ns(
+                _sym, TRADING_MODE, _setup_type, _dir_ns,
+                _sess_ns, _vol_ns, _struct_ns, _trigger_type)
+        except Exception:
+            _setup_type, _trigger_type, _learning_ns = None, None, None
         row = (
             managed_key,
             mt.get("journal_id"),
@@ -10930,6 +10977,9 @@ def _record_strategy_trade(mt):
             TRADING_MODE,
             STRATEGY_VERSION,
             trade_label,
+            _setup_type,
+            _trigger_type,
+            _learning_ns,
         )
         conn = _learning_conn()
         if conn is None:
@@ -10945,9 +10995,10 @@ def _record_strategy_trade(mt):
                         entry_efficiency, momentum_score, grade, scalper_grade,
                         mfe_r, mae_r, slippage, exit_price, entry_reason,
                         outcome_reason, outcome_tag, day_of_week, volatility_type,
-                        trading_mode, strategy_version, trade_label)
+                        trading_mode, strategy_version, trade_label,
+                        setup_type, trigger_type, learning_ns)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (managed_key) DO NOTHING
                    RETURNING id""",
                 row,
@@ -10995,15 +11046,18 @@ def _maybe_recompute_learning():
                 pass
 
 
-def _check_learning_eligibility(instrument):
+def _check_learning_eligibility(instrument, mode=None):
     """Return (status, rule_reason) from the in-memory LEARNING_ELIGIBILITY cache.
     FAIL-OPEN: no data (DB off, 0 trades computed) -> ('LIVE_ELIGIBLE', None).
     GHOST_ONLY means: demote live mode to paper (trade still fires, builds evidence).
-    DISABLED means: block this instrument entirely (repeated setup failures)."""
+    DISABLED means: block this instrument entirely (repeated setup failures).
+    mode-namespaced key ('{inst}::{mode}') tried first; bare instrument as warm-up
+    fallback so the gate never silently permits before first recompute."""
     if not LEARNING_DB_ENABLED:
         return "LIVE_ELIGIBLE", None
+    ns = _ns_learning_key(instrument, mode) if mode else instrument
     with LEARNING_ELIGIBILITY_LOCK:
-        elig = LEARNING_ELIGIBILITY.get(instrument)
+        elig = LEARNING_ELIGIBILITY.get(ns) or LEARNING_ELIGIBILITY.get(instrument)
     if not elig:
         return "LIVE_ELIGIBLE", None  # no recompute yet: fail-open
     return elig.get("status", "LIVE_ELIGIBLE"), elig.get("rule_triggered")
@@ -11020,40 +11074,43 @@ def _recompute_learning_eligibility(conn):
         cur.execute("""
             SELECT
                 symbol,
+                COALESCE(trading_mode, 'SWING') AS trading_mode,
                 count(*) AS n,
                 avg(r_multiple) AS expectancy,
                 avg((result='Win')::int::float) AS win_rate,
                 avg((r_multiple >= 0.9)::int::float) AS tp1_hit_rate
             FROM strategy_trades
             WHERE symbol IS NOT NULL AND result IS NOT NULL
-            GROUP BY symbol
+            GROUP BY symbol, COALESCE(trading_mode, 'SWING')
         """)
-        inst_rows = {r["symbol"]: r for r in (cur.fetchall() or [])}
-        # Last-20 avg R per instrument
+        inst_rows = {(r["symbol"], r["trading_mode"]): r for r in (cur.fetchall() or [])}
+        # Last-20 avg R per instrument (mode-namespaced; SWING/SCALP/MICRO_SCALP isolated)
         cur.execute("""
             WITH ranked AS (
-                SELECT symbol, r_multiple,
-                       row_number() OVER (PARTITION BY symbol ORDER BY closed_at DESC NULLS LAST) AS rn
+                SELECT symbol, COALESCE(trading_mode, 'SWING') AS trading_mode, r_multiple,
+                       row_number() OVER (
+                           PARTITION BY symbol, COALESCE(trading_mode, 'SWING')
+                           ORDER BY closed_at DESC NULLS LAST) AS rn
                 FROM strategy_trades
                 WHERE symbol IS NOT NULL AND closed_at IS NOT NULL
             )
-            SELECT symbol, avg(r_multiple) AS last_20_avg_r
+            SELECT symbol, trading_mode, avg(r_multiple) AS last_20_avg_r
             FROM ranked WHERE rn <= 20
-            GROUP BY symbol
+            GROUP BY symbol, trading_mode
         """)
         last20 = {}
         for r in (cur.fetchall() or []):
-            try: last20[r["symbol"]] = float(r["last_20_avg_r"])
+            try: last20[(r["symbol"], r["trading_mode"])] = float(r["last_20_avg_r"])
             except Exception: pass
-        # Per-instrument+setup: detect repeatedly-failing strategies
+        # Per-instrument+mode+setup: detect repeatedly-failing strategies (mode-isolated)
         cur.execute("""
-            SELECT symbol, strategy_key,
+            SELECT symbol, COALESCE(trading_mode, 'SWING') AS trading_mode, strategy_key,
                    count(*) AS n,
                    avg((result='Win')::int::float) AS win_rate,
                    avg(r_multiple) AS expectancy
             FROM strategy_trades
             WHERE symbol IS NOT NULL AND strategy_key IS NOT NULL AND result IS NOT NULL
-            GROUP BY symbol, strategy_key
+            GROUP BY symbol, COALESCE(trading_mode, 'SWING'), strategy_key
             HAVING count(*) >= %s
         """, (LEARNING_SETUP_DISABLE_MIN_N,))
         setup_rows = cur.fetchall() or []
@@ -11072,17 +11129,21 @@ def _recompute_learning_eligibility(conn):
             try: return float(v) if v is not None else d
             except Exception: return d
 
+        # Iterate over every known instrument × every trading mode for isolation.
+        # Instruments with no trades in a mode get GHOST_ONLY (under-sampled) — safe.
+        _all_elig_modes = ["SWING", "SCALP", "MICRO_SCALP"]
         new_elig = {}
-        for instrument in list(ASSETS.keys()):
-            row = inst_rows.get(instrument) or inst_rows.get(instrument + "1!") or {}
+        for instrument, mode in [(i, m) for i in list(ASSETS.keys()) for m in _all_elig_modes]:
+            ns   = "%s::%s" % (instrument, mode)
+            row  = inst_rows.get((instrument, mode)) or inst_rows.get((instrument + "1!", mode)) or {}
             n    = int(row.get("n") or 0)
             exp  = _ff(row.get("expectancy"))
             wr   = _ff(row.get("win_rate"))
             tp1h = _ff(row.get("tp1_hit_rate"))
-            l20  = last20.get(instrument) or last20.get(instrument + "1!")
+            l20  = last20.get((instrument, mode)) or last20.get((instrument + "1!", mode))
             if n < LEARNING_LIVE_MIN_SAMPLE:
                 status = "GHOST_ONLY"
-                rule   = "under_%d_samples (%d recorded)" % (LEARNING_LIVE_MIN_SAMPLE, n)
+                rule   = "under_%d_%s_samples (%d recorded)" % (LEARNING_LIVE_MIN_SAMPLE, mode, n)
             elif exp < 0:
                 status = "GHOST_ONLY"
                 rule   = "negative_expectancy (%+.2fR avg)" % exp
@@ -11091,8 +11152,8 @@ def _recompute_learning_eligibility(conn):
                 rule   = "last_20_trades_negative (%+.2fR avg)" % l20
             else:
                 status = "LIVE_ELIGIBLE"
-                rule   = "positive_expectancy (%+.2fR, %.0f%% WR, n=%d)" % (exp, wr * 100, n)
-            new_elig[instrument] = {
+                rule   = "%s positive_expectancy (%+.2fR, %.0f%% WR, n=%d)" % (mode, exp, wr * 100, n)
+            new_elig[ns] = {
                 "status":        status,
                 "rule_triggered": rule,
                 "sample_size":   n,
@@ -11103,22 +11164,24 @@ def _recompute_learning_eligibility(conn):
                 "updated_at":    now_utc().isoformat(),
             }
 
-        # Collect disabled setups
+        # Collect disabled setups — keyed by "{inst}::{mode}" for cross-mode isolation
         disabled_by_inst = {}
         for r in setup_rows:
-            inst = instrument_of(r["symbol"] or "") or r["symbol"]
+            sym  = instrument_of(r["symbol"] or "") or r["symbol"]
+            mode = r.get("trading_mode") or "SWING"
+            ns   = "%s::%s" % (sym, mode)
             rwr  = _ff(r["win_rate"])
             rexp = _ff(r["expectancy"])
             if rwr < LEARNING_SETUP_DISABLE_MAX_WR and rexp < LEARNING_SETUP_DISABLE_MAX_EXP:
-                disabled_by_inst.setdefault(inst, []).append({
+                disabled_by_inst.setdefault(ns, []).append({
                     "setup_key":   r["strategy_key"],
                     "win_rate":    round(rwr, 3),
                     "expectancy":  round(rexp, 3),
                     "sample_size": int(r["n"] or 0),
                 })
-        for inst, setups in disabled_by_inst.items():
-            if inst in new_elig:
-                new_elig[inst]["disabled_setups"] = setups
+        for ns_key, setups in disabled_by_inst.items():
+            if ns_key in new_elig:
+                new_elig[ns_key]["disabled_setups"] = setups
 
         today_labels = {}
         for r in today_label_rows:
@@ -11175,7 +11238,7 @@ def _recompute_learning():
     """Recompute per-strategy analytics + bounded weights from strategy_trades and
     swap the in-memory caches atomically. Also persists strategy_weights for
     continuity/inspection. FAIL-OPEN; runs at startup and every Nth close."""
-    global LEARNING_ANALYTICS, GOVERNOR_STATS
+    global LEARNING_ANALYTICS, GOVERNOR_STATS, PER_MODE_STATS
     if not LEARNING_DB_ENABLED:
         return
     # Serialize: hold this across the whole read→compute→swap so an older/slower
@@ -11188,7 +11251,8 @@ def _recompute_learning():
             return
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT strategy_key,
+            SELECT COALESCE(trading_mode, 'UNKNOWN') AS trading_mode,
+                   strategy_key,
                    max(strategy)                                            AS strategy,
                    count(*)                                                 AS n,
                    avg((result='Win')::int::float)                          AS win_rate,
@@ -11198,7 +11262,7 @@ def _recompute_learning():
                    sum(CASE WHEN r_multiple < 0 THEN -r_multiple ELSE 0 END) AS gross_loss
             FROM strategy_trades
             WHERE strategy_key IS NOT NULL
-            GROUP BY strategy_key
+            GROUP BY trading_mode, strategy_key
         """)
         strat_rows = cur.fetchall()
         cur.execute("""
@@ -11280,8 +11344,11 @@ def _recompute_learning():
                 return None
 
         new_weights, new_samples, ranking = {}, {}, []
+        _per_mode_accum = {}   # mode_key -> {n, wr_sum, ar_sum, top_setup, top_w}
         for r in strat_rows:
-            key = r["strategy_key"]
+            _r_mode = r.get("trading_mode") or "UNKNOWN"
+            key     = r["strategy_key"]
+            ns_key  = _ns_learning_key(key, _r_mode)
             n   = int(r["n"] or 0)
             wr  = _f(r["win_rate"])
             avg_r = _f(r["avg_r"])
@@ -11289,15 +11356,28 @@ def _recompute_learning():
             pf  = (gw / gl) if gl > 0 else (3.0 if gw > 0 else 0.0)
             pf  = min(pf, 3.0)
             w   = _learning_weight(wr, pf, avg_r, n)
-            new_weights[key] = w
-            new_samples[key] = n
+            new_weights[ns_key] = w
+            new_samples[ns_key] = n
             ranking.append({
-                "strategy_key": key, "strategy": r["strategy"] or key, "n": n,
+                "strategy_key": key, "trading_mode": _r_mode,
+                "strategy": r["strategy"] or key, "n": n,
                 "win_rate": round(wr * 100, 1), "avg_r": round(avg_r, 2),
                 "profit_factor": round(pf, 2),
                 "avg_hold_min": round(_f(r["avg_hold"]), 1),
                 "weight": round(w, 3),
             })
+            # Accumulate per-mode aggregate stats for cross-mode comparison
+            _e = _per_mode_accum.setdefault(_r_mode, {"n": 0, "wr_sum": 0.0, "ar_sum": 0.0, "top_setup": None, "top_w": 0.0})
+            _e["n"] += n; _e["wr_sum"] += wr * n; _e["ar_sum"] += avg_r * n
+            if w > _e["top_w"]: _e["top_w"] = w; _e["top_setup"] = r.get("strategy") or key
+        new_per_mode = {
+            m: {"n": e["n"],
+                "win_rate":   round(e["wr_sum"] / e["n"], 3) if e["n"] > 0 else None,
+                "avg_r":      round(e["ar_sum"] / e["n"], 3) if e["n"] > 0 else None,
+                "expectancy": round(e["ar_sum"] / e["n"], 3) if e["n"] > 0 else None,
+                "top_setup":  e["top_setup"]}
+            for m, e in _per_mode_accum.items() if e["n"] > 0
+        }
         ranking.sort(key=lambda x: (x["weight"], x["win_rate"], x["avg_r"]), reverse=True)
 
         best_hours = [{
@@ -11435,6 +11515,7 @@ def _recompute_learning():
             LEARNING_ANALYTICS = analytics
             GOVERNOR_STATS = governor_stats
             MEMORY_TRADES[:] = mem_cache
+            PER_MODE_STATS.clear();          PER_MODE_STATS.update(new_per_mode)
         logger.info("learning analytics recomputed: %s trades across %s strategies",
                     total, len(ranking))
     except Exception as exc:
@@ -17384,6 +17465,29 @@ def compute_session_day_type(result):
         return _session_day_type_neutral()
 
 
+def compute_cross_mode_stats(inst=None):
+    """Per-mode (SWING/SCALP/MICRO_SCALP) aggregate stats from the PER_MODE_STATS cache.
+    Returns {mode: {n, win_rate, avg_r, expectancy, top_setup}} — only includes modes
+    that have actual closed-trade samples. DISPLAY-ONLY, FAIL-OPEN."""
+    try:
+        with LEARNING_LOCK:
+            pms = dict(PER_MODE_STATS)
+        out = {}
+        for m in ["SWING", "SCALP", "MICRO_SCALP"]:
+            s = pms.get(m) or {}
+            if s.get("n", 0) > 0:
+                out[m] = {
+                    "n":          s["n"],
+                    "win_rate":   s.get("win_rate"),
+                    "avg_r":      s.get("avg_r"),
+                    "expectancy": s.get("expectancy"),
+                    "top_setup":  s.get("top_setup"),
+                }
+        return out if out else None
+    except Exception:
+        return None
+
+
 def compute_main_brain_learning_stats():
     """Curated deeper learning stats (most common losing pattern, most common skip
     reason, best setup / best+worst windows, win-rate, avg-R) sourced from the
@@ -17406,7 +17510,8 @@ def compute_main_brain_learning_stats():
                 "skip_pattern": (cr.get("reason") if cr else None),
                 "best_setup": r.get("best_setup"),
                 "best_window": r.get("best_window"),
-                "worst_window": r.get("worst_window")}
+                "worst_window": r.get("worst_window"),
+                "mode_comparison": compute_cross_mode_stats()}
     except Exception:
         base["reason"] = "Learning stats unavailable."
         return base
@@ -17475,7 +17580,7 @@ def _build_brain_state(result):
 
         # ── Learning eligibility ──────────────────────────────────────────
         try:
-            _elig_status, _elig_reason = _resolve_learning_eligibility(inst)
+            _elig_status, _elig_reason = _check_learning_eligibility(inst, mode=TRADING_MODE)
         except Exception:
             _elig_status, _elig_reason = "LIVE_ELIGIBLE", None
 
@@ -36922,7 +37027,7 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
     # GHOST_ONLY = demote live order to paper so the trade still fires + builds data.
     # No data yet (DB off / under-sampled) = FAIL-OPEN (pass through, unchanged).
     try:
-        _lre_status, _lre_rule = _check_learning_eligibility(instrument)
+        _lre_status, _lre_rule = _check_learning_eligibility(instrument, mode=TRADING_MODE)
         if _lre_status == "DISABLED":
             logger.warning("LearningRuleGate: %s DISABLED (%s) → blocking", instrument, _lre_rule)
             return {"status": "error",
@@ -36941,9 +37046,11 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
         _lre_sk = ((a.get("learning_score_influence") or {}).get("meta") or {}).get("active_key") or \
                   (a.get("strategy_engine") or {}).get("active_key")
         if _lre_sk and execution_is_live(mode):
+            _lre_ns_key = _ns_learning_key(instrument, TRADING_MODE)
             with LEARNING_ELIGIBILITY_LOCK:
                 _lre_dis_set = {s["setup_key"] for s in
-                                LEARNING_ELIGIBILITY.get(instrument, {}).get("disabled_setups", [])}
+                                (LEARNING_ELIGIBILITY.get(_lre_ns_key)
+                                 or LEARNING_ELIGIBILITY.get(instrument) or {}).get("disabled_setups", [])}
             if _lre_sk in _lre_dis_set:
                 logger.warning("LearningRuleGate: %s setup '%s' repeatedly fails → demoting to ghost",
                                instrument, _lre_sk)
