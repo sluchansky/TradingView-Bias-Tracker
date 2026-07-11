@@ -172,41 +172,42 @@ function BrainFace({ speaking, color, glow, status }: {
       if (r2 > 1.05) return -1;  // background
 
       // Ellipsoid surface normal (paraboloid approx)
-      const nz   = Math.sqrt(Math.max(0, 1 - sq(dx) * 0.55 - sq(dy) * 0.55));
-      const nxF  = -dx * 0.65;
-      const nyF  = -dy * 0.65;
-      // Key light: upper-left, forward-facing
-      const lx   = -0.40, ly = -0.50, lz = 0.77;
+      const nz   = Math.sqrt(Math.max(0, 1 - sq(dx) * 0.5 - sq(dy) * 0.5));
+      const nxF  = -dx * 0.60;
+      const nyF  = -dy * 0.60;
+      // Key light: upper-left, forward-facing (more frontal = brighter overall)
+      const lx   = -0.30, ly = -0.42, lz = 0.86;
       const diff = Math.max(0, nxF * lx + nyF * ly + nz * lz);
-      // Rim: subtle from opposite side
-      const rim  = 0.08 * Math.max(0, -nxF * lx - nyF * ly + nz * 0.9);
+      // Rim: subtle fill from right
+      const rim  = 0.07 * Math.max(0, nxF * 0.5 + nz * 0.86);
 
-      let b = 0.13 + diff * 0.67 + rim;
+      // Higher ambient + stronger diffuse = brighter, younger-looking face
+      let b = 0.24 + diff * 0.72 + rim;
 
       // ── Highlight Gaussians ──────────────────────────────────────────────
-      b += gauss(cx, cy, FCX, FCY - 1, 1.3, 5.5, 0.20);    // nose bridge
-      b += gauss(cx, cy, FCX, FCY + 4, 2.0, 2.2, 0.14);    // nose tip
-      b += gauss(cx, cy, 9,   FCY - 1, 4.5, 3.5, 0.11);    // L cheekbone
-      b += gauss(cx, cy, 31,  FCY - 1, 4.5, 3.5, 0.11);    // R cheekbone
-      b += gauss(cx, cy, 19,  FCY-13,  5.0, 4.0, 0.09);    // forehead (key-lit)
-      b += gauss(cx, cy, FCX, MY - 0.8, 5.5, 1.1, 0.07 + smile * 0.05); // upper lip
-      b += gauss(cx, cy, FCX, MY + 1.8, 4.5, 1.0, 0.05 + smile * 0.04); // lower lip
+      b += gauss(cx, cy, FCX, FCY - 1, 2.0, 6.0, 0.13);    // nose bridge (wider, softer)
+      b += gauss(cx, cy, FCX, FCY + 4, 2.5, 2.5, 0.14);    // nose tip
+      b += gauss(cx, cy, 9,   FCY - 1, 5.0, 4.0, 0.16);    // L cheekbone (brighter)
+      b += gauss(cx, cy, 31,  FCY - 1, 5.0, 4.0, 0.16);    // R cheekbone
+      b += gauss(cx, cy, 18,  FCY-13,  6.0, 4.5, 0.12);    // forehead center
+      b += gauss(cx, cy, FCX, MY - 0.8, 6.0, 1.2, 0.09 + smile * 0.06); // upper lip
+      b += gauss(cx, cy, FCX, MY + 1.8, 5.0, 1.0, 0.07 + smile * 0.05); // lower lip
 
-      // ── Shadow Gaussians ─────────────────────────────────────────────────
-      b -= gauss(cx, cy, LEX, EY, 4.2, 3.0, 0.40);                       // L eye socket
-      b -= gauss(cx, cy, REX, EY, 4.2, 3.0, 0.40);                       // R eye socket
-      b -= gauss(cx, cy, LEX, EY - 2.5 + browRaise, 3.5, 1.5, 0.14);    // L sub-brow
-      b -= gauss(cx, cy, REX, EY - 2.5 + browRaise, 3.5, 1.5, 0.14);    // R sub-brow
-      b -= gauss(cx, cy, 17,  FCY + 3,  1.5, 3.0, 0.10);                 // L nasolabial
-      b -= gauss(cx, cy, 23,  FCY + 3,  1.5, 3.0, 0.10);                 // R nasolabial
-      b -= gauss(cx, cy, FCX, MY - 2.5, 2.2, 2.0, 0.11);                // philtrum/under-nose
-      b -= gauss(cx, cy, FCX, MY + 4.0, 3.5, 1.5, 0.09);                // under-lip shadow
-      b -= gauss(cx, cy, 6,   FCY + 5,  3.0, 7.0, 0.22);                 // L jaw shadow
-      b -= gauss(cx, cy, 34,  FCY + 5,  3.0, 7.0, 0.22);                 // R jaw shadow
-      b -= gauss(cx, cy, 5,   EY,       2.5, 4.5, 0.16);                 // L temple
-      b -= gauss(cx, cy, 35,  EY,       2.5, 4.5, 0.16);                 // R temple
-      b -= gauss(cx, cy, FCX, FCY + 17, 4.0, 2.5, 0.10);                // chin shadow
-      b -= gauss(cx, cy, FCX, FCY - 15, 9.0, 3.5, 0.38);                // hair / top shadow
+      // ── Shadow Gaussians — kept subtle to avoid gaunt/aged look ──────────
+      b -= gauss(cx, cy, LEX, EY, 3.8, 2.5, 0.22);                       // L eye socket (much softer)
+      b -= gauss(cx, cy, REX, EY, 3.8, 2.5, 0.22);                       // R eye socket
+      b -= gauss(cx, cy, LEX, EY - 2.2 + browRaise, 3.2, 1.2, 0.09);    // L sub-brow
+      b -= gauss(cx, cy, REX, EY - 2.2 + browRaise, 3.2, 1.2, 0.09);    // R sub-brow
+      b -= gauss(cx, cy, 17,  FCY + 3,  2.0, 3.5, 0.05);                 // L nasolabial (very subtle)
+      b -= gauss(cx, cy, 23,  FCY + 3,  2.0, 3.5, 0.05);                 // R nasolabial
+      b -= gauss(cx, cy, FCX, MY - 2.5, 2.5, 2.0, 0.07);                // philtrum
+      b -= gauss(cx, cy, FCX, MY + 4.0, 4.0, 1.5, 0.06);                // under-lip shadow
+      b -= gauss(cx, cy, 6,   FCY + 5,  4.0, 8.0, 0.13);                 // L jaw (wider, softer)
+      b -= gauss(cx, cy, 34,  FCY + 5,  4.0, 8.0, 0.13);                 // R jaw
+      b -= gauss(cx, cy, 5,   EY,       2.5, 4.5, 0.09);                 // L temple
+      b -= gauss(cx, cy, 35,  EY,       2.5, 4.5, 0.09);                 // R temple
+      b -= gauss(cx, cy, FCX, FCY + 17, 5.0, 2.5, 0.06);                // chin (softer)
+      b -= gauss(cx, cy, FCX, FCY - 16, 10.0, 3.0, 0.22);               // hairline (much less receding)
 
       // Speaking: subtle mouth-region brightness pulse
       if (mouthOpen > 0.1) b += gauss(cx, cy, FCX, MY, 5.0, 1.5, mouthOpen * 0.06);
