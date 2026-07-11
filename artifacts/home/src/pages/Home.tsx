@@ -620,6 +620,204 @@ function EvidenceDrawer({ data, status }: { data: any; status: string }) {
   );
 }
 
+// ── Internal monologue ─────────────────────────────────────────────────────────
+
+function buildThoughts(data: any, status: string, edge: number, grade: string): string[] {
+  if (!data) return ['Initializing market scan...', 'Connecting to live data feed...'];
+
+  const price   = Number(data.price           || 0);
+  const vwap    = Number(data.vwap_value      || 0);
+  const demand  = Number(data.nearest_demand  || 0);
+  const supply  = Number(data.nearest_supply  || 0);
+  const gd      = (data.gate_debug            || {}) as Record<string,any>;
+  const ad      = (data.alert_diagnostics     || {}) as Record<string,any>;
+  const sig     = ((data.main_brain || {}).signals || {}) as Record<string,any>;
+  const bias    = String(sig.bias  || '').toLowerCase();
+  const cvd     = String(sig.cvd   || ad.cvd  || '').toLowerCase();
+  const vol     = String(ad.volume || '').toLowerCase();
+  const at      = data.active_trade || data.managing_trade;
+  const tp      = (data.trade_plan  || {}) as Record<string,any>;
+  const strictR = String(data.strict_reason || (data.main_brain || {}).wait_reason || '').trim();
+  const structOk = !!(gd.structure_confirmed);
+  const zoneOk   = !!(gd.zone_valid);
+  const thoughts: string[] = [];
+
+  // ── MANAGING ──────────────────────────────────────────────────────────────
+  if (status === 'MANAGING' || at) {
+    const dir = String((at && at.direction) || tp.direction || '').toUpperCase();
+    thoughts.push(dir ? `${dir} position is live. Monitoring actively.` : 'Position is live. Watching every tick.');
+    const ep = at && Number(at.entry_price || 0);
+    if (ep && ep > 0) thoughts.push(`Entry at ${fmt(ep)}. Thesis remains intact.`);
+    const t1 = Number(tp.target1 || 0);
+    if (t1 > 0) thoughts.push(`Target at ${fmt(t1)}. Watching for price reaction.`);
+    const st = Number(tp.stop || 0);
+    if (st > 0) thoughts.push(`Stop at ${fmt(st)}. Risk is defined and committed.`);
+    if (price > 0 && vwap > 0) thoughts.push(price > vwap
+      ? 'Price holding above VWAP. Bullish structural context intact.'
+      : 'Price below VWAP. Monitoring for breakdown signals.');
+    thoughts.push('Scanning for thesis invalidation signals.');
+    thoughts.push('Delta and structure holding expected behavior.');
+    thoughts.push('Waiting for target or invalidation — patience is the edge.');
+    return thoughts;
+  }
+
+  // ── READY ─────────────────────────────────────────────────────────────────
+  if (status === 'READY') {
+    const dir = String(tp.direction || '').toLowerCase();
+    const dw  = /long|bull/i.test(dir) ? 'Long' : /short|bear/i.test(dir) ? 'Short' : '';
+    thoughts.push(dw ? `${dw} edge confirmed. All gate conditions satisfied.` : 'Edge confirmed. Execution window is open.');
+    thoughts.push(`Score ${Math.round(edge)} — grade ${grade}. Highest-probability setup right now.`);
+    const entry = Number(tp.entry || 0);
+    if (entry > 0) thoughts.push(`Entry zone near ${fmt(entry)}. Price is approaching.`);
+    const t1 = Number(tp.target1 || 0);
+    if (t1 > 0) thoughts.push(`Targeting ${fmt(t1)} — ${tp.rr_display || '1:3'} risk-to-reward.`);
+    const stopP = Number(tp.stop || 0);
+    if (stopP > 0) thoughts.push(`Stop at ${fmt(stopP)}. Maximum risk is capped.`);
+    if (price > 0 && vwap > 0) thoughts.push(price > vwap
+      ? `VWAP at ${fmt(vwap)}. Price above — momentum confirmed.`
+      : `VWAP at ${fmt(vwap)}. Price below — short flow verified.`);
+    thoughts.push('All conditions checked. This is exactly the setup I wait for.');
+    return thoughts;
+  }
+
+  // ── BUILDING ──────────────────────────────────────────────────────────────
+  if (status === 'BUILDING') {
+    thoughts.push('Setup is forming. Edge is building toward the threshold.');
+    thoughts.push(`Score ${Math.round(edge)}. Getting closer — not acting yet.`);
+    if (!structOk) thoughts.push('Waiting for structural confirmation — BOS or CHOCH required.');
+    if (price > 0 && vwap > 0) thoughts.push(`Price ${price > vwap ? 'above' : 'below'} VWAP at ${fmt(vwap)}.`);
+    if (demand > 0) thoughts.push(`Demand zone near ${fmt(demand)}. Looking for a reaction here.`);
+    if (supply > 0) thoughts.push(`Supply overhead at ${fmt(supply)}. Watching for rejection.`);
+    thoughts.push('Patience. Waiting for the final confirmation signal.');
+    return thoughts;
+  }
+
+  // ── WAIT / NO_EDGE ────────────────────────────────────────────────────────
+
+  // VWAP context
+  if (price > 0 && vwap > 0) {
+    const above = price > vwap;
+    thoughts.push(`Price ${above ? 'above' : 'below'} VWAP at ${fmt(vwap)}. ${above ? 'Bullish' : 'Bearish'} structural context.`);
+    if (!above) thoughts.push(`VWAP resistance at ${fmt(vwap)}. Bearish until price reclaims it.`);
+  } else {
+    thoughts.push('Watching overnight liquidity for signs of absorption.');
+  }
+
+  // Zones
+  if (demand > 0 && price > 0) {
+    const d = ((price - demand) / demand * 100).toFixed(1);
+    thoughts.push(`Demand zone at ${fmt(demand)}. Price is ${d}% above it.`);
+    thoughts.push(`Watching for a liquidity sweep into ${fmt(demand)}.`);
+  } else {
+    thoughts.push('No confirmed demand zone present.');
+  }
+  if (supply > 0 && price > 0) {
+    const d = ((supply - price) / price * 100).toFixed(1);
+    thoughts.push(`Supply zone overhead at ${fmt(supply)} — ${d}% away.`);
+  }
+
+  // Structure
+  if (!structOk) {
+    thoughts.push('Structure has not been confirmed. No BOS or CHOCH detected.');
+    thoughts.push('Waiting for a structural break before considering entry.');
+  } else {
+    thoughts.push('Structure is confirmed. Waiting for zone alignment.');
+  }
+
+  // Zone gate
+  if (!zoneOk && !demand && !supply) thoughts.push('No confirmed demand or supply zone in play.');
+
+  // CVD / delta
+  if      (/bull|pos/.test(cvd)) thoughts.push('Delta is bullish. Buyers are active in the tape.');
+  else if (/bear|neg/.test(cvd)) thoughts.push('Delta is bearish. Sellers controlling order flow.');
+  else                           thoughts.push('Delta is neutral. No directional conviction in current flow.');
+
+  // Volume
+  if      (/strong|high|incr/.test(vol)) thoughts.push('Volume is above average. Participation is healthy.');
+  else if (/low|thin|decr/.test(vol))   thoughts.push('Volume is below average. Thin tape — waiting for expansion.');
+  else                                   thoughts.push('Volume is unremarkable. No catalyst has emerged yet.');
+
+  // Bias
+  if      (/bull/.test(bias)) thoughts.push('Directional bias is bullish. Scanning for long setups only.');
+  else if (/bear/.test(bias)) thoughts.push('Directional bias is bearish. Short pressure remains dominant.');
+  else                        thoughts.push('Bias is neutral. No clear directional conviction yet.');
+
+  // Edge score qualitative
+  if (edge < 15) {
+    thoughts.push('Edge score is very low. Conditions are unfavorable right now.');
+    thoughts.push('Capital preservation mode. Standing completely aside.');
+  } else if (edge < 35) {
+    thoughts.push(`Edge at ${Math.round(edge)}. Still well below the entry threshold.`);
+    thoughts.push('Probability is insufficient. Discipline means waiting.');
+  } else if (edge < 50) {
+    thoughts.push(`Edge at ${Math.round(edge)}. Getting closer, but not ready.`);
+    thoughts.push('One more confirmation needed before considering a trade.');
+  } else {
+    thoughts.push(`Edge at ${Math.round(edge)} — approaching threshold.`);
+    thoughts.push('Almost there. Waiting for the final piece to click into place.');
+  }
+
+  // Strict reason from backend (cleaned up)
+  if (strictR.length > 8 && strictR.length < 140 && !strictR.includes('undefined') && !strictR.includes('null')) {
+    const sr = strictR.charAt(0).toUpperCase() + strictR.slice(1);
+    thoughts.push(sr.endsWith('.') ? sr : sr + '.');
+  }
+
+  // Atmospheric / always-present
+  thoughts.push('Scanning key levels for institutional footprints.');
+  thoughts.push('Patience. The highest-probability setup has not arrived yet.');
+  thoughts.push('Waiting for a liquidity sweep before considering entry.');
+  thoughts.push('Every minute of waiting protects capital for the right moment.');
+
+  return thoughts.filter(t => t.length > 4);
+}
+
+function useMonologue(thoughts: string[], restartKey: string): { text: string; live: boolean } {
+  const [text, setText] = useState('');
+  const [live, setLive] = useState(false);
+  const thoughtsRef = useRef<string[]>(thoughts);
+  const ctrl = useRef<{ idx: number; charIdx: number; tid: ReturnType<typeof setTimeout> | null }>({ idx: 0, charIdx: 0, tid: null });
+
+  // Update thoughts content silently — no restart on every 3s poll
+  useEffect(() => { thoughtsRef.current = thoughts; }, [thoughts]);
+
+  // Restart the typewriter loop only when the market state changes
+  useEffect(() => {
+    const c = ctrl.current;
+    if (c.tid) clearTimeout(c.tid);
+    c.idx = 0; c.charIdx = 0;
+    setText(''); setLive(false);
+
+    const tick = () => {
+      const ts = thoughtsRef.current;
+      if (!ts.length) { c.tid = setTimeout(tick, 500); return; }
+      const cur = ts[c.idx % ts.length] || '';
+      if (c.charIdx < cur.length) {
+        c.charIdx++;
+        setText(cur.slice(0, c.charIdx));
+        setLive(true);
+        c.tid = setTimeout(tick, 18);
+      } else {
+        setLive(false);
+        // Pause between thoughts: 2.8–4.0s
+        const pause = 2800 + Math.random() * 1200;
+        c.tid = setTimeout(() => {
+          c.idx = (c.idx + 1) % ts.length;
+          c.charIdx = 0;
+          setText('');
+          c.tid = setTimeout(tick, 80);
+        }, pause);
+      }
+    };
+
+    // Brief initial delay before first thought appears
+    c.tid = setTimeout(tick, 700);
+    return () => { if (c.tid) clearTimeout(c.tid); };
+  }, [restartKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return { text, live };
+}
+
 // ── Root ───────────────────────────────────────────────────────────────────────
 export default function Home() {
   const [ticker, setTicker]     = useState<Ticker>('MNQ');
@@ -703,7 +901,9 @@ export default function Home() {
       'Watching the tape. Scanning for high-probability setups across key levels...')
   ) as string;
 
-  const { text: displayed, live: streaming } = useStream(narration, 13);
+  // Monologue: cycles through data-driven thoughts; restarts only on status change
+  const thoughts  = useMemo(() => buildThoughts(data, status, edge, grade), [data, status, edge, grade]);
+  const { text: displayed, live: streaming } = useMonologue(thoughts, status);
   const checklist = data ? getBrainChecklist(data) : [];
 
   // Avatar state
