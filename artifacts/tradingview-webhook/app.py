@@ -37516,12 +37516,15 @@ def dashboard():
   .mb-list li{font-size:12px;line-height:1.45;color:#cfd0e0;padding-left:12px;position:relative}
   .mb-list li:before{content:"›";position:absolute;left:0;color:var(--amber-dim)}
   .mb-feed-h{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:6px}
-  .mb-feed{max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:#060911;border:1px solid rgba(56,200,255,.18);border-radius:6px;padding:10px;font-family:ui-monospace,monospace}
-  .mb-feed-empty{font-size:12px;color:#6b7280;font-style:italic}
-  .mb-feed-row{display:flex;gap:8px;align-items:baseline;font-size:12px;line-height:1.4}
-  .mb-feed-t{flex:0 0 auto;color:#6b7280;font-family:ui-monospace,monospace;font-size:11px}
-  .mb-feed-badge{flex:0 0 auto;font-weight:800;font-size:10px;letter-spacing:.5px}
-  .mb-feed-tx{flex:1 1 auto;color:#c8d0e8}
+  .mb-feed{max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;background:#060911;border:1px solid rgba(56,200,255,.15);border-radius:6px;padding:8px}
+  .mb-feed-empty{font-size:12px;color:#6b7280;font-style:italic;padding:4px 2px}
+  .mb-feed-row{display:flex;flex-direction:column;gap:2px;padding:7px 10px 7px 12px;border-left:2px solid var(--fk,#2d2d40);background:rgba(255,255,255,.025);border-radius:0 5px 5px 0}
+  .mb-feed-meta{display:flex;gap:8px;align-items:center;margin-bottom:1px}
+  .mb-feed-t{color:#4b5563;font-family:ui-monospace,monospace;font-size:10px}
+  .mb-feed-badge{font-size:9px;font-weight:800;letter-spacing:1px}
+  .mb-feed-tx{font-size:12.5px;color:#c8d0e8;line-height:1.55}
+  .fk-question{--fk:#c084fc}.fk-answer{--fk:#818cf8}.fk-trade{--fk:#34d399}
+  .fk-thesis{--fk:#fbbf24}.fk-risk{--fk:#f87171}.fk-thought{--fk:#4f5585}.fk-memory{--fk:#2dd4bf}
   .mb-feed-h::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-right:7px;vertical-align:middle;animation:mbLivePulse 2.2s ease-in-out infinite}
   @keyframes mbLivePulse{0%,100%{opacity:1}50%{opacity:.2}}
   .mb-msg-a .mb-msg-who{color:#9d99ff;letter-spacing:.5px}
@@ -40916,14 +40919,47 @@ function renderMBJudge(d){
     else miss.forEach(function(m){ var li=document.createElement('li'); li.className='mbj-miss'; li.textContent='+'+m.points+' '+m.label; ms.appendChild(li); });
   }
 }
-const MB_FEED_MAX = 40;
-let mbFeeds = {};     // { SYM: [ {t, status, text} ] }
-let mbLastSignals = {};   // { SYM: <last signals snapshot> } — diffed for the What-Changed feed
-let mbCurSym = null;  // last symbol whose transcript was painted
+const MB_FEED_MAX = 80;
+let mbFeeds = {};        // { SYM: [{t, kind, text, confKey?}] }
+let mbLastSignals = {};  // { SYM: last signals snapshot }
+let mbCurSym = null;     // last painted symbol
+let mbConfArc = {};      // { SYM: {start, peak, floor, current} } — confidence narrative arc
+const MB_FEED_KINDS = {
+  thought:  {label:'BRAIN',   color:'#818cf8'},
+  thesis:   {label:'THESIS',  color:'#fbbf24'},
+  trade:    {label:'TRADE',   color:'#34d399'},
+  risk:     {label:'RISK',    color:'#f87171'},
+  memory:   {label:'MEMORY',  color:'#2dd4bf'},
+  question: {label:'YOU',     color:'#c084fc'},
+  answer:   {label:'BRAIN',   color:'#818cf8'},
+};
 function mbNowET(){
-  try { return new Date().toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
+  try{ return new Date().toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}); }
   catch(e){ return ''; }
 }
+// Collapse repeated confidence fluctuations into one running narrative sentence.
+// Finds and REPLACES the last confKey entry rather than appending a new one.
+function mbMergeConf(symKey, fromVal, toVal){
+  const arc = mbConfArc[symKey] || (mbConfArc[symKey] = {start:fromVal, peak:fromVal, floor:toVal});
+  arc.peak    = Math.max(arc.peak,    toVal);
+  arc.floor   = Math.min(arc.floor,   toVal);
+  arc.current = toVal;
+  let text;
+  const rose   = arc.peak   - arc.start > 4;
+  const fell   = arc.start  - arc.floor > 4;
+  const stillUp = toVal >= arc.peak - 4;
+  if(rose && stillUp)         text = 'Confidence improved from '+arc.start+'% to '+arc.peak+'%.';
+  else if(rose && !stillUp)   text = 'Confidence rose to '+arc.peak+'%, then softened to '+toVal+'%.';
+  else if(fell && toVal < arc.start - 4)
+                              text = 'Confidence slipped from '+arc.start+'% to '+toVal+'%.';
+  else                        text = 'Confidence at '+toVal+'%.';
+  const feed = mbFeeds[symKey] || (mbFeeds[symKey] = []);
+  let ci = -1;
+  for(let i = feed.length-1; i >= 0; i--){ if(feed[i].confKey){ ci = i; break; } }
+  if(ci >= 0){ feed[ci].text = text; feed[ci].t = mbNowET(); }
+  else { feed.push({t:mbNowET(), kind:'thought', text:text, confKey:true}); }
+}
+// Render the feed as a typed conversational transcript — one card per entry.
 function mbRenderFeed(symKey, scrollToEnd){
   const feed = document.getElementById('mb-feed');
   if(!feed) return;
@@ -40932,64 +40968,67 @@ function mbRenderFeed(symKey, scrollToEnd){
   if(!arr.length){
     const e = document.createElement('div');
     e.className = 'mb-feed-empty';
-    e.textContent = 'Narration will appear here as the read changes…';
+    e.textContent = 'The transcript will build here as the market read changes…';
     feed.appendChild(e);
     return;
   }
   arr.forEach(function(item){
-    const row = document.createElement('div'); row.className = 'mb-feed-row';
+    const cfg = MB_FEED_KINDS[item.kind] || MB_FEED_KINDS.thought;
+    const row = document.createElement('div');
+    row.className = 'mb-feed-row fk-' + (item.kind || 'thought');
+    const meta = document.createElement('div'); meta.className = 'mb-feed-meta';
+    const bd = document.createElement('span'); bd.className = 'mb-feed-badge';
+    bd.textContent = cfg.label; bd.style.color = cfg.color;
     const ts = document.createElement('span'); ts.className = 'mb-feed-t'; ts.textContent = item.t;
-    const bd = document.createElement('span'); bd.className = 'mb-feed-badge'; bd.textContent = item.status;
-    bd.style.color = MB_BADGE_COLORS[item.status] || '#6b7280';
-    const tx = document.createElement('span'); tx.className = 'mb-feed-tx'; tx.textContent = item.text;
-    row.appendChild(ts); row.appendChild(bd); row.appendChild(tx);
+    meta.appendChild(bd); meta.appendChild(ts);
+    const tx = document.createElement('div'); tx.className = 'mb-feed-tx'; tx.textContent = item.text;
+    row.appendChild(meta); row.appendChild(tx);
     feed.appendChild(row);
   });
   if(scrollToEnd) feed.scrollTop = feed.scrollHeight;
 }
-// Diff two server signals snapshots → human "what changed" lines. Display-only;
-// the feed appends a line ONLY on a real transition (never every poll).
+// Diff two signal snapshots into typed transcript entries. DISPLAY-ONLY.
+// Returns [{kind, text}] — confidence gets kind:'_conf' and is collapsed via mbMergeConf.
 function mbChangeMessages(prev, sig){
   if(!sig) return [];
   const m = [];
   const fav = sig.favored;
   if(prev.status !== sig.status){
-    if(sig.status === 'READY') m.push('Setup is READY' + (fav && fav !== 'none' ? ' — ' + fav : '') + '.');
-    else if(sig.status === 'INVALIDATED') m.push('Setup invalidated — thesis broke, protect capital.');
-    else if(sig.status === 'MANAGING') m.push('Now managing an open position.');
-    else if(sig.status === 'BUILDING') m.push('A setup is building' + (fav && fav !== 'none' ? ' (' + fav + ')' : '') + '.');
-    else if(sig.status === 'WATCHING') m.push('Back to watching — no clean edge yet.');
-    else if(sig.status === 'WAIT') m.push('Standing down — waiting on confirmation.');
+    if(sig.status === 'READY')
+      m.push({kind:'trade',   text:'Setup reached READY'+(fav&&fav!=='none'?' — favoring '+fav:'')+'. '});
+    else if(sig.status === 'INVALIDATED')
+      m.push({kind:'risk',    text:'Setup invalidated — thesis broke. Protect capital.'});
+    else if(sig.status === 'MANAGING')
+      m.push({kind:'trade',   text:'Position is now open and being managed.'});
+    else if(sig.status === 'BUILDING')
+      m.push({kind:'thought', text:'A setup is building'+(fav&&fav!=='none'?' ('+fav+')':'')+'. Watching for confirmation.'});
+    else if(sig.status === 'WATCHING')
+      m.push({kind:'thought', text:'Back to watching — no clean edge right now.'});
+    else if(sig.status === 'WAIT')
+      m.push({kind:'thought', text:'Conditions are not there yet — standing down.'});
   }
-  if(prev.favored !== sig.favored && prev.favored && sig.favored && sig.favored !== 'none'){
-    m.push('Bias flipped to ' + sig.favored + '.');
-  }
-  if(prev.vwap_side !== sig.vwap_side && sig.vwap_side !== 'unknown'){
-    if(sig.vwap_side === 'above') m.push('VWAP reclaimed — now trading above it.');
-    else m.push('Lost VWAP — now trading below it.');
-  }
-  if(prev.cvd !== sig.cvd && (sig.cvd === 'bullish' || sig.cvd === 'bearish')){
-    m.push('Order-flow (CVD) turned ' + sig.cvd + '.');
-  }
-  if(prev.structure !== sig.structure && sig.structure){
-    m.push('Structure now reads ' + sig.structure + '.');
-  }
+  if(prev.favored !== sig.favored && prev.favored && sig.favored && sig.favored !== 'none')
+    m.push({kind:'thesis',  text:'Bias flipped to '+sig.favored+'.'});
+  if(prev.vwap_side !== sig.vwap_side && sig.vwap_side !== 'unknown')
+    m.push({kind:'thought', text: sig.vwap_side==='above'
+      ? 'Price reclaimed VWAP — now trading above it.'
+      : 'Price slipped below VWAP.'});
+  if(prev.cvd !== sig.cvd && (sig.cvd==='bullish' || sig.cvd==='bearish'))
+    m.push({kind:'thought', text:'Order flow (CVD) turned '+sig.cvd+'.'});
+  if(prev.structure !== sig.structure && sig.structure)
+    m.push({kind:'thesis',  text:'Structure shifted — now reading '+sig.structure+'.'});
   if(prev.zone !== sig.zone){
-    if(sig.zone === 'demand') m.push('Demand zone now in play.');
-    else if(sig.zone === 'supply') m.push('Supply zone now in play.');
-    else if(sig.zone === 'none' && prev.zone && prev.zone !== 'none') m.push('Trade-side zone no longer in play.');
+    if(sig.zone==='demand')       m.push({kind:'thought', text:'Demand zone now in play.'});
+    else if(sig.zone==='supply')  m.push({kind:'thought', text:'Supply zone now in play.'});
+    else if(sig.zone==='none'&&prev.zone&&prev.zone!=='none')
+      m.push({kind:'thought', text:'Zone cleared — no longer in play.'});
   }
-  if(prev.rr !== sig.rr && sig.rr){
-    m.push('Risk/reward now ' + sig.rr + '.');
-  }
-  if(typeof sig.confidence === 'number' && typeof prev.confidence === 'number'){
-    const a = Math.round(prev.confidence / 10), b = Math.round(sig.confidence / 10);
-    if(b > a) m.push('Confidence improved to ' + sig.confidence + '%.');
-    else if(b < a) m.push('Confidence slipped to ' + sig.confidence + '%.');
-  }
-  if(prev.risk !== sig.risk && sig.risk){
-    m.push('Risk level now ' + sig.risk + '.');
-  }
+  if(prev.rr !== sig.rr && sig.rr)
+    m.push({kind:'thought', text:'Risk/reward shifted to '+sig.rr+'.'});
+  if(typeof sig.confidence==='number' && typeof prev.confidence==='number' && Math.abs(sig.confidence-prev.confidence)>=5)
+    m.push({kind:'_conf', confFrom:prev.confidence, confTo:sig.confidence, text:''});
+  if(prev.risk !== sig.risk && sig.risk)
+    m.push({kind:'risk', text:'Risk elevated to '+sig.risk+'.'});
   return m;
 }
 function renderMainBrain(d){
@@ -41226,12 +41265,20 @@ function renderMainBrain(d){
   const prevSig = mbLastSignals[symKey];
   let appended = false;
   if(prevSig === undefined){
-    mbFeeds[symKey].push({ t: mbNowET(), status: status, text: summary });
+    // First observation — seed the transcript with a brain thought
+    mbFeeds[symKey].push({t:mbNowET(), kind:'thought', text:summary});
     appended = true;
   } else {
-    mbChangeMessages(prevSig, sig).forEach(function(msg){
-      mbFeeds[symKey].push({ t: mbNowET(), status: status, text: msg });
-      appended = true;
+    mbChangeMessages(prevSig, sig).forEach(function(item){
+      if(item.kind === '_conf'){
+        mbMergeConf(symKey, item.confFrom, item.confTo);
+        appended = true;
+      } else {
+        // Reset the confidence arc on regime changes so the next arc has a fresh baseline
+        if(item.kind === 'trade' || item.kind === 'thesis') delete mbConfArc[symKey];
+        mbFeeds[symKey].push({t:mbNowET(), kind:item.kind, text:item.text});
+        appended = true;
+      }
     });
   }
   mbLastSignals[symKey] = sig;
@@ -42427,20 +42474,27 @@ async function mbChatSend(){
   if(!q) return;
   if(mbChatBusy) return;   // ignore rapid double-taps while a request is pending
   mbChatBusy = true;
+  const fsk = mbCurSym || sym;  // symbol whose feed this conversation belongs to
   const priorHist = mbChatHistory.slice(-8).map(function(m){ return {role:m.role, content:m.content}; });
   mbChatHistory.push({ role:'user', content:q });
   inp.value = '';
-  mbChatHistory.push({ role:'assistant', content:'…', _pending:true });
+  // Push the user question into the live transcript feed
+  if(fsk){ if(!mbFeeds[fsk]) mbFeeds[fsk]=[]; mbFeeds[fsk].push({t:mbNowET(),kind:'question',text:q}); mbRenderFeed(fsk,true); }
+  mbChatHistory.push({ role:'assistant', content:'\u2026', _pending:true });
   mbChatRender();
-  const prev = btn.textContent; btn.disabled = true; btn.textContent = '…';
+  const prev = btn.textContent; btn.disabled = true; btn.textContent = '\u2026';
   try{
     const r = await api('/assistant', { question:q, ticker:sym, history:priorHist });
     if(mbChatHistory.length && mbChatHistory[mbChatHistory.length-1]._pending) mbChatHistory.pop();
-    if(!r || r.ok === false){ mbChatHistory.push({ role:'assistant', content:(r && r.error) ? r.error : 'Sorry — something went wrong.' }); }
-    else { mbChatHistory.push({ role:'assistant', content:(r.answer || '(no answer)') }); }
+    const ans = (!r || r.ok===false) ? ((r&&r.error)?r.error:'Sorry — something went wrong.') : (r.answer||'(no answer)');
+    mbChatHistory.push({ role:'assistant', content:ans });
+    // Push the answer into the same live transcript feed
+    if(fsk && mbFeeds[fsk]){ mbFeeds[fsk].push({t:mbNowET(),kind:'answer',text:ans}); mbRenderFeed(fsk,true); }
   }catch(e){
     if(mbChatHistory.length && mbChatHistory[mbChatHistory.length-1]._pending) mbChatHistory.pop();
-    mbChatHistory.push({ role:'assistant', content:'Request failed — try again.' });
+    const err = 'Request failed — try again.';
+    mbChatHistory.push({ role:'assistant', content:err });
+    if(fsk && mbFeeds[fsk]){ mbFeeds[fsk].push({t:mbNowET(),kind:'answer',text:err}); mbRenderFeed(fsk,true); }
   }finally{ mbChatBusy = false; btn.disabled = false; btn.textContent = prev; mbChatRender(); }
 }
 // Blocked Orders — locally-rejected (never-sent) invalid-payload orders. Display-only.
