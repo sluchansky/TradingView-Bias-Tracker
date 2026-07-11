@@ -37570,6 +37570,61 @@ def dashboard():
   @keyframes orbRing{0%{transform:scale(.82);opacity:.8}100%{transform:scale(2.1);opacity:0}}
   .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:5px;transition:color .5s;text-shadow:0 0 24px currentColor}
   .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
+  /* ── Brain-first 3-column layout: LEFT (controls) · CENTER (Main Brain) · RIGHT (compact state) ── */
+  #view-live{display:flex;flex-direction:column}
+  #live-layout{order:0;display:grid;grid-template-columns:180px 1fr 260px;gap:14px;align-items:start;margin-bottom:12px}
+  #bl-left{min-width:0;display:flex;flex-direction:column;position:sticky;top:8px;align-self:start}
+  #bl-center{min-width:0}
+  #bl-right{min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:8px;align-self:start}
+  /* Compact cards in bl-right — not .mod so drag-reorder ignores them */
+  .bl-card{background:linear-gradient(165deg,rgba(28,36,58,.7),rgba(15,20,34,.6));border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px)}
+  .bl-card .mod-h{margin-bottom:8px;font-size:10px}
+  .bl-verdict-big{font-size:20px;font-weight:900;letter-spacing:2px;text-align:center;padding:6px 0 2px;transition:color .4s;text-shadow:0 0 18px currentColor}
+  .bl-edge-bar-wrap{height:4px;background:var(--inset);border-radius:2px;margin:5px 0 8px;overflow:hidden}
+  .bl-edge-fill{height:100%;border-radius:2px;transition:width .4s,background .4s}
+  .bl-kv{display:flex;justify-content:space-between;align-items:baseline;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px}
+  .bl-kv:last-child{border-bottom:none}
+  .bl-k{color:#6b7280;font-size:10px;letter-spacing:.3px}
+  .bl-v{font-weight:700;font-size:12px}
+  /* Bottom event strip */
+  #bl-bottom{order:1;padding:8px 12px;background:rgba(14,12,28,.6);border:1px solid rgba(255,255,255,.07);border-radius:10px;margin-bottom:10px}
+  #bl-bottom-h{font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:var(--amber-dim);font-weight:700;margin-bottom:7px}
+  #bl-bottom-events{display:flex;gap:7px;flex-wrap:wrap;align-items:center;min-height:22px}
+  .bl-evt{display:inline-flex;align-items:center;gap:4px;font-size:10px;color:#9aa3c0;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:3px 8px;white-space:nowrap}
+  .bl-evt-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+  .bl-evt-empty{font-size:11px;color:#4b5563;font-style:italic}
+  /* Drawer toggle row */
+  #bl-drawer-row{order:2;display:flex;align-items:center;gap:10px;margin:0 0 10px;flex-wrap:wrap}
+  #bl-drawer-btn{background:#0a0818;border:1px solid var(--border);border-radius:20px;color:#6b7280;font-size:11px;font-weight:700;letter-spacing:.8px;padding:6px 16px;cursor:pointer;transition:color .15s,border-color .15s;text-transform:uppercase}
+  #bl-drawer-btn:hover{color:var(--text);border-color:rgba(125,140,255,.4)}
+  #bl-drawer-btn.open{color:#7fe9f5;border-color:#39d7e6;background:rgba(57,215,230,.07)}
+  /* All direct-child .mod panels go to drawer area (order 61, hidden by default) */
+  #view-live > .mod{order:61;display:none}
+  #view-live.drawer-open > .mod:not(.mb-hidden){display:block !important}
+  /* Pre-brain non-.mod elements also go to drawer position */
+  #view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{order:60;display:none}
+  #view-live.drawer-open > #mode-row{display:block !important}
+  #view-live.drawer-open > #adv-row{display:flex !important}
+  #view-live.drawer-open > #status-card,#view-live.drawer-open > #rec-card{display:block !important}
+  /* bl-left compact controls */
+  .bl-sect-h{font-size:9px;text-transform:uppercase;letter-spacing:1.4px;color:#4b5563;font-weight:700;margin:0 0 5px;padding:0 1px}
+  .bl-mode-seg{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+  .bl-mode-btn{border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:11px;font-weight:700;cursor:pointer;text-align:center;color:var(--muted);transition:all .18s;letter-spacing:.4px;background:rgba(255,255,255,.02)}
+  .bl-mode-btn:hover{border-color:rgba(125,140,255,.3);color:var(--text)}
+  .bl-mode-btn.active{border-color:rgba(125,140,255,.55);color:#dfe4ff;background:var(--amber-deep)}
+  .bl-inst-tabs{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+  .bl-inst-tab{border:1px solid var(--border);border-radius:7px;padding:7px 9px;font-size:11px;font-weight:700;cursor:pointer;display:flex;justify-content:space-between;align-items:center;color:var(--muted);transition:all .18s;background:rgba(255,255,255,.02);letter-spacing:.3px}
+  .bl-inst-tab:hover{border-color:rgba(125,140,255,.28);color:var(--text)}
+  .bl-inst-tab.active{border-color:rgba(125,140,255,.55);color:#dfe4ff;background:var(--amber-deep)}
+  .bl-inst-sub{font-size:9px;font-weight:400;letter-spacing:.4px;opacity:.6}
+  .bl-inst-tab.active .bl-inst-sub{opacity:.8}
+  .bl-ctrl-row{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+  .bl-ctrl-pill{border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:10px;cursor:pointer;color:var(--muted);background:rgba(255,255,255,.02);transition:all .16s;display:flex;justify-content:space-between;align-items:center;letter-spacing:.3px;user-select:none}
+  .bl-ctrl-pill:hover{border-color:rgba(125,140,255,.25);color:var(--text)}
+  .bl-ctrl-pill.on{color:#22c55e;border-color:rgba(34,197,94,.3)}
+  .bl-ctrl-pill.muted{color:#ef4444;border-color:rgba(239,68,68,.3)}
+  /* Responsive: single column on small screens — show drawer inline */
+  @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-left,#bl-right{display:none}#view-live{display:block}#view-live > .mod,#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}}
   .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
   .mb-av-sep{color:#2d2d40;font-size:14px}
   .mb-av-foot{font-size:10px;letter-spacing:.5px;margin-top:10px;display:flex;align-items:center;justify-content:center;gap:10px;color:#4b5563}
@@ -38114,6 +38169,52 @@ def dashboard():
     </div>
   </div>
 
+  <!-- ═══════════════════════════════════════════════════════════════════════════
+       3-COLUMN BRAIN LAYOUT (DISPLAY-ONLY)
+       LEFT: compact market/mode/alert controls — always visible
+       CENTER: Main Brain avatar + conversation — dominant
+       RIGHT: compact verdict · trade plan · position · risk — always visible
+       All existing panels stay as direct children of #view-live; CSS flex-order
+       (order:60+) and display:none push them below this grid until the drawer
+       toggle is pressed.  No data / gate / money-path changes.
+       ═══════════════════════════════════════════════════════════════════════════ -->
+<div id="live-layout">
+
+  <!-- LEFT COLUMN ── compact controls -->
+  <div id="bl-left">
+    <div class="bl-sect-h">Mode</div>
+    <div class="bl-mode-seg">
+      <div class="bl-mode-btn active" id="bl-mode-scalp" onclick="setMode('SCALP')">SCALP<span style="font-weight:400;opacity:.6;font-size:9px;display:block;letter-spacing:.3px">Sensitive</span></div>
+      <div class="bl-mode-btn" id="bl-mode-swing" onclick="setMode('SWING')">SWING<span style="font-weight:400;opacity:.6;font-size:9px;display:block;letter-spacing:.3px">Strict</span></div>
+    </div>
+
+    <div class="bl-sect-h">Market</div>
+    <div class="bl-inst-tabs">
+      <div class="bl-inst-tab active" data-tk="MGC" onclick="userPickedSetup=true;setSymbol('MGC')">MGC<span class="bl-inst-sub">Gold</span></div>
+      <div class="bl-inst-tab" data-tk="MNQ" onclick="userPickedSetup=true;setSymbol('MNQ')">MNQ<span class="bl-inst-sub">Nasdaq</span></div>
+      <div class="bl-inst-tab" data-tk="MES" onclick="userPickedSetup=true;setSymbol('MES')">MES<span class="bl-inst-sub">S&amp;P</span></div>
+      <div class="bl-inst-tab" data-tk="MYM" onclick="userPickedSetup=true;setSymbol('MYM')">MYM<span class="bl-inst-sub">Dow</span></div>
+    </div>
+
+    <div class="bl-sect-h">Alerts</div>
+    <div class="bl-ctrl-row">
+      <div class="bl-ctrl-pill" id="bl-mute-MGC" role="button" tabindex="0" onclick="toggleMute('MGC')"><span>MGC</span><span id="bl-mute-MGC-lbl">🔔 on</span></div>
+      <div class="bl-ctrl-pill" id="bl-mute-MNQ" role="button" tabindex="0" onclick="toggleMute('MNQ')"><span>MNQ</span><span id="bl-mute-MNQ-lbl">🔔 on</span></div>
+      <div class="bl-ctrl-pill" id="bl-mute-MES" role="button" tabindex="0" onclick="toggleMute('MES')"><span>MES</span><span id="bl-mute-MES-lbl">🔔 on</span></div>
+      <div class="bl-ctrl-pill" id="bl-mute-MYM" role="button" tabindex="0" onclick="toggleMute('MYM')"><span>MYM</span><span id="bl-mute-MYM-lbl">🔔 on</span></div>
+    </div>
+
+    <div class="bl-sect-h">Auto-trade</div>
+    <div class="bl-ctrl-row">
+      <div class="bl-ctrl-pill" id="bl-auto-MGC" role="button" tabindex="0" onclick="toggleAuto('MGC')"><span>MGC</span><span id="bl-auto-MGC-lbl">off</span></div>
+      <div class="bl-ctrl-pill" id="bl-auto-MNQ" role="button" tabindex="0" onclick="toggleAuto('MNQ')"><span>MNQ</span><span id="bl-auto-MNQ-lbl">off</span></div>
+      <div class="bl-ctrl-pill" id="bl-auto-MES" role="button" tabindex="0" onclick="toggleAuto('MES')"><span>MES</span><span id="bl-auto-MES-lbl">off</span></div>
+      <div class="bl-ctrl-pill" id="bl-auto-MYM" role="button" tabindex="0" onclick="toggleAuto('MYM')"><span>MYM</span><span id="bl-auto-MYM-lbl">off</span></div>
+    </div>
+  </div><!-- /#bl-left -->
+
+  <!-- CENTER COLUMN ── Main Brain (dominant) -->
+  <div id="bl-center">
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
@@ -38242,7 +38343,57 @@ def dashboard():
       <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
       <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask →</button>
     </div>
-  </div>
+  </div><!-- /#mod-brain -->
+  </div><!-- /#bl-center -->
+
+  <!-- RIGHT COLUMN ── compact state panels -->
+  <div id="bl-right">
+
+    <!-- Verdict + edge score -->
+    <div class="bl-card" id="bl-verdict-panel">
+      <div class="mod-h">⚡ Verdict</div>
+      <div id="blv-verdict" class="bl-verdict-big">—</div>
+      <div id="blv-grade" style="text-align:center;font-size:10px;color:#6b7280;margin-bottom:4px">—</div>
+      <div class="bl-edge-bar-wrap"><div id="blv-edge-fill" class="bl-edge-fill" style="width:0;background:#4b5563"></div></div>
+      <div class="bl-kv"><span class="bl-k">Edge</span><span class="bl-v" id="blv-edge">—</span></div>
+      <div class="bl-kv"><span class="bl-k">Direction</span><span class="bl-v" id="blv-dir">—</span></div>
+      <div class="bl-kv"><span class="bl-k">Mode</span><span class="bl-v" id="blv-mode">—</span></div>
+      <div id="blv-reason" style="font-size:10px;color:#6b7280;margin-top:7px;line-height:1.4;font-style:italic;min-height:14px"></div>
+    </div>
+
+    <!-- Trade plan -->
+    <div class="bl-card" id="bl-plan-panel">
+      <div class="mod-h">📐 Trade Plan</div>
+      <div id="blp-body"><div style="font-size:11px;color:#6b7280;font-style:italic">No active plan</div></div>
+    </div>
+
+    <!-- Open position -->
+    <div class="bl-card" id="bl-pos-panel">
+      <div class="mod-h">📊 Position</div>
+      <div id="blpos-body"><div style="font-size:11px;color:#6b7280;font-style:italic">No open position</div></div>
+    </div>
+
+    <!-- Risk / prop guard -->
+    <div class="bl-card" id="bl-risk-panel">
+      <div class="mod-h">🛡 Risk</div>
+      <div id="blrisk-body"><div style="font-size:11px;color:#6b7280;font-style:italic">Loading…</div></div>
+    </div>
+
+  </div><!-- /#bl-right -->
+</div><!-- /#live-layout -->
+
+<!-- BOTTOM: event activity strip (DISPLAY-ONLY) -->
+<div id="bl-bottom">
+  <div id="bl-bottom-h">Recent Activity</div>
+  <div id="bl-bottom-events"><span class="bl-evt-empty">Awaiting market data…</span></div>
+</div>
+
+<!-- Drawer toggle row -->
+<div id="bl-drawer-row">
+  <button id="bl-drawer-btn" onclick="toggleBLDrawer()">⚙ Details ▾</button>
+  <span class="adv-hint">full diagnostics · learning tables · strategy modules · raw metrics</span>
+</div>
+
   <!-- ════ Live Chart Preview — TradingView Advanced Chart embed (DISPLAY-ONLY).
        Pure view layer for visual confirmation next to the bot's verdict. It never
        reads into or feeds the gate, alerts, tracking, ENTER eligibility or any
@@ -40381,6 +40532,7 @@ function gaugeColor(v,prob){
 function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
+  try{ renderBLPanels(d); }catch(e){}
   window._mscPageData = d;
   var _mscMainInst = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '';
   renderMscInstPills(_mscMainInst);
@@ -46835,7 +46987,7 @@ setInterval(function(){
   // One-time layout reset when the panel set changes (Main Brain added) so existing
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
-  var VKEY = 'dashLayoutVer', VER = 'market-intelligence-2026-06';
+  var VKEY = 'dashLayoutVer', VER = 'brain-layout-2026-07';
   try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
@@ -47007,6 +47159,202 @@ function toggleAdvPanels(){
   var on = document.documentElement.getAttribute('data-adv') !== '1';
   try{ localStorage.setItem('dashAdv', on ? '1' : '0'); }catch(e){}
   _advApply(on);
+}
+
+// ── Brain-first layout: drawer toggle + compact side-panel renderer (DISPLAY-ONLY) ──
+function toggleBLDrawer(){
+  var vl = document.getElementById('view-live');
+  if(!vl) return;
+  var open = vl.classList.toggle('drawer-open');
+  var btn = document.getElementById('bl-drawer-btn');
+  if(btn){ btn.textContent = open ? '\u2715 Close details' : '\u2699 Details \u25be'; btn.classList.toggle('open', open); }
+  // When opening the drawer, also show Advanced panels so everything is visible
+  if(open){ _advApply(true); }
+}
+
+function renderBLPanels(d){
+  if(!d) return;
+  var v    = d.verdict || 'WAIT';
+  var edge = Number(d.edge_score || 0);
+  var grade= d.edge_grade || '\u2014';
+  var mode = String(d.market_mode || d.mode || '\u2014').toUpperCase();
+  var inst = String(d.active_ticker || d.instrument || '').replace('1!','');
+  var tp   = d.trade_plan || {};
+  var at   = d.active_trade || null;
+  var diag = d.alert_diagnostics || {};
+
+  // Instrument tabs in bl-left
+  if(inst){
+    document.querySelectorAll('.bl-inst-tab').forEach(function(t){
+      t.classList.toggle('active', t.dataset.tk===inst);
+    });
+  }
+
+  // Mode buttons in bl-left (mirror from existing authoritative #mode-scalp/#mode-swing)
+  var mS = document.getElementById('bl-mode-scalp'), mW = document.getElementById('bl-mode-swing');
+  var srcS = document.getElementById('mode-scalp'), srcW = document.getElementById('mode-swing');
+  if(mS && srcS) mS.classList.toggle('active', srcS.classList.contains('active'));
+  if(mW && srcW) mW.classList.toggle('active', srcW.classList.contains('active'));
+
+  // Mirror mute / auto pills from existing authoritative pills
+  ['MGC','MNQ','MES','MYM'].forEach(function(sym){
+    var ms = document.getElementById('mute-'+sym);
+    var ml = document.getElementById('bl-mute-'+sym+'-lbl');
+    var mc = document.getElementById('bl-mute-'+sym);
+    if(ms && ml && mc){
+      var muted = (ms.textContent||'').indexOf('off')!==-1;
+      mc.classList.toggle('muted', muted);
+      ml.textContent = muted ? '\U0001F515 muted' : '\U0001F514 on';
+    }
+    var as = document.getElementById('auto-'+sym);
+    var al = document.getElementById('bl-auto-'+sym+'-lbl');
+    var ac = document.getElementById('bl-auto-'+sym);
+    if(as && al && ac){
+      var aon = (as.textContent||'').indexOf(': on')!==-1;
+      ac.classList.toggle('on', aon);
+      al.textContent = aon ? 'AUTO' : 'off';
+    }
+  });
+
+  // Verdict panel
+  var vEl  = document.getElementById('blv-verdict');
+  var gEl  = document.getElementById('blv-grade');
+  var edEl = document.getElementById('blv-edge');
+  var dEl  = document.getElementById('blv-dir');
+  var mEl  = document.getElementById('blv-mode');
+  var fEl  = document.getElementById('blv-edge-fill');
+  var rEl  = document.getElementById('blv-reason');
+  if(vEl){
+    var vc='#6b7280';
+    if(v.indexOf('READY')!==-1 && v!=='EARLY') vc='#22c55e';
+    else if(v==='MANAGING') vc='#7fe9f5';
+    else if(v==='EARLY') vc='#eab308';
+    else if(v==='INVALIDATED'||v==='BLOCKED') vc='#ef4444';
+    vEl.textContent=v; vEl.style.color=vc;
+  }
+  if(gEl){ gEl.textContent='Grade: '+grade+' \u00b7 '+edge+'/110'; }
+  if(edEl){ edEl.textContent=edge; }
+  if(fEl){
+    var pct=Math.min(100,Math.round(edge/110*100));
+    var fc=edge>=85?'#22c55e':edge>=70?'#6ee7b7':edge>=50?'#eab308':'#ef4444';
+    fEl.style.width=pct+'%'; fEl.style.background=fc;
+  }
+  var favDir = d.favored_direction || (Number(diag.long_score||0)>Number(diag.short_score||0)?'Long':'Short');
+  if(dEl){ dEl.textContent=favDir; }
+  if(mEl){ mEl.textContent=mode; }
+  if(rEl){
+    var reason=(d.strict_reason||d.strict_missing||'');
+    rEl.textContent=reason?(reason.split('.')[0]):'';
+  }
+
+  // Trade plan panel
+  var planEl=document.getElementById('blp-body');
+  if(planEl){
+    var hasPlan=tp&&(tp.entry||tp.stop||tp.direction);
+    if(!hasPlan&&at&&at.entry){ tp=at; hasPlan=true; }
+    if(hasPlan){
+      var rows=[
+        ['Direction', tp.direction||favDir||'\u2014'],
+        ['Entry',    tp.entry   ? Number(tp.entry).toFixed(2)   : '\u2014'],
+        ['Stop',     tp.stop    ? Number(tp.stop).toFixed(2)    : '\u2014'],
+        ['T1',       tp.target1 ? Number(tp.target1).toFixed(2) : '\u2014'],
+        ['T2',       tp.target2 ? Number(tp.target2).toFixed(2) : '\u2014'],
+        ['R:R',      tp.rr1?'1:'+Number(tp.rr1).toFixed(1):(tp.rr?'1:'+Number(tp.rr).toFixed(1):'\u2014')]
+      ].filter(function(r){ return r[1]&&r[1]!=='\u2014'; });
+      planEl.innerHTML=rows.map(function(r){
+        return '<div class="bl-kv"><span class="bl-k">'+r[0]+'</span><span class="bl-v">'+r[1]+'</span></div>';
+      }).join('');
+    } else {
+      planEl.innerHTML='<div style="font-size:11px;color:#6b7280;font-style:italic">No active plan</div>';
+    }
+  }
+
+  // Position panel
+  var posEl=document.getElementById('blpos-body');
+  if(posEl){
+    if(at&&at.direction){
+      var rNum=at.current_r!=null?Number(at.current_r):null;
+      var rc=rNum!=null?(rNum>=0?'#22c55e':'#ef4444'):'#6b7280';
+      var rTxt=rNum!=null?rNum.toFixed(2)+'R':'\u2014';
+      var rows2=[
+        ['Instrument', inst||'\u2014'],
+        ['Direction',  at.direction],
+        ['Entry',      at.entry?Number(at.entry).toFixed(2):'\u2014'],
+        ['Current R',  '<span style="color:'+rc+';font-weight:900">'+rTxt+'</span>'],
+        ['Stop',       at.stop?Number(at.stop).toFixed(2):'\u2014']
+      ].filter(function(r){ return r[1]&&r[1]!=='\u2014'; });
+      posEl.innerHTML=rows2.map(function(r){
+        return '<div class="bl-kv"><span class="bl-k">'+r[0]+'</span><span class="bl-v">'+r[1]+'</span></div>';
+      }).join('');
+    } else {
+      posEl.innerHTML='<div style="font-size:11px;color:#6b7280;font-style:italic">No open position</div>';
+    }
+  }
+
+  // Risk panel
+  var riskEl=document.getElementById('blrisk-body');
+  if(riskEl){
+    var pg=d.prop_guard||d.prop||{};
+    var losses=pg.daily_losses!=null?Number(pg.daily_losses):(d.daily_losses!=null?Number(d.daily_losses):null);
+    var maxL=pg.max_losses_per_day!=null?Number(pg.max_losses_per_day):(d.max_losses_per_day!=null?Number(d.max_losses_per_day):null);
+    var rows3=[];
+    if(losses!=null&&maxL!=null){
+      var lc=losses>=(maxL-1)?'#ef4444':losses>=(maxL/2)?'#eab308':'#22c55e';
+      rows3.push(['Daily losses','<span style="color:'+lc+'">'+losses+' / '+maxL+'</span>']);
+    }
+    rows3.push(['Mode', mode]);
+    rows3.push(['Prop guard', (pg.active||pg.enabled)?'<span style="color:#22c55e">active</span>':'<span style="color:#6b7280">off</span>']);
+    riskEl.innerHTML=rows3.map(function(r){
+      return '<div class="bl-kv"><span class="bl-k">'+r[0]+'</span><span class="bl-v">'+r[1]+'</span></div>';
+    }).join('');
+  }
+
+  // Event timeline strip
+  var evEl=document.getElementById('bl-bottom-events');
+  if(evEl){
+    var events=[];
+    var ra=d.recent_alerts||d.alert_history_summary||[];
+    if(Array.isArray(ra)&&ra.length){
+      ra.slice(0,10).forEach(function(a){
+        var type=String(a.alert_type||a.type||'').replace(/_/g,' ');
+        var sym=a.ticker||a.instrument||'';
+        var ts=a.time_et||a.ts||'';
+        if(ts&&ts.length>5) ts=ts.slice(-5);
+        var dc='#4b5563';
+        if(/BOS|CHOCH|HH|HL|LH|LL/.test(type)) dc='#6ee7b7';
+        else if(/SWEEP|LIQ/.test(type)) dc='#7dd3fc';
+        else if(/ZONE|SUPPLY|DEMAND/.test(type)) dc='#fcd34d';
+        else if(/CVD/.test(type)) dc='#c084fc';
+        else if(/VOLUME|RVOL/.test(type)) dc='#fb923c';
+        events.push('<span class="bl-evt"><span class="bl-evt-dot" style="background:'+dc+'"></span>'
+          +'<span style="font-weight:700;font-size:9px;letter-spacing:.3px">'+type+'</span>'
+          +(sym?' <span style="opacity:.6">'+sym+'</span>':'')
+          +(ts?' <span style="opacity:.4">'+ts+'</span>':'')
+          +'</span>');
+      });
+    }
+    // Fallback: show current verdict for each instrument from instrument_summary
+    if(!events.length){
+      var summary=d.instrument_summary||{};
+      Object.keys(summary).forEach(function(sym){
+        var s=summary[sym]||{};
+        var sv=s.verdict||'WAIT';
+        var se=s.edge_score!=null?(' \u00b7 '+Number(s.edge_score)):'';
+        var dc2=sv.indexOf('READY')!==-1?'#22c55e':sv==='MANAGING'?'#7fe9f5':'#374151';
+        events.push('<span class="bl-evt"><span class="bl-evt-dot" style="background:'+dc2+'"></span>'
+          +'<span style="font-weight:700;font-size:9px">'+sym+'</span>'
+          +' <span style="opacity:.7">'+sv+se+'</span></span>');
+      });
+    }
+    // Last fallback: current instrument+verdict
+    if(!events.length){
+      var dc3=v.indexOf('READY')!==-1?'#22c55e':v==='MANAGING'?'#7fe9f5':'#374151';
+      events.push('<span class="bl-evt"><span class="bl-evt-dot" style="background:'+dc3+'"></span>'
+        +'<span style="font-weight:700;font-size:9px">'+inst+'</span>'
+        +' <span style="opacity:.7">'+v+' \u00b7 '+edge+'</span></span>');
+    }
+    evEl.innerHTML=events.join('');
+  }
 }
 (function(){ var on=false; try{ on = localStorage.getItem('dashAdv')==='1'; }catch(e){} _advApply(on); })();
 // ── Top controls collapsed into a single menu (DISPLAY-ONLY, this device) ──
