@@ -47167,10 +47167,22 @@ function toggleBLDrawer(){
   if(!vl) return;
   var open = vl.classList.toggle('drawer-open');
   var btn = document.getElementById('bl-drawer-btn');
-  if(btn){ btn.textContent = open ? '\u2715 Close details' : '\u2699 Details \u25be'; btn.classList.toggle('open', open); }
-  // When opening the drawer, also show Advanced panels so everything is visible
+  if(btn){ btn.textContent = open ? '\u2715 Hide panels' : '\u2699 Show panels \u25be'; btn.classList.toggle('open', open); }
   if(open){ _advApply(true); }
+  try{ localStorage.setItem('dashBLDrawer', open ? '1' : '0'); }catch(e){}
 }
+// Auto-open the panel drawer on desktop (>960px) — mobile media query already
+// shows everything.  User pref persisted in localStorage; default = OPEN.
+(function(){
+  var stored = null; try{ stored = localStorage.getItem('dashBLDrawer'); }catch(e){}
+  var shouldOpen = (stored === null) ? (window.innerWidth > 960) : (stored === '1');
+  if(shouldOpen){
+    var vl = document.getElementById('view-live');
+    var btn = document.getElementById('bl-drawer-btn');
+    if(vl){ vl.classList.add('drawer-open'); _advApply(true); }
+    if(btn){ btn.textContent = '\u2715 Hide panels'; btn.classList.add('open'); }
+  }
+})();
 
 function renderBLPanels(d){
   if(!d) return;
