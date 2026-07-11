@@ -75,150 +75,212 @@ function useStream(target: string, msPerChar = 14) {
   return { text, live };
 }
 
-// ── Digital face — 1s & 0s with blinking eyes and speaking mouth ─────────────
-function BrainFace({ speaking, color, glow }: {
-  speaking: boolean; color: string; glow: string;
+// ── Full digital face — all features in 1s & 0s ──────────────────────────────
+function BrainFace({ speaking, color, glow, status }: {
+  speaking: boolean; color: string; glow: string; status: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const spkRef    = useRef(speaking);
-  const colRef    = useRef(color);
-  useEffect(() => { spkRef.current = speaking; }, [speaking]);
-  useEffect(() => { colRef.current = color; },   [color]);
+  const propsRef  = useRef({ speaking, color, status });
+  useEffect(() => { propsRef.current = { speaking, color, status }; }, [speaking, color, status]);
 
   useEffect(() => {
     const cv = canvasRef.current;
     if (!cv) return;
     const ctx = cv.getContext('2d')!;
 
-    // Grid: 22 cols × 16 rows, each cell 9×11 px → canvas 198×176
-    const COLS = 22, ROWS = 16, CW = 9, CH = 11;
+    // 28 cols × 20 rows at 9×11 px → 252×220 canvas
+    const COLS = 28, ROWS = 20, CW = 9, CH = 11;
 
-    // Initialise random 1/0 character grid
     const grid: string[][] = Array.from({ length: ROWS }, () =>
       Array.from({ length: COLS }, () => (Math.random() < 0.5 ? '0' : '1'))
     );
 
-    // All geometry in cell-centre coordinates (col+0.5, row+0.5)
-    const FCX = 11,   FCY = 8,    FRX = 9.2,  FRY = 6.8;   // face ellipse
-    const LEX = 6.5,  LEY = 5.5,  ERX = 2.1,  ERY_F = 1.25; // left eye
-    const REX = 15.5, REY = 5.5;                              // right eye
-    const PR  = 0.72;                                          // pupil radius
-    const MX  = 11,   MY  = 11.5, MHW = 3.4,  MRY_MAX = 1.7; // mouth
+    // ── Geometry (all in cell-centre coords: col+0.5, row+0.5) ───────────────
+    const FCX = 14, FCY = 10, FRX = 12.5, FRY = 8.8;                     // face
+    const LBX = 8.5, RBX = 19.5, BY_B = 4.2, BWH = 2.3, BARCH = 0.7;    // brows
+    const LEX = 8.5, REX = 19.5, EY = 6.8;                                // eyes (shared Y)
+    const ERX = 2.5, ERY_F = 1.35, IRS_X = 1.45, IRS_Y = 1.15, PR = 0.73; // eye radii
+    const NX = 14, NBY1 = 9.5, NBY2 = 12.5;                               // nose bridge
+    const NLX = 12.5, NRX = 15.5, NNY = 12.8, NNR = 0.82;                // nostrils
+    const MX = 14, M_UY = 15.5, M_LY = 16.9, MHW = 4.5, M_OPEN = 1.9;  // mouth
 
-    function ell(px: number, py: number, cx: number, cy: number, rx: number, ry: number) {
-      return ry > 0.01 && ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 <= 1;
-    }
+    const ell = (px: number, py: number, cx: number, cy: number, rx: number, ry: number) =>
+      ry > 0.01 && ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 <= 1;
 
-    // Animation state
+    // Eyebrow Y at column cx (parabolic arch, raises with expression)
+    const browY = (cx: number, bx: number, raise: number) => {
+      const t = (cx - bx) / BWH;
+      return BY_B + raise - BARCH * Math.max(0, 1 - t * t);
+    };
+
+    // Upper lip: Cupid's bow via two Gaussians (M-shape)
+    const upperLipY = (cx: number, smile: number) => {
+      const g1 = 0.45 * Math.exp(-(((cx - (MX - 1.9)) / 1.5) ** 2));
+      const g2 = 0.45 * Math.exp(-(((cx - (MX + 1.9)) / 1.5) ** 2));
+      const sm = smile * 0.42 * ((cx - MX) / MHW) ** 2;  // corners curve up
+      return M_UY - (g1 + g2) - sm;
+    };
+
+    // Lower lip: fuller arc, drops when mouth opens, corners rise with smile
+    const lowerLipY = (cx: number, mo: number, smile: number) => {
+      const t  = (cx - MX) / (MHW - 0.5);
+      const sm = smile * 0.32 * ((cx - MX) / MHW) ** 2;
+      return M_LY + mo * M_OPEN + 0.52 * Math.max(0, 1 - t * t) - sm;
+    };
+
+    // ── Animation state ───────────────────────────────────────────────────────
     let blinkAmt = 0;
-    let blinkPhase: 'open' | 'closing' | 'closed' | 'opening' = 'open';
+    let blinkPhase: 'open'|'closing'|'closed'|'opening' = 'open';
     let blinkWait = 2.5 + Math.random() * 4;
-    let mouthOpen = 0;
+    let mouthOpen  = 0;
+    let smile      = 0.2;
+    let browRaise  = 0;
     let eox = 0, eoy = 0, tex = 0, tey = 0, ewait = 2;
     let cflip = 0;
-    let last = performance.now();
-    let raf = 0;
+    let last  = performance.now();
+    let raf   = 0;
 
     function frame(now: number) {
-      const dt  = Math.min((now - last) / 1000, 0.05);
-      last      = now;
-      const spk = spkRef.current;
-      const col = colRef.current;
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last     = now;
+      const { speaking: spk, color: col, status: st } = propsRef.current;
 
-      // Blink cycle
+      // Blink
       if (blinkPhase === 'open') {
         blinkWait -= dt;
         if (blinkWait <= 0) blinkPhase = 'closing';
       } else if (blinkPhase === 'closing') {
-        blinkAmt = Math.min(1, blinkAmt + dt * 11);
+        blinkAmt = Math.min(1, blinkAmt + dt * 12);
         if (blinkAmt >= 1) { blinkPhase = 'closed'; blinkWait = 0.06; }
       } else if (blinkPhase === 'closed') {
         blinkWait -= dt;
         if (blinkWait <= 0) blinkPhase = 'opening';
       } else {
-        blinkAmt = Math.max(0, blinkAmt - dt * 11);
+        blinkAmt = Math.max(0, blinkAmt - dt * 12);
         if (blinkAmt <= 0) { blinkPhase = 'open'; blinkWait = 3.5 + Math.random() * 5; }
       }
-      const eyeRY = ERY_F * (1 - blinkAmt * 0.97);
+      const eyeRY     = ERY_F * (1 - blinkAmt * 0.97);
+      const pupilRY   = PR * 0.88 * (1 - blinkAmt * 0.96);
 
-      // Eye drift (pupils wander gently)
+      // Pupil drift
       ewait -= dt;
       if (ewait <= 0) {
-        tex = (Math.random() - 0.5) * 1.1;
-        tey = (Math.random() - 0.5) * 0.45;
-        ewait = 2 + Math.random() * 3;
+        tex = (Math.random() - 0.5) * 1.3;
+        tey = (Math.random() - 0.5) * 0.5;
+        ewait = 2 + Math.random() * 3.5;
       }
       eox += (tex - eox) * dt * 2.5;
       eoy += (tey - eoy) * dt * 2.5;
 
-      // Mouth: oscillate when speaking, close silently
-      const tMouth = spk ? (0.4 + 0.6 * Math.abs(Math.sin(now * 0.011))) : 0;
-      mouthOpen   += (tMouth - mouthOpen) * Math.min(1, dt * 13);
+      // Mouth (oscillate fast when speaking)
+      const tMouth = spk ? (0.35 + 0.65 * Math.abs(Math.sin(now * 0.012))) : 0;
+      mouthOpen   += (tMouth - mouthOpen) * Math.min(1, dt * 14);
 
-      // Slow char shuffle for ambient noise
+      // Expression per status (lerped)
+      const tSmile = st === 'READY' ? 0.85 : st === 'MANAGING' ? 0.1 : 0.22;
+      const tBrow  = st === 'READY' ? -0.38 : st === 'MANAGING' ? 0.38 : st === 'BUILDING' ? -0.22 : 0;
+      smile     += (tSmile - smile)     * dt * 1.2;
+      browRaise += (tBrow  - browRaise) * dt * 1.2;
+
+      // Char shuffle
       cflip -= dt;
       if (cflip <= 0) {
-        cflip = 0.075;
-        for (let k = 0; k < 5; k++) {
+        cflip = 0.07;
+        for (let k = 0; k < 6; k++) {
           const r = Math.floor(Math.random() * ROWS);
           const c = Math.floor(Math.random() * COLS);
           grid[r][c] = grid[r][c] === '0' ? '1' : '0';
         }
       }
 
-      // Draw frame
+      // ── Draw ─────────────────────────────────────────────────────────────
       ctx.clearRect(0, 0, cv.width, cv.height);
       ctx.font         = 'bold 8px monospace';
       ctx.textAlign    = 'center';
       ctx.textBaseline = 'middle';
-      const mRY = mouthOpen * MRY_MAX;
 
       for (let row = 0; row < ROWS; row++) {
         for (let c = 0; c < COLS; c++) {
           const cx = c + 0.5, cy = row + 0.5;
-          const ch = grid[row][c];
-          const px = c  * CW + CW / 2;
-          const py = row * CH + CH / 2;
+          const ch  = grid[row][c];
+          const px  = c   * CW + CW / 2;
+          const py  = row * CH + CH / 2;
 
-          const inFace       = ell(cx, cy, FCX, FCY, FRX, FRY);
-          const inLE         = ell(cx, cy, LEX, LEY, ERX, eyeRY);
-          const inRE         = ell(cx, cy, REX, REY, ERX, eyeRY);
-          const inLP         = ell(cx, cy, LEX + eox, LEY + eoy, PR, PR * 0.9);
-          const inRP         = ell(cx, cy, REX + eox, REY + eoy, PR, PR * 0.9);
-          const closedL      = blinkAmt > 0.3 && Math.abs(cy - LEY) < 0.6 && Math.abs(cx - LEX) <= ERX;
-          const closedR      = blinkAmt > 0.3 && Math.abs(cy - REY) < 0.6 && Math.abs(cx - REX) <= ERX;
-          const inMouthOpen  = mouthOpen > 0.12 && cy >= MY - mRY * 0.4 && ell(cx, cy, MX, MY, MHW, mRY);
-          const inMouthLine  = mouthOpen <= 0.12 && Math.abs(cy - MY) < 0.58 && Math.abs(cx - MX) <= MHW;
+          const inFace = ell(cx, cy, FCX, FCY, FRX, FRY);
 
+          // Eyebrows
+          const lBrowY  = browY(cx, LBX, browRaise);
+          const rBrowY  = browY(cx, RBX, browRaise);
+          const inLBrow = Math.abs(cx - LBX) <= BWH + 0.5 && Math.abs(cy - lBrowY) < 0.53;
+          const inRBrow = Math.abs(cx - RBX) <= BWH + 0.5 && Math.abs(cy - rBrowY) < 0.53;
+
+          // Eyes (whites → iris → pupil)
+          const inLE    = ell(cx, cy, LEX, EY, ERX, eyeRY);
+          const inRE    = ell(cx, cy, REX, EY, ERX, eyeRY);
+          const inLI    = ell(cx, cy, LEX, EY, IRS_X, IRS_Y * (eyeRY / ERY_F));
+          const inRI    = ell(cx, cy, REX, EY, IRS_X, IRS_Y * (eyeRY / ERY_F));
+          const inLP    = ell(cx, cy, LEX + eox, EY + eoy, PR, pupilRY);
+          const inRP    = ell(cx, cy, REX + eox, EY + eoy, PR, pupilRY);
+          // Eyelid line (appears when eye is mostly closed)
+          const closedL = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.63 && Math.abs(cx - LEX) <= ERX;
+          const closedR = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.63 && Math.abs(cx - REX) <= ERX;
+
+          // Nose
+          const inBridge   = Math.abs(cx - NX) < 0.62 && cy >= NBY1 && cy <= NBY2;
+          const inLNostril = ell(cx, cy, NLX, NNY, NNR, 0.65);
+          const inRNostril = ell(cx, cy, NRX, NNY, NNR, 0.65);
+
+          // Mouth
+          const uLY        = upperLipY(cx, smile);
+          const lLY        = lowerLipY(cx, mouthOpen, smile);
+          const inULip     = Math.abs(cx - MX) <= MHW       && Math.abs(cy - uLY) < 0.55;
+          const inLLip     = Math.abs(cx - MX) <= MHW - 0.4 && Math.abs(cy - lLY) < 0.60;
+          const inMouthInt = mouthOpen > 0.08 && Math.abs(cx - MX) < MHW - 0.9
+                             && cy > uLY + 0.4 && cy < lLY - 0.3;
+          const inTeeth    = inMouthInt && mouthOpen > 0.28
+                             && cy < uLY + mouthOpen * 0.9;
+
+          // ── Render (priority: pupil > eyelid > iris > white > brow > teeth > interior > lip > nose > face > bg)
           ctx.globalAlpha = 1;
 
           if (inLP || inRP) {
-            ctx.fillStyle   = col;
-            ctx.globalAlpha = 0.92;
+            ctx.fillStyle = col; ctx.globalAlpha = 0.95;
             ctx.fillText('1', px, py);
           } else if (closedL || closedR) {
-            ctx.fillStyle   = col;
-            ctx.globalAlpha = Math.min(0.55, blinkAmt * 0.65);
+            ctx.fillStyle = col; ctx.globalAlpha = Math.min(0.58, blinkAmt * 0.7);
             ctx.fillText('-', px, py);
-          } else if (inLE || inRE) {
-            ctx.fillStyle   = '#e4e4e7';
-            ctx.globalAlpha = 0.60;
+          } else if (inLI || inRI) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.55;
             ctx.fillText(ch, px, py);
-          } else if (inMouthOpen) {
-            ctx.fillStyle   = col;
-            ctx.globalAlpha = 0.68 * mouthOpen;
+          } else if (inLE || inRE) {
+            ctx.fillStyle = '#e4e4e7'; ctx.globalAlpha = 0.56;
+            ctx.fillText(ch, px, py);
+          } else if (inLBrow || inRBrow) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.60;
+            ctx.fillText('1', px, py);
+          } else if (inTeeth) {
+            ctx.fillStyle = '#d4d4d8'; ctx.globalAlpha = 0.52 * mouthOpen;
+            ctx.fillText('1', px, py);
+          } else if (inMouthInt) {
+            ctx.fillStyle = '#000000'; ctx.globalAlpha = 0.72 * mouthOpen;
             ctx.fillText('0', px, py);
-          } else if (inMouthLine) {
-            ctx.fillStyle   = col;
-            ctx.globalAlpha = 0.22;
-            ctx.fillText('-', px, py);
+          } else if (inULip) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.48;
+            ctx.fillText(ch, px, py);
+          } else if (inLLip) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.52;
+            ctx.fillText(ch, px, py);
+          } else if (inBridge) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.16;
+            ctx.fillText(ch, px, py);
+          } else if (inLNostril || inRNostril) {
+            ctx.fillStyle = col; ctx.globalAlpha = 0.30;
+            ctx.fillText('0', px, py);
           } else if (inFace) {
-            ctx.fillStyle   = col;
-            ctx.globalAlpha = 0.09 + (Math.random() < 0.003 ? 0.11 : 0);
+            ctx.fillStyle = col; ctx.globalAlpha = 0.08 + (Math.random() < 0.003 ? 0.10 : 0);
             ctx.fillText(ch, px, py);
           } else {
-            ctx.fillStyle   = col;
-            ctx.globalAlpha = 0.027;
+            ctx.fillStyle = col; ctx.globalAlpha = 0.026;
             ctx.fillText(ch, px, py);
           }
         }
@@ -232,8 +294,8 @@ function BrainFace({ speaking, color, glow }: {
   }, []);
 
   return (
-    <div style={{ filter: `drop-shadow(0 0 22px ${glow})` }}>
-      <canvas ref={canvasRef} width={22 * 9} height={16 * 11} style={{ display: 'block' }} />
+    <div style={{ filter: `drop-shadow(0 0 32px ${glow})` }}>
+      <canvas ref={canvasRef} width={28 * 9} height={20 * 11} style={{ display: 'block' }} />
     </div>
   );
 }
@@ -500,7 +562,7 @@ export default function Home() {
         {/* Avatar + narration section */}
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 24, flex: 1, justifyContent: 'center', width: '100%' }}>
 
-          <BrainFace speaking={streaming} color={pal.dot} glow={pal.glow} />
+          <BrainFace speaking={streaming || asking} color={pal.dot} glow={pal.glow} status={status} />
 
           {/* Status · instrument · edge · direction */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, fontFamily: 'monospace', letterSpacing: '0.08em' }}>
