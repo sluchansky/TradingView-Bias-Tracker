@@ -128,9 +128,10 @@ function useTTS() {
   return { voices, voiceName, setVoice, muted, setMuted, speaking, speak };
 }
 
-// ── Digital portrait — 3D-lit face emerging from 1s & 0s ─────────────────────
-// Approach: Lambertian lighting on an ellipsoid face, Gaussian features (eye
-// socket shadows, nose/cheekbone highlights, jaw shadows), dense 6×8 grid.
+// ── Living particle intelligence — no human face, pure data cloud ─────────────
+// Particle zones: 0=bg stars, 1=head cloud, 2=eye_L, 3=eye_R, 4=mouth, 5=halo
+// Physics: each particle has a home; spring + sine-noise drives organic drift.
+// Status drives energy level → particle speed, brightness, color temperature.
 function BrainFace({ speaking, color, glow, status }: {
   speaking: boolean; color: string; glow: string; status: string;
 }) {
@@ -142,238 +143,183 @@ function BrainFace({ speaking, color, glow, status }: {
     const cv = canvasRef.current;
     if (!cv) return;
     const ctx = cv.getContext('2d')!;
+    const W = cv.width, H = cv.height;
 
-    // 40 cols × 42 rows at 6×8 px → 240×336 portrait canvas
-    const COLS = 40, ROWS = 42, CW = 6, CH = 8;
+    // Head geometry (all in canvas px)
+    const CX = W * 0.50, CY = H * 0.43;
+    const RX = W * 0.29, RY = H * 0.35;
+    const EL_X = CX - RX * 0.40, EL_Y = CY - RY * 0.19;
+    const ER_X = CX + RX * 0.40, ER_Y = CY - RY * 0.19;
+    const M_X  = CX,             M_Y  = CY + RY * 0.40;
 
-    const grid: string[][] = Array.from({ length: ROWS }, () =>
-      Array.from({ length: COLS }, () => (Math.random() < 0.5 ? '0' : '1'))
-    );
+    // Status → [face colour, eye colour, energy 0–1]
+    const S: Record<string, [string, string, number]> = {
+      READY:    ['#bfdbfe', '#ffffff', 1.00],
+      MANAGING: ['#67e8f9', '#e0f9ff', 0.88],
+      BUILDING: ['#60a5fa', '#bae6fd', 0.68],
+      WATCHING: ['#3b82f6', '#93c5fd', 0.50],
+      WAIT:     ['#2563eb', '#60a5fa', 0.36],
+    };
 
-    // ── Face geometry (cell-centre coords) ────────────────────────────────────
-    const FCX = 20, FCY = 22, FRX = 15.5, FRY = 18;  // main face ellipse
-    const LEX = 14, REX = 26, EY  = 19;               // eye centres (shared Y)
-    const ERX = 3.5, ERY_F = 2.2;                      // eye ellipse half-radii
-    const IRS_X = 2.0, IRS_Y = 1.6, PR = 1.05;        // iris / pupil
-    const MX = 20, MY = 29, MHW = 5.8, M_OPEN = 2.8; // mouth
+    type Pt = { x:number; y:number; vx:number; vy:number; hx:number; hy:number; sz:number; br:number; ph:number; z:number };
+    const pts: Pt[]   = [];
+    const bz: Pt[][] = [[], [], [], [], [], []];  // by zone
 
-    // sq avoids unary-minus-before-** parse errors
-    const sq = (x: number) => x * x;
-    const gauss = (cx: number, cy: number, gx: number, gy: number, srx: number, sry: number, amp: number) =>
-      amp * Math.exp(-(sq((cx - gx) / srx) + sq((cy - gy) / sry)));
-    const ell = (cx: number, cy: number, ex: number, ey: number, rx: number, ry: number) =>
-      ry > 0.01 && sq((cx - ex) / rx) + sq((cy - ey) / ry) <= 1;
+    const mk = (hx:number, hy:number, sz:number, br:number, z:number) => {
+      const p: Pt = { x:hx+(Math.random()-.5)*6, y:hy+(Math.random()-.5)*6, vx:0, vy:0, hx, hy, sz, br, ph:Math.random()*Math.PI*2, z };
+      pts.push(p); bz[z].push(p);
+    };
 
-    // ── 3D brightness model ────────────────────────────────────────────────────
-    // Returns -1 for background, 0.0-1.0 for face (driven by lighting + Gaussians)
-    function brightness(cx: number, cy: number, smile: number, browRaise: number, mouthOpen: number): number {
-      const dx = (cx - FCX) / FRX, dy = (cy - FCY) / FRY;
-      const r2 = sq(dx) + sq(dy);
-      if (r2 > 1.05) return -1;  // background
+    // Zone 0 — background star field
+    for (let i = 0; i < 75; i++)
+      mk(Math.random()*W, Math.random()*H, 0.6+Math.random()*0.9, 0.05+Math.random()*0.10, 0);
 
-      // Ellipsoid surface normal (paraboloid approx)
-      const nz   = Math.sqrt(Math.max(0, 1 - sq(dx) * 0.5 - sq(dy) * 0.5));
-      const nxF  = -dx * 0.60;
-      const nyF  = -dy * 0.60;
-      // Key light: upper-left, forward-facing (more frontal = brighter overall)
-      const lx   = -0.30, ly = -0.42, lz = 0.86;
-      const diff = Math.max(0, nxF * lx + nyF * ly + nz * lz);
-      // Rim: subtle fill from right
-      const rim  = 0.07 * Math.max(0, nxF * 0.5 + nz * 0.86);
-
-      // Higher ambient + stronger diffuse = brighter, younger-looking face
-      let b = 0.24 + diff * 0.72 + rim;
-
-      // ── Highlight Gaussians ──────────────────────────────────────────────
-      b += gauss(cx, cy, FCX, FCY - 1, 2.0, 6.0, 0.13);    // nose bridge (wider, softer)
-      b += gauss(cx, cy, FCX, FCY + 4, 2.5, 2.5, 0.14);    // nose tip
-      b += gauss(cx, cy, 9,   FCY - 1, 5.0, 4.0, 0.16);    // L cheekbone (brighter)
-      b += gauss(cx, cy, 31,  FCY - 1, 5.0, 4.0, 0.16);    // R cheekbone
-      b += gauss(cx, cy, 18,  FCY-13,  6.0, 4.5, 0.12);    // forehead center
-      b += gauss(cx, cy, FCX, MY - 0.8, 6.0, 1.2, 0.09 + smile * 0.06); // upper lip
-      b += gauss(cx, cy, FCX, MY + 1.8, 5.0, 1.0, 0.07 + smile * 0.05); // lower lip
-
-      // ── Shadow Gaussians — kept subtle to avoid gaunt/aged look ──────────
-      b -= gauss(cx, cy, LEX, EY, 3.8, 2.5, 0.22);                       // L eye socket (much softer)
-      b -= gauss(cx, cy, REX, EY, 3.8, 2.5, 0.22);                       // R eye socket
-      b -= gauss(cx, cy, LEX, EY - 2.2 + browRaise, 3.2, 1.2, 0.09);    // L sub-brow
-      b -= gauss(cx, cy, REX, EY - 2.2 + browRaise, 3.2, 1.2, 0.09);    // R sub-brow
-      b -= gauss(cx, cy, 17,  FCY + 3,  2.0, 3.5, 0.05);                 // L nasolabial (very subtle)
-      b -= gauss(cx, cy, 23,  FCY + 3,  2.0, 3.5, 0.05);                 // R nasolabial
-      b -= gauss(cx, cy, FCX, MY - 2.5, 2.5, 2.0, 0.07);                // philtrum
-      b -= gauss(cx, cy, FCX, MY + 4.0, 4.0, 1.5, 0.06);                // under-lip shadow
-      b -= gauss(cx, cy, 6,   FCY + 5,  4.0, 8.0, 0.13);                 // L jaw (wider, softer)
-      b -= gauss(cx, cy, 34,  FCY + 5,  4.0, 8.0, 0.13);                 // R jaw
-      b -= gauss(cx, cy, 5,   EY,       2.5, 4.5, 0.09);                 // L temple
-      b -= gauss(cx, cy, 35,  EY,       2.5, 4.5, 0.09);                 // R temple
-      b -= gauss(cx, cy, FCX, FCY + 17, 5.0, 2.5, 0.06);                // chin (softer)
-      b -= gauss(cx, cy, FCX, FCY - 16, 10.0, 3.0, 0.22);               // hairline (much less receding)
-
-      // Speaking: subtle mouth-region brightness pulse
-      if (mouthOpen > 0.1) b += gauss(cx, cy, FCX, MY, 5.0, 1.5, mouthOpen * 0.06);
-
-      return Math.max(0.02, Math.min(1.0, b));
+    // Zone 1 — head cloud (inside ellipse, denser centre)
+    for (let i = 0; i < 520; i++) {
+      let hx=0, hy=0, r2=2, tries=0;
+      while (r2>1 && tries++<60) {
+        hx = CX+(Math.random()*2-1)*RX; hy = CY+(Math.random()*2-1)*RY;
+        const ddx=(hx-CX)/RX, ddy=(hy-CY)/RY; r2=ddx*ddx+ddy*ddy;
+      }
+      const ef = Math.sqrt(r2);
+      mk(hx, hy, Math.max(0.5, 1.3+Math.random()*1.3-ef*0.9), Math.max(0.04, 0.11+Math.random()*0.19-ef*0.07), 1);
     }
 
-    // Upper lip: Cupid's bow via two Gaussians
-    const upperLipY = (cx: number, smile: number) => {
-      const g1 = 0.65 * Math.exp(-sq((cx - (MX - 2.6)) / 2.1));
-      const g2 = 0.65 * Math.exp(-sq((cx - (MX + 2.6)) / 2.1));
-      const sm = smile * 0.50 * sq((cx - MX) / MHW);
-      return MY - (g1 + g2) - sm;
-    };
-    const lowerLipY = (cx: number, mo: number, smile: number) => {
-      const t  = (cx - MX) / (MHW - 0.5);
-      const sm = smile * 0.38 * sq((cx - MX) / MHW);
-      return MY + 1.9 + mo * M_OPEN + 0.75 * Math.max(0, 1 - sq(t)) - sm;
-    };
+    // Zone 5 — halo ring
+    for (let i = 0; i < 90; i++) {
+      const a=(i/90)*Math.PI*2, r=1.06+Math.random()*0.11;
+      mk(CX+Math.cos(a)*RX*r, CY+Math.sin(a)*RY*r, 0.5+Math.random()*0.9, 0.07+Math.random()*0.13, 5);
+    }
 
-    // ── Animation state ───────────────────────────────────────────────────────
-    let blinkAmt = 0;
-    let blinkPhase: 'open'|'closing'|'closed'|'opening' = 'open';
-    let blinkWait = 2.5 + Math.random() * 4;
-    let mouthOpen = 0, smile = 0.22, browRaise = 0;
-    let eox = 0, eoy = 0, tex = 0, tey = 0, ewait = 2;
-    let cflip = 0, last = performance.now(), raf = 0;
+    // Zones 2+3 — eye particle clusters
+    for (let i = 0; i < 52; i++) {
+      const a=Math.random()*Math.PI*2, r=Math.sqrt(Math.random())*RX*0.13;
+      mk(EL_X+Math.cos(a)*r, EL_Y+Math.sin(a)*r*0.55, 1.4+Math.random()*2.1, 0.48+Math.random()*0.52, 2);
+      mk(ER_X+Math.cos(a)*r, ER_Y+Math.sin(a)*r*0.55, 1.4+Math.random()*2.1, 0.48+Math.random()*0.52, 3);
+    }
+
+    // Zone 4 — mouth region
+    for (let i = 0; i < 30; i++)
+      mk(M_X+(Math.random()-.5)*RX*0.40, M_Y+(Math.random()-.5)*RY*0.13, 0.8+Math.random()*1.2, 0.08+Math.random()*0.13, 4);
+
+    // Animation state
+    let t=0, pulseT=0;
+    let blinkAmt=0, blinkWait=3+Math.random()*5;
+    type BP = 'open'|'closing'|'closed'|'opening';
+    let blinkPhase: BP = 'open';
+    let last=performance.now(), raf=0;
 
     function frame(now: number) {
-      const dt = Math.min((now - last) / 1000, 0.05);
-      last     = now;
-      const { speaking: spk, color: col, status: st } = propsRef.current;
+      const dt = Math.min((now-last)/1000, 0.05);
+      last=now; t+=dt;
+      const { speaking:spk, status:st } = propsRef.current;
+      const [fCol, eCol, energy] = S[st] ?? S.WAIT;
+      const isReady=st==='READY', isMgmt=st==='MANAGING', isBuild=st==='BUILDING';
 
       // Blink
-      if (blinkPhase === 'open') {
-        blinkWait -= dt;
-        if (blinkWait <= 0) blinkPhase = 'closing';
-      } else if (blinkPhase === 'closing') {
-        blinkAmt = Math.min(1, blinkAmt + dt * 13);
-        if (blinkAmt >= 1) { blinkPhase = 'closed'; blinkWait = 0.07; }
-      } else if (blinkPhase === 'closed') {
-        blinkWait -= dt;
-        if (blinkWait <= 0) blinkPhase = 'opening';
-      } else {
-        blinkAmt = Math.max(0, blinkAmt - dt * 13);
-        if (blinkAmt <= 0) { blinkPhase = 'open'; blinkWait = 3.5 + Math.random() * 5.5; }
-      }
-      const eyeRY   = ERY_F * (1 - blinkAmt * 0.97);
-      const pupilRY = PR * (1 - blinkAmt * 0.96);
+      if (blinkPhase==='open')    { blinkWait-=dt; if (blinkWait<=0) blinkPhase='closing'; }
+      if (blinkPhase==='closing') { blinkAmt=Math.min(1,blinkAmt+dt*11); if (blinkAmt>=1)  { blinkPhase='closed'; blinkWait=0.09; } }
+      if (blinkPhase==='closed')  { blinkWait-=dt; if (blinkWait<=0) blinkPhase='opening'; }
+      if (blinkPhase==='opening') { blinkAmt=Math.max(0,blinkAmt-dt*11); if (blinkAmt<=0) { blinkPhase='open'; blinkWait=3.5+Math.random()*6; } }
 
-      // Pupil drift
-      ewait -= dt;
-      if (ewait <= 0) {
-        tex = (Math.random() - 0.5) * 2.0;
-        tey = (Math.random() - 0.5) * 0.8;
-        ewait = 2.5 + Math.random() * 4;
-      }
-      eox += (tex - eox) * dt * 2.5;
-      eoy += (tey - eoy) * dt * 2.5;
+      pulseT += dt * (isReady ? 1.6 : isMgmt ? 1.0 : 0.45);
 
-      // Mouth
-      const tMouth = spk ? (0.38 + 0.62 * Math.abs(Math.sin(now * 0.013))) : 0;
-      mouthOpen   += (tMouth - mouthOpen) * Math.min(1, dt * 14);
-
-      // Expression
-      const tSmile = st === 'READY' ? 0.88 : st === 'MANAGING' ? 0.06 : 0.22;
-      const tBrow  = st === 'READY' ? -0.55 : st === 'MANAGING' ? 0.55 : st === 'BUILDING' ? -0.28 : 0;
-      smile     += (tSmile - smile)     * dt * 1.2;
-      browRaise += (tBrow  - browRaise) * dt * 1.2;
-
-      // Char shuffle
-      cflip -= dt;
-      if (cflip <= 0) {
-        cflip = 0.055;
-        for (let k = 0; k < 8; k++) {
-          const r = Math.floor(Math.random() * ROWS);
-          const c = Math.floor(Math.random() * COLS);
-          grid[r][c] = grid[r][c] === '0' ? '1' : '0';
-        }
-      }
+      // Physics params driven by status
+      const turb   = spk ? 3.4 : isBuild ? 2.2 : isReady ? 1.5 : 0.65;
+      const spring = spk ? 0.030 : isReady ? 0.058 : 0.046;
 
       // ── Draw ─────────────────────────────────────────────────────────────
-      ctx.clearRect(0, 0, cv.width, cv.height);
-      ctx.font         = 'bold 6px monospace';
-      ctx.textAlign    = 'center';
-      ctx.textBaseline = 'middle';
+      // Trail: soft fade instead of clear → motion blur / glow persistence
+      ctx.fillStyle = 'rgba(0,0,0,0.13)';
+      ctx.fillRect(0, 0, W, H);
 
-      for (let row = 0; row < ROWS; row++) {
-        for (let c = 0; c < COLS; c++) {
-          const cx = c + 0.5, cy = row + 0.5;
-          const ch  = grid[row][c];
-          const px  = c   * CW + CW / 2;
-          const py  = row * CH + CH / 2;
-
-          const b = brightness(cx, cy, smile, browRaise, mouthOpen);
-
-          // ── Background ───────────────────────────────────────────────────
-          if (b < 0) {
-            ctx.fillStyle = col; ctx.globalAlpha = 0.022 + Math.random() * 0.006;
-            ctx.fillText(ch, px, py);
-            continue;
-          }
-
-          // ── Eye feature zones ────────────────────────────────────────────
-          const inLE    = ell(cx, cy, LEX, EY, ERX, eyeRY);
-          const inRE    = ell(cx, cy, REX, EY, ERX, eyeRY);
-          const inLI    = ell(cx, cy, LEX, EY, IRS_X, IRS_Y * (eyeRY / ERY_F));
-          const inRI    = ell(cx, cy, REX, EY, IRS_X, IRS_Y * (eyeRY / ERY_F));
-          const inLP    = ell(cx, cy, LEX + eox, EY + eoy, PR, pupilRY);
-          const inRP    = ell(cx, cy, REX + eox, EY + eoy, PR, pupilRY);
-          const closedL = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.9 && Math.abs(cx - LEX) <= ERX;
-          const closedR = blinkAmt > 0.45 && Math.abs(cy - EY) < 0.9 && Math.abs(cx - REX) <= ERX;
-
-          // ── Mouth zones ──────────────────────────────────────────────────
-          const uLY       = upperLipY(cx, smile);
-          const lLY       = lowerLipY(cx, mouthOpen, smile);
-          const inULip    = Math.abs(cx - MX) <= MHW && Math.abs(cy - uLY) < 0.75;
-          const inLLip    = Math.abs(cx - MX) <= MHW - 0.4 && Math.abs(cy - lLY) < 0.80;
-          const inMouthIn = mouthOpen > 0.08 && Math.abs(cx - MX) < MHW - 1.4
-                            && cy > uLY + 0.6 && cy < lLY - 0.4;
-          const inTeeth   = inMouthIn && mouthOpen > 0.3 && cy < uLY + mouthOpen * 1.2;
-
-          // ── Render (priority order) ───────────────────────────────────────
-          ctx.globalAlpha = 1;
-          if (inLP || inRP) {
-            ctx.fillStyle = col;          ctx.globalAlpha = 0.96;
-            ctx.fillText('1', px, py);
-          } else if (closedL || closedR) {
-            ctx.fillStyle = col;          ctx.globalAlpha = Math.min(0.65, blinkAmt * 0.78);
-            ctx.fillText('-', px, py);
-          } else if (inLI || inRI) {
-            ctx.fillStyle = col;          ctx.globalAlpha = 0.60;
-            ctx.fillText(ch, px, py);
-          } else if (inLE || inRE) {
-            ctx.fillStyle = '#e8e8ec';    ctx.globalAlpha = 0.58;
-            ctx.fillText(ch, px, py);
-          } else if (inTeeth) {
-            ctx.fillStyle = '#d0d0d8';    ctx.globalAlpha = 0.52 * mouthOpen;
-            ctx.fillText('1', px, py);
-          } else if (inMouthIn) {
-            ctx.fillStyle = '#060606';    ctx.globalAlpha = 0.78 * mouthOpen;
-            ctx.fillText('0', px, py);
-          } else if (inULip || inLLip) {
-            ctx.fillStyle = col;          ctx.globalAlpha = Math.min(0.98, b * 1.5);
-            ctx.fillText(ch, px, py);
-          } else {
-            // Face — brightness-driven opacity
-            ctx.fillStyle = col;          ctx.globalAlpha = Math.max(0.03, b * 0.90);
-            ctx.fillText(ch, px, py);
+      // Background constellation lines
+      const bg = bz[0];
+      ctx.lineWidth = 0.5;
+      for (let i=0; i<bg.length; i++) {
+        for (let j=i+1; j<bg.length; j++) {
+          const ddx=bg[i].x-bg[j].x, ddy=bg[i].y-bg[j].y, d2=ddx*ddx+ddy*ddy;
+          if (d2<5625) {  // ~75 px
+            ctx.globalAlpha = (1-d2/5625)*0.040;
+            ctx.strokeStyle = fCol;
+            ctx.beginPath(); ctx.moveTo(bg[i].x,bg[i].y); ctx.lineTo(bg[j].x,bg[j].y); ctx.stroke();
           }
         }
       }
-      ctx.globalAlpha = 1;
-      raf = requestAnimationFrame(frame);
+
+      // Halo pulse ring
+      if (isReady || isMgmt) {
+        const pulse = (Math.sin(pulseT*2.2)+1)*0.5;
+        ctx.globalAlpha = (1-pulse)*(isReady?0.20:0.11);
+        ctx.strokeStyle = fCol; ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.ellipse(CX, CY, RX*(1+pulse*0.42), RY*(1+pulse*0.42), 0, 0, Math.PI*2);
+        ctx.stroke();
+      }
+
+      // Breathing — head+halo home positions shift as a unit
+      const breathX = Math.sin(t*0.55)*1.9;
+      const breathY = Math.sin(t*0.37)*2.8;
+
+      // Update + render all particles
+      for (const p of pts) {
+        p.ph += dt*(0.36+turb*0.21);
+
+        // Two-octave sine noise field
+        const nx = (Math.sin(p.ph*1.61+p.hx*0.018)+Math.sin(p.ph*0.89+p.hy*0.014))*turb;
+        const ny = (Math.cos(p.ph*1.39+p.hx*0.012)+Math.cos(p.ph*0.76+p.hy*0.021))*turb;
+
+        const bx = (p.z===1||p.z===5) ? breathX : 0;
+        const by = (p.z===1||p.z===5) ? breathY : 0;
+
+        p.vx += (p.hx+bx-p.x+nx)*spring;
+        p.vy += (p.hy+by-p.y+ny)*spring;
+        p.vx *= 0.85; p.vy *= 0.85;
+        p.x  += p.vx; p.y  += p.vy;
+
+        // Zone-specific brightness
+        let drawBr = 0;
+        if (p.z===0) {
+          drawBr = p.br*(0.4+0.6*Math.abs(Math.sin(t*0.21+p.ph)));
+        } else if (p.z===1) {
+          drawBr = p.br*energy*(0.72+0.28*Math.sin(t*0.84+p.ph*0.11));
+          if (spk) drawBr *= 1+0.60*Math.abs(Math.sin(t*22+p.ph*2.2));
+        } else if (p.z===2||p.z===3) {
+          drawBr = p.br*(0.38+energy*0.62)*(1-blinkAmt*0.94);
+        } else if (p.z===4) {
+          drawBr = p.br*(spk ? 0.30+0.70*Math.abs(Math.sin(t*26+p.ph*2.0)) : 0.10*energy);
+        } else {
+          drawBr = p.br*(isReady ? 0.42+0.58*Math.abs(Math.sin(pulseT*2.8-p.ph)) : 0.10+0.14*Math.abs(Math.sin(t*0.65+p.ph)));
+        }
+        if (drawBr<0.013) continue;
+
+        const col = (p.z===2||p.z===3) ? eCol : fCol;
+
+        // Soft glow bloom for eyes
+        if ((p.z===2||p.z===3) && drawBr>0.22) {
+          ctx.fillStyle=eCol; ctx.globalAlpha=drawBr*0.17;
+          ctx.beginPath(); ctx.arc(p.x,p.y,p.sz*4.5,0,Math.PI*2); ctx.fill();
+        }
+
+        ctx.fillStyle=col; ctx.globalAlpha=Math.min(0.95,drawBr);
+        ctx.beginPath(); ctx.arc(p.x,p.y,p.sz,0,Math.PI*2); ctx.fill();
+      }
+
+      ctx.globalAlpha=1;
+      raf=requestAnimationFrame(frame);
     }
 
-    raf = requestAnimationFrame(frame);
+    raf=requestAnimationFrame(frame);
     return () => cancelAnimationFrame(raf);
   }, []);
 
   return (
-    <div style={{ filter: `drop-shadow(0 0 38px ${glow})` }}>
-      <canvas ref={canvasRef} width={40 * 6} height={42 * 8} style={{ display: 'block' }} />
+    <div style={{ filter: `drop-shadow(0 0 48px ${glow})` }}>
+      <canvas ref={canvasRef} width={280} height={340} style={{ display:'block' }} />
     </div>
   );
 }
+
 
 // ── Quick-prompt chips ────────────────────────────────────────────────────────
 function Chips({ status, onSelect }: { status: string; onSelect: (p: string) => void }) {
