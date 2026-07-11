@@ -114,17 +114,19 @@ function getBrainChecklist(data: any): Array<{ text: string; st: 'pass' | 'fail'
 }
 
 // ── Synthetic AI face canvas ───────────────────────────────────────────────────
-const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; speaking: boolean }) => {
+const AvatarCanvas = React.memo(({ avState, speaking, ringColor }: { avState: AvatarState; speaking: boolean; ringColor: string }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef   = useRef(0);
   const stateRef  = useRef(avState);
   const speakRef  = useRef(speaking);
+  const ringRef   = useRef(ringColor);
   const nodesRef  = useRef<{ x: number; y: number; phase: number }[]>([]);
   const partRef      = useRef<{ angle: number; r: number; speed: number; sz: number; phase: number }[]>([]);
   const nextBlinkRef = useRef(3);   // seconds from t0 until next blink fires
 
   useEffect(() => { stateRef.current = avState; }, [avState]);
   useEffect(() => { speakRef.current = speaking; }, [speaking]);
+  useEffect(() => { ringRef.current = ringColor; }, [ringColor]);
 
   useEffect(() => {
     const W = 240, H = 320;
@@ -431,6 +433,30 @@ const AvatarCanvas = React.memo(({ avState, speaking }: { avState: AvatarState; 
         ctx.beginPath(); ctx.arc(qx, qy, p.sz, 0, Math.PI * 2);
         ctx.fillStyle = rc(cfg.mesh, a); ctx.fill();
       });
+
+      // ── Confidence ring (outermost — communicates state before text is read) ─
+      // Drawn last so it sits outside face area and is always visible.
+      // Centered on face oval (CX,CY), not bobbing — the face moves inside it.
+      const rHex    = ringRef.current;
+      const rBreath = 0.58 + 0.32 * pulse;   // 0.58–0.90, breathes with pulse
+
+      // Wide outer glow (large shadow bloom)
+      ctx.save();
+      ctx.shadowBlur  = 24; ctx.shadowColor = rHex;
+      ctx.globalAlpha = Math.min(1, rBreath * 0.18);
+      ctx.beginPath();
+      ctx.ellipse(CX, CY, RX + 44, RY + 56, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = rHex; ctx.lineWidth = 10; ctx.stroke();
+      ctx.restore();
+
+      // Crisp main ring (thin, precise edge)
+      ctx.save();
+      ctx.shadowBlur  = 9; ctx.shadowColor = rHex;
+      ctx.globalAlpha = Math.min(1, rBreath * 0.84);
+      ctx.beginPath();
+      ctx.ellipse(CX, CY, RX + 37, RY + 47, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = rHex; ctx.lineWidth = 1.8; ctx.stroke();
+      ctx.restore();
 
       animRef.current = requestAnimationFrame(draw);
     };
@@ -918,6 +944,17 @@ export default function Home() {
   const avCfg = AV_CFG[avState];
   const eyeColor = `rgb(${avCfg.eye[0]},${avCfg.eye[1]},${avCfg.eye[2]})`;
 
+  // Confidence ring color — communicates AI state at a glance before text is read
+  const ringColor = (() => {
+    if (!isOpen && data)    return '#374151';   // gray   — market closed
+    if (isManaging)         return '#06b6d4';   // cyan   — active trade monitoring
+    if (status === 'READY') return '#22c55e';   // green  — trade ready
+    if (edge >= 60)         return '#f97316';   // orange — high attention, close to READY
+    if (edge >= 40)         return '#eab308';   // yellow — setup forming
+    if (edge >= 15)         return '#3b82f6';   // blue   — observing, scanning
+    return '#374151';                            // gray   — no edge / insufficient data
+  })();
+
   useEffect(() => {
     if (narration && narration !== lastSpokenRef.current) { lastSpokenRef.current = narration; speakRef.current(narration); }
   }, [narration]);
@@ -1201,7 +1238,7 @@ export default function Home() {
                 <div style={{ position:'absolute', inset:-14, borderRadius:'50%',
                   background:`radial-gradient(ellipse at center, ${auraColor}14 0%, transparent 70%)`,
                   animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none' }} />
-                <AvatarCanvas avState={avState} speaking={speaking} />
+                <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} />
               </div>
               {/* State label below avatar */}
               <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:7 }}>
