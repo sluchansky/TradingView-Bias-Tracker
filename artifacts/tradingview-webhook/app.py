@@ -37431,6 +37431,11 @@ def dashboard():
   .mb-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
   .mb-chip{background:#1a1230;color:#cbb6ff;border:1px solid #3a2363;border-radius:14px;padding:5px 12px;font-size:11px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:background .15s,border-color .15s,color .15s}
   .mb-chip:hover{background:#241a3a;border-color:rgba(142,162,255,.5);color:#ddd4ff}
+  .mb-chip-wait{border-color:#78350f;color:#fbbf24}.mb-chip-wait:hover{border-color:#f59e0b;background:#1c1000;color:#fcd34d}
+  .mb-chip-ready{border-color:#14532d;color:#4ade80}.mb-chip-ready:hover{border-color:#22c55e;background:#001a06;color:#86efac}
+  .mb-chip-manage{border-color:#0c4a6e;color:#38bdf8}.mb-chip-manage:hover{border-color:#0ea5e9;background:#00101a;color:#7dd3fc}
+  .mb-chip-block{border-color:#7f1d1d;color:#f87171}.mb-chip-block:hover{border-color:#ef4444;background:#1a0000;color:#fca5a5}
+  .mb-qq-state{font-size:9px;text-transform:uppercase;letter-spacing:1.2px;font-weight:800;margin-bottom:4px;opacity:.7}
   .mb-chat-row{display:flex;gap:6px}
   .mb-chat-row input{flex:1;background:#0a0817;border:1px solid #3a2363;border-radius:8px;color:#efe9ff;padding:11px 13px;font-size:13px;transition:border-color .18s,box-shadow .18s}
   .mb-chat-row input:focus{outline:none;border-color:rgba(142,162,255,.65);box-shadow:0 0 0 3px rgba(125,140,255,.12)}
@@ -38211,15 +38216,7 @@ def dashboard():
          DISPLAY-ONLY: it NEVER places, sizes, or changes a trade. -->
     <div class="mb-chat-h">💬 Talk to your partner <span style="font-size:9px;color:#6b7280;letter-spacing:1px">LIVE STATE · READ-ONLY</span></div>
     <div id="mb-chat-log" class="mb-chat-log"></div>
-    <div class="mb-chips">
-      <button type="button" class="mb-chip" onclick="mbAsk('Why are you waiting? What is keeping the current setup from being READY right now?')">WHY WAIT?</button>
-      <button type="button" class="mb-chip" onclick="mbAsk('What exactly would make this setup READY? List what still needs to happen.')">WHAT'S MISSING?</button>
-      <button type="button" class="mb-chip" onclick="mbAsk('Is this a good entry right now or is it late and extended? Where is price relative to VWAP, structure and the nearest zones?')">ENTRY OK?</button>
-      <button type="button" class="mb-chip" onclick="mbAsk('I am managing a position right now — where should my stop go and should I take partials? Use my open trade if there is one.')">MANAGE TRADE</button>
-      <button type="button" class="mb-chip" onclick="mbAsk('What would invalidate this trade or setup, and at what point should I stand aside?')">INVALIDATION?</button>
-      <button type="button" class="mb-chip" onclick="mbAsk('Is this a scalp or a swing setup right now, and why?')">SCALP OR SWING?</button>
-      <button type="button" class="mb-chip" onclick="mbAsk('Give me a risk check: my risk rules, daily limits, contracts used, profit and loss today, and whether it is safe to take another trade right now.')">RISK CHECK</button>
-    </div>
+    <div id="mb-quick-q" class="mb-chips"></div>
     <div class="mb-chat-row">
       <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
       <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask →</button>
@@ -41134,6 +41131,70 @@ function mbChangeMessages(prev, sig){
     m.push({kind:'risk', text:'Risk elevated to '+sig.risk+'.'});
   return m;
 }
+// ── Contextual quick questions — chip set changes with the bot state. DISPLAY-ONLY. ──
+const MB_QUICK_QS = {
+  wait: {
+    cls:'mb-chip-wait', label:'WAITING', color:'#f59e0b',
+    chips:[
+      {t:'Why wait?',         q:'Why are you saying WAIT right now? What specific conditions are keeping this from being READY? Be precise about what is missing.'},
+      {t:'What is missing?',  q:'What exactly is still missing from this setup? List each unmet condition and explain why it matters before I can enter.'},
+      {t:'What price matters?',q:'What is the key price level I should be watching right now? Where would a move to that level change the situation?'},
+      {t:'What changes your mind?',q:'What would need to happen to flip this from WAIT to READY? Give me the exact trigger I am looking for.'},
+    ]
+  },
+  ready: {
+    cls:'mb-chip-ready', label:'READY', color:'#22c55e',
+    chips:[
+      {t:'Why this trade?',   q:'Walk me through why this trade is worth taking right now. What is the edge, why now, and why this instrument?'},
+      {t:'Show learning proof',q:'What does my trade history say about this type of setup? Has this pattern worked before and what were the outcomes?'},
+      {t:'What is the risk?', q:'What is the exact risk on this trade? Stop level, expected contract size, dollar risk, and whether that fits my rules.'},
+      {t:'What invalidates it?',q:'At what point is this trade invalid? What price action or condition would tell you I should stand aside immediately?'},
+    ]
+  },
+  manage: {
+    cls:'mb-chip-manage', label:'MANAGING', color:'#38bdf8',
+    chips:[
+      {t:'Is the thesis intact?',q:'With my position open right now, is the original trade thesis still valid? What has changed since entry and does it still hold?'},
+      {t:'Should I hold?',    q:'Should I hold this trade or is there a reason to exit early? Give me a clear hold or exit recommendation with reasoning.'},
+      {t:'What would trigger an exit?',q:'What specific event or price action would tell you to exit this trade right now? What am I watching for?'},
+      {t:'Is momentum weakening?',q:'Is the momentum behind this trade weakening? Are there signs the move is exhausting or starting to reverse?'},
+    ]
+  },
+  block: {
+    cls:'mb-chip-block', label:'BLOCKED', color:'#f87171',
+    chips:[
+      {t:'What blocked it?',  q:'What exactly blocked this setup? Walk me through which condition or gate caused the INVALIDATED verdict.'},
+      {t:'Is this a learning block?',q:'Is this setup being blocked because of patterns from my trade history? Show me the learning data behind this block.'},
+      {t:'Is this a risk block?',q:'Is this a risk or volatility block? What are the current risk metrics or conditions flagging this setup?'},
+      {t:'Show similar failures',q:'Show me similar setups from my history that failed. What did they have in common with this current situation?'},
+    ]
+  },
+};
+function mbStatusToQSet(status){
+  if(status==='READY'||status==='EARLY')       return 'ready';
+  if(status==='MANAGING')                       return 'manage';
+  if(status==='INVALIDATED')                    return 'block';
+  return 'wait';  // WATCHING / BUILDING / WAIT
+}
+function renderMBQuickQ(status){
+  const wrap = document.getElementById('mb-quick-q');
+  if(!wrap) return;
+  const key = mbStatusToQSet(status);
+  const set = MB_QUICK_QS[key];
+  if(!set){ wrap.innerHTML=''; return; }
+  wrap.innerHTML = '';
+  const lbl = document.createElement('div'); lbl.className='mb-qq-state';
+  lbl.textContent = set.label; lbl.style.color = set.color;
+  wrap.appendChild(lbl);
+  set.chips.forEach(function(c){
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'mb-chip ' + set.cls;
+    btn.textContent = c.t;
+    btn.onclick = function(){ mbAsk(c.q); };
+    wrap.appendChild(btn);
+  });
+}
 function renderMainBrain(d){
   const mod = document.getElementById('mod-brain');
   if(!mod) return;
@@ -41143,6 +41204,7 @@ function renderMainBrain(d){
   const badge = document.getElementById('mb-badge');
   if(badge){ badge.textContent = status; badge.style.background = MB_BADGE_COLORS[status] || '#6b7280'; }
   renderMBAvatar(mb, d);
+  renderMBQuickQ(status);
   const summary = (mb && mb.summary) || 'Waiting for live data…';
   const sumEl = document.getElementById('mb-summary');
   if(sumEl) sumEl.textContent = summary;
