@@ -1235,6 +1235,8 @@ export default function Home() {
       .chart-hdr-extra{display:none!important;}
       .quick-chips{gap:5px!important;}
     }
+    .sat-col{opacity:0.40;transition:opacity 0.35s ease;}
+    .sat-col:hover{opacity:0.90!important;}
     @media(max-width:1000px){.sat-col{display:none!important;}.avtr-col{justify-content:center;}}
     @media(max-width:760px){.intel-strip{flex-wrap:wrap!important;}.intel-strip>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.intel-strip{display:none!important;}}
@@ -1441,7 +1443,9 @@ export default function Home() {
           )}
 
           {/* ── MAIN BRAIN COMMAND CENTER ───────────────────────────────── */}
-          <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:320 }}>
+          <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:320,
+            position:'relative',
+            background:`radial-gradient(ellipse 700px 560px at 38% 46%, ${auraColor}06 0%, transparent 72%)` }}>
 
             {/* Avatar command center — avatar flanked by live intelligence panels */}
             <div className="avtr-col" style={{ flexShrink:0, display:'flex', flexDirection:'row', gap:10, alignItems:'flex-start' }}>
@@ -1498,19 +1502,43 @@ export default function Home() {
 
               {/* ── AVATAR CENTER ────────────────────────────────────────────── */}
               <div style={{ display:'flex', flexDirection:'column', alignItems:'center' }}>
-                <div style={{ position:'relative' }}>
-                  <div style={{ position:'absolute', inset:-14, borderRadius:'50%',
-                    background:`radial-gradient(ellipse at center, ${auraColor}14 0%, transparent 70%)`,
-                    animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none' }} />
-                  <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+
+                {/* Spotlight stage — avatar's visual territory, 1.2× scaled */}
+                <div style={{ position:'relative', width:292, height:390, flexShrink:0 }}>
+
+                  {/* Layer 1 — wide ambient spotlight, largest + softest */}
+                  <div style={{ position:'absolute', top:-100, left:-120, right:-120, bottom:-60,
+                    background:`radial-gradient(ellipse at 50% 46%, ${auraColor}18 0%, ${auraColor}07 40%, transparent 70%)`,
+                    pointerEvents:'none', zIndex:0 }} />
+
+                  {/* Layer 2 — breathing inner halo, animates with avrPulse */}
+                  <div style={{ position:'absolute', inset:-22,
+                    background:`radial-gradient(ellipse at 50% 46%, ${auraColor}26 0%, transparent 64%)`,
+                    animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none', zIndex:0 }} />
+
+                  {/* Layer 3 — floor-light: upward bloom rising from base */}
+                  <div style={{ position:'absolute', bottom:-28, left:'8%', right:'8%', height:68,
+                    background:`radial-gradient(ellipse at 50% 100%, ${auraColor}20 0%, transparent 70%)`,
+                    pointerEvents:'none', zIndex:0 }} />
+
+                  {/* Canvas at 1.2× visual scale, centered in stage */}
+                  <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
+                    justifyContent:'center', transform:'scale(1.2)', transformOrigin:'center center', zIndex:1 }}>
+                    <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+                  </div>
+
                 </div>
-                <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:7 }}>
-                  <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor, boxShadow:`0 0 6px ${verdictColor}` }} />
+
+                {/* Status badge */}
+                <div style={{ marginTop:4, display:'flex', alignItems:'center', gap:7 }}>
+                  <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor,
+                    boxShadow:`0 0 8px ${verdictColor}, 0 0 18px ${verdictColor}44` }} />
                   <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
-                    color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>
+                    color:'rgba(255,255,255,0.38)', textTransform:'uppercase' }}>
                     {avState === 'ACTIVE' ? 'MANAGING' : avState === 'READY_LONG' ? 'LONG SETUP' : avState === 'READY_SHORT' ? 'SHORT SETUP' : avState === 'NO_EDGE' ? 'NO EDGE' : 'WATCHING'}
                   </span>
                 </div>
+
               </div>
 
               {/* ── RIGHT PANELS ─────────────────────────────────────────────── */}
