@@ -713,6 +713,100 @@ function getEvidenceRadar(
 }
 
 // ── Mission Control Card ──────────────────────────────────────────────────────
+// ── Evidence connector lines ───────────────────────────────────────────────────
+type SigColor = 'gray' | 'blue' | 'yellow' | 'green' | 'red';
+const SIG_LINE: Record<SigColor, { stroke: string; w: number; dash: string }> = {
+  gray:   { stroke: 'rgba(120,132,155,0.13)', w: 0.65, dash: '2 9' },
+  blue:   { stroke: 'rgba(96,165,250,0.38)',  w: 0.90, dash: '4 6' },
+  yellow: { stroke: 'rgba(251,191,36,0.44)',  w: 1.00, dash: '3 5' },
+  green:  { stroke: 'rgba(34,197,94,0.50)',   w: 1.10, dash: '4 5' },
+  red:    { stroke: 'rgba(239,68,68,0.47)',   w: 1.00, dash: '3 5' },
+};
+const SIG_PTCL: Record<SigColor, string> = {
+  gray:   'transparent',
+  blue:   'rgba(147,197,253,0.72)',
+  yellow: 'rgba(253,224,71,0.82)',
+  green:  'rgba(74,222,128,0.90)',
+  red:    'rgba(252,165,165,0.85)',
+};
+const SIG_PR:  Record<SigColor, number> = { gray: 0,   blue: 1.4, yellow: 1.7, green: 2.0, red: 1.8 };
+const SIG_DUR: Record<SigColor, number> = { gray: 99,  blue: 3.8, yellow: 2.8, green: 2.2, red: 2.5 };
+// SVG coordinate space: 618 × 584 px
+//   width:  leftCol(130) + gap(8) + avatar(342) + gap(8) + rightCol(130) = 618
+//   height: topRow(~56) + gap(8) + midRow(455) + gap(8) + botRow(~56) = 583
+const AVC_X = 309, AVC_Y = 291, AVC_R = 118;
+const MC_CARDS: { cx: number; cy: number; id: string }[] = [
+  { cx: 100, cy:  28, id: 'edge'     }, // top-row col 0
+  { cx: 309, cy:  28, id: 'winprob'  }, // top-row col 1
+  { cx: 518, cy:  28, id: 'strategy' }, // top-row col 2
+  { cx:  65, cy: 137, id: 'bias'     }, // left-col row 0
+  { cx:  65, cy: 291, id: 'struct'   }, // left-col row 1
+  { cx:  65, cy: 446, id: 'liq'      }, // left-col row 2
+  { cx: 553, cy: 137, id: 'vwap'     }, // right-col row 0
+  { cx: 553, cy: 291, id: 'flow'     }, // right-col row 1
+  { cx: 553, cy: 446, id: 'volume'   }, // right-col row 2
+  { cx: 100, cy: 555, id: 'plan'     }, // bot-row col 0
+  { cx: 309, cy: 555, id: 'volt'     }, // bot-row col 1
+  { cx: 518, cy: 555, id: 'risk'     }, // bot-row col 2
+];
+function connPts(cx: number, cy: number) {
+  const dx = AVC_X - cx, dy = AVC_Y - cy;
+  const d  = Math.sqrt(dx * dx + dy * dy) || 1;
+  return {
+    x1: (cx + dx / d * 24).toFixed(1), y1: (cy + dy / d * 24).toFixed(1),
+    x2: (AVC_X - dx / d * AVC_R).toFixed(1), y2: (AVC_Y - dy / d * AVC_R).toFixed(1),
+  };
+}
+function ConnectorSVG({ sigs, flashIds }: { sigs: SigColor[]; flashIds: Set<string> }) {
+  return (
+    <svg viewBox="0 0 618 584" style={{
+      position: 'absolute', inset: 0, width: '100%', height: '100%',
+      pointerEvents: 'none', zIndex: 0, overflow: 'visible',
+    }}>
+      <defs>
+        {MC_CARDS.map(c => {
+          const p = connPts(c.cx, c.cy);
+          return <path key={c.id} id={`cp-${c.id}`}
+            d={`M${p.x1},${p.y1} L${p.x2},${p.y2}`} fill="none" />;
+        })}
+      </defs>
+      {MC_CARDS.map((c, i) => {
+        const sig   = (sigs[i] ?? 'gray') as SigColor;
+        const p     = connPts(c.cx, c.cy);
+        const ls    = SIG_LINE[sig];
+        const active = sig !== 'gray';
+        const flash  = flashIds.has(c.id);
+        return (
+          <g key={c.id}>
+            {/* Static dashed connector */}
+            <line x1={p.x1} y1={p.y1} x2={p.x2} y2={p.y2}
+              stroke={ls.stroke} strokeWidth={ls.w} strokeLinecap="round"
+              strokeDasharray={ls.dash} />
+            {/* One-shot brighten on signal change */}
+            {flash && (
+              <line x1={p.x1} y1={p.y1} x2={p.x2} y2={p.y2}
+                stroke={SIG_PTCL[sig]} strokeWidth={ls.w + 1.5} strokeLinecap="round"
+                style={{ animation: 'connFlash 1.4s ease-out forwards' } as React.CSSProperties} />
+            )}
+            {/* Particle flowing toward avatar */}
+            {active && (
+              <circle r={SIG_PR[sig]} fill={SIG_PTCL[sig]}>
+                <animateMotion
+                  dur={`${SIG_DUR[sig]}s`}
+                  repeatCount="indefinite"
+                  begin={`-${((i * 0.31) % SIG_DUR[sig]).toFixed(2)}s`}
+                  keyPoints="0;1" keyTimes="0;1" calcMode="linear">
+                  <mpath href={`#cp-${c.id}`} />
+                </animateMotion>
+              </circle>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 function McCard({ label, value, sub, col = 'rgba(255,255,255,0.75)', delay = 0, dot }: {
   label: string; value: React.ReactNode; sub?: React.ReactNode;
   col?: string; delay?: number; dot?: EvStrength;
@@ -1506,6 +1600,37 @@ export default function Home() {
   const gd  = (data?.gate_debug        || {}) as Record<string,any>;
   const eb  = (data?.edge_breakdown    || mb.edge_breakdown || {}) as Record<string,any>;
 
+  // Connector signal colors — one per MC card (same order as MC_CARDS)
+  const connSigs: SigColor[] = [
+    edge >= 75 ? 'green' : edge >= 55 ? 'yellow' : edge >= 30 ? 'blue' : 'gray',
+    (() => { const ep = Number(data?.entry_probability ?? (data?.analyst as any)?.entry_probability ?? 0); return ep >= 65 ? 'green' : ep >= 45 ? 'yellow' : 'gray'; })(),
+    (data?.active_strategy || data?.strategy_mode || sig.strategy) ? 'blue' : 'gray',
+    (() => { const b = String(sig.bias || '').toLowerCase(); return /bull/.test(b) ? 'green' : /bear/.test(b) ? 'red' : 'gray'; })(),
+    !!gd.structure_confirmed ? 'green' : 'gray',
+    !!gd.zone_valid ? 'yellow' : (data?.nearest_demand || data?.nearest_supply) ? 'blue' : 'gray',
+    (() => { const vv = Number(data?.vwap_value || 0), pp = Number(data?.price || 0); return vv > 0 ? (pp > vv ? 'green' : 'red') : 'gray'; })(),
+    (() => { const c = String(sig.cvd || ad.cvd || '').toLowerCase(); return /bull|pos/.test(c) ? 'green' : /bear|neg/.test(c) ? 'red' : 'gray'; })(),
+    (() => { const v = String(ad.volume || '').toLowerCase(); return /strong|high/.test(v) ? 'green' : /incr/.test(v) ? 'yellow' : /low|thin/.test(v) ? 'gray' : 'blue'; })(),
+    (() => { const tp = (data?.trade_plan || {}) as Record<string,any>; return (tp.entry || tp.stop) ? (status === 'READY' ? 'green' : 'blue') : 'gray'; })(),
+    (() => { const vr = Number((data?.volatility as any)?.ratio ?? data?.vol_ratio ?? 0); return vr > 2.5 ? 'red' : vr > 1.5 ? 'yellow' : vr > 0 ? 'green' : 'gray'; })(),
+    (() => { const r = String((data?.risk_level ?? sig.risk_level ?? '') as string).toLowerCase(); return /high/.test(r) ? 'red' : /med/.test(r) ? 'yellow' : /low/.test(r) ? 'green' : 'blue'; })(),
+  ];
+  const connSigStr = connSigs.join(',');
+  const connSigsPrev = useRef('');
+  const [flashIds, setFlashIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!connSigsPrev.current) { connSigsPrev.current = connSigStr; return; }
+    if (connSigStr === connSigsPrev.current) return;
+    const prev = connSigsPrev.current.split(',');
+    const changed = new Set<string>();
+    connSigs.forEach((s, idx) => { if (s !== prev[idx]) changed.add(MC_CARDS[idx].id); });
+    connSigsPrev.current = connSigStr;
+    if (changed.size === 0) return;
+    setFlashIds(changed);
+    const t = setTimeout(() => setFlashIds(new Set()), 1500);
+    return () => clearTimeout(t);
+  }, [connSigStr]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Session memory ──────────────────────────────────────────────────────────
   const todayStr = getToday();
   const [showBriefing, setShowBriefing] = useState<boolean>(() => {
@@ -1770,18 +1895,19 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
-    .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;}
+    .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
     .mc-top-row,.mc-bot-row{display:flex;gap:8px;}
     .mc-top-row>.mc-card,.mc-bot-row>.mc-card{flex:1;min-width:0;}
     .mc-mid-row{display:flex;gap:8px;align-items:stretch;}
     .mc-col{display:flex;flex-direction:column;gap:8px;width:130px;flex-shrink:0;}
     .mc-col>.mc-card{flex:1;min-height:0;}
-    .mc-card{background:rgba(5,8,18,0.58);border:1px solid rgba(255,255,255,0.036);border-radius:10px;padding:10px 12px;transition:border-color 0.6s ease,box-shadow 0.6s ease,background 0.25s ease;animation:mcFloat 7s ease-in-out infinite;}
+    .mc-card{background:rgba(5,8,18,0.58);border:1px solid rgba(255,255,255,0.036);border-radius:10px;padding:10px 12px;transition:border-color 0.6s ease,box-shadow 0.6s ease,background 0.25s ease;animation:mcFloat 7s ease-in-out infinite;position:relative;z-index:1;}
     .mc-card:hover{background:rgba(10,15,34,0.72)!important;border-color:rgba(255,255,255,0.09)!important;}
     .mc-label{font-size:8.5px;font-family:monospace;font-weight:700;letter-spacing:0.10em;text-transform:uppercase;color:rgba(255,255,255,0.18);}
     .mc-value{font-size:13px;font-family:monospace;font-weight:800;letter-spacing:0.03em;line-height:1.1;margin-top:4px;opacity:0.82;}
     .mc-sub{font-size:9px;font-family:monospace;color:rgba(255,255,255,0.18);margin-top:3px;line-height:1.3;}
     @keyframes mcFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-1.8px)}}
+    @keyframes connFlash{0%{opacity:0.92}50%{opacity:0.55}100%{opacity:0}}
     @media(max-width:1100px){.mc-col{width:108px!important;}.mc-card{padding:7px 9px!important;}.mc-value{font-size:11.5px!important;}}
     @media(max-width:900px){.mc-stage{display:none!important;}}
   `;
@@ -1998,6 +2124,7 @@ export default function Home() {
 
             {/* ── MISSION CONTROL STAGE — avatar centered, 12 live telemetry cards ── */}
             <div className="mc-stage">
+              <ConnectorSVG sigs={connSigs} flashIds={flashIds} />
 
               {/* TOP ROW — Edge Score · Win Probability · Strategy */}
               <div className="mc-top-row">
