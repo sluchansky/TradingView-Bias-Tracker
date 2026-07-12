@@ -73,5 +73,10 @@
     "vite": "catalog:",
     "wouter": "^3.3.5",
     "zod": "catalog:"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "^3.5.5",
+    "@types/three": "^0.185.1",
+    "three": "^0.182.0"
   }
 }
