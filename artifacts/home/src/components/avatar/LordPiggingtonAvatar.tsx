@@ -407,6 +407,52 @@ function LordPiggingtonAvatar({ avState, speaking, gazeEvent, speechCtrlRef, deb
         if (spine) { spine.rotation.x = breathRot * 0.5; spine.rotation.z = swayRot * 0.4; }
         const uc = hum?.getNormalizedBoneNode?.('upperChest' as never);
         if (uc) { uc.rotation.x = breathRot * 0.3; uc.rotation.z = swayRot * 0.25; }
+
+        // ── Arm & leg walk cycle ─────────────────────────────────────────────
+        // Amplitude scales with market state — READY is energetic, STOP is sluggish
+        const walkHz  = 0.52; // comfortable idle cadence (~1 step/s)
+        const phi     = elapsed * Math.PI * 2 * walkHz;
+        const ampMult = (state === 'READY_LONG' || state === 'READY_SHORT') ? 1.55
+                      : state === 'TARGET_HIT' ? 2.0
+                      : state === 'STOP_HIT'   ? 0.28
+                      : 1.0;
+
+        // Upper-arm X = forward / back flex; sin alternates L vs R
+        const armSwing  = Math.sin(phi) * 0.30 * ampMult;
+        // Elbow bends when the arm is swinging back (trailing phase)
+        const elbowL    = 0.14 + Math.max(0,  Math.sin(phi + Math.PI * 0.5)) * 0.26 * ampMult;
+        const elbowR    = 0.14 + Math.max(0, -Math.sin(phi + Math.PI * 0.5)) * 0.26 * ampMult;
+
+        const lUA = hum?.getNormalizedBoneNode?.('leftUpperArm'  as never);
+        if (lUA) { lUA.rotation.x =  armSwing; lUA.rotation.z = swayRot * 0.2; }
+        const lLA = hum?.getNormalizedBoneNode?.('leftLowerArm'  as never);
+        if (lLA) { lLA.rotation.x = elbowL; }
+        const rUA = hum?.getNormalizedBoneNode?.('rightUpperArm' as never);
+        if (rUA) { rUA.rotation.x = -armSwing; rUA.rotation.z = -swayRot * 0.2; }
+        const rLA = hum?.getNormalizedBoneNode?.('rightLowerArm' as never);
+        if (rLA) { rLA.rotation.x = elbowR; }
+
+        // Legs swing opposite phase to same-side arm (natural counter-sway)
+        const legSwing = Math.sin(phi + Math.PI) * 0.20 * ampMult;
+        // Knee bends at the back of each leg's swing arc
+        const kneeL = 0.05 + Math.max(0,  Math.sin(phi + Math.PI * 1.5)) * 0.18 * ampMult;
+        const kneeR = 0.05 + Math.max(0, -Math.sin(phi + Math.PI * 1.5)) * 0.18 * ampMult;
+
+        const lUL = hum?.getNormalizedBoneNode?.('leftUpperLeg'  as never);
+        if (lUL) { lUL.rotation.x =  legSwing; }
+        const lLL = hum?.getNormalizedBoneNode?.('leftLowerLeg'  as never);
+        if (lLL) { lLL.rotation.x = kneeL; }
+        const rUL = hum?.getNormalizedBoneNode?.('rightUpperLeg' as never);
+        if (rUL) { rUL.rotation.x = -legSwing; }
+        const rLL = hum?.getNormalizedBoneNode?.('rightLowerLeg' as never);
+        if (rLL) { rLL.rotation.x = kneeR; }
+
+        // Hips: subtle side-tilt + counter-rotate matching each step
+        const hipsNode = hum?.getNormalizedBoneNode?.('hips' as never);
+        if (hipsNode) {
+          hipsNode.rotation.y = Math.sin(phi) * 0.03 * ampMult;
+          hipsNode.rotation.z = Math.sin(phi) * 0.025 * ampMult;
+        }
       } catch (_) {}
 
       // ── Accent light ──────────────────────────────────────────────────────
