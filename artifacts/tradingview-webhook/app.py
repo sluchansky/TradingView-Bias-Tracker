@@ -40139,6 +40139,7 @@ def dashboard():
   <span id="layout-reset" role="button" tabindex="0" onclick="resetDashLayout()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();resetDashLayout();}" title="Restore the default panel order and un-minimize everything" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">↕️ Reset layout</span>
   <a id="bot-switch" href="/api2/dashboard" onclick="event.preventDefault();var t=this;t.style.opacity='0.5';fetch('/api2/ping',{cache:'no-store'}).then(function(r){t.style.opacity='1';if(r.ok){location.href='/api2/dashboard';}else{alert('The Analysis Bot is only running in the published app. Open your deployed site to use it.');}}).catch(function(){t.style.opacity='1';alert('The Analysis Bot is only running in the published app. Open your deployed site to use it.');});return false;" title="Open the analysis-only bot's dashboard. It mirrors this engine but cannot place trades or post to Discord — the live bot keeps running untouched." style="text-decoration:none;cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔬 Analysis Bot &rarr;</a>
   <a href="/cockpit" title="Open the AI Cockpit — a clean at-a-glance view of the live bot." style="text-decoration:none;cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🎛️ Cockpit &rarr;</a>
+  <a href="/" title="Back to the AI Trading Partner landing page" style="text-decoration:none;cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🏠 Home &larr;</a>
 </div>
 
 <!-- Top-level view selector — collapsed into a single dropdown menu (DISPLAY-ONLY,
@@ -49531,7 +49532,7 @@ setInterval(function(){
   });
   renderHiddenChips();
   window.resetDashLayout = function(){
-    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); }catch(e){}
+    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.setItem('dashAdv','1'); }catch(e){}
     location.reload();
   };
 })();
