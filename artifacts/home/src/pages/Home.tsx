@@ -869,191 +869,220 @@ function EvidenceRadarPanel({ items, side }: { items: EvidenceItem[]; side: 'lef
 }
 
 // ── Live Thought Stream ────────────────────────────────────────────────────────
-interface StreamEntry { id: number; text: string; }
-const MAX_STREAM = 5;
+interface ThoughtEntry { id: number; text: string; ts: number; }
+const MAX_THOUGHTS = 6;
 
-function getThoughtPool(
-  data: any, status: string, edge: number, ticker: string,
+function useLiveThoughtStream(
+  data: any, status: string, edge: number, grade: string,
   sig: Record<string,any>, ad: Record<string,any>, gd: Record<string,any>
-): string[] {
-  const pool: string[] = [];
-  const price   = Number(data?.price           || 0);
-  const vwap    = Number(data?.vwap_value       || 0);
-  const demand  = Number(data?.nearest_demand   || 0);
-  const supply  = Number(data?.nearest_supply   || 0);
-  const cvd     = String(sig.cvd  || ad.cvd     || '').toLowerCase();
-  const vol     = String(ad.volume              || '').toLowerCase();
-  const vReg    = String(ad.volatility_regime   || '').toLowerCase();
-  const bias    = String(sig.bias               || '').toLowerCase();
-  const struct  = !!(gd.structure_confirmed);
-  const zone    = !!(gd.zone_valid);
-  const hasPlan = !!(data?.trade_plan?.entry && Number(data?.trade_plan?.entry) > 0);
+): ThoughtEntry[] {
+  const [entries, setEntries] = useState<ThoughtEntry[]>([]);
+  const idRef     = useRef(0);
+  const recentRef = useRef<string[]>([]);
+  const prevRef   = useRef({ status: '', edgeBand: -1, struct: false, zone: false, vwapSide: '', cvdDir: '', volReg: '', biasDir: '' });
+  const cadRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const snapRef   = useRef({ data, status, edge, grade, sig, ad, gd });
 
-  // Baseline observations — always present
-  pool.push(`Watching ${ticker} tape...`);
-  pool.push('Scanning for liquidity sweeps at key levels...');
-  pool.push('Monitoring institutional order flow...');
-  pool.push('Watching overnight liquidity for early reaction...');
-  pool.push('Tracking smart money positioning ahead of key levels...');
+  // Keep snapshot fresh so cadence timer always reads current values
+  useEffect(() => { snapRef.current = { data, status, edge, grade, sig, ad, gd }; });
 
-  // VWAP relationship
-  if (price > 0 && vwap > 0) {
-    if (price > vwap * 1.001)      pool.push(`Price holding above VWAP at ${fmt(vwap)} — bullish intraday structure...`);
-    else if (price < vwap * 0.999) pool.push(`VWAP ${fmt(vwap)} still rejecting buyers — bearish lean...`);
-    else                            pool.push(`Price coiling around VWAP ${fmt(vwap)} — watching for direction...`);
-  }
-
-  // Structure
-  if (struct) {
-    pool.push('Structure break confirmed — tracking the developing move...');
-    pool.push('BOS established — waiting for retest or continuation...');
-  } else {
-    pool.push('No confirmed BOS or CHOCH yet — waiting for structural clarity...');
-    pool.push('Watching for a clean market structure shift before considering entry...');
-  }
-
-  // Zone
-  if (zone && demand > 0) pool.push(`Demand zone active at ${fmt(demand)} — watching for buyer reaction...`);
-  else if (zone)           pool.push('Demand zone present — watching for buyer confirmation...');
-  else                     pool.push('No significant demand zone in immediate range...');
-  if (supply > 0)          pool.push(`Supply cluster at ${fmt(supply)} — potential overhead resistance...`);
-
-  // CVD / delta
-  if (/bull|pos/.test(cvd))      pool.push('Buying pressure accumulating in cumulative delta...');
-  else if (/bear|neg/.test(cvd)) pool.push('Delta turning bearish — watching for sellers to take control...');
-  else                            pool.push('Delta neutral — waiting for directional commitment...');
-
-  // Volume
-  if (/strong|high|incr/.test(vol)) {
-    pool.push('Strong institutional volume entering the tape...');
-    pool.push('Volume surge detected — smart money is active...');
-  } else if (/low|thin|decr/.test(vol)) {
-    pool.push('Volume remains below session average...');
-    pool.push('Thin participation — waiting for volume to confirm before entry...');
-  } else {
-    pool.push('Volume at session average — monitoring for a surge...');
-  }
-
-  // Edge score
-  if (edge >= 75) {
-    pool.push(`Edge elevated at ${edge}/110 — setup is strengthening...`);
-    pool.push('Confidence increasing as conditions align...');
-  } else if (edge >= 55) {
-    pool.push(`Edge building at ${edge}/110 — alignment improving...`);
-    pool.push('Watching for the final piece to confirm the setup...');
-  } else {
-    pool.push(`Edge at ${edge}/110 — multiple conditions still open...`);
-    pool.push('Waiting for higher-probability alignment before sizing in...');
-  }
-
-  // Status-specific
-  if (status === 'WAIT') {
-    pool.push('Standing aside — capital preservation is a position...');
-    pool.push('Not every minute needs a trade. Patience is the edge...');
-    pool.push('Waiting for the right setup rather than forcing one...');
-    pool.push('Looking for aggressive buying pressure to develop...');
-    pool.push('Waiting for liquidity sweep before committing...');
-  } else if (status === 'READY') {
-    pool.push('Setup criteria met — monitoring for optimal entry timing...');
-    pool.push('All systems aligned — ready to execute on confirmation...');
-    if (hasPlan) pool.push('Trade plan locked in — watching for the trigger...');
-  } else if (status === 'MANAGING') {
-    pool.push('Position open — managing strictly to the original plan...');
-    pool.push('Monitoring price action against the thesis...');
-    pool.push('Watching for thesis invalidation signals...');
-    pool.push('Letting the trade breathe — no early exits...');
-  }
-
-  // Bias
-  if (/bull/.test(bias)) {
-    pool.push('Bullish bias intact — focusing exclusively on long setups...');
-    pool.push('Looking for aggressive buying at key support levels...');
-  } else if (/bear/.test(bias)) {
-    pool.push('Bearish pressure building — favoring short setups...');
-    pool.push('Watching for failed rallies into supply zones...');
-  } else {
-    pool.push('Bias neutral — waiting for directional conviction to develop...');
-  }
-
-  // Volatility regime
-  if (/extreme/.test(vReg)) {
-    pool.push('Volatility extreme — strict risk management protocols active...');
-    pool.push('Wide ranges — reducing position sizing accordingly...');
-  } else if (/elev/.test(vReg)) {
-    pool.push('Elevated volatility — keeping stops proportionally wide...');
-  } else if (/quiet|low/.test(vReg)) {
-    pool.push('Quiet tape — compression often precedes expansion...');
-    pool.push('Low volatility environment — watching for breakout potential...');
-  }
-
-  // Contextual fillers — always available
-  pool.push('Looking for aggressive buying or selling to confirm direction...');
-  pool.push('Potential demand forming below current price...');
-
-  return pool;
-}
-
-function useThoughtStream(pool: string[]): StreamEntry[] {
-  const [stream, setStream] = useState<StreamEntry[]>([]);
-  const idRef    = useRef(0);
-  const poolRef  = useRef<string[]>(pool);
-  const usedRef  = useRef<Set<string>>(new Set());
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Keep pool ref current — timer closure always sees fresh thoughts
-  useEffect(() => { poolRef.current = pool; }, [pool]);
-
-  const addThought = useCallback(() => {
-    const p      = poolRef.current;
-    if (p.length === 0) return;
-    const unused = p.filter(t => !usedRef.current.has(t));
-    const src    = unused.length > 0 ? unused : p;
-    const text   = src[Math.floor(Math.random() * src.length)];
-    usedRef.current.add(text);
-    if (usedRef.current.size >= p.length) usedRef.current.clear();
-    setStream(prev => [...prev, { id: idRef.current++, text }].slice(-MAX_STREAM));
-  }, []);
-
-  const scheduleNext = useCallback(() => {
-    const delay = 5800 + Math.floor(Math.random() * 3400);
-    timerRef.current = setTimeout(() => { addThought(); scheduleNext(); }, delay);
-  }, [addThought]);
-
-  // Seed with 3 random thoughts on mount, then start cycling
-  useEffect(() => {
-    const p    = poolRef.current;
-    const seed = [...p].sort(() => 0.5 - Math.random()).slice(0, 3);
-    setStream(seed.map(text => { usedRef.current.add(text); return { id: idRef.current++, text }; }));
-    scheduleNext();
-    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  const push = useCallback((text: string) => {
+    if (recentRef.current.slice(-MAX_THOUGHTS).includes(text)) return;
+    recentRef.current = [...recentRef.current, text].slice(-(MAX_THOUGHTS * 2));
+    setEntries(prev => [...prev, { id: idRef.current++, text, ts: Date.now() }].slice(-MAX_THOUGHTS));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return stream;
+  // Derive change-detection signals
+  const price    = Number(data?.price           || 0);
+  const vwap     = Number(data?.vwap_value       || 0);
+  const demand   = Number(data?.nearest_demand   || 0);
+  const supply   = Number(data?.nearest_supply   || 0);
+  const structOk = !!(gd.structure_confirmed);
+  const zoneOk   = !!(gd.zone_valid);
+  const vwapSide = vwap > 0 && price > 0 ? (price > vwap ? 'above' : 'below') : '';
+  const cvdRaw   = String(sig.cvd || ad.cvd || '').toLowerCase();
+  const cvdDir   = /bull|pos/.test(cvdRaw) ? 'bull' : /bear|neg/.test(cvdRaw) ? 'bear' : '';
+  const volRaw   = String(ad.volume || '').toLowerCase();
+  const volReg   = /strong|high/.test(volRaw) ? 'high' : /low|thin/.test(volRaw) ? 'low' : 'norm';
+  const biasRaw  = String(sig.bias || '').toLowerCase();
+  const biasDir  = /bull/.test(biasRaw) ? 'bull' : /bear/.test(biasRaw) ? 'bear' : '';
+  const edgeBand = edge >= 85 ? 5 : edge >= 75 ? 4 : edge >= 65 ? 3 : edge >= 50 ? 2 : edge >= 30 ? 1 : 0;
+  const changeKey = [status, edgeBand, structOk, zoneOk, vwapSide, cvdDir, volReg, biasDir].join('|');
+
+  // Fire a thought whenever a meaningful market state changes
+  useEffect(() => {
+    const pr = prevRef.current;
+
+    if (pr.status === '') {
+      // Seed with 1-2 observations on first data arrival
+      if (data) {
+        if (vwap > 0 && price > 0) push(`Price ${vwapSide} VWAP at ${fmt(vwap)}.`);
+        else                        push('Monitoring market conditions.');
+        if (!structOk) push('Structure confirmation is still missing.');
+      }
+      prevRef.current = { status, edgeBand, struct: structOk, zone: zoneOk, vwapSide, cvdDir, volReg, biasDir };
+      return;
+    }
+
+    // Status transition
+    if (status !== pr.status) {
+      if (status === 'READY') {
+        const tp   = (data?.trade_plan || {}) as Record<string,any>;
+        const dir  = String(tp.direction || '').toLowerCase();
+        const side = /long|bull/.test(dir) ? 'Long' : /short|bear/.test(dir) ? 'Short' : '';
+        push(side ? `${side} setup confirmed. All gate conditions satisfied.` : 'All gate conditions satisfied. Edge is confirmed.');
+        const entry = Number(tp.entry || 0);
+        if (entry > 0) push(`Entry zone near ${fmt(entry)}.`);
+      } else if (status === 'MANAGING') {
+        push('Position is live. Monitoring for thesis invalidation.');
+      } else if (status === 'BUILDING') {
+        push(`Edge at ${Math.round(edge)}. Setup is developing — watching closely.`);
+      } else if (/READY|MANAGING/.test(pr.status) && /WAIT|WATCH|NO_EDGE/.test(status)) {
+        push('Setup has reset. Returning to observation mode.');
+      }
+    }
+
+    // Edge band crossed
+    if (edgeBand !== pr.edgeBand) {
+      if (edgeBand > pr.edgeBand && pr.edgeBand >= 0) {
+        if      (edgeBand === 1) push('Edge crossed 30. Conditions beginning to align.');
+        else if (edgeBand === 2) push(`Edge at ${Math.round(edge)}. More than halfway to the entry threshold.`);
+        else if (edgeBand === 3) push(`Edge at ${Math.round(edge)}. Setup is developing — watching closely.`);
+        else if (edgeBand === 4) push(`Edge at ${Math.round(edge)}. Approaching confirmation threshold.`);
+        else if (edgeBand === 5) push(`Edge at ${Math.round(edge)}. Near maximum confidence.`);
+      } else if (edgeBand < pr.edgeBand && pr.edgeBand >= 2) {
+        push(`Edge at ${Math.round(edge)}. Setup conditions softening.`);
+      }
+    }
+
+    // Structure confirmation change
+    if (structOk !== pr.struct) {
+      if (structOk) {
+        const st = String((sig.structure_type || gd.structure_type || '') as string).toUpperCase();
+        push(st ? `${st} confirmed. Structural break shifts the outlook.` : 'Structure confirmed. BOS or CHOCH detected.');
+      } else {
+        push('Structure confirmation cleared. Reset to observation.');
+      }
+    }
+
+    // Zone change
+    if (zoneOk !== pr.zone) {
+      if (zoneOk) {
+        if (demand > 0)      push(`Demand zone at ${fmt(demand)} is now active.`);
+        else if (supply > 0) push(`Supply zone at ${fmt(supply)} is now active.`);
+        else                 push('Liquidity zone is now active.');
+      } else {
+        push('Zone has been mitigated. Watching for re-entry.');
+      }
+    }
+
+    // VWAP side flip
+    if (vwapSide && vwapSide !== pr.vwapSide && pr.vwapSide !== '') {
+      push(vwapSide === 'above'
+        ? `Price reclaimed VWAP at ${fmt(vwap)}. Bullish structural shift.`
+        : `Price dropped below VWAP at ${fmt(vwap)}. Bearish pressure increasing.`);
+    }
+
+    // CVD direction flip
+    if (cvdDir && cvdDir !== pr.cvdDir && pr.cvdDir !== '') {
+      push(cvdDir === 'bull'
+        ? 'Delta flipped bullish. Buyers stepping in at current levels.'
+        : 'Delta flipped bearish. Sellers taking control of order flow.');
+    }
+
+    // Volume regime change
+    if (volReg !== pr.volReg && pr.volReg !== '') {
+      if      (volReg === 'high') push('Volume expanding. Institutional participation increasing.');
+      else if (volReg === 'low')  push('Volume contracting. Thin tape — reducing confidence.');
+      else                        push('Volume returning to session average.');
+    }
+
+    prevRef.current = { status, edgeBand, struct: structOk, zone: zoneOk, vwapSide, cvdDir, volReg, biasDir };
+  }, [changeKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Scheduled cadence: every 90-120 seconds add a monitoring observation
+  useEffect(() => {
+    const fire = () => {
+      const { data: d, status: st, edge: eg, sig: sg, ad: a, gd: g } = snapRef.current;
+      if (!d) { cadRef.current = setTimeout(fire, 30000); return; }
+      const px  = Number(d.price          || 0);
+      const vw  = Number(d.vwap_value     || 0);
+      const dem = Number(d.nearest_demand || 0);
+      const sup = Number(d.nearest_supply || 0);
+      const sOk = !!(g.structure_confirmed);
+      const zOk = !!(g.zone_valid);
+      const cv  = String(sg.cvd || a.cvd || '').toLowerCase();
+      const vl  = String(a.volume || '').toLowerCase();
+
+      const pool: string[] = [];
+      if (px > 0 && vw > 0)          pool.push(`Price remains ${px > vw ? 'above' : 'below'} VWAP at ${fmt(vw)}.`);
+      if (dem > 0 && !zOk)           pool.push(`Watching ${fmt(dem)} for a demand reaction.`);
+      if (sup > 0 && !zOk)           pool.push(`Supply at ${fmt(sup)} remains overhead.`);
+      if (!sOk && st !== 'MANAGING') pool.push('Structure confirmation is still missing.');
+      if (/bear|neg/.test(cv))       pool.push('No aggressive buying detected.');
+      if (/bull|pos/.test(cv))       pool.push('Buyers remain active in the tape.');
+      if (/low|thin/.test(vl))       pool.push('Volume remains near session average.');
+      if (/strong|high/.test(vl))    pool.push('Volume remains elevated.');
+      if (eg >= 30 && eg < 75)       pool.push(`Monitoring conditions. Edge holds at ${Math.round(eg)}.`);
+      if (st === 'MANAGING')         pool.push('Thesis remains intact. No invalidation detected.');
+      pool.push('No new signals. Continuing to monitor.');
+      pool.push('Scanning key levels for institutional footprints.');
+
+      const fresh = pool.filter(t => !recentRef.current.slice(-MAX_THOUGHTS).includes(t));
+      const src   = fresh.length > 0 ? fresh : pool;
+      push(src[Math.floor(Math.random() * src.length)]);
+      cadRef.current = setTimeout(fire, 90000 + Math.floor(Math.random() * 30000));
+    };
+    cadRef.current = setTimeout(fire, 28000 + Math.floor(Math.random() * 17000));
+    return () => { if (cadRef.current) clearTimeout(cadRef.current); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return entries;
 }
 
-function ThoughtStream({ stream }: { stream: StreamEntry[] }) {
-  const OPACITIES = [1, 0.52, 0.28, 0.12, 0.05];
-  const SIZES     = [15, 14.5, 14, 14, 13.5];
+function ThoughtStream({ stream }: { stream: ThoughtEntry[] }) {
+  const now  = Date.now();
+  const FADE = [1.0, 0.58, 0.32, 0.16, 0.07, 0.03];
+  const FSIZ = [14.5, 14, 13.5, 13, 12.5, 12];
+
+  function relTime(ts: number) {
+    const s = Math.floor((now - ts) / 1000);
+    if (s < 5)  return 'now';
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    return `${Math.floor(m / 60)}h`;
+  }
+
   return (
     <div style={{ display:'flex', flexDirection:'column', justifyContent:'flex-end',
-      minHeight:130, maxWidth:560, overflow:'hidden', gap:0 }}>
+      minHeight:148, maxWidth:540, overflow:'hidden', gap:0 }}>
       {stream.map((entry, i) => {
-        const age     = stream.length - 1 - i; // 0 = newest
-        const opacity = OPACITIES[age] ?? 0.04;
-        const fsz     = SIZES[age]     ?? 13.5;
-        const isNew   = age === 0;
+        const age   = stream.length - 1 - i;
+        const opRow = FADE[age] ?? 0.02;
+        const fsz   = FSIZ[age] ?? 12;
+        const isNew = age === 0;
         return (
           <div key={entry.id} style={{
-            fontSize: fsz, lineHeight: 1.65,
-            color: `rgba(255,255,255,${opacity})`,
-            fontFamily: 'inherit', letterSpacing: '0.01em',
-            padding: '1.5px 0',
+            display:'flex', alignItems:'baseline', gap:9,
+            padding:'2px 0',
             animation: isNew ? 'tsIn 0.55s cubic-bezier(0.22,1,0.36,1)' : undefined,
-            transition: 'opacity 1.6s ease',
-            willChange: 'opacity',
+            transition:'opacity 1.8s ease',
+            willChange:'opacity',
           }}>
-            {entry.text}
-            {isNew && <span style={{ opacity:0.32, animation:'bDot 1.1s infinite', marginLeft:3 }}>▌</span>}
+            <span style={{
+              fontSize:8, fontFamily:'monospace', fontWeight:700,
+              letterSpacing:'0.07em', color:`rgba(255,255,255,${opRow * 0.42})`,
+              minWidth:24, flexShrink:0, userSelect:'none',
+            }}>{relTime(entry.ts)}</span>
+            <span style={{
+              fontSize:fsz, lineHeight:1.65,
+              color:`rgba(255,255,255,${opRow})`,
+              fontFamily:'inherit', letterSpacing:'0.01em',
+            }}>
+              {entry.text}
+              {isNew && <span style={{ opacity:0.30, animation:'bDot 1.1s infinite', marginLeft:3 }}>▌</span>}
+            </span>
           </div>
         );
       })}
@@ -1651,12 +1680,8 @@ export default function Home() {
   const mem = useSessionMemory(status, edge, ticker, strictR);
   const briefingText = generateBriefing(mem.yest, mem.wkPeak, mem.active, mem.mcWR);
 
-  // Live thought stream — pool refreshes every poll; timer cycles thoughts every ~6-9s
-  const thoughtPool      = useMemo(
-    () => getThoughtPool(data, status, edge, ticker, sig, ad, gd),
-    [data, status, edge, ticker] // eslint-disable-line react-hooks/exhaustive-deps
-  );
-  const streamedThoughts = useThoughtStream(thoughtPool);
+  // Live thought stream — change-triggered + 90s cadence, timestamped
+  const streamedThoughts = useLiveThoughtStream(data, status, edge, grade, sig, ad, gd);
   const radar            = useMemo(
     () => getEvidenceRadar(data, gd, ad, sig, edge),
     [data, edge] // eslint-disable-line react-hooks/exhaustive-deps
