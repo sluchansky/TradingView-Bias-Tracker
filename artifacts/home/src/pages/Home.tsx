@@ -1142,17 +1142,115 @@ function loadMem(): DayRec[] {
   catch { return []; }
 }
 
-function generateBriefing(yest: DayRec | null, wkPeak: number, active: number, mcWR: string | null): string {
-  if (!yest && active === 0) return 'First session detected. Building my performance baseline from today — scanning for high-probability setups.';
-  const parts: string[] = [];
-  if (yest) {
-    const dn = new Date(yest.d + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' });
-    parts.push(`${dn}: peaked at ${Math.round(yest.pe)}/110 edge, ${yest.su} setup${yest.su !== 1 ? 's' : ''} identified${yest.tr > 0 ? `, ${yest.tr} trade${yest.tr !== 1 ? 's' : ''} executed` : ''}.`);
+// ── Trade Memory types ─────────────────────────────────────────────────────────
+interface TradeStat  { wins:number; losses:number; total:number; wr:number|null; avgRR:number|null; }
+interface SetupStat  { name:string; wr:number; total:number; wins:number; losses:number; }
+interface TradeMemory {
+  today:      TradeStat;
+  yesterday:  TradeStat;
+  week:       TradeStat;
+  bestSetup:  SetupStat | null;
+  worstSetup: SetupStat | null;
+  dailyBars:  { date:string; wins:number; losses:number; total:number }[];
+}
+
+// ── useTradeMemory — derive W/L/R:R/setup stats from data.recent_trades ────────
+function useTradeMemory(trades: any[]): TradeMemory {
+  return useMemo(() => {
+    const today    = getToday();
+    const yestDate = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const weekAgo  = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const isWin  = (t: any) => /win|target|profit/i.test(String(t?.outcome ?? t?.result ?? ''));
+    const isLoss = (t: any) => /loss|stop|miss/i.test(String(t?.outcome ?? t?.result ?? ''));
+    const isDone = (t: any) => isWin(t) || isLoss(t);
+    const mkStat = (ts: any[]): TradeStat => {
+      const done   = ts.filter(isDone);
+      const wins   = done.filter(isWin).length;
+      const losses = done.filter(isLoss).length;
+      const rrs    = done.map(t => Number(t?.rr_actual ?? t?.rr ?? 0)).filter(r => r > 0);
+      return {
+        wins, losses, total: done.length,
+        wr:    done.length > 0 ? Math.round(wins / done.length * 100) : null,
+        avgRR: rrs.length  > 0 ? +(rrs.reduce((s, r) => s + r, 0) / rrs.length).toFixed(2) : null,
+      };
+    };
+    const todayT  = trades.filter(t => String(t?.opened_at ?? '').slice(0, 10) === today);
+    const yesterT = trades.filter(t => String(t?.opened_at ?? '').slice(0, 10) === yestDate);
+    const weekT   = trades.filter(t => String(t?.opened_at ?? '').slice(0, 10) >= weekAgo);
+    const strat: Record<string, { w:number; l:number }> = {};
+    weekT.forEach(t => {
+      const s = String(t?.strategy ?? t?.active_strategy ?? '').replace(/_/g, ' ').trim().toLowerCase();
+      if (s.length < 2) return;
+      if (!strat[s]) strat[s] = { w: 0, l: 0 };
+      if (isWin(t)) strat[s].w++; else if (isLoss(t)) strat[s].l++;
+    });
+    const byWR: SetupStat[] = Object.entries(strat)
+      .filter(([, v]) => v.w + v.l >= 1)
+      .map(([name, { w, l }]) => ({ name, wr: w / ((w + l) || 1), total: w + l, wins: w, losses: l }))
+      .sort((a, b) => b.wr - a.wr);
+    const dailyBars = Array.from({ length: 7 }, (_, i) => {
+      const d  = new Date(Date.now() - (6 - i) * 86400000).toISOString().slice(0, 10);
+      const dt = trades.filter(t => String(t?.opened_at ?? '').slice(0, 10) === d && isDone(t));
+      return { date: d, wins: dt.filter(isWin).length, losses: dt.filter(isLoss).length, total: dt.length };
+    });
+    return {
+      today: mkStat(todayT), yesterday: mkStat(yesterT), week: mkStat(weekT),
+      bestSetup:  byWR.find(s => s.total >= 1) ?? null,
+      worstSetup: [...byWR].reverse().find(s => s.total >= 1 && s.wr < 0.5) ?? null,
+      dailyBars,
+    };
+  }, [trades]); // eslint-disable-line react-hooks/exhaustive-deps
+}
+
+// ── computeObjectives — derive specific daily goals from performance history ────
+function computeObjectives(tm: TradeMemory, mcWR: string | null): string[] {
+  const out: string[] = [];
+  if (tm.week.total === 0) {
+    out.push('No recent trade history \u2014 read the market today, let edge reach \u226575 before entering.');
+    if (mcWR) out.push('Recurring block: "' + mcWR.slice(0, 55) + '"');
+    return out;
   }
-  if (wkPeak > 0) parts.push(`Week best: ${Math.round(wkPeak)}/110 across ${active} active session${active !== 1 ? 's' : ''}.`);
-  if (mcWR) parts.push(`Recurring gap: "${mcWR.slice(0, 50)}" — giving this extra focus today.`);
-  else if (yest) parts.push('No recurring patterns yet — keeping analysis clean today.');
-  return parts.join(' ');
+  if (tm.week.wr !== null) {
+    if (tm.week.wr < 40)      out.push('Win rate ' + tm.week.wr + '% this week \u2014 only take A+ setups, edge \u226585 required.');
+    else if (tm.week.wr < 55) out.push('Win rate ' + tm.week.wr + '% \u2014 wait for full gate confirmation before every entry.');
+    else                       out.push('Win rate ' + tm.week.wr + '% \u2014 solid week. Maintain discipline, avoid marginal setups.');
+  }
+  if (tm.week.avgRR !== null && tm.week.avgRR < 0.9)
+    out.push('Avg exit ' + tm.week.avgRR.toFixed(1) + 'R \u2014 give winners room, target T1 before scaling out.');
+  if (tm.bestSetup && tm.bestSetup.wr >= 0.6 && tm.bestSetup.total >= 2)
+    out.push(tm.bestSetup.name.toUpperCase() + ' strongest this week (' + Math.round(tm.bestSetup.wr * 100) + '%) \u2014 prioritize it.');
+  if (tm.worstSetup && tm.worstSetup.losses >= 2)
+    out.push(tm.worstSetup.name.toUpperCase() + ' underperforming (' + Math.round(tm.worstSetup.wr * 100) + '%) \u2014 consider avoiding today.');
+  if (mcWR) {
+    const g = mcWR.toLowerCase();
+    if (/structure|bos|choch/.test(g)) out.push('Wait for confirmed BOS/CHOCH \u2014 structure gate is blocking repeatedly.');
+    else if (/zone/.test(g))           out.push('Enter only from an active demand or supply zone \u2014 zone gate keeps blocking.');
+    else if (/vwap/.test(g))           out.push('Align with VWAP before any entry \u2014 VWAP gate keeps blocking.');
+    else                               out.push('Focus: "' + mcWR.slice(0, 55) + '" \u2014 top recurring block this week.');
+  }
+  return out.slice(0, 4);
+}
+
+function generateBriefing(yest: DayRec | null, wkPeak: number, active: number, mcWR: string | null, tm: TradeMemory | null): string {
+  if (!tm) return 'Loading session memory...';
+  if (!yest && active === 0 && tm.week.total === 0) return 'First session. Building my baseline \u2014 scanning for high-probability setups today.';
+  const parts: string[] = [];
+  if (tm.yesterday.total > 0) {
+    const { wins, losses, wr, avgRR } = tm.yesterday;
+    parts.push('Yesterday: ' + wins + 'W ' + losses + 'L (' + wr + '% WR' + (avgRR ? ', ' + avgRR.toFixed(1) + 'R avg' : '') + ').');
+  } else if (yest) {
+    const dn = new Date(yest.d + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' });
+    parts.push(dn + ': edge peaked ' + Math.round(yest.pe) + '/110, ' + yest.su + ' setup' + (yest.su !== 1 ? 's' : '') + ' identified' + (yest.tr > 0 ? ', ' + yest.tr + ' executed' : '') + '.');
+  }
+  if (tm.week.total > 0) {
+    parts.push('Week: ' + tm.week.wins + 'W ' + tm.week.losses + 'L (' + tm.week.wr + '% WR' + (tm.week.avgRR ? ', ' + tm.week.avgRR.toFixed(1) + 'R avg' : '') + ').');
+  } else if (wkPeak > 0) {
+    parts.push('Week peak: ' + Math.round(wkPeak) + '/110 across ' + active + ' session' + (active !== 1 ? 's' : '') + '.');
+  }
+  if (tm.bestSetup && tm.bestSetup.wr >= 0.55 && tm.bestSetup.total >= 2)
+    parts.push('Best setup: ' + tm.bestSetup.name.toUpperCase() + ' (' + Math.round(tm.bestSetup.wr * 100) + '%).');
+  if (mcWR) parts.push('Top gap: "' + mcWR.slice(0, 48) + '" \u2014 addressing today.');
+  return parts.join(' ') || 'Analyzing previous sessions...';
 }
 
 function useSessionMemory(status: string, edge: number, ticker: string, strictR: string) {
@@ -1709,8 +1807,11 @@ export default function Home() {
     setShowBriefing(false);
     try { localStorage.setItem('atp_briefed_' + getToday(), '1'); } catch {}
   };
-  const mem = useSessionMemory(status, edge, ticker, strictR);
-  const briefingText = generateBriefing(mem.yest, mem.wkPeak, mem.active, mem.mcWR);
+  const mem        = useSessionMemory(status, edge, ticker, strictR);
+  const tradeArr   = useMemo(() => Array.isArray(data?.recent_trades) ? (data.recent_trades as any[]) : [], [data]); // eslint-disable-line react-hooks/exhaustive-deps
+  const tm         = useTradeMemory(tradeArr);
+  const objectives = useMemo(() => computeObjectives(tm, mem.mcWR), [tm, mem.mcWR]);
+  const briefingText = generateBriefing(mem.yest, mem.wkPeak, mem.active, mem.mcWR, tm);
 
   // Live thought stream — change-triggered + 90s cadence, timestamped
   const streamedThoughts = useLiveThoughtStream(data, status, edge, grade, sig, ad, gd);
@@ -2157,20 +2258,71 @@ export default function Home() {
 
           {/* ── SESSION BRIEFING — shows once per calendar day ──────────── */}
           {showBriefing && (
-            <div style={{ display:'flex', gap:12, padding:'11px 15px', borderRadius:8, marginBottom:16,
-              background:'rgba(59,130,246,0.07)', border:'1px solid rgba(59,130,246,0.18)',
-              animation:'bUp 0.28s ease-out', flexShrink:0 }}>
-              <div style={{ fontSize:18, lineHeight:1.2, paddingTop:1 }}>🧠</div>
-              <div style={{ flex:1, minWidth:0 }}>
-                <div style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(99,179,237,0.65)', letterSpacing:'0.12em', marginBottom:4, textTransform:'uppercase' }}>
-                  AI Session Briefing · {new Date().toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}
+            <div style={{ marginBottom:16, borderRadius:10, overflow:'hidden', flexShrink:0,
+              border:'1px solid rgba(59,130,246,0.22)', animation:'bUp 0.28s ease-out',
+              background:'rgba(5,10,24,0.94)' }}>
+              {/* Header */}
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                padding:'8px 14px', background:'rgba(59,130,246,0.08)',
+                borderBottom:'1px solid rgba(59,130,246,0.12)' }}>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  <span style={{ fontSize:13 }}>🧠</span>
+                  <span style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(99,179,237,0.75)',
+                    letterSpacing:'0.12em', textTransform:'uppercase', fontWeight:700 }}>AI Session Briefing</span>
+                  <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.25)', letterSpacing:'0.06em' }}>
+                    {new Date().toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}
+                  </span>
                 </div>
-                <div style={{ fontSize:11.5, color:'rgba(255,255,255,0.68)', lineHeight:1.58, fontFamily:'monospace' }}>
-                  {briefingText}
-                </div>
+                <button onClick={dismissBriefing} style={{ background:'none', border:'none',
+                  color:'rgba(255,255,255,0.30)', cursor:'pointer', fontSize:16, padding:'0 2px', lineHeight:1 }}>×</button>
               </div>
-              <button onClick={dismissBriefing} style={{ background:'none', border:'none', color:'rgba(255,255,255,0.28)',
-                cursor:'pointer', fontSize:18, padding:'0 3px', lineHeight:1, alignSelf:'flex-start', flexShrink:0 }}>×</button>
+              {/* Stats grid */}
+              <div style={{ display:'flex', borderBottom:'1px solid rgba(255,255,255,0.045)' }}>
+                {[
+                  {
+                    label: 'Yesterday',
+                    value: tm.yesterday.total > 0 ? (tm.yesterday.wins + 'W ' + tm.yesterday.losses + 'L') : mem.yest ? (Math.round(mem.yest.pe) + '/110') : '\u2014',
+                    sub:   tm.yesterday.wr !== null ? (tm.yesterday.wr + '% win rate') : 'No recorded trades',
+                  },
+                  {
+                    label: 'This Week',
+                    value: tm.week.total > 0 ? (tm.week.wins + 'W ' + tm.week.losses + 'L') : mem.active > 0 ? (mem.active + ' sessions') : '\u2014',
+                    sub:   tm.week.wr !== null ? (tm.week.wr + '% win rate') : 'Building history',
+                  },
+                  {
+                    label: 'Avg R:R',
+                    value: tm.week.avgRR ? (tm.week.avgRR.toFixed(1) + 'R') : '\u2014',
+                    sub:   tm.week.avgRR ? (tm.week.avgRR >= 1.5 ? 'Above target' : tm.week.avgRR >= 1.0 ? 'On target' : 'Below target') : 'No closed trades',
+                  },
+                  {
+                    label: 'Best Setup',
+                    value: tm.bestSetup ? tm.bestSetup.name.replace(/\b\w/g, (c:string) => c.toUpperCase()).slice(0, 16) : '\u2014',
+                    sub:   tm.bestSetup ? (Math.round(tm.bestSetup.wr * 100) + '%  \u00b7  ' + tm.bestSetup.total + ' trade' + (tm.bestSetup.total !== 1 ? 's' : '')) : 'Accumulating data',
+                  },
+                ].map((item, i) => (
+                  <div key={i} style={{ flex:1, padding:'9px 12px', borderRight: i < 3 ? '1px solid rgba(255,255,255,0.04)' : 'none' }}>
+                    <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.11em', color:'rgba(255,255,255,0.25)', textTransform:'uppercase', marginBottom:4 }}>{item.label}</div>
+                    <div style={{ fontSize:13, fontFamily:'monospace', fontWeight:800, color:'rgba(255,255,255,0.85)', lineHeight:1 }}>{item.value}</div>
+                    <div style={{ fontSize:9, fontFamily:'monospace', color:'rgba(255,255,255,0.35)', marginTop:3 }}>{item.sub}</div>
+                  </div>
+                ))}
+              </div>
+              {/* Today's objectives */}
+              {objectives.length > 0 && (
+                <div style={{ padding:'10px 14px' }}>
+                  <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.13em', color:'rgba(99,179,237,0.45)', textTransform:'uppercase', marginBottom:7 }}>
+                    Today's Objectives
+                  </div>
+                  <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+                    {objectives.map((obj, i) => (
+                      <div key={i} style={{ display:'flex', gap:8, alignItems:'flex-start' }}>
+                        <span style={{ fontSize:8.5, color:'rgba(99,179,237,0.50)', fontFamily:'monospace', fontWeight:700, flexShrink:0, marginTop:1 }}>{i + 1}.</span>
+                        <span style={{ fontSize:11, color:'rgba(255,255,255,0.62)', fontFamily:'monospace', lineHeight:1.45 }}>{obj}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -2573,93 +2725,192 @@ export default function Home() {
           </div>
 
           {/* ── AI MEMORY & PERFORMANCE ──────────────────────────────────── */}
-          <div className="mem-panel" style={{ display:'flex', gap:8, marginBottom:14, minWidth:0 }}>
-
-            {/* Yesterday */}
-            {mem.yest && (
-              <SatPanel label="Yesterday" style={{ flex:'1 1 0', minWidth:0 }}>
-                <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
-                  color: mem.yest.pe >= 70 ? BULL : mem.yest.pe >= 50 ? AMB : MUTED }}>
-                  {Math.round(mem.yest.pe)}<span style={{ fontSize:9, fontWeight:400, opacity:0.55 }}>/110</span>
-                </div>
-                <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:3 }}>
-                  PEAK · {mem.yest.su} SETUP{mem.yest.su !== 1 ? 'S' : ''} · {mem.yest.tr} TRADE{mem.yest.tr !== 1 ? 'S' : ''}
-                </div>
-                <div style={{ fontSize:8, color:'rgba(255,255,255,0.20)', fontFamily:'monospace', marginTop:2 }}>
-                  {new Date(mem.yest.d + 'T12:00:00').toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}
-                </div>
-              </SatPanel>
-            )}
-
-            {/* 7-day sparkline */}
-            {mem.last7.length >= 2 && (
-              <SatPanel label="7-Day Trend" style={{ flex:'1.8 1 0', minWidth:0 }}>
-                <div style={{ display:'flex', alignItems:'flex-end', gap:4, height:30 }}>
-                  {mem.last7.map((r, i) => {
-                    const h   = Math.max(3, Math.round((r.pe / 110) * 30));
-                    const isT = r.d === todayStr;
-                    const col = isT ? verdictColor : r.pe >= 70 ? BULL : r.pe >= 50 ? AMB : 'rgba(255,255,255,0.13)';
-                    return (
-                      <div key={i} title={`${r.d}: ${Math.round(r.pe)}/110 edge`}
-                        style={{ flex:1, height:h, borderRadius:2, background:col, opacity:isT?1:0.68,
-                          transition:'height 0.4s', cursor:'default' }} />
-                    );
-                  })}
-                </div>
-                <div style={{ fontSize:8, color:MUTED, fontFamily:'monospace', marginTop:5 }}>
-                  WEEK BEST {Math.round(mem.wkPeak)}/110 · {mem.active} SESSION{mem.active !== 1 ? 'S' : ''}
-                </div>
-              </SatPanel>
-            )}
-
-            {/* Most common wait obstacle */}
-            {mem.mcWR && (
-              <SatPanel label="Recurring Gap" style={{ flex:'2 1 0', minWidth:0 }}>
-                <div style={{ fontSize:11, color:'rgba(255,255,255,0.65)', fontFamily:'monospace', lineHeight:1.45 }}>
-                  {mem.mcWR.length > 65 ? mem.mcWR.slice(0, 62) + '...' : mem.mcWR}
-                </div>
-                <div style={{ fontSize:8, color:MUTED, fontFamily:'monospace', marginTop:4 }}>MOST COMMON THIS WEEK — FOCUS AREA</div>
-              </SatPanel>
-            )}
-
-            {/* This session live */}
-            <SatPanel label="This Session" style={{ flex:'1 1 0', minWidth:0 }}>
-              <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
-                color: mem.live.pe >= 70 ? BULL : mem.live.pe >= 50 ? AMB : MUTED }}>
-                {Math.round(mem.live.pe)}<span style={{ fontSize:9, fontWeight:400, opacity:0.55 }}>/110</span>
+          <div style={{ marginBottom:14, borderRadius:10, overflow:'hidden',
+            border:'1px solid rgba(255,255,255,0.055)', background:'rgba(5,8,18,0.55)' }}>
+            {/* Panel header */}
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+              padding:'7px 14px', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
+              <span style={{ fontSize:8, fontFamily:'monospace', letterSpacing:'0.13em',
+                color:'rgba(255,255,255,0.28)', textTransform:'uppercase' }}>AI Memory \u00b7 Performance History</span>
+              <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.16)' }}>7-day</span>
+            </div>
+            {/* Stats row: Yesterday | This Week | Win Rate | Avg R:R | Best Setup */}
+            <div style={{ display:'flex', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
+              {/* Yesterday */}
+              <div style={{ flex:1, padding:'9px 12px', borderRight:'1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.11em', color:'rgba(255,255,255,0.22)', textTransform:'uppercase', marginBottom:4 }}>Yesterday</div>
+                {tm.yesterday.total > 0 ? (
+                  <>
+                    <div style={{ fontSize:14, fontWeight:800, fontFamily:'monospace',
+                      color: tm.yesterday.wr !== null && tm.yesterday.wr >= 55 ? BULL : tm.yesterday.wr !== null && tm.yesterday.wr >= 40 ? AMB : BEAR }}>
+                      {tm.yesterday.wins}W {tm.yesterday.losses}L
+                    </div>
+                    <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                      {tm.yesterday.wr !== null ? tm.yesterday.wr + '% WR' : ''}
+                      {tm.yesterday.avgRR ? '  \u00b7  ' + tm.yesterday.avgRR.toFixed(1) + 'R' : ''}
+                    </div>
+                  </>
+                ) : mem.yest ? (
+                  <>
+                    <div style={{ fontSize:14, fontWeight:800, fontFamily:'monospace',
+                      color: mem.yest.pe >= 70 ? BULL : mem.yest.pe >= 50 ? AMB : MUTED }}>
+                      {Math.round(mem.yest.pe)}<span style={{ fontSize:8, fontWeight:400 }}>/110</span>
+                    </div>
+                    <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                      {mem.yest.su} setup{mem.yest.su !== 1 ? 's' : ''} \u00b7 {mem.yest.tr} trade{mem.yest.tr !== 1 ? 's' : ''}
+                    </div>
+                  </>
+                ) : <div style={{ fontSize:11, fontFamily:'monospace', color:MUTED }}>\u2014</div>}
               </div>
-              <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:3 }}>
-                PEAK · {mem.live.su} SETUP{mem.live.su !== 1 ? 'S' : ''} · {mem.live.tr} TRADE{mem.live.tr !== 1 ? 'S' : ''}
+              {/* This Week */}
+              <div style={{ flex:1, padding:'9px 12px', borderRight:'1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.11em', color:'rgba(255,255,255,0.22)', textTransform:'uppercase', marginBottom:4 }}>This Week</div>
+                {tm.week.total > 0 ? (
+                  <>
+                    <div style={{ fontSize:14, fontWeight:800, fontFamily:'monospace',
+                      color: tm.week.wr !== null && tm.week.wr >= 55 ? BULL : tm.week.wr !== null && tm.week.wr >= 40 ? AMB : BEAR }}>
+                      {tm.week.wins}W {tm.week.losses}L
+                    </div>
+                    <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                      {tm.week.wr !== null ? tm.week.wr + '% WR' : ''}
+                      {tm.week.avgRR ? '  \u00b7  ' + tm.week.avgRR.toFixed(1) + 'R avg' : ''}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize:14, fontWeight:800, fontFamily:'monospace',
+                      color: mem.wkPeak >= 70 ? BULL : mem.wkPeak >= 50 ? AMB : MUTED }}>
+                      {mem.wkPeak > 0 ? Math.round(mem.wkPeak) + '/110' : '\u2014'}
+                    </div>
+                    <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                      {mem.active} session{mem.active !== 1 ? 's' : ''} active
+                    </div>
+                  </>
+                )}
               </div>
-              {mem.live.en > 5 && (
-                <div style={{ fontSize:8, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', marginTop:2 }}>
-                  AVG {Math.round(mem.live.es / mem.live.en)}/110
+              {/* Win Rate */}
+              <div style={{ flex:1, padding:'9px 12px', borderRight:'1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.11em', color:'rgba(255,255,255,0.22)', textTransform:'uppercase', marginBottom:4 }}>Win Rate</div>
+                <div style={{ fontSize:14, fontWeight:800, fontFamily:'monospace',
+                  color: tm.week.wr !== null ? (tm.week.wr >= 55 ? BULL : tm.week.wr >= 40 ? AMB : BEAR) : MUTED }}>
+                  {tm.week.wr !== null ? tm.week.wr + '%' : '\u2014'}
                 </div>
-              )}
-            </SatPanel>
+                <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                  {tm.week.total > 0 ? tm.week.total + ' trade' + (tm.week.total !== 1 ? 's' : '') + ' recorded' : 'Building data'}
+                </div>
+              </div>
+              {/* Avg R:R */}
+              <div style={{ flex:1, padding:'9px 12px', borderRight:'1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.11em', color:'rgba(255,255,255,0.22)', textTransform:'uppercase', marginBottom:4 }}>Avg R:R</div>
+                <div style={{ fontSize:14, fontWeight:800, fontFamily:'monospace',
+                  color: tm.week.avgRR ? (tm.week.avgRR >= 1.5 ? BULL : tm.week.avgRR >= 1.0 ? AMB : BEAR) : MUTED }}>
+                  {tm.week.avgRR ? tm.week.avgRR.toFixed(1) + 'R' : '\u2014'}
+                </div>
+                <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                  {tm.week.avgRR ? (tm.week.avgRR >= 1.5 ? 'Above target' : tm.week.avgRR >= 1.0 ? 'On target' : 'Below target') : 'No data yet'}
+                </div>
+              </div>
+              {/* Best Setup */}
+              <div style={{ flex:1.4, padding:'9px 12px' }}>
+                <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.11em', color:'rgba(255,255,255,0.22)', textTransform:'uppercase', marginBottom:4 }}>Best Setup</div>
+                <div style={{ fontSize:12, fontWeight:800, fontFamily:'monospace', color:BULL, lineHeight:1.2 }}>
+                  {tm.bestSetup ? tm.bestSetup.name.replace(/\b\w/g, (c:string) => c.toUpperCase()).slice(0, 18) : '\u2014'}
+                </div>
+                <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
+                  {tm.bestSetup ? Math.round(tm.bestSetup.wr * 100) + '%  \u00b7  ' + tm.bestSetup.total + ' trade' + (tm.bestSetup.total !== 1 ? 's' : '') : 'Accumulating data'}
+                </div>
+              </div>
+            </div>
 
-            {/* Backend learning stats — shown if available in /status */}
-            {(() => {
-              const ls = data?.learning_engine || data?.per_mode_stats?.[ticker] || data?.adaptive_learning;
-              if (!ls || typeof ls !== 'object') return null;
-              const wr  = Number(ls.win_rate  ?? ls.winRate  ?? -1);
-              const tot = Number(ls.total_trades ?? ls.totalTrades ?? 0);
-              if (wr < 0 && tot === 0) return null;
-              return (
-                <SatPanel key="learn" label="Learning Engine" style={{ flex:'1 1 0', minWidth:0 }}>
-                  {wr >= 0 && (
-                    <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
-                      color: wr >= 0.55 ? BULL : wr >= 0.45 ? AMB : BEAR }}>
-                      {Math.round(wr * 100)}%
+            {/* 7-day W/L bar chart */}
+            <div style={{ padding:'10px 14px 8px', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
+              <div style={{ display:'flex', alignItems:'flex-end', gap:5, height:38 }}>
+                {tm.dailyBars.map((bar, i) => {
+                  const isT = bar.date === todayStr;
+                  const mx  = Math.max(...tm.dailyBars.map(b => b.total), 1);
+                  const wH  = bar.total > 0 ? Math.max(3, Math.round(bar.wins   / mx * 30)) : 0;
+                  const lH  = bar.total > 0 ? Math.max(3, Math.round(bar.losses / mx * 30)) : 0;
+                  return (
+                    <div key={i} title={bar.date + ': ' + bar.wins + 'W ' + bar.losses + 'L'}
+                      style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', gap:2, cursor:'default' }}>
+                      {bar.total > 0 ? (
+                        <>
+                          {wH > 0 && <div style={{ width:'60%', height:wH, borderRadius:2, background: isT ? verdictColor : BULL, opacity: isT ? 1 : 0.58, transition:'height 0.4s' }} />}
+                          {lH > 0 && <div style={{ width:'60%', height:lH, borderRadius:2, background: isT ? 'rgba(239,68,68,0.75)' : 'rgba(239,68,68,0.38)', transition:'height 0.4s' }} />}
+                        </>
+                      ) : (
+                        <div style={{ width:'60%', height:3, borderRadius:2, background:'rgba(255,255,255,0.07)' }} />
+                      )}
+                      <div style={{ fontSize:7, fontFamily:'monospace', marginTop:2,
+                        color: isT ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.18)' }}>
+                        {new Date(bar.date + 'T12:00:00').toLocaleDateString('en-US', { weekday:'narrow' })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Bottom row: Today's Focus | Most Common Mistake + This Session */}
+            <div style={{ display:'flex' }}>
+              {/* Today's Focus */}
+              <div style={{ flex:1.6, padding:'10px 14px', borderRight:'1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.13em', color:'rgba(255,255,255,0.28)', textTransform:'uppercase', marginBottom:7 }}>Today's Focus</div>
+                {objectives.length > 0 ? (
+                  <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+                    {objectives.slice(0, 3).map((obj, i) => (
+                      <div key={i} style={{ display:'flex', gap:7, alignItems:'flex-start' }}>
+                        <span style={{ fontSize:8, color:'rgba(99,179,237,0.45)', fontFamily:'monospace', fontWeight:700, flexShrink:0, marginTop:1 }}>{i + 1}.</span>
+                        <span style={{ fontSize:10.5, color:'rgba(255,255,255,0.58)', fontFamily:'monospace', lineHeight:1.45 }}>{obj}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize:10.5, color:MUTED, fontFamily:'monospace', lineHeight:1.5 }}>
+                    Loading objectives from your trade history...
+                  </div>
+                )}
+              </div>
+              {/* Most Common Mistake + This Session */}
+              <div style={{ flex:1, padding:'10px 14px', display:'flex', flexDirection:'column', gap:10 }}>
+                {(tm.worstSetup || mem.mcWR) && (
+                  <div>
+                    <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.13em', color:'rgba(255,255,255,0.28)', textTransform:'uppercase', marginBottom:5 }}>Most Common Mistake</div>
+                    {tm.worstSetup ? (
+                      <>
+                        <div style={{ fontSize:11, fontWeight:700, fontFamily:'monospace', color:BEAR, lineHeight:1.2 }}>
+                          {tm.worstSetup.name.replace(/\b\w/g, (c:string) => c.toUpperCase()).slice(0, 22)}
+                        </div>
+                        <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:2 }}>
+                          {tm.worstSetup.losses} loss{tm.worstSetup.losses !== 1 ? 'es' : ''}  \u00b7  {Math.round(tm.worstSetup.wr * 100)}% WR
+                        </div>
+                      </>
+                    ) : mem.mcWR ? (
+                      <div style={{ fontSize:10, fontFamily:'monospace', color:'rgba(255,255,255,0.50)', lineHeight:1.4 }}>
+                        {mem.mcWR.slice(0, 60)}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+                {/* This Session live */}
+                <div>
+                  <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.13em', color:'rgba(255,255,255,0.28)', textTransform:'uppercase', marginBottom:5 }}>This Session</div>
+                  <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
+                    color: mem.live.pe >= 70 ? BULL : mem.live.pe >= 50 ? AMB : MUTED }}>
+                    {Math.round(mem.live.pe)}<span style={{ fontSize:8, fontWeight:400, opacity:0.55 }}>/110</span>
+                  </div>
+                  <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:2 }}>
+                    peak \u00b7 {mem.live.su} setup{mem.live.su !== 1 ? 's' : ''} \u00b7 {mem.live.tr} trade{mem.live.tr !== 1 ? 's' : ''}
+                  </div>
+                  {tm.today.total > 0 && (
+                    <div style={{ fontSize:9, fontFamily:'monospace', marginTop:2,
+                      color: tm.today.wr !== null && tm.today.wr >= 55 ? BULL : tm.today.wr !== null && tm.today.wr >= 40 ? AMB : BEAR }}>
+                      {tm.today.wins}W {tm.today.losses}L{tm.today.wr !== null ? '  \u00b7  ' + tm.today.wr + '% WR' : ''}
                     </div>
                   )}
-                  <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:wr >= 0 ? 3 : 0 }}>
-                    {wr >= 0 ? 'WIN RATE' : ''}{tot > 0 ? `${wr >= 0 ? ' · ' : ''}${tot} TRADE${tot !== 1 ? 'S' : ''}` : ''}
-                  </div>
-                </SatPanel>
-              );
-            })()}
-
+                </div>
+              </div>
+            </div>
           </div>
 
           {/* ── QUICK CHIPS ─────────────────────────────────────────────── */}
