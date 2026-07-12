@@ -1999,23 +1999,28 @@ export default function Home() {
     .action-btn:hover:not(:disabled) { filter:brightness(1.15); }
     .sidebar-panel { animation:slideIn 0.18s ease-out; }
     @media(max-width:760px){.sidebar-l{display:none!important;}}
-    @media(max-width:640px){
+    @media(max-width:768px){
+      /* ── ALL AVATAR: pig fills the screen, everything else hidden ── */
+      .main-center>*:not(.mb-row){display:none!important;}
+      .main-center{padding:0!important;overflow:hidden!important;}
+      .mb-row{flex-direction:column!important;min-height:calc(100vh - 48px)!important;height:calc(100vh - 48px)!important;margin-bottom:0!important;gap:0!important;align-items:center!important;justify-content:center!important;}
+      .mb-brain{display:none!important;}
+      .mc-stage{flex:1!important;min-height:0!important;width:100%!important;display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;}
+      .mc-top-row{display:none!important;}
+      .mc-bot-row{display:none!important;}
+      .mc-col{display:none!important;}
+      .mc-mid-row{flex:1!important;justify-content:center!important;align-items:flex-start!important;gap:0!important;}
+      .mc-avtr-outer{align-self:stretch!important;flex:1!important;justify-content:center!important;align-items:flex-start!important;}
+      .mc-avtr-box{transform:scale(1.48)!important;transform-origin:top center!important;}
+      .mob-avtr-overlay{display:flex!important;}
+      /* Header: compact */
       .hdr-logo-name{display:none!important;}
       .hdr-clock{display:none!important;}
       .hdr-eng{display:none!important;}
       .ticker-btn{padding:3px 7px!important;font-size:10px!important;}
-      .main-center{padding:14px 12px 20px!important;}
-      .mb-row{flex-direction:column!important;min-height:unset!important;gap:14px!important;align-items:center!important;}
-      .mb-brain{min-width:0!important;width:100%!important;align-items:flex-start!important;}
-      .verdict-big{font-size:26px!important;letter-spacing:-0.01em!important;}
-      .verdict-sub{font-size:15px!important;}
-      .edge-wrap{max-width:100%!important;}
-      .narration{font-size:14px!important;max-width:100%!important;min-height:unset!important;}
-      .wait-box{max-width:100%!important;}
-      .ev-grid{grid-template-columns:1fr!important;}
-      .chart-hdr-extra{display:none!important;}
-      .quick-chips{gap:5px!important;}
     }
+    /* Hidden on desktop, shown on mobile */
+    .mob-avtr-overlay{display:none;}
     .sat-col{opacity:0.90;transition:opacity 0.35s ease;}
     .sat-col:hover{opacity:1!important;}
     @keyframes evPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(1.9)}}
@@ -2038,7 +2043,7 @@ export default function Home() {
     @keyframes mcFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-1.8px)}}
     @keyframes connFlash{0%{opacity:0.92}50%{opacity:0.55}100%{opacity:0}}
     @media(max-width:1100px){.mc-col{width:108px!important;}.mc-card{padding:7px 9px!important;}.mc-value{font-size:11.5px!important;}}
-    @media(max-width:900px){
+    @media(min-width:769px) and (max-width:900px){
       .mc-top-row{display:none!important;}
       .mc-bot-row{display:none!important;}
       .mc-col{display:none!important;}
@@ -2392,8 +2397,8 @@ export default function Home() {
                 </div>
 
                 {/* AVATAR SPOTLIGHT CENTER */}
-                <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
-                  <div style={{ position:'relative', width:342, height:455, flexShrink:0 }}>
+                <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+                  <div className="mc-avtr-box" style={{ position:'relative', width:342, height:455, flexShrink:0 }}>
                     {/* Far-field halo — wide soft envelope */}
                     <div style={{ position:'absolute', top:-130, left:-150, right:-150, bottom:-80,
                       background:`radial-gradient(ellipse at 50% 46%, ${auraColor}24 0%, ${auraColor}09 36%, transparent 66%)`,
@@ -2483,6 +2488,45 @@ export default function Home() {
                         </div>
                       );
                     })()}
+
+                    {/* ── MOBILE OVERLAY — verdict · price · narration ── */}
+                    <div className="mob-avtr-overlay" style={{
+                      position:'absolute', bottom:0, left:0, right:0, zIndex:6,
+                      background:'linear-gradient(transparent,rgba(4,6,14,0.96) 52%)',
+                      padding:'52px 16px 24px', flexDirection:'column', alignItems:'center', gap:8,
+                      pointerEvents:'none',
+                    }}>
+                      <div style={{
+                        background:`${auraColor}1c`, border:`1px solid ${auraColor}4c`,
+                        borderRadius:22, padding:'6px 22px',
+                        fontSize:17, fontWeight:800, color:auraColor,
+                        fontFamily:'monospace', letterSpacing:'0.04em',
+                        boxShadow:`0 0 20px ${auraColor}28`,
+                      }}>
+                        {status === 'READY'
+                          ? (/long|bull/i.test(dirn) ? '▲ READY — LONG' : '▼ READY — SHORT')
+                          : (status || 'WAIT')}
+                      </div>
+                      <div style={{ display:'flex', gap:10, alignItems:'center' }}>
+                        <span style={{ fontSize:24, fontWeight:800, color:'rgba(255,255,255,0.92)', fontFamily:'monospace' }}>
+                          {price > 0 ? fmt(price) : '—'}
+                        </span>
+                        <span style={{ fontSize:11, color:'rgba(255,255,255,0.32)', fontFamily:'monospace' }}>{ticker}</span>
+                        <span style={{
+                          fontSize:10, fontWeight:700, color:verdictColor,
+                          background:`${verdictColor}18`, border:`1px solid ${verdictColor}30`,
+                          borderRadius:8, padding:'2px 8px', fontFamily:'monospace',
+                        }}>{Math.round(edge)}/110</span>
+                      </div>
+                      {narration && (
+                        <div style={{
+                          fontSize:11.5, color:'rgba(255,255,255,0.45)', fontFamily:'monospace',
+                          textAlign:'center', lineHeight:1.5, maxWidth:260,
+                        }}>
+                          {String(narration).slice(0,88)}{String(narration).length > 88 ? '…' : ''}
+                        </div>
+                      )}
+                    </div>
 
                   </div>
                   <div style={{ marginTop:4, display:'flex', alignItems:'center', gap:7 }}>
