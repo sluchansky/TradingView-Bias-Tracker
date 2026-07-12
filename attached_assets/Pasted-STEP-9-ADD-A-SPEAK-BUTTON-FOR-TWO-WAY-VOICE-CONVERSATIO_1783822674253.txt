@@ -1,0 +1,261 @@
+STEP 9 – ADD A SPEAK BUTTON FOR TWO-WAY VOICE CONVERSATION
+
+Add a large Speak button that allows me to talk directly to the AI trading partner through my microphone.
+
+The goal is to make the dashboard feel like a real voice conversation.
+
+USER EXPERIENCE:
+
+1. The user presses the Speak button.
+2. The browser requests microphone permission if needed.
+3. The avatar enters a LISTENING state.
+4. The user speaks naturally.
+5. The spoken audio is converted into text.
+6. The transcript is sent through the existing Ask Brain conversation system.
+7. The AI generates a response using all current dashboard data.
+8. The response is spoken aloud.
+9. The avatar’s eyes and lips move in sync with the response.
+10. The full conversation remains visible in the existing text feed.
+
+
+SPEAK BUTTON DESIGN:
+
+Add a prominent microphone button near the Ask Brain input.
+
+The button should include:
+- Microphone icon
+- Label: Speak
+- Clear active and inactive states
+- Touch-friendly size for mobile
+- At least a 48px tap target
+- Visible microphone permission status
+
+Button states:
+
+IDLE
+- Label: Speak
+- Normal microphone icon
+- Soft blue glow
+
+LISTENING
+- Label: Listening...
+- Animated microphone pulse
+- Red or orange recording indicator
+- Avatar looks directly toward the user
+
+PROCESSING
+- Label: Thinking...
+- Disable repeated submissions
+- Show a subtle loading animation
+- Avatar enters ANALYZING state
+
+SPEAKING
+- Label: Stop
+- Avatar lips and eyes animate
+- Show that audio is currently playing
+
+ERROR
+- Show a clear message
+- Allow the user to retry
+
+
+RECOMMENDED CONTROLS:
+
+Include these controls:
+
+- Tap Speak to begin listening
+- Tap again to stop recording
+- Stop button to interrupt the AI while it is speaking
+- Cancel button to discard the current voice input
+- Optional mute button for AI voice output
+- Optional text edit step before sending the transcript
+
+On mobile, do not require the user to hold the button down unless a push-to-talk mode is specifically enabled.
+
+
+VOICE INPUT REQUIREMENTS:
+
+Use browser microphone access through:
+
+navigator.mediaDevices.getUserMedia({ audio: true })
+
+Preferred implementation:
+- Use a reliable speech-to-text service or existing backend speech transcription provider.
+- Send the recorded audio to the server for transcription.
+- Do not rely only on browser SpeechRecognition because browser support is inconsistent, especially on iPhone Safari.
+
+The transcription system should:
+- Support natural sentences
+- Handle market terms such as MNQ, MGC, VWAP, CHOCH, BOS, ATR, liquidity sweep, stop loss and take profit
+- Ignore long silence
+- Automatically stop after a configurable silence period
+- Display the transcript before or while it is being submitted
+- Allow manual corrections if transcription is inaccurate
+
+
+VOICE ACTIVITY DETECTION:
+
+Add voice activity detection so recording behaves naturally.
+
+Requirements:
+- Detect when the user starts speaking
+- Detect when the user stops speaking
+- Stop automatically after approximately 1.5 to 2.5 seconds of silence
+- Do not stop during brief pauses between words
+- Show a live audio waveform or microphone level
+- Prevent empty recordings from being submitted
+
+
+CONVERSATION INTEGRATION:
+
+The voice transcript must use the exact same logic as the existing Ask Brain input.
+
+Do not create a separate AI conversation system.
+
+Voice questions should:
+- Enter the same conversation history
+- Use current market data
+- Use active symbol and timeframe
+- Use current verdict and Edge Score
+- Use current structure, liquidity, VWAP, delta and volatility data
+- Use active trade information
+- Use session memory
+- Use the existing AI reasoning engine
+
+Example:
+
+User says:
+“Why are you waiting on MNQ?”
+
+The system should submit:
+“Why are you waiting on MNQ?”
+
+The AI should answer using current live conditions, display the answer in text, and speak it aloud.
+
+
+AVATAR LISTENING STATE:
+
+Add a dedicated avatar state:
+
+LISTENING
+
+While LISTENING:
+- Mouth remains closed
+- Eyes look toward the user
+- Eyes blink naturally
+- Ear or side glow pulses gently
+- Confidence ring changes to blue
+- Background particles slow down
+- Audio waveform responds to microphone volume
+
+When listening ends:
+- Transition smoothly into ANALYZING
+- Do not snap back to the idle state
+
+
+INTERRUPTION AND BARGE-IN:
+
+Allow me to interrupt the AI while it is talking.
+
+Required behavior:
+- Pressing Speak while the AI is speaking stops the current voice response
+- Lip animation stops immediately
+- Current audio playback is cancelled
+- Avatar switches to LISTENING
+- The new question becomes the latest request
+
+This should feel like a natural conversation, not a voice recording form.
+
+
+PERMISSION HANDLING:
+
+Handle microphone permissions clearly.
+
+If permission has not been granted:
+- Request permission only after the user presses Speak
+- Explain why microphone access is needed
+
+If permission is denied:
+- Show: “Microphone access is blocked. Enable microphone permission in your browser settings.”
+- Keep the text input available
+- Do not repeatedly trigger permission prompts
+
+If no microphone is detected:
+- Show a clear error
+- Keep the rest of the dashboard working
+
+
+MOBILE AND IPHONE REQUIREMENTS:
+
+The Speak feature must work on iPhone Safari.
+
+Important requirements:
+- Microphone access must begin from a direct user tap
+- Audio playback must also be unlocked through user interaction
+- Use HTTPS
+- Do not autoplay AI speech before the user has interacted with the page
+- Handle Safari audio session restrictions
+- Keep the screen awake during an active voice conversation where possible
+- Test on iPhone Safari at 375px, 390px and 430px widths
+
+
+PRIVACY AND RECORDING:
+
+Show a visible indicator whenever the microphone is active.
+
+Requirements:
+- Never record before the user presses Speak
+- Stop the microphone stream when recording ends
+- Stop all media tracks when cancelled
+- Do not keep the microphone active in the background
+- Do not store raw audio unless needed for transcription
+- Clearly separate temporary audio from saved conversation text
+
+
+SUGGESTED STATE MODEL:
+
+voiceState:
+- idle
+- requesting_permission
+- listening
+- transcribing
+- processing
+- speaking
+- paused
+- error
+
+Suggested reusable functions:
+
+startListening()
+stopListening()
+cancelListening()
+submitTranscript()
+stopAIResponse()
+playAIResponse()
+setVoiceState()
+releaseMicrophone()
+interruptAndListen()
+
+
+COMPLETION TESTS:
+
+This step is complete only when:
+
+- Pressing Speak activates the microphone.
+- The avatar clearly enters LISTENING mode.
+- The user can speak without typing.
+- The spoken words appear as text.
+- The transcript enters the existing Ask Brain conversation.
+- The AI response appears in the text feed.
+- The AI response is spoken aloud.
+- The lips move in sync with the AI voice.
+- The eyes remain active while speaking.
+- The user can interrupt the AI and immediately ask another question.
+- The microphone always stops after the interaction.
+- Permission errors are handled clearly.
+- It works on desktop Chrome and iPhone Safari.
+- No second disconnected chat system is created.
+
+Do not redesign the existing avatar.
+
+Connect the new Speak button to the existing conversation feed, AI reasoning engine, voice output, and facial animation system.

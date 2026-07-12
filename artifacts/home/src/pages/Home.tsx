@@ -82,12 +82,29 @@ function useStream(target: string, msPerChar = 13) {
   return { text, live };
 }
 
+// ── Speech control — written by useTTS energy loop, read each frame by AvatarCanvas ─
+interface SpeechCtrl { energy: number; viseme: string; active: boolean; }
+function charToViseme(c: string): string {
+  const lc = (c || '').toLowerCase();
+  if (lc === 'o') return 'rounded';
+  if ('aiu'.includes(lc)) return 'open';
+  if (lc === 'e') return 'narrow';
+  if ('mbp'.includes(lc)) return 'press';
+  if ('fv'.includes(lc)) return 'narrow';
+  return 'open';
+}
+
 // ── TTS ─────────────────────────────────────────────────────────────────────────
 function useTTS() {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voiceName, setVoiceN] = useState<string>(() => { try { return localStorage.getItem('brain_voice') ?? ''; } catch { return ''; } });
   const [muted, setMutedState] = useState<boolean>(() => { try { return localStorage.getItem('brain_muted') !== '0'; } catch { return true; } });
   const [speaking, setSpeaking] = useState(false);
+  // Shared energy ref: written by the RAF loop below, read by AvatarCanvas draw loop (no React re-renders)
+  const speechCtrlRef = useRef<SpeechCtrl>({ energy: 0, viseme: 'rest', active: false });
+  const energyRafRef  = useRef(0);
+  const wordDataRef   = useRef({ t0: Date.now(), dur: 250, char: 'a' });
+
   useEffect(() => {
     const ss = window.speechSynthesis; if (!ss) return;
     const load = () => { const all = ss.getVoices(); const en = all.filter(v => v.lang.startsWith('en')); setVoices(en.length ? en : all.slice(0, 30)); };
@@ -96,18 +113,76 @@ function useTTS() {
   const setVoice = useCallback((name: string) => { try { localStorage.setItem('brain_voice', name); } catch {} setVoiceN(name); }, []);
   const setMuted = useCallback((m: boolean) => {
     try { localStorage.setItem('brain_muted', m ? '1' : '0'); } catch {}
-    if (m) { window.speechSynthesis?.cancel(); setSpeaking(false); }
+    if (m) {
+      window.speechSynthesis?.cancel();
+      setSpeaking(false);
+      cancelAnimationFrame(energyRafRef.current);
+      speechCtrlRef.current = { energy: 0, viseme: 'rest', active: false };
+    }
     setMutedState(m);
   }, []);
   const speak = useCallback((text: string) => {
     const ss = window.speechSynthesis; if (!text || muted || !ss) return;
-    ss.cancel(); const utt = new SpeechSynthesisUtterance(text.slice(0, 400));
+    ss.cancel();
+    cancelAnimationFrame(energyRafRef.current);
+
+    const utt = new SpeechSynthesisUtterance(text.slice(0, 400));
     const voice = voices.find(v => v.name === voiceName) ?? voices[0]; if (voice) utt.voice = voice;
     utt.rate = 0.92; utt.pitch = 1.05;
-    utt.onstart = () => setSpeaking(true); utt.onend = () => setSpeaking(false); utt.onerror = () => setSpeaking(false);
+
+    utt.onstart = () => {
+      setSpeaking(true);
+      speechCtrlRef.current = { energy: 0, viseme: 'open', active: true };
+      wordDataRef.current = { t0: Date.now(), dur: 280, char: 'a' };
+      // Drive mouth energy via a dedicated RAF loop — no React renders, no jitter
+      const driveEnergy = () => {
+        const ctrl = speechCtrlRef.current;
+        if (!ctrl.active) return;
+        const { t0, dur, char } = wordDataRef.current;
+        const age  = Date.now() - t0;
+        const prog = Math.min(1, age / Math.max(1, dur));
+        // Bell-curve energy per word: ramp up, sustain, ramp down
+        const bell = prog < 0.28 ? prog / 0.28 : prog < 0.70 ? 1.0 : Math.max(0, (1 - prog) / 0.30);
+        // Natural micro-jitter — two low-freq oscillators
+        const jit = Math.sin(Date.now() * 0.020) * 0.13 + Math.sin(Date.now() * 0.035) * 0.08;
+        const tgt  = Math.max(0, Math.min(1, bell * 0.74 + jit * bell));
+        // Exponential smoothing — prevents shaky mouth
+        ctrl.energy += (tgt - ctrl.energy) * 0.18;
+        ctrl.viseme  = charToViseme(char);
+        energyRafRef.current = requestAnimationFrame(driveEnergy);
+      };
+      energyRafRef.current = requestAnimationFrame(driveEnergy);
+    };
+
+    // Word-boundary events: update word timing for next energy bell
+    utt.onboundary = (e: SpeechSynthesisEvent) => {
+      if (e.name !== 'word') return;
+      const rest     = text.slice(0, 400).slice(e.charIndex);
+      const spaceIdx = rest.indexOf(' ');
+      const word     = spaceIdx > 0 ? rest.slice(0, spaceIdx) : rest.slice(0, 8);
+      wordDataRef.current = { t0: Date.now(), dur: Math.max(130, word.length * 88), char: word[0]?.toLowerCase() ?? 'a' };
+    };
+
+    const stopEnergy = () => {
+      setSpeaking(false);
+      speechCtrlRef.current.active = false;
+      cancelAnimationFrame(energyRafRef.current);
+      // Smooth decay back to closed mouth
+      const decay = () => {
+        speechCtrlRef.current.energy *= 0.86;
+        if (speechCtrlRef.current.energy > 0.015) {
+          energyRafRef.current = requestAnimationFrame(decay);
+        } else {
+          speechCtrlRef.current.energy = 0;
+          speechCtrlRef.current.viseme = 'rest';
+        }
+      };
+      energyRafRef.current = requestAnimationFrame(decay);
+    };
+    utt.onend = stopEnergy; utt.onerror = stopEnergy;
     ss.speak(utt);
   }, [voices, voiceName, muted]);
-  return { voices, voiceName, setVoice, muted, setMuted, speaking, speak };
+  return { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef };
 }
 
 // ── Candle data ────────────────────────────────────────────────────────────────
@@ -140,8 +215,9 @@ function getBrainChecklist(data: any): Array<{ text: string; st: 'pass' | 'fail'
 // ── Synthetic AI face canvas ───────────────────────────────────────────────────
 type GazeEvt = { dx: number; dy: number; widen: boolean; dur: number; id: number };
 
-const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
+const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, speechCtrlRef }: {
   avState: AvatarState; speaking: boolean; ringColor: string; gazeEvent: GazeEvt;
+  speechCtrlRef: React.MutableRefObject<SpeechCtrl>;
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef   = useRef(0);
@@ -249,11 +325,15 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
         : breatheY + leanY;
 
       // ── Eye scan (pupil drift) — speed/amplitude keyed from AV_EXPR ─────────────
-      const scanSpeed = expr.scanSpd;
-      const scanAmpX  = expr.scanAX;
-      const scanAmpY  = expr.scanAY;
-      const eyeOffX   = Math.sin(elapsed * scanSpeed) * scanAmpX;
-      const eyeOffY   = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY;
+      const scanSpeed  = expr.scanSpd;
+      const scanAmpX   = expr.scanAX;
+      const scanAmpY   = expr.scanAY;
+      // While speaking: tighten scan to appear focused; add subtle speech-gaze sway
+      const scanScale  = spk ? 0.38 : 1.0;
+      const spkGazeX   = spk ? Math.sin(elapsed * 0.00078) * 2.6 : 0;
+      const spkGazeY   = spk ? Math.sin(elapsed * 0.00112 + 0.9) * 1.4 : 0;
+      const eyeOffX    = Math.sin(elapsed * scanSpeed) * scanAmpX * scanScale + spkGazeX;
+      const eyeOffY    = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY * scanScale + spkGazeY;
 
       // ── Market-event gaze blend ───────────────────────────────────────────────
       // When a notable event fires (structure, sweep, READY, edge spike) the eyes
@@ -275,9 +355,11 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
       const widenFactor = gz.widen && gazeLerp > 0.05 ? 1 + 0.28 * gazeLerp : 1.0;
 
       // ── Expression parameters — all driven by AV_EXPR table ─────────────────────
-      const browLift = expr.browLift;
-      const bgAlpha  = expr.bgAlpha;
-      const eyeGlow  = expr.eyeGlow;
+      const browLift  = expr.browLift;
+      const bgAlpha   = expr.bgAlpha;
+      // Boost eye glow while speaking — keeps eyes alive and engaged
+      const spkEnergy = spk ? (speechCtrlRef.current?.energy ?? 0) : 0;
+      const eyeGlow   = expr.eyeGlow + (spk ? 7 + spkEnergy * 9 : 0);
 
       ctx.clearRect(0, 0, W, H);
 
@@ -446,24 +528,69 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
         ctx.strokeStyle = rc(cfg.mesh, 0.09 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
       });
 
-      // ── Mouth — all expressions professional and understated ─────────────────
+      // ── Mouth — lip-sync while speaking, expression shapes at rest ─────────────
       // Bezier control point BELOW endpoints (higher y) = smile (U-shape)
       // Bezier control point ABOVE endpoints (lower y)  = frown (arch-shape)
-      ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.30);
+      const my         = CY + 57 + bob;
+      const lipEnergy  = spk ? Math.max(0, Math.min(1, speechCtrlRef.current?.energy ?? 0)) : 0;
+      const lipViseme  = spk ? (speechCtrlRef.current?.viseme ?? 'rest') : 'rest';
       ctx.beginPath();
-      const my = CY + 57 + bob;
-      switch (expr.mouthType) {
-        case 'confident':     ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+4,   CX+17,my);     break; // clear smile — READY_LONG
-        case 'satisfaction':  ctx.moveTo(CX-16,my+1);   ctx.quadraticCurveTo(CX,my+3.5, CX+16,my+1);   break; // warm close-lipped smile
-        case 'interested':    ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+3,   CX+15,my+0.5); break; // curious upturn
-        case 'relaxed':       ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break; // gentle resting curve
-        case 'focused':       ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+1,   CX+15,my+0.5); break; // nearly flat, controlled
-        case 'tight':         ctx.moveTo(CX-13,my);     ctx.lineTo(CX+13,my);                          break; // firm line — ACTIVE
-        case 'disappointment':ctx.moveTo(CX-15,my);     ctx.quadraticCurveTo(CX,my-2,   CX+15,my);     break; // subtle arch-down frown
-        default:              ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break;
+      if (lipEnergy > 0.04 && spk) {
+        // ── Lip-sync: jaw drops with energy, shape varies by current viseme ──────
+        const jawDrop = lipEnergy * 10.5;
+        const mw      = 15 + lipEnergy * 3.5;
+        ctx.shadowBlur = 6 + lipEnergy * 6; ctx.shadowColor = rc(cfg.eye, 0.50);
+        if (lipViseme === 'press') {
+          // M / B / P — lips firmly together, slight centre crease
+          ctx.moveTo(CX - 13, my); ctx.quadraticCurveTo(CX, my + 0.6, CX + 13, my);
+        } else if (lipViseme === 'rounded') {
+          // O — pursed, small elliptical opening
+          const rw = 6 + lipEnergy * 5;
+          const rh = Math.max(2, jawDrop * 0.68);
+          ctx.ellipse(CX, my - rh * 0.22, rw, rh, 0, 0, Math.PI * 2);
+        } else if (lipViseme === 'narrow') {
+          // E / F / V — wide, shallow slit
+          ctx.moveTo(CX - mw, my);
+          ctx.quadraticCurveTo(CX, my + jawDrop * 0.20, CX + mw, my);
+        } else {
+          // Default open / wide — upper lip stays, lower lip drops with jaw
+          ctx.moveTo(CX - mw, my);
+          ctx.quadraticCurveTo(CX, my + jawDrop * 0.13 + 1, CX + mw, my);
+          ctx.moveTo(CX - mw * 0.86, my + jawDrop * 0.40);
+          ctx.quadraticCurveTo(CX, my + jawDrop + 1.5, CX + mw * 0.86, my + jawDrop * 0.40);
+        }
+        ctx.strokeStyle = rc(cfg.eye, (0.55 + lipEnergy * 0.28) * cfg.dim);
+        ctx.lineWidth = 1.4; ctx.stroke();
+      } else {
+        // ── Resting expression shapes ─────────────────────────────────────────────
+        ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.30);
+        switch (expr.mouthType) {
+          case 'confident':     ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+4,   CX+17,my);     break;
+          case 'satisfaction':  ctx.moveTo(CX-16,my+1);   ctx.quadraticCurveTo(CX,my+3.5, CX+16,my+1);   break;
+          case 'interested':    ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+3,   CX+15,my+0.5); break;
+          case 'relaxed':       ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break;
+          case 'focused':       ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+1,   CX+15,my+0.5); break;
+          case 'tight':         ctx.moveTo(CX-13,my);     ctx.lineTo(CX+13,my);                          break;
+          case 'disappointment':ctx.moveTo(CX-15,my);     ctx.quadraticCurveTo(CX,my-2,   CX+15,my);     break;
+          default:              ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break;
+        }
+        ctx.strokeStyle = rc(cfg.eye, 0.38 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
       }
-      ctx.strokeStyle = rc(cfg.eye, 0.38 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+
+      // ── Speaking pulse ring — soft aura that breathes with voice energy ─────────
+      if (spk && spkEnergy > 0.0) {
+        const spkPulse = 0.55 + 0.45 * Math.sin(elapsed * 0.0040);
+        ctx.save();
+        ctx.shadowBlur  = 14 + spkEnergy * 14;
+        ctx.shadowColor = rc(cfg.eye, 0.72);
+        ctx.globalAlpha = spkPulse * (0.09 + spkEnergy * 0.15);
+        ctx.beginPath();
+        ctx.ellipse(CX, CY, RX + 11, RY + 15, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = rc(cfg.eye, 1.0);
+        ctx.lineWidth = 2.2; ctx.stroke();
+        ctx.restore();
+      }
 
       // ── Orbiting particles (speed tied to state energy) ───────────────────────
       partRef.current.forEach(p => {
@@ -1707,7 +1834,7 @@ export default function Home() {
   const prevZoneRef   = useRef(false);
 
   const clock = useClock();
-  const { voices, voiceName, setVoice, muted, setMuted, speaking, speak } = useTTS();
+  const { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef } = useTTS();
   useEffect(() => { speakRef.current = speak; }, [speak]);
 
   const authHeader = useMemo((): Record<string,string> =>
@@ -2415,7 +2542,7 @@ export default function Home() {
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
                       justifyContent:'center', transform:'scale(1.50)', transformOrigin:'center center', zIndex:1 }}>
-                      <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+                      <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} />
                     </div>
 
                     {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}
