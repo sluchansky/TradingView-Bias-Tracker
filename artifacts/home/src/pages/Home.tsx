@@ -428,10 +428,12 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         }
       }
 
-      // ── Breathing (slow sinusoidal Y bob, period varies by state) ────────────
+      // ── Breathing — two overlapping sinusoids with golden-ratio frequency ratio
+      // Produces organic non-periodic rhythm; never feels like a mechanical loop
       const breatheSpeed = expr.breatheSpd;
       const breatheAmp   = expr.breatheAmp;
-      const breatheY     = Math.sin(elapsed * breatheSpeed) * breatheAmp;
+      const breatheY     = Math.sin(elapsed * breatheSpeed) * breatheAmp * 0.76
+                         + Math.sin(elapsed * breatheSpeed * 1.618 + 0.9) * breatheAmp * 0.26;
 
       // Per-state lean: positive = tilt toward viewer, negative = lean back
       const leanY = expr.leanY;
@@ -440,6 +442,16 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       const bob = spk
         ? breatheY * 0.4 + Math.sin(elapsed * 0.006) * 2 + leanY
         : breatheY + leanY;
+
+      // ── Idle micro-animation — multi-frequency sinusoids, always running ─────────
+      // Irrational frequency ratios keep movement non-periodic and organic
+      const idleSwayX = Math.sin(elapsed * 0.00048) * 1.5
+                      + Math.sin(elapsed * 0.00081 + 1.3) * 0.7;
+      const idleSwayY = Math.sin(elapsed * 0.00061 + 2.4) * 0.55
+                      + Math.sin(elapsed * 0.00097 + 0.6) * 0.28;
+      // Micro head-nod rotation overlay (±0.009 rad ≈ ±0.5°), layered on state tilt
+      const idleNod = Math.sin(elapsed * 0.00037 + 1.9) * 0.006
+                    + Math.sin(elapsed * 0.00059 + 3.2) * 0.003;
 
       // ── Eye scan (pupil drift) — speed/amplitude keyed from AV_EXPR ─────────────
       const scanSpeed  = expr.scanSpd;
@@ -507,9 +519,10 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
 
       ctx.clearRect(0, 0, W, H);
 
-      // Ambient bg radial glow (breathes with face)
+      // Ambient bg radial glow — alpha breathes on a slow independent cycle
+      const ambBreath = 0.78 + 0.22 * Math.sin(elapsed * 0.00064 + 1.4);
       const bg = ctx.createRadialGradient(CX, CY + bob, 8, CX, CY + bob, 155);
-      bg.addColorStop(0, rc(cfg.mesh, bgAlpha));
+      bg.addColorStop(0, rc(cfg.mesh, bgAlpha * ambBreath));
       bg.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
 
@@ -548,10 +561,11 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.fillStyle = rc(cfg.mesh, p * 0.65 * cfg.dim); ctx.fill();
       });
 
-      // ── Head tilt transform — pivots entire face; rings/particles stay fixed ────
+      // ── Head tilt + body sway — face shifts; outer rings/particles stay fixed ────
       ctx.save();
+      ctx.translate(idleSwayX, idleSwayY);  // body sway shifts entire face
       ctx.translate(CX, CY + bob);
-      ctx.rotate(headTilt);
+      ctx.rotate(headTilt + idleNod);       // state tilt + idle micro head-nod
       ctx.translate(-CX, -(CY + bob));
 
       // ── Face fill — cinematic 3-point lighting over dark volumetric base ────────
@@ -563,8 +577,10 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       faceBase.addColorStop(0.42, rc([12, 18, 46], 0.97));
       faceBase.addColorStop(1,    rc([4,  6,  24], 0.99));
       ctx.fillStyle = faceBase; ctx.fillRect(0, 0, W, H);
-      // Key light — upper-left warm tint using state colour
-      const keyL = ctx.createRadialGradient(CX - 30, CY + bob - 62, 6, CX - 10, CY + bob - 14, RX * 0.92);
+      // Key light — upper-left warm tint; source drifts slowly for ambient life
+      const kLx = CX - 30 + Math.sin(elapsed * 0.00046) * 5;
+      const kLy = CY + bob - 62 + Math.sin(elapsed * 0.00071 + 1.8) * 3;
+      const keyL = ctx.createRadialGradient(kLx, kLy, 6, CX - 10, CY + bob - 14, RX * 0.92);
       keyL.addColorStop(0,    rc(cfg.mesh, 0.44));
       keyL.addColorStop(0.50, rc(cfg.mesh, 0.14));
       keyL.addColorStop(1,    'rgba(0,0,0,0)');
@@ -978,7 +994,8 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         p.angle += p.speed * 0.008 * effectivePartMult;
         const qx = CX + Math.cos(p.angle) * p.r;
         const qy = CY + Math.sin(p.angle) * p.r * 0.72 + bob;
-        const a  = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim;
+        const partAmb = 0.86 + 0.14 * Math.sin(elapsed * 0.00088 + p.phase * 0.4);
+        const a  = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim * partAmb;
         ctx.beginPath(); ctx.arc(qx, qy, p.sz, 0, Math.PI * 2);
         ctx.fillStyle = rc(cfg.mesh, a); ctx.fill();
       });
