@@ -1,0 +1,261 @@
+Make LordPiggington’s lips move in sync with the AI voice audio.
+
+Do not use a timer-only animation and do not fake the mouth with CSS. Use the facial expressions built into LordPiggington.vrm.
+
+FIRST, INSPECT THE MODEL
+
+After the VRM loads, log the available expression names:
+
+console.log(vrm.expressionManager?.expressions.map(e => e.expressionName));
+
+Confirm whether the model uses names such as:
+
+aa
+ih
+ou
+ee
+oh
+
+or older VRM names such as:
+
+A
+I
+U
+E
+O
+
+Use the expression names that actually exist in the model.
+
+CONNECT TO THE REAL VOICE AUDIO
+
+The same HTMLAudioElement used to play the AI response must be passed to the avatar lip-sync system.
+
+Example:
+
+<LordPiggingtonAvatar
+  audioElement={voiceAudioRef.current}
+  isSpeaking={isSpeaking}
+/>
+
+Use the Web Audio API:
+
+1. Create an AudioContext.
+2. Create a MediaElementAudioSourceNode from the voice audio element.
+3. Connect it to an AnalyserNode.
+4. Connect the analyser to audioContext.destination so sound still plays.
+5. Read the audio volume every animation frame.
+6. Convert the current volume into a mouth-open value from 0 to 1.
+7. Apply that value to the VRM mouth expressions.
+8. Smooth the movement so the mouth does not chatter.
+9. Reset every mouth expression to zero when audio pauses, ends, or errors.
+
+IMPORTANT:
+Create MediaElementAudioSourceNode only once for each audio element. Do not recreate it every render or animation frame.
+
+IMPLEMENT A LIP-SYNC CONTROLLER SIMILAR TO THIS:
+
+type MouthExpression = "aa" | "ih" | "ou" | "ee" | "oh";
+
+const mouthExpressions: MouthExpression[] = [
+  "aa",
+  "ih",
+  "ou",
+  "ee",
+  "oh"
+];
+
+function resetMouth(vrm) {
+  if (!vrm?.expressionManager) return;
+
+  for (const expression of mouthExpressions) {
+    if (vrm.expressionManager.getExpression(expression)) {
+      vrm.expressionManager.setValue(expression, 0);
+    }
+  }
+}
+
+function setMouthShape(vrm, selectedExpression, amount) {
+  if (!vrm?.expressionManager) return;
+
+  for (const expression of mouthExpressions) {
+    if (!vrm.expressionManager.getExpression(expression)) continue;
+
+    const target = expression === selectedExpression ? amount : 0;
+    const current =
+      vrm.expressionManager.getValue(expression) ?? 0;
+
+    const smoothed = THREE.MathUtils.lerp(
+      current,
+      target,
+      0.35
+    );
+
+    vrm.expressionManager.setValue(expression, smoothed);
+  }
+}
+
+AUDIO ANALYSIS:
+
+const audioContext = new AudioContext();
+
+const analyser = audioContext.createAnalyser();
+analyser.fftSize = 256;
+analyser.smoothingTimeConstant = 0.65;
+
+const source =
+  audioContext.createMediaElementSource(audioElement);
+
+source.connect(analyser);
+analyser.connect(audioContext.destination);
+
+const frequencyData =
+  new Uint8Array(analyser.frequencyBinCount);
+
+Inside the existing Three.js animation loop:
+
+analyser.getByteFrequencyData(frequencyData);
+
+let total = 0;
+
+for (let i = 0; i < frequencyData.length; i++) {
+  total += frequencyData[i];
+}
+
+const average = total / frequencyData.length;
+
+const noiseFloor = 8;
+const speechLevel = 55;
+
+let mouthAmount = THREE.MathUtils.clamp(
+  (average - noiseFloor) / speechLevel,
+  0,
+  1
+);
+
+mouthAmount = Math.pow(mouthAmount, 0.8);
+
+Add a small silence threshold:
+
+if (
+  audioElement.paused ||
+  audioElement.ended ||
+  average < noiseFloor
+) {
+  mouthAmount = 0;
+}
+
+SELECTING MOUTH SHAPES
+
+For the first working version, choose different vowel expressions based on frequency ranges rather than opening only one expression constantly.
+
+Example:
+
+let mouthShape: MouthExpression = "aa";
+
+const low =
+  averageFrequencyRange(frequencyData, 0, 8);
+
+const middle =
+  averageFrequencyRange(frequencyData, 8, 24);
+
+const high =
+  averageFrequencyRange(frequencyData, 24, 55);
+
+if (high > middle && high > low) {
+  mouthShape = "ee";
+} else if (middle > low) {
+  mouthShape = "ih";
+} else if (mouthAmount > 0.65) {
+  mouthShape = "aa";
+} else {
+  mouthShape = "oh";
+}
+
+setMouthShape(
+  vrm,
+  mouthShape,
+  mouthAmount * 0.9
+);
+
+Do not activate all vowels at full strength simultaneously because that will distort the face.
+
+ANIMATION LOOP
+
+Run the lip-sync update inside the avatar’s existing requestAnimationFrame or React Three Fiber useFrame loop.
+
+Do not create a separate requestAnimationFrame loop.
+
+Example:
+
+useFrame(() => {
+  updateLipSync();
+  vrm.update(clockDelta);
+});
+
+AUDIO START REQUIREMENT
+
+Because browsers can suspend AudioContext until the user interacts with the page, resume it when the user presses Speak or when audio playback begins:
+
+if (audioContext.state === "suspended") {
+  await audioContext.resume();
+}
+
+EVENT HANDLING
+
+Listen for:
+
+audioElement.addEventListener("play", startLipSync);
+audioElement.addEventListener("pause", stopLipSync);
+audioElement.addEventListener("ended", stopLipSync);
+audioElement.addEventListener("error", stopLipSync);
+
+On stop:
+
+resetMouth(vrm);
+
+CLEANUP
+
+When the component unmounts:
+
+- Remove all audio event listeners.
+- Disconnect the analyser and source nodes.
+- Reset the mouth expressions.
+- Close the AudioContext if this component owns it.
+- Do not create duplicate audio nodes after React rerenders.
+
+DEBUG DISPLAY
+
+Temporarily show:
+
+Lip Sync: ACTIVE or INACTIVE
+Audio Level: 0–100
+Current Mouth Shape: aa, ih, ou, ee, or oh
+Audio Element Connected: YES or NO
+Expression Manager Found: YES or NO
+
+TEST BUTTONS
+
+Add a temporary developer test section:
+
+- Test AA
+- Test IH
+- Test OU
+- Test EE
+- Test OH
+- Reset Mouth
+- Play Voice Test
+
+Each expression button should briefly set that expression to 1 so we can confirm that the VRM facial rig works before connecting live audio.
+
+IMPLEMENT IN THIS ORDER:
+
+1. List the avatar’s real expression names.
+2. Add manual expression test buttons.
+3. Confirm each mouth expression visibly moves the lips.
+4. Connect the existing voice audio element.
+5. Add analyser-based mouth opening.
+6. Add vowel-shape switching.
+7. Add smoothing.
+8. Remove the developer controls only after it works.
+
+Do not redesign the avatar or dashboard. Only implement and verify VRM lip sync.
