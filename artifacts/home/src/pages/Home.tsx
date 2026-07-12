@@ -2017,9 +2017,12 @@ export default function Home() {
     try {
       const r = await fetch('/api/enter', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json', ...authHeader}, body:JSON.stringify({ ticker, direction: dir }) });
       if (r.ok) { setTradeSent('✓ Order sent'); memAddEntry('trade', 'ENTERED ' + dir.toUpperCase() + ' ' + ticker + ' at market'); }
-      else setTradeSent('✗ Send failed');
+      else {
+        const body = await r.json().catch(() => ({}));
+        setTradeSent('✗ ' + (body?.reason || body?.error || 'Send failed'));
+      }
     } catch { setTradeSent('✗ Network error'); }
-    setTimeout(() => setTradeSent(null), 4000);
+    setTimeout(() => setTradeSent(null), 6000);
   };
 
   const tp = data?.trade_plan || {};
@@ -2866,10 +2869,10 @@ export default function Home() {
                     {tradeSent}
                   </div>
                 ) : (
-                  <button className="action-btn" onClick={doEnter} disabled={!isActionable} style={{
-                    padding:'10px 22px', borderRadius:8, border:'none', cursor: isActionable ? 'pointer' : 'default',
-                    background: confirming ? 'rgba(239,68,68,0.22)' : isActionable ? `${verdictColor}22` : 'rgba(255,255,255,0.04)',
-                    color: isActionable ? verdictColor : 'rgba(255,255,255,0.22)',
+                  <button className="action-btn" onClick={doEnter} style={{
+                    padding:'10px 22px', borderRadius:8, border:'none', cursor:'pointer',
+                    background: confirming ? 'rgba(239,68,68,0.22)' : isActionable ? `${verdictColor}22` : 'rgba(255,255,255,0.07)',
+                    color: isActionable ? verdictColor : 'rgba(255,255,255,0.38)',
                     fontSize:13, fontWeight:800, fontFamily:'monospace', letterSpacing:'0.06em',
                     boxShadow: isActionable ? `0 0 18px ${verdictColor}28` : 'none',
                   }}>

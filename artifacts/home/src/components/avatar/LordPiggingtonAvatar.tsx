@@ -40,7 +40,7 @@ const W = 420;
 const H = 560;
 
 // ─── Animation state ──────────────────────────────────────────────────────────
-type AnimState = 'idle' | 'talking' | 'walking' | 'pointing' | 'thinking' | 'waving';
+type AnimState = 'idle' | 'talking' | 'walking' | 'pointing' | 'thinking' | 'waving' | 'dancing';
 interface OneShotMeta { returnTo: AnimState; endT: number; }
 
 // All three axes always present — prevents partial lerp leaving a bone frozen
@@ -214,6 +214,40 @@ function waveTargets(phi: number, breathX: number): BoneTargets {
     rightUpperArm: { x: -0.44, y: 0, z: -0.78 }, // arm raised, forward
     rightLowerArm: { x:  0.82, y: 0, z:  0 },
     rightHand:     { x:  0,    y: 0, z: waveZ },  // waving
+  };
+}
+
+function danceTargets(phi: number): BoneTargets {
+  // Double the walk tempo for a lively dance beat
+  const beat    = phi * 2;
+  const hipSway = Math.sin(beat) * 0.11;                     // side-to-side shimmy
+  const hipBob  = Math.abs(Math.sin(beat * 2)) * 0.032;      // subtle up-down bob on every beat
+  // Arms alternate: left up when right is down, both oscillate between T-pose and raised
+  const armLz   = ARM_Z - 0.65 + Math.sin(beat + Math.PI) * 0.48; // left arm z (raises up/down)
+  const armRz   = -(ARM_Z - 0.65 + Math.sin(beat) * 0.48);         // right arm z (opposite phase)
+  const armLx   =  Math.sin(beat + Math.PI) * 0.32;               // left arm forward swing
+  const armRx   =  Math.sin(beat) * 0.32;                          // right arm forward swing
+  const elbL    = 0.55 + Math.sin(beat * 2)           * 0.28;      // elbow bend pulses
+  const elbR    = 0.55 + Math.sin(beat * 2 + Math.PI) * 0.28;
+  const kneeL   = 0.08 + Math.max(0, Math.sin(beat * 2 + Math.PI)) * 0.20; // knees bounce
+  const kneeR   = 0.08 + Math.max(0, Math.sin(beat * 2))           * 0.20;
+  return {
+    hips:          { x: hipBob,  y: 0, z: hipSway            },
+    spine:         { x: 0,       y: 0, z: -hipSway * 0.42    }, // counter-rotate torso
+    chest:         { x: 0,       y: 0, z:  hipSway * 0.24    },
+    upperChest:    { x: 0,       y: 0, z:  0                  },
+    leftUpperArm:  { x:  armLx,  y: 0, z: armLz               },
+    leftLowerArm:  { x: elbL,    y: 0, z: 0                   },
+    leftHand:      { x: 0,       y: 0, z:  Math.sin(beat * 3) * 0.22 },
+    rightUpperArm: { x:  armRx,  y: 0, z: armRz               },
+    rightLowerArm: { x: elbR,    y: 0, z: 0                   },
+    rightHand:     { x: 0,       y: 0, z: -Math.sin(beat * 3) * 0.22 },
+    leftUpperLeg:  { x:  Math.sin(beat * 2 + Math.PI) * 0.09, y: 0, z: 0 },
+    leftLowerLeg:  { x: kneeL,   y: 0, z: 0                   },
+    leftFoot:      { x: -0.04,   y: 0, z: 0                   },
+    rightUpperLeg: { x:  Math.sin(beat * 2)           * 0.09, y: 0, z: 0 },
+    rightLowerLeg: { x: kneeR,   y: 0, z: 0                   },
+    rightFoot:     { x: -0.04,   y: 0, z: 0                   },
   };
 }
 
@@ -525,6 +559,7 @@ function LordPiggingtonAvatar({
         case 'pointing': targets = pointTargets(breathX);                   break;
         case 'thinking': targets = thinkTargets(breathX, elapsed);          break;
         case 'waving':   targets = waveTargets(phi * 0.52, breathX);        break;
+        case 'dancing':  targets = danceTargets(phi * 0.52);               break;
         default:         targets = idleTargets(breathX, swayZ);             break;
       }
 
@@ -548,12 +583,46 @@ function LordPiggingtonAvatar({
         }
       }
 
-      // ── Market-state nod / shake on transition ────────────────────────────
+      // ── Market-state nod / shake + animation drive on transition ─────────
       if (mktSt !== prevMktRef.current) {
         const pos = mktSt === 'READY_LONG'  || mktSt === 'TARGET_HIT';
         const neg = mktSt === 'STOP_HIT'    || mktSt === 'READY_SHORT';
         if (pos || neg) nodRef.current = { active: true, t: 0, dir: pos ? 1 : -1 };
         prevMktRef.current = mktSt;
+
+        // Drive body animation from market state
+        if (mktSt === 'READY_LONG' || mktSt === 'READY_SHORT') {
+          // Dance loop — sustained while setup stays READY
+          oneShotRef.current   = null;
+          animStateRef.current = 'dancing';
+        } else if (mktSt === 'TARGET_HIT') {
+          // Celebration: big wave (6 s one-shot then back to idle)
+          prevAnimRef.current  = 'idle';
+          animStateRef.current = 'waving';
+          oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 6.0 };
+        } else if (mktSt === 'STOP_HIT') {
+          // Dejected thinking pose (4 s one-shot)
+          prevAnimRef.current  = 'idle';
+          animStateRef.current = 'thinking';
+          oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 4.0 };
+        } else if (mktSt === 'ACTIVE') {
+          // Monitoring walk while holding a trade
+          oneShotRef.current   = null;
+          animStateRef.current = 'walking';
+        } else if (mktSt === 'FORMING' || mktSt === 'ANALYZING') {
+          // Brief analysis thinking (3 s one-shot; won't interrupt an existing one)
+          if (!oneShotRef.current) {
+            prevAnimRef.current  = 'idle';
+            animStateRef.current = 'thinking';
+            oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 3.0 };
+          }
+        } else {
+          // WAIT / NO_EDGE — stop any looped state, return to idle
+          if (animStateRef.current === 'dancing' || animStateRef.current === 'walking') {
+            oneShotRef.current   = null;
+            animStateRef.current = 'idle';
+          }
+        }
       }
 
       // ── Blink FSM ─────────────────────────────────────────────────────────
@@ -752,7 +821,7 @@ function LordPiggingtonAvatar({
           )}
 
           <div style={{ marginTop: 8, color: '#89a', marginBottom: 4 }}>Animation</div>
-          {(['idle','talking','walking','pointing','thinking','waving'] as AnimState[]).map(s => (
+          {(['idle','talking','walking','pointing','thinking','waving','dancing'] as AnimState[]).map(s => (
             <button key={s} onClick={() => setAnimState(s)} style={{
               display: 'inline-block', margin: '2px 2px', padding: '2px 7px',
               fontSize: 10, borderRadius: 3, cursor: 'pointer',
