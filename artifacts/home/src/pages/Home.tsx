@@ -712,6 +712,28 @@ function getEvidenceRadar(
   ];
 }
 
+// ── Mission Control Card ──────────────────────────────────────────────────────
+function McCard({ label, value, sub, col = 'rgba(255,255,255,0.75)', delay = 0, dot }: {
+  label: string; value: React.ReactNode; sub?: React.ReactNode;
+  col?: string; delay?: number; dot?: EvStrength;
+}) {
+  const dotColor = dot ? EV_COLOR[dot] : undefined;
+  const dotGlow  = dot ? EV_GLOW[dot]  : undefined;
+  const pulse    = dot === 'developing';
+  return (
+    <div className="mc-card" style={{ animationDelay:`${delay}s` }}>
+      <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:2 }}>
+        {dot && <div style={{ width:5, height:5, borderRadius:'50%', flexShrink:0,
+          background:dotColor, boxShadow:dotGlow,
+          animation: pulse ? 'evPulse 2.2s ease-in-out infinite' : undefined }} />}
+        <span className="mc-label">{label}</span>
+      </div>
+      <div className="mc-value" style={{ color:col }}>{value}</div>
+      {sub && <div className="mc-sub">{sub}</div>}
+    </div>
+  );
+}
+
 function EvidenceRadarPanel({ items, side }: { items: EvidenceItem[]; side: 'left' | 'right' }) {
   const isRight = side === 'right';
   return (
@@ -1618,6 +1640,20 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
+    .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;}
+    .mc-top-row,.mc-bot-row{display:flex;gap:8px;}
+    .mc-top-row>.mc-card,.mc-bot-row>.mc-card{flex:1;min-width:0;}
+    .mc-mid-row{display:flex;gap:8px;align-items:stretch;}
+    .mc-col{display:flex;flex-direction:column;gap:8px;width:130px;flex-shrink:0;}
+    .mc-col>.mc-card{flex:1;min-height:0;}
+    .mc-card{background:rgba(8,12,28,0.80);border:1px solid rgba(255,255,255,0.055);border-radius:10px;padding:10px 12px;transition:border-color 0.6s ease,box-shadow 0.6s ease,background 0.25s ease;animation:mcFloat 7s ease-in-out infinite;}
+    .mc-card:hover{background:rgba(14,20,44,0.90)!important;border-color:rgba(255,255,255,0.13)!important;}
+    .mc-label{font-size:8.5px;font-family:monospace;font-weight:700;letter-spacing:0.10em;text-transform:uppercase;color:rgba(255,255,255,0.28);}
+    .mc-value{font-size:13px;font-family:monospace;font-weight:800;letter-spacing:0.03em;line-height:1.1;margin-top:4px;}
+    .mc-sub{font-size:9px;font-family:monospace;color:rgba(255,255,255,0.28);margin-top:3px;line-height:1.3;}
+    @keyframes mcFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-2.5px)}}
+    @media(max-width:1100px){.mc-col{width:108px!important;}.mc-card{padding:7px 9px!important;}.mc-value{font-size:11.5px!important;}}
+    @media(max-width:900px){.mc-stage{display:none!important;}}
   `;
 
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
@@ -1830,65 +1866,172 @@ export default function Home() {
             position:'relative',
             background:`radial-gradient(ellipse 700px 560px at 38% 46%, ${auraColor}06 0%, transparent 72%)` }}>
 
-            {/* Avatar command center — avatar flanked by live intelligence panels */}
-            <div className="avtr-col" style={{ flexShrink:0, display:'flex', flexDirection:'row', gap:10, alignItems:'flex-start' }}>
+            {/* ── MISSION CONTROL STAGE — avatar centered, 12 live telemetry cards ── */}
+            <div className="mc-stage">
 
-              {/* ── LEFT EVIDENCE RADAR ──────────────────────────────────────── */}
-              <div className="sat-col" style={{ width:128, display:'flex', flexDirection:'column', gap:7, paddingTop:6 }}>
-                <EvidenceRadarPanel items={radar.slice(0,5)} side="left" />
+              {/* TOP ROW — Edge Score · Win Probability · Strategy */}
+              <div className="mc-top-row">
+                {(() => {
+                  const edgeCol = edge >= 75 ? BULL : edge >= 55 ? '#f97316' : edge >= 30 ? AMB : MUTED;
+                  const eDot: EvStrength = edge >= 75 ? 'confirmed' : edge >= 55 ? 'developing' : edge >= 30 ? 'neutral' : 'inactive';
+                  return <McCard delay={0} label="Edge Score" col={edgeCol} dot={eDot}
+                    value={`${Math.round(edge)}/110`} sub={grade || 'WAIT'} />;
+                })()}
+                {(() => {
+                  const ep  = Number(data?.entry_probability ?? data?.analyst?.entry_probability ?? 0);
+                  const col = ep >= 65 ? BULL : ep >= 45 ? AMB : MUTED;
+                  const dot: EvStrength = ep >= 65 ? 'confirmed' : ep >= 45 ? 'developing' : 'inactive';
+                  return <McCard delay={0.4} label="Win Probability" col={col} dot={dot}
+                    value={ep > 0 ? `${Math.round(ep)}%` : '—'} sub="setup quality signal" />;
+                })()}
+                {(() => {
+                  const raw   = String(data?.active_strategy || data?.strategy_mode || sig.strategy || '');
+                  const strat = raw.replace(/_/g,' ').toUpperCase() || '—';
+                  const mode  = String(data?.trading_mode || '').toUpperCase();
+                  return <McCard delay={0.8} label="Strategy" col="rgba(255,255,255,0.72)" dot="neutral"
+                    value={strat.slice(0,14) || '—'} sub={mode || undefined} />;
+                })()}
               </div>
 
-              {/* ── AVATAR CENTER ────────────────────────────────────────────── */}
-              <div style={{ display:'flex', flexDirection:'column', alignItems:'center' }}>
+              {/* MID ROW — left data col | avatar spotlight | right data col */}
+              <div className="mc-mid-row">
 
-                {/* Spotlight stage — avatar's visual territory, 1.2× scaled */}
-                <div style={{ position:'relative', width:292, height:390, flexShrink:0 }}>
+                {/* LEFT — Bias · Structure · Liquidity */}
+                <div className="mc-col">
+                  {(() => {
+                    const b   = String(sig.bias || '').toLowerCase();
+                    const col = /bull/.test(b) ? BULL : /bear/.test(b) ? BEAR : MUTED;
+                    const lbl = /bull/.test(b) ? 'BULLISH' : /bear/.test(b) ? 'BEARISH' : 'NEUTRAL';
+                    const dot: EvStrength = /bull/.test(b) ? 'confirmed' : /bear/.test(b) ? 'invalidated' : 'inactive';
+                    const dirFav = String(sig.favored_direction || '').toUpperCase();
+                    return <McCard delay={1.2} label="Bias" col={col} dot={dot}
+                      value={lbl} sub={dirFav ? `Favoring ${dirFav}` : undefined} />;
+                  })()}
+                  {(() => {
+                    const sc   = !!gd.structure_confirmed;
+                    const zv   = !!gd.zone_valid;
+                    const col  = sc ? BULL : MUTED;
+                    const dot: EvStrength = sc ? 'confirmed' : 'inactive';
+                    const stype = String(gd.structure_type || '').toUpperCase() || (sc ? 'BOS/CHOCH' : 'NONE');
+                    return <McCard delay={1.6} label="Market Structure" col={col} dot={dot}
+                      value={stype} sub={zv ? 'Zone active' : 'No zone'} />;
+                  })()}
+                  {(() => {
+                    const zv  = !!gd.zone_valid;
+                    const dem = data?.nearest_demand;
+                    const sup = data?.nearest_supply;
+                    const col = zv ? '#f97316' : (dem || sup) ? AMB : MUTED;
+                    const dot: EvStrength = zv ? 'confirmed' : (dem || sup) ? 'neutral' : 'inactive';
+                    const lbl = zv ? 'Zone Active' : (dem || sup) ? 'Nearby' : 'No Zone';
+                    return <McCard delay={2.0} label="Liquidity" col={col} dot={dot}
+                      value={lbl} sub={dem ? `D: ${fmt(Number(dem))}` : sup ? `S: ${fmt(Number(sup))}` : undefined} />;
+                  })()}
+                </div>
 
-                  {/* Layer 1 — wide ambient spotlight, largest + softest */}
-                  <div style={{ position:'absolute', top:-100, left:-120, right:-120, bottom:-60,
-                    background:`radial-gradient(ellipse at 50% 46%, ${auraColor}18 0%, ${auraColor}07 40%, transparent 70%)`,
-                    pointerEvents:'none', zIndex:0 }} />
-
-                  {/* Layer 2 — breathing inner halo, animates with avrPulse */}
-                  <div style={{ position:'absolute', inset:-22,
-                    background:`radial-gradient(ellipse at 50% 46%, ${auraColor}26 0%, transparent 64%)`,
-                    animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none', zIndex:0 }} />
-
-                  {/* Layer 3 — floor-light: upward bloom rising from base */}
-                  <div style={{ position:'absolute', bottom:-28, left:'8%', right:'8%', height:68,
-                    background:`radial-gradient(ellipse at 50% 100%, ${auraColor}20 0%, transparent 70%)`,
-                    pointerEvents:'none', zIndex:0 }} />
-
-                  {/* Canvas at 1.2× visual scale, centered in stage */}
-                  <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
-                    justifyContent:'center', transform:'scale(1.2)', transformOrigin:'center center', zIndex:1 }}>
-                    <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+                {/* AVATAR SPOTLIGHT CENTER */}
+                <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+                  <div style={{ position:'relative', width:292, height:390, flexShrink:0 }}>
+                    <div style={{ position:'absolute', top:-100, left:-120, right:-120, bottom:-60,
+                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}18 0%, ${auraColor}07 40%, transparent 70%)`,
+                      pointerEvents:'none', zIndex:0 }} />
+                    <div style={{ position:'absolute', inset:-22,
+                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}26 0%, transparent 64%)`,
+                      animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none', zIndex:0 }} />
+                    <div style={{ position:'absolute', bottom:-28, left:'8%', right:'8%', height:68,
+                      background:`radial-gradient(ellipse at 50% 100%, ${auraColor}20 0%, transparent 70%)`,
+                      pointerEvents:'none', zIndex:0 }} />
+                    <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
+                      justifyContent:'center', transform:'scale(1.2)', transformOrigin:'center center', zIndex:1 }}>
+                      <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
+                    </div>
                   </div>
-
+                  <div style={{ marginTop:4, display:'flex', alignItems:'center', gap:7 }}>
+                    <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor,
+                      boxShadow:`0 0 8px ${verdictColor}, 0 0 18px ${verdictColor}44` }} />
+                    <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
+                      color:'rgba(255,255,255,0.38)', textTransform:'uppercase' }}>
+                      {avState === 'ACTIVE'      ? 'MANAGING'      :
+                       avState === 'READY_LONG'  ? 'LONG SETUP'    :
+                       avState === 'READY_SHORT' ? 'SHORT SETUP'   :
+                       avState === 'FORMING'     ? 'SETUP FORMING' :
+                       avState === 'ANALYZING'   ? 'ANALYZING'     :
+                       avState === 'STOP_HIT'    ? 'STOP HIT'      :
+                       avState === 'TARGET_HIT'  ? 'TARGET HIT'    :
+                       avState === 'NO_EDGE'     ? 'NO EDGE'       : 'WATCHING'}
+                    </span>
+                  </div>
                 </div>
 
-                {/* Status badge */}
-                <div style={{ marginTop:4, display:'flex', alignItems:'center', gap:7 }}>
-                  <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor,
-                    boxShadow:`0 0 8px ${verdictColor}, 0 0 18px ${verdictColor}44` }} />
-                  <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
-                    color:'rgba(255,255,255,0.38)', textTransform:'uppercase' }}>
-                    {avState === 'ACTIVE'      ? 'MANAGING'      :
-                     avState === 'READY_LONG'  ? 'LONG SETUP'    :
-                     avState === 'READY_SHORT' ? 'SHORT SETUP'   :
-                     avState === 'FORMING'     ? 'SETUP FORMING' :
-                     avState === 'ANALYZING'   ? 'ANALYZING'     :
-                     avState === 'STOP_HIT'    ? 'STOP HIT'      :
-                     avState === 'TARGET_HIT'  ? 'TARGET HIT'    :
-                     avState === 'NO_EDGE'     ? 'NO EDGE'       : 'WATCHING'}
-                  </span>
+                {/* RIGHT — VWAP · Order Flow · Volume */}
+                <div className="mc-col">
+                  {(() => {
+                    const vwapVal = Number(data?.vwap_value || 0);
+                    const priceV  = Number(data?.price || 0);
+                    const above   = priceV > 0 && vwapVal > 0 && priceV > vwapVal;
+                    const col = vwapVal > 0 ? (above ? BULL : BEAR) : MUTED;
+                    const dot: EvStrength = gd.vwap_confirmed ? 'confirmed' : vwapVal > 0 ? 'developing' : 'inactive';
+                    return <McCard delay={2.4} label="VWAP" col={col} dot={dot}
+                      value={vwapVal > 0 ? fmt(vwapVal) : '—'}
+                      sub={vwapVal > 0 ? (above ? 'Price above' : 'Price below') : undefined} />;
+                  })()}
+                  {(() => {
+                    const c   = String(sig.cvd || ad.cvd || '').toLowerCase();
+                    const col = /bull|pos/.test(c) ? BULL : /bear|neg/.test(c) ? BEAR : MUTED;
+                    const lbl = /bull|pos/.test(c) ? 'BULL DELTA' : /bear|neg/.test(c) ? 'BEAR DELTA' : 'NEUTRAL';
+                    const dot: EvStrength = /bull|pos/.test(c) ? 'confirmed' : /bear|neg/.test(c) ? 'invalidated' : 'neutral';
+                    const v = String(ad.volume || '').toLowerCase();
+                    const volSub = /strong|high/.test(v) ? 'High vol' : /incr/.test(v) ? 'Rising vol' : /low|thin/.test(v) ? 'Low vol' : 'Normal vol';
+                    return <McCard delay={2.8} label="Order Flow" col={col} dot={dot}
+                      value={lbl} sub={volSub} />;
+                  })()}
+                  {(() => {
+                    const v   = String(ad.volume || '').toLowerCase();
+                    const col = /strong|high/.test(v) ? BULL : /incr/.test(v) ? AMB : /low|thin/.test(v) ? MUTED : 'rgba(255,255,255,0.55)';
+                    const lbl = /strong|high/.test(v) ? 'HIGH' : /incr/.test(v) ? 'INCREASING' : /low|thin/.test(v) ? 'LOW' : 'NORMAL';
+                    const dot: EvStrength = /strong|high/.test(v) ? 'confirmed' : /incr/.test(v) ? 'developing' : /low|thin/.test(v) ? 'inactive' : 'neutral';
+                    const rvol = data?.rvol ? `RVOL ${Number(data.rvol).toFixed(1)}x` : undefined;
+                    return <McCard delay={3.2} label="Volume" col={col} dot={dot}
+                      value={lbl} sub={rvol} />;
+                  })()}
                 </div>
 
               </div>
 
-              {/* ── RIGHT EVIDENCE RADAR ─────────────────────────────────────── */}
-              <div className="sat-col" style={{ width:128, display:'flex', flexDirection:'column', gap:7, paddingTop:6 }}>
-                <EvidenceRadarPanel items={radar.slice(5)} side="right" />
+              {/* BOTTOM ROW — Trade Plan · Volatility · Risk */}
+              <div className="mc-bot-row">
+                {(() => {
+                  const has  = tp.entry && Number(tp.entry) > 0;
+                  const col  = has ? AMB : MUTED;
+                  const dot: EvStrength = has ? 'developing' : 'inactive';
+                  const entryLbl = has ? `E: ${fmt(Number(tp.entry))}` : 'No plan';
+                  const stopLbl  = tp.stop    ? `SL: ${fmt(Number(tp.stop))}`    : '';
+                  const tgtLbl   = tp.target1 ? `T1: ${fmt(Number(tp.target1))}` : '';
+                  return <McCard delay={3.6} label="Trade Plan" col={col} dot={dot}
+                    value={entryLbl}
+                    sub={[stopLbl, tgtLbl].filter(Boolean).join('  ') || undefined} />;
+                })()}
+                {(() => {
+                  const vr  = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
+                  const col = /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : /low|quiet/.test(vr) ? MUTED : AMB;
+                  const lbl = /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'ELEVATED' : /low|quiet/.test(vr) ? 'QUIET' : isOpen ? 'NORMAL' : '—';
+                  const dot: EvStrength = /extreme/.test(vr) ? 'invalidated' : /high|elev/.test(vr) ? 'developing' : /low|quiet/.test(vr) ? 'confirmed' : 'neutral';
+                  const atr = data?.atr_pts ?? data?.atr;
+                  return <McCard delay={4.0} label="Volatility" col={col} dot={dot}
+                    value={lbl} sub={atr ? `ATR ${Number(atr).toFixed(1)} pts` : 'ATR regime'} />;
+                })()}
+                {(() => {
+                  const hasTP   = tp.entry && tp.stop && Number(tp.entry) > 0;
+                  const riskPts = hasTP ? Math.abs(Number(tp.entry) - Number(tp.stop)) : null;
+                  const rrRaw   = data?.trade_plan?.rr_num ?? data?.rr_num ?? null;
+                  const rr      = rrRaw ?? (tp.target1 && tp.entry && tp.stop
+                    ? Math.abs(Number(tp.target1) - Number(tp.entry)) / (Math.abs(Number(tp.entry) - Number(tp.stop)) || 1)
+                    : null);
+                  const col  = hasTP ? AMB : MUTED;
+                  const dot: EvStrength = hasTP ? 'developing' : 'inactive';
+                  return <McCard delay={4.4} label="Risk" col={col} dot={dot}
+                    value={riskPts ? `${fmt(riskPts, 1)} pts` : '—'}
+                    sub={rr ? `1:${Number(rr).toFixed(1)} R:R` : 'No active plan'} />;
+                })()}
               </div>
 
             </div>
