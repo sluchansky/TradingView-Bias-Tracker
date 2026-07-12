@@ -18,9 +18,9 @@ import { VRMLoaderPlugin, VRMUtils, VRM, VRMExpressionPresetName } from '@pixiv/
 import type { LordPiggingtonProps, AvatarState } from './avatarTypes';
 import { STATE_ACCENT_HEX, STATE_PULSE_HZ } from './avatarTypes';
 
-// ─── Canvas dimensions ────────────────────────────────────────────────────────
-const W = 240;
-const H = 320;
+// ─── Canvas dimensions — match the Home.tsx avatar container exactly ─────────
+const W = 342;
+const H = 455;
 
 // ─── Mouth expression candidates (VRM 1.0 lowercase then VRM 0.x uppercase) ──
 const MOUTH_CANDIDATES = ['aa', 'ih', 'ou', 'ee', 'oh', 'A', 'I', 'U', 'E', 'O'];
@@ -91,27 +91,26 @@ function setMouthShape(vrm: VRM, available: string[], active: string, amount: nu
   });
 }
 
-// Auto-frame camera from model bounding box
-function autoFrame(vrm: VRM, gltfScene: THREE.Group, camera: THREE.PerspectiveCamera) {
+// Auto-frame camera to show the FULL body with a little breathing room
+function autoFrame(_vrm: VRM, gltfScene: THREE.Group, camera: THREE.PerspectiveCamera) {
   const box = new THREE.Box3().setFromObject(gltfScene);
   if (box.isEmpty()) return;
-  const size = box.getSize(new THREE.Vector3());
-  let headTop = box.max.y;
-  try {
-    const headBone = vrm.humanoid?.getNormalizedBoneNode?.('head' as never);
-    if (headBone) {
-      const wp = new THREE.Vector3();
-      headBone.getWorldPosition(wp);
-      headTop = wp.y + size.y * 0.08;
-    }
-  } catch (_) {}
-  const showBottom = headTop - size.y * 0.45;
-  const frameCenterY = (headTop + showBottom) / 2;
-  const frameH = headTop - showBottom;
-  const fovRad = (camera.fov * Math.PI) / 180;
-  const distance = (frameH / 2) / Math.tan(fovRad / 2) / 0.88;
-  camera.position.set(0, frameCenterY, distance);
-  camera.lookAt(0, frameCenterY, 0);
+  const size   = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+
+  // Add 6 % padding above + below so the model doesn't touch the canvas edge
+  const pad     = size.y * 0.06;
+  const frameTop = box.max.y + pad;
+  const frameBtm = box.min.y - pad;
+  const frameH   = frameTop - frameBtm;
+  const frameCY  = (frameTop + frameBtm) / 2;
+
+  // Distance so frameH fills 92 % of the vertical FOV
+  const fovRad   = (camera.fov * Math.PI) / 180;
+  const distance = (frameH / 2) / Math.tan(fovRad / 2) / 0.92;
+
+  camera.position.set(center.x, frameCY, distance);
+  camera.lookAt(center.x, frameCY, 0);
   camera.updateProjectionMatrix();
 }
 
@@ -201,9 +200,10 @@ function LordPiggingtonAvatar({ avState, speaking, gazeEvent, speechCtrlRef, deb
     const scene = new THREE.Scene();
     scene.background = null;
 
-    const camera = new THREE.PerspectiveCamera(22, W / H, 0.01, 30);
-    camera.position.set(0, 1.40, 1.20);
-    camera.lookAt(0, 1.40, 0);
+    // Wider FOV for full-body portrait; aspect matches canvas exactly
+    const camera = new THREE.PerspectiveCamera(30, W / H, 0.01, 30);
+    camera.position.set(0, 0.85, 3.0);
+    camera.lookAt(0, 0.85, 0);
 
     const lookAtTarget = new THREE.Object3D();
     camera.add(lookAtTarget);
