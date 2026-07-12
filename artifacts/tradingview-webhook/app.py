@@ -39443,7 +39443,7 @@ def dashboard():
     --radius:16px; --radius-sm:11px;
   }
   html{background:var(--bg)}
-  body{background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  body{zoom:.75;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
   .vw-bg{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
     background:
@@ -40124,7 +40124,7 @@ def dashboard():
 </head>
 <body>
 <div class="vw-bg" aria-hidden="true"></div>
-<h1><span id="refresh-dot"></span>🤖 AI Trading Partner</h1>
+<h1><span id="refresh-dot"></span>🐷 AI Trading Partner</h1>
 <div id="last-updated">Last updated —</div>
 <!-- Top controls collapsed into a single menu (DISPLAY-ONLY, per-device; persisted
      in localStorage('dashTopMenu')). Never touches the money path. -->
@@ -40563,7 +40563,7 @@ def dashboard():
       <ul class="mb-list" id="mb-mg-watch"></ul>
     </div>
     <div class="mb-bot" id="mb-bot" style="display:none">
-      <div class="mb-bot-h">🤖 Bot's live positions</div>
+      <div class="mb-bot-h">🐷 Bot's live positions</div>
       <div id="mb-bot-list"></div>
     </div>
     <div class="mb-tl" id="mb-tl" style="display:none">
@@ -40775,7 +40775,7 @@ def dashboard():
 </div>
 
 <div class="mod mb-hidden" id="mod-checklist">
-  <div class="mod-h">🤖 AI Trade Checklist</div>
+  <div class="mod-h">🐷 AI Trade Checklist</div>
   <div class="ai-ck" id="ai-ck"></div>
 </div>
 
@@ -41709,7 +41709,7 @@ def dashboard():
 <!-- Bot Hold Score — advisory HOLD/SCALE OUT/EXIT conviction for OPEN bot positions.
      DISPLAY-ONLY; hidden unless BOT_HOLD_SCORE_ENABLED and a position is open. -->
 <div class="mod" id="mod-bothold" style="display:none">
-  <div class="mod-h">🤖 Bot Hold Score <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span></div>
+  <div class="mod-h">🐷 Bot Hold Score <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span></div>
   <div id="bh-list"></div>
   <div id="bh-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
@@ -41753,7 +41753,7 @@ def dashboard():
      N consecutive checks — never a bare stop-touch) flattens that position with a
      NON-REVERSING exit through the audited broker sink. -->
 <div class="mod" id="mod-autoexit" style="display:none">
-  <div class="mod-h">🤖 Auto Early-Exit <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ACTS ON ITS OWN ADVICE</span></div>
+  <div class="mod-h">🐷 Auto Early-Exit <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ACTS ON ITS OWN ADVICE</span></div>
   <div class="focus-row">
     <span class="focus-lbl">Arm auto-exit</span>
     <span id="ae-arm" class="mute-pill" role="button" tabindex="0" onclick="toggleAutoExit()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAutoExit();}">off</span>
@@ -42067,7 +42067,7 @@ def dashboard():
     </div>
 
     <div class="mod">
-      <div class="mod-h">🤖 Bot Recommendation</div>
+      <div class="mod-h">🐷 Bot Recommendation</div>
       <div class="se-reason" id="tz-reco">—</div>
     </div>
   </div>
@@ -50064,7 +50064,7 @@ function renderBotHold(d){
           +'</div>';
       }).join('');
       const head='<div class="mb-bot-top">'
-        +'<span class="mb-bot-badge">🤖 '+aiEsc(p.score!=null?p.score:'')+'</span>'
+        +'<span class="mb-bot-badge">🐷 '+aiEsc(p.score!=null?p.score:'')+'</span>'
         +'<span class="mb-bot-sym">'+aiEsc(p.symbol||'—')+'</span>'
         +'<span class="mb-bot-dir" style="color:'+dirCol+'">'+aiEsc(p.direction||'')+' @ '+aiEsc(p.entry!=null?p.entry:'—')+' · '+aiEsc(p.current_r!=null?(p.current_r+'R'):'—')+'</span>'
         +'<span style="margin-left:auto;font-weight:800;color:'+_bhVerdictColor(p.verdict)+'">'+aiEsc(p.verdict||'')+'</span>'
@@ -50233,7 +50233,7 @@ function renderBotPositions(rows){
     var act = r.action || r.recommendation || '';
     var why = r.recommendation_reason || '';
     var head = '<div class="mb-bot-top">'
-      + '<span class="mb-bot-badge">🤖 BOT</span>'
+      + '<span class="mb-bot-badge">🐷 BOT</span>'
       + '<span class="mb-bot-sym">' + aiEsc(r.symbol || '—') + '</span>'
       + '<span class="mb-bot-dir" style="color:' + dirCol + '">' + aiEsc(dir) + ' ' + aiEsc(ct) + ' @ ' + aiEsc(entry) + '</span>'
       + '</div>';
