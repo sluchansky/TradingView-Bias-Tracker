@@ -2265,11 +2265,165 @@ function MemoryPanel({ entries, onClear }: { entries: MemEntry[]; onClear: () =>
   );
 }
 
+// ── Demo Mode Engine ─────────────────────────────────────────────────────────
+// Simulates live market data for after-hours development and testing.
+// Cycles through 7 phases (WAIT → ANALYZING → FORMING → READY → ACTIVE → TARGET → repeat)
+// every ~42 seconds. Generates realistic price drift, VWAP, CVD, sweeps, zone hits,
+// and edge-score changes that drive the full avatar + dashboard experience.
+
+const DEMO_BASE: Record<string, number> = { MNQ:21240, MGC:3218, MES:5847, MYM:44120 };
+const DEMO_ATR:  Record<string, number> = { MNQ:18,    MGC:12,   MES:6,    MYM:85    };
+// Seconds each phase holds before advancing
+const DEMO_DUR = [7, 6, 6, 6, 7, 7, 3];
+// Narration lines per phase — rotated as phase progresses
+const DEMO_NARR: string[][] = [
+  ['No edge present. Market consolidating near VWAP. Capital preservation comes first.',
+   'Watching key levels. Price coiling below resistance. No confirmed structure.',
+   'Volume thin. Bears and bulls in equilibrium. Standing aside.'],
+  ['Price testing VWAP from below. Bulls attempting a reclaim. Need confirmation.',
+   'Approaching demand zone. Momentum flattening. Setup not ready yet.',
+   'Order flow mixed. CVD neutral. Patient — waiting for the right entry.'],
+  ['BOS confirmed on the lower timeframe. Structure is shifting bullish. Edge building.',
+   'Break of Structure detected. Monitoring for a clean pullback entry.',
+   'Structure break confirmed. CVD turning bullish. Setup beginning to develop.'],
+  ['Liquidity sweep complete into demand zone. Smart money absorption visible.',
+   'Sweep into premium liquidity. CVD strongly bullish. Confidence rising.',
+   'Zone holding firm. Volume spiking on the bid. Setup criteria nearly all met.'],
+  ['High-probability long setup. All gates confirmed. Risk-to-reward meets requirements.',
+   'Strong BOS into demand. CVD bullish. VWAP reclaimed. Entry criteria met.',
+   'Cleanest setup of the session. Structure, zone, and flow all aligned.'],
+  ['Position active. Price extending in our direction. Monitoring for first target.',
+   'Trade running. Thesis intact. Adjusting stop to break-even on momentum.',
+   'Managing the trade. Price holding above entry. Watching for scale-out.'],
+  ['Target reached. Trade profitable. Clean execution — exactly what we waited for.',
+   'First target hit. Secured the R. Resetting for the next high-probability setup.',
+   'Trade closed at target. Discipline rewarded. Back to watching the tape.'],
+];
+
+function _buildDemoData(
+  phase: number, progress: number,
+  ticker: string, price: number, vwap: number,
+): Record<string, any> {
+  const atr   = DEMO_ATR[ticker]  ?? 18;
+  const bases = [8, 22, 40, 64, 86, 88, 88];
+  const edge  = Math.min(110, Math.max(0, bases[phase] + (Math.random() - 0.45) * 6 + progress * 5));
+  const grade = edge >= 85 ? 'A+' : edge >= 70 ? 'A' : edge >= 50 ? 'B' : 'WAIT';
+  const dir   = phase >= 2 ? 'LONG' : '';
+  const mbSt  = phase === 4 ? 'READY' : phase === 5 ? 'MANAGING' : phase >= 2 ? 'BUILDING' : 'WAIT';
+  const sConf = phase >= 2;
+  const zVal  = phase >= 3;
+  const vConf = phase >= 2 && price > vwap;
+  const hasPl = phase >= 3;
+  const stop  = price - atr * 2.2;
+  const t1    = price + atr * 2.0;
+  const t2    = price + atr * 4.0;
+  const cvd   = phase >= 2 ? 'Bullish' : 'Neutral';
+  const volS  = phase >= 4 ? 'Strong volume' : phase >= 3 ? 'Increasing volume' : phase <= 0 ? 'Low volume' : 'Normal volume';
+  const narr  = DEMO_NARR[phase];
+  const narration = narr[Math.min(Math.floor(progress * narr.length), narr.length - 1)];
+  const activeTrade = phase === 5 ? {
+    instrument: ticker, direction: 'LONG',
+    entry_price: price - atr * 0.3, stop_price: price - atr * 0.3 - atr * 2.2,
+    target1: price - atr * 0.3 + atr * 2.0,
+    opened_at: new Date(Date.now() - 45000).toISOString(),
+  } : null;
+  const recentTrades = phase === 6 ? [{
+    id: 'demo-001', outcome: 'win', direction: 'LONG', instrument: ticker,
+    opened_at: new Date(Date.now() - 180000).toISOString(),
+  }] : [];
+  return {
+    price, vwap_value: vwap,
+    edge_score: edge, edge_grade: grade,
+    is_actionable: phase === 4,
+    market_status: 'open',
+    direction: dir,
+    strict_reason: phase < 2 ? 'Structure not confirmed. Waiting for BOS or CHOCH.' : '',
+    main_brain: {
+      status: mbSt, edge_score: edge, edge_grade: grade, favored_direction: dir,
+      wait_reason: phase < 2 ? 'No confirmed structure.' : '',
+      signals: { bias: phase >= 2 ? 'Bullish' : 'Neutral', cvd, strategy: phase >= 2 ? 'Liquidity Sweep Reversal' : '' },
+    },
+    main_brain_voice: { narration },
+    gate_debug: { structure_confirmed: sConf, zone_valid: zVal, vwap_confirmed: vConf },
+    alert_diagnostics: { cvd, volume: volS, volatility_regime: 'Normal' },
+    edge_breakdown: {
+      score: edge,
+      components: {
+        'BOS/CHOCH': phase >= 2 ? 20 : 0, 'VWAP': phase >= 2 ? 15 : 0,
+        'Volume': phase >= 3 ? 15 : phase >= 1 ? 5 : 0,
+        'CVD': phase >= 2 ? 15 : 0, 'Session': 8, 'Sweep': phase >= 3 ? 15 : 0,
+      },
+    },
+    trade_plan: hasPl ? { entry: price, stop, target1: t1, target2: t2, rr_num: 2.0 } : {},
+    nearest_demand: price - atr * 2.8, nearest_supply: price + atr * 4.5,
+    atr_pts: atr, vol_regime: 'Normal',
+    rvol: phase >= 3 ? 1.8 + Math.random() * 0.7 : 0.7 + Math.random() * 0.5,
+    active_trade: activeTrade,
+    managing_trade: activeTrade ? { ...activeTrade, managed: true } : null,
+    recent_trades: recentTrades,
+    news_filter: { next_event: { title: 'NFP Report', mins: 47, impact: 'high' } },
+    volatility: { ratio: 1.1 + Math.random() * 0.4 }, vol_ratio: 1.15,
+    entry_probability: phase >= 4 ? 68 + Math.random() * 12 : phase >= 3 ? 44 + Math.random() * 14 : 18 + Math.random() * 12,
+    active_strategy: phase >= 2 ? 'Liquidity Sweep Reversal' : null,
+    strategy_mode: 'SCALP', risk_level: phase >= 4 ? 'Low' : phase >= 2 ? 'Medium' : 'Low',
+    _demo: true,
+  };
+}
+
+function useDemoEngine(
+  enabled: boolean, ticker: string,
+  setData: (d: any) => void, setLoading: (v: boolean) => void,
+): void {
+  const phaseRef      = useRef(0);
+  const phaseStartRef = useRef(Date.now());
+  const priceRef      = useRef(0);
+  const vwapRef       = useRef(0);
+  useEffect(() => {
+    if (!enabled) return;
+    const base = DEMO_BASE[ticker] ?? 21240;
+    phaseRef.current      = 0;
+    phaseStartRef.current = Date.now();
+    priceRef.current      = base;
+    vwapRef.current       = base * 0.9992;
+    setLoading(false);
+    const tick = () => {
+      const base2 = DEMO_BASE[ticker] ?? 21240;
+      const atr2  = DEMO_ATR[ticker]  ?? 18;
+      // Micro price drift — biased slightly bullish during READY buildup
+      priceRef.current += (Math.random() - 0.48) * atr2 * 0.14;
+      vwapRef.current  += (Math.random() - 0.50) * atr2 * 0.04;
+      // Clamp drift to ±6/+8 ATRs from base so price stays realistic
+      priceRef.current = base2 + Math.max(-atr2 * 6, Math.min(atr2 * 8, priceRef.current - base2));
+      const now      = Date.now();
+      const phaseSec = (now - phaseStartRef.current) / 1000;
+      const dur      = DEMO_DUR[phaseRef.current];
+      const progress = Math.min(phaseSec / dur, 1);
+      if (phaseSec >= dur) {
+        phaseRef.current      = (phaseRef.current + 1) % 7;
+        phaseStartRef.current = now;
+        // ACTIVE→TARGET: push price up to simulate target hit
+        if (phaseRef.current === 6) priceRef.current += atr2 * 2.1;
+        // TARGET→WAIT: reset near base for a fresh cycle
+        if (phaseRef.current === 0) {
+          priceRef.current = base2 + (Math.random() - 0.5) * atr2 * 2;
+          vwapRef.current  = base2 * 0.9992;
+        }
+      }
+      setData(_buildDemoData(phaseRef.current, progress, ticker, priceRef.current, vwapRef.current));
+    };
+    tick(); // immediate first frame
+    const id = setInterval(tick, 1400);
+    return () => clearInterval(id);
+  }, [enabled, ticker]); // eslint-disable-line react-hooks/exhaustive-deps
+}
+
 // ── Root ───────────────────────────────────────────────────────────────────────
 export default function Home() {
   const [ticker, setTicker]     = useState<Ticker>('MNQ');
   const [data,   setData]       = useState<any>(null);
   const [loading, setLoading]   = useState(true);
+  const [demoMode, setDemoMode] = useState<boolean>(() => { try { return localStorage.getItem('atp_demo') === '1'; } catch { return false; } });
+  useDemoEngine(demoMode, ticker, setData, setLoading);
   const [msgs,   setMsgs]       = useState<Msg[]>([]);
   const [input,  setInput]      = useState('');
   const [asking, setAsking]     = useState(false);
@@ -2318,7 +2472,7 @@ export default function Home() {
   }, []);
 
   const poll = useCallback(async () => {
-    if (!authPwd) return;
+    if (!authPwd || demoMode) return;
     try {
       const r = await fetch(`/api/status?ticker=${ticker}`, { credentials:'include', headers:authHeader });
       if (r.status === 401) { setAuthNeeded(true); setAuthPwd(''); try { localStorage.removeItem('brain_auth'); } catch {} return; }
@@ -2332,9 +2486,13 @@ export default function Home() {
         }
       }
     } catch {}
-  }, [ticker, authPwd, authHeader]);
+  }, [ticker, authPwd, authHeader, demoMode]);
 
-  useEffect(() => { setLoading(true); setData(null); candlesRef.current = []; poll(); const id = setInterval(poll, 3000); return () => clearInterval(id); }, [poll]);
+  useEffect(() => {
+    if (demoMode) return; // demo engine owns data when active
+    setLoading(true); setData(null); candlesRef.current = [];
+    poll(); const id = setInterval(poll, 3000); return () => clearInterval(id);
+  }, [poll, demoMode]);
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [msgs]);
 
   // Derived
@@ -2758,6 +2916,26 @@ export default function Home() {
           <button onClick={() => setMuted(!muted)} style={{ background:'none', border:'none', cursor:'pointer',
             fontSize:15, color: muted ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.45)', padding:'3px' }}>
             {muted ? '🔇' : '🔊'}
+          </button>
+          {/* LIVE / DEMO mode toggle */}
+          <button
+            title={demoMode ? 'Demo Mode active — click for Live Mode' : 'Live Mode — click for Demo Mode'}
+            onClick={() => setDemoMode(v => {
+              const next = !v;
+              try { localStorage.setItem('atp_demo', next ? '1' : '0'); } catch {}
+              if (!next) { setLoading(true); setData(null); }
+              return next;
+            })}
+            style={{
+              padding:'3px 10px', borderRadius:12, cursor:'pointer', fontSize:9.5,
+              fontWeight:700, fontFamily:'monospace', letterSpacing:'0.10em',
+              background:   demoMode ? 'rgba(245,158,11,0.14)' : 'transparent',
+              color:        demoMode ? '#f59e0b' : 'rgba(255,255,255,0.20)',
+              border:       demoMode ? '1px solid rgba(245,158,11,0.38)' : '1px solid rgba(255,255,255,0.07)',
+              transition:   'all 0.20s',
+              boxShadow:    demoMode ? '0 0 10px rgba(245,158,11,0.18)' : 'none',
+            }}>
+            {demoMode ? '◈ DEMO' : '◈ LIVE'}
           </button>
           <a className="hdr-eng" href="/api/dashboard" style={{ fontSize:10.5, color:'rgba(255,255,255,0.15)', textDecoration:'none', fontFamily:'monospace' }}
             onMouseEnter={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.45)')}
