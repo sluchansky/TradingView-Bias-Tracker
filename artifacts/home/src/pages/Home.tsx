@@ -2096,6 +2096,8 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
+    /* Reduce main dashboard content by 25% on desktop */
+    @media(min-width:769px){.main-center{zoom:0.75;}}
     .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
     /* ConnectorSVG wires with no target cards are visual noise — hidden */
     .mc-stage>svg{display:none!important;}
