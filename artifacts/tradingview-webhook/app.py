@@ -49758,7 +49758,7 @@ function renderBLPanels(d){
     evEl.innerHTML=events.join('');
   }
 }
-(function(){ var on=false; try{ on = localStorage.getItem('dashAdv')==='1'; }catch(e){} _advApply(on); })();
+(function(){ var on=true; try{ var v=localStorage.getItem('dashAdv'); if(v!==null) on=(v==='1'); }catch(e){} _advApply(on); })();
 // ── Top controls collapsed into a single menu (DISPLAY-ONLY, this device) ──
 // Shows/hides the top utility pill row (#alert-ctl) behind one ☰ Menu button.
 // Persisted in localStorage('dashTopMenu'); default collapsed; never touches the

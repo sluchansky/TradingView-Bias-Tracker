@@ -440,13 +440,13 @@ export default function Cockpit() {
             <span style={{ fontSize: "8px", color: C.textFaint, letterSpacing: "0.5px" }}>{item.label}</span>
           </button>
         ))}
-        <a href="/api/dashboard" title="Back to dashboard" style={{
+        <a href="/" title="Back to AI Brain" style={{
           width: "44px", height: "42px", background: "transparent", border: "none",
           borderRadius: "10px", cursor: "pointer", textDecoration: "none",
           display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px",
         }}>
-          <span style={{ fontSize: "15px", lineHeight: 1 }}>◀</span>
-          <span style={{ fontSize: "7px", color: C.textFaint, letterSpacing: "0.5px" }}>Dash</span>
+          <span style={{ fontSize: "15px", lineHeight: 1 }}>🧠</span>
+          <span style={{ fontSize: "7px", color: C.textFaint, letterSpacing: "0.5px" }}>Brain</span>
         </a>
       </nav>
 
