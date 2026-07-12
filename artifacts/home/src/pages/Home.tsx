@@ -1328,6 +1328,87 @@ function useMonologue(thoughts: string[], restartKey: string): { text: string; l
   return { text, live };
 }
 
+// ── Session Memory ──────────────────────────────────────────────────────────
+type MemTag = 'pref' | 'setup' | 'trade' | 'chat' | 'insight';
+interface MemEntry { t: number; tag: MemTag; text: string; }
+function _memKey() { return 'brain_mem_' + new Date().toISOString().slice(0, 10); }
+
+const PREF_PATTERNS: Array<[RegExp, string]> = [
+  [/\baggressive\b/i,             'User wants aggressive entries today'],
+  [/\bconservative|cautious\b/i,  'User wants to trade conservatively today'],
+  [/\bselective\b/i,              'User is being selective with setups today'],
+  [/\bpatient\b/i,                'User wants to be patient and wait'],
+  [/\bpullback\b/i,               'User wants a cleaner pullback before entering'],
+  [/\bskip this|pass on\b/i,      'User considered skipping this setup'],
+  [/\bnot trading|no trade\b/i,   'User decided against trading this setup'],
+  [/\btight stop\b/i,             'User focused on tight stop placement'],
+  [/\bscalp\b/i,                  'User interested in scalping opportunities'],
+  [/\bswing\b/i,                  'User mentioned swing trade perspective'],
+];
+
+function useConvMemory() {
+  const [entries, setEntries] = useState<MemEntry[]>(() => {
+    try { const r = localStorage.getItem(_memKey()); return r ? (JSON.parse(r) as MemEntry[]) : []; }
+    catch { return []; }
+  });
+
+  const addEntry = useCallback((tag: MemTag, text: string) => {
+    const entry: MemEntry = { t: Date.now(), tag, text: text.slice(0, 200) };
+    setEntries(prev => {
+      const next = [...prev, entry].slice(-60);
+      try { localStorage.setItem(_memKey(), JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+
+  const clear = useCallback(() => {
+    setEntries([]);
+    try { localStorage.removeItem(_memKey()); } catch {}
+  }, []);
+
+  const context = useMemo((): string => {
+    if (entries.length === 0) return '';
+    const TAG: Record<MemTag, string> = { pref:'NOTE', setup:'SETUP', trade:'TRADE', chat:'YOU', insight:'BRAIN' };
+    const lines = entries.slice(-20).map(e => {
+      const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/New_York' });
+      return hh + ' [' + TAG[e.tag] + '] ' + e.text;
+    });
+    return "[TODAY'S SESSION CONTEXT - reference naturally if relevant]\n" + lines.join('\n') + '\n---\n';
+  }, [entries]);
+
+  return { entries, addEntry, clear, context };
+}
+
+// ── Memory Panel ─────────────────────────────────────────────────────────────
+function MemoryPanel({ entries, onClear }: { entries: MemEntry[]; onClear: () => void }) {
+  const TAG_COLOR: Record<MemTag, string> = { pref:AMB, setup:BLUE, trade:BULL, chat:'rgba(255,255,255,0.50)', insight:CYAN };
+  const TAG_LABEL: Record<MemTag, string> = { pref:'NOTE', setup:'SETUP', trade:'TRADE', chat:'YOU', insight:'BRAIN' };
+  if (entries.length === 0) return (
+    <div style={{ fontSize:10.5, color:MUTED, fontFamily:'monospace', textAlign:'center', padding:'8px 0' }}>
+      No events yet — I will remember what happens this session.
+    </div>
+  );
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+      {[...entries].reverse().slice(0, 18).map((e, i) => {
+        const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/New_York' });
+        return (
+          <div key={i} style={{ display:'flex', gap:7, alignItems:'flex-start', opacity: i > 9 ? 0.5 : 1, transition:'opacity 0.3s' }}>
+            <span style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(255,255,255,0.22)', flexShrink:0, paddingTop:2, letterSpacing:'0.04em' }}>{hh}</span>
+            <span style={{ fontSize:8.5, fontFamily:'monospace', fontWeight:700, color:TAG_COLOR[e.tag], flexShrink:0, paddingTop:2, letterSpacing:'0.08em' }}>{TAG_LABEL[e.tag]}</span>
+            <span style={{ fontSize:10.5, color:'rgba(255,255,255,0.60)', fontFamily:'monospace', lineHeight:1.44 }}>{e.text}</span>
+          </div>
+        );
+      })}
+      <button onClick={onClear} style={{ background:'none', border:'none', cursor:'pointer',
+        color:'rgba(255,255,255,0.16)', fontSize:9, fontFamily:'monospace',
+        textAlign:'right', padding:'5px 0 0', letterSpacing:'0.06em', textTransform:'uppercase' }}>
+        Clear session memory
+      </button>
+    </div>
+  );
+}
+
 // ── Root ───────────────────────────────────────────────────────────────────────
 export default function Home() {
   const [ticker, setTicker]     = useState<Ticker>('MNQ');
@@ -1345,6 +1426,9 @@ export default function Home() {
   const [confirming,   setConfirming]   = useState(false);
   const [tradeSent,    setTradeSent]    = useState<string | null>(null);
   const [gazeEvent,    setGazeEvent]    = useState<GazeEvt>({ dx:0, dy:0, widen:false, dur:0, id:0 });
+
+  const { entries: memEntries, addEntry: memAddEntry, clear: memClear, context: memContext } = useConvMemory();
+  const [memOpen, setMemOpen] = useState(false);
 
   const chatRef  = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -1493,6 +1577,28 @@ export default function Home() {
     return 'WAIT';
   })();
 
+  // Keep a current snapshot of values needed when avState transitions fire
+  const memDataRef = useRef({ ticker, edge, grade });
+  useEffect(() => { memDataRef.current = { ticker, edge, grade }; });
+
+  // Auto-log notable avState transitions into session memory
+  const prevAvStateRef = useRef<AvatarState | null>(null);
+  useEffect(() => {
+    if (prevAvStateRef.current === avState) return;
+    const prev = prevAvStateRef.current;
+    prevAvStateRef.current = avState;
+    if (prev === null) return;
+    const { ticker: t, edge: e, grade: g } = memDataRef.current;
+    const en = Math.round(e);
+    if (avState === 'READY_LONG')  memAddEntry('setup', 'LONG setup on ' + t + ' — Edge ' + en + '/110' + (g ? ' (' + g + ')' : ''));
+    if (avState === 'READY_SHORT') memAddEntry('setup', 'SHORT setup on ' + t + ' — Edge ' + en + '/110' + (g ? ' (' + g + ')' : ''));
+    if (avState === 'STOP_HIT')    memAddEntry('trade', 'Trade stopped out on ' + t);
+    if (avState === 'TARGET_HIT')  memAddEntry('trade', 'Target hit on ' + t);
+    if (avState === 'ACTIVE' && (prev === 'READY_LONG' || prev === 'READY_SHORT')) {
+      memAddEntry('trade', 'Position entered on ' + t + ' (' + (prev === 'READY_LONG' ? 'LONG' : 'SHORT') + ')');
+    }
+  }, [avState, memAddEntry]);
+
   const avCfg = AV_CFG[avState];
   const eyeColor = `rgb(${avCfg.eye[0]},${avCfg.eye[1]},${avCfg.eye[2]})`;
 
@@ -1567,22 +1673,35 @@ export default function Home() {
     const question = (q ?? input).trim(); if (!question || asking) return;
     setInput(''); setMsgs(m => [...m, mkMsg('user', question)]); setAsking(true);
     setChatOpen(true);
+    // Log user message and check for session preferences
+    memAddEntry('chat', question.slice(0, 150));
+    PREF_PATTERNS.forEach(([pat, note]) => { if (pat.test(question)) memAddEntry('pref', note); });
+    // Prepend today's session context so the AI can reference it naturally
+    const fullQ = memContext ? memContext + question : question;
     try {
-      const r = await fetch('/api/assistant', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json', ...authHeader}, body:JSON.stringify({ question, ticker }) });
+      const r = await fetch('/api/assistant', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json', ...authHeader}, body:JSON.stringify({ question: fullQ, ticker }) });
       if (r.status === 401) { setAuthNeeded(true); setAuthPwd(''); try { localStorage.removeItem('brain_auth'); } catch {} setMsgs(m => [...m, mkMsg('brain', 'Session expired.')]); }
-      else { const j = await r.json(); const answer = j.answer || j.error || 'No response.'; speakRef.current(answer); setMsgs(m => [...m, mkMsg('brain', answer)]); }
+      else {
+        const j = await r.json();
+        const answer = j.answer || j.error || 'No response.';
+        speakRef.current(answer);
+        setMsgs(m => [...m, mkMsg('brain', answer)]);
+        memAddEntry('insight', answer.slice(0, 140));
+      }
     } catch { setMsgs(m => [...m, mkMsg('brain', 'Connection error.')]); }
     finally { setAsking(false); setTimeout(() => inputRef.current?.focus(), 60); }
-  }, [input, asking, ticker, authHeader]);
+  }, [input, asking, ticker, authHeader, memContext, memAddEntry]);
 
   const onKey = (e: React.KeyboardEvent) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } };
 
   const doEnter = async () => {
     if (!confirming) { setConfirming(true); return; }
     setConfirming(false);
+    const dir = /short|bear/i.test(dirn) ? 'short' : 'long';
     try {
-      const r = await fetch('/api/enter', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json', ...authHeader}, body:JSON.stringify({ ticker, direction: /short|bear/i.test(dirn) ? 'short' : 'long' }) });
-      setTradeSent(r.ok ? '✓ Order sent' : '✗ Send failed');
+      const r = await fetch('/api/enter', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json', ...authHeader}, body:JSON.stringify({ ticker, direction: dir }) });
+      if (r.ok) { setTradeSent('✓ Order sent'); memAddEntry('trade', 'ENTERED ' + dir.toUpperCase() + ' ' + ticker + ' at market'); }
+      else setTradeSent('✗ Send failed');
     } catch { setTradeSent('✗ Network error'); }
     setTimeout(() => setTradeSent(null), 4000);
   };
@@ -2281,6 +2400,30 @@ export default function Home() {
                 {c}
               </button>
             ))}
+          </div>
+
+          {/* ── SESSION MEMORY ──────────────────────────────────────── */}
+          <div style={{ marginBottom:10, border:'1px solid rgba(255,255,255,0.048)', borderRadius:10, overflow:'hidden' }}>
+            <button className="accord-toggle" onClick={() => setMemOpen(!memOpen)} style={{
+              width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
+              padding:'9px 14px', background:'rgba(255,255,255,0.012)', border:'none', cursor:'pointer',
+              color:'rgba(255,255,255,0.40)', fontSize:11, fontFamily:'monospace', letterSpacing:'0.08em' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                <span style={{ fontWeight:700, textTransform:'uppercase' }}>Session Memory</span>
+                {memEntries.length > 0 && (
+                  <span style={{ fontSize:9.5, color:CYAN, background:'rgba(56,189,248,0.08)',
+                    border:'1px solid rgba(56,189,248,0.18)', borderRadius:10, padding:'1px 7px', fontFamily:'monospace' }}>
+                    {memEntries.length}
+                  </span>
+                )}
+              </div>
+              <span style={{ fontSize:12, color:'rgba(255,255,255,0.22)' }}>{memOpen ? '▲' : '▼'}</span>
+            </button>
+            {memOpen && (
+              <div style={{ padding:'11px 14px 14px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
+                <MemoryPanel entries={memEntries} onClear={memClear} />
+              </div>
+            )}
           </div>
 
           {/* ── CHAT ────────────────────────────────────────────────────── */}
