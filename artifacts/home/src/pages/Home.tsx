@@ -2062,8 +2062,7 @@ export default function Home() {
         transform-origin:top left!important;
       }
 
-      /* Corner overlays sit on top of the pig — hide on mobile */
-      .avtr-corner-sat{display:none!important;}
+      /* Corner overlays — already hidden globally, rule kept for specificity */
 
       /* Full-screen overlay not used in this layout */
       .mob-avtr-overlay{display:none!important;}
@@ -2100,6 +2099,8 @@ export default function Home() {
     .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
     /* ConnectorSVG wires with no target cards are visual noise — hidden */
     .mc-stage>svg{display:none!important;}
+    /* Corner sats sit position:absolute inside the avatar box and overlap the pig */
+    .avtr-corner-sat{display:none!important;}
     /* mc-top-row (Edge Score/Win Prob/Strategy) is duplicated in the brain panel */
     .mc-top-row{display:none!important;}
     .mc-bot-row{display:flex;gap:8px;}
@@ -2471,14 +2472,14 @@ export default function Home() {
                 </div>
 
                 {/* AVATAR SPOTLIGHT CENTER */}
-                <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+                <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0, overflow:'hidden' }}>
                   <div className="mc-avtr-box" style={{ position:'relative', width:342, height:455, flexShrink:0 }}>
-                    {/* Far-field halo — wide soft envelope */}
-                    <div style={{ position:'absolute', top:-130, left:-150, right:-150, bottom:-80,
+                    {/* Far-field halo — contained within avtr-outer, no bleed into adjacent cards */}
+                    <div style={{ position:'absolute', top:0, left:0, right:0, bottom:0,
                       background:`radial-gradient(ellipse at 50% 46%, ${auraColor}24 0%, ${auraColor}09 36%, transparent 66%)`,
                       pointerEvents:'none', zIndex:0 }} />
                     {/* Breathing mid-field pulse */}
-                    <div style={{ position:'absolute', inset:-30,
+                    <div style={{ position:'absolute', inset:0,
                       background:`radial-gradient(ellipse at 50% 46%, ${auraColor}3e 0%, transparent 58%)`,
                       animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none', zIndex:0 }} />
                     {/* Always-on close glow — keeps face bright against dim cards */}
