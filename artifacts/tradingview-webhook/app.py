@@ -39443,7 +39443,7 @@ def dashboard():
     --radius:16px; --radius-sm:11px;
   }
   html{background:var(--bg)}
-  body{zoom:.75;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  body{zoom:.55;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
   .vw-bg{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
     background:
@@ -40125,6 +40125,7 @@ def dashboard():
 <body>
 <div class="vw-bg" aria-hidden="true"></div>
 <h1><span id="refresh-dot"></span>🐷 AI Trading Partner</h1>
+<div style="text-align:center;margin:6px 0 2px"><img src="__APP_ICON_DATA_URI__" alt="LordPiggington" style="width:96px;height:96px;border-radius:50%;object-fit:cover;border:2px solid rgba(125,140,255,.55);box-shadow:0 0 24px rgba(110,125,255,.38),0 4px 16px rgba(0,0,0,.55);display:inline-block"></div>
 <div id="last-updated">Last updated —</div>
 <!-- Top controls collapsed into a single menu (DISPLAY-ONLY, per-device; persisted
      in localStorage('dashTopMenu')). Never touches the money path. -->
