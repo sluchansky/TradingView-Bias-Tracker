@@ -385,6 +385,10 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
     let microDx     = 0;     // microsaccade tremor X offset
     let microDy     = 0;     // microsaccade tremor Y offset
     let microNextMs = 1800;  // elapsed ms timestamp of next microsaccade jump
+    let lipJaw      = 0;     // jaw open amount (px, 0 = fully closed)
+    let lipCorner   = 0;     // corner Y offset — neg = smile lift, pos = frown drop
+    let lipWidth    = 0;     // extra half-width when speaking (widens with energy)
+    let lipUpperV   = -3.2;  // Cupid's bow peak height relative to mouth Y (always neg)
 
     const draw = () => {
       const elapsed = Date.now() - t0;
@@ -824,71 +828,120 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       jawG.addColorStop(1, rc(cfg.mesh, 0.10 * cfg.dim));
       ctx.fillStyle = jawG; ctx.fillRect(CX - RX, CY + bob + 50, RX * 2, RY);
 
-      // ── Mouth — volumetric lips with filled lower lip and crease ─────────────
-      const my        = CY + 57 + bob;
-      const lipEnergy = spk ? Math.max(0, Math.min(1, speechCtrlRef.current?.energy ?? 0)) : 0;
-      const lipViseme = spk ? (speechCtrlRef.current?.viseme ?? 'rest') : 'rest';
+      // ── Mouth — anatomical lips with smooth jaw animation ────────────────────
+      // Per-frame target computation (viseme + state → geometry targets)
+      const lipEn  = spk ? Math.max(0, Math.min(1, speechCtrlRef.current?.energy ?? 0)) : 0;
+      const lipVis = spk ? (speechCtrlRef.current?.viseme ?? 'rest') : 'rest';
+      const lipMT  = expr.mouthType;
+      const tgCorner =
+        lipMT === 'confident' || lipMT === 'satisfaction' ? -2.5 :
+        lipMT === 'disappointment' ? 2.6 :
+        lipMT === 'tight' || lipMT === 'focused' ? 0.5 :
+        lipMT === 'interested' ? -0.8 : 0.0;
+      const tgUpperV =
+        lipMT === 'confident' || lipMT === 'satisfaction' ? -5.0 :
+        lipMT === 'disappointment' ? -1.5 :
+        lipMT === 'tight' ? -2.2 : -3.2;
+      const tgJaw =
+        lipVis === 'press'   ? 0 :
+        lipVis === 'rounded' ? lipEn * 5.5 :
+        lipVis === 'narrow'  ? lipEn * 4.2 :
+        lipEn * 7.8;
+      const tgWidth = lipEn * 2.8;
+      // Exponential smoothing — jaw snaps for press consonants, corners settle slowly
+      lipJaw    += (tgJaw    - lipJaw)    * (lipVis === 'press' ? 0.32 : 0.22);
+      lipCorner += (tgCorner - lipCorner) * 0.08;
+      lipWidth  += (tgWidth  - lipWidth)  * 0.16;
+      lipUpperV += (tgUpperV - lipUpperV) * 0.09;
 
-      if (lipEnergy > 0.04 && spk) {
-        // Lip-sync — jaw drops, shape driven by viseme
-        const jawDrop = lipEnergy * 10.5;
-        const mw      = 15 + lipEnergy * 3.5;
-        ctx.save();
-        ctx.shadowBlur = 6 + lipEnergy * 6; ctx.shadowColor = rc(cfg.eye, 0.50);
+      // Derived geometry
+      const MY  = CY + 57 + bob;       // mouth Y reference (oral margin)
+      const MW  = 18 + lipWidth;        // half-width, widens with energy
+      const COR = lipCorner;            // corner Y offset (neg=up/smile, pos=down/frown)
+      const UV  = lipUpperV;            // Cupid's bow peak Y offset (always negative)
+      const JW  = Math.max(0, lipJaw);  // jaw open amount ≥0
+      const UL  = JW * 0.12;           // upper oral margin rises as jaw opens
+
+      ctx.save();
+      ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.eye, 0.22 * cfg.dim);
+
+      // ── 1. Oral cavity — dark interior, visible when jaw open ────────────────
+      if (JW > 1.8) {
+        const oW  = MW * 0.66;
+        const oH  = Math.max(0.4, (JW - 1.2) * 0.52);
+        const oCY = MY + COR + oH * 0.42;
+        const oG  = ctx.createRadialGradient(CX, oCY - 1, 0, CX, oCY, oW);
+        oG.addColorStop(0,    rc([4, 4, 14], 0.97));
+        oG.addColorStop(0.65, rc([3, 3, 10], 0.90));
+        oG.addColorStop(1,    'rgba(0,0,0,0)');
         ctx.beginPath();
-        if (lipViseme === 'press') {
-          ctx.moveTo(CX - 13, my); ctx.quadraticCurveTo(CX, my + 0.7, CX + 13, my);
-        } else if (lipViseme === 'rounded') {
-          const rw = 6 + lipEnergy * 5, rh = Math.max(2, jawDrop * 0.68);
-          const oG = ctx.createRadialGradient(CX, my, 0, CX, my, rw + 4);
-          oG.addColorStop(0, rc(cfg.eye, 0.38)); oG.addColorStop(1, 'rgba(0,0,0,0)');
-          ctx.ellipse(CX, my - rh * 0.22, rw, rh, 0, 0, Math.PI * 2);
-          ctx.fillStyle = oG; ctx.fill();
-        } else if (lipViseme === 'narrow') {
-          ctx.moveTo(CX - mw, my); ctx.quadraticCurveTo(CX, my + jawDrop * 0.20, CX + mw, my);
-        } else {
-          ctx.moveTo(CX - mw, my);
-          ctx.quadraticCurveTo(CX, my + jawDrop * 0.13 + 1, CX + mw, my);
-          ctx.moveTo(CX - mw * 0.86, my + jawDrop * 0.40);
-          ctx.quadraticCurveTo(CX, my + jawDrop + 1.5, CX + mw * 0.86, my + jawDrop * 0.40);
-        }
-        ctx.strokeStyle = rc(cfg.eye, (0.58 + lipEnergy * 0.26) * cfg.dim);
-        ctx.lineWidth = 1.6; ctx.stroke();
-        ctx.restore();
-      } else {
-        // Resting — filled lower lip with volume + crease
-        const mt = expr.mouthType;
-        const mw = 17;
-        const mc = mt === 'confident' || mt === 'satisfaction' ? 5 :
-                   mt === 'interested' ? 3.5 : mt === 'disappointment' ? -2.5 :
-                   mt === 'tight' ? 0 : 2;
-        ctx.save();
-        ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.28 * cfg.dim);
-        // Lower lip fill — filled bezier region with radial gradient
-        const llG = ctx.createRadialGradient(CX, my + mc + 1.5, 0, CX, my + mc + 1.5, mw * 0.80);
-        llG.addColorStop(0,   rc(cfg.eye,  0.24 * cfg.dim));
-        llG.addColorStop(0.5, rc(cfg.mesh, 0.12 * cfg.dim));
-        llG.addColorStop(1,   'rgba(0,0,0,0)');
-        ctx.beginPath();
-        ctx.moveTo(CX - mw, my);
-        ctx.quadraticCurveTo(CX, my + mc, CX + mw, my);
-        ctx.quadraticCurveTo(CX + mw * 0.60, my + mc + 4.0, CX, my + mc + 5.2);
-        ctx.quadraticCurveTo(CX - mw * 0.60, my + mc + 4.0, CX - mw, my);
-        ctx.fillStyle = llG; ctx.fill();
-        // Lip crease
-        ctx.beginPath();
-        if (mt === 'tight') {
-          ctx.moveTo(CX - mw + 2, my); ctx.lineTo(CX + mw - 2, my);
-        } else {
-          ctx.moveTo(CX - mw + 2, my); ctx.quadraticCurveTo(CX, my + mc, CX + mw - 2, my);
-        }
-        ctx.strokeStyle = rc(cfg.mesh, 0.45 * cfg.dim); ctx.lineWidth = 1.4; ctx.stroke();
-        // Lower lip centre highlight
-        ctx.beginPath();
-        ctx.ellipse(CX, my + mc + 3.6, mw * 0.34, 1.9, 0, 0, Math.PI * 2);
-        ctx.fillStyle = rc(cfg.eye, 0.15 * cfg.dim); ctx.fill();
-        ctx.restore();
+        ctx.ellipse(CX, oCY, oW, Math.max(0.5, oH), 0, 0, Math.PI * 2);
+        ctx.fillStyle = oG; ctx.fill();
       }
+
+      // ── 2. Lower lip — filled volume (oral margin top + outer arc bottom) ────
+      ctx.beginPath();
+      ctx.moveTo(CX - MW, MY + COR);
+      // Oral margin (top edge) — center drops with jaw
+      ctx.bezierCurveTo(CX-MW*0.55, MY+COR+JW*0.22, CX-MW*0.12, MY+COR+JW*0.52, CX,   MY+COR+JW*0.58);
+      ctx.bezierCurveTo(CX+MW*0.12, MY+COR+JW*0.52, CX+MW*0.55, MY+COR+JW*0.22, CX+MW, MY+COR);
+      // Outer arc — the visible fullness of the lower lip
+      ctx.bezierCurveTo(CX+MW*0.58, MY+COR+JW*0.10+1.0, CX+MW*0.26, MY+COR+JW+5.8, CX,   MY+COR+JW+6.4);
+      ctx.bezierCurveTo(CX-MW*0.26, MY+COR+JW+5.8,      CX-MW*0.58, MY+COR+JW*0.10+1.0, CX-MW, MY+COR);
+      ctx.closePath();
+      const llG = ctx.createRadialGradient(CX, MY+COR+JW*0.35+3.2, 0, CX, MY+COR+JW*0.35+3.2, MW*0.88);
+      llG.addColorStop(0,   rc(cfg.eye,  0.28 * cfg.dim));
+      llG.addColorStop(0.5, rc(cfg.mesh, 0.18 * cfg.dim));
+      llG.addColorStop(1,   rc(cfg.mesh, 0.05 * cfg.dim));
+      ctx.fillStyle = llG; ctx.fill();
+
+      // ── 3. Upper lip — Cupid's bow fill ──────────────────────────────────────
+      ctx.beginPath();
+      ctx.moveTo(CX - MW, MY + COR);
+      // Top: left arch → left peak → philtrum valley → right peak → right arch
+      ctx.bezierCurveTo(CX-MW*0.64, MY+COR,     CX-MW*0.40, MY+UV,     CX-MW*0.18, MY+UV+1.6);
+      ctx.bezierCurveTo(CX-MW*0.05, MY+UV+2.4,  CX+MW*0.05, MY+UV+2.4, CX+MW*0.18, MY+UV+1.6);
+      ctx.bezierCurveTo(CX+MW*0.40, MY+UV,      CX+MW*0.64, MY+COR,    CX+MW,      MY+COR);
+      // Oral margin back (bottom of upper lip arches up slightly as jaw opens)
+      ctx.bezierCurveTo(CX+MW*0.50, MY+COR-UL,  CX-MW*0.50, MY+COR-UL, CX-MW,      MY+COR);
+      ctx.closePath();
+      const ulG = ctx.createLinearGradient(CX, MY+UV-1, CX, MY+COR+4);
+      ulG.addColorStop(0,    rc(cfg.mesh, 0.20 * cfg.dim));
+      ulG.addColorStop(0.55, rc(cfg.mesh, 0.30 * cfg.dim));
+      ulG.addColorStop(1,    rc(cfg.eye,  0.10 * cfg.dim));
+      ctx.fillStyle = ulG; ctx.fill();
+
+      // ── 4. Cupid's bow crease / oral margin stroke ────────────────────────────
+      ctx.shadowBlur = 0;
+      ctx.beginPath();
+      ctx.moveTo(CX - MW, MY + COR);
+      ctx.bezierCurveTo(CX-MW*0.64, MY+COR,     CX-MW*0.40, MY+UV,     CX-MW*0.18, MY+UV+1.6);
+      ctx.bezierCurveTo(CX-MW*0.05, MY+UV+2.4,  CX+MW*0.05, MY+UV+2.4, CX+MW*0.18, MY+UV+1.6);
+      ctx.bezierCurveTo(CX+MW*0.40, MY+UV,      CX+MW*0.64, MY+COR,    CX+MW,      MY+COR);
+      ctx.strokeStyle = rc(cfg.mesh, 0.44 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
+
+      // ── 5. Commissure accents — depth marks where lips meet at corners ────────
+      [-1, 1].forEach(sx => {
+        const ccG = ctx.createRadialGradient(CX+sx*MW, MY+COR, 0, CX+sx*MW, MY+COR, 3.2);
+        ccG.addColorStop(0, rc(cfg.mesh, 0.42 * cfg.dim));
+        ccG.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.beginPath(); ctx.arc(CX+sx*MW, MY+COR, 3.2, 0, Math.PI * 2);
+        ctx.fillStyle = ccG; ctx.fill();
+      });
+
+      // ── 6. Lower lip shine + Cupid's bow peak highlights ─────────────────────
+      const shY = MY + COR + JW*0.38 + 4.0;
+      const shG = ctx.createRadialGradient(CX, shY, 0, CX, shY, MW*0.36);
+      shG.addColorStop(0, rc(cfg.eye, 0.20 * cfg.dim));
+      shG.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.beginPath(); ctx.ellipse(CX, shY, MW*0.34, 2.0, 0, 0, Math.PI * 2);
+      ctx.fillStyle = shG; ctx.fill();
+      [-1, 1].forEach(sx => {
+        ctx.beginPath(); ctx.arc(CX+sx*MW*0.22, MY+UV+1.0, 1.2, 0, Math.PI * 2);
+        ctx.fillStyle = rc(cfg.eye, 0.14 * cfg.dim); ctx.fill();
+      });
+
+      ctx.restore();
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       ctx.restore(); // end head tilt transform
 
