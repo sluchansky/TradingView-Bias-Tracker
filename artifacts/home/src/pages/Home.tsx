@@ -1776,12 +1776,12 @@ export default function Home() {
     .mc-mid-row{display:flex;gap:8px;align-items:stretch;}
     .mc-col{display:flex;flex-direction:column;gap:8px;width:130px;flex-shrink:0;}
     .mc-col>.mc-card{flex:1;min-height:0;}
-    .mc-card{background:rgba(8,12,28,0.80);border:1px solid rgba(255,255,255,0.055);border-radius:10px;padding:10px 12px;transition:border-color 0.6s ease,box-shadow 0.6s ease,background 0.25s ease;animation:mcFloat 7s ease-in-out infinite;}
-    .mc-card:hover{background:rgba(14,20,44,0.90)!important;border-color:rgba(255,255,255,0.13)!important;}
-    .mc-label{font-size:8.5px;font-family:monospace;font-weight:700;letter-spacing:0.10em;text-transform:uppercase;color:rgba(255,255,255,0.28);}
-    .mc-value{font-size:13px;font-family:monospace;font-weight:800;letter-spacing:0.03em;line-height:1.1;margin-top:4px;}
-    .mc-sub{font-size:9px;font-family:monospace;color:rgba(255,255,255,0.28);margin-top:3px;line-height:1.3;}
-    @keyframes mcFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-2.5px)}}
+    .mc-card{background:rgba(5,8,18,0.58);border:1px solid rgba(255,255,255,0.036);border-radius:10px;padding:10px 12px;transition:border-color 0.6s ease,box-shadow 0.6s ease,background 0.25s ease;animation:mcFloat 7s ease-in-out infinite;}
+    .mc-card:hover{background:rgba(10,15,34,0.72)!important;border-color:rgba(255,255,255,0.09)!important;}
+    .mc-label{font-size:8.5px;font-family:monospace;font-weight:700;letter-spacing:0.10em;text-transform:uppercase;color:rgba(255,255,255,0.18);}
+    .mc-value{font-size:13px;font-family:monospace;font-weight:800;letter-spacing:0.03em;line-height:1.1;margin-top:4px;opacity:0.82;}
+    .mc-sub{font-size:9px;font-family:monospace;color:rgba(255,255,255,0.18);margin-top:3px;line-height:1.3;}
+    @keyframes mcFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-1.8px)}}
     @media(max-width:1100px){.mc-col{width:108px!important;}.mc-card{padding:7px 9px!important;}.mc-value{font-size:11.5px!important;}}
     @media(max-width:900px){.mc-stage{display:none!important;}}
   `;
@@ -1992,9 +1992,9 @@ export default function Home() {
           )}
 
           {/* ── MAIN BRAIN COMMAND CENTER ───────────────────────────────── */}
-          <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:320,
+          <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:420,
             position:'relative',
-            background:`radial-gradient(ellipse 700px 560px at 38% 46%, ${auraColor}06 0%, transparent 72%)` }}>
+            background:`radial-gradient(ellipse 820px 660px at 38% 48%, ${auraColor}0e 0%, transparent 68%)` }}>
 
             {/* ── MISSION CONTROL STAGE — avatar centered, 12 live telemetry cards ── */}
             <div className="mc-stage">
@@ -2060,18 +2060,25 @@ export default function Home() {
 
                 {/* AVATAR SPOTLIGHT CENTER */}
                 <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
-                  <div style={{ position:'relative', width:292, height:390, flexShrink:0 }}>
-                    <div style={{ position:'absolute', top:-100, left:-120, right:-120, bottom:-60,
-                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}18 0%, ${auraColor}07 40%, transparent 70%)`,
+                  <div style={{ position:'relative', width:342, height:455, flexShrink:0 }}>
+                    {/* Far-field halo — wide soft envelope */}
+                    <div style={{ position:'absolute', top:-130, left:-150, right:-150, bottom:-80,
+                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}24 0%, ${auraColor}09 36%, transparent 66%)`,
                       pointerEvents:'none', zIndex:0 }} />
-                    <div style={{ position:'absolute', inset:-22,
-                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}26 0%, transparent 64%)`,
+                    {/* Breathing mid-field pulse */}
+                    <div style={{ position:'absolute', inset:-30,
+                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}3e 0%, transparent 58%)`,
                       animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none', zIndex:0 }} />
-                    <div style={{ position:'absolute', bottom:-28, left:'8%', right:'8%', height:68,
-                      background:`radial-gradient(ellipse at 50% 100%, ${auraColor}20 0%, transparent 70%)`,
+                    {/* Always-on close glow — keeps face bright against dim cards */}
+                    <div style={{ position:'absolute', top:'18%', left:'14%', right:'14%', bottom:'22%',
+                      background:`radial-gradient(ellipse at 50% 44%, ${auraColor}1e 0%, transparent 52%)`,
+                      pointerEvents:'none', zIndex:0 }} />
+                    {/* Floor reflection */}
+                    <div style={{ position:'absolute', bottom:-36, left:'5%', right:'5%', height:82,
+                      background:`radial-gradient(ellipse at 50% 100%, ${auraColor}2c 0%, transparent 66%)`,
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
-                      justifyContent:'center', transform:'scale(1.2)', transformOrigin:'center center', zIndex:1 }}>
+                      justifyContent:'center', transform:'scale(1.50)', transformOrigin:'center center', zIndex:1 }}>
                       <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
                     </div>
                   </div>
