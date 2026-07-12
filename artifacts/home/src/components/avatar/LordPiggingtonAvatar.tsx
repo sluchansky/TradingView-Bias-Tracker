@@ -36,8 +36,8 @@ import type { LordPiggingtonProps, AvatarState } from './avatarTypes';
 import { STATE_ACCENT_HEX, STATE_PULSE_HZ } from './avatarTypes';
 
 // ─── Canvas ───────────────────────────────────────────────────────────────────
-const W = 342;
-const H = 455;
+const W = 420;
+const H = 560;
 
 // ─── Animation state ──────────────────────────────────────────────────────────
 type AnimState = 'idle' | 'talking' | 'walking' | 'pointing' | 'thinking' | 'waving';

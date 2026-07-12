@@ -2096,8 +2096,14 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
-    /* Reduce main dashboard content by 25% on desktop */
-    @media(min-width:769px){.main-center{zoom:0.75;}}
+    /* Desktop layout: brain panel LEFT, avatar stage centered RIGHT */
+    @media(min-width:769px){
+      .main-center{zoom:1;}
+      .mc-col{display:none!important;}
+      .mb-brain{order:1;max-width:660px;}
+      .mc-stage{order:2;flex:1;display:flex;flex-direction:column;align-items:center;}
+      .mc-mid-row{justify-content:center;width:100%;}
+    }
     .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
     /* ConnectorSVG wires with no target cards are visual noise — hidden */
     .mc-stage>svg{display:none!important;}
@@ -2475,7 +2481,7 @@ export default function Home() {
 
                 {/* AVATAR SPOTLIGHT CENTER */}
                 <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0, overflow:'hidden' }}>
-                  <div className="mc-avtr-box" style={{ position:'relative', width:342, height:455, flexShrink:0 }}>
+                  <div className="mc-avtr-box" style={{ position:'relative', width:420, height:560, flexShrink:0 }}>
                     {/* Far-field halo — contained within avtr-outer, no bleed into adjacent cards */}
                     <div style={{ position:'absolute', top:0, left:0, right:0, bottom:0,
                       background:`radial-gradient(ellipse at 50% 46%, ${auraColor}24 0%, ${auraColor}09 36%, transparent 66%)`,
