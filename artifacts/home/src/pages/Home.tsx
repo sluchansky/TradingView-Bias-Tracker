@@ -185,6 +185,104 @@ function useTTS() {
   return { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef };
 }
 
+// ── Voice input ───────────────────────────────────────────────────────────────
+type VoiceState = 'idle' | 'requesting' | 'listening' | 'processing' | 'error';
+
+function useVoiceInput({ onTranscript }: { onTranscript: (t: string) => void }) {
+  const [voiceState, setVoiceState] = useState<VoiceState>('idle');
+  const [transcript, setTranscript] = useState('');
+  const [errorMsg,   setErrorMsg]   = useState('');
+  const recognitionRef = useRef<any>(null);
+  const streamRef      = useRef<MediaStream | null>(null);
+  const finalRef       = useRef('');
+
+  const releaseMic = useCallback(() => {
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+  }, []);
+
+  const startListening = useCallback(async () => {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) {
+      setErrorMsg('Voice input requires Chrome or Safari. Type your question below.');
+      setVoiceState('error'); return;
+    }
+    setVoiceState('requesting');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      setVoiceState('listening');
+      finalRef.current = ''; setTranscript('');
+
+      const rec = new SR();
+      recognitionRef.current = rec;
+      rec.continuous = false; rec.interimResults = true;
+      rec.lang = 'en-US'; rec.maxAlternatives = 1;
+
+      rec.onresult = (e: any) => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (e.results[i].isFinal) finalRef.current += e.results[i][0].transcript;
+          else interim += e.results[i][0].transcript;
+        }
+        setTranscript(finalRef.current + interim);
+      };
+
+      rec.onend = () => {
+        releaseMic();
+        const t = finalRef.current.trim();
+        if (t) { setVoiceState('processing'); onTranscript(t); }
+        else   { setVoiceState('idle'); setTranscript(''); }
+      };
+
+      rec.onerror = (e: any) => {
+        releaseMic();
+        if (e.error === 'no-speech') { setVoiceState('idle'); setTranscript(''); return; }
+        setErrorMsg(
+          (e.error === 'not-allowed' || e.error === 'service-not-allowed')
+            ? 'Microphone access blocked. Enable it in your browser settings.'
+            : e.error === 'audio-capture'
+              ? 'No microphone detected. Connect a microphone and try again.'
+              : 'Voice error: ' + (e.error || 'unknown')
+        );
+        setVoiceState('error');
+      };
+
+      rec.start();
+    } catch (err: any) {
+      releaseMic();
+      setErrorMsg(
+        (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
+          ? 'Microphone access blocked. Enable it in your browser settings.'
+          : err.name === 'NotFoundError'
+            ? 'No microphone detected. Connect a microphone and try again.'
+            : 'Microphone error: ' + (err.message || err.name)
+      );
+      setVoiceState('error');
+    }
+  }, [releaseMic, onTranscript]);
+
+  const stopListening = useCallback(() => {
+    try { recognitionRef.current?.stop(); } catch {}
+    // onend fires automatically and submits any collected transcript
+  }, []);
+
+  const cancelListening = useCallback(() => {
+    try { recognitionRef.current?.abort(); } catch {}
+    releaseMic();
+    setVoiceState('idle'); setTranscript(''); setErrorMsg(''); finalRef.current = '';
+  }, [releaseMic]);
+
+  const clearError = useCallback(() => { setErrorMsg(''); setVoiceState('idle'); }, []);
+
+  useEffect(() => () => {
+    releaseMic();
+    try { recognitionRef.current?.abort(); } catch {}
+  }, [releaseMic]);
+
+  return { voiceState, setVoiceState, transcript, errorMsg, startListening, stopListening, cancelListening, clearError };
+}
+
 // ── Candle data ────────────────────────────────────────────────────────────────
 type Candle = { t: number; o: number; h: number; l: number; c: number; vol: number };
 function makeCandles(base: number, n = 60): Candle[] {
@@ -215,9 +313,10 @@ function getBrainChecklist(data: any): Array<{ text: string; st: 'pass' | 'fail'
 // ── Synthetic AI face canvas ───────────────────────────────────────────────────
 type GazeEvt = { dx: number; dy: number; widen: boolean; dur: number; id: number };
 
-const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, speechCtrlRef }: {
+const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, speechCtrlRef, voiceListeningRef }: {
   avState: AvatarState; speaking: boolean; ringColor: string; gazeEvent: GazeEvt;
   speechCtrlRef: React.MutableRefObject<SpeechCtrl>;
+  voiceListeningRef: React.MutableRefObject<boolean>;
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef   = useRef(0);
@@ -592,9 +691,23 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.restore();
       }
 
+      // ── Listening side glow — soft blue ear pulses while mic is active ──────────
+      const isListening = voiceListeningRef.current;
+      if (isListening) {
+        const lp = 0.52 + 0.48 * Math.sin(elapsed * 0.0030);
+        [-1, 1].forEach(side => {
+          const gx = CX + side * (RX + 16);
+          const lg = ctx.createRadialGradient(gx, CY + bob, 0, gx, CY + bob, 30);
+          lg.addColorStop(0, rc([59, 130, 246], lp * 0.42));
+          lg.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.fillStyle = lg; ctx.fillRect(0, 0, W, H);
+        });
+      }
+
       // ── Orbiting particles (speed tied to state energy) ───────────────────────
+      const effectivePartMult = isListening ? partMult * 0.28 : partMult;
       partRef.current.forEach(p => {
-        p.angle += p.speed * 0.008 * partMult;
+        p.angle += p.speed * 0.008 * effectivePartMult;
         const qx = CX + Math.cos(p.angle) * p.r;
         const qy = CY + Math.sin(p.angle) * p.r * 0.72 + bob;
         const a  = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim;
@@ -1825,8 +1938,10 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const candlesRef    = useRef<Candle[]>([]);
   const priceBaseRef  = useRef<number>(0);
-  const speakRef      = useRef<(t: string) => void>(() => {});
-  const lastSpokenRef = useRef('');
+  const speakRef          = useRef<(t: string) => void>(() => {});
+  const lastSpokenRef     = useRef('');
+  const askVoiceRef       = useRef<(t: string) => void>(() => {});
+  const voiceListeningRef = useRef(false);
   // Gaze event detection — track previous poll values to detect transitions
   const prevStatusRef = useRef('');
   const prevEdgeRef   = useRef(0);
@@ -1836,6 +1951,10 @@ export default function Home() {
   const clock = useClock();
   const { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef } = useTTS();
   useEffect(() => { speakRef.current = speak; }, [speak]);
+  const onVoiceTranscript = useCallback((t: string) => { askVoiceRef.current(t); }, []);
+  const { voiceState, setVoiceState: setVoiceSt, transcript: voiceTranscript,
+          errorMsg: voiceErrorMsg, startListening, stopListening, cancelListening,
+          clearError: clearVoiceError } = useVoiceInput({ onTranscript: onVoiceTranscript });
 
   const authHeader = useMemo((): Record<string,string> =>
     authPwd ? { 'Authorization': 'Basic ' + btoa('admin:' + authPwd) } : {}
@@ -2025,6 +2144,7 @@ export default function Home() {
 
   // Confidence ring color — communicates AI state at a glance before text is read
   const ringColor = (() => {
+    if (voiceState === 'listening') return '#3b82f6'; // blue — listening to user
     if (!isOpen && data)    return '#374151';   // gray   — market closed
     if (isManaging)         return '#06b6d4';   // cyan   — active trade monitoring
     if (status === 'READY') return '#22c55e';   // green  — trade ready
@@ -2115,6 +2235,28 @@ export default function Home() {
 
   const onKey = (e: React.KeyboardEvent) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } };
 
+  // Sync askVoiceRef to latest ask callback so onVoiceTranscript always calls current version
+  useEffect(() => { askVoiceRef.current = ask; }, [ask]);
+  // Reset voice state to idle once ask() finishes processing
+  useEffect(() => { if (!asking && voiceState === 'processing') setVoiceSt('idle'); }, [asking, voiceState, setVoiceSt]);
+  // Keep voiceListeningRef in sync for AvatarCanvas draw loop (read via ref, no re-render)
+  useEffect(() => { voiceListeningRef.current = voiceState === 'listening'; }, [voiceState]);
+  // Make avatar look directly at user while listening; release naturally when done
+  useEffect(() => {
+    if (voiceState === 'listening') setGazeEvent({ dx: 0, dy: -0.6, widen: true, dur: 90000, id: Date.now() });
+  }, [voiceState]);
+  // Speak / barge-in: tap to talk, tap again to stop, tap while AI speaking to interrupt
+  const handleSpeak = useCallback(() => {
+    if (speaking) {
+      window.speechSynthesis?.cancel();
+      startListening(); return;
+    }
+    if (voiceState === 'listening')                              { stopListening();  return; }
+    if (voiceState === 'requesting' || voiceState === 'processing') return;
+    if (voiceState === 'error')                                  { clearVoiceError(); return; }
+    startListening();
+  }, [speaking, voiceState, startListening, stopListening, clearVoiceError]);
+
   const doEnter = async () => {
     if (!confirming) { setConfirming(true); return; }
     setConfirming(false);
@@ -2137,6 +2279,8 @@ export default function Home() {
     @keyframes bUp     { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
     @keyframes glow    { 0%,100%{opacity:.65} 50%{opacity:1} }
     @keyframes avrPulse{ 0%,100%{opacity:.18;transform:scale(1)} 50%{opacity:.55;transform:scale(1.04)} }
+    @keyframes micPulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.14);opacity:0.72} }
+    @keyframes micRing  { 0%{transform:scale(0.95);opacity:0.55} 100%{transform:scale(1.65);opacity:0} }
     @keyframes slideIn { from{opacity:0;transform:translateX(-8px)} to{opacity:1;transform:translateX(0)} }
     @keyframes tsIn    { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
     ::-webkit-scrollbar { width:3px; height:3px; }
@@ -2542,7 +2686,7 @@ export default function Home() {
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
                       justifyContent:'center', transform:'scale(1.50)', transformOrigin:'center center', zIndex:1 }}>
-                      <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} />
+                      <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} />
                     </div>
 
                     {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}
@@ -2788,6 +2932,43 @@ export default function Home() {
                   padding:'10px 16px', borderRadius:8, border:'1px solid rgba(255,255,255,0.10)',
                   background:'transparent', color:'rgba(255,255,255,0.45)', fontSize:12, fontFamily:'monospace', cursor:'pointer' }}>
                   {chatOpen ? 'Hide Chat' : 'Ask Brain'}
+                </button>
+                {/* ── SPEAK BUTTON ─────────────────────────────────────────── */}
+                <button onClick={handleSpeak} disabled={voiceState === 'requesting'}
+                  title={voiceState === 'error' ? voiceErrorMsg : voiceState === 'listening' ? 'Tap to stop recording' : speaking ? 'Tap to interrupt' : 'Tap to speak'}
+                  style={{
+                    display:'flex', alignItems:'center', gap:5,
+                    minHeight:42, minWidth:52, padding:'8px 13px', borderRadius:8,
+                    border: voiceState === 'listening' ? '1px solid rgba(239,68,68,0.50)'
+                          : speaking                  ? '1px solid rgba(56,189,248,0.35)'
+                          : voiceState === 'error'    ? '1px solid rgba(248,113,113,0.30)'
+                          :                            '1px solid rgba(59,130,246,0.28)',
+                    background: voiceState === 'listening' ? 'rgba(239,68,68,0.09)'
+                              : speaking                  ? 'rgba(56,189,248,0.07)'
+                              : voiceState === 'error'    ? 'rgba(239,68,68,0.06)'
+                              :                            'rgba(59,130,246,0.05)',
+                    color: voiceState === 'listening' ? '#ef4444'
+                         : speaking                  ? CYAN
+                         : voiceState === 'error'    ? '#f87171'
+                         :                            BLUE,
+                    fontSize:12, fontFamily:'monospace',
+                    cursor: voiceState === 'requesting' ? 'default' : 'pointer',
+                    transition:'all 0.18s',
+                    animation: voiceState === 'listening' ? 'micPulse 1.1s ease-in-out infinite' : 'none' }}>
+                  {voiceState === 'listening' && (
+                    <span style={{ display:'flex', gap:2, alignItems:'flex-end', height:12 }}>
+                      {[0,1,2,3].map(i => (
+                        <span key={i} style={{ width:3, height:10, borderRadius:2, background:'#ef4444', display:'block',
+                          animation:`wv ${0.38+i*0.11}s ease-in-out ${i*0.07}s infinite alternate` }} />
+                      ))}
+                    </span>
+                  )}
+                  <span style={{ fontSize:13 }}>
+                    {speaking ? '\u25A0' : voiceState === 'listening' ? '\u25CF' : voiceState === 'requesting' || voiceState === 'processing' ? '\u22EF' : '\uD83C\uDFA4'}
+                  </span>
+                  <span>
+                    {voiceState === 'listening' ? 'Listening\u2026' : speaking ? 'Stop' : voiceState === 'requesting' ? '\u2026' : voiceState === 'processing' ? 'Thinking\u2026' : voiceState === 'error' ? 'Retry' : 'Speak'}
+                  </span>
                 </button>
               </div>
             </div>
@@ -3091,14 +3272,31 @@ export default function Home() {
                   </div>
                 )}
               </div>
+              {/* Voice transcript preview — shown while listening or processing */}
+              {(voiceState === 'listening' || voiceState === 'processing') && voiceTranscript && (
+                <div style={{ padding:'5px 14px 0', fontSize:12, color:'rgba(255,255,255,0.52)', fontFamily:'monospace',
+                  fontStyle:'italic', borderTop:'1px solid rgba(59,130,246,0.08)', display:'flex', alignItems:'center', gap:6 }}>
+                  <span style={{ color:'rgba(59,130,246,0.55)', fontSize:9 }}>{'\u25CF'}</span>
+                  {voiceTranscript}
+                </div>
+              )}
+              {/* Voice error — with dismiss */}
+              {voiceState === 'error' && voiceErrorMsg && (
+                <div style={{ padding:'5px 14px 0', fontSize:11.5, color:'#f87171', fontFamily:'monospace',
+                  borderTop:'1px solid rgba(239,68,68,0.08)', display:'flex', alignItems:'center', gap:6 }}>
+                  <span style={{ flex:1 }}>{voiceErrorMsg}</span>
+                  <button onClick={clearVoiceError} style={{ background:'none', border:'none',
+                    color:'rgba(255,255,255,0.28)', fontSize:11, cursor:'pointer', padding:'0 2px' }}>{'\u2715'}</button>
+                </div>
+              )}
               <div className="input-wrap" style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 14px 12px',
                 borderTop:'1px solid rgba(255,255,255,0.045)' }}>
                 <input ref={inputRef} className="brain-input" value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey}
-                  placeholder="Ask the brain…" disabled={asking}
+                  placeholder="Ask the brain\u2026" disabled={asking}
                   style={{ flex:1, background:'transparent', border:'none', color:'rgba(255,255,255,0.80)', fontSize:13, fontFamily:'inherit' }} />
                 <button onClick={() => ask()} disabled={!input.trim() || asking} style={{
                   background:'none', border:'none', padding:'2px 4px', cursor: input.trim() && !asking ? 'pointer' : 'default',
-                  color: input.trim() && !asking ? eyeColor : 'rgba(255,255,255,0.18)', fontSize:15 }}>↵</button>
+                  color: input.trim() && !asking ? eyeColor : 'rgba(255,255,255,0.18)', fontSize:15 }}>{'\u21B5'}</button>
               </div>
             </div>
           )}
