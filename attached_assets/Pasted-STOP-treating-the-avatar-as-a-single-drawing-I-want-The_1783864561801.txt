@@ -1,0 +1,286 @@
+STOP treating the avatar as a single drawing.
+
+I want The Sentinel built as a layered rendering system.
+
+Every facial feature should be an independent layer that can animate separately.
+
+The avatar should be assembled from the following layers.
+
+------------------------------------
+
+LAYER 1
+
+Background
+
+- Gradient background
+- Soft particles
+- Floating stars
+- Atmospheric fog
+
+------------------------------------
+
+LAYER 2
+
+Energy Halo
+
+Large glowing ring behind the head.
+
+Animated.
+
+Slow rotation.
+
+Brightness changes with confidence.
+
+------------------------------------
+
+LAYER 3
+
+Outer Energy Shell
+
+Soft holographic glow.
+
+Breathing animation.
+
+Subtle transparency.
+
+------------------------------------
+
+LAYER 4
+
+Head Shape
+
+Smooth matte black mask.
+
+No facial details.
+
+No skin.
+
+No textures.
+
+Only the overall head silhouette.
+
+------------------------------------
+
+LAYER 5
+
+Internal Lighting
+
+Blue light moving beneath the surface.
+
+Very subtle.
+
+Should make the mask feel alive.
+
+------------------------------------
+
+LAYER 6
+
+Eye Sockets
+
+Soft shadow around the eyes.
+
+Creates depth.
+
+------------------------------------
+
+LAYER 7
+
+Eyebrows
+
+Independent animation.
+
+Move slightly while thinking.
+
+------------------------------------
+
+LAYER 8
+
+Eyeballs
+
+Independent.
+
+Move together.
+
+Track dashboard elements.
+
+Maintain eye contact.
+
+------------------------------------
+
+LAYER 9
+
+Irises
+
+Glow independently.
+
+Brightness changes.
+
+Pupil dilation.
+
+------------------------------------
+
+LAYER 10
+
+Eye Reflections
+
+Multiple reflection layers.
+
+Tiny moving highlights.
+
+------------------------------------
+
+LAYER 11
+
+Upper Eyelids
+
+Separate animation.
+
+------------------------------------
+
+LAYER 12
+
+Lower Eyelids
+
+Separate animation.
+
+------------------------------------
+
+LAYER 13
+
+Blink Layer
+
+Single animation controlling eyelids.
+
+------------------------------------
+
+LAYER 14
+
+Forehead Energy
+
+Soft moving energy.
+
+Shows processing activity.
+
+------------------------------------
+
+LAYER 15
+
+Mouth Line
+
+Minimal line while idle.
+
+------------------------------------
+
+LAYER 16
+
+Upper Lip
+
+Independent.
+
+------------------------------------
+
+LAYER 17
+
+Lower Lip
+
+Independent.
+
+------------------------------------
+
+LAYER 18
+
+Jaw
+
+Moves slightly while speaking.
+
+------------------------------------
+
+LAYER 19
+
+Speech Glow
+
+Subtle pulse around the mouth while talking.
+
+------------------------------------
+
+LAYER 20
+
+Thinking Particles
+
+Particles appear near the forehead while analyzing.
+
+------------------------------------
+
+LAYER 21
+
+Confidence Ring
+
+Independent.
+
+Changes color.
+
+Blue
+
+Yellow
+
+Orange
+
+Green
+
+Red
+
+------------------------------------
+
+LAYER 22
+
+Scanning Lines
+
+Very faint holographic scan.
+
+Appears occasionally.
+
+------------------------------------
+
+LAYER 23
+
+Ambient Fog
+
+Very soft.
+
+Slow movement.
+
+------------------------------------
+
+LAYER 24
+
+Interaction Layer
+
+Mouse movement.
+
+Phone tilt.
+
+Very slight parallax.
+
+------------------------------------
+
+LAYER 25
+
+Speech Layer
+
+Lip sync.
+
+Jaw movement.
+
+Eye contact.
+
+Only active while speaking.
+
+------------------------------------
+
+Every layer should animate independently.
+
+Nothing should be baked into one image.
+
+Every feature should have its own component.
+
+The Sentinel should feel assembled from multiple holographic systems rather than drawn as a single face.
