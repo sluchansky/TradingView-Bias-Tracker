@@ -2022,7 +2022,7 @@ export default function Home() {
     .sidebar-panel { animation:slideIn 0.18s ease-out; }
     @media(max-width:760px){.sidebar-l{display:none!important;}}
     @media(max-width:768px){
-      /* ── COMPACT COCKPIT: avatar (left) + brain panel (right) ── */
+      /* ── VERTICAL SCROLL COCKPIT — pig hero at top, all panels accessible ── */
 
       /* Header: compact */
       .hdr-logo-name{display:none!important;}
@@ -2030,54 +2030,62 @@ export default function Home() {
       .hdr-eng{display:none!important;}
       .ticker-btn{padding:3px 7px!important;font-size:10px!important;}
 
-      /* Scrollable main, tight padding */
-      .main-center{padding:8px!important;overflow-y:auto!important;overflow-x:hidden!important;}
-      /* Keep focus on the command center */
-      .main-center>*:not(.mb-row){display:none!important;}
+      /* main-center: single column, full vertical scroll, all panels visible */
+      .main-center{padding:8px!important;overflow-y:auto!important;overflow-x:hidden!important;gap:10px!important;}
 
-      /* mb-row: horizontal row, auto height */
+      /* mb-row: avatar stacks on top, brain panel below */
       .mb-row{
-        flex-direction:row!important;
-        gap:10px!important;
+        flex-direction:column!important;
+        gap:0!important;
         min-height:unset!important;
         height:auto!important;
         margin-bottom:0!important;
-        align-items:flex-start!important;
-        justify-content:flex-start!important;
+        align-items:center!important;
       }
 
-      /* mc-stage: trim to just the avatar (hide card rows + telemetry cols) */
-      .mc-stage{flex-shrink:0!important;flex:unset!important;width:unset!important;}
+      /* mc-stage: centered column, hide telemetry cards */
+      .mc-stage{width:100%!important;align-items:center!important;display:flex!important;flex-direction:column!important;}
       .mc-top-row{display:none!important;}
       .mc-bot-row{display:none!important;}
       .mc-col{display:none!important;}
-      .mc-mid-row{flex:unset!important;gap:0!important;align-items:flex-start!important;}
+      .mc-mid-row{flex:unset!important;gap:0!important;justify-content:center!important;align-items:flex-start!important;}
 
-      /* Avatar: 342×455 canvas scaled to 0.41 → 140×187px visible window */
+      /* Avatar hero: 342×455 → scale(0.52) → 178×237px visible, centered */
       .mc-avtr-outer{
-        width:140px!important;height:190px!important;
+        width:178px!important;height:237px!important;
         overflow:hidden!important;
         flex:unset!important;flex-shrink:0!important;
-        align-self:flex-start!important;
         align-items:flex-start!important;justify-content:flex-start!important;
       }
       .mc-avtr-box{
-        transform:scale(0.41)!important;
+        transform:scale(0.52)!important;
         transform-origin:top left!important;
       }
 
-      /* Overlay not needed in cockpit layout */
+      /* Corner overlays sit on top of the pig — hide on mobile */
+      .avtr-corner-sat{display:none!important;}
+
+      /* Full-screen overlay not used in this layout */
       .mob-avtr-overlay{display:none!important;}
 
-      /* Brain panel: visible, fills remaining width */
+      /* Brain panel: full width, vertical column below the avatar */
       .mb-brain{
-        display:flex!important;flex:1!important;min-width:0!important;
-        gap:8px!important;justify-content:flex-start!important;
+        display:flex!important;flex:unset!important;
+        width:100%!important;min-width:0!important;
+        gap:10px!important;justify-content:flex-start!important;
+        padding:8px 0 0!important;
       }
-      .verdict-big{font-size:19px!important;letter-spacing:-0.01em!important;}
-      .verdict-sub{font-size:11px!important;margin-top:2px!important;}
+      .verdict-big{font-size:28px!important;letter-spacing:-0.02em!important;}
+      .verdict-sub{font-size:14px!important;margin-top:3px!important;}
       .edge-wrap{max-width:unset!important;}
       .wait-box{font-size:10px!important;padding:6px 8px!important;}
+
+      /* intel-strip: 2-column wrap grid so all 4 info panels are readable */
+      .intel-strip{flex-wrap:wrap!important;gap:8px!important;margin-bottom:10px!important;}
+      .intel-strip>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;flex:unset!important;}
+
+      /* Quick chips: wrap freely */
+      .quick-chips{gap:5px!important;margin-bottom:10px!important;}
     }
     /* Hidden on desktop, shown on mobile */
     .mob-avtr-overlay{display:none;}
@@ -2488,7 +2496,7 @@ export default function Home() {
                       const px  = Number(data?.price || 0);
                       const pct = dem > 0 && px > 0 ? ((px - dem) / px * 100).toFixed(1) : null;
                       return dem > 0 ? (
-                        <div style={{ position:'absolute', top:14, left:4, zIndex:2, pointerEvents:'none' }}>
+                        <div className="avtr-corner-sat" style={{ position:'absolute', top:14, left:4, zIndex:2, pointerEvents:'none' }}>
                           <CornerSat label="Support" col={BULL} value={fmt(dem)}
                             sub={pct ? `${pct}% below price` : 'Demand zone'} />
                         </div>
@@ -2501,7 +2509,7 @@ export default function Home() {
                       const px  = Number(data?.price || 0);
                       const pct = sup > 0 && px > 0 ? ((sup - px) / px * 100).toFixed(1) : null;
                       return sup > 0 ? (
-                        <div style={{ position:'absolute', top:14, right:4, zIndex:2, pointerEvents:'none' }}>
+                        <div className="avtr-corner-sat" style={{ position:'absolute', top:14, right:4, zIndex:2, pointerEvents:'none' }}>
                           <CornerSat label="Resistance" col={BEAR} align="right" value={fmt(sup)}
                             sub={pct ? `${pct}% above price` : 'Supply zone'} />
                         </div>
@@ -2520,7 +2528,7 @@ export default function Home() {
                         : evt ? 'Imminent' : '';
                       const evtCol = /high/.test(impact) ? BEAR : /medium/.test(impact) ? AMB : 'rgba(255,255,255,0.60)';
                       return (
-                        <div style={{ position:'absolute', bottom:14, left:4, zIndex:2, pointerEvents:'none' }}>
+                        <div className="avtr-corner-sat" style={{ position:'absolute', bottom:14, left:4, zIndex:2, pointerEvents:'none' }}>
                           <CornerSat label="Next Event"
                             col={title ? evtCol : 'rgba(255,255,255,0.32)'}
                             value={title || 'No Events'}
@@ -2540,7 +2548,7 @@ export default function Home() {
                       const wr    = total > 0 ? Math.round(wins / total * 100) : null;
                       const col   = wins > loss ? BULL : loss > wins ? BEAR : 'rgba(255,255,255,0.68)';
                       return (
-                        <div style={{ position:'absolute', bottom:14, right:4, zIndex:2, pointerEvents:'none' }}>
+                        <div className="avtr-corner-sat" style={{ position:'absolute', bottom:14, right:4, zIndex:2, pointerEvents:'none' }}>
                           <CornerSat label="Today" align="right"
                             col={total > 0 ? col : 'rgba(255,255,255,0.32)'}
                             value={total > 0 ? `${wins}W  ${loss}L` : 'No Trades'}
