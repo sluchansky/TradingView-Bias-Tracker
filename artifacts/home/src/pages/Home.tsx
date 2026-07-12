@@ -2130,16 +2130,18 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
-    /* Desktop layout: avatar TRUE-CENTER via 3-col CSS Grid */
+    /* Desktop layout: avatar LEFT (294px, CSS-scaled 70%) + brain content fills RIGHT */
     @media(min-width:769px){
       .main-center{zoom:1;}
       .mc-col{display:none!important;}
-      .mb-row{display:grid!important;grid-template-columns:1fr auto 1fr!important;align-items:start!important;}
-      .mb-brain{grid-column:1;min-width:0;order:unset;}
-      .mc-stage{grid-column:2;display:flex!important;flex-direction:column!important;align-items:center!important;order:unset;}
-      .mc-mid-row{justify-content:center;width:100%;}
-      .verdict-big{font-size:46px!important;letter-spacing:-0.03em!important;}
-      .verdict-sub{font-size:24px!important;margin-top:6px!important;}
+      .mb-row{display:flex!important;flex-direction:row!important;gap:20px!important;align-items:flex-start!important;min-height:unset!important;}
+      .mb-brain{flex:1!important;min-width:0!important;grid-column:unset!important;}
+      .mc-stage{flex:0 0 294px!important;width:294px!important;display:flex!important;flex-direction:column!important;align-items:flex-start!important;grid-column:unset!important;}
+      .mc-avtr-outer{width:294px!important;height:392px!important;overflow:hidden!important;align-items:flex-start!important;justify-content:flex-start!important;flex-shrink:0!important;}
+      .mc-avtr-box{transform:scale(0.70)!important;transform-origin:top left!important;}
+      .mc-mid-row{width:294px!important;justify-content:flex-start!important;}
+      .verdict-big{font-size:36px!important;letter-spacing:-0.03em!important;}
+      .verdict-sub{font-size:17px!important;margin-top:5px!important;}
       .edge-wrap{max-width:unset!important;}
     }
     .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
@@ -2450,7 +2452,7 @@ export default function Home() {
           )}
 
           {/* ── MAIN BRAIN COMMAND CENTER ───────────────────────────────── */}
-          <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:420,
+          <div className="mb-row" style={{ display:'flex', gap:20, marginBottom:20,
             position:'relative',
             background:`radial-gradient(ellipse 820px 660px at 38% 48%, ${auraColor}0e 0%, transparent 68%)` }}>
 
@@ -2518,7 +2520,7 @@ export default function Home() {
                 </div>
 
                 {/* AVATAR SPOTLIGHT CENTER */}
-                <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', flexShrink:0, overflow:'hidden' }}>
+                <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'flex-start', justifyContent:'flex-start', flexShrink:0, overflow:'hidden' }}>
                   <div className="mc-avtr-box" style={{ position:'relative', width:420, height:560, flexShrink:0 }}>
                     {/* Far-field halo — contained within avtr-outer, no bleed into adjacent cards */}
                     <div style={{ position:'absolute', top:0, left:0, right:0, bottom:0,
@@ -2809,7 +2811,7 @@ export default function Home() {
             </div>
 
             {/* Brain content */}
-            <div className="mb-brain" style={{ flex:1, display:'flex', flexDirection:'column', gap:14, justifyContent:'center', minWidth:0 }}>
+            <div className="mb-brain" style={{ flex:1, display:'flex', flexDirection:'column', gap:14, justifyContent:'flex-start', minWidth:0 }}>
 
               {/* BIG VERDICT */}
               <div>
