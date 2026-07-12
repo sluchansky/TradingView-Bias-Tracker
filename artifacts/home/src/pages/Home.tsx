@@ -389,6 +389,9 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
     let lipCorner   = 0;     // corner Y offset — neg = smile lift, pos = frown drop
     let lipWidth    = 0;     // extra half-width when speaking (widens with energy)
     let lipUpperV   = -3.2;  // Cupid's bow peak height relative to mouth Y (always neg)
+    let smoothPX    = 0;     // exponentially smoothed pointer X (-1..1)
+    let smoothPY    = 0;     // exponentially smoothed pointer Y (-1..1)
+    const ptr       = { x: 0, y: 0 }; // raw pointer — written by event handlers
 
     const draw = () => {
       const elapsed = Date.now() - t0;
@@ -453,6 +456,13 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       const idleNod = Math.sin(elapsed * 0.00037 + 1.9) * 0.006
                     + Math.sin(elapsed * 0.00059 + 3.2) * 0.003;
 
+      // ── Pointer parallax — slow-follow smoothing then derive per-layer offsets ──
+      smoothPX += (ptr.x - smoothPX) * 0.052;
+      smoothPY += (ptr.y - smoothPY) * 0.052;
+      const prlxX   =  smoothPX * 4.2;    // face lateral shift toward pointer
+      const prlxY   =  smoothPY * 2.8;    // face vertical shift
+      const prlxRot = -smoothPX * 0.038;  // face rotates slightly toward pointer side
+
       // ── Eye scan (pupil drift) — speed/amplitude keyed from AV_EXPR ─────────────
       const scanSpeed  = expr.scanSpd;
       const scanAmpX   = expr.scanAX;
@@ -489,9 +499,9 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       }
       microDx *= 0.93; microDy *= 0.93; // fast exponential decay back to center
 
-      // Blend scan + gaze event + microsaccade tremor; widen on gaze event
-      const finalOffX   = eyeOffX * (1 - gazeLerp) + gz.dx * gazeLerp + microDx;
-      const finalOffY   = eyeOffY * (1 - gazeLerp) + gz.dy * gazeLerp + microDy;
+      // Blend scan + gaze event + microsaccade tremor + pointer gaze; widen on event
+      const finalOffX   = eyeOffX * (1 - gazeLerp) + gz.dx * gazeLerp + microDx + smoothPX * 2.0;
+      const finalOffY   = eyeOffY * (1 - gazeLerp) + gz.dy * gazeLerp + microDy + smoothPY * 1.3;
       const widenFactor = gz.widen && gazeLerp > 0.05 ? 1 + 0.28 * gazeLerp : 1.0;
 
       // ── Expression parameters — all driven by AV_EXPR table ─────────────────────
@@ -518,6 +528,23 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       pupilAnimR += (pupilTgt - pupilAnimR) * pupilSmth;
 
       ctx.clearRect(0, 0, W, H);
+
+      // ── Depth atmosphere: background scatter + face hover shadow ─────────────────
+      // Scattered light shifts OPPOSITE to pointer → bg stays, face comes forward
+      const atmX = CX - smoothPX * 9, atmY = CY - smoothPY * 6;
+      const atmG = ctx.createRadialGradient(atmX, atmY, 0, atmX, atmY, 190);
+      atmG.addColorStop(0,    rc(cfg.eye,  0.055 + Math.abs(smoothPX) * 0.028));
+      atmG.addColorStop(0.40, rc(cfg.mesh, 0.034));
+      atmG.addColorStop(1,    'rgba(0,0,0,0)');
+      ctx.fillStyle = atmG; ctx.fillRect(0, 0, W, H);
+      // Hover shadow: soft dark halo that makes the face appear to float
+      const hvX = CX + smoothPX * 1.8, hvY = CY + bob + smoothPY * 1.2;
+      const hvG = ctx.createRadialGradient(hvX, hvY, 0, hvX, hvY, RX * 1.32);
+      hvG.addColorStop(0,    rc([0, 0, 0], 0.50));
+      hvG.addColorStop(0.52, rc([0, 0, 0], 0.18));
+      hvG.addColorStop(1,    'rgba(0,0,0,0)');
+      ctx.beginPath(); ctx.ellipse(hvX, hvY + 6, RX * 1.26, RY * 0.90, 0, 0, Math.PI * 2);
+      ctx.fillStyle = hvG; ctx.fill();
 
       // Ambient bg radial glow — alpha breathes on a slow independent cycle
       const ambBreath = 0.78 + 0.22 * Math.sin(elapsed * 0.00064 + 1.4);
@@ -561,11 +588,11 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.fillStyle = rc(cfg.mesh, p * 0.65 * cfg.dim); ctx.fill();
       });
 
-      // ── Head tilt + body sway — face shifts; outer rings/particles stay fixed ────
+      // ── Head tilt + sway + pointer parallax — bg rings/particles stay fixed ───────
       ctx.save();
-      ctx.translate(idleSwayX, idleSwayY);  // body sway shifts entire face
+      ctx.translate(idleSwayX + prlxX, idleSwayY + prlxY);  // sway + parallax
       ctx.translate(CX, CY + bob);
-      ctx.rotate(headTilt + idleNod);       // state tilt + idle micro head-nod
+      ctx.rotate(headTilt + idleNod + prlxRot);              // tilt + nod + pointer
       ctx.translate(-CX, -(CY + bob));
 
       // ── Face fill — cinematic 3-point lighting over dark volumetric base ────────
@@ -577,11 +604,12 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       faceBase.addColorStop(0.42, rc([12, 18, 46], 0.97));
       faceBase.addColorStop(1,    rc([4,  6,  24], 0.99));
       ctx.fillStyle = faceBase; ctx.fillRect(0, 0, W, H);
-      // Key light — upper-left warm tint; source drifts slowly for ambient life
-      const kLx = CX - 30 + Math.sin(elapsed * 0.00046) * 5;
-      const kLy = CY + bob - 62 + Math.sin(elapsed * 0.00071 + 1.8) * 3;
+      // Key light — drifts with idle + pulled toward pointer (lit from viewer's side)
+      const kLx = CX - 30 + Math.sin(elapsed * 0.00046) * 5 + smoothPX * 24;
+      const kLy = CY + bob - 62 + Math.sin(elapsed * 0.00071 + 1.8) * 3 + smoothPY * 15;
+      const kA  = Math.max(0.24, Math.min(0.64, 0.44 - smoothPX * 0.18));
       const keyL = ctx.createRadialGradient(kLx, kLy, 6, CX - 10, CY + bob - 14, RX * 0.92);
-      keyL.addColorStop(0,    rc(cfg.mesh, 0.44));
+      keyL.addColorStop(0,    rc(cfg.mesh, kA));
       keyL.addColorStop(0.50, rc(cfg.mesh, 0.14));
       keyL.addColorStop(1,    'rgba(0,0,0,0)');
       ctx.fillStyle = keyL; ctx.fillRect(0, 0, W, H);
@@ -961,6 +989,15 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       ctx.restore(); // end head tilt transform
 
+      // ── Subsurface scatter — face emits soft coloured light into surrounding space
+      const ssX = CX + prlxX * 0.42, ssY = CY + bob + prlxY * 0.32;
+      const ssG = ctx.createRadialGradient(ssX, ssY, RX * 0.66, ssX, ssY, RX * 1.62);
+      ssG.addColorStop(0,    'rgba(0,0,0,0)');
+      ssG.addColorStop(0.50, rc(cfg.mesh, 0.072 * cfg.dim));
+      ssG.addColorStop(0.78, rc(cfg.eye,  0.048 * cfg.dim));
+      ssG.addColorStop(1,    'rgba(0,0,0,0)');
+      ctx.fillStyle = ssG; ctx.fillRect(0, 0, W, H);
+
       // ── Speaking pulse ring — soft aura that breathes with voice energy ─────────
       if (spk && spkEnergy > 0.0) {
         const spkPulse = 0.55 + 0.45 * Math.sin(elapsed * 0.0040);
@@ -988,15 +1025,20 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         });
       }
 
-      // ── Orbiting particles (speed tied to state energy) ───────────────────────
+      // ── Orbiting particles — depth parallax: outer = further back, shift opposite
       const effectivePartMult = isListening ? partMult * 0.28 : partMult;
       partRef.current.forEach(p => {
         p.angle += p.speed * 0.008 * effectivePartMult;
         const qx = CX + Math.cos(p.angle) * p.r;
         const qy = CY + Math.sin(p.angle) * p.r * 0.72 + bob;
+        // pD=0 → inner (close, moves with face); pD=1 → outer (far, shifts opposite)
+        const pD  = Math.min(1, Math.max(0, (p.r - RX * 1.18) / (RX * 0.48)));
+        const pqx = qx - smoothPX * (1.2 + pD * 5.8);
+        const pqy = qy - smoothPY * (0.8 + pD * 3.8);
         const partAmb = 0.86 + 0.14 * Math.sin(elapsed * 0.00088 + p.phase * 0.4);
-        const a  = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim * partAmb;
-        ctx.beginPath(); ctx.arc(qx, qy, p.sz, 0, Math.PI * 2);
+        const pAlpha = 1 - pD * 0.28;
+        const a  = (0.22 + 0.55 * Math.abs(Math.sin(elapsed * 0.0028 + p.phase))) * cfg.dim * partAmb * pAlpha;
+        ctx.beginPath(); ctx.arc(pqx, pqy, p.sz * (1 - pD * 0.22), 0, Math.PI * 2);
         ctx.fillStyle = rc(cfg.mesh, a); ctx.fill();
       });
 
@@ -1024,11 +1066,36 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       ctx.strokeStyle = rHex; ctx.lineWidth = 1.8; ctx.stroke();
       ctx.restore();
 
+      // ── Canvas edge vignette — depth tunnel; face floats inside the screen ───────
+      const vigCX = CX + prlxX * 0.20, vigCY = CY + prlxY * 0.16 + bob;
+      const vigG  = ctx.createRadialGradient(vigCX, vigCY, RX * 0.50, vigCX, vigCY, 202);
+      vigG.addColorStop(0,    'rgba(0,0,0,0)');
+      vigG.addColorStop(0.58, 'rgba(0,0,0,0)');
+      vigG.addColorStop(1,    'rgba(0,0,0,0.58)');
+      ctx.fillStyle = vigG; ctx.fillRect(0, 0, W, H);
+
       animRef.current = requestAnimationFrame(draw);
     };
 
+    // Pointer tracking — mousemove on desktop, deviceorientation on mobile
+    const onMouse = (e: MouseEvent) => {
+      const r = canvas.getBoundingClientRect();
+      ptr.x = Math.max(-1, Math.min(1, (e.clientX - r.left  - r.width  * 0.5) / (r.width  * 0.5)));
+      ptr.y = Math.max(-1, Math.min(1, (e.clientY - r.top   - r.height * 0.5) / (r.height * 0.5)));
+    };
+    const onTilt = (e: DeviceOrientationEvent) => {
+      if (e.gamma == null) return;
+      ptr.x = Math.max(-1, Math.min(1, e.gamma / 18));
+      ptr.y = Math.max(-1, Math.min(1, ((e.beta ?? 45) - 45) / 22));
+    };
+    window.addEventListener('mousemove', onMouse);
+    window.addEventListener('deviceorientation', onTilt);
     animRef.current = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(animRef.current);
+    return () => {
+      cancelAnimationFrame(animRef.current);
+      window.removeEventListener('mousemove', onMouse);
+      window.removeEventListener('deviceorientation', onTilt);
+    };
   }, []); // init once — state/speaking via refs
 
   return (
