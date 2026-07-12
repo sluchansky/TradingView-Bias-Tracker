@@ -607,6 +607,199 @@ function EdgeBar({ score, max = 110, color = BLUE }: { score: number; max?: numb
   );
 }
 
+// ── Live Thought Stream ────────────────────────────────────────────────────────
+interface StreamEntry { id: number; text: string; }
+const MAX_STREAM = 5;
+
+function getThoughtPool(
+  data: any, status: string, edge: number, ticker: string,
+  sig: Record<string,any>, ad: Record<string,any>, gd: Record<string,any>
+): string[] {
+  const pool: string[] = [];
+  const price   = Number(data?.price           || 0);
+  const vwap    = Number(data?.vwap_value       || 0);
+  const demand  = Number(data?.nearest_demand   || 0);
+  const supply  = Number(data?.nearest_supply   || 0);
+  const cvd     = String(sig.cvd  || ad.cvd     || '').toLowerCase();
+  const vol     = String(ad.volume              || '').toLowerCase();
+  const vReg    = String(ad.volatility_regime   || '').toLowerCase();
+  const bias    = String(sig.bias               || '').toLowerCase();
+  const struct  = !!(gd.structure_confirmed);
+  const zone    = !!(gd.zone_valid);
+  const hasPlan = !!(data?.trade_plan?.entry && Number(data?.trade_plan?.entry) > 0);
+
+  // Baseline observations — always present
+  pool.push(`Watching ${ticker} tape...`);
+  pool.push('Scanning for liquidity sweeps at key levels...');
+  pool.push('Monitoring institutional order flow...');
+  pool.push('Watching overnight liquidity for early reaction...');
+  pool.push('Tracking smart money positioning ahead of key levels...');
+
+  // VWAP relationship
+  if (price > 0 && vwap > 0) {
+    if (price > vwap * 1.001)      pool.push(`Price holding above VWAP at ${fmt(vwap)} — bullish intraday structure...`);
+    else if (price < vwap * 0.999) pool.push(`VWAP ${fmt(vwap)} still rejecting buyers — bearish lean...`);
+    else                            pool.push(`Price coiling around VWAP ${fmt(vwap)} — watching for direction...`);
+  }
+
+  // Structure
+  if (struct) {
+    pool.push('Structure break confirmed — tracking the developing move...');
+    pool.push('BOS established — waiting for retest or continuation...');
+  } else {
+    pool.push('No confirmed BOS or CHOCH yet — waiting for structural clarity...');
+    pool.push('Watching for a clean market structure shift before considering entry...');
+  }
+
+  // Zone
+  if (zone && demand > 0) pool.push(`Demand zone active at ${fmt(demand)} — watching for buyer reaction...`);
+  else if (zone)           pool.push('Demand zone present — watching for buyer confirmation...');
+  else                     pool.push('No significant demand zone in immediate range...');
+  if (supply > 0)          pool.push(`Supply cluster at ${fmt(supply)} — potential overhead resistance...`);
+
+  // CVD / delta
+  if (/bull|pos/.test(cvd))      pool.push('Buying pressure accumulating in cumulative delta...');
+  else if (/bear|neg/.test(cvd)) pool.push('Delta turning bearish — watching for sellers to take control...');
+  else                            pool.push('Delta neutral — waiting for directional commitment...');
+
+  // Volume
+  if (/strong|high|incr/.test(vol)) {
+    pool.push('Strong institutional volume entering the tape...');
+    pool.push('Volume surge detected — smart money is active...');
+  } else if (/low|thin|decr/.test(vol)) {
+    pool.push('Volume remains below session average...');
+    pool.push('Thin participation — waiting for volume to confirm before entry...');
+  } else {
+    pool.push('Volume at session average — monitoring for a surge...');
+  }
+
+  // Edge score
+  if (edge >= 75) {
+    pool.push(`Edge elevated at ${edge}/110 — setup is strengthening...`);
+    pool.push('Confidence increasing as conditions align...');
+  } else if (edge >= 55) {
+    pool.push(`Edge building at ${edge}/110 — alignment improving...`);
+    pool.push('Watching for the final piece to confirm the setup...');
+  } else {
+    pool.push(`Edge at ${edge}/110 — multiple conditions still open...`);
+    pool.push('Waiting for higher-probability alignment before sizing in...');
+  }
+
+  // Status-specific
+  if (status === 'WAIT') {
+    pool.push('Standing aside — capital preservation is a position...');
+    pool.push('Not every minute needs a trade. Patience is the edge...');
+    pool.push('Waiting for the right setup rather than forcing one...');
+    pool.push('Looking for aggressive buying pressure to develop...');
+    pool.push('Waiting for liquidity sweep before committing...');
+  } else if (status === 'READY') {
+    pool.push('Setup criteria met — monitoring for optimal entry timing...');
+    pool.push('All systems aligned — ready to execute on confirmation...');
+    if (hasPlan) pool.push('Trade plan locked in — watching for the trigger...');
+  } else if (status === 'MANAGING') {
+    pool.push('Position open — managing strictly to the original plan...');
+    pool.push('Monitoring price action against the thesis...');
+    pool.push('Watching for thesis invalidation signals...');
+    pool.push('Letting the trade breathe — no early exits...');
+  }
+
+  // Bias
+  if (/bull/.test(bias)) {
+    pool.push('Bullish bias intact — focusing exclusively on long setups...');
+    pool.push('Looking for aggressive buying at key support levels...');
+  } else if (/bear/.test(bias)) {
+    pool.push('Bearish pressure building — favoring short setups...');
+    pool.push('Watching for failed rallies into supply zones...');
+  } else {
+    pool.push('Bias neutral — waiting for directional conviction to develop...');
+  }
+
+  // Volatility regime
+  if (/extreme/.test(vReg)) {
+    pool.push('Volatility extreme — strict risk management protocols active...');
+    pool.push('Wide ranges — reducing position sizing accordingly...');
+  } else if (/elev/.test(vReg)) {
+    pool.push('Elevated volatility — keeping stops proportionally wide...');
+  } else if (/quiet|low/.test(vReg)) {
+    pool.push('Quiet tape — compression often precedes expansion...');
+    pool.push('Low volatility environment — watching for breakout potential...');
+  }
+
+  // Contextual fillers — always available
+  pool.push('Looking for aggressive buying or selling to confirm direction...');
+  pool.push('Potential demand forming below current price...');
+
+  return pool;
+}
+
+function useThoughtStream(pool: string[]): StreamEntry[] {
+  const [stream, setStream] = useState<StreamEntry[]>([]);
+  const idRef    = useRef(0);
+  const poolRef  = useRef<string[]>(pool);
+  const usedRef  = useRef<Set<string>>(new Set());
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep pool ref current — timer closure always sees fresh thoughts
+  useEffect(() => { poolRef.current = pool; }, [pool]);
+
+  const addThought = useCallback(() => {
+    const p      = poolRef.current;
+    if (p.length === 0) return;
+    const unused = p.filter(t => !usedRef.current.has(t));
+    const src    = unused.length > 0 ? unused : p;
+    const text   = src[Math.floor(Math.random() * src.length)];
+    usedRef.current.add(text);
+    if (usedRef.current.size >= p.length) usedRef.current.clear();
+    setStream(prev => [...prev, { id: idRef.current++, text }].slice(-MAX_STREAM));
+  }, []);
+
+  const scheduleNext = useCallback(() => {
+    const delay = 5800 + Math.floor(Math.random() * 3400);
+    timerRef.current = setTimeout(() => { addThought(); scheduleNext(); }, delay);
+  }, [addThought]);
+
+  // Seed with 3 random thoughts on mount, then start cycling
+  useEffect(() => {
+    const p    = poolRef.current;
+    const seed = [...p].sort(() => 0.5 - Math.random()).slice(0, 3);
+    setStream(seed.map(text => { usedRef.current.add(text); return { id: idRef.current++, text }; }));
+    scheduleNext();
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return stream;
+}
+
+function ThoughtStream({ stream }: { stream: StreamEntry[] }) {
+  const OPACITIES = [1, 0.52, 0.28, 0.12, 0.05];
+  const SIZES     = [15, 14.5, 14, 14, 13.5];
+  return (
+    <div style={{ display:'flex', flexDirection:'column', justifyContent:'flex-end',
+      minHeight:130, maxWidth:560, overflow:'hidden', gap:0 }}>
+      {stream.map((entry, i) => {
+        const age     = stream.length - 1 - i; // 0 = newest
+        const opacity = OPACITIES[age] ?? 0.04;
+        const fsz     = SIZES[age]     ?? 13.5;
+        const isNew   = age === 0;
+        return (
+          <div key={entry.id} style={{
+            fontSize: fsz, lineHeight: 1.65,
+            color: `rgba(255,255,255,${opacity})`,
+            fontFamily: 'inherit', letterSpacing: '0.01em',
+            padding: '1.5px 0',
+            animation: isNew ? 'tsIn 0.55s cubic-bezier(0.22,1,0.36,1)' : undefined,
+            transition: 'opacity 1.6s ease',
+            willChange: 'opacity',
+          }}>
+            {entry.text}
+            {isNew && <span style={{ opacity:0.32, animation:'bDot 1.1s infinite', marginLeft:3 }}>▌</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Session Memory Engine ──────────────────────────────────────────────────────
 const MEM_KEY = 'atp_session_v2';
 function getToday() { return new Date().toISOString().slice(0, 10); }
@@ -1071,6 +1264,13 @@ export default function Home() {
   const mem = useSessionMemory(status, edge, ticker, strictR);
   const briefingText = generateBriefing(mem.yest, mem.wkPeak, mem.active, mem.mcWR);
 
+  // Live thought stream — pool refreshes every poll; timer cycles thoughts every ~6-9s
+  const thoughtPool      = useMemo(
+    () => getThoughtPool(data, status, edge, ticker, sig, ad, gd),
+    [data, status, edge, ticker] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const streamedThoughts = useThoughtStream(thoughtPool);
+
   const narration = (
     voice_d.narration ||
     (mb.synthesis as any)?.narrative ||
@@ -1202,6 +1402,7 @@ export default function Home() {
     @keyframes glow    { 0%,100%{opacity:.65} 50%{opacity:1} }
     @keyframes avrPulse{ 0%,100%{opacity:.18;transform:scale(1)} 50%{opacity:.55;transform:scale(1.04)} }
     @keyframes slideIn { from{opacity:0;transform:translateX(-8px)} to{opacity:1;transform:translateX(0)} }
+    @keyframes tsIn    { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
     ::-webkit-scrollbar { width:3px; height:3px; }
     ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.07); border-radius:2px; }
     ::-webkit-scrollbar-track { background:transparent; }
@@ -1620,11 +1821,8 @@ export default function Home() {
                 <EdgeBar score={edge} max={110} color={verdictColor} />
               </div>
 
-              {/* Spoken message — large */}
-              <div className="narration" style={{ fontSize:16, lineHeight:1.65, color:'rgba(255,255,255,0.78)', maxWidth:560, minHeight:52,
-                letterSpacing:'0.01em' }}>
-                {displayed || (loading ? '' : '…')}{streaming && <span style={{ opacity:0.4, animation:'bDot 0.8s infinite' }}>▌</span>}
-              </div>
+              {/* Live thought stream — replaces static narration */}
+              <ThoughtStream stream={streamedThoughts} />
 
               {/* Wait reason */}
               {strictR && status === 'WAIT' && (
