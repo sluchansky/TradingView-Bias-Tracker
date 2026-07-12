@@ -96,17 +96,25 @@ function makeL01_Background(): Layer {
   return {
     name: 'Background',
     draw(ctx, { W, H, CX, CY, elapsed, eyeCol, glowAmt }) {
-      const bgG = ctx.createRadialGradient(CX, CY * 0.9, 0, CX, CY, 192);
-      bgG.addColorStop(0,    'rgba(6,10,28,1)');
-      bgG.addColorStop(0.52, 'rgba(3,5,16,1)');
-      bgG.addColorStop(1,    'rgba(0,0,8,1)');
+      // Soft oval backdrop — fades to fully transparent at canvas edges (no rectangular box)
+      const bgG = ctx.createRadialGradient(CX, CY * 0.88, 0, CX, CY, 158);
+      bgG.addColorStop(0,    'rgba(6,10,28,0.96)');
+      bgG.addColorStop(0.50, 'rgba(3,5,16,0.90)');
+      bgG.addColorStop(0.72, 'rgba(1,2,8,0.65)');
+      bgG.addColorStop(0.88, 'rgba(0,0,4,0.28)');
+      bgG.addColorStop(1,    'rgba(0,0,0,0)');
       ctx.fillStyle = bgG; ctx.fillRect(0, 0, W, H);
+      // Stars — only visible inside the soft backdrop oval (naturally faded at edges)
       stars.forEach(s => {
-        const t = 0.5 + 0.5 * Math.sin(elapsed * s.sp + s.ph);
+        const dx = s.x - CX, dy = s.y - CY;
+        const dist = Math.sqrt(dx * dx + dy * dy) / 155;
+        if (dist > 1) return;
+        const t    = 0.5 + 0.5 * Math.sin(elapsed * s.sp + s.ph);
+        const fade = Math.max(0, 1 - dist * dist);
         ctx.beginPath(); ctx.arc(s.x, s.y, s.r * t, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(200,220,255,${0.12 + t * 0.28})`; ctx.fill();
+        ctx.fillStyle = `rgba(200,220,255,${(0.10 + t * 0.24) * fade})`; ctx.fill();
       });
-      const fogG = ctx.createRadialGradient(CX + 28, 55, 0, CX + 28, 55, 135);
+      const fogG = ctx.createRadialGradient(CX + 28, 55, 0, CX + 28, 55, 120);
       fogG.addColorStop(0, rc(eyeCol, 0.038 * glowAmt));
       fogG.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = fogG; ctx.fillRect(0, 0, W, H);
@@ -245,6 +253,16 @@ function makeL04_HeadShape(): Layer {
   return {
     name: 'Head Shape',
     draw(ctx, { CX, CY, bob, MRX, MRY }) {
+      // Soft outer feather — blends the mask edge into the transparent background
+      const featherG = ctx.createRadialGradient(CX, CY + bob, MRX * 0.80, CX, CY + bob, MRX + 20);
+      featherG.addColorStop(0,    'rgba(5,6,16,0.95)');
+      featherG.addColorStop(0.35, 'rgba(3,4,12,0.75)');
+      featherG.addColorStop(0.65, 'rgba(1,2,8,0.35)');
+      featherG.addColorStop(0.85, 'rgba(0,0,4,0.12)');
+      featherG.addColorStop(1,    'rgba(0,0,0,0)');
+      ctx.beginPath(); ctx.ellipse(CX, CY + bob, MRX + 20, MRY + 24, 0, 0, Math.PI * 2);
+      ctx.fillStyle = featherG; ctx.fill();
+      // Hard mask body on top of the feather
       const mG = ctx.createRadialGradient(CX - 16, CY + bob - 38, 4, CX + 4, CY + bob + 12, MRY * 1.12);
       mG.addColorStop(0,    'rgba(16,20,40,0.98)');
       mG.addColorStop(0.38, 'rgba(9,12,26,0.99)');
