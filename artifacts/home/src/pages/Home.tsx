@@ -2526,6 +2526,57 @@ export default function Home() {
                           {String(narration).slice(0,88)}{String(narration).length > 88 ? '…' : ''}
                         </div>
                       )}
+
+                      {/* ── MOBILE ENTER BUTTON ───────────────────────── */}
+                      <div style={{ pointerEvents:'auto', display:'flex', gap:8, alignItems:'center', marginTop:4 }}>
+                        {tradeSent ? (
+                          <div style={{
+                            padding:'11px 28px', borderRadius:12,
+                            background: tradeSent.startsWith('✓') ? 'rgba(34,197,94,0.20)' : 'rgba(239,68,68,0.20)',
+                            color:      tradeSent.startsWith('✓') ? BULL : BEAR,
+                            border:    `1px solid ${tradeSent.startsWith('✓') ? BULL+'55' : BEAR+'55'}`,
+                            fontSize:14, fontWeight:800, fontFamily:'monospace', letterSpacing:'0.04em',
+                          }}>
+                            {tradeSent}
+                          </div>
+                        ) : (
+                          <>
+                            <button onClick={doEnter} style={{
+                              padding:'12px 32px', borderRadius:12, border:'none',
+                              cursor: isActionable || confirming ? 'pointer' : 'default',
+                              background: confirming
+                                ? 'rgba(239,68,68,0.28)'
+                                : isActionable
+                                ? `${verdictColor}2a`
+                                : 'rgba(255,255,255,0.06)',
+                              color: confirming ? '#ef4444' : isActionable ? verdictColor : 'rgba(255,255,255,0.22)',
+                              fontSize:15, fontWeight:900, fontFamily:'monospace', letterSpacing:'0.05em',
+                              boxShadow: confirming
+                                ? '0 0 28px rgba(239,68,68,0.45)'
+                                : isActionable
+                                ? `0 0 28px ${verdictColor}50`
+                                : 'none',
+                              transition:'all 0.18s',
+                            }}>
+                              {confirming
+                                ? '⚡ CONFIRM ENTRY'
+                                : isActionable
+                                ? (/short|bear/i.test(dirn) ? '▼ ENTER SHORT' : '▲ ENTER LONG')
+                                : 'WAITING FOR SETUP'}
+                            </button>
+                            {confirming && (
+                              <button onClick={() => setConfirming(false)} style={{
+                                padding:'12px 18px', borderRadius:12,
+                                border:'1px solid rgba(239,68,68,0.35)',
+                                background:'rgba(239,68,68,0.06)',
+                                color:BEAR, fontSize:13, fontFamily:'monospace', cursor:'pointer',
+                              }}>
+                                Cancel
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </div>
 
                   </div>
