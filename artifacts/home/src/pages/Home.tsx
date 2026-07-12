@@ -607,6 +607,87 @@ function EdgeBar({ score, max = 110, color = BLUE }: { score: number; max?: numb
   );
 }
 
+// ── Session Memory Engine ──────────────────────────────────────────────────────
+const MEM_KEY = 'atp_session_v2';
+function getToday() { return new Date().toISOString().slice(0, 10); }
+
+interface DayRec {
+  d: string;         // YYYY-MM-DD
+  pe: number;        // peak edge score
+  es: number;        // edge sum (for avg)
+  en: number;        // edge count (for avg)
+  su: number;        // READY signals seen
+  tr: number;        // MANAGING events seen (trades)
+  wr: Record<string, number>; // wait-reason histogram
+  tk: string;        // primary ticker
+}
+
+function loadMem(): DayRec[] {
+  try { const r = localStorage.getItem(MEM_KEY); return r ? (JSON.parse(r) as DayRec[]) : []; }
+  catch { return []; }
+}
+
+function generateBriefing(yest: DayRec | null, wkPeak: number, active: number, mcWR: string | null): string {
+  if (!yest && active === 0) return 'First session detected. Building my performance baseline from today — scanning for high-probability setups.';
+  const parts: string[] = [];
+  if (yest) {
+    const dn = new Date(yest.d + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' });
+    parts.push(`${dn}: peaked at ${Math.round(yest.pe)}/110 edge, ${yest.su} setup${yest.su !== 1 ? 's' : ''} identified${yest.tr > 0 ? `, ${yest.tr} trade${yest.tr !== 1 ? 's' : ''} executed` : ''}.`);
+  }
+  if (wkPeak > 0) parts.push(`Week best: ${Math.round(wkPeak)}/110 across ${active} active session${active !== 1 ? 's' : ''}.`);
+  if (mcWR) parts.push(`Recurring gap: "${mcWR.slice(0, 50)}" — giving this extra focus today.`);
+  else if (yest) parts.push('No recurring patterns yet — keeping analysis clean today.');
+  return parts.join(' ');
+}
+
+function useSessionMemory(status: string, edge: number, ticker: string, strictR: string) {
+  const td = getToday();
+
+  // Load historical records once on mount (lazy useState init)
+  const [initHist] = useState<DayRec[]>(() => loadMem().filter(r => r.d !== td));
+  const histRef   = useRef<DayRec[]>(initHist);
+  const recRef    = useRef<DayRec>({ d: td, pe: 0, es: 0, en: 0, su: 0, tr: 0, wr: {}, tk: ticker });
+  const prevStRef = useRef('');
+
+  // Update live record on each data tick
+  useEffect(() => {
+    const r = recRef.current;
+    r.en++; r.es += edge; r.tk = ticker;
+    if (edge > r.pe) r.pe = edge;
+    const ps = prevStRef.current;
+    if (status === 'READY'    && ps !== 'READY')    r.su++;
+    if (status === 'MANAGING' && ps !== 'MANAGING') r.tr++;
+    prevStRef.current = status;
+    if (status === 'WAIT' && strictR) { const k = strictR.slice(0, 50); r.wr[k] = (r.wr[k] || 0) + 1; }
+  }, [status, edge, ticker, strictR]);
+
+  // Persist to localStorage every 20s + on page unload
+  useEffect(() => {
+    const flush = () => {
+      const all = [...histRef.current, { ...recRef.current }];
+      try { localStorage.setItem(MEM_KEY, JSON.stringify(all.slice(-31))); } catch {}
+    };
+    const t = setInterval(flush, 20000);
+    window.addEventListener('beforeunload', flush);
+    return () => { clearInterval(t); window.removeEventListener('beforeunload', flush); flush(); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Derived — recomputed on every render (refs always current)
+  const all    = [...histRef.current, recRef.current].sort((a, b) => a.d.localeCompare(b.d));
+  const hist   = all.filter(r => r.d !== td);
+  const yest   = hist.length > 0 ? hist[hist.length - 1] : null;
+  const last7  = all.slice(-7);
+  const wkPeak = last7.reduce((s, r) => Math.max(s, r.pe), 0);
+  const active = last7.filter(r => r.en >= 3).length;
+  const mcWR   = (() => {
+    const agg: Record<string, number> = {};
+    last7.forEach(r => Object.entries(r.wr).forEach(([k, v]) => { agg[k] = (agg[k] || 0) + v; }));
+    return Object.entries(agg).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+  })();
+
+  return { live: recRef.current, yest, last7, wkPeak, active, mcWR };
+}
+
 // ── Satellite intelligence panel ───────────────────────────────────────────────
 function SatPanel({ label, children, style }: { label: string; children: React.ReactNode; style?: React.CSSProperties }) {
   return (
@@ -970,6 +1051,26 @@ export default function Home() {
   const gd  = (data?.gate_debug        || {}) as Record<string,any>;
   const eb  = (data?.edge_breakdown    || mb.edge_breakdown || {}) as Record<string,any>;
 
+  // ── Session memory ──────────────────────────────────────────────────────────
+  const todayStr = getToday();
+  const [showBriefing, setShowBriefing] = useState<boolean>(() => {
+    try { return !localStorage.getItem('atp_briefed_' + getToday()); } catch { return false; }
+  });
+  useEffect(() => {
+    if (!showBriefing) return;
+    const t = setTimeout(() => {
+      setShowBriefing(false);
+      try { localStorage.setItem('atp_briefed_' + getToday(), '1'); } catch {}
+    }, 16000);
+    return () => clearTimeout(t);
+  }, [showBriefing]);
+  const dismissBriefing = () => {
+    setShowBriefing(false);
+    try { localStorage.setItem('atp_briefed_' + getToday(), '1'); } catch {}
+  };
+  const mem = useSessionMemory(status, edge, ticker, strictR);
+  const briefingText = generateBriefing(mem.yest, mem.wkPeak, mem.active, mem.mcWR);
+
   const narration = (
     voice_d.narration ||
     (mb.synthesis as any)?.narrative ||
@@ -1137,6 +1238,8 @@ export default function Home() {
     @media(max-width:1000px){.sat-col{display:none!important;}.avtr-col{justify-content:center;}}
     @media(max-width:760px){.intel-strip{flex-wrap:wrap!important;}.intel-strip>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.intel-strip{display:none!important;}}
+    @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
+    @media(max-width:500px){.mem-panel{display:none!important;}}
   `;
 
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
@@ -1317,6 +1420,25 @@ export default function Home() {
 
         {/* ── MAIN CENTER ──────────────────────────────────────────────────── */}
         <div className="main-center" style={{ flex:1, overflowY:'auto', overflowX:'hidden', padding:'24px 28px 24px', display:'flex', flexDirection:'column', gap:0, minWidth:0 }}>
+
+          {/* ── SESSION BRIEFING — shows once per calendar day ──────────── */}
+          {showBriefing && (
+            <div style={{ display:'flex', gap:12, padding:'11px 15px', borderRadius:8, marginBottom:16,
+              background:'rgba(59,130,246,0.07)', border:'1px solid rgba(59,130,246,0.18)',
+              animation:'bUp 0.28s ease-out', flexShrink:0 }}>
+              <div style={{ fontSize:18, lineHeight:1.2, paddingTop:1 }}>🧠</div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(99,179,237,0.65)', letterSpacing:'0.12em', marginBottom:4, textTransform:'uppercase' }}>
+                  AI Session Briefing · {new Date().toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}
+                </div>
+                <div style={{ fontSize:11.5, color:'rgba(255,255,255,0.68)', lineHeight:1.58, fontFamily:'monospace' }}>
+                  {briefingText}
+                </div>
+              </div>
+              <button onClick={dismissBriefing} style={{ background:'none', border:'none', color:'rgba(255,255,255,0.28)',
+                cursor:'pointer', fontSize:18, padding:'0 3px', lineHeight:1, alignSelf:'flex-start', flexShrink:0 }}>×</button>
+            </div>
+          )}
 
           {/* ── MAIN BRAIN COMMAND CENTER ───────────────────────────────── */}
           <div className="mb-row" style={{ display:'flex', gap:28, marginBottom:20, minHeight:320 }}>
@@ -1589,6 +1711,96 @@ export default function Home() {
                 <SatPanel key="news" label="Next Event" style={{ flex:'1 1 0', minWidth:0 }}>
                   <div style={{ fontSize:10.5, fontWeight:700, color:'rgba(255,255,255,0.72)', fontFamily:'monospace', marginBottom:3 }}>{evTitle}</div>
                   <div style={{ fontSize:8.5, color:impCol, fontFamily:'monospace' }}>{imp} IMPACT</div>
+                </SatPanel>
+              );
+            })()}
+
+          </div>
+
+          {/* ── AI MEMORY & PERFORMANCE ──────────────────────────────────── */}
+          <div className="mem-panel" style={{ display:'flex', gap:8, marginBottom:14, minWidth:0 }}>
+
+            {/* Yesterday */}
+            {mem.yest && (
+              <SatPanel label="Yesterday" style={{ flex:'1 1 0', minWidth:0 }}>
+                <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
+                  color: mem.yest.pe >= 70 ? BULL : mem.yest.pe >= 50 ? AMB : MUTED }}>
+                  {Math.round(mem.yest.pe)}<span style={{ fontSize:9, fontWeight:400, opacity:0.55 }}>/110</span>
+                </div>
+                <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:3 }}>
+                  PEAK · {mem.yest.su} SETUP{mem.yest.su !== 1 ? 'S' : ''} · {mem.yest.tr} TRADE{mem.yest.tr !== 1 ? 'S' : ''}
+                </div>
+                <div style={{ fontSize:8, color:'rgba(255,255,255,0.20)', fontFamily:'monospace', marginTop:2 }}>
+                  {new Date(mem.yest.d + 'T12:00:00').toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric' })}
+                </div>
+              </SatPanel>
+            )}
+
+            {/* 7-day sparkline */}
+            {mem.last7.length >= 2 && (
+              <SatPanel label="7-Day Trend" style={{ flex:'1.8 1 0', minWidth:0 }}>
+                <div style={{ display:'flex', alignItems:'flex-end', gap:4, height:30 }}>
+                  {mem.last7.map((r, i) => {
+                    const h   = Math.max(3, Math.round((r.pe / 110) * 30));
+                    const isT = r.d === todayStr;
+                    const col = isT ? verdictColor : r.pe >= 70 ? BULL : r.pe >= 50 ? AMB : 'rgba(255,255,255,0.13)';
+                    return (
+                      <div key={i} title={`${r.d}: ${Math.round(r.pe)}/110 edge`}
+                        style={{ flex:1, height:h, borderRadius:2, background:col, opacity:isT?1:0.68,
+                          transition:'height 0.4s', cursor:'default' }} />
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize:8, color:MUTED, fontFamily:'monospace', marginTop:5 }}>
+                  WEEK BEST {Math.round(mem.wkPeak)}/110 · {mem.active} SESSION{mem.active !== 1 ? 'S' : ''}
+                </div>
+              </SatPanel>
+            )}
+
+            {/* Most common wait obstacle */}
+            {mem.mcWR && (
+              <SatPanel label="Recurring Gap" style={{ flex:'2 1 0', minWidth:0 }}>
+                <div style={{ fontSize:11, color:'rgba(255,255,255,0.65)', fontFamily:'monospace', lineHeight:1.45 }}>
+                  {mem.mcWR.length > 65 ? mem.mcWR.slice(0, 62) + '...' : mem.mcWR}
+                </div>
+                <div style={{ fontSize:8, color:MUTED, fontFamily:'monospace', marginTop:4 }}>MOST COMMON THIS WEEK — FOCUS AREA</div>
+              </SatPanel>
+            )}
+
+            {/* This session live */}
+            <SatPanel label="This Session" style={{ flex:'1 1 0', minWidth:0 }}>
+              <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
+                color: mem.live.pe >= 70 ? BULL : mem.live.pe >= 50 ? AMB : MUTED }}>
+                {Math.round(mem.live.pe)}<span style={{ fontSize:9, fontWeight:400, opacity:0.55 }}>/110</span>
+              </div>
+              <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:3 }}>
+                PEAK · {mem.live.su} SETUP{mem.live.su !== 1 ? 'S' : ''} · {mem.live.tr} TRADE{mem.live.tr !== 1 ? 'S' : ''}
+              </div>
+              {mem.live.en > 5 && (
+                <div style={{ fontSize:8, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', marginTop:2 }}>
+                  AVG {Math.round(mem.live.es / mem.live.en)}/110
+                </div>
+              )}
+            </SatPanel>
+
+            {/* Backend learning stats — shown if available in /status */}
+            {(() => {
+              const ls = data?.learning_engine || data?.per_mode_stats?.[ticker] || data?.adaptive_learning;
+              if (!ls || typeof ls !== 'object') return null;
+              const wr  = Number(ls.win_rate  ?? ls.winRate  ?? -1);
+              const tot = Number(ls.total_trades ?? ls.totalTrades ?? 0);
+              if (wr < 0 && tot === 0) return null;
+              return (
+                <SatPanel key="learn" label="Learning Engine" style={{ flex:'1 1 0', minWidth:0 }}>
+                  {wr >= 0 && (
+                    <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace',
+                      color: wr >= 0.55 ? BULL : wr >= 0.45 ? AMB : BEAR }}>
+                      {Math.round(wr * 100)}%
+                    </div>
+                  )}
+                  <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:wr >= 0 ? 3 : 0 }}>
+                    {wr >= 0 ? 'WIN RATE' : ''}{tot > 0 ? `${wr >= 0 ? ' · ' : ''}${tot} TRADE${tot !== 1 ? 'S' : ''}` : ''}
+                  </div>
                 </SatPanel>
               );
             })()}
