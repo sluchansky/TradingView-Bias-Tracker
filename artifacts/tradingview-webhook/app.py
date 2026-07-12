@@ -39443,7 +39443,7 @@ def dashboard():
     --radius:16px; --radius-sm:11px;
   }
   html{background:var(--bg)}
-  body{zoom:.55;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  body{zoom:.80;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
   .vw-bg{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
     background:
