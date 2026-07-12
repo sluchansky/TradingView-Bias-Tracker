@@ -380,6 +380,12 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       `rgba(${c[0]},${c[1]},${c[2]},${Math.max(0, Math.min(1, a))})`;
     const t0 = Date.now();
 
+    // Persistent per-frame animation state — closure variables survive between draw() calls
+    let pupilAnimR  = 4.6;   // smooth animated pupil radius (px)
+    let microDx     = 0;     // microsaccade tremor X offset
+    let microDy     = 0;     // microsaccade tremor Y offset
+    let microNextMs = 1800;  // elapsed ms timestamp of next microsaccade jump
+
     const draw = () => {
       const elapsed = Date.now() - t0;
       const sec     = elapsed / 1000;
@@ -402,14 +408,16 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       const meshSpeed = expr.meshSpd;
       const partMult  = expr.partMult;
 
-      // ── Random blink (2.5–8s interval, 0.20s duration) ───────────────────────
+      // ── Asymmetric blink — fast close (80ms), slower open (140ms) ───────────
       let blinkPct = 0;
       if (sec >= nextBlinkRef.current) {
         const bd = sec - nextBlinkRef.current;
-        if (bd < 0.20) {
-          blinkPct = Math.sin((bd / 0.20) * Math.PI);
+        const BC = 0.08, BO = 0.14;          // close duration / open duration
+        if (bd < BC + BO) {
+          const raw = bd < BC ? bd / BC : 1 - (bd - BC) / BO;
+          // Ease-in-out on close, ease-out on open for natural feel
+          blinkPct = raw < 0.5 ? 2 * raw * raw : 1 - 2 * (1 - raw) * (1 - raw);
         } else {
-          // Schedule next blink: shorter interval when ACTIVE (alert), longer when WAIT
           const minGap = expr.blinkMin;
           const maxGap = expr.blinkMax;
           nextBlinkRef.current = sec + minGap + Math.random() * (maxGap - minGap);
@@ -433,30 +441,41 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       const scanSpeed  = expr.scanSpd;
       const scanAmpX   = expr.scanAX;
       const scanAmpY   = expr.scanAY;
-      // While speaking: tighten scan to appear focused; add subtle speech-gaze sway
-      const scanScale  = spk ? 0.38 : 1.0;
-      const spkGazeX   = spk ? Math.sin(elapsed * 0.00078) * 2.6 : 0;
-      const spkGazeY   = spk ? Math.sin(elapsed * 0.00112 + 0.9) * 1.4 : 0;
-      const eyeOffX    = Math.sin(elapsed * scanSpeed) * scanAmpX * scanScale + spkGazeX;
-      const eyeOffY    = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY * scanScale + spkGazeY;
+      // While speaking: eyes focus on dashboard regions rather than free-scanning
+      const scanScale = spk ? 0.28 : 1.0;
+      // Dashboard focal points: price area (upper-left), status (right), chat (lower-left)
+      const spkFi  = Math.floor(elapsed / 2800) % 3;
+      const spkFX  = spkFi === 0 ? -1.4 : spkFi === 1 ? 0.9 : -0.4;
+      const spkFY  = spkFi === 0 ? -0.9 : spkFi === 1 ? -0.4 : 1.1;
+      const spkGazeX = spk ? spkFX * 2.0 + Math.sin(elapsed * 0.00055) * 0.45 : 0;
+      const spkGazeY = spk ? spkFY * 1.3 + Math.sin(elapsed * 0.00082) * 0.28 : 0;
+      const eyeOffX  = Math.sin(elapsed * scanSpeed) * scanAmpX * scanScale + spkGazeX;
+      const eyeOffY  = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY * scanScale + spkGazeY;
 
       // ── Market-event gaze blend ───────────────────────────────────────────────
-      // When a notable event fires (structure, sweep, READY, edge spike) the eyes
-      // saccade toward a target direction, hold, then smoothly return to idle scan.
       const gz     = gazeRef.current;
       const gzAge  = Date.now() - gz.t0;
-      const rampT  = 150;                      // ms — saccade rise time
-      const holdT  = gz.dur * 0.55;            // hold at target
-      const decayT = Math.max(1, gz.dur * 0.45); // ease back to scan
+      const rampT  = 150;
+      const holdT  = gz.dur * 0.55;
+      const decayT = Math.max(1, gz.dur * 0.45);
       let gazeLerp = 0;
       if (gz.dur > 0) {
         if (gzAge < rampT)               gazeLerp = gzAge / rampT;
         else if (gzAge < rampT + holdT)  gazeLerp = 1.0;
         else                             gazeLerp = Math.max(0, 1 - (gzAge - rampT - holdT) / decayT);
       }
-      // Blend scan offset with gaze target; widenFactor expands eyeRY briefly
-      const finalOffX   = eyeOffX * (1 - gazeLerp) + gz.dx * gazeLerp;
-      const finalOffY   = eyeOffY * (1 - gazeLerp) + gz.dy * gazeLerp;
+
+      // ── Microsaccades — tiny involuntary tremors every 0.8–2.8s ─────────────
+      if (elapsed > microNextMs) {
+        microDx = (Math.random() - 0.5) * 1.4;
+        microDy = (Math.random() - 0.5) * 0.8;
+        microNextMs = elapsed + 800 + Math.random() * 2000;
+      }
+      microDx *= 0.93; microDy *= 0.93; // fast exponential decay back to center
+
+      // Blend scan + gaze event + microsaccade tremor; widen on gaze event
+      const finalOffX   = eyeOffX * (1 - gazeLerp) + gz.dx * gazeLerp + microDx;
+      const finalOffY   = eyeOffY * (1 - gazeLerp) + gz.dy * gazeLerp + microDy;
       const widenFactor = gz.widen && gazeLerp > 0.05 ? 1 + 0.28 * gazeLerp : 1.0;
 
       // ── Expression parameters — all driven by AV_EXPR table ─────────────────────
@@ -472,6 +491,15 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       // Boost eye glow while speaking — keeps eyes alive and engaged
       const spkEnergy = spk ? (speechCtrlRef.current?.energy ?? 0) : 0;
       const eyeGlow   = expr.eyeGlow + (spk ? 7 + spkEnergy * 9 : 0);
+
+      // ── Animated pupil dilation — smooth exponential toward state target ──────
+      const eyeRYref  = 7.5 * expr.eyeOpen * widenFactor;
+      const pupilBase = Math.min(4.6, eyeRYref * 0.62) * pupilScale;
+      // Slow breathe pulse (±0.28px, ~7s period) layered on top of state target
+      const pupilTgt  = pupilBase + Math.sin(elapsed * 0.00088) * 0.28;
+      // ANALYZING dilates fast; ACTIVE contracts fast; other states glide slowly
+      const pupilSmth = s === 'ANALYZING' ? 0.055 : isActive ? 0.072 : 0.024;
+      pupilAnimR += (pupilTgt - pupilAnimR) * pupilSmth;
 
       ctx.clearRect(0, 0, W, H);
 
@@ -597,123 +625,176 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       drawBrow(CX - 46, CY - 37, CX - 27, CY - 48 + innerBrowY * 0.35, CX - 11, CY - 43 + innerBrowY);
       drawBrow(CX + 11, CY - 43 + innerBrowY, CX + 27, CY - 48 + innerBrowY * 0.35, CX + 46, CY - 37);
 
-      // ── Eyes — anatomical with sclera, iris fibers, eyelids, lashes ──────────
+      // ── Eyes — cinematic; primary emotion surface ────────────────────────────
       const eyeDefs = [
         { x: CX - 27, y: CY - 20, tilt: -0.07 },
         { x: CX + 27, y: CY - 20, tilt:  0.07 },
       ];
       const eyeRX = 15;
-      eyeDefs.forEach(eye => {
-        const eyeY = eye.y + bob;
-        const eyeRY = 7.5 * expr.eyeOpen * widenFactor * (1 - blinkPct * 0.94);
-        const tilt  = eye.tilt;
-        // Pupil/iris centre: gaze drift slightly constrained so it stays in iris
-        const px = eye.x + finalOffX * 0.60;
-        const py = eyeY  + finalOffY * 0.40;
 
-        // Eye socket shadow — depth behind the eye
-        const sockG = ctx.createRadialGradient(eye.x, eyeY + 2, 0, eye.x, eyeY + 2, 24);
-        sockG.addColorStop(0,   'rgba(0,0,20,0.70)');
-        sockG.addColorStop(1,   'rgba(0,0,0,0)');
-        ctx.beginPath(); ctx.ellipse(eye.x, eyeY + 2, 23, 16, tilt, 0, Math.PI * 2);
+      // Confidence-driven glow: brighter with eyeBright, surges with speaking energy
+      const effectiveGlow = eyeGlow * (0.75 + eyeBright * 0.30) + (spk ? spkEnergy * 11 : 0);
+
+      eyeDefs.forEach(eye => {
+        const eyeY      = eye.y + bob;
+        const eyeRY_max = 7.5 * expr.eyeOpen * widenFactor;   // fully-open aperture
+        const eyeRY     = eyeRY_max * (1 - blinkPct * 0.94);  // blink-compressed
+        const tilt      = eye.tilt;
+        // Iris/pupil centre constrained inside iris bounds
+        const px = eye.x + finalOffX * 0.62;
+        const py = eyeY  + finalOffY * 0.42;
+
+        // ── 1. Socket shadow ───────────────────────────────────────────────────
+        const sockG = ctx.createRadialGradient(eye.x, eyeY + 2, 0, eye.x, eyeY + 2, 25);
+        sockG.addColorStop(0, 'rgba(0,0,20,0.74)');
+        sockG.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.beginPath(); ctx.ellipse(eye.x, eyeY + 2, 24, 16, tilt, 0, Math.PI * 2);
         ctx.fillStyle = sockG; ctx.fill();
 
-        // Sclera — blue-tinted white, clipped to almond
-        if (blinkPct < 0.95) {
+        // ── 2. Confidence glow halo (drawn before content = ambient layer) ────
+        ctx.save();
+        ctx.shadowBlur = effectiveGlow; ctx.shadowColor = rc(cfg.eye, 0.88);
+        ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX + 2.8, Math.max(0.5, eyeRY_max + 2.2), tilt, 0, Math.PI * 2);
+        ctx.strokeStyle = rc(cfg.eye, 0.10 + eyeBright * 0.08); ctx.lineWidth = 3.8; ctx.stroke();
+        ctx.restore();
+
+        // ── 3. Sclera — blue-tinted white ────────────────────────────────────
+        if (blinkPct < 0.96) {
           ctx.save();
-          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.86, Math.max(0.5, eyeRY), tilt, 0, Math.PI * 2); ctx.clip();
+          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.86, Math.max(0.4, eyeRY), tilt, 0, Math.PI * 2); ctx.clip();
           const scG = ctx.createRadialGradient(eye.x - 3, eyeY - eyeRY * 0.3, 0, eye.x, eyeY, eyeRX);
-          scG.addColorStop(0,    'rgba(200,218,252,0.95)');
-          scG.addColorStop(0.55, 'rgba(152,176,228,0.82)');
-          scG.addColorStop(1,    'rgba(88,112,192,0.44)');
+          scG.addColorStop(0,    'rgba(208,224,255,0.97)');
+          scG.addColorStop(0.50, 'rgba(160,185,234,0.85)');
+          scG.addColorStop(1,    'rgba(90,116,196,0.46)');
           ctx.fillStyle = scG; ctx.fillRect(0, 0, W, H);
           // Upper-lid shadow cast on sclera
-          const lshad = ctx.createLinearGradient(eye.x, eyeY - eyeRY, eye.x, eyeY + eyeRY * 0.38);
-          lshad.addColorStop(0,    'rgba(0,0,32,0.48)');
-          lshad.addColorStop(0.42, 'rgba(0,0,0,0)');
+          const lshad = ctx.createLinearGradient(eye.x, eyeY - eyeRY, eye.x, eyeY + eyeRY * 0.42);
+          lshad.addColorStop(0,    'rgba(0,0,36,0.52)');
+          lshad.addColorStop(0.44, 'rgba(0,0,0,0)');
           ctx.fillStyle = lshad; ctx.fillRect(0, 0, W, H);
           ctx.restore();
         }
 
         if (blinkPct < 0.80) {
-          // Iris — radial gradient with fiber texture, clipped to iris circle
-          const irisR = Math.min(eyeRX * 0.69, 10.2);
+          const irisR = Math.min(eyeRX * 0.68, 10.0);
+
+          // ── 4. Iris — 5-stop gradient + slow rotation + fiber spokes ────────
           ctx.save();
-          ctx.beginPath(); ctx.ellipse(px, py, irisR, Math.max(0.5, eyeRY * 0.87), tilt, 0, Math.PI * 2); ctx.clip();
+          ctx.beginPath(); ctx.ellipse(px, py, irisR, Math.max(0.4, eyeRY * 0.86), tilt, 0, Math.PI * 2); ctx.clip();
           const irisG = ctx.createRadialGradient(px - 1.5, py - 1.5, 0, px, py, irisR);
-          irisG.addColorStop(0,    rc(cfg.eye,  Math.min(1, 0.94 * eyeBright)));
-          irisG.addColorStop(0.38, rc(cfg.mesh, Math.min(1, 0.62 * eyeBright)));
-          irisG.addColorStop(0.80, rc(cfg.mesh, 0.26));
-          irisG.addColorStop(1,    rc([2, 4, 22], 0.95));
+          irisG.addColorStop(0,    rc(cfg.eye,  Math.min(1, 0.98 * eyeBright)));
+          irisG.addColorStop(0.22, rc(cfg.eye,  Math.min(1, 0.74 * eyeBright)));
+          irisG.addColorStop(0.50, rc(cfg.mesh, Math.min(1, 0.56 * eyeBright)));
+          irisG.addColorStop(0.82, rc(cfg.mesh, 0.24));
+          irisG.addColorStop(1,    rc([2, 5, 24], 0.97));
           ctx.fillStyle = irisG; ctx.fillRect(0, 0, W, H);
-          // Radial iris fibers (10 spokes)
-          for (let fi = 0; fi < 10; fi++) {
-            const fa = (fi / 10) * Math.PI * 2;
+          // 12 radial fiber spokes with imperceptibly slow iris rotation
+          const irisRot = elapsed * 0.000012;
+          for (let fi = 0; fi < 12; fi++) {
+            const fa = (fi / 12) * Math.PI * 2 + irisRot;
             ctx.beginPath();
-            ctx.moveTo(px + Math.cos(fa) * 2.5, py + Math.sin(fa) * 2.0);
-            ctx.lineTo(px + Math.cos(fa) * irisR, py + Math.sin(fa) * eyeRY * 0.87);
-            ctx.strokeStyle = rc(cfg.eye, 0.14); ctx.lineWidth = 0.44; ctx.stroke();
+            ctx.moveTo(px + Math.cos(fa) * 2.0, py + Math.sin(fa) * 1.7);
+            ctx.lineTo(px + Math.cos(fa) * irisR, py + Math.sin(fa) * eyeRY * 0.86);
+            ctx.strokeStyle = rc(cfg.eye, 0.11); ctx.lineWidth = 0.40; ctx.stroke();
           }
-          ctx.restore();
-          // Limbal ring (dark outer iris edge)
+          // Crypts ring — mid-iris darker annulus
           ctx.beginPath();
-          ctx.ellipse(px, py, irisR, Math.max(0.5, eyeRY * 0.87), tilt, 0, Math.PI * 2);
-          ctx.strokeStyle = rc(cfg.mesh, 0.38); ctx.lineWidth = 0.85; ctx.stroke();
-
-          // Pupil — deep black, slightly soft edge
-          const pupR = Math.min(4.6, eyeRY * 0.62) * pupilScale;
-          ctx.save();
-          ctx.shadowBlur = 5; ctx.shadowColor = 'rgba(0,0,0,0.92)';
-          ctx.beginPath(); ctx.ellipse(px, py, pupR, Math.max(0.3, pupR), tilt, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(0,0,10,0.99)'; ctx.fill();
+          ctx.ellipse(px, py, irisR * 0.55, Math.max(0.2, eyeRY * 0.48), tilt, 0, Math.PI * 2);
+          ctx.strokeStyle = rc(cfg.mesh, 0.17); ctx.lineWidth = 0.55; ctx.stroke();
           ctx.restore();
 
-          // Upper-eyelid shadow gradient inside eye
+          // Limbal ring — deep dark outer edge of iris
+          ctx.beginPath();
+          ctx.ellipse(px, py, irisR, Math.max(0.4, eyeRY * 0.86), tilt, 0, Math.PI * 2);
+          ctx.strokeStyle = rc([2, 4, 20], 0.82); ctx.lineWidth = 1.1; ctx.stroke();
+
+          // ── 5. Pupillary ruff — faint bright halo just outside pupil ────────
+          const ruffR = pupilAnimR * 1.58;
+          const ruffG = ctx.createRadialGradient(px, py, Math.max(0.1, pupilAnimR * 0.86), px, py, ruffR);
+          ruffG.addColorStop(0, rc(cfg.eye, Math.min(0.32, 0.25 * eyeBright)));
+          ruffG.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.beginPath(); ctx.ellipse(px, py, ruffR, Math.max(0.2, ruffR * 0.84), tilt, 0, Math.PI * 2);
+          ctx.fillStyle = ruffG; ctx.fill();
+
+          // ── 6. Pupil — animated dilation, deep black ─────────────────────────
+          const pR = Math.max(0.3, pupilAnimR);
           ctx.save();
-          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.90, Math.max(0.5, eyeRY + 0.4), tilt, 0, Math.PI * 2); ctx.clip();
-          const elidG = ctx.createLinearGradient(eye.x, eyeY - eyeRY - 1, eye.x, eyeY + eyeRY * 0.18);
-          elidG.addColorStop(0,    rc(cfg.mesh, 0.55 * cfg.dim));
+          ctx.shadowBlur = 7; ctx.shadowColor = 'rgba(0,0,0,0.96)';
+          ctx.beginPath(); ctx.ellipse(px, py, pR, Math.max(0.2, pR * 0.91), tilt, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(0,0,8,0.99)'; ctx.fill();
+          ctx.restore();
+
+          // ── 7. Upper-lid gradient shadow inside eye ───────────────────────────
+          ctx.save();
+          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.90, Math.max(0.4, eyeRY + 0.5), tilt, 0, Math.PI * 2); ctx.clip();
+          const elidG = ctx.createLinearGradient(eye.x, eyeY - eyeRY - 1, eye.x, eyeY + eyeRY * 0.20);
+          elidG.addColorStop(0,    rc(cfg.mesh, 0.60 * cfg.dim));
           elidG.addColorStop(0.55, 'rgba(0,0,0,0)');
           ctx.fillStyle = elidG; ctx.fillRect(0, 0, W, H);
           ctx.restore();
 
-          // Specular highlights
-          ctx.shadowBlur = 4; ctx.shadowColor = 'rgba(255,255,255,0.55)';
-          ctx.beginPath(); ctx.arc(px - 3.9, py - Math.max(0.5, eyeRY) * 0.52, 2.2, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.fill();
-          ctx.beginPath(); ctx.arc(px + 2.7, py + Math.max(0.5, eyeRY) * 0.24, 0.95, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(255,255,255,0.30)'; ctx.fill();
+          // ── 8. Four specular reflections ──────────────────────────────────────
+          ctx.save();
+          // Primary catch light — key light, upper-left, sharp and bright
+          ctx.shadowBlur = 5; ctx.shadowColor = 'rgba(255,255,255,0.62)';
+          ctx.beginPath(); ctx.arc(px - 3.8, py - eyeRY * 0.54, 2.2, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
+          // Secondary fill-light — lower-right, soft
+          ctx.shadowBlur = 2;
+          ctx.beginPath(); ctx.arc(px + 2.5, py + eyeRY * 0.22, 1.05, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.36)'; ctx.fill();
+          // Rim-light micro-reflection — state-tinted, right iris edge
+          ctx.shadowBlur = 0;
+          ctx.beginPath(); ctx.arc(px + irisR * 0.68, py - eyeRY * 0.10, 0.72, 0, Math.PI * 2);
+          ctx.fillStyle = rc(cfg.eye, 0.40 * eyeBright); ctx.fill();
+          // Ambient scatter — tiny blue-white near pupil
+          ctx.beginPath(); ctx.arc(px - 1.0, py + eyeRY * 0.38, 0.52, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(200,225,255,0.26)'; ctx.fill();
           ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+          ctx.restore();
         }
 
-        // Outer glow ring (state-colour halo)
-        ctx.save();
-        ctx.shadowBlur = eyeGlow; ctx.shadowColor = rc(cfg.eye, 0.82);
-        ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX + 2.2, Math.max(0.5, eyeRY + 2.4), tilt, 0, Math.PI * 2);
-        ctx.strokeStyle = rc(cfg.eye, 0.14); ctx.lineWidth = 3.5; ctx.stroke();
-        ctx.restore();
-
-        // Upper eyelid — thick dark arc + eyelash fringe
-        if (blinkPct < 0.85) {
+        // ── 9. Animated eyelid fill — upper lid descends during blink ─────────
+        if (blinkPct > 0.04) {
           ctx.save();
-          ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.mesh, 0.36 * cfg.dim);
-          ctx.beginPath();
-          ctx.ellipse(eye.x, eyeY - eyeRY * 0.04, eyeRX * 0.95, Math.max(0.5, eyeRY * 1.02), tilt, Math.PI * 0.88, Math.PI * 2.12);
-          ctx.strokeStyle = rc(cfg.mesh, 0.90 * cfg.dim); ctx.lineWidth = 2.3; ctx.stroke();
-          // Eyelash fringe — 5 angled strokes
+          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.97, eyeRY_max + 1.2, tilt, 0, Math.PI * 2); ctx.clip();
+          const lidTopY = eyeY - eyeRY_max;
+          const lidBotY = lidTopY + (eyeRY_max * 2.1 + 2) * blinkPct + 1;
+          const lidFill = ctx.createLinearGradient(eye.x, lidTopY, eye.x, lidBotY);
+          lidFill.addColorStop(0,    rc(cfg.mesh, Math.min(1, 0.88 * cfg.dim + 0.10)));
+          lidFill.addColorStop(0.68, rc([8, 12, 36], 0.93));
+          lidFill.addColorStop(1,    'rgba(0,0,0,0)');
+          ctx.fillStyle = lidFill; ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+        }
+
+        // ── 10. Upper eyelid arc + lash fringe ───────────────────────────────
+        ctx.save();
+        ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.mesh, 0.38 * cfg.dim);
+        // Arc descends with lid during blink
+        const lidOffY = eyeRY_max * blinkPct * 0.82;
+        ctx.beginPath();
+        ctx.ellipse(eye.x, eyeY - eyeRY * 0.04 + lidOffY, eyeRX * 0.95, Math.max(0.4, eyeRY * 1.02 + lidOffY * 0.28), tilt, Math.PI * 0.88, Math.PI * 2.12);
+        ctx.strokeStyle = rc(cfg.mesh, 0.92 * cfg.dim); ctx.lineWidth = 2.4; ctx.stroke();
+        // Lash fringe — fanned strokes, pulled down with lid
+        if (blinkPct < 0.72) {
           for (let li = -2; li <= 2; li++) {
             const la = Math.PI + (li / 5.8) * Math.PI;
             const lx1 = eye.x + Math.cos(la) * eyeRX * 0.90;
-            const ly1 = eyeY  + Math.sin(la) * eyeRY;
+            const ly1 = eyeY  + Math.sin(la) * eyeRY + lidOffY;
             ctx.beginPath(); ctx.moveTo(lx1, ly1);
-            ctx.lineTo(lx1 + Math.cos(la - 0.15) * 4.0, ly1 + Math.sin(la - 0.15) * 3.2);
-            ctx.strokeStyle = rc(cfg.mesh, 0.74 * cfg.dim); ctx.lineWidth = 1.0; ctx.stroke();
+            ctx.lineTo(lx1 + Math.cos(la - 0.16) * 4.2, ly1 + Math.sin(la - 0.16) * 3.3 + lidOffY * 0.38);
+            ctx.strokeStyle = rc(cfg.mesh, 0.76 * cfg.dim); ctx.lineWidth = 1.1; ctx.stroke();
           }
-          ctx.restore();
-          // Lower eyelid — subtle crescent
+        }
+        ctx.restore();
+
+        // Lower eyelid crescent — rises slightly on blink
+        if (blinkPct < 0.90) {
+          const lowerRise = eyeRY_max * blinkPct * 0.20;
           ctx.beginPath();
-          ctx.ellipse(eye.x, eyeY + eyeRY * 0.08, eyeRX * 0.76, Math.max(0.5, eyeRY * 0.79), tilt, 0.10, Math.PI * 0.90);
-          ctx.strokeStyle = rc(cfg.mesh, 0.20 * cfg.dim); ctx.lineWidth = 0.85; ctx.stroke();
+          ctx.ellipse(eye.x, eyeY + eyeRY * 0.08 - lowerRise, eyeRX * 0.76, Math.max(0.4, eyeRY * 0.78), tilt, 0.10, Math.PI * 0.90);
+          ctx.strokeStyle = rc(cfg.mesh, 0.22 * cfg.dim); ctx.lineWidth = 0.88; ctx.stroke();
         }
         ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       });
