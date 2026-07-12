@@ -1,0 +1,140 @@
+STEP 8 – ADD REAL-TIME EYE MOVEMENT AND LIP SYNC WHILE THE AI IS TALKING
+
+I want the avatar to visibly speak whenever the AI voice is active.
+
+The avatar should not remain frozen while audio is playing.
+
+REQUIREMENTS:
+
+1. LIP SYNC
+
+Animate the mouth in real time while the AI voice is speaking.
+
+The lips should:
+- Open and close based on the current audio volume.
+- Change shape naturally instead of only moving straight up and down.
+- Include small jaw movement.
+- Return smoothly to a closed resting position when speech ends.
+- Never continue moving after the audio stops.
+
+Use several mouth shapes, not one repeated animation.
+
+Suggested mouth shapes:
+- Closed/resting
+- Slightly open
+- Wide open
+- Rounded “O”
+- Narrow “E”
+- Lip press for “M,” “B,” and “P”
+
+Best implementation:
+- Use phoneme or viseme timing from the text-to-speech provider when available.
+- If viseme timing is unavailable, use the Web Audio API AnalyserNode to drive approximate lip movement from the speech audio.
+- Smooth the values so the mouth does not shake or flicker.
+
+
+2. EYE MOVEMENT WHILE SPEAKING
+
+The eyes should remain active while the AI is talking.
+
+While speaking:
+- Maintain natural eye contact most of the time.
+- Occasionally glance toward relevant dashboard evidence.
+- Blink naturally every 3 to 7 seconds.
+- Make small eye movements between sentences.
+- Look directly at the user when giving an important conclusion.
+- Do not make the eyes move constantly or randomly.
+
+Examples:
+- When discussing market structure, glance toward the Structure evidence.
+- When discussing liquidity, glance toward the Liquidity evidence.
+- When discussing risk, glance toward the risk and stop information.
+- When saying “I would take this trade,” look directly forward.
+
+
+3. SPEAKING ANIMATION STATE
+
+Add a dedicated avatar state:
+
+SPEAKING
+
+When SPEAKING is active:
+- Start lip-sync animation.
+- Keep the eyes alive.
+- Add subtle jaw and cheek movement.
+- Slightly increase the eye glow.
+- Add a soft pulse around the avatar.
+- Reduce unrelated scanning animations.
+- Keep the face focused and engaged.
+
+When speech ends:
+- Stop lip movement.
+- Return the mouth to the resting shape.
+- Transition back to WAITING, ANALYZING, READY, or TRADE_ACTIVE.
+- Do not abruptly snap between states.
+
+
+4. SPEECH QUEUE SYNCHRONIZATION
+
+The visual animation must stay synchronized with the exact audio currently playing.
+
+Required behavior:
+- Start facial animation when audio playback starts.
+- Pause facial animation when audio is paused.
+- Resume when audio resumes.
+- Stop facial animation when audio ends.
+- Cancel the current animation if the user interrupts the AI.
+- Do not animate for text that is displayed but not spoken.
+
+
+5. TECHNICAL STRUCTURE
+
+Create reusable avatar controls such as:
+
+setAvatarState("SPEAKING")
+setMouthViseme(visemeName)
+setEyeTarget(targetName)
+setSpeechEnergy(value)
+resetFaceToIdle()
+
+Use a single source of truth for:
+- Whether the AI is currently speaking
+- Current audio playback position
+- Current viseme
+- Current eye target
+- Current avatar state
+
+Do not build separate disconnected animation timers that can become unsynchronized.
+
+
+6. MOBILE PERFORMANCE
+
+The animation must work smoothly on iPhone Safari.
+
+Requirements:
+- Target 60 FPS where possible.
+- Use requestAnimationFrame.
+- Prefer CSS transforms, opacity, SVG paths, or canvas rendering.
+- Avoid constantly triggering React re-renders.
+- Do not use large video files for every animation state.
+- Pause unnecessary animations when the tab is hidden.
+- Respect prefers-reduced-motion.
+
+
+7. COMPLETION TESTS
+
+This step is complete only when:
+
+- The lips begin moving exactly when the voice begins.
+- The lips stop when the voice stops.
+- The mouth shapes vary naturally.
+- The eyes blink and move while speaking.
+- The avatar looks toward relevant evidence when discussing it.
+- The face looks directly forward for important decisions.
+- Interrupting the AI immediately stops the speech animation.
+- There is no jittering, flickering, overlap, or delayed mouth movement.
+- It works correctly on desktop and iPhone Safari.
+
+Do not replace the current avatar design.
+
+Animate the existing eyes, lips, jaw, glow, and facial layers so the same avatar appears alive while speaking.

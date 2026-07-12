@@ -828,6 +828,38 @@ function McCard({ label, value, sub, col = 'rgba(255,255,255,0.75)', delay = 0, 
   );
 }
 
+// ── Corner Satellite Panel — small glassmorphic chip for avatar corners ────────
+function CornerSat({ label, value, sub, col = 'rgba(255,255,255,0.80)', align = 'left' }: {
+  label: string; value: React.ReactNode; sub?: string;
+  col?: string; align?: 'left' | 'right';
+}) {
+  return (
+    <div style={{
+      width: 128, padding: '6px 9px 7px',
+      background: 'rgba(4,7,16,0.84)',
+      border: '1px solid rgba(255,255,255,0.055)',
+      borderRadius: 8,
+      backdropFilter: 'blur(10px)',
+      textAlign: align,
+    }}>
+      <div style={{ fontSize:7, fontFamily:'monospace', letterSpacing:'0.13em',
+        color:'rgba(255,255,255,0.26)', textTransform:'uppercase', marginBottom:3 }}>
+        {label}
+      </div>
+      <div style={{ fontSize:11.5, fontFamily:'monospace', fontWeight:700,
+        color:col, lineHeight:1.2 }}>
+        {value}
+      </div>
+      {sub && (
+        <div style={{ fontSize:9, fontFamily:'monospace',
+          color:'rgba(255,255,255,0.35)', marginTop:2 }}>
+          {sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EvidenceRadarPanel({ items, side }: { items: EvidenceItem[]; side: 'left' | 'right' }) {
   const isRight = side === 'right';
   return (
@@ -2233,6 +2265,76 @@ export default function Home() {
                       justifyContent:'center', transform:'scale(1.50)', transformOrigin:'center center', zIndex:1 }}>
                       <AvatarCanvas avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} />
                     </div>
+
+                    {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}
+
+                    {/* TOP-LEFT: Nearest Support / Demand Zone */}
+                    {(() => {
+                      const dem = Number(data?.nearest_demand || 0);
+                      const px  = Number(data?.price || 0);
+                      const pct = dem > 0 && px > 0 ? ((px - dem) / px * 100).toFixed(1) : null;
+                      return dem > 0 ? (
+                        <div style={{ position:'absolute', top:14, left:4, zIndex:2, pointerEvents:'none' }}>
+                          <CornerSat label="Support" col={BULL} value={fmt(dem)}
+                            sub={pct ? `${pct}% below price` : 'Demand zone'} />
+                        </div>
+                      ) : null;
+                    })()}
+
+                    {/* TOP-RIGHT: Nearest Resistance / Supply Zone */}
+                    {(() => {
+                      const sup = Number(data?.nearest_supply || 0);
+                      const px  = Number(data?.price || 0);
+                      const pct = sup > 0 && px > 0 ? ((sup - px) / px * 100).toFixed(1) : null;
+                      return sup > 0 ? (
+                        <div style={{ position:'absolute', top:14, right:4, zIndex:2, pointerEvents:'none' }}>
+                          <CornerSat label="Resistance" col={BEAR} align="right" value={fmt(sup)}
+                            sub={pct ? `${pct}% above price` : 'Supply zone'} />
+                        </div>
+                      ) : null;
+                    })()}
+
+                    {/* BOTTOM-LEFT: Next Economic Event */}
+                    {(() => {
+                      const nf     = data?.news_filter;
+                      const evt    = nf?.next_event;
+                      const mins   = Number(evt?.mins ?? 0);
+                      const title  = String(evt?.title || evt?.name || '').slice(0, 17) || null;
+                      const impact = String(evt?.impact || '').toLowerCase();
+                      const ctd    = mins > 0
+                        ? (mins < 60 ? `in ${mins}m` : `in ${Math.floor(mins / 60)}h ${mins % 60}m`)
+                        : evt ? 'Imminent' : '';
+                      const evtCol = /high/.test(impact) ? BEAR : /medium/.test(impact) ? AMB : 'rgba(255,255,255,0.60)';
+                      return (
+                        <div style={{ position:'absolute', bottom:14, left:4, zIndex:2, pointerEvents:'none' }}>
+                          <CornerSat label="Next Event"
+                            col={title ? evtCol : 'rgba(255,255,255,0.32)'}
+                            value={title || 'No Events'}
+                            sub={ctd || 'Calendar clear'} />
+                        </div>
+                      );
+                    })()}
+
+                    {/* BOTTOM-RIGHT: Today's Trade Performance */}
+                    {(() => {
+                      const todayStr = new Date().toISOString().slice(0, 10);
+                      const all: any[] = Array.isArray(data?.recent_trades) ? data.recent_trades : [];
+                      const today = all.filter((t: any) => String(t?.opened_at || '').slice(0, 10) === todayStr);
+                      const wins  = today.filter((t: any) => /win|profit|target/i.test(String(t?.outcome || ''))).length;
+                      const loss  = today.filter((t: any) => /loss|stop|miss/i.test(String(t?.outcome || ''))).length;
+                      const total = wins + loss;
+                      const wr    = total > 0 ? Math.round(wins / total * 100) : null;
+                      const col   = wins > loss ? BULL : loss > wins ? BEAR : 'rgba(255,255,255,0.68)';
+                      return (
+                        <div style={{ position:'absolute', bottom:14, right:4, zIndex:2, pointerEvents:'none' }}>
+                          <CornerSat label="Today" align="right"
+                            col={total > 0 ? col : 'rgba(255,255,255,0.32)'}
+                            value={total > 0 ? `${wins}W  ${loss}L` : 'No Trades'}
+                            sub={wr !== null ? `${wr}% win rate` : 'Session tracking'} />
+                        </div>
+                      );
+                    })()}
+
                   </div>
                   <div style={{ marginTop:4, display:'flex', alignItems:'center', gap:7 }}>
                     <div style={{ width:6, height:6, borderRadius:'50%', background:verdictColor,
