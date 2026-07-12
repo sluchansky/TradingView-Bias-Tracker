@@ -607,6 +607,141 @@ function EdgeBar({ score, max = 110, color = BLUE }: { score: number; max?: numb
   );
 }
 
+// ── Evidence Radar ────────────────────────────────────────────────────────────
+type EvStrength = 'inactive' | 'neutral' | 'developing' | 'confirmed' | 'invalidated';
+interface EvidenceItem { label: string; strength: EvStrength; }
+
+const EV_COLOR: Record<EvStrength, string> = {
+  inactive:    'rgba(255,255,255,0.16)',
+  neutral:     '#3b82f6',
+  developing:  '#f59e0b',
+  confirmed:   '#22c55e',
+  invalidated: '#ef4444',
+};
+const EV_GLOW: Record<EvStrength, string> = {
+  inactive:    'none',
+  neutral:     '0 0 7px #3b82f650',
+  developing:  '0 0 10px #f59e0b88',
+  confirmed:   '0 0 12px #22c55eaa',
+  invalidated: '0 0 10px #ef444488',
+};
+
+function getEvidenceRadar(
+  data: any, gd: Record<string,any>, ad: Record<string,any>,
+  sig: Record<string,any>, edge: number
+): EvidenceItem[] {
+  const price = Number(data?.price          || 0);
+  const vwap  = Number(data?.vwap_value     || 0);
+  const cvd   = String(sig.cvd || ad.cvd    || '').toLowerCase();
+  const vol   = String(ad.volume            || '').toLowerCase();
+  const vReg  = String(ad.volatility_regime || '').toLowerCase();
+  const bias  = String(sig.bias             || '').toLowerCase();
+
+  const structure: EvStrength =
+    gd.structure_confirmed ? 'confirmed' :
+    (bias && bias !== 'neutral' && bias !== 'unknown') ? 'developing' : 'inactive';
+
+  let vwapS: EvStrength = 'inactive';
+  if (price > 0 && vwap > 0) {
+    if (gd.vwap_confirmed)                             vwapS = 'confirmed';
+    else if (Math.abs(price - vwap) / vwap < 0.0012)  vwapS = 'neutral';
+    else if (price > vwap)                             vwapS = 'developing';
+    else                                                vwapS = 'invalidated';
+  }
+
+  const liquidity: EvStrength =
+    gd.zone_valid                                  ? 'confirmed' :
+    (data?.nearest_demand || data?.nearest_supply) ? 'neutral'   : 'inactive';
+
+  const volume: EvStrength =
+    /strong|high/.test(vol)  ? 'confirmed'   :
+    /incr/.test(vol)          ? 'developing'  :
+    /low|thin/.test(vol)      ? 'inactive'    : 'neutral';
+
+  const delta: EvStrength =
+    /bull|pos/.test(cvd)  ? 'confirmed'   :
+    /bear|neg/.test(cvd)  ? 'invalidated' : 'neutral';
+
+  const orderFlow: EvStrength =
+    delta === 'confirmed'   && volume !== 'inactive' ? 'confirmed'   :
+    delta === 'invalidated'                          ? 'invalidated' :
+    delta !== 'neutral'  || volume === 'confirmed'   ? 'developing'  : 'neutral';
+
+  const trend: EvStrength =
+    /bull/.test(bias) ? 'confirmed'   :
+    /bear/.test(bias) ? 'invalidated' :
+    bias              ? 'neutral'     : 'inactive';
+
+  const momentum: EvStrength =
+    edge >= 75 ? 'confirmed'  :
+    edge >= 55 ? 'developing' :
+    edge >= 30 ? 'neutral'    : 'inactive';
+
+  const volatility: EvStrength =
+    /extreme/.test(vReg)   ? 'invalidated' :
+    /elev/.test(vReg)      ? 'developing'  :
+    /quiet|low/.test(vReg) ? 'confirmed'   : 'neutral';
+
+  let htf: EvStrength = 'inactive';
+  const swCtx = data?.swing_context;
+  if (swCtx?.htf_bias_aligned !== undefined) htf = swCtx.htf_bias_aligned ? 'confirmed' : 'invalidated';
+  else if (sig.htf_aligned !== undefined)    htf = sig.htf_aligned        ? 'confirmed' : 'developing';
+  else if (bias && bias !== 'neutral')       htf = 'neutral';
+
+  return [
+    { label: 'Structure',  strength: structure  },
+    { label: 'VWAP',       strength: vwapS      },
+    { label: 'Liquidity',  strength: liquidity  },
+    { label: 'Volume',     strength: volume     },
+    { label: 'Delta',      strength: delta      },
+    { label: 'Order Flow', strength: orderFlow  },
+    { label: 'Trend',      strength: trend      },
+    { label: 'Momentum',   strength: momentum   },
+    { label: 'Volatility', strength: volatility },
+    { label: 'Higher TF',  strength: htf        },
+  ];
+}
+
+function EvidenceRadarPanel({ items, side }: { items: EvidenceItem[]; side: 'left' | 'right' }) {
+  const isRight = side === 'right';
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:10, justifyContent:'center',
+      flex:1, paddingTop:24, paddingBottom:20,
+      alignItems: isRight ? 'flex-start' : 'flex-end' }}>
+      {items.map((item, i) => {
+        const col   = EV_COLOR[item.strength];
+        const glow  = EV_GLOW[item.strength];
+        const pulse = item.strength === 'developing';
+        const dim   = item.strength === 'inactive';
+        return (
+          <div key={i} style={{
+            display:'flex', alignItems:'center', gap:7,
+            flexDirection: isRight ? 'row' : 'row-reverse',
+            opacity: dim ? 0.33 : 1,
+            transition:'opacity 0.8s ease',
+          }}>
+            <div style={{
+              width:7, height:7, borderRadius:'50%', flexShrink:0,
+              background: col, boxShadow: glow,
+              animation: pulse ? 'evPulse 2.2s ease-in-out infinite' : undefined,
+              transition:'background 0.6s ease, box-shadow 0.6s ease',
+            }} />
+            <span style={{
+              fontSize:10, fontFamily:'monospace', fontWeight:700,
+              letterSpacing:'0.06em', textTransform:'uppercase',
+              color: dim ? 'rgba(255,255,255,0.22)' : col,
+              transition:'color 0.6s ease', lineHeight:1,
+              textAlign: isRight ? 'left' : 'right',
+            }}>
+              {item.label}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Live Thought Stream ────────────────────────────────────────────────────────
 interface StreamEntry { id: number; text: string; }
 const MAX_STREAM = 5;
@@ -1270,6 +1405,10 @@ export default function Home() {
     [data, status, edge, ticker] // eslint-disable-line react-hooks/exhaustive-deps
   );
   const streamedThoughts = useThoughtStream(thoughtPool);
+  const radar            = useMemo(
+    () => getEvidenceRadar(data, gd, ad, sig, edge),
+    [data, edge] // eslint-disable-line react-hooks/exhaustive-deps
+  );
 
   const narration = (
     voice_d.narration ||
@@ -1436,8 +1575,9 @@ export default function Home() {
       .chart-hdr-extra{display:none!important;}
       .quick-chips{gap:5px!important;}
     }
-    .sat-col{opacity:0.40;transition:opacity 0.35s ease;}
-    .sat-col:hover{opacity:0.90!important;}
+    .sat-col{opacity:0.90;transition:opacity 0.35s ease;}
+    .sat-col:hover{opacity:1!important;}
+    @keyframes evPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(1.9)}}
     @media(max-width:1000px){.sat-col{display:none!important;}.avtr-col{justify-content:center;}}
     @media(max-width:760px){.intel-strip{flex-wrap:wrap!important;}.intel-strip>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.intel-strip{display:none!important;}}
@@ -1651,54 +1791,9 @@ export default function Home() {
             {/* Avatar command center — avatar flanked by live intelligence panels */}
             <div className="avtr-col" style={{ flexShrink:0, display:'flex', flexDirection:'row', gap:10, alignItems:'flex-start' }}>
 
-              {/* ── LEFT PANELS ─────────────────────────────────────────────── */}
+              {/* ── LEFT EVIDENCE RADAR ──────────────────────────────────────── */}
               <div className="sat-col" style={{ width:128, display:'flex', flexDirection:'column', gap:7, paddingTop:6 }}>
-
-                <SatPanel label="Market Bias">
-                  {(() => {
-                    const b = String(sig.bias || '').toLowerCase();
-                    const col = /bull/.test(b) ? BULL : /bear/.test(b) ? BEAR : MUTED;
-                    return (
-                      <>
-                        <div style={{ fontSize:13, fontWeight:800, fontFamily:'monospace', color:col, letterSpacing:'0.03em' }}>
-                          {/bull/.test(b) ? 'BULLISH' : /bear/.test(b) ? 'BEARISH' : 'NEUTRAL'}
-                        </div>
-                        {dirn && <div style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', marginTop:3 }}>
-                          FAVORING {String(dirn).toUpperCase()}
-                        </div>}
-                      </>
-                    );
-                  })()}
-                </SatPanel>
-
-                <SatPanel label="Key Levels">
-                  {[['VWAP', data?.vwap_value, '#60a5fa'], ['SUPPORT', data?.nearest_demand, BULL], ['RESIST', data?.nearest_supply, BEAR]].map(([l,v,c]) => (
-                    <div key={l as string} style={{ display:'flex', justifyContent:'space-between', marginBottom:3 }}>
-                      <span style={{ fontSize:8, color:'rgba(255,255,255,0.28)', fontFamily:'monospace' }}>{l}</span>
-                      <span style={{ fontSize:10, color:c as string, fontFamily:'monospace', fontWeight:700 }}>
-                        {v ? fmt(Number(v)) : '—'}
-                      </span>
-                    </div>
-                  ))}
-                </SatPanel>
-
-                <SatPanel label="Signal Flow">
-                  {(() => {
-                    const c = String(sig.cvd || ad.cvd || '').toLowerCase();
-                    const v = String(ad.volume || '').toLowerCase();
-                    const cvdCol = /bull|pos/.test(c) ? BULL : /bear|neg/.test(c) ? BEAR : MUTED;
-                    const cvdLbl = /bull|pos/.test(c) ? 'BULL DELTA' : /bear|neg/.test(c) ? 'BEAR DELTA' : 'NEUTRAL';
-                    const volLbl = /strong|high|incr/.test(v) ? 'HIGH VOL' : /low|thin|decr/.test(v) ? 'THIN' : 'NORMAL';
-                    const volCol = /strong|high|incr/.test(v) ? BULL : /low|thin|decr/.test(v) ? '#f97316' : MUTED;
-                    return (
-                      <>
-                        <div style={{ fontSize:11, fontWeight:700, color:cvdCol, fontFamily:'monospace' }}>{cvdLbl}</div>
-                        <div style={{ fontSize:9, color:volCol, fontFamily:'monospace', marginTop:3 }}>{volLbl}</div>
-                      </>
-                    );
-                  })()}
-                </SatPanel>
-
+                <EvidenceRadarPanel items={radar.slice(0,5)} side="left" />
               </div>
 
               {/* ── AVATAR CENTER ────────────────────────────────────────────── */}
@@ -1742,58 +1837,9 @@ export default function Home() {
 
               </div>
 
-              {/* ── RIGHT PANELS ─────────────────────────────────────────────── */}
+              {/* ── RIGHT EVIDENCE RADAR ─────────────────────────────────────── */}
               <div className="sat-col" style={{ width:128, display:'flex', flexDirection:'column', gap:7, paddingTop:6 }}>
-
-                <SatPanel label="Structure">
-                  {(() => {
-                    const sc = !!(gd.structure_confirmed);
-                    const zv = !!(gd.zone_valid);
-                    return (
-                      <>
-                        <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4 }}>
-                          <div style={{ width:5, height:5, borderRadius:'50%', flexShrink:0, background: sc ? BULL : 'rgba(255,255,255,0.12)' }} />
-                          <span style={{ fontSize:9, fontFamily:'monospace', color: sc ? BULL : MUTED }}>{sc ? 'BOS CONFIRMED' : 'NO BOS/CHOCH'}</span>
-                        </div>
-                        <div style={{ display:'flex', alignItems:'center', gap:5 }}>
-                          <div style={{ width:5, height:5, borderRadius:'50%', flexShrink:0, background: zv ? '#f97316' : 'rgba(255,255,255,0.12)' }} />
-                          <span style={{ fontSize:9, fontFamily:'monospace', color: zv ? '#f97316' : MUTED }}>{zv ? 'ZONE ACTIVE' : 'NO ZONE'}</span>
-                        </div>
-                      </>
-                    );
-                  })()}
-                </SatPanel>
-
-                <SatPanel label="Edge Breakdown">
-                  {[['BOS', eb.bos20 ?? eb.choch20 ?? null, 20], ['VWAP', eb.vwap15 ?? null, 15], ['SWEEP', eb.sweep15 ?? null, 15], ['VOL', eb.volume15 ?? null, 15]].map(([n,s,m]) => {
-                    const sc2 = s != null ? Math.round(Number(s)) : null;
-                    const col2 = sc2 == null ? MUTED : sc2 >= Number(m)*0.6 ? BULL : sc2 > 0 ? AMB : MUTED;
-                    return (
-                      <div key={n as string} style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
-                        <span style={{ fontSize:8, color:'rgba(255,255,255,0.28)', fontFamily:'monospace' }}>{n}</span>
-                        <span style={{ fontSize:9.5, color:col2, fontFamily:'monospace', fontWeight:700 }}>{sc2 != null ? `${sc2}/${m}` : '—'}</span>
-                      </div>
-                    );
-                  })}
-                </SatPanel>
-
-                <SatPanel label="Trade Plan">
-                  {(() => {
-                    const has = tp.entry && Number(tp.entry) > 0;
-                    if (!has) return <div style={{ fontSize:9.5, color:MUTED, fontFamily:'monospace' }}>No active plan</div>;
-                    return (
-                      <>
-                        {[['ENTRY', tp.entry, AMB], ['STOP', tp.stop, BEAR], ['TARGET', tp.target1, BULL]].map(([l,v,c]) => (
-                          <div key={l as string} style={{ display:'flex', justifyContent:'space-between', marginBottom:2 }}>
-                            <span style={{ fontSize:8, color:'rgba(255,255,255,0.28)', fontFamily:'monospace' }}>{l}</span>
-                            <span style={{ fontSize:9.5, color:c as string, fontFamily:'monospace', fontWeight:700 }}>{v ? fmt(Number(v)) : '—'}</span>
-                          </div>
-                        ))}
-                      </>
-                    );
-                  })()}
-                </SatPanel>
-
+                <EvidenceRadarPanel items={radar.slice(5)} side="right" />
               </div>
 
             </div>
