@@ -2098,10 +2098,16 @@ export default function Home() {
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
     .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
-    .mc-top-row,.mc-bot-row{display:flex;gap:8px;}
+    /* ConnectorSVG wires with no target cards are visual noise — hidden */
+    .mc-stage>svg{display:none!important;}
+    /* mc-top-row (Edge Score/Win Prob/Strategy) is duplicated in the brain panel */
+    .mc-top-row{display:none!important;}
+    .mc-bot-row{display:flex;gap:8px;}
     .mc-top-row>.mc-card,.mc-bot-row>.mc-card{flex:1;min-width:0;}
     .mc-mid-row{display:flex;gap:8px;align-items:stretch;}
-    .mc-col{display:flex;flex-direction:column;gap:8px;width:130px;flex-shrink:0;}
+    /* Flanking data columns — narrower, subtler so avatar breathes */
+    .mc-col{display:flex;flex-direction:column;gap:8px;width:112px;flex-shrink:0;opacity:0.72;}
+    .mc-col:hover{opacity:1;transition:opacity 0.2s;}
     .mc-col>.mc-card{flex:1;min-height:0;}
     .mc-card{background:rgba(5,8,18,0.58);border:1px solid rgba(255,255,255,0.036);border-radius:10px;padding:10px 12px;transition:border-color 0.6s ease,box-shadow 0.6s ease,background 0.25s ease;animation:mcFloat 7s ease-in-out infinite;position:relative;z-index:1;}
     .mc-card:hover{background:rgba(10,15,34,0.72)!important;border-color:rgba(255,255,255,0.09)!important;}
@@ -2485,7 +2491,7 @@ export default function Home() {
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
                       justifyContent:'center', zIndex:1 }}>
-                      <LordPiggingtonAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} debug={true} />
+                      <LordPiggingtonAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} debug={false} />
                     </div>
 
                     {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}
