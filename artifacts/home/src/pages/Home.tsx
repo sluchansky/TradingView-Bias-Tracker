@@ -503,177 +503,289 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.fillStyle = rc(cfg.mesh, p * 0.65 * cfg.dim); ctx.fill();
       });
 
-      // Face oval
+      // ── Face fill — cinematic 3-point lighting over dark volumetric base ────────
+      ctx.save();
+      ctx.beginPath(); ctx.ellipse(CX, CY + bob, RX, RY, 0, 0, Math.PI * 2); ctx.clip();
+      // Dark base — deep slate, lighter at top-centre where key light hits
+      const faceBase = ctx.createRadialGradient(CX - 16, CY + bob - 50, 8, CX, CY + bob + 14, RY * 1.18);
+      faceBase.addColorStop(0,    rc([22, 30, 62], 0.93));
+      faceBase.addColorStop(0.42, rc([12, 18, 46], 0.97));
+      faceBase.addColorStop(1,    rc([4,  6,  24], 0.99));
+      ctx.fillStyle = faceBase; ctx.fillRect(0, 0, W, H);
+      // Key light — upper-left warm tint using state colour
+      const keyL = ctx.createRadialGradient(CX - 30, CY + bob - 62, 6, CX - 10, CY + bob - 14, RX * 0.92);
+      keyL.addColorStop(0,    rc(cfg.mesh, 0.44));
+      keyL.addColorStop(0.50, rc(cfg.mesh, 0.14));
+      keyL.addColorStop(1,    'rgba(0,0,0,0)');
+      ctx.fillStyle = keyL; ctx.fillRect(0, 0, W, H);
+      // Fill light — soft right-side haze (eye colour, very dim)
+      const fillL = ctx.createRadialGradient(CX + 64, CY + bob + 8, 0, CX + 20, CY + bob, RX * 0.82);
+      fillL.addColorStop(0,   rc(cfg.eye, 0.11));
+      fillL.addColorStop(1,   'rgba(0,0,0,0)');
+      ctx.fillStyle = fillL; ctx.fillRect(0, 0, W, H);
+      // Chin vignette — shadows deepen toward jaw
+      const chinV = ctx.createLinearGradient(CX, CY + bob + RY * 0.36, CX, CY + bob + RY);
+      chinV.addColorStop(0, 'rgba(0,0,0,0)'); chinV.addColorStop(1, 'rgba(0,0,0,0.55)');
+      ctx.fillStyle = chinV; ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+      // Face silhouette — soft glowing edge (no harsh stroke)
+      ctx.save();
+      ctx.shadowBlur = 16; ctx.shadowColor = rc(cfg.mesh, 0.60 * cfg.dim);
       ctx.beginPath(); ctx.ellipse(CX, CY + bob, RX, RY, 0, 0, Math.PI * 2);
-      ctx.strokeStyle = rc(cfg.mesh, 0.50 * cfg.dim); ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.strokeStyle = rc(cfg.mesh, 0.26 * cfg.dim); ctx.lineWidth = 1.1; ctx.stroke();
+      ctx.restore();
 
-      // Forehead scan lines (animated for ACTIVE — sweeping data-read effect)
+      // ── Cheekbone highlights — luminescent shimmer over high cheekbones ───────
+      [-1, 1].forEach(side => {
+        const cg = ctx.createRadialGradient(CX + side * 42, CY + 16 + bob, 0, CX + side * 42, CY + 16 + bob, 32);
+        cg.addColorStop(0,   rc(cfg.eye, 0.09 * cfg.dim));
+        cg.addColorStop(1,   'rgba(0,0,0,0)');
+        ctx.fillStyle = cg; ctx.fillRect(0, 0, W, H);
+      });
+
+      // ── Forehead scan lines (subtle data-read texture) ─────────────────────────
       const scanBaseAlpha = isActive
-        ? 0.06 + 0.09 * Math.abs(Math.sin(elapsed * 0.0028))
-        : s === 'NO_EDGE' ? 0.04 : 0.09;
+        ? 0.048 + 0.065 * Math.abs(Math.sin(elapsed * 0.0028))
+        : s === 'NO_EDGE' ? 0.028 : 0.055;
       const scanLine = (y: number, mul: number) => {
         const hw = Math.sqrt(Math.max(0, RX * RX * (1 - ((y - CY) * (y - CY)) / (RY * RY))));
-        ctx.beginPath(); ctx.moveTo(CX - hw * 0.8, y + bob); ctx.lineTo(CX + hw * 0.8, y + bob);
-        ctx.strokeStyle = rc(cfg.mesh, scanBaseAlpha * mul * cfg.dim); ctx.lineWidth = 0.4; ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(CX - hw * 0.68, y + bob); ctx.lineTo(CX + hw * 0.68, y + bob);
+        ctx.strokeStyle = rc(cfg.mesh, scanBaseAlpha * mul * cfg.dim); ctx.lineWidth = 0.35; ctx.stroke();
       };
-      scanLine(CY - 68, 1.0); scanLine(CY - 60, 0.78); scanLine(CY - 52, 0.56);
+      scanLine(CY - 68, 1.0); scanLine(CY - 60, 0.70); scanLine(CY - 52, 0.45);
 
-      // Cheekbone lines
-      const cheekLine = (x1: number, y1: number, x2: number, y2: number) => {
-        ctx.beginPath(); ctx.moveTo(x1, y1 + bob); ctx.lineTo(x2, y2 + bob);
-        ctx.strokeStyle = rc(cfg.mesh, 0.09 * cfg.dim); ctx.lineWidth = 0.5; ctx.stroke();
-      };
-      cheekLine(CX - RX + 5, CY + 22, CX - 38, CY + 12);
-      cheekLine(CX + 38, CY + 12, CX + RX - 5, CY + 22);
-
-      // ── Brow lines (lift/furrow per state) ──────────────────────────────────
+      // ── Brows — arched with sub-brow shadow and inner highlight ──────────────
       const drawBrow = (p1x: number, p1y: number, pcx: number, pcy: number, p2x: number, p2y: number) => {
-        ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.mesh, 0.22 * cfg.dim);
+        const by = bob + browLift;
+        // Sub-brow shadow (cast down)
         ctx.beginPath();
-        ctx.moveTo(p1x, p1y + bob + browLift);
-        ctx.quadraticCurveTo(pcx, pcy + bob + browLift, p2x, p2y + bob + browLift);
-        ctx.strokeStyle = rc(cfg.mesh, 0.45 * cfg.dim);
-        ctx.lineWidth = 1.2; ctx.stroke();
-        ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+        ctx.moveTo(p1x, p1y + by + 3.5); ctx.quadraticCurveTo(pcx, pcy + by + 3.2, p2x, p2y + by + 3.5);
+        ctx.strokeStyle = 'rgba(0,0,0,0.42)'; ctx.lineWidth = 4.5; ctx.stroke();
+        // Main brow with glow
+        ctx.save();
+        ctx.shadowBlur = 7; ctx.shadowColor = rc(cfg.mesh, 0.32 * cfg.dim);
+        ctx.beginPath();
+        ctx.moveTo(p1x, p1y + by); ctx.quadraticCurveTo(pcx, pcy + by, p2x, p2y + by);
+        ctx.strokeStyle = rc(cfg.mesh, 0.62 * cfg.dim); ctx.lineWidth = 2.2; ctx.stroke();
+        // Inner brow highlight
+        ctx.beginPath();
+        ctx.moveTo(p1x + 4, p1y + by + 0.8); ctx.quadraticCurveTo(pcx, pcy + by + 0.8, p2x - 4, p2y + by + 0.8);
+        ctx.strokeStyle = rc(cfg.eye, 0.24 * cfg.dim); ctx.lineWidth = 0.65; ctx.stroke();
+        ctx.restore();
       };
       drawBrow(CX - 46, CY - 37, CX - 27, CY - 48, CX - 11, CY - 43);
       drawBrow(CX + 11, CY - 43, CX + 27, CY - 48, CX + 46, CY - 37);
 
-      // ── Eyes (almond-shaped, with live pupil scan drift) ─────────────────────
+      // ── Eyes — anatomical with sclera, iris fibers, eyelids, lashes ──────────
       const eyeDefs = [
         { x: CX - 27, y: CY - 20, tilt: -0.07 },
         { x: CX + 27, y: CY - 20, tilt:  0.07 },
       ];
+      const eyeRX = 15;
       eyeDefs.forEach(eye => {
-        const eyeY  = eye.y + bob;
-        // eyeOpen (AV_EXPR) = emotional openness; widenFactor = event pop
+        const eyeY = eye.y + bob;
         const eyeRY = 7.5 * expr.eyeOpen * widenFactor * (1 - blinkPct * 0.94);
         const tilt  = eye.tilt;
+        // Pupil/iris centre: gaze drift slightly constrained so it stays in iris
+        const px = eye.x + finalOffX * 0.60;
+        const py = eyeY  + finalOffY * 0.40;
 
-        // Iris/pupil center: idle scan blended with market-event gaze target
-        const px = eye.x + finalOffX;
-        const py = eyeY   + finalOffY;
+        // Eye socket shadow — depth behind the eye
+        const sockG = ctx.createRadialGradient(eye.x, eyeY + 2, 0, eye.x, eyeY + 2, 24);
+        sockG.addColorStop(0,   'rgba(0,0,20,0.70)');
+        sockG.addColorStop(1,   'rgba(0,0,0,0)');
+        ctx.beginPath(); ctx.ellipse(eye.x, eyeY + 2, 23, 16, tilt, 0, Math.PI * 2);
+        ctx.fillStyle = sockG; ctx.fill();
 
+        // Sclera — blue-tinted white, clipped to almond
+        if (blinkPct < 0.95) {
+          ctx.save();
+          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.86, Math.max(0.5, eyeRY), tilt, 0, Math.PI * 2); ctx.clip();
+          const scG = ctx.createRadialGradient(eye.x - 3, eyeY - eyeRY * 0.3, 0, eye.x, eyeY, eyeRX);
+          scG.addColorStop(0,    'rgba(200,218,252,0.95)');
+          scG.addColorStop(0.55, 'rgba(152,176,228,0.82)');
+          scG.addColorStop(1,    'rgba(88,112,192,0.44)');
+          ctx.fillStyle = scG; ctx.fillRect(0, 0, W, H);
+          // Upper-lid shadow cast on sclera
+          const lshad = ctx.createLinearGradient(eye.x, eyeY - eyeRY, eye.x, eyeY + eyeRY * 0.38);
+          lshad.addColorStop(0,    'rgba(0,0,32,0.48)');
+          lshad.addColorStop(0.42, 'rgba(0,0,0,0)');
+          ctx.fillStyle = lshad; ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+        }
+
+        if (blinkPct < 0.80) {
+          // Iris — radial gradient with fiber texture, clipped to iris circle
+          const irisR = Math.min(eyeRX * 0.69, 10.2);
+          ctx.save();
+          ctx.beginPath(); ctx.ellipse(px, py, irisR, Math.max(0.5, eyeRY * 0.87), tilt, 0, Math.PI * 2); ctx.clip();
+          const irisG = ctx.createRadialGradient(px - 1.5, py - 1.5, 0, px, py, irisR);
+          irisG.addColorStop(0,    rc(cfg.eye,  0.94));
+          irisG.addColorStop(0.38, rc(cfg.mesh, 0.62));
+          irisG.addColorStop(0.80, rc(cfg.mesh, 0.26));
+          irisG.addColorStop(1,    rc([2, 4, 22], 0.95));
+          ctx.fillStyle = irisG; ctx.fillRect(0, 0, W, H);
+          // Radial iris fibers (10 spokes)
+          for (let fi = 0; fi < 10; fi++) {
+            const fa = (fi / 10) * Math.PI * 2;
+            ctx.beginPath();
+            ctx.moveTo(px + Math.cos(fa) * 2.5, py + Math.sin(fa) * 2.0);
+            ctx.lineTo(px + Math.cos(fa) * irisR, py + Math.sin(fa) * eyeRY * 0.87);
+            ctx.strokeStyle = rc(cfg.eye, 0.14); ctx.lineWidth = 0.44; ctx.stroke();
+          }
+          ctx.restore();
+          // Limbal ring (dark outer iris edge)
+          ctx.beginPath();
+          ctx.ellipse(px, py, irisR, Math.max(0.5, eyeRY * 0.87), tilt, 0, Math.PI * 2);
+          ctx.strokeStyle = rc(cfg.mesh, 0.38); ctx.lineWidth = 0.85; ctx.stroke();
+
+          // Pupil — deep black, slightly soft edge
+          const pupR = Math.min(4.6, eyeRY * 0.62);
+          ctx.save();
+          ctx.shadowBlur = 5; ctx.shadowColor = 'rgba(0,0,0,0.92)';
+          ctx.beginPath(); ctx.ellipse(px, py, pupR, Math.max(0.3, pupR), tilt, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(0,0,10,0.99)'; ctx.fill();
+          ctx.restore();
+
+          // Upper-eyelid shadow gradient inside eye
+          ctx.save();
+          ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX * 0.90, Math.max(0.5, eyeRY + 0.4), tilt, 0, Math.PI * 2); ctx.clip();
+          const elidG = ctx.createLinearGradient(eye.x, eyeY - eyeRY - 1, eye.x, eyeY + eyeRY * 0.18);
+          elidG.addColorStop(0,    rc(cfg.mesh, 0.55 * cfg.dim));
+          elidG.addColorStop(0.55, 'rgba(0,0,0,0)');
+          ctx.fillStyle = elidG; ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+
+          // Specular highlights
+          ctx.shadowBlur = 4; ctx.shadowColor = 'rgba(255,255,255,0.55)';
+          ctx.beginPath(); ctx.arc(px - 3.9, py - Math.max(0.5, eyeRY) * 0.52, 2.2, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.fill();
+          ctx.beginPath(); ctx.arc(px + 2.7, py + Math.max(0.5, eyeRY) * 0.24, 0.95, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,255,255,0.30)'; ctx.fill();
+          ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+        }
+
+        // Outer glow ring (state-colour halo)
+        ctx.save();
         ctx.shadowBlur = eyeGlow; ctx.shadowColor = rc(cfg.eye, 0.82);
+        ctx.beginPath(); ctx.ellipse(eye.x, eyeY, eyeRX + 2.2, Math.max(0.5, eyeRY + 2.4), tilt, 0, Math.PI * 2);
+        ctx.strokeStyle = rc(cfg.eye, 0.14); ctx.lineWidth = 3.5; ctx.stroke();
+        ctx.restore();
 
-        // Outer glow halo
-        ctx.beginPath();
-        ctx.ellipse(eye.x, eyeY, 17.5, Math.max(0.5, eyeRY + 2.5), tilt, 0, Math.PI * 2);
-        ctx.strokeStyle = rc(cfg.eye, 0.16); ctx.lineWidth = 3.5; ctx.stroke();
-
-        // Main eye rim
-        ctx.beginPath();
-        ctx.ellipse(eye.x, eyeY, 15, Math.max(0.5, eyeRY), tilt, 0, Math.PI * 2);
-        ctx.strokeStyle = rc(cfg.eye, 0.88); ctx.lineWidth = 1.2; ctx.stroke();
-
-        if (blinkPct < 0.8) {
-          // Upper eyelid emphasis
+        // Upper eyelid — thick dark arc + eyelash fringe
+        if (blinkPct < 0.85) {
+          ctx.save();
+          ctx.shadowBlur = 4; ctx.shadowColor = rc(cfg.mesh, 0.36 * cfg.dim);
           ctx.beginPath();
-          ctx.ellipse(eye.x, eyeY, 15, Math.max(0.5, eyeRY), tilt, Math.PI, Math.PI * 2);
-          ctx.strokeStyle = rc(cfg.eye, 0.62); ctx.lineWidth = 1.9; ctx.stroke();
-
-          ctx.shadowBlur = 0; // clear glow before fills
-
-          // Iris gradient (centered on scan position)
-          const ig = ctx.createRadialGradient(px - 1, py - 1, 0, px, py, 10);
-          ig.addColorStop(0,    rc(cfg.eye,  0.74));
-          ig.addColorStop(0.52, rc(cfg.mesh, 0.38));
-          ig.addColorStop(1,    'rgba(0,4,14,0.58)');
+          ctx.ellipse(eye.x, eyeY - eyeRY * 0.04, eyeRX * 0.95, Math.max(0.5, eyeRY * 1.02), tilt, Math.PI * 0.88, Math.PI * 2.12);
+          ctx.strokeStyle = rc(cfg.mesh, 0.90 * cfg.dim); ctx.lineWidth = 2.3; ctx.stroke();
+          // Eyelash fringe — 5 angled strokes
+          for (let li = -2; li <= 2; li++) {
+            const la = Math.PI + (li / 5.8) * Math.PI;
+            const lx1 = eye.x + Math.cos(la) * eyeRX * 0.90;
+            const ly1 = eyeY  + Math.sin(la) * eyeRY;
+            ctx.beginPath(); ctx.moveTo(lx1, ly1);
+            ctx.lineTo(lx1 + Math.cos(la - 0.15) * 4.0, ly1 + Math.sin(la - 0.15) * 3.2);
+            ctx.strokeStyle = rc(cfg.mesh, 0.74 * cfg.dim); ctx.lineWidth = 1.0; ctx.stroke();
+          }
+          ctx.restore();
+          // Lower eyelid — subtle crescent
           ctx.beginPath();
-          ctx.ellipse(px, py, 10, Math.max(0.5, eyeRY * 0.85), tilt, 0, Math.PI * 2);
-          ctx.fillStyle = ig; ctx.fill();
-
-          // Inner iris ring
-          ctx.beginPath();
-          ctx.ellipse(px, py, 6.5, Math.max(0.3, eyeRY * 0.54), tilt, 0, Math.PI * 2);
-          ctx.strokeStyle = rc(cfg.eye, 0.26); ctx.lineWidth = 0.7; ctx.stroke();
-
-          // Pupil (follows scan position)
-          ctx.beginPath();
-          ctx.ellipse(px, py, 3.8, Math.max(0.3, eyeRY * 0.47), tilt, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(0,3,12,0.97)'; ctx.fill();
-
-          // Specular highlight (follows iris)
-          ctx.beginPath();
-          ctx.arc(px - 4, py - eyeRY * 0.52, 1.7, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(255,255,255,0.82)'; ctx.fill();
-          ctx.beginPath();
-          ctx.arc(px + 3.2, py + eyeRY * 0.28, 0.8, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fill();
+          ctx.ellipse(eye.x, eyeY + eyeRY * 0.08, eyeRX * 0.76, Math.max(0.5, eyeRY * 0.79), tilt, 0.10, Math.PI * 0.90);
+          ctx.strokeStyle = rc(cfg.mesh, 0.20 * cfg.dim); ctx.lineWidth = 0.85; ctx.stroke();
         }
         ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
       });
 
-      // ── Nose bridge + nostril wings ───────────────────────────────────────────
-      const noseBridge = (dx: number) => {
-        ctx.beginPath();
-        ctx.moveTo(CX + dx * 0.4, CY - 8 + bob);
-        ctx.lineTo(CX + dx, CY + 17 + bob);
-        ctx.strokeStyle = rc(cfg.mesh, 0.12 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
-      };
-      noseBridge(-4); noseBridge(4);
-      const drawNostril = (side: number) => {
-        ctx.beginPath();
-        ctx.arc(CX + side * 7.5, CY + 21 + bob, 3.8, Math.PI * 0.12, Math.PI * 0.88);
-        ctx.strokeStyle = rc(cfg.mesh, 0.20 * cfg.dim); ctx.lineWidth = 0.9; ctx.stroke();
-      };
-      drawNostril(-1); drawNostril(1);
-
-      // ── Jaw angle markers ─────────────────────────────────────────────────────
+      // ── Nose — shadow gradient instead of lines, with tip highlight ───────────
+      // Bridge side shadow (left)
+      const nsG = ctx.createLinearGradient(CX - 9, CY - 8 + bob, CX + 3, CY + 18 + bob);
+      nsG.addColorStop(0,   'rgba(0,0,0,0)');
+      nsG.addColorStop(0.5, rc([2, 4, 22], 0.30));
+      nsG.addColorStop(1,   'rgba(0,0,0,0)');
+      ctx.fillStyle = nsG; ctx.fillRect(CX - 10, CY - 14 + bob, 10, 38);
+      // Nose tip soft highlight
+      const ntG = ctx.createRadialGradient(CX - 1, CY + 15 + bob, 0, CX + 1, CY + 17 + bob, 5.5);
+      ntG.addColorStop(0,   rc(cfg.eye, 0.13));
+      ntG.addColorStop(1,   'rgba(0,0,0,0)');
+      ctx.fillStyle = ntG; ctx.fillRect(CX - 8, CY + 10 + bob, 16, 14);
+      // Nostril wings
       [-1, 1].forEach(side => {
         ctx.beginPath();
-        ctx.moveTo(CX + side * 60, CY + 44 + bob);
-        ctx.lineTo(CX + side * 51, CY + 63 + bob);
-        ctx.strokeStyle = rc(cfg.mesh, 0.09 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
+        ctx.arc(CX + side * 8, CY + 22 + bob, 4.8, Math.PI * 0.10, Math.PI * 0.90);
+        ctx.strokeStyle = rc(cfg.mesh, 0.20 * cfg.dim); ctx.lineWidth = 1.0; ctx.stroke();
       });
 
-      // ── Mouth — lip-sync while speaking, expression shapes at rest ─────────────
-      // Bezier control point BELOW endpoints (higher y) = smile (U-shape)
-      // Bezier control point ABOVE endpoints (lower y)  = frown (arch-shape)
-      const my         = CY + 57 + bob;
-      const lipEnergy  = spk ? Math.max(0, Math.min(1, speechCtrlRef.current?.energy ?? 0)) : 0;
-      const lipViseme  = spk ? (speechCtrlRef.current?.viseme ?? 'rest') : 'rest';
-      ctx.beginPath();
+      // ── Jaw shadow — soft under-jaw vignette ─────────────────────────────────
+      const jawG = ctx.createLinearGradient(CX, CY + bob + 50, CX, CY + bob + RY);
+      jawG.addColorStop(0, 'rgba(0,0,0,0)');
+      jawG.addColorStop(1, rc(cfg.mesh, 0.10 * cfg.dim));
+      ctx.fillStyle = jawG; ctx.fillRect(CX - RX, CY + bob + 50, RX * 2, RY);
+
+      // ── Mouth — volumetric lips with filled lower lip and crease ─────────────
+      const my        = CY + 57 + bob;
+      const lipEnergy = spk ? Math.max(0, Math.min(1, speechCtrlRef.current?.energy ?? 0)) : 0;
+      const lipViseme = spk ? (speechCtrlRef.current?.viseme ?? 'rest') : 'rest';
+
       if (lipEnergy > 0.04 && spk) {
-        // ── Lip-sync: jaw drops with energy, shape varies by current viseme ──────
+        // Lip-sync — jaw drops, shape driven by viseme
         const jawDrop = lipEnergy * 10.5;
         const mw      = 15 + lipEnergy * 3.5;
+        ctx.save();
         ctx.shadowBlur = 6 + lipEnergy * 6; ctx.shadowColor = rc(cfg.eye, 0.50);
+        ctx.beginPath();
         if (lipViseme === 'press') {
-          // M / B / P — lips firmly together, slight centre crease
-          ctx.moveTo(CX - 13, my); ctx.quadraticCurveTo(CX, my + 0.6, CX + 13, my);
+          ctx.moveTo(CX - 13, my); ctx.quadraticCurveTo(CX, my + 0.7, CX + 13, my);
         } else if (lipViseme === 'rounded') {
-          // O — pursed, small elliptical opening
-          const rw = 6 + lipEnergy * 5;
-          const rh = Math.max(2, jawDrop * 0.68);
+          const rw = 6 + lipEnergy * 5, rh = Math.max(2, jawDrop * 0.68);
+          const oG = ctx.createRadialGradient(CX, my, 0, CX, my, rw + 4);
+          oG.addColorStop(0, rc(cfg.eye, 0.38)); oG.addColorStop(1, 'rgba(0,0,0,0)');
           ctx.ellipse(CX, my - rh * 0.22, rw, rh, 0, 0, Math.PI * 2);
+          ctx.fillStyle = oG; ctx.fill();
         } else if (lipViseme === 'narrow') {
-          // E / F / V — wide, shallow slit
-          ctx.moveTo(CX - mw, my);
-          ctx.quadraticCurveTo(CX, my + jawDrop * 0.20, CX + mw, my);
+          ctx.moveTo(CX - mw, my); ctx.quadraticCurveTo(CX, my + jawDrop * 0.20, CX + mw, my);
         } else {
-          // Default open / wide — upper lip stays, lower lip drops with jaw
           ctx.moveTo(CX - mw, my);
           ctx.quadraticCurveTo(CX, my + jawDrop * 0.13 + 1, CX + mw, my);
           ctx.moveTo(CX - mw * 0.86, my + jawDrop * 0.40);
           ctx.quadraticCurveTo(CX, my + jawDrop + 1.5, CX + mw * 0.86, my + jawDrop * 0.40);
         }
-        ctx.strokeStyle = rc(cfg.eye, (0.55 + lipEnergy * 0.28) * cfg.dim);
-        ctx.lineWidth = 1.4; ctx.stroke();
+        ctx.strokeStyle = rc(cfg.eye, (0.58 + lipEnergy * 0.26) * cfg.dim);
+        ctx.lineWidth = 1.6; ctx.stroke();
+        ctx.restore();
       } else {
-        // ── Resting expression shapes ─────────────────────────────────────────────
-        ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.30);
-        switch (expr.mouthType) {
-          case 'confident':     ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+4,   CX+17,my);     break;
-          case 'satisfaction':  ctx.moveTo(CX-16,my+1);   ctx.quadraticCurveTo(CX,my+3.5, CX+16,my+1);   break;
-          case 'interested':    ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+3,   CX+15,my+0.5); break;
-          case 'relaxed':       ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break;
-          case 'focused':       ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+1,   CX+15,my+0.5); break;
-          case 'tight':         ctx.moveTo(CX-13,my);     ctx.lineTo(CX+13,my);                          break;
-          case 'disappointment':ctx.moveTo(CX-15,my);     ctx.quadraticCurveTo(CX,my-2,   CX+15,my);     break;
-          default:              ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break;
+        // Resting — filled lower lip with volume + crease
+        const mt = expr.mouthType;
+        const mw = 17;
+        const mc = mt === 'confident' || mt === 'satisfaction' ? 5 :
+                   mt === 'interested' ? 3.5 : mt === 'disappointment' ? -2.5 :
+                   mt === 'tight' ? 0 : 2;
+        ctx.save();
+        ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.28 * cfg.dim);
+        // Lower lip fill — filled bezier region with radial gradient
+        const llG = ctx.createRadialGradient(CX, my + mc + 1.5, 0, CX, my + mc + 1.5, mw * 0.80);
+        llG.addColorStop(0,   rc(cfg.eye,  0.24 * cfg.dim));
+        llG.addColorStop(0.5, rc(cfg.mesh, 0.12 * cfg.dim));
+        llG.addColorStop(1,   'rgba(0,0,0,0)');
+        ctx.beginPath();
+        ctx.moveTo(CX - mw, my);
+        ctx.quadraticCurveTo(CX, my + mc, CX + mw, my);
+        ctx.quadraticCurveTo(CX + mw * 0.60, my + mc + 4.0, CX, my + mc + 5.2);
+        ctx.quadraticCurveTo(CX - mw * 0.60, my + mc + 4.0, CX - mw, my);
+        ctx.fillStyle = llG; ctx.fill();
+        // Lip crease
+        ctx.beginPath();
+        if (mt === 'tight') {
+          ctx.moveTo(CX - mw + 2, my); ctx.lineTo(CX + mw - 2, my);
+        } else {
+          ctx.moveTo(CX - mw + 2, my); ctx.quadraticCurveTo(CX, my + mc, CX + mw - 2, my);
         }
-        ctx.strokeStyle = rc(cfg.eye, 0.38 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
+        ctx.strokeStyle = rc(cfg.mesh, 0.45 * cfg.dim); ctx.lineWidth = 1.4; ctx.stroke();
+        // Lower lip centre highlight
+        ctx.beginPath();
+        ctx.ellipse(CX, my + mc + 3.6, mw * 0.34, 1.9, 0, 0, Math.PI * 2);
+        ctx.fillStyle = rc(cfg.eye, 0.15 * cfg.dim); ctx.fill();
+        ctx.restore();
       }
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
 
