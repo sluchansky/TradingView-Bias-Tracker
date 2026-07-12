@@ -176,6 +176,14 @@ function useTTS() {
     audioUnlockedRef.current = true;
   }, []);
 
+  // Auto-unlock on first touch anywhere — mobile browsers need a real gesture
+  // before speechSynthesis.speak() works from async contexts (useEffect polls).
+  useEffect(() => {
+    const handler = () => unlockAudio();
+    document.addEventListener('touchstart', handler, { once: true, capture: true, passive: true });
+    return () => document.removeEventListener('touchstart', handler, { capture: true });
+  }, [unlockAudio]);
+
   return { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef, unlockAudio };
 }
 
@@ -1960,6 +1968,7 @@ export default function Home() {
   }, [voiceState]);
   // Speak / barge-in: tap to talk, tap again to stop, tap while AI speaking to interrupt
   const handleSpeak = useCallback(() => {
+    unlockAudio();
     if (speaking) {
       window.speechSynthesis?.cancel();
       startListening(); return;
@@ -2165,7 +2174,7 @@ export default function Home() {
             fontFamily:'monospace', transition:'all 0.15s' }}>
             {leftOpen ? '◀ Levels' : '▶ Levels'}
           </button>
-          <button onClick={() => setMuted(!muted)} style={{ background:'none', border:'none', cursor:'pointer',
+          <button onClick={() => { unlockAudio(); setMuted(!muted); }} style={{ background:'none', border:'none', cursor:'pointer',
             fontSize:15, color: muted ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.45)', padding:'3px' }}>
             {muted ? '🔇' : '🔊'}
           </button>

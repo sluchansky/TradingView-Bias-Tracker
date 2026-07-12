@@ -297,8 +297,9 @@ function LordPiggingtonAvatar({
   const rafRef    = useRef<number>(0);
   const pausedRef = useRef(false);
 
-  // Mouth
+  // Mouth + jaw bone
   const availableMouthRef = useRef<string[]>([]);
+  const jawBoneRef        = useRef<THREE.Bone | null>(null);
   const activeShapeRef    = useRef('');
   const testExprRef       = useRef<{ name: string; until: number } | null>(null);
 
@@ -441,6 +442,14 @@ function LordPiggingtonAvatar({
       const foundMouth = MOUTH_CANDIDATES.filter(n => vrm.expressionManager?.getExpression(n));
       console.log('[LordPiggington] mouth exprs:', foundMouth);
       availableMouthRef.current = foundMouth;
+
+      // Find jaw bone via raw traversal — works on VRM0 and VRM1
+      vrm.scene.traverse((obj) => {
+        if (!jawBoneRef.current && obj instanceof THREE.Bone && /jaw/i.test(obj.name)) {
+          jawBoneRef.current = obj;
+          console.log('[LordPiggington] jaw bone found:', obj.name);
+        }
+      });
 
       debugDataRef.current = {
         ...debugDataRef.current,
@@ -598,13 +607,13 @@ function LordPiggingtonAvatar({
       activeShapeRef.current = activeShape;
 
       // ── Jaw bone fallback: visible mouth even when model has no morph targets ─
-      // VRM1 normalised bone 'jaw', opens with positive rotation.x
-      const jawBone = hum?.getNormalizedBoneNode?.('jaw' as never) ?? null;
+      // Uses raw THREE.Bone found by /jaw/i traversal — works on VRM0 + VRM1.
+      const jawBone = jawBoneRef.current;
       if (jawBone) {
         const bs   = boneSm as Record<string, { x: number; y: number; z: number }>;
         if (!bs['_jaw']) bs['_jaw'] = { x: 0, y: 0, z: 0 };
         const jawSm = bs['_jaw'];
-        const jawTgt = rawEnergy * 0.30;          // 0.30 rad ≈ 17° at peak energy
+        const jawTgt = rawEnergy * 0.30;   // 0.30 rad ≈ 17° open at peak energy
         jawSm.x += (jawTgt - jawSm.x) * (1 - Math.exp(-16 * dt));
         jawBone.rotation.x = jawSm.x;
       }
