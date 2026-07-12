@@ -1631,6 +1631,7 @@ function useDemoEngine(
 // ── Root ───────────────────────────────────────────────────────────────────────
 export default function Home() {
   const [ticker, setTicker]     = useState<Ticker>('MNQ');
+  const manualPickRef           = useRef<number>(0); // ms-timestamp of last manual ticker pick
   const [data,   setData]       = useState<any>(null);
   const [loading, setLoading]   = useState(true);
   const [demoMode, setDemoMode] = useState<boolean>(() => { try { return localStorage.getItem('atp_demo') === '1'; } catch { return false; } });
@@ -1704,6 +1705,36 @@ export default function Home() {
     setLoading(true); setData(null); candlesRef.current = [];
     poll(); const id = setInterval(poll, 3000); return () => clearInterval(id);
   }, [poll, demoMode]);
+
+  // ── 30s auto-follow: switch to highest-edge / actionable ticker ────────────
+  const autoTickerRef     = useRef<Ticker>('MNQ');
+  const autoAuthHdrRef    = useRef<Record<string,string>>({});
+  useEffect(() => { autoTickerRef.current = ticker; }, [ticker]);
+  useEffect(() => { autoAuthHdrRef.current = authHeader; }, [authHeader]);
+  useEffect(() => {
+    const ALL = ['MNQ','MGC','MES','MYM'] as const;
+    const id = setInterval(async () => {
+      if (demoMode) return;
+      const hdr = autoAuthHdrRef.current;
+      if (!hdr['Authorization']) return;
+      if (Date.now() - manualPickRef.current < 30000) return; // sticky after manual pick
+      try {
+        const res = await Promise.all(ALL.map(t =>
+          fetch(`/api/status?ticker=${t}`, { credentials:'include', headers:hdr })
+            .then(r => r.ok ? r.json() : null).catch(() => null)
+        ));
+        const scored = ALL.map((t, i) => {
+          const d = res[i];
+          const isAct = d && /READY|MANAGING/.test(String(d.main_brain?.status ?? d.status ?? ''));
+          const es    = Number(d?.main_brain?.edge_score ?? d?.edge_score ?? 0);
+          return { t, isAct, es };
+        }).sort((a, b) => (a.isAct !== b.isAct ? (a.isAct ? -1 : 1) : b.es - a.es));
+        const best = scored[0];
+        if (best && best.t !== autoTickerRef.current) setTicker(best.t);
+      } catch {}
+    }, 30000);
+    return () => clearInterval(id);
+  }, [demoMode]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [msgs]);
 
   // Derived
@@ -2096,13 +2127,17 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
-    /* Desktop layout: brain panel LEFT, avatar stage centered RIGHT */
+    /* Desktop layout: avatar TRUE-CENTER via 3-col CSS Grid */
     @media(min-width:769px){
       .main-center{zoom:1;}
       .mc-col{display:none!important;}
-      .mb-brain{order:1;max-width:660px;}
-      .mc-stage{order:2;flex:1;display:flex;flex-direction:column;align-items:center;}
+      .mb-row{display:grid!important;grid-template-columns:1fr auto 1fr!important;align-items:start!important;}
+      .mb-brain{grid-column:1;min-width:0;order:unset;}
+      .mc-stage{grid-column:2;display:flex!important;flex-direction:column!important;align-items:center!important;order:unset;}
       .mc-mid-row{justify-content:center;width:100%;}
+      .verdict-big{font-size:46px!important;letter-spacing:-0.03em!important;}
+      .verdict-sub{font-size:24px!important;margin-top:6px!important;}
+      .edge-wrap{max-width:unset!important;}
     }
     .mc-stage{display:flex;flex-direction:column;gap:8px;flex-shrink:0;position:relative;isolation:isolate;}
     /* ConnectorSVG wires with no target cards are visual noise — hidden */
@@ -2165,7 +2200,7 @@ export default function Home() {
           </div>
           <div style={{ display:'flex', gap:1 }}>
             {(['MNQ','MGC','MES','MYM'] as const).map(t => (
-              <button key={t} className="ticker-btn" onClick={() => setTicker(t)} style={{
+              <button key={t} className="ticker-btn" onClick={() => { manualPickRef.current = Date.now(); setTicker(t); }} style={{
                 padding:'3px 11px', borderRadius:5, cursor:'pointer', fontSize:11.5, fontWeight:700,
                 fontFamily:'monospace', letterSpacing:'0.06em',
                 background: ticker === t ? 'rgba(59,130,246,0.22)' : 'transparent',
