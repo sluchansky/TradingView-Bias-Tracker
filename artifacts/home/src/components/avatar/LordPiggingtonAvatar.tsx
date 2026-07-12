@@ -65,11 +65,12 @@ const ALL_LOG_BONES = [...BODY_BONES, 'neck', 'head'] as const;
 const Z3: BoneRot3 = { x: 0, y: 0, z: 0 };
 
 // ─── ARM Z-ROTATION CONSTANTS ─────────────────────────────────────────────────
-// In VRM normalised-humanoid space the T-pose has arms horizontal (+X / -X).
-// A rotation of ≈ ±1.20 around Z brings arms ~69° down toward the body sides.
-//   leftUpperArm  z = -ARM_Z  (rotates from +X toward −Y = arm swings down)
-//   rightUpperArm z = +ARM_Z  (rotates from −X toward −Y = arm swings down)
-const ARM_Z = 1.20;
+// In three-vrm normalised-humanoid space the T-pose has arms horizontal.
+// Verified convention (three-vrm v1+):
+//   leftUpperArm  z = +ARM_Z  → arm swings DOWN to side
+//   rightUpperArm z = -ARM_Z  → arm swings DOWN to side
+// (Opposite signs to what Unity/VRM0 raw bone space uses.)
+const ARM_Z = 1.4;
 
 // ─── Mouth expression candidates ──────────────────────────────────────────────
 const MOUTH_CANDIDATES = ['aa','ih','ou','ee','oh','A','I','U','E','O'];
@@ -114,10 +115,10 @@ function idleTargets(breathX: number, swayZ: number): BoneTargets {
     chest:         { x: breathX * 0.55, y: 0, z: swayZ * 0.28 },
     upperChest:    { x: breathX * 0.28, y: 0, z: swayZ * 0.20 },
     // Arms: ONLY Z to bring from T-pose horizontal → sides; x and y both 0
-    leftUpperArm:  { x: 0, y: 0, z: -ARM_Z },
+    leftUpperArm:  { x: 0, y: 0, z:  ARM_Z },
     leftLowerArm:  { x: 0.16, y: 0, z: 0 },   // slight natural elbow bend
     leftHand:      { x: 0, y: 0, z: 0 },
-    rightUpperArm: { x: 0, y: 0, z:  ARM_Z },
+    rightUpperArm: { x: 0, y: 0, z: -ARM_Z },
     rightLowerArm: { x: 0.16, y: 0, z: 0 },
     rightHand:     { x: 0, y: 0, z: 0 },
     // Legs: standing, very slight knee bend
@@ -138,10 +139,10 @@ function talkTargets(breathX: number, swayZ: number, phi: number): BoneTargets {
     spine:         { x: breathX * 1.2, y: 0, z: swayZ * 0.30 },
     chest:         { x: breathX * 0.70, y: 0, z: swayZ * 0.24 },
     upperChest:    { x: breathX * 0.36, y: 0, z: swayZ * 0.18 },
-    leftUpperArm:  { x: 0,       y: 0, z: -ARM_Z },   // same Z as idle
+    leftUpperArm:  { x: 0,       y: 0, z:  ARM_Z },   // same Z as idle
     leftLowerArm:  { x: 0.18,    y: 0, z: 0 },
     leftHand:      { x: 0,       y: 0, z: 0 },
-    rightUpperArm: { x: gestR,   y: 0, z:  ARM_Z },   // same Z as idle; small fwd swing
+    rightUpperArm: { x: gestR,   y: 0, z: -ARM_Z },   // same Z as idle; small fwd swing
     rightLowerArm: { x: 0.24 + Math.abs(gestR) * 0.4, y: 0, z: 0 },
     rightHand:     { x: 0,       y: 0, z: 0 },
     leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
@@ -165,10 +166,10 @@ function walkTargets(phi: number): BoneTargets {
     spine:         { x: 0, y: 0, z: Math.sin(phi + Math.PI) * 0.022 },
     chest:         { x: 0, y: 0, z: 0 },
     upperChest:    { x: 0, y: 0, z: 0 },
-    leftUpperArm:  { x:  armX, y: 0, z: -ARM_Z },
+    leftUpperArm:  { x:  armX, y: 0, z:  ARM_Z },
     leftLowerArm:  { x: elbL,  y: 0, z: 0 },
     leftHand:      { x: 0, y: 0, z: 0 },
-    rightUpperArm: { x: -armX, y: 0, z:  ARM_Z },
+    rightUpperArm: { x: -armX, y: 0, z: -ARM_Z },
     rightLowerArm: { x: elbR,  y: 0, z: 0 },
     rightHand:     { x: 0, y: 0, z: 0 },
     leftUpperLeg:  { x:  legX, y: 0, z: 0 },
@@ -185,10 +186,10 @@ function pointTargets(breathX: number): BoneTargets {
   return {
     ...base,
     // Right arm: raise to pointing height; left arm stays relaxed
-    rightUpperArm: { x: -0.30, y: 0, z: 0.55 }, // z < ARM_Z = arm raised, x = forward
+    rightUpperArm: { x: -0.30, y: 0, z: -0.55 }, // z > -ARM_Z = arm raised
     rightLowerArm: { x:  0.22, y: 0, z: 0 },
     rightHand:     { x:  0,    y: 0, z: 0 },
-    leftUpperArm:  { x:  0,    y: 0, z: -ARM_Z - 0.08 }, // slightly more relaxed
+    leftUpperArm:  { x:  0,    y: 0, z:  ARM_Z + 0.08 }, // slightly more relaxed
   };
 }
 
@@ -198,10 +199,10 @@ function thinkTargets(breathX: number, elapsed: number): BoneTargets {
   return {
     ...base,
     hips:          { x: rock, y: 0, z: 0 },
-    rightUpperArm: { x: -0.50, y: 0, z: 0.48 }, // arm raised toward chin
-    rightLowerArm: { x:  1.20, y: 0, z: 0 },    // elbow bent upward
+    rightUpperArm: { x: -0.50, y: 0, z: -0.48 }, // arm raised toward chin
+    rightLowerArm: { x:  1.20, y: 0, z: 0 },     // elbow bent upward
     rightHand:     { x: -0.12, y: 0, z: 0 },
-    leftUpperArm:  { x:  0,    y: 0, z: -ARM_Z - 0.05 },
+    leftUpperArm:  { x:  0,    y: 0, z:  ARM_Z + 0.05 },
   };
 }
 
@@ -210,7 +211,7 @@ function waveTargets(phi: number, breathX: number): BoneTargets {
   const waveZ = Math.sin(phi * 3.5) * 0.42;
   return {
     ...base,
-    rightUpperArm: { x: -0.44, y: 0, z:  0.78 }, // arm raised, forward
+    rightUpperArm: { x: -0.44, y: 0, z: -0.78 }, // arm raised, forward
     rightLowerArm: { x:  0.82, y: 0, z:  0 },
     rightHand:     { x:  0,    y: 0, z: waveZ },  // waving
   };
@@ -222,8 +223,8 @@ function initBoneSm(): BoneSm {
   const sm: BoneSm = {};
   for (const b of ALL_LOG_BONES) sm[b] = { x: 0, y: 0, z: 0 };
   // Pre-set arm Z to idle position → no visible snap from T-pose
-  sm.leftUpperArm  = { x: 0, y: 0, z: -ARM_Z };
-  sm.rightUpperArm = { x: 0, y: 0, z:  ARM_Z };
+  sm.leftUpperArm  = { x: 0, y: 0, z:  ARM_Z };
+  sm.rightUpperArm = { x: 0, y: 0, z: -ARM_Z };
   sm.leftLowerArm  = { x: 0.16, y: 0, z: 0 };
   sm.rightLowerArm = { x: 0.16, y: 0, z: 0 };
   return sm;
