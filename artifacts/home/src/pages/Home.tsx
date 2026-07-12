@@ -79,7 +79,7 @@ function charToViseme(c: string): string {
 function useTTS() {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voiceName, setVoiceN] = useState<string>(() => { try { return localStorage.getItem('brain_voice') ?? ''; } catch { return ''; } });
-  const [muted, setMutedState] = useState<boolean>(() => { try { return localStorage.getItem('brain_muted') !== '0'; } catch { return true; } });
+  const [muted, setMutedState] = useState<boolean>(() => { try { const v = localStorage.getItem('brain_muted'); return v === null ? false : v !== '0'; } catch { return false; } });
   const [speaking, setSpeaking] = useState(false);
   // Shared energy ref: written by the RAF loop below, read by AvatarCanvas draw loop (no React re-renders)
   const speechCtrlRef = useRef<SpeechCtrl>({ energy: 0, viseme: 'rest', active: false });
@@ -163,7 +163,20 @@ function useTTS() {
     utt.onend = stopEnergy; utt.onerror = stopEnergy;
     ss.speak(utt);
   }, [voices, voiceName, muted]);
-  return { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef };
+
+  // One-shot warm-up: mobile browsers block async speechSynthesis until a user gesture
+  // has directly called ss.speak(). Call unlockAudio() inside a click/touch handler.
+  const audioUnlockedRef = useRef(false);
+  const unlockAudio = useCallback(() => {
+    const ss = window.speechSynthesis;
+    if (!ss || audioUnlockedRef.current) return;
+    const warmup = new SpeechSynthesisUtterance('');
+    warmup.volume = 0;
+    ss.speak(warmup);
+    audioUnlockedRef.current = true;
+  }, []);
+
+  return { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef, unlockAudio };
 }
 
 // ── Voice input ───────────────────────────────────────────────────────────────
@@ -1645,7 +1658,7 @@ export default function Home() {
   const prevZoneRef   = useRef(false);
 
   const clock = useClock();
-  const { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef } = useTTS();
+  const { voices, voiceName, setVoice, muted, setMuted, speaking, speak, speechCtrlRef, unlockAudio } = useTTS();
   useEffect(() => { speakRef.current = speak; }, [speak]);
   const onVoiceTranscript = useCallback((t: string) => { askVoiceRef.current(t); }, []);
   const { voiceState, setVoiceState: setVoiceSt, transcript: voiceTranscript,
@@ -2496,6 +2509,22 @@ export default function Home() {
                       padding:'52px 16px 24px', flexDirection:'column', alignItems:'center', gap:8,
                       pointerEvents:'none',
                     }}>
+                      {/* ── Mobile mute / audio-unlock chip ──────────────── */}
+                      <div style={{ pointerEvents:'auto', display:'flex', gap:6, alignItems:'center' }}>
+                        <button onClick={() => {
+                          unlockAudio();
+                          setMuted(!muted);
+                          if (muted) lastSpokenRef.current = ''; // re-speak next narration
+                        }} style={{
+                          background:'rgba(255,255,255,0.07)', border:'1px solid rgba(255,255,255,0.14)',
+                          borderRadius:20, padding:'4px 14px', cursor:'pointer',
+                          fontSize:13, color: muted ? 'rgba(255,255,255,0.30)' : 'rgba(255,255,255,0.70)',
+                          fontFamily:'monospace',
+                        }}>
+                          {muted ? '🔇 Audio off' : '🔊 Audio on'}
+                        </button>
+                      </div>
+
                       <div style={{
                         background:`${auraColor}1c`, border:`1px solid ${auraColor}4c`,
                         borderRadius:22, padding:'6px 22px',

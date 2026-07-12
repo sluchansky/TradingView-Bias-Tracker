@@ -597,6 +597,18 @@ function LordPiggingtonAvatar({
       }
       activeShapeRef.current = activeShape;
 
+      // ── Jaw bone fallback: visible mouth even when model has no morph targets ─
+      // VRM1 normalised bone 'jaw', opens with positive rotation.x
+      const jawBone = hum?.getNormalizedBoneNode?.('jaw' as never) ?? null;
+      if (jawBone) {
+        const bs   = boneSm as Record<string, { x: number; y: number; z: number }>;
+        if (!bs['_jaw']) bs['_jaw'] = { x: 0, y: 0, z: 0 };
+        const jawSm = bs['_jaw'];
+        const jawTgt = rawEnergy * 0.30;          // 0.30 rad ≈ 17° at peak energy
+        jawSm.x += (jawTgt - jawSm.x) * (1 - Math.exp(-16 * dt));
+        jawBone.rotation.x = jawSm.x;
+      }
+
       // ── Market-state expressions ──────────────────────────────────────────
       const exprTargets = STATE_EXPR[mktSt] ?? {};
       STATE_EXPR_NAMES.forEach(n => {
