@@ -1367,13 +1367,24 @@ function useConvMemory() {
   }, []);
 
   const context = useMemo((): string => {
-    if (entries.length === 0) return '';
+    const PERSONA = [
+      '[ANALYST VOICE — apply strictly]',
+      'You are a senior institutional futures trader narrating the tape live.',
+      'Rules: direct and concise (2-3 sentences unless complexity demands more); present tense, active voice.',
+      'Use professional market language — examples: "Structure weak." / "Buyers defending VWAP." /',
+      '"Momentum fading." / "Confirmation still missing." / "Risk outweighs reward." /',
+      '"No edge yet." / "Liquidity sweep complete." / "High-probability setup developing."',
+      'For every answer explain (1) what you see, (2) why it matters, (3) what would change your read.',
+      'Never use filler, hedging disclaimers, or generic chatbot language.',
+      '---',
+    ].join('\n');
     const TAG: Record<MemTag, string> = { pref:'NOTE', setup:'SETUP', trade:'TRADE', chat:'YOU', insight:'BRAIN' };
+    if (entries.length === 0) return PERSONA + '\n';
     const lines = entries.slice(-20).map(e => {
       const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/New_York' });
       return hh + ' [' + TAG[e.tag] + '] ' + e.text;
     });
-    return "[TODAY'S SESSION CONTEXT - reference naturally if relevant]\n" + lines.join('\n') + '\n---\n';
+    return PERSONA + '\n[TODAY\'S SESSION — weave in naturally if relevant]\n' + lines.join('\n') + '\n---\n';
   }, [entries]);
 
   return { entries, addEntry, clear, context };
@@ -1665,9 +1676,9 @@ export default function Home() {
     MUTED;
 
   const chips =
-    status === 'READY'    ? ['Walk me through this setup.', 'What invalidates the trade?', "Where's my stop?"] :
-    status === 'MANAGING' ? ['How is the trade going?', 'When do you exit?', 'Is thesis still valid?'] :
-    ['Why are you waiting?', 'Show me the evidence.', 'What changes your mind?'];
+    status === 'READY'    ? ['Break down the edge.', 'What invalidates this?', 'What does structure say?'] :
+    status === 'MANAGING' ? ['Thesis still intact?', 'Where do you partial?', 'Conviction level?'] :
+    ['What is missing?', 'Read the tape.', 'What triggers entry?'];
 
   const ask = useCallback(async (q?: string) => {
     const question = (q ?? input).trim(); if (!question || asking) return;
@@ -2432,7 +2443,7 @@ export default function Home() {
               background:'rgba(255,255,255,0.018)', overflow:'hidden' }}>
               <div ref={chatRef} style={{ maxHeight:220, overflowY:'auto', padding:'14px 14px 6px' }}>
                 {msgs.length === 0 && (
-                  <div style={{ fontSize:12, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', textAlign:'center', padding:'20px 0' }}>Ask me anything about this market.</div>
+                  <div style={{ fontSize:12, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', textAlign:'center', padding:'20px 0' }}>What do you see in the tape?</div>
                 )}
                 {msgs.map(m => <BrainBubble key={m.id} msg={m} />)}
                 {asking && (
