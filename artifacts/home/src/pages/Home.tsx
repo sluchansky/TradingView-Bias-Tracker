@@ -6,14 +6,38 @@ const MUTED = 'rgba(255,255,255,0.24)';
 const BLUE = '#3b82f6'; const CYAN = '#38bdf8';
 
 type Ticker = 'MNQ' | 'MGC' | 'MES' | 'MYM';
-type AvatarState = 'WAIT' | 'READY_LONG' | 'READY_SHORT' | 'NO_EDGE' | 'ACTIVE';
+type AvatarState = 'WAIT' | 'ANALYZING' | 'FORMING' | 'READY_LONG' | 'READY_SHORT' | 'NO_EDGE' | 'ACTIVE' | 'STOP_HIT' | 'TARGET_HIT';
 
 const AV_CFG: Record<AvatarState, { mesh: [number,number,number]; eye: [number,number,number]; dim: number }> = {
   WAIT:        { mesh: [40,  110, 230], eye: [80,  150, 255], dim: 0.60 },
+  ANALYZING:   { mesh: [50,  130, 245], eye: [90,  165, 255], dim: 0.72 },
+  FORMING:     { mesh: [200, 140,  35], eye: [245, 175,  60], dim: 0.85 },
   READY_LONG:  { mesh: [20,  185, 105], eye: [50,  225, 145], dim: 1.00 },
   READY_SHORT: { mesh: [225,  55,  72], eye: [255,  88, 108], dim: 0.95 },
   NO_EDGE:     { mesh: [45,   55, 125], eye: [70,   85, 175], dim: 0.30 },
   ACTIVE:      { mesh: [18,  165, 225], eye: [60,  205, 255], dim: 1.10 },
+  STOP_HIT:    { mesh: [180,  70,  80], eye: [220, 100, 110], dim: 0.65 },
+  TARGET_HIT:  { mesh: [180, 165,  30], eye: [220, 200,  55], dim: 0.90 },
+};
+
+type MouthType = 'relaxed'|'focused'|'interested'|'confident'|'tight'|'disappointment'|'satisfaction';
+interface AvExpr {
+  browLift: number; eyeOpen: number; mouthType: MouthType; leanY: number;
+  scanSpd: number; scanAX: number; scanAY: number;
+  blinkMin: number; blinkMax: number;
+  breatheSpd: number; breatheAmp: number;
+  partMult: number; meshSpd: number; eyeGlow: number; bgAlpha: number;
+}
+const AV_EXPR: Record<AvatarState, AvExpr> = {
+  WAIT:        { browLift: 0,    eyeOpen:1.00, mouthType:'relaxed',       leanY: 0, scanSpd:0.00028, scanAX:1.5, scanAY:0.6, blinkMin:3.5, blinkMax:8.5, breatheSpd:0.00078, breatheAmp:2.6, partMult:0.68, meshSpd:0.0019, eyeGlow:20, bgAlpha:0.11 },
+  ANALYZING:   { browLift: 1.4,  eyeOpen:0.91, mouthType:'focused',       leanY: 1, scanSpd:0.00055, scanAX:2.2, scanAY:0.9, blinkMin:3.0, blinkMax:7.0, breatheSpd:0.00088, breatheAmp:2.0, partMult:0.90, meshSpd:0.0026, eyeGlow:22, bgAlpha:0.13 },
+  FORMING:     { browLift:-1.0,  eyeOpen:1.06, mouthType:'interested',    leanY: 2, scanSpd:0.00048, scanAX:2.0, scanAY:0.8, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00092, breatheAmp:1.8, partMult:1.10, meshSpd:0.0028, eyeGlow:22, bgAlpha:0.13 },
+  READY_LONG:  { browLift:-2.0,  eyeOpen:1.00, mouthType:'confident',     leanY: 4, scanSpd:0.00022, scanAX:0.8, scanAY:0.3, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00095, breatheAmp:1.5, partMult:1.40, meshSpd:0.0028, eyeGlow:24, bgAlpha:0.14 },
+  READY_SHORT: { browLift:-2.0,  eyeOpen:1.00, mouthType:'focused',       leanY: 4, scanSpd:0.00022, scanAX:0.8, scanAY:0.3, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00095, breatheAmp:1.5, partMult:1.40, meshSpd:0.0028, eyeGlow:24, bgAlpha:0.14 },
+  ACTIVE:      { browLift: 1.5,  eyeOpen:0.88, mouthType:'tight',         leanY: 0, scanSpd:0.00115, scanAX:3.5, scanAY:1.2, blinkMin:2.0, blinkMax:5.0, breatheSpd:0.00115, breatheAmp:1.5, partMult:1.80, meshSpd:0.0038, eyeGlow:28, bgAlpha:0.17 },
+  STOP_HIT:    { browLift: 0.8,  eyeOpen:0.93, mouthType:'disappointment',leanY:-1, scanSpd:0.00020, scanAX:1.0, scanAY:0.5, blinkMin:3.5, blinkMax:8.0, breatheSpd:0.00068, breatheAmp:2.4, partMult:0.55, meshSpd:0.0016, eyeGlow:18, bgAlpha:0.09 },
+  TARGET_HIT:  { browLift:-1.2,  eyeOpen:1.03, mouthType:'satisfaction',  leanY: 2, scanSpd:0.00035, scanAX:1.5, scanAY:0.6, blinkMin:2.5, blinkMax:6.0, breatheSpd:0.00092, breatheAmp:1.8, partMult:1.00, meshSpd:0.0025, eyeGlow:23, bgAlpha:0.13 },
+  NO_EDGE:     { browLift: 0,    eyeOpen:1.00, mouthType:'relaxed',       leanY: 0, scanSpd:0.00018, scanAX:0.8, scanAY:0.4, blinkMin:3.5, blinkMax:8.5, breatheSpd:0.00058, breatheAmp:1.8, partMult:0.38, meshSpd:0.0019, eyeGlow:20, bgAlpha:0.05 },
 };
 
 const fmt = (n: number | null | undefined, dec = 2): string =>
@@ -180,25 +204,22 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
       const sec     = elapsed / 1000;
       const s       = stateRef.current;
       const cfg     = AV_CFG[s] || AV_CFG.WAIT;
+      const expr    = AV_EXPR[s] || AV_EXPR.WAIT;
       const spk     = speakRef.current;
 
-      // ── Derived per-state parameters ─────────────────────────────────────────
+      // ── State flags (used for ring / pulse pacing only) ───────────────────────
       const isReady  = s === 'READY_LONG' || s === 'READY_SHORT';
       const isActive = s === 'ACTIVE';
-      const isWait   = s === 'WAIT';
-      const isNoEdge = s === 'NO_EDGE';
 
-      // Pulse speeds: ACTIVE fastest, NO_EDGE slowest
+      // Pulse speeds: ACTIVE fastest (ring breathes faster under pressure)
       const pulseSpeed1 = isActive ? 0.0032 : isReady ? 0.0025 : 0.0018;
       const pulseSpeed2 = isActive ? 0.0038 : isReady ? 0.0030 : 0.0022;
       const pulse  = 0.5 + 0.5 * Math.sin(elapsed * pulseSpeed1);
       const pulse2 = 0.5 + 0.5 * Math.sin(elapsed * pulseSpeed2 + 1.1);
 
-      // Mesh node pulse speed (ACTIVE thinks fastest)
-      const meshSpeed = isActive ? 0.0038 : isReady ? 0.0028 : 0.0019;
-
-      // Particle speed multiplier
-      const partMult = isActive ? 1.80 : isReady ? 1.40 : isNoEdge ? 0.38 : 0.68;
+      // All expression/animation parameters keyed from AV_EXPR
+      const meshSpeed = expr.meshSpd;
+      const partMult  = expr.partMult;
 
       // ── Random blink (2.5–8s interval, 0.20s duration) ───────────────────────
       let blinkPct = 0;
@@ -208,37 +229,29 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
           blinkPct = Math.sin((bd / 0.20) * Math.PI);
         } else {
           // Schedule next blink: shorter interval when ACTIVE (alert), longer when WAIT
-          const minGap = isActive ? 2.0 : isWait ? 3.5 : 2.5;
-          const maxGap = isActive ? 5.0 : isWait ? 8.5 : 6.5;
+          const minGap = expr.blinkMin;
+          const maxGap = expr.blinkMax;
           nextBlinkRef.current = sec + minGap + Math.random() * (maxGap - minGap);
         }
       }
 
       // ── Breathing (slow sinusoidal Y bob, period varies by state) ────────────
-      const breatheSpeed = isWait   ? 0.00078 :
-                           isNoEdge ? 0.00058 :
-                           isActive ? 0.00115 : 0.00095;
-      const breatheAmp   = isWait ? 2.6 : isNoEdge ? 1.8 : 1.5;
+      const breatheSpeed = expr.breatheSpd;
+      const breatheAmp   = expr.breatheAmp;
       const breatheY     = Math.sin(elapsed * breatheSpeed) * breatheAmp;
 
-      // READY: lean-forward (+4px down = face tilts toward viewer)
-      const leanY = isReady ? 4 : 0;
+      // Per-state lean: positive = tilt toward viewer, negative = lean back
+      const leanY = expr.leanY;
 
       // Speaking: fast jaw bob blended with breathing
       const bob = spk
         ? breatheY * 0.4 + Math.sin(elapsed * 0.006) * 2 + leanY
         : breatheY + leanY;
 
-      // ── Eye scan (pupil drift) ────────────────────────────────────────────────
-      // ACTIVE: clear left-right market-monitoring sweep
-      // WAIT:   very slow, dreamlike drift
-      // READY:  barely moves, locked-in gaze
-      // NO_EDGE: slow gentle drift
-      const scanSpeed = isActive  ? 0.00115 :
-                        isWait    ? 0.00028 :
-                        isNoEdge  ? 0.00018 : 0.00048;
-      const scanAmpX  = isActive  ? 3.5 : isWait ? 1.5 : 0.8;
-      const scanAmpY  = isActive  ? 1.2 : isWait ? 0.6 : 0.3;
+      // ── Eye scan (pupil drift) — speed/amplitude keyed from AV_EXPR ─────────────
+      const scanSpeed = expr.scanSpd;
+      const scanAmpX  = expr.scanAX;
+      const scanAmpY  = expr.scanAY;
       const eyeOffX   = Math.sin(elapsed * scanSpeed) * scanAmpX;
       const eyeOffY   = Math.sin(elapsed * scanSpeed * 0.68 + 1.4) * scanAmpY;
 
@@ -261,16 +274,10 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
       const finalOffY   = eyeOffY * (1 - gazeLerp) + gz.dy * gazeLerp;
       const widenFactor = gz.widen && gazeLerp > 0.05 ? 1 + 0.28 * gazeLerp : 1.0;
 
-      // ── Brow offset per state ─────────────────────────────────────────────────
-      // READY: raised slightly (alert, confident)
-      // ACTIVE: very slight furrow (concentrated)
-      const browLift = isReady ? -2 : isActive ? 1 : 0;
-
-      // ── Ambient glow intensity ────────────────────────────────────────────────
-      const bgAlpha = isActive ? 0.17 : isReady ? 0.14 : isNoEdge ? 0.05 : 0.11;
-
-      // ── Eye glow brightness ───────────────────────────────────────────────────
-      const eyeGlow = isActive ? 28 : isReady ? 24 : 20;
+      // ── Expression parameters — all driven by AV_EXPR table ─────────────────────
+      const browLift = expr.browLift;
+      const bgAlpha  = expr.bgAlpha;
+      const eyeGlow  = expr.eyeGlow;
 
       ctx.clearRect(0, 0, W, H);
 
@@ -322,7 +329,7 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
       // Forehead scan lines (animated for ACTIVE — sweeping data-read effect)
       const scanBaseAlpha = isActive
         ? 0.06 + 0.09 * Math.abs(Math.sin(elapsed * 0.0028))
-        : isNoEdge ? 0.04 : 0.09;
+        : s === 'NO_EDGE' ? 0.04 : 0.09;
       const scanLine = (y: number, mul: number) => {
         const hw = Math.sqrt(Math.max(0, RX * RX * (1 - ((y - CY) * (y - CY)) / (RY * RY))));
         ctx.beginPath(); ctx.moveTo(CX - hw * 0.8, y + bob); ctx.lineTo(CX + hw * 0.8, y + bob);
@@ -358,8 +365,8 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
       ];
       eyeDefs.forEach(eye => {
         const eyeY  = eye.y + bob;
-        // widenFactor briefly expands the eye opening on volatility / zone events
-        const eyeRY = 7.5 * widenFactor * (1 - blinkPct * 0.94);
+        // eyeOpen (AV_EXPR) = emotional openness; widenFactor = event pop
+        const eyeRY = 7.5 * expr.eyeOpen * widenFactor * (1 - blinkPct * 0.94);
         const tilt  = eye.tilt;
 
         // Iris/pupil center: idle scan blended with market-event gaze target
@@ -439,18 +446,21 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent }: {
         ctx.strokeStyle = rc(cfg.mesh, 0.09 * cfg.dim); ctx.lineWidth = 0.7; ctx.stroke();
       });
 
-      // ── Mouth ────────────────────────────────────────────────────────────────
+      // ── Mouth — all expressions professional and understated ─────────────────
+      // Bezier control point BELOW endpoints (higher y) = smile (U-shape)
+      // Bezier control point ABOVE endpoints (lower y)  = frown (arch-shape)
       ctx.shadowBlur = 5; ctx.shadowColor = rc(cfg.eye, 0.30);
       ctx.beginPath();
       const my = CY + 57 + bob;
-      if (s === 'READY_LONG') {
-        ctx.moveTo(CX - 17, my); ctx.quadraticCurveTo(CX, my + 4, CX + 17, my);
-      } else if (s === 'READY_SHORT') {
-        ctx.moveTo(CX - 15, my + 1); ctx.lineTo(CX + 15, my + 1);
-      } else if (s === 'ACTIVE') {
-        ctx.moveTo(CX - 13, my); ctx.lineTo(CX + 13, my);
-      } else {
-        ctx.moveTo(CX - 17, my); ctx.quadraticCurveTo(CX, my + 2, CX + 17, my);
+      switch (expr.mouthType) {
+        case 'confident':     ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+4,   CX+17,my);     break; // clear smile — READY_LONG
+        case 'satisfaction':  ctx.moveTo(CX-16,my+1);   ctx.quadraticCurveTo(CX,my+3.5, CX+16,my+1);   break; // warm close-lipped smile
+        case 'interested':    ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+3,   CX+15,my+0.5); break; // curious upturn
+        case 'relaxed':       ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break; // gentle resting curve
+        case 'focused':       ctx.moveTo(CX-15,my+0.5); ctx.quadraticCurveTo(CX,my+1,   CX+15,my+0.5); break; // nearly flat, controlled
+        case 'tight':         ctx.moveTo(CX-13,my);     ctx.lineTo(CX+13,my);                          break; // firm line — ACTIVE
+        case 'disappointment':ctx.moveTo(CX-15,my);     ctx.quadraticCurveTo(CX,my-2,   CX+15,my);     break; // subtle arch-down frown
+        default:              ctx.moveTo(CX-17,my);     ctx.quadraticCurveTo(CX,my+2,   CX+17,my);     break;
       }
       ctx.strokeStyle = rc(cfg.eye, 0.38 * cfg.dim); ctx.lineWidth = 1.2; ctx.stroke();
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
@@ -1427,12 +1437,37 @@ export default function Home() {
   const { text: displayed, live: streaming } = useMonologue(thoughts, status);
   const checklist = data ? getBrainChecklist(data) : [];
 
-  // Avatar state
+  // Transient outcome state — STOP_HIT / TARGET_HIT for 22s after a closed trade
+  const [outcomeState, setOutcomeState] = useState<'none'|'win'|'loss'>('none');
+  const lastTradeIdRef = useRef<string|null>(null);
+  useEffect(() => {
+    if (!data) return;
+    const trades: any[] = data?.recent_trades ?? data?.by_instrument_today ?? [];
+    const latest = trades[0];
+    if (!latest) return;
+    const tid = String(latest.id ?? latest.opened_at ?? '');
+    if (!tid || tid === lastTradeIdRef.current) return;
+    lastTradeIdRef.current = tid;
+    const out = String(latest.outcome ?? latest.result ?? '').toLowerCase();
+    if (/win|profit|target/.test(out)) {
+      setOutcomeState('win');
+      setTimeout(() => setOutcomeState('none'), 22000);
+    } else if (/loss|stop|sl/.test(out)) {
+      setOutcomeState('loss');
+      setTimeout(() => setOutcomeState('none'), 22000);
+    }
+  }, [data]);
+
+  // Avatar emotional state — maps trading context to one of 9 expressions
   const avState: AvatarState = (() => {
-    if (isManaging) return 'ACTIVE';
-    if (status === 'READY' && /long|bull/i.test(dirn)) return 'READY_LONG';
-    if (status === 'READY' && /short|bear/i.test(dirn)) return 'READY_SHORT';
-    if (edge < 25) return 'NO_EDGE';
+    if (outcomeState === 'loss')                                    return 'STOP_HIT';
+    if (outcomeState === 'win')                                     return 'TARGET_HIT';
+    if (isManaging)                                                 return 'ACTIVE';
+    if (status === 'READY' && /long|bull/i.test(dirn))             return 'READY_LONG';
+    if (status === 'READY' && /short|bear/i.test(dirn))            return 'READY_SHORT';
+    if (status === 'BUILDING' || edge >= 50)                        return 'FORMING';
+    if (edge >= 28)                                                 return 'ANALYZING';
+    if (edge < 20)                                                  return 'NO_EDGE';
     return 'WAIT';
   })();
 
@@ -1588,7 +1623,14 @@ export default function Home() {
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
 
   // Aura glow color
-  const auraColor = avState === 'READY_LONG' ? '#22c55e' : avState === 'READY_SHORT' ? '#ef4444' : avState === 'ACTIVE' ? CYAN : BLUE;
+  const auraColor =
+    avState === 'READY_LONG'  ? '#22c55e' :
+    avState === 'READY_SHORT' ? '#ef4444' :
+    avState === 'ACTIVE'      ? CYAN       :
+    avState === 'FORMING'     ? '#f59e0b' :
+    avState === 'ANALYZING'   ? '#60a5fa' :
+    avState === 'STOP_HIT'    ? '#f87171' :
+    avState === 'TARGET_HIT'  ? '#fbbf24' : BLUE;
 
   return (
     <div style={{ height:'100vh', background:'#060810', color:'#fff', display:'flex', flexDirection:'column',
@@ -1831,7 +1873,14 @@ export default function Home() {
                     boxShadow:`0 0 8px ${verdictColor}, 0 0 18px ${verdictColor}44` }} />
                   <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
                     color:'rgba(255,255,255,0.38)', textTransform:'uppercase' }}>
-                    {avState === 'ACTIVE' ? 'MANAGING' : avState === 'READY_LONG' ? 'LONG SETUP' : avState === 'READY_SHORT' ? 'SHORT SETUP' : avState === 'NO_EDGE' ? 'NO EDGE' : 'WATCHING'}
+                    {avState === 'ACTIVE'      ? 'MANAGING'      :
+                     avState === 'READY_LONG'  ? 'LONG SETUP'    :
+                     avState === 'READY_SHORT' ? 'SHORT SETUP'   :
+                     avState === 'FORMING'     ? 'SETUP FORMING' :
+                     avState === 'ANALYZING'   ? 'ANALYZING'     :
+                     avState === 'STOP_HIT'    ? 'STOP HIT'      :
+                     avState === 'TARGET_HIT'  ? 'TARGET HIT'    :
+                     avState === 'NO_EDGE'     ? 'NO EDGE'       : 'WATCHING'}
                   </span>
                 </div>
 
