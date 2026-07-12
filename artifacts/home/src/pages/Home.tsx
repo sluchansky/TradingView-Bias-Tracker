@@ -2038,7 +2038,13 @@ export default function Home() {
     @keyframes mcFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-1.8px)}}
     @keyframes connFlash{0%{opacity:0.92}50%{opacity:0.55}100%{opacity:0}}
     @media(max-width:1100px){.mc-col{width:108px!important;}.mc-card{padding:7px 9px!important;}.mc-value{font-size:11.5px!important;}}
-    @media(max-width:900px){.mc-stage{display:none!important;}}
+    @media(max-width:900px){
+      .mc-top-row{display:none!important;}
+      .mc-bot-row{display:none!important;}
+      .mc-col{display:none!important;}
+      .mc-mid-row{justify-content:center!important;gap:0!important;}
+      .mc-stage{min-height:unset!important;}
+    }
   `;
 
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
