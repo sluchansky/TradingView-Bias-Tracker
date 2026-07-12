@@ -2013,24 +2013,62 @@ export default function Home() {
     .sidebar-panel { animation:slideIn 0.18s ease-out; }
     @media(max-width:760px){.sidebar-l{display:none!important;}}
     @media(max-width:768px){
-      /* ── ALL AVATAR: pig fills the screen, everything else hidden ── */
-      .main-center>*:not(.mb-row){display:none!important;}
-      .main-center{padding:0!important;overflow:hidden!important;}
-      .mb-row{flex-direction:column!important;min-height:calc(100vh - 48px)!important;height:calc(100vh - 48px)!important;margin-bottom:0!important;gap:0!important;align-items:center!important;justify-content:center!important;}
-      .mb-brain{display:none!important;}
-      .mc-stage{flex:1!important;min-height:0!important;width:100%!important;display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;}
-      .mc-top-row{display:none!important;}
-      .mc-bot-row{display:none!important;}
-      .mc-col{display:none!important;}
-      .mc-mid-row{flex:1!important;justify-content:center!important;align-items:flex-start!important;gap:0!important;}
-      .mc-avtr-outer{align-self:stretch!important;flex:1!important;justify-content:center!important;align-items:flex-start!important;}
-      .mc-avtr-box{transform:scale(1.48)!important;transform-origin:top center!important;}
-      .mob-avtr-overlay{display:flex!important;}
+      /* ── COMPACT COCKPIT: avatar (left) + brain panel (right) ── */
+
       /* Header: compact */
       .hdr-logo-name{display:none!important;}
       .hdr-clock{display:none!important;}
       .hdr-eng{display:none!important;}
       .ticker-btn{padding:3px 7px!important;font-size:10px!important;}
+
+      /* Scrollable main, tight padding */
+      .main-center{padding:8px!important;overflow-y:auto!important;overflow-x:hidden!important;}
+      /* Keep focus on the command center */
+      .main-center>*:not(.mb-row){display:none!important;}
+
+      /* mb-row: horizontal row, auto height */
+      .mb-row{
+        flex-direction:row!important;
+        gap:10px!important;
+        min-height:unset!important;
+        height:auto!important;
+        margin-bottom:0!important;
+        align-items:flex-start!important;
+        justify-content:flex-start!important;
+      }
+
+      /* mc-stage: trim to just the avatar (hide card rows + telemetry cols) */
+      .mc-stage{flex-shrink:0!important;flex:unset!important;width:unset!important;}
+      .mc-top-row{display:none!important;}
+      .mc-bot-row{display:none!important;}
+      .mc-col{display:none!important;}
+      .mc-mid-row{flex:unset!important;gap:0!important;align-items:flex-start!important;}
+
+      /* Avatar: 342×455 canvas scaled to 0.41 → 140×187px visible window */
+      .mc-avtr-outer{
+        width:140px!important;height:190px!important;
+        overflow:hidden!important;
+        flex:unset!important;flex-shrink:0!important;
+        align-self:flex-start!important;
+        align-items:flex-start!important;justify-content:flex-start!important;
+      }
+      .mc-avtr-box{
+        transform:scale(0.41)!important;
+        transform-origin:top left!important;
+      }
+
+      /* Overlay not needed in cockpit layout */
+      .mob-avtr-overlay{display:none!important;}
+
+      /* Brain panel: visible, fills remaining width */
+      .mb-brain{
+        display:flex!important;flex:1!important;min-width:0!important;
+        gap:8px!important;justify-content:flex-start!important;
+      }
+      .verdict-big{font-size:19px!important;letter-spacing:-0.01em!important;}
+      .verdict-sub{font-size:11px!important;margin-top:2px!important;}
+      .edge-wrap{max-width:unset!important;}
+      .wait-box{font-size:10px!important;padding:6px 8px!important;}
     }
     /* Hidden on desktop, shown on mobile */
     .mob-avtr-overlay{display:none;}
