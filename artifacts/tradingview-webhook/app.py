@@ -49377,8 +49377,8 @@ setInterval(function(){
   // One-time layout reset when the panel set changes (Main Brain added) so existing
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
-  var VKEY = 'dashLayoutVer', VER = 'brain-layout-2026-07';
-  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.setItem(VKEY, VER); } }catch(e){}
+  var VKEY = 'dashLayoutVer', VER = 'brain-layout-2026-07c';
+  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.setItem('dashAdv','1'); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
   function key(m){ return m.id || ''; }
