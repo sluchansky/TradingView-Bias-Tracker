@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import VRMAvatar from './VRMAvatar';
+import LordPiggingtonAvatar from '../components/avatar/LordPiggingtonAvatar';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const BULL = '#22c55e'; const BEAR = '#ef4444'; const AMB = '#f59e0b';
@@ -2406,7 +2406,7 @@ export default function Home() {
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
                       justifyContent:'center', transform:'scale(1.50)', transformOrigin:'center center', zIndex:1 }}>
-                      <VRMAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} />
+                      <LordPiggingtonAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} />
                     </div>
 
                     {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}

@@ -1,0 +1,245 @@
+The VRM avatar is now visible, but it is still being displayed like a flat video or image inside a bright rectangular box.
+
+Do not redesign the dashboard or replace the avatar.
+
+Use the existing LordPiggington.vrm file and improve only the avatar presentation and animation.
+
+GOAL:
+Make Lord Piggington feel like a living AI trading partner integrated directly into the dashboard.
+
+1. REMOVE THE RECTANGULAR BACKGROUND
+
+The VRM canvas must have a transparent background.
+
+Requirements:
+- Remove the orange/yellow rectangular scene background.
+- Set the Three.js renderer alpha to true.
+- Use renderer.setClearColor(0x000000, 0).
+- Make the canvas background transparent.
+- Do not place the avatar inside a visible card, video frame, or colored rectangle.
+- The avatar should appear directly over the dashboard background.
+
+Example:
+
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: true
+});
+
+renderer.setClearColor(0x000000, 0);
+
+2. FIX THE CAMERA FRAMING
+
+The avatar is currently too zoomed in and cropped.
+
+Requirements:
+- Show the full head, ears, shoulders, and upper torso.
+- Keep the character centered.
+- Leave space above the ears.
+- Do not crop the chin.
+- Automatically frame the avatar based on the VRM model bounds.
+- Make the avatar responsive on desktop, tablet, and Tesla browser dimensions.
+
+3. USE THE EXISTING VRM MODEL
+
+Load:
+
+/LordPiggington.vrm
+
+Use:
+- three
+- @pixiv/three-vrm
+- GLTFLoader
+
+Do not rebuild the pig with CSS, SVG, images, or generated geometry.
+
+4. ADD NATURAL IDLE ANIMATION
+
+The avatar must never look completely frozen.
+
+Add:
+- Automatic blinking every 3 to 7 seconds
+- Subtle breathing
+- Very small body sway
+- Occasional head tilt
+- Occasional eye movement
+- Slight ear or head movement if supported
+- Smooth transitions only
+
+Keep the movements subtle. Do not make the avatar constantly shake or bounce.
+
+5. ADD REAL LIP SYNC
+
+Use the VRM facial expressions already included in the model.
+
+Drive:
+- aa
+- ih
+- ou
+- ee
+- oh
+
+Use the actual audio output from the AI voice.
+
+Preferred implementation:
+- Web Audio API
+- AnalyserNode
+- Audio amplitude controls mouth opening
+- Cycle or map the VRM vowel expressions during speech
+- Smoothly interpolate expression weights
+- Reset all mouth expressions to zero when speech ends
+
+Do not use a random CSS mouth animation.
+
+6. ADD BLINKING AND EYE MOVEMENT
+
+Use the VRM expression manager.
+
+Blink:
+- blink
+- blinkLeft
+- blinkRight
+
+Also:
+- Use the VRM lookAt system where available
+- Have the eyes generally face the camera
+- Occasionally glance toward the left-side market indicators
+- Occasionally glance toward the Managing Trade panel
+- Return to looking toward the user
+
+Keep eye movement slow and natural.
+
+7. ADD MARKET REACTIONS
+
+Connect the avatar state to the dashboard’s existing trading state.
+
+States:
+
+NEUTRAL
+- Normal expression
+- Slow idle movement
+
+ANALYZING
+- Slight head tilt
+- Eyes glance toward dashboard data
+- Subtle thinking motion
+
+BULLISH
+- Mild happy expression
+- Small nod
+- Subtle green glow around the avatar container
+
+BEARISH
+- Mild concerned or serious expression
+- Small head shake
+- Subtle red glow
+
+HIGH VOLATILITY
+- Slightly widened eyes
+- Lean forward slightly
+- Do not exaggerate
+
+TRADE OPENED
+- Brief confident nod
+
+TRADE WON
+- Brief happy expression
+- Small celebration motion
+
+TRADE LOST
+- Brief disappointed expression
+- Return to neutral after a few seconds
+
+Do not use extreme cartoon reactions.
+
+8. ADD SPEAKING STATUS
+
+When the AI is speaking:
+- Set avatar state to SPEAKING
+- Run lip sync
+- Look toward the user
+- Show a small animated speaking indicator
+- Allow the subtitle text to appear near the avatar
+
+When speech ends:
+- Stop lip sync
+- Fade the subtitle
+- Return to the previous market state
+
+9. ADD A SPEAK BUTTON
+
+Add a clearly visible microphone button beneath or beside the avatar.
+
+Behavior:
+- Tap once to start microphone listening
+- Tap again to stop
+- Show Listening while active
+- Show Thinking while processing
+- Show Speaking while the avatar responds
+- Prevent multiple recordings from running simultaneously
+- Handle microphone permission errors cleanly
+
+10. PERFORMANCE REQUIREMENTS
+
+This must work smoothly inside the existing dashboard.
+
+Requirements:
+- Only one WebGL renderer
+- Only one animation loop
+- Properly dispose of the renderer, textures, geometry, and event listeners when the component unmounts
+- Do not reload the VRM whenever dashboard data updates
+- Store frequently changing market data in refs or isolated state
+- Target smooth performance on the Tesla browser and normal desktop browsers
+- Pause or reduce animation when the page is not visible
+- Do not break the existing trade logic, alerts, data feeds, voice system, or Managing Trade panel
+
+11. COMPONENT STRUCTURE
+
+Create or update components similar to:
+
+components/avatar/
+  LordPiggingtonAvatar.tsx
+  useVrmLoader.ts
+  useAvatarIdle.ts
+  useAvatarLipSync.ts
+  useAvatarBlink.ts
+  useAvatarLookAt.ts
+  useAvatarMarketState.ts
+  avatarTypes.ts
+
+The main dashboard should pass only simple props such as:
+
+<LordPiggingtonAvatar
+  status={brainStatus}
+  marketBias={marketBias}
+  volatilityState={volatilityState}
+  isSpeaking={isSpeaking}
+  audioElement={audioElement}
+  subtitle={currentSpeechText}
+/>
+
+12. IMPORTANT RESTRICTIONS
+
+Do not:
+- Replace LordPiggington.vrm
+- Generate another face
+- Use a flat image of the avatar
+- Put the avatar inside an orange rectangle
+- Redesign the whole dashboard
+- Remove the existing market indicators
+- Change trading logic
+- Add more information boxes
+- Create a second AI brain
+- Use fake mouth movement when VRM expressions are available
+
+FIRST TASK:
+Before making changes, inspect the current avatar component and report:
+
+1. Where the VRM is loaded
+2. Whether the renderer has alpha enabled
+3. What is creating the orange background
+4. Whether VRM expressions are currently being used
+5. Whether the voice audio is accessible for lip sync
+6. Which files will be modified
+
+Then implement the changes in small steps and test after each step.
