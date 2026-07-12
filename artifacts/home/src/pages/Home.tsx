@@ -2405,7 +2405,7 @@ export default function Home() {
                       background:`radial-gradient(ellipse at 50% 100%, ${auraColor}2c 0%, transparent 66%)`,
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
-                      justifyContent:'center', transform:'scale(1.50)', transformOrigin:'center center', zIndex:1 }}>
+                      justifyContent:'center', zIndex:1 }}>
                       <LordPiggingtonAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} />
                     </div>
 

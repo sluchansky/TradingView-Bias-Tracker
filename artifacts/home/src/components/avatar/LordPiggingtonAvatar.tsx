@@ -421,7 +421,6 @@ function LordPiggingtonAvatar({ avState, speaking, gazeEvent, speechCtrlRef }: L
       style={{
         display: 'block',
         background: 'transparent',
-        filter: 'drop-shadow(0 4px 32px rgba(0,148,255,0.28))',
       }}
     />
   );
