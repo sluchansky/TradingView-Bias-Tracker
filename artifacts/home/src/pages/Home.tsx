@@ -27,17 +27,23 @@ interface AvExpr {
   blinkMin: number; blinkMax: number;
   breatheSpd: number; breatheAmp: number;
   partMult: number; meshSpd: number; eyeGlow: number; bgAlpha: number;
+  browPinch:  number;  // inner-brow corners down(+)/up(–) — furrow vs open
+  browWave:   number;  // sinusoidal inner-brow micro-movement amplitude (px)
+  eyeBright:  number;  // iris brightness multiplier (1.0 = normal)
+  headTilt:   number;  // canvas rotation for head tilt (radians)
+  pupilScale: number;  // pupil radius multiplier (1.0 = normal)
 }
 const AV_EXPR: Record<AvatarState, AvExpr> = {
-  WAIT:        { browLift: 0,    eyeOpen:1.00, mouthType:'relaxed',       leanY: 0, scanSpd:0.00028, scanAX:1.5, scanAY:0.6, blinkMin:3.5, blinkMax:8.5, breatheSpd:0.00078, breatheAmp:2.6, partMult:0.68, meshSpd:0.0019, eyeGlow:20, bgAlpha:0.11 },
-  ANALYZING:   { browLift: 1.4,  eyeOpen:0.91, mouthType:'focused',       leanY: 1, scanSpd:0.00055, scanAX:2.2, scanAY:0.9, blinkMin:3.0, blinkMax:7.0, breatheSpd:0.00088, breatheAmp:2.0, partMult:0.90, meshSpd:0.0026, eyeGlow:22, bgAlpha:0.13 },
-  FORMING:     { browLift:-1.0,  eyeOpen:1.06, mouthType:'interested',    leanY: 2, scanSpd:0.00048, scanAX:2.0, scanAY:0.8, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00092, breatheAmp:1.8, partMult:1.10, meshSpd:0.0028, eyeGlow:22, bgAlpha:0.13 },
-  READY_LONG:  { browLift:-2.0,  eyeOpen:1.00, mouthType:'confident',     leanY: 4, scanSpd:0.00022, scanAX:0.8, scanAY:0.3, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00095, breatheAmp:1.5, partMult:1.40, meshSpd:0.0028, eyeGlow:24, bgAlpha:0.14 },
-  READY_SHORT: { browLift:-2.0,  eyeOpen:1.00, mouthType:'focused',       leanY: 4, scanSpd:0.00022, scanAX:0.8, scanAY:0.3, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00095, breatheAmp:1.5, partMult:1.40, meshSpd:0.0028, eyeGlow:24, bgAlpha:0.14 },
-  ACTIVE:      { browLift: 1.5,  eyeOpen:0.88, mouthType:'tight',         leanY: 0, scanSpd:0.00115, scanAX:3.5, scanAY:1.2, blinkMin:2.0, blinkMax:5.0, breatheSpd:0.00115, breatheAmp:1.5, partMult:1.80, meshSpd:0.0038, eyeGlow:28, bgAlpha:0.17 },
-  STOP_HIT:    { browLift: 0.8,  eyeOpen:0.93, mouthType:'disappointment',leanY:-1, scanSpd:0.00020, scanAX:1.0, scanAY:0.5, blinkMin:3.5, blinkMax:8.0, breatheSpd:0.00068, breatheAmp:2.4, partMult:0.55, meshSpd:0.0016, eyeGlow:18, bgAlpha:0.09 },
-  TARGET_HIT:  { browLift:-1.2,  eyeOpen:1.03, mouthType:'satisfaction',  leanY: 2, scanSpd:0.00035, scanAX:1.5, scanAY:0.6, blinkMin:2.5, blinkMax:6.0, breatheSpd:0.00092, breatheAmp:1.8, partMult:1.00, meshSpd:0.0025, eyeGlow:23, bgAlpha:0.13 },
-  NO_EDGE:     { browLift: 0,    eyeOpen:1.00, mouthType:'relaxed',       leanY: 0, scanSpd:0.00018, scanAX:0.8, scanAY:0.4, blinkMin:3.5, blinkMax:8.5, breatheSpd:0.00058, breatheAmp:1.8, partMult:0.38, meshSpd:0.0019, eyeGlow:20, bgAlpha:0.05 },
+  //                                                                                                                                                                           browPinch  browWave eyeBright headTilt  pupilScale
+  WAIT:        { browLift: 0,    eyeOpen:1.00, mouthType:'relaxed',        leanY: 0, scanSpd:0.00028, scanAX:1.5, scanAY:0.6, blinkMin:3.5, blinkMax:8.5, breatheSpd:0.00078, breatheAmp:2.6, partMult:0.68, meshSpd:0.0019, eyeGlow:20, bgAlpha:0.11, browPinch: 0,   browWave:0,   eyeBright:1.00, headTilt: 0,     pupilScale:1.00 },
+  ANALYZING:   { browLift: 1.4,  eyeOpen:0.91, mouthType:'focused',        leanY: 1, scanSpd:0.00055, scanAX:2.2, scanAY:0.9, blinkMin:3.0, blinkMax:7.0, breatheSpd:0.00088, breatheAmp:2.0, partMult:0.90, meshSpd:0.0026, eyeGlow:22, bgAlpha:0.13, browPinch: 2.5, browWave:1.2, eyeBright:0.92, headTilt: 0,     pupilScale:0.88 },
+  FORMING:     { browLift:-1.0,  eyeOpen:1.08, mouthType:'interested',     leanY: 2, scanSpd:0.00048, scanAX:2.0, scanAY:0.8, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00092, breatheAmp:1.8, partMult:1.10, meshSpd:0.0028, eyeGlow:22, bgAlpha:0.13, browPinch:-1.5, browWave:0,   eyeBright:1.06, headTilt: 0.030, pupilScale:1.12 },
+  READY_LONG:  { browLift:-2.0,  eyeOpen:1.00, mouthType:'confident',      leanY: 4, scanSpd:0.00022, scanAX:0.8, scanAY:0.3, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00095, breatheAmp:1.5, partMult:1.40, meshSpd:0.0028, eyeGlow:26, bgAlpha:0.14, browPinch: 0,   browWave:0,   eyeBright:1.18, headTilt: 0,     pupilScale:1.00 },
+  READY_SHORT: { browLift:-1.5,  eyeOpen:0.98, mouthType:'focused',        leanY: 4, scanSpd:0.00022, scanAX:0.8, scanAY:0.3, blinkMin:2.5, blinkMax:6.5, breatheSpd:0.00095, breatheAmp:1.5, partMult:1.40, meshSpd:0.0028, eyeGlow:26, bgAlpha:0.14, browPinch: 0.8, browWave:0,   eyeBright:1.10, headTilt: 0,     pupilScale:0.94 },
+  ACTIVE:      { browLift: 1.5,  eyeOpen:0.88, mouthType:'tight',          leanY: 0, scanSpd:0.00115, scanAX:3.5, scanAY:1.2, blinkMin:2.0, blinkMax:5.0, breatheSpd:0.00115, breatheAmp:1.5, partMult:1.80, meshSpd:0.0038, eyeGlow:28, bgAlpha:0.17, browPinch: 2.0, browWave:0.6, eyeBright:1.05, headTilt: 0,     pupilScale:0.88 },
+  STOP_HIT:    { browLift: 0.8,  eyeOpen:0.93, mouthType:'disappointment', leanY:-1, scanSpd:0.00020, scanAX:1.0, scanAY:0.5, blinkMin:3.5, blinkMax:8.0, breatheSpd:0.00068, breatheAmp:2.4, partMult:0.55, meshSpd:0.0016, eyeGlow:18, bgAlpha:0.09, browPinch: 3.5, browWave:0,   eyeBright:0.88, headTilt: 0,     pupilScale:0.92 },
+  TARGET_HIT:  { browLift:-1.2,  eyeOpen:1.03, mouthType:'satisfaction',   leanY: 2, scanSpd:0.00035, scanAX:1.5, scanAY:0.6, blinkMin:2.5, blinkMax:6.0, breatheSpd:0.00092, breatheAmp:1.8, partMult:1.00, meshSpd:0.0025, eyeGlow:23, bgAlpha:0.13, browPinch:-1.0, browWave:0,   eyeBright:1.12, headTilt: 0,     pupilScale:1.05 },
+  NO_EDGE:     { browLift: 0,    eyeOpen:1.00, mouthType:'relaxed',        leanY: 0, scanSpd:0.00018, scanAX:0.8, scanAY:0.4, blinkMin:3.5, blinkMax:8.5, breatheSpd:0.00058, breatheAmp:1.8, partMult:0.38, meshSpd:0.0019, eyeGlow:20, bgAlpha:0.05, browPinch: 0,   browWave:0,   eyeBright:0.82, headTilt: 0,     pupilScale:1.00 },
 };
 
 const fmt = (n: number | null | undefined, dec = 2): string =>
@@ -454,8 +460,15 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
       const widenFactor = gz.widen && gazeLerp > 0.05 ? 1 + 0.28 * gazeLerp : 1.0;
 
       // ── Expression parameters — all driven by AV_EXPR table ─────────────────────
-      const browLift  = expr.browLift;
-      const bgAlpha   = expr.bgAlpha;
+      const browLift   = expr.browLift;
+      const bgAlpha    = expr.bgAlpha;
+      const browPinch  = expr.browPinch;
+      const browWave   = expr.browWave;
+      const eyeBright  = expr.eyeBright;
+      const headTilt   = expr.headTilt;
+      const pupilScale = expr.pupilScale;
+      // Inner-brow offset: static pinch + slow sinusoidal wave (thinking micro-movement)
+      const innerBrowY = browPinch + browWave * Math.sin(elapsed * 0.0014);
       // Boost eye glow while speaking — keeps eyes alive and engaged
       const spkEnergy = spk ? (speechCtrlRef.current?.energy ?? 0) : 0;
       const eyeGlow   = expr.eyeGlow + (spk ? 7 + spkEnergy * 9 : 0);
@@ -502,6 +515,12 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.beginPath(); ctx.arc(n.x, n.y + bob, 1.5, 0, Math.PI * 2);
         ctx.fillStyle = rc(cfg.mesh, p * 0.65 * cfg.dim); ctx.fill();
       });
+
+      // ── Head tilt transform — pivots entire face; rings/particles stay fixed ────
+      ctx.save();
+      ctx.translate(CX, CY + bob);
+      ctx.rotate(headTilt);
+      ctx.translate(-CX, -(CY + bob));
 
       // ── Face fill — cinematic 3-point lighting over dark volumetric base ────────
       ctx.save();
@@ -573,8 +592,10 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.strokeStyle = rc(cfg.eye, 0.24 * cfg.dim); ctx.lineWidth = 0.65; ctx.stroke();
         ctx.restore();
       };
-      drawBrow(CX - 46, CY - 37, CX - 27, CY - 48, CX - 11, CY - 43);
-      drawBrow(CX + 11, CY - 43, CX + 27, CY - 48, CX + 46, CY - 37);
+      // innerBrowY > 0: inner corners move down (furrow/concerned)
+      // innerBrowY < 0: inner corners move up (open/curious)
+      drawBrow(CX - 46, CY - 37, CX - 27, CY - 48 + innerBrowY * 0.35, CX - 11, CY - 43 + innerBrowY);
+      drawBrow(CX + 11, CY - 43 + innerBrowY, CX + 27, CY - 48 + innerBrowY * 0.35, CX + 46, CY - 37);
 
       // ── Eyes — anatomical with sclera, iris fibers, eyelids, lashes ──────────
       const eyeDefs = [
@@ -620,8 +641,8 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
           ctx.save();
           ctx.beginPath(); ctx.ellipse(px, py, irisR, Math.max(0.5, eyeRY * 0.87), tilt, 0, Math.PI * 2); ctx.clip();
           const irisG = ctx.createRadialGradient(px - 1.5, py - 1.5, 0, px, py, irisR);
-          irisG.addColorStop(0,    rc(cfg.eye,  0.94));
-          irisG.addColorStop(0.38, rc(cfg.mesh, 0.62));
+          irisG.addColorStop(0,    rc(cfg.eye,  Math.min(1, 0.94 * eyeBright)));
+          irisG.addColorStop(0.38, rc(cfg.mesh, Math.min(1, 0.62 * eyeBright)));
           irisG.addColorStop(0.80, rc(cfg.mesh, 0.26));
           irisG.addColorStop(1,    rc([2, 4, 22], 0.95));
           ctx.fillStyle = irisG; ctx.fillRect(0, 0, W, H);
@@ -640,7 +661,7 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
           ctx.strokeStyle = rc(cfg.mesh, 0.38); ctx.lineWidth = 0.85; ctx.stroke();
 
           // Pupil — deep black, slightly soft edge
-          const pupR = Math.min(4.6, eyeRY * 0.62);
+          const pupR = Math.min(4.6, eyeRY * 0.62) * pupilScale;
           ctx.save();
           ctx.shadowBlur = 5; ctx.shadowColor = 'rgba(0,0,0,0.92)';
           ctx.beginPath(); ctx.ellipse(px, py, pupR, Math.max(0.3, pupR), tilt, 0, Math.PI * 2);
@@ -788,6 +809,7 @@ const AvatarCanvas = React.memo(({ avState, speaking, ringColor, gazeEvent, spee
         ctx.restore();
       }
       ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+      ctx.restore(); // end head tilt transform
 
       // ── Speaking pulse ring — soft aura that breathes with voice energy ─────────
       if (spk && spkEnergy > 0.0) {
