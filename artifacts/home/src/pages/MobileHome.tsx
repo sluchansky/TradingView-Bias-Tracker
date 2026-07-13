@@ -568,6 +568,170 @@ function PositionCard({ trade }: { trade: any }) {
   );
 }
 
+// ── Trade plan card (entry / stop / targets) ──────────────────────────────────
+function TradePlanCard({ data }: { data: any }) {
+  const tp  = data?.trade_plan || {};
+  const mb  = data?.main_brain || {};
+  const dir = String(mb.direction || tp.direction || '').toUpperCase();
+  const isShort = /short/i.test(dir);
+  const accent  = isShort ? BEAR : BULL;
+
+  const entry   = Number(tp.entry   || tp.entry_price  || 0);
+  const stop    = Number(tp.stop    || tp.stop_price    || 0);
+  const target1 = Number(tp.target1 || tp.target_1      || 0);
+  const target2 = Number(tp.target2 || tp.target_2      || 0);
+  const rr      = tp.rr_display ?? (tp.rr_num != null ? `1:${Number(tp.rr_num).toFixed(1)}` : null);
+  const contracts = tp.contracts != null ? String(tp.contracts) : null;
+
+  if (!entry && !stop && !target1) return null;
+
+  const risk   = entry > 0 && stop > 0   ? Math.abs(entry - stop)    : null;
+  const reward = entry > 0 && target1 > 0 ? Math.abs(target1 - entry) : null;
+
+  return (
+    <div style={{
+      background: `linear-gradient(135deg, ${accent}0d 0%, rgba(6,8,16,0.9) 60%)`,
+      border: `1.5px solid ${accent}40`,
+      borderRadius: 16,
+      padding: '16px',
+      position: 'relative',
+      overflow: 'hidden',
+    }}>
+      {/* Glow streak top-right */}
+      <div style={{ position:'absolute', top:0, right:0, width:80, height:80,
+        background:`radial-gradient(circle at 80% 20%, ${accent}22, transparent 70%)`,
+        pointerEvents:'none' }} />
+
+      {/* Header row */}
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+          <div style={{ width:8, height:8, borderRadius:'50%', background:accent,
+            boxShadow:`0 0 10px ${accent}`, animation:'mPulse 1.8s ease-in-out infinite' }} />
+          <span style={{ fontSize:11, fontFamily:'monospace', fontWeight:800,
+            letterSpacing:'0.12em', textTransform:'uppercase', color:accent }}>
+            TRADE PLAN · {dir || 'READY'}
+          </span>
+        </div>
+        <div style={{ display:'flex', gap:6 }}>
+          {rr && (
+            <span style={{ fontSize:10, fontFamily:'monospace', fontWeight:700,
+              padding:'3px 8px', borderRadius:10,
+              background:`${accent}18`, border:`1px solid ${accent}35`, color:accent }}>
+              R:R {rr}
+            </span>
+          )}
+          {contracts && (
+            <span style={{ fontSize:10, fontFamily:'monospace', fontWeight:700,
+              padding:'3px 8px', borderRadius:10,
+              background:'rgba(255,255,255,0.06)', border:'1px solid rgba(255,255,255,0.12)',
+              color:'rgba(255,255,255,0.60)' }}>
+              {contracts} ct
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Price levels */}
+      <div style={{ display:'flex', flexDirection:'column', gap:0 }}>
+        {/* Entry */}
+        {entry > 0 && (
+          <PlanRow
+            label="Entry"
+            value={fmt(entry)}
+            color={AMB}
+            icon="→"
+            note="Ideal entry zone"
+            isFirst
+          />
+        )}
+        {/* Stop */}
+        {stop > 0 && (
+          <PlanRow
+            label="Stop Loss"
+            value={fmt(stop)}
+            color={BEAR}
+            icon="✕"
+            note={risk ? `${fmt(risk, 1)} pts risk` : 'Max loss level'}
+          />
+        )}
+        {/* Target 1 */}
+        {target1 > 0 && (
+          <PlanRow
+            label="Take Profit 1"
+            value={fmt(target1)}
+            color={BULL}
+            icon="✓"
+            note={reward ? `+${fmt(reward, 1)} pts · ${rr ?? ''}` : 'First target'}
+          />
+        )}
+        {/* Target 2 / Runner */}
+        {target2 > 0 && target2 !== target1 && (
+          <PlanRow
+            label="Take Profit 2"
+            value={fmt(target2)}
+            color='#86efac'
+            icon="★"
+            note="Runner / extension"
+            isLast
+          />
+        )}
+      </div>
+
+      {/* Visual risk-reward bar */}
+      {risk != null && reward != null && (
+        <div style={{ marginTop:14 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}>
+            <span style={{ fontSize:9, fontFamily:'monospace', color:'rgba(255,255,255,0.28)',
+              letterSpacing:'0.08em', textTransform:'uppercase' }}>Risk</span>
+            <span style={{ fontSize:9, fontFamily:'monospace', color:'rgba(255,255,255,0.28)',
+              letterSpacing:'0.08em', textTransform:'uppercase' }}>Reward</span>
+          </div>
+          <div style={{ display:'flex', height:6, borderRadius:3, overflow:'hidden', gap:1 }}>
+            <div style={{ flex:1, background:`${BEAR}60`, borderRadius:'3px 0 0 3px' }} />
+            <div style={{ flex: Math.min(reward / risk, 6), background:`${BULL}70`,
+              borderRadius:'0 3px 3px 0',
+              boxShadow:`0 0 8px ${BULL}50` }} />
+          </div>
+          <div style={{ display:'flex', justifyContent:'space-between', marginTop:3 }}>
+            <span style={{ fontSize:9, fontFamily:'monospace', color:BEAR }}>−{fmt(risk, 1)}</span>
+            <span style={{ fontSize:9, fontFamily:'monospace', color:BULL }}>+{fmt(reward, 1)}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlanRow({ label, value, color, icon, note, isFirst, isLast }: {
+  label: string; value: string; color: string; icon: string; note: string;
+  isFirst?: boolean; isLast?: boolean;
+}) {
+  return (
+    <div style={{
+      display:'flex', alignItems:'center', gap:10,
+      padding:'10px 0',
+      borderTop: isFirst ? 'none' : '1px solid rgba(255,255,255,0.06)',
+    }}>
+      {/* Icon dot */}
+      <div style={{ width:28, height:28, borderRadius:'50%', flexShrink:0,
+        background:`${color}15`, border:`1px solid ${color}35`,
+        display:'flex', alignItems:'center', justifyContent:'center',
+        fontSize:11, color, fontWeight:700 }}>
+        {icon}
+      </div>
+      {/* Label + note */}
+      <div style={{ flex:1, minWidth:0 }}>
+        <div style={{ fontSize:10, fontFamily:'monospace', letterSpacing:'0.08em',
+          textTransform:'uppercase', color:'rgba(255,255,255,0.35)', marginBottom:1 }}>{label}</div>
+        <div style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.30)' }}>{note}</div>
+      </div>
+      {/* Value */}
+      <span style={{ fontSize:16, fontFamily:'monospace', fontWeight:800,
+        color, letterSpacing:'0.02em', flexShrink:0 }}>{value}</span>
+    </div>
+  );
+}
+
 // ── Signal tab ────────────────────────────────────────────────────────────────
 function SignalTab({ data, ticker, narration, avatarState, speaking }: {
   data: any; ticker: Ticker; narration: string; avatarState: string; speaking: boolean;
@@ -580,6 +744,7 @@ function SignalTab({ data, ticker, narration, avatarState, speaking }: {
   const atr   = Number(data?.atr_pts || data?.current_atr || 0);
   const mb    = data?.main_brain || {};
   const reason = data?.strict_reason || mb.what_now || '';
+  const isReady = label.includes('READY') || label === 'MANAGING';
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
@@ -592,6 +757,9 @@ function SignalTab({ data, ticker, narration, avatarState, speaking }: {
             letterSpacing:'0.10em', color }}>{label}</span>
         </div>
       </div>
+
+      {/* ── TRADE PLAN: shown prominently when READY ── */}
+      {isReady && data?.trade_plan && <TradePlanCard data={data} />}
 
       {/* Avatar bar */}
       <AvatarStatusBar state={avatarState} narration={narration} speaking={speaking} />
