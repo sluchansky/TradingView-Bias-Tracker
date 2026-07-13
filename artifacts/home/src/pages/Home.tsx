@@ -2579,7 +2579,7 @@ export default function Home() {
       /* Brain column: fills remaining width */
       .mb-brain{flex:1!important;min-width:0!important;grid-column:unset!important;padding-left:20px!important;}
       /* Avatar outer: sized to fit the narrowed stage */
-      .mc-avtr-outer{width:228px!important;height:304px!important;overflow:hidden!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;}
+      .mc-avtr-outer{width:228px!important;height:304px!important;overflow:hidden!important;align-items:center!important;justify-content:flex-start!important;flex-shrink:0!important;}
       .mc-avtr-box{transform:scale(0.56)!important;transform-origin:top center!important;}
       /* mc-mid-row: show only the avatar centre — hide flanking mc-col and radar panels */
       .mc-mid-row{width:100%!important;justify-content:center!important;gap:0!important;}
