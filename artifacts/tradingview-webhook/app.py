@@ -43342,9 +43342,10 @@ function mbSpeak(text){
   utt.rate = 0.92; utt.pitch = 0.88; utt.volume = 0.9;
   try{
     var voices = window.speechSynthesis.getVoices();
-    var pref = voices.find(function(v){
-      return v.lang.startsWith('en') && (v.name.indexOf('Daniel') >= 0 || v.name.indexOf('Alex') >= 0 || (v.name.indexOf('Google') >= 0 && v.name.indexOf('US') >= 0));
-    });
+    var _storedVoice = ''; try{ _storedVoice = localStorage.getItem('brain_voice') || ''; }catch(e){}
+    var pref = _storedVoice
+      ? voices.find(function(v){ return v.name === _storedVoice; })
+      : voices.find(function(v){ return v.lang.startsWith('en') && (v.name.indexOf('Daniel') >= 0 || v.name.indexOf('Alex') >= 0 || (v.name.indexOf('Google') >= 0 && v.name.indexOf('US') >= 0)); });
     if(pref) utt.voice = pref;
   }catch(ignore){}
   utt.onstart = function(){ _startSpeakAnim(); };

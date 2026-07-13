@@ -2010,6 +2010,7 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const candlesRef    = useRef<Candle[]>([]);
   const priceBaseRef  = useRef<number>(0);
+  const [candlesV, setCandlesV] = useState(0); // bumped on each mutation → forces chart re-render
   const speakRef          = useRef<(t: string) => void>(() => {});
   const lastSpokenRef     = useRef('');
   const lastSpokeAtRef    = useRef(0);
@@ -2048,8 +2049,8 @@ export default function Home() {
         const p = Number(d?.price || 0);
         if (p > 0) {
           const pct = Math.abs(p - priceBaseRef.current) / (priceBaseRef.current || 1);
-          if (candlesRef.current.length === 0 || pct > 0.006) { priceBaseRef.current = p; candlesRef.current = makeCandles(p); }
-          else { const c = candlesRef.current; if (c.length > 0) { const last = c[c.length-1]; c[c.length-1] = { ...last, c:p, h:Math.max(last.h,p), l:Math.min(last.l,p) }; } }
+          if (candlesRef.current.length === 0 || pct > 0.006) { priceBaseRef.current = p; candlesRef.current = makeCandles(p); setCandlesV(v => v + 1); }
+          else { const c = candlesRef.current; if (c.length > 0) { const last = c[c.length-1]; c[c.length-1] = { ...last, c:p, h:Math.max(last.h,p), l:Math.min(last.l,p) }; setCandlesV(v => v + 1); } }
         }
       }
     } catch {}
