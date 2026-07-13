@@ -1476,6 +1476,122 @@ function MemoryPanel({ entries, onClear }: { entries: MemEntry[]; onClear: () =>
   );
 }
 
+// ── Voice line bank ────────────────────────────────────────────────────────────
+// Large pool of spoken lines per avatar state. Cycled in order so consecutive
+// lines never repeat. The periodic-narration timer picks from this bank.
+const VOICE_BANK: Record<string, string[]> = {
+  WAIT: [
+    'No edge present. Standing aside. Capital preservation comes first.',
+    'Market not offering a clean entry right now. Staying patient.',
+    'Conditions not meeting my criteria. I will wait for the right setup.',
+    'Structure is unclear. No defined risk. Not touching it.',
+    'Too many conflicting signals. Best trade right now is no trade.',
+    'Nothing to do but wait. The edge will show itself.',
+    'Markets are ranging. Choppy conditions — I sit on my hands.',
+    'Volume is thin and conviction is low. No reason to be involved.',
+    'Not forcing anything today. The cleanest setups come from patience.',
+    'Neutral until one side proves itself. No directional edge right now.',
+    'I do not chase. I wait. The setup has to come to me.',
+    'Tape looks indecisive. Institutions are not showing their hand yet.',
+  ],
+  ANALYZING: [
+    'Some signals are aligning. Watching carefully for confirmation.',
+    'Score is building. Not there yet — but worth watching closely.',
+    'Early signs of a potential setup. Monitoring for the next signal.',
+    'Edge beginning to develop. Still missing a couple of key conditions.',
+    'Conditions improving. CVD and structure starting to agree.',
+    'Something may be setting up here. Staying alert.',
+    'Order flow is showing some interest. Needs more development.',
+    'Market is showing early tells. Need a few more bars to confirm.',
+    'Starting to like what I see. Not committing yet though.',
+    'Score is creeping up. Keeping this one on my radar.',
+  ],
+  FORMING: [
+    'Setup is developing. Edge building toward the confirmation threshold.',
+    'Structure confirmed. Waiting on zone and flow alignment now.',
+    'Getting close. Just a couple of conditions left to trigger.',
+    'Score approaching the entry zone. Staying focused.',
+    'Thesis is forming nicely. Waiting on the final confirmation signal.',
+    'Good structure, improving delta. Zone is the last piece of the puzzle.',
+    'Setup building well. Patience — almost there.',
+    'Order flow cooperating. Zone activation would seal this setup.',
+    'I can feel this one developing. Waiting for the green light.',
+    'All the pieces are moving into place. Just need the final signal.',
+  ],
+  READY_LONG: [
+    'Long setup confirmed. All gates green. Execution window is open.',
+    'Highest probability long of the session. All conditions are satisfied.',
+    'Bullish edge confirmed. Structure, zone, and flow are all aligned. This is the one.',
+    'Long entry criteria fully met. Risk to reward is favorable.',
+    'All gate conditions satisfied on the long side. This is what I wait for.',
+    'Demand zone holding with bullish delta and clean structure. Long bias locked in.',
+    'Price above VWAP with structure and zone confirmed. Long setup is live.',
+    'Full confidence on the long side right now. Waiting for execution.',
+    'This is a textbook long setup. Clean entry, defined risk, strong edge.',
+    'Long edge at peak confidence. Every signal is in agreement.',
+  ],
+  READY_SHORT: [
+    'Short setup confirmed. All gates green. Execution window is open.',
+    'Bearish edge confirmed. Sellers in control with structure and zone aligned.',
+    'Short entry criteria fully met. Risk is defined. Confidence is high.',
+    'Supply zone holding with bearish delta and confirmed structure. Short bias locked in.',
+    'All conditions satisfied on the short side. This is the setup I was waiting for.',
+    'Price below VWAP, structure confirmed bearish, zone active. Short setup is live.',
+    'Short setup at peak confidence. All signals are in full agreement.',
+    'Highest probability short of the session. Execution window is open.',
+    'Textbook short. Clean supply zone, bearish delta, structure confirmed.',
+    'Full conviction on the short side. Waiting for execution.',
+  ],
+  ACTIVE: [
+    'Position is live. Monitoring every tick for thesis confirmation or invalidation.',
+    'Trade running. Stop is placed. Letting the edge play out.',
+    'In the trade now. Managing risk. Thesis remains intact so far.',
+    'Position active. No reason to exit early — the setup was clean.',
+    'Live trade. Price behaving as expected. Staying disciplined.',
+    'Watching for the first target level. Stop is set. No second-guessing.',
+    'Trade is on. The setup was textbook — trusting the process here.',
+    'Managing the position. Will adjust stop to break-even if momentum holds.',
+    'Thesis intact. Price moving in our direction. Letting it run.',
+    'Open position. Monitoring structure and delta for any invalidation.',
+  ],
+  TARGET_HIT: [
+    'Target hit. Trade profitable. Exactly what the setup called for.',
+    'First target reached. Booked the R. Excellent execution today.',
+    'Winner. Thesis played out perfectly. Back to scanning the tape.',
+    'Target achieved. Clean entry, clean exit. That is disciplined trading.',
+    'Trade closed at target. Patience and process paid off.',
+    'Profit secured. The setup was textbook. Resetting for the next opportunity.',
+    'Winner in the books. That is what happens when you wait for the right edge.',
+    'Target hit. No luck involved — that was skill and patience combined.',
+  ],
+  STOP_HIT: [
+    'Stopped out. Loss is taken. Risk was defined — no damage beyond the plan.',
+    'Stop hit. That happens sometimes. Not every setup works. Moving on.',
+    'Took the loss. Position was sized correctly. Ready for the next opportunity.',
+    'Stopped out. The thesis was invalidated. That is exactly why stops exist.',
+    'Loss booked. Clean risk management. Back to observation mode now.',
+    'Stop hit. One loss does not define the edge. Looking for the next setup.',
+    'Trade did not work out. Cut the loss quickly. That is the discipline.',
+    'Stopped out. Re-evaluating market conditions. Back to analysis mode.',
+  ],
+  NO_EDGE: [
+    'Edge score too low to act. Completely standing aside.',
+    'No identifiable setup right now. Waiting for conditions to develop.',
+    'Market structure is weak. Not worth the risk at these levels.',
+    'Zero edge on any instrument right now. Watching only.',
+    'Unfavorable conditions across the board. Capital stays on the sideline.',
+  ],
+};
+
+// Tracks cycling position per state so we never say the same thing twice in a row
+const _voiceBankIdx: Record<string, number> = {};
+function pickVoiceLine(state: string): string {
+  const lines = VOICE_BANK[state] ?? VOICE_BANK.WAIT;
+  const start = _voiceBankIdx[state] ?? Math.floor(Math.random() * lines.length);
+  _voiceBankIdx[state] = (start + 1) % lines.length;
+  return lines[start];
+}
+
 // ── Demo Mode Engine ─────────────────────────────────────────────────────────
 // Simulates live market data for after-hours development and testing.
 // Cycles through 7 phases (WAIT → ANALYZING → FORMING → READY → ACTIVE → TARGET → repeat)
@@ -1486,29 +1602,71 @@ const DEMO_BASE: Record<string, number> = { MNQ:21240, MGC:3218, MES:5847, MYM:4
 const DEMO_ATR:  Record<string, number> = { MNQ:18,    MGC:12,   MES:6,    MYM:85    };
 // Seconds each phase holds before advancing
 const DEMO_DUR = [7, 6, 6, 6, 7, 7, 3];
-// Narration lines per phase — rotated as phase progresses
+// Demo narration bank — randomly selected each phase so lines never repeat in order
 const DEMO_NARR: string[][] = [
+  // Phase 0 — WAIT / no edge
   ['No edge present. Market consolidating near VWAP. Capital preservation comes first.',
-   'Watching key levels. Price coiling below resistance. No confirmed structure.',
-   'Volume thin. Bears and bulls in equilibrium. Standing aside.'],
+   'Price coiling in a tight range. No structural break yet. Standing aside.',
+   'Volume is thin and CVD is flat. Bears and bulls are in equilibrium.',
+   'Nothing to do here. Waiting for the market to tip its hand.',
+   'Choppy tape with no clear direction. Best position right now is no position.',
+   'VWAP is acting as a magnet. Price oscillating without conviction.',
+   'No institutional footprints visible at this level. Watching only.',
+   'Low probability environment. I will not force a trade into this mess.'],
+  // Phase 1 — ANALYZING
   ['Price testing VWAP from below. Bulls attempting a reclaim. Need confirmation.',
-   'Approaching demand zone. Momentum flattening. Setup not ready yet.',
-   'Order flow mixed. CVD neutral. Patient — waiting for the right entry.'],
+   'Approaching the demand zone. Momentum is flattening. Setup not ready yet.',
+   'Order flow is mixed. CVD neutral but starting to show buying interest.',
+   'Early signs of accumulation near this level. Keeping a close eye.',
+   'Buyers defending the low, but no structural break yet. Monitoring closely.',
+   'Something is brewing here. Watching for a break of structure to the upside.',
+   'Delta ticking up slightly. Not committing yet — need more evidence.',
+   'This level is attracting attention. Waiting for a clear signal before acting.'],
+  // Phase 2 — FORMING / structure confirmed
   ['BOS confirmed on the lower timeframe. Structure is shifting bullish. Edge building.',
-   'Break of Structure detected. Monitoring for a clean pullback entry.',
-   'Structure break confirmed. CVD turning bullish. Setup beginning to develop.'],
+   'Break of structure detected. Looking for a clean pullback into the zone.',
+   'Structure break confirmed with bullish CVD. Setup is beginning to develop.',
+   'CHOCH on the five minute. Bias shifts long. Watching for the zone tap.',
+   'Structural break is clean. Delta confirming. Edge crossing the threshold.',
+   'Change of character confirmed. Buyers took out the last swing high.',
+   'BOS with above-average volume. Institutions may be accumulating.',
+   'Structure aligned. CVD cooperating. One more confirmation and this is live.'],
+  // Phase 3 — zone + sweep
   ['Liquidity sweep complete into demand zone. Smart money absorption visible.',
-   'Sweep into premium liquidity. CVD strongly bullish. Confidence rising.',
-   'Zone holding firm. Volume spiking on the bid. Setup criteria nearly all met.'],
+   'Price swept the low and reversed sharply. Classic stop-hunt into demand.',
+   'Zone holding firm. Volume spiking on the bid. Setup criteria nearly all met.',
+   'Sweep into the demand zone with a strong rejection wick. This is textbook.',
+   'Sellers exhausted at the zone. Buyers stepping in with conviction.',
+   'Demand zone activated. CVD sharply bullish. Waiting for structure to confirm.',
+   'Sweep and reclaim of the zone. Exactly the entry trigger I look for.',
+   'Institutional absorption visible at this demand level. Edge is rising fast.'],
+  // Phase 4 — READY
   ['High-probability long setup. All gates confirmed. Risk-to-reward meets requirements.',
-   'Strong BOS into demand. CVD bullish. VWAP reclaimed. Entry criteria met.',
-   'Cleanest setup of the session. Structure, zone, and flow all aligned.'],
-  ['Position active. Price extending in our direction. Monitoring for first target.',
-   'Trade running. Thesis intact. Adjusting stop to break-even on momentum.',
-   'Managing the trade. Price holding above entry. Watching for scale-out.'],
+   'Strong BOS into demand. CVD bullish. VWAP reclaimed. Entry criteria fully met.',
+   'Cleanest setup of the session. Structure, zone, and flow are all aligned.',
+   'All gate conditions satisfied. This is the setup I have been waiting for.',
+   'Full edge confirmation. Every signal is in agreement. Execution window is open.',
+   'Textbook long setup. Clean demand zone, bullish delta, structure confirmed above VWAP.',
+   'Maximum confidence on the long side right now. Waiting for execution.',
+   'This is exactly what disciplined waiting looks like. Perfect setup confirmed.'],
+  // Phase 5 — ACTIVE / managing
+  ['Position active. Price extending in our direction. Monitoring for the first target.',
+   'Trade running. Thesis intact. Moving stop toward break-even on this momentum.',
+   'Managing the trade. Price holding above entry. Watching for scale-out level.',
+   'Live position. No signs of invalidation. Letting the edge work.',
+   'In the trade. Stop is placed. No need to touch it — the setup is playing out.',
+   'Position is running well. Monitoring delta for any sign of reversal.',
+   'Trade active. Price above VWAP and structure holding. Thesis intact.',
+   'Watching every bar. No invalidation signals yet. Staying in the trade.'],
+  // Phase 6 — TARGET HIT
   ['Target reached. Trade profitable. Clean execution — exactly what we waited for.',
    'First target hit. Secured the R. Resetting for the next high-probability setup.',
-   'Trade closed at target. Discipline rewarded. Back to watching the tape.'],
+   'Trade closed at target. Discipline rewarded. Back to watching the tape.',
+   'Winner. Thesis played out perfectly. That is what patience looks like.',
+   'Profit booked. Textbook from entry to exit. Back to scanning for the next one.',
+   'Target achieved. Clean risk-to-reward. This is how the process is supposed to work.',
+   'Win in the books. Not luck — that was preparation and patience.',
+   'Closed at target. No second-guessing, no early exits. Trusted the plan.'],
 ];
 
 function _buildDemoData(
@@ -1531,7 +1689,9 @@ function _buildDemoData(
   const cvd   = phase >= 2 ? 'Bullish' : 'Neutral';
   const volS  = phase >= 4 ? 'Strong volume' : phase >= 3 ? 'Increasing volume' : phase <= 0 ? 'Low volume' : 'Normal volume';
   const narr  = DEMO_NARR[phase];
-  const narration = narr[Math.min(Math.floor(progress * narr.length), narr.length - 1)];
+  // Random pick per phase tick — never the same line two ticks in a row
+  const _demoNarrKey = `demo_${phase}`;
+  const narration = narr[(_voiceBankIdx[_demoNarrKey] = ((_voiceBankIdx[_demoNarrKey] ?? -1) + 1) % narr.length)];
   const activeTrade = phase === 5 ? {
     instrument: ticker, direction: 'LONG',
     entry_price: price - atr * 0.3, stop_price: price - atr * 0.3 - atr * 2.2,
@@ -1826,12 +1986,7 @@ export default function Home() {
     voice_d.narration ||
     (mb.synthesis as any)?.narrative ||
     mb.summary ||
-    (loading ? '' :
-      status === 'READY' ? 'This is the strongest setup I have seen in the last hour. Risk-to-reward meets requirements. I recommend entry.' :
-      status === 'MANAGING' ? 'Managing open position. Monitoring price action for thesis invalidation or target hits.' :
-      status === 'BUILDING' ? 'Setup is forming. Waiting for final confirmation before considering entry.' :
-      status === 'WAIT' ? 'No edge present. Capital preservation comes first.' :
-      'Watching the tape. Scanning for high-probability setups across key levels...')
+    (loading ? '' : pickVoiceLine(avState))
   ) as string;
 
   // Monologue: cycles through data-driven thoughts; restarts only on status change
@@ -1913,6 +2068,24 @@ export default function Home() {
   useEffect(() => {
     if (narration && narration !== lastSpokenRef.current) { lastSpokenRef.current = narration; speakRef.current(narration); }
   }, [narration]);
+
+  // Periodic ambient commentary — cycles through VOICE_BANK every 40-80 s
+  // so the avatar never goes silent for long even when backend narration is stable
+  const avStateRef = useRef(avState);
+  useEffect(() => { avStateRef.current = avState; }, [avState]);
+  useEffect(() => {
+    let tid: ReturnType<typeof setTimeout>;
+    const fire = () => {
+      const line = pickVoiceLine(avStateRef.current);
+      if (line !== lastSpokenRef.current) {
+        lastSpokenRef.current = line;
+        speakRef.current(line);
+      }
+      tid = setTimeout(fire, 40000 + Math.random() * 40000);
+    };
+    tid = setTimeout(fire, 50000 + Math.random() * 30000);
+    return () => clearTimeout(tid);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Detect market events → fire a gaze direction that drives eye movement
   useEffect(() => {
