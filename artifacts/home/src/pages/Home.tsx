@@ -2628,16 +2628,21 @@ export default function Home() {
     @media(max-width:500px){.intel-strip{display:none!important;}}
     @media(max-width:760px){.mem-panel{flex-wrap:wrap!important;}.mem-panel>*{flex-basis:calc(50% - 4px)!important;min-width:unset!important;}}
     @media(max-width:500px){.mem-panel{display:none!important;}}
-    /* Desktop layout: avatar LEFT (294px, CSS-scaled 70%) + brain content fills RIGHT */
+    /* Desktop layout: avatar stage LEFT (centered) + brain content fills RIGHT */
     @media(min-width:769px){
       .main-center{zoom:1;}
-      .mc-col{display:none!important;}
-      .mb-row{display:flex!important;flex-direction:row!important;gap:20px!important;align-items:flex-start!important;min-height:unset!important;}
-      .mb-brain{flex:1!important;min-width:0!important;grid-column:unset!important;}
-      .mc-stage{flex:0 0 378px!important;width:378px!important;display:flex!important;flex-direction:column!important;align-items:flex-start!important;grid-column:unset!important;}
-      .mc-avtr-outer{width:378px!important;height:504px!important;overflow:hidden!important;align-items:flex-start!important;justify-content:flex-start!important;flex-shrink:0!important;}
-      .mc-avtr-box{transform:scale(0.90)!important;transform-origin:top left!important;}
-      .mc-mid-row{width:378px!important;justify-content:flex-start!important;}
+      .mb-row{display:flex!important;flex-direction:row!important;gap:0!important;align-items:flex-start!important;min-height:unset!important;}
+      /* Avatar stage: fixed width, centered content, right border as divider */
+      .mc-stage{flex:0 0 420px!important;width:420px!important;display:flex!important;flex-direction:column!important;align-items:center!important;grid-column:unset!important;padding-right:20px!important;border-right:1px solid rgba(255,255,255,0.055)!important;}
+      /* Brain column: left spacing so it doesn't hug the divider */
+      .mb-brain{flex:1!important;min-width:0!important;grid-column:unset!important;padding-left:24px!important;}
+      /* Avatar outer: center the canvas inside the stage */
+      .mc-avtr-outer{width:378px!important;height:504px!important;overflow:hidden!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;}
+      .mc-avtr-box{transform:scale(0.90)!important;transform-origin:top center!important;}
+      .mc-mid-row{width:100%!important;justify-content:center!important;}
+      /* Gate indicator pills: show as a compact horizontal row below the avatar */
+      .mc-col{display:flex!important;flex-direction:row!important;gap:6px!important;width:100%!important;justify-content:center!important;flex-wrap:wrap!important;margin-top:4px!important;}
+      .mc-col>.mc-card{flex:1!important;min-width:100px!important;max-width:130px!important;}
       .verdict-big{font-size:36px!important;letter-spacing:-0.03em!important;}
       .verdict-sub{font-size:17px!important;margin-top:5px!important;}
       .edge-wrap{max-width:unset!important;}
