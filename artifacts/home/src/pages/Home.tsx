@@ -1997,7 +1997,7 @@ export default function Home() {
   const setVrmSrc = useCallback((src: string) => { try { localStorage.setItem('brain_vrm', src); } catch {} setVrmSrcRaw(src); setShowAvatarPicker(false); }, []);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [chatOpen,     setChatOpen]     = useState(false);
-  const [chartOpen,    setChartOpen]    = useState(false);
+  const [chartOpen,    setChartOpen]    = useState(true);
   const [leftOpen,     setLeftOpen]     = useState(false);
   const [confirming,   setConfirming]   = useState(false);
   const [tradeSent,    setTradeSent]    = useState<string | null>(null);
@@ -2008,8 +2008,9 @@ export default function Home() {
 
   const chatRef  = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const candlesRef    = useRef<Candle[]>([]);
-  const priceBaseRef  = useRef<number>(0);
+  const candlesRef      = useRef<Candle[]>([]);
+  const priceBaseRef    = useRef<number>(0);
+  const candleMinRef    = useRef<number>(0); // unix-ms of current candle's 1-min bucket
   const [candlesV, setCandlesV] = useState(0); // bumped on each mutation → forces chart re-render
   const speakRef          = useRef<(t: string) => void>(() => {});
   const lastSpokenRef     = useRef('');
@@ -2048,9 +2049,24 @@ export default function Home() {
         const d = await r.json(); setData(d); setLoading(false);
         const p = Number(d?.price || 0);
         if (p > 0) {
-          const pct = Math.abs(p - priceBaseRef.current) / (priceBaseRef.current || 1);
-          if (candlesRef.current.length === 0 || pct > 0.006) { priceBaseRef.current = p; candlesRef.current = makeCandles(p); setCandlesV(v => v + 1); }
-          else { const c = candlesRef.current; if (c.length > 0) { const last = c[c.length-1]; c[c.length-1] = { ...last, c:p, h:Math.max(last.h,p), l:Math.min(last.l,p) }; setCandlesV(v => v + 1); } }
+          const nowMin = Math.floor(Date.now() / 60000) * 60000;
+          if (candlesRef.current.length === 0) {
+            // First load — build 60 synthetic historical candles
+            priceBaseRef.current = p; candleMinRef.current = nowMin;
+            candlesRef.current = makeCandles(p);
+          } else if (nowMin > candleMinRef.current) {
+            // New 1-minute bucket — close last candle, open a fresh one, roll the window
+            candleMinRef.current = nowMin;
+            const prev = candlesRef.current[candlesRef.current.length - 1];
+            const nc: Candle = { t: nowMin, o: prev.c, h: Math.max(prev.c, p), l: Math.min(prev.c, p), c: p, vol: 0.3 + Math.random() * 0.7 };
+            candlesRef.current = [...candlesRef.current.slice(-59), nc];
+          } else {
+            // Same minute — update the live candle's close / high / low
+            const c = candlesRef.current;
+            const last = c[c.length - 1];
+            c[c.length - 1] = { ...last, c: p, h: Math.max(last.h, p), l: Math.min(last.l, p) };
+          }
+          setCandlesV(v => v + 1);
         }
       }
     } catch {}
@@ -2058,7 +2074,7 @@ export default function Home() {
 
   useEffect(() => {
     if (demoMode) return; // demo engine owns data when active
-    setLoading(true); setData(null); candlesRef.current = [];
+    setLoading(true); setData(null); candlesRef.current = []; candleMinRef.current = 0;
     poll(); const id = setInterval(poll, 3000); return () => clearInterval(id);
   }, [poll, demoMode]);
 
