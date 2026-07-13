@@ -612,21 +612,59 @@ function PositionCard({ trade }: { trade: any }) {
 }
 
 // ── Trade plan card (entry / stop / targets) ──────────────────────────────────
-function TradePlanCard({ data }: { data: any }) {
+// Parse "4040.2–4045.8" or "4042.1" entry_zone string → midpoint number
+function parseEntryZone(z: any): number {
+  if (z == null) return 0;
+  const s = String(z).trim();
+  // em-dash or regular dash with surrounding digits
+  const m = s.match(/^([\d.]+)\s*[–-]\s*([\d.]+)$/);
+  if (m) return (parseFloat(m[1]) + parseFloat(m[2])) / 2;
+  return parseFloat(s) || 0;
+}
+
+function TradePlanCard({ data, authHeader, ticker }: {
+  data: any;
+  authHeader?: Record<string,string>;
+  ticker?: string;
+}) {
+  const [enterSt, setEnterSt] = useState<null | 'sending' | 'ok' | 'err'>(null);
+  const [enterErr, setEnterErr] = useState('');
+
   const tp  = data?.trade_plan || {};
   const mb  = data?.main_brain || {};
-  const dir = String(mb.direction || tp.direction || '').toUpperCase();
+  const dir = String(tp.direction || mb.direction || '').toUpperCase();
   const isShort = /short/i.test(dir);
   const accent  = isShort ? BEAR : BULL;
 
-  const entry   = Number(tp.entry   || tp.entry_price  || 0);
-  const stop    = Number(tp.stop    || tp.stop_price    || 0);
-  const target1 = Number(tp.target1 || tp.target_1      || 0);
-  const target2 = Number(tp.target2 || tp.target_2      || 0);
-  const rr      = tp.rr_display ?? (tp.rr_num != null ? `1:${Number(tp.rr_num).toFixed(1)}` : null);
+  // Server sends: entry_zone (str), stop_loss (str), target1 (str), target2 (str), rr (str)
+  const entry   = parseEntryZone(tp.entry_zone) || Number(tp.entry) || Number(tp.entry_price) || 0;
+  const stop    = parseFloat(String(tp.stop_loss  || tp.stop  || tp.stop_price  || 0)) || 0;
+  const target1 = parseFloat(String(tp.target1    || tp.target_1 || 0)) || 0;
+  const target2 = parseFloat(String(tp.target2    || tp.target_2 || 0)) || 0;
+  const rr      = tp.rr ?? tp.rr_display ?? (tp.rr_num != null ? `1:${Number(tp.rr_num).toFixed(1)}` : null);
   const contracts = tp.contracts != null ? String(tp.contracts) : null;
 
   if (!entry && !stop && !target1) return null;
+
+  const canEnterReady = !!(authHeader && ticker && data?.execution_enabled && entry > 0 && stop > 0);
+
+  const handleEnterReady = async () => {
+    if (!canEnterReady || enterSt === 'sending') return;
+    setEnterSt('sending'); setEnterErr('');
+    try {
+      const t1 = target1 || (isShort ? entry - Math.abs(entry - stop) : entry + Math.abs(entry - stop));
+      const body = { ticker, direction: isShort ? 'Short' : 'Long',
+        entry, stop, t1, t2: target2 || t1, contracts: 1, source: 'mobile_ready' };
+      const r = await fetch('/api/enter', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) { setEnterSt('ok'); setTimeout(() => setEnterSt(null), 5000); }
+      else { setEnterSt('err'); setEnterErr(j?.reason || j?.error || `HTTP ${r.status}`); }
+    } catch (e: any) { setEnterSt('err'); setEnterErr(e?.message || 'Network error'); }
+  };
 
   const risk   = entry > 0 && stop > 0   ? Math.abs(entry - stop)    : null;
   const reward = entry > 0 && target1 > 0 ? Math.abs(target1 - entry) : null;
@@ -739,6 +777,38 @@ function TradePlanCard({ data }: { data: any }) {
             <span style={{ fontSize:9, fontFamily:'monospace', color:BEAR }}>−{fmt(risk, 1)}</span>
             <span style={{ fontSize:9, fontFamily:'monospace', color:BULL }}>+{fmt(reward, 1)}</span>
           </div>
+        </div>
+      )}
+
+      {/* ── ENTER button for confirmed READY setup ── */}
+      {canEnterReady && (
+        <div style={{ borderTop:'1px solid rgba(255,255,255,0.08)', marginTop:14, paddingTop:13 }}>
+          <button
+            onClick={handleEnterReady}
+            disabled={enterSt === 'sending'}
+            style={{
+              width:'100%', padding:'14px 0',
+              background: enterSt === 'ok'  ? `${BULL}20`
+                        : enterSt === 'err' ? `${BEAR}20`
+                        : `${accent}16`,
+              border: `1.5px solid ${enterSt === 'ok' ? BULL : enterSt === 'err' ? BEAR : accent}55`,
+              borderRadius: 11,
+              color: enterSt === 'ok' ? BULL : enterSt === 'err' ? BEAR : accent,
+              fontSize: 12, fontFamily:'monospace', fontWeight:800,
+              letterSpacing:'0.13em', textTransform:'uppercase',
+              cursor: enterSt === 'sending' ? 'not-allowed' : 'pointer',
+              opacity: enterSt === 'sending' ? 0.6 : 1,
+              transition:'all 0.2s',
+            }}>
+            {enterSt === 'sending' ? 'SENDING…'
+           : enterSt === 'ok'     ? `✓ TRADE ENTERED — ${isShort ? 'SHORT' : 'LONG'}`
+           : enterSt === 'err'    ? `✗ ${enterErr}`
+           : `ENTER ${isShort ? 'SHORT' : 'LONG'} — ${fmt(entry)}`}
+          </button>
+          <p style={{ fontSize:9.5, fontStyle:'italic', color:'rgba(255,255,255,0.20)',
+            margin:'7px 0 0', textAlign:'center', lineHeight:1.4 }}>
+            Uses live plan levels · manual override · advisory use
+          </p>
         </div>
       )}
     </div>
@@ -1007,7 +1077,9 @@ function SignalTab({ data, ticker, narration, avatarState, speaking, authHeader 
       </div>
 
       {/* ── TRADE PLAN: shown prominently when READY ── */}
-      {isReady && data?.trade_plan && <TradePlanCard data={data} />}
+      {isReady && data?.trade_plan && (
+        <TradePlanCard data={data} authHeader={authHeader} ticker={ticker} />
+      )}
 
       {/* ── STALK MODE: shown while a setup is forming (pre-READY) ── */}
       <StalkCard data={data} ticker={ticker} authHeader={authHeader} />
