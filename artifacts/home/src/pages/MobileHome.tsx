@@ -53,9 +53,10 @@ function useTTS() {
   const [muted,  setMutedSt]  = useState<boolean>(() => {
     try { const v = localStorage.getItem('brain_muted'); return v === null ? false : v !== '0'; } catch { return false; }
   });
-  const [speaking, setSpeaking] = useState(false);
+  const [speaking,      setSpeaking]      = useState(false);
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
 
-  // Queue: activeRef = currently speaking, pendingRef = next line to play (max 1 queued)
+  // Queue: activeRef = a speak() was sent to the browser, pendingRef = next line (max 1)
   const activeRef  = useRef(false);
   const pendingRef = useRef<string | null>(null);
   const voicesRef  = useRef<SpeechSynthesisVoice[]>([]);
@@ -70,15 +71,24 @@ function useTTS() {
 
   const _fire = useCallback((text: string) => {
     const ss = window.speechSynthesis; if (!ss || !text) return;
-    activeRef.current = true;
-    setSpeaking(true);
+    activeRef.current = true;           // block concurrent calls
     const utt = new SpeechSynthesisUtterance(text);
     const voice = voicesRef.current[0]; if (voice) utt.voice = voice;
     utt.rate = 0.90; utt.pitch = 1.05;
+
+    // Safety net: mobile browsers silently reject ss.speak() when there has been no
+    // recent user gesture. onstart never fires in that case, so activeRef stays true
+    // forever and the queue deadlocks. Reset after 700 ms if onstart hasn't confirmed.
+    let started = false;
+    const safetyTimer = setTimeout(() => {
+      if (!started) { activeRef.current = false; setSpeaking(false); }
+    }, 700);
+
+    utt.onstart = () => { started = true; clearTimeout(safetyTimer); setSpeaking(true); };
     const done = () => {
+      clearTimeout(safetyTimer);
       activeRef.current = false;
       setSpeaking(false);
-      // Automatically play the next queued line when this one finishes
       const next = pendingRef.current;
       if (next) { pendingRef.current = null; _fire(next); }
     };
@@ -102,8 +112,7 @@ function useTTS() {
     if (!text || muted) return;
     const cleaned = cleanTTS(text);
     if (activeRef.current) {
-      // Don't interrupt — replace the pending slot so it plays next
-      pendingRef.current = cleaned;
+      pendingRef.current = cleaned;   // don't interrupt — queue for after current finishes
     } else {
       _fire(cleaned);
     }
@@ -112,6 +121,7 @@ function useTTS() {
   const unlockAudio = useCallback(() => {
     const ss = window.speechSynthesis; if (!ss) return;
     const w = new SpeechSynthesisUtterance(''); w.volume = 0; ss.speak(w);
+    setAudioUnlocked(true);
   }, []);
 
   useEffect(() => {
@@ -120,7 +130,7 @@ function useTTS() {
     return () => document.removeEventListener('touchstart', h);
   }, [unlockAudio]);
 
-  return { muted, setMuted, speaking, speak, unlockAudio };
+  return { muted, setMuted, speaking, speak, unlockAudio, audioUnlocked };
 }
 
 // ── Voice input ───────────────────────────────────────────────────────────────
@@ -1318,12 +1328,13 @@ export default function MobileHome() {
 
   const { authed, checking, authHeader, tryAuth } = useAuth();
   const { data, conn, ts } = useLiveData(ticker, authHeader);
-  const { muted, setMuted, speaking, speak } = useTTS();
+  const { muted, setMuted, speaking, speak, audioUnlocked } = useTTS();
   const clock = useClock();
 
-  // Stable ref so effects never go stale on speak identity changes
+  // Stable refs so effects never go stale
   const speakRef      = useRef<(t: string) => void>(() => {});
   const lastSpokenRef = useRef('');
+  const narrationRef  = useRef('');
   useEffect(() => { speakRef.current = speak; }, [speak]);
 
   // Persist ticker choice
@@ -1337,12 +1348,29 @@ export default function MobileHome() {
     setNarr(pickMLine(st));
   }, [data]);
 
+  // Keep narrationRef current so the unlock effect can read it without stale closure
+  useEffect(() => { narrationRef.current = narration; }, [narration]);
+
   // Speak whenever narration text changes (guards against repeating the same line)
   useEffect(() => {
     if (!narration || narration === lastSpokenRef.current) return;
     lastSpokenRef.current = narration;
     speakRef.current(narration);
   }, [narration]);
+
+  // After the first touch unlocks audio, immediately speak whatever narration we have.
+  // Without this, the avatar is silent until the 18s timer fires because the first
+  // speak() call (triggered by data load) was silently rejected before user gesture.
+  useEffect(() => {
+    if (!audioUnlocked) return;
+    const t = setTimeout(() => {
+      const line = narrationRef.current;
+      if (!line) return;
+      lastSpokenRef.current = '';   // clear guard so the speak goes through
+      speakRef.current(line);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [audioUnlocked]);
 
   // Periodic narration refresh every 18s — pick a new line (speak effect handles voicing)
   useEffect(() => {
