@@ -145,20 +145,26 @@ function useTTS() {
     utt.onstart = () => {
       setSpeaking(true);
       speechCtrlRef.current = { energy: 0, viseme: 'open', active: true };
-      wordDataRef.current = { t0: Date.now(), dur: 280, char: 'a' };
+      wordDataRef.current = { t0: Date.now(), dur: 350, char: 'a' };
       // Drive mouth energy via a dedicated RAF loop — no React renders, no jitter
       const driveEnergy = () => {
         const ctrl = speechCtrlRef.current;
         if (!ctrl.active) return;
         const { t0, dur, char } = wordDataRef.current;
         const age  = Date.now() - t0;
-        const prog = Math.min(1, age / Math.max(1, dur));
-        // Bell-curve energy per word: ramp up, sustain, ramp down
+        // Self-sustaining: auto-advance syllable when onboundary hasn't fired.
+        // Without this, energy collapses to 0 after the first ~280ms and lips freeze.
+        const effectiveDur = Math.max(dur, 300);
+        if (age >= effectiveDur) {
+          wordDataRef.current = { t0: Date.now(), dur: 300 + Math.random() * 120, char: char };
+        }
+        const prog = Math.min(1, age / effectiveDur);
+        // Bell-curve energy per syllable: ramp up, sustain, ramp down
         const bell = prog < 0.28 ? prog / 0.28 : prog < 0.70 ? 1.0 : Math.max(0, (1 - prog) / 0.30);
         // Natural micro-jitter — two low-freq oscillators
         const jit = Math.sin(Date.now() * 0.020) * 0.14 + Math.sin(Date.now() * 0.035) * 0.09;
-        const tgt  = Math.max(0, Math.min(1, bell * 0.92 + jit * bell)); // boosted: 0.74→0.92
-        // Exponential smoothing — faster attack so mouth opens quickly
+        const tgt  = Math.max(0, Math.min(1, bell * 0.92 + jit * bell));
+        // Exponential smoothing — fast attack so mouth opens quickly
         ctrl.energy += (tgt - ctrl.energy) * 0.26;
         ctrl.viseme  = charToViseme(char);
         energyRafRef.current = requestAnimationFrame(driveEnergy);

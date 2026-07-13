@@ -66,7 +66,13 @@ const WALK_SPEED  = 0.22;  // world units per second
 const WALK_LIMIT  = 0.42;  // ± world-X boundary before turning
 
 // ─── Mouth expression candidates ──────────────────────────────────────────────
-const MOUTH_CANDIDATES = ['aa','ih','ou','ee','oh','A','I','U','E','O'];
+// VRM1.0 preset names (lowercase), VRM0.x legacy (uppercase), plus common custom names
+const MOUTH_CANDIDATES = [
+  'aa','ih','ou','ee','oh',          // VRM1.0 presets
+  'A','I','U','E','O',               // VRM0.x presets
+  'mouthOpen','mouth_open',          // common custom
+  'viseme_aa','viseme_PP',           // alternate naming
+];
 const VISEME_CANDIDATES: Record<string, string[]> = {
   open:    ['aa','A'],
   rounded: ['ou','oh','U'],
@@ -573,12 +579,18 @@ function LordPiggingtonAvatar({
       const foundMouth = MOUTH_CANDIDATES.filter(n => vrm.expressionManager?.getExpression(n));
       availableMouthRef.current = foundMouth;
 
-      // Jaw bone via raw traversal
-      vrm.scene.traverse((obj) => {
-        if (!jawBoneRef.current && obj instanceof THREE.Bone && /jaw/i.test(obj.name)) {
-          jawBoneRef.current = obj;
-        }
-      });
+      // Jaw bone — try VRM humanoid API first (most reliable), then raw traversal
+      const jawNode = hum?.getNormalizedBoneNode?.('jaw' as never) as THREE.Bone | null;
+      if (jawNode) {
+        jawBoneRef.current = jawNode;
+      } else {
+        vrm.scene.traverse((obj) => {
+          if (!jawBoneRef.current && obj instanceof THREE.Object3D &&
+              /jaw|chin|mandible|lowerjaw|J_Adj_.*Jaw|J_Bip.*Jaw/i.test(obj.name)) {
+            jawBoneRef.current = obj as THREE.Bone;
+          }
+        });
+      }
 
       debugDataRef.current = {
         ...debugDataRef.current,
