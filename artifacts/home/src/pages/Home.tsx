@@ -156,10 +156,10 @@ function useTTS() {
         // Bell-curve energy per word: ramp up, sustain, ramp down
         const bell = prog < 0.28 ? prog / 0.28 : prog < 0.70 ? 1.0 : Math.max(0, (1 - prog) / 0.30);
         // Natural micro-jitter — two low-freq oscillators
-        const jit = Math.sin(Date.now() * 0.020) * 0.13 + Math.sin(Date.now() * 0.035) * 0.08;
-        const tgt  = Math.max(0, Math.min(1, bell * 0.74 + jit * bell));
-        // Exponential smoothing — prevents shaky mouth
-        ctrl.energy += (tgt - ctrl.energy) * 0.18;
+        const jit = Math.sin(Date.now() * 0.020) * 0.14 + Math.sin(Date.now() * 0.035) * 0.09;
+        const tgt  = Math.max(0, Math.min(1, bell * 0.92 + jit * bell)); // boosted: 0.74→0.92
+        // Exponential smoothing — faster attack so mouth opens quickly
+        ctrl.energy += (tgt - ctrl.energy) * 0.26;
         ctrl.viseme  = charToViseme(char);
         energyRafRef.current = requestAnimationFrame(driveEnergy);
       };
@@ -2927,7 +2927,7 @@ export default function Home() {
                 <span style={{ fontSize:12 }}>🎭</span>
                 <span style={{ fontSize:9.5, color:'rgba(255,255,255,0.38)', fontFamily:'monospace', flex:1 }}>Avatar</span>
                 <span style={{ fontSize:8.5, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>
-                  {({'/LordPiggington.vrm':'LordPiggington','/Orion.vrm':'Orion','/Bizdude.vrm':'Bizdude','/Bruno.vrm':'Bruno','/Steamboat.vrm':'Steamboat','/avatar.vrm':'Default'} as Record<string,string>)[vrmSrc] ?? 'Custom'}
+                  {({'/LordPiggington.vrm':'LordPiggington','/MaxHax.vrm':'MaxHax','/Orion.vrm':'Orion','/Bizdude.vrm':'Bizdude','/Bruno.vrm':'Bruno','/Steamboat.vrm':'Steamboat','/avatar.vrm':'Default'} as Record<string,string>)[vrmSrc] ?? 'Custom'}
                 </span>
                 <span style={{ fontSize:10, color:'rgba(255,255,255,0.25)' }}>{showAvatarPicker ? '▲' : '▼'}</span>
               </button>
@@ -2939,6 +2939,7 @@ export default function Home() {
                   <div style={{ fontSize:9, color:'rgba(255,255,255,0.28)', fontFamily:'monospace', marginBottom:2, letterSpacing:'0.08em' }}>PRESETS</div>
                   {[
                     { label: 'LordPiggington', src: '/LordPiggington.vrm' },
+                    { label: 'MaxHax',         src: '/MaxHax.vrm' },
                     { label: 'Orion',          src: '/Orion.vrm' },
                     { label: 'Bizdude',        src: '/Bizdude.vrm' },
                     { label: 'Bruno',          src: '/Bruno.vrm' },

@@ -799,7 +799,7 @@ function LordPiggingtonAvatar({
       // ── Lip-sync ──────────────────────────────────────────────────────────
       const rawEnergy  = isSpeaking ? Math.max(0, Math.min(1, sc?.energy ?? 0)) : 0;
       let activeShape  = '';
-      if (rawEnergy > 0.02 && avMouth.length > 0) {
+      if (rawEnergy > 0.01 && avMouth.length > 0) { // lowered threshold: 0.02→0.01
         const viseme = sc?.viseme ?? 'open';
         const cands  = VISEME_CANDIDATES[viseme] ?? VISEME_CANDIDATES.open;
         activeShape  = cands.find(c => avMouth.includes(c)) ?? avMouth[0] ?? '';
