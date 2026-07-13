@@ -1657,12 +1657,16 @@ export default function MobileHome() {
   // Persist ticker choice
   useEffect(() => { try { localStorage.setItem('brain_ticker', ticker); } catch {} }, [ticker]);
 
-  // Derive avatar state from live data and pick a narration line
+  // Derive avatar state; only pick a new narration line when the state actually changes
+  const prevAvStRef = useRef('');
   useEffect(() => {
     if (!data) return;
     const st = toAvatarState(data);
     setAvSt(st);
-    setNarr(pickMLine(st));
+    if (st !== prevAvStRef.current) {
+      prevAvStRef.current = st;
+      setNarr(pickMLine(st));
+    }
   }, [data]);
 
   // Keep narrationRef current so the unlock effect can read it without stale closure
@@ -1689,11 +1693,11 @@ export default function MobileHome() {
     return () => clearTimeout(t);
   }, [audioUnlocked]);
 
-  // Periodic narration refresh every 18s — pick a new line (speak effect handles voicing)
+  // Periodic narration refresh every 90s — pick a new line (speak effect handles voicing)
   useEffect(() => {
     const id = setInterval(() => {
       setNarr(pickMLine(avatarState));
-    }, 18000);
+    }, 90000);
     return () => clearInterval(id);
   }, [avatarState]);
 
