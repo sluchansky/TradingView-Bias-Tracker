@@ -2002,7 +2002,7 @@ export default function Home() {
   const [vrmUrlInput, setVrmUrlInput] = useState('');
   const setVrmSrc = useCallback((src: string) => { try { localStorage.setItem('brain_vrm', src); } catch {} setVrmSrcRaw(src); setShowAvatarPicker(false); }, []);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
-  const [chatOpen,     setChatOpen]     = useState(false);
+  const [chatOpen,     setChatOpen]     = useState(true);
   const [chartOpen,    setChartOpen]    = useState(true);
   const [leftOpen,     setLeftOpen]     = useState(false);
   const [confirming,   setConfirming]   = useState(false);
@@ -2329,7 +2329,8 @@ export default function Home() {
           ? 100000 + Math.random() * 30000 // 100-130 s during live trade
           : 55000 + Math.random() * 35000; // 55-90 s while forming
 
-      if (silentMs >= silenceMs) {
+      // If the avatar is mid-utterance, skip this chatter fire entirely — no interruption.
+      if (silentMs >= silenceMs && !speechCtrlRef.current.active) {
         // Build market context pool
         const px  = Number(d?.price          || 0);
         const vw  = Number(d?.vwap_value     || 0);
@@ -3524,11 +3525,14 @@ export default function Home() {
                     Cancel
                   </button>
                 )}
-                <button className="action-btn chip-btn" onClick={() => setChatOpen(!chatOpen)} style={{
-                  padding:'10px 16px', borderRadius:8, border:'1px solid rgba(255,255,255,0.10)',
-                  background:'transparent', color:'rgba(255,255,255,0.45)', fontSize:12, fontFamily:'monospace', cursor:'pointer' }}>
-                  {chatOpen ? 'Hide Chat' : 'Ask Brain'}
-                </button>
+                {!chatOpen && (
+                  <button className="action-btn chip-btn" onClick={() => setChatOpen(true)} style={{
+                    padding:'10px 16px', borderRadius:8, border:`1px solid ${eyeColor}40`,
+                    background:`${eyeColor}08`, color:eyeColor, fontSize:12, fontFamily:'monospace', cursor:'pointer',
+                    fontWeight:600, letterSpacing:'0.04em' }}>
+                    &#x1F4AC; Chat
+                  </button>
+                )}
                 {/* ── SPEAK BUTTON ─────────────────────────────────────────── */}
                 <button onClick={handleSpeak} disabled={voiceState === 'requesting'}
                   title={voiceState === 'error' ? voiceErrorMsg : voiceState === 'listening' ? 'Tap to stop recording' : speaking ? 'Tap to interrupt' : 'Tap to speak'}
@@ -3855,11 +3859,24 @@ export default function Home() {
 
           {/* ── CHAT ────────────────────────────────────────────────────── */}
           {chatOpen && (
-            <div style={{ marginBottom:16, border:'1px solid rgba(255,255,255,0.062)', borderRadius:10,
-              background:'rgba(255,255,255,0.018)', overflow:'hidden' }}>
+            <div style={{ marginBottom:16, border:`1px solid ${eyeColor}30`, borderRadius:10,
+              background:'rgba(255,255,255,0.022)', overflow:'hidden' }}>
+              {/* Chat header — always visible so user knows this is the reply area */}
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                padding:'9px 14px 7px', borderBottom:'1px solid rgba(255,255,255,0.045)',
+                background:'rgba(255,255,255,0.014)' }}>
+                <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                  <span style={{ fontSize:12, color:eyeColor, opacity:0.8 }}>&#x1F4AC;</span>
+                  <span style={{ fontSize:11.5, fontFamily:'monospace', color:'rgba(255,255,255,0.55)',
+                    letterSpacing:'0.06em', textTransform:'uppercase', fontWeight:700 }}>Talk to Avatar</span>
+                  <span style={{ fontSize:10, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>— type below or tap the mic</span>
+                </div>
+                <button onClick={() => setChatOpen(false)} style={{ background:'none', border:'none',
+                  color:'rgba(255,255,255,0.22)', fontSize:12, cursor:'pointer', padding:'0 2px' }}>&#x2715;</button>
+              </div>
               <div ref={chatRef} style={{ maxHeight:220, overflowY:'auto', padding:'14px 14px 6px' }}>
                 {msgs.length === 0 && (
-                  <div style={{ fontSize:12, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', textAlign:'center', padding:'20px 0' }}>What do you see in the tape?</div>
+                  <div style={{ fontSize:12, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', textAlign:'center', padding:'20px 0' }}>Reply to the avatar or ask it anything&hellip;</div>
                 )}
                 {msgs.map(m => <BrainBubble key={m.id} msg={m} />)}
                 {asking && (
