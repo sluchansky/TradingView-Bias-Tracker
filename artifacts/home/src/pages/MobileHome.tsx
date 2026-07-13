@@ -1735,6 +1735,53 @@ export default function MobileHome() {
 
   const verdI = useMemo(() => data ? verdictInfo(data) : { label:'—', color:MUTED, bg:'transparent' }, [data]);
 
+  // ── Pull-to-refresh: find best available setup across all tickers ──────────
+  const [pulling,    setPulling]    = useState(false);
+  const [pullY,      setPullY]      = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const touchStartY  = useRef(-1);
+  const scrollRef    = useRef<HTMLDivElement>(null);
+
+  const findBestTicker = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const tickers: Ticker[] = ['MNQ', 'MGC', 'MES', 'MYM'];
+      const results = await Promise.all(tickers.map(async t => {
+        try {
+          const r = await fetch(`/api/status?ticker=${t}`, { headers: authHeader, credentials: 'include' });
+          if (!r.ok) return { ticker: t, priority: -1, edge: 0 };
+          const d = await r.json();
+          const mb  = d.main_brain || {};
+          const st  = String(mb.status || '').toUpperCase();
+          const edge = Number(d.edge_score || 0);
+          const priority = d.active_trade ? 4 : st === 'READY' ? 3 : st === 'BUILDING' ? 2 : edge > 30 ? 1 : 0;
+          return { ticker: t, priority, edge };
+        } catch { return { ticker: t, priority: -1, edge: 0 }; }
+      }));
+      results.sort((a, b) => b.priority - a.priority || b.edge - a.edge);
+      const best = results[0];
+      if (best && best.priority >= 0) {
+        setTicker(best.ticker);
+        setTab('signal');
+      }
+    } finally { setRefreshing(false); }
+  }, [authHeader]);
+
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    touchStartY.current = scrollRef.current?.scrollTop === 0 ? e.touches[0].clientY : -1;
+  }, []);
+
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (touchStartY.current < 0) return;
+    const dy = e.touches[0].clientY - touchStartY.current;
+    if (dy > 0) { setPulling(true); setPullY(Math.min(dy * 0.55, 72)); }
+  }, []);
+
+  const handleTouchEnd = useCallback(() => {
+    if (pulling && pullY >= 60) findBestTicker();
+    setPulling(false); setPullY(0); touchStartY.current = -1;
+  }, [pulling, pullY, findBestTicker]);
+
   if (checking) {
     return (
       <div style={{ position:'fixed', inset:0, background:BG, display:'flex',
@@ -1783,21 +1830,57 @@ export default function MobileHome() {
         <TickerBar value={ticker} onChange={setTicker} />
       </div>
 
-      {/* ── Content area ── */}
-      <div style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch',
-        padding:`12px 14px ${TAB_BOTTOM_PAD}px` }}>
-        {tab === 'signal' && (
-          <SignalTab data={data} ticker={ticker} narration={narration}
-            avatarState={avatarState} speaking={speaking} authHeader={authHeader} />
-        )}
-        {tab === 'brain' && <BrainTab data={data} />}
-        {tab === 'chat' && (
-          <AvatarTab authHeader={authHeader} ticker={ticker} speak={speak}
-            speaking={speaking} avatarState={avatarState} narration={narration} />
-        )}
-        {tab === 'position' && (
-          <PositionTab data={data} muted={muted} setMuted={setMuted} />
-        )}
+      {/* ── Content area + pull-to-refresh ── */}
+      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        {/* Pull indicator */}
+        <div style={{
+          height: refreshing ? 44 : pulling ? pullY : 0,
+          transition: pulling ? 'none' : 'height 0.28s ease',
+          flexShrink: 0, overflow:'hidden',
+          display:'flex', alignItems:'center', justifyContent:'center', gap:8,
+          borderBottom: (pulling || refreshing) ? '1px solid rgba(255,255,255,0.07)' : 'none',
+          background:'rgba(6,8,16,0.98)',
+        }}>
+          {refreshing ? (
+            <>
+              {[0,1,2].map(i => (
+                <div key={i} style={{ width:6, height:6, borderRadius:'50%', background:BLUE,
+                  animation:`mDot 0.9s ${i*0.18}s ease-in-out infinite` }} />
+              ))}
+              <span style={{ fontSize:11, fontFamily:'monospace', letterSpacing:'0.09em',
+                color:'rgba(255,255,255,0.38)' }}>SCANNING ALL INSTRUMENTS…</span>
+            </>
+          ) : pullY >= 60 ? (
+            <span style={{ fontSize:11, fontFamily:'monospace', letterSpacing:'0.09em', color:BLUE }}>
+              ↑ Release to jump to best setup
+            </span>
+          ) : (
+            <span style={{ fontSize:11, fontFamily:'monospace', letterSpacing:'0.09em',
+              color:'rgba(255,255,255,0.22)' }}>
+              ↓ Pull down for best setup
+            </span>
+          )}
+        </div>
+
+        {/* Scrollable content */}
+        <div ref={scrollRef} style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch',
+          padding:`12px 14px ${TAB_BOTTOM_PAD}px` }}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}>
+          {tab === 'signal' && (
+            <SignalTab data={data} ticker={ticker} narration={narration}
+              avatarState={avatarState} speaking={speaking} authHeader={authHeader} />
+          )}
+          {tab === 'brain' && <BrainTab data={data} />}
+          {tab === 'chat' && (
+            <AvatarTab authHeader={authHeader} ticker={ticker} speak={speak}
+              speaking={speaking} avatarState={avatarState} narration={narration} />
+          )}
+          {tab === 'position' && (
+            <PositionTab data={data} muted={muted} setMuted={setMuted} />
+          )}
+        </div>
       </div>
 
       {/* ── Bottom nav ── */}
