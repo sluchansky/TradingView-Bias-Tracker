@@ -666,7 +666,9 @@ function LordPiggingtonAvatar({
         walkFacingYRef.current = ed(walkFacingYRef.current, 0, 4.0, dt);
       }
       vrm.scene.position.x = walkPosXRef.current;
-      vrm.scene.rotation.y = walkFacingYRef.current;
+      // Math.PI is the VRM0 base rotation (rotateVRM0 sets scene.rotation.y = π to face camera)
+      // walkFacingYRef holds a small ±offset lean — never overwrite the π base
+      vrm.scene.rotation.y = Math.PI + walkFacingYRef.current;
 
       // ── Spontaneous roam timer ────────────────────────────────────────────
       roamRef.current.t += dt;
