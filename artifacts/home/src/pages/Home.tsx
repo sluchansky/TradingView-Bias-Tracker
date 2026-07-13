@@ -198,6 +198,10 @@ function useTTS() {
       energyRafRef.current = requestAnimationFrame(decay);
     };
     utt.onend = stopEnergy; utt.onerror = stopEnergy;
+    // Set active=true SYNCHRONOUSLY before ss.speak() so any code that checks
+    // speechCtrlRef.current.active immediately after this call sees true —
+    // onstart fires asynchronously and would leave a race window open.
+    speechCtrlRef.current.active = true;
     ss.speak(utt);
   }, [voices, voiceName, muted]);
 
@@ -2315,77 +2319,9 @@ export default function Home() {
   useEffect(() => { avStateRef.current = avState; }, [avState]);
   useEffect(() => { cockpitRef.current = { data, edge, avState }; }, [data, edge, avState]);
   useEffect(() => { setIdleLineRef.current = setIdleLine; }, [setIdleLine]);
-  useEffect(() => {
-    let tid: ReturnType<typeof setTimeout>;
-    const fire = () => {
-      const { data: d, edge: eg, avState: st } = cockpitRef.current;
-      const silentMs  = Date.now() - lastSpokeAtRef.current;
-      const isIdle    = st === 'WAIT' || st === 'NO_EDGE';
-      const isActive  = st === 'ACTIVE' || st === 'READY_LONG' || st === 'READY_SHORT';
-      const silenceMs = 30000; // 30s guard — never cut across an ongoing utterance
-      const nextMs    = isIdle
-        ? 45000 + Math.random() * 30000  // 45-75 s when idle
-        : isActive
-          ? 100000 + Math.random() * 30000 // 100-130 s during live trade
-          : 55000 + Math.random() * 35000; // 55-90 s while forming
-
-      // If the avatar is mid-utterance, skip this chatter fire entirely — no interruption.
-      if (silentMs >= silenceMs && !speechCtrlRef.current.active) {
-        // Build market context pool
-        const px  = Number(d?.price          || 0);
-        const vw  = Number(d?.vwap_value     || 0);
-        const dem = Number(d?.nearest_demand || 0);
-        const sup = Number(d?.nearest_supply || 0);
-        const gd  = (d?.gate_debug        || {}) as Record<string,any>;
-        const ad  = (d?.alert_diagnostics || {}) as Record<string,any>;
-        const cv  = String(ad.cvd  || '').toLowerCase();
-        const vol = String(ad.volume || '').toLowerCase();
-        const sc  = !!gd.structure_confirmed;
-        const zv  = !!gd.zone_valid;
-        const egR = Math.round(eg);
-        const ctx: string[] = [];
-        if (px > 0 && vw > 0) {
-          const diff = ((Math.abs(px - vw) / vw) * 100).toFixed(2);
-          ctx.push(px > vw
-            ? `Price is trading ${diff} percent above vee-wap. Bulls are holding above the key intraday level.`
-            : `Price is ${diff} percent below vee-wap. Sellers are in control of the intraday structure.`);
-        }
-        if (zv)              ctx.push('The key zone is active. Watching closely for a reaction.');
-        if (dem > 0 && !zv) ctx.push('Watching the demand zone below. That is the level that could trigger a long setup.');
-        if (sup > 0 && !zv) ctx.push('Supply overhead is the main obstacle. Bulls need to clear that level.');
-        if (sc && !zv)      ctx.push('Structure is confirmed. Waiting for the zone to complete the full setup.');
-        if (!sc)            ctx.push('No confirmed break of structure yet. That is the primary signal I am waiting for.');
-        if (/bull|pos/.test(cv))     ctx.push('Cumulative delta is bullish. Buyers are active in the order flow right now.');
-        if (/bear|neg/.test(cv))     ctx.push('Cumulative delta is bearish. Sellers are controlling the tape.');
-        if (/strong|high/.test(vol)) ctx.push('Volume is elevated. Real institutional participation is showing up.');
-        if (/low|thin/.test(vol))    ctx.push('Volume is light right now. I want to see more participation before acting.');
-        if (egR > 0) ctx.push(`Edge score is at ${egR} out of 110. ${egR >= 75 ? 'That is above my entry threshold.' : egR >= 50 ? 'Getting closer — watching for the final signals.' : 'Not enough edge to trade yet.'}`);
-
-        // Weighted roll — personality only; no questions (intrusive mid-session)
-        const roll = Math.random();
-        let line: string;
-        if (roll < 0.30) {
-          line = _pickCycling(JOKES, '__jokes');
-        } else if (roll < 0.70) {
-          line = _pickCycling(BANTER, '__banter');
-        } else {
-          const pool = ctx.length > 0 ? ctx : [pickVoiceLine(st)];
-          line = pool[Math.floor(Math.random() * pool.length)];
-        }
-
-        if (line !== lastSpokenRef.current) {
-          lastSpokenRef.current = line;
-          lastSpokeAtRef.current = Date.now();
-          setIdleLineRef.current(line); // ← drives the displayed narration text
-          speakRef.current(line);
-        }
-      }
-      tid = setTimeout(fire, nextMs);
-    };
-    // First fire after a longer warm-up — page settles before avatar speaks
-    tid = setTimeout(fire, 60000 + Math.random() * 30000);
-    return () => clearTimeout(tid);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Ambient chatter removed — it was the source of the "second voice" because its
+  // independent timer fired speak() concurrently with the narration useEffect.
+  // The avatar now speaks only on narration changes (poll-driven) and chat replies.
 
   // Detect market events → fire a gaze direction that drives eye movement
   useEffect(() => {
