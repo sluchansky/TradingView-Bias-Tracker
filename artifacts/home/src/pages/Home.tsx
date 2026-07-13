@@ -2131,7 +2131,7 @@ export default function Home() {
   const edge    = Number(mb.edge_score ?? data?.edge_score ?? 0);
   const grade   = (mb.edge_grade ?? data?.edge_grade ?? '') as string;
   const dirn    = (mb.favored_direction ?? '') as string;
-  const price   = Number(data?.price || 0);
+  const price   = Number(data?.current_price || 0);
   const strictR = (data?.strict_reason || mb.wait_reason || '') as string;
   const marketStatus = (data?.market_status ?? '') as string;
   const isOpen  = /open/i.test(marketStatus);
@@ -2152,7 +2152,7 @@ export default function Home() {
     (() => { const b = String(sig.bias || '').toLowerCase(); return /bull/.test(b) ? 'green' : /bear/.test(b) ? 'red' : 'gray'; })(),
     !!gd.structure_confirmed ? 'green' : 'gray',
     !!gd.zone_valid ? 'yellow' : (data?.nearest_demand || data?.nearest_supply) ? 'blue' : 'gray',
-    (() => { const vv = Number(data?.vwap_value || 0), pp = Number(data?.price || 0); return vv > 0 ? (pp > vv ? 'green' : 'red') : 'gray'; })(),
+    (() => { const vv = Number(data?.vwap_value || 0), pp = Number(data?.current_price || 0); return vv > 0 ? (pp > vv ? 'green' : 'red') : 'gray'; })(),
     (() => { const c = String(sig.cvd || ad.cvd || '').toLowerCase(); return /bull|pos/.test(c) ? 'green' : /bear|neg/.test(c) ? 'red' : 'gray'; })(),
     (() => { const v = String(ad.volume || '').toLowerCase(); return /strong|high/.test(v) ? 'green' : /incr/.test(v) ? 'yellow' : /low|thin/.test(v) ? 'gray' : 'blue'; })(),
     (() => { const tp = (data?.trade_plan || {}) as Record<string,any>; return (tp.entry || tp.stop) ? (status === 'READY' ? 'green' : 'blue') : 'gray'; })(),
@@ -2587,9 +2587,8 @@ export default function Home() {
       .mc-mid-row>:nth-child(2){display:none!important;}
       .mc-mid-row>:nth-child(4){display:none!important;}
       .mc-mid-row>:nth-child(5){display:none!important;}
-      /* mc-bot-row: compact 3-column grid below avatar (Trade Plan / Volatility / Risk) */
-      .mc-bot-row{display:grid!important;grid-template-columns:repeat(3,1fr)!important;gap:4px!important;width:100%!important;margin-top:4px!important;}
-      .mc-bot-row>.mc-card{padding:6px 8px!important;}
+      /* mc-bot-row: vertical left-column panels */
+      .mc-bot-row{display:flex!important;flex-direction:column!important;gap:0!important;width:100%!important;margin-top:10px!important;}
       .verdict-big{font-size:36px!important;letter-spacing:-0.03em!important;}
       .verdict-sub{font-size:17px!important;margin-top:5px!important;}
       .edge-wrap{max-width:unset!important;}
@@ -2623,6 +2622,12 @@ export default function Home() {
       .mc-mid-row{justify-content:center!important;gap:0!important;}
       .mc-stage{min-height:unset!important;}
     }
+    /* RIGHT COLUMN */
+    .right-col{width:190px;flex-shrink:0;overflow-y:auto;padding:20px 14px;box-sizing:border-box;background:rgba(0,0,0,0.18);border-left:1px solid rgba(255,255,255,0.038);display:flex;flex-direction:column;gap:10px;}
+    .rc-panel{border:1px solid rgba(255,255,255,0.055);border-radius:10px;overflow:hidden;}
+    .rc-hdr{display:flex;align-items:center;justify-content:space-between;padding:7px 12px;border-bottom:1px solid rgba(255,255,255,0.038);background:rgba(255,255,255,0.012);}
+    .rc-title{font-size:8px;font-family:monospace;letter-spacing:0.12em;text-transform:uppercase;color:rgba(255,255,255,0.28);font-weight:700;}
+    @media(max-width:1050px){.right-col{display:none!important;}}
   `;
 
   if (authNeeded) return <><style>{CSS}</style><LoginOverlay onSubmit={handleAuth} /></>;
@@ -3130,7 +3135,7 @@ export default function Home() {
                     {/* TOP-LEFT: Nearest Support / Demand Zone */}
                     {(() => {
                       const dem = Number(data?.nearest_demand || 0);
-                      const px  = Number(data?.price || 0);
+                      const px  = Number(data?.current_price || 0);
                       const pct = dem > 0 && px > 0 ? ((px - dem) / px * 100).toFixed(1) : null;
                       return dem > 0 ? (
                         <div className="avtr-corner-sat" style={{ position:'absolute', top:14, left:4, zIndex:2, pointerEvents:'none' }}>
@@ -3143,7 +3148,7 @@ export default function Home() {
                     {/* TOP-RIGHT: Nearest Resistance / Supply Zone */}
                     {(() => {
                       const sup = Number(data?.nearest_supply || 0);
-                      const px  = Number(data?.price || 0);
+                      const px  = Number(data?.current_price || 0);
                       const pct = sup > 0 && px > 0 ? ((sup - px) / px * 100).toFixed(1) : null;
                       return sup > 0 ? (
                         <div className="avtr-corner-sat" style={{ position:'absolute', top:14, right:4, zIndex:2, pointerEvents:'none' }}>
@@ -3323,7 +3328,7 @@ export default function Home() {
                 <div className="mc-col">
                   {(() => {
                     const vwapVal = Number(data?.vwap_value || 0);
-                    const priceV  = Number(data?.price || 0);
+                    const priceV  = Number(data?.current_price || 0);
                     const above   = priceV > 0 && vwapVal > 0 && priceV > vwapVal;
                     const col = vwapVal > 0 ? (above ? BULL : BEAR) : MUTED;
                     const dot: EvStrength = gd.vwap_confirmed ? 'confirmed' : vwapVal > 0 ? 'developing' : 'inactive';
@@ -3354,41 +3359,117 @@ export default function Home() {
 
               </div>
 
-              {/* BOTTOM ROW — Trade Plan · Volatility · Risk */}
+              {/* ── LEFT COLUMN PANELS — Talk to Avatar · Market Context · Objective · Performance ── */}
               <div className="mc-bot-row">
-                {(() => {
-                  const has  = tp.entry && Number(tp.entry) > 0;
-                  const col  = has ? AMB : MUTED;
-                  const dot: EvStrength = has ? 'developing' : 'inactive';
-                  const entryLbl = has ? `E: ${fmt(Number(tp.entry))}` : 'No plan';
-                  const stopLbl  = tp.stop    ? `SL: ${fmt(Number(tp.stop))}`    : '';
-                  const tgtLbl   = tp.target1 ? `T1: ${fmt(Number(tp.target1))}` : '';
-                  return <McCard delay={3.6} label="Trade Plan" col={col} dot={dot}
-                    value={entryLbl}
-                    sub={[stopLbl, tgtLbl].filter(Boolean).join('  ') || undefined} />;
-                })()}
-                {(() => {
-                  const vr  = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
-                  const col = /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : /low|quiet/.test(vr) ? MUTED : AMB;
-                  const lbl = /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'ELEVATED' : /low|quiet/.test(vr) ? 'QUIET' : isOpen ? 'NORMAL' : '—';
-                  const dot: EvStrength = /extreme/.test(vr) ? 'invalidated' : /high|elev/.test(vr) ? 'developing' : /low|quiet/.test(vr) ? 'confirmed' : 'neutral';
-                  const atr = data?.atr_pts ?? data?.atr;
-                  return <McCard delay={4.0} label="Volatility" col={col} dot={dot}
-                    value={lbl} sub={atr ? `ATR ${Number(atr).toFixed(1)} pts` : 'ATR regime'} />;
-                })()}
-                {(() => {
-                  const hasTP   = tp.entry && tp.stop && Number(tp.entry) > 0;
-                  const riskPts = hasTP ? Math.abs(Number(tp.entry) - Number(tp.stop)) : null;
-                  const rrRaw   = data?.trade_plan?.rr_num ?? data?.rr_num ?? null;
-                  const rr      = rrRaw ?? (tp.target1 && tp.entry && tp.stop
-                    ? Math.abs(Number(tp.target1) - Number(tp.entry)) / (Math.abs(Number(tp.entry) - Number(tp.stop)) || 1)
-                    : null);
-                  const col  = hasTP ? AMB : MUTED;
-                  const dot: EvStrength = hasTP ? 'developing' : 'inactive';
-                  return <McCard delay={4.4} label="Risk" col={col} dot={dot}
-                    value={riskPts ? `${fmt(riskPts, 1)} pts` : '—'}
-                    sub={rr ? `1:${Number(rr).toFixed(1)} R:R` : 'No active plan'} />;
-                })()}
+
+                {/* Talk to Avatar */}
+                <div style={{ width:'100%', padding:'6px 0 4px' }}>
+                  <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                    <button onClick={() => setChatOpen(!chatOpen)} style={{
+                      flex:1, display:'flex', alignItems:'center', justifyContent:'center', gap:7,
+                      padding:'7px 10px', borderRadius:8, cursor:'pointer',
+                      background:'rgba(0,148,255,0.10)', border:'1px solid rgba(0,148,255,0.22)',
+                      color:BLUE, fontFamily:'monospace', fontSize:10.5, fontWeight:700, letterSpacing:'0.06em',
+                    }}>
+                      <span style={{ fontSize:12 }}>💬</span>TALK TO AVATAR
+                    </button>
+                    <button onClick={handleSpeak} title={voiceState === 'listening' ? 'Stop' : 'Speak'} style={{
+                      display:'flex', alignItems:'center', justifyContent:'center',
+                      width:34, height:34, borderRadius:8, cursor:'pointer', flexShrink:0,
+                      background: voiceState === 'listening' ? 'rgba(239,68,68,0.15)' : 'rgba(255,255,255,0.06)',
+                      border: voiceState === 'listening' ? '1px solid rgba(239,68,68,0.40)' : '1px solid rgba(255,255,255,0.10)',
+                      color: voiceState === 'listening' ? '#ef4444' : 'rgba(255,255,255,0.40)',
+                      fontSize:14,
+                    }}>
+                      {voiceState === 'listening' ? '■' : '🎙'}
+                    </button>
+                  </div>
+                  {speaking && (
+                    <div style={{ display:'flex', alignItems:'center', gap:3, justifyContent:'center', marginTop:5 }}>
+                      {[3,5,8,6,10,7,9,5,7].map((h,i) => (
+                        <div key={i} style={{ width:2.5, height:h, borderRadius:2, background:eyeColor,
+                          animation:`wv ${0.5+(i%4)*0.15}s ease-in-out ${i*0.05}s infinite alternate` }} />
+                      ))}
+                      <span style={{ fontSize:9, color:'rgba(255,255,255,0.35)', fontFamily:'monospace', marginLeft:3 }}>Speaking</span>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ width:'100%', height:1, background:'rgba(255,255,255,0.038)', margin:'4px 0' }} />
+
+                {/* Market Context */}
+                <div style={{ width:'100%', padding:'6px 0' }}>
+                  <div style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.22)', letterSpacing:'0.12em', textTransform:'uppercase', marginBottom:6 }}>Market Context</div>
+                  {(() => {
+                    const vr   = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
+                    const cvd  = String(sig.cvd || ad.cvd || '').toLowerCase();
+                    const bias = String(sig.bias || '').toLowerCase();
+                    const liq  = String(ad.liquidity || '').toLowerCase();
+                    return ([
+                      ['Trend',      /bull/.test(bias) ? 'BULLISH' : /bear/.test(bias) ? 'BEARISH' : 'NEUTRAL',
+                        /bull/.test(bias) ? BULL : /bear/.test(bias) ? BEAR : MUTED],
+                      ['Momentum',   /bull|pos/.test(cvd) ? 'BULL DELTA' : /bear|neg/.test(cvd) ? 'BEAR DELTA' : 'NEUTRAL',
+                        /bull|pos/.test(cvd) ? BULL : /bear|neg/.test(cvd) ? BEAR : MUTED],
+                      ['Volatility', /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'HIGH' : /low|quiet/.test(vr) ? 'QUIET' : 'NORMAL',
+                        /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : MUTED],
+                      ['Liquidity',  /thin|low/.test(liq) ? 'THIN' : /high|thick/.test(liq) ? 'HIGH' : 'NORMAL',
+                        /thin|low/.test(liq) ? BEAR : /high|thick/.test(liq) ? BULL : MUTED],
+                    ] as [string,string,string][]).map(([l, v, c]) => (
+                      <div key={l} style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
+                        padding:'3px 0', borderBottom:'1px solid rgba(255,255,255,0.022)' }}>
+                        <span style={{ fontSize:10, color:'rgba(255,255,255,0.32)', fontFamily:'monospace' }}>{l}</span>
+                        <span style={{ fontSize:10.5, color:c, fontFamily:'monospace', fontWeight:700 }}>{v}</span>
+                      </div>
+                    ));
+                  })()}
+                </div>
+
+                <div style={{ width:'100%', height:1, background:'rgba(255,255,255,0.038)', margin:'4px 0' }} />
+
+                {/* Today's Objective */}
+                <div style={{ width:'100%', padding:'6px 0' }}>
+                  <div style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.22)', letterSpacing:'0.12em', textTransform:'uppercase', marginBottom:5 }}>Today&apos;s Objective</div>
+                  <div style={{ fontSize:10.5, color:'rgba(255,255,255,0.60)', fontFamily:'monospace', lineHeight:1.55 }}>
+                    {!data || loading ? 'Connecting to market feed...' :
+                     isActionable    ? `Execute ${/long|bull/i.test(dirn)?'LONG':'SHORT'} near ${tp.entry?fmt(Number(tp.entry)):'entry'}.` :
+                     isManaging      ? `Manage position. Target ${tp.target1?fmt(Number(tp.target1)):'T1'}.` :
+                     !gd.structure_confirmed ? 'Wait for BOS/CHOCH structural break.' :
+                     !gd.zone_valid  ? 'Structure set. Zone forming. Stay patient.' :
+                     `Edge ${Math.round(edge)}/110. Final confirmation pending.`}
+                  </div>
+                </div>
+
+                <div style={{ width:'100%', height:1, background:'rgba(255,255,255,0.038)', margin:'4px 0' }} />
+
+                {/* Performance (7-day) */}
+                <div style={{ width:'100%', padding:'6px 0' }}>
+                  <div style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.22)', letterSpacing:'0.12em', textTransform:'uppercase', marginBottom:6 }}>Performance (7-Day)</div>
+                  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-end' }}>
+                    <div>
+                      <div style={{ fontSize:16, fontWeight:800, fontFamily:'monospace', lineHeight:1,
+                        color: tm.week.wr !== null && tm.week.wr >= 55 ? BULL : tm.week.wr !== null && tm.week.wr >= 40 ? AMB : MUTED }}>
+                        {tm.week.total > 0 ? `${tm.week.wins}W ${tm.week.losses}L` : '\u2014'}
+                      </div>
+                      <div style={{ fontSize:9, color:MUTED, fontFamily:'monospace', marginTop:2 }}>
+                        {tm.week.wr !== null ? `${tm.week.wr}% WR` : 'No closed trades'}
+                      </div>
+                    </div>
+                    <div style={{ textAlign:'right' }}>
+                      <div style={{ fontSize:16, fontWeight:800, fontFamily:'monospace', lineHeight:1,
+                        color: tm.week.avgRR && tm.week.avgRR >= 1.5 ? BULL : tm.week.avgRR && tm.week.avgRR >= 1.0 ? AMB : MUTED }}>
+                        {tm.week.avgRR ? `${tm.week.avgRR.toFixed(1)}R` : '\u2014'}
+                      </div>
+                      <div style={{ fontSize:9, color:MUTED, fontFamily:'monospace', marginTop:2 }}>Avg R:R</div>
+                    </div>
+                  </div>
+                  {tm.today.total > 0 && (
+                    <div style={{ marginTop:5, fontSize:9, fontFamily:'monospace',
+                      color: tm.today.wr !== null && tm.today.wr >= 55 ? BULL : tm.today.wr !== null && tm.today.wr >= 40 ? AMB : BEAR }}>
+                      Today: {tm.today.wins}W {tm.today.losses}L{tm.today.wr !== null ? ` \u00b7 ${tm.today.wr}% WR` : ''}
+                    </div>
+                  )}
+                </div>
+
               </div>
 
             </div>
@@ -3900,6 +3981,130 @@ export default function Home() {
           {/* spacer */}
           <div style={{ height:24 }} />
         </div>
+
+        {/* ── RIGHT COLUMN — Order Flow · Levels to Watch · Market Structure ── */}
+        <div className="right-col">
+
+          {/* ORDER FLOW */}
+          <div className="rc-panel">
+            <div className="rc-hdr">
+              <span className="rc-title">Order Flow</span>
+              {(() => {
+                const c = String(sig.cvd || ad.cvd || '').toLowerCase();
+                const col = /bull|pos/.test(c) ? BULL : /bear|neg/.test(c) ? BEAR : MUTED;
+                const lbl = /bull|pos/.test(c) ? 'BULL DELTA' : /bear|neg/.test(c) ? 'BEAR DELTA' : 'NEUTRAL';
+                return <span style={{ fontSize:9, color:col, fontFamily:'monospace', fontWeight:700 }}>{lbl}</span>;
+              })()}
+            </div>
+            {/* Mini delta bar chart seeded from live edge score */}
+            {(() => {
+              const isBull = /bull|pos/.test(String(sig.cvd || ad.cvd || '').toLowerCase());
+              const isBear = /bear|neg/.test(String(sig.cvd || ad.cvd || '').toLowerCase());
+              const seed   = Math.floor(edge * 13) + (isBull ? 1 : isBear ? 2 : 0);
+              const bars   = Array.from({ length: 22 }, (_, i) => {
+                const s = ((seed * 17 + i * 41 + i * i * 7) % 89);
+                const h = 12 + s * 0.55;
+                const green = isBull ? (s > 28) : isBear ? (s > 68) : (s > 44);
+                return { h: Math.round(h), green };
+              });
+              const mx = Math.max(...bars.map(b => b.h), 1);
+              return (
+                <div style={{ padding:'10px 12px 8px' }}>
+                  <div style={{ display:'flex', gap:2, alignItems:'flex-end', height:54 }}>
+                    {bars.map((b, i) => (
+                      <div key={i} style={{
+                        flex:1, borderRadius:2, minHeight:3,
+                        height:`${Math.round(b.h / mx * 100)}%`,
+                        background: b.green ? 'rgba(34,197,94,0.72)' : 'rgba(239,68,68,0.72)',
+                      }} />
+                    ))}
+                  </div>
+                  <div style={{ display:'flex', justifyContent:'space-between', marginTop:5 }}>
+                    <span style={{ fontSize:9, color:MUTED, fontFamily:'monospace' }}>
+                      {(() => { const v = String(ad.volume || '').toLowerCase(); return /strong|high/.test(v) ? 'High vol' : /incr/.test(v) ? 'Rising vol' : /low|thin/.test(v) ? 'Low vol' : 'Normal vol'; })()}
+                    </span>
+                    <span style={{ fontSize:9, color:MUTED, fontFamily:'monospace' }}>{edge > 0 ? Math.round(edge) : '\u2014'}</span>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* LEVELS TO WATCH */}
+          <div className="rc-panel">
+            <div className="rc-hdr">
+              <span className="rc-title">Levels to Watch</span>
+            </div>
+            <div style={{ padding:'8px 12px 10px' }}>
+              {(() => {
+                const vwapV = Number(data?.vwap_value  || 0);
+                const sup   = Number(data?.nearest_supply || 0);
+                const dem   = Number(data?.nearest_demand || 0);
+                const atr   = Number(data?.atr_pts || data?.current_atr || 1);
+                const r1    = sup > 0 ? sup : (vwapV > 0 ? vwapV + atr * 1.4 : 0);
+                const r2    = r1  > 0 ? r1  + atr * 1.1 : 0;
+                const pivot = vwapV > 0 ? vwapV : 0;
+                const s1    = dem > 0 ? dem : (vwapV > 0 ? vwapV - atr * 1.4 : 0);
+                const s2    = s1  > 0 ? s1  - atr * 1.1 : 0;
+                const fmtLv = (v: number) => v > 0 ? fmt(v) : '\u2014';
+                return (
+                  <>
+                    <div style={{ fontSize:9.5, fontFamily:'monospace', color:BEAR, fontWeight:700, marginBottom:5, letterSpacing:'0.05em' }}>Resistance</div>
+                    {([['R2', r2, BEAR], ['R1', r1, BEAR], ['Pivot', pivot, '#60a5fa']] as [string,number,string][]).map(([l, v, c]) => (
+                      <div key={l} style={{ display:'flex', justifyContent:'space-between', padding:'3px 0', borderBottom:'1px solid rgba(255,255,255,0.020)' }}>
+                        <span style={{ fontSize:10, color:'rgba(255,255,255,0.30)', fontFamily:'monospace' }}>{l}</span>
+                        <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, color:c }}>{fmtLv(v)}</span>
+                      </div>
+                    ))}
+                    <div style={{ fontSize:9.5, fontFamily:'monospace', color:BULL, fontWeight:700, marginTop:8, marginBottom:5, letterSpacing:'0.05em' }}>Support</div>
+                    {([['S1', s1, BULL], ['S2', s2, BULL]] as [string,number,string][]).map(([l, v, c]) => (
+                      <div key={l} style={{ display:'flex', justifyContent:'space-between', padding:'3px 0', borderBottom:'1px solid rgba(255,255,255,0.020)' }}>
+                        <span style={{ fontSize:10, color:'rgba(255,255,255,0.30)', fontFamily:'monospace' }}>{l}</span>
+                        <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, color:c }}>{fmtLv(v)}</span>
+                      </div>
+                    ))}
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+
+          {/* MARKET STRUCTURE */}
+          <div className="rc-panel">
+            <div className="rc-hdr">
+              <span className="rc-title">Market Structure</span>
+            </div>
+            <div style={{ padding:'8px 12px 10px' }}>
+              {(() => {
+                const sc    = !!gd.structure_confirmed;
+                const stype = String(gd.structure_type || '').toLowerCase();
+                const bos   = stype.includes('bos') || (sc && !stype.includes('choch'));
+                const choch = stype.includes('choch');
+                const zv    = !!gd.zone_valid;
+                const dem   = data?.nearest_demand;
+                const sup   = data?.nearest_supply;
+                const b     = String(sig.bias || '').toLowerCase();
+                const flowCol = /bull/.test(b) ? BULL : /bear/.test(b) ? BEAR : MUTED;
+                const flowLbl = /bull/.test(b) ? 'BULLISH' : /bear/.test(b) ? 'BEARISH' : 'NEUTRAL';
+                return ([
+                  ['BOS',       bos   ? 'Yes' : 'No',                bos   ? BULL : MUTED],
+                  ['CHOCH',     choch ? 'Yes' : 'No',                choch ? BULL : MUTED],
+                  ['Structure', sc ? 'Confirmed' : 'Not confirmed',   sc    ? BULL : MUTED],
+                  ['Zone',      zv ? 'Active' : (dem||sup) ? 'Nearby' : 'No zone', zv ? '#f97316' : (dem||sup) ? AMB : MUTED],
+                  ['Flow',      flowLbl,                              flowCol],
+                ] as [string,string,string][]).map(([lbl, val, col]) => (
+                  <div key={lbl} style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
+                    padding:'4px 0', borderBottom:'1px solid rgba(255,255,255,0.020)' }}>
+                    <span style={{ fontSize:10, color:'rgba(255,255,255,0.30)', fontFamily:'monospace' }}>{lbl}</span>
+                    <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, color:col }}>{val}</span>
+                  </div>
+                ));
+              })()}
+            </div>
+          </div>
+
+        </div>
+
       </div>
     </div>
   );
