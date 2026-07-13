@@ -6,8 +6,8 @@ const BEAR  = '#ef4444';
 const AMB   = '#f59e0b';
 const MUTED = 'rgba(255,255,255,0.22)';
 const BLUE  = '#3b82f6';
-const CYAN  = '#22d3ee';
-const BG    = '#0b0f1e';
+const CYAN  = '#38bdf8';
+const BG    = '#060810';
 
 type Ticker = 'MNQ' | 'MGC' | 'MES' | 'MYM';
 type Tab    = 'signal' | 'brain' | 'chat' | 'position';

@@ -39774,7 +39774,7 @@ def dashboard():
   .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
   /* ── Brain-first 3-column layout: LEFT (controls) · CENTER (Main Brain) · RIGHT (compact state) ── */
   #view-live{display:flex;flex-direction:column}
-  #live-layout{order:0;display:grid;grid-template-columns:180px 1fr 260px;gap:14px;align-items:start;margin-bottom:12px}
+  #live-layout{order:0;display:grid;grid-template-columns:220px 1fr 280px;gap:14px;align-items:start;margin-bottom:12px}
   #bl-left{min-width:0;display:flex;flex-direction:column;position:sticky;top:8px;align-self:start}
   #bl-center{min-width:0}
   #bl-right{min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:8px;align-self:start}
@@ -39825,6 +39825,71 @@ def dashboard():
   .bl-ctrl-pill:hover{border-color:rgba(125,140,255,.25);color:var(--text)}
   .bl-ctrl-pill.on{color:#22c55e;border-color:rgba(34,197,94,.3)}
   .bl-ctrl-pill.muted{color:#ef4444;border-color:rgba(239,68,68,.3)}
+  /* ── Terminal header nav bar ── */
+  #tp-hdr{display:flex;align-items:center;gap:10px;padding:8px 14px;background:rgba(8,12,24,.9);border:1px solid rgba(125,140,255,.14);border-radius:14px;margin-bottom:10px;-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px)}
+  .tp-logo{display:flex;align-items:center;gap:9px;flex-shrink:0;min-width:0}
+  .tp-logo-a{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#3b4fd0,#22d3ee);color:#fff;font-family:var(--sans);font-size:13px;font-weight:900;flex-shrink:0}
+  .tp-logo-title{font-family:var(--sans);font-size:11px;font-weight:800;letter-spacing:1.8px;color:#b0bce0;text-transform:uppercase;white-space:nowrap}
+  .tp-tabs{display:flex;gap:3px;flex:1;justify-content:center}
+  .tp-tab{font-family:var(--sans);font-size:11px;font-weight:700;letter-spacing:.8px;padding:5px 12px;border-radius:8px;border:1px solid rgba(125,140,255,.13);color:#6b7280;cursor:pointer;transition:all .16s;background:transparent;user-select:none;white-space:nowrap}
+  .tp-tab:hover{color:#b0bce0;border-color:rgba(125,140,255,.3)}
+  .tp-tab.active{color:#dfe4ff;border-color:rgba(125,140,255,.55);background:var(--amber-deep)}
+  .tp-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+  .tp-time{font-family:var(--mono);font-size:10px;color:#4b5563;letter-spacing:.3px}
+  .tp-badge{font-size:9px;font-weight:800;letter-spacing:1.2px;padding:3px 8px;border-radius:6px;border:1px solid rgba(34,197,94,.5);color:#22c55e;background:rgba(34,197,94,.08);transition:all .3s;white-space:nowrap}
+  .tp-badge.closed{border-color:#374151;color:#4b5563;background:transparent}
+  #menu-toggle{cursor:pointer;padding:4px 8px;border:1px solid rgba(125,140,255,.2);border-radius:7px;color:#6b7280;transition:all .16s;user-select:none;font-size:12px;background:transparent;font-family:var(--mono)}
+  #menu-toggle:hover{color:#b0bce0;border-color:rgba(125,140,255,.4)}
+  /* ── Center verdict hero panel ── */
+  #blh-hero{padding:18px 18px 14px;border:1px solid rgba(125,140,255,.13);border-radius:16px;background:linear-gradient(165deg,rgba(22,28,52,.72),rgba(8,12,26,.65));-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);margin-bottom:12px;box-shadow:var(--glass-shadow)}
+  #blh-verdict{font-family:var(--sans);font-size:54px;font-weight:900;letter-spacing:4px;text-align:center;line-height:1;padding:4px 0 6px;color:#374151;transition:color .4s,text-shadow .4s}
+  #blh-verdict.v-ready{color:#22c55e;text-shadow:0 0 50px rgba(34,197,94,.45)}
+  #blh-verdict.v-early{color:#eab308;text-shadow:0 0 50px rgba(234,179,8,.35)}
+  #blh-verdict.v-managing{color:#7fe9f5;text-shadow:0 0 50px rgba(127,233,245,.35)}
+  #blh-inst-price{text-align:center;font-family:var(--mono);font-size:19px;font-weight:700;color:#e8e8f0;letter-spacing:.5px;margin:6px 0 2px}
+  #blh-vwap-ctx{text-align:center;font-size:11px;font-weight:600;letter-spacing:.7px;margin-bottom:10px;color:#6b7280;transition:color .3s}
+  #blh-edge-wrap{height:5px;background:rgba(255,255,255,.06);border-radius:3px;margin:0 24px 3px;overflow:hidden}
+  #blh-edge-fill{height:100%;border-radius:3px;transition:width .5s,background .4s;width:0}
+  #blh-edge-label{text-align:center;font-size:10px;color:#6b7280;margin-bottom:12px;letter-spacing:.4px;font-family:var(--sans)}
+  .blh-section-h{font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#4b5563;font-weight:700;margin:0 0 6px;display:flex;align-items:center;gap:6px}
+  #blh-reasoning-box{background:rgba(10,14,28,.6);border:1px solid rgba(125,140,255,.10);border-radius:9px;padding:10px 13px;margin-bottom:11px}
+  #blh-reasoning-text{font-size:12px;color:#a8b4d0;line-height:1.6;min-height:32px}
+  .blh-obs-tbl{width:100%;border-collapse:collapse;font-size:11.5px;margin-bottom:10px}
+  .blh-obs-tbl td{padding:5px 6px;border-bottom:1px solid rgba(125,140,255,.06)}
+  .blh-obs-tbl tr:last-child td{border-bottom:none}
+  .blh-obs-tbl td:first-child{color:#6b7280;text-transform:uppercase;letter-spacing:.5px;font-size:10px;white-space:nowrap;width:36%}
+  .blh-obs-tbl td:last-child{color:#c8d0f0;text-align:right;font-weight:600}
+  .blh-pills{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px}
+  .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(125,140,255,.18);color:#6b7280;background:rgba(255,255,255,.03);text-transform:uppercase}
+  .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
+  .blh-pill.fail{border-color:rgba(239,68,68,.4);color:#fca5a5;background:rgba(239,68,68,.07)}
+  .blh-pill.warn{border-color:rgba(234,179,8,.35);color:#fde68a;background:rgba(234,179,8,.06)}
+  #blh-waveform{display:flex;align-items:center;justify-content:center;gap:3px;height:30px;margin:6px 0 2px}
+  .blh-wave-bar{width:3px;border-radius:2px;background:var(--cyan);animation:blhWave 1.4s ease-in-out infinite}
+  .blh-wave-bar:nth-child(2){animation-delay:.1s}.blh-wave-bar:nth-child(3){animation-delay:.2s}.blh-wave-bar:nth-child(4){animation-delay:.3s}.blh-wave-bar:nth-child(5){animation-delay:.4s}.blh-wave-bar:nth-child(6){animation-delay:.5s}.blh-wave-bar:nth-child(7){animation-delay:.6s}
+  @keyframes blhWave{0%,100%{transform:scaleY(.25);opacity:.25}50%{transform:scaleY(1);opacity:.65}}
+  #blh-wf-label{text-align:center;font-size:8.5px;letter-spacing:2px;color:#374151;text-transform:uppercase;margin-bottom:4px;font-family:var(--sans)}
+  /* ── Left column avatar + market context ── */
+  .bl-av-wrap{text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(125,140,255,.08);margin-bottom:10px}
+  .bl-av-svg{width:70px;height:93px;margin:0 auto 5px;display:block;filter:drop-shadow(0 0 10px rgba(82,224,255,.28))}
+  #bl-av-state-lbl{font-size:7.5px;letter-spacing:2px;text-transform:uppercase;color:#374151;font-weight:700;text-align:center;margin-bottom:6px}
+  .bl-av-chat-btn{width:100%;padding:6px 4px;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-radius:7px;border:1px solid rgba(82,224,255,.28);color:var(--cyan);background:rgba(82,224,255,.05);cursor:pointer;margin-bottom:10px;transition:all .16s;font-family:var(--sans)}
+  .bl-av-chat-btn:hover{background:rgba(82,224,255,.12);border-color:rgba(82,224,255,.5)}
+  .bl-mc-tbl{width:100%;border-collapse:collapse;font-size:10px;margin-bottom:10px}
+  .bl-mc-tbl td{padding:4px 2px;border-bottom:1px solid rgba(125,140,255,.06)}
+  .bl-mc-tbl tr:last-child td{border-bottom:none}
+  .bl-mc-tbl td:first-child{color:#4b5563;text-transform:uppercase;letter-spacing:.3px;font-size:9px;font-weight:700;width:55%}
+  .bl-mc-tbl td:last-child{color:#b0bce0;text-align:right;font-weight:600;font-size:10px}
+  .bl-perf-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:10px}
+  .bl-perf-cell{background:rgba(255,255,255,.02);border:1px solid rgba(125,140,255,.07);border-radius:6px;padding:5px;text-align:center}
+  .bl-perf-label{font-size:7.5px;color:#4b5563;text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px;font-weight:700}
+  .bl-perf-val{font-size:12px;font-weight:800;color:#b0bce0;font-family:var(--sans);line-height:1.1}
+  /* ── Right column additions ── */
+  .blr-obs-tbl{width:100%;border-collapse:collapse;font-size:10.5px}
+  .blr-obs-tbl td{padding:4px 4px;border-bottom:1px solid rgba(125,140,255,.07)}
+  .blr-obs-tbl tr:last-child td{border-bottom:none}
+  .blr-obs-tbl td:first-child{color:#6b7280;font-size:9.5px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap;width:52%}
+  .blr-obs-tbl td:last-child{color:#c8d0f0;text-align:right;font-weight:600}
   /* Responsive: single column on small screens — show drawer inline */
   @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-left,#bl-right{display:none}#view-live{display:block}#view-live > .mod,#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}}
   .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
@@ -40124,14 +40189,23 @@ def dashboard():
 </head>
 <body>
 <div class="vw-bg" aria-hidden="true"></div>
-<h1><span id="refresh-dot"></span>🐷 AI Trading Partner</h1>
-<div style="text-align:center;margin:6px 0 2px"><img src="__APP_ICON_DATA_URI__" alt="LordPiggington" style="width:96px;height:96px;border-radius:50%;object-fit:cover;border:2px solid rgba(125,140,255,.55);box-shadow:0 0 24px rgba(110,125,255,.38),0 4px 16px rgba(0,0,0,.55);display:inline-block"></div>
-<div id="last-updated">Last updated —</div>
-<!-- Top controls collapsed into a single menu (DISPLAY-ONLY, per-device; persisted
-     in localStorage('dashTopMenu')). Never touches the money path. -->
-<div id="menu-ctl" style="margin:2px 0 8px;text-align:center">
-  <span id="menu-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="alert-ctl" onclick="toggleTopMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleTopMenu();}" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 14px;background:var(--panel)">☰ Menu</span>
+<!-- ── Terminal nav header ── -->
+<div id="tp-hdr">
+  <div class="tp-logo"><span class="tp-logo-a">A</span><span class="tp-logo-title">AI Trading Partner</span></div>
+  <div class="tp-tabs" id="tp-tabs">
+    <span class="tp-tab active" data-tk="MGC" onclick="userPickedSetup=true;setSymbol('MGC')">MGC</span>
+    <span class="tp-tab" data-tk="MNQ" onclick="userPickedSetup=true;setSymbol('MNQ')">MNQ</span>
+    <span class="tp-tab" data-tk="MES" onclick="userPickedSetup=true;setSymbol('MES')">MES</span>
+    <span class="tp-tab" data-tk="MYM" onclick="userPickedSetup=true;setSymbol('MYM')">MYM</span>
+  </div>
+  <div class="tp-right">
+    <span class="tp-time" id="tp-time">—</span>
+    <span class="tp-badge closed" id="tp-session-badge">CLOSED</span>
+    <span id="refresh-dot"></span>
+    <span id="menu-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="alert-ctl" onclick="toggleTopMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleTopMenu();}">☰ Menu</span>
+  </div>
 </div>
+<div id="last-updated">Last updated —</div>
 <div id="alert-ctl" style="margin:2px 0 8px;font-size:12px;display:none;gap:8px;justify-content:center;flex-wrap:wrap">
   <span id="snd-toggle" onclick="toggleSound()" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Setup bell: on</span>
   <span id="test-alert-btn" onclick="testAlert()" title="Ring this dashboard now AND send a test push to your phone via Discord" style="cursor:pointer;user-select:none;color:var(--amber-dim);border:1px solid var(--border);border-radius:999px;padding:3px 12px;background:var(--panel)">🔔 Test alert</span>
@@ -40384,8 +40458,45 @@ def dashboard():
        ═══════════════════════════════════════════════════════════════════════════ -->
 <div id="live-layout">
 
-  <!-- LEFT COLUMN ── compact controls -->
+  <!-- LEFT COLUMN ── avatar + market context + compact controls -->
   <div id="bl-left">
+    <!-- Avatar -->
+    <div class="bl-av-wrap">
+      <svg class="bl-av-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
+        <defs><radialGradient id="blHG" cx="50%" cy="38%" r="58%"><stop offset="0%" stop-color="#253249"/><stop offset="100%" stop-color="#0c1422"/></radialGradient></defs>
+        <rect x="52" y="120" width="16" height="36" rx="5" fill="#111c30"/>
+        <path d="M0,158 Q28,130 52,120 L68,120 Q92,130 120,158 Z" fill="#0c1625"/>
+        <rect x="18" y="16" width="84" height="108" rx="30" fill="url(#blHG)"/>
+        <ellipse cx="60" cy="27" rx="22" ry="8" fill="rgba(255,255,255,.03)"/>
+        <ellipse cx="40" cy="61" rx="12.5" ry="9" fill="#071325"/>
+        <ellipse cx="80" cy="61" rx="12.5" ry="9" fill="#071325"/>
+        <circle cx="40" cy="61" r="6" fill="#0ea5e9" opacity=".9"/>
+        <circle cx="40" cy="61" r="3" fill="#020c1c"/>
+        <circle cx="38.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+        <circle cx="80" cy="61" r="6" fill="#0ea5e9" opacity=".9"/>
+        <circle cx="80" cy="61" r="3" fill="#020c1c"/>
+        <circle cx="78.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+        <path d="M46,94 Q60,97 74,94" stroke="rgba(80,120,200,.6)" stroke-width="2" fill="none" stroke-linecap="round"/>
+        <circle cx="60" cy="19" r="2.8" fill="#0ea5e9" opacity=".85"/>
+        <ellipse cx="60" cy="156" rx="22" ry="4" fill="rgba(14,165,233,.1)"/>
+      </svg>
+      <div id="bl-av-state-lbl">OBSERVING</div>
+      <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
+    </div>
+    <!-- Market Context -->
+    <div class="bl-sect-h">Market Context</div>
+    <table class="bl-mc-tbl">
+      <tr><td>Trend</td><td id="blmc-trend">—</td></tr>
+      <tr><td>Momentum</td><td id="blmc-momentum">—</td></tr>
+      <tr><td>Volatility</td><td id="blmc-volatility">—</td></tr>
+      <tr><td>Liquidity</td><td id="blmc-liquidity">—</td></tr>
+    </table>
+    <!-- Performance -->
+    <div class="bl-sect-h">Performance</div>
+    <div class="bl-perf-grid">
+      <div class="bl-perf-cell"><div class="bl-perf-label">Win Rate</div><div class="bl-perf-val" id="blp-winrate">—</div></div>
+      <div class="bl-perf-cell"><div class="bl-perf-label">Avg R:R</div><div class="bl-perf-val" id="blp-rr">—</div></div>
+    </div>
     <div class="bl-sect-h">Mode</div>
     <div class="bl-mode-seg">
       <div class="bl-mode-btn active" id="bl-mode-scalp" onclick="setMode('SCALP')">SCALP<span style="font-weight:400;opacity:.6;font-size:9px;display:block;letter-spacing:.3px">Sensitive</span></div>
@@ -40417,8 +40528,39 @@ def dashboard():
     </div>
   </div><!-- /#bl-left -->
 
-  <!-- CENTER COLUMN ── Main Brain (dominant) -->
+  <!-- CENTER COLUMN ── Verdict Hero + Main Brain -->
   <div id="bl-center">
+  <!-- ── VERDICT HERO ── Big decision + price + edge + observations (DISPLAY-ONLY) ── -->
+  <div id="blh-hero">
+    <div id="blh-verdict" class="v-wait">WAIT</div>
+    <div id="blh-inst-price">— ——.——</div>
+    <div id="blh-vwap-ctx">Price context loading…</div>
+    <div id="blh-edge-wrap"><div id="blh-edge-fill"></div></div>
+    <div id="blh-edge-label">EDGE SCORE 0 / 110</div>
+    <div id="blh-reasoning-box">
+      <div class="blh-section-h">🤖 AI REASONING</div>
+      <div id="blh-reasoning-text">Loading analysis…</div>
+    </div>
+    <div class="blh-section-h">KEY OBSERVATIONS</div>
+    <table class="blh-obs-tbl">
+      <tr><td>Order Flow</td><td id="blh-obs-flow">—</td></tr>
+      <tr><td>Structure</td><td id="blh-obs-struct">—</td></tr>
+      <tr><td>Zone</td><td id="blh-obs-zone">—</td></tr>
+      <tr><td>Volatility</td><td id="blh-obs-vol">—</td></tr>
+      <tr><td>Conditions</td><td id="blh-obs-cond">—</td></tr>
+    </table>
+    <div class="blh-pills" id="blh-pills"></div>
+    <div id="blh-waveform">
+      <div class="blh-wave-bar" style="height:8px"></div>
+      <div class="blh-wave-bar" style="height:16px"></div>
+      <div class="blh-wave-bar" style="height:24px"></div>
+      <div class="blh-wave-bar" style="height:30px"></div>
+      <div class="blh-wave-bar" style="height:24px"></div>
+      <div class="blh-wave-bar" style="height:16px"></div>
+      <div class="blh-wave-bar" style="height:8px"></div>
+    </div>
+    <div id="blh-wf-label">WAITING FOR SETUP</div>
+  </div>
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
@@ -40611,6 +40753,28 @@ def dashboard():
       <div class="bl-kv"><span class="bl-k">Direction</span><span class="bl-v" id="blv-dir">—</span></div>
       <div class="bl-kv"><span class="bl-k">Mode</span><span class="bl-v" id="blv-mode">—</span></div>
       <div id="blv-reason" style="font-size:10px;color:#6b7280;margin-top:7px;line-height:1.4;font-style:italic;min-height:14px"></div>
+    </div>
+
+    <!-- Market Structure -->
+    <div class="bl-card" id="bl-struct-panel">
+      <div class="mod-h">📐 Market Structure</div>
+      <table class="blr-obs-tbl">
+        <tr><td>BOS</td><td id="blr-bos">—</td></tr>
+        <tr><td>CHOCH</td><td id="blr-choch">—</td></tr>
+        <tr><td>Structure</td><td id="blr-struct">—</td></tr>
+        <tr><td>Zone</td><td id="blr-zone">—</td></tr>
+        <tr><td>Flow (CVD)</td><td id="blr-flow">—</td></tr>
+      </table>
+    </div>
+
+    <!-- Levels to Watch -->
+    <div class="bl-card" id="bl-levels-panel">
+      <div class="mod-h">🎯 Levels to Watch</div>
+      <table class="blr-obs-tbl">
+        <tr><td>Supply zone</td><td id="blr-supply">—</td></tr>
+        <tr><td>VWAP</td><td id="blr-vwap">—</td></tr>
+        <tr><td>Demand zone</td><td id="blr-demand">—</td></tr>
+      </table>
     </div>
 
     <!-- Trade plan -->
@@ -49741,6 +49905,83 @@ function renderBLPanels(d){
     }
     evEl.innerHTML=events.join('');
   }
+
+  // ── Header nav bar: sync ticker tabs + time + session badge ──
+  var tpTabEls=document.querySelectorAll('#tp-tabs .tp-tab');
+  if(tpTabEls.length&&inst){tpTabEls.forEach(function(t){t.classList.toggle('active',t.dataset.tk===inst);});}
+  var tpT=document.getElementById('tp-time');
+  if(tpT){var nt=new Date();tpT.textContent=nt.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+  var tpSess=document.getElementById('tp-session-badge');
+  if(tpSess){var mkt=d.market_session||{};var isOpen=mkt.market_open===true||mkt.is_open===true;tpSess.textContent=isOpen?'OPEN':'CLOSED';tpSess.className='tp-badge'+(isOpen?'':' closed');}
+
+  // ── Center verdict hero ──
+  var hvEl=document.getElementById('blh-verdict');
+  if(hvEl){var vc2=(v.indexOf('READY')!==-1&&v!=='EARLY')?'v-ready':(v==='EARLY'?'v-early':(v==='MANAGING'?'v-managing':'v-wait'));hvEl.textContent=v;hvEl.className=vc2;}
+  var price=d.current_price||d.price||null;
+  var hpEl=document.getElementById('blh-inst-price');
+  if(hpEl){hpEl.textContent=(inst&&price)?inst+' '+Number(price).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):(inst||'\u2014');}
+  var vwapVal=d.vwap_value||d.vwap||null;
+  var vwapCtxEl=document.getElementById('blh-vwap-ctx');
+  if(vwapCtxEl&&price&&vwapVal){var abv=Number(price)>Number(vwapVal);vwapCtxEl.textContent=(abv?'\u25b2 Price above VWAP':'\u25bc Price below VWAP')+' \u00b7 VWAP '+Number(vwapVal).toFixed(2);vwapCtxEl.style.color=abv?'#22c55e':'#ef4444';}else if(vwapCtxEl){vwapCtxEl.textContent='VWAP \u2014';vwapCtxEl.style.color='#6b7280';}
+  var heFill=document.getElementById('blh-edge-fill');
+  var heLabel=document.getElementById('blh-edge-label');
+  if(heFill){var p2=Math.min(100,Math.round(edge/110*100));var fc2=edge>=85?'#22c55e':edge>=70?'#6ee7b7':edge>=50?'#eab308':'#ef4444';heFill.style.width=p2+'%';heFill.style.background=fc2;}
+  if(heLabel){heLabel.textContent='EDGE SCORE '+edge+' / 110 \u00b7 Grade '+grade;}
+  var hrText=document.getElementById('blh-reasoning-text');
+  var mbsumm=(d.main_brain&&d.main_brain.summary)?d.main_brain.summary:(d.reason||d.strict_reason||'Analyzing market conditions\u2026');
+  if(hrText){hrText.textContent=mbsumm;}
+  var hdiag=d.alert_diagnostics||{};
+  var hcvdDir=String(hdiag.cvd_direction||hdiag.cvd||'');
+  var hstructOk=hdiag.structure_ok||hdiag.structure;
+  var hzoneOk=hdiag.zone_ok||hdiag.zone;
+  var hvolReg=String(d.volatility||d.vol_regime||hdiag.vol_regime||'');
+  var obsFlow=document.getElementById('blh-obs-flow');
+  var obsStruct=document.getElementById('blh-obs-struct');
+  var obsZone=document.getElementById('blh-obs-zone');
+  var obsVol=document.getElementById('blh-obs-vol');
+  var obsCond=document.getElementById('blh-obs-cond');
+  if(obsFlow)obsFlow.textContent=hcvdDir?hcvdDir.toUpperCase():'\u2014';
+  if(obsStruct)obsStruct.textContent=hstructOk?(hstructOk===true?'PRESENT':String(hstructOk)):'NONE';
+  if(obsZone)obsZone.textContent=hzoneOk?(hzoneOk===true?'ACTIVE':String(hzoneOk)):'NONE';
+  if(obsVol)obsVol.textContent=hvolReg?hvolReg.toUpperCase():'NORMAL';
+  if(obsCond){var hgd=d.gate_debug||{};obsCond.textContent=hgd.blocking_reason||(v.indexOf('READY')!==-1?'Setup confirmed':(d.strict_reason||'Building setup').split('.')[0]);}
+  var pillsEl=document.getElementById('blh-pills');
+  if(pillsEl){var hgd2=d.gate_debug||{};var pills=[];if(hgd2.structure===false||hgd2.structure==='FAIL')pills.push({t:'No structure',c:'fail'});else if(hstructOk)pills.push({t:'Structure',c:'ok'});if(hgd2.zone===false||hgd2.zone==='FAIL')pills.push({t:'No zone',c:'warn'});else if(hzoneOk)pills.push({t:'Zone',c:'ok'});if(hcvdDir)pills.push({t:hcvdDir.toUpperCase(),c:hcvdDir.toLowerCase().indexOf('bull')!==-1?'ok':hcvdDir.toLowerCase().indexOf('bear')!==-1?'fail':'warn'});if(!pills.length)pills.push({t:v,c:v.indexOf('READY')!==-1?'ok':'warn'});pillsEl.innerHTML=pills.map(function(p){return '<span class="blh-pill '+p.c+'">'+p.t+'</span>';}).join('');}
+  var wfEl=document.getElementById('blh-waveform');var wfLbl=document.getElementById('blh-wf-label');
+  var isActn=v.indexOf('READY')!==-1||v==='MANAGING';
+  if(wfEl){wfEl.style.display=isActn?'none':'flex';}
+  if(wfLbl){wfLbl.style.display=isActn?'none':'block';}
+
+  // ── Left column: avatar state + market context + performance ──
+  var blAvSt=document.getElementById('bl-av-state-lbl');
+  if(blAvSt){blAvSt.textContent=isActn?'TRADING':'OBSERVING';}
+  var hbias=String(d.bias||d.trend_bias||d.htf_bias||'');
+  var mcTrend=document.getElementById('blmc-trend');var mcMom=document.getElementById('blmc-momentum');
+  var mcVol=document.getElementById('blmc-volatility');var mcLiq=document.getElementById('blmc-liquidity');
+  if(mcTrend)mcTrend.textContent=hbias?hbias.toUpperCase():'\u2014';
+  if(mcMom)mcMom.textContent=hcvdDir?hcvdDir.toUpperCase():'\u2014';
+  if(mcVol)mcVol.textContent=hvolReg?hvolReg.toUpperCase():'NORMAL';
+  var swpAge=hdiag.sweep_age_min||hdiag.latest_sweep_age;
+  if(mcLiq)mcLiq.textContent=swpAge!=null?(Number(swpAge)<5?'RECENT SWEEP':'Last '+Math.round(Number(swpAge))+'m ago'):'\u2014';
+  var lstats=d.learning_stats||d.strategy_stats||d.daily_stats||{};
+  var winrEl=document.getElementById('blp-winrate');var avgrrEl=document.getElementById('blp-rr');
+  if(winrEl){var wr=lstats.win_rate!=null?Math.round(Number(lstats.win_rate)*100)+'%':(d.win_rate!=null?Math.round(Number(d.win_rate)*100)+'%':'\u2014');winrEl.textContent=wr;}
+  if(avgrrEl){var ar=lstats.avg_rr!=null?Number(lstats.avg_rr).toFixed(1)+'R':(d.avg_rr!=null?Number(d.avg_rr).toFixed(1)+'R':'\u2014');avgrrEl.textContent=ar;}
+
+  // ── Right column: market structure + levels ──
+  var hgd3=d.gate_debug||{};
+  var elBos=document.getElementById('blr-bos');var elChoch=document.getElementById('blr-choch');
+  var elStruct=document.getElementById('blr-struct');var elZone=document.getElementById('blr-zone');var elFlow=document.getElementById('blr-flow');
+  if(elBos){elBos.style.color=hgd3.bos?'#22c55e':'#4b5563';elBos.textContent=hgd3.bos?'\u2713 Yes':'\u2013';}
+  if(elChoch){elChoch.style.color=hgd3.choch?'#22c55e':'#4b5563';elChoch.textContent=hgd3.choch?'\u2713 Yes':'\u2013';}
+  if(elStruct){elStruct.textContent=hstructOk?'CONFIRMED':'MISSING';elStruct.style.color=hstructOk?'#22c55e':'#6b7280';}
+  if(elZone){elZone.textContent=hzoneOk?'ACTIVE':'NONE';elZone.style.color=hzoneOk?'#eab308':'#6b7280';}
+  if(elFlow){elFlow.textContent=hcvdDir?hcvdDir.toUpperCase():'NEUTRAL';elFlow.style.color=hcvdDir?(hcvdDir.toLowerCase().indexOf('bull')!==-1?'#22c55e':'#ef4444'):'#6b7280';}
+  var nearDem=d.nearest_demand||null;var nearSup=d.nearest_supply||null;
+  var blrVwap=document.getElementById('blr-vwap');var blrDemand=document.getElementById('blr-demand');var blrSupply=document.getElementById('blr-supply');
+  if(blrVwap)blrVwap.textContent=vwapVal?Number(vwapVal).toFixed(2):'\u2014';
+  if(blrDemand){var dv2=nearDem&&nearDem.high?Number(nearDem.high).toFixed(2):(nearDem&&typeof nearDem==='number'?Number(nearDem).toFixed(2):'\u2014');blrDemand.textContent=dv2;}
+  if(blrSupply){var sv3=nearSup&&nearSup.low?Number(nearSup.low).toFixed(2):(nearSup&&typeof nearSup==='number'?Number(nearSup).toFixed(2):'\u2014');blrSupply.textContent=sv3;}
 }
 (function(){ var on=true; try{ var v=localStorage.getItem('dashAdv'); if(v!==null) on=(v==='1'); }catch(e){} _advApply(on); })();
 // ── Top controls collapsed into a single menu (DISPLAY-ONLY, this device) ──
