@@ -1138,10 +1138,15 @@ export default function MobileHome() {
   const { muted, setMuted, speaking, speak } = useTTS();
   const clock = useClock();
 
+  // Stable ref so effects never go stale on speak identity changes
+  const speakRef      = useRef<(t: string) => void>(() => {});
+  const lastSpokenRef = useRef('');
+  useEffect(() => { speakRef.current = speak; }, [speak]);
+
   // Persist ticker choice
   useEffect(() => { try { localStorage.setItem('brain_ticker', ticker); } catch {} }, [ticker]);
 
-  // Derive avatar state + narration from live data
+  // Derive avatar state from live data and pick a narration line
   useEffect(() => {
     if (!data) return;
     const st = toAvatarState(data);
@@ -1149,16 +1154,20 @@ export default function MobileHome() {
     setNarr(pickMLine(st));
   }, [data]);
 
-  // Periodic narration every 18s
+  // Speak whenever narration text changes (guards against repeating the same line)
+  useEffect(() => {
+    if (!narration || narration === lastSpokenRef.current) return;
+    lastSpokenRef.current = narration;
+    speakRef.current(narration);
+  }, [narration]);
+
+  // Periodic narration refresh every 18s — pick a new line (speak effect handles voicing)
   useEffect(() => {
     const id = setInterval(() => {
-      const st = avatarState;
-      const line = pickMLine(st);
-      setNarr(line);
-      speak(line);
+      setNarr(pickMLine(avatarState));
     }, 18000);
     return () => clearInterval(id);
-  }, [avatarState, speak]);
+  }, [avatarState]);
 
   const verdI = useMemo(() => data ? verdictInfo(data) : { label:'—', color:MUTED, bg:'transparent' }, [data]);
 
