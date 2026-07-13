@@ -2245,6 +2245,18 @@ export default function Home() {
     (loading ? '' : pickVoiceLine(avState))
   ) as string;
 
+  // idleLine — set by the chatter timer; cleared when a real narration fires or
+  // the state goes active so we never show a stale joke during a live trade.
+  const [idleLine, setIdleLine] = useState('');
+  useEffect(() => {
+    if (['READY_LONG','READY_SHORT','ACTIVE','TARGET_HIT','STOP_HIT'].includes(avState)) {
+      setIdleLine('');
+    }
+  }, [avState]);
+
+  // What actually appears in the narration display and caption
+  const displayNarration = idleLine || narration;
+
   // Confidence ring color — communicates AI state at a glance before text is read
   const ringColor = (() => {
     if (voiceState === 'listening') return '#3b82f6'; // blue — listening to user
@@ -2261,22 +2273,37 @@ export default function Home() {
     if (narration && narration !== lastSpokenRef.current) {
       lastSpokenRef.current = narration;
       lastSpokeAtRef.current = Date.now();
+      setIdleLine(''); // real narration takes over the display
       speakRef.current(narration);
     }
-  }, [narration]);
+  }, [narration]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Periodic ambient commentary — fires every 55-90s but ONLY when silent 45+ seconds
-  // Generates context-aware lines from live data; VOICE_BANK is the fallback.
+  // Idle chatter + market commentary timer
+  // Fires every 12-20s (idle states) or 22-38s (forming/analyzing).
+  // Silence guard is 8s so it never interrupts an ongoing TTS utterance.
+  // Picks jokes/questions/banter ~65% of the time; market context ~35%.
   const avStateRef   = useRef(avState);
   const cockpitRef   = useRef({ data, edge, avState });
+  const setIdleLineRef = useRef(setIdleLine);
   useEffect(() => { avStateRef.current = avState; }, [avState]);
   useEffect(() => { cockpitRef.current = { data, edge, avState }; }, [data, edge, avState]);
+  useEffect(() => { setIdleLineRef.current = setIdleLine; }, [setIdleLine]);
   useEffect(() => {
     let tid: ReturnType<typeof setTimeout>;
     const fire = () => {
-      const silentMs = Date.now() - lastSpokeAtRef.current;
-      if (silentMs >= 45000) {
-        const { data: d, edge: eg, avState: st } = cockpitRef.current;
+      const { data: d, edge: eg, avState: st } = cockpitRef.current;
+      const silentMs  = Date.now() - lastSpokeAtRef.current;
+      const isIdle    = st === 'WAIT' || st === 'NO_EDGE';
+      const isActive  = st === 'ACTIVE' || st === 'READY_LONG' || st === 'READY_SHORT';
+      const silenceMs = isIdle ? 8000 : isActive ? 20000 : 12000;
+      const nextMs    = isIdle
+        ? 12000 + Math.random() * 8000   // 12-20 s when idle
+        : isActive
+          ? 30000 + Math.random() * 20000 // 30-50 s during live trade
+          : 22000 + Math.random() * 16000; // 22-38 s while forming
+
+      if (silentMs >= silenceMs) {
+        // Build market context pool
         const px  = Number(d?.price          || 0);
         const vw  = Number(d?.vwap_value     || 0);
         const dem = Number(d?.nearest_demand || 0);
@@ -2295,39 +2322,42 @@ export default function Home() {
             ? `Price is trading ${diff} percent above vee-wap. Bulls are holding above the key intraday level.`
             : `Price is ${diff} percent below vee-wap. Sellers are in control of the intraday structure.`);
         }
-        if (zv)         ctx.push('The key zone is active. Watching closely for a reaction and confirmation signal.');
+        if (zv)              ctx.push('The key zone is active. Watching closely for a reaction.');
         if (dem > 0 && !zv) ctx.push('Watching the demand zone below. That is the level that could trigger a long setup.');
-        if (sup > 0 && !zv) ctx.push('Supply overhead is the main obstacle right now. Bulls need to clear that level.');
-        if (sc && !zv)  ctx.push('Structure is confirmed. Waiting for the zone to complete the full setup.');
-        if (!sc)        ctx.push('No confirmed break of structure yet. That is the primary signal I am waiting for.');
-        if (/bull|pos/.test(cv)) ctx.push('Cumulative delta is bullish. Buyers are active in the order flow right now.');
-        if (/bear|neg/.test(cv)) ctx.push('Cumulative delta is bearish. Sellers are controlling the tape.');
+        if (sup > 0 && !zv) ctx.push('Supply overhead is the main obstacle. Bulls need to clear that level.');
+        if (sc && !zv)      ctx.push('Structure is confirmed. Waiting for the zone to complete the full setup.');
+        if (!sc)            ctx.push('No confirmed break of structure yet. That is the primary signal I am waiting for.');
+        if (/bull|pos/.test(cv))     ctx.push('Cumulative delta is bullish. Buyers are active in the order flow right now.');
+        if (/bear|neg/.test(cv))     ctx.push('Cumulative delta is bearish. Sellers are controlling the tape.');
         if (/strong|high/.test(vol)) ctx.push('Volume is elevated. Real institutional participation is showing up.');
         if (/low|thin/.test(vol))    ctx.push('Volume is light right now. I want to see more participation before acting.');
         if (egR > 0) ctx.push(`Edge score is at ${egR} out of 110. ${egR >= 75 ? 'That is above my entry threshold.' : egR >= 50 ? 'Getting closer — watching for the final signals.' : 'Not enough edge to trade yet.'}`);
-        // Decide what kind of line to say this cycle
-        // ~25% joke, ~25% question, ~15% banter, ~35% market context / state
+
+        // Weighted category roll — jokes/questions/banter dominate for personality
         const roll = Math.random();
         let line: string;
-        if (roll < 0.25) {
+        if (roll < 0.28) {
           line = _pickCycling(JOKES, '__jokes');
-        } else if (roll < 0.50) {
+        } else if (roll < 0.55) {
           line = _pickCycling(QUESTIONS, '__questions');
-        } else if (roll < 0.65) {
+        } else if (roll < 0.72) {
           line = _pickCycling(BANTER, '__banter');
         } else {
           const pool = ctx.length > 0 ? ctx : [pickVoiceLine(st)];
           line = pool[Math.floor(Math.random() * pool.length)];
         }
+
         if (line !== lastSpokenRef.current) {
           lastSpokenRef.current = line;
           lastSpokeAtRef.current = Date.now();
+          setIdleLineRef.current(line); // ← drives the displayed narration text
           speakRef.current(line);
         }
       }
-      tid = setTimeout(fire, 55000 + Math.random() * 35000);
+      tid = setTimeout(fire, nextMs);
     };
-    tid = setTimeout(fire, 65000 + Math.random() * 25000);
+    // First fire after a short warm-up so the page feels alive quickly
+    tid = setTimeout(fire, 10000 + Math.random() * 8000);
     return () => clearTimeout(tid);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -3229,12 +3259,12 @@ export default function Home() {
                           borderRadius:8, padding:'2px 8px', fontFamily:'monospace',
                         }}>{Math.round(edge)}/110</span>
                       </div>
-                      {narration && (
+                      {displayNarration && (
                         <div style={{
                           fontSize:11.5, color:'rgba(255,255,255,0.45)', fontFamily:'monospace',
                           textAlign:'center', lineHeight:1.5, maxWidth:260,
                         }}>
-                          {String(narration).slice(0,88)}{String(narration).length > 88 ? '…' : ''}
+                          {String(displayNarration).slice(0,88)}{String(displayNarration).length > 88 ? '…' : ''}
                         </div>
                       )}
 
@@ -3529,7 +3559,7 @@ export default function Home() {
             {/* AI REASONING — backend synthesis / voice narration */}
             <SatPanel label="AI Reasoning" style={{ flex:'2.2 1 0', minWidth:0 }}>
               <div style={{ fontSize:11.5, color:'rgba(255,255,255,0.58)', lineHeight:1.5, fontFamily:'monospace', fontStyle:'italic' }}>
-                {narration ? narration.slice(0, 130) + (narration.length > 130 ? '...' : '') : 'Analyzing market conditions...'}
+                {displayNarration ? displayNarration.slice(0, 130) + (displayNarration.length > 130 ? '...' : '') : 'Analyzing market conditions...'}
               </div>
             </SatPanel>
 
