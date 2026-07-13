@@ -2007,7 +2007,7 @@ export default function Home() {
   const setVrmSrc = useCallback((src: string) => { try { localStorage.setItem('brain_vrm', src); } catch {} setVrmSrcRaw(src); setShowAvatarPicker(false); }, []);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [chatOpen,     setChatOpen]     = useState(true);
-  const [chartOpen,    setChartOpen]    = useState(true);
+  // chartOpen removed — chart is now always visible above intel-strip
   const [leftOpen,     setLeftOpen]     = useState(false);
   const [confirming,   setConfirming]   = useState(false);
   const [tradeSent,    setTradeSent]    = useState<string | null>(null);
@@ -2022,6 +2022,8 @@ export default function Home() {
   const priceBaseRef    = useRef<number>(0);
   const candleMinRef    = useRef<number>(0); // unix-ms of current candle's 1-min bucket
   const [candlesV, setCandlesV] = useState(0); // bumped on each mutation → forces chart re-render
+  // chartSnap is a proper React state copy of candlesRef — ensures CandleChart always re-renders with fresh data
+  const [chartSnap, setChartSnap] = useState<Candle[]>([]);
   const speakRef          = useRef<(t: string) => void>(() => {});
   const lastSpokenRef     = useRef('');
   const lastSpokeAtRef    = useRef(0);
@@ -2084,9 +2086,12 @@ export default function Home() {
 
   useEffect(() => {
     if (demoMode) return; // demo engine owns data when active
-    setLoading(true); setData(null); candlesRef.current = []; candleMinRef.current = 0;
+    setLoading(true); setData(null); candlesRef.current = []; candleMinRef.current = 0; setChartSnap([]);
     poll(); const id = setInterval(poll, 3000); return () => clearInterval(id);
   }, [poll, demoMode]);
+
+  // Sync chart snapshot every time candlesV bumps — gives CandleChart a new array reference
+  useEffect(() => { setChartSnap([...candlesRef.current]); }, [candlesV]);
 
   // ── 30s auto-follow: switch to highest-edge / actionable ticker ────────────
   const autoTickerRef     = useRef<Ticker>('MNQ');
@@ -2569,17 +2574,22 @@ export default function Home() {
     @media(min-width:769px){
       .main-center{zoom:1;}
       .mb-row{display:flex!important;flex-direction:row!important;gap:0!important;align-items:flex-start!important;min-height:unset!important;}
-      /* Avatar stage: fixed width, centered content, right border as divider */
-      .mc-stage{flex:0 0 420px!important;width:420px!important;display:flex!important;flex-direction:column!important;align-items:center!important;grid-column:unset!important;padding-right:20px!important;border-right:1px solid rgba(255,255,255,0.055)!important;}
-      /* Brain column: left spacing so it doesn't hug the divider */
-      .mb-brain{flex:1!important;min-width:0!important;grid-column:unset!important;padding-left:24px!important;}
-      /* Avatar outer: center the canvas inside the stage */
-      .mc-avtr-outer{width:378px!important;height:504px!important;overflow:hidden!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;}
-      .mc-avtr-box{transform:scale(0.90)!important;transform-origin:top center!important;}
-      .mc-mid-row{width:100%!important;justify-content:center!important;}
-      /* Gate indicator pills: show as a compact horizontal row below the avatar */
-      .mc-col{display:flex!important;flex-direction:row!important;gap:6px!important;width:100%!important;justify-content:center!important;flex-wrap:wrap!important;margin-top:4px!important;}
-      .mc-col>.mc-card{flex:1!important;min-width:100px!important;max-width:130px!important;}
+      /* Avatar stage: narrowed — flanking cards and radar hidden so avatar fits cleanly */
+      .mc-stage{flex:0 0 258px!important;width:258px!important;display:flex!important;flex-direction:column!important;align-items:center!important;grid-column:unset!important;padding-right:14px!important;border-right:1px solid rgba(255,255,255,0.055)!important;}
+      /* Brain column: fills remaining width */
+      .mb-brain{flex:1!important;min-width:0!important;grid-column:unset!important;padding-left:20px!important;}
+      /* Avatar outer: sized to fit the narrowed stage */
+      .mc-avtr-outer{width:228px!important;height:304px!important;overflow:hidden!important;align-items:center!important;justify-content:center!important;flex-shrink:0!important;}
+      .mc-avtr-box{transform:scale(0.56)!important;transform-origin:top center!important;}
+      /* mc-mid-row: show only the avatar centre — hide flanking mc-col and radar panels */
+      .mc-mid-row{width:100%!important;justify-content:center!important;gap:0!important;}
+      .mc-mid-row>:nth-child(1){display:none!important;}
+      .mc-mid-row>:nth-child(2){display:none!important;}
+      .mc-mid-row>:nth-child(4){display:none!important;}
+      .mc-mid-row>:nth-child(5){display:none!important;}
+      /* mc-bot-row: compact 3-column grid below avatar (Trade Plan / Volatility / Risk) */
+      .mc-bot-row{display:grid!important;grid-template-columns:repeat(3,1fr)!important;gap:4px!important;width:100%!important;margin-top:4px!important;}
+      .mc-bot-row>.mc-card{padding:6px 8px!important;}
       .verdict-big{font-size:36px!important;letter-spacing:-0.03em!important;}
       .verdict-sub{font-size:17px!important;margin-top:5px!important;}
       .edge-wrap{max-width:unset!important;}
@@ -3510,6 +3520,24 @@ export default function Home() {
             </div>
           </div>
 
+          {/* ── LIVE CHART ───────────────────────────────────────────────── */}
+          <div style={{ border:'1px solid rgba(255,255,255,0.042)', borderRadius:10, overflow:'hidden', marginBottom:10 }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+              padding:'8px 14px', background:'rgba(255,255,255,0.018)' }}>
+              <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.08em',
+                color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>{ticker} Chart · 1m</span>
+              <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                {data?.vwap_value   && <span style={{ color:'#60a5fa', fontSize:10.5, fontFamily:'monospace' }}>VWAP {fmt(data.vwap_value)}</span>}
+                {data?.nearest_demand && <span style={{ color:BULL, fontSize:10.5, fontFamily:'monospace' }}>D {fmt(data.nearest_demand)}</span>}
+                {data?.nearest_supply && <span style={{ color:BEAR, fontSize:10.5, fontFamily:'monospace' }}>S {fmt(data.nearest_supply)}</span>}
+              </div>
+            </div>
+            <div style={{ height:180, padding:'8px 12px 10px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
+              <CandleChart candles={chartSnap} vwap={data?.vwap_value}
+                demand={data?.nearest_demand} supply={data?.nearest_supply} ticker={ticker} />
+            </div>
+          </div>
+
           {/* ── INTELLIGENCE STRIP ──────────────────────────────────────── */}
           <div className="intel-strip" style={{ display:'flex', gap:8, marginBottom:16, flexWrap:'nowrap', minWidth:0 }}>
 
@@ -3865,27 +3893,6 @@ export default function Home() {
             {evidenceOpen && data && (
               <div style={{ padding:'14px 16px 16px', borderTop:'1px solid rgba(255,255,255,0.040)' }}>
                 <EvidenceDrawer data={data} status={status} />
-              </div>
-            )}
-          </div>
-
-          {/* ── CHART ACCORDION ─────────────────────────────────────────── */}
-          <div style={{ border:'1px solid rgba(255,255,255,0.042)', borderRadius:10, overflow:'hidden' }}>
-            <button className="accord-toggle" onClick={() => setChartOpen(!chartOpen)} style={{
-              width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
-              padding:'10px 16px', background:'rgba(255,255,255,0.018)', border:'none', cursor:'pointer',
-              color:'rgba(255,255,255,0.40)', fontSize:11, fontFamily:'monospace', letterSpacing:'0.08em' }}>
-              <span style={{ textTransform:'uppercase', fontWeight:700 }}>{ticker} Chart · 1m</span>
-              <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                {data?.vwap_value && <span className="chart-hdr-extra" style={{ color:'#60a5fa', fontSize:10.5 }}>VWAP {fmt(data.vwap_value)}</span>}
-                {data?.nearest_demand && <span className="chart-hdr-extra" style={{ color:BULL, fontSize:10.5 }}>D {fmt(data.nearest_demand)}</span>}
-                {data?.nearest_supply && <span className="chart-hdr-extra" style={{ color:BEAR, fontSize:10.5 }}>S {fmt(data.nearest_supply)}</span>}
-                <span style={{ fontSize:13, color:'rgba(255,255,255,0.25)' }}>{chartOpen ? '▲' : '▼'}</span>
-              </div>
-            </button>
-            {chartOpen && (
-              <div style={{ height:190, padding:'8px 12px 10px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
-                <CandleChart candles={candlesRef.current} vwap={data?.vwap_value} demand={data?.nearest_demand} supply={data?.nearest_supply} ticker={ticker} />
               </div>
             )}
           </div>
