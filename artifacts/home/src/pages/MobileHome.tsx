@@ -60,6 +60,11 @@ function useTTS() {
   const activeRef  = useRef(false);
   const pendingRef = useRef<string | null>(null);
   const voicesRef  = useRef<SpeechSynthesisVoice[]>([]);
+  // mutedRef mirrors the muted state synchronously so _fire can check it without
+  // relying on a closure that may be stale (e.g. queued calls that fire after mute).
+  const mutedRef   = useRef<boolean>(() => {
+    try { return localStorage.getItem('brain_muted') === '1'; } catch { return false; }
+  });
   useEffect(() => { voicesRef.current = voices; }, [voices]);
 
   useEffect(() => {
@@ -70,7 +75,9 @@ function useTTS() {
   }, []);
 
   const _fire = useCallback((text: string) => {
-    const ss = window.speechSynthesis; if (!ss || !text) return;
+    // Guard here (not just in speak()) so queued items flushed from done() also respect mute.
+    if (mutedRef.current || !text) return;
+    const ss = window.speechSynthesis; if (!ss) return;
     activeRef.current = true;           // block concurrent calls
     const utt = new SpeechSynthesisUtterance(text);
     const voice = voicesRef.current[0]; if (voice) utt.voice = voice;
@@ -99,10 +106,14 @@ function useTTS() {
 
   const setMuted = useCallback((m: boolean) => {
     try { localStorage.setItem('brain_muted', m ? '1' : '0'); } catch {}
+    // Update the ref synchronously BEFORE cancel() — some browsers fire the utterance's
+    // onerror/onend handler synchronously on cancel(), which would flush pendingRef and
+    // call _fire() again before pendingRef is cleared. mutedRef guards _fire() against that.
+    mutedRef.current = m;
     if (m) {
-      window.speechSynthesis?.cancel();
+      pendingRef.current = null;          // clear queue BEFORE cancel to prevent re-fire
       activeRef.current = false;
-      pendingRef.current = null;
+      window.speechSynthesis?.cancel();
       setSpeaking(false);
     }
     setMutedSt(m);
