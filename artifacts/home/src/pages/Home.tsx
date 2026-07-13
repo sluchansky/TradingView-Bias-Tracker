@@ -2437,7 +2437,7 @@ export default function Home() {
                 <span style={{ fontSize:12 }}>🎭</span>
                 <span style={{ fontSize:9.5, color:'rgba(255,255,255,0.38)', fontFamily:'monospace', flex:1 }}>Avatar</span>
                 <span style={{ fontSize:8.5, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>
-                  {vrmSrc === '/LordPiggington.vrm' ? 'LordPiggington' : vrmSrc === '/avatar.vrm' ? 'Default' : 'Custom'}
+                  {vrmSrc === '/LordPiggington.vrm' ? 'LordPiggington' : vrmSrc === '/Orion.vrm' ? 'Orion' : vrmSrc === '/Bizdude.vrm' ? 'Bizdude' : vrmSrc === '/avatar.vrm' ? 'Default' : 'Custom'}
                 </span>
                 <span style={{ fontSize:10, color:'rgba(255,255,255,0.25)' }}>{showAvatarPicker ? '▲' : '▼'}</span>
               </button>
@@ -2449,6 +2449,8 @@ export default function Home() {
                   <div style={{ fontSize:9, color:'rgba(255,255,255,0.28)', fontFamily:'monospace', marginBottom:2, letterSpacing:'0.08em' }}>PRESETS</div>
                   {[
                     { label: 'LordPiggington', src: '/LordPiggington.vrm' },
+                    { label: 'Orion',          src: '/Orion.vrm' },
+                    { label: 'Bizdude',        src: '/Bizdude.vrm' },
                     { label: 'Default VRM',    src: '/avatar.vrm' },
                   ].map(p => (
                     <button key={p.src} onClick={() => setVrmSrc(p.src)} style={{
