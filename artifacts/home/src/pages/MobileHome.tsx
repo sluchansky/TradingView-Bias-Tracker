@@ -33,12 +33,33 @@ function useClock() {
 }
 
 // ── TTS ───────────────────────────────────────────────────────────────────────
+function cleanTTS(text: string) {
+  return text
+    .replace(/\bBOS\b/g,   'break of structure')
+    .replace(/\bCHOCH\b/g, 'change of character')
+    .replace(/\bVWAP\b/gi, 'vee-wap')
+    .replace(/\bCVD\b/g,   'cumulative delta')
+    .replace(/\bATR\b/g,   'average true range')
+    .replace(/\bMNQ\b/g,   'mini nasdaq')
+    .replace(/\bMGC\b/g,   'micro gold')
+    .replace(/\bMES\b/g,   'micro S and P')
+    .replace(/\bMYM\b/g,   'micro Dow')
+    .replace(/\bR:R\b/gi,  'risk reward')
+    .slice(0, 420);
+}
+
 function useTTS() {
   const [voices, setVoices]   = useState<SpeechSynthesisVoice[]>([]);
   const [muted,  setMutedSt]  = useState<boolean>(() => {
     try { const v = localStorage.getItem('brain_muted'); return v === null ? false : v !== '0'; } catch { return false; }
   });
   const [speaking, setSpeaking] = useState(false);
+
+  // Queue: activeRef = currently speaking, pendingRef = next line to play (max 1 queued)
+  const activeRef  = useRef(false);
+  const pendingRef = useRef<string | null>(null);
+  const voicesRef  = useRef<SpeechSynthesisVoice[]>([]);
+  useEffect(() => { voicesRef.current = voices; }, [voices]);
 
   useEffect(() => {
     const ss = window.speechSynthesis; if (!ss) return;
@@ -47,34 +68,46 @@ function useTTS() {
     return () => ss.removeEventListener('voiceschanged', load);
   }, []);
 
+  const _fire = useCallback((text: string) => {
+    const ss = window.speechSynthesis; if (!ss || !text) return;
+    activeRef.current = true;
+    setSpeaking(true);
+    const utt = new SpeechSynthesisUtterance(text);
+    const voice = voicesRef.current[0]; if (voice) utt.voice = voice;
+    utt.rate = 0.90; utt.pitch = 1.05;
+    const done = () => {
+      activeRef.current = false;
+      setSpeaking(false);
+      // Automatically play the next queued line when this one finishes
+      const next = pendingRef.current;
+      if (next) { pendingRef.current = null; _fire(next); }
+    };
+    utt.onend = done;
+    utt.onerror = done;
+    ss.speak(utt);
+  }, []);
+
   const setMuted = useCallback((m: boolean) => {
     try { localStorage.setItem('brain_muted', m ? '1' : '0'); } catch {}
-    if (m) { window.speechSynthesis?.cancel(); setSpeaking(false); }
+    if (m) {
+      window.speechSynthesis?.cancel();
+      activeRef.current = false;
+      pendingRef.current = null;
+      setSpeaking(false);
+    }
     setMutedSt(m);
   }, []);
 
   const speak = useCallback((text: string) => {
-    const ss = window.speechSynthesis; if (!text || muted || !ss) return;
-    ss.cancel();
-    const cleaned = text
-      .replace(/\bBOS\b/g,   'break of structure')
-      .replace(/\bCHOCH\b/g, 'change of character')
-      .replace(/\bVWAP\b/gi, 'vee-wap')
-      .replace(/\bCVD\b/g,   'cumulative delta')
-      .replace(/\bATR\b/g,   'average true range')
-      .replace(/\bMNQ\b/g,   'mini nasdaq')
-      .replace(/\bMGC\b/g,   'micro gold')
-      .replace(/\bMES\b/g,   'micro S and P')
-      .replace(/\bMYM\b/g,   'micro Dow')
-      .slice(0, 380);
-    const utt = new SpeechSynthesisUtterance(cleaned);
-    const voice = voices[0]; if (voice) utt.voice = voice;
-    utt.rate = 0.92; utt.pitch = 1.05;
-    utt.onstart = () => setSpeaking(true);
-    const done = () => setSpeaking(false);
-    utt.onend = done; utt.onerror = done;
-    ss.speak(utt);
-  }, [voices, muted]);
+    if (!text || muted) return;
+    const cleaned = cleanTTS(text);
+    if (activeRef.current) {
+      // Don't interrupt — replace the pending slot so it plays next
+      pendingRef.current = cleaned;
+    } else {
+      _fire(cleaned);
+    }
+  }, [muted, _fire]);
 
   const unlockAudio = useCallback(() => {
     const ss = window.speechSynthesis; if (!ss) return;
@@ -1088,17 +1121,167 @@ const MOBILE_CSS = `
 @keyframes mAuraMid { 0%,100%{opacity:0.4;transform:scale(1)} 50%{opacity:0.9;transform:scale(1.04)} }
 `;
 
-// ── Voice bank (shortened mirror for narration cycle) ─────────────────────────
+// ── Voice bank ────────────────────────────────────────────────────────────────
 const M_VOICE: Record<string, string[]> = {
-  WAIT:         ['No edge present. Standing aside.', 'Conditions not meeting my criteria. Watching.', 'Nothing to do but wait.', 'Too many conflicting signals. No trade.'],
-  ANALYZING:    ['Some signals aligning. Watching carefully.', 'Score is building. Not there yet.', 'Getting interested. Still needs confirmation.', 'Something may be setting up.'],
-  FORMING:      ['Setup developing. Almost there.', 'Score approaching the threshold.', 'Three of four gates are green.', 'This is building into something real.'],
-  READY_LONG:   ['Long setup confirmed. All gates green.', 'Bullish edge locked. Execution window open.', 'Textbook long. Clean entry, defined risk.', 'High conviction on the long side.'],
-  READY_SHORT:  ['Short setup confirmed. All gates green.', 'Bearish edge locked. Execution window open.', 'Textbook short. Supply zone holding.', 'High conviction on the short side.'],
-  ACTIVE:       ['Position live. Monitoring every tick.', 'Trade running. Thesis intact.', 'Managing the position. Letting it run.', 'Stop is placed. Trusting the process.'],
-  TARGET_HIT:   ['Target hit. Trade profitable.', 'Winner. Thesis played out perfectly.', 'Profit secured. Back to scanning.', 'Clean win. Process paid off.'],
-  STOP_HIT:     ['Stopped out. Loss taken. Moving on.', 'Stop hit. Risk was defined. Reset.', 'Took the loss. Next setup incoming.', 'Cut cleanly. Back to observation.'],
-  NO_EDGE:      ['No edge on any instrument.', 'Conditions unfavorable. Watching only.', 'Capital stays sidelined. No trade.'],
+  WAIT: [
+    'No edge present. Standing aside and watching the tape.',
+    'Conditions are not meeting my criteria right now. Patience is the trade.',
+    'Nothing to do here but wait for the market to show its hand.',
+    'Too many conflicting signals. When in doubt, stay out.',
+    'The market is not offering anything clean at the moment. I can wait all day.',
+    'Price is in a choppy range. No trend to trade, no setup to take.',
+    'My job right now is to do nothing. Discipline means knowing when to sit on your hands.',
+    'I see noise, not signal. The edge is not there yet.',
+    'Markets can go sideways for a long time. I am not forcing anything.',
+    'Waiting is a position. Right now, cash is my best trade.',
+    'Structure is unclear. I need to see something definitive before committing capital.',
+    'Volume is thin and direction is absent. This is a trap for impatient traders.',
+    'Not every session has a trade. Today might be one of those days and that is perfectly fine.',
+    'The tape is giving me mixed messages. I will wait for clarity.',
+    'Risk versus reward does not favor anything right now. Standing aside.',
+    'No confluence of signals. Each gate has to be green before I move.',
+    'Watching the order flow. Nothing compelling has shown up yet.',
+    'The best traders know when not to trade. This is one of those moments.',
+    'Market needs to make a decision. Until it does, I am staying neutral.',
+    'Calm and patient. The setup will come when it is ready.',
+  ],
+  ANALYZING: [
+    'Some signals starting to align. Watching this carefully.',
+    'Score is building. Not quite at the threshold yet, but getting interesting.',
+    'Getting interested here. Still needs one more confirmation before I act.',
+    'Something may be setting up. Keeping a close eye on the structure.',
+    'The pieces are starting to come together. Not quite there yet.',
+    'Edge score is climbing. Watching for that final gate to flip green.',
+    'Volume is picking up. Price structure is beginning to define itself.',
+    'I am seeing early signs of a potential setup. Staying alert.',
+    'Market is beginning to show some directional intent. Watching closely.',
+    'Two gates are green. Need the rest to confirm before considering an entry.',
+    'This could develop into something. Patience while the setup matures.',
+    'Momentum is starting to shift. Not enough to act on yet, but worth monitoring.',
+    'The score is above thirty. We are in the zone of interest, not yet the zone of action.',
+    'Bias is aligning with price action. Waiting for structure to confirm.',
+    'I feel the setup forming but I will not chase it. Let it come to me.',
+    'Order flow is tilting in one direction. Watching for confirmation on a higher timeframe.',
+  ],
+  FORMING: [
+    'Setup is developing. Almost at the threshold for a full green light.',
+    'Score is approaching the threshold. Three of four gates are lit.',
+    'This is building into something real. One final gate to go.',
+    'Structure is strong. Just waiting for that last piece of confirmation.',
+    'We are close. The market is doing exactly what I want to see.',
+    'Every box is nearly checked. Entry is not far away.',
+    'The thesis is solid. Edge is forming fast, stay sharp.',
+    'I can feel the tension in this setup. Price wants to move and we are almost ready.',
+    'Zone is holding, structure is good, and momentum is building. We are very close.',
+    'This is the moment before the signal fires. Breathe and stay focused.',
+    'Almost everything is aligned. One more confirmation and we are live.',
+    'Setup quality is high. Just needs that final trigger before I act.',
+    'The market is coiling. When it releases, I want to be positioned correctly.',
+    'Score is just below the line. Any moment now this crosses into action territory.',
+    'Risk is defined, entry is clear, target is visible. Just waiting on the last gate.',
+    'I have been watching this build for the last few minutes. Nearly there.',
+  ],
+  READY_LONG: [
+    'Long setup confirmed. All gates are green and the edge is locked.',
+    'Bullish edge locked in. The execution window is open right now.',
+    'Textbook long setup. Clean entry level, defined risk, and target in sight.',
+    'High conviction on the long side. Structure, momentum, and flow are all aligned.',
+    'This is the setup I have been waiting for. Long bias confirmed across all criteria.',
+    'Demand zone is holding, structure is bullish, and volume is supporting. This is it.',
+    'All four gates are green. The edge score is strong. This is a valid long opportunity.',
+    'Price is above vee-wap, structure is bullish, and momentum is with us. Long is the trade.',
+    'The market handed us a clean setup on the long side. Entry is clearly defined.',
+    'Bullish bias confirmed. Risk is at the stop below structure, target is at the measured move.',
+    'Everything I need to see for a long is present. This is a high probability setup.',
+    'Structure flipped bullish, price held the zone, and delta confirmed. Long is the read.',
+    'The setup looks exactly as it should. Clean risk, clear target, strong edge.',
+    'Long is ready to execute. Thesis is intact and all signals are pointing higher.',
+    'High edge score on the long. This is not a guess, this is a calculated opportunity.',
+    'Demand absorbed the selling and price is resuming higher. Long is the path of least resistance.',
+    'All criteria met for a bullish entry. The market is giving us a gift right now.',
+    'Setup formed exactly at the level I was watching. Long at these prices looks excellent.',
+    'Momentum, structure, flow, and zone are all in agreement on the upside. Long is confirmed.',
+    'Patient waiting paid off. The long setup is clean and ready to act on.',
+  ],
+  READY_SHORT: [
+    'Short setup confirmed. All gates are green and the edge is locked.',
+    'Bearish edge locked in. The execution window is open right now.',
+    'Textbook short setup. Supply zone is holding and the structure has rolled over.',
+    'High conviction on the short side. Structure, momentum, and flow are all aligned bearishly.',
+    'This is the short setup I have been waiting for. All criteria confirmed.',
+    'Supply zone held perfectly, structure turned bearish, delta is negative. Short is the trade.',
+    'All four gates are green on the short side. Edge score is strong. This is a valid opportunity.',
+    'Price is below vee-wap, structure is bearish, and sellers are in control. Short is the read.',
+    'The market handed us a clean setup on the short side. Entry and risk are clearly defined.',
+    'Bearish bias confirmed. Stop is above structure, target is at the measured move lower.',
+    'Everything I need to see for a short is present. This is a high probability bearish setup.',
+    'Structure flipped bearish, price rejected the supply zone, and delta confirmed selling pressure.',
+    'The setup looks exactly as it should on the short side. Clean risk, clear target, strong edge.',
+    'Short is ready to execute. Thesis is intact and all signals are pointing lower.',
+    'High edge score on the short. This is a calculated opportunity, not a guess.',
+    'Supply absorbed the buying and price is resuming lower. Short is the path of least resistance.',
+    'All criteria met for a bearish entry. The market is offering a clean short right here.',
+    'Setup formed exactly at the supply level I was watching. Short at these prices looks excellent.',
+    'Momentum, structure, flow, and zone all agree on the downside. Short is confirmed.',
+    'Patient waiting paid off. The short setup is clean and ready to act on.',
+  ],
+  ACTIVE: [
+    'Position is live. Monitoring every tick as the trade unfolds.',
+    'Trade is running. The thesis remains intact and I am trusting the process.',
+    'Managing the position. Stop is placed and I am letting the market do its work.',
+    'Stop is protected. Target is in view. Nothing to do but wait for the outcome.',
+    'We are in the trade. My job now is to manage, not to second guess.',
+    'Position open and breathing. Staying disciplined and not micromanaging.',
+    'The market is working through our trade. Thesis has not changed.',
+    'Live position in the book. Watching for signs of invalidation but thesis is intact.',
+    'Trade is alive and the setup is playing out as expected. Patience from here.',
+    'I entered at a clean level with defined risk. Now the market decides.',
+    'Managing risk in real time. Stop stays where it is unless structure changes.',
+    'Position is working. Do not touch the stop and let the target come to you.',
+    'Every tick is accountable but I am not reacting to noise. Thesis rules.',
+    'We are in the trade and the tape is cooperating. Staying focused.',
+    'Risk is defined, target is set, position is live. Everything from here is process.',
+    'The trade is in motion. My edge was to get in at a good level, which we did.',
+    'Monitoring the momentum for any signs the thesis is weakening. So far so good.',
+    'Position is healthy. Price is respecting the structure and moving our way.',
+  ],
+  TARGET_HIT: [
+    'Target hit. Trade was profitable and the thesis played out perfectly.',
+    'Winner. The process worked exactly as designed.',
+    'Profit secured. Resetting and back to scanning for the next opportunity.',
+    'Clean win. Patient waiting and disciplined execution paid off.',
+    'Target reached. That is why we define levels before entering the trade.',
+    'We got paid. The setup was valid, the execution was clean, and the market delivered.',
+    'Trade closed at target. One more data point confirming the edge works.',
+    'Profitable outcome. The thesis from entry to exit was correct throughout.',
+    'Got to target. Now back to observation mode. Do not chase the next trade.',
+    'Win logged. The process is solid. Take a breath and reset before the next setup.',
+    'Target achieved. That is what disciplined trading looks like.',
+    'Clean exit at the level I drew before entering. Exactly how it should work.',
+  ],
+  STOP_HIT: [
+    'Stopped out. The loss was defined before entry and it is taken with discipline.',
+    'Stop was hit. Risk was controlled and we live to trade another setup.',
+    'Took the loss cleanly. The next valid setup will come and we will be ready.',
+    'Cut out at the stop. That is the job. Define risk, take the loss, reset.',
+    'The thesis was invalidated. Stop protected capital and that is all I need from it.',
+    'Loss taken. It was a planned risk, not a surprise. On to the next one.',
+    'Stopped. Every loss is tuition. The important thing is the setup was valid and sized correctly.',
+    'Hit the stop. The market disagreed with the setup today and that is acceptable.',
+    'Loss logged. No revenge trading, no chasing. Back to observation and patience.',
+    'Stopped out cleanly. The edge does not win every time, it wins enough times. Moving forward.',
+    'Risk was defined and controlled. That stop was exactly where it needed to be.',
+    'Trade did not work this time. Reset the mental state and wait for the next opportunity.',
+  ],
+  NO_EDGE: [
+    'No edge present on any instrument right now. Fully on the sidelines.',
+    'Conditions are unfavorable across the board. Watching only, no capital at risk.',
+    'Nothing to trade here. Capital stays sidelined until edge returns.',
+    'Market is offering nothing clean today. Staying patient and disciplined.',
+    'No instrument is showing a valid setup. Cash is the best position right now.',
+    'All signals are below threshold. I will not force a trade just to be active.',
+    'No edge means no trade. Simple as that.',
+  ],
 };
 
 const _mIdx: Record<string, number> = {};
