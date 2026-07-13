@@ -88,7 +88,7 @@ function useTTS() {
 
   useEffect(() => {
     const ss = window.speechSynthesis; if (!ss) return;
-    const load = () => { const all = ss.getVoices(); const en = all.filter(v => v.lang.startsWith('en')); setVoices(en.length ? en : all.slice(0, 30)); };
+    const load = () => { const all = ss.getVoices(); setVoices(all.length ? all : []); };
     load(); ss.addEventListener('voiceschanged', load); return () => ss.removeEventListener('voiceschanged', load);
   }, []);
   const setVoice = useCallback((name: string) => { try { localStorage.setItem('brain_voice', name); } catch {} setVoiceN(name); }, []);
@@ -1641,6 +1641,10 @@ export default function Home() {
   const [asking, setAsking]     = useState(false);
   const [authPwd, setAuthPwd]   = useState<string>(() => { try { return localStorage.getItem('brain_auth') || ''; } catch { return ''; } });
   const [authNeeded, setAuthNeeded] = useState<boolean>(() => { try { return !localStorage.getItem('brain_auth'); } catch { return true; } });
+  const [vrmSrc, setVrmSrcRaw] = useState<string>(() => { try { return localStorage.getItem('brain_vrm') || '/LordPiggington.vrm'; } catch { return '/LordPiggington.vrm'; } });
+  const [showAvatarPicker, setShowAvatarPicker] = useState(false);
+  const [vrmUrlInput, setVrmUrlInput] = useState('');
+  const setVrmSrc = useCallback((src: string) => { try { localStorage.setItem('brain_vrm', src); } catch {} setVrmSrcRaw(src); setShowAvatarPicker(false); }, []);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [chatOpen,     setChatOpen]     = useState(false);
   const [chartOpen,    setChartOpen]    = useState(false);
@@ -2389,12 +2393,87 @@ export default function Home() {
                 </span>
               </div>
               {!muted && voices.length > 0 && (
-                <select value={voiceName||voices[0]?.name||''} onChange={e => setVoice(e.target.value)} style={{
-                  width:'100%', background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.07)',
-                  borderRadius:6, padding:'3px 6px', color:'rgba(255,255,255,0.35)', fontSize:9.5,
-                  fontFamily:'monospace', cursor:'pointer', outline:'none' }}>
-                  {voices.map(v => <option key={v.name} value={v.name} style={{ background:'#111' }}>{v.name}</option>)}
-                </select>
+                <div style={{ display:'flex', gap:4, alignItems:'center' }}>
+                  <select value={voiceName||voices[0]?.name||''} onChange={e => setVoice(e.target.value)} style={{
+                    flex:1, background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.07)',
+                    borderRadius:6, padding:'3px 6px', color:'rgba(255,255,255,0.45)', fontSize:9.5,
+                    fontFamily:'monospace', cursor:'pointer', outline:'none' }}>
+                    {(() => {
+                      // Group voices: English first, then others
+                      const en = voices.filter(v => v.lang.startsWith('en'));
+                      const other = voices.filter(v => !v.lang.startsWith('en'));
+                      return <>
+                        {en.length > 0 && <optgroup label="English" style={{ background:'#111' }}>
+                          {en.map(v => <option key={v.name} value={v.name} style={{ background:'#111' }}>{v.name} ({v.lang})</option>)}
+                        </optgroup>}
+                        {other.length > 0 && <optgroup label="Other Languages" style={{ background:'#111' }}>
+                          {other.map(v => <option key={v.name} value={v.name} style={{ background:'#111' }}>{v.name} ({v.lang})</option>)}
+                        </optgroup>}
+                      </>;
+                    })()}
+                  </select>
+                  <button title="Preview voice" onClick={() => {
+                    const ss = window.speechSynthesis; if (!ss) return;
+                    ss.cancel();
+                    const utt = new SpeechSynthesisUtterance("Hey, I'm your AI trading partner. Looking good out there.");
+                    const v = voices.find(x => x.name === (voiceName||voices[0]?.name||''));
+                    if (v) utt.voice = v;
+                    ss.speak(utt);
+                  }} style={{
+                    flexShrink:0, padding:'3px 7px', borderRadius:6, fontSize:10,
+                    background:'rgba(0,148,255,0.12)', border:'1px solid rgba(0,148,255,0.22)',
+                    color:'rgba(0,200,255,0.75)', cursor:'pointer', fontFamily:'monospace' }}>▶</button>
+                </div>
+              )}
+            </div>
+
+            {/* ── Avatar switcher ── */}
+            <div style={{ borderTop:'1px solid rgba(255,255,255,0.038)', margin:'12px 0 8px' }} />
+            <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+              <button onClick={() => setShowAvatarPicker(p => !p)} style={{
+                display:'flex', alignItems:'center', gap:6, width:'100%',
+                background:'rgba(0,0,0,0.25)', border:'1px solid rgba(255,255,255,0.07)',
+                borderRadius:6, padding:'4px 8px', cursor:'pointer', textAlign:'left' }}>
+                <span style={{ fontSize:12 }}>🎭</span>
+                <span style={{ fontSize:9.5, color:'rgba(255,255,255,0.38)', fontFamily:'monospace', flex:1 }}>Avatar</span>
+                <span style={{ fontSize:8.5, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>
+                  {vrmSrc === '/LordPiggington.vrm' ? 'LordPiggington' : vrmSrc === '/avatar.vrm' ? 'Default' : 'Custom'}
+                </span>
+                <span style={{ fontSize:10, color:'rgba(255,255,255,0.25)' }}>{showAvatarPicker ? '▲' : '▼'}</span>
+              </button>
+              {showAvatarPicker && (
+                <div style={{ display:'flex', flexDirection:'column', gap:5,
+                  background:'rgba(0,0,0,0.40)', border:'1px solid rgba(255,255,255,0.07)',
+                  borderRadius:8, padding:'8px 10px' }}>
+                  {/* Presets */}
+                  <div style={{ fontSize:9, color:'rgba(255,255,255,0.28)', fontFamily:'monospace', marginBottom:2, letterSpacing:'0.08em' }}>PRESETS</div>
+                  {[
+                    { label: 'LordPiggington', src: '/LordPiggington.vrm' },
+                    { label: 'Default VRM',    src: '/avatar.vrm' },
+                  ].map(p => (
+                    <button key={p.src} onClick={() => setVrmSrc(p.src)} style={{
+                      padding:'4px 8px', borderRadius:5, fontSize:10, cursor:'pointer', textAlign:'left',
+                      background: vrmSrc === p.src ? 'rgba(0,148,255,0.18)' : 'rgba(255,255,255,0.04)',
+                      border: `1px solid ${vrmSrc === p.src ? 'rgba(0,148,255,0.35)' : 'rgba(255,255,255,0.06)'}`,
+                      color: vrmSrc === p.src ? 'rgba(0,200,255,0.9)' : 'rgba(255,255,255,0.45)',
+                      fontFamily:'monospace' }}>
+                      {p.label}
+                    </button>
+                  ))}
+                  {/* Custom URL */}
+                  <div style={{ fontSize:9, color:'rgba(255,255,255,0.28)', fontFamily:'monospace', marginTop:4, marginBottom:2, letterSpacing:'0.08em' }}>CUSTOM URL (.vrm)</div>
+                  <div style={{ display:'flex', gap:4 }}>
+                    <input value={vrmUrlInput} onChange={e => setVrmUrlInput(e.target.value)}
+                      placeholder="https://example.com/model.vrm"
+                      style={{ flex:1, background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.08)',
+                        borderRadius:5, padding:'3px 6px', color:'rgba(255,255,255,0.6)', fontSize:9.5,
+                        fontFamily:'monospace', outline:'none' }} />
+                    <button onClick={() => { if (vrmUrlInput.trim()) setVrmSrc(vrmUrlInput.trim()); }}
+                      style={{ padding:'3px 8px', borderRadius:5, fontSize:10, cursor:'pointer',
+                        background:'rgba(0,148,255,0.15)', border:'1px solid rgba(0,148,255,0.25)',
+                        color:'rgba(0,200,255,0.8)', fontFamily:'monospace' }}>Load</button>
+                  </div>
+                </div>
               )}
             </div>
           </div>
@@ -2562,7 +2641,7 @@ export default function Home() {
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
                       justifyContent:'center', zIndex:1 }}>
-                      <LordPiggingtonAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} debug={false} />
+                      <LordPiggingtonAvatar avState={avState} speaking={speaking} ringColor={ringColor} gazeEvent={gazeEvent} speechCtrlRef={speechCtrlRef} voiceListeningRef={voiceListeningRef} debug={false} vrmSrc={vrmSrc} />
                     </div>
 
                     {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}
