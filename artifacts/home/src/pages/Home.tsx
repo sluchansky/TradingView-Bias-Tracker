@@ -107,7 +107,37 @@ function useTTS() {
     ss.cancel();
     cancelAnimationFrame(energyRafRef.current);
 
-    const utt = new SpeechSynthesisUtterance(text.slice(0, 400));
+    // Expand trading abbreviations so TTS reads them naturally instead of spelling
+    const cleaned = text
+      .replace(/\bBOS\b/g,   'break of structure')
+      .replace(/\bCHOCH\b/g, 'change of character')
+      .replace(/\bVWAP\b/gi, 'vee-wap')
+      .replace(/\bCVD\b/g,   'cumulative delta')
+      .replace(/\bRVOL\b/g,  'relative volume')
+      .replace(/\bHTF\b/g,   'higher timeframe')
+      .replace(/\bLTF\b/g,   'lower timeframe')
+      .replace(/\bATR\b/g,   'average true range')
+      .replace(/\bFVG\b/g,   'fair value gap')
+      .replace(/\bPOI\b/g,   'point of interest')
+      .replace(/\bR:R\b/gi,  'risk to reward')
+      .replace(/\bHH\b/g,    'higher high')
+      .replace(/\bHL\b/g,    'higher low')
+      .replace(/\bLH\b/g,    'lower high')
+      .replace(/\bLL\b/g,    'lower low')
+      .replace(/\bTP\b/g,    'take profit')
+      .replace(/\bSL\b/g,    'stop loss')
+      .replace(/\bBE\b/g,    'break even')
+      .replace(/\bMNQ\b/g,   'mini nasdaq')
+      .replace(/\bMGC\b/g,   'micro gold')
+      .replace(/\bMES\b/g,   'micro S&P')
+      .replace(/\bMYM\b/g,   'micro Dow')
+      .replace(/\b1R\b/gi,   'one R')
+      .replace(/\b2R\b/gi,   'two R')
+      .replace(/\b3R\b/gi,   'three R')
+      .replace(/\b4R\b/gi,   'four R')
+      .slice(0, 450);
+
+    const utt = new SpeechSynthesisUtterance(cleaned);
     const voice = voices.find(v => v.name === voiceName) ?? voices[0]; if (voice) utt.voice = voice;
     utt.rate = 0.92; utt.pitch = 1.05;
 
@@ -1982,13 +2012,6 @@ export default function Home() {
     [data, edge] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
-  const narration = (
-    voice_d.narration ||
-    (mb.synthesis as any)?.narrative ||
-    mb.summary ||
-    (loading ? '' : pickVoiceLine(avState))
-  ) as string;
-
   // Monologue: cycles through data-driven thoughts; restarts only on status change
   const thoughts  = useMemo(() => buildThoughts(data, status, edge, grade), [data, status, edge, grade]);
   const { text: displayed, live: streaming } = useMonologue(thoughts, status);
@@ -2052,6 +2075,14 @@ export default function Home() {
 
   const avCfg = AV_CFG[avState];
   const eyeColor = `rgb(${avCfg.eye[0]},${avCfg.eye[1]},${avCfg.eye[2]})`;
+
+  // Narration — declared after avState so pickVoiceLine(avState) resolves correctly
+  const narration = (
+    voice_d.narration ||
+    (mb.synthesis as any)?.narrative ||
+    mb.summary ||
+    (loading ? '' : pickVoiceLine(avState))
+  ) as string;
 
   // Confidence ring color — communicates AI state at a glance before text is read
   const ringColor = (() => {
@@ -2571,19 +2602,13 @@ export default function Home() {
                     flex:1, background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.07)',
                     borderRadius:6, padding:'3px 6px', color:'rgba(255,255,255,0.45)', fontSize:9.5,
                     fontFamily:'monospace', cursor:'pointer', outline:'none' }}>
-                    {(() => {
-                      // Group voices: English first, then others
-                      const en = voices.filter(v => v.lang.startsWith('en'));
-                      const other = voices.filter(v => !v.lang.startsWith('en'));
-                      return <>
-                        {en.length > 0 && <optgroup label="English" style={{ background:'#111' }}>
-                          {en.map(v => <option key={v.name} value={v.name} style={{ background:'#111' }}>{v.name} ({v.lang})</option>)}
-                        </optgroup>}
-                        {other.length > 0 && <optgroup label="Other Languages" style={{ background:'#111' }}>
-                          {other.map(v => <option key={v.name} value={v.name} style={{ background:'#111' }}>{v.name} ({v.lang})</option>)}
-                        </optgroup>}
-                      </>;
-                    })()}
+                    {voices
+                      .filter(v => v.lang.startsWith('en'))
+                      .map(v => (
+                        <option key={v.name} value={v.name} style={{ background:'#111' }}>
+                          {v.name}
+                        </option>
+                      ))}
                   </select>
                   <button title="Preview voice" onClick={() => {
                     const ss = window.speechSynthesis; if (!ss) return;
@@ -2794,6 +2819,9 @@ export default function Home() {
                       value={lbl} sub={dem ? `D: ${fmt(Number(dem))}` : sup ? `S: ${fmt(Number(sup))}` : undefined} />;
                   })()}
                 </div>
+
+                {/* Signal radar — flanks the avatar on both sides */}
+                <EvidenceRadarPanel items={radar.slice(0, 5)} side="left" />
 
                 {/* AVATAR SPOTLIGHT CENTER */}
                 <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'flex-start', justifyContent:'flex-start', flexShrink:0, overflow:'hidden' }}>
@@ -3011,6 +3039,7 @@ export default function Home() {
                     </span>
                   </div>
                 </div>
+                <EvidenceRadarPanel items={radar.slice(5)} side="right" />
 
                 {/* RIGHT — VWAP · Order Flow · Volume */}
                 <div className="mc-col">
