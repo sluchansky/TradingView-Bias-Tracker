@@ -811,28 +811,32 @@ function StalkCard({ data, ticker, authHeader }: { data: any; ticker: Ticker; au
   const rrLabel   = rrRaw != null ? `1:${Number(rrRaw).toFixed(1)}` : '—';
   const why: string[] = Array.isArray(sm.why_waiting) ? sm.why_waiting.filter(Boolean) : [];
 
-  // ENTER eligibility: need execution on + have entry zone + state is actionable
-  const canEnter  = data?.execution_enabled && isActive &&
-                    sm.ideal_entry_zone != null && sm.stop_reference != null;
+  // Show ENTER whenever execution is on AND we have at least a direction —
+  // whether or not specific price levels have been computed yet.
+  const canEnter = data?.execution_enabled && !!sm.direction;
 
   const handleEnter = async () => {
     if (!canEnter || status === 'sending') return;
     setStatus('sending'); setErrMsg('');
     try {
       const entryMid = zoneToMid(sm.ideal_entry_zone);
-      const stop     = Number(sm.stop_reference);
-      const t1       = sm.target_reference != null ? Number(sm.target_reference) : null;
-      if (!entryMid || !stop) { setStatus('err'); setErrMsg('No entry data'); return; }
-      const body: Record<string,any> = {
-        ticker,
-        direction: sm.direction,
-        entry:     entryMid,
-        stop,
-        t1:        t1 ?? (isShort ? entryMid - Math.abs(entryMid - stop) : entryMid + Math.abs(entryMid - stop)),
-        t2:        t1 ?? (isShort ? entryMid - Math.abs(entryMid - stop) : entryMid + Math.abs(entryMid - stop)),
-        contracts: 1,
-        source:    'stalk_mode',
-      };
+      const stop     = sm.stop_reference != null ? Number(sm.stop_reference) : null;
+      const t1raw    = sm.target_reference != null ? Number(sm.target_reference) : null;
+
+      // Build explicit-price body when the engine has computed levels
+      const body: Record<string,any> = { ticker, direction: sm.direction, source: 'stalk_mode' };
+      if (entryMid && stop) {
+        const t1 = t1raw ?? (isShort
+          ? entryMid - Math.abs(entryMid - stop)
+          : entryMid + Math.abs(entryMid - stop));
+        body.entry     = entryMid;
+        body.stop      = stop;
+        body.t1        = t1;
+        body.t2        = t1;
+        body.contracts = 1;
+      }
+      // Without explicit levels the server attempts to pull from the live trade_plan;
+      // if none exists it returns 400 — we surface that clearly.
       const r = await fetch('/api/enter', {
         method: 'POST', credentials: 'include',
         headers: { 'Content-Type': 'application/json', ...authHeader },
