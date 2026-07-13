@@ -2059,7 +2059,7 @@ export default function Home() {
       if (r.status === 401) { setAuthNeeded(true); setAuthPwd(''); try { localStorage.removeItem('brain_auth'); } catch {} return; }
       if (r.ok) {
         const d = await r.json(); setData(d); setLoading(false);
-        const p = Number(d?.price || 0);
+        const p = Number(d?.current_price || d?.vwap_value || 0);
         if (p > 0) {
           const nowMin = Math.floor(Date.now() / 60000) * 60000;
           if (candlesRef.current.length === 0) {
