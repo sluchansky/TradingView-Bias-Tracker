@@ -2695,14 +2695,63 @@ export default function Home() {
                     flex:1, background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.07)',
                     borderRadius:6, padding:'3px 6px', color:'rgba(255,255,255,0.45)', fontSize:9.5,
                     fontFamily:'monospace', cursor:'pointer', outline:'none' }}>
-                    {[
-                      ...voices.filter(v => v.lang.startsWith('en')),
-                      ...voices.filter(v => !v.lang.startsWith('en')),
-                    ].map(v => (
-                      <option key={v.name} value={v.name} style={{ background:'#111' }}>
-                        {v.name}{!v.lang.startsWith('en') ? ` (${v.lang})` : ''}
-                      </option>
-                    ))}
+                    {(() => {
+                      // Dialect groups — English only, sorted by region
+                      const DIALECT: Record<string, string> = {
+                        'en-US':'🇺🇸 American', 'en-GB':'🇬🇧 British',
+                        'en-AU':'🇦🇺 Australian', 'en-IN':'🇮🇳 Indian',
+                        'en-CA':'🇨🇦 Canadian', 'en-NZ':'🇳🇿 New Zealand',
+                        'en-ZA':'🇿🇦 South African', 'en-IE':'🇮🇪 Irish',
+                        'en-NG':'🇳🇬 Nigerian', 'en-SG':'🇸🇬 Singaporean',
+                      };
+                      const DIALECT_ORDER = Object.keys(DIALECT);
+
+                      // Heuristic gender from voice name
+                      const isMale = (n: string) => /\b(david|james|daniel|thomas|mark|george|arthur|oliver|ryan|aaron|fred|bruce|paul|rishi|lee|alex\b|mike|john|kevin|brian|eric|reed|guy|guy|rod|lance|junior|ralph|zarvox|ralph|eddy|whisper|organ|deranged|boing|boowomp|bells|bad news|cellos|hysterical|pipe|trinoids)\b/i.test(n) || /\bmale\b/i.test(n);
+                      const isFemale = (n: string) => /\b(samantha|victoria|karen|zira|hazel|fiona|veena|monica|allison|ava|lisa|susan|sarah|kate|tessa|nicky|moira|amelie|anna|laura|petra|lekha|mariam|milena|damayanti|luciana|joana|carmit|satu|kanya|nuray|ioana|ellen|alice|marie|emma|emily|claire|grace|diane|heather|joanna|nora|siri|aria|cortana)\b/i.test(n) || /\bfemale\b/i.test(n);
+                      const gender = (n: string) => isMale(n) ? '♂ ' : isFemale(n) ? '♀ ' : '';
+
+                      // Strip manufacturer prefix for cleaner display
+                      const clean = (n: string) => n.replace(/^(Microsoft|Google|Apple)\s+/i, '');
+
+                      // Bucket voices into dialect groups
+                      const enVoices = voices.filter(v => v.lang.startsWith('en'));
+                      const grouped: Record<string, typeof voices> = {};
+                      enVoices.forEach(v => {
+                        const key = DIALECT_ORDER.find(k => v.lang === k) ?? 'en-other';
+                        (grouped[key] ??= []).push(v);
+                      });
+
+                      // Render dialect optgroups in order
+                      const rendered = DIALECT_ORDER
+                        .filter(k => grouped[k]?.length)
+                        .map(k => (
+                          <optgroup key={k} label={DIALECT[k]} style={{ background:'#111' }}>
+                            {grouped[k].map(v => (
+                              <option key={v.name} value={v.name} style={{ background:'#111' }}>
+                                {gender(v.name)}{clean(v.name)}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ));
+
+                      // Catch-all for any English dialect not in the map
+                      if (grouped['en-other']?.length) {
+                        rendered.push(
+                          <optgroup key="en-other" label="🌐 Other English" style={{ background:'#111' }}>
+                            {grouped['en-other'].map(v => (
+                              <option key={v.name} value={v.name} style={{ background:'#111' }}>
+                                {gender(v.name)}{clean(v.name)} ({v.lang})
+                              </option>
+                            ))}
+                          </optgroup>
+                        );
+                      }
+
+                      return rendered.length > 0 ? rendered : (
+                        <option value="" style={{ background:'#111' }}>No voices available</option>
+                      );
+                    })()}
                   </select>
                   <button title="Preview voice" onClick={() => {
                     const ss = window.speechSynthesis; if (!ss) return;
