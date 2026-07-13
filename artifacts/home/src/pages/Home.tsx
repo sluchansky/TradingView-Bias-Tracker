@@ -1665,6 +1665,108 @@ const VOICE_BANK: Record<string, string[]> = {
   ],
 };
 
+// ── Jokes ─────────────────────────────────────────────────────────────────────
+const JOKES: string[] = [
+  "Why did the trader go broke? He kept buying high and selling low. Classic beginner mistake.",
+  "They say buy low, sell high. Sounds easy until you realize nobody rings a bell at the bottom.",
+  "What is a day trader's favorite movie? The Big Short. Followed closely by Margin Call.",
+  "Why do traders make great poker players? They already know how to hold their losses.",
+  "I told my partner I was going to make a killing in the market today. They said please don't — we need that money.",
+  "What is the difference between a trader and a pizza? A pizza can feed a family of four.",
+  "A bear, a bull, and a trader walk into a bar. Only the trader leaves with money — and only because he shorted the other two.",
+  "Why did the technical analyst get kicked out of the casino? He kept drawing support lines on the roulette table.",
+  "What do you call a trader who never takes a loss? A liar.",
+  "I tried to explain options trading to my grandmother. Now she is my broker.",
+  "Why do traders love volatility? Because it is the only way they feel alive.",
+  "Two traders are arguing about the direction of the market. They are both wrong.",
+  "My strategy is simple. Buy when price is low. Sell when my therapist tells me to.",
+  "What is a trader's least favorite word? Retracement. Unless it goes their way.",
+  "You know what they say — the market can stay irrational longer than you can stay solvent. I have personally tested that.",
+  "Why did the futures trader sleep so well? He finally had stops in place.",
+  "I have three emotions as a trader. Greed, fear, and — I swear I did not just do that.",
+  "What separates a successful trader from an unsuccessful one? About six months and a funded account.",
+  "The market is like a mirror. It shows you exactly who you are. Most people don't like what they see.",
+  "My favorite candlestick pattern is called the Oh No. You'll know it when you see it.",
+  "Why do analysts always hedge their predictions? Because if you are wrong in four different ways, at least one of them was right.",
+  "What do you call someone who predicted the last ten market crashes? A perma-bear with a podcast.",
+  "The stock market is a device for transferring money from the impatient to the patient. I am trying to be the patient one.",
+  "Why did the trader bring a ladder to the market? He heard prices were going up.",
+  "Risk management is not exciting. But neither is blowing up your account. Pick your boring.",
+  "I asked my edge score what it thought about this trade. It said ask again later.",
+  "What is a momentum trader's favorite song? Running With the Bulls. Or maybe Running Scared.",
+  "Apparently there are two rules in trading. Rule one: never lose money. Rule two: never forget rule one. I am working on both.",
+  "Trading is ninety percent psychology and ten percent strategy. The other fifty percent is math. Wait — that doesn't add up. Exactly.",
+  "Why did the candlestick go to therapy? It had too many wicks and not enough body.",
+];
+
+// ── Questions directed at the user ────────────────────────────────────────────
+const QUESTIONS: string[] = [
+  "Hey, quick question — what is your biggest trading goal this month?",
+  "Do you prefer scalping quick moves or swinging for a bigger target? I'm curious about your style.",
+  "What market are you most focused on today? I want to make sure I'm watching the right instrument.",
+  "How long have you been trading futures? I'd love to know where you're coming from.",
+  "What is the hardest trading rule for you to follow? For most people it's cutting losses quickly.",
+  "Do you journal your trades? It's one of the highest-leverage habits you can build.",
+  "What does your pre-market routine look like? How do you prepare for the session?",
+  "Have you ever nailed a perfect setup and then missed the entry? How did that feel?",
+  "What's your favorite time of day to trade — the open, mid-session, or the afternoon push?",
+  "Do you trade with a fixed risk per trade, or does your size vary? Walk me through your approach.",
+  "What was your best trade ever? I'm genuinely curious what made it work.",
+  "What was your most painful lesson as a trader? Mine was learning not to average into a losing position.",
+  "Do you think the market is more technical or more psychological? I have a strong opinion on this.",
+  "What trading books have shaped the way you think? I have recommendations if you want them.",
+  "Are you more comfortable going long or short? Most traders have a natural directional bias.",
+  "Do you have a maximum number of trades per day? Overtrading is the number one killer of edge.",
+  "If you could change one thing about how you traded last week, what would it be?",
+  "How do you handle a losing streak mentally? That's where most traders fall apart.",
+  "What got you into futures trading in the first place? I'm always curious about the origin story.",
+  "Do you follow the economic calendar? Some of the best and worst moves happen around data releases.",
+  "What does a good trading day look like for you — is it about the P and L or the process?",
+  "Are you a momentum trader or a mean reversion trader at heart?",
+  "How many hours a day are you in front of the screen? Screen time is not the same as productive time.",
+  "If the market closed for a week, would you be relieved or stressed? That tells you a lot about your relationship with trading.",
+  "Do you have a trading mentor, or are you mostly self-taught? Both paths are valid — just different.",
+  "What instrument do you find hardest to read — gold, the Nasdaq, or something else entirely?",
+  "Do you ever take breaks mid-session? Walking away from the screen can actually improve your decision-making.",
+  "What does your post-trade review look like? That is where most of the real learning happens.",
+  "Have you ever traded against your own analysis just because you were bored? No judgment — I've seen it happen.",
+  "What would you tell yourself on day one of your trading career?",
+];
+
+// ── Personality banter ────────────────────────────────────────────────────────
+const BANTER: string[] = [
+  "Just so you know, I've been watching this chart so long I'm starting to dream in candlesticks.",
+  "You ever notice how the market moves the second you step away? It knows.",
+  "Waiting for edge is the hardest part. Anyone who says otherwise hasn't waited long enough.",
+  "I'm not saying the market is rigged. I'm just saying it does exactly what it wants, when it wants.",
+  "Fun fact — most retail traders lose because they overtrade. The best trade is often the one you don't take.",
+  "There is something meditative about watching price action when you are not forcing a trade.",
+  "The tape never lies. Traders lie to themselves — but the tape is always honest.",
+  "I've seen a lot of setups. The ones I trust most are the ones that make me wait the longest.",
+  "Every session is different. That's what keeps this interesting.",
+  "Patience is literally a trading edge. The market pays people who wait for high-probability setups.",
+  "You know what I find fascinating? The same pattern plays out over and over. Different year, same psychology.",
+  "Good setups are like buses. If you miss one, another one is coming. Do not chase.",
+  "The quietest traders are usually the most dangerous ones. They wait, then strike with conviction.",
+  "There is a reason most prop firm challenges are won by people who trade less, not more.",
+  "The best traders I have studied all share one trait — they are completely comfortable doing nothing.",
+  "Plan the trade, trade the plan. It sounds simple. It is absolutely not easy.",
+  "The market will humble you the moment you think you have it figured out. Every single time.",
+  "I respect the market. I don't fear it, I don't love it — I just respect it.",
+  "Screen time and productive time are not the same thing. Quality of attention beats quantity of hours.",
+  "Losing trades are not failures if your process was sound. That's a hard thing to truly internalize.",
+  "Some days the market owes you nothing. Accept that and trade better because of it.",
+  "The difference between discipline and stubbornness is whether you are following a rule or ignoring one.",
+  "I think about risk before I think about reward. Always. In that order.",
+  "Most people focus on entries. The real edge is in exits and position sizing.",
+  "If you're not willing to take a small loss, the market will eventually give you a large one.",
+  "There's a version of trading where you are calm, clear, and decisive. That version exists. I've seen it.",
+  "Consistency beats brilliance in trading. Boring wins. Every time.",
+  "One of the hardest skills in trading is knowing when to do absolutely nothing.",
+  "The market does not know what you paid. It does not care. That's both humbling and liberating.",
+  "Sometimes the smartest thing I do all day is close the chart and go take a walk.",
+];
+
 // Tracks cycling position per state so we never say the same thing twice in a row
 const _voiceBankIdx: Record<string, number> = {};
 function pickVoiceLine(state: string): string {
@@ -1672,6 +1774,12 @@ function pickVoiceLine(state: string): string {
   const start = _voiceBankIdx[state] ?? Math.floor(Math.random() * lines.length);
   _voiceBankIdx[state] = (start + 1) % lines.length;
   return lines[start];
+}
+// Picks from an array cycling forward (no immediate repeats), keyed by label
+function _pickCycling(arr: string[], key: string): string {
+  const i = (_voiceBankIdx[key] ?? Math.floor(Math.random() * arr.length)) % arr.length;
+  _voiceBankIdx[key] = i + 1;
+  return arr[i];
 }
 
 // ── Demo Mode Engine ─────────────────────────────────────────────────────────
@@ -2197,8 +2305,20 @@ export default function Home() {
         if (/strong|high/.test(vol)) ctx.push('Volume is elevated. Real institutional participation is showing up.');
         if (/low|thin/.test(vol))    ctx.push('Volume is light right now. I want to see more participation before acting.');
         if (egR > 0) ctx.push(`Edge score is at ${egR} out of 110. ${egR >= 75 ? 'That is above my entry threshold.' : egR >= 50 ? 'Getting closer — watching for the final signals.' : 'Not enough edge to trade yet.'}`);
-        const pool = ctx.length > 0 ? ctx : [pickVoiceLine(st)];
-        const line = pool[Math.floor(Math.random() * pool.length)];
+        // Decide what kind of line to say this cycle
+        // ~25% joke, ~25% question, ~15% banter, ~35% market context / state
+        const roll = Math.random();
+        let line: string;
+        if (roll < 0.25) {
+          line = _pickCycling(JOKES, '__jokes');
+        } else if (roll < 0.50) {
+          line = _pickCycling(QUESTIONS, '__questions');
+        } else if (roll < 0.65) {
+          line = _pickCycling(BANTER, '__banter');
+        } else {
+          const pool = ctx.length > 0 ? ctx : [pickVoiceLine(st)];
+          line = pool[Math.floor(Math.random() * pool.length)];
+        }
         if (line !== lastSpokenRef.current) {
           lastSpokenRef.current = line;
           lastSpokeAtRef.current = Date.now();
