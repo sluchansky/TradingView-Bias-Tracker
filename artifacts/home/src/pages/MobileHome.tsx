@@ -1012,8 +1012,40 @@ function SignalTab({ data, ticker, narration, avatarState, speaking, authHeader 
       {/* ── STALK MODE: shown while a setup is forming (pre-READY) ── */}
       <StalkCard data={data} ticker={ticker} authHeader={authHeader} />
 
-      {/* Avatar bar */}
-      <AvatarStatusBar state={avatarState} narration={narration} speaking={speaking} />
+      {/* Avatar hero */}
+      <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:12, padding:'8px 0 4px' }}>
+        <BigAvatar state={avatarState} speaking={speaking} size={100} />
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:5 }}>
+          {(() => {
+            const col = avatarState === 'READY_LONG' ? BULL : avatarState === 'READY_SHORT' ? BEAR
+              : avatarState === 'ACTIVE' ? CYAN : (avatarState === 'FORMING' || avatarState === 'ANALYZING') ? AMB : '#94a3b8';
+            return (
+              <>
+                <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                  <span style={{ fontSize:10, fontFamily:'monospace', fontWeight:700,
+                    letterSpacing:'0.13em', textTransform:'uppercase', color:col }}>
+                    {avatarState.replace(/_/g,' ')}
+                  </span>
+                  {speaking && (
+                    <div style={{ display:'flex', gap:2, alignItems:'flex-end', height:10 }}>
+                      {[0,1,2].map(i => (
+                        <div key={i} style={{ width:2.5, height:4+i*3, borderRadius:2,
+                          background:col, animation:`mWave 0.8s ${i*0.15}s ease-in-out infinite` }} />
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <p style={{ textAlign:'center', fontSize:13, color:'rgba(255,255,255,0.52)',
+                  lineHeight:1.5, margin:0, maxWidth:272,
+                  display:'-webkit-box', WebkitLineClamp:2,
+                  WebkitBoxOrient:'vertical' as any, overflow:'hidden' }}>
+                  {narration || 'Watching the tape\u2026'}
+                </p>
+              </>
+            );
+          })()}
+        </div>
+      </div>
 
       {/* Edge score */}
       <Card><EdgeBar score={edge} color={color === MUTED ? BLUE : color} /></Card>
@@ -1120,9 +1152,9 @@ function BrainTab({ data }: { data: any }) {
 }
 
 // ── Big Avatar orb ────────────────────────────────────────────────────────────
-function BigAvatar({ state, speaking, listening, thinking, onTap }: {
-  state: string; speaking: boolean; listening: boolean; thinking: boolean;
-  onTap: () => void;
+function BigAvatar({ state, speaking, listening = false, thinking = false, onTap, size = 136 }: {
+  state: string; speaking: boolean; listening?: boolean; thinking?: boolean;
+  onTap?: () => void; size?: number;
 }) {
   const col = state === 'READY_LONG'  ? BULL
     : state === 'READY_SHORT' ? BEAR
@@ -1131,10 +1163,10 @@ function BigAvatar({ state, speaking, listening, thinking, onTap }: {
     : '#4b5563';
   const bright = ['READY_LONG','READY_SHORT','ACTIVE','ANALYZING','FORMING'].includes(state);
   const ringCol = listening ? '#ef4444' : col;
-  const S = 136;
+  const S = size;
   return (
     <div onClick={onTap}
-      style={{ position:'relative', width:S, height:S, cursor:'pointer', flexShrink:0,
+      style={{ position:'relative', width:S, height:S, cursor: onTap ? 'pointer' : 'default', flexShrink:0,
         WebkitTapHighlightColor:'transparent' }}>
       {/* Outermost breathing halo */}
       <div style={{ position:'absolute', inset:-20, borderRadius:'50%',
