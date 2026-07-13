@@ -1523,18 +1523,38 @@ const VOICE_BANK: Record<string, string[]> = {
     'Neutral until one side proves itself. No directional edge right now.',
     'I do not chase. I wait. The setup has to come to me.',
     'Tape looks indecisive. Institutions are not showing their hand yet.',
+    'No break of structure confirmed yet. Watching for the market to tip its hand.',
+    'Price is oscillating around vee-wap. No directional commitment from either side.',
+    'Neither buyers nor sellers are committing. I will not trade a choppy tape.',
+    'The demand zone is nearby but I am not seeing absorption yet.',
+    'Bias is neutral. Without a directional lean, there is nothing worth trading.',
+    'Edge score is below my threshold right now. Quality over quantity — always.',
+    'Watching the recent swing level for any sign of institutional reaction.',
+    'I need a break of structure before I start building a thesis here.',
+    'Volume is confirming nothing. Sitting on my hands until one side steps up.',
+    'Looking for smart money to show their position before I commit.',
   ],
   ANALYZING: [
     'Some signals are aligning. Watching carefully for confirmation.',
     'Score is building. Not there yet — but worth watching closely.',
     'Early signs of a potential setup. Monitoring for the next signal.',
     'Edge beginning to develop. Still missing a couple of key conditions.',
-    'Conditions improving. CVD and structure starting to agree.',
+    'Conditions improving. Delta and structure starting to agree.',
     'Something may be setting up here. Staying alert.',
     'Order flow is showing some interest. Needs more development.',
     'Market is showing early tells. Need a few more bars to confirm.',
     'Starting to like what I see. Not committing yet though.',
     'Score is creeping up. Keeping this one on my radar.',
+    'Watching for a clean break above the recent swing high. That would confirm structure.',
+    'Price compressing near vee-wap. A move is coming — watching for the direction.',
+    'Delta is starting to show buying interest but volume has not confirmed yet.',
+    'The demand zone is holding but I need to see buyers defend it with conviction.',
+    'Edge is climbing but I am still below my entry threshold. Staying patient.',
+    'Seeing a change of character developing. Monitoring for structure to confirm.',
+    'Cumulative delta is improving. If structure breaks, this becomes a real setup.',
+    'Price is respecting the key level. Watching how it handles the next test.',
+    'Order flow is mixed right now. I want to see cleaner conviction before acting.',
+    'Regime is improving. Score could cross the threshold on the next signal.',
   ],
   FORMING: [
     'Setup is developing. Edge building toward the confirmation threshold.',
@@ -1547,6 +1567,16 @@ const VOICE_BANK: Record<string, string[]> = {
     'Order flow cooperating. Zone activation would seal this setup.',
     'I can feel this one developing. Waiting for the green light.',
     'All the pieces are moving into place. Just need the final signal.',
+    'Break of structure confirmed. Watching for the pullback into the demand zone.',
+    'Change of character detected. The sellers are losing control at this level.',
+    'Structure has shifted. Waiting for the zone to be tagged and hold.',
+    'Cumulative delta is showing strong buying pressure. Score approaching my threshold.',
+    'Vee-wap has been reclaimed. Bulls are now in control of the intraday move.',
+    'Higher timeframe bias is aligned with short-term structure. Confidence is building.',
+    'Liquidity was swept at the recent low. Watching for a strong reaction and hold.',
+    'The setup is forming well. Missing one more gate — watching for it now.',
+    'I see structure, I see the zone, I see improving delta. Nearly there.',
+    'Score just crossed into the building zone. High alert — watching every bar now.',
   ],
   READY_LONG: [
     'Long setup confirmed. All gates green. Execution window is open.',
@@ -1555,10 +1585,15 @@ const VOICE_BANK: Record<string, string[]> = {
     'Long entry criteria fully met. Risk to reward is favorable.',
     'All gate conditions satisfied on the long side. This is what I wait for.',
     'Demand zone holding with bullish delta and clean structure. Long bias locked in.',
-    'Price above VWAP with structure and zone confirmed. Long setup is live.',
+    'Price above vee-wap with structure and zone confirmed. Long setup is live.',
     'Full confidence on the long side right now. Waiting for execution.',
     'This is a textbook long setup. Clean entry, defined risk, strong edge.',
     'Long edge at peak confidence. Every signal is in agreement.',
+    'Demand zone absorbed the sellers. Buyers are stepping in with real conviction.',
+    'Structure confirmed above vee-wap with strong delta. This is exactly what I look for.',
+    'All gate conditions satisfied. Smart money has absorbed the liquidity. Long is live.',
+    'The sweep into demand held. Buyers defended aggressively. Long setup is clean.',
+    'Everything is aligned on the long side. Structure, zone, flow, and vee-wap. Waiting.',
   ],
   READY_SHORT: [
     'Short setup confirmed. All gates green. Execution window is open.',
@@ -1566,11 +1601,15 @@ const VOICE_BANK: Record<string, string[]> = {
     'Short entry criteria fully met. Risk is defined. Confidence is high.',
     'Supply zone holding with bearish delta and confirmed structure. Short bias locked in.',
     'All conditions satisfied on the short side. This is the setup I was waiting for.',
-    'Price below VWAP, structure confirmed bearish, zone active. Short setup is live.',
+    'Price below vee-wap, structure confirmed bearish, zone active. Short setup is live.',
     'Short setup at peak confidence. All signals are in full agreement.',
     'Highest probability short of the session. Execution window is open.',
     'Textbook short. Clean supply zone, bearish delta, structure confirmed.',
     'Full conviction on the short side. Waiting for execution.',
+    'Supply zone rejected price hard. Sellers are defending aggressively. Short is on.',
+    'Structure broke bearish with negative delta and volume. Short setup is confirmed.',
+    'Everything is aligned on the short side. All gates green. Waiting for execution.',
+    'The sweep into supply held perfectly. Sellers stepped in with conviction. Short is live.',
   ],
   ACTIVE: [
     'Position is live. Monitoring every tick for thesis confirmation or invalidation.',
@@ -1580,9 +1619,15 @@ const VOICE_BANK: Record<string, string[]> = {
     'Live trade. Price behaving as expected. Staying disciplined.',
     'Watching for the first target level. Stop is set. No second-guessing.',
     'Trade is on. The setup was textbook — trusting the process here.',
-    'Managing the position. Will adjust stop to break-even if momentum holds.',
+    'Managing the position. Will adjust stop to break even if momentum holds.',
     'Thesis intact. Price moving in our direction. Letting it run.',
     'Open position. Monitoring structure and delta for any invalidation.',
+    'Vee-wap is holding as support below entry. That is a good sign for the thesis.',
+    'Trade progressing as planned. Watching for structure to hold on any pullback.',
+    'Delta continues to confirm the move. No signs of reversal yet.',
+    'Tracking price toward the first target. Position is behaving exactly as modeled.',
+    'In the trade and focused. Thesis is intact — do not overthink this.',
+    'Stop is protected. Let the market do its job. I will manage if needed.',
   ],
   TARGET_HIT: [
     'Target hit. Trade profitable. Exactly what the setup called for.',
@@ -1593,6 +1638,8 @@ const VOICE_BANK: Record<string, string[]> = {
     'Profit secured. The setup was textbook. Resetting for the next opportunity.',
     'Winner in the books. That is what happens when you wait for the right edge.',
     'Target hit. No luck involved — that was skill and patience combined.',
+    'Clean win. The setup, the entry, the management — all executed correctly.',
+    'Trade worked exactly as planned. That is what the process looks like.',
   ],
   STOP_HIT: [
     'Stopped out. Loss is taken. Risk was defined — no damage beyond the plan.',
@@ -1602,7 +1649,9 @@ const VOICE_BANK: Record<string, string[]> = {
     'Loss booked. Clean risk management. Back to observation mode now.',
     'Stop hit. One loss does not define the edge. Looking for the next setup.',
     'Trade did not work out. Cut the loss quickly. That is the discipline.',
-    'Stopped out. Re-evaluating market conditions. Back to analysis mode.',
+    'Stopped out. Re-evaluating conditions. Back to analysis mode.',
+    'The market said no. I respected that with a defined stop. Moving on.',
+    'Loss taken cleanly. Setup was valid. Sometimes the market has other plans.',
   ],
   NO_EDGE: [
     'Edge score too low to act. Completely standing aside.',
@@ -1610,6 +1659,8 @@ const VOICE_BANK: Record<string, string[]> = {
     'Market structure is weak. Not worth the risk at these levels.',
     'Zero edge on any instrument right now. Watching only.',
     'Unfavorable conditions across the board. Capital stays on the sideline.',
+    'Nothing is setting up. I would rather miss a trade than take a bad one.',
+    'The score does not support a trade. Watching for the environment to improve.',
   ],
 };
 
@@ -1852,6 +1903,7 @@ export default function Home() {
   const priceBaseRef  = useRef<number>(0);
   const speakRef          = useRef<(t: string) => void>(() => {});
   const lastSpokenRef     = useRef('');
+  const lastSpokeAtRef    = useRef(0);
   const askVoiceRef       = useRef<(t: string) => void>(() => {});
   const voiceListeningRef = useRef(false);
   // Gaze event detection — track previous poll values to detect transitions
@@ -2097,24 +2149,64 @@ export default function Home() {
   })();
 
   useEffect(() => {
-    if (narration && narration !== lastSpokenRef.current) { lastSpokenRef.current = narration; speakRef.current(narration); }
+    if (narration && narration !== lastSpokenRef.current) {
+      lastSpokenRef.current = narration;
+      lastSpokeAtRef.current = Date.now();
+      speakRef.current(narration);
+    }
   }, [narration]);
 
-  // Periodic ambient commentary — cycles through VOICE_BANK every 40-80 s
-  // so the avatar never goes silent for long even when backend narration is stable
-  const avStateRef = useRef(avState);
+  // Periodic ambient commentary — fires every 55-90s but ONLY when silent 45+ seconds
+  // Generates context-aware lines from live data; VOICE_BANK is the fallback.
+  const avStateRef   = useRef(avState);
+  const cockpitRef   = useRef({ data, edge, avState });
   useEffect(() => { avStateRef.current = avState; }, [avState]);
+  useEffect(() => { cockpitRef.current = { data, edge, avState }; }, [data, edge, avState]);
   useEffect(() => {
     let tid: ReturnType<typeof setTimeout>;
     const fire = () => {
-      const line = pickVoiceLine(avStateRef.current);
-      if (line !== lastSpokenRef.current) {
-        lastSpokenRef.current = line;
-        speakRef.current(line);
+      const silentMs = Date.now() - lastSpokeAtRef.current;
+      if (silentMs >= 45000) {
+        const { data: d, edge: eg, avState: st } = cockpitRef.current;
+        const px  = Number(d?.price          || 0);
+        const vw  = Number(d?.vwap_value     || 0);
+        const dem = Number(d?.nearest_demand || 0);
+        const sup = Number(d?.nearest_supply || 0);
+        const gd  = (d?.gate_debug        || {}) as Record<string,any>;
+        const ad  = (d?.alert_diagnostics || {}) as Record<string,any>;
+        const cv  = String(ad.cvd  || '').toLowerCase();
+        const vol = String(ad.volume || '').toLowerCase();
+        const sc  = !!gd.structure_confirmed;
+        const zv  = !!gd.zone_valid;
+        const egR = Math.round(eg);
+        const ctx: string[] = [];
+        if (px > 0 && vw > 0) {
+          const diff = ((Math.abs(px - vw) / vw) * 100).toFixed(2);
+          ctx.push(px > vw
+            ? `Price is trading ${diff} percent above vee-wap. Bulls are holding above the key intraday level.`
+            : `Price is ${diff} percent below vee-wap. Sellers are in control of the intraday structure.`);
+        }
+        if (zv)         ctx.push('The key zone is active. Watching closely for a reaction and confirmation signal.');
+        if (dem > 0 && !zv) ctx.push('Watching the demand zone below. That is the level that could trigger a long setup.');
+        if (sup > 0 && !zv) ctx.push('Supply overhead is the main obstacle right now. Bulls need to clear that level.');
+        if (sc && !zv)  ctx.push('Structure is confirmed. Waiting for the zone to complete the full setup.');
+        if (!sc)        ctx.push('No confirmed break of structure yet. That is the primary signal I am waiting for.');
+        if (/bull|pos/.test(cv)) ctx.push('Cumulative delta is bullish. Buyers are active in the order flow right now.');
+        if (/bear|neg/.test(cv)) ctx.push('Cumulative delta is bearish. Sellers are controlling the tape.');
+        if (/strong|high/.test(vol)) ctx.push('Volume is elevated. Real institutional participation is showing up.');
+        if (/low|thin/.test(vol))    ctx.push('Volume is light right now. I want to see more participation before acting.');
+        if (egR > 0) ctx.push(`Edge score is at ${egR} out of 110. ${egR >= 75 ? 'That is above my entry threshold.' : egR >= 50 ? 'Getting closer — watching for the final signals.' : 'Not enough edge to trade yet.'}`);
+        const pool = ctx.length > 0 ? ctx : [pickVoiceLine(st)];
+        const line = pool[Math.floor(Math.random() * pool.length)];
+        if (line !== lastSpokenRef.current) {
+          lastSpokenRef.current = line;
+          lastSpokeAtRef.current = Date.now();
+          speakRef.current(line);
+        }
       }
-      tid = setTimeout(fire, 40000 + Math.random() * 40000);
+      tid = setTimeout(fire, 55000 + Math.random() * 35000);
     };
-    tid = setTimeout(fire, 50000 + Math.random() * 30000);
+    tid = setTimeout(fire, 65000 + Math.random() * 25000);
     return () => clearTimeout(tid);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -2602,13 +2694,14 @@ export default function Home() {
                     flex:1, background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.07)',
                     borderRadius:6, padding:'3px 6px', color:'rgba(255,255,255,0.45)', fontSize:9.5,
                     fontFamily:'monospace', cursor:'pointer', outline:'none' }}>
-                    {voices
-                      .filter(v => v.lang.startsWith('en'))
-                      .map(v => (
-                        <option key={v.name} value={v.name} style={{ background:'#111' }}>
-                          {v.name}
-                        </option>
-                      ))}
+                    {[
+                      ...voices.filter(v => v.lang.startsWith('en')),
+                      ...voices.filter(v => !v.lang.startsWith('en')),
+                    ].map(v => (
+                      <option key={v.name} value={v.name} style={{ background:'#111' }}>
+                        {v.name}{!v.lang.startsWith('en') ? ` (${v.lang})` : ''}
+                      </option>
+                    ))}
                   </select>
                   <button title="Preview voice" onClick={() => {
                     const ss = window.speechSynthesis; if (!ss) return;
