@@ -39858,7 +39858,8 @@ def dashboard():
   .blh-obs-tbl td{padding:5px 6px;border-bottom:1px solid rgba(125,140,255,.06)}
   .blh-obs-tbl tr:last-child td{border-bottom:none}
   .blh-obs-tbl td:first-child{color:#6b7280;text-transform:uppercase;letter-spacing:.5px;font-size:10px;white-space:nowrap;width:36%}
-  .blh-obs-tbl td:last-child{color:#c8d0f0;text-align:right;font-weight:600}
+  .blh-obs-tbl td:nth-child(2){color:#c8d0f0;font-weight:700;white-space:nowrap;padding-left:8px}
+  .blh-obs-tbl td:last-child{color:#4b5563;text-align:right;font-size:10px;font-style:italic;padding-left:6px}
   .blh-pills{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(125,140,255,.18);color:#6b7280;background:rgba(255,255,255,.03);text-transform:uppercase}
   .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
@@ -39869,6 +39870,9 @@ def dashboard():
   .blh-wave-bar:nth-child(2){animation-delay:.1s}.blh-wave-bar:nth-child(3){animation-delay:.2s}.blh-wave-bar:nth-child(4){animation-delay:.3s}.blh-wave-bar:nth-child(5){animation-delay:.4s}.blh-wave-bar:nth-child(6){animation-delay:.5s}.blh-wave-bar:nth-child(7){animation-delay:.6s}
   @keyframes blhWave{0%,100%{transform:scaleY(.25);opacity:.25}50%{transform:scaleY(1);opacity:.65}}
   #blh-wf-label{text-align:center;font-size:8.5px;letter-spacing:2px;color:#374151;text-transform:uppercase;margin-bottom:4px;font-family:var(--sans)}
+  #blh-current-take{font-size:11px;color:#7c8ba8;line-height:1.55;padding:8px 11px;border-radius:7px;background:rgba(255,255,255,.022);border-left:2px solid rgba(125,140,255,.22);margin-bottom:9px}
+  #blh-speak-btn{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;padding:6px 0;border:1px solid rgba(125,140,255,.18);border-radius:8px;background:rgba(125,140,255,.06);color:#5b6a8a;font-size:10.5px;font-family:var(--sans);letter-spacing:.6px;cursor:pointer;margin-top:5px;transition:background .18s,color .18s}
+  #blh-speak-btn:hover{background:rgba(125,140,255,.13);color:#c8d0f0}
   /* ── Left column avatar + market context ── */
   .bl-av-wrap{text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(125,140,255,.08);margin-bottom:10px}
   .bl-av-svg{width:70px;height:93px;margin:0 auto 5px;display:block;filter:drop-shadow(0 0 10px rgba(82,224,255,.28))}
@@ -40543,12 +40547,13 @@ def dashboard():
     </div>
     <div class="blh-section-h">KEY OBSERVATIONS</div>
     <table class="blh-obs-tbl">
-      <tr><td>Order Flow</td><td id="blh-obs-flow">—</td></tr>
-      <tr><td>Structure</td><td id="blh-obs-struct">—</td></tr>
-      <tr><td>Zone</td><td id="blh-obs-zone">—</td></tr>
-      <tr><td>Volatility</td><td id="blh-obs-vol">—</td></tr>
-      <tr><td>Conditions</td><td id="blh-obs-cond">—</td></tr>
+      <tr><td>Order Flow</td><td id="blh-obs-flow">\u2014</td><td id="blh-obs-flow-n"></td></tr>
+      <tr><td>Watching</td><td id="blh-obs-watch">\u2014</td><td id="blh-obs-watch-n"></td></tr>
+      <tr><td>Liquidity</td><td id="blh-obs-liq">\u2014</td><td id="blh-obs-liq-n"></td></tr>
+      <tr><td>Volatility</td><td id="blh-obs-vol">\u2014</td><td id="blh-obs-vol-n"></td></tr>
+      <tr><td>Conditions</td><td id="blh-obs-cond">\u2014</td><td id="blh-obs-cond-n"></td></tr>
     </table>
+    <div id="blh-current-take">Reading market conditions\u2026</div>
     <div class="blh-pills" id="blh-pills"></div>
     <div id="blh-waveform">
       <div class="blh-wave-bar" style="height:8px"></div>
@@ -40560,6 +40565,7 @@ def dashboard():
       <div class="blh-wave-bar" style="height:8px"></div>
     </div>
     <div id="blh-wf-label">WAITING FOR SETUP</div>
+    <button id="blh-speak-btn">\u25b6 Speak</button>
   </div>
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
@@ -49935,16 +49941,32 @@ function renderBLPanels(d){
   var hstructOk=hdiag.structure_ok||hdiag.structure;
   var hzoneOk=hdiag.zone_ok||hdiag.zone;
   var hvolReg=String(d.volatility||d.vol_regime||hdiag.vol_regime||'');
-  var obsFlow=document.getElementById('blh-obs-flow');
-  var obsStruct=document.getElementById('blh-obs-struct');
-  var obsZone=document.getElementById('blh-obs-zone');
-  var obsVol=document.getElementById('blh-obs-vol');
-  var obsCond=document.getElementById('blh-obs-cond');
-  if(obsFlow)obsFlow.textContent=hcvdDir?hcvdDir.toUpperCase():'\u2014';
-  if(obsStruct)obsStruct.textContent=hstructOk?(hstructOk===true?'PRESENT':String(hstructOk)):'NONE';
-  if(obsZone)obsZone.textContent=hzoneOk?(hzoneOk===true?'ACTIVE':String(hzoneOk)):'NONE';
+  var obsFlow=document.getElementById('blh-obs-flow');var obsFlowN=document.getElementById('blh-obs-flow-n');
+  var obsWatch=document.getElementById('blh-obs-watch');var obsWatchN=document.getElementById('blh-obs-watch-n');
+  var obsLiq=document.getElementById('blh-obs-liq');var obsLiqN=document.getElementById('blh-obs-liq-n');
+  var obsVol=document.getElementById('blh-obs-vol');var obsVolN=document.getElementById('blh-obs-vol-n');
+  var obsCond=document.getElementById('blh-obs-cond');var obsCondN=document.getElementById('blh-obs-cond-n');
+  var flowLbl=hcvdDir?hcvdDir.toUpperCase():'\u2014';
+  var flowNote=hcvdDir?(hcvdDir.toLowerCase().indexOf('bull')!==-1?'Bullish delta':'Bearish delta'):'';
+  if(obsFlow)obsFlow.textContent=flowLbl;if(obsFlowN)obsFlowN.textContent=flowNote;
+  var nearDemW=d.nearest_demand||null;var nearSupW=d.nearest_supply||null;
+  var watchDem=nearDemW&&nearDemW.high?Number(nearDemW.high).toFixed(2):(nearDemW&&typeof nearDemW==='number'?Number(nearDemW).toFixed(2):null);
+  var watchSup=nearSupW&&nearSupW.low?Number(nearSupW.low).toFixed(2):(nearSupW&&typeof nearSupW==='number'?Number(nearSupW).toFixed(2):null);
+  var watchLvl=watchDem||watchSup||'\u2014';
+  var watchNote=watchDem?'For a demand reaction':(watchSup?'For a supply reaction':'No key level');
+  if(obsWatch)obsWatch.textContent=watchLvl;if(obsWatchN)obsWatchN.textContent=watchNote;
+  var liqSrc=d.liquidity_status||(hdiag&&hdiag.liquidity)||null;
+  var liqLbl=liqSrc?String(liqSrc).toUpperCase():(swpAge!=null&&Number(swpAge)<3?'ACTIVE SWEEP':'\u2014');
+  var liqNote=swpAge!=null?'Last sweep '+Math.round(Number(swpAge))+'m ago':'No recent sweep';
+  if(obsLiq)obsLiq.textContent=liqLbl;if(obsLiqN)obsLiqN.textContent=liqNote;
   if(obsVol)obsVol.textContent=hvolReg?hvolReg.toUpperCase():'NORMAL';
-  if(obsCond){var hgd=d.gate_debug||{};obsCond.textContent=hgd.blocking_reason||(v.indexOf('READY')!==-1?'Setup confirmed':(d.strict_reason||'Building setup').split('.')[0]);}
+  var atrPts=d.atr||(hdiag&&hdiag.atr)||null;if(obsVolN)obsVolN.textContent=atrPts?'ATR '+Number(atrPts).toFixed(1)+'pts':'ATR regime';
+  var hgd=d.gate_debug||{};
+  var condLbl=hgd.blocking_reason||(v.indexOf('READY')!==-1?'ALIGNED':(d.strict_reason||'NOT ALIGNED').split('.')[0]);
+  var condNote=v.indexOf('READY')!==-1?'Setup confirmed':'Waiting for confluence';
+  if(obsCond){obsCond.textContent=condLbl.length>18?condLbl.slice(0,17)+'\u2026':condLbl;}if(obsCondN)obsCondN.textContent=condNote;
+  var ctEl=document.getElementById('blh-current-take');
+  if(ctEl){var ctParts=[];if(watchLvl&&watchLvl!=='\u2014')ctParts.push('Watching '+watchLvl);if(edge>0)ctParts.push('Edge '+edge+'/110');var ctR=(d.strict_reason||d.reason||'');if(ctR)ctParts.push(ctR.split('.')[0]);ctEl.textContent=ctParts.length?ctParts.join('. ')+'.':'Reading market conditions\u2026';}
   var pillsEl=document.getElementById('blh-pills');
   if(pillsEl){var hgd2=d.gate_debug||{};var pills=[];if(hgd2.structure===false||hgd2.structure==='FAIL')pills.push({t:'No structure',c:'fail'});else if(hstructOk)pills.push({t:'Structure',c:'ok'});if(hgd2.zone===false||hgd2.zone==='FAIL')pills.push({t:'No zone',c:'warn'});else if(hzoneOk)pills.push({t:'Zone',c:'ok'});if(hcvdDir)pills.push({t:hcvdDir.toUpperCase(),c:hcvdDir.toLowerCase().indexOf('bull')!==-1?'ok':hcvdDir.toLowerCase().indexOf('bear')!==-1?'fail':'warn'});if(!pills.length)pills.push({t:v,c:v.indexOf('READY')!==-1?'ok':'warn'});pillsEl.innerHTML=pills.map(function(p){return '<span class="blh-pill '+p.c+'">'+p.t+'</span>';}).join('');}
   var wfEl=document.getElementById('blh-waveform');var wfLbl=document.getElementById('blh-wf-label');
