@@ -2015,12 +2015,34 @@ export default function Home() {
     setConfirming(false);
     const dir = /short|bear/i.test(dirn) ? 'short' : 'long';
     try {
-      const r = await fetch('/api/enter', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json', ...authHeader}, body:JSON.stringify({ ticker, direction: dir }) });
-      if (r.ok) { setTradeSent('✓ Order sent'); memAddEntry('trade', 'ENTERED ' + dir.toUpperCase() + ' ' + ticker + ' at market'); }
-      else {
-        const body = await r.json().catch(() => ({}));
-        setTradeSent('✗ ' + (body?.reason || body?.error || 'Send failed'));
+      // Step 1: broker gateway — the actual execution path (same as Flask dashboard)
+      const gw = await fetch('/api/traderspost', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+        body: JSON.stringify({ ticker: ticker + '1!', contracts: 1 }),
+      });
+      const gwBody = await gw.json().catch(() => ({}));
+      const st = gwBody?.status;
+      if (st === 'sent') {
+        setTradeSent('✓ Order sent to broker');
+        memAddEntry('trade', 'ENTERED ' + dir.toUpperCase() + ' ' + ticker + ' at market');
+      } else if (st === 'simulated') {
+        setTradeSent('✓ Paper order simulated');
+        memAddEntry('trade', 'PAPER ' + dir.toUpperCase() + ' ' + ticker);
+      } else if (st === 'manual_required') {
+        setTradeSent('📋 ' + (gwBody?.message || 'Place this order manually on your broker'));
+        memAddEntry('trade', 'PLAN ' + dir.toUpperCase() + ' ' + ticker);
+      } else {
+        setTradeSent('✗ ' + (gwBody?.reason || gwBody?.error || 'Gateway error'));
+        setTimeout(() => setTradeSent(null), 6000);
+        return;
       }
+      // Step 2: local tracking — records trade on bot dashboard + Discord
+      await fetch('/api/enter', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...authHeader },
+        body: JSON.stringify({ ticker, direction: dir }),
+      }).catch(() => {});
     } catch { setTradeSent('✗ Network error'); }
     setTimeout(() => setTradeSent(null), 6000);
   };
