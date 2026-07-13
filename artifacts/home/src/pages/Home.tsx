@@ -2280,9 +2280,9 @@ export default function Home() {
   }, [narration]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Idle chatter + market commentary timer
-  // Fires every 12-20s (idle states) or 22-38s (forming/analyzing).
-  // Silence guard is 8s so it never interrupts an ongoing TTS utterance.
-  // Picks jokes/questions/banter ~65% of the time; market context ~35%.
+  // Fires every 45-75s (idle) / 55-90s (forming) / 100-130s (active).
+  // Silence guard bumped to 30s so it doesn't interrupt ongoing speech.
+  // No QUESTIONS pool — questions are intrusive when you're watching a live chart.
   const avStateRef   = useRef(avState);
   const cockpitRef   = useRef({ data, edge, avState });
   const setIdleLineRef = useRef(setIdleLine);
@@ -2296,12 +2296,12 @@ export default function Home() {
       const silentMs  = Date.now() - lastSpokeAtRef.current;
       const isIdle    = st === 'WAIT' || st === 'NO_EDGE';
       const isActive  = st === 'ACTIVE' || st === 'READY_LONG' || st === 'READY_SHORT';
-      const silenceMs = isIdle ? 8000 : isActive ? 20000 : 12000;
+      const silenceMs = 30000; // 30s guard — never cut across an ongoing utterance
       const nextMs    = isIdle
-        ? 12000 + Math.random() * 8000   // 12-20 s when idle
+        ? 45000 + Math.random() * 30000  // 45-75 s when idle
         : isActive
-          ? 30000 + Math.random() * 20000 // 30-50 s during live trade
-          : 22000 + Math.random() * 16000; // 22-38 s while forming
+          ? 100000 + Math.random() * 30000 // 100-130 s during live trade
+          : 55000 + Math.random() * 35000; // 55-90 s while forming
 
       if (silentMs >= silenceMs) {
         // Build market context pool
@@ -2334,14 +2334,12 @@ export default function Home() {
         if (/low|thin/.test(vol))    ctx.push('Volume is light right now. I want to see more participation before acting.');
         if (egR > 0) ctx.push(`Edge score is at ${egR} out of 110. ${egR >= 75 ? 'That is above my entry threshold.' : egR >= 50 ? 'Getting closer — watching for the final signals.' : 'Not enough edge to trade yet.'}`);
 
-        // Weighted category roll — jokes/questions/banter dominate for personality
+        // Weighted roll — personality only; no questions (intrusive mid-session)
         const roll = Math.random();
         let line: string;
-        if (roll < 0.28) {
+        if (roll < 0.30) {
           line = _pickCycling(JOKES, '__jokes');
-        } else if (roll < 0.55) {
-          line = _pickCycling(QUESTIONS, '__questions');
-        } else if (roll < 0.72) {
+        } else if (roll < 0.70) {
           line = _pickCycling(BANTER, '__banter');
         } else {
           const pool = ctx.length > 0 ? ctx : [pickVoiceLine(st)];
@@ -2357,8 +2355,8 @@ export default function Home() {
       }
       tid = setTimeout(fire, nextMs);
     };
-    // First fire after a short warm-up so the page feels alive quickly
-    tid = setTimeout(fire, 10000 + Math.random() * 8000);
+    // First fire after a longer warm-up — page settles before avatar speaks
+    tid = setTimeout(fire, 60000 + Math.random() * 30000);
     return () => clearTimeout(tid);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
