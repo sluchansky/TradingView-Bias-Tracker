@@ -775,6 +775,105 @@ function PlanRow({ label, value, color, icon, note, isFirst, isLast }: {
   );
 }
 
+// ── Stalk mode card ───────────────────────────────────────────────────────────
+function fmtZone(v: any): string {
+  if (v == null) return '—';
+  if (Array.isArray(v) && v.length >= 2) return `${fmt(v[0])}–${fmt(v[1])}`;
+  const n = Number(v);
+  return isNaN(n) ? String(v) : fmt(n);
+}
+
+function StalkCard({ data }: { data: any }) {
+  const sm = data?.stalk_mode;
+  if (!sm?.enabled) return null;
+  const state = sm.state as string;
+  if (state !== 'stalking' && state !== 'engine_entering') return null;
+
+  const isShort  = sm.direction === 'Short';
+  const accent   = isShort ? BEAR : BULL;
+  const dirLabel = sm.direction ?? '—';
+  const bias     = sm.bias ?? 'Neutral';
+  const rrRaw    = sm.rr;
+  const rrLabel  = rrRaw != null ? `1:${Number(rrRaw).toFixed(1)}` : '—';
+  const why: string[] = Array.isArray(sm.why_waiting) ? sm.why_waiting.filter(Boolean) : [];
+
+  return (
+    <div style={{
+      background: `linear-gradient(135deg, ${accent}0a 0%, rgba(6,8,16,0.92) 65%)`,
+      border: `1.5px solid ${accent}35`,
+      borderRadius: 16,
+      padding: '14px 16px',
+      position: 'relative',
+      overflow: 'hidden',
+    }}>
+      {/* Corner glow */}
+      <div style={{ position:'absolute', top:0, right:0, width:90, height:90,
+        background:`radial-gradient(circle at 80% 10%, ${accent}18, transparent 65%)`,
+        pointerEvents:'none' }} />
+
+      {/* Header */}
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+          <span style={{ fontSize:14 }}>🕵</span>
+          <span style={{ fontSize:10, fontFamily:'monospace', fontWeight:800,
+            letterSpacing:'0.12em', textTransform:'uppercase', color: accent }}>STALK MODE</span>
+        </div>
+        <span style={{ fontSize:8.5, fontFamily:'monospace', fontWeight:700,
+          letterSpacing:'0.09em', textTransform:'uppercase', padding:'3px 8px',
+          borderRadius:8, background:`${accent}14`, border:`1px solid ${accent}28`,
+          color:`${accent}bb` }}>PRE-ENTRY · ADVISORY</span>
+      </div>
+
+      {/* Summary */}
+      {sm.summary && (
+        <p style={{ fontSize:12.5, fontStyle:'italic', lineHeight:1.55, margin:'0 0 12px',
+          color:'rgba(255,255,255,0.68)', borderLeft:`2px solid ${accent}50`, paddingLeft:10 }}>
+          {sm.summary}
+        </p>
+      )}
+
+      {/* Info grid */}
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom: why.length ? 10 : 0 }}>
+        {[
+          { label:'Direction',    value: dirLabel, col: accent },
+          { label:'Bias',         value: bias,     col: accent },
+          { label:'Ideal Entry',  value: fmtZone(sm.ideal_entry_zone), col:'rgba(255,255,255,0.80)' },
+          { label:'Pullback Area',value: fmtZone(sm.pullback_area),    col:'rgba(255,255,255,0.65)' },
+          { label:'Liq. Target',  value: sm.liquidity_target != null ? fmt(Number(sm.liquidity_target)) : '—', col: accent },
+          { label:'R:R',          value: rrLabel, col: AMB },
+        ].map(({ label: lbl, value, col }) => (
+          <div key={lbl} style={{ background:'rgba(255,255,255,0.04)', borderRadius:8,
+            padding:'8px 10px', border:'1px solid rgba(255,255,255,0.07)' }}>
+            <div style={{ fontSize:8.5, fontFamily:'monospace', letterSpacing:'0.09em',
+              textTransform:'uppercase', color:'rgba(255,255,255,0.32)', marginBottom:3 }}>{lbl}</div>
+            <div style={{ fontSize:13, fontFamily:'monospace', fontWeight:700, color: col }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Why Waiting */}
+      {why.length > 0 && (
+        <div style={{ borderTop:'1px solid rgba(255,255,255,0.07)', paddingTop:10 }}>
+          <div style={{ fontSize:9, fontFamily:'monospace', letterSpacing:'0.09em',
+            textTransform:'uppercase', color:'rgba(255,255,255,0.30)', marginBottom:6 }}>Why Waiting</div>
+          {why.map((w, i) => (
+            <div key={i} style={{ display:'flex', gap:7, marginBottom: i < why.length-1 ? 5 : 0 }}>
+              <span style={{ color:`${accent}80`, fontSize:11, flexShrink:0, marginTop:1 }}>›</span>
+              <span style={{ fontSize:12, color:'rgba(255,255,255,0.55)', lineHeight:1.5 }}>{w}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Disclaimer */}
+      <p style={{ fontSize:10, fontStyle:'italic', color:'rgba(255,255,255,0.22)',
+        margin:'10px 0 0', lineHeight:1.4, textAlign:'center' }}>
+        Pre-entry observation only — never places or influences a trade.
+      </p>
+    </div>
+  );
+}
+
 // ── Signal tab ────────────────────────────────────────────────────────────────
 function SignalTab({ data, ticker, narration, avatarState, speaking }: {
   data: any; ticker: Ticker; narration: string; avatarState: string; speaking: boolean;
@@ -803,6 +902,9 @@ function SignalTab({ data, ticker, narration, avatarState, speaking }: {
 
       {/* ── TRADE PLAN: shown prominently when READY ── */}
       {isReady && data?.trade_plan && <TradePlanCard data={data} />}
+
+      {/* ── STALK MODE: shown while a setup is forming (pre-READY) ── */}
+      <StalkCard data={data} />
 
       {/* Avatar bar */}
       <AvatarStatusBar state={avatarState} narration={narration} speaking={speaking} />
