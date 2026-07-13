@@ -2927,7 +2927,7 @@ export default function Home() {
                 <span style={{ fontSize:12 }}>🎭</span>
                 <span style={{ fontSize:9.5, color:'rgba(255,255,255,0.38)', fontFamily:'monospace', flex:1 }}>Avatar</span>
                 <span style={{ fontSize:8.5, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>
-                  {({'/LordPiggington.vrm':'LordPiggington','/MaxHax.vrm':'MaxHax','/Orion.vrm':'Orion','/Bizdude.vrm':'Bizdude','/Bruno.vrm':'Bruno','/Steamboat.vrm':'Steamboat','/avatar.vrm':'Default'} as Record<string,string>)[vrmSrc] ?? 'Custom'}
+                  {({'/LordPiggington.vrm':'LordPiggington','/MaxHax.vrm':'MaxHax','/Aurora3.vrm':'Aurora 3','/Aurora4.vrm':'Aurora 4','/Orion.vrm':'Orion','/Bizdude.vrm':'Bizdude','/Bruno.vrm':'Bruno','/Steamboat.vrm':'Steamboat','/avatar.vrm':'Default'} as Record<string,string>)[vrmSrc] ?? 'Custom'}
                 </span>
                 <span style={{ fontSize:10, color:'rgba(255,255,255,0.25)' }}>{showAvatarPicker ? '▲' : '▼'}</span>
               </button>
@@ -2940,6 +2940,8 @@ export default function Home() {
                   {[
                     { label: 'LordPiggington', src: '/LordPiggington.vrm' },
                     { label: 'MaxHax',         src: '/MaxHax.vrm' },
+                    { label: 'Aurora 3',       src: '/Aurora3.vrm' },
+                    { label: 'Aurora 4',       src: '/Aurora4.vrm' },
                     { label: 'Orion',          src: '/Orion.vrm' },
                     { label: 'Bizdude',        src: '/Bizdude.vrm' },
                     { label: 'Bruno',          src: '/Bruno.vrm' },
