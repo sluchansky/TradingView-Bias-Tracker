@@ -1,22 +1,16 @@
 /**
- * LordPiggingtonAvatar — Three.js + @pixiv/three-vrm  (v4 — idle pose fix)
+ * LordPiggingtonAvatar — Three.js + @pixiv/three-vrm  (v5 — locomotion + gestures)
  *
- * KEY FIXES vs v3:
- * ─────────────────
- * 1. boneSmoothRef uses null! + lazy-init guard so it is never re-set on
- *    React re-renders (debug timer was causing 200ms resets mid-lerp).
- * 2. Every bone target function specifies x, y AND z for every bone.
- *    If any axis is undefined the lerp skips it, leaving old gesture values
- *    frozen — that was the "arms stay raised after wave" root cause.
- * 3. idleTargets has ZERO shoulder/upper-arm/forearm/hand X rotation.
- *    Only the Z axis is set (to bring arms from T-pose horizontal to sides).
- *    Breathing lives only in spine/chest/hips — never in arms.
- * 4. talkTargets keeps arms at the same Z as idle; only small X gesture
- *    on the right arm, never raising it above the idle resting level.
- * 5. One-shots (wave/point/think) expire and lerp smoothly back; the idle
- *    loop runs continuously at all times as the base layer.
+ * NEW in v5:
+ * ──────────
+ * 1. Avatar physically walks left/right across the canvas; flips to face the direction
+ *    of travel, drifts back to center when not walking.
+ * 2. Spontaneous roam timer — avatar auto-walks every ~20-35 s when idle (feels alive).
+ * 3. New animation states: 'shrug' and 'fistpump' (one-shots).
+ * 4. Richer talk-gesture cycling: three gesture patterns rotate slowly while speaking.
+ * 5. vrmSrc prop — any VRM URL (or User-provided) can be loaded; effect rebuilds on change.
  *
- * LAYER ORDER (no conflicts):
+ * LAYER ORDER (unchanged):
  *   1. State-machine  → BODY_BONES (never head/neck)
  *   2. Gaze + nod     → head / neck  (additive)
  *   3. Blink          → blink expression
@@ -40,7 +34,7 @@ const W = 420;
 const H = 560;
 
 // ─── Animation state ──────────────────────────────────────────────────────────
-type AnimState = 'idle' | 'talking' | 'walking' | 'pointing' | 'thinking' | 'waving' | 'dancing';
+type AnimState = 'idle' | 'talking' | 'walking' | 'pointing' | 'thinking' | 'waving' | 'dancing' | 'shrug' | 'fistpump';
 interface OneShotMeta { returnTo: AnimState; endT: number; }
 
 // All three axes always present — prevents partial lerp leaving a bone frozen
@@ -61,16 +55,15 @@ const BODY_BONES = [
 // Full list — logged at load time
 const ALL_LOG_BONES = [...BODY_BONES, 'neck', 'head'] as const;
 
-// ─── Zero helper ──────────────────────────────────────────────────────────────
-const Z3: BoneRot3 = { x: 0, y: 0, z: 0 };
-
 // ─── ARM Z-ROTATION CONSTANTS ─────────────────────────────────────────────────
 // In three-vrm normalised-humanoid space the T-pose has arms horizontal.
-// Verified convention (three-vrm v1+):
 //   leftUpperArm  z = +ARM_Z  → arm swings DOWN to side
 //   rightUpperArm z = -ARM_Z  → arm swings DOWN to side
-// (Opposite signs to what Unity/VRM0 raw bone space uses.)
 const ARM_Z = 1.4;
+
+// ─── Walk locomotion ──────────────────────────────────────────────────────────
+const WALK_SPEED  = 0.22;  // world units per second
+const WALK_LIMIT  = 0.42;  // ± world-X boundary before turning
 
 // ─── Mouth expression candidates ──────────────────────────────────────────────
 const MOUTH_CANDIDATES = ['aa','ih','ou','ee','oh','A','I','U','E','O'];
@@ -102,11 +95,6 @@ const STATE_EXPR: Record<AvatarState, ExprMap> = {
 };
 
 // ─── Bone target functions ────────────────────────────────────────────────────
-//
-// RULES:
-//   • Every function specifies x, y, z for every bone in BODY_BONES.
-//   • Idle: ZERO x/y on all arm bones — only z brings arms to sides.
-//   • Breathing lives in spine/chest ONLY.
 
 function idleTargets(breathX: number, swayZ: number): BoneTargets {
   return {
@@ -114,14 +102,12 @@ function idleTargets(breathX: number, swayZ: number): BoneTargets {
     spine:         { x: breathX,  y: 0, z: swayZ * 0.35 },
     chest:         { x: breathX * 0.55, y: 0, z: swayZ * 0.28 },
     upperChest:    { x: breathX * 0.28, y: 0, z: swayZ * 0.20 },
-    // Arms: ONLY Z to bring from T-pose horizontal → sides; x and y both 0
     leftUpperArm:  { x: 0, y: 0, z:  ARM_Z },
-    leftLowerArm:  { x: 0.16, y: 0, z: 0 },   // slight natural elbow bend
+    leftLowerArm:  { x: 0.16, y: 0, z: 0 },
     leftHand:      { x: 0, y: 0, z: 0 },
     rightUpperArm: { x: 0, y: 0, z: -ARM_Z },
     rightLowerArm: { x: 0.16, y: 0, z: 0 },
     rightHand:     { x: 0, y: 0, z: 0 },
-    // Legs: standing, very slight knee bend
     leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
     leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
     leftFoot:      { x: -0.04, y: 0, z: 0 },
@@ -131,27 +117,74 @@ function idleTargets(breathX: number, swayZ: number): BoneTargets {
   };
 }
 
-function talkTargets(breathX: number, swayZ: number, phi: number): BoneTargets {
-  // Small right-arm gesture; arms stay AT THE SAME Z as idle — never raised
-  const gestR = Math.sin(phi) * 0.12;
-  return {
-    hips:          { x: 0,              y: 0, z: swayZ * 0.15 },
-    spine:         { x: breathX * 1.2, y: 0, z: swayZ * 0.30 },
-    chest:         { x: breathX * 0.70, y: 0, z: swayZ * 0.24 },
-    upperChest:    { x: breathX * 0.36, y: 0, z: swayZ * 0.18 },
-    leftUpperArm:  { x: 0,       y: 0, z:  ARM_Z },   // same Z as idle
-    leftLowerArm:  { x: 0.18,    y: 0, z: 0 },
-    leftHand:      { x: 0,       y: 0, z: 0 },
-    rightUpperArm: { x: gestR,   y: 0, z: -ARM_Z },   // same Z as idle; small fwd swing
-    rightLowerArm: { x: 0.24 + Math.abs(gestR) * 0.4, y: 0, z: 0 },
-    rightHand:     { x: 0,       y: 0, z: 0 },
-    leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
-    leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
-    leftFoot:      { x: -0.04, y: 0, z: 0 },
-    rightUpperLeg: { x: 0.02, y: 0, z: 0 },
-    rightLowerLeg: { x: 0.04, y: 0, z: 0 },
-    rightFoot:     { x: -0.04, y: 0, z: 0 },
-  };
+// talkTargets cycles through 3 gesture styles based on a slow phase value
+function talkTargets(breathX: number, swayZ: number, phi: number, talkPhase: number): BoneTargets {
+  const cycle = talkPhase % 3;  // 0, 1, or 2
+  const t = Math.sin(phi) * 0.14;
+
+  if (cycle < 1) {
+    // Style A: small right-arm forward swing
+    return {
+      hips:          { x: 0,              y: 0, z: swayZ * 0.15 },
+      spine:         { x: breathX * 1.2,  y: 0, z: swayZ * 0.30 },
+      chest:         { x: breathX * 0.70, y: 0, z: swayZ * 0.24 },
+      upperChest:    { x: breathX * 0.36, y: 0, z: swayZ * 0.18 },
+      leftUpperArm:  { x: 0,       y: 0, z:  ARM_Z },
+      leftLowerArm:  { x: 0.18,    y: 0, z: 0 },
+      leftHand:      { x: 0,       y: 0, z: 0 },
+      rightUpperArm: { x: t,       y: 0, z: -ARM_Z },
+      rightLowerArm: { x: 0.24 + Math.abs(t) * 0.4, y: 0, z: 0 },
+      rightHand:     { x: 0,       y: 0, z: 0 },
+      leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
+      leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
+      leftFoot:      { x: -0.04, y: 0, z: 0 },
+      rightUpperLeg: { x: 0.02, y: 0, z: 0 },
+      rightLowerLeg: { x: 0.04, y: 0, z: 0 },
+      rightFoot:     { x: -0.04, y: 0, z: 0 },
+    };
+  } else if (cycle < 2) {
+    // Style B: both arms open slightly (expansive gesture)
+    const open = Math.abs(Math.sin(phi * 0.7)) * 0.18;
+    return {
+      hips:          { x: 0,              y: 0, z: swayZ * 0.18 },
+      spine:         { x: breathX * 1.1,  y: 0, z: swayZ * 0.28 },
+      chest:         { x: breathX * 0.60, y: 0, z: swayZ * 0.20 },
+      upperChest:    { x: breathX * 0.30, y: 0, z: swayZ * 0.14 },
+      leftUpperArm:  { x: -open, y: 0, z:  ARM_Z - 0.08 },
+      leftLowerArm:  { x: 0.22,  y: 0, z: 0 },
+      leftHand:      { x: 0,     y: 0, z: 0.06 },
+      rightUpperArm: { x: -open, y: 0, z: -ARM_Z + 0.08 },
+      rightLowerArm: { x: 0.22,  y: 0, z: 0 },
+      rightHand:     { x: 0,     y: 0, z: -0.06 },
+      leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
+      leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
+      leftFoot:      { x: -0.04, y: 0, z: 0 },
+      rightUpperLeg: { x: 0.02, y: 0, z: 0 },
+      rightLowerLeg: { x: 0.04, y: 0, z: 0 },
+      rightFoot:     { x: -0.04, y: 0, z: 0 },
+    };
+  } else {
+    // Style C: left-arm raised, emphatic point-ish
+    const liftL = 0.08 + Math.max(0, Math.sin(phi * 0.6)) * 0.16;
+    return {
+      hips:          { x: 0,              y: 0, z: swayZ * 0.16 },
+      spine:         { x: breathX * 1.15, y: 0, z: swayZ * 0.32 },
+      chest:         { x: breathX * 0.65, y: 0, z: swayZ * 0.22 },
+      upperChest:    { x: breathX * 0.32, y: 0, z: swayZ * 0.16 },
+      leftUpperArm:  { x: -liftL, y: 0, z:  ARM_Z - 0.20 },
+      leftLowerArm:  { x: 0.50,   y: 0, z: 0 },
+      leftHand:      { x: 0.06,   y: 0, z: 0 },
+      rightUpperArm: { x: 0,      y: 0, z: -ARM_Z },
+      rightLowerArm: { x: 0.18,   y: 0, z: 0 },
+      rightHand:     { x: 0,      y: 0, z: 0 },
+      leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
+      leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
+      leftFoot:      { x: -0.04, y: 0, z: 0 },
+      rightUpperLeg: { x: 0.02, y: 0, z: 0 },
+      rightLowerLeg: { x: 0.04, y: 0, z: 0 },
+      rightFoot:     { x: -0.04, y: 0, z: 0 },
+    };
+  }
 }
 
 function walkTargets(phi: number): BoneTargets {
@@ -185,11 +218,10 @@ function pointTargets(breathX: number): BoneTargets {
   const base = idleTargets(breathX, 0);
   return {
     ...base,
-    // Right arm: raise to pointing height; left arm stays relaxed
-    rightUpperArm: { x: -0.30, y: 0, z: -0.55 }, // z > -ARM_Z = arm raised
+    rightUpperArm: { x: -0.30, y: 0, z: -0.55 },
     rightLowerArm: { x:  0.22, y: 0, z: 0 },
     rightHand:     { x:  0,    y: 0, z: 0 },
-    leftUpperArm:  { x:  0,    y: 0, z:  ARM_Z + 0.08 }, // slightly more relaxed
+    leftUpperArm:  { x:  0,    y: 0, z:  ARM_Z + 0.08 },
   };
 }
 
@@ -199,8 +231,8 @@ function thinkTargets(breathX: number, elapsed: number): BoneTargets {
   return {
     ...base,
     hips:          { x: rock, y: 0, z: 0 },
-    rightUpperArm: { x: -0.50, y: 0, z: -0.48 }, // arm raised toward chin
-    rightLowerArm: { x:  1.20, y: 0, z: 0 },     // elbow bent upward
+    rightUpperArm: { x: -0.50, y: 0, z: -0.48 },
+    rightLowerArm: { x:  1.20, y: 0, z: 0 },
     rightHand:     { x: -0.12, y: 0, z: 0 },
     leftUpperArm:  { x:  0,    y: 0, z:  ARM_Z + 0.05 },
   };
@@ -211,29 +243,27 @@ function waveTargets(phi: number, breathX: number): BoneTargets {
   const waveZ = Math.sin(phi * 3.5) * 0.42;
   return {
     ...base,
-    rightUpperArm: { x: -0.44, y: 0, z: -0.78 }, // arm raised, forward
+    rightUpperArm: { x: -0.44, y: 0, z: -0.78 },
     rightLowerArm: { x:  0.82, y: 0, z:  0 },
-    rightHand:     { x:  0,    y: 0, z: waveZ },  // waving
+    rightHand:     { x:  0,    y: 0, z: waveZ },
   };
 }
 
 function danceTargets(phi: number): BoneTargets {
-  // Double the walk tempo for a lively dance beat
   const beat    = phi * 2;
-  const hipSway = Math.sin(beat) * 0.11;                     // side-to-side shimmy
-  const hipBob  = Math.abs(Math.sin(beat * 2)) * 0.032;      // subtle up-down bob on every beat
-  // Arms alternate: left up when right is down, both oscillate between T-pose and raised
-  const armLz   = ARM_Z - 0.65 + Math.sin(beat + Math.PI) * 0.48; // left arm z (raises up/down)
-  const armRz   = -(ARM_Z - 0.65 + Math.sin(beat) * 0.48);         // right arm z (opposite phase)
-  const armLx   =  Math.sin(beat + Math.PI) * 0.32;               // left arm forward swing
-  const armRx   =  Math.sin(beat) * 0.32;                          // right arm forward swing
-  const elbL    = 0.55 + Math.sin(beat * 2)           * 0.28;      // elbow bend pulses
+  const hipSway = Math.sin(beat) * 0.11;
+  const hipBob  = Math.abs(Math.sin(beat * 2)) * 0.032;
+  const armLz   = ARM_Z - 0.65 + Math.sin(beat + Math.PI) * 0.48;
+  const armRz   = -(ARM_Z - 0.65 + Math.sin(beat) * 0.48);
+  const armLx   =  Math.sin(beat + Math.PI) * 0.32;
+  const armRx   =  Math.sin(beat) * 0.32;
+  const elbL    = 0.55 + Math.sin(beat * 2)           * 0.28;
   const elbR    = 0.55 + Math.sin(beat * 2 + Math.PI) * 0.28;
-  const kneeL   = 0.08 + Math.max(0, Math.sin(beat * 2 + Math.PI)) * 0.20; // knees bounce
+  const kneeL   = 0.08 + Math.max(0, Math.sin(beat * 2 + Math.PI)) * 0.20;
   const kneeR   = 0.08 + Math.max(0, Math.sin(beat * 2))           * 0.20;
   return {
     hips:          { x: hipBob,  y: 0, z: hipSway            },
-    spine:         { x: 0,       y: 0, z: -hipSway * 0.42    }, // counter-rotate torso
+    spine:         { x: 0,       y: 0, z: -hipSway * 0.42    },
     chest:         { x: 0,       y: 0, z:  hipSway * 0.24    },
     upperChest:    { x: 0,       y: 0, z:  0                  },
     leftUpperArm:  { x:  armLx,  y: 0, z: armLz               },
@@ -251,12 +281,57 @@ function danceTargets(phi: number): BoneTargets {
   };
 }
 
+function shrugTargets(breathX: number, elapsed: number): BoneTargets {
+  // Both arms raise to shoulder height with spread hands — classic shrug
+  const hold = Math.sin(elapsed * 1.8) * 0.018;
+  return {
+    hips:          { x: 0,          y: 0, z: 0 },
+    spine:         { x: breathX,    y: 0, z: 0 },
+    chest:         { x: breathX * 0.4 + 0.04, y: 0, z: 0 },
+    upperChest:    { x: 0.06 + hold, y: 0, z: 0 },
+    leftUpperArm:  { x: -0.08, y: 0, z:  0.62 },   // arms raised up & out
+    leftLowerArm:  { x:  0.28, y: 0, z: 0 },
+    leftHand:      { x:  0,    y: 0, z:  0.30 },   // palms-up hand tilt
+    rightUpperArm: { x: -0.08, y: 0, z: -0.62 },
+    rightLowerArm: { x:  0.28, y: 0, z: 0 },
+    rightHand:     { x:  0,    y: 0, z: -0.30 },
+    leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
+    leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
+    leftFoot:      { x: -0.04, y: 0, z: 0 },
+    rightUpperLeg: { x: 0.02, y: 0, z: 0 },
+    rightLowerLeg: { x: 0.04, y: 0, z: 0 },
+    rightFoot:     { x: -0.04, y: 0, z: 0 },
+  };
+}
+
+function fistpumpTargets(elapsed: number): BoneTargets {
+  // Right fist repeatedly punches upward — victory pump
+  const pump  = Math.abs(Math.sin(elapsed * 5.5));   // fast pump cycle
+  const raise = 0.40 + pump * 0.28;                  // arm rises more at peak
+  return {
+    hips:          { x: pump * 0.012, y: 0, z: 0 },
+    spine:         { x: pump * 0.018, y: 0, z: 0 },
+    chest:         { x: pump * 0.012, y: 0, z: 0 },
+    upperChest:    { x: pump * 0.006, y: 0, z: 0 },
+    leftUpperArm:  { x: 0, y: 0, z:  ARM_Z },
+    leftLowerArm:  { x: 0.16, y: 0, z: 0 },
+    leftHand:      { x: 0, y: 0, z: 0 },
+    rightUpperArm: { x: -raise, y: 0, z: -0.45 },   // raised, in front
+    rightLowerArm: { x:  0.30 + pump * 0.20, y: 0, z: 0 },
+    rightHand:     { x: -0.10, y: 0, z: 0 },         // fist
+    leftUpperLeg:  { x: 0.02, y: 0, z: 0 },
+    leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
+    leftFoot:      { x: -0.04, y: 0, z: 0 },
+    rightUpperLeg: { x: 0.02, y: 0, z: 0 },
+    rightLowerLeg: { x: 0.04, y: 0, z: 0 },
+    rightFoot:     { x: -0.04, y: 0, z: 0 },
+  };
+}
+
 // ─── Bone smooth value initialiser ───────────────────────────────────────────
-// Called once; pre-sets arm Z so there is NO snap from T-pose on first frame.
 function initBoneSm(): BoneSm {
   const sm: BoneSm = {};
   for (const b of ALL_LOG_BONES) sm[b] = { x: 0, y: 0, z: 0 };
-  // Pre-set arm Z to idle position → no visible snap from T-pose
   sm.leftUpperArm  = { x: 0, y: 0, z:  ARM_Z };
   sm.rightUpperArm = { x: 0, y: 0, z: -ARM_Z };
   sm.leftLowerArm  = { x: 0.16, y: 0, z: 0 };
@@ -317,13 +392,18 @@ interface DebugData {
   animState:       AnimState;
   bonesFound:      string[];
   bonesMissing:    string[];
+  walkPos:         number;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
-interface Props extends LordPiggingtonProps { debug?: boolean; }
+interface Props extends LordPiggingtonProps {
+  debug?:   boolean;
+  vrmSrc?:  string;
+}
 
 function LordPiggingtonAvatar({
   avState, speaking, gazeEvent, speechCtrlRef, debug = false,
+  vrmSrc = '/LordPiggington.vrm',
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const vrmRef    = useRef<VRM | null>(null);
@@ -341,6 +421,13 @@ function LordPiggingtonAvatar({
   const animStateRef  = useRef<AnimState>('idle');
   const prevAnimRef   = useRef<AnimState>('idle');
   const oneShotRef    = useRef<OneShotMeta | null>(null);
+  const talkPhaseRef  = useRef(0); // cycles 0→1→2 every ~8 seconds of speech
+
+  // Locomotion state (walk across screen)
+  const walkPosXRef   = useRef(0);
+  const walkDirRef    = useRef<1 | -1>(1);
+  const walkFacingYRef = useRef(0);  // smoothed Y rotation of vrm.scene
+  const roamRef       = useRef({ t: 0, next: 18 + Math.random() * 14 });
 
   // Bone smoothed values — LAZY INIT: initialised once, never reset on re-render
   const boneSmoothRef = useRef<BoneSm>(null!);
@@ -366,7 +453,7 @@ function LordPiggingtonAvatar({
   const debugDataRef = useRef<DebugData>({
     expressionNames: [], availableMouth: [], activeShape: '',
     energy: 0, isSpeaking: false, exprMgrFound: false,
-    animState: 'idle', bonesFound: [], bonesMissing: [],
+    animState: 'idle', bonesFound: [], bonesMissing: [], walkPos: 0,
   });
   const [debugDisplay, setDebugDisplay] = useState<DebugData | null>(null);
 
@@ -396,8 +483,8 @@ function LordPiggingtonAvatar({
   // Trigger one-shot animation from dev panel
   const triggerOneShot = useCallback((state: AnimState, duration: number) => {
     const cur = animStateRef.current;
-    const rtn = (cur === 'waving' || cur === 'pointing' || cur === 'thinking')
-      ? prevAnimRef.current : cur;
+    const oneShots: AnimState[] = ['waving','pointing','thinking','shrug','fistpump'];
+    const rtn = oneShots.includes(cur) ? prevAnimRef.current : cur;
     prevAnimRef.current  = cur;
     animStateRef.current = state;
     oneShotRef.current   = { returnTo: rtn, endT: performance.now() / 1000 + duration };
@@ -405,10 +492,11 @@ function LordPiggingtonAvatar({
 
   // Set animation state from dev panel
   const setAnimState = useCallback((s: AnimState) => {
-    const oneShots: AnimState[] = ['pointing','thinking','waving'];
-    const durations: Record<string, number> = { pointing: 2.5, thinking: 4.0, waving: 3.5 };
-    if (oneShots.includes(s)) {
-      triggerOneShot(s, durations[s]);
+    const durations: Partial<Record<AnimState, number>> = {
+      pointing: 2.5, thinking: 4.0, waving: 3.5, shrug: 2.8, fistpump: 2.5,
+    };
+    if (durations[s] !== undefined) {
+      triggerOneShot(s, durations[s]!);
     } else {
       oneShotRef.current   = null;
       prevAnimRef.current  = animStateRef.current;
@@ -421,6 +509,15 @@ function LordPiggingtonAvatar({
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // Reset locomotion on VRM swap
+    walkPosXRef.current   = 0;
+    walkDirRef.current    = 1;
+    walkFacingYRef.current = 0;
+    roamRef.current       = { t: 0, next: 18 + Math.random() * 14 };
+    animStateRef.current  = 'idle';
+    oneShotRef.current    = null;
+    boneSmoothRef.current = initBoneSm();
+
     const renderer = new THREE.WebGLRenderer({
       canvas, antialias: true, alpha: true, premultipliedAlpha: false,
     });
@@ -432,7 +529,8 @@ function LordPiggingtonAvatar({
     const scene = new THREE.Scene();
     scene.background = null;
 
-    const camera = new THREE.PerspectiveCamera(30, W / H, 0.01, 30);
+    // FOV widened slightly to accommodate walk range (38° vs prior 30°)
+    const camera = new THREE.PerspectiveCamera(38, W / H, 0.01, 30);
     camera.position.set(0, 0.85, 3.0);
     camera.lookAt(0, 0.85, 0);
     scene.add(camera);
@@ -450,9 +548,9 @@ function LordPiggingtonAvatar({
     // Load VRM
     const loader = new GLTFLoader();
     loader.register(p => new VRMLoaderPlugin(p));
-    loader.load('/LordPiggington.vrm', (gltf) => {
+    loader.load(vrmSrc, (gltf) => {
       const vrm: VRM = (gltf.userData as { vrm: VRM }).vrm;
-      if (!vrm) { console.error('[LordPiggington] VRM not found'); return; }
+      if (!vrm) { console.error('[Avatar] VRM not found in', vrmSrc); return; }
 
       VRMUtils.rotateVRM0(vrm);
       scene.add(vrm.scene);
@@ -465,23 +563,20 @@ function LordPiggingtonAvatar({
       const bonesMissing: string[] = [];
       ALL_LOG_BONES.forEach(name => {
         const node = hum?.getNormalizedBoneNode?.(name as never);
-        if (node) { bonesFound.push(name); console.log(`[bone ✓] ${name}`, node.name); }
-        else       { bonesMissing.push(name); console.warn(`[bone ✗] ${name} — not found`); }
+        if (node) { bonesFound.push(name); }
+        else       { bonesMissing.push(name); }
       });
 
       // Expression inventory
       const allNames = (vrm.expressionManager?.expressions ?? [])
         .map((e: { expressionName: string }) => e.expressionName);
-      console.log('[LordPiggington] expressions:', allNames);
       const foundMouth = MOUTH_CANDIDATES.filter(n => vrm.expressionManager?.getExpression(n));
-      console.log('[LordPiggington] mouth exprs:', foundMouth);
       availableMouthRef.current = foundMouth;
 
-      // Find jaw bone via raw traversal — works on VRM0 and VRM1
+      // Jaw bone via raw traversal
       vrm.scene.traverse((obj) => {
         if (!jawBoneRef.current && obj instanceof THREE.Bone && /jaw/i.test(obj.name)) {
           jawBoneRef.current = obj;
-          console.log('[LordPiggington] jaw bone found:', obj.name);
         }
       });
 
@@ -491,7 +586,7 @@ function LordPiggingtonAvatar({
         exprMgrFound: !!vrm.expressionManager, bonesFound, bonesMissing,
       };
 
-      // Wave on first load (800ms grace for idle lerp to settle first)
+      // Wave on first load
       setTimeout(() => {
         prevAnimRef.current  = 'idle';
         animStateRef.current = 'waving';
@@ -499,7 +594,7 @@ function LordPiggingtonAvatar({
       }, 800);
     },
     undefined,
-    (err) => console.error('[LordPiggington] load error:', err));
+    (err) => console.error('[Avatar] load error:', err));
 
     // Page-visibility pause
     const onVis = () => { pausedRef.current = document.hidden; };
@@ -538,14 +633,51 @@ function LordPiggingtonAvatar({
         oneShotRef.current   = null;
       }
 
-      // Auto-drive idle ↔ talking based on speech (only when no one-shot active
-      // and not in a manually-held non-talking state like 'walking')
+      // Auto-drive idle ↔ talking based on speech
+      const isSpeaking = sc?.active ?? false;
       if (!oneShotRef.current &&
           (animStateRef.current === 'idle' || animStateRef.current === 'talking')) {
-        animStateRef.current = (sc?.active ?? false) ? 'talking' : 'idle';
+        animStateRef.current = isSpeaking ? 'talking' : 'idle';
+      }
+
+      // Advance talk-gesture phase every ~8 s of continuous speech
+      if (isSpeaking) {
+        talkPhaseRef.current = Math.floor(elapsed / 8) % 3;
       }
 
       const anim = animStateRef.current;
+
+      // ── Locomotion (walk across screen) ───────────────────────────────────
+      if (anim === 'walking') {
+        walkPosXRef.current += walkDirRef.current * WALK_SPEED * dt;
+        if (walkPosXRef.current >= WALK_LIMIT) {
+          walkPosXRef.current  = WALK_LIMIT;
+          walkDirRef.current   = -1;
+        } else if (walkPosXRef.current <= -WALK_LIMIT) {
+          walkPosXRef.current  = -WALK_LIMIT;
+          walkDirRef.current   = 1;
+        }
+        // Slight angle toward direction of travel (about ±18°)
+        const targetFacingY = walkDirRef.current * -0.32;
+        walkFacingYRef.current = ed(walkFacingYRef.current, targetFacingY, 5, dt);
+      } else {
+        // Drift back to center when not walking
+        walkPosXRef.current    = ed(walkPosXRef.current,    0, 2.5, dt);
+        walkFacingYRef.current = ed(walkFacingYRef.current, 0, 4.0, dt);
+      }
+      vrm.scene.position.x = walkPosXRef.current;
+      vrm.scene.rotation.y = walkFacingYRef.current;
+
+      // ── Spontaneous roam timer ────────────────────────────────────────────
+      roamRef.current.t += dt;
+      if (!oneShotRef.current && anim === 'idle' && roamRef.current.t >= roamRef.current.next) {
+        roamRef.current.t    = 0;
+        roamRef.current.next = 18 + Math.random() * 16;
+        // Random direction + walk duration
+        walkDirRef.current   = Math.random() < 0.5 ? 1 : -1;
+        animStateRef.current = 'walking';
+        oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 3 + Math.random() * 3 };
+      }
 
       // ── Compute bone targets for this frame ───────────────────────────────
       const breathX = Math.sin(elapsed * 0.82) * 0.0055;
@@ -554,16 +686,18 @@ function LordPiggingtonAvatar({
 
       let targets: BoneTargets;
       switch (anim) {
-        case 'talking':  targets = talkTargets(breathX, swayZ, phi * 0.85); break;
-        case 'walking':  targets = walkTargets(phi * 0.52);                 break;
-        case 'pointing': targets = pointTargets(breathX);                   break;
-        case 'thinking': targets = thinkTargets(breathX, elapsed);          break;
-        case 'waving':   targets = waveTargets(phi * 0.52, breathX);        break;
-        case 'dancing':  targets = danceTargets(phi * 0.52);               break;
-        default:         targets = idleTargets(breathX, swayZ);             break;
+        case 'talking':   targets = talkTargets(breathX, swayZ, phi * 0.85, talkPhaseRef.current); break;
+        case 'walking':   targets = walkTargets(phi * 0.52);                  break;
+        case 'pointing':  targets = pointTargets(breathX);                    break;
+        case 'thinking':  targets = thinkTargets(breathX, elapsed);           break;
+        case 'waving':    targets = waveTargets(phi * 0.52, breathX);         break;
+        case 'dancing':   targets = danceTargets(phi * 0.52);                 break;
+        case 'shrug':     targets = shrugTargets(breathX, elapsed);           break;
+        case 'fistpump':  targets = fistpumpTargets(elapsed);                 break;
+        default:          targets = idleTargets(breathX, swayZ);              break;
       }
 
-      // ── Lerp bone smooth values toward targets (λ=8 → ~0.3 s to 90 %) ───
+      // ── Lerp bone smooth values toward targets ────────────────────────────
       const lerpF = 1 - Math.exp(-8 * dt);
       for (const [name, tgt] of Object.entries(targets)) {
         const sm = boneSm[name] ?? (boneSm[name] = { x: 0, y: 0, z: 0 });
@@ -572,7 +706,7 @@ function LordPiggingtonAvatar({
         sm.z = sm.z + (tgt.z - sm.z) * lerpF;
       }
 
-      // ── Apply to body bones (head/neck handled by gaze layer below) ───────
+      // ── Apply to body bones ───────────────────────────────────────────────
       for (const name of BODY_BONES) {
         const sm   = boneSm[name];
         const bone = hum?.getNormalizedBoneNode?.(name as never);
@@ -590,34 +724,37 @@ function LordPiggingtonAvatar({
         if (pos || neg) nodRef.current = { active: true, t: 0, dir: pos ? 1 : -1 };
         prevMktRef.current = mktSt;
 
-        // Drive body animation from market state
         if (mktSt === 'READY_LONG' || mktSt === 'READY_SHORT') {
-          // Dance loop — sustained while setup stays READY
           oneShotRef.current   = null;
           animStateRef.current = 'dancing';
         } else if (mktSt === 'TARGET_HIT') {
-          // Celebration: big wave (6 s one-shot then back to idle)
           prevAnimRef.current  = 'idle';
-          animStateRef.current = 'waving';
-          oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 6.0 };
+          animStateRef.current = 'fistpump';  // fist-pump on win!
+          oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 3.5 };
+          setTimeout(() => {  // then wave
+            prevAnimRef.current  = 'idle';
+            animStateRef.current = 'waving';
+            oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 4.0 };
+          }, 3600);
         } else if (mktSt === 'STOP_HIT') {
-          // Dejected thinking pose (4 s one-shot)
           prevAnimRef.current  = 'idle';
-          animStateRef.current = 'thinking';
-          oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 4.0 };
+          animStateRef.current = 'shrug';     // shrug on loss
+          oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 2.8 };
+          setTimeout(() => {  // then think
+            prevAnimRef.current  = 'idle';
+            animStateRef.current = 'thinking';
+            oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 3.5 };
+          }, 2900);
         } else if (mktSt === 'ACTIVE') {
-          // Monitoring walk while holding a trade
           oneShotRef.current   = null;
           animStateRef.current = 'walking';
         } else if (mktSt === 'FORMING' || mktSt === 'ANALYZING') {
-          // Brief analysis thinking (3 s one-shot; won't interrupt an existing one)
           if (!oneShotRef.current) {
             prevAnimRef.current  = 'idle';
             animStateRef.current = 'thinking';
             oneShotRef.current   = { returnTo: 'idle', endT: nowSec + 3.0 };
           }
         } else {
-          // WAIT / NO_EDGE — stop any looped state, return to idle
           if (animStateRef.current === 'dancing' || animStateRef.current === 'walking') {
             oneShotRef.current   = null;
             animStateRef.current = 'idle';
@@ -658,7 +795,6 @@ function LordPiggingtonAvatar({
       }
 
       // ── Lip-sync ──────────────────────────────────────────────────────────
-      const isSpeaking = sc?.active ?? false;
       const rawEnergy  = isSpeaking ? Math.max(0, Math.min(1, sc?.energy ?? 0)) : 0;
       let activeShape  = '';
       if (rawEnergy > 0.02 && avMouth.length > 0) {
@@ -675,14 +811,13 @@ function LordPiggingtonAvatar({
       }
       activeShapeRef.current = activeShape;
 
-      // ── Jaw bone fallback: visible mouth even when model has no morph targets ─
-      // Uses raw THREE.Bone found by /jaw/i traversal — works on VRM0 + VRM1.
+      // ── Jaw bone fallback ─────────────────────────────────────────────────
       const jawBone = jawBoneRef.current;
       if (jawBone) {
         const bs   = boneSm as Record<string, { x: number; y: number; z: number }>;
         if (!bs['_jaw']) bs['_jaw'] = { x: 0, y: 0, z: 0 };
         const jawSm = bs['_jaw'];
-        const jawTgt = rawEnergy * 0.30;   // 0.30 rad ≈ 17° open at peak energy
+        const jawTgt = rawEnergy * 0.30;
         jawSm.x += (jawTgt - jawSm.x) * (1 - Math.exp(-16 * dt));
         jawBone.rotation.x = jawSm.x;
       }
@@ -753,11 +888,12 @@ function LordPiggingtonAvatar({
           (isHot ? 2.0 : 1.4) + Math.sin(elapsed * hz * Math.PI * 2) * (isHot ? 0.7 : 0.25);
       }
 
-      // Update debug ref (does not trigger a React re-render)
-      debugDataRef.current.animState  = anim;
+      // Update debug ref
+      debugDataRef.current.animState   = anim;
       debugDataRef.current.activeShape = activeShape;
       debugDataRef.current.energy      = rawEnergy;
       debugDataRef.current.isSpeaking  = isSpeaking;
+      debugDataRef.current.walkPos     = walkPosXRef.current;
 
       vrm.update(dt);
       try { em?.update(); } catch (_) {}
@@ -775,7 +911,8 @@ function LordPiggingtonAvatar({
       }
       renderer.dispose();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vrmSrc]);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -792,11 +929,11 @@ function LordPiggingtonAvatar({
         <div style={{
           position: 'absolute', top: 0, left: '100%', marginLeft: 8,
           background: 'rgba(0,0,0,0.88)', border: '1px solid rgba(0,148,255,0.35)',
-          borderRadius: 6, padding: '8px 10px', width: 220,
+          borderRadius: 6, padding: '8px 10px', width: 230,
           fontFamily: 'monospace', fontSize: 11, color: '#cde', lineHeight: 1.65,
           pointerEvents: 'auto', zIndex: 10, overflowY: 'auto', maxHeight: '90vh',
         }}>
-          <div style={{ color: '#7df', fontWeight: 700, marginBottom: 4 }}>🐷 Lord Piggington</div>
+          <div style={{ color: '#7df', fontWeight: 700, marginBottom: 4 }}>🎭 Avatar Debug</div>
 
           <div>Anim: <b style={{ color: '#fa0' }}>{debugDisplay.animState}</b></div>
           <div>Speech: <b style={{ color: debugDisplay.isSpeaking ? '#4f4' : '#888' }}>
@@ -804,6 +941,7 @@ function LordPiggingtonAvatar({
           </b></div>
           <div>Energy: <b>{Math.round(debugDisplay.energy * 100)}</b>/100</div>
           <div>Shape: <b style={{ color: '#fa0' }}>{debugDisplay.activeShape || '—'}</b></div>
+          <div>WalkX: <b style={{ color: '#4af' }}>{debugDisplay.walkPos.toFixed(3)}</b></div>
           <div>ExprMgr: <b style={{ color: debugDisplay.exprMgrFound ? '#4f4' : '#f44' }}>
             {debugDisplay.exprMgrFound ? 'YES' : 'NO'}
           </b></div>
@@ -811,17 +949,9 @@ function LordPiggingtonAvatar({
           <div style={{ marginTop: 6, color: '#89a' }}>
             Bones ✓ ({debugDisplay.bonesFound.length}) / ✗ ({debugDisplay.bonesMissing.length})
           </div>
-          <div style={{ color: '#6b8', fontSize: 10 }}>
-            {debugDisplay.bonesFound.join(', ') || '—'}
-          </div>
-          {debugDisplay.bonesMissing.length > 0 && (
-            <div style={{ color: '#f88', fontSize: 10 }}>
-              Missing: {debugDisplay.bonesMissing.join(', ')}
-            </div>
-          )}
 
           <div style={{ marginTop: 8, color: '#89a', marginBottom: 4 }}>Animation</div>
-          {(['idle','talking','walking','pointing','thinking','waving','dancing'] as AnimState[]).map(s => (
+          {(['idle','talking','walking','pointing','thinking','waving','dancing','shrug','fistpump'] as AnimState[]).map(s => (
             <button key={s} onClick={() => setAnimState(s)} style={{
               display: 'inline-block', margin: '2px 2px', padding: '2px 7px',
               fontSize: 10, borderRadius: 3, cursor: 'pointer',
