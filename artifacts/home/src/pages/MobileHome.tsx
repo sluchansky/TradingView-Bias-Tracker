@@ -33,6 +33,22 @@ function useClock() {
 }
 
 // ── TTS ───────────────────────────────────────────────────────────────────────
+// Pick the best available English voice — prefer natural/premium voices over the
+// default robotic system voice (which is usually index 0).
+function pickVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | undefined {
+  if (!voices.length) return undefined;
+  const en = voices.filter(v => v.lang.startsWith('en'));
+  // Named voices in priority order: iOS Samantha/Siri, Chrome Google, enhanced/premium
+  const prefer = [/samantha/i, /google us english/i, /ava/i, /nicky/i, /karen/i,
+                  /daniel/i, /natural/i, /premium/i, /enhanced/i];
+  for (const p of prefer) {
+    const hit = en.find(v => p.test(v.name));
+    if (hit) return hit;
+  }
+  // Fall back: first local-service English voice, then any English, then anything
+  return en.find(v => v.localService) ?? en[0] ?? voices[0];
+}
+
 function cleanTTS(text: string) {
   return text
     .replace(/\bBOS\b/g,   'break of structure')
@@ -57,9 +73,10 @@ function useTTS() {
   const [audioUnlocked, setAudioUnlocked] = useState(false);
 
   // Queue: activeRef = a speak() was sent to the browser, pendingRef = next line (max 1)
-  const activeRef  = useRef(false);
-  const pendingRef = useRef<string | null>(null);
-  const voicesRef  = useRef<SpeechSynthesisVoice[]>([]);
+  const activeRef     = useRef(false);
+  const activeTextRef = useRef('');          // tracks what's currently playing for dedup
+  const pendingRef    = useRef<string | null>(null);
+  const voicesRef     = useRef<SpeechSynthesisVoice[]>([]);
   // mutedRef mirrors the muted state synchronously so _fire can check it without
   // relying on a closure that may be stale (e.g. queued calls that fire after mute).
   const mutedRef   = useRef<boolean>(() => {
@@ -78,9 +95,10 @@ function useTTS() {
     // Guard here (not just in speak()) so queued items flushed from done() also respect mute.
     if (mutedRef.current || !text) return;
     const ss = window.speechSynthesis; if (!ss) return;
-    activeRef.current = true;           // block concurrent calls
+    activeRef.current = true;
+    activeTextRef.current = text;
     const utt = new SpeechSynthesisUtterance(text);
-    const voice = voicesRef.current[0]; if (voice) utt.voice = voice;
+    const voice = pickVoice(voicesRef.current); if (voice) utt.voice = voice;
     utt.rate = 0.90; utt.pitch = 1.05;
 
     // Safety net: mobile browsers silently reject ss.speak() when there has been no
@@ -88,13 +106,14 @@ function useTTS() {
     // forever and the queue deadlocks. Reset after 700 ms if onstart hasn't confirmed.
     let started = false;
     const safetyTimer = setTimeout(() => {
-      if (!started) { activeRef.current = false; setSpeaking(false); }
+      if (!started) { activeRef.current = false; activeTextRef.current = ''; setSpeaking(false); }
     }, 700);
 
     utt.onstart = () => { started = true; clearTimeout(safetyTimer); setSpeaking(true); };
     const done = () => {
       clearTimeout(safetyTimer);
       activeRef.current = false;
+      activeTextRef.current = '';
       setSpeaking(false);
       const next = pendingRef.current;
       if (next) { pendingRef.current = null; _fire(next); }
@@ -122,6 +141,10 @@ function useTTS() {
   const speak = useCallback((text: string) => {
     if (!text || muted) return;
     const cleaned = cleanTTS(text);
+    // Deduplicate: skip if the exact same text is already playing or already queued.
+    // This is the main cause of "two voices" — the audioUnlocked effect and the
+    // narration-change effect can both call speak() with the same line within ms of each other.
+    if (cleaned === activeTextRef.current || cleaned === pendingRef.current) return;
     if (activeRef.current) {
       pendingRef.current = cleaned;   // don't interrupt — queue for after current finishes
     } else {
