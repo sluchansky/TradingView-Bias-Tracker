@@ -466,7 +466,7 @@ function CardLabel({ children }: { children: React.ReactNode }) {
 const TAB_DEF: { id: Tab; icon: string; label: string }[] = [
   { id:'signal',   icon:'⚡', label:'Signal'   },
   { id:'brain',    icon:'🧠', label:'Brain'    },
-  { id:'chat',     icon:'💬', label:'Chat'     },
+  { id:'chat',     icon:'🫧', label:'Avatar'   },
   { id:'position', icon:'📊', label:'Position' },
 ];
 
@@ -1119,56 +1119,180 @@ function BrainTab({ data }: { data: any }) {
   );
 }
 
-// ── Chat tab ──────────────────────────────────────────────────────────────────
-function ChatTab({ authHeader, ticker, speak }: {
-  authHeader: Record<string, string>; ticker: Ticker; speak: (t: string) => void;
+// ── Big Avatar orb ────────────────────────────────────────────────────────────
+function BigAvatar({ state, speaking, listening, thinking, onTap }: {
+  state: string; speaking: boolean; listening: boolean; thinking: boolean;
+  onTap: () => void;
+}) {
+  const col = state === 'READY_LONG'  ? BULL
+    : state === 'READY_SHORT' ? BEAR
+    : state === 'ACTIVE'      ? CYAN
+    : (state === 'FORMING' || state === 'ANALYZING') ? AMB
+    : '#4b5563';
+  const bright = ['READY_LONG','READY_SHORT','ACTIVE','ANALYZING','FORMING'].includes(state);
+  const ringCol = listening ? '#ef4444' : col;
+  const S = 136;
+  return (
+    <div onClick={onTap}
+      style={{ position:'relative', width:S, height:S, cursor:'pointer', flexShrink:0,
+        WebkitTapHighlightColor:'transparent' }}>
+      {/* Outermost breathing halo */}
+      <div style={{ position:'absolute', inset:-20, borderRadius:'50%',
+        border:`1px solid ${ringCol}18`,
+        animation: bright || listening ? 'mAuraOuter 3.2s ease-in-out infinite' : undefined }} />
+      {/* Outer ring */}
+      <div style={{ position:'absolute', inset:-8, borderRadius:'50%',
+        border:`1px solid ${ringCol}30`,
+        animation: bright || listening ? 'mAuraOuter 2.4s ease-in-out infinite' : undefined }} />
+      {/* Mid ring — faster while listening */}
+      <div style={{ position:'absolute', inset:0, borderRadius:'50%',
+        border:`2px solid ${ringCol}50`,
+        animation: listening ? 'mAuraMid 0.65s ease-in-out infinite'
+          : bright ? 'mAuraMid 1.9s ease-in-out infinite' : undefined }} />
+      {/* Core sphere */}
+      <div style={{ position:'absolute', inset:0, borderRadius:'50%',
+        background:`radial-gradient(circle at 33% 28%, ${col}55, ${col}20, ${col}06)`,
+        boxShadow: bright
+          ? `0 0 56px ${col}30, 0 0 112px ${col}14, inset 0 1px 0 rgba(255,255,255,0.10)`
+          : `0 0 24px ${col}12, inset 0 1px 0 rgba(255,255,255,0.06)`,
+        display:'flex', alignItems:'center', justifyContent:'center', overflow:'hidden' }}>
+        {/* Inner glowing dot — hidden while speaking (waveform takes over) */}
+        {!speaking && (
+          <div style={{ width:Math.round(S * 0.30), height:Math.round(S * 0.30), borderRadius:'50%',
+            background:`radial-gradient(circle at 36% 32%, rgba(255,255,255,0.90), ${col})`,
+            boxShadow:`0 0 28px ${col}cc, 0 0 56px ${col}55`,
+            opacity: bright ? 1 : 0.45,
+            animation: thinking ? 'mPulse 1.0s ease-in-out infinite' : undefined }} />
+        )}
+        {/* Waveform bars while speaking */}
+        {speaking && (
+          <div style={{ display:'flex', gap:4, alignItems:'center' }}>
+            {[9,18,28,22,14,26,10].map((h, i) => (
+              <div key={i} style={{ width:3.5, height:h, borderRadius:3, background:`${col}ee`,
+                animation:`mWave ${0.55 + (i % 3) * 0.13}s ${i * 0.07}s ease-in-out infinite` }} />
+            ))}
+          </div>
+        )}
+        {/* Listening radial pulse */}
+        {listening && (
+          <div style={{ position:'absolute', inset:0, borderRadius:'50%',
+            background:'radial-gradient(circle, rgba(239,68,68,0.14) 0%, transparent 70%)',
+            animation:'mPulse 0.7s ease-in-out infinite' }} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Avatar dialogue tab ────────────────────────────────────────────────────────
+function AvatarTab({ authHeader, ticker, speak, speaking, avatarState, narration }: {
+  authHeader: Record<string, string>; ticker: Ticker;
+  speak: (t: string) => void; speaking: boolean;
+  avatarState: string; narration: string;
 }) {
   const [msgs,   setMsgs]   = useState<Msg[]>([]);
   const [input,  setInput]  = useState('');
   const [asking, setAsking] = useState(false);
   const msgEnd = useRef<HTMLDivElement>(null);
 
-  const onTranscript = useCallback((t: string) => { setInput(t); }, []);
+  // Stable ref so onTranscript never captures a stale ask closure
+  const askRef = useRef<((q: string) => void) | null>(null);
+  const onTranscript = useCallback((t: string) => { askRef.current?.(t); }, []);
   const { voiceState, setVoiceState, start, stop } = useVoiceInput(onTranscript);
+
+  const listening = voiceState === 'listening';
+  const thinking  = asking || voiceState === 'processing';
 
   useEffect(() => { msgEnd.current?.scrollIntoView({ behavior:'smooth' }); }, [msgs]);
 
-  const ask = useCallback(async (q?: string) => {
-    const question = (q ?? input).trim();
-    if (!question || asking) return;
+  const ask = useCallback(async (question: string) => {
+    const q = question.trim();
+    if (!q || asking) return;
     setInput('');
-    setMsgs(m => [...m, mkMsg('user', question)]);
+    setMsgs(m => [...m, mkMsg('user', q)]);
     setAsking(true);
     try {
       const r = await fetch('/api/assistant', {
         method:'POST', credentials:'include',
         headers:{ 'Content-Type':'application/json', ...authHeader },
-        body:JSON.stringify({ question, ticker }),
+        body: JSON.stringify({ question: q, ticker }),
       });
-      if (r.ok) {
-        const j = await r.json();
-        const ans = j.answer || j.error || 'No response.';
-        speak(ans);
-        setMsgs(m => [...m, mkMsg('brain', ans)]);
-      } else {
-        setMsgs(m => [...m, mkMsg('brain', 'Could not connect. Try again.')]);
-      }
+      const j = await r.json().catch(() => ({}));
+      const ans = r.ok ? (j.answer || j.error || 'No response.') : 'Connection error. Try again.';
+      speak(ans);
+      setMsgs(m => [...m, mkMsg('brain', ans)]);
     } catch {
       setMsgs(m => [...m, mkMsg('brain', 'Connection error.')]);
-    } finally { setAsking(false); }
-  }, [input, asking, ticker, authHeader, speak]);
+    } finally {
+      setAsking(false);
+      setVoiceState('idle');
+    }
+  }, [asking, ticker, authHeader, speak, setVoiceState]);
 
-  const chips = ['Read the tape.', 'What are you waiting for?', 'What is missing?', 'Conviction level?'];
+  // Keep ref current with every render
+  useEffect(() => { askRef.current = ask; }, [ask]);
+
+  const stateCol = avatarState === 'READY_LONG'  ? BULL
+    : avatarState === 'READY_SHORT' ? BEAR
+    : avatarState === 'ACTIVE'      ? CYAN
+    : (avatarState === 'FORMING' || avatarState === 'ANALYZING') ? AMB
+    : '#94a3b8';
+
+  const lastBrainMsg = msgs.filter(m => m.role === 'brain').at(-1)?.text;
+
+  const chips = [
+    'Read the tape.', 'What are you waiting for?',
+    'What is missing?', 'Conviction level?',
+    'Where is the entry?', 'What is the risk?',
+  ];
 
   return (
-    <div style={{ display:'flex', flexDirection:'column', gap:0, height:'100%' }}>
-      {/* Chip buttons */}
-      <div style={{ display:'flex', gap:6, overflowX:'auto', paddingBottom:10,
-        scrollbarWidth:'none', WebkitOverflowScrolling:'touch' }}>
+    <div style={{ display:'flex', flexDirection:'column', height:'100%', gap:0 }}>
+
+      {/* ── Avatar hero ── */}
+      <div style={{ display:'flex', flexDirection:'column', alignItems:'center',
+        paddingTop:20, paddingBottom:16, gap:14, flexShrink:0 }}>
+        <BigAvatar
+          state={avatarState} speaking={speaking}
+          listening={listening} thinking={thinking}
+          onTap={() => { if (listening) stop(); else start(); }}
+        />
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:6 }}>
+          {/* State label */}
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            <span style={{ fontSize:11, fontFamily:'monospace', fontWeight:700,
+              letterSpacing:'0.14em', textTransform:'uppercase', color:stateCol }}>
+              {listening ? '● LISTENING' : thinking ? '◌ THINKING' : avatarState.replace(/_/g,' ')}
+            </span>
+            {speaking && (
+              <div style={{ display:'flex', gap:2, alignItems:'flex-end', height:11 }}>
+                {[0,1,2].map(i => (
+                  <div key={i} style={{ width:2.5, height:4+i*3, borderRadius:2,
+                    background:stateCol, animation:`mWave 0.8s ${i*0.15}s ease-in-out infinite` }} />
+                ))}
+              </div>
+            )}
+          </div>
+          {/* Latest brain utterance or live narration */}
+          <p style={{ textAlign:'center', fontSize:13.5, color:'rgba(255,255,255,0.58)',
+            lineHeight:1.55, margin:0, maxWidth:288, padding:'0 4px',
+            display:'-webkit-box', WebkitLineClamp:3,
+            WebkitBoxOrient:'vertical' as any, overflow:'hidden' }}>
+            {lastBrainMsg ?? narration ?? 'Watching the tape\u2026'}
+          </p>
+          <span style={{ fontSize:11, color:'rgba(255,255,255,0.20)', fontFamily:'monospace' }}>
+            {listening ? 'Speak now\u2026' : 'Tap the orb or type below'}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Quick chips ── */}
+      <div style={{ display:'flex', gap:6, overflowX:'auto', paddingBottom:12,
+        scrollbarWidth:'none', WebkitOverflowScrolling:'touch' as any, flexShrink:0 }}>
         {chips.map((c, i) => (
           <button key={i} onClick={() => ask(c)}
-            style={{ flexShrink:0, padding:'7px 12px', borderRadius:20,
-              background:'rgba(59,130,246,0.10)', border:'1px solid rgba(59,130,246,0.25)',
+            style={{ flexShrink:0, padding:'6px 12px', borderRadius:20,
+              background:'rgba(59,130,246,0.10)', border:'1px solid rgba(59,130,246,0.22)',
               color:'#93c5fd', fontSize:12, fontFamily:'inherit', cursor:'pointer',
               whiteSpace:'nowrap' }}>
             {c}
@@ -1176,22 +1300,25 @@ function ChatTab({ authHeader, ticker, speak }: {
         ))}
       </div>
 
-      {/* Messages */}
-      <div style={{ flex:1, overflowY:'auto', paddingBottom:8 }}>
-        {msgs.length === 0 && (
-          <div style={{ textAlign:'center', padding:'32px 0',
-            color:'rgba(255,255,255,0.25)', fontSize:13, fontFamily:'monospace' }}>
-            Ask me anything about the current setup.
+      {/* ── Message history ── */}
+      <div style={{ flex:1, overflowY:'auto', WebkitOverflowScrolling:'touch' as any }}>
+        {msgs.length === 0 ? (
+          <div style={{ textAlign:'center', padding:'24px 0',
+            color:'rgba(255,255,255,0.18)', fontSize:12, fontFamily:'monospace' }}>
+            Tap the orb to speak, or type a question below.
           </div>
+        ) : (
+          msgs.map(m => <ChatBubble key={m.id} msg={m} />)
         )}
-        {msgs.map(m => <ChatBubble key={m.id} msg={m} />)}
         {asking && (
           <div style={{ display:'flex', justifyContent:'flex-start', marginBottom:8 }}>
             <div style={{ padding:'10px 14px', borderRadius:'4px 16px 16px 16px',
               background:'rgba(59,130,246,0.10)', border:'1px solid rgba(59,130,246,0.22)' }}>
               <div style={{ display:'flex', gap:4, alignItems:'center' }}>
-                {[0,1,2].map(i => <div key={i} style={{ width:5, height:5, borderRadius:'50%',
-                  background:BLUE, animation:`mDot 1s ${i*0.2}s ease-in-out infinite` }} />)}
+                {[0,1,2].map(i => (
+                  <div key={i} style={{ width:5, height:5, borderRadius:'50%',
+                    background:BLUE, animation:`mDot 1s ${i*0.2}s ease-in-out infinite` }} />
+                ))}
               </div>
             </div>
           </div>
@@ -1199,42 +1326,24 @@ function ChatTab({ authHeader, ticker, speak }: {
         <div ref={msgEnd} />
       </div>
 
-      {/* Input row */}
+      {/* ── Text input row ── */}
       <div style={{ display:'flex', gap:8, paddingTop:8,
-        borderTop:'1px solid rgba(255,255,255,0.07)' }}>
+        borderTop:'1px solid rgba(255,255,255,0.07)', flexShrink:0 }}>
         <input value={input} onChange={e => setInput(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } }}
-          placeholder="Ask anything…"
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(input); } }}
+          placeholder="Type anything\u2026"
           style={{ flex:1, background:'rgba(255,255,255,0.05)', border:'1px solid rgba(255,255,255,0.12)',
-            borderRadius:12, padding:'12px 14px', fontSize:15, color:'rgba(255,255,255,0.85)',
+            borderRadius:12, padding:'12px 14px', fontSize:14, color:'rgba(255,255,255,0.85)',
             fontFamily:'inherit', outline:'none', WebkitAppearance:'none' }} />
-        <button onClick={() => {
-          if (voiceState === 'listening') stop();
-          else start();
-        }}
+        <button onClick={() => ask(input)} disabled={!input.trim() || asking}
           style={{ width:46, height:46, borderRadius:12, flexShrink:0,
-            background: voiceState === 'listening' ? 'rgba(239,68,68,0.2)' : 'rgba(255,255,255,0.07)',
-            border:`1px solid ${voiceState === 'listening' ? 'rgba(239,68,68,0.4)' : 'rgba(255,255,255,0.12)'}`,
-            display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer',
-            fontSize:18, transition:'all 0.2s' }}>
-          {voiceState === 'listening' ? '⏹' : '🎤'}
-        </button>
-        <button onClick={() => ask()} disabled={!input.trim() || asking}
-          style={{ width:46, height:46, borderRadius:12, flexShrink:0,
-            background: input.trim() ? 'rgba(59,130,246,0.25)' : 'rgba(255,255,255,0.05)',
-            border:`1px solid ${input.trim() ? 'rgba(59,130,246,0.45)' : 'rgba(255,255,255,0.10)'}`,
+            background: input.trim() && !asking ? 'rgba(59,130,246,0.25)' : 'rgba(255,255,255,0.05)',
+            border:`1px solid ${input.trim() && !asking ? 'rgba(59,130,246,0.45)' : 'rgba(255,255,255,0.10)'}`,
             display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer',
             fontSize:18, transition:'all 0.2s', opacity: asking ? 0.5 : 1 }}>
-          ➤
+          &#x27A4;
         </button>
       </div>
-
-      {voiceState === 'listening' && (
-        <div style={{ textAlign:'center', fontSize:11, color:BEAR, fontFamily:'monospace',
-          paddingTop:4, letterSpacing:'0.08em', animation:'mPulse 1.4s ease-in-out infinite' }}>
-          ● LISTENING
-        </div>
-      )}
     </div>
   );
 }
@@ -1647,7 +1756,8 @@ export default function MobileHome() {
         )}
         {tab === 'brain' && <BrainTab data={data} />}
         {tab === 'chat' && (
-          <ChatTab authHeader={authHeader} ticker={ticker} speak={speak} />
+          <AvatarTab authHeader={authHeader} ticker={ticker} speak={speak}
+            speaking={speaking} avatarState={avatarState} narration={narration} />
         )}
         {tab === 'position' && (
           <PositionTab data={data} muted={muted} setMuted={setMuted} />
