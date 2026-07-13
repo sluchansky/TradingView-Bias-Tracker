@@ -2289,9 +2289,13 @@ export default function Home() {
   useEffect(() => {
     if (narration && narration !== lastSpokenRef.current) {
       lastSpokenRef.current = narration;
-      lastSpokeAtRef.current = Date.now();
-      setIdleLine(''); // real narration takes over the display
-      speakRef.current(narration);
+      setIdleLine(''); // real narration takes over the display (always update text)
+      // Don't cancel ongoing speech just because narration text changed —
+      // let the avatar finish what it's saying, then the next unique narration will play.
+      if (!speechCtrlRef.current.active) {
+        lastSpokeAtRef.current = Date.now();
+        speakRef.current(narration);
+      }
     }
   }, [narration]); // eslint-disable-line react-hooks/exhaustive-deps
 

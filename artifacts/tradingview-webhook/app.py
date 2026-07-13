@@ -40593,7 +40593,6 @@ def dashboard():
     <div id="mb-quick-q" class="mb-chips"></div>
     <div class="mb-chat-row">
       <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
-      <button type="button" class="mb-tts-btn" id="mb-tts-btn" onclick="mbTtsToggle()" title="Toggle voice narration">&#9835; Voice</button>
       <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask →</button>
     </div>
   </div><!-- /#mod-brain -->
@@ -43334,24 +43333,7 @@ function mbTtsToggle(){
   if(btn){ btn.textContent = _ttsMuted ? '\u266b Voice' : '\u266b Live'; btn.className = 'mb-tts-btn' + (_ttsMuted ? '' : ' tts-on'); }
   if(_ttsMuted && 'speechSynthesis' in window){ window.speechSynthesis.cancel(); _stopSpeakAnim(); }
 }
-function mbSpeak(text){
-  if(_ttsMuted || !text || text === _ttsLastNarr || !('speechSynthesis' in window)) return;
-  _ttsLastNarr = text;
-  window.speechSynthesis.cancel(); _stopSpeakAnim();
-  var utt = new SpeechSynthesisUtterance(text);
-  utt.rate = 0.92; utt.pitch = 0.88; utt.volume = 0.9;
-  try{
-    var voices = window.speechSynthesis.getVoices();
-    var _storedVoice = ''; try{ _storedVoice = localStorage.getItem('brain_voice') || ''; }catch(e){}
-    var pref = _storedVoice
-      ? voices.find(function(v){ return v.name === _storedVoice; })
-      : voices.find(function(v){ return v.lang.startsWith('en') && (v.name.indexOf('Daniel') >= 0 || v.name.indexOf('Alex') >= 0 || (v.name.indexOf('Google') >= 0 && v.name.indexOf('US') >= 0)); });
-    if(pref) utt.voice = pref;
-  }catch(ignore){}
-  utt.onstart = function(){ _startSpeakAnim(); };
-  utt.onend = utt.onerror = function(){ _stopSpeakAnim(); };
-  window.speechSynthesis.speak(utt);
-}
+function mbSpeak(text){ /* voice is owned by the cockpit avatar — no-op here */ }
 if('speechSynthesis' in window){ try{ window.speechSynthesis.getVoices(); }catch(ignore){} }
 
 // Avatar state → orb animation class mapping. DISPLAY-ONLY; never touches gate/scoring.
