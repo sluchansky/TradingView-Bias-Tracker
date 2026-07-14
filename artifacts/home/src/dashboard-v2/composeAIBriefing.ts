@@ -197,8 +197,9 @@ export function composeAIBriefing({
     ? sentence(`On ${ticker}, ${observation.slice(0, 3).join(", and ")}`)
     : `I’m monitoring ${ticker}, but the current status does not include a directional market read.`);
 
-  const why = reason
-    ?? (missing.length ? `the setup is still missing ${missing.join(", ")}` : null);
+  const why = missing.length
+    ? "required confirmation is incomplete"
+    : reason;
   sentences.push(why
     ? sentence(`The verdict is ${verdict} because ${why[0].toLowerCase()}${why.slice(1)}`)
     : ready
@@ -209,8 +210,8 @@ export function composeAIBriefing({
   if (confidence) {
     sentences.push(missing.length
       ? confidence === "strong"
-        ? "The edge reading is strong, but confirmation remains incomplete."
-        : sentence(`My confidence remains ${confidence} while confirmation is incomplete`)
+        ? "The edge reading is strong, but I’m not treating the setup as confirmed while required checks remain incomplete."
+        : sentence(`The current edge supports ${confidence} confidence, and required confirmation remains incomplete`)
       : sentence(`My confidence is ${confidence} based on the current edge reading`));
   }
 

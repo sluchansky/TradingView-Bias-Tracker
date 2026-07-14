@@ -34,7 +34,7 @@ test("explains WAIT with missing confirmation and next step", () => {
   assert.match(result.paragraph, /verdict is WAIT/i);
   assert.match(result.paragraph, /price is below VWAP/i);
   assert.match(result.paragraph, /confirmed break of structure/i);
-  assert.match(result.paragraph, /confidence remains developing/i);
+  assert.match(result.paragraph, /current edge supports developing confidence/i);
   assert.match(result.paragraph, /Wait for bullish BOS/i);
   assert.doesNotMatch(result.paragraph, /48\/110/);
 });
@@ -150,7 +150,7 @@ test("caps live briefing output at four sentences", () => {
   const sentences = result.paragraph.split(/(?<=[.!?])\s+/);
 
   assert.ok(sentences.length <= 4);
-  assert.match(result.paragraph, /confidence remains moderate/i);
+  assert.match(result.paragraph, /current edge supports moderate confidence/i);
   assert.match(result.paragraph, /I would reconsider if Price invalidates the current zone/i);
 });
 
@@ -187,5 +187,5 @@ test("mentions each natural missing confirmation only once", () => {
   const matches = result.paragraph.match(/confirmed break of structure/gi) ?? [];
 
   assert.equal(matches.length, 1);
-  assert.match(result.paragraph, /confidence remains moderate while confirmation is incomplete/i);
+  assert.match(result.paragraph, /current edge supports moderate confidence/i);
 });
