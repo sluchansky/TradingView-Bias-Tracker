@@ -36,7 +36,7 @@ test("explains WAIT with missing confirmation and next step", () => {
   assert.match(result.paragraph, /structure confirmation is missing/i);
   assert.match(result.paragraph, /current edge supports developing confidence/i);
   assert.doesNotMatch(result.paragraph, /Wait for bullish BOS/i);
-  assert.match(result.paragraph, /confirmation there would change my current assessment/i);
+  assert.match(result.paragraph, /a change there would alter my current assessment/i);
   assert.doesNotMatch(result.paragraph, /48\/110/);
 });
 
