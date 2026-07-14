@@ -32,6 +32,7 @@ import { STATE_ACCENT_HEX, STATE_PULSE_HZ } from './avatarTypes';
 // ─── Canvas ───────────────────────────────────────────────────────────────────
 const W = 420;
 const H = 560;
+const LORD_PIGGINGTON_SRC = '/LordPiggington.vrm';
 
 // ─── Animation state ──────────────────────────────────────────────────────────
 type AnimState = 'idle' | 'talking' | 'walking' | 'pointing' | 'thinking' | 'waving' | 'dancing' | 'shrug' | 'fistpump';
@@ -133,6 +134,27 @@ function calmIdleTargets(breathX: number, swayZ: number): BoneTargets {
     upperChest:    { x: breathX * 0.32, y: 0, z: swayZ * 0.14 },
     leftUpperLeg:  { x: 0.02, y: 0, z: swayZ * 0.08 },
     rightUpperLeg: { x: 0.02, y: 0, z: -swayZ * 0.08 },
+  };
+}
+
+function lordPiggingtonIdleTargets(breathX: number, swayZ: number): BoneTargets {
+  return {
+    hips:          { x: 0, y: 0, z: swayZ * 0.50 },
+    spine:         { x: breathX * 0.42, y: 0, z: swayZ * 0.28 },
+    chest:         { x: breathX * 0.72, y: 0, z: swayZ * 0.16 },
+    upperChest:    { x: breathX * 0.46, y: 0, z: swayZ * 0.10 },
+    leftUpperArm:  { x: 0, y: 0, z:  ARM_Z },
+    leftLowerArm:  { x: 0.18, y: 0, z: 0 },
+    leftHand:      { x: 0, y: 0, z: 0 },
+    rightUpperArm: { x: 0, y: 0, z: -ARM_Z },
+    rightLowerArm: { x: 0.18, y: 0, z: 0 },
+    rightHand:     { x: 0, y: 0, z: 0 },
+    leftUpperLeg:  { x: 0.02, y: 0, z: swayZ * 0.06 },
+    leftLowerLeg:  { x: 0.04, y: 0, z: 0 },
+    leftFoot:      { x: -0.04, y: 0, z: 0 },
+    rightUpperLeg: { x: 0.02, y: 0, z: -swayZ * 0.06 },
+    rightLowerLeg: { x: 0.04, y: 0, z: 0 },
+    rightFoot:     { x: -0.04, y: 0, z: 0 },
   };
 }
 
@@ -458,8 +480,9 @@ interface Props extends LordPiggingtonProps {
 
 function LordPiggingtonAvatar({
   avState, speaking, gazeEvent, speechCtrlRef, voiceListeningRef, debug = false,
-  vrmSrc = '/LordPiggington.vrm', calmMode = false, onLoad, onError,
+  vrmSrc = LORD_PIGGINGTON_SRC, calmMode = false, onLoad, onError,
 }: Props) {
+  const isLordPiggington = vrmSrc === LORD_PIGGINGTON_SRC;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const vrmRef    = useRef<VRM | null>(null);
   const accentRef = useRef<THREE.PointLight | null>(null);
@@ -742,6 +765,11 @@ function LordPiggingtonAvatar({
       }
 
       const anim = animStateRef.current;
+      const lordIdleActive = isLordPiggington
+        && !isSpeaking
+        && !isListening
+        && !isThinking
+        && (calmMode || anim === 'idle');
 
       // ── Locomotion (walk across screen) ───────────────────────────────────
       if (anim === 'walking') {
@@ -790,7 +818,9 @@ function LordPiggingtonAvatar({
             ? calmTalkTargets(breathX, swayZ, elapsed)
             : isThinking
               ? calmThinkingTargets(breathX, swayZ)
-              : calmIdleTargets(breathX, swayZ);
+              : isLordPiggington
+                ? lordPiggingtonIdleTargets(breathX, swayZ)
+                : calmIdleTargets(breathX, swayZ);
       } else {
         switch (anim) {
           case 'talking':   targets = talkTargets(breathX, swayZ, phi * 0.85, talkPhaseRef.current); break;
@@ -801,12 +831,14 @@ function LordPiggingtonAvatar({
           case 'dancing':   targets = danceTargets(phi * 0.52);                 break;
           case 'shrug':     targets = shrugTargets(breathX, elapsed);           break;
           case 'fistpump':  targets = fistpumpTargets(elapsed);                 break;
-          default:          targets = idleTargets(breathX, swayZ);              break;
+          default:          targets = isLordPiggington
+            ? lordPiggingtonIdleTargets(breathX, swayZ)
+            : idleTargets(breathX, swayZ);                                      break;
         }
       }
 
       // ── Lerp bone smooth values toward targets ────────────────────────────
-      const lerpF = 1 - Math.exp(-(calmMode ? 3.2 : 8) * dt);
+      const lerpF = 1 - Math.exp(-(lordIdleActive ? 10 : calmMode ? 3.2 : 8) * dt);
       for (const [name, tgt] of Object.entries(targets)) {
         const sm = boneSm[name] ?? (boneSm[name] = { x: 0, y: 0, z: 0 });
         sm.x = sm.x + (tgt.x - sm.x) * lerpF;
@@ -819,6 +851,12 @@ function LordPiggingtonAvatar({
         const sm   = boneSm[name];
         const bone = hum?.getNormalizedBoneNode?.(name as never);
         if (bone && sm) {
+          if (lordIdleActive
+              && Math.abs(bone.rotation.x - sm.x) < 0.00001
+              && Math.abs(bone.rotation.y - sm.y) < 0.00001
+              && Math.abs(bone.rotation.z - sm.z) < 0.00001) {
+            continue;
+          }
           bone.rotation.x = sm.x;
           bone.rotation.y = sm.y;
           bone.rotation.z = sm.z;
@@ -829,7 +867,9 @@ function LordPiggingtonAvatar({
       if (mktSt !== prevMktRef.current) {
         const pos = mktSt === 'READY_LONG'  || mktSt === 'TARGET_HIT';
         const neg = mktSt === 'STOP_HIT'    || mktSt === 'READY_SHORT';
-        if (pos || neg) nodRef.current = { active: true, t: 0, dir: pos ? 1 : -1 };
+        if ((pos || neg) && !(calmMode && isLordPiggington)) {
+          nodRef.current = { active: true, t: 0, dir: pos ? 1 : -1 };
+        }
         prevMktRef.current = mktSt;
 
         if (calmMode) {
@@ -972,9 +1012,9 @@ function LordPiggingtonAvatar({
         && (!calmMode || (!isSpeaking && !isListening && !isThinking));
       if (allowAmbientGlance && !gl.active && gl.t >= gl.nextGlance) {
         gl.active  = true; gl.t = 0; gl.holdT = 0;
-        const glanceScale = calmMode ? 0.065 : 0.22;
+        const glanceScale = lordIdleActive ? 0.035 : calmMode ? 0.065 : 0.22;
         gl.targetX = (Math.random() < 0.5 ? -1 : 1) * (glanceScale * (0.65 + Math.random() * 0.7));
-        gl.targetY = (Math.random() - 0.5) * (calmMode ? 0.045 : 0.09);
+        gl.targetY = (Math.random() - 0.5) * (lordIdleActive ? 0.024 : calmMode ? 0.045 : 0.09);
       }
       if (allowAmbientGlance && gl.active) {
         gl.holdT += dt; tYaw += gl.targetX; tPitch += gl.targetY;
