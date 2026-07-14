@@ -11,7 +11,7 @@ export function LevelsPanel({ data }: { data: DashboardStatus | null }) {
         <DataRow label="Demand" value={formatValue(data?.nearest_demand)} tone="bull" />
         <DataRow
           label="Last valid"
-          value={data?.last_valid_time ?? "Current snapshot"}
+          value={data ? (data.last_valid_time ?? "Current snapshot") : "Unavailable"}
         />
       </div>
     </DashboardPanel>

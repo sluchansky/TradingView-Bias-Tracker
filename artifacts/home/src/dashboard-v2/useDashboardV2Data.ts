@@ -19,9 +19,11 @@ function readStoredPassword(): string {
 }
 
 function authHeaders(password: string): Record<string, string> {
-  return password
-    ? { Authorization: `Basic ${btoa(`admin:${password}`)}` }
-    : {};
+  if (!password) return {};
+  const bytes = new TextEncoder().encode(`admin:${password}`);
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return { Authorization: `Basic ${btoa(binary)}` };
 }
 
 export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
@@ -33,7 +35,8 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [priceHistory, setPriceHistory] = useState<PricePoint[]>([]);
-  const refreshNonce = useRef(0);
+  const requestVersionRef = useRef(0);
+  const tickerRef = useRef<DashboardTicker>(initialTicker);
 
   const headers = useMemo(() => authHeaders(password), [password]);
 
@@ -56,7 +59,7 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
     setLastUpdated(now);
 
     const price = Number(payload.current_price);
-    if (Number.isFinite(price) && price > 0) {
+    if (payload.market_open === true && Number.isFinite(price) && price > 0) {
       setPriceHistory((previous) => [
         ...previous,
         { time: now, price },
@@ -68,11 +71,15 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
     selectedTicker: DashboardTicker,
     requestHeaders = headers,
   ): Promise<"ok" | "warming" | "unauthorized" | "error"> => {
+    const requestVersion = ++requestVersionRef.current;
     try {
       const response = await fetch(
         `/api/status?ticker=${encodeURIComponent(selectedTicker)}`,
         { credentials: "include", headers: requestHeaders },
       );
+      if (requestVersion !== requestVersionRef.current || selectedTicker !== tickerRef.current) {
+        return "ok";
+      }
 
       if (response.status === 401) {
         clearAuth();
@@ -123,9 +130,14 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
   }, [fetchStatus, ticker]);
 
   const refresh = useCallback(() => {
-    refreshNonce.current += 1;
     void fetchStatus(ticker);
   }, [fetchStatus, ticker]);
+
+  const selectTicker = useCallback((nextTicker: DashboardTicker) => {
+    requestVersionRef.current += 1;
+    tickerRef.current = nextTicker;
+    setTicker(nextTicker);
+  }, []);
 
   useEffect(() => {
     setData(null);
@@ -144,6 +156,7 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
     void poll();
     return () => {
       active = false;
+      requestVersionRef.current += 1;
       if (timeout) clearTimeout(timeout);
     };
   }, [fetchStatus, password, ticker]);
@@ -168,14 +181,17 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
       clearAuth();
       throw new Error("Your dashboard session expired.");
     }
-    const payload = await response.json() as { answer?: string; error?: string };
-    if (!response.ok) throw new Error(payload.error || `Assistant request failed (${response.status}).`);
-    return payload.answer || payload.error || "The assistant did not return a response.";
+    const payload = await response.json() as { ok?: boolean; answer?: string; error?: string };
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload.error || `Assistant request failed (${response.status}).`);
+    }
+    if (!payload.answer) throw new Error("The assistant did not return a response.");
+    return payload.answer;
   }, [clearAuth, headers, ticker]);
 
   return {
     ticker,
-    setTicker,
+    setTicker: selectTicker,
     data,
     connection,
     error,

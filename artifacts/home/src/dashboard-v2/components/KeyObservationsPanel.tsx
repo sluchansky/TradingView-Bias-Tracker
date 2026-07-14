@@ -28,7 +28,7 @@ export function KeyObservationsPanel({ data }: { data: DashboardStatus | null })
       )}
       <div className="dv2-current-action">
         <span className="dv2-eyebrow">Current action</span>
-        <strong>{currentAction ?? "Wait for the next confirmed condition."}</strong>
+        <strong>{currentAction ?? (data ? "Wait for the next confirmed condition." : "Unavailable")}</strong>
       </div>
     </DashboardPanel>
   );

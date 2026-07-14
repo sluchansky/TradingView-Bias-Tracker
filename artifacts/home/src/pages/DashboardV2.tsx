@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AvatarState } from "@/components/avatar/avatarTypes";
 import { AIReasoningPanel } from "@/dashboard-v2/components/AIReasoningPanel";
 import { AvatarPanel } from "@/dashboard-v2/components/AvatarPanel";
@@ -26,6 +26,15 @@ export default function DashboardV2() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const brain = asRecord(dashboard.data?.main_brain);
 
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSettingsOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [settingsOpen]);
+
   const avatarState = useMemo<AvatarState>(() => {
     if (!dashboard.data) return "WAIT";
     const status = (asString(brain.status) ?? asString(dashboard.data.verdict) ?? "").toUpperCase();
@@ -51,12 +60,18 @@ export default function DashboardV2() {
         data={dashboard.data}
         connection={dashboard.connection}
         muted={voice.muted}
+        settingsOpen={settingsOpen}
         onToggleMuted={() => voice.setMuted(!voice.muted)}
         onToggleSettings={() => setSettingsOpen((open) => !open)}
       />
 
       {settingsOpen && (
-        <div className="dv2-settings" role="dialog" aria-label="Dashboard settings">
+        <div
+          id="dashboard-v2-settings"
+          className="dv2-settings"
+          role="region"
+          aria-label="Dashboard settings"
+        >
           <div>
             <strong>Dashboard V2 settings</strong>
             <span>

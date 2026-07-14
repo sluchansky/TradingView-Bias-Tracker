@@ -27,6 +27,7 @@ export function DashboardV2Header({
   data,
   connection,
   muted,
+  settingsOpen,
   onToggleMuted,
   onToggleSettings,
 }: {
@@ -35,6 +36,7 @@ export function DashboardV2Header({
   data: DashboardStatus | null;
   connection: ConnectionState;
   muted: boolean;
+  settingsOpen: boolean;
   onToggleMuted: () => void;
   onToggleSettings: () => void;
 }) {
@@ -71,11 +73,11 @@ export function DashboardV2Header({
           <i />
           {connection === "connected" ? "Connected" : connection}
         </span>
-        <span className={marketOpen ? "dv2-bull" : "dv2-caution"}>
-          {data ? (marketOpen ? "Market open" : "Market closed") : "Market —"}
+        <span className={data ? (marketOpen ? "dv2-bull" : "dv2-caution") : undefined}>
+          {data ? (marketOpen ? "Market open" : "Market closed") : "Market unavailable"}
         </span>
-        <span className={demo ? "dv2-caution" : "dv2-info"}>
-          {demo ? "Demo / paper" : "Live data"}
+        <span className={data ? (demo ? "dv2-caution" : "dv2-info") : undefined}>
+          {data ? (demo ? "Demo / paper" : "Live data") : "Mode unavailable"}
         </span>
         <time>{time}</time>
         <button
@@ -92,6 +94,8 @@ export function DashboardV2Header({
           type="button"
           onClick={onToggleSettings}
           aria-label="Open dashboard settings"
+          aria-expanded={settingsOpen}
+          aria-controls="dashboard-v2-settings"
         >
           Settings
         </button>

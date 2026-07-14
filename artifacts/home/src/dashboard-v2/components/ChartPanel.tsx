@@ -36,16 +36,26 @@ export function ChartPanel({
   const x = (index: number) => points.length <= 1 ? width / 2 : (index / (points.length - 1)) * width;
   const y = (price: number) => plotTop + ((high - price) / range) * (plotBottom - plotTop);
   const polyline = points.map((point, index) => `${x(index)},${y(point.price)}`).join(" ");
+  const marketOpen = data?.market_open === true;
+  const displayPrice = marketOpen ? data?.current_price : data?.last_valid_price ?? data?.current_price;
 
   return (
     <DashboardPanel
-      title="Live price"
-      eyebrow="Real samples from status polling"
+      title={marketOpen ? "Live price" : "Price chart"}
+      eyebrow={marketOpen
+        ? "Real samples from status polling"
+        : data
+          ? "Market closed · last valid snapshot"
+          : "No live data available"}
       className="dv2-chart-panel"
     >
       <div className="dv2-chart-meta">
-        <strong>{formatValue(data?.current_price)}</strong>
-        <span>{points.length} live sample{points.length === 1 ? "" : "s"}</span>
+        <strong>{formatValue(displayPrice)}</strong>
+        <span>
+          {marketOpen
+            ? `${points.length} live sample${points.length === 1 ? "" : "s"}`
+            : data?.last_valid_time ?? "No live sampling while closed"}
+        </span>
       </div>
       {points.length ? (
         <div className="dv2-chart-wrap">
@@ -86,7 +96,13 @@ export function ChartPanel({
           </svg>
         </div>
       ) : (
-        <Unavailable>Waiting for the first real price sample.</Unavailable>
+        <Unavailable>
+          {!data
+            ? "Waiting for live status data."
+            : marketOpen
+            ? "Waiting for the first real price sample."
+            : "The market is closed. Live sampling will resume when it opens."}
+        </Unavailable>
       )}
     </DashboardPanel>
   );

@@ -17,9 +17,14 @@ export function DashboardV2Login({
           if (!password.trim() || submitting) return;
           setSubmitting(true);
           setError(null);
-          const accepted = await authenticate(password);
-          if (!accepted) setError("Unable to authenticate with that password.");
-          setSubmitting(false);
+          try {
+            const accepted = await authenticate(password);
+            if (!accepted) setError("Unable to authenticate with that password.");
+          } catch {
+            setError("Unable to authenticate with that password.");
+          } finally {
+            setSubmitting(false);
+          }
         }}
       >
         <span className="dv2-brand-mark">AI</span>

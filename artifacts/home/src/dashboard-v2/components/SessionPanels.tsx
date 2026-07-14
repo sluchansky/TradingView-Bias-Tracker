@@ -17,14 +17,14 @@ export function SessionPerformancePanel({ data }: { data: DashboardStatus | null
   const equity = asRecord(data?.equity_curve_today);
   const wins = asNumber(equity.wins) ?? asNumber(quality.wins);
   const losses = asNumber(equity.losses) ?? asNumber(quality.losses);
-  const expectancy = asNumber(learning.expectancy);
+  const averageR = asNumber(learning.avg_r);
 
   return (
     <DashboardPanel title="Session performance">
       <div className="dv2-data-list">
         <DataRow label="Record" value={wins === null && losses === null ? "Unavailable" : `${wins ?? 0}W · ${losses ?? 0}L`} />
-        <DataRow label="Expectancy" value={expectancy === null ? "Unavailable" : `${expectancy.toFixed(2)}R`} />
-        <DataRow label="Quality" value={asString(quality.grade) ?? asString(quality.label) ?? "Unavailable"} />
+        <DataRow label="Average result" value={averageR === null ? "Unavailable" : `${averageR.toFixed(2)}R`} />
+        <DataRow label="Quality" value={asString(quality.overall_grade) ?? "Unavailable"} />
       </div>
     </DashboardPanel>
   );
@@ -53,14 +53,26 @@ export function NewsSessionPanel({ data }: { data: DashboardStatus | null }) {
   const news = asRecord(data?.news_filter);
   const nextEvent = asRecord(news.next_event);
   const eventName = asString(nextEvent.title) ?? asString(nextEvent.name);
+  const sessionLabel = data?.session_preferred === true
+    ? "Preferred window"
+    : data?.session_preferred === false
+      ? "Outside preferred window"
+      : "Unavailable";
+  const nextOpen = !data
+    ? "Unavailable"
+    : data.market_open === false
+      ? data.next_open ?? "Unavailable"
+      : data.market_open === true
+        ? "Market is open"
+        : "Unavailable";
 
   return (
     <DashboardPanel title="News & session">
       <div className="dv2-data-list">
         <DataRow label="Window" value={data?.session_window ?? "Unavailable"} />
-        <DataRow label="Session" value={data?.session_preferred ? "Preferred window" : "Outside preferred window"} />
+        <DataRow label="Session" value={sessionLabel} />
         <DataRow label="Next event" value={eventName ?? asString(news.reason) ?? "No event available"} />
-        <DataRow label="Next open" value={data?.market_open === false ? data.next_open ?? "Unavailable" : "Market is open"} />
+        <DataRow label="Next open" value={nextOpen} />
       </div>
     </DashboardPanel>
   );

@@ -15,9 +15,9 @@ export function EvidenceSnapshotPanel({ data }: { data: DashboardStatus | null }
   const gate = asRecord(data?.gate_debug);
   const confluences = asRecord(data?.confluences);
   const items = EVIDENCE_KEYS.map(([key, label]) => {
-    const raw = gate[key] ?? confluences[key] ?? (
-      key === "zone_valid" ? confluences.zone_confirmed : undefined
-    );
+    const raw = key === "zone_valid"
+      ? gate.zoneValid ?? gate.zone_valid ?? confluences.zone_confirmed
+      : gate[key] ?? confluences[key];
     return { label, value: typeof raw === "boolean" ? raw : null };
   });
   const hasEvidence = items.some((item) => item.value !== null);

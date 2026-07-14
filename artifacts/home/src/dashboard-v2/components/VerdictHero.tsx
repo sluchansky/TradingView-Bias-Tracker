@@ -6,7 +6,7 @@ export function VerdictHero({ data, loading }: { data: DashboardStatus | null; l
   const status = (
     asString(brain.status)
     ?? asString(data?.verdict)
-    ?? (loading ? "CONNECTING" : "WAIT")
+    ?? (loading ? "CONNECTING" : "UNAVAILABLE")
   ).toUpperCase();
   const direction = asString(brain.favored_direction) ?? asString(data?.strict_direction);
   const edge = asNumber(brain.edge_score) ?? asNumber(data?.edge_score);
