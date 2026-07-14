@@ -13,6 +13,7 @@ test("returns an honest unavailable-data briefing", () => {
   assert.equal(result.status, "Waiting for market data");
   assert.match(result.paragraph, /trading service is currently unavailable/i);
   assert.match(result.paragraph, /fresh status data/i);
+  assert.doesNotMatch(result.paragraph, /^Unavailable\.?$/i);
 });
 
 test("explains WAIT with missing confirmation and next step", () => {
@@ -31,10 +32,11 @@ test("explains WAIT with missing confirmation and next step", () => {
 
   assert.equal(result.status, "Waiting for confirmation");
   assert.match(result.paragraph, /verdict is WAIT/i);
-  assert.match(result.paragraph, /48\/110/);
   assert.match(result.paragraph, /price is below VWAP/i);
-  assert.match(result.paragraph, /still waiting on BOS/i);
+  assert.match(result.paragraph, /confirmed break of structure/i);
+  assert.match(result.paragraph, /confidence remains developing/i);
   assert.match(result.paragraph, /Wait for bullish BOS/i);
+  assert.doesNotMatch(result.paragraph, /48\/110/);
 });
 
 test("composes a READY LONG briefing", () => {
@@ -49,7 +51,7 @@ test("composes a READY LONG briefing", () => {
 
   assert.equal(result.status, "Setup ready");
   assert.match(result.paragraph, /verdict is READY LONG/i);
-  assert.match(result.paragraph, /82\/110/);
+  assert.match(result.paragraph, /confidence is strong/i);
   assert.doesNotMatch(result.paragraph, /READY SHORT/i);
 });
 
@@ -65,7 +67,7 @@ test("composes a READY SHORT briefing", () => {
 
   assert.equal(result.status, "Setup ready");
   assert.match(result.paragraph, /verdict is READY SHORT/i);
-  assert.match(result.paragraph, /77\/110/);
+  assert.match(result.paragraph, /confidence is moderate/i);
   assert.doesNotMatch(result.paragraph, /READY LONG/i);
 });
 
@@ -107,7 +109,7 @@ test("sanitizes multi-sentence missing-confirmation text", () => {
     strict_missing: ["BOS missing.Second sentence!Third sentence"],
   });
 
-  assert.match(result.paragraph, /still waiting on BOS missing/i);
+  assert.match(result.paragraph, /confirmed break of structure/i);
   assert.doesNotMatch(result.paragraph, /Second sentence|Third sentence/i);
 });
 
@@ -130,4 +132,24 @@ test("preserves common abbreviations while flattening source sentences", () => {
 
   assert.match(result.paragraph, /U\.S\. session; Confirm structure next/i);
   assert.doesNotMatch(result.paragraph, /Await the U\.(?:\s|$)/);
+});
+
+test("caps live briefing output at four sentences", () => {
+  const result = connected({
+    verdict: "WAIT",
+    edge_score: 61,
+    bias: "Bullish",
+    market_structure: "Range Structure",
+    current_price: 100,
+    vwap_value: 101,
+    strict_reason: "Structure is incomplete",
+    strict_missing: ["BOS", "VWAP confirmation"],
+    stage_next_step: "Wait for a bullish BOS",
+    stage_invalidation: "Price invalidates the current zone",
+  });
+  const sentences = result.paragraph.split(/(?<=[.!?])\s+/);
+
+  assert.ok(sentences.length <= 4);
+  assert.match(result.paragraph, /confidence remains moderate/i);
+  assert.match(result.paragraph, /I would reconsider if Price invalidates the current zone/i);
 });

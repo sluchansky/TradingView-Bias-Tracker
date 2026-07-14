@@ -74,6 +74,34 @@ function sameText(left: string | null, right: string | null): boolean {
     && left.toLowerCase().replace(/[.!?;]$/, "") === right.toLowerCase().replace(/[.!?;]$/, "");
 }
 
+function naturalConfirmation(value: string, direction: string | null): string {
+  const normalized = value.toLowerCase().replace(/_/g, " ");
+  if (/\bbos\b|break of structure|structure/.test(normalized)) {
+    return "a confirmed break of structure";
+  }
+  if (/vwap/.test(normalized)) {
+    return direction === "Long"
+      ? "a VWAP reclaim"
+      : direction === "Short"
+        ? "VWAP confirmation for the short"
+        : "VWAP confirmation";
+  }
+  if (/liquidity|sweep/.test(normalized)) return "liquidity confirmation";
+  if (/zone/.test(normalized)) return "zone confirmation";
+  if (/cvd|delta/.test(normalized)) return "delta confirmation";
+  if (/volume|rvol/.test(normalized)) return "volume confirmation";
+  if (/location|entry quality/.test(normalized)) return "entry-location confirmation";
+  return normalized;
+}
+
+function confidenceLanguage(edge: number | null): string | null {
+  if (edge === null) return null;
+  if (edge >= 80) return "strong";
+  if (edge >= 55) return "moderate";
+  if (edge >= 30) return "developing";
+  return "limited";
+}
+
 export function composeAIBriefing({
   data,
   ticker,
@@ -98,6 +126,7 @@ export function composeAIBriefing({
   const brainState = record(data.brain_state);
   const marketRead = record(brainState.market_read);
   const liquidityFocus = record(brain.liquidity_focus);
+  const gate = record(data.gate_debug);
   const rawStatus = (text(data.verdict) ?? text(brain.status) ?? "WAIT").toUpperCase();
   const directionValue = text(data.strict_direction) ?? text(brain.favored_direction);
   const direction = /^(short|bearish)$/i.test(directionValue ?? "")
@@ -127,14 +156,26 @@ export function composeAIBriefing({
   const volatility = concise(text(marketRead.volatility)
     ?? text(record(root.volatility).regime));
   const reason = concise(text(data.strict_reason) ?? text(brain.wait_reason));
-  const missing = Array.isArray(data.strict_missing)
+  const explicitMissing = Array.isArray(data.strict_missing)
     ? data.strict_missing
       .map((item) => conciseMissing(text(item)))
       .filter((item): item is string => item !== null)
       .slice(0, 3)
       .map((item) => item.replace(/_/g, " "))
     : [];
+  const gateMissing = [
+    gate.structure_confirmed === false || gate.bosState === false ? "structure confirmation" : null,
+    gate.vwap_confirmed === false || gate.vwapState === false ? "VWAP confirmation" : null,
+    gate.zoneValid === false ? "zone confirmation" : null,
+    gate.cvd_ok === false ? "delta confirmation" : null,
+    gate.volume_ok === false ? "volume confirmation" : null,
+  ].filter((item): item is string => item !== null);
+  const missing = [...explicitMissing, ...gateMissing]
+    .map((item) => naturalConfirmation(item, direction))
+    .filter((item, index, items) => items.indexOf(item) === index)
+    .slice(0, 3);
   const nextStep = concise(text(data.stage_next_step));
+  const invalidation = concise(text(data.stage_invalidation));
 
   const status = ready
     ? "Setup ready"
@@ -145,37 +186,54 @@ export function composeAIBriefing({
         : `Monitoring ${ticker}`;
 
   const sentences: string[] = [];
-  const view = [
-    bias ? `${bias.toLowerCase()} bias` : null,
-    structure ? structure.toLowerCase() : null,
-  ].filter((item): item is string => item !== null);
-  sentences.push(view.length
-    ? sentence(`On ${ticker}, I see ${view.join(" with ")}`)
-    : `I’m monitoring ${ticker}.`);
-
-  const context: string[] = [];
+  const observation: string[] = [];
+  if (bias) observation.push(`the bias is ${bias.toLowerCase()}`);
+  if (structure) observation.push(`structure is ${structure.toLowerCase()}`);
   if (price !== null && vwap !== null) {
-    context.push(`price is ${price === vwap ? "at" : price > vwap ? "above" : "below"} VWAP`);
+    observation.push(`price is ${price === vwap ? "at" : price > vwap ? "above" : "below"} VWAP`);
   }
-  if (liquidity) context.push(`liquidity is ${liquidity}`);
-  if (orderFlow) context.push(`order flow is ${orderFlow}`);
-  if (volatility) context.push(`volatility is ${volatility}`);
-  if (context.length) sentences.push(sentence(`${context.slice(0, 3).join("; ")}`));
+  if (!observation.length && orderFlow) observation.push(`order flow is ${orderFlow}`);
+  if (!observation.length && liquidity) observation.push(`liquidity is ${liquidity}`);
+  if (!observation.length && volatility) observation.push(`volatility is ${volatility}`);
+  sentences.push(observation.length
+    ? sentence(`On ${ticker}, ${observation.slice(0, 3).join(", and ")}`)
+    : `I’m monitoring ${ticker}, but the current status does not include a directional market read.`);
 
-  const edgeText = edge === null ? "" : ` at an edge score of ${Math.round(edge)}/110`;
-  sentences.push(reason
-    ? sentence(`The verdict is ${verdict}${edgeText}: ${reason}`)
-    : sentence(`The verdict is ${verdict}${edgeText}`));
+  const why = reason
+    ?? (missing.length ? `the setup is still missing ${missing.join(", ")}` : null);
+  sentences.push(why
+    ? sentence(`The verdict is ${verdict} because ${why[0].toLowerCase()}${why.slice(1)}`)
+    : ready
+      ? sentence(`The verdict is ${verdict} because the current trading status marks the setup as ready`)
+      : `The verdict is WAIT; the current status does not include a specific decision reason.`);
 
-  if (missing.length && !sameText(missing.join(", "), reason)) {
-    sentences.push(sentence(`I’m still waiting on ${missing.join(", ")}`));
+  const confidence = confidenceLanguage(edge);
+  if (confidence) {
+    sentences.push(missing.length
+      ? sentence(`My confidence remains ${confidence} because ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} still outstanding`)
+      : sentence(`My confidence is ${confidence} based on the current edge reading`));
   }
-  if (nextStep && !sameText(nextStep, reason) && !missing.some((item) => sameText(item, nextStep))) {
-    sentences.push(sentence(`Next, I’m watching for ${nextStep}`));
+
+  const nextDistinct = nextStep && !sameText(nextStep, reason) ? nextStep : null;
+  const watchTarget = missing.length
+    ? missing.join(", ")
+    : nextDistinct;
+  if (watchTarget || invalidation) {
+    const watchClause = watchTarget
+      ? `I’m watching for ${watchTarget}`
+      : "I’m holding the current view";
+    const changeClause = invalidation
+      ? `I would reconsider if ${invalidation}`
+      : nextDistinct && nextDistinct !== watchTarget
+        ? `I would reassess when the status reports ${nextDistinct}`
+        : "confirmation there would change my current assessment";
+    sentences.push(sentence(`${watchClause}; ${changeClause}`));
+  } else if (sentences.length < 3) {
+    sentences.push("I’ll continue monitoring fresh status updates before changing this assessment.");
   }
 
   return {
     status,
-    paragraph: sentences.slice(0, 5).join(" "),
+    paragraph: sentences.slice(0, 4).join(" "),
   };
 }
