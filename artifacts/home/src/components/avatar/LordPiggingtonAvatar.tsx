@@ -405,11 +405,12 @@ interface DebugData {
 interface Props extends LordPiggingtonProps {
   debug?:   boolean;
   vrmSrc?:  string;
+  calmMode?: boolean;
 }
 
 function LordPiggingtonAvatar({
   avState, speaking, gazeEvent, speechCtrlRef, debug = false,
-  vrmSrc = '/LordPiggington.vrm',
+  vrmSrc = '/LordPiggington.vrm', calmMode = false,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const vrmRef    = useRef<VRM | null>(null);
@@ -598,12 +599,15 @@ function LordPiggingtonAvatar({
         exprMgrFound: !!vrm.expressionManager, bonesFound, bonesMissing,
       };
 
-      // Wave on first load
-      setTimeout(() => {
-        prevAnimRef.current  = 'idle';
-        animStateRef.current = 'waving';
-        oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 3.5 };
-      }, 800);
+      // The V2 dashboard requests a calm, presentation-safe idle. Existing
+      // consumers retain the original welcome wave by default.
+      if (!calmMode) {
+        setTimeout(() => {
+          prevAnimRef.current  = 'idle';
+          animStateRef.current = 'waving';
+          oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 3.5 };
+        }, 800);
+      }
     },
     undefined,
     (err) => console.error('[Avatar] load error:', err));
@@ -684,7 +688,7 @@ function LordPiggingtonAvatar({
 
       // ── Spontaneous roam timer ────────────────────────────────────────────
       roamRef.current.t += dt;
-      if (!oneShotRef.current && anim === 'idle' && roamRef.current.t >= roamRef.current.next) {
+      if (!calmMode && !oneShotRef.current && anim === 'idle' && roamRef.current.t >= roamRef.current.next) {
         roamRef.current.t    = 0;
         roamRef.current.next = 18 + Math.random() * 16;
         // Random direction + walk duration
@@ -738,7 +742,12 @@ function LordPiggingtonAvatar({
         if (pos || neg) nodRef.current = { active: true, t: 0, dir: pos ? 1 : -1 };
         prevMktRef.current = mktSt;
 
-        if (mktSt === 'READY_LONG' || mktSt === 'READY_SHORT') {
+        if (calmMode) {
+          if (!isSpeaking) {
+            oneShotRef.current = null;
+            animStateRef.current = 'idle';
+          }
+        } else if (mktSt === 'READY_LONG' || mktSt === 'READY_SHORT') {
           oneShotRef.current   = null;
           animStateRef.current = 'dancing';
         } else if (mktSt === 'TARGET_HIT') {
@@ -926,7 +935,7 @@ function LordPiggingtonAvatar({
       renderer.dispose();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vrmSrc]);
+  }, [vrmSrc, calmMode]);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
