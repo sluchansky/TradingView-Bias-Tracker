@@ -570,6 +570,7 @@ function LordPiggingtonAvatar({
         return;
       }
 
+      try {
       VRMUtils.rotateVRM0(vrm);
       scene.add(vrm.scene);
       vrmRef.current = vrm;
@@ -609,7 +610,6 @@ function LordPiggingtonAvatar({
         expressionNames: allNames, availableMouth: foundMouth,
         exprMgrFound: !!vrm.expressionManager, bonesFound, bonesMissing,
       };
-      onLoad?.(vrmSrc);
 
       // The V2 dashboard requests a calm, presentation-safe idle. Existing
       // consumers retain the original welcome wave by default.
@@ -619,6 +619,14 @@ function LordPiggingtonAvatar({
           animStateRef.current = 'waving';
           oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 3.5 };
         }, 800);
+      }
+      onLoad?.(vrmSrc);
+      } catch (err) {
+        console.error('[Avatar] setup error:', err);
+        vrmRef.current = null;
+        scene.remove(vrm.scene);
+        try { VRMUtils.deepDispose(vrm.scene); } catch (_) {}
+        if (!cancelled) onError?.(vrmSrc);
       }
     },
     undefined,
