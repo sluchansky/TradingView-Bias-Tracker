@@ -110,3 +110,24 @@ test("sanitizes multi-sentence missing-confirmation text", () => {
   assert.match(result.paragraph, /still waiting on BOS missing/i);
   assert.doesNotMatch(result.paragraph, /Second sentence|Third sentence/i);
 });
+
+test("does not treat NOT READY as actionable", () => {
+  const result = connected({
+    verdict: "SETUP NOT READY",
+    strict_direction: "Long",
+    strict_reason: "One confirmation remains",
+  });
+
+  assert.match(result.paragraph, /verdict is WAIT/i);
+  assert.doesNotMatch(result.paragraph, /READY LONG/i);
+});
+
+test("preserves common abbreviations while flattening source sentences", () => {
+  const result = connected({
+    verdict: "WAIT",
+    stage_next_step: "Await the U.S. session.Confirm structure next.",
+  });
+
+  assert.match(result.paragraph, /U\.S\. session; Confirm structure next/i);
+  assert.doesNotMatch(result.paragraph, /Await the U\.(?:\s|$)/);
+});

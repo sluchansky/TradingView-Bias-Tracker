@@ -21,13 +21,46 @@ function number(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function flattenPunctuation(value: string): string {
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "!" || character === "?") {
+      output += ";";
+      continue;
+    }
+    if (character !== ".") {
+      output += character;
+      continue;
+    }
+
+    const previous = value[index - 1] ?? "";
+    const next = value[index + 1] ?? "";
+    const token = value.slice(Math.max(0, value.lastIndexOf(" ", index - 1) + 1), index);
+    const decimal = /\d/.test(previous) && /\d/.test(next);
+    const abbreviation = /^[A-Za-z]$/.test(token)
+      || /^(?:[A-Za-z]\.)+[A-Za-z]$/.test(token);
+    output += decimal || abbreviation ? "." : ";";
+  }
+  return output
+    .replace(/\s*;\s*/g, "; ")
+    .replace(/(?:;\s*)+/g, "; ")
+    .replace(/[;\s]+$/, "")
+    .trim();
+}
+
 function concise(value: string | null, maxLength = 220): string | null {
   if (!value) return null;
-  const firstSentence = value.split(/[!?]|\.(?!\d)/)[0].trim();
-  if (!firstSentence) return null;
-  return firstSentence.length <= maxLength
-    ? firstSentence
-    : `${firstSentence.slice(0, maxLength - 1).trimEnd()}…`;
+  const flattened = flattenPunctuation(value);
+  if (!flattened) return null;
+  return flattened.length <= maxLength
+    ? flattened
+    : `${flattened.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function conciseMissing(value: string | null): string | null {
+  const flattened = concise(value, 100);
+  return flattened?.split(";")[0].trim() || null;
 }
 
 function sentence(value: string): string {
@@ -38,7 +71,7 @@ function sentence(value: string): string {
 
 function sameText(left: string | null, right: string | null): boolean {
   return left !== null && right !== null
-    && left.toLowerCase().replace(/[.!?]$/, "") === right.toLowerCase().replace(/[.!?]$/, "");
+    && left.toLowerCase().replace(/[.!?;]$/, "") === right.toLowerCase().replace(/[.!?;]$/, "");
 }
 
 export function composeAIBriefing({
@@ -76,7 +109,9 @@ export function composeAIBriefing({
         : /long|bull/i.test(rawStatus)
           ? "Long"
           : null;
-  const ready = /READY|STRONG TRADE|POSSIBLE TRADE/i.test(rawStatus);
+  const explicitlyNotReady = /\b(?:NOT READY|WAIT|NO TRADE|INVALIDATED)\b/i.test(rawStatus);
+  const ready = !explicitlyNotReady
+    && /\b(?:READY|STRONG TRADE|POSSIBLE TRADE)\b/i.test(rawStatus);
   const verdict = ready
     ? direction
       ? (/short|bear/i.test(direction) ? "READY SHORT" : "READY LONG")
@@ -94,7 +129,7 @@ export function composeAIBriefing({
   const reason = concise(text(data.strict_reason) ?? text(brain.wait_reason));
   const missing = Array.isArray(data.strict_missing)
     ? data.strict_missing
-      .map((item) => concise(text(item), 100))
+      .map((item) => conciseMissing(text(item)))
       .filter((item): item is string => item !== null)
       .slice(0, 3)
       .map((item) => item.replace(/_/g, " "))
