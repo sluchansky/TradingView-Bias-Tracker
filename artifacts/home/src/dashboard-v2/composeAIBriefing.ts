@@ -159,10 +159,19 @@ function afterBecause(value: string): string {
 }
 
 function watchTarget(value: string): string {
-  return value
+  const normalized = value
     .replace(/^(?:wait|watch)\s+for\s+/i, "")
     .replace(/^await\s+/i, "")
     .trim();
+  const imperative = normalized.match(/^(resolve|confirm|enter)\s+(.+)$/i);
+  if (!imperative) return normalized;
+  const [, verb, rest] = imperative;
+  const naturalRest = afterBecause(rest);
+  if (/^resolve$/i.test(verb)) return `resolution of ${naturalRest}`;
+  if (/^confirm$/i.test(verb)) return `confirmation of ${naturalRest}`;
+  return /^(after|when|on)\b/i.test(naturalRest)
+    ? `an entry condition ${naturalRest}`
+    : `an entry condition for ${naturalRest}`;
 }
 
 export function composeAIBriefing({

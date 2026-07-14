@@ -257,6 +257,7 @@ test("classifies conflict resolution as a condition", () => {
 
   assert.equal(cvd.status, "Waiting for conditions");
   assert.equal(structure.status, "Waiting for conditions");
+  assert.match(structure.paragraph, /watching for resolution of conflicting structure/i);
 });
 
 test("preserves leading acronyms in verdict reasoning", () => {
@@ -277,4 +278,15 @@ test("removes imperative prefixes from the watch sentence", () => {
 
   assert.match(result.paragraph, /I’m watching for buyers to reclaim VWAP/i);
   assert.doesNotMatch(result.paragraph, /watching for Wait for/i);
+});
+
+test("naturalizes resolve, confirm, and enter imperatives", () => {
+  const resolve = connected({ verdict: "WAIT", stage_next_step: "Resolve conflicting structure" });
+  const confirm = connected({ verdict: "WAIT", stage_next_step: "Confirm VWAP reclaim" });
+  const enter = connected({ verdict: "WAIT", stage_next_step: "Enter after bullish BOS" });
+
+  assert.match(resolve.paragraph, /watching for resolution of conflicting structure/i);
+  assert.match(confirm.paragraph, /watching for confirmation of VWAP reclaim/i);
+  assert.match(enter.paragraph, /watching for an entry condition after bullish BOS/i);
+  assert.doesNotMatch(`${resolve.paragraph} ${confirm.paragraph} ${enter.paragraph}`, /watching for (Resolve|Confirm|Enter)\b/);
 });
