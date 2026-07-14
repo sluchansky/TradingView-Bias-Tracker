@@ -41,7 +41,7 @@ export function DashboardV2Header({
   onToggleSettings: () => void;
 }) {
   const time = useEasternClock();
-  const marketOpen = data?.market_open === true;
+  const marketOpen = data?.market_open;
   const execution = String(data?.execution_mode ?? "");
   const demo = data?._demo === true || /paper|sim|demo/i.test(execution);
 
@@ -73,8 +73,8 @@ export function DashboardV2Header({
           <i />
           {connection === "connected" ? "Connected" : connection}
         </span>
-        <span className={data ? (marketOpen ? "dv2-bull" : "dv2-caution") : undefined}>
-          {data ? (marketOpen ? "Market open" : "Market closed") : "Market unavailable"}
+        <span className={marketOpen === true ? "dv2-bull" : marketOpen === false ? "dv2-caution" : undefined}>
+          {marketOpen === true ? "Market open" : marketOpen === false ? "Market closed" : "Market unavailable"}
         </span>
         <span className={data ? (demo ? "dv2-caution" : "dv2-info") : undefined}>
           {data ? (demo ? "Demo / paper" : "Live data") : "Mode unavailable"}

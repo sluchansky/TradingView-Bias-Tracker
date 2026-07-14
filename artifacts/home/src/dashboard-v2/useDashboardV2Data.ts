@@ -136,6 +136,10 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
   const selectTicker = useCallback((nextTicker: DashboardTicker) => {
     requestVersionRef.current += 1;
     tickerRef.current = nextTicker;
+    setData(null);
+    setPriceHistory([]);
+    setError(null);
+    setConnection("loading");
     setTicker(nextTicker);
   }, []);
 

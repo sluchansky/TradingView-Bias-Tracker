@@ -71,7 +71,10 @@ export function NewsSessionPanel({ data }: { data: DashboardStatus | null }) {
       <div className="dv2-data-list">
         <DataRow label="Window" value={data?.session_window ?? "Unavailable"} />
         <DataRow label="Session" value={sessionLabel} />
-        <DataRow label="Next event" value={eventName ?? asString(news.reason) ?? "No event available"} />
+        <DataRow
+          label="Next event"
+          value={data ? eventName ?? asString(news.reason) ?? "No event available" : "Unavailable"}
+        />
         <DataRow label="Next open" value={nextOpen} />
       </div>
     </DashboardPanel>

@@ -36,15 +36,19 @@ export function ChartPanel({
   const x = (index: number) => points.length <= 1 ? width / 2 : (index / (points.length - 1)) * width;
   const y = (price: number) => plotTop + ((high - price) / range) * (plotBottom - plotTop);
   const polyline = points.map((point, index) => `${x(index)},${y(point.price)}`).join(" ");
-  const marketOpen = data?.market_open === true;
-  const displayPrice = marketOpen ? data?.current_price : data?.last_valid_price ?? data?.current_price;
+  const marketOpen = data?.market_open;
+  const displayPrice = marketOpen === true
+    ? data?.current_price
+    : marketOpen === false
+      ? data?.last_valid_price ?? data?.current_price
+      : data?.current_price;
 
   return (
     <DashboardPanel
-      title={marketOpen ? "Live price" : "Price chart"}
-      eyebrow={marketOpen
+      title={marketOpen === true ? "Live price" : "Price chart"}
+      eyebrow={marketOpen === true
         ? "Real samples from status polling"
-        : data
+        : marketOpen === false
           ? "Market closed · last valid snapshot"
           : "No live data available"}
       className="dv2-chart-panel"
@@ -52,9 +56,11 @@ export function ChartPanel({
       <div className="dv2-chart-meta">
         <strong>{formatValue(displayPrice)}</strong>
         <span>
-          {marketOpen
+          {marketOpen === true
             ? `${points.length} live sample${points.length === 1 ? "" : "s"}`
-            : data?.last_valid_time ?? "No live sampling while closed"}
+            : marketOpen === false
+              ? data?.last_valid_time ?? "No live sampling while closed"
+              : "Sampling status unavailable"}
         </span>
       </div>
       {points.length ? (
@@ -97,9 +103,9 @@ export function ChartPanel({
         </div>
       ) : (
         <Unavailable>
-          {!data
+          {marketOpen === undefined
             ? "Waiting for live status data."
-            : marketOpen
+            : marketOpen === true
             ? "Waiting for the first real price sample."
             : "The market is closed. Live sampling will resume when it opens."}
         </Unavailable>
