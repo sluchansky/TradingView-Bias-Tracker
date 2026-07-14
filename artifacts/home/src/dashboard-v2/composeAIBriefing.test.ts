@@ -36,7 +36,7 @@ test("explains WAIT with missing confirmation and next step", () => {
   assert.match(result.paragraph, /structure confirmation is missing/i);
   assert.match(result.paragraph, /current edge supports developing confidence/i);
   assert.doesNotMatch(result.paragraph, /Wait for bullish BOS/i);
-  assert.match(result.paragraph, /a change there would alter my current assessment/i);
+  assert.match(result.paragraph, /resolving the outstanding condition would alter my current assessment/i);
   assert.doesNotMatch(result.paragraph, /48\/110/);
 });
 
@@ -217,4 +217,29 @@ test("describes volatility and location blockers as conditions, not confirmation
   assert.match(result.paragraph, /acceptable entry location/i);
   assert.doesNotMatch(result.paragraph, /volatility confirmation|location confirmation/i);
   assert.match(result.paragraph, /a change there would alter my current assessment/i);
+});
+
+test("classifies next-step-only non-confirmation blockers as conditions", () => {
+  const session = connected({
+    verdict: "WAIT",
+    stage_next_step: "Wait for the U.S. session window",
+  });
+  const volatility = connected({
+    verdict: "WAIT",
+    stage_next_step: "Wait for volatility to normalize",
+  });
+
+  assert.equal(session.status, "Waiting for conditions");
+  assert.equal(volatility.status, "Waiting for conditions");
+});
+
+test("keeps first-person rationale capitalized and uses a clear condition referent", () => {
+  const result = connected({
+    verdict: "WAIT",
+    strict_missing: ["edge_score_low"],
+  });
+
+  assert.match(result.paragraph, /because I still need a sufficient edge score/i);
+  assert.match(result.paragraph, /resolving the outstanding condition would alter my current assessment/i);
+  assert.doesNotMatch(result.paragraph, /because i still|a change there/i);
 });

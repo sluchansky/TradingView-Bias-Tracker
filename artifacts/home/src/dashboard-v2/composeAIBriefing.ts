@@ -151,6 +151,12 @@ function sharesConfirmationConcept(left: string | null, right: string | null): b
   return leftConcepts.some((concept) => rightConcepts.includes(concept));
 }
 
+function afterBecause(value: string): string {
+  return /^I\b/.test(value)
+    ? value
+    : `${value[0].toLowerCase()}${value.slice(1)}`;
+}
+
 export function composeAIBriefing({
   data,
   ticker,
@@ -221,10 +227,16 @@ export function composeAIBriefing({
   const missingAreConfirmations = missing.every((item) =>
     /confirmation|alignment|break of structure|reclaim/.test(item)
   );
+  const nextConcepts = confirmationConcepts(nextStep);
+  const nextIsConfirmation = nextConcepts.some((concept) =>
+    ["structure", "vwap", "liquidity", "delta", "volume", "zone"].includes(concept)
+  );
   const status = ready
     ? "Setup ready"
-    : missing.length || nextStep
-      ? missing.length && !missingAreConfirmations ? "Waiting for conditions" : "Waiting for confirmation"
+    : missing.length
+      ? missingAreConfirmations ? "Waiting for confirmation" : "Waiting for conditions"
+      : nextStep
+        ? nextIsConfirmation ? "Waiting for confirmation" : "Waiting for conditions"
       : structure
         ? "Reviewing structure"
         : `Monitoring ${ticker}`;
@@ -253,7 +265,7 @@ export function composeAIBriefing({
         ? `I still need ${missingPhrase}`
         : null;
   sentences.push(verdictReason
-    ? sentence(`The verdict is ${verdict} because ${verdictReason[0].toLowerCase()}${verdictReason.slice(1)}`)
+    ? sentence(`The verdict is ${verdict} because ${afterBecause(verdictReason)}`)
     : ready
       ? sentence(`The verdict is ${verdict} because the current trading status marks the setup as ready`)
       : `The verdict is WAIT; the current status does not include a specific decision reason.`);
@@ -275,7 +287,7 @@ export function composeAIBriefing({
       : "I’m holding the current view";
     const changeClause = invalidation
       ? `I would reconsider if ${invalidation}`
-      : "a change there would alter my current assessment";
+      : "resolving the outstanding condition would alter my current assessment";
     sentences.push(sentence(`${watchClause}; ${changeClause}`));
   } else if (sentences.length < 3) {
     sentences.push("I’ll continue monitoring fresh status updates before changing this assessment.");
