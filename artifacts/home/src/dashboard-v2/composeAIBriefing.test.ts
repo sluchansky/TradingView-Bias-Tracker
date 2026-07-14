@@ -187,5 +187,6 @@ test("mentions each natural missing confirmation only once", () => {
   const matches = result.paragraph.match(/confirmed break of structure/gi) ?? [];
 
   assert.equal(matches.length, 1);
+  assert.match(result.paragraph, /because structure confirmation is missing; specifically/i);
   assert.match(result.paragraph, /current edge supports moderate confidence/i);
 });

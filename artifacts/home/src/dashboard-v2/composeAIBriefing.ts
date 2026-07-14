@@ -197,37 +197,35 @@ export function composeAIBriefing({
     ? sentence(`On ${ticker}, ${observation.slice(0, 3).join(", and ")}`)
     : `I’m monitoring ${ticker}, but the current status does not include a directional market read.`);
 
-  const why = missing.length
-    ? "required confirmation is incomplete"
-    : reason;
-  sentences.push(why
-    ? sentence(`The verdict is ${verdict} because ${why[0].toLowerCase()}${why.slice(1)}`)
+  const missingPhrase = missing.join(", ");
+  const verdictReason = reason && missing.length
+    ? `${reason}; specifically, I still need ${missingPhrase}`
+    : reason
+      ? reason
+      : missing.length
+        ? `I still need ${missingPhrase}`
+        : null;
+  sentences.push(verdictReason
+    ? sentence(`The verdict is ${verdict} because ${verdictReason[0].toLowerCase()}${verdictReason.slice(1)}`)
     : ready
       ? sentence(`The verdict is ${verdict} because the current trading status marks the setup as ready`)
       : `The verdict is WAIT; the current status does not include a specific decision reason.`);
 
   const confidence = confidenceLanguage(edge);
   if (confidence) {
-    sentences.push(missing.length
-      ? confidence === "strong"
-        ? "The edge reading is strong, but I’m not treating the setup as confirmed while required checks remain incomplete."
-        : sentence(`The current edge supports ${confidence} confidence, and required confirmation remains incomplete`)
-      : sentence(`My confidence is ${confidence} based on the current edge reading`));
+    sentences.push(sentence(`The current edge supports ${confidence} confidence`));
   }
 
   const nextDistinct = nextStep && !sameText(nextStep, reason) ? nextStep : null;
-  const watchTarget = missing.length
-    ? missing.join(", ")
-    : nextDistinct;
-  if (watchTarget || invalidation) {
-    const watchClause = watchTarget
-      ? `I’m watching for ${watchTarget}`
-      : "I’m holding the current view";
+  if (nextDistinct || invalidation || missing.length) {
+    const watchClause = nextDistinct
+      ? `I’m watching for ${nextDistinct}`
+      : missing.length
+        ? "I’m watching for that confirmation"
+        : "I’m holding the current view";
     const changeClause = invalidation
       ? `I would reconsider if ${invalidation}`
-      : nextDistinct && nextDistinct !== watchTarget
-        ? `I would reassess when the status reports ${nextDistinct}`
-        : "confirmation there would change my current assessment";
+      : "confirmation there would change my current assessment";
     sentences.push(sentence(`${watchClause}; ${changeClause}`));
   } else if (sentences.length < 3) {
     sentences.push("I’ll continue monitoring fresh status updates before changing this assessment.");
