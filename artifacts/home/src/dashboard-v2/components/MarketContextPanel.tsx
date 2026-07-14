@@ -15,6 +15,10 @@ export function MarketContextPanel({ data }: { data: DashboardStatus | null }) {
         />
         <DataRow label="ATR" value={formatValue(data?.current_atr)} />
         <DataRow
+          label="Last valid"
+          value={data ? (data.last_valid_time ?? "Current snapshot") : "Unavailable"}
+        />
+        <DataRow
           label="Feed"
           value={asString(feed.freshness_label) ?? asString(feed.overall_freshness) ?? "Unavailable"}
         />

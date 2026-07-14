@@ -11,6 +11,7 @@ import { DashboardV2Login } from "@/dashboard-v2/components/DashboardV2Login";
 import { EvidenceSnapshotPanel } from "@/dashboard-v2/components/EvidenceSnapshotPanel";
 import { KeyObservationsPanel } from "@/dashboard-v2/components/KeyObservationsPanel";
 import { MarketContextPanel } from "@/dashboard-v2/components/MarketContextPanel";
+import { MarketHistoryPanel } from "@/dashboard-v2/components/MarketHistoryPanel";
 import { MarketStatusPanel } from "@/dashboard-v2/components/MarketStatusPanel";
 import { NewsSessionPanel, ObjectivePanel, SessionMemoryPanel, SessionPerformancePanel } from "@/dashboard-v2/components/SessionPanels";
 import { TalkToAvatarPanel } from "@/dashboard-v2/components/TalkToAvatarPanel";
@@ -135,6 +136,12 @@ export default function DashboardV2() {
                 <SessionMemoryPanel data={dashboard.data} />
               </CollapsibleSection>
             </div>
+            <CollapsibleSection
+              title="Market history"
+              summary="Recent verdict, bias, structure, and blocker changes"
+            >
+              <MarketHistoryPanel data={dashboard.data} />
+            </CollapsibleSection>
           </section>
 
           <aside className="dv2-column dv2-right-column">

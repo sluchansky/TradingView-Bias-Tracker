@@ -1,5 +1,5 @@
 import type { DashboardStatus } from "../types";
-import { asNumber, asRecord, asString, formatValue } from "../types";
+import { asNumber, asRecord, asString } from "../types";
 import { DashboardPanel, DataRow, Unavailable } from "./Panel";
 
 export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
@@ -17,7 +17,7 @@ export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
   const volume = asString(diagnostics.volume);
 
   return (
-    <DashboardPanel title="Market status" eyebrow="Flow · levels · structure" className="dv2-market-status">
+    <DashboardPanel title="Market status" eyebrow="Flow · structure" className="dv2-market-status">
       <div className="dv2-market-status-section">
         <h3>Order flow</h3>
         {asString(marketRead.order_flow) && (
@@ -35,20 +35,13 @@ export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
       </div>
 
       <div className="dv2-market-status-section">
-        <h3>Levels</h3>
+        <h3>Structure</h3>
         <div className="dv2-market-status-grid">
-          <DataRow label="Supply" value={formatValue(data?.nearest_supply)} tone="bear" />
-          <DataRow label="VWAP" value={formatValue(data?.vwap_value)} tone="info" />
-          <DataRow label="Demand" value={formatValue(data?.nearest_demand)} tone="bull" />
           <DataRow
-            label="Last valid"
-            value={data ? (data.last_valid_time ?? "Current snapshot") : "Unavailable"}
+            label="Character"
+            value={asString(marketRead.market_character) ?? "Unavailable"}
           />
         </div>
-      </div>
-
-      <div className="dv2-market-status-section">
-        <h3>Structure</h3>
         {data?.market_structure ? (
           <>
             <div className="dv2-structure-label">{data.market_structure}</div>
@@ -57,10 +50,6 @@ export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
             </p>
             <div className="dv2-market-status-grid">
               <DataRow label="Class" value={data.structure_class ?? "Unavailable"} />
-              <DataRow
-                label="Character"
-                value={asString(marketRead.market_character) ?? "Unavailable"}
-              />
               <DataRow
                 label="Risk zone"
                 value={data.risk_zone ?? "Unavailable"}

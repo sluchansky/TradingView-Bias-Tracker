@@ -740,6 +740,45 @@
   display: none;
 }
 
+.dv2-history-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dv2-history-list li {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 10px;
+  align-items: start;
+}
+
+.dv2-history-list time {
+  color: var(--dv2-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dv2-history-list div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dv2-history-list strong {
+  color: var(--dv2-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.dv2-history-list span {
+  color: var(--dv2-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .dv2-market-status {
   padding: 17px;
 }
