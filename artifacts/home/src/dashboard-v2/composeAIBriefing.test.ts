@@ -51,7 +51,7 @@ test("composes a READY LONG briefing", () => {
 
   assert.equal(result.status, "Setup ready");
   assert.match(result.paragraph, /verdict is READY LONG/i);
-  assert.match(result.paragraph, /confidence is strong/i);
+  assert.match(result.paragraph, /current edge supports strong confidence/i);
   assert.doesNotMatch(result.paragraph, /READY SHORT/i);
 });
 
@@ -67,7 +67,7 @@ test("composes a READY SHORT briefing", () => {
 
   assert.equal(result.status, "Setup ready");
   assert.match(result.paragraph, /verdict is READY SHORT/i);
-  assert.match(result.paragraph, /confidence is moderate/i);
+  assert.match(result.paragraph, /current edge supports moderate confidence/i);
   assert.doesNotMatch(result.paragraph, /READY LONG/i);
 });
 
