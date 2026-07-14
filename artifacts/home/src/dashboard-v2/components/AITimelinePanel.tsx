@@ -24,16 +24,37 @@ export function AITimelinePanel({
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const wasAtTopRef = useRef(true);
-  const previousHeightRef = useRef(0);
+  const anchorRef = useRef<{ id: string; offset: number } | null>(null);
+
+  const captureAnchor = () => {
+    const viewport = viewportRef.current;
+    if (!viewport || wasAtTopRef.current) {
+      anchorRef.current = null;
+      return;
+    }
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const items = Array.from(viewport.querySelectorAll<HTMLElement>("[data-event-id]"));
+    const firstVisible = items.find((item) => item.getBoundingClientRect().bottom >= viewportTop);
+    anchorRef.current = firstVisible
+      ? { id: firstVisible.dataset.eventId ?? "", offset: firstVisible.getBoundingClientRect().top - viewportTop }
+      : null;
+  };
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
-    const nextHeight = viewport.scrollHeight;
-    if (!wasAtTopRef.current && previousHeightRef.current > 0) {
-      viewport.scrollTop += nextHeight - previousHeightRef.current;
+    const anchor = anchorRef.current;
+    if (!wasAtTopRef.current && anchor?.id) {
+      const item = Array.from(
+        viewport.querySelectorAll<HTMLElement>("[data-event-id]"),
+      ).find((candidate) => candidate.dataset.eventId === anchor.id);
+      if (item) {
+        const viewportTop = viewport.getBoundingClientRect().top;
+        const currentOffset = item.getBoundingClientRect().top - viewportTop;
+        viewport.scrollTop += currentOffset - anchor.offset;
+      }
     }
-    previousHeightRef.current = nextHeight;
+    captureAnchor();
   }, [events]);
 
   const showNewest = () => {
@@ -58,6 +79,7 @@ export function AITimelinePanel({
         onScroll={(event) => {
           const atTop = event.currentTarget.scrollTop <= 8;
           wasAtTopRef.current = atTop;
+          captureAnchor();
           onViewingNewestChange(atTop);
         }}
       >
@@ -69,7 +91,7 @@ export function AITimelinePanel({
         ) : (
           <ol className="dv2-timeline-list">
             {events.map((item) => (
-              <li key={item.id} className={`is-${item.tone}`}>
+              <li key={item.id} data-event-id={item.id} className={`is-${item.tone}`}>
                 <i aria-hidden="true" />
                 <time dateTime={item.timestamp}>{eventTime(item.timestamp)}</time>
                 <strong>{item.category}</strong>

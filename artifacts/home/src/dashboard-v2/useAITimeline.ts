@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionState, DashboardStatus, DashboardTicker } from "./types";
 import type { AITimelineEvent, AITimelineSnapshot } from "./aiTimelineTypes";
 import {
+  composeInstrumentDepartureEvent,
   composeInstrumentSelectionEvent,
   composeTimelineEvents,
   createTimelineSnapshot,
@@ -39,14 +40,24 @@ export function useAITimeline({
   const eventsRef = useRef<AITimelineEvent[]>([]);
   const previousSnapshotRef = useRef<AITimelineSnapshot | null>(null);
   const previousTickerRef = useRef<DashboardTicker | null>(null);
+  const previousStorageKeyRef = useRef<string | null>(null);
   const viewingNewestRef = useRef(true);
   const activeScopeRef = useRef("");
 
   useEffect(() => {
     const storage = browserStorage();
+    const previousTicker = previousTickerRef.current;
+    const previousStorageKey = previousStorageKeyRef.current;
+    const departureEvent = previousTicker
+      ? composeInstrumentDepartureEvent(previousTicker, ticker)
+      : null;
+    if (storage && previousStorageKey && departureEvent) {
+      const departedEvents = mergeTimelineEvents(eventsRef.current, [departureEvent]);
+      persistTimeline(storage, previousStorageKey, departedEvents);
+    }
     const restored = storage ? restoreTimeline(storage, storageKey) : [];
-    const selectionEvent = previousTickerRef.current
-      ? composeInstrumentSelectionEvent(previousTickerRef.current, ticker)
+    const selectionEvent = previousTicker
+      ? composeInstrumentSelectionEvent(previousTicker, ticker)
       : null;
     const scopedEvents = selectionEvent
       ? mergeTimelineEvents(restored, [selectionEvent])
@@ -54,6 +65,7 @@ export function useAITimeline({
     activeScopeRef.current = storageKey;
     previousSnapshotRef.current = null;
     previousTickerRef.current = ticker;
+    previousStorageKeyRef.current = storageKey;
     viewingNewestRef.current = true;
     setNewEventCount(0);
     eventsRef.current = scopedEvents;

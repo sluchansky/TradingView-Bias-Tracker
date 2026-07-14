@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   TIMELINE_LIMIT,
+  composeInstrumentDepartureEvent,
   composeInstrumentSelectionEvent,
   composeTimelineEvents,
   createTimelineSnapshot,
@@ -57,11 +58,16 @@ test("distinguishes stale status from a disconnected service", () => {
 
 test("creates an instrument-selection event", () => {
   const selected = composeInstrumentSelectionEvent("MNQ", "MGC", NOW);
+  const departed = composeInstrumentDepartureEvent("MNQ", "MGC", NOW);
 
   assert.ok(selected);
+  assert.ok(departed);
   assert.equal(selected.category, "Monitoring");
   assert.match(selected.message, /MNQ to MGC/);
+  assert.equal(departed.instrument, "MNQ");
+  assert.match(departed.message, /MNQ to MGC/);
   assert.equal(composeInstrumentSelectionEvent("MGC", "MGC", NOW), null);
+  assert.equal(composeInstrumentDepartureEvent("MGC", "MGC", NOW), null);
 });
 
 test("creates a verdict-change event", () => {
@@ -108,7 +114,7 @@ test("suppresses duplicate continuing events", () => {
   const repeated = mergeTimelineEvents(
     once,
     incoming,
-    new Date(NOW.getTime() + 60_000),
+    new Date(NOW.getTime() + 10 * 60_000),
   );
 
   assert.equal(once.length, 1);
@@ -130,6 +136,17 @@ test("allows a state after it changed away and returned", () => {
 
   assert.equal(result[0].id, "returned");
   assert.equal(result.length, 3);
+});
+
+test("allows a rapid instrument return after departure is recorded in its scope", () => {
+  const firstArrival = composeInstrumentSelectionEvent("MGC", "MNQ", NOW)!;
+  const departure = composeInstrumentDepartureEvent("MNQ", "MGC", new Date(NOW.getTime() + 1000))!;
+  const returnEvent = composeInstrumentSelectionEvent("MGC", "MNQ", new Date(NOW.getTime() + 2000))!;
+  const departedScope = mergeTimelineEvents([firstArrival], [departure]);
+  const returnedScope = mergeTimelineEvents(departedScope, [returnEvent]);
+
+  assert.equal(returnedScope[0].id, returnEvent.id);
+  assert.equal(returnedScope.length, 3);
 });
 
 test("keeps only the newest 100 events", () => {

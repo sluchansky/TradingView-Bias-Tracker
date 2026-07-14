@@ -10,7 +10,6 @@ import type {
 export const TIMELINE_LIMIT = 100;
 export const EDGE_TIMELINE_THRESHOLDS = [20, 28, 50] as const;
 export const EDGE_MEANINGFUL_DELTA = 12;
-export const TIMELINE_REPEAT_AFTER_MS = 5 * 60 * 1000;
 
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -292,9 +291,39 @@ export function composeInstrumentSelectionEvent(
     snapshot,
     now,
     "Monitoring",
-    `instrument-${currentInstrument}`,
+    `selected-from-${previousInstrument}`,
     `Monitoring switched from ${previousInstrument} to ${currentInstrument}.`,
     "blue",
+  );
+}
+
+export function composeInstrumentDepartureEvent(
+  previousInstrument: AITimelineSnapshot["instrument"],
+  currentInstrument: AITimelineSnapshot["instrument"],
+  now = new Date(),
+): AITimelineEvent | null {
+  if (previousInstrument === currentInstrument) return null;
+  const snapshot: AITimelineSnapshot = {
+    instrument: previousInstrument,
+    connection: "connecting",
+    verdict: null,
+    edge: null,
+    structure: null,
+    liquidity: null,
+    orderFlow: null,
+    vwapRelation: null,
+    volatility: null,
+    risk: null,
+    position: null,
+    news: null,
+  };
+  return event(
+    snapshot,
+    now,
+    "Monitoring",
+    `left-for-${currentInstrument}`,
+    `Monitoring moved from ${previousInstrument} to ${currentInstrument}.`,
+    "gray",
   );
 }
 
@@ -310,13 +339,7 @@ export function mergeTimelineEvents(
       item.category === candidate.category && item.instrument === candidate.instrument
     );
     const sameStateContinues = latestInCategory?.key === candidate.key;
-    const latestTime = latestInCategory
-      ? new Date(latestInCategory.timestamp).getTime()
-      : Number.NaN;
-    const age = Number.isFinite(latestTime)
-      ? now.getTime() - latestTime
-      : Number.POSITIVE_INFINITY;
-    if (sameStateContinues && age < TIMELINE_REPEAT_AFTER_MS) continue;
+    if (sameStateContinues) continue;
     merged = [candidate, ...merged];
   }
   return merged.slice(0, limit);
