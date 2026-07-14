@@ -76,6 +76,12 @@ function sameText(left: string | null, right: string | null): boolean {
 
 function naturalConfirmation(value: string, direction: string | null): string {
   const normalized = value.toLowerCase().replace(/_/g, " ");
+  if (/conflicting structure|structure conflict/.test(normalized)) {
+    return "resolution of conflicting structure";
+  }
+  if (/cvd conflict|delta conflict/.test(normalized)) {
+    return "delta alignment";
+  }
   if (/\bbos\b|break of structure|structure/.test(normalized)) {
     return "a confirmed break of structure";
   }
@@ -126,7 +132,6 @@ export function composeAIBriefing({
   const brainState = record(data.brain_state);
   const marketRead = record(brainState.market_read);
   const liquidityFocus = record(brain.liquidity_focus);
-  const gate = record(data.gate_debug);
   const rawStatus = (text(data.verdict) ?? text(brain.status) ?? "WAIT").toUpperCase();
   const directionValue = text(data.strict_direction) ?? text(brain.favored_direction);
   const direction = /^(short|bearish)$/i.test(directionValue ?? "")
@@ -163,14 +168,7 @@ export function composeAIBriefing({
       .slice(0, 3)
       .map((item) => item.replace(/_/g, " "))
     : [];
-  const gateMissing = [
-    gate.structure_confirmed === false || gate.bosState === false ? "structure confirmation" : null,
-    gate.vwap_confirmed === false || gate.vwapState === false ? "VWAP confirmation" : null,
-    gate.zoneValid === false ? "zone confirmation" : null,
-    gate.cvd_ok === false ? "delta confirmation" : null,
-    gate.volume_ok === false ? "volume confirmation" : null,
-  ].filter((item): item is string => item !== null);
-  const missing = [...explicitMissing, ...gateMissing]
+  const missing = explicitMissing
     .map((item) => naturalConfirmation(item, direction))
     .filter((item, index, items) => items.indexOf(item) === index)
     .slice(0, 3);
@@ -210,7 +208,9 @@ export function composeAIBriefing({
   const confidence = confidenceLanguage(edge);
   if (confidence) {
     sentences.push(missing.length
-      ? sentence(`My confidence remains ${confidence} because ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} still outstanding`)
+      ? confidence === "strong"
+        ? "The edge reading is strong, but confirmation remains incomplete."
+        : sentence(`My confidence remains ${confidence} while confirmation is incomplete`)
       : sentence(`My confidence is ${confidence} based on the current edge reading`));
   }
 

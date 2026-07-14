@@ -153,3 +153,39 @@ test("caps live briefing output at four sentences", () => {
   assert.match(result.paragraph, /confidence remains moderate/i);
   assert.match(result.paragraph, /I would reconsider if Price invalidates the current zone/i);
 });
+
+test("preserves conflict semantics in missing confirmations", () => {
+  const result = connected({
+    verdict: "WAIT",
+    edge_score: 42,
+    strict_missing: ["conflicting_structure", "cvd_conflict"],
+  });
+
+  assert.match(result.paragraph, /resolution of conflicting structure/i);
+  assert.match(result.paragraph, /delta alignment/i);
+  assert.doesNotMatch(result.paragraph, /confirmed break of structure|delta confirmation/i);
+});
+
+test("does not infer required blockers from optional gate diagnostics", () => {
+  const result = connected({
+    verdict: "WAIT",
+    market_structure: "Range Structure",
+    gate_debug: { zoneValid: false, cvd_ok: false },
+  });
+
+  assert.equal(result.status, "Reviewing structure");
+  assert.doesNotMatch(result.paragraph, /zone confirmation|delta confirmation/i);
+});
+
+test("mentions each natural missing confirmation only once", () => {
+  const result = connected({
+    verdict: "WAIT",
+    edge_score: 60,
+    strict_reason: "Structure confirmation is missing",
+    strict_missing: ["BOS"],
+  });
+  const matches = result.paragraph.match(/confirmed break of structure/gi) ?? [];
+
+  assert.equal(matches.length, 1);
+  assert.match(result.paragraph, /confidence remains moderate while confirmation is incomplete/i);
+});
