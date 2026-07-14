@@ -108,6 +108,25 @@ function confidenceLanguage(edge: number | null): string | null {
   return "limited";
 }
 
+function confirmationConcepts(value: string | null): string[] {
+  if (!value) return [];
+  const normalized = value.toLowerCase();
+  return [
+    /\bbos\b|break of structure|structure/.test(normalized) ? "structure" : null,
+    /vwap/.test(normalized) ? "vwap" : null,
+    /liquidity|sweep/.test(normalized) ? "liquidity" : null,
+    /cvd|delta/.test(normalized) ? "delta" : null,
+    /volume|rvol/.test(normalized) ? "volume" : null,
+    /zone/.test(normalized) ? "zone" : null,
+  ].filter((concept): concept is string => concept !== null);
+}
+
+function sharesConfirmationConcept(left: string | null, right: string | null): boolean {
+  const leftConcepts = confirmationConcepts(left);
+  const rightConcepts = confirmationConcepts(right);
+  return leftConcepts.some((concept) => rightConcepts.includes(concept));
+}
+
 export function composeAIBriefing({
   data,
   ticker,
@@ -197,12 +216,13 @@ export function composeAIBriefing({
     ? sentence(`On ${ticker}, ${observation.slice(0, 3).join(", and ")}`)
     : `I’m monitoring ${ticker}, but the current status does not include a directional market read.`);
 
-  const missingPhrase = missing.join(", ");
-  const verdictReason = reason && missing.length
+  const uncoveredMissing = missing.filter((item) => !sharesConfirmationConcept(item, reason));
+  const missingPhrase = uncoveredMissing.join(", ");
+  const verdictReason = reason && uncoveredMissing.length
     ? `${reason}; specifically, I still need ${missingPhrase}`
     : reason
       ? reason
-      : missing.length
+      : uncoveredMissing.length
         ? `I still need ${missingPhrase}`
         : null;
   sentences.push(verdictReason
@@ -216,13 +236,16 @@ export function composeAIBriefing({
     sentences.push(sentence(`The current edge supports ${confidence} confidence`));
   }
 
-  const nextDistinct = nextStep && !sameText(nextStep, reason) ? nextStep : null;
+  const nextDistinct = nextStep
+    && !sameText(nextStep, reason)
+    && !sharesConfirmationConcept(nextStep, reason)
+    && !missing.some((item) => sharesConfirmationConcept(nextStep, item))
+    ? nextStep
+    : null;
   if (nextDistinct || invalidation || missing.length) {
     const watchClause = nextDistinct
       ? `I’m watching for ${nextDistinct}`
-      : missing.length
-        ? "I’m watching for that confirmation"
-        : "I’m holding the current view";
+      : "I’m holding the current view";
     const changeClause = invalidation
       ? `I would reconsider if ${invalidation}`
       : "confirmation there would change my current assessment";

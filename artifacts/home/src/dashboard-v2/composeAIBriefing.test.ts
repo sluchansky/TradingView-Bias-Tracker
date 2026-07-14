@@ -33,9 +33,10 @@ test("explains WAIT with missing confirmation and next step", () => {
   assert.equal(result.status, "Waiting for confirmation");
   assert.match(result.paragraph, /verdict is WAIT/i);
   assert.match(result.paragraph, /price is below VWAP/i);
-  assert.match(result.paragraph, /confirmed break of structure/i);
+  assert.match(result.paragraph, /structure confirmation is missing/i);
   assert.match(result.paragraph, /current edge supports developing confidence/i);
-  assert.match(result.paragraph, /Wait for bullish BOS/i);
+  assert.doesNotMatch(result.paragraph, /Wait for bullish BOS/i);
+  assert.match(result.paragraph, /confirmation there would change my current assessment/i);
   assert.doesNotMatch(result.paragraph, /48\/110/);
 });
 
@@ -184,9 +185,9 @@ test("mentions each natural missing confirmation only once", () => {
     strict_reason: "Structure confirmation is missing",
     strict_missing: ["BOS"],
   });
-  const matches = result.paragraph.match(/confirmed break of structure/gi) ?? [];
+  const matches = result.paragraph.match(/structure confirmation is missing/gi) ?? [];
 
   assert.equal(matches.length, 1);
-  assert.match(result.paragraph, /because structure confirmation is missing; specifically/i);
+  assert.doesNotMatch(result.paragraph, /confirmed break of structure/i);
   assert.match(result.paragraph, /current edge supports moderate confidence/i);
 });
