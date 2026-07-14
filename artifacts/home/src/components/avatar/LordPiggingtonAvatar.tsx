@@ -503,6 +503,7 @@ function LordPiggingtonAvatar({
   });
   const nodRef    = useRef({ active: false, t: 0, dir: 1 });
   const listenNodRef = useRef({ t: 0, next: 4.5 + Math.random() * 2.5 });
+  const speechContactRef = useRef({ wasSpeaking: false, t: 0 });
   const prevMktRef = useRef<AvatarState>(avState);
 
   // Debug display
@@ -723,6 +724,13 @@ function LordPiggingtonAvatar({
       const isSpeaking = sc?.active ?? false;
       const isListening = voiceListeningRef.current === true;
       const isThinking = mktSt === 'ANALYZING' || mktSt === 'FORMING';
+      const speechContact = speechContactRef.current;
+      if (isSpeaking) {
+        speechContact.t = speechContact.wasSpeaking ? speechContact.t + dt : 0;
+      } else {
+        speechContact.t = 0;
+      }
+      speechContact.wasSpeaking = isSpeaking;
       if (!oneShotRef.current &&
           (animStateRef.current === 'idle' || animStateRef.current === 'talking')) {
         animStateRef.current = isSpeaking ? 'talking' : 'idle';
@@ -944,7 +952,7 @@ function LordPiggingtonAvatar({
       gl.t += dt;
       let tYaw   = g.dx * 0.018;
       let tPitch = -g.dy * 0.012;
-      const speakingEyeContact = calmMode && isSpeaking && (elapsed % 6) < 2.2;
+      const speakingEyeContact = calmMode && isSpeaking && speechContact.t < 2.2;
       const directEyeContact = calmMode && (isListening || speakingEyeContact);
       const thinkingUpGlance = calmMode && isThinking && (elapsed % 7.5) < 1.8;
 
@@ -955,7 +963,7 @@ function LordPiggingtonAvatar({
         gl.t = 0;
       } else if (thinkingUpGlance) {
         tYaw = 0.025;
-        tPitch = -0.11;
+        tPitch = 0.11;
         gl.active = false;
         gl.t = 0;
       }
