@@ -1179,3 +1179,364 @@
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+/* Command-center composition */
+.dv2-command-center {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 300px;
+  grid-template-areas:
+    "left main right"
+    "bottom bottom bottom";
+  align-items: start;
+  gap: 12px;
+  width: 100%;
+  max-width: 1760px;
+  margin: 0 auto;
+  padding: 12px 16px 24px;
+}
+
+.dv2-command-left {
+  grid-area: left;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dv2-command-main {
+  grid-area: main;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dv2-command-right {
+  grid-area: right;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dv2-command-bottom {
+  grid-area: bottom;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.dv2-decision-row {
+  display: grid;
+  grid-template-columns: 1.08fr 1.45fr 1fr 0.95fr;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.dv2-decision-card,
+.dv2-decision-row .dv2-verdict {
+  min-width: 0;
+  min-height: 218px;
+  padding: 14px;
+}
+
+.dv2-decision-row .dv2-verdict {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--dv2-border);
+  border-top: 3px solid var(--dv2-blue);
+  border-radius: 12px;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.018), transparent 48%),
+    var(--dv2-surface);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.14);
+}
+
+.dv2-decision-row .dv2-verdict-bull {
+  border-top-color: var(--dv2-green);
+}
+
+.dv2-decision-row .dv2-verdict-bear {
+  border-top-color: var(--dv2-red);
+}
+
+.dv2-decision-row .dv2-verdict-caution {
+  border-top-color: var(--dv2-yellow);
+}
+
+.dv2-decision-row .dv2-verdict h1 {
+  margin: 7px 0 8px;
+  font-size: clamp(36px, 3.2vw, 52px);
+  line-height: 0.94;
+  letter-spacing: -0.045em;
+}
+
+.dv2-decision-row .dv2-verdict-state {
+  display: block;
+  color: var(--dv2-secondary);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.dv2-decision-row .dv2-edge {
+  grid-template-columns: auto 1fr;
+  padding: 9px 10px;
+}
+
+.dv2-decision-row .dv2-edge-number {
+  font-size: 34px;
+}
+
+.dv2-decision-row .dv2-panel-heading {
+  margin-bottom: 9px;
+}
+
+.dv2-decision-row .dv2-data-row {
+  min-height: 30px;
+  padding: 5px 0;
+}
+
+.dv2-command-reason {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: #dce3ed;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+}
+
+.dv2-next-step {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--dv2-border);
+}
+
+.dv2-next-step span {
+  display: block;
+  margin-bottom: 3px;
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.dv2-next-step strong {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--dv2-text);
+  font-size: 13px;
+  line-height: 1.42;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.dv2-power {
+  display: grid;
+  gap: 11px;
+}
+
+.dv2-power > div:not(.dv2-power-track) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dv2-power span {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.dv2-power strong {
+  font-size: 24px;
+}
+
+.dv2-power-track {
+  height: 8px;
+  display: flex;
+  overflow: hidden;
+  border-radius: 99px;
+  background: rgba(148, 163, 184, 0.14);
+}
+
+.dv2-power-track i {
+  display: block;
+  height: 100%;
+}
+
+.dv2-power-track .is-bull {
+  background: var(--dv2-green);
+}
+
+.dv2-power-track .is-bear {
+  background: var(--dv2-red);
+}
+
+.dv2-command-main .dv2-chart-panel {
+  min-height: 590px;
+  margin-top: 0;
+}
+
+.dv2-command-main .dv2-chart-wrap {
+  height: 505px;
+}
+
+.dv2-command-left .dv2-avatar-hero {
+  min-height: 365px;
+  border: 1px solid var(--dv2-border);
+  border-radius: 12px;
+  background:
+    radial-gradient(ellipse at 50% 78%, rgba(96, 165, 250, 0.14), transparent 55%),
+    var(--dv2-surface);
+}
+
+.dv2-command-left .dv2-avatar-stage {
+  height: 355px;
+}
+
+.dv2-command-left .dv2-avatar-stage > div {
+  transform: scale(0.63);
+  margin-top: -205px;
+}
+
+.dv2-command-left .dv2-avatar-identity {
+  top: 16px;
+  left: 16px;
+}
+
+.dv2-command-left .dv2-avatar-caption {
+  right: 12px;
+  bottom: 11px;
+}
+
+.dv2-avatar-caption i.is-listening {
+  background: var(--dv2-blue);
+  box-shadow: 0 0 8px rgba(96, 165, 250, 0.75);
+}
+
+.dv2-command-left .dv2-panel {
+  padding: 14px;
+}
+
+.dv2-command-left .dv2-chat-log {
+  max-height: 118px;
+}
+
+.dv2-command-left .dv2-chat-form {
+  grid-template-columns: 1fr 1fr;
+}
+
+.dv2-command-left .dv2-chat-form input {
+  grid-column: 1 / -1;
+}
+
+.dv2-voice-output {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--dv2-border);
+  border-radius: 12px;
+  background: var(--dv2-surface);
+}
+
+.dv2-voice-output span,
+.dv2-voice-output small {
+  color: var(--dv2-muted);
+  font-size: 12px;
+}
+
+.dv2-voice-output strong {
+  color: var(--dv2-text);
+  font-size: 13px;
+}
+
+.dv2-voice-output small {
+  grid-column: 1 / -1;
+}
+
+.dv2-intel-card {
+  padding: 14px;
+}
+
+.dv2-intel-card .dv2-panel-heading {
+  margin-bottom: 9px;
+}
+
+.dv2-intel-headline {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--dv2-text);
+  font-size: 14px;
+}
+
+.dv2-intel-card .dv2-panel-summary {
+  font-size: 13px;
+  line-height: 1.48;
+}
+
+.dv2-intel-card .dv2-data-row {
+  min-height: 30px;
+  padding: 5px 0;
+}
+
+.dv2-bottom-card {
+  min-width: 0;
+  min-height: 170px;
+  padding: 14px;
+}
+
+.dv2-bottom-card .dv2-panel-heading {
+  margin-bottom: 9px;
+}
+
+.dv2-bottom-card .dv2-data-row {
+  min-height: 29px;
+  padding: 4px 0;
+}
+
+@media (max-width: 1260px) {
+  .dv2-command-center {
+    grid-template-columns: 290px minmax(0, 1fr);
+    grid-template-areas:
+      "left main"
+      "left right"
+      "bottom bottom";
+  }
+
+  .dv2-command-right {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dv2-decision-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dv2-command-bottom {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 840px) {
+  .dv2-command-center {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "left"
+      "main"
+      "right"
+      "bottom";
+  }
+
+  .dv2-command-left {
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .dv2-command-left .dv2-voice-output {
+    grid-column: 2;
+  }
+}

@@ -4,7 +4,7 @@ import { DashboardPanel, DataRow } from "./Panel";
 
 export function LevelsPanel({ data }: { data: DashboardStatus | null }) {
   return (
-    <DashboardPanel title="Levels to watch">
+    <DashboardPanel title="Key levels" className="dv2-bottom-card">
       <div className="dv2-data-list">
         <DataRow label="Supply" value={formatValue(data?.nearest_supply)} tone="bear" />
         <DataRow label="VWAP" value={formatValue(data?.vwap_value)} tone="info" />

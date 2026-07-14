@@ -2,6 +2,7 @@ import type { DashboardStatus } from "../types";
 import { asNumber, asRecord, asString } from "../types";
 
 export function VerdictHero({ data, loading }: { data: DashboardStatus | null; loading: boolean }) {
+  const root = asRecord(data);
   const brain = asRecord(data?.main_brain);
   const status = (
     asString(brain.status)
@@ -14,11 +15,11 @@ export function VerdictHero({ data, loading }: { data: DashboardStatus | null; l
   const ready = status.includes("READY");
   const bearish = /short|bear/i.test(direction ?? status);
   const tone = ready ? (bearish ? "bear" : "bull") : status.includes("BUILD") ? "caution" : "info";
-  const label = ready && direction ? `${status} — ${direction.toUpperCase()}` : status;
-  const mainReason = (
-    asString(data?.strict_reason)
-    ?? asString(brain.wait_reason)
-    ?? asString(brain.summary)
+  const label = ready ? (bearish ? "READY SHORT" : "READY LONG") : loading ? "CONNECTING" : "WAIT";
+  const classification = (
+    asString(root.setup_stage)
+    ?? asString(root.trade_quality_label)
+    ?? asString(data?.edge_grade)
   );
 
   return (
@@ -26,11 +27,8 @@ export function VerdictHero({ data, loading }: { data: DashboardStatus | null; l
       <div className="dv2-verdict-copy">
         <span className="dv2-eyebrow">Live verdict</span>
         <h1>{label}</h1>
-        <p className="dv2-verdict-reason">
-          {mainReason ?? (loading ? "Connecting to live analysis…" : "Decision reason unavailable.")}
-        </p>
         <span className="dv2-verdict-state">
-          {direction ? `${direction} context` : "Monitoring live conditions"}
+          {classification ?? (loading ? "Loading setup classification" : "Setup classification unavailable")}
         </span>
       </div>
       <div className="dv2-edge">

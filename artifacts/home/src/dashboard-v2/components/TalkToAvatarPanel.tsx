@@ -5,6 +5,7 @@ import { DashboardPanel } from "./Panel";
 let messageId = 0;
 
 export function TalkToAvatarPanel({
+  title = "Talk to Avatar",
   askAssistant,
   speak,
   voiceState,
@@ -14,6 +15,7 @@ export function TalkToAvatarPanel({
   stopListening,
   markIdle,
 }: {
+  title?: string;
   askAssistant: (question: string) => Promise<string>;
   speak: (text: string) => void;
   voiceState: "idle" | "requesting" | "listening" | "processing" | "error";
@@ -47,7 +49,7 @@ export function TalkToAvatarPanel({
   }, [askAssistant, asking, markIdle, speak]);
 
   return (
-    <DashboardPanel title="Talk to Avatar" eyebrow="Read-only AI assistant">
+    <DashboardPanel title={title} eyebrow="Voice & text">
       <div className="dv2-chat-log" aria-live="polite">
         {messages.length === 0 ? (
           <p>Ask what the AI sees, what is missing, or what would invalidate the current idea.</p>

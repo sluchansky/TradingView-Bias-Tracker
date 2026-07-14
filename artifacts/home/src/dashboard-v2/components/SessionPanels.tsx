@@ -67,7 +67,7 @@ export function NewsSessionPanel({ data }: { data: DashboardStatus | null }) {
         : "Unavailable";
 
   return (
-    <DashboardPanel title="News & session">
+    <DashboardPanel title="News / events" className="dv2-bottom-card">
       <div className="dv2-data-list">
         <DataRow label="Window" value={data?.session_window ?? "Unavailable"} />
         <DataRow label="Session" value={sessionLabel} />

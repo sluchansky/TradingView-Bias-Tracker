@@ -2,20 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { AvatarSettingsPanel } from "@/components/avatar/AvatarSettingsPanel";
 import type { AvatarState } from "@/components/avatar/avatarTypes";
 import { useAvatarSelection } from "@/components/avatar/useAvatarSelection";
-import { AIReasoningPanel } from "@/dashboard-v2/components/AIReasoningPanel";
 import { AvatarPanel } from "@/dashboard-v2/components/AvatarPanel";
 import { ChartPanel } from "@/dashboard-v2/components/ChartPanel";
-import { CollapsibleSection } from "@/dashboard-v2/components/CollapsibleSection";
+import { ActiveAlertsPanel, PositionsPanel } from "@/dashboard-v2/components/CommandBottomPanels";
 import { DashboardV2Header } from "@/dashboard-v2/components/DashboardV2Header";
 import { DashboardV2Login } from "@/dashboard-v2/components/DashboardV2Login";
-import { EvidenceSnapshotPanel } from "@/dashboard-v2/components/EvidenceSnapshotPanel";
-import { KeyObservationsPanel } from "@/dashboard-v2/components/KeyObservationsPanel";
+import { BullBearPowerCard, MainReasonCard } from "@/dashboard-v2/components/DecisionCards";
+import { IntelligenceRail } from "@/dashboard-v2/components/IntelligenceRail";
+import { LevelsPanel } from "@/dashboard-v2/components/LevelsPanel";
 import { MarketContextPanel } from "@/dashboard-v2/components/MarketContextPanel";
-import { MarketHistoryPanel } from "@/dashboard-v2/components/MarketHistoryPanel";
-import { MarketStatusPanel } from "@/dashboard-v2/components/MarketStatusPanel";
-import { NewsSessionPanel, ObjectivePanel, SessionMemoryPanel, SessionPerformancePanel } from "@/dashboard-v2/components/SessionPanels";
+import { NewsSessionPanel } from "@/dashboard-v2/components/SessionPanels";
 import { TalkToAvatarPanel } from "@/dashboard-v2/components/TalkToAvatarPanel";
-import { TradePlanPanel } from "@/dashboard-v2/components/TradePlanPanel";
 import { VerdictHero } from "@/dashboard-v2/components/VerdictHero";
 import { asNumber, asRecord, asString } from "@/dashboard-v2/types";
 import { useDashboardV2Data } from "@/dashboard-v2/useDashboardV2Data";
@@ -99,77 +96,64 @@ export default function DashboardV2() {
         </div>
       )}
 
-      <main className="dv2-dashboard-body">
-        <section className="dv2-hero-experience">
+      <main className="dv2-command-center">
+        <aside className="dv2-command-left">
           <AvatarPanel
             avatarState={avatarState}
             speaking={voice.speaking}
             speechCtrlRef={voice.speechCtrlRef}
             voiceListeningRef={voice.voiceListeningRef}
             selection={avatarSelection}
+            voiceState={voice.voiceState}
           />
-          <div className="dv2-hero-intelligence">
+          <TalkToAvatarPanel
+            title="Speak to Lord Piggington"
+            askAssistant={dashboard.askAssistant}
+            speak={voice.speak}
+            voiceState={voice.voiceState}
+            transcript={voice.transcript}
+            voiceError={voice.voiceError}
+            startListening={voice.startListening}
+            stopListening={voice.stopListening}
+            markIdle={voice.markIdle}
+          />
+          <section className="dv2-voice-output" aria-label="Voice output status">
+            <span>Voice output</span>
+            <strong>{voice.muted
+              ? "Muted"
+              : voice.speaking
+                ? "Speaking"
+                : voice.voiceState === "listening"
+                  ? "Listening"
+                  : "Ready"}</strong>
+            <small>{voice.voiceError ?? "Browser speech and microphone status"}</small>
+          </section>
+        </aside>
+
+        <section className="dv2-command-main">
+          <div className="dv2-decision-row">
             <VerdictHero
               data={dashboard.data}
               loading={dashboard.connection === "loading" || dashboard.connection === "warming"}
             />
-            <AIReasoningPanel data={dashboard.data} />
+            <MainReasonCard data={dashboard.data} />
+            <MarketContextPanel data={dashboard.data} />
+            <BullBearPowerCard data={dashboard.data} />
           </div>
+          <ChartPanel data={dashboard.data} points={dashboard.priceHistory} />
         </section>
 
-        <ChartPanel data={dashboard.data} points={dashboard.priceHistory} />
+        <aside className="dv2-command-right">
+          <IntelligenceRail data={dashboard.data} />
+        </aside>
 
-        <section className="dv2-workspace dv2-workspace-secondary">
-          <aside className="dv2-column dv2-left-column">
-            <MarketContextPanel data={dashboard.data} />
-            <ObjectivePanel data={dashboard.data} />
-          </aside>
-
-          <section className="dv2-column dv2-center-column">
-            <KeyObservationsPanel data={dashboard.data} />
-            <div className="dv2-session-grid">
-              <SessionPerformancePanel data={dashboard.data} />
-              <CollapsibleSection
-                title="Session memory"
-                summary="Learning context and similar setups"
-              >
-                <SessionMemoryPanel data={dashboard.data} />
-              </CollapsibleSection>
-            </div>
-            <CollapsibleSection
-              title="Market history"
-              summary="Recent verdict, bias, structure, and blocker changes"
-            >
-              <MarketHistoryPanel data={dashboard.data} />
-            </CollapsibleSection>
-          </section>
-
-          <aside className="dv2-column dv2-right-column">
-            <MarketStatusPanel data={dashboard.data} />
-            <TradePlanPanel data={dashboard.data} />
-            <NewsSessionPanel data={dashboard.data} />
-          </aside>
+        <section className="dv2-command-bottom">
+          <LevelsPanel data={dashboard.data} />
+          <NewsSessionPanel data={dashboard.data} />
+          <ActiveAlertsPanel data={dashboard.data} />
+          <PositionsPanel data={dashboard.data} />
         </section>
       </main>
-
-      <footer className="dv2-bottom">
-        <TalkToAvatarPanel
-          askAssistant={dashboard.askAssistant}
-          speak={voice.speak}
-          voiceState={voice.voiceState}
-          transcript={voice.transcript}
-          voiceError={voice.voiceError}
-          startListening={voice.startListening}
-          stopListening={voice.stopListening}
-          markIdle={voice.markIdle}
-        />
-        <CollapsibleSection
-          title="Evidence snapshot"
-          summary="Gate inputs and confirmation detail"
-        >
-          <EvidenceSnapshotPanel data={dashboard.data} />
-        </CollapsibleSection>
-      </footer>
     </div>
   );
 }

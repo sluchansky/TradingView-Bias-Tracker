@@ -9,12 +9,14 @@ export function AvatarPanel({
   speechCtrlRef,
   voiceListeningRef,
   selection,
+  voiceState,
 }: {
   avatarState: AvatarState;
   speaking: boolean;
   speechCtrlRef: RefObject<SpeechCtrl>;
   voiceListeningRef: RefObject<boolean>;
   selection: AvatarSelection;
+  voiceState: "idle" | "requesting" | "listening" | "processing" | "error";
 }) {
   // The avatar sits left of the verdict and above the chart in V2. Hold a gentle
   // right/down gaze so he appears to be monitoring that shared workspace.
@@ -22,7 +24,7 @@ export function AvatarPanel({
   return (
     <section className="dv2-avatar-hero" aria-label={`${selection.profile.name} AI partner`}>
       <div className="dv2-avatar-identity">
-        <span className="dv2-eyebrow">AI partner</span>
+        <span className="dv2-eyebrow">AI Trading Partner</span>
         <strong>{selection.profile.name}</strong>
       </div>
       <div className="dv2-avatar-stage">
@@ -38,8 +40,14 @@ export function AvatarPanel({
         />
       </div>
       <div className="dv2-avatar-caption">
-        <i className={speaking ? "is-speaking" : ""} />
-        {speaking ? "Speaking" : "Relaxed · monitoring the tape"}
+        <i className={speaking ? "is-speaking" : voiceState === "listening" ? "is-listening" : ""} />
+        {speaking
+          ? "Speaking"
+          : voiceState === "listening"
+            ? "Listening"
+            : voiceState === "processing"
+              ? "Processing"
+              : "Idle · monitoring"}
       </div>
     </section>
   );

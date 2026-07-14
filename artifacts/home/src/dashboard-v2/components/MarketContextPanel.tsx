@@ -6,7 +6,7 @@ export function MarketContextPanel({ data }: { data: DashboardStatus | null }) {
   const feed = asRecord(data?.data_feed);
 
   return (
-    <DashboardPanel title="Market context">
+    <DashboardPanel title="Market context" className="dv2-decision-card">
       <div className="dv2-data-list">
         <DataRow
           label="Bias"
