@@ -1,0 +1,119 @@
+.avatar-manager {
+  position: relative;
+  width: 420px;
+  height: 560px;
+}
+
+.avatar-manager-loading {
+  position: absolute;
+  right: 50%;
+  bottom: 18px;
+  padding: 7px 11px;
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  border-radius: 99px;
+  background: rgba(6, 8, 16, 0.84);
+  color: #bfdbfe;
+  font-size: 12px;
+  white-space: nowrap;
+  transform: translateX(50%);
+}
+
+.avatar-manager-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px;
+  background: radial-gradient(circle, rgba(37, 99, 235, 0.14), transparent 60%);
+  color: var(--dv2-secondary, #b8c2d3);
+  font-size: 13px;
+  text-align: center;
+}
+
+.avatar-manager-error strong {
+  color: var(--dv2-text, #f1f5f9);
+  font-size: 16px;
+}
+
+.avatar-manager-error button {
+  min-height: 36px;
+  padding: 7px 13px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.16);
+  color: #dbeafe;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.avatar-settings {
+  flex: 1 0 100%;
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr);
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 5px;
+  padding-top: 12px;
+  border-top: 1px solid var(--dv2-border, rgba(148, 163, 184, 0.18));
+}
+
+.avatar-settings > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.avatar-settings label,
+.avatar-settings-state {
+  color: var(--dv2-muted, #8894a7);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.avatar-settings-state {
+  padding: 2px 7px;
+  border: 1px solid var(--dv2-border, rgba(148, 163, 184, 0.18));
+  border-radius: 99px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.avatar-settings-state.is-ready {
+  border-color: rgba(34, 197, 94, 0.3);
+  color: #86efac;
+}
+
+.avatar-settings-state.is-error {
+  border-color: rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+}
+
+.avatar-settings select {
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--dv2-border-strong, rgba(148, 163, 184, 0.3));
+  border-radius: 8px;
+  background: #0b101a;
+  color: var(--dv2-text, #f1f5f9);
+  font: inherit;
+  font-size: 13px;
+}
+
+.avatar-settings p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #fde68a;
+  font-size: 12px;
+}
+
+@media (max-width: 560px) {
+  .avatar-settings {
+    grid-template-columns: 1fr;
+  }
+}
