@@ -28,8 +28,9 @@ export function MainReasonCard({ data }: { data: DashboardStatus | null }) {
 
 export function BullBearPowerCard({ data }: { data: DashboardStatus | null }) {
   const root = asRecord(data);
-  const bullish = asNumber(root.bullish_score);
-  const bearish = asNumber(root.bearish_score);
+  const diagnostics = asRecord(data?.alert_diagnostics);
+  const bullish = asNumber(root.long_score) ?? asNumber(diagnostics.long_score);
+  const bearish = asNumber(root.short_score) ?? asNumber(diagnostics.short_score);
   const total = (bullish ?? 0) + (bearish ?? 0);
   const bullWidth = total > 0 ? ((bullish ?? 0) / total) * 100 : 0;
   const bearWidth = total > 0 ? ((bearish ?? 0) / total) * 100 : 0;

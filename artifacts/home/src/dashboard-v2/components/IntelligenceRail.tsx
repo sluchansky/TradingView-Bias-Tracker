@@ -44,9 +44,6 @@ export function IntelligenceRail({ data }: { data: DashboardStatus | null }) {
       </DashboardPanel>
 
       <DashboardPanel title="Order flow" className="dv2-intel-card">
-        {asString(marketRead.order_flow) && (
-          <p className="dv2-panel-summary">{asString(marketRead.order_flow)}</p>
-        )}
         <div className="dv2-data-list">
           <DataRow
             label="CVD"
