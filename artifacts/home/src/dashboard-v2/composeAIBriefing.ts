@@ -23,7 +23,7 @@ function number(value: unknown): number | null {
 
 function concise(value: string | null, maxLength = 220): string | null {
   if (!value) return null;
-  const firstSentence = value.split(/(?<=[.!?])\s+/)[0].replace(/[.!?]+$/, "").trim();
+  const firstSentence = value.split(/[!?]|\.(?!\d)/)[0].trim();
   if (!firstSentence) return null;
   return firstSentence.length <= maxLength
     ? firstSentence
@@ -66,9 +66,16 @@ export function composeAIBriefing({
   const marketRead = record(brainState.market_read);
   const liquidityFocus = record(brain.liquidity_focus);
   const rawStatus = (text(data.verdict) ?? text(brain.status) ?? "WAIT").toUpperCase();
-  const direction = text(data.strict_direction)
-    ?? text(brain.favored_direction)
-    ?? (/short|bear/i.test(rawStatus) ? "Short" : /long|bull/i.test(rawStatus) ? "Long" : null);
+  const directionValue = text(data.strict_direction) ?? text(brain.favored_direction);
+  const direction = /^(short|bearish)$/i.test(directionValue ?? "")
+    ? "Short"
+    : /^(long|bullish)$/i.test(directionValue ?? "")
+      ? "Long"
+      : /short|bear/i.test(rawStatus)
+        ? "Short"
+        : /long|bull/i.test(rawStatus)
+          ? "Long"
+          : null;
   const ready = /READY|STRONG TRADE|POSSIBLE TRADE/i.test(rawStatus);
   const verdict = ready
     ? direction

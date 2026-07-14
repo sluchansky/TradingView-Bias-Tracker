@@ -89,3 +89,24 @@ test("does not invent a direction for an ambiguous READY verdict", () => {
   assert.match(result.paragraph, /verdict is READY(?:[.:])/i);
   assert.doesNotMatch(result.paragraph, /READY (LONG|SHORT)/i);
 });
+
+test("does not treat a non-directional label as LONG", () => {
+  const result = connected({
+    verdict: "READY",
+    strict_direction: "Neither",
+    strict_reason: "Direction is unresolved",
+  });
+
+  assert.match(result.paragraph, /verdict is READY(?:[.:])/i);
+  assert.doesNotMatch(result.paragraph, /READY (LONG|SHORT)/i);
+});
+
+test("sanitizes multi-sentence missing-confirmation text", () => {
+  const result = connected({
+    verdict: "WAIT",
+    strict_missing: ["BOS missing.Second sentence!Third sentence"],
+  });
+
+  assert.match(result.paragraph, /still waiting on BOS missing/i);
+  assert.doesNotMatch(result.paragraph, /Second sentence|Third sentence/i);
+});
