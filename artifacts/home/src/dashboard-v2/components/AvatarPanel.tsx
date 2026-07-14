@@ -12,6 +12,8 @@ export function AvatarPanel({
   voiceState,
   operatorStatus,
   operatorTone,
+  aiThinking,
+  dataUnavailable,
 }: {
   avatarState: AvatarState;
   speaking: boolean;
@@ -21,6 +23,8 @@ export function AvatarPanel({
   voiceState: "idle" | "requesting" | "listening" | "processing" | "error";
   operatorStatus: string;
   operatorTone: "live" | "caution" | "error" | "idle";
+  aiThinking: boolean;
+  dataUnavailable: boolean;
 }) {
   // The avatar sits left of the verdict and above the chart in V2. Hold a gentle
   // right/down gaze so he appears to be monitoring that shared workspace.
@@ -45,6 +49,8 @@ export function AvatarPanel({
           speechCtrlRef={speechCtrlRef}
           voiceListeningRef={voiceListeningRef}
           calmMode
+          aiThinking={aiThinking}
+          dataUnavailable={dataUnavailable}
         />
       </div>
       <div className="dv2-avatar-caption">

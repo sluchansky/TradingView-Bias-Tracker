@@ -14,6 +14,7 @@ export function TalkToAvatarPanel({
   startListening,
   stopListening,
   markIdle,
+  onThinkingChange,
 }: {
   title?: string;
   askAssistant: (question: string) => Promise<string>;
@@ -24,6 +25,7 @@ export function TalkToAvatarPanel({
   startListening: (onTranscript: (text: string) => void) => void;
   stopListening: () => void;
   markIdle: () => void;
+  onThinkingChange?: (thinking: boolean) => void;
 }) {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<DashboardMessage[]>([]);
@@ -34,6 +36,7 @@ export function TalkToAvatarPanel({
     if (!question || asking) return;
     setInput("");
     setAsking(true);
+    onThinkingChange?.(true);
     setMessages((current) => [...current, { id: ++messageId, role: "user", text: question }]);
     try {
       const answer = await askAssistant(question);
@@ -44,9 +47,10 @@ export function TalkToAvatarPanel({
       setMessages((current) => [...current, { id: ++messageId, role: "assistant", text }]);
     } finally {
       setAsking(false);
+      onThinkingChange?.(false);
       markIdle();
     }
-  }, [askAssistant, asking, markIdle, speak]);
+  }, [askAssistant, asking, markIdle, onThinkingChange, speak]);
 
   return (
     <DashboardPanel title={title} eyebrow="Voice & text">

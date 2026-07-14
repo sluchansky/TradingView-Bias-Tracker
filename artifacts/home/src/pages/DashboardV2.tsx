@@ -24,6 +24,7 @@ export default function DashboardV2() {
   const voice = useDashboardV2Voice();
   const avatarSelection = useAvatarSelection();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [assistantThinking, setAssistantThinking] = useState(false);
   const brain = asRecord(dashboard.data?.main_brain);
 
   useEffect(() => {
@@ -48,6 +49,8 @@ export default function DashboardV2() {
     return "WAIT";
   }, [brain, dashboard.data]);
   const operatorState = asString(brain.status) ?? asString(dashboard.data?.market_status);
+  const nextStep = asString(dashboard.data?.stage_next_step);
+  const readyToTrade = (operatorState ?? "").toUpperCase() === "READY";
   const operatorTone = dashboard.connection === "connected"
     ? "live"
     : dashboard.connection === "stale" || dashboard.connection === "warming"
@@ -55,8 +58,25 @@ export default function DashboardV2() {
       : dashboard.connection === "error"
         ? "error"
         : "idle";
+  const connectedOperatorStatus = voice.speaking
+    ? "Explaining setup"
+    : assistantThinking || voice.voiceState === "processing" || voice.voiceState === "requesting"
+      ? "Evaluating setup"
+      : readyToTrade
+        ? "Ready to trade"
+        : nextStep && /\bBOS\b/i.test(nextStep)
+          ? "Waiting for BOS"
+          : nextStep && /liquidity/i.test(nextStep)
+            ? "Reviewing liquidity"
+            : nextStep && /VWAP/i.test(nextStep)
+              ? "Watching VWAP"
+              : nextStep && /order flow|CVD|volume/i.test(nextStep)
+                ? "Evaluating order flow"
+                : nextStep && /confirm/i.test(nextStep)
+                  ? "Waiting for confirmation"
+                  : `Monitoring ${dashboard.ticker}`;
   const operatorStatus = dashboard.connection === "connected"
-    ? `Monitoring ${dashboard.ticker}${operatorState ? ` · ${operatorState}` : ""}`
+    ? connectedOperatorStatus
     : dashboard.connection === "stale"
       ? `Data stale · ${dashboard.ticker}`
       : dashboard.connection === "error"
@@ -124,6 +144,9 @@ export default function DashboardV2() {
             voiceState={voice.voiceState}
             operatorStatus={operatorStatus}
             operatorTone={operatorTone}
+            aiThinking={assistantThinking || voice.voiceState === "processing" || voice.voiceState === "requesting"}
+            dataUnavailable={!dashboard.data || dashboard.connection === "loading"
+              || dashboard.connection === "warming" || dashboard.connection === "error"}
           />
           <TalkToAvatarPanel
             title="Speak to Lord Piggington"
@@ -135,6 +158,7 @@ export default function DashboardV2() {
             startListening={voice.startListening}
             stopListening={voice.stopListening}
             markIdle={voice.markIdle}
+            onThinkingChange={setAssistantThinking}
           />
           <section className="dv2-voice-output" aria-label="Voice output status">
             <span>Voice output</span>

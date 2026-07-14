@@ -13,6 +13,8 @@ export function AvatarManager({
   speechCtrlRef,
   voiceListeningRef,
   calmMode,
+  aiThinking,
+  dataUnavailable,
 }: {
   selection: AvatarSelection;
   avState: AvatarState;
@@ -22,6 +24,8 @@ export function AvatarManager({
   speechCtrlRef: RefObject<SpeechCtrl>;
   voiceListeningRef: RefObject<boolean>;
   calmMode?: boolean;
+  aiThinking?: boolean;
+  dataUnavailable?: boolean;
 }) {
   return (
     <div className="avatar-manager" data-state={selection.loadState}>
@@ -35,6 +39,8 @@ export function AvatarManager({
         voiceListeningRef={voiceListeningRef}
         vrmSrc={selection.profile.src}
         calmMode={calmMode}
+        aiThinking={aiThinking}
+        dataUnavailable={dataUnavailable}
         onLoad={selection.loaded}
         onError={selection.failed}
       />
