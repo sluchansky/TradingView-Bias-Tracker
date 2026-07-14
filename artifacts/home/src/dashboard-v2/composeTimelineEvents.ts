@@ -110,8 +110,13 @@ function event(
   const normalizedState = normalizeTimelineState(state);
   const timestamp = now.toISOString();
   const key = `${category}:${snapshot.instrument}:${normalizedState}`;
+  let hash = 2166136261;
+  for (let index = 0; index < message.length; index += 1) {
+    hash ^= message.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
   return {
-    id: `${timestamp}:${key}`,
+    id: `${timestamp}:${key}:${(hash >>> 0).toString(36)}`,
     key,
     timestamp,
     category,

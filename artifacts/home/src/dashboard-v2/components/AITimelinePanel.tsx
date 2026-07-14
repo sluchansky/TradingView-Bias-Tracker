@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { memo, useLayoutEffect, useRef } from "react";
 import type { AITimelineEvent } from "../aiTimelineTypes";
 
 function eventTime(timestamp: string): string {
@@ -13,7 +13,7 @@ function eventTime(timestamp: string): string {
       });
 }
 
-export function AITimelinePanel({
+export const AITimelinePanel = memo(function AITimelinePanel({
   events,
   newEventCount,
   onViewingNewestChange,
@@ -24,7 +24,7 @@ export function AITimelinePanel({
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const wasAtTopRef = useRef(true);
-  const anchorRef = useRef<{ id: string; offset: number } | null>(null);
+  const anchorRef = useRef<{ id: string; offset: number; distanceFromBottom: number } | null>(null);
 
   const captureAnchor = () => {
     const viewport = viewportRef.current;
@@ -36,7 +36,11 @@ export function AITimelinePanel({
     const items = Array.from(viewport.querySelectorAll<HTMLElement>("[data-event-id]"));
     const firstVisible = items.find((item) => item.getBoundingClientRect().bottom >= viewportTop);
     anchorRef.current = firstVisible
-      ? { id: firstVisible.dataset.eventId ?? "", offset: firstVisible.getBoundingClientRect().top - viewportTop }
+      ? {
+          id: firstVisible.dataset.eventId ?? "",
+          offset: firstVisible.getBoundingClientRect().top - viewportTop,
+          distanceFromBottom: viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop,
+        }
       : null;
   };
 
@@ -52,6 +56,11 @@ export function AITimelinePanel({
         const viewportTop = viewport.getBoundingClientRect().top;
         const currentOffset = item.getBoundingClientRect().top - viewportTop;
         viewport.scrollTop += currentOffset - anchor.offset;
+      } else {
+        viewport.scrollTop = Math.max(
+          0,
+          viewport.scrollHeight - viewport.clientHeight - anchor.distanceFromBottom,
+        );
       }
     }
     captureAnchor();
@@ -103,4 +112,4 @@ export function AITimelinePanel({
       </div>
     </section>
   );
-}
+});

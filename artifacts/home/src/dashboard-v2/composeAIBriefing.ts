@@ -5,6 +5,12 @@ export type AIBriefing = {
   paragraph: string;
 };
 
+export type ResolvedVerdict = {
+  label: "WAIT" | "READY" | "READY LONG" | "READY SHORT" | "INVALIDATED";
+  ready: boolean;
+  direction: "Long" | "Short" | null;
+};
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -174,6 +180,34 @@ function watchTarget(value: string): string {
     : `an entry condition for ${naturalRest}`;
 }
 
+export function resolveAuthoritativeVerdict(data: DashboardStatus | null): ResolvedVerdict {
+  const brain = record(data?.main_brain);
+  const rawStatus = (text(data?.verdict) ?? text(brain.status) ?? "WAIT").toUpperCase();
+  const directionValue = text(data?.strict_direction) ?? text(brain.favored_direction);
+  const direction = /^(short|bearish)$/i.test(directionValue ?? "")
+    ? "Short"
+    : /^(long|bullish)$/i.test(directionValue ?? "")
+      ? "Long"
+      : /short|bear/i.test(rawStatus)
+        ? "Short"
+        : /long|bull/i.test(rawStatus)
+          ? "Long"
+          : null;
+  const invalidated = /\bINVALIDATED\b/i.test(rawStatus);
+  const explicitlyNotReady = /\b(?:NOT READY|WAIT|NO TRADE|INVALIDATED)\b/i.test(rawStatus);
+  const ready = !explicitlyNotReady
+    && /\b(?:READY|STRONG TRADE|POSSIBLE TRADE)\b/i.test(rawStatus);
+  return {
+    ready,
+    direction,
+    label: invalidated
+      ? "INVALIDATED"
+      : ready
+        ? direction === "Short" ? "READY SHORT" : direction === "Long" ? "READY LONG" : "READY"
+        : "WAIT",
+  };
+}
+
 export function composeAIBriefing({
   data,
   ticker,
@@ -198,25 +232,9 @@ export function composeAIBriefing({
   const brainState = record(data.brain_state);
   const marketRead = record(brainState.market_read);
   const liquidityFocus = record(brain.liquidity_focus);
-  const rawStatus = (text(data.verdict) ?? text(brain.status) ?? "WAIT").toUpperCase();
-  const directionValue = text(data.strict_direction) ?? text(brain.favored_direction);
-  const direction = /^(short|bearish)$/i.test(directionValue ?? "")
-    ? "Short"
-    : /^(long|bullish)$/i.test(directionValue ?? "")
-      ? "Long"
-      : /short|bear/i.test(rawStatus)
-        ? "Short"
-        : /long|bull/i.test(rawStatus)
-          ? "Long"
-          : null;
-  const explicitlyNotReady = /\b(?:NOT READY|WAIT|NO TRADE|INVALIDATED)\b/i.test(rawStatus);
-  const ready = !explicitlyNotReady
-    && /\b(?:READY|STRONG TRADE|POSSIBLE TRADE)\b/i.test(rawStatus);
-  const verdict = ready
-    ? direction
-      ? (/short|bear/i.test(direction) ? "READY SHORT" : "READY LONG")
-      : "READY"
-    : "WAIT";
+  const resolvedVerdict = resolveAuthoritativeVerdict(data);
+  const { direction, ready } = resolvedVerdict;
+  const verdict = resolvedVerdict.label;
   const edge = number(brain.edge_score) ?? number(data.edge_score);
   const bias = concise(text(data.bias));
   const structure = concise(text(data.market_structure) ?? text(marketRead.structure));

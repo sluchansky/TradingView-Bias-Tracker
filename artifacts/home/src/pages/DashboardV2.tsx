@@ -16,6 +16,7 @@ import { MarketContextPanel } from "@/dashboard-v2/components/MarketContextPanel
 import { NewsSessionPanel } from "@/dashboard-v2/components/SessionPanels";
 import { TalkToAvatarPanel } from "@/dashboard-v2/components/TalkToAvatarPanel";
 import { VerdictHero } from "@/dashboard-v2/components/VerdictHero";
+import { resolveAuthoritativeVerdict } from "@/dashboard-v2/composeAIBriefing";
 import { asNumber, asRecord, asString } from "@/dashboard-v2/types";
 import { useDashboardV2Data } from "@/dashboard-v2/useDashboardV2Data";
 import { useAITimeline } from "@/dashboard-v2/useAITimeline";
@@ -34,6 +35,11 @@ export default function DashboardV2() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [assistantThinking, setAssistantThinking] = useState(false);
   const brain = asRecord(dashboard.data?.main_brain);
+  const liveStatus = dashboard.connection === "connected";
+  const authoritativeVerdict = useMemo(
+    () => resolveAuthoritativeVerdict(dashboard.data),
+    [dashboard.data],
+  );
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -45,20 +51,20 @@ export default function DashboardV2() {
   }, [settingsOpen]);
 
   const avatarState = useMemo<AvatarState>(() => {
-    if (!dashboard.data) return "WAIT";
-    const status = (asString(brain.status) ?? asString(dashboard.data.verdict) ?? "").toUpperCase();
-    const direction = asString(brain.favored_direction) ?? asString(dashboard.data.strict_direction) ?? "";
+    if (!dashboard.data || !liveStatus) return "WAIT";
     const edge = asNumber(brain.edge_score) ?? asNumber(dashboard.data.edge_score) ?? 0;
-    if (status.includes("READY")) return /short|bear/i.test(direction) ? "READY_SHORT" : "READY_LONG";
-    if (status.includes("MANAGING")) return "ACTIVE";
-    if (status.includes("BUILD") || edge >= 50) return "FORMING";
+    if (authoritativeVerdict.ready) {
+      if (authoritativeVerdict.direction === "Short") return "READY_SHORT";
+      if (authoritativeVerdict.direction === "Long") return "READY_LONG";
+      return "ANALYZING";
+    }
+    if (edge >= 50) return "FORMING";
     if (edge >= 28) return "ANALYZING";
     if (edge < 20) return "NO_EDGE";
     return "WAIT";
-  }, [brain, dashboard.data]);
-  const operatorState = asString(brain.status) ?? asString(dashboard.data?.market_status);
+  }, [authoritativeVerdict, brain, dashboard.data, liveStatus]);
   const nextStep = asString(dashboard.data?.stage_next_step);
-  const readyToTrade = (operatorState ?? "").toUpperCase() === "READY";
+  const readyToTrade = liveStatus && authoritativeVerdict.ready;
   const operatorTone = dashboard.connection === "connected"
     ? "live"
     : dashboard.connection === "stale" || dashboard.connection === "warming"
@@ -186,6 +192,7 @@ export default function DashboardV2() {
             <VerdictHero
               data={dashboard.data}
               loading={dashboard.connection === "loading" || dashboard.connection === "warming"}
+              live={liveStatus}
             />
             <MainReasonCard
               data={dashboard.data}

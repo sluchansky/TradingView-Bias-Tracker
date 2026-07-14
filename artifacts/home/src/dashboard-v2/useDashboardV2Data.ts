@@ -70,12 +70,17 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
   const fetchStatus = useCallback(async (
     selectedTicker: DashboardTicker,
     requestHeaders = headers,
+    externalSignal?: AbortSignal,
   ): Promise<"ok" | "warming" | "unauthorized" | "error"> => {
     const requestVersion = ++requestVersionRef.current;
+    const controller = new AbortController();
+    const abortFromExternal = () => controller.abort();
+    externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
+    const timeout = setTimeout(() => controller.abort(), 10_000);
     try {
       const response = await fetch(
         `/api/status?ticker=${encodeURIComponent(selectedTicker)}`,
-        { credentials: "include", headers: requestHeaders },
+        { credentials: "include", headers: requestHeaders, signal: controller.signal },
       );
       if (requestVersion !== requestVersionRef.current || selectedTicker !== tickerRef.current) {
         return "ok";
@@ -105,9 +110,17 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
       applyPayload(payload);
       return "ok";
     } catch {
+      if (requestVersion !== requestVersionRef.current
+          || selectedTicker !== tickerRef.current
+          || externalSignal?.aborted) {
+        return "error";
+      }
       setConnection("error");
       setError("Unable to reach the trading service.");
       return "error";
+    } finally {
+      clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", abortFromExternal);
     }
   }, [applyPayload, clearAuth, headers]);
 
@@ -150,20 +163,24 @@ export function useDashboardV2Data(initialTicker: DashboardTicker = "MNQ") {
     if (!password) return;
 
     let active = true;
+    let controller: AbortController | null = null;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       if (!active) return;
       setConnection((current) => current === "idle" ? "loading" : current);
-      await fetchStatus(ticker);
+      controller = new AbortController();
+      await fetchStatus(ticker, headers, controller.signal);
+      controller = null;
       if (active) timeout = setTimeout(poll, POLL_INTERVAL_MS);
     };
     void poll();
     return () => {
       active = false;
+      controller?.abort();
       requestVersionRef.current += 1;
       if (timeout) clearTimeout(timeout);
     };
-  }, [fetchStatus, password, ticker]);
+  }, [fetchStatus, headers, password, ticker]);
 
   useEffect(() => {
     const interval = setInterval(() => {

@@ -88,7 +88,7 @@ export function useAITimeline({
     eventsRef.current = merged;
     setEvents(merged);
     if (!viewingNewestRef.current) {
-      setNewEventCount((count) => count + added);
+      setNewEventCount((count) => Math.min(100, count + added));
     }
     const storage = browserStorage();
     if (storage) persistTimeline(storage, storageKey, merged);

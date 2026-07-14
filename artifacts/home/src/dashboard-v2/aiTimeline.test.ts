@@ -191,6 +191,8 @@ test("drops malformed stored timeline events", () => {
   const key = "timeline";
   values.set(key, JSON.stringify([
     valid,
+    { ...valid, id: "wrong-scope", instrument: "MGC" },
+    { ...valid },
     { ...valid, id: "bad-date", timestamp: "not-a-date" },
     { ...valid, id: "bad-category", category: "Unknown" },
     { ...valid, id: "bad-tone", tone: "orange" },
