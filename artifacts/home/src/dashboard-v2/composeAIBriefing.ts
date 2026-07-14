@@ -65,15 +65,15 @@ export function composeAIBriefing({
   const brainState = record(data.brain_state);
   const marketRead = record(brainState.market_read);
   const liquidityFocus = record(brain.liquidity_focus);
-  const rawStatus = (
-    text(brain.status)
-    ?? text(data.verdict)
-    ?? "WAIT"
-  ).toUpperCase();
-  const direction = text(brain.favored_direction) ?? text(data.strict_direction);
-  const ready = rawStatus.includes("READY");
+  const rawStatus = (text(data.verdict) ?? text(brain.status) ?? "WAIT").toUpperCase();
+  const direction = text(data.strict_direction)
+    ?? text(brain.favored_direction)
+    ?? (/short|bear/i.test(rawStatus) ? "Short" : /long|bull/i.test(rawStatus) ? "Long" : null);
+  const ready = /READY|STRONG TRADE|POSSIBLE TRADE/i.test(rawStatus);
   const verdict = ready
-    ? (/short|bear/i.test(direction ?? rawStatus) ? "READY SHORT" : "READY LONG")
+    ? direction
+      ? (/short|bear/i.test(direction) ? "READY SHORT" : "READY LONG")
+      : "READY"
     : "WAIT";
   const edge = number(brain.edge_score) ?? number(data.edge_score);
   const bias = concise(text(data.bias));
@@ -87,7 +87,7 @@ export function composeAIBriefing({
   const reason = concise(text(data.strict_reason) ?? text(brain.wait_reason));
   const missing = Array.isArray(data.strict_missing)
     ? data.strict_missing
-      .map(text)
+      .map((item) => concise(text(item), 100))
       .filter((item): item is string => item !== null)
       .slice(0, 3)
       .map((item) => item.replace(/_/g, " "))

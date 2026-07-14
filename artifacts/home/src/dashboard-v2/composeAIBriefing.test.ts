@@ -68,3 +68,24 @@ test("composes a READY SHORT briefing", () => {
   assert.match(result.paragraph, /77\/110/);
   assert.doesNotMatch(result.paragraph, /READY LONG/i);
 });
+
+test("does not let display brain status override an authoritative WAIT", () => {
+  const result = connected({
+    verdict: "WAIT",
+    strict_reason: "Confirmation is still missing",
+    main_brain: { status: "READY", favored_direction: "Long" },
+  });
+
+  assert.match(result.paragraph, /verdict is WAIT/i);
+  assert.doesNotMatch(result.paragraph, /READY LONG/i);
+});
+
+test("does not invent a direction for an ambiguous READY verdict", () => {
+  const result = connected({
+    verdict: "READY",
+    strict_reason: "Setup conditions are aligned",
+  });
+
+  assert.match(result.paragraph, /verdict is READY(?:[.:])/i);
+  assert.doesNotMatch(result.paragraph, /READY (LONG|SHORT)/i);
+});
