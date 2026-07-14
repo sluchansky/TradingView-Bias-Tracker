@@ -1,46 +1,25 @@
-import type { DashboardStatus } from "../types";
-import { asNumber, asRecord, asString } from "../types";
+import { composeAIBriefing } from "../composeAIBriefing";
+import type { ConnectionState, DashboardStatus, DashboardTicker } from "../types";
+import { asNumber, asRecord } from "../types";
 import { DashboardPanel, Unavailable } from "./Panel";
 
-export function MainReasonCard({ data }: { data: DashboardStatus | null }) {
-  const brain = asRecord(data?.main_brain);
-  const edge = asNumber(brain.edge_score) ?? asNumber(data?.edge_score);
-  const price = asNumber(data?.current_price);
-  const vwap = asNumber(data?.vwap_value);
-  const structure = asString(data?.market_structure);
-  const reason = (
-    asString(data?.strict_reason)
-    ?? asString(brain.summary)
-  );
-  const nextStep = asString(data?.stage_next_step);
-  const recommendation = asString(data?.recommendation) ?? asString(data?.action);
-  const vwapRelation = price !== null && vwap !== null
-    ? price === vwap ? "at" : price > vwap ? "above" : "below"
-    : null;
-  const sameAsReason = (value: string | null) =>
-    value !== null && reason !== null && value.trim().toLowerCase() === reason.trim().toLowerCase();
-  const finalInstruction = nextStep && !sameAsReason(nextStep)
-    ? `The next step is: ${nextStep}`
-    : recommendation && !sameAsReason(recommendation)
-      ? `The current recommendation is: ${recommendation}`
-      : null;
-  const briefing = [
-    structure ? `I'm monitoring ${structure.toLowerCase()}.` : null,
-    edge !== null ? `Current edge is ${Math.round(edge)}/110.` : null,
-    vwapRelation ? `Price is ${vwapRelation} VWAP.` : null,
-    reason ? `My current read: ${reason}` : null,
-    finalInstruction,
-  ].filter((line, index, lines): line is string =>
-    line !== null && lines.indexOf(line) === index
-  );
+export function MainReasonCard({
+  data,
+  ticker,
+  connection,
+}: {
+  data: DashboardStatus | null;
+  ticker: DashboardTicker;
+  connection: ConnectionState;
+}) {
+  const briefing = composeAIBriefing({ data, ticker, connection });
 
   return (
     <DashboardPanel title="AI briefing" className="dv2-decision-card dv2-reason-card">
-      {briefing.length ? (
-        <div className="dv2-briefing-copy">
-          {briefing.map((line) => <p key={line}>{line}</p>)}
-        </div>
-      ) : <Unavailable>Live briefing unavailable.</Unavailable>}
+      <div className="dv2-briefing-copy">
+        <span className="dv2-briefing-status"><i />{briefing.status}</span>
+        <p>{briefing.paragraph}</p>
+      </div>
     </DashboardPanel>
   );
 }

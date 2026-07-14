@@ -179,7 +179,11 @@ export default function DashboardV2() {
               data={dashboard.data}
               loading={dashboard.connection === "loading" || dashboard.connection === "warming"}
             />
-            <MainReasonCard data={dashboard.data} />
+            <MainReasonCard
+              data={dashboard.data}
+              ticker={dashboard.ticker}
+              connection={dashboard.connection}
+            />
             <MarketContextPanel data={dashboard.data} />
             <BullBearPowerCard data={dashboard.data} />
           </div>

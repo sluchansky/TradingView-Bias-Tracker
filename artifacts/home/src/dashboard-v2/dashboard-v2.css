@@ -1815,20 +1815,32 @@
 
 .dv2-briefing-copy {
   display: grid;
+  gap: 10px;
+}
+
+.dv2-briefing-status {
+  display: inline-flex;
+  align-items: center;
   gap: 7px;
+  width: fit-content;
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.dv2-briefing-status i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dv2-blue);
+  box-shadow: 0 0 7px rgba(96, 165, 250, 0.55);
 }
 
 .dv2-briefing-copy p {
   margin: 0;
   color: #dce3ed;
   font-size: 15px;
-  line-height: 1.48;
-}
-
-.dv2-briefing-copy p:first-child {
-  color: var(--dv2-text);
-  font-size: 16px;
-  font-weight: 650;
+  line-height: 1.6;
 }
 
 .dv2-avatar-operator-status {
