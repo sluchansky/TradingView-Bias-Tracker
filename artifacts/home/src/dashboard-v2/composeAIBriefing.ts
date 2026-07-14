@@ -152,9 +152,17 @@ function sharesConfirmationConcept(left: string | null, right: string | null): b
 }
 
 function afterBecause(value: string): string {
-  return /^I\b/.test(value)
+  const firstWord = value.split(/\s+/)[0].replace(/[^A-Za-z]/g, "");
+  return /^I\b/.test(value) || /^[A-Z]{2,}$/.test(firstWord)
     ? value
     : `${value[0].toLowerCase()}${value.slice(1)}`;
+}
+
+function watchTarget(value: string): string {
+  return value
+    .replace(/^(?:wait|watch)\s+for\s+/i, "")
+    .replace(/^await\s+/i, "")
+    .trim();
 }
 
 export function composeAIBriefing({
@@ -225,12 +233,13 @@ export function composeAIBriefing({
   const invalidation = concise(text(data.stage_invalidation));
 
   const missingAreConfirmations = missing.every((item) =>
-    /confirmation|alignment|break of structure|reclaim/.test(item)
+    /confirmation|break of structure|reclaim/.test(item)
   );
   const nextConcepts = confirmationConcepts(nextStep);
+  const nextResolvesConflict = /conflict|resolve|resolution/i.test(nextStep ?? "");
   const nextIsConfirmation = nextConcepts.some((concept) =>
     ["structure", "vwap", "liquidity", "delta", "volume", "zone"].includes(concept)
-  );
+  ) && !nextResolvesConflict;
   const status = ready
     ? "Setup ready"
     : missing.length
@@ -282,8 +291,9 @@ export function composeAIBriefing({
     ? nextStep
     : null;
   if (nextDistinct || invalidation || missing.length) {
+    const naturalNext = nextDistinct ? watchTarget(nextDistinct) : null;
     const watchClause = nextDistinct
-      ? `I’m watching for ${nextDistinct}`
+      ? `I’m watching for ${naturalNext || nextDistinct}`
       : "I’m holding the current view";
     const changeClause = invalidation
       ? `I would reconsider if ${invalidation}`

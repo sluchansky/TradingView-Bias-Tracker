@@ -244,3 +244,37 @@ test("keeps first-person rationale capitalized and uses a clear condition refere
   assert.doesNotMatch(result.paragraph, /because i still/);
   assert.doesNotMatch(result.paragraph, /a change there/i);
 });
+
+test("classifies conflict resolution as a condition", () => {
+  const cvd = connected({
+    verdict: "WAIT",
+    strict_missing: ["cvd_conflict"],
+  });
+  const structure = connected({
+    verdict: "WAIT",
+    stage_next_step: "Resolve conflicting structure",
+  });
+
+  assert.equal(cvd.status, "Waiting for conditions");
+  assert.equal(structure.status, "Waiting for conditions");
+});
+
+test("preserves leading acronyms in verdict reasoning", () => {
+  const result = connected({
+    verdict: "WAIT",
+    strict_reason: "VWAP confirmation is missing",
+  });
+
+  assert.match(result.paragraph, /because VWAP confirmation is missing/i);
+  assert.doesNotMatch(result.paragraph, /because vWAP/);
+});
+
+test("removes imperative prefixes from the watch sentence", () => {
+  const result = connected({
+    verdict: "WAIT",
+    stage_next_step: "Wait for buyers to reclaim VWAP",
+  });
+
+  assert.match(result.paragraph, /I’m watching for buyers to reclaim VWAP/i);
+  assert.doesNotMatch(result.paragraph, /watching for Wait for/i);
+});
