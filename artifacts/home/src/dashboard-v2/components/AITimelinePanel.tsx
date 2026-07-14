@@ -34,7 +34,7 @@ export function AITimelinePanel({
       viewport.scrollTop += nextHeight - previousHeightRef.current;
     }
     previousHeightRef.current = nextHeight;
-  }, [events.length]);
+  }, [events]);
 
   const showNewest = () => {
     const viewport = viewportRef.current;

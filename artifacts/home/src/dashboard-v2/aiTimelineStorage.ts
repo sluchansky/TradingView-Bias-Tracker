@@ -4,6 +4,13 @@ import { TIMELINE_LIMIT } from "./composeTimelineEvents.ts";
 
 export type TimelineStorage = Pick<Storage, "getItem" | "setItem">;
 
+const VALID_CATEGORIES = new Set([
+  "System", "Monitoring", "Verdict", "Edge", "Structure", "Liquidity",
+  "Order Flow", "VWAP", "Volatility", "Risk", "Trade", "News",
+]);
+const VALID_TONES = new Set(["blue", "purple", "cyan", "amber", "green", "red", "gray"]);
+const VALID_INSTRUMENTS = new Set(["MNQ", "MGC", "MES", "MYM"]);
+
 export function timelineSessionDate(date = new Date()): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
@@ -26,8 +33,14 @@ function isTimelineEvent(value: unknown): value is AITimelineEvent {
     && typeof event.key === "string"
     && typeof event.timestamp === "string"
     && typeof event.category === "string"
+    && VALID_CATEGORIES.has(event.category)
     && typeof event.message === "string"
-    && typeof event.instrument === "string";
+    && typeof event.tone === "string"
+    && VALID_TONES.has(event.tone)
+    && typeof event.instrument === "string"
+    && VALID_INSTRUMENTS.has(event.instrument)
+    && typeof event.state === "string"
+    && Number.isFinite(new Date(event.timestamp).getTime());
 }
 
 export function restoreTimeline(storage: TimelineStorage, key: string): AITimelineEvent[] {

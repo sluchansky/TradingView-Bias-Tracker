@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   TIMELINE_LIMIT,
+  composeInstrumentSelectionEvent,
   composeTimelineEvents,
   createTimelineSnapshot,
   mergeTimelineEvents,
@@ -42,6 +43,25 @@ test("creates one honest disconnected-service event", () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].category, "System");
   assert.match(events[0].message, /Trading service disconnected/i);
+});
+
+test("distinguishes stale status from a disconnected service", () => {
+  const before = snapshot({ verdict: "WAIT" });
+  const stale = createTimelineSnapshot({ ticker: "MNQ", connection: "stale", data: { verdict: "WAIT" } });
+  const events = composeTimelineEvents(before, stale, NOW);
+
+  assert.equal(events.length, 1);
+  assert.match(events[0].message, /status became stale/i);
+  assert.doesNotMatch(events[0].message, /service disconnected/i);
+});
+
+test("creates an instrument-selection event", () => {
+  const selected = composeInstrumentSelectionEvent("MNQ", "MGC", NOW);
+
+  assert.ok(selected);
+  assert.equal(selected.category, "Monitoring");
+  assert.match(selected.message, /MNQ to MGC/);
+  assert.equal(composeInstrumentSelectionEvent("MGC", "MGC", NOW), null);
 });
 
 test("creates a verdict-change event", () => {
@@ -95,6 +115,23 @@ test("suppresses duplicate continuing events", () => {
   assert.equal(repeated.length, 1);
 });
 
+test("allows a state after it changed away and returned", () => {
+  const first = timelineEvent(1);
+  const changed = { ...timelineEvent(2), key: "Edge:MNQ:changed", state: "changed" };
+  const returned = {
+    ...timelineEvent(3),
+    id: "returned",
+    key: first.key,
+    state: first.state,
+    timestamp: new Date(NOW.getTime() + 30_000).toISOString(),
+  };
+  const history = mergeTimelineEvents([first], [changed], NOW);
+  const result = mergeTimelineEvents(history, [returned], new Date(NOW.getTime() + 30_000));
+
+  assert.equal(result[0].id, "returned");
+  assert.equal(result.length, 3);
+});
+
 test("keeps only the newest 100 events", () => {
   const oversized = Array.from({ length: 125 }, (_, index) => timelineEvent(index));
   const limited = mergeTimelineEvents(oversized, [], NOW);
@@ -125,4 +162,24 @@ test("restores the current instrument and session timeline from storage", () => 
   assert.deepEqual(restoreTimeline(storage, mnqKey), expected);
   assert.deepEqual(restoreTimeline(storage, mgcKey), []);
   assert.match(mnqKey, /MNQ$/);
+});
+
+test("drops malformed stored timeline events", () => {
+  const valid = timelineEvent(1);
+  const values = new Map<string, string>();
+  const storage: TimelineStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => { values.set(key, value); },
+  };
+  const key = "timeline";
+  values.set(key, JSON.stringify([
+    valid,
+    { ...valid, id: "bad-date", timestamp: "not-a-date" },
+    { ...valid, id: "bad-category", category: "Unknown" },
+    { ...valid, id: "bad-tone", tone: "orange" },
+    { ...valid, id: "bad-instrument", instrument: "ES" },
+    { ...valid, id: "missing-state", state: undefined },
+  ]));
+
+  assert.deepEqual(restoreTimeline(storage, key), [valid]);
 });

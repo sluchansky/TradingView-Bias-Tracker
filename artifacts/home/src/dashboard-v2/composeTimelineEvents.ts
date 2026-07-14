@@ -34,7 +34,8 @@ export function normalizeTimelineState(value: string | null): string {
 
 function connectionState(value: TimelineInput["connection"]): AITimelineSnapshot["connection"] {
   if (value === "connected") return "connected";
-  if (value === "error" || value === "stale") return "disconnected";
+  if (value === "error") return "disconnected";
+  if (value === "stale") return "stale";
   return "connecting";
 }
 
@@ -156,6 +157,16 @@ export function composeTimelineEvents(
         "blue",
       )];
     }
+    if (current.connection === "stale") {
+      return [event(
+        current,
+        now,
+        "System",
+        "stale",
+        "Live status is stale. Waiting for fresh market data before updating analysis.",
+        "amber",
+      )];
+    }
     return [];
   }
 
@@ -166,10 +177,19 @@ export function composeTimelineEvents(
         current, now, "System", "disconnected",
         "Trading service disconnected. Waiting to resume live analysis.", "red",
       ));
+    } else if (current.connection === "stale") {
+      events.push(event(
+        current, now, "System", "stale",
+        "Live status became stale. Keeping the last snapshot while waiting for fresh data.", "amber",
+      ));
     } else if (current.connection === "connected") {
+      const fromOffline = previous.connection === "disconnected";
       events.push(event(
         current, now, "System", "connected",
-        `Trading service connected. Live analysis resumed for ${current.instrument}.`, "gray",
+        fromOffline
+          ? `Trading service reconnected. Live analysis resumed for ${current.instrument}.`
+          : `Fresh status data received. Monitoring ${current.instrument}.`,
+        "gray",
       ));
     }
   }
@@ -248,6 +268,36 @@ export function composeTimelineEvents(
   return events;
 }
 
+export function composeInstrumentSelectionEvent(
+  previousInstrument: AITimelineSnapshot["instrument"],
+  currentInstrument: AITimelineSnapshot["instrument"],
+  now = new Date(),
+): AITimelineEvent | null {
+  if (previousInstrument === currentInstrument) return null;
+  const snapshot: AITimelineSnapshot = {
+    instrument: currentInstrument,
+    connection: "connecting",
+    verdict: null,
+    edge: null,
+    structure: null,
+    liquidity: null,
+    orderFlow: null,
+    vwapRelation: null,
+    volatility: null,
+    risk: null,
+    position: null,
+    news: null,
+  };
+  return event(
+    snapshot,
+    now,
+    "Monitoring",
+    `instrument-${currentInstrument}`,
+    `Monitoring switched from ${previousInstrument} to ${currentInstrument}.`,
+    "blue",
+  );
+}
+
 export function mergeTimelineEvents(
   existing: AITimelineEvent[],
   incoming: AITimelineEvent[],
@@ -260,8 +310,11 @@ export function mergeTimelineEvents(
       item.category === candidate.category && item.instrument === candidate.instrument
     );
     const sameStateContinues = latestInCategory?.key === candidate.key;
-    const age = latestInCategory
-      ? now.getTime() - new Date(latestInCategory.timestamp).getTime()
+    const latestTime = latestInCategory
+      ? new Date(latestInCategory.timestamp).getTime()
+      : Number.NaN;
+    const age = Number.isFinite(latestTime)
+      ? now.getTime() - latestTime
       : Number.POSITIVE_INFINITY;
     if (sameStateContinues && age < TIMELINE_REPEAT_AFTER_MS) continue;
     merged = [candidate, ...merged];

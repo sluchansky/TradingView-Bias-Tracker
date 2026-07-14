@@ -36,7 +36,7 @@ export type AITimelineEvent = {
 
 export type AITimelineSnapshot = {
   instrument: DashboardTicker;
-  connection: "connected" | "connecting" | "disconnected";
+  connection: "connected" | "connecting" | "disconnected" | "stale";
   verdict: string | null;
   edge: number | null;
   structure: string | null;
