@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { AvatarSettingsPanel } from "@/components/avatar/AvatarSettingsPanel";
 import type { AvatarState } from "@/components/avatar/avatarTypes";
+import { useAvatarSelection } from "@/components/avatar/useAvatarSelection";
 import { AIReasoningPanel } from "@/dashboard-v2/components/AIReasoningPanel";
 import { AvatarPanel } from "@/dashboard-v2/components/AvatarPanel";
 import { ChartPanel } from "@/dashboard-v2/components/ChartPanel";
@@ -21,6 +23,7 @@ import "@/dashboard-v2/dashboard-v2.css";
 export default function DashboardV2() {
   const dashboard = useDashboardV2Data();
   const voice = useDashboardV2Voice();
+  const avatarManager = useAvatarSelection();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const brain = asRecord(dashboard.data?.main_brain);
 
@@ -82,6 +85,7 @@ export default function DashboardV2() {
           <button type="button" onClick={dashboard.clearAuth}>Sign out</button>
           <a href="/">Open current dashboard</a>
           <a href="/api/dashboard">Open engineering dashboard</a>
+          <AvatarSettingsPanel controller={avatarManager} />
         </div>
       )}
 
@@ -100,6 +104,7 @@ export default function DashboardV2() {
             speaking={voice.speaking}
             speechCtrlRef={voice.speechCtrlRef}
             voiceListeningRef={voice.voiceListeningRef}
+            manager={avatarManager}
           />
           <div className="dv2-hero-intelligence">
             <VerdictHero

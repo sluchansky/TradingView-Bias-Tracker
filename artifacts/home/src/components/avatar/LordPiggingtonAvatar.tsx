@@ -406,11 +406,13 @@ interface Props extends LordPiggingtonProps {
   debug?:   boolean;
   vrmSrc?:  string;
   calmMode?: boolean;
+  onLoad?:  (source: string) => void;
+  onError?: (source: string) => void;
 }
 
 function LordPiggingtonAvatar({
   avState, speaking, gazeEvent, speechCtrlRef, debug = false,
-  vrmSrc = '/LordPiggington.vrm', calmMode = false,
+  vrmSrc = '/LordPiggington.vrm', calmMode = false, onLoad, onError,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const vrmRef    = useRef<VRM | null>(null);
@@ -535,6 +537,7 @@ function LordPiggingtonAvatar({
 
     const scene = new THREE.Scene();
     scene.background = null;
+    let disposed = false;
 
     // FOV widened slightly to accommodate walk range (38° vs prior 30°)
     const camera = new THREE.PerspectiveCamera(38, W / H, 0.01, 30);
@@ -556,61 +559,74 @@ function LordPiggingtonAvatar({
     const loader = new GLTFLoader();
     loader.register(p => new VRMLoaderPlugin(p));
     loader.load(vrmSrc, (gltf) => {
-      const vrm: VRM = (gltf.userData as { vrm: VRM }).vrm;
-      if (!vrm) { console.error('[Avatar] VRM not found in', vrmSrc); return; }
+      try {
+        const vrm: VRM = (gltf.userData as { vrm: VRM }).vrm;
+        if (!vrm) throw new Error('VRM payload missing');
+        if (disposed) {
+          try { VRMUtils.deepDispose(vrm.scene); } catch (_) {}
+          return;
+        }
 
-      VRMUtils.rotateVRM0(vrm);
-      scene.add(vrm.scene);
-      vrmRef.current = vrm;
-      autoFrame(vrm, vrm.scene, camera);
+        VRMUtils.rotateVRM0(vrm);
+        scene.add(vrm.scene);
+        vrmRef.current = vrm;
+        autoFrame(vrm, vrm.scene, camera);
 
-      // Bone inventory
-      const hum = vrm.humanoid;
-      const bonesFound: string[] = [];
-      const bonesMissing: string[] = [];
-      ALL_LOG_BONES.forEach(name => {
-        const node = hum?.getNormalizedBoneNode?.(name as never);
-        if (node) { bonesFound.push(name); }
-        else       { bonesMissing.push(name); }
-      });
-
-      // Expression inventory
-      const allNames = (vrm.expressionManager?.expressions ?? [])
-        .map((e: { expressionName: string }) => e.expressionName);
-      const foundMouth = MOUTH_CANDIDATES.filter(n => vrm.expressionManager?.getExpression(n));
-      availableMouthRef.current = foundMouth;
-
-      // Jaw bone — try VRM humanoid API first (most reliable), then raw traversal
-      const jawNode = hum?.getNormalizedBoneNode?.('jaw' as never) as THREE.Bone | null;
-      if (jawNode) {
-        jawBoneRef.current = jawNode;
-      } else {
-        vrm.scene.traverse((obj) => {
-          if (!jawBoneRef.current && obj instanceof THREE.Object3D &&
-              /jaw|chin|mandible|lowerjaw|J_Adj_.*Jaw|J_Bip.*Jaw/i.test(obj.name)) {
-            jawBoneRef.current = obj as THREE.Bone;
-          }
+        // Bone inventory
+        const hum = vrm.humanoid;
+        const bonesFound: string[] = [];
+        const bonesMissing: string[] = [];
+        ALL_LOG_BONES.forEach(name => {
+          const node = hum?.getNormalizedBoneNode?.(name as never);
+          if (node) { bonesFound.push(name); }
+          else       { bonesMissing.push(name); }
         });
-      }
 
-      debugDataRef.current = {
-        ...debugDataRef.current,
-        expressionNames: allNames, availableMouth: foundMouth,
-        exprMgrFound: !!vrm.expressionManager, bonesFound, bonesMissing,
-      };
+        // Expression inventory
+        const allNames = (vrm.expressionManager?.expressions ?? [])
+          .map((e: { expressionName: string }) => e.expressionName);
+        const foundMouth = MOUTH_CANDIDATES.filter(n => vrm.expressionManager?.getExpression(n));
+        availableMouthRef.current = foundMouth;
 
-      // The V2 dashboard requests a calm, presentation-safe idle. Existing
-      // consumers retain the original welcome wave by default.
-      if (!calmMode) {
-        setTimeout(() => {
-          prevAnimRef.current  = 'idle';
-          animStateRef.current = 'waving';
-          oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 3.5 };
-        }, 800);
+        // Jaw bone — try VRM humanoid API first (most reliable), then raw traversal
+        const jawNode = hum?.getNormalizedBoneNode?.('jaw' as never) as THREE.Bone | null;
+        if (jawNode) {
+          jawBoneRef.current = jawNode;
+        } else {
+          vrm.scene.traverse((obj) => {
+            if (!jawBoneRef.current && obj instanceof THREE.Object3D &&
+                /jaw|chin|mandible|lowerjaw|J_Adj_.*Jaw|J_Bip.*Jaw/i.test(obj.name)) {
+              jawBoneRef.current = obj as THREE.Bone;
+            }
+          });
+        }
+
+        debugDataRef.current = {
+          ...debugDataRef.current,
+          expressionNames: allNames, availableMouth: foundMouth,
+          exprMgrFound: !!vrm.expressionManager, bonesFound, bonesMissing,
+        };
+        onLoad?.(vrmSrc);
+
+        // The V2 dashboard requests a calm, presentation-safe idle. Existing
+        // consumers retain the original welcome wave by default.
+        if (!calmMode) {
+          setTimeout(() => {
+            prevAnimRef.current  = 'idle';
+            animStateRef.current = 'waving';
+            oneShotRef.current   = { returnTo: 'idle', endT: performance.now() / 1000 + 3.5 };
+          }, 800);
+        }
+      } catch (err) {
+        console.error('[Avatar] setup error:', err);
+        if (!disposed) onError?.(vrmSrc);
       }
     },
     undefined,
-    (err) => console.error('[Avatar] load error:', err));
+    (err) => {
+      console.error('[Avatar] load error:', err);
+      if (!disposed) onError?.(vrmSrc);
+    });
 
     // Page-visibility pause
     const onVis = () => { pausedRef.current = document.hidden; };
@@ -926,6 +942,7 @@ function LordPiggingtonAvatar({
     tick();
 
     return () => {
+      disposed = true;
       cancelAnimationFrame(rafRef.current);
       document.removeEventListener('visibilitychange', onVis);
       if (vrmRef.current) {
@@ -935,7 +952,7 @@ function LordPiggingtonAvatar({
       renderer.dispose();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vrmSrc, calmMode]);
+  }, [vrmSrc, calmMode, onLoad, onError]);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
