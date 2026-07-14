@@ -1034,6 +1034,10 @@
     height: 390px;
   }
 
+  .dv2-avatar-stage > div {
+    transform: scale(0.69);
+  }
+
   .dv2-session-grid {
     grid-template-columns: 1fr;
   }

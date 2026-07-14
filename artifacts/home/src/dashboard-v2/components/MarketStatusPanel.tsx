@@ -40,6 +40,10 @@ export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
           <DataRow label="Supply" value={formatValue(data?.nearest_supply)} tone="bear" />
           <DataRow label="VWAP" value={formatValue(data?.vwap_value)} tone="info" />
           <DataRow label="Demand" value={formatValue(data?.nearest_demand)} tone="bull" />
+          <DataRow
+            label="Last valid"
+            value={data ? (data.last_valid_time ?? "Current snapshot") : "Unavailable"}
+          />
         </div>
       </div>
 
