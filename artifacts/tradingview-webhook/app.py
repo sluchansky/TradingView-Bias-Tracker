@@ -10950,7 +10950,8 @@ def _record_strategy_trade(mt):
             mt.get("journal_id"),
             opened_at,
             closed_at,
-            mt.get("symbol") or mt.get("instrument"),
+            (_instrument_from_text(mt.get("symbol") or mt.get("instrument"))
+             or mt.get("symbol") or mt.get("instrument")),
             ctx.get("strategy_key"),
             ctx.get("strategy") or "Unknown",
             ctx.get("regime") or "UNKNOWN",
@@ -11050,6 +11051,64 @@ def _maybe_recompute_learning():
                 conn.close()
             except Exception:
                 pass
+
+
+def _record_orphan_active_trade(at, inst, outcome_str, exit_price):
+    """Safety-net recorder: write an ACTIVE_TRADE close to strategy_trades when
+    NO managed trade is tracking this position (so the managed-trade watcher
+    would never cover it). Synthesises a minimal mt dict and calls
+    _record_strategy_trade. FAIL-OPEN — a failure here never blocks the caller.
+
+    Invariants:
+    - Only fires when no OPEN managed trade exists for `inst`. The managed
+      watcher is the authoritative path; this is strictly an orphan-close net.
+    - ON CONFLICT (managed_key) DO NOTHING inside _record_strategy_trade
+      prevents a double-record if a managed trade somehow closes in the same
+      window.
+    - Enriched fields (strategy, session, edge_score, etc.) are NULL because
+      the ACTIVE_TRADE dict does not carry learning_ctx. This is honest.
+    """
+    if not LEARNING_DB_ENABLED or not at:
+        return
+    has_managed = any(
+        not v.get("closed") and v.get("instrument") == inst
+        for v in MANAGED_TRADES_BY_KEY.values()
+    )
+    if has_managed:
+        return
+    try:
+        entry   = float(at.get("entry_price") or 0)
+        stop    = float(at.get("stop_loss") or 0)
+        risk    = abs(entry - stop)
+        is_long = (at.get("direction") or "Long") == "Long"
+        ep      = float(exit_price) if exit_price is not None else entry
+        pnl_pts = (ep - entry) if is_long else (entry - ep)
+        r_val   = round(pnl_pts / risk, 2) if risk > 0 else 0.0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        mt = {
+            "key":          (inst, at.get("direction") or "Long",
+                             round(entry, 0),
+                             datetime.now(timezone.utc).strftime("%Y-%m-%d")),
+            "registered_at": at.get("opened_at") or now_iso,
+            "closed_at":     now_iso,
+            "symbol":        at.get("symbol") or inst,
+            "instrument":    inst,
+            "direction":     at.get("direction") or "Long",
+            "entry":         entry,
+            "stop":          stop,
+            "tp1":           at.get("target1"),
+            "outcome":       outcome_str,
+            "r_multiple":    r_val,
+            "mfe_r":         0.0,
+            "mae_r":         0.0,
+            "exit_price":    ep,
+            "learning_ctx":  {},
+        }
+        _record_strategy_trade(mt)
+        logger.info("orphan active-trade recorded: %s %s %s (%.2fR)",
+                    inst, at.get("direction"), outcome_str, r_val)
+    except Exception as exc:
+        logger.warning("orphan active-trade record failed: %s", exc)
 
 
 def _check_learning_eligibility(instrument, mode=None):
@@ -28659,6 +28718,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             # OUTSIDE AUTO_TRADE_LOCK (SAFETY_LOCK must never nest under it).
             _set_outcome_cooldown(resolved_inst, cooldown_after_loss(resolved_inst), "loss")
             clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
+            _record_orphan_active_trade(_at, resolved_inst, "Loss", parsed_price)
         elif "T1_HIT" in events or "T2_HIT" in events:
             send_trade_event_message("T1_HIT", _at, parsed_price)
             d_pnl, _ = compute_pnl(_at, parsed_price)
@@ -28666,6 +28726,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             # Per-asset post-WIN cooldown (0s default => no-op for MGC/MNQ).
             _set_outcome_cooldown(resolved_inst, cooldown_after_win(resolved_inst), "win")
             clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
+            _record_orphan_active_trade(_at, resolved_inst, "Win", parsed_price)
 
     # ── Trading Journal + live alert ───────────────────────────────────────────
     # The main alert channel now receives the same clean trade-card as the
