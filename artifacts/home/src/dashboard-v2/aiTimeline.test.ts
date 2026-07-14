@@ -188,7 +188,7 @@ test("drops malformed stored timeline events", () => {
     getItem: (key) => values.get(key) ?? null,
     setItem: (key, value) => { values.set(key, value); },
   };
-  const key = "timeline";
+  const key = timelineStorageKey("MNQ", timelineSessionDate(NOW));
   values.set(key, JSON.stringify([
     valid,
     { ...valid, id: "wrong-scope", instrument: "MGC" },
