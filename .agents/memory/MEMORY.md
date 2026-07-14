@@ -144,3 +144,4 @@
 - [Verdict Board](verdict-board.md) — 4-bucket plain-English classifier (supports/opposes/missing/vetoes); reads observations+BCR+result; mb_out["verdict_board"]; never feeds money path.
 - [Main Brain architecture](main-brain-architecture.md) — 3-layer rule: orchestrate(_mb_orchestrate)+learning(_mb_learning_snapshot)+sole-speaker(compute_main_brain); never collapse layers.
 - [Operator Mode UI](operator-mode-ui.md) — conversational Brain interface at `/`; auth=localStorage Basic Auth; narration=main_brain_voice; chat=/assistant; Engineering=/api/dashboard.
+- [Swing Mode V2 engine](swing-mode-v2.md) — flag-gated (SWING_MODE_V2_ENABLED default-OFF) 9-category 0-100 HTF swing scorer + SCANNING→READY lifecycle + entry/stop/3-target plan; Tier-1=live HTF data, Tier-2=Pine EMA/RSI/MACD/ADX via SWING_EMA_UPDATE webhook; /swing-analysis route + /status whitelisted; goldens byte-identical.

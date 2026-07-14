@@ -268,6 +268,10 @@ VOLATILITY_BY_TICKER = {}     # {"MNQ": {"atr_pts","ratio","ts"}, "MGC": {...}} 
 #  "4H": {...same...}, "1D": {bias,atr,levels{...},confidence,bars,ts,source}}
 # Written ONLY when _swing_htf_enabled() (SWING + flag on); empty/ignored in SCALP.
 HTF_STATE_BY_INST   = {}
+# Swing Mode V2 per-instrument Pine EMA/RSI/MACD/ADX data.
+# Written by SWING_EMA_UPDATE webhook payloads; DISPLAY-ONLY.
+SWING_V2_STATE_BY_INST     = {}  # inst -> {ema20_d, ema50_d, ema200_d, rsi_d, macd_hist_d, adx_d, atr_d, ts}
+SWING_V2_LIFECYCLE_BY_INST = {}  # inst -> {status, score, grade, reason, ts, prev_status}
 # CVD (Cumulative Volume Delta) confirmation state, per instrument. Set by the
 # CVD_BULLISH / CVD_BEARISH webhook alerts; read by the strict gate as a HARD
 # confirmation filter (reject longs when bearish, shorts when bullish) that
@@ -546,6 +550,8 @@ MANUAL_ORDER_ENABLED = _env_flag_on("MANUAL_ORDER_ENABLED", default_on=False)
 # added to the Edge Score, the gate, strategy votes, risk rules or execution. Default
 # OFF => the block is never attached and full_analysis / main_brain stay byte-identical.
 LIQUIDITY_SWEEP_FOCUS_ENABLED = _env_flag_on("LIQUIDITY_SWEEP_FOCUS_ENABLED", default_on=False)
+SWING_MODE_V2_ENABLED   = _env_flag_on("SWING_MODE_V2_ENABLED",   default_on=False)
+SWING_AUTO_EXEC_ENABLED = _env_flag_on("SWING_AUTO_EXEC_ENABLED", default_on=False)
 # Only sweeps newer than this (minutes) count — a stale sweep alert must decay to
 # "NO SWEEP" rather than reading as CONFIRMED forever. DISPLAY-ONLY tuning knob.
 LIQ_SWEEP_RECENCY_MIN = _env_float("LIQ_SWEEP_RECENCY_MIN", 20.0)
@@ -20835,6 +20841,15 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["brain_state"] = _build_brain_state(result)
     except Exception:
         result["brain_state"] = {"available": False, "reason": "unavailable"}
+    # ── Swing Mode V2 (flag-gated, DISPLAY-ONLY) ──────────────────────────────
+    # Attaches full HTF swing scoring + lifecycle + entry plan when enabled.
+    # Fail-open; never raises; never touches gate/sizing/execution.
+    # Flag default-OFF → key never attached → goldens byte-identical.
+    if SWING_MODE_V2_ENABLED:
+        try:
+            result["swing_v2"] = compute_swing_v2_analysis(active_ticker, result)
+        except Exception as _sv2_e:
+            result["swing_v2"] = {"available": False, "reason": str(_sv2_e)}
     return result
 
 
@@ -33467,6 +33482,536 @@ def _forward_to_analysis_bot(raw_body, content_type):
         pass
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# SWING MODE V2 ENGINE — display-only HTF swing scoring + lifecycle system
+# ════════════════════════════════════════════════════════════════════════════
+# Master flags (both default-OFF → goldens byte-identical):
+#   SWING_MODE_V2_ENABLED=1   → activates scoring, lifecycle, dashboard panel
+#   SWING_AUTO_EXEC_ENABLED=1 → (reserved) future auto-execution gate
+#
+# All paths are DISPLAY-ONLY and FAIL-OPEN. Money path (strict gate, sizing,
+# execution) is completely untouched. Data sources:
+#   Tier 1 (live): HTF_STATE_BY_INST, gate_debug, CVD, RVOL, zone data, VWAP.
+#   Tier 2 (Pine): EMA20/50/200 D/4H/W, RSI-D, MACD-D, ADX-D via webhook.
+#     Scores 0 honestly for Tier 2 categories until Pine script connected.
+# ────────────────────────────────────────────────────────────────────────────
+
+def _swing_v2_regime(inst, d, state):
+    """Market regime from HTF bias + EMA + volatility data."""
+    htf     = HTF_STATE_BY_INST.get(inst, {})
+    d1_bias = str((htf.get("1D") or {}).get("bias", "")).lower()
+    h4_bias = str((htf.get("4H") or {}).get("bias", "")).lower()
+    daily_bull = state.get("daily_bullish")
+    daily_bear = state.get("daily_bearish")
+    vol_reg    = str(d.get("volatility") or d.get("vol_regime") or "").lower()
+    atr_ratio  = 1.0
+    try:
+        atr_ratio = float(d.get("atr_ratio") or 1.0)
+    except (TypeError, ValueError):
+        pass
+    bull = sum(1 for b in [d1_bias, h4_bias] if "bull" in b)
+    bear = sum(1 for b in [d1_bias, h4_bias] if "bear" in b)
+    if daily_bull is True:
+        bull += 2
+    elif daily_bear is True:
+        bear += 2
+    if "high" in vol_reg or atr_ratio > 2.5:
+        return "HIGH-VOLATILITY RISK-OFF"
+    if bull >= 4:
+        return "STRONG BULL TREND"
+    if bull >= 2:
+        return "BULL TREND"
+    if bear >= 4:
+        return "STRONG BEAR TREND"
+    if bear >= 2:
+        return "BEAR TREND"
+    if atr_ratio < 0.6:
+        return "LOW-VOLATILITY COMPRESSION"
+    if bull == 1 or bear == 1:
+        return "TRANSITION/UNCERTAIN"
+    return "NEUTRAL/RANGE"
+
+
+def _swing_v2_extension(inst, d, state):
+    """
+    Chase-protection: extension from Daily EMA20 (Pine) or VWAP proxy.
+    Returns {extensionInATR, label, blocked, proxy, at_htf_level, ref_price}.
+    """
+    try:
+        price   = float(d.get("current_price") or d.get("price") or 0)
+        atr_d   = float(state.get("atr_d") or d.get("atr") or 0)
+        ema20_d = float(state.get("ema20_d") or 0)
+        vwap    = float(d.get("vwap_value") or d.get("vwap") or 0)
+        ref   = ema20_d if ema20_d > 0 else vwap
+        proxy = "EMA20_D" if ema20_d > 0 else "VWAP_proxy"
+        if not (ref and price and atr_d):
+            return {"extensionInATR": None, "label": "unknown", "blocked": False,
+                    "proxy": proxy, "at_htf_level": False}
+        ext_atr = abs(price - ref) / atr_d
+        if ext_atr <= 0.75:
+            lbl = "healthy"
+        elif ext_atr <= 1.25:
+            lbl = "elevated"
+        elif ext_atr <= 1.75:
+            lbl = "extended"
+        else:
+            lbl = "do_not_chase"
+        return {"extensionInATR": round(ext_atr, 2), "label": lbl,
+                "blocked": lbl == "do_not_chase", "proxy": proxy,
+                "at_htf_level": ext_atr <= 0.5,
+                "ref_price": round(ref, 2)}
+    except Exception:
+        return {"extensionInATR": None, "label": "unknown", "blocked": False,
+                "proxy": "error", "at_htf_level": False}
+
+
+def _swing_v2_classify_setup(inst, d, state):
+    """Classify into one of 5 swing setup types (spec Section 3)."""
+    htf     = HTF_STATE_BY_INST.get(inst, {})
+    d1_bias = str((htf.get("1D") or {}).get("bias", "")).lower()
+    gd      = d.get("gate_debug") or {}
+    has_bos   = bool(gd.get("bos"))
+    has_choch = bool(gd.get("choch"))
+    has_zone  = bool(d.get("nearest_demand") or d.get("nearest_supply"))
+    vol_reg   = str(d.get("volatility") or "").lower()
+    ext = _swing_v2_extension(inst, d, state)
+    if has_choch and ext.get("at_htf_level"):
+        return "HTF_REVERSAL"
+    if ("low" in vol_reg or "quiet" in vol_reg or "compress" in vol_reg) and has_bos:
+        return "COMPRESSION_BREAKOUT"
+    if has_bos and not has_zone:
+        return "BREAKOUT_RETEST"
+    if has_zone and ("bull" in d1_bias or "bear" in d1_bias):
+        return "TREND_PULLBACK"
+    if has_bos:
+        return "RANGE_EXPANSION"
+    return "TREND_PULLBACK"
+
+
+def _swing_v2_score(inst, d, state):
+    """
+    9-category 0-100 swing score (spec Sections 4-7). Scores 0 for missing
+    data honestly — never fabricates certainty.
+    Returns {total, max:100, grade, breakdown:{category:{pts,max,note}}}.
+    """
+    htf  = HTF_STATE_BY_INST.get(inst, {})
+    gd   = d.get("gate_debug") or {}
+    diag = d.get("alert_diagnostics") or {}
+    price = vwap = 0.0
+    try:
+        price = float(d.get("current_price") or d.get("price") or 0)
+        vwap  = float(d.get("vwap_value") or d.get("vwap") or 0)
+    except (TypeError, ValueError):
+        pass
+    d1_bias = str((htf.get("1D") or {}).get("bias", "")).lower()
+    h4_bias = str((htf.get("4H") or {}).get("bias", "")).lower()
+    h1_bias = str((htf.get("1H") or {}).get("bias", "")).lower()
+    bias_dir = "bull" if "bull" in d1_bias else ("bear" if "bear" in d1_bias else "")
+    bd = {}
+
+    # 1. HTF Trend (20 pts)
+    htf_pts = 0
+    if bias_dir:
+        htf_pts += 4
+        if state.get("daily_bullish") is True and bias_dir == "bull":
+            htf_pts += 4
+        elif state.get("daily_bearish") is True and bias_dir == "bear":
+            htf_pts += 4
+    if bias_dir and h4_bias and bias_dir in h4_bias:
+        htf_pts += 6
+    if bias_dir and h1_bias and bias_dir in h1_bias:
+        htf_pts += 4
+    ema20_d = ema50_d = ema200_d = 0.0
+    try:
+        ema20_d  = float(state.get("ema20_d")  or 0)
+        ema50_d  = float(state.get("ema50_d")  or 0)
+        ema200_d = float(state.get("ema200_d") or 0)
+    except (TypeError, ValueError):
+        pass
+    if ema20_d and ema50_d and ema200_d:
+        if (ema20_d > ema50_d > ema200_d) or (ema20_d < ema50_d < ema200_d):
+            htf_pts += 2
+    bd["htf_trend"] = {"pts": min(htf_pts, 20), "max": 20,
+                       "note": "1H/4H/D bias + EMA stack"}
+
+    # 2. Market Structure (15 pts)
+    s_pts = 0
+    if gd.get("bos"):      s_pts += 6
+    if gd.get("choch"):    s_pts += 5
+    if gd.get("structure"): s_pts += 4
+    bd["market_structure"] = {"pts": min(s_pts, 15), "max": 15,
+                               "note": "BOS/CHOCH/structure"}
+
+    # 3. Entry Location (15 pts)
+    loc_pts = 0
+    if d.get("nearest_demand") or d.get("nearest_supply"):
+        loc_pts += 7
+    if price and vwap:
+        if (bias_dir == "bull" and price > vwap) or (bias_dir == "bear" and price < vwap):
+            loc_pts += 4
+        else:
+            loc_pts += 1
+    ext = _swing_v2_extension(inst, d, state)
+    ext_lbl = ext.get("label", "unknown")
+    if ext_lbl == "healthy":
+        loc_pts += 4
+    elif ext_lbl == "elevated":
+        loc_pts += 2
+    bd["entry_location"] = {"pts": min(loc_pts, 15), "max": 15,
+                             "note": "zone+VWAP+ext %.1fATR" % (ext.get("extensionInATR") or 0)}
+
+    # 4. Momentum & Trend Strength (10 pts)
+    mom_pts = 0
+    rsi_d = macd_hist_d = adx_d = 0.0
+    try:
+        rsi_d       = float(state.get("rsi_d")       or 0)
+        macd_hist_d = float(state.get("macd_hist_d") or 0)
+        adx_d       = float(state.get("adx_d")       or 0)
+    except (TypeError, ValueError):
+        pass
+    cvd_dir = str(diag.get("cvd_direction") or "").lower()
+    if rsi_d:
+        if bias_dir == "bull" and 40 <= rsi_d <= 72:
+            mom_pts += 3
+        elif bias_dir == "bear" and 28 <= rsi_d <= 60:
+            mom_pts += 3
+        else:
+            mom_pts += 1
+    if macd_hist_d:
+        if (bias_dir == "bull" and macd_hist_d > 0) or (bias_dir == "bear" and macd_hist_d < 0):
+            mom_pts += 3
+    if adx_d >= 20:
+        mom_pts += 2
+    elif adx_d > 0:
+        mom_pts += 1
+    if cvd_dir and bias_dir and bias_dir in cvd_dir:
+        mom_pts += 2
+    bd["momentum"] = {"pts": min(mom_pts, 10), "max": 10,
+                      "note": "RSI-D/MACD-D/ADX/CVD (Pine %s)" % ("ON" if rsi_d else "OFF")}
+
+    # 5. Volume & Participation (10 pts)
+    vol_pts = 0
+    rvol = 0.0
+    try:
+        rvol = float((d.get("rvol") or (RVOL_BY_TICKER.get(inst) or {}).get("value")) or 0)
+    except (TypeError, ValueError):
+        pass
+    has_vol_spike = bool(VOLUME_SPIKE_BY_TICKER.get(inst))
+    if rvol >= 1.5:
+        vol_pts += 5
+    elif rvol >= 1.0:
+        vol_pts += 3
+    if has_vol_spike:
+        vol_pts += 3
+    if cvd_dir in ("bullish", "bearish"):
+        vol_pts += 2
+    bd["volume"] = {"pts": min(vol_pts, 10), "max": 10,
+                    "note": "RVOL %.1f spike=%s" % (rvol, has_vol_spike)}
+
+    # 6. Relative Strength & Correlation (10 pts)
+    corr_pts = 5  # neutral default when no cross-market data
+    cross = d.get("cross_market") or {}
+    if cross:
+        alignment = str(cross.get("alignment") or cross.get("status") or "").lower()
+        if "aligned" in alignment:
+            corr_pts = 10
+        elif "conflict" in alignment or "diverge" in alignment:
+            corr_pts = 0
+        elif "partial" in alignment:
+            corr_pts = 5
+    bd["correlation"] = {"pts": min(corr_pts, 10), "max": 10,
+                         "note": "cross-market index alignment"}
+
+    # 7. Risk & Reward Quality (10 pts)
+    rr_pts = 0
+    rr_num = 0.0
+    try:
+        rr_num = float((d.get("trade_plan") or {}).get("rr_num") or d.get("rr_num") or 0)
+    except (TypeError, ValueError):
+        pass
+    if rr_num >= 4.0:
+        rr_pts = 10
+    elif rr_num >= 3.0:
+        rr_pts = 7
+    elif rr_num >= 2.0:
+        rr_pts = 4
+    bd["risk_reward"] = {"pts": rr_pts, "max": 10,
+                         "note": "R:R %.1f" % rr_num}
+
+    # 8. Volatility Quality (5 pts)
+    vq_pts = 0
+    vol_reg = str(d.get("volatility") or d.get("vol_regime") or "").lower()
+    if "normal" in vol_reg or not vol_reg:
+        vq_pts = 5
+    elif "low" in vol_reg or "quiet" in vol_reg:
+        vq_pts = 3
+    elif "elevated" in vol_reg or "caution" in vol_reg:
+        vq_pts = 3
+    elif "high" in vol_reg or "block" in vol_reg:
+        vq_pts = 1
+    bd["volatility_quality"] = {"pts": min(vq_pts, 5), "max": 5,
+                                 "note": vol_reg or "normal"}
+
+    # 9. Catalyst & Event Risk (5 pts)
+    event_pts = 5
+    news = d.get("news_events") or []
+    if isinstance(news, list):
+        for _ev in news:
+            _imp = str(_ev.get("impact") or _ev.get("type") or "").lower()
+            if "high" in _imp or "red" in _imp:
+                event_pts = max(0, event_pts - 3)
+                break
+            elif "med" in _imp or "orange" in _imp:
+                event_pts = max(2, event_pts - 1)
+    import datetime as _sv2dt
+    if _sv2dt.datetime.now().weekday() == 4:  # Friday
+        event_pts = max(1, event_pts - 2)
+    bd["event_risk"] = {"pts": event_pts, "max": 5, "note": "news + day-of-week"}
+
+    total = min(sum(v["pts"] for v in bd.values()), 100)
+    if total >= 85:
+        grade = "HIGH CONVICTION"
+    elif total >= 75:
+        grade = "READY"
+    elif total >= 65:
+        grade = "WATCHING"
+    elif total >= 50:
+        grade = "WEAK"
+    else:
+        grade = "NO TRADE"
+    return {"total": total, "max": 100, "grade": grade, "breakdown": bd}
+
+
+def _swing_v2_hard_blocks(inst, d, state, score_data):
+    """Hard-block conditions (spec Section 6). Returns list of active blocks."""
+    blocks = []
+    rr_num = 0.0
+    try:
+        rr_num = float((d.get("trade_plan") or {}).get("rr_num") or d.get("rr_num") or 0)
+    except (TypeError, ValueError):
+        pass
+    if rr_num and rr_num < 2.0:
+        blocks.append("R:R %.1fR below 2.0 minimum" % rr_num)
+    gd = d.get("gate_debug") or {}
+    if not gd.get("bos") and not gd.get("choch"):
+        blocks.append("No BOS/CHOCH — no clear structural invalidation level")
+    ext = _swing_v2_extension(inst, d, state)
+    if ext.get("blocked"):
+        blocks.append("Price excessively extended (%.1f ATR — do not chase)"
+                      % (ext.get("extensionInATR") or 0))
+    htf    = HTF_STATE_BY_INST.get(inst, {})
+    d1_ts  = (htf.get("1D") or {}).get("ts")
+    if d1_ts:
+        try:
+            age_min = (now_utc() - _parse_ts(d1_ts)).total_seconds() / 60.0
+            if age_min > 2160:
+                blocks.append("Daily HTF data stale (%dh)" % int(age_min / 60))
+        except Exception:
+            pass
+    return blocks
+
+
+def _swing_v2_lifecycle(inst, score_data, blocks, d, state):
+    """Lifecycle state machine. Mutates SWING_V2_LIFECYCLE_BY_INST (DISPLAY-ONLY)."""
+    total    = score_data.get("total", 0)
+    grade    = score_data.get("grade", "NO TRADE")
+    gd       = d.get("gate_debug") or {}
+    confirms = sum([bool(gd.get("bos")), bool(gd.get("choch")),
+                    bool(d.get("nearest_demand") or d.get("nearest_supply")),
+                    bool(gd.get("structure"))])
+    if blocks:
+        status = "NO TRADE"
+        reason = blocks[0]
+    elif grade == "NO TRADE":
+        status = "SCANNING"
+        reason = "Score %d — below threshold" % total
+    elif grade == "WEAK":
+        status = "WATCHING"
+        reason = "Score %d — building setup" % total
+    elif grade == "WATCHING":
+        status = "SETUP FORMING" if confirms >= 1 else "WATCHING"
+        reason = "Score %d — %d confirmation(s)" % (total, confirms)
+    else:
+        status = "READY" if confirms >= 2 else "SETUP FORMING"
+        reason = "Score %d — %d confirmations" % (total, confirms)
+    prev  = SWING_V2_LIFECYCLE_BY_INST.get(inst, {})
+    entry = {"status": status, "prev_status": prev.get("status", ""),
+             "changed": status != prev.get("status", ""), "reason": reason,
+             "score": total, "grade": grade, "ts": now_utc().isoformat()}
+    SWING_V2_LIFECYCLE_BY_INST[inst] = entry
+    return entry
+
+
+def _swing_v2_entry_plan(inst, d, state, score_data):
+    """Entry zone, structural stop, 3-target plan (spec Sections 9-11)."""
+    price = atr_d = 0.0
+    try:
+        price = float(d.get("current_price") or d.get("price") or 0)
+        atr_d = float(state.get("atr_d") or d.get("atr") or 0)
+    except (TypeError, ValueError):
+        pass
+    htf     = HTF_STATE_BY_INST.get(inst, {})
+    d1_bias = str((htf.get("1D") or {}).get("bias", "")).lower()
+    direction = "LONG" if "bull" in d1_bias else ("SHORT" if "bear" in d1_bias else "NEUTRAL")
+    tp_d = d.get("trade_plan") or {}
+    stop = 0.0
+    try:
+        stop = float(tp_d.get("stop") or tp_d.get("stop_price") or 0)
+    except (TypeError, ValueError):
+        pass
+    stop_reason = "Structural level"
+    if not stop and atr_d and price:
+        mult = 2.25
+        stop = (price - mult * atr_d) if direction == "LONG" else (price + mult * atr_d)
+        stop_reason = "ATR stop (%.1f x %.2f ATR-D)" % (mult, atr_d)
+    stop_dist = abs(price - stop) if price and stop else 0.0
+    stop_atr  = round(stop_dist / atr_d, 2) if atr_d and stop_dist else None
+    zone_buf  = (atr_d * 0.25) if atr_d else (price * 0.001 if price else 1.0)
+    no_chase_above = round(price + atr_d * 0.75, 2) if atr_d and price else None
+    no_chase_below = round(price - atr_d * 0.75, 2) if atr_d and price else None
+    t1 = float(tp_d.get("target1") or tp_d.get("target") or 0)
+    t2 = float(tp_d.get("target2") or 0)
+    t3 = float(tp_d.get("target3") or 0)
+    if not t1 and stop_dist and price:
+        if direction == "LONG":
+            t1 = round(price + stop_dist * 2.0, 2)
+            t2 = round(price + stop_dist * 3.0, 2)
+            t3 = round(price + stop_dist * 5.0, 2)
+        else:
+            t1 = round(price - stop_dist * 2.0, 2)
+            t2 = round(price - stop_dist * 3.0, 2)
+            t3 = round(price - stop_dist * 5.0, 2)
+    rr1 = round(abs(t1 - price) / stop_dist, 1) if t1 and stop_dist else None
+    rr2 = round(abs(t2 - price) / stop_dist, 1) if t2 and stop_dist else None
+    rr3 = round(abs(t3 - price) / stop_dist, 1) if t3 and stop_dist else None
+    return {
+        "direction": direction,
+        "entryZoneLow":    round(price - zone_buf, 2) if price else None,
+        "entryZoneHigh":   round(price + zone_buf, 2) if price else None,
+        "preferredEntry":  round(price, 2) if price else None,
+        "doNotChaseAbove": no_chase_above if direction == "LONG"  else None,
+        "doNotChaseBelow": no_chase_below if direction == "SHORT" else None,
+        "entryMethod": "Limit at pullback zone",
+        "entryExpiration": "3-5 trading sessions",
+        "structuralStop":  round(stop, 2) if stop else None,
+        "stopReason":      stop_reason,
+        "stopDistance":    round(stop_dist, 2) if stop_dist else None,
+        "stopDistanceATR": stop_atr,
+        "target1": round(t1, 2) if t1 else None, "target1Reason": "Prior 4H structure / 2R",
+        "target2": round(t2, 2) if t2 else None, "target2Reason": "Supply/demand zone / 3R",
+        "target3": round(t3, 2) if t3 else None, "target3Reason": "Weekly level / runner",
+        "rewardRiskTarget1": rr1, "rewardRiskTarget2": rr2, "rewardRiskTarget3": rr3,
+    }
+
+
+def _swing_v2_overnight_risk(d, state):
+    """Overnight / weekend hold risk (spec Section 18)."""
+    import datetime as _ov_dt
+    dow  = _ov_dt.datetime.now().weekday()
+    hour = _ov_dt.datetime.now().hour
+    vol_reg  = str(d.get("volatility") or "").lower()
+    high_vol = ("high" in vol_reg or "block" in vol_reg)
+    pre_wknd = (dow == 4 and hour >= 12)
+    hold_on  = not high_vol
+    if dow >= 5:
+        action = "CLOSE BEFORE WEEKEND"
+    elif pre_wknd:
+        action = "HOLD REDUCED" if not high_vol else "CLOSE BEFORE WEEKEND"
+    else:
+        action = "HOLD FULL"
+    return {
+        "overnightRisk":          "HIGH" if high_vol else "LOW",
+        "weekendRisk":            "HIGH" if high_vol else "MODERATE",
+        "holdOvernightAllowed":   hold_on,
+        "holdOverWeekendAllowed": hold_on and not pre_wknd and dow < 5,
+        "weekendRecommendation":  action,
+        "eventRiskLevel":         "HIGH" if high_vol else "LOW",
+    }
+
+
+def compute_swing_v2_analysis(inst, d):
+    """
+    Master Swing V2 orchestrator. DISPLAY-ONLY, FAIL-OPEN.
+    Called in full_analysis when SWING_MODE_V2_ENABLED is True.
+    Never touches gate / sizing / execution.
+    """
+    if not SWING_MODE_V2_ENABLED:
+        return {"available": False, "reason": "flag_off"}
+    try:
+        state  = dict(SWING_V2_STATE_BY_INST.get(inst, {}))
+        score  = _swing_v2_score(inst, d, state)
+        blocks = _swing_v2_hard_blocks(inst, d, state, score)
+        lc     = _swing_v2_lifecycle(inst, score, blocks, d, state)
+        setup  = _swing_v2_classify_setup(inst, d, state)
+        regime = _swing_v2_regime(inst, d, state)
+        ext    = _swing_v2_extension(inst, d, state)
+        plan   = _swing_v2_entry_plan(inst, d, state, score)
+        risk   = _swing_v2_overnight_risk(d, state)
+        htf    = HTF_STATE_BY_INST.get(inst, {})
+        d1_b   = str((htf.get("1D") or {}).get("bias", "")).lower()
+        h4_b   = str((htf.get("4H") or {}).get("bias", "")).lower()
+        h1_b   = str((htf.get("1H") or {}).get("bias", "")).lower()
+        br     = score["breakdown"]
+        supporting  = []
+        conflicting = []
+        if br["htf_trend"]["pts"] >= 14:
+            supporting.append("Weekly and Daily HTF trends aligned")
+        if br["market_structure"]["pts"] >= 10:
+            supporting.append("Strong BOS/CHOCH structure confirmed")
+        if br["entry_location"]["pts"] >= 10:
+            supporting.append("Price near key demand/supply zone")
+        if ext.get("label") == "healthy":
+            supporting.append("Price not extended from reference level")
+        if br["momentum"]["pts"] >= 6:
+            supporting.append("Momentum aligned with direction")
+        if br["volume"]["pts"] >= 6:
+            supporting.append("Volume participation confirmed")
+        if ext.get("label") in ("elevated", "extended"):
+            conflicting.append("Price %.1f ATR from key level" % (ext.get("extensionInATR") or 0))
+        if br["momentum"]["pts"] < 3:
+            conflicting.append("RSI/MACD/ADX unavailable — connect Pine script")
+        if blocks:
+            conflicting.extend(blocks[:2])
+        gd = d.get("gate_debug") or {}
+        next_conf = []
+        if not gd.get("bos"):
+            next_conf.append("4H BOS in the trade direction")
+        if not (d.get("nearest_demand") or d.get("nearest_supply")):
+            next_conf.append("Price at key demand/supply zone")
+        if not state.get("rsi_d"):
+            next_conf.append("Connect Pine EMA/Momentum script for full scoring")
+        if not next_conf:
+            next_conf.append("Confirm entry on 1H close")
+        daily_trend = (
+            "Bullish" if state.get("daily_bullish") else
+            "Bearish" if state.get("daily_bearish") else
+            "Bullish" if "bull" in d1_b else
+            "Bearish" if "bear" in d1_b else "Neutral"
+        )
+        return {
+            "available": True, "inst": inst, "ts": now_utc().isoformat(),
+            "setupType": setup, "direction": plan["direction"],
+            "lifecycle": lc, "score": score, "hardBlocks": blocks,
+            "regime": regime, "extension": ext,
+            "weeklyTrend": daily_trend, "dailyTrend": daily_trend,
+            "h4Structure": h4_b.capitalize() if h4_b else "Unknown",
+            "htfSummary":  {"1h": h1_b, "4h": h4_b, "1d": d1_b},
+            "entryPlan": plan, "overnightRisk": risk,
+            "supportingFactors": supporting, "conflictingFactors": conflicting,
+            "nextConfirmation": next_conf,
+            "expectedHoldMin": 2, "expectedHoldMax": 7,
+            "dataFreshness": {
+                "ema_data":      bool(state.get("ema20_d")),
+                "rsi_data":      bool(state.get("rsi_d")),
+                "macd_data":     bool(state.get("macd_hist_d")),
+                "htf_data":      bool(htf),
+                "pine_connected": bool(state.get("ts")),
+            },
+        }
+    except Exception as _sv2e:
+        return {"available": False, "reason": str(_sv2e)}
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global CURRENT_PRICE, ZONE_BROKEN_AT, LAST_WEBHOOK_AT, LAST_ALERT_AT
@@ -33548,6 +34093,26 @@ def webhook():
     # engine is live; with the flag OFF they are unknown to the system exactly as
     # before this engine shipped, so a direct (non-`event`) bare-sweep payload stays
     # "unrecognized" — keeping the dormant flag-OFF contract byte-identical.
+    # ── Swing V2 EMA/Momentum data ingestion (DISPLAY-ONLY) ──────────────────
+    # SWING_EMA_UPDATE payloads store Pine-sourced EMA/RSI/MACD/ADX data for the
+    # swing v2 scoring engine. They bypass the ALERT_TYPES check and return early.
+    # Flag-off → ack only (no state written). Never touches the money path.
+    if normalized == "SWING_EMA_UPDATE":
+        _sw_inst = (_instrument_from_text(data.get("ticker"))
+                    or _instrument_from_text(data.get("instrument")))
+        if _sw_inst and SWING_MODE_V2_ENABLED:
+            _sw_prev = dict(SWING_V2_STATE_BY_INST.get(_sw_inst, {}))
+            for _sk in ("ema20_d","ema50_d","ema200_d","ema20_4h","ema50_4h",
+                        "ema20_w","ema50_w","atr_d","rsi_d","macd_hist_d",
+                        "adx_d","daily_bullish","daily_bearish"):
+                if _sk in data:
+                    _sw_prev[_sk] = data[_sk]
+            _sw_prev["ts"] = now_utc().isoformat()
+            SWING_V2_STATE_BY_INST[_sw_inst] = _sw_prev
+            logger.info("SWING_V2 EMA state updated: %s", _sw_inst)
+        return jsonify({"status": "ok", "type": "swing_ema_update",
+                        "inst": _sw_inst, "flag": SWING_MODE_V2_ENABLED}), 200
+
     _dormant_sweep = (normalized in DUAL_TF_SWEEP_TYPES
                       and not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"))
     if normalized not in ALERT_TYPES or _dormant_sweep:
@@ -34962,6 +35527,7 @@ def _build_status_payload(_tk):
         "strategy_engine":     a.get("strategy_engine"),
         "market_intelligence": a.get("market_intelligence"),
         "breakout_mode":       a.get("breakout_mode"),
+        "swing_v2":            a.get("swing_v2"),
         "equity_curve_today":  a.get("equity_curve_today"),
         "news_filter":         a.get("news_filter"),
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
@@ -39865,6 +40431,24 @@ def dashboard():
   .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
   .blh-pill.fail{border-color:rgba(239,68,68,.4);color:#fca5a5;background:rgba(239,68,68,.07)}
   .blh-pill.warn{border-color:rgba(234,179,8,.35);color:#fde68a;background:rgba(234,179,8,.06)}
+  #mod-swing-v2{padding:14px 16px 12px}
+  .sv2-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(125,140,255,.05);font-size:11.5px}
+  .sv2-lbl{color:#6b7280;font-size:10px;text-transform:uppercase;letter-spacing:.5px;flex-shrink:0}
+  .sv2-row>span:last-child{color:#c8d0f0;font-weight:600;text-align:right;padding-left:8px}
+  .sv2-sec{font-size:9px;letter-spacing:1.2px;color:#374151;text-transform:uppercase;margin:8px 0 4px;font-weight:700}
+  .sv2-div{height:1px;background:rgba(125,140,255,.08);margin:8px 0}
+  #sv2-score-wrap{text-align:center;padding:10px 0 8px}
+  #sv2-score-val{font-size:42px;font-weight:900;font-family:var(--sans);color:#374151;line-height:1}
+  #sv2-score-lbl{font-size:10px;letter-spacing:1px;color:#4b5563;margin-bottom:6px;text-transform:uppercase}
+  #sv2-bar-wrap{height:4px;background:rgba(255,255,255,.06);border-radius:2px;margin:6px 0 0}
+  #sv2-bar{height:100%;border-radius:2px;transition:width .4s,background .4s;width:0%}
+  #sv2-lifecycle-badge{font-size:8px;margin-left:6px;padding:2px 7px;vertical-align:middle}
+  .sv2-bd-row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:10.5px}
+  .sv2-bd-lbl{color:#6b7280;font-size:9.5px}
+  .sv2-bd-bw{flex:1;margin:0 8px;height:3px;background:rgba(255,255,255,.05);border-radius:2px}
+  .sv2-bd-b{height:100%;border-radius:2px;transition:width .3s}
+  .sv2-bd-pts{color:#c8d0f0;font-size:9.5px;font-weight:700;min-width:28px;text-align:right}
+  .sv2-rr{font-size:9px;color:#6b7280;margin-left:4px}
   #blh-waveform{display:flex;align-items:center;justify-content:center;gap:3px;height:30px;margin:6px 0 2px}
   .blh-wave-bar{width:3px;border-radius:2px;background:var(--cyan);animation:blhWave 1.4s ease-in-out infinite}
   .blh-wave-bar:nth-child(2){animation-delay:.1s}.blh-wave-bar:nth-child(3){animation-delay:.2s}.blh-wave-bar:nth-child(4){animation-delay:.3s}.blh-wave-bar:nth-child(5){animation-delay:.4s}.blh-wave-bar:nth-child(6){animation-delay:.5s}.blh-wave-bar:nth-child(7){animation-delay:.6s}
@@ -41595,6 +42179,41 @@ def dashboard():
   <div class="se-fid" id="bo-fid"></div>
 </div>
 
+<!-- Swing Mode V2 — HTF swing scoring + lifecycle (DISPLAY-ONLY; flag-gated) -->
+<div class="mod" id="mod-swing-v2" style="display:none">
+  <div class="mod-h">&#x1F4CA; Swing V2 <span id="sv2-lifecycle-badge" class="blh-pill">SCANNING</span></div>
+  <div id="sv2-score-wrap">
+    <div id="sv2-score-val">&#x2014;</div>
+    <div id="sv2-score-lbl">/100 &#x2014; SCANNING</div>
+    <div id="sv2-bar-wrap"><div id="sv2-bar"></div></div>
+  </div>
+  <div class="sv2-div"></div>
+  <div class="sv2-row"><span class="sv2-lbl">Setup Type</span><span id="sv2-setup">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">Regime</span><span id="sv2-regime">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">Direction</span><span id="sv2-dir">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">Daily Trend</span><span id="sv2-daily">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">4H Structure</span><span id="sv2-4h">&#x2014;</span></div>
+  <div class="sv2-div"></div>
+  <div class="sv2-sec">Entry Plan</div>
+  <div class="sv2-row"><span class="sv2-lbl">Entry Zone</span><span id="sv2-zone">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">Don&#39;t Chase</span><span id="sv2-nochase">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">Stop</span><span id="sv2-stop">&#x2014;</span></div>
+  <div class="sv2-div"></div>
+  <div class="sv2-sec">Targets</div>
+  <div class="sv2-row"><span class="sv2-lbl">TP1</span><span id="sv2-t1">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">TP2</span><span id="sv2-t2">&#x2014;</span></div>
+  <div class="sv2-row"><span class="sv2-lbl">Runner</span><span id="sv2-t3">&#x2014;</span></div>
+  <div class="sv2-div"></div>
+  <div class="sv2-sec">Score Breakdown</div>
+  <div id="sv2-breakdown"></div>
+  <div class="sv2-div"></div>
+  <div class="sv2-sec">Hard Blocks</div>
+  <div id="sv2-blocks" style="font-size:11px;color:#6b7280;line-height:1.5">&#x2014;</div>
+  <div class="sv2-sec" style="margin-top:6px">Next Confirmation Needed</div>
+  <div id="sv2-nextconf" style="font-size:11px;color:#a8b4d0;line-height:1.5">&#x2014;</div>
+  <div id="sv2-pine-warn" style="display:none;font-size:10px;color:#f59e0b;margin-top:8px;padding:6px 8px;border:1px solid rgba(245,158,11,.3);border-radius:6px">Pine EMA script not yet connected &#x2014; RSI/MACD/ADX scoring unavailable. Connect the Pine script below to unlock full scoring.</div>
+</div>
+
 <!-- Learning Rule Engine — REAL evidence-based ghost/live eligibility per instrument -->
 <div class="mod" id="mod-rule-engine">
   <div class="mod-h">⚡ Learning Rule Engine <span id="lre-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
@@ -43257,6 +43876,9 @@ function renderModules(d){
 
   // ── Module 7b: 9:30 ET Breakout Mode (DISPLAY-ONLY advisory) ──
   renderBreakoutMode(d);
+
+  // ── Module 7d: Swing Mode V2 scoring + lifecycle (DISPLAY-ONLY; flag-gated) ──
+  renderSwingV2(d);
 
   // ── Module 7c: Market Intelligence (state + Long/Short confidence + trend memory) ──
   renderMarketIntelligence(d);
@@ -47258,6 +47880,60 @@ function renderStrategyEngine(d){
   }
 }
 
+// ── Swing Mode V2 panel — fed by d.swing_v2 (compute_swing_v2_analysis).
+// DISPLAY-ONLY; panel hidden when flag is OFF (key absent from result).
+function renderSwingV2(d){
+  var el=document.getElementById('mod-swing-v2');
+  if(!el)return;
+  var sv2=d.swing_v2||{};
+  var ok=sv2.available===true;
+  el.style.display=ok?'':'none';
+  if(!ok)return;
+  var lc=sv2.lifecycle||{};
+  var sc=sv2.score||{};
+  var ep=sv2.entryPlan||{};
+  var st=lc.status||'SCANNING';
+  var tot=sc.total||0;
+  var grade=sc.grade||'NO TRADE';
+  var col=tot>=75?'#22c55e':tot>=65?'#eab308':tot>=50?'#f97316':'#ef4444';
+  var badge=document.getElementById('sv2-lifecycle-badge');
+  var sv2Val=document.getElementById('sv2-score-val');
+  var sv2Lbl=document.getElementById('sv2-score-lbl');
+  var sv2Bar=document.getElementById('sv2-bar');
+  if(badge){badge.textContent=st;badge.className='blh-pill '+(st==='READY'?'ok':st==='NO TRADE'?'fail':st==='SETUP FORMING'?'warn':'');}
+  if(sv2Val){sv2Val.textContent=tot;sv2Val.style.color=col;}
+  if(sv2Lbl){sv2Lbl.textContent='/100 \u2014 '+grade;}
+  if(sv2Bar){sv2Bar.style.width=Math.min(tot,100)+'%';sv2Bar.style.background=col;}
+  function sv2Set(id,v){var e=document.getElementById(id);if(e&&v!=null)e.textContent=String(v);}
+  sv2Set('sv2-setup',(sv2.setupType||'').replace(/_/g,' '));
+  sv2Set('sv2-regime',sv2.regime);
+  sv2Set('sv2-dir',ep.direction);
+  sv2Set('sv2-daily',sv2.dailyTrend);
+  sv2Set('sv2-4h',sv2.h4Structure);
+  var zlo=ep.entryZoneLow,zhi=ep.entryZoneHigh;
+  sv2Set('sv2-zone',zlo&&zhi?zlo+' \u2013 '+zhi:'\u2014');
+  var noc=ep.direction==='LONG'?ep.doNotChaseAbove:ep.doNotChaseBelow;
+  sv2Set('sv2-nochase',noc?String(noc):'\u2014');
+  var stpTxt=ep.structuralStop?String(ep.structuralStop)+(ep.stopDistanceATR?' ('+ep.stopDistanceATR+'R stop)':''):'\u2014';
+  sv2Set('sv2-stop',stpTxt);
+  function sv2Tgt(id,price,rr){var e=document.getElementById(id);if(!e)return;e.innerHTML=price?(String(price)+(rr?'<span class="sv2-rr">('+rr+'R)</span>':'')):'\u2014';}
+  sv2Tgt('sv2-t1',ep.target1,ep.rewardRiskTarget1);
+  sv2Tgt('sv2-t2',ep.target2,ep.rewardRiskTarget2);
+  sv2Tgt('sv2-t3',ep.target3,ep.rewardRiskTarget3);
+  var bkEl=document.getElementById('sv2-breakdown');
+  if(bkEl&&sc.breakdown){
+    var bk=sc.breakdown;
+    var keys=[['htf_trend','HTF Trend',20],['market_structure','Structure',15],['entry_location','Location',15],['momentum','Momentum',10],['volume','Volume',10],['correlation','Correlation',10],['risk_reward','R:R',10],['volatility_quality','Volatility',5],['event_risk','Events',5]];
+    bkEl.innerHTML=keys.map(function(k){var v=bk[k[0]]||{};var p=v.pts||0;var m=k[2];var c=p>=m*.7?'#22c55e':p>=m*.4?'#eab308':'#ef4444';return '<div class="sv2-bd-row"><span class="sv2-bd-lbl">'+k[1]+'</span><div class="sv2-bd-bw"><div class="sv2-bd-b" style="width:'+Math.round(p/m*100)+'%;background:'+c+'"></div></div><span class="sv2-bd-pts">'+p+'/'+m+'</span></div>';}).join('');
+  }
+  var blkEl=document.getElementById('sv2-blocks');
+  if(blkEl){var blks=sv2.hardBlocks||[];blkEl.textContent=blks.length?blks.join(' | '):'None';blkEl.style.color=blks.length?'#ef4444':'#22c55e';}
+  var ncEl=document.getElementById('sv2-nextconf');
+  if(ncEl){ncEl.textContent=(sv2.nextConfirmation||[]).join(' | ');}
+  var pw=document.getElementById('sv2-pine-warn');
+  if(pw){var df=sv2.dataFreshness||{};pw.style.display=df.pine_connected?'none':'';}
+}
+
 // 9:30 ET Breakout Mode panel — fed by d.breakout_mode (compute_breakout_mode).
 // DISPLAY-ONLY; the whole panel is hidden when the block is absent (flag OFF).
 function renderBreakoutMode(d){
@@ -50856,6 +51532,18 @@ def safety_settings():
     if persisted is not None:
         resp["persisted"] = persisted
     return jsonify(resp), 200
+
+
+@app.route("/swing-analysis", methods=["GET"])
+def swing_analysis_v2():
+    """Swing Mode V2 full analysis for a specific instrument (DISPLAY-ONLY).
+    Pass ?ticker=MNQ to select instrument. Auth + CSRF via the Express proxy;
+    deliberately NOT in OPEN_PATHS."""
+    tkr  = request.args.get("ticker") or request.args.get("inst") or TRADING_INSTRUMENT
+    inst = _instrument_from_text(tkr) or TRADING_INSTRUMENT
+    fa   = full_analysis(ticker_override=inst)
+    sv2  = fa.get("swing_v2") or {"available": False, "reason": "not_computed"}
+    return jsonify(sv2), 200
 
 
 @app.route("/swing-strategy", methods=["GET", "POST"])

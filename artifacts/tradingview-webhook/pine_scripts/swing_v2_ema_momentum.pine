@@ -1,0 +1,112 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Swing Mode V2 — EMA & Momentum Data Sender
+// ─────────────────────────────────────────────────────────────────────────────
+// PURPOSE: Sends daily/4H/weekly EMA, ATR, RSI, MACD, ADX data to the trading
+//          bot webhook so the Swing V2 engine has Tier-2 data for full scoring.
+//
+// SETUP INSTRUCTIONS:
+//   1. Add this indicator to your 5-minute chart (same chart as other scripts).
+//   2. In TradingView, create an alert on this indicator:
+//        Condition : "Swing V2 EMA Update (bar close)"
+//        Message   : (auto-filled — do NOT change the message field)
+//        Webhook   : Your webhook URL (same as other alert webhooks)
+//        Frequency : "Once Per Bar Close"
+//   3. Enable SWING_MODE_V2_ENABLED=1 on the bot.
+//
+// NOTE: The script fires on every confirmed bar close (5-minute by default).
+//       This is intentional — it keeps daily EMA values current without
+//       overwhelming the server (one small JSON payload per 5m bar).
+// ─────────────────────────────────────────────────────────────────────────────
+//@version=5
+indicator("Swing V2 — EMA & Momentum Data", overlay=false, max_bars_back=500)
+
+// ── Instrument auto-detection ─────────────────────────────────────────────────
+// Matches the same detection logic used by all other bot Pine scripts.
+_ticker = syminfo.ticker
+_inst   = str.startswith(_ticker, "MGC") ? "MGC" :
+          str.startswith(_ticker, "MNQ") ? "MNQ" :
+          str.startswith(_ticker, "MES") ? "MES" :
+          str.startswith(_ticker, "MYM") ? "MYM" : "MGC"
+
+// ── Daily timeframe EMAs ───────────────────────────────────────────────────────
+ema20_d  = request.security(syminfo.tickerid, "D", ta.ema(close, 20),  lookahead=barmerge.lookahead_off)
+ema50_d  = request.security(syminfo.tickerid, "D", ta.ema(close, 50),  lookahead=barmerge.lookahead_off)
+ema200_d = request.security(syminfo.tickerid, "D", ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+
+// ── 4H timeframe EMAs ─────────────────────────────────────────────────────────
+ema20_4h = request.security(syminfo.tickerid, "240", ta.ema(close, 20), lookahead=barmerge.lookahead_off)
+ema50_4h = request.security(syminfo.tickerid, "240", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+
+// ── Weekly timeframe EMAs ──────────────────────────────────────────────────────
+ema20_w = request.security(syminfo.tickerid, "W", ta.ema(close, 20), lookahead=barmerge.lookahead_off)
+ema50_w = request.security(syminfo.tickerid, "W", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+
+// ── Daily ATR (14-period) ──────────────────────────────────────────────────────
+atr_d = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead=barmerge.lookahead_off)
+
+// ── Daily RSI (14) ─────────────────────────────────────────────────────────────
+rsi_d = request.security(syminfo.tickerid, "D", ta.rsi(close, 14), lookahead=barmerge.lookahead_off)
+
+// ── Daily MACD histogram ───────────────────────────────────────────────────────
+// Uses a helper function so the full MACD calculation happens in the Daily context.
+get_macd_hist() =>
+    _fast   = ta.ema(close, 12)
+    _slow   = ta.ema(close, 26)
+    _macd   = _fast - _slow
+    _signal = ta.ema(_macd, 9)
+    _macd - _signal
+
+macd_hist_d = request.security(syminfo.tickerid, "D", get_macd_hist(), lookahead=barmerge.lookahead_off)
+
+// ── Daily ADX (14) ─────────────────────────────────────────────────────────────
+get_adx() =>
+    [_dp, _dm, _adx] = ta.dmi(14, 14)
+    _adx
+
+adx_d = request.security(syminfo.tickerid, "D", get_adx(), lookahead=barmerge.lookahead_off)
+
+// ── Trend classification ───────────────────────────────────────────────────────
+// Bullish: EMA stack aligned up + price above 200 EMA
+// Bearish: EMA stack aligned down + price below 200 EMA
+daily_bullish = ema20_d > ema50_d and close > ema200_d
+daily_bearish = ema20_d < ema50_d and close < ema200_d
+
+// ── Alert JSON payload ─────────────────────────────────────────────────────────
+_msg = '{"alert_type":"SWING_EMA_UPDATE"'
+     + ',"ticker":"'    + syminfo.ticker + '"'
+     + ',"instrument":"' + _inst + '"'
+     + ',"ema20_d":'    + str.tostring(ema20_d,    "#.####")
+     + ',"ema50_d":'    + str.tostring(ema50_d,    "#.####")
+     + ',"ema200_d":'   + str.tostring(ema200_d,   "#.####")
+     + ',"ema20_4h":'   + str.tostring(ema20_4h,   "#.####")
+     + ',"ema50_4h":'   + str.tostring(ema50_4h,   "#.####")
+     + ',"ema20_w":'    + str.tostring(ema20_w,    "#.####")
+     + ',"ema50_w":'    + str.tostring(ema50_w,    "#.####")
+     + ',"atr_d":'      + str.tostring(atr_d,      "#.######")
+     + ',"rsi_d":'      + str.tostring(rsi_d,      "#.##")
+     + ',"macd_hist_d":' + str.tostring(macd_hist_d, "#.########")
+     + ',"adx_d":'      + str.tostring(adx_d,      "#.##")
+     + ',"daily_bullish":' + (daily_bullish ? "true" : "false")
+     + ',"daily_bearish":' + (daily_bearish ? "true" : "false")
+     + '}'
+
+// ── Fire the alert on every confirmed bar close ───────────────────────────────
+// Use alert() (not alertcondition) because the message is dynamic.
+// In TradingView: create an alert → "Any alert() function call" → paste webhook URL.
+if barstate.isconfirmed
+    alert(_msg, alert.freq_once_per_bar_close)
+
+// ── Visual reference panel ─────────────────────────────────────────────────────
+// Shows RSI-D in a sub-chart pane so you can visually verify data quality.
+plot(rsi_d, title="RSI-D (14)", color=color.new(color.yellow, 0), linewidth=2)
+hline(70, "Overbought", color=color.new(color.red,   50), linestyle=hline.style_dashed)
+hline(50, "Midline",    color=color.new(color.gray,  70), linestyle=hline.style_dotted)
+hline(30, "Oversold",   color=color.new(color.green, 50), linestyle=hline.style_dashed)
+
+// Label: show current daily trend state
+var label _lbl = na
+if barstate.islast
+    label.delete(_lbl)
+    _state = daily_bullish ? "DAILY BULLISH" : daily_bearish ? "DAILY BEARISH" : "DAILY NEUTRAL"
+    _col   = daily_bullish ? color.green : daily_bearish ? color.red : color.gray
+    _lbl   := label.new(bar_index, rsi_d, _state + "\nEMA20D=" + str.tostring(ema20_d, "#.##") + "  ADX=" + str.tostring(adx_d, "#.#"), color=_col, textcolor=color.white, size=size.small, style=label.style_label_left)
