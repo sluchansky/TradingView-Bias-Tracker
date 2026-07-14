@@ -38,7 +38,7 @@ export function VerdictHero({ data, loading }: { data: DashboardStatus | null; l
           <span>{grade ? `${grade} grade` : "Grade unavailable"}</span>
         </div>
         <div className="dv2-edge-track" aria-label={`Edge score ${edge ?? "unavailable"}`}>
-          <i style={{ width: `${Math.max(0, Math.min(edge ?? 0, 100))}%` }} />
+          <i style={{ width: `${(Math.max(0, Math.min(edge ?? 0, 110)) / 110) * 100}%` }} />
         </div>
       </div>
     </section>

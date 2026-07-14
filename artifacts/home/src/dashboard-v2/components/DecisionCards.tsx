@@ -11,23 +11,28 @@ export function MainReasonCard({ data }: { data: DashboardStatus | null }) {
   const reason = (
     asString(data?.strict_reason)
     ?? asString(brain.summary)
-    ?? asString(data?.recommendation)
   );
-  const nextStep = (
-    asString(data?.stage_next_step)
-    ?? asString(data?.action)
-    ?? asString(data?.recommendation)
-  );
+  const nextStep = asString(data?.stage_next_step);
+  const recommendation = asString(data?.recommendation) ?? asString(data?.action);
   const vwapRelation = price !== null && vwap !== null
     ? price === vwap ? "at" : price > vwap ? "above" : "below"
     : null;
+  const sameAsReason = (value: string | null) =>
+    value !== null && reason !== null && value.trim().toLowerCase() === reason.trim().toLowerCase();
+  const finalInstruction = nextStep && !sameAsReason(nextStep)
+    ? `The next step is: ${nextStep}`
+    : recommendation && !sameAsReason(recommendation)
+      ? `The current recommendation is: ${recommendation}`
+      : null;
   const briefing = [
     structure ? `I'm monitoring ${structure.toLowerCase()}.` : null,
-    edge !== null ? `Current edge is ${Math.round(edge)}/100.` : null,
-    vwapRelation ? `Price remains ${vwapRelation} VWAP.` : null,
+    edge !== null ? `Current edge is ${Math.round(edge)}/110.` : null,
+    vwapRelation ? `Price is ${vwapRelation} VWAP.` : null,
     reason ? `My current read: ${reason}` : null,
-    nextStep ? `I'm waiting for this next condition: ${nextStep}` : null,
-  ].filter((line): line is string => line !== null);
+    finalInstruction,
+  ].filter((line, index, lines): line is string =>
+    line !== null && lines.indexOf(line) === index
+  );
 
   return (
     <DashboardPanel title="AI briefing" className="dv2-decision-card dv2-reason-card">

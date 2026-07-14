@@ -1852,6 +1852,26 @@
   box-shadow: 0 0 8px rgba(96, 165, 250, 0.6);
 }
 
+.dv2-avatar-operator-status.is-live i {
+  background: var(--dv2-green);
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.55);
+}
+
+.dv2-avatar-operator-status.is-caution i {
+  background: var(--dv2-yellow);
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.5);
+}
+
+.dv2-avatar-operator-status.is-error i {
+  background: var(--dv2-red);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+}
+
+.dv2-avatar-operator-status.is-idle i {
+  background: var(--dv2-muted);
+  box-shadow: none;
+}
+
 @media (max-width: 1260px) {
   .dv2-decision-row {
     grid-template-columns: minmax(250px, 1fr) repeat(2, minmax(0, 0.9fr));

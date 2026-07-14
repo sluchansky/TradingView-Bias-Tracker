@@ -48,11 +48,22 @@ export default function DashboardV2() {
     return "WAIT";
   }, [brain, dashboard.data]);
   const operatorState = asString(brain.status) ?? asString(dashboard.data?.market_status);
-  const operatorStatus = dashboard.connection === "loading" || dashboard.connection === "warming"
-    ? `Connecting to ${dashboard.ticker}`
-    : operatorState
-      ? `Monitoring ${dashboard.ticker} · ${operatorState}`
-      : `Monitoring ${dashboard.ticker}`;
+  const operatorTone = dashboard.connection === "connected"
+    ? "live"
+    : dashboard.connection === "stale" || dashboard.connection === "warming"
+      ? "caution"
+      : dashboard.connection === "error"
+        ? "error"
+        : "idle";
+  const operatorStatus = dashboard.connection === "connected"
+    ? `Monitoring ${dashboard.ticker}${operatorState ? ` · ${operatorState}` : ""}`
+    : dashboard.connection === "stale"
+      ? `Data stale · ${dashboard.ticker}`
+      : dashboard.connection === "error"
+        ? `Connection error · ${dashboard.ticker}`
+        : dashboard.connection === "loading" || dashboard.connection === "warming"
+          ? `Connecting to ${dashboard.ticker}`
+          : `Waiting to connect · ${dashboard.ticker}`;
 
   if (dashboard.authRequired) {
     return <DashboardV2Login authenticate={dashboard.authenticate} />;
@@ -112,6 +123,7 @@ export default function DashboardV2() {
             selection={avatarSelection}
             voiceState={voice.voiceState}
             operatorStatus={operatorStatus}
+            operatorTone={operatorTone}
           />
           <TalkToAvatarPanel
             title="Speak to Lord Piggington"
