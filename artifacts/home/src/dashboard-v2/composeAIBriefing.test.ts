@@ -216,7 +216,7 @@ test("describes volatility and location blockers as conditions, not confirmation
   assert.match(result.paragraph, /volatility to return inside the allowed range/i);
   assert.match(result.paragraph, /acceptable entry location/i);
   assert.doesNotMatch(result.paragraph, /volatility confirmation|location confirmation/i);
-  assert.match(result.paragraph, /a change there would alter my current assessment/i);
+  assert.match(result.paragraph, /resolving the outstanding condition would alter my current assessment/i);
 });
 
 test("classifies next-step-only non-confirmation blockers as conditions", () => {
@@ -241,5 +241,6 @@ test("keeps first-person rationale capitalized and uses a clear condition refere
 
   assert.match(result.paragraph, /because I still need a sufficient edge score/i);
   assert.match(result.paragraph, /resolving the outstanding condition would alter my current assessment/i);
-  assert.doesNotMatch(result.paragraph, /because i still|a change there/i);
+  assert.doesNotMatch(result.paragraph, /because i still/);
+  assert.doesNotMatch(result.paragraph, /a change there/i);
 });
