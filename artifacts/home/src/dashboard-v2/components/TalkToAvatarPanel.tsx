@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { DashboardMessage } from "../types";
 import { DashboardPanel } from "./Panel";
 
@@ -30,10 +30,12 @@ export function TalkToAvatarPanel({
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<DashboardMessage[]>([]);
   const [asking, setAsking] = useState(false);
+  const askingRef = useRef(false);
 
   const submit = useCallback(async (raw: string) => {
     const question = raw.trim();
-    if (!question || asking) return;
+    if (!question || askingRef.current) return;
+    askingRef.current = true;
     setInput("");
     setAsking(true);
     onThinkingChange?.(true);
@@ -46,11 +48,12 @@ export function TalkToAvatarPanel({
       const text = error instanceof Error ? error.message : "The assistant is unavailable.";
       setMessages((current) => [...current, { id: ++messageId, role: "assistant", text }]);
     } finally {
+      askingRef.current = false;
       setAsking(false);
       onThinkingChange?.(false);
       markIdle();
     }
-  }, [askAssistant, asking, markIdle, onThinkingChange, speak]);
+  }, [askAssistant, markIdle, onThinkingChange, speak]);
 
   return (
     <DashboardPanel title={title} eyebrow="Voice & text">

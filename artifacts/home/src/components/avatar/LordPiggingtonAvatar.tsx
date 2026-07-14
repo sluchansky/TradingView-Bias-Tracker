@@ -519,6 +519,7 @@ function LordPiggingtonAvatar({
   const liveState  = useRef(avState);
   const liveSpeech = useRef(speechCtrlRef);
   const liveGaze   = useRef({ lastId: -1, dx: 0, dy: 0 });
+  const liveBehavior = useRef({ aiThinking, dataUnavailable });
 
   // Gaze / blink / nod state
   const blinkRef  = useRef({ phase: 'idle' as 'idle'|'closing'|'opening', t: 0, next: 2.8 });
@@ -553,6 +554,9 @@ function LordPiggingtonAvatar({
   // Keep live refs in sync
   useEffect(() => { liveState.current  = avState;       }, [avState]);
   useEffect(() => { liveSpeech.current = speechCtrlRef; }, [speechCtrlRef]);
+  useEffect(() => {
+    liveBehavior.current = { aiThinking, dataUnavailable };
+  }, [aiThinking, dataUnavailable]);
   useEffect(() => {
     if (gazeEvent && gazeEvent.id !== liveGaze.current.lastId) {
       liveGaze.current.dx    = gazeEvent.dx;
@@ -759,7 +763,8 @@ function LordPiggingtonAvatar({
       // Auto-drive idle ↔ talking based on speech
       const isSpeaking = sc?.active ?? false;
       const isListening = voiceListeningRef.current === true;
-      const isThinking = aiThinking || mktSt === 'ANALYZING' || mktSt === 'FORMING';
+      const isThinking = liveBehavior.current.aiThinking
+        || mktSt === 'ANALYZING' || mktSt === 'FORMING';
       const speechContact = speechContactRef.current;
       if (isSpeaking) {
         speechContact.t = speechContact.wasSpeaking ? speechContact.t + dt : 0;
@@ -778,6 +783,9 @@ function LordPiggingtonAvatar({
       }
 
       const anim = animStateRef.current;
+      const breathX = Math.sin(elapsed * (calmMode ? 0.55 : 0.82)) * (calmMode ? 0.0048 : 0.0055);
+      const swayZ   = Math.sin(elapsed * (calmMode ? 0.22 : 0.28)) * (calmMode ? 0.018 : 0.0036);
+      const phi     = elapsed * Math.PI * 2;
       const lordIdleActive = isLordPiggington
         && !isSpeaking
         && !isListening
@@ -818,7 +826,7 @@ function LordPiggingtonAvatar({
       const awarenessWeight = awareness.action === 'weight'
         ? Math.sin(awarenessProgress * Math.PI) * awareness.direction * 0.008
         : 0;
-      const idleSwayZ = lordIdleActive && awareness.action !== 'none' && awareness.action !== 'weight'
+      const idleSwayZ = lordIdleActive && awareness.action !== 'none'
         ? 0
         : swayZ;
       const headSwayZ = lordIdleActive && awareness.action !== 'none' ? 0 : swayZ;
@@ -858,10 +866,6 @@ function LordPiggingtonAvatar({
       }
 
       // ── Compute bone targets for this frame ───────────────────────────────
-      const breathX = Math.sin(elapsed * (calmMode ? 0.55 : 0.82)) * (calmMode ? 0.0048 : 0.0055);
-      const swayZ   = Math.sin(elapsed * (calmMode ? 0.22 : 0.28)) * (calmMode ? 0.018 : 0.0036);
-      const phi     = elapsed * Math.PI * 2;
-
       let targets: BoneTargets;
       if (calmMode) {
         targets = isListening
@@ -1034,7 +1038,7 @@ function LordPiggingtonAvatar({
 
       // ── Market-state expressions ──────────────────────────────────────────
       const exprTargets = STATE_EXPR[mktSt] ?? {};
-      const concernActive = isLordPiggington && calmMode && dataUnavailable;
+      const concernActive = isLordPiggington && calmMode && liveBehavior.current.dataUnavailable;
       STATE_EXPR_NAMES.forEach(n => {
         const baseTarget = exprTargets[n] ?? 0;
         const tgt = concernActive && n === VRMExpressionPresetName.Sad
