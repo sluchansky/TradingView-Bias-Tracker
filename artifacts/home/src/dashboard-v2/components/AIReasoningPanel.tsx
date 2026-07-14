@@ -1,6 +1,6 @@
 import type { DashboardStatus } from "../types";
 import { asRecord, asString } from "../types";
-import { DashboardPanel, Unavailable } from "./Panel";
+import { Unavailable } from "./Panel";
 
 export function AIReasoningPanel({ data }: { data: DashboardStatus | null }) {
   const voice = asRecord(data?.main_brain_voice);
@@ -10,15 +10,21 @@ export function AIReasoningPanel({ data }: { data: DashboardStatus | null }) {
     asString(voice.narration)
     ?? asString(brain.summary)
     ?? asString(analyst.summary)
+    ?? asString(data?.strict_reason)
   );
 
   return (
-    <DashboardPanel title="AI reasoning" eyebrow="Why this verdict">
-      {reasoning ? (
-        <p className="dv2-reasoning">{reasoning}</p>
-      ) : (
-        <Unavailable>AI reasoning is not available for this snapshot.</Unavailable>
-      )}
-    </DashboardPanel>
+    <section className="dv2-conversation-card" aria-labelledby="dv2-reasoning-title">
+      <div className="dv2-conversation-speaker" aria-hidden="true">LP</div>
+      <div>
+        <span className="dv2-eyebrow">Lord Piggington’s read</span>
+        <h2 id="dv2-reasoning-title">Why I see it this way</h2>
+        {reasoning ? (
+          <p className="dv2-reasoning">{reasoning}</p>
+        ) : (
+          <Unavailable>AI reasoning is not available for this snapshot.</Unavailable>
+        )}
+      </div>
+    </section>
   );
 }

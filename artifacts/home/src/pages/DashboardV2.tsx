@@ -7,11 +7,9 @@ import { DashboardV2Header } from "@/dashboard-v2/components/DashboardV2Header";
 import { DashboardV2Login } from "@/dashboard-v2/components/DashboardV2Login";
 import { EvidenceSnapshotPanel } from "@/dashboard-v2/components/EvidenceSnapshotPanel";
 import { KeyObservationsPanel } from "@/dashboard-v2/components/KeyObservationsPanel";
-import { LevelsPanel } from "@/dashboard-v2/components/LevelsPanel";
 import { MarketContextPanel } from "@/dashboard-v2/components/MarketContextPanel";
-import { MarketStructurePanel } from "@/dashboard-v2/components/MarketStructurePanel";
+import { MarketStatusPanel } from "@/dashboard-v2/components/MarketStatusPanel";
 import { NewsSessionPanel, ObjectivePanel, SessionMemoryPanel, SessionPerformancePanel } from "@/dashboard-v2/components/SessionPanels";
-import { OrderFlowPanel } from "@/dashboard-v2/components/OrderFlowPanel";
 import { TalkToAvatarPanel } from "@/dashboard-v2/components/TalkToAvatarPanel";
 import { TradePlanPanel } from "@/dashboard-v2/components/TradePlanPanel";
 import { VerdictHero } from "@/dashboard-v2/components/VerdictHero";
@@ -95,37 +93,45 @@ export default function DashboardV2() {
         </div>
       )}
 
-      <main className="dv2-workspace">
-        <aside className="dv2-column dv2-left-column">
+      <main className="dv2-dashboard-body">
+        <section className="dv2-hero-experience">
           <AvatarPanel
             avatarState={avatarState}
             speaking={voice.speaking}
             speechCtrlRef={voice.speechCtrlRef}
             voiceListeningRef={voice.voiceListeningRef}
           />
-          <MarketContextPanel data={dashboard.data} />
-          <ObjectivePanel data={dashboard.data} />
-          <SessionPerformancePanel data={dashboard.data} />
-          <SessionMemoryPanel data={dashboard.data} />
-        </aside>
-
-        <section className="dv2-column dv2-center-column">
-          <VerdictHero
-            data={dashboard.data}
-            loading={dashboard.connection === "loading" || dashboard.connection === "warming"}
-          />
-          <AIReasoningPanel data={dashboard.data} />
-          <KeyObservationsPanel data={dashboard.data} />
-          <ChartPanel data={dashboard.data} points={dashboard.priceHistory} />
+          <div className="dv2-hero-intelligence">
+            <VerdictHero
+              data={dashboard.data}
+              loading={dashboard.connection === "loading" || dashboard.connection === "warming"}
+            />
+            <AIReasoningPanel data={dashboard.data} />
+          </div>
         </section>
 
-        <aside className="dv2-column dv2-right-column">
-          <OrderFlowPanel data={dashboard.data} />
-          <LevelsPanel data={dashboard.data} />
-          <MarketStructurePanel data={dashboard.data} />
-          <TradePlanPanel data={dashboard.data} />
-          <NewsSessionPanel data={dashboard.data} />
-        </aside>
+        <ChartPanel data={dashboard.data} points={dashboard.priceHistory} />
+
+        <section className="dv2-workspace dv2-workspace-secondary">
+          <aside className="dv2-column dv2-left-column">
+            <MarketContextPanel data={dashboard.data} />
+            <ObjectivePanel data={dashboard.data} />
+          </aside>
+
+          <section className="dv2-column dv2-center-column">
+            <KeyObservationsPanel data={dashboard.data} />
+            <div className="dv2-session-grid">
+              <SessionPerformancePanel data={dashboard.data} />
+              <SessionMemoryPanel data={dashboard.data} />
+            </div>
+          </section>
+
+          <aside className="dv2-column dv2-right-column">
+            <MarketStatusPanel data={dashboard.data} />
+            <TradePlanPanel data={dashboard.data} />
+            <NewsSessionPanel data={dashboard.data} />
+          </aside>
+        </section>
       </main>
 
       <footer className="dv2-bottom">

@@ -1,7 +1,6 @@
 import LordPiggingtonAvatar from "@/components/avatar/LordPiggingtonAvatar";
 import type { AvatarState, GazeEvt, SpeechCtrl } from "@/components/avatar/avatarTypes";
 import type { RefObject } from "react";
-import { DashboardPanel } from "./Panel";
 
 export function AvatarPanel({
   avatarState,
@@ -14,7 +13,9 @@ export function AvatarPanel({
   speechCtrlRef: RefObject<SpeechCtrl>;
   voiceListeningRef: RefObject<boolean>;
 }) {
-  const neutralGaze: GazeEvt = { dx: 0, dy: 0, widen: false, dur: 0, id: 0 };
+  // The avatar sits left of the verdict and above the chart in V2. Hold a gentle
+  // right/down gaze so he appears to be monitoring that shared workspace.
+  const chartGaze: GazeEvt = { dx: 3.6, dy: 2.1, widen: false, dur: 90_000, id: 2 };
   let vrmSrc = "/LordPiggington.vrm";
   try {
     vrmSrc = localStorage.getItem("brain_vrm") || vrmSrc;
@@ -23,13 +24,17 @@ export function AvatarPanel({
   }
 
   return (
-    <DashboardPanel title="Lord Piggington" eyebrow="AI partner" className="dv2-avatar-panel">
+    <section className="dv2-avatar-hero" aria-label="Lord Piggington AI partner">
+      <div className="dv2-avatar-identity">
+        <span className="dv2-eyebrow">AI partner</span>
+        <strong>Lord Piggington</strong>
+      </div>
       <div className="dv2-avatar-stage">
         <LordPiggingtonAvatar
           avState={avatarState}
           speaking={speaking}
           ringColor="#3b82f6"
-          gazeEvent={neutralGaze}
+          gazeEvent={chartGaze}
           speechCtrlRef={speechCtrlRef}
           voiceListeningRef={voiceListeningRef}
           debug={false}
@@ -41,6 +46,6 @@ export function AvatarPanel({
         <i className={speaking ? "is-speaking" : ""} />
         {speaking ? "Speaking" : "Relaxed · monitoring the tape"}
       </div>
-    </DashboardPanel>
+    </section>
   );
 }

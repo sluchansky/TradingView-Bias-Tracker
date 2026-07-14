@@ -21,11 +21,9 @@ export function VerdictHero({ data, loading }: { data: DashboardStatus | null; l
       <div className="dv2-verdict-copy">
         <span className="dv2-eyebrow">Live verdict</span>
         <h1>{label}</h1>
-        <p>
-          {asString(data?.strict_reason)
-            ?? asString(brain.summary)
-            ?? (loading ? "Connecting to the live analysis service…" : "No live reasoning is available.")}
-        </p>
+        <span className="dv2-verdict-state">
+          {loading ? "Connecting to live analysis…" : direction ? `${direction} context` : "Monitoring live conditions"}
+        </span>
       </div>
       <div className="dv2-edge">
         <div className="dv2-edge-number">{edge === null ? "—" : Math.round(edge)}</div>
