@@ -23,7 +23,7 @@ import "@/dashboard-v2/dashboard-v2.css";
 export default function DashboardV2() {
   const dashboard = useDashboardV2Data();
   const voice = useDashboardV2Voice();
-  const avatarManager = useAvatarSelection();
+  const avatarSelection = useAvatarSelection();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const brain = asRecord(dashboard.data?.main_brain);
 
@@ -85,7 +85,7 @@ export default function DashboardV2() {
           <button type="button" onClick={dashboard.clearAuth}>Sign out</button>
           <a href="/">Open current dashboard</a>
           <a href="/api/dashboard">Open engineering dashboard</a>
-          <AvatarSettingsPanel controller={avatarManager} />
+          <AvatarSettingsPanel selection={avatarSelection} />
         </div>
       )}
 
@@ -104,7 +104,7 @@ export default function DashboardV2() {
             speaking={voice.speaking}
             speechCtrlRef={voice.speechCtrlRef}
             voiceListeningRef={voice.voiceListeningRef}
-            manager={avatarManager}
+            selection={avatarSelection}
           />
           <div className="dv2-hero-intelligence">
             <VerdictHero

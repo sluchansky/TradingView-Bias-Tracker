@@ -1,123 +1,86 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   AVATAR_STORAGE_KEY,
-  DEFAULT_AVATAR_SOURCE,
-  avatarLabelFor,
-  isValidAvatarSource,
-} from "./avatarModels";
+  DEFAULT_AVATAR_ID,
+  getAvatarById,
+  getAvatarBySource,
+  type AvatarProfile,
+} from "./AvatarRegistry";
 
 export type AvatarLoadState = "loading" | "ready" | "error";
 
-export type AvatarManagerController = {
-  source: string;
-  label: string;
+export type AvatarSelection = {
+  profile: AvatarProfile;
   loadState: AvatarLoadState;
-  message: string | null;
+  fallbackMessage: string | null;
   revision: number;
-  selectAvatar: (source: string) => boolean;
-  handleModelLoad: (source: string) => void;
-  handleModelError: (source: string) => void;
+  select: (id: string) => void;
+  loaded: (src: string) => void;
+  failed: (src: string) => void;
   retry: () => void;
-  reset: () => void;
-  clearMessage: () => void;
 };
 
-function readInitialSource(): string {
+function initialProfile(): AvatarProfile {
   try {
-    const stored = localStorage.getItem(AVATAR_STORAGE_KEY)?.trim();
-    return stored && isValidAvatarSource(stored) ? stored : DEFAULT_AVATAR_SOURCE;
+    return getAvatarBySource(localStorage.getItem(AVATAR_STORAGE_KEY));
   } catch {
-    return DEFAULT_AVATAR_SOURCE;
+    return getAvatarById(DEFAULT_AVATAR_ID);
   }
 }
 
-function persistSource(source: string) {
+function persist(profile: AvatarProfile) {
   try {
-    localStorage.setItem(AVATAR_STORAGE_KEY, source);
+    localStorage.setItem(AVATAR_STORAGE_KEY, profile.src);
   } catch {
-    // Selection remains active for this session if storage is unavailable.
+    // The selection remains active for the current session.
   }
 }
 
-export function useAvatarSelection(): AvatarManagerController {
-  const [source, setSource] = useState(readInitialSource);
+export function useAvatarSelection(): AvatarSelection {
+  const [profile, setProfile] = useState(initialProfile);
   const [loadState, setLoadState] = useState<AvatarLoadState>("loading");
-  const [message, setMessage] = useState<string | null>(null);
+  const [fallbackMessage, setFallbackMessage] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
-  const sourceRef = useRef(source);
-  sourceRef.current = source;
+  const profileRef = useRef(profile);
+  profileRef.current = profile;
 
-  const selectAvatar = useCallback((nextSource: string): boolean => {
-    const normalized = nextSource.trim();
-    if (!isValidAvatarSource(normalized)) {
-      setMessage("Enter a valid local path or HTTP(S) VRM URL.");
-      return false;
-    }
-    persistSource(normalized);
-    sourceRef.current = normalized;
-    setSource(normalized);
+  const select = useCallback((id: string) => {
+    const next = getAvatarById(id);
+    profileRef.current = next;
+    persist(next);
+    setProfile(next);
     setLoadState("loading");
-    setMessage(null);
-    setRevision((current) => current + 1);
-    return true;
+    setFallbackMessage(null);
+    setRevision((value) => value + 1);
   }, []);
 
-  const handleModelLoad = useCallback((loadedSource: string) => {
-    if (sourceRef.current === loadedSource) setLoadState("ready");
+  const loaded = useCallback((src: string) => {
+    if (profileRef.current.src === src) setLoadState("ready");
   }, []);
 
-  const handleModelError = useCallback((failedSource: string) => {
-    if (sourceRef.current !== failedSource) return;
-    if (failedSource === DEFAULT_AVATAR_SOURCE) {
+  const failed = useCallback((src: string) => {
+    if (profileRef.current.src !== src) return;
+    const failedName = profileRef.current.name;
+    const fallback = getAvatarById(DEFAULT_AVATAR_ID);
+    if (src === fallback.src) {
       setLoadState("error");
-      setMessage("The default avatar could not be loaded. Voice and dashboard controls remain available.");
+      setFallbackMessage("The default avatar model is unavailable. Dashboard and voice features remain active.");
       return;
     }
 
-    persistSource(DEFAULT_AVATAR_SOURCE);
-    sourceRef.current = DEFAULT_AVATAR_SOURCE;
-    setSource(DEFAULT_AVATAR_SOURCE);
+    profileRef.current = fallback;
+    persist(fallback);
+    setProfile(fallback);
     setLoadState("loading");
-    setMessage(`${avatarLabelFor(failedSource)} could not be loaded. Restoring Lord Piggington.`);
-    setRevision((current) => current + 1);
+    setFallbackMessage(`${failedName} could not load. Restoring Lord Piggington.`);
+    setRevision((value) => value + 1);
   }, []);
 
   const retry = useCallback(() => {
     setLoadState("loading");
-    setMessage(null);
-    setRevision((current) => current + 1);
+    setFallbackMessage(null);
+    setRevision((value) => value + 1);
   }, []);
 
-  const reset = useCallback(() => {
-    persistSource(DEFAULT_AVATAR_SOURCE);
-    sourceRef.current = DEFAULT_AVATAR_SOURCE;
-    setSource(DEFAULT_AVATAR_SOURCE);
-    setLoadState("loading");
-    setMessage(null);
-    setRevision((current) => current + 1);
-  }, []);
-
-  return useMemo(() => ({
-    source,
-    label: avatarLabelFor(source),
-    loadState,
-    message,
-    revision,
-    selectAvatar,
-    handleModelLoad,
-    handleModelError,
-    retry,
-    reset,
-    clearMessage: () => setMessage(null),
-  }), [
-    source,
-    loadState,
-    message,
-    revision,
-    selectAvatar,
-    handleModelLoad,
-    handleModelError,
-    retry,
-    reset,
-  ]);
+  return { profile, loadState, fallbackMessage, revision, select, loaded, failed, retry };
 }
