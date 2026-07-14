@@ -3,7 +3,9 @@ import { AvatarSettingsPanel } from "@/components/avatar/AvatarSettingsPanel";
 import type { AvatarState } from "@/components/avatar/avatarTypes";
 import { useAvatarSelection } from "@/components/avatar/useAvatarSelection";
 import { AvatarPanel } from "@/dashboard-v2/components/AvatarPanel";
+import { AITimelinePanel } from "@/dashboard-v2/components/AITimelinePanel";
 import { ChartPanel } from "@/dashboard-v2/components/ChartPanel";
+import { CollapsibleSection } from "@/dashboard-v2/components/CollapsibleSection";
 import { ActiveAlertsPanel, PositionsPanel } from "@/dashboard-v2/components/CommandBottomPanels";
 import { DashboardV2Header } from "@/dashboard-v2/components/DashboardV2Header";
 import { DashboardV2Login } from "@/dashboard-v2/components/DashboardV2Login";
@@ -16,11 +18,17 @@ import { TalkToAvatarPanel } from "@/dashboard-v2/components/TalkToAvatarPanel";
 import { VerdictHero } from "@/dashboard-v2/components/VerdictHero";
 import { asNumber, asRecord, asString } from "@/dashboard-v2/types";
 import { useDashboardV2Data } from "@/dashboard-v2/useDashboardV2Data";
+import { useAITimeline } from "@/dashboard-v2/useAITimeline";
 import { useDashboardV2Voice } from "@/dashboard-v2/useDashboardV2Voice";
 import "@/dashboard-v2/dashboard-v2.css";
 
 export default function DashboardV2() {
   const dashboard = useDashboardV2Data();
+  const timeline = useAITimeline({
+    ticker: dashboard.ticker,
+    connection: dashboard.connection,
+    data: dashboard.data,
+  });
   const voice = useDashboardV2Voice();
   const avatarSelection = useAvatarSelection();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -199,6 +207,19 @@ export default function DashboardV2() {
           <NewsSessionPanel data={dashboard.data} />
           <ActiveAlertsPanel data={dashboard.data} />
           <PositionsPanel data={dashboard.data} />
+          <div className="dv2-timeline-slot">
+            <CollapsibleSection
+              title="AI Timeline"
+              summary="Recent meaningful changes in live reasoning"
+              badge={timeline.newEventCount > 0 ? `${timeline.newEventCount} new` : undefined}
+            >
+              <AITimelinePanel
+                events={timeline.events}
+                newEventCount={timeline.newEventCount}
+                onViewingNewestChange={timeline.setViewingNewest}
+              />
+            </CollapsibleSection>
+          </div>
         </section>
       </main>
     </div>
