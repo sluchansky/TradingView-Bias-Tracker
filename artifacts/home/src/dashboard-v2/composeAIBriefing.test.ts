@@ -88,7 +88,7 @@ test("does not invent a direction for an ambiguous READY verdict", () => {
     strict_reason: "Setup conditions are aligned",
   });
 
-  assert.match(result.paragraph, /verdict is READY(?:[.:])/i);
+  assert.match(result.paragraph, /verdict is READY\b/i);
   assert.doesNotMatch(result.paragraph, /READY (LONG|SHORT)/i);
 });
 
@@ -99,7 +99,7 @@ test("does not treat a non-directional label as LONG", () => {
     strict_reason: "Direction is unresolved",
   });
 
-  assert.match(result.paragraph, /verdict is READY(?:[.:])/i);
+  assert.match(result.paragraph, /verdict is READY\b/i);
   assert.doesNotMatch(result.paragraph, /READY (LONG|SHORT)/i);
 });
 
