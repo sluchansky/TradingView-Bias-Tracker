@@ -4,6 +4,10 @@ import { DashboardPanel, Unavailable } from "./Panel";
 
 export function MainReasonCard({ data }: { data: DashboardStatus | null }) {
   const brain = asRecord(data?.main_brain);
+  const edge = asNumber(brain.edge_score) ?? asNumber(data?.edge_score);
+  const price = asNumber(data?.current_price);
+  const vwap = asNumber(data?.vwap_value);
+  const structure = asString(data?.market_structure);
   const reason = (
     asString(data?.strict_reason)
     ?? asString(brain.summary)
@@ -14,14 +18,24 @@ export function MainReasonCard({ data }: { data: DashboardStatus | null }) {
     ?? asString(data?.action)
     ?? asString(data?.recommendation)
   );
+  const vwapRelation = price !== null && vwap !== null
+    ? price === vwap ? "at" : price > vwap ? "above" : "below"
+    : null;
+  const briefing = [
+    structure ? `I'm monitoring ${structure.toLowerCase()}.` : null,
+    edge !== null ? `Current edge is ${Math.round(edge)}/100.` : null,
+    vwapRelation ? `Price remains ${vwapRelation} VWAP.` : null,
+    reason ? `My current read: ${reason}` : null,
+    nextStep ? `I'm waiting for this next condition: ${nextStep}` : null,
+  ].filter((line): line is string => line !== null);
 
   return (
-    <DashboardPanel title="Main reason" className="dv2-decision-card dv2-reason-card">
-      {reason ? <p className="dv2-command-reason">{reason}</p> : <Unavailable />}
-      <div className="dv2-next-step">
-        <span>Next step</span>
-        <strong>{nextStep ?? "Unavailable"}</strong>
-      </div>
+    <DashboardPanel title="AI briefing" className="dv2-decision-card dv2-reason-card">
+      {briefing.length ? (
+        <div className="dv2-briefing-copy">
+          {briefing.map((line) => <p key={line}>{line}</p>)}
+        </div>
+      ) : <Unavailable>Live briefing unavailable.</Unavailable>}
     </DashboardPanel>
   );
 }

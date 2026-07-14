@@ -1761,3 +1761,113 @@
     padding-left: 14px;
   }
 }
+
+/* Hero experience */
+.dv2-decision-row {
+  grid-template-columns: minmax(280px, 1.12fr) minmax(0, 0.9fr) minmax(0, 0.9fr);
+  grid-template-areas:
+    "verdict briefing briefing"
+    "verdict context power";
+}
+
+.dv2-decision-row > :nth-child(even),
+.dv2-decision-row > :nth-child(n + 3) {
+  border: 0;
+}
+
+.dv2-decision-row .dv2-verdict {
+  grid-area: verdict;
+  min-height: 100%;
+  padding: 28px;
+}
+
+.dv2-reason-card {
+  grid-area: briefing;
+  min-height: 245px;
+  border-left: 1px solid rgba(148, 163, 184, 0.12) !important;
+}
+
+.dv2-context-card {
+  grid-area: context;
+  min-height: 180px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12) !important;
+  border-left: 1px solid rgba(148, 163, 184, 0.12) !important;
+}
+
+.dv2-power-card {
+  grid-area: power;
+  min-height: 180px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12) !important;
+  border-left: 1px solid rgba(148, 163, 184, 0.12) !important;
+}
+
+.dv2-decision-row .dv2-verdict h1 {
+  max-width: 420px;
+  font-size: clamp(48px, 5vw, 76px);
+  line-height: 0.9;
+  letter-spacing: -0.065em;
+}
+
+.dv2-decision-row .dv2-edge {
+  max-width: 280px;
+  margin-top: auto;
+}
+
+.dv2-briefing-copy {
+  display: grid;
+  gap: 7px;
+}
+
+.dv2-briefing-copy p {
+  margin: 0;
+  color: #dce3ed;
+  font-size: 15px;
+  line-height: 1.48;
+}
+
+.dv2-briefing-copy p:first-child {
+  color: var(--dv2-text);
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.dv2-avatar-operator-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 248px;
+  margin-top: 8px;
+  color: var(--dv2-secondary);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 1.35;
+}
+
+.dv2-avatar-operator-status i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--dv2-blue);
+  box-shadow: 0 0 8px rgba(96, 165, 250, 0.6);
+}
+
+@media (max-width: 1260px) {
+  .dv2-decision-row {
+    grid-template-columns: minmax(250px, 1fr) repeat(2, minmax(0, 0.9fr));
+  }
+}
+
+@media (max-width: 940px) {
+  .dv2-decision-row {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "verdict verdict"
+      "briefing briefing"
+      "context power";
+  }
+
+  .dv2-reason-card {
+    border-top: 1px solid rgba(148, 163, 184, 0.12) !important;
+  }
+}

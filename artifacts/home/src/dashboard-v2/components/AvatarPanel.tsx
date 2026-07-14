@@ -10,6 +10,7 @@ export function AvatarPanel({
   voiceListeningRef,
   selection,
   voiceState,
+  operatorStatus,
 }: {
   avatarState: AvatarState;
   speaking: boolean;
@@ -17,6 +18,7 @@ export function AvatarPanel({
   voiceListeningRef: RefObject<boolean>;
   selection: AvatarSelection;
   voiceState: "idle" | "requesting" | "listening" | "processing" | "error";
+  operatorStatus: string;
 }) {
   // The avatar sits left of the verdict and above the chart in V2. Hold a gentle
   // right/down gaze so he appears to be monitoring that shared workspace.
@@ -26,6 +28,10 @@ export function AvatarPanel({
       <div className="dv2-avatar-identity">
         <span className="dv2-eyebrow">AI Trading Partner</span>
         <strong>{selection.profile.name}</strong>
+        <span className="dv2-avatar-operator-status">
+          <i />
+          {operatorStatus}
+        </span>
       </div>
       <div className="dv2-avatar-stage">
         <AvatarManager

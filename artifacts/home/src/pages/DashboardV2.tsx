@@ -47,6 +47,12 @@ export default function DashboardV2() {
     if (edge < 20) return "NO_EDGE";
     return "WAIT";
   }, [brain, dashboard.data]);
+  const operatorState = asString(brain.status) ?? asString(dashboard.data?.market_status);
+  const operatorStatus = dashboard.connection === "loading" || dashboard.connection === "warming"
+    ? `Connecting to ${dashboard.ticker}`
+    : operatorState
+      ? `Monitoring ${dashboard.ticker} · ${operatorState}`
+      : `Monitoring ${dashboard.ticker}`;
 
   if (dashboard.authRequired) {
     return <DashboardV2Login authenticate={dashboard.authenticate} />;
@@ -105,6 +111,7 @@ export default function DashboardV2() {
             voiceListeningRef={voice.voiceListeningRef}
             selection={avatarSelection}
             voiceState={voice.voiceState}
+            operatorStatus={operatorStatus}
           />
           <TalkToAvatarPanel
             title="Speak to Lord Piggington"
