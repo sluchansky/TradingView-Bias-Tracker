@@ -15,14 +15,22 @@ export function VerdictHero({ data, loading }: { data: DashboardStatus | null; l
   const bearish = /short|bear/i.test(direction ?? status);
   const tone = ready ? (bearish ? "bear" : "bull") : status.includes("BUILD") ? "caution" : "info";
   const label = ready && direction ? `${status} — ${direction.toUpperCase()}` : status;
+  const mainReason = (
+    asString(data?.strict_reason)
+    ?? asString(brain.wait_reason)
+    ?? asString(brain.summary)
+  );
 
   return (
     <section className={`dv2-verdict dv2-verdict-${tone}`}>
       <div className="dv2-verdict-copy">
         <span className="dv2-eyebrow">Live verdict</span>
         <h1>{label}</h1>
+        <p className="dv2-verdict-reason">
+          {mainReason ?? (loading ? "Connecting to live analysis…" : "Decision reason unavailable.")}
+        </p>
         <span className="dv2-verdict-state">
-          {loading ? "Connecting to live analysis…" : direction ? `${direction} context` : "Monitoring live conditions"}
+          {direction ? `${direction} context` : "Monitoring live conditions"}
         </span>
       </div>
       <div className="dv2-edge">

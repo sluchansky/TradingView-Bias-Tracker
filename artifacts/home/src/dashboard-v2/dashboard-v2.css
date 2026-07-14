@@ -5,8 +5,8 @@
   --dv2-border: rgba(148, 163, 184, 0.18);
   --dv2-border-strong: rgba(148, 163, 184, 0.3);
   --dv2-text: #f1f5f9;
-  --dv2-secondary: #b8c2d3;
-  --dv2-muted: #8894a7;
+  --dv2-secondary: #c5cedb;
+  --dv2-muted: #a0acbd;
   --dv2-green: #22c55e;
   --dv2-red: #ef4444;
   --dv2-yellow: #fbbf24;
@@ -220,16 +220,16 @@
 
 .dv2-dashboard-body {
   width: 100%;
-  max-width: 1900px;
+  max-width: 1760px;
   margin: 0 auto;
   padding: 14px 18px 12px;
 }
 
 .dv2-hero-experience {
   position: relative;
-  min-height: 430px;
+  min-height: 410px;
   display: grid;
-  grid-template-columns: minmax(330px, 0.82fr) minmax(560px, 1.65fr);
+  grid-template-columns: minmax(300px, 0.68fr) minmax(600px, 1.75fr);
   align-items: stretch;
   gap: 8px;
   overflow: hidden;
@@ -256,8 +256,8 @@
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 12px;
-  padding: 26px 30px 26px 8px;
+  gap: 14px;
+  padding: 22px 32px 22px 4px;
 }
 
 .dv2-workspace {
@@ -290,7 +290,7 @@
 }
 
 .dv2-panel {
-  padding: 16px;
+  padding: 18px;
 }
 
 .dv2-panel-heading {
@@ -313,8 +313,7 @@
   color: #93c5fd;
   font-size: 12px;
   font-weight: 750;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
+  letter-spacing: 0.025em;
 }
 
 .dv2-data-list {
@@ -363,7 +362,7 @@
 .dv2-avatar-hero {
   position: relative;
   min-width: 0;
-  min-height: 430px;
+  min-height: 410px;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -386,7 +385,7 @@
 
 .dv2-avatar-stage {
   width: 100%;
-  height: 420px;
+  height: 405px;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -396,7 +395,7 @@
 
 .dv2-avatar-stage > div {
   flex: 0 0 420px;
-  transform: scale(0.76);
+  transform: scale(0.72);
   transform-origin: center bottom;
   margin-top: -135px;
 }
@@ -460,8 +459,15 @@
   color: var(--dv2-secondary);
   font-size: 14px;
   font-weight: 650;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  letter-spacing: 0.015em;
+}
+
+.dv2-verdict-reason {
+  max-width: 760px;
+  margin: 0 0 7px;
+  color: #d7deea;
+  font-size: 15px;
+  line-height: 1.55;
 }
 
 .dv2-edge {
@@ -490,7 +496,7 @@
 }
 
 .dv2-edge span {
-  color: var(--dv2-muted);
+  color: var(--dv2-secondary);
 }
 
 .dv2-edge-track {
@@ -590,7 +596,7 @@
 }
 
 .dv2-chart-panel {
-  min-height: 590px;
+  min-height: 660px;
   margin-top: 12px;
   padding: 18px;
 }
@@ -612,7 +618,7 @@
 }
 
 .dv2-chart-wrap {
-  height: 505px;
+  height: 575px;
   overflow: hidden;
   border: 1px solid rgba(148, 163, 184, 0.11);
   border-radius: 9px;
@@ -659,6 +665,79 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
+  align-items: start;
+}
+
+.dv2-disclosure {
+  overflow: hidden;
+  border: 1px solid var(--dv2-border);
+  border-radius: 12px;
+  background: var(--dv2-surface);
+}
+
+.dv2-disclosure > summary {
+  min-height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 16px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.dv2-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dv2-disclosure > summary > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dv2-disclosure > summary strong {
+  color: var(--dv2-text);
+  font-size: 14px;
+}
+
+.dv2-disclosure > summary small {
+  color: var(--dv2-muted);
+  font-size: 12px;
+}
+
+.dv2-disclosure > summary i {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--dv2-border);
+  border-radius: 50%;
+  color: var(--dv2-secondary);
+  font-size: 18px;
+  font-style: normal;
+  transition: transform 0.2s ease;
+}
+
+.dv2-disclosure[open] > summary i {
+  transform: rotate(45deg);
+}
+
+.dv2-disclosure-content {
+  border-top: 1px solid var(--dv2-border);
+}
+
+.dv2-disclosure-content > .dv2-panel {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.dv2-disclosure-content > .dv2-panel > .dv2-panel-heading {
+  display: none;
 }
 
 .dv2-market-status {
@@ -684,8 +763,7 @@
   color: #bfdbfe;
   font-size: 12px;
   font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
 }
 
 .dv2-market-status-grid {
@@ -709,10 +787,10 @@
 .dv2-bottom {
   display: grid;
   grid-template-columns: 2fr 1fr;
-  align-items: stretch;
+  align-items: start;
   gap: 12px;
   width: 100%;
-  max-width: 1900px;
+  max-width: 1760px;
   margin: 0 auto;
   padding: 0 18px 24px;
 }

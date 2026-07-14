@@ -30,9 +30,9 @@ export function ChartPanel({
   const high = maximum + padding;
   const range = high - low || 1;
   const width = 1_000;
-  const height = 440;
-  const plotTop = 22;
-  const plotBottom = 408;
+  const height = 520;
+  const plotTop = 24;
+  const plotBottom = 484;
   const x = (index: number) => points.length <= 1 ? width / 2 : (index / (points.length - 1)) * width;
   const y = (price: number) => plotTop + ((high - price) / range) * (plotBottom - plotTop);
   const polyline = points.map((point, index) => `${x(index)},${y(point.price)}`).join(" ");

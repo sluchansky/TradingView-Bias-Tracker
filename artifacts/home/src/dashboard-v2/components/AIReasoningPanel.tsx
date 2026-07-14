@@ -10,14 +10,13 @@ export function AIReasoningPanel({ data }: { data: DashboardStatus | null }) {
     asString(voice.narration)
     ?? asString(brain.summary)
     ?? asString(analyst.summary)
-    ?? asString(data?.strict_reason)
   );
 
   return (
     <section className="dv2-conversation-card" aria-labelledby="dv2-reasoning-title">
-      <div className="dv2-conversation-speaker" aria-hidden="true">LP</div>
+      <div className="dv2-conversation-speaker" aria-hidden="true">AI</div>
       <div>
-        <span className="dv2-eyebrow">Lord Piggington’s read</span>
+        <span className="dv2-eyebrow">AI partner’s read</span>
         <h2 id="dv2-reasoning-title">Why I see it this way</h2>
         {reasoning ? (
           <p className="dv2-reasoning">{reasoning}</p>

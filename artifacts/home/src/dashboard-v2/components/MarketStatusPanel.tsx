@@ -17,7 +17,7 @@ export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
   const volume = asString(diagnostics.volume);
 
   return (
-    <DashboardPanel title="Market Status" eyebrow="Flow · levels · structure" className="dv2-market-status">
+    <DashboardPanel title="Market status" eyebrow="Flow · levels · structure" className="dv2-market-status">
       <div className="dv2-market-status-section">
         <h3>Order flow</h3>
         {asString(marketRead.order_flow) && (
@@ -57,6 +57,10 @@ export function MarketStatusPanel({ data }: { data: DashboardStatus | null }) {
             </p>
             <div className="dv2-market-status-grid">
               <DataRow label="Class" value={data.structure_class ?? "Unavailable"} />
+              <DataRow
+                label="Character"
+                value={asString(marketRead.market_character) ?? "Unavailable"}
+              />
               <DataRow
                 label="Risk zone"
                 value={data.risk_zone ?? "Unavailable"}

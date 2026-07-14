@@ -5,6 +5,7 @@ import { useAvatarSelection } from "@/components/avatar/useAvatarSelection";
 import { AIReasoningPanel } from "@/dashboard-v2/components/AIReasoningPanel";
 import { AvatarPanel } from "@/dashboard-v2/components/AvatarPanel";
 import { ChartPanel } from "@/dashboard-v2/components/ChartPanel";
+import { CollapsibleSection } from "@/dashboard-v2/components/CollapsibleSection";
 import { DashboardV2Header } from "@/dashboard-v2/components/DashboardV2Header";
 import { DashboardV2Login } from "@/dashboard-v2/components/DashboardV2Login";
 import { EvidenceSnapshotPanel } from "@/dashboard-v2/components/EvidenceSnapshotPanel";
@@ -127,7 +128,12 @@ export default function DashboardV2() {
             <KeyObservationsPanel data={dashboard.data} />
             <div className="dv2-session-grid">
               <SessionPerformancePanel data={dashboard.data} />
-              <SessionMemoryPanel data={dashboard.data} />
+              <CollapsibleSection
+                title="Session memory"
+                summary="Learning context and similar setups"
+              >
+                <SessionMemoryPanel data={dashboard.data} />
+              </CollapsibleSection>
             </div>
           </section>
 
@@ -150,7 +156,12 @@ export default function DashboardV2() {
           stopListening={voice.stopListening}
           markIdle={voice.markIdle}
         />
-        <EvidenceSnapshotPanel data={dashboard.data} />
+        <CollapsibleSection
+          title="Evidence snapshot"
+          summary="Gate inputs and confirmation detail"
+        >
+          <EvidenceSnapshotPanel data={dashboard.data} />
+        </CollapsibleSection>
       </footer>
     </div>
   );
