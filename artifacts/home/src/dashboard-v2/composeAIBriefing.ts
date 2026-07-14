@@ -82,6 +82,24 @@ function naturalConfirmation(value: string, direction: string | null): string {
   if (/cvd conflict|delta conflict/.test(normalized)) {
     return "delta alignment";
   }
+  if (/edge score|edge low/.test(normalized)) {
+    return "a sufficient edge score";
+  }
+  if (/volatility block|too volatile|too quiet/.test(normalized)) {
+    return "volatility to return inside the allowed range";
+  }
+  if (/location/.test(normalized)) {
+    return "an acceptable entry location";
+  }
+  if (/session filter|session window/.test(normalized)) {
+    return "the preferred session window";
+  }
+  if (/cooldown|duplicate/.test(normalized)) {
+    return "the duplicate-signal cooldown to clear";
+  }
+  if (/data stale|fresh data/.test(normalized)) {
+    return "fresh market data";
+  }
   if (/\bbos\b|break of structure|structure/.test(normalized)) {
     return "a confirmed break of structure";
   }
@@ -118,6 +136,12 @@ function confirmationConcepts(value: string | null): string[] {
     /cvd|delta/.test(normalized) ? "delta" : null,
     /volume|rvol/.test(normalized) ? "volume" : null,
     /zone/.test(normalized) ? "zone" : null,
+    /edge score|edge low/.test(normalized) ? "edge" : null,
+    /location/.test(normalized) ? "location" : null,
+    /volatility|too volatile|too quiet/.test(normalized) ? "volatility" : null,
+    /session/.test(normalized) ? "session" : null,
+    /cooldown|duplicate/.test(normalized) ? "cooldown" : null,
+    /data stale|fresh data/.test(normalized) ? "data" : null,
   ].filter((concept): concept is string => concept !== null);
 }
 
@@ -194,10 +218,13 @@ export function composeAIBriefing({
   const nextStep = concise(text(data.stage_next_step));
   const invalidation = concise(text(data.stage_invalidation));
 
+  const missingAreConfirmations = missing.every((item) =>
+    /confirmation|alignment|break of structure|reclaim/.test(item)
+  );
   const status = ready
     ? "Setup ready"
     : missing.length || nextStep
-      ? "Waiting for confirmation"
+      ? missing.length && !missingAreConfirmations ? "Waiting for conditions" : "Waiting for confirmation"
       : structure
         ? "Reviewing structure"
         : `Monitoring ${ticker}`;
@@ -248,7 +275,7 @@ export function composeAIBriefing({
       : "I’m holding the current view";
     const changeClause = invalidation
       ? `I would reconsider if ${invalidation}`
-      : "confirmation there would change my current assessment";
+      : "a change there would alter my current assessment";
     sentences.push(sentence(`${watchClause}; ${changeClause}`));
   } else if (sentences.length < 3) {
     sentences.push("I’ll continue monitoring fresh status updates before changing this assessment.");

@@ -191,3 +191,30 @@ test("mentions each natural missing confirmation only once", () => {
   assert.doesNotMatch(result.paragraph, /confirmed break of structure/i);
   assert.match(result.paragraph, /current edge supports moderate confidence/i);
 });
+
+test("deduplicates non-confirmation blockers against the verdict reason", () => {
+  const result = connected({
+    verdict: "WAIT",
+    edge_score: 35,
+    strict_reason: "Edge score is below the required threshold",
+    strict_missing: ["edge_score_low"],
+  });
+  const edgeReason = result.paragraph.match(/edge score is below the required threshold/gi) ?? [];
+
+  assert.equal(edgeReason.length, 1);
+  assert.doesNotMatch(result.paragraph, /sufficient edge score/i);
+  assert.equal(result.status, "Waiting for conditions");
+});
+
+test("describes volatility and location blockers as conditions, not confirmations", () => {
+  const result = connected({
+    verdict: "WAIT",
+    strict_missing: ["volatility_block", "location"],
+  });
+
+  assert.equal(result.status, "Waiting for conditions");
+  assert.match(result.paragraph, /volatility to return inside the allowed range/i);
+  assert.match(result.paragraph, /acceptable entry location/i);
+  assert.doesNotMatch(result.paragraph, /volatility confirmation|location confirmation/i);
+  assert.match(result.paragraph, /a change there would alter my current assessment/i);
+});
