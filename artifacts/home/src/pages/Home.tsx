@@ -111,7 +111,7 @@ function useTTS() {
     // Expand trading abbreviations so TTS reads them naturally instead of spelling
     const cleaned = text
       .replace(/\bBOS\b/g,   'break of structure')
-      .replace(/\bCHOCH\b/g, 'change of character')
+      .replace(/\bCHOCH\b/g, 'structure flip')
       .replace(/\bVWAP\b/gi, 'vee-wap')
       .replace(/\bCVD\b/g,   'cumulative delta')
       .replace(/\bRVOL\b/g,  'relative volume')
@@ -1579,7 +1579,7 @@ const VOICE_BANK: Record<string, string[]> = {
     "Delta's showing some buying interest but volume hasn't confirmed yet.",
     "Demand zone's holding but I need to see buyers defend it with real conviction.",
     "Edge is climbing but I'm still below my entry threshold. Staying patient.",
-    "Seeing a change of character developing. Watching for structure to confirm.",
+    "Structure's starting to shift. Watching for that confirmation signal.",
     "Cumulative delta's improving. If structure breaks, this becomes a real setup.",
     "Price is respecting the key level. Watching how it handles the next test.",
     "Order flow's mixed right now. I want cleaner conviction before acting.",
@@ -1611,7 +1611,7 @@ const VOICE_BANK: Record<string, string[]> = {
     "I can feel this one developing. Waiting for the green light.",
     "All the pieces are moving into place. Just need that final signal.",
     "Break of structure confirmed. Watching for the pullback into the demand zone.",
-    "Change of character detected — sellers are losing control at this level.",
+    "Sellers are losing control at this level. Structure's breaking in our favor.",
     "Structure has shifted. Waiting for the zone to be tagged and hold.",
     "Cumulative delta is showing strong buying pressure. Score's approaching my threshold.",
     "Vee-wap's been reclaimed. Bulls are in control of the intraday move.",
@@ -1691,7 +1691,7 @@ const VOICE_BANK: Record<string, string[]> = {
     "Score's maxed. Direction's clear. Short is live. This is exactly what I train for.",
     "That supply zone rejection was aggressive and clean. Short setup is confirmed.",
     "Sellers absorbed every bid at that level. That's real supply. Short is on.",
-    "Bearish change of character confirmed. Structure flipped. Short has full clearance.",
+    "Structure flipped bearish. Every gate is cleared. Short is fully confirmed.",
     "Nothing's missing on the short side. Score, structure, zone, flow — all confirmed.",
   ],
   ACTIVE: [
@@ -1995,7 +1995,7 @@ const DEMO_NARR: string[][] = [
    'Structure break confirmed with bullish CVD. Setup is beginning to develop.',
    'CHOCH on the five minute. Bias shifts long. Watching for the zone tap.',
    'Structural break is clean. Delta confirming. Edge crossing the threshold.',
-   'Change of character confirmed. Buyers took out the last swing high.',
+   'Buyers took out the last swing high. Structure has shifted bullish.',
    'BOS with above-average volume. Institutions may be accumulating.',
    'Structure aligned. CVD cooperating. One more confirmation and this is live.'],
   // Phase 3 — zone + sweep
@@ -2702,6 +2702,10 @@ export default function Home() {
     .action-btn { transition:all 0.2s; }
     .action-btn:hover:not(:disabled) { filter:brightness(1.15); }
     .sidebar-panel { animation:slideIn 0.18s ease-out; }
+    /* AI Memory pushed to very bottom of main-center flex column */
+    .ai-mem-panel { order:100; }
+    /* Live chart in brain panel */
+    .mb-chart { width:100%; flex-shrink:0; }
     @media(max-width:760px){.sidebar-l{display:none!important;}}
     @media(max-width:768px){
       /* ── VERTICAL SCROLL COCKPIT — pig hero at top, all panels accessible ── */
@@ -3734,6 +3738,24 @@ export default function Home() {
                 </div>
               )}
 
+              {/* ── LIVE CHART — 1-min, inline in brain panel ─────────────── */}
+              <div className="mb-chart" style={{ border:'1px solid rgba(255,255,255,0.042)', borderRadius:10, overflow:'hidden' }}>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                  padding:'8px 14px', background:'rgba(255,255,255,0.018)' }}>
+                  <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.08em',
+                    color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>{ticker} · 1m</span>
+                  <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                    {data?.vwap_value    && <span style={{ color:'#60a5fa', fontSize:10.5, fontFamily:'monospace' }}>VWAP {fmt(data.vwap_value)}</span>}
+                    {data?.nearest_demand && <span style={{ color:BULL,     fontSize:10.5, fontFamily:'monospace' }}>D {fmt(data.nearest_demand)}</span>}
+                    {data?.nearest_supply && <span style={{ color:BEAR,     fontSize:10.5, fontFamily:'monospace' }}>S {fmt(data.nearest_supply)}</span>}
+                  </div>
+                </div>
+                <div style={{ height:160, padding:'8px 12px 10px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
+                  <CandleChart candles={chartSnap} vwap={data?.vwap_value}
+                    demand={data?.nearest_demand} supply={data?.nearest_supply} ticker={ticker} />
+                </div>
+              </div>
+
               {/* ── SUGGESTED TRADE ─ shown when edge ≥ 65 and a plan exists ── */}
               {edge >= 65 && !isManaging && (() => {
                 const tpEntry  = Number(tp.entry    || 0);
@@ -3872,24 +3894,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* ── LIVE CHART ───────────────────────────────────────────────── */}
-          <div style={{ border:'1px solid rgba(255,255,255,0.042)', borderRadius:10, overflow:'hidden', marginBottom:10 }}>
-            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-              padding:'8px 14px', background:'rgba(255,255,255,0.018)' }}>
-              <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.08em',
-                color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>{ticker} Chart · 1m</span>
-              <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                {data?.vwap_value   && <span style={{ color:'#60a5fa', fontSize:10.5, fontFamily:'monospace' }}>VWAP {fmt(data.vwap_value)}</span>}
-                {data?.nearest_demand && <span style={{ color:BULL, fontSize:10.5, fontFamily:'monospace' }}>D {fmt(data.nearest_demand)}</span>}
-                {data?.nearest_supply && <span style={{ color:BEAR, fontSize:10.5, fontFamily:'monospace' }}>S {fmt(data.nearest_supply)}</span>}
-              </div>
-            </div>
-            <div style={{ height:180, padding:'8px 12px 10px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
-              <CandleChart candles={chartSnap} vwap={data?.vwap_value}
-                demand={data?.nearest_demand} supply={data?.nearest_supply} ticker={ticker} />
-            </div>
-          </div>
-
           {/* ── INTELLIGENCE STRIP ──────────────────────────────────────── */}
           <div className="intel-strip" style={{ display:'flex', gap:8, marginBottom:16, flexWrap:'nowrap', minWidth:0 }}>
 
@@ -3948,8 +3952,8 @@ export default function Home() {
 
           </div>
 
-          {/* ── AI MEMORY & PERFORMANCE ──────────────────────────────────── */}
-          <div style={{ marginBottom:14, borderRadius:10, overflow:'hidden',
+          {/* ── AI MEMORY & PERFORMANCE ── ordered to bottom via CSS ───── */}
+          <div className="ai-mem-panel" style={{ marginBottom:14, borderRadius:10, overflow:'hidden',
             border:'1px solid rgba(255,255,255,0.055)', background:'rgba(5,8,18,0.55)' }}>
             {/* Panel header */}
             <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
