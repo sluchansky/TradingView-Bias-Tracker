@@ -2491,9 +2491,43 @@ export default function Home() {
   useEffect(() => { avStateRef.current = avState; }, [avState]);
   useEffect(() => { cockpitRef.current = { data, edge, avState }; }, [data, edge, avState]);
   useEffect(() => { setIdleLineRef.current = setIdleLine; }, [setIdleLine]);
-  // Ambient chatter removed — it was the source of the "second voice" because its
-  // independent timer fired speak() concurrently with the narration useEffect.
-  // The avatar now speaks only on narration changes (poll-driven) and chat replies.
+  // 10-second chatter timer — cycles through VOICE_BANK lines for the current state.
+  // Silence guard (speechCtrlRef.current.active + 8s cooldown) prevents the "two voices"
+  // double-speak that caused the original removal of ambient chatter.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const ctrl = speechCtrlRef.current;
+      if (ctrl?.active) return;                          // already talking — skip
+      if (Date.now() - lastSpokeAtRef.current < 8000) return; // spoke too recently
+      const st = avStateRef.current;
+      // Let the server-driven narration dominate during high-signal moments
+      if (['READY_LONG', 'READY_SHORT'].includes(st)) return;
+      const { data: d, edge: eg } = cockpitRef.current;
+      const px = Number((d as any)?.price || 0);
+      const vw = Number((d as any)?.vwap_value || 0);
+      let line = '';
+      // 35% of the time: inject a live-data contextual observation
+      if (d && Math.random() < 0.35 && px > 0 && vw > 0) {
+        const side = px > vw ? 'above' : 'below';
+        const pts  = Math.abs(px - vw).toFixed(1);
+        const pool = [
+          `Price is ${pts} points ${side} vee-wap at ${fmt(px)}.`,
+          `Edge sits at ${Math.round(eg)} right now. ${eg >= 65 ? 'Getting close.' : eg >= 45 ? 'Setup is building.' : 'Still watching.'}`,
+          `We are ${side} vee-wap. ${px > vw ? 'Intraday bias is bullish.' : 'Intraday bias is bearish.'}`,
+          `Vee-wap is at ${fmt(vw)}. Price is ${pts} points ${side} it.`,
+          eg >= 50 ? `Edge is at ${Math.round(eg)} — conditions are improving.` : `Edge at ${Math.round(eg)}. Not there yet.`,
+        ];
+        line = pool[Math.floor(Math.random() * pool.length)];
+      }
+      if (!line) line = pickVoiceLine(st);
+      if (!line) return;
+      setIdleLineRef.current(line);
+      lastSpokeAtRef.current = Date.now();
+      lastSpokenRef.current  = line;
+      speakRef.current(line);
+    }, 10000);
+    return () => clearInterval(id);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Detect market events → fire a gaze direction that drives eye movement
   useEffect(() => {
