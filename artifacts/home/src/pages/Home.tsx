@@ -2192,7 +2192,7 @@ export default function Home() {
   // chartSnap is a proper React state copy of candlesRef — ensures CandleChart always re-renders with fresh data
   const [chartSnap, setChartSnap] = useState<Candle[]>([]);
   const speakRef          = useRef<(t: string) => void>(() => {});
-  const lastSpokenRef     = useRef('');
+  const lastSpokenRef     = useRef<string[]>([]); // ring of last 4 lines — dedup guard
   const lastSpokeAtRef    = useRef(0);
   const askVoiceRef       = useRef<(t: string) => void>(() => {});
   const voiceListeningRef = useRef(false);
@@ -2469,8 +2469,8 @@ export default function Home() {
   })();
 
   useEffect(() => {
-    if (narration && narration !== lastSpokenRef.current) {
-      lastSpokenRef.current = narration;
+    if (narration && !lastSpokenRef.current.includes(narration)) {
+      lastSpokenRef.current = [narration, ...lastSpokenRef.current].slice(0, 4);
       setIdleLine(''); // real narration takes over the display (always update text)
       // Don't cancel ongoing speech just because narration text changed —
       // let the avatar finish what it's saying, then the next unique narration will play.
@@ -2519,11 +2519,18 @@ export default function Home() {
         ];
         line = pool[Math.floor(Math.random() * pool.length)];
       }
-      if (!line) line = pickVoiceLine(st);
+      // Try up to 3 picks to avoid repeating a recently-spoken line
+      if (!line) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const candidate = pickVoiceLine(st);
+          if (!lastSpokenRef.current.includes(candidate)) { line = candidate; break; }
+          line = candidate; // fall back to last attempt rather than silencing
+        }
+      }
       if (!line) return;
       setIdleLineRef.current(line);
       lastSpokeAtRef.current = Date.now();
-      lastSpokenRef.current  = line;
+      lastSpokenRef.current  = [line, ...lastSpokenRef.current].slice(0, 4);
       speakRef.current(line);
     }, 10000);
     return () => clearInterval(id);
@@ -3412,7 +3419,7 @@ export default function Home() {
                         <button onClick={() => {
                           unlockAudio();
                           setMuted(!muted);
-                          if (muted) lastSpokenRef.current = ''; // re-speak next narration
+                          if (muted) lastSpokenRef.current = []; // re-speak next narration
                         }} style={{
                           background:'rgba(255,255,255,0.07)', border:'1px solid rgba(255,255,255,0.14)',
                           borderRadius:20, padding:'4px 14px', cursor:'pointer',
