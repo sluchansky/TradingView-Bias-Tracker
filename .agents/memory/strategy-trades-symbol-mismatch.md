@@ -16,22 +16,21 @@ ingestion started persisting the raw `1!` form.
 clearly trading. The trades ARE in the table — the read just doesn't match the stored
 symbol. Confirm with a prod read-replica `SELECT symbol, count(*) ... GROUP BY symbol`.
 
-**Rule:** any PER-SYMBOL read of `strategy_trades` must canonicalize both sides, not
-string-compare raw symbols. The equity-curve read fetches today's rows then filters in
-Python with the STRICT resolver `_instrument_from_text(row.symbol) == instrument_of(ticker)`
-— strict (not lenient `instrument_of`) on the ROW symbol so a blank/ambiguous symbol is
-SKIPPED, never lenient-defaulted into the MGC curve.
+**Fix (applied):** `_record_strategy_trade` now canonicalizes at INSERT with
+`_instrument_from_text() or instrument_of()` as fallback — so `MNQ1!` stores as `MNQ`.
+The equity curve SELECT filter also has a second clause: if the strict `_instrument_from_text`
+fails, it falls back to `instrument_of(row.symbol) == _want` so old `1!` rows are still
+matched.
 
-**Why strict on the row:** `instrument_of()` defaults unknown/blank → MGC (DEFAULT_INSTRUMENT),
-which would fold stray rows into the MGC tab. `_instrument_from_text()` returns None for
-blank/ambiguous/unknown. `enabled_instruments()` includes all four even when a contract is
-"SHIP DISABLED" (that's an execution kill-switch, not a registry removal), so `MES1!`→MES.
+**Rule:** any PER-SYMBOL read of `strategy_trades` must canonicalize both sides. The strict
+resolver `_instrument_from_text()` returns None for blank/ambiguous; `instrument_of()` is
+lenient and falls back to DEFAULT_INSTRUMENT (MGC) for blank/unknown — only use it when the
+symbol is known non-empty and when an MGC fallback is acceptable.
 
 **Blast radius:** as of this writing ONLY the equity-curve read filters by symbol; all
 learning-engine / session-analytics reads are GLOBAL (no symbol filter), so the raw-vs-
 canonical drift does NOT fragment them. If you add a new per-symbol read, canonicalize it
-too. Cleaner long-term: normalize the symbol to canonical at WRITE time (left as-is here to
-keep the change display-only and avoid shifting learning grouping).
+too.
 
 # get_setup_stage is global + MGC/MNQ-centric (display-only)
 

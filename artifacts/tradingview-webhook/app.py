@@ -125,6 +125,7 @@ AUTO_PRICE_BY_TICKER = {}      # {"MNQ": {"value": float, "ts": iso8601}}
 # compare-and-clear by opened_at so a newer trade is never wiped).
 ACTIVE_TRADES_BY_INST = {}                 # inst -> single trade dict
 ACTIVE_TRADES_LOCK    = threading.RLock()
+ACTIVE_TRADES_DB_READY = False             # set by _check_active_trades_db_ready at boot
 # Retained (now unused): historical ENTER serialisation lock. Writes now go
 # through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
@@ -163,7 +164,8 @@ def set_active_trade(inst, trade, overwrite=True):
         if not overwrite and inst in ACTIVE_TRADES_BY_INST:
             return False
         ACTIVE_TRADES_BY_INST[inst] = trade
-        return True
+    _persist_active_trade(inst, trade)     # write-through; outside lock; fail-open
+    return True
 
 
 def clear_active_trade(inst, opened_at=None):
@@ -173,13 +175,17 @@ def clear_active_trade(inst, opened_at=None):
     (e.g. a re-entry after a stop-out) is never wiped by a stale clear."""
     if not inst:
         return None
+    popped = None
     with ACTIVE_TRADES_LOCK:
         cur = ACTIVE_TRADES_BY_INST.get(inst)
         if cur is None:
             return None
         if opened_at is not None and cur.get("opened_at") != opened_at:
             return None
-        return ACTIVE_TRADES_BY_INST.pop(inst, None)
+        popped = ACTIVE_TRADES_BY_INST.pop(inst, None)
+    if popped is not None:
+        _persist_active_trade(inst, None)  # delete from DB; outside lock; fail-open
+    return popped
 
 
 def active_trade_snapshot():
@@ -10951,7 +10957,8 @@ def _record_strategy_trade(mt):
             opened_at,
             closed_at,
             (_instrument_from_text(mt.get("symbol") or mt.get("instrument"))
-             or mt.get("symbol") or mt.get("instrument")),
+             or (instrument_of(mt.get("symbol") or mt.get("instrument"))
+                 if (mt.get("symbol") or mt.get("instrument")) else None)),
             ctx.get("strategy_key"),
             ctx.get("strategy") or "Unknown",
             ctx.get("regime") or "UNKNOWN",
@@ -12633,7 +12640,10 @@ def get_today_equity_curve(ticker):
         # symbols: it returns None for blank/ambiguous/unknown, so a malformed row is
         # SKIPPED rather than lenient-defaulted into the MGC curve. Display-only.
         _want = instrument_of(ticker)
-        rows = [r for r in rows if _instrument_from_text(r.get("symbol")) == _want]
+        rows = [r for r in rows if (
+            _instrument_from_text(r.get("symbol")) == _want
+            or (instrument_of(r.get("symbol") or "") == _want
+                if r.get("symbol") else False))]
         points, cum, wins, losses = [], 0.0, 0, 0
         realism_used = False
         for r in rows:
@@ -24723,6 +24733,99 @@ def _load_swing_theses_from_db():
         logger.info("SWING theses restored from DB: %d open", restored)
     except Exception as exc:
         logger.warning("swing thesis load failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Active-trade open-position persistence (survive restart / republish) ──────
+def _check_active_trades_db_ready():
+    """Probe the open_trades table (no DDL) and set ACTIVE_TRADES_DB_READY. FAIL-OPEN:
+    a missing table / unavailable DB disables position persistence (in-memory only)."""
+    global ACTIVE_TRADES_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM open_trades LIMIT 1")
+            cur.fetchone()
+        ACTIVE_TRADES_DB_READY = True
+        logger.info("open_trades table ready")
+    except Exception as exc:
+        logger.warning("open_trades table unavailable (active-trade persistence disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_active_trade(inst, trade):
+    """Upsert (trade dict) or delete (trade=None) the open_trades row for `inst`.
+    Called from set_active_trade (upsert) and clear_active_trade (delete).
+    Offloaded to the slow-task worker so it never holds ACTIVE_TRADES_LOCK. FAIL-OPEN."""
+    if not ACTIVE_TRADES_DB_READY or not inst:
+        return
+    snapshot = _swing_json_safe(dict(trade)) if trade else None
+
+    def _task():
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                if snapshot is None:
+                    cur.execute("DELETE FROM open_trades WHERE inst = %s", (inst,))
+                else:
+                    cur.execute(
+                        """INSERT INTO open_trades (inst, payload, opened_at)
+                           VALUES (%s, %s, %s)
+                           ON CONFLICT (inst)
+                           DO UPDATE SET payload    = EXCLUDED.payload,
+                                         opened_at  = EXCLUDED.opened_at,
+                                         updated_at = now()""",
+                        (inst, psycopg2.extras.Json(snapshot), snapshot.get("opened_at")),
+                    )
+        except Exception as exc:
+            logger.warning("active trade persist failed (%s): %s", inst, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _enqueue_slow(_task)
+
+
+def _load_active_trades_from_db():
+    """Rehydrate open active trades from Postgres at boot. INERT — populates
+    ACTIVE_TRADES_BY_INST directly without firing any alert, journal, or broker
+    side-effect. FAIL-OPEN."""
+    if not ACTIVE_TRADES_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT inst, payload FROM open_trades")
+            rows = cur.fetchall()
+        restored = 0
+        with ACTIVE_TRADES_LOCK:
+            for (inst, payload) in rows:
+                if not inst or not isinstance(payload, dict):
+                    continue
+                ACTIVE_TRADES_BY_INST[inst] = payload
+                restored += 1
+        if restored:
+            logger.info("Active trades restored from DB: %d", restored)
+    except Exception as exc:
+        logger.warning("active trades load failed: %s", exc)
     finally:
         try:
             conn.close()
@@ -53981,6 +54084,8 @@ if __name__ == "__main__":
         if _swing_htf_enabled():                   # SWING flag-on only — SCALP boot stays untouched
             _check_swing_thesis_db_ready()         # probe swing_theses (no DDL; table created via DB tool/publish diff)
             _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher
+        _check_active_trades_db_ready()            # probe open_trades (no DDL; created via DB tool/publish diff)
+        _load_active_trades_from_db()              # rehydrate open active positions (INERT) BEFORE the webhook worker
         _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
         _load_manual_trades_from_db()              # rehydrate open ADVISORY-ONLY manual positions (display monitor)
         _check_main_brain_events_db_ready()        # probe main_brain_events (no DDL; created via DB tool/publish diff)
