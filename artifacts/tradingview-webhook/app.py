@@ -759,21 +759,21 @@ MODES = {
         #    required, so trend continuation fires without a zone reaction. SWING
         #    keeps the strict zone AND vwap AND structure AND edge>=80 behaviour
         #    exactly.
-        #    READY bands: a HALF-SIZE EARLY entry fires at Edge 50-59
+        #    READY bands: a HALF-SIZE EARLY entry fires at Edge 60-69
         #    (EDGE_READY_THRESHOLD .. EDGE_FULL_READY_THRESHOLD) and a FULL-SIZE READY
-        #    at Edge >= 60 (EDGE_FULL_READY_THRESHOLD); below 50 it WAITs. This is the
-        #    "get in early, smaller" scalp behaviour — the full-size quality bar (60)
-        #    is unchanged. EDGE_STRONG_THRESHOLD (75) only upgrades the LABEL ("Strong
-        #    Trade" / "Strong READY"); it never changes the READY decision. SETUP
-        #    BUILDING (informational, NON-actionable) fills the Edge 40-49 band when a
-        #    valid zone + confirming structure are present but the Edge is still
-        #    climbing to the EARLY floor (EDGE_SETUP_BUILDING_THRESHOLD .. EDGE_READY_THRESHOLD).
+        #    at Edge >= 70 (grade A minimum). Edge 50-59 is now informational SETUP
+        #    BUILDING only — no auto-execution at that level. Tightened from the
+        #    original 50/60 bands to require at least grade A for full-size execution
+        #    and grade B upper half for any execution. EDGE_STRONG_THRESHOLD (80) only
+        #    upgrades the LABEL ("Strong Trade" / "Strong READY"); it never changes the
+        #    READY decision. SETUP BUILDING fills the Edge 50-59 band — visible on
+        #    the dashboard but non-actionable.
         #    location & CVD-conflict are SOFT score modifiers in SCALP (see
         #    GATE_SOFT_MODIFIERS), not hard blocks. ──
-        "EDGE_READY_THRESHOLD":          50,   # actionable floor: Edge 50-59 = half-size EARLY
-        "EDGE_FULL_READY_THRESHOLD":     60,   # full-size READY floor (Edge >= 60)
-        "EDGE_STRONG_THRESHOLD":         75,   # label-only: "Strong Trade" / "Strong READY"
-        "EDGE_SETUP_BUILDING_THRESHOLD": 40,   # informational SETUP BUILDING band floor (< EARLY)
+        "EDGE_READY_THRESHOLD":          60,   # actionable floor: Edge 60-69 = half-size EARLY
+        "EDGE_FULL_READY_THRESHOLD":     70,   # full-size READY floor (Edge >= 70, grade A)
+        "EDGE_STRONG_THRESHOLD":         80,   # label-only: "Strong Trade" / "Strong READY"
+        "EDGE_SETUP_BUILDING_THRESHOLD": 50,   # informational SETUP BUILDING band floor (< EARLY)
         "GATE_REQUIRE_VWAP":      True,    # VWAP confirmation is a hard READY requirement
         "GATE_REQUIRE_STRUCTURE": True,    # structure is a hard READY requirement
         "GATE_REQUIRE_ZONE":      False,   # zone DEMOTED to a confirmation — structure+VWAP+Edge fire alone; zone state only informs/accelerates
