@@ -2,7 +2,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 // Fast Entry Trigger -> Webhook  (MGC / MNQ / MES / MYM)
 //
-// SECONDS (1s / 5s) micro-event source for the bot's optional "Fast Entry
+// SECONDS (5s) micro-event source for the bot's optional "Fast Entry
 // Trigger" layer. This script does NOT make trade decisions — it only reports
 // tight, fast micro events. The webhook app combines them with the EXISTING
 // higher-timeframe strict setup and ONLY sharpens entry timing when that HTF
@@ -12,55 +12,47 @@
 //
 // Emits these exact alert_type strings (instrument resolved via `ticker`):
 //   SWEEP_RECLAIM_LONG  / SWEEP_RECLAIM_SHORT   (micro sweep + reclaim)
-//   DELTA_FLIP_BULLISH  / DELTA_FLIP_BEARISH    (signed-volume momentum flip)
-//   MICRO_VWAP_RECLAIM  / MICRO_VWAP_LOSS       (price crosses session VWAP)
 //   MICRO_CHOCH_LONG    / MICRO_CHOCH_SHORT      (micro structure break)
-//   FAST_SECONDS_BAR                             (optional directionless ref bar)
+//   DELTA_FLIP_BULLISH  / DELTA_FLIP_BEARISH     (signed-volume momentum flip)
+//   MICRO_VWAP_RECLAIM  / MICRO_VWAP_LOSS        (price crosses session VWAP)
+//
+// RATE-LIMIT DESIGN: At most ONE alert() per bar, using priority order:
+//   Sweep+Reclaim > Micro CHOCH > Delta Flip > VWAP cross
+// This prevents TradingView's "Too many triggering" stop.
+// Each type also has a per-bar cooldown (default 3 bars) before it can
+// re-fire, further reducing noise.
 //
 // NOTE: Alert types are UN-PREFIXED. The server resolves the instrument from
 // the `ticker` field (syminfo.ticker = "MGC1!", "MNQ1!", etc.). Do NOT add an
 // instrument prefix to the alert_type — it will be rejected as unrecognized.
 //
-// SETUP (do once per instrument per timeframe):
-//   1. Open a SECONDS chart (1s or 5s recommended) for one of:
-//        MGC1!   MNQ1!   MES1!   MYM1!
+// SETUP (do once per instrument):
+//   1. Open a 5s chart for one of: MGC1!  MNQ1!  MES1!  MYM1!
 //   2. Add this indicator (Pine Script → Add to chart).
 //   3. Open Alerts panel → Create Alert:
 //        Condition : Fast Entry Trigger → "Any alert() function call"
-//        Webhook   : your bot webhook URL  (same URL as your other alerts)
+//        Webhook   : https://myaitradingpartner.com/api/webhook
 //        Message   : leave blank / default  (script supplies the JSON)
 //        Frequency : "Once Per Bar Close"
 //   4. Save the alert. Repeat for each instrument you trade.
 //   5. Enable FAST_ENTRY_TRIGGER=1 on the bot (Secrets / env vars).
-//
-// TUNING TIPS:
-//   • On 1s bars: lower swLeft/swRight (e.g. 4 / 1) and chLeft/chRight (3/1)
-//     to catch tighter micro pivots before they mature.
-//   • On 5s bars: defaults (6/2, 5/2) work well and produce less noise.
-//   • deltaLen 8 is a good starting EMA length; lower = more sensitive.
-//   • "Emit FAST SECONDS BAR" is OFF by default — only enable it if you want
-//     per-bar hi/lo/vwap snapshots on the server (adds webhook traffic).
 // ───────────────────────────────────────────────────────────────────────────
 indicator("Fast Entry Trigger -> Webhook (MGC/MNQ/MES/MYM)", overlay=true)
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
-swLeft    = input.int(6, "Micro swing left bars",  minval=1,
-             tooltip="Bars to the left of a swing pivot. Lower on 1s charts (try 4).")
-swRight   = input.int(2, "Micro swing right bars", minval=1,
-             tooltip="Bars to the right confirming a swing pivot. Lower on 1s (try 1).")
-deltaLen  = input.int(8, "Delta momentum EMA length", minval=1,
-             tooltip="EMA of signed-volume. Shorter = more sensitive to delta flips.")
-chLeft    = input.int(5, "Micro CHOCH left bars",  minval=1)
-chRight   = input.int(2, "Micro CHOCH right bars", minval=1)
-emitBar   = input.bool(false, "Emit FAST_SECONDS_BAR each bar (adds webhook traffic)")
-showMarks = input.bool(true,  "Show micro event markers on chart")
+swLeft    = input.int(6,  "Micro swing left bars",        minval=1)
+swRight   = input.int(2,  "Micro swing right bars",       minval=1)
+deltaLen  = input.int(8,  "Delta momentum EMA length",    minval=1)
+chLeft    = input.int(5,  "Micro CHOCH left bars",        minval=1)
+chRight   = input.int(2,  "Micro CHOCH right bars",       minval=1)
+cooldown  = input.int(3,  "Min bars between same-type alerts", minval=1,
+             tooltip="Suppresses the same event type firing on consecutive bars. Raise to reduce noise.")
+showMarks = input.bool(true, "Show micro event markers on chart")
 
 // ── Session VWAP ─────────────────────────────────────────────────────────────
 vwapVal = ta.vwap(hlc3)
 
 // ── Micro swing levels (for sweep + reclaim) ─────────────────────────────────
-// A bullish sweep: price dips BELOW the latest micro low and closes back ABOVE it.
-// A bearish sweep: price pops ABOVE the latest micro high and closes back BELOW it.
 var float swHigh = na
 var float swLow  = na
 ph = ta.pivothigh(high, swLeft, swRight)
@@ -73,8 +65,6 @@ if not na(pl)
 bullReclaim = not na(swLow)  and low  < swLow  and close > swLow
 bearReclaim = not na(swHigh) and high > swHigh and close < swHigh
 
-// Deduplicate: only fire once per unique level (prevents repeat alerts on the
-// same bar when multiple conditions are true simultaneously).
 var float lastBullLvl = na
 var float lastBearLvl = na
 bullSweepFire = bullReclaim and (na(lastBullLvl) or swLow  != lastBullLvl)
@@ -84,25 +74,17 @@ if bullSweepFire
 if bearSweepFire
     lastBearLvl := swHigh
 
-// ── Delta flip (approximate signed-volume momentum crossing zero) ─────────────
-// Uses EMA of signed bar volume as a proxy for cumulative delta momentum.
-// A bullish flip = the momentum EMA crosses above zero.
-// A bearish flip = the momentum EMA crosses below zero.
+// ── Delta flip ────────────────────────────────────────────────────────────────
 sgnVol   = close > open ? volume : close < open ? -volume : 0.0
 deltaMom = ta.ema(sgnVol, deltaLen)
 deltaBull = ta.crossover(deltaMom,  0)
 deltaBear = ta.crossunder(deltaMom, 0)
 
 // ── Micro VWAP reclaim / loss ─────────────────────────────────────────────────
-// Crossover = price reclaims VWAP from below (bullish).
-// Crossunder = price loses VWAP from above (bearish).
 vwapReclaim = ta.crossover(close,  vwapVal)
 vwapLoss    = ta.crossunder(close, vwapVal)
 
-// ── Micro CHOCH (break of the latest micro structure pivot) ───────────────────
-// A separate, tighter pivot set for structure breaks on the seconds TF.
-// Bullish CHOCH = close breaks above the latest micro swing high.
-// Bearish CHOCH = close breaks below the latest micro swing low.
+// ── Micro CHOCH ───────────────────────────────────────────────────────────────
 var float chHigh = na
 var float chLow  = na
 cph = ta.pivothigh(high, chLeft, chRight)
@@ -114,57 +96,87 @@ if not na(cpl)
 chochLong  = not na(chHigh) and ta.crossover(close,  chHigh)
 chochShort = not na(chLow)  and ta.crossunder(close, chLow)
 
-// ── Webhook payloads ──────────────────────────────────────────────────────────
-// IMPORTANT: alert_type is UN-PREFIXED. The server resolves the instrument
-// from the `ticker` field (syminfo.ticker). Do not add "MGC " or similar.
+// ── Per-type cooldown tracking ────────────────────────────────────────────────
+// Tracks the bar_index when each type last fired. Suppresses re-fires within
+// `cooldown` bars to prevent rapid-fire duplicates and TradingView rate-limits.
+var int lastBullSweepBar  = -999
+var int lastBearSweepBar  = -999
+var int lastDeltaBullBar  = -999
+var int lastDeltaBearBar  = -999
+var int lastVwapReclaimBar = -999
+var int lastVwapLossBar   = -999
+var int lastChochLongBar  = -999
+var int lastChochShortBar = -999
+
+bullSweepReady  = bullSweepFire  and (bar_index - lastBullSweepBar)  >= cooldown
+bearSweepReady  = bearSweepFire  and (bar_index - lastBearSweepBar)  >= cooldown
+deltaBullReady  = deltaBull      and (bar_index - lastDeltaBullBar)  >= cooldown
+deltaBearReady  = deltaBear      and (bar_index - lastDeltaBearBar)  >= cooldown
+vwapReclaimReady = vwapReclaim   and (bar_index - lastVwapReclaimBar) >= cooldown
+vwapLossReady   = vwapLoss       and (bar_index - lastVwapLossBar)   >= cooldown
+chochLongReady  = chochLong      and (bar_index - lastChochLongBar)  >= cooldown
+chochShortReady = chochShort     and (bar_index - lastChochShortBar) >= cooldown
+
+// ── Single alert per bar (priority: Sweep > CHOCH > Delta > VWAP) ────────────
+// Only the highest-priority event fires. This guarantees at most 1 webhook
+// per bar, preventing TradingView's "Too many triggering" stop.
 f_msg(t) =>
-    '{"alert_type":"' + t + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close, "#.####") + '}'
+    '{"alert_type":"' + t + '","ticker":"' + syminfo.ticker
+    + '","price":' + str.tostring(close, "#.####") + '}'
 
-if bullSweepFire
-    alert(f_msg("SWEEP_RECLAIM_LONG"),  alert.freq_once_per_bar_close)
-if bearSweepFire
-    alert(f_msg("SWEEP_RECLAIM_SHORT"), alert.freq_once_per_bar_close)
-if deltaBull
-    alert(f_msg("DELTA_FLIP_BULLISH"),  alert.freq_once_per_bar_close)
-if deltaBear
-    alert(f_msg("DELTA_FLIP_BEARISH"),  alert.freq_once_per_bar_close)
-if vwapReclaim
-    alert(f_msg("MICRO_VWAP_RECLAIM"),  alert.freq_once_per_bar_close)
-if vwapLoss
-    alert(f_msg("MICRO_VWAP_LOSS"),     alert.freq_once_per_bar_close)
-if chochLong
-    alert(f_msg("MICRO_CHOCH_LONG"),    alert.freq_once_per_bar_close)
-if chochShort
-    alert(f_msg("MICRO_CHOCH_SHORT"),   alert.freq_once_per_bar_close)
+var int lastAlertBar = -999
 
-// Optional per-bar reference (hi / lo / vwap snapshot, directionless).
-// Enable only if you want the server to track micro price structure per-bar.
-if emitBar
-    alert(
-     '{"alert_type":"FAST_SECONDS_BAR","ticker":"' + syminfo.ticker
-     + '","price":'  + str.tostring(close, "#.####")
-     + ',"high":'    + str.tostring(high,  "#.####")
-     + ',"low":'     + str.tostring(low,   "#.####")
-     + ',"vwap":'    + str.tostring(vwapVal, "#.####") + '}',
-     alert.freq_once_per_bar_close)
+if bar_index > lastAlertBar  // only one alert per bar total
+    if bullSweepReady
+        alert(f_msg("SWEEP_RECLAIM_LONG"),  alert.freq_once_per_bar_close)
+        lastBullSweepBar := bar_index
+        lastAlertBar     := bar_index
+    else if bearSweepReady
+        alert(f_msg("SWEEP_RECLAIM_SHORT"), alert.freq_once_per_bar_close)
+        lastBearSweepBar := bar_index
+        lastAlertBar     := bar_index
+    else if chochLongReady
+        alert(f_msg("MICRO_CHOCH_LONG"),    alert.freq_once_per_bar_close)
+        lastChochLongBar := bar_index
+        lastAlertBar     := bar_index
+    else if chochShortReady
+        alert(f_msg("MICRO_CHOCH_SHORT"),   alert.freq_once_per_bar_close)
+        lastChochShortBar := bar_index
+        lastAlertBar      := bar_index
+    else if deltaBullReady
+        alert(f_msg("DELTA_FLIP_BULLISH"),  alert.freq_once_per_bar_close)
+        lastDeltaBullBar := bar_index
+        lastAlertBar     := bar_index
+    else if deltaBearReady
+        alert(f_msg("DELTA_FLIP_BEARISH"),  alert.freq_once_per_bar_close)
+        lastDeltaBearBar := bar_index
+        lastAlertBar     := bar_index
+    else if vwapReclaimReady
+        alert(f_msg("MICRO_VWAP_RECLAIM"),  alert.freq_once_per_bar_close)
+        lastVwapReclaimBar := bar_index
+        lastAlertBar       := bar_index
+    else if vwapLossReady
+        alert(f_msg("MICRO_VWAP_LOSS"),     alert.freq_once_per_bar_close)
+        lastVwapLossBar := bar_index
+        lastAlertBar    := bar_index
 
 // ── Visual markers ────────────────────────────────────────────────────────────
-plotshape(showMarks and bullSweepFire, title="Sweep+Reclaim Long",
+plotshape(showMarks and bullSweepFire,  title="Sweep+Reclaim Long",
  style=shape.triangleup,   location=location.belowbar,
  color=color.new(color.lime,   0), size=size.tiny, text="SR↑")
-plotshape(showMarks and bearSweepFire, title="Sweep+Reclaim Short",
+plotshape(showMarks and bearSweepFire,  title="Sweep+Reclaim Short",
  style=shape.triangledown, location=location.abovebar,
  color=color.new(color.red,    0), size=size.tiny, text="SR↓")
-plotshape(showMarks and deltaBull, title="Delta Flip Bullish",
+plotshape(showMarks and deltaBull,      title="Delta Flip Bullish",
  style=shape.circle, location=location.belowbar,
  color=color.new(color.aqua,   0), size=size.tiny, text="Δ↑")
-plotshape(showMarks and deltaBear, title="Delta Flip Bearish",
+plotshape(showMarks and deltaBear,      title="Delta Flip Bearish",
  style=shape.circle, location=location.abovebar,
  color=color.new(color.orange, 0), size=size.tiny, text="Δ↓")
-plotshape(showMarks and chochLong,  title="Micro CHOCH Long",
+plotshape(showMarks and chochLong,      title="Micro CHOCH Long",
  style=shape.labelup,   location=location.belowbar,
  color=color.new(color.teal,   0), size=size.tiny, text="CH↑")
-plotshape(showMarks and chochShort, title="Micro CHOCH Short",
+plotshape(showMarks and chochShort,     title="Micro CHOCH Short",
  style=shape.labeldown, location=location.abovebar,
  color=color.new(color.maroon, 0), size=size.tiny, text="CH↓")
 plot(vwapVal, title="Session VWAP", color=color.new(color.yellow, 20), linewidth=1)
