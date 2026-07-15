@@ -11314,6 +11314,40 @@ def _recompute_learning():
         conn = _learning_conn()
         if conn is None:
             return
+        # ── One-shot boot migration: normalize any raw TV continuous-contract
+        # symbols (e.g. MGC1!, MNQ1!) to canonical names (MGC, MNQ) so the
+        # per-instrument eligibility lookup keys always match. Idempotent:
+        # after the first run no rows satisfy the WHERE clause.
+        try:
+            mig_cur = conn.cursor()
+            mig_cur.execute("""
+                UPDATE strategy_trades
+                SET symbol = CASE symbol
+                    WHEN 'MGC1!' THEN 'MGC'
+                    WHEN 'MGC2!' THEN 'MGC'
+                    WHEN 'MNQ1!' THEN 'MNQ'
+                    WHEN 'MNQ2!' THEN 'MNQ'
+                    WHEN 'MES1!' THEN 'MES'
+                    WHEN 'MES2!' THEN 'MES'
+                    WHEN 'MYM1!' THEN 'MYM'
+                    WHEN 'MYM2!' THEN 'MYM'
+                    WHEN 'GC1!'  THEN 'MGC'
+                    WHEN 'NQ1!'  THEN 'MNQ'
+                    ELSE symbol
+                END
+                WHERE symbol LIKE '%!'
+            """)
+            if mig_cur.rowcount:
+                logger.info("symbol migration: normalized %d strategy_trades rows",
+                            mig_cur.rowcount)
+            conn.commit()
+            mig_cur.close()
+        except Exception as _mig_exc:
+            logger.warning("symbol migration skipped: %s", _mig_exc)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT COALESCE(trading_mode, 'UNKNOWN') AS trading_mode,
