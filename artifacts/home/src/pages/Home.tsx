@@ -3734,6 +3734,69 @@ export default function Home() {
                 </div>
               )}
 
+              {/* ── SUGGESTED TRADE ─ shown when edge ≥ 65 and a plan exists ── */}
+              {edge >= 65 && !isManaging && (() => {
+                const tpEntry  = Number(tp.entry    || 0);
+                const tpStop   = Number(tp.stop     || 0);
+                const tpT1     = Number(tp.target1  || 0);
+                const tpRR     = String(tp.rr_display || '');
+                const isLong   = /long|bull/i.test(dirn);
+                const isShort  = /short|bear/i.test(dirn);
+                const dirColor = isLong ? BULL : isShort ? BEAR : AMB;
+                const dirLabel = isLong ? 'LONG' : isShort ? 'SHORT' : String(dirn||'—').toUpperCase();
+                const glow     = isActionable ? `0 0 24px ${dirColor}30` : 'none';
+                const hasPlan  = tpEntry > 0 || tpStop > 0 || tpT1 > 0;
+                if (!hasPlan) return null;
+                return (
+                  <div style={{
+                    borderRadius:10, border:`1px solid ${dirColor}28`,
+                    background:`${dirColor}07`, padding:'11px 14px',
+                    boxShadow:glow, maxWidth:400, animation:'tsIn 0.3s ease-out',
+                  }}>
+                    {/* Header */}
+                    <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10 }}>
+                      <span style={{ fontSize:8.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.12em',
+                        textTransform:'uppercase', color:'rgba(255,255,255,0.22)' }}>Suggested Entry</span>
+                      <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                        {dirLabel !== '—' && (
+                          <span style={{ fontSize:9.5, fontFamily:'monospace', fontWeight:800, letterSpacing:'0.08em',
+                            color:dirColor, background:`${dirColor}18`, padding:'2px 8px', borderRadius:10,
+                            border:`1px solid ${dirColor}30` }}>{dirLabel}</span>
+                        )}
+                        {tpRR && (
+                          <span style={{ fontSize:9, fontFamily:'monospace', color:'rgba(255,255,255,0.32)', letterSpacing:'0.04em' }}>
+                            {tpRR} R:R
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {/* Three-column plan */}
+                    <div style={{ display:'flex', gap:0 }}>
+                      {[
+                        { lbl:'Entry',  val:tpEntry, col:'rgba(255,255,255,0.82)' },
+                        { lbl:'Stop',   val:tpStop,  col:BEAR },
+                        { lbl:'TP1',    val:tpT1,    col:BULL },
+                      ].map(({ lbl, val, col }) => (
+                        <div key={lbl} style={{ flex:1, padding:'0 8px', borderLeft:'1px solid rgba(255,255,255,0.06)' }}
+                          className={lbl === 'Entry' ? '' : ''}>
+                          <div style={{ fontSize:8, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.10em',
+                            textTransform:'uppercase', color:'rgba(255,255,255,0.20)', marginBottom:4 }}>{lbl}</div>
+                          <div style={{ fontSize:14, fontFamily:'monospace', fontWeight:800, color:val > 0 ? col : 'rgba(255,255,255,0.18)',
+                            letterSpacing:'0.01em' }}>
+                            {val > 0 ? fmt(val) : '—'}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    {/* Disclaimer */}
+                    <div style={{ marginTop:8, fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.14)',
+                      letterSpacing:'0.04em' }}>
+                      DISPLAY ONLY · UPDATES EVERY POLL · NOT FINANCIAL ADVICE
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* Action buttons */}
               <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
                 {tradeSent ? (
