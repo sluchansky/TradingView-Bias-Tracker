@@ -2156,6 +2156,18 @@ function useDemoEngine(
 }
 
 // ── Root ───────────────────────────────────────────────────────────────────────
+const PANEL_NAMES: Record<string,string> = {
+  'intel-strip':  'Intelligence Strip',
+  'mb-chart':     'Live Chart',
+  'session-mem':  'Session Memory',
+  'quick-chips':  'Quick Chips',
+  'evidence':     'Evidence Snapshot',
+  'ai-mem':       'AI Memory',
+  'rc-orderflow': 'Order Flow',
+  'rc-levels':    'Levels to Watch',
+  'rc-structure': 'Market Structure',
+};
+
 export default function Home() {
   const [ticker, setTicker]     = useState<Ticker>('MNQ');
   const manualPickRef           = useRef<number>(0); // ms-timestamp of last manual ticker pick
@@ -2182,6 +2194,13 @@ export default function Home() {
 
   const { entries: memEntries, addEntry: memAddEntry, clear: memClear, context: memContext } = useConvMemory();
   const [memOpen, setMemOpen] = useState(false);
+  const [hiddenPanels, setHiddenPanels] = useState<Set<string>>(() => {
+    try { const s = localStorage.getItem('atp_hidden'); return s ? new Set(JSON.parse(s) as string[]) : new Set<string>(); }
+    catch { return new Set<string>(); }
+  });
+  const [showRestoreMenu, setShowRestoreMenu] = useState(false);
+  const hidePanel = (id: string) => setHiddenPanels(prev => { const n = new Set(prev); n.add(id); try { localStorage.setItem('atp_hidden', JSON.stringify([...n])); } catch {} return n; });
+  const showPanel = (id: string) => setHiddenPanels(prev => { const n = new Set(prev); n.delete(id); try { localStorage.setItem('atp_hidden', JSON.stringify([...n])); } catch {} return n; });
 
   const chatRef  = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -2928,9 +2947,49 @@ export default function Home() {
             }}>
             {demoMode ? '◈ DEMO' : '◈ LIVE'}
           </button>
-          <a className="hdr-eng" href="/api/dashboard" style={{ fontSize:10.5, color:'rgba(255,255,255,0.15)', textDecoration:'none', fontFamily:'monospace' }}
-            onMouseEnter={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.45)')}
-            onMouseLeave={e => (e.currentTarget.style.color = 'rgba(255,255,255,0.15)')}>ENG ↗</a>
+          {/* Page nav */}
+          <div style={{ display:'flex', gap:1, borderRadius:6, border:'1px solid rgba(255,255,255,0.07)', padding:'2px 3px', background:'rgba(255,255,255,0.020)' }}>
+            <span style={{ fontSize:9.5, fontFamily:'monospace', fontWeight:700, color:'#93c5fd', padding:'3px 9px', borderRadius:4, background:'rgba(59,130,246,0.14)', letterSpacing:'0.08em' }}>HOME</span>
+            <a href="/cockpit" style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em' }}
+              onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.65)'}
+              onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.28)'}>COCKPIT</a>
+            <a href="/api/dashboard" target="_blank" rel="noreferrer" style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em' }}
+              onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.65)'}
+              onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.28)'}>ENGINE ↗</a>
+          </div>
+          {/* Restore hidden panels pill */}
+          {hiddenPanels.size > 0 && (
+            <div style={{ position:'relative' }}>
+              <button onClick={() => setShowRestoreMenu(v => !v)} style={{ padding:'3px 9px', borderRadius:5, cursor:'pointer',
+                fontSize:9.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.08em',
+                background:'rgba(99,102,241,0.14)', color:'#a5b4fc', border:'1px solid rgba(99,102,241,0.30)' }}>
+                ↑ {hiddenPanels.size} hidden
+              </button>
+              {showRestoreMenu && (
+                <div style={{ position:'absolute', top:'calc(100% + 6px)', right:0, zIndex:999,
+                  background:'#0d0d1a', border:'1px solid rgba(255,255,255,0.10)', borderRadius:8,
+                  padding:'6px 0', minWidth:180, boxShadow:'0 8px 24px rgba(0,0,0,0.65)' }}>
+                  {[...hiddenPanels].map(id => (
+                    <button key={id} onClick={() => showPanel(id)}
+                      style={{ display:'block', width:'100%', textAlign:'left', padding:'7px 14px',
+                        background:'none', border:'none', color:'rgba(255,255,255,0.55)',
+                        fontSize:11, fontFamily:'monospace', cursor:'pointer' }}
+                      onMouseEnter={e => e.currentTarget.style.background='rgba(255,255,255,0.06)'}
+                      onMouseLeave={e => e.currentTarget.style.background='none'}>
+                      + {PANEL_NAMES[id] ?? id}
+                    </button>
+                  ))}
+                  <div style={{ borderTop:'1px solid rgba(255,255,255,0.06)', margin:'4px 0 2px' }} />
+                  <button onClick={() => { setHiddenPanels(new Set()); setShowRestoreMenu(false); try { localStorage.removeItem('atp_hidden'); } catch {} }}
+                    style={{ display:'block', width:'100%', textAlign:'left', padding:'6px 14px',
+                      background:'none', border:'none', color:'rgba(99,102,241,0.75)',
+                      fontSize:10.5, fontFamily:'monospace', cursor:'pointer' }}>
+                    + restore all
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </header>
 
@@ -3739,6 +3798,7 @@ export default function Home() {
               )}
 
               {/* ── LIVE CHART — 1-min, inline in brain panel ─────────────── */}
+              {!hiddenPanels.has('mb-chart') && (
               <div className="mb-chart" style={{ border:'1px solid rgba(255,255,255,0.042)', borderRadius:10, overflow:'hidden' }}>
                 <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
                   padding:'8px 14px', background:'rgba(255,255,255,0.018)' }}>
@@ -3748,6 +3808,9 @@ export default function Home() {
                     {data?.vwap_value    && <span style={{ color:'#60a5fa', fontSize:10.5, fontFamily:'monospace' }}>VWAP {fmt(data.vwap_value)}</span>}
                     {data?.nearest_demand && <span style={{ color:BULL,     fontSize:10.5, fontFamily:'monospace' }}>D {fmt(data.nearest_demand)}</span>}
                     {data?.nearest_supply && <span style={{ color:BEAR,     fontSize:10.5, fontFamily:'monospace' }}>S {fmt(data.nearest_supply)}</span>}
+                    <button onClick={() => hidePanel('mb-chart')} title="Hide chart" style={{ background:'none', border:'none', cursor:'pointer', fontSize:13, lineHeight:1, color:'rgba(255,255,255,0.18)', padding:'0 2px', marginLeft:2 }}
+                      onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.60)'}
+                      onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.18)'}>×</button>
                   </div>
                 </div>
                 <div style={{ height:160, padding:'8px 12px 10px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
@@ -3755,6 +3818,7 @@ export default function Home() {
                     demand={data?.nearest_demand} supply={data?.nearest_supply} ticker={ticker} />
                 </div>
               </div>
+              )}{/* end mb-chart guard */}
 
               {/* ── SUGGESTED TRADE ─ shown when edge ≥ 65 and a plan exists ── */}
               {edge >= 65 && !isManaging && (() => {
@@ -3895,7 +3959,14 @@ export default function Home() {
           </div>
 
           {/* ── INTELLIGENCE STRIP ──────────────────────────────────────── */}
-          <div className="intel-strip" style={{ display:'flex', gap:8, marginBottom:16, flexWrap:'nowrap', minWidth:0 }}>
+          {!hiddenPanels.has('intel-strip') && (
+          <div style={{ position:'relative', marginBottom:16 }}>
+            <button onClick={() => hidePanel('intel-strip')} title="Hide panel" style={{ position:'absolute', top:0, right:0, zIndex:2,
+              background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1,
+              color:'rgba(255,255,255,0.13)', padding:'2px 5px' }}
+              onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+              onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.13)'}>×</button>
+            <div className="intel-strip" style={{ display:'flex', gap:8, flexWrap:'nowrap', minWidth:0 }}>
 
             {/* TODAY'S OBJECTIVE */}
             <SatPanel label="Today's Objective" style={{ flex:'1.6 1 0', minWidth:0 }}>
@@ -3950,9 +4021,12 @@ export default function Home() {
               );
             })()}
 
+            </div>{/* end intel-strip flex */}
           </div>
+          )}{/* end intel-strip hide guard */}
 
           {/* ── AI MEMORY & PERFORMANCE ── ordered to bottom via CSS ───── */}
+          {!hiddenPanels.has('ai-mem') && (
           <div className="ai-mem-panel" style={{ marginBottom:14, borderRadius:10, overflow:'hidden',
             border:'1px solid rgba(255,255,255,0.055)', background:'rgba(5,8,18,0.55)' }}>
             {/* Panel header */}
@@ -3960,7 +4034,12 @@ export default function Home() {
               padding:'7px 14px', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
               <span style={{ fontSize:8, fontFamily:'monospace', letterSpacing:'0.13em',
                 color:'rgba(255,255,255,0.28)', textTransform:'uppercase' }}>AI Memory \u00b7 Performance History</span>
-              <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.16)' }}>7-day</span>
+              <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.16)' }}>7-day</span>
+                <button onClick={() => hidePanel('ai-mem')} title="Hide panel" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px' }}
+                  onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                  onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
+              </div>
             </div>
             {/* Stats row: Yesterday | This Week | Win Rate | Avg R:R | Best Setup */}
             <div style={{ display:'flex', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
@@ -4140,9 +4219,11 @@ export default function Home() {
               </div>
             </div>
           </div>
+          )}{/* end ai-mem guard */}
 
           {/* ── QUICK CHIPS ─────────────────────────────────────────────── */}
-          <div className="quick-chips" style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:16 }}>
+          {!hiddenPanels.has('quick-chips') && (
+          <div className="quick-chips" style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:16, alignItems:'center' }}>
             {chips.map(c => (
               <button key={c} className="chip-btn" onClick={() => ask(c)} disabled={asking} style={{
                 padding:'5px 13px', borderRadius:16, border:'1px solid rgba(255,255,255,0.09)',
@@ -4151,31 +4232,42 @@ export default function Home() {
                 {c}
               </button>
             ))}
+            <button onClick={() => hidePanel('quick-chips')} title="Hide" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.13)', padding:'2px 4px', marginLeft:'auto' }}
+              onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.50)'}
+              onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.13)'}>×</button>
           </div>
+          )}{/* end quick-chips guard */}
 
           {/* ── SESSION MEMORY ──────────────────────────────────────── */}
+          {!hiddenPanels.has('session-mem') && (
           <div style={{ marginBottom:10, border:'1px solid rgba(255,255,255,0.048)', borderRadius:10, overflow:'hidden' }}>
-            <button className="accord-toggle" onClick={() => setMemOpen(!memOpen)} style={{
-              width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
-              padding:'9px 14px', background:'rgba(255,255,255,0.012)', border:'none', cursor:'pointer',
-              color:'rgba(255,255,255,0.40)', fontSize:11, fontFamily:'monospace', letterSpacing:'0.08em' }}>
-              <div style={{ display:'flex', alignItems:'center', gap:7 }}>
-                <span style={{ fontWeight:700, textTransform:'uppercase' }}>Session Memory</span>
-                {memEntries.length > 0 && (
-                  <span style={{ fontSize:9.5, color:CYAN, background:'rgba(56,189,248,0.08)',
-                    border:'1px solid rgba(56,189,248,0.18)', borderRadius:10, padding:'1px 7px', fontFamily:'monospace' }}>
-                    {memEntries.length}
-                  </span>
-                )}
-              </div>
-              <span style={{ fontSize:12, color:'rgba(255,255,255,0.22)' }}>{memOpen ? '▲' : '▼'}</span>
-            </button>
+            <div style={{ display:'flex', alignItems:'center', background:'rgba(255,255,255,0.012)', borderBottom: memOpen ? '1px solid rgba(255,255,255,0.035)' : 'none' }}>
+              <button className="accord-toggle" onClick={() => setMemOpen(!memOpen)} style={{
+                flex:1, display:'flex', alignItems:'center', justifyContent:'space-between',
+                padding:'9px 14px', background:'none', border:'none', cursor:'pointer',
+                color:'rgba(255,255,255,0.40)', fontSize:11, fontFamily:'monospace', letterSpacing:'0.08em' }}>
+                <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                  <span style={{ fontWeight:700, textTransform:'uppercase' }}>Session Memory</span>
+                  {memEntries.length > 0 && (
+                    <span style={{ fontSize:9.5, color:CYAN, background:'rgba(56,189,248,0.08)',
+                      border:'1px solid rgba(56,189,248,0.18)', borderRadius:10, padding:'1px 7px', fontFamily:'monospace' }}>
+                      {memEntries.length}
+                    </span>
+                  )}
+                </div>
+                <span style={{ fontSize:12, color:'rgba(255,255,255,0.22)' }}>{memOpen ? '▲' : '▼'}</span>
+              </button>
+              <button onClick={() => hidePanel('session-mem')} title="Hide panel" style={{ background:'none', border:'none', cursor:'pointer', fontSize:15, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 12px', alignSelf:'stretch', display:'flex', alignItems:'center' }}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
+            </div>
             {memOpen && (
-              <div style={{ padding:'11px 14px 14px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
+              <div style={{ padding:'11px 14px 14px' }}>
                 <MemoryPanel entries={memEntries} onClear={memClear} />
               </div>
             )}
           </div>
+          )}{/* end session-mem guard */}
 
           {/* ── CHAT ────────────────────────────────────────────────────── */}
           {chatOpen && (
@@ -4235,23 +4327,30 @@ export default function Home() {
           )}
 
           {/* ── EVIDENCE ACCORDION ──────────────────────────────────────── */}
+          {!hiddenPanels.has('evidence') && (
           <div style={{ marginBottom:12, border:'1px solid rgba(255,255,255,0.055)', borderRadius:10, overflow:'hidden' }}>
-            <button className="accord-toggle" onClick={() => setEvidenceOpen(!evidenceOpen)} style={{
-              width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
-              padding:'11px 16px', background:'rgba(255,255,255,0.020)', border:'none', cursor:'pointer',
-              color:'rgba(255,255,255,0.55)', fontSize:11.5, fontFamily:'monospace', letterSpacing:'0.08em' }}>
-              <span style={{ textTransform:'uppercase', fontWeight:700 }}>Evidence Snapshot</span>
-              <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                {data && <span style={{ fontSize:11, color:verdictColor, fontWeight:700 }}>EDGE {Math.round(edge)} / 110</span>}
-                <span style={{ fontSize:13, color:'rgba(255,255,255,0.30)' }}>{evidenceOpen ? '▲' : '▼'}</span>
-              </div>
-            </button>
+            <div style={{ display:'flex', alignItems:'center', background:'rgba(255,255,255,0.020)' }}>
+              <button className="accord-toggle" onClick={() => setEvidenceOpen(!evidenceOpen)} style={{
+                flex:1, display:'flex', alignItems:'center', justifyContent:'space-between',
+                padding:'11px 16px', background:'none', border:'none', cursor:'pointer',
+                color:'rgba(255,255,255,0.55)', fontSize:11.5, fontFamily:'monospace', letterSpacing:'0.08em' }}>
+                <span style={{ textTransform:'uppercase', fontWeight:700 }}>Evidence Snapshot</span>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  {data && <span style={{ fontSize:11, color:verdictColor, fontWeight:700 }}>EDGE {Math.round(edge)} / 110</span>}
+                  <span style={{ fontSize:13, color:'rgba(255,255,255,0.30)' }}>{evidenceOpen ? '▲' : '▼'}</span>
+                </div>
+              </button>
+              <button onClick={() => hidePanel('evidence')} title="Hide panel" style={{ background:'none', border:'none', cursor:'pointer', fontSize:15, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 14px', alignSelf:'stretch', display:'flex', alignItems:'center' }}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
+            </div>
             {evidenceOpen && data && (
               <div style={{ padding:'14px 16px 16px', borderTop:'1px solid rgba(255,255,255,0.040)' }}>
                 <EvidenceDrawer data={data} status={status} />
               </div>
             )}
           </div>
+          )}{/* end evidence guard */}
 
           {/* spacer */}
           <div style={{ height:24 }} />
@@ -4261,6 +4360,7 @@ export default function Home() {
         <div className="right-col">
 
           {/* ORDER FLOW */}
+          {!hiddenPanels.has('rc-orderflow') && (
           <div className="rc-panel">
             <div className="rc-hdr">
               <span className="rc-title">Order Flow</span>
@@ -4270,6 +4370,9 @@ export default function Home() {
                 const lbl = /bull|pos/.test(c) ? 'BULL DELTA' : /bear|neg/.test(c) ? 'BEAR DELTA' : 'NEUTRAL';
                 return <span style={{ fontSize:9, color:col, fontFamily:'monospace', fontWeight:700 }}>{lbl}</span>;
               })()}
+              <button onClick={() => hidePanel('rc-orderflow')} title="Hide" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px', marginLeft:4 }}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
             </div>
             {/* Mini delta bar chart seeded from live edge score */}
             {(() => {
@@ -4304,11 +4407,16 @@ export default function Home() {
               );
             })()}
           </div>
+          )}{/* end rc-orderflow guard */}
 
           {/* LEVELS TO WATCH */}
+          {!hiddenPanels.has('rc-levels') && (
           <div className="rc-panel">
             <div className="rc-hdr">
               <span className="rc-title">Levels to Watch</span>
+              <button onClick={() => hidePanel('rc-levels')} title="Hide" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px', marginLeft:'auto' }}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
             </div>
             <div style={{ padding:'8px 12px 10px' }}>
               {(() => {
@@ -4343,11 +4451,16 @@ export default function Home() {
               })()}
             </div>
           </div>
+          )}{/* end rc-levels guard */}
 
           {/* MARKET STRUCTURE */}
+          {!hiddenPanels.has('rc-structure') && (
           <div className="rc-panel">
             <div className="rc-hdr">
               <span className="rc-title">Market Structure</span>
+              <button onClick={() => hidePanel('rc-structure')} title="Hide" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px', marginLeft:'auto' }}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
             </div>
             <div style={{ padding:'8px 12px 10px' }}>
               {(() => {
@@ -4377,6 +4490,7 @@ export default function Home() {
               })()}
             </div>
           </div>
+          )}{/* end rc-structure guard */}
 
         </div>
 
