@@ -11203,7 +11203,9 @@ def _recompute_learning_eligibility(conn):
             except Exception: return d
 
         # Iterate over every known instrument × every trading mode for isolation.
-        # Instruments with no trades in a mode get GHOST_ONLY (under-sampled) — safe.
+        # n=0  → truly no history → FAIL-OPEN (LIVE_ELIGIBLE) so first trades can build evidence.
+        # 1≤n<MIN → some data but not yet enough → GHOST_ONLY (accumulate without risking live).
+        # n≥MIN → quality decision based on expectancy / last-20.
         _all_elig_modes = ["SWING", "SCALP", "MICRO_SCALP"]
         new_elig = {}
         for instrument, mode in [(i, m) for i in list(ASSETS.keys()) for m in _all_elig_modes]:
@@ -11214,7 +11216,10 @@ def _recompute_learning_eligibility(conn):
             wr   = _ff(row.get("win_rate"))
             tp1h = _ff(row.get("tp1_hit_rate"))
             l20  = last20.get((instrument, mode)) or last20.get((instrument + "1!", mode))
-            if n < LEARNING_LIVE_MIN_SAMPLE:
+            if n == 0:
+                status = "LIVE_ELIGIBLE"
+                rule   = "no_prior_%s_trades (bootstrapping — fail-open)" % mode
+            elif n < LEARNING_LIVE_MIN_SAMPLE:
                 status = "GHOST_ONLY"
                 rule   = "under_%d_%s_samples (%d recorded)" % (LEARNING_LIVE_MIN_SAMPLE, mode, n)
             elif exp < 0:
