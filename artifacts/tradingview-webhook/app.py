@@ -18641,29 +18641,30 @@ def compute_main_brain_voice(result):
         trend    = str(ct.get("trend") or "")
 
         parts = []
-        see = "Right now on %s I'm reading %s" % (inst, (phase.lower() if phase != "—" else "a developing tape"))
+        phase_desc = phase.lower() if phase != "—" else "a developing tape"
+        see = "%s's in %s right now" % (inst, phase_desc)
         if control:
             see += " — %s" % control.rstrip(".").lower()
         parts.append(see + ".")
 
         if edge:
-            c = "My edge score sits at %d%s" % (edge, (" (%s)" % grade if grade else ""))
+            c = "Edge is at %d%s" % (edge, (" — grade %s" % grade if grade else ""))
             if fav and fav != "Neither":
                 c += ", leaning %s" % fav.lower()
             if trend in ("rising", "falling"):
-                c += ", and confidence has been %s" % trend
+                c += ", and it's been %s" % trend
             parts.append(c + ".")
 
         if is_actionable(verdict):
-            parts.append("The pieces line up here, so I'd treat this as actionable.")
+            parts.append("The pieces are there — this is actionable.")
         elif what_now:
             nx = what_now[0] if isinstance(what_now[0], str) else str(what_now[0])
-            parts.append("Before I'd act, I want %s." % nx.rstrip("."))
+            parts.append("Still need %s before I'd pull the trigger." % nx.rstrip("."))
         else:
-            parts.append("There's no clean trigger yet, so I'd stay patient.")
+            parts.append("No clean trigger yet, so I'm staying patient.")
 
         if inval and inval != "—":
-            parts.append("I'm wrong on this if %s." % inval.rstrip(".").lower())
+            parts.append("Thesis is out if %s." % inval.rstrip(".").lower())
 
         narration = " ".join(p for p in parts if p)
         if edge:
@@ -52515,7 +52516,7 @@ def review_idea():
 #    CSRF via the Express proxy; deliberately NOT in OPEN_PATHS). Powered by Replit AI
 #    Integrations (OpenAI) — keys auto-provisioned, no API key handling here.
 ASSISTANT_MODEL          = "gpt-5.4"
-ASSISTANT_MAX_TOKENS     = 350
+ASSISTANT_MAX_TOKENS     = 600
 ASSISTANT_HISTORY_TURNS  = 8
 
 
