@@ -121,8 +121,7 @@ chochShortReady = chochShort     and (bar_index - lastChochShortBar) >= cooldown
 // Only the highest-priority event fires. This guarantees at most 1 webhook
 // per bar, preventing TradingView's "Too many triggering" stop.
 f_msg(t) =>
-    '{"alert_type":"' + t + '","ticker":"' + syminfo.ticker
-    + '","price":' + str.tostring(close, "#.####") + '}'
+    '{"alert_type":"' + t + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + '}'
 
 var int lastAlertBar = -999
 
