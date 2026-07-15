@@ -48354,7 +48354,7 @@ async function refreshRec() {
 // broker path: Apply / Copy / Send stay hidden here and key off the top-level
 // trade_plan + actionable verdict, never this preview.
 let _ppAnchor = {};                 // "INST|DIR" -> { price, ts }
-const PP_REANCHOR_MS = 30000;       // re-anchor the preview to the live price every 30s
+const PP_REANCHOR_MS = 10000;       // re-anchor the preview to the live price every 10s
 function _liveAnchoredPotential(pp, dir, inst) {
   const live = (lastRec && lastRec.display_price != null) ? lastRec.display_price
              : (lastRec && lastRec.current_price != null) ? lastRec.current_price : null;
@@ -48553,7 +48553,7 @@ function renderDirView() {
     const la = _liveAnchoredPotential(pp, dir, ppInst);
     const shown = la.anchored ? la.plan : pp;
     const anchNote = la.anchored
-      ? '<div style="color:#22c55e;font-size:11px;margin-top:5px">⟳ Preview anchored to live price <b>'+la.anchorTxt+'</b> · updates every 30s'+(la.secsLeft!=null?' (next in '+la.secsLeft+'s)':'')+' · actual setup zone unchanged</div>'
+      ? '<div style="color:#22c55e;font-size:11px;margin-top:5px">⟳ Preview anchored to live price <b>'+la.anchorTxt+'</b> · updates every 10s'+(la.secsLeft!=null?' (next in '+la.secsLeft+'s)':'')+' · actual setup zone unchanged</div>'
       : '';
     planEl.style.display = 'block';
     // Flag-gated manual override: allow TAKING this forming preview BEFORE READY when
