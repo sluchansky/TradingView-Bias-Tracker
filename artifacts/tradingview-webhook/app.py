@@ -883,12 +883,13 @@ MODES = {
         "VOL_HIGH_BLOCK":    3.0,
         # SWING keeps volatility as a hard gate - a BLOCK regime holds READY->WAIT.
         "VOL_HARD_GATE":     True,
-        # SWING keeps the original strict gate: zone AND vwap AND structure AND
-        # edge>=80, with no tiered early alerts. Expressed via the same cfg keys so
-        # the READY boolean reduces to the historical behaviour exactly.
-        "EDGE_READY_THRESHOLD":          80,
-        "EDGE_FULL_READY_THRESHOLD":     80,   # SWING: floor == full → no EARLY READY band
-        "EDGE_STRONG_THRESHOLD":         80,   # == READY floor → "Strong Trade" label unchanged
+        # SWING strict gate: zone AND vwap AND structure AND edge>=85 (A+ only).
+        # Raised from 80→85 to require A+ grade, not just A, before auto-executing.
+        # Setups at 80-84 remain visible but resolve WAIT until another component
+        # lifts the score into A+ territory.  No EARLY band in SWING — floor == full.
+        "EDGE_READY_THRESHOLD":          85,
+        "EDGE_FULL_READY_THRESHOLD":     85,   # SWING: floor == full → no EARLY READY band
+        "EDGE_STRONG_THRESHOLD":         85,   # == READY floor → "Strong Trade" label unchanged
         "EDGE_SETUP_BUILDING_THRESHOLD": None, # SWING never emits SETUP BUILDING
         "GATE_REQUIRE_VWAP":      True,
         "GATE_REQUIRE_STRUCTURE": True,
@@ -2190,7 +2191,7 @@ def _auto_trade_bump_count(inst):
 # operator arms them. All money-path helpers take a STRICT (already-resolved)
 # instrument and fail CLOSED on anything unknown — never the lenient instrument_of().
 SAFETY_MAX_TRADES_PER_DAY = int(_env_float("SAFETY_MAX_TRADES_PER_DAY", 5))   # per-day AUTO entry cap
-SAFETY_MAX_LOSSES_PER_DAY = _env_int_or_none("SAFETY_MAX_LOSSES_PER_DAY", 5)  # per-day realized-LOSS cap (wins NEVER counted; none => unlimited)
+SAFETY_MAX_LOSSES_PER_DAY = _env_int_or_none("SAFETY_MAX_LOSSES_PER_DAY", 3)  # per-day realized-LOSS cap (wins NEVER counted; none => unlimited)
 SAFETY_MAX_OPEN_TRADES    = _env_int_or_none("SAFETY_MAX_OPEN_TRADES", 1)     # concurrent open positions (None => legacy unlimited)
 # Force the one-position guard ON even for SCALP (allow_stack requests are demoted)
 # so concurrent stacking can't compound a losing streak. NOTE: a live position is
@@ -2204,7 +2205,7 @@ SAFETY_DEFAULTS = {
     "maxContracts":      TRADERSPOST_MAX_CONTRACTS,# hard server contract ceiling
     "maxDailyLoss":      None,                     # USD; None => no daily-loss cap
     "maxOpenTrades":     SAFETY_MAX_OPEN_TRADES,   # concurrent open positions (1 => one-slot)
-    "cooldownAfterLoss": 0,                        # seconds; 0 => no post-loss cooldown
+    "cooldownAfterLoss": 900,                      # seconds; 15-min rest after each loss
     "cooldownAfterWin":  0,                        # seconds; 0 => no post-win cooldown
     "emergencyDisable":  False,                    # per-asset money-path kill switch
 }
