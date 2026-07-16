@@ -42047,7 +42047,7 @@ def dashboard():
   .cp-btn.active{background:#2563eb;border-color:#2563eb;color:#fff}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]):not([data-unified="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(#mod-thesis):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]):not([data-unified="1"]) #view-live .mod:not(#mod-brain):not(#mod-data-feed):not(#mod-real-results):not(#mod-ai-decision-center):not(#mod-analysis-groups):not(#mod-journal-groups):not(#mod-news):not(#mod-rule-engine):not(#mod-controls-groups):not(#mod-prop):not(#mod-hvsessions):not(#mod-chartprev):not(#mod-cvd):not(#mod-scalpdiag):not(#mod-swingdiag):not(#mod-microscalp):not(#mod-mb-voice):not(#mod-mb-predictions):not(#mod-mb-narrative):not(#mod-equity):not(#mod-trades):not(#mod-thesis):not(#mod-review):not(#mod-mb-thesis):not(#mod-exec-reject):not(#mod-broker-send-log):not(#mod-mb-confidence):not(#mod-mi):not(#mod-fastentry):not(#mod-xmarket):not(#mod-breakout):not(#mod-swing-v2):not(#mod-dual-sim):not(#mod-scalp-advisory):not(#mod-stalk-mode):not(#mod-active-thinking):not(#mod-bothold):not(#mod-atm):not(#mod-liverunner):not(#mod-autoexit):not(.mb-hidden){display:none !important}
 
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
@@ -52923,7 +52923,7 @@ setInterval(function(){
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
   var VKEY = 'dashLayoutVer', VER = 'brain-layout-2026-07d';
-  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.removeItem('dashBLDrawer'); localStorage.setItem('dashAdv','1'); localStorage.setItem(VKEY, VER); } }catch(e){}
+  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.removeItem('dashBLDrawer'); localStorage.setItem('dashAdv','0'); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
   function key(m){ return m.id || ''; }
@@ -53396,7 +53396,7 @@ function renderBLPanels(d){
   if(blrDemand){var dv2=nearDem&&nearDem.high?Number(nearDem.high).toFixed(2):(nearDem&&typeof nearDem==='number'?Number(nearDem).toFixed(2):'\u2014');blrDemand.textContent=dv2;}
   if(blrSupply){var sv3=nearSup&&nearSup.low?Number(nearSup.low).toFixed(2):(nearSup&&typeof nearSup==='number'?Number(nearSup).toFixed(2):'\u2014');blrSupply.textContent=sv3;}
 }
-(function(){ var on=true; try{ var v=localStorage.getItem('dashAdv'); if(v!==null) on=(v==='1'); }catch(e){} _advApply(on); })();
+(function(){ var on=false; try{ var v=localStorage.getItem('dashAdv'); if(v!==null) on=(v==='1'); }catch(e){} _advApply(on); })();
 // ── Top controls collapsed into a single menu (DISPLAY-ONLY, this device) ──
 // Shows/hides the top utility pill row (#alert-ctl) behind one ☰ Menu button.
 // Persisted in localStorage('dashTopMenu'); default collapsed; never touches the

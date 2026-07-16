@@ -1,0 +1,118 @@
+TASK: Dashboard Cleanup — Phase 1.4
+
+OBJECTIVE
+
+Hide panels labeled ADVANCED from the default dashboard view.
+
+This task must make only one functional change.
+
+REQUIREMENTS
+
+1. Find every dashboard panel categorized as ADVANCED during Phase 1.3.
+
+2. Make those ADVANCED panels hidden when the dashboard first loads.
+
+3. Do not delete the panels or their code.
+
+4. Do not hide panels labeled:
+
+* PRIMARY
+* DETAIL
+* EXPERIMENTAL
+
+5. Do not move, resize, rename, merge, or redesign any panel.
+
+6. Do not change:
+
+* Dashboard navigation
+* Colors
+* Typography
+* Data sources
+* API endpoints
+* Trading logic
+* Brain logic
+* Panel content
+* Mobile layout
+
+7. Preserve the existing Advanced View control if one already exists.
+
+8. When Advanced View is enabled, all ADVANCED panels must become visible again.
+
+9. When Advanced View is disabled, all ADVANCED panels must hide again.
+
+10. The Advanced View preference only needs to last for the current browser session. Do not build a new settings system.
+
+IMPORTANT SAFETY RULES
+
+* Do not remove any backend calculations.
+* Do not stop ADVANCED panel data from being generated.
+* Do not change feature flags.
+* Do not modify panels merely because they contain overlapping information.
+* Only change their default visibility.
+* Do not touch EXPERIMENTAL panels during this phase.
+* Do not make unrelated cleanup changes.
+
+BEFORE EDITING
+
+First report:
+
+* The exact files you intend to modify
+* The ADVANCED panel IDs that will be affected
+* Whether an Advanced View toggle already exists
+* The smallest implementation approach you will use
+
+Then perform the change.
+
+EXPECTED ADVANCED PANELS
+
+Verify these against the actual Phase 1.3 labels before changing them:
+
+* mod-strategy
+* mod-learning
+* mod-memory
+* mod-governor
+* mod-assistant
+
+Do not automatically assume this list is complete or correct. Use the Phase 1.3 classifications in the current code as the source of truth.
+
+SUCCESS CRITERIA
+
+The phase passes only when:
+
+* The normal dashboard loads with ADVANCED panels hidden.
+* PRIMARY and DETAIL panels remain visible.
+* Enabling Advanced View reveals the ADVANCED panels.
+* Disabling Advanced View hides them again.
+* No panels were deleted.
+* No panel content or functionality changed.
+* No unrelated files were modified.
+* The browser console shows no new errors.
+
+TESTING
+
+Test the following:
+
+1. Refresh the dashboard with Advanced View disabled.
+2. Confirm all ADVANCED panels are hidden.
+3. Confirm PRIMARY and DETAIL panels remain visible.
+4. Enable Advanced View.
+5. Confirm all ADVANCED panels appear.
+6. Disable Advanced View.
+7. Confirm they disappear again.
+8. Switch between dashboard sections.
+9. Confirm the visibility behavior remains correct.
+10. Check the browser console for errors.
+
+FINAL RESPONSE
+
+Return:
+
+* Files changed
+* Panel IDs affected
+* How default visibility was implemented
+* Testing performed
+* Testing results
+* Any ADVANCED panel that could not be safely hidden
+* Confirmation that no other dashboard behavior was changed
+
+Do not begin Phase 1.5.
