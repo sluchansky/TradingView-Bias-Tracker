@@ -42255,19 +42255,10 @@ def dashboard():
   .bl-evt{display:inline-flex;align-items:center;gap:4px;font-size:10px;color:#9aa3c0;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:3px 8px;white-space:nowrap}
   .bl-evt-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
   .bl-evt-empty{font-size:11px;color:#4b5563;font-style:italic}
-  /* Drawer toggle row */
-  #bl-drawer-row{order:2;display:flex;align-items:center;gap:10px;margin:0 0 10px;flex-wrap:wrap}
-  #bl-drawer-btn{background:#0a0818;border:1px solid var(--border);border-radius:20px;color:#6b7280;font-size:11px;font-weight:700;letter-spacing:.8px;padding:6px 16px;cursor:pointer;transition:color .15s,border-color .15s;text-transform:uppercase}
-  #bl-drawer-btn:hover{color:var(--text);border-color:rgba(125,140,255,.4)}
-  #bl-drawer-btn.open{color:#7fe9f5;border-color:#39d7e6;background:rgba(57,215,230,.07)}
-  /* All direct-child .mod panels go to drawer area (order 61, hidden by default) */
-  #view-live > .mod{order:61;display:none}
-  #view-live.drawer-open > .mod:not(.mb-hidden){display:block !important}
-  /* Pre-brain non-.mod elements also go to drawer position */
-  #view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{order:60;display:none}
-  #view-live.drawer-open > #mode-row{display:block !important}
-  #view-live.drawer-open > #adv-row{display:flex !important}
-  #view-live.drawer-open > #status-card,#view-live.drawer-open > #rec-card{display:block !important}
+  /* All direct-child .mod panels — no drawer hiding, always in flow */
+  #view-live > .mod{order:61}
+  /* Pre-brain non-.mod elements */
+  #view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{order:60}
   /* bl-left compact controls */
   .bl-sect-h{font-size:9px;text-transform:uppercase;letter-spacing:1.4px;color:#4b5563;font-weight:700;margin:0 0 5px;padding:0 1px}
   .bl-mode-seg{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
@@ -43427,11 +43418,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="bl-bottom-events"><span class="bl-evt-empty">Awaiting market data…</span></div>
 </div>
 
-<!-- Drawer toggle row -->
-<div id="bl-drawer-row">
-  <button id="bl-drawer-btn" onclick="toggleBLDrawer()">⚙ Details ▾</button>
-  <span class="adv-hint">full diagnostics · learning tables · strategy modules · raw metrics</span>
-</div>
 
   <!-- ════ Live Chart Preview — TradingView Advanced Chart embed (DISPLAY-ONLY).
        Pure view layer for visual confirmation next to the bot's verdict. It never
@@ -52575,7 +52561,7 @@ setInterval(function(){
   // users fall back to the default order with Main Brain on top. Any later manual
   // reorder/collapse persists again under the new version marker.
   var VKEY = 'dashLayoutVer', VER = 'brain-layout-2026-07d';
-  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.removeItem('dashBLDrawer'); localStorage.setItem('dashAdv','0'); localStorage.setItem(VKEY, VER); } }catch(e){}
+  try{ if(localStorage.getItem(VKEY) !== VER){ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.setItem('dashAdv','0'); localStorage.setItem(VKEY, VER); } }catch(e){}
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
   function key(m){ return m.id || ''; }
@@ -52729,7 +52715,7 @@ setInterval(function(){
   });
   renderHiddenChips();
   window.resetDashLayout = function(){
-    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.removeItem('dashBLDrawer'); localStorage.setItem('dashAdv','1'); }catch(e){}
+    try{ localStorage.removeItem(CKEY); localStorage.removeItem(OKEY); localStorage.removeItem(HKEY); localStorage.setItem('dashAdv','1'); }catch(e){}
     location.reload();
   };
 })();
@@ -52748,28 +52734,7 @@ function toggleAdvPanels(){
   _advApply(on);
 }
 
-// ── Brain-first layout: drawer toggle + compact side-panel renderer (DISPLAY-ONLY) ──
-function toggleBLDrawer(){
-  var vl = document.getElementById('view-live');
-  if(!vl) return;
-  var open = vl.classList.toggle('drawer-open');
-  var btn = document.getElementById('bl-drawer-btn');
-  if(btn){ btn.textContent = open ? '\u2715 Hide panels' : '\u2699 Show panels \u25be'; btn.classList.toggle('open', open); }
-  if(open){ _advApply(true); }
-  try{ localStorage.setItem('dashBLDrawer', open ? '1' : '0'); }catch(e){}
-}
-// Auto-open the panel drawer on desktop (>960px) — mobile media query already
-// shows everything.  User pref persisted in localStorage; default = OPEN.
-(function(){
-  var stored = null; try{ stored = localStorage.getItem('dashBLDrawer'); }catch(e){}
-  var shouldOpen = (stored === null) ? (window.innerWidth > 960) : (stored === '1');
-  if(shouldOpen){
-    var vl = document.getElementById('view-live');
-    var btn = document.getElementById('bl-drawer-btn');
-    if(vl){ vl.classList.add('drawer-open'); _advApply(true); }
-    if(btn){ btn.textContent = '\u2715 Hide panels'; btn.classList.add('open'); }
-  }
-})();
+// ── Brain-first layout: compact side-panel renderer (DISPLAY-ONLY) ──
 
 function renderBLPanels(d){
   if(!d) return;
