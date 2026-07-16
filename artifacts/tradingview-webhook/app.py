@@ -42043,9 +42043,7 @@ def dashboard():
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
   html:not([data-adv="1"]):not([data-unified="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(#mod-thesis):not(.mb-hidden){display:none !important}
-  /* When section-nav is active (data-unified="1"), only primary group panels + core overview
-     panels are visible by default; individual detail panels appear only with Advanced ON. */
-  html[data-unified="1"]:not([data-adv="1"]) #view-live .mod:not(#mod-brain):not(#mod-data-feed):not(#mod-real-results):not(#mod-hvsessions):not(#mod-ai-decision-center):not(#mod-analysis-groups):not(#mod-journal-groups):not(#mod-controls-groups):not(.mb-hidden){display:none !important}
+
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
   #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
