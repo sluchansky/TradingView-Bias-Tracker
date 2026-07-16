@@ -80,7 +80,7 @@ function charToViseme(c: string): string {
 function useTTS() {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voiceName, setVoiceN] = useState<string>(() => { try { return localStorage.getItem('brain_voice') ?? ''; } catch { return ''; } });
-  const [muted, setMutedState] = useState<boolean>(() => { try { const v = localStorage.getItem('brain_muted'); return v === null ? false : v !== '0'; } catch { return false; } });
+  const [muted, setMutedState] = useState<boolean>(() => { try { const v = localStorage.getItem('brain_muted'); const isProd = window.location.hostname.endsWith('.replit.app'); return v === null ? !isProd : v !== '0'; } catch { return false; } });
   const [speaking, setSpeaking] = useState(false);
   // Shared energy ref: written by the RAF loop below, read by AvatarCanvas draw loop (no React re-renders)
   const speechCtrlRef = useRef<SpeechCtrl>({ energy: 0, viseme: 'rest', active: false });
