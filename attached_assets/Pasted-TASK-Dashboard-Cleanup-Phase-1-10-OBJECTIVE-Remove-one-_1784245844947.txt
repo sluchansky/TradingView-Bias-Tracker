@@ -1,0 +1,186 @@
+TASK: Dashboard Cleanup — Phase 1.10
+
+OBJECTIVE
+
+Remove one duplicate dashboard panel:
+
+Panel: Confidence Governor
+Panel ID: mod-governor
+
+The AI Decision Center already contains a Confidence tab that presents the same
+confidence breakdown.
+
+MAKE ONLY THIS ONE CHANGE.
+
+BEFORE EDITING
+
+Inspect and report:
+
+1. The exact file or files that will be modified.
+2. The exact markup belonging to mod-governor.
+3. Every JavaScript function, DOM selector, event handler, CSS rule, category
+   entry, navigation entry, registry entry, and Advanced View reference
+   connected to mod-governor.
+4. Which d.confidence_governor fields are also used by:
+   - mod-ai-decision-center
+   - Main Brain
+   - verdict logic
+   - trade approval logic
+   - strategy selection
+   - scoring systems
+   - diagnostics or exports
+5. Whether mod-governor contains any unique controls not available in the
+   AI Decision Center Confidence tab.
+6. Specifically determine whether these controls are unique:
+   - Demote toggle
+   - Score toggle
+7. Which rendering code is exclusive to mod-governor.
+8. Which backend calculations and shared logic must remain.
+
+Then perform the smallest safe change.
+
+REQUIREMENTS
+
+1. Remove the standalone mod-governor panel from the rendered dashboard only if
+   its controls remain safely accessible elsewhere.
+
+2. Preserve:
+- d.confidence_governor in the /status response
+- Base edge calculation
+- Final confidence calculation
+- Net adjustment calculation
+- Threshold calculation
+- Adjustment breakdown
+- Confidence demotion logic
+- Confidence scoring logic
+- AI Decision Center → Confidence tab
+- Main Brain confidence references
+- Any trade-gating or strategy dependencies
+- Any shared formatting functions
+- Any saved settings, API endpoints, or exports
+
+3. UNIQUE CONTROL SAFETY RULE
+
+If the Demote toggle or Score toggle exists only inside mod-governor:
+
+- Do not silently remove the panel.
+- Do not remove access to those controls.
+- Stop before removal and report exactly which controls are unique.
+- Recommend the smallest future micro-step to move those controls into the
+  AI Decision Center Confidence tab.
+
+Only remove mod-governor during this phase if both controls already exist
+elsewhere or the standalone panel contains no unique controls.
+
+4. Remove mod-governor from any:
+- Dashboard markup
+- Section navigation registry
+- Panel category registry
+- Advanced View visibility rules
+- Panel lookup lists
+- Dashboard inventory structures
+- Client-side update loops used only by mod-governor
+
+5. Remove JavaScript and CSS only when used exclusively by mod-governor.
+
+6. Do not remove or rename:
+- d.confidence_governor
+- confidence_governor
+- AI Decision Center Confidence tab
+- Demote state
+- Score state
+- Confidence thresholds
+- Trade-gating dependencies
+
+7. Do not modify any other panel.
+
+8. Do not:
+- Move panels
+- Resize panels
+- Change navigation
+- Redesign layout
+- Change confidence formulas
+- Change thresholds
+- Change verdict logic
+- Change trade approval behavior
+- Change toggle defaults
+- Perform unrelated cleanup
+
+SUCCESS CRITERIA
+
+The phase passes only if one of these outcomes occurs:
+
+OUTCOME A — Safe removal
+
+- mod-governor no longer exists in the rendered DOM.
+- Confidence Governor is absent with Advanced View OFF and ON.
+- AI Decision Center → Confidence still displays:
+  - Base edge
+  - Final confidence
+  - Net adjustment
+  - Threshold
+  - Adjustment breakdown
+- Demote and Score controls remain accessible and functional.
+- d.confidence_governor remains present in /status.
+- No empty panel gap remains.
+- No other panel changes.
+- No new browser-console errors.
+
+OUTCOME B — Safe stop
+
+- Replit confirms one or both controls are unique.
+- No code is changed.
+- Replit reports the exact controls and dependencies.
+- Replit identifies the smallest next micro-step needed before removal.
+
+TESTING
+
+If removal is safe:
+
+1. Search served HTML for:
+   id="mod-governor"
+
+2. Confirm it is absent.
+
+3. Load dashboard with Advanced View OFF.
+
+4. Turn Advanced View ON.
+
+5. Confirm no standalone Confidence Governor panel appears.
+
+6. Open AI Decision Center → Confidence.
+
+7. Confirm all confidence values and adjustment details populate.
+
+8. Test the Demote toggle.
+
+9. Test the Score toggle.
+
+10. Confirm each toggle retains its state after switching dashboard sections.
+
+11. Inspect /status and confirm confidence_governor still exists.
+
+12. Verify one READY or WAIT decision still uses confidence normally.
+
+13. Check the browser console.
+
+FINAL RESPONSE
+
+Return:
+
+- Outcome A or Outcome B
+- Files changed, if any
+- Exact markup removed, if any
+- Standalone JavaScript removed, if any
+- Shared confidence logic preserved
+- Whether Demote is duplicated or unique
+- Whether Score is duplicated or unique
+- Where both controls remain accessible
+- CSS, registry, and visibility references removed
+- AI Decision Center Confidence test result
+- Toggle test results
+- /status confidence_governor result
+- Browser-console result
+- Confirmation that no other panel was modified
+
+Do not begin Phase 1.11.
