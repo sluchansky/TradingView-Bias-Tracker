@@ -1775,6 +1775,10 @@ OVERSIZED_LOSS_PROTECTION_ENABLED = os.environ.get("OVERSIZED_LOSS_PROTECTION_EN
 OVERSIZED_LOSS_MULT               = max(1.0, float(os.environ.get("OVERSIZED_LOSS_MULT", "1.5") or 1.5))
 SESSION_QUALITY_ENABLED           = os.environ.get("SESSION_QUALITY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 BOT_HOLD_SCORE_ENABLED            = os.environ.get("BOT_HOLD_SCORE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# ── Dashboard reorganization feature flags (DISPLAY-ONLY; backend unchanged) ─
+UNIFIED_DASHBOARD_ENABLED         = os.environ.get("UNIFIED_DASHBOARD_ENABLED", "1").strip() == "1"
+HIGH_VOLUME_PANEL_ENABLED         = os.environ.get("HIGH_VOLUME_PANEL_ENABLED", "1").strip() == "1"
+TOP_NAVIGATION_ENABLED            = os.environ.get("TOP_NAVIGATION_ENABLED", "1").strip() == "1"
 
 # ── Active Trade Management (ADVISORY / DISPLAY-ONLY, default ON) ──────────────
 # After the bot enters/suggests a trade, continuously re-evaluate the OPEN position
@@ -3845,6 +3849,94 @@ SESSION_WINDOWS = (
     ("20:00–23:00 ET", 20.0, 23.0),
 )
 SESSION_BONUS_POINTS = 10
+
+# ── High-Volume Session Windows ─────────────────────────────────────────────
+# Configurable per instrument. DISPLAY-ONLY: these windows appear on the
+# dashboard for timing awareness. They NEVER gate, score, or size trades.
+HIGH_VOLUME_SESSIONS = {
+    "MNQ": [
+        {"name": "Open Drive",    "start": "09:30", "end": "10:30"},
+        {"name": "Mid-Morning",   "start": "10:30", "end": "11:30"},
+        {"name": "Power Hour",    "start": "15:00", "end": "16:00"},
+    ],
+    "MES": [
+        {"name": "Open Drive",    "start": "09:30", "end": "10:30"},
+        {"name": "Mid-Morning",   "start": "10:30", "end": "11:30"},
+        {"name": "Power Hour",    "start": "15:00", "end": "16:00"},
+    ],
+    "MYM": [
+        {"name": "Open Drive",    "start": "09:30", "end": "10:30"},
+        {"name": "Mid-Morning",   "start": "10:30", "end": "11:30"},
+        {"name": "Power Hour",    "start": "15:00", "end": "16:00"},
+    ],
+    "MGC": [
+        {"name": "Gold Open",     "start": "08:20", "end": "09:20"},
+        {"name": "Post-Equities", "start": "09:20", "end": "10:20"},
+        {"name": "London Fix",    "start": "13:30", "end": "14:30"},
+    ],
+}
+
+
+def compute_hv_session_windows(ticker, now=None):
+    """Return HV session windows for ticker with state UPCOMING/ACTIVE/COMPLETED.
+
+    DISPLAY-ONLY — pure function of the clock. Never touches the gate or
+    any money-path variable. Safe to call on every /status poll.
+    """
+    import datetime as _dt
+    inst = instrument_of(ticker) if ticker else "MGC"
+    windows = HIGH_VOLUME_SESSIONS.get(inst, HIGH_VOLUME_SESSIONS.get("MGC", []))
+    base = now or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    et = base.astimezone(ET_TZ)
+    today = et.date()
+    result = []
+    for w in windows:
+        try:
+            sh, sm = [int(x) for x in w["start"].split(":")]
+            eh, em = [int(x) for x in w["end"].split(":")]
+        except (ValueError, KeyError):
+            continue
+        try:
+            start_naive = _dt.datetime(today.year, today.month, today.day, sh, sm)
+            end_naive   = _dt.datetime(today.year, today.month, today.day, eh, em)
+            start_et = ET_TZ.localize(start_naive)
+            end_et   = ET_TZ.localize(end_naive)
+        except Exception:
+            start_et = _dt.datetime(today.year, today.month, today.day, sh, sm,
+                                    tzinfo=ET_TZ)
+            end_et   = _dt.datetime(today.year, today.month, today.day, eh, em,
+                                    tzinfo=ET_TZ)
+        if et < start_et:
+            state = "UPCOMING"
+            delta = start_et - et
+            total_sec = int(delta.total_seconds())
+            h, rem = divmod(total_sec, 3600)
+            m_rem, _ = divmod(rem, 60)
+            countdown_str = ("%dh %02dm" % (h, m_rem)) if h else ("%dm" % m_rem)
+            remaining_str = None
+        elif et < end_et:
+            state = "ACTIVE"
+            delta = end_et - et
+            total_sec = int(delta.total_seconds())
+            h, rem = divmod(total_sec, 3600)
+            m_rem, _ = divmod(rem, 60)
+            remaining_str = ("%dh %02dm" % (h, m_rem)) if h else ("%dm" % m_rem)
+            countdown_str = None
+        else:
+            state = "COMPLETED"
+            countdown_str = None
+            remaining_str = None
+        result.append({
+            "name":          w["name"],
+            "start_et":      w["start"],
+            "end_et":        w["end"],
+            "state":         state,
+            "countdown_str": countdown_str,
+            "remaining_str": remaining_str,
+        })
+    return result
 
 
 def get_session_state(now=None):
@@ -37333,6 +37425,14 @@ def _build_status_payload(_tk):
         # off mode:    None (gate not computed)
         # enforced:    action=="BLOCK" already demoted verdict before we reach here
         "thesis_gate": a.get("thesis_gate"),
+        # ── High-Volume Session Windows — DISPLAY-ONLY ──────────────────────
+        # Per-instrument UPCOMING/ACTIVE/COMPLETED state for the 3 priority
+        # trading windows. Never gates, scores, or sizes any trade.
+        "session_windows": (
+            {inst: compute_hv_session_windows(inst)
+             for inst in HIGH_VOLUME_SESSIONS}
+            if HIGH_VOLUME_PANEL_ENABLED else None
+        ),
     }
 
 
@@ -42589,6 +42689,27 @@ def dashboard():
 .th-neutral-txt{font-size:12px;color:#444}
 html[data-theme=retro] .th-card{background:rgba(0,20,0,.38);border-radius:4px}
 html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
+/* ── Unified Dashboard: 5-section live-nav ── */
+#live-nav{display:none;flex-direction:row;gap:4px;padding:6px 0 10px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+#live-nav::-webkit-scrollbar{display:none}
+.ln-btn{flex:0 0 auto;padding:5px 13px;border-radius:16px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:10px;font-weight:700;letter-spacing:.9px;cursor:pointer;font-family:var(--sans);text-transform:uppercase;transition:all .15s;white-space:nowrap}
+.ln-btn:hover{color:var(--text);border-color:var(--border-lit)}
+.ln-btn.active{background:rgba(217,119,6,.18);color:#f59e0b;border-color:rgba(245,158,11,.4)}
+/* ── High-Volume Sessions panel ── */
+#mod-hvsessions .hvs-win{border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:7px;background:var(--panel)}
+#mod-hvsessions .hvs-win.hvs-active{border-color:var(--green,#34e3a4);background:rgba(52,227,164,.07)}
+#mod-hvsessions .hvs-win.hvs-upcoming{border-color:var(--amber,#f59e0b);background:rgba(245,158,11,.05)}
+#mod-hvsessions .hvs-win.hvs-completed{opacity:.55}
+.hvs-state{font-size:9px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px}
+.hvs-win.hvs-active .hvs-state{color:var(--green,#34e3a4)}
+.hvs-win.hvs-upcoming .hvs-state{color:var(--amber,#f59e0b)}
+.hvs-win.hvs-completed .hvs-state{color:var(--muted,#6b7280)}
+.hvs-name{font-size:13px;font-weight:700;color:var(--text,#f3f4f6);margin-bottom:2px}
+.hvs-time{font-size:11px;color:var(--muted,#6b7280)}
+.hvs-cd{font-size:18px;font-weight:800;font-family:var(--mono,monospace);color:var(--cyan,#52e0ff);margin-top:4px}
+.hvs-tabs{display:flex;gap:4px;margin-bottom:9px}
+.hvs-tab{padding:3px 10px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--muted,#6b7280);font-size:10px;font-weight:700;cursor:pointer;font-family:var(--sans);letter-spacing:.7px}
+.hvs-tab.active{background:rgba(82,224,255,.12);color:var(--cyan,#52e0ff);border-color:rgba(82,224,255,.35)}
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
 </head>
@@ -42640,6 +42761,15 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 </div>
 
 <div id="view-live">
+
+<!-- ── Unified Dashboard: 5-section live-nav (shown when UNIFIED_DASH=1) ── -->
+<div id="live-nav">
+  <button class="ln-btn active" data-sec="overview" onclick="setLiveSection('overview')">Overview</button>
+  <button class="ln-btn" data-sec="brain" onclick="setLiveSection('brain')">Brain</button>
+  <button class="ln-btn" data-sec="analysis" onclick="setLiveSection('analysis')">Analysis</button>
+  <button class="ln-btn" data-sec="journal" onclick="setLiveSection('journal')">Journal</button>
+  <button class="ln-btn" data-sec="controls" onclick="setLiveSection('controls')">Controls</button>
+</div>
 
 <!-- Sensitivity (trading mode) -->
 <div id="mode-row">
@@ -44369,6 +44499,19 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
   <div id="ae-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
+<!-- ════ High-Volume Session Windows (DISPLAY-ONLY; never gates trades) ════ -->
+<div class="mod" id="mod-hvsessions">
+  <div class="mod-h">&#x23F0; High-Volume Session Windows <span style="font-size:10px;color:#6b7280;margin-left:auto;letter-spacing:.8px">DISPLAY ONLY</span></div>
+  <div style="font-size:11px;color:#9aa;margin:0 0 8px">Configurable per instrument. These windows reflect typical high-activity hours. They never gate, score, or size any trade.</div>
+  <div class="hvs-tabs" id="hvs-tabs">
+    <button class="hvs-tab active" data-inst="MGC" onclick="hvsSetInst('MGC')">MGC</button>
+    <button class="hvs-tab" data-inst="MNQ" onclick="hvsSetInst('MNQ')">MNQ</button>
+    <button class="hvs-tab" data-inst="MES" onclick="hvsSetInst('MES')">MES</button>
+    <button class="hvs-tab" data-inst="MYM" onclick="hvsSetInst('MYM')">MYM</button>
+  </div>
+  <div id="hvs-body"><div style="color:var(--muted);font-size:12px;padding:8px 0">Loading session windows&#8230;</div></div>
+</div>
+
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
 <div class="mod" id="mod-cvd">
   <div class="mod-h">📊 Volume Delta (CVD) &amp; RVOL</div>
@@ -45426,6 +45569,7 @@ function renderModules(d){
   renderMainBrainCognitive(d);
   try{ renderStalkMode(d); }catch(e){}
   try{ renderActiveThinking(d); }catch(e){}
+  try{ hvsUpdateFromStatus(d); }catch(e){}
   const diag   = d.alert_diagnostics || {};
   const v      = d.verdict || 'WAIT';
   const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
@@ -50145,6 +50289,109 @@ function _liveAnchoredPotential(pp, dir, inst) {
 function _edgeBdPref(){ try{ return localStorage.getItem('edgeBdCollapsed'); }catch(e){ return null; } }
 function onEdgeBdToggle(el){ try{ localStorage.setItem('edgeBdCollapsed', el.open ? '0' : '1'); }catch(e){} }
 
+// ── Unified Dashboard: 5-section live-nav ──────────────────────────────────
+// DISPLAY-ONLY feature. Never touches the money path, gate, or execution flow.
+var UNIFIED_DASH = ('__UNIFIED_DASH__' === '1');
+var _liveNavSections = {
+  overview: ['mod-data-feed','mod-real-results'],
+  brain: ['mod-mb-voice','mod-mb-predictions','mod-mb-confidence','mod-mb-narrative',
+    'mod-mb-events','mod-mb-thesis','mod-mb-daytype','mod-mb-learning','mod-assistant'],
+  analysis: ['mod-chartprev','mod-cvd','mod-mi','mod-scores','mod-prob','mod-checklist',
+    'mod-countdown','mod-whynot','mod-fastentry','mod-xmarket','mod-strategy',
+    'mod-report','mod-analyst','mod-pro','mod-entryq','mod-debate','mod-scalpdiag',
+    'mod-swingdiag','mod-swingstrat','mod-breakout','mod-scalp-advisory',
+    'mod-stalk-mode','mod-active-thinking','mod-dual-sim','mod-microscalp',
+    'mod-review','mod-rule-engine','mod-hvsessions'],
+  journal: ['mod-equity','mod-trades','mod-news','mod-sessionq','mod-trademgmt'],
+  controls: ['mod-prop','mod-training','mod-bothold','mod-atm','mod-liverunner',
+    'mod-autoexit','mod-learning','mod-governor','mod-memory','mod-exec-reject',
+    'mod-broker-send-log']
+};
+var _liveNavAllIds = (function(){
+  var r=[];
+  Object.keys(_liveNavSections).forEach(function(k){
+    _liveNavSections[k].forEach(function(id){r.push(id);});
+  });
+  return r;
+})();
+function setLiveSection(sec) {
+  if (!UNIFIED_DASH) return;
+  try { localStorage.setItem('live_section', sec); } catch(e) {}
+  // Update nav button state
+  document.querySelectorAll('#live-nav .ln-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.sec === sec);
+  });
+  // Show/hide managed panels
+  var active = _liveNavSections[sec] || [];
+  _liveNavAllIds.forEach(function(id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var show = (active.indexOf(id) !== -1);
+    if (show) {
+      el.style.display = (el._liveOrigDisplay !== undefined) ? (el._liveOrigDisplay || '') : '';
+    } else {
+      if (el._liveOrigDisplay === undefined) el._liveOrigDisplay = el.style.display || '';
+      el.style.display = 'none';
+    }
+  });
+  // Brain 3-column layout visible only in Overview section
+  var showBrain = (sec === 'overview');
+  ['live-layout','bl-bottom','bl-drawer-row'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = showBrain ? '' : 'none';
+  });
+}
+function initUnifiedDash() {
+  if (!UNIFIED_DASH) return;
+  var nav = document.getElementById('live-nav');
+  if (nav) nav.style.display = 'flex';
+  var saved = 'overview';
+  try { saved = localStorage.getItem('live_section') || 'overview'; } catch(e) {}
+  setLiveSection(saved);
+}
+
+// ── High-Volume Sessions panel ─────────────────────────────────────────────
+var _hvsInst = 'MGC';
+var _hvsData = {};
+function hvsSetInst(inst) {
+  _hvsInst = inst;
+  document.querySelectorAll('#hvs-tabs .hvs-tab').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.inst === inst);
+  });
+  hvsRender();
+}
+function hvsRender() {
+  var body = document.getElementById('hvs-body');
+  if (!body) return;
+  var wins = (_hvsData[_hvsInst] || []);
+  if (!wins.length) {
+    body.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px 0">No session data available.</div>';
+    return;
+  }
+  var h = '';
+  wins.forEach(function(w) {
+    var state = (w.state || 'UPCOMING').toLowerCase();
+    h += '<div class="hvs-win hvs-' + state + '">';
+    h += '<div class="hvs-state">' + esc(w.state || 'UPCOMING') + '</div>';
+    h += '<div class="hvs-name">' + esc(w.name) + '</div>';
+    h += '<div class="hvs-time">' + esc(w.start_et) + ' &#x2013; ' + esc(w.end_et) + ' ET</div>';
+    if (w.state === 'UPCOMING' && w.countdown_str) {
+      h += '<div class="hvs-cd">Opens in ' + esc(w.countdown_str) + '</div>';
+    } else if (w.state === 'ACTIVE' && w.remaining_str) {
+      h += '<div class="hvs-cd">' + esc(w.remaining_str) + ' remaining</div>';
+    } else if (w.state === 'COMPLETED') {
+      h += '<div style="font-size:11px;color:var(--muted);margin-top:4px">Session complete</div>';
+    }
+    h += '</div>';
+  });
+  body.innerHTML = h;
+}
+function hvsUpdateFromStatus(d) {
+  if (!d || !d.session_windows) return;
+  _hvsData = d.session_windows;
+  hvsRender();
+}
+
 // Render the checklist + edge score + plan/reason for the CURRENTLY SELECTED
 // direction (the Long/Short toggle). Reads lastRec.directions[dir]; falls back to
 // the authoritative favored block if directions is missing (older server).
@@ -53175,6 +53422,8 @@ function pollThesis() {
 }
 setInterval(pollThesis, 3000);
 setTimeout(pollThesis, 500);
+// ── Unified Dashboard init (runs once at page load, DISPLAY-ONLY) ───────────
+try { initUnifiedDash(); } catch(e) {}
 
 // ── THESIS SHADOW VALIDATION PANEL (Phase 3) ───────────────────────────────
 function loadThesisStats() {
@@ -53241,6 +53490,8 @@ setTimeout(loadThesisStats, 1500);
     html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
     html = html.replace("__BELL_DATA_URI__", BELL_DATA_URI)
     html = html.replace("__APP_ICON_DATA_URI__", APP_ICON_DATA_URI)
+    html = html.replace("__UNIFIED_DASH__", "1" if UNIFIED_DASHBOARD_ENABLED else "0")
+    html = html.replace("__HV_PANEL__", "1" if HIGH_VOLUME_PANEL_ENABLED else "0")
     return html, 200, {
         "Content-Type": "text/html; charset=utf-8",
         # The dashboard is a live view whose inline JS changes on every deploy.

@@ -1,0 +1,837 @@
+DASHBOARD REORGANIZATION — CLEANUP, UNIFIED MARKET BRAIN, AND HIGH-VOLUME SESSION VIEW
+
+OBJECTIVE
+
+Reorganize the existing dashboard before deployment and live testing.
+
+Do not add another development phase.
+Do not add new strategies, indicators, scoring models, AI services, or execution logic.
+
+The goal is to:
+
+1. Remove or repair blank panels.
+2. Move approximately 75% of secondary panels into top navigation dropdowns.
+3. Replace the current confusing Brain panel with one unified market interpretation.
+4. Stop panels from displaying contradictory independent predictions.
+5. Separate long-term context, intraday direction, and entry timing.
+6. Add a dedicated High-Volume Session view for the three most important trading windows.
+7. Preserve all existing trading, risk, webhook, TradersPost, thesis, and shadow-mode behavior.
+
+This task is primarily dashboard architecture, data wiring, and presentation.
+
+--------------------------------------------------
+PART 1 — INVENTORY EVERY CURRENT PANEL
+--------------------------------------------------
+
+Before changing the dashboard, create a complete inventory of all existing panels.
+
+For every panel, document:
+
+- Panel name
+- Frontend component/file
+- Backend endpoint or data source
+- Expected fields
+- Fields actually received
+- Polling or websocket method
+- Whether data is current or stale
+- Whether the panel renders correctly
+- Whether the panel duplicates another panel
+- Whether it issues an independent bullish/bearish verdict
+- Recommendation:
+  - KEEP ON OVERVIEW
+  - MOVE TO MENU
+  - FIX
+  - REMOVE
+  - ARCHIVE
+
+Create a temporary developer report or markdown file containing this audit.
+
+Do not remove a panel simply because it is currently blank until its endpoint and expected data have been checked.
+
+--------------------------------------------------
+PART 2 — HANDLE BLANK PANELS
+--------------------------------------------------
+
+For every blank panel, identify the exact reason.
+
+Check for:
+
+- Wrong API endpoint
+- Old response schema
+- Renamed fields
+- Missing instrument normalization
+- Frontend expecting camelCase while backend returns snake_case
+- Feature flag disabled
+- Backend not persisting data
+- Polling never starting
+- Failed websocket connection
+- Silent JavaScript exception
+- Empty database table
+- Endpoint returning null
+- Unsupported instrument
+- Data being written to a different legacy table
+- Market-closed state
+- Component hidden behind incorrect conditions
+
+Classify each blank panel as:
+
+A. FIX
+The feature is active and useful but the data connection is broken.
+
+B. EMPTY BY DESIGN
+There is currently no data, but the feature is valid.
+
+C. OBSOLETE
+The panel belongs to an old or replaced feature.
+
+D. DUPLICATE
+The same information is already displayed elsewhere.
+
+Required behavior:
+
+- FIX panels must be connected to the correct data.
+- EMPTY BY DESIGN panels must display a clear empty state.
+- OBSOLETE panels must be removed from the main dashboard.
+- DUPLICATE panels must be consolidated.
+
+Never leave a blank unexplained container.
+
+Use messages such as:
+
+- No thesis history recorded yet
+- Waiting for first completed trade
+- No active position
+- No TradingView data received in the last 10 minutes
+- Shadow validation has no completed outcomes yet
+- Market is closed
+- Feature disabled in environment settings
+- Data source unavailable
+
+Include:
+
+- Last successful update
+- Data source
+- Error state when applicable
+
+--------------------------------------------------
+PART 3 — NEW TOP DASHBOARD NAVIGATION
+--------------------------------------------------
+
+Move approximately 75% of dashboard panels out of the default overview.
+
+Create a persistent top navigation system:
+
+OVERVIEW
+MARKET
+TRADE
+PERFORMANCE
+SYSTEM
+
+Each top-level item should open a dropdown or view selector.
+
+Suggested structure:
+
+OVERVIEW
+- Command Center
+- Unified Market Brain
+- Active Thesis
+- High-Volume Sessions
+- Current Trade
+- Account and Risk
+
+MARKET
+- Multi-Timeframe Context
+- Market Structure
+- Supply and Demand
+- VWAP
+- CVD / Delta
+- Volume / RVOL
+- Liquidity Sweeps
+- Fast Entry
+- Thesis Timeline
+
+TRADE
+- Current Opportunity
+- Open Position
+- Trade Management
+- TradersPost Activity
+- TradingView Alerts
+- Order History
+- Risk Controls
+
+PERFORMANCE
+- Journal
+- Shadow Validation
+- Thesis Statistics
+- Strategy Performance
+- Instrument Performance
+- Session Performance
+- Trade Outcomes
+
+SYSTEM
+- Diagnostics
+- Webhook Health
+- Market Data Freshness
+- Database Status
+- Discord Status
+- Feature Flags
+- Error Log
+- Deployment Health
+
+Desktop behavior:
+
+- Top navigation stays visible.
+- Selecting a menu item replaces the main workspace.
+- Do not stack every selected component on one endless page.
+- Remember the user’s last selected view.
+
+Mobile behavior:
+
+Use a compact selector:
+
+View: Command Center ▼
+
+The mobile selector should open the same categories and views.
+
+Do not create horizontal overflow.
+
+--------------------------------------------------
+PART 4 — DEFAULT OVERVIEW LAYOUT
+--------------------------------------------------
+
+The default dashboard should show only the information needed for immediate decisions.
+
+Persistent top status bar:
+
+- Selected instrument
+- Mode: SCALP / SWING
+- Market open or closed
+- Data freshness
+- Account state
+- Auto-trade state
+- Thesis enforcement mode
+- Current time in Eastern Time
+
+Primary overview layout:
+
+1. Unified Market Brain
+2. Active Market Thesis
+3. High-Volume Session panel
+4. Current Trade / Current Opportunity
+5. Compact account and risk status
+
+Everything else belongs in the menu system.
+
+--------------------------------------------------
+PART 5 — REPLACE THE CURRENT BRAIN PANEL
+--------------------------------------------------
+
+The current Brain panel is not useful enough and must be reorganized.
+
+Do not make it a generic chatbot transcript.
+
+The new Unified Market Brain must answer:
+
+1. What is happening in the market now?
+2. What is the higher-timeframe direction?
+3. What is the intraday direction?
+4. What is happening on the entry timeframe?
+5. Are these layers aligned?
+6. What does the bot expect price to attempt next?
+7. What is the preferred trade scenario?
+8. What is the alternative scenario?
+9. What would invalidate the current interpretation?
+10. Is the correct action ENTER, WAIT, MANAGE, or AVOID?
+
+Required panel sections:
+
+A. HIGHER-TIMEFRAME CONTEXT
+
+Display:
+
+- Direction: BULLISH / BEARISH / NEUTRAL
+- Confidence
+- Timeframes used
+- Major structure
+- Major supply/demand location
+- Key higher-timeframe target
+- Higher-timeframe invalidation
+
+Suggested timeframes:
+
+- Daily
+- 4-hour
+- 1-hour
+
+B. INTRADAY CONTEXT
+
+Display:
+
+- Direction
+- Confidence
+- Current session trend
+- 15-minute and 5-minute structure
+- VWAP position
+- Active intraday zone
+- Session high and low
+- Overnight high and low
+- Previous-day high and low
+
+C. ENTRY-TIMING CONTEXT
+
+Display:
+
+- 1-minute state
+- 15-second or 5-second state when available
+- Sweep status
+- Delta/CVD status
+- Micro structure
+- Volume impulse
+- Entry timing status:
+  - CONFIRMED
+  - FORMING
+  - EARLY
+  - LATE
+  - NOT CONFIRMED
+
+D. CURRENT MARKET PHASE
+
+Use a controlled set of labels:
+
+- TREND EXPANSION
+- PULLBACK
+- CONSOLIDATION
+- BREAKOUT ATTEMPT
+- FAILED BREAKOUT
+- REVERSAL ATTEMPT
+- LIQUIDITY SWEEP
+- RANGE
+- OPENING DRIVE
+- CLOSING DRIVE
+- LOW-LIQUIDITY CHOP
+
+E. WHAT PRICE IS DOING
+
+Generate one concise explanation from the actual evidence.
+
+Example:
+
+Price is pulling back inside a bullish intraday structure while holding above the session VWAP and testing an active demand zone.
+
+F. EXPECTED NEXT PATH
+
+Show:
+
+Preferred path
+Alternative path
+Conditions required for each path
+Key target levels
+
+This is an interpretation, not a guaranteed forecast.
+
+G. CURRENT ACTION
+
+Use one final action:
+
+- ENTER LONG
+- ENTER SHORT
+- WAIT
+- MANAGE LONG
+- MANAGE SHORT
+- AVOID
+- MARKET CLOSED
+
+H. WAITING FOR
+
+When action is WAIT, list the exact missing confirmations.
+
+Example:
+
+- 5-minute bullish CHOCH
+- Reclaim of VWAP
+- CVD flip bullish
+- Volume above minimum threshold
+
+I. INVALIDATION
+
+Show:
+
+- Invalidation level
+- Invalidation reason
+- Evidence that would make the thesis wrong
+
+J. TRADE READINESS
+
+Display:
+
+- Higher-timeframe alignment
+- Intraday alignment
+- Entry-timing alignment
+- Thesis status
+- Confidence
+- Edge score
+- Shadow gate result
+- Final readiness state
+
+--------------------------------------------------
+PART 6 — ONE SOURCE OF TRUTH FOR MARKET DIRECTION
+--------------------------------------------------
+
+Current panels must stop competing with each other.
+
+Indicators and strategy modules may provide evidence, but they may not publish independent final trade directions on the main dashboard.
+
+Required architecture:
+
+RAW MARKET DATA
+↓
+EVIDENCE MODULES
+↓
+TIMEFRAME INTERPRETATIONS
+↓
+PERSISTENT MARKET THESIS
+↓
+UNIFIED MARKET BRAIN
+↓
+FINAL ACTION
+↓
+EXECUTION PATH
+
+Examples of evidence modules:
+
+- Market structure
+- VWAP
+- CVD
+- Delta
+- Volume
+- RVOL
+- Supply/demand
+- Liquidity sweep
+- Opening range
+- Strategy matches
+
+These modules may return states such as:
+
+- bullish
+- bearish
+- aligned
+- opposing
+- confirmed
+- weak
+- unavailable
+
+They should not independently display:
+
+- BUY NOW
+- SELL NOW
+- EXPECTED UP
+- EXPECTED DOWN
+
+Only the Unified Market Brain should display the final interpretation and action.
+
+Keep raw module details available in the MARKET menu.
+
+--------------------------------------------------
+PART 7 — MULTI-TIMEFRAME ALIGNMENT
+--------------------------------------------------
+
+Create one shared timeframe alignment object per instrument.
+
+Suggested output:
+
+{
+  "instrument": "MNQ",
+  "higherTimeframe": {
+    "direction": "BULLISH",
+    "confidence": 78,
+    "timeframes": {
+      "1D": "BULLISH",
+      "4H": "BULLISH",
+      "1H": "NEUTRAL"
+    }
+  },
+  "intraday": {
+    "direction": "BULLISH",
+    "confidence": 71,
+    "timeframes": {
+      "15M": "BULLISH",
+      "5M": "BULLISH"
+    }
+  },
+  "entryTiming": {
+    "direction": "BEARISH_PULLBACK",
+    "confidence": 58,
+    "timeframes": {
+      "1M": "BEARISH",
+      "15S": "NEUTRAL",
+      "5S": "NO_SIGNAL"
+    }
+  },
+  "combinedInterpretation": "Bullish context with a short-term pullback",
+  "action": "WAIT",
+  "waitingFor": [
+    "5M bullish confirmation",
+    "CVD bullish flip"
+  ]
+}
+
+Create an Alignment Matrix in the brain panel:
+
+4H     BULLISH
+1H     BULLISH
+15M    BULLISH
+5M     NEUTRAL
+1M     BEARISH PULLBACK
+5S     NO SIGNAL
+
+Then summarize it:
+
+LONG-TERM: BULLISH
+SHORT-TERM: PULLBACK
+ENTRY TIMING: NOT READY
+FINAL ACTION: WAIT
+
+Do not label different-timeframe conditions as contradictions when they can coexist.
+
+Examples:
+
+- Bullish higher timeframe plus bearish 1-minute = bullish context with short-term pullback
+- Bearish higher timeframe plus bullish 1-minute = bearish context with short-term bounce
+- Mixed higher timeframes = neutral or transition
+- Aligned higher and lower timeframes = directional continuation setup
+
+SCALP mode:
+
+- Higher timeframe provides context.
+- 15M and 5M determine intraday direction.
+- 1M, 15S, and 5S determine entry timing.
+
+SWING mode:
+
+- Daily, 4H, and 1H carry more weight.
+- 15M and 5M are used for entry refinement.
+- Micro timeframes must not reverse the swing thesis alone.
+
+Do not create a second unrelated edge score.
+
+--------------------------------------------------
+PART 8 — HIGH-VOLUME SESSION COMMAND PANEL
+--------------------------------------------------
+
+Create a dedicated High-Volume Sessions view and a compact version on the Overview.
+
+This panel should focus on the three highest-priority trading windows per instrument.
+
+Initial configurable defaults:
+
+MNQ / MES / MYM:
+
+- Window 1: 9:30 AM–10:30 AM ET
+- Window 2: 10:30 AM–11:30 AM ET
+- Window 3: 3:00 PM–4:00 PM ET
+
+MGC:
+
+- Window 1: 8:20 AM–9:20 AM ET
+- Window 2: 9:20 AM–10:20 AM ET
+- Window 3: 1:30 PM–2:30 PM ET
+
+Store these in configuration rather than hardcoding them throughout the UI.
+
+Allow future configuration by instrument and mode.
+
+The panel must have three operating states:
+
+A. UPCOMING WINDOW
+
+Show:
+
+- Window name
+- Start time
+- Countdown
+- Overnight high and low
+- Previous-day high and low
+- Session VWAP
+- Important supply/demand zones
+- Higher-timeframe bias
+- Intraday bias
+- Primary scenario
+- Secondary scenario
+- No-trade condition
+
+B. ACTIVE WINDOW
+
+Show:
+
+- Time remaining
+- Current market phase
+- Opening range high and low
+- Opening range width
+- Current price relative to range
+- Volume versus average
+- RVOL
+- VWAP state
+- Sweep events
+- Structure events
+- CVD state
+- Brain interpretation
+- Preferred setup
+- Entry conditions
+- Do-not-chase level
+- Invalidation
+- Current action
+
+C. COMPLETED WINDOW
+
+Show:
+
+- Direction of initial move
+- Whether breakout held or failed
+- Maximum extension
+- Maximum reversal
+- Best qualifying setup
+- Whether an entry triggered
+- Outcome
+- R result
+- Whether the brain direction was correct
+- Whether entry timing was early, correct, or late
+
+--------------------------------------------------
+PART 9 — BRAIN CONTROL DURING HIGH-VOLUME WINDOWS
+--------------------------------------------------
+
+The High-Volume Session panel should not be another isolated strategy.
+
+It should change the presentation priorities of the Unified Market Brain.
+
+Required behavior:
+
+NORMAL MODE
+- General thesis and market monitoring
+
+WINDOW APPROACHING
+- Build session plan
+- Highlight key levels and scenarios
+
+WINDOW ACTIVE
+- Prioritize:
+  - Opening range
+  - Overnight high and low
+  - Previous-day levels
+  - VWAP
+  - Volume expansion
+  - RVOL
+  - Liquidity sweeps
+  - Break-and-hold
+  - Sweep-and-reject
+  - 5-minute structure
+  - Fast-entry confirmation
+
+WINDOW COMPLETE
+- Grade the window
+- Save the result
+- Return to normal monitoring
+
+Do not automatically submit a trade merely because a high-volume window begins.
+
+All existing readiness, risk, and execution safeguards remain active.
+
+--------------------------------------------------
+PART 10 — DATA FRESHNESS
+--------------------------------------------------
+
+Every major dashboard data block must show freshness.
+
+Required states:
+
+- LIVE
+- DELAYED
+- STALE
+- UNAVAILABLE
+- MARKET CLOSED
+
+Display:
+
+- Last event timestamp
+- Age of data
+- Data source
+
+Suggested stale thresholds must be configurable by data type.
+
+Examples:
+
+- Fast-entry data becomes stale quickly.
+- Higher-timeframe structure can remain valid longer.
+- VWAP data must not be presented as live if it was last refreshed 20 minutes ago.
+- CVD must not display a current directional state if its latest alert is stale.
+
+If critical data is stale, the brain must say so.
+
+Example:
+
+ACTION: WAIT
+Reason: CVD and fast-entry data are stale.
+
+Do not silently reuse old data as current confirmation.
+
+--------------------------------------------------
+PART 11 — PRESERVE EXISTING LOGIC
+--------------------------------------------------
+
+This dashboard task must not change:
+
+- Phase 1 hysteresis logic
+- Phase 2 thesis persistence
+- Phase 3 shadow validation
+- Existing edge score
+- READY threshold
+- Hold threshold
+- Reversal threshold
+- Risk calculations
+- Entry calculation
+- Stop calculation
+- Target calculation
+- Contract sizing
+- TradersPost payloads
+- TradingView webhook behavior
+- Discord execution alerts
+- Auto-trade state
+- Account rules
+
+The new Unified Market Brain may summarize existing data but must not invent unavailable inputs.
+
+When data is missing, display UNKNOWN or UNAVAILABLE.
+
+--------------------------------------------------
+PART 12 — FEATURE FLAGS AND SAFE ROLLBACK
+--------------------------------------------------
+
+Add a dashboard feature flag if one does not already exist:
+
+UNIFIED_DASHBOARD_ENABLED=1
+
+When disabled:
+
+- Restore the existing dashboard layout.
+- Backend trading behavior remains unchanged.
+
+Optional separate flags:
+
+HIGH_VOLUME_PANEL_ENABLED=1
+TOP_NAVIGATION_ENABLED=1
+
+Do not remove the old layout until the new layout has been verified.
+
+Keep the previous components available for rollback during testing.
+
+--------------------------------------------------
+PART 13 — TESTING REQUIREMENTS
+--------------------------------------------------
+
+Add tests for:
+
+1. Every existing panel is included in the audit.
+2. Blank panels display an explanatory empty state.
+3. Broken endpoints display an error state without crashing.
+4. Top navigation switches views correctly.
+5. Mobile view selector works.
+6. Last selected view is remembered.
+7. Unified Brain renders missing fields safely.
+8. Higher-timeframe and entry-timeframe disagreement is summarized correctly.
+9. Evidence modules cannot overwrite the final action.
+10. SCALP mode uses the correct timeframe hierarchy.
+11. SWING mode uses the correct timeframe hierarchy.
+12. Stale data is not treated as confirmation.
+13. High-volume panel selects the correct instrument schedule.
+14. Upcoming, active, and completed window states render correctly.
+15. Market-closed state renders correctly.
+16. No dashboard interaction can change trading state.
+17. Existing Phase 1–3 tests remain passing.
+18. Existing golden smoke tests remain byte-identical where required.
+19. Existing TradersPost tests remain passing.
+20. No duplicate polling loops are created.
+21. No duplicate Discord alerts are created.
+22. Frontend build passes.
+23. Mobile viewport has no horizontal overflow.
+24. Feature flag restores the old dashboard.
+
+--------------------------------------------------
+PART 14 — IMPLEMENTATION ORDER
+--------------------------------------------------
+
+Complete the work in this order:
+
+STEP 1
+Inventory all panels and provide the audit before deleting anything.
+
+STEP 2
+Repair useful broken panels and add proper empty/error states.
+
+STEP 3
+Remove or archive obsolete and duplicate panels.
+
+STEP 4
+Build top navigation and move secondary panels into categorized views.
+
+STEP 5
+Create the shared multi-timeframe alignment object.
+
+STEP 6
+Replace the existing Brain presentation with the Unified Market Brain.
+
+STEP 7
+Connect every evidence module to the shared interpretation hierarchy.
+
+STEP 8
+Build the High-Volume Sessions panel.
+
+STEP 9
+Add data freshness and stale-state handling.
+
+STEP 10
+Run all frontend, backend, regression, money-path, and mobile tests.
+
+Do not skip directly to visual redesign before the panel audit and data wiring are complete.
+
+--------------------------------------------------
+PART 15 — DEFINITION OF DONE
+--------------------------------------------------
+
+This task is complete only when:
+
+1. Every existing dashboard panel has been audited.
+2. Useful blank panels have been repaired.
+3. Empty panels clearly explain why no data exists.
+4. Obsolete and duplicate panels are removed from the primary layout.
+5. Approximately 75% of panels are accessible through top menu views.
+6. The default dashboard is no longer an endless collection of boxes.
+7. The Unified Market Brain clearly separates:
+   - Higher-timeframe context
+   - Intraday context
+   - Entry timing
+8. The dashboard shows one final action per instrument.
+9. Supporting panels provide evidence rather than competing predictions.
+10. Apparent timeframe contradictions are reconciled into one explanation.
+11. The High-Volume Session panel supports upcoming, active, and completed states.
+12. High-volume schedules are configurable by instrument.
+13. Data freshness is visible and stale inputs are not treated as current confirmation.
+14. No execution, risk, scoring, or TradersPost logic was changed.
+15. All previous tests and all new dashboard tests pass.
+16. The old dashboard can be restored through a feature flag.
+
+At completion, provide:
+
+- Complete panel audit
+- Panels fixed
+- Panels removed
+- Panels moved to menu
+- Files created
+- Files modified
+- New components
+- New endpoints or endpoint changes
+- New environment variables
+- Desktop screenshots
+- Mobile screenshots
+- Test results
+- Confirmation that no trading logic was changed
+- Confirmation that thesis enforcement remains in shadow mode

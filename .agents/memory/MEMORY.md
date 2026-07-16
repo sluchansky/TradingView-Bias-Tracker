@@ -2,6 +2,8 @@
 
 - [Thesis Phase 2 dashboard + alerts](thesis-phase2.md) — timeline/Discord/DB/routes/dashboard panel for thesis hysteresis; emoji escape rules; 33 tests total (P1+P2).
 
+- [Unified Dashboard live-nav](dashboard-live-nav-architecture.md) — 5-section nav is pure-JS show/hide via _liveNavSections map (no data-nav attrs); HV session config + feature flag locations; flag-OFF byte-identical.
+
 - [Structured observation bus](structured-observation-bus.md) — _emit_observation schema + _mb_build_structured_observations reads 11 specialist blocks centrally; NO specialist functions edited; mb_out["observations"] + neutral []; goldens byte-identical.
 
 - [/status poll cache](status-poll-cache.md) — prod froze from 3s polls × 16s inline full_analysis; /status now single-flight TTL cache + client tick guard; money path NEVER reads the cache; dev-empty history hides this bug class.
