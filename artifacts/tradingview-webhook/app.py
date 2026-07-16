@@ -44049,42 +44049,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="pr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
-<!-- Entry Quality Engine (LOCATION-aware: is this a GOOD place to enter? Distance to
-     S/R, impulse % done, ATR extension, pullback, momentum, sweep, chasing, swing
-     traps). DISPLAY by default; the money-path veto is flag-gated server-side,
-     default OFF. Hidden unless the engine is enabled. -->
-<div class="mod mb-hidden" id="mod-entryq" style="display:none">
-  <div class="mod-h">🎯 Entry Quality <span id="eq-badge" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-advanced">ADVANCED</span></div>
-  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 2px">
-    <span style="font-size:11px;color:#9aa">Location score — separate from the Edge gate</span>
-    <span id="eq-gate-toggle" role="button" tabindex="0" onclick="toggleEntryGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleEntryGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Veto: off</span>
-  </div>
-  <div style="display:flex;align-items:baseline;gap:10px;margin:2px 0 6px;flex-wrap:wrap">
-    <div id="eq-score" style="font-size:28px;font-weight:800">—</div>
-    <div id="eq-grade" style="font-size:14px;font-weight:700">—</div>
-    <div id="eq-dir" style="font-size:12px;color:#9aa"></div>
-    <div id="eq-verdict" style="font-size:11px;font-weight:800;letter-spacing:.5px;margin-left:auto"></div>
-  </div>
-  <div class="eqx-chasing" id="eq-chasing"></div>
-  <div id="eq-bars"></div>
-  <div class="se-bias-h">Entry Math (raw)</div>
-  <div id="eq-raw" class="eqx-raw"></div>
-  <div class="se-bias-h">Location Flags</div>
-  <div id="eq-flags" style="display:flex;flex-wrap:wrap;gap:6px"></div>
-  <div class="se-bias-h">What This Means</div>
-  <div class="se-reason" id="eq-plain">—</div>
-  <div class="eqx-zone" id="eq-zone"></div>
-  <div class="se-bias-h">What Improves This Trade</div>
-  <div id="eq-plan"></div>
-  <div id="eq-proj" style="font-size:11px;color:#9aa;margin-top:6px"></div>
-  <div class="eqx-entryplan" id="eq-entryplan"></div>
-  <div class="se-bias-h" id="eq-planner-h" style="display:none">🧭 Entry Improvement Plan</div>
-  <div class="eqx-planner" id="eq-planner"></div>
-  <div class="se-bias-h">Assessment</div>
-  <div class="se-reason" id="eq-why">—</div>
-  <div id="eq-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
-</div>
-
 <!-- Trade Debate Engine (Bull vs Bear vs Decision Judge; pre-READY internal debate.
      DISPLAY by default; the money-path veto is flag-gated server-side, default OFF.
      Hidden unless the engine is enabled.) -->
@@ -45168,7 +45132,7 @@ let SAFETY_STATE = { MGC:{}, MNQ:{}, MES:{}, MYM:{} };  // per-asset safety snap
 let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdvisor() + /status
 let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
 let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
-let EQ_GATE_STATE = false;  // Entry Quality money-path veto, painted by renderEntryQuality() from /status
+let EQ_GATE_STATE = false;  // Entry Quality money-path veto, synced from /status via renderAiDecisionCenter()
 let LEARNING_GATE_STATE = false;  // Learning-demotion money-path veto, painted by renderConfidenceGovernor() from /status
 let LEARNING_SCORE_STATE = false;  // Learning-influences-SCORING flag (Task #18), painted by _paintLearnScoreGate() from /status
 async function loadAutoTrade(){
@@ -45990,8 +45954,6 @@ function renderModules(d){
   // ── Module 11b: Professional Review — pre-READY pro-trader grading (DISPLAY-ONLY) ──
   renderProReview(d);
 
-  // ── Module 11b2: Entry Quality — LOCATION-aware entry grading (DISPLAY-ONLY) ──
-  renderEntryQuality(d);
 
   // ── Module 11b3: Fast Entry Trigger — seconds-timing layer (DISPLAY-FIRST) ──
   renderFastEntry(d);
@@ -48776,220 +48738,12 @@ function toggleProGate(){
 // Entry Quality Engine — LOCATION-aware "is this a good place to enter?" grading.
 // DISPLAY-ONLY on the dashboard; the money-path veto is flag-gated server-side. Fed
 // by d.entry_quality. Dynamic webhook-derived text is written via textContent; the
-// component / flag chips are app-generated and HTML-escaped via _eqEsc.
-function _eqGradeColor(g){ return g==='Excellent'?'#22c55e':g==='Good'?'#84cc16':g==='Acceptable'?'#f59e0b':g==='Poor'?'#ef4444':'#6b7280'; }
-function _eqEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function renderEntryQuality(d){
-  const eq=(d && d.entry_quality) || null;
-  const mod=document.getElementById('mod-entryq');
-  if(!mod) return;
-  if(!eq || !eq.engine_enabled){ mod.style.display='none'; return; }
-  mod.style.display='';
-  const _set=function(id,txt,col){ const e=document.getElementById(id); if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; } };
-  EQ_GATE_STATE = !!eq.gate_enabled;
-  const badge=document.getElementById('eq-badge');
-  if(badge){ badge.textContent=eq.gate_enabled?'VETO ARMED':'DISPLAY'; badge.style.color=eq.gate_enabled?'#ef4444':'#6b7280'; }
-  const score=(eq.score!=null)?eq.score:null;
-  _set('eq-score', score!=null?score:'—', _eqGradeColor(eq.grade));
-  _set('eq-grade', eq.grade||'—', _eqGradeColor(eq.grade));
-  _set('eq-dir', eq.direction?('· '+eq.direction):(eq.available?'':'· no candidate'), '#9aa');
-  const bars=document.getElementById('eq-bars');
-  if(bars){
-    const comps=eq.components||[];
-    bars.innerHTML=comps.map(function(c){
-      const frac=c.max?Math.max(0,Math.min(1,c.score/c.max)):0;
-      const pct=Math.round(frac*100);
-      const col=frac>=0.8?'#22c55e':frac>=0.55?'#f59e0b':'#ef4444';
-      return '<div style="margin:3px 0">'
-        +'<div style="display:flex;justify-content:space-between;font-size:11px;color:#9aa">'
-        +'<span>'+_eqEsc(c.label)+'</span><span style="color:'+col+'">'+c.score+'/'+c.max+'</span></div>'
-        +'<div style="height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden">'
-        +'<div style="height:100%;width:'+pct+'%;background:'+col+'"></div></div>'
-        +(c.detail?'<div style="font-size:9px;color:#6b7280">'+_eqEsc(c.detail)+'</div>':'')
-        +'</div>';
-    }).join('');
-  }
-  const fl=document.getElementById('eq-flags');
-  if(fl){
-    const flags=eq.flags||{};
-    const chips=[];
-    const add=function(label,bad){ chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:'+(bad?'#ef4444':'#22c55e')+';background:'+(bad?'rgba(239,68,68,.12)':'rgba(34,197,94,.12)')+'">'+(bad?'⚠ ':'✓ ')+_eqEsc(label)+'</span>'); };
-    add('Chasing', !!flags.chasing_breakout);
-    if(eq.direction==='Long') add('At Swing High', !!flags.near_swing_high);
-    if(eq.direction==='Short') add('At Swing Low', !!flags.near_swing_low);
-    add('Overextended', !!flags.overextended);
-    if(flags.sweep_complete===true) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#22c55e;background:rgba(34,197,94,.12)">✓ Sweep Done</span>');
-    if(flags.impulse_pct!=null) chips.push('<span style="font-size:11px;padding:2px 8px;border-radius:10px;color:#9aa;background:rgba(148,163,184,.12)">Impulse '+flags.impulse_pct+'%</span>');
-    fl.innerHTML=chips.join('');
-  }
-  // Entry verdict pill — server-tiered (ok / better_entry / caution / bad). A strong
-  // Edge with a poor location reads "WAIT FOR BETTER ENTRY", not "NO TRADE".
-  const verd=document.getElementById('eq-verdict');
-  if(verd){
-    const _tc={ok:'#22c55e',better_entry:'#38bdf8',caution:'#f59e0b',bad:'#ef4444'};
-    if(score==null || !eq.available){ verd.textContent=''; }
-    else { verd.textContent=eq.verdict_label||''; verd.style.color=_tc[eq.verdict_tier]||'#9aa'; }
-  }
-  // Raw entry math (price / VWAP / distance / ATR + timeframe / extension / decision).
-  const rawEl=document.getElementById('eq-raw');
-  if(rawEl){
-    const r=eq.raw||{};
-    const rows=[
-      ['Price', (r.price==null?'—':r.price)],
-      ['VWAP', (r.vwap==null?'—':r.vwap)],
-      ['Distance from VWAP', (r.distance_from_vwap==null?'—':(r.distance_from_vwap+' pts'))],
-      ['ATR ('+(r.atr_timeframe||'?')+')', (r.atr==null?'—':(r.atr+' pts'))],
-      ['ATR Extension', (r.atr_extension==null?'—':(r.atr_extension+' ATR'))],
-      ['Decision', (r.atr_extension_decision||'—')]
-    ];
-    rawEl.innerHTML=rows.map(function(p){
-      return '<div class="k">'+_eqEsc(p[0])+'</div><div class="v">'+_eqEsc(p[1])+'</div>';
-    }).join('');
-  }
-  // Plain-English explanation.
-  _set('eq-plain', eq.plain_english||'—');
-  // Chasing warning (price > 3 ATR from VWAP).
-  const chEl=document.getElementById('eq-chasing');
-  if(chEl){
-    if(eq.chasing_warning){ chEl.innerHTML='<b>⚠ CHASING WARNING</b><br>'+_eqEsc(eq.chasing_warning); chEl.style.display=''; }
-    else { chEl.style.display='none'; chEl.innerHTML=''; }
-  }
-  // Better entry zone (where a smarter entry sits).
-  const zEl=document.getElementById('eq-zone');
-  if(zEl){
-    const z=eq.better_entry_zone;
-    if(z && z.low!=null && z.high!=null){
-      const why=(z.reasons&&z.reasons.length)?(' <span class="z-why">— '+z.reasons.map(_eqEsc).join(', ')+'</span>'):'';
-      zEl.innerHTML='<b>Better Entry Zone</b><br><span class="z-px">'+_eqEsc(z.low)+' – '+_eqEsc(z.high)+'</span>'+why;
-      zEl.style.display='';
-    } else { zEl.style.display='none'; zEl.innerHTML=''; }
-  }
-  // What Improves This Trade — per-condition point deltas + projected score.
-  const planEl=document.getElementById('eq-plan');
-  const imps=(eq.improvements&&eq.improvements.length)
-    ? eq.improvements
-    : (eq.improvement_plan||[]).map(function(s){ return {text:s, points:null}; });
-  if(planEl){
-    planEl.innerHTML=imps.length
-      ? imps.map(function(it){
-          const pts=(it.points!=null)?'<span class="eqx-pts">+'+_eqEsc(it.points)+'</span>':'';
-          return '<div class="eqx-plan-item"><span>→</span><span>'+_eqEsc(it.text)+'</span>'+pts+'</div>';
-        }).join('')
-      : '<div class="eqx-plan-empty">No blocking conditions — entry location is clear.</div>';
-  }
-  const projEl=document.getElementById('eq-proj');
-  if(projEl){
-    if(imps.length && eq.projected_high!=null){
-      const lo=(eq.projected_low!=null?eq.projected_low:eq.projected_high);
-      projEl.textContent='Projected score if confirmed: '+eq.projected_high+'/100 (range '+lo+'–'+eq.projected_high+')';
-    } else { projEl.textContent=''; }
-  }
-  // Entry plan (what to do next instead of a bare WAIT).
-  const epEl=document.getElementById('eq-entryplan');
-  if(epEl){
-    const ep=eq.entry_plan;
-    if(ep && ep.wait_for){
-      const req=(ep.then_require||[]).slice();
-      if(ep.stop) req.push(ep.stop);
-      if(ep.target) req.push(ep.target);
-      let h='<div class="ep-w">'+_eqEsc(ep.wait_for)+'</div>';
-      if(req.length){ h+='Then require:<ul>'+req.map(function(s){ return '<li>'+_eqEsc(s)+'</li>'; }).join('')+'</ul>'; }
-      epEl.innerHTML=h; epEl.style.display='';
-    } else { epEl.style.display='none'; epEl.innerHTML=''; }
-  }
-  let assess=eq.why_not_trade||'';
-  if(!assess){
-    if(eq.available && score!=null){ assess=(score>=(eq.min_score!=null?eq.min_score:70))?('Good entry location ('+(eq.grade||'')+').'):'Poor entry location.'; }
-    else { assess=eq.summary||'Entry location not evaluated.'; }
-  }
-  _set('eq-why', assess);
-  const gt=document.getElementById('eq-gate-toggle');
-  if(gt){ gt.textContent=eq.gate_enabled?'Veto: ARMED':'Veto: off'; gt.style.color=eq.gate_enabled?'#ef4444':'#9aa'; gt.style.borderColor=eq.gate_enabled?'#ef4444':'var(--border)'; }
-  _set('eq-foot', 'Reject < '+(eq.min_score!=null?eq.min_score:70)+'/100 unless Edge ≥ '+(eq.override_edge!=null?eq.override_edge:90)+(eq.gate_enabled?' · VETO ARMED (may demote to WAIT)':' · veto OFF (display-only)')+(eq.override_applied?' · override active':''));
-  // ── Entry Improvement Plan (display-only PLANNER) — 4 sections: current entry,
-  //    best entry zone, what needs to happen, entry triggers. Purely additive; every
-  //    dynamic value is escaped via _eqEsc and no template escape ever enters the
-  //    served HTML string (all concatenation, no \\n/\\t literals).
-  const plEl=document.getElementById('eq-planner');
-  const plH=document.getElementById('eq-planner-h');
-  if(plEl){
-    const pl=eq.entry_planner;
-    if(pl && pl.available){
-      const _pv=function(v){ return (v==null||v==='')?'—':_eqEsc(v); };
-      let H='';
-      const ce=pl.current_entry||{};
-      const probs=ce.problems||[];
-      H+='<div class="eqp-sec"><div class="eqp-h">Current Entry</div>'
-        +'<div class="eqp-row"><span>Entry Quality</span><span style="color:'+_eqGradeColor(ce.grade)+';font-weight:800">'+_pv(ce.score)+(ce.score!=null?'/100':'')+' · '+_pv(ce.grade)+'</span></div>';
-      if(probs.length){
-        H+='<div class="eqp-sub">Problems detected</div><div class="eqp-probs">'
-          +probs.map(function(p){
-              const lost=(p.lost!=null)?'<span class="eqp-lost">-'+_eqEsc(p.lost)+'</span>':'';
-              return '<div class="eqp-prob"><span>⚠</span><span>'+_eqEsc(p.text)+'</span>'+lost+'</div>';
-            }).join('');
-        H+='</div>';
-      } else {
-        H+='<div class="eqp-ok">No location problems detected — entry is clean.</div>';
-      }
-      H+='</div>';
-      const bz=pl.best_entry_zone||{};
-      H+='<div class="eqp-sec"><div class="eqp-h">Best Entry Zone</div>';
-      if(bz.ideal!=null || bz.range_low!=null){
-        const why=(bz.reasons&&bz.reasons.length)?('<div class="eqp-why">Anchored to: '+bz.reasons.map(_eqEsc).join(' · ')+'</div>'):'';
-        H+='<div class="eqp-grid">'
-          +'<div><div class="eqp-k">Ideal</div><div class="eqp-v" style="color:#22c55e">'+_pv(bz.ideal)+'</div></div>'
-          +'<div><div class="eqp-k">Range</div><div class="eqp-v">'+_pv(bz.range_low)+' – '+_pv(bz.range_high)+'</div></div>'
-          +'<div><div class="eqp-k">Aggressive</div><div class="eqp-v">'+_pv(bz.aggressive)+'</div></div>'
-          +'<div><div class="eqp-k">Conservative</div><div class="eqp-v">'+_pv(bz.conservative)+'</div></div>'
-          +'</div>'+why;
-      } else {
-        H+='<div class="eqp-ok">Current entry is already well-located — no better zone to wait for.</div>';
-      }
-      H+='</div>';
-      const wn=pl.what_needs_to_happen||[];
-      H+='<div class="eqp-sec"><div class="eqp-h">What Needs To Happen</div>';
-      if(wn.length){
-        H+='<ul class="eqp-wait">'+wn.map(function(s){ return '<li>'+_eqEsc(s)+'</li>'; }).join('')+'</ul>';
-      } else {
-        H+='<div class="eqp-ok">Nothing pending — entry conditions are already satisfied.</div>';
-      }
-      H+='</div>';
-      const tr=pl.entry_triggers||{};
-      const conds=tr.conditions||[];
-      H+='<div class="eqp-sec"><div class="eqp-h">Entry Triggers</div>';
-      if(conds.length){
-        H+='<div class="eqp-sub">Checklist to raise Entry Quality above 80</div><div class="eqp-checks">'
-          +conds.map(function(s){ return '<div class="eqp-check"><span>☐</span><span>'+_eqEsc(s)+'</span></div>'; }).join('');
-        H+='</div>';
-      }
-      H+='<div class="eqp-grid">'
-        +'<div><div class="eqp-k">Est. Quality</div><div class="eqp-v">'+_pv(tr.estimated_quality)+(tr.estimated_quality!=null?'/100':'')+'</div></div>'
-        +'<div><div class="eqp-k">Est. Confidence</div><div class="eqp-v">'+_pv(tr.estimated_confidence)+(tr.estimated_confidence!=null?'%':'')+'</div></div>'
-        +'<div><div class="eqp-k">Suggested Entry</div><div class="eqp-v">'+_pv(tr.suggested_entry)+'</div></div>'
-        +'<div><div class="eqp-k">Suggested Stop</div><div class="eqp-v">'+_pv(tr.suggested_stop)+'</div></div>'
-        +'<div><div class="eqp-k">Suggested Target</div><div class="eqp-v">'+_pv(tr.suggested_target)+'</div></div>'
-        +'<div><div class="eqp-k">Risk</div><div class="eqp-v">'+_pv(tr.risk_points)+(tr.risk_points!=null?(' pts · '+_eqEsc(tr.risk_basis||'')):'')+'</div></div>'
-        +'</div>';
-      if(tr.confidence_basis){ H+='<div class="eqp-basis">Confidence basis: '+_eqEsc(tr.confidence_basis)+'</div>'; }
-      if(tr.status){
-        const _stc=(tr.status==='ENTRY LOCATION OK')?'#22c55e':'#f59e0b';
-        H+='<div class="eqp-status" style="color:'+_stc+'">'+_eqEsc(tr.status)+'</div>';
-      }
-      H+='</div>';
-      plEl.innerHTML=H; plEl.style.display='';
-      if(plH) plH.style.display='';
-    } else {
-      plEl.style.display='none'; plEl.innerHTML='';
-      if(plH) plH.style.display='none';
-    }
-  }
-}
 function toggleEntryGate(){
   const cur=!!EQ_GATE_STATE;
   const next=!cur;
   if(next && !confirm('Arm the Entry Quality VETO? While ARMED, a poor entry LOCATION (score below threshold) can DEMOTE an actionable setup to WAIT — unless confidence is extremely high (Edge override). It can NEVER force a trade. Affects AUTO-trades and READY alerts; manual ENTER is unaffected.')) return;
   EQ_GATE_STATE=next;
-  const gt=document.getElementById('eq-gate-toggle');
+  const gt=document.getElementById('adc-eq-gate-btn');
   if(gt){ gt.textContent=next?'Veto: ARMED':'Veto: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
   api('/entry-quality', { gate_enabled: next })
     .then(function(d){
@@ -50353,7 +50107,6 @@ var _liveNavSections = {
     'mod-microscalp',     // Micro Scalp Brain
     'mod-analyst',        // Unified Analyst Report
     'mod-pro',            // Professional Review
-    'mod-entryq',         // Entry Quality
     'mod-debate',         // Trade Debate
     'mod-strategy',       // Strategy Engine
     'mod-scalp-advisory', // Strategy Advisory
@@ -50596,13 +50349,15 @@ function renderAiDecisionCenter(d) {
   // ── Tab: Entry Quality ─────────────────────────────────────────────────
   var eqPEl=document.getElementById('adc-eq-content');
   if (eqPEl) {
+    EQ_GATE_STATE = !!(eq && eq.gate_enabled);
     var h4='';
     if (eq.engine_enabled&&eq.score!=null) {
       var egc=eq.grade==='Excellent'?'#22c55e':eq.grade==='Good'?'#84cc16':eq.grade==='Acceptable'?'#f59e0b':'#ef4444';
       h4+='<div class="adc-ri"><span class="k">Score</span><span class="v" style="color:'+egc+'">'+eq.score+' / 100</span></div>';
       h4+='<div class="adc-ri"><span class="k">Grade</span><span class="v" style="color:'+egc+'">'+_adcEsc(eq.grade||'\u2014')+'</span></div>';
       if (eq.verdict_label) h4+='<div class="adc-ri"><span class="k">Status</span><span class="v">'+_adcEsc(eq.verdict_label)+'</span></div>';
-      if (eq.gate_enabled) h4+='<div style="font-size:10px;color:#ef4444;padding:4px 0">\u26a1 Entry Quality Veto Armed</div>';
+      var _gtc=eq.gate_enabled?'#ef4444':'#9aa', _gtb=eq.gate_enabled?'#ef4444':'var(--border)';
+      h4+='<div style="margin:6px 0"><span id="adc-eq-gate-btn" role="button" tabindex="0" onclick="toggleEntryGate()" style="cursor:pointer;font-size:11px;border:1px solid '+_gtb+';border-radius:999px;padding:2px 10px;color:'+_gtc+'">'+(eq.gate_enabled?'Veto: ARMED':'Veto: off')+'</span></div>';
       var comps4=eq.components||[];
       if (comps4.length) {
         h4+='<div style="margin-top:8px">';
