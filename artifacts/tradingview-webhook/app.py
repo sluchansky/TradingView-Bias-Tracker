@@ -50317,28 +50317,26 @@ var _liveNavAllIds = (function(){
 function setLiveSection(sec) {
   if (!UNIFIED_DASH) return;
   try { localStorage.setItem('live_section', sec); } catch(e) {}
-  // Update nav button state
+  // Update nav button active state
   document.querySelectorAll('#live-nav .ln-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.sec === sec);
   });
-  // Show/hide managed panels
+  // Show/hide individually managed panels.
+  // NOTE: we never hide parent containers (#live-layout, #bl-bottom,
+  // #bl-drawer-row) — hiding a parent makes child show/hide a no-op.
+  // The verdict brain stays visible in every section as the anchor.
   var active = _liveNavSections[sec] || [];
   _liveNavAllIds.forEach(function(id) {
     var el = document.getElementById(id);
     if (!el) return;
     var show = (active.indexOf(id) !== -1);
     if (show) {
+      // Restore whatever the panel's natural display was before we hid it
       el.style.display = (el._liveOrigDisplay !== undefined) ? (el._liveOrigDisplay || '') : '';
     } else {
       if (el._liveOrigDisplay === undefined) el._liveOrigDisplay = el.style.display || '';
       el.style.display = 'none';
     }
-  });
-  // Brain 3-column layout visible only in Overview section
-  var showBrain = (sec === 'overview');
-  ['live-layout','bl-bottom','bl-drawer-row'].forEach(function(id) {
-    var el = document.getElementById(id);
-    if (el) el.style.display = showBrain ? '' : 'none';
   });
 }
 function initUnifiedDash() {
