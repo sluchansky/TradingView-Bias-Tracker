@@ -42047,7 +42047,7 @@ def dashboard():
   .cp-btn.active{background:#2563eb;border-color:#2563eb;color:#fff}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-brain):not(#mod-data-feed):not(#mod-real-results):not(#mod-ai-decision-center):not(#mod-analysis-groups):not(#mod-journal-groups):not(#mod-news):not(#mod-rule-engine):not(#mod-controls-groups):not(#mod-prop):not(#mod-hvsessions):not(#mod-chartprev):not(#mod-cvd):not(#mod-scalpdiag):not(#mod-swingdiag):not(#mod-microscalp):not(#mod-mb-voice):not(#mod-mb-predictions):not(#mod-mb-narrative):not(#mod-equity):not(#mod-trades):not(#mod-thesis):not(#mod-review):not(#mod-mb-thesis):not(#mod-exec-reject):not(#mod-broker-send-log):not(#mod-mb-confidence):not(#mod-mi):not(#mod-fastentry):not(#mod-xmarket):not(#mod-breakout):not(#mod-swing-v2):not(#mod-dual-sim):not(#mod-scalp-advisory):not(#mod-stalk-mode):not(#mod-active-thinking):not(#mod-bothold):not(#mod-atm):not(#mod-liverunner):not(#mod-autoexit):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]) #view-live .mod:not(#mod-brain):not(#mod-data-feed):not(#mod-real-results):not(#mod-ai-decision-center):not(#mod-analysis-groups):not(#mod-journal-groups):not(#mod-news):not(#mod-rule-engine):not(#mod-controls-groups):not(#mod-prop):not(#mod-hvsessions):not(#mod-chartprev):not(#mod-cvd):not(#mod-scalpdiag):not(#mod-swingdiag):not(#mod-microscalp):not(#mod-mb-predictions):not(#mod-mb-narrative):not(#mod-equity):not(#mod-trades):not(#mod-thesis):not(#mod-review):not(#mod-mb-thesis):not(#mod-exec-reject):not(#mod-broker-send-log):not(#mod-mb-confidence):not(#mod-mi):not(#mod-fastentry):not(#mod-xmarket):not(#mod-breakout):not(#mod-swing-v2):not(#mod-dual-sim):not(#mod-scalp-advisory):not(#mod-stalk-mode):not(#mod-active-thinking):not(#mod-bothold):not(#mod-atm):not(#mod-liverunner):not(#mod-autoexit):not(.mb-hidden){display:none !important}
 
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
@@ -43660,12 +43660,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      market_narrative / market_events_timeline / session_day_type /
      main_brain_learning_stats). NEVER touch the gate, scoring, sizing or broker.
      Every dynamic string is written via textContent / _anFill (escaped). -->
-<div class="mod" id="mod-mb-voice">
-  <div class="mod-h">🗣 Analyst Voice <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">DISPLAY-ONLY</span><span class="mod-cat cat-detail">DETAIL</span></div>
-  <div id="mbv-headline" class="mb-summary" style="font-weight:600">—</div>
-  <div id="mbv-narration" class="mb-summary" style="color:#cdcde0">Watching the tape…</div>
-</div>
-
 <div class="mod" id="mod-mb-predictions">
   <div class="mod-h">🔮 Forward Odds <span id="mbp-fav" style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">—</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div id="mbp-horizon" style="font-size:11px;color:#6b7280;margin-bottom:6px">—</div>
@@ -46984,13 +46978,6 @@ function _mbEvT(iso){
   try{ return new Date(iso).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false}); }
   catch(e){ return ''; }
 }
-function renderMBVoice(d){
-  const mod=document.getElementById('mod-mb-voice'); if(!mod) return;
-  const v=(d&&d.main_brain_voice)||null;
-  _mbSetText('mbv-headline', v&&v.headline);
-  const n=document.getElementById('mbv-narration');
-  if(n) n.textContent=(v&&v.narration)||'Watching the tape — no clear read yet.';
-}
 function renderMBPredictions(d){
   const mod=document.getElementById('mod-mb-predictions'); if(!mod) return;
   const p=(d&&d.main_brain_predictions)||null;
@@ -48092,7 +48079,6 @@ function renderActiveThinking(d){
   }
 }
 function renderMainBrainCognitive(d){
-  try{ renderMBVoice(d); }catch(e){}
   try{ renderMBPredictions(d); }catch(e){}
   try{ renderMBConfidence(d); }catch(e){}
   try{ renderMBNarrative(d); }catch(e){}
@@ -50444,7 +50430,6 @@ var _liveNavSections = {
     'mod-scalp-advisory', // Strategy Advisory
     'mod-stalk-mode',     // Stalk Mode
     'mod-active-thinking',// Active Trade Thinking
-    'mod-mb-voice',       // Analyst Voice
     'mod-mb-predictions', // Forward Odds
     'mod-mb-narrative'    // Session Story
   ],

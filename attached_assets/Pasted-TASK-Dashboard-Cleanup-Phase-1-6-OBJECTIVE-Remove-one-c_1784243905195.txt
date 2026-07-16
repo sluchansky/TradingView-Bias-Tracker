@@ -1,0 +1,143 @@
+TASK: Dashboard Cleanup — Phase 1.6
+
+OBJECTIVE
+
+Remove one clear duplicate dashboard panel:
+
+Panel: Analyst Voice
+Panel ID: mod-mb-voice
+
+The Main Brain already displays the analyst voice narration and caption using
+the same main_brain_voice data.
+
+The standalone Analyst Voice panel repeats that information and is no longer
+needed.
+
+MAKE ONLY THIS ONE CHANGE.
+
+BEFORE EDITING
+
+Inspect and report:
+
+1. The exact file or files that will be modified.
+2. The exact markup belonging to mod-mb-voice.
+3. Every JavaScript function, selector, CSS rule, registry entry, and navigation
+   reference connected to mod-mb-voice.
+4. Where d.main_brain_voice is rendered inside mod-brain.
+5. Which voice-related code is shared with:
+   - Main Brain narration
+   - Avatar speech
+   - Speak button
+   - Text-to-speech
+   - Voice waveform
+6. Which code belongs exclusively to the standalone mod-mb-voice panel.
+7. Which code must remain because another feature uses it.
+
+Then perform the smallest safe change.
+
+REQUIREMENTS
+
+1. Remove the standalone mod-mb-voice panel from the rendered dashboard.
+
+2. Preserve all Main Brain voice functionality, including:
+- Narration text inside mod-brain
+- Avatar speech
+- Speak button
+- Text-to-speech
+- Voice waveform or speaking animation
+- d.main_brain_voice data generation
+- Any API response fields related to voice
+- Any shared update or rendering functions
+
+3. Remove mod-mb-voice from any:
+- Dashboard markup
+- Panel category registry
+- Advanced View visibility rules
+- Section navigation registry
+- Panel lookup list
+- Dashboard inventory structure
+
+4. Remove JavaScript or CSS only when it is used exclusively by the standalone
+   mod-mb-voice panel.
+
+5. Do not remove or rename d.main_brain_voice.
+
+6. Do not alter the wording or formatting of the narration inside Main Brain.
+
+7. Do not modify any other panel.
+
+8. Do not:
+- Move panels
+- Resize panels
+- Redesign layout
+- Change navigation
+- Change Brain logic
+- Change voice generation
+- Change text-to-speech behavior
+- Change avatar animation
+- Perform unrelated cleanup
+
+SUCCESS CRITERIA
+
+- mod-mb-voice no longer exists in the rendered DOM.
+- The standalone Analyst Voice panel is absent with Advanced View OFF.
+- The standalone Analyst Voice panel is absent with Advanced View ON.
+- Main Brain narration still updates normally.
+- The Speak button still works.
+- Avatar speech still works.
+- Voice waveform or speaking animation still works.
+- d.main_brain_voice remains present in the /status response.
+- No empty panel gap remains.
+- No other panel changes.
+- No new browser-console errors.
+
+TESTING
+
+1. Search the served HTML for:
+   id="mod-mb-voice"
+
+2. Confirm it is absent.
+
+3. Load the dashboard with Advanced View OFF.
+
+4. Confirm the standalone Analyst Voice panel does not appear.
+
+5. Turn Advanced View ON.
+
+6. Confirm it still does not appear.
+
+7. Confirm narration text still appears inside Main Brain.
+
+8. Trigger or wait for a new Main Brain voice update.
+
+9. Confirm the narration changes inside Main Brain.
+
+10. Click the Speak button.
+
+11. Confirm speech still plays.
+
+12. Confirm avatar speaking animation or waveform still responds.
+
+13. Inspect the /status response and confirm main_brain_voice still exists.
+
+14. Switch through all dashboard sections.
+
+15. Check the browser console.
+
+FINAL RESPONSE
+
+Return:
+
+- Files changed
+- Exact markup removed
+- Standalone JavaScript removed
+- Shared voice JavaScript preserved
+- CSS, registry, and visibility references removed
+- Main Brain narration test result
+- Speak button test result
+- Avatar speech or waveform test result
+- /status main_brain_voice result
+- Browser-console result
+- Confirmation that no other panel was modified
+
+Do not begin Phase 1.7.
