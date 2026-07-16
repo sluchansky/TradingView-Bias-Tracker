@@ -43523,18 +43523,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
     </div>
   </div>
 
-  <!-- Long vs Short Score — moved up to sit directly under the Long/Short toggle. -->
-  <div class="mod mb-hidden" id="mod-scores">
-    <div class="mod-h">⚖️ Long vs Short Score</div>
-    <div class="sg-row">
-      <div class="sg-top"><span>📈 Long</span><span id="sg-long-n">0</span></div>
-      <div class="sg-track"><div class="sg-fill long" id="sg-long-f" style="width:0%"></div></div>
-    </div>
-    <div class="sg-row">
-      <div class="sg-top"><span>📉 Short</span><span id="sg-short-n">0</span></div>
-      <div class="sg-track"><div class="sg-fill short" id="sg-short-f" style="width:0%"></div></div>
-    </div>
-  </div>
 </div>
 
 <!-- ── AI Decision Center ─────────────────────────────────────────────────
@@ -43678,28 +43666,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Diagnostics modules (feed off alert_diagnostics) -->
-<div class="mod mb-hidden" id="mod-prob">
-  <div class="mod-h">⏱ Trade Probability Meter</div>
-  <div class="gauge-wrap">
-    <svg id="gauge-svg" viewBox="0 0 220 132" style="width:100%;display:block"></svg>
-    <div class="mgauge-center">
-      <div class="mgauge-prob" id="gauge-prob">—</div>
-      <div class="gauge-sub" id="gauge-sub"></div>
-    </div>
-  </div>
-  <div class="gauge-stats">
-    <div class="gstat"><div class="l">Long</div><div class="v" id="gs-long" style="color:#22c55e">—</div></div>
-    <div class="gstat"><div class="l">Short</div><div class="v" id="gs-short" style="color:#ef4444">—</div></div>
-    <div class="gstat"><div class="l">Edge Δ</div><div class="v" id="gs-gap" style="color:#e8e8f0">—</div></div>
-    <div class="gstat"><div class="l">Dominant</div><div class="v" id="gs-dom" style="color:#ff5fb0">—</div></div>
-  </div>
-</div>
-
-<div class="mod mb-hidden" id="mod-checklist">
-  <div class="mod-h">🐷 AI Trade Checklist</div>
-  <div class="ai-ck" id="ai-ck"></div>
-</div>
-
 <!-- ══ Main Brain Cognitive Upgrade — continuous-analyst panels (DISPLAY-ONLY) ══
      Fed by /status keys (main_brain_voice / _predictions / confidence_timeline /
      market_narrative / market_events_timeline / session_day_type /
@@ -43762,11 +43728,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="mbn-analyst-note" style="font-size:11px;color:#9aa3b2;font-style:italic;border-top:1px solid var(--border,#1e2535);padding-top:8px;margin-top:2px">—</div>
 </div>
 
-<div class="mod" id="mod-mb-events">
-  <div class="mod-h">🗂 Events Timeline</div>
-  <ul id="mbe-list" class="mb-list"></ul>
-</div>
-
 <!-- ══ Thesis Tracker — analyst memory / outcome-based learning (DISPLAY-ONLY)
      Saves a directional thesis snapshot every time the AI generates a bias.
      25–75 min later resolves the outcome vs actual tape and writes a lesson.
@@ -43811,22 +43772,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="mbt-history" style="display:flex;flex-direction:column;gap:4px"></div>
 
   <div class="nf-fid">Thesis Tracker is display-only — it learns from what the analyst predicted and what actually happened. It never changes how trades are taken.</div>
-</div>
-
-<div class="mod" id="mod-mb-daytype">
-  <div class="mod-h">🗓 Day Type <span id="mbd-conf" style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">—</span></div>
-  <div id="mbd-type" class="mb-stat-v" style="font-size:18px;margin-bottom:6px">—</div>
-  <ul id="mbd-reasons" class="mb-list"></ul>
-</div>
-
-<div class="mod" id="mod-mb-learning">
-  <div class="mod-h">🎓 Learning Stats<span title="Computed from simulated proxy-feed outcomes — not your real broker fills. See Real Account Results above." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span></div>
-  <div class="mb-stats">
-    <div class="mb-stat"><div class="mb-stat-l">Win rate</div><div class="mb-stat-v" id="mbl-wr">—</div></div>
-    <div class="mb-stat"><div class="mb-stat-l">Avg R</div><div class="mb-stat-v" id="mbl-avgr">—</div></div>
-    <div class="mb-stat"><div class="mb-stat-l">Sample</div><div class="mb-stat-v" id="mbl-sample">—</div></div>
-  </div>
-  <ul id="mbl-list" class="mb-list" style="margin-top:8px"></ul>
 </div>
 
 <!-- Dual Shadow Simulator — passive ALWAYS-ON paper sim that replays the bot's REAL
@@ -43916,18 +43861,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div style="font-size:11px;font-weight:600;color:#cdd3e0;margin:12px 0 4px;letter-spacing:.3px">Notes</div>
   <div id="att-reasons" style="font-size:11px;color:#9aa3b2">—</div>
   <div class="nf-fid">Advisory only — recommendations are never auto-executed; no auto-exit.</div>
-</div>
-
-<div class="mod mb-hidden" id="mod-countdown">
-  <div class="mod-h">🎯 Setup Countdown</div>
-  <div class="cd-big" id="cd-big">—</div>
-  <div class="cd-sub" id="cd-sub"></div>
-  <div class="cd-track"><div class="cd-fill" id="cd-fill" style="width:0%"></div></div>
-</div>
-
-<div class="mod mb-hidden" id="mod-whynot">
-  <div class="mod-h">🚦 Why Not Ready</div>
-  <div id="wn-body"></div>
 </div>
 
 <!-- Fast Entry Trigger — seconds (1s/5s) timing layer. DISPLAY-FIRST: the money-path
@@ -44416,40 +44349,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
     </div>
   </div>
   <div class="le-fid" id="le-fid"></div>
-</div>
-
-<!-- Performance Report — every-25-trades review + auto-recommendations (display-only) -->
-<div class="mod mb-hidden" id="mod-report">
-  <div class="mod-h">📊 Performance Report <span id="pr-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span></div>
-  <div class="le-top">
-    <div class="gstat"><div class="l">Win Rate</div><div class="v" id="pr-wr">—</div></div>
-    <div class="gstat"><div class="l">Avg R</div><div class="v" id="pr-avgr">—</div></div>
-    <div class="gstat"><div class="l">Profit Factor</div><div class="v" id="pr-pf">—</div></div>
-    <div class="gstat"><div class="l">Avg Hold</div><div class="v" id="pr-hold">—</div></div>
-  </div>
-  <div class="le-grid">
-    <div>
-      <div class="le-sub">Best / Worst Session</div>
-      <div class="le-list" id="pr-session"></div>
-    </div>
-    <div>
-      <div class="le-sub">Best / Worst Strategy</div>
-      <div class="le-list" id="pr-strategy"></div>
-    </div>
-  </div>
-  <div class="le-grid">
-    <div>
-      <div class="le-sub">Most Common Mistake</div>
-      <div class="le-list" id="pr-mistake"></div>
-    </div>
-    <div>
-      <div class="le-sub">Best Entry Efficiency</div>
-      <div class="le-list" id="pr-eff"></div>
-    </div>
-  </div>
-  <div class="le-sub">Recommendations</div>
-  <div class="le-rank" id="pr-recs"></div>
-  <div class="le-fid" id="pr-fid"></div>
 </div>
 
 <!-- Confidence Governor — transparent Edge→confidence breakdown (DISPLAY-ONLY) -->
@@ -50537,8 +50436,6 @@ var _liveNavSections = {
     'mod-chartprev',      // Live Chart Preview
     'mod-cvd',            // Volume Delta (CVD) & RVOL
     'mod-mi',             // Market Intelligence (structure / supply-demand)
-    'mod-scores',         // Long vs Short Score
-    'mod-prob',           // Trade Probability Meter
     'mod-fastentry',      // Fast Entry Trigger
     'mod-xmarket',        // Index Alignment
     'mod-scalpdiag',      // SCALP Diagnostics
@@ -50549,10 +50446,7 @@ var _liveNavSections = {
     'mod-dual-sim',       // Dual Shadow Simulator
     'mod-report',         // Analysis Report
     // Detailed brain engine outputs (accessible for deep inspection)
-    'mod-checklist',      // AI Trade Checklist
     'mod-microscalp',     // Micro Scalp Brain
-    'mod-countdown',      // Setup Countdown
-    'mod-whynot',         // Why Not Ready
     'mod-analyst',        // Unified Analyst Report
     'mod-pro',            // Professional Review
     'mod-entryq',         // Entry Quality
@@ -50563,8 +50457,7 @@ var _liveNavSections = {
     'mod-active-thinking',// Active Trade Thinking
     'mod-mb-voice',       // Analyst Voice
     'mod-mb-predictions', // Forward Odds
-    'mod-mb-narrative',   // Session Story
-    'mod-mb-daytype'      // Day Type
+    'mod-mb-narrative'    // Session Story
   ],
   // Performance & history: primary journal groups + individual panels (Advanced ON)
   journal: [
@@ -50579,9 +50472,7 @@ var _liveNavSections = {
     'mod-review',         // Trade Idea Review
     'mod-rule-engine',    // Learning Rule Engine
     'mod-memory',         // Trade Memory
-    'mod-mb-events',      // Events Timeline
-    'mod-mb-thesis',      // Thesis Tracker
-    'mod-mb-learning'     // Learning Stats
+    'mod-mb-thesis'       // Thesis Tracker
   ],
   // Toggles & execution: primary controls overview + detail panels (Advanced ON)
   controls: [
