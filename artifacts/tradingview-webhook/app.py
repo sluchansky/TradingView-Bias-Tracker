@@ -43881,39 +43881,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      by default; the trade VETO is flag-gated server-side, default OFF). Hidden unless
      the analyst engine is enabled. FVG / Order Blocks ARE tracked (display-only
      analyst evidence); the footer shows their live state per instrument. -->
-<!-- Unified Analyst Report — executive synthesis that CONSUMES the analyst, debate,
-     governor, memory, volatility & news engines into ONE thesis. DISPLAY-ONLY (no
-     money-path veto). Hidden unless the engine is enabled. Fed by d.analyst_report. -->
-<div class="mod mb-hidden" id="mod-report" style="display:none">
-  <div class="mod-h">🧭 Unified Analyst Report <span id="ar-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY-ONLY</span><span class="mod-cat cat-advanced">ADVANCED</span></div>
-  <div class="se-bias-h">Thesis</div>
-  <div class="se-reason" id="ar-headline">—</div>
-  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
-    <div class="gstat"><div class="l">Stance</div><div class="v" id="ar-stance">—</div></div>
-    <div class="gstat"><div class="l">Bias</div><div class="v" id="ar-bias">—</div></div>
-    <div class="gstat"><div class="l">Favored</div><div class="v" id="ar-fav">—</div></div>
-  </div>
-  <div class="se-bias-h">Outcome Probability <span style="font-size:10px;color:#6b7280">· derived heuristic estimate</span></div>
-  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
-    <div class="gstat"><div class="l">Continuation</div><div class="v" id="ar-p-cont">—</div></div>
-    <div class="gstat"><div class="l">Range</div><div class="v" id="ar-p-range">—</div></div>
-    <div class="gstat"><div class="l">Reversal</div><div class="v" id="ar-p-rev">—</div></div>
-  </div>
-  <div class="se-bias-h">Confidence</div>
-  <div class="se-reason" id="ar-conf">—</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
-    <div><div class="se-bias-h" style="color:#22c55e">Why It Works</div><ul id="ar-for" style="margin:4px 0;padding-left:16px"></ul></div>
-    <div><div class="se-bias-h" style="color:#ef4444">Risks / Against</div><ul id="ar-against" style="margin:4px 0;padding-left:16px"></ul></div>
-  </div>
-  <div class="se-bias-h">What Would Increase Confidence</div>
-  <ul id="ar-next" style="margin:4px 0;padding-left:16px"></ul>
-  <div class="se-bias-h">Early-Exit Triggers</div>
-  <ul id="ar-exit" style="margin:4px 0;padding-left:16px"></ul>
-  <div class="se-bias-h">Invalidation</div>
-  <div class="se-reason" id="ar-inval">—</div>
-  <div id="ar-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
-</div>
-
 <div class="mod mb-hidden" id="mod-analyst" style="display:none">
   <div class="mod-h">🧠 Analyst Mode <span id="an-verdict" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-advanced">ADVANCED</span></div>
   <div class="se-bias-h">Final Verdict</div>
@@ -46016,9 +45983,6 @@ function renderModules(d){
   renderBotHold(d);
   renderActiveTradeMgmt(d);
   renderLiveRunner(d);
-
-  // ── Module 10b: Unified Analyst Report — ONE synthesis of the engines below (DISPLAY-ONLY) ──
-  renderReportMode(d);
 
   // ── Module 11: Analyst Mode — professional-analyst reasoning (DISPLAY-ONLY) ──
   renderAnalystMode(d);
@@ -48699,41 +48663,6 @@ function renderAnalystMode(d){
   }
 }
 
-// Unified Analyst Report — ONE executive thesis that CONSUMES the analyst, debate,
-// governor, memory, volatility & news engines (no duplication, DISPLAY-ONLY, no
-// veto). Fed by d.analyst_report. All dynamic strings via textContent.
-function renderReportMode(d){
-  const r=(d && d.analyst_report) || null;
-  const mod=document.getElementById('mod-report');
-  if(!mod) return;
-  if(!r || !r.engine_enabled){ mod.style.display='none'; return; }
-  mod.style.display='';
-  const _set=function(id, txt, col){
-    const e=document.getElementById(id);
-    if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
-  };
-  _set('ar-headline', r.headline, '#cfd0e0');
-  const st=r.stance||'—';
-  _set('ar-stance', st, _anVerdictColor(st));
-  _set('ar-bias', r.bias, r.bias==='Bullish'?'#22c55e':r.bias==='Bearish'?'#ef4444':'#9aa');
-  const fav=r.favored_direction||'—';
-  _set('ar-fav', fav, fav==='Long'?'#22c55e':fav==='Short'?'#ef4444':'#6b7280');
-  const p=r.probability||{};
-  _set('ar-p-cont', (p.continuation!=null?p.continuation+'%':'—'), '#22c55e');
-  _set('ar-p-range', (p.range!=null?p.range+'%':'—'), '#f59e0b');
-  _set('ar-p-rev', (p.reversal!=null?p.reversal+'%':'—'), '#ef4444');
-  const c=r.confidence||{};
-  const cc=(c.direction==='up')?'#22c55e':(c.direction==='down')?'#ef4444':'#cfd0e0';
-  _set('ar-conf', c.narrative, cc);
-  _anFill('ar-for', r.evidence_for);
-  _anFill('ar-against', r.evidence_against);
-  _anFill('ar-next', r.what_increases_confidence);
-  _anFill('ar-exit', r.early_exit_triggers);
-  _set('ar-inval', r.invalidation, '#cfd0e0');
-  const foot=document.getElementById('ar-foot');
-  if(foot){ foot.textContent = r.disclaimer || 'Consumes the existing analyst engines · display-only.'; }
-}
-
 // Professional Review — pre-READY pro-trader grading. TWO models (SCALP / SWING)
 // scored from the FINAL assembled analysis and selected SEPARATELY per instrument.
 // DISPLAY-ONLY on the dashboard; the money-path veto is flag-gated server-side.
@@ -50420,7 +50349,6 @@ var _liveNavSections = {
     'mod-breakout',       // 9:30 Breakout Mode
     'mod-swing-v2',       // Swing V2 engine
     'mod-dual-sim',       // Dual Shadow Simulator
-    'mod-report',         // Analysis Report
     // Detailed brain engine outputs (accessible for deep inspection)
     'mod-microscalp',     // Micro Scalp Brain
     'mod-analyst',        // Unified Analyst Report
