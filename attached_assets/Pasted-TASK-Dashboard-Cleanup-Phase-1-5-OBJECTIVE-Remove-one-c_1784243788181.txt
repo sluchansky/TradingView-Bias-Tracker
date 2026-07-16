@@ -1,0 +1,110 @@
+TASK: Dashboard Cleanup — Phase 1.5
+
+OBJECTIVE
+
+Remove one clear duplicate dashboard interface:
+
+Panel: Ask the AI
+Panel ID: mod-assistant
+
+The Main Brain already contains its own chat interface and uses the same
+/assistant backend. The separate mod-assistant panel is redundant.
+
+MAKE ONLY THIS ONE CHANGE.
+
+BEFORE EDITING
+
+Inspect and report:
+
+1. The exact file or files that would be modified.
+2. The markup belonging exclusively to mod-assistant.
+3. Every JavaScript function, event handler, DOM selector, and CSS rule that
+   references mod-assistant.
+4. Which assistant functions are shared with the Main Brain chat.
+5. Which code can be removed safely.
+6. Which code must remain because the Main Brain depends on it.
+
+Then perform the change.
+
+REQUIREMENTS
+
+1. Remove the standalone mod-assistant panel from the rendered dashboard.
+
+2. Preserve:
+- The /assistant backend endpoint
+- The Main Brain chat interface
+- Main Brain quick-question buttons
+- Shared request and response functions
+- Shared assistant state
+- Any assistant logic used elsewhere
+
+3. Remove mod-assistant from any:
+- Dashboard markup
+- Panel category registry
+- Advanced View whitelist or visibility selector
+- Section navigation registry
+- Panel inventory or lookup structure
+- Toggle logic specific to that panel
+
+4. Remove JavaScript and CSS only when it is exclusively used by the standalone
+   mod-assistant panel.
+
+5. Do not remove shared code merely because its function name includes
+   “assistant.”
+
+6. Do not modify any other panel.
+
+7. Do not:
+- Move panels
+- Resize panels
+- Redesign layout
+- Change dashboard navigation
+- Change Brain content
+- Change trading logic
+- Change the /assistant response format
+- Perform unrelated cleanup
+
+SUCCESS CRITERIA
+
+- mod-assistant no longer exists in the rendered DOM.
+- Ask the AI does not appear with Advanced View OFF.
+- Ask the AI does not appear with Advanced View ON.
+- Main Brain chat still opens.
+- Main Brain chat still submits a question successfully.
+- Main Brain quick-question buttons still work.
+- /assistant still returns a successful response.
+- No empty dashboard gap remains.
+- No other panel changed.
+- No new browser-console errors.
+
+TESTING
+
+1. Search the served HTML for id="mod-assistant".
+2. Confirm it is absent.
+3. Load the dashboard with Advanced View OFF.
+4. Confirm no standalone Ask the AI panel appears.
+5. Turn Advanced View ON.
+6. Confirm it still does not appear.
+7. Open the Main Brain chat.
+8. Submit: Why WAIT?
+9. Confirm a response appears.
+10. Test one Main Brain quick-question button.
+11. Switch between all dashboard sections.
+12. Check the browser console.
+
+FINAL RESPONSE
+
+Return:
+
+- Files changed
+- Exact markup removed
+- Standalone JavaScript removed
+- Shared JavaScript preserved
+- CSS, registry, or visibility references removed
+- Main Brain chat test result
+- Quick-question test result
+- /assistant endpoint test result
+- Browser-console result
+- Confirmation that no other panel was modified
+
+Do not begin Phase 1.6.
