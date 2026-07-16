@@ -52415,7 +52415,7 @@ function _thCard(inst, t) {
     +(evF?'<div class="th-ev-row th-for"><span class="th-ev-lbl">For:</span> '+aiEsc(evF)+'</div>':'')
     +(evA?'<div class="th-ev-row th-ag"><span class="th-ev-lbl">Against:</span> '+aiEsc(evA)+'</div>':'')
     +'<div class="th-meta">Age: '+age+rdyAge+' <span class="th-tid">'+tid+'</span></div>'
-    +'<button class="th-hist-btn" onclick="toggleThHist(\''+inst+'\')">'+
+    +'<button class="th-hist-btn" data-inst="'+inst+'" onclick="toggleThHist(this.dataset.inst)">'+
       (expanded?'&#x25B2; Hide':'&#x25BE; History')+
     '</button>'
     +(expanded?histHtml:'')
