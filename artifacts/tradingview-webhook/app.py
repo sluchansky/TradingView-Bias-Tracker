@@ -2250,6 +2250,31 @@ EMERGENCY_DISABLED = {
 SAFETY_LOCK = threading.Lock()
 _OUTCOME_COOLDOWN = {}
 
+# ── Correlated entry cooldown (equity-index group: MNQ / MES / MYM) ──────────
+# When any one of the three correlated index instruments fires an auto-trade in
+# a direction, the OTHER two are suppressed for CORR_COOLDOWN_SECS so a single
+# losing move can't compound across all three simultaneously. In-memory only —
+# a restart clears all cooldowns (fail-safe toward allowing a trade).
+CORR_COOLDOWN_SECS   = 600   # 10 min between same-direction entries in the group
+_CORR_ENTRY_COOLDOWN = {}    # {inst: {"direction": str, "until": float}}
+
+# ── Directional loss-streak tracker ─────────────────────────────────────────
+# After DIRSTREAK_LOSS_COUNT losses in the same direction within
+# DIRSTREAK_WINDOW_SECS, that direction is paused for DIRSTREAK_PAUSE_SECS to
+# stop chasing a failing thesis. In-memory; a restart resets all timestamps
+# (fail-safe toward trading — the cooldown is short by design).
+DIRSTREAK_LOSS_COUNT  = 3      # N same-direction losses within window → pause
+DIRSTREAK_WINDOW_SECS = 3600   # 60-min look-back window
+DIRSTREAK_PAUSE_SECS  = 1800   # 30-min pause after streak triggers
+_DIRSTREAK_OUTCOMES   = deque(maxlen=200)   # {"inst","direction","result","ts"}
+_DIRSTREAK_LOCK       = threading.Lock()
+
+# ── Asia session Long edge floor ─────────────────────────────────────────────
+# Long auto/manual-ENTER entries during the Asia session (18:00–02:00 ET) must
+# reach ASIA_SESSION_LONG_MIN_EDGE. Empirical finding: Asia Longs lose at ~73%
+# while shorts and London/NY morning sessions win at 100% and 80%+ respectively.
+ASIA_SESSION_LONG_MIN_EDGE = 85  # min Edge Score for a Long entry in Asia hours
+
 # ── Runtime safety overrides (operator-set via /safety-settings) ─────────────
 # {inst: {key: value}} — the HIGHEST layer of the safety lookup (runtime →
 # registry → defaults). Reads are LOCK-FREE: each per-inst dict is swapped
@@ -2401,6 +2426,84 @@ def _outcome_cooldown_remaining(inst):
     if rem <= 0:
         return 0, None
     return int(rem) + 1, c.get("reason")
+
+
+# ── Correlated entry cooldown helpers ────────────────────────────────────────
+
+def _check_corr_cooldown(inst, direction):
+    """(blocked: bool, blocker_inst: str|None) — True when a peer equity-index
+    instrument has an active cooldown matching `direction` (fired within
+    CORR_COOLDOWN_SECS). LOCK-FREE dict reads under the GIL; never call while
+    holding SAFETY_LOCK."""
+    if inst not in INDEX_ALIGNMENT_INSTRUMENTS:
+        return False, None
+    now = time.time()
+    for peer in INDEX_ALIGNMENT_INSTRUMENTS:
+        if peer == inst:
+            continue
+        entry = _CORR_ENTRY_COOLDOWN.get(peer)
+        if (entry
+                and entry.get("direction") == direction
+                and entry.get("until", 0) > now):
+            return True, peer
+    return False, None
+
+
+def _record_corr_entry(inst, direction):
+    """After a confirmed entry for `inst` in `direction`, arm CORR_COOLDOWN_SECS
+    on every peer in the equity-index group (never on `inst` itself — it can
+    re-enter on a new READY signal). Called AFTER a confirmed send so a failed
+    attempt never suppresses peers. SAFETY_LOCK guards the write; never call
+    while holding AUTO_TRADE_LOCK."""
+    if inst not in INDEX_ALIGNMENT_INSTRUMENTS or not direction:
+        return
+    until = time.time() + CORR_COOLDOWN_SECS
+    with SAFETY_LOCK:
+        for peer in INDEX_ALIGNMENT_INSTRUMENTS:
+            if peer != inst:
+                _CORR_ENTRY_COOLDOWN[peer] = {"direction": direction, "until": until}
+
+
+# ── Directional loss-streak helpers ─────────────────────────────────────────
+
+def _record_direction_outcome(inst, direction, result):
+    """Append a trade outcome to the directional-streak tracker. Called from the
+    managed-trade close seam (_record_strategy_trade). FAIL-OPEN — all exceptions
+    are swallowed. The deque is maxlen-bounded; old entries auto-evict."""
+    if not inst or not direction or result not in ("Win", "Loss"):
+        return
+    try:
+        with _DIRSTREAK_LOCK:
+            _DIRSTREAK_OUTCOMES.append({
+                "inst":      inst,
+                "direction": direction,
+                "result":    result,
+                "ts":        time.time(),
+            })
+    except Exception:
+        pass
+
+
+def _directional_streak_blocked(inst, direction):
+    """(blocked: bool, loss_count: int) — True when DIRSTREAK_LOSS_COUNT or more
+    losses for `inst`+`direction` occurred within DIRSTREAK_WINDOW_SECS.
+    FAIL-OPEN: any error returns (False, 0). _DIRSTREAK_LOCK held briefly for
+    the list snapshot; never call while holding AUTO_TRADE_LOCK."""
+    try:
+        cutoff = time.time() - DIRSTREAK_WINDOW_SECS
+        with _DIRSTREAK_LOCK:
+            recent = list(_DIRSTREAK_OUTCOMES)
+        losses = [
+            e for e in recent
+            if e["inst"] == inst
+            and e["direction"] == direction
+            and e["result"] == "Loss"
+            and e["ts"] >= cutoff
+        ]
+        count = len(losses)
+        return count >= DIRSTREAK_LOSS_COUNT, count
+    except Exception:
+        return False, 0
 
 
 def _realized_pnl_today(inst):
@@ -11083,6 +11186,15 @@ def _record_strategy_trade(mt):
             _maybe_recompute_learning()
             _maybe_generate_learning_report()
             _emit_trade_closed_event(mt, ctx, outcome_reason, outcome_tag)  # Main Brain learning loop (display-only, fail-open)
+            # Feed directional-streak tracker (in-memory; fail-open).
+            try:
+                _record_direction_outcome(
+                    instrument_of(mt.get("symbol") or mt.get("instrument") or ""),
+                    mt.get("direction") or "",
+                    "Win" if float(mt.get("r_multiple") or 0) > 0 else "Loss",
+                )
+            except Exception:
+                pass
     except Exception as exc:
         logger.warning("record_strategy_trade failed: %s", exc)
     finally:
@@ -40750,6 +40862,28 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
             return {"status": "error",
                             "reason": "Setup direction is ambiguous — refusing to send."}, 409
 
+        # ── Asia session Long edge floor ──────────────────────────────────────
+        # Long entries via the standard auto/manual-ENTER path during the Asia
+        # session (18:00–02:00 ET) require Edge ≥ ASIA_SESSION_LONG_MIN_EDGE.
+        # Empirical data: Asia Longs lose at ~73%; shorts and London/NY sessions
+        # win at 100% and 100% respectively. Discretionary sources (manual_desk,
+        # user_approved_preview, etc.) are NOT subject to this — they are
+        # explicit operator overrides that bypass the Edge gate by design.
+        _et_hr_a = now_utc().astimezone(ET_TZ).hour
+        if (direction == "Long"
+                and (_et_hr_a >= 18 or _et_hr_a < 2)
+                and (a.get("edge_score") or 0) < ASIA_SESSION_LONG_MIN_EDGE):
+            _esc_a = a.get("edge_score") or 0
+            logger.info(
+                "Asia Long floor: %s edge %s < %s during Asia (18:00-02:00 ET) — blocked.",
+                instrument, _esc_a, ASIA_SESSION_LONG_MIN_EDGE)
+            return {"status": "error",
+                    "reason": (
+                        f"Asia session Long blocked — edge {_esc_a} "
+                        f"< {ASIA_SESSION_LONG_MIN_EDGE} required (18:00–02:00 ET). "
+                        "Wait for higher-conviction setup or the London/NY session."
+                    )}, 409
+
     # ── Learning Rule Engine gate (FAIL-OPEN: no data = no effect) ───────────────────────
     # Check per-instrument eligibility from the in-memory LEARNING_ELIGIBILITY cache
     # (warmed by _recompute_learning every Nth close + boot). DISABLED = hard 409.
@@ -41113,6 +41247,40 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
             except Exception:
                 pass
             return False
+    # ── Pre-execution direction safety checks ──────────────────────────────────
+    # Both the correlated-cooldown (B) and the streak-pause (C) need to know the
+    # likely direction before entering the gateway. full_analysis() is cached per-
+    # instrument (short TTL) so this is almost always a cache hit — the gateway
+    # calls it again internally with negligible extra cost. FAIL-OPEN: any error
+    # is swallowed and the trade proceeds as normal.
+    try:
+        _pex_a   = full_analysis(ticker_override=inst)
+        _pex_dir = ready_direction(str(_pex_a.get("verdict", "")))
+        if _pex_dir:
+            # (B) Correlated equity-index cooldown: after any one of MNQ/MES/MYM
+            # fires in a direction, suppress same-direction entries on the other
+            # two for CORR_COOLDOWN_SECS to avoid compounding correlated losses.
+            if inst in INDEX_ALIGNMENT_INSTRUMENTS:
+                _c_blocked, _c_peer = _check_corr_cooldown(inst, _pex_dir)
+                if _c_blocked:
+                    logger.info(
+                        "Auto-trade skipped for %s (%s) — correlated peer %s fired "
+                        "same direction within %ds.",
+                        inst, _pex_dir, _c_peer, CORR_COOLDOWN_SECS)
+                    return False
+            # (C) Directional loss-streak pause: after DIRSTREAK_LOSS_COUNT losses
+            # in the same direction within DIRSTREAK_WINDOW_SECS, pause that side
+            # for DIRSTREAK_PAUSE_SECS to stop chasing a failing thesis.
+            _s_blocked, _s_count = _directional_streak_blocked(inst, _pex_dir)
+            if _s_blocked:
+                logger.info(
+                    "Auto-trade skipped for %s (%s) — direction streak: %d %s losses "
+                    "in last %dmin (pausing %dmin).",
+                    inst, _pex_dir, _s_count, _pex_dir,
+                    DIRSTREAK_WINDOW_SECS // 60, DIRSTREAK_PAUSE_SECS // 60)
+                return False
+    except Exception as _pex_exc:
+        logger.debug("Pre-execution direction checks failed (fail-open): %s", _pex_exc)
     with _AUTO_EXEC_LOCK:
         # A still-open USER-APPROVED PREVIEW take holds this instrument's slot by the
         # operator's own hand — never let a bot-AUTO entry stack on top of it, even in
@@ -41180,6 +41348,11 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
                             "managed-trade authoritative; no ACTIVE_TRADE slot.",
                             inst, plan.get("direction"), plan.get("quantity"),
                             result.get("provider"))
+                # Arm correlated-instrument cooldown for equity-index peers.
+                try:
+                    _record_corr_entry(inst, plan.get("direction"))
+                except Exception:
+                    pass
                 return True
             try:
                 # One slot per instrument; overwrite=False preserves an existing
@@ -41207,6 +41380,11 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
                             result.get("provider"), status)
             except (TypeError, ValueError) as exc:
                 logger.error("Auto-trade tracking failed after %s send (VERIFY BROKER): %s", status, exc)
+            # Arm correlated-instrument cooldown for equity-index peers.
+            try:
+                _record_corr_entry(inst, plan.get("direction"))
+            except Exception:
+                pass
             # Order reached the broker - never re-send this setup, even if the local
             # tracking write above failed (the position is real; verify manually).
             return True

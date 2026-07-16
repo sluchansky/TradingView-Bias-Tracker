@@ -84,3 +84,23 @@ path and without changing MGC/MNQ behaviour.
 IDENTICAL), the helper unit checks (fail-closed unknown, cooldown arming,
 maxOpenTrades=0→block), and the gateway smokes. MES/MYM ship emergency-disabled
 until the operator POSTs `/auto-trade {emergencyDisabled:false}` AND arms AUTO.
+
+## Data-driven safety layer (in _maybe_auto_execute, FAIL-OPEN)
+
+Three guards added based on 25-trade loss analysis (9W/16L, −7R):
+
+- **Asia Long floor** (`execute_trade_gateway` `else:`-branch): Long entries during
+  18:00–02:00 ET require Edge ≥ `ASIA_SESSION_LONG_MIN_EDGE` (85). Standard
+  auto/manual-ENTER only — discretionary sources bypass. Returns 409.
+- **Correlated index cooldown**: After any MNQ/MES/MYM fires a direction,
+  `_CORR_ENTRY_COOLDOWN` suppresses same direction on the other two for
+  `CORR_COOLDOWN_SECS` (600 s). Direction pre-resolved from cached `full_analysis`.
+  Cooldown set after confirmed send in BOTH Option-C (paper dynamic) and legacy paths.
+- **Directional streak pause**: After `DIRSTREAK_LOSS_COUNT` (3) losses in the same
+  direction within `DIRSTREAK_WINDOW_SECS` (3600 s), that direction pauses for
+  `DIRSTREAK_PAUSE_SECS` (1800 s). `_DIRSTREAK_OUTCOMES` deque fed from
+  `_record_strategy_trade` close seam. All three constants are module-level and
+  env-reversible by design (they are plain ints — change to `_env_int` if an env
+  override path is ever needed).
+- **Lock order for new structures**: `_CORR_ENTRY_COOLDOWN` writes under `SAFETY_LOCK`;
+  `_DIRSTREAK_LOCK` is independent. Neither ever nests under `AUTO_TRADE_LOCK`.
