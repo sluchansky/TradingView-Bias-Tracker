@@ -212,6 +212,12 @@ export const BOT1_ROUTES = [
   "/academy/rules/:id/status",
   "/academy/metrics",
   "/academy/ask",
+  // Persistent Market Thesis (Phase 2) — owner-only; DISPLAY-ONLY; NOT in
+  // dashboard-auth OPEN_PATHS. Returns current thesis snapshots for all
+  // enabled instruments plus per-instrument transition history.
+  "/thesis",
+  "/thesis/:instrument",
+  "/thesis/:instrument/history",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

@@ -1,0 +1,415 @@
+PHASE 2 — LIVE MARKET THESIS DASHBOARD + TRANSITION ALERTS
+
+OBJECTIVE
+
+Phase 1 created the persistent Market Thesis and hysteresis engine.
+
+Phase 2 must make that thesis visible, understandable, and actionable for the user.
+
+Do not add new strategies, indicators, scoring systems, prediction engines, or entry rules during this phase.
+
+Do not redesign the entire dashboard.
+
+Do not change the existing TradersPost execution path, risk rules, verdict logic, entry calculations, stop calculations, target calculations, or market-closed behavior.
+
+The existing bot must continue operating normally if any Phase 2 UI or notification feature fails.
+
+--------------------------------------------------
+1. BUILD A LIVE MARKET THESIS PANEL
+--------------------------------------------------
+
+Create a reusable MarketThesisPanel component.
+
+Display one thesis card for each enabled instrument:
+
+- MNQ
+- MES
+- MYM
+- MGC
+- Any additional enabled instrument returned by /status
+
+Each card must display:
+
+A. Instrument
+
+B. Direction
+- LONG
+- SHORT
+- NEUTRAL
+
+C. Thesis status
+- NEUTRAL
+- FORMING_LONG
+- FORMING_SHORT
+- READY_LONG
+- READY_SHORT
+- INVALIDATED
+- COOLDOWN
+
+D. Confidence
+- Large percentage number
+- Progress bar or confidence meter
+- Example: 78%
+
+E. Confidence state
+- BUILDING
+- STABLE
+- WEAKENING
+- INVALIDATED
+
+F. Thesis age
+- Example: 14m 32s
+
+G. Ready age, when applicable
+- Example: READY for 2m 18s
+
+H. Evidence For
+Display human-readable labels, not raw internal codes.
+
+Examples:
+- Bullish BOS
+- Bullish CHOCH
+- Active demand zone
+- Price above VWAP
+- Bullish CVD
+- Liquidity sweep confirmed
+- Volume confirmed
+- Prime trading session
+
+I. Evidence Against
+
+Examples:
+- Weak relative volume
+- CVD opposing direction
+- Price lost VWAP
+- Structure weakening
+- Zone consumed
+- Opposite-direction signal detected
+
+J. Entry plan
+When available, display:
+- Entry
+- Stop
+- Target 1
+- Target 2
+- Risk/reward
+- Invalidation level or reason
+
+K. Thesis identifier
+Show an abbreviated thesisId for debugging.
+
+Example:
+THESIS: A72F91
+
+L. Last updated timestamp
+
+--------------------------------------------------
+2. VISUAL STATE RULES
+--------------------------------------------------
+
+Use clear visual states without redesigning the whole application.
+
+NEUTRAL:
+- Gray
+- No directional emphasis
+
+FORMING LONG:
+- Soft green accent
+
+READY LONG:
+- Strong green accent
+- Clearly label READY LONG
+
+FORMING SHORT:
+- Soft red accent
+
+READY SHORT:
+- Strong red accent
+- Clearly label READY SHORT
+
+WEAKENING:
+- Amber warning accent
+
+INVALIDATED:
+- Red warning state
+- Show invalidation reason prominently
+
+COOLDOWN:
+- Muted purple or gray
+- Display remaining cooldown time
+
+Do not communicate state using color alone. Always include text labels.
+
+--------------------------------------------------
+3. ADD A THESIS TIMELINE
+--------------------------------------------------
+
+Add a compact timeline beneath each instrument card.
+
+Record and display recent transitions such as:
+
+- NEUTRAL → FORMING_LONG
+- FORMING_LONG → READY_LONG
+- READY_LONG confidence 81% → 68%
+- READY_LONG → INVALIDATED
+- INVALIDATED → COOLDOWN
+- COOLDOWN → NEUTRAL
+- LONG thesis → confirmed SHORT thesis
+
+Each timeline event must include:
+
+- Time
+- Previous status
+- New status
+- Previous confidence
+- New confidence
+- Primary reason
+- thesisId
+
+Keep at least the most recent 10 events visible per instrument.
+
+--------------------------------------------------
+4. ADD DISCORD THESIS TRANSITION NOTIFICATIONS
+--------------------------------------------------
+
+Do not send a Discord message for every status poll or small confidence change.
+
+Send notifications only for important transitions:
+
+- NEUTRAL → FORMING
+- FORMING → READY
+- READY → INVALIDATED
+- Any confirmed LONG-to-SHORT or SHORT-to-LONG reversal
+- Entering COOLDOWN
+- Confidence crossing below the READY hold threshold
+- A hard invalidation
+- An actual trade being submitted
+
+Discord message example:
+
+MNQ — READY LONG
+
+Confidence: 82%
+Previous status: FORMING_LONG
+New status: READY_LONG
+Thesis age: 16m 42s
+
+Evidence For:
+✓ Bullish BOS
+✓ Active demand zone
+✓ Above VWAP
+✓ Bullish CVD
+✓ Liquidity sweep confirmed
+
+Evidence Against:
+• Relative volume only moderate
+
+Entry: 23,184.25
+Stop: 23,161.25
+Target 1: 23,207.25
+Target 2: 23,230.25
+
+Thesis ID: A72F91
+
+Prevent duplicate Discord notifications for the same transition.
+
+A status poll must never repeatedly resend the same alert.
+
+--------------------------------------------------
+5. UPGRADE THE TRADE CARD
+--------------------------------------------------
+
+Every dashboard or Discord trade card must include the thesis context that existed when the entry was created.
+
+Add:
+
+- thesisId
+- Thesis direction
+- Thesis status
+- Confidence at entry
+- Thesis age at entry
+- Ready age at entry
+- Evidence For
+- Evidence Against
+- Invalidation reason
+- VWAP alignment
+- CVD state
+- Sweep confirmation
+- Volume confirmation
+- Entry, stop and targets
+- Strategy/mode
+- Instrument
+- Timestamp
+
+The trade card must use the frozen entry snapshot.
+
+Do not allow later confidence changes to rewrite what the bot believed at the moment of entry.
+
+--------------------------------------------------
+6. PERSIST THESIS STATE ACROSS RESTARTS
+--------------------------------------------------
+
+Phase 1 currently stores the active thesis in memory.
+
+Add database persistence for the new hysteresis thesis schema.
+
+Do not reuse an incompatible legacy table without a migration.
+
+Persist at minimum:
+
+- thesisId
+- instrument
+- direction
+- status
+- confidence
+- confidenceState
+- evidenceFor
+- evidenceAgainst
+- reasonCodes
+- createdAt
+- updatedAt
+- readyAt
+- cooldownUntil
+- vwapAligned
+- cvdAligned
+- cvdState
+- sweepConfirmed
+- volumeConfirmed
+- entry snapshot
+- stop snapshot
+- targets snapshot
+- invalidationReason
+
+On application restart:
+
+1. Load the most recent active thesis for every enabled instrument.
+2. Validate that it is not stale.
+3. Restore it only when safe.
+4. If stale, expired, malformed, or incompatible, start that instrument at NEUTRAL.
+5. Never submit a trade merely because a READY thesis was restored.
+6. Require fresh market evidence before any post-restart execution.
+
+Add an environment-controlled maximum restore age.
+
+Example:
+
+THESIS_RESTORE_MAX_AGE_MS
+
+--------------------------------------------------
+7. API REQUIREMENTS
+--------------------------------------------------
+
+Keep the thesis object available through /status.
+
+Also create a focused endpoint if appropriate:
+
+GET /api/thesis
+
+Response should contain all enabled instruments and their current thesis snapshots.
+
+Optional:
+
+GET /api/thesis/:instrument/history
+
+This can return recent transition events.
+
+The dashboard must handle:
+
+- Missing thesis data
+- API timeout
+- Invalid response
+- Unknown instrument
+- Backend temporarily unavailable
+
+Display “Thesis unavailable” rather than crashing the dashboard.
+
+--------------------------------------------------
+8. SAFETY AND FAIL-OPEN REQUIREMENTS
+--------------------------------------------------
+
+The Phase 2 dashboard must remain read-only.
+
+It must not directly modify:
+
+- Confidence
+- Thesis direction
+- Thesis status
+- Verdict
+- Trade entry
+- Stop
+- Targets
+- Auto-trade state
+
+Discord failures must not block analysis or execution.
+
+Database persistence failures must not crash the money path.
+
+Dashboard rendering failures must not affect the backend.
+
+The existing feature flag must remain available:
+
+THESIS_HYSTERESIS=0
+
+When disabled, the application must preserve the verified pre-feature behavior.
+
+Add separate flags if needed:
+
+THESIS_DASHBOARD_ENABLED=1
+THESIS_DISCORD_ALERTS_ENABLED=1
+THESIS_DB_PERSISTENCE_ENABLED=1
+
+--------------------------------------------------
+9. TESTING
+--------------------------------------------------
+
+Keep all Phase 1 tests passing.
+
+Add tests for:
+
+- Dashboard receives the correct thesis schema
+- All statuses render safely
+- Missing fields do not crash the UI
+- FORMING → READY creates one notification
+- Repeated READY polling does not duplicate notifications
+- READY → INVALIDATED sends an invalidation notification
+- Confirmed reversal creates a new thesisId
+- Weak opposite alert does not create a confirmed reversal
+- Entry trade card freezes confidenceAtEntry
+- Thesis state persists across a normal restart
+- Stale thesis is not restored
+- Restored READY thesis does not automatically submit a trade
+- Discord failure does not block the analysis path
+- Database failure does not block the existing money path
+- Feature flags restore old behavior
+
+Run the full existing test suite plus the new Phase 2 tests.
+
+--------------------------------------------------
+10. DEFINITION OF DONE
+--------------------------------------------------
+
+Phase 2 is complete only when:
+
+1. Every enabled instrument has a visible live thesis card.
+2. The card clearly explains what the bot believes and why.
+3. Evidence For and Evidence Against are both visible.
+4. Confidence and thesis age update automatically.
+5. Important transitions appear in the timeline.
+6. Discord sends one alert per meaningful transition.
+7. Trade cards include the frozen thesis-at-entry snapshot.
+8. Active thesis state safely survives an application restart.
+9. Restoring a thesis cannot automatically place a trade.
+10. All previous tests and new Phase 2 tests pass.
+11. Existing trading and TradersPost behavior remains unchanged.
+
+At completion, provide:
+
+- Files created
+- Files modified
+- Database migration details
+- New environment variables
+- API response example
+- Screenshots of the thesis dashboard
+- Example Discord transition messages
+- Full test results
+- Confirmation that no entry, risk, stop, target, or execution logic was changed

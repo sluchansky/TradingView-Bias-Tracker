@@ -265,8 +265,11 @@ STATE_LOCK        = threading.Lock()
 # Statuses (DISPLAY):
 #   NEUTRAL / FORMING_LONG / FORMING_SHORT / READY_LONG / READY_SHORT /
 #   ACTIVE_LONG / ACTIVE_SHORT / INVALIDATED / COOLDOWN
-THESIS_BY_INST = {}            # inst -> thesis dict
-THESIS_LOCK    = threading.RLock()
+THESIS_BY_INST            = {}  # inst -> thesis dict
+THESIS_LOCK               = threading.RLock()
+THESIS_TIMELINE_BY_INST   = {}  # inst -> deque(maxlen=25) of transition events
+THESIS_NOTIF_LAST_BY_INST = {}  # inst -> {"sig": str} last-notified transition
+THESIS_DB_READY           = False  # probed at boot; persist/restore fail-open when False
 # Lightweight rolling-window timestamp logs (last hour) for diagnostics that the
 # capped EVAL_METRICS deque can't answer once the heartbeat floods it. Guarded by
 # COUNTERS_LOCK (appended in webhook(), read+trimmed in /eval-metrics).
@@ -3149,6 +3152,12 @@ _THESIS_REVERSAL_THRESHOLD   = int(os.environ.get("REVERSAL_THRESHOLD",   85))
 _THESIS_MIN_AGE_MS           = int(os.environ.get("MIN_THESIS_AGE_MS",   5000))
 _THESIS_REVERSAL_COOLDOWN_MS = int(os.environ.get("REVERSAL_COOLDOWN_MS", 20000))
 _THESIS_MAX_CONF_DROP        = 15   # max confidence drop per evaluation (inertia)
+# ── Phase 2 feature flags (each independently toggleable) ─────────────────────
+_THESIS_DISCORD_ALERTS_ENABLED = (os.environ.get("THESIS_DISCORD_ALERTS_ENABLED", "1")
+                                   .strip().lower() not in ("0", "false", "no", "off"))
+_THESIS_DB_PERSISTENCE_ENABLED = (os.environ.get("THESIS_DB_PERSISTENCE_ENABLED", "1")
+                                   .strip().lower() not in ("0", "false", "no", "off"))
+THESIS_RESTORE_MAX_AGE_MS      = int(os.environ.get("THESIS_RESTORE_MAX_AGE_MS", 3_600_000))
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 # ── Weekly performance report (additive) ──────────────────────────────────────
 # Posts a week-in-review embed once a week, just after the close. Default is
@@ -21380,6 +21389,44 @@ def _build_trade_card_embed(entry, footer_text):
     except Exception as exc:
         logger.error("Market-intelligence card block error: %s", exc)
 
+    # ── Additive: 🧠 Thesis at Entry (Phase 2 — frozen snapshot from full_analysis) ──
+    try:
+        th = entry.get("thesis") or {}
+        if th and th.get("thesisId"):
+            tid_s = (th.get("thesisId") or "")[-6:].upper()
+            st    = (th.get("status") or "?").replace("_", " ")
+            conf  = th.get("confidence", "?")
+            age   = _ms_to_human(th.get("thesisAgeMs", 0))
+            ev_for = [_ev_label(e) for e in (th.get("evidenceFor")  or [])][:5]
+            ev_ag  = [_ev_label(e) for e in (th.get("evidenceAgainst") or [])][:3]
+            th_lines = [
+                f"ID `{tid_s}` · {th.get('direction', '?')} · **{st}**",
+                f"Confidence: **{conf}%** · Age: {age}",
+            ]
+            if th.get("readyAgeMs") is not None:
+                th_lines.append(f"READY for: {_ms_to_human(th['readyAgeMs'])}")
+            if ev_for:
+                th_lines.append("For: " + " · ".join(ev_for))
+            if ev_ag:
+                th_lines.append("Against: " + " · ".join(ev_ag))
+            _vwap_ok  = th.get("vwapAligned")
+            _cvd_st   = th.get("cvdState", "?")
+            _sweep_ok = th.get("sweepConfirmed")
+            _vol_ok   = th.get("volumeConfirmed")
+            th_lines.append(
+                f"VWAP:{'✓' if _vwap_ok else '✗'}  CVD:{_cvd_st}  "
+                f"Sweep:{'✓' if _sweep_ok else '✗'}  Vol:{'✓' if _vol_ok else '✗'}"
+            )
+            if th.get("invalidationReason"):
+                th_lines.append("\u26a0 Invalidation: " + str(th["invalidationReason"]))
+            embed["fields"].append({
+                "name":   "\U0001F9E0 Thesis at Entry",
+                "value":  "\n".join(th_lines)[:1024],
+                "inline": False,
+            })
+    except Exception as _th_exc:
+        logger.error("Thesis card block error: %s", _th_exc)
+
     # Attach the chart screenshot when a validated public URL is present.
     shot = entry.get("screenshot_url")
     if shot:
@@ -28830,6 +28877,351 @@ def _thesis_blank(inst, direction, now_dt):
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# THESIS PHASE 2 — Timeline, Discord Notifications, DB Persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Evidence code → human-readable label map ──────────────────────────────────
+_EV_LABELS = {
+    "STRUCTURE_BULLISH":     "Bullish structure",
+    "STRUCTURE_BEARISH":     "Bearish structure",
+    "STRUCTURE_INVALIDATED": "Structure invalidated",
+    "ZONE_ACTIVE":           "Active demand/supply zone",
+    "ZONE_CONSUMED":         "Zone consumed",
+    "ZONE_INACTIVE":         "No active zone",
+    "VWAP_ALIGNED":          "VWAP aligned",
+    "VWAP_OPPOSING":         "VWAP opposing",
+    "CVD_ALIGNED":           "CVD confirms direction",
+    "CVD_OPPOSING":          "CVD opposing direction",
+    "SWEEP_CONFIRMED":       "Liquidity sweep confirmed",
+    "VOLUME_CONFIRMED":      "Volume confirmed",
+    "PRIME_SESSION":         "Prime trading session",
+}
+
+def _ev_label(code):
+    """Map an internal evidence code to a human-readable label."""
+    return _EV_LABELS.get(code, str(code).replace("_", " ").title())
+
+def _ms_to_human(ms):
+    """Convert milliseconds to a compact human string, e.g. '14m 32s'."""
+    try:
+        if not ms or int(ms) < 0:
+            return "—"
+        s = int(ms) // 1000
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m {sec}s"
+        return f"{sec}s"
+    except Exception:
+        return "—"
+
+# ── Timeline event recording ───────────────────────────────────────────────────
+
+def _record_thesis_event(inst, prev_snap, new_snap):
+    """Append a transition event to THESIS_TIMELINE_BY_INST[inst] (fail-open).
+    Capped at 25 events per instrument; guarded by THESIS_LOCK."""
+    try:
+        event = {
+            "ts":               new_snap.get("lastUpdatedAt") or now_utc().isoformat(),
+            "thesisId":         new_snap.get("thesisId"),
+            "direction":        new_snap.get("direction"),
+            "prevStatus":       prev_snap.get("status", "NEUTRAL"),
+            "newStatus":        new_snap.get("status", "NEUTRAL"),
+            "prevConfidence":   int(prev_snap.get("confidence") or 0),
+            "newConfidence":    int(new_snap.get("confidence") or 0),
+            "reasonCodes":      list(new_snap.get("reasonCodes") or []),
+            "primaryReason":    ((new_snap.get("reasonCodes") or [""])[0]),
+            "invalidationReason": new_snap.get("invalidationReason"),
+        }
+        with THESIS_LOCK:
+            if inst not in THESIS_TIMELINE_BY_INST:
+                THESIS_TIMELINE_BY_INST[inst] = deque(maxlen=25)
+            THESIS_TIMELINE_BY_INST[inst].appendleft(event)
+    except Exception as exc:
+        logger.debug("_record_thesis_event fail-open [%s]: %s", inst, exc)
+
+# ── Discord notification helpers ───────────────────────────────────────────────
+
+# Important transitions that warrant a Discord push (prev_status, new_status).
+_THESIS_NOTIFY_TRANSITIONS = frozenset({
+    ("NEUTRAL",       "FORMING_LONG"),
+    ("NEUTRAL",       "FORMING_SHORT"),
+    ("INVALIDATED",   "FORMING_LONG"),
+    ("INVALIDATED",   "FORMING_SHORT"),
+    ("COOLDOWN",      "FORMING_LONG"),
+    ("COOLDOWN",      "FORMING_SHORT"),
+    ("FORMING_LONG",  "READY_LONG"),
+    ("FORMING_SHORT", "READY_SHORT"),
+    ("READY_LONG",    "INVALIDATED"),
+    ("READY_SHORT",   "INVALIDATED"),
+    ("READY_LONG",    "COOLDOWN"),
+    ("READY_SHORT",   "COOLDOWN"),
+    ("READY_LONG",    "FORMING_LONG"),
+    ("READY_SHORT",   "FORMING_SHORT"),
+})
+
+def _should_notify_thesis(inst, prev_snap, new_snap):
+    """Return True iff this transition warrants a Discord alert.
+    Dedup: skip if we already sent for this exact (thesisId, prev→new) signature.
+    Never raises — fail-open returns False."""
+    try:
+        prev_st = prev_snap.get("status", "NEUTRAL")
+        new_st  = new_snap.get("status", "NEUTRAL")
+        tid     = new_snap.get("thesisId", "")
+        is_transition = (prev_st, new_st) in _THESIS_NOTIFY_TRANSITIONS
+        if not is_transition:
+            # Also fire on confirmed direction flip (new thesisId + opposite direction)
+            prev_dir = prev_snap.get("direction")
+            new_dir  = new_snap.get("direction")
+            prev_tid = prev_snap.get("thesisId", "")
+            if not (tid and prev_tid and tid != prev_tid
+                    and prev_dir and new_dir and prev_dir != new_dir):
+                return False
+        sig = f"{tid}|{prev_st}|{new_st}"
+        last = THESIS_NOTIF_LAST_BY_INST.get(inst) or {}
+        return last.get("sig") != sig
+    except Exception:
+        return False
+
+_THESIS_STATUS_EMOJI = {
+    "FORMING_LONG":  "🟢",
+    "FORMING_SHORT": "🔴",
+    "READY_LONG":    "🚀",
+    "READY_SHORT":   "🔻",
+    "ACTIVE_LONG":   "📈",
+    "ACTIVE_SHORT":  "📉",
+    "INVALIDATED":   "❌",
+    "COOLDOWN":      "⏳",
+    "NEUTRAL":       "⚫",
+}
+
+def _thesis_notification_embed(inst, prev_snap, new_snap):
+    """Build a compact Discord embed for a thesis transition notification."""
+    prev_st   = prev_snap.get("status", "NEUTRAL")
+    new_st    = new_snap.get("status", "NEUTRAL")
+    direction = new_snap.get("direction", "—")
+    conf      = new_snap.get("confidence", 0)
+    age_ms    = new_snap.get("thesisAgeMs", 0)
+    ready_ms  = new_snap.get("readyAgeMs")
+    tid       = (new_snap.get("thesisId") or "")[-6:].upper()
+    inv_r     = new_snap.get("invalidationReason")
+    if new_st in ("READY_LONG", "READY_SHORT"):
+        color = 0x2ECC71
+    elif new_st == "INVALIDATED":
+        color = 0xE74C3C
+    elif new_st == "COOLDOWN":
+        color = 0x9B59B6
+    elif new_st.startswith("FORMING"):
+        color = 0xF39C12
+    else:
+        color = 0x95A5A6
+    emoji = _THESIS_STATUS_EMOJI.get(new_st, "⚫")
+    ev_for = [_ev_label(e) for e in (new_snap.get("evidenceFor")  or [])][:6]
+    ev_ag  = [_ev_label(e) for e in (new_snap.get("evidenceAgainst") or [])][:4]
+    fields = [
+        {"name": "📊 Confidence",    "value": f"**{conf}%**",          "inline": True},
+        {"name": "🔄 Transition",    "value": f"{prev_st} → **{new_st}**", "inline": True},
+        {"name": "⏱️ Age",           "value": _ms_to_human(age_ms),    "inline": True},
+        {"name": "✅ Evidence For",  "value": ("\n".join(f"✓ {e}" for e in ev_for) or "—"),
+         "inline": False},
+        {"name": "⚠️ Against",       "value": ("\n".join(f"• {e}" for e in ev_ag)  or "—"),
+         "inline": False},
+    ]
+    if ready_ms is not None:
+        fields.insert(3, {"name": "🚀 READY for",
+                          "value": _ms_to_human(ready_ms), "inline": True})
+    if inv_r:
+        fields.append({"name": "🚫 Invalidation",
+                       "value": str(inv_r)[:300], "inline": False})
+    e_v  = new_snap.get("entry")
+    s_v  = new_snap.get("stop")
+    tgts = [t for t in (new_snap.get("targets") or []) if t is not None]
+    if e_v and s_v:
+        plan_lines = [f"Entry: {e_v}", f"Stop: {s_v}"]
+        for i, t in enumerate(tgts[:2], 1):
+            plan_lines.append(f"Target {i}: {t}")
+        fields.append({"name": "📐 Plan",
+                       "value": "\n".join(plan_lines), "inline": False})
+    return {
+        "title":       f"{emoji} {inst} — {new_st.replace('_', ' ')}",
+        "description": f"Direction: **{direction}**  ·  Thesis ID: `{tid}`",
+        "color":       color,
+        "timestamp":   now_utc().isoformat(),
+        "fields":      fields,
+        "footer":      {"text": f"Market Thesis · {inst}"},
+    }
+
+def _maybe_send_thesis_notification(inst, prev_snap, new_snap):
+    """Enqueue a Discord thesis-transition notification (fail-open, deduped).
+    Only fires when THESIS_DISCORD_ALERTS_ENABLED + DISCORD_LIVE_ENABLED.
+    Dedup stamp is written BEFORE enqueueing to prevent race-condition duplicates."""
+    try:
+        if not _THESIS_DISCORD_ALERTS_ENABLED:
+            return
+        if not _should_notify_thesis(inst, prev_snap, new_snap):
+            return
+        prev_st = prev_snap.get("status", "NEUTRAL")
+        new_st  = new_snap.get("status", "NEUTRAL")
+        tid     = new_snap.get("thesisId", "")
+        sig     = f"{tid}|{prev_st}|{new_st}"
+        THESIS_NOTIF_LAST_BY_INST[inst] = {"sig": sig, "ts": now_utc().isoformat()}
+        url   = _asset_discord_url(inst)
+        embed = _thesis_notification_embed(inst, prev_snap, new_snap)
+        def _send():
+            try:
+                if not DISCORD_LIVE_ENABLED or not url:
+                    return
+                resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
+                if resp.status_code not in (200, 204):
+                    logger.warning("Thesis Discord failed [%s]: %s %s",
+                                   inst, resp.status_code, resp.text[:200])
+            except Exception as exc:
+                logger.warning("Thesis Discord send error [%s]: %s", inst, exc)
+        _enqueue_slow(_send)
+    except Exception as exc:
+        logger.debug("_maybe_send_thesis_notification fail-open [%s]: %s", inst, exc)
+
+# ── Database persist / restore ────────────────────────────────────────────────
+
+def _check_hysteresis_thesis_db_ready():
+    """Probe the hysteresis_thesis table (no DDL). FAIL-OPEN."""
+    global THESIS_DB_READY
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM hysteresis_thesis LIMIT 1")
+        conn.close()
+        THESIS_DB_READY = True
+        logger.info("hysteresis_thesis table ready (thesis persistence enabled)")
+    except Exception as exc:
+        logger.warning("hysteresis_thesis unavailable (thesis DB disabled): %s", exc)
+        THESIS_DB_READY = False
+
+def _persist_thesis_state(inst, snap):
+    """UPSERT the current thesis snapshot for `inst` (fail-open).
+    Runs in the slow-task worker so it never blocks the webhook path."""
+    if not THESIS_DB_READY or not inst or not snap:
+        return
+    try:
+        import json as _json
+        conn = get_db_connection()
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO hysteresis_thesis
+                       (instrument, thesis_id, direction, status, confidence, data, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
+                   ON CONFLICT (instrument)
+                   DO UPDATE SET
+                       thesis_id  = EXCLUDED.thesis_id,
+                       direction  = EXCLUDED.direction,
+                       status     = EXCLUDED.status,
+                       confidence = EXCLUDED.confidence,
+                       data       = EXCLUDED.data,
+                       updated_at = NOW()""",
+                (inst,
+                 snap.get("thesisId"),
+                 snap.get("direction"),
+                 snap.get("status"),
+                 snap.get("confidence"),
+                 _json.dumps(snap)),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.debug("_persist_thesis_state fail-open [%s]: %s", inst, exc)
+
+def _restore_thesis_states():
+    """On boot, restore the most-recent thesis snapshot for every instrument.
+    Validates age (THESIS_RESTORE_MAX_AGE_MS), status, and schema.
+    A stale, malformed, or cooldown-expired row resets that instrument to NEUTRAL.
+    NEVER submits a trade — only restores THESIS_BY_INST for display/inertia."""
+    if not THESIS_DB_READY:
+        return
+    try:
+        import json as _json
+        conn = get_db_connection()
+        if not conn:
+            return
+        now_dt  = now_utc()
+        now_ms  = now_dt.timestamp() * 1000
+        restored = 0
+        with conn.cursor() as cur:
+            cur.execute("SELECT instrument, data, updated_at FROM hysteresis_thesis")
+            rows = cur.fetchall()
+        conn.close()
+        for inst, data_raw, updated_at in rows:
+            try:
+                snap = (data_raw if isinstance(data_raw, dict)
+                        else _json.loads(data_raw or "{}"))
+                if not snap or not snap.get("thesisId"):
+                    continue
+                age_ms = (now_ms - updated_at.timestamp() * 1000) if updated_at else float("inf")
+                if age_ms > THESIS_RESTORE_MAX_AGE_MS:
+                    logger.info("Thesis restore: %s skipped — stale (%d ms old)",
+                                inst, int(age_ms))
+                    continue
+                # Refresh timing fields so dashboard age display starts fresh
+                snap["thesisAgeMs"]    = max(0, int(age_ms))
+                snap["lastUpdatedAt"]  = now_dt.isoformat()
+                # Reject cooldown-expired snapshots
+                if snap.get("status") == "COOLDOWN":
+                    cu = snap.get("cooldownUntil")
+                    if cu:
+                        try:
+                            from datetime import timezone as _tz
+                            cu_dt = datetime.fromisoformat(cu)
+                            if cu_dt.tzinfo is None:
+                                cu_dt = cu_dt.replace(tzinfo=_tz.utc)
+                            if now_dt >= cu_dt:
+                                logger.info("Thesis restore: %s cooldown expired — resetting", inst)
+                                continue
+                        except (ValueError, TypeError):
+                            continue
+                with THESIS_LOCK:
+                    THESIS_BY_INST[inst] = snap
+                logger.info("Thesis restored: %s %s conf=%s%%",
+                            inst, snap.get("status"), snap.get("confidence"))
+                restored += 1
+            except Exception as row_exc:
+                logger.debug("Thesis restore row error [%s]: %s", inst, row_exc)
+        logger.info("Thesis restore complete: %d instrument(s) loaded", restored)
+    except Exception as exc:
+        logger.warning("_restore_thesis_states fail-open: %s", exc)
+
+# ── Post-update hook ──────────────────────────────────────────────────────────
+
+def _thesis_post_update(inst, prev_snap, new_snap):
+    """Called from _apply_thesis after _apply_thesis_inner completes.
+    Records timeline events, triggers Discord notifications, and schedules
+    a DB persist for any significant change. All three subsystems are fail-open
+    and never block the caller."""
+    try:
+        prev_st   = prev_snap.get("status",     "NEUTRAL")
+        new_st    = new_snap.get("status",      "NEUTRAL")
+        prev_conf = int(prev_snap.get("confidence") or 0)
+        new_conf  = int(new_snap.get("confidence")  or 0)
+        status_changed = (prev_st != new_st)
+        conf_delta     = abs(new_conf - prev_conf)
+        if not (status_changed or conf_delta >= 5):
+            return
+        _record_thesis_event(inst, prev_snap, new_snap)
+        if _THESIS_DISCORD_ALERTS_ENABLED:
+            _maybe_send_thesis_notification(inst, prev_snap, new_snap)
+        if _THESIS_DB_PERSISTENCE_ENABLED and THESIS_DB_READY:
+            _snap_copy = dict(new_snap)
+            _enqueue_slow(lambda i=inst, s=_snap_copy: _persist_thesis_state(i, s))
+    except Exception as exc:
+        logger.debug("_thesis_post_update fail-open [%s]: %s", inst, exc)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _apply_thesis(inst, strict, raw_verdict, trade_plan=None):
     """Apply confidence hysteresis and return (adjusted_verdict, thesis_snapshot).
 
@@ -28840,7 +29232,13 @@ def _apply_thesis(inst, strict, raw_verdict, trade_plan=None):
     if not _THESIS_ENABLED or not inst:
         return raw_verdict, {}
     try:
-        return _apply_thesis_inner(inst, strict, raw_verdict, trade_plan)
+        # Snapshot prev state before inner runs (needed for Phase 2 post-update diff)
+        with THESIS_LOCK:
+            _prev = dict(THESIS_BY_INST.get(inst) or {})
+        adj, snap = _apply_thesis_inner(inst, strict, raw_verdict, trade_plan)
+        # Phase 2: timeline + Discord + DB (all fail-open; never block money path)
+        _thesis_post_update(inst, _prev, snap)
+        return adj, snap
     except Exception as _te:
         logger.warning("_apply_thesis fail-open [%s]: %s", inst, _te)
         return raw_verdict, {}
@@ -29130,6 +29528,33 @@ def get_thesis_snapshot(inst):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ── Phase 2 thesis routes ────────────────────────────────────────────────────
+
+@app.route("/thesis", methods=["GET"])
+def get_all_thesis():
+    """Owner-only (dashboard auth via Express; NOT in OPEN_PATHS).
+    Returns the current thesis snapshot for every enabled instrument in one call.
+    The dashboard thesis panel polls this every 3 s to render all-instrument cards."""
+    insts = enabled_instruments()
+    out   = {}
+    with THESIS_LOCK:
+        for inst in insts:
+            t = THESIS_BY_INST.get(inst)
+            out[inst] = dict(t) if t else None
+    return jsonify({"ok": True, "thesis": out, "instruments": insts}), 200
+
+@app.route("/thesis/<instrument>/history", methods=["GET"])
+def get_thesis_history(instrument):
+    """Owner-only (dashboard auth via Express; NOT in OPEN_PATHS).
+    Returns the last 25 transition events for the requested instrument.
+    Fetched on-demand by the dashboard timeline expansion, not the 3-s poll."""
+    inst = _instrument_from_text(instrument)
+    if not inst:
+        return jsonify({"ok": False, "error": "Unknown instrument"}), 400
+    with THESIS_LOCK:
+        events = list(THESIS_TIMELINE_BY_INST.get(inst) or [])
+    return jsonify({"ok": True, "instrument": inst, "events": events}), 200
+
 # END THESIS HYSTERESIS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -40817,7 +41242,7 @@ def dashboard():
   .cp-btn.active{background:#2563eb;border-color:#2563eb;color:#fff}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(#mod-thesis):not(.mb-hidden){display:none !important}
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
   #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
@@ -41434,6 +41859,31 @@ def dashboard():
     .tab{min-width:0;flex:1 1 44%}
     #pnl{font-size:22px}#trade-info{font-size:19px}
   }
+/* ── Thesis Panel (Phase 2) ───────────────────────────────────── */
+#thesis-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:10px}
+.th-card{background:rgba(0,0,0,.32);border-radius:8px;padding:10px 12px;border-left:3px solid #444;transition:border-color .3s}
+.th-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
+.th-inst{font-weight:700;font-size:13px;color:var(--hi,#7fe9f5)}
+.th-badge{font-size:11px;padding:2px 7px;border-radius:10px}
+.th-dir{font-size:13px;margin:3px 0;color:#ccc}
+.th-conf{font-weight:700}
+.th-bar-wrap{height:3px;background:#1a2a2a;border-radius:2px;margin:3px 0 6px}
+.th-bar{height:3px;border-radius:2px;transition:width .4s}
+.th-ev-row{font-size:11px;color:#aaa;margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.th-for .th-ev-lbl{color:#2ecc71;font-weight:600}
+.th-ag .th-ev-lbl{color:#e74c3c;font-weight:600}
+.th-meta{font-size:10px;color:#555;margin-top:5px}
+.th-tid{margin-left:6px;font-family:monospace;color:#446}
+.th-hist-btn{font-size:10px;color:#557;background:none;border:none;cursor:pointer;margin-top:3px;padding:0;display:block}
+.th-timeline{max-height:180px;overflow-y:auto;margin-top:5px;border-top:1px solid #1a2a2a;padding-top:4px}
+.th-tl-ev{font-size:11px;color:#aaa;padding:2px 0;border-bottom:1px solid #111}
+.th-tl-time{color:#446;font-family:monospace}
+.th-tl-trans{margin:0 4px}
+.th-tl-reason{font-style:italic;color:#6a9}
+.th-loading{font-size:11px;color:#555;margin-top:4px}
+.th-neutral-txt{font-size:12px;color:#444}
+html[data-theme=retro] .th-card{background:rgba(0,20,0,.38);border-radius:4px}
+html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
 </head>
@@ -43288,6 +43738,15 @@ def dashboard():
     <input id="ri-shot" type="text" placeholder="optional — not stored or logged"></div>
   <button class="btn" id="ri-btn" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560;margin-top:8px;width:100%" onclick="reviewIdea()">🔎 Review my idea</button>
   <div id="ri-out" style="margin-top:10px"></div>
+</div>
+
+<!-- ════ MARKET THESIS PANEL (Phase 2) ════ -->
+<div class="mod" id="mod-thesis" style="grid-column:1/-1">
+  <div class="mod-h" onclick="toggleMod(this)">&#x1F9E0; Market Thesis</div>
+  <div class="mod-c">
+    <div id="thesis-cards"></div>
+    <div id="thesis-empty" style="display:none;color:var(--dim,#555);font-size:12px;margin:6px 0">No thesis data yet — awaiting first webhook</div>
+  </div>
 </div>
 
 </div><!-- /#view-live -->
@@ -51899,6 +52358,99 @@ setInterval(async () => {
 setInterval(loadAutoExit, 30000); // Auto Early-Exit status (arm state + invalid-streak) — light owner-only read
 setInterval(checkStale, 2000);
 loadTraining();
+
+// ── THESIS PANEL (Phase 2) — per-instrument hysteresis state display ──────────
+var _thExpanded = {};
+var _thHistCache = {};
+var _thLastData  = null;
+function _thColor(st) {
+  var m={'FORMING_LONG':'#f39c12','FORMING_SHORT':'#f39c12','READY_LONG':'#2ecc71','READY_SHORT':'#2ecc71','ACTIVE_LONG':'#3498db','ACTIVE_SHORT':'#3498db','INVALIDATED':'#e74c3c','COOLDOWN':'#9b59b6','NEUTRAL':'#555'};
+  return m[st]||'#555';
+}
+function _thEmoji(st) {
+  var m={'FORMING_LONG':'&#x1F7E2;','FORMING_SHORT':'&#x1F534;','READY_LONG':'&#x1F680;','READY_SHORT':'&#x1F53B;','ACTIVE_LONG':'&#x1F4C8;','ACTIVE_SHORT':'&#x1F4C9;','INVALIDATED':'&#x274C;','COOLDOWN':'&#x23F3;','NEUTRAL':'&#x26AB;'};
+  return m[st]||'&#x26AB;';
+}
+function _thMs(ms) {
+  if (!ms||ms<0) return '&mdash;';
+  var s=Math.floor(ms/1000),h=Math.floor(s/3600),rem=s%3600,m=Math.floor(rem/60),sec=rem%60;
+  if(h) return h+'h '+m+'m'; if(m) return m+'m '+sec+'s'; return sec+'s';
+}
+function _evLbl(c) {
+  var m={'STRUCTURE_BULLISH':'Bullish struct','STRUCTURE_BEARISH':'Bearish struct','STRUCTURE_INVALIDATED':'Struct invalid','ZONE_ACTIVE':'Active zone','ZONE_CONSUMED':'Zone consumed','ZONE_INACTIVE':'No zone','VWAP_ALIGNED':'VWAP aligned','VWAP_OPPOSING':'VWAP opposing','CVD_ALIGNED':'CVD confirms','CVD_OPPOSING':'CVD opposing','SWEEP_CONFIRMED':'Sweep confirmed','VOLUME_CONFIRMED':'Vol confirmed','PRIME_SESSION':'Prime session'};
+  return m[c]||(c||'').replace(/_/g,' ');
+}
+function _thCard(inst, t) {
+  if (!t) return '<div class="th-card" data-inst="'+inst+'"><div class="th-hdr"><span class="th-inst">'+inst+'</span></div><div class="th-neutral-txt">No thesis</div></div>';
+  var st=t.status||'NEUTRAL',col=_thColor(st),emoji=_thEmoji(st),dir=aiEsc(t.direction||'&mdash;'),conf=t.confidence||0;
+  var evF=(t.evidenceFor||[]).map(_evLbl).slice(0,5).join(', ');
+  var evA=(t.evidenceAgainst||[]).map(_evLbl).slice(0,3).join(', ');
+  var tid=(t.thesisId||'').slice(-6).toUpperCase()||'&mdash;&mdash;';
+  var age=_thMs(t.thesisAgeMs);
+  var rdyAge=t.readyAgeMs!=null?' &middot; READY: '+_thMs(t.readyAgeMs):'';
+  var stDisp=st.replace(/_/g,' ');
+  var expanded=!!_thExpanded[inst];
+  var histHtml='';
+  if (expanded) {
+    var hist=_thHistCache[inst];
+    if (!hist) {
+      histHtml='<div class="th-loading">Loading...</div>';
+      _fetchThHist(inst);
+    } else {
+      var rows=hist.length?hist.map(function(e){
+        var ts=e.ts?(e.ts+'').substring(11,16)+' UTC':'';
+        return '<div class="th-tl-ev"><span class="th-tl-time">'+ts+'</span>'
+          +'<span class="th-tl-trans">'+(e.prevStatus||'?')+' &rarr; <b>'+(e.newStatus||'?')+'</b></span>'
+          +(e.primaryReason?'<span class="th-tl-reason"> '+aiEsc(e.primaryReason)+'</span>':'')
+          +'</div>';
+      }).join(''):'<span style="color:#555;font-size:11px">No events yet</span>';
+      histHtml='<div class="th-timeline">'+rows+'</div>';
+    }
+  }
+  return '<div class="th-card" data-inst="'+inst+'" style="border-left-color:'+col+'">'
+    +'<div class="th-hdr"><span class="th-inst">'+inst+'</span>'
+    +'<span class="th-badge" style="background:'+col+'1a;color:'+col+'">'+emoji+' '+stDisp+'</span></div>'
+    +'<div class="th-dir">'+dir+'&nbsp;&nbsp;<span class="th-conf">'+conf+'%</span></div>'
+    +'<div class="th-bar-wrap"><div class="th-bar" style="width:'+Math.min(conf,100)+'%;background:'+col+'"></div></div>'
+    +(evF?'<div class="th-ev-row th-for"><span class="th-ev-lbl">For:</span> '+aiEsc(evF)+'</div>':'')
+    +(evA?'<div class="th-ev-row th-ag"><span class="th-ev-lbl">Against:</span> '+aiEsc(evA)+'</div>':'')
+    +'<div class="th-meta">Age: '+age+rdyAge+' <span class="th-tid">'+tid+'</span></div>'
+    +'<button class="th-hist-btn" onclick="toggleThHist(\''+inst+'\')">'+
+      (expanded?'&#x25B2; Hide':'&#x25BE; History')+
+    '</button>'
+    +(expanded?histHtml:'')
+    +'</div>';
+}
+function _fetchThHist(inst) {
+  fetch('/api/thesis/'+inst+'/history').then(function(r){return r.json();}).then(function(d){
+    if(d.ok){_thHistCache[inst]=d.events||[];renderThPanel(null);}
+  }).catch(function(){});
+}
+function toggleThHist(inst) {
+  if(_thExpanded[inst]){delete _thExpanded[inst];delete _thHistCache[inst];}
+  else{_thExpanded[inst]=true;}
+  renderThPanel(null);
+}
+function renderThPanel(data) {
+  if(data!==null)_thLastData=data;
+  var d=_thLastData;
+  var body=document.getElementById('thesis-cards');
+  var empty=document.getElementById('thesis-empty');
+  if(!body)return;
+  if(!d||!d.thesis){if(empty)empty.style.display='';return;}
+  var insts=d.instruments||Object.keys(d.thesis||{});
+  var hasAny=insts.some(function(i){return !!d.thesis[i];});
+  if(!hasAny){if(empty)empty.style.display='';body.innerHTML='';return;}
+  if(empty)empty.style.display='none';
+  body.innerHTML=insts.map(function(i){return _thCard(i,d.thesis[i]);}).join('');
+}
+function pollThesis() {
+  fetch('/api/thesis').then(function(r){return r.json();}).then(function(d){
+    if(d.ok)renderThPanel(d);
+  }).catch(function(){});
+}
+setInterval(pollThesis, 3000);
+setTimeout(pollThesis, 500);
 </script>
 </body>
 </html>"""
@@ -54567,6 +55119,8 @@ if __name__ == "__main__":
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
+        _check_hysteresis_thesis_db_ready()        # probe hysteresis_thesis (no DDL; created via DB tool/publish diff) — THESIS PHASE 2 persistence
+        _restore_thesis_states()                   # rehydrate thesis hysteresis state from DB (DISPLAY/INERTIA only; never submits a trade; stale rows skipped)
         _check_safety_overrides_db_ready()         # probe safety_overrides (no DDL; created via DB tool/publish diff) — runtime per-asset safety controls
         _load_safety_overrides_from_db()           # load operator safety overrides (FAIL-OPEN: a DB error keeps the tight protective defaults)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
