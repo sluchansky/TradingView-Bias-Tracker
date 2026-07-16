@@ -247,6 +247,26 @@ DEDUP_LOCK        = threading.Lock()
 # the gate/verdict. States: FORMING / READY / ACTIVE / INVALIDATED / EXPIRED.
 SETUP_STATE       = {}              # instrument ("MGC"/"MNQ") -> state dict
 STATE_LOCK        = threading.Lock()
+# ── Persistent thesis per instrument (hysteresis layer, Phase 1) ──────────────
+# Sits ABOVE evaluate_strict_setup(). The strict gate recalculates from scratch on
+# every alert; the thesis layer applies confidence inertia to stop READY↔WAIT
+# flip-flopping from a single bad tick.
+#
+# The ONLY money-path effect: a READY thesis whose confidence is still ≥
+# HOLD_READY_THRESHOLD may MAINTAIN a READY verdict when the raw gate would
+# momentarily return WAIT (hysteresis band). Hard invalidations (zone broken in
+# SWING, structural break) always snap confidence to 0 and override the hold.
+# A thesis NEVER promotes a raw WAIT to READY for the first time — the strict gate
+# must pass first.
+#
+# Flag: THESIS_HYSTERESIS=0  → disabled, raw verdict unchanged (byte-identical).
+# Default: ON.
+#
+# Statuses (DISPLAY):
+#   NEUTRAL / FORMING_LONG / FORMING_SHORT / READY_LONG / READY_SHORT /
+#   ACTIVE_LONG / ACTIVE_SHORT / INVALIDATED / COOLDOWN
+THESIS_BY_INST = {}            # inst -> thesis dict
+THESIS_LOCK    = threading.RLock()
 # Lightweight rolling-window timestamp logs (last hour) for diagnostics that the
 # capped EVAL_METRICS deque can't answer once the heartbeat floods it. Guarded by
 # COUNTERS_LOCK (appended in webhook(), read+trimmed in /eval-metrics).
@@ -3115,6 +3135,20 @@ def signal_dedup_cooldown_sec(instrument):
 # How long a non-ACTIVE setup (FORMING/READY) or an ACTIVE setup may persist before
 # the per-instrument lifecycle marks it EXPIRED (display-only; never gates).
 SETUP_STATE_TTL_SEC       = int(os.environ.get("SETUP_STATE_TTL_SEC", 1800))  # default 30 min
+# ── Thesis hysteresis thresholds (env-tunable) ────────────────────────────────
+# Promote to READY when confidence reaches READY_THRESHOLD and ALL required gates pass.
+# Maintain READY while confidence ≥ HOLD_READY_THRESHOLD (hysteresis band).
+# Require REVERSAL_THRESHOLD on the opposite side before flipping direction.
+# Confidence falls at most _THESIS_MAX_CONF_DROP points per evaluation (inertia);
+# rises immediately when evidence improves.
+_THESIS_ENABLED              = (os.environ.get("THESIS_HYSTERESIS", "1")
+                                 .strip().lower() not in ("0", "false", "no", "off"))
+_THESIS_READY_THRESHOLD      = int(os.environ.get("READY_THRESHOLD",      75))
+_THESIS_HOLD_THRESHOLD       = int(os.environ.get("HOLD_READY_THRESHOLD", 60))
+_THESIS_REVERSAL_THRESHOLD   = int(os.environ.get("REVERSAL_THRESHOLD",   85))
+_THESIS_MIN_AGE_MS           = int(os.environ.get("MIN_THESIS_AGE_MS",   5000))
+_THESIS_REVERSAL_COOLDOWN_MS = int(os.environ.get("REVERSAL_COOLDOWN_MS", 20000))
+_THESIS_MAX_CONF_DROP        = 15   # max confidence drop per evaluation (inertia)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 # ── Weekly performance report (additive) ──────────────────────────────────────
 # Posts a week-in-review embed once a week, just after the close. Default is
@@ -19841,6 +19875,14 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     else:
         display_price, price_source = display_price_for(active_ticker)
 
+    # ── Thesis hysteresis layer (additive; fail-open) ─────────────────────────
+    # Runs AFTER all vetoes (zone-broken, analyst, etc.) so the thesis sees the
+    # fully-adjudicated verdict. The ONLY money-path effect: a READY thesis held
+    # above HOLD_READY_THRESHOLD may maintain a READY verdict against transient
+    # WAIT noise from the raw gate. Hard invalidations always snap conf=0, so the
+    # hold never traps a genuinely broken setup.  Flag OFF → pass-through.
+    verdict, _thesis_snap = _apply_thesis(active_ticker, strict, verdict, trade_plan)
+
     result = dict(
         bullish=bullish, bearish=bearish, counts=counts,
         bias=bias, strength=strength, confidence=confidence,
@@ -19878,6 +19920,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # Edge Score and the Session block on /status, /why and the trade card. Reuses
     # the SAME instant threaded into the gate so the bonus stays consistent.
     result["session"] = session_state
+    # Thesis hysteresis snapshot — attached here so every downstream surface
+    # (status, diagnostics, journal, Discord card) reads the same snapshot.
+    # The thesis was already applied above to adjust `verdict`; this is display-only.
+    result["thesis"] = _thesis_snap
     # Per-gate WAIT debug (which READY gate failed) — surfaced on /status + logs.
     result["gate_debug"] = strict.get("gate_debug")
     # Candidate direction the gate evaluated (Long/Short/None) — for /diagnostics.
@@ -28025,6 +28071,23 @@ def create_journal_entry(record, a, sizing, post_discord=True):
 
         entry["id"]      = len(JOURNAL) + 1
         entry["outcome"] = "Pending"
+        # ── Thesis fields (Phase 1 — additive; fail-open) ─────────────────────
+        _th = a.get("thesis") or {}
+        entry["thesisId"]          = _th.get("thesisId")
+        entry["thesisCreatedAt"]   = _th.get("createdAt")
+        entry["confidenceAtEntry"] = _th.get("confidence")
+        entry["thesisAgeAtEntry"]  = _th.get("thesisAgeMs")
+        entry["supportingEvidence"]= _th.get("evidenceFor") or []
+        entry["opposingEvidence"]  = _th.get("evidenceAgainst") or []
+        entry["fastEntryUsed"]     = bool(a.get("fast_entry", {}) and
+                                          a.get("fast_entry", {}).get("trigger_fired"))
+        # confidenceAtReady and strongestConfidence are populated when the entry
+        # becomes READY (or on close) — stamped here as the entry-time values.
+        entry["confidenceAtReady"] = (_th.get("confidence")
+                                      if _th.get("status") in ("READY_LONG", "READY_SHORT")
+                                      else None)
+        entry["strongestConfidence"] = _th.get("confidence")   # updated on close
+        entry["invalidationReason"]  = _th.get("invalidationReason")
         # Chart screenshot: use a validated public URL when the alert carried one,
         # else keep the legacy placeholder string and continue (no failure).
         if entry.get("screenshot_url"):
@@ -28680,6 +28743,395 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
                         _bump_rr("conflicting_structure")
     except Exception as exc:
         logger.error("Counter update failed (eval still recorded): %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THESIS HYSTERESIS ENGINE  (Phase 1)
+# ══════════════════════════════════════════════════════════════════════════════
+# The thesis layer wraps evaluate_strict_setup(). The strict gate re-runs on
+# every alert; the thesis applies confidence inertia so a single bad alert can't
+# flip READY↔WAIT.
+#
+# CONFIDENCE BANDS (0-100):
+#   85-100  STRONG_READY  — very high conviction
+#   75-84   READY         — all gates pass, promote/maintain READY
+#   60-74   VALID         — gates mostly pass; READY is held above 60
+#   40-59   FORMING       — setup building, not yet actionable
+#    0-39   WEAK          — minimal evidence
+#
+# VERDICT ADJUSTMENT (the ONLY money-path effect):
+#   • Raw READY + conf ≥ 75   → thesis READY_LONG/SHORT (promote)
+#   • Thesis READY + conf ≥ 60 → stay READY even if raw gate returns WAIT (hold)
+#   • Thesis READY + conf < 60 → demote to FORMING, return raw WAIT
+#   • Hard invalidation (zone_broken/structural break) → snap conf=0, INVALIDATED
+#   • Opposite direction needs conf ≥ 85 to reverse; weaker signal just weakens
+#
+# FAIL-OPEN: _apply_thesis() catches all exceptions and returns the raw verdict.
+# FLAG-OFF:  THESIS_HYSTERESIS=0 → immediate (raw_verdict, {}) passthrough.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _thesis_new_id():
+    """Generate a short unique thesis ID (e.g. 'th_a3f9c12b')."""
+    return "th_" + uuid.uuid4().hex[:8]
+
+
+def _thesis_confidence_label(conf):
+    """Map 0-100 confidence to a display label used in Discord/dashboard."""
+    if conf >= 85: return "STRONG_READY"
+    if conf >= 75: return "READY"
+    if conf >= 60: return "VALID"
+    if conf >= 40: return "FORMING"
+    return "WEAK"
+
+
+def _thesis_blank(inst, direction, now_dt):
+    """Return an empty thesis dict for `inst` in `direction`."""
+    status = ("FORMING_LONG"  if direction == "Long"  else
+              "FORMING_SHORT" if direction == "Short" else "NEUTRAL")
+    return {
+        # Identity
+        "thesisId":            _thesis_new_id(),
+        "instrument":          inst,
+        "direction":           direction,
+        "status":              status,
+        # Timestamps
+        "createdAt":           now_dt.isoformat(),
+        "lastUpdatedAt":       now_dt.isoformat(),
+        "lastStrengthenedAt":  None,
+        "lastWeakenedAt":      None,
+        # Confidence
+        "confidence":          0,
+        "previousConfidence":  0,
+        "confidenceState":     "WEAK",
+        # Gate state (per-evaluation snapshot)
+        "structureDirection":  direction,
+        "vwapAligned":         False,
+        "cvdAligned":          False,
+        "cvdState":            "UNKNOWN",
+        "sweepConfirmed":      False,
+        "volumeConfirmed":     False,
+        "sessionPrime":        False,
+        # Plan snapshot
+        "entry":               None,
+        "stop":                None,
+        "targets":             [],
+        "invalidationReason":  None,
+        # Evidence
+        "evidenceFor":         [],
+        "evidenceAgainst":     [],
+        # Timing
+        "readyAt":             None,
+        "readyAgeMs":          None,
+        "thesisAgeMs":         0,
+        "cooldownUntil":       None,
+        "cooldownRemainingMs": None,
+        # Reason codes for dashboard / Discord
+        "reasonCodes":         [],
+    }
+
+
+def _apply_thesis(inst, strict, raw_verdict, trade_plan=None):
+    """Apply confidence hysteresis and return (adjusted_verdict, thesis_snapshot).
+
+    FAIL-OPEN: any exception falls back to (raw_verdict, {}) so the money path is
+    never blocked by a thesis bug.
+    FLAG-OFF:  THESIS_HYSTERESIS=0 → immediate (raw_verdict, {}) passthrough.
+    """
+    if not _THESIS_ENABLED or not inst:
+        return raw_verdict, {}
+    try:
+        return _apply_thesis_inner(inst, strict, raw_verdict, trade_plan)
+    except Exception as _te:
+        logger.warning("_apply_thesis fail-open [%s]: %s", inst, _te)
+        return raw_verdict, {}
+
+
+def _apply_thesis_inner(inst, strict, raw_verdict, trade_plan):
+    """Core thesis state-machine update. Called only by _apply_thesis()."""
+    now    = now_utc()
+    now_ms = now.timestamp() * 1000
+
+    # ── Extract gate evidence from evaluate_strict_setup output ──────────────
+    raw_score    = int(strict.get("score") or 0)
+    raw_dir      = strict.get("direction") or strict.get("candidate")
+    gd           = strict.get("gate_debug") or {}
+    zone_valid   = bool(gd.get("zone_valid"))
+    vwap_valid   = bool(gd.get("vwap_confirmed"))
+    struct_valid = bool(gd.get("structure_confirmed"))
+    sweep_conf   = bool(gd.get("sweep_confirmed"))
+    vol_conf     = bool(gd.get("volume_confirmed"))
+    session_ok   = bool(gd.get("session"))
+    is_raw_ready = is_actionable(raw_verdict)
+
+    # ── Hard invalidation (zone broken in SWING; structural break with no direction)
+    zone_req     = bool(cfg_for(TRADING_MODE, "GATE_REQUIRE_ZONE"))
+    zone_broken  = bool(zone_req and (
+        strict.get("zone_broken_active")
+        or ("zone_valid" in (strict.get("missing") or []))
+    ))
+    struct_lost  = bool(
+        not raw_dir
+        and ("structure_confirmed" in (strict.get("missing") or []))
+    )
+    hard_invalid = zone_broken or struct_lost
+
+    # ── CVD state (direction-relative) ───────────────────────────────────────
+    _cvd      = CVD_BY_TICKER.get(inst) or {}
+    _cvd_raw  = (_cvd.get("state") or "").lower()
+    _cvd_ts   = _cvd.get("ts")
+    if not _cvd_raw:
+        cvd_label = "UNKNOWN"
+    elif _cvd_ts:
+        try:
+            _age = (now - datetime.fromisoformat(_cvd_ts)).total_seconds()
+            cvd_label = "STALE" if _age > 600 else _cvd_raw.upper()
+        except (ValueError, TypeError):
+            cvd_label = _cvd_raw.upper()
+    else:
+        cvd_label = _cvd_raw.upper()
+
+    if raw_dir == "Long":
+        cvd_aligned = cvd_label in ("BULLISH", "NEUTRAL", "UNKNOWN", "STALE")
+    elif raw_dir == "Short":
+        cvd_aligned = cvd_label in ("BEARISH", "NEUTRAL", "UNKNOWN", "STALE")
+    else:
+        cvd_aligned = True
+
+    # ── Evidence lists ────────────────────────────────────────────────────────
+    ev_for, ev_against = [], []
+    if struct_valid:
+        ev_for.append("STRUCTURE_BULLISH" if raw_dir == "Long" else "STRUCTURE_BEARISH")
+    else:
+        ev_against.append("STRUCTURE_INVALIDATED")
+    if zone_valid:    ev_for.append("ZONE_ACTIVE")
+    elif zone_broken: ev_against.append("ZONE_CONSUMED")
+    else:             ev_against.append("ZONE_INACTIVE")
+    if vwap_valid:  ev_for.append("VWAP_ALIGNED")
+    else:           ev_against.append("VWAP_OPPOSING")
+    if cvd_label == "BULLISH" and raw_dir == "Long":    ev_for.append("CVD_ALIGNED")
+    elif cvd_label == "BEARISH" and raw_dir == "Short": ev_for.append("CVD_ALIGNED")
+    elif cvd_label in ("BULLISH", "BEARISH"):           ev_against.append("CVD_OPPOSING")
+    if sweep_conf:   ev_for.append("SWEEP_CONFIRMED")
+    if vol_conf:     ev_for.append("VOLUME_CONFIRMED")
+    if session_ok:   ev_for.append("PRIME_SESSION")
+
+    # All required gates (zone gate is mode-dependent)
+    all_gates = struct_valid and vwap_valid and (zone_valid if zone_req else True)
+
+    with THESIS_LOCK:
+        prev        = THESIS_BY_INST.get(inst)
+        prev_dir    = prev["direction"]  if prev else None
+        prev_status = prev["status"]     if prev else "NEUTRAL"
+        prev_conf   = prev["confidence"] if prev else 0
+
+        # ── Cooldown check ────────────────────────────────────────────────────
+        if prev and prev_status == "COOLDOWN":
+            cu = prev.get("cooldownUntil")
+            if cu:
+                try:
+                    cu_dt = datetime.fromisoformat(cu)
+                    if now < cu_dt:
+                        t = dict(prev)
+                        t["thesisAgeMs"] = max(0, int(now_ms - datetime.fromisoformat(
+                            t["createdAt"]).timestamp() * 1000))
+                        t["cooldownRemainingMs"] = max(0, int(
+                            (cu_dt.timestamp() - now.timestamp()) * 1000))
+                        THESIS_BY_INST[inst] = t
+                        return "WAIT", dict(t)
+                except (ValueError, TypeError):
+                    pass
+            # Cooldown expired → reset so a fresh thesis can form
+            prev = None
+            prev_dir = prev_status = None
+            prev_conf = 0
+
+        # ── Reversal protection ───────────────────────────────────────────────
+        # An opposite-direction signal below REVERSAL_THRESHOLD only weakens the
+        # existing thesis; it does NOT flip direction. The user sees confidence
+        # falling while the original direction holds until hard-invalidated.
+        is_reversal = (
+            prev and raw_dir and prev_dir
+            and raw_dir != prev_dir
+            and prev_status in ("FORMING_LONG", "FORMING_SHORT",
+                                "READY_LONG",   "READY_SHORT")
+        )
+        if is_reversal and raw_score < _THESIS_REVERSAL_THRESHOLD:
+            new_conf  = max(0, prev_conf - _THESIS_MAX_CONF_DROP)
+            codes     = ["REVERSAL_THRESHOLD_NOT_REACHED", "CONFIDENCE_DECREASED"]
+            t = dict(prev)
+            t["previousConfidence"] = prev_conf
+            t["confidence"]         = new_conf
+            t["confidenceState"]    = _thesis_confidence_label(new_conf)
+            t["lastUpdatedAt"]      = now.isoformat()
+            t["evidenceFor"]        = ev_for
+            t["evidenceAgainst"]    = ev_against
+            t["cvdState"]           = cvd_label
+            t["reasonCodes"]        = codes
+            if new_conf < prev_conf:
+                t["lastWeakenedAt"] = now.isoformat()
+            # Demote if fell below hold threshold
+            if new_conf < _THESIS_HOLD_THRESHOLD and t["status"] in ("READY_LONG", "READY_SHORT"):
+                t["status"] = "FORMING_LONG" if t["direction"] == "Long" else "FORMING_SHORT"
+            t["thesisAgeMs"] = max(0, int(now_ms - datetime.fromisoformat(
+                t["createdAt"]).timestamp() * 1000))
+            THESIS_BY_INST[inst] = t
+            # Verdict: maintain READY only if still in hold band
+            if t["status"] in ("READY_LONG", "READY_SHORT") and new_conf >= _THESIS_HOLD_THRESHOLD:
+                adj = "LONG READY" if t["direction"] == "Long" else "SHORT READY"
+            else:
+                adj = "WAIT"
+            return adj, dict(t)
+
+        # ── Decide whether to start a new thesis or update existing ──────────
+        # ── Genuine reversal above threshold → treat as a brand-new thesis ────
+        # The reversal-protection block above handled score < threshold (weaken +
+        # keep direction). When score >= REVERSAL_THRESHOLD the flip is confirmed;
+        # we reset `prev` so `needs_new` triggers a fresh blank thesis with a new
+        # thesisId — the old direction is gone.
+        if is_reversal and raw_score >= _THESIS_REVERSAL_THRESHOLD:
+            prev = None
+
+        needs_new = (
+            not prev
+            or prev_status in ("NEUTRAL", "INVALIDATED")
+        )
+        if needs_new:
+            if not raw_dir:
+                t = _thesis_blank(inst, None, now)
+                t["status"] = "NEUTRAL"
+                THESIS_BY_INST[inst] = t
+                return "WAIT", dict(t)
+            t          = _thesis_blank(inst, raw_dir, now)
+            base_conf  = raw_score   # fresh thesis starts at raw score (no inertia yet)
+        else:
+            t         = dict(prev)
+            base_conf = prev_conf
+
+        # ── Hard invalidation (always overrides the hold band) ────────────────
+        if hard_invalid:
+            inv_reason = ("Zone consumed"      if zone_broken else
+                          "Structure lost"     if struct_lost  else "Hard invalidation")
+            t["status"]             = "INVALIDATED"
+            t["confidence"]         = 0
+            t["previousConfidence"] = base_conf
+            t["confidenceState"]    = "INVALIDATED"
+            t["invalidationReason"] = inv_reason
+            t["lastUpdatedAt"]      = now.isoformat()
+            t["lastWeakenedAt"]     = now.isoformat()
+            t["evidenceFor"]        = ev_for
+            t["evidenceAgainst"]    = ev_against
+            t["cvdState"]           = cvd_label
+            t["reasonCodes"]        = [
+                "ZONE_CONSUMED" if zone_broken else "STRUCTURE_INVALIDATED"
+            ]
+            t["cooldownUntil"]      = (
+                now + timedelta(milliseconds=_THESIS_REVERSAL_COOLDOWN_MS)
+            ).isoformat()
+            t["thesisAgeMs"] = max(0, int(now_ms - datetime.fromisoformat(
+                t["createdAt"]).timestamp() * 1000))
+            THESIS_BY_INST[inst] = t
+            return "WAIT", dict(t)
+
+        # ── Confidence delta (inertia: fall capped; rise immediate) ──────────
+        codes = []
+        if raw_score >= base_conf:
+            new_conf = raw_score
+            codes.append("CONFIDENCE_INCREASED")
+        else:
+            new_conf = max(raw_score, base_conf - _THESIS_MAX_CONF_DROP)
+            codes.append("CONFIDENCE_DECREASED")
+
+        t["previousConfidence"] = base_conf
+        t["confidence"]         = new_conf
+        t["confidenceState"]    = _thesis_confidence_label(new_conf)
+        t["lastUpdatedAt"]      = now.isoformat()
+        if new_conf > base_conf:
+            t["lastStrengthenedAt"] = now.isoformat()
+            codes.append("CONFIDENCE_INCREASED")
+        elif new_conf < base_conf:
+            t["lastWeakenedAt"] = now.isoformat()
+
+        # ── Snapshot gate state ───────────────────────────────────────────────
+        t["vwapAligned"]        = vwap_valid
+        t["cvdAligned"]         = cvd_aligned
+        t["cvdState"]           = cvd_label
+        t["sweepConfirmed"]     = sweep_conf
+        t["volumeConfirmed"]    = vol_conf
+        t["sessionPrime"]       = session_ok
+        t["structureDirection"] = raw_dir or t.get("direction")
+        t["direction"]          = raw_dir or t.get("direction")
+        t["evidenceFor"]        = ev_for
+        t["evidenceAgainst"]    = ev_against
+
+        # Trade plan snapshot (for journal / dashboard)
+        if trade_plan and trade_plan.get("trade_plan"):
+            t["entry"]   = trade_plan.get("entry_zone")
+            t["stop"]    = trade_plan.get("stop_loss")
+            t["targets"] = [trade_plan.get("target1"), trade_plan.get("target2")]
+
+        # ── Status machine ────────────────────────────────────────────────────
+        prev_was_ready = prev_status in ("READY_LONG", "READY_SHORT")
+
+        if is_raw_ready and all_gates and new_conf >= _THESIS_READY_THRESHOLD:
+            # Promote (or re-confirm) READY
+            new_status = "READY_LONG" if t["direction"] == "Long" else "READY_SHORT"
+            if not prev_was_ready:
+                t["readyAt"] = now.isoformat()
+                codes.append("READY_THRESHOLD_REACHED")
+            else:
+                codes.append("HOLD_THRESHOLD_MAINTAINED")
+        elif prev_was_ready and new_conf >= _THESIS_HOLD_THRESHOLD:
+            # Hysteresis hold — stay READY despite raw WAIT
+            new_status = prev_status
+            codes.append("HOLD_THRESHOLD_MAINTAINED")
+        elif t.get("direction"):
+            new_status = "FORMING_LONG" if t["direction"] == "Long" else "FORMING_SHORT"
+        else:
+            new_status = "NEUTRAL"
+
+        t["status"]      = new_status
+        t["reasonCodes"] = codes
+
+        # Ready age
+        if new_status in ("READY_LONG", "READY_SHORT") and t.get("readyAt"):
+            try:
+                t["readyAgeMs"] = max(0, int(
+                    (now - datetime.fromisoformat(t["readyAt"])).total_seconds() * 1000
+                ))
+            except (ValueError, TypeError):
+                t["readyAgeMs"] = 0
+
+        # Thesis age
+        try:
+            t["thesisAgeMs"] = max(0, int(
+                (now - datetime.fromisoformat(t["createdAt"])).total_seconds() * 1000
+            ))
+        except (ValueError, TypeError):
+            t["thesisAgeMs"] = 0
+
+        THESIS_BY_INST[inst] = t
+
+        # ── Adjusted verdict ──────────────────────────────────────────────────
+        if new_status in ("READY_LONG", "READY_SHORT"):
+            adj = "LONG READY" if t["direction"] == "Long" else "SHORT READY"
+        else:
+            adj = raw_verdict   # WAIT / SETUP BUILDING pass through unchanged
+
+        return adj, dict(t)
+
+
+def get_thesis_snapshot(inst):
+    """Return a copy of the current thesis for `inst` (None if not present)."""
+    if not inst:
+        return None
+    with THESIS_LOCK:
+        t = THESIS_BY_INST.get(inst)
+        return dict(t) if t else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END THESIS HYSTERESIS ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False):
@@ -35817,6 +36269,11 @@ def _build_status_payload(_tk):
            if ACTIVE_THINKING_ENABLED else {}),
         # ── BrainState: unified per-instrument snapshot — DISPLAY-ONLY ──
         "brain_state": a.get("brain_state"),
+        # ── Persistent thesis + hysteresis (Phase 1) — DISPLAY-ONLY ──────────
+        # The thesis was already applied to the verdict above; this exposes the
+        # full snapshot (confidence, status, age, evidence, reason codes) for the
+        # dashboard briefing area and Discord cards.
+        "thesis": a.get("thesis"),
     }
 
 
