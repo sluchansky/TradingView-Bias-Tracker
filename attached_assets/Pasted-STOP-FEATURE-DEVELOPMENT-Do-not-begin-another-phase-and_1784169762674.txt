@@ -1,0 +1,266 @@
+STOP FEATURE DEVELOPMENT.
+
+Do not begin another phase and do not add any new indicators, strategies, dashboard modules, scoring rules, AI features, or entry logic.
+
+Prepare the current completed Phase 1–3 build for deployment and controlled testing.
+
+TASKS
+
+1. FINAL CODE REVIEW
+
+Review all Phase 1–3 changes for:
+
+- Broken imports
+- Missing environment variables
+- Development-only paths
+- Hardcoded localhost URLs
+- Incompatible database schemas
+- Duplicate event listeners
+- Duplicate Discord alerts
+- Duplicate trade submissions
+- Unhandled API errors
+- Restart recovery problems
+- Race conditions between alerts
+- Mobile dashboard rendering errors
+
+Do not refactor unrelated working code.
+
+2. RUN ALL TESTS
+
+Run:
+
+- Phase 1 thesis hysteresis tests
+- Phase 2 dashboard and persistence tests
+- Phase 3 thesis enforcement tests
+- Existing golden smoke tests
+- Existing webhook tests
+- Existing TradersPost tests
+- Existing journal tests
+- Frontend build
+- Backend startup test
+- Dashboard JavaScript validation
+
+Report every passing and failing test.
+
+Do not claim deployment readiness if any money-path test fails.
+
+3. DEPLOY IN SHADOW MODE
+
+Deploy with thesis enforcement remaining in SHADOW MODE.
+
+Required behavior:
+
+- Existing READY verdict behavior remains unchanged.
+- Thesis gate evaluates every READY setup.
+- Shadow gate records WOULD_ALLOW or WOULD_BLOCK.
+- Shadow gate never changes a live verdict.
+- Shadow gate never changes an order.
+- Shadow gate never changes entry, stop, target, contracts, or risk.
+- Existing TradersPost behavior remains unchanged.
+- No automatically restored thesis may submit a trade after restart.
+
+4. CONFIRM ENVIRONMENT SETTINGS
+
+Verify the production environment has the correct values for:
+
+THESIS_HYSTERESIS=1
+THESIS_DASHBOARD_ENABLED=1
+THESIS_DISCORD_ALERTS_ENABLED=1
+THESIS_DB_PERSISTENCE_ENABLED=1
+THESIS_ENFORCEMENT_MODE=shadow
+
+Also verify all existing:
+
+- Database variables
+- Discord variables
+- TradingView webhook secrets
+- TradersPost webhook variables
+- Dashboard API URLs
+- Production domain configuration
+
+Do not expose secrets in the report.
+
+5. DATABASE MIGRATION
+
+Apply the Phase 2 and Phase 3 database migrations safely.
+
+Before applying:
+
+- Back up the current database.
+- Confirm migrations are additive.
+- Do not delete existing journal or trade history.
+- Do not overwrite the older thesis data.
+- Confirm rollback steps.
+
+After applying:
+
+- Verify thesis snapshots can be written.
+- Verify transition history can be written.
+- Verify shadow evaluations can be written.
+- Verify outcome records can be connected to evaluations.
+
+6. PRODUCTION HEALTH CHECK
+
+After deployment, verify:
+
+- Application starts without errors.
+- Dashboard loads.
+- /status responds.
+- /api/thesis responds if implemented.
+- /thesis/stats responds.
+- /thesis/stale responds.
+- Database connection works.
+- Discord connection works.
+- TradingView webhook accepts a test alert.
+- Test alert reaches the correct instrument.
+- Thesis state updates once.
+- No duplicate transitions are created.
+- No duplicate Discord messages are created.
+- No test order is sent to TradersPost.
+
+Use a clearly marked non-trading test payload for health checks.
+
+7. LIVE TESTING MODE
+
+For the initial test period:
+
+- Keep thesis enforcement in shadow mode.
+- Keep auto-trading in its current state; do not enable it automatically.
+- Do not increase contract size.
+- Do not change risk settings.
+- Do not loosen READY thresholds.
+- Do not change confidence thresholds.
+- Do not modify the scoring model during the collection period.
+
+Collect every valid setup whether the shadow gate agrees or conflicts.
+
+8. DATA TO RECORD FOR EACH READY SETUP
+
+Record:
+
+- Timestamp
+- Instrument
+- Mode
+- Direction
+- Original verdict
+- Edge score
+- Thesis ID
+- Thesis direction
+- Thesis status
+- Thesis confidence
+- Alignment classification
+- Shadow decision: WOULD_ALLOW or WOULD_BLOCK
+- Confidence adjustment
+- Evidence For
+- Evidence Against
+- Entry
+- Stop
+- Targets
+- Whether entry triggered
+- Maximum favorable excursion
+- Maximum adverse excursion
+- Target reached first
+- Stop reached first
+- Final R result
+- Outcome
+- Whether the shadow gate avoided a loss
+- Whether the shadow gate falsely blocked a winner
+
+Do not count an untriggered setup as a win or loss.
+
+9. TESTING SAMPLE
+
+Do not make enforcement decisions from only a few trades.
+
+Initial checkpoint:
+
+- Minimum 25 completed, triggered setups
+
+Useful checkpoint:
+
+- Minimum 50 completed, triggered setups
+
+Stronger checkpoint:
+
+- 100 completed, triggered setups across normal market conditions
+
+Show results separately by:
+
+- Instrument
+- SCALP versus SWING
+- Long versus short
+- Trading session
+- ALIGNED
+- PARTIALLY_ALIGNED
+- NEUTRAL
+- CONFLICTING
+- INVALIDATED
+- NO_THESIS
+
+Do not combine every instrument and mode into one misleading statistic.
+
+10. DAILY TEST REPORT
+
+Create a compact report that shows:
+
+- READY setups
+- Triggered setups
+- Completed outcomes
+- WOULD_ALLOW count
+- WOULD_BLOCK count
+- Wins allowed
+- Losses allowed
+- Winners falsely blocked
+- Losses avoided
+- Actual net R
+- Shadow-filtered theoretical net R
+- Difference in net R
+- False-block rate
+- Loss-avoidance rate
+- Missing outcome count
+- Stale thesis count
+- Duplicate event count
+- Errors
+
+Make this visible in the existing Shadow Validation panel or through the existing stats route.
+
+11. DO NOT ENABLE ENFORCEMENT AUTOMATICALLY
+
+Even if the first several results look positive, do not switch from shadow to enforced.
+
+The mode must remain:
+
+THESIS_ENFORCEMENT_MODE=shadow
+
+Changing it to enforced requires a separate manual decision after reviewing the collected sample.
+
+12. FINAL DEPLOYMENT REPORT
+
+After deployment, provide:
+
+- Git commit hash
+- Branch pushed
+- Deployment URL
+- Database migration status
+- Environment variable checklist without secret values
+- Full test results
+- Production health-check results
+- Current enforcement mode
+- Confirmation that live verdict behavior is unchanged
+- Confirmation that no test order was submitted
+- Any warnings or unresolved issues
+
+DEFINITION OF DONE
+
+The push-and-test task is complete only when:
+
+1. The current code is committed and pushed.
+2. Production deployment succeeds.
+3. All money-path tests pass.
+4. Dashboard and APIs load correctly.
+5. Test webhooks update the correct thesis exactly once.
+6. Database records Phase 1–3 data correctly.
+7. Thesis enforcement remains in shadow mode.
+8. Existing live behavior remains unchanged.
+9. No additional features were added.
+10. A clear testing report is available.
