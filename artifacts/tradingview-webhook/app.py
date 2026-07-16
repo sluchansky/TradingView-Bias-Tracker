@@ -44268,30 +44268,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div class="le-fid" id="cg-fid"></div>
 </div>
 
-<!-- Professional Memory — similar-trades lookup over recent closed trades (DISPLAY-ONLY) -->
-<div class="mod mb-hidden" id="mod-memory">
-  <div class="mod-h">🧩 Trade Memory <span id="tm-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-advanced">ADVANCED</span></div>
-  <div class="le-top">
-    <div class="gstat"><div class="l">Similar Trades</div><div class="v" id="tm-n">—</div></div>
-    <div class="gstat"><div class="l">Win Rate</div><div class="v" id="tm-wr">—</div></div>
-    <div class="gstat"><div class="l">Avg R</div><div class="v" id="tm-avgr">—</div></div>
-    <div class="gstat"><div class="l">Avg Hold</div><div class="v" id="tm-hold">—</div></div>
-  </div>
-  <div class="le-grid">
-    <div>
-      <div class="le-sub">Excursions (Avg)</div>
-      <div class="le-list" id="tm-exc"></div>
-    </div>
-    <div>
-      <div class="le-sub">Most Common Failure</div>
-      <div class="le-list" id="tm-fail"></div>
-    </div>
-  </div>
-  <div class="le-sub">Memory Read</div>
-  <div class="le-rank" id="tm-rec"></div>
-  <div class="le-fid" id="tm-fid"></div>
-</div>
-
 <!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
 <div class="mod" id="mod-equity" data-cat="detail">
   <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcome simulated from a price proxy — not your real broker fills, and shown NET of estimated commission &amp; slippage. See Real Account Results above for actual P&amp;L." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED · NET</span><span class="mod-cat cat-detail">DETAIL</span></div>
@@ -45905,9 +45881,6 @@ function renderModules(d){
 
   // ── Module 8c: Confidence Governor (transparent Edge→confidence) — display-only ──
   renderConfidenceGovernor(d);
-
-  // ── Module 8d: Trade Memory (similar-trades lookup) — display-only ──
-  renderTradeMemory(d);
 
   // ── Module 9: Equity curve (today) — display-only, real closed trades ──
   renderEquityCurve(d);
@@ -49217,47 +49190,6 @@ function renderConfidenceGovernor(d){
   }
 }
 
-// Trade Memory panel — fed by d.trade_memory (in-memory similar-trades lookup over recent
-// closed trades). DISPLAY-ONLY. Awaiting / no-match states are explicit.
-function renderTradeMemory(d){
-  const m = (d && d.trade_memory) || null;
-  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
-  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
-  const metaEl = document.getElementById('tm-meta');
-  if (!m || !m.ready){
-    if (metaEl) metaEl.textContent = (m && m.reason && m.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· NO MATCHES';
-    setT('tm-n', (m && m.similar_trades_found!=null) ? m.similar_trades_found : '0');
-    setT('tm-wr','—'); setT('tm-avgr','—'); setT('tm-hold','—');
-    setH('tm-exc',''); setH('tm-fail','');
-    setH('tm-rec','<div class="le-empty">'+_modEsc((m && (m.memory_recommendation||m.reason)) || 'Awaiting comparable history.')+'</div>');
-    const f0=document.getElementById('tm-fid'); if(f0) f0.textContent='Similar = same instrument + direction + ≥1 matching context. Display-only.';
-    return;
-  }
-  if (metaEl) metaEl.textContent = '· '+(m.trade_count||0)+' IN MEMORY';
-  setT('tm-n', m.similar_trades_found);
-  const wr = (m.similar_win_rate!=null) ? Math.round(m.similar_win_rate*100) : null;
-  setT('tm-wr', wr!=null ? wr+'%' : '—');
-  const we=document.getElementById('tm-wr'); if(we && wr!=null) we.style.color=_leColor(wr);
-  setT('tm-avgr', m.average_r!=null ? (m.average_r>=0?'+':'')+m.average_r+'R' : '—');
-  setT('tm-hold', m.average_hold_time!=null ? m.average_hold_time+'m' : '—');
-  let eH='';
-  if (m.average_mfe!=null) eH += '<div class="le-li"><span>Avg MFE</span><span style="color:#22c55e">'+(m.average_mfe>=0?'+':'')+m.average_mfe+'R</span></div>';
-  if (m.average_mae!=null) eH += '<div class="le-li"><span>Avg MAE</span><span style="color:#ef4444">'+m.average_mae+'R</span></div>';
-  setH('tm-exc', eH || '<div class="le-empty">—</div>');
-  setH('tm-fail', m.most_common_failure
-    ? '<div class="le-li"><span>'+_modEsc(m.most_common_failure)+'</span></div>'
-    : '<div class="le-empty">—</div>');
-  setH('tm-rec', m.memory_recommendation
-    ? '<div class="le-row"><div class="nm">• '+_modEsc(m.memory_recommendation)+'</div></div>'
-    : '<div class="le-empty">—</div>');
-  const f=document.getElementById('tm-fid');
-  if (f){
-    let when='';
-    try { if(m.last_refreshed_at) when=new Date(m.last_refreshed_at).toLocaleString(); } catch(e){}
-    f.textContent='Similar = same instrument + direction + ≥1 matching context. Display-only'+(when?' · refreshed '+when:'')+'.';
-  }
-}
-
 // Shared cumulative-R line/area chart for an inline SVG: a 0R baseline, a colored
 // area + line of running cumulative R, and a win/loss dot per trade. Hides the SVG
 // on an empty series. Used by BOTH the standalone equity-curve panel and the
@@ -50113,7 +50045,6 @@ var _liveNavSections = {
     'mod-thesis',         // Market Thesis / lessons learned
     'mod-review',         // Trade Idea Review
     'mod-rule-engine',    // Learning Rule Engine
-    'mod-memory',         // Trade Memory
     'mod-mb-thesis'       // Thesis Tracker
   ],
   // Toggles & execution: primary controls overview + detail panels (Advanced ON)
@@ -50393,6 +50324,8 @@ function renderAiDecisionCenter(d) {
       if (twr!=null) h6+='<div class="adc-ri"><span class="k">Win Rate</span><span class="v" style="color:'+twrc+'">'+twr+'%</span></div>';
       if (tm.average_r!=null) h6+='<div class="adc-ri"><span class="k">Avg R</span><span class="v">'+(tm.average_r>=0?'+':'')+tm.average_r+'R</span></div>';
       if (tm.average_hold_time!=null) h6+='<div class="adc-ri"><span class="k">Avg Hold</span><span class="v">'+tm.average_hold_time+'m</span></div>';
+      if (tm.average_mfe!=null) h6+='<div class="adc-ri"><span class="k">Avg MFE</span><span class="v" style="color:#22c55e">'+(tm.average_mfe>=0?'+':'')+tm.average_mfe+'R</span></div>';
+      if (tm.average_mae!=null) h6+='<div class="adc-ri"><span class="k">Avg MAE</span><span class="v" style="color:#ef4444">'+tm.average_mae+'R</span></div>';
       if (tm.memory_recommendation) h6+='<div class="adc-reason">'+_adcEsc(tm.memory_recommendation)+'</div>';
       if (tm.most_common_failure) h6+='<div class="adc-ri"><span class="k">Common Failure</span><span class="v">'+_adcEsc(tm.most_common_failure)+'</span></div>';
     } else {
