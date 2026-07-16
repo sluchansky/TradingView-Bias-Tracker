@@ -42042,7 +42042,10 @@ def dashboard():
   .cp-btn.active{background:#2563eb;border-color:#2563eb;color:#fff}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(#mod-thesis):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]):not([data-unified="1"]) #view-live .mod:not(#mod-real-results):not(#mod-brain):not(#mod-microscalp):not(#mod-news):not(#mod-prop):not(#mod-autoexit):not(#mod-chartprev):not(#mod-thesis):not(.mb-hidden){display:none !important}
+  /* When section-nav is active (data-unified="1"), only primary group panels + core overview
+     panels are visible by default; individual detail panels appear only with Advanced ON. */
+  html[data-unified="1"]:not([data-adv="1"]) #view-live .mod:not(#mod-brain):not(#mod-data-feed):not(#mod-real-results):not(#mod-hvsessions):not(#mod-ai-decision-center):not(#mod-analysis-groups):not(#mod-journal-groups):not(#mod-controls-groups):not(.mb-hidden){display:none !important}
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
   #adv-toggle:hover{color:var(--text);border-color:var(--border-lit)}
@@ -42729,6 +42732,50 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 .adc-chip.warn{background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.3);color:#fde68a}
 .adc-bw{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-top:3px}
 .adc-bf{height:100%;border-radius:3px;transition:width .3s}
+/* ── Phase 3: Analysis / Journal / Controls group panels ── */
+.grp-details{margin-bottom:2px}
+.grp-summary{list-style:none;display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;user-select:none;border-radius:8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05);font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#9aa3b2;transition:background .15s}
+.grp-summary::-webkit-details-marker{display:none}
+.grp-summary:hover{background:rgba(255,255,255,.06);color:#e8e8f0}
+.grp-title{flex:1}
+.grp-arrow{font-size:8px;transition:transform .2s}
+details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
+.grp-badge{display:inline-flex;align-items:center;padding:1px 7px;border-radius:8px;font-size:9px;font-weight:700}
+.grp-badge.ok{background:rgba(34,197,94,.12);color:#86efac}
+.grp-badge.warn{background:rgba(245,158,11,.12);color:#fde68a}
+.grp-badge.bad{background:rgba(239,68,68,.12);color:#fca5a5}
+.grp-badge.neu{background:rgba(255,255,255,.06);color:#9aa3b2}
+.grp-body{padding:8px 2px 4px}
+.grp-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11px}
+.grp-row:last-child{border-bottom:none}
+.grp-k{color:#9aa3b2;font-size:10px;letter-spacing:.6px;min-width:90px}
+.grp-v{color:#e8e8f0;font-weight:600;text-align:right;max-width:58%;word-break:break-word}
+.grp-chips{display:flex;flex-wrap:wrap;gap:3px;padding:5px 0}
+.grp-chip{display:inline-flex;align-items:center;gap:2px;padding:2px 7px;border-radius:9px;font-size:10px;font-weight:700;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.09);color:#9aa3b2}
+.grp-chip.ok{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);color:#86efac}
+.grp-chip.bad{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:#fca5a5}
+.grp-chip.warn{background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.3);color:#fde68a}
+.grp-note{font-size:10px;color:#6b7280;font-style:italic;padding:4px 0;line-height:1.5}
+/* ── Mobile: 430px and below (iPhone Pro / Pro Max width) ── */
+@media(max-width:430px){
+  body{overflow-x:hidden!important}
+  #view-live{padding:0 8px;padding-bottom:max(20px,env(safe-area-inset-bottom,20px))}
+  #live-nav{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding:6px 0 4px;gap:4px}
+  #live-nav::-webkit-scrollbar{display:none}
+  .ln-btn{flex:0 0 auto;padding:5px 10px;font-size:9px;letter-spacing:.4px}
+  #live-layout{display:block!important}
+  #bl-left,#bl-right{display:none!important}
+  #bl-center{width:100%!important;min-width:0!important}
+  #bl-bottom,#bl-drawer-row{display:none!important}
+  .mod{padding:12px 10px;margin-bottom:8px}
+  .mod-h{font-size:11px}
+  #adc-tabs{gap:2px;padding:4px 0 6px}
+  .adc-tab{padding:3px 8px;font-size:8px;letter-spacing:.3px}
+  .adc-grid{grid-template-columns:1fr!important}
+  .adc-verdict-big{font-size:18px}
+  .grp-summary{padding:7px 8px}
+  .grp-row{font-size:10px}
+}
 /* ── High-Volume Sessions panel ── */
 #mod-hvsessions .hvs-win{border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:7px;background:var(--panel)}
 #mod-hvsessions .hvs-win.hvs-active{border-color:var(--green,#34e3a4);background:rgba(52,227,164,.07)}
@@ -43547,6 +43594,89 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
   <div id="adc-panel-confidence" class="adc-panel"><div id="adc-cg-content"></div></div>
   <div id="adc-panel-memory" class="adc-panel"><div id="adc-tm-content"></div></div>
   <div id="adc-panel-microscalp" class="adc-panel"><div id="adc-ms-content"></div></div>
+</div>
+
+<!-- ── Phase 3: Analysis Groups — primary Analysis section view (DISPLAY-ONLY).
+     5 collapsible evidence sections rendered from the same /status poll.
+     Individual analysis panels remain in this section, visible when Advanced is ON. -->
+<div class="mod" id="mod-analysis-groups">
+  <div class="mod-h">Market Analysis</div>
+  <details class="grp-details" id="ag-struct-det" open>
+    <summary class="grp-summary"><span class="grp-title">Structure &amp; Trend</span><span class="grp-badge neu" id="ag-struct-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="ag-struct-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="ag-liq-det">
+    <summary class="grp-summary"><span class="grp-title">Liquidity &amp; Volume</span><span class="grp-badge neu" id="ag-liq-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="ag-liq-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="ag-vwap-det">
+    <summary class="grp-summary"><span class="grp-title">VWAP &amp; Key Levels</span><span class="grp-badge neu" id="ag-vwap-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="ag-vwap-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="ag-vol-det">
+    <summary class="grp-summary"><span class="grp-title">Volatility &amp; Risk</span><span class="grp-badge neu" id="ag-vol-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="ag-vol-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="ag-diag-det">
+    <summary class="grp-summary"><span class="grp-title">Strategy Diagnostics</span><span class="grp-badge neu" id="ag-diag-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="ag-diag-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+</div>
+
+<!-- ── Phase 3: Journal Groups — primary Journal section view (DISPLAY-ONLY). -->
+<div class="mod" id="mod-journal-groups">
+  <div class="mod-h">Journal</div>
+  <details class="grp-details" id="jg-today-det" open>
+    <summary class="grp-summary"><span class="grp-title">Today</span><span class="grp-badge neu" id="jg-today-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="jg-today-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="jg-hist-det">
+    <summary class="grp-summary"><span class="grp-title">Trade History</span><span class="grp-badge neu" id="jg-hist-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="jg-hist-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="jg-perf-det">
+    <summary class="grp-summary"><span class="grp-title">Performance</span><span class="grp-badge neu" id="jg-perf-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="jg-perf-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="jg-learn-det">
+    <summary class="grp-summary"><span class="grp-title">Learning</span><span class="grp-badge neu" id="jg-learn-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="jg-learn-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="jg-sim-det">
+    <summary class="grp-summary"><span class="grp-title">Simulated &amp; Ghost</span><span class="grp-badge neu" id="jg-sim-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="jg-sim-body"><div class="grp-note">No simulation activity.</div></div>
+  </details>
+</div>
+
+<!-- ── Phase 3: Controls Groups — primary Controls section status view (DISPLAY-ONLY).
+     Shows current state of each control group. Full controls are in the individual
+     detail panels below (visible when Advanced panels are enabled). -->
+<div class="mod" id="mod-controls-groups">
+  <div class="mod-h">Controls Overview</div>
+  <details class="grp-details" id="cg-markets-det" open>
+    <summary class="grp-summary"><span class="grp-title">Markets</span><span class="grp-badge neu" id="cg-markets-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="cg-markets-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="cg-alerts-det">
+    <summary class="grp-summary"><span class="grp-title">Alerts</span><span class="grp-badge neu" id="cg-alerts-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="cg-alerts-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="cg-auto-det">
+    <summary class="grp-summary"><span class="grp-title">Trading Automation</span><span class="grp-badge neu" id="cg-auto-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="cg-auto-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="cg-brain-det">
+    <summary class="grp-summary"><span class="grp-title">Brain Modes</span><span class="grp-badge neu" id="cg-brain-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="cg-brain-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="cg-display-det">
+    <summary class="grp-summary"><span class="grp-title">Display</span><span class="grp-badge neu" id="cg-display-badge">Settings</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="cg-display-body"><div class="grp-note">Theme, advanced panels, and layout controls are in the toolbar above the section navigation.</div></div>
+  </details>
+  <details class="grp-details" id="cg-integ-det">
+    <summary class="grp-summary"><span class="grp-title">Integrations</span><span class="grp-badge neu" id="cg-integ-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="cg-integ-body"><div class="grp-note">Awaiting data&#8230;</div></div>
+  </details>
 </div>
 
 <!-- Diagnostics modules (feed off alert_diagnostics) -->
@@ -45654,6 +45784,9 @@ function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
   try{ renderAiDecisionCenter(d); }catch(e){}
+  try{ renderAnalysisGroups(d); }catch(e){}
+  try{ renderJournalGroups(d); }catch(e){}
+  try{ renderControlsGroups(d); }catch(e){}
   try{ renderBLPanels(d); }catch(e){}
   window._mscPageData = d;
   var _mscMainInst = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '';
@@ -50400,9 +50533,9 @@ var _liveNavSections = {
   brain: [
     'mod-ai-decision-center' // All brain engine outputs in one panel
   ],
-  // Market analysis: structure, volume, volatility, diagnostics, simulations
-  // Also includes the detailed brain engine layers for deep-dive access
+  // Market analysis: primary group view + detail panels (visible with Advanced ON)
   analysis: [
+    'mod-analysis-groups',// Primary: 5-section grouped evidence view
     'mod-chartprev',      // Live Chart Preview
     'mod-cvd',            // Volume Delta (CVD) & RVOL
     'mod-mi',             // Market Intelligence (structure / supply-demand)
@@ -50435,8 +50568,9 @@ var _liveNavSections = {
     'mod-mb-narrative',   // Session Story
     'mod-mb-daytype'      // Day Type
   ],
-  // Performance & history: trades, P&L, learning, memory, thesis, events
+  // Performance & history: primary journal groups + individual panels (Advanced ON)
   journal: [
+    'mod-journal-groups', // Primary: grouped journal sections
     'mod-equity',         // Equity Curve · Today
     'mod-trades',         // Today's Trades log
     'mod-news',           // News Filter
@@ -50451,8 +50585,9 @@ var _liveNavSections = {
     'mod-mb-thesis',      // Thesis Tracker
     'mod-mb-learning'     // Learning Stats
   ],
-  // Toggles & execution: broker, auto-trade, training, safety, utilities
+  // Toggles & execution: primary controls overview + detail panels (Advanced ON)
   controls: [
+    'mod-controls-groups',// Primary: grouped controls status view
     'mod-prop',           // Prop Firm Protection
     'mod-training',       // Bot Training Mode
     'mod-bothold',        // Bot Hold Score
@@ -50751,8 +50886,185 @@ function renderAiDecisionCenter(d) {
     msEl.innerHTML=h7;
   }
 }
+// ── Phase 3: Analysis / Journal / Controls Group Panel render helpers ─────────
+// Shared: reuse _adcEsc (already defined above) for HTML escaping.
+function _grpRow(k,v,col){ return '<div class="grp-row"><span class="grp-k">'+_adcEsc(k)+'</span><span class="grp-v"'+(col?' style="color:'+col+'"':'')+'>'+(v==null?'&#8212;':_adcEsc(String(v)))+'</span></div>'; }
+function _grpChip(label, ok){ return '<span class="grp-chip '+(ok?'ok':'bad')+'">'+(ok?'&#10003;':'&#10007;')+' '+_adcEsc(label)+'</span>'; }
+function _grpBadge(id, text, cls){ var el=document.getElementById(id); if(!el) return; el.textContent=text; el.className='grp-badge '+cls; }
+function _biasCol(s){ s=String(s||'').toLowerCase(); return s.indexOf('bull')>=0?'#22c55e':s.indexOf('bear')>=0?'#ef4444':null; }
+
+// renderAnalysisGroups: fills the 5 collapsible evidence sections in mod-analysis-groups.
+// DISPLAY-ONLY — reads the same /status poll d. Never touches money path or gate.
+function renderAnalysisGroups(d) {
+  if (!document.getElementById('mod-analysis-groups')) return;
+  var ea=(d&&d.alert_diagnostics)||{};
+  var gd=(d&&d.gate_debug)||{};
+  var sc=(d&&d.swing_context)||{};
+  var se=(d&&d.strategy_engine)||{};
+  var dom=(ea.dominant_direction)||(d&&d.direction)||'Long';
+  var dg=(d&&d.directions&&dom!=='Neutral'&&d.directions[dom]&&d.directions[dom].gate_debug)?d.directions[dom].gate_debug:gd;
+  // Structure & Trend
+  var h1='',dir=(d&&d.bias)||(d&&d.direction)||'';
+  if(dir) h1+=_grpRow('Direction',dir,_biasCol(dir));
+  if(sc.htf_bias_1h)    h1+=_grpRow('1H Bias',   sc.htf_bias_1h,   _biasCol(sc.htf_bias_1h));
+  if(sc.htf_bias_4h)    h1+=_grpRow('4H Bias',   sc.htf_bias_4h,   _biasCol(sc.htf_bias_4h));
+  if(sc.htf_bias_daily) h1+=_grpRow('Daily Bias',sc.htf_bias_daily,_biasCol(sc.htf_bias_daily));
+  var strOk=!!(dg.structure_confirmed||gd.structure_confirmed),locOk=!!(dg.location_ok||gd.location_ok);
+  h1+='<div class="grp-chips">'+_grpChip('Structure',strOk)+_grpChip('Location',locOk)+'</div>';
+  if(d&&d.strict_reason) h1+='<div class="grp-note">'+_adcEsc(d.strict_reason)+'</div>';
+  _grpBadge('ag-struct-badge',strOk?'Confirmed':(dir?'Watching':'—'),strOk?'ok':(dir?'warn':'neu'));
+  document.getElementById('ag-struct-body').innerHTML=h1;
+  // Liquidity & Volume
+  var h2='',cvdDir=ea.cvd_direction||ea.cvd_dir||'',rvol=ea.rvol_value!=null?ea.rvol_value:ea.rvol;
+  var sweepOk=!!(dg.liquidity_sweep||gd.liquidity_sweep),volOk=!!(dg.volume_confirmed||gd.volume_confirmed);
+  if(cvdDir) h2+=_grpRow('CVD Direction',cvdDir,_biasCol(cvdDir));
+  if(ea.cvd_value!=null) h2+=_grpRow('CVD Value',ea.cvd_value);
+  if(rvol!=null){ var rv=Number(rvol); h2+=_grpRow('Rel Volume',rv.toFixed(2)+'x',rv>=1.5?'#22c55e':rv>=1.0?'#e8e8f0':'#6b7280'); }
+  h2+='<div class="grp-chips">'+_grpChip('Sweep',sweepOk)+_grpChip('Volume',volOk)+'</div>';
+  _grpBadge('ag-liq-badge',(sweepOk&&volOk)?'Active':(sweepOk?'Swept':volOk?'Volume':'Waiting'),(sweepOk&&volOk)?'ok':(sweepOk||volOk)?'warn':'neu');
+  document.getElementById('ag-liq-body').innerHTML=h2;
+  document.getElementById('ag-liq-det').style.display=(cvdDir||rvol!=null||sweepOk||volOk)?'':'none';
+  // VWAP & Key Levels
+  var h3='',price=d&&d.price,vv=d&&d.vwap_value,vwapOk=!!(dg.vwap_confirmed||gd.vwap_confirmed);
+  if(price&&vv){ var side=price>vv?'Above':'Below',sideC=((side==='Above'&&dir.toLowerCase().indexOf('bull')>=0)||(side==='Below'&&dir.toLowerCase().indexOf('bear')>=0))?'#22c55e':'#f59e0b'; h3+=_grpRow('Price vs VWAP',side+' ('+Number(vv).toFixed(2)+')',sideC); }
+  else if(vv){ h3+=_grpRow('VWAP',Number(vv).toFixed(2)); }
+  if(d&&d.nearest_demand) h3+=_grpRow('Demand Zone',d.nearest_demand);
+  if(d&&d.nearest_supply) h3+=_grpRow('Supply Zone',d.nearest_supply);
+  h3+='<div class="grp-chips">'+_grpChip('VWAP Gate',vwapOk)+'</div>';
+  _grpBadge('ag-vwap-badge',vwapOk?'Aligned':'—',vwapOk?'ok':'neu');
+  document.getElementById('ag-vwap-body').innerHTML=h3;
+  document.getElementById('ag-vwap-det').style.display=(vv||price||(d&&d.nearest_demand)||(d&&d.nearest_supply))?'':'none';
+  // Volatility & Risk
+  var h4='',volReg=ea.vol_regime||ea.volatility_regime||'',atrPts=ea.atr_pts!=null?ea.atr_pts:ea.atr,volBrake=!!(d&&d.vol_brake_active);
+  if(volReg){ var vrc=volReg==='HIGH'?'#ef4444':volReg==='LOW'?'#22c55e':'#f59e0b'; h4+=_grpRow('Vol Regime',volReg,vrc); }
+  if(atrPts!=null) h4+=_grpRow('ATR (pts)',Number(atrPts).toFixed(2));
+  if(volBrake) h4+='<div class="grp-note">\u26a1 Extreme ATR ratio \u2014 vol brake active</div>';
+  if(!h4) h4='<div class="grp-note">No volatility data yet.</div>';
+  _grpBadge('ag-vol-badge',volBrake?'Brake!':volReg||'—',volBrake?'bad':volReg==='HIGH'?'warn':volReg?'ok':'neu');
+  document.getElementById('ag-vol-body').innerHTML=h4;
+  // Strategy Diagnostics
+  var h5='',edge=ea.edge_score!=null?ea.edge_score:(d&&d.edge_score);
+  if(se.market_regime){ var mrc=se.market_regime==='TRENDING'?'#22c55e':se.market_regime==='VOLATILE'?'#ef4444':se.market_regime==='RANGING'?'#3b82f6':'#6b7280'; h5+=_grpRow('Regime',se.market_regime,mrc); }
+  if(se.active_strategy) h5+=_grpRow('Strategy',se.active_strategy+(se.direction?' \u00b7 '+se.direction:''));
+  if(se.confidence!=null) h5+=_grpRow('Confidence',Math.round(Number(se.confidence))+'%',Number(se.confidence)>=85?'#22c55e':Number(se.confidence)>=55?'#eab308':'#6b7280');
+  if(edge!=null) h5+=_grpRow('Edge Score',Math.round(Number(edge))+(ea.edge_grade?' \u00b7 '+ea.edge_grade:''),Number(edge)>=70?'#22c55e':Number(edge)>=50?'#f59e0b':'#9aa3b2');
+  var miss=se.missing||[];
+  h5+='<div class="grp-chips">'+(miss.length?miss.map(function(m){ return '<span class="grp-chip bad">'+_adcEsc(m)+'</span>'; }).join(''):se.active_strategy?'<span class="grp-chip ok">&#10003; All met</span>':'')+'</div>';
+  if(!h5) h5='<div class="grp-note">Awaiting strategy data.</div>';
+  _grpBadge('ag-diag-badge',se.active_strategy||se.market_regime||'—',se.active_strategy?'ok':se.market_regime?'warn':'neu');
+  document.getElementById('ag-diag-body').innerHTML=h5;
+}
+
+// renderJournalGroups: fills the 5 journal sections in mod-journal-groups.
+// DISPLAY-ONLY. Reads today's equity, trade history, and learning stats from /status.
+function renderJournalGroups(d) {
+  if (!document.getElementById('mod-journal-groups')) return;
+  // Today
+  var eq=(d&&d.today_equity)||(d&&d.equity_curve)||(d&&d.session_equity)||{};
+  var h1='';
+  if(eq.net_r!=null){ var nr=Number(eq.net_r); h1+=_grpRow('Net R',(nr>=0?'+':'')+nr.toFixed(2)+'R',nr>0?'#22c55e':nr<0?'#ef4444':'#6b7280'); }
+  if(eq.trade_count!=null||eq.count!=null) h1+=_grpRow('Trades Today',eq.trade_count||eq.count);
+  if(eq.wins!=null) h1+=_grpRow('Wins / Losses',(eq.wins||0)+' / '+(eq.losses||0));
+  var at=(d&&d.active_trade)||(d&&d.open_trade)||{};
+  if(at.instrument||at.direction) h1+=_grpRow('Open Trade',_adcEsc((at.instrument||'?')+' \u00b7 '+(at.direction||'?')),at.direction==='Long'?'#22c55e':at.direction==='Short'?'#ef4444':null);
+  if(!h1) h1='<div class="grp-note">No trades recorded today.</div>';
+  _grpBadge('jg-today-badge',eq.trade_count||eq.count||'0',(eq.trade_count||eq.count)?'ok':'neu');
+  document.getElementById('jg-today-body').innerHTML=h1;
+  // Trade History
+  var trades=(d&&d.recent_trades)||(d&&d.trade_history)||[],h2='';
+  if(trades.length){
+    trades.slice(0,5).forEach(function(t){ var r=t.r_multiple!=null?t.r_multiple:t.r,isWin=t.outcome==='WIN'||t.outcome==='win'||(r!=null&&r>0); h2+='<div class="grp-row"><span class="grp-k">'+_adcEsc((t.instrument||t.symbol||'?')+' '+(t.strategy||''))+'</span><span class="grp-v"><span style="color:'+(isWin?'#22c55e':'#ef4444')+'">'+(isWin?'WIN':'LOSS')+'</span>'+(r!=null?' '+(r>=0?'+':'')+Number(r).toFixed(1)+'R':'')+'</span></div>'; });
+  } else { h2='<div class="grp-note">No recent trade history.</div>'; }
+  _grpBadge('jg-hist-badge',trades.length?trades.length+' trades':'—','neu');
+  document.getElementById('jg-hist-body').innerHTML=h2;
+  // Performance
+  var la=(d&&d.learning_analytics)||(d&&d.performance_stats)||(d&&d.stats)||{},total=la.total_trades||la.total||la.count,h3='';
+  if(total!=null&&Number(total)>=25){
+    if(la.win_rate!=null){ var wr=Number(la.win_rate); h3+=_grpRow('Win Rate',Math.round(wr*(wr<=1?100:1))+'%',wr>=0.55?'#22c55e':wr>=0.45?'#f59e0b':'#ef4444'); }
+    if(la.avg_r!=null||la.average_r!=null){ var ar=la.avg_r!=null?la.avg_r:la.average_r; h3+=_grpRow('Avg R',(ar>=0?'+':'')+Number(ar).toFixed(2)+'R'); }
+    if(la.profit_factor!=null) h3+=_grpRow('Profit Factor',Number(la.profit_factor).toFixed(2));
+    h3+=_grpRow('Trades',total);
+  } else { var needed=total!=null?Math.max(0,25-Number(total)):25; h3='<div class="grp-note">Performance statistics will appear after enough completed trades are recorded.'+(total!=null?' ('+needed+' more needed)':'')+'</div>'; }
+  _grpBadge('jg-perf-badge',total!=null&&Number(total)>=25?total+' trades':'Building',total!=null&&Number(total)>=25?'ok':'neu');
+  document.getElementById('jg-perf-body').innerHTML=h3;
+  // Learning
+  var le=(d&&d.learning_engine)||(d&&d.adaptive_learning)||(d&&d.learning_influence)||{},h4='';
+  if(le.recent_insight||le.insight) h4+='<div class="grp-note">'+_adcEsc(le.recent_insight||le.insight)+'</div>';
+  if(le.score_adjustment!=null||le.adjustment!=null){ var adj=le.score_adjustment!=null?le.score_adjustment:le.adjustment; h4+=_grpRow('Score Adj',(adj>=0?'+':'')+adj,adj>0?'#22c55e':adj<0?'#ef4444':'#6b7280'); }
+  if(le.weight!=null||le.multiplier!=null){ var wt=le.weight!=null?le.weight:le.multiplier; h4+=_grpRow('Weight',Number(wt).toFixed(2)+'x'); }
+  if(le.best_setup) h4+=_grpRow('Best Setup',le.best_setup);
+  if(!h4) h4='<div class="grp-note">Learning insights appear after enough completed trades.</div>';
+  document.getElementById('jg-learn-body').innerHTML=h4;
+  // Simulated & Ghost
+  var ds=(d&&d.dual_sim)||{},h5='';
+  if(ds.scalp_verdict||ds.swing_verdict){
+    h5+='<div class="grp-note" style="margin-bottom:4px">Shadow sim \u2014 not real trades</div>';
+    if(ds.scalp_verdict){ var sv=ds.scalp_verdict,svc=sv.indexOf('READY')>=0?'#22c55e':sv.indexOf('EARLY')>=0?'#f59e0b':'#6b7280'; h5+=_grpRow('Scalp Sim',sv,svc); }
+    if(ds.swing_verdict){ var wv=ds.swing_verdict,wvc=wv.indexOf('READY')>=0?'#22c55e':wv.indexOf('EARLY')>=0?'#f59e0b':'#6b7280'; h5+=_grpRow('Swing Sim',wv,wvc); }
+    if(ds.active_is) h5+=_grpRow('Active Mode',ds.active_is);
+  } else { h5='<div class="grp-note">No simulation activity.</div>'; }
+  document.getElementById('jg-sim-body').innerHTML=h5;
+  document.getElementById('jg-sim-det').style.display=(ds.scalp_verdict||ds.swing_verdict)?'':'none';
+}
+
+// renderControlsGroups: fills the 6 control status sections in mod-controls-groups.
+// DISPLAY-ONLY status view. Full controls are in individual detail panels further below.
+function renderControlsGroups(d) {
+  if (!document.getElementById('mod-controls-groups')) return;
+  var muted=(d&&d.muted_instruments)||{},muteList=Object.keys(muted).filter(function(k){ return muted[k]; });
+  var ms=(d&&d.market_session)||{},discLive=d&&d.discord_live_enabled;
+  var exMode=(d&&d.execution_mode)||'';
+  var autoMap=(d&&d.auto_trade)||(d&&d.auto_trade_enabled)||{};
+  var armedList=Object.keys(autoMap).filter(function(k){ return autoMap[k]&&k!=='any'; });
+  // Markets
+  var inst=(d&&d.active_ticker)||'',h1='';
+  if(inst) h1+=_grpRow('Active Instrument',inst.replace('1!',''));
+  if(ms.status) h1+=_grpRow('Session',ms.status,ms.is_open?'#22c55e':'#6b7280');
+  h1+=_grpRow('Muted',muteList.length?muteList.join(', '):'None',muteList.length?'#f59e0b':null);
+  _grpBadge('cg-markets-badge',inst?inst.replace('1!',''):'—',inst?'ok':'neu');
+  document.getElementById('cg-markets-body').innerHTML=h1||'<div class="grp-note">No market data.</div>';
+  // Alerts
+  var h2='';
+  if(discLive!=null) h2+=_grpRow('Discord Sends',discLive?'Live (prod)':'Dev only',discLive?'#22c55e':'#6b7280');
+  h2+=muteList.length?'<div class="grp-note">Muted: '+_adcEsc(muteList.join(', '))+'</div>':'<div class="grp-note">All instruments unmuted.</div>';
+  _grpBadge('cg-alerts-badge',muteList.length?muteList.length+' muted':'Active',muteList.length?'warn':'ok');
+  document.getElementById('cg-alerts-body').innerHTML=h2;
+  // Trading Automation
+  var h3='';
+  h3+=armedList.length?'<div class="grp-chips">'+armedList.map(function(k){ return '<span class="grp-chip ok">AUTO '+_adcEsc(k)+'</span>'; }).join('')+'</div>':'<div class="grp-note">Auto-trading not armed. Use Active Trade Management to arm.</div>';
+  if(exMode) h3+=_grpRow('Execution',exMode,exMode==='traderspost'?'#22c55e':exMode==='paper'?'#f59e0b':exMode==='manual_only'?'#6b7280':null);
+  var trainOn=d&&d.training_mode_enabled;
+  if(trainOn!=null) h3+=_grpRow('Training Mode',trainOn?'Stage '+(d.training_stage||'?'):'Off',trainOn?'#f59e0b':'#6b7280');
+  _grpBadge('cg-auto-badge',armedList.length?armedList.length+' armed':'Off',armedList.length?'ok':'neu');
+  document.getElementById('cg-auto-body').innerHTML=h3;
+  // Brain Modes
+  var h4='';
+  if(d&&d.advisor_enabled!=null) h4+=_grpRow('Analyst Advisor',d.advisor_enabled?'On':'Off',d.advisor_enabled?'#22c55e':'#6b7280');
+  if(d&&d.debate_enabled!=null) h4+=_grpRow('Trade Debate',d.debate_enabled?'On':'Off',d.debate_enabled?'#22c55e':'#6b7280');
+  var eq2=(d&&d.entry_quality)||{};
+  if(eq2.engine_enabled) h4+=_grpRow('Entry Quality',eq2.gate_enabled?'Veto Armed':'Scoring',eq2.gate_enabled?'#f59e0b':'#22c55e');
+  var msb=(d&&d.main_brain&&d.main_brain.micro_scalp)||{};
+  if(msb.enabled!=null) h4+=_grpRow('Micro Scalp',msb.enabled?'On':'Off',msb.enabled?'#22c55e':'#6b7280');
+  if(!h4) h4='<div class="grp-note">Brain mode flags are set via environment variables.</div>';
+  _grpBadge('cg-brain-badge','—','neu');
+  document.getElementById('cg-brain-body').innerHTML=h4;
+  // Display (static — no live data needed)
+  document.getElementById('cg-display-det').style.display='';
+  // Integrations
+  var h6='';
+  if(exMode) h6+=_grpRow('Broker Gateway',exMode,exMode==='traderspost'?'#22c55e':exMode==='paper'?'#f59e0b':null);
+  if(d&&d.traderspost_connected!=null) h6+=_grpRow('TradersPost',d.traderspost_connected?'Connected':'Not configured',d.traderspost_connected?'#22c55e':'#ef4444');
+  if(discLive!=null) h6+=_grpRow('Discord',discLive?'Live (prod)':'Dev mode',discLive?'#22c55e':'#6b7280');
+  if(!h6) h6='<div class="grp-note">Configure broker and Discord via environment variables.</div>';
+  _grpBadge('cg-integ-badge',exMode||'—',exMode==='traderspost'?'ok':exMode?'warn':'neu');
+  document.getElementById('cg-integ-body').innerHTML=h6;
+}
+
 function initUnifiedDash() {
   if (!UNIFIED_DASH) return;
+  // Set data-unified="1" on <html> so the Advanced-panels CSS gate defers to
+  // ln-hidden (section nav) instead of its own show/hide list.
+  document.documentElement.setAttribute('data-unified', '1');
   var nav = document.getElementById('live-nav');
   if (nav) {
     nav.style.display = 'flex';
