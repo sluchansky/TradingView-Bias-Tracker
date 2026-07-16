@@ -1,0 +1,459 @@
+REFINE THE EXISTING TRADE DECISION PIPELINE — DO NOT ADD NEW FEATURES OR INDICATORS
+
+The current pipeline already uses:
+
+- BOS / CHOCH structure
+- Supply and demand zones
+- VWAP
+- CVD
+- Liquidity sweeps
+- Volume / RVOL
+- Session windows
+- Edge score
+- Fast Entry timing
+- TradersPost execution
+- Trade journaling
+
+The goal is to improve the stability and usefulness of the existing system without adding more indicators, strategies, pages, modes, or dashboard panels.
+
+IMPORTANT
+
+- Do not rebuild the application.
+- Do not remove existing working logic.
+- Do not change TradingView webhook formats.
+- Do not change TradersPost execution behavior.
+- Do not enable auto-submit.
+- Do not add Databento yet.
+- Do not add new strategies.
+- Do not add new indicators.
+- Preserve the current Dashboard V2 work.
+- Make these changes behind configuration flags where practical.
+
+==================================================
+1. CREATE A PERSISTENT MARKET THESIS
+==================================================
+
+The bot currently appears to recalculate WAIT or READY from individual incoming signals.
+
+Change this so each instrument maintains one persistent active thesis.
+
+Create an ActiveThesis object per instrument:
+
+{
+  thesisId,
+  instrument,
+  direction,
+  status,
+  createdAt,
+  lastUpdatedAt,
+  lastStrengthenedAt,
+  lastWeakenedAt,
+  confidence,
+  previousConfidence,
+  structureDirection,
+  activeZoneId,
+  zoneType,
+  zoneStatus,
+  vwapAligned,
+  cvdAligned,
+  sweepConfirmed,
+  volumeConfirmed,
+  sessionPrime,
+  entry,
+  stop,
+  targets,
+  invalidationPrice,
+  invalidationReason,
+  evidenceFor,
+  evidenceAgainst,
+  expirationAt
+}
+
+Supported thesis statuses:
+
+- NEUTRAL
+- FORMING_LONG
+- FORMING_SHORT
+- READY_LONG
+- READY_SHORT
+- ACTIVE_LONG
+- ACTIVE_SHORT
+- INVALIDATED
+- COOLDOWN
+
+The thesis must not be recreated every time a new alert arrives.
+
+Incoming alerts should update the existing thesis.
+
+==================================================
+2. STRUCTURE REMAINS THE FOUNDATION
+==================================================
+
+Preserve the existing rule that BOS or CHOCH creates the directional foundation.
+
+Rules:
+
+- Bullish structure may create or strengthen a long thesis.
+- Bearish structure may create or strengthen a short thesis.
+- An opposite structure signal should weaken the thesis first.
+- It should only invalidate immediately when it breaches the saved structural invalidation rule.
+- One isolated opposite alert must not instantly reverse the bot.
+
+Do not permit a direct transition from READY_LONG to READY_SHORT or READY_SHORT to READY_LONG without invalidating or expiring the original thesis first.
+
+==================================================
+3. KEEP THE EXISTING THREE REQUIRED GATES
+==================================================
+
+READY still requires:
+
+- valid structure
+- active fresh zone
+- correct VWAP side
+
+These remain mandatory gates.
+
+Edge score alone must never override a missing required gate.
+
+If any required gate is missing:
+
+status = FORMING_LONG or FORMING_SHORT
+
+Do not promote the setup to READY.
+
+==================================================
+4. PRESERVE CVD AS A HARD FILTER
+==================================================
+
+Keep the current CVD behavior:
+
+- Long setup requires bullish or non-opposing CVD.
+- Short setup requires bearish or non-opposing CVD.
+- Strong opposing CVD vetoes READY.
+- Temporary missing or stale CVD should show UNKNOWN rather than immediately creating the opposite thesis.
+
+Record CVD state as:
+
+- ALIGNED
+- OPPOSING
+- NEUTRAL
+- STALE
+- UNKNOWN
+
+Display the exact CVD state in the reasoning.
+
+==================================================
+5. CONVERT EDGE SCORE INTO PERSISTENT CONFIDENCE
+==================================================
+
+Keep the current scoring inputs, but store the result as persistent thesis confidence.
+
+Existing evidence includes:
+
+- BOS / CHOCH
+- VWAP alignment
+- liquidity sweep
+- volume / RVOL
+- CVD agreement
+- prime session window
+- valid zone
+
+Do not reset confidence to zero every time one alert changes.
+
+Confidence should rise or fall as evidence is added or removed.
+
+Use a range of 0–100 for the displayed confidence.
+
+Suggested default interpretation:
+
+0–39:
+Weak or invalid setup
+
+40–59:
+Setup forming
+
+60–74:
+Valid but not ready
+
+75–84:
+Ready candidate
+
+85–100:
+Strong ready setup
+
+The existing READY threshold may remain configurable, but all mandatory gates must still be present.
+
+==================================================
+6. ADD HYSTERESIS TO STOP FLIP-FLOPPING
+==================================================
+
+Use separate thresholds for becoming ready, remaining ready, and reversing.
+
+Defaults:
+
+READY_THRESHOLD=75
+HOLD_READY_THRESHOLD=60
+REVERSAL_THRESHOLD=85
+MIN_THESIS_AGE_MS=5000
+REVERSAL_COOLDOWN_MS=20000
+
+Rules:
+
+- Promote to READY when confidence reaches the READY threshold and all gates pass.
+- Maintain READY while confidence stays above the hold threshold and hard invalidation has not occurred.
+- Do not reverse direction unless the opposite setup reaches the reversal threshold.
+- Hard structural invalidation may override these thresholds immediately.
+- A brief VWAP touch, one candle, or one alert must not reverse the thesis.
+
+==================================================
+7. ADD THESIS AGE AND MOMENTUM
+==================================================
+
+Track and display:
+
+- thesis age
+- last strengthened time
+- last weakened time
+- confidence change
+- setup expiration time
+- READY age
+- cooldown remaining
+
+Example reasoning:
+
+“Long thesis remains active at 82 confidence. CVD weakened 12 seconds ago, but structure, demand, and VWAP alignment remain valid.”
+
+“Long confidence dropped from 84 to 67 because volume weakened. The thesis remains valid because the structural invalidation has not been breached.”
+
+“Long thesis invalidated because price closed below the active demand zone.”
+
+==================================================
+8. DO NOT REPLACE WAIT / READY, ENRICH THEM
+==================================================
+
+Keep the existing WAIT and READY verdicts so current integrations do not break.
+
+Add a descriptive confidence state:
+
+- WEAK
+- FORMING
+- VALID
+- READY
+- STRONG_READY
+- INVALIDATED
+- COOLDOWN
+
+Examples:
+
+WAIT — FORMING LONG — 58 confidence
+
+WAIT — VALID LONG — 69 confidence
+
+READY LONG — 79 confidence
+
+READY LONG — STRONG — 91 confidence
+
+INVALIDATED LONG — structure lost
+
+The dashboard and Discord messages should still use the existing verdict fields where required.
+
+==================================================
+9. IMPROVE FAST ENTRY WITHOUT CHANGING ITS PURPOSE
+==================================================
+
+Fast Entry must remain a timing layer only.
+
+It must not:
+
+- create the higher-timeframe thesis
+- reverse the thesis
+- override missing structure
+- override a consumed zone
+- override opposing CVD
+- submit a trade when the main setup is not READY
+
+Fast Entry may only sharpen entry timing when:
+
+- thesis status is READY_LONG or READY_SHORT
+- all mandatory gates are valid
+- direction agrees with the higher-timeframe thesis
+
+Keep the existing 5-second events such as:
+
+- SWEEP_RECLAIM_LONG
+- SWEEP_RECLAIM_SHORT
+- DELTA_FLIP_BULLISH
+- DELTA_FLIP_BEARISH
+
+Require the events to occur within a configurable confirmation window.
+
+Suggested default:
+
+FAST_ENTRY_CONFIRMATION_WINDOW_MS=15000
+
+==================================================
+10. PREVENT DUPLICATE READY EVENTS
+==================================================
+
+Do not post a new Discord trade card every time the score updates while the same thesis remains READY.
+
+Create a READY event only when:
+
+- the thesis first transitions into READY
+- entry, stop, target, or invalidation materially changes
+- the thesis is invalidated and later becomes a new setup with a new thesisId
+
+Use thesisId as the deduplication key.
+
+==================================================
+11. PRESERVE ACTIVE ZONE IDENTITY
+==================================================
+
+Each thesis must reference the exact zone that supports it.
+
+Store:
+
+- zoneId
+- zone created time
+- zone upper boundary
+- zone lower boundary
+- zone type
+- zone freshness
+- zone mitigation status
+
+If the zone is consumed:
+
+- invalidate or weaken the thesis according to the current rules
+- do not silently attach the thesis to another zone
+- require a new thesisId if a different zone becomes the foundation
+
+==================================================
+12. ADD CLEAR REASON CODES
+==================================================
+
+Every decision update should return structured reason codes.
+
+Examples:
+
+- STRUCTURE_BULLISH
+- STRUCTURE_BEARISH
+- STRUCTURE_INVALIDATED
+- ZONE_ACTIVE
+- ZONE_CONSUMED
+- VWAP_ALIGNED
+- VWAP_OPPOSING
+- CVD_ALIGNED
+- CVD_OPPOSING
+- SWEEP_CONFIRMED
+- VOLUME_CONFIRMED
+- PRIME_SESSION
+- CONFIDENCE_INCREASED
+- CONFIDENCE_DECREASED
+- READY_THRESHOLD_REACHED
+- HOLD_THRESHOLD_MAINTAINED
+- REVERSAL_THRESHOLD_NOT_REACHED
+- FAST_ENTRY_CONFIRMED
+- SETUP_EXPIRED
+
+The avatar and dashboard should use these codes to explain the existing decision.
+
+Do not let the avatar independently calculate a separate verdict.
+
+==================================================
+13. DASHBOARD CHANGES
+==================================================
+
+Use the existing Dashboard V2 layout.
+
+Do not add another large panel.
+
+Update the existing verdict or briefing area to show:
+
+- verdict
+- direction
+- confidence
+- thesis status
+- thesis age
+- last strengthened
+- last weakened
+- required gates
+- supporting evidence
+- opposing evidence
+- invalidation
+- Fast Entry state
+- cooldown
+
+Keep the presentation compact.
+
+==================================================
+14. JOURNALING
+==================================================
+
+Add the following fields to the existing journal records where possible:
+
+- thesisId
+- thesisCreatedAt
+- confidenceAtReady
+- confidenceAtEntry
+- thesisAgeAtEntry
+- strongestConfidence
+- invalidationReason
+- fastEntryUsed
+- supportingEvidence
+- opposingEvidence
+
+Do not create a separate journaling system.
+
+==================================================
+15. TESTING
+==================================================
+
+Add tests covering:
+
+1. A bullish thesis remains bullish through one temporary bearish CVD event.
+2. A READY long setup does not become short from one opposite alert.
+3. A consumed demand zone invalidates the long thesis.
+4. Missing VWAP prevents READY.
+5. Edge score cannot override missing structure.
+6. Edge score cannot override a consumed zone.
+7. Opposing CVD vetoes READY.
+8. Fast Entry cannot trigger without a READY thesis.
+9. Duplicate READY alerts do not create duplicate Discord cards.
+10. A new zone creates a new thesisId.
+11. Confidence can weaken without immediately invalidating the thesis.
+12. Hard structural invalidation acts immediately.
+13. Each instrument maintains an independent thesis.
+14. Existing TradingView webhooks remain compatible.
+15. Existing TradersPost execution behavior remains unchanged.
+16. Auto-submit remains disabled.
+
+==================================================
+16. DELIVERABLE
+==================================================
+
+Before changing code, identify:
+
+- current edge-score implementation
+- current WAIT / READY implementation
+- current structure storage
+- current zone storage
+- current CVD handling
+- current Fast Entry implementation
+- current Discord deduplication
+- current journal model
+
+Then implement only the smallest changes needed.
+
+At completion, report:
+
+1. Files changed.
+2. Existing logic preserved.
+3. New thesis fields added.
+4. Confidence thresholds used.
+5. How flip-flopping is prevented.
+6. Tests added.
+7. Build result.
+8. Test result.
+9. Confirmation that no new indicators or strategies were added.
+10. Confirmation that auto-submit remains disabled.
+11. Confirmation that TradersPost behavior was not changed.
