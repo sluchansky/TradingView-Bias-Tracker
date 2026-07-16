@@ -43512,22 +43512,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
     <div class="se-fid" id="mi-fid"></div>
   </div>
 
-  <!-- ════ AI Assistant (DISPLAY-ONLY; read-only Q&amp;A — live setup + general trading) ════ -->
-  <div class="mod mb-hidden" id="mod-assistant">
-    <div class="mod-h">💬 Ask the AI <span style="font-size:10px;color:#6b7280;letter-spacing:1px">READ-ONLY · LIVE + GENERAL Q&amp;A</span><span class="mod-cat cat-advanced">ADVANCED</span></div>
-    <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Ask about the current setup (why WAIT, explain the edge score, what's blocking a trade) or general trading questions. It reads your live data — it never places or changes a trade.</div>
-    <div id="ai-log" style="max-height:340px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:8px"></div>
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <button onclick="aiQuick('Why is the current setup on WAIT?')" style="background:#0b2330;color:#9fd9e6;border:1px solid #234a55;border-radius:14px;padding:4px 10px;font-size:11px;cursor:pointer">Why WAIT?</button>
-      <button onclick="aiQuick('Explain the current edge score and how it was calculated.')" style="background:#0b2330;color:#9fd9e6;border:1px solid #234a55;border-radius:14px;padding:4px 10px;font-size:11px;cursor:pointer">Explain edge score</button>
-      <button onclick="aiQuick('What needs to happen for a trade to trigger right now?')" style="background:#0b2330;color:#9fd9e6;border:1px solid #234a55;border-radius:14px;padding:4px 10px;font-size:11px;cursor:pointer">What is blocking a trade?</button>
-    </div>
-    <div style="display:flex;gap:6px">
-      <input id="ai-input" type="text" placeholder="Ask anything about your setup or trading…" autocomplete="off" onkeydown="if(event.key==='Enter'){aiSend();}" style="flex:1;background:#08252b;border:1px solid #2a5560;border-radius:6px;color:#e8f6f9;padding:8px;font-size:12px">
-      <button class="btn" id="ai-send" style="background:#0b2a33;color:#7fe9f5;border:1px solid #2a5560" onclick="aiSend()">Send</button>
-    </div>
-  </div>
-
 </div>
 
 <!-- ── AI Decision Center ─────────────────────────────────────────────────
@@ -50492,7 +50476,6 @@ var _liveNavSections = {
     'mod-broker-send-log',// Broker Send Log
     'mod-governor',       // Confidence Governor
     'mod-mb-confidence',  // Confidence Timeline
-    'mod-assistant'       // AI Assistant chat
   ]
 };
 var _liveNavAllIds = (function(){
@@ -53537,51 +53520,7 @@ function renderReview(r){
   out.innerHTML = html;
 }
 
-// ── AI Assistant (DISPLAY-ONLY; read-only Q&A; on-demand, NOT in the 3s poll) ──
-// Sends the owner's question + the selected instrument + recent turns to /assistant,
-// which grounds the answer on a read-only full_analysis snapshot. It never places,
-// sizes, or changes a trade.
-var aiHistory = [];   // [{role, content}] — trimmed client-side; the server also caps it
 function aiEsc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function aiRender(){
-  var log=document.getElementById('ai-log'); if(!log) return;
-  if(!aiHistory.length){
-    log.innerHTML='<div style="color:#6b7280;font-size:11px;padding:6px 2px">Ask a question to get started — try a chip above, or type anything.</div>';
-    return;
-  }
-  log.innerHTML = aiHistory.map(function(m){
-    var mine = m.role==='user';
-    var bg = mine ? '#0b2a33' : '#0e1b14';
-    var bd = mine ? '#2a5560' : '#1f3d2a';
-    var col = mine ? '#cdeef5' : '#d7f0dd';
-    var who = mine ? 'You' : 'AI';
-    return '<div style="align-self:'+(mine?'flex-end':'flex-start')+';max-width:92%;background:'+bg+';border:1px solid '+bd+';border-radius:8px;padding:7px 9px">'
-      + '<div style="font-size:9px;letter-spacing:1px;color:#6b7280;margin-bottom:2px">'+who+'</div>'
-      + '<div style="font-size:12px;color:'+col+';white-space:pre-wrap;line-height:1.45">'+aiEsc(m.content)+'</div></div>';
-  }).join('');
-  log.scrollTop = log.scrollHeight;
-}
-function aiQuick(q){ var i=document.getElementById('ai-input'); if(i){ i.value=q; } aiSend(); }
-async function aiSend(){
-  var inp=document.getElementById('ai-input'); var btn=document.getElementById('ai-send');
-  if(!inp||!btn) return;
-  var q=(inp.value||'').trim(); if(!q) return;
-  var priorHist = aiHistory.slice(-8).map(function(m){ return {role:m.role, content:m.content}; });
-  aiHistory.push({role:'user', content:q});
-  inp.value='';
-  aiHistory.push({role:'assistant', content:'…', _pending:true});
-  aiRender();
-  var prev=btn.textContent; btn.disabled=true; btn.textContent='…';
-  try{
-    var r=await api('/assistant', { question:q, ticker:sym, history:priorHist });
-    if(aiHistory.length && aiHistory[aiHistory.length-1]._pending) aiHistory.pop();
-    if(!r || r.ok===false){ aiHistory.push({role:'assistant', content:(r&&r.error)?r.error:'Sorry — something went wrong.'}); }
-    else { aiHistory.push({role:'assistant', content:(r.answer||'(no answer)')}); }
-  }catch(e){
-    if(aiHistory.length && aiHistory[aiHistory.length-1]._pending) aiHistory.pop();
-    aiHistory.push({role:'assistant', content:'Request failed — try again.'});
-  }finally{ btn.disabled=false; btn.textContent=prev; aiRender(); }
-}
 
 
 // ── Manual Trade Management Mode (inside Main Brain) ──────────────────────────
