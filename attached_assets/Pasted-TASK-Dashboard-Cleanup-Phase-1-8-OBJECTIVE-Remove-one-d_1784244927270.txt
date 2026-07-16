@@ -1,0 +1,158 @@
+TASK: Dashboard Cleanup — Phase 1.8
+
+OBJECTIVE
+
+Remove one duplicate dashboard panel:
+
+Panel: Entry Quality
+Panel ID: mod-entryq
+
+The AI Decision Center already contains an Entry Quality tab using the same
+underlying entry-quality data.
+
+MAKE ONLY THIS ONE CHANGE.
+
+BEFORE EDITING
+
+Inspect and report:
+
+1. The exact file or files that will be modified.
+2. The exact markup belonging to mod-entryq.
+3. Every JavaScript function, selector, event handler, CSS rule, registry entry,
+   navigation entry, and Advanced View reference connected to mod-entryq.
+4. Which d.entry_quality fields are also used by:
+   - mod-ai-decision-center
+   - trade approval logic
+   - veto logic
+   - Main Brain
+   - any diagnostics or exports
+5. Whether the standalone panel contains any controls not present in the
+   AI Decision Center Entry Quality tab.
+6. Whether the veto toggle in mod-entryq is shared with another interface.
+7. Which rendering code is exclusive to mod-entryq.
+8. Which data-generation and shared logic must remain.
+
+Then perform the smallest safe change.
+
+REQUIREMENTS
+
+1. Remove the standalone mod-entryq panel from the rendered dashboard.
+
+2. Preserve:
+- d.entry_quality in the /status response
+- Entry-quality score generation
+- Entry-quality grading logic
+- Entry-quality veto logic
+- Any trade-gating dependency
+- AI Decision Center → Entry Quality tab
+- Main Brain references to entry quality
+- Any shared formatting functions
+- Any backend endpoints or saved settings
+
+3. If mod-entryq contains a veto control that is not available anywhere else:
+
+DO NOT silently delete access to that control.
+
+Instead:
+- Keep all veto functionality and state intact.
+- Report that the control is unique.
+- Do not remove the panel until the control has a safe replacement.
+
+If the veto control already exists elsewhere, remove only the duplicate
+standalone interface.
+
+4. Remove mod-entryq from any:
+- Dashboard markup
+- Section navigation registry
+- Panel category registry
+- Advanced View visibility rules
+- Panel lookup lists
+- Dashboard inventory structures
+- Client-side update loops used only by mod-entryq
+
+5. Remove JavaScript and CSS only when used exclusively by mod-entryq.
+
+6. Do not remove or rename:
+- d.entry_quality
+- entry_quality
+- Entry Quality tab in mod-ai-decision-center
+- Entry-quality veto state
+- Any backend scoring or gating logic
+
+7. Do not modify any other panel.
+
+8. Do not:
+- Move panels
+- Resize panels
+- Change navigation
+- Redesign layout
+- Change score calculations
+- Change thresholds
+- Change trade approval behavior
+- Change veto behavior
+- Perform unrelated cleanup
+
+SUCCESS CRITERIA
+
+- mod-entryq no longer exists in the rendered DOM, unless its veto control is
+  confirmed to be unique and has no safe replacement.
+- Entry Quality is absent with Advanced View OFF.
+- Entry Quality is absent with Advanced View ON.
+- AI Decision Center → Entry Quality still displays:
+  - Score
+  - Grade
+  - Location flags
+  - Meaning
+  - Improvement guidance
+- Entry-quality gating still functions.
+- Entry-quality veto state remains functional.
+- d.entry_quality remains present in /status.
+- No empty panel gap remains.
+- No other panel changes.
+- No new browser-console errors.
+
+TESTING
+
+1. Search the served HTML for:
+   id="mod-entryq"
+
+2. Confirm it is absent, unless Replit stopped because the veto control is unique.
+
+3. Load the dashboard with Advanced View OFF.
+
+4. Turn Advanced View ON.
+
+5. Confirm no standalone Entry Quality panel appears.
+
+6. Open AI Decision Center → Entry Quality.
+
+7. Confirm score, grade, flags, explanation, and improvement plan populate.
+
+8. Verify the entry-quality veto setting still exists and retains its state.
+
+9. Inspect /status and confirm entry_quality still exists.
+
+10. Verify one READY or WAIT decision still considers entry quality normally.
+
+11. Switch through all dashboard sections.
+
+12. Check the browser console.
+
+FINAL RESPONSE
+
+Return:
+
+- Files changed
+- Exact markup removed
+- Standalone JavaScript removed
+- Shared entry-quality logic preserved
+- Whether the veto control was duplicated or unique
+- Where the veto control remains accessible
+- CSS, registry, and visibility references removed
+- AI Decision Center Entry Quality test result
+- Entry-quality gating test result
+- /status entry_quality result
+- Browser-console result
+- Confirmation that no other panel was modified
+
+Do not begin Phase 1.9.
