@@ -270,6 +270,8 @@ THESIS_LOCK               = threading.RLock()
 THESIS_TIMELINE_BY_INST   = {}  # inst -> deque(maxlen=25) of transition events
 THESIS_NOTIF_LAST_BY_INST = {}  # inst -> {"sig": str} last-notified transition
 THESIS_DB_READY           = False  # probed at boot; persist/restore fail-open when False
+STALE_SETUPS_BY_INST      = {}  # inst -> list of stale-setup markers (Phase 3)
+THESIS_EVAL_DB_READY      = False  # probed at boot; thesis_trade_evaluations persist fail-open (Phase 3)
 # Lightweight rolling-window timestamp logs (last hour) for diagnostics that the
 # capped EVAL_METRICS deque can't answer once the heartbeat floods it. Guarded by
 # COUNTERS_LOCK (appended in webhook(), read+trimmed in /eval-metrics).
@@ -3158,6 +3160,19 @@ _THESIS_DISCORD_ALERTS_ENABLED = (os.environ.get("THESIS_DISCORD_ALERTS_ENABLED"
 _THESIS_DB_PERSISTENCE_ENABLED = (os.environ.get("THESIS_DB_PERSISTENCE_ENABLED", "1")
                                    .strip().lower() not in ("0", "false", "no", "off"))
 THESIS_RESTORE_MAX_AGE_MS      = int(os.environ.get("THESIS_RESTORE_MAX_AGE_MS", 3_600_000))
+# ── Phase 3 enforcement mode ──────────────────────────────────────────────────
+# "off"      → thesis evaluated & displayed; ZERO effect on any verdict.
+# "shadow"   → thesis evaluates every setup; records what would happen; NEVER changes verdict.
+# "enforced" → CONFLICTING/INVALIDATED thesis can block a setup from becoming READY.
+# Default is shadow so the engine validates itself before enforcement is enabled.
+_THESIS_ENFORCEMENT_MODE         = (os.environ.get("THESIS_ENFORCEMENT_MODE", "shadow")
+                                    .strip().lower())
+_THESIS_EVAL_ENABLED             = (_THESIS_ENFORCEMENT_MODE != "off")
+_THESIS_EVAL_DB_PERSIST_ENABLED  = (os.environ.get("THESIS_EVAL_DB_PERSIST", "1")
+                                    .strip().lower() not in ("0", "false", "no", "off"))
+THESIS_EVAL_MAX_CONF_ADJ_ALIGNED  = 5    # display-only adj when ALIGNED (not added to edge_score)
+THESIS_EVAL_MAX_CONF_ADJ_PARTIAL  = 2    # display-only adj when PARTIALLY_ALIGNED
+THESIS_EVAL_MAX_CONF_ADJ_CONFLICT = -10  # display-only adj when CONFLICTING (shadow calc only)
 EOD_HOUR_UTC       = int(os.environ.get("EOD_HOUR_UTC", 21))  # default 21:00 UTC = 4 PM ET
 # ── Weekly performance report (additive) ──────────────────────────────────────
 # Posts a week-in-review embed once a week, just after the close. Default is
@@ -19933,6 +19948,19 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # (status, diagnostics, journal, Discord card) reads the same snapshot.
     # The thesis was already applied above to adjust `verdict`; this is display-only.
     result["thesis"] = _thesis_snap
+    # ── Phase 3: Thesis gate evaluation (shadow / off / enforced) ────────────
+    # Shadow mode (default): gate is computed + recorded; verdict is NEVER changed.
+    # Off mode:              _compute_thesis_gate() returns {} immediately.
+    # Enforced mode:         BLOCK action → verdict overridden to "WAIT" here.
+    # The confidence_adjustment in the gate result is DISPLAY-ONLY; it is NOT
+    # added to edge_score to avoid double-counting indicators already in the gate.
+    _thesis_gate = _compute_thesis_gate(active_ticker, _thesis_snap, strict, verdict, edge_score)
+    if _thesis_gate and _THESIS_ENFORCEMENT_MODE == "enforced":
+        if _thesis_gate.get("action") == "BLOCK":
+            verdict = "WAIT"
+            _thesis_gate["original_verdict"] = result.get("verdict", verdict)
+            _thesis_gate["shadow_verdict"]   = "WAIT"
+    result["thesis_gate"] = _thesis_gate if _thesis_gate else None
     # Per-gate WAIT debug (which READY gate failed) — surfaced on /status + logs.
     result["gate_debug"] = strict.get("gate_debug")
     # Candidate direction the gate evaluated (Long/Short/None) — for /diagnostics.
@@ -21426,6 +21454,61 @@ def _build_trade_card_embed(entry, footer_text):
             })
     except Exception as _th_exc:
         logger.error("Thesis card block error: %s", _th_exc)
+
+    # ── Additive: 🔬 Thesis Gate (Phase 3 — shadow/enforced evaluation result) ──
+    try:
+        tg = entry.get("thesis_gate") or {}
+        if tg and tg.get("alignment"):
+            mode      = (tg.get("enforcement_mode") or "shadow").upper()
+            alignment = tg.get("alignment", "")
+            shadow_act = tg.get("shadow_action") or tg.get("action", "")
+            real_act   = tg.get("action", "")
+            adj        = tg.get("confidence_adjustment", 0)
+            tid        = (tg.get("thesis_id") or "")[-6:].upper()
+            t_state    = (tg.get("thesis_state") or "?").replace("_", " ")
+            t_dir      = tg.get("thesis_direction", "?")
+            t_conf     = tg.get("thesis_confidence", "?")
+            s_dir      = tg.get("setup_direction", "?")
+            would_chg  = bool(tg.get("would_change_decision"))
+            reasons    = tg.get("reasons") or []
+
+            _align_emoji = {
+                "ALIGNED":           "\u2705",
+                "PARTIALLY_ALIGNED": "\U0001F7E1",
+                "NEUTRAL":           "\u26ab",
+                "CONFLICTING":       "\u274c",
+                "INVALIDATED":       "\u274c",
+                "NO_THESIS":         "\u2b1c",
+            }.get(alignment, "\u26ab")
+
+            if mode == "SHADOW":
+                action_disp = ("WOULD BLOCK" if shadow_act == "BLOCK"
+                               else ("WOULD ALLOW" if shadow_act == "ALLOW"
+                                     else "ALLOW (no confirmation)"))
+            else:
+                action_disp = ("BLOCKED"     if real_act == "BLOCK"
+                               else "ALLOWED")
+
+            adj_str = (("+" + str(adj)) if adj > 0 else str(adj)) if adj != 0 else "0"
+
+            tg_lines = [
+                f"**{_align_emoji} {alignment.replace('_', ' ')}**  \u00b7  Mode: {mode}",
+                f"Thesis: {t_dir} {t_state}" + (f"  \u00b7  ID `{tid}`" if tid else ""),
+                f"Confidence: {t_conf}%  \u00b7  Setup dir: {s_dir}",
+                f"Decision: **{action_disp}**  \u00b7  Adj: {adj_str}",
+            ]
+            if would_chg:
+                tg_lines.append("\u26a0\ufe0f Shadow: This setup WOULD have been blocked")
+            for _r in reasons[:3]:
+                tg_lines.append(f"\u2192 {_r}")
+
+            embed["fields"].append({
+                "name":   "\U0001F52C Thesis Gate",
+                "value":  "\n".join(tg_lines)[:1024],
+                "inline": False,
+            })
+    except Exception as _tg_exc:
+        logger.error("Thesis gate card block error: %s", _tg_exc)
 
     # Attach the chart screenshot when a validated public URL is present.
     shot = entry.get("screenshot_url")
@@ -29212,6 +29295,8 @@ def _thesis_post_update(inst, prev_snap, new_snap):
         if not (status_changed or conf_delta >= 5):
             return
         _record_thesis_event(inst, prev_snap, new_snap)
+        # Phase 3: mark untriggered setups stale on direction flip or invalidation
+        _mark_setups_stale_for_inst(inst, prev_snap, new_snap)
         if _THESIS_DISCORD_ALERTS_ENABLED:
             _maybe_send_thesis_notification(inst, prev_snap, new_snap)
         if _THESIS_DB_PERSISTENCE_ENABLED and THESIS_DB_READY:
@@ -29554,6 +29639,438 @@ def get_thesis_history(instrument):
     with THESIS_LOCK:
         events = list(THESIS_TIMELINE_BY_INST.get(inst) or [])
     return jsonify({"ok": True, "instrument": inst, "events": events}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Phase 3 — Thesis Enforcement + Outcome Validation ────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# SHADOW MODE (default, _THESIS_ENFORCEMENT_MODE="shadow"):
+#   - Evaluates every setup against the current thesis for that instrument.
+#   - Records what would have been allowed / blocked / downgraded / upgraded.
+#   - NEVER changes the actual verdict or prevents an order.
+#   - Attaches thesis_gate to result[] for display and outcome tracking.
+#
+# OFF MODE (_THESIS_ENFORCEMENT_MODE="off"):
+#   - _compute_thesis_gate() returns {} immediately; result["thesis_gate"] absent.
+#
+# ENFORCED MODE (_THESIS_ENFORCEMENT_MODE="enforced"):
+#   - gate_action=="BLOCK" → full_analysis sets verdict="WAIT" (CONFLICTING /
+#     INVALIDATED thesis can prevent a setup from becoming READY).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Alignment evaluation ──────────────────────────────────────────────────────
+
+def _evaluate_thesis_alignment(thesis_snap, setup_direction):
+    """Evaluate how well a setup direction aligns with the current thesis.
+
+    Returns one of:
+      ALIGNED           — direction match + thesis READY/ACTIVE + conf >= 70
+      PARTIALLY_ALIGNED — direction match + thesis FORMING or conf < 70
+      NEUTRAL           — thesis has no confirmed directional bias
+      CONFLICTING       — setup direction opposes an active directional thesis
+      INVALIDATED       — thesis is INVALIDATED or COOLDOWN
+      NO_THESIS         — no usable thesis snapshot for this instrument
+    """
+    if not thesis_snap:
+        return "NO_THESIS"
+
+    status = (thesis_snap.get("status") or "NEUTRAL").upper()
+    t_dir  = (thesis_snap.get("direction") or "").upper()
+    conf   = int(thesis_snap.get("confidence") or 0)
+    s_dir  = (setup_direction or "").upper()
+
+    if status in ("INVALIDATED", "COOLDOWN"):
+        return "INVALIDATED"
+
+    if status == "NEUTRAL" or not t_dir:
+        return "NEUTRAL"
+
+    # Derive direction from status string as a fallback
+    if not t_dir:
+        t_dir = "LONG" if "LONG" in status else ("SHORT" if "SHORT" in status else "")
+
+    if not t_dir or not s_dir:
+        return "NEUTRAL"
+
+    if t_dir != s_dir:
+        return "CONFLICTING"
+
+    # Directions match — check strength
+    if any(k in status for k in ("READY", "ACTIVE")) and conf >= 70:
+        return "ALIGNED"
+    return "PARTIALLY_ALIGNED"
+
+
+def _thesis_gate_reasons(alignment, thesis_snap, setup_direction):
+    """Build human-readable reason strings for a thesis gate result."""
+    reasons = []
+    if not thesis_snap:
+        reasons.append("No active thesis found for this instrument")
+        return reasons
+
+    status  = (thesis_snap.get("status")    or "NEUTRAL")
+    t_dir   = (thesis_snap.get("direction") or "")
+    conf    = int(thesis_snap.get("confidence") or 0)
+    s_dir   = (setup_direction or "")
+    ev_for  = [_ev_label(e) for e in (thesis_snap.get("evidenceFor")    or [])][:3]
+    ev_ag   = [_ev_label(e) for e in (thesis_snap.get("evidenceAgainst") or [])][:2]
+
+    if alignment == "ALIGNED":
+        reasons.append(f"Setup direction ({s_dir}) matches active {t_dir} thesis")
+        reasons.append(f"Thesis state is {status} ({conf}% confidence)")
+        if ev_for:
+            reasons.append("Thesis evidence: " + ", ".join(ev_for))
+    elif alignment == "PARTIALLY_ALIGNED":
+        reasons.append(f"Setup direction ({s_dir}) matches thesis direction ({t_dir})")
+        if "FORMING" in status.upper():
+            reasons.append(f"Thesis still forming ({status}) — partial confirmation only")
+        else:
+            reasons.append(f"Thesis confidence ({conf}%) below strong threshold (70%)")
+    elif alignment == "NEUTRAL":
+        reasons.append("Thesis has no confirmed directional bias")
+        reasons.append("Setup proceeds on its own merits without thesis confirmation")
+    elif alignment == "CONFLICTING":
+        reasons.append(f"Setup direction ({s_dir}) opposes active {t_dir} thesis")
+        reasons.append(f"Thesis: {status} at {conf}% confidence")
+        if ev_for:
+            reasons.append("Thesis evidence for opposing direction: " + ", ".join(ev_for))
+        if ev_ag:
+            reasons.append("Note against thesis: " + ", ".join(ev_ag))
+    elif alignment == "INVALIDATED":
+        reasons.append(f"Thesis is in {status} state — no active support")
+        inv = thesis_snap.get("invalidationReason")
+        if inv:
+            reasons.append(f"Invalidation reason: {inv}")
+    elif alignment == "NO_THESIS":
+        reasons.append("No usable thesis exists for this instrument")
+        reasons.append("Failing open — setup evaluated without thesis confirmation")
+    return reasons
+
+
+def _build_thesis_gate_result(inst, thesis_snap, alignment, setup_direction,
+                               verdict, setup_id=None):
+    """Build the structured Phase-3 thesis gate result dict.
+
+    CRITICAL: This function NEVER modifies `verdict`.
+    The caller (full_analysis) decides whether to act on `action` based on mode.
+
+    Confidence adjustment caps (NOTE: these are DISPLAY-ONLY; they are NOT added
+    to edge_score to avoid double-counting indicators already in the gate):
+      ALIGNED:           +5 (thesis provides broad macro confirmation)
+      PARTIALLY_ALIGNED: +2
+      NEUTRAL:            0
+      CONFLICTING:      -10 (shadow display / enforced block)
+      INVALIDATED:     BLOCK in enforced; display-only in shadow
+    """
+    mode   = _THESIS_ENFORCEMENT_MODE
+    snap   = thesis_snap or {}
+    status = (snap.get("status")    or "NO_THESIS")
+    t_dir  = (snap.get("direction") or "")
+    conf   = int(snap.get("confidence") or 0)
+    tid    = (snap.get("thesisId")  or "")
+
+    # True gate action (what enforcement mode would do)
+    if alignment == "ALIGNED":
+        true_action = "ALLOW"
+        conf_adj    = THESIS_EVAL_MAX_CONF_ADJ_ALIGNED
+    elif alignment == "PARTIALLY_ALIGNED":
+        true_action = "ALLOW_WITHOUT_CONFIRMATION"
+        conf_adj    = THESIS_EVAL_MAX_CONF_ADJ_PARTIAL
+    elif alignment == "NEUTRAL":
+        true_action = "ALLOW_WITHOUT_CONFIRMATION"
+        conf_adj    = 0
+    elif alignment in ("CONFLICTING", "INVALIDATED"):
+        true_action = "BLOCK"
+        conf_adj    = (THESIS_EVAL_MAX_CONF_ADJ_CONFLICT
+                       if alignment == "CONFLICTING" else 0)
+    else:  # NO_THESIS — fail open
+        true_action = "ALLOW_WITHOUT_CONFIRMATION"
+        conf_adj    = 0
+
+    if mode == "shadow":
+        action        = "ALLOW"        # money path NEVER changed
+        shadow_action = true_action    # what enforcement WOULD do
+    elif mode == "enforced":
+        action        = true_action
+        shadow_action = true_action
+    else:  # "off"
+        action        = "ALLOW"
+        shadow_action = "ALLOW"
+
+    original_verdict = verdict
+    shadow_verdict   = "WAIT" if shadow_action == "BLOCK" else verdict
+    would_change     = (shadow_action == "BLOCK"
+                        and original_verdict not in (None, "WAIT"))
+
+    reasons = _thesis_gate_reasons(alignment, thesis_snap, setup_direction)
+
+    return {
+        "instrument":            inst,
+        "setup_id":              setup_id or ("TS-" + str(uuid.uuid4())[:8].upper()),
+        "thesis_id":             tid,
+        "thesis_state":          status,
+        "thesis_direction":      t_dir,
+        "setup_direction":       (setup_direction or ""),
+        "thesis_confidence":     conf,
+        "alignment":             alignment,
+        "enforcement_mode":      mode,
+        "action":                action,
+        "shadow_action":         shadow_action,
+        "confidence_adjustment": conf_adj,
+        "would_change_decision": would_change,
+        "original_verdict":      original_verdict,
+        "shadow_verdict":        shadow_verdict,
+        "reasons":               reasons,
+        "evaluated_at":          now_utc().isoformat(),
+    }
+
+
+def _compute_thesis_gate(inst, thesis_snap, strict, verdict, edge_score=None):
+    """Top-level Phase-3 gate called from full_analysis immediately after
+    _apply_thesis.
+
+    FAIL-OPEN: any exception returns {} so the money path is never blocked.
+    OFF mode:  returns {} immediately (money path byte-identical).
+
+    The caller must honour the return value:
+      - shadow:   attach to result["thesis_gate"]; NEVER change verdict
+      - enforced: gate["action"]=="BLOCK" → set verdict="WAIT"
+    """
+    if not _THESIS_EVAL_ENABLED or not inst:
+        return {}
+    try:
+        candidate   = (strict.get("candidate") or "") if strict else ""
+        setup_dir   = candidate.upper()
+        alignment   = _evaluate_thesis_alignment(thesis_snap, setup_dir)
+        gate        = _build_thesis_gate_result(
+            inst, thesis_snap, alignment, setup_dir, verdict)
+        if _THESIS_EVAL_DB_PERSIST_ENABLED and THESIS_EVAL_DB_READY:
+            _g = dict(gate)
+            _enqueue_slow(lambda g=_g: _persist_thesis_evaluation(g))
+        return gate
+    except Exception as _e:
+        logger.debug("_compute_thesis_gate fail-open [%s]: %s", inst, _e)
+        return {}
+
+
+# ── Stale-setup detection ─────────────────────────────────────────────────────
+
+_STALE_THESIS_TRANSITIONS = frozenset({
+    ("READY_LONG",  "INVALIDATED"), ("READY_SHORT",  "INVALIDATED"),
+    ("ACTIVE_LONG", "INVALIDATED"), ("ACTIVE_SHORT", "INVALIDATED"),
+    ("READY_LONG",  "READY_SHORT"), ("READY_SHORT",  "READY_LONG"),
+    ("READY_LONG",  "FORMING_SHORT"), ("READY_SHORT", "FORMING_LONG"),
+    ("ACTIVE_LONG", "READY_SHORT"),  ("ACTIVE_SHORT", "READY_LONG"),
+    ("ACTIVE_LONG", "FORMING_SHORT"), ("ACTIVE_SHORT", "FORMING_LONG"),
+})
+
+
+def _mark_setups_stale_for_inst(inst, prev_snap, new_snap):
+    """Record a stale-setup marker when the thesis invalidates or direction-flips.
+
+    Shadow mode: record only — no live broker orders are touched.
+    Enforced mode: _compute_thesis_gate will see STALE_SETUPS_BY_INST and apply
+    BLOCK to untriggered setups for this instrument.
+    FAIL-OPEN: never blocks the caller.
+    """
+    try:
+        prev_st = (prev_snap.get("status") or "NEUTRAL").upper()
+        new_st  = (new_snap.get("status")  or "NEUTRAL").upper()
+        if (prev_st, new_st) not in _STALE_THESIS_TRANSITIONS:
+            return
+
+        p_dir = "LONG" if "LONG" in prev_st else ("SHORT" if "SHORT" in prev_st else "")
+        n_dir = "LONG" if "LONG" in new_st  else ("SHORT" if "SHORT" in new_st  else "")
+        t_type = ("DIRECTION_FLIP" if (p_dir and n_dir and p_dir != n_dir)
+                  else "INVALIDATED")
+
+        marker = {
+            "transition_type":    t_type,
+            "previous_thesis_id": (prev_snap.get("thesisId") or ""),
+            "new_thesis_id":      (new_snap.get("thesisId")  or ""),
+            "prev_status":        prev_st,
+            "new_status":         new_st,
+            "stale_reason":       (
+                f"Thesis {t_type.lower().replace('_', ' ')} "
+                f"from {prev_st} to {new_st}"
+            ),
+            "enforcement_mode":   _THESIS_ENFORCEMENT_MODE,
+            "timestamp":          now_utc().isoformat(),
+            "shadow_only":        (_THESIS_ENFORCEMENT_MODE == "shadow"),
+        }
+        with THESIS_LOCK:
+            lst = STALE_SETUPS_BY_INST.setdefault(inst, [])
+            lst.append(marker)
+            if len(lst) > 20:
+                STALE_SETUPS_BY_INST[inst] = lst[-20:]
+        logger.debug("_mark_setups_stale [%s]: %s (%s→%s)", inst, t_type, prev_st, new_st)
+    except Exception as exc:
+        logger.debug("_mark_setups_stale fail-open [%s]: %s", inst, exc)
+
+
+# ── DB probe + persist ────────────────────────────────────────────────────────
+
+def _check_thesis_eval_db_ready():
+    """Probe thesis_trade_evaluations (no DDL). FAIL-OPEN."""
+    global THESIS_EVAL_DB_READY
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM thesis_trade_evaluations LIMIT 1")
+        THESIS_EVAL_DB_READY = True
+        logger.info("thesis_trade_evaluations table ready")
+    except Exception as exc:
+        logger.warning(
+            "thesis_trade_evaluations unavailable (Phase 3 eval persist disabled): %s", exc)
+
+
+def _persist_thesis_evaluation(gate):
+    """INSERT one thesis gate evaluation row into thesis_trade_evaluations.
+    FAIL-OPEN. Called async from _enqueue_slow so never blocks the webhook path."""
+    if not gate or not THESIS_EVAL_DB_READY:
+        return
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        import json as _json_p3
+        reasons_json = _json_p3.dumps(gate.get("reasons") or [])
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO thesis_trade_evaluations
+                   (instrument, setup_id, thesis_id, thesis_state,
+                    thesis_direction, setup_direction, thesis_confidence,
+                    alignment, enforcement_mode, original_verdict,
+                    shadow_verdict, gate_action, confidence_adjustment,
+                    would_change_decision, reasons)
+                   VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s,%s, %s,%s)
+                   ON CONFLICT DO NOTHING""",
+                (gate.get("instrument"), gate.get("setup_id"),
+                 gate.get("thesis_id"),  gate.get("thesis_state"),
+                 gate.get("thesis_direction"), gate.get("setup_direction"),
+                 gate.get("thesis_confidence"),
+                 gate.get("alignment"),  gate.get("enforcement_mode"),
+                 gate.get("original_verdict"), gate.get("shadow_verdict"),
+                 gate.get("action"),     gate.get("confidence_adjustment"),
+                 bool(gate.get("would_change_decision")),
+                 reasons_json),
+            )
+        logger.debug("thesis_eval persisted: %s %s %s",
+                     gate.get("instrument"), gate.get("alignment"), gate.get("action"))
+    except Exception as exc:
+        logger.debug("_persist_thesis_evaluation fail-open: %s", exc)
+
+
+# ── Stats aggregation for the shadow validation panel ─────────────────────────
+
+def _thesis_eval_stats(instrument=None):
+    """Aggregate Phase-3 stats from thesis_trade_evaluations.
+    Returns a safe dict with zero counts on any DB error (fail-open)."""
+    empty = {
+        "total": 0, "aligned": 0, "partially_aligned": 0,
+        "neutral": 0, "conflicting": 0, "invalidated": 0, "no_thesis": 0,
+        "would_block": 0, "would_upgrade": 0, "would_downgrade": 0,
+        "false_blocks": 0, "losses_avoided": 0,
+        "avg_r_aligned": None, "avg_r_conflicting": None,
+        "net_r_impact": None,
+        "enforcement_mode": _THESIS_ENFORCEMENT_MODE,
+        "db_ready": THESIS_EVAL_DB_READY,
+    }
+    if not THESIS_EVAL_DB_READY:
+        return empty
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return empty
+        where  = ""
+        params: list = []
+        if instrument and instrument.upper() != "ALL":
+            where  = "WHERE instrument = %s"
+            params = [instrument]
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT
+                    COUNT(*)                                                      AS total,
+                    COUNT(*) FILTER (WHERE alignment='ALIGNED')                  AS aligned,
+                    COUNT(*) FILTER (WHERE alignment='PARTIALLY_ALIGNED')        AS partially_aligned,
+                    COUNT(*) FILTER (WHERE alignment='NEUTRAL')                  AS neutral,
+                    COUNT(*) FILTER (WHERE alignment='CONFLICTING')              AS conflicting,
+                    COUNT(*) FILTER (WHERE alignment='INVALIDATED')              AS invalidated,
+                    COUNT(*) FILTER (WHERE alignment='NO_THESIS')                AS no_thesis,
+                    COUNT(*) FILTER (WHERE would_change_decision=TRUE)           AS would_block,
+                    COUNT(*) FILTER (WHERE confidence_adjustment > 0)            AS would_upgrade,
+                    COUNT(*) FILTER (WHERE confidence_adjustment < 0)            AS would_downgrade,
+                    COUNT(*) FILTER (WHERE would_change_decision=TRUE
+                                      AND target_hit=TRUE AND stop_hit=FALSE)    AS false_blocks,
+                    COUNT(*) FILTER (WHERE would_change_decision=TRUE
+                                      AND stop_hit=TRUE  AND target_hit=FALSE)   AS losses_avoided,
+                    AVG(result_r) FILTER (WHERE alignment='ALIGNED'
+                                           AND result_r IS NOT NULL)             AS avg_r_aligned,
+                    AVG(result_r) FILTER (WHERE alignment='CONFLICTING'
+                                           AND result_r IS NOT NULL)             AS avg_r_conflicting
+                FROM thesis_trade_evaluations {where}""",
+                params,
+            )
+            row = cur.fetchone()
+        if not row:
+            return empty
+
+        def _f(v):
+            return round(float(v), 2) if v is not None else None
+
+        avg_a = _f(row[12])
+        avg_c = _f(row[13])
+        net_r = round(avg_a - avg_c, 2) if (avg_a is not None and avg_c is not None) else None
+        return {
+            "total":             int(row[0]  or 0),
+            "aligned":           int(row[1]  or 0),
+            "partially_aligned": int(row[2]  or 0),
+            "neutral":           int(row[3]  or 0),
+            "conflicting":       int(row[4]  or 0),
+            "invalidated":       int(row[5]  or 0),
+            "no_thesis":         int(row[6]  or 0),
+            "would_block":       int(row[7]  or 0),
+            "would_upgrade":     int(row[8]  or 0),
+            "would_downgrade":   int(row[9]  or 0),
+            "false_blocks":      int(row[10] or 0),
+            "losses_avoided":    int(row[11] or 0),
+            "avg_r_aligned":     avg_a,
+            "avg_r_conflicting": avg_c,
+            "net_r_impact":      net_r,
+            "enforcement_mode":  _THESIS_ENFORCEMENT_MODE,
+            "db_ready":          True,
+        }
+    except Exception as exc:
+        logger.debug("_thesis_eval_stats fail-open: %s", exc)
+        return empty
+
+
+# ── Phase 3 routes ────────────────────────────────────────────────────────────
+
+@app.route("/thesis/stats", methods=["GET"])
+def get_thesis_stats():
+    """Owner-only (dashboard auth via Express; NOT in OPEN_PATHS).
+    Returns aggregate Phase-3 shadow-validation stats from thesis_trade_evaluations.
+    Used by the shadow validation panel on the thesis dashboard.
+    ?instrument=MNQ  to scope to one instrument (default: ALL)."""
+    inst = request.args.get("instrument", "ALL")
+    return jsonify({"ok": True, "stats": _thesis_eval_stats(inst)}), 200
+
+
+@app.route("/thesis/stale", methods=["GET"])
+def get_thesis_stale():
+    """Owner-only. Returns recent stale-setup markers for all instruments.
+    Informational endpoint for the shadow validation panel."""
+    with THESIS_LOCK:
+        out = {i: list(v) for i, v in STALE_SETUPS_BY_INST.items()}
+    return jsonify({
+        "ok":               True,
+        "stale_by_inst":    out,
+        "enforcement_mode": _THESIS_ENFORCEMENT_MODE,
+    }), 200
 
 # END THESIS HYSTERESIS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -36699,6 +37216,11 @@ def _build_status_payload(_tk):
         # full snapshot (confidence, status, age, evidence, reason codes) for the
         # dashboard briefing area and Discord cards.
         "thesis": a.get("thesis"),
+        # ── Phase 3: Thesis gate result — DISPLAY-ONLY ──────────────────────
+        # shadow mode: alignment + shadow_action + would_change_decision + reasons
+        # off mode:    None (gate not computed)
+        # enforced:    action=="BLOCK" already demoted verdict before we reach here
+        "thesis_gate": a.get("thesis_gate"),
     }
 
 
@@ -41881,6 +42403,11 @@ def dashboard():
 .th-tl-trans{margin:0 4px}
 .th-tl-reason{font-style:italic;color:#6a9}
 .th-loading{font-size:11px;color:#555;margin-top:4px}
+/* ── Thesis Shadow Validation Stats (Phase 3) ──────────────── */
+.th-stats-grid,.th-stats-breakdown{margin-top:6px}
+.th-stat-row{display:flex;justify-content:space-between;align-items:center;font-size:11px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.th-stat-lbl{color:#aaa}
+.th-stat-val{font-weight:700;font-family:monospace;min-width:36px;text-align:right}
 .th-neutral-txt{font-size:12px;color:#444}
 html[data-theme=retro] .th-card{background:rgba(0,20,0,.38);border-radius:4px}
 html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
@@ -43745,7 +44272,26 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
   <div class="mod-h" onclick="toggleMod(this)">&#x1F9E0; Market Thesis</div>
   <div class="mod-c">
     <div id="thesis-cards"></div>
-    <div id="thesis-empty" style="display:none;color:var(--dim,#555);font-size:12px;margin:6px 0">No thesis data yet — awaiting first webhook</div>
+    <div id="thesis-empty" style="display:none;color:var(--dim,#555);font-size:12px;margin:6px 0">No thesis data yet &#x2014; awaiting first webhook</div>
+    <!-- ── Phase 3: Shadow Validation sub-panel ── -->
+    <div id="thesis-shadow-val" style="margin-top:14px;border-top:1px solid var(--border,#1e2835);padding-top:10px">
+      <div style="font-size:11px;font-weight:600;color:var(--dim,#888);letter-spacing:.04em;text-transform:uppercase;margin-bottom:5px">&#x1F52C; Thesis Impact &#x2014; Shadow Validation</div>
+      <div id="thesis-shadow-mode" style="font-size:11px;color:var(--dim,#555);margin-bottom:6px"></div>
+      <div style="margin-bottom:6px">
+        <select id="thesis-stats-inst" style="font-size:11px;background:var(--panel,#0f1923);color:var(--fg,#cfd0e0);border:1px solid var(--border,#1e2835);padding:2px 6px;border-radius:3px" onchange="loadThesisStats()">
+          <option value="ALL">All instruments</option>
+          <option value="MGC">MGC</option>
+          <option value="MNQ">MNQ</option>
+          <option value="MES">MES</option>
+          <option value="MYM">MYM</option>
+        </select>
+      </div>
+      <div id="thesis-shadow-stats-wrap" style="display:none">
+        <div class="th-stats-grid" id="thesis-shadow-stats"></div>
+        <div class="th-stats-breakdown" id="thesis-shadow-breakdown"></div>
+      </div>
+      <div id="thesis-shadow-empty" style="font-size:11px;color:var(--dim,#555)">No evaluations yet &#x2014; setups evaluated in shadow mode appear here.</div>
+    </div>
   </div>
 </div>
 
@@ -52451,6 +52997,66 @@ function pollThesis() {
 }
 setInterval(pollThesis, 3000);
 setTimeout(pollThesis, 500);
+
+// ── THESIS SHADOW VALIDATION PANEL (Phase 3) ───────────────────────────────
+function loadThesisStats() {
+  var el = document.getElementById('thesis-stats-inst');
+  var inst = el ? el.value : 'ALL';
+  fetch('/api/thesis/stats?instrument=' + encodeURIComponent(inst))
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if(d.ok) renderThesisStats(d.stats); })
+    .catch(function(){});
+}
+function renderThesisStats(s) {
+  var modeEl  = document.getElementById('thesis-shadow-mode');
+  var wrapEl  = document.getElementById('thesis-shadow-stats-wrap');
+  var emptyEl = document.getElementById('thesis-shadow-empty');
+  var statsEl = document.getElementById('thesis-shadow-stats');
+  var bdownEl = document.getElementById('thesis-shadow-breakdown');
+  if (!modeEl || !statsEl) return;
+  var mode = ((s.enforcement_mode||'shadow').toUpperCase());
+  modeEl.textContent = 'Enforcement mode: ' + mode + (s.db_ready ? '' : ' \u2014 DB unavailable');
+  if (!s.total) {
+    if (wrapEl)  wrapEl.style.display  = 'none';
+    if (emptyEl) emptyEl.style.display = '';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (wrapEl)  wrapEl.style.display  = '';
+  var rows = [
+    ['Total Evaluated',    s.total,             '#cfd0e0'],
+    ['&#x2705; Aligned',   s.aligned,           '#2ecc71'],
+    ['&#x1F7E1; Partial',  s.partially_aligned, '#f39c12'],
+    ['&#x26AB; Neutral',   s.neutral,           '#555'],
+    ['&#x274C; Conflicting',s.conflicting,      '#e74c3c'],
+    ['&#x274C; Invalidated',s.invalidated,      '#9b59b6'],
+    ['&#x2B1C; No Thesis', s.no_thesis,         '#555']
+  ];
+  statsEl.innerHTML = rows.map(function(r){
+    return '<div class="th-stat-row"><span class="th-stat-lbl">'+r[0]+'</span>'
+      +'<span class="th-stat-val" style="color:'+r[2]+'">'+r[1]+'</span></div>';
+  }).join('');
+  var na = '&#x2014;';
+  function _r(v){ return v!=null ? v+'R' : na; }
+  function _rc(v){ return v>0?'#2ecc71':v<0?'#e74c3c':'#555'; }
+  var imp = [
+    ['Would Block',      s.would_block,     s.would_block>0?'#e74c3c':'#555'],
+    ['Would Upgrade',    s.would_upgrade,   s.would_upgrade>0?'#2ecc71':'#555'],
+    ['Would Downgrade',  s.would_downgrade, s.would_downgrade>0?'#f39c12':'#555'],
+    ['False Blocks',     s.false_blocks,    s.false_blocks>0?'#e74c3c':'#555'],
+    ['Losses Avoided',   s.losses_avoided,  s.losses_avoided>0?'#2ecc71':'#555'],
+    ['Avg R Aligned',    _r(s.avg_r_aligned),    _rc(s.avg_r_aligned)],
+    ['Avg R Conflict',   _r(s.avg_r_conflicting), _rc(s.avg_r_conflicting)],
+    ['Net R Impact',     s.net_r_impact!=null?(s.net_r_impact>0?'+':'')+s.net_r_impact+'R':na, _rc(s.net_r_impact)]
+  ];
+  bdownEl.innerHTML = '<div style="margin-top:8px;font-size:11px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:.04em">Impact Metrics</div>'
+    + imp.map(function(r){
+      return '<div class="th-stat-row"><span class="th-stat-lbl">'+r[0]+'</span>'
+        +'<span class="th-stat-val" style="color:'+r[2]+'">'+r[1]+'</span></div>';
+    }).join('');
+}
+setInterval(loadThesisStats, 30000);
+setTimeout(loadThesisStats, 1500);
 </script>
 </body>
 </html>"""
@@ -55121,6 +55727,7 @@ if __name__ == "__main__":
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
         _check_hysteresis_thesis_db_ready()        # probe hysteresis_thesis (no DDL; created via DB tool/publish diff) — THESIS PHASE 2 persistence
         _restore_thesis_states()                   # rehydrate thesis hysteresis state from DB (DISPLAY/INERTIA only; never submits a trade; stale rows skipped)
+        _check_thesis_eval_db_ready()              # probe thesis_trade_evaluations (no DDL; created via DB tool/publish diff) — THESIS PHASE 3 outcome recording
         _check_safety_overrides_db_ready()         # probe safety_overrides (no DDL; created via DB tool/publish diff) — runtime per-asset safety controls
         _load_safety_overrides_from_db()           # load operator safety overrides (FAIL-OPEN: a DB error keeps the tight protective defaults)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)

@@ -1,0 +1,387 @@
+PHASE 3 — MARKET THESIS ENFORCEMENT + OUTCOME VALIDATION
+
+Objective:
+Make the Market Thesis Hysteresis Engine actively evaluate every trade setup, while initially operating in SHADOW MODE so existing live behavior is not changed until results are verified.
+
+Do not add another major dashboard or unrelated strategy.
+Do not redesign the existing thesis engine.
+Build on Phase 1 and Phase 2.
+
+==================================================
+1. ADD THESIS ENFORCEMENT MODES
+==================================================
+
+Add a configurable environment setting:
+
+THESIS_ENFORCEMENT_MODE=shadow
+
+Supported values:
+
+off
+- Thesis engine is recorded and displayed only.
+- It has no effect on setups.
+
+shadow
+- Thesis engine evaluates every setup.
+- It records what it would have allowed, blocked, downgraded, or upgraded.
+- It must not change the actual existing verdict or prevent an order.
+
+enforced
+- Thesis alignment becomes part of the actual READY decision.
+- Conflicting or invalidated thesis states can block a setup.
+
+Default must be:
+
+THESIS_ENFORCEMENT_MODE=shadow
+
+Show the current mode clearly on the Thesis Dashboard.
+
+==================================================
+2. EVALUATE EVERY TRADE SETUP AGAINST THE THESIS
+==================================================
+
+Before any setup becomes READY, evaluate it against the current thesis for that exact instrument.
+
+Create a thesis alignment result with these possible values:
+
+ALIGNED
+PARTIALLY_ALIGNED
+NEUTRAL
+CONFLICTING
+INVALIDATED
+NO_THESIS
+
+Suggested decision rules:
+
+ALIGNED:
+- Trade direction matches thesis direction.
+- Thesis state is READY or ACTIVE.
+- Thesis confidence meets the required threshold.
+- Setup receives a positive thesis confirmation.
+
+PARTIALLY_ALIGNED:
+- Direction matches.
+- Thesis is still FORMING or confidence is below the strong threshold.
+- Setup may continue, but thesis does not provide full confirmation.
+
+NEUTRAL:
+- Thesis does not have a confirmed direction.
+- Existing setup logic continues unchanged in shadow mode.
+- In enforced mode, do not allow thesis confirmation credit.
+
+CONFLICTING:
+- Setup direction is opposite the thesis direction.
+- In shadow mode, record “WOULD BLOCK.”
+- In enforced mode, block the setup from becoming READY.
+
+INVALIDATED:
+- Thesis was invalidated or entered cooldown.
+- In shadow mode, record “WOULD BLOCK.”
+- In enforced mode, prevent the setup from becoming READY.
+
+NO_THESIS:
+- No usable thesis exists for the instrument.
+- Fail open in shadow mode.
+- In enforced mode, behavior should be configurable and default to fail open.
+
+==================================================
+3. CREATE A THESIS GATE RESULT
+==================================================
+
+Every evaluated setup must receive a structured thesis gate result:
+
+{
+  "instrument": "MNQ",
+  "setup_id": "...",
+  "thesis_id": "...",
+  "thesis_state": "READY",
+  "thesis_direction": "LONG",
+  "setup_direction": "LONG",
+  "thesis_confidence": 82,
+  "alignment": "ALIGNED",
+  "enforcement_mode": "shadow",
+  "action": "ALLOW",
+  "shadow_action": "ALLOW",
+  "confidence_adjustment": 5,
+  "reasons": [
+    "Setup direction matches the active bullish thesis",
+    "Thesis state is READY",
+    "Bullish structure and CVD remain supportive"
+  ],
+  "evaluated_at": "ISO_TIMESTAMP"
+}
+
+Possible action values:
+
+ALLOW
+ALLOW_WITHOUT_CONFIRMATION
+DOWNGRADE
+BLOCK
+
+In shadow mode, preserve the original setup decision and separately record:
+
+shadow_action
+would_change_decision
+original_verdict
+shadow_verdict
+
+==================================================
+4. ADD THESIS INFORMATION TO EVERY TRADE CARD
+==================================================
+
+Add a compact “Thesis Gate” section to existing trade cards.
+
+Display:
+
+Thesis ID
+Thesis state
+Thesis direction
+Thesis confidence
+Setup/thesis alignment
+Enforcement mode
+Gate action
+Confidence adjustment
+Reasons for the decision
+
+Example:
+
+THESIS GATE: ALIGNED
+Bullish READY thesis | 84% confidence
+Setup direction: LONG
+Mode: SHADOW
+Decision: WOULD ALLOW
+Adjustment: +5 confidence
+
+If conflicting:
+
+THESIS GATE: CONFLICTING
+Active thesis direction: SHORT
+Setup direction: LONG
+Mode: SHADOW
+Decision: WOULD BLOCK
+Reason: Setup opposes the active market thesis
+
+Do not hide this under the Advanced toggle.
+
+==================================================
+5. PREVENT STALE SETUPS
+==================================================
+
+When a meaningful thesis transition occurs:
+
+READY → INVALIDATED
+ACTIVE → INVALIDATED
+LONG → SHORT
+SHORT → LONG
+
+Find open internal setups for the same instrument.
+
+Mark untriggered setups as:
+
+STALE_THESIS
+
+Record:
+
+previous_thesis_id
+new_thesis_id
+transition_type
+stale_reason
+timestamp
+
+During shadow mode:
+- Only mark and report what would happen.
+- Do not cancel live broker orders.
+- Do not change existing live execution behavior.
+
+During enforced mode:
+- Prevent stale, untriggered internal setups from becoming READY.
+- Do not automatically cancel a live broker order unless a separate explicit safety setting is enabled in the future.
+
+==================================================
+6. RECORD THESIS-TO-TRADE OUTCOMES
+==================================================
+
+Create persistence for every setup evaluated by the thesis engine.
+
+Suggested table:
+
+thesis_trade_evaluations
+
+Fields:
+
+id
+instrument
+setup_id
+trade_id
+thesis_id
+thesis_state
+thesis_direction
+setup_direction
+thesis_confidence
+alignment
+enforcement_mode
+original_verdict
+shadow_verdict
+gate_action
+confidence_adjustment
+entry_price
+stop_price
+target_price
+triggered
+target_hit
+stop_hit
+result_r
+maximum_favorable_excursion
+maximum_adverse_excursion
+created_at
+resolved_at
+
+Fail open if the database is unavailable.
+
+Do not allow database errors to stop setup evaluation or market processing.
+
+==================================================
+7. ADD A PHASE 3 VALIDATION PANEL
+==================================================
+
+Add a small section to the existing Thesis Dashboard called:
+
+“Thesis Impact — Shadow Validation”
+
+Show:
+
+Total setups evaluated
+Aligned setups
+Conflicting setups
+Would-have-blocked setups
+Would-have-upgraded setups
+Would-have-downgraded setups
+Win rate when aligned
+Win rate when conflicting
+Average R when aligned
+Average R when conflicting
+False blocks
+Losses avoided
+Net hypothetical R impact
+
+Filters:
+
+Instrument
+Strategy
+Direction
+Date range
+Thesis state
+Alignment result
+
+This should use the existing dashboard design.
+Do not create a separate new dashboard page unless technically necessary.
+
+==================================================
+8. DEFINE FALSE BLOCKS AND LOSSES AVOIDED
+==================================================
+
+Loss avoided:
+- Shadow thesis action was BLOCK.
+- Original setup would have triggered.
+- Original setup hit its stop before its target.
+
+False block:
+- Shadow thesis action was BLOCK.
+- Original setup would have triggered.
+- Original setup reached its target before its stop.
+
+Record both clearly so the thesis engine cannot appear successful simply because it blocked more trades.
+
+==================================================
+9. DO NOT DOUBLE-COUNT CONFIDENCE
+==================================================
+
+Audit the existing scoring pipeline.
+
+If thesis evidence is already derived from:
+
+structure
+VWAP
+CVD
+liquidity sweep
+volume
+trend
+zones
+
+Do not blindly add the same evidence to the setup score twice.
+
+The thesis adjustment must represent the stability and agreement of the broader thesis, not duplicate every underlying indicator.
+
+Cap thesis confidence adjustment:
+
+Strong alignment: maximum +5
+Partial alignment: maximum +2
+Neutral: 0
+Conflict: maximum -10 in shadow calculations
+Invalidated: BLOCK in enforced mode
+
+Keep current scoring behavior unchanged while mode is shadow.
+
+==================================================
+10. DISCORD BEHAVIOR
+==================================================
+
+Do not send a Discord alert for every thesis evaluation.
+
+Only include the Thesis Gate section inside an existing READY trade alert.
+
+Continue sending thesis transition alerts from Phase 2.
+
+For shadow-blocked READY alerts, add:
+
+“SHADOW THESIS RESULT: This setup would have been blocked because…”
+
+Do not prevent the existing alert from firing while in shadow mode.
+
+==================================================
+11. TESTS
+==================================================
+
+Add Phase 3 tests covering at minimum:
+
+Aligned LONG setup with LONG READY thesis
+Aligned SHORT setup with SHORT ACTIVE thesis
+LONG setup conflicting with SHORT thesis
+SHORT setup conflicting with LONG thesis
+FORMING thesis produces partial alignment
+NEUTRAL thesis behavior
+INVALIDATED thesis behavior
+COOLDOWN thesis behavior
+Missing thesis fails open
+Database unavailable fails open
+Shadow mode does not change original verdict
+Enforced mode blocks conflicting setup
+Direction flip marks untriggered setup stale
+Duplicate evaluations are not created
+Thesis evidence does not receive unlimited score stacking
+Outcome correctly identifies a false block
+Outcome correctly identifies a loss avoided
+Dashboard statistics calculate correctly
+
+All Phase 1 and Phase 2 tests must continue passing.
+
+==================================================
+12. COMPLETION REPORT
+==================================================
+
+When finished, provide:
+
+1. Files created
+2. Files modified
+3. Database migration details
+4. API routes added or changed
+5. Exact location where thesis evaluation enters the trade pipeline
+6. Confirmation that shadow mode cannot change live decisions
+7. Number of Phase 3 tests
+8. Total tests passing
+9. Screenshot of the Thesis Gate on a trade card
+10. Screenshot of the Thesis Impact validation section
+
+Do not enable enforced mode automatically.
+
+Phase 3 is complete only when every existing setup is evaluated and recorded in shadow mode without changing current trading behavior.

@@ -212,10 +212,12 @@ export const BOT1_ROUTES = [
   "/academy/rules/:id/status",
   "/academy/metrics",
   "/academy/ask",
-  // Persistent Market Thesis (Phase 2) — owner-only; DISPLAY-ONLY; NOT in
-  // dashboard-auth OPEN_PATHS. Returns current thesis snapshots for all
-  // enabled instruments plus per-instrument transition history.
+  // Persistent Market Thesis (Phase 2 + Phase 3) — owner-only; DISPLAY-ONLY; NOT in
+  // dashboard-auth OPEN_PATHS. Returns thesis snapshots, history, and Phase-3
+  // shadow-validation stats / stale-setup markers.
   "/thesis",
+  "/thesis/stats",
+  "/thesis/stale",
   "/thesis/:instrument",
   "/thesis/:instrument/history",
 ];

@@ -149,3 +149,4 @@
 - [Operator Mode UI](operator-mode-ui.md) — conversational Brain interface at `/`; auth=localStorage Basic Auth; narration=main_brain_voice; chat=/assistant; Engineering=/api/dashboard.
 - [Swing Mode V2 engine](swing-mode-v2.md) — flag-gated (SWING_MODE_V2_ENABLED default-OFF) 9-category 0-100 HTF swing scorer + SCANNING→READY lifecycle + entry/stop/3-target plan; Tier-1=live HTF data, Tier-2=Pine EMA/RSI/MACD/ADX via SWING_EMA_UPDATE webhook; /swing-analysis route + /status whitelisted; goldens byte-identical.
 - [Persistent thesis + hysteresis](thesis-hysteresis.md) — confidence-inertia layer over evaluate_strict_setup; reversal flip needs prev=None reset before needs_new; 4 integration points; 16 tests; flag-OFF byte-identical.
+- [Phase 3 Thesis Enforcement](thesis-phase3-enforcement.md) — shadow gate evaluates READY vs thesis, display-only by default; enforced demotes; confidence_adj is NEVER added to edge_score.
