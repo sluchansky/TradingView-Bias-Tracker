@@ -42690,11 +42690,13 @@ def dashboard():
 html[data-theme=retro] .th-card{background:rgba(0,20,0,.38);border-radius:4px}
 html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 /* ── Unified Dashboard: 5-section live-nav ── */
-#live-nav{display:none;flex-direction:row;gap:4px;padding:6px 0 10px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+#live-nav{display:none;flex-direction:row;gap:5px;padding:8px 0 6px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;max-width:100%}
 #live-nav::-webkit-scrollbar{display:none}
-.ln-btn{flex:0 0 auto;padding:5px 13px;border-radius:16px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:10px;font-weight:700;letter-spacing:.9px;cursor:pointer;font-family:var(--sans);text-transform:uppercase;transition:all .15s;white-space:nowrap}
-.ln-btn:hover{color:var(--text);border-color:var(--border-lit)}
-.ln-btn.active{background:rgba(217,119,6,.18);color:#f59e0b;border-color:rgba(245,158,11,.4)}
+.ln-btn{flex:0 0 auto;padding:6px 16px;border-radius:20px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04);color:#6b7280;font-size:10px;font-weight:700;letter-spacing:.9px;cursor:pointer;font-family:var(--sans);text-transform:uppercase;transition:background .2s,color .2s,border-color .2s,box-shadow .2s;white-space:nowrap;outline:none;user-select:none}
+.ln-btn:hover{color:var(--text);border-color:rgba(255,255,255,.18);background:rgba(255,255,255,.08)}
+.ln-btn:focus-visible{outline:2px solid rgba(245,158,11,.6);outline-offset:2px}
+.ln-btn.active,.ln-btn[aria-selected=true]{background:rgba(245,158,11,.18);color:#fbbf24;border-color:rgba(245,158,11,.55);box-shadow:0 0 10px rgba(245,158,11,.22),inset 0 1px 0 rgba(245,158,11,.12)}
+#live-nav-heading{display:none;padding:2px 0 10px;font-size:10px;font-weight:700;letter-spacing:2.5px;color:var(--muted);text-transform:uppercase;border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:10px}
 /* ── High-Volume Sessions panel ── */
 #mod-hvsessions .hvs-win{border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:7px;background:var(--panel)}
 #mod-hvsessions .hvs-win.hvs-active{border-color:var(--green,#34e3a4);background:rgba(52,227,164,.07)}
@@ -42763,13 +42765,14 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 <div id="view-live">
 
 <!-- ── Unified Dashboard: 5-section live-nav (shown when UNIFIED_DASH=1) ── -->
-<div id="live-nav">
-  <button class="ln-btn active" data-sec="overview" onclick="setLiveSection('overview')">Overview</button>
-  <button class="ln-btn" data-sec="brain" onclick="setLiveSection('brain')">Brain</button>
-  <button class="ln-btn" data-sec="analysis" onclick="setLiveSection('analysis')">Analysis</button>
-  <button class="ln-btn" data-sec="journal" onclick="setLiveSection('journal')">Journal</button>
-  <button class="ln-btn" data-sec="controls" onclick="setLiveSection('controls')">Controls</button>
+<div id="live-nav" role="tablist" aria-label="Dashboard sections">
+  <button class="ln-btn active" data-sec="overview" role="tab" aria-selected="true" onclick="setLiveSection('overview')">Overview</button>
+  <button class="ln-btn" data-sec="brain" role="tab" aria-selected="false" onclick="setLiveSection('brain')">Brain</button>
+  <button class="ln-btn" data-sec="analysis" role="tab" aria-selected="false" onclick="setLiveSection('analysis')">Analysis</button>
+  <button class="ln-btn" data-sec="journal" role="tab" aria-selected="false" onclick="setLiveSection('journal')">Journal</button>
+  <button class="ln-btn" data-sec="controls" role="tab" aria-selected="false" onclick="setLiveSection('controls')">Controls</button>
 </div>
+<div id="live-nav-heading">Overview</div>
 
 <!-- Sensitivity (trading mode) -->
 <div id="mode-row">
@@ -50292,20 +50295,83 @@ function onEdgeBdToggle(el){ try{ localStorage.setItem('edgeBdCollapsed', el.ope
 // ── Unified Dashboard: 5-section live-nav ──────────────────────────────────
 // DISPLAY-ONLY feature. Never touches the money path, gate, or execution flow.
 var UNIFIED_DASH = ('__UNIFIED_DASH__' === '1');
+// DISPLAY-ONLY section map — never touches the money path.
+// Keys are the 5 tab names; values are the panel IDs shown in that tab.
+// Panels not listed here are never hidden (always visible).
 var _liveNavSections = {
-  overview: ['mod-data-feed','mod-real-results'],
-  brain: ['mod-mb-voice','mod-mb-predictions','mod-mb-confidence','mod-mb-narrative',
-    'mod-mb-events','mod-mb-thesis','mod-mb-daytype','mod-mb-learning','mod-assistant'],
-  analysis: ['mod-chartprev','mod-cvd','mod-mi','mod-scores','mod-prob','mod-checklist',
-    'mod-countdown','mod-whynot','mod-fastentry','mod-xmarket','mod-strategy',
-    'mod-report','mod-analyst','mod-pro','mod-entryq','mod-debate','mod-scalpdiag',
-    'mod-swingdiag','mod-swingstrat','mod-breakout','mod-scalp-advisory',
-    'mod-stalk-mode','mod-active-thinking','mod-dual-sim','mod-microscalp',
-    'mod-review','mod-rule-engine','mod-hvsessions'],
-  journal: ['mod-equity','mod-trades','mod-news','mod-sessionq','mod-trademgmt'],
-  controls: ['mod-prop','mod-training','mod-bothold','mod-atm','mod-liverunner',
-    'mod-autoexit','mod-learning','mod-governor','mod-memory','mod-exec-reject',
-    'mod-broker-send-log']
+  // Quick status: sensitivity, current verdict, active trade summary, HV windows
+  overview: [
+    'mod-brain',          // Main Brain compact hub
+    'mod-data-feed',      // Data Feed / Sensitivity / Mode
+    'mod-real-results',   // Real Account Results
+    'mod-hvsessions'      // High-Volume Session Windows
+  ],
+  // AI reasoning: checklists, analyst layers, memory, advisory overlays
+  brain: [
+    'mod-checklist',      // AI Trade Checklist (live recommendation)
+    'mod-microscalp',     // Micro Scalp Brain
+    'mod-countdown',      // Setup Countdown
+    'mod-whynot',         // Why Not Ready
+    'mod-analyst',        // Unified Analyst Report
+    'mod-pro',            // Professional Review
+    'mod-entryq',         // Entry Quality
+    'mod-debate',         // Trade Debate
+    'mod-strategy',       // Strategy Engine
+    'mod-governor',       // Confidence Governor
+    'mod-memory',         // Trade Memory
+    'mod-mb-voice',       // Analyst Voice
+    'mod-mb-predictions', // Forward Odds
+    'mod-mb-confidence',  // Confidence Over Time
+    'mod-mb-narrative',   // Session Story
+    'mod-mb-events',      // Events Timeline
+    'mod-mb-thesis',      // Thesis Tracker
+    'mod-mb-daytype',     // Day Type
+    'mod-mb-learning',    // Learning Stats
+    'mod-assistant',      // AI Assistant chat
+    'mod-scalp-advisory', // Strategy Advisory
+    'mod-stalk-mode',     // Stalk Mode (pre-entry)
+    'mod-active-thinking' // Active Trade Thinking (in-trade)
+  ],
+  // Market analysis: structure, volume, volatility, diagnostics, simulations
+  analysis: [
+    'mod-chartprev',      // Live Chart Preview
+    'mod-cvd',            // Volume Delta (CVD) & RVOL
+    'mod-mi',             // Market Intelligence (structure / supply-demand)
+    'mod-scores',         // Long vs Short Score
+    'mod-prob',           // Trade Probability Meter
+    'mod-fastentry',      // Fast Entry Trigger
+    'mod-xmarket',        // Index Alignment
+    'mod-scalpdiag',      // SCALP Diagnostics
+    'mod-swingdiag',      // SWING Diagnostics
+    'mod-swingstrat',     // SWING Strategy filter
+    'mod-breakout',       // 9:30 Breakout Mode
+    'mod-swing-v2',       // Swing V2 engine
+    'mod-dual-sim',       // Dual Shadow Simulator
+    'mod-report'          // Analysis Report
+  ],
+  // Performance & history: trades, P&L, learning, lessons, thesis
+  journal: [
+    'mod-equity',         // Equity Curve · Today
+    'mod-trades',         // Today's Trades log
+    'mod-news',           // News Filter
+    'mod-sessionq',       // Session Quality
+    'mod-trademgmt',      // Trade Management
+    'mod-learning',       // Adaptive Learning
+    'mod-thesis',         // Market Thesis / lessons learned
+    'mod-review',         // Trade Idea Review
+    'mod-rule-engine'     // Learning Rule Engine
+  ],
+  // Toggles & execution: broker, auto-trade, training, safety
+  controls: [
+    'mod-prop',           // Prop Firm Protection
+    'mod-training',       // Bot Training Mode
+    'mod-bothold',        // Bot Hold Score
+    'mod-atm',            // Active Trade Management
+    'mod-liverunner',     // LIVE Runner
+    'mod-autoexit',       // Auto Early-Exit
+    'mod-exec-reject',    // Blocked Orders log
+    'mod-broker-send-log' // Broker Send Log
+  ]
 };
 var _liveNavAllIds = (function(){
   var r=[];
@@ -50316,22 +50382,34 @@ var _liveNavAllIds = (function(){
 })();
 function setLiveSection(sec) {
   if (!UNIFIED_DASH) return;
+  // Persist selection across refreshes
   try { localStorage.setItem('live_section', sec); } catch(e) {}
-  // Update nav button active state
+  // Update pill active state + aria-selected (accessibility)
+  var activeBtn = null;
   document.querySelectorAll('#live-nav .ln-btn').forEach(function(b) {
-    b.classList.toggle('active', b.dataset.sec === sec);
+    var isActive = (b.dataset.sec === sec);
+    b.classList.toggle('active', isActive);
+    b.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    if (isActive) activeBtn = b;
   });
+  // Scroll active pill into view on mobile (no-op on desktop)
+  if (activeBtn) { try { activeBtn.scrollIntoView({block:'nearest',inline:'nearest',behavior:'smooth'}); } catch(e) {} }
+  // Update section heading displayed below the pills
+  var heading = document.getElementById('live-nav-heading');
+  if (heading) {
+    var labels = {overview:'Overview',brain:'Brain',analysis:'Analysis',journal:'Journal',controls:'Controls'};
+    heading.textContent = labels[sec] || sec;
+  }
   // Show/hide individually managed panels.
-  // NOTE: we never hide parent containers (#live-layout, #bl-bottom,
+  // IMPORTANT: never hide parent containers (#live-layout, #bl-bottom,
   // #bl-drawer-row) — hiding a parent makes child show/hide a no-op.
-  // The verdict brain stays visible in every section as the anchor.
+  // The verdict/brain area stays visible in every section as the anchor.
   var active = _liveNavSections[sec] || [];
   _liveNavAllIds.forEach(function(id) {
     var el = document.getElementById(id);
     if (!el) return;
     var show = (active.indexOf(id) !== -1);
     if (show) {
-      // Restore whatever the panel's natural display was before we hid it
       el.style.display = (el._liveOrigDisplay !== undefined) ? (el._liveOrigDisplay || '') : '';
     } else {
       if (el._liveOrigDisplay === undefined) el._liveOrigDisplay = el.style.display || '';
@@ -50339,10 +50417,33 @@ function setLiveSection(sec) {
     }
   });
 }
+// Keyboard navigation: left/right arrows move between tabs
+function _liveNavKeydown(e) {
+  if (!UNIFIED_DASH) return;
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+  e.preventDefault();
+  var keys = ['overview','brain','analysis','journal','controls'];
+  var cur = null;
+  document.querySelectorAll('#live-nav .ln-btn').forEach(function(b){ if(b.classList.contains('active')) cur = b.dataset.sec; });
+  var idx = keys.indexOf(cur);
+  if (idx === -1) idx = 0;
+  var next = (e.key === 'ArrowRight' || e.key === 'ArrowDown')
+    ? keys[(idx+1) % keys.length]
+    : keys[(idx + keys.length - 1) % keys.length];
+  setLiveSection(next);
+  // Move focus to newly active button
+  var btn = document.querySelector('#live-nav .ln-btn[data-sec="'+next+'"]');
+  if (btn) btn.focus();
+}
 function initUnifiedDash() {
   if (!UNIFIED_DASH) return;
   var nav = document.getElementById('live-nav');
-  if (nav) nav.style.display = 'flex';
+  if (nav) {
+    nav.style.display = 'flex';
+    nav.addEventListener('keydown', _liveNavKeydown);
+  }
+  var heading = document.getElementById('live-nav-heading');
+  if (heading) heading.style.display = 'block';
   var saved = 'overview';
   try { saved = localStorage.getItem('live_section') || 'overview'; } catch(e) {}
   setLiveSection(saved);

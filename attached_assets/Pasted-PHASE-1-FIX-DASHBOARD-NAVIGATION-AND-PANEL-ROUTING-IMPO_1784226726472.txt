@@ -1,0 +1,180 @@
+PHASE 1: FIX DASHBOARD NAVIGATION AND PANEL ROUTING
+
+IMPORTANT:
+Do not change trading logic, alerts, scoring, webhooks, auto-trading, backend calculations, or database behavior.
+
+This phase is only for fixing the top navigation pills and separating the dashboard into real sections.
+
+GOAL:
+The existing pills:
+
+OVERVIEW
+BRAIN
+ANALYSIS
+JOURNAL
+CONTROLS
+
+must behave as actual dashboard sections.
+
+REQUIREMENTS:
+
+1. Only one section may be active at a time.
+
+2. Clicking a pill must render only the panels assigned to that section.
+
+3. The selected pill must remain clearly highlighted.
+
+4. Add a visible section heading directly below the pills.
+
+Example:
+
+BRAIN selected
+
+Heading:
+BRAIN
+
+Visible content:
+Only Brain panels
+
+5. Do not make the pills simply scroll to content.
+
+6. Do not leave every panel rendered underneath the selected section.
+
+7. Preserve current instrument, sensitivity, alert, and trading-control state when switching sections.
+
+8. Save the selected section in localStorage so it remains selected after refresh.
+
+Use this section structure:
+
+type DashboardSection =
+  | "overview"
+  | "brain"
+  | "analysis"
+  | "journal"
+  | "controls";
+
+9. Add accessibility support:
+
+- aria-selected="true" on the active pill
+- keyboard navigation between pills
+- visible focus state
+
+10. Active pill styling:
+
+- brighter or filled background
+- accent border
+- high-contrast text
+- optional subtle glow
+
+Inactive pills:
+
+- darker background
+- muted text
+- no glow
+
+11. Mobile requirements:
+
+- pills may scroll horizontally
+- selected pill must remain visible
+- no page-level horizontal overflow
+- one-column layout
+- no clipped pill text
+
+PANEL SECTION MAPPING:
+
+OVERVIEW:
+- Sensitivity
+- Current Status
+- Live Recommendation
+- Current active trade
+- Compact market summary
+- Compact readiness explanation
+
+BRAIN:
+- AI Trade Checklist
+- Micro Scalp Brain
+- Setup Countdown
+- Why Not Ready
+- Unified Analyst Report
+- Analyst Mode
+- Professional Review
+- Entry Quality
+- Trade Debate
+- Strategy Engine
+- Confidence Governor
+- Trade Memory
+
+ANALYSIS:
+- Market structure
+- VWAP
+- Volume
+- Liquidity
+- Supply and demand
+- Order flow
+- Volatility
+- Strategy diagnostics
+
+JOURNAL:
+- Trade history
+- Performance Report
+- Adaptive Learning
+- Simulated trades
+- Ghost trades
+- Lessons learned
+- Similar historical trades
+
+CONTROLS:
+- Instrument selection
+- Focus instruments
+- Alert toggles
+- Auto-trade toggles
+- Setup bell
+- Test alert
+- Retro mode
+- Advisor mode
+- Advanced panels
+- Reset layout
+- Discord controls
+- Broker/webhook controls
+- Sensitivity settings
+
+IMPLEMENTATION:
+
+Create one centralized section mapping.
+
+Do not scatter many independent visibility checks throughout the code.
+
+Example:
+
+const dashboardSections = {
+  overview: [...],
+  brain: [...],
+  analysis: [...],
+  journal: [...],
+  controls: [...]
+};
+
+Do not delete or consolidate any panels yet.
+
+This phase is only about correctly routing the existing panels into the five sections.
+
+ACCEPTANCE TESTS:
+
+1. Dashboard opens on Overview.
+2. Only Overview panels are visible.
+3. Selecting Brain displays only Brain panels.
+4. Selecting Analysis displays only Analysis panels.
+5. Selecting Journal displays only Journal panels.
+6. Selecting Controls displays only Controls panels.
+7. Refreshing preserves the selected section.
+8. Mobile has no horizontal page overflow.
+9. Trading and alert behavior remains unchanged.
+
+FINAL RESPONSE:
+
+Report:
+- files changed
+- section mapping used
+- mobile test result
+- desktop test result
+- confirmation that trading logic was untouched
