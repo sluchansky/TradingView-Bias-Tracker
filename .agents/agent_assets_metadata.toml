@@ -29,3 +29,9 @@ id = "MLkfHV4LBsgQTJ-EpTvv3"
 uri = "file://artifacts/shawn-roast/public/audio/bg_music.mp3"
 type = "audio"
 title = "breaking news background music"
+
+[[outputs]]
+id = "qFIAn1APV_r8BNHrCau1J"
+uri = "file://dashboard-panel-inventory.md"
+type = "text"
+title = "Dashboard Panel Inventory — Phase 1.2"
