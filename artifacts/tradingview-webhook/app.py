@@ -42047,7 +42047,8 @@ def dashboard():
   .cp-btn.active{background:#2563eb;border-color:#2563eb;color:#fff}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
-  html:not([data-adv="1"]) #view-live .mod:not(#mod-brain):not(#mod-data-feed):not(#mod-real-results):not(#mod-ai-decision-center):not(#mod-analysis-groups):not(#mod-journal-groups):not(#mod-news):not(#mod-rule-engine):not(#mod-controls-groups):not(#mod-prop):not(#mod-hvsessions):not(#mod-chartprev):not(#mod-cvd):not(#mod-scalpdiag):not(#mod-swingdiag):not(#mod-microscalp):not(#mod-mb-predictions):not(#mod-mb-narrative):not(#mod-equity):not(#mod-trades):not(#mod-thesis):not(#mod-review):not(#mod-mb-thesis):not(#mod-exec-reject):not(#mod-broker-send-log):not(#mod-mb-confidence):not(#mod-mi):not(#mod-fastentry):not(#mod-xmarket):not(#mod-breakout):not(#mod-swing-v2):not(#mod-dual-sim):not(#mod-scalp-advisory):not(#mod-stalk-mode):not(#mod-active-thinking):not(#mod-bothold):not(#mod-atm):not(#mod-liverunner):not(#mod-autoexit):not(.mb-hidden){display:none !important}
+  html:not([data-adv="1"]) #view-live .mod[data-cat="advanced"],
+  html:not([data-adv="1"]) #view-live .mod[data-cat="experimental"]{display:none !important}
 
   #adv-row{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
   #adv-toggle{cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none}
@@ -43016,7 +43017,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   </div>
   <!-- ════ Data Feed Status — alert timing + yfinance bid/ask/volume/day stats
        (DISPLAY-ONLY; never gates trades unless DATA_STALENESS_GATE_ENABLED=1). ════ -->
-  <div class="mod" id="mod-data-feed">
+  <div class="mod" id="mod-data-feed" data-cat="primary">
     <div class="mod-h">📡 Data Feed
       <span id="dfs-mode-badge" style="font-size:10px;font-weight:700;letter-spacing:1.2px;padding:2px 8px;border-radius:8px;background:#14532d;color:#22c55e;margin-left:6px">LOADING…</span>
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">DATA MODE</span>
@@ -43039,7 +43040,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
        The proxy-feed panels below (Equity Curve, Today's Trades, Learning Stats)
        are SIMULATIONS off a price proxy and are labelled SIMULATED. DISPLAY-ONLY —
        this panel never touches the gate, scoring, sizing or the broker. ════ -->
-  <div class="mod" id="mod-real-results">
+  <div class="mod" id="mod-real-results" data-cat="primary">
     <div class="mod-h">💰 Real Account Results
       <span style="font-size:10px;color:#22c55e;letter-spacing:1.5px">BROKER FILLS</span>
       <span id="rr-asof" style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">—</span>
@@ -43186,7 +43187,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
-  <div class="mod" id="mod-brain">
+  <div class="mod" id="mod-brain" data-cat="primary">
     <div class="mod-h mb-av-handle"><span class="mb-av-handle-lbl">🧠 Main Brain</span><span id="mb-badge" class="mb-badge" style="display:none">…</span></div>
     <div class="mb-av" id="mb-av">
       <div class="mb-orb" id="mb-orb">
@@ -43436,7 +43437,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
        Pure view layer for visual confirmation next to the bot's verdict. It never
        reads into or feeds the gate, alerts, tracking, ENTER eligibility or any
        webhook/broker logic. Symbol/timeframe persist per device (localStorage). ════ -->
-  <div class="mod" id="mod-chartprev">
+  <div class="mod" id="mod-chartprev" data-cat="detail">
     <div class="mod-h">📈 Live Chart Preview
       <span id="cp-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:6px">&mdash;</span>
       <span style="font-size:10px;color:#6b7280;letter-spacing:1px;margin-left:auto">VIEW-ONLY</span>
@@ -43463,7 +43464,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
        with hysteresis, momentum + confidence decay, and (once the money-path flags are on)
        surfaces allowed/blocked strategies and why a trade was accepted/rejected. The renderer
        hides the whole panel when the block is absent (master flag OFF). ════ -->
-  <div class="mod" id="mod-mi" style="display:none">
+  <div class="mod" id="mod-mi" data-cat="experimental" style="display:none">
     <div class="mod-h">🧭 Market Intelligence <span id="mi-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
     <div class="se-top">
       <div class="gstat"><div class="l">Market State</div><div class="v" id="mi-state">—</div></div>
@@ -43518,7 +43519,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      Consolidated Brain view: all AI engine outputs in one panel with an
      internal tab bar. Data comes from the same /status poll that drives
      the individual panels. DISPLAY-ONLY — never touches money path. -->
-<div class="mod" id="mod-ai-decision-center">
+<div class="mod" id="mod-ai-decision-center" data-cat="primary">
   <div class="mod-h">&#129504; AI Decision Center<span class="mod-cat cat-primary">PRIMARY</span></div>
   <!-- Top summary: verdict + key context at a glance -->
   <div class="adc-sum">
@@ -43574,7 +43575,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 <!-- ── Phase 3: Analysis Groups — primary Analysis section view (DISPLAY-ONLY).
      5 collapsible evidence sections rendered from the same /status poll.
      Individual analysis panels remain in this section, visible when Advanced is ON. -->
-<div class="mod" id="mod-analysis-groups">
+<div class="mod" id="mod-analysis-groups" data-cat="primary">
   <div class="mod-h">Market Analysis<span class="mod-cat cat-primary">PRIMARY</span></div>
   <details class="grp-details" id="ag-struct-det" open>
     <summary class="grp-summary"><span class="grp-title">Structure &amp; Trend</span><span class="grp-badge neu" id="ag-struct-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
@@ -43599,7 +43600,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- ── Phase 3: Journal Groups — primary Journal section view (DISPLAY-ONLY). -->
-<div class="mod" id="mod-journal-groups">
+<div class="mod" id="mod-journal-groups" data-cat="primary">
   <div class="mod-h">Journal<span class="mod-cat cat-primary">PRIMARY</span></div>
   <details class="grp-details" id="jg-today-det" open>
     <summary class="grp-summary"><span class="grp-title">Today</span><span class="grp-badge neu" id="jg-today-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
@@ -43626,7 +43627,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 <!-- ── Phase 3: Controls Groups — primary Controls section status view (DISPLAY-ONLY).
      Shows current state of each control group. Full controls are in the individual
      detail panels below (visible when Advanced panels are enabled). -->
-<div class="mod" id="mod-controls-groups">
+<div class="mod" id="mod-controls-groups" data-cat="primary">
   <div class="mod-h">Controls Overview<span class="mod-cat cat-primary">PRIMARY</span></div>
   <details class="grp-details" id="cg-markets-det" open>
     <summary class="grp-summary"><span class="grp-title">Markets</span><span class="grp-badge neu" id="cg-markets-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
@@ -43660,14 +43661,14 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      market_narrative / market_events_timeline / session_day_type /
      main_brain_learning_stats). NEVER touch the gate, scoring, sizing or broker.
      Every dynamic string is written via textContent / _anFill (escaped). -->
-<div class="mod" id="mod-mb-predictions">
+<div class="mod" id="mod-mb-predictions" data-cat="detail">
   <div class="mod-h">🔮 Forward Odds <span id="mbp-fav" style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">—</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div id="mbp-horizon" style="font-size:11px;color:#6b7280;margin-bottom:6px">—</div>
   <div id="mbp-list"></div>
   <div id="mbp-note" style="font-size:10px;color:#6b7280;margin-top:6px;font-style:italic"></div>
 </div>
 
-<div class="mod" id="mod-mb-confidence">
+<div class="mod" id="mod-mb-confidence" data-cat="detail">
   <div class="mod-h">📈 Confidence Over Time<span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="mb-stats">
     <div class="mb-stat"><div class="mb-stat-l">Current</div><div class="mb-stat-v" id="mbc-current">—</div></div>
@@ -43679,7 +43680,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="mbc-why" style="font-size:11px;color:#6b7280;margin-top:6px">—</div>
 </div>
 
-<div class="mod" id="mod-mb-narrative">
+<div class="mod" id="mod-mb-narrative" data-cat="detail">
   <div class="mod-h">📖 Session Story <span style="font-size:10px;letter-spacing:1.5px;color:#6b7280;margin-left:auto">ANALYST NOTEBOOK</span><span class="mod-cat cat-detail">DETAIL</span></div>
 
   <div class="mb-col-h" style="margin-top:2px;margin-bottom:3px">1 — Current Bias</div>
@@ -43716,7 +43717,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      25–75 min later resolves the outcome vs actual tape and writes a lesson.
      Also surfaces a Pattern Memory: historical win/loss for the current fingerprint.
      Never touches gate / scoring / sizing / broker. All strings via textContent. -->
-<div class="mod" id="mod-mb-thesis">
+<div class="mod" id="mod-mb-thesis" data-cat="detail">
   <div class="mod-h">🧠 Thesis Tracker <span style="font-size:10px;letter-spacing:1.5px;color:#6b7280;margin-left:auto">ANALYST MEMORY</span><span class="mod-cat cat-detail">DETAIL</span></div>
 
   <!-- Pattern Memory -->
@@ -43763,7 +43764,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      strategy_trades / MANAGED_TRADES, never changes the live verdict. Hidden unless the
      server attaches d.dual_sim (flag DUAL_MODE_SHADOW_SIM_ENABLED). Every dynamic string
      goes through textContent (XSS-safe), never innerHTML. -->
-<div class="mod" id="mod-dual-sim" style="display:none">
+<div class="mod" id="mod-dual-sim" data-cat="experimental" style="display:none">
   <div class="mod-h">🔬 Dual Shadow Simulator<span title="Passive paper simulation of BOTH rulebooks side by side — not your real broker fills, and it never affects the live bot." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="dual-sim-meta" style="font-size:11px;color:#6b7280;margin-bottom:6px"></div>
   <div id="dual-sim-tables"></div>
@@ -43773,7 +43774,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      -> micro trigger). DISPLAY + GHOST ONLY: the toggle never arms a real order path;
      a TAKE verdict only logs a ghost trade. Fed by main_brain.micro_scalp (key absent
      while OFF). ALL dynamic strings rendered via textContent (XSS-safe). -->
-<div class="mod" id="mod-microscalp">
+<div class="mod" id="mod-microscalp" data-cat="detail">
   <div class="mod-h">⚡ Micro Scalp Brain <span id="msc-badge" style="font-size:10px;padding:1px 8px;border-radius:8px;background:#6b7280;color:#fff;margin-left:6px">OFF</span><span id="msc-ghostonly" style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto" title="Ghost mode: it logs the trades it WOULD take. Arm LIVE to let a TAKE also place a real order.">GHOST ONLY</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px;flex-wrap:wrap">
     <button id="msc-toggle" onclick="toggleMicroScalp()" style="font-size:11px;padding:4px 12px;border-radius:6px;border:1px solid var(--border,#2a2a3a);background:#1f2430;color:#e8e8f0;cursor:pointer">Turn ON</button>
@@ -43811,7 +43812,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      (display/advisory only; it ranks ideas, it never places or changes a trade). Hidden
      unless SCALP_MAIN_BRAIN_ADVISORY_ENABLED is on (fed by d.scalp_strategy_advisory).
      ALL dynamic strings are written via textContent (XSS-safe), never innerHTML. -->
-<div class="mod" id="mod-scalp-advisory" style="display:none">
+<div class="mod" id="mod-scalp-advisory" data-cat="experimental" style="display:none">
   <div class="mod-h">🧠 Strategy Advisory Reasoning <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">ADVISORY-ONLY</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="ssa-status" class="sd-grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px"></div>
   <div id="ssa-summary" class="mb-summary" style="margin:8px 0">—</div>
@@ -43825,7 +43826,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div class="nf-fid" id="ssa-safety">Advisory layer is display-only and does not place or influence live trades.</div>
 </div>
 
-<div class="mod" id="mod-stalk-mode" style="display:none">
+<div class="mod" id="mod-stalk-mode" data-cat="experimental" style="display:none">
   <div class="mod-h">🦉 Stalk Mode <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">PRE-ENTRY · ADVISORY-ONLY</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="stk-summary" class="mb-summary" style="margin:8px 0">—</div>
   <div id="stk-grid" class="sd-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px"></div>
@@ -43835,7 +43836,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div class="nf-fid">Pre-entry observation only — never places, sizes, or influences a trade.</div>
 </div>
 
-<div class="mod" id="mod-active-thinking" style="display:none">
+<div class="mod" id="mod-active-thinking" data-cat="experimental" style="display:none">
   <div class="mod-h">🧭 Active Trade Thinking <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">IN-TRADE · ADVISORY-ONLY</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="att-rec" style="font-size:15px;font-weight:800;letter-spacing:.4px;margin:6px 0">—</div>
   <div id="att-summary" class="mb-summary" style="margin:8px 0">—</div>
@@ -43851,7 +43852,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      is on. Fed by d.fast_entry. Improves entry TIMING only on an aligned, valid /
      nearly-valid HTF setup — it never creates a trade alone and never overrides a bad
      setup. ALL dynamic strings are written via textContent (never innerHTML). -->
-<div class="mod" id="mod-fastentry" style="display:none">
+<div class="mod" id="mod-fastentry" data-cat="experimental" style="display:none">
   <div class="mod-h">⚡ Fast Entry Trigger <span id="fe-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
     <div class="gstat"><div class="l">Seconds Bias</div><div class="v" id="fe-bias">—</div></div>
@@ -43869,7 +43870,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Cross-market index alignment (Nasdaq/S&P/Dow agreement — DISPLAY + ALERTS only; never gates trades) -->
-<div class="mod" id="mod-xmarket" style="display:none">
+<div class="mod" id="mod-xmarket" data-cat="experimental" style="display:none">
   <div class="mod-h">🔀 Index Alignment <span id="xm-verdict" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="xm-row" class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
   <div class="se-reason" id="xm-summary" style="margin-top:8px">—</div>
@@ -44154,7 +44155,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- SCALP dynamic-exit diagnostics (req 7 — DISPLAY-ONLY; hidden unless SCALP dynamic exits are on) -->
-<div class="mod" id="mod-scalpdiag" style="display:none">
+<div class="mod" id="mod-scalpdiag" data-cat="detail" style="display:none">
   <div class="mod-h">🩺 SCALP Diagnostics <span id="sd-verdict" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
     <div class="gstat"><div class="l">Setup Quality</div><div class="v" id="sd-quality">—</div></div>
@@ -44171,7 +44172,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- SWING thesis diagnostics (P7 / req 6 — DISPLAY-ONLY; hidden unless SWING + SWING_HTF_ENABLED) -->
-<div class="mod" id="mod-swingdiag" style="display:none">
+<div class="mod" id="mod-swingdiag" data-cat="detail" style="display:none">
   <div class="mod-h">🌊 SWING Diagnostics <span id="swd-status" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
     <div class="gstat"><div class="l">Mode</div><div class="v" id="swd-mode">—</div></div>
@@ -44193,7 +44194,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Live SWING Strategy library selector (money-path DEMOTE-ONLY; hidden unless SWING + SWING_STRATEGY_FILTER_ENABLED) -->
-<div class="mod" id="mod-swingstrat" style="display:none">
+<div class="mod" id="mod-swingstrat" data-cat="advanced" style="display:none">
   <div class="mod-h">🎯 SWING Strategy <span id="sws-status" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-advanced">ADVANCED</span></div>
   <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Only take SWING setups matching the selected strategy. Demote-only — it narrows which READY setups are taken; never creates a trade, loosens the gate, or changes stops/targets/size.</div>
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -44231,7 +44232,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 
 <!-- 9:30 ET Breakout Mode (display-only advisory; flag-gated). Fed by d.breakout_mode;
      the renderer hides this whole panel when the block is absent (flag OFF). -->
-<div class="mod" id="mod-breakout" style="display:none">
+<div class="mod" id="mod-breakout" data-cat="experimental" style="display:none">
   <div class="mod-h">🚀 9:30 Breakout Mode <span id="bo-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div class="se-top">
     <div class="gstat"><div class="l">Entry Status</div><div class="v" id="bo-status">—</div></div>
@@ -44263,7 +44264,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Swing Mode V2 — HTF swing scoring + lifecycle (DISPLAY-ONLY; flag-gated) -->
-<div class="mod" id="mod-swing-v2" style="display:none">
+<div class="mod" id="mod-swing-v2" data-cat="experimental" style="display:none">
   <div class="mod-h">&#x1F4CA; Swing V2 <span id="sv2-lifecycle-badge" class="blh-pill">SCANNING</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="sv2-score-wrap">
     <div id="sv2-score-val">&#x2014;</div>
@@ -44298,7 +44299,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Learning Rule Engine — REAL evidence-based ghost/live eligibility per instrument -->
-<div class="mod" id="mod-rule-engine">
+<div class="mod" id="mod-rule-engine" data-cat="primary">
   <div class="mod-h">⚡ Learning Rule Engine <span id="lre-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-primary">PRIMARY</span></div>
   <div style="font-size:11px;color:#9ca3af;margin-bottom:10px">Observes every closed trade. Blocks proven-failing setup patterns. Nudges the Edge Score based on strategy track record (±15 pts max).</div>
   <div id="lre-instruments"></div>
@@ -44375,7 +44376,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
-<div class="mod" id="mod-equity">
+<div class="mod" id="mod-equity" data-cat="detail">
   <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcome simulated from a price proxy — not your real broker fills, and shown NET of estimated commission &amp; slippage. See Real Account Results above for actual P&amp;L." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED · NET</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="eq-top">
     <div class="gstat"><div class="l">Net R</div><div class="v" id="eq-net">—</div></div>
@@ -44389,7 +44390,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Today's Trades — per-trade list of trades closed today (display-only, from strategy_trades) -->
-<div class="mod" id="mod-trades">
+<div class="mod" id="mod-trades" data-cat="detail">
   <div class="mod-h">📋 Today's Trades <span id="tt-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcomes simulated from a price proxy — not your real broker fills, and shown NET of estimated commission &amp; slippage. See Real Account Results above for actual trades." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED · NET</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="tt-pairs" id="tt-pairs">
     <span class="tt-pair active" id="tt-pair-MGC" role="button" tabindex="0" onclick="ttSelect('MGC')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();ttSelect('MGC');}">MGC</span>
@@ -44403,7 +44404,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Economic-calendar news filter (ForexFactory; DISPLAY-ONLY — never gates trades) -->
-<div class="mod" id="mod-news">
+<div class="mod" id="mod-news" data-cat="primary">
   <div class="mod-h">📰 News Filter <span id="nf-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-primary">PRIMARY</span></div>
   <div class="nf-status" id="nf-status">—</div>
   <div id="nf-list"></div>
@@ -44411,7 +44412,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Blocked Orders — orders rejected LOCALLY before any broker send (invalid-payload guard; DISPLAY-ONLY) -->
-<div class="mod" id="mod-exec-reject" style="display:none">
+<div class="mod" id="mod-exec-reject" data-cat="detail" style="display:none">
   <div class="mod-h">🛑 Blocked Orders <span id="xr-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="nf-status" id="xr-status">—</div>
   <ul id="xr-list" style="margin:4px 0;padding-left:16px"></ul>
@@ -44419,14 +44420,14 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Broker Send Log — every attempted POST to TradersPost with signal type, direction, and response (DISPLAY-ONLY) -->
-<div class="mod" id="mod-broker-send-log" style="display:none">
+<div class="mod" id="mod-broker-send-log" data-cat="detail" style="display:none">
   <div class="mod-h">📡 Broker Send Log <span id="bsl-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="nf-fid">Every order sent (or attempted) to TradersPost — signal type, direction, action, sentiment, HTTP status, and broker response. Display-only — clears on restart.</div>
   <div style="overflow-x:auto;margin-top:6px"><table id="bsl-table" style="width:100%;border-collapse:collapse;font-size:11px"></table></div>
 </div>
 
 <!-- Prop Firm Protection (Task #15) — owner-only; FINAL fail-closed guard layer -->
-<div class="mod" id="mod-prop">
+<div class="mod" id="mod-prop" data-cat="primary">
   <div class="mod-h">
     <span id="prop-dot" style="color:#6b7280">&#9679;</span> Prop Firm Protection
     <span id="prop-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span>
@@ -44461,7 +44462,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 
 <!-- BOT TRAINING MODE — staged path to autonomy. DISPLAY/READ-ONLY; hidden unless
      /training/status reports enabled. Nothing here sends or sizes a live order. -->
-<div class="mod" id="mod-training" style="display:none">
+<div class="mod" id="mod-training" data-cat="advanced" style="display:none">
   <div class="mod-h">
     <span id="tr-dot" style="color:#6b7280">&#9679;</span> Bot Training Mode
     <span id="tr-stage-badge" style="font-size:10px;color:#6b7280;letter-spacing:1px;float:right"></span>
@@ -44511,7 +44512,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 
 <!-- Trade-management analytics (MFE/MAE booleans + commission + oversized-loss).
      DISPLAY-ONLY; hidden unless TRADE_MGMT/COMMISSION/OVERSIZED analytics are on. -->
-<div class="mod" id="mod-trademgmt" style="display:none">
+<div class="mod" id="mod-trademgmt" data-cat="advanced" style="display:none">
   <div class="mod-h">📐 Trade Management <span id="tmg-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">DISPLAY</span><span class="mod-cat cat-advanced">ADVANCED</span></div>
   <div style="font-size:11px;color:#9aa;margin:2px 0 6px">Most recent closed trade</div>
   <div class="cvd-stats">
@@ -44534,7 +44535,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 
 <!-- Session Quality — today's live trading-session report card (6 components).
      DISPLAY-ONLY; hidden unless SESSION_QUALITY_ENABLED. -->
-<div class="mod" id="mod-sessionq" style="display:none">
+<div class="mod" id="mod-sessionq" data-cat="advanced" style="display:none">
   <div class="mod-h">🎓 Session Quality <span style="font-size:10px;letter-spacing:1px;color:#6b7280">TODAY · DISPLAY</span><span class="mod-cat cat-advanced">ADVANCED</span></div>
   <div style="display:flex;align-items:baseline;gap:12px;margin:2px 0 6px;flex-wrap:wrap">
     <div id="sq-grade" style="font-size:30px;font-weight:800">—</div>
@@ -44546,7 +44547,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 
 <!-- Bot Hold Score — advisory HOLD/SCALE OUT/EXIT conviction for OPEN bot positions.
      DISPLAY-ONLY; hidden unless BOT_HOLD_SCORE_ENABLED and a position is open. -->
-<div class="mod" id="mod-bothold" style="display:none">
+<div class="mod" id="mod-bothold" data-cat="experimental" style="display:none">
   <div class="mod-h">🐷 Bot Hold Score <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="bh-list"></div>
   <div id="bh-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
@@ -44556,7 +44557,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      status (VALID/WEAKENING/INVALID), hold reason, exit-warning + suggested action
      for every OPEN bot position. DISPLAY-ONLY; never closes a position. Hidden unless
      ACTIVE_TRADE_MGMT_ENABLED and a position is open. -->
-<div class="mod" id="mod-atm" style="display:none">
+<div class="mod" id="mod-atm" data-cat="experimental" style="display:none">
   <div class="mod-h">🛡️ Active Trade Management <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ADVISORY</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div id="atm-list"></div>
   <div id="atm-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
@@ -44565,7 +44566,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 <!-- LIVE 2-contract runner (Option B) — arming control + eligibility. Owner-only.
      Hidden unless LIVE_RUNNER_ENABLED (env). The armed flag is in-memory and RESETS
      OFF on every restart/publish. Arming never bypasses the fail-closed gateway. -->
-<div class="mod" id="mod-liverunner" style="display:none">
+<div class="mod" id="mod-liverunner" data-cat="experimental" style="display:none">
   <div class="mod-h">🏃 LIVE Runner <span id="lr-badge" style="font-size:10px;letter-spacing:1px;color:#6b7280">OPTION B</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div class="focus-row">
     <span class="focus-lbl">Arm split-runner</span>
@@ -44590,7 +44591,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
      CONFIRMED-invalid thesis (structure flipped against an open bot position for
      N consecutive checks — never a bare stop-touch) flattens that position with a
      NON-REVERSING exit through the audited broker sink. -->
-<div class="mod" id="mod-autoexit" style="display:none">
+<div class="mod" id="mod-autoexit" data-cat="experimental" style="display:none">
   <div class="mod-h">🐷 Auto Early-Exit <span style="font-size:10px;letter-spacing:1px;color:#6b7280">ACTS ON ITS OWN ADVICE</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
   <div class="focus-row">
     <span class="focus-lbl">Arm auto-exit</span>
@@ -44602,7 +44603,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- ════ High-Volume Session Windows (DISPLAY-ONLY; never gates trades) ════ -->
-<div class="mod" id="mod-hvsessions">
+<div class="mod" id="mod-hvsessions" data-cat="detail">
   <div class="mod-h">&#x23F0; High-Volume Session Windows <span style="font-size:10px;color:#6b7280;margin-left:auto;letter-spacing:.8px">DISPLAY ONLY</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div style="font-size:11px;color:#9aa;margin:0 0 8px">Configurable per instrument. These windows reflect typical high-activity hours. They never gate, score, or size any trade.</div>
   <div class="hvs-tabs" id="hvs-tabs">
@@ -44615,7 +44616,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- Order-flow: CVD (hard confirmation filter) + RVOL (soft Edge modifier) -->
-<div class="mod" id="mod-cvd">
+<div class="mod" id="mod-cvd" data-cat="detail">
   <div class="mod-h">📊 Volume Delta (CVD) &amp; RVOL<span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="cvd-stats">
     <div class="gstat"><div class="l">CVD State</div><div class="v" id="cvd-state">—</div></div>
@@ -44664,7 +44665,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 <a class="btn btn-eod" href="/api/auto-trade-settings" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">⚙️ Auto-Trade Settings (limits &amp; kill switch)</a>
 
 <!-- ════ Potential Trade Idea Review (DISPLAY-ONLY second opinion; review-only) ════ -->
-<div class="mod" id="mod-review">
+<div class="mod" id="mod-review" data-cat="detail">
   <div class="mod-h">🔎 Trade Idea Review <span style="font-size:10px;color:#6b7280;letter-spacing:1px">ANALYST SECOND OPINION · REVIEW-ONLY</span><span class="mod-cat cat-detail">DETAIL</span></div>
   <div style="font-size:11px;color:#9aa;margin:2px 0 8px">Type a trade you're considering. The bot grades it with its read-only engines — it never places this for you.</div>
   <div class="fields">
@@ -44691,7 +44692,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 </div>
 
 <!-- ════ MARKET THESIS PANEL (Phase 2) ════ -->
-<div class="mod" id="mod-thesis" style="grid-column:1/-1">
+<div class="mod" id="mod-thesis" data-cat="detail" style="grid-column:1/-1">
   <div class="mod-h" onclick="toggleMod(this)">&#x1F9E0; Market Thesis<span class="mod-cat cat-detail">DETAIL</span></div>
   <div class="mod-c">
     <div id="thesis-cards"></div>
@@ -44963,29 +44964,29 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
     <div class="bt-msg" id="sr-msg"></div>
   </div>
 
-  <div class="mod" id="mod-sr-new">
+  <div class="mod" id="mod-sr-new" data-cat="experimental">
     <div class="mod-h">🆕 New Strategies Found <span class="bt-mini" id="sr-new-cap"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
     <div class="bt-mini" style="margin-bottom:6px">The research catalog — scalp strategies discovered &amp; defined for study. Status is advisory only.</div>
     <div class="bt-scroll" id="sr-new"></div>
   </div>
 
-  <div class="mod" id="mod-sr-tested">
+  <div class="mod" id="mod-sr-tested" data-cat="experimental">
     <div class="mod-h">🧪 Strategies Being Tested <span class="bt-mini" id="sr-tested-cap"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
     <div class="bt-mini" style="margin-bottom:6px">Simulated on historical candles (1:1 R, live-consistent). Stats are out-of-sample research, not live results.</div>
     <div class="bt-scroll" id="sr-tested"></div>
   </div>
 
-  <div class="mod" id="mod-sr-best">
+  <div class="mod" id="mod-sr-best" data-cat="experimental">
     <div class="mod-h">🏆 Best Performing <span class="bt-mini">research + live, ranked by net R</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
     <div class="bt-scroll" id="sr-best"></div>
   </div>
 
-  <div class="mod" id="mod-sr-worst">
+  <div class="mod" id="mod-sr-worst" data-cat="experimental">
     <div class="mod-h">🥀 Worst Performing <span class="bt-mini">research + live, ranked by net R</span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
     <div class="bt-scroll" id="sr-worst"></div>
   </div>
 
-  <div class="mod" id="mod-sr-promo">
+  <div class="mod" id="mod-sr-promo" data-cat="experimental">
     <div class="mod-h">📈 Promotion Recommendations <span class="bt-mini" id="sr-promo-cap"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
     <div class="bt-mini" style="margin-bottom:6px">Advisory only. A human promotes manually — this engine never promotes a strategy to live trading.</div>
     <div class="bt-scroll" id="sr-promo"></div>
