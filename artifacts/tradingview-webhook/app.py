@@ -42697,6 +42697,38 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 .ln-btn:focus-visible{outline:2px solid rgba(245,158,11,.6);outline-offset:2px}
 .ln-btn.active,.ln-btn[aria-selected=true]{background:rgba(245,158,11,.18);color:#fbbf24;border-color:rgba(245,158,11,.55);box-shadow:0 0 10px rgba(245,158,11,.22),inset 0 1px 0 rgba(245,158,11,.12)}
 #live-nav-heading{display:none;padding:2px 0 10px;font-size:10px;font-weight:700;letter-spacing:2.5px;color:var(--muted);text-transform:uppercase;border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:10px}
+/* ln-hidden: applied by setLiveSection to hide panels that belong to inactive tabs.
+   display:none!important overrides any style.display='' set by render functions,
+   so the section switcher always wins. */
+.ln-hidden{display:none!important}
+/* ── AI Decision Center ── */
+.adc-sum{padding:8px 0 6px;border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:10px}
+.adc-verdict-big{font-size:22px;font-weight:800;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;color:#6b7280}
+.adc-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;margin-bottom:8px}
+.adc-row{display:flex;flex-direction:column;gap:1px}
+.adc-lbl{font-size:9px;font-weight:700;letter-spacing:1.2px;color:#6b7280;text-transform:uppercase}
+.adc-val{font-size:12px;font-weight:600;color:#e8e8f0}
+.adc-reason{font-size:11px;line-height:1.5;color:#9aa3b2;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04);margin:4px 0}
+.adc-kv{display:flex;gap:6px;align-items:flex-start;font-size:11px;padding:4px 0;border-top:1px solid rgba(255,255,255,.05)}
+.adc-kv .k{font-weight:700;letter-spacing:.8px;color:#6b7280;white-space:nowrap;min-width:90px;font-size:10px;padding-top:1px;text-transform:uppercase}
+.adc-kv .v{color:#cfd0e0;line-height:1.4}
+#adc-tabs{display:flex;gap:3px;overflow-x:auto;scrollbar-width:none;padding:6px 0 8px;flex-wrap:nowrap;border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:8px}
+#adc-tabs::-webkit-scrollbar{display:none}
+.adc-tab{flex:0 0 auto;padding:4px 11px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#6b7280;font-size:9px;font-weight:700;letter-spacing:.8px;cursor:pointer;font-family:var(--sans);text-transform:uppercase;white-space:nowrap;outline:none;transition:all .15s}
+.adc-tab.active{background:rgba(99,102,241,.18);color:#a5b4fc;border-color:rgba(99,102,241,.4)}
+.adc-tab:hover{color:#e8e8f0;border-color:rgba(255,255,255,.18)}
+.adc-panel{display:none}.adc-panel.active{display:block}
+.adc-empty{font-size:11px;color:#6b7280;font-style:italic;padding:8px 0}
+.adc-ri{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:11px}
+.adc-ri:last-child{border-bottom:none}
+.adc-ri .k{color:#9aa3b2;font-size:10px;letter-spacing:.6px}
+.adc-ri .v{font-weight:600;color:#e8e8f0;text-align:right;max-width:60%}
+.adc-chip{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#9aa3b2;margin:2px}
+.adc-chip.ok{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);color:#86efac}
+.adc-chip.bad{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:#fca5a5}
+.adc-chip.warn{background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.3);color:#fde68a}
+.adc-bw{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-top:3px}
+.adc-bf{height:100%;border-radius:3px;transition:width .3s}
 /* ── High-Volume Sessions panel ── */
 #mod-hvsessions .hvs-win{border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:7px;background:var(--panel)}
 #mod-hvsessions .hvs-win.hvs-active{border-color:var(--green,#34e3a4);background:rgba(52,227,164,.07)}
@@ -43458,6 +43490,63 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
       <div class="sg-track"><div class="sg-fill short" id="sg-short-f" style="width:0%"></div></div>
     </div>
   </div>
+</div>
+
+<!-- ── AI Decision Center ─────────────────────────────────────────────────
+     Consolidated Brain view: all AI engine outputs in one panel with an
+     internal tab bar. Data comes from the same /status poll that drives
+     the individual panels. DISPLAY-ONLY — never touches money path. -->
+<div class="mod" id="mod-ai-decision-center">
+  <div class="mod-h">&#129504; AI Decision Center</div>
+  <!-- Top summary: verdict + key context at a glance -->
+  <div class="adc-sum">
+    <div class="adc-verdict-big" id="adc-verdict-big">WAIT</div>
+    <div class="adc-grid">
+      <div class="adc-row">
+        <span class="adc-lbl">Market Bias</span>
+        <span class="adc-val" id="adc-bias">&#8212;</span>
+      </div>
+      <div class="adc-row">
+        <span class="adc-lbl">Confidence</span>
+        <span class="adc-val" id="adc-conf">&#8212;</span>
+      </div>
+      <div class="adc-row" style="grid-column:1/-1">
+        <span class="adc-lbl">Active Strategy</span>
+        <span class="adc-val" id="adc-strategy-val">&#8212;</span>
+      </div>
+    </div>
+    <div class="adc-reason" id="adc-reason">Awaiting signal data.</div>
+    <div class="adc-kv">
+      <span class="k">Entry Quality</span>
+      <span class="v" id="adc-eq-inline">&#8212;</span>
+    </div>
+    <div class="adc-kv" id="adc-trigger-row" style="display:none">
+      <span class="k">Next Trigger</span>
+      <span class="v" id="adc-trigger"></span>
+    </div>
+    <div class="adc-kv" id="adc-inval-row" style="display:none">
+      <span class="k">Invalidation</span>
+      <span class="v" id="adc-inval"></span>
+    </div>
+  </div>
+  <!-- Internal tab bar (horizontal scroll on mobile) -->
+  <div id="adc-tabs">
+    <button class="adc-tab active" data-tab="decision" onclick="adcSetTab('decision')">Decision</button>
+    <button class="adc-tab" data-tab="readiness" onclick="adcSetTab('readiness')">Readiness</button>
+    <button class="adc-tab" data-tab="strategy" onclick="adcSetTab('strategy')">Strategy</button>
+    <button class="adc-tab" data-tab="entryq" onclick="adcSetTab('entryq')">Entry Quality</button>
+    <button class="adc-tab" data-tab="confidence" onclick="adcSetTab('confidence')">Confidence</button>
+    <button class="adc-tab" data-tab="memory" onclick="adcSetTab('memory')">Memory</button>
+    <button class="adc-tab" data-tab="microscalp" onclick="adcSetTab('microscalp')">Micro Scalp</button>
+  </div>
+  <!-- Tab panels (toggled by adcSetTab) -->
+  <div id="adc-panel-decision" class="adc-panel active"><div id="adc-d-content"></div></div>
+  <div id="adc-panel-readiness" class="adc-panel"><div id="adc-r-content"></div></div>
+  <div id="adc-panel-strategy" class="adc-panel"><div id="adc-s-content"></div></div>
+  <div id="adc-panel-entryq" class="adc-panel"><div id="adc-eq-content"></div></div>
+  <div id="adc-panel-confidence" class="adc-panel"><div id="adc-cg-content"></div></div>
+  <div id="adc-panel-memory" class="adc-panel"><div id="adc-tm-content"></div></div>
+  <div id="adc-panel-microscalp" class="adc-panel"><div id="adc-ms-content"></div></div>
 </div>
 
 <!-- Diagnostics modules (feed off alert_diagnostics) -->
@@ -45564,6 +45653,7 @@ function gaugeColor(v,prob){
 function renderModules(d){
   if (!d) return;
   renderMainBrain(d);
+  try{ renderAiDecisionCenter(d); }catch(e){}
   try{ renderBLPanels(d); }catch(e){}
   window._mscPageData = d;
   var _mscMainInst = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '';
@@ -50306,33 +50396,12 @@ var _liveNavSections = {
     'mod-real-results',   // Real Account Results
     'mod-hvsessions'      // High-Volume Session Windows
   ],
-  // AI reasoning: checklists, analyst layers, memory, advisory overlays
+  // Brain: ONE consolidated AI Decision Center card
   brain: [
-    'mod-checklist',      // AI Trade Checklist (live recommendation)
-    'mod-microscalp',     // Micro Scalp Brain
-    'mod-countdown',      // Setup Countdown
-    'mod-whynot',         // Why Not Ready
-    'mod-analyst',        // Unified Analyst Report
-    'mod-pro',            // Professional Review
-    'mod-entryq',         // Entry Quality
-    'mod-debate',         // Trade Debate
-    'mod-strategy',       // Strategy Engine
-    'mod-governor',       // Confidence Governor
-    'mod-memory',         // Trade Memory
-    'mod-mb-voice',       // Analyst Voice
-    'mod-mb-predictions', // Forward Odds
-    'mod-mb-confidence',  // Confidence Over Time
-    'mod-mb-narrative',   // Session Story
-    'mod-mb-events',      // Events Timeline
-    'mod-mb-thesis',      // Thesis Tracker
-    'mod-mb-daytype',     // Day Type
-    'mod-mb-learning',    // Learning Stats
-    'mod-assistant',      // AI Assistant chat
-    'mod-scalp-advisory', // Strategy Advisory
-    'mod-stalk-mode',     // Stalk Mode (pre-entry)
-    'mod-active-thinking' // Active Trade Thinking (in-trade)
+    'mod-ai-decision-center' // All brain engine outputs in one panel
   ],
   // Market analysis: structure, volume, volatility, diagnostics, simulations
+  // Also includes the detailed brain engine layers for deep-dive access
   analysis: [
     'mod-chartprev',      // Live Chart Preview
     'mod-cvd',            // Volume Delta (CVD) & RVOL
@@ -50347,9 +50416,26 @@ var _liveNavSections = {
     'mod-breakout',       // 9:30 Breakout Mode
     'mod-swing-v2',       // Swing V2 engine
     'mod-dual-sim',       // Dual Shadow Simulator
-    'mod-report'          // Analysis Report
+    'mod-report',         // Analysis Report
+    // Detailed brain engine outputs (accessible for deep inspection)
+    'mod-checklist',      // AI Trade Checklist
+    'mod-microscalp',     // Micro Scalp Brain
+    'mod-countdown',      // Setup Countdown
+    'mod-whynot',         // Why Not Ready
+    'mod-analyst',        // Unified Analyst Report
+    'mod-pro',            // Professional Review
+    'mod-entryq',         // Entry Quality
+    'mod-debate',         // Trade Debate
+    'mod-strategy',       // Strategy Engine
+    'mod-scalp-advisory', // Strategy Advisory
+    'mod-stalk-mode',     // Stalk Mode
+    'mod-active-thinking',// Active Trade Thinking
+    'mod-mb-voice',       // Analyst Voice
+    'mod-mb-predictions', // Forward Odds
+    'mod-mb-narrative',   // Session Story
+    'mod-mb-daytype'      // Day Type
   ],
-  // Performance & history: trades, P&L, learning, lessons, thesis
+  // Performance & history: trades, P&L, learning, memory, thesis, events
   journal: [
     'mod-equity',         // Equity Curve · Today
     'mod-trades',         // Today's Trades log
@@ -50359,9 +50445,13 @@ var _liveNavSections = {
     'mod-learning',       // Adaptive Learning
     'mod-thesis',         // Market Thesis / lessons learned
     'mod-review',         // Trade Idea Review
-    'mod-rule-engine'     // Learning Rule Engine
+    'mod-rule-engine',    // Learning Rule Engine
+    'mod-memory',         // Trade Memory
+    'mod-mb-events',      // Events Timeline
+    'mod-mb-thesis',      // Thesis Tracker
+    'mod-mb-learning'     // Learning Stats
   ],
-  // Toggles & execution: broker, auto-trade, training, safety
+  // Toggles & execution: broker, auto-trade, training, safety, utilities
   controls: [
     'mod-prop',           // Prop Firm Protection
     'mod-training',       // Bot Training Mode
@@ -50370,7 +50460,10 @@ var _liveNavSections = {
     'mod-liverunner',     // LIVE Runner
     'mod-autoexit',       // Auto Early-Exit
     'mod-exec-reject',    // Blocked Orders log
-    'mod-broker-send-log' // Broker Send Log
+    'mod-broker-send-log',// Broker Send Log
+    'mod-governor',       // Confidence Governor
+    'mod-mb-confidence',  // Confidence Timeline
+    'mod-assistant'       // AI Assistant chat
   ]
 };
 var _liveNavAllIds = (function(){
@@ -50408,13 +50501,10 @@ function setLiveSection(sec) {
   _liveNavAllIds.forEach(function(id) {
     var el = document.getElementById(id);
     if (!el) return;
-    var show = (active.indexOf(id) !== -1);
-    if (show) {
-      el.style.display = (el._liveOrigDisplay !== undefined) ? (el._liveOrigDisplay || '') : '';
-    } else {
-      if (el._liveOrigDisplay === undefined) el._liveOrigDisplay = el.style.display || '';
-      el.style.display = 'none';
-    }
+    // Use class instead of inline style so render-function style.display='' cannot
+    // override section hiding (.ln-hidden has display:none!important).
+    if (active.indexOf(id) !== -1) { el.classList.remove('ln-hidden'); }
+    else { el.classList.add('ln-hidden'); }
   });
 }
 // Keyboard navigation: left/right arrows move between tabs
@@ -50435,6 +50525,232 @@ function _liveNavKeydown(e) {
   var btn = document.querySelector('#live-nav .ln-btn[data-sec="'+next+'"]');
   if (btn) btn.focus();
 }
+// ── AI Decision Center tab switcher + render ──────────────────────────────
+// adcSetTab: show the requested internal tab, persist the choice in localStorage.
+function adcSetTab(tab) {
+  document.querySelectorAll('#adc-tabs .adc-tab').forEach(function(b){
+    b.classList.toggle('active', b.dataset.tab===tab);
+  });
+  document.querySelectorAll('#mod-ai-decision-center .adc-panel').forEach(function(p){
+    p.classList.toggle('active', p.id==='adc-panel-'+tab);
+  });
+  try { localStorage.setItem('adc_tab', tab); } catch(e) {}
+}
+// _adcEsc: lightweight HTML-escape for innerHTML assignments in the ADC panel.
+function _adcEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+// renderAiDecisionCenter: populates the top summary + all 7 internal tabs from
+// the same /status poll data that drives the individual brain panels.
+// DISPLAY-ONLY. Never reads from or writes to the money path.
+function renderAiDecisionCenter(d) {
+  var mod = document.getElementById('mod-ai-decision-center');
+  if (!mod) return;
+  var v   = (d && d.verdict) || 'WAIT';
+  var ea  = (d && d.alert_diagnostics) || {};
+  var edge = (d && d.edge_score != null) ? d.edge_score
+           : (ea.edge_score != null) ? ea.edge_score : null;
+  var se  = (d && d.strategy_engine) || {};
+  var a   = (d && d.analyst) || {};
+  var pr  = (d && d.pro_review) || {};
+  var eq  = (d && d.entry_quality) || {};
+  var cg  = (d && d.confidence_governor) || {};
+  var tm  = (d && d.trade_memory) || {};
+  var ms  = (d && d.main_brain && d.main_brain.micro_scalp) ? d.main_brain.micro_scalp : {};
+  var td  = (d && d.trade_debate) || {};
+  // ── Top summary ────────────────────────────────────────────────────────
+  var vEl = document.getElementById('adc-verdict-big');
+  if (vEl) {
+    var vTxt='WAIT', vCol='#6b7280';
+    if (v.indexOf('LONG')>=0)       { vTxt='LONG READY';  vCol='#22c55e'; }
+    else if (v.indexOf('SHORT')>=0) { vTxt='SHORT READY'; vCol='#ef4444'; }
+    else if (v.indexOf('EARLY')>=0) { vTxt='EARLY SETUP'; vCol='#f59e0b'; }
+    vEl.textContent=vTxt; vEl.style.color=vCol;
+  }
+  var biasEl=document.getElementById('adc-bias');
+  if (biasEl) {
+    var bStr=String((d&&d.bias)||(d&&d.direction)||'\u2014');
+    biasEl.textContent=bStr;
+    biasEl.style.color=bStr.toLowerCase().indexOf('bull')>=0?'#22c55e'
+                      :bStr.toLowerCase().indexOf('bear')>=0?'#ef4444':'#9aa3b2';
+  }
+  var confEl=document.getElementById('adc-conf');
+  if (confEl) {
+    confEl.textContent=edge!=null?Math.round(edge)+'%':'\u2014';
+    if (edge!=null) confEl.style.color=edge>=70?'#22c55e':edge>=50?'#f59e0b':'#9aa3b2';
+  }
+  var stEl=document.getElementById('adc-strategy-val');
+  if (stEl) {
+    var snm=se.active_strategy||'No qualified strategy', sdir=se.direction||'';
+    stEl.textContent=snm+(sdir?' \u00b7 '+sdir:'');
+    stEl.style.color=se.active_strategy?(sdir==='Long'?'#22c55e':sdir==='Short'?'#ef4444':'#e8e8f0'):'#6b7280';
+  }
+  var reasonEl=document.getElementById('adc-reason');
+  if (reasonEl) reasonEl.textContent=(d&&d.strict_reason)||(a&&a.market_story)||(d&&d.reason)||'Awaiting signal data.';
+  var eqInEl=document.getElementById('adc-eq-inline');
+  if (eqInEl) {
+    if (eq.engine_enabled&&eq.grade) {
+      eqInEl.textContent='Grade: '+eq.grade+(eq.verdict_label?' \u00b7 '+eq.verdict_label:'')+(eq.gate_enabled?' \u00b7 VETO':'');
+      var egc2=eq.grade==='Excellent'?'#22c55e':eq.grade==='Good'?'#84cc16':eq.grade==='Acceptable'?'#f59e0b':'#ef4444';
+      eqInEl.style.color=egc2;
+    } else { eqInEl.textContent='\u2014'; eqInEl.style.color='#6b7280'; }
+  }
+  var gp=a.game_plan||{};
+  var trig=(gp.next_opportunity)||(d&&d.next_trigger)||'';
+  var trigRow=document.getElementById('adc-trigger-row'), trigEl=document.getElementById('adc-trigger');
+  if (trigRow) trigRow.style.display=trig?'':'none';
+  if (trigEl)  trigEl.textContent=trig;
+  var inval=(gp.invalidation_hint||gp.cancels_setup)||(d&&d.invalidation)||'';
+  var invalRow=document.getElementById('adc-inval-row'), invalEl=document.getElementById('adc-inval');
+  if (invalRow) invalRow.style.display=inval?'':'none';
+  if (invalEl)  invalEl.textContent=inval;
+  // ── Tab: Decision ──────────────────────────────────────────────────────
+  var dEl=document.getElementById('adc-d-content');
+  if (dEl) {
+    var h='';
+    if (td.engine_enabled&&td.judge) {
+      var jd=td.judge||{}, jv=jd.final_verdict||'WAIT';
+      var jvc=jv==='TAKE'?'#22c55e':jv==='PASS'?'#ef4444':'#f59e0b';
+      h+='<div class="adc-ri"><span class="k">Debate</span><span class="v" style="color:'+jvc+'">'+_adcEsc(jv)+'</span></div>';
+      if (jd.winning_side) h+='<div class="adc-ri"><span class="k">Edge</span><span class="v">'+_adcEsc(jd.winning_side)+' side</span></div>';
+      if (jd.reason_winner_won) h+='<div class="adc-reason">'+_adcEsc(jd.reason_winner_won)+'</div>';
+    }
+    if (d&&d.advisor_enabled&&a.final_verdict) {
+      var av=a.final_verdict, avc=av==='TAKE'?'#22c55e':'#f59e0b';
+      h+='<div class="adc-ri"><span class="k">Analyst</span><span class="v" style="color:'+avc+'">'+_adcEsc(av)+(a.confidence!=null?' \u00b7 '+a.confidence+'%':'')+'</span></div>';
+      if (a.market_story) h+='<div class="adc-reason">'+_adcEsc(a.market_story)+'</div>';
+    }
+    if (pr.engine_enabled&&pr.active) {
+      var pa=pr.active||{}, pd=pa.professional_decision||'\u2014';
+      var pdc=pd==='TAKE'?'#22c55e':pd==='PASS'?'#ef4444':'#f59e0b';
+      h+='<div class="adc-ri"><span class="k">Pro Review</span><span class="v" style="color:'+pdc+'">'+_adcEsc(pd)+(pa.grade?' \u00b7 '+_adcEsc(pa.grade):'')+'</span></div>';
+      if (pa.why_not_trade) h+='<div class="adc-reason">'+_adcEsc(pa.why_not_trade)+'</div>';
+    }
+    dEl.innerHTML=h||'<div class="adc-empty">Awaiting analysis data.</div>';
+  }
+  // ── Tab: Readiness ─────────────────────────────────────────────────────
+  var rEl=document.getElementById('adc-r-content');
+  if (rEl) {
+    var h2='', sr=(d&&d.strict_reason)||'';
+    if (sr) h2+='<div class="adc-reason">'+_adcEsc(sr)+'</div>';
+    var domDir=(ea&&ea.dominant_direction)||(d&&d.direction)||'Long';
+    var aiGd=(d&&d.directions&&domDir!=='Neutral'&&d.directions[domDir]&&d.directions[domDir].gate_debug)
+             ?d.directions[domDir].gate_debug:((d&&d.gate_debug)||{});
+    var gKeys=[['Structure',!!aiGd.structure_confirmed],['Location',!!aiGd.location_ok],
+               ['Volume',!!aiGd.volume_confirmed],['VWAP',!!aiGd.vwap_confirmed],['Sweep',!!aiGd.liquidity_sweep]];
+    if (Object.keys(aiGd).length) {
+      h2+='<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">';
+      gKeys.forEach(function(it){ h2+='<span class="adc-chip '+(it[1]?'ok':'bad')+'">'+(it[1]?'\u2713':'\u2717')+' '+_adcEsc(it[0])+'</span>'; });
+      h2+='</div>';
+    }
+    rEl.innerHTML=h2||'<div class="adc-empty">No active gate data.</div>';
+  }
+  // ── Tab: Strategy ──────────────────────────────────────────────────────
+  var sEl=document.getElementById('adc-s-content');
+  if (sEl) {
+    var h3='';
+    if (se&&se.market_regime) {
+      var rc=se.market_regime==='TRENDING'?'#22c55e':se.market_regime==='VOLATILE'?'#ef4444':se.market_regime==='RANGING'?'#3b82f6':'#6b7280';
+      h3+='<div class="adc-ri"><span class="k">Regime</span><span class="v" style="color:'+rc+'">'+_adcEsc(se.market_regime)+'</span></div>';
+    }
+    if (se.active_strategy) h3+='<div class="adc-ri"><span class="k">Strategy</span><span class="v">'+_adcEsc(se.active_strategy)+'</span></div>';
+    if (se.confidence!=null) {
+      var sc3=Number(se.confidence), scc3=sc3>=85?'#22c55e':sc3>=55?'#eab308':'#6b7280';
+      h3+='<div class="adc-ri"><span class="k">Confidence</span><span class="v" style="color:'+scc3+'">'+Math.round(sc3)+'%</span></div>';
+    }
+    if (se.quality) h3+='<div class="adc-ri"><span class="k">Quality</span><span class="v">'+_adcEsc(se.quality)+'</span></div>';
+    if (se.expected_target_r!=null) h3+='<div class="adc-ri"><span class="k">Expected R</span><span class="v">'+Number(se.expected_target_r).toFixed(1)+'R</span></div>';
+    var miss=se.missing||[];
+    if (miss.length) {
+      h3+='<div style="margin-top:6px;font-size:10px;color:#6b7280;letter-spacing:.8px;margin-bottom:3px">MISSING</div>';
+      h3+='<div style="display:flex;flex-wrap:wrap;gap:3px">'+miss.map(function(m){ return '<span class="adc-chip bad">'+_adcEsc(m)+'</span>'; }).join('')+'</div>';
+    } else if (se.active_strategy) {
+      h3+='<div style="margin-top:6px"><span class="adc-chip ok">\u2713 All confirmations met</span></div>';
+    }
+    sEl.innerHTML=h3||'<div class="adc-empty">No strategy engine data.</div>';
+  }
+  // ── Tab: Entry Quality ─────────────────────────────────────────────────
+  var eqPEl=document.getElementById('adc-eq-content');
+  if (eqPEl) {
+    var h4='';
+    if (eq.engine_enabled&&eq.score!=null) {
+      var egc=eq.grade==='Excellent'?'#22c55e':eq.grade==='Good'?'#84cc16':eq.grade==='Acceptable'?'#f59e0b':'#ef4444';
+      h4+='<div class="adc-ri"><span class="k">Score</span><span class="v" style="color:'+egc+'">'+eq.score+' / 100</span></div>';
+      h4+='<div class="adc-ri"><span class="k">Grade</span><span class="v" style="color:'+egc+'">'+_adcEsc(eq.grade||'\u2014')+'</span></div>';
+      if (eq.verdict_label) h4+='<div class="adc-ri"><span class="k">Status</span><span class="v">'+_adcEsc(eq.verdict_label)+'</span></div>';
+      if (eq.gate_enabled) h4+='<div style="font-size:10px;color:#ef4444;padding:4px 0">\u26a1 Entry Quality Veto Armed</div>';
+      var comps4=eq.components||[];
+      if (comps4.length) {
+        h4+='<div style="margin-top:8px">';
+        comps4.forEach(function(c){
+          var frac4=c.max?Math.max(0,Math.min(1,c.score/c.max)):0, pct4=Math.round(frac4*100);
+          var bc4=frac4>=0.8?'#22c55e':frac4>=0.55?'#f59e0b':'#ef4444';
+          h4+='<div style="margin:4px 0"><div style="display:flex;justify-content:space-between;font-size:10px;color:#9aa">'
+            +'<span>'+_adcEsc(c.label)+'</span><span style="color:'+bc4+'">'+c.score+'/'+c.max+'</span></div>'
+            +'<div class="adc-bw"><div class="adc-bf" style="width:'+pct4+'%;background:'+bc4+'"></div></div></div>';
+        });
+        h4+='</div>';
+      }
+    } else { h4='<div class="adc-empty">Entry quality engine inactive.</div>'; }
+    eqPEl.innerHTML=h4;
+  }
+  // ── Tab: Confidence ────────────────────────────────────────────────────
+  var cgEl=document.getElementById('adc-cg-content');
+  if (cgEl) {
+    var h5='';
+    if (cg&&cg.ready) {
+      var cfin=cg.final_confidence_score, cthr=cg.threshold;
+      var cc5=(cfin>=cthr)?'#22c55e':'#f59e0b';
+      h5+='<div class="adc-ri"><span class="k">Base</span><span class="v">'+_adcEsc(cg.base_edge_score!=null?cg.base_edge_score:'\u2014')+'</span></div>';
+      h5+='<div class="adc-ri"><span class="k">Adjusted</span><span class="v" style="color:'+cc5+'">'+_adcEsc(cfin!=null?cfin:'\u2014')+'</span></div>';
+      h5+='<div class="adc-ri"><span class="k">Threshold</span><span class="v">'+_adcEsc(cthr!=null?cthr:'\u2014')+'</span></div>';
+      var cadj=cg.total_adjustment||0, cadjC=cadj>0?'#22c55e':cadj<0?'#ef4444':'#6b7280';
+      h5+='<div class="adc-ri"><span class="k">Adjustment</span><span class="v" style="color:'+cadjC+'">'+(cadj>0?'+':'')+cadj+'</span></div>';
+      var ccomps=cg.confidence_components||[];
+      if (ccomps.length) {
+        h5+='<div style="margin-top:8px;font-size:10px;color:#6b7280;letter-spacing:.8px;margin-bottom:4px">COMPONENTS</div>';
+        ccomps.forEach(function(c){
+          var csc=c.score!=null?c.score:'\u2014', cscc=c.score!=null?(c.score>=60?'#22c55e':c.score>=45?'#f59e0b':'#ef4444'):'#6b7280';
+          h5+='<div class="adc-ri"><span class="k">'+_adcEsc(c.label||c.name||'?')+'</span><span class="v" style="color:'+cscc+'">'+csc+(c.nudge!=null?' ('+(c.nudge>0?'+':'')+c.nudge+')':'')+'</span></div>';
+        });
+      }
+    } else { h5='<div class="adc-empty">'+_adcEsc((cg&&cg.reason)||'Awaiting trade history.')+'</div>'; }
+    cgEl.innerHTML=h5;
+  }
+  // ── Tab: Memory ────────────────────────────────────────────────────────
+  var tmEl=document.getElementById('adc-tm-content');
+  if (tmEl) {
+    var h6='';
+    if (tm.ready&&tm.similar_trades_found) {
+      var twr=tm.similar_win_rate!=null?Math.round(tm.similar_win_rate*100):null;
+      var twrc=twr!=null?(twr>=55?'#22c55e':twr>=45?'#eab308':'#ef4444'):'#9aa3b2';
+      h6+='<div class="adc-ri"><span class="k">Similar Trades</span><span class="v">'+(tm.similar_trades_found||0)+' found</span></div>';
+      if (twr!=null) h6+='<div class="adc-ri"><span class="k">Win Rate</span><span class="v" style="color:'+twrc+'">'+twr+'%</span></div>';
+      if (tm.average_r!=null) h6+='<div class="adc-ri"><span class="k">Avg R</span><span class="v">'+(tm.average_r>=0?'+':'')+tm.average_r+'R</span></div>';
+      if (tm.average_hold_time!=null) h6+='<div class="adc-ri"><span class="k">Avg Hold</span><span class="v">'+tm.average_hold_time+'m</span></div>';
+      if (tm.memory_recommendation) h6+='<div class="adc-reason">'+_adcEsc(tm.memory_recommendation)+'</div>';
+      if (tm.most_common_failure) h6+='<div class="adc-ri"><span class="k">Common Failure</span><span class="v">'+_adcEsc(tm.most_common_failure)+'</span></div>';
+    } else {
+      h6='<div class="adc-empty">'+_adcEsc((tm&&(tm.reason||'No similar historical trades found.'))||'Awaiting comparable history.')+'</div>';
+    }
+    tmEl.innerHTML=h6;
+  }
+  // ── Tab: Micro Scalp ───────────────────────────────────────────────────
+  var msEl=document.getElementById('adc-ms-content');
+  if (msEl) {
+    var h7='';
+    if (ms&&ms.enabled) {
+      var mv=ms.verdict||'NO TRADE', mvc=mv==='TAKE'?'#22c55e':mv==='WAIT'?'#f59e0b':'#6b7280';
+      h7+='<div class="adc-ri"><span class="k">Verdict</span><span class="v" style="color:'+mvc+'">'+_adcEsc(mv)+'</span></div>';
+      if (ms.direction) h7+='<div class="adc-ri"><span class="k">Direction</span><span class="v">'+_adcEsc(ms.direction)+(ms.setup_type?' \u00b7 '+_adcEsc(String(ms.setup_type).replace(/_/g,' ')):'')+'</span></div>';
+      if (ms.summary) h7+='<div class="adc-reason">'+_adcEsc(ms.summary)+'</div>';
+      var msteps=[['Sweep',!!ms.liquidity_event],['Trap',!!(ms.trapped_side&&ms.trapped_side!=='NONE')],['Absorption',!!ms.absorption],['Trigger',!!ms.micro_trigger]];
+      h7+='<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">';
+      msteps.forEach(function(st){ h7+='<span class="adc-chip '+(st[1]?'ok':'')+'">'+(st[1]?'\u2713':'\u2014')+' '+_adcEsc(st[0])+'</span>'; });
+      h7+='</div>';
+      if (ms.suggested_entry!=null&&ms.suggested_stop!=null) h7+='<div class="adc-ri" style="margin-top:4px"><span class="k">Plan</span><span class="v">entry '+ms.suggested_entry+' \u00b7 stop '+ms.suggested_stop+'</span></div>';
+    } else { h7='<div class="adc-empty">Micro Scalp '+(ms&&ms.enabled===false?'disabled.':'inactive.')+'</div>'; }
+    msEl.innerHTML=h7;
+  }
+}
 function initUnifiedDash() {
   if (!UNIFIED_DASH) return;
   var nav = document.getElementById('live-nav');
@@ -50447,6 +50763,8 @@ function initUnifiedDash() {
   var saved = 'overview';
   try { saved = localStorage.getItem('live_section') || 'overview'; } catch(e) {}
   setLiveSection(saved);
+  // Restore the AI Decision Center's last-viewed internal tab
+  try { var adcSaved=localStorage.getItem('adc_tab'); if(adcSaved) adcSetTab(adcSaved); } catch(e) {}
 }
 
 // ── High-Volume Sessions panel ─────────────────────────────────────────────
