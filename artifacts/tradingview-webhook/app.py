@@ -594,6 +594,18 @@ MANUAL_ORDER_ENABLED = _env_flag_on("MANUAL_ORDER_ENABLED", default_on=False)
 LIQUIDITY_SWEEP_FOCUS_ENABLED = _env_flag_on("LIQUIDITY_SWEEP_FOCUS_ENABLED", default_on=False)
 SWING_MODE_V2_ENABLED   = _env_flag_on("SWING_MODE_V2_ENABLED",   default_on=False)
 SWING_AUTO_EXEC_ENABLED = _env_flag_on("SWING_AUTO_EXEC_ENABLED", default_on=False)
+# ── Decision Pipeline V2 (2026-07-17) ────────────────────────────────────────
+# Shadow-mode 5-stage decision architecture. ALL CAN_* flags default OFF — the
+# pipeline is display-only and never touches the money path. Future phases flip
+# flags one-at-a-time to grant influence. Flag default OFF → key absent →
+# goldens byte-identical.
+DECISION_PIPELINE_V2_ENABLED        = _env_flag_on("DECISION_PIPELINE_V2_ENABLED",             default_on=False)
+_DPV2_SHADOW_MODE                   = _env_flag_on("DECISION_PIPELINE_V2_SHADOW_MODE",         default_on=True)
+_DPV2_CAN_CHANGE_VERDICT            = _env_flag_on("DECISION_PIPELINE_V2_CAN_CHANGE_VERDICT",    default_on=False)
+_DPV2_CAN_CHANGE_CONFIDENCE         = _env_flag_on("DECISION_PIPELINE_V2_CAN_CHANGE_CONFIDENCE", default_on=False)
+_DPV2_CAN_CHANGE_RISK               = _env_flag_on("DECISION_PIPELINE_V2_CAN_CHANGE_RISK",       default_on=False)
+_DPV2_CAN_PAUSE_ENTRIES             = _env_flag_on("DECISION_PIPELINE_V2_CAN_PAUSE_ENTRIES",     default_on=False)
+_DPV2_CAN_ROUTE_ORDERS              = _env_flag_on("DECISION_PIPELINE_V2_CAN_ROUTE_ORDERS",      default_on=False)
 # Only sweeps newer than this (minutes) count — a stale sweep alert must decay to
 # "NO SWEEP" rather than reading as CONFIRMED forever. DISPLAY-ONLY tuning knob.
 LIQ_SWEEP_RECENCY_MIN = _env_float("LIQ_SWEEP_RECENCY_MIN", 20.0)
@@ -20346,6 +20358,534 @@ def _build_brain_state(result):
         return {"available": False, "reason": str(_bse)}
 
 
+# ── Decision Pipeline V2 (2026-07-17) ────────────────────────────────────────
+# Shadow-mode 5-stage decision architecture: OBSERVE → INTERPRET → PRIORITIZE
+# → VALIDATE → DECIDE. Runs at the single full_analysis return seam AFTER the
+# production system has produced its final verdict. Builds its own verdict
+# independently from raw signal stores, then compares with live for diagnostic
+# interest. DISPLAY-ONLY; never mutates global state, never calls full_analysis
+# recursively. Flag OFF → returns None → key not attached → goldens byte-identical.
+# All CAN_* flags default False; money-path influence is future-proofing only.
+#
+# Stage contracts:
+#   OBSERVE    → raw snapshot from global stores (no signal interpretation)
+#   INTERPRET  → bias + alignment from observations (no gate logic)
+#   PRIORITIZE → ranked, weighted signal list (no verdict)
+#   VALIDATE   → per-gate PASS/FAIL/INSUFFICIENT (no combining)
+#   DECIDE     → pipeline verdict + comparison against live system
+
+def _dpv2_stage_observe(instrument):
+    """Stage 1: Snapshot raw signals from global in-memory stores. Read-only, fail-open."""
+    _now = now_utc()
+    _STRUCT_TYPES = {"BOS", "CHOCH", "HH", "HL", "LH", "LL"}
+    _SWEEP_TYPES  = {"LIQUIDITY_SWEEP", "SWEEP", "SWEEP_HIGH", "SWEEP_LOW",
+                     "SWEEP_LONG", "SWEEP_SHORT"}
+
+    # Price
+    auto_rec  = AUTO_PRICE_BY_TICKER.get(instrument) or {}
+    price     = auto_rec.get("value")
+    price_ts  = auto_rec.get("ts")
+    price_age = None
+    if price_ts:
+        try:
+            price_age = (_now - datetime.fromisoformat(price_ts)).total_seconds()
+        except Exception:
+            pass
+
+    # VWAP
+    vwap_rec   = VWAP_BY_TICKER.get(instrument) or {}
+    vwap_value = vwap_rec.get("value")
+    vwap_ts    = vwap_rec.get("ts")
+    vwap_age   = None
+    if vwap_ts:
+        try:
+            vwap_age = (_now - datetime.fromisoformat(vwap_ts)).total_seconds()
+        except Exception:
+            pass
+    price_above_vwap = None
+    if price is not None and vwap_value is not None:
+        try:
+            price_above_vwap = float(price) > float(vwap_value)
+        except Exception:
+            pass
+
+    # CVD
+    cvd_rec   = CVD_BY_TICKER.get(instrument) or {}
+    cvd_state = cvd_rec.get("state")    # "bullish" | "bearish" | None
+    cvd_ts    = cvd_rec.get("ts")
+    cvd_age   = None
+    if cvd_ts:
+        try:
+            cvd_age = (_now - datetime.fromisoformat(cvd_ts)).total_seconds()
+        except Exception:
+            pass
+
+    # RVOL
+    rvol_rec   = RVOL_BY_TICKER.get(instrument) or {}
+    rvol_value = rvol_rec.get("value")
+
+    # Volume spike
+    vol_rec         = VOLUME_SPIKE_BY_TICKER.get(instrument) or {}
+    vol_spike_ts    = vol_rec.get("ts")
+    vol_spike_age   = None
+    vol_spike_fresh = False
+    if vol_spike_ts:
+        try:
+            vol_spike_age   = (_now - datetime.fromisoformat(vol_spike_ts)).total_seconds()
+            vol_spike_fresh = vol_spike_age <= float(cfg("VOLUME_SPIKE_TTL_MIN")) * 60
+        except Exception:
+            pass
+
+    # Structure + sweep alerts from ALERT_HISTORY (last 30 min, per-instrument)
+    horizon_s         = 30 * 60
+    structure_signals = []
+    sweep_signals     = []
+    for _ah in list(ALERT_HISTORY):           # list() for GIL-safe snapshot
+        try:
+            a_inst = (_ah.get("instrument") or
+                      instrument_of(_ah.get("ticker") or ""))
+            if a_inst != instrument:
+                continue
+            a_type = (_ah.get("alert_type") or "").upper()
+            a_ts   = _ah.get("ts") or _ah.get("timestamp")
+            a_age  = None
+            if a_ts:
+                try:
+                    a_age = (_now - datetime.fromisoformat(a_ts)).total_seconds()
+                except Exception:
+                    pass
+            if a_age is not None and a_age > horizon_s:
+                continue
+            direction = (_ah.get("direction") or "").upper()
+            if any(s in a_type for s in _STRUCT_TYPES):
+                structure_signals.append({
+                    "type":      a_type,
+                    "direction": direction,
+                    "age_s":     round(a_age, 1) if a_age is not None else None,
+                })
+            elif any(s in a_type for s in _SWEEP_TYPES):
+                sweep_signals.append({
+                    "type":      a_type,
+                    "direction": direction,
+                    "age_s":     round(a_age, 1) if a_age is not None else None,
+                })
+        except Exception:
+            pass
+
+    structure_signals.sort(key=lambda x: x.get("age_s") or 9999)
+    sweep_signals.sort(key=lambda x:     x.get("age_s") or 9999)
+
+    data_coverage = sum([
+        price is not None,
+        vwap_value is not None,
+        cvd_state is not None,
+        bool(structure_signals),
+    ]) / 4.0
+
+    return {
+        "status":            "OK",
+        "price":             price,
+        "price_age_s":       round(price_age, 1) if price_age is not None else None,
+        "vwap_value":        vwap_value,
+        "vwap_age_s":        round(vwap_age, 1) if vwap_age is not None else None,
+        "price_above_vwap":  price_above_vwap,
+        "cvd_state":         cvd_state,
+        "cvd_age_s":         round(cvd_age, 1) if cvd_age is not None else None,
+        "rvol_value":        rvol_value,
+        "vol_spike_fresh":   vol_spike_fresh,
+        "vol_spike_age_s":   round(vol_spike_age, 1) if vol_spike_age is not None else None,
+        "structure_signals": structure_signals[:5],
+        "sweep_signals":     sweep_signals[:3],
+        "data_coverage":     round(data_coverage, 2),
+    }
+
+
+def _dpv2_stage_interpret(obs):
+    """Stage 2: Derive directional bias and alignment from observations."""
+    long_signals    = []
+    short_signals   = []
+    neutral_signals = []
+
+    # VWAP side
+    pav = obs.get("price_above_vwap")
+    if pav is True:
+        long_signals.append("VWAP_ABOVE")
+    elif pav is False:
+        short_signals.append("VWAP_BELOW")
+    else:
+        neutral_signals.append("VWAP_UNKNOWN")
+
+    # CVD
+    cvd = obs.get("cvd_state")
+    if cvd == "bullish":
+        long_signals.append("CVD_BULLISH")
+    elif cvd == "bearish":
+        short_signals.append("CVD_BEARISH")
+    else:
+        neutral_signals.append("CVD_UNKNOWN")
+
+    # Structure (most recent signal wins; BOS/CHOCH without a clear direction omitted)
+    structs = obs.get("structure_signals") or []
+    if structs:
+        s = structs[0]
+        d = (s.get("direction") or "").upper()
+        t = (s.get("type") or "").upper()
+        if d in ("LONG", "BULLISH", "DEMAND") or t in ("HH", "HL", "BOS_UP", "CHOCH_UP"):
+            long_signals.append("STRUCT_" + t)
+        elif d in ("SHORT", "BEARISH", "SUPPLY") or t in ("LH", "LL", "BOS_DOWN", "CHOCH_DOWN"):
+            short_signals.append("STRUCT_" + t)
+        else:
+            if any(k in t for k in ("BULL", "_UP", "DEMAND")) or t in ("HH", "HL"):
+                long_signals.append("STRUCT_" + t)
+            elif any(k in t for k in ("BEAR", "_DOWN", "SUPPLY")) or t in ("LH", "LL"):
+                short_signals.append("STRUCT_" + t)
+            # BOS/CHOCH with no direction clue → omit (ambiguous)
+
+    # Sweep (most recent; sweep of lows = bullish reversal potential)
+    sweeps = obs.get("sweep_signals") or []
+    if sweeps:
+        s = sweeps[0]
+        d = (s.get("direction") or "").upper()
+        t = (s.get("type") or "").upper()
+        if d in ("LONG", "BULLISH", "DEMAND") or "LOW" in t:
+            long_signals.append("SWEEP_LOW")
+        elif d in ("SHORT", "BEARISH", "SUPPLY") or "HIGH" in t:
+            short_signals.append("SWEEP_HIGH")
+
+    # Volume (directionally neutral — confirms conviction only)
+    if obs.get("vol_spike_fresh"):
+        neutral_signals.append("VOL_SPIKE")
+    if obs.get("rvol_value") is not None:
+        try:
+            if float(obs["rvol_value"]) >= 1.5:
+                neutral_signals.append("RVOL_HIGH")
+        except Exception:
+            pass
+
+    n_long    = len(long_signals)
+    n_short   = len(short_signals)
+    total_dir = n_long + n_short
+
+    if total_dir == 0:
+        bias          = "NEUTRAL"
+        bias_strength = 0
+    elif n_long > n_short:
+        bias          = "LONG_BIAS"
+        bias_strength = round(n_long / total_dir * 100)
+    elif n_short > n_long:
+        bias          = "SHORT_BIAS"
+        bias_strength = round(n_short / total_dir * 100)
+    else:
+        bias          = "CONFLICTED"
+        bias_strength = 50
+
+    alignment_score = 0
+    if bias in ("LONG_BIAS", "SHORT_BIAS") and total_dir > 0:
+        aligned_n       = n_long if bias == "LONG_BIAS" else n_short
+        alignment_score = round(aligned_n / total_dir * 100)
+
+    return {
+        "status":            "OK",
+        "bias":              bias,
+        "bias_strength":     bias_strength,
+        "alignment_score":   alignment_score,
+        "long_signals":      long_signals,
+        "short_signals":     short_signals,
+        "neutral_signals":   neutral_signals,
+        "conflict_detected": n_long > 0 and n_short > 0,
+        "signal_count":      total_dir + len(neutral_signals),
+    }
+
+
+def _dpv2_stage_prioritize(obs, interp, mode):
+    """Stage 3: Rank and weight signals by reliability tier and mode."""
+    bias = interp.get("bias", "NEUTRAL")
+    if bias == "LONG_BIAS":
+        aligned  = list(interp.get("long_signals")  or [])
+        opposing = list(interp.get("short_signals") or [])
+    elif bias == "SHORT_BIAS":
+        aligned  = list(interp.get("short_signals") or [])
+        opposing = list(interp.get("long_signals")  or [])
+    else:
+        aligned  = []
+        opposing = list((interp.get("long_signals") or []) +
+                        (interp.get("short_signals") or []))
+
+    # Reliability tier (higher = more trustworthy)
+    _TIERS = {"STRUCT": 3, "VWAP": 2, "CVD": 2, "SWEEP": 1, "VOL": 1, "RVOL": 1}
+    # Mode sensitivity weights
+    _MW = {
+        "SCALP": {"STRUCT": 1.5, "CVD": 1.5, "VWAP": 1.0, "SWEEP": 1.3, "VOL": 1.2},
+        "SWING": {"STRUCT": 2.0, "CVD": 0.8, "VWAP": 1.5, "SWEEP": 0.8, "VOL": 1.0},
+    }
+    mw = _MW.get(mode, _MW["SCALP"])
+
+    def _tier(sig):
+        for pfx, t in _TIERS.items():
+            if sig.startswith(pfx):
+                return t
+        return 1
+
+    def _mw(sig):
+        for pfx, w in mw.items():
+            if sig.startswith(pfx):
+                return w
+        return 1.0
+
+    scored = sorted(
+        [{"signal": s, "tier": _tier(s), "weight": round(_tier(s) * _mw(s) * 10)}
+         for s in aligned],
+        key=lambda x: -x["weight"],
+    )
+    scored_opp = [{"signal": s, "tier": _tier(s), "weight": round(_tier(s) * 10)}
+                  for s in opposing]
+
+    total_aligned  = sum(x["weight"] for x in scored)
+    total_opposing = sum(x["weight"] for x in scored_opp)
+
+    return {
+        "status":           "OK",
+        "bias":             bias,
+        "primary_signal":   scored[0]["signal"] if scored else None,
+        "secondary_signal": scored[1]["signal"] if len(scored) > 1 else None,
+        "aligned_signals":  scored,
+        "opposing_signals": scored_opp,
+        "weight_advantage": total_aligned - total_opposing,
+        "mode_used":        mode,
+    }
+
+
+def _dpv2_stage_validate(obs, interp, prio, instrument, mode):
+    """Stage 4: Per-gate PASS/FAIL/INSUFFICIENT checks against raw signal data."""
+    bias  = interp.get("bias", "NEUTRAL")
+    gates = {}
+
+    # Gate 1: Structure (BOS/CHOCH/HH/HL/LH/LL within 20 min)
+    structs  = obs.get("structure_signals") or []
+    fresh_s  = [s for s in structs if (s.get("age_s") or 9999) <= 20 * 60]
+    if fresh_s:
+        gates["structure"] = {
+            "result": "PASS",
+            "reason": "%s — %ds ago" % (fresh_s[0]["type"], int(fresh_s[0].get("age_s") or 0)),
+        }
+    elif structs:
+        gates["structure"] = {
+            "result": "FAIL",
+            "reason": "Structure stale (%ds)" % int(structs[0].get("age_s") or 0),
+        }
+    else:
+        gates["structure"] = {"result": "INSUFFICIENT", "reason": "No structure in last 30 min"}
+
+    # Gate 2: VWAP alignment
+    pav        = obs.get("price_above_vwap")
+    vwap_age   = obs.get("vwap_age_s")
+    vwap_stale = vwap_age is not None and vwap_age > 3600
+    if obs.get("vwap_value") is None:
+        gates["vwap"] = {"result": "INSUFFICIENT", "reason": "No VWAP data"}
+    elif vwap_stale:
+        gates["vwap"] = {"result": "INSUFFICIENT", "reason": "VWAP stale (%ds)" % int(vwap_age)}
+    elif bias == "LONG_BIAS" and pav:
+        gates["vwap"] = {"result": "PASS",         "reason": "Price above VWAP — long-aligned"}
+    elif bias == "SHORT_BIAS" and not pav:
+        gates["vwap"] = {"result": "PASS",         "reason": "Price below VWAP — short-aligned"}
+    elif bias in ("NEUTRAL", "CONFLICTED"):
+        gates["vwap"] = {"result": "PASS",         "reason": "VWAP present — neutral bias"}
+    else:
+        gates["vwap"] = {"result": "FAIL",         "reason": "Price on wrong VWAP side for %s" % bias}
+
+    # Gate 3: CVD alignment (fail-open when unknown / stale)
+    cvd       = obs.get("cvd_state")
+    cvd_age   = obs.get("cvd_age_s")
+    cvd_stale = cvd_age is not None and cvd_age > 3600
+    if cvd is None or cvd_stale:
+        gates["cvd"] = {"result": "PASS", "reason": "CVD unknown — fail-open"}
+    elif bias == "LONG_BIAS"  and cvd == "bullish":
+        gates["cvd"] = {"result": "PASS", "reason": "CVD bullish — long-aligned"}
+    elif bias == "SHORT_BIAS" and cvd == "bearish":
+        gates["cvd"] = {"result": "PASS", "reason": "CVD bearish — short-aligned"}
+    elif bias == "LONG_BIAS"  and cvd == "bearish":
+        gates["cvd"] = {"result": "FAIL", "reason": "CVD bearish opposes long bias"}
+    elif bias == "SHORT_BIAS" and cvd == "bullish":
+        gates["cvd"] = {"result": "FAIL", "reason": "CVD bullish opposes short bias"}
+    else:
+        gates["cvd"] = {"result": "PASS", "reason": "CVD %s — neutral bias, fail-open" % cvd}
+
+    # Gate 4: Signal alignment strength (≥50% of directional signals must agree)
+    align_score = interp.get("alignment_score", 0)
+    n_signals   = interp.get("signal_count", 0)
+    if n_signals == 0:
+        gates["alignment"] = {"result": "INSUFFICIENT", "reason": "No directional signals"}
+    elif align_score >= 67:
+        gates["alignment"] = {"result": "PASS", "reason": "Alignment %d%% — strong" % align_score}
+    elif align_score >= 50:
+        gates["alignment"] = {"result": "PASS", "reason": "Alignment %d%% — moderate" % align_score}
+    else:
+        gates["alignment"] = {
+            "result": "FAIL",
+            "reason": "Alignment %d%% — conflicted (%s)" % (align_score, bias),
+        }
+
+    # Gate 5: Conflict clear (fail only on high-tier opposing signal ≥ tier 2)
+    conflict      = interp.get("conflict_detected", False)
+    opp_sigs      = prio.get("opposing_signals") or []
+    high_tier_opp = any(s.get("tier", 0) >= 2 for s in opp_sigs)
+    if not conflict:
+        gates["conflict"] = {"result": "PASS", "reason": "No opposing signals"}
+    elif high_tier_opp:
+        opp_names = [s["signal"] for s in opp_sigs if s.get("tier", 0) >= 2]
+        gates["conflict"] = {"result": "FAIL",
+                              "reason": "High-tier opposition: %s" % opp_names}
+    else:
+        gates["conflict"] = {
+            "result": "PASS",
+            "reason": "Low-tier conflict only — %s" % [s["signal"] for s in opp_sigs],
+        }
+
+    n_pass   = sum(1 for g in gates.values() if g["result"] == "PASS")
+    n_fail   = sum(1 for g in gates.values() if g["result"] == "FAIL")
+    n_insuf  = sum(1 for g in gates.values() if g["result"] == "INSUFFICIENT")
+    pass_rate = round(n_pass / len(gates) * 100) if gates else 0
+
+    return {
+        "status":             "OK",
+        "gates":              gates,
+        "gates_passed":       n_pass,
+        "gates_failed":       n_fail,
+        "gates_insufficient": n_insuf,
+        "total_gates":        len(gates),
+        "pass_rate":          pass_rate,
+    }
+
+
+def _dpv2_stage_decide(interp, prio, validate, live_verdict, live_direction):
+    """Stage 5: Synthesize pipeline verdict and compare with live system."""
+    n_pass  = validate.get("gates_passed", 0)
+    n_fail  = validate.get("gates_failed", 0)
+    n_insuf = validate.get("gates_insufficient", 0)
+    total   = validate.get("total_gates", 5)
+    bias    = interp.get("bias", "NEUTRAL")
+    align   = interp.get("alignment_score", 0)
+    p_rate  = validate.get("pass_rate", 0)
+
+    # Verdict logic: data-sufficient READY requires ≥3 pass + ≤1 fail
+    if n_insuf >= 3:
+        pipeline_verdict   = "INSUFFICIENT_DATA"
+        pipeline_direction = None
+        reasoning = ["Insufficient data: %d/%d gates had data" % (total - n_insuf, total)]
+    elif n_fail == 0 and n_pass >= 4:
+        pipeline_verdict   = "READY"
+        pipeline_direction = ("LONG"  if bias == "LONG_BIAS"
+                               else "SHORT" if bias == "SHORT_BIAS" else None)
+        reasoning = ["%d/%d gates passed (clean)" % (n_pass, total),
+                     "Bias: %s" % bias,
+                     "Alignment: %d%%" % align]
+    elif n_pass >= 3 and n_fail <= 1:
+        pipeline_verdict   = "READY"
+        pipeline_direction = ("LONG"  if bias == "LONG_BIAS"
+                               else "SHORT" if bias == "SHORT_BIAS" else None)
+        reasoning = ["%d/%d gates passed (1 failed)" % (n_pass, total),
+                     "Bias: %s" % bias,
+                     "Alignment: %d%%" % align]
+    else:
+        pipeline_verdict   = "WAIT"
+        pipeline_direction = None
+        failed_names = [k for k, v in (validate.get("gates") or {}).items()
+                        if v["result"] == "FAIL"]
+        reasoning = ["Failed: %s" % failed_names, "Pass rate: %d%%" % p_rate]
+
+    pipeline_confidence = round(p_rate * 0.6 + align * 0.4)
+    live_is_ready       = is_actionable(live_verdict or "WAIT")
+    pipeline_is_ready   = pipeline_verdict == "READY"
+    agreement           = live_is_ready == pipeline_is_ready
+
+    divergence_reason = None
+    if not agreement:
+        if pipeline_is_ready:
+            divergence_reason = "Pipeline READY but live says %s" % live_verdict
+        else:
+            divergence_reason = "Pipeline WAIT but live says %s" % live_verdict
+
+    return {
+        "status":              "OK",
+        "pipeline_verdict":    pipeline_verdict,
+        "pipeline_direction":  pipeline_direction,
+        "pipeline_confidence": pipeline_confidence,
+        "pipeline_reasoning":  reasoning,
+        "agreement_with_live": agreement,
+        "live_verdict":        live_verdict,
+        "live_direction":      live_direction,
+        "divergence_reason":   divergence_reason,
+    }
+
+
+def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction):
+    """
+    Shadow 5-stage decision pipeline: OBSERVE → INTERPRET → PRIORITIZE → VALIDATE → DECIDE.
+
+    DISPLAY-ONLY in shadow mode. Never mutates global state, never calls full_analysis
+    recursively. Fail-open at every stage. Flag OFF → returns None → key not attached
+    → goldens byte-identical. All CAN_* flags default False.
+    """
+    if not DECISION_PIPELINE_V2_ENABLED:
+        return None
+    try:
+        flags = {
+            "enabled":               DECISION_PIPELINE_V2_ENABLED,
+            "shadow_mode":           _DPV2_SHADOW_MODE,
+            "can_change_verdict":    _DPV2_CAN_CHANGE_VERDICT,
+            "can_change_confidence": _DPV2_CAN_CHANGE_CONFIDENCE,
+            "can_change_risk":       _DPV2_CAN_CHANGE_RISK,
+            "can_pause_entries":     _DPV2_CAN_PAUSE_ENTRIES,
+            "can_route_orders":      _DPV2_CAN_ROUTE_ORDERS,
+        }
+
+        def _safe(fn, *args):
+            try:
+                return fn(*args)
+            except Exception as _e:
+                return {"status": "ERROR", "error": str(_e)}
+
+        s1 = _safe(_dpv2_stage_observe, instrument)
+        s2 = (_safe(_dpv2_stage_interpret, s1)
+               if s1.get("status") == "OK" else {"status": "SKIPPED"})
+        s3 = (_safe(_dpv2_stage_prioritize, s1, s2, mode)
+               if s2.get("status") == "OK" else {"status": "SKIPPED"})
+        s4 = (_safe(_dpv2_stage_validate, s1, s2, s3, instrument, mode)
+               if s3.get("status") == "OK" else {"status": "SKIPPED"})
+        s5 = (_safe(_dpv2_stage_decide, s2, s3, s4, live_verdict, live_direction)
+               if s4.get("status") == "OK" else {"status": "SKIPPED"})
+
+        pipeline_verdict = (s5 or {}).get("pipeline_verdict", "INSUFFICIENT_DATA")
+        agreement        = (s5 or {}).get("agreement_with_live")
+
+        logger.info(
+            "[DPv2 shadow] inst=%s mode=%s pipeline=%s live=%s agree=%s",
+            instrument, mode, pipeline_verdict, live_verdict, agreement,
+        )
+        return {
+            "available":           True,
+            "shadow_mode":         True,
+            "instrument":          instrument,
+            "mode":                mode,
+            "flags":               flags,
+            "stages": {
+                "observe":    s1,
+                "interpret":  s2,
+                "prioritize": s3,
+                "validate":   s4,
+                "decide":     s5,
+            },
+            "pipeline_verdict":    pipeline_verdict,
+            "pipeline_direction":  (s5 or {}).get("pipeline_direction"),
+            "pipeline_confidence": (s5 or {}).get("pipeline_confidence"),
+            "agreement_with_live": agreement,
+            "divergence_reason":   (s5 or {}).get("divergence_reason"),
+        }
+    except Exception as _exc:
+        logger.warning("[DPv2] orchestrator error (fail-open): %s", _exc)
+        return {"available": False, "reason": str(_exc), "shadow_mode": True}
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -21909,6 +22449,22 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             result["swing_v2"] = compute_swing_v2_analysis(active_ticker, result)
         except Exception as _sv2_e:
             result["swing_v2"] = {"available": False, "reason": str(_sv2_e)}
+
+    # ── Decision Pipeline V2 (shadow mode, display-only) ─────────────────────
+    # Runs AFTER all production-system vetoes are final so Stage 5 can compare
+    # against the authoritative verdict. Flag OFF → key absent → byte-identical.
+    if DECISION_PIPELINE_V2_ENABLED:
+        try:
+            result["decision_pipeline_v2"] = compute_decision_pipeline_v2(
+                instrument     = instrument_of(active_ticker),
+                mode           = TRADING_MODE,
+                live_verdict   = verdict,
+                live_direction = strict_direction,
+            )
+        except Exception as _dpv2_exc:
+            result["decision_pipeline_v2"] = {
+                "available": False, "reason": str(_dpv2_exc), "shadow_mode": True,
+            }
 
     # ── Trade Failure Analyzer: record actionable READY decisions ─────────────
     # DISPLAY-ONLY, FAIL-OPEN. Hooks at the single return path AFTER all vetoes so
@@ -38624,6 +39180,7 @@ def _build_status_payload(_tk):
         "market_intelligence": a.get("market_intelligence"),
         "breakout_mode":       a.get("breakout_mode"),
         "swing_v2":            a.get("swing_v2"),
+        "decision_pipeline_v2": a.get("decision_pipeline_v2"),
         "equity_curve_today":  a.get("equity_curve_today"),
         "news_filter":         a.get("news_filter"),
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
@@ -44864,6 +45421,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
     <button class="adc-tab" data-tab="memory" onclick="adcSetTab('memory')">Memory</button>
     <button class="adc-tab" data-tab="microscalp" onclick="adcSetTab('microscalp')">Micro Scalp</button>
     <button class="adc-tab" data-tab="mktenv" onclick="adcSetTab('mktenv')">Market Env</button>
+    <button class="adc-tab" data-tab="dpv2" onclick="adcSetTab('dpv2')">Pipeline V2</button>
   </div>
   <!-- Tab panels (toggled by adcSetTab) -->
   <div id="adc-panel-decision" class="adc-panel active"><div id="adc-d-content"></div></div>
@@ -44884,6 +45442,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="adc-panel-memory" class="adc-panel"><div id="adc-tm-content"></div></div>
   <div id="adc-panel-microscalp" class="adc-panel"><div id="adc-ms-content"></div></div>
   <div id="adc-panel-mktenv" class="adc-panel"><div id="adc-me-content"></div></div>
+  <div id="adc-panel-dpv2" class="adc-panel"><div id="adc-dpv2-content"></div></div>
 </div>
 
 <!-- ── Phase 3: Analysis Groups — primary Analysis section view (DISPLAY-ONLY).
@@ -46883,6 +47442,7 @@ function renderModules(d){
   try{ renderActiveThinking(d); }catch(e){}
   try{ hvsUpdateFromStatus(d); }catch(e){}
   try{ renderMarketEnv(d); }catch(e){}
+  try{ renderDecisionPipeline(d); }catch(e){}
   const diag   = d.alert_diagnostics || {};
   const v      = d.verdict || 'WAIT';
   const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
@@ -52062,6 +52622,101 @@ function renderMarketEnv(d) {
   h += '</div>';
   el.innerHTML = h;
 }
+function renderDecisionPipeline(d) {
+  var el = document.getElementById('adc-dpv2-content');
+  if (!el) return;
+  var dp = d && d.decision_pipeline_v2;
+  if (!dp || !dp.available) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:11px;padding:6px 0">'
+      + (dp && dp.reason ? 'Pipeline: ' + aiEsc(dp.reason) : 'Decision Pipeline V2 disabled') + '</div>';
+    return;
+  }
+  var stages  = dp.stages  || {};
+  var decide  = stages.decide   || {};
+  var validate= stages.validate || {};
+  var interp  = stages.interpret|| {};
+  var prio    = stages.prioritize||{};
+  var gates   = validate.gates  || {};
+  function verdCol(v){
+    if(v==='READY') return '#22c55e';
+    if(v==='WAIT')  return '#ef4444';
+    return '#f59e0b';
+  }
+  function gateCol(r){
+    if(r==='PASS')        return '#22c55e';
+    if(r==='FAIL')        return '#ef4444';
+    if(r==='INSUFFICIENT')return '#f59e0b';
+    return '#6b7280';
+  }
+  function stageOk(s){ return s && s.status==='OK'; }
+  var pv   = decide.pipeline_verdict || 'INSUFFICIENT_DATA';
+  var agree= decide.agreement_with_live;
+  var h = '';
+  h += '<div style="font-size:10px;color:#818cf8;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#8635; DECISION PIPELINE V2 &mdash; SHADOW MODE</div>';
+  h += '<div style="margin-bottom:10px;padding:8px;background:rgba(255,255,255,.04);border-radius:6px;border:1px solid var(--border)">';
+  h += '<div style="font-size:15px;font-weight:800;color:'+verdCol(pv)+';letter-spacing:.02em">'+aiEsc(pv.replace(/_/g,' '))+'</div>';
+  if(decide.pipeline_direction){
+    h += '<div style="font-size:10px;color:var(--muted);margin-top:2px">Direction: <span style="color:var(--fg);font-weight:600">'+aiEsc(decide.pipeline_direction)+'</span></div>';
+  }
+  h += '<div style="font-size:10px;color:var(--muted);margin-top:3px">';
+  if(decide.pipeline_confidence!=null){ h += 'Confidence: <span style="color:var(--fg)">'+decide.pipeline_confidence+'%</span> &bull; '; }
+  h += 'Bias: <span style="color:var(--fg)">'+aiEsc((interp.bias||'&mdash;').replace(/_/g,' '))+'</span></div>';
+  if(agree!=null){
+    var agC = agree ? '#22c55e' : '#f59e0b';
+    var agL = agree ? '&#10003; Agrees with live system' : '&#9888; Diverges from live system';
+    h += '<div style="font-size:10px;color:'+agC+';margin-top:4px;font-weight:600">'+agL+'</div>';
+    if(!agree && decide.divergence_reason){
+      h += '<div style="font-size:9px;color:var(--muted);margin-top:2px">'+aiEsc(decide.divergence_reason)+'</div>';
+    }
+  }
+  h += '</div>';
+  var SNAMES = ['observe','interpret','prioritize','validate','decide'];
+  var SLABELS= ['OBS','INT','PRI','VAL','DEC'];
+  h += '<div style="display:flex;gap:3px;margin-bottom:10px;align-items:center">';
+  SNAMES.forEach(function(sn,i){
+    var s  = stages[sn] || {};
+    var ok = stageOk(s);
+    var sc = ok ? '#22c55e' : (s.status==='ERROR' ? '#ef4444' : '#6b7280');
+    if(i>0) h += '<div style="flex:1;height:1px;background:rgba(255,255,255,.1);margin-bottom:8px"></div>';
+    h += '<div style="text-align:center">';
+    h += '<div style="width:8px;height:8px;border-radius:50%;background:'+sc+';margin:0 auto 3px"></div>';
+    h += '<div style="font-size:7px;color:'+sc+';letter-spacing:.4px;font-weight:700">'+SLABELS[i]+'</div>';
+    h += '</div>';
+  });
+  h += '</div>';
+  var gkeys = Object.keys(gates);
+  if(gkeys.length){
+    h += '<div style="font-size:9px;color:var(--muted);margin-bottom:5px;font-weight:700;letter-spacing:.05em">GATES ('+
+         (validate.gates_passed||0)+'/'+( validate.total_gates||0)+' PASS)</div>';
+    gkeys.forEach(function(gk){
+      var g  = gates[gk];
+      var gc = gateCol(g.result);
+      var sym= g.result==='PASS' ? '&#10003;' : g.result==='FAIL' ? '&#10007;' : '?';
+      h += '<div style="display:flex;gap:5px;align-items:flex-start;margin-bottom:3px">';
+      h += '<span style="font-size:9px;color:'+gc+';font-weight:700;min-width:12px">'+sym+'</span>';
+      h += '<span style="font-size:9px;color:var(--muted);min-width:58px;text-transform:capitalize">'+aiEsc(gk)+'</span>';
+      h += '<span style="font-size:9px;color:var(--fg);flex:1">'+aiEsc(g.reason||'')+'</span>';
+      h += '</div>';
+    });
+  }
+  var aligned = prio.aligned_signals || [];
+  if(aligned.length){
+    h += '<div style="font-size:9px;color:var(--muted);margin:8px 0 4px;font-weight:700;letter-spacing:.05em">TOP SIGNALS</div>';
+    aligned.slice(0,3).forEach(function(s){
+      h += '<div style="font-size:9px;color:var(--fg);margin-bottom:2px">&#9642; '+
+           aiEsc(s.signal.replace(/_/g,' '))+
+           ' <span style="color:var(--muted)">(tier '+s.tier+', wt '+s.weight+')</span></div>';
+    });
+  }
+  var reasoning = decide.pipeline_reasoning || [];
+  if(reasoning.length){
+    h += '<div style="font-size:9px;color:var(--muted);margin-top:6px">'+
+         reasoning.map(function(r){return aiEsc(r);}).join(' &bull; ')+'</div>';
+  }
+  h += '<div style="font-size:8px;color:rgba(130,130,160,.4);margin-top:8px;border-top:1px solid var(--border);padding-top:6px">Shadow mode &mdash; display only &mdash; no live trading influence</div>';
+  el.innerHTML = h;
+}
+
 function hvsUpdateFromStatus(d) {
   if (!d) return;
   _hvsData = d.session_windows || {};

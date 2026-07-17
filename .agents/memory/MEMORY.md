@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Decision Pipeline V2](decision-pipeline-v2.md) — shadow 5-stage OBSERVE→INTERPRET→PRIORITIZE→VALIDATE→DECIDE; all CAN_* flags default-OFF; flag-OFF byte-identical; future phases flip flags one-at-a-time.
 - [ME regime vs primary_driver split](me-regime-driver-split.md) — regime=market condition (RISK_ON/OFF/MIXED/NEUTRAL/UNKNOWN); primary_driver=news cause (GEOPOLITICAL_ESCALATION/FED_DRIVEN/…/NONE); risk_state derived from both (SHOCK=RISK_OFF+GEO); _risk_off_like boolean in futures_preference unifies the two.
 - [Trade Failure Analyzer](trade-failure-analyzer.md) — TFA_DB_READY-gated READY→trigger→outcome recorder; 8 functions + /failure-analysis route; goldens byte-identical when DB absent.
 - [Thesis Phase 2 dashboard + alerts](thesis-phase2.md) — timeline/Discord/DB/routes/dashboard panel for thesis hysteresis; emoji escape rules; 33 tests total (P1+P2).
