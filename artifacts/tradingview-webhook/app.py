@@ -21321,6 +21321,65 @@ def _dpv2_analyst_briefing(s1, s2, s3, s4, s5, instrument, mode):
         parts += [_nl, "Next Action", next_action, _nl, "Invalidation", invalidation]
         briefing_text = "\n".join(p for p in parts if p != _nl or True)
 
+        # ── Narrative summary (assembled from existing briefing fields only) ─────
+        # Max 90 words. Template-based, deterministic. No external calls.
+        # narrative_summary_source: dpv2_existing_fields
+        _ns_parts = []
+        if regime_label and regime_label.lower() != "unknown":
+            _ns_parts.append(
+                "%s conditions are being driven by %s." % (regime_label, driver_label.lower())
+            )
+        else:
+            _ns_parts.append("Market conditions are currently undetermined.")
+        if leading and weak:
+            _ns_ls = " and ".join(leading[:2])
+            _ns_ws = " and ".join(weak[:2])
+            _ns_lv = "are" if " and " in _ns_ls else "is"
+            _ns_wv = "are" if " and " in _ns_ws else "is"
+            _ns_parts.append(
+                "%s %s showing the strongest relative flow "
+                "while %s %s weak." % (_ns_ls, _ns_lv, _ns_ws.lower(), _ns_wv)
+            )
+        elif leading:
+            _ns_ls = " and ".join(leading[:2])
+            _ns_lv = "are" if " and " in _ns_ls else "is"
+            _ns_parts.append("%s %s showing the strongest relative flow." % (_ns_ls, _ns_lv))
+        else:
+            _ns_parts.append("No dominant capital flow direction has been identified.")
+        _ns_parts.append("%s is currently the highest-priority market." % top_symbol)
+        _ns_generic_block = ["Insufficient technical confirmation"]
+        if verdict_display in ("LONG READY", "SHORT READY"):
+            _ns_parts.append("The production engine verdict is %s." % verdict_display)
+        elif blocking and blocking != _ns_generic_block:
+            _ns_block = blocking[0].lower().rstrip(".")
+            _ns_parts.append(
+                "The production engine verdict is %s because %s." % (verdict_display, _ns_block)
+            )
+        else:
+            _ns_parts.append(
+                "The production engine verdict is %s; "
+                "technical confirmation is still pending." % verdict_display
+            )
+        _ns_na = next_action.rstrip(".")
+        if _ns_na and _ns_na.lower() not in ("monitor current conditions",):
+            if _ns_na[0].isupper():
+                _ns_na = _ns_na[0].lower() + _ns_na[1:]
+            _ns_parts.append("Next, %s." % _ns_na)
+        else:
+            _ns_parts.append("Monitor current conditions.")
+        _ns_generic_inv = "Loss of structure and sustained break of VWAP."
+        if invalidation and invalidation != _ns_generic_inv:
+            _ns_inv = invalidation.strip()
+            if not _ns_inv.endswith("."):
+                _ns_inv += "."
+            _ns_parts.append(_ns_inv)
+        narrative_summary = " ".join(_ns_parts)
+        _ns_words = narrative_summary.split()
+        if len(_ns_words) > 90:
+            narrative_summary = " ".join(_ns_words[:90])
+            if not narrative_summary.endswith("."):
+                narrative_summary = narrative_summary.rsplit(" ", 1)[0] + "."
+
         return {
             "available":       True,
             "display_only":    True,
@@ -21352,9 +21411,11 @@ def _dpv2_analyst_briefing(s1, s2, s3, s4, s5, instrument, mode):
                 "confirming_factors":passed[:3],
                 "technical_found":   expl.get("what_the_technical_engine_found", ""),
             },
-            "next_action":    next_action,
-            "invalidation":   invalidation,
-            "briefing_text":  briefing_text,
+            "next_action":             next_action,
+            "invalidation":            invalidation,
+            "briefing_text":           briefing_text,
+            "narrative_summary":       narrative_summary,
+            "narrative_summary_source":"dpv2_existing_fields",
         }
     except Exception as _ae:
         return {
@@ -53421,6 +53482,20 @@ function renderDecisionPipeline(d) {
         + '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">'+label+'</div>'
         + '<div style="font-size:10px;color:'+vc+';line-height:1.45;word-break:break-word">'+aiEsc(String(val||''))+'</div>'
         + '</div>';
+    }
+    var nsText = ab.narrative_summary || '';
+    if (nsText) {
+      var nsV  = tv.verdict || '';
+      var nsVR = (nsV==='LONG READY'||nsV==='SHORT READY');
+      var nsVW = (!nsV || nsV==='WAIT');
+      var nsVC = nsVR ? '#22c55e' : (nsVW ? '#f59e0b' : '#ef4444');
+      h += '<div style="margin-bottom:10px;padding:9px 10px;background:rgba(129,140,248,.06);border:1px solid rgba(129,140,248,.18);border-radius:6px">';
+      h += '<div style="font-size:9px;color:var(--fg);line-height:1.6;word-break:break-word">'+aiEsc(nsText)+'</div>';
+      h += '</div>';
+      h += '<div style="margin-bottom:9px;display:flex;align-items:center;gap:8px">';
+      h += '<div style="font-size:13px;font-weight:800;color:'+nsVC+'">'+aiEsc(nsV||'WAIT')+'</div>';
+      h += '<div style="font-size:8px;color:rgba(130,130,160,.5)">Source: Production Engine</div>';
+      h += '</div>';
     }
     h += brow('Market Environment', me.regime || 'Market regime unavailable');
     h += brow('Primary Driver',     me.primary_driver || 'No primary driver identified');
