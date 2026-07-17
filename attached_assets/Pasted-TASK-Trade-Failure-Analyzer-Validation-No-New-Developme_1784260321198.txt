@@ -1,0 +1,373 @@
+TASK: Trade Failure Analyzer Validation — No New Development
+
+Do not add more features.
+Do not publish production yet.
+Do not modify trading logic, thresholds, scoring, risk, or execution.
+
+The Trade Failure Analyzer implementation is complete locally. Validate it thoroughly before production.
+
+==================================================
+1. CHANGE INVENTORY
+==================================================
+
+Report:
+
+- exact files changed
+- exact functions added
+- exact existing functions modified
+- database table schema
+- indexes and uniqueness constraints
+- API routes added
+- proxy routes added
+- background-loop changes
+- every READY, execution, and trade-close hook added
+
+Explain why each hook is necessary.
+
+==================================================
+2. VERIFY SCOPE
+==================================================
+
+Confirm the analyzer is observational only.
+
+It must not change:
+
+- READY verdict
+- direction
+- entry
+- stop
+- targets
+- confidence
+- edge score
+- contracts
+- risk
+- execution timing
+- TradersPost payloads
+- position management
+- trade exits
+
+Show the actual control flow proving analyzer failures cannot block or alter trading.
+
+All analyzer database writes must fail open.
+
+==================================================
+3. READY RECORDING TEST
+==================================================
+
+Simulate a READY decision and verify exactly one analysis record is created.
+
+Report the saved fields:
+
+- analysis ID
+- instrument
+- direction
+- strategy
+- decision timestamp
+- market timestamp
+- entry
+- stop
+- targets
+- confidence
+- edge score
+- HTF bias
+- structure state
+- VWAP position
+- setup age
+- volatility state
+- failed conditions
+- actionable status
+- execution status
+
+Replay the same READY event and prove no duplicate record is created.
+
+==================================================
+4. EXECUTION LINKAGE TEST
+==================================================
+
+Simulate an executed trade.
+
+Prove the execution is linked to the correct READY analysis record.
+
+Verify:
+
+- analysis ID
+- trade ID
+- TradersPost request ID, when applicable
+- execution timestamp
+- requested entry
+- actual entry
+- slippage
+- contracts
+- execution source
+
+Confirm a trade cannot accidentally link to a different instrument, direction, strategy, or older READY decision.
+
+==================================================
+5. OUTCOME LINKAGE TEST
+==================================================
+
+Simulate trade closure and verify the original analysis record is updated rather than duplicated.
+
+Check:
+
+- exit timestamp
+- exit price
+- realized P&L
+- result label
+- target reached
+- stop reached
+- MFE
+- MAE
+- holding duration
+- exit reason
+- failure classification
+
+Prove one closed trade creates one final outcome.
+
+==================================================
+6. MFE AND MAE VALIDATION
+==================================================
+
+Explain exactly where MFE and MAE prices come from.
+
+Verify calculations independently using a known price sequence.
+
+Test:
+
+LONG:
+- entry 100
+- highest price 108
+- lowest price 97
+- expected MFE = +8
+- expected MAE = -3
+
+SHORT:
+- entry 100
+- lowest price 92
+- highest price 104
+- expected MFE = +8
+- expected MAE = -4
+
+Also report values in:
+
+- price points
+- ticks
+- dollars, when contract metadata is available
+- R multiples, when stop distance is valid
+
+Do not silently substitute realized P&L for MFE or MAE.
+
+==================================================
+7. FAILURE CLASSIFICATION TESTS
+==================================================
+
+Test every supported failure bucket independently:
+
+- late entry
+- wrong directional bias
+- poor location
+- weak trigger
+- volatility mismatch
+- deteriorated risk/reward
+- execution or slippage problem
+- exit-management problem
+- invalidated before entry
+- no trigger
+- successful trade
+- unknown
+
+For each bucket provide:
+
+- exact classification rules
+- input fixture
+- expected result
+- actual result
+
+Classification rules must be deterministic and auditable.
+
+Do not use vague AI-generated labels.
+
+==================================================
+8. TIME AND SESSION SAFETY
+==================================================
+
+Verify all timestamps use one defined standard internally.
+
+Report:
+
+- storage timezone
+- display timezone
+- TradingView timestamp handling
+- market-data timestamp handling
+- restart handling
+- session-boundary behavior
+
+Confirm setup age cannot become negative or incorrectly span stale sessions.
+
+==================================================
+9. RESTART PERSISTENCE
+==================================================
+
+Test:
+
+1. Create READY analysis.
+2. Restart application.
+3. Confirm the analysis survives.
+4. Execute or simulate the linked trade.
+5. Restart again.
+6. Close the trade.
+7. Confirm one continuous analysis record remains linked throughout.
+
+Confirm no restored analysis record becomes an actionable trade signal.
+
+==================================================
+10. CONCURRENCY AND DEDUPLICATION
+==================================================
+
+Submit two identical READY events 5 milliseconds apart.
+
+Verify:
+
+- exactly one analysis record
+- no database exception
+- no race-created duplicate
+- no corrupted execution linkage
+
+Submit two legitimate READY events for different instruments at the same time.
+
+Verify both are recorded independently.
+
+==================================================
+11. WRITE-RATE CHECK
+==================================================
+
+Confirm the analyzer does not write on:
+
+- dashboard polls
+- status requests
+- diagnostics requests
+- every market tick
+- every snapshot-loop cycle when nothing changed
+
+Report the expected writes per completed trade:
+
+- READY record
+- execution update
+- MFE/MAE updates
+- closure update
+- summary aggregation
+
+If MFE/MAE writes occur every tick, add bounded or change-based persistence before publishing.
+
+Do not change code unless an actual excessive-write problem is proven.
+
+==================================================
+12. API VALIDATION
+==================================================
+
+Test the new analyzer endpoints through both:
+
+- Flask directly
+- the Express proxy
+
+Verify:
+
+- success response
+- empty-state response
+- malformed parameter handling
+- missing-record response
+- pagination or result limits
+- no secret/internal fields exposed
+- no endpoint can modify trading state
+
+==================================================
+13. SUMMARY ACCURACY
+==================================================
+
+Create a controlled dataset of 25 completed trades with known outcomes.
+
+Verify the summary calculates correctly:
+
+- total trades
+- wins
+- losses
+- breakeven
+- win rate
+- average MFE
+- average MAE
+- average R
+- late-entry percentage
+- wrong-bias percentage
+- poor-location percentage
+- other failure percentages
+
+Percentages must use the correct denominator and sum appropriately.
+
+==================================================
+14. TEST SUITE
+==================================================
+
+Add focused Trade Failure Analyzer tests covering all items above.
+
+Then run:
+
+- Python syntax check
+- Trade Failure Analyzer tests
+- persistence tests
+- parity test
+- scalp golden
+- dual-sim golden
+- breakout-mode golden
+- all money-path tests
+
+Report test names and pass/fail totals.
+
+==================================================
+15. PRODUCTION PLAN
+==================================================
+
+Prepare, but do not execute, a safe production rollout plan.
+
+The first production phase must be:
+
+- shadow observation only
+- no strategy changes
+- no threshold changes
+- no live execution changes
+- collect at least 25 completed decisions
+- generate the first failure summary
+
+==================================================
+FINAL RESPONSE
+==================================================
+
+Return:
+
+IMPLEMENTATION SUMMARY
+
+SCHEMA
+
+HOOKS
+
+DEDUPLICATION
+
+MFE/MAE VALIDATION
+
+CLASSIFICATION RULES
+
+RESTART RESULTS
+
+API RESULTS
+
+WRITE RATE
+
+TEST RESULTS
+
+UNRESOLVED RISKS
+
+RECOMMENDATION:
+- SAFE TO PUBLISH
+or
+- NOT SAFE TO PUBLISH
+
+Stop after the report.

@@ -42,7 +42,10 @@ Reuses `_derive_trade_label` categories (WIN, LATE_ENTRY, EARLY_ENTRY, STOPPED_B
 Posts to `DISCORD_WEBHOOK_URL` gated on `DISCORD_LIVE_ENABLED`.
 
 ## Route
-`/failure-analysis GET` — owner-only, added to Express proxy whitelist in `artifacts/api-server/src/routes/flask-proxy.ts`. Returns `{status, records, summary, totals{completed, wins, win_rate_pct}}`.
+`/failure-analysis GET` — owner-only, added to Express proxy whitelist in `artifacts/api-server/src/routes/flask-proxy.ts`. Returns `{status, records, summary, totals{completed, wins, win_rate_pct}}`. Flask runs on PORT env (default 8000).
+
+## Schema gap found during validation
+The initial CREATE TABLE omitted the `outcome VARCHAR` column. Fixed via `ALTER TABLE trade_failure_analysis ADD COLUMN IF NOT EXISTS outcome VARCHAR`. Must be applied to production via Publish schema-diff before the first production deploy. Without it every `_complete_tfa_record()` call fails silently (fail-open — record stays incomplete forever).
 
 ## How to apply
 - Any new READY trigger path (gateway variant, new instrument) must call `_mark_tfa_triggered(inst, source, entry_price)` after a `sent`/`simulated` status.
