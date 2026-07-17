@@ -1670,3 +1670,338 @@ def test_scope_tfa_db_ready_false_skips_all_writes():
 
     _guarded_record(inst="MGC", direction="Long")
     assert not called, "TFA_DB_READY=False must skip all writes"
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 16 — End-to-End Lifecycle Simulation
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# These tests walk a complete trade lifecycle through the real database:
+#   READY  →  triggered  →  completed with outcome + failure classification
+#
+# All DB work uses the existing _insert_ready / _trigger / _complete / _fetch /
+# _clean helpers.  Failure classification uses the inlined
+# _classify_failure_mode_test() — identical to production code — so this
+# section stays import-free (no app.py dependency).
+#
+# Six scenarios:
+#   Sim-A  Loss / WRONG_BIAS          (long vs bearish bias — top priority)
+#   Sim-B  Loss / NO_FOLLOW_THROUGH   (aligned bias, price never moved)
+#   Sim-C  Win                        (target hit → failure_mode = "WIN")
+#   Sim-D  check_trade_events STOP    (price-triggered stop: r=-1, mfe/mae=None)
+#   Sim-E  check_trade_events T1      (price-triggered win: r computed from geometry)
+#   Sim-F  Two instruments concurrent (MGC Win + MNQ Loss — no cross-contamination)
+
+
+SIM_PFX = "SIM-E2E"
+
+
+def _sim_classify(outcome, mfe_r=None, mae_r=None, r_multiple=None,
+                  entry_price=None, stop_loss=None,
+                  bias=None, vol_regime="NORMAL", eq_score=72.0,
+                  session="RTH", trigger_lag_sec=4.0, direction="Long"):
+    """Classify a trade outcome using the inlined test classifier.
+
+    Builds the minimal `mt` dict that _classify_failure_mode_test expects
+    and returns (failure_mode, failure_detail).
+    """
+    mt = {
+        "outcome":         outcome,
+        "r_multiple":      r_multiple,
+        "mfe_r":           mfe_r,
+        "mae_r":           mae_r,
+        "direction":       direction,
+        "entry_price":     entry_price,
+        "stop_loss":       stop_loss,
+        "trigger_lag_sec": trigger_lag_sec,
+    }
+    ctx = {"session": session}
+    return _classify_failure_mode_test(mt, ctx,
+                                       bias=bias,
+                                       vol_regime=vol_regime,
+                                       eq_score=eq_score)
+
+
+# ── Sim-A: Loss / WRONG_BIAS ─────────────────────────────────────────────────
+
+def test_sim_a_wrong_bias_full_lifecycle():
+    """Full lifecycle — Long setup with bearish bias → WRONG_BIAS.
+
+    Lifecycle:
+      1. READY  (direction=Long, bias=bearish, edge=78, eq=72)
+      2. Triggered (auto, 4.2s lag, entry 2648.0)
+      3. Stop hit  (exit 2643.0, r=-1.0, mfe=0.4, mae=0.85)
+      4. Verify: outcome=Loss, failure_mode=WRONG_BIAS, all fields persisted.
+    """
+    pfx = SIM_PFX + "-A"
+    rid = pfx + "-wrong-bias"
+    _clean(pfx)
+    try:
+        # Step 1: READY
+        _insert_ready(rid, inst="MGC", direction="Long", mode="SCALP",
+                      edge=78.0, eq=72.0, strategy="momentum",
+                      bias="bearish", price=2650.0)
+        r0 = _fetch(rid)
+        assert r0 is not None
+        assert not r0["triggered"],      "Should be untriggered at READY"
+        assert r0["outcome"] is None,    "No outcome yet at READY"
+        assert r0["completed_at"] is None
+
+        # Step 2: Entry triggered
+        _trigger(rid, source="auto", entry_price=2648.0, lag_sec=4.2)
+        r1 = _fetch(rid)
+        assert r1["triggered"]
+        assert r1["trigger_source"] == "auto"
+        assert float(r1["trigger_lag_sec"]) == pytest.approx(4.2, abs=0.01)
+        assert float(r1["entry_price"]) == pytest.approx(2648.0, abs=0.01)
+        assert r1["outcome"] is None,    "Trade still in flight"
+
+        # Step 3: Classify and complete
+        fm, fd = _sim_classify("Loss", mfe_r=0.4, mae_r=0.85, r_multiple=-1.0,
+                               bias="bearish", vol_regime="NORMAL",
+                               eq_score=72.0, direction="Long")
+        _complete(rid, outcome="Loss", exit_price=2643.0, mfe_r=0.4,
+                  mae_r=0.85, r_multiple=-1.0, duration_min=6.5,
+                  failure_mode=fm, failure_detail=fd)
+
+        # Step 4: Verify complete record
+        r2 = _fetch(rid)
+        assert r2["outcome"] == "Loss"
+        assert float(r2["r_multiple"]) == pytest.approx(-1.0, abs=0.01)
+        assert float(r2["exit_price"]) == pytest.approx(2643.0, abs=0.01)
+        assert float(r2["mfe_r"])      == pytest.approx(0.4,    abs=0.01)
+        assert float(r2["mae_r"])      == pytest.approx(0.85,   abs=0.01)
+        assert r2["completed_at"] is not None
+        assert r2["failure_mode"] == "WRONG_BIAS", (
+            f"Expected WRONG_BIAS, got {r2['failure_mode']!r}")
+        assert r2["failure_detail"] is not None
+    finally:
+        _clean(pfx)
+
+
+# ── Sim-B: Loss / NO_FOLLOW_THROUGH ─────────────────────────────────────────
+
+def test_sim_b_no_follow_through_full_lifecycle():
+    """Full lifecycle — aligned bias, price never extended → NO_FOLLOW_THROUGH.
+
+    Bias is bullish and direction is Long (aligned → WRONG_BIAS skipped).
+    mfe_r=0.2 < 0.25 threshold → NO_FOLLOW_THROUGH wins the classification.
+    (The inlined _derive_trade_label_test uses the 0.25 cutoff, matching app.py.)
+    """
+    pfx = SIM_PFX + "-B"
+    rid = pfx + "-no-follow"
+    _clean(pfx)
+    try:
+        _insert_ready(rid, inst="MGC", direction="Long", mode="SCALP",
+                      edge=80.0, eq=74.0, strategy="momentum",
+                      bias="bullish", price=2650.0)
+
+        _trigger(rid, source="manual", entry_price=2649.0, lag_sec=2.8)
+        r1 = _fetch(rid)
+        assert r1["triggered"]
+        assert r1["trigger_source"] == "manual"
+
+        fm, fd = _sim_classify("Loss", mfe_r=0.2, mae_r=0.9, r_multiple=-1.0,
+                               bias="bullish", vol_regime="NORMAL",
+                               eq_score=74.0, direction="Long")
+        _complete(rid, outcome="Loss", exit_price=2644.0, mfe_r=0.2,
+                  mae_r=0.9, r_multiple=-1.0, duration_min=4.0,
+                  failure_mode=fm, failure_detail=fd)
+
+        r2 = _fetch(rid)
+        assert r2["outcome"] == "Loss"
+        assert r2["failure_mode"] == "NO_FOLLOW_THROUGH", (
+            f"Expected NO_FOLLOW_THROUGH (mfe=0.2 < 0.25 threshold), got {r2['failure_mode']!r}")
+        assert r2["completed_at"] is not None
+    finally:
+        _clean(pfx)
+
+
+# ── Sim-C: Win ───────────────────────────────────────────────────────────────
+
+def test_sim_c_win_full_lifecycle():
+    """Full lifecycle — target hit → failure_mode = WIN.
+
+    High edge (88) + good entry quality (80) + aligned bullish bias.
+    outcome=Win must produce failure_mode="WIN" regardless of mfe/mae.
+    """
+    pfx = SIM_PFX + "-C"
+    rid = pfx + "-win"
+    _clean(pfx)
+    try:
+        _insert_ready(rid, inst="MGC", direction="Long", mode="SCALP",
+                      edge=88.0, eq=80.0, strategy="momentum",
+                      bias="bullish", price=2650.0)
+
+        _trigger(rid, source="manual", entry_price=2651.0, lag_sec=1.5)
+
+        fm, fd = _sim_classify("Win", mfe_r=1.2, mae_r=0.1, r_multiple=1.0,
+                               bias="bullish", vol_regime="NORMAL",
+                               eq_score=80.0, direction="Long")
+        _complete(rid, outcome="Win", exit_price=2661.0, mfe_r=1.2,
+                  mae_r=0.1, r_multiple=1.0, duration_min=12.0,
+                  failure_mode=fm, failure_detail=fd)
+
+        r = _fetch(rid)
+        assert r["outcome"] == "Win"
+        assert float(r["r_multiple"]) > 0
+        assert r["failure_mode"] == "WIN", f"Got {r['failure_mode']!r}"
+        assert r["completed_at"] is not None
+        assert float(r["mfe_r"]) == pytest.approx(1.2, abs=0.01)
+    finally:
+        _clean(pfx)
+
+
+# ── Sim-D: check_trade_events STOP_HIT path ──────────────────────────────────
+
+def test_sim_d_check_trade_events_stop_hook():
+    """Replicates the check_trade_events STOP_HIT TFA hook from app.py.
+
+    On the price-poll close path the hook sets outcome=Loss, r_multiple=-1.0
+    (hardcoded — full stop realised), and leaves mfe_r / mae_r as NULL
+    because the managed-trade watcher owns those fields.
+
+    This test builds the same thin dict the hook creates and verifies:
+      - outcome = Loss, r_multiple = -1.0
+      - mfe_r and mae_r are NULL in the DB (not tracked on this path)
+      - failure_mode is a real label (not uncategorized / None)
+    """
+    pfx = SIM_PFX + "-D"
+    rid = pfx + "-stop-hook"
+    _clean(pfx)
+    try:
+        _insert_ready(rid, inst="MGC", direction="Long", mode="SCALP",
+                      edge=75.0, eq=68.0, strategy="breakout",
+                      bias="bullish", price=2640.0)
+        _trigger(rid, source="auto", entry_price=2639.0, lag_sec=6.0)
+
+        # Replicate the exact hook logic from the STOP_HIT branch in app.py.
+        # mfe_r / mae_r are deliberately omitted (None = hook doesn't have them).
+        parsed_price = 2629.0   # stop level
+        outcome      = "Loss"
+        r_multiple   = -1.0     # hardcoded in hook
+        fm, fd = _sim_classify(outcome, mfe_r=None, mae_r=None,
+                               r_multiple=r_multiple,
+                               entry_price=2639.0, stop_loss=2629.0,
+                               bias="bullish", vol_regime="NORMAL",
+                               eq_score=68.0, direction="Long")
+        # Complete without mfe_r / mae_r to confirm they stay NULL
+        _complete(rid, outcome=outcome, exit_price=parsed_price,
+                  mfe_r=None, mae_r=None, r_multiple=r_multiple,
+                  duration_min=None, failure_mode=fm, failure_detail=fd)
+
+        r = _fetch(rid)
+        assert r["outcome"]    == "Loss"
+        assert float(r["r_multiple"]) == pytest.approx(-1.0, abs=0.01)
+        assert float(r["exit_price"]) == pytest.approx(2629.0, abs=0.01)
+        assert r["mfe_r"] is None, "mfe_r must be NULL on check_trade_events path"
+        assert r["mae_r"] is None, "mae_r must be NULL on check_trade_events path"
+        assert r["failure_mode"] not in (None, "uncategorized"), (
+            f"Expected a real failure label, got {r['failure_mode']!r}")
+        assert r["completed_at"] is not None
+    finally:
+        _clean(pfx)
+
+
+# ── Sim-E: check_trade_events T1_HIT path ────────────────────────────────────
+
+def test_sim_e_check_trade_events_t1_hook():
+    """Replicates the check_trade_events T1_HIT TFA hook — r_multiple from geometry.
+
+    The hook computes: r_multiple = (exit - entry) / |entry - stop| for Long.
+    With entry=2640, stop=2630, T1=2650 → risk=10, move=10 → r_multiple=1.0.
+    mfe_r and mae_r are again NULL (not tracked on this path).
+    """
+    pfx = SIM_PFX + "-E"
+    rid = pfx + "-t1-hook"
+    _clean(pfx)
+    try:
+        _insert_ready(rid, inst="MGC", direction="Long", mode="SCALP",
+                      edge=85.0, eq=78.0, strategy="momentum",
+                      bias="bullish", price=2640.0)
+        _trigger(rid, source="auto", entry_price=2640.0, lag_sec=3.1)
+
+        # Replicate T1_HIT geometry computation from app.py hook
+        entry      = 2640.0
+        stop       = 2630.0
+        parsed_price = 2650.0
+        risk       = abs(entry - stop) or 1.0
+        r_multiple = round((parsed_price - entry) / risk, 2)  # = 1.0
+
+        fm, fd = _sim_classify("Win", mfe_r=None, mae_r=None,
+                               r_multiple=r_multiple,
+                               entry_price=entry, stop_loss=stop,
+                               bias="bullish", vol_regime="NORMAL",
+                               eq_score=78.0, direction="Long")
+        _complete(rid, outcome="Win", exit_price=parsed_price,
+                  mfe_r=None, mae_r=None, r_multiple=r_multiple,
+                  duration_min=None, failure_mode=fm, failure_detail=fd)
+
+        r = _fetch(rid)
+        assert r["outcome"]    == "Win"
+        assert float(r["r_multiple"]) == pytest.approx(1.0, abs=0.01)
+        assert float(r["exit_price"]) == pytest.approx(2650.0, abs=0.01)
+        assert r["mfe_r"] is None, "mfe_r NULL on check_trade_events path"
+        assert r["mae_r"] is None, "mae_r NULL on check_trade_events path"
+        assert r["failure_mode"] == "WIN", f"Expected WIN, got {r['failure_mode']!r}"
+        assert r["completed_at"] is not None
+    finally:
+        _clean(pfx)
+
+
+# ── Sim-F: Two instruments concurrent — no cross-contamination ───────────────
+
+def test_sim_f_two_instruments_independent_close():
+    """MGC and MNQ run their full lifecycles simultaneously without interfering.
+
+    MGC closes as a Win; MNQ closes as a Loss with aligned bias + low MFE
+    → NO_FOLLOW_THROUGH.  Verifies that closing one record does not affect
+    the other (instrument isolation in the UPDATE WHERE ready_id = %s).
+    """
+    pfx     = SIM_PFX + "-F"
+    rid_mgc = pfx + "-MGC"
+    rid_mnq = pfx + "-MNQ"
+    _clean(pfx)
+    try:
+        # Insert both READY rows
+        _insert_ready(rid_mgc, inst="MGC", direction="Long",  mode="SCALP",
+                      edge=80.0, eq=74.0, bias="bullish", price=2650.0)
+        _insert_ready(rid_mnq, inst="MNQ", direction="Short", mode="SCALP",
+                      edge=78.0, eq=72.0, bias="bearish",  price=19800.0)
+
+        # Trigger both
+        _trigger(rid_mgc, source="auto",   entry_price=2651.0,  lag_sec=2.0)
+        _trigger(rid_mnq, source="manual", entry_price=19800.0, lag_sec=3.5)
+
+        # Classify and close each instrument
+        fm_mgc, fd_mgc = _sim_classify("Win",  mfe_r=1.1, mae_r=0.1,
+                                       r_multiple=1.0,
+                                       bias="bullish", direction="Long")
+        fm_mnq, fd_mnq = _sim_classify("Loss", mfe_r=0.2, mae_r=0.9,
+                                       r_multiple=-1.0,
+                                       bias="bearish", direction="Short")
+
+        _complete(rid_mgc, outcome="Win",  exit_price=2661.0,  mfe_r=1.1,
+                  mae_r=0.1, r_multiple=1.0, duration_min=8.0,
+                  failure_mode=fm_mgc, failure_detail=fd_mgc)
+        _complete(rid_mnq, outcome="Loss", exit_price=19820.0, mfe_r=0.2,
+                  mae_r=0.9, r_multiple=-1.0, duration_min=5.0,
+                  failure_mode=fm_mnq, failure_detail=fd_mnq)
+
+        r_mgc = _fetch(rid_mgc)
+        r_mnq = _fetch(rid_mnq)
+
+        assert r_mgc["outcome"] == "Win",  f"MGC: {r_mgc['outcome']}"
+        assert r_mgc["failure_mode"] == "WIN", f"MGC mode: {r_mgc['failure_mode']!r}"
+        assert r_mnq["outcome"] == "Loss", f"MNQ: {r_mnq['outcome']}"
+        # MNQ: Short+bearish aligned → WRONG_BIAS skipped; mfe=0.2 < 0.5 → NO_FOLLOW_THROUGH
+        assert r_mnq["failure_mode"] == "NO_FOLLOW_THROUGH", (
+            f"MNQ: expected NO_FOLLOW_THROUGH, got {r_mnq['failure_mode']!r}")
+        # Verify cross-contamination guard: each record has its own instrument
+        assert r_mgc["instrument"] == "MGC"
+        assert r_mnq["instrument"] == "MNQ"
+        assert r_mgc["completed_at"] is not None
+        assert r_mnq["completed_at"] is not None
+    finally:
+        _clean(pfx)

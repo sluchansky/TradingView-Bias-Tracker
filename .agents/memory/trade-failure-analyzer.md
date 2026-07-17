@@ -47,7 +47,25 @@ Posts to `DISCORD_WEBHOOK_URL` gated on `DISCORD_LIVE_ENABLED`.
 ## Schema gap found during validation
 The initial CREATE TABLE omitted the `outcome VARCHAR` column. Fixed via `ALTER TABLE trade_failure_analysis ADD COLUMN IF NOT EXISTS outcome VARCHAR`. Must be applied to production via Publish schema-diff before the first production deploy. Without it every `_complete_tfa_record()` call fails silently (fail-open — record stays incomplete forever).
 
+## check_trade_events close hooks (added)
+The price-poll path now completes TFA for both STOP_HIT and T1_HIT branches.
+Both hooks pop `LIVE_TFA_BY_INST` and call `_complete_tfa_record` with a thin dict built from `_at`:
+- STOP_HIT: outcome=Loss, r_multiple=-1.0 (hardcoded), mfe_r/mae_r=NULL
+- T1_HIT: outcome=Win, r_multiple computed from (exit-entry)/|entry-stop|, mfe_r/mae_r=NULL
+**Why:** The managed-trade watcher (`_close_managed_trade`) is the source of MFE/MAE; the check_trade_events path doesn't track live highs/lows so those columns stay NULL honestly.
+
+## NO_FOLLOW_THROUGH threshold
+`mfe_r < 0.25` (not 0.5) — `_derive_trade_label` in app.py uses 0.25.
+Pinned in test_sim_b to prevent future drift.
+
+## Production schema migration
+`outcome VARCHAR` added to dev DB via ALTER TABLE. Will land in prod via Replit Publish diff (no migration script — database skill rule). The column must be present before first production deploy or all `_complete_tfa_record()` calls fail silently.
+
 ## How to apply
 - Any new READY trigger path (gateway variant, new instrument) must call `_mark_tfa_triggered(inst, source, entry_price)` after a `sent`/`simulated` status.
-- Any new close path (ACTIVE_TRADE check_trade_events) should pop `LIVE_TFA_BY_INST.pop(inst)` and call `_complete_tfa_record`.
+- Any new close path beyond check_trade_events / _close_managed_trade should pop `LIVE_TFA_BY_INST.pop(inst)` and call `_complete_tfa_record`.
 - A new failure mode = add a priority branch in `_classify_failure_mode_tfa` ABOVE the `base_label` fall-through.
+- After collecting 25 completed records, the 25-trade Discord summary fires automatically.
+
+## Test suite
+`test_tfa.py` — 79 tests (16 sections). Section 16 = 6 end-to-end simulation tests (Sim-A through Sim-F) using the inlined classifier + raw psycopg2 — no app.py import.

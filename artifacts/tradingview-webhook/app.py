@@ -31038,6 +31038,27 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             _set_outcome_cooldown(resolved_inst, cooldown_after_loss(resolved_inst), "loss")
             clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
             _record_orphan_active_trade(_at, resolved_inst, "Loss", parsed_price)
+            # ── TFA: complete the record for a price-triggered stop-out ──
+            # DISPLAY-ONLY, FAIL-OPEN. _at no longer holds the active slot (cleared
+            # above) but is still in local scope.  outcome/r_multiple are definite
+            # for a stop: -1.0 (full risk realised).  mfe/mae are unknown on this
+            # path (managed-trade watcher is the source of those fields), so they
+            # remain NULL in the DB and the failure-mode classifier works on the
+            # fields that ARE set (bias, vol_regime, eq_score from the READY row).
+            try:
+                if TFA_DB_READY:
+                    _tfa_rid_ct = LIVE_TFA_BY_INST.pop(resolved_inst, None)
+                    if _tfa_rid_ct:
+                        _at_tfa = dict(_at)
+                        _at_tfa.update({
+                            "outcome":    "Loss",
+                            "exit_price": parsed_price,
+                            "r_multiple": -1.0,
+                            "closed_at":  datetime.now(timezone.utc).isoformat(),
+                        })
+                        _complete_tfa_record(ready_id=_tfa_rid_ct, mt=_at_tfa)
+            except Exception as _tfa_exc:
+                logger.debug("TFA complete (STOP) fail-open: %s", _tfa_exc)
         elif "T1_HIT" in events or "T2_HIT" in events:
             send_trade_event_message("T1_HIT", _at, parsed_price)
             d_pnl, _ = compute_pnl(_at, parsed_price)
@@ -31046,6 +31067,31 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
             _set_outcome_cooldown(resolved_inst, cooldown_after_win(resolved_inst), "win")
             clear_active_trade(resolved_inst, opened_at=_at.get("opened_at"))
             _record_orphan_active_trade(_at, resolved_inst, "Win", parsed_price)
+            # ── TFA: complete the record for a price-triggered target hit ──
+            # DISPLAY-ONLY, FAIL-OPEN.  r_multiple is computed from the actual exit
+            # vs the entry/stop geometry stored in _at; mfe/mae remain NULL (not
+            # tracked on this path — managed-trade watcher owns those fields).
+            try:
+                if TFA_DB_READY:
+                    _tfa_rid_ct = LIVE_TFA_BY_INST.pop(resolved_inst, None)
+                    if _tfa_rid_ct:
+                        _ct_entry = float(_at.get("entry_price") or 0)
+                        _ct_stop  = float(_at.get("stop_loss")   or _ct_entry)
+                        _ct_risk  = abs(_ct_entry - _ct_stop) or 1.0
+                        _ct_dir   = _at.get("direction", "Long")
+                        _ct_rr    = ((parsed_price - _ct_entry) / _ct_risk
+                                     if _ct_dir == "Long"
+                                     else (_ct_entry - parsed_price) / _ct_risk)
+                        _at_tfa = dict(_at)
+                        _at_tfa.update({
+                            "outcome":    "Win",
+                            "exit_price": parsed_price,
+                            "r_multiple": round(_ct_rr, 2),
+                            "closed_at":  datetime.now(timezone.utc).isoformat(),
+                        })
+                        _complete_tfa_record(ready_id=_tfa_rid_ct, mt=_at_tfa)
+            except Exception as _tfa_exc:
+                logger.debug("TFA complete (T1) fail-open: %s", _tfa_exc)
 
     # ── Trading Journal + live alert ───────────────────────────────────────────
     # The main alert channel now receives the same clean trade-card as the
