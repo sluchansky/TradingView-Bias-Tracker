@@ -255,14 +255,16 @@ def test_conflicting_conditions_produce_mixed():
     print("PASS test_conflicting_conditions_produce_mixed")
 
 
-# ── 7. Geopolitical news WITHOUT market confirmation → NOT GEOPOLITICAL ────────
+# ── 7. Geopolitical news + bullish market → regime=RISK_ON, driver=GEO ────────
 
-def test_geopolitical_news_alone_does_not_classify_geopolitical():
+def test_geopolitical_news_with_bullish_market():
     """
-    CRITICAL TEST: A geopolitical headline alone must not produce the
-    GEOPOLITICAL regime without at least 2 market confirmations.
+    CRITICAL TEST: When geo news is active but equities are ABOVE VWAP,
+    the regime must be RISK_ON (market condition). The driver is GEOPOLITICAL
+    (news cause) but risk_state must NOT be SHOCK since the market is bullish.
+    Regime and driver are independent fields — the market may be shrugging
+    off the geo news.
     """
-    # Give equities above VWAP (risk-on), gold below → no market confirmations
     snap = _run_with_state(
         vwap={
             "MNQ": _make_vwap(21000), "MES": _make_vwap(5800),
@@ -276,16 +278,25 @@ def test_geopolitical_news_alone_does_not_classify_geopolitical():
         },
         news_filter=_make_news_filter(upcoming=_geo_news()),
     )
-    assert snap["regime"] != "GEOPOLITICAL", (
-        f"CRITICAL FAILURE: geopolitical news alone classified regime as GEOPOLITICAL "
-        f"without market confirmation. regime={snap['regime']}")
-    print("PASS test_geopolitical_news_alone_does_not_classify_geopolitical")
+    assert snap["regime"] == "RISK_ON", (
+        f"Expected RISK_ON (equities bullish), got {snap['regime']}")
+    assert snap["primary_driver"] == "GEOPOLITICAL_ESCALATION", (
+        f"Expected GEOPOLITICAL_ESCALATION driver from geo news, "
+        f"got {snap['primary_driver']}")
+    assert snap["risk_state"] != "SHOCK", (
+        f"CRITICAL: SHOCK requires RISK_OFF regime + geo driver; "
+        f"RISK_ON market must not produce SHOCK. risk_state={snap['risk_state']}")
+    print("PASS test_geopolitical_news_with_bullish_market")
 
 
-# ── 8. Geopolitical news WITH market confirmation → GEOPOLITICAL ──────────────
+# ── 8. Geopolitical news + risk-off market → regime=RISK_OFF, driver=GEO ──────
 
-def test_geopolitical_news_with_market_confirmation():
-    """Geo news + gold strength + equity weakness → GEOPOLITICAL."""
+def test_geopolitical_news_with_bearish_market():
+    """
+    Geo news + equity weakness + gold strength → RISK_OFF regime + GEOPOLITICAL
+    driver → risk_state=SHOCK. The two-field architecture produces a clear
+    statement: 'Regime: Risk Off. Primary Driver: Geopolitical. Risk State: Shock.'
+    """
     snap = _run_with_state(
         vwap={
             "MNQ": _make_vwap(21000), "MES": _make_vwap(5800),
@@ -295,16 +306,18 @@ def test_geopolitical_news_with_market_confirmation():
             "MNQ": _make_auto_price(20500),  # below — equity weak
             "MES": _make_auto_price(5700),   # below
             "MYM": _make_auto_price(43500),  # below
-            "MGC": _make_auto_price(2400),   # above — gold strong
+            "MGC": _make_auto_price(2400),   # above — gold (safe-haven) strong
         },
         news_filter=_make_news_filter(upcoming=_geo_news()),
     )
-    # With gold strong + equities weak (2 market confirmations) → GEOPOLITICAL
-    assert snap["regime"] == "GEOPOLITICAL", (
-        f"Expected GEOPOLITICAL, got {snap['regime']}. "
-        f"Confirms: {snap['supporting_evidence']}")
-    assert snap["risk_state"] == "SHOCK"
-    print("PASS test_geopolitical_news_with_market_confirmation")
+    assert snap["regime"] == "RISK_OFF", (
+        f"Expected RISK_OFF (equities bearish, gold bid), got {snap['regime']}")
+    assert snap["primary_driver"] == "GEOPOLITICAL_ESCALATION", (
+        f"Expected GEOPOLITICAL_ESCALATION driver, got {snap['primary_driver']}")
+    assert snap["risk_state"] == "SHOCK", (
+        f"Expected SHOCK (RISK_OFF + GEOPOLITICAL driver), "
+        f"got {snap['risk_state']}")
+    print("PASS test_geopolitical_news_with_bearish_market")
 
 
 # ── 9. Expired news (outside ±window) ─────────────────────────────────────────
@@ -402,7 +415,8 @@ def test_influence_feature_flags_are_false():
 def test_snapshot_schema_complete_when_unavailable():
     """Even when available=False the snapshot must have all required keys."""
     required_keys = {
-        "regime", "confidence", "dominant_theme", "secondary_theme",
+        "regime", "primary_driver", "confidence",
+        "dominant_theme", "secondary_theme",
         "risk_state", "sector_rotation", "futures_preferences",
         "supporting_evidence", "conflicting_evidence",
         "news_context", "data_quality", "shadow_mode", "available",
@@ -461,8 +475,8 @@ if __name__ == "__main__":
         test_risk_on_classification,
         test_risk_off_classification,
         test_conflicting_conditions_produce_mixed,
-        test_geopolitical_news_alone_does_not_classify_geopolitical,
-        test_geopolitical_news_with_market_confirmation,
+        test_geopolitical_news_with_bullish_market,
+        test_geopolitical_news_with_bearish_market,
         test_expired_news_not_used,
         test_insufficient_coverage_yields_unknown,
         test_module_failure_is_isolated,

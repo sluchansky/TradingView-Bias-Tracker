@@ -13270,8 +13270,14 @@ def _me_sector_state(ob):
     return "NEUTRAL"
 
 
-def _me_futures_preference(symbol, ob, regime, news_category, news_direction):
-    """Compute a futures preference dict for one instrument. Never raises."""
+def _me_futures_preference(symbol, ob, regime, primary_driver,
+                           news_category, news_direction):
+    """Compute a futures preference dict for one instrument. Never raises.
+
+    `regime`         — market condition: RISK_ON / RISK_OFF / NEUTRAL / MIXED / UNKNOWN
+    `primary_driver` — news-based cause: GEOPOLITICAL_ESCALATION / FED_DRIVEN / … / NONE
+    These two fields are independent; their combination drives the score.
+    """
     try:
         if not ob["data_available"]:
             return {
@@ -13293,46 +13299,46 @@ def _me_futures_preference(symbol, ob, regime, news_category, news_direction):
         elif ob["cvd_state"] == "bearish":
             score -= 1; conflicting.append(f"{symbol} CVD is bearish")
 
-        # Regime alignment per instrument
+        # Regime + driver alignment per instrument.
+        # `_risk_off_like` = market is risk-off OR an active geo driver implies
+        # flight-to-safety pressure regardless of the current regime reading.
+        _risk_off_like = (regime == "RISK_OFF"
+                          or primary_driver == "GEOPOLITICAL_ESCALATION")
         if symbol == "MGC":
-            directional = ("BULLISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
+            directional = ("BULLISH" if _risk_off_like
                            else "BEARISH" if regime == "RISK_ON" else "NEUTRAL")
-            if regime in ("RISK_OFF", "GEOPOLITICAL"):
+            if _risk_off_like:
                 score += 1
-                supporting.append("Risk-off / geopolitical environment supports safe-haven demand")
+                supporting.append("Risk-off / geo-escalation environment supports safe-haven demand")
             elif regime == "RISK_ON":
                 score -= 1
                 conflicting.append("Risk-on environment may reduce safe-haven demand")
-            if news_category in ("GEOPOLITICAL_ESCALATION",
-                                  "ENERGY_SUPPLY_RISK", "SHIPPING_DISRUPTION"):
+            if primary_driver == "GEOPOLITICAL_ESCALATION":
                 score += 1
-                supporting.append("Active event-risk news supports gold demand")
+                supporting.append("Active geopolitical driver reinforces gold demand")
         elif symbol == "MNQ":
             directional = ("BULLISH" if regime == "RISK_ON"
-                           else "BEARISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
-                           else "NEUTRAL")
+                           else "BEARISH" if _risk_off_like else "NEUTRAL")
             if regime == "RISK_ON":
                 score += 1; supporting.append("Risk-on environment favors technology-heavy MNQ")
-            elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+            elif _risk_off_like:
                 score -= 1
-                conflicting.append("Risk-off / geopolitical environment disfavors growth assets")
+                conflicting.append("Risk-off / geopolitical driver disfavors growth assets")
         elif symbol == "MES":
             directional = ("BULLISH" if regime == "RISK_ON"
-                           else "BEARISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
-                           else "NEUTRAL")
+                           else "BEARISH" if _risk_off_like else "NEUTRAL")
             if regime == "RISK_ON":
                 score += 1; supporting.append("Broad market strength favors MES")
-            elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+            elif _risk_off_like:
                 score -= 1
                 conflicting.append("Risk-off environment disfavors broad equity exposure")
         elif symbol == "MYM":
             directional = ("BULLISH" if regime == "RISK_ON"
-                           else "BEARISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
-                           else "NEUTRAL")
+                           else "BEARISH" if _risk_off_like else "NEUTRAL")
             if regime == "RISK_ON":
                 score += 1
                 supporting.append("Risk-on supports industrial/financial exposure via MYM")
-            elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+            elif _risk_off_like:
                 score -= 1
                 conflicting.append("Risk-off environment disfavors cyclical MYM")
         else:
@@ -13388,7 +13394,7 @@ def compute_market_environment():
     except Exception as _e:
         logger.error(f"[MktEnv] compute_market_environment error (fail-open): {_e}")
         return {
-            "regime": "UNKNOWN", "confidence": 0,
+            "regime": "UNKNOWN", "primary_driver": "NONE", "confidence": 0,
             "dominant_theme": "UNKNOWN", "secondary_theme": "NONE",
             "risk_state": "UNKNOWN",
             "sector_rotation": [], "futures_preferences": [],
@@ -13497,10 +13503,12 @@ def _compute_market_env_inner():
     eq_cvd_bear  = sum(1 for i in EQUITY_INSTS if obs[i]["cvd_state"] == "bearish")
     gold_cvd_bull = obs["MGC"]["cvd_state"] == "bullish"
 
-    # ── 5. Regime classification (minimum 3 confirmations for RISK_ON/RISK_OFF)
+    # ── 5. Market regime — pure market condition; no driver blending ──────────
+    # "What is the market DOING?" → RISK_ON / RISK_OFF / MIXED / NEUTRAL / UNKNOWN
+    # "WHY?" is answered by primary_driver (step 6), independently.
+    # Adding new causes (earnings surprise, geopolitics, …) never touches this block.
     risk_on_confirms  = []
     risk_off_confirms = []
-    geo_market_confirms = []
 
     for i in EQUITY_INSTS:
         if obs[i]["above_vwap"] is True:
@@ -13517,40 +13525,49 @@ def _compute_market_env_inner():
             f"CVD bearish on {eq_cvd_bear} equity instrument(s)")
     if gold_cvd_bull:
         risk_off_confirms.append("MGC CVD bullish — gold demand confirmed")
-    if gold_above:
-        geo_market_confirms.append("Gold strengthening")
-    if equity_below >= 2:
-        geo_market_confirms.append("Equity markets weakening")
-    if eq_cvd_bear >= 1:
-        geo_market_confirms.append("Bearish equity CVD")
 
     if quality_label == "INSUFFICIENT":
-        regime     = "UNKNOWN"
-        risk_state = "UNKNOWN"
+        regime = "UNKNOWN"
     elif len(risk_on_confirms) >= 3:
-        regime     = "RISK_ON"
-        risk_state = "AGGRESSIVE" if eq_cvd_bull >= 2 else "BALANCED"
-    elif (news_category == "GEOPOLITICAL_ESCALATION"
-          and len(geo_market_confirms) >= 2):
-        # GEOPOLITICAL requires active news + at least 2 market confirmations.
-        # Checked before generic RISK_OFF so that geo news + equity weakness +
-        # gold strength classifies as GEOPOLITICAL rather than plain RISK_OFF.
-        regime     = "GEOPOLITICAL"
-        risk_state = "SHOCK"
+        regime = "RISK_ON"
     elif len(risk_off_confirms) >= 3:
-        regime     = "RISK_OFF"
-        risk_state = "DEFENSIVE"
+        regime = "RISK_OFF"
     elif risk_on_confirms and risk_off_confirms:
-        regime     = "MIXED"
-        risk_state = "BALANCED"
+        regime = "MIXED"
     elif risk_on_confirms or risk_off_confirms:
-        regime     = "NEUTRAL"
-        risk_state = "BALANCED"
+        regime = "NEUTRAL"
     else:
-        regime     = "NEUTRAL"
+        regime = "NEUTRAL"
+
+    # ── 6. Primary driver — independent of regime; derived from active news ───
+    # "WHY is the market moving?" Adding a new driver here never touches step 5.
+    # Sentence form: "Regime: Risk Off. Primary Driver: Geopolitical. Conf: 86%."
+    _DRIVER_MAP = [
+        ({"GEOPOLITICAL_ESCALATION", "ENERGY_SUPPLY_RISK", "SHIPPING_DISRUPTION"},
+         "GEOPOLITICAL_ESCALATION"),
+        ({"CENTRAL_BANK"},                     "FED_DRIVEN"),
+        ({"INFLATION"},                         "INFLATIONARY"),
+        ({"EMPLOYMENT", "ECONOMIC_GROWTH"},     "ECONOMIC_DATA"),
+        ({"EARNINGS"},                          "EARNINGS"),
+    ]
+    primary_driver = "NONE"
+    for _cats, _drv in _DRIVER_MAP:
+        if news_category in _cats:
+            primary_driver = _drv
+            break
+
+    # ── 7. Risk state — derived from both regime and driver ───────────────────
+    if regime == "UNKNOWN":
+        risk_state = "UNKNOWN"
+    elif regime == "RISK_ON":
+        risk_state = "AGGRESSIVE" if eq_cvd_bull >= 2 else "BALANCED"
+    elif regime == "RISK_OFF":
+        # GEOPOLITICAL_ESCALATION driver escalates RISK_OFF market to SHOCK
+        risk_state = "SHOCK" if primary_driver == "GEOPOLITICAL_ESCALATION" else "DEFENSIVE"
+    else:  # MIXED / NEUTRAL
         risk_state = "BALANCED"
 
-    # ── 6. Regime confidence ──────────────────────────────────────────────────
+    # ── 8. Regime confidence ──────────────────────────────────────────────────
     if regime == "UNKNOWN":
         confidence = 0
     elif regime == "RISK_ON":
@@ -13560,35 +13577,39 @@ def _compute_market_env_inner():
     elif regime == "RISK_OFF":
         base = int(len(risk_off_confirms) / 5 * 75)
         if news_direction == "RISK_OFF": base = min(95, base + 10)
+        if primary_driver == "GEOPOLITICAL_ESCALATION":
+            # Market + news alignment compounds conviction
+            _geo_conf = sum([gold_above, equity_below >= 2, eq_cvd_bear >= 1])
+            base = min(95, base + _geo_conf * 5)
         confidence = min(100, max(25, base))
-    elif regime == "GEOPOLITICAL":
-        confidence = min(85, 50 + len(geo_market_confirms) * 10)
     elif regime == "MIXED":
         confidence = 35
     else:
         confidence = 30
 
-    # ── 7. Dominant theme ─────────────────────────────────────────────────────
+    # ── 9. Dominant theme ─────────────────────────────────────────────────────
     if regime == "RISK_ON":
         if obs["MNQ"]["above_vwap"] and equity_above == 3 and gold_below:
             dominant_theme = "TECHNOLOGY_STRENGTH"
+        elif primary_driver == "FED_DRIVEN":
+            dominant_theme = "FED_POLICY"
         else:
             dominant_theme = "BROAD_MARKET_STRENGTH"
     elif regime == "RISK_OFF":
-        dominant_theme = "SAFE_HAVEN_DEMAND" if gold_above else "DEFENSIVE_ROTATION"
-    elif regime == "GEOPOLITICAL":
-        dominant_theme = "GEOPOLITICAL_ESCALATION"
+        if primary_driver == "GEOPOLITICAL_ESCALATION":
+            dominant_theme = "GEOPOLITICAL_ESCALATION"
+        elif gold_above:
+            dominant_theme = "SAFE_HAVEN_DEMAND"
+        else:
+            dominant_theme = "DEFENSIVE_ROTATION"
     elif regime == "MIXED":
         dominant_theme = "MIXED"
     elif regime == "NEUTRAL":
-        if   news_category == "CENTRAL_BANK":
-            dominant_theme = "FED_POLICY"
-        elif news_category == "INFLATION":
-            dominant_theme = "RATE_SENSITIVITY"
-        elif news_category in ("EMPLOYMENT", "ECONOMIC_GROWTH"):
-            dominant_theme = "ECONOMIC_DATA"
-        else:
-            dominant_theme = "NONE"
+        if   primary_driver == "FED_DRIVEN":      dominant_theme = "FED_POLICY"
+        elif primary_driver == "INFLATIONARY":    dominant_theme = "RATE_SENSITIVITY"
+        elif primary_driver == "ECONOMIC_DATA":   dominant_theme = "ECONOMIC_DATA"
+        elif primary_driver == "EARNINGS":        dominant_theme = "EARNINGS_DRIVEN"
+        else:                                     dominant_theme = "NONE"
     else:
         dominant_theme = "UNKNOWN"
 
@@ -13597,15 +13618,14 @@ def _compute_market_env_inner():
         secondary_theme = "TECHNOLOGY_STRENGTH"
     elif regime == "RISK_OFF" and dominant_theme != "SAFE_HAVEN_DEMAND" and gold_above:
         secondary_theme = "SAFE_HAVEN_DEMAND"
-    elif news_category == "CENTRAL_BANK" and dominant_theme != "FED_POLICY":
+    elif primary_driver == "FED_DRIVEN" and dominant_theme != "FED_POLICY":
         secondary_theme = "FED_POLICY"
-    elif news_category == "INFLATION" and dominant_theme != "RATE_SENSITIVITY":
+    elif primary_driver == "INFLATIONARY" and dominant_theme != "RATE_SENSITIVITY":
         secondary_theme = "RATE_SENSITIVITY"
-    elif (news_category in ("EMPLOYMENT", "ECONOMIC_GROWTH")
-          and dominant_theme != "ECONOMIC_DATA"):
+    elif primary_driver == "ECONOMIC_DATA" and dominant_theme != "ECONOMIC_DATA":
         secondary_theme = "ECONOMIC_DATA"
 
-    # ── 8. Supporting / conflicting evidence ──────────────────────────────────
+    # ── 10. Supporting / conflicting evidence ─────────────────────────────────
     if regime == "RISK_ON":
         supporting_evidence  = list(risk_on_confirms)
         conflicting_evidence = []
@@ -13618,10 +13638,8 @@ def _compute_market_env_inner():
         if eq_cvd_bear:
             conflicting_evidence.append(
                 f"CVD bearish on {eq_cvd_bear} instrument(s)")
-    elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+    elif regime == "RISK_OFF":
         supporting_evidence  = list(risk_off_confirms)
-        if regime == "GEOPOLITICAL":
-            supporting_evidence += geo_market_confirms
         conflicting_evidence = [
             f"{i} above VWAP" for i in EQUITY_INSTS
             if obs[i]["above_vwap"] is True]
@@ -13634,16 +13652,18 @@ def _compute_market_env_inner():
 
     if news_headline and news_category not in ("NONE", "OTHER"):
         headline_short = news_headline[:60]
-        if news_direction in (regime,
-                              "RISK_ON"  if regime == "RISK_ON"  else None,
-                              "RISK_OFF" if regime == "RISK_OFF" else None):
+        # Active driver news is always supporting (it explains the move);
+        # otherwise align by the stated news direction vs. the regime.
+        regime_dir = ("RISK_ON" if regime == "RISK_ON" else
+                      "RISK_OFF" if regime == "RISK_OFF" else "NEUTRAL")
+        if news_direction == regime_dir or primary_driver != "NONE":
             supporting_evidence.append(
                 f"News ({news_category}): {headline_short}")
         elif news_direction not in ("NEUTRAL", "MIXED"):
             conflicting_evidence.append(
                 f"News ({news_category}): {headline_short}")
 
-    # ── 9. Sector rotation ────────────────────────────────────────────────────
+    # ── 11. Sector rotation ───────────────────────────────────────────────────
     sector_rotation = [
         {"sector": "Technology",
          "proxy": "MNQ", "state": _me_sector_state(obs["MNQ"]),
@@ -13673,21 +13693,22 @@ def _compute_market_env_inner():
          "state": "UNAVAILABLE", "note": "XLV not in system"},
     ]
 
-    # ── 10. Futures preferences ───────────────────────────────────────────────
+    # ── 12. Futures preferences ───────────────────────────────────────────────
     futures_preferences = [
-        _me_futures_preference("MGC", obs["MGC"], regime,
+        _me_futures_preference("MGC", obs["MGC"], regime, primary_driver,
                                news_category, news_direction),
-        _me_futures_preference("MNQ", obs["MNQ"], regime,
+        _me_futures_preference("MNQ", obs["MNQ"], regime, primary_driver,
                                news_category, news_direction),
-        _me_futures_preference("MES", obs["MES"], regime,
+        _me_futures_preference("MES", obs["MES"], regime, primary_driver,
                                news_category, news_direction),
-        _me_futures_preference("MYM", obs["MYM"], regime,
+        _me_futures_preference("MYM", obs["MYM"], regime, primary_driver,
                                news_category, news_direction),
     ]
 
-    # ── 11. Assemble snapshot ─────────────────────────────────────────────────
+    # ── 13. Assemble snapshot ─────────────────────────────────────────────────
     snapshot = {
         "regime":               regime,
+        "primary_driver":       primary_driver,
         "confidence":           confidence,
         "dominant_theme":       dominant_theme,
         "secondary_theme":      secondary_theme,
@@ -13732,8 +13753,8 @@ def _compute_market_env_inner():
         prefs_s  = ", ".join(
             f"{p['symbol']}:{p['preference']}" for p in futures_preferences)
         logger.info(
-            f"[MktEnv shadow] regime={regime} conf={confidence}% "
-            f"theme={dominant_theme} risk={risk_state} "
+            f"[MktEnv shadow] regime={regime} driver={primary_driver} "
+            f"conf={confidence}% theme={dominant_theme} risk={risk_state} "
             f"quality={quality_label} cov={coverage_pct}% "
             f"leaders={leaders} laggards={laggards} "
             f"prefs=[{prefs_s}] news={news_category}"
@@ -51930,11 +51951,19 @@ function renderMarketEnv(d) {
     return;
   }
   function regCol(r) {
-    if (r==='RISK_ON') return '#22c55e';
+    if (r==='RISK_ON')  return '#22c55e';
     if (r==='RISK_OFF') return '#ef4444';
-    if (r==='GEOPOLITICAL') return '#f97316';
-    if (r==='MIXED') return '#f59e0b';
-    if (r==='NEUTRAL') return '#9aa';
+    if (r==='MIXED')    return '#f59e0b';
+    if (r==='NEUTRAL')  return '#9aa';
+    return '#6b7280';
+  }
+  function drvCol(d) {
+    if (d==='GEOPOLITICAL_ESCALATION') return '#f97316';
+    if (d==='FED_DRIVEN')              return '#818cf8';
+    if (d==='INFLATIONARY')            return '#fbbf24';
+    if (d==='DEFLATIONARY')            return '#60a5fa';
+    if (d==='ECONOMIC_DATA')           return '#34d399';
+    if (d==='EARNINGS')                return '#a78bfa';
     return '#6b7280';
   }
   function prefCol(p) {
@@ -51953,23 +51982,24 @@ function renderMarketEnv(d) {
   }
   var dq = me.data_quality || {};
   var nc = me.news_context || {};
+  var hasDrv = me.primary_driver && me.primary_driver !== 'NONE';
   var h = '';
-  h += '<div style="font-size:10px;color:#f59e0b;font-weight:700;letter-spacing:.05em;margin-bottom:6px">&#127758; MARKET ENVIRONMENT &mdash; SHADOW MODE</div>';
-  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">';
-  h += '<div style="flex:1;min-width:90px">';
-  h += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px">REGIME</div>';
-  h += '<div style="font-size:14px;font-weight:700;color:' + regCol(me.regime) + '">' + aiEsc(me.regime) + '</div>';
-  if (me.confidence > 0) { h += '<div style="font-size:10px;color:var(--muted)">' + me.confidence + '% confidence</div>'; }
+  h += '<div style="font-size:10px;color:#f59e0b;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#127758; MARKET ENVIRONMENT &mdash; SHADOW MODE</div>';
+  h += '<div style="margin-bottom:10px;padding:8px;background:rgba(255,255,255,.04);border-radius:6px;border:1px solid var(--border)">';
+  h += '<div style="font-size:15px;font-weight:800;color:' + regCol(me.regime) + ';letter-spacing:.02em">' + aiEsc((me.regime||'UNKNOWN').replace(/_/g,' ')) + '</div>';
+  if (hasDrv) {
+    h += '<div style="font-size:10px;margin-top:3px"><span style="color:var(--muted)">Primary Driver: </span>';
+    h += '<span style="color:' + drvCol(me.primary_driver) + ';font-weight:700">' + aiEsc(me.primary_driver.replace(/_/g,' ')) + '</span></div>';
+  }
+  h += '<div style="font-size:10px;color:var(--muted);margin-top:3px">';
+  h += 'Risk State: <span style="color:var(--fg);font-weight:600">' + aiEsc(me.risk_state) + '</span>';
+  if (me.confidence > 0) { h += ' &bull; Confidence: <span style="color:var(--fg)">' + me.confidence + '%</span>'; }
   h += '</div>';
-  h += '<div style="flex:1;min-width:80px">';
-  h += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px">RISK STATE</div>';
-  h += '<div style="font-size:11px;font-weight:600;color:var(--fg)">' + aiEsc(me.risk_state) + '</div>';
   h += '</div>';
-  h += '<div style="flex:1;min-width:80px">';
-  h += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px">DATA QUALITY</div>';
-  h += '<div style="font-size:10px;font-weight:600;color:' + qCol(dq.level) + '">' + aiEsc(dq.level||'UNKNOWN') + '</div>';
-  h += '<div style="font-size:9px;color:var(--muted)">' + (dq.coverage_percent||0) + '% fresh</div>';
-  h += '</div>';
+  h += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;font-size:10px">';
+  h += '<span style="color:var(--muted)">Data: </span>';
+  h += '<span style="color:' + qCol(dq.level) + ';font-weight:600">' + aiEsc(dq.level||'UNKNOWN') + '</span>';
+  h += '<span style="color:var(--muted)">&bull; ' + (dq.coverage_percent||0) + '% fresh</span>';
   h += '</div>';
   if (me.dominant_theme && me.dominant_theme !== 'NONE' && me.dominant_theme !== 'UNKNOWN') {
     h += '<div style="margin-bottom:6px"><span style="font-size:9px;color:var(--muted)">THEME: </span>';
