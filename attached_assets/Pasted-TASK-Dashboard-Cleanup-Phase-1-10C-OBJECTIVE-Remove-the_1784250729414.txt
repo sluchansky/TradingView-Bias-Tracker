@@ -1,0 +1,282 @@
+TASK: Dashboard Cleanup — Phase 1.10C
+
+OBJECTIVE
+
+Remove the now-dead standalone Confidence Governor renderer and any governor-only code that is proven unused after Phase 1.10B.
+
+This is a narrow dead-code cleanup.
+
+MAKE ONLY THIS CHANGE.
+
+IMPORTANT:
+Do not change the AI Decision Center Confidence tab.
+Do not change how confidence values are calculated, painted, toggled, polled, or stored.
+
+==================================================
+CURRENT STATE
+==================================================
+
+The standalone panel:
+
+mod-governor
+
+has already been removed.
+
+The AI Decision Center → Confidence tab now uses:
+
+- adc-cg-gate-btn
+- adc-cg-score-btn
+- adc-cg-demote
+- adc-cg-lscore
+
+The shared functions currently used by ADC must remain:
+
+- toggleLearningGate()
+- toggleLearningScoreGate()
+- _paintLearnGate()
+- _paintLearnScoreGate()
+- _applyGateBtn()
+- _applyScoreBtn()
+
+The function below is currently an empty compatibility stub:
+
+function renderConfidenceGovernor(d){ }
+
+==================================================
+REQUIREMENTS
+==================================================
+
+1. Search the entire repository for every reference to:
+
+- renderConfidenceGovernor
+- mod-governor
+- cg-gate-toggle
+- cg-score-toggle
+- cg-demote
+- cg-lscore
+- cg-base
+- cg-final
+- cg-adj
+- cg-thr
+- cg-comps
+- cg-fid
+- cg-meta
+
+2. Remove:
+
+- the empty renderConfidenceGovernor(d) stub
+- any dead call sites that reference it
+- governor-only constants, selectors, registry entries, comments, or CSS that are no longer used anywhere
+- governor-only helper code that is proven unrelated to the ADC Confidence tab
+
+3. Do not remove shared logic merely because it still supports legacy IDs.
+
+Safe legacy-ID support may remain inside:
+
+- _applyGateBtn()
+- _applyScoreBtn()
+- _paintLearnGate()
+- _paintLearnScoreGate()
+- toggleLearningGate()
+- toggleLearningScoreGate()
+
+Do not rewrite these functions just to remove old ID strings unless the change is obviously safe and all tests prove parity.
+
+4. Preserve the current ADC polling path:
+
+renderAiDecisionCenter(d)
+
+must continue to call:
+
+- _paintLearnGate(...)
+- _paintLearnScoreGate(...)
+
+inside the Confidence rendering section.
+
+5. Do not introduce a replacement renderer.
+
+There should not be:
+
+- renderConfidenceGovernorV2()
+- renderGovernorConfidence()
+- another wrapper function around the ADC paint calls
+
+The ADC is now the only visible confidence interface.
+
+==================================================
+CSS CLEANUP
+==================================================
+
+Search for CSS selectors that exist only for the removed standalone governor panel.
+
+Examples may include selectors based on:
+
+- #mod-governor
+- #cg-gate-toggle
+- #cg-score-toggle
+- #cg-demote
+- #cg-lscore
+- governor-specific container classes
+
+Remove a selector only when it has no ADC or shared use.
+
+Do not remove generic classes used by other panels.
+
+Do not restyle the ADC Confidence tab in this phase.
+
+==================================================
+JAVASCRIPT CLEANUP RULES
+==================================================
+
+Before deleting any function, variable, or selector:
+
+1. Search all HTML, JavaScript, inline scripts, templates, tests, and generated dashboard code.
+2. Confirm there are zero active callers.
+3. Confirm it is not referenced through a string-based registry.
+4. Confirm it is not used by reset layout, visibility settings, navigation, polling, or test fixtures.
+
+Do not delete code based only on the function name.
+
+==================================================
+DO NOT CHANGE
+==================================================
+
+Do not modify:
+
+- AI Decision Center layout
+- ADC Confidence markup
+- Demote toggle behavior
+- Score toggle behavior
+- Demotion reason content
+- Score delta content
+- Confidence formulas
+- Edge score calculations
+- Learning-gate state
+- Backend API routes
+- Poll frequency
+- Dashboard navigation
+- Other panels
+- Trading logic
+- Strategy logic
+- Alerts
+- Webhooks
+- Auto-trading
+- Database schema
+
+Do not begin the next dashboard consolidation task.
+
+==================================================
+ACCEPTANCE TESTS
+==================================================
+
+TEST 1:
+Search the repository for:
+
+renderConfidenceGovernor
+
+Expected:
+Zero definitions and zero call sites remain.
+
+TEST 2:
+Search for:
+
+mod-governor
+
+Expected:
+Zero active markup, registry, navigation, reset-layout, visibility, or JavaScript references remain.
+
+Comments referring only to the removed panel should also be removed.
+
+TEST 3:
+Load the dashboard and open:
+
+AI Decision Center → Confidence
+
+Expected:
+All four ADC controls render normally.
+
+TEST 4:
+Toggle Demote.
+
+Expected:
+- immediate visual update
+- backend state update
+- correct repaint on the next poll
+- no console errors
+
+TEST 5:
+Toggle Score.
+
+Expected:
+- immediate visual update
+- backend state update
+- correct repaint on the next poll
+- no console errors
+
+TEST 6:
+Verify:
+
+- adc-cg-demote
+- adc-cg-lscore
+
+Expected:
+Both display the correct current values.
+
+TEST 7:
+Leave the dashboard open for at least five poll cycles.
+
+Expected:
+- ADC Confidence values continue updating
+- no undefined-function errors
+- no missing-element errors
+- no repeated console warnings
+
+TEST 8:
+Refresh the dashboard.
+
+Expected:
+ADC Confidence remains functional and the removed governor panel does not return.
+
+TEST 9:
+Run all existing golden tests.
+
+Expected:
+
+- PARITY OK
+- SCALP GOLDEN OK
+- BREAKOUT SMOKE OK
+- DUAL-SIM SMOKE OK
+
+TEST 10:
+Compare the ADC Confidence values before and after this cleanup.
+
+Expected:
+No behavioral or display-value differences.
+
+==================================================
+STOP CONDITION
+==================================================
+
+If renderConfidenceGovernor or any governor-specific code still has an active caller outside the removed panel:
+
+- Do not delete it.
+- Report the exact caller.
+- Explain why it remains necessary.
+- Make no broader architectural change.
+
+==================================================
+FINAL RESPONSE REQUIRED
+==================================================
+
+Report:
+
+- Exact files changed
+- Exact function, selectors, comments, and dead references removed
+- Repository search results for renderConfidenceGovernor
+- Repository search results for mod-governor
+- Any legacy cg-* references intentionally retained and why
+- Confirmation that ADC polling remains inside renderAiDecisionCenter()
+- Confirmation that shared toggle and paint functions were not duplicated or rewritten
+- Golden test results
+- Browser console results after at least five polling cycles
+- Confirmation that backend and trading logic were untouched

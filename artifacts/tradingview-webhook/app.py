@@ -49148,10 +49148,6 @@ function toggleLearningGate(){
     })
     .catch(function(){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); });
 }
-// renderConfidenceGovernor: stub retained for call-site compatibility.
-// Panel removed in Phase 1.10B; paint calls now live in renderAiDecisionCenter.
-function renderConfidenceGovernor(d){ }
-
 // Shared cumulative-R line/area chart for an inline SVG: a 0R baseline, a colored
 // area + line of running cumulative R, and a win/loss dot per trade. Hides the SVG
 // on an empty series. Used by BOTH the standalone equity-curve panel and the
