@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Analyst Briefing — Dev Verification</title>
+<style>
+  :root { --fg:#e2e8f0; --muted:#6b7280; --border:rgba(255,255,255,.1); --bg:#0f1117; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--fg); font-family:'SF Mono',ui-monospace,monospace; padding:16px; }
+  .page-title { font-size:11px; color:#818cf8; font-weight:700; letter-spacing:.1em; margin-bottom:16px;
+    border-bottom:1px solid var(--border); padding-bottom:8px; }
+  .cases { display:flex; gap:16px; flex-wrap:wrap; }
+  .case { background:rgba(255,255,255,.03); border:1px solid var(--border); border-radius:10px;
+    padding:14px; width:280px; min-width:240px; }
+  .case-label { font-size:9px; font-weight:700; letter-spacing:.12em; text-transform:uppercase;
+    margin-bottom:10px; padding:3px 7px; border-radius:4px; display:inline-block; }
+  .label-a { background:rgba(34,197,94,.12); color:#22c55e; }
+  .label-b { background:rgba(245,158,11,.12); color:#f59e0b; }
+  .label-c { background:rgba(129,140,248,.12); color:#818cf8; }
+  .fixture-note { font-size:8px; color:rgba(245,158,11,.6); margin-bottom:8px; font-style:italic; }
+  .mobile-section { margin-top:24px; }
+  .mobile-label { font-size:9px; color:#f59e0b; font-weight:700; letter-spacing:.1em;
+    margin-bottom:10px; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  .mobile-frame { width:375px; background:rgba(255,255,255,.03); border:2px solid rgba(245,158,11,.3);
+    border-radius:10px; padding:14px; overflow:hidden; }
+  .mobile-frame .case { width:100%; }
+</style>
+</head>
+<body>
+
+<div class="page-title">&#9998; ANALYST BRIEFING — DEVELOPMENT VERIFICATION (Not Production)</div>
+
+<div class="cases">
+  <div class="case">
+    <span class="case-label label-a">CASE A — Normal Pipeline Data</span>
+    <div id="case-a"></div>
+  </div>
+  <div class="case">
+    <span class="case-label label-b">CASE B — WAIT + Blocking Factors</span>
+    <div class="fixture-note">TEST DATA</div>
+    <div id="case-b"></div>
+  </div>
+  <div class="case">
+    <span class="case-label label-c">CASE C — None / Missing Stage Data</span>
+    <div class="fixture-note">TEST DATA</div>
+    <div id="case-c"></div>
+  </div>
+</div>
+
+<div class="mobile-section">
+  <div class="mobile-label">&#9700; MOBILE WIDTH — 375px (CASE B)</div>
+  <div class="mobile-frame">
+    <div id="case-mobile"></div>
+  </div>
+</div>
+
+<script>
+// ── exact same aiEsc used in production dashboard ────────────────────────
+function aiEsc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+// ── exact same renderBriefing logic from renderDecisionPipeline ──────────
+function renderBriefing(ab) {
+  var abAvail = ab && ab.available;
+  var abErr   = ab && !ab.available && ab.error;
+  var h = '';
+  h += '<div style="font-size:10px;color:#818cf8;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#9998; ANALYST BRIEFING</div>';
+  if (abErr) {
+    h += '<div style="font-size:9px;color:var(--muted);padding:4px 0">Briefing unavailable: '+aiEsc(String(ab.error||''))+'</div>';
+  } else if (!abAvail) {
+    h += '<div style="font-size:9px;color:rgba(130,130,160,.4);padding:4px 0">Awaiting pipeline data&hellip;</div>';
+  } else {
+    var me = ab.market_environment || {};
+    var mf = ab.money_flow || {};
+    var mp = ab.market_priority || {};
+    var tv = ab.technical_verdict || {};
+    function brow(label, val, valColor) {
+      var vc = valColor || 'var(--fg)';
+      return '<div style="margin-bottom:7px">'
+        + '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">'+label+'</div>'
+        + '<div style="font-size:10px;color:'+vc+';line-height:1.45;word-break:break-word">'+aiEsc(String(val||''))+'</div>'
+        + '</div>';
+    }
+    h += brow('Market Environment', me.regime || 'Market regime unavailable');
+    h += brow('Primary Driver',     me.primary_driver || 'No primary driver identified');
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Money Flow</div>';
+    if (mf.leading && mf.leading.length) {
+      h += '<div style="font-size:9px;margin-bottom:2px"><span style="color:#22c55e;font-weight:700">Leading: </span><span style="color:var(--fg)">'+aiEsc(mf.leading.join(', '))+'</span></div>';
+    }
+    if (mf.weak && mf.weak.length) {
+      h += '<div style="font-size:9px"><span style="color:#ef4444;font-weight:700">Weak: </span><span style="color:var(--fg)">'+aiEsc(mf.weak.join(', '))+'</span></div>';
+    }
+    if ((!mf.leading || !mf.leading.length) && (!mf.weak || !mf.weak.length)) {
+      h += '<div style="font-size:9px;color:rgba(130,130,160,.5)">No clear flow direction identified</div>';
+    }
+    h += '</div>';
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Market Priority</div>';
+    if (mp.ranked && mp.ranked.length) {
+      mp.ranked.slice(0,4).forEach(function(r){
+        var isTop = r.priority === 1;
+        h += '<div style="font-size:9px;color:'+(isTop?'var(--fg)':'#94a3b8')+';margin-bottom:2px">';
+        h += '<span style="font-weight:'+(isTop?'700':'400')+'">'+r.priority+'. '+aiEsc(r.symbol)+'</span>';
+        var dctx = (r.direction_ctx||'').replace('UNKNOWN','').toLowerCase().trim();
+        if (dctx) h += ' <span style="color:var(--muted)">&#8212; '+aiEsc(dctx)+'</span>';
+        h += '</div>';
+      });
+      if (mp.top_reason) {
+        h += '<div style="font-size:8px;color:var(--muted);margin-top:3px;font-style:italic;word-break:break-word">'+aiEsc(mp.top_reason)+'</div>';
+      }
+    } else {
+      h += '<div style="font-size:9px;color:rgba(130,130,160,.5)">Market ranking unavailable</div>';
+    }
+    h += '</div>';
+    var tvV     = tv.verdict || '';
+    var tvReady = (tvV==='LONG READY'||tvV==='SHORT READY');
+    var tvWait  = (!tvV || tvV==='WAIT');
+    var tvColor = tvReady ? '#22c55e' : (tvWait ? '#f59e0b' : '#ef4444');
+    var tvLabel = tvV || 'Awaiting production-engine verdict';
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Technical Verdict</div>';
+    h += '<div style="font-size:11px;font-weight:800;color:'+tvColor+'">'+aiEsc(tvLabel)+'</div>';
+    h += '<div style="font-size:8px;color:rgba(130,130,160,.45);margin-top:1px">Source: Production Engine</div>';
+    h += '</div>';
+    var bf = tv.blocking_factors || [];
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Blocking Factors</div>';
+    if (bf.length) {
+      bf.forEach(function(b){ h += '<div style="font-size:9px;color:#ef4444;margin-bottom:1px;word-break:break-word">&#8226; '+aiEsc(b)+'</div>'; });
+    } else {
+      h += '<div style="font-size:9px;color:rgba(130,130,160,.5)">No blocking factors reported</div>';
+    }
+    h += '</div>';
+    h += brow('Next Action',  ab.next_action  || 'No next action defined');
+    h += brow('Invalidation', ab.invalidation || 'Invalidation not yet defined');
+  }
+  h += '<div style="font-size:8px;color:rgba(130,130,160,.3);margin-top:8px;border-top:1px solid var(--border);padding-top:4px">display_only=true &bull; shadow mode &bull; no live trading influence</div>';
+  return h;
+}
+
+// ── inline test data — generated by Python test harness ─────────────────
+var CASE_A = {"available":true,"display_only":true,"shadow_mode_note":"SHADOW MODE \u2014 NO LIVE AUTHORITY","market_environment":{"regime":"Risk Off","raw_regime":"RISK_OFF","primary_driver":"Geopolitical Escalation","raw_driver":"GEOPOLITICAL","narrative":"","driver_detail":""},"money_flow":{"leading":["Gold"],"weak":["Broad Equity","Technology"],"narrative":"Safe-haven assets are absorbing capital."},"market_priority":{"ranked":[{"priority":1,"symbol":"MGC","preference":"STRONGLY_FAVORED","direction_ctx":"BULLISH"},{"priority":2,"symbol":"MES","preference":"DISFAVORED","direction_ctx":"BEARISH"},{"priority":3,"symbol":"MYM","preference":"DISFAVORED","direction_ctx":"BEARISH"},{"priority":4,"symbol":"MNQ","preference":"STRONGLY_DISFAVORED","direction_ctx":"BEARISH"}],"top_market":"MGC","top_reason":"RISK-OFF regime","focus_context":""},"technical_verdict":{"verdict":"WAIT","source":"production_engine","note":"Production engine verdict \u2014 not recomputed by analyst","blocking_factors":["Insufficient technical confirmation"],"confirming_factors":["Fresh BOS 280s ago","Price above VWAP","Bullish CVD"],"technical_found":""},"next_action":"Wait for price to reclaim VWAP and a bullish confirmation candle to close above it.","invalidation":"A sustained close below the active demand zone and loss of bullish structure invalidates the long idea."};
+
+var CASE_B = {"available":true,"display_only":true,"shadow_mode_note":"SHADOW MODE \u2014 NO LIVE AUTHORITY","market_environment":{"regime":"Risk Off","raw_regime":"RISK_OFF","primary_driver":"Geopolitical Escalation","raw_driver":"GEOPOLITICAL","narrative":"","driver_detail":""},"money_flow":{"leading":["Gold"],"weak":["Broad Equity","Technology"],"narrative":"Safe-haven assets are absorbing capital."},"market_priority":{"ranked":[{"priority":1,"symbol":"MGC","preference":"STRONGLY_FAVORED","direction_ctx":"BULLISH"},{"priority":2,"symbol":"MES","preference":"DISFAVORED","direction_ctx":"BEARISH"},{"priority":3,"symbol":"MYM","preference":"DISFAVORED","direction_ctx":"BEARISH"},{"priority":4,"symbol":"MNQ","preference":"STRONGLY_DISFAVORED","direction_ctx":"BEARISH"}],"top_market":"MGC","top_reason":"RISK-OFF regime","focus_context":""},"technical_verdict":{"verdict":"WAIT","source":"production_engine","note":"Production engine verdict \u2014 not recomputed by analyst","blocking_factors":["VWAP confirmation window too wide","No confirmation candle close"],"confirming_factors":["Fresh BOS 280s ago"],"technical_found":""},"next_action":"Wait for price to reclaim VWAP and a bullish confirmation candle to close above it.","invalidation":"A sustained close below the active demand zone and loss of bullish structure invalidates the long idea."};
+
+var CASE_C = {"available":true,"display_only":true,"shadow_mode_note":"SHADOW MODE \u2014 NO LIVE AUTHORITY","market_environment":{"regime":"Unknown","raw_regime":"UNKNOWN","primary_driver":"Undetermined","raw_driver":"UNKNOWN","narrative":"","driver_detail":""},"money_flow":{"leading":[],"weak":[],"narrative":"No dominant capital flow direction identified."},"market_priority":{"ranked":[],"top_market":"MGC","top_reason":"Highest priority for Unknown regime","focus_context":""},"technical_verdict":{"verdict":"WAIT","source":"production_engine","note":"Production engine verdict \u2014 not recomputed by analyst","blocking_factors":["Insufficient technical confirmation"],"confirming_factors":[],"technical_found":""},"next_action":"Monitor current conditions.","invalidation":"Loss of structure and sustained break of VWAP."};
+
+document.getElementById('case-a').innerHTML      = renderBriefing(CASE_A);
+document.getElementById('case-b').innerHTML      = renderBriefing(CASE_B);
+document.getElementById('case-c').innerHTML      = renderBriefing(CASE_C);
+document.getElementById('case-mobile').innerHTML = renderBriefing(CASE_B);
+</script>
+</body>
+</html>

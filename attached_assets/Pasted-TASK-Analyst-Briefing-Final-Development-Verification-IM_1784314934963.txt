@@ -1,0 +1,128 @@
+TASK: Analyst Briefing — Final Development Verification
+
+IMPORTANT CONTEXT
+
+The production dashboard is password protected and the Replit agent cannot access it.
+
+Do not claim to have visually inspected the production dashboard.
+
+Use the development environment for all visual and runtime verification.
+
+DO NOT make new features.
+DO NOT change trading logic.
+DO NOT change production behavior.
+DO NOT remove or weaken the production password protection.
+
+1. CLARIFY THE FIELD COUNT
+
+The report says “all 9 confirmed correct,” but the Analyst Briefing has 8 displayed sections.
+
+State exactly what the ninth verified item is.
+
+If the ninth item is metadata such as:
+- display_only
+- source
+- available
+
+label it as metadata, not as a displayed briefing section.
+
+2. DEVELOPMENT DASHBOARD PROOF
+
+Run the development application and show the ANALYST BRIEFING inside the actual development DPv2 dashboard panel.
+
+The screenshot must show:
+
+- Market Environment
+- Primary Driver
+- Money Flow
+- Market Priority
+- Technical Verdict
+- Source: Production Engine
+- Blocking Factors
+- Next Action
+- Invalidation
+
+Do not provide only code, unit tests, or a written description.
+
+3. THREE DEVELOPMENT RUNTIME CASES
+
+Demonstrate the rendered development dashboard using:
+
+CASE A — Normal pipeline data
+
+CASE B — WAIT verdict with at least one blocking factor
+
+CASE C — Missing or None stage data showing fallback text
+
+Controlled test fixtures are permitted for Cases B and C.
+
+Clearly label fixture data as TEST DATA.
+
+Do not describe fixture data as live market data.
+
+4. MOBILE DEVELOPMENT CHECK
+
+Show the development dashboard at mobile width.
+
+Confirm:
+
+- No horizontal scrolling
+- No clipped text
+- Long market-priority text wraps
+- Blocking factors wrap
+- All 8 sections remain readable
+- The Source: Production Engine label remains visible
+
+5. FEATURE-FLAG VERIFICATION
+
+Report:
+
+- Current development value of DECISION_PIPELINE_V2_ENABLED
+- Expected production value from deployment configuration or environment settings
+- Whether the production deployment configuration includes the flag
+
+Do not claim the production UI was visually verified.
+
+Do not change the production flag during this verification task.
+
+6. SAFETY PROOF
+
+Show the test proving these prohibited execution terms cannot appear in briefing-generated text:
+
+- EXECUTE
+- ROUTE
+- ORDER
+- SUBMIT
+- FIRE
+
+Confirm whether the protection:
+
+- removes prohibited words,
+- replaces the affected text,
+- or rejects the entire briefing.
+
+Also confirm the protection applies to every generated text field, including:
+
+- Primary Driver
+- Money Flow
+- Market Priority reasons
+- Blocking Factors
+- Next Action
+- Invalidation
+
+7. EXACT CHANGE REPORT
+
+Provide:
+
+- Development screenshots for Cases A, B, and C
+- Mobile-width development screenshot
+- Exact files changed
+- Exact tests run
+- Full test results
+- Development feature-flag value
+- Production configuration value, if visible from deployment settings
+- Clear statement that the production dashboard was not visually inspected because it is password protected
+- Confirmation that no production trading behavior changed
+
+MAKE NO NEW FEATURES.
+THIS TASK IS DEVELOPMENT VERIFICATION ONLY.
