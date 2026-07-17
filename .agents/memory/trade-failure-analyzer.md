@@ -58,6 +58,15 @@ Both hooks pop `LIVE_TFA_BY_INST` and call `_complete_tfa_record` with a thin di
 `mfe_r < 0.25` (not 0.5) — `_derive_trade_label` in app.py uses 0.25.
 Pinned in test_sim_b to prevent future drift.
 
+## NULL mfe/mae handling (critical correctness rule)
+`_derive_trade_label` does NOT coerce None→0.0 for mfe_r/mae_r. Every branch
+that uses those values is guarded with `is not None`. Without this, a STOP_HIT
+with no MFE/MAE data would land as STOPPED_BEFORE_MOVE (wrong).
+`_classify_failure_mode_tfa` appends "partial: mfe/mae unavailable" to
+`failure_detail` via `_partial_flag()` on ALL return paths when both are None.
+Both the test inlines (`_derive_trade_label_test`, `_classify_failure_mode_test`)
+must be kept byte-identical to the production functions or unit tests drift.
+
 ## Production schema migration
 `outcome VARCHAR` added to dev DB via ALTER TABLE. Will land in prod via Replit Publish diff (no migration script — database skill rule). The column must be present before first production deploy or all `_complete_tfa_record()` calls fail silently.
 

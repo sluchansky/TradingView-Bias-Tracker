@@ -58,7 +58,8 @@ pytestmark = pytest.mark.skipif(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _derive_trade_label_test(mt, ctx):
-    """Exact copy of _derive_trade_label from app.py (line 11086)."""
+    """Exact copy of _derive_trade_label from app.py (line 11089).
+    mfe_r / mae_r may be None — never coerced to 0.0 (price-poll close path)."""
     def _f(v):
         try:
             return float(v) if v is not None else None
@@ -69,8 +70,8 @@ def _derive_trade_label_test(mt, ctx):
         if not outcome:
             return "UNCATEGORIZED"
         r     = _f(mt.get("r_multiple")) or 0.0
-        mfe_r = _f(mt.get("mfe_r"))    or 0.0
-        mae_r = _f(mt.get("mae_r"))    or 0.0
+        mfe_r = _f(mt.get("mfe_r"))          # None when unavailable — not coerced
+        mae_r = _f(mt.get("mae_r"))          # None when unavailable — not coerced
         ctx   = ctx or {}
         eff   = None
         try:
@@ -83,28 +84,28 @@ def _derive_trade_label_test(mt, ctx):
         is_win = "Win" in outcome
         is_be  = outcome == "Breakeven" or (-0.15 < r < 0.15)
         if is_win:
-            if mfe_r >= 0.8 and r < 0.4:
+            if mfe_r is not None and mfe_r >= 0.8 and r < 0.4:
                 return "TP1_THEN_BE"
             return "WIN"
         if is_be:
-            if mfe_r >= 0.8:
+            if mfe_r is not None and mfe_r >= 0.8:
                 return "TP1_THEN_BE"
             return "BREAKEVEN"
-        if mfe_r >= 0.8:
+        if mfe_r is not None and mfe_r >= 0.8:
             return "TP1_THEN_BE"
         if eff is not None and eff >= 0 and eff < 45:
             return "LATE_ENTRY"
         if eff is not None and eff >= 0 and eff > 85 and r < 0:
             return "EARLY_ENTRY"
-        if abs(mae_r) < 0.3 and mfe_r < 0.3:
+        if mae_r is not None and mfe_r is not None and abs(mae_r) < 0.3 and mfe_r < 0.3:
             return "STOPPED_BEFORE_MOVE"
-        if mae_r < -0.8 and mfe_r > abs(mae_r) * 0.5:
+        if mae_r is not None and mfe_r is not None and mae_r < -0.8 and mfe_r > abs(mae_r) * 0.5:
             return "STOP_TOO_TIGHT"
         if edge is not None and edge < 45:
             return "BAD_SETUP"
         if sess and any(s in sess for s in ("LUNCH", "MIDDAY", "OVERNIGHT")):
             return "BAD_SESSION"
-        if mfe_r < 0.25:
+        if mfe_r is not None and mfe_r < 0.25:
             return "NO_FOLLOW_THROUGH"
         return "LOSS"
     except Exception:
@@ -112,29 +113,36 @@ def _derive_trade_label_test(mt, ctx):
 
 
 def _classify_failure_mode_test(mt, ctx, bias=None, vol_regime=None, eq_score=None):
-    """Exact copy of _classify_failure_mode_tfa from app.py (line ~27430)."""
+    """Exact copy of _classify_failure_mode_tfa from app.py (line ~27409).
+    Includes _partial_flag: appends 'partial: mfe/mae unavailable' to
+    failure_detail when both mfe_r and mae_r are absent from mt."""
+    def _partial_flag(fm, fd):
+        if mt.get("mfe_r") is None and mt.get("mae_r") is None:
+            sfx = "partial: mfe/mae unavailable"
+            fd  = (fd + "; " + sfx) if fd else sfx
+        return fm, fd
     try:
         base_label = _derive_trade_label_test(mt, ctx)
         outcome    = (mt.get("outcome") or "").strip()
         is_win     = "Win" in outcome or base_label == "WIN"
         if is_win or base_label in ("TP1_THEN_BE", "BREAKEVEN"):
-            return base_label, None
+            return _partial_flag(base_label, None)
         direction = (mt.get("direction") or "").strip()
         _bias     = (bias or "").upper()
         if _bias and direction:
             if direction == "Long"  and "BEAR" in _bias:
-                return "WRONG_BIAS", "Bias was %s at entry" % bias
+                return _partial_flag("WRONG_BIAS", "Bias was %s at entry" % bias)
             if direction == "Short" and "BULL" in _bias:
-                return "WRONG_BIAS", "Bias was %s at entry" % bias
+                return _partial_flag("WRONG_BIAS", "Bias was %s at entry" % bias)
         if eq_score is not None:
             try:
                 if float(eq_score) < 60:
-                    return "POOR_LOCATION", "Entry quality %d at entry" % round(float(eq_score))
+                    return _partial_flag("POOR_LOCATION", "Entry quality %d at entry" % round(float(eq_score)))
             except Exception:
                 pass
         if vol_regime and "EXTREME" in str(vol_regime).upper():
-            return "VOLATILITY_MISMATCH", "Vol regime: %s" % vol_regime
-        return base_label, None
+            return _partial_flag("VOLATILITY_MISMATCH", "Vol regime: %s" % vol_regime)
+        return _partial_flag(base_label, None)
     except Exception:
         return "UNCATEGORIZED", None
 
@@ -947,6 +955,43 @@ def test_classify_uncategorized_no_outcome():
     mt  = {"r_multiple": -1.0, "mfe_r": 0.2, "mae_r": -1.0}  # no outcome key
     mode, _ = _classify_failure_mode_test(mt, {})
     assert mode == "UNCATEGORIZED"
+
+
+def test_classify_null_mfe_mae_not_coerced_to_zero():
+    """NULL mfe_r / mae_r must NOT be coerced to 0.0.
+
+    A stop-out on the price-poll close path arrives with mfe_r=None,
+    mae_r=None.  If they were treated as 0.0 the classifier would fire
+    STOPPED_BEFORE_MOVE (abs(0)<0.3 and 0<0.3).  With the correct None
+    handling the mfe/mae-dependent branches are skipped and the label
+    falls through to the base LOSS.
+    """
+    mt = _mt(outcome="Loss", r_multiple=-1.0)
+    # Deliberately omit mfe_r / mae_r (they default to None via .get())
+    mt.pop("mfe_r", None)
+    mt.pop("mae_r", None)
+    mode, _ = _classify_failure_mode_test(mt, {})
+    assert mode != "STOPPED_BEFORE_MOVE", (
+        "STOPPED_BEFORE_MOVE must not fire when mfe/mae are unknown (None)")
+    assert mode == "LOSS", (
+        f"Expected LOSS as the base label for a stop-out with no mfe/mae data, "
+        f"got {mode!r}")
+
+
+def test_classify_null_mfe_mae_partial_marker_in_detail():
+    """Records with NULL mfe_r and mae_r must carry the partial-analytics marker.
+
+    The 'partial: mfe/mae unavailable' suffix in failure_detail signals to any
+    downstream consumer that this record was closed on the price-poll path and
+    the MFE/MAE fields are genuinely absent — not zero, not a small value.
+    """
+    mt = _mt(outcome="Loss", r_multiple=-1.0)
+    mt.pop("mfe_r", None)
+    mt.pop("mae_r", None)
+    _, detail = _classify_failure_mode_test(mt, {})
+    assert detail is not None, "failure_detail must not be None when mfe/mae are absent"
+    assert "partial" in detail, (
+        f"Expected 'partial: mfe/mae unavailable' in failure_detail, got {detail!r}")
 
 
 def test_classify_wrong_bias_long_bearish():
@@ -1897,8 +1942,14 @@ def test_sim_d_check_trade_events_stop_hook():
         assert float(r["exit_price"]) == pytest.approx(2629.0, abs=0.01)
         assert r["mfe_r"] is None, "mfe_r must be NULL on check_trade_events path"
         assert r["mae_r"] is None, "mae_r must be NULL on check_trade_events path"
-        assert r["failure_mode"] not in (None, "uncategorized"), (
-            f"Expected a real failure label, got {r['failure_mode']!r}")
+        # Without mfe/mae the base label falls through to LOSS — NOT
+        # STOPPED_BEFORE_MOVE (which would fire if None were coerced to 0.0).
+        assert r["failure_mode"] == "LOSS", (
+            f"Expected LOSS (null mfe/mae must not coerce to STOPPED_BEFORE_MOVE), "
+            f"got {r['failure_mode']!r}")
+        # Records with missing mfe/mae must carry the partial-analytics marker.
+        assert r["failure_detail"] is not None and "partial" in r["failure_detail"], (
+            f"Expected 'partial' in failure_detail, got {r['failure_detail']!r}")
         assert r["completed_at"] is not None
     finally:
         _clean(pfx)
@@ -1945,6 +1996,9 @@ def test_sim_e_check_trade_events_t1_hook():
         assert r["mfe_r"] is None, "mfe_r NULL on check_trade_events path"
         assert r["mae_r"] is None, "mae_r NULL on check_trade_events path"
         assert r["failure_mode"] == "WIN", f"Expected WIN, got {r['failure_mode']!r}"
+        # WIN records on the price-poll path also carry the partial-analytics marker.
+        assert r["failure_detail"] is not None and "partial" in r["failure_detail"], (
+            f"Expected 'partial' in failure_detail for T1_HIT WIN, got {r['failure_detail']!r}")
         assert r["completed_at"] is not None
     finally:
         _clean(pfx)

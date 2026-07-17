@@ -11085,7 +11085,9 @@ def _derive_trade_outcome(mt, ctx):
 
 def _derive_trade_label(mt, ctx):
     """11-label failure classifier stored as trade_label in strategy_trades.
-    DISPLAY + Rule Engine diagnostics; never gates. Fail-open -> 'UNCATEGORIZED'."""
+    DISPLAY + Rule Engine diagnostics; never gates. Fail-open -> 'UNCATEGORIZED'.
+    mfe_r / mae_r may be None on the price-poll close path — they are NEVER
+    coerced to 0.0.  Branches that require those values are guarded accordingly."""
     try:
         outcome = (mt.get("outcome") or "").strip()
         if not outcome:
@@ -11094,8 +11096,8 @@ def _derive_trade_label(mt, ctx):
             try: return float(v) if v is not None else None
             except Exception: return None
         r     = _f(mt.get("r_multiple")) or 0.0
-        mfe_r = _f(mt.get("mfe_r"))    or 0.0
-        mae_r = _f(mt.get("mae_r"))    or 0.0
+        mfe_r = _f(mt.get("mfe_r"))          # None when unavailable — not coerced
+        mae_r = _f(mt.get("mae_r"))          # None when unavailable — not coerced
         ctx   = ctx or {}
         eff   = None
         try: eff = int(ctx.get("entry_efficiency") if ctx.get("entry_efficiency") is not None else -1)
@@ -11105,28 +11107,28 @@ def _derive_trade_label(mt, ctx):
         is_win = "Win" in outcome
         is_be  = outcome == "Breakeven" or (-0.15 < r < 0.15)
         if is_win:
-            if mfe_r >= 0.8 and r < 0.4:
+            if mfe_r is not None and mfe_r >= 0.8 and r < 0.4:
                 return "TP1_THEN_BE"
             return "WIN"
         if is_be:
-            if mfe_r >= 0.8:
+            if mfe_r is not None and mfe_r >= 0.8:
                 return "TP1_THEN_BE"
             return "BREAKEVEN"
-        if mfe_r >= 0.8:
+        if mfe_r is not None and mfe_r >= 0.8:
             return "TP1_THEN_BE"
         if eff is not None and eff >= 0 and eff < 45:
             return "LATE_ENTRY"
         if eff is not None and eff >= 0 and eff > 85 and r < 0:
             return "EARLY_ENTRY"
-        if abs(mae_r) < 0.3 and mfe_r < 0.3:
+        if mae_r is not None and mfe_r is not None and abs(mae_r) < 0.3 and mfe_r < 0.3:
             return "STOPPED_BEFORE_MOVE"
-        if mae_r < -0.8 and mfe_r > abs(mae_r) * 0.5:
+        if mae_r is not None and mfe_r is not None and mae_r < -0.8 and mfe_r > abs(mae_r) * 0.5:
             return "STOP_TOO_TIGHT"
         if edge is not None and edge < 45:
             return "BAD_SETUP"
         if sess and any(s in sess for s in ("LUNCH", "MIDDAY", "OVERNIGHT")):
             return "BAD_SESSION"
-        if mfe_r < 0.25:
+        if mfe_r is not None and mfe_r < 0.25:
             return "NO_FOLLOW_THROUGH"
         return "LOSS"
     except Exception:
@@ -27405,29 +27407,39 @@ def _classify_failure_mode_tfa(mt, ctx, bias=None, vol_regime=None, eq_score=Non
     """Extended failure classifier for the TFA.  Calls _derive_trade_label for the
     standard categories then overlays TFA-specific modes: WRONG_BIAS, POOR_LOCATION,
     VOLATILITY_MISMATCH.  Returns (failure_mode, failure_detail | None).
+    When mfe_r and mae_r are both absent from mt (price-poll close path), a
+    'partial: mfe/mae unavailable' suffix is appended to failure_detail so
+    downstream consumers know the record has incomplete analytics.  NULL is never
+    treated as zero — _derive_trade_label handles None correctly.
     FAIL-OPEN: returns ('UNCATEGORIZED', None) on any error."""
+    def _partial_flag(fm, fd):
+        """Annotate records where MFE/MAE were unavailable at close time."""
+        if mt.get("mfe_r") is None and mt.get("mae_r") is None:
+            sfx = "partial: mfe/mae unavailable"
+            fd  = (fd + "; " + sfx) if fd else sfx
+        return fm, fd
     try:
         base_label = _derive_trade_label(mt, ctx)
         outcome    = (mt.get("outcome") or "").strip()
         is_win     = "Win" in outcome or base_label == "WIN"
         if is_win or base_label in ("TP1_THEN_BE", "BREAKEVEN"):
-            return base_label, None
+            return _partial_flag(base_label, None)
         direction = (mt.get("direction") or "").strip()
         _bias     = (bias or "").upper()
         if _bias and direction:
             if direction == "Long"  and "BEAR" in _bias:
-                return "WRONG_BIAS", "Bias was %s at entry" % bias
+                return _partial_flag("WRONG_BIAS", "Bias was %s at entry" % bias)
             if direction == "Short" and "BULL" in _bias:
-                return "WRONG_BIAS", "Bias was %s at entry" % bias
+                return _partial_flag("WRONG_BIAS", "Bias was %s at entry" % bias)
         if eq_score is not None:
             try:
                 if float(eq_score) < 60:
-                    return "POOR_LOCATION", "Entry quality %d at entry" % round(float(eq_score))
+                    return _partial_flag("POOR_LOCATION", "Entry quality %d at entry" % round(float(eq_score)))
             except Exception:
                 pass
         if vol_regime and "EXTREME" in str(vol_regime).upper():
-            return "VOLATILITY_MISMATCH", "Vol regime: %s" % vol_regime
-        return base_label, None
+            return _partial_flag("VOLATILITY_MISMATCH", "Vol regime: %s" % vol_regime)
+        return _partial_flag(base_label, None)
     except Exception:
         return "UNCATEGORIZED", None
 
