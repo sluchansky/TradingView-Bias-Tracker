@@ -21196,12 +21196,182 @@ def _dpv2_stage_decide(obs, interp, prio, validate,
     }
 
 
+def _dpv2_analyst_briefing(s1, s2, s3, s4, s5, instrument, mode):
+    """Phase 2 — AI Analyst Layer: one concise market briefing from DPv2 stage outputs.
+
+    Answers 8 questions in order:
+      1. What is happening?        (regime narrative)
+      2. Why is it happening?      (primary driver)
+      3. Where is money flowing?   (leading/weak asset classes)
+      4. Which market is strongest?(ranked instruments + top reason)
+      5. Technical engine verdict? (production verdict — NEVER recomputed)
+      6. What is preventing trade? (failed checks → blocking factors)
+      7. What must happen next?    (from explain block)
+      8. What would invalidate?    (from explain block)
+
+    DISPLAY-ONLY. Consumes stage dicts only. Never calls full_analysis, never
+    recomputes any signals, never produces trade commands. Fail-open.
+    """
+    try:
+        regime       = (s2 or {}).get("regime",          "UNKNOWN")
+        driver       = (s2 or {}).get("primary_driver",  "UNKNOWN")
+        ranked       = (s3 or {}).get("ranked_instruments") or []
+        passed       = (s4 or {}).get("passed_checks")   or []
+        failed       = (s4 or {}).get("failed_checks")   or []
+        expl         = (s5 or {}).get("explanation")     or {}
+        live_verdict = (s5 or {}).get("production_verdict", "WAIT")
+
+        # ── 1 & 2. Regime + driver ────────────────────────────────────────────
+        _REGIME_LABEL = {
+            "RISK_ON":  "Risk On",
+            "RISK_OFF": "Risk Off",
+            "NEUTRAL":  "Neutral",
+            "MIXED":    "Mixed",
+            "UNKNOWN":  "Unknown",
+        }
+        _DRIVER_LABEL = {
+            "GEOPOLITICAL":    "Geopolitical Escalation",
+            "FED_POLICY":      "Federal Reserve Policy",
+            "INFLATION":       "Inflation Concerns",
+            "EMPLOYMENT":      "Labor Market Conditions",
+            "ECONOMIC_GROWTH": "Economic Growth Expectations",
+            "EARNINGS":        "Corporate Earnings",
+            "ENERGY":          "Energy Market Conditions",
+            "LIQUIDITY":       "Liquidity Conditions",
+            "TECHNICAL":       "Technical Price Action",
+            "MULTIPLE":        "Multiple Macro Drivers",
+            "NONE":            "No Clear Macro Driver",
+            "UNKNOWN":         "Undetermined",
+        }
+        regime_label = _REGIME_LABEL.get(regime, regime.replace("_", " ").title())
+        driver_label = _DRIVER_LABEL.get(driver, driver.replace("_", " ").title())
+
+        # ── 3. Money flow ─────────────────────────────────────────────────────
+        _ASSET_CLASS = {
+            "SAFE_HAVEN":    "Gold",
+            "EQUITY_TECH":   "Technology",
+            "EQUITY_BROAD":  "Broad Equity",
+        }
+        leading, weak = [], []
+        for r in ranked:
+            pref  = r.get("preference", "")
+            sym   = r.get("symbol", "")
+            itype = _dpv2_inst_type(sym)
+            asset = _ASSET_CLASS.get(itype, sym)
+            if pref in ("STRONGLY_FAVORED", "FAVORED"):
+                if asset not in leading: leading.append(asset)
+            elif pref in ("DISFAVORED", "STRONGLY_DISFAVORED"):
+                if asset not in weak: weak.append(asset)
+        if regime == "RISK_OFF":
+            flow_narrative = "Safe-haven assets are absorbing capital." if leading else "Risk-off conditions with no clear leading asset."
+        elif regime == "RISK_ON":
+            flow_narrative = "Risk assets are attracting capital." if leading else "Risk-on conditions with no clear leading asset."
+        else:
+            flow_narrative = "No dominant capital flow direction identified."
+
+        # ── 4. Highest priority market ────────────────────────────────────────
+        top        = ranked[0] if ranked else {}
+        top_symbol = top.get("symbol", instrument)
+        top_prefs  = top.get("reasons") or []
+        top_reason = top_prefs[0] if top_prefs else ("Highest priority for %s regime" % regime_label)
+        market_ranking = [
+            {"priority":     r["priority"],
+             "symbol":       r["symbol"],
+             "preference":   r.get("preference", "INSUFFICIENT_DATA"),
+             "direction_ctx":r.get("directional_context", "UNKNOWN")}
+            for r in ranked
+        ]
+
+        # ── 5. Technical verdict (production engine — never recomputed) ───────
+        verdict_display = live_verdict or "WAIT"
+
+        # ── 6. Blocking factors (from VALIDATE failed checks) ─────────────────
+        blocking = [f for f in failed if f][:3]
+        if not blocking and "WAIT" in (verdict_display or ""):
+            blocking = ["Insufficient technical confirmation"]
+
+        # ── 7. Next action ────────────────────────────────────────────────────
+        next_action = expl.get("what_must_happen_next", "")
+        if not next_action:
+            next_action = ("Resolve: %s." % "; ".join(failed[:2])
+                           if failed else "Monitor current conditions.")
+
+        # ── 8. Invalidation ───────────────────────────────────────────────────
+        invalidation = expl.get("what_invalidates_the_idea", "")
+        if not invalidation:
+            invalidation = "Loss of structure and sustained break of VWAP."
+
+        # ── Plain-text briefing (display-ready) ───────────────────────────────
+        _nl = "\n"
+        parts = [
+            "Market Environment",  regime_label,      _nl,
+            "Primary Driver",      driver_label,      _nl,
+            "Money Flow",
+        ]
+        parts.append("Leading: " + (", ".join(leading) if leading else "None"))
+        parts.append("Weak: "    + (", ".join(weak)    if weak    else "None"))
+        parts += [
+            _nl,
+            "Highest Priority Market", top_symbol,
+            "Reason: " + top_reason,  _nl,
+            "Technical Verdict",       verdict_display,
+        ]
+        if blocking:
+            parts.append("Blocking: " + "; ".join(blocking))
+        parts += [_nl, "Next Action", next_action, _nl, "Invalidation", invalidation]
+        briefing_text = "\n".join(p for p in parts if p != _nl or True)
+
+        return {
+            "available":       True,
+            "display_only":    True,
+            "shadow_mode_note":"SHADOW MODE — NO LIVE AUTHORITY",
+            "market_environment": {
+                "regime":        regime_label,
+                "raw_regime":    regime,
+                "primary_driver":driver_label,
+                "raw_driver":    driver,
+                "narrative":     expl.get("what_is_happening", ""),
+                "driver_detail": expl.get("why_it_is_happening", ""),
+            },
+            "money_flow": {
+                "leading":   leading,
+                "weak":      weak,
+                "narrative": flow_narrative,
+            },
+            "market_priority": {
+                "ranked":         market_ranking,
+                "top_market":     top_symbol,
+                "top_reason":     top_reason,
+                "focus_context":  expl.get("why_this_market_is_relevant", ""),
+            },
+            "technical_verdict": {
+                "verdict":           verdict_display,
+                "source":            "production_engine",
+                "note":              "Production engine verdict — not recomputed by analyst",
+                "blocking_factors":  blocking,
+                "confirming_factors":passed[:3],
+                "technical_found":   expl.get("what_the_technical_engine_found", ""),
+            },
+            "next_action":    next_action,
+            "invalidation":   invalidation,
+            "briefing_text":  briefing_text,
+        }
+    except Exception as _ae:
+        return {
+            "available":       False,
+            "error":           str(_ae),
+            "display_only":    True,
+            "shadow_mode_note":"SHADOW MODE — NO LIVE AUTHORITY",
+        }
+
+
 def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction,
                                   trade_plan=None):
     """
     Shadow 5-stage decision pipeline: OBSERVE -> INTERPRET -> PRIORITIZE -> VALIDATE -> DECIDE.
 
     Phase 1B: Corrected stage responsibilities + outcome-comparison agreement tracking.
+    Phase 2:  AI Analyst Layer — one plain-English briefing consuming stage outputs.
     DISPLAY-ONLY in shadow mode. Never mutates global state, never calls full_analysis
     recursively. Fail-open at every stage. Flag OFF -> returns None -> key not attached
     -> goldens byte-identical. All CAN_* flags default False.
@@ -21327,6 +21497,9 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction,
 
         scorecard = _dpv2_compute_scorecard()
 
+        # Phase 2: AI Analyst briefing — consumes stage outputs, never recomputes
+        analyst_briefing = _dpv2_analyst_briefing(s1, s2, s3, s4, s5, instrument, mode)
+
         return {
             "available":           True,
             "shadow_mode":         True,
@@ -21348,6 +21521,7 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction,
             "divergence_reason":   (s5 or {}).get("divergence_reason"),
             "shadow_trade":        shadow_trade,
             "scorecard":           scorecard,
+            "analyst_briefing":    analyst_briefing,
             "record_id":           record_id,
         }
     except Exception as _exc:
@@ -53226,6 +53400,65 @@ function renderDecisionPipeline(d) {
   if(reasoning.length){
     h += '<div style="font-size:9px;color:var(--muted);margin-top:6px">'+
          reasoning.map(function(r){return aiEsc(r);}).join(' &bull; ')+'</div>';
+  }
+  var ab = dp.analyst_briefing;
+  if (ab && ab.available) {
+    h += '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">';
+    h += '<div style="font-size:10px;color:#818cf8;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#9998; ANALYST BRIEFING</div>';
+    var me = ab.market_environment || {};
+    var mf = ab.money_flow || {};
+    var mp = ab.market_priority || {};
+    var tv = ab.technical_verdict || {};
+    function bsec(label, val) {
+      if (!val) return '';
+      return '<div style="margin-bottom:8px">'
+        + '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">'+label+'</div>'
+        + '<div style="font-size:10px;color:var(--fg);line-height:1.5">'+aiEsc(val)+'</div>'
+        + '</div>';
+    }
+    h += bsec('Market Environment', me.regime || '');
+    h += bsec('Primary Driver', me.primary_driver || '');
+    if (mf.leading && mf.leading.length) {
+      h += '<div style="margin-bottom:8px">';
+      h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Money Flow</div>';
+      h += '<div style="font-size:9px;margin-bottom:2px"><span style="color:#22c55e;font-weight:700">Leading: </span><span style="color:var(--fg)">'+aiEsc((mf.leading||[]).join(', '))+'</span></div>';
+      if (mf.weak && mf.weak.length) {
+        h += '<div style="font-size:9px"><span style="color:#ef4444;font-weight:700">Weak: </span><span style="color:var(--fg)">'+aiEsc((mf.weak||[]).join(', '))+'</span></div>';
+      }
+      h += '</div>';
+    }
+    if (mp.ranked && mp.ranked.length) {
+      h += '<div style="margin-bottom:8px">';
+      h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Market Priority</div>';
+      mp.ranked.slice(0,4).forEach(function(r){
+        var isTop = r.priority === 1;
+        h += '<div style="font-size:9px;color:'+(isTop?'var(--fg)':'#94a3b8')+';margin-bottom:1px">';
+        h += r.priority+'. <span style="font-weight:'+(isTop?'700':'400')+'">'+aiEsc(r.symbol)+'</span>';
+        if (r.direction_ctx && r.direction_ctx !== 'UNKNOWN') {
+          h += ' <span style="color:var(--muted)">('+aiEsc(r.direction_ctx.toLowerCase())+')</span>';
+        }
+        h += '</div>';
+      });
+      if (mp.top_reason) {
+        h += '<div style="font-size:9px;color:var(--muted);margin-top:3px;font-style:italic">'+aiEsc(mp.top_reason)+'</div>';
+      }
+      h += '</div>';
+    }
+    var tvVerdCol = tv.verdict === 'LONG READY' || tv.verdict === 'SHORT READY' ? '#22c55e' : '#ef4444';
+    h += '<div style="margin-bottom:8px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Technical Verdict</div>';
+    h += '<div style="font-size:11px;font-weight:800;color:'+tvVerdCol+'">'+aiEsc(tv.verdict||'WAIT')+'</div>';
+    if (tv.blocking_factors && tv.blocking_factors.length) {
+      h += '<div style="font-size:9px;color:var(--muted);margin-top:3px">';
+      (tv.blocking_factors||[]).forEach(function(b){
+        h += '<div>&#10007; '+aiEsc(b)+'</div>';
+      });
+      h += '</div>';
+    }
+    h += '</div>';
+    h += bsec('Next Action', ab.next_action || '');
+    h += bsec('Invalidation', ab.invalidation || '');
+    h += '</div>';
   }
   h += '<div style="font-size:8px;color:rgba(130,130,160,.4);margin-top:8px;border-top:1px solid var(--border);padding-top:6px">Shadow mode &mdash; display only &mdash; no live trading influence</div>';
   el.innerHTML = h;
