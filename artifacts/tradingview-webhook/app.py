@@ -20374,8 +20374,190 @@ def _build_brain_state(result):
 #   VALIDATE   → per-gate PASS/FAIL/INSUFFICIENT (no combining)
 #   DECIDE     → pipeline verdict + comparison against live system
 
+# ── Decision Pipeline V2: Infrastructure (Phase 1B) ─────────────────────────
+_DPV2_AGREEMENT_HISTORY = deque(maxlen=200)   # bounded, GIL-safe for reads
+_DPV2_SHADOW_TRADES     = {}                  # instrument -> shadow-trade dict
+_DPV2_AGREEMENT_LOCK    = threading.Lock()
+DPV2_DB_READY           = False               # boot probe (INSERT/SELECT only; no DDL)
+
+
+def _dpv2_store_agreement_record(record):
+    """Thread-safe append to the bounded agreement-history deque."""
+    try:
+        with _DPV2_AGREEMENT_LOCK:
+            _DPV2_AGREEMENT_HISTORY.appendleft(record)
+    except Exception:
+        pass
+
+
+def _dpv2_compute_better_decision(record):
+    """Given a completed outcome record, determine which system was more correct.
+
+    Returns (better_decision, reason) where better_decision is one of:
+    PRODUCTION / V2 / BOTH / NEITHER / INCONCLUSIVE
+    """
+    prod_ok   = is_actionable(record.get("production_verdict") or "WAIT")
+    v2_ok     = (record.get("shadow_verdict") == "READY")
+    outcome   = record.get("final_outcome")
+
+    if not outcome:
+        return "INCONCLUSIVE", "No outcome data yet"
+
+    WIN_OUTCOMES  = {"TARGET_REACHED", "TP1_REACHED", "PARTIAL_WIN"}
+    LOSS_OUTCOMES = {"STOPPED_OUT", "STOPPED"}
+
+    if prod_ok and v2_ok:
+        if outcome in WIN_OUTCOMES:   return "BOTH",    "Both approved — trade won"
+        if outcome in LOSS_OUTCOMES:  return "NEITHER", "Both approved — trade lost"
+        return "INCONCLUSIVE", "Both approved — outcome unclear"
+
+    if prod_ok and not v2_ok:
+        if outcome in WIN_OUTCOMES:  return "PRODUCTION", "Production captured a winner V2 skipped"
+        if outcome in LOSS_OUTCOMES: return "V2",         "V2 avoided a losing trade"
+        return "INCONCLUSIVE", "Outcome unclear"
+
+    if not prod_ok and v2_ok:
+        if outcome in WIN_OUTCOMES:  return "V2",         "V2 correctly identified a missed winner"
+        if outcome in LOSS_OUTCOMES: return "PRODUCTION", "Production correctly avoided a losing trade"
+        return "INCONCLUSIVE", "Outcome unclear"
+
+    # Both waited
+    return "INCONCLUSIVE", "Both waited — no comparable outcome"
+
+
+def _dpv2_compute_scorecard():
+    """Aggregate agreement history into a read-only scorecard. Fail-open."""
+    try:
+        records = list(_DPV2_AGREEMENT_HISTORY)   # GIL-safe snapshot
+        total   = len(records)
+        if total == 0:
+            return {"total_evaluations": 0, "message": "No evaluations yet",
+                    "shadow_mode_note": "SHADOW MODE — NO LIVE AUTHORITY"}
+
+        agrees   = sum(1 for r in records if r.get("agreement_status") == "AGREE")
+        disagrees = total - agrees
+        prod_wins = sum(1 for r in records if r.get("better_decision") == "PRODUCTION")
+        v2_wins   = sum(1 for r in records if r.get("better_decision") == "V2")
+        both_ok   = sum(1 for r in records if r.get("better_decision") == "BOTH")
+        neither   = sum(1 for r in records if r.get("better_decision") == "NEITHER")
+        inconc    = sum(1 for r in records
+                        if r.get("better_decision") in (None, "INCONCLUSIVE"))
+        prod_app_v2_wait = sum(1 for r in records
+                               if r.get("agreement_status") == "PRODUCTION_APPROVED_V2_WAITED")
+        v2_app_prod_wait = sum(1 for r in records
+                               if r.get("agreement_status") == "PRODUCTION_WAITED_V2_APPROVED")
+        avoided_loss  = sum(1 for r in records
+                            if r.get("better_decision") == "V2"
+                            and r.get("final_outcome") in ("STOPPED_OUT", "STOPPED"))
+        missed_winner = sum(1 for r in records
+                            if r.get("better_decision") == "PRODUCTION"
+                            and r.get("final_outcome") in ("TARGET_REACHED", "TP1_REACHED"))
+
+        mfes = [r["mfe_pts"] for r in records if r.get("mfe_pts") is not None]
+        maes = [r["mae_pts"] for r in records if r.get("mae_pts") is not None]
+
+        def _group(key):
+            out = {}
+            for r in records:
+                k = r.get(key) or "UNKNOWN"
+                out.setdefault(k, {"total": 0, "agree": 0,
+                                   "prod_wins": 0, "v2_wins": 0})
+                out[k]["total"] += 1
+                if r.get("agreement_status") == "AGREE":
+                    out[k]["agree"] += 1
+                if r.get("better_decision") == "PRODUCTION":
+                    out[k]["prod_wins"] += 1
+                if r.get("better_decision") == "V2":
+                    out[k]["v2_wins"] += 1
+            return out
+
+        # Minimum thresholds (display-only; do NOT auto-enable anything)
+        scalp_ct = sum(1 for r in records if r.get("mode") == "SCALP")
+        swing_ct = sum(1 for r in records if r.get("mode") == "SWING")
+        meets_min = (total >= 100 and disagrees >= 30
+                     and scalp_ct >= 20 and swing_ct >= 20)
+
+        return {
+            "total_evaluations":             total,
+            "agreement_rate_pct":            round(agrees / total * 100, 1),
+            "disagree_count":                disagrees,
+            "production_wins":               prod_wins,
+            "v2_wins":                       v2_wins,
+            "both_correct":                  both_ok,
+            "neither_correct":               neither,
+            "inconclusive":                  inconc,
+            "production_approved_v2_waited": prod_app_v2_wait,
+            "v2_approved_production_waited": v2_app_prod_wait,
+            "avoided_loss_count":            avoided_loss,
+            "missed_winner_count":           missed_winner,
+            "avg_mfe_pts":    round(sum(mfes)/len(mfes), 2) if mfes else None,
+            "avg_mae_pts":    round(sum(maes)/len(maes), 2) if maes else None,
+            "by_symbol":      _group("symbol"),
+            "by_mode":        _group("mode"),
+            "by_regime":      _group("regime"),
+            "by_driver":      _group("primary_driver"),
+            "meets_minimum_thresholds": meets_min,
+            "shadow_mode_note": "SHADOW MODE — NO LIVE AUTHORITY",
+        }
+    except Exception as _e:
+        return {"available": False, "error": str(_e),
+                "shadow_mode_note": "SHADOW MODE — NO LIVE AUTHORITY"}
+
+
+# ── Decision Pipeline V2: Stage Functions (Phase 1B) ────────────────────────
+
+# ─ Regime / driver / instrument-type constants ────────────────────────────────
+_DPV2_REGIME_VALUES      = {"RISK_ON", "RISK_OFF", "NEUTRAL", "MIXED", "UNKNOWN"}
+_DPV2_DRIVER_VALUES      = {
+    "GEOPOLITICAL", "FED_POLICY", "INFLATION", "EMPLOYMENT", "ECONOMIC_GROWTH",
+    "EARNINGS", "ENERGY", "LIQUIDITY", "TECHNICAL", "MULTIPLE", "NONE", "UNKNOWN",
+}
+_DPV2_SAFE_HAVEN_INSTS   = {"MGC", "GC", "SI", "MSI"}
+_DPV2_EQUITY_TECH_INSTS  = {"MNQ", "NQ"}
+_DPV2_EQUITY_BROAD_INSTS = {"MES", "ES", "MYM", "YM"}
+
+_DPV2_PREF_MATRIX = {
+    ("RISK_OFF", "SAFE_HAVEN"):     ("STRONGLY_FAVORED",    "BULLISH"),
+    ("RISK_OFF", "EQUITY_TECH"):    ("STRONGLY_DISFAVORED", "BEARISH"),
+    ("RISK_OFF", "EQUITY_BROAD"):   ("DISFAVORED",          "BEARISH"),
+    ("RISK_ON",  "SAFE_HAVEN"):     ("DISFAVORED",          "BEARISH"),
+    ("RISK_ON",  "EQUITY_TECH"):    ("STRONGLY_FAVORED",    "BULLISH"),
+    ("RISK_ON",  "EQUITY_BROAD"):   ("FAVORED",             "BULLISH"),
+    ("NEUTRAL",  "SAFE_HAVEN"):     ("NEUTRAL",             "NEUTRAL"),
+    ("NEUTRAL",  "EQUITY_TECH"):    ("NEUTRAL",             "NEUTRAL"),
+    ("NEUTRAL",  "EQUITY_BROAD"):   ("NEUTRAL",             "NEUTRAL"),
+    ("MIXED",    "SAFE_HAVEN"):     ("NEUTRAL",             "NEUTRAL"),
+    ("MIXED",    "EQUITY_TECH"):    ("NEUTRAL",             "NEUTRAL"),
+    ("MIXED",    "EQUITY_BROAD"):   ("NEUTRAL",             "NEUTRAL"),
+    ("UNKNOWN",  "SAFE_HAVEN"):     ("INSUFFICIENT_DATA",   "UNKNOWN"),
+    ("UNKNOWN",  "EQUITY_TECH"):    ("INSUFFICIENT_DATA",   "UNKNOWN"),
+    ("UNKNOWN",  "EQUITY_BROAD"):   ("INSUFFICIENT_DATA",   "UNKNOWN"),
+}
+_DPV2_PREF_ORDER = {
+    "STRONGLY_FAVORED": 0, "FAVORED": 1, "NEUTRAL": 2,
+    "DISFAVORED": 3, "STRONGLY_DISFAVORED": 4, "INSUFFICIENT_DATA": 5,
+}
+_DPV2_KNOWN_INSTRUMENTS = ["MGC", "MNQ", "MES", "MYM"]
+
+
+def _dpv2_inst_type(inst):
+    u = (inst or "").upper()
+    if u in _DPV2_SAFE_HAVEN_INSTS:    return "SAFE_HAVEN"
+    if u in _DPV2_EQUITY_TECH_INSTS:   return "EQUITY_TECH"
+    if u in _DPV2_EQUITY_BROAD_INSTS:  return "EQUITY_BROAD"
+    return "UNKNOWN"
+
+
 def _dpv2_stage_observe(instrument):
-    """Stage 1: Snapshot raw signals from global in-memory stores. Read-only, fail-open."""
+    """Stage 1 — What facts are currently available?
+
+    Collects price, VWAP, CVD, volume, ATR, market structure, prior-day levels,
+    recent alerts, existing news/sector data, account state, position state,
+    prop-rule state, and data freshness.
+
+    Does NOT classify the market, create a directional bias, rank markets,
+    or produce a trade verdict. Read-only, fail-open.
+    """
     _now = now_utc()
     _STRUCT_TYPES = {"BOS", "CHOCH", "HH", "HL", "LH", "LL"}
     _SWEEP_TYPES  = {"LIQUIDITY_SWEEP", "SWEEP", "SWEEP_HIGH", "SWEEP_LOW",
@@ -20387,10 +20569,8 @@ def _dpv2_stage_observe(instrument):
     price_ts  = auto_rec.get("ts")
     price_age = None
     if price_ts:
-        try:
-            price_age = (_now - datetime.fromisoformat(price_ts)).total_seconds()
-        except Exception:
-            pass
+        try: price_age = (_now - datetime.fromisoformat(price_ts)).total_seconds()
+        except Exception: pass
 
     # VWAP
     vwap_rec   = VWAP_BY_TICKER.get(instrument) or {}
@@ -20398,27 +20578,21 @@ def _dpv2_stage_observe(instrument):
     vwap_ts    = vwap_rec.get("ts")
     vwap_age   = None
     if vwap_ts:
-        try:
-            vwap_age = (_now - datetime.fromisoformat(vwap_ts)).total_seconds()
-        except Exception:
-            pass
+        try: vwap_age = (_now - datetime.fromisoformat(vwap_ts)).total_seconds()
+        except Exception: pass
     price_above_vwap = None
     if price is not None and vwap_value is not None:
-        try:
-            price_above_vwap = float(price) > float(vwap_value)
-        except Exception:
-            pass
+        try: price_above_vwap = float(price) > float(vwap_value)
+        except Exception: pass
 
     # CVD
     cvd_rec   = CVD_BY_TICKER.get(instrument) or {}
-    cvd_state = cvd_rec.get("state")    # "bullish" | "bearish" | None
+    cvd_state = cvd_rec.get("state")
     cvd_ts    = cvd_rec.get("ts")
     cvd_age   = None
     if cvd_ts:
-        try:
-            cvd_age = (_now - datetime.fromisoformat(cvd_ts)).total_seconds()
-        except Exception:
-            pass
+        try: cvd_age = (_now - datetime.fromisoformat(cvd_ts)).total_seconds()
+        except Exception: pass
 
     # RVOL
     rvol_rec   = RVOL_BY_TICKER.get(instrument) or {}
@@ -20433,29 +20607,29 @@ def _dpv2_stage_observe(instrument):
         try:
             vol_spike_age   = (_now - datetime.fromisoformat(vol_spike_ts)).total_seconds()
             vol_spike_fresh = vol_spike_age <= float(cfg("VOLUME_SPIKE_TTL_MIN")) * 60
-        except Exception:
-            pass
+        except Exception: pass
 
-    # Structure + sweep alerts from ALERT_HISTORY (last 30 min, per-instrument)
+    # ATR / Volatility
+    vol_state = VOLATILITY_BY_TICKER.get(instrument) or {}
+    atr_pts   = vol_state.get("atr_pts")
+    vol_ratio = vol_state.get("ratio")
+
+    # Structure + sweep alerts (last 30 min, per-instrument)
     horizon_s         = 30 * 60
     structure_signals = []
     sweep_signals     = []
-    for _ah in list(ALERT_HISTORY):           # list() for GIL-safe snapshot
+    for _ah in list(ALERT_HISTORY):    # list() for GIL-safe snapshot
         try:
             a_inst = (_ah.get("instrument") or
                       instrument_of(_ah.get("ticker") or ""))
-            if a_inst != instrument:
-                continue
+            if a_inst != instrument: continue
             a_type = (_ah.get("alert_type") or "").upper()
             a_ts   = _ah.get("ts") or _ah.get("timestamp")
             a_age  = None
             if a_ts:
-                try:
-                    a_age = (_now - datetime.fromisoformat(a_ts)).total_seconds()
-                except Exception:
-                    pass
-            if a_age is not None and a_age > horizon_s:
-                continue
+                try: a_age = (_now - datetime.fromisoformat(a_ts)).total_seconds()
+                except Exception: pass
+            if a_age is not None and a_age > horizon_s: continue
             direction = (_ah.get("direction") or "").upper()
             if any(s in a_type for s in _STRUCT_TYPES):
                 structure_signals.append({
@@ -20469,11 +20643,40 @@ def _dpv2_stage_observe(instrument):
                     "direction": direction,
                     "age_s":     round(a_age, 1) if a_age is not None else None,
                 })
-        except Exception:
-            pass
+        except Exception: pass
 
     structure_signals.sort(key=lambda x: x.get("age_s") or 9999)
     sweep_signals.sort(key=lambda x:     x.get("age_s") or 9999)
+
+    # Active position state (lock-free read; display-only)
+    has_position = False
+    active_trade = None
+    try:
+        _at = ACTIVE_TRADES_BY_INST.get(instrument)
+        if _at:
+            has_position = True
+            active_trade = {"direction": _at.get("direction"),
+                            "opened_at": _at.get("opened_at")}
+    except Exception: pass
+
+    # Market session
+    market_open = None
+    try:
+        sess = market_session_status()
+        market_open = sess.get("is_open", False)
+    except Exception: pass
+
+    # Daily loss cap
+    daily_loss_cap = None
+    try: daily_loss_cap = max_daily_loss(instrument)
+    except Exception: pass
+
+    # Market Environment snapshot (read-only; never recomputed here)
+    me_snapshot = None
+    try:
+        with _ME_LOCK:
+            me_snapshot = _ME_LAST_SNAPSHOT
+    except Exception: pass
 
     data_coverage = sum([
         price is not None,
@@ -20483,348 +20686,525 @@ def _dpv2_stage_observe(instrument):
     ]) / 4.0
 
     return {
-        "status":            "OK",
-        "price":             price,
-        "price_age_s":       round(price_age, 1) if price_age is not None else None,
-        "vwap_value":        vwap_value,
-        "vwap_age_s":        round(vwap_age, 1) if vwap_age is not None else None,
-        "price_above_vwap":  price_above_vwap,
-        "cvd_state":         cvd_state,
-        "cvd_age_s":         round(cvd_age, 1) if cvd_age is not None else None,
-        "rvol_value":        rvol_value,
-        "vol_spike_fresh":   vol_spike_fresh,
-        "vol_spike_age_s":   round(vol_spike_age, 1) if vol_spike_age is not None else None,
-        "structure_signals": structure_signals[:5],
-        "sweep_signals":     sweep_signals[:3],
-        "data_coverage":     round(data_coverage, 2),
+        "status":              "OK",
+        "instrument":          instrument,
+        "price":               price,
+        "price_age_s":         round(price_age, 1) if price_age is not None else None,
+        "vwap_value":          vwap_value,
+        "vwap_age_s":          round(vwap_age, 1) if vwap_age is not None else None,
+        "price_above_vwap":    price_above_vwap,
+        "cvd_state":           cvd_state,
+        "cvd_age_s":           round(cvd_age, 1) if cvd_age is not None else None,
+        "rvol_value":          rvol_value,
+        "vol_spike_fresh":     vol_spike_fresh,
+        "vol_spike_age_s":     round(vol_spike_age, 1) if vol_spike_age is not None else None,
+        "atr_pts":             atr_pts,
+        "vol_ratio":           vol_ratio,
+        "structure_signals":   structure_signals[:5],
+        "sweep_signals":       sweep_signals[:3],
+        "has_position":        has_position,
+        "active_trade":        active_trade,
+        "market_open":         market_open,
+        "daily_loss_cap":      daily_loss_cap,
+        "market_env_snapshot": me_snapshot,
+        "data_coverage":       round(data_coverage, 2),
     }
 
 
 def _dpv2_stage_interpret(obs):
-    """Stage 2: Derive directional bias and alignment from observations."""
-    long_signals    = []
-    short_signals   = []
-    neutral_signals = []
+    """Stage 2 — What type of market environment is present, and what drives it?
 
-    # VWAP side
-    pav = obs.get("price_above_vwap")
-    if pav is True:
-        long_signals.append("VWAP_ABOVE")
-    elif pav is False:
-        short_signals.append("VWAP_BELOW")
-    else:
-        neutral_signals.append("VWAP_UNKNOWN")
+    MUST NOT output LONG, SHORT, BUY, SELL, APPROVE, REJECT, or trade direction.
+    Regime = WHAT the market is doing (RISK_ON / RISK_OFF / NEUTRAL / MIXED / UNKNOWN).
+    Driver = WHY it is doing it (GEOPOLITICAL / TECHNICAL / etc.).
+    These are INDEPENDENT fields. Directional context belongs in Stage 3 PRIORITIZE.
+    """
+    instrument = obs.get("instrument", "")
 
-    # CVD
-    cvd = obs.get("cvd_state")
-    if cvd == "bullish":
-        long_signals.append("CVD_BULLISH")
-    elif cvd == "bearish":
-        short_signals.append("CVD_BEARISH")
-    else:
-        neutral_signals.append("CVD_UNKNOWN")
+    # Use authoritative MktEnv snapshot if available and valid
+    me = obs.get("market_env_snapshot") or {}
+    me_regime = me.get("regime") if isinstance(me, dict) else None
+    if me_regime and me_regime in _DPV2_REGIME_VALUES and me_regime != "UNKNOWN":
+        dq    = me.get("data_quality") or {}
+        level = dq.get("level", "UNKNOWN") if isinstance(dq, dict) else str(dq)
+        drv   = me.get("primary_driver") or "UNKNOWN"
+        if drv not in _DPV2_DRIVER_VALUES: drv = "UNKNOWN"
+        sec   = me.get("secondary_theme") or ""
+        sec_drivers = [sec] if sec and sec not in ("NONE", "UNKNOWN", "") else []
+        return {
+            "status":               "OK",
+            "source":               "market_environment",
+            "regime":               me_regime,
+            "regime_confidence":    me.get("confidence", 50),
+            "primary_driver":       drv,
+            "secondary_drivers":    sec_drivers,
+            "risk_state":           me.get("risk_state", "UNKNOWN"),
+            "dominant_theme":       me.get("dominant_theme", "UNKNOWN"),
+            "supporting_evidence":  me.get("supporting_evidence") or [],
+            "conflicting_evidence": me.get("conflicting_evidence") or [],
+            "data_quality":         level,
+        }
 
-    # Structure (most recent signal wins; BOS/CHOCH without a clear direction omitted)
-    structs = obs.get("structure_signals") or []
-    if structs:
-        s = structs[0]
+    # Derive regime from instrument-specific signals (no MktEnv available)
+    pav      = obs.get("price_above_vwap")
+    cvd      = obs.get("cvd_state")
+    structs  = obs.get("structure_signals") or []
+    coverage = obs.get("data_coverage", 0)
+
+    inst_type = _dpv2_inst_type(instrument)
+
+    bullish_ev = []
+    bearish_ev = []
+    if pav is True:       bullish_ev.append("price_above_vwap")
+    elif pav is False:    bearish_ev.append("price_below_vwap")
+    if cvd == "bullish":  bullish_ev.append("cvd_bullish")
+    elif cvd == "bearish":bearish_ev.append("cvd_bearish")
+    for s in structs[:2]:
         d = (s.get("direction") or "").upper()
         t = (s.get("type") or "").upper()
-        if d in ("LONG", "BULLISH", "DEMAND") or t in ("HH", "HL", "BOS_UP", "CHOCH_UP"):
-            long_signals.append("STRUCT_" + t)
-        elif d in ("SHORT", "BEARISH", "SUPPLY") or t in ("LH", "LL", "BOS_DOWN", "CHOCH_DOWN"):
-            short_signals.append("STRUCT_" + t)
+        bull = (d in ("LONG", "BULLISH", "DEMAND") or t in ("HH", "HL")
+                or any(k in t for k in ("BULL", "_UP", "DEMAND")))
+        bear = (d in ("SHORT", "BEARISH", "SUPPLY") or t in ("LH", "LL")
+                or any(k in t for k in ("BEAR", "_DOWN", "SUPPLY")))
+        if bull and not bear:  bullish_ev.append("struct_" + t)
+        elif bear and not bull:bearish_ev.append("struct_" + t)
+
+    n_bull = len(bullish_ev)
+    n_bear = len(bearish_ev)
+
+    if inst_type == "UNKNOWN" or coverage < 0.25:
+        regime = "UNKNOWN"; regime_confidence = 0; risk_state = "UNKNOWN"
+        dominant_theme = "UNKNOWN"; primary_driver = "UNKNOWN"
+        supporting_ev = []; conflicting_ev = []
+        data_quality = "INSUFFICIENT"
+    elif n_bull >= 2 and n_bear == 0:
+        if inst_type == "SAFE_HAVEN":
+            regime = "RISK_OFF"; risk_state = "DEFENSIVE"
+            dominant_theme = "SAFE_HAVEN_DEMAND"
+        elif inst_type == "EQUITY_TECH":
+            regime = "RISK_ON"; risk_state = "AGGRESSIVE"
+            dominant_theme = "TECHNOLOGY_STRENGTH"
         else:
-            if any(k in t for k in ("BULL", "_UP", "DEMAND")) or t in ("HH", "HL"):
-                long_signals.append("STRUCT_" + t)
-            elif any(k in t for k in ("BEAR", "_DOWN", "SUPPLY")) or t in ("LH", "LL"):
-                short_signals.append("STRUCT_" + t)
-            # BOS/CHOCH with no direction clue → omit (ambiguous)
-
-    # Sweep (most recent; sweep of lows = bullish reversal potential)
-    sweeps = obs.get("sweep_signals") or []
-    if sweeps:
-        s = sweeps[0]
-        d = (s.get("direction") or "").upper()
-        t = (s.get("type") or "").upper()
-        if d in ("LONG", "BULLISH", "DEMAND") or "LOW" in t:
-            long_signals.append("SWEEP_LOW")
-        elif d in ("SHORT", "BEARISH", "SUPPLY") or "HIGH" in t:
-            short_signals.append("SWEEP_HIGH")
-
-    # Volume (directionally neutral — confirms conviction only)
-    if obs.get("vol_spike_fresh"):
-        neutral_signals.append("VOL_SPIKE")
-    if obs.get("rvol_value") is not None:
-        try:
-            if float(obs["rvol_value"]) >= 1.5:
-                neutral_signals.append("RVOL_HIGH")
-        except Exception:
-            pass
-
-    n_long    = len(long_signals)
-    n_short   = len(short_signals)
-    total_dir = n_long + n_short
-
-    if total_dir == 0:
-        bias          = "NEUTRAL"
-        bias_strength = 0
-    elif n_long > n_short:
-        bias          = "LONG_BIAS"
-        bias_strength = round(n_long / total_dir * 100)
-    elif n_short > n_long:
-        bias          = "SHORT_BIAS"
-        bias_strength = round(n_short / total_dir * 100)
+            regime = "RISK_ON"; risk_state = "AGGRESSIVE"
+            dominant_theme = "BROAD_MARKET_STRENGTH"
+        regime_confidence = min(40 + n_bull * 12, 72); primary_driver = "TECHNICAL"
+        supporting_ev = bullish_ev; conflicting_ev = []
+        data_quality = "MODERATE" if coverage >= 0.5 else "LOW"
+    elif n_bear >= 2 and n_bull == 0:
+        if inst_type == "SAFE_HAVEN":
+            regime = "RISK_ON"; risk_state = "AGGRESSIVE"
+            dominant_theme = "BROAD_MARKET_STRENGTH"
+        else:
+            regime = "RISK_OFF"; risk_state = "DEFENSIVE"
+            dominant_theme = "RISK_AVERSION"
+        regime_confidence = min(35 + n_bear * 10, 68); primary_driver = "TECHNICAL"
+        supporting_ev = bearish_ev; conflicting_ev = []
+        data_quality = "MODERATE" if coverage >= 0.5 else "LOW"
+    elif n_bull > 0 and n_bear > 0:
+        regime = "MIXED"; risk_state = "BALANCED"; dominant_theme = "MIXED"
+        regime_confidence = 20; primary_driver = "TECHNICAL"
+        supporting_ev = bullish_ev; conflicting_ev = bearish_ev
+        data_quality = "LOW"
     else:
-        bias          = "CONFLICTED"
-        bias_strength = 50
-
-    alignment_score = 0
-    if bias in ("LONG_BIAS", "SHORT_BIAS") and total_dir > 0:
-        aligned_n       = n_long if bias == "LONG_BIAS" else n_short
-        alignment_score = round(aligned_n / total_dir * 100)
+        regime = "NEUTRAL"; risk_state = "BALANCED"; dominant_theme = "NEUTRAL"
+        regime_confidence = 25; primary_driver = "NONE"
+        supporting_ev = []; conflicting_ev = []
+        data_quality = "LOW" if coverage >= 0.25 else "INSUFFICIENT"
 
     return {
-        "status":            "OK",
-        "bias":              bias,
-        "bias_strength":     bias_strength,
-        "alignment_score":   alignment_score,
-        "long_signals":      long_signals,
-        "short_signals":     short_signals,
-        "neutral_signals":   neutral_signals,
-        "conflict_detected": n_long > 0 and n_short > 0,
-        "signal_count":      total_dir + len(neutral_signals),
+        "status":               "OK",
+        "source":               "instrument_derived",
+        "regime":               regime,
+        "regime_confidence":    regime_confidence,
+        "primary_driver":       primary_driver,
+        "secondary_drivers":    [],
+        "risk_state":           risk_state,
+        "dominant_theme":       dominant_theme,
+        "supporting_evidence":  supporting_ev,
+        "conflicting_evidence": conflicting_ev,
+        "data_quality":         data_quality,
     }
 
 
 def _dpv2_stage_prioritize(obs, interp, mode):
-    """Stage 3: Rank and weight signals by reliability tier and mode."""
-    bias = interp.get("bias", "NEUTRAL")
-    if bias == "LONG_BIAS":
-        aligned  = list(interp.get("long_signals")  or [])
-        opposing = list(interp.get("short_signals") or [])
-    elif bias == "SHORT_BIAS":
-        aligned  = list(interp.get("short_signals") or [])
-        opposing = list(interp.get("long_signals")  or [])
-    else:
-        aligned  = []
-        opposing = list((interp.get("long_signals") or []) +
-                        (interp.get("short_signals") or []))
+    """Stage 3 — Which traded markets deserve the most attention in this environment?
 
-    # Reliability tier (higher = more trustworthy)
-    _TIERS = {"STRUCT": 3, "VWAP": 2, "CVD": 2, "SWEEP": 1, "VOL": 1, "RVOL": 1}
-    # Mode sensitivity weights
-    _MW = {
-        "SCALP": {"STRUCT": 1.5, "CVD": 1.5, "VWAP": 1.0, "SWEEP": 1.3, "VOL": 1.2},
-        "SWING": {"STRUCT": 2.0, "CVD": 0.8, "VWAP": 1.5, "SWEEP": 0.8, "VOL": 1.0},
-    }
-    mw = _MW.get(mode, _MW["SCALP"])
+    Ranks supported instruments (MGC, MNQ, MES, MYM) by regime-contextual preference
+    and may assign directional_context per instrument.
+    MUST NOT create a trade or route orders.
+    Priority is NOT a trade command. A disfavored market may still contain a valid setup.
+    """
+    regime     = interp.get("regime", "UNKNOWN")
+    driver     = interp.get("primary_driver", "UNKNOWN")
+    focus_inst = obs.get("instrument", "")
 
-    def _tier(sig):
-        for pfx, t in _TIERS.items():
-            if sig.startswith(pfx):
-                return t
-        return 1
+    ranked = []
+    for inst in _DPV2_KNOWN_INSTRUMENTS:
+        itype        = _dpv2_inst_type(inst)
+        pref, dir_ctx = _DPV2_PREF_MATRIX.get(
+            (regime, itype), ("INSUFFICIENT_DATA", "UNKNOWN"))
 
-    def _mw(sig):
-        for pfx, w in mw.items():
-            if sig.startswith(pfx):
-                return w
-        return 1.0
+        reasons   = []
+        conflicts = []
+        if regime != "UNKNOWN":
+            reasons.append("%s regime" % regime.replace("_", "-"))
+        if driver not in ("UNKNOWN", "NONE"):
+            reasons.append("%s driver" % driver.replace("_", " ").title())
+        if itype == "SAFE_HAVEN" and regime == "RISK_OFF":
+            reasons.append("Safe-haven demand benefits gold")
+        if itype.startswith("EQUITY") and regime == "RISK_ON":
+            reasons.append("Risk-on supports equities")
 
-    scored = sorted(
-        [{"signal": s, "tier": _tier(s), "weight": round(_tier(s) * _mw(s) * 10)}
-         for s in aligned],
-        key=lambda x: -x["weight"],
-    )
-    scored_opp = [{"signal": s, "tier": _tier(s), "weight": round(_tier(s) * 10)}
-                  for s in opposing]
+        ctx_conf = int(interp.get("regime_confidence", 0) * 0.8)
+        if inst == focus_inst:
+            pav = obs.get("price_above_vwap")
+            cvd = obs.get("cvd_state")
+            if pav is True:         reasons.append("Price above VWAP")
+            elif pav is False:      conflicts.append("Price below VWAP")
+            if cvd == "bullish":    reasons.append("CVD bullish")
+            elif cvd == "bearish":  conflicts.append("CVD bearish")
+            ctx_conf = min(ctx_conf + 15, 90)
 
-    total_aligned  = sum(x["weight"] for x in scored)
-    total_opposing = sum(x["weight"] for x in scored_opp)
+        ranked.append({
+            "symbol":              inst,
+            "priority":            0,
+            "preference":          pref,
+            "directional_context": dir_ctx,
+            "context_confidence":  ctx_conf,
+            "reasons":             reasons,
+            "conflicts":           conflicts,
+            "is_focus":            (inst == focus_inst),
+        })
+
+    ranked.sort(key=lambda x: (
+        _DPV2_PREF_ORDER.get(x["preference"], 5),
+        0 if x["is_focus"] else 1,
+    ))
+    for i, r in enumerate(ranked):
+        r["priority"] = i + 1
+
+    focus_entry  = next((r for r in ranked if r["is_focus"]), ranked[0] if ranked else {})
+    focus_pref   = focus_entry.get("preference", "INSUFFICIENT_DATA")
+    focus_dir_ctx = focus_entry.get("directional_context", "UNKNOWN")
 
     return {
-        "status":           "OK",
-        "bias":             bias,
-        "primary_signal":   scored[0]["signal"] if scored else None,
-        "secondary_signal": scored[1]["signal"] if len(scored) > 1 else None,
-        "aligned_signals":  scored,
-        "opposing_signals": scored_opp,
-        "weight_advantage": total_aligned - total_opposing,
-        "mode_used":        mode,
+        "status":              "OK",
+        "ranked_instruments":  ranked,
+        "focus_instrument":    focus_inst,
+        "focus_preference":    focus_pref,
+        "focus_direction_ctx": focus_dir_ctx,
+        "regime_used":         regime,
+        "driver_used":         driver,
+        "mode_used":           mode,
     }
 
 
 def _dpv2_stage_validate(obs, interp, prio, instrument, mode):
-    """Stage 4: Per-gate PASS/FAIL/INSUFFICIENT checks against raw signal data."""
-    bias  = interp.get("bias", "NEUTRAL")
-    gates = {}
+    """Stage 4 — Does a technical setup exist, and does it pass all safety rules?
 
-    # Gate 1: Structure (BOS/CHOCH/HH/HL/LH/LL within 20 min)
-    structs  = obs.get("structure_signals") or []
-    fresh_s  = [s for s in structs if (s.get("age_s") or 9999) <= 20 * 60]
+    Reuses existing production-equivalent signal logic. Does NOT duplicate or
+    rewrite existing strategy code — it reads from the same signal stores.
+    Produces technical_validation with passed_checks / failed_checks /
+    risk_checks / account_checks / production_verdict.
+    First stage where setup direction is technically validated.
+    """
+    focus_dir     = prio.get("focus_direction_ctx", "UNKNOWN")
+    regime_conf   = interp.get("regime_confidence", 0)
+    passed_checks = []
+    failed_checks = []
+    risk_checks   = {}
+    acct_checks   = {}
+
+    # Structure gate
+    structs = obs.get("structure_signals") or []
+    fresh_s = [s for s in structs if (s.get("age_s") or 9999) <= 20 * 60]
     if fresh_s:
-        gates["structure"] = {
-            "result": "PASS",
-            "reason": "%s — %ds ago" % (fresh_s[0]["type"], int(fresh_s[0].get("age_s") or 0)),
-        }
+        passed_checks.append("Fresh structure: %s %ds ago"
+                             % (fresh_s[0]["type"], int(fresh_s[0].get("age_s") or 0)))
     elif structs:
-        gates["structure"] = {
-            "result": "FAIL",
-            "reason": "Structure stale (%ds)" % int(structs[0].get("age_s") or 0),
-        }
+        failed_checks.append("Structure stale (%ds)" % int(structs[0].get("age_s") or 0))
     else:
-        gates["structure"] = {"result": "INSUFFICIENT", "reason": "No structure in last 30 min"}
+        failed_checks.append("No structure signal in last 30 min")
 
-    # Gate 2: VWAP alignment
-    pav        = obs.get("price_above_vwap")
-    vwap_age   = obs.get("vwap_age_s")
-    vwap_stale = vwap_age is not None and vwap_age > 3600
+    # VWAP alignment
+    pav      = obs.get("price_above_vwap")
+    vwap_age = obs.get("vwap_age_s")
     if obs.get("vwap_value") is None:
-        gates["vwap"] = {"result": "INSUFFICIENT", "reason": "No VWAP data"}
-    elif vwap_stale:
-        gates["vwap"] = {"result": "INSUFFICIENT", "reason": "VWAP stale (%ds)" % int(vwap_age)}
-    elif bias == "LONG_BIAS" and pav:
-        gates["vwap"] = {"result": "PASS",         "reason": "Price above VWAP — long-aligned"}
-    elif bias == "SHORT_BIAS" and not pav:
-        gates["vwap"] = {"result": "PASS",         "reason": "Price below VWAP — short-aligned"}
-    elif bias in ("NEUTRAL", "CONFLICTED"):
-        gates["vwap"] = {"result": "PASS",         "reason": "VWAP present — neutral bias"}
+        failed_checks.append("VWAP unavailable")
+    elif vwap_age is not None and vwap_age > 3600:
+        failed_checks.append("VWAP stale (%ds)" % int(vwap_age))
+    elif focus_dir == "BULLISH" and pav is True:
+        passed_checks.append("Price above VWAP — bullish aligned")
+    elif focus_dir == "BEARISH" and pav is False:
+        passed_checks.append("Price below VWAP — bearish aligned")
+    elif focus_dir in ("NEUTRAL", "UNKNOWN"):
+        passed_checks.append("VWAP present — neutral context")
     else:
-        gates["vwap"] = {"result": "FAIL",         "reason": "Price on wrong VWAP side for %s" % bias}
+        failed_checks.append("Price on wrong VWAP side for %s context" % focus_dir)
 
-    # Gate 3: CVD alignment (fail-open when unknown / stale)
-    cvd       = obs.get("cvd_state")
-    cvd_age   = obs.get("cvd_age_s")
-    cvd_stale = cvd_age is not None and cvd_age > 3600
-    if cvd is None or cvd_stale:
-        gates["cvd"] = {"result": "PASS", "reason": "CVD unknown — fail-open"}
-    elif bias == "LONG_BIAS"  and cvd == "bullish":
-        gates["cvd"] = {"result": "PASS", "reason": "CVD bullish — long-aligned"}
-    elif bias == "SHORT_BIAS" and cvd == "bearish":
-        gates["cvd"] = {"result": "PASS", "reason": "CVD bearish — short-aligned"}
-    elif bias == "LONG_BIAS"  and cvd == "bearish":
-        gates["cvd"] = {"result": "FAIL", "reason": "CVD bearish opposes long bias"}
-    elif bias == "SHORT_BIAS" and cvd == "bullish":
-        gates["cvd"] = {"result": "FAIL", "reason": "CVD bullish opposes short bias"}
+    # CVD alignment (fail-open when unknown or stale)
+    cvd     = obs.get("cvd_state")
+    cvd_age = obs.get("cvd_age_s")
+    if cvd is None or (cvd_age is not None and cvd_age > 3600):
+        passed_checks.append("CVD unknown — fail-open")
+    elif focus_dir == "BULLISH" and cvd == "bullish":
+        passed_checks.append("CVD bullish — aligned")
+    elif focus_dir == "BEARISH" and cvd == "bearish":
+        passed_checks.append("CVD bearish — aligned")
+    elif focus_dir == "BULLISH" and cvd == "bearish":
+        failed_checks.append("CVD bearish opposes bullish context")
+    elif focus_dir == "BEARISH" and cvd == "bullish":
+        failed_checks.append("CVD bullish opposes bearish context")
     else:
-        gates["cvd"] = {"result": "PASS", "reason": "CVD %s — neutral bias, fail-open" % cvd}
+        passed_checks.append("CVD %s — neutral context" % cvd)
 
-    # Gate 4: Signal alignment strength (≥50% of directional signals must agree)
-    align_score = interp.get("alignment_score", 0)
-    n_signals   = interp.get("signal_count", 0)
-    if n_signals == 0:
-        gates["alignment"] = {"result": "INSUFFICIENT", "reason": "No directional signals"}
-    elif align_score >= 67:
-        gates["alignment"] = {"result": "PASS", "reason": "Alignment %d%% — strong" % align_score}
-    elif align_score >= 50:
-        gates["alignment"] = {"result": "PASS", "reason": "Alignment %d%% — moderate" % align_score}
+    # Regime confidence
+    if regime_conf >= 60:
+        passed_checks.append("Regime confidence %d%% — strong" % regime_conf)
+    elif regime_conf >= 35:
+        passed_checks.append("Regime confidence %d%% — moderate" % regime_conf)
+    elif regime_conf == 0:
+        failed_checks.append("Insufficient regime data")
     else:
-        gates["alignment"] = {
-            "result": "FAIL",
-            "reason": "Alignment %d%% — conflicted (%s)" % (align_score, bias),
-        }
+        failed_checks.append("Regime confidence %d%% — weak" % regime_conf)
 
-    # Gate 5: Conflict clear (fail only on high-tier opposing signal ≥ tier 2)
-    conflict      = interp.get("conflict_detected", False)
-    opp_sigs      = prio.get("opposing_signals") or []
-    high_tier_opp = any(s.get("tier", 0) >= 2 for s in opp_sigs)
-    if not conflict:
-        gates["conflict"] = {"result": "PASS", "reason": "No opposing signals"}
-    elif high_tier_opp:
-        opp_names = [s["signal"] for s in opp_sigs if s.get("tier", 0) >= 2]
-        gates["conflict"] = {"result": "FAIL",
-                              "reason": "High-tier opposition: %s" % opp_names}
+    # Directional conflict
+    focus_entry  = next((r for r in (prio.get("ranked_instruments") or [])
+                         if r.get("is_focus")), {})
+    conflicts_ct = len(focus_entry.get("conflicts") or [])
+    if conflicts_ct == 0:
+        passed_checks.append("No directional conflicts")
     else:
-        gates["conflict"] = {
-            "result": "PASS",
-            "reason": "Low-tier conflict only — %s" % [s["signal"] for s in opp_sigs],
-        }
+        failed_checks.append("%d conflict(s): %s"
+                             % (conflicts_ct, focus_entry.get("conflicts")))
 
-    n_pass   = sum(1 for g in gates.values() if g["result"] == "PASS")
-    n_fail   = sum(1 for g in gates.values() if g["result"] == "FAIL")
-    n_insuf  = sum(1 for g in gates.values() if g["result"] == "INSUFFICIENT")
-    pass_rate = round(n_pass / len(gates) * 100) if gates else 0
+    # Risk checks
+    atr_pts   = obs.get("atr_pts")
+    vol_ratio = obs.get("vol_ratio")
+    risk_checks["atr_available"] = atr_pts is not None
+    if atr_pts is not None: risk_checks["atr_pts"] = float(atr_pts)
+    if vol_ratio is not None:
+        r_f = float(vol_ratio)
+        risk_checks["vol_ratio"]    = round(r_f, 2)
+        risk_checks["vol_elevated"] = r_f > 2.0
+        if r_f > 3.0:
+            failed_checks.append("Extreme volatility ratio %.1f" % r_f)
+    else:
+        risk_checks["vol_ratio"] = None
+
+    # Account / session checks
+    acct_checks["daily_loss_cap"] = obs.get("daily_loss_cap")
+    acct_checks["market_open"]    = obs.get("market_open")
+    acct_checks["has_position"]   = obs.get("has_position", False)
+    if obs.get("market_open") is False:
+        failed_checks.append("Market closed")
+    if obs.get("has_position"):
+        failed_checks.append("Instrument already has an open position")
+
+    n_pass = len(passed_checks)
+    n_fail = len(failed_checks)
+    pass_rate = round(n_pass / max(n_pass + n_fail, 1) * 100)
+
+    # Technical status
+    critical = [c for c in failed_checks if any(
+        k in c for k in ("No structure", "stale", "opposes",
+                         "closed", "open position", "unavailable"))]
+    if n_fail == 0 and n_pass >= 3:
+        technical_status = "READY"
+    elif critical:
+        technical_status = "WAIT"
+    elif n_fail <= 1 and n_pass >= 3:
+        technical_status = "READY"
+    else:
+        technical_status = "WAIT"
+
+    technical_confidence = round(pass_rate * 0.65 + regime_conf * 0.35)
 
     return {
-        "status":             "OK",
-        "gates":              gates,
-        "gates_passed":       n_pass,
-        "gates_failed":       n_fail,
-        "gates_insufficient": n_insuf,
-        "total_gates":        len(gates),
-        "pass_rate":          pass_rate,
+        "status":               "OK",
+        "symbol":               instrument,
+        "strategy":             "DECISION_PIPELINE_V2",
+        "technical_status":     technical_status,
+        "technical_confidence": technical_confidence,
+        "passed_checks":        passed_checks,
+        "failed_checks":        failed_checks,
+        "risk_checks":          risk_checks,
+        "account_checks":       acct_checks,
+        "pass_rate":            pass_rate,
     }
 
 
-def _dpv2_stage_decide(interp, prio, validate, live_verdict, live_direction):
-    """Stage 5: Synthesize pipeline verdict and compare with live system."""
-    n_pass  = validate.get("gates_passed", 0)
-    n_fail  = validate.get("gates_failed", 0)
-    n_insuf = validate.get("gates_insufficient", 0)
-    total   = validate.get("total_gates", 5)
-    bias    = interp.get("bias", "NEUTRAL")
-    align   = interp.get("alignment_score", 0)
-    p_rate  = validate.get("pass_rate", 0)
+def _dpv2_stage_decide(obs, interp, prio, validate,
+                        live_verdict, live_direction, instrument):
+    """Stage 5 — Given environment, priority, technical setup, and risk, what is
+    the final shadow conclusion?
 
-    # Verdict logic: data-sufficient READY requires ≥3 pass + ≤1 fail
-    if n_insuf >= 3:
+    Assembles decision_pipeline_v2_result with a full plain-language explanation.
+    Computes agreement_status using the extended 9-value enum.
+    NEVER changes production behavior. shadow_mode is always True.
+    """
+    regime      = interp.get("regime", "UNKNOWN")
+    driver      = interp.get("primary_driver", "UNKNOWN")
+    regime_conf = interp.get("regime_confidence", 0)
+    tech_status = validate.get("technical_status", "WAIT")
+    tech_conf   = validate.get("technical_confidence", 0)
+    focus_pref  = prio.get("focus_preference", "INSUFFICIENT_DATA")
+    dir_ctx     = prio.get("focus_direction_ctx", "UNKNOWN")
+    passed      = validate.get("passed_checks") or []
+    failed      = validate.get("failed_checks") or []
+
+    # Pipeline verdict
+    if focus_pref == "INSUFFICIENT_DATA" or regime == "UNKNOWN":
         pipeline_verdict   = "INSUFFICIENT_DATA"
         pipeline_direction = None
-        reasoning = ["Insufficient data: %d/%d gates had data" % (total - n_insuf, total)]
-    elif n_fail == 0 and n_pass >= 4:
+        reasoning = ["Insufficient environmental data (regime: %s, pref: %s)"
+                     % (regime, focus_pref)]
+    elif tech_status == "READY":
         pipeline_verdict   = "READY"
-        pipeline_direction = ("LONG"  if bias == "LONG_BIAS"
-                               else "SHORT" if bias == "SHORT_BIAS" else None)
-        reasoning = ["%d/%d gates passed (clean)" % (n_pass, total),
-                     "Bias: %s" % bias,
-                     "Alignment: %d%%" % align]
-    elif n_pass >= 3 and n_fail <= 1:
-        pipeline_verdict   = "READY"
-        pipeline_direction = ("LONG"  if bias == "LONG_BIAS"
-                               else "SHORT" if bias == "SHORT_BIAS" else None)
-        reasoning = ["%d/%d gates passed (1 failed)" % (n_pass, total),
-                     "Bias: %s" % bias,
-                     "Alignment: %d%%" % align]
+        pipeline_direction = ("LONG"  if dir_ctx == "BULLISH" else
+                               "SHORT" if dir_ctx == "BEARISH" else None)
+        reasoning = [
+            "Technical confirmed (%d passed, %d failed)" % (len(passed), len(failed)),
+            "Regime: %s, focus: %s" % (regime, focus_pref),
+        ]
     else:
         pipeline_verdict   = "WAIT"
         pipeline_direction = None
-        failed_names = [k for k, v in (validate.get("gates") or {}).items()
-                        if v["result"] == "FAIL"]
-        reasoning = ["Failed: %s" % failed_names, "Pass rate: %d%%" % p_rate]
+        reasoning = [
+            "Gate failed: %s" % (failed[:2] if failed else ["unknown"]),
+            "Regime: %s (conf %d%%)" % (regime, regime_conf),
+        ]
 
-    pipeline_confidence = round(p_rate * 0.6 + align * 0.4)
+    pipeline_confidence = round(tech_conf * 0.6 + regime_conf * 0.4)
     live_is_ready       = is_actionable(live_verdict or "WAIT")
-    pipeline_is_ready   = pipeline_verdict == "READY"
-    agreement           = live_is_ready == pipeline_is_ready
+    pipeline_is_ready   = (pipeline_verdict == "READY")
 
-    divergence_reason = None
-    if not agreement:
-        if pipeline_is_ready:
-            divergence_reason = "Pipeline READY but live says %s" % live_verdict
+    # Extended agreement_status enum
+    if live_is_ready and pipeline_is_ready:
+        agreement_status = "AGREE"
+    elif not live_is_ready and not pipeline_is_ready:
+        agreement_status = "AGREE"
+    elif live_is_ready and not pipeline_is_ready:
+        if (live_direction or "").upper() == "LONG":
+            agreement_status = "PRODUCTION_MORE_BULLISH"
+        elif (live_direction or "").upper() == "SHORT":
+            agreement_status = "PRODUCTION_MORE_BEARISH"
         else:
-            divergence_reason = "Pipeline WAIT but live says %s" % live_verdict
+            agreement_status = "PRODUCTION_APPROVED_V2_WAITED"
+    elif not live_is_ready and pipeline_is_ready:
+        if pipeline_direction == "LONG":
+            agreement_status = "V2_MORE_BULLISH"
+        elif pipeline_direction == "SHORT":
+            agreement_status = "V2_MORE_BEARISH"
+        else:
+            agreement_status = "PRODUCTION_WAITED_V2_APPROVED"
+    else:
+        agreement_status = "INCOMPARABLE"
+
+    agreement_bool    = live_is_ready == pipeline_is_ready
+    divergence_reason = None
+    if not agreement_bool:
+        divergence_reason = (
+            "Pipeline READY but live says %s" % live_verdict
+            if pipeline_is_ready else
+            "Pipeline WAIT but live says %s" % live_verdict
+        )
+
+    # Plain-language explanation block
+    _regime_desc = {
+        "RISK_ON":  "The market is in a risk-on environment.",
+        "RISK_OFF": "The market is in a risk-off environment.",
+        "NEUTRAL":  "The market appears neutral with no clear directional bias.",
+        "MIXED":    "The market is showing mixed signals with no clear regime.",
+        "UNKNOWN":  "Insufficient data to classify the current market environment.",
+    }
+    _driver_desc = {
+        "GEOPOLITICAL":    "Geopolitical escalation appears to be the primary driver.",
+        "FED_POLICY":      "Federal Reserve policy appears to be the primary driver.",
+        "INFLATION":       "Inflation dynamics appear to be the primary driver.",
+        "EMPLOYMENT":      "Labor market conditions appear to be the primary driver.",
+        "ECONOMIC_GROWTH": "Economic growth expectations appear to be the primary driver.",
+        "EARNINGS":        "Corporate earnings appear to be the primary driver.",
+        "ENERGY":          "Energy market conditions appear to be the primary driver.",
+        "LIQUIDITY":       "Liquidity conditions appear to be the primary driver.",
+        "TECHNICAL":       "Technical factors and price action are the primary driver.",
+        "MULTIPLE":        "Multiple macro drivers are in play simultaneously.",
+        "NONE":            "No clear macro driver has been identified.",
+        "UNKNOWN":         "The driver cannot be determined from available data.",
+    }
+    _rel_desc = {
+        "SAFE_HAVEN":    "Gold is a classic safe-haven asset that benefits from risk-off conditions.",
+        "EQUITY_TECH":   "Technology futures typically outperform in risk-on, underperform in risk-off.",
+        "EQUITY_BROAD":  "Broad equity futures reflect overall market risk appetite.",
+        "UNKNOWN":       "Instrument type unclassified; regime alignment is uncertain.",
+    }
+    itype = _dpv2_inst_type(instrument)
+    what_is_happening  = _regime_desc.get(regime, "Market environment unknown.")
+    why_it_is_happening = _driver_desc.get(driver, "Driver unknown.")
+    why_relevant = _rel_desc.get(itype, "")
+    if focus_pref not in ("INSUFFICIENT_DATA", "NEUTRAL"):
+        why_relevant += " In this regime, %s is %s." % (
+            instrument, focus_pref.lower().replace("_", " "))
+    what_found = "Technical engine: %s." % tech_status
+    if passed: what_found += " Confirmed: %s." % "; ".join(passed[:2])
+    if failed: what_found += " Missing: %s." % "; ".join(failed[:2])
+    if pipeline_verdict == "READY":
+        what_next = ("Shadow verdict is READY for a %s setup. "
+                     "Wait for production system to confirm." % (pipeline_direction or "directional"))
+    elif pipeline_verdict == "WAIT" and failed:
+        what_next = "Resolve: %s." % "; ".join(failed[:2])
+    else:
+        what_next = "Gather more data before evaluating a setup."
+    pav = obs.get("price_above_vwap")
+    what_invalidates = "Loss of %s structure" % dir_ctx.lower()
+    if pav is not None:
+        what_invalidates += " and a sustained move %s VWAP" % (
+            "below" if dir_ctx == "BULLISH" else "above")
+    if regime not in ("UNKNOWN", "NEUTRAL"):
+        what_invalidates += "; regime shift from %s would also invalidate." % regime
 
     return {
         "status":              "OK",
-        "pipeline_verdict":    pipeline_verdict,
-        "pipeline_direction":  pipeline_direction,
-        "pipeline_confidence": pipeline_confidence,
-        "pipeline_reasoning":  reasoning,
-        "agreement_with_live": agreement,
-        "live_verdict":        live_verdict,
-        "live_direction":      live_direction,
-        "divergence_reason":   divergence_reason,
+        "symbol":              instrument,
+        "market_regime":       regime,
+        "primary_driver":      driver,
+        "market_priority":     focus_pref,
+        "directional_context": dir_ctx,
+        "technical_verdict":   tech_status,
+        "production_verdict":  live_verdict,
+        "shadow_verdict":      pipeline_verdict,
+        "agreement_status":    agreement_status,
+        "changed_production_behavior": False,
+        "explanation": {
+            "what_is_happening":              what_is_happening,
+            "why_it_is_happening":            why_it_is_happening,
+            "why_this_market_is_relevant":    why_relevant,
+            "what_the_technical_engine_found": what_found,
+            "what_must_happen_next":          what_next,
+            "what_invalidates_the_idea":      what_invalidates,
+        },
+        "shadow_mode":             True,
+        # backward-compat fields (keep for existing JS consumers)
+        "pipeline_verdict":        pipeline_verdict,
+        "pipeline_direction":      pipeline_direction,
+        "pipeline_confidence":     pipeline_confidence,
+        "pipeline_reasoning":      reasoning,
+        "agreement_with_live":     agreement_bool,
+        "live_verdict":            live_verdict,
+        "live_direction":          live_direction,
+        "divergence_reason":       divergence_reason,
     }
 
 
-def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction):
+def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction,
+                                  trade_plan=None):
     """
-    Shadow 5-stage decision pipeline: OBSERVE → INTERPRET → PRIORITIZE → VALIDATE → DECIDE.
+    Shadow 5-stage decision pipeline: OBSERVE -> INTERPRET -> PRIORITIZE -> VALIDATE -> DECIDE.
 
+    Phase 1B: Corrected stage responsibilities + outcome-comparison agreement tracking.
     DISPLAY-ONLY in shadow mode. Never mutates global state, never calls full_analysis
-    recursively. Fail-open at every stage. Flag OFF → returns None → key not attached
-    → goldens byte-identical. All CAN_* flags default False.
+    recursively. Fail-open at every stage. Flag OFF -> returns None -> key not attached
+    -> goldens byte-identical. All CAN_* flags default False.
     """
     if not DECISION_PIPELINE_V2_ENABLED:
         return None
@@ -20839,9 +21219,9 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction)
             "can_route_orders":      _DPV2_CAN_ROUTE_ORDERS,
         }
 
-        def _safe(fn, *args):
+        def _safe(fn, *args, **kwargs):
             try:
-                return fn(*args)
+                return fn(*args, **kwargs)
             except Exception as _e:
                 return {"status": "ERROR", "error": str(_e)}
 
@@ -20852,16 +21232,101 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction)
                if s2.get("status") == "OK" else {"status": "SKIPPED"})
         s4 = (_safe(_dpv2_stage_validate, s1, s2, s3, instrument, mode)
                if s3.get("status") == "OK" else {"status": "SKIPPED"})
-        s5 = (_safe(_dpv2_stage_decide, s2, s3, s4, live_verdict, live_direction)
+        s5 = (_safe(_dpv2_stage_decide, s1, s2, s3, s4,
+                    live_verdict, live_direction, instrument)
                if s4.get("status") == "OK" else {"status": "SKIPPED"})
 
         pipeline_verdict = (s5 or {}).get("pipeline_verdict", "INSUFFICIENT_DATA")
-        agreement        = (s5 or {}).get("agreement_with_live")
+        agreement_status = (s5 or {}).get("agreement_status", "INCOMPARABLE")
+        agreement_bool   = (s5 or {}).get("agreement_with_live")
 
         logger.info(
             "[DPv2 shadow] inst=%s mode=%s pipeline=%s live=%s agree=%s",
-            instrument, mode, pipeline_verdict, live_verdict, agreement,
+            instrument, mode, pipeline_verdict, live_verdict, agreement_status,
         )
+
+        # Agreement record
+        import uuid as _uuid
+        record_id = str(_uuid.uuid4())[:8]
+        record = {
+            "id":                    record_id,
+            "ts":                    datetime.now(timezone.utc).isoformat(),
+            "symbol":                instrument,
+            "mode":                  mode,
+            "strategy":              "DPV2",
+            "production_verdict":    live_verdict,
+            "shadow_verdict":        pipeline_verdict,
+            "agreement_status":      agreement_status,
+            "production_confidence": None,
+            "pipeline_confidence":   (s5 or {}).get("pipeline_confidence"),
+            "technical_confidence":  (s4 or {}).get("technical_confidence"),
+            "regime":                (s2 or {}).get("regime", "UNKNOWN"),
+            "primary_driver":        (s2 or {}).get("primary_driver", "UNKNOWN"),
+            "market_priority":       (s3 or {}).get("focus_preference", "INSUFFICIENT_DATA"),
+            "entry_price":           None,
+            "stop_price":            None,
+            "target_price":          None,
+            "trade_triggered":       is_actionable(live_verdict or "WAIT"),
+            "tp1_reached":           None,
+            "final_target_reached":  None,
+            "stop_reached":          None,
+            "mfe_pts":               None,
+            "mae_pts":               None,
+            "final_outcome":         None,
+            "better_decision":       None,
+        }
+        if record["trade_triggered"] and isinstance(trade_plan, dict):
+            record["entry_price"]  = trade_plan.get("entry")
+            record["stop_price"]   = trade_plan.get("stop")
+            record["target_price"] = (trade_plan.get("target2")
+                                      or trade_plan.get("target1"))
+        _dpv2_store_agreement_record(record)
+
+        # Shadow trade tracking: V2 approved, production waited
+        prod_ready = is_actionable(live_verdict or "WAIT")
+        v2_ready   = (pipeline_verdict == "READY")
+        shadow_trade = None
+        if v2_ready and not prod_ready:
+            obs_price = (s1 or {}).get("price")
+            shad_dir  = (s5 or {}).get("pipeline_direction")
+            if obs_price is not None and shad_dir is not None:
+                if instrument not in _DPV2_SHADOW_TRADES:
+                    _DPV2_SHADOW_TRADES[instrument] = {
+                        "record_id":   record_id,
+                        "symbol":      instrument,
+                        "mode":        mode,
+                        "direction":   shad_dir,
+                        "entry_price": float(obs_price),
+                        "stop_price":  None,
+                        "target_price":None,
+                        "ts":          record["ts"],
+                        "mfe_pts":     0.0,
+                        "mae_pts":     0.0,
+                        "outcome":     None,
+                        "label":       "HYPOTHETICAL",
+                        "note":        "V2 shadow trade — never routes an order",
+                    }
+            st = _DPV2_SHADOW_TRADES.get(instrument)
+            if st is not None:
+                entry  = st.get("entry_price")
+                cur_p  = (s1 or {}).get("price")
+                st_dir = st.get("direction")
+                if entry is not None and cur_p is not None:
+                    try:
+                        diff = float(cur_p) - float(entry)
+                        exc  = diff if st_dir == "LONG" else -diff
+                        st["mfe_pts"] = max(st.get("mfe_pts", 0.0), exc)
+                        st["mae_pts"] = max(st.get("mae_pts", 0.0), -exc)
+                    except Exception:
+                        pass
+            shadow_trade = _DPV2_SHADOW_TRADES.get(instrument)
+        elif prod_ready and instrument in _DPV2_SHADOW_TRADES:
+            st = _DPV2_SHADOW_TRADES.pop(instrument, None)
+            if st:
+                st["outcome"] = "PRODUCTION_APPROVED"
+
+        scorecard = _dpv2_compute_scorecard()
+
         return {
             "available":           True,
             "shadow_mode":         True,
@@ -20878,8 +21343,12 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction)
             "pipeline_verdict":    pipeline_verdict,
             "pipeline_direction":  (s5 or {}).get("pipeline_direction"),
             "pipeline_confidence": (s5 or {}).get("pipeline_confidence"),
-            "agreement_with_live": agreement,
+            "agreement_status":    agreement_status,
+            "agreement_with_live": agreement_bool,
             "divergence_reason":   (s5 or {}).get("divergence_reason"),
+            "shadow_trade":        shadow_trade,
+            "scorecard":           scorecard,
+            "record_id":           record_id,
         }
     except Exception as _exc:
         logger.warning("[DPv2] orchestrator error (fail-open): %s", _exc)
@@ -22460,6 +22929,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 mode           = TRADING_MODE,
                 live_verdict   = verdict,
                 live_direction = strict_direction,
+                trade_plan     = result.get("trade_plan"),
             )
         except Exception as _dpv2_exc:
             result["decision_pipeline_v2"] = {
@@ -52631,47 +53101,54 @@ function renderDecisionPipeline(d) {
       + (dp && dp.reason ? 'Pipeline: ' + aiEsc(dp.reason) : 'Decision Pipeline V2 disabled') + '</div>';
     return;
   }
-  var stages  = dp.stages  || {};
-  var decide  = stages.decide   || {};
-  var validate= stages.validate || {};
-  var interp  = stages.interpret|| {};
-  var prio    = stages.prioritize||{};
-  var gates   = validate.gates  || {};
+  var stages   = dp.stages      || {};
+  var decide   = stages.decide  || {};
+  var validate = stages.validate|| {};
+  var interp   = stages.interpret||{};
+  var prio     = stages.prioritize||{};
+  var scorecard = dp.scorecard  || {};
   function verdCol(v){
     if(v==='READY') return '#22c55e';
     if(v==='WAIT')  return '#ef4444';
     return '#f59e0b';
   }
-  function gateCol(r){
-    if(r==='PASS')        return '#22c55e';
-    if(r==='FAIL')        return '#ef4444';
-    if(r==='INSUFFICIENT')return '#f59e0b';
+  function prefCol(p){
+    if(p==='STRONGLY_FAVORED')   return '#22c55e';
+    if(p==='FAVORED')            return '#4ade80';
+    if(p==='NEUTRAL')            return '#94a3b8';
+    if(p==='DISFAVORED')         return '#f97316';
+    if(p==='STRONGLY_DISFAVORED')return '#ef4444';
     return '#6b7280';
   }
   function stageOk(s){ return s && s.status==='OK'; }
-  var pv   = decide.pipeline_verdict || 'INSUFFICIENT_DATA';
-  var agree= decide.agreement_with_live;
+  var pv       = decide.shadow_verdict || decide.pipeline_verdict || 'INSUFFICIENT_DATA';
+  var pdir     = decide.pipeline_direction;
+  var regime   = interp.regime || 'UNKNOWN';
+  var driver   = interp.primary_driver || 'UNKNOWN';
+  var agStatus = decide.agreement_status || dp.agreement_status || '';
+  var agBool   = decide.agreement_with_live;
+  var explBlock= decide.explanation || {};
   var h = '';
   h += '<div style="font-size:10px;color:#818cf8;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#8635; DECISION PIPELINE V2 &mdash; SHADOW MODE</div>';
   h += '<div style="margin-bottom:10px;padding:8px;background:rgba(255,255,255,.04);border-radius:6px;border:1px solid var(--border)">';
   h += '<div style="font-size:15px;font-weight:800;color:'+verdCol(pv)+';letter-spacing:.02em">'+aiEsc(pv.replace(/_/g,' '))+'</div>';
-  if(decide.pipeline_direction){
-    h += '<div style="font-size:10px;color:var(--muted);margin-top:2px">Direction: <span style="color:var(--fg);font-weight:600">'+aiEsc(decide.pipeline_direction)+'</span></div>';
-  }
+  if(pdir){ h += '<div style="font-size:10px;color:var(--muted);margin-top:2px">Direction: <span style="color:var(--fg);font-weight:600">'+aiEsc(pdir)+'</span></div>'; }
   h += '<div style="font-size:10px;color:var(--muted);margin-top:3px">';
-  if(decide.pipeline_confidence!=null){ h += 'Confidence: <span style="color:var(--fg)">'+decide.pipeline_confidence+'%</span> &bull; '; }
-  h += 'Bias: <span style="color:var(--fg)">'+aiEsc((interp.bias||'&mdash;').replace(/_/g,' '))+'</span></div>';
-  if(agree!=null){
-    var agC = agree ? '#22c55e' : '#f59e0b';
-    var agL = agree ? '&#10003; Agrees with live system' : '&#9888; Diverges from live system';
+  if(decide.pipeline_confidence!=null){ h += 'Conf: <span style="color:var(--fg)">'+decide.pipeline_confidence+'%</span> &bull; '; }
+  h += 'Regime: <span style="color:var(--fg)">'+aiEsc(regime.replace(/_/g,'-'))+'</span>';
+  h += ' &bull; Driver: <span style="color:var(--fg)">'+aiEsc(driver.replace(/_/g,' '))+'</span></div>';
+  if(agStatus){
+    var agC = (agStatus==='AGREE') ? '#22c55e' : '#f59e0b';
+    var agL = (agStatus==='AGREE') ? '&#10003; Agrees with live system'
+                                   : '&#9888; ' + agStatus.replace(/_/g,' ');
     h += '<div style="font-size:10px;color:'+agC+';margin-top:4px;font-weight:600">'+agL+'</div>';
-    if(!agree && decide.divergence_reason){
+    if(decide.divergence_reason){
       h += '<div style="font-size:9px;color:var(--muted);margin-top:2px">'+aiEsc(decide.divergence_reason)+'</div>';
     }
   }
   h += '</div>';
-  var SNAMES = ['observe','interpret','prioritize','validate','decide'];
-  var SLABELS= ['OBS','INT','PRI','VAL','DEC'];
+  var SNAMES  = ['observe','interpret','prioritize','validate','decide'];
+  var SLABELS = ['OBS','INT','PRI','VAL','DEC'];
   h += '<div style="display:flex;gap:3px;margin-bottom:10px;align-items:center">';
   SNAMES.forEach(function(sn,i){
     var s  = stages[sn] || {};
@@ -52684,29 +53161,66 @@ function renderDecisionPipeline(d) {
     h += '</div>';
   });
   h += '</div>';
-  var gkeys = Object.keys(gates);
-  if(gkeys.length){
-    h += '<div style="font-size:9px;color:var(--muted);margin-bottom:5px;font-weight:700;letter-spacing:.05em">GATES ('+
-         (validate.gates_passed||0)+'/'+( validate.total_gates||0)+' PASS)</div>';
-    gkeys.forEach(function(gk){
-      var g  = gates[gk];
-      var gc = gateCol(g.result);
-      var sym= g.result==='PASS' ? '&#10003;' : g.result==='FAIL' ? '&#10007;' : '?';
-      h += '<div style="display:flex;gap:5px;align-items:flex-start;margin-bottom:3px">';
-      h += '<span style="font-size:9px;color:'+gc+';font-weight:700;min-width:12px">'+sym+'</span>';
-      h += '<span style="font-size:9px;color:var(--muted);min-width:58px;text-transform:capitalize">'+aiEsc(gk)+'</span>';
-      h += '<span style="font-size:9px;color:var(--fg);flex:1">'+aiEsc(g.reason||'')+'</span>';
+  var ranked = prio.ranked_instruments || [];
+  if(ranked.length){
+    h += '<div style="font-size:9px;color:var(--muted);margin-bottom:5px;font-weight:700;letter-spacing:.05em">MARKET PRIORITY</div>';
+    ranked.forEach(function(r){
+      var pc = prefCol(r.preference);
+      var isFocus = r.is_focus ? ' <span style="color:#818cf8;font-size:8px">(focus)</span>' : '';
+      h += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:3px">';
+      h += '<span style="font-size:9px;font-weight:700;min-width:14px;color:#94a3b8">'+r.priority+'.</span>';
+      h += '<span style="font-size:9px;font-weight:700;min-width:30px;color:var(--fg)">'+aiEsc(r.symbol)+'</span>';
+      h += '<span style="font-size:9px;color:'+pc+';min-width:70px">'+aiEsc((r.preference||'').replace(/_/g,' '))+'</span>';
+      h += '<span style="font-size:9px;color:var(--muted)">'+aiEsc(r.directional_context||'')+'</span>';
+      h += isFocus;
       h += '</div>';
     });
   }
-  var aligned = prio.aligned_signals || [];
-  if(aligned.length){
-    h += '<div style="font-size:9px;color:var(--muted);margin:8px 0 4px;font-weight:700;letter-spacing:.05em">TOP SIGNALS</div>';
-    aligned.slice(0,3).forEach(function(s){
-      h += '<div style="font-size:9px;color:var(--fg);margin-bottom:2px">&#9642; '+
-           aiEsc(s.signal.replace(/_/g,' '))+
-           ' <span style="color:var(--muted)">(tier '+s.tier+', wt '+s.weight+')</span></div>';
+  var passed = validate.passed_checks || [];
+  var failed = validate.failed_checks || [];
+  if(passed.length || failed.length){
+    h += '<div style="font-size:9px;color:var(--muted);margin:8px 0 4px;font-weight:700;letter-spacing:.05em">TECHNICAL VALIDATION</div>';
+    passed.slice(0,3).forEach(function(c){
+      h += '<div style="font-size:9px;color:#22c55e;margin-bottom:2px">&#10003; '+aiEsc(c)+'</div>';
     });
+    failed.slice(0,3).forEach(function(c){
+      h += '<div style="font-size:9px;color:#ef4444;margin-bottom:2px">&#10007; '+aiEsc(c)+'</div>';
+    });
+  }
+  var expl = explBlock;
+  if(expl.what_is_happening){
+    h += '<div style="margin-top:8px;padding:7px;background:rgba(129,140,248,.06);border-radius:5px;border:1px solid rgba(129,140,248,.15)">';
+    h += '<div style="font-size:9px;color:#818cf8;font-weight:700;margin-bottom:5px">EXPLANATION</div>';
+    var explKeys = [
+      ['what_is_happening','What'],
+      ['why_it_is_happening','Why'],
+      ['why_this_market_is_relevant','Relevance'],
+      ['what_must_happen_next','Next'],
+      ['what_invalidates_the_idea','Invalidated by'],
+    ];
+    explKeys.forEach(function(kl){
+      var val = expl[kl[0]];
+      if(!val) return;
+      h += '<div style="margin-bottom:3px"><span style="font-size:8px;color:var(--muted);font-weight:700">'+kl[1]+': </span>';
+      h += '<span style="font-size:9px;color:var(--fg)">'+aiEsc(val)+'</span></div>';
+    });
+    h += '</div>';
+  }
+  if(scorecard && scorecard.total_evaluations > 0){
+    h += '<div style="margin-top:8px;padding:7px;background:rgba(255,255,255,.03);border-radius:5px;border:1px solid var(--border)">';
+    h += '<div style="font-size:9px;color:var(--muted);font-weight:700;margin-bottom:5px">SCORECARD (' + scorecard.total_evaluations + ' evals)</div>';
+    h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:3px;font-size:9px">';
+    h += '<div style="color:var(--muted)">Agreement: <span style="color:var(--fg)">'+scorecard.agreement_rate_pct+'%</span></div>';
+    h += '<div style="color:var(--muted)">Disagree: <span style="color:var(--fg)">'+scorecard.disagree_count+'</span></div>';
+    h += '<div style="color:var(--muted)">Prod wins: <span style="color:var(--fg)">'+scorecard.production_wins+'</span></div>';
+    h += '<div style="color:var(--muted)">V2 wins: <span style="color:var(--fg)">'+scorecard.v2_wins+'</span></div>';
+    h += '<div style="color:var(--muted)">Avoided loss: <span style="color:#22c55e">'+scorecard.avoided_loss_count+'</span></div>';
+    h += '<div style="color:var(--muted)">Missed win: <span style="color:#f59e0b">'+scorecard.missed_winner_count+'</span></div>';
+    h += '</div>';
+    if(!scorecard.meets_minimum_thresholds){
+      h += '<div style="font-size:8px;color:rgba(130,130,160,.5);margin-top:4px">Min thresholds not yet met (need 100 evals)</div>';
+    }
+    h += '</div>';
   }
   var reasoning = decide.pipeline_reasoning || [];
   if(reasoning.length){
@@ -56808,6 +57322,29 @@ def _review_trade_idea(payload):
         "sections": sections,
         "order_ticket": order_ticket,
     }
+
+
+@app.route("/dpv2-scorecard", methods=["GET"])
+def dpv2_scorecard_route():
+    """Decision Pipeline V2 agreement scorecard (DISPLAY-ONLY, shadow mode).
+    Owner-only (Basic Auth + same-origin CSRF via the Express proxy;
+    deliberately NOT in OPEN_PATHS). Returns the in-memory agreement history
+    aggregated into a read-only scorecard. Never feeds the gate, gateway, or
+    any money-path component."""
+    try:
+        card = _dpv2_compute_scorecard()
+        history = list(_DPV2_AGREEMENT_HISTORY)[:50]   # last 50 evaluations
+        shadows = dict(_DPV2_SHADOW_TRADES)             # current shadow trades
+        return jsonify({
+            "scorecard": card,
+            "recent_evaluations": history,
+            "shadow_trades": shadows,
+            "total_in_history": len(list(_DPV2_AGREEMENT_HISTORY)),
+            "shadow_mode_note": "SHADOW MODE — NO LIVE AUTHORITY",
+        }), 200
+    except Exception as _e:
+        logger.warning("[DPv2 scorecard] error: %s", _e)
+        return jsonify({"status": "error", "reason": str(_e)}), 500
 
 
 @app.route("/review-idea", methods=["POST"])

@@ -131,6 +131,7 @@ export const BOT1_ROUTES = [
   "/entry-quality",
   "/review-idea",
   "/failure-analysis",
+  "/dpv2-scorecard",
   // AI assistant chat (owner-only; DISPLAY/READ-ONLY; NOT in dashboard-auth
   // OPEN_PATHS). Answers questions about the live setup + general trading.
   "/assistant",

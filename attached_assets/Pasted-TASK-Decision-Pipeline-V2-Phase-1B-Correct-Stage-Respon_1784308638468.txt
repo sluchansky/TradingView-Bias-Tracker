@@ -1,0 +1,633 @@
+TASK: Decision Pipeline V2 — Phase 1B: Correct Stage Responsibilities and Add Outcome Comparison
+
+OBJECTIVE
+
+Refine the existing Decision Pipeline V2 so each stage has one clear responsibility.
+
+Do not add new strategies.
+Do not add new indicators.
+Do not change live trading behavior.
+Do not change production confidence.
+Do not change risk.
+Do not change position sizing.
+Do not change TradersPost or broker routing.
+
+Keep the pipeline in shadow mode.
+
+The existing production system remains authoritative.
+
+==================================================
+1. CORRECT THE 5-STAGE RESPONSIBILITIES
+==================================================
+
+The pipeline must operate in this order:
+
+1. OBSERVE
+2. INTERPRET
+3. PRIORITIZE
+4. VALIDATE
+5. DECIDE
+
+Each stage must answer a different question.
+
+--------------------------------------------------
+STAGE 1: OBSERVE
+--------------------------------------------------
+
+Question:
+
+What facts are currently available?
+
+Collect existing:
+
+- Price
+- VWAP
+- CVD
+- Volume
+- ATR
+- Market structure
+- Prior-day levels
+- Recent alerts
+- Existing news-panel data
+- Sector data
+- Account state
+- Position state
+- Prop-rule state
+- Data freshness
+
+Do not classify the market here.
+
+Do not create a directional bias here.
+
+Do not rank markets here.
+
+Do not produce a trade verdict here.
+
+--------------------------------------------------
+STAGE 2: INTERPRET
+--------------------------------------------------
+
+Question:
+
+What type of market environment is present, and what appears to be driving it?
+
+This stage must not produce LONG or SHORT trade instructions.
+
+Create or update:
+
+market_interpretation
+
+Required fields:
+
+{
+  "regime": "RISK_OFF",
+  "regime_confidence": 82,
+  "primary_driver": "GEOPOLITICAL",
+  "secondary_drivers": [
+    "ENERGY"
+  ],
+  "risk_state": "DEFENSIVE",
+  "dominant_theme": "SAFE_HAVEN_DEMAND",
+  "supporting_evidence": [],
+  "conflicting_evidence": [],
+  "data_quality": "MODERATE"
+}
+
+Allowed regime values:
+
+- RISK_ON
+- RISK_OFF
+- NEUTRAL
+- MIXED
+- UNKNOWN
+
+Allowed driver values:
+
+- GEOPOLITICAL
+- FED_POLICY
+- INFLATION
+- EMPLOYMENT
+- ECONOMIC_GROWTH
+- EARNINGS
+- ENERGY
+- LIQUIDITY
+- TECHNICAL
+- MULTIPLE
+- NONE
+- UNKNOWN
+
+Critical rule:
+
+The regime describes what the market is doing.
+
+The driver explains why it is doing it.
+
+Correct:
+
+Regime: RISK_OFF
+Primary driver: GEOPOLITICAL
+
+Incorrect:
+
+Regime: GEOPOLITICAL
+
+Do not resolve classification conflicts by enum ordering.
+
+Do not output long, short, buy, sell, approve, or reject from this stage.
+
+--------------------------------------------------
+STAGE 3: PRIORITIZE
+--------------------------------------------------
+
+Question:
+
+Which existing traded markets deserve the most attention in this environment?
+
+Rank only supported instruments such as:
+
+- MNQ
+- MES
+- MYM
+- MGC
+
+This stage may assign contextual direction, but it must not create a trade.
+
+Example:
+
+{
+  "symbol": "MGC",
+  "priority": 1,
+  "preference": "FAVORED",
+  "directional_context": "BULLISH",
+  "context_confidence": 74,
+  "reasons": [
+    "Risk-off regime",
+    "Safe-haven demand",
+    "Gold above VWAP"
+  ],
+  "conflicts": [
+    "Dollar strength"
+  ]
+}
+
+Allowed preference values:
+
+- STRONGLY_FAVORED
+- FAVORED
+- NEUTRAL
+- DISFAVORED
+- STRONGLY_DISFAVORED
+- INSUFFICIENT_DATA
+
+Rules:
+
+- Priority is not a trade command.
+- Directional context is not an APPROVE verdict.
+- A disfavored market may still contain a valid technical setup.
+- Do not block markets solely because of ranking.
+- Do not route orders from this stage.
+
+--------------------------------------------------
+STAGE 4: VALIDATE
+--------------------------------------------------
+
+Question:
+
+Does an actual technical setup exist, and does it pass all safety rules?
+
+Reuse the existing production logic for:
+
+- Structure
+- VWAP
+- CVD
+- Trend
+- Liquidity sweep
+- CHOCH
+- BOS
+- FVG
+- Order blocks
+- Zone freshness
+- ATR
+- Reward-to-risk
+- Volatility
+- Prop rules
+- Daily loss limits
+- FLAT checks
+- Working-order checks
+- Instrument verification
+- Position sizing
+
+Do not duplicate or rewrite existing strategy logic.
+
+Create:
+
+technical_validation
+
+Example:
+
+{
+  "symbol": "MGC",
+  "strategy": "EXISTING_STRATEGY",
+  "technical_status": "WAIT",
+  "technical_confidence": 81,
+  "passed_checks": [],
+  "failed_checks": [
+    "Fresh demand-zone retest missing"
+  ],
+  "risk_checks": {},
+  "account_checks": {},
+  "production_verdict": "WAIT"
+}
+
+This is the first stage where setup direction may be technically validated.
+
+--------------------------------------------------
+STAGE 5: DECIDE
+--------------------------------------------------
+
+Question:
+
+Given the environment, market priority, technical setup, and risk checks, what is the final shadow conclusion?
+
+Create:
+
+decision_pipeline_v2_result
+
+Example:
+
+{
+  "symbol": "MGC",
+  "market_regime": "RISK_OFF",
+  "primary_driver": "GEOPOLITICAL",
+  "market_priority": "FAVORED",
+  "directional_context": "BULLISH",
+  "technical_verdict": "WAIT",
+  "production_verdict": "WAIT",
+  "shadow_verdict": "WAIT",
+  "agreement_status": "AGREE",
+  "changed_production_behavior": false,
+  "explanation": {
+    "what_is_happening": "The market is risk-off.",
+    "why_it_is_happening": "Geopolitical escalation appears to be the primary driver.",
+    "why_this_market_is_relevant": "Gold is showing safe-haven strength.",
+    "what_the_technical_engine_found": "MGC is above VWAP but has not completed a fresh demand-zone retest.",
+    "what_must_happen_next": "Wait for a valid retest and renewed structure confirmation.",
+    "what_invalidates_the_idea": "Loss of bullish structure and a sustained move below VWAP."
+  },
+  "shadow_mode": true
+}
+
+The shadow verdict must not affect production behavior.
+
+==================================================
+2. REMOVE EARLY DIRECTIONAL DECISIONS
+==================================================
+
+Inspect the current INTERPRET stage.
+
+If it currently outputs:
+
+- LONG
+- SHORT
+- BUY
+- SELL
+- APPROVE
+- REJECT
+- Trade direction
+- Signal direction
+
+Move that responsibility out of INTERPRET.
+
+INTERPRET may describe:
+
+- Risk-on
+- Risk-off
+- Neutral
+- Mixed
+- Defensive
+- Aggressive
+- Geopolitical
+- Fed-driven
+- Inflationary
+- Safe-haven demand
+- Technology leadership
+- Energy strength
+
+It must not issue a trade instruction.
+
+Directional context belongs in PRIORITIZE.
+
+Technical trade direction belongs in VALIDATE.
+
+The final shadow conclusion belongs in DECIDE.
+
+==================================================
+3. ADD LIVE VS V2 AGREEMENT TRACKING
+==================================================
+
+Do not track only whether V2 agrees with production.
+
+Track disagreement and eventual trade outcome.
+
+For each evaluated setup, save:
+
+- Timestamp
+- Symbol
+- Mode
+- Strategy
+- Production verdict
+- V2 shadow verdict
+- Agreement status
+- Production confidence
+- V2 contextual confidence
+- Technical confidence
+- Regime
+- Primary driver
+- Market priority
+- Entry price if triggered
+- Stop
+- Target
+- Whether trade triggered
+- Whether TP1 was reached
+- Whether final target was reached
+- Whether stop was reached
+- Maximum favorable excursion
+- Maximum adverse excursion
+- Final outcome
+- Which system was more correct
+
+Allowed agreement values:
+
+- AGREE
+- PRODUCTION_MORE_BULLISH
+- V2_MORE_BULLISH
+- PRODUCTION_MORE_BEARISH
+- V2_MORE_BEARISH
+- PRODUCTION_APPROVED_V2_WAITED
+- PRODUCTION_WAITED_V2_APPROVED
+- PRODUCTION_REJECTED_V2_APPROVED
+- INCOMPARABLE
+
+==================================================
+4. DETERMINE WHICH SYSTEM WAS MORE CORRECT
+==================================================
+
+Create a later outcome-grading result.
+
+Example:
+
+{
+  "production_verdict": "APPROVE",
+  "shadow_verdict": "WAIT",
+  "trade_outcome": "STOPPED_OUT",
+  "better_decision": "V2",
+  "reason": "V2 avoided a losing trade"
+}
+
+Possible better-decision values:
+
+- PRODUCTION
+- V2
+- BOTH
+- NEITHER
+- INCONCLUSIVE
+
+Examples:
+
+Production APPROVE
+V2 WAIT
+Trade stops out
+
+Result:
+
+V2 was more correct.
+
+Production APPROVE
+V2 WAIT
+Trade reaches target
+
+Result:
+
+Production was more correct.
+
+Production WAIT
+V2 APPROVE
+Hypothetical entry reaches target
+
+Result:
+
+V2 was more correct.
+
+Both APPROVE
+Trade reaches target
+
+Result:
+
+BOTH.
+
+Both APPROVE
+Trade stops out
+
+Result:
+
+NEITHER.
+
+Do not make this judgment before sufficient outcome data exists.
+
+==================================================
+5. SUPPORT HYPOTHETICAL OUTCOMES
+==================================================
+
+When V2 would have approved but production did not enter:
+
+Track a shadow trade only if all required entry details exist:
+
+- Entry
+- Stop
+- Target
+- Direction
+- Timestamp
+- Symbol
+
+The shadow trade must:
+
+- Never route an order
+- Never affect account state
+- Never affect risk limits
+- Never appear as a live trade
+- Be clearly labeled HYPOTHETICAL
+- Use the same market data used for normal trade tracking
+
+If required trade details are missing:
+
+Mark the result INCONCLUSIVE.
+
+Do not invent an entry, stop, or target.
+
+==================================================
+6. ADD PIPELINE SCORECARD
+==================================================
+
+Add a read-only scorecard to the existing Pipeline V2 dashboard tab.
+
+Display:
+
+- Total evaluations
+- Agreement rate
+- Disagreement count
+- Production wins
+- V2 wins
+- Both correct
+- Neither correct
+- Inconclusive
+- Production-approved/V2-waited count
+- V2-approved/production-waited count
+- Avoided-loss count
+- Missed-winner count
+- Average MFE
+- Average MAE
+- Results by symbol
+- Results by mode
+- Results by regime
+- Results by primary driver
+
+Clearly label:
+
+SHADOW MODE — NO LIVE AUTHORITY
+
+Do not claim V2 is better based only on agreement rate.
+
+==================================================
+7. ADD MINIMUM VALIDATION REQUIREMENTS
+==================================================
+
+Do not enable V2 authority based on a small sample.
+
+Minimum before discussing any influence:
+
+- At least 100 completed comparable evaluations
+- At least 30 actual disagreements
+- At least 20 evaluated trades per active mode
+- At least 20 evaluations per primary traded symbol where possible
+- Outcome data must be complete
+- No unresolved regression failures
+- No live-routing calls from V2
+
+These thresholds do not enable anything automatically.
+
+They only determine when a review is meaningful.
+
+==================================================
+8. KEEP ALL AUTHORITY FLAGS OFF
+==================================================
+
+Confirm:
+
+DECISION_PIPELINE_V2_CAN_CHANGE_VERDICT=false
+
+DECISION_PIPELINE_V2_CAN_CHANGE_CONFIDENCE=false
+
+DECISION_PIPELINE_V2_CAN_CHANGE_RISK=false
+
+DECISION_PIPELINE_V2_CAN_PAUSE_ENTRIES=false
+
+DECISION_PIPELINE_V2_CAN_ROUTE_ORDERS=false
+
+Master enable behavior may remain as currently implemented.
+
+Do not alter production defaults without explicit instruction.
+
+==================================================
+9. FAILURE ISOLATION
+==================================================
+
+If outcome tracking, scorecard logic, or any V2 stage fails:
+
+- Production trading continues normally
+- Existing production verdict remains available
+- Existing confidence remains unchanged
+- Existing position sizing remains unchanged
+- Existing order routing remains unchanged
+- Log the V2 error
+- Mark V2 data unavailable
+- Do not block open-position management
+- Do not cancel protective stops
+
+==================================================
+10. TESTING REQUIREMENTS
+==================================================
+
+Add tests for:
+
+1. INTERPRET returns regime and driver but no trade direction
+2. PRIORITIZE returns contextual direction but no order
+3. VALIDATE reuses production technical logic
+4. DECIDE assembles the full explanation
+5. Production APPROVE versus V2 WAIT
+6. Production WAIT versus V2 APPROVE
+7. Both systems agree
+8. V2 avoids a stopped-out trade
+9. Production captures a winner V2 skipped
+10. Both correct
+11. Neither correct
+12. Inconclusive due to missing entry details
+13. Hypothetical trade never routes an order
+14. Outcome grading waits for complete data
+15. Agreement rate calculation
+16. Better-decision calculation
+17. Results grouped by symbol
+18. Results grouped by mode
+19. Results grouped by regime
+20. Results grouped by driver
+21. Production verdict unchanged
+22. Production confidence unchanged
+23. Position size unchanged
+24. No TradersPost or broker call from V2
+25. V2 failure isolation
+26. Existing golden regression checks remain byte-identical when V2 is disabled
+
+==================================================
+11. ACCEPTANCE CRITERIA
+==================================================
+
+This phase is complete only when:
+
+- INTERPRET no longer makes an early long/short trade decision.
+- Regime and driver remain independent.
+- PRIORITIZE ranks markets without creating trades.
+- VALIDATE uses existing technical logic.
+- DECIDE creates the final shadow explanation.
+- Agreement tracking exists.
+- Outcome tracking exists.
+- The system can determine which decision was more correct after the outcome.
+- Hypothetical V2 trades remain completely isolated.
+- Production behavior remains unchanged.
+- All influence flags remain false.
+- All tests pass.
+- Existing golden checks remain unchanged when V2 is disabled.
+
+==================================================
+12. DELIVERABLES
+==================================================
+
+Provide:
+
+1. Files changed
+2. Stage responsibility changes
+3. Any directional logic moved out of INTERPRET
+4. Existing technical services reused
+5. Agreement schema
+6. Outcome-grading schema
+7. Hypothetical-trade schema
+8. Dashboard scorecard screenshot
+9. Full test results
+10. Proof production verdicts are unchanged
+11. Proof production confidence is unchanged
+12. Proof risk and position sizing are unchanged
+13. Proof V2 made no broker or TradersPost calls
+14. Known limitations
+15. Current evaluation sample size
+
+STOP after completing this phase.
+
+Do not enable V2 to change trades, confidence, risk, entry pauses, or order routing.
