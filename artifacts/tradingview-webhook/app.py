@@ -324,6 +324,12 @@ RVOL_BY_TICKER      = {}
 # spike is only "fresh" for VOLUME_SPIKE_TTL_MIN minutes after it arrives.
 # {"MNQ": {"ts": iso}, "MGC": {"ts": iso}}
 VOLUME_SPIKE_BY_TICKER = {}
+# ── Market Environment Layer — Phase 1A in-memory state ───────────────────────
+# Written only by compute_market_environment(); never read by the money path.
+_ME_LOCK          = threading.Lock()
+_ME_LAST_SNAPSHOT = None     # last successfully computed snapshot (global cache)
+_ME_LAST_LOG_TS   = 0.0      # epoch of last shadow log write
+_ME_LOG_INTERVAL  = 300.0    # min seconds between shadow-log lines (5 min)
 
 # ── Alert vocabulary (generated per instrument from one template) ────────────
 # The full prefixed alert set ("MGC NEW SUPPLY ZONE", "MNQ BULLISH SWEEP", …) is
@@ -1780,6 +1786,15 @@ OVERSIZED_LOSS_PROTECTION_ENABLED = os.environ.get("OVERSIZED_LOSS_PROTECTION_EN
 OVERSIZED_LOSS_MULT               = max(1.0, float(os.environ.get("OVERSIZED_LOSS_MULT", "1.5") or 1.5))
 SESSION_QUALITY_ENABLED           = os.environ.get("SESSION_QUALITY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 BOT_HOLD_SCORE_ENABLED            = os.environ.get("BOT_HOLD_SCORE_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# ── Market Environment Layer — Phase 1A feature flags ─────────────────────────
+# Master on/off switch (default ON). Shadow mode is always True for Phase 1A.
+# All four influence flags are HARDCODED False — they can never be set from env.
+MARKET_ENVIRONMENT_ENABLED               = os.environ.get("MARKET_ENVIRONMENT_ENABLED", "1").strip() == "1"
+MARKET_ENVIRONMENT_SHADOW_MODE           = True   # Phase 1A: always shadow, never influences
+MARKET_ENVIRONMENT_CAN_AFFECT_CONFIDENCE = False  # hardcoded — never
+MARKET_ENVIRONMENT_CAN_AFFECT_RISK       = False  # hardcoded — never
+MARKET_ENVIRONMENT_CAN_PAUSE_ENTRIES     = False  # hardcoded — never
+MARKET_ENVIRONMENT_CAN_AFFECT_VERDICTS   = False  # hardcoded — never
 # ── Dashboard reorganization feature flags (DISPLAY-ONLY; backend unchanged) ─
 UNIFIED_DASHBOARD_ENABLED         = os.environ.get("UNIFIED_DASHBOARD_ENABLED", "1").strip() == "1"
 HIGH_VOLUME_PANEL_ENABLED         = os.environ.get("HIGH_VOLUME_PANEL_ENABLED", "1").strip() == "1"
@@ -13107,6 +13122,624 @@ def get_news_filter():
         "as_of": (fmt_et(datetime.fromtimestamp(fetched_at, tz=timezone.utc), "%H:%M ET")
                   if fetched_at else None),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET ENVIRONMENT LAYER — PHASE 1A (READ-ONLY SHADOW MODE)
+# ══════════════════════════════════════════════════════════════════════════════
+# Observes the four traded micro-futures using EXISTING in-memory globals only.
+# Produces a market_environment_snapshot object that is DISPLAY-ONLY.
+# NEVER touches the money path, gate logic, confidence, sizing, or order routing.
+# All four influence flags are hardcoded False (asserted at entry).
+#
+# Available instruments: MNQ, MES, MYM, MGC
+# Unavailable (no data in system): VIX, QQQ, SPY, DIA, GLD, XLE, ITA, XAR,
+#   XLK, XLF, XLI, XLU, XLP, XLY, XLV, CL  — marked UNAVAILABLE, not estimated.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _me_age_min(ts_str):
+    """Parse an ISO timestamp and return its age in minutes, or None on failure."""
+    try:
+        if not ts_str:
+            return None
+        dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+def _me_instrument_obs(inst):
+    """Build a per-instrument observation dict from existing in-memory globals.
+    Reads VWAP_BY_TICKER, CURRENT_PRICE_BY_TICKER, AUTO_PRICE_BY_TICKER,
+    VOLATILITY_BY_TICKER, CVD_BY_TICKER, RVOL_BY_TICKER.  Never raises."""
+    try:
+        price   = CURRENT_PRICE_BY_TICKER.get(inst)
+        auto_p  = AUTO_PRICE_BY_TICKER.get(inst) or {}
+        if price is None:
+            price = auto_p.get("value")
+        price_age   = _me_age_min(auto_p.get("ts"))
+        price_fresh = (price is not None and
+                       (price_age is None or price_age < 10.0))
+
+        vwap_d    = VWAP_BY_TICKER.get(inst) or {}
+        vwap      = vwap_d.get("value")
+        vwap_age  = _me_age_min(vwap_d.get("ts"))
+        vwap_fresh = (vwap is not None and
+                      (vwap_age is None or vwap_age < 120.0))
+
+        above_vwap = None
+        if price is not None and vwap is not None:
+            try:
+                above_vwap = float(price) > float(vwap)
+            except (TypeError, ValueError):
+                pass
+
+        cvd_d     = CVD_BY_TICKER.get(inst) or {}
+        cvd_state = cvd_d.get("state")
+        cvd_age   = _me_age_min(cvd_d.get("ts"))
+        if not (cvd_state and (cvd_age is None or cvd_age < 30.0)):
+            cvd_state = None
+
+        rvol_d    = RVOL_BY_TICKER.get(inst) or {}
+        rvol      = rvol_d.get("value")
+        rvol_age  = _me_age_min(rvol_d.get("ts"))
+        if not (rvol is not None and (rvol_age is None or rvol_age < 30.0)):
+            rvol = None
+
+        vol_d     = VOLATILITY_BY_TICKER.get(inst) or {}
+        atr_pts   = vol_d.get("atr_pts")
+        vol_ratio = vol_d.get("ratio")
+
+        data_available = price is not None or vwap is not None
+        data_fresh     = price_fresh and vwap_fresh
+
+        return {
+            "symbol":         inst,
+            "price":          price,
+            "vwap":           vwap,
+            "above_vwap":     above_vwap,
+            "cvd_state":      cvd_state,
+            "rvol":           rvol,
+            "atr_pts":        atr_pts,
+            "vol_ratio":      vol_ratio,
+            "data_fresh":     data_fresh,
+            "data_available": data_available,
+            "price_age_min":  round(price_age, 1) if price_age is not None else None,
+            "vwap_age_min":   round(vwap_age, 1)  if vwap_age  is not None else None,
+        }
+    except Exception as _e:
+        logger.debug(f"[MktEnv] obs error for {inst}: {_e}")
+        return {
+            "symbol": inst, "price": None, "vwap": None, "above_vwap": None,
+            "cvd_state": None, "rvol": None, "atr_pts": None, "vol_ratio": None,
+            "data_fresh": False, "data_available": False,
+            "price_age_min": None, "vwap_age_min": None,
+        }
+
+
+# News keyword → (category, direction) — Phase 1A: used for news_context only
+_ME_NEWS_KEYWORDS = [
+    (["fomc", "fed rate", "federal funds", "interest rate", "powell",
+      "federal reserve", "monetary policy", "rate decision"],
+     "CENTRAL_BANK", "MIXED"),
+    (["cpi", "pce", " inflation", "ppi", "consumer price", "core inflation"],
+     "INFLATION", "INFLATIONARY"),
+    (["nonfarm", "payroll", "employment", "jobless", "unemployment",
+      "initial claims", "labor market"],
+     "EMPLOYMENT", "MIXED"),
+    (["gdp", "gross domestic", "economic growth", "recession",
+      "retail sales", "consumer spending"],
+     "ECONOMIC_GROWTH", "MIXED"),
+    (["war", "conflict", "attack", "military", "sanction", "geopolit",
+      "escalat", "missile", "invasion", "strike", "hostil"],
+     "GEOPOLITICAL_ESCALATION", "RISK_OFF"),
+    (["ceasefire", "peace", "deescal", "agreement", "withdrawal",
+      "resolution", "diplomatic"],
+     "GEOPOLITICAL_DEESCALATION", "RISK_ON"),
+    (["oil supply", "crude supply", "opec", "energy supply",
+      "pipeline", "natural gas", "lng supply"],
+     "ENERGY_SUPPLY_RISK", "MIXED"),
+    (["shipping", "freight", "suez", "panama canal", "cargo", "container ship"],
+     "SHIPPING_DISRUPTION", "RISK_OFF"),
+    (["earnings", "quarterly result", "revenue beat", "guidance cut"],
+     "EARNINGS", "MIXED"),
+]
+
+
+def _me_classify_news_event(title):
+    """Return (category, direction) for a news headline via keyword matching."""
+    t = (title or "").lower()
+    for keywords, category, direction in _ME_NEWS_KEYWORDS:
+        if any(k in t for k in keywords):
+            return category, direction
+    return "OTHER", "NEUTRAL"
+
+
+def _me_sector_state(ob):
+    """Derive STRONG_LEADER/LEADER/NEUTRAL/LAGGING/STRONG_LAGGARD/UNAVAILABLE/STALE."""
+    if not ob["data_available"]:
+        return "UNAVAILABLE"
+    if not ob["data_fresh"]:
+        return "STALE"
+    av = ob["above_vwap"]
+    cvd = ob["cvd_state"]
+    if av is True  and cvd == "bullish": return "STRONG_LEADER"
+    if av is True:                       return "LEADER"
+    if av is False and cvd == "bearish": return "STRONG_LAGGARD"
+    if av is False:                      return "LAGGING"
+    return "NEUTRAL"
+
+
+def _me_futures_preference(symbol, ob, regime, news_category, news_direction):
+    """Compute a futures preference dict for one instrument. Never raises."""
+    try:
+        if not ob["data_available"]:
+            return {
+                "symbol": symbol, "preference": "INSUFFICIENT_DATA",
+                "directional_context": "UNKNOWN", "confidence": 0,
+                "supporting_evidence": [], "conflicting_evidence": [],
+            }
+        score       = 0
+        supporting  = []
+        conflicting = []
+
+        if ob["above_vwap"] is True:
+            score += 1; supporting.append(f"{symbol} is above VWAP")
+        elif ob["above_vwap"] is False:
+            score -= 1; conflicting.append(f"{symbol} is below VWAP")
+
+        if ob["cvd_state"] == "bullish":
+            score += 1; supporting.append(f"{symbol} CVD is bullish")
+        elif ob["cvd_state"] == "bearish":
+            score -= 1; conflicting.append(f"{symbol} CVD is bearish")
+
+        # Regime alignment per instrument
+        if symbol == "MGC":
+            directional = ("BULLISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
+                           else "BEARISH" if regime == "RISK_ON" else "NEUTRAL")
+            if regime in ("RISK_OFF", "GEOPOLITICAL"):
+                score += 1
+                supporting.append("Risk-off / geopolitical environment supports safe-haven demand")
+            elif regime == "RISK_ON":
+                score -= 1
+                conflicting.append("Risk-on environment may reduce safe-haven demand")
+            if news_category in ("GEOPOLITICAL_ESCALATION",
+                                  "ENERGY_SUPPLY_RISK", "SHIPPING_DISRUPTION"):
+                score += 1
+                supporting.append("Active event-risk news supports gold demand")
+        elif symbol == "MNQ":
+            directional = ("BULLISH" if regime == "RISK_ON"
+                           else "BEARISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
+                           else "NEUTRAL")
+            if regime == "RISK_ON":
+                score += 1; supporting.append("Risk-on environment favors technology-heavy MNQ")
+            elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+                score -= 1
+                conflicting.append("Risk-off / geopolitical environment disfavors growth assets")
+        elif symbol == "MES":
+            directional = ("BULLISH" if regime == "RISK_ON"
+                           else "BEARISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
+                           else "NEUTRAL")
+            if regime == "RISK_ON":
+                score += 1; supporting.append("Broad market strength favors MES")
+            elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+                score -= 1
+                conflicting.append("Risk-off environment disfavors broad equity exposure")
+        elif symbol == "MYM":
+            directional = ("BULLISH" if regime == "RISK_ON"
+                           else "BEARISH" if regime in ("RISK_OFF", "GEOPOLITICAL")
+                           else "NEUTRAL")
+            if regime == "RISK_ON":
+                score += 1
+                supporting.append("Risk-on supports industrial/financial exposure via MYM")
+            elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+                score -= 1
+                conflicting.append("Risk-off environment disfavors cyclical MYM")
+        else:
+            directional = "NEUTRAL"
+
+        if not ob["data_fresh"]:
+            return {
+                "symbol": symbol, "preference": "INSUFFICIENT_DATA",
+                "directional_context": directional, "confidence": 0,
+                "supporting_evidence": supporting,
+                "conflicting_evidence": conflicting,
+            }
+
+        if   score >= 3:  pref = "STRONGLY_FAVORED"
+        elif score >= 1:  pref = "FAVORED"
+        elif score == 0:  pref = "NEUTRAL"
+        elif score >= -2: pref = "DISFAVORED"
+        else:             pref = "STRONGLY_DISFAVORED"
+
+        return {
+            "symbol":              symbol,
+            "preference":          pref,
+            "directional_context": directional,
+            "confidence":          min(100, max(0, 50 + score * 12)),
+            "supporting_evidence": supporting,
+            "conflicting_evidence": conflicting,
+        }
+    except Exception as _e:
+        logger.debug(f"[MktEnv] preference error for {symbol}: {_e}")
+        return {
+            "symbol": symbol, "preference": "INSUFFICIENT_DATA",
+            "directional_context": "UNKNOWN", "confidence": 0,
+            "supporting_evidence": [], "conflicting_evidence": [],
+        }
+
+
+def compute_market_environment():
+    """Phase 1A: Market Environment Layer — read-only shadow mode.
+
+    Reads existing in-memory globals and returns a market_environment_snapshot.
+    STRICTLY display-only.  All influence flags are hardcoded False.
+    Fails open: any exception returns an UNAVAILABLE snapshot so existing
+    trading logic is completely unaffected.
+    """
+    # Influence guards — asserted so a future Phase 1B cannot accidentally
+    # remove the hardcoded False values without triggering an explicit error.
+    assert not MARKET_ENVIRONMENT_CAN_AFFECT_CONFIDENCE, "Phase1A: no confidence changes"
+    assert not MARKET_ENVIRONMENT_CAN_AFFECT_RISK,       "Phase1A: no risk changes"
+    assert not MARKET_ENVIRONMENT_CAN_PAUSE_ENTRIES,     "Phase1A: no entry pausing"
+    assert not MARKET_ENVIRONMENT_CAN_AFFECT_VERDICTS,   "Phase1A: no verdict changes"
+    try:
+        return _compute_market_env_inner()
+    except Exception as _e:
+        logger.error(f"[MktEnv] compute_market_environment error (fail-open): {_e}")
+        return {
+            "regime": "UNKNOWN", "confidence": 0,
+            "dominant_theme": "UNKNOWN", "secondary_theme": "NONE",
+            "risk_state": "UNKNOWN",
+            "sector_rotation": [], "futures_preferences": [],
+            "supporting_evidence": [], "conflicting_evidence": [],
+            "news_context": {
+                "status": "CLEAR", "category": "NONE", "direction": "NEUTRAL",
+                "headline": None, "minutes_until": None, "expires_at": None,
+            },
+            "data_quality": {
+                "level": "INSUFFICIENT", "fresh": False,
+                "coverage_percent": 0, "available_count": 0, "fresh_count": 0,
+                "missing_inputs": [], "stale_inputs": [],
+                "unavailable_symbols": [],
+            },
+            "observations": {},
+            "shadow_mode": True, "available": False,
+            "error": str(_e)[:120],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "_can_affect_confidence": False, "_can_affect_risk": False,
+            "_can_pause_entries": False,     "_can_affect_verdicts": False,
+        }
+
+
+def _compute_market_env_inner():
+    """Inner implementation — may raise; wrapped by compute_market_environment."""
+    global _ME_LAST_SNAPSHOT, _ME_LAST_LOG_TS
+
+    EQUITY_INSTS = ("MNQ", "MES", "MYM")
+    ALL_INSTS    = ("MNQ", "MES", "MYM", "MGC")
+    UNAVAILABLE_SYMBOLS = [
+        "VIX", "QQQ", "SPY", "DIA", "GLD", "XLE", "ITA", "XAR",
+        "XLK", "XLF", "XLI", "XLU", "XLP", "XLY", "XLV", "CL",
+    ]
+
+    # ── 1. Per-instrument observations ───────────────────────────────────────
+    obs = {inst: _me_instrument_obs(inst) for inst in ALL_INSTS}
+
+    # ── 2. Data quality ───────────────────────────────────────────────────────
+    available_insts = [i for i in ALL_INSTS if obs[i]["data_available"]]
+    fresh_insts     = [i for i in ALL_INSTS if obs[i]["data_fresh"]]
+    stale_insts     = [i for i in ALL_INSTS if
+                       obs[i]["data_available"] and not obs[i]["data_fresh"]]
+    missing_insts   = [i for i in ALL_INSTS if not obs[i]["data_available"]]
+    coverage_pct    = int(len(fresh_insts) / len(ALL_INSTS) * 100) if ALL_INSTS else 0
+    if   coverage_pct >= 90: quality_label = "HIGH"
+    elif coverage_pct >= 70: quality_label = "MODERATE"
+    elif coverage_pct >= 50: quality_label = "LOW"
+    else:                    quality_label = "INSUFFICIENT"
+
+    data_quality = {
+        "level":              quality_label,
+        "fresh":              bool(fresh_insts),
+        "coverage_percent":   coverage_pct,
+        "available_count":    len(available_insts),
+        "fresh_count":        len(fresh_insts),
+        "missing_inputs":     missing_insts,
+        "stale_inputs":       stale_insts,
+        "unavailable_symbols": UNAVAILABLE_SYMBOLS,
+    }
+
+    # ── 3. News context (from existing ForexFactory feed) ─────────────────────
+    try:
+        nf = get_news_filter()
+    except Exception:
+        nf = {}
+
+    news_category  = "NONE"
+    news_direction = "NEUTRAL"
+    news_headline  = None
+    news_minutes   = None
+    news_status    = "CLEAR"
+
+    if nf.get("available"):
+        candidates = [
+            ev for ev in (nf.get("upcoming") or [])
+            if isinstance(ev.get("minutes_until"), (int, float))
+            and -15 <= ev["minutes_until"] <= 60
+        ]
+        if candidates:
+            ev = candidates[0]
+            news_category, news_direction = _me_classify_news_event(
+                ev.get("title", ""))
+            news_headline = ev.get("title")
+            news_minutes  = ev.get("minutes_until")
+            news_status   = ("ACTIVE" if (ev.get("minutes_until") or 60) <= 0
+                             else "UPCOMING")
+        elif nf.get("within_window"):
+            news_status = "ACTIVE"
+
+    news_context = {
+        "status":        news_status,
+        "category":      news_category,
+        "direction":     news_direction,
+        "headline":      news_headline,
+        "minutes_until": (int(round(news_minutes))
+                          if news_minutes is not None else None),
+        "expires_at":    None,
+    }
+
+    # ── 4. Signal counts ──────────────────────────────────────────────────────
+    equity_above = sum(1 for i in EQUITY_INSTS if obs[i]["above_vwap"] is True)
+    equity_below = sum(1 for i in EQUITY_INSTS if obs[i]["above_vwap"] is False)
+    gold_above   = obs["MGC"]["above_vwap"] is True
+    gold_below   = obs["MGC"]["above_vwap"] is False
+    eq_cvd_bull  = sum(1 for i in EQUITY_INSTS if obs[i]["cvd_state"] == "bullish")
+    eq_cvd_bear  = sum(1 for i in EQUITY_INSTS if obs[i]["cvd_state"] == "bearish")
+    gold_cvd_bull = obs["MGC"]["cvd_state"] == "bullish"
+
+    # ── 5. Regime classification (minimum 3 confirmations for RISK_ON/RISK_OFF)
+    risk_on_confirms  = []
+    risk_off_confirms = []
+    geo_market_confirms = []
+
+    for i in EQUITY_INSTS:
+        if obs[i]["above_vwap"] is True:
+            risk_on_confirms.append(f"{i} above VWAP")
+        elif obs[i]["above_vwap"] is False:
+            risk_off_confirms.append(f"{i} below VWAP")
+    if eq_cvd_bull >= 2:
+        risk_on_confirms.append(
+            f"CVD bullish on {eq_cvd_bull} equity instrument(s)")
+    if gold_above:
+        risk_off_confirms.append("MGC (Gold) above VWAP — safe-haven demand")
+    if eq_cvd_bear >= 2:
+        risk_off_confirms.append(
+            f"CVD bearish on {eq_cvd_bear} equity instrument(s)")
+    if gold_cvd_bull:
+        risk_off_confirms.append("MGC CVD bullish — gold demand confirmed")
+    if gold_above:
+        geo_market_confirms.append("Gold strengthening")
+    if equity_below >= 2:
+        geo_market_confirms.append("Equity markets weakening")
+    if eq_cvd_bear >= 1:
+        geo_market_confirms.append("Bearish equity CVD")
+
+    if quality_label == "INSUFFICIENT":
+        regime     = "UNKNOWN"
+        risk_state = "UNKNOWN"
+    elif len(risk_on_confirms) >= 3:
+        regime     = "RISK_ON"
+        risk_state = "AGGRESSIVE" if eq_cvd_bull >= 2 else "BALANCED"
+    elif (news_category == "GEOPOLITICAL_ESCALATION"
+          and len(geo_market_confirms) >= 2):
+        # GEOPOLITICAL requires active news + at least 2 market confirmations.
+        # Checked before generic RISK_OFF so that geo news + equity weakness +
+        # gold strength classifies as GEOPOLITICAL rather than plain RISK_OFF.
+        regime     = "GEOPOLITICAL"
+        risk_state = "SHOCK"
+    elif len(risk_off_confirms) >= 3:
+        regime     = "RISK_OFF"
+        risk_state = "DEFENSIVE"
+    elif risk_on_confirms and risk_off_confirms:
+        regime     = "MIXED"
+        risk_state = "BALANCED"
+    elif risk_on_confirms or risk_off_confirms:
+        regime     = "NEUTRAL"
+        risk_state = "BALANCED"
+    else:
+        regime     = "NEUTRAL"
+        risk_state = "BALANCED"
+
+    # ── 6. Regime confidence ──────────────────────────────────────────────────
+    if regime == "UNKNOWN":
+        confidence = 0
+    elif regime == "RISK_ON":
+        base = int(len(risk_on_confirms) / 4 * 75)
+        if news_direction == "RISK_ON": base = min(95, base + 10)
+        confidence = min(100, max(25, base))
+    elif regime == "RISK_OFF":
+        base = int(len(risk_off_confirms) / 5 * 75)
+        if news_direction == "RISK_OFF": base = min(95, base + 10)
+        confidence = min(100, max(25, base))
+    elif regime == "GEOPOLITICAL":
+        confidence = min(85, 50 + len(geo_market_confirms) * 10)
+    elif regime == "MIXED":
+        confidence = 35
+    else:
+        confidence = 30
+
+    # ── 7. Dominant theme ─────────────────────────────────────────────────────
+    if regime == "RISK_ON":
+        if obs["MNQ"]["above_vwap"] and equity_above == 3 and gold_below:
+            dominant_theme = "TECHNOLOGY_STRENGTH"
+        else:
+            dominant_theme = "BROAD_MARKET_STRENGTH"
+    elif regime == "RISK_OFF":
+        dominant_theme = "SAFE_HAVEN_DEMAND" if gold_above else "DEFENSIVE_ROTATION"
+    elif regime == "GEOPOLITICAL":
+        dominant_theme = "GEOPOLITICAL_ESCALATION"
+    elif regime == "MIXED":
+        dominant_theme = "MIXED"
+    elif regime == "NEUTRAL":
+        if   news_category == "CENTRAL_BANK":
+            dominant_theme = "FED_POLICY"
+        elif news_category == "INFLATION":
+            dominant_theme = "RATE_SENSITIVITY"
+        elif news_category in ("EMPLOYMENT", "ECONOMIC_GROWTH"):
+            dominant_theme = "ECONOMIC_DATA"
+        else:
+            dominant_theme = "NONE"
+    else:
+        dominant_theme = "UNKNOWN"
+
+    secondary_theme = "NONE"
+    if regime == "RISK_ON" and dominant_theme != "TECHNOLOGY_STRENGTH" and obs["MNQ"]["above_vwap"]:
+        secondary_theme = "TECHNOLOGY_STRENGTH"
+    elif regime == "RISK_OFF" and dominant_theme != "SAFE_HAVEN_DEMAND" and gold_above:
+        secondary_theme = "SAFE_HAVEN_DEMAND"
+    elif news_category == "CENTRAL_BANK" and dominant_theme != "FED_POLICY":
+        secondary_theme = "FED_POLICY"
+    elif news_category == "INFLATION" and dominant_theme != "RATE_SENSITIVITY":
+        secondary_theme = "RATE_SENSITIVITY"
+    elif (news_category in ("EMPLOYMENT", "ECONOMIC_GROWTH")
+          and dominant_theme != "ECONOMIC_DATA"):
+        secondary_theme = "ECONOMIC_DATA"
+
+    # ── 8. Supporting / conflicting evidence ──────────────────────────────────
+    if regime == "RISK_ON":
+        supporting_evidence  = list(risk_on_confirms)
+        conflicting_evidence = []
+        if gold_above:
+            conflicting_evidence.append(
+                "Gold above VWAP — some safe-haven demand persists")
+        conflicting_evidence += [
+            f"{i} below VWAP" for i in EQUITY_INSTS
+            if obs[i]["above_vwap"] is False]
+        if eq_cvd_bear:
+            conflicting_evidence.append(
+                f"CVD bearish on {eq_cvd_bear} instrument(s)")
+    elif regime in ("RISK_OFF", "GEOPOLITICAL"):
+        supporting_evidence  = list(risk_off_confirms)
+        if regime == "GEOPOLITICAL":
+            supporting_evidence += geo_market_confirms
+        conflicting_evidence = [
+            f"{i} above VWAP" for i in EQUITY_INSTS
+            if obs[i]["above_vwap"] is True]
+        if gold_below:
+            conflicting_evidence.append(
+                "Gold below VWAP — limited safe-haven confirmation")
+    else:
+        supporting_evidence  = risk_on_confirms[:2] + risk_off_confirms[:2]
+        conflicting_evidence = []
+
+    if news_headline and news_category not in ("NONE", "OTHER"):
+        headline_short = news_headline[:60]
+        if news_direction in (regime,
+                              "RISK_ON"  if regime == "RISK_ON"  else None,
+                              "RISK_OFF" if regime == "RISK_OFF" else None):
+            supporting_evidence.append(
+                f"News ({news_category}): {headline_short}")
+        elif news_direction not in ("NEUTRAL", "MIXED"):
+            conflicting_evidence.append(
+                f"News ({news_category}): {headline_short}")
+
+    # ── 9. Sector rotation ────────────────────────────────────────────────────
+    sector_rotation = [
+        {"sector": "Technology",
+         "proxy": "MNQ", "state": _me_sector_state(obs["MNQ"]),
+         "note": "Proxied by MNQ; XLK/QQQ unavailable"},
+        {"sector": "Broad Market",
+         "proxy": "MES", "state": _me_sector_state(obs["MES"]),
+         "note": "Proxied by MES; SPY unavailable"},
+        {"sector": "Industrials",
+         "proxy": "MYM", "state": _me_sector_state(obs["MYM"]),
+         "note": "Proxied by MYM; XLI/DIA unavailable"},
+        {"sector": "Safe Haven",
+         "proxy": "MGC", "state": _me_sector_state(obs["MGC"]),
+         "note": "Proxied by MGC; GLD unavailable"},
+        {"sector": "Energy",             "proxy": None,
+         "state": "UNAVAILABLE", "note": "XLE/CL not in system"},
+        {"sector": "Financials",         "proxy": None,
+         "state": "UNAVAILABLE", "note": "XLF not in system"},
+        {"sector": "Defense & Aerospace","proxy": None,
+         "state": "UNAVAILABLE", "note": "ITA/XAR not in system"},
+        {"sector": "Utilities",          "proxy": None,
+         "state": "UNAVAILABLE", "note": "XLU not in system"},
+        {"sector": "Consumer Staples",   "proxy": None,
+         "state": "UNAVAILABLE", "note": "XLP not in system"},
+        {"sector": "Consumer Discretionary","proxy": None,
+         "state": "UNAVAILABLE", "note": "XLY not in system"},
+        {"sector": "Healthcare",         "proxy": None,
+         "state": "UNAVAILABLE", "note": "XLV not in system"},
+    ]
+
+    # ── 10. Futures preferences ───────────────────────────────────────────────
+    futures_preferences = [
+        _me_futures_preference("MGC", obs["MGC"], regime,
+                               news_category, news_direction),
+        _me_futures_preference("MNQ", obs["MNQ"], regime,
+                               news_category, news_direction),
+        _me_futures_preference("MES", obs["MES"], regime,
+                               news_category, news_direction),
+        _me_futures_preference("MYM", obs["MYM"], regime,
+                               news_category, news_direction),
+    ]
+
+    # ── 11. Assemble snapshot ─────────────────────────────────────────────────
+    snapshot = {
+        "regime":               regime,
+        "confidence":           confidence,
+        "dominant_theme":       dominant_theme,
+        "secondary_theme":      secondary_theme,
+        "risk_state":           risk_state,
+        "sector_rotation":      sector_rotation,
+        "futures_preferences":  futures_preferences,
+        "supporting_evidence":  supporting_evidence,
+        "conflicting_evidence": conflicting_evidence,
+        "news_context":         news_context,
+        "data_quality":         data_quality,
+        "observations":         {inst: obs[inst] for inst in ALL_INSTS},
+        "shadow_mode":          True,
+        "available":            True,
+        "updated_at":           datetime.now(timezone.utc).isoformat(),
+        # Influence flags — hardcoded False; present in output for auditability
+        "_can_affect_confidence": False,
+        "_can_affect_risk":       False,
+        "_can_pause_entries":     False,
+        "_can_affect_verdicts":   False,
+    }
+
+    # ── 12. Shadow logging (throttled; logs on regime/theme/quality change) ───
+    now_ts = time.time()
+    prev   = _ME_LAST_SNAPSHOT
+    should_log = (
+        prev is None
+        or (now_ts - _ME_LAST_LOG_TS) >= _ME_LOG_INTERVAL
+        or snapshot["regime"]         != (prev or {}).get("regime")
+        or snapshot["dominant_theme"] != (prev or {}).get("dominant_theme")
+        or quality_label != (prev or {}).get("data_quality", {}).get("level")
+    )
+    with _ME_LOCK:
+        _ME_LAST_SNAPSHOT = snapshot
+        if should_log:
+            _ME_LAST_LOG_TS = now_ts
+
+    if should_log:
+        leaders  = [s["sector"] for s in sector_rotation
+                    if s["state"] in ("STRONG_LEADER", "LEADER")]
+        laggards = [s["sector"] for s in sector_rotation
+                    if s["state"] in ("LAGGING", "STRONG_LAGGARD")]
+        prefs_s  = ", ".join(
+            f"{p['symbol']}:{p['preference']}" for p in futures_preferences)
+        logger.info(
+            f"[MktEnv shadow] regime={regime} conf={confidence}% "
+            f"theme={dominant_theme} risk={risk_state} "
+            f"quality={quality_label} cov={coverage_pct}% "
+            f"leaders={leaders} laggards={laggards} "
+            f"prefs=[{prefs_s}] news={news_category}"
+        )
+
+    return snapshot
 
 
 # ── Analyst Reasoning Engine (professional-analyst layer) ─────────────────────
@@ -38072,6 +38705,13 @@ def _build_status_payload(_tk):
              for inst in HIGH_VOLUME_SESSIONS}
             if HIGH_VOLUME_PANEL_ENABLED else None
         ),
+        # ── Market Environment Snapshot (Phase 1A, read-only shadow mode) ─────
+        # Fail-open: if compute_market_environment() raises, the rest of the
+        # status payload is completely unaffected.
+        "market_environment": (
+            compute_market_environment()
+            if MARKET_ENVIRONMENT_ENABLED else None
+        ),
     }
 
 
@@ -44202,6 +44842,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
     <button class="adc-tab" data-tab="confidence" onclick="adcSetTab('confidence')">Confidence</button>
     <button class="adc-tab" data-tab="memory" onclick="adcSetTab('memory')">Memory</button>
     <button class="adc-tab" data-tab="microscalp" onclick="adcSetTab('microscalp')">Micro Scalp</button>
+    <button class="adc-tab" data-tab="mktenv" onclick="adcSetTab('mktenv')">Market Env</button>
   </div>
   <!-- Tab panels (toggled by adcSetTab) -->
   <div id="adc-panel-decision" class="adc-panel active"><div id="adc-d-content"></div></div>
@@ -44221,6 +44862,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   </div>
   <div id="adc-panel-memory" class="adc-panel"><div id="adc-tm-content"></div></div>
   <div id="adc-panel-microscalp" class="adc-panel"><div id="adc-ms-content"></div></div>
+  <div id="adc-panel-mktenv" class="adc-panel"><div id="adc-me-content"></div></div>
 </div>
 
 <!-- ── Phase 3: Analysis Groups — primary Analysis section view (DISPLAY-ONLY).
@@ -46219,6 +46861,7 @@ function renderModules(d){
   try{ renderStalkMode(d); }catch(e){}
   try{ renderActiveThinking(d); }catch(e){}
   try{ hvsUpdateFromStatus(d); }catch(e){}
+  try{ renderMarketEnv(d); }catch(e){}
   const diag   = d.alert_diagnostics || {};
   const v      = d.verdict || 'WAIT';
   const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
@@ -51276,6 +51919,118 @@ function hvsRender() {
     h += '</div>';
   });
   body.innerHTML = h;
+}
+function renderMarketEnv(d) {
+  var el = document.getElementById('adc-me-content');
+  if (!el) return;
+  var me = d && d.market_environment;
+  if (!me || !me.available) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:11px;padding:6px 0">'
+      + (me && me.error ? 'Market Env error: ' + aiEsc(me.error) : 'Market Environment unavailable') + '</div>';
+    return;
+  }
+  function regCol(r) {
+    if (r==='RISK_ON') return '#22c55e';
+    if (r==='RISK_OFF') return '#ef4444';
+    if (r==='GEOPOLITICAL') return '#f97316';
+    if (r==='MIXED') return '#f59e0b';
+    if (r==='NEUTRAL') return '#9aa';
+    return '#6b7280';
+  }
+  function prefCol(p) {
+    if (p==='STRONGLY_FAVORED')   return '#22c55e';
+    if (p==='FAVORED')            return '#86efac';
+    if (p==='NEUTRAL')            return '#9aa';
+    if (p==='DISFAVORED')         return '#fca5a5';
+    if (p==='STRONGLY_DISFAVORED') return '#ef4444';
+    return '#6b7280';
+  }
+  function qCol(l) {
+    if (l==='HIGH')     return '#22c55e';
+    if (l==='MODERATE') return '#86efac';
+    if (l==='LOW')      return '#f59e0b';
+    return '#ef4444';
+  }
+  var dq = me.data_quality || {};
+  var nc = me.news_context || {};
+  var h = '';
+  h += '<div style="font-size:10px;color:#f59e0b;font-weight:700;letter-spacing:.05em;margin-bottom:6px">&#127758; MARKET ENVIRONMENT &mdash; SHADOW MODE</div>';
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">';
+  h += '<div style="flex:1;min-width:90px">';
+  h += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px">REGIME</div>';
+  h += '<div style="font-size:14px;font-weight:700;color:' + regCol(me.regime) + '">' + aiEsc(me.regime) + '</div>';
+  if (me.confidence > 0) { h += '<div style="font-size:10px;color:var(--muted)">' + me.confidence + '% confidence</div>'; }
+  h += '</div>';
+  h += '<div style="flex:1;min-width:80px">';
+  h += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px">RISK STATE</div>';
+  h += '<div style="font-size:11px;font-weight:600;color:var(--fg)">' + aiEsc(me.risk_state) + '</div>';
+  h += '</div>';
+  h += '<div style="flex:1;min-width:80px">';
+  h += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px">DATA QUALITY</div>';
+  h += '<div style="font-size:10px;font-weight:600;color:' + qCol(dq.level) + '">' + aiEsc(dq.level||'UNKNOWN') + '</div>';
+  h += '<div style="font-size:9px;color:var(--muted)">' + (dq.coverage_percent||0) + '% fresh</div>';
+  h += '</div>';
+  h += '</div>';
+  if (me.dominant_theme && me.dominant_theme !== 'NONE' && me.dominant_theme !== 'UNKNOWN') {
+    h += '<div style="margin-bottom:6px"><span style="font-size:9px;color:var(--muted)">THEME: </span>';
+    h += '<span style="font-size:10px;color:var(--fg)">' + aiEsc(me.dominant_theme.replace(/_/g,' ')) + '</span>';
+    if (me.secondary_theme && me.secondary_theme !== 'NONE') {
+      h += ' <span style="font-size:9px;color:var(--muted)">/ ' + aiEsc(me.secondary_theme.replace(/_/g,' ')) + '</span>';
+    }
+    h += '</div>';
+  }
+  var prefs = me.futures_preferences || [];
+  if (prefs.length) {
+    h += '<div style="margin-bottom:8px">';
+    h += '<div style="font-size:9px;color:var(--muted);margin-bottom:3px">OBSERVED PREFERENCES</div>';
+    h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:3px">';
+    prefs.forEach(function(p) {
+      h += '<div style="font-size:10px"><span style="color:var(--muted)">' + aiEsc(p.symbol) + ': </span>';
+      h += '<span style="color:' + prefCol(p.preference) + ';font-weight:600">' + aiEsc((p.preference||'').replace(/_/g,' ')) + '</span></div>';
+    });
+    h += '</div></div>';
+  }
+  var sects = me.sector_rotation || [];
+  var leaders  = sects.filter(function(s){ return s.state==='STRONG_LEADER'||s.state==='LEADER'; });
+  var laggards = sects.filter(function(s){ return s.state==='LAGGING'||s.state==='STRONG_LAGGARD'; });
+  if (leaders.length||laggards.length) {
+    h += '<div style="margin-bottom:6px;font-size:10px">';
+    if (leaders.length) {
+      h += '<span style="color:var(--muted)">Leading: </span>';
+      h += '<span style="color:#22c55e">' + leaders.map(function(s){ return aiEsc(s.sector); }).join(', ') + '</span>';
+    }
+    if (leaders.length && laggards.length) h += ' &bull; ';
+    if (laggards.length) {
+      h += '<span style="color:var(--muted)">Lagging: </span>';
+      h += '<span style="color:#ef4444">' + laggards.map(function(s){ return aiEsc(s.sector); }).join(', ') + '</span>';
+    }
+    h += '</div>';
+  }
+  if (nc.status !== 'CLEAR' && nc.headline) {
+    h += '<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:4px;padding:4px 6px;margin-bottom:6px;font-size:10px">';
+    h += '<span style="color:#f59e0b;font-weight:600">' + aiEsc((nc.category||'').replace(/_/g,' ')) + '</span>';
+    if (nc.minutes_until !== null && nc.minutes_until !== undefined) {
+      h += nc.minutes_until <= 0 ? ' <span style="color:#ef4444">(NOW)</span>' : ' <span style="color:var(--muted)">in ' + nc.minutes_until + 'm</span>';
+    }
+    h += '<div style="color:var(--fg);margin-top:2px">' + aiEsc(nc.headline) + '</div></div>';
+  }
+  var sup = me.supporting_evidence || [];
+  var con = me.conflicting_evidence || [];
+  if (sup.length||con.length) {
+    h += '<details style="margin-bottom:6px"><summary style="font-size:9px;color:var(--muted);cursor:pointer">Evidence (' + (sup.length+con.length) + ')</summary>';
+    h += '<div style="margin-top:4px;font-size:10px">';
+    sup.slice(0,4).forEach(function(e){ h += '<div style="color:#22c55e">&#10003; ' + aiEsc(e) + '</div>'; });
+    con.slice(0,4).forEach(function(e){ h += '<div style="color:#ef4444">&#10007; ' + aiEsc(e) + '</div>'; });
+    h += '</div></details>';
+  }
+  h += '<div style="border-top:1px solid var(--border);padding-top:4px;margin-top:2px;font-size:9px;color:var(--muted)">';
+  h += '<div style="color:#f59e0b">&#9888; Shadow mode &mdash; not affecting trades</div>';
+  if (dq.unavailable_symbols && dq.unavailable_symbols.length) {
+    h += '<div style="margin-top:2px">No data for: ' + aiEsc(dq.unavailable_symbols.slice(0,8).join(', ')) + (dq.unavailable_symbols.length>8?'...':'') + '</div>';
+  }
+  if (me.updated_at) { h += '<div>Updated: ' + aiEsc(me.updated_at.substring(0,19).replace('T',' ')) + ' UTC</div>'; }
+  h += '</div>';
+  el.innerHTML = h;
 }
 function hvsUpdateFromStatus(d) {
   if (!d) return;
