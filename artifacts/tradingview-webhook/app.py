@@ -48554,6 +48554,8 @@ function renderModules(d){
       }
     }
   }
+  // Avatar Intelligence Engine — observe new data every poll tick
+  try{ mbAvatarObserve(d); }catch(e){ console.warn('[Avatar] observe error', e && e.message ? e.message.slice(0,60) : String(e).slice(0,40)); }
 }
 
 // Analyst Mode — professional-analyst reasoning over the EXISTING signals
@@ -48701,8 +48703,186 @@ function mbTtsToggle(){
   if(vt){ vt.textContent = _ttsMuted ? '\u266b Voice' : '\u266b Live'; vt.className = 'mb-sess-btn' + (_ttsMuted ? '' : ' active'); }
   if(_ttsMuted && 'speechSynthesis' in window){ window.speechSynthesis.cancel(); _stopSpeakAnim(); var ss=document.getElementById('mb-stop-speak'); if(ss) ss.style.display='none'; }
 }
-function mbSpeak(text){ /* voice is owned by the cockpit avatar — no-op here */ }
+// Ambient narration — speaks the caption text when TTS is on and it materially
+// changed, with a 45s cooldown so the same narration is not repeated every poll.
+// Only fires when no proactive/chat speech is already playing.
+var _mbSpeakLast = '', _mbSpeakTime = 0;
+function mbSpeak(text){
+  if(!text || _ttsMuted || !('speechSynthesis' in window)) return;
+  if(text === _mbSpeakLast) return;
+  if(Date.now() - _mbSpeakTime < 45000) return;
+  if(window.speechSynthesis.speaking) return;
+  _mbSpeakLast = text; _mbSpeakTime = Date.now();
+  mbSpeakAnswer(text);
+}
 if('speechSynthesis' in window){ try{ window.speechSynthesis.getVoices(); }catch(ignore){} }
+
+// ══════════════════════════════════════════════════════════════════════════
+// AVATAR INTELLIGENCE ENGINE v1 — Proactive AI Trading Partner (DISPLAY-ONLY)
+// Watches existing /status production data on every poll tick. Generates
+// context-aware proactive announcements for significant events. Zero new
+// API calls — reuses the same data that already drives the dashboard.
+// Failures silently caught and NEVER interrupt trading or alert routing.
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── Internal state ────────────────────────────────────────────────────────
+var _avPrev      = null;   // previous poll snapshot for delta detection
+var _avQueue     = [];     // pending proactive speech items
+var _avQTimer    = null;   // queue flush timer handle
+var _avCooldowns = {};     // {type: lastFiredTimestamp} for spam prevention
+var _avGreetDone = false;  // true after the first greeting check this page load
+
+// Per-event minimum gap (ms) before the same event type can fire again
+var _AV_CD = {
+  greeting:       86400000,   // once per day (localStorage-gated)
+  ready:             60000,   // at most once per minute
+  verdict_change:    20000,   // at most every 20 seconds
+  trade_opened:      30000,
+  trade_closed:      30000,
+};
+var _AV_GAP = 5000;  // minimum gap between consecutive announcements
+
+// ── Core helpers ──────────────────────────────────────────────────────────
+function _avExtract(d){
+  var mb  = (d && d.main_brain)       || {};
+  var mbv = (d && d.main_brain_voice) || {};
+  return {
+    sk:          mbDeriveState(mb),
+    verdict:     (d && d.verdict)    || '',
+    edge:        (d && d.edge_score) || 0,
+    confidence:  (d && d.confidence) || 0,
+    opened_at:   (d && d.active_trade && d.active_trade.opened_at) || null,
+    has_trade:   !!(d && d.active_trade && d.active_trade.direction),
+    inst:        (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '',
+    market_open: (d && d.market_open !== false),
+    narration:   (mb.unified && mb.unified.narrative) || mbv.narration || '',
+  };
+}
+function _avCoolOk(type){ return (Date.now() - (_avCooldowns[type]||0)) >= (_AV_CD[type]||30000); }
+function _avMarkCool(type){ _avCooldowns[type] = Date.now(); }
+
+function mbAvatarEnqueue(type, text, priority){
+  if(!text || !_avCoolOk(type)) return;
+  _avMarkCool(type);
+  if(priority) _avQueue.unshift({type:type, text:text});
+  else          _avQueue.push({type:type, text:text});
+  if(!_avQTimer) _avQTimer = setTimeout(_avDequeue, 900);
+}
+function _avDequeue(){
+  _avQTimer = null;
+  if(!_avQueue.length) return;
+  if('speechSynthesis' in window && window.speechSynthesis.speaking){
+    _avQTimer = setTimeout(_avDequeue, 2000); return;
+  }
+  var item = _avQueue.shift();
+  _avSayProactive(item.text);
+  if(_avQueue.length) _avQTimer = setTimeout(_avDequeue, _AV_GAP + 500);
+}
+function _avSayProactive(text){
+  if(!text) return;
+  // Update caption panel so non-audio users can read the announcement
+  try{
+    var el = document.getElementById('mb-caption');
+    if(el){ el.textContent = text.length > 118 ? text.slice(0,117) + '\u2026' : text; _captionLast = el.textContent; }
+  }catch(e){}
+  if(!_ttsMuted) mbSpeakAnswer(text);
+  console.log('[Avatar] proactive: ' + text.slice(0,60));
+}
+
+// ── Proactive text generators (deterministic — no AI calls) ───────────────
+function _avGreetText(snap){
+  var h = new Date().getHours();
+  var g = h < 12 ? 'Good morning.' : h < 17 ? 'Good afternoon.' : 'Good evening.';
+  var i = snap.inst || 'the market';
+  if(!snap.market_open) return g + ' Markets are closed. I\u2019ll be here when they reopen.';
+  var vk = (snap.verdict || '').toUpperCase();
+  if(vk.indexOf('READY') >= 0) return g + ' ' + i + ' already has a live setup. Review it below.';
+  if(snap.has_trade)            return g + ' There\u2019s an active position open on ' + i + '. I\u2019m watching it.';
+  return g + ' Nothing actionable yet on ' + i + '. I\u2019ll let you know when that changes.';
+}
+function _avReadyText(snap){
+  var vk  = (snap.verdict || '').toUpperCase();
+  var dir = vk.indexOf('LONG') >= 0 ? 'LONG' : vk.indexOf('SHORT') >= 0 ? 'SHORT' : '';
+  var i   = snap.inst || 'the market';
+  var s   = dir ? ('We now have a ' + dir + ' READY setup on ' + i + '.')
+                : ('Setup is READY on ' + i + '.');
+  if(snap.edge) s += ' Edge score is at ' + snap.edge + '.';
+  return s;
+}
+function _avVerdictChangeText(snap){
+  var i = snap.inst || 'the market';
+  if(snap.sk === 'HUNTING')  return i + ' is building toward a setup. Structure is forming.';
+  if(snap.sk === 'MANAGING') return 'Trade is open on ' + i + '. I\u2019m watching the position.';
+  if(snap.sk === 'WAITING')  return i + ' is waiting. I\u2019ll notify you when something changes.';
+  if(snap.sk === 'BLOCKED')  return 'Setup invalidated on ' + i + '. Resetting the read.';
+  return null;
+}
+
+// ── Daily greeting (once per ET calendar day via localStorage gate) ────────
+function _avCheckGreeting(snap){
+  if(_avGreetDone) return;
+  _avGreetDone = true;
+  var today;
+  try{ today = new Date(Date.now() - 300 * 60000).toISOString().slice(0,10); }
+  catch(e){ today = new Date().toISOString().slice(0,10); }
+  var stored = '';
+  try{ stored = localStorage.getItem('mbGreetDate') || ''; }catch(e){}
+  if(stored === today) return;
+  try{ localStorage.setItem('mbGreetDate', today); }catch(e){}
+  var text = _avGreetText(snap);
+  setTimeout(function(){ mbAvatarEnqueue('greeting', text, true); }, 2500);
+}
+
+// ── Main observe function — called every poll tick from renderModules(d) ──
+function mbAvatarObserve(d){
+  var snap = _avExtract(d);
+  _avCheckGreeting(snap);
+  var prev = _avPrev;
+  _avPrev  = snap;
+  if(!prev) return;  // first tick: establish baseline silently
+  // Trade opened (new opened_at that didn\u2019t exist before)
+  if(snap.has_trade && snap.opened_at && snap.opened_at !== prev.opened_at){
+    mbAvatarEnqueue('trade_opened',
+      'We are now in a live trade on ' + snap.inst + '. Stop and targets are set.', true);
+    return;
+  }
+  // Trade closed (had a trade last tick, gone now)
+  if(prev.has_trade && !snap.has_trade){
+    mbAvatarEnqueue('trade_closed',
+      'The trade has closed. I\u2019ll keep watching for the next setup.');
+    return;
+  }
+  if(snap.has_trade) return;  // avoid distracting while a trade is open
+  // Setup became READY
+  if(snap.sk === 'READY' && prev.sk !== 'READY'){
+    mbAvatarEnqueue('ready', _avReadyText(snap), true);
+    return;
+  }
+  // General state or verdict change (excluding READY — handled above)
+  if(snap.sk !== prev.sk || snap.verdict !== prev.verdict){
+    var txt = _avVerdictChangeText(snap);
+    if(txt) mbAvatarEnqueue('verdict_change', txt);
+  }
+}
+
+// ── Voice interrupt — stop speech when user starts typing ─────────────────
+(function(){
+  var inp = document.getElementById('mb-chat-input');
+  if(inp) inp.addEventListener('keydown', function(){
+    if('speechSynthesis' in window && window.speechSynthesis.speaking) mbStopSpeaking();
+  }, {passive:true});
+})();
+
+// ── Memory Placeholder — future trading memory interface (stubs only) ─────
+// Defines the interface for a future phase that will surface historical trade
+// patterns. NOT implemented in Phase 1. NEVER wire to gate, sizing, execution,
+// broker path, or any production decision.
+var mbMemory = {
+  findSimilar:   function(params)   { return Promise.resolve([]); },
+  strategyStats: function(strategy) { return Promise.resolve(null); },
+  recordOutcome: function(trade)    { return Promise.resolve(); },
+  recentSummary: function()         { return Promise.resolve({available:false}); },
+};
 
 // Avatar state → orb animation class mapping. DISPLAY-ONLY; never touches gate/scoring.
 const ORB_STATE_CLASSES = ['orb-obs','orb-wait','orb-hunt','orb-ready','orb-manage','orb-defend','orb-block'];
@@ -58199,6 +58379,14 @@ def _assistant_answer(data):
     if len(question) > 2000:
         question = question[:2000]
 
+    # Detect "explain simply" / beginner mode requests
+    _q_lower = question.lower()
+    _explain_simple = any(phrase in _q_lower for phrase in (
+        "explain simply", "explain like i", "what does that mean",
+        "for a beginner", "simpler", "simple terms", "in plain english",
+        "i don't understand", "i dont understand", "dumb it down",
+    ))
+
     raw_tk = data.get("ticker")
     tk = _instrument_from_text(raw_tk.upper()) if isinstance(raw_tk, str) else None
 
@@ -58294,6 +58482,13 @@ def _assistant_answer(data):
         "- If no position is open, say so simply. If one is open, give the key numbers concisely.\n"
         "- Read-only: never imply you placed, modified, or closed a trade."
     )
+    if _explain_simple:
+        system_primer += (
+            "\n\nEXPLAIN SIMPLY MODE: The user asked for a simpler explanation. "
+            "Use plain everyday language. No jargon or field names. "
+            "Explain as if to a new trader who just opened their first chart. "
+            "Stay accurate — just cut the vocabulary. 2-3 plain sentences max."
+        )
 
     _inst_label = (ctx.get("selected") or {}).get("instrument") or "unknown"
     _mode_label = TRADING_MODE

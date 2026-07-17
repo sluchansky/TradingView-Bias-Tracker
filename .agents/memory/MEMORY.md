@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Avatar Intelligence Engine v1](avatar-intelligence-engine.md) — proactive event queue + daily greeting + explain-simply mode + mbMemory placeholder; hook is mbAvatarObserve(d) at end of renderModules.
 - [Decision Pipeline V2](decision-pipeline-v2.md) — shadow 5-stage OBSERVE→INTERPRET→PRIORITIZE→VALIDATE→DECIDE; all CAN_* flags default-OFF; flag-OFF byte-identical; future phases flip flags one-at-a-time.
 - [ME regime vs primary_driver split](me-regime-driver-split.md) — regime=market condition (RISK_ON/OFF/MIXED/NEUTRAL/UNKNOWN); primary_driver=news cause (GEOPOLITICAL_ESCALATION/FED_DRIVEN/…/NONE); risk_state derived from both (SHOCK=RISK_OFF+GEO); _risk_off_like boolean in futures_preference unifies the two.
 - [Trade Failure Analyzer](trade-failure-analyzer.md) — TFA_DB_READY-gated READY→trigger→outcome recorder; 8 functions + /failure-analysis route; goldens byte-identical when DB absent.
