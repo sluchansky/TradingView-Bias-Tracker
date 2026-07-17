@@ -49380,6 +49380,235 @@ var mbMemory = {
   recentSummary: function()         { return Promise.resolve({available:false}); },
 };
 
+// ══════════════════════════════════════════════════════════════════════════════
+// AVATAR PRESENCE LAYER v4 — Expression, Eye Contact, Attention System
+// Pure JS presentation layer. Reads _avPrev (v3) + speechSynthesis state.
+// Adds: smooth lerp transitions, directional gaze, pre-speech attention
+// sequence, natural gaze wander, WIN/LOSS expressions, listening mode API.
+// DISPLAY-ONLY. Zero backend changes. Zero money-path contact. Fail-silent.
+// ══════════════════════════════════════════════════════════════════════════════
+(function _avPresenceV4(){
+
+  // ── Lerp state (current → target, advanced each rAF frame) ───────────────
+  var _ap = {
+    irisTx:0, irisTy:0,   irisTxT:0, irisTyT:0,  // iris direction
+    browLY:43, browRY:43, browLYT:43, browRYT:43, // brow control-point Y
+    mouthY:97, mouthYT:97,                         // mouth control-point Y
+    t:0,                                           // clock for natural float
+  };
+  var _apSpeaking  = false;
+  var _apListening = false;
+  var _apCurState  = 'OBSERVING';
+  var _apJawPhase  = 0;
+  var _apEyeMode   = 'user';
+  var _apRefs      = null;
+  var _apWinTimer  = null;
+  var _apGazeTimer = null;
+
+  // ── SVG element refs — cached on first successful retrieval ───────────────
+  function _apGetRefs(){
+    if(_apRefs) return _apRefs;
+    var browL = document.getElementById('mbBrowL');
+    var browR = document.getElementById('mbBrowR');
+    var mouth = document.getElementById('mbMouth');
+    var iris  = document.getElementById('mbIrisGrp');
+    if(!browL||!browR||!mouth||!iris) return null;
+    // Hand iris positioning entirely to JS; disable the CSS irisFloat/irisHunt
+    iris.style.animation = 'none';
+    _apRefs = {browL:browL, browR:browR, mouth:mouth, iris:iris};
+    return _apRefs;
+  }
+
+  // ── Gaze direction targets ─────────────────────────────────────────────────
+  // Chart is RIGHT of the avatar column; user is front/center-down.
+  var _apGazeMap = {
+    user:   {tx: 0.0, ty: 0.8},   // center + slight down  = facing user
+    chart:  {tx: 2.0, ty:-0.6},   // right + slight up     = chart area
+    widget: {tx: 1.6, ty: 1.4},   // right + down          = dashboard below
+    think:  {tx:-2.2, ty:-0.4},   // left + slight up      = internal
+  };
+
+  function _apSetEye(mode){
+    _apEyeMode = mode;
+    var t = _apGazeMap[mode] || _apGazeMap.user;
+    _ap.irisTxT = t.tx;
+    _ap.irisTyT = t.ty;
+  }
+
+  // ── Parse control-point Y from a SVG quadratic path string ────────────────
+  // Path format is always: M??,?? Q??,?? ??,??
+  // Split on 'Q', take second segment, split on ',', parse second number.
+  function _apParseY(d){
+    try{ var s=d.split('Q')[1]; return parseFloat(s.split(',')[1])||97; }catch(e){ return 97; }
+  }
+
+  // ── Set expression targets from existing _CHAR_BROWS / _CHAR_MOUTHS ───────
+  function _apSetExpr(sk, special){
+    try{
+      var brows  = _CHAR_BROWS[special||sk]  || _CHAR_BROWS.OBSERVING;
+      var mouthD = _CHAR_MOUTHS[special||sk] || _CHAR_MOUTHS.OBSERVING;
+      _ap.browLYT = _apParseY(brows[0]);
+      _ap.browRYT = _apParseY(brows[1]);
+      if(!_apSpeaking) _ap.mouthYT = _apParseY(mouthD);
+    }catch(e){}
+  }
+
+  // Extra presets for trade outcomes (not in the base dictionaries)
+  var _apOutcome = {
+    WIN:  {browLY:43, browRY:43, mouthY:89},  // relaxed brows + genuine smile
+    LOSS: {browLY:44, browRY:44, mouthY:95},  // composed — slight set mouth
+  };
+
+  function _apSetOutcome(name){
+    var s = _apOutcome[name]; if(!s) return;
+    _ap.browLYT = s.browLY;
+    _ap.browRYT = s.browRY;
+    if(!_apSpeaking) _ap.mouthYT = s.mouthY;
+  }
+
+  // ── rAF animation loop ─────────────────────────────────────────────────────
+  function _apTick(){
+    try{
+      requestAnimationFrame(_apTick);
+      var r = _apGetRefs(); if(!r) return;
+
+      // Natural iris float: two overlapping sine waves (replicates irisFloat CSS)
+      _ap.t += 0.005;
+      var tt = _ap.t;
+      var fx = Math.sin(tt*0.72)*1.0 + Math.cos(tt*1.38)*0.45;
+      var fy = Math.cos(tt*0.55)*0.35 + Math.sin(tt*1.15)*0.28;
+
+      // Lerp iris toward directional target
+      _ap.irisTx += (_ap.irisTxT - _ap.irisTx) * 0.032;
+      _ap.irisTy += (_ap.irisTyT - _ap.irisTy) * 0.032;
+      r.iris.style.transform = 'translate(' + (_ap.irisTx+fx).toFixed(2) + 'px,'
+                                            + (_ap.irisTy+fy).toFixed(2) + 'px)';
+
+      // Lerp brows (slow, deliberate — 0.025 factor ≈ 2s to 95%)
+      _ap.browLY += (_ap.browLYT - _ap.browLY) * 0.025;
+      _ap.browRY += (_ap.browRYT - _ap.browRY) * 0.025;
+      r.browL.setAttribute('d','M28,47 Q40,' + _ap.browLY.toFixed(1) + ' 52,47');
+      r.browR.setAttribute('d','M68,47 Q80,' + _ap.browRY.toFixed(1) + ' 92,47');
+
+      // Mouth: jaw oscillation during speech; lerp to expression target otherwise
+      if(_apSpeaking){
+        _apJawPhase += 0.10;
+        _ap.mouthY = 97 + Math.sin(_apJawPhase)*3.0 + Math.sin(_apJawPhase*1.8)*1.2;
+      } else {
+        _ap.mouthY += (_ap.mouthYT - _ap.mouthY) * 0.035;
+      }
+      r.mouth.setAttribute('d','M46,94 Q60,' + _ap.mouthY.toFixed(1) + ' 74,94');
+
+    }catch(e){}
+  }
+
+  // ── Speech monitoring — polls speechSynthesis.speaking every 120ms ─────────
+  setInterval(function(){
+    try{
+      var now = ('speechSynthesis' in window) && window.speechSynthesis.speaking;
+      if(now === _apSpeaking) return;
+      _apSpeaking = now;
+      if(now){
+        _apSetEye('user');             // maintain eye contact while speaking
+      } else {
+        // After speech: restore mouth target, then drift back to chart after 2.2s
+        var def = _CHAR_MOUTHS[_apCurState] || _CHAR_MOUTHS.OBSERVING;
+        _ap.mouthYT = _apParseY(def);
+        setTimeout(function(){ if(!_apSpeaking) _apSetEye('chart'); }, 2200);
+      }
+    }catch(e){}
+  }, 120);
+
+  // ── State sync — reads _avPrev every 2s ───────────────────────────────────
+  var _apPrevSK        = '';
+  var _apPrevHasTrade  = false;
+  var _apPrevTradeR    = null;
+
+  setInterval(function(){
+    try{
+      var snap = _avPrev; if(!snap) return;
+      var sk = snap.sk;
+      _apCurState = sk;
+
+      if(sk !== _apPrevSK){
+        _apPrevSK = sk;
+        _apSetExpr(sk);
+        // Purposeful eye movement on state transitions
+        if(sk === 'READY')    _apSetEye('user');    // eye contact — setup confirmed
+        if(sk === 'HUNTING')  _apSetEye('chart');   // watching market develop
+        if(sk === 'MANAGING') _apSetEye('chart');   // monitoring the trade
+        if(sk === 'BLOCKED')  _apSetEye('think');   // processing / away
+      }
+
+      // WIN/LOSS — detect trade closure
+      var hasTrade = snap.has_trade;
+      var tradeR   = snap.trade_r;
+      if(_apPrevHasTrade && !hasTrade){
+        var won = (_apPrevTradeR !== null && _apPrevTradeR >= 0.8);
+        _apSetOutcome(won ? 'WIN' : 'LOSS');
+        _apSetEye('user');                          // composed direct look after close
+        clearTimeout(_apWinTimer);
+        _apWinTimer = setTimeout(function(){ _apSetExpr(_apCurState); }, 6000);
+      }
+      _apPrevHasTrade = hasTrade;
+      _apPrevTradeR   = tradeR;
+    }catch(e){}
+  }, 2000);
+
+  // ── Natural gaze wander ────────────────────────────────────────────────────
+  // State-aware: HUNTING scans more actively; READY holds user eye contact.
+  function _apWander(){
+    _apGazeTimer = setTimeout(function(){
+      if(!_apSpeaking && !_apListening){
+        var r = Math.random();
+        if(_apCurState === 'HUNTING'){
+          // Active scan — chart vs user, no widgets
+          _apSetEye(r < 0.55 ? 'chart' : 'user');
+        } else if(_apCurState === 'MANAGING'){
+          // Trade active — mostly watching the chart
+          _apSetEye(r < 0.60 ? 'chart' : r < 0.82 ? 'widget' : 'user');
+        } else if(_apCurState === 'READY'){
+          // Setup confirmed — hold eye contact, occasional chart glance
+          _apSetEye(r < 0.72 ? 'user' : 'chart');
+        } else {
+          // Observing / Waiting — relaxed wander
+          _apSetEye(r < 0.38 ? 'chart' : r < 0.60 ? 'widget' : 'user');
+        }
+      }
+      // HUNTING scans faster; other states wander slowly
+      var gap = (_apCurState === 'HUNTING') ? 2000 : 5500;
+      _apGazeTimer = setTimeout(_apWander, gap + Math.floor(Math.random()*2800));
+    }, 1200);
+  }
+
+  // ── Pre-speech attention sequence ─────────────────────────────────────────
+  // Before every proactive statement: think-glance (left) → user eye contact
+  // → speak. Total lead: ~760ms. Feels deliberate, not instant.
+  try{
+    var _apOrigSay = _avSayProactive;
+    _avSayProactive = function(text){
+      _apSetEye('think');
+      setTimeout(function(){
+        _apSetEye('user');
+        setTimeout(function(){ _apOrigSay(text); }, 280);
+      }, 480);
+    };
+  }catch(e){}
+
+  // ── Listening mode API ────────────────────────────────────────────────────
+  // Called by mic integration (when/if added) to engage listening posture.
+  window._apSetListening = function(on){
+    _apListening = !!on;
+    if(on) _apSetEye('user');
+  };
+
+  // ── Boot ──────────────────────────────────────────────────────────────────
+  requestAnimationFrame(_apTick);
+  _apWander();
+  _apSetEye('user');
+
+})();
+
 // Avatar state → orb animation class mapping. DISPLAY-ONLY; never touches gate/scoring.
 const ORB_STATE_CLASSES = ['orb-obs','orb-wait','orb-hunt','orb-ready','orb-manage','orb-defend','orb-block'];
 const ORB_CLASS_MAP = {
