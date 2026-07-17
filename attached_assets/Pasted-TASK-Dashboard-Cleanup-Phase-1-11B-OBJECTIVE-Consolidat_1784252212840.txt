@@ -1,0 +1,658 @@
+TASK: Dashboard Cleanup — Phase 1.11B
+
+OBJECTIVE
+
+Consolidate the long stack of Brain panels into the existing AI Decision Center.
+
+The AI Decision Center must become the primary Brain workspace.
+
+MAKE ONLY THIS CHANGE.
+
+Do not change trading logic.
+Do not change backend calculations.
+Do not change scoring, alerts, webhooks, auto-trading, polling, or saved state.
+Do not redesign Analysis, Journal, Controls, or Overview in this phase.
+
+==================================================
+CURRENT STATE
+==================================================
+
+The top section navigation now works:
+
+- OVERVIEW
+- BRAIN
+- ANALYSIS
+- JOURNAL
+- CONTROLS
+
+The BRAIN section still contains a long stack of separate modules.
+
+The existing AI Decision Center already exists and includes a Confidence tab.
+
+The following standalone Brain panels are candidates for consolidation:
+
+- AI Trade Checklist
+- Micro Scalp Brain
+- Setup Countdown
+- Why Not Ready
+- Unified Analyst Report
+- Analyst Mode
+- Professional Review
+- Entry Quality
+- Trade Debate
+- Strategy Engine
+- Adaptive Learning
+- Performance Report
+- Trade Memory
+
+The removed standalone Confidence Governor must not return.
+
+==================================================
+GOAL
+==================================================
+
+The BRAIN section should show one main panel:
+
+AI DECISION CENTER
+
+The useful information from the standalone Brain panels must be accessible inside the AI Decision Center through its existing tabs or new internal tabs.
+
+Do not create a second decision center.
+
+Do not duplicate data.
+
+Do not delete the source calculations.
+
+==================================================
+AI DECISION CENTER TOP SUMMARY
+==================================================
+
+At the top of the existing AI Decision Center, preserve or create one unified summary containing:
+
+CURRENT DECISION
+- WAIT
+- LONG
+- SHORT
+- MANAGE
+- BLOCKED
+
+MARKET BIAS
+- Bullish
+- Bearish
+- Neutral
+- Mixed
+
+CONFIDENCE
+- 0–100%
+
+ACTIVE STRATEGY
+- current strategy name
+- or “No qualified strategy”
+
+PRIMARY REASON
+- one concise sentence
+
+NEXT TRIGGER
+- the specific event or level required next
+
+INVALIDATION
+- what proves the current setup wrong
+
+Do not create new calculations for these values.
+
+Use the existing authoritative outputs already produced by the dashboard.
+
+==================================================
+INTERNAL TABS
+==================================================
+
+Use the existing AI Decision Center tab system.
+
+Required tabs:
+
+1. DECISION
+2. READINESS
+3. STRATEGY
+4. ENTRY QUALITY
+5. CONFIDENCE
+6. MEMORY
+7. MICRO SCALP
+
+If equivalent tabs already exist, reuse them.
+
+Do not duplicate tabs with slightly different names.
+
+Keep the existing Confidence tab and its current controls intact.
+
+==================================================
+PANEL MIGRATION
+==================================================
+
+Move the useful display content from these standalone modules into the following tabs.
+
+------------------------------------------
+DECISION
+------------------------------------------
+
+Consolidate:
+
+- Unified Analyst Report
+- Analyst Mode
+- Professional Review
+- Trade Debate
+
+Show one final decision first.
+
+Below it, optionally show compact supporting views:
+
+- Analyst view
+- Professional review
+- Debate summary
+
+These must support the final decision rather than appear as competing verdicts.
+
+If internal views disagree, summarize the disagreement clearly.
+
+Example:
+
+CURRENT DECISION: WAIT
+
+CONFLICT:
+Short-term momentum is bearish while higher-timeframe structure remains bullish.
+
+RESOLUTION:
+Wait for directional alignment before entry.
+
+Do not show four unrelated verdict boxes.
+
+------------------------------------------
+READINESS
+------------------------------------------
+
+Consolidate:
+
+- AI Trade Checklist
+- Setup Countdown
+- Why Not Ready
+
+Show:
+
+- Ready / Not Ready
+- completed checklist count
+- missing requirements
+- setup stage
+- estimated trigger condition
+- countdown only when meaningful
+- one “Why not ready” explanation
+
+Do not render a large empty countdown area when no setup is forming.
+
+Preferred empty state:
+
+No qualified setup is currently forming.
+
+------------------------------------------
+STRATEGY
+------------------------------------------
+
+Consolidate:
+
+- Strategy Engine
+
+Show:
+
+- active strategy
+- qualification status
+- strategy confidence
+- matching conditions
+- failed conditions
+- strategy mode
+- instrument
+
+Do not change strategy-selection logic.
+
+------------------------------------------
+ENTRY QUALITY
+------------------------------------------
+
+Consolidate:
+
+- Entry Quality
+
+Show:
+
+- entry grade
+- entry status
+- veto status
+- entry timing
+- location quality
+- confirmation quality
+- concise rejection reason when blocked
+
+Do not change veto behavior.
+
+------------------------------------------
+CONFIDENCE
+------------------------------------------
+
+Keep the existing Confidence tab.
+
+Preserve:
+
+- adc-cg-gate-btn
+- adc-cg-score-btn
+- adc-cg-demote
+- adc-cg-lscore
+
+Also preserve the existing confidence components already displayed there.
+
+Do not restyle or rewrite this tab beyond what is necessary to fit the consolidated Brain layout.
+
+------------------------------------------
+MEMORY
+------------------------------------------
+
+Consolidate:
+
+- Trade Memory
+- relevant historical match information
+- Adaptive Learning summary only when relevant
+
+Show Trade Memory only when:
+
+- a meaningful similar trade exists
+- a learned pattern is relevant
+- a prior outcome helps explain the current decision
+
+Preferred empty state:
+
+No relevant historical match found.
+
+Do not show a large permanent “No matches” card.
+
+Do not move full performance reporting here.
+
+------------------------------------------
+MICRO SCALP
+------------------------------------------
+
+Consolidate:
+
+- Micro Scalp Brain
+
+Preserve its current separation from normal SCALP and SWING logic.
+
+Show:
+
+- enabled / disabled
+- ghost-only / live state
+- selected instrument
+- setup status
+- liquidity sweep status
+- trapped-trader signal
+- target move
+- any arm state
+
+Do not allow this phase to change whether Micro Scalp can place trades.
+
+==================================================
+PANELS THAT SHOULD NOT REMAIN AS STANDALONE BRAIN CARDS
+==================================================
+
+After their useful display content is confirmed inside the AI Decision Center, remove the standalone visible Brain cards for:
+
+- AI Trade Checklist
+- Micro Scalp Brain
+- Setup Countdown
+- Why Not Ready
+- Unified Analyst Report
+- Analyst Mode
+- Professional Review
+- Entry Quality
+- Trade Debate
+- Strategy Engine
+- Trade Memory
+
+Do not delete their backend data producers.
+
+Do not delete shared render helpers that are still needed inside the ADC.
+
+==================================================
+ADAPTIVE LEARNING AND PERFORMANCE REPORT
+==================================================
+
+Do not fully migrate these in this phase:
+
+- Adaptive Learning
+- Performance Report
+
+They belong primarily in JOURNAL.
+
+For Phase 1.11B:
+
+- remove them from the visible BRAIN stack
+- keep their existing data and render logic intact
+- leave them assigned to JOURNAL through the current section registry
+- do not redesign their Journal appearance yet
+
+If they are already correctly routed to JOURNAL, leave them unchanged.
+
+==================================================
+IMPLEMENTATION REQUIREMENTS
+==================================================
+
+1. Reuse existing data objects and render functions.
+
+2. Do not create duplicate API calls.
+
+3. Do not create parallel calculations inside the ADC.
+
+4. Use the current dashboard poll cycle.
+
+5. Keep renderAiDecisionCenter(d) as the main ADC render path.
+
+6. Existing source render functions may be:
+
+- called from renderAiDecisionCenter()
+- adapted to accept a destination container
+- refactored into shared formatting helpers
+
+Do not leave the same renderer updating both a removed standalone panel and the ADC.
+
+7. Preserve all current IDs where possible.
+
+8. When new IDs are required, prefix them consistently with:
+
+adc-
+
+9. Remove standalone panel registration only after the information is verified inside ADC.
+
+10. Remove each migrated panel from:
+
+- BRAIN section registry
+- live navigation registry
+- panel order
+- reset layout defaults
+- panel visibility menu
+- drag-and-drop registration
+
+Do not remove unrelated panels.
+
+11. Missing removed elements must not produce console errors.
+
+12. All old panel renderers must either:
+
+- safely render into the ADC
+- be converted to shared helpers
+- or be removed only when proven dead
+
+==================================================
+ONE AUTHORITATIVE DECISION
+==================================================
+
+The Brain must display one authoritative final decision.
+
+Use the dashboard’s existing final verdict source.
+
+Do not average or invent a new verdict.
+
+Supporting systems may show evidence, but they must not appear as equal competing decisions.
+
+Bad:
+
+Unified Analyst: LONG
+Professional Review: WAIT
+Trade Debate: SHORT
+Strategy Engine: LONG
+
+Preferred:
+
+FINAL DECISION: WAIT
+
+WHY:
+Two systems support LONG, but entry quality and higher-timeframe conflict prevent approval.
+
+NEXT TRIGGER:
+Long approval requires reclaim of VWAP and confirmation above the identified level.
+
+==================================================
+VISIBILITY RULES
+==================================================
+
+Inside the AI Decision Center:
+
+- Do not render blank tab sections.
+- Do not render title-only cards.
+- Do not render “awaiting data” as a large panel.
+- Hide irrelevant detail until useful.
+- Use compact empty states.
+- Do not repeat the same confidence, verdict, bias, or reason in several tabs.
+- Keep the top summary visible regardless of the selected internal tab.
+
+==================================================
+MOBILE REQUIREMENTS
+==================================================
+
+At mobile widths:
+
+- BRAIN should show one AI Decision Center card.
+- Do not show the previous long vertical list of module headers.
+- Internal tabs may scroll horizontally.
+- Keep the selected tab visible.
+- Main decision must be readable without opening a tab.
+- Tab content must use one column.
+- No page-level horizontal overflow.
+- Long reasons must wrap.
+- Controls must not overlap.
+- The Confidence controls must remain touch-friendly.
+- Micro Scalp controls must remain usable.
+
+Test approximately:
+
+390 × 844
+430 × 932
+
+==================================================
+DO NOT CHANGE
+==================================================
+
+Do not modify:
+
+- section navigation behavior from Phase 1.11A
+- localStorage section state
+- Overview layout
+- Analysis layout
+- Journal layout
+- Controls layout
+- backend routes
+- database schema
+- poll interval
+- confidence formulas
+- edge-score formulas
+- learning-gate logic
+- strategy-selection logic
+- checklist logic
+- Micro Scalp trading permissions
+- alerts
+- Discord
+- webhooks
+- broker integration
+- auto-trading
+- journal calculations
+
+Do not begin Phase 1.11C.
+
+==================================================
+ACCEPTANCE TESTS
+==================================================
+
+TEST 1 — Brain layout
+
+Select BRAIN.
+
+Expected:
+
+- one AI Decision Center is visible
+- the old long stack of standalone Brain module cards is gone
+- Adaptive Learning and Performance Report are not shown in BRAIN
+
+TEST 2 — Top summary
+
+Expected:
+
+The ADC top summary shows:
+
+- current decision
+- market bias
+- confidence
+- active strategy
+- primary reason
+- next trigger
+- invalidation
+
+Values must come from existing dashboard data.
+
+TEST 3 — Decision tab
+
+Expected:
+
+- unified final decision appears first
+- analyst/review/debate data remains available in compact supporting form
+- conflicting opinions are summarized, not displayed as unexplained contradictions
+
+TEST 4 — Readiness tab
+
+Expected:
+
+- checklist status appears
+- setup stage appears
+- missing requirements appear
+- Why Not Ready appears as one concise explanation
+- no empty countdown block appears when no setup is forming
+
+TEST 5 — Strategy tab
+
+Expected:
+
+- current strategy and qualification details appear
+- strategy calculations are unchanged
+
+TEST 6 — Entry Quality tab
+
+Expected:
+
+- grade, veto state, and rejection reason appear
+- veto behavior is unchanged
+
+TEST 7 — Confidence tab
+
+Expected:
+
+- adc-cg-gate-btn works
+- adc-cg-score-btn works
+- adc-cg-demote paints correctly
+- adc-cg-lscore paints correctly
+- no removed standalone governor panel returns
+
+TEST 8 — Memory tab
+
+Expected:
+
+- relevant match appears when available
+- compact empty state appears when unavailable
+- no standalone Trade Memory card remains
+
+TEST 9 — Micro Scalp tab
+
+Expected:
+
+- current enable/disable and ghost/live state appear
+- instrument and setup data appear
+- Micro Scalp logic is unchanged
+
+TEST 10 — Removed panel references
+
+Expected:
+
+Migrated standalone panel IDs are no longer active in:
+
+- BRAIN registry
+- panel order
+- reset layout
+- visibility menu
+- drag registration
+
+Shared internal data references may remain.
+
+TEST 11 — Polling
+
+Leave the dashboard open for at least five poll cycles.
+
+Expected:
+
+- all ADC tabs continue receiving current data
+- no stale content
+- no null-reference errors
+- no missing-element warnings
+- no duplicate render errors
+
+TEST 12 — Section switching
+
+Switch between BRAIN and all other top sections.
+
+Expected:
+
+- ADC state remains stable
+- selected ADC tab remains stable if currently persisted
+- no trading or instrument state resets
+
+TEST 13 — Mobile
+
+Expected:
+
+- one ADC card
+- no long Brain panel stack
+- no horizontal page overflow
+- tabs and controls are usable
+- main verdict is visible near the top
+
+TEST 14 — Golden tests
+
+Expected:
+
+- PARITY OK
+- SCALP GOLDEN OK
+- BREAKOUT SMOKE OK
+- DUAL-SIM SMOKE OK
+
+==================================================
+STOP CONDITION
+==================================================
+
+If any candidate standalone panel contains unique controls or behavior that cannot safely be moved into the ADC without changing its logic:
+
+- do not remove that panel
+- report its exact ID and unique behavior
+- migrate the safe display-only panels
+- make no backend rewrite
+- do not fake or duplicate the missing functionality
+
+==================================================
+FINAL RESPONSE REQUIRED
+==================================================
+
+Report:
+
+- exact files changed
+- existing ADC tab system reused
+- complete list of panels consolidated
+- complete list of panels intentionally retained and why
+- registry, layout, reset, visibility, and drag entries removed
+- source renderers reused or refactored
+- confirmation that one authoritative final decision is used
+- confirmation that Confidence controls remain unchanged
+- confirmation that Micro Scalp logic remains unchanged
+- mobile test results
+- browser console results after five poll cycles
+- golden test results
+- confirmation that backend and trading logic were untouched

@@ -47496,10 +47496,14 @@ let mscEnabled = false, mscBusy = false, mscLive = false, mscLiveBusy = false;
 let mscInst = (function(){ try{ return localStorage.getItem('mscInst') || null; }catch(e){ return null; } })();
 let mscPanelFetching = false, mscPanelTs = 0;
 function renderMicroScalp(d){
-  const mod = document.getElementById('mod-microscalp'); if(!mod) return;
+  // Consolidated into ADC Micro Scalp tab; hide standalone panel, keep state vars.
+  const mod = document.getElementById('mod-microscalp');
+  if(mod) mod.style.display = 'none';
   const ms = (d && d.main_brain) ? d.main_brain.micro_scalp : null;
   mscEnabled = !!(ms && ms.enabled);
-  const badge = document.getElementById('msc-badge');
+  mscLive = !!(ms && ms.live_armed);
+  return;
+  const badge = document.getElementById('msc-badge'); // unreachable — legacy body kept
   if(badge){ badge.textContent = mscEnabled ? 'ON' : 'OFF'; badge.style.background = mscEnabled ? 'var(--green,#22c55e)' : '#6b7280'; }
   const btn = document.getElementById('msc-toggle');
   if(btn && !mscBusy) btn.textContent = mscEnabled ? 'Turn OFF' : 'Turn ON';
@@ -48435,14 +48439,16 @@ function renderTraining(s, m){
 }
 
 function renderAnalystMode(d){
-  const a=(d && d.analyst) || null;
-  const mod=document.getElementById('mod-analyst');
-  if(!mod) return;
-  // The Advisor toggle (server truth via /status) controls visibility — OFF =>
-  // quiet/hidden. Keep the header pill in sync with the authoritative state.
+  // Consolidated into ADC Decision tab; standalone panel removed from nav.
   if(d && typeof d.advisor_enabled === 'boolean' && d.advisor_enabled !== ADVISOR_STATE){
     ADVISOR_STATE = d.advisor_enabled; renderAdvisorUI();
   }
+  const _amMod=document.getElementById('mod-analyst');
+  if(_amMod) _amMod.style.display='none';
+  return;
+  const a=(d && d.analyst) || null; // unreachable — legacy body kept to preserve local helpers
+  const mod=document.getElementById('mod-analyst');
+  if(!mod) return;
   if(!d || !d.advisor_enabled){ mod.style.display='none'; return; }
   if(!a || !a.engine_enabled){ mod.style.display='none'; return; }
   mod.style.display='';
@@ -48594,8 +48600,13 @@ function _prDecisionColor(dec){
   return '#6b7280';
 }
 function renderProReview(d){
+  // Consolidated into ADC Decision tab; sync PRO_GATE_STATE and hide panel.
   const pr=(d && d.pro_review) || null;
-  const mod=document.getElementById('mod-pro');
+  if(pr) PRO_GATE_STATE = !!pr.gate_enabled;
+  const _prMod=document.getElementById('mod-pro');
+  if(_prMod) _prMod.style.display='none';
+  return;
+  const mod=document.getElementById('mod-pro'); // unreachable — legacy body kept
   if(!mod) return;
   if(!pr || !pr.engine_enabled){ mod.style.display='none'; return; }
   mod.style.display='';
@@ -48737,8 +48748,13 @@ function renderFastEntry(d){
 // textContent (never innerHTML) so webhook-derived reason text can't inject markup.
 function _tdVerdictColor(v){ return v==='TAKE'?'#22c55e':v==='WAIT'?'#f59e0b':'#6b7280'; }
 function renderTradeDebate(d){
+  // Consolidated into ADC Decision tab; sync DEBATE_GATE_STATE and hide panel.
   const td=(d && d.trade_debate) || null;
-  const mod=document.getElementById('mod-debate');
+  if(td) DEBATE_GATE_STATE = !!td.gate_enabled;
+  const _tdMod=document.getElementById('mod-debate');
+  if(_tdMod) _tdMod.style.display='none';
+  return;
+  const mod=document.getElementById('mod-debate'); // unreachable — legacy body kept
   if(!mod) return;
   if(!td || !td.engine_enabled){ mod.style.display='none'; return; }
   mod.style.display='';
@@ -49436,7 +49452,11 @@ function _seBias(id, val){
   e.style.color = t==='Bullish' ? '#22c55e' : t==='Bearish' ? '#ef4444' : '#6b7280';
 }
 function renderStrategyEngine(d){
-  const se = (d && d.strategy_engine) || null;
+  // Consolidated into ADC Strategy tab; hide standalone panel.
+  const _seMod=document.getElementById('mod-strategy');
+  if(_seMod) _seMod.style.display='none';
+  return;
+  const se = (d && d.strategy_engine) || null; // unreachable — legacy body kept
   const modeEl = document.getElementById('se-mode');
   if (modeEl) modeEl.textContent = se && se.mode ? '· '+String(se.mode).toUpperCase() : '';
   if (!se){
@@ -49979,12 +49999,6 @@ var _liveNavSections = {
     'mod-breakout',       // 9:30 Breakout Mode
     'mod-swing-v2',       // Swing V2 engine
     'mod-dual-sim',       // Dual Shadow Simulator
-    // Detailed brain engine outputs (accessible for deep inspection)
-    'mod-microscalp',     // Micro Scalp Brain
-    'mod-analyst',        // Unified Analyst Report
-    'mod-pro',            // Professional Review
-    'mod-debate',         // Trade Debate
-    'mod-strategy',       // Strategy Engine
     'mod-scalp-advisory', // Strategy Advisory
     'mod-stalk-mode',     // Stalk Mode
     'mod-active-thinking',// Active Trade Thinking
@@ -50109,6 +50123,11 @@ function renderAiDecisionCenter(d) {
   var tm  = (d && d.trade_memory) || {};
   var ms  = (d && d.main_brain && d.main_brain.micro_scalp) ? d.main_brain.micro_scalp : {};
   var td  = (d && d.trade_debate) || {};
+  // Sync gate states now that standalone renderers are stubbed — read directly from poll data
+  PRO_GATE_STATE = !!(pr && pr.gate_enabled);
+  DEBATE_GATE_STATE = !!(td && td.gate_enabled);
+  mscEnabled = !!(ms && ms.enabled);
+  mscLive = !!(ms && ms.live_armed);
   // ── Top summary ────────────────────────────────────────────────────────
   var vEl = document.getElementById('adc-verdict-big');
   if (vEl) {
@@ -50184,22 +50203,65 @@ function renderAiDecisionCenter(d) {
       h+='<div class="adc-ri"><span class="k">Pro Review</span><span class="v" style="color:'+pdc+'">'+_adcEsc(pd)+(pa.grade?' \u00b7 '+_adcEsc(pa.grade):'')+'</span></div>';
       if (pa.why_not_trade) h+='<div class="adc-reason">'+_adcEsc(pa.why_not_trade)+'</div>';
     }
+    // Compact veto controls for Pro Review and Debate (consolidated from standalone panels)
+    if((pr&&pr.engine_enabled)||(td&&td.engine_enabled)){
+      h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.06)">';
+      if(pr&&pr.engine_enabled){ var _pg=!!PRO_GATE_STATE; h+='<span role="button" tabindex="0" onclick="toggleProGate()" style="cursor:pointer;font-size:11px;border:1px solid '+(_pg?'#ef4444':'var(--border)')+';border-radius:999px;padding:2px 10px;color:'+(_pg?'#ef4444':'#9aa3b2')+'">Pro: '+(_pg?'ARMED':'off')+'</span>'; }
+      if(td&&td.engine_enabled){ var _dg=!!DEBATE_GATE_STATE; h+='<span role="button" tabindex="0" onclick="toggleDebateGate()" style="cursor:pointer;font-size:11px;border:1px solid '+(_dg?'#ef4444':'var(--border)')+';border-radius:999px;padding:2px 10px;color:'+(_dg?'#ef4444':'#9aa3b2')+'">Debate: '+(_dg?'ARMED':'off')+'</span>'; }
+      h+='</div>';
+    }
     dEl.innerHTML=h||'<div class="adc-empty">Awaiting analysis data.</div>';
   }
   // ── Tab: Readiness ─────────────────────────────────────────────────────
   var rEl=document.getElementById('adc-r-content');
   if (rEl) {
-    var h2='', sr=(d&&d.strict_reason)||'';
-    if (sr) h2+='<div class="adc-reason">'+_adcEsc(sr)+'</div>';
+    var h2='';
+    // Status badge
+    var rStat='NOT READY', rStatC='#ef4444';
+    if (isFullReady(v)) { rStat='READY'; rStatC='#22c55e'; }
+    else if (isEarlyReady(v)) { rStat='EARLY READY'; rStatC='#f59e0b'; }
+    h2+='<div class="adc-ri"><span class="k">Status</span><span class="v" style="color:'+rStatC+'">'+rStat+'</span></div>';
+    // Gate checklist with count
     var domDir=(ea&&ea.dominant_direction)||(d&&d.direction)||'Long';
     var aiGd=(d&&d.directions&&domDir!=='Neutral'&&d.directions[domDir]&&d.directions[domDir].gate_debug)
              ?d.directions[domDir].gate_debug:((d&&d.gate_debug)||{});
-    var gKeys=[['Structure',!!aiGd.structure_confirmed],['Location',!!aiGd.location_ok],
-               ['Volume',!!aiGd.volume_confirmed],['VWAP',!!aiGd.vwap_confirmed],['Sweep',!!aiGd.liquidity_sweep]];
-    if (Object.keys(aiGd).length) {
-      h2+='<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">';
-      gKeys.forEach(function(it){ h2+='<span class="adc-chip '+(it[1]?'ok':'bad')+'">'+(it[1]?'\u2713':'\u2717')+' '+_adcEsc(it[0])+'</span>'; });
-      h2+='</div>';
+    var reqd=Number(ea.required_score!=null?ea.required_score:(aiGd.ready_threshold!=null?aiGd.ready_threshold:50));
+    var edgeNow=Number(aiGd.edge_score!=null?aiGd.edge_score:(ea.edge_score!=null?ea.edge_score:0));
+    var items=[
+      ['Structure (BOS/CHOCH)',!!aiGd.structure_confirmed],
+      ['Location (VWAP / zone)',!!aiGd.location_ok],
+      ['Volume confirming',!!aiGd.volume_confirmed],
+      ['VWAP confirming',!!aiGd.vwap_confirmed],
+      ['Liquidity sweep',!!aiGd.liquidity_sweep],
+      ['Edge \u2265 '+reqd, edgeNow>=reqd]
+    ];
+    var passCount=items.filter(function(it){ return it[1]; }).length;
+    h2+='<div class="adc-ri"><span class="k">Checklist</span><span class="v">'+passCount+' / '+items.length+' met</span></div>';
+    h2+='<div style="display:flex;flex-wrap:wrap;gap:4px;margin:4px 0 8px">';
+    items.forEach(function(it){ h2+='<span class="adc-chip '+(it[1]?'ok':'bad')+'">'+(it[1]?'\u2713':'\u2717')+' '+_adcEsc(it[0])+'</span>'; });
+    h2+='</div>';
+    // Edge progress bar (only when not full READY)
+    if (!isFullReady(v)&&reqd>0) {
+      var cur=Number(ea.current_score!=null?ea.current_score:edgeNow);
+      var togo=Math.max(0,reqd-cur);
+      if (togo>0) {
+        var pct=Math.max(0,Math.min(100,cur/reqd*100));
+        h2+='<div class="adc-ri"><span class="k">Edge Progress</span><span class="v" style="color:#f59e0b">'+Math.round(cur)+' / '+reqd+' (need +'+togo+' pts)</span></div>';
+        h2+='<div class="adc-bw" style="margin-bottom:8px"><div class="adc-bf" style="width:'+Math.round(pct)+'%;background:#f59e0b"></div></div>';
+      }
+    }
+    // Why Ready / Why Not Ready section
+    if (isReadyVerdict(v)) {
+      h2+='<div class="adc-reason" style="color:#22c55e">\u2705 '+(isFullReady(v)?'All systems go':'Early entry active')+'</div>';
+    } else {
+      var sr=(d&&d.strict_reason)||'';
+      if (sr) h2+='<div class="adc-reason">'+_adcEsc(sr)+'</div>';
+      var rr=(ea&&ea.rejected_reasons)||[];
+      if (rr.length) {
+        h2+='<div style="margin-top:4px">';
+        rr.forEach(function(r){ h2+='<div style="font-size:11px;color:#9aa3b2;padding:2px 0">\u26d4 '+_adcEsc(r)+'</div>'; });
+        h2+='</div>';
+      }
     }
     rEl.innerHTML=h2||'<div class="adc-empty">No active gate data.</div>';
   }
@@ -50303,6 +50365,15 @@ function renderAiDecisionCenter(d) {
   var msEl=document.getElementById('adc-ms-content');
   if (msEl) {
     var h7='';
+    // Controls row: ON/OFF toggle + LIVE ARM (moved from standalone mod-microscalp)
+    h7+='<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">';
+    h7+='<span class="adc-ri" style="flex:0;white-space:nowrap"><span class="k">State</span><span class="v" style="color:'+(mscEnabled?'#22c55e':'#6b7280')+'">'+(mscEnabled?'ENABLED':'DISABLED')+'</span></span>';
+    h7+='<button onclick="toggleMicroScalp()" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border);background:#1f2430;color:#e8e8f0;cursor:pointer">'+(mscEnabled?'Turn OFF':'Turn ON')+'</button>';
+    if(mscEnabled){
+      h7+='<span style="font-size:11px;color:'+(mscLive?'#ef4444':'#f59e0b')+';letter-spacing:1px">'+(mscLive?'LIVE ARMED':'GHOST ONLY')+'</span>';
+      h7+='<button onclick="toggleMicroLive()" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#2a1215;color:#fca5a5;cursor:pointer;font-weight:700">'+(mscLive?'DISARM LIVE':'ARM LIVE')+'</button>';
+    }
+    h7+='</div>';
     if (ms&&ms.enabled) {
       var mv=ms.verdict||'NO TRADE', mvc=mv==='TAKE'?'#22c55e':mv==='WAIT'?'#f59e0b':'#6b7280';
       h7+='<div class="adc-ri"><span class="k">Verdict</span><span class="v" style="color:'+mvc+'">'+_adcEsc(mv)+'</span></div>';
@@ -50313,7 +50384,17 @@ function renderAiDecisionCenter(d) {
       msteps.forEach(function(st){ h7+='<span class="adc-chip '+(st[1]?'ok':'')+'">'+(st[1]?'\u2713':'\u2014')+' '+_adcEsc(st[0])+'</span>'; });
       h7+='</div>';
       if (ms.suggested_entry!=null&&ms.suggested_stop!=null) h7+='<div class="adc-ri" style="margin-top:4px"><span class="k">Plan</span><span class="v">entry '+ms.suggested_entry+' \u00b7 stop '+ms.suggested_stop+'</span></div>';
-    } else { h7='<div class="adc-empty">Micro Scalp '+(ms&&ms.enabled===false?'disabled.':'inactive.')+'</div>'; }
+      var _mg=ms.ghost||null;
+      if(_mg&&_mg.stats&&_mg.stats.trades>0){
+        var _mst=_mg.stats;
+        h7+='<div class="adc-ri" style="margin-top:6px"><span class="k">Ghost Trades</span><span class="v">'+_mst.trades+(_mst.win_rate!=null?' \u00b7 '+_mst.win_rate+'% win':'')+'</span></div>';
+        if(_mst.net_r!=null) h7+='<div class="adc-ri"><span class="k">Ghost Net R</span><span class="v" style="color:'+(_mst.net_r>=0?'#22c55e':'#ef4444')+'">'+(_mst.net_r>=0?'+':'')+_mst.net_r+'R</span></div>';
+      }
+    } else if(!mscEnabled){
+      h7+='<div class="adc-empty">Micro Scalp disabled. Use Turn ON to enable.</div>';
+    } else {
+      h7+='<div class="adc-empty">Micro Scalp enabled but no setup forming.</div>';
+    }
     msEl.innerHTML=h7;
   }
 }
