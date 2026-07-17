@@ -1,0 +1,205 @@
+TASK: Dashboard Cleanup — Phase 1.10B
+
+OBJECTIVE
+
+Remove the now-redundant standalone Confidence Governor panel from the visible dashboard because its unique controls now exist inside:
+
+AI Decision Center → Confidence
+
+Do not remove or rewrite the underlying Confidence Governor logic.
+
+MAKE ONLY THIS CHANGE.
+
+==================================================
+REQUIREMENTS
+==================================================
+
+1. Remove the standalone mod-governor panel from the dashboard UI.
+
+The panel currently contains or references:
+
+- cg-gate-toggle
+- cg-score-toggle
+- cg-demote
+- cg-lscore
+
+2. Keep the new AI Decision Center Confidence controls fully functional:
+
+- adc-cg-gate-btn
+- adc-cg-score-btn
+- adc-cg-demote
+- adc-cg-lscore
+
+3. Preserve all existing functions:
+
+- toggleLearningGate()
+- toggleLearningScoreGate()
+- _paintLearnGate()
+- _paintLearnScoreGate()
+- _applyGateBtn()
+
+Do not duplicate, rename, or replace these functions.
+
+4. Preserve:
+
+- Backend logic
+- API responses
+- Learning-gate state
+- Score-gate state
+- Demotion reason logic
+- Score delta calculations
+- Polling behavior
+- Existing event handlers
+- Existing local or server state
+
+5. Remove only the standalone panel markup and any dashboard registration that causes mod-governor to render.
+
+6. Do not remove shared JavaScript merely because it still references the legacy IDs.
+
+The paint and toggle functions may continue supporting both old and new IDs unless the old-ID handling is clearly isolated and can be removed without affecting anything else.
+
+Preferred safe approach:
+
+- Remove the visible mod-governor panel.
+- Leave dual-ID support in the shared functions for now.
+- Missing legacy elements must be handled safely without console errors.
+
+7. Confirm that calls such as:
+
+document.getElementById('cg-gate-toggle')
+
+or equivalent helpers safely handle the element being absent.
+
+Do not allow null-element errors after removing the panel.
+
+==================================================
+DO NOT CHANGE
+==================================================
+
+Do not modify:
+
+- AI Decision Center layout
+- Other Brain panels
+- Dashboard navigation
+- Trading logic
+- Scoring formulas
+- Confidence calculations
+- Strategy logic
+- Alerts
+- Webhooks
+- Auto-trade logic
+- Journal behavior
+- Backend routes
+- Database schema
+- CSS outside what is necessary to remove the resulting gap
+
+Do not begin broader dashboard consolidation in this phase.
+
+==================================================
+LAYOUT CLEANUP
+==================================================
+
+After removing mod-governor:
+
+- Remove any empty gap left by the panel.
+- Remove it from any panel-order or draggable-panel configuration.
+- Remove it from any “reset layout” default list.
+- Remove it from any panel visibility menu.
+- Do not leave a blank card, placeholder, or collapsed header.
+- Do not renumber or reorganize unrelated panels.
+
+If mod-governor is referenced by a panel registry, remove only its visible registration.
+
+Do not delete shared Confidence Governor data objects or logic.
+
+==================================================
+ACCEPTANCE TESTS
+==================================================
+
+TEST 1:
+Load the dashboard.
+
+Expected:
+The standalone Confidence Governor panel is no longer visible.
+
+TEST 2:
+Open AI Decision Center → Confidence.
+
+Expected:
+The Demote toggle is visible and functional.
+
+TEST 3:
+Toggle Demote.
+
+Expected:
+- adc-cg-gate-btn updates immediately
+- backend state updates normally
+- subsequent polling keeps the ADC button synchronized
+- no console errors occur
+
+TEST 4:
+Toggle Score.
+
+Expected:
+- adc-cg-score-btn updates immediately
+- backend state updates normally
+- subsequent polling keeps the ADC button synchronized
+- no console errors occur
+
+TEST 5:
+Verify the demotion reason.
+
+Expected:
+adc-cg-demote displays the current reason correctly.
+
+TEST 6:
+Verify the score delta.
+
+Expected:
+adc-cg-lscore displays the current score delta correctly.
+
+TEST 7:
+Search the rendered page.
+
+Expected:
+No visible element with id:
+
+- cg-gate-toggle
+- cg-score-toggle
+- cg-demote
+- cg-lscore
+
+The shared JavaScript may still safely support these IDs.
+
+TEST 8:
+Check the browser console.
+
+Expected:
+No null-reference errors, missing-element errors, or repeated polling errors.
+
+TEST 9:
+Use Reset Layout and refresh the dashboard.
+
+Expected:
+The standalone Confidence Governor panel does not return.
+
+TEST 10:
+Run all existing golden tests.
+
+Expected:
+All tests continue to pass.
+
+==================================================
+FINAL RESPONSE REQUIRED
+==================================================
+
+When complete, report:
+
+- Exact files changed
+- Exact mod-governor markup or registration removed
+- Whether it was removed from panel order, reset layout, and visibility settings
+- Confirmation that the ADC Confidence controls still work
+- Confirmation that shared functions were not duplicated
+- Confirmation that backend and trading logic were untouched
+- Golden test results
+- Browser console test result

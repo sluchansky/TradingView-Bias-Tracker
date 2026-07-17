@@ -44262,22 +44262,6 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div class="le-fid" id="le-fid"></div>
 </div>
 
-<!-- Confidence Governor — transparent Edge→confidence breakdown (DISPLAY-ONLY) -->
-<div class="mod mb-hidden" id="mod-governor">
-  <div class="mod-h">🎯 Confidence Governor <span id="cg-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span id="cg-gate-toggle" role="button" tabindex="0" onclick="toggleLearningGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:auto">Demote: off</span><span id="cg-score-toggle" role="button" tabindex="0" onclick="toggleLearningScoreGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningScoreGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;margin-left:6px">Score: off</span><span class="mod-cat cat-advanced">ADVANCED</span></div>
-  <div class="le-top">
-    <div class="gstat"><div class="l">Base Edge</div><div class="v" id="cg-base">—</div></div>
-    <div class="gstat"><div class="l">Final Confidence</div><div class="v" id="cg-final">—</div></div>
-    <div class="gstat"><div class="l">Net Adjust</div><div class="v" id="cg-adj">—</div></div>
-    <div class="gstat"><div class="l">Threshold</div><div class="v" id="cg-thr">—</div></div>
-  </div>
-  <div class="le-sub">Adjustment Breakdown</div>
-  <div class="le-rank" id="cg-comps"></div>
-  <div class="le-fid" id="cg-demote" style="color:#ef4444"></div>
-  <div class="le-fid" id="cg-lscore"></div>
-  <div class="le-fid" id="cg-fid"></div>
-</div>
-
 <!-- Equity Curve (today) — cumulative R from real closed strategy_trades (display-only) -->
 <div class="mod" id="mod-equity" data-cat="detail">
   <div class="mod-h">📈 Equity Curve · Today <span id="eq-meta" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span title="Outcome simulated from a price proxy — not your real broker fills, and shown NET of estimated commission &amp; slippage. See Real Account Results above for actual P&amp;L." style="font-size:10px;color:#f59e0b;letter-spacing:1.5px;margin-left:auto">SIMULATED · NET</span><span class="mod-cat cat-detail">DETAIL</span></div>
@@ -45105,7 +45089,7 @@ let ADVISOR_STATE = false;   // global advisor review toggle, painted by loadAdv
 let PRO_GATE_STATE = false;  // Professional Review money-path veto, painted by renderProReview() from /status
 let DEBATE_GATE_STATE = false;  // Trade Debate money-path veto, painted by renderTradeDebate() from /status
 let EQ_GATE_STATE = false;  // Entry Quality money-path veto, synced from /status via renderAiDecisionCenter()
-let LEARNING_GATE_STATE = false;  // Learning-demotion money-path veto, painted by renderConfidenceGovernor() from /status
+let LEARNING_GATE_STATE = false;  // Learning-demotion money-path veto, synced from /status via _paintLearnGate() in renderAiDecisionCenter()
 let LEARNING_SCORE_STATE = false;  // Learning-influences-SCORING flag (Task #18), painted by _paintLearnScoreGate() from /status
 async function loadAutoTrade(){
   try {
@@ -45889,8 +45873,6 @@ function renderModules(d){
   // ── Module 8b: Performance report (every-25-trades review) — display-only ──
   renderPerformanceReport(d);
 
-  // ── Module 8c: Confidence Governor (transparent Edge→confidence) — display-only ──
-  renderConfidenceGovernor(d);
 
   // ── Module 9: Equity curve (today) — display-only, real closed trades ──
   renderEquityCurve(d);
@@ -49166,58 +49148,9 @@ function toggleLearningGate(){
     })
     .catch(function(){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); });
 }
-// Confidence Governor panel — fed by d.confidence_governor (base Edge Score + bounded,
-// explained historical adjustments => final confidence). DISPLAY-ONLY unless the
-// Learning demotion VETO above is armed. Awaiting state until trade history exists.
-function renderConfidenceGovernor(d){
-  const g = (d && d.confidence_governor) || null;
-  const setT = function(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; };
-  const setH = function(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; };
-  const metaEl = document.getElementById('cg-meta');
-  _paintLearnGate(g);
-  _paintLearnScoreGate(d);
-  if (!g || !g.ready){
-    if (metaEl) metaEl.textContent = (g && g.reason && g.reason.indexOf('closed')>=0) ? '· MARKET CLOSED' : '· AWAITING TRADES';
-    setT('cg-base', (g && g.base_edge_score!=null) ? g.base_edge_score : '—');
-    setT('cg-final', (g && g.final_confidence_score!=null) ? g.final_confidence_score : '—');
-    setT('cg-adj','—');
-    setT('cg-thr', (g && g.threshold!=null) ? g.threshold : '—');
-    setH('cg-comps','<div class="le-empty">'+_modEsc((g && g.reason) || 'Awaiting trade history.')+'</div>');
-    const f0=document.getElementById('cg-fid'); if(f0) f0.textContent='Display-only — never changes the verdict.';
-    return;
-  }
-  if (metaEl) metaEl.textContent = '· '+(g.trade_count||0)+' TRADES';
-  setT('cg-base', g.base_edge_score);
-  const fe=document.getElementById('cg-final');
-  if (fe){ fe.textContent=g.final_confidence_score;
-           fe.style.color = g.final_confidence_score>=g.threshold ? '#22c55e' : '#f59e0b'; }
-  const ae=document.getElementById('cg-adj');
-  if (ae){ const t=g.total_adjustment||0; ae.textContent=(t>0?'+':'')+t;
-           ae.style.color = t>0?'#22c55e':t<0?'#ef4444':'#6b7280'; }
-  setT('cg-thr', g.threshold);
-  const comps=g.confidence_components||[];
-  setH('cg-comps', comps.length ? comps.map(function(c){
-    const sc=(c.score!=null)?c.score:'—';
-    const scc=(c.score!=null)?(c.score>=60?'#22c55e':c.score>=45?'#f59e0b':'#ef4444'):'#6b7280';
-    let tail='';
-    if(c.nudge!=null){
-      const nc=c.nudge>0?'#22c55e':c.nudge<0?'#ef4444':'#6b7280';
-      tail=' <span style="color:'+nc+'">('+(c.nudge>0?'+':'')+c.nudge+')</span>';
-    } else {
-      tail=' <span style="color:#6b7280">(anchor)</span>';
-    }
-    return '<div class="le-row">'
-         + '<div class="nm"><b>'+_modEsc(c.label||c.name)+'</b> · '+_modEsc(c.explanation||'')+'</div>'
-         + '<div class="st" style="color:'+scc+'">'+sc+tail+'</div>'
-         + '</div>';
-  }).join('') : '<div class="le-empty">No components.</div>');
-  const f=document.getElementById('cg-fid');
-  if (f){
-    let when='';
-    try { if(g.last_refreshed_at) when=new Date(g.last_refreshed_at).toLocaleString(); } catch(e){}
-    f.textContent='Current setup anchors; Live market, AI reasoning & History each nudge within caps. Display-only — never changes the verdict'+(when?' · refreshed '+when:'')+'.';
-  }
-}
+// renderConfidenceGovernor: stub retained for call-site compatibility.
+// Panel removed in Phase 1.10B; paint calls now live in renderAiDecisionCenter.
+function renderConfidenceGovernor(d){ }
 
 // Shared cumulative-R line/area chart for an inline SVG: a 0R baseline, a colored
 // area + line of running cumulative R, and a win/loss dot per trade. Hides the SVG
@@ -50087,7 +50020,6 @@ var _liveNavSections = {
     'mod-autoexit',       // Auto Early-Exit
     'mod-exec-reject',    // Blocked Orders log
     'mod-broker-send-log',// Broker Send Log
-    'mod-governor',       // Confidence Governor
     'mod-mb-confidence',  // Confidence Timeline
   ]
 };
@@ -50320,6 +50252,8 @@ function renderAiDecisionCenter(d) {
     eqPEl.innerHTML=h4;
   }
   // ── Tab: Confidence ────────────────────────────────────────────────────
+  _paintLearnGate(cg||null);
+  _paintLearnScoreGate(d);
   var cgEl=document.getElementById('adc-cg-content');
   if (cgEl) {
     var h5='';
