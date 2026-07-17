@@ -1,0 +1,181 @@
+TASK: Final Production Validation — Decision Pipeline V2
+
+OBJECTIVE
+
+Before enabling Decision Pipeline V2 in production, prove beyond reasonable doubt that it does NOT alter live trading behavior.
+
+This is a validation task ONLY.
+
+DO NOT modify trading logic.
+
+DO NOT modify scoring.
+
+DO NOT modify broker routing.
+
+DO NOT modify TradersPost.
+
+DO NOT modify Discord.
+
+DO NOT modify production execution.
+
+--------------------------------------------------
+
+VALIDATION STEP 1
+
+Replay at least 500 historical TradingView alerts through BOTH pipelines.
+
+Run:
+
+Legacy Production Pipeline
+
+AND
+
+Decision Pipeline V2
+
+at the same time.
+
+--------------------------------------------------
+
+VALIDATION STEP 2
+
+Compare every output field.
+
+The following MUST be byte-identical.
+
+• Verdict
+• Edge Score
+• Confidence
+• Risk %
+• Position Size
+• Entry
+• Stop
+• Targets
+• Invalidation
+• Broker Payload
+• TradersPost Payload
+• Discord Payload
+• Journal Data
+• Execution Flags
+• Routing Decisions
+• Gate Results
+• Technical Verdict
+• Blocking Factors
+
+The ONLY field allowed to differ is:
+
+narrative_summary
+
+Nothing else may change.
+
+--------------------------------------------------
+
+VALIDATION STEP 3
+
+Generate a mismatch report.
+
+Example:
+
+Alerts Tested:
+500
+
+Perfect Matches:
+500
+
+Mismatches:
+0
+
+Allowed Differences:
+narrative_summary only
+
+If ANY other field changes, immediately FAIL validation and report:
+
+• Alert ID
+• Field Name
+• Legacy Value
+• DPv2 Value
+
+Do not continue.
+
+--------------------------------------------------
+
+VALIDATION STEP 4
+
+Measure performance.
+
+Report:
+
+Average execution time added
+
+p50 latency
+
+p95 latency
+
+p99 latency
+
+Maximum latency
+
+Target:
+
+Average added latency < 5 ms
+
+No alert processing slowdown greater than 10 ms.
+
+--------------------------------------------------
+
+VALIDATION STEP 5
+
+Verify production isolation.
+
+Confirm that Decision Pipeline V2 NEVER calls:
+
+execute_trade_gateway()
+
+_send_to_traderspost()
+
+_send_discord()
+
+broker routing
+
+order submission
+
+execution handlers
+
+or any order-routing function.
+
+Provide call-chain evidence proving the feature remains display-only.
+
+--------------------------------------------------
+
+VALIDATION STEP 6
+
+Verify rollback.
+
+Disable:
+
+DECISION_PIPELINE_V2_ENABLED=0
+
+Confirm:
+
+• Dashboard returns to legacy behavior.
+• Trading behavior remains unchanged.
+• No code rollback required.
+• Restart completes successfully.
+
+--------------------------------------------------
+
+SUCCESS CRITERIA
+
+Deployment is APPROVED only if ALL of the following are true:
+
+✓ 500/500 historical alerts produce identical trading outputs.
+✓ Only narrative_summary differs.
+✓ Zero broker payload differences.
+✓ Zero TradersPost differences.
+✓ Zero Discord differences.
+✓ Zero routing differences.
+✓ Zero execution differences.
+✓ Average latency under 5 ms.
+✓ Feature remains completely display-only.
+✓ Rollback verified with environment variable.
+
+Produce a final Production Readiness Report showing PASS or FAIL for every validation category.
