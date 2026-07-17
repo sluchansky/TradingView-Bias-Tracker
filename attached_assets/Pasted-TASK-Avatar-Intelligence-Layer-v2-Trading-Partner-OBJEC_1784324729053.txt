@@ -1,0 +1,277 @@
+TASK: Avatar Intelligence Layer v2 (Trading Partner)
+
+OBJECTIVE
+
+Turn the avatar from a notification system into an intelligent trading partner.
+
+DO NOT modify any trading logic.
+
+DO NOT modify scoring.
+
+DO NOT modify execution.
+
+DO NOT modify TradersPost.
+
+DO NOT modify alerts.
+
+This is strictly an intelligence and presentation layer.
+
+---------------------------------------
+1. NATURAL CONVERSATIONAL VOICE
+---------------------------------------
+
+Replace robotic announcements with natural speech.
+
+Examples:
+
+Instead of:
+
+"LONG READY on MNQ."
+
+Use:
+
+"I've been watching MNQ for the last few minutes. We finally have a qualified long setup. Confidence is 82."
+
+Instead of:
+
+"Trade closed."
+
+Use:
+
+"That trade is finished. I'll keep watching for the next high-quality opportunity."
+
+Responses should sound conversational.
+
+---------------------------------------
+2. ALWAYS EXPLAIN WHY
+---------------------------------------
+
+Every READY announcement must include WHY.
+
+Example:
+
+"I'm interested because:
+
+• Liquidity sweep completed
+• VWAP reclaimed
+• Structure confirmed
+• Buyers increasing
+• Fresh demand zone
+
+Overall confidence is 84."
+
+Reuse existing diagnostics.
+
+Do not calculate anything new.
+
+---------------------------------------
+3. CONFIDENCE NARRATION
+---------------------------------------
+
+Whenever confidence changes significantly, announce it.
+
+Examples:
+
+"My confidence just increased to 91."
+
+"I'm losing confidence because structure weakened."
+
+"Confidence has fallen below my trade threshold."
+
+Only announce meaningful changes.
+
+Avoid spam.
+
+---------------------------------------
+4. TRADE MANAGEMENT SPEECH
+---------------------------------------
+
+During active trades, narrate important events.
+
+Examples:
+
+"We're approaching Target 1."
+
+"Momentum is improving."
+
+"Sellers are appearing."
+
+"I would not add to this position."
+
+"Stop should remain at breakeven."
+
+"Trade thesis remains valid."
+
+Only speak when state changes.
+
+---------------------------------------
+5. WAIT MODE INTELLIGENCE
+---------------------------------------
+
+Instead of silence during WAIT state, occasionally explain what is missing.
+
+Examples:
+
+"I'm waiting for structure."
+
+"I need buyers to reclaim VWAP."
+
+"Volume isn't convincing."
+
+"I'm staying patient."
+
+"This setup isn't worth risking money yet."
+
+Cooldown 60-90 seconds between WAIT messages.
+
+---------------------------------------
+6. MARKET OPEN BRIEFING
+---------------------------------------
+
+On first visit after market opens:
+
+Generate a short spoken briefing.
+
+Include:
+
+Current market bias
+
+Current session
+
+Important nearby levels
+
+Current confidence
+
+What the avatar is watching for
+
+Keep under 30 seconds.
+
+Reuse existing data only.
+
+---------------------------------------
+7. END OF TRADE SUMMARY
+---------------------------------------
+
+When a trade closes:
+
+Summarize:
+
+Direction
+
+Result
+
+Confidence
+
+Reason it worked or failed
+
+What the avatar learned
+
+No new analytics.
+
+Reuse existing trade information.
+
+---------------------------------------
+8. BETTER SPEECH SYSTEM
+---------------------------------------
+
+Prevent repeated speech.
+
+Do not repeat the same message twice.
+
+Queue messages.
+
+Interrupt low-priority speech for:
+
+READY
+
+ENTRY
+
+EXIT
+
+STOP HIT
+
+TARGET HIT
+
+---------------------------------------
+9. INTERNAL THOUGHT STREAM
+---------------------------------------
+
+Create a lightweight "thinking" layer.
+
+Examples:
+
+"Watching buyers..."
+
+"Structure improving..."
+
+"Still waiting."
+
+"Almost there."
+
+"Momentum fading."
+
+"Nothing worth risking."
+
+These are informational only.
+
+Do NOT affect decisions.
+
+Do NOT affect scoring.
+
+Do NOT affect execution.
+
+---------------------------------------
+10. PERSONALITY
+---------------------------------------
+
+The avatar should behave like a calm professional trader.
+
+Never hype trades.
+
+Never promise outcomes.
+
+Always speak with confidence but uncertainty.
+
+Examples:
+
+"I like this setup."
+
+"I'd rather miss this trade than force one."
+
+"I need one more confirmation."
+
+"This isn't good enough yet."
+
+Keep responses concise.
+
+---------------------------------------
+REQUIREMENTS
+---------------------------------------
+
+Reuse existing diagnostics.
+
+Reuse existing confidence.
+
+Reuse existing market state.
+
+Reuse existing event system.
+
+Reuse existing TTS.
+
+Reuse existing polling.
+
+No new APIs.
+
+No backend changes.
+
+No trading logic changes.
+
+No scoring changes.
+
+No execution changes.
+
+No database changes.
+
+No performance degradation.
+
+The avatar should feel like an experienced trading partner sitting beside the user, continuously observing the market, explaining its reasoning, and communicating naturally while remaining completely separate from the trading engine.

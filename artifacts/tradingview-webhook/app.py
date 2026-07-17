@@ -48718,54 +48718,110 @@ function mbSpeak(text){
 if('speechSynthesis' in window){ try{ window.speechSynthesis.getVoices(); }catch(ignore){} }
 
 // ══════════════════════════════════════════════════════════════════════════
-// AVATAR INTELLIGENCE ENGINE v1 — Proactive AI Trading Partner (DISPLAY-ONLY)
-// Watches existing /status production data on every poll tick. Generates
-// context-aware proactive announcements for significant events. Zero new
-// API calls — reuses the same data that already drives the dashboard.
-// Failures silently caught and NEVER interrupt trading or alert routing.
+// AVATAR INTELLIGENCE ENGINE v2 — Intelligent Trading Partner (DISPLAY-ONLY)
+// Watches existing /status data every poll tick. Natural conversational voice,
+// WHY explanations from real diagnostics, confidence narration, trade mgmt
+// narration, wait-mode intelligence, thought stream. Zero new API calls.
+// Zero backend changes. Failures silently caught; never touches trading path.
 // ══════════════════════════════════════════════════════════════════════════
 
 // ── Internal state ────────────────────────────────────────────────────────
-var _avPrev      = null;   // previous poll snapshot for delta detection
-var _avQueue     = [];     // pending proactive speech items
-var _avQTimer    = null;   // queue flush timer handle
-var _avCooldowns = {};     // {type: lastFiredTimestamp} for spam prevention
-var _avGreetDone = false;  // true after the first greeting check this page load
+var _avPrev         = null;   // previous poll snapshot
+var _avQueue        = [];     // pending speech items [{type,text,pri}]
+var _avQTimer       = null;   // queue flush timer
+var _avCooldowns    = {};     // {type: lastFiredTimestamp}
+var _avSpokenMap    = {};     // {text_key: timestamp} — recent-message dedup
+var _avGreetDone    = false;  // daily greeting check flag
+var _avTradeR       = null;   // last known R value of active trade
+var _avTradeDir     = '';     // direction of active trade
+var _avTradeMiles   = {};     // milestones fired within current trade
+var _avLastConf     = null;   // last spoken confidence value
+var _avWaitTimer    = null;   // periodic wait-mode explanation timer
+var _avThoughtTimer = null;   // periodic thought-stream timer
 
-// Per-event minimum gap (ms) before the same event type can fire again
+// Per-type minimum gap (ms). Priority 3=HIGH, 2=NORMAL, 1=LOW.
 var _AV_CD = {
-  greeting:       86400000,   // once per day (localStorage-gated)
-  ready:             60000,   // at most once per minute
-  verdict_change:    20000,   // at most every 20 seconds
-  trade_opened:      30000,
-  trade_closed:      30000,
+  greeting:       86400000,   // once per day
+  market_open:    3600000,    // once per hour
+  ready:          60000,      // at most once per minute
+  verdict_change: 20000,
+  trade_opened:   30000,
+  trade_closed:   30000,
+  trade_mgmt:     25000,
+  confidence_up:  45000,
+  confidence_dn:  45000,
+  wait_explain:   75000,      // 75s floor between wait explanations
+  thought:        30000,      // thought stream
 };
-var _AV_GAP = 5000;  // minimum gap between consecutive announcements
+var _AV_GAP      = 4000;   // min ms between consecutive announcements
+var _AV_DEDUP_MS = 120000; // ignore a message spoken within the last 2 min
 
-// ── Core helpers ──────────────────────────────────────────────────────────
+// ── Snapshot extractor ────────────────────────────────────────────────────
 function _avExtract(d){
-  var mb  = (d && d.main_brain)       || {};
-  var mbv = (d && d.main_brain_voice) || {};
+  var mb   = (d && d.main_brain) || {};
+  var diag = (d && d.alert_diagnostics) || {};
+  var dom  = diag.dominant_direction || '';
+  var gd   = (d && d.directions && dom && d.directions[dom] && d.directions[dom].gate_debug)
+             ? d.directions[dom].gate_debug : (d && d.gate_debug || diag || {});
+  var at   = (d && d.active_trade) || null;
+  var confRaw = (d && d.confidence) || '0';
   return {
     sk:          mbDeriveState(mb),
     verdict:     (d && d.verdict)    || '',
-    edge:        (d && d.edge_score) || 0,
-    confidence:  (d && d.confidence) || 0,
-    opened_at:   (d && d.active_trade && d.active_trade.opened_at) || null,
-    has_trade:   !!(d && d.active_trade && d.active_trade.direction),
+    edge:        Number((d && d.edge_score) || 0),
+    grade:       (d && d.edge_grade) || '',
+    confidence:  parseInt(confRaw, 10) || 0,
+    opened_at:   (at && at.opened_at) || null,
+    has_trade:   !!(at && at.direction),
+    trade_dir:   (at && at.direction) || '',
+    trade_r:     (at && at.current_r != null) ? parseFloat(at.current_r) : null,
     inst:        (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '',
     market_open: (d && d.market_open !== false),
-    narration:   (mb.unified && mb.unified.narrative) || mbv.narration || '',
+    bias:        (d && d.bias)           || '',
+    session:     (d && d.session)        || '',
+    missing:     (d && d.strict_missing) || '',
+    reason:      (d && d.strict_reason)  || '',
+    g_struct:    !!(gd.structure_confirmed),
+    g_vwap:      !!(gd.vwap_confirmed),
+    g_volume:    !!(gd.volume_confirmed),
+    g_zone:      !!(gd.zone_valid),
+    g_sweep:     !!(gd.liquidity_sweep),
   };
 }
+
+// ── Cooldown + dedup helpers ──────────────────────────────────────────────
 function _avCoolOk(type){ return (Date.now() - (_avCooldowns[type]||0)) >= (_AV_CD[type]||30000); }
 function _avMarkCool(type){ _avCooldowns[type] = Date.now(); }
+function _avSpokenRecently(text){
+  var k = text.slice(0,80);
+  return !!(_avSpokenMap[k] && (Date.now() - _avSpokenMap[k]) < _AV_DEDUP_MS);
+}
+function _avMarkSpoken(text){
+  _avSpokenMap[text.slice(0,80)] = Date.now();
+  var now = Date.now();
+  Object.keys(_avSpokenMap).forEach(function(k){
+    if(now - _avSpokenMap[k] > _AV_DEDUP_MS) delete _avSpokenMap[k];
+  });
+}
 
-function mbAvatarEnqueue(type, text, priority){
+// ── Priority queue ────────────────────────────────────────────────────────
+// pri 3=HIGH (READY/ENTRY/EXIT) 2=NORMAL  1=LOW (thoughts/wait)
+function mbAvatarEnqueue(type, text, pri){
   if(!text || !_avCoolOk(type)) return;
+  if(_avSpokenRecently(text)) return;
   _avMarkCool(type);
-  if(priority) _avQueue.unshift({type:type, text:text});
-  else          _avQueue.push({type:type, text:text});
+  var p = pri || 1;
+  var item = {type:type, text:text, pri:p};
+  if(p >= 3){
+    _avQueue = _avQueue.filter(function(x){ return x.pri >= 2; }); // evict LOW
+    _avQueue.unshift(item);
+  } else if(p === 2){
+    var idx = _avQueue.length;
+    for(var i=0; i<_avQueue.length; i++){ if(_avQueue[i].pri < 2){ idx=i; break; } }
+    _avQueue.splice(idx, 0, item);
+  } else {
+    _avQueue.push(item);
+  }
   if(!_avQTimer) _avQTimer = setTimeout(_avDequeue, 900);
 }
 function _avDequeue(){
@@ -48780,88 +48836,348 @@ function _avDequeue(){
 }
 function _avSayProactive(text){
   if(!text) return;
-  // Update caption panel so non-audio users can read the announcement
+  _avMarkSpoken(text);
   try{
     var el = document.getElementById('mb-caption');
-    if(el){ el.textContent = text.length > 118 ? text.slice(0,117) + '\u2026' : text; _captionLast = el.textContent; }
+    if(el){ el.textContent = text.length>118 ? text.slice(0,117)+'\u2026' : text; _captionLast = el.textContent; }
   }catch(e){}
   if(!_ttsMuted) mbSpeakAnswer(text);
-  console.log('[Avatar] proactive: ' + text.slice(0,60));
+  console.log('[Avatar v2] ' + text.slice(0,70));
 }
 
-// ── Proactive text generators (deterministic — no AI calls) ───────────────
+// ── Natural text generators (no AI calls — all deterministic) ─────────────
+
+// Daily greeting
 function _avGreetText(snap){
   var h = new Date().getHours();
   var g = h < 12 ? 'Good morning.' : h < 17 ? 'Good afternoon.' : 'Good evening.';
   var i = snap.inst || 'the market';
-  if(!snap.market_open) return g + ' Markets are closed. I\u2019ll be here when they reopen.';
-  var vk = (snap.verdict || '').toUpperCase();
-  if(vk.indexOf('READY') >= 0) return g + ' ' + i + ' already has a live setup. Review it below.';
-  if(snap.has_trade)            return g + ' There\u2019s an active position open on ' + i + '. I\u2019m watching it.';
-  return g + ' Nothing actionable yet on ' + i + '. I\u2019ll let you know when that changes.';
+  if(!snap.market_open) return g + ' Markets are closed right now. I\u2019ll be here when they reopen.';
+  var vk = (snap.verdict||'').toUpperCase();
+  if(vk.indexOf('READY') >= 0){
+    var dg = vk.indexOf('LONG')>=0 ? 'long' : vk.indexOf('SHORT')>=0 ? 'short' : '';
+    return g + (dg ? ' We already have a ' + dg + ' setup on ' + i + '.' : ' We have a live setup on ' + i + '.');
+  }
+  if(snap.has_trade) return g + ' There\u2019s an active trade open on ' + i + '. I\u2019m watching it.';
+  var conf = snap.confidence;
+  if(conf >= 70) return g + ' I\u2019m watching ' + i + '. Confidence is decent at ' + conf + '. I\u2019ll let you know when something develops.';
+  if(conf >= 40) return g + ' I\u2019m watching ' + i + '. Still building toward a setup. Nothing worth acting on yet.';
+  return g + ' I\u2019m watching ' + i + '. Nothing actionable yet. I\u2019ll let you know when that changes.';
 }
+
+// READY announcement with WHY from live gate diagnostics
 function _avReadyText(snap){
-  var vk  = (snap.verdict || '').toUpperCase();
-  var dir = vk.indexOf('LONG') >= 0 ? 'LONG' : vk.indexOf('SHORT') >= 0 ? 'SHORT' : '';
+  var vk  = (snap.verdict||'').toUpperCase();
+  var dir = vk.indexOf('LONG')>=0 ? 'long' : vk.indexOf('SHORT')>=0 ? 'short' : '';
   var i   = snap.inst || 'the market';
-  var s   = dir ? ('We now have a ' + dir + ' READY setup on ' + i + '.')
-                : ('Setup is READY on ' + i + '.');
-  if(snap.edge) s += ' Edge score is at ' + snap.edge + '.';
+  var opener = dir
+    ? 'I\u2019ve been watching ' + i + ' and we finally have a qualified ' + dir + ' setup.'
+    : 'We have a qualified setup on ' + i + '.';
+  var why = [];
+  if(snap.g_sweep)  why.push('liquidity sweep completed');
+  if(snap.g_vwap)   why.push('VWAP reclaimed');
+  if(snap.g_struct) why.push('structure confirmed');
+  if(snap.g_volume) why.push('volume confirming');
+  if(snap.g_zone)   why.push('inside a demand zone');
+  var s = opener;
+  if(why.length){
+    s += ' I like this because ' + why.slice(0,3).join(', ');
+    if(why.length > 3) s += ' and ' + why.slice(3).join(', ');
+    s += '.';
+  }
+  if(snap.confidence) s += ' Confidence is at ' + snap.confidence + '.';
   return s;
 }
+
+// State change narration
 function _avVerdictChangeText(snap){
   var i = snap.inst || 'the market';
-  if(snap.sk === 'HUNTING')  return i + ' is building toward a setup. Structure is forming.';
+  if(snap.sk === 'HUNTING'){
+    var miss = (snap.missing||'').toLowerCase();
+    if(miss.indexOf('struct')>=0) return i + ' is building. I need structure to confirm before I\u2019d act.';
+    if(miss.indexOf('vwap')>=0)   return i + ' is setting up. Waiting for VWAP to be reclaimed.';
+    return i + ' is building toward a setup. Getting closer.';
+  }
   if(snap.sk === 'MANAGING') return 'Trade is open on ' + i + '. I\u2019m watching the position.';
-  if(snap.sk === 'WAITING')  return i + ' is waiting. I\u2019ll notify you when something changes.';
-  if(snap.sk === 'BLOCKED')  return 'Setup invalidated on ' + i + '. Resetting the read.';
+  if(snap.sk === 'WAITING'){
+    var r = snap.reason || '';
+    if(r) return 'Still waiting on ' + i + '. ' + r.split('.')[0] + '.';
+    return 'Still waiting on ' + i + '. I\u2019ll stay patient.';
+  }
+  if(snap.sk === 'BLOCKED') return 'Setup invalidated on ' + i + '. Resetting the read. I\u2019d rather miss a trade than force one.';
   return null;
 }
 
-// ── Daily greeting (once per ET calendar day via localStorage gate) ────────
+// What is missing — wait mode explanation
+function _avWaitText(snap){
+  var i    = snap.inst || 'the market';
+  var miss = (snap.missing||'').toLowerCase();
+  var rea  = (snap.reason||'').toLowerCase();
+  var comb = miss + ' ' + rea;
+  if(!snap.market_open) return null;
+  var opts = [];
+  if(comb.indexOf('struct') >= 0){
+    opts.push('I\u2019m waiting for a clear BOS or CHOCH to confirm structure.');
+    opts.push('Structure hasn\u2019t given me a clean signal yet. I need that before I\u2019d act.');
+  }
+  if(comb.indexOf('vwap') >= 0){
+    opts.push('I need ' + i + ' to reclaim VWAP before this is worth a trade.');
+    opts.push('VWAP is the line I\u2019m watching. Price needs to get back above it.');
+  }
+  if(comb.indexOf('vol') >= 0){
+    opts.push('Volume isn\u2019t convincing yet. I want real participation before entering.');
+    opts.push('Buyers aren\u2019t showing up with conviction. Volume needs to improve.');
+  }
+  if(comb.indexOf('sweep') >= 0){
+    opts.push('I\u2019m watching for a liquidity sweep to clean out the weak hands first.');
+  }
+  if(comb.indexOf('zone') >= 0){
+    opts.push('Price hasn\u2019t reached a clean demand zone yet. I\u2019ll wait for it to come to me.');
+  }
+  if(!opts.length){
+    var e = snap.edge || 0;
+    if(e < 40) return 'Nothing worth risking money on right now. I\u2019m staying patient.';
+    if(e < 60) return 'Getting closer but not there yet. I\u2019d rather miss this than force it.';
+    return 'Setup is building. Still waiting for the final confirmation piece.';
+  }
+  return opts[Math.floor(Math.random() * opts.length)];
+}
+
+// Market open briefing
+function _avMarketOpenText(snap){
+  var i = snap.inst || 'the market';
+  var s = 'Market is open.';
+  if(snap.bias) s += ' Bias is ' + snap.bias.toLowerCase() + '.';
+  if(snap.session) s += ' ' + snap.session + ' session.';
+  if(snap.confidence >= 60) s += ' Confidence is at ' + snap.confidence + '.';
+  var vk = (snap.verdict||'').toUpperCase();
+  if(vk.indexOf('READY') >= 0) s += ' There\u2019s already a setup forming.';
+  else {
+    var miss = (snap.missing||'').toLowerCase();
+    if(miss.indexOf('struct')>=0)      s += ' I\u2019m waiting for structure.';
+    else if(miss.indexOf('vwap')>=0)   s += ' I need VWAP confirmation.';
+    else if(miss.indexOf('vol')>=0)    s += ' Volume hasn\u2019t confirmed yet.';
+    else if(snap.confidence < 50)      s += ' Nothing actionable yet. I\u2019ll watch.';
+    else                                s += ' Getting closer to a setup.';
+  }
+  return s;
+}
+
+// Trade entered
+function _avTradeOpenedText(snap){
+  var dir = (snap.trade_dir||'').toLowerCase();
+  var i   = snap.inst || 'the market';
+  var s   = 'We\u2019re now in a ' + (dir||'live') + ' trade on ' + i + '.';
+  s += ' Stop and targets are set. I\u2019ll narrate any important developments.';
+  return s;
+}
+
+// Trade closed — end-of-trade summary using last known R
+function _avTradeClosedText(){
+  var dir = _avTradeDir ? _avTradeDir.toLowerCase() + ' ' : '';
+  var r   = _avTradeR;
+  if(r !== null && r !== undefined){
+    if(r >= 1.0) return 'That ' + dir + 'trade worked out. We reached the target. Good execution. I\u2019ll keep watching for the next one.';
+    if(r >= 0.3) return 'Trade closed with a small gain. Not a full target but we managed it well. Looking for the next setup.';
+    if(r >= 0.0) return 'Scratched the trade near breakeven. No damage done. I\u2019ll wait for a cleaner opportunity.';
+    return 'That trade stopped out. It happens. The thesis didn\u2019t hold. I\u2019ll stay patient and wait for a better setup.';
+  }
+  return 'That trade is finished. I\u2019ll keep watching for the next high-quality opportunity.';
+}
+
+// Ambient thought stream (very short — personality layer)
+function _avThoughtText(snap){
+  var sk = snap.sk;
+  var pool;
+  if(sk === 'HUNTING'){
+    pool = [
+      'Watching buyers\u2026',
+      'Structure improving\u2026',
+      'Getting interesting.',
+      'Almost there.',
+      'I need one more confirmation.',
+      'Setup is building.',
+    ];
+  } else if(sk === 'WAITING'){
+    pool = [
+      'Still waiting.',
+      'Not yet.',
+      'Staying patient.',
+      'I\u2019d rather miss this than force it.',
+      'Nothing worth risking yet.',
+      'Not good enough yet.',
+    ];
+  } else if(sk === 'OBSERVING'){
+    pool = [
+      'Watching the tape.',
+      'Market is quiet.',
+      'Nothing yet.',
+      'Monitoring.',
+      'Staying focused.',
+    ];
+  } else { return null; }
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ── Confidence narration ──────────────────────────────────────────────────
+function _avCheckConfidence(snap, prev){
+  if(snap.has_trade) return;
+  var conf = snap.confidence;
+  if(!conf) return;
+  if(_avLastConf === null){ _avLastConf = conf; return; }
+  var delta = conf - _avLastConf;
+  if(Math.abs(delta) < 8) return;
+  var text;
+  var thresh = 50;
+  if(_avLastConf >= thresh && conf < thresh){
+    text = 'Confidence has fallen below my trade threshold, now at ' + conf + '. This setup is off for now.';
+  } else if(delta >= 15){
+    text = 'My confidence just jumped to ' + conf + '. The setup is strengthening significantly.';
+  } else if(delta >= 8){
+    text = 'Confidence is increasing, now at ' + conf + '.';
+  } else if(delta <= -15){
+    text = 'I\u2019m losing confidence. Down to ' + conf + '. Something in the setup weakened.';
+  } else {
+    text = 'Confidence has slipped to ' + conf + '.';
+  }
+  _avLastConf = conf;
+  if(text) mbAvatarEnqueue(delta >= 0 ? 'confidence_up' : 'confidence_dn', text, 2);
+}
+
+// ── Trade management narration ────────────────────────────────────────────
+function _avTradeManagement(snap, prev){
+  if(!snap.has_trade) return;
+  var r = snap.trade_r;
+  if(r === null) return;
+  var pr = (prev && prev.trade_r !== null) ? prev.trade_r : r;
+  // Reset milestones when opened_at changes (new trade)
+  if(snap.opened_at !== (prev && prev.opened_at)) _avTradeMiles = {};
+  if(!_avTradeMiles.be_near && r >= 0.35 && pr < 0.35){
+    _avTradeMiles.be_near = true;
+    mbAvatarEnqueue('trade_mgmt', 'We\u2019re working toward breakeven territory. Stop should remain where it is for now.', 2);
+  }
+  if(!_avTradeMiles.t1_near && r >= 0.7 && pr < 0.7){
+    _avTradeMiles.t1_near = true;
+    mbAvatarEnqueue('trade_mgmt', 'We\u2019re approaching Target 1. Consider where your stop is.', 2);
+  }
+  if(!_avTradeMiles.t1_hit && r >= 1.0){
+    _avTradeMiles.t1_hit = true;
+    mbAvatarEnqueue('trade_mgmt', 'Target 1 reached. Strong move. Managing the stop to breakeven is appropriate here.', 2);
+  }
+  if(!_avTradeMiles.t2_near && r >= 1.7 && pr < 1.7){
+    _avTradeMiles.t2_near = true;
+    mbAvatarEnqueue('trade_mgmt', 'Approaching Target 2. Momentum is holding. Let the runner work.', 2);
+  }
+  if(!_avTradeMiles.drawdown && r < -0.6 && pr > -0.6){
+    _avTradeMiles.drawdown = true;
+    mbAvatarEnqueue('trade_mgmt', 'Trade is in drawdown. Thesis needs to hold here. The stop will do its job if it doesn\u2019t.', 2);
+  }
+  if(_avTradeMiles.drawdown && r > -0.3) _avTradeMiles.drawdown = false;
+  _avTradeR   = r;
+  _avTradeDir = snap.trade_dir;
+}
+
+// ── Periodic timers ───────────────────────────────────────────────────────
+function _avStartWaitMode(){
+  if(_avWaitTimer) return;
+  (function _tick(){
+    _avWaitTimer = null;
+    var snap = _avPrev;
+    if(!snap || snap.has_trade || !snap.market_open){ _avWaitTimer = setTimeout(_tick, 30000); return; }
+    if(snap.sk !== 'WAITING' && snap.sk !== 'HUNTING'){ _avWaitTimer = setTimeout(_tick, 30000); return; }
+    var text = _avWaitText(snap);
+    if(text) mbAvatarEnqueue('wait_explain', text, 1);
+    var delay = 65000 + Math.floor(Math.random() * 25000);
+    _avWaitTimer = setTimeout(_tick, delay);
+  })();
+}
+function _avStopWaitMode(){ if(_avWaitTimer){ clearTimeout(_avWaitTimer); _avWaitTimer = null; } }
+
+function _avStartThoughts(){
+  if(_avThoughtTimer) return;
+  (function _tick(){
+    _avThoughtTimer = null;
+    var snap = _avPrev;
+    if(snap && snap.market_open && !snap.has_trade && snap.sk !== 'READY'){
+      var text = _avThoughtText(snap);
+      if(text) mbAvatarEnqueue('thought', text, 1);
+    }
+    _avThoughtTimer = setTimeout(_tick, 30000 + Math.floor(Math.random() * 20000));
+  })();
+}
+
+// ── Daily greeting ────────────────────────────────────────────────────────
 function _avCheckGreeting(snap){
   if(_avGreetDone) return;
   _avGreetDone = true;
   var today;
-  try{ today = new Date(Date.now() - 300 * 60000).toISOString().slice(0,10); }
+  try{ today = new Date(Date.now() - 300*60000).toISOString().slice(0,10); }
   catch(e){ today = new Date().toISOString().slice(0,10); }
   var stored = '';
   try{ stored = localStorage.getItem('mbGreetDate') || ''; }catch(e){}
   if(stored === today) return;
   try{ localStorage.setItem('mbGreetDate', today); }catch(e){}
   var text = _avGreetText(snap);
-  setTimeout(function(){ mbAvatarEnqueue('greeting', text, true); }, 2500);
+  setTimeout(function(){ mbAvatarEnqueue('greeting', text, 2); }, 2500);
 }
 
-// ── Main observe function — called every poll tick from renderModules(d) ──
+// ── Main observe — called every poll tick from renderModules(d) ───────────
 function mbAvatarObserve(d){
   var snap = _avExtract(d);
   _avCheckGreeting(snap);
   var prev = _avPrev;
   _avPrev  = snap;
-  if(!prev) return;  // first tick: establish baseline silently
-  // Trade opened (new opened_at that didn\u2019t exist before)
+  if(!prev){
+    // First tick — establish baseline, start background timers
+    _avLastConf = snap.confidence;
+    _avTradeR   = snap.trade_r;
+    _avTradeDir = snap.trade_dir;
+    _avStartThoughts();
+    if(!snap.has_trade && snap.market_open) _avStartWaitMode();
+    return;
+  }
+  // Market opened
+  if(snap.market_open && !prev.market_open){
+    mbAvatarEnqueue('market_open', _avMarketOpenText(snap), 2);
+    _avStartWaitMode(); _avStartThoughts();
+  }
+  // ── Trade lifecycle (HIGH priority) ──────────────────────────────────
   if(snap.has_trade && snap.opened_at && snap.opened_at !== prev.opened_at){
-    mbAvatarEnqueue('trade_opened',
-      'We are now in a live trade on ' + snap.inst + '. Stop and targets are set.', true);
+    _avTradeMiles = {}; _avTradeR = null;
+    _avStopWaitMode();
+    mbAvatarEnqueue('trade_opened', _avTradeOpenedText(snap), 3);
     return;
   }
-  // Trade closed (had a trade last tick, gone now)
   if(prev.has_trade && !snap.has_trade){
-    mbAvatarEnqueue('trade_closed',
-      'The trade has closed. I\u2019ll keep watching for the next setup.');
+    var closedText = _avTradeClosedText();
+    _avTradeDir = ''; _avTradeR = null; _avTradeMiles = {};
+    mbAvatarEnqueue('trade_closed', closedText, 3);
+    _avStartWaitMode(); _avStartThoughts();
     return;
   }
-  if(snap.has_trade) return;  // avoid distracting while a trade is open
-  // Setup became READY
+  // ── During a trade: management narration only ─────────────────────────
+  if(snap.has_trade){
+    _avTradeManagement(snap, prev);
+    return;
+  }
+  // ── Outside a trade: full intelligence ───────────────────────────────
+  _avCheckConfidence(snap, prev);
   if(snap.sk === 'READY' && prev.sk !== 'READY'){
-    mbAvatarEnqueue('ready', _avReadyText(snap), true);
+    _avStopWaitMode();
+    mbAvatarEnqueue('ready', _avReadyText(snap), 3);
     return;
   }
-  // General state or verdict change (excluding READY — handled above)
+  if(prev.sk === 'READY' && snap.sk !== 'READY'){
+    var gone = 'Setup is no longer valid. ' + (snap.missing ? 'Lost ' + snap.missing.split(/[,;]/)[0].trim().toLowerCase() + '.' : 'Back to watching.');
+    mbAvatarEnqueue('verdict_change', gone, 2);
+    _avStartWaitMode();
+    return;
+  }
   if(snap.sk !== prev.sk || snap.verdict !== prev.verdict){
     var txt = _avVerdictChangeText(snap);
-    if(txt) mbAvatarEnqueue('verdict_change', txt);
+    if(txt) mbAvatarEnqueue('verdict_change', txt, 2);
+    if(snap.sk === 'WAITING' || snap.sk === 'HUNTING') _avStartWaitMode();
+    else if(snap.sk !== 'WAITING' && snap.sk !== 'HUNTING') _avStopWaitMode();
   }
 }
 
@@ -48873,10 +49189,9 @@ function mbAvatarObserve(d){
   }, {passive:true});
 })();
 
-// ── Memory Placeholder — future trading memory interface (stubs only) ─────
-// Defines the interface for a future phase that will surface historical trade
-// patterns. NOT implemented in Phase 1. NEVER wire to gate, sizing, execution,
-// broker path, or any production decision.
+// ── Memory — future trading memory interface (stubs only) ─────────────────
+// Interface contract for a future phase that surfaces historical trade patterns.
+// NEVER wire to gate, sizing, execution, broker, or any production decision.
 var mbMemory = {
   findSimilar:   function(params)   { return Promise.resolve([]); },
   strategyStats: function(strategy) { return Promise.resolve(null); },
