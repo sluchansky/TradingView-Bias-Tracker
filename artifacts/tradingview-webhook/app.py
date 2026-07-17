@@ -45372,6 +45372,163 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
 .hvs-tabs{display:flex;gap:4px;margin-bottom:9px}
 .hvs-tab{padding:3px 10px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--muted,#6b7280);font-size:10px;font-weight:700;cursor:pointer;font-family:var(--sans);letter-spacing:.7px}
 .hvs-tab.active{background:rgba(82,224,255,.12);color:var(--cyan,#52e0ff);border-color:rgba(82,224,255,.35)}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   MAIN BRAIN — COMMAND CENTER REDESIGN  (visual only, IDs preserved)
+   Apple + Palantir + JARVIS aesthetic.  Zero trading logic changes.
+   All IDs + JS render functions unchanged.  Goldens byte-identical.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Handle: de-emphasised identity strip ─────────────────────────────── */
+.mb-av-handle{padding:10px 22px 9px;background:rgba(255,255,255,.012);border-bottom:1px solid rgba(125,140,255,.07)}
+.mb-av-handle-lbl{font-size:9px;letter-spacing:3.5px;color:#2d3348;font-weight:700}
+#mb-badge{background:rgba(125,140,255,.18);color:#a5b4fc;border-radius:999px;font-size:9px;padding:2px 8px;letter-spacing:.8px}
+
+/* ── Avatar section: CENTERPIECE ─────────────────────────────────────── */
+#mb-av{padding:32px 20px 0;position:relative;overflow:visible;text-align:center}
+#mb-av::before{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);width:400px;height:320px;border-radius:50%;background:radial-gradient(ellipse 55% 60% at 50% 38%,var(--orb-glow,rgba(99,102,241,.24)) 0%,rgba(56,189,248,.10) 45%,transparent 72%);pointer-events:none;z-index:0;animation:avGlowPulse 5s ease-in-out infinite}
+@keyframes avGlowPulse{0%,100%{opacity:.75}50%{opacity:1}}
+
+/* Orb: larger, centered — keeps all ring/state animations intact */
+.mb-orb{width:248px;height:316px;margin:0 auto 12px;position:relative;z-index:1}
+
+/* SVG character: bigger face */
+.mb-char-svg{width:182px;height:243px}
+
+/* Rings: slightly more visible */
+.mb-orb-ring{border-width:1px;border-color:var(--orb-glow,rgba(129,140,248,.32))}
+
+/* ── State label: commanding ──────────────────────────────────────────── */
+.mb-av-state{font-size:30px;font-weight:900;letter-spacing:3.5px;margin-bottom:8px;position:relative;z-index:1;transition:color .5s ease,text-shadow .5s ease}
+
+/* ── Caption: the AI voice ────────────────────────────────────────────── */
+#mb-caption{font-size:13px;max-width:380px;margin:0 auto 14px;line-height:1.62;opacity:.92;position:relative;z-index:1;min-height:22px;transition:color .5s,opacity .4s}
+
+/* ── Context line ─────────────────────────────────────────────────────── */
+.mb-av-ctx{font-size:11.5px;opacity:.82;margin-bottom:13px;position:relative;z-index:1;letter-spacing:.3px}
+
+/* ── Meta strip ───────────────────────────────────────────────────────── */
+.mb-av-meta{font-size:10px;color:#374151;gap:5px;margin-bottom:0;position:relative;z-index:1;letter-spacing:.5px}
+.mb-av-sep{opacity:.35}
+
+/* ── Primary AI statement — the headline ─────────────────────────────── */
+.mb-summary{font-size:15px;line-height:1.68;text-align:center;border-left:none;padding:16px 28px 18px;margin:18px 0 0;color:#dce6ff;font-weight:600;font-style:italic;letter-spacing:.01em;background:rgba(255,255,255,.022);border-top:1px solid rgba(125,140,255,.08);border-bottom:1px solid rgba(125,140,255,.08)}
+
+/* ── Live indicator ───────────────────────────────────────────────────── */
+.mb-av-foot{margin-top:10px;padding:0 0 16px;font-size:10px;color:#2d3348}
+.mb-av-live{color:#22c55e;letter-spacing:.8px}
+
+/* ── Confidence / Stats — PREMIUM GLASS MODULE ───────────────────────── */
+.mb-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:0;margin:0;background:rgba(125,140,255,.07);border-radius:0;overflow:hidden;border-top:1px solid rgba(125,140,255,.09);border-bottom:1px solid rgba(125,140,255,.09)}
+.mb-stat{background:rgba(7,11,23,.8);border:none;border-radius:0;padding:14px 13px;border-right:1px solid rgba(125,140,255,.08)}
+.mb-stat:last-child{border-right:none}
+.mb-stat:hover{background:rgba(16,24,48,.95)}
+.mb-stat-l{font-size:9px;letter-spacing:1.3px;color:#4b5563;margin-bottom:7px;font-weight:700}
+.mb-stat-v{font-size:19px;font-weight:900;letter-spacing:.4px}
+.mb-lean{height:5px;border-radius:3px;margin-top:8px;overflow:hidden;background:rgba(255,255,255,.05)}
+.mb-lean-long{background:linear-gradient(90deg,#1a7a48,#22c55e)}
+.mb-lean-short{background:linear-gradient(90deg,#7a1a22,#ef4444)}
+
+/* ── Mission strip ────────────────────────────────────────────────────── */
+.mb-mission{background:rgba(7,11,23,.7);border:none;border-bottom:1px solid rgba(125,140,255,.08);border-radius:0;padding:12px 20px;margin-bottom:0}
+.mb-mission-h{font-size:9.5px;letter-spacing:1.5px;color:#6b7280}
+.mb-mission-fill{transition:width .5s cubic-bezier(.2,.8,.3,1)}
+
+/* ── Thinking panels — CONVERSATION CARDS ────────────────────────────── */
+.mb-grid{display:flex;flex-direction:column;gap:0;margin:0;background:transparent;border-radius:0;border-top:1px solid rgba(125,140,255,.07)}
+.mb-col{background:transparent;border:none;border-radius:0;padding:16px 22px;border-bottom:1px solid rgba(125,140,255,.07)}
+.mb-col:last-child{border-bottom:none}
+.mb-col:hover{background:rgba(125,140,255,.025)}
+.mb-col-h{font-size:12px;text-transform:none;letter-spacing:.2px;color:#818cf8;font-weight:700;margin-bottom:10px;border-bottom:1px solid rgba(125,140,255,.07);padding-bottom:8px;display:flex;align-items:center;gap:8px}
+.mb-list{gap:5px}
+.mb-list li{font-size:13px;color:#c2cce8;line-height:1.65;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.035)}
+.mb-list li:last-child{border-bottom:none}
+.mb-list li:before{display:none}
+
+/* ── Bull / Bear cases ────────────────────────────────────────────────── */
+.mb-cases{gap:0;margin:0;border-top:1px solid rgba(125,140,255,.07);border-bottom:1px solid rgba(125,140,255,.07)}
+.mb-case{background:rgba(7,11,23,.6);border:none;border-radius:0;padding:14px 22px}
+.mb-case-bull{border-left:2px solid rgba(34,197,94,.4)}
+.mb-case-bear{border-left:2px solid rgba(239,68,68,.4)}
+.mb-case-h{font-size:11px;font-weight:700;letter-spacing:.5px;margin-bottom:8px}
+
+/* ── Management / bot / timeline panels — de-emphasised ─────────────── */
+.mb-manage,.mb-bot,.mb-tl,.mb-review{background:rgba(6,10,22,.55);border-color:rgba(125,140,255,.09);border-left-width:1px;border-radius:0;margin:0;border-top:1px solid rgba(125,140,255,.08);border-bottom:1px solid rgba(125,140,255,.08)}
+.mb-manage-h,.mb-bot-h,.mb-tl-h,.mb-review-h{font-size:9px;letter-spacing:1.8px;color:#4b5563}
+.mb-manage-grid{gap:6px}
+.mb-mt{background:rgba(6,10,22,.55);border-color:rgba(125,140,255,.09);border-left-width:1px;border-radius:0;margin:0;border-top:1px solid rgba(125,140,255,.08)}
+.mb-mt-h{font-size:9.5px;letter-spacing:.5px;color:#4b5563;padding:10px 22px}
+
+/* ── Live thinking — CONVERSATION TIMELINE ───────────────────────────── */
+.mb-feed-h{font-size:9px;letter-spacing:2.5px;color:#2d3348;text-transform:uppercase;font-weight:700;margin:0;padding:12px 22px 8px;border-top:1px solid rgba(125,140,255,.07);display:flex;align-items:center;gap:8px}
+.mb-feed{background:transparent;border:none;padding:0 0 8px;gap:0;max-height:220px;border-radius:0;border-bottom:1px solid rgba(125,140,255,.07)}
+.mb-feed-empty{padding:6px 22px;font-size:12px;color:#2d3348}
+.mb-feed-row{padding:8px 22px;border-left:none;background:transparent;border-radius:0;border-bottom:1px solid rgba(255,255,255,.04);display:flex;align-items:baseline;gap:16px}
+.mb-feed-row:hover{background:rgba(125,140,255,.03)}
+.mb-feed-row:last-child{border-bottom:none}
+.mb-feed-meta{margin-bottom:0;flex-shrink:0}
+.mb-feed-t{font-size:10px;color:#2d3348;min-width:40px;font-family:ui-monospace,monospace;flex-shrink:0}
+.mb-feed-badge{display:none}
+.mb-feed-tx{font-size:12.5px;color:#8a95b4;line-height:1.55}
+.mb-brief-row{gap:12px;align-items:baseline}
+.mb-brief-label{flex:0 0 90px;font-size:9px;color:#374151}
+.mb-brief-val{font-size:12.5px;color:#8a95b4}
+
+/* ── Prop / foot ──────────────────────────────────────────────────────── */
+.mb-prop{border-top:1px solid rgba(125,140,255,.07);padding-top:10px;margin:0;font-size:10.5px;color:#374151}
+.mb-foot{font-size:10px;color:#2d3348;margin:10px 0 0;padding:0 22px 14px;font-style:italic}
+
+/* ── Chat section ─────────────────────────────────────────────────────── */
+.mb-chat-h{font-size:9px;letter-spacing:2px;color:#374151;text-transform:uppercase;font-weight:700;margin:0;padding:12px 22px 8px;border-top:1px solid rgba(125,140,255,.07);display:flex;align-items:center;gap:8px}
+.mb-sess-bar{padding:0 22px 10px;margin:0}
+.mb-chat-log{padding:0 22px;margin-bottom:8px}
+.mb-chips{padding:0 22px;margin-bottom:8px}
+.mb-followups{padding:0 22px;margin:0 0 6px}
+.mb-chat-row{padding:0 22px 18px}
+.mb-chat-row input{font-size:12px;padding:9px 12px}
+
+/* ── Unified decision: glass panel when visible ──────────────────────── */
+#mb-unified{background:rgba(10,16,34,.8);border-radius:0;margin:0;border:none;border-top:1px solid rgba(125,140,255,.08);padding:14px 22px}
+#mb-liq{border:none;border-top:1px solid rgba(125,140,255,.07);border-radius:0;margin:0;padding:10px 22px}
+
+/* ── Judge panel ──────────────────────────────────────────────────────── */
+.mb-judge{border-radius:0;border:none;background:rgba(8,12,28,.7);border-top:1px solid rgba(125,140,255,.12);margin:0;padding:16px 22px 14px}
+.mb-judge-label{font-size:12px;letter-spacing:.5px}
+.mb-judge-h{font-size:10px;letter-spacing:.8px;color:#374151}
+.mb-judge-grid{gap:20px}
+
+/* ── Remove inherited mod padding — handle + sections provide spacing ── */
+#mod-brain{padding:0}
+
+/* ── Smooth transitions ───────────────────────────────────────────────── */
+.mb-stat{transition:background .3s cubic-bezier(.25,.8,.25,1)}
+.mb-col{transition:background .3s cubic-bezier(.25,.8,.25,1)}
+.mb-summary{transition:color .5s ease,opacity .4s ease}
+.mb-feed-row{transition:background .2s ease}
+#mb-caption{transition:color .5s ease,opacity .4s ease}
+.mb-lean-long,.mb-lean-short{transition:width .55s cubic-bezier(.2,.7,.3,1)}
+
+/* ── Retro theme compat ───────────────────────────────────────────────── */
+html[data-theme="retro"] .mb-summary{background:rgba(0,0,0,.4);border-color:var(--border-lit)}
+html[data-theme="retro"] .mb-stats{background:var(--panel);border-color:var(--border-lit)}
+html[data-theme="retro"] .mb-stat{background:var(--panel)}
+html[data-theme="retro"] .mb-col{background:transparent}
+html[data-theme="retro"] .mb-feed{background:transparent}
+
+/* ── Responsive ───────────────────────────────────────────────────────── */
+@media(max-width:720px){
+  .mb-stats{grid-template-columns:1fr 1fr}
+  .mb-orb{width:210px;height:267px}
+  .mb-char-svg{width:155px;height:207px}
+  #mb-av::before{width:280px;height:240px}
+  .mb-col,.mb-feed-row,.mb-foot,.mb-chat-h,.mb-sess-bar,.mb-chat-log,.mb-chips,.mb-followups,.mb-chat-row,#mb-unified,#mb-liq,.mb-mission,.mb-manage,.mb-judge,.mb-feed-h{padding-left:16px;padding-right:16px}
+}
+@media(max-width:560px){
+  .mb-stat{padding:11px 10px}
+  .mb-stat-v{font-size:16px}
+  .mb-av-state{font-size:24px}
+}
+
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
 </head>

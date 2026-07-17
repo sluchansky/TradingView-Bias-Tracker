@@ -1,0 +1,478 @@
+TASK: Main Brain UI Redesign — AI Command Center
+
+OBJECTIVE
+
+Redesign the Main Brain section to feel like the command center of the entire dashboard.
+
+DO NOT remove any existing functionality.
+
+DO NOT remove any existing information.
+
+DO NOT change:
+
+- Trading logic
+- Confidence
+- Edge scoring
+- AI reasoning
+- Trade management
+- Learning system
+- Avatar intelligence
+- Backend
+- APIs
+- Database
+
+This is a visual redesign only.
+
+Think Apple + Palantir + JARVIS.
+
+The goal is to make the Main Brain feel like ONE intelligent system instead of a collection of stacked widgets.
+
+--------------------------------------------------
+1. ONE UNIFIED COMMAND CENTER
+--------------------------------------------------
+
+The Main Brain should become one cohesive experience.
+
+Do NOT look like multiple independent cards.
+
+Instead create one large integrated panel with visual sections.
+
+The user should immediately understand:
+
+• What the AI sees
+• What the AI thinks
+• What the AI is waiting for
+• What happens next
+
+Everything else supports those four ideas.
+
+--------------------------------------------------
+2. MAKE THE AVATAR THE CENTERPIECE
+--------------------------------------------------
+
+The avatar should visually anchor the entire Main Brain.
+
+Increase its visual importance.
+
+Do not make it enormous.
+
+Instead:
+
+- larger
+- cleaner
+- centered
+- surrounded by subtle depth
+
+Use:
+
+• soft radial glow
+• holographic ring
+• gentle animated pulse
+• ambient lighting
+
+Never flashy.
+
+Never distracting.
+
+The avatar should feel like the AI powering the dashboard.
+
+--------------------------------------------------
+3. REMOVE THE "STACK OF BOXES" FEEL
+--------------------------------------------------
+
+Currently every section is inside another bordered rectangle.
+
+Reduce visual clutter.
+
+Replace unnecessary borders with:
+
+- spacing
+- typography
+- alignment
+- subtle separators
+- lighting
+
+Use cards only where they improve readability.
+
+The Main Brain should feel like one workspace instead of ten widgets.
+
+--------------------------------------------------
+4. CREATE VISUAL HIERARCHY
+--------------------------------------------------
+
+The eye should naturally flow through the interface.
+
+Priority order:
+
+1. Avatar
+2. Current AI statement
+3. Current state
+4. Confidence
+5. AI reasoning
+6. Supporting information
+7. Historical information
+
+Nothing should compete equally.
+
+The user should know what matters within one second.
+
+--------------------------------------------------
+5. REDESIGN THE STATUS AREA
+--------------------------------------------------
+
+Instead of:
+
+WAITING
+
+Create a richer presentation.
+
+Example:
+
+WAITING
+
+"I'm waiting for buyers to reclaim VWAP before considering a trade."
+
+Below that:
+
+Confidence
+
+Current Bias
+
+Market State
+
+Next Session
+
+Presented as clean status chips instead of paragraphs.
+
+--------------------------------------------------
+6. REDESIGN THE THINKING PANELS
+--------------------------------------------------
+
+Current boxes:
+
+What I See
+
+What I'm Thinking
+
+What I'm Watching
+
+The Plan
+
+Keep them.
+
+Redesign them to feel like conversation cards.
+
+Example:
+
+👁 What I See
+
+"Buyers are defending support."
+
+🧠 What I'm Thinking
+
+"Momentum isn't strong enough yet."
+
+🎯 What I'm Watching
+
+"I need VWAP confirmation."
+
+📋 The Plan
+
+"If structure confirms I'll prepare a long."
+
+These should feel like the AI speaking.
+
+Not empty form fields.
+
+--------------------------------------------------
+7. REDESIGN CONFIDENCE
+--------------------------------------------------
+
+Replace generic confidence boxes.
+
+Create a premium confidence module.
+
+Include:
+
+Current confidence
+
+Trend
+
+Quality
+
+Risk
+
+Use:
+
+- clean progress bars
+- subtle gradients
+- smooth animation
+
+Do not use loud colors.
+
+--------------------------------------------------
+8. AI REASONING
+--------------------------------------------------
+
+The reasoning section should become easier to scan.
+
+Use:
+
+✓ confirmed
+
+○ waiting
+
+✕ missing
+
+Group similar items.
+
+Example:
+
+Structure
+
+✓ BOS
+
+✓ CHOCH
+
+Liquidity
+
+✓ Sweep
+
+○ Retest
+
+Volume
+
+✕ Confirmation
+
+Make the reasoning readable in seconds.
+
+--------------------------------------------------
+9. PERFORMANCE SECTION
+--------------------------------------------------
+
+The performance review is valuable.
+
+Reduce its visual dominance.
+
+Make it collapsible.
+
+Collapsed during active trading.
+
+Expanded automatically after market close.
+
+Do not remove any information.
+
+--------------------------------------------------
+10. LIVE THINKING FEED
+--------------------------------------------------
+
+The live thinking feed should resemble a conversation timeline.
+
+Instead of a log.
+
+Examples:
+
+13:15
+
+Watching buyers.
+
+13:17
+
+Structure improving.
+
+13:19
+
+VWAP reclaimed.
+
+13:22
+
+Waiting for confirmation.
+
+Small timestamps.
+
+Subtle separators.
+
+Minimal visual weight.
+
+--------------------------------------------------
+11. TYPOGRAPHY
+--------------------------------------------------
+
+Improve hierarchy.
+
+Use fewer font weights.
+
+Use more whitespace.
+
+Large headings.
+
+Comfortable line spacing.
+
+Smaller secondary text.
+
+Reduce visual noise.
+
+--------------------------------------------------
+12. SPACING
+--------------------------------------------------
+
+Increase breathing room.
+
+Reduce unnecessary padding.
+
+Align sections consistently.
+
+Use an 8-point spacing system throughout.
+
+Everything should line up cleanly.
+
+--------------------------------------------------
+13. DEPTH
+--------------------------------------------------
+
+Replace heavy borders with depth.
+
+Use:
+
+soft shadows
+
+glass panels
+
+subtle gradients
+
+ambient glow
+
+layer separation
+
+The dashboard should feel premium.
+
+Not like nested HTML boxes.
+
+--------------------------------------------------
+14. MOTION
+--------------------------------------------------
+
+Add subtle transitions.
+
+Examples:
+
+Cards gently fade.
+
+Progress bars animate smoothly.
+
+Confidence changes ease.
+
+State chips softly transition.
+
+No sudden jumps.
+
+No distracting animation.
+
+--------------------------------------------------
+15. RESPONSIVE LAYOUT
+--------------------------------------------------
+
+Maintain functionality on:
+
+Desktop
+
+Laptop
+
+Tablet
+
+Do not allow sections to overlap.
+
+Maintain clear hierarchy at all sizes.
+
+--------------------------------------------------
+16. DO NOT REMOVE INFORMATION
+--------------------------------------------------
+
+Every existing feature remains.
+
+Only improve:
+
+organization
+
+layout
+
+spacing
+
+presentation
+
+visual hierarchy
+
+Nothing functional should disappear.
+
+--------------------------------------------------
+17. VALIDATION
+--------------------------------------------------
+
+Before completion verify:
+
+✓ No trading logic changed
+
+✓ No backend changes
+
+✓ No API changes
+
+✓ No scoring changes
+
+✓ No confidence changes
+
+✓ No AI reasoning changes
+
+✓ No execution changes
+
+✓ No learning changes
+
+✓ Existing Main Brain functionality preserved
+
+✓ Existing Avatar functionality preserved
+
+✓ Existing speech preserved
+
+✓ Existing diagnostics preserved
+
+✓ Existing golden tests pass
+
+--------------------------------------------------
+DELIVERABLE
+
+After implementation provide:
+
+1. Files changed
+
+2. Components redesigned
+
+3. Visual hierarchy changes
+
+4. Layout improvements
+
+5. Typography improvements
+
+6. Spacing improvements
+
+7. Motion improvements
+
+8. Responsive behavior
+
+9. Confirmation that no functionality changed
+
+10. Screenshots before and after
+
+--------------------------------------------------
+SUCCESS CRITERIA
+
+The Main Brain should no longer feel like a developer dashboard.
+
+It should feel like the AI's command center.
+
+The user should immediately understand:
+
+• What the AI knows
+• What the AI is thinking
+• What the AI is waiting for
+• What the AI recommends
+
+The experience should feel premium, modern, and cohesive while preserving every existing capability.
