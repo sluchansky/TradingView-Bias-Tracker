@@ -130,6 +130,7 @@ export const BOT1_ROUTES = [
   "/learning-score",
   "/entry-quality",
   "/review-idea",
+  "/failure-analysis",
   // AI assistant chat (owner-only; DISPLAY/READ-ONLY; NOT in dashboard-auth
   // OPEN_PATHS). Answers questions about the live setup + general trading.
   "/assistant",

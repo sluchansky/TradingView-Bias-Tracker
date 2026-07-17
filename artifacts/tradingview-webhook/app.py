@@ -127,6 +127,10 @@ ACTIVE_TRADES_BY_INST = {}                 # inst -> single trade dict
 ACTIVE_TRADES_LOCK    = threading.RLock()
 ACTIVE_TRADES_DB_READY = False             # set by _check_active_trades_db_ready at boot
 MARKET_STATE_CACHE_DB_READY = False        # set by _check_market_state_cache_db_ready at boot
+TFA_DB_READY        = False              # set by _check_tfa_db_ready at boot
+PENDING_TFA_BY_INST = {}                 # inst → ready_id, links READY verdict → triggered trade
+LAST_TFA_BY_INST    = {}                 # inst → {ready_id, direction, ts}, dedup repeated READY webhooks
+LIVE_TFA_BY_INST    = {}                 # inst → ready_id of the most recently triggered trade
 # Retained (now unused): historical ENTER serialisation lock. Writes now go
 # through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
@@ -21249,6 +21253,44 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             result["swing_v2"] = compute_swing_v2_analysis(active_ticker, result)
         except Exception as _sv2_e:
             result["swing_v2"] = {"available": False, "reason": str(_sv2_e)}
+
+    # ── Trade Failure Analyzer: record actionable READY decisions ─────────────
+    # DISPLAY-ONLY, FAIL-OPEN. Hooks at the single return path AFTER all vetoes so
+    # only the final-verdict READY (not demoted) setups are recorded. The ready_id
+    # is stored per-instrument to link this recording to the eventual trigger + close.
+    # Never touches the money path, never blocks or raises.
+    try:
+        if TFA_DB_READY and is_actionable(verdict):
+            _tfa_eq = None
+            try:
+                _tfa_eq = (scalp_quality_block or {}).get("score")
+            except Exception:
+                pass
+            _tfa_strat = None
+            try:
+                _as = result.get("active_strategy")
+                _tfa_strat = (_as.get("name") if isinstance(_as, dict) else _as) or None
+            except Exception:
+                pass
+            _record_ready_decision(
+                inst         = instrument_of(active_ticker),
+                direction    = strict_direction,
+                mode         = TRADING_MODE,
+                edge_score   = edge_score,
+                eq_score     = _tfa_eq,
+                strategy     = _tfa_strat,
+                bias         = bias,
+                structure_ok = bool((confluences or {}).get("structure_confirmed")),
+                zone_ok      = bool(nearest_demand or nearest_supply),
+                vwap_ok      = bool((confluences or {}).get("vwap")),
+                cvd_ok       = bool((confluences or {}).get("cvd_aligned")),
+                session      = result.get("session"),
+                vol_regime   = (volatility or {}).get("regime"),
+                price        = current_price,
+            )
+    except Exception as _tfa_exc:
+        logger.debug("TFA record-ready fail-open: %s", _tfa_exc)
+
     return result
 
 
@@ -23666,6 +23708,26 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
         _record_strategy_trade(mt)
     except Exception as exc:
         logger.warning("strategy-trade persist error: %s", exc)
+
+    # ── Trade Failure Analyzer: complete the record with outcome + failure mode ──
+    # DISPLAY-ONLY, FAIL-OPEN. Uses LIVE_TFA_BY_INST to find the READY record that
+    # led to this trade (set by _mark_tfa_triggered at gateway time). Pops the slot
+    # so a subsequent same-instrument trade won't re-use this ready_id.
+    try:
+        if TFA_DB_READY:
+            _tfa_inst = mt.get("instrument") or mt.get("symbol")
+            _tfa_rid  = LIVE_TFA_BY_INST.pop(_tfa_inst, None) if _tfa_inst else None
+            if _tfa_rid:
+                _tfa_ctx = mt.get("learning_ctx") or {}
+                _complete_tfa_record(
+                    ready_id  = _tfa_rid,
+                    mt        = mt,
+                    bias      = _tfa_ctx.get("bias"),
+                    vol_regime= _tfa_ctx.get("vol_regime"),
+                    eq_score  = _tfa_ctx.get("entry_quality_score"),
+                )
+    except Exception as _tfa_exc:
+        logger.debug("TFA complete fail-open: %s", _tfa_exc)
 
     # ── SWING (flag-on) multi-day persistence: mark the thesis row closed so a
     # stopped/TP'd SWING trade is NOT resurrected as OPEN on the next boot (the
@@ -27224,6 +27286,283 @@ _MSC_ALERT_HISTORY_MAX_AGE_SEC = 1800                         # 30 min
 _MSC_AUTO_FIRED_MAX_AGE_SEC    = 86400                        # 24 h (same ET day check)
 
 
+# ---------------------------------------------------------------------------
+# Trade Failure Analyzer (TFA) — INSERT/SELECT/UPDATE only (no DDL in app.py).
+# Table `trade_failure_analysis` created via database tool (dev) and Publish
+# schema-diff (prod).  DISPLAY-ONLY: records every final-verdict READY decision
+# post-all-vetoes, whether it triggered, the outcome, MFE/MAE/R, and the
+# primary failure reason.  After every 25 completed trades a Discord summary is
+# posted showing which failure modes are most common.
+# Never touches the money path (gate / sizing / gateway / broker / Discord send).
+# ---------------------------------------------------------------------------
+
+def _check_tfa_db_ready():
+    """Probe the trade_failure_analysis table (no DDL) and set TFA_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB silently disables TFA everywhere."""
+    global TFA_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM trade_failure_analysis LIMIT 0")
+        cur.close()
+        conn.close()
+        TFA_DB_READY = True
+        logger.info("trade_failure_analysis table ready — TFA enabled")
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        logger.warning("trade_failure_analysis table NOT ready: %s — TFA disabled", exc)
+
+
+def _make_tfa_ready_id(inst, direction, ts):
+    """Build a collision-resistant ready_id from instrument, direction, and UTC ts."""
+    return "%s::%s::%s" % (inst, direction, ts.strftime("%Y%m%dT%H%M%SZ"))
+
+
+def _record_ready_decision(inst, direction, mode, edge_score, eq_score, strategy,
+                            bias, structure_ok, zone_ok, vwap_ok, cvd_ok,
+                            session, vol_regime, price):
+    """INSERT a new TFA row when the final READY verdict fires (post-all-vetoes).
+    Deduplicates repeated webhooks: same instrument + direction within 5 minutes
+    = same setup still active, skip.  FAIL-OPEN."""
+    if not TFA_DB_READY:
+        return
+    try:
+        ts    = datetime.now(timezone.utc)
+        _last = LAST_TFA_BY_INST.get(inst)
+        if _last:
+            age_s = (ts - _last["ts"]).total_seconds()
+            if _last["direction"] == direction and age_s < 300:
+                return
+        ready_id = _make_tfa_ready_id(inst, direction, ts)
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO trade_failure_analysis
+               (ready_id, instrument, direction, mode, edge_score, entry_quality_score,
+                strategy, bias, structure_ok, zone_ok, vwap_ok, cvd_ok, session,
+                vol_regime, price_at_ready, ready_at, schema_version)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+               ON CONFLICT (ready_id) DO NOTHING""",
+            (ready_id, inst, direction, mode, edge_score, eq_score, strategy, bias,
+             structure_ok, zone_ok, vwap_ok, cvd_ok, session, vol_regime, price, ts),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        PENDING_TFA_BY_INST[inst] = ready_id
+        LAST_TFA_BY_INST[inst]    = {"ready_id": ready_id, "direction": direction, "ts": ts}
+        logger.debug("TFA READY recorded %s → %s", ready_id, inst)
+    except Exception as exc:
+        logger.debug("_record_ready_decision fail-open: %s", exc)
+
+
+def _mark_tfa_triggered(inst, source, entry_price=None):
+    """UPDATE the TFA row as triggered when the gateway confirms send/simulated.
+    Stores the ready_id in LIVE_TFA_BY_INST so _complete_tfa_record can find it
+    at close time even if a new READY fires for the same instrument first.
+    FAIL-OPEN."""
+    if not TFA_DB_READY:
+        return
+    try:
+        ready_id = PENDING_TFA_BY_INST.get(inst)
+        if not ready_id:
+            return
+        ts_now  = datetime.now(timezone.utc)
+        lag_sec = None
+        _last   = LAST_TFA_BY_INST.get(inst)
+        if _last and _last.get("ts"):
+            lag_sec = round((ts_now - _last["ts"]).total_seconds(), 1)
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE trade_failure_analysis
+               SET triggered=TRUE, triggered_at=%s, trigger_source=%s,
+                   trigger_lag_sec=%s, entry_price=%s
+               WHERE ready_id=%s AND triggered=FALSE""",
+            (ts_now, source, lag_sec, entry_price, ready_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        LIVE_TFA_BY_INST[inst] = ready_id
+        logger.debug("TFA TRIGGERED %s src=%s lag=%.1fs", ready_id, source, lag_sec or 0)
+    except Exception as exc:
+        logger.debug("_mark_tfa_triggered fail-open: %s", exc)
+
+
+def _classify_failure_mode_tfa(mt, ctx, bias=None, vol_regime=None, eq_score=None):
+    """Extended failure classifier for the TFA.  Calls _derive_trade_label for the
+    standard categories then overlays TFA-specific modes: WRONG_BIAS, POOR_LOCATION,
+    VOLATILITY_MISMATCH.  Returns (failure_mode, failure_detail | None).
+    FAIL-OPEN: returns ('UNCATEGORIZED', None) on any error."""
+    try:
+        base_label = _derive_trade_label(mt, ctx)
+        outcome    = (mt.get("outcome") or "").strip()
+        is_win     = "Win" in outcome or base_label == "WIN"
+        if is_win or base_label in ("TP1_THEN_BE", "BREAKEVEN"):
+            return base_label, None
+        direction = (mt.get("direction") or "").strip()
+        _bias     = (bias or "").upper()
+        if _bias and direction:
+            if direction == "Long"  and "BEAR" in _bias:
+                return "WRONG_BIAS", "Bias was %s at entry" % bias
+            if direction == "Short" and "BULL" in _bias:
+                return "WRONG_BIAS", "Bias was %s at entry" % bias
+        if eq_score is not None:
+            try:
+                if float(eq_score) < 60:
+                    return "POOR_LOCATION", "Entry quality %d at entry" % round(float(eq_score))
+            except Exception:
+                pass
+        if vol_regime and "EXTREME" in str(vol_regime).upper():
+            return "VOLATILITY_MISMATCH", "Vol regime: %s" % vol_regime
+        return base_label, None
+    except Exception:
+        return "UNCATEGORIZED", None
+
+
+def _complete_tfa_record(ready_id, mt, bias=None, vol_regime=None, eq_score=None):
+    """UPDATE the TFA row with the final outcome + failure classification when
+    a managed trade closes.  Fires a 25-trade Discord summary every 25 completions.
+    FAIL-OPEN: any DB error is swallowed and logged at DEBUG."""
+    if not TFA_DB_READY or not ready_id:
+        return
+    try:
+        ctx        = mt.get("learning_ctx") or {}
+        outcome    = mt.get("outcome")
+        exit_price = mt.get("exit_price")
+        mfe_r      = mt.get("mfe_r")
+        mae_r      = mt.get("mae_r")
+        r_multiple = mt.get("r_multiple")
+        opened_at  = mt.get("registered_at")
+        closed_at  = mt.get("closed_at")
+        duration_min = None
+        try:
+            if opened_at and closed_at:
+                duration_min = round(
+                    (datetime.fromisoformat(closed_at) -
+                     datetime.fromisoformat(opened_at)).total_seconds() / 60.0, 1)
+        except Exception:
+            pass
+        failure_mode, failure_detail = _classify_failure_mode_tfa(
+            mt, ctx, bias=bias, vol_regime=vol_regime, eq_score=eq_score)
+        ts_now = datetime.now(timezone.utc)
+        conn   = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE trade_failure_analysis
+               SET outcome=%s, exit_price=%s, mfe_r=%s, mae_r=%s, r_multiple=%s,
+                   duration_min=%s, completed_at=%s, failure_mode=%s, failure_detail=%s
+               WHERE ready_id=%s""",
+            (outcome, exit_price, mfe_r, mae_r, r_multiple,
+             duration_min, ts_now, failure_mode, failure_detail, ready_id),
+        )
+        conn.commit()
+        cur.execute(
+            "SELECT COUNT(*) FROM trade_failure_analysis WHERE completed_at IS NOT NULL")
+        row   = cur.fetchone()
+        total = int((row[0] if row else 0) or 0)
+        cur.close()
+        conn.close()
+        logger.debug("TFA COMPLETE %s fm=%s r=%.2f", ready_id, failure_mode, float(r_multiple or 0))
+        if total and total % 25 == 0:
+            _enqueue_slow(_generate_failure_summary, total)
+    except Exception as exc:
+        logger.debug("_complete_tfa_record fail-open: %s", exc)
+
+
+def _expire_stale_tfa_records():
+    """Mark READY decisions older than 2 hours with no trigger as NOT_TRIGGERED.
+    Called from the 60-second snapshot daemon (every 30 iterations = every 30 min).
+    FAIL-OPEN."""
+    if not TFA_DB_READY:
+        return
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE trade_failure_analysis
+               SET failure_mode='NOT_TRIGGERED', outcome='not_triggered',
+                   completed_at=NOW()
+               WHERE triggered=FALSE AND completed_at IS NULL
+                 AND ready_at < NOW() - INTERVAL '2 hours'""")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        logger.debug("_expire_stale_tfa_records fail-open: %s", exc)
+
+
+def _generate_failure_summary(total_count=None):
+    """Query all completed TFA records, compute failure-mode distribution, and post
+    a Discord summary.  Called every 25 completions via _enqueue_slow.  FAIL-OPEN."""
+    if not TFA_DB_READY:
+        return
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT failure_mode, COUNT(*) AS cnt,
+                      ROUND(AVG(r_multiple)::numeric, 2) AS avg_r,
+                      ROUND(AVG(mfe_r)::numeric, 2)      AS avg_mfe,
+                      SUM(CASE WHEN outcome='Win' THEN 1 ELSE 0 END) AS wins
+               FROM trade_failure_analysis
+               WHERE completed_at IS NOT NULL
+               GROUP BY failure_mode
+               ORDER BY cnt DESC
+               LIMIT 15""")
+        rows   = cur.fetchall()
+        cur.execute(
+            """SELECT COUNT(*),
+                      SUM(CASE WHEN outcome='Win' THEN 1 ELSE 0 END)
+               FROM trade_failure_analysis WHERE completed_at IS NOT NULL""")
+        totrow = cur.fetchone() or (0, 0)
+        cur.close()
+        conn.close()
+        total = int(totrow[0] or 0)
+        wins  = int(totrow[1] or 0)
+        if not total:
+            return
+        header = "**Trade Failure Analyzer \u2014 %d Completed Trades**" % total
+        wr_str = "Win Rate: **%d/%d (%d%%)**" % (wins, total, round(100 * wins / total))
+        sep    = "-" * 56
+        col    = "%-26s %5s %7s %8s %6s" % ("Mode", "Count", "AvgR", "AvgMFE", "WinR")
+        rows_s = [header, wr_str, "", "```", col, sep]
+        for mode, cnt, avg_r, avg_mfe, w in rows:
+            wr = "%d%%" % round(100 * w / cnt) if cnt else "-"
+            rows_s.append("%-26s %5d %7.2f %8.2f %6s" % (
+                (mode or "unknown")[:26], cnt,
+                float(avg_r or 0), float(avg_mfe or 0), wr))
+        rows_s.append("```")
+        msg = "\n".join(rows_s)
+        url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+        if url and DISCORD_LIVE_ENABLED:
+            try:
+                requests.post(url, json={"content": msg[:1990]}, timeout=8)
+            except Exception:
+                pass
+        logger.info("TFA 25-trade summary posted: %d completed, %d/%d wins", total, wins, total)
+    except Exception as exc:
+        logger.debug("_generate_failure_summary fail-open: %s", exc)
+
+
 def _check_market_state_cache_db_ready():
     """Probe the market_state_cache table (no DDL) and set MARKET_STATE_CACHE_DB_READY.
     FAIL-OPEN: a missing table / unavailable DB disables all market-state persistence."""
@@ -27426,12 +27765,16 @@ def _alert_history_snapshot_loop():
     market_state_cache every 60 seconds so boot-restore has fresh scoring context.
     Sleeps first so a restart doesn't immediately overwrite a good snapshot. FAIL-OPEN."""
     import time as _t
+    _tfa_expire_ticks = 0
     while True:
         try:
             _t.sleep(60)
             if MARKET_STATE_CACHE_DB_READY:
                 snapshot = list(ALERT_HISTORY)[-100:]
                 _save_market_state("alert_history_snapshot", {"alerts": snapshot})
+            _tfa_expire_ticks += 1
+            if _tfa_expire_ticks % 30 == 0:
+                _expire_stale_tfa_records()
         except Exception as exc:
             logger.debug("_alert_history_snapshot_loop fail-open: %s", exc)
 
@@ -37892,6 +38235,14 @@ def traderspost_order():
                         "reason": f"contracts must be between 1 and {_max_contracts}."}), 400
 
     result, code = execute_trade_gateway(instrument, contracts, source="manual")
+    # ── TFA: mark this setup as triggered via manual ENTER (DISPLAY-ONLY, FAIL-OPEN) ──
+    try:
+        if TFA_DB_READY and (result or {}).get("status") in ("sent", "simulated"):
+            _plan = (result or {}).get("plan") or {}
+            _mark_tfa_triggered(instrument, "manual",
+                                float(_plan.get("entry") or 0) or None)
+    except Exception:
+        pass
     return jsonify(result), code
 
 
@@ -41661,6 +42012,13 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
             plan = result.get("plan") or {}
+            # ── TFA: mark triggered from AUTO (DISPLAY-ONLY, FAIL-OPEN) ──
+            try:
+                if TFA_DB_READY:
+                    _mark_tfa_triggered(inst, source,
+                                        float(plan.get("entry") or 0) or None)
+            except Exception:
+                pass
             if source == "micro_scalp":
                 # REAL-ORDER ledger (display-only): remember exactly what was just
                 # transmitted for the dashboard "real orders" list. FAIL-OPEN —
@@ -54974,6 +55332,74 @@ def review_idea():
     return jsonify(out), 200
 
 
+@app.route("/failure-analysis", methods=["GET"])
+def failure_analysis_route():
+    """Owner-only (dashboard auth via Express /api; NOT in OPEN_PATHS). Returns the
+    last N TFA records + failure-mode distribution summary. DISPLAY-ONLY — never feeds
+    the gate, gateway, or any money-path component. Requires the
+    trade_failure_analysis table (created via DB tool / Publish schema-diff)."""
+    if not TFA_DB_READY:
+        return jsonify({"status": "unavailable",
+                        "reason": "trade_failure_analysis table not ready"}), 503
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        conn  = _learning_conn()
+        if conn is None:
+            return jsonify({"status": "error", "reason": "DB unavailable"}), 503
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT ready_id, instrument, direction, mode, edge_score,
+                      entry_quality_score, strategy, bias, structure_ok, zone_ok,
+                      vwap_ok, vol_regime, session, price_at_ready, ready_at,
+                      triggered, trigger_source, trigger_lag_sec, entry_price,
+                      exit_price, mfe_r, mae_r, r_multiple, duration_min, outcome,
+                      failure_mode, failure_detail, completed_at
+               FROM trade_failure_analysis
+               ORDER BY ready_at DESC LIMIT %s""",
+            (limit,),
+        )
+        cols    = [d[0] for d in cur.description]
+        records = []
+        for row in cur.fetchall():
+            rec = dict(zip(cols, row))
+            for k, v in list(rec.items()):
+                if hasattr(v, "isoformat"):
+                    rec[k] = v.isoformat()
+            records.append(rec)
+        cur.execute(
+            """SELECT failure_mode, COUNT(*) AS cnt,
+                      ROUND(AVG(r_multiple)::numeric, 2) AS avg_r,
+                      ROUND(AVG(mfe_r)::numeric, 2)     AS avg_mfe,
+                      SUM(CASE WHEN outcome='Win' THEN 1 ELSE 0 END) AS wins
+               FROM trade_failure_analysis
+               WHERE completed_at IS NOT NULL
+               GROUP BY failure_mode ORDER BY cnt DESC""")
+        summary = [
+            {"failure_mode": r[0], "count": int(r[1]),
+             "avg_r":   float(r[2] or 0),
+             "avg_mfe": float(r[3] or 0),
+             "wins":    int(r[4] or 0)}
+            for r in cur.fetchall()
+        ]
+        cur.close()
+        conn.close()
+        total_completed = sum(s["count"] for s in summary)
+        total_wins      = sum(s["wins"]  for s in summary)
+        return jsonify({
+            "status":  "ok",
+            "records": records,
+            "summary": summary,
+            "totals":  {
+                "completed":    total_completed,
+                "wins":         total_wins,
+                "win_rate_pct": round(100 * total_wins / total_completed, 1)
+                                if total_completed else None,
+            },
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "reason": str(exc)}), 500
+
+
 # ── AI Assistant (DISPLAY-ONLY chat; read-only Q&A over the live snapshot) ──────
 #    Reuses full_analysis (the same read the dashboard /status poll uses) to ground
 #    its answers. It NEVER touches the gate / scoring / auto-execute path, never
@@ -56574,6 +57000,7 @@ if __name__ == "__main__":
         _check_thesis_eval_db_ready()              # probe thesis_trade_evaluations (no DDL; created via DB tool/publish diff) — THESIS PHASE 3 outcome recording
         _check_safety_overrides_db_ready()         # probe safety_overrides (no DDL; created via DB tool/publish diff) — runtime per-asset safety controls
         _load_safety_overrides_from_db()           # load operator safety overrides (FAIL-OPEN: a DB error keeps the tight protective defaults)
+        _check_tfa_db_ready()                      # probe trade_failure_analysis (no DDL; created via DB tool/publish diff) — READY decision + failure mode recording (DISPLAY-ONLY)
         _check_market_state_cache_db_ready()       # probe market_state_cache (no DDL; created via DB tool/publish diff) — in-memory market-state persistence (CVD, vol-spike, TP dedup, AUTO_FIRED_KEYS, alert history)
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)

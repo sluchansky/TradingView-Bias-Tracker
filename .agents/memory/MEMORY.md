@@ -1,5 +1,7 @@
 # Memory Index
 
+- [Trade Failure Analyzer](trade-failure-analyzer.md) — TFA_DB_READY-gated READY→trigger→outcome recorder; 8 functions + /failure-analysis route; goldens byte-identical when DB absent.
+
 - [Thesis Phase 2 dashboard + alerts](thesis-phase2.md) — timeline/Discord/DB/routes/dashboard panel for thesis hysteresis; emoji escape rules; 33 tests total (P1+P2).
 
 - [Unified Dashboard live-nav](dashboard-live-nav-architecture.md) — 5-section nav is pure-JS show/hide via _liveNavSections map (no data-nav attrs); HV session config + feature flag locations; flag-OFF byte-identical.
