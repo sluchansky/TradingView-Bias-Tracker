@@ -43553,7 +43553,17 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   <div id="adc-panel-readiness" class="adc-panel"><div id="adc-r-content"></div></div>
   <div id="adc-panel-strategy" class="adc-panel"><div id="adc-s-content"></div></div>
   <div id="adc-panel-entryq" class="adc-panel"><div id="adc-eq-content"></div></div>
-  <div id="adc-panel-confidence" class="adc-panel"><div id="adc-cg-content"></div></div>
+  <div id="adc-panel-confidence" class="adc-panel">
+    <div id="adc-cg-content"></div>
+    <div id="adc-cg-controls" style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <span id="adc-cg-gate-btn" role="button" tabindex="0" onclick="toggleLearningGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:#9aa">Demote: off</span>
+        <span id="adc-cg-score-btn" role="button" tabindex="0" onclick="toggleLearningScoreGate()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleLearningScoreGate();}" style="cursor:pointer;font-size:11px;border:1px solid var(--border);border-radius:999px;padding:2px 10px;color:#9aa">Score: off</span>
+      </div>
+      <div id="adc-cg-demote" style="font-size:10px;color:#ef4444;min-height:14px"></div>
+      <div id="adc-cg-lscore" style="font-size:10px;color:#6b7280;margin-top:4px"></div>
+    </div>
+  </div>
   <div id="adc-panel-memory" class="adc-panel"><div id="adc-tm-content"></div></div>
   <div id="adc-panel-microscalp" class="adc-panel"><div id="adc-ms-content"></div></div>
 </div>
@@ -49072,12 +49082,16 @@ function renderPerformanceReport(d){
 // in both the awaiting and ready branches so the toggle is always operable.
 function _paintLearnGate(g){
   LEARNING_GATE_STATE = !!(g && g.gate_enabled);
-  const gt=document.getElementById('cg-gate-toggle');
-  if(gt){ gt.textContent=LEARNING_GATE_STATE?'Demote: ARMED':'Demote: off';
-          gt.style.color=LEARNING_GATE_STATE?'#ef4444':'#9aa';
-          gt.style.borderColor=LEARNING_GATE_STATE?'#ef4444':'var(--border)'; }
-  const de=document.getElementById('cg-demote');
-  if(de){ de.textContent=(g && g.demotion_reason) ? ('⛔ '+g.demotion_reason) : ''; }
+  const _applyGateBtn=function(id){
+    const el=document.getElementById(id); if(!el) return;
+    el.textContent=LEARNING_GATE_STATE?'Demote: ARMED':'Demote: off';
+    el.style.color=LEARNING_GATE_STATE?'#ef4444':'#9aa';
+    el.style.borderColor=LEARNING_GATE_STATE?'#ef4444':'var(--border)';
+  };
+  _applyGateBtn('cg-gate-toggle');
+  _applyGateBtn('adc-cg-gate-btn');
+  const demoteTxt=(g && g.demotion_reason) ? ('\u26d4 '+g.demotion_reason) : '';
+  ['cg-demote','adc-cg-demote'].forEach(function(id){ const e=document.getElementById(id); if(e) e.textContent=demoteTxt; });
 }
 // Learning-influences-SCORING (Task #18) — paints the Score toggle + the base->adjusted
 // Edge nudge line from d.learning_score_influence. Distinct from the Demote veto above:
@@ -49085,35 +49099,48 @@ function _paintLearnGate(g){
 function _paintLearnScoreGate(d){
   const ls = (d && d.learning_score_influence) || null;
   LEARNING_SCORE_STATE = !!(ls && ls.enabled);
-  const gt=document.getElementById('cg-score-toggle');
-  if(gt){ gt.textContent=LEARNING_SCORE_STATE?'Score: ARMED':'Score: off';
-          gt.style.color=LEARNING_SCORE_STATE?'#f59e0b':'#9aa';
-          gt.style.borderColor=LEARNING_SCORE_STATE?'#f59e0b':'var(--border)'; }
-  const el=document.getElementById('cg-lscore');
-  if(!el) return;
-  if(!LEARNING_SCORE_STATE){ el.textContent='Learning -> Score: off — Edge Score unchanged.'; el.style.color='#6b7280'; return; }
-  const cap=(ls && ls.max_delta!=null)?ls.max_delta:15;
-  const fmtDir=function(name,o){
-    if(!o) return '';
-    const base=(o.base!=null)?o.base:'—', adj=(o.adjusted!=null)?o.adjusted:'—';
-    const dl=o.delta||0, w=(o.weight!=null)?o.weight:1;
-    if(dl===0) return name+' '+base+' (no change)';
-    return name+' '+base+'->'+adj+' ('+(dl>0?'+':'')+dl+', w='+w+(o.strategy_key?(', '+o.strategy_key):'')+(o.capped?', capped':'')+')';
+  const _applyScoreBtn=function(id){
+    const el=document.getElementById(id); if(!el) return;
+    el.textContent=LEARNING_SCORE_STATE?'Score: ARMED':'Score: off';
+    el.style.color=LEARNING_SCORE_STATE?'#f59e0b':'#9aa';
+    el.style.borderColor=LEARNING_SCORE_STATE?'#f59e0b':'var(--border)';
   };
-  const parts=[];
-  const L=fmtDir('L', ls.Long), S=fmtDir('S', ls.Short);
-  if(L) parts.push(L);
-  if(S) parts.push(S);
-  el.innerHTML='⚖ Learning -> Score ARMED (±'+cap+'): '+_modEsc(parts.join('   ·   ') || 'no active learning weight');
-  el.style.color='#f59e0b';
+  _applyScoreBtn('cg-score-toggle');
+  _applyScoreBtn('adc-cg-score-btn');
+  let scoreTxt='', scoreColor='#6b7280', scoreIsHTML=false;
+  if(!LEARNING_SCORE_STATE){
+    scoreTxt='Learning -> Score: off \u2014 Edge Score unchanged.';
+  } else {
+    const cap=(ls && ls.max_delta!=null)?ls.max_delta:15;
+    const fmtDir=function(name,o){
+      if(!o) return '';
+      const base=(o.base!=null)?o.base:'\u2014', adj=(o.adjusted!=null)?o.adjusted:'\u2014';
+      const dl=o.delta||0, w=(o.weight!=null)?o.weight:1;
+      if(dl===0) return name+' '+base+' (no change)';
+      return name+' '+base+'->'+adj+' ('+(dl>0?'+':'')+dl+', w='+w+(o.strategy_key?(', '+o.strategy_key):'')+(o.capped?', capped':'')+')';
+    };
+    const parts=[];
+    const L=fmtDir('L', ls.Long), S=fmtDir('S', ls.Short);
+    if(L) parts.push(L);
+    if(S) parts.push(S);
+    scoreTxt='\u2696 Learning -> Score ARMED (\u00b1'+cap+'): '+_modEsc(parts.join('   \u00b7   ') || 'no active learning weight');
+    scoreColor='#f59e0b'; scoreIsHTML=true;
+  }
+  ['cg-lscore','adc-cg-lscore'].forEach(function(id){
+    const el=document.getElementById(id); if(!el) return;
+    if(scoreIsHTML) el.innerHTML=scoreTxt; else el.textContent=scoreTxt;
+    el.style.color=scoreColor;
+  });
 }
 function toggleLearningScoreGate(){
   const cur=!!LEARNING_SCORE_STATE;
   const next=!cur;
   if(next && !confirm('Arm Learning -> Score influence?\\n\\nWhile ARMED, the bounded per-strategy learning weight ADJUSTS the Edge Score (up AND down, capped at ±15) BEFORE the READY gate decides — so it can move a setup INTO or OUT of READY. Affects AUTO-trades + READY alerts; manual ENTER is unaffected. Fail-closed: any error uses the unmodified base score.')) return;
   LEARNING_SCORE_STATE=next;
-  const gt=document.getElementById('cg-score-toggle');
-  if(gt){ gt.textContent=next?'Score: ARMED':'Score: off'; gt.style.color=next?'#f59e0b':'#9aa'; gt.style.borderColor=next?'#f59e0b':'var(--border)'; }
+  ['cg-score-toggle','adc-cg-score-btn'].forEach(function(id){
+    const gt=document.getElementById(id); if(!gt) return;
+    gt.textContent=next?'Score: ARMED':'Score: off'; gt.style.color=next?'#f59e0b':'#9aa'; gt.style.borderColor=next?'#f59e0b':'var(--border)';
+  });
   api('/learning-score', { enabled: next })
     .then(function(d){
       if(!d || d.status!=='ok'){ LEARNING_SCORE_STATE=cur; toast('Learning score update failed', false); return; }
@@ -49127,8 +49154,10 @@ function toggleLearningGate(){
   const next=!cur;
   if(next && !confirm('Arm the Learning demotion VETO?\\n\\nWhile ARMED, the Confidence Governor can DEMOTE an actionable setup to WAIT when its final confidence (Edge + historical adjustments) is below the READY threshold (it can NEVER force a trade). Affects AUTO-trades + READY alerts; manual ENTER is unaffected.')) return;
   LEARNING_GATE_STATE=next;
-  const gt=document.getElementById('cg-gate-toggle');
-  if(gt){ gt.textContent=next?'Demote: ARMED':'Demote: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)'; }
+  ['cg-gate-toggle','adc-cg-gate-btn'].forEach(function(id){
+    const gt=document.getElementById(id); if(!gt) return;
+    gt.textContent=next?'Demote: ARMED':'Demote: off'; gt.style.color=next?'#ef4444':'#9aa'; gt.style.borderColor=next?'#ef4444':'var(--border)';
+  });
   api('/learning', { gate_enabled: next })
     .then(function(d){
       if(!d || d.status!=='ok'){ LEARNING_GATE_STATE=cur; toast('Learning veto update failed', false); return; }
