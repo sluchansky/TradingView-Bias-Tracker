@@ -21213,13 +21213,13 @@ def _dpv2_analyst_briefing(s1, s2, s3, s4, s5, instrument, mode):
     recomputes any signals, never produces trade commands. Fail-open.
     """
     try:
-        regime       = (s2 or {}).get("regime",          "UNKNOWN")
-        driver       = (s2 or {}).get("primary_driver",  "UNKNOWN")
+        regime       = (s2 or {}).get("regime",         "UNKNOWN") or "UNKNOWN"
+        driver       = (s2 or {}).get("primary_driver","UNKNOWN") or "UNKNOWN"
         ranked       = (s3 or {}).get("ranked_instruments") or []
         passed       = (s4 or {}).get("passed_checks")   or []
         failed       = (s4 or {}).get("failed_checks")   or []
         expl         = (s5 or {}).get("explanation")     or {}
-        live_verdict = (s5 or {}).get("production_verdict", "WAIT")
+        live_verdict = (s5 or {}).get("production_verdict") or "WAIT"
 
         # ── 1 & 2. Regime + driver ────────────────────────────────────────────
         _REGIME_LABEL = {
@@ -53402,64 +53402,81 @@ function renderDecisionPipeline(d) {
          reasoning.map(function(r){return aiEsc(r);}).join(' &bull; ')+'</div>';
   }
   var ab = dp.analyst_briefing;
-  if (ab && ab.available) {
-    h += '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">';
-    h += '<div style="font-size:10px;color:#818cf8;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#9998; ANALYST BRIEFING</div>';
+  var abAvail = ab && ab.available;
+  var abErr   = ab && !ab.available && ab.error;
+  h += '<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">';
+  h += '<div style="font-size:10px;color:#818cf8;font-weight:700;letter-spacing:.05em;margin-bottom:8px">&#9998; ANALYST BRIEFING</div>';
+  if (abErr) {
+    h += '<div style="font-size:9px;color:var(--muted);padding:4px 0">Briefing unavailable: '+aiEsc(String(ab.error||''))+'</div>';
+  } else if (!abAvail) {
+    h += '<div style="font-size:9px;color:rgba(130,130,160,.4);padding:4px 0">Awaiting pipeline data&hellip;</div>';
+  } else {
     var me = ab.market_environment || {};
     var mf = ab.money_flow || {};
     var mp = ab.market_priority || {};
     var tv = ab.technical_verdict || {};
-    function bsec(label, val) {
-      if (!val) return '';
-      return '<div style="margin-bottom:8px">'
-        + '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">'+label+'</div>'
-        + '<div style="font-size:10px;color:var(--fg);line-height:1.5">'+aiEsc(val)+'</div>'
+    function brow(label, val, valColor) {
+      var vc = valColor || 'var(--fg)';
+      return '<div style="margin-bottom:7px">'
+        + '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">'+label+'</div>'
+        + '<div style="font-size:10px;color:'+vc+';line-height:1.45;word-break:break-word">'+aiEsc(String(val||''))+'</div>'
         + '</div>';
     }
-    h += bsec('Market Environment', me.regime || '');
-    h += bsec('Primary Driver', me.primary_driver || '');
+    h += brow('Market Environment', me.regime || 'Market regime unavailable');
+    h += brow('Primary Driver',     me.primary_driver || 'No primary driver identified');
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Money Flow</div>';
     if (mf.leading && mf.leading.length) {
-      h += '<div style="margin-bottom:8px">';
-      h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Money Flow</div>';
-      h += '<div style="font-size:9px;margin-bottom:2px"><span style="color:#22c55e;font-weight:700">Leading: </span><span style="color:var(--fg)">'+aiEsc((mf.leading||[]).join(', '))+'</span></div>';
-      if (mf.weak && mf.weak.length) {
-        h += '<div style="font-size:9px"><span style="color:#ef4444;font-weight:700">Weak: </span><span style="color:var(--fg)">'+aiEsc((mf.weak||[]).join(', '))+'</span></div>';
-      }
-      h += '</div>';
+      h += '<div style="font-size:9px;margin-bottom:2px"><span style="color:#22c55e;font-weight:700">Leading: </span><span style="color:var(--fg)">'+aiEsc(mf.leading.join(', '))+'</span></div>';
     }
+    if (mf.weak && mf.weak.length) {
+      h += '<div style="font-size:9px"><span style="color:#ef4444;font-weight:700">Weak: </span><span style="color:var(--fg)">'+aiEsc(mf.weak.join(', '))+'</span></div>';
+    }
+    if ((!mf.leading || !mf.leading.length) && (!mf.weak || !mf.weak.length)) {
+      h += '<div style="font-size:9px;color:rgba(130,130,160,.5)">No clear flow direction identified</div>';
+    }
+    h += '</div>';
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Market Priority</div>';
     if (mp.ranked && mp.ranked.length) {
-      h += '<div style="margin-bottom:8px">';
-      h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Market Priority</div>';
       mp.ranked.slice(0,4).forEach(function(r){
         var isTop = r.priority === 1;
-        h += '<div style="font-size:9px;color:'+(isTop?'var(--fg)':'#94a3b8')+';margin-bottom:1px">';
-        h += r.priority+'. <span style="font-weight:'+(isTop?'700':'400')+'">'+aiEsc(r.symbol)+'</span>';
-        if (r.direction_ctx && r.direction_ctx !== 'UNKNOWN') {
-          h += ' <span style="color:var(--muted)">('+aiEsc(r.direction_ctx.toLowerCase())+')</span>';
-        }
+        h += '<div style="font-size:9px;color:'+(isTop?'var(--fg)':'#94a3b8')+';margin-bottom:2px">';
+        h += '<span style="font-weight:'+(isTop?'700':'400')+'">'+r.priority+'. '+aiEsc(r.symbol)+'</span>';
+        var dctx = (r.direction_ctx||'').replace('UNKNOWN','').toLowerCase().trim();
+        if (dctx) h += ' <span style="color:var(--muted)">&#8212; '+aiEsc(dctx)+'</span>';
         h += '</div>';
       });
       if (mp.top_reason) {
-        h += '<div style="font-size:9px;color:var(--muted);margin-top:3px;font-style:italic">'+aiEsc(mp.top_reason)+'</div>';
+        h += '<div style="font-size:8px;color:var(--muted);margin-top:3px;font-style:italic;word-break:break-word">'+aiEsc(mp.top_reason)+'</div>';
       }
-      h += '</div>';
-    }
-    var tvVerdCol = tv.verdict === 'LONG READY' || tv.verdict === 'SHORT READY' ? '#22c55e' : '#ef4444';
-    h += '<div style="margin-bottom:8px">';
-    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px">Technical Verdict</div>';
-    h += '<div style="font-size:11px;font-weight:800;color:'+tvVerdCol+'">'+aiEsc(tv.verdict||'WAIT')+'</div>';
-    if (tv.blocking_factors && tv.blocking_factors.length) {
-      h += '<div style="font-size:9px;color:var(--muted);margin-top:3px">';
-      (tv.blocking_factors||[]).forEach(function(b){
-        h += '<div>&#10007; '+aiEsc(b)+'</div>';
-      });
-      h += '</div>';
+    } else {
+      h += '<div style="font-size:9px;color:rgba(130,130,160,.5)">Market ranking unavailable</div>';
     }
     h += '</div>';
-    h += bsec('Next Action', ab.next_action || '');
-    h += bsec('Invalidation', ab.invalidation || '');
+    var tvV = tv.verdict || '';
+    var tvReady = (tvV==='LONG READY'||tvV==='SHORT READY');
+    var tvWait  = (!tvV || tvV==='WAIT');
+    var tvColor = tvReady ? '#22c55e' : (tvWait ? '#f59e0b' : '#ef4444');
+    var tvLabel = tvV || 'Awaiting production-engine verdict';
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Technical Verdict</div>';
+    h += '<div style="font-size:11px;font-weight:800;color:'+tvColor+'">'+aiEsc(tvLabel)+'</div>';
+    h += '<div style="font-size:8px;color:rgba(130,130,160,.45);margin-top:1px">Source: Production Engine</div>';
     h += '</div>';
+    var bf = tv.blocking_factors || [];
+    h += '<div style="margin-bottom:7px">';
+    h += '<div style="font-size:8px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px">Blocking Factors</div>';
+    if (bf.length) {
+      bf.forEach(function(b){ h += '<div style="font-size:9px;color:#ef4444;margin-bottom:1px">&#8226; '+aiEsc(b)+'</div>'; });
+    } else {
+      h += '<div style="font-size:9px;color:rgba(130,130,160,.5)">No blocking factors reported</div>';
+    }
+    h += '</div>';
+    h += brow('Next Action',  ab.next_action  || 'No next action defined');
+    h += brow('Invalidation', ab.invalidation || 'Invalidation not yet defined');
   }
+  h += '</div>';
   h += '<div style="font-size:8px;color:rgba(130,130,160,.4);margin-top:8px;border-top:1px solid var(--border);padding-top:6px">Shadow mode &mdash; display only &mdash; no live trading influence</div>';
   el.innerHTML = h;
 }
