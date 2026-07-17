@@ -1,0 +1,280 @@
+TASK: Avatar Extended Conversation — Phase 1
+
+OBJECTIVE
+
+Upgrade the existing dashboard avatar conversation so the user can hold a longer, continuous conversation without losing the current topic or market context.
+
+This is a conversation-layer improvement only.
+
+DO NOT modify:
+- Trading strategies
+- Production verdict logic
+- Broker payloads
+- TradersPost routing
+- Risk management
+- Entry or exit logic
+- Decision Pipeline V2 calculations
+- Existing analyst briefing calculations
+
+REUSE the existing avatar, chat interface, voice controls, market data, and backend endpoints wherever possible.
+
+==================================================
+REQUIREMENTS
+==================================================
+
+1. CONTINUOUS CONVERSATION SESSION
+
+Create a stable conversation session for the avatar.
+
+The conversation must preserve context across multiple messages instead of treating each question as a new conversation.
+
+Store:
+- session_id
+- conversation start time
+- last activity time
+- active instrument
+- active trading mode
+- current production verdict
+- recent user messages
+- recent assistant messages
+- compact conversation summary
+
+Do not send unlimited message history on every request.
+
+Keep the most recent 10 message pairs and a compact summary of older conversation.
+
+2. CONVERSATION MEMORY
+
+The avatar should remember information stated earlier in the same session.
+
+Examples:
+
+User:
+“Why are we waiting on MNQ?”
+
+Avatar:
+“VWAP confirmation and candle confirmation are still missing.”
+
+User:
+“What would change that?”
+
+Avatar must understand that “that” refers to the MNQ WAIT verdict.
+
+User:
+“And what would invalidate it?”
+
+Avatar must continue discussing the same MNQ setup without requiring the user to repeat the instrument or setup.
+
+3. MARKET CONTEXT INJECTION
+
+Each avatar response may receive a read-only snapshot of existing production data:
+
+- Active instrument
+- Active mode
+- Production verdict
+- Analyst Briefing narrative
+- Confidence or edge score
+- Entry
+- Stop
+- Targets
+- Invalidation
+- Rejection reasons
+- Market structure
+- VWAP condition
+- Active zone
+- Latest alert timestamp
+- Position status
+- Working order status
+
+Use existing production outputs.
+
+Do not recalculate market signals inside the conversation system.
+
+The production engine remains the source of truth.
+
+4. RESPONSE GROUNDING
+
+The avatar must clearly distinguish between:
+
+A. Production facts
+B. Explanation
+C. General educational discussion
+
+When discussing a live setup, the avatar must not invent prices, confirmations, entries, stops, targets, or verdicts.
+
+If production data is unavailable, say:
+
+“I do not currently have enough production data to answer that reliably.”
+
+Do not guess.
+
+5. CONVERSATION MODES
+
+Support these conversation intents:
+
+- Explain current verdict
+- Explain why the bot is waiting
+- Explain what must happen next
+- Explain invalidation
+- Explain confidence
+- Summarize the active market
+- Compare current setup to previous setup
+- Explain an indicator or strategy
+- Explain a recent alert
+- Review current position status
+- General follow-up conversation
+
+Do not add trade execution through normal conversation during this phase.
+
+6. FOLLOW-UP SUGGESTIONS
+
+After relevant responses, display up to 3 small follow-up buttons.
+
+Examples:
+
+- What needs to happen next?
+- What invalidates this setup?
+- Why is confidence low?
+- Summarize this simply.
+- Compare this to the last setup.
+
+Follow-up buttons should submit normal user messages through the existing conversation flow.
+
+7. VOICE CONVERSATION
+
+Preserve the existing speak button.
+
+Improve the voice flow so that:
+
+- User taps speak
+- Speech is transcribed
+- Transcript appears in the input
+- Message is submitted
+- Avatar responds
+- Avatar speech plays when enabled
+- Avatar mouth animation runs only while audio is playing
+
+Do not allow multiple overlapping speech responses.
+
+Add:
+- Stop speaking button
+- Mute/unmute avatar
+- Clear conversation button
+
+8. SESSION CONTROLS
+
+Add small controls:
+
+- New conversation
+- Clear conversation
+- Conversation status
+- Voice enabled/disabled
+- Current instrument context
+
+Starting a new conversation should reset conversational memory but must not change production or trading state.
+
+9. ERROR HANDLING
+
+Handle:
+
+- Empty response
+- Request timeout
+- Speech recognition failure
+- Speech playback failure
+- Missing market context
+- Server unavailable
+
+Show a readable message inside the conversation panel.
+
+Do not leave the avatar permanently loading.
+
+10. PERFORMANCE
+
+- Do not reload the full dashboard after every message.
+- Do not restart the avatar model after every response.
+- Avoid duplicate API calls.
+- Limit stored conversation history.
+- Conversation must not block alert processing.
+- Conversation failures must not affect the trading pipeline.
+
+11. LOGGING
+
+Add non-sensitive logs for:
+
+- session created
+- message received
+- context attached
+- response generated
+- speech started
+- speech stopped
+- error encountered
+
+Do not log API keys, authentication tokens, full broker payloads, or private credentials.
+
+==================================================
+ACCEPTANCE TESTS
+==================================================
+
+Test this exact conversation:
+
+User:
+“Why are we waiting?”
+
+Avatar explains the active production WAIT reasons.
+
+User:
+“What needs to happen next?”
+
+Avatar continues discussing the same active setup.
+
+User:
+“What would invalidate it?”
+
+Avatar uses the existing invalidation data.
+
+User:
+“Explain that more simply.”
+
+Avatar simplifies the previous answer rather than starting a new topic.
+
+User:
+“Now summarize the entire setup.”
+
+Avatar gives a concise summary of the same setup.
+
+Also verify:
+
+- New conversation resets conversational memory.
+- Refreshing the page preserves the current session if session persistence already exists.
+- Missing market data produces an honest missing-data response.
+- No broker or TradersPost functions are called.
+- No production decision fields are changed.
+- Existing alert processing remains operational.
+
+==================================================
+DELIVERABLES
+==================================================
+
+Before making changes, identify:
+
+- Existing avatar chat component
+- Existing message endpoint
+- Existing speech input implementation
+- Existing text-to-speech implementation
+- Existing production context endpoint
+- Existing session or history storage
+
+After implementation, report:
+
+1. Files changed
+2. Functions reused
+3. New functions added
+4. How conversation memory works
+5. Maximum retained history
+6. How production context is injected
+7. Tests performed
+8. Confirmation that trading and execution logic were untouched
+
+STOP after completing this phase.
+
+Do not begin another dashboard redesign or add new trading features.

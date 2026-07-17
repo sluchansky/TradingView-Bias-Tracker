@@ -44649,6 +44649,14 @@ def dashboard():
   .mb-chip-manage{border-color:#0c4a6e;color:#38bdf8}.mb-chip-manage:hover{border-color:#0ea5e9;background:#00101a;color:#7dd3fc}
   .mb-chip-block{border-color:#7f1d1d;color:#f87171}.mb-chip-block:hover{border-color:#ef4444;background:#1a0000;color:#fca5a5}
   .mb-qq-state{font-size:9px;text-transform:uppercase;letter-spacing:1.2px;font-weight:800;margin-bottom:4px;opacity:.7}
+  .mb-sess-bar{display:flex;align-items:center;gap:6px;margin:4px 0 10px;flex-wrap:wrap}
+  .mb-sess-btn{background:none;border:1px solid rgba(125,140,255,.2);border-radius:6px;color:#6b7280;font-size:10px;padding:3px 9px;cursor:pointer;letter-spacing:.3px;transition:background .15s,color .15s;white-space:nowrap}
+  .mb-sess-btn:hover{background:rgba(125,140,255,.1);color:#b8c0e0}
+  .mb-sess-btn.active{color:#22c55e;border-color:rgba(34,197,94,.4)}
+  .mb-sess-status{font-size:9px;color:#4b5563;letter-spacing:.4px;margin-left:auto;white-space:nowrap}
+  .mb-followups{display:flex;flex-wrap:wrap;gap:5px;margin:4px 0 6px}
+  .mb-fu-chip{background:#0d1520;color:#818cf8;border:1px solid rgba(129,140,248,.25);border-radius:12px;padding:4px 11px;font-size:11px;cursor:pointer;transition:background .15s,border-color .15s;white-space:nowrap}
+  .mb-fu-chip:hover{background:#1a1f3a;border-color:rgba(129,140,248,.5)}
   .mb-chat-row{display:flex;gap:6px}
   .mb-chat-row input{flex:1;background:#0a0817;border:1px solid #3a2363;border-radius:8px;color:#efe9ff;padding:11px 13px;font-size:13px;transition:border-color .18s,box-shadow .18s}
   .mb-chat-row input:focus{outline:none;border-color:rgba(142,162,255,.65);box-shadow:0 0 0 3px rgba(125,140,255,.12)}
@@ -45923,7 +45931,16 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
          /assistant backend (grounded on the same snapshot + open trades + risk rules).
          DISPLAY-ONLY: it NEVER places, sizes, or changes a trade. -->
     <div class="mb-chat-h">💬 Talk to your partner <span style="font-size:9px;color:#6b7280;letter-spacing:1px">LIVE STATE · READ-ONLY</span></div>
+    <div class="mb-sess-bar">
+      <button type="button" class="mb-sess-btn" onclick="mbNewConv()" title="Start a new conversation (resets memory)">+ New</button>
+      <button type="button" class="mb-sess-btn" onclick="mbClearConv()" title="Clear chat messages">× Clear</button>
+      <button type="button" class="mb-sess-btn" id="mb-voice-toggle" onclick="mbTtsToggle()" title="Toggle voice playback">♫ Voice</button>
+      <button type="button" class="mb-sess-btn" id="mb-speak-inp" onclick="mbToggleSpeechInput()" title="Speak your question">◎ Speak</button>
+      <button type="button" class="mb-sess-btn" id="mb-stop-speak" onclick="mbStopSpeaking()" title="Stop avatar speaking" style="display:none">■ Stop</button>
+      <span class="mb-sess-status" id="mb-sess-status">Ready</span>
+    </div>
     <div id="mb-chat-log" class="mb-chat-log"></div>
+    <div id="mb-conv-followups" class="mb-followups" style="display:none"></div>
     <div id="mb-quick-q" class="mb-chips"></div>
     <div class="mb-chat-row">
       <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
@@ -48680,7 +48697,9 @@ function mbTtsToggle(){
   _ttsMuted = !_ttsMuted;
   var btn = document.getElementById('mb-tts-btn');
   if(btn){ btn.textContent = _ttsMuted ? '\u266b Voice' : '\u266b Live'; btn.className = 'mb-tts-btn' + (_ttsMuted ? '' : ' tts-on'); }
-  if(_ttsMuted && 'speechSynthesis' in window){ window.speechSynthesis.cancel(); _stopSpeakAnim(); }
+  var vt = document.getElementById('mb-voice-toggle');
+  if(vt){ vt.textContent = _ttsMuted ? '\u266b Voice' : '\u266b Live'; vt.className = 'mb-sess-btn' + (_ttsMuted ? '' : ' active'); }
+  if(_ttsMuted && 'speechSynthesis' in window){ window.speechSynthesis.cancel(); _stopSpeakAnim(); var ss=document.getElementById('mb-stop-speak'); if(ss) ss.style.display='none'; }
 }
 function mbSpeak(text){ /* voice is owned by the cockpit avatar — no-op here */ }
 if('speechSynthesis' in window){ try{ window.speechSynthesis.getVoices(); }catch(ignore){} }
@@ -50562,8 +50581,37 @@ function renderMainBrainCognitive(d){
 // snapshot + open trades + risk rules). It NEVER places, sizes, or changes a trade.
 // Own state/ids (mb-*) so it never collides with the legacy assistant panel. All
 // model output is rendered via textContent (XSS-safe), never innerHTML.
-let mbChatHistory = [];   // [{role, content}] — trimmed client-side; server also caps it
-let mbChatBusy = false;   // one /assistant request in flight at a time (no overlap/misorder)
+
+// ── Session state ─────────────────────────────────────────────────────────────
+let mbChatHistory  = [];    // [{role,content}] — max 20 entries kept (10 pairs)
+let mbChatBusy     = false; // one /assistant request in flight at a time (no overlap)
+let mbConvSummary  = '';    // compact digest of older turns (built client-side)
+let mbTurnCount    = 0;     // total turns in this session
+// Session ID persists across page refreshes via sessionStorage
+let mbSessionId = (function(){
+  try{ var s=sessionStorage.getItem('mbSid'); if(s) return s; }catch(x){}
+  var id='mb-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);
+  try{ sessionStorage.setItem('mbSid',id); }catch(x){}
+  return id;
+})();
+var mbSpeechRecog  = null;  // SpeechRecognition instance (null when unsupported)
+var mbSpeechActive = false; // is the microphone currently recording?
+
+function mbSessStatus(txt){
+  var el=document.getElementById('mb-sess-status'); if(el) el.textContent=txt;
+}
+// Build a compact summary of turns older than the recent window for continuity
+function mbBuildConvSummary(){
+  if(mbChatHistory.length<=20) return '';
+  var older=mbChatHistory.slice(0,-20).filter(function(m){ return !m._pending && m.content; });
+  var lines=[];
+  for(var i=0;i<older.length-1;i+=2){
+    var u=older[i]   ? older[i].content.slice(0,100)   : '';
+    var a=older[i+1] ? older[i+1].content.slice(0,100) : '';
+    if(u) lines.push('Q: '+u+' A: '+a);
+  }
+  return lines.slice(-5).join(' | ');
+}
 function mbChatRender(){
   const log = document.getElementById('mb-chat-log');
   if(!log) return;
@@ -50571,7 +50619,7 @@ function mbChatRender(){
   if(!mbChatHistory.length){
     const e = document.createElement('div');
     e.className = 'mb-chat-empty';
-    e.textContent = 'Ask me anything about the live read — tap a button above or type a question.';
+    e.textContent = 'Ask me anything about the live read \u2014 tap a button above or type a question.';
     log.appendChild(e);
     return;
   }
@@ -50598,10 +50646,100 @@ function mbChatRender(){
   });
   log.scrollTop = log.scrollHeight;
 }
+// Render AI follow-up suggestion chips below the chat log (textContent-only, XSS-safe)
+function mbRenderFollowUps(suggestions){
+  var wrap=document.getElementById('mb-conv-followups');
+  if(!wrap) return;
+  if(!Array.isArray(suggestions)||!suggestions.length){ wrap.style.display='none'; wrap.innerHTML=''; return; }
+  wrap.innerHTML=''; wrap.style.display='';
+  suggestions.slice(0,3).forEach(function(txt){
+    if(typeof txt!=='string'||!txt.trim()) return;
+    var btn=document.createElement('button');
+    btn.type='button'; btn.className='mb-fu-chip';
+    btn.textContent=txt.trim();
+    btn.onclick=function(){ mbAsk(txt.trim()); };
+    wrap.appendChild(btn);
+  });
+}
 function mbAsk(q){
   const i = document.getElementById('mb-chat-input');
   if(i){ i.value = q; }
   mbChatSend();
+}
+// Speak an answer via Web Speech API; mouth animation runs while audio plays
+function mbSpeakAnswer(text){
+  if(_ttsMuted||!text||!('speechSynthesis' in window)) return;
+  try{
+    window.speechSynthesis.cancel();
+    var utt=new SpeechSynthesisUtterance(text);
+    utt.rate=1.05; utt.pitch=1.0;
+    utt.onstart=function(){ _startSpeakAnim(); var s=document.getElementById('mb-stop-speak'); if(s) s.style.display=''; console.log('[Avatar] speech started'); };
+    utt.onend  =function(){ _stopSpeakAnim();  var s=document.getElementById('mb-stop-speak'); if(s) s.style.display='none'; console.log('[Avatar] speech ended'); };
+    utt.onerror=function(ev){ _stopSpeakAnim(); var s=document.getElementById('mb-stop-speak'); if(s) s.style.display='none'; console.warn('[Avatar] speech error',ev.error); };
+    window.speechSynthesis.speak(utt);
+  }catch(ex){ console.warn('[Avatar] speak failed',ex); }
+}
+// Stop any active speech and reset the stop button
+function mbStopSpeaking(){
+  if('speechSynthesis' in window){ window.speechSynthesis.cancel(); }
+  _stopSpeakAnim();
+  var s=document.getElementById('mb-stop-speak'); if(s) s.style.display='none';
+  console.log('[Avatar] speech stopped by user');
+}
+// Clear messages but keep the session ID (conversation context resets client-side only)
+function mbClearConv(){
+  mbChatHistory=[]; mbConvSummary='';
+  mbRenderFollowUps([]); mbChatRender();
+  mbSessStatus('Cleared \u00b7 '+mbTurnCount+' turns');
+  console.log('[Avatar] conversation cleared sid=...'+mbSessionId.slice(-6));
+}
+// Start a brand-new session (new ID, full reset — does NOT affect trading state)
+function mbNewConv(){
+  mbChatHistory=[]; mbConvSummary=''; mbTurnCount=0;
+  mbSessionId='mb-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);
+  try{ sessionStorage.setItem('mbSid',mbSessionId); }catch(x){}
+  mbRenderFollowUps([]); mbChatRender();
+  mbSessStatus('New session');
+  console.log('[Avatar] new conversation started sid=...'+mbSessionId.slice(-6));
+}
+// Toggle speech-to-text mic input; on result fills the chat input and auto-submits
+function mbToggleSpeechInput(){
+  var btn=document.getElementById('mb-speak-inp');
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){ mbSessStatus('Speech not supported in this browser'); return; }
+  if(mbSpeechActive){
+    if(mbSpeechRecog) try{ mbSpeechRecog.stop(); }catch(x){}
+    mbSpeechActive=false;
+    if(btn){ btn.textContent='\u25ce Speak'; btn.className='mb-sess-btn'; }
+    mbSessStatus('Mic stopped'); return;
+  }
+  mbSpeechRecog=new SR();
+  mbSpeechRecog.lang='en-US'; mbSpeechRecog.interimResults=false; mbSpeechRecog.maxAlternatives=1;
+  mbSpeechActive=true;
+  if(btn){ btn.textContent='\u25cf Listening\u2026'; btn.className='mb-sess-btn active'; }
+  mbSessStatus('Listening\u2026');
+  mbSpeechRecog.onresult=function(ev){
+    var transcript=((ev.results[0][0]&&ev.results[0][0].transcript)||'').trim();
+    if(transcript){
+      var inp=document.getElementById('mb-chat-input'); if(inp) inp.value=transcript;
+      console.log('[Avatar] speech transcript len='+transcript.length);
+      setTimeout(function(){ mbChatSend(); },120);
+    }
+  };
+  mbSpeechRecog.onerror=function(ev){
+    mbSpeechActive=false;
+    if(btn){ btn.textContent='\u25ce Speak'; btn.className='mb-sess-btn'; }
+    mbSessStatus(ev.error==='not-allowed'?'Mic permission denied':'Speech error: '+ev.error);
+    console.warn('[Avatar] speech error:',ev.error);
+  };
+  mbSpeechRecog.onend=function(){
+    mbSpeechActive=false;
+    if(btn){ btn.textContent='\u25ce Speak'; btn.className='mb-sess-btn'; }
+    var sel=document.getElementById('mb-sess-status');
+    if(sel&&sel.textContent.indexOf('Listening')!==-1) mbSessStatus('Done listening');
+  };
+  try{ mbSpeechRecog.start(); console.log('[Avatar] speech recognition started'); }
+  catch(ex){ mbSpeechActive=false; if(btn){ btn.textContent='\u25ce Speak'; btn.className='mb-sess-btn'; } mbSessStatus('Could not start mic'); console.warn('[Avatar] speech start failed:',ex); }
 }
 async function mbChatSend(){
   const inp = document.getElementById('mb-chat-input');
@@ -50609,29 +50747,47 @@ async function mbChatSend(){
   if(!inp || !btn) return;
   const q = (inp.value || '').trim();
   if(!q) return;
-  if(mbChatBusy) return;   // ignore rapid double-taps while a request is pending
+  if(mbChatBusy) return;
   mbChatBusy = true;
-  const fsk = mbCurSym || sym;  // symbol whose feed this conversation belongs to
-  const priorHist = mbChatHistory.slice(-8).map(function(m){ return {role:m.role, content:m.content}; });
+  mbTurnCount++;
+  const fsk = mbCurSym || sym;
+  // Trim to 20 entries before building history; build compact summary of older turns
+  if(mbChatHistory.length>20) mbChatHistory=mbChatHistory.slice(-20);
+  mbConvSummary=mbBuildConvSummary();
+  const priorHist=mbChatHistory.slice(-10).filter(function(m){ return !m._pending; }).map(function(m){ return {role:m.role,content:m.content}; });
   mbChatHistory.push({ role:'user', content:q });
   inp.value = '';
-  // Push the user question into the live transcript feed
   if(fsk){ if(!mbFeeds[fsk]) mbFeeds[fsk]=[]; mbFeeds[fsk].push({t:mbNowET(),kind:'question',text:q}); mbRenderFeed(fsk,true); }
   mbChatHistory.push({ role:'assistant', content:'\u2026', _pending:true });
   mbChatRender();
   const prev = btn.textContent; btn.disabled = true; btn.textContent = '\u2026';
+  mbSessStatus('Thinking\u2026');
   try{
-    const r = await api('/assistant', { question:q, ticker:sym, history:priorHist });
+    const r = await api('/assistant', {
+      question:             q,
+      ticker:               sym,
+      history:              priorHist,
+      session_id:           mbSessionId,
+      conversation_summary: mbConvSummary || undefined,
+    });
     if(mbChatHistory.length && mbChatHistory[mbChatHistory.length-1]._pending) mbChatHistory.pop();
-    const ans = (!r || r.ok===false) ? ((r&&r.error)?r.error:'Sorry — something went wrong.') : (r.answer||'(no answer)');
+    const ans = (!r||r.ok===false) ? ((r&&r.error)?r.error:'Sorry \u2014 something went wrong.') : (r.answer||'(no answer)');
     mbChatHistory.push({ role:'assistant', content:ans });
-    // Push the answer into the same live transcript feed
     if(fsk && mbFeeds[fsk]){ mbFeeds[fsk].push({t:mbNowET(),kind:'answer',text:ans}); mbRenderFeed(fsk,true); }
+    mbRenderFollowUps((r&&Array.isArray(r.follow_ups))?r.follow_ups:[]);
+    if(r&&r.ok) mbSpeakAnswer(ans);
+    mbSessStatus('Turn '+mbTurnCount+' \u00b7 '+mbSessionId.slice(-5));
+    console.log('[Avatar] answer received sid=...'+mbSessionId.slice(-6)+' turn='+mbTurnCount);
   }catch(e){
     if(mbChatHistory.length && mbChatHistory[mbChatHistory.length-1]._pending) mbChatHistory.pop();
-    const err = 'Request failed — try again.';
-    mbChatHistory.push({ role:'assistant', content:err });
-    if(fsk && mbFeeds[fsk]){ mbFeeds[fsk].push({t:mbNowET(),kind:'answer',text:err}); mbRenderFeed(fsk,true); }
+    var errMsg=(e&&e.name==='AbortError')
+      ?'Request timed out \u2014 AI took too long. Try again.'
+      :'Request failed \u2014 try again.';
+    mbChatHistory.push({ role:'assistant', content:errMsg });
+    if(fsk && mbFeeds[fsk]){ mbFeeds[fsk].push({t:mbNowET(),kind:'answer',text:errMsg}); mbRenderFeed(fsk,true); }
+    mbRenderFollowUps([]);
+    mbSessStatus('Error \u2014 retry');
+    console.warn('[Avatar] chat error:',(e&&e.message?e.message:String(e)).slice(0,80));
   }finally{ mbChatBusy = false; btn.disabled = false; btn.textContent = prev; mbChatRender(); }
 }
 // Blocked Orders — locally-rejected (never-sent) invalid-payload orders. Display-only.
@@ -57763,7 +57919,13 @@ def failure_analysis_route():
 #    Integrations (OpenAI) — keys auto-provisioned, no API key handling here.
 ASSISTANT_MODEL          = "gpt-5.4"
 ASSISTANT_MAX_TOKENS     = 600
-ASSISTANT_HISTORY_TURNS  = 8
+ASSISTANT_HISTORY_TURNS  = 10  # max conversation pairs forwarded per request
+
+# In-memory session registry — lightweight metadata only; no message content stored
+# server-side (history lives in the browser). Display-only; never touches money path.
+_MB_CONV_SESSIONS      = {}        # sid -> {started_at, last_at, turns, instrument}
+_MB_CONV_SESSIONS_LOCK = threading.Lock()
+_MB_CONV_SESSIONS_MAX  = 200
 
 
 def _assistant_live_context(ticker_override=None):
@@ -57989,6 +58151,36 @@ def _assistant_live_context(ticker_override=None):
     }
 
 
+def _assistant_follow_ups(ctx, verdict_key=""):
+    """Return up to 3 context-appropriate follow-up questions. Deterministic —
+    no additional AI call. Display-only; never touches the gate or money path."""
+    has_pos = bool(ctx.get("open_trades"))
+    vk = (verdict_key or "").upper()
+    if "READY" in vk or "EARLY" in vk:
+        return [
+            "What needs to happen for this to stay valid?",
+            "What would invalidate this setup right now?",
+            "Walk me through the entry and stop.",
+        ]
+    if has_pos:
+        return [
+            "How is the current position tracking?",
+            "When should I consider taking partials?",
+            "What would tell you to exit early?",
+        ]
+    if any(x in vk for x in ("WAIT", "WATCHING", "BUILDING", "FORMING")):
+        return [
+            "What needs to happen next?",
+            "What would move this to a trade-ready setup?",
+            "What invalidates the current thesis?",
+        ]
+    return [
+        "Summarize the current market read simply.",
+        "What are you watching most closely right now?",
+        "Is there anything interesting developing?",
+    ]
+
+
 def _assistant_answer(data):
     """Owner-only, DISPLAY-ONLY assistant. Answers questions about the live setup and
     general trading using the read-only snapshot. NEVER touches the gate, scoring,
@@ -58010,14 +58202,53 @@ def _assistant_answer(data):
     raw_tk = data.get("ticker")
     tk = _instrument_from_text(raw_tk.upper()) if isinstance(raw_tk, str) else None
 
+    # ── Session tracking — lightweight metadata only; no content stored server-side ──
+    sid = data.get("session_id")
+    if not isinstance(sid, str) or not sid.strip():
+        sid = None
+    else:
+        sid = sid.strip()[:64]
+    if sid:
+        _ts = datetime.now(timezone.utc).isoformat()
+        with _MB_CONV_SESSIONS_LOCK:
+            if sid not in _MB_CONV_SESSIONS:
+                logger.info("assistant session created sid=...%s inst=%s", sid[-8:], tk or "?")
+                _MB_CONV_SESSIONS[sid] = {
+                    "started_at": _ts,
+                    "last_at":    _ts,
+                    "turns":      0,
+                    "instrument": tk or "unknown",
+                }
+            _sess = _MB_CONV_SESSIONS[sid]
+            _sess["last_at"] = _ts
+            _sess["turns"]   = _sess.get("turns", 0) + 1
+            if tk:
+                _sess["instrument"] = tk
+            # Prune oldest session when over cap
+            if len(_MB_CONV_SESSIONS) > _MB_CONV_SESSIONS_MAX:
+                _oldest = sorted(
+                    _MB_CONV_SESSIONS.items(),
+                    key=lambda kv: kv[1].get("last_at", ""),
+                )[0][0]
+                del _MB_CONV_SESSIONS[_oldest]
+
     try:
         ctx = _assistant_live_context(tk)
     except Exception as exc:
         logger.warning("assistant context build failed (non-fatal): %s", exc)
         ctx = {"selected": {}, "all_instruments": []}
 
+    logger.info("assistant message received sid=...%s inst=%s q_len=%d",
+                (sid or "anon")[-8:], tk or "?", len(question))
+
+    # ── Conversation summary injected by the client (compact digest of older turns) ──
+    raw_summary = data.get("conversation_summary")
+    conv_summary = ""
+    if isinstance(raw_summary, str):
+        conv_summary = raw_summary.strip()[:800]
+
     # Sanitize optional multi-turn history from the client: only known roles + string
-    # content, length-capped, most-recent few turns. Defensive against a malformed body.
+    # content, length-capped, most-recent turns. Defensive against a malformed body.
     history_msgs = []
     raw_hist = data.get("history")
     if isinstance(raw_hist, list):
@@ -58050,6 +58281,13 @@ def _assistant_answer(data):
         "Say 'volatility is 4.6x normal' not 'atr_ratio is 4.6'. "
         "Say 'structure is confirmed bullish' not 'gate_debug says BOS PASS'.\n"
         "- If the question is casual or personal (jokes, feelings, banter), just banter back naturally.\n\n"
+        "CONVERSATION CONTINUITY:\n"
+        "- This is a continuous session. Remember everything said earlier in this conversation.\n"
+        "- If the user says 'that', 'it', 'this setup', 'the same thing', resolve the reference "
+        "from the previous exchange — never ask the user to repeat context.\n"
+        "- If you genuinely lack data, say exactly: "
+        "'I do not currently have enough production data to answer that reliably.' "
+        "Never guess a price, entry, stop, or verdict.\n\n"
         "DATA RULES (only when the question is about the live market):\n"
         "- Use the live snapshot to give the specific real answer — price, verdict, what is missing.\n"
         "- If data is stale (age > 60s), say 'My last read was [X] ago' and answer on that.\n"
@@ -58079,6 +58317,12 @@ def _assistant_answer(data):
     )
 
     messages = [{"role": "system", "content": system_primer}]
+    # Inject conversation summary before recent turns for cross-turn continuity
+    if conv_summary:
+        messages.append({
+            "role": "system",
+            "content": "CONVERSATION SUMMARY (older turns, for continuity):\n" + conv_summary,
+        })
     messages.extend(history_msgs)
     messages.append({"role": "system", "content": snapshot_msg})
     messages.append({"role": "user", "content": question})
@@ -58088,6 +58332,10 @@ def _assistant_answer(data):
         "messages": messages,
         "max_completion_tokens": ASSISTANT_MAX_TOKENS,
     }
+
+    logger.info("assistant context attached sid=...%s history_turns=%d has_summary=%s",
+                (sid or "anon")[-8:], len(history_msgs), bool(conv_summary))
+
     try:
         resp = requests.post(
             base + "/chat/completions",
@@ -58114,11 +58362,19 @@ def _assistant_answer(data):
     if not answer:
         return {"ok": False, "error": "The AI returned an empty answer. Try rephrasing."}
 
+    _verdict_key = (ctx.get("selected") or {}).get("verdict") or ""
+    follow_ups   = _assistant_follow_ups(ctx, _verdict_key)
+
+    logger.info("assistant response generated sid=...%s ans_len=%d follow_ups=%d",
+                (sid or "anon")[-8:], len(answer), len(follow_ups))
+
     return {
-        "ok": True,
-        "answer": answer,
-        "model": ASSISTANT_MODEL,
-        "instrument": (ctx.get("selected") or {}).get("instrument"),
+        "ok":         True,
+        "answer":     answer,
+        "model":      ASSISTANT_MODEL,
+        "instrument": _inst_label,
+        "session_id": sid,
+        "follow_ups": follow_ups,
     }
 
 
