@@ -49255,16 +49255,11 @@ function _prDecisionColor(dec){
   return '#6b7280';
 }
 function renderProReview(d){
-  // Consolidated into ADC Decision tab; sync PRO_GATE_STATE and hide panel.
   const pr=(d && d.pro_review) || null;
   if(pr) PRO_GATE_STATE = !!pr.gate_enabled;
   const _prMod=document.getElementById('mod-pro');
   if(_prMod) _prMod.style.display='none';
-  return;
-  const mod=document.getElementById('mod-pro'); // unreachable — legacy body kept
-  if(!mod) return;
-  if(!pr || !pr.engine_enabled){ mod.style.display='none'; return; }
-  mod.style.display='';
+  if(!pr || !pr.engine_enabled) return;
   const _set=function(id, txt, col){
     const e=document.getElementById(id);
     if(e){ e.textContent=(txt==null||txt==='')?'—':txt; if(col!==undefined) e.style.color=col; }
@@ -51283,8 +51278,8 @@ function hvsRender() {
   body.innerHTML = h;
 }
 function hvsUpdateFromStatus(d) {
-  if (!d || !d.session_windows) return;
-  _hvsData = d.session_windows;
+  if (!d) return;
+  _hvsData = d.session_windows || {};
   hvsRender();
 }
 
