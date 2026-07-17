@@ -126,6 +126,7 @@ AUTO_PRICE_BY_TICKER = {}      # {"MNQ": {"value": float, "ts": iso8601}}
 ACTIVE_TRADES_BY_INST = {}                 # inst -> single trade dict
 ACTIVE_TRADES_LOCK    = threading.RLock()
 ACTIVE_TRADES_DB_READY = False             # set by _check_active_trades_db_ready at boot
+MARKET_STATE_CACHE_DB_READY = False        # set by _check_market_state_cache_db_ready at boot
 # Retained (now unused): historical ENTER serialisation lock. Writes now go
 # through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
@@ -3045,6 +3046,7 @@ def _process_dual_tf_entry_job(resolved_inst, direction=None, trigger_price=None
         if _maybe_auto_execute(inst, allow_stack=True, setup_key=setup_key, source="dual_tf"):
             with AUTO_TRADE_LOCK:
                 AUTO_FIRED_KEYS.add(setup_key)
+            _persist_auto_fired_key(setup_key)
     except Exception as exc:
         logger.error("Dual-TF auto-execute error (non-fatal): %s", exc)
 
@@ -27202,6 +27204,238 @@ def _main_brain_resolver_loop():
 # Persistence mirrors the journal / swing-thesis convention: app-side INSERT/SELECT
 # (+ a status UPDATE on close) ONLY, NO in-app DDL — the manual_trades table is
 # created out-of-band (database tool in dev, Publish schema-diff in prod). FAIL-OPEN
+# ── Market State Cache — boot-restart persistence for in-memory market data ───
+# Persists CVD committed state, volume-spike timestamps, TradersPost duplicate-send
+# fingerprints, AUTO_FIRED_KEYS, and a rolling ALERT_HISTORY snapshot to the
+# `market_state_cache` table. On boot each entry is restored only when it is within
+# its freshness window. Fail-open throughout: any DB error skips silently.
+#
+# Classification (per the State Inventory spec):
+#   MUST PERSIST   — _TRADERSPOST_LAST (TradersPost dedup), AUTO_FIRED_KEYS
+#   MAY RESTORE    — CVD state, volume spike, ALERT_HISTORY snapshot (all expire)
+#   NOT RESTORED   — _READY_STATE_BY_INST (new post-restart evidence required)
+#   NEVER restored as actionable — restored state never calls TradersPost / broker /
+#                                  Discord / journal / evaluation
+_MSC_SCHEMA_VERSION            = 1
+_MSC_CVD_MAX_AGE_SEC           = 3600                         # 60 min
+_MSC_VOLUME_SPIKE_MAX_AGE_SEC  = VOLUME_SPIKE_TTL_MIN * 60    # 20 min (existing constant)
+_MSC_TP_DEDUP_MAX_AGE_SEC      = max(TRADERSPOST_COOLDOWN_SEC * 4, 7200)  # ≥ 2 h
+_MSC_ALERT_HISTORY_MAX_AGE_SEC = 1800                         # 30 min
+_MSC_AUTO_FIRED_MAX_AGE_SEC    = 86400                        # 24 h (same ET day check)
+
+
+def _check_market_state_cache_db_ready():
+    """Probe the market_state_cache table (no DDL) and set MARKET_STATE_CACHE_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB disables all market-state persistence."""
+    global MARKET_STATE_CACHE_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM market_state_cache LIMIT 1")
+            cur.fetchone()
+        MARKET_STATE_CACHE_DB_READY = True
+        logger.info("market_state_cache table ready")
+    except Exception as exc:
+        logger.warning(
+            "market_state_cache table unavailable (market-state persistence disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _save_market_state(key, data):
+    """Upsert one entry in market_state_cache. Called from the fast / data-only
+    webhook arms and from the slow-task worker — NOT inside shared locks. FAIL-OPEN."""
+    if not MARKET_STATE_CACHE_DB_READY:
+        return
+    try:
+        import json as _json
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO market_state_cache (key, data, schema_version, updated_at)
+                       VALUES (%s, %s::jsonb, %s, NOW())
+                       ON CONFLICT (key) DO UPDATE
+                         SET data           = EXCLUDED.data,
+                             schema_version = EXCLUDED.schema_version,
+                             updated_at     = EXCLUDED.updated_at""",
+                    (key, _json.dumps(data, default=str), _MSC_SCHEMA_VERSION),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("_save_market_state(%r) fail-open: %s", key, exc)
+
+
+def _load_market_state(key, max_age_sec=None):
+    """Return the data dict for `key` if it exists and is within `max_age_sec` seconds
+    of its last update. Returns None if absent, stale, or on any error. FAIL-OPEN."""
+    if not MARKET_STATE_CACHE_DB_READY:
+        return None
+    try:
+        import json as _json
+        conn = _learning_conn()
+        if conn is None:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT data, updated_at FROM market_state_cache WHERE key = %s",
+                    (key,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        data_raw, updated_at = row
+        if max_age_sec is not None and updated_at:
+            age_sec = (now_utc() - updated_at).total_seconds()
+            if age_sec > max_age_sec:
+                return None
+        return (data_raw if isinstance(data_raw, dict) else _json.loads(data_raw or "{}"))
+    except Exception as exc:
+        logger.debug("_load_market_state(%r) fail-open: %s", key, exc)
+        return None
+
+
+def _restore_market_state_from_db():
+    """Boot restore: load CVD state, volume-spike timestamps, TradersPost dedup
+    fingerprints, AUTO_FIRED_KEYS, and the ALERT_HISTORY snapshot from
+    market_state_cache if each entry is within its freshness window.
+
+    Safety invariants (enforced unconditionally):
+    - NEVER submits a TradersPost / broker order.
+    - NEVER sends a Discord message or creates a journal entry.
+    - NEVER creates a thesis transition or shadow evaluation.
+    - NEVER marks any verdict as actionable.
+    - Restored READY state is intentionally NOT restored — only new post-restart
+      market evidence can create an actionable READY event.
+    FAIL-OPEN throughout."""
+    if not MARKET_STATE_CACHE_DB_READY:
+        return
+    restored_cvd = restored_vol = restored_tp = restored_auto = restored_alerts = 0
+
+    # ── CVD committed state (MAY RESTORE IF FRESH) ────────────────────────────
+    for inst in _ALERT_INSTRUMENTS:
+        try:
+            data = _load_market_state("cvd::" + inst, _MSC_CVD_MAX_AGE_SEC)
+            if data and data.get("state") and data.get("ts"):
+                CVD_BY_TICKER[inst] = data
+                restored_cvd += 1
+                logger.info("Market-state restore: CVD %s state=%s (from cache)",
+                            inst, data.get("state"))
+        except Exception as exc:
+            logger.debug("CVD restore fail-open [%s]: %s", inst, exc)
+
+    # ── Volume-spike timestamps (MAY RESTORE IF FRESH) ────────────────────────
+    for inst in _ALERT_INSTRUMENTS:
+        try:
+            data = _load_market_state("volume_spike::" + inst, _MSC_VOLUME_SPIKE_MAX_AGE_SEC)
+            if data and data.get("ts"):
+                VOLUME_SPIKE_BY_TICKER[inst] = {"ts": data["ts"]}
+                restored_vol += 1
+                logger.info("Market-state restore: volume spike %s ts=%s (from cache)",
+                            inst, data["ts"])
+        except Exception as exc:
+            logger.debug("Volume-spike restore fail-open [%s]: %s", inst, exc)
+
+    # ── TradersPost duplicate-send guard (MUST PERSIST) ───────────────────────
+    for inst in _ALERT_INSTRUMENTS:
+        try:
+            data = _load_market_state("traderspost_last::" + inst, _MSC_TP_DEDUP_MAX_AGE_SEC)
+            if data and data.get("fingerprint") and data.get("epoch"):
+                with _TRADERSPOST_LOCK:
+                    _TRADERSPOST_LAST[inst] = (data["fingerprint"], float(data["epoch"]))
+                restored_tp += 1
+                logger.info("Market-state restore: TradersPost dedup %s (from cache)", inst)
+        except Exception as exc:
+            logger.debug("TradersPost dedup restore fail-open [%s]: %s", inst, exc)
+
+    # ── AUTO_FIRED_KEYS — fire-once auto-trade dedup (MUST PERSIST) ───────────
+    try:
+        data = _load_market_state("auto_fired_keys", _MSC_AUTO_FIRED_MAX_AGE_SEC)
+        if data:
+            today_et = now_utc().astimezone(ET_TZ).strftime("%Y-%m-%d")
+            if data.get("date_et") == today_et:
+                raw_keys = data.get("keys", [])
+                with AUTO_TRADE_LOCK:
+                    for raw_key in raw_keys:
+                        try:
+                            k = tuple(raw_key) if isinstance(raw_key, list) else raw_key
+                            AUTO_FIRED_KEYS.add(k)
+                            restored_auto += 1
+                        except Exception:
+                            pass
+                if restored_auto:
+                    logger.info("Market-state restore: %d AUTO_FIRED_KEYS date=%s",
+                                restored_auto, today_et)
+            else:
+                logger.info(
+                    "Market-state restore: AUTO_FIRED_KEYS skipped — stale date "
+                    "(stored=%s today=%s)", data.get("date_et"), today_et)
+    except Exception as exc:
+        logger.debug("AUTO_FIRED_KEYS restore fail-open: %s", exc)
+
+    # ── ALERT_HISTORY snapshot (MAY RESTORE IF FRESH) ─────────────────────────
+    try:
+        data = _load_market_state("alert_history_snapshot", _MSC_ALERT_HISTORY_MAX_AGE_SEC)
+        if data and isinstance(data.get("alerts"), list):
+            alerts = data["alerts"]
+            ALERT_HISTORY.clear()
+            ALERT_HISTORY.extend(alerts[-100:])
+            restored_alerts = len(ALERT_HISTORY)
+            logger.info("Market-state restore: ALERT_HISTORY %d entries (from cache)",
+                        restored_alerts)
+    except Exception as exc:
+        logger.debug("ALERT_HISTORY restore fail-open: %s", exc)
+
+    logger.info(
+        "Market-state restore complete: CVD=%d vol=%d tp_dedup=%d "
+        "auto_keys=%d alerts=%d",
+        restored_cvd, restored_vol, restored_tp, restored_auto, restored_alerts,
+    )
+
+
+def _persist_auto_fired_key(key):
+    """Persist the full AUTO_FIRED_KEYS set after a new key is added.
+    Snapshots the set under AUTO_TRADE_LOCK then writes outside the lock. FAIL-OPEN."""
+    if not MARKET_STATE_CACHE_DB_READY:
+        return
+    try:
+        today_et = now_utc().astimezone(ET_TZ).strftime("%Y-%m-%d")
+        with AUTO_TRADE_LOCK:
+            keys_snapshot = list(AUTO_FIRED_KEYS)
+        serialized = [list(k) if isinstance(k, tuple) else k for k in keys_snapshot]
+        _save_market_state("auto_fired_keys", {"keys": serialized, "date_et": today_et})
+    except Exception as exc:
+        logger.debug("_persist_auto_fired_key fail-open: %s", exc)
+
+
+def _alert_history_snapshot_loop():
+    """Background daemon: snapshot the last 100 ALERT_HISTORY entries to
+    market_state_cache every 60 seconds so boot-restore has fresh scoring context.
+    Sleeps first so a restart doesn't immediately overwrite a good snapshot. FAIL-OPEN."""
+    import time as _t
+    while True:
+        try:
+            _t.sleep(60)
+            if MARKET_STATE_CACHE_DB_READY:
+                snapshot = list(ALERT_HISTORY)[-100:]
+                _save_market_state("alert_history_snapshot", {"alerts": snapshot})
+        except Exception as exc:
+            logger.debug("_alert_history_snapshot_loop fail-open: %s", exc)
+
+
 # throughout: when the table / DB is unavailable the manager runs in-memory only and
 # a restart simply clears the (display-only) monitor.
 MANUAL_TRADE_DB_READY = False
@@ -30550,6 +30784,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                                            setup_key=_setup_key):
                         with AUTO_TRADE_LOCK:
                             AUTO_FIRED_KEYS.add(_setup_key)
+                        _persist_auto_fired_key(_setup_key)
                 except Exception as exc:
                     logger.error("Auto-trade dispatch error (non-fatal): %s", exc)
     else:
@@ -30594,6 +30829,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
                                            setup_key=_fe_key, source="fast_entry"):
                         with AUTO_TRADE_LOCK:
                             AUTO_FIRED_KEYS.add(_fe_key)
+                        _persist_auto_fired_key(_fe_key)
                 except Exception as exc:
                     logger.error("Fast-entry auto-execute error (non-fatal): %s", exc)
 
@@ -36119,6 +36355,7 @@ def webhook():
             "opposite_count":       opp_count,
             "last_opposite_minute": last_opp_min,
         }
+        _save_market_state("cvd::" + resolved_inst, CVD_BY_TICKER[resolved_inst])
         logger.info("CVD update: %s signaled=%s committed=%s (%s, value=%s, dir=%s)",
                     resolved_inst, signaled_state, committed_state, _flip_note, cvd_val, cvd_dir)
         _record_diagnostic("%s | %s — CVD signaled %s, committed %s (%s) — data only, no scoring" % (
@@ -36143,6 +36380,7 @@ def webhook():
     #    until a spike arrives, volume confirmation falls back to RVOL / no-data.
     if normalized in VOLUME_SPIKE_TYPES:
         VOLUME_SPIKE_BY_TICKER[resolved_inst] = {"ts": now_utc().isoformat()}
+        _save_market_state("volume_spike::" + resolved_inst, VOLUME_SPIKE_BY_TICKER[resolved_inst])
         logger.info("Volume-spike update: %s", resolved_inst)
         _record_diagnostic("%s | %s — VOLUME SPIKE — data only, no scoring" % (
             fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), resolved_inst))
@@ -41197,6 +41435,7 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
                             "reason": (f"Duplicate order suppressed — the same {instrument} setup was sent "
                                        f"{int(now - prev[1])}s ago (cooldown {TRADERSPOST_COOLDOWN_SEC}s).")}, 429
         _TRADERSPOST_LAST[instrument] = (fingerprint, now)
+    _save_market_state("traderspost_last::" + instrument, {"fingerprint": fingerprint, "epoch": now})
 
     def _release_slot():
         # Nothing was placed at the broker — free the cooldown so a retry is allowed.
@@ -56335,7 +56574,11 @@ if __name__ == "__main__":
         _check_thesis_eval_db_ready()              # probe thesis_trade_evaluations (no DDL; created via DB tool/publish diff) — THESIS PHASE 3 outcome recording
         _check_safety_overrides_db_ready()         # probe safety_overrides (no DDL; created via DB tool/publish diff) — runtime per-asset safety controls
         _load_safety_overrides_from_db()           # load operator safety overrides (FAIL-OPEN: a DB error keeps the tight protective defaults)
+        _check_market_state_cache_db_ready()       # probe market_state_cache (no DDL; created via DB tool/publish diff) — in-memory market-state persistence (CVD, vol-spike, TP dedup, AUTO_FIRED_KEYS, alert history)
+        _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
+    if LEARNING_DB_ENABLED:
+        threading.Thread(target=_alert_history_snapshot_loop, daemon=True).start()  # snapshot ALERT_HISTORY to market_state_cache every 60s so boot-restore has fresh scoring context
     threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
     threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
     threading.Timer(0, _managed_watch_loop).start()  # open-trade exit (stop/TP) watcher on its own fast timer (MANAGED_WATCH_INTERVAL); no-op while flat, never feeds the gate
