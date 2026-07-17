@@ -42364,7 +42364,7 @@ def dashboard():
   .blr-obs-tbl td:first-child{color:#6b7280;font-size:9.5px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap;width:52%}
   .blr-obs-tbl td:last-child{color:#c8d0f0;text-align:right;font-weight:600}
   /* Responsive: single column on small screens — show drawer inline */
-  @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-left,#bl-right{display:none}#view-live{display:block}#view-live > .mod,#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}}
+  @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-left,#bl-right{display:none}#view-live{display:block}#view-live > .mod:not(.ln-hidden),#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}#view-live > .mod.ln-hidden{display:none!important}}
   .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
   .mb-av-sep{color:#2d2d40;font-size:14px}
   .mb-av-foot{font-size:10px;letter-spacing:.5px;margin-top:10px;display:flex;align-items:center;justify-content:center;gap:10px;color:#4b5563}
@@ -50147,7 +50147,14 @@ function renderAiDecisionCenter(d) {
     } else { eqInEl.textContent='\u2014'; eqInEl.style.color='#6b7280'; }
   }
   var gp=a.game_plan||{};
-  var trig=(gp.next_opportunity)||(d&&d.next_trigger)||'';
+  var _no=(gp&&gp.next_opportunity)||null;
+  var _noStr='';
+  if(_no&&typeof _no==='object'){
+    var _wf=(_no.waiting_for||[]).filter(Boolean);
+    if(_wf.length) _noStr=_wf.join(' \u00b7 ');
+    else if(_no.estimated_entry&&_no.estimated_entry!=='\u2014') _noStr=_no.estimated_entry;
+  } else if(typeof _no==='string'){ _noStr=_no; }
+  var trig=_noStr||(d&&typeof d.next_trigger==='string'?d.next_trigger:'')||'';
   var trigRow=document.getElementById('adc-trigger-row'), trigEl=document.getElementById('adc-trigger');
   if (trigRow) trigRow.style.display=trig?'':'none';
   if (trigEl)  trigEl.textContent=trig;
