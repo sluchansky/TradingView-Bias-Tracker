@@ -44929,11 +44929,7 @@ def dashboard():
   #blh-speak-btn{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;padding:6px 0;border:1px solid rgba(239,68,68,.18);border-radius:8px;background:rgba(239,68,68,.06);color:#ef4444;font-size:10.5px;font-family:var(--sans);letter-spacing:.6px;cursor:pointer;margin-top:5px;transition:background .18s,color .18s}
   #blh-speak-btn:hover{background:rgba(239,68,68,.13);color:#f4f4f4}
   /* ── Left column avatar + market context ── */
-  .bl-av-wrap{text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(239,68,68,.10);margin-bottom:10px}
-  .bl-av-svg{width:70px;height:93px;margin:0 auto 5px;display:block;filter:drop-shadow(0 0 10px rgba(239,68,68,.28))}
-  #bl-av-state-lbl{font-size:7.5px;letter-spacing:2px;text-transform:uppercase;color:#374151;font-weight:700;text-align:center;margin-bottom:6px}
-  .bl-av-chat-btn{width:100%;padding:6px 4px;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-radius:7px;border:1px solid rgba(239,68,68,.28);color:#ef4444;background:rgba(34,197,94,.05);cursor:pointer;margin-bottom:10px;transition:all .16s;font-family:var(--sans)}
-  .bl-av-chat-btn:hover{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.45)}
+
   .bl-mc-tbl{width:100%;border-collapse:collapse;font-size:10px;margin-bottom:10px}
   .bl-mc-tbl td{padding:4px 2px;border-bottom:1px solid rgba(255,255,255,.06)}
   .bl-mc-tbl tr:last-child td{border-bottom:none}
@@ -45885,29 +45881,7 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
 
   <!-- LEFT COLUMN ── avatar + market context + compact controls -->
   <div id="bl-left">
-    <!-- Avatar -->
-    <div class="bl-av-wrap">
-      <svg class="bl-av-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
-        <defs><radialGradient id="blHG" cx="50%" cy="38%" r="58%"><stop offset="0%" stop-color="#253249"/><stop offset="100%" stop-color="#0c1422"/></radialGradient></defs>
-        <rect x="52" y="120" width="16" height="36" rx="5" fill="#111c30"/>
-        <path d="M0,158 Q28,130 52,120 L68,120 Q92,130 120,158 Z" fill="#0c1625"/>
-        <rect x="18" y="16" width="84" height="108" rx="30" fill="url(#blHG)"/>
-        <ellipse cx="60" cy="27" rx="22" ry="8" fill="rgba(255,255,255,.03)"/>
-        <ellipse cx="40" cy="61" rx="12.5" ry="9" fill="#071325"/>
-        <ellipse cx="80" cy="61" rx="12.5" ry="9" fill="#071325"/>
-        <circle cx="40" cy="61" r="6" fill="#0ea5e9" opacity=".9"/>
-        <circle cx="40" cy="61" r="3" fill="#020c1c"/>
-        <circle cx="38.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
-        <circle cx="80" cy="61" r="6" fill="#0ea5e9" opacity=".9"/>
-        <circle cx="80" cy="61" r="3" fill="#020c1c"/>
-        <circle cx="78.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
-        <path d="M46,94 Q60,97 74,94" stroke="rgba(80,120,200,.6)" stroke-width="2" fill="none" stroke-linecap="round"/>
-        <circle cx="60" cy="19" r="2.8" fill="#0ea5e9" opacity=".85"/>
-        <ellipse cx="60" cy="156" rx="22" ry="4" fill="rgba(14,165,233,.1)"/>
-      </svg>
-      <div id="bl-av-state-lbl">OBSERVING</div>
-      <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
-    </div>
+
     <!-- Market Context -->
     <div class="bl-sect-h">Market Context</div>
     <table class="bl-mc-tbl">
