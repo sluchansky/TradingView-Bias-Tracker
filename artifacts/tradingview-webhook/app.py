@@ -44439,6 +44439,29 @@ def _load_icon_data_uri():
 APP_ICON_DATA_URI = _load_icon_data_uri()
 
 
+def _load_dicebear_svg():
+    """Fetch DiceBear lorelei-neutral SVG once at startup; inject animation IDs."""
+    try:
+        import urllib.request as _ur
+        _url = ("https://api.dicebear.com/9.x/lorelei-neutral/svg"
+                "?seed=Felix&backgroundColor=transparent")
+        with _ur.urlopen(_url, timeout=8) as _r:
+            _svg = _r.read().decode("utf-8")
+        _svg = _svg.replace(
+            '<g transform="translate(-246 -234)"><g fill="#000000">',
+            '<g id="db-eyes" transform="translate(-246 -234)"><g fill="#000000">'
+        )
+        _svg = _svg.replace(
+            '<g transform="translate(-246 -234)"><path fill-rule="evenodd"',
+            '<g id="db-mouth" transform="translate(-246 -234)"><path fill-rule="evenodd"'
+        )
+        return _svg
+    except Exception:
+        return ""
+
+DICEBEAR_SVG = _load_dicebear_svg()
+
+
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     html = """<!DOCTYPE html>
@@ -46005,9 +46028,7 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
-        <img id="mb-dicebear-avatar" class="mb-dicebear-av"
-             src="https://api.dicebear.com/9.x/lorelei-neutral/svg?seed=Felix&backgroundColor=transparent"
-             alt="avatar" crossorigin="anonymous"/>
+        <div id="mb-dicebear-avatar" class="mb-dicebear-av">__DICEBEAR_SVG__</div>
         <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <!-- Humanoid defs kept for JS compatibility (updateCharacter refs these) -->
@@ -58219,6 +58240,7 @@ import { VRMLoaderPlugin, VRMUtils } from 'https://esm.sh/@pixiv/three-vrm@2';
     html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
     html = html.replace("__BELL_DATA_URI__", BELL_DATA_URI)
     html = html.replace("__APP_ICON_DATA_URI__", APP_ICON_DATA_URI)
+    html = html.replace("__DICEBEAR_SVG__", DICEBEAR_SVG)
     html = html.replace("__UNIFIED_DASH__", "1" if UNIFIED_DASHBOARD_ENABLED else "0")
     html = html.replace("__HV_PANEL__", "1" if HIGH_VOLUME_PANEL_ENABLED else "0")
     return html, 200, {
