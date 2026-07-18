@@ -44516,15 +44516,15 @@ def dashboard():
     --glass-shadow:0 10px 34px rgba(0,0,0,.72),0 2px 8px rgba(0,0,0,.55);
     --glass-shadow-hi:0 16px 48px rgba(0,0,0,.85),0 0 0 1px rgba(80,100,200,.14);
   }
-  html.dark .vw-bg{background:
-    radial-gradient(900px 620px at 16% -12%,rgba(50,65,160,.10),transparent 60%),
-    radial-gradient(820px 600px at 102% -4%,rgba(30,110,160,.07),transparent 55%),
-    linear-gradient(180deg,#030508 0%,#000000 58%,#020304 100%)}
-  html.dark #mod-brain{background:linear-gradient(165deg,rgba(8,10,22,.97),rgba(4,5,14,.92));border-color:rgba(80,100,200,.22)}
-  html.dark .mod{background:linear-gradient(165deg,rgba(4,5,13,.97),rgba(2,3,9,.95));border-color:rgba(55,70,160,.09)}
-  html.dark .brain-hero{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(18,24,72,.32),transparent 65%),linear-gradient(180deg,#010103 0%,#000000 100%)}
-  html.dark .brain-state-pill{background:rgba(255,255,255,.04)}
-  html.dark .mod-h{background:rgba(3,4,11,.95);border-color:rgba(55,70,160,.09)}
+  html.dark .vw-bg{background:#000000}
+  html.dark #mod-brain{background:#000000;border-color:rgba(255,255,255,.14)}
+  html.dark .mod{background:#050507;border-color:rgba(255,255,255,.13)}
+  html.dark .brain-hero{background:#000000}
+  html.dark .brain-state-pill{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.22)}
+  html.dark .mod-h{background:#000000;border-color:rgba(255,255,255,.10);color:#ffffff}
+  html.dark body{color:#e8ecff}
+  html.dark .mod *{--text:#e8ecff;--muted:#9098b8}
+  html.dark .brain-orb-halo{opacity:.6}
   html{background:var(--bg)}
   body{zoom:.80;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
@@ -58321,101 +58321,6 @@ setTimeout(loadThesisStats, 1500);
   }, 2000);
   window.orbWinPulse  = _orWin;
   window.orbLossPulse = _orLoss;
-})();
-</script>
-<script type="module">
-import * as THREE from 'https://esm.sh/three@0.170.0';
-import { GLTFLoader } from 'https://esm.sh/three@0.170.0/examples/jsm/loaders/GLTFLoader';
-import { VRMLoaderPlugin, VRMUtils } from 'https://esm.sh/@pixiv/three-vrm@2';
-(function(){
-  var orbEl = document.getElementById('mb-orb');
-  if(!orbEl) return;
-  var canvas = document.createElement('canvas');
-  canvas.id = 'mb-pig-canvas';
-  canvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:5;border-radius:inherit;pointer-events:none;';
-  orbEl.appendChild(canvas);
-  var st = document.createElement('div');
-  st.style.cssText = 'position:absolute;bottom:6px;left:0;right:0;text-align:center;font-size:8px;color:rgba(255,255,255,.28);font-family:monospace;z-index:6;pointer-events:none;letter-spacing:.5px;';
-  st.textContent = 'connecting...';
-  orbEl.appendChild(st);
-  var W = orbEl.clientWidth||248, H = orbEl.clientHeight||316;
-  var renderer = new THREE.WebGLRenderer({canvas:canvas,alpha:true,antialias:true});
-  renderer.setSize(W,H);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
-  var scene = new THREE.Scene();
-  var camera = new THREE.PerspectiveCamera(26,W/H,0.01,20);
-  camera.position.set(0,0.90,2.2);
-  camera.lookAt(new THREE.Vector3(0,0.86,0));
-  scene.add(new THREE.AmbientLight(0xffeedd,1.1));
-  var key=new THREE.DirectionalLight(0xfff8f0,2.2); key.position.set(1.2,2.5,2.0); scene.add(key);
-  var rim=new THREE.DirectionalLight(0xff2200,0.55); rim.position.set(-2,0.8,-1.5); scene.add(rim);
-  var fill=new THREE.DirectionalLight(0x334466,0.25); fill.position.set(0.5,-0.5,1.5); scene.add(fill);
-  var stL=new THREE.PointLight(0xef4444,0.9,4); stL.position.set(0,0.5,1.8); scene.add(stL);
-  var loader=new GLTFLoader();
-  loader.register(function(p){ return new VRMLoaderPlugin(p); });
-  var vrm=null, clock=new THREE.Clock();
-  var breatheP=0, swayP=0, blinkT=0, blinkC=3+Math.random()*2;
-  loader.load('/api/vrm',
-    function(gltf){
-      vrm=gltf.userData.vrm;
-      try{ VRMUtils.removeUnnecessaryVertices(vrm.scene); }catch(x){}
-      try{ VRMUtils.combineSkeletons(vrm.scene); }catch(x){}
-      vrm.scene.traverse(function(o){ o.frustumCulled=false; });
-      scene.add(vrm.scene);
-      st.textContent='Lord Piggington';
-      setTimeout(function(){ st.style.transition='opacity 2s'; st.style.opacity='0'; },2500);
-    },
-    function(p){ if(p.total>0) st.textContent='loading '+Math.round(p.loaded/p.total*100)+'%'; },
-    function(e){ console.warn('[VRM]',e); canvas.style.display='none'; st.textContent=''; }
-  );
-  function bone(n){ try{ return vrm.humanoid.getRawBoneNode(n); }catch(x){ return null; } }
-  var blinkNames=['blink','Blink','blinkLeft','BlinkLeft'];
-  function doBlink(){
-    if(!vrm||!vrm.expressionManager) return;
-    var em=vrm.expressionManager, found=false;
-    for(var i=0;i<blinkNames.length;i++){ try{ em.setValue(blinkNames[i],1); found=true; }catch(x){} }
-    if(!found) return;
-    setTimeout(function(){
-      if(!vrm||!vrm.expressionManager) return;
-      for(var i=0;i<blinkNames.length;i++){ try{ vrm.expressionManager.setValue(blinkNames[i],0); }catch(x){} }
-    },130);
-  }
-  function animate(){
-    requestAnimationFrame(animate);
-    var dt=Math.min(clock.getDelta(),0.05);
-    if(vrm){
-      vrm.update(dt);
-      breatheP+=dt*0.72;
-      var bv=Math.sin(breatheP)*0.018;
-      var ch=bone('chest'), sp=bone('spine');
-      if(ch) ch.rotation.x=bv;
-      if(sp) sp.rotation.x=bv*0.35;
-      swayP+=dt*0.26;
-      var hd=bone('head'), nk=bone('neck');
-      if(hd){ hd.rotation.y=Math.sin(swayP)*0.040; hd.rotation.z=Math.sin(swayP*0.62)*0.012; }
-      if(nk)  nk.rotation.y=Math.sin(swayP)*0.016;
-      blinkT+=dt;
-      if(blinkT>=blinkC){ blinkT=0; blinkC=2.5+Math.random()*4; doBlink(); }
-      var orb2=document.getElementById('mb-orb');
-      if(orb2){
-        var cl=orb2.classList;
-        if(cl.contains('orb-manage'))      stL.color.setHex(0x22c55e);
-        else if(cl.contains('orb-ready'))  stL.color.setHex(0xffd060);
-        else if(cl.contains('orb-hunt'))   stL.color.setHex(0xff8800);
-        else if(cl.contains('orb-defend')) stL.color.setHex(0xff0000);
-        else                               stL.color.setHex(0xef4444);
-      }
-    }
-    renderer.render(scene,camera);
-  }
-  animate();
-  window.addEventListener('resize',function(){
-    W=orbEl.clientWidth||248; H=orbEl.clientHeight||316;
-    camera.aspect=W/H; camera.updateProjectionMatrix(); renderer.setSize(W,H);
-  });
 })();
 </script>
 </body>
