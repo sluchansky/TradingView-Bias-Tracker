@@ -46010,75 +46010,171 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
             <filter id="orbCF" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
             <filter id="orbNF" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
           </defs>
-          <!-- LORD PIGGINGTON — Colonial Trading Pig (replaces orb visual) -->
-          <!-- Ambient state glow — reuses orb-amb class for JS state transitions -->
-          <circle class="orb-amb" cx="60" cy="85" r="58" filter="url(#orbAF)"/>
-          <!-- State pulse ring -->
-          <circle class="orb-halo-ring" cx="60" cy="85" r="52" stroke-width="1"/>
-          <!-- === TRICORN HAT === -->
-          <!-- Hat felt crown -->
-          <path d="M10,32 Q38,4 60,2 Q82,4 110,32 L98,38 Q60,28 22,38 Z" fill="#111111"/>
-          <!-- Hat brim underside -->
-          <path d="M8,36 L22,32 Q60,24 98,32 L112,36 L98,42 Q60,34 22,42 Z" fill="#1a1a1a"/>
-          <!-- Red hat band -->
-          <rect x="24" y="30" width="72" height="3.5" rx="1.5" fill="#ef4444"/>
-          <!-- Corner cockades (red rosettes) -->
-          <circle cx="11" cy="35" r="5" fill="#ef4444"/>
-          <circle cx="11" cy="35" r="2.5" fill="#cc1111"/>
-          <circle cx="109" cy="35" r="5" fill="#ef4444"/>
-          <circle cx="109" cy="35" r="2.5" fill="#cc1111"/>
-          <circle cx="60" cy="4" r="4" fill="#ef4444"/>
-          <circle cx="60" cy="4" r="2" fill="#cc1111"/>
-          <!-- === LEFT EAR === -->
-          <ellipse cx="16" cy="60" rx="13" ry="17" fill="#f9a8c9" transform="rotate(-14,16,60)"/>
-          <ellipse cx="16" cy="60" rx="7" ry="11" fill="#f472b6" transform="rotate(-14,16,60)"/>
-          <!-- === RIGHT EAR === -->
-          <ellipse cx="104" cy="60" rx="13" ry="17" fill="#f9a8c9" transform="rotate(14,104,60)"/>
-          <ellipse cx="104" cy="60" rx="7" ry="11" fill="#f472b6" transform="rotate(14,104,60)"/>
+          <!-- LORD PIGGINGTON v2 — Colonial Trading Pig (powdered wig, full portrait) -->
+          <!-- State glow — JS-responsive via orb-amb class -->
+          <circle class="orb-amb" cx="60" cy="105" r="65" filter="url(#orbAF)"/>
+          <circle class="orb-halo-ring" cx="60" cy="105" r="58" stroke-width="1"/>
+          <!-- === LEFT EAR (behind wig) === -->
+          <ellipse cx="20" cy="46" rx="12" ry="16" fill="#e89090" transform="rotate(-14,20,46)"/>
+          <ellipse cx="20" cy="46" rx="6.5" ry="10" fill="#c86060" transform="rotate(-14,20,46)"/>
+          <!-- === RIGHT EAR (behind wig) === -->
+          <ellipse cx="100" cy="46" rx="12" ry="16" fill="#e89090" transform="rotate(14,100,46)"/>
+          <ellipse cx="100" cy="46" rx="6.5" ry="10" fill="#c86060" transform="rotate(14,100,46)"/>
+          <!-- === POWDERED WIG — main mass === -->
+          <ellipse cx="60" cy="30" rx="48" ry="36" fill="#d8d4ce"/>
+          <!-- Wig top highlight (lighter crown) -->
+          <ellipse cx="56" cy="14" rx="30" ry="18" fill="#eeeae5" opacity=".72"/>
+          <!-- Wig wave/curl texture lines across the top -->
+          <path d="M22,14 Q34,6 46,13 Q58,5 70,12 Q82,5 96,13 Q104,6 102,14" stroke="#b8b3ad" stroke-width="1.3" fill="none" opacity=".6"/>
+          <path d="M18,23 Q32,15 44,21 Q56,13 68,20 Q80,13 92,21 Q106,15 104,23" stroke="#b0aba5" stroke-width="1.1" fill="none" opacity=".5"/>
+          <path d="M16,33 Q30,26 42,31 Q54,23 66,30 Q78,23 90,31 Q104,26 106,33" stroke="#aaa5a0" stroke-width=".9" fill="none" opacity=".42"/>
+          <!-- Wig front hairline shadow (soft edge over face) -->
+          <path d="M22,46 Q40,38 60,36 Q80,38 98,46 Q90,54 60,52 Q30,54 22,46 Z" fill="rgba(0,0,0,.10)"/>
+          <!-- === LEFT DROP CURLS === -->
+          <ellipse cx="10" cy="58" rx="9.5" ry="19" fill="#ccc8c2"/>
+          <ellipse cx="10" cy="58" rx="6" ry="13" fill="#d8d4ce" opacity=".85"/>
+          <path d="M4,44 Q1,58 3,72 Q7,82 12,88" stroke="#b8b3ad" stroke-width=".8" fill="none" opacity=".5"/>
+          <ellipse cx="7" cy="79" rx="8.5" ry="15" fill="#c4c0ba"/>
+          <ellipse cx="7" cy="79" rx="5.5" ry="10" fill="#ccc8c2" opacity=".8"/>
+          <ellipse cx="10" cy="96" rx="7.5" ry="13" fill="#bcb8b2"/>
+          <ellipse cx="10" cy="96" rx="5" ry="8.5" fill="#c4c0ba" opacity=".7"/>
+          <!-- === RIGHT DROP CURLS === -->
+          <ellipse cx="110" cy="58" rx="9.5" ry="19" fill="#ccc8c2"/>
+          <ellipse cx="110" cy="58" rx="6" ry="13" fill="#d8d4ce" opacity=".85"/>
+          <path d="M116,44 Q119,58 117,72 Q113,82 108,88" stroke="#b8b3ad" stroke-width=".8" fill="none" opacity=".5"/>
+          <ellipse cx="113" cy="79" rx="8.5" ry="15" fill="#c4c0ba"/>
+          <ellipse cx="113" cy="79" rx="5.5" ry="10" fill="#ccc8c2" opacity=".8"/>
+          <ellipse cx="110" cy="96" rx="7.5" ry="13" fill="#bcb8b2"/>
+          <ellipse cx="110" cy="96" rx="5" ry="8.5" fill="#c4c0ba" opacity=".7"/>
           <!-- === PIG FACE === -->
-          <ellipse cx="60" cy="87" rx="46" ry="52" fill="#f9a8c9"/>
-          <ellipse cx="60" cy="94" rx="36" ry="38" fill="#fbb6c8" opacity=".30"/>
-          <!-- === EYES === -->
-          <ellipse cx="40" cy="74" rx="11" ry="12" fill="white"/>
-          <ellipse cx="80" cy="74" rx="11" ry="12" fill="white"/>
-          <circle cx="42" cy="75" r="7.5" fill="#1a1a1a"/>
-          <circle cx="82" cy="75" r="7.5" fill="#1a1a1a"/>
-          <!-- Iris sheen (red tint to match theme) -->
-          <circle cx="42" cy="75" r="4" fill="#3a0808"/>
-          <circle cx="82" cy="75" r="4" fill="#3a0808"/>
-          <!-- Pupil highlight -->
-          <circle cx="44" cy="73" r="2.8" fill="white"/>
-          <circle cx="84" cy="73" r="2.8" fill="white"/>
-          <circle cx="38" cy="78" r="1.2" fill="rgba(255,255,255,.55)"/>
-          <circle cx="78" cy="78" r="1.2" fill="rgba(255,255,255,.55)"/>
-          <!-- === DISTINGUISHED EYEBROWS === -->
-          <path d="M29,62 Q40,55 52,61" stroke="#555" stroke-width="2.4" fill="none" stroke-linecap="round"/>
-          <path d="M68,61 Q80,55 91,62" stroke="#555" stroke-width="2.4" fill="none" stroke-linecap="round"/>
-          <!-- === SNOUT === -->
-          <ellipse cx="60" cy="102" rx="19" ry="14" fill="#f87171"/>
-          <ellipse cx="52" cy="103" rx="5.5" ry="4.5" fill="#dc2626"/>
-          <ellipse cx="68" cy="103" rx="5.5" ry="4.5" fill="#dc2626"/>
-          <!-- === DIGNIFIED SMILE === -->
-          <path d="M46,118 Q60,128 74,118" stroke="#dc2626" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-          <!-- === CHEEK BLUSH === -->
-          <ellipse cx="22" cy="92" rx="9" ry="7" fill="#f87171" opacity=".28"/>
-          <ellipse cx="98" cy="92" rx="9" ry="7" fill="#f87171" opacity=".28"/>
+          <!-- Subtle depth shadow behind face -->
+          <ellipse cx="62" cy="72" rx="38" ry="40" fill="#c87070" opacity=".18"/>
+          <!-- Face main (peachy pink) -->
+          <ellipse cx="60" cy="70" rx="37" ry="38" fill="#f0a898"/>
+          <!-- Face highlight (upper left light source) -->
+          <ellipse cx="52" cy="54" rx="18" ry="13" fill="#f8c4b8" opacity=".52"/>
+          <!-- Cheek blush left -->
+          <ellipse cx="27" cy="77" rx="9" ry="7" fill="#e06060" opacity=".24"/>
+          <!-- Cheek blush right -->
+          <ellipse cx="93" cy="77" rx="9" ry="7" fill="#e06060" opacity=".24"/>
+          <!-- === EYEBROWS — distinguished, slightly arched === -->
+          <path d="M29,55 Q42,46 55,53" stroke="#5a3030" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+          <path d="M65,53 Q78,46 91,55" stroke="#5a3030" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+          <!-- === LEFT EYE === -->
+          <!-- Sclera (white) -->
+          <ellipse cx="42" cy="63" rx="11.5" ry="11.5" fill="white"/>
+          <!-- Iris — warm dark brown -->
+          <circle cx="44" cy="64" r="8" fill="#1e0e06"/>
+          <!-- Iris color layer — amber-brown -->
+          <circle cx="44" cy="64" r="5.5" fill="#3c1a08"/>
+          <!-- Pupil -->
+          <circle cx="44" cy="64" r="3.2" fill="#080404"/>
+          <!-- Main catchlight (large, natural) -->
+          <circle cx="47" cy="61" r="2.8" fill="white"/>
+          <!-- Small secondary catchlight -->
+          <circle cx="40" cy="67.5" r="1.3" fill="rgba(255,255,255,.55)"/>
+          <!-- Eyelid (skin-colored, slides down for charBlink) -->
+          <ellipse class="char-lid" id="mbLidL" cx="42" cy="51.5" rx="12.5" ry="12" fill="#f0a898" style="transform-box:fill-box;transform-origin:50% 0%"/>
+          <!-- Lower eyelid crease -->
+          <path d="M31,66 Q42,71 53,66" stroke="#d08080" stroke-width=".8" fill="none" opacity=".5"/>
+          <!-- === RIGHT EYE === -->
+          <ellipse cx="78" cy="63" rx="11.5" ry="11.5" fill="white"/>
+          <circle cx="80" cy="64" r="8" fill="#1e0e06"/>
+          <circle cx="80" cy="64" r="5.5" fill="#3c1a08"/>
+          <circle cx="80" cy="64" r="3.2" fill="#080404"/>
+          <circle cx="83" cy="61" r="2.8" fill="white"/>
+          <circle cx="76" cy="67.5" r="1.3" fill="rgba(255,255,255,.55)"/>
+          <ellipse class="char-lid" id="mbLidR" cx="78" cy="51.5" rx="12.5" ry="12" fill="#f0a898" style="transform-box:fill-box;transform-origin:50% 0%;animation-delay:.09s"/>
+          <path d="M67,66 Q78,71 89,66" stroke="#d08080" stroke-width=".8" fill="none" opacity=".5"/>
+          <!-- === PIG SNOUT === -->
+          <!-- Snout base -->
+          <ellipse cx="60" cy="84" rx="17.5" ry="12" fill="#d88080"/>
+          <!-- Snout top highlight -->
+          <ellipse cx="57" cy="80" rx="11" ry="7" fill="#e8a0a0" opacity=".52"/>
+          <!-- Philtrum lines -->
+          <path d="M57,76 L55,84" stroke="#c06868" stroke-width=".8" fill="none" opacity=".5"/>
+          <path d="M63,76 L65,84" stroke="#c06868" stroke-width=".8" fill="none" opacity=".5"/>
+          <!-- Left nostril -->
+          <ellipse cx="52" cy="85" rx="5.5" ry="4.2" fill="#b05050"/>
+          <ellipse cx="52" cy="85.5" rx="3.8" ry="2.9" fill="#902828"/>
+          <!-- Right nostril -->
+          <ellipse cx="68" cy="85" rx="5.5" ry="4.2" fill="#b05050"/>
+          <ellipse cx="68" cy="85.5" rx="3.8" ry="2.9" fill="#902828"/>
+          <!-- === DIGNIFIED SMIRK === -->
+          <!-- Lower lip curve -->
+          <path d="M46,99 Q55,106 60,105 Q65,106 74,99" stroke="#b85858" stroke-width="2.1" fill="none" stroke-linecap="round"/>
+          <!-- Upper lip bow -->
+          <path d="M52,97 Q57,94 60,96 Q63,94 68,97" stroke="#b85858" stroke-width="1.3" fill="none" stroke-linecap="round"/>
+          <!-- Smile dimples -->
+          <circle cx="44" cy="100" r="1.8" fill="#d08080" opacity=".4"/>
+          <circle cx="76" cy="100" r="1.8" fill="#d08080" opacity=".4"/>
           <!-- === NECK === -->
-          <rect x="48" y="133" width="24" height="14" rx="6" fill="#f9a8c9"/>
-          <!-- === WHITE COLONIAL CRAVAT / JABOT === -->
-          <path d="M42,140 Q60,133 78,140 L74,158 Q60,163 46,158 Z" fill="#f4f4f4"/>
-          <path d="M50,142 Q60,137 70,142 L68,152 Q60,156 52,152 Z" fill="white"/>
-          <ellipse cx="60" cy="142" rx="5.5" ry="4" fill="#e8e8e8"/>
-          <!-- Cravat shadow line -->
-          <path d="M60,146 L60,155" stroke="#ddd" stroke-width="1" stroke-linecap="round"/>
-          <!-- === COLONIAL COAT === -->
-          <path d="M0,160 L24,146 L42,140 Q60,148 78,140 L96,146 L120,160 Z" fill="#111111"/>
-          <!-- Red coat lapels / epaulettes -->
-          <path d="M24,146 L42,137 Q42,145 42,150 Z" fill="#ef4444"/>
-          <path d="M96,146 L78,137 Q78,145 78,150 Z" fill="#ef4444"/>
-          <!-- Gold/red coat buttons -->
-          <circle cx="60" cy="152" r="2.5" fill="#ef4444"/>
-          <circle cx="60" cy="157" r="2" fill="#ef4444"/>
+          <rect x="50" y="102" width="20" height="11" rx="6" fill="#f0a898"/>
+          <!-- Neck shadow underside -->
+          <path d="M50,110 Q60,114 70,110" stroke="#d08080" stroke-width="1" fill="none" opacity=".35"/>
+          <!-- === WHITE CRAVAT / COLONIAL JABOT === -->
+          <!-- Outer cravat shape -->
+          <path d="M44,109 Q60,102 76,109 L73,125 Q60,130 47,125 Z" fill="#eeeeee"/>
+          <!-- Inner cravat (whiter) -->
+          <path d="M50,111 Q60,106 70,111 L68,121 Q60,125 52,121 Z" fill="white"/>
+          <!-- Cravat bow/knot at neck -->
+          <ellipse cx="60" cy="110" rx="8" ry="5" fill="#e5e5e5"/>
+          <ellipse cx="60" cy="110" rx="5" ry="3" fill="white"/>
+          <!-- Ruffle crease lines -->
+          <path d="M56,115 Q60,118 64,115" stroke="#d5d5d5" stroke-width=".9" fill="none"/>
+          <path d="M55,120 Q60,123 65,120" stroke="#d5d5d5" stroke-width=".9" fill="none"/>
+          <!-- === COLONIAL COAT (dark teal, gold trim) === -->
+          <!-- Coat body main -->
+          <path d="M2,160 L12,132 Q20,114 36,107 L48,103 L72,103 L84,107 Q100,114 108,132 L118,160 Z" fill="#163a48"/>
+          <!-- Left coat half (slightly lighter) -->
+          <path d="M36,107 Q44,103 48,103 L46,122 Q32,128 20,142 L12,160 Z" fill="#1e4d60" opacity=".55"/>
+          <!-- Right coat half -->
+          <path d="M84,107 Q76,103 72,103 L74,122 Q88,128 100,142 L108,160 Z" fill="#1e4d60" opacity=".55"/>
+          <!-- Deep V-neck opening (dark) -->
+          <path d="M50,103 L60,120 L70,103 L72,110 Q60,122 48,110 Z" fill="#0d2430"/>
+          <!-- Red waistcoat visible in V -->
+          <path d="M52,103 L60,117 L68,103 L70,109 Q60,120 50,109 Z" fill="#6e1414"/>
+          <!-- Waistcoat highlight -->
+          <path d="M55,104 L60,113 L65,104 L67,108 Q60,116 53,108 Z" fill="#821818" opacity=".65"/>
+          <!-- Gold coat trim — left lapel edge -->
+          <path d="M36,107 Q26,118 16,136 L12,132 Q20,114 36,107 Z" fill="#c4981e" opacity=".80"/>
+          <!-- Gold coat trim — right lapel edge -->
+          <path d="M84,107 Q94,118 104,136 L108,132 Q100,114 84,107 Z" fill="#c4981e" opacity=".80"/>
+          <!-- Coat left lapel fold (teal facing) -->
+          <path d="M50,103 Q44,112 40,122 L46,122 Q48,112 52,108 Z" fill="#1a4458" opacity=".7"/>
+          <!-- Coat right lapel fold -->
+          <path d="M70,103 Q76,112 80,122 L74,122 Q72,112 68,108 Z" fill="#1a4458" opacity=".7"/>
+          <!-- Gold coat buttons (center column) -->
+          <circle cx="60" cy="127" r="2.8" fill="#d4a828"/>
+          <circle cx="60" cy="136" r="2.8" fill="#d4a828"/>
+          <circle cx="60" cy="145" r="2.8" fill="#d4a828"/>
+          <circle cx="60" cy="154" r="2.8" fill="#d4a828"/>
+          <!-- Button shine highlights -->
+          <circle cx="61.2" cy="126.2" r="1.1" fill="rgba(255,255,255,.55)"/>
+          <circle cx="61.2" cy="135.2" r="1.1" fill="rgba(255,255,255,.55)"/>
+          <circle cx="61.2" cy="144.2" r="1.1" fill="rgba(255,255,255,.55)"/>
+          <!-- === LEFT ARM / SLEEVE === -->
+          <path d="M36,107 Q14,120 8,146 Q14,152 23,148 Q26,134 38,120 Z" fill="#163a48"/>
+          <!-- Left sleeve highlight -->
+          <path d="M26,118 Q22,130 20,144" stroke="#1e4d60" stroke-width="3" fill="none" opacity=".6"/>
+          <!-- Left cuff (white) -->
+          <path d="M7,144 Q6,152 14,154 Q22,154 23,148 Q15,150 7,144 Z" fill="#e8e8e8"/>
+          <ellipse cx="15" cy="149" rx="8.5" ry="4.5" fill="white" opacity=".9"/>
+          <!-- Left hand / trotter -->
+          <ellipse cx="13" cy="153" rx="7.5" ry="5" fill="#f0a898"/>
+          <path d="M8,151 Q10,157 15,158 Q20,157 19,152" stroke="#e09090" stroke-width=".8" fill="none" opacity=".6"/>
+          <!-- === RIGHT ARM / SLEEVE === -->
+          <path d="M84,107 Q106,120 112,146 Q106,152 97,148 Q94,134 82,120 Z" fill="#163a48"/>
+          <!-- Right sleeve highlight -->
+          <path d="M94,118 Q98,130 100,144" stroke="#1e4d60" stroke-width="3" fill="none" opacity=".6"/>
+          <!-- Right cuff (white) -->
+          <path d="M113,144 Q114,152 106,154 Q98,154 97,148 Q105,150 113,144 Z" fill="#e8e8e8"/>
+          <ellipse cx="105" cy="149" rx="8.5" ry="4.5" fill="white" opacity=".9"/>
+          <!-- Right hand / trotter -->
+          <ellipse cx="107" cy="153" rx="7.5" ry="5" fill="#f0a898"/>
+          <path d="M112,151 Q110,157 105,158 Q100,157 101,152" stroke="#e09090" stroke-width=".8" fill="none" opacity=".6"/>
+          <!-- === STATE PULSE DOT (bottom) === -->
+          <circle class="orb-core" cx="60" cy="159" r="4" filter="url(#orbCF)" opacity=".42"/>
           <!-- Humanoid elements — hidden, preserved so updateCharacter + Avatar v4 don't null-ref -->
           <g class="mb-orb-humanoid" opacity="0" pointer-events="none" aria-hidden="true">
             <rect x="52" y="120" width="16" height="36" rx="5" fill="#111c30"/>
