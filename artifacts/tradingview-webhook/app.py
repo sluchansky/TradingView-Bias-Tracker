@@ -46018,7 +46018,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
 
     <!-- Avatar -->
     <div class="bl-av-wrap">
-      <img class="bl-av-img" src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp&backgroundColor=transparent" alt="avatar" crossorigin="anonymous"/>
+      <img class="bl-av-img" src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp" alt="avatar" crossorigin="anonymous"/>
       <div id="bl-av-state-lbl">OBSERVING</div>
       <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
     </div>
@@ -46120,7 +46120,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
-        <div id="mb-dicebear-avatar" class="mb-dicebear-av"><img src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp&backgroundColor=transparent" alt="avatar" crossorigin="anonymous" style="width:100%;height:100%;object-fit:contain"/></div>
+        <div id="mb-dicebear-avatar" class="mb-dicebear-av"><img src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp" alt="avatar" crossorigin="anonymous" style="width:100%;height:100%;object-fit:contain"/></div>
         <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <!-- Humanoid defs kept for JS compatibility (updateCharacter refs these) -->
@@ -58313,7 +58313,7 @@ setTimeout(loadThesisStats, 1500);
 </script>
 <script>
 (function(){
-  var DB_URL='https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp&backgroundColor=transparent';
+  var DB_URL='https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp';
   var wrap=document.getElementById('mb-dicebear-avatar');
   if(!wrap) return;
   fetch(DB_URL,{mode:'cors'}).then(function(r){return r.text();}).then(function(text){
