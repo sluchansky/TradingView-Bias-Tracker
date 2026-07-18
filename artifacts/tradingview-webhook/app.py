@@ -44455,6 +44455,9 @@ def _load_dicebear_svg():
             '<g transform="translate(-246 -234)"><path fill-rule="evenodd"',
             '<g id="db-mouth" transform="translate(-246 -234)"><path fill-rule="evenodd"'
         )
+        # Crop viewBox to the face-feature region so it fills the avatar container
+        # Features occupy viewport coords approx x:155-470, y:120-465
+        _svg = _svg.replace('viewBox="0 0 600 600"', 'viewBox="155 120 315 350"')
         return _svg
     except Exception:
         return ""
@@ -45938,7 +45941,7 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
 
     <!-- Avatar -->
     <div class="bl-av-wrap">
-      <img class="bl-av-img" src="https://api.dicebear.com/9.x/lorelei-neutral/svg?seed=Felix" alt="avatar" crossorigin="anonymous"/>
+      <img class="bl-av-img" src="https://api.dicebear.com/9.x/lorelei-neutral/svg?seed=Felix&backgroundColor=transparent" alt="avatar" crossorigin="anonymous"/>
       <div id="bl-av-state-lbl">OBSERVING</div>
       <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
     </div>
