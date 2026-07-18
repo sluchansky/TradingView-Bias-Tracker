@@ -44801,6 +44801,19 @@ def dashboard():
   #db-eyes{transform-box:fill-box;transform-origin:center;animation:dbBlink var(--av-blink-dur,4s) ease-in-out infinite}
   #db-mouth{transform-box:fill-box;transform-origin:center bottom;animation:dbMouth var(--av-mouth-dur,5.5s) ease-in-out infinite 1.2s}
   #mb-char-svg{display:none}
+  @keyframes mbFaceSway{
+    0%,100%{transform:rotate(-5deg)}
+    30%{transform:rotate(5deg)}
+    70%{transform:rotate(-3deg) scaleX(.97)}
+  }
+  @keyframes mbEyeWink{
+    0%,86%,100%{transform:scaleY(1)}
+    92%{transform:scaleY(.05)}
+  }
+  @keyframes mbMouthTalk{
+    0%,100%{transform:scaleY(1)}
+    35%,65%{transform:scaleY(.45) translateY(2px)}
+  }
   .mb-orb{position:relative;width:194px;height:246px;margin:0 auto 10px}
   .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#7f0000) 42%,var(--orb-c2,#300000) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(239,68,68,.4)),0 0 72px var(--orb-soft,rgba(239,68,68,.12));animation:orbIdle 4.5s ease-in-out infinite}
   .mb-orb-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid var(--orb-glow,rgba(239,68,68,.38));animation:orbRing 4.5s ease-out infinite;opacity:0}
@@ -58296,6 +58309,32 @@ setTimeout(loadThesisStats, 1500);
   }, 2000);
   window.orbWinPulse  = _orWin;
   window.orbLossPulse = _orLoss;
+})();
+</script>
+<script>
+(function(){
+  var DB_URL='https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp&backgroundColor=transparent';
+  var wrap=document.getElementById('mb-dicebear-avatar');
+  if(!wrap) return;
+  fetch(DB_URL,{mode:'cors'}).then(function(r){return r.text();}).then(function(text){
+    wrap.innerHTML=text;
+    var svg=wrap.querySelector('svg');
+    if(!svg) return;
+    svg.setAttribute('width','100%');
+    svg.setAttribute('height','100%');
+    svg.style.cssText='overflow:visible;animation:mbFaceSway 3.6s ease-in-out infinite;transform-origin:50% 42%;';
+    var circles=svg.querySelectorAll('circle');
+    for(var i=0;i<circles.length;i++){
+      var c=circles[i];
+      if(parseFloat(c.getAttribute('r')||'99')<20){
+        c.style.cssText='transform-box:fill-box;transform-origin:center;animation:mbEyeWink '+(3.5+i*0.7)+'s ease-in-out infinite '+(i*0.4)+'s;';
+      }
+    }
+    var paths=svg.querySelectorAll('path[fill-rule="evenodd"],path[clip-rule="evenodd"]');
+    for(var j=0;j<paths.length;j++){
+      paths[j].style.cssText='transform-box:fill-box;transform-origin:center bottom;animation:mbMouthTalk 4.1s ease-in-out infinite 1.2s;';
+    }
+  }).catch(function(){});
 })();
 </script>
 </body>
