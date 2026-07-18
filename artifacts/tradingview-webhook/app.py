@@ -57569,14 +57569,14 @@ function renderBLPanels(d){
   if(wfLbl){wfLbl.style.display=isActn?'none':'block';}
 
 
-  // ── Dark mode toggle (uses html.dark class; independent of retro data-theme) ──
-  function toggleDarkMode(){
+  // ── Dark mode toggle (window.* so onclick= can reach it from any scope) ──
+  window.toggleDarkMode = function(){
     var isDark = document.documentElement.classList.contains('dark');
     if(isDark){ document.documentElement.classList.remove('dark'); localStorage.setItem('dashTheme','off'); }
     else { document.documentElement.classList.add('dark'); localStorage.setItem('dashTheme','on'); }
     var btn = document.getElementById('dark-mode-toggle');
     if(btn) btn.textContent = document.documentElement.classList.contains('dark') ? '🌙 Dark mode: on' : '🌙 Dark mode: off';
-  }
+  };
   (function(){
     if(localStorage.getItem('dashTheme')==='on'){
       document.documentElement.classList.add('dark');
