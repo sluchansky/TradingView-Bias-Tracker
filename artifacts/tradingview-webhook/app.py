@@ -44802,17 +44802,21 @@ def dashboard():
   #db-mouth{transform-box:fill-box;transform-origin:center bottom;animation:dbMouth var(--av-mouth-dur,5.5s) ease-in-out infinite 1.2s}
   #mb-char-svg{display:none}
   @keyframes mbFaceSway{
-    0%,100%{transform:rotate(-5deg)}
-    30%{transform:rotate(5deg)}
-    70%{transform:rotate(-3deg) scaleX(.97)}
+    0%,100%{transform:rotate(-6deg)}
+    30%{transform:rotate(6deg)}
+    65%{transform:rotate(-4deg) scaleX(.97)}
   }
-  @keyframes mbEyeWink{
-    0%,86%,100%{transform:scaleY(1)}
-    92%{transform:scaleY(.05)}
+  @keyframes mbEyeBlink{
+    0%,85%,100%{transform:scaleY(0)}
+    91%,97%{transform:scaleY(1)}
   }
-  @keyframes mbMouthTalk{
-    0%,100%{transform:scaleY(1)}
-    35%,65%{transform:scaleY(.45) translateY(2px)}
+  @keyframes mbBrowLift{
+    0%,100%{transform:translateY(0)}
+    38%,62%{transform:translateY(-3px)}
+  }
+  @keyframes mbJawDrop{
+    0%,100%{transform:scaleY(0)}
+    30%,70%{transform:scaleY(1)}
   }
   .mb-orb{position:relative;width:194px;height:246px;margin:0 auto 10px}
   .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#7f0000) 42%,var(--orb-c2,#300000) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(239,68,68,.4)),0 0 72px var(--orb-soft,rgba(239,68,68,.12));animation:orbIdle 4.5s ease-in-out infinite}
@@ -46120,7 +46124,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
-        <div id="mb-dicebear-avatar" class="mb-dicebear-av"><img src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp" alt="avatar" crossorigin="anonymous" style="width:100%;height:100%;object-fit:contain"/></div>
+        <div id="mb-dicebear-avatar" class="mb-dicebear-av"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 110" style="width:100%;height:100%;overflow:visible;animation:mbFaceSway 3.8s ease-in-out infinite;transform-origin:50% 40%"><defs><radialGradient id="avFaceGr" cx="44%" cy="38%" r="62%"><stop offset="0%" stop-color="#fde8d0"/><stop offset="100%" stop-color="#e8b088"/></radialGradient><radialGradient id="avHairGr" cx="50%" cy="65%" r="58%"><stop offset="0%" stop-color="#3c2814"/><stop offset="100%" stop-color="#180d05"/></radialGradient><radialGradient id="avIrisGr" cx="36%" cy="34%" r="62%"><stop offset="0%" stop-color="#6090e0"/><stop offset="100%" stop-color="#1a3a90"/></radialGradient></defs><ellipse cx="50" cy="44" rx="42" ry="45" fill="url(#avHairGr)"/><ellipse cx="50" cy="58" rx="36" ry="40" fill="url(#avFaceGr)"/><path d="M8 44 Q10 5 50 4 Q90 5 92 44 Q82 18 50 16 Q18 18 8 44Z" fill="url(#avHairGr)"/><ellipse cx="33" cy="56" rx="12" ry="13" fill="white"/><ellipse cx="67" cy="56" rx="12" ry="13" fill="white"/><circle cx="33" cy="58" r="8" fill="url(#avIrisGr)"/><circle cx="67" cy="58" r="8" fill="url(#avIrisGr)"/><circle cx="33" cy="58" r="4.5" fill="#0d0d1a"/><circle cx="67" cy="58" r="4.5" fill="#0d0d1a"/><circle cx="36" cy="53" r="2.5" fill="white" opacity=".9"/><circle cx="70" cy="53" r="2.5" fill="white" opacity=".9"/><ellipse cx="33" cy="56" rx="12" ry="13" fill="#e8b088" style="transform-box:fill-box;transform-origin:center top;transform:scaleY(0);animation:mbEyeBlink 4.2s ease-in-out infinite"/><ellipse cx="67" cy="56" rx="12" ry="13" fill="#e8b088" style="transform-box:fill-box;transform-origin:center top;transform:scaleY(0);animation:mbEyeBlink 4.2s ease-in-out infinite .18s"/><path d="M20 40 Q33 35 46 40" stroke="#2a1408" stroke-width="3" fill="none" stroke-linecap="round" style="transform-box:fill-box;transform-origin:center bottom;animation:mbBrowLift 4.2s ease-in-out infinite .35s"/><path d="M54 40 Q67 35 80 40" stroke="#2a1408" stroke-width="3" fill="none" stroke-linecap="round" style="transform-box:fill-box;transform-origin:center bottom;animation:mbBrowLift 4.2s ease-in-out infinite .5s"/><path d="M50 67 Q47 73 44 74 Q50 77 56 74 Q53 73 50 67" fill="#d09068" opacity=".5"/><path d="M35 83 Q50 93 65 83" stroke="#c05868" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M35 83 Q50 94 65 83 Q58 97 50 98 Q42 97 35 83Z" fill="#d87080" style="transform-box:fill-box;transform-origin:center top;transform:scaleY(0);animation:mbJawDrop 4.4s ease-in-out infinite 1.1s"/><ellipse cx="17" cy="70" rx="10" ry="6" fill="#f090a0" opacity=".16"/><ellipse cx="83" cy="70" rx="10" ry="6" fill="#f090a0" opacity=".16"/></svg></div>
         <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <!-- Humanoid defs kept for JS compatibility (updateCharacter refs these) -->
@@ -58311,32 +58315,7 @@ setTimeout(loadThesisStats, 1500);
   window.orbLossPulse = _orLoss;
 })();
 </script>
-<script>
-(function(){
-  var DB_URL='https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp';
-  var wrap=document.getElementById('mb-dicebear-avatar');
-  if(!wrap) return;
-  fetch(DB_URL,{mode:'cors'}).then(function(r){return r.text();}).then(function(text){
-    wrap.innerHTML=text;
-    var svg=wrap.querySelector('svg');
-    if(!svg) return;
-    svg.setAttribute('width','100%');
-    svg.setAttribute('height','100%');
-    svg.style.cssText='overflow:visible;animation:mbFaceSway 3.6s ease-in-out infinite;transform-origin:50% 42%;';
-    var circles=svg.querySelectorAll('circle');
-    for(var i=0;i<circles.length;i++){
-      var c=circles[i];
-      if(parseFloat(c.getAttribute('r')||'99')<20){
-        c.style.cssText='transform-box:fill-box;transform-origin:center;animation:mbEyeWink '+(3.5+i*0.7)+'s ease-in-out infinite '+(i*0.4)+'s;';
-      }
-    }
-    var paths=svg.querySelectorAll('path[fill-rule="evenodd"],path[clip-rule="evenodd"]');
-    for(var j=0;j<paths.length;j++){
-      paths[j].style.cssText='transform-box:fill-box;transform-origin:center bottom;animation:mbMouthTalk 4.1s ease-in-out infinite 1.2s;';
-    }
-  }).catch(function(){});
-})();
-</script>
+
 </body>
 </html>"""
     html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
