@@ -44440,33 +44440,8 @@ APP_ICON_DATA_URI = _load_icon_data_uri()
 
 
 def _load_dicebear_svg():
-    """Fetch DiceBear lorelei-neutral SVG (seed u4come6q) at startup; inject animation IDs."""
-    try:
-        import urllib.request as _ur
-        _url = ("https://api.dicebear.com/9.x/lorelei-neutral/svg"
-                "?seed=u4come6q&backgroundColor=transparent")
-        with _ur.urlopen(_url, timeout=8) as _r:
-            _svg = _r.read().decode("utf-8")
-        # Eyebrows: first group after the mask wrapper (seed-independent anchor)
-        _svg = _svg.replace(
-            'mask="url(#viewboxMask)"><g transform="translate(-246 -234)">',
-            'mask="url(#viewboxMask)"><g id="db-brows" transform="translate(-246 -234)">'
-        )
-        # Eyes: second group — for this seed its paths start with M642
-        _svg = _svg.replace(
-            '<g transform="translate(-246 -234)"><path d="M642',
-            '<g id="db-eyes" transform="translate(-246 -234)"><path d="M642'
-        )
-        # Mouth: first fill-rule=evenodd group (d="M622 for this seed)
-        _svg = _svg.replace(
-            '<g transform="translate(-246 -234)"><path fill-rule="evenodd" clip-rule="evenodd" d="M622',
-            '<g id="db-mouth" transform="translate(-246 -234)"><path fill-rule="evenodd" clip-rule="evenodd" d="M622'
-        )
-        # Crop viewBox to face-feature region (eyebrows y~124, mouth bottom y~470)
-        _svg = _svg.replace('viewBox="0 0 600 600"', 'viewBox="155 120 315 350"')
-        return _svg
-    except Exception:
-        return ""
+    """No-op: avatar is now a client-side <img> tag; placeholder no longer used."""
+    return ""
 
 DICEBEAR_SVG = _load_dicebear_svg()
 
@@ -44821,7 +44796,7 @@ def dashboard():
   @keyframes dbBrowLift{0%,100%{transform:translateY(var(--av-brow-y,0px))}50%{transform:translateY(calc(var(--av-brow-y,0px) - 2px))}}
   @keyframes dbMouth{0%,100%{transform:scaleY(1)}30%,70%{transform:scaleY(var(--av-mouth-scale,0.78))}}
   .mb-dicebear-av{position:absolute;width:170px;height:170px;left:50%;transform:translateX(-50%);top:20px;z-index:4;pointer-events:none;animation:avatarFloat 4.5s ease-in-out infinite;filter:drop-shadow(0 8px 24px rgba(110,125,255,.28))}
-  .mb-dicebear-av svg{width:100%;height:100%}
+  .mb-dicebear-av svg,.mb-dicebear-av img{width:100%;height:100%;object-fit:contain}
   #db-brows{transform-box:fill-box;transform-origin:center;animation:dbBrowLift var(--av-brow-dur,5s) ease-in-out infinite}
   #db-eyes{transform-box:fill-box;transform-origin:center;animation:dbBlink var(--av-blink-dur,4s) ease-in-out infinite}
   #db-mouth{transform-box:fill-box;transform-origin:center bottom;animation:dbMouth var(--av-mouth-dur,5.5s) ease-in-out infinite 1.2s}
@@ -46030,7 +46005,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
 
     <!-- Avatar -->
     <div class="bl-av-wrap">
-      <img class="bl-av-img" src="https://api.dicebear.com/9.x/lorelei-neutral/svg?seed=Felix&backgroundColor=transparent" alt="avatar" crossorigin="anonymous"/>
+      <img class="bl-av-img" src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp&backgroundColor=transparent" alt="avatar" crossorigin="anonymous"/>
       <div id="bl-av-state-lbl">OBSERVING</div>
       <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
     </div>
@@ -46132,7 +46107,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
-        <div id="mb-dicebear-avatar" class="mb-dicebear-av">__DICEBEAR_SVG__</div>
+        <div id="mb-dicebear-avatar" class="mb-dicebear-av"><img src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp&backgroundColor=transparent" alt="avatar" crossorigin="anonymous" style="width:100%;height:100%;object-fit:contain"/></div>
         <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <!-- Humanoid defs kept for JS compatibility (updateCharacter refs these) -->
