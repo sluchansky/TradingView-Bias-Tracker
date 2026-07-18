@@ -1,0 +1,510 @@
+TASK: Main Brain Visual Redesign v3 — Replace Humanoid Avatar with AI Orb
+
+OBJECTIVE
+
+Remove the humanoid face/avatar from the Main Brain section and replace it with a simpler abstract AI presence.
+
+Use a living energy orb as the default design.
+
+IMPORTANT:
+
+- Only change the visual centerpiece inside the Main Brain.
+- Keep the interactive avatar used elsewhere in the application unchanged.
+- Do not remove any Main Brain information.
+- Do not change any trading or intelligence behavior.
+
+DO NOT modify:
+
+- Trading logic
+- Gate decisions
+- Confidence calculations
+- Edge scoring
+- Position sizing
+- Execution
+- TradersPost
+- Alerts
+- AI reasoning
+- Avatar Intelligence Layers
+- Backend
+- APIs
+- Database
+- Polling frequency
+- Existing event names or payloads
+
+This is a frontend visual redesign only.
+
+--------------------------------------------------
+1. REMOVE THE HUMANOID FROM MAIN BRAIN ONLY
+--------------------------------------------------
+
+Remove the existing face/avatar from the Main Brain centerpiece.
+
+Do not delete the underlying shared avatar code if it is used elsewhere.
+
+Do not modify the separate conversational avatar.
+
+The Main Brain should no longer look like a second character or assistant.
+
+It should look like the visible core of the system’s intelligence.
+
+--------------------------------------------------
+2. CREATE A LIVING AI ORB
+--------------------------------------------------
+
+Replace the humanoid with a floating energy orb.
+
+The orb should include:
+
+- Soft radial glow
+- Layered translucent rings
+- Bright internal core
+- Subtle animated gradients
+- Faint halo
+- Small orbiting particles
+- Gentle depth and shadow
+- Smooth breathing animation
+
+The orb should feel:
+
+- Intelligent
+- Calm
+- Premium
+- Alive
+- Powerful but restrained
+
+It must not resemble:
+
+- A loading spinner
+- A button
+- A planet
+- A cartoon object
+- A gaming power-up
+- A loud neon effect
+
+--------------------------------------------------
+3. VISUAL STRUCTURE
+--------------------------------------------------
+
+Build the orb from lightweight frontend layers.
+
+Suggested structure:
+
+- Outer ambient glow
+- Outer halo ring
+- Two or three thin orbit rings
+- Semi-transparent main sphere
+- Inner energy core
+- Small orbiting particles
+- Optional faint background ripple
+
+Prefer CSS, SVG, or the existing canvas renderer.
+
+Do not add a large 3D dependency solely for this feature.
+
+Keep the implementation lightweight.
+
+--------------------------------------------------
+4. STATE-BASED BEHAVIOR
+--------------------------------------------------
+
+Reuse the existing Main Brain state as a read-only input.
+
+WAITING / MARKET CLOSED
+
+- Slow breathing animation
+- Soft, dim glow
+- Minimal particle movement
+- Calm stable center
+- Long animation cycle
+
+OBSERVING / HUNTING
+
+- Slightly brighter center
+- Gentle particle activity
+- Slow ring rotation
+- Occasional soft ripple
+
+INTERESTED
+
+- Inner core becomes more concentrated
+- Halo brightens slightly
+- Orbit speed increases modestly
+- Small controlled pulse
+
+THINKING
+
+- Inner gradients shift slowly
+- Rings rotate in opposite directions
+- Brief energy ripple
+- Slight increase in internal motion
+
+READY
+
+- Stronger outer halo
+- Brighter central core
+- Slight controlled expansion
+- More focused ring alignment
+- Faster pulse, but still restrained
+
+TRADE ACTIVE / MANAGING
+
+- Stable bright core
+- Continuous subtle energy flow
+- Reduced breathing variation
+- More deliberate ring motion
+- No flashing
+
+WIN
+
+- One brief warm gold pulse
+- Small outward ripple
+- Return smoothly to the underlying state
+- Fire only once per completed winning trade
+
+LOSS
+
+- Gentle temporary dimming
+- One slow inward pulse
+- Calm return to the underlying state
+- No red flash
+- No dramatic collapse
+- Fire only once per completed losing trade
+
+--------------------------------------------------
+5. COLOR DIRECTION
+--------------------------------------------------
+
+Use the dashboard’s existing visual language.
+
+Default palette:
+
+- Deep navy
+- Indigo
+- Violet
+- Cyan highlights
+- Very restrained white core
+
+Optional state accents:
+
+- READY: slightly brighter cyan or violet
+- WIN: brief muted gold
+- LOSS: brief desaturated violet or blue
+
+Do not use strong red or green as the main orb color.
+
+Do not make confidence changes produce abrupt color jumps.
+
+All color transitions must blend smoothly.
+
+--------------------------------------------------
+6. THE ORB MUST NOT BECOME A GAUGE
+--------------------------------------------------
+
+Do not map confidence directly to orb size in a way that looks like a meter.
+
+Do not display percentages inside the orb.
+
+Do not place text over the orb.
+
+The orb represents the AI’s activity and state, not a literal score.
+
+Confidence remains displayed in the existing information modules.
+
+--------------------------------------------------
+7. CURRENT AI STATEMENT
+--------------------------------------------------
+
+Place the current conversational AI statement directly below the orb.
+
+Examples:
+
+“Markets are closed. I’ll resume monitoring when the session opens.”
+
+“I’m watching buyers defend support.”
+
+“I still need VWAP confirmation.”
+
+“This setup is becoming more interesting.”
+
+This statement should be the most prominent text in the Main Brain.
+
+Do not use giant status text such as:
+
+- MARKET CLOSED
+- WAITING
+- READY
+
+Show those as smaller status chips instead.
+
+--------------------------------------------------
+8. COMPACT STATUS CHIPS
+--------------------------------------------------
+
+Place compact status chips near or beneath the orb.
+
+Examples:
+
+- Market Closed
+- Waiting
+- MGC
+- Scalp
+- No Position
+
+Use the existing values.
+
+Do not calculate anything new.
+
+The chips should support the AI statement rather than compete with it.
+
+--------------------------------------------------
+9. INTEGRATE WITH THE MAIN BRAIN LAYOUT
+--------------------------------------------------
+
+The orb should feel embedded in the Main Brain rather than placed inside a separate card.
+
+Use:
+
+- Soft background gradient
+- Faint concentric lines
+- Subtle radial lighting
+- Minimal separators
+- Generous negative space
+
+Avoid placing the orb inside another heavy bordered rectangle.
+
+The orb should visually connect to:
+
+- Current AI statement
+- Status chips
+- What I See
+- What I’m Thinking
+- What I’m Watching
+- The Plan
+
+Do not add decorative lines that reduce readability.
+
+--------------------------------------------------
+10. KEEP ALL EXISTING INFORMATION
+--------------------------------------------------
+
+Preserve all existing Main Brain content, including:
+
+- Current state
+- AI statement
+- Confidence
+- Bias
+- Quality
+- Risk
+- Decision hierarchy
+- Score breakdown
+- Missing-for-ready information
+- What I See
+- What I’m Thinking
+- What I’m Watching For
+- The Plan
+- Manual trade advisory
+- Performance review
+- Lessons
+- Live thinking timeline
+
+Only reorganize or restyle where required.
+
+Do not remove information.
+
+Do not replace real values with placeholders.
+
+--------------------------------------------------
+11. MOTION RULES
+--------------------------------------------------
+
+All motion must be subtle and slow.
+
+Requirements:
+
+- No flashing
+- No bouncing
+- No rapid spinning
+- No constant large expansion
+- No abrupt resets
+- No obvious repeated 2-second loop
+- No animation restart on every polling update
+
+Use long, overlapping animation cycles.
+
+Recommended ranges:
+
+- Breathing: 5–9 seconds
+- Ring rotation: 14–30 seconds
+- Particle orbit: 10–24 seconds
+- Ambient drift: 8–18 seconds
+
+Use slightly different durations so the animation does not look synchronized.
+
+--------------------------------------------------
+12. STATE TRANSITIONS
+--------------------------------------------------
+
+Track the current visual state.
+
+Only transition when the effective state changes or a one-time outcome event occurs.
+
+Use smooth interpolation for:
+
+- Glow intensity
+- Core brightness
+- Ring speed
+- Halo opacity
+- Orb scale
+- Particle activity
+
+Do not rebuild the orb DOM or SVG on every 3-second poll.
+
+Do not restart CSS animations when the state has not changed.
+
+--------------------------------------------------
+13. PERFORMANCE
+--------------------------------------------------
+
+The orb must remain lightweight.
+
+Avoid:
+
+- New API calls
+- New polling loops
+- Excessive particles
+- Hundreds of animated DOM nodes
+- Creating animation objects every frame
+- Repeated event listeners
+- Unbounded timers
+- Continuous React rerenders
+
+Suggested particle count:
+
+- 6–14 visible particles
+
+Cache references after initialization.
+
+Clean up all timers and listeners when the component unmounts.
+
+--------------------------------------------------
+14. REDUCED MOTION
+--------------------------------------------------
+
+Respect prefers-reduced-motion.
+
+When reduced motion is enabled:
+
+- Stop orbiting particles
+- Stop ring rotation
+- Disable large pulses
+- Keep a static soft glow
+- Allow only a minimal opacity breath if appropriate
+- Preserve status and conversational text
+
+The Main Brain must remain fully understandable without animation.
+
+--------------------------------------------------
+15. SAFE FALLBACK
+--------------------------------------------------
+
+If the orb fails to initialize:
+
+- Show a static radial orb
+- Keep the AI statement visible
+- Keep all Main Brain information functional
+- Do not break the dashboard
+- Do not display the old humanoid as an automatic fallback unless explicitly required
+
+--------------------------------------------------
+16. RESPONSIVE BEHAVIOR
+--------------------------------------------------
+
+Desktop:
+
+- Orb centered as the primary visual anchor
+- Full conversational statement beneath it
+- Status chips on one or two lines
+
+Tablet:
+
+- Slightly smaller orb
+- Preserve hierarchy
+- Do not crowd the conversation cards
+
+Mobile:
+
+- Compact orb
+- AI statement remains readable
+- Chips wrap cleanly
+- No horizontal overflow
+- No overlap with Main Brain controls
+
+--------------------------------------------------
+17. VALIDATION
+--------------------------------------------------
+
+Before declaring completion, verify:
+
+- Humanoid is removed from Main Brain only
+- Interactive avatar elsewhere remains unchanged
+- Main Brain still receives all existing states
+- Existing AI statement still updates
+- Existing speech still works
+- WAITING visual state works
+- OBSERVING visual state works
+- READY visual state works
+- TRADE ACTIVE visual state works
+- WIN reaction fires once
+- LOSS reaction fires once
+- State transitions do not restart every poll
+- No console errors
+- No animation jitter
+- No polling increase
+- No backend requests added
+- No trading logic changed
+- No information removed
+- All golden tests pass unchanged
+- Served dashboard JavaScript passes syntax validation
+
+--------------------------------------------------
+DELIVERABLE
+--------------------------------------------------
+
+After implementation, report:
+
+1. Files changed
+2. Old Main Brain avatar code removed or bypassed
+3. Confirmation that the separate interactive avatar was untouched
+4. Orb layers created
+5. Existing states mapped to orb behavior
+6. State-transition handling
+7. One-time WIN/LOSS reaction handling
+8. Reduced-motion behavior
+9. Responsive behavior
+10. Performance safeguards
+11. Confirmation that no information was removed
+12. Confirmation that no backend or trading logic changed
+13. Golden-test results
+14. Before-and-after screenshots
+
+--------------------------------------------------
+SUCCESS CRITERIA
+--------------------------------------------------
+
+The Main Brain should no longer look like it contains a second humanoid assistant.
+
+It should feel like the visible core of the trading system’s intelligence.
+
+The user’s eye should naturally move through:
+
+1. Living AI orb
+2. Current AI statement
+3. Compact status chips
+4. What the AI sees
+5. What the AI thinks
+6. What the AI is watching
+7. What the AI plans to do
+
+The orb should feel calm, intelligent, premium, and alive without becoming flashy or distracting.
+
+All trading logic, AI reasoning, confidence, scoring, execution, TradersPost, backend, APIs, database, polling, and the separate conversational avatar must remain completely unchanged.

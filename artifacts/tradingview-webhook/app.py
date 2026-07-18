@@ -45529,6 +45529,76 @@ html[data-theme="retro"] .mb-feed{background:transparent}
   .mb-av-state{font-size:24px}
 }
 
+/* ══ AI ORB — living energy centerpiece for Main Brain ══ */
+.mb-orb-humanoid{display:none}
+/* Orb element base styles */
+.orb-amb{fill:var(--orb-glow,rgba(129,140,248,.38));transition:opacity 1.4s ease,fill 1.6s ease}
+.orb-halo-ring{fill:none;stroke:var(--orb-glow,rgba(129,140,248,.32));transition:opacity 1.2s ease,stroke .8s ease}
+.orb-e1,.orb-e2{fill:none;transition:opacity .8s ease}
+.orb-e1{stroke:rgba(162,178,255,.24)}
+.orb-e2{stroke:rgba(82,224,255,.18)}
+.orb-sphere{fill:var(--orb-c1,rgba(55,48,163,.85));transition:fill 1.6s ease,opacity .8s ease}
+.orb-core{fill:var(--orb-glow,rgba(129,140,248,.72));transition:opacity 1.1s ease,fill 1.4s ease}
+.orb-nuc{fill:rgba(220,228,255,.95);transition:fill 1.1s ease}
+.orb-spec{fill:rgba(255,255,255,.42)}
+.orb-p{fill:var(--orb-glow,rgba(129,140,248,.58));transition:opacity 1.2s ease}
+/* State-based opacity — maps existing orb state classes to orb brightness */
+.orb-obs .orb-amb,.orb-wait .orb-amb{opacity:.34}
+.orb-obs .orb-core,.orb-wait .orb-core{opacity:.38}
+.orb-obs .orb-p,.orb-wait .orb-p{opacity:.28}
+.orb-obs .orb-halo-ring,.orb-wait .orb-halo-ring{opacity:.26}
+.orb-hunt .orb-amb{opacity:.55}
+.orb-hunt .orb-core{opacity:.60}
+.orb-hunt .orb-p{opacity:.52}
+.orb-hunt .orb-halo-ring{opacity:.42}
+.orb-ready .orb-amb{opacity:.88}
+.orb-ready .orb-core{opacity:.90}
+.orb-ready .orb-p{opacity:.82}
+.orb-ready .orb-halo-ring{opacity:.72}
+.orb-ready .orb-nuc{opacity:1}
+.orb-manage .orb-amb{opacity:.70}
+.orb-manage .orb-core{opacity:.74}
+.orb-manage .orb-p{opacity:.62}
+.orb-defend .orb-amb{opacity:.82}
+.orb-defend .orb-core{opacity:.84}
+.orb-block .orb-amb{opacity:.18}
+.orb-block .orb-core{opacity:.20}
+.orb-block .orb-p{opacity:.14}
+.orb-block .orb-sphere{opacity:.50}
+/* WIN/LOSS one-shot — class added/removed by JS, 1.6s transition returns it to base */
+#mb-orb.orb-win-flash .orb-amb{fill:rgba(200,162,52,.62);opacity:.95}
+#mb-orb.orb-win-flash .orb-core{fill:rgba(200,162,52,.74)}
+#mb-orb.orb-win-flash .orb-nuc{fill:rgba(255,226,112,.98)}
+#mb-orb.orb-loss-flash .orb-amb{opacity:.22}
+#mb-orb.orb-loss-flash .orb-core{opacity:.26}
+#mb-orb.orb-loss-flash .orb-nuc{fill:rgba(148,160,200,.78)}
+/* State chip — status text becomes a compact pill (overrides earlier 30px heading) */
+.mb-av-state{
+  display:inline-block;
+  font-size:10px;font-weight:800;letter-spacing:1.6px;
+  padding:4px 14px;border-radius:999px;
+  background:rgba(125,140,255,.10);
+  border:1px solid rgba(125,140,255,.20);
+  margin-bottom:14px;text-shadow:none;
+  transition:color .5s ease,background .5s ease,border-color .5s ease
+}
+/* Caption → main AI statement (most prominent text below the orb) */
+#mb-caption{
+  font-size:16px;font-weight:600;font-style:normal;
+  color:#dce4ff;max-width:430px;margin:0 auto 12px;
+  line-height:1.56;min-height:28px;
+  transition:color .5s ease,opacity .4s ease
+}
+.cap-ready{color:#86efac!important}
+.cap-defend{color:#fca5a5!important}
+.cap-hunt{color:#fcd34d!important}
+html[data-theme=retro] .mb-av-state{background:rgba(60,40,0,.28);border-color:rgba(180,140,40,.32)}
+/* Reduced motion */
+@media(prefers-reduced-motion:reduce){
+  .orb-p{display:none}
+  .mb-char-svg{animation:none!important}
+}
+
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
 </head>
@@ -45930,37 +46000,69 @@ html[data-theme="retro"] .mb-feed{background:transparent}
         <div class="mb-orb-ring"></div>
         <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
           <defs>
+            <!-- Humanoid defs kept for JS compatibility (updateCharacter refs these) -->
             <radialGradient id="mbHG" cx="50%" cy="38%" r="58%"><stop offset="0%" stop-color="#253249"/><stop offset="100%" stop-color="#0c1422"/></radialGradient>
             <radialGradient id="mbIG" cx="38%" cy="33%" r="62%"><stop offset="0%" stop-color="#7dd3fc"/><stop offset="100%" stop-color="#0284c7"/></radialGradient>
             <filter id="mbGlw" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
             <filter id="mbSft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur in="SourceGraphic" stdDeviation="0.8"/></filter>
+            <!-- Orb filters -->
+            <filter id="orbAF" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="14"/></filter>
+            <filter id="orbCF" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+            <filter id="orbNF" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
           </defs>
-          <rect x="52" y="120" width="16" height="36" rx="5" fill="#111c30"/>
-          <path d="M0,158 Q28,130 52,120 L68,120 Q92,130 120,158 Z" fill="#0c1625"/>
-          <rect id="mbHead" x="18" y="16" width="84" height="108" rx="30" fill="url(#mbHG)"/>
-          <ellipse cx="60" cy="27" rx="24" ry="9" fill="rgba(255,255,255,.03)"/>
-          <ellipse cx="23" cy="72" rx="7" ry="15" fill="rgba(255,255,255,.02)"/>
-          <ellipse cx="97" cy="72" rx="7" ry="15" fill="rgba(255,255,255,.02)"/>
-          <ellipse cx="40" cy="61" rx="14.5" ry="10.5" fill="rgba(3,7,18,.65)"/>
-          <ellipse cx="80" cy="61" rx="14.5" ry="10.5" fill="rgba(3,7,18,.65)"/>
-          <ellipse cx="40" cy="61" rx="12.5" ry="9" fill="#071325"/>
-          <ellipse cx="80" cy="61" rx="12.5" ry="9" fill="#071325"/>
-          <g id="mbIrisGrp" class="char-iris-grp">
-            <circle class="mb-char-iris" cx="40" cy="61" r="6" fill="#0ea5e9" filter="url(#mbSft)"/>
-            <circle cx="40" cy="61" r="3" fill="#020c1c"/>
-            <circle cx="38.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
-            <circle class="mb-char-iris" cx="80" cy="61" r="6" fill="#0ea5e9" filter="url(#mbSft)"/>
-            <circle cx="80" cy="61" r="3" fill="#020c1c"/>
-            <circle cx="78.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+          <!-- ORB VISUAL LAYERS (back to front) -->
+          <!-- Ambient outer glow — responds to --orb-glow CSS var via .orb-amb class -->
+          <circle class="orb-amb" cx="60" cy="78" r="52" filter="url(#orbAF)"/>
+          <!-- Halo ring -->
+          <circle class="orb-halo-ring" cx="60" cy="78" r="46" stroke-width="1.2"/>
+          <!-- Orbit ellipse 1 — tilted decorative ring -->
+          <ellipse class="orb-e1" cx="60" cy="78" rx="40" ry="11" stroke-width=".8" transform="rotate(-32,60,78)"/>
+          <!-- Orbit ellipse 2 — different tilt, slightly smaller -->
+          <ellipse class="orb-e2" cx="60" cy="78" rx="36" ry="9" stroke-width=".7" transform="rotate(54,60,78)"/>
+          <!-- Main sphere -->
+          <circle class="orb-sphere" cx="60" cy="78" r="37"/>
+          <!-- Inner energy core — glowing, responds to state -->
+          <circle class="orb-core" cx="60" cy="78" r="20" filter="url(#orbCF)"/>
+          <!-- Nucleus — bright center point -->
+          <circle class="orb-nuc" cx="60" cy="78" r="7" filter="url(#orbNF)"/>
+          <!-- Specular highlight -->
+          <ellipse class="orb-spec" cx="50" cy="68" rx="9" ry="6" transform="rotate(-18,50,68)" opacity=".5"/>
+          <!-- 6 orbiting particles — varying radii, durations, and phase offsets -->
+          <circle class="orb-p" cx="103" cy="78" r="2.1"><animateTransform attributeName="transform" type="rotate" from="0 60 78" to="360 60 78" dur="22s" repeatCount="indefinite"/></circle>
+          <circle class="orb-p" cx="96" cy="78" r="1.5"><animateTransform attributeName="transform" type="rotate" from="120 60 78" to="480 60 78" dur="31s" repeatCount="indefinite"/></circle>
+          <circle class="orb-p" cx="100" cy="78" r="1.8"><animateTransform attributeName="transform" type="rotate" from="240 60 78" to="600 60 78" dur="17s" repeatCount="indefinite"/></circle>
+          <circle class="orb-p" cx="101" cy="78" r="1.4"><animateTransform attributeName="transform" type="rotate" from="60 60 78" to="420 60 78" dur="26s" repeatCount="indefinite"/></circle>
+          <circle class="orb-p" cx="98" cy="78" r="2.0"><animateTransform attributeName="transform" type="rotate" from="185 60 78" to="545 60 78" dur="19s" repeatCount="indefinite"/></circle>
+          <circle class="orb-p" cx="102" cy="78" r="1.2"><animateTransform attributeName="transform" type="rotate" from="305 60 78" to="665 60 78" dur="14s" repeatCount="indefinite"/></circle>
+          <!-- Humanoid elements — hidden, preserved so updateCharacter + Avatar v4 don't null-ref -->
+          <g class="mb-orb-humanoid" opacity="0" pointer-events="none" aria-hidden="true">
+            <rect x="52" y="120" width="16" height="36" rx="5" fill="#111c30"/>
+            <path d="M0,158 Q28,130 52,120 L68,120 Q92,130 120,158 Z" fill="#0c1625"/>
+            <rect id="mbHead" x="18" y="16" width="84" height="108" rx="30" fill="url(#mbHG)"/>
+            <ellipse cx="60" cy="27" rx="24" ry="9" fill="rgba(255,255,255,.03)"/>
+            <ellipse cx="23" cy="72" rx="7" ry="15" fill="rgba(255,255,255,.02)"/>
+            <ellipse cx="97" cy="72" rx="7" ry="15" fill="rgba(255,255,255,.02)"/>
+            <ellipse cx="40" cy="61" rx="14.5" ry="10.5" fill="rgba(3,7,18,.65)"/>
+            <ellipse cx="80" cy="61" rx="14.5" ry="10.5" fill="rgba(3,7,18,.65)"/>
+            <ellipse cx="40" cy="61" rx="12.5" ry="9" fill="#071325"/>
+            <ellipse cx="80" cy="61" rx="12.5" ry="9" fill="#071325"/>
+            <g id="mbIrisGrp" class="char-iris-grp">
+              <circle class="mb-char-iris" cx="40" cy="61" r="6" fill="#0ea5e9" filter="url(#mbSft)"/>
+              <circle cx="40" cy="61" r="3" fill="#020c1c"/>
+              <circle cx="38.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+              <circle class="mb-char-iris" cx="80" cy="61" r="6" fill="#0ea5e9" filter="url(#mbSft)"/>
+              <circle cx="80" cy="61" r="3" fill="#020c1c"/>
+              <circle cx="78.5" cy="59.5" r="1.5" fill="rgba(255,255,255,.8)"/>
+            </g>
+            <ellipse id="mbLidL" class="char-lid" cx="40" cy="51" rx="13" ry="9.5" fill="#1b2740" style="transform-box:fill-box;transform-origin:50% 0%"/>
+            <ellipse id="mbLidR" class="char-lid" cx="80" cy="51" rx="13" ry="9.5" fill="#1b2740" style="transform-box:fill-box;transform-origin:50% 0%;animation-delay:.07s"/>
+            <path id="mbBrowL" d="M28,47 Q40,43 52,47" stroke="rgba(120,140,200,.55)" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+            <path id="mbBrowR" d="M68,47 Q80,43 92,47" stroke="rgba(120,140,200,.55)" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+            <path d="M57,67 L55,77 Q60,80 65,77 L63,67" stroke="rgba(255,255,255,.04)" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+            <path id="mbMouth" d="M46,94 Q60,97 74,94" stroke="rgba(80,120,200,.6)" stroke-width="2" fill="none" stroke-linecap="round"/>
+            <ellipse cx="60" cy="118" rx="14" ry="3.5" fill="rgba(255,255,255,.02)"/>
+            <circle id="mbIndicator" cx="60" cy="19" r="2.8" fill="#0ea5e9" opacity=".85" filter="url(#mbGlw)"/>
           </g>
-          <ellipse id="mbLidL" class="char-lid" cx="40" cy="51" rx="13" ry="9.5" fill="#1b2740" style="transform-box:fill-box;transform-origin:50% 0%"/>
-          <ellipse id="mbLidR" class="char-lid" cx="80" cy="51" rx="13" ry="9.5" fill="#1b2740" style="transform-box:fill-box;transform-origin:50% 0%;animation-delay:.07s"/>
-          <path id="mbBrowL" d="M28,47 Q40,43 52,47" stroke="rgba(120,140,200,.55)" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-          <path id="mbBrowR" d="M68,47 Q80,43 92,47" stroke="rgba(120,140,200,.55)" stroke-width="2.2" fill="none" stroke-linecap="round"/>
-          <path d="M57,67 L55,77 Q60,80 65,77 L63,67" stroke="rgba(255,255,255,.04)" stroke-width="1.5" fill="none" stroke-linecap="round"/>
-          <path id="mbMouth" d="M46,94 Q60,97 74,94" stroke="rgba(80,120,200,.6)" stroke-width="2" fill="none" stroke-linecap="round"/>
-          <ellipse cx="60" cy="118" rx="14" ry="3.5" fill="rgba(255,255,255,.02)"/>
-          <circle id="mbIndicator" cx="60" cy="19" r="2.8" fill="#0ea5e9" opacity=".85" filter="url(#mbGlw)"/>
         </svg>
       </div>
       <div class="mb-av-state" id="mb-av-state">OBSERVING</div>
@@ -57807,6 +57909,45 @@ function renderThesisStats(s) {
 }
 setInterval(loadThesisStats, 30000);
 setTimeout(loadThesisStats, 1500);
+
+// ══ AI ORB — WIN/LOSS one-shot reactions (DISPLAY-ONLY, reads _avPrev) ══
+(function _orbReactions(){
+  var _orEl = null;
+  var _orPrevHasTrade = false;
+  var _orPrevR = null;
+  var _orWinT = null, _orLossT = null;
+  function _orGet(){ if(!_orEl) _orEl = document.getElementById('mb-orb'); return _orEl; }
+  function _orWin(){
+    var el = _orGet(); if(!el) return;
+    if(_orWinT) clearTimeout(_orWinT);
+    el.classList.remove('orb-loss-flash');
+    el.classList.add('orb-win-flash');
+    _orWinT = setTimeout(function(){ var e = _orGet(); if(e) e.classList.remove('orb-win-flash'); }, 3200);
+  }
+  function _orLoss(){
+    var el = _orGet(); if(!el) return;
+    if(_orLossT) clearTimeout(_orLossT);
+    el.classList.remove('orb-win-flash');
+    el.classList.add('orb-loss-flash');
+    _orLossT = setTimeout(function(){ var e = _orGet(); if(e) e.classList.remove('orb-loss-flash'); }, 3200);
+  }
+  setInterval(function(){
+    try{
+      var snap = _avPrev; if(!snap) return;
+      var hasTrade = snap.has_trade;
+      var tradeR   = snap.trade_r;
+      if(_orPrevHasTrade && !hasTrade){
+        if(_orPrevR !== null && _orPrevR >= 0.8) _orWin();
+        else if(_orPrevR !== null) _orLoss();
+      }
+      _orPrevHasTrade = hasTrade;
+      if(hasTrade && tradeR != null) _orPrevR = tradeR;
+      if(!hasTrade) _orPrevR = null;
+    }catch(e){}
+  }, 2000);
+  window.orbWinPulse  = _orWin;
+  window.orbLossPulse = _orLoss;
+})();
 </script>
 </body>
 </html>"""
