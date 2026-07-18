@@ -44461,36 +44461,52 @@ def dashboard():
   *{box-sizing:border-box;margin:0;padding:0}
   /* ── Dark glassmorphism cockpit: restrained indigo/cyan neon on deep ink ── */
   :root{
-    --bg:#000000; --panel:rgba(14,14,14,.88); --inset:rgba(8,8,8,.70);
-    --border:rgba(255,255,255,.11); --border-lit:rgba(239,68,68,.60);
-    --amber:#ef4444; --amber-dim:#cc3333; --amber-deep:rgba(239,68,68,.14);
-    --cyan:#22c55e; --cyan-deep:rgba(34,197,94,.12);
-    --green:#22c55e; --red:#ef4444; --warn:#ffb454;
-    --text:#f4f4f4; --muted:#888888;
+    --bg:#070b16; --panel:rgba(20,27,45,.66); --inset:rgba(12,17,30,.56);
+    --border:rgba(150,170,220,.10); --border-lit:rgba(125,140,255,.55);
+    --amber:#8ea2ff; --amber-dim:#aab3d6; --amber-deep:rgba(110,125,255,.14);
+    --cyan:#52e0ff; --cyan-deep:rgba(56,200,255,.12);
+    --green:#34e3a4; --red:#ff5d72; --warn:#ffb454;
+    --text:#eef1fb; --muted:#8b93b4;
     --mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace;
     --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
     --glass-shadow:0 10px 34px rgba(0,0,0,.46),0 2px 8px rgba(0,0,0,.32);
-    --glass-shadow-hi:0 16px 48px rgba(0,0,0,.65),0 0 0 1px rgba(239,68,68,.18);
+    --glass-shadow-hi:0 16px 48px rgba(0,0,0,.55),0 0 0 1px rgba(125,140,255,.16);
     --radius:16px; --radius-sm:11px;
   }
+  /* ── DARK MODE override (applied via html[data-theme=dark]) ── */
+  html[data-theme=dark]{
+    --bg:#000000; --panel:rgba(8,8,14,.97); --inset:rgba(4,4,10,.85);
+    --border:rgba(100,120,200,.10); --border-lit:rgba(90,110,220,.45);
+    --amber:#7080cc; --amber-dim:#8090bb; --amber-deep:rgba(80,100,220,.12);
+    --cyan:#38aacc; --cyan-deep:rgba(40,160,210,.10);
+    --green:#22c97a; --red:#e05060; --warn:#e8a020;
+    --text:#d8dcf0; --muted:#606888;
+    --glass-shadow:0 10px 34px rgba(0,0,0,.72),0 2px 8px rgba(0,0,0,.55);
+    --glass-shadow-hi:0 16px 48px rgba(0,0,0,.85),0 0 0 1px rgba(80,100,200,.14);
+  }
+  html[data-theme=dark] .vw-bg{background:
+    radial-gradient(900px 620px at 16% -12%,rgba(50,65,160,.10),transparent 60%),
+    radial-gradient(820px 600px at 102% -4%,rgba(30,110,160,.07),transparent 55%),
+    linear-gradient(180deg,#030508 0%,#000000 58%,#020304 100%)}
+  html[data-theme=dark] #mod-brain{background:linear-gradient(165deg,rgba(8,10,22,.97),rgba(4,5,14,.92));border-color:rgba(80,100,200,.22)}
   html{background:var(--bg)}
   body{zoom:.80;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
   .vw-bg{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
     background:
-      radial-gradient(900px 620px at 16% -12%,rgba(180,0,0,.10),transparent 60%),
-      radial-gradient(820px 600px at 102% -4%,rgba(34,197,94,.06),transparent 55%),
-      radial-gradient(1100px 760px at 50% 118%,rgba(34,197,94,.04),transparent 60%),
-      linear-gradient(180deg,#0a0a0a 0%,#000000 58%,#050505 100%)}
+      radial-gradient(900px 620px at 16% -12%,rgba(110,125,255,.16),transparent 60%),
+      radial-gradient(820px 600px at 102% -4%,rgba(56,200,255,.11),transparent 55%),
+      radial-gradient(1100px 760px at 50% 118%,rgba(52,227,164,.06),transparent 60%),
+      linear-gradient(180deg,#0a1122 0%,#070b16 58%,#05080f 100%)}
   .vw-bg::before{content:"";position:absolute;inset:0;
     background-image:radial-gradient(rgba(255,255,255,.04) 1px,transparent 1px);background-size:46px 46px;opacity:.5}
   .vw-bg::after{content:none}
   /* faint top + corner glow only — no CRT scanlines, keep the glass clean */
   body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:9998;
-    background:radial-gradient(120% 70% at 50% -6%,rgba(180,0,0,.05),rgba(0,0,0,0) 55%)}
+    background:radial-gradient(120% 70% at 50% -6%,rgba(120,140,255,.07),rgba(0,0,0,0) 55%)}
   body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9997;
-    background:radial-gradient(90% 60% at 100% 100%,rgba(34,197,94,.03),rgba(0,0,0,0) 55%)}
-  h1{font-family:var(--sans);font-size:21px;font-weight:800;text-align:center;padding:4px 0 2px;color:#f4f4f4;letter-spacing:.2px;text-transform:none;text-shadow:0 1px 14px rgba(180,0,0,.22);display:flex;align-items:center;justify-content:center;gap:9px}
+    background:radial-gradient(90% 60% at 100% 100%,rgba(56,200,255,.04),rgba(0,0,0,0) 55%)}
+  h1{font-family:var(--sans);font-size:21px;font-weight:800;text-align:center;padding:4px 0 2px;color:#f4f6ff;letter-spacing:.2px;text-transform:none;text-shadow:0 1px 20px rgba(120,140,255,.28);display:flex;align-items:center;justify-content:center;gap:9px}
   h1::after{content:""}
   @keyframes cblink{0%,49%{opacity:1}50%,100%{opacity:0}}
   /* Status card */
@@ -44613,11 +44629,11 @@ def dashboard():
   #view-live .mod.mod-drop-before{box-shadow:0 -3px 0 0 var(--border-lit)}
   #view-live .mod.mod-drop-after{box-shadow:0 3px 0 0 var(--border-lit)}
   /* ── Main Brain command center (DISPLAY-ONLY) ── */
-  #mod-brain{position:relative;border:1px solid rgba(239,68,68,.28);border-radius:20px;padding:24px 22px;background:linear-gradient(165deg,rgba(18,18,18,.90),rgba(8,8,8,.80));box-shadow:0 24px 70px rgba(0,0,0,.70),0 0 0 1px rgba(239,68,68,.12),inset 0 1px 0 rgba(255,255,255,.04);overflow:hidden}
-  #mod-brain::before{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:radial-gradient(120% 80% at 0% 0%,rgba(180,0,0,.10),transparent 42%),radial-gradient(120% 80% at 100% 0%,rgba(34,197,94,.06),transparent 42%)}
-  #mod-brain::after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,transparent,rgba(239,68,68,.85),rgba(34,197,94,.70),transparent);pointer-events:none;z-index:2}
+  #mod-brain{position:relative;border:1px solid rgba(125,140,255,.26);border-radius:20px;padding:24px 22px;background:linear-gradient(165deg,rgba(34,42,72,.78),rgba(16,21,38,.66));box-shadow:0 24px 70px rgba(8,12,30,.6),0 0 0 1px rgba(125,140,255,.10),inset 0 1px 0 rgba(255,255,255,.05);overflow:hidden}
+  #mod-brain::before{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:radial-gradient(120% 80% at 0% 0%,rgba(110,125,255,.16),transparent 42%),radial-gradient(120% 80% at 100% 0%,rgba(56,200,255,.10),transparent 42%)}
+  #mod-brain::after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,transparent,rgba(142,162,255,.85),rgba(82,224,255,.7),transparent);pointer-events:none;z-index:2}
   #mod-brain > *{position:relative;z-index:1}
-  #view-live #mod-brain:hover{transform:translateY(-2px);box-shadow:0 30px 84px rgba(0,0,0,.75),0 0 0 1px rgba(239,68,68,.22)}
+  #view-live #mod-brain:hover{transform:translateY(-2px);box-shadow:0 30px 84px rgba(8,12,30,.66),0 0 0 1px rgba(125,140,255,.18)}
   /* Panels consolidated into Main Brain — hidden with !important so the existing
      render JS (which toggles inline display) can stay intact and still stay hidden. */
   .mb-hidden{display:none !important}
@@ -44763,6 +44779,10 @@ def dashboard():
   .mb-av-handle{padding:7px 14px 5px;border-bottom:1px solid rgba(255,255,255,.06);min-height:0;cursor:move;display:flex;align-items:center;gap:8px}
   .mb-av-handle-lbl{font-size:10px;letter-spacing:2.5px;color:#4b5563;font-weight:700;text-transform:uppercase}
   .mb-av{text-align:center;padding:20px 16px 14px}
+  /* ── DiceBear brain avatar ── */
+  @keyframes avatarFloat{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-6px)}}
+  .mb-dicebear-av{position:absolute;width:170px;height:170px;left:50%;transform:translateX(-50%);top:20px;z-index:4;pointer-events:none;animation:avatarFloat 4.5s ease-in-out infinite;filter:drop-shadow(0 8px 24px rgba(110,125,255,.28))}
+  #mb-char-svg{display:none}
   .mb-orb{position:relative;width:194px;height:246px;margin:0 auto 10px}
   .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#7f0000) 42%,var(--orb-c2,#300000) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(239,68,68,.4)),0 0 72px var(--orb-soft,rgba(239,68,68,.12));animation:orbIdle 4.5s ease-in-out infinite}
   .mb-orb-ring{position:absolute;inset:0;border-radius:50%;border:1.5px solid var(--orb-glow,rgba(239,68,68,.38));animation:orbRing 4.5s ease-out infinite;opacity:0}
@@ -45676,6 +45696,7 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
      view. Persisted in localStorage('dashAdv'); never touches the money path. -->
 <div id="adv-row">
   <span id="adv-toggle" role="button" tabindex="0" onclick="toggleAdvPanels()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleAdvPanels();}">🔧 Advanced panels: off</span>
+  <span id="dark-mode-toggle" role="button" tabindex="0" style="cursor:pointer;font-size:12px;letter-spacing:.5px;border:1px solid var(--border);border-radius:999px;padding:5px 14px;color:var(--muted);transition:color .12s,border-color .12s,background .12s;user-select:none" onclick="toggleDarkMode()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleDarkMode();}">🌙 Dark mode: off</span>
   <span class="adv-hint">extra analysis &amp; simulated panels are hidden — flip on to see everything</span>
 </div>
 
@@ -45984,6 +46005,9 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
+        <img id="mb-dicebear-avatar" class="mb-dicebear-av"
+             src="https://api.dicebear.com/9.x/lorelei-neutral/svg?seed=Felix&backgroundColor=transparent"
+             alt="avatar" crossorigin="anonymous"/>
         <svg id="mb-char-svg" class="mb-char-svg" viewBox="0 0 120 160" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <!-- Humanoid defs kept for JS compatibility (updateCharacter refs these) -->
@@ -57337,6 +57361,25 @@ function renderBLPanels(d){
   var isActn=v.indexOf('READY')!==-1||v==='MANAGING';
   if(wfEl){wfEl.style.display=isActn?'none':'flex';}
   if(wfLbl){wfLbl.style.display=isActn?'none':'block';}
+
+
+  // ── Dark mode toggle ──────────────────────────────────────────────────────
+  function toggleDarkMode(){
+    var isDark = document.documentElement.getAttribute('data-theme')==='dark';
+    var next = isDark ? 'default' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('dashTheme', next);
+    var btn = document.getElementById('dark-mode-toggle');
+    if(btn) btn.textContent = next==='dark' ? '[dark] Dark mode: on' : '[light] Dark mode: off';
+  }
+  (function(){
+    var saved = localStorage.getItem('dashTheme') || 'default';
+    if(saved === 'dark'){
+      document.documentElement.setAttribute('data-theme','dark');
+      var btn = document.getElementById('dark-mode-toggle');
+      if(btn) btn.textContent = '[dark] Dark mode: on';
+    }
+  })();
 
   // ── Left column: avatar state + market context + performance ──
   var blAvSt=document.getElementById('bl-av-state-lbl');
