@@ -110,8 +110,21 @@ function useTTS() {
 
     // Expand trading abbreviations so TTS reads them naturally instead of spelling
     const cleaned = text
+      // ── Natural pause markers — em dashes and ellipses become short pauses ──
+      .replace(/\s*—\s*/g,  ', ')
+      .replace(/\.\.\./g,   '. ')
+      // ── Ticker names ──────────────────────────────────────────────────────────
+      .replace(/\bMNQ\b/g,   'mini nasdaq')
+      .replace(/\bMGC\b/g,   'micro gold')
+      .replace(/\bMES\b/g,   'micro S and P')
+      .replace(/\bMYM\b/g,   'micro Dow')
+      .replace(/\bNQ\b/g,    'nasdaq')
+      .replace(/\bES\b/g,    'S and P')
+      .replace(/\bYM\b/g,    'Dow futures')
+      .replace(/\bGC\b/g,    'gold')
+      // ── Structure & flow ──────────────────────────────────────────────────────
       .replace(/\bBOS\b/g,   'break of structure')
-      .replace(/\bCHOCH\b/g, 'structure flip')
+      .replace(/\bCHOCH\b/g, 'change of character')
       .replace(/\bVWAP\b/gi, 'vee-wap')
       .replace(/\bCVD\b/g,   'cumulative delta')
       .replace(/\bRVOL\b/g,  'relative volume')
@@ -119,7 +132,9 @@ function useTTS() {
       .replace(/\bLTF\b/g,   'lower timeframe')
       .replace(/\bATR\b/g,   'average true range')
       .replace(/\bFVG\b/g,   'fair value gap')
+      .replace(/\bOB\b/g,    'order block')
       .replace(/\bPOI\b/g,   'point of interest')
+      .replace(/\bORB\b/g,   'opening range breakout')
       .replace(/\bR:R\b/gi,  'risk to reward')
       .replace(/\bHH\b/g,    'higher high')
       .replace(/\bHL\b/g,    'higher low')
@@ -128,19 +143,49 @@ function useTTS() {
       .replace(/\bTP\b/g,    'take profit')
       .replace(/\bSL\b/g,    'stop loss')
       .replace(/\bBE\b/g,    'break even')
-      .replace(/\bMNQ\b/g,   'mini nasdaq')
-      .replace(/\bMGC\b/g,   'micro gold')
-      .replace(/\bMES\b/g,   'micro S&P')
-      .replace(/\bMYM\b/g,   'micro Dow')
+      .replace(/\bPnL\b/gi,  'profit and loss')
+      // ── R multiples ───────────────────────────────────────────────────────────
       .replace(/\b1R\b/gi,   'one R')
       .replace(/\b2R\b/gi,   'two R')
       .replace(/\b3R\b/gi,   'three R')
       .replace(/\b4R\b/gi,   'four R')
-      .slice(0, 450);
+      // ── Cleanup: strip markdown symbols that TTS would read aloud ─────────────
+      .replace(/\*\*/g, '')
+      .replace(/\*/g,   '')
+      .replace(/#/g,    '')
+      .slice(0, 500);
 
     const utt = new SpeechSynthesisUtterance(cleaned);
-    const voice = voices.find(v => v.name === voiceName) ?? voices[0]; if (voice) utt.voice = voice;
-    utt.rate = 1.0; utt.pitch = 1.0;
+
+    // ── Voice priority: prefer natural-sounding voices over robotic defaults ──
+    // Priority list (browser/OS specific — first match wins):
+    //   macOS/Safari: "Daniel" (UK male), "Alex" (US male)
+    //   Chrome/Windows: "Google UK English Male", "Microsoft David Desktop"
+    //   Android: "Google UK English Male"
+    //   Fallback: first available, or none (browser default)
+    const PREFERRED_VOICES = [
+      'Daniel',                     // macOS Safari — deep, natural
+      'Google UK English Male',     // Chrome — clear and warm
+      'Microsoft David Desktop - English (United States)',
+      'Microsoft David - English (United States)',
+      'Alex',                       // macOS fallback
+      'Google US English',          // Chrome US fallback
+      'en-US-Neural2-D',            // some Android builds
+      'en-GB-Neural2-B',
+    ];
+    const savedVoice  = voiceName ? voices.find(v => v.name === voiceName) : null;
+    const pickedVoice = savedVoice
+      ?? PREFERRED_VOICES.reduce<SpeechSynthesisVoice | null>((found, name) =>
+           found ?? voices.find(v => v.name === name) ?? null, null)
+      ?? voices.find(v => /male/i.test(v.name) && /en/i.test(v.lang))
+      ?? voices.find(v => /en/i.test(v.lang))
+      ?? voices[0]
+      ?? null;
+    if (pickedVoice) utt.voice = pickedVoice;
+
+    // Slightly slower than default: more deliberate, analytical pacing
+    utt.rate  = 0.92;
+    utt.pitch = 1.0;
 
     utt.onstart = () => {
       setSpeaking(true);
