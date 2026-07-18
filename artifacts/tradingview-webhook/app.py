@@ -45658,6 +45658,83 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
   .orb-p{display:none}
   .mb-char-svg{animation:none!important}
 }
+/* ════════════════════════════════════════════════════════════════
+   MAIN BRAIN — Apple × OpenAI experience redesign
+   ════════════════════════════════════════════════════════════════ */
+#mod-brain{background:linear-gradient(175deg,#05070e 0%,#020308 100%);border:1px solid rgba(110,130,255,.09);border-radius:20px;padding:0;overflow:hidden;position:relative}
+/* ── Hero ── */
+.brain-hero{position:relative;display:flex;flex-direction:column;align-items:center;padding:38px 24px 26px;background:radial-gradient(ellipse 90% 55% at 50% 0%,rgba(90,110,255,.08) 0%,transparent 70%);overflow:hidden}
+.brain-orb-halo{position:absolute;top:-30px;left:50%;transform:translateX(-50%);width:360px;height:230px;border-radius:50%;background:radial-gradient(ellipse at 50% 60%,rgba(99,102,241,.17) 0%,transparent 70%);transition:background 1.5s ease;pointer-events:none;z-index:0}
+#mod-brain[data-brain-state=ready] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(52,211,153,.22) 0%,transparent 70%)}
+#mod-brain[data-brain-state=trade] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(251,191,36,.18) 0%,transparent 70%)}
+#mod-brain[data-brain-state=closed] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(15,15,30,.20) 0%,transparent 70%)}
+#mod-brain .mb-orb{position:relative;z-index:2;width:224px;height:284px;margin:0 auto 20px}
+#mod-brain .mb-dicebear-av{width:202px;height:202px;top:14px}
+/* ── State pill ── */
+.brain-state-pill{position:relative;z-index:2;font-size:10px;font-weight:700;letter-spacing:3.2px;text-transform:uppercase;color:#374151;padding:5px 22px;border:1px solid rgba(255,255,255,.07);border-radius:999px;background:rgba(255,255,255,.025);margin-bottom:14px;transition:color .5s,border-color .5s,background .5s}
+#mod-brain[data-brain-state=ready] .brain-state-pill{color:#34d399;border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.06)}
+#mod-brain[data-brain-state=trade] .brain-state-pill{color:#fbbf24;border-color:rgba(251,191,36,.28);background:rgba(251,191,36,.05)}
+#mod-brain[data-brain-state=closed] .brain-state-pill{color:#1f2937;border-color:rgba(31,41,55,.15)}
+/* ── Caption ── */
+.brain-caption{position:relative;z-index:2;text-align:center;font-size:15px;font-weight:500;color:#b8c0da;line-height:1.60;min-height:22px;margin:0 0 16px;max-width:310px;letter-spacing:-.1px;transition:color .5s}
+#mod-brain[data-brain-state=closed] .brain-caption{color:#2d3748}
+/* ── Context strip ── */
+.brain-ctx-row{position:relative;z-index:2;display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:11px;color:#374151;letter-spacing:.3px;justify-content:center}
+.brain-ctx-sep{opacity:.3}
+.brain-verdict-chip{font-weight:700;color:#4b5563;transition:color .5s}
+#mod-brain[data-brain-state=ready] .brain-verdict-chip{color:#34d399}
+#mod-brain[data-brain-state=trade] .brain-verdict-chip{color:#fbbf24}
+.brain-age{color:#1f2937;font-size:10px}
+/* ── The Four Questions ── */
+.brain-intel{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:4px}
+.brain-intel-block{padding:14px 14px 14px 18px;border-bottom:1px solid rgba(255,255,255,.04)}
+.brain-intel-block:nth-child(odd){border-right:1px solid rgba(255,255,255,.04)}
+.brain-intel-block:nth-child(3),.brain-intel-block:nth-child(4){border-bottom:none}
+.brain-intel-lbl{font-size:8px;font-weight:700;letter-spacing:2.4px;color:rgba(255,255,255,.15);text-transform:uppercase;margin-bottom:8px}
+.brain-intel-list{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:5px}
+.brain-intel-list li{font-size:12px;color:#9ca3af;line-height:1.52;padding-left:12px;position:relative}
+.brain-intel-list li::before{content:'';position:absolute;left:0;top:8px;width:3px;height:3px;border-radius:50%;background:rgba(255,255,255,.16)}
+/* ── Unified decision ── */
+.brain-unified{padding:12px 20px;border-top:1px solid rgba(255,255,255,.05);border-bottom:1px solid rgba(255,255,255,.05)}
+.brain-unified-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px}
+.brain-unified-lbl{font-size:8px;font-weight:700;letter-spacing:2px;color:rgba(255,255,255,.15);text-transform:uppercase}
+.brain-unified-rec{font-weight:700;font-size:13px;letter-spacing:.3px;color:#e8e8f0}
+.brain-unified-conf{font-size:11px;color:#6b7280}
+.brain-unified-play{font-size:10px;color:#ef4444;margin-left:auto;white-space:nowrap}
+.brain-unified-narr{font-size:12.5px;color:#b0b8d4;line-height:1.62;margin-bottom:4px}
+.brain-unified-eng{font-size:10px;color:#374151;display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.brain-unified-warn{font-size:10px;color:#f59e0b;margin-top:4px}
+/* ── Feed ── */
+.brain-feed-wrap{padding:16px 20px 12px}
+.brain-section-lbl{font-size:8px;font-weight:700;letter-spacing:2.4px;color:rgba(255,255,255,.14);text-transform:uppercase;margin-bottom:10px}
+#mod-brain .mb-feed{background:transparent;border:none;padding:0;margin:0;max-height:260px;overflow-y:auto}
+/* ── Details toggle ── */
+.brain-details-btn{width:100%;background:transparent;border:none;border-top:1px solid rgba(255,255,255,.05);color:#1f2937;font-size:9px;letter-spacing:2.2px;text-transform:uppercase;font-family:inherit;padding:12px 20px;text-align:left;cursor:pointer;display:flex;align-items:center;justify-content:space-between;transition:background .15s,color .15s}
+.brain-details-btn:hover{background:rgba(255,255,255,.025);color:#4b5563}
+.brain-details-btn[data-open=true]{color:#4b5563}
+.brain-details-arr{font-size:16px;line-height:1;opacity:.4;transition:transform .25s}
+.brain-details-btn[data-open=true] .brain-details-arr{transform:rotate(90deg)}
+.brain-details{padding:0 16px 16px;border-top:1px solid rgba(255,255,255,.04)}
+/* ── Chat section ── */
+.brain-chat-section{padding:14px 16px 16px;border-top:1px solid rgba(255,255,255,.05)}
+#mod-brain .mb-chat-h{display:none}
+#mod-brain .mb-chat-row input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#e8e8f0}
+#mod-brain .mb-chat-row input:focus{border-color:rgba(110,130,255,.38);box-shadow:0 0 0 3px rgba(110,130,255,.07)}
+#mod-brain #mb-chat-send{background:rgba(110,130,255,.11);color:#a5b4fc;border:1px solid rgba(110,130,255,.18);border-radius:10px}
+#mod-brain #mb-chat-send:hover:not(:disabled){background:rgba(110,130,255,.20);border-color:rgba(110,130,255,.32)}
+#mod-brain .mb-sess-btn{border-color:rgba(255,255,255,.06);color:#1f2937}
+#mod-brain .mb-sess-btn:hover{background:rgba(255,255,255,.035);color:#4b5563}
+/* ── Trade mgmt tuck ── */
+#mod-brain .mb-mt{border-radius:0;border-left:none;border-right:none;border-top:1px solid rgba(255,255,255,.05);background:transparent;margin-bottom:0}
+#mod-brain .mb-mt-h{color:#1f2937;letter-spacing:2px;font-size:9px}
+#mod-brain .mb-manage,#mod-brain .mb-bot,#mod-brain .mb-tl,#mod-brain .mb-review{border-radius:0;border-left:none;border-right:none;border-top:1px solid rgba(255,255,255,.05);background:transparent;margin-bottom:0}
+/* ── Retro theme parity ── */
+html[data-theme=retro] #mod-brain{background:rgba(8,2,2,.96);border-color:rgba(180,30,30,.18)}
+html[data-theme=retro] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(160,20,20,.18) 0%,transparent 70%)}
+html[data-theme=retro] #mod-brain[data-brain-state=ready] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(52,211,153,.18) 0%,transparent 70%)}
+html[data-theme=retro] .brain-caption{color:#c89090}
+html[data-theme=retro] .brain-intel-block{border-color:rgba(180,30,30,.10)}
+html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details-btn,html[data-theme=retro] .brain-feed-wrap,html[data-theme=retro] .brain-unified,html[data-theme=retro] #mod-brain .mb-mt{border-color:rgba(180,30,30,.10)}
 
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
@@ -46037,9 +46114,16 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
-  <div class="mod" id="mod-brain" data-cat="primary">
-    <div class="mod-h mb-av-handle"><span class="mb-av-handle-lbl">🧠 Main Brain</span><span id="mb-badge" class="mb-badge" style="display:none">…</span></div>
-    <div class="mb-av" id="mb-av">
+  <div class="mod" id="mod-brain" data-cat="primary" data-brain-state="wait">
+    <!-- Badge (JS-controlled, stays hidden until data arrives) -->
+    <span id="mb-badge" class="mb-badge" style="display:none">…</span>
+    <!-- mb-av preserved for JS compat -->
+    <div id="mb-av" style="display:none" aria-hidden="true"></div>
+    <!-- ═══════════════════════════════════════════════════════
+         HERO — The AI is the product. Everything orbits this.
+         ═══════════════════════════════════════════════════════ -->
+    <div class="brain-hero">
+      <div class="brain-orb-halo"></div>
       <div class="mb-orb" id="mb-orb">
         <div class="mb-orb-ring"></div>
         <div class="mb-orb-ring"></div>
@@ -46252,97 +46336,136 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
             <circle id="mbIndicator" cx="60" cy="19" r="2.8" fill="#0ea5e9" opacity=".85" filter="url(#mbGlw)"/>
           </g>
         </svg>
+      </div><!-- /#mb-orb -->
+      <!-- State pill — large, centred, reactive -->
+      <div class="brain-state-pill" id="mb-av-state">OBSERVING</div>
+      <!-- One-sentence AI caption -->
+      <div class="brain-caption" id="mb-caption"></div>
+      <!-- Context strip -->
+      <div class="brain-ctx-row">
+        <span id="mb-av-market">—</span><span class="brain-ctx-sep">·</span><span id="mb-av-mode">—</span><span class="brain-ctx-sep">·</span><span id="mb-av-verdict" class="brain-verdict-chip">—</span>
+        <span id="mb-av-age" class="brain-age"></span>
       </div>
-      <div class="mb-av-state" id="mb-av-state">OBSERVING</div>
-      <div id="mb-caption" class="mb-caption"></div>
-      <div id="mb-av-ctx" class="mb-av-ctx"></div>
-      <div class="mb-av-meta">
-        <span id="mb-av-market">—</span><span class="mb-av-sep">·</span><span id="mb-av-mode">—</span><span class="mb-av-sep">·</span>Verdict:&nbsp;<span id="mb-av-verdict" style="font-weight:800">—</span>
+      <!-- Preserved for JS compat (mb-av-ctx written by mbAvatarObserve) -->
+      <div id="mb-av-ctx" style="display:none"></div>
+    </div><!-- /.brain-hero -->
+
+    <!-- ═══════════════════════════════════════════════════════
+         THE FOUR QUESTIONS — What I see / think / wait / plan
+         ═══════════════════════════════════════════════════════ -->
+    <div class="brain-intel">
+      <div class="brain-intel-block">
+        <div class="brain-intel-lbl">WHAT I SEE</div>
+        <ul id="mb-market" class="brain-intel-list"></ul>
       </div>
-      <div id="mb-summary" class="mb-summary">Loading…</div>
-      <div class="mb-av-foot"><span class="mb-av-live">● LIVE</span> <span id="mb-av-age"></span></div>
-    </div>
-    <!-- Unified Learning Brain — ONE reconciled verdict from all specialist engines.
-         Display-only; populated by _mb_reconcile() in compute_main_brain.
-         Never feeds the gate, sizing, dedupe or any money path. -->
-    <div id="mb-unified" style="display:none;margin:8px 0 4px;padding:9px 12px;border-radius:10px;border:1px solid rgba(239,68,68,.22);background:rgba(14,14,14,.85)">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
-        <span style="font-size:9px;letter-spacing:1.2px;color:#6b7280;font-weight:600">UNIFIED DECISION</span>
-        <span id="mb-u-rec" style="font-weight:700;font-size:13px;letter-spacing:.4px"></span>
-        <span id="mb-u-conf" style="font-size:11px;color:#9ca3af"></span>
-        <span id="mb-u-playbook" style="font-size:10px;color:#ef4444;margin-left:auto;white-space:nowrap"></span>
+      <div class="brain-intel-block">
+        <div class="brain-intel-lbl">WHAT I THINK</div>
+        <ul id="mb-strategy" class="brain-intel-list"></ul>
       </div>
-      <div id="mb-u-narrative" style="font-size:12px;color:#e8e8e8;line-height:1.55;margin-bottom:4px"></div>
-      <div id="mb-u-engines" style="font-size:10px;color:#888888;display:flex;gap:5px;flex-wrap:wrap;align-items:center"></div>
-      <div id="mb-u-conflicts" style="display:none;font-size:10px;color:#f59e0b;margin-top:3px">&#9888; <span id="mb-u-conflict-text"></span></div>
-    </div>
-    <!-- Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (fed by
-         main_brain.liquidity_focus). Hidden unless the flag is on and the block is
-         present; it never affects the gate, Edge Score or execution. -->
-    <div id="mb-liq" style="display:none;margin:8px 0;padding:8px 10px;border:1px solid var(--border,#2a2a3a);border-radius:8px;font-size:11px;line-height:1.55">
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <span style="color:#6b7280;letter-spacing:.5px;font-size:10px">💧 LIQUIDITY FOCUS</span>
-        <span id="mb-liq-state" style="font-weight:600">—</span>
-        <span id="mb-liq-delta" style="font-size:10px;color:#6b7280"></span>
+      <div class="brain-intel-block">
+        <div class="brain-intel-lbl">WAITING FOR</div>
+        <ul id="mb-risk" class="brain-intel-list"></ul>
       </div>
-      <div><span style="color:#6b7280">Nearby liquidity:</span> <span id="mb-liq-near">—</span></div>
-      <div><span style="color:#6b7280">Trader read:</span> <span id="mb-liq-read">—</span></div>
-      <div id="mb-liq-voice" style="color:#9ca3af;margin-top:2px"></div>
-    </div>
-    <div class="mb-judge" id="mb-judge" style="display:none">
-      <div class="mb-judge-head">
-        <span class="mb-judge-label" id="mbj-label">—</span>
-        <span class="mb-judge-reason" id="mbj-reason"></span>
+      <div class="brain-intel-block">
+        <div class="brain-intel-lbl">I RECOMMEND</div>
+        <ul id="mb-tm" class="brain-intel-list"></ul>
       </div>
-      <div class="mb-judge-grid">
-        <div class="mb-judge-col"><div class="mb-judge-h">Decision hierarchy</div><ul class="mb-judge-list" id="mbj-hierarchy"></ul></div>
-        <div class="mb-judge-col"><div class="mb-judge-h">Score breakdown</div><div class="mbj-score" id="mbj-score"></div><ul class="mb-judge-list" id="mbj-components"></ul></div>
-        <div class="mb-judge-col"><div class="mb-judge-h">Missing for READY</div><ul class="mb-judge-list" id="mbj-missing"></ul></div>
+    </div><!-- /.brain-intel -->
+
+    <!-- ═══════════════════════════════════════════════════════
+         UNIFIED DECISION (display-only, shown when populated)
+         ═══════════════════════════════════════════════════════ -->
+    <div id="mb-unified" class="brain-unified" style="display:none">
+      <div class="brain-unified-top">
+        <span class="brain-unified-lbl">DECISION</span>
+        <span id="mb-u-rec" class="brain-unified-rec"></span>
+        <span id="mb-u-conf" class="brain-unified-conf"></span>
+        <span id="mb-u-playbook" class="brain-unified-play"></span>
       </div>
+      <div id="mb-u-narrative" class="brain-unified-narr"></div>
+      <div id="mb-u-engines" class="brain-unified-eng"></div>
+      <div id="mb-u-conflicts" style="display:none" class="brain-unified-warn">&#9888; <span id="mb-u-conflict-text"></span></div>
     </div>
-    <div class="mb-stats" id="mb-stats">
-      <div class="mb-stat"><div class="mb-stat-l">Confidence</div><div class="mb-stat-v" id="mb-conf">—</div></div>
-      <div class="mb-stat"><div class="mb-stat-l">Lean</div><div class="mb-stat-v" id="mb-lean-txt" style="font-size:12px">—</div><div class="mb-lean"><div class="mb-lean-long" id="mb-lean-long" style="width:50%"></div><div class="mb-lean-short" id="mb-lean-short" style="width:50%"></div></div></div>
-      <div class="mb-stat"><div class="mb-stat-l">Quality</div><div class="mb-stat-v" id="mb-quality">—</div></div>
-      <div class="mb-stat"><div class="mb-stat-l">Risk</div><div class="mb-stat-v" id="mb-risk-level">—</div></div>
+
+    <!-- ═══════════════════════════════════════════════════════
+         LIVE THINKING FEED
+         ═══════════════════════════════════════════════════════ -->
+    <div class="brain-feed-wrap">
+      <div class="brain-section-lbl">LIVE THINKING</div>
+      <div id="mb-feed" class="mb-feed"></div>
     </div>
-    <div class="mb-mission" id="mb-mission-wrap" style="display:none">
-      <div class="mb-mission-h"><span>🎯 Current Mission</span><span class="mb-mission-pct" id="mb-mission-pct"></span></div>
-      <ul class="mb-mission-list" id="mb-mission"></ul>
-      <div class="mb-mission-track"><div class="mb-mission-fill" id="mb-mission-fill"></div></div>
-    </div>
-    <div class="mb-grid">
-      <div class="mb-col"><div class="mb-col-h">📡 What I see</div><ul id="mb-market" class="mb-list"></ul></div>
-      <div class="mb-col"><div class="mb-col-h">♟ What I'm thinking</div><ul id="mb-strategy" class="mb-list"></ul></div>
-      <div class="mb-col"><div class="mb-col-h">🛡 What I'm watching for</div><ul id="mb-risk" class="mb-list"></ul></div>
-      <div class="mb-col"><div class="mb-col-h">🎯 The plan</div><ul id="mb-tm" class="mb-list"></ul></div>
-    </div>
-    <div class="mb-cases" id="mb-cases" style="display:none">
-      <div class="mb-case mb-case-bull"><div class="mb-case-h">🐂 Bull Case</div><ul id="mb-bull" class="mb-list"></ul></div>
-      <div class="mb-case mb-case-bear"><div class="mb-case-h">🐻 Bear Case</div><ul id="mb-bear" class="mb-list"></ul></div>
-    </div>
-    <!-- Manual Trade Management Mode — log a trade and the brain becomes your live
-         copilot. ADVISORY / DISPLAY-ONLY: never sends or closes a broker order. -->
+
+    <!-- ═══════════════════════════════════════════════════════
+         SECONDARY LAYER — scores, gates, stats (tap to expand)
+         ═══════════════════════════════════════════════════════ -->
+    <button class="brain-details-btn" id="brain-details-btn"
+      onclick="(function(b,d){var o=d.style.display!=='none';d.style.display=o?'none':'block';b.setAttribute('data-open',!o);b.querySelector('.brain-details-arr').textContent=o?'›':'‹';})(this,document.getElementById('brain-details'))">
+      <span>Details</span>
+      <span class="brain-details-arr">›</span>
+    </button>
+    <div id="brain-details" class="brain-details" style="display:none">
+      <div id="mb-summary" class="mb-summary" style="display:none"></div>
+      <div class="mb-judge" id="mb-judge" style="display:none">
+        <div class="mb-judge-head">
+          <span class="mb-judge-label" id="mbj-label">—</span>
+          <span class="mb-judge-reason" id="mbj-reason"></span>
+        </div>
+        <div class="mb-judge-grid">
+          <div class="mb-judge-col"><div class="mb-judge-h">Decision hierarchy</div><ul class="mb-judge-list" id="mbj-hierarchy"></ul></div>
+          <div class="mb-judge-col"><div class="mb-judge-h">Score breakdown</div><div class="mbj-score" id="mbj-score"></div><ul class="mb-judge-list" id="mbj-components"></ul></div>
+          <div class="mb-judge-col"><div class="mb-judge-h">Missing for READY</div><ul class="mb-judge-list" id="mbj-missing"></ul></div>
+        </div>
+      </div>
+      <div class="mb-stats" id="mb-stats">
+        <div class="mb-stat"><div class="mb-stat-l">Confidence</div><div class="mb-stat-v" id="mb-conf">—</div></div>
+        <div class="mb-stat"><div class="mb-stat-l">Lean</div><div class="mb-stat-v" id="mb-lean-txt" style="font-size:12px">—</div><div class="mb-lean"><div class="mb-lean-long" id="mb-lean-long" style="width:50%"></div><div class="mb-lean-short" id="mb-lean-short" style="width:50%"></div></div></div>
+        <div class="mb-stat"><div class="mb-stat-l">Quality</div><div class="mb-stat-v" id="mb-quality">—</div></div>
+        <div class="mb-stat"><div class="mb-stat-l">Risk</div><div class="mb-stat-v" id="mb-risk-level">—</div></div>
+      </div>
+      <div class="mb-mission" id="mb-mission-wrap" style="display:none">
+        <div class="mb-mission-h"><span>Current Mission</span><span class="mb-mission-pct" id="mb-mission-pct"></span></div>
+        <ul class="mb-mission-list" id="mb-mission"></ul>
+        <div class="mb-mission-track"><div class="mb-mission-fill" id="mb-mission-fill"></div></div>
+      </div>
+      <div class="mb-cases" id="mb-cases" style="display:none">
+        <div class="mb-case mb-case-bull"><div class="mb-case-h">Bull Case</div><ul id="mb-bull" class="mb-list"></ul></div>
+        <div class="mb-case mb-case-bear"><div class="mb-case-h">Bear Case</div><ul id="mb-bear" class="mb-list"></ul></div>
+      </div>
+      <div id="mb-liq" style="display:none;padding:8px 10px;border:1px solid var(--border,#2a2a3a);border-radius:8px;font-size:11px;line-height:1.55;margin-top:10px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span style="color:#6b7280;letter-spacing:.5px;font-size:10px">LIQUIDITY FOCUS</span>
+          <span id="mb-liq-state" style="font-weight:600">—</span>
+          <span id="mb-liq-delta" style="font-size:10px;color:#6b7280"></span>
+        </div>
+        <div><span style="color:#6b7280">Nearby:</span> <span id="mb-liq-near">—</span></div>
+        <div><span style="color:#6b7280">Read:</span> <span id="mb-liq-read">—</span></div>
+        <div id="mb-liq-voice" style="color:#9ca3af;margin-top:2px"></div>
+      </div>
+    </div><!-- /#brain-details -->
+
+    <!-- ═══════════════════════════════════════════════════════
+         TRADE MANAGEMENT — advisory copilot (display-only)
+         ═══════════════════════════════════════════════════════ -->
     <div class="mb-mt" id="mb-mt">
-      <div class="mb-mt-h" onclick="mbmtToggle()"><span>🧭 Manage a manual trade — advisory, never places orders</span><span id="mbmt-caret">▸</span></div>
+      <div class="mb-mt-h" onclick="mbmtToggle()"><span>Manage a manual trade</span><span id="mbmt-caret">▸</span></div>
       <div class="mb-mt-body" id="mbmt-body" style="display:none">
         <div class="mb-mt-grid">
           <div class="mb-mt-f"><label>Symbol</label><select id="mbmt-symbol"><option>MGC</option><option>MNQ</option><option>MES</option><option>MYM</option></select></div>
           <div class="mb-mt-f"><label>Direction</label><select id="mbmt-dir"><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></div>
           <div class="mb-mt-f"><label>Mode</label><select id="mbmt-mode"><option>SCALP</option><option>SWING</option></select></div>
-          <div class="mb-mt-f"><label>Position size</label><input id="mbmt-contracts" type="number" step="1" min="1" value="1"></div>
+          <div class="mb-mt-f"><label>Size</label><input id="mbmt-contracts" type="number" step="1" min="1" value="1"></div>
           <div class="mb-mt-f"><label>Entry</label><input id="mbmt-entry" type="number" step="0.1"></div>
           <div class="mb-mt-f"><label>Stop</label><input id="mbmt-stop" type="number" step="0.1"></div>
           <div class="mb-mt-f"><label>TP1</label><input id="mbmt-t1" type="number" step="0.1"></div>
           <div class="mb-mt-f"><label>TP2</label><input id="mbmt-t2" type="number" step="0.1"></div>
         </div>
-        <div class="mb-mt-f"><label>Trade reason / thesis (opt)</label><input id="mbmt-reason" type="text" placeholder="why you took this trade"></div>
-        <button class="mb-mt-btn" id="mbmt-btn" onclick="mbmtAdd()">🧠 Manage this trade</button>
+        <div class="mb-mt-f"><label>Thesis</label><input id="mbmt-reason" type="text" placeholder="why you took this trade"></div>
+        <button class="mb-mt-btn" id="mbmt-btn" onclick="mbmtAdd()">Track this trade</button>
         <div class="mb-mt-msg" id="mbmt-msg"></div>
       </div>
     </div>
     <div class="mb-manage" id="mb-manage" style="display:none">
-      <div class="mb-manage-h">📍 Managing position</div>
+      <div class="mb-manage-h">Managing position</div>
       <div class="mb-manage-grid">
         <div><div class="mb-mc-l">Position</div><div class="mb-mc-v" id="mb-mg-pos">—</div></div>
         <div><div class="mb-mc-l">Open R</div><div class="mb-mc-v" id="mb-mg-r">—</div></div>
@@ -46353,46 +46476,46 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
       <ul class="mb-list" id="mb-mg-watch"></ul>
     </div>
     <div class="mb-bot" id="mb-bot" style="display:none">
-      <div class="mb-bot-h">🐷 Bot's live positions</div>
+      <div class="mb-bot-h">Bot's live positions</div>
       <div id="mb-bot-list"></div>
     </div>
     <div class="mb-tl" id="mb-tl" style="display:none">
-      <div class="mb-tl-h">🕒 Trade timeline</div>
+      <div class="mb-tl-h">Trade timeline</div>
       <ul class="mb-tl-list" id="mb-tl-list"></ul>
     </div>
     <div class="mb-review" id="mb-review" style="display:none">
-      <div class="mb-review-h">🧠 Performance review &amp; lessons</div>
+      <div class="mb-review-h">Performance review &amp; lessons</div>
       <div class="mb-review-stats" id="mb-review-stats"></div>
       <ul class="mb-list mb-lessons" id="mb-lessons"></ul>
       <div class="mb-review-note" id="mb-review-note"></div>
     </div>
-    <div class="mb-feed-h">Live thinking</div>
-    <div id="mb-feed" class="mb-feed"></div>
-    <!-- Prop Firm Protection — one-line guard status (display-only read of
-         main_brain.prop_rule; the guard itself lives in execute_trade_gateway). -->
     <div id="mb-prop" class="mb-prop" style="display:none">
       <span class="mb-prop-dot" id="mb-prop-dot"></span><span id="mb-prop-line"></span><span class="mb-prop-acct" id="mb-prop-acct"></span>
     </div>
     <div id="mb-foot" class="mb-foot"></div>
-    <!-- Interactive partner — ask the brain live questions. Reuses the read-only
-         /assistant backend (grounded on the same snapshot + open trades + risk rules).
-         DISPLAY-ONLY: it NEVER places, sizes, or changes a trade. -->
-    <div class="mb-chat-h">💬 Talk to your partner <span style="font-size:9px;color:#6b7280;letter-spacing:1px">LIVE STATE · READ-ONLY</span></div>
-    <div class="mb-sess-bar">
-      <button type="button" class="mb-sess-btn" onclick="mbNewConv()" title="Start a new conversation (resets memory)">+ New</button>
-      <button type="button" class="mb-sess-btn" onclick="mbClearConv()" title="Clear chat messages">× Clear</button>
-      <button type="button" class="mb-sess-btn" id="mb-voice-toggle" onclick="mbTtsToggle()" title="Toggle voice playback">♫ Voice</button>
-      <button type="button" class="mb-sess-btn" id="mb-speak-inp" onclick="mbToggleSpeechInput()" title="Speak your question">◎ Speak</button>
-      <button type="button" class="mb-sess-btn" id="mb-stop-speak" onclick="mbStopSpeaking()" title="Stop avatar speaking" style="display:none">■ Stop</button>
-      <span class="mb-sess-status" id="mb-sess-status">Ready</span>
+
+    <!-- ═══════════════════════════════════════════════════════
+         CHAT — ask the AI anything, grounded on live state
+         ═══════════════════════════════════════════════════════ -->
+    <div class="brain-chat-section">
+      <div class="brain-section-lbl">ASK THE AI <span style="font-size:8px;color:#1f2937;font-weight:400;letter-spacing:1px">LIVE STATE · READ-ONLY</span></div>
+      <div class="mb-sess-bar">
+        <button type="button" class="mb-sess-btn" onclick="mbNewConv()" title="New conversation">+ New</button>
+        <button type="button" class="mb-sess-btn" onclick="mbClearConv()" title="Clear messages">× Clear</button>
+        <button type="button" class="mb-sess-btn" id="mb-voice-toggle" onclick="mbTtsToggle()" title="Toggle voice">♫ Voice</button>
+        <button type="button" class="mb-sess-btn" id="mb-speak-inp" onclick="mbToggleSpeechInput()" title="Speak">◎ Speak</button>
+        <button type="button" class="mb-sess-btn" id="mb-stop-speak" onclick="mbStopSpeaking()" title="Stop speaking" style="display:none">■ Stop</button>
+        <span class="mb-sess-status" id="mb-sess-status">Ready</span>
+      </div>
+      <div id="mb-chat-log" class="mb-chat-log"></div>
+      <div id="mb-conv-followups" class="mb-followups" style="display:none"></div>
+      <div id="mb-quick-q" class="mb-chips"></div>
+      <div class="mb-chat-row">
+        <input id="mb-chat-input" type="text" placeholder="Ask anything — what do you see right now?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
+        <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask</button>
+      </div>
     </div>
-    <div id="mb-chat-log" class="mb-chat-log"></div>
-    <div id="mb-conv-followups" class="mb-followups" style="display:none"></div>
-    <div id="mb-quick-q" class="mb-chips"></div>
-    <div class="mb-chat-row">
-      <input id="mb-chat-input" type="text" placeholder="What do you see right now? Would you take this trade?" autocomplete="off" onkeydown="if(event.key==='Enter'){mbChatSend();}">
-      <button type="button" class="btn" id="mb-chat-send" onclick="mbChatSend()">Ask →</button>
-    </div>
+
   </div><!-- /#mod-brain -->
   </div><!-- /#bl-center -->
 
@@ -49682,6 +49805,9 @@ function mbSetAvatarFace(state){
   var el = document.getElementById('mb-dicebear-avatar');
   if(!el) return;
   var s = el.style;
+  // Drive CSS state transitions on the brain panel
+  var _mb = document.getElementById('mod-brain');
+  if(_mb) _mb.setAttribute('data-brain-state', state);
   if(state === 'ready'){
     s.setProperty('--av-blink-dur','1.8s');
     s.setProperty('--av-brow-dur','2s');
