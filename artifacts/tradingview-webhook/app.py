@@ -44929,6 +44929,11 @@ def dashboard():
   #blh-speak-btn{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;padding:6px 0;border:1px solid rgba(239,68,68,.18);border-radius:8px;background:rgba(239,68,68,.06);color:#ef4444;font-size:10.5px;font-family:var(--sans);letter-spacing:.6px;cursor:pointer;margin-top:5px;transition:background .18s,color .18s}
   #blh-speak-btn:hover{background:rgba(239,68,68,.13);color:#f4f4f4}
   /* ── Left column avatar + market context ── */
+  .bl-av-wrap{text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(239,68,68,.10);margin-bottom:10px}
+  .bl-av-img{width:70px;height:70px;margin:0 auto 5px;display:block;border-radius:50%;filter:drop-shadow(0 0 10px rgba(239,68,68,.28))}
+  #bl-av-state-lbl{font-size:7.5px;letter-spacing:2px;text-transform:uppercase;color:#374151;font-weight:700;text-align:center;margin-bottom:6px}
+  .bl-av-chat-btn{width:100%;padding:6px 4px;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-radius:7px;border:1px solid rgba(239,68,68,.28);color:#ef4444;background:rgba(34,197,94,.05);cursor:pointer;margin-bottom:10px;transition:all .16s;font-family:var(--sans)}
+  .bl-av-chat-btn:hover{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.45)}
 
   .bl-mc-tbl{width:100%;border-collapse:collapse;font-size:10px;margin-bottom:10px}
   .bl-mc-tbl td{padding:4px 2px;border-bottom:1px solid rgba(255,255,255,.06)}
@@ -45881,6 +45886,13 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
 
   <!-- LEFT COLUMN ── avatar + market context + compact controls -->
   <div id="bl-left">
+
+    <!-- Avatar -->
+    <div class="bl-av-wrap">
+      <img class="bl-av-img" src="https://api.dicebear.com/9.x/lorelei-neutral/svg?seed=Felix" alt="avatar" crossorigin="anonymous"/>
+      <div id="bl-av-state-lbl">OBSERVING</div>
+      <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
+    </div>
 
     <!-- Market Context -->
     <div class="bl-sect-h">Market Context</div>
