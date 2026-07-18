@@ -259,4 +259,6 @@ export const BOT2_ROUTES = [
   "/backtest/optimize",
   "/backtest/runs/:id",
   "/backtest/export",
+  // Lord Piggington VRM model (static asset; no auth — fetched by Three.js in the dashboard).
+  "/vrm",
 ];

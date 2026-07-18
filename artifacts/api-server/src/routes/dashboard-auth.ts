@@ -7,7 +7,7 @@ import { timingSafeEqual } from "node:crypto";
 //   "/webhook" -> TradingView alert delivery
 // Everything else (the dashboard page, its data reads, and all trade
 // mutations) requires the dashboard password.
-const OPEN_PATHS = new Set(["/", "/ping", "/webhook"]);
+const OPEN_PATHS = new Set(["/", "/ping", "/webhook", "/vrm"]);
 
 // Methods that do not change state — no CSRF (origin) check needed.
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);

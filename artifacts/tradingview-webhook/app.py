@@ -13,7 +13,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 import requests
 
 app = Flask(__name__)
@@ -58090,6 +58090,101 @@ setTimeout(loadThesisStats, 1500);
   window.orbLossPulse = _orLoss;
 })();
 </script>
+<script type="module">
+import * as THREE from 'https://esm.sh/three@0.170.0';
+import { GLTFLoader } from 'https://esm.sh/three@0.170.0/examples/jsm/loaders/GLTFLoader';
+import { VRMLoaderPlugin, VRMUtils } from 'https://esm.sh/@pixiv/three-vrm@2';
+(function(){
+  var orbEl = document.getElementById('mb-orb');
+  if(!orbEl) return;
+  var canvas = document.createElement('canvas');
+  canvas.id = 'mb-pig-canvas';
+  canvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:5;border-radius:inherit;pointer-events:none;';
+  orbEl.appendChild(canvas);
+  var st = document.createElement('div');
+  st.style.cssText = 'position:absolute;bottom:6px;left:0;right:0;text-align:center;font-size:8px;color:rgba(255,255,255,.28);font-family:monospace;z-index:6;pointer-events:none;letter-spacing:.5px;';
+  st.textContent = 'connecting...';
+  orbEl.appendChild(st);
+  var W = orbEl.clientWidth||248, H = orbEl.clientHeight||316;
+  var renderer = new THREE.WebGLRenderer({canvas:canvas,alpha:true,antialias:true});
+  renderer.setSize(W,H);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  var scene = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(26,W/H,0.01,20);
+  camera.position.set(0,0.90,2.2);
+  camera.lookAt(new THREE.Vector3(0,0.86,0));
+  scene.add(new THREE.AmbientLight(0xffeedd,1.1));
+  var key=new THREE.DirectionalLight(0xfff8f0,2.2); key.position.set(1.2,2.5,2.0); scene.add(key);
+  var rim=new THREE.DirectionalLight(0xff2200,0.55); rim.position.set(-2,0.8,-1.5); scene.add(rim);
+  var fill=new THREE.DirectionalLight(0x334466,0.25); fill.position.set(0.5,-0.5,1.5); scene.add(fill);
+  var stL=new THREE.PointLight(0xef4444,0.9,4); stL.position.set(0,0.5,1.8); scene.add(stL);
+  var loader=new GLTFLoader();
+  loader.register(function(p){ return new VRMLoaderPlugin(p); });
+  var vrm=null, clock=new THREE.Clock();
+  var breatheP=0, swayP=0, blinkT=0, blinkC=3+Math.random()*2;
+  loader.load('/api/vrm',
+    function(gltf){
+      vrm=gltf.userData.vrm;
+      try{ VRMUtils.removeUnnecessaryVertices(vrm.scene); }catch(x){}
+      try{ VRMUtils.combineSkeletons(vrm.scene); }catch(x){}
+      vrm.scene.traverse(function(o){ o.frustumCulled=false; });
+      scene.add(vrm.scene);
+      st.textContent='Lord Piggington';
+      setTimeout(function(){ st.style.transition='opacity 2s'; st.style.opacity='0'; },2500);
+    },
+    function(p){ if(p.total>0) st.textContent='loading '+Math.round(p.loaded/p.total*100)+'%'; },
+    function(e){ console.warn('[VRM]',e); canvas.style.display='none'; st.textContent=''; }
+  );
+  function bone(n){ try{ return vrm.humanoid.getRawBoneNode(n); }catch(x){ return null; } }
+  var blinkNames=['blink','Blink','blinkLeft','BlinkLeft'];
+  function doBlink(){
+    if(!vrm||!vrm.expressionManager) return;
+    var em=vrm.expressionManager, found=false;
+    for(var i=0;i<blinkNames.length;i++){ try{ em.setValue(blinkNames[i],1); found=true; }catch(x){} }
+    if(!found) return;
+    setTimeout(function(){
+      if(!vrm||!vrm.expressionManager) return;
+      for(var i=0;i<blinkNames.length;i++){ try{ vrm.expressionManager.setValue(blinkNames[i],0); }catch(x){} }
+    },130);
+  }
+  function animate(){
+    requestAnimationFrame(animate);
+    var dt=Math.min(clock.getDelta(),0.05);
+    if(vrm){
+      vrm.update(dt);
+      breatheP+=dt*0.72;
+      var bv=Math.sin(breatheP)*0.018;
+      var ch=bone('chest'), sp=bone('spine');
+      if(ch) ch.rotation.x=bv;
+      if(sp) sp.rotation.x=bv*0.35;
+      swayP+=dt*0.26;
+      var hd=bone('head'), nk=bone('neck');
+      if(hd){ hd.rotation.y=Math.sin(swayP)*0.040; hd.rotation.z=Math.sin(swayP*0.62)*0.012; }
+      if(nk)  nk.rotation.y=Math.sin(swayP)*0.016;
+      blinkT+=dt;
+      if(blinkT>=blinkC){ blinkT=0; blinkC=2.5+Math.random()*4; doBlink(); }
+      var orb2=document.getElementById('mb-orb');
+      if(orb2){
+        var cl=orb2.classList;
+        if(cl.contains('orb-manage'))      stL.color.setHex(0x22c55e);
+        else if(cl.contains('orb-ready'))  stL.color.setHex(0xffd060);
+        else if(cl.contains('orb-hunt'))   stL.color.setHex(0xff8800);
+        else if(cl.contains('orb-defend')) stL.color.setHex(0xff0000);
+        else                               stL.color.setHex(0xef4444);
+      }
+    }
+    renderer.render(scene,camera);
+  }
+  animate();
+  window.addEventListener('resize',function(){
+    W=orbEl.clientWidth||248; H=orbEl.clientHeight||316;
+    camera.aspect=W/H; camera.updateProjectionMatrix(); renderer.setSize(W,H);
+  });
+})();
+</script>
 </body>
 </html>"""
     html = html.replace("__EDGE_MAX__", str(EDGE_SCORE_MAX))
@@ -58106,6 +58201,16 @@ setTimeout(loadThesisStats, 1500);
         "Pragma": "no-cache",
         "Expires": "0",
     }
+
+
+@app.route("/vrm", methods=["GET", "HEAD"])
+def serve_vrm():
+    """Serve Lord Piggington VRM 3-D model (no auth — static asset for Three.js)."""
+    import os as _os
+    vrm_path = _os.path.join(_os.path.dirname(__file__), 'attached_assets',
+                             'LordPiggington_1784339766462.vrm')
+    return send_file(vrm_path, mimetype='model/gltf-binary',
+                     conditional=True, max_age=86400)
 
 
 @app.route("/ping", methods=["GET", "POST", "HEAD"])
