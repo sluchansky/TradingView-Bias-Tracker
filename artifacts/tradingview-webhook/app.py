@@ -45947,19 +45947,19 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
        anchors the entry at the fresh live price, builds an ATR stop/target and runs
        EVERY safety layer. Owner-only (/manual-order, not an open path); dormant unless
        MANUAL_ORDER_ENABLED is set on the server. ════ -->
-  <div id="manual-order-box" style="margin-top:10px;padding:10px;border:1px solid #b45309;border-radius:6px;background:#1a1206">
-    <div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#f59e0b;margin-bottom:8px">🖐️ MANUAL MARKET ORDER
-      <span style="font-size:10px;color:#9a6a12;font-weight:400;letter-spacing:1px">· fires regardless of setup</span>
+  <div id="manual-order-box" style="margin-top:10px;padding:10px;border:1px solid rgba(100,120,200,.20);border-radius:6px;background:rgba(14,18,32,.70)">
+    <div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#8b96b8;margin-bottom:8px">🖐️ MANUAL MARKET ORDER
+      <span style="font-size:10px;color:#505878;font-weight:400;letter-spacing:1px">· fires regardless of setup</span>
     </div>
     <div class="dir-row" style="margin:0 0 8px">
       <div id="mo-dir-long" class="dir-btn long active" onclick="setManualDir('Long')">📈 LONG</div>
       <div id="mo-dir-short" class="dir-btn short" onclick="setManualDir('Short')">📉 SHORT</div>
     </div>
-    <div style="display:flex;align-items:center;justify-content:center;gap:8px;color:#c9a66b;font-size:12px;margin-bottom:8px">
-      Contracts <input id="mo-qty" type="number" min="1" value="1" style="width:62px;background:#120726;border:1px solid #6b4a12;border-radius:2px;color:#f3e9ff;padding:4px 6px;font-size:13px">
+    <div style="display:flex;align-items:center;justify-content:center;gap:8px;color:#7880a0;font-size:12px;margin-bottom:8px">
+      Contracts <input id="mo-qty" type="number" min="1" value="1" style="width:62px;background:rgba(10,14,26,.80);border:1px solid rgba(100,120,200,.22);border-radius:4px;color:#c4cbe6;padding:4px 6px;font-size:13px">
     </div>
-    <button class="btn" id="mo-send" style="width:100%;background:#7c2d12;border:1px solid #f59e0b;color:#ffedd5;font-weight:700" onclick="sendManualOrder()">🚀 Send Market Order</button>
-    <div style="margin-top:6px;color:#9a6a12;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
+    <button class="btn" id="mo-send" style="width:100%;background:rgba(28,36,70,.85);border:1px solid rgba(100,120,200,.32);color:#b8c0e0;font-weight:700" onclick="sendManualOrder()">🚀 SEND MARKET ORDER</button>
+    <div style="margin-top:6px;color:#505878;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
   </div>
   <!-- ════ Data Feed Status — alert timing + yfinance bid/ask/volume/day stats
        (DISPLAY-ONLY; never gates trades unless DATA_STALENESS_GATE_ENABLED=1). ════ -->
