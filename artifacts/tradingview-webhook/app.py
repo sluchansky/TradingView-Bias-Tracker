@@ -44804,7 +44804,12 @@ def dashboard():
   .mb-av{text-align:center;padding:20px 16px 14px}
   /* ── DiceBear brain avatar ── */
   @keyframes avatarFloat{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-6px)}}
+  @keyframes dbBlink{0%,40%,56%,100%{transform:scaleY(1)}46%,50%{transform:scaleY(0.04)}}
+  @keyframes dbMouth{0%,100%{transform:scaleY(1)}20%,30%{transform:scaleY(0.70)}25%{transform:scaleY(0.82)}}
   .mb-dicebear-av{position:absolute;width:170px;height:170px;left:50%;transform:translateX(-50%);top:20px;z-index:4;pointer-events:none;animation:avatarFloat 4.5s ease-in-out infinite;filter:drop-shadow(0 8px 24px rgba(110,125,255,.28))}
+  .mb-dicebear-av svg{width:100%;height:100%}
+  #db-eyes{transform-box:fill-box;transform-origin:center;animation:dbBlink 3.8s ease-in-out infinite}
+  #db-mouth{transform-box:fill-box;transform-origin:center bottom;animation:dbMouth 5.2s ease-in-out infinite 1.4s}
   #mb-char-svg{display:none}
   .mb-orb{position:relative;width:194px;height:246px;margin:0 auto 10px}
   .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#7f0000) 42%,var(--orb-c2,#300000) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(239,68,68,.4)),0 0 72px var(--orb-soft,rgba(239,68,68,.12));animation:orbIdle 4.5s ease-in-out infinite}
