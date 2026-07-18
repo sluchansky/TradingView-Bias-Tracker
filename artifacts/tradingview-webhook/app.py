@@ -44521,6 +44521,10 @@ def dashboard():
     radial-gradient(820px 600px at 102% -4%,rgba(30,110,160,.07),transparent 55%),
     linear-gradient(180deg,#030508 0%,#000000 58%,#020304 100%)}
   html.dark #mod-brain{background:linear-gradient(165deg,rgba(8,10,22,.97),rgba(4,5,14,.92));border-color:rgba(80,100,200,.22)}
+  html.dark .mod{background:linear-gradient(165deg,rgba(4,5,13,.97),rgba(2,3,9,.95));border-color:rgba(55,70,160,.09)}
+  html.dark .brain-hero{background:radial-gradient(ellipse 120% 80% at 50% -10%,rgba(18,24,72,.32),transparent 65%),linear-gradient(180deg,#010103 0%,#000000 100%)}
+  html.dark .brain-state-pill{background:rgba(255,255,255,.04)}
+  html.dark .mod-h{background:rgba(3,4,11,.95);border-color:rgba(55,70,160,.09)}
   html{background:var(--bg)}
   body{zoom:.80;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
@@ -57571,13 +57575,13 @@ function renderBLPanels(d){
     if(isDark){ document.documentElement.classList.remove('dark'); localStorage.setItem('dashTheme','off'); }
     else { document.documentElement.classList.add('dark'); localStorage.setItem('dashTheme','on'); }
     var btn = document.getElementById('dark-mode-toggle');
-    if(btn) btn.textContent = document.documentElement.classList.contains('dark') ? 'Dark mode: on' : 'Dark mode: off';
+    if(btn) btn.textContent = document.documentElement.classList.contains('dark') ? '🌙 Dark mode: on' : '🌙 Dark mode: off';
   }
   (function(){
     if(localStorage.getItem('dashTheme')==='on'){
       document.documentElement.classList.add('dark');
       var btn = document.getElementById('dark-mode-toggle');
-      if(btn) btn.textContent = 'Dark mode: on';
+      if(btn) btn.textContent = '🌙 Dark mode: on';
     }
   })();
 
