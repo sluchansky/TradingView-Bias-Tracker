@@ -44440,23 +44440,29 @@ APP_ICON_DATA_URI = _load_icon_data_uri()
 
 
 def _load_dicebear_svg():
-    """Fetch DiceBear lorelei-neutral SVG once at startup; inject animation IDs."""
+    """Fetch DiceBear lorelei-neutral SVG (seed u4come6q) at startup; inject animation IDs."""
     try:
         import urllib.request as _ur
         _url = ("https://api.dicebear.com/9.x/lorelei-neutral/svg"
-                "?seed=Felix&backgroundColor=transparent")
+                "?seed=u4come6q&backgroundColor=transparent")
         with _ur.urlopen(_url, timeout=8) as _r:
             _svg = _r.read().decode("utf-8")
+        # Eyebrows: first group after the mask wrapper (seed-independent anchor)
         _svg = _svg.replace(
-            '<g transform="translate(-246 -234)"><g fill="#000000">',
-            '<g id="db-eyes" transform="translate(-246 -234)"><g fill="#000000">'
+            'mask="url(#viewboxMask)"><g transform="translate(-246 -234)">',
+            'mask="url(#viewboxMask)"><g id="db-brows" transform="translate(-246 -234)">'
         )
+        # Eyes: second group — for this seed its paths start with M642
         _svg = _svg.replace(
-            '<g transform="translate(-246 -234)"><path fill-rule="evenodd"',
-            '<g id="db-mouth" transform="translate(-246 -234)"><path fill-rule="evenodd"'
+            '<g transform="translate(-246 -234)"><path d="M642',
+            '<g id="db-eyes" transform="translate(-246 -234)"><path d="M642'
         )
-        # Crop viewBox to the face-feature region so it fills the avatar container
-        # Features occupy viewport coords approx x:155-470, y:120-465
+        # Mouth: first fill-rule=evenodd group (d="M622 for this seed)
+        _svg = _svg.replace(
+            '<g transform="translate(-246 -234)"><path fill-rule="evenodd" clip-rule="evenodd" d="M622',
+            '<g id="db-mouth" transform="translate(-246 -234)"><path fill-rule="evenodd" clip-rule="evenodd" d="M622'
+        )
+        # Crop viewBox to face-feature region (eyebrows y~124, mouth bottom y~470)
         _svg = _svg.replace('viewBox="0 0 600 600"', 'viewBox="155 120 315 350"')
         return _svg
     except Exception:
@@ -44807,12 +44813,14 @@ def dashboard():
   .mb-av{text-align:center;padding:20px 16px 14px}
   /* ── DiceBear brain avatar ── */
   @keyframes avatarFloat{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-6px)}}
-  @keyframes dbBlink{0%,40%,56%,100%{transform:scaleY(1)}46%,50%{transform:scaleY(0.04)}}
-  @keyframes dbMouth{0%,100%{transform:scaleY(1)}20%,30%{transform:scaleY(0.70)}25%{transform:scaleY(0.82)}}
+  @keyframes dbBlink{0%,44%,56%,100%{transform:scaleY(1)}49%,51%{transform:scaleY(var(--av-eye-close,0.06))}}
+  @keyframes dbBrowLift{0%,100%{transform:translateY(var(--av-brow-y,0px))}50%{transform:translateY(calc(var(--av-brow-y,0px) - 2px))}}
+  @keyframes dbMouth{0%,100%{transform:scaleY(1)}30%,70%{transform:scaleY(var(--av-mouth-scale,0.78))}}
   .mb-dicebear-av{position:absolute;width:170px;height:170px;left:50%;transform:translateX(-50%);top:20px;z-index:4;pointer-events:none;animation:avatarFloat 4.5s ease-in-out infinite;filter:drop-shadow(0 8px 24px rgba(110,125,255,.28))}
   .mb-dicebear-av svg{width:100%;height:100%}
-  #db-eyes{transform-box:fill-box;transform-origin:center;animation:dbBlink 3.8s ease-in-out infinite}
-  #db-mouth{transform-box:fill-box;transform-origin:center bottom;animation:dbMouth 5.2s ease-in-out infinite 1.4s}
+  #db-brows{transform-box:fill-box;transform-origin:center;animation:dbBrowLift var(--av-brow-dur,5s) ease-in-out infinite}
+  #db-eyes{transform-box:fill-box;transform-origin:center;animation:dbBlink var(--av-blink-dur,4s) ease-in-out infinite}
+  #db-mouth{transform-box:fill-box;transform-origin:center bottom;animation:dbMouth var(--av-mouth-dur,5.5s) ease-in-out infinite 1.2s}
   #mb-char-svg{display:none}
   .mb-orb{position:relative;width:194px;height:246px;margin:0 auto 10px}
   .mb-orb-core{position:absolute;top:12px;left:12px;width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 36% 34%,rgba(255,255,255,.32) 0%,var(--orb-c1,#7f0000) 42%,var(--orb-c2,#300000) 100%);box-shadow:0 0 28px var(--orb-glow,rgba(239,68,68,.4)),0 0 72px var(--orb-soft,rgba(239,68,68,.12));animation:orbIdle 4.5s ease-in-out infinite}
@@ -49669,12 +49677,51 @@ function _avCheckGreeting(snap){
   setTimeout(function(){ mbAvatarEnqueue('greeting', text, 2); }, 2500);
 }
 
+// ── Avatar face sync — driven by session state every poll tick ───────────
+function mbSetAvatarFace(state){
+  var el = document.getElementById('mb-dicebear-avatar');
+  if(!el) return;
+  var s = el.style;
+  if(state === 'ready'){
+    s.setProperty('--av-blink-dur','1.8s');
+    s.setProperty('--av-brow-dur','2s');
+    s.setProperty('--av-mouth-dur','2.2s');
+    s.setProperty('--av-brow-y','-10px');
+    s.setProperty('--av-eye-close','0.04');
+    s.setProperty('--av-mouth-scale','0.60');
+  } else if(state === 'trade'){
+    s.setProperty('--av-blink-dur','3s');
+    s.setProperty('--av-brow-dur','3.5s');
+    s.setProperty('--av-mouth-dur','3s');
+    s.setProperty('--av-brow-y','-6px');
+    s.setProperty('--av-eye-close','0.06');
+    s.setProperty('--av-mouth-scale','0.68');
+  } else if(state === 'closed'){
+    s.setProperty('--av-blink-dur','9s');
+    s.setProperty('--av-brow-dur','11s');
+    s.setProperty('--av-mouth-dur','14s');
+    s.setProperty('--av-brow-y','4px');
+    s.setProperty('--av-eye-close','0.02');
+    s.setProperty('--av-mouth-scale','0.92');
+  } else {
+    s.setProperty('--av-blink-dur','4.5s');
+    s.setProperty('--av-brow-dur','5.5s');
+    s.setProperty('--av-mouth-dur','6s');
+    s.setProperty('--av-brow-y','0px');
+    s.setProperty('--av-eye-close','0.06');
+    s.setProperty('--av-mouth-scale','0.80');
+  }
+}
+
 // ── Main observe — called every poll tick from renderModules(d) ───────────
 function mbAvatarObserve(d){
   var snap = _avExtract(d);
   _avCheckGreeting(snap);
   var prev = _avPrev;
   _avPrev  = snap;
+  // Sync avatar face expression with live session state on every tick
+  var _fs = !snap.market_open ? 'closed' : snap.has_trade ? 'trade' : snap.sk==='READY' ? 'ready' : 'wait';
+  mbSetAvatarFace(_fs);
   if(!prev){
     _avLastConf = snap.confidence;
     _avTradeR   = snap.trade_r;
