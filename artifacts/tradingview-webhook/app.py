@@ -44499,8 +44499,8 @@ def dashboard():
     --glass-shadow-hi:0 16px 48px rgba(0,0,0,.55),0 0 0 1px rgba(125,140,255,.16);
     --radius:16px; --radius-sm:11px;
   }
-  /* ── DARK MODE override (applied via html[data-theme=dark]) ── */
-  html[data-theme=dark]{
+  /* ── DARK MODE override (applied via html.dark class — independent of retro data-theme) ── */
+  html.dark{
     --bg:#000000; --panel:rgba(8,8,14,.97); --inset:rgba(4,4,10,.85);
     --border:rgba(100,120,200,.10); --border-lit:rgba(90,110,220,.45);
     --amber:#7080cc; --amber-dim:#8090bb; --amber-deep:rgba(80,100,220,.12);
@@ -44510,11 +44510,11 @@ def dashboard():
     --glass-shadow:0 10px 34px rgba(0,0,0,.72),0 2px 8px rgba(0,0,0,.55);
     --glass-shadow-hi:0 16px 48px rgba(0,0,0,.85),0 0 0 1px rgba(80,100,200,.14);
   }
-  html[data-theme=dark] .vw-bg{background:
+  html.dark .vw-bg{background:
     radial-gradient(900px 620px at 16% -12%,rgba(50,65,160,.10),transparent 60%),
     radial-gradient(820px 600px at 102% -4%,rgba(30,110,160,.07),transparent 55%),
     linear-gradient(180deg,#030508 0%,#000000 58%,#020304 100%)}
-  html[data-theme=dark] #mod-brain{background:linear-gradient(165deg,rgba(8,10,22,.97),rgba(4,5,14,.92));border-color:rgba(80,100,200,.22)}
+  html.dark #mod-brain{background:linear-gradient(165deg,rgba(8,10,22,.97),rgba(4,5,14,.92));border-color:rgba(80,100,200,.22)}
   html{background:var(--bg)}
   body{zoom:.80;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
@@ -57392,21 +57392,19 @@ function renderBLPanels(d){
   if(wfLbl){wfLbl.style.display=isActn?'none':'block';}
 
 
-  // ── Dark mode toggle ──────────────────────────────────────────────────────
+  // ── Dark mode toggle (uses html.dark class; independent of retro data-theme) ──
   function toggleDarkMode(){
-    var isDark = document.documentElement.getAttribute('data-theme')==='dark';
-    var next = isDark ? 'default' : 'dark';
-    document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('dashTheme', next);
+    var isDark = document.documentElement.classList.contains('dark');
+    if(isDark){ document.documentElement.classList.remove('dark'); localStorage.setItem('dashTheme','off'); }
+    else { document.documentElement.classList.add('dark'); localStorage.setItem('dashTheme','on'); }
     var btn = document.getElementById('dark-mode-toggle');
-    if(btn) btn.textContent = next==='dark' ? '[dark] Dark mode: on' : '[light] Dark mode: off';
+    if(btn) btn.textContent = document.documentElement.classList.contains('dark') ? 'Dark mode: on' : 'Dark mode: off';
   }
   (function(){
-    var saved = localStorage.getItem('dashTheme') || 'default';
-    if(saved === 'dark'){
-      document.documentElement.setAttribute('data-theme','dark');
+    if(localStorage.getItem('dashTheme')==='on'){
+      document.documentElement.classList.add('dark');
       var btn = document.getElementById('dark-mode-toggle');
-      if(btn) btn.textContent = '[dark] Dark mode: on';
+      if(btn) btn.textContent = 'Dark mode: on';
     }
   })();
 
