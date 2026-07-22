@@ -45132,7 +45132,10 @@ def dashboard():
   /* ── Center verdict hero panel ── */
   /* ── Main Brain Summary card ── */
   #main-brain-summary{padding:18px 20px 16px;border-radius:14px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.14);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:var(--glass-shadow);margin-bottom:12px}
-  #mbs-verdict{font-size:22px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:8px}
+  #mbs-verdict{font-size:22px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:6px}
+  #mbs-meter-wrap{height:5px;background:rgba(255,255,255,.07);border-radius:3px;margin:0 0 4px;overflow:hidden}
+  #mbs-meter-fill{height:100%;border-radius:3px;width:0;transition:width .5s,background .4s}
+  #mbs-meter-label{font-size:9px;color:#4b5563;letter-spacing:.5px;text-align:right;margin-bottom:8px;font-family:var(--mono)}
   #mbs-edge{margin-bottom:10px;display:flex;align-items:baseline;gap:4px}
   #mbs-gates{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
   .mbs-pill{font-size:10px;font-weight:700;letter-spacing:.6px;padding:2px 6px;border-radius:5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
@@ -46230,6 +46233,8 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <!-- ── MAIN BRAIN SUMMARY ── Compact verdict card (DISPLAY-ONLY, Brain Contract) ── -->
   <div id="main-brain-summary" data-testid="main-brain-summary">
     <div id="mbs-verdict" data-testid="main-brain-verdict" style="color:#6b7280">WAIT</div>
+    <div id="mbs-meter-wrap"><div id="mbs-meter-fill" style="background:#4b5563"></div></div>
+    <div id="mbs-meter-label">EDGE  0 / 110</div>
     <div id="mbs-edge" data-testid="main-brain-edge"></div>
     <div id="mbs-gates" data-testid="main-brain-gates"></div>
     <div id="mbs-reason" data-testid="main-brain-reason" style="display:none"></div>
@@ -57594,6 +57599,10 @@ function renderBLPanels(d){
               typeof edge!=='undefined'?Number(edge):0;
     var grade=sc2&&sc2.grade?sc2.grade:
               (edgeN>=85?'A+':edgeN>=70?'A':edgeN>=50?'B':'WAIT');
+    var mMf=document.getElementById('mbs-meter-fill');
+    var mMl=document.getElementById('mbs-meter-label');
+    if(mMf){var mPct=Math.min(100,Math.max(0,edgeN/110*100)).toFixed(1);mMf.style.width=mPct+'%';mMf.style.background=edgeN>=70?'#22c55e':edgeN>=50?'#eab308':'#4b5563';}
+    if(mMl){mMl.textContent='EDGE  '+Math.round(edgeN)+' / 110';}
     var mE=document.getElementById('mbs-edge');
     if(mE){
       var eCol=edgeN>=70?'#22c55e':edgeN>=50?'#eab308':'#6b7280';
