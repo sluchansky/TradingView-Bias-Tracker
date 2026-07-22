@@ -1,0 +1,84 @@
+TASK: Confidence Integrity Fix — Phase 1
+
+Work only in artifacts/tradingview-webhook/app.py.
+
+Do not change scoring weights, strategy rules, thresholds, order execution,
+database schema, or dashboard layout beyond the specific display safeguard below.
+
+OBJECTIVE 1 — USE ONE EDGE SCORE FOR TRADE PLANNING
+
+The dashboard's authoritative score is produced by:
+
+_analysis_edge_breakdown()
+→ compute_trade_edge_components()
+→ result["edge_score"]
+
+Currently build_strict_trade_plan() receives the earlier legacy value from:
+
+calculate_edge_score(bias, confidence, strength)
+
+Refactor the execution order so the authoritative per-instrument edge score is
+computed before build_strict_trade_plan() is called.
+
+Pass the authoritative score into:
+
+build_strict_trade_plan(..., edge_score=authoritative_edge_score, ...)
+
+The value passed to trade-plan construction must be identical to the value later
+stored in result["edge_score"] and displayed by /status.
+
+Do not calculate the authoritative score twice. Compute it once and reuse it.
+
+OBJECTIVE 2 — DISABLE MISLEADING LEGACY CONFIDENCE DISPLAY
+
+The /status field named "confidence" comes from calculate_confidence() and is
+cross-instrument contaminated because it uses shared ALERT_HISTORY.
+
+Do not delete the calculation yet because other legacy code may reference it.
+
+For dashboard/API presentation:
+
+- Add "legacy_confidence" containing the existing value.
+- Add "legacy_confidence_valid": false.
+- Stop presenting this field as the active probability/confidence score.
+- Preserve backward compatibility where possible.
+
+Do not replace it with a new calculation during this phase.
+
+OBJECTIVE 3 — ADD SCORE TRACE METADATA
+
+Add the following fields to /status:
+
+- edge_score_source: "EDGE_COMPONENTS"
+- edge_score_instrument: the explicitly analyzed instrument
+- edge_score_generated_at: current ISO timestamp
+- edge_score_components: existing authoritative breakdown
+
+Ensure requesting:
+
+/status?ticker=MNQ
+/status?ticker=MES
+/status?ticker=MYM
+/status?ticker=MGC
+
+returns the requested instrument in edge_score_instrument.
+
+REQUIRED TESTS
+
+1. Prove build_strict_trade_plan receives the same numeric edge score returned
+   by /status.
+2. Prove MNQ, MES, MYM, and MGC requests remain instrument-specific.
+3. Prove the old legacy confidence still exists internally but is marked invalid
+   for display.
+4. Prove no scoring weights or execution thresholds changed.
+5. Run syntax/import checks and existing relevant tests.
+
+Before modifying code, show the exact intended call-order change.
+
+After implementation, provide:
+
+- files and lines changed
+- before/after data flow
+- test evidence
+- confirmation that no strategy weights changed
+- confirmation that trade planning and dashboard now use the same edge score
