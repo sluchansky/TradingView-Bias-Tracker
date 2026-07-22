@@ -45130,19 +45130,14 @@ def dashboard():
   #menu-toggle{cursor:pointer;padding:4px 8px;border:1px solid rgba(239,68,68,.18);border-radius:7px;color:#888888;transition:all .16s;user-select:none;font-size:12px;background:transparent;font-family:var(--mono)}
   #menu-toggle:hover{color:#b0bce0;border-color:rgba(239,68,68,.40)}
   /* ── Center verdict hero panel ── */
-  /* ── Main Brain Summary card (compact center, replaces blh-hero) ── */
-  #main-brain-summary{padding:20px 22px 18px;border-radius:16px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.16);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);box-shadow:var(--glass-shadow);margin-bottom:12px}
-  .mbs-heading{font-size:9px;font-weight:700;letter-spacing:2.4px;text-transform:uppercase;color:rgba(255,255,255,.28);margin-bottom:10px}
-  #mbs-narrative{font-size:14px;color:#b8c0da;line-height:1.65;margin:0 0 14px;font-weight:500}
-  .mbs-section{margin-bottom:10px}
-  .mbs-lbl{font-size:8px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.20);margin-bottom:3px}
-  .mbs-val{font-size:12px;color:#9ca3af;line-height:1.48}
-  #mbs-stale-warn{font-size:11px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:6px 10px;margin-bottom:10px;display:none}
-  .mbs-controls{display:flex;gap:8px;margin-top:14px}
-  .mbs-btn{flex:1;padding:7px 0;border-radius:8px;font-size:10.5px;font-family:var(--sans);letter-spacing:.6px;cursor:pointer;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:#8b96b8;transition:background .18s,color .18s}
-  .mbs-btn:hover{background:rgba(255,255,255,.09);color:#e8e8f0}
-  .mbs-btn.mbs-talk{border-color:rgba(34,197,94,.22);background:rgba(34,197,94,.06);color:#6ee7b7}
-  .mbs-btn.mbs-talk:hover{background:rgba(34,197,94,.12);color:#a7f3d0}
+  /* ── Main Brain Summary card ── */
+  #main-brain-summary{padding:18px 20px 16px;border-radius:14px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.14);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:var(--glass-shadow);margin-bottom:12px}
+  #mbs-verdict{font-size:22px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:8px}
+  #mbs-edge{margin-bottom:10px;display:flex;align-items:baseline;gap:4px}
+  #mbs-gates{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+  .mbs-pill{font-size:10px;font-weight:700;letter-spacing:.6px;padding:2px 6px;border-radius:5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
+  #mbs-reason{font-size:11px;color:#9ca3af;line-height:1.45;margin-top:6px;padding:6px 8px;background:rgba(239,68,68,.06);border-radius:6px;border-left:2px solid rgba(239,68,68,.25)}
+  #mbs-stale-warn{font-size:11px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:5px 8px;margin-top:8px;display:none}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(239,68,68,.16);color:#888888;background:rgba(255,255,255,.03);text-transform:uppercase}
   .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
   .blh-pill.fail{border-color:rgba(239,68,68,.4);color:#fca5a5;background:rgba(239,68,68,.07)}
@@ -46232,25 +46227,13 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     </div>
   </div><!-- /#bl-left -->
 
-  <!-- ── MAIN BRAIN SUMMARY ── Compact center card; Brain Contract (DISPLAY-ONLY) ── -->
+  <!-- ── MAIN BRAIN SUMMARY ── Compact verdict card (DISPLAY-ONLY, Brain Contract) ── -->
   <div id="main-brain-summary" data-testid="main-brain-summary">
-    <div class="mbs-heading">MAIN BRAIN</div>
-    <p id="mbs-narrative" data-testid="main-brain-narrative">Analyzing market conditions…</p>
-    <div id="mbs-next-action" class="mbs-section" data-testid="main-brain-next-action" style="display:none">
-      <div class="mbs-lbl">NEXT ACTION</div>
-      <div id="mbs-next-val" class="mbs-val"></div>
-    </div>
-    <div id="mbs-invalidation" class="mbs-section" data-testid="main-brain-invalidation" style="display:none">
-      <div class="mbs-lbl">INVALIDATION</div>
-      <div id="mbs-inval-val" class="mbs-val"></div>
-    </div>
+    <div id="mbs-verdict" data-testid="main-brain-verdict" style="color:#6b7280">WAIT</div>
+    <div id="mbs-edge" data-testid="main-brain-edge"></div>
+    <div id="mbs-gates" data-testid="main-brain-gates"></div>
+    <div id="mbs-reason" data-testid="main-brain-reason" style="display:none"></div>
     <div id="mbs-stale-warn">&#9888; Data may be stale</div>
-    <div class="mbs-controls">
-      <button class="mbs-btn mbs-talk" data-testid="main-brain-talk"
-        onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
-      <button class="mbs-btn" id="mbs-speak-btn" data-testid="main-brain-speak"
-        onclick="(function(){var t=document.getElementById('mbs-narrative');if(!t)return;var u=window.speechSynthesis;if(!u)return;u.cancel();var s=new SpeechSynthesisUtterance(t.textContent);s.rate=0.95;u.speak(s);})()">&#9654; Speak</button>
-    </div>
   </div>
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
@@ -57594,30 +57577,59 @@ function renderBLPanels(d){
   var hvolReg=String(d.volatility||d.vol_regime||hdiag.vol_regime||'');
   (function(){
     var bk2=getBrain(d);
-    var bInst=(bk2&&bk2.instrument)?String(bk2.instrument).replace('1!',''):(inst||'—');
-    var bVerdict=(bk2&&bk2.decision&&bk2.decision.verdict)||v||'WAIT';
-    var bTopR=(bk2&&bk2.reasons&&bk2.reasons.top)||null;
-    var bVoice=(bk2&&bk2.voice)||null;
-    var bSumm=(bk2&&bk2.summary&&String(bk2.summary).indexOf('Waiting for')===-1)?bk2.summary:null;
-    var narr=bVoice||bSumm||null;
-    if(!narr){
-      var np=[bInst+' is '+bVerdict+'.'];
-      if(bTopR&&String(bTopR).indexOf('[object')===-1){var rt=String(bTopR).split('.')[0].trim();if(rt)np.push(rt+'.');}
-      if(bVerdict.indexOf('READY')===-1)np.push('Wait for confirmation before entering.');
-      narr=np.join(' ');
+    var sc2=bk2?bk2.score:{};
+    // Verdict
+    var mV=document.getElementById('mbs-verdict');
+    if(mV){
+      var vTxt='WAIT',vCol='#6b7280';
+      if(v.indexOf('LONG')>=0){vTxt='LONG READY';vCol='#22c55e';}
+      else if(v.indexOf('SHORT')>=0){vTxt='SHORT READY';vCol='#ef4444';}
+      else if(v==='MANAGING'){vTxt='MANAGING';vCol='#7fe9f5';}
+      else if(v.indexOf('EARLY')>=0){vTxt='EARLY';vCol='#f59e0b';}
+      mV.textContent=vTxt;mV.style.color=vCol;
     }
-    var mNarr=document.getElementById('mbs-narrative');
-    if(mNarr)mNarr.textContent=narr;
-    var mNextW=document.getElementById('mbs-next-action');
-    var mNextV=document.getElementById('mbs-next-val');
-    var bNext=(bk2&&bk2.decision&&bk2.decision.next_action)||null;
-    if(mNextW&&mNextV){if(bNext&&String(bNext).indexOf('[object')===-1){mNextV.textContent=String(bNext);mNextW.style.display='';}else{mNextW.style.display='none';}}
-    var mInvalW=document.getElementById('mbs-invalidation');
-    var mInvalV=document.getElementById('mbs-inval-val');
-    var bInval=(bk2&&bk2.decision&&bk2.decision.invalidation)||(d.trade_plan&&d.trade_plan.invalidation)||(d.active_trade&&d.active_trade.invalidation)||null;
-    if(mInvalW&&mInvalV){if(bInval&&String(bInval).indexOf('[object')===-1){mInvalV.textContent=String(bInval);mInvalW.style.display='';}else{mInvalW.style.display='none';}}
-    var mStale=document.getElementById('mbs-stale-warn');
-    if(mStale){var bFr=(bk2&&bk2.freshness)||null;mStale.style.display=(bFr&&(bFr.price_fresh===false||bFr.is_stale===true))?'':'none';}
+    // Edge score + grade
+    var edgeN=sc2&&sc2.value!=null?Number(sc2.value):
+              hdiag.edge_score!=null?Number(hdiag.edge_score):
+              typeof edge!=='undefined'?Number(edge):0;
+    var grade=sc2&&sc2.grade?sc2.grade:
+              (edgeN>=85?'A+':edgeN>=70?'A':edgeN>=50?'B':'WAIT');
+    var mE=document.getElementById('mbs-edge');
+    if(mE){
+      var eCol=edgeN>=70?'#22c55e':edgeN>=50?'#eab308':'#6b7280';
+      mE.innerHTML='<span style="font-size:22px;font-weight:800;color:'+eCol+'">'+Math.round(edgeN)+'</span>'+'<span style="font-size:11px;color:'+eCol+';margin-left:5px">'+grade+'</span>'+'<span style="font-size:9px;color:#4b5563;margin-left:6px">/ 110</span>';
+    }
+    // Gate pills
+    var mG=document.getElementById('mbs-gates');
+    if(mG){
+      var vwapOk=hdiag.vwap_ok!=null?hdiag.vwap_ok:hdiag.vwap;
+      var pills=[
+        ['STR',hstructOk,hdiag.structure_reason||''],
+        ['ZONE',hzoneOk,hdiag.zone_reason||''],
+        ['VWAP',vwapOk,hdiag.vwap_reason||''],
+        ['CVD',(hcvdDir&&hcvdDir!=='unknown'&&hcvdDir!=='')?true:null,hcvdDir]
+      ];
+      mG.innerHTML=pills.map(function(p){
+        var ok=p[1];
+        var pass=ok===true||ok==='Y'||ok==='yes'||ok==='1'||ok===1;
+        var fail=ok===false||ok==='N'||ok==='no'||ok==='0'||ok===0;
+        var col=pass?'#22c55e':fail?'#ef4444':'#4b5563';
+        var sym=pass?'\u2713':fail?'\u2717':'\u00b7';
+        return '<span class="mbs-pill" title="'+String(p[2]).replace(/"/g,\'\\&quot;\')+'" style="color:'+col+'">'+sym+' '+p[0]+'</span>';
+      }).join('');
+    }
+    // WAIT reason
+    var mR=document.getElementById('mbs-reason');
+    if(mR){
+      var reason=d.strict_reason||d.strict_missing||
+                 (hdiag.wait_reason)||null;
+      if(reason&&!isActn){mR.textContent=String(reason).split(';')[0].trim();mR.style.display='';}
+      else{mR.style.display='none';}
+    }
+    // Stale warn
+    var mSt=document.getElementById('mbs-stale-warn');
+    if(mSt){var bFr=(bk2&&bk2.freshness)||null;
+      mSt.style.display=(bFr&&(bFr.price_fresh===false||bFr.is_stale===true))?'':'none';}
   })();
 
 

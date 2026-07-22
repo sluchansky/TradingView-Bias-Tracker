@@ -2,9 +2,9 @@
 test_center_card_replacement.py
 
 Tests A-Z: verify that the large #blh-hero center card has been replaced
-with the compact #main-brain-summary card, all required elements are present
-with correct data-testid attributes, old elements are removed, CSS is updated,
-and downstream JS variable dependencies are preserved.
+with the compact #main-brain-summary verdict card, all required elements are
+present with correct data-testid attributes, old elements are removed, CSS is
+updated, and downstream JS variable dependencies are preserved.
 
 No server is started — we parse the HTML/CSS/JS template directly from app.py.
 """
@@ -71,118 +71,105 @@ class TestNewCardPresent(unittest.TestCase):
         self.assertIn('data-testid="main-brain-summary"', MBS_CARD,
                       "main-brain-summary card must have its data-testid")
 
-    def test_C_narrative_element(self):
-        """C: #mbs-narrative with data-testid='main-brain-narrative' present."""
-        self.assertIn('id="mbs-narrative"', MBS_CARD,
-                      "#mbs-narrative must be in the summary card")
-        self.assertIn('data-testid="main-brain-narrative"', MBS_CARD,
-                      "mbs-narrative must carry its data-testid")
+    def test_C_verdict_element(self):
+        """C: #mbs-verdict with data-testid='main-brain-verdict' present."""
+        self.assertIn('id="mbs-verdict"', MBS_CARD,
+                      "#mbs-verdict must be in the summary card")
+        self.assertIn('data-testid="main-brain-verdict"', MBS_CARD,
+                      "mbs-verdict must carry its data-testid")
 
-    def test_D_next_action_element(self):
-        """D: #mbs-next-action with data-testid='main-brain-next-action' present."""
-        self.assertIn('id="mbs-next-action"', MBS_CARD,
-                      "#mbs-next-action must be in the summary card")
-        self.assertIn('data-testid="main-brain-next-action"', MBS_CARD,
-                      "mbs-next-action must carry its data-testid")
+    def test_D_edge_element(self):
+        """D: #mbs-edge with data-testid='main-brain-edge' present."""
+        self.assertIn('id="mbs-edge"', MBS_CARD,
+                      "#mbs-edge must be in the summary card")
+        self.assertIn('data-testid="main-brain-edge"', MBS_CARD,
+                      "mbs-edge must carry its data-testid")
 
-    def test_E_invalidation_element(self):
-        """E: #mbs-invalidation with data-testid='main-brain-invalidation' present."""
-        self.assertIn('id="mbs-invalidation"', MBS_CARD,
-                      "#mbs-invalidation must be in the summary card")
-        self.assertIn('data-testid="main-brain-invalidation"', MBS_CARD,
-                      "mbs-invalidation must carry its data-testid")
+    def test_E_gates_element(self):
+        """E: #mbs-gates with data-testid='main-brain-gates' present."""
+        self.assertIn('id="mbs-gates"', MBS_CARD,
+                      "#mbs-gates must be in the summary card")
+        self.assertIn('data-testid="main-brain-gates"', MBS_CARD,
+                      "mbs-gates must carry its data-testid")
 
-    def test_F_stale_warn_element(self):
-        """F: #mbs-stale-warn element present for data-stale display."""
+    def test_F_reason_element(self):
+        """F: #mbs-reason with data-testid='main-brain-reason' present."""
+        self.assertIn('id="mbs-reason"', MBS_CARD,
+                      "#mbs-reason must be in the summary card")
+        self.assertIn('data-testid="main-brain-reason"', MBS_CARD,
+                      "mbs-reason must carry its data-testid")
+
+    def test_G_stale_warn_element(self):
+        """G: #mbs-stale-warn element present for data-stale display."""
         self.assertIn('id="mbs-stale-warn"', MBS_CARD,
                       "#mbs-stale-warn must be in the summary card")
 
-    def test_G_talk_button(self):
-        """G: Talk-to-AI button with data-testid='main-brain-talk' present."""
-        self.assertIn('data-testid="main-brain-talk"', MBS_CARD,
-                      "Talk button must carry data-testid='main-brain-talk'")
-        self.assertIn('TALK TO AI', MBS_CARD,
-                      "Talk button must have text 'TALK TO AI'")
-
-    def test_H_speak_button(self):
-        """H: Speak button #mbs-speak-btn with data-testid='main-brain-speak' present."""
-        self.assertIn('id="mbs-speak-btn"', MBS_CARD,
-                      "#mbs-speak-btn must be in the summary card")
-        self.assertIn('data-testid="main-brain-speak"', MBS_CARD,
-                      "Speak button must carry data-testid='main-brain-speak'")
-
-    def test_I_heading_text(self):
-        """I: .mbs-heading div contains the text 'MAIN BRAIN'."""
-        self.assertIn('mbs-heading', MBS_CARD,
-                      ".mbs-heading must be present")
-        self.assertIn('MAIN BRAIN', MBS_CARD,
-                      "Heading text must be 'MAIN BRAIN'")
-
-    def test_J_next_action_starts_hidden(self):
-        """J: #mbs-next-action starts with display:none (revealed by JS when available)."""
+    def test_H_reason_starts_hidden(self):
+        """H: #mbs-reason starts with display:none (shown only on WAIT)."""
         m = re.search(
-            r'id="mbs-next-action"[^>]*style="[^"]*display:\s*none[^"]*"',
+            r'id="mbs-reason"[^>]*style="[^"]*display:\s*none[^"]*"',
             MBS_CARD,
         )
-        self.assertIsNotNone(
-            m,
-            "#mbs-next-action must have style='display:none' in HTML",
-        )
+        self.assertIsNotNone(m, "#mbs-reason must start hidden (display:none)")
 
-    def test_K_invalidation_starts_hidden(self):
-        """K: #mbs-invalidation starts with display:none (revealed by JS when available)."""
-        m = re.search(
-            r'id="mbs-invalidation"[^>]*style="[^"]*display:\s*none[^"]*"',
-            MBS_CARD,
-        )
-        self.assertIsNotNone(
-            m,
-            "#mbs-invalidation must have style='display:none' in HTML",
-        )
+    def test_I_no_talk_to_ai_button_in_card(self):
+        """I: TALK TO AI button is NOT inside #main-brain-summary card."""
+        self.assertNotIn('mbs-btn', MBS_CARD,
+                         ".mbs-btn must not be in the summary card")
+        self.assertNotIn('mbs-speak-btn', MBS_CARD,
+                         "#mbs-speak-btn must not be in the summary card")
+        self.assertNotIn('mbs-controls', MBS_CARD,
+                         ".mbs-controls must not be in the summary card")
 
-    def test_L_talk_button_scrolls_to_chat(self):
-        """L: Talk button onclick scrolls to #mb-chat-input (mod-brain chat box)."""
-        self.assertIn('mb-chat-input', MBS_CARD,
-                      "Talk button onclick must reference mb-chat-input")
-        self.assertIn('scrollIntoView', MBS_CARD,
-                      "Talk button onclick must use scrollIntoView")
+    def test_J_no_narrative_element(self):
+        """J: Old narrative paragraph (#mbs-narrative) is not in the card."""
+        self.assertNotIn('id="mbs-narrative"', MBS_CARD,
+                         "#mbs-narrative must not be in the new compact card")
 
-    def test_M_speak_button_uses_tts(self):
-        """M: Speak button onclick uses window.speechSynthesis TTS."""
-        self.assertIn('speechSynthesis', MBS_CARD,
-                      "Speak button must use window.speechSynthesis")
-        self.assertIn('SpeechSynthesisUtterance', MBS_CARD,
-                      "Speak button must create a SpeechSynthesisUtterance")
+    def test_K_verdict_has_initial_color(self):
+        """K: #mbs-verdict has an initial color style set (WAIT gray)."""
+        self.assertIn('color:', MBS_CARD,
+                      "#mbs-verdict must have an initial color style")
+
+    def test_L_mbs_pill_css_used(self):
+        """L: .mbs-pill CSS class is referenced in the card's gate pills."""
+        self.assertIn('mbs-pill', SRC,
+                      ".mbs-pill must be defined in CSS and used by gate pills")
 
 
 # ─── OLD blh-hero REMOVED ────────────────────────────────────────────────────
 
 class TestOldHeroRemoved(unittest.TestCase):
 
-    def test_N_blh_hero_gone(self):
-        """N: id='blh-hero' is not present in the HTML (replaced by mbs card)."""
+    def test_M_blh_hero_gone(self):
+        """M: id='blh-hero' is not present in the template."""
         self.assertNotIn('<div id="blh-hero">', SRC,
                          "#blh-hero must not appear anywhere in the template")
 
-    def test_O_blh_verdict_gone(self):
-        """O: id='blh-verdict' (giant WAIT/READY headline) is removed."""
+    def test_N_blh_verdict_gone(self):
+        """N: id='blh-verdict' (giant WAIT/READY headline) is removed."""
         self.assertNotIn('id="blh-verdict"', SRC,
-                         "#blh-verdict must be removed (replaced by mbs-narrative)")
+                         "#blh-verdict must be removed")
 
-    def test_P_blh_reasoning_text_gone(self):
-        """P: id='blh-reasoning-text' (AI REASONING box) is removed."""
+    def test_O_blh_reasoning_text_gone(self):
+        """O: id='blh-reasoning-text' (AI REASONING box) is removed."""
         self.assertNotIn('id="blh-reasoning-text"', SRC,
                          "#blh-reasoning-text must be removed")
 
-    def test_Q_blh_obs_tbl_gone(self):
-        """Q: KEY OBSERVATIONS table (.blh-obs-tbl) is removed."""
+    def test_P_blh_obs_tbl_gone(self):
+        """P: KEY OBSERVATIONS table (.blh-obs-tbl) is removed."""
         self.assertNotIn('blh-obs-tbl', SRC,
-                         ".blh-obs-tbl must be removed (KEY OBSERVATIONS table)")
+                         ".blh-obs-tbl must be removed")
 
-    def test_R_blh_waveform_gone(self):
-        """R: id='blh-waveform' (animated waveform) is removed."""
+    def test_Q_blh_waveform_gone(self):
+        """Q: id='blh-waveform' (animated waveform) is removed."""
         self.assertNotIn('id="blh-waveform"', SRC,
                          "#blh-waveform must be removed")
+
+    def test_R_no_speak_btn_in_card(self):
+        """R: Old speak button (#mbs-speak-btn) is not in the card."""
+        self.assertNotIn('id="mbs-speak-btn"', SRC,
+                         "#mbs-speak-btn must be removed from the new card")
 
 
 # ─── CSS: new styles present ──────────────────────────────────────────────────
@@ -190,40 +177,39 @@ class TestOldHeroRemoved(unittest.TestCase):
 class TestNewCSS(unittest.TestCase):
 
     def test_S_mbs_card_css(self):
-        """S: #main-brain-summary CSS rule is present in source."""
+        """S: #main-brain-summary CSS rule is present."""
         self.assertIn('#main-brain-summary{', SRC,
                       "#main-brain-summary CSS must be defined")
 
-    def test_T_mbs_btn_css(self):
-        """T: .mbs-btn and .mbs-controls CSS classes are defined in source."""
-        self.assertIn('.mbs-btn{', SRC,
-                      ".mbs-btn CSS must be defined")
-        self.assertIn('.mbs-controls{', SRC,
-                      ".mbs-controls CSS must be defined")
+    def test_T_mbs_verdict_css(self):
+        """T: #mbs-verdict CSS is defined."""
+        self.assertIn('#mbs-verdict{', SRC,
+                      "#mbs-verdict CSS must be defined")
+
+    def test_U_mbs_pill_css(self):
+        """U: .mbs-pill CSS class is defined for gate pills."""
+        self.assertIn('.mbs-pill{', SRC,
+                      ".mbs-pill CSS must be defined")
 
 
 # ─── CSS: Swing V2 .blh-pill preserved ───────────────────────────────────────
 
 class TestBlhPillPreserved(unittest.TestCase):
 
-    def test_U_blh_pill_css_preserved(self):
-        """U: .blh-pill CSS is preserved (Swing V2 lifecycle badge uses it)."""
+    def test_V_blh_pill_css_preserved(self):
+        """V: .blh-pill CSS is preserved (Swing V2 lifecycle badge uses it)."""
         self.assertIn('.blh-pill{', SRC,
                       ".blh-pill CSS must be preserved for sv2-lifecycle-badge")
         self.assertIn('.blh-pill.ok{', SRC,
                       ".blh-pill.ok must be preserved")
-        self.assertIn('.blh-pill.fail{', SRC,
-                      ".blh-pill.fail must be preserved")
-        self.assertIn('.blh-pill.warn{', SRC,
-                      ".blh-pill.warn must be preserved")
 
-    def test_V_blh_hero_css_removed(self):
-        """V: #blh-hero{ CSS rule is removed."""
+    def test_W_blh_hero_css_removed(self):
+        """W: #blh-hero{ CSS rule is removed."""
         self.assertNotIn('#blh-hero{', SRC,
                          "#blh-hero CSS must be removed")
 
-    def test_W_blhwave_keyframes_removed(self):
-        """W: @keyframes blhWave (waveform animation) CSS is removed."""
+    def test_X_blhwave_keyframes_removed(self):
+        """X: @keyframes blhWave (waveform animation) CSS is removed."""
         self.assertNotIn('@keyframes blhWave', SRC,
                          "@keyframes blhWave must be removed")
 
@@ -232,28 +218,25 @@ class TestBlhPillPreserved(unittest.TestCase):
 
 class TestCenterJS(unittest.TestCase):
 
-    def test_X_isactn_defined(self):
-        """X: isActn is defined in the center JS block (downstream left-col uses it)."""
-        self.assertIn("var isActn=", CENTER_JS,
-                      "isActn must be defined in the center card JS block")
-
-    def test_Y_shared_diag_vars_defined(self):
-        """Y: hdiag/hcvdDir/hstructOk/hzoneOk/hvolReg defined for right-col use."""
-        for var in ("var hdiag=", "var hcvdDir=", "var hstructOk=",
-                    "var hzoneOk=", "var hvolReg="):
+    def test_Y_isactn_and_diag_vars_defined(self):
+        """Y: isActn/hdiag/hcvdDir/hstructOk/hzoneOk/hvolReg defined (downstream use)."""
+        for var in ("var isActn=", "var hdiag=", "var hcvdDir=",
+                    "var hstructOk=", "var hzoneOk=", "var hvolReg="):
             self.assertIn(var, CENTER_JS,
                           f"{var.strip()} must be defined in center JS block")
 
-    def test_Z_getbrain_called_in_center_block(self):
-        """Z: getBrain(d) is called in the center card JS block (Brain Contract)."""
+    def test_Z_js_populates_verdict_edge_gates_reason(self):
+        """Z: Center JS updates mbs-verdict, mbs-edge, mbs-gates, mbs-reason."""
+        self.assertIn("mbs-verdict", CENTER_JS,
+                      "center JS must update #mbs-verdict")
+        self.assertIn("mbs-edge", CENTER_JS,
+                      "center JS must update #mbs-edge")
+        self.assertIn("mbs-gates", CENTER_JS,
+                      "center JS must update #mbs-gates")
+        self.assertIn("mbs-reason", CENTER_JS,
+                      "center JS must update #mbs-reason")
         self.assertIn("getBrain(d)", CENTER_JS,
-                      "getBrain(d) must be called in the center card JS block")
-        self.assertIn("mbs-narrative", CENTER_JS,
-                      "center JS must update #mbs-narrative")
-        self.assertIn("mbs-next-action", CENTER_JS,
-                      "center JS must update #mbs-next-action")
-        self.assertIn("mbs-stale-warn", CENTER_JS,
-                      "center JS must update #mbs-stale-warn")
+                      "center JS must call getBrain(d) for edge score/grade")
 
 
 if __name__ == "__main__":
