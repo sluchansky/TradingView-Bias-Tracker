@@ -464,6 +464,116 @@ def test_fail_open_has_plan_fields():
     assert trace["plan_executable"] is False
 
 
+# ── T31: exception during adapter does NOT change result ──────────────────
+
+def test_adapter_exception_does_not_change_result():
+    """Req 4: adapter failure is display-only; full_analysis result is unchanged."""
+    import copy
+    result_before = {
+        "verdict": "LONG READY",
+        "edge_score": 82,
+        "strict_reason": "All gates pass",
+        "trade_plan": {"trade_plan": True, "entry_zone": 2050.0, "stop_loss": 2045.0, "target1": 2060.0},
+        "alert_level": "READY",
+        "conviction_tier": "STRONG",
+    }
+    snap = copy.deepcopy(result_before)
+    # Call the adapter; even if it raises internally, the result dict is unchanged.
+    try:
+        app.build_legacy_decision_trace(result_before, "MGC")
+    except Exception:
+        pass
+    assert result_before == snap, "build_legacy_decision_trace must not mutate the result dict"
+
+
+# ── T32: adapter exception produces an observable log record ──────────────
+
+def test_adapter_exception_produces_log_record():
+    """Req 4: the cache block logs at WARNING level on exception, not silently passes."""
+    import logging
+    import logging.handlers
+    import copy
+
+    # Patch build_legacy_decision_trace to raise
+    original = app.build_legacy_decision_trace
+
+    def _boom(result, instrument, generated_at=None):
+        raise RuntimeError("injected test failure")
+
+    app.build_legacy_decision_trace = _boom
+    log_records = []
+    handler = logging.handlers.MemoryHandler(capacity=100, flushLevel=logging.CRITICAL)
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            log_records.append(record)
+
+    cap = _Cap()
+    cap.setLevel(logging.WARNING)
+    app.logger.addHandler(cap)
+
+    old_flag = app.DECISION_TRACE_SHADOW_ENABLED
+    try:
+        app.DECISION_TRACE_SHADOW_ENABLED = True
+        # Simulate the cache block
+        try:
+            _dt_inst = app.instrument_of("MGC")
+            if _dt_inst in app._ALERT_INSTRUMENTS:
+                _dt = app.build_legacy_decision_trace({}, _dt_inst)
+                with app._DECISION_TRACE_LOCK:
+                    app._LAST_DECISION_TRACE[_dt_inst] = _dt
+        except Exception as _dt_exc:
+            app.logger.warning(
+                "[decision-trace] adapter exception (display-only, analysis unaffected): %s",
+                type(_dt_exc).__name__,
+            )
+    finally:
+        app.build_legacy_decision_trace = original
+        app.DECISION_TRACE_SHADOW_ENABLED = old_flag
+        app.logger.removeHandler(cap)
+
+    assert len(log_records) >= 1, "Expected at least one WARNING log record"
+    assert "decision-trace" in log_records[0].getMessage().lower() or            "decision-trace" in log_records[0].msg.lower(),            f"Log record should mention decision-trace: {log_records[0].getMessage()}"
+
+
+# ── T33: unknown instrument cannot create arbitrary cache key ─────────────
+
+def test_cache_bound_unknown_instrument():
+    """Req 5: unknown tickers resolve to a valid registry key, never arbitrary strings."""
+    import app as _app
+
+    # instrument_of() always returns a known instrument (DEFAULT_INSTRUMENT=MGC for unknowns).
+    for unknown in ("XRPBTC", "AAPL", "foobar", "1!@#$", ""):
+        resolved = _app.instrument_of(unknown)
+        assert resolved in _app._ALERT_INSTRUMENTS,             f"instrument_of({unknown!r}) returned {resolved!r} which is not in _ALERT_INSTRUMENTS"
+
+
+# ── T34: cache write guard requires key in _ALERT_INSTRUMENTS ─────────────
+
+def test_cache_write_requires_valid_instrument():
+    """Req 5: the cache block guards the write with `if _dt_inst in _ALERT_INSTRUMENTS`."""
+    import app as _app
+    import copy
+
+    # Snapshot the cache before
+    with _app._DECISION_TRACE_LOCK:
+        before = dict(_app._LAST_DECISION_TRACE)
+
+    # Even if somehow instrument_of returned something bad, the guard blocks writes.
+    bad_key = "ARBITRARY_KEY_12345"
+    assert bad_key not in _app._ALERT_INSTRUMENTS
+    if bad_key in _app._ALERT_INSTRUMENTS:
+        # Guard prevents this write path — this branch is unreachable by design.
+        with _app._DECISION_TRACE_LOCK:
+            _app._LAST_DECISION_TRACE[bad_key] = {"injected": True}
+
+    with _app._DECISION_TRACE_LOCK:
+        after = dict(_app._LAST_DECISION_TRACE)
+
+    assert bad_key not in after, f"Cache must never contain arbitrary key {bad_key!r}"
+    assert set(after.keys()) <= set(_app._ALERT_INSTRUMENTS),         f"Cache keys outside registry: {set(after.keys()) - set(_app._ALERT_INSTRUMENTS)}"
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -23400,12 +23400,18 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # does NOT mutate result. Flag OFF => block never executes (byte-identical).
     if DECISION_TRACE_SHADOW_ENABLED:
         try:
-            _dt_inst = instrument_of(active_ticker) or active_ticker
-            _dt = build_legacy_decision_trace(result, _dt_inst)
-            with _DECISION_TRACE_LOCK:
-                _LAST_DECISION_TRACE[_dt_inst] = _dt
-        except Exception:
-            pass
+            # instrument_of() always returns a valid registry key (never falsy),
+            # so _dt_inst is always in _ALERT_INSTRUMENTS — cache is bounded.
+            _dt_inst = instrument_of(active_ticker)
+            if _dt_inst in _ALERT_INSTRUMENTS:
+                _dt = build_legacy_decision_trace(result, _dt_inst)
+                with _DECISION_TRACE_LOCK:
+                    _LAST_DECISION_TRACE[_dt_inst] = _dt
+        except Exception as _dt_exc:
+            logger.warning(
+                "[decision-trace] adapter exception (display-only, analysis unaffected): %s",
+                type(_dt_exc).__name__,
+            )
 
     return result
 
