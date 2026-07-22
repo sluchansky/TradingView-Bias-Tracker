@@ -45855,32 +45855,31 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
    MAIN BRAIN — Apple × OpenAI experience redesign
    ════════════════════════════════════════════════════════════════ */
 #mod-brain{background:linear-gradient(175deg,#05070e 0%,#020308 100%);border:1px solid rgba(110,130,255,.09);border-radius:20px;padding:0;overflow:hidden;position:relative}
-/* ── Brain surface: compact 2-col (desktop: avatar left | narrative right) ── */
-.brain-surface{display:flex;align-items:flex-start;gap:18px;padding:22px 20px 18px;position:relative}
-.brain-orb-halo{position:absolute;top:-20px;left:50%;transform:translateX(-50%);width:280px;height:160px;border-radius:50%;background:radial-gradient(ellipse at 50% 60%,rgba(99,102,241,.17) 0%,transparent 70%);transition:background 1.5s ease;pointer-events:none;z-index:0}
+/* ── Brain surface: compact stacked layout for 220px left column ── */
+.brain-surface{padding:14px 16px 12px;position:relative}
+.brain-orb-halo{position:absolute;top:-10px;left:50%;transform:translateX(-50%);width:200px;height:100px;border-radius:50%;background:radial-gradient(ellipse at 50% 60%,rgba(99,102,241,.17) 0%,transparent 70%);transition:background 1.5s ease;pointer-events:none;z-index:0}
 #mod-brain[data-brain-state=ready] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(52,211,153,.22) 0%,transparent 70%)}
 #mod-brain[data-brain-state=trade] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(251,191,36,.18) 0%,transparent 70%)}
 #mod-brain[data-brain-state=closed] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(15,15,30,.20) 0%,transparent 70%)}
-.brain-av-side{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;z-index:2}
-#mod-brain .mb-orb{position:relative;z-index:2;width:152px;height:190px;margin:0 0 8px}
-#mod-brain .mb-dicebear-av{width:136px;height:136px;top:10px}
+/* avatar row: small orb left, state pill right */
+.brain-av-side{display:flex;align-items:center;gap:10px;margin-bottom:12px;position:relative;z-index:2}
+#mod-brain .mb-orb{position:relative;z-index:2;width:72px;height:90px;margin:0;flex-shrink:0}
+#mod-brain .mb-dicebear-av{width:64px;height:64px;top:6px}
 /* ── State pill ── */
-.brain-state-pill{position:relative;z-index:2;font-size:9px;font-weight:700;letter-spacing:2.8px;text-transform:uppercase;color:#374151;padding:4px 14px;border:1px solid rgba(255,255,255,.07);border-radius:999px;background:rgba(255,255,255,.025);transition:color .5s,border-color .5s,background .5s;white-space:nowrap}
+.brain-state-pill{position:relative;z-index:2;font-size:8px;font-weight:700;letter-spacing:2.4px;text-transform:uppercase;color:#374151;padding:3px 12px;border:1px solid rgba(255,255,255,.07);border-radius:999px;background:rgba(255,255,255,.025);transition:color .5s,border-color .5s,background .5s;white-space:nowrap;flex-shrink:0}
 #mod-brain[data-brain-state=ready] .brain-state-pill{color:#34d399;border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.06)}
 #mod-brain[data-brain-state=trade] .brain-state-pill{color:#fbbf24;border-color:rgba(251,191,36,.28);background:rgba(251,191,36,.05)}
 #mod-brain[data-brain-state=closed] .brain-state-pill{color:#1f2937;border-color:rgba(31,41,55,.15)}
-/* ── Narrative side ── */
-.brain-narr-side{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px;padding-top:6px;z-index:2}
-.brain-caption{font-size:13px;font-weight:500;color:#b8c0da;line-height:1.58;letter-spacing:-.1px;transition:color .5s;margin:0}
+/* ── Narrative section below the avatar row ── */
+.brain-narr-side{display:flex;flex-direction:column;gap:9px;position:relative;z-index:2}
+.brain-caption{font-size:12px;font-weight:500;color:#b8c0da;line-height:1.56;letter-spacing:-.1px;transition:color .5s;margin:0}
 #mod-brain[data-brain-state=closed] .brain-caption{color:#2d3748}
 /* ── Next action / invalidation ── */
-.brain-na-wrap{display:flex;flex-direction:column;gap:3px}
-.brain-na-lbl{font-size:8px;font-weight:700;letter-spacing:2px;color:rgba(255,255,255,.18);text-transform:uppercase}
-.brain-na-val{font-size:12px;color:#9ca3af;line-height:1.48}
+.brain-na-wrap{display:flex;flex-direction:column;gap:2px}
+.brain-na-lbl{font-size:7px;font-weight:700;letter-spacing:2px;color:rgba(255,255,255,.18);text-transform:uppercase}
+.brain-na-val{font-size:11px;color:#9ca3af;line-height:1.46}
 /* ── Feed section label (shared by chat section) ── */
 .brain-section-lbl{font-size:8px;font-weight:700;letter-spacing:2.4px;color:rgba(255,255,255,.14);text-transform:uppercase;margin-bottom:10px}
-/* ── Mobile: stack vertically ── */
-@media(max-width:540px){.brain-surface{flex-direction:column;align-items:center}.brain-narr-side{width:100%}}
 /* ── Chat section ── */
 .brain-chat-section{padding:14px 16px 16px;border-top:1px solid rgba(255,255,255,.05)}
 #mod-brain .mb-chat-h{display:none}
