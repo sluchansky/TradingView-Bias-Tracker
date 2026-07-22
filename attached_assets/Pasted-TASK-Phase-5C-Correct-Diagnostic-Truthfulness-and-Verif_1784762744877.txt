@@ -1,0 +1,256 @@
+TASK: Phase 5C — Correct Diagnostic Truthfulness and Verify MNQ/MYM Alerts
+
+OBJECTIVE
+
+Correct misleading diagnostic output uncovered by the live-session audit.
+
+Do not change trading decisions, scoring behavior, thresholds, structure TTL, zone behavior, volatility behavior, sizing, R:R, stops, targets, or order execution.
+
+PROVEN CURRENT BEHAVIOR
+
+1. MGC evaluation:
+    * CHOCH SUPPLY = +20
+    * VWAP rejection = +15
+    * Volume confirmation = +15
+    * Raw score = 50
+    * Final score = 50
+    * Threshold = 60
+    * Only failed requirement = edge score
+2. SCALP zone behavior:
+    * GATE_REQUIRE_ZONE = False
+    * Zone state does not contribute edge points
+    * Zone state does not block READY
+    * “Tested” is diagnostic only
+3. Volatility behavior:
+    * volAdj may display values such as -10
+    * The displayed volatility adjustment is not currently applied to edge score
+    * Do not change that behavior in this phase
+4. Structure:
+    * MGC structure alerts work
+    * MES structure alerts work
+    * MNQ and MYM have not produced full BOS/CHOCH events in the observed session
+    * TradingView configuration must be manually verified before declaring a production defect
+
+CHANGE 1 — VOLATILITY DISPLAY TRUTHFULNESS
+
+Problem:
+
+The gate diagnostic displays:
+
+volAdj=-10
+
+This implies the score was reduced by 10, but current scoring code does not apply that value.
+
+Required fix:
+
+Rename or relabel this diagnostic field so it cannot be mistaken for an applied score adjustment.
+
+Acceptable examples:
+
+* volSuggestedAdj=-10
+* volDiagnosticAdj=-10
+* volPolicyAdj=-10 (not applied)
+* volatilityRegime=Choppy, configuredAdj=-10, appliedAdj=0
+
+Preferred structured output:
+
+volatility: {
+regime: “Choppy”,
+configured_adjustment: -10,
+applied_adjustment: 0,
+affects_edge_score: false,
+hard_block: false
+}
+
+In text logs, render something like:
+
+volatility=Choppy configuredAdj=-10 appliedAdj=0
+
+Do not display only “volAdj=-10.”
+
+CHANGE 2 — SCORE MATH IN DECISION TRACE
+
+Add explicit scoring fields to the existing decision trace:
+
+edge_score: {
+component_points: {
+bos: 0,
+choch: 20,
+vwap: 15,
+sweep: 0,
+volume: 15,
+cvd: 0,
+session: 0
+},
+raw_component_score: 50,
+soft_modifier_total: 0,
+learning_delta: 0,
+volatility_configured_adjustment: -10,
+volatility_applied_adjustment: 0,
+final_score: 50,
+threshold: 60,
+gap_to_threshold: 10,
+passes: false
+}
+
+Use the actual existing values dynamically.
+
+Do not hardcode the example numbers.
+
+Preserve all existing keys.
+
+CHANGE 3 — ZONE ROLE DISCLOSURE
+
+Add explicit zone diagnostic fields:
+
+zone: {
+state: “Tested”,
+required_by_current_mode: false,
+hard_gate_pass: null,
+edge_points: 0,
+affects_verdict: false
+}
+
+Rules:
+
+* If the current mode does not require the zone, hard_gate_pass should be null, not false.
+* Display “Informational only” in the dashboard when the zone is not required.
+* Do not show a red failure indicator for a non-required zone.
+
+CHANGE 4 — FAILURE REASON PRECISION
+
+When the only failed condition is edge score, the displayed reason must say:
+
+Edge score 50 is below the required 60.
+
+Do not list:
+
+* Zone Tested
+* Choppy volatility
+* Missing CVD
+
+as hard blockers unless they actually fail a required gate.
+
+They may appear under:
+
+* Missing confirmations
+* Informational context
+* Potential score additions
+
+Separate these categories clearly:
+
+Hard blockers
+Missing optional confirmations
+Context only
+
+CHANGE 5 — OPTIONAL CONFIRMATION GAP
+
+Add a read-only field explaining possible ways to reach threshold.
+
+Example:
+
+score_gap: {
+points_needed: 10,
+available_missing_components: [
+{“name”: “CVD confirms Short”, “points”: 15},
+{“name”: “Liquidity sweep”, “points”: 15},
+{“name”: “Bearish BOS”, “points”: 20}
+]
+}
+
+Only include components that are actually absent and directionally applicable.
+
+Do not imply they are guaranteed to occur.
+
+Do not change the scoring system.
+
+CHANGE 6 — MNQ/MYM STRUCTURE VERIFICATION STATUS
+
+For MNQ and MYM, display:
+
+Structure alert status: NOT VERIFIED
+
+Reason:
+
+No full BOS/CHOCH webhook was received during the observed session.
+
+Do not display:
+
+* Broken
+* Missing configuration
+* Alert disabled
+
+unless manually verified in TradingView.
+
+Add a checklist status field that can be updated manually:
+
+tradingview_structure_check: {
+script_loaded: null,
+correct_symbol: null,
+intended_timeframe: null,
+alert_exists: null,
+any_alert_function_call: null,
+webhook_enabled: null,
+correct_webhook_url: null,
+message_blank: null,
+active: null,
+expired: null,
+recent_chart_labels: null
+}
+
+This is diagnostic metadata only.
+
+Do not add automatic assumptions.
+
+CHANGE 7 — TESTS
+
+Add tests for:
+
+1. Configured volatility adjustment not applied:
+    * configured_adjustment = -10
+    * applied_adjustment = 0
+    * final score unchanged
+2. Gate log does not misleadingly show only volAdj=-10.
+3. SCALP zone not required:
+    * required_by_current_mode = false
+    * hard_gate_pass = null
+    * affects_verdict = false
+4. Edge score is the only failed gate:
+    * strict reason names edge score only
+5. Missing optional CVD:
+    * appears as optional confirmation
+    * does not appear as hard blocker
+6. Score-gap calculation:
+    * points_needed correct
+    * only absent, applicable components listed
+7. Unverified MNQ/MYM status:
+    * no structure received produces NOT VERIFIED
+    * must not produce BROKEN or DISABLED
+8. Existing verdict remains unchanged.
+9. Existing Phase 5B schema remains backward compatible.
+
+VALIDATION
+
+Run:
+
+* Phase 5B tests
+* New Phase 5C tests
+* Golden tests
+* Regression suite
+* JavaScript syntax checks
+* git diff –check
+
+FINAL REPORT
+
+Provide:
+
+* Files changed
+* Exact diagnostic labels before and after
+* Score math fields added
+* Zone role fields added
+* Confirmation no trading logic changed
+* Complete test results
+
+STOP after validation.
+
+Do not publish automatically.

@@ -21709,6 +21709,204 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
         except Exception:
             pass
 
+        # ── Phase 5C: Diagnostic truthfulness additions (DISPLAY/DIAGNOSTICS-ONLY)
+        # All five blocks are individually fail-open: an exception leaves the new key
+        # None without touching ANY existing key. Reads ONLY from the already-assembled
+        # `result` (gate_debug, edge_breakdown, volatility); no recomputation and no
+        # money-path access. ─────────────────────────────────────────────────────────
+
+        # Change 2 — Full edge score math breakdown ───────────────────────────
+        _5c_edge_detail = None
+        try:
+            _5c_eb  = result.get("edge_breakdown") or {}
+            _5c_gd  = result.get("gate_debug") or {}
+            _5c_vol = result.get("volatility") or {}
+            _5c_comps = _5c_eb.get("components") or []
+            _5c_key_map = {
+                "bos_confirmed": "bos", "choch_confirmed": "choch",
+                "vwap_confirmed": "vwap", "liquidity_sweep": "sweep",
+                "volume_confirmed": "volume", "cvd_confirmed": "cvd",
+                "preferred_session": "session",
+            }
+            _5c_cpts = {
+                _5c_key_map.get(c.get("key", ""), c.get("key", "")):
+                (c.get("points", 0) if c.get("present") else 0)
+                for c in _5c_comps if c.get("key")
+            }
+            _5c_raw   = int(_5c_eb.get("raw_score") or 0)
+            _5c_final = int(_5c_eb.get("score") or edge_score or 0)
+            _5c_ls    = int(_5c_gd.get("learning_score_delta") or 0)
+            _5c_sb    = _5c_eb.get("score_breakdown") or []
+            _5c_soft  = sum(it.get("points", 0) for it in _5c_sb
+                            if (it.get("points") or 0) < 0
+                            and "Learning" not in (it.get("label") or ""))
+            _5c_vcfg  = (int(_5c_vol.get("score_adj") or 0)
+                         if _5c_vol.get("status") == "ok" else 0)
+            _5c_thr   = int(
+                _5c_gd.get("full_ready_threshold")
+                or _5c_gd.get("ready_threshold")
+                or EDGE_READY_THRESHOLD
+            )
+            _5c_edge_detail = {
+                "component_points":               _5c_cpts,
+                "raw_component_score":            _5c_raw,
+                "soft_modifier_total":            _5c_soft,
+                "learning_delta":                 _5c_ls,
+                "volatility_configured_adjustment": _5c_vcfg,
+                "volatility_applied_adjustment":  0,
+                "final_score":                    _5c_final,
+                "threshold":                      _5c_thr,
+                "gap_to_threshold":               max(0, _5c_thr - _5c_final),
+                "passes":                         _5c_final >= _5c_thr,
+            }
+        except Exception:
+            pass
+
+        # Change 3 — Zone role disclosure ──────────────────────────────────────
+        _5c_zone_role = None
+        try:
+            _5c_gd  = result.get("gate_debug") or {}
+            _5c_req = bool(_5c_gd.get("require_zone"))
+            _5c_zst = _5c_gd.get("zoneState") or None
+            _5c_zvl = bool(_5c_gd.get("zone_valid"))
+            _5c_zone_role = {
+                "state":                    _5c_zst,
+                "required_by_current_mode": _5c_req,
+                # null when zone is not required — avoid a misleading "false" gate label
+                "hard_gate_pass":           bool(_5c_zvl) if _5c_req else None,
+                "edge_points":              0,
+                "affects_verdict":          _5c_req,
+            }
+        except Exception:
+            pass
+
+        # Change 4 — Failure summary (human-readable, categorized) ─────────────
+        _5c_failure = None
+        if domain == "WAIT" and not market_closed and not has_active:
+            try:
+                _5c_gd    = result.get("gate_debug") or {}
+                _5c_vol   = result.get("volatility") or {}
+                _5c_fails = list(_5c_gd.get("failed_conditions") or [])
+                _5c_ef    = [f for f in _5c_fails if f.startswith("edge_score")]
+                _5c_nef   = [f for f in _5c_fails if not f.startswith("edge_score")]
+                if _5c_ef and not _5c_nef:
+                    _5c_cur = int(_5c_gd.get("edge_score") or 0)
+                    _5c_thr = int(
+                        _5c_gd.get("full_ready_threshold")
+                        or _5c_gd.get("ready_threshold")
+                        or EDGE_READY_THRESHOLD
+                    )
+                    _5c_hreason = ("Edge score %d is below the required %d."
+                                   % (_5c_cur, _5c_thr))
+                else:
+                    _5c_hreason = (", ".join(_5c_fails)) if _5c_fails else None
+                _5c_il = (True if direction == "Long"
+                          else (False if direction == "Short" else None))
+                def _5c_dl(lg, sh):
+                    if _5c_il is True:  return lg
+                    if _5c_il is False: return sh
+                    return lg
+                _5c_opt_map = [
+                    ("bos",              _5c_dl("Bullish BOS",       "Bearish BOS"),        20),
+                    ("choch",            _5c_dl("Bullish CHOCH",     "Bearish CHOCH"),      20),
+                    ("vwap_confirmed",   _5c_dl("VWAP Reclaim",      "VWAP Rejection"),     15),
+                    ("liquidity_sweep",  "Liquidity Sweep",                                 15),
+                    ("volume_confirmed", "Volume Confirmation",                             15),
+                    ("cvd_confirmed",    _5c_dl("CVD Confirms Long", "CVD Confirms Short"), 15),
+                    ("session_pref",     "Session Bonus",                                   10),
+                ]
+                _5c_hard_keys = {"zone_valid", "vwap_confirmed", "structure_confirmed",
+                                 "volume_unconfirmed", "cvd_conflict", "location"}
+                _5c_actual_hard = [f for f in _5c_fails if f in _5c_hard_keys]
+                _5c_miss_opt = [
+                    {"name": lbl, "points": pts}
+                    for gk, lbl, pts in _5c_opt_map
+                    if gk not in _5c_hard_keys and not _5c_gd.get(gk)
+                ]
+                _5c_ctx = []
+                if not _5c_gd.get("require_zone") and _5c_gd.get("zoneState"):
+                    _5c_ctx.append(
+                        'Zone state "%s" is informational — zone is not a gate '
+                        "requirement in this mode (GATE_REQUIRE_ZONE=False)"
+                        % _5c_gd.get("zoneState")
+                    )
+                _5c_vc = int(_5c_vol.get("score_adj") or 0)
+                if _5c_vol.get("status") == "ok" and _5c_vc:
+                    _5c_ctx.append(
+                        "Volatility configuredAdj=%+d is a policy value — "
+                        "it is NOT applied to the edge score (appliedAdj=0)" % _5c_vc
+                    )
+                _5c_failure = {
+                    "human_reason":                   _5c_hreason,
+                    "hard_blockers":                  _5c_actual_hard or _5c_nef or _5c_ef,
+                    "missing_optional_confirmations": _5c_miss_opt,
+                    "context_only":                   _5c_ctx,
+                }
+            except Exception:
+                pass
+
+        # Change 5 — Score gap: points needed and which absent components add them ─
+        # Labels in edge_breakdown.components are already direction-aware (set by
+        # compute_edge_breakdown / _analysis_edge_breakdown). Use them as-is; no
+        # secondary remapping needed or correct here.
+        _5c_score_gap = None
+        try:
+            _5c_eb    = result.get("edge_breakdown") or {}
+            _5c_gd    = result.get("gate_debug") or {}
+            _5c_comps = _5c_eb.get("components") or []
+            _5c_final = int(_5c_eb.get("score") or edge_score or 0)
+            _5c_thr   = int(
+                _5c_gd.get("full_ready_threshold")
+                or _5c_gd.get("ready_threshold")
+                or EDGE_READY_THRESHOLD
+            )
+            _5c_gap      = max(0, _5c_thr - _5c_final)
+            _5c_available = [
+                {"name": c.get("label", ""), "points": c.get("points", 0)}
+                for c in _5c_comps if not c.get("present")
+            ]
+            _5c_score_gap = {
+                "points_needed":                _5c_gap,
+                "available_missing_components": _5c_available,
+            }
+        except Exception:
+            pass
+
+        # Change 6 — Structure alert verification status ────────────────────────
+        _5c_struct_alert = None
+        try:
+            _5c_gd     = result.get("gate_debug") or {}
+            _5c_bos    = bool(_5c_gd.get("bos"))
+            _5c_choch  = bool(_5c_gd.get("choch"))
+            _5c_struct = bool(_5c_gd.get("structure_confirmed"))
+            _5c_struct_alert = {
+                "status":         "VERIFIED" if _5c_struct else "NOT VERIFIED",
+                "bos_received":   _5c_bos,
+                "choch_received": _5c_choch,
+                "note": (
+                    "Structure alert received and confirmed in current session."
+                    if _5c_struct
+                    else "No full BOS/CHOCH webhook received in the current session. "
+                         "Manual TradingView configuration check required before "
+                         "declaring a production defect."
+                ),
+                "tradingview_check": {
+                    "script_loaded":           None,
+                    "correct_symbol":          None,
+                    "intended_timeframe":      None,
+                    "alert_exists":            None,
+                    "any_alert_function_call": None,
+                    "webhook_enabled":         None,
+                    "correct_webhook_url":     None,
+                    "message_blank":           None,
+                    "active":                  None,
+                    "expired":                 None,
+                    "recent_chart_labels":     None,
+                },
+            }
+        except Exception:
+            pass
+
         return {
             "schema_version":   1,
             "generated_at":     ts,
@@ -21732,6 +21930,12 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
                                     and tp.get("stop_loss") and tp.get("target1")),
             "plan_executable":  has_plan and verdict in FULL_READY_VERDICTS,
             "next_action":      next_action,
+            # ── Phase 5C diagnostic truthfulness (Changes 2-6, display-only) ──
+            "edge_score_detail": _5c_edge_detail,
+            "zone_role":         _5c_zone_role,
+            "failure_summary":   _5c_failure,
+            "score_gap":         _5c_score_gap,
+            "structure_alert":   _5c_struct_alert,
         }
     except Exception as _exc:
         import datetime as _dtime2
@@ -21754,6 +21958,12 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
             "plan_available":   False,
             "plan_executable":  False,
             "next_action":      None,
+            # ── Phase 5C diagnostic truthfulness (fail-open defaults) ──────────
+            "edge_score_detail": None,
+            "zone_role":         None,
+            "failure_summary":   None,
+            "score_gap":         None,
+            "structure_alert":   None,
         }
 
 
@@ -31457,7 +31667,9 @@ def _vol_diag_detail(vol):
         "    volatilityMultiplier . %sx" % _n(vol.get("ratio")),
         "    volatilityThreshold .. elevated >= %sx | extreme >= %sx" % (
             _n(vol.get("threshold_elevated")), _n(vol.get("threshold_extreme"))),
-        "    volatilityDecision ... %s (Edge %s)" % (vol.get("label", "—"), adj_str),
+        "    volatilityDecision ... %s" % vol.get("label", "—"),
+        "    configuredAdj ........ %s (policy only, NOT applied to edge score)" % adj_str,
+        "    appliedAdj ........... 0",
     ]
 
 
@@ -31522,7 +31734,9 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
         "  Zone Mitigated ........ %s" % _pf(gd.get("zone_mitigated")),
         "  Reaction (candle/sweep) %s" % _pf(gd.get("reaction")),
         "  Zone valid (mit+react)  %s" % _pf(gd.get("zone_valid")),
-        "  Zone state ............ %s" % (gd.get("zoneState") or "—"),
+        "  Zone state ............ %s%s" % (
+            gd.get("zoneState") or "—",
+            " (informational, not required by mode)" if not gd.get("require_zone") else ""),
         "  Zone valid (gate) ..... %s" % _pf(gd.get("zoneValid")),
         "  Trading Session (bonus) %s" % _pf(gd.get("session_pref")),
         "  Conflict .............. %s" % ("YES" if gd.get("conflicting_structure") else "no"),
@@ -31546,6 +31760,52 @@ def format_gate_diagnostic(symbol, trigger, candidate, gd, verdict,
     else:
         lines.append("  Result: WAIT")
         lines.append("  Blocked by: %s" % (", ".join(fails) if fails else "confluence"))
+        # ── Human-readable reason when edge_score is the sole hard failure ──────
+        _ef  = [f for f in fails if f.startswith("edge_score")]
+        _nef = [f for f in fails if not f.startswith("edge_score")]
+        if _ef and not _nef:
+            _ce = gd.get("edge_score", 0)
+            _te = (gd.get("full_ready_threshold") or gd.get("ready_threshold")
+                   or EDGE_READY_THRESHOLD)
+            lines.append("  Reason: Edge score %d is below the required %d." % (_ce, _te))
+        # ── Missing optional confirmations (absent EDGE_COMPONENTS, not hard gates) ──
+        _il = True if candidate == "Long" else (False if candidate == "Short" else None)
+        def _dl(lg, sh):
+            if _il is True:  return lg
+            if _il is False: return sh
+            return lg
+        _opt_map = [
+            ("bos",              _dl("Bullish BOS",       "Bearish BOS"),        20),
+            ("choch",            _dl("Bullish CHOCH",     "Bearish CHOCH"),      20),
+            ("vwap_confirmed",   _dl("VWAP Reclaim",      "VWAP Rejection"),     15),
+            ("liquidity_sweep",  "Liquidity Sweep",                              15),
+            ("volume_confirmed", "Volume Confirmation",                          15),
+            ("cvd_confirmed",    _dl("CVD Confirms Long", "CVD Confirms Short"), 15),
+            ("session_pref",     "Session Bonus",                                10),
+        ]
+        _hard_keys = {"zone_valid", "vwap_confirmed", "structure_confirmed",
+                      "volume_unconfirmed", "cvd_conflict", "location"}
+        _miss = [(lbl, pts) for gk, lbl, pts in _opt_map
+                 if gk not in _hard_keys and not gd.get(gk)]
+        if _miss:
+            lines.append("")
+            lines.append("  Missing optional confirmations (each adds points toward threshold):")
+            for lbl, pts in _miss:
+                lines.append("    \u2022 %s  (+%d pts)" % (lbl, pts))
+        # ── Context only: informational items that are NOT hard gate failures ──
+        _ctx = []
+        if not gd.get("require_zone") and gd.get("zoneState"):
+            _ctx.append('Zone state "%s" \u2014 informational only; zone is not a gate '
+                        "requirement in this mode" % gd.get("zoneState"))
+        _vv = vol or {}
+        if _vv.get("status") == "ok" and _vv.get("score_adj"):
+            _ctx.append("Volatility configuredAdj=%+d \u2014 policy value, "
+                        "NOT applied to edge score (appliedAdj=0)" % _vv.get("score_adj"))
+        if _ctx:
+            lines.append("")
+            lines.append("  Context only (informational, not hard blockers):")
+            for c in _ctx:
+                lines.append("    \u2022 %s" % c)
     lines.append("──────── END DIAGNOSTIC ─────────")
     return "\n".join(lines)
 
@@ -33417,7 +33677,9 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
         if _gd.get("volatility_block"):
             _gate_str += " vol=BLOCK"
         elif _vol.get("status") == "ok" and _vol.get("score_adj"):
-            _gate_str += " volAdj=%+d" % _vol.get("score_adj")
+            _gate_str += " volatility=%s configuredAdj=%+d appliedAdj=0" % (
+                _vol.get("regime") or _vol.get("label") or "—",
+                _vol.get("score_adj"))
     logger.info(
         "Alert: %s | %s (%d/10) | %d%% | Edge %d | %s → %s | Struct: %s | Risk: %s | Gate: %s",
         normalized, a["bias"], a["strength"], a["confidence"], a["edge_score"],
