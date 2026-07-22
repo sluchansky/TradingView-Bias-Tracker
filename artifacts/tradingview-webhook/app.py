@@ -45855,59 +45855,32 @@ html[data-theme=retro] .mb-av-state{background:rgba(80,0,0,.28);border-color:rgb
    MAIN BRAIN — Apple × OpenAI experience redesign
    ════════════════════════════════════════════════════════════════ */
 #mod-brain{background:linear-gradient(175deg,#05070e 0%,#020308 100%);border:1px solid rgba(110,130,255,.09);border-radius:20px;padding:0;overflow:hidden;position:relative}
-/* ── Hero ── */
-.brain-hero{position:relative;display:flex;flex-direction:column;align-items:center;padding:38px 24px 26px;background:radial-gradient(ellipse 90% 55% at 50% 0%,rgba(90,110,255,.08) 0%,transparent 70%);overflow:hidden}
-.brain-orb-halo{position:absolute;top:-30px;left:50%;transform:translateX(-50%);width:360px;height:230px;border-radius:50%;background:radial-gradient(ellipse at 50% 60%,rgba(99,102,241,.17) 0%,transparent 70%);transition:background 1.5s ease;pointer-events:none;z-index:0}
+/* ── Brain surface: compact 2-col (desktop: avatar left | narrative right) ── */
+.brain-surface{display:flex;align-items:flex-start;gap:18px;padding:22px 20px 18px;position:relative}
+.brain-orb-halo{position:absolute;top:-20px;left:50%;transform:translateX(-50%);width:280px;height:160px;border-radius:50%;background:radial-gradient(ellipse at 50% 60%,rgba(99,102,241,.17) 0%,transparent 70%);transition:background 1.5s ease;pointer-events:none;z-index:0}
 #mod-brain[data-brain-state=ready] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(52,211,153,.22) 0%,transparent 70%)}
 #mod-brain[data-brain-state=trade] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(251,191,36,.18) 0%,transparent 70%)}
 #mod-brain[data-brain-state=closed] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(15,15,30,.20) 0%,transparent 70%)}
-#mod-brain .mb-orb{position:relative;z-index:2;width:224px;height:284px;margin:0 auto 20px}
-#mod-brain .mb-dicebear-av{width:202px;height:202px;top:14px}
+.brain-av-side{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;z-index:2}
+#mod-brain .mb-orb{position:relative;z-index:2;width:152px;height:190px;margin:0 0 8px}
+#mod-brain .mb-dicebear-av{width:136px;height:136px;top:10px}
 /* ── State pill ── */
-.brain-state-pill{position:relative;z-index:2;font-size:10px;font-weight:700;letter-spacing:3.2px;text-transform:uppercase;color:#374151;padding:5px 22px;border:1px solid rgba(255,255,255,.07);border-radius:999px;background:rgba(255,255,255,.025);margin-bottom:14px;transition:color .5s,border-color .5s,background .5s}
+.brain-state-pill{position:relative;z-index:2;font-size:9px;font-weight:700;letter-spacing:2.8px;text-transform:uppercase;color:#374151;padding:4px 14px;border:1px solid rgba(255,255,255,.07);border-radius:999px;background:rgba(255,255,255,.025);transition:color .5s,border-color .5s,background .5s;white-space:nowrap}
 #mod-brain[data-brain-state=ready] .brain-state-pill{color:#34d399;border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.06)}
 #mod-brain[data-brain-state=trade] .brain-state-pill{color:#fbbf24;border-color:rgba(251,191,36,.28);background:rgba(251,191,36,.05)}
 #mod-brain[data-brain-state=closed] .brain-state-pill{color:#1f2937;border-color:rgba(31,41,55,.15)}
-/* ── Caption ── */
-.brain-caption{position:relative;z-index:2;text-align:center;font-size:15px;font-weight:500;color:#b8c0da;line-height:1.60;min-height:22px;margin:0 0 16px;max-width:310px;letter-spacing:-.1px;transition:color .5s}
+/* ── Narrative side ── */
+.brain-narr-side{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px;padding-top:6px;z-index:2}
+.brain-caption{font-size:13px;font-weight:500;color:#b8c0da;line-height:1.58;letter-spacing:-.1px;transition:color .5s;margin:0}
 #mod-brain[data-brain-state=closed] .brain-caption{color:#2d3748}
-/* ── Context strip ── */
-.brain-ctx-row{position:relative;z-index:2;display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:11px;color:#374151;letter-spacing:.3px;justify-content:center}
-.brain-ctx-sep{opacity:.3}
-.brain-verdict-chip{font-weight:700;color:#4b5563;transition:color .5s}
-#mod-brain[data-brain-state=ready] .brain-verdict-chip{color:#34d399}
-#mod-brain[data-brain-state=trade] .brain-verdict-chip{color:#fbbf24}
-.brain-age{color:#1f2937;font-size:10px}
-/* ── The Four Questions ── */
-.brain-intel{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:4px}
-.brain-intel-block{padding:14px 14px 14px 18px;border-bottom:1px solid rgba(255,255,255,.04)}
-.brain-intel-block:nth-child(odd){border-right:1px solid rgba(255,255,255,.04)}
-.brain-intel-block:nth-child(3),.brain-intel-block:nth-child(4){border-bottom:none}
-.brain-intel-lbl{font-size:8px;font-weight:700;letter-spacing:2.4px;color:rgba(255,255,255,.15);text-transform:uppercase;margin-bottom:8px}
-.brain-intel-list{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:5px}
-.brain-intel-list li{font-size:12px;color:#9ca3af;line-height:1.52;padding-left:12px;position:relative}
-.brain-intel-list li::before{content:'';position:absolute;left:0;top:8px;width:3px;height:3px;border-radius:50%;background:rgba(255,255,255,.16)}
-/* ── Unified decision ── */
-.brain-unified{padding:12px 20px;border-top:1px solid rgba(255,255,255,.05);border-bottom:1px solid rgba(255,255,255,.05)}
-.brain-unified-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px}
-.brain-unified-lbl{font-size:8px;font-weight:700;letter-spacing:2px;color:rgba(255,255,255,.15);text-transform:uppercase}
-.brain-unified-rec{font-weight:700;font-size:13px;letter-spacing:.3px;color:#e8e8f0}
-.brain-unified-conf{font-size:11px;color:#6b7280}
-.brain-unified-play{font-size:10px;color:#ef4444;margin-left:auto;white-space:nowrap}
-.brain-unified-narr{font-size:12.5px;color:#b0b8d4;line-height:1.62;margin-bottom:4px}
-.brain-unified-eng{font-size:10px;color:#374151;display:flex;gap:5px;flex-wrap:wrap;align-items:center}
-.brain-unified-warn{font-size:10px;color:#f59e0b;margin-top:4px}
-/* ── Feed ── */
-.brain-feed-wrap{padding:16px 20px 12px}
+/* ── Next action / invalidation ── */
+.brain-na-wrap{display:flex;flex-direction:column;gap:3px}
+.brain-na-lbl{font-size:8px;font-weight:700;letter-spacing:2px;color:rgba(255,255,255,.18);text-transform:uppercase}
+.brain-na-val{font-size:12px;color:#9ca3af;line-height:1.48}
+/* ── Feed section label (shared by chat section) ── */
 .brain-section-lbl{font-size:8px;font-weight:700;letter-spacing:2.4px;color:rgba(255,255,255,.14);text-transform:uppercase;margin-bottom:10px}
-#mod-brain .mb-feed{background:transparent;border:none;padding:0;margin:0;max-height:260px;overflow-y:auto}
-/* ── Details toggle ── */
-.brain-details-btn{width:100%;background:transparent;border:none;border-top:1px solid rgba(255,255,255,.05);color:#1f2937;font-size:9px;letter-spacing:2.2px;text-transform:uppercase;font-family:inherit;padding:12px 20px;text-align:left;cursor:pointer;display:flex;align-items:center;justify-content:space-between;transition:background .15s,color .15s}
-.brain-details-btn:hover{background:rgba(255,255,255,.025);color:#4b5563}
-.brain-details-btn[data-open=true]{color:#4b5563}
-.brain-details-arr{font-size:16px;line-height:1;opacity:.4;transition:transform .25s}
-.brain-details-btn[data-open=true] .brain-details-arr{transform:rotate(90deg)}
-.brain-details{padding:0 16px 16px;border-top:1px solid rgba(255,255,255,.04)}
+/* ── Mobile: stack vertically ── */
+@media(max-width:540px){.brain-surface{flex-direction:column;align-items:center}.brain-narr-side{width:100%}}
 /* ── Chat section ── */
 .brain-chat-section{padding:14px 16px 16px;border-top:1px solid rgba(255,255,255,.05)}
 #mod-brain .mb-chat-h{display:none}
@@ -45926,8 +45899,7 @@ html[data-theme=retro] #mod-brain{background:rgba(8,2,2,.96);border-color:rgba(1
 html[data-theme=retro] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(160,20,20,.18) 0%,transparent 70%)}
 html[data-theme=retro] #mod-brain[data-brain-state=ready] .brain-orb-halo{background:radial-gradient(ellipse at 50% 60%,rgba(52,211,153,.18) 0%,transparent 70%)}
 html[data-theme=retro] .brain-caption{color:#c89090}
-html[data-theme=retro] .brain-intel-block{border-color:rgba(180,30,30,.10)}
-html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details-btn,html[data-theme=retro] .brain-feed-wrap,html[data-theme=retro] .brain-unified,html[data-theme=retro] #mod-brain .mb-mt{border-color:rgba(180,30,30,.10)}
+html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb-mt{border-color:rgba(180,30,30,.10)}
 
 </style>
 <script>try{var _t=localStorage.getItem('dashboardTheme');if(_t==='retro')document.documentElement.dataset.theme='retro';}catch(e){}</script>
@@ -46322,7 +46294,8 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
     <!-- ═══════════════════════════════════════════════════════
          HERO — The AI is the product. Everything orbits this.
          ═══════════════════════════════════════════════════════ -->
-    <div class="brain-hero">
+    <div class="brain-surface">
+      <div class="brain-av-side">
       <div class="brain-orb-halo"></div>
       <div class="mb-orb" id="mb-orb">
         <div class="mb-orb-ring"></div>
@@ -46537,111 +46510,31 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
           </g>
         </svg>
       </div><!-- /#mb-orb -->
-      <!-- State pill — large, centred, reactive -->
+      <!-- State pill -->
       <div class="brain-state-pill" id="mb-av-state">OBSERVING</div>
-      <!-- One-sentence AI caption -->
-      <div class="brain-caption" id="mb-caption"></div>
-      <!-- Context strip -->
-      <div class="brain-ctx-row">
-        <span id="mb-av-market">—</span><span class="brain-ctx-sep">·</span><span id="mb-av-mode">—</span><span class="brain-ctx-sep">·</span><span id="mb-av-verdict" class="brain-verdict-chip">—</span>
-        <span id="mb-av-age" class="brain-age"></span>
-      </div>
-      <!-- Preserved for JS compat (mb-av-ctx written by mbAvatarObserve) -->
-      <div id="mb-av-ctx" style="display:none"></div>
-    </div><!-- /.brain-hero -->
+      </div><!-- /.brain-av-side -->
+      <!-- Narrative side: caption + next action + invalidation -->
+      <div class="brain-narr-side">
+        <div class="brain-caption" id="mb-caption"></div>
+        <div class="brain-na-wrap" id="mb-next-action-wrap" style="display:none">
+          <span class="brain-na-lbl">NEXT ACTION</span>
+          <div id="mb-next-action" class="brain-na-val">—</div>
+        </div>
+        <div class="brain-na-wrap" id="mb-inval-wrap" style="display:none">
+          <span class="brain-na-lbl">INVALIDATION</span>
+          <div id="mb-inval-text" class="brain-na-val">—</div>
+        </div>
+        <!-- JS compat stubs (hidden) -->
+        <span id="mb-av-market" style="display:none"></span>
+        <span id="mb-av-mode" style="display:none"></span>
+        <span id="mb-av-verdict" style="display:none" class="brain-verdict-chip"></span>
+        <span id="mb-av-age" style="display:none" class="brain-age"></span>
+        <div id="mb-av-ctx" style="display:none"></div>
+      </div><!-- /.brain-narr-side -->
+    </div><!-- /.brain-surface -->
 
     <!-- ═══════════════════════════════════════════════════════
          THE FOUR QUESTIONS — What I see / think / wait / plan
-         ═══════════════════════════════════════════════════════ -->
-    <div class="brain-intel">
-      <div class="brain-intel-block">
-        <div class="brain-intel-lbl">WHAT I SEE</div>
-        <ul id="mb-market" class="brain-intel-list"></ul>
-      </div>
-      <div class="brain-intel-block">
-        <div class="brain-intel-lbl">WHAT I THINK</div>
-        <ul id="mb-strategy" class="brain-intel-list"></ul>
-      </div>
-      <div class="brain-intel-block">
-        <div class="brain-intel-lbl">WAITING FOR</div>
-        <ul id="mb-risk" class="brain-intel-list"></ul>
-      </div>
-      <div class="brain-intel-block">
-        <div class="brain-intel-lbl">I RECOMMEND</div>
-        <ul id="mb-tm" class="brain-intel-list"></ul>
-      </div>
-    </div><!-- /.brain-intel -->
-
-    <!-- ═══════════════════════════════════════════════════════
-         UNIFIED DECISION (display-only, shown when populated)
-         ═══════════════════════════════════════════════════════ -->
-    <div id="mb-unified" class="brain-unified" style="display:none">
-      <div class="brain-unified-top">
-        <span class="brain-unified-lbl">DECISION</span>
-        <span id="mb-u-rec" class="brain-unified-rec"></span>
-        <span id="mb-u-conf" class="brain-unified-conf"></span>
-        <span id="mb-u-playbook" class="brain-unified-play"></span>
-      </div>
-      <div id="mb-u-narrative" class="brain-unified-narr"></div>
-      <div id="mb-u-engines" class="brain-unified-eng"></div>
-      <div id="mb-u-conflicts" style="display:none" class="brain-unified-warn">&#9888; <span id="mb-u-conflict-text"></span></div>
-    </div>
-
-    <!-- ═══════════════════════════════════════════════════════
-         LIVE THINKING FEED
-         ═══════════════════════════════════════════════════════ -->
-    <div class="brain-feed-wrap">
-      <div class="brain-section-lbl">LIVE THINKING</div>
-      <div id="mb-feed" class="mb-feed"></div>
-    </div>
-
-    <!-- ═══════════════════════════════════════════════════════
-         SECONDARY LAYER — scores, gates, stats (tap to expand)
-         ═══════════════════════════════════════════════════════ -->
-    <button class="brain-details-btn" id="brain-details-btn"
-      onclick="(function(b,d){var o=d.style.display!=='none';d.style.display=o?'none':'block';b.setAttribute('data-open',!o);b.querySelector('.brain-details-arr').textContent=o?'›':'‹';})(this,document.getElementById('brain-details'))">
-      <span>Details</span>
-      <span class="brain-details-arr">›</span>
-    </button>
-    <div id="brain-details" class="brain-details" style="display:none">
-      <div id="mb-summary" class="mb-summary" style="display:none"></div>
-      <div class="mb-judge" id="mb-judge" style="display:none">
-        <div class="mb-judge-head">
-          <span class="mb-judge-label" id="mbj-label">—</span>
-          <span class="mb-judge-reason" id="mbj-reason"></span>
-        </div>
-        <div class="mb-judge-grid">
-          <div class="mb-judge-col"><div class="mb-judge-h">Decision hierarchy</div><ul class="mb-judge-list" id="mbj-hierarchy"></ul></div>
-          <div class="mb-judge-col"><div class="mb-judge-h">Score breakdown</div><div class="mbj-score" id="mbj-score"></div><ul class="mb-judge-list" id="mbj-components"></ul></div>
-          <div class="mb-judge-col"><div class="mb-judge-h">Missing for READY</div><ul class="mb-judge-list" id="mbj-missing"></ul></div>
-        </div>
-      </div>
-      <div class="mb-stats" id="mb-stats">
-        <div class="mb-stat"><div class="mb-stat-l">Confidence</div><div class="mb-stat-v" id="mb-conf">—</div></div>
-        <div class="mb-stat"><div class="mb-stat-l">Lean</div><div class="mb-stat-v" id="mb-lean-txt" style="font-size:12px">—</div><div class="mb-lean"><div class="mb-lean-long" id="mb-lean-long" style="width:50%"></div><div class="mb-lean-short" id="mb-lean-short" style="width:50%"></div></div></div>
-        <div class="mb-stat"><div class="mb-stat-l">Quality</div><div class="mb-stat-v" id="mb-quality">—</div></div>
-        <div class="mb-stat"><div class="mb-stat-l">Risk</div><div class="mb-stat-v" id="mb-risk-level">—</div></div>
-      </div>
-      <div class="mb-mission" id="mb-mission-wrap" style="display:none">
-        <div class="mb-mission-h"><span>Current Mission</span><span class="mb-mission-pct" id="mb-mission-pct"></span></div>
-        <ul class="mb-mission-list" id="mb-mission"></ul>
-        <div class="mb-mission-track"><div class="mb-mission-fill" id="mb-mission-fill"></div></div>
-      </div>
-      <div class="mb-cases" id="mb-cases" style="display:none">
-        <div class="mb-case mb-case-bull"><div class="mb-case-h">Bull Case</div><ul id="mb-bull" class="mb-list"></ul></div>
-        <div class="mb-case mb-case-bear"><div class="mb-case-h">Bear Case</div><ul id="mb-bear" class="mb-list"></ul></div>
-      </div>
-      <div id="mb-liq" style="display:none;padding:8px 10px;border:1px solid var(--border,#2a2a3a);border-radius:8px;font-size:11px;line-height:1.55;margin-top:10px">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <span style="color:#6b7280;letter-spacing:.5px;font-size:10px">LIQUIDITY FOCUS</span>
-          <span id="mb-liq-state" style="font-weight:600">—</span>
-          <span id="mb-liq-delta" style="font-size:10px;color:#6b7280"></span>
-        </div>
-        <div><span style="color:#6b7280">Nearby:</span> <span id="mb-liq-near">—</span></div>
-        <div><span style="color:#6b7280">Read:</span> <span id="mb-liq-read">—</span></div>
-        <div id="mb-liq-voice" style="color:#9ca3af;margin-top:2px"></div>
-      </div>
-    </div><!-- /#brain-details -->
 
     <!-- ═══════════════════════════════════════════════════════
          TRADE MANAGEMENT — advisory copilot (display-only)
@@ -50941,117 +50834,38 @@ function renderMainBrain(d){
   const summary = (mb && mb.summary) || 'Waiting for live data…';
   const sumEl = document.getElementById('mb-summary');
   if(sumEl) sumEl.textContent = summary;
-  // ── Unified Learning Brain: ONE reconciled decision from all engines ──────
+  // ── Compact Brain: narrative / next-action / invalidation (Brain Contract) ──
   (function(){
-    var u = mb && mb.unified;
-    var box = document.getElementById('mb-unified');
-    if(!box) return;
-    if(!u || !u.available){ box.style.display = 'none'; return; }
-    box.style.display = '';
-    var REC_COLORS = {TAKE:'#22c55e', CAUTION:'#f59e0b', WAIT:'#6b7280'};
-    var rEl = document.getElementById('mb-u-rec');
-    if(rEl){ rEl.textContent = u.recommendation || '\u2014'; rEl.style.color = REC_COLORS[u.recommendation] || '#e8e8f0'; }
-    var cEl = document.getElementById('mb-u-conf');
-    if(cEl) cEl.textContent = (u.confidence != null) ? (u.confidence + '% confidence') : '';
-    var nEl = document.getElementById('mb-u-narrative');
-    if(nEl) nEl.textContent = u.narrative || '';
-    var pEl = document.getElementById('mb-u-playbook');
-    if(pEl) pEl.textContent = u.playbook ? ('\u25b8 ' + u.playbook) : '';
-    var eEl = document.getElementById('mb-u-engines');
-    if(eEl){
-      while(eEl.firstChild) eEl.removeChild(eEl.firstChild);
-      var chips = [];
-      if(u.engine_count) chips.push({t: u.engine_count + ' engines', c: '#6b7280'});
-      var sc = (u.supporting_engines || []).length;
-      if(sc) chips.push({t: sc + ' supporting', c: '#22c55e'});
-      if(u.veto_count) chips.push({t: u.veto_count + ' veto', c: '#ef4444'});
-      chips.forEach(function(ch, i){
-        var s = document.createElement('span');
-        s.textContent = ch.t; s.style.color = ch.c;
-        eEl.appendChild(s);
-        if(i < chips.length - 1){ var sep = document.createElement('span'); sep.textContent = '\u00b7'; sep.style.color = '#374151'; sep.style.margin = '0 2px'; eEl.appendChild(sep); }
-      });
+    var bk = getBrain(d);
+    var narr = (mb && mb.voice)
+      || (mb && mb.summary && mb.summary.indexOf('Waiting for') === -1 ? mb.summary : null)
+      || null;
+    if(!narr){
+      var inst    = String(bk.instrument || sym || '—').replace('1!','');
+      var verdict = (bk.decision && bk.decision.verdict) || 'WAIT';
+      var sv      = (bk.score && bk.score.value != null) ? bk.score.value : 0;
+      var sm      = (bk.score && bk.score.max) || __EDGE_MAX__;
+      var topR    = (bk.reasons && bk.reasons.top) || null;
+      narr = inst + ' is ' + verdict + '. Edge score ' + sv + '/' + sm + '.';
+      if(topR) narr += ' ' + topR + '.';
     }
-    var cfEl = document.getElementById('mb-u-conflicts');
-    var cfTxt = document.getElementById('mb-u-conflict-text');
-    var cflicts = u.conflicts || [];
-    if(cfEl) cfEl.style.display = cflicts.length ? '' : 'none';
-    if(cfTxt && cflicts.length) cfTxt.textContent = cflicts[0];
+    var capEl = document.getElementById('mb-caption');
+    if(capEl && !capEl.textContent) capEl.textContent = narr;
+    var nextAct = (bk.decision && bk.decision.next_action)
+      || (mb && mb.mission_text) || null;
+    var naWrap = document.getElementById('mb-next-action-wrap');
+    var naEl   = document.getElementById('mb-next-action');
+    if(naWrap) naWrap.style.display = nextAct ? '' : 'none';
+    if(naEl && nextAct) naEl.textContent = nextAct;
+    var inval = (bk.decision && bk.decision.invalidation)
+      || (mb && mb.invalidation)
+      || (d && d.strict_missing ? ('Setup requires: ' + d.strict_missing) : null)
+      || null;
+    var ivWrap = document.getElementById('mb-inval-wrap');
+    var ivEl   = document.getElementById('mb-inval-text');
+    if(ivWrap) ivWrap.style.display = inval ? '' : 'none';
+    if(ivEl && inval) ivEl.textContent = inval;
   })();
-  // Liquidity Sweep Focus — small ADVISORY/DISPLAY-ONLY read (main_brain.liquidity_focus).
-  (function(){
-    const box = document.getElementById('mb-liq');
-    if(!box) return;
-    const lf = mb && mb.liquidity_focus;
-    if(!lf || !lf.enabled){ box.style.display = 'none'; return; }
-    box.style.display = '';
-    const stEl = document.getElementById('mb-liq-state');
-    if(stEl){ stEl.textContent = lf.state || 'NO SWEEP'; stEl.style.color = LIQ_STATE_COLORS[lf.state_key] || '#e8e8f0'; }
-    const dEl = document.getElementById('mb-liq-delta');
-    if(dEl){
-      const dv = lf.advisory_confidence_delta;
-      if(typeof dv === 'number' && dv !== 0){
-        dEl.textContent = (dv>0?'+':'') + dv + ' advisory';
-        dEl.style.color = dv>0 ? 'var(--green,#22c55e)' : 'var(--warn,#f59e0b)';
-      } else { dEl.textContent = ''; }
-    }
-    const nEl = document.getElementById('mb-liq-near');
-    if(nEl) nEl.textContent = lf.nearby_liquidity_text || '—';
-    const rEl = document.getElementById('mb-liq-read');
-    if(rEl) rEl.textContent = lf.trader_read || '—';
-    const vEl = document.getElementById('mb-liq-voice');
-    if(vEl) vEl.textContent = lf.voice || '';
-  })();
-  renderMBJudge(d);
-  _anFill('mb-market',   (mb && mb.market_brain)   || []);
-  _anFill('mb-strategy', (mb && mb.strategy_brain) || []);
-  _anFill('mb-risk',     (mb && mb.risk_brain)     || []);
-  _anFill('mb-tm',       (mb && mb.trade_manager)  || []);
-  // Confidence / bias / quality / risk strip (display-only reads of main_brain).
-  const _cf = (mb && mb.confidence_pct);
-  const cfEl = document.getElementById('mb-conf');
-  if(cfEl) cfEl.textContent = (_cf===0 || _cf) ? (_cf + '%') : '—';
-  const _lp = (mb && mb.long_bias_pct), _sp = (mb && mb.short_bias_pct);
-  const lLong = document.getElementById('mb-lean-long'), lShort = document.getElementById('mb-lean-short'), lTxt = document.getElementById('mb-lean-txt');
-  if(lLong && lShort){
-    if((_lp || _lp===0) && (_sp || _sp===0)){
-      lLong.style.width = _lp + '%'; lShort.style.width = _sp + '%';
-      if(lTxt) lTxt.textContent = _lp + '%L / ' + _sp + '%S';
-    } else {
-      lLong.style.width = '50%'; lShort.style.width = '50%';
-      if(lTxt) lTxt.textContent = '—';
-    }
-  }
-  const qEl = document.getElementById('mb-quality');
-  if(qEl) qEl.textContent = (mb && mb.trade_quality) || '—';
-  const rEl = document.getElementById('mb-risk-level');
-  if(rEl){ const _rl = (mb && mb.risk_level) || '—'; rEl.textContent = _rl; rEl.style.color = MB_RISK_COLORS[_rl] || '#e8e8f0'; }
-  // Current Mission checklist + progress.
-  const mission = (mb && mb.mission) || [];
-  const mWrap = document.getElementById('mb-mission-wrap');
-  const mList = document.getElementById('mb-mission');
-  if(mWrap) mWrap.style.display = mission.length ? '' : 'none';
-  if(mList){
-    mList.innerHTML = '';
-    mission.forEach(function(m){
-      const li = document.createElement('li');
-      li.className = 'mb-mission-item' + (m && m.done ? ' done' : '');
-      const bx = document.createElement('span'); bx.className = 'mb-mission-box';
-      bx.textContent = (m && m.done) ? '☑' : '☐';
-      const tx = document.createElement('span'); tx.textContent = (m && m.label) ? m.label : '';
-      li.appendChild(bx); li.appendChild(tx); mList.appendChild(li);
-    });
-  }
-  const _mp = (mb && (mb.mission_progress || mb.mission_progress===0)) ? mb.mission_progress : null;
-  const mFill = document.getElementById('mb-mission-fill'), mPctEl = document.getElementById('mb-mission-pct');
-  if(mFill) mFill.style.width = ((_mp===null ? 0 : _mp)) + '%';
-  if(mPctEl) mPctEl.textContent = (mission.length && _mp!==null) ? (_mp + '%') : '';
-  // Bull / Bear case (read straight from analyst.bull_case / bear_case).
-  const _bull = (mb && mb.bull_case) || [], _bear = (mb && mb.bear_case) || [];
-  _anFill('mb-bull', _bull);
-  _anFill('mb-bear', _bear);
-  const casesEl = document.getElementById('mb-cases');
-  if(casesEl) casesEl.style.display = (_bull.length || _bear.length) ? '' : 'none';
   // Managing position — richer advisory read (display-only) when a trade is open.
   const mr = (mb && mb.management_read) || null;
   const mgWrap = document.getElementById('mb-manage');
