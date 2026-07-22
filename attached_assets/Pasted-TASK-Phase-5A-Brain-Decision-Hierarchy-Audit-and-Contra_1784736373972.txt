@@ -1,0 +1,667 @@
+TASK: Phase 5A — Brain Decision Hierarchy Audit and Contract Design
+
+OBJECTIVE
+
+Define the authoritative decision hierarchy for the trading system.
+
+The current system has a canonical Brain Contract, but the decision process is
+still spread across market regime, strategy filters, gates, edge score, verdict,
+trade plan, execution, and trade-management logic.
+
+This task must identify the real current order of operations and design one
+explicit hierarchy.
+
+DO NOT change live behavior during this phase.
+
+Do not change:
+
+- scoring
+- thresholds
+- strategy eligibility
+- gates
+- execution
+- sizing
+- alerts
+- database behavior
+- trade management
+- dashboard layout
+- Brain Contract fields
+- Databento
+- broker integrations
+
+ARCHITECTURAL GOAL
+
+The eventual authoritative flow should be:
+
+1. Data Integrity
+2. Market State
+3. Strategy Eligibility
+4. Setup Evaluation
+5. Decision
+6. Risk Approval
+7. Execution Plan
+8. Active Trade Management
+
+A later phase will implement the hierarchy.
+
+This phase is audit and design only.
+
+==================================================
+LEVEL 0 — DATA INTEGRITY
+==================================================
+
+Identify all checks that determine whether the system has enough valid and fresh
+data to make a decision.
+
+Audit:
+
+- active instrument
+- price freshness
+- data-feed freshness
+- missing indicators
+- stale analysis
+- cross-instrument contamination guards
+- malformed values
+- null or object-shaped fields
+- session availability
+- bar age
+- required timeframes
+- account/execution-state freshness
+
+Report:
+
+- exact functions
+- current ordering
+- whether failure blocks analysis, blocks execution, or merely reduces score
+- current user-facing verdict or reason
+- any conflicting behavior
+
+Proposed hierarchy behavior:
+
+If required data is invalid or stale, no strategy or setup should become READY.
+
+Propose explicit state values such as:
+
+- VALID
+- DEGRADED
+- STALE
+- INVALID
+
+Do not implement them yet.
+
+==================================================
+LEVEL 1 — MARKET STATE
+==================================================
+
+Audit how the system currently determines:
+
+- bullish trend
+- bearish trend
+- range
+- breakout
+- reversal
+- elevated volatility
+- extreme volatility
+- low-liquidity conditions
+- news or event risk
+- session conditions
+- VWAP context
+- market structure
+- dominant directional bias
+
+Locate all current market-state functions and fields.
+
+Report:
+
+1. authoritative source, if one exists
+2. duplicated sources
+3. conflicting classifications
+4. update frequency
+5. instrument scoping
+6. whether the state currently blocks or demotes strategies
+
+Propose one canonical Market State object containing at minimum:
+
+- regime
+- direction
+- volatility_state
+- liquidity_state
+- session_state
+- structure_state
+- event_risk
+- freshness
+- primary_evidence
+- primary_risks
+
+Do not add it to the contract yet.
+
+==================================================
+LEVEL 2 — STRATEGY ELIGIBILITY
+==================================================
+
+Audit every strategy or mode currently evaluated, including where applicable:
+
+- scalp
+- swing
+- micro scalp
+- breakout
+- trend following
+- reversal
+- liquidity sweep
+- VWAP reclaim
+- opening-range or session breakout
+- any of the previously added strategy library entries
+
+For each strategy, report:
+
+- exact identifier
+- enabling function
+- market-state requirements
+- session requirements
+- volatility requirements
+- structure requirements
+- hard blocks
+- score modifiers
+- whether it can currently produce a decision in parallel with other strategies
+- conflict-resolution behavior
+- whether it is production, experimental, display-only, shadow, or disabled
+
+Propose one eligibility result per strategy:
+
+- ELIGIBLE
+- DEMOTED
+- BLOCKED
+- DISABLED
+- EXPERIMENTAL
+
+Each result should include:
+
+- reason
+- supporting market state
+- blocking conditions
+- priority
+- timestamp
+- instrument
+
+Determine how multiple eligible strategies should be ranked.
+
+Do not change rankings yet.
+
+==================================================
+LEVEL 3 — SETUP EVALUATION
+==================================================
+
+Audit the actual setup-quality pipeline.
+
+Map all components contributing to:
+
+- edge score
+- edge grade
+- strict gates
+- readiness
+- directional support
+- confidence governor
+- zone validity
+- BOS
+- CHOCH
+- VWAP
+- CVD
+- volume
+- liquidity sweep
+- volatility
+- structure
+- candle confirmation
+- risk/reward
+- opposing zones
+- timing
+- freshness
+
+For each component classify it as:
+
+- hard prerequisite
+- hard blocker
+- score component
+- score adjustment
+- diagnostic only
+- execution-only requirement
+
+Identify contradictions, such as a condition that:
+
+- adds points but also blocks
+- is shown as failed but does not affect the verdict
+- is evaluated differently across strategies
+- is calculated more than once
+- uses different thresholds in different locations
+
+Report the exact current score and gate ordering.
+
+==================================================
+LEVEL 4 — DECISION
+==================================================
+
+Audit all current verdict values and derivation paths.
+
+Find every possible operator-facing state, including:
+
+- READY
+- LONG READY
+- SHORT READY
+- EARLY READY
+- WAIT
+- LONG WAIT
+- SHORT WAIT
+- INVALID
+- BLOCKED
+- NO TRADE
+- HOLD
+- any strategy-specific variants
+
+For each verdict report:
+
+- exact creation function
+- conditions
+- precedence
+- whether it is strategy-specific
+- whether it permits execution
+- whether it is converted or simplified elsewhere
+- whether dashboards or alerts reinterpret it
+
+Propose one canonical decision-state enum.
+
+Recommended starting point:
+
+- INVALID_DATA
+- NO_STRATEGY
+- MONITOR
+- SETUP_FORMING
+- READY
+- BLOCKED_BY_RISK
+- ACTIVE_TRADE
+- MANAGE
+- EXIT
+
+Direction should be a separate field:
+
+- LONG
+- SHORT
+- null
+
+Do not encode direction inside the state name unless backward compatibility
+requires it.
+
+Define exact precedence rules.
+
+Example:
+
+INVALID_DATA outranks everything.
+ACTIVE_TRADE outranks new-entry analysis.
+BLOCKED_BY_RISK outranks READY.
+READY requires an eligible strategy and a valid setup.
+SETUP_FORMING means directional intent exists but one or more prerequisites are
+missing.
+MONITOR means no actionable setup currently exists.
+
+Do not implement yet.
+
+==================================================
+LEVEL 5 — RISK APPROVAL
+==================================================
+
+Audit all pre-execution risk checks:
+
+- prop-firm drawdown
+- daily loss cap
+- account state
+- flat-account requirement
+- existing working orders
+- max contracts
+- position sizing
+- stop distance
+- maximum risk
+- minimum R:R
+- opposing zone proximity
+- volatility suitability
+- session restrictions
+- duplicate-trade prevention
+- cooldowns
+- manual versus automated mode
+
+For every check report:
+
+- exact source
+- hard-block versus warning
+- when it runs
+- whether it runs before or after READY
+- whether the reason appears in the Brain
+- whether manual market orders bypass it
+
+Propose one Risk Approval result:
+
+- APPROVED
+- APPROVED_WITH_WARNING
+- BLOCKED
+- NOT_EVALUATED
+
+Include:
+
+- blockers
+- warnings
+- max contracts
+- approved risk
+- account state
+- generated_at
+
+Do not alter manual-order behavior in this phase.
+
+==================================================
+LEVEL 6 — EXECUTION PLAN
+==================================================
+
+Audit how the system creates:
+
+- entry
+- stop
+- TP1
+- TP2
+- R:R
+- position size
+- order type
+- timing
+- expiration
+- invalidation
+- TradersPost payload
+- auto-submit permission
+
+Determine whether trade-plan creation happens:
+
+- before READY
+- during READY
+- after risk approval
+- independently of verdict
+
+Identify any case where:
+
+- a plan exists while decision is WAIT
+- READY exists without a complete plan
+- stale plan values remain after decision changes
+- plan direction conflicts with Brain direction
+- execution payload differs from displayed plan
+
+Propose a rule:
+
+A plan may be informational while SETUP_FORMING, but an executable plan must
+require both READY and Risk Approval = APPROVED.
+
+Do not implement yet.
+
+==================================================
+LEVEL 7 — ACTIVE TRADE MANAGEMENT
+==================================================
+
+Audit the full active-trade hierarchy:
+
+- active position detection
+- entry confirmation
+- stop state
+- target state
+- partial exits
+- break-even
+- trail
+- hold
+- scratch
+- full exit
+- thesis invalidation
+- reversal handling
+- new-signal suppression while active
+- instrument-specific active-trade state
+
+Report:
+
+- exact state machine, if one exists
+- current precedence over new-entry logic
+- whether a new READY signal can appear while a trade is active
+- whether management decisions use the same Brain
+- whether active-trade status is authoritative per instrument
+
+Propose canonical management states:
+
+- ENTRY_PENDING
+- ACTIVE
+- HOLD
+- SCALE
+- MOVE_TO_BREAKEVEN
+- TRAIL
+- REDUCE
+- EXIT
+- CLOSED
+
+Do not implement yet.
+
+==================================================
+CONFLICT AND PRECEDENCE AUDIT
+==================================================
+
+Find every place where two systems can disagree.
+
+Specifically audit:
+
+- market state versus strict direction
+- strategy direction versus dominant direction
+- edge score versus hard gates
+- READY versus prop-risk block
+- READY versus missing trade plan
+- plan direction versus Brain direction
+- active trade versus new-entry signal
+- manual market order versus setup gate
+- confidence governor versus edge score
+- stale data versus cached READY
+- different strategies producing opposite directions
+- scalp versus swing conflicts
+- production versus experimental strategies
+
+For each conflict report:
+
+1. current behavior
+2. current winner
+3. whether that winner is explicit or accidental
+4. recommended authoritative winner
+
+==================================================
+PROPOSED CANONICAL HIERARCHY
+==================================================
+
+Return a proposed deterministic evaluation sequence.
+
+Example:
+
+Step 0:
+Validate instrument and data.
+
+Step 1:
+Resolve active-trade state.
+
+Step 2:
+Classify market state.
+
+Step 3:
+Evaluate and rank strategy eligibility.
+
+Step 4:
+Evaluate the highest-priority eligible setup.
+
+Step 5:
+Apply hard gates and calculate edge score.
+
+Step 6:
+Produce canonical decision state and direction.
+
+Step 7:
+Run risk approval.
+
+Step 8:
+Create or validate executable trade plan.
+
+Step 9:
+Publish Brain Contract.
+
+Step 10:
+Allow alerts or execution only when the published state permits them.
+
+Provide exact precedence rules and explain where current behavior differs.
+
+==================================================
+PROPOSED DECISION TRACE
+==================================================
+
+Design a structured decision trace that can explain every result without
+recalculating anything in the dashboard.
+
+Suggested shape:
+
+decision_trace: {
+  instrument,
+  generated_at,
+  data_integrity: {
+    state,
+    blockers
+  },
+  market_state: {
+    regime,
+    direction,
+    volatility,
+    evidence
+  },
+  strategies: [
+    {
+      id,
+      status,
+      priority,
+      blockers,
+      score
+    }
+  ],
+  selected_strategy: {
+    id,
+    reason
+  },
+  setup: {
+    score,
+    max_score,
+    grade,
+    hard_gates,
+    failed_gates
+  },
+  decision: {
+    state,
+    direction,
+    reason,
+    next_action
+  },
+  risk_approval: {
+    state,
+    blockers,
+    warnings
+  },
+  execution_plan: {
+    available,
+    executable
+  },
+  active_trade: {
+    state
+  }
+}
+
+Do not add this object to the production response yet.
+
+Determine:
+
+- which fields already exist
+- which fields are missing
+- which fields would duplicate existing values
+- which fields belong in diagnostics rather than the operator Brain Contract
+
+==================================================
+SCENARIO TABLE
+==================================================
+
+Produce expected hierarchy outcomes for at least these scenarios:
+
+1. Fresh data, no directional setup
+2. Bullish trend, long strategy eligible, structure missing
+3. Bullish trend, long setup fully confirmed
+4. Fully confirmed setup but prop-risk blocked
+5. Edge score high but hard structure gate failed
+6. Low score but all hard gates passed
+7. Extreme volatility
+8. Breakout regime with countertrend strategy
+9. Two eligible strategies agree long
+10. Two eligible strategies conflict
+11. Active long trade while new short setup appears
+12. Stale price while cached READY exists
+13. Trade plan missing while setup otherwise READY
+14. Manual market order during WAIT
+15. Null or malformed indicator data
+16. Non-active instrument snapshot
+17. Swing setup versus scalp setup conflict
+18. Experimental fast-entry signal without strict confirmation
+
+For each scenario show:
+
+- market state
+- eligible strategy
+- setup state
+- decision state
+- risk approval
+- execution permission
+- operator-facing explanation
+
+==================================================
+TEST PLAN
+==================================================
+
+Design—not implement yet—a comprehensive hierarchy test suite covering:
+
+- precedence
+- deterministic output
+- cross-instrument isolation
+- stale-data blocking
+- hard-gate dominance
+- strategy conflicts
+- risk blocks
+- missing plans
+- active-trade precedence
+- manual-order exception behavior
+- exact decision trace
+- backward-compatible Brain output
+- no dashboard reinterpretation
+
+Identify which existing tests can be reused and which new tests will be required.
+
+==================================================
+OUTPUT
+==================================================
+
+Return:
+
+1. Current real decision-order diagram
+2. Exact functions involved at every level
+3. Current verdict enum and creation paths
+4. Strategy eligibility matrix
+5. Hard-block versus scoring-component matrix
+6. Risk-approval matrix
+7. Execution-plan ordering
+8. Active-trade state ordering
+9. All conflicts and accidental precedence
+10. Proposed canonical hierarchy
+11. Proposed canonical decision states
+12. Proposed decision-trace schema
+13. Scenario table
+14. Migration plan divided into safe phases
+15. Complete test plan
+16. Confirmation that no code was modified
+
+Do not modify code.
+Do not alter live decisions.
+Do not add fields.
+Do not redesign UI.
+Do not add Databento.
