@@ -1,0 +1,143 @@
+TASK: Verify Equity Structure Alerts and Explain MGC Near-Miss
+
+OBJECTIVE
+
+Perform two tightly scoped checks:
+
+1. Determine why full BOS/CHOCH structure events are not arriving for MNQ, MES, and MYM.
+2. Reconstruct the exact MGC evaluation while CHOCH SUPPLY was fresh.
+
+Do not change application code or trading logic.
+
+PART 1 — MGC EXACT DECISION RECONSTRUCTION
+
+Use the evaluation closest to MGC’s highest score while CHOCH SUPPLY was active between approximately 22:01 and 22:21 UTC on July 22, 2026.
+
+Report the exact evaluation timestamp and direction.
+
+Provide every component used:
+
+* Current price
+* VWAP value and directional confirmation
+* Active zone type
+* Zone state
+* BOS state
+* CHOCH state
+* CVD state
+* Volume state
+* Sweep state
+* Session bonus
+* Raw edge score before adjustments
+* Volatility classification
+* Volatility adjustment
+* Final edge score
+* Required edge threshold
+* Every hard gate
+* Every failed hard gate
+* Final strict reason
+* Final verdict
+
+Show the score mathematically:
+
+Raw components = __
+Raw score = __
+Volatility adjustment = __
+Final score = __
+Threshold = __
+
+Answer these questions explicitly:
+
+1. Was “Tested” a failing hard zone gate?
+2. Did the zone state affect edge points, gate eligibility, or both?
+3. If the zone gate had passed, would the final score still have been below 60?
+4. What exact additional component would have been required to reach 60?
+5. Was direction alignment correct between CHOCH SUPPLY, VWAP, CVD, and the evaluated Short setup?
+6. Was the displayed grade B based on raw score or adjusted score?
+
+Do not describe it as “one zone-pass away from READY” unless the reconstructed numbers prove that statement.
+
+PART 2 — VERIFY MNQ, MES, AND MYM TRADINGVIEW CONFIGURATION
+
+The application cannot directly inspect TradingView’s alert panel.
+
+Therefore, do not claim the alerts are unconfigured from production logs alone.
+
+Prepare a concise manual verification matrix for:
+
+* MNQ1!
+* MES1!
+* MYM1!
+
+Required TradingView settings:
+
+* Script: Market Structure BOS/CHOCH -> Webhook
+* Script visibly loaded on the correct chart
+* Condition: Any alert() function call
+* Webhook enabled
+* Production webhook URL selected
+* Custom message field blank
+* Alert active and not paused
+* Alert not expired
+* Correct symbol
+* Intended timeframe
+* Once per bar close
+* No visible TradingView execution error
+
+Also verify whether the script is printing BOS or CHOCH labels on each chart.
+
+Interpretation:
+
+* Labels appear but no webhook events arrive:
+    Alert configuration, webhook, or alert status problem.
+* No labels appear:
+    Pine conditions did not trigger or the pivot settings/timeframe are too restrictive.
+* Webhook events appear but production rejects them:
+    Payload or parser problem.
+* Production accepts them but structure remains false:
+    Cache, TTL, direction, or consumer problem.
+
+PART 3 — MYM VWAP FAILURE
+
+The audit states MYM “lost VWAP.”
+
+Determine exactly what that means:
+
+* No VWAP fetch
+* Fetch exception
+* Stale VWAP
+* Null VWAP
+* Zero VWAP
+* Wrong instrument mapping
+* Provider response missing
+* Cache overwritten
+* Price-to-VWAP comparison failure
+
+Report:
+
+* Last successful MYM VWAP timestamp
+* Last successful value
+* Current cache value
+* Current age
+* Latest fetch result
+* Relevant exception or warning
+* Whether the next refresh recovered automatically
+* Whether other instruments used the same provider successfully at that time
+
+Do not change the VWAP fallback yet.
+
+FINAL REPORT
+
+Provide only:
+
+1. Exact MGC decision reconstruction
+2. Whether MGC was truly one condition away from READY
+3. MNQ/MES/MYM TradingView manual verification matrix
+4. Exact MYM VWAP condition
+5. Any proven production-side defect
+6. Any required user-side TradingView action
+
+No code changes.
+No deployment.
+No threshold changes.
+No score changes.
+No gate changes.
