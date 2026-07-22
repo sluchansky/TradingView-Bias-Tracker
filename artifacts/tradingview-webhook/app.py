@@ -57602,12 +57602,17 @@ function renderBLPanels(d){
     // Gate pills
     var mG=document.getElementById('mbs-gates');
     if(mG){
+      var _mbsStr=function(x){if(!x)return '';if(typeof x==='string')return x;if(Array.isArray(x))return x.join(', ');if(typeof x==='object')return '';return String(x);};
       var vwapOk=hdiag.vwap_ok!=null?hdiag.vwap_ok:hdiag.vwap;
+      var volBlocked=hdiag.volatility_block;
+      var volOk=volBlocked===true?false:volBlocked===false?true:null;
+      var volTip=volBlocked===true?('Vol blocked: '+_mbsStr(hvolReg)):_mbsStr(hvolReg)||'';
       var pills=[
-        ['STR',hstructOk,hdiag.structure_reason||''],
-        ['ZONE',hzoneOk,hdiag.zone_reason||''],
-        ['VWAP',vwapOk,hdiag.vwap_reason||''],
-        ['CVD',(hcvdDir&&hcvdDir!=='unknown'&&hcvdDir!=='')?true:null,hcvdDir]
+        ['STR',hstructOk,_mbsStr(hdiag.structure_reason)],
+        ['ZONE',hzoneOk,_mbsStr(hdiag.zone_reason)],
+        ['VWAP',vwapOk,_mbsStr(hdiag.vwap_reason)],
+        ['CVD',(hcvdDir&&hcvdDir!=='unknown'&&hcvdDir!=='')?true:null,_mbsStr(hcvdDir)],
+        ['VOL',volOk,volTip]
       ];
       mG.innerHTML=pills.map(function(p){
         var ok=p[1];
@@ -57615,7 +57620,8 @@ function renderBLPanels(d){
         var fail=ok===false||ok==='N'||ok==='no'||ok==='0'||ok===0;
         var col=pass?'#22c55e':fail?'#ef4444':'#4b5563';
         var sym=pass?'\u2713':fail?'\u2717':'\u00b7';
-        return '<span class="mbs-pill" title="'+String(p[2]).replace(/"/g,\'\\&quot;\')+'" style="color:'+col+'">'+sym+' '+p[0]+'</span>';
+        var tip=_mbsStr(p[2]).replace(/"/g,'&quot;');
+        return '<span class="mbs-pill"'+(tip?' title="'+tip+'"':'')+' style="color:'+col+'">'+sym+' '+p[0]+'</span>';
       }).join('');
     }
     // WAIT reason
