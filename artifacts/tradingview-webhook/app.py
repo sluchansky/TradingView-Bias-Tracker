@@ -46195,9 +46195,8 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div id="rec-next-action"></div>
   <!-- Freshness stale warning (bk.freshness.price_fresh) — Phase 3B -->
   <div id="rec-fresh-warn"></div>
-  <!-- Trade Probability Gauge — hidden from Home operator view (Phase 3B);
-       renderGauge() still runs so Cockpit reads it normally. -->
-  <div id="rec-gauge" class="rec-gauge" style="display:none">
+  <!-- Trade Probability Gauge -->
+  <div id="rec-gauge" class="rec-gauge">
     <svg viewBox="0 0 200 116" class="gauge-svg" aria-hidden="true">
       <path id="g-band-red"    fill="none" stroke="#ef4444" stroke-width="16"></path>
       <path id="g-band-yellow" fill="none" stroke="#eab308" stroke-width="16"></path>
