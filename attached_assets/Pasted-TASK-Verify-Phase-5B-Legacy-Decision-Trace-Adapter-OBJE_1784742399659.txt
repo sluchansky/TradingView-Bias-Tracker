@@ -1,0 +1,376 @@
+TASK: Verify Phase 5B — Legacy Decision Trace Adapter
+
+OBJECTIVE
+
+Prove that the Phase 5B decision-trace implementation is correct, read-only, side-effect-free, and does not change trading behavior.
+
+Do not make new feature changes during this verification.
+
+If a defect is found, report it first before modifying anything.
+
+────────────────────────────────────────
+
+1. SHOW THE EXACT CODE CHANGES
+    ────────────────────────────────────────
+
+Provide a diff limited to the Phase 5B implementation.
+
+Identify:
+
+* Every file changed
+* Every function added
+* Every existing function modified
+* Every route modified
+* Every environment flag added
+
+Confirm whether any code outside the diagnostics and trace path was changed.
+
+Flag unexpected changes.
+
+────────────────────────────────────────
+2. VERIFY FEATURE-FLAG BEHAVIOR
+────────────────────────────────────────
+
+Test with:
+
+DECISION_TRACE_SHADOW_ENABLED=0
+
+Prove:
+
+* build_legacy_decision_trace() is not called
+* No decision_trace key is added to full_analysis()
+* No decision_trace key appears in /status
+* No decision_trace key appears in the Brain Contract
+* No decision_trace key appears in dashboard polling responses
+* Existing golden outputs are byte-identical
+
+Then test with:
+
+DECISION_TRACE_SHADOW_ENABLED=1
+
+Prove:
+
+* The trace is generated only after full_analysis() completes
+* The trace appears only in owner-only /diagnostics-live
+* The trace does not appear in /status
+* The trace does not appear in broker payloads
+* The trace does not appear in Discord payloads
+* The trace does not affect verdict, score, plan, or execution
+
+────────────────────────────────────────
+3. VERIFY THE ADAPTER IS PURE
+────────────────────────────────────────
+
+Inspect build_legacy_decision_trace().
+
+Confirm it does not call:
+
+* full_analysis()
+* evaluate_strict_setup()
+* generate_trade_plan()
+* build_strict_trade_plan()
+* execute_trade_gateway()
+* adapt_traderspost()
+* Any yfinance or network function
+* Any database read or write
+* Any cooldown function
+* Any duplicate-trade function
+* Any active-trade mutation function
+* Any global-state mutation function
+
+Confirm the function only reads:
+
+* The supplied result
+* The supplied instrument
+* The supplied generated_at value
+
+Add or run a mutation test:
+
+1. Deep-copy the input result
+2. Call build_legacy_decision_trace()
+3. Assert the original input equals the deep copy
+
+Also call the adapter twice with the same inputs and generated_at value.
+
+Assert both outputs are identical.
+
+────────────────────────────────────────
+4. VERIFY VERDICT MAPPING
+────────────────────────────────────────
+
+Run explicit tests for each case.
+
+Case A:
+Input verdict: LONG READY
+
+Expected:
+
+* domain = ENTRY
+* state = READY
+* direction = LONG
+* tier = FULL
+
+Case B:
+Input verdict: SHORT READY
+
+Expected:
+
+* domain = ENTRY
+* state = READY
+* direction = SHORT
+* tier = FULL
+
+Case C:
+Input verdict: LONG EARLY READY
+
+Expected:
+
+* domain = ENTRY
+* state = READY
+* direction = LONG
+* tier = EARLY
+
+Case D:
+Input verdict: SHORT EARLY READY
+
+Expected:
+
+* domain = ENTRY
+* state = READY
+* direction = SHORT
+* tier = EARLY
+
+Case E:
+Input verdict: NO TRADE
+Existing reason indicates market closed
+
+Expected:
+
+* state = MARKET_CLOSED
+* state must not equal INVALID_DATA
+
+Case F:
+Input verdict: WAIT
+No directional setup-forming evidence
+
+Expected:
+
+* state = MONITOR
+
+Case G:
+Input verdict: WAIT
+Existing result contains clear directional setup-forming evidence
+
+Expected:
+
+* state = SETUP_FORMING
+* direction matches the existing evidence
+
+Case H:
+Existing active trade is present
+
+Expected:
+
+* domain = MANAGEMENT
+* state = MANAGE
+
+Case I:
+Unknown or explicitly invalid instrument/data
+
+Expected:
+
+* state = INVALID_DATA
+
+Case J:
+READY verdict but trade plan is missing
+
+Expected:
+
+* Legacy verdict remains preserved
+* plan_available = false
+* plan_executable = false
+* Adapter does not silently rewrite the legacy verdict
+* A mapping warning may be added
+
+────────────────────────────────────────
+5. VERIFY RESPONSE ISOLATION
+────────────────────────────────────────
+
+Capture and compare actual JSON responses.
+
+With the flag OFF:
+
+* Save /status JSON
+* Save Brain Contract JSON
+* Save /diagnostics-live JSON
+
+With the flag ON:
+
+* Save the same three responses
+
+Compare them.
+
+Required result:
+
+* /status must be unchanged
+* Brain Contract must be unchanged
+* /diagnostics-live may contain decision_trace only when enabled
+
+Print the exact JSON paths where decision_trace appears.
+
+Expected allowed path:
+
+/diagnostics-live → decision_trace
+
+Any other appearance is a failure.
+
+────────────────────────────────────────
+6. VERIFY NO EXECUTION SIDE EFFECTS
+────────────────────────────────────────
+
+Mock or patch the following functions so the test fails if any are called while building the trace:
+
+* execute_trade_gateway
+* adapt_traderspost
+* _enqueue_auto_trade
+* set_active_trade
+* _register_managed_trade
+* Database write functions
+* Duplicate-fingerprint registration
+* Cooldown mutation functions
+* Discord send functions
+* Network request functions
+
+Call build_legacy_decision_trace().
+
+Expected:
+
+* Zero mocked side-effect functions called
+
+Also run one full analysis cycle with the flag OFF and ON using the same fixture.
+
+Compare:
+
+* verdict
+* score
+* strict_reason
+* trade_plan
+* is_actionable
+* auto-execute eligibility
+* alert eligibility
+
+All values must be identical.
+
+────────────────────────────────────────
+7. RUN THE REQUIRED TESTS
+────────────────────────────────────────
+
+Run the new Phase 5B tests.
+
+Then run all existing critical tests:
+
+* parity
+* scalp_golden
+* dual_sim
+* breakout_mode
+* test_brain_contract.py
+* test_brain_dashboard.py
+* test_confidence_integrity.py
+* test_thesis_hysteresis.py
+
+Then run the complete test suite.
+
+Provide:
+
+* Exact commands used
+* Number of tests passed
+* Number failed
+* Number skipped
+* Full failure details for any failure
+
+Do not report “tests pass” without the command output summary.
+
+────────────────────────────────────────
+8. STATIC SEARCH FOR ACCIDENTAL COUPLING
+────────────────────────────────────────
+
+Search the repository for:
+
+decision_trace
+DECISION_TRACE_SHADOW_ENABLED
+build_legacy_decision_trace
+
+Report every occurrence.
+
+Verify:
+
+* No execution function reads decision_trace
+* No scoring function reads decision_trace
+* No strategy function reads decision_trace
+* No dashboard money-path logic reads decision_trace
+* No broker adapter reads decision_trace
+
+The trace must have one-way data flow:
+
+legacy result → decision trace → owner diagnostics
+
+It must never flow back into the trading decision.
+
+────────────────────────────────────────
+9. RUNTIME SMOKE TEST
+────────────────────────────────────────
+
+In the development environment:
+
+1. Start the application with the flag OFF
+2. Load /status
+3. Load /diagnostics-live
+4. Submit or replay a known analysis fixture
+5. Record the verdict and plan
+
+Then:
+
+1. Restart with the flag ON
+2. Replay the exact same fixture
+3. Record the verdict and plan
+4. Load /status
+5. Load /diagnostics-live
+
+Required result:
+
+* Same verdict
+* Same score
+* Same strict reason
+* Same plan
+* Same execution eligibility
+* Same /status response
+* decision_trace appears only in diagnostics
+
+────────────────────────────────────────
+10. FINAL VERIFICATION REPORT
+────────────────────────────────────────
+
+Return a report with these headings:
+
+1. Files changed
+2. Diff review
+3. Flag-OFF behavior
+4. Flag-ON behavior
+5. Purity and mutation proof
+6. Mapping test results
+7. Response isolation proof
+8. Execution side-effect proof
+9. Existing golden test results
+10. Full test-suite results
+11. Runtime smoke-test comparison
+12. Defects or concerns found
+13. Final verdict
+
+The final verdict must be exactly one of:
+
+* VERIFIED — safe read-only implementation
+* VERIFIED WITH CONCERNS — no behavior change, but cleanup required
+* NOT VERIFIED — insufficient proof
+* FAILED — implementation changes behavior or has side effects
+
+Do not publish or deploy changes as part of this verification.

@@ -21654,7 +21654,7 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
         elif verdict in FULL_READY_VERDICTS:
             state, tier = "READY", "FULL"
         elif verdict in EARLY_READY_VERDICTS:
-            state, tier = "EARLY", "EARLY"
+            state, tier = "READY", "EARLY"
         elif result.get("strict_direction"):
             state, tier = "SETUP_FORMING", None
         else:
@@ -21700,6 +21700,12 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
             "strict_missing":   strict_missing,
             "has_active_trade": has_active,
             "has_trade_plan":   has_plan,
+            # plan_available: plan dict is populated with entry/stop/target.
+            # plan_executable: plan_available AND a FULL (candle-close) READY verdict.
+            "plan_available":   has_plan and bool(
+                                    (tp.get("entry_zone") or tp.get("entry"))
+                                    and tp.get("stop_loss") and tp.get("target1")),
+            "plan_executable":  has_plan and verdict in FULL_READY_VERDICTS,
             "next_action":      next_action,
         }
     except Exception as _exc:
@@ -21720,6 +21726,8 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
             "strict_missing":   None,
             "has_active_trade": False,
             "has_trade_plan":   False,
+            "plan_available":   False,
+            "plan_executable":  False,
             "next_action":      None,
         }
 

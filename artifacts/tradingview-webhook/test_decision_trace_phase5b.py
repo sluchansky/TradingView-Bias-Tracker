@@ -79,7 +79,9 @@ REQUIRED_KEYS = {
     "domain", "state", "tier", "direction",
     "edge_score", "edge_grade", "strict_score", "strict_label",
     "strict_reason", "strict_missing",
-    "has_active_trade", "has_trade_plan", "next_action",
+    "has_active_trade", "has_trade_plan",
+    "plan_available", "plan_executable",
+    "next_action",
 }
 
 def test_all_schema_keys_present():
@@ -166,7 +168,7 @@ def test_long_early_ready():
         "market_open":      True,
     })
     assert trace["domain"]    == "ENTRY"
-    assert trace["state"]     == "EARLY"
+    assert trace["state"]     == "READY",  f"EARLY READY → state should be READY (tier distinguishes), got {trace['state']}"
     assert trace["tier"]      == "EARLY"
     assert trace["direction"] == "Long"
 
@@ -373,6 +375,93 @@ def test_endpoint_registered():
     rules = [str(r) for r in app.app.url_map.iter_rules()]
     assert "/decision-trace" in rules, \
         f"/decision-trace not in Flask routes: {rules}"
+
+
+# ── T25: SHORT EARLY READY → state=READY, tier=EARLY ─────────────────────────
+
+def test_short_early_ready():
+    trace = _build_trace({
+        "verdict":          "SHORT EARLY READY",
+        "strict_direction": "Short",
+        "edge_score":       57,
+        "trade_plan":       {"trade_plan": True, "direction": "Short"},
+        "market_open":      True,
+    })
+    assert trace["domain"]    == "ENTRY"
+    assert trace["state"]     == "READY",  f"SHORT EARLY READY → state should be READY, got {trace['state']}"
+    assert trace["tier"]      == "EARLY"
+    assert trace["direction"] == "Short"
+
+
+# ── T26: plan_available True when entry/stop/target present ───────────────
+
+def test_plan_available_true():
+    trace = _build_trace({
+        "verdict":    "LONG READY",
+        "trade_plan": {
+            "trade_plan": True, "entry_zone": 2050.0,
+            "stop_loss": 2045.0, "target1": 2060.0,
+        },
+    })
+    assert trace["plan_available"] is True,  f"plan_available={trace['plan_available']}"
+
+
+# ── T27: plan_available False when plan flag is False ─────────────────────
+
+def test_plan_available_false():
+    trace = _build_trace({"trade_plan": {"trade_plan": False}})
+    assert trace["plan_available"] is False
+
+
+# ── T28: plan_executable True only for FULL READY with plan ───────────────
+
+def test_plan_executable_full_ready():
+    trace = _build_trace({
+        "verdict":    "LONG READY",
+        "trade_plan": {
+            "trade_plan": True, "entry_zone": 2050.0,
+            "stop_loss": 2045.0, "target1": 2060.0,
+        },
+    })
+    assert trace["plan_executable"] is True,  f"FULL READY plan should be executable"
+
+
+def test_plan_executable_false_for_early():
+    trace = _build_trace({
+        "verdict":    "LONG EARLY READY",
+        "trade_plan": {
+            "trade_plan": True, "entry_zone": 2050.0,
+            "stop_loss": 2045.0, "target1": 2060.0,
+        },
+    })
+    assert trace["plan_executable"] is False,         f"EARLY READY verdict → plan_executable must be False (intrabar), got {trace['plan_executable']}"
+
+
+# ── T29: Case J — READY verdict but plan missing ──────────────────────────
+
+def test_case_j_ready_no_plan():
+    trace = _build_trace({
+        "verdict":          "LONG READY",
+        "strict_direction": "Long",
+        "edge_score":       85,
+        "trade_plan":       {"trade_plan": False, "reason": "MSF veto"},
+    })
+    assert trace["domain"]           == "ENTRY",  f"domain={trace['domain']}"
+    assert trace["state"]            == "READY",  f"state={trace['state']}"
+    assert trace["tier"]             == "FULL",   f"tier={trace['tier']}"
+    assert trace["has_trade_plan"]   is False,    f"has_trade_plan should be False"
+    assert trace["plan_available"]   is False,    f"plan_available should be False"
+    assert trace["plan_executable"]  is False,    f"plan_executable should be False"
+
+
+# ── T30: fail-open block includes plan_available + plan_executable ─────────
+
+def test_fail_open_has_plan_fields():
+    trace = app.build_legacy_decision_trace(None, "MGC")
+    assert "plan_available"  in trace, "plan_available missing from fail-open block"
+    assert "plan_executable" in trace, "plan_executable missing from fail-open block"
+    assert trace["plan_available"]  is False
+    assert trace["plan_executable"] is False
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
