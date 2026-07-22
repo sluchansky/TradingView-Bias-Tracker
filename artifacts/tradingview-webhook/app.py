@@ -57574,7 +57574,7 @@ function renderBLPanels(d){
   var hcvdDir=String(hdiag.cvd_direction||hdiag.cvd||'');
   var hstructOk=hdiag.structure_ok||hdiag.structure;
   var hzoneOk=hdiag.zone_ok||hdiag.zone;
-  var hvolReg=String(d.volatility||d.vol_regime||hdiag.vol_regime||'');
+  var _dVol=d.volatility;var hvolReg=String((_dVol&&typeof _dVol==='object'?(_dVol.regime||_dVol.vol_regime):_dVol)||d.vol_regime||hdiag.vol_regime||'');
   (function(){
     var bk2=getBrain(d);
     var sc2=bk2?bk2.score:{};
