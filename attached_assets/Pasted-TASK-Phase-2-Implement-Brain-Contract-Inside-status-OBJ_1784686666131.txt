@@ -1,0 +1,165 @@
+TASK: Phase 2 — Implement Brain Contract Inside /status
+
+OBJECTIVE
+
+Create one canonical read-only Brain Contract inside the existing /status response.
+
+Do not create a new /brain endpoint.
+
+Do not change:
+
+- scoring weights
+- thresholds
+- gate logic
+- execution logic
+- trade sizing
+- database behavior
+- alert behavior
+- existing strategy behavior
+
+The existing /status fields must remain available during this phase for backward compatibility.
+
+IMPLEMENTATION
+
+1. Add a new top-level key to _build_status_payload():
+
+"brain": { ... }
+
+2. Build the brain object only from the already-computed full_analysis result.
+
+Do not call full_analysis() a second time.
+Do not recalculate edge score.
+Do not create another scoring path.
+
+3. Brain Contract schema:
+
+{
+  "contract_version": "1.0",
+  "instrument": active_ticker,
+  "generated_at": edge_score_generated_at,
+
+  "decision": {
+    "verdict": verdict,
+    "is_ready": boolean,
+    "direction": "Long" | "Short" | null,
+    "next_action": string
+  },
+
+  "score": {
+    "value": edge_score,
+    "max": 110,
+    "grade": edge_grade,
+    "source": "EDGE_COMPONENTS",
+    "components": edge_breakdown components,
+    "adjustments": edge_breakdown adjustments
+  },
+
+  "directional": {
+    "bias": market_intelligence.directional_confidence.bias,
+    "long": market_intelligence.directional_confidence.long,
+    "short": market_intelligence.directional_confidence.short,
+    "margin": absolute difference between long and short
+  },
+
+  "supporting_diagnostics": {
+    "governor_confidence": confidence_governor.final_confidence_score,
+    "governor_components": confidence_governor component breakdown
+  },
+
+  "reasons": {
+    "top": maximum 3 normalized reason strings
+  },
+
+  "risks": {
+    "top": maximum 3 normalized risk strings
+  },
+
+  "trade_plan": null or the existing trade_plan object,
+
+  "freshness": {
+    "price_last_valid_at": last_valid_time,
+    "price_age_seconds": computed from last_valid_time when valid,
+    "price_fresh": boolean
+  }
+}
+
+4. Contract rules
+
+- brain.instrument must equal active_ticker.
+- brain.score.value must equal top-level edge_score.
+- brain.score.grade must equal edge_grade.
+- brain.score.source must always be EDGE_COMPONENTS.
+- brain.trade_plan must be null when the decision is not actionable.
+- brain.decision.direction must be null when the verdict is WAIT/non-actionable.
+- Do not include legacy_confidence.
+- Do not include strict_score.
+- Do not include cross-instrument bias.
+- Governor confidence must remain supporting diagnostics only.
+- Directional data must come from market_intelligence.directional_confidence.
+- Reasons and risks must contain no empty strings, null values, or duplicates.
+- Limit reasons and risks to 3 items each.
+
+5. Direction normalization
+
+Normalize direction to exactly:
+
+- "Long"
+- "Short"
+- null
+
+Do not expose inconsistent values such as LONG, BUY, Bullish, or Neutral inside brain.decision.direction.
+
+6. Backward compatibility
+
+Keep all existing top-level /status keys unchanged in this phase.
+
+The new brain object is additive only.
+
+7. Tests
+
+Add test_brain_contract.py covering:
+
+A. brain exists in /status
+B. contract_version == "1.0"
+C. brain.instrument == active_ticker
+D. brain.score.value == top-level edge_score
+E. brain.score.source == "EDGE_COMPONENTS"
+F. score components reconcile to score including adjustments
+G. WAIT verdict produces direction=null
+H. WAIT verdict produces trade_plan=null
+I. actionable verdict preserves the existing trade plan
+J. reasons contain at most 3 unique non-empty strings
+K. risks contain at most 3 unique non-empty strings
+L. legacy_confidence and strict_score are absent from brain
+M. directional values are per-instrument
+N. no second full_analysis() call is introduced
+O. all existing confidence-integrity tests still pass
+
+8. Validation
+
+Run:
+
+- py_compile
+- test_brain_contract.py
+- test_confidence_integrity.py
+- test_scalp_zone_gate.py
+- test_backtest_stop_parity.py
+- parity
+- scalp_golden
+- breakout_mode smoke
+- dual_sim smoke
+- node --check through existing smoke suites
+
+REPORT
+
+Return:
+
+1. Exact files and functions changed
+2. Final brain JSON example for MNQ
+3. Test results
+4. Confirmation that no scoring, gating, execution, sizing, database, or alert behavior changed
+5. Any field whose source was ambiguous
+
+Do not update dashboard JavaScript yet.
+Do not remove old /status fields yet.
+Do not add Databento.

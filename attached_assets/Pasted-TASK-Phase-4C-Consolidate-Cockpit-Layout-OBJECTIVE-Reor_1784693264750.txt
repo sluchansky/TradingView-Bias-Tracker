@@ -1,0 +1,288 @@
+TASK: Phase 4C — Consolidate Cockpit Layout
+
+OBJECTIVE
+
+Reorganize the Cockpit into a clear detailed view of the trading system.
+
+All existing operator-decision widgets must continue reading from data.brain.
+
+This phase is visual consolidation and information architecture only.
+
+Do not change:
+
+- backend logic
+- Brain Contract
+- scoring
+- thresholds
+- gates
+- strategy behavior
+- execution behavior
+- sizing
+- alerts
+- broker integrations
+- database behavior
+- Home dashboard
+- Databento
+
+TARGET STRUCTURE
+
+Organize Cockpit into these five sections:
+
+1. Brain Decision
+2. Market Structure
+3. Risk and Execution
+4. Diagnostics
+5. Learning and History
+
+SECTION 1 — BRAIN DECISION
+
+Retain one instance of:
+
+- instrument
+- trading mode
+- price
+- verdict
+- readiness
+- direction
+- score
+- score maximum
+- grade
+- primary reason
+- next action
+- trade plan
+- Enter Trade action
+
+Use only:
+
+- brain.instrument
+- brain.decision.*
+- brain.score.*
+- brain.reasons.top
+- brain.trade_plan
+
+Do not show duplicate verdicts, scores, directions, or next actions elsewhere.
+
+SECTION 2 — MARKET STRUCTURE
+
+Retain:
+
+- BOS
+- CHOCH
+- VWAP
+- CVD
+- volume
+- zone
+- liquidity sweep
+- ATR
+- bias
+- relevant structural context
+
+These may continue using their existing diagnostic sources when they are not
+part of the Brain Contract.
+
+This section must support the Brain decision, not compete with it.
+
+SECTION 3 — RISK AND EXECUTION
+
+Retain:
+
+- active trade state
+- entry
+- stop
+- target
+- current R
+- unrealized R
+- execution mode
+- trading mode
+- TradersPost status where already available
+- prop-account protection
+- account/risk status
+
+Do not move active trade or prop-account state into the Brain Contract.
+
+SECTION 4 — DIAGNOSTICS
+
+Move or retain here:
+
+- gate_debug
+- data-feed details
+- stale-data detail
+- raw directional scores
+- raw confidence-governor details
+- complete score component breakdown
+- score adjustments
+- per-instrument snapshot diagnostics
+- raw developer status fields
+
+Keep this section collapsed or behind the existing diagnostics control by default.
+
+SECTION 5 — LEARNING AND HISTORY
+
+Retain:
+
+- market-events timeline
+- trade memory
+- analyst memory
+- learning history
+- historical matches
+- research findings
+- bark/audio control
+
+Do not mix learning text into the primary Brain reason.
+
+REMOVE OR COMBINE DUPLICATES
+
+Remove duplicated Cockpit displays of:
+
+- verdict
+- edge score
+- score grade
+- direction
+- readiness
+- next action
+- reasons
+- trade plan levels
+- feed status
+- execution mode
+- VWAP
+- ATR
+- instrument labels
+
+Each concept should have one primary display location.
+
+TRADE TICKET
+
+The trade ticket may repeat trade-plan values because it is an action surface.
+
+It must still read from:
+
+brain.trade_plan
+
+and readiness must use:
+
+brain.decision.is_ready
+
+When trade_plan is null:
+
+- clear all values
+- disable entry
+- show “No actionable trade plan”
+
+NAVIGATION RAIL
+
+Keep the four instrument tabs.
+
+Improve non-active instrument snapshot freshness only if this can be done without
+changing backend behavior.
+
+A 30-second background refresh for non-active snapshots is acceptable.
+
+Requirements:
+
+- active instrument continues polling at its existing interval
+- background responses cannot overwrite active instrument data
+- timers are cleaned up on unmount
+- failed refreshes retain the previous valid snapshot and visibly mark it stale
+- no cross-instrument data contamination
+
+RESPONSIVE DESIGN
+
+Desktop:
+
+- Brain Decision remains dominant
+- Market Structure and Risk/Execution remain visible without excessive scrolling
+- Diagnostics stays secondary
+- Learning and History sits below the immediate trading view
+
+Mobile/tablet:
+
+- Brain Decision appears first
+- Risk and Execution appears before deep diagnostics
+- sections stack cleanly
+- no horizontal overflow
+- trade actions remain accessible
+
+DO NOT OVERDESIGN
+
+Preserve the current Cockpit visual language where practical.
+
+Do not introduce:
+
+- a new design system
+- heavy animation
+- decorative gauges with no additional information
+- additional competing colors
+- new backend data
+- new AI-generated narrative
+
+TESTS
+
+Add or update tests covering:
+
+A. exactly one primary verdict display
+B. exactly one primary score display
+C. exactly one primary direction display
+D. exactly one next-action display
+E. Brain Decision remains sourced from data.brain
+F. trade ticket remains sourced from brain.trade_plan
+G. null trade plan disables entry
+H. Market Structure retains all seven existing gate indicators
+I. active trade state remains visible
+J. prop protection remains visible
+K. diagnostics remain accessible
+L. diagnostics are not the dominant initial view
+M. market timeline remains available
+N. learning fields do not replace the Brain reason
+O. instrument switching remains functional
+P. no cross-instrument overwrite occurs
+Q. timers are cleaned up
+R. layout has no duplicate primary decision panels
+S. mobile layout places Brain Decision first
+T. Phase 4B migration tests still pass
+
+VALIDATION
+
+Run:
+
+- new Cockpit consolidation tests
+- Phase 4B Cockpit tests
+- test_brain_home.py
+- test_brain_dashboard.py
+- test_brain_contract.py
+- test_confidence_integrity.py
+- test_scalp_zone_gate.py
+- node --check
+- TypeScript check, clearly separating pre-existing errors
+- py_compile
+- parity
+- scalp_golden
+- breakout_mode smoke
+- dual_sim smoke
+
+REPORT
+
+Return:
+
+1. Before-and-after Cockpit panel inventory
+2. Panels removed, combined, moved, or retained
+3. Exact source used by every retained decision widget
+4. Any remaining duplicated concept and why it is necessary
+5. Responsive-layout evidence
+6. Rendered evidence for:
+   - WAIT
+   - READY
+   - active trade
+   - prop protection enabled
+   - null trade plan
+   - diagnostics open
+   - mobile view
+7. All validation results
+8. TypeScript errors separated into:
+   - introduced by this phase
+   - pre-existing
+9. Confirmation that backend and execution behavior were untouched
+
+Do not change Home.
+Do not expand the Brain Contract.
+Do not add Databento.
+Do not remove legacy /status fields yet.

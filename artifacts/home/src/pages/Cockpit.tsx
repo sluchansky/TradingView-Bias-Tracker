@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
+// ── Types ──────────────────────────────────────────────────────────────────────
 type TradePlan = {
   trade_plan?: boolean;
   direction?: string;
@@ -26,6 +27,25 @@ type TimelineEvent = {
   time?: string;
   ts?: string;
   icon?: string;
+};
+
+type BrainContract = {
+  decision: {
+    verdict: string;
+    is_ready: boolean;
+    direction: string | null;
+    next_action: string | null;
+  };
+  score: {
+    value: number;
+    max: number;
+    grade: string | null;
+  };
+  reasons: {
+    top: string[];
+  };
+  trade_plan: TradePlan | null;
+  freshness?: Record<string, unknown>;
 };
 
 type StatusData = {
@@ -85,12 +105,14 @@ type StatusData = {
     provider?: string;
     instruments?: Record<string, { freshness?: string; auto_age_secs?: number }>;
   };
+  brain?: BrainContract;
 };
 
 type InstSnap = { state: string; edge: number; mode: string };
 
 const INSTRUMENTS = ["MNQ", "MGC", "MES", "MYM"];
 
+// ── Design tokens (unchanged) ──────────────────────────────────────────────────
 const C = {
   bg: "#07070d",
   surface: "#0c0c18",
@@ -112,6 +134,7 @@ const C = {
   teal: "#34d399",
 };
 
+// ── Helper components ──────────────────────────────────────────────────────────
 function Label({ children }: { children: string }) {
   return (
     <span style={{
@@ -175,29 +198,55 @@ function playChihuahuaBark(): void {
   } catch { /* unsupported */ }
 }
 
+function buildLegacyBrainFallback(d: StatusData): BrainContract {
+  console.warn("[Cockpit] data.brain absent — using legacy whole-contract fallback");
+  const top: string[] = [];
+  if (d.strict_reason) top.push(d.strict_reason);
+  return {
+    decision: {
+      verdict: d.verdict,
+      is_ready: d.verdict.includes("READY"),
+      direction: d.strict_direction ?? null,
+      next_action: d.stage_next_step ?? null,
+    },
+    score: {
+      value: d.edge_score,
+      max: 110,
+      grade: d.edge_grade ?? null,
+    },
+    reasons: { top },
+    trade_plan: d.trade_plan ?? null,
+  };
+}
+
+// ── Main component ─────────────────────────────────────────────────────────────
 export default function Cockpit() {
   const [activeTicker, setActiveTicker] = useState("MNQ");
-  const [drawerOpen, setDrawerOpen]   = useState(false);
-  const [tradeOpen, setTradeOpen]     = useState(false);
-  const [data, setData]               = useState<StatusData | null>(null);
-  const [instSnaps, setInstSnaps]     = useState<Record<string, InstSnap>>({});
-  const [fetchError, setFetchError]   = useState<string | null>(null);
-  const [pwd, setPwd]                 = useState<string>(() => { try { return sessionStorage.getItem("cockpit_pwd") ?? ""; } catch { return ""; } });
-  const [showLogin, setShowLogin]     = useState<boolean>(() => { try { return !sessionStorage.getItem("cockpit_pwd"); } catch { return true; } });
-  const [loginInput, setLoginInput]   = useState("");
-  const [loginErr, setLoginErr]       = useState(false);
-  const activeRef = useRef(activeTicker);
-  activeRef.current = activeTicker;
-  const pwdRef = useRef(pwd);
-  pwdRef.current = pwd;
-  const loginAttempted = useRef(false);
-  const prevVerdictRef = useRef<string>("");
-  const [barkMuted, setBarkMuted] = useState<boolean>(() => {
+  const [drawerOpen, setDrawerOpen]     = useState(false);
+  const [tradeOpen, setTradeOpen]       = useState(false);
+  const [data, setData]                 = useState<StatusData | null>(null);
+  const [instSnaps, setInstSnaps]       = useState<Record<string, InstSnap>>({});
+  const [staleSnaps, setStaleSnaps]     = useState<Record<string, boolean>>({});
+  const [fetchError, setFetchError]     = useState<string | null>(null);
+  const [pwd, setPwd]                   = useState<string>(() => { try { return sessionStorage.getItem("cockpit_pwd") ?? ""; } catch { return ""; } });
+  const [showLogin, setShowLogin]       = useState<boolean>(() => { try { return !sessionStorage.getItem("cockpit_pwd"); } catch { return true; } });
+  const [loginInput, setLoginInput]     = useState("");
+  const [loginErr, setLoginErr]         = useState(false);
+  const [isMobile, setIsMobile]         = useState(() => typeof window !== "undefined" && window.innerWidth < 768);
+  const [barkMuted, setBarkMuted]       = useState<boolean>(() => {
     try { return localStorage.getItem("cockpit_bark_muted") === "1"; } catch { return false; }
   });
-  const barkMutedRef = useRef(barkMuted);
-  barkMutedRef.current = barkMuted;
 
+  const activeRef   = useRef(activeTicker);
+  activeRef.current = activeTicker;
+  const pwdRef      = useRef(pwd);
+  pwdRef.current    = pwd;
+  const loginAttempted  = useRef(false);
+  const prevVerdictRef  = useRef<string>("");
+  const barkMutedRef    = useRef(barkMuted);
+  barkMutedRef.current  = barkMuted;
+
+  // ── applyData: shared by active poll + background snap ──────────────────────
   const applyData = useCallback((json: StatusData, ticker: string) => {
     if (ticker === activeRef.current) {
       const newVerdict = json.verdict ?? "";
@@ -208,16 +257,22 @@ export default function Cockpit() {
       setData(json);
       setFetchError(null);
     }
+    // Successful response clears stale flag for that instrument
+    setStaleSnaps(prev => ({ ...prev, [ticker]: false }));
+    const snapBrain = json.brain;
     setInstSnaps(prev => ({
       ...prev,
       [ticker]: {
-        state: (json.verdict ?? "").includes("READY") ? "READY" : "WAIT",
-        edge:  json.edge_score ?? 0,
+        state: snapBrain
+          ? (snapBrain.decision.is_ready ? "READY" : "WAIT")
+          : ((json.verdict ?? "").includes("READY") ? "READY" : "WAIT"),
+        edge:  snapBrain ? snapBrain.score.value : (json.edge_score ?? 0),
         mode:  json.trading_mode ?? "SCALP",
       },
     }));
   }, []);
 
+  // ── Active instrument 3s poll ────────────────────────────────────────────────
   const fetchStatus = useCallback(async (ticker: string) => {
     try {
       const headers: Record<string, string> = {};
@@ -243,6 +298,27 @@ export default function Cockpit() {
     }
   }, [applyData]);
 
+  // ── Non-active instrument 30s background snap ────────────────────────────────
+  // Guards: ticker !== activeRef; failed fetch marks the snap stale; cannot
+  // overwrite active instrument data (applyData guards on activeRef.current).
+  const fetchBackgroundSnap = useCallback(async (ticker: string) => {
+    try {
+      const headers: Record<string, string> = {};
+      const p = pwdRef.current;
+      if (p) headers["Authorization"] = `Basic ${btoa(":" + p)}`;
+      const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
+      if (!res.ok) {
+        setStaleSnaps(prev => ({ ...prev, [ticker]: true }));
+        return;
+      }
+      const json: StatusData = await res.json();
+      if (json.status === "warming") return;
+      applyData(json, ticker);
+    } catch {
+      setStaleSnaps(prev => ({ ...prev, [ticker]: true }));
+    }
+  }, [applyData]);
+
   const handleLogin = useCallback((e: React.FormEvent) => {
     e.preventDefault();
     setLoginErr(false);
@@ -257,17 +333,39 @@ export default function Cockpit() {
     INSTRUMENTS.forEach(inst => fetchStatus(inst));
   }, [loginInput, fetchStatus]);
 
+  // Initial fetch for all instruments
   useEffect(() => { INSTRUMENTS.forEach(inst => fetchStatus(inst)); }, [fetchStatus]);
 
+  // Active instrument: 3s poll
   useEffect(() => {
     fetchStatus(activeTicker);
     const id = setInterval(() => fetchStatus(activeTicker), 3000);
     return () => clearInterval(id);
   }, [activeTicker, fetchStatus]);
 
-  const verdict  = data?.verdict ?? "—";
-  const isReady  = verdict.includes("READY");
-  const edge     = data?.edge_score ?? 0;
+  // Non-active instruments: 30s background refresh
+  useEffect(() => {
+    const id = setInterval(() => {
+      INSTRUMENTS.forEach(inst => {
+        if (inst !== activeRef.current) fetchBackgroundSnap(inst);
+      });
+    }, 30000);
+    return () => clearInterval(id);
+  }, [fetchBackgroundSnap]);
+
+  // Responsive: track viewport width
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // ── Brain Contract (Phase 4B — single whole-contract accessor) ───────────────
+  const brain    = data != null ? (data.brain ?? buildLegacyBrainFallback(data)) : null;
+  const verdict  = brain?.decision.verdict ?? "—";
+  const isReady  = brain?.decision.is_ready ?? false;
+  const edge     = brain?.score.value ?? 0;
+  const edgeMax  = brain?.score.max ?? 110;
   const mode     = data?.trading_mode ?? "—";
 
   const displayPrice = data?.display_price
@@ -275,18 +373,19 @@ export default function Cockpit() {
         ? data.current_price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
         : "—");
 
-  const reason = safeStr(data?.strict_reason)
-    ?? safeStr(data?.main_brain_voice)
-    ?? (data ? "Analysis ready." : "Connecting to bot...");
-
-  const nextReq      = safeStr(data?.stage_next_step)    ?? (data ? "No requirement pending." : "—");
+  // Brain-owned operator fields
+  const reason       = safeStr(brain?.reasons.top?.[0]) ?? (data ? "" : "Connecting to bot...");
+  const nextReq      = safeStr(brain?.decision.next_action) ?? (data ? "No requirement pending." : "—");
   const invalidation = safeStr(data?.stage_invalidation) ?? (data ? "No invalidation defined." : "—");
+
+  // Learning — diagnostic/history sources (Section 5 only, not the Brain reason)
   const learningText = safeStr(data?.trade_memory?.summary_text)
     ?? safeStr(data?.analyst?.memory_review)
     ?? safeStr(data?.confidence_governor?.summary)
     ?? (data ? "No matching setups in learning memory yet." : "—");
 
-  const tp           = data?.trade_plan;
+  // Trade plan — from brain contract
+  const tp           = brain?.trade_plan ?? null;
   const hasPlan      = !!tp?.trade_plan && !!tp?.entry_zone;
   const entryZoneStr = tp?.entry_zone ?? "—";
   const stopLossStr  = tp?.stop_loss  != null ? Number(tp.stop_loss).toFixed(2)  : "—";
@@ -307,11 +406,12 @@ export default function Cockpit() {
   const t1Delta   = midEntry != null && target1Str !== "—"
     ? `+${(Number(target1Str) - midEntry).toFixed(0)} pts` : "";
 
-  const levelsBadgeText   = isReady && hasPlan ? "ACTIVE PLAN" : "FORMING · not yet READY";
-  const levelsBadgeColor  = isReady && hasPlan ? C.green       : "#f59e0b";
+  const levelsBadgeText   = isReady && hasPlan ? "ACTIVE PLAN"           : "FORMING · not yet READY";
+  const levelsBadgeColor  = isReady && hasPlan ? C.green                 : "#f59e0b";
   const levelsBadgeBg     = isReady && hasPlan ? "rgba(34,197,94,0.08)"  : "rgba(245,158,11,0.08)";
   const levelsBadgeBorder = isReady && hasPlan ? "rgba(34,197,94,0.18)" : "rgba(245,158,11,0.18)";
 
+  // Section 3 — Risk & Execution (flat /status sources retained)
   const atm            = data?.active_trade_mgmt;
   const hasActiveTrade = (atm?.active === true) || atm?.status === "active";
   const atDir          = atm?.direction ?? "Long";
@@ -320,21 +420,25 @@ export default function Cockpit() {
   const atR            = atm?.current_r ?? atm?.unrealized_r;
   const atUnrealized   = atR != null ? `${atR > 0 ? "+" : ""}${atR.toFixed(2)}R` : "—";
 
-  const propEnabled = data?.prop_firm?.enabled ?? false;
+  const propEnabled    = data?.prop_firm?.enabled ?? false;
   const propHasAccount = data?.prop_firm?.account != null;
-  const propSafe = !propEnabled || propHasAccount;
+  const propSafe       = !propEnabled || propHasAccount;
 
-  const bias       = safeStr(data?.bias) ?? "—";
-  const vwapVal    = data?.confluences?.vwap_value ?? data?.vwap_value;
-  const price      = data?.current_price;
-  const aboveVwap  = vwapVal != null && price != null ? price > vwapVal : null;
-  const vwapCtx    = vwapVal != null
+  // Section 2 — Market Structure (flat /status sources retained)
+  const bias      = safeStr(data?.bias) ?? "—";
+  const vwapVal   = data?.confluences?.vwap_value ?? data?.vwap_value;
+  const price     = data?.current_price;
+  const aboveVwap = vwapVal != null && price != null ? price > vwapVal : null;
+  const vwapCtx   = vwapVal != null
     ? `${vwapVal.toFixed(2)} · ${aboveVwap === true ? "price above" : aboveVwap === false ? "price below" : ""}`
     : "—";
-  const atrStr     = data?.current_atr != null ? `${data.current_atr.toFixed(2)} pts` : "—";
-  const freshness  = safeStr(data?.data_feed?.overall_freshness) ?? "—";
-  const execMode   = safeStr(data?.execution_mode)?.replace(/_/g, " ") ?? "—";
+  const atrStr    = data?.current_atr != null ? `${data.current_atr.toFixed(2)} pts` : "—";
 
+  // Section 3 — execution context (flat /status)
+  const freshness = safeStr(data?.data_feed?.overall_freshness) ?? "—";
+  const execMode  = safeStr(data?.execution_mode)?.replace(/_/g, " ") ?? "—";
+
+  // Seven gate indicators (Section 2)
   const gateItems = [
     { label: "BOS",    ok: data?.confluences?.bos },
     { label: "CHOCH",  ok: data?.confluences?.choch },
@@ -345,14 +449,20 @@ export default function Cockpit() {
     { label: "Sweep",  ok: data?.confluences?.liquidity_sweep },
   ];
 
+  // Section 5 — Learning & History
   const timeline: TimelineEvent[] = Array.isArray(data?.market_events_timeline)
     ? data!.market_events_timeline!.slice(0, 12) : [];
 
+  // Section 4 — Diagnostics drawer (raw/diagnostic fields, behind control)
   const gateDebug = (data?.gate_debug && typeof data.gate_debug === "object") ? data.gate_debug : null;
   const diagItems = (() => {
     if (!data) return [];
     const items: { label: string; value: string; sub: string }[] = [];
-    items.push({ label: "Edge score", value: `${edge} / 100`, sub: data.edge_grade ? `${data.edge_grade} grade` : "" });
+    items.push({ label: "Edge score", value: `${edge} / ${edgeMax}`, sub: brain?.score.grade ? `${brain.score.grade} grade` : "" });
+    items.push({ label: "Direction (raw)", value: data.strict_direction ?? "—", sub: "" });
+    items.push({ label: "Bull score", value: `${data.bullish_score ?? 0}`, sub: "directional confidence" });
+    items.push({ label: "Bear score", value: `${data.bearish_score ?? 0}`, sub: "directional confidence" });
+    items.push({ label: "Feed",        value: freshness, sub: data.data_feed?.provider ?? "" });
     if (data.vwap_value) {
       const dir = (data.current_price ?? 0) > data.vwap_value ? "above" : "below";
       items.push({ label: "VWAP", value: data.vwap_value.toFixed(2), sub: `Price ${dir} VWAP` });
@@ -374,29 +484,46 @@ export default function Cockpit() {
     return items;
   })();
 
+  // Nav rail instrument snapshots (with stale indicator)
   const instruments = INSTRUMENTS.map(name => ({
     name,
     state: instSnaps[name]?.state ?? "—",
     edge:  instSnaps[name]?.edge  ?? 0,
     mode:  instSnaps[name]?.mode  ?? "—",
+    stale: staleSnaps[name] ?? false,
   }));
 
   const verdictColor = isReady ? C.green : "#a5b4fc";
   const verdictGlow  = isReady ? "0 0 100px rgba(34,197,94,0.12)" : "0 0 100px rgba(165,180,252,0.07)";
 
+  // ── Render ─────────────────────────────────────────────────────────────────────
   return (
-    <div style={{
+    <div id="cockpit-root" style={{
       background: C.bg, color: C.textPrimary,
       fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-      height: "100vh", display: "grid",
-      gridTemplateColumns: "56px 1fr 228px", gridTemplateRows: "1fr 80px",
-      overflow: "hidden", WebkitFontSmoothing: "antialiased",
+      WebkitFontSmoothing: "antialiased",
+      // Desktop: fixed 3-column × 2-row grid; Mobile: 2-column × 3-row, scrollable
+      ...(isMobile ? {
+        display: "grid",
+        gridTemplateColumns: "56px 1fr",
+        gridTemplateRows: "auto auto 92px",
+        minHeight: "100vh",
+      } : {
+        display: "grid",
+        gridTemplateColumns: "56px 1fr 228px",
+        gridTemplateRows: "1fr 92px",
+        height: "100vh",
+        overflow: "hidden",
+      }),
     }}>
-      {/* NAV RAIL */}
-      <nav style={{
-        gridRow: "1 / -1", background: C.surface, borderRight: `1px solid ${C.border}`,
+
+      {/* ── NAV RAIL ──────────────────────────────────────────────────────────── */}
+      <nav id="cockpit-nav" style={{
+        gridRow: "1 / -1", gridColumn: 1,
+        background: C.surface, borderRight: `1px solid ${C.border}`,
         display: "flex", flexDirection: "column", alignItems: "center",
         paddingTop: "14px", paddingBottom: "14px", gap: "4px",
+        ...(isMobile ? { position: "sticky", top: 0, zIndex: 10 } : {}),
       }}>
         <div style={{
           width: "32px", height: "32px",
@@ -407,7 +534,12 @@ export default function Cockpit() {
 
         {instruments.map((inst) => {
           const active = inst.name === activeTicker;
-          const dotColor = inst.state === "READY" ? C.green : inst.state === "WAIT" ? "#2a2a44" : "#1e1e32";
+          // Purple dot = stale snapshot; green = READY; dim = WAIT
+          const dotColor = inst.stale
+            ? "#7c3aed"
+            : inst.state === "READY" ? C.green
+            : inst.state === "WAIT"  ? "#2a2a44"
+            : "#1e1e32";
           return (
             <button key={inst.name} onClick={() => setActiveTicker(inst.name)} style={{
               width: "44px", background: active ? C.accentMuted : "transparent",
@@ -420,7 +552,7 @@ export default function Cockpit() {
               </span>
               <div style={{
                 width: "5px", height: "5px", borderRadius: "50%", background: dotColor,
-                boxShadow: inst.state === "READY" ? "0 0 6px rgba(34,197,94,0.6)" : "none",
+                boxShadow: inst.state === "READY" && !inst.stale ? "0 0 6px rgba(34,197,94,0.6)" : "none",
               }} />
             </button>
           );
@@ -450,9 +582,15 @@ export default function Cockpit() {
         </a>
       </nav>
 
-      {/* MAIN BRAIN */}
-      <main style={{ padding: "36px 48px 28px", display: "flex", flexDirection: "column", overflowY: "auto" }}>
-        {/* Top bar */}
+      {/* ── SECTION 1: BRAIN DECISION ──────────────────────────────────────────── */}
+      <main id="cockpit-brain-decision" style={{
+        gridColumn: 2, gridRow: 1,
+        padding: isMobile ? "20px 16px" : "36px 48px 28px",
+        display: "flex", flexDirection: "column",
+        overflowY: isMobile ? "visible" : "auto",
+      }}>
+
+        {/* Top bar: instrument · mode · price */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "40px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
             <span style={{ fontSize: "12px", fontWeight: 600, color: C.textDim, letterSpacing: "2px", textTransform: "uppercase" }}>
@@ -472,60 +610,62 @@ export default function Cockpit() {
           </span>
         </div>
 
-        {/* Verdict */}
+        {/* Primary verdict + score + grade + direction */}
         <div style={{ marginBottom: "24px" }}>
-          <div style={{
+          {/* Verdict headline — single primary display */}
+          <div id="primary-verdict" style={{
             fontSize: "76px", fontWeight: 800, color: verdictColor,
             letterSpacing: "-4px", lineHeight: 0.95, textShadow: verdictGlow,
             marginBottom: "20px", userSelect: "none",
           }}>{verdict}</div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "22px" }}>
+          {/* Score bar + score label */}
+          <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "10px" }}>
             <div style={{ flex: 1, height: "3px", background: "rgba(255,255,255,0.05)", borderRadius: "2px" }}>
-              <div style={{
-                height: "100%", width: `${edge}%`,
+              <div id="primary-score-bar" style={{
+                height: "100%",
+                width: `${Math.max(0, Math.min(100, edgeMax > 0 ? (edge / edgeMax) * 100 : 0))}%`,
                 background: `linear-gradient(90deg, ${C.accent}, ${verdictColor})`,
                 borderRadius: "2px", transition: "width 0.6s ease",
               }} />
             </div>
-            <span style={{ fontSize: "12px", color: C.textDim, fontWeight: 600, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
-              {edge} / 100
+            <span id="primary-score-label" style={{
+              fontSize: "12px", color: C.textDim, fontWeight: 600,
+              fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap",
+            }}>
+              {edge} / {edgeMax}
             </span>
           </div>
 
-          {/* Info strip */}
-          {data && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "18px" }}>
-              {[
-                { label: "Bias",  value: bias },
-                { label: "VWAP",  value: vwapCtx },
-                { label: "ATR",   value: atrStr },
-                { label: "Exec",  value: execMode },
-                { label: "Feed",  value: freshness },
-              ].map(chip => (
-                <div key={chip.label} style={{
-                  display: "flex", alignItems: "center", gap: "5px",
-                  background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
-                  borderRadius: "8px", padding: "4px 10px", fontSize: "11px",
-                }}>
-                  <span style={{ color: C.textDim, fontWeight: 700, letterSpacing: "0.5px" }}>{chip.label}</span>
-                  <span style={{ color: C.textSecondary }}>{chip.value}</span>
-                </div>
-              ))}
-            </div>
-          )}
+          {/* Grade + direction — brain-owned, single primary display */}
+          <div style={{ display: "flex", gap: "6px", marginBottom: "18px", flexWrap: "wrap" }}>
+            {brain?.score.grade && (
+              <div id="primary-grade" style={{
+                background: "rgba(165,180,252,0.08)", border: "1px solid rgba(165,180,252,0.18)",
+                borderRadius: "8px", padding: "3px 10px",
+                fontSize: "11px", color: C.indigo, fontWeight: 700, letterSpacing: "0.5px",
+              }}>Grade {brain.score.grade}</div>
+            )}
+            {brain != null && (
+              <div id="primary-direction" style={{
+                background: "rgba(52,211,153,0.08)", border: "1px solid rgba(52,211,153,0.18)",
+                borderRadius: "8px", padding: "3px 10px",
+                fontSize: "11px", color: C.teal, fontWeight: 700, letterSpacing: "0.5px",
+              }}>{brain?.decision.direction ?? "—"}</div>
+            )}
+          </div>
 
+          {/* Primary reason (Brain reasons.top[0] only) */}
           <p style={{ fontSize: "17px", fontWeight: 400, color: C.textSecondary, lineHeight: 1.65, maxWidth: "620px", margin: 0 }}>
             {reason}
           </p>
         </div>
 
-        {/* Three key rows */}
-        <div style={{ display: "flex", flexDirection: "column" }}>
+        {/* Two key rows: Next action + Invalidation */}
+        <div id="cockpit-key-rows" style={{ display: "flex", flexDirection: "column" }}>
           {[
-            { label: "Next requirement", value: nextReq,       accent: C.indigo,  symbol: "→" },
-            { label: "Invalidation",     value: invalidation,  accent: C.orange,  symbol: "✕" },
-            { label: "Learning memory",  value: learningText,  accent: C.teal,    symbol: "◎" },
+            { label: "Next action",  value: nextReq,      accent: C.indigo, symbol: "→" },
+            { label: "Invalidation", value: invalidation, accent: C.orange, symbol: "✕" },
           ].map((row, i) => (
             <div key={row.label}>
               <div style={{ display: "flex", alignItems: "flex-start", gap: "16px", padding: "15px 0" }}>
@@ -539,12 +679,12 @@ export default function Cockpit() {
                   </div>
                 </div>
               </div>
-              {i < 2 && <Divider />}
+              {i < 1 && <Divider />}
             </div>
           ))}
         </div>
 
-        {/* Suggested levels */}
+        {/* Suggested levels — from brain.trade_plan */}
         <div style={{ marginTop: "24px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
             <Label>Suggested levels</Label>
@@ -554,7 +694,7 @@ export default function Cockpit() {
               borderRadius: "20px", padding: "1px 8px", letterSpacing: "0.5px",
             }}>{levelsBadgeText}</div>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "10px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr 1fr", gap: "10px" }}>
             {[
               { label: "Entry Zone", value: entryZoneStr, sub: entryZoneStr.includes("–") ? "zone range" : "", color: "#e8e8f0", bg: "rgba(255,255,255,0.03)", accent: "rgba(255,255,255,0.08)" },
               { label: "Stop Loss",  value: stopLossStr,  sub: stopDelta,  color: "#f87171", bg: "rgba(239,68,68,0.05)",    accent: "rgba(239,68,68,0.15)" },
@@ -576,15 +716,15 @@ export default function Cockpit() {
           </div>
         </div>
 
-        {/* Actions */}
-        <div style={{ marginTop: "auto", paddingTop: "20px", display: "flex", gap: "10px", alignItems: "center" }}>
-          <button onClick={() => setTradeOpen(true)} style={{
-            padding: "11px 26px", background: isReady ? C.green : C.accentMuted,
-            border: `1px solid ${isReady ? "transparent" : C.accentBorder}`,
-            borderRadius: "12px", cursor: "pointer", fontSize: "13px", fontWeight: 700,
-            color: isReady ? "#030d06" : "#9090d0", letterSpacing: "0.3px",
+        {/* Primary action buttons */}
+        <div style={{ marginTop: "auto", paddingTop: "20px", display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+          <button id="enter-trade-btn" onClick={() => { if (hasPlan) setTradeOpen(true); }} style={{
+            padding: "11px 26px", background: isReady && hasPlan ? C.green : C.accentMuted,
+            border: `1px solid ${isReady && hasPlan ? "transparent" : C.accentBorder}`,
+            borderRadius: "12px", cursor: hasPlan ? "pointer" : "default", fontSize: "13px", fontWeight: 700,
+            color: isReady && hasPlan ? "#030d06" : "#9090d0", letterSpacing: "0.3px",
           }}>
-            {isReady ? "Enter Trade" : "Open Trade Ticket"}
+            {isReady && hasPlan ? "Enter Trade" : !hasPlan ? "No actionable trade plan" : "Open Trade Ticket"}
           </button>
           <button onClick={() => setDrawerOpen(true)} style={{
             padding: "11px 18px", background: "transparent", border: `1px solid ${C.border}`,
@@ -595,37 +735,25 @@ export default function Cockpit() {
         </div>
       </main>
 
-      {/* RIGHT RAIL */}
-      <aside style={{
-        background: C.surface, borderLeft: `1px solid ${C.border}`,
-        padding: "24px 20px", display: "flex", flexDirection: "column", overflow: "hidden",
+      {/* ── SECTIONS 2 + 3: MARKET STRUCTURE & RISK/EXECUTION ─────────────────── */}
+      <aside id="cockpit-market-risk" style={{
+        gridColumn: isMobile ? 2 : 3,
+        gridRow: isMobile ? 2 : 1,
+        background: C.surface,
+        borderLeft: isMobile ? "none" : `1px solid ${C.border}`,
+        borderTop: isMobile ? `1px solid ${C.border}` : "none",
+        padding: "20px 20px",
+        display: "flex", flexDirection: "column",
+        overflowY: isMobile ? "visible" : "auto",
       }}>
-        <Label>Market context</Label>
-        <div style={{ marginTop: "8px", marginBottom: "14px" }}>
-          {[
-            { label: "VWAP",       value: vwapCtx },
-            { label: "Bias",       value: bias },
-            { label: "ATR",        value: atrStr },
-            { label: "Grade",      value: data?.edge_grade ?? "—" },
-            { label: "Direction",  value: data?.strict_direction ?? "—" },
-            { label: "Bull / Bear",value: data ? `${data?.bullish_score ?? 0} / ${data?.bearish_score ?? 0}` : "—" },
-            { label: "Feed",       value: freshness },
-            { label: "Exec mode",  value: execMode },
-          ].map(stat => (
-            <div key={stat.label} style={{
-              display: "flex", justifyContent: "space-between", alignItems: "center",
-              padding: "7px 0", borderBottom: `1px solid ${C.border}`,
-            }}>
-              <span style={{ fontSize: "11px", color: C.textDim }}>{stat.label}</span>
-              <span style={{ fontSize: "11px", fontWeight: 600, color: C.textSecondary,
-                textAlign: "right", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
-              }}>{stat.value}</span>
-            </div>
-          ))}
+
+        {/* ─ SECTION 2: Market Structure ─────────────────────────────────────── */}
+        <div id="cockpit-market-structure" style={{ marginBottom: "2px" }}>
+          <Label>Market structure</Label>
         </div>
 
-        <Label>Gate checklist</Label>
-        <div style={{ marginTop: "8px", marginBottom: "14px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
+        {/* Seven gate indicators */}
+        <div id="gate-checklist" style={{ marginTop: "8px", marginBottom: "10px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
           {gateItems.map(g => (
             <div key={g.label} style={{
               display: "flex", alignItems: "center", gap: "3px",
@@ -641,12 +769,57 @@ export default function Cockpit() {
           ))}
         </div>
 
+        {/* Structural context: VWAP, Bias, ATR */}
+        <div style={{ marginBottom: "14px" }}>
+          {[
+            { label: "VWAP", value: vwapCtx },
+            { label: "Bias", value: bias },
+            { label: "ATR",  value: atrStr },
+          ].map(stat => (
+            <div key={stat.label} style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "6px 0", borderBottom: `1px solid ${C.border}`,
+            }}>
+              <span style={{ fontSize: "11px", color: C.textDim }}>{stat.label}</span>
+              <span style={{
+                fontSize: "11px", fontWeight: 600, color: C.textSecondary,
+                textAlign: "right", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
+              }}>{stat.value}</span>
+            </div>
+          ))}
+        </div>
+
         <Divider />
+
+        {/* ─ SECTION 3: Risk & Execution ─────────────────────────────────────── */}
+        <div id="cockpit-risk-execution" style={{ marginTop: "12px", marginBottom: "8px" }}>
+          <Label>Risk & execution</Label>
+        </div>
+
+        {/* Execution context rows */}
+        <div style={{ marginBottom: "10px" }}>
+          {[
+            { label: "Exec mode", value: execMode },
+            { label: "Mode",      value: mode },
+          ].map(stat => (
+            <div key={stat.label} style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "6px 0", borderBottom: `1px solid ${C.border}`,
+            }}>
+              <span style={{ fontSize: "11px", color: C.textDim }}>{stat.label}</span>
+              <span style={{
+                fontSize: "11px", fontWeight: 600, color: C.textSecondary,
+                textAlign: "right", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const,
+              }}>{stat.value}</span>
+            </div>
+          ))}
+        </div>
 
         <div style={{ flex: 1 }} />
 
+        {/* Active trade block */}
         {hasActiveTrade ? (
-          <div style={{
+          <div id="active-trade-block" style={{
             padding: "12px 14px", background: C.greenBg, border: `1px solid ${C.greenBorder}`,
             borderRadius: "10px", marginBottom: "10px",
           }}>
@@ -662,15 +835,14 @@ export default function Cockpit() {
           </div>
         ) : null}
 
-        <div style={{ display: "flex", alignItems: "center", gap: "7px" }}>
+        {/* Prop-account protection dot */}
+        <div id="prop-protection" style={{ display: "flex", alignItems: "center", gap: "7px" }}>
           <div style={{
             width: "6px", height: "6px", borderRadius: "50%",
             background: !propEnabled ? "#4b5563" : propSafe ? C.green : "#f97316",
             boxShadow: propEnabled && propSafe ? "0 0 6px rgba(34,197,94,0.5)" : "none",
           }} />
-          <span style={{ fontSize: "11px", fontWeight: 600,
-            color: !propEnabled ? C.textDim : propSafe ? "#16a34a" : "#f97316",
-          }}>
+          <span style={{ fontSize: "11px", fontWeight: 600, color: !propEnabled ? C.textDim : propSafe ? "#16a34a" : "#f97316" }}>
             {!data ? "—" :
              !propEnabled ? "Prop rules off" :
              !propHasAccount ? "No account set" :
@@ -681,67 +853,109 @@ export default function Cockpit() {
         </div>
       </aside>
 
-      {/* TIMELINE FOOTER */}
-      <footer style={{
-        gridColumn: "1 / -1", background: "#090912", borderTop: `1px solid ${C.border}`,
-        display: "flex", alignItems: "center", overflowX: "auto", overflowY: "hidden", paddingLeft: "8px",
+      {/* ── SECTION 5: LEARNING & HISTORY ──────────────────────────────────────── */}
+      <footer id="cockpit-learning" style={{
+        gridColumn: isMobile ? 2 : "2 / -1",
+        gridRow: isMobile ? 3 : 2,
+        background: "#090912", borderTop: `1px solid ${C.border}`,
+        display: "flex", flexDirection: "column",
+        overflow: "hidden",
       }}>
-        {/* Bark mute toggle */}
-        <button
-          onClick={() => setBarkMuted(m => {
-            const next = !m;
-            try { localStorage.setItem("cockpit_bark_muted", next ? "1" : "0"); } catch { /* ignore */ }
-            return next;
-          })}
-          title={barkMuted ? "Unmute chihuahua bark on READY" : "Mute chihuahua bark on READY"}
-          style={{
-            flexShrink: 0, background: "none", border: `1px solid ${C.border}`,
-            borderRadius: "6px", padding: "2px 9px", cursor: "pointer",
-            fontSize: "11px", color: barkMuted ? C.textFaint : C.textDim,
-            marginRight: "8px", whiteSpace: "nowrap",
-          }}
-        >
-          {barkMuted ? "🔇" : "🐕"} {barkMuted ? "bark: off" : "bark: on"}
-        </button>
-
-        {timeline.length === 0 ? (
-          <span style={{ fontSize: "12px", color: C.textFaint, padding: "0 24px" }}>
-            {data ? "No timeline events yet." : "Loading timeline..."}
-          </span>
-        ) : timeline.map((ev, i) => (
-          <div key={i} style={{
-            display: "flex", alignItems: "center", gap: "10px",
-            padding: "0 24px", height: "100%", borderRight: `1px solid ${C.border}`, flexShrink: 0,
+        {/* Learning text row (trade memory / analyst memory / governor — Section 5 only) */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: "8px",
+          padding: "5px 12px 5px 16px", borderBottom: `1px solid ${C.border}`,
+          flexShrink: 0,
+        }}>
+          <span style={{
+            fontSize: "9px", fontWeight: 700, letterSpacing: "1.5px",
+            textTransform: "uppercase", color: C.teal, flexShrink: 0,
+          }}>Learning</span>
+          <span style={{
+            fontSize: "11px", color: C.textDim,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
           }}>
-            <span style={{ fontSize: "10px", color: C.textFaint, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
-              {fmtTime(ev)}
+            {learningText}
+          </span>
+        </div>
+
+        {/* Timeline events + bark mute */}
+        <div style={{ display: "flex", alignItems: "center", flex: 1, overflowX: "auto", overflowY: "hidden", paddingLeft: "8px" }}>
+          <button
+            onClick={() => setBarkMuted(m => {
+              const next = !m;
+              try { localStorage.setItem("cockpit_bark_muted", next ? "1" : "0"); } catch { /* ignore */ }
+              return next;
+            })}
+            title={barkMuted ? "Unmute chihuahua bark on READY" : "Mute chihuahua bark on READY"}
+            style={{
+              flexShrink: 0, background: "none", border: `1px solid ${C.border}`,
+              borderRadius: "6px", padding: "2px 9px", cursor: "pointer",
+              fontSize: "11px", color: barkMuted ? C.textFaint : C.textDim,
+              marginRight: "8px", whiteSpace: "nowrap",
+            }}
+          >
+            {barkMuted ? "🔇" : "🐕"} {barkMuted ? "bark: off" : "bark: on"}
+          </button>
+
+          {timeline.length === 0 ? (
+            <span style={{ fontSize: "12px", color: C.textFaint, padding: "0 24px" }}>
+              {data ? "No timeline events yet." : "Loading timeline..."}
             </span>
-            <span style={{ fontSize: "13px" }}>{ev.icon ?? timelineIcon(ev.category)}</span>
-            <span style={{ fontSize: "12px", color: timelineColor(ev.category), whiteSpace: "nowrap" }}>
-              {safeStr(ev.event) ?? ""}
-            </span>
-          </div>
-        ))}
+          ) : timeline.map((ev, i) => (
+            <div key={i} style={{
+              display: "flex", alignItems: "center", gap: "10px",
+              padding: "0 24px", height: "100%", borderRight: `1px solid ${C.border}`, flexShrink: 0,
+            }}>
+              <span style={{ fontSize: "10px", color: C.textFaint, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
+                {fmtTime(ev)}
+              </span>
+              <span style={{ fontSize: "13px" }}>{ev.icon ?? timelineIcon(ev.category)}</span>
+              <span style={{ fontSize: "12px", color: timelineColor(ev.category), whiteSpace: "nowrap" }}>
+                {safeStr(ev.event) ?? ""}
+              </span>
+            </div>
+          ))}
+        </div>
       </footer>
 
-      {/* DIAGNOSTICS DRAWER */}
+      {/* ── SECTION 4: DIAGNOSTICS DRAWER (collapsed by default) ──────────────── */}
       {drawerOpen && (
-        <div style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex" }}>
-          <div onClick={() => setDrawerOpen(false)} style={{ flex: 1, background: "rgba(0,0,0,0.55)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }} />
-          <div style={{ width: "360px", background: C.surfaceHigh, borderLeft: `1px solid ${C.borderMid}`, display: "flex", flexDirection: "column", overflowY: "auto" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "22px 24px 18px", borderBottom: `1px solid ${C.border}`, position: "sticky", top: 0, background: C.surfaceHigh }}>
+        <div id="cockpit-diagnostics" style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex" }}>
+          <div onClick={() => setDrawerOpen(false)} style={{
+            flex: 1, background: "rgba(0,0,0,0.55)",
+            backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)",
+          }} />
+          <div style={{
+            width: "360px", background: C.surfaceHigh,
+            borderLeft: `1px solid ${C.borderMid}`,
+            display: "flex", flexDirection: "column", overflowY: "auto",
+          }}>
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "22px 24px 18px", borderBottom: `1px solid ${C.border}`,
+              position: "sticky", top: 0, background: C.surfaceHigh,
+            }}>
               <span style={{ fontSize: "13px", fontWeight: 700, color: C.textPrimary }}>Diagnostics</span>
-              <button onClick={() => setDrawerOpen(false)} style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: "20px", color: C.textDim, lineHeight: 1, padding: "0 2px" }}>×</button>
+              <button onClick={() => setDrawerOpen(false)} style={{
+                background: "transparent", border: "none", cursor: "pointer",
+                fontSize: "20px", color: C.textDim, lineHeight: 1, padding: "0 2px",
+              }}>×</button>
             </div>
             <div style={{ padding: "16px 24px", display: "flex", flexDirection: "column", gap: "8px" }}>
               <Label>{`Gate breakdown — ${activeTicker}`}</Label>
               <div style={{ height: "12px" }} />
               {diagItems.length === 0 ? (
-                <div style={{ fontSize: "12px", color: C.textFaint }}>{data ? "No gate data." : "Loading..."}</div>
+                <div style={{ fontSize: "12px", color: C.textFaint }}>
+                  {data ? "No gate data." : "Loading..."}
+                </div>
               ) : diagItems.map(item => {
                 const isFail = item.value === "FAIL" || item.value === "false";
                 return (
-                  <div key={item.label} style={{ padding: "13px 16px", background: "rgba(255,255,255,0.02)", border: `1px solid ${C.border}`, borderRadius: "10px" }}>
+                  <div key={item.label} style={{
+                    padding: "13px 16px", background: "rgba(255,255,255,0.02)",
+                    border: `1px solid ${C.border}`, borderRadius: "10px",
+                  }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: item.sub ? "5px" : 0 }}>
                       <span style={{ fontSize: "12px", color: C.textDim }}>{item.label}</span>
                       <span style={{ fontSize: "12px", fontWeight: 600, color: isFail ? "#f87171" : C.textSecondary }}>{item.value}</span>
@@ -752,20 +966,29 @@ export default function Cockpit() {
               })}
             </div>
             <div style={{ padding: "16px 24px", marginTop: "auto", borderTop: `1px solid ${C.border}` }}>
-              <button onClick={() => setDrawerOpen(false)} style={{ width: "100%", padding: "11px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: "10px", cursor: "pointer", fontSize: "12px", color: C.textDim, fontWeight: 600 }}>
-                Close
-              </button>
+              <button onClick={() => setDrawerOpen(false)} style={{
+                width: "100%", padding: "11px", background: "transparent",
+                border: `1px solid ${C.border}`, borderRadius: "10px",
+                cursor: "pointer", fontSize: "12px", color: C.textDim, fontWeight: 600,
+              }}>Close</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* TRADE TICKET */}
+      {/* ── TRADE TICKET ───────────────────────────────────────────────────────── */}
       {tradeOpen && (
         <div style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "flex-end" }}>
-          <div onClick={() => setTradeOpen(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.55)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }} />
-          <div style={{ position: "relative", width: "100%", background: C.surfaceHigh, borderTop: `1px solid ${C.borderMid}`, padding: "28px 40px", display: "flex", gap: "32px", alignItems: "flex-start" }}>
-            <div style={{ flex: 1 }}>
+          <div onClick={() => setTradeOpen(false)} style={{
+            position: "absolute", inset: 0, background: "rgba(0,0,0,0.55)",
+            backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)",
+          }} />
+          <div style={{
+            position: "relative", width: "100%", background: C.surfaceHigh,
+            borderTop: `1px solid ${C.borderMid}`, padding: "28px 40px",
+            display: "flex", gap: "32px", alignItems: "flex-start", flexWrap: "wrap",
+          }}>
+            <div style={{ flex: 1, minWidth: "240px" }}>
               <div style={{ fontSize: "13px", fontWeight: 700, color: C.textPrimary, marginBottom: "18px" }}>
                 Trade Ticket
                 <span style={{ fontSize: "12px", color: C.textDim, fontWeight: 400, marginLeft: "10px" }}>
@@ -779,39 +1002,61 @@ export default function Cockpit() {
                   { label: "Target 1",  value: target1Str,   color: "#60a5fa" },
                   { label: "R:R",        value: rrStr,         color: C.indigo },
                 ].map(f => (
-                  <div key={f.label} style={{ padding: "14px 16px", background: "rgba(255,255,255,0.02)", border: `1px solid ${C.border}`, borderRadius: "10px" }}>
+                  <div key={f.label} style={{
+                    padding: "14px 16px", background: "rgba(255,255,255,0.02)",
+                    border: `1px solid ${C.border}`, borderRadius: "10px",
+                  }}>
                     <Label>{f.label}</Label>
-                    <div style={{ fontSize: "18px", fontWeight: 700, color: f.color, marginTop: "6px", letterSpacing: "-0.3px" }}>{f.value}</div>
+                    <div style={{ fontSize: "18px", fontWeight: 700, color: f.color, marginTop: "6px", letterSpacing: "-0.3px" }}>
+                      {f.value}
+                    </div>
                   </div>
                 ))}
               </div>
               <div style={{ marginTop: "12px", fontSize: "11px", color: C.textFaint }}>
-                {hasPlan ? `${tp?.direction ?? ""} setup · levels are bot-suggested` : "No active plan — levels populate when a setup forms"}
+                {hasPlan
+                  ? `${tp?.direction ?? ""} setup · levels are bot-suggested`
+                  : "No active plan — levels populate when a setup forms"}
               </div>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: "8px", paddingTop: "28px", flexShrink: 0 }}>
               <button onClick={() => setTradeOpen(false)} style={{
-                padding: "12px 36px", background: isReady ? C.green : "rgba(99,102,241,0.15)",
-                border: isReady ? "none" : `1px solid ${C.accentBorder}`,
+                padding: "12px 36px",
+                background: isReady && hasPlan ? C.green : "rgba(99,102,241,0.15)",
+                border: isReady && hasPlan ? "none" : `1px solid ${C.accentBorder}`,
                 borderRadius: "10px", cursor: "pointer", fontSize: "14px", fontWeight: 800,
-                color: isReady ? "#030d06" : "#9090d0",
+                color: isReady && hasPlan ? "#030d06" : "#9090d0",
               }}>
-                {isReady ? `Enter ${tp?.direction ?? "Trade"}` : "Watching..."}
+                {isReady && hasPlan ? `Enter ${tp?.direction ?? "Trade"}` : !hasPlan ? "No Trade Plan" : "Watching..."}
               </button>
-              <button onClick={() => setTradeOpen(false)} style={{ padding: "11px 36px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: "10px", cursor: "pointer", fontSize: "13px", color: C.textDim, fontWeight: 600 }}>
-                Cancel
-              </button>
+              <button onClick={() => setTradeOpen(false)} style={{
+                padding: "11px 36px", background: "transparent",
+                border: `1px solid ${C.border}`, borderRadius: "10px",
+                cursor: "pointer", fontSize: "13px", color: C.textDim, fontWeight: 600,
+              }}>Cancel</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* LOGIN OVERLAY */}
+      {/* ── LOGIN OVERLAY ───────────────────────────────────────────────────────── */}
       {showLogin && (
-        <div style={{ position: "fixed", inset: 0, zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(7,7,13,0.96)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)" }}>
-          <div style={{ background: C.surface, border: `1px solid ${C.borderMid}`, borderRadius: "20px", padding: "40px 36px", width: "320px", display: "flex", flexDirection: "column", gap: "0px" }}>
-            <div style={{ fontSize: "26px", fontWeight: 800, color: C.textPrimary, letterSpacing: "-0.5px", marginBottom: "6px" }}>🤖 AI Cockpit</div>
-            <div style={{ fontSize: "13px", color: C.textDim, marginBottom: "28px" }}>Enter your dashboard password to connect.</div>
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 100,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          background: "rgba(7,7,13,0.96)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
+        }}>
+          <div style={{
+            background: C.surface, border: `1px solid ${C.borderMid}`,
+            borderRadius: "20px", padding: "40px 36px", width: "320px",
+            display: "flex", flexDirection: "column", gap: "0px",
+          }}>
+            <div style={{ fontSize: "26px", fontWeight: 800, color: C.textPrimary, letterSpacing: "-0.5px", marginBottom: "6px" }}>
+              🤖 AI Cockpit
+            </div>
+            <div style={{ fontSize: "13px", color: C.textDim, marginBottom: "28px" }}>
+              Enter your dashboard password to connect.
+            </div>
             <form onSubmit={handleLogin} style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
               <input
                 type="password"
@@ -820,7 +1065,8 @@ export default function Cockpit() {
                 value={loginInput}
                 onChange={e => { setLoginInput(e.target.value); setLoginErr(false); }}
                 style={{
-                  padding: "13px 16px", background: "rgba(255,255,255,0.04)", border: `1px solid ${loginErr ? "#f87171" : C.borderMid}`,
+                  padding: "13px 16px", background: "rgba(255,255,255,0.04)",
+                  border: `1px solid ${loginErr ? "#f87171" : C.borderMid}`,
                   borderRadius: "12px", color: C.textPrimary, fontSize: "15px", outline: "none",
                   fontFamily: "inherit", width: "100%", boxSizing: "border-box" as const,
                 }}
@@ -828,13 +1074,10 @@ export default function Cockpit() {
               {loginErr && <div style={{ fontSize: "12px", color: "#f87171" }}>Incorrect password — try again.</div>}
               <button type="submit" style={{
                 padding: "13px", background: "linear-gradient(135deg, #6366f1, #818cf8)",
-                border: "none", borderRadius: "12px", cursor: "pointer", fontSize: "14px", fontWeight: 700,
-                color: "#fff", letterSpacing: "0.3px", marginTop: "4px",
+                border: "none", borderRadius: "12px", cursor: "pointer",
+                fontSize: "14px", fontWeight: 700, color: "#fff", letterSpacing: "0.3px", marginTop: "4px",
               }}>Connect</button>
             </form>
-            <a href="/api/dashboard" style={{ marginTop: "20px", fontSize: "12px", color: C.textFaint, textAlign: "center" as const, textDecoration: "none" }}>
-              ← Back to full dashboard
-            </a>
           </div>
         </div>
       )}

@@ -1,0 +1,222 @@
+TASK: Phase 3B — Simplify Home Dashboard Around Brain Contract
+
+OBJECTIVE
+
+Simplify the Home dashboard so it presents one clear operator view of the
+canonical data.brain contract.
+
+This phase is a visual and information-architecture cleanup only.
+
+Do not change:
+
+- backend analysis
+- brain contract schema
+- scoring
+- thresholds
+- gates
+- execution
+- sizing
+- alerts
+- database behavior
+- strategy behavior
+- Cockpit data logic
+- Databento integration
+
+CORE RULE
+
+Home is the operator summary.
+
+Cockpit is the detailed diagnostic view.
+
+Home must show only the information needed to answer:
+
+1. What instrument am I looking at?
+2. Is the data fresh?
+3. What is the Brain’s verdict?
+4. What is the primary edge score?
+5. What direction is supported?
+6. Why?
+7. What are the risks?
+8. What should happen next?
+9. Is there a valid trade plan?
+
+HOME — REQUIRED SECTIONS
+
+Keep or create these sections:
+
+1. Instrument and freshness header
+   - brain.instrument
+   - brain.freshness.price_fresh
+   - brain.freshness.price_age_seconds
+   - brain.generated_at
+
+2. Primary decision
+   - brain.decision.verdict
+   - brain.decision.is_ready
+   - brain.decision.direction
+
+3. Primary edge score
+   - brain.score.value
+   - brain.score.max
+   - brain.score.grade
+
+4. Top reasons
+   - brain.reasons.top
+   - maximum 3 items
+
+5. Top risks
+   - brain.risks.top
+   - maximum 3 items
+
+6. Next action
+   - brain.decision.next_action
+
+7. Trade plan
+   - brain.trade_plan
+   - hidden or replaced with a clear “No actionable trade plan” state when null
+
+MOVE OUT OF HOME
+
+Remove from Home or move to Cockpit navigation/detail views:
+
+- governor component breakdown
+- directional component breakdown
+- raw edge components
+- score adjustments
+- gate debug data
+- strict_score
+- legacy confidence
+- thesis confidence history
+- confidence timeline
+- raw market intelligence internals
+- duplicated reason panels
+- duplicated verdict panels
+- duplicated risk panels
+- developer diagnostics
+- raw alert data
+- backend status/debug blocks
+- repeated instrument labels
+- repeated score gauges
+- repeated next-action text
+
+Do not delete the underlying data or backend fields.
+
+Only remove or hide these items from the Home operator view.
+
+LAYOUT PRINCIPLES
+
+- One primary verdict
+- One primary score
+- One direction
+- One reasons section
+- One risks section
+- One next-action section
+- One trade-plan section
+- No competing confidence numbers
+- No duplicated panels
+- No dashboard-side interpretation
+- No more than one screen of critical information at normal desktop height where practical
+
+VISUAL HIERARCHY
+
+Priority order:
+
+1. Verdict
+2. Edge score
+3. Next action
+4. Trade plan
+5. Reasons
+6. Risks
+7. Freshness
+
+The avatar may remain visually present, but it must not push the primary decision
+below the fold.
+
+The avatar must consume the same brain object and must not independently derive
+or invent market state.
+
+RESPONSIVE BEHAVIOR
+
+Desktop:
+- decision and score prominent at top
+- reasons and risks visible without excessive scrolling
+- trade plan clearly separated
+
+Tablet/mobile:
+- stack sections vertically
+- preserve verdict and score at the top
+- do not hide freshness or risk information
+
+SAFETY STATES
+
+Render clearly for:
+
+- score 0
+- WAIT verdict
+- direction null
+- empty reasons
+- empty risks
+- null trade plan
+- stale price
+- missing optional diagnostics
+- absent brain contract using the existing whole-contract fallback
+
+TESTS
+
+Add or update tests covering:
+
+A. only one primary verdict is rendered on Home
+B. only one primary edge score is rendered on Home
+C. governor confidence is not shown as a competing Home score
+D. strict_score is not shown on Home
+E. legacy confidence is not shown on Home
+F. top reasons render once
+G. top risks render once
+H. next action renders once
+I. null trade plan shows a clear empty state
+J. stale-price state remains visible
+K. score 0 remains visible
+L. direction null does not render a false direction
+M. avatar receives the same brain object without recalculation
+N. Cockpit links or navigation remain functional
+O. no backend or Brain Contract fields are removed
+P. existing Phase 3A dashboard tests still pass
+
+VALIDATION
+
+Run:
+
+- dashboard simplification tests
+- test_brain_dashboard.py
+- test_brain_contract.py
+- test_confidence_integrity.py
+- test_scalp_zone_gate.py
+- node --check
+- py_compile
+- parity
+- scalp_golden
+- breakout_mode smoke
+- dual_sim smoke
+
+REPORT
+
+Return:
+
+1. Exact Home panels removed, hidden, combined, or retained
+2. Before-and-after widget inventory
+3. Screenshots or rendered evidence for:
+   - normal WAIT
+   - actionable trade
+   - score 0
+   - null trade plan
+   - stale price
+   - desktop
+   - mobile
+4. All test results
+5. Confirmation that backend and execution behavior were untouched
+6. Any panel that could not be moved because it is tightly coupled to Cockpit
+
+Do not migrate Cockpit yet.
+Do not remove legacy /status fields.
+Do not add Databento.
+Do not change the Brain Contract.

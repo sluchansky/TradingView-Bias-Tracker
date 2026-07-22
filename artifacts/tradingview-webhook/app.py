@@ -21674,10 +21674,53 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception:
             swing_ctx = None
 
+    # ── Authoritative Edge Score — computed ONCE before build_strict_trade_plan ──
+    # Pre-compute zone flags (pure global reads, identical to the later zone-override
+    # computation) so _analysis_edge_breakdown can apply the hard-block and return the
+    # EXACT score the dashboard will display.  The zone-override logic below re-reads
+    # the same globals; the values are always identical within a single call.
+    _pre_zone_broken = (
+        ZONE_BROKEN_AT is not None
+        and ZONE_BROKEN_AT.get("instrument") in (None, instrument_of(active_ticker))
+    )
+    _pre_mitig_confirmed = bool(confluences.get("zone_mitigated"))
+    _pre_mit_inst = instrument_of(active_ticker)
+    _pre_near_sup_mz, _ = is_near_mitigated_zone(nearest_supply, _pre_mit_inst)
+    _pre_near_dem_mz, _ = is_near_mitigated_zone(nearest_demand, _pre_mit_inst)
+    _pre_zone_mitig_near = (
+        MITIGATED_FLAG_BY_TICKER.get(_pre_mit_inst)
+        and (_pre_near_sup_mz or _pre_near_dem_mz)
+        and not _pre_zone_broken
+        and not _pre_mitig_confirmed
+    )
+    _eb_pre = {
+        "confluences":         confluences,
+        "bias":                bias,
+        "strict_direction":    strict_direction,
+        "strict_label":        strict_label,
+        "verdict":             verdict,
+        "gate_debug":          strict.get("gate_debug"),
+        "last_price_by_type":  last_price_by_type,
+        "nearest_supply":      nearest_supply,
+        "nearest_demand":      nearest_demand,
+        "vwap_value":          vwap_value,
+        "current_price":       current_price,
+        "zone_broken_active":  _pre_zone_broken,
+        "zone_mitigated_near": _pre_zone_mitig_near,
+        "risk_label":          risk_label,
+        "overextended":        overextended,
+        "volatility":          volatility,
+        "session":             session_state,
+        "volume_confirmed":    strict.get("volume_confirmed"),
+        "rvol_adj":            strict.get("rvol_adj"),
+    }
+    _authoritative_eb = _analysis_edge_breakdown(_eb_pre)
+
     if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
-            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value, edge_score=edge_score,
+            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+            edge_score=_authoritative_eb["score"],
             swing_context=swing_ctx,
         )
         if trade_plan["trade_plan"]:
@@ -22167,7 +22210,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # score on EVERY user-facing surface (status, why, alerts, journal, recaps,
     # dashboard, trade management). The legacy value is kept internal-only as a
     # last-resort ranking fallback for old/manual journal entries; never displayed.
-    eb = _analysis_edge_breakdown(result)
+    # _authoritative_eb was computed BEFORE build_strict_trade_plan (above) so the
+    # runner min-edge gate and the dashboard always share the identical number.
+    eb = _authoritative_eb
     result["legacy_edge_score"] = edge_score
     result["edge_breakdown"]    = eb
     result["edge_score"]        = eb["score"]
@@ -39799,6 +39844,141 @@ _STATUS_BUILDING   = {}   # key -> True while a build is running (single-flight 
 _STATUS_CACHE_LOCK = threading.Lock()   # guards the two dicts only — never held during a build
 
 
+def _build_brain_contract(a, generated_at):
+    """Assemble the canonical Brain Output Contract from an already-computed
+    full_analysis result `a`.
+
+    Pure assembly — zero additional scoring, zero gate calls, zero DB queries,
+    no second full_analysis() invocation.  Display-only; never touches the
+    money path.  Fail-open: any assembly error returns a minimal neutral block
+    so _build_status_payload() is never interrupted.
+    """
+    try:
+        verdict   = a.get("verdict") or ""
+        _ready    = bool(is_actionable(verdict))
+        direction = ready_direction(verdict)          # "Long" | "Short" | None
+
+        # ── Edge Score ────────────────────────────────────────────────────
+        eb         = a.get("edge_breakdown") or {}
+        edge_score = int(a.get("edge_score") or 0)
+        edge_grade = a.get("edge_grade") or _grade_for_score(edge_score)
+        components = list(eb.get("components") or [])
+        # Adjustments = negative-point soft modifiers from the score breakdown.
+        # Risk lines (points: None) are not adjustments — they are informational.
+        # Positive-point items are the additive components already reflected in
+        # `components`, so we exclude them here.
+        adjustments = [
+            it for it in (eb.get("score_breakdown") or [])
+            if it.get("points") is not None and int(it.get("points") or 0) < 0
+        ]
+
+        # ── Directional confidence — per-instrument from market_intelligence ─
+        _mi    = a.get("market_intelligence") or {}
+        _dc    = _mi.get("directional_confidence") or {}
+        _long  = float(_dc.get("long")  or 0)
+        _short = float(_dc.get("short") or 0)
+        directional = {
+            "bias":   _dc.get("bias"),
+            "long":   _long,
+            "short":  _short,
+            "margin": round(abs(_long - _short), 4),
+        }
+
+        # ── Confidence governor (supporting diagnostics only) ─────────────
+        _gov = a.get("confidence_governor") or {}
+        supporting_diagnostics = dict(_gov)  # full confidence_governor object
+
+        # ── Reasons / risks (up to 3, unique, non-empty strings) ──────────
+        def _clean(items, limit=3):
+            seen, out = set(), []
+            for it in (items or []):
+                s = str(it).strip() if it is not None else ""
+                if s and s not in seen:
+                    seen.add(s)
+                    out.append(s)
+                    if len(out) == limit:
+                        break
+            return out
+
+        reasons_raw = list(eb.get("reasons") or [])
+        if not reasons_raw:
+            reasons_raw = [str(w) for w in (a.get("why") or []) if w]
+
+        risks_raw = list(eb.get("risks") or [])
+        if not risks_raw:
+            risks_raw = [it.get("label") for it in (eb.get("risk_adjustments") or [])
+                         if it.get("label")]
+
+        # ── Trade plan (null when not actionable) ─────────────────────────
+        trade_plan = a.get("trade_plan") if _ready else None
+
+        # ── Freshness ─────────────────────────────────────────────────────
+        _PRICE_STALE_S  = 120          # 2 min; futures feed alert cadence
+        last_valid_time = a.get("last_valid_time")
+        price_age_s     = None
+        price_fresh     = False
+        if last_valid_time:
+            try:
+                if isinstance(last_valid_time, str):
+                    _lv = datetime.strptime(last_valid_time, "%Y-%m-%dT%H:%M:%SZ")
+                    price_age_s = round((datetime.utcnow() - _lv).total_seconds())
+                elif isinstance(last_valid_time, (int, float)):
+                    price_age_s = round(time.time() - float(last_valid_time))
+                if price_age_s is not None:
+                    price_fresh = 0 <= price_age_s < _PRICE_STALE_S
+            except Exception:
+                pass
+
+        return {
+            "contract_version": "1.0",
+            "instrument":       a.get("active_ticker"),
+            "generated_at":     generated_at,
+
+            "decision": {
+                "verdict":     verdict,
+                "is_ready":    _ready,
+                "direction":   direction,
+                "next_action": a.get("stage_next_step") or a.get("recommendation") or "",
+            },
+
+            "score": {
+                "value":       edge_score,
+                "max":         EDGE_SCORE_MAX,
+                "grade":       edge_grade,
+                "source":      "EDGE_COMPONENTS",
+                "components":  components,
+                "adjustments": adjustments,
+            },
+
+            "directional":            directional,
+            "supporting_diagnostics": supporting_diagnostics,
+
+            "reasons": {
+                "top": _clean(reasons_raw),
+            },
+
+            "risks": {
+                "top": _clean(risks_raw),
+            },
+
+            "trade_plan": trade_plan,
+
+            "freshness": {
+                "price_last_valid_at": last_valid_time,
+                "price_age_seconds":   price_age_s,
+                "price_fresh":         price_fresh,
+            },
+        }
+
+    except Exception as _brain_exc:   # noqa: BLE001
+        return {
+            "contract_version": "1.0",
+            "instrument":       a.get("active_ticker") if isinstance(a, dict) else None,
+            "generated_at":     generated_at,
+            "error":            "contract_build_failed",
+        }
+
+
 def _build_status_payload(_tk):
     """Build the full /status payload dict for one instrument (display-only)."""
     a = full_analysis(ticker_override=_tk)
@@ -39810,6 +39990,9 @@ def _build_status_payload(_tk):
                           "bullish_score": w_bull, "bearish_score": w_bear}
     # Dual-timeframe engine display (DISPLAY-ONLY; lazy-expires; all-None when flag OFF).
     _dtf = _dual_tf_snapshot(a.get("active_ticker"))
+    # Compute once and share between edge_score_generated_at and brain.generated_at
+    # so the two timestamps are identical — both represent payload generation time.
+    _now_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "status":              "running",
         "version":             "11.0",
@@ -39843,8 +40026,13 @@ def _build_status_payload(_tk):
         "why":                 a["why"],
         "bias":                a["bias"],
         "strength":            f"{a['strength']}/10",
-        "confidence":          f"{a['confidence']}%",
+        "legacy_confidence":       f"{a['confidence']}%",
+        "legacy_confidence_valid": False,
         "edge_score":          a["edge_score"],
+        "edge_score_source":        "EDGE_COMPONENTS",
+        "edge_score_instrument":    a.get("active_ticker"),
+        "edge_score_generated_at":  _now_ts,
+        "edge_score_components":    a.get("edge_breakdown"),
         "edge_grade":          a.get("edge_grade"),
         "edge_breakdown":      a.get("edge_breakdown"),
         "conviction_tier":     a.get("conviction_tier"),
@@ -39995,6 +40183,11 @@ def _build_status_payload(_tk):
             compute_market_environment()
             if MARKET_ENVIRONMENT_ENABLED else None
         ),
+        # ── Brain Output Contract (Phase 2) — canonical read-only summary ────
+        # Assembled from `a` (already computed above) — zero second full_analysis()
+        # call.  Display-only; no scoring, gate, execution, or sizing changes.
+        # All existing top-level /status keys remain present for backward compat.
+        "brain": _build_brain_contract(a, _now_ts),
     }
 
 
@@ -44590,6 +44783,10 @@ def dashboard():
   .rec-badge.early-long{background:#10180d;color:#a3e635;border:1px solid #4d7c0f}
   .rec-badge.early-short{background:#180d10;color:#fb923c;border:1px solid #7c4d0f}
   .rec-badge.wait{background:#1f1a0d;color:var(--warn);border:1px solid #5a4a1a}
+  /* Phase 3B: Home-only operator sections */
+  #rec-next-action{font-size:11px;color:#6b7280;text-align:center;letter-spacing:.3px;padding:0 0 6px;line-height:1.4}
+  #rec-fresh-warn{display:none;font-size:11px;color:#f59e0b;text-align:center;padding:4px 8px;border-radius:4px;background:rgba(245,158,11,.08);margin:4px 0}
+  #rec-risks{display:none;font-size:12px;color:#f59e0b;padding:7px 10px;border-radius:5px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.15);margin-top:8px;line-height:1.5}
   #rec-meta{font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.6}
   .rec-gauge{position:relative;width:220px;margin:2px auto 14px;text-align:center}
   .gauge-svg{width:220px;height:auto;display:block;transition:filter .3s}
@@ -45827,8 +46024,13 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
     <span id="rec-badge" class="rec-badge wait">…</span>
   </div>
   <div id="rec-meta"></div>
-  <!-- Trade Probability Gauge (speedometer / RPM style) — fed by /status fields -->
-  <div id="rec-gauge" class="rec-gauge">
+  <!-- Next action (bk.decision.next_action) — operator-essential section (Phase 3B) -->
+  <div id="rec-next-action"></div>
+  <!-- Freshness stale warning (bk.freshness.price_fresh) — Phase 3B -->
+  <div id="rec-fresh-warn"></div>
+  <!-- Trade Probability Gauge — hidden from Home operator view (Phase 3B);
+       renderGauge() still runs so Cockpit reads it normally. -->
+  <div id="rec-gauge" class="rec-gauge" style="display:none">
     <svg viewBox="0 0 200 116" class="gauge-svg" aria-hidden="true">
       <path id="g-band-red"    fill="none" stroke="#ef4444" stroke-width="16"></path>
       <path id="g-band-yellow" fill="none" stroke="#eab308" stroke-width="16"></path>
@@ -45923,6 +46125,8 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] .brain-details
   <div id="rec-checklist" class="rec-checklist"></div>
   <div id="rec-plan" class="rec-plan"></div>
   <div id="rec-reason" class="rec-reason"></div>
+  <!-- Top risks (bk.risks.top) — operator-essential section (Phase 3B) -->
+  <div id="rec-risks"></div>
   <button class="btn btn-apply" id="btn-apply" style="display:none" onclick="applyRec()">⬇️ Use This Setup</button>
   <button class="btn btn-apply" id="btn-copy" style="display:none;margin-top:6px" onclick="copyOrder()">📋 Copy Order</button>
   <div id="send-row" style="display:none;margin-top:6px">
@@ -48644,10 +48848,73 @@ function drawGaugeBands(){
   g.setAttribute('d', gaugeArc(70,100,R));
   gaugeBandsDrawn=true;
 }
+// ── Brain Output Contract helpers (Phase 3A) ─────────────────────────────────
+// All operator-facing decision fields read from data.brain exclusively.
+// When brain is absent (old server / warming cache) buildLegacyFallback() returns
+// a structurally-identical object so render functions need no individual fallbacks.
+function buildLegacyFallback(d) {
+  console.warn('[dashboard] brain contract absent - using legacy fallback');
+  var v   = (d && d.verdict) || 'WAIT';
+  var es  = (d && d.edge_score != null) ? Number(d.edge_score) : 0;
+  var eg  = (d && d.edge_grade) || (d && d.conviction_tier) || '';
+  var tp  = jsIsActionable(v) ? ((d && d.trade_plan) || null) : null;
+  var rd  = jsReadyDir(v);
+  var mi  = (d && d.market_intelligence) || {};
+  var dc  = (mi && mi.directional_confidence) || {};
+  var _l  = parseFloat(dc.long  || 0);
+  var _s  = parseFloat(dc.short || 0);
+  var whyList = (d && d.why) || [];
+  if (!whyList.length && d && d.strict_reason) whyList = [d.strict_reason];
+  var riskList = [];
+  if (d && d.risk_label && d.risk_label !== 'Normal') riskList.push(d.risk_label);
+  if (d && d.risk_detail && d.risk_detail !== d.risk_label) riskList.push(d.risk_detail);
+  if (d && d.overextended) riskList.push('Overextended');
+  return {
+    contract_version: 'legacy',
+    instrument:   (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : null,
+    generated_at: (d && d.edge_score_generated_at) || null,
+    decision: {
+      verdict:     v,
+      is_ready:    jsIsActionable(v),
+      direction:   rd,
+      next_action: (d && d.stage_next_step) || '',
+    },
+    score: {
+      value:       es,
+      max:         110,
+      grade:       eg,
+      components:  [],
+      adjustments: [],
+    },
+    directional: {
+      bias:   dc.bias   || '',
+      long:   _l,
+      short:  _s,
+      margin: Math.abs(_l - _s),
+    },
+    supporting_diagnostics: (d && d.confidence_governor) || {},
+    reasons: {
+      top: whyList.filter(function(x){ return x && String(x).trim(); }).slice(0, 3),
+    },
+    risks: {
+      top: riskList.filter(function(x){ return x && String(x).trim(); }).slice(0, 3),
+    },
+    trade_plan: tp,
+    freshness: {
+      price_last_valid_at: (d && d.last_valid_time) || null,
+      price_age_seconds:   null,
+      price_fresh:         !!(d && d.last_valid_time),
+    },
+  };
+}
+function getBrain(d) {
+  return (d && d.brain) ? d.brain : buildLegacyFallback(d);
+}
 function renderGauge(d){
   var wrap=document.getElementById('rec-gauge');
   if(!wrap) return;
   drawGaugeBands();
+  var bk = getBrain(d);
   var ds=d.decision_support||{};
   // Direction-aware: the meter reflects the SELECTED side (the Long/Short toggle).
   // The favored side's per-side Edge equals the authoritative Edge (parity), so the
@@ -48656,7 +48923,7 @@ function renderGauge(d){
   // probability when per-side data is absent (older server / market closed).
   var blk = (d.directions && d.directions[dir]) ? d.directions[dir] : null;
   var prob = (blk && blk.edge_score!=null) ? blk.edge_score
-           : (ds.probability!=null ? ds.probability : (d.edge_score!=null ? d.edge_score : 0));
+           : (ds.probability!=null ? ds.probability : bk.score.value);
   prob = Math.max(0, Math.min(100, Number(prob)||0));
   // Needle: value 0 -> -90deg (left), 50 -> 0deg (up), 100 -> +90deg (right).
   var needle=document.getElementById('g-needle');
@@ -48669,7 +48936,7 @@ function renderGauge(d){
   // can't contradict the needle); favored side matches the header by parity. Falls
   // back to authoritative quality / conviction tier when per-side data is absent.
   var quality = (blk && blk.edge_score!=null) ? jsQualityForScore(blk.edge_score)
-              : (ds.quality || d.conviction_tier || '—');
+              : (ds.quality || bk.score.grade || '—');
   var confEl=document.getElementById('g-conf');
   if(confEl) confEl.textContent = quality;
   // Direction indicator = the side you're viewing (the meter is per-side now).
@@ -48689,7 +48956,7 @@ function renderGauge(d){
   // Deep-green glow only when VIEWING the actionable side at high conviction (full
   // READY + the ready direction + green band) — never on the non-favored side.
   var hi = (quality==='HIGH');
-  wrap.classList.toggle('glow', !!(hi && jsIsFullReady(d.verdict) && jsReadyDir(d.verdict)===dir && prob>=70));
+  wrap.classList.toggle('glow', !!(hi && jsIsFullReady(bk.decision.verdict) && bk.decision.direction===dir && prob>=70));
 }
 
 // ── Diagnostics modules (5) — all DISPLAY-ONLY, fed by alert_diagnostics ──────
@@ -48715,6 +48982,7 @@ function gaugeColor(v,prob){
 }
 function renderModules(d){
   if (!d) return;
+  var bk = getBrain(d);
   renderMainBrain(d);
   try{ renderAiDecisionCenter(d); }catch(e){}
   try{ renderAnalysisGroups(d); }catch(e){}
@@ -48722,7 +48990,7 @@ function renderModules(d){
   try{ renderControlsGroups(d); }catch(e){}
   try{ renderBLPanels(d); }catch(e){}
   window._mscPageData = d;
-  var _mscMainInst = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '';
+  var _mscMainInst = bk.instrument ? String(bk.instrument).replace('1!','') : '';
   renderMscInstPills(_mscMainInst);
   if (mscInst && mscInst !== _mscMainInst) { refreshMscPanel(); } else { renderMicroScalp(d); }
   renderMainBrainCognitive(d);
@@ -48732,8 +49000,8 @@ function renderModules(d){
   try{ renderMarketEnv(d); }catch(e){}
   try{ renderDecisionPipeline(d); }catch(e){}
   const diag   = d.alert_diagnostics || {};
-  const v      = d.verdict || 'WAIT';
-  const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:(d.edge_score||0))));
+  const v      = bk.decision.verdict || 'WAIT';
+  const prob   = Math.max(0, Math.min(100, Number(diag.edge_score!=null?diag.edge_score:bk.score.value)));
   const longS  = Number(diag.long_score||0);
   const shortS = Number(diag.short_score||0);
   const gap    = Number(diag.conflict_gap!=null?diag.conflict_gap:Math.abs(longS-shortS));
@@ -49355,6 +49623,7 @@ var _AV_TL = {greeting:1, market_open:1, ready:1, trade_opened:1, trade_closed:1
 
 // ── Snapshot extractor ────────────────────────────────────────────────────
 function _avExtract(d){
+  var bk   = getBrain(d);
   var mb   = (d && d.main_brain) || {};
   var diag = (d && d.alert_diagnostics) || {};
   var dom  = diag.dominant_direction || '';
@@ -49364,15 +49633,15 @@ function _avExtract(d){
   var confRaw = (d && d.confidence) || '0';
   return {
     sk:          mbDeriveState(mb),
-    verdict:     (d && d.verdict)    || '',
-    edge:        Number((d && d.edge_score) || 0),
-    grade:       (d && d.edge_grade) || '',
+    verdict:     bk.decision.verdict || '',
+    edge:        Number(bk.score.value),
+    grade:       bk.score.grade || '',
     confidence:  parseInt(confRaw, 10) || 0,
     opened_at:   (at && at.opened_at) || null,
     has_trade:   !!(at && at.direction),
     trade_dir:   (at && at.direction) || '',
     trade_r:     (at && at.current_r != null) ? parseFloat(at.current_r) : null,
-    inst:        (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : '',
+    inst:        bk.instrument ? String(bk.instrument).replace('1!','') : '',
     market_open: (d && d.market_open !== false),
     bias:        (d && d.bias)           || '',
     session:     (d && d.session)        || '',
@@ -50225,6 +50494,7 @@ const ORB_CLASS_MAP = {
 };
 function renderMBAvatar(mb, d){
   const sk = mbDeriveState(mb);
+  const bk = getBrain(d);
   const pal = MB_STATE_PALETTE[sk] || MB_STATE_PALETTE.OBSERVING;
   const stColor = MB_STATE_COLOR[sk] || '#888888';
 
@@ -50247,7 +50517,7 @@ function renderMBAvatar(mb, d){
   const ctxEl = document.getElementById('mb-av-ctx');
   if(ctxEl){
     var ctxText = '', ctxColor = '#6b7280';
-    var tp       = d && d.trade_plan;
+    var tp       = bk.trade_plan;
     var miss     = (d && d.strict_missing) || '';
     var reason   = (d && d.strict_reason)  || '';
     var prog     = mb && (mb.setup_progress != null ? mb.setup_progress : null);
@@ -50258,7 +50528,7 @@ function renderMBAvatar(mb, d){
       ctxColor = '#22c55e';
       if(tp && tp.entry != null)
         ctxText = 'Entry ' + tp.entry + ' · Stop ' + tp.stop + (tp.target1 != null ? ' · T1 ' + tp.target1 : '');
-      else ctxText = (d && d.verdict) ? d.verdict : 'Setup confirmed';
+      else ctxText = bk.decision.verdict ? bk.decision.verdict : 'Setup confirmed';
 
     } else if(sk === 'MANAGING'){
       ctxColor = '#38bdf8';
@@ -50284,7 +50554,7 @@ function renderMBAvatar(mb, d){
     } else if(sk === 'HUNTING'){
       ctxColor = '#f59e0b';
       if(prog != null) ctxText = 'Setup ' + prog + '% · building';
-      else if(d && d.stage_next_step) ctxText = d.stage_next_step;
+      else if(bk.decision.next_action) ctxText = bk.decision.next_action;
       else ctxText = 'Scanning for entry…';
 
     } else if(sk === 'WAITING'){
@@ -50303,7 +50573,7 @@ function renderMBAvatar(mb, d){
 
   // ── Footer meta ──
   const mktEl = document.getElementById('mb-av-market');
-  if(mktEl) mktEl.textContent = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : (sym || '—');
+  if(mktEl) mktEl.textContent = bk.instrument ? String(bk.instrument).replace('1!','') : (sym || '—');
   const modeEl = document.getElementById('mb-av-mode');
   if(modeEl) modeEl.textContent = mbGetMode();
   const verdEl = document.getElementById('mb-av-verdict');
@@ -50662,7 +50932,7 @@ function renderMainBrain(d){
   const mod = document.getElementById('mod-brain');
   if(!mod) return;
   const mb = (d && d.main_brain) || null;
-  const symKey = (d && d.active_ticker) ? String(d.active_ticker).replace('1!','') : (sym || '—');
+  const symKey = getBrain(d).instrument || sym || '—';
   const status = (mb && mb.status) || 'WATCHING';
   const badge = document.getElementById('mb-badge');
   if(badge){ badge.textContent = status; badge.style.background = MB_BADGE_COLORS[status] || '#6b7280'; }
@@ -53583,8 +53853,9 @@ function cpSetTf(t){ cpTf=t; cpApply(); }
 function cpToggleFollow(){ cpFollow=!cpFollow; cpApply(); }
 function renderChartPreview(d){
   try {
-    if (cpFollow && d && jsIsActionable(d.verdict)){
-      const inst=String(d.active_ticker||'').replace('1!','');
+    const bk = getBrain(d);
+    if (cpFollow && d && jsIsActionable(bk.decision.verdict)){
+      const inst=String(bk.instrument||'').replace('1!','');
       if (inst && CP_TV_SYMBOLS[inst]) cpSym=inst;
     }
   } catch(e){}
@@ -53595,7 +53866,7 @@ cpApply();
 function renderTodaysTrades(d){
   ttLastMainD = d;
   ttPaintButtons();
-  const mainInst=(d&&d.active_ticker)?String(d.active_ticker).replace('1!',''):sym;
+  const mainInst=getBrain(d).instrument||sym;
   // Log pinned to a different pair than the main view → drive it from its own
   // /status fetch and do NOT clobber it with the main payload.
   if (ttInst && ttInst!==mainInst){ ttFetchOverride(); return; }
@@ -54062,12 +54333,13 @@ async function refreshRec() {
     const d = await api('/status?ticker='+encodeURIComponent(sym));
     lastRec = d;
     if (d.trading_mode) paintMode(d.trading_mode);
+    const bk = getBrain(d);
     const badge = document.getElementById('rec-badge');
     const meta  = document.getElementById('rec-meta');
     const card  = document.getElementById('rec-card');
 
     // ── Authoritative header (the system's single call) — toggle-independent ──
-    const v = d.verdict || 'WAIT';
+    const v = bk.decision.verdict || 'WAIT';
 
     // Market closed (CME/COMEX hours) — show a paused banner instead of WAIT, and
     // skip the live-setup rendering below. Live alerts resume on the next open.
@@ -54075,11 +54347,11 @@ async function refreshRec() {
       badge.textContent = 'MARKET CLOSED';
       badge.className = 'rec-badge wait';
       card.style.borderColor = '#3a3a52';
-      const inst = d.active_ticker ? String(d.active_ticker).replace('1!','') : 'MNQ/MGC';
+      const inst = bk.instrument || 'MNQ/MGC';
       const no = d.next_open ? ' &nbsp;·&nbsp; Next open: <b style="color:#e8e8f0">'+d.next_open+'</b>' : '';
       const lv = (d.last_valid_price!=null)
         ? '<br>Last valid data: <b style="color:#e8e8f0">'+d.last_valid_price+'</b>'
-          + (d.last_valid_time ? ' <span style="color:#6b7280;font-size:11px">('+d.last_valid_time+')</span>' : '')
+          + (bk.freshness.price_last_valid_at ? ' <span style="color:#6b7280;font-size:11px">('+bk.freshness.price_last_valid_at+')</span>' : '')
         : '';
       meta.innerHTML = '<b style="color:#ff5fb0">'+inst+'</b> &nbsp;·&nbsp; '
         + '<b style="color:#f59e0b">🌙 Live alerts paused</b>' + no + lv;
@@ -54104,7 +54376,7 @@ async function refreshRec() {
       : v==='LONG EARLY READY'?'#26301b':v==='SHORT EARLY READY'?'#301b1b'
       : '#1e1e32';
 
-    const inst  = d.active_ticker ? String(d.active_ticker).replace('1!','') : '—';
+    const inst  = bk.instrument || '—';
     const _pval = d.display_price!=null ? d.display_price
                 : (d.current_price!=null ? d.current_price : null);
     const price = _pval!=null ? _pval : '—';
@@ -54142,13 +54414,40 @@ async function refreshRec() {
     }
     meta.innerHTML = '<b style="color:#ff5fb0">'+inst+'</b> &nbsp;·&nbsp; Price <b style="color:#e8e8f0">'+price+'</b>'+psrc+' &nbsp;·&nbsp; VWAP <b style="color:#e8e8f0">'+vwap+'</b> &nbsp;·&nbsp; '+sess+volTxt+lvlTxt+convTxt;
 
+    // ── Next action (bk.decision.next_action) — Phase 3B operator-essential section ──
+    var naEl = document.getElementById('rec-next-action');
+    if (naEl) {
+      var na = bk.decision.next_action || '';
+      if (na) { naEl.textContent = '\u27A4 ' + na; naEl.style.display = ''; }
+      else { naEl.style.display = 'none'; naEl.textContent = ''; }
+    }
+    // ── Freshness stale warning (bk.freshness.price_fresh) — Phase 3B ─────────────
+    var fwEl = document.getElementById('rec-fresh-warn');
+    if (fwEl) {
+      var pf = !(bk.freshness && bk.freshness.price_fresh === false);
+      var pa = bk.freshness ? (Number(bk.freshness.price_age_seconds) || 0) : 0;
+      if (!pf || pa > 120) {
+        fwEl.innerHTML = '\u26A0\uFE0F Price data stale' + (pa > 0 ? ' \u00b7 ' + pa + 's ago' : '');
+        fwEl.style.display = '';
+      } else { fwEl.style.display = 'none'; fwEl.innerHTML = ''; }
+    }
+
     // Trade probability gauge — fed by the authoritative /status fields.
     renderGauge(d);
+    // ── Top risks (bk.risks.top) — Phase 3B operator-essential section ─────────────
+    var rkEl = document.getElementById('rec-risks');
+    if (rkEl) {
+      var rks = (bk.risks && bk.risks.top) ? bk.risks.top.slice(0, 3) : [];
+      if (rks.length) {
+        rkEl.innerHTML = '\u26A0 ' + rks.map(function(r){ return _modEsc(r); }).join(' &nbsp;\u00b7&nbsp; ');
+        rkEl.style.display = '';
+      } else { rkEl.style.display = 'none'; rkEl.innerHTML = ''; }
+    }
     renderModules(d);
 
     // Mark the recommended toggle button (the system's actionable side, incl. EARLY
     // READY) — display-only hint, no auto-switch.
-    const readyDir = jsReadyDir(v);
+    const readyDir = bk.decision.direction;
     const lb = document.querySelector('.dir-btn.long');
     const sb = document.querySelector('.dir-btn.short');
     if (lb) lb.classList.toggle('rec', readyDir==='Long');
@@ -54225,9 +54524,9 @@ var _liveNavSections = {
   // Quick status: sensitivity, current verdict, active trade summary, HV windows
   overview: [
     'mod-brain',          // Main Brain compact hub
-    'mod-data-feed',      // Data Feed / Sensitivity / Mode
     'mod-real-results',   // Real Account Results
     'mod-hvsessions'      // High-Volume Session Windows
+    // mod-data-feed moved to analysis section (Phase 3B: raw alert data is diagnostic)
   ],
   // Brain: ONE consolidated AI Decision Center card
   brain: [
@@ -54236,6 +54535,7 @@ var _liveNavSections = {
   // Market analysis: primary group view + detail panels (visible with Advanced ON)
   analysis: [
     'mod-analysis-groups',// Primary: 5-section grouped evidence view
+    'mod-data-feed',      // Data Feed / alert timing (moved from overview Phase 3B)
     'mod-chartprev',      // Live Chart Preview
     'mod-cvd',            // Volume Delta (CVD) & RVOL
     'mod-mi',             // Market Intelligence (structure / supply-demand)
@@ -54359,15 +54659,15 @@ function _adcEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/
 function renderAiDecisionCenter(d) {
   var mod = document.getElementById('mod-ai-decision-center');
   if (!mod) return;
-  var v   = (d && d.verdict) || 'WAIT';
+  var bk  = getBrain(d);
+  var v   = bk.decision.verdict || 'WAIT';
   var ea  = (d && d.alert_diagnostics) || {};
-  var edge = (d && d.edge_score != null) ? d.edge_score
-           : (ea.edge_score != null) ? ea.edge_score : null;
+  var edge = bk.score.value;
   var se  = (d && d.strategy_engine) || {};
   var a   = (d && d.analyst) || {};
   var pr  = (d && d.pro_review) || {};
   var eq  = (d && d.entry_quality) || {};
-  var cg  = (d && d.confidence_governor) || {};
+  var cg  = bk.supporting_diagnostics || {};
   var tm  = (d && d.trade_memory) || {};
   var ms  = (d && d.main_brain && d.main_brain.micro_scalp) ? d.main_brain.micro_scalp : {};
   var td  = (d && d.trade_debate) || {};
@@ -54404,7 +54704,7 @@ function renderAiDecisionCenter(d) {
     stEl.style.color=se.active_strategy?(sdir==='Long'?'#22c55e':sdir==='Short'?'#ef4444':'#e8e8f0'):'#6b7280';
   }
   var reasonEl=document.getElementById('adc-reason');
-  if (reasonEl) reasonEl.textContent=(d&&d.strict_reason)||(a&&a.market_story)||(d&&d.reason)||'Awaiting signal data.';
+  if (reasonEl) reasonEl.textContent=(bk.reasons.top&&bk.reasons.top.length?bk.reasons.top[0]:'')||(a&&a.market_story)||'Awaiting signal data.';
   var eqInEl=document.getElementById('adc-eq-inline');
   if (eqInEl) {
     if (eq.engine_enabled&&eq.grade) {
@@ -55237,6 +55537,7 @@ function hvsUpdateFromStatus(d) {
 function renderDirView() {
   if (!lastRec) return;
   const d = lastRec;
+  const bk = getBrain(d);
   const bar    = document.getElementById('rec-score-bar');
   const num    = document.getElementById('rec-score-num');
   const list   = document.getElementById('rec-checklist');
@@ -55281,25 +55582,14 @@ function renderDirView() {
     ckItem('Price '+(isShort?'< ':'> ')+'VWAP', !!ck.vwap) +
     ckItem('Edge Score \u2265 '+_thr, !!ck.edge);
 
-  // Raw gate debug — exact per-condition booleans driving the verdict.
+  // gate_debug needed by edge threshold below; raw per-condition display moved to Cockpit (Phase 3B).
   const gd = (blk && blk.gate_debug) ? blk.gate_debug : null;
-  if (gd) {
-    const yn = v => v ? '\u2713' : '\u2717';
-    const fails = (gd.failed_conditions && gd.failed_conditions.length)
-                ? gd.failed_conditions.join(', ') : 'none';
-    list.innerHTML +=
-      '<div style="margin-top:8px;padding-top:6px;border-top:1px solid #1e1e32;' +
-      'font-size:11px;line-height:1.5;color:#6b7280;font-family:ui-monospace,monospace">' +
-      'debug · zone_valid '+yn(gd.zone_valid)+' · vwap_confirmed '+yn(gd.vwap_confirmed)+
-      ' · structure_confirmed '+yn(gd.structure_confirmed)+' · candle_confirmed '+yn(gd.candle_confirmed)+
-      '<br>edge_score '+(gd.edge_score!=null?gd.edge_score:0)+'/'+EDGE_MAX+' · failed_conditions: '+fails+'</div>';
-  }
 
   // Per-direction Edge Score.
   const score = blk && blk.edge_score!=null ? blk.edge_score
-              : (d.edge_score!=null ? d.edge_score : 0);
+              : bk.score.value;
   const grade = blk && blk.edge_grade ? ' · ' + blk.edge_grade
-              : (d.edge_grade ? ' · ' + d.edge_grade : '');
+              : (bk.score.grade ? ' · ' + bk.score.grade : '');
   const label = blk ? (blk.label || 'WAIT') : (d.strict_label || 'WAIT');
   const met   = blk && blk.met!=null ? ' · ' + blk.met + '/4' : '';
   bar.style.width = Math.max(0, Math.min(100, score / EDGE_MAX * 100)) + '%';
@@ -55346,8 +55636,8 @@ function renderDirView() {
 
   // Trade plan + Apply only when the SELECTED side is the system's actionable side
   // (full READY or EARLY READY).
-  const readyDir = jsReadyDir(d.verdict);
-  const tp = d.trade_plan || {};
+  const readyDir = bk.decision.direction;
+  const tp = bk.trade_plan || {};
   const pp = (blk && blk.potential_plan) ? blk.potential_plan : null;
   const planRow = (p) =>
       'Entry <b>'+p.entry_zone+'</b> &nbsp;·&nbsp; Stop Loss <b>'+p.stop_loss+'</b><br>' +
@@ -55371,7 +55661,7 @@ function renderDirView() {
     // Send controls only when the snapshot is for the selected instrument — hides the
     // button during the brief stale window right after a symbol toggle.
     if (sendRow) {
-      const recInst = String(d.active_ticker || '').replace('1!','');
+      const recInst = bk.instrument || '';
       sendRow.style.display = (d.execution_enabled && recInst === sym) ? 'block' : 'none';
     }
   } else if (pp && pp.trade_plan) {
@@ -55385,7 +55675,7 @@ function renderDirView() {
     // Re-anchor the four preview prices to the LIVE price every 30s so they visibly
     // track the market (the server plan is zone-anchored, so it otherwise looks
     // frozen). Geometry is preserved; the broker path never reads this preview.
-    const ppInst = (d.active_ticker||'').toString().replace('1!','') || sym;
+    const ppInst = bk.instrument || sym;
     const la = _liveAnchoredPotential(pp, dir, ppInst);
     const shown = la.anchored ? la.plan : pp;
     const anchNote = la.anchored
@@ -55396,7 +55686,7 @@ function renderDirView() {
     // the deployment enabled it, execution is configured, and the snapshot is for the
     // instrument on screen. Sends the SERVER pp stop (not the live-anchored copy) for
     // the drift guard. Hidden by default (user_preview_enabled=false).
-    const _recInstP = String(d.active_ticker || '').replace('1!','');
+    const _recInstP = String(bk.instrument || '');
     const _canTake = !!(d.user_preview_enabled && d.execution_enabled && _recInstP === sym
                         && pp.stop_loss!=null && pp.target1!=null && pp.stop_valid!==false);
     const _takeBtn = _canTake
@@ -55424,19 +55714,20 @@ function renderDirView() {
   }
 
   // Reason for the selected side; nudge to the ready side when viewing the other.
-  let txt = (blk && blk.reason) ? blk.reason : (d.strict_reason || '');
+  let txt = (blk && blk.reason) ? blk.reason : (bk.reasons.top && bk.reasons.top.length ? bk.reasons.top[0] : '');
   if (readyDir && readyDir !== dir) {
-    txt = '↪ System says ' + d.verdict + ' — switch to ' + readyDir + ' for the live setup.  ' + txt;
+    txt = '↪ System says ' + bk.decision.verdict + ' — switch to ' + readyDir + ' for the live setup.  ' + txt;
   }
   reason.textContent = txt;
 }
 
 function applyRec() {
   if (!lastRec) return;
-  const tp = lastRec.trade_plan || {};
-  const dirReady = jsReadyDir(lastRec.verdict);
+  const bk = getBrain(lastRec);
+  const tp = bk.trade_plan || {};
+  const dirReady = bk.decision.direction;
   if (!dirReady || !tp.trade_plan) { toast('No ready setup to apply', false); return; }
-  const inst = (lastRec.active_ticker||'').toString().replace('1!','');
+  const inst = bk.instrument || '';
   if (INSTRUMENTS.indexOf(inst) !== -1) setSymbol(inst);
   setDir(dirReady);
   if (tp.entry_zone) {
@@ -57072,8 +57363,8 @@ async function pickCleanestSetup(force, actionableOnly){
       const cand = {
         s:    r.s,
         d:    r.d,
-        act:  jsIsActionable(r.d.verdict) ? 1 : 0,
-        edge: num(r.d.edge_score)
+        act:  jsIsActionable(getBrain(r.d).decision.verdict) ? 1 : 0,
+        edge: getBrain(r.d).score.value
       };
       if (!best){ best = cand; return; }
       const better = (cand.act !== best.act) ? (cand.act > best.act)
@@ -57085,7 +57376,7 @@ async function pickCleanestSetup(force, actionableOnly){
     // actionable (all WAIT) leave the current view put instead of hopping between WAITs.
     // The manual button (actionableOnly falsy) still jumps to the best of whatever exists.
     if (actionableOnly && !best.act) return null;
-    let bdir = jsReadyDir(best.d.verdict);            // ready side when actionable
+    let bdir = getBrain(best.d).decision.direction;   // ready side when actionable
     if (!bdir){                                       // else the higher per-side edge
       bdir = (num(best.d.short_score) > num(best.d.long_score)) ? 'Short' : 'Long';
     }
@@ -57316,12 +57607,13 @@ function toggleAdvPanels(){
 
 function renderBLPanels(d){
   if(!d) return;
-  var v    = d.verdict || 'WAIT';
-  var edge = Number(d.edge_score || 0);
-  var grade= d.edge_grade || '\u2014';
+  var bk   = getBrain(d);
+  var v    = bk.decision.verdict || 'WAIT';
+  var edge = Number(bk.score.value);
+  var grade= bk.score.grade || '\u2014';
   var mode = String(d.market_mode || d.mode || '\u2014').toUpperCase();
-  var inst = String(d.active_ticker || d.instrument || '').replace('1!','');
-  var tp   = d.trade_plan || {};
+  var inst = String(bk.instrument || '').replace('1!','');
+  var tp   = bk.trade_plan || {};
   var at   = d.active_trade || null;
   var diag = d.alert_diagnostics || {};
 
@@ -57374,7 +57666,7 @@ function renderBLPanels(d){
     else if(v==='INVALIDATED'||v==='BLOCKED') vc='#ef4444';
     vEl.textContent=v; vEl.style.color=vc;
   }
-  if(gEl){ gEl.textContent='Grade: '+grade+' \u00b7 '+edge+'/110'; }
+  if(gEl){ gEl.textContent='Grade: '+grade+' \u00b7 '+edge+'/'+bk.score.max; }
   if(edEl){ edEl.textContent=edge; }
   if(fEl){
     var pct=Math.min(100,Math.round(edge/110*100));
@@ -57385,7 +57677,7 @@ function renderBLPanels(d){
   if(dEl){ dEl.textContent=favDir; }
   if(mEl){ mEl.textContent=mode; }
   if(rEl){
-    var reason=(d.strict_reason||d.strict_missing||'');
+    var reason=(bk.reasons.top&&bk.reasons.top.length?bk.reasons.top[0]:'');
     rEl.textContent=reason?(reason.split('.')[0]):'';
   }
 
@@ -57433,13 +57725,17 @@ function renderBLPanels(d){
     }
   }
 
-  // Risk panel
+  // Risk panel — top risks (bk.risks.top) + prop guard (Phase 3B: risks.top added)
   var riskEl=document.getElementById('blrisk-body');
   if(riskEl){
+    var topRisks=(bk.risks&&bk.risks.top&&bk.risks.top.length)?bk.risks.top.slice(0,3):[];
     var pg=d.prop_guard||d.prop||{};
     var losses=pg.daily_losses!=null?Number(pg.daily_losses):(d.daily_losses!=null?Number(d.daily_losses):null);
     var maxL=pg.max_losses_per_day!=null?Number(pg.max_losses_per_day):(d.max_losses_per_day!=null?Number(d.max_losses_per_day):null);
     var rows3=[];
+    if(topRisks.length){
+      rows3.push(['Risks','<span style="color:#f59e0b">'+topRisks.map(function(r){return _modEsc(r);}).join(' \u00b7 ')+'</span>']);
+    }
     if(losses!=null&&maxL!=null){
       var lc=losses>=(maxL-1)?'#ef4444':losses>=(maxL/2)?'#eab308':'#22c55e';
       rows3.push(['Daily losses','<span style="color:'+lc+'">'+losses+' / '+maxL+'</span>']);

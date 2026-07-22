@@ -260,13 +260,13 @@ def _run_early(mode):
 
     saved_mode = app.TRADING_MODE
     saved_enabled = app.EARLY_ALERTS_ENABLED
-    saved_active = app.ACTIVE_TRADE
+    saved_active = dict(app.ACTIVE_TRADES_BY_INST)
     saved_eet = dict(app.EARLY_EVENT_TIMES)
     saved_anchor = dict(app.LAST_EARLY_ANCHOR)
     saved_at = dict(app.LAST_EARLY_AT)
     app.TRADING_MODE = mode
     app.EARLY_ALERTS_ENABLED = True
-    app.ACTIVE_TRADE = None
+    app.ACTIVE_TRADES_BY_INST.pop("MGC", None)
     app.LAST_EARLY_ANCHOR.clear()
     app.LAST_EARLY_AT.clear()
     ts = app.now_utc()
@@ -290,7 +290,8 @@ def _run_early(mode):
     finally:
         app.TRADING_MODE = saved_mode
         app.EARLY_ALERTS_ENABLED = saved_enabled
-        app.ACTIVE_TRADE = saved_active
+        app.ACTIVE_TRADES_BY_INST.clear()
+        app.ACTIVE_TRADES_BY_INST.update(saved_active)
         for k, v in saved.items():
             setattr(app, k, v)
         app.EARLY_EVENT_TIMES.clear()

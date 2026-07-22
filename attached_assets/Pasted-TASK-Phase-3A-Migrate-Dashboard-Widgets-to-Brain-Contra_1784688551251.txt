@@ -1,0 +1,254 @@
+TASK: Phase 3A — Migrate Dashboard Widgets to Brain Contract
+
+OBJECTIVE
+
+Make the existing dashboard consume the canonical data.brain contract for all
+operator-facing decision information.
+
+This phase is a data-binding migration only.
+
+Do not redesign, remove, combine, move, or restyle dashboard panels yet.
+
+Do not change backend scoring, thresholds, gates, execution, sizing, alerts,
+database behavior, or strategy logic.
+
+SOURCE-OF-TRUTH RULE
+
+For migrated operator-facing fields, dashboard JavaScript must read from:
+
+data.brain
+
+Do not independently calculate or reinterpret:
+
+- verdict
+- readiness
+- direction
+- edge score
+- edge grade
+- reasons
+- risks
+- next action
+- trade plan
+- freshness
+
+MIGRATE THESE BINDINGS
+
+1. Instrument
+Current source:
+data.active_ticker
+
+New source:
+data.brain.instrument
+
+2. Verdict
+Current source:
+data.verdict and related fallback fields
+
+New source:
+data.brain.decision.verdict
+
+3. Readiness
+New source:
+data.brain.decision.is_ready
+
+4. Direction
+Current mixed sources:
+strict_direction, dominant_direction, bias, plan direction
+
+New source:
+data.brain.decision.direction
+
+5. Primary score
+Current source:
+data.edge_score and any gauge fallbacks
+
+New source:
+data.brain.score.value
+
+6. Score maximum
+New source:
+data.brain.score.max
+
+Do not hardcode 100 or 110 in dashboard rendering when brain.score.max exists.
+
+7. Grade
+Current source:
+edge_grade or conviction_tier
+
+New source:
+data.brain.score.grade
+
+8. Score components
+Current source:
+edge_breakdown or edge_score_components
+
+New source:
+data.brain.score.components
+
+9. Score adjustments
+New source:
+data.brain.score.adjustments
+
+10. Top reasons
+Current mixed sources:
+why, strict_reason, recommendation, ready_reason, opportunity_reason
+
+New source:
+data.brain.reasons.top
+
+11. Top risks
+Current mixed sources:
+risk_label, risk_detail, overextended, volatility
+
+New source:
+data.brain.risks.top
+
+12. Next action
+Current mixed sources:
+action, recommendation, stage_next_step
+
+New source:
+data.brain.decision.next_action
+
+13. Trade plan
+Current source:
+data.trade_plan or nested recommendation state
+
+New source:
+data.brain.trade_plan
+
+14. Freshness
+Current sources:
+last_valid_time, edge_score_generated_at
+
+New sources:
+data.brain.freshness.price_last_valid_at
+data.brain.freshness.price_age_seconds
+data.brain.freshness.price_fresh
+data.brain.generated_at
+
+15. Directional diagnostics
+Current source:
+data.market_intelligence.directional_confidence
+
+New source:
+data.brain.directional
+
+16. Governor diagnostics
+Current source:
+data.confidence_governor
+
+New source:
+data.brain.supporting_diagnostics
+
+SCOPE
+
+Apply this migration to the existing Home/dashboard operator-facing widgets.
+
+Do not migrate developer-only diagnostics that are not represented in the Brain
+Contract.
+
+Do not modify Cockpit yet unless Home and Cockpit share the exact same rendering
+function and separating them would create duplicate logic. Report any such case
+before broadening scope.
+
+BACKWARD-COMPATIBILITY FALLBACK
+
+During Phase 3A, a temporary fallback to existing top-level fields is allowed
+only when data.brain is entirely absent.
+
+Example:
+
+const brain = data.brain || buildLegacyFallback(data);
+
+Do not use individual mixed fallbacks such as:
+
+brain.score.value || data.edge_score
+
+because valid values such as 0, false, null, or empty lists must not fall through.
+
+When data.brain exists, all migrated widgets must use it exclusively.
+
+Add a clear console warning when the whole-contract legacy fallback is used.
+
+NO CLIENT-SIDE REINTERPRETATION
+
+Dashboard JavaScript must not:
+
+- derive a different verdict
+- convert WAIT into READY
+- choose direction from another field
+- recalculate scores
+- merge additional reasons
+- manufacture risks
+- display a trade plan when brain.trade_plan is null
+
+DASHBOARD SAFETY
+
+Handle safely:
+
+- score value 0
+- governor confidence 0
+- direction null
+- trade_plan null
+- empty reasons
+- empty risks
+- stale price
+- missing optional diagnostics
+
+Do not treat 0 or false as missing.
+
+TESTS
+
+Add or update dashboard tests covering:
+
+A. Home renders from data.brain when present
+B. conflicting top-level edge_score does not override brain.score.value
+C. conflicting top-level verdict does not override brain.decision.verdict
+D. score value 0 renders correctly
+E. WAIT with direction null renders correctly
+F. trade_plan null hides or clears the plan display
+G. at most three brain reasons render
+H. at most three brain risks render
+I. stale-price state uses brain.freshness
+J. directional diagnostics use brain.directional
+K. governor diagnostics use brain.supporting_diagnostics
+L. legacy fallback occurs only when the complete brain object is absent
+M. no dashboard scoring or verdict calculation is introduced
+N. existing smoke and syntax tests continue to pass
+
+VALIDATION
+
+Run:
+
+- dashboard-specific tests
+- node --check
+- py_compile
+- test_brain_contract.py
+- test_confidence_integrity.py
+- test_scalp_zone_gate.py
+- parity
+- scalp_golden
+- breakout_mode smoke
+- dual_sim smoke
+
+REPORT
+
+Return:
+
+1. Exact dashboard functions and widgets changed
+2. Before → after source mapping for each migrated widget
+3. Any widget still reading legacy decision fields and why
+4. Tests and validation results
+5. Screenshots or rendered-state evidence for:
+   - normal WAIT
+   - score 0
+   - null trade plan
+   - stale price
+6. Confirmation that layout and styling were not intentionally changed
+
+Do not simplify the dashboard layout yet.
+Do not remove panels yet.
+Do not migrate Cockpit broadly yet.
+Do not remove legacy /status fields.
+Do not add Databento.
