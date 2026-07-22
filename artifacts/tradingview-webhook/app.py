@@ -45141,6 +45141,16 @@ def dashboard():
   .mbs-pill{font-size:10px;font-weight:700;letter-spacing:.6px;padding:2px 6px;border-radius:5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
   #mbs-reason{font-size:11px;color:#9ca3af;line-height:1.45;margin-top:6px;padding:6px 8px;background:rgba(239,68,68,.06);border-radius:6px;border-left:2px solid rgba(239,68,68,.25)}
   #mbs-stale-warn{font-size:11px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:5px 8px;margin-top:8px;display:none}
+  #mbs-narrative{font-size:12px;color:#a8b4d0;line-height:1.55;margin:8px 0 6px;min-height:18px}
+  #mbs-next-wrap{margin:6px 0;display:none}
+  #mbs-next-lbl{font-size:9px;color:#4b5563;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+  #mbs-next-action{font-size:11px;color:#c8d0f0;font-weight:600}
+  #mbs-inv-wrap{margin:6px 0;display:none}
+  #mbs-inv-lbl{font-size:9px;color:rgba(239,68,68,.6);letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+  #mbs-invalidation{font-size:11px;color:#fca5a5}
+  .mbs-controls{display:flex;gap:8px;margin-top:10px}
+  .mbs-ctrl-btn{flex:1;padding:7px 10px;border-radius:8px;border:1px solid rgba(100,120,255,.22);background:rgba(100,120,255,.08);color:#a8b4d0;font-size:11px;font-weight:600;letter-spacing:.4px;cursor:pointer;text-align:center;transition:background .2s,border-color .2s}
+  .mbs-ctrl-btn:hover{background:rgba(100,120,255,.18);border-color:rgba(100,120,255,.4);color:#e0e8ff}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(239,68,68,.16);color:#888888;background:rgba(255,255,255,.03);text-transform:uppercase}
   .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
   .blh-pill.fail{border-color:rgba(239,68,68,.4);color:#fca5a5;background:rgba(239,68,68,.07)}
@@ -46238,6 +46248,19 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <div id="mbs-edge" data-testid="main-brain-edge"></div>
     <div id="mbs-gates" data-testid="main-brain-gates"></div>
     <div id="mbs-reason" data-testid="main-brain-reason" style="display:none"></div>
+    <div id="mbs-narrative" data-testid="main-brain-narrative"></div>
+    <div id="mbs-next-wrap">
+      <div id="mbs-next-lbl">NEXT ACTION</div>
+      <div id="mbs-next-action" data-testid="main-brain-next-action"></div>
+    </div>
+    <div id="mbs-inv-wrap">
+      <div id="mbs-inv-lbl">INVALIDATION</div>
+      <div id="mbs-invalidation" data-testid="main-brain-invalidation"></div>
+    </div>
+    <div class="mbs-controls">
+      <button class="mbs-ctrl-btn" data-testid="main-brain-talk" onclick="(function(){var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}})()">Talk to AI</button>
+      <button class="mbs-ctrl-btn" id="mbs-speak-btn" data-testid="main-brain-speak" onclick="(function(){var t=document.getElementById('mbs-narrative');if(!t||!t.textContent.trim()){return;}var u=new SpeechSynthesisUtterance(t.textContent);u.rate=0.95;window.speechSynthesis.speak(u);})()">Speak</button>
+    </div>
     <div id="mbs-stale-warn">&#9888; Data may be stale</div>
   </div>
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
@@ -57645,6 +57668,24 @@ function renderBLPanels(d){
     var mSt=document.getElementById('mbs-stale-warn');
     if(mSt){var bFr=(bk2&&bk2.freshness)||null;
       mSt.style.display=(bFr&&(bFr.price_fresh===false||bFr.is_stale===true))?'':'none';}
+    // Narrative / next-action / invalidation
+    var bkDec=(bk2&&bk2.decision)||{};
+    var bkTop=(bk2&&bk2.reasons&&Array.isArray(bk2.reasons.top))?bk2.reasons.top:[];
+    var bkNext=typeof bkDec.next_action==='string'?bkDec.next_action:'';
+    var bkInv=bk2&&typeof bk2.invalidation==='string'?bk2.invalidation:'';
+    var mNarr=document.getElementById('mbs-narrative');
+    if(mNarr){
+      var safeR=bkTop.filter(function(r){return typeof r==='string'&&r.trim();});
+      var nParts=[];
+      if(bk2&&bk2.instrument)nParts.push(String(bk2.instrument)+' is '+String(bkDec.verdict||v||'WAIT').toLowerCase()+'.');
+      if(safeR.length)nParts.push(safeR[0]);
+      if(bkNext)nParts.push('Next: '+bkNext);
+      mNarr.textContent=nParts.join(' ')||'Brain analysis is available.';
+    }
+    var mNwrap=document.getElementById('mbs-next-wrap'),mNact=document.getElementById('mbs-next-action');
+    if(mNwrap&&mNact){if(bkNext){mNact.textContent=bkNext;mNwrap.style.display='';}else{mNact.textContent='';mNwrap.style.display='none';}}
+    var mIwrap=document.getElementById('mbs-inv-wrap'),mItext=document.getElementById('mbs-invalidation');
+    if(mIwrap&&mItext){if(bkInv){mItext.textContent=bkInv;mIwrap.style.display='';}else{mItext.textContent='';mIwrap.style.display='none';}}
   })();
 
 
