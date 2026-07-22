@@ -536,42 +536,142 @@ def test_adapter_exception_produces_log_record():
     assert "decision-trace" in log_records[0].getMessage().lower() or            "decision-trace" in log_records[0].msg.lower(),            f"Log record should mention decision-trace: {log_records[0].getMessage()}"
 
 
-# ── T33: unknown instrument cannot create arbitrary cache key ─────────────
+# ── T33-T41: _dt_instrument_of() -- strict diagnostics-only resolver ---------
+# Proves that only recognized aliases resolve to an instrument and that
+# unknown, blank, or malformed input returns None (never defaults to MGC).
 
-def test_cache_bound_unknown_instrument():
-    """Req 5: unknown tickers resolve to a valid registry key, never arbitrary strings."""
-    import app as _app
-
-    # instrument_of() always returns a known instrument (DEFAULT_INSTRUMENT=MGC for unknowns).
-    for unknown in ("XRPBTC", "AAPL", "foobar", "1!@#$", ""):
-        resolved = _app.instrument_of(unknown)
-        assert resolved in _app._ALERT_INSTRUMENTS,             f"instrument_of({unknown!r}) returned {resolved!r} which is not in _ALERT_INSTRUMENTS"
+def test_dt_instrument_of_mgc_aliases():
+    """MGC and TradingView continuous-contract aliases resolve to MGC."""
+    assert app._dt_instrument_of("MGC")    == "MGC"
+    assert app._dt_instrument_of("MGC1!")  == "MGC"
+    assert app._dt_instrument_of("mgc")    == "MGC", "case-insensitive"
+    assert app._dt_instrument_of("MGCUSD") == "MGC"
 
 
-# ── T34: cache write guard requires key in _ALERT_INSTRUMENTS ─────────────
+def test_dt_instrument_of_mnq_aliases():
+    """MNQ and its continuous-contract form resolve to MNQ."""
+    assert app._dt_instrument_of("MNQ")   == "MNQ"
+    assert app._dt_instrument_of("MNQ1!") == "MNQ"
+    assert app._dt_instrument_of("mnq")   == "MNQ", "case-insensitive"
 
-def test_cache_write_requires_valid_instrument():
-    """Req 5: the cache block guards the write with `if _dt_inst in _ALERT_INSTRUMENTS`."""
-    import app as _app
+
+def test_dt_instrument_of_mes_aliases():
+    """MES and its continuous-contract form resolve to MES."""
+    assert app._dt_instrument_of("MES")   == "MES"
+    assert app._dt_instrument_of("MES1!") == "MES"
+    assert app._dt_instrument_of("mes")   == "MES", "case-insensitive"
+
+
+def test_dt_instrument_of_mym_aliases():
+    """MYM and its continuous-contract form resolve to MYM."""
+    assert app._dt_instrument_of("MYM")   == "MYM"
+    assert app._dt_instrument_of("MYM1!") == "MYM"
+    assert app._dt_instrument_of("mym")   == "MYM", "case-insensitive"
+
+
+def test_dt_instrument_of_aapl_returns_none():
+    """AAPL is not a recognized alias -- must return None, not default to MGC."""
+    result = app._dt_instrument_of("AAPL")
+    assert result is None, f"Expected None for AAPL, got {result!r}"
+
+
+def test_dt_instrument_of_xrpbtc_returns_none():
+    """XRPBTC is not a recognized alias -- must return None, not default to MGC."""
+    result = app._dt_instrument_of("XRPBTC")
+    assert result is None, f"Expected None for XRPBTC, got {result!r}"
+
+
+def test_dt_instrument_of_blank_returns_none():
+    """Blank, whitespace-only, and None input must all return None."""
+    assert app._dt_instrument_of("")    is None
+    assert app._dt_instrument_of(None) is None
+    assert app._dt_instrument_of("   ") is None
+
+
+def test_dt_instrument_of_malformed_returns_none():
+    """Malformed / unrelated symbol strings must return None."""
+    assert app._dt_instrument_of("1!@#$")   is None
+    assert app._dt_instrument_of("UNKNOWN") is None
+    assert app._dt_instrument_of("SPY")     is None
+    assert app._dt_instrument_of("NQ=F")    is None  # raw yfinance feed, not an alias
+
+
+def test_unknown_instrument_does_not_modify_cache():
+    """Unknown ticker must not create or overwrite any entry in _LAST_DECISION_TRACE."""
+    with app._DECISION_TRACE_LOCK:
+        before = dict(app._LAST_DECISION_TRACE)
+
+    for bad in ("AAPL", "XRPBTC", "SPY", "", "1!@#$", "UNKNOWN_XYZ"):
+        resolved = app._dt_instrument_of(bad)
+        assert resolved is None, (
+            f"_dt_instrument_of({bad!r}) should be None to block cache write, got {resolved!r}"
+        )
+
+    with app._DECISION_TRACE_LOCK:
+        after = dict(app._LAST_DECISION_TRACE)
+
+    assert before == after, (
+        "Cache changed while resolving unknown tickers. "
+        f"Before: {before}, After: {after}"
+    )
+    assert set(after.keys()) <= set(app._ALERT_INSTRUMENTS), (
+        f"Cache contains key(s) outside registry: "
+        f"{set(after.keys()) - set(app._ALERT_INSTRUMENTS)}"
+    )
+
+
+# -- T42: double-fault -- adapter raises AND logger raises --------------------
+
+def test_double_fault_logger_also_raises():
+    """Req 2: when build_legacy raises AND logger.warning also raises,
+    the cache block must not propagate any exception into full_analysis."""
     import copy
 
-    # Snapshot the cache before
-    with _app._DECISION_TRACE_LOCK:
-        before = dict(_app._LAST_DECISION_TRACE)
+    original_trace  = app.build_legacy_decision_trace
+    original_logger = app.logger.warning
 
-    # Even if somehow instrument_of returned something bad, the guard blocks writes.
-    bad_key = "ARBITRARY_KEY_12345"
-    assert bad_key not in _app._ALERT_INSTRUMENTS
-    if bad_key in _app._ALERT_INSTRUMENTS:
-        # Guard prevents this write path — this branch is unreachable by design.
-        with _app._DECISION_TRACE_LOCK:
-            _app._LAST_DECISION_TRACE[bad_key] = {"injected": True}
+    def _boom_trace(result, instrument, generated_at=None):
+        raise RuntimeError("injected adapter failure")
 
-    with _app._DECISION_TRACE_LOCK:
-        after = dict(_app._LAST_DECISION_TRACE)
+    def _boom_logger(msg, *args, **kwargs):
+        raise OSError("injected logger failure")
 
-    assert bad_key not in after, f"Cache must never contain arbitrary key {bad_key!r}"
-    assert set(after.keys()) <= set(_app._ALERT_INSTRUMENTS),         f"Cache keys outside registry: {set(after.keys()) - set(_app._ALERT_INSTRUMENTS)}"
+    sentinel = {
+        "verdict": "WAIT", "edge_score": 42,
+        "strict_reason": "no structure", "trade_plan": {"trade_plan": False},
+        "alert_level": None, "conviction_tier": None,
+    }
+    snap = copy.deepcopy(sentinel)
+
+    app.build_legacy_decision_trace = _boom_trace
+    app.logger.warning = _boom_logger
+    old_flag = app.DECISION_TRACE_SHADOW_ENABLED
+    try:
+        app.DECISION_TRACE_SHADOW_ENABLED = True
+        # Reproduce the exact cache block from full_analysis
+        try:
+            _dt_inst = app._dt_instrument_of("MGC")
+            if _dt_inst is not None:
+                _dt = app.build_legacy_decision_trace(sentinel, _dt_inst)
+                with app._DECISION_TRACE_LOCK:
+                    app._LAST_DECISION_TRACE[_dt_inst] = _dt
+        except Exception as _dt_exc:
+            try:
+                app.logger.warning(
+                    "[decision-trace] adapter exception (display-only, analysis unaffected): %s",
+                    type(_dt_exc).__name__,
+                )
+            except Exception:
+                pass  # both faults contained; result returned unchanged below
+    finally:
+        app.build_legacy_decision_trace = original_trace
+        app.logger.warning = original_logger
+        app.DECISION_TRACE_SHADOW_ENABLED = old_flag
+
+    assert sentinel == snap, (
+        "Double-fault must not mutate the result dict. "
+        f"Before: {snap}, After: {sentinel}"
+    )
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────

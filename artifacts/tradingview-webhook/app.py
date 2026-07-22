@@ -21597,6 +21597,31 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction,
         return {"available": False, "reason": str(_exc), "shadow_mode": True}
 
 
+# ── Phase 5B strict instrument resolver (DIAGNOSTICS-ONLY) ─────────────────
+# Returns the canonical instrument name ONLY when a recognized alias is present.
+# Returns None for unknown, blank, or malformed input — prevents an unrecognized
+# ticker from silently overwriting the legitimate MGC cache slot (MGC is the
+# lenient global default; this function never defaults). Do NOT use in any money
+# path, gate, scoring, or sizing; instrument_of() is the correct resolver there.
+
+def _dt_instrument_of(ticker):
+    """Diagnostics-only strict resolver for the decision-trace cache.
+
+    Unlike instrument_of() this never defaults to MGC. It returns None
+    whenever the ticker does not explicitly match a known alias, so an
+    unknown ticker cannot overwrite the legitimate MGC cache entry.
+    """
+    if not ticker:
+        return None
+    s = str(ticker).upper().strip()
+    if not s:
+        return None
+    for inst in _ALERT_INSTRUMENTS:
+        if any(alias in s for alias in ASSETS[inst]["aliases"]):
+            return inst
+    return None
+
+
 # ── Phase 5B: Decision Trace adapter (DISPLAY/DIAGNOSTICS-ONLY) ──────────────
 # Pure read-only adapter: maps the FINAL assembled result from full_analysis into
 # a compact, human-readable snapshot showing WHAT the system decided and WHY.
@@ -23400,18 +23425,21 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # does NOT mutate result. Flag OFF => block never executes (byte-identical).
     if DECISION_TRACE_SHADOW_ENABLED:
         try:
-            # instrument_of() always returns a valid registry key (never falsy),
-            # so _dt_inst is always in _ALERT_INSTRUMENTS — cache is bounded.
-            _dt_inst = instrument_of(active_ticker)
-            if _dt_inst in _ALERT_INSTRUMENTS:
+            # _dt_instrument_of() returns None for unrecognized tickers — prevents
+            # an unknown input from overwriting the legitimate MGC cache slot.
+            _dt_inst = _dt_instrument_of(active_ticker)
+            if _dt_inst is not None:
                 _dt = build_legacy_decision_trace(result, _dt_inst)
                 with _DECISION_TRACE_LOCK:
                     _LAST_DECISION_TRACE[_dt_inst] = _dt
         except Exception as _dt_exc:
-            logger.warning(
-                "[decision-trace] adapter exception (display-only, analysis unaffected): %s",
-                type(_dt_exc).__name__,
-            )
+            try:
+                logger.warning(
+                    "[decision-trace] adapter exception (display-only, analysis unaffected): %s",
+                    type(_dt_exc).__name__,
+                )
+            except Exception:
+                pass  # logging itself failed; analysis result is still returned unchanged
 
     return result
 
