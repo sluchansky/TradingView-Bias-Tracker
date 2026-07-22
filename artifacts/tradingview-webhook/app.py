@@ -45130,26 +45130,19 @@ def dashboard():
   #menu-toggle{cursor:pointer;padding:4px 8px;border:1px solid rgba(239,68,68,.18);border-radius:7px;color:#888888;transition:all .16s;user-select:none;font-size:12px;background:transparent;font-family:var(--mono)}
   #menu-toggle:hover{color:#b0bce0;border-color:rgba(239,68,68,.40)}
   /* ── Center verdict hero panel ── */
-  #blh-hero{padding:18px 18px 14px;border:1px solid rgba(239,68,68,.15);border-radius:16px;background:linear-gradient(165deg,rgba(15,15,15,.85),rgba(5,5,5,.75));-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);margin-bottom:12px;box-shadow:var(--glass-shadow)}
-  #blh-verdict{font-family:var(--sans);font-size:54px;font-weight:900;letter-spacing:4px;text-align:center;line-height:1;padding:4px 0 6px;color:#374151;transition:color .4s,text-shadow .4s}
-  #blh-verdict.v-ready{color:#22c55e;text-shadow:0 0 50px rgba(34,197,94,.45)}
-  #blh-verdict.v-early{color:#eab308;text-shadow:0 0 50px rgba(234,179,8,.35)}
-  #blh-verdict.v-managing{color:#7fe9f5;text-shadow:0 0 50px rgba(127,233,245,.35)}
-  #blh-inst-price{text-align:center;font-family:var(--mono);font-size:19px;font-weight:700;color:#e8e8f0;letter-spacing:.5px;margin:6px 0 2px}
-  #blh-vwap-ctx{text-align:center;font-size:11px;font-weight:600;letter-spacing:.7px;margin-bottom:10px;color:#6b7280;transition:color .3s}
-  #blh-edge-wrap{height:5px;background:rgba(255,255,255,.06);border-radius:3px;margin:0 24px 3px;overflow:hidden}
-  #blh-edge-fill{height:100%;border-radius:3px;transition:width .5s,background .4s;width:0}
-  #blh-edge-label{text-align:center;font-size:10px;color:#6b7280;margin-bottom:12px;letter-spacing:.4px;font-family:var(--sans)}
-  .blh-section-h{font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#4b5563;font-weight:700;margin:0 0 6px;display:flex;align-items:center;gap:6px}
-  #blh-reasoning-box{background:rgba(5,5,5,.70);border:1px solid rgba(239,68,68,.10);border-radius:9px;padding:10px 13px;margin-bottom:11px}
-  #blh-reasoning-text{font-size:12px;color:#a8b4d0;line-height:1.6;min-height:32px}
-  .blh-obs-tbl{width:100%;border-collapse:collapse;font-size:11.5px;margin-bottom:10px}
-  .blh-obs-tbl td{padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.06)}
-  .blh-obs-tbl tr:last-child td{border-bottom:none}
-  .blh-obs-tbl td:first-child{color:#6b7280;text-transform:uppercase;letter-spacing:.5px;font-size:10px;white-space:nowrap;width:36%}
-  .blh-obs-tbl td:nth-child(2){color:#c8d0f0;font-weight:700;white-space:nowrap;padding-left:8px}
-  .blh-obs-tbl td:last-child{color:#4b5563;text-align:right;font-size:10px;font-style:italic;padding-left:6px}
-  .blh-pills{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px}
+  /* ── Main Brain Summary card (compact center, replaces blh-hero) ── */
+  #main-brain-summary{padding:20px 22px 18px;border-radius:16px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.16);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);box-shadow:var(--glass-shadow);margin-bottom:12px}
+  .mbs-heading{font-size:9px;font-weight:700;letter-spacing:2.4px;text-transform:uppercase;color:rgba(255,255,255,.28);margin-bottom:10px}
+  #mbs-narrative{font-size:14px;color:#b8c0da;line-height:1.65;margin:0 0 14px;font-weight:500}
+  .mbs-section{margin-bottom:10px}
+  .mbs-lbl{font-size:8px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.20);margin-bottom:3px}
+  .mbs-val{font-size:12px;color:#9ca3af;line-height:1.48}
+  #mbs-stale-warn{font-size:11px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:6px 10px;margin-bottom:10px;display:none}
+  .mbs-controls{display:flex;gap:8px;margin-top:14px}
+  .mbs-btn{flex:1;padding:7px 0;border-radius:8px;font-size:10.5px;font-family:var(--sans);letter-spacing:.6px;cursor:pointer;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);color:#8b96b8;transition:background .18s,color .18s}
+  .mbs-btn:hover{background:rgba(255,255,255,.09);color:#e8e8f0}
+  .mbs-btn.mbs-talk{border-color:rgba(34,197,94,.22);background:rgba(34,197,94,.06);color:#6ee7b7}
+  .mbs-btn.mbs-talk:hover{background:rgba(34,197,94,.12);color:#a7f3d0}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(239,68,68,.16);color:#888888;background:rgba(255,255,255,.03);text-transform:uppercase}
   .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
   .blh-pill.fail{border-color:rgba(239,68,68,.4);color:#fca5a5;background:rgba(239,68,68,.07)}
@@ -45172,14 +45165,6 @@ def dashboard():
   .sv2-bd-b{height:100%;border-radius:2px;transition:width .3s}
   .sv2-bd-pts{color:#c8d0f0;font-size:9.5px;font-weight:700;min-width:28px;text-align:right}
   .sv2-rr{font-size:9px;color:#6b7280;margin-left:4px}
-  #blh-waveform{display:flex;align-items:center;justify-content:center;gap:3px;height:30px;margin:6px 0 2px}
-  .blh-wave-bar{width:3px;border-radius:2px;background:#22c55e;animation:blhWave 1.4s ease-in-out infinite}
-  .blh-wave-bar:nth-child(2){animation-delay:.1s}.blh-wave-bar:nth-child(3){animation-delay:.2s}.blh-wave-bar:nth-child(4){animation-delay:.3s}.blh-wave-bar:nth-child(5){animation-delay:.4s}.blh-wave-bar:nth-child(6){animation-delay:.5s}.blh-wave-bar:nth-child(7){animation-delay:.6s}
-  @keyframes blhWave{0%,100%{transform:scaleY(.25);opacity:.25}50%{transform:scaleY(1);opacity:.65}}
-  #blh-wf-label{text-align:center;font-size:8.5px;letter-spacing:2px;color:#374151;text-transform:uppercase;margin-bottom:4px;font-family:var(--sans)}
-  #blh-current-take{font-size:11px;color:#aaaaaa;line-height:1.55;padding:8px 11px;border-radius:7px;background:rgba(255,255,255,.022);border-left:2px solid rgba(239,68,68,.22);margin-bottom:9px}
-  #blh-speak-btn{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;padding:6px 0;border:1px solid rgba(239,68,68,.18);border-radius:8px;background:rgba(239,68,68,.06);color:#ef4444;font-size:10.5px;font-family:var(--sans);letter-spacing:.6px;cursor:pointer;margin-top:5px;transition:background .18s,color .18s}
-  #blh-speak-btn:hover{background:rgba(239,68,68,.13);color:#f4f4f4}
   /* ── Left column avatar + market context ── */
   .bl-av-wrap{text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(239,68,68,.10);margin-bottom:10px}
   .bl-av-img{width:70px;height:70px;margin:0 auto 5px;display:block;border-radius:50%;filter:drop-shadow(0 0 10px rgba(239,68,68,.28))}
@@ -46247,40 +46232,25 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     </div>
   </div><!-- /#bl-left -->
 
-  <!-- CENTER COLUMN ── Verdict Hero + Main Brain -->
-  <div id="bl-center">
-  <!-- ── VERDICT HERO ── Big decision + price + edge + observations (DISPLAY-ONLY) ── -->
-  <div id="blh-hero">
-    <div id="blh-verdict" class="v-wait">WAIT</div>
-    <div id="blh-inst-price">— ——.——</div>
-    <div id="blh-vwap-ctx">Price context loading…</div>
-    <div id="blh-edge-wrap"><div id="blh-edge-fill"></div></div>
-    <div id="blh-edge-label">EDGE SCORE 0 / 110</div>
-    <div id="blh-reasoning-box">
-      <div class="blh-section-h">🤖 AI REASONING</div>
-      <div id="blh-reasoning-text">Loading analysis…</div>
+  <!-- ── MAIN BRAIN SUMMARY ── Compact center card; Brain Contract (DISPLAY-ONLY) ── -->
+  <div id="main-brain-summary" data-testid="main-brain-summary">
+    <div class="mbs-heading">MAIN BRAIN</div>
+    <p id="mbs-narrative" data-testid="main-brain-narrative">Analyzing market conditions…</p>
+    <div id="mbs-next-action" class="mbs-section" data-testid="main-brain-next-action" style="display:none">
+      <div class="mbs-lbl">NEXT ACTION</div>
+      <div id="mbs-next-val" class="mbs-val"></div>
     </div>
-    <div class="blh-section-h">KEY OBSERVATIONS</div>
-    <table class="blh-obs-tbl">
-      <tr><td>Order Flow</td><td id="blh-obs-flow">\u2014</td><td id="blh-obs-flow-n"></td></tr>
-      <tr><td>Watching</td><td id="blh-obs-watch">\u2014</td><td id="blh-obs-watch-n"></td></tr>
-      <tr><td>Liquidity</td><td id="blh-obs-liq">\u2014</td><td id="blh-obs-liq-n"></td></tr>
-      <tr><td>Volatility</td><td id="blh-obs-vol">\u2014</td><td id="blh-obs-vol-n"></td></tr>
-      <tr><td>Conditions</td><td id="blh-obs-cond">\u2014</td><td id="blh-obs-cond-n"></td></tr>
-    </table>
-    <div id="blh-current-take">Reading market conditions\u2026</div>
-    <div class="blh-pills" id="blh-pills"></div>
-    <div id="blh-waveform">
-      <div class="blh-wave-bar" style="height:8px"></div>
-      <div class="blh-wave-bar" style="height:16px"></div>
-      <div class="blh-wave-bar" style="height:24px"></div>
-      <div class="blh-wave-bar" style="height:30px"></div>
-      <div class="blh-wave-bar" style="height:24px"></div>
-      <div class="blh-wave-bar" style="height:16px"></div>
-      <div class="blh-wave-bar" style="height:8px"></div>
+    <div id="mbs-invalidation" class="mbs-section" data-testid="main-brain-invalidation" style="display:none">
+      <div class="mbs-lbl">INVALIDATION</div>
+      <div id="mbs-inval-val" class="mbs-val"></div>
     </div>
-    <div id="blh-wf-label">WAITING FOR SETUP</div>
-    <button id="blh-speak-btn">\u25b6 Speak</button>
+    <div id="mbs-stale-warn">&#9888; Data may be stale</div>
+    <div class="mbs-controls">
+      <button class="mbs-btn mbs-talk" data-testid="main-brain-talk"
+        onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
+      <button class="mbs-btn" id="mbs-speak-btn" data-testid="main-brain-speak"
+        onclick="(function(){var t=document.getElementById('mbs-narrative');if(!t)return;var u=window.speechSynthesis;if(!u)return;u.cancel();var s=new SpeechSynthesisUtterance(t.textContent);s.rate=0.95;u.speak(s);})()">&#9654; Speak</button>
+    </div>
   </div>
   <!-- ════ Main Brain — ONE plain-English command center (DISPLAY-ONLY; consumes the
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
@@ -57615,59 +57585,40 @@ function renderBLPanels(d){
   var tpSess=document.getElementById('tp-session-badge');
   if(tpSess){var mkt=d.market_session||{};var isOpen=mkt.market_open===true||mkt.is_open===true;tpSess.textContent=isOpen?'OPEN':'CLOSED';tpSess.className='tp-badge'+(isOpen?'':' closed');}
 
-  // ── Center verdict hero ──
-  var hvEl=document.getElementById('blh-verdict');
-  if(hvEl){var vc2=(v.indexOf('READY')!==-1&&v!=='EARLY')?'v-ready':(v==='EARLY'?'v-early':(v==='MANAGING'?'v-managing':'v-wait'));hvEl.textContent=v;hvEl.className=vc2;}
-  var price=d.current_price||d.price||null;
-  var hpEl=document.getElementById('blh-inst-price');
-  if(hpEl){hpEl.textContent=(inst&&price)?inst+' '+Number(price).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):(inst||'\u2014');}
-  var vwapVal=d.vwap_value||d.vwap||null;
-  var vwapCtxEl=document.getElementById('blh-vwap-ctx');
-  if(vwapCtxEl&&price&&vwapVal){var abv=Number(price)>Number(vwapVal);vwapCtxEl.textContent=(abv?'\u25b2 Price above VWAP':'\u25bc Price below VWAP')+' \u00b7 VWAP '+Number(vwapVal).toFixed(2);vwapCtxEl.style.color=abv?'#22c55e':'#ef4444';}else if(vwapCtxEl){vwapCtxEl.textContent='VWAP \u2014';vwapCtxEl.style.color='#6b7280';}
-  var heFill=document.getElementById('blh-edge-fill');
-  var heLabel=document.getElementById('blh-edge-label');
-  if(heFill){var p2=Math.min(100,Math.round(edge/110*100));var fc2=edge>=85?'#22c55e':edge>=70?'#6ee7b7':edge>=50?'#eab308':'#ef4444';heFill.style.width=p2+'%';heFill.style.background=fc2;}
-  if(heLabel){heLabel.textContent='EDGE SCORE '+edge+' / 110 \u00b7 Grade '+grade;}
-  var hrText=document.getElementById('blh-reasoning-text');
-  var mbsumm=(d.main_brain&&d.main_brain.summary)?d.main_brain.summary:(d.reason||d.strict_reason||'Analyzing market conditions\u2026');
-  if(hrText){hrText.textContent=mbsumm;}
+  // ── Main Brain Summary card (replaces blh-hero; Brain Contract) ──
+  var isActn=v.indexOf('READY')!==-1||v==='MANAGING';
   var hdiag=d.alert_diagnostics||{};
   var hcvdDir=String(hdiag.cvd_direction||hdiag.cvd||'');
   var hstructOk=hdiag.structure_ok||hdiag.structure;
   var hzoneOk=hdiag.zone_ok||hdiag.zone;
   var hvolReg=String(d.volatility||d.vol_regime||hdiag.vol_regime||'');
-  var obsFlow=document.getElementById('blh-obs-flow');var obsFlowN=document.getElementById('blh-obs-flow-n');
-  var obsWatch=document.getElementById('blh-obs-watch');var obsWatchN=document.getElementById('blh-obs-watch-n');
-  var obsLiq=document.getElementById('blh-obs-liq');var obsLiqN=document.getElementById('blh-obs-liq-n');
-  var obsVol=document.getElementById('blh-obs-vol');var obsVolN=document.getElementById('blh-obs-vol-n');
-  var obsCond=document.getElementById('blh-obs-cond');var obsCondN=document.getElementById('blh-obs-cond-n');
-  var flowLbl=hcvdDir?hcvdDir.toUpperCase():'\u2014';
-  var flowNote=hcvdDir?(hcvdDir.toLowerCase().indexOf('bull')!==-1?'Bullish delta':'Bearish delta'):'';
-  if(obsFlow)obsFlow.textContent=flowLbl;if(obsFlowN)obsFlowN.textContent=flowNote;
-  var nearDemW=d.nearest_demand||null;var nearSupW=d.nearest_supply||null;
-  var watchDem=nearDemW&&nearDemW.high?Number(nearDemW.high).toFixed(2):(nearDemW&&typeof nearDemW==='number'?Number(nearDemW).toFixed(2):null);
-  var watchSup=nearSupW&&nearSupW.low?Number(nearSupW.low).toFixed(2):(nearSupW&&typeof nearSupW==='number'?Number(nearSupW).toFixed(2):null);
-  var watchLvl=watchDem||watchSup||'\u2014';
-  var watchNote=watchDem?'For a demand reaction':(watchSup?'For a supply reaction':'No key level');
-  if(obsWatch)obsWatch.textContent=watchLvl;if(obsWatchN)obsWatchN.textContent=watchNote;
-  var liqSrc=d.liquidity_status||(hdiag&&hdiag.liquidity)||null;
-  var liqLbl=liqSrc?String(liqSrc).toUpperCase():(swpAge!=null&&Number(swpAge)<3?'ACTIVE SWEEP':'\u2014');
-  var liqNote=swpAge!=null?'Last sweep '+Math.round(Number(swpAge))+'m ago':'No recent sweep';
-  if(obsLiq)obsLiq.textContent=liqLbl;if(obsLiqN)obsLiqN.textContent=liqNote;
-  if(obsVol)obsVol.textContent=hvolReg?hvolReg.toUpperCase():'NORMAL';
-  var atrPts=d.atr||(hdiag&&hdiag.atr)||null;if(obsVolN)obsVolN.textContent=atrPts?'ATR '+Number(atrPts).toFixed(1)+'pts':'ATR regime';
-  var hgd=d.gate_debug||{};
-  var condLbl=hgd.blocking_reason||(v.indexOf('READY')!==-1?'ALIGNED':(d.strict_reason||'NOT ALIGNED').split('.')[0]);
-  var condNote=v.indexOf('READY')!==-1?'Setup confirmed':'Waiting for confluence';
-  if(obsCond){obsCond.textContent=condLbl.length>18?condLbl.slice(0,17)+'\u2026':condLbl;}if(obsCondN)obsCondN.textContent=condNote;
-  var ctEl=document.getElementById('blh-current-take');
-  if(ctEl){var ctParts=[];if(watchLvl&&watchLvl!=='\u2014')ctParts.push('Watching '+watchLvl);if(edge>0)ctParts.push('Edge '+edge+'/110');var ctR=(d.strict_reason||d.reason||'');if(ctR)ctParts.push(ctR.split('.')[0]);ctEl.textContent=ctParts.length?ctParts.join('. ')+'.':'Reading market conditions\u2026';}
-  var pillsEl=document.getElementById('blh-pills');
-  if(pillsEl){var hgd2=d.gate_debug||{};var pills=[];if(hgd2.structure===false||hgd2.structure==='FAIL')pills.push({t:'No structure',c:'fail'});else if(hstructOk)pills.push({t:'Structure',c:'ok'});if(hgd2.zone===false||hgd2.zone==='FAIL')pills.push({t:'No zone',c:'warn'});else if(hzoneOk)pills.push({t:'Zone',c:'ok'});if(hcvdDir)pills.push({t:hcvdDir.toUpperCase(),c:hcvdDir.toLowerCase().indexOf('bull')!==-1?'ok':hcvdDir.toLowerCase().indexOf('bear')!==-1?'fail':'warn'});if(!pills.length)pills.push({t:v,c:v.indexOf('READY')!==-1?'ok':'warn'});pillsEl.innerHTML=pills.map(function(p){return '<span class="blh-pill '+p.c+'">'+p.t+'</span>';}).join('');}
-  var wfEl=document.getElementById('blh-waveform');var wfLbl=document.getElementById('blh-wf-label');
-  var isActn=v.indexOf('READY')!==-1||v==='MANAGING';
-  if(wfEl){wfEl.style.display=isActn?'none':'flex';}
-  if(wfLbl){wfLbl.style.display=isActn?'none':'block';}
+  (function(){
+    var bk2=getBrain(d);
+    var bInst=(bk2&&bk2.instrument)?String(bk2.instrument).replace('1!',''):(inst||'—');
+    var bVerdict=(bk2&&bk2.decision&&bk2.decision.verdict)||v||'WAIT';
+    var bTopR=(bk2&&bk2.reasons&&bk2.reasons.top)||null;
+    var bVoice=(bk2&&bk2.voice)||null;
+    var bSumm=(bk2&&bk2.summary&&String(bk2.summary).indexOf('Waiting for')===-1)?bk2.summary:null;
+    var narr=bVoice||bSumm||null;
+    if(!narr){
+      var np=[bInst+' is '+bVerdict+'.'];
+      if(bTopR&&String(bTopR).indexOf('[object')===-1){var rt=String(bTopR).split('.')[0].trim();if(rt)np.push(rt+'.');}
+      if(bVerdict.indexOf('READY')===-1)np.push('Wait for confirmation before entering.');
+      narr=np.join(' ');
+    }
+    var mNarr=document.getElementById('mbs-narrative');
+    if(mNarr)mNarr.textContent=narr;
+    var mNextW=document.getElementById('mbs-next-action');
+    var mNextV=document.getElementById('mbs-next-val');
+    var bNext=(bk2&&bk2.decision&&bk2.decision.next_action)||null;
+    if(mNextW&&mNextV){if(bNext&&String(bNext).indexOf('[object')===-1){mNextV.textContent=String(bNext);mNextW.style.display='';}else{mNextW.style.display='none';}}
+    var mInvalW=document.getElementById('mbs-invalidation');
+    var mInvalV=document.getElementById('mbs-inval-val');
+    var bInval=(bk2&&bk2.decision&&bk2.decision.invalidation)||(d.trade_plan&&d.trade_plan.invalidation)||(d.active_trade&&d.active_trade.invalidation)||null;
+    if(mInvalW&&mInvalV){if(bInval&&String(bInval).indexOf('[object')===-1){mInvalV.textContent=String(bInval);mInvalW.style.display='';}else{mInvalW.style.display='none';}}
+    var mStale=document.getElementById('mbs-stale-warn');
+    if(mStale){var bFr=(bk2&&bk2.freshness)||null;mStale.style.display=(bFr&&(bFr.price_fresh===false||bFr.is_stale===true))?'':'none';}
+  })();
 
 
   // ── Dark mode toggle (window.* so onclick= can reach it from any scope) ──
