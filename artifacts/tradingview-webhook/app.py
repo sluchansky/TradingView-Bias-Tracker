@@ -549,6 +549,11 @@ DATA_STALE_THRESHOLD_MINS   = int(os.environ.get("DATA_STALE_THRESHOLD_MINS", "1
 # reversal instead of clinging to stale +20 credit. Default OFF => byte-identical to
 # today (goldens green); SCALP-only (SWING never affected). Env kill switch =0.
 STRUCTURE_REVERSAL_DEMOTE_ENABLED = _env_flag_on("STRUCTURE_REVERSAL_DEMOTE_ENABLED", default_on=False)
+# Phase 5B — Decision Trace shadow (DISPLAY/DIAGNOSTICS-ONLY, default OFF).
+# Pure read-only adapter: maps the FINAL assembled full_analysis() result into a
+# compact structured snapshot showing WHAT the system decided and WHY. Exposed
+# ONLY via the owner-only /decision-trace endpoint. Flag OFF => byte-identical.
+DECISION_TRACE_SHADOW_ENABLED = _env_flag_on("DECISION_TRACE_SHADOW_ENABLED", default_on=False)
 # T3 — SCALP 1:2 reward upgrade: lift the SCALP primary/first target from 1R to 2R,
 #      with the staged exit multiples moving in lockstep (TP2 2.5R, runner 3R) so the
 #      broker TP, management geometry, dashboard quality and entry veto all agree.
@@ -742,6 +747,8 @@ FAST_ENTRY_TTL_SEC    = int(os.environ.get("FAST_ENTRY_TTL_SEC", "45"))
 # actionable floor. Conservative small band; structure must ALSO be confirmed.
 FAST_ENTRY_HTF_EDGE_BAND = int(os.environ.get("FAST_ENTRY_HTF_EDGE_BAND", "10"))
 FAST_ENTRY_LOCK = threading.Lock()
+_DECISION_TRACE_LOCK = threading.Lock()
+_LAST_DECISION_TRACE = {}   # inst -> latest build_legacy_decision_trace() output (display-only)
 # {inst: {category: {"direction": "Long"/"Short"/None, "ts": iso, ...}}}
 # categories: sweep_reclaim | delta_flip | micro_vwap | micro_choch | bar
 FAST_ENTRY_STATE_BY_TICKER = {}
@@ -21590,6 +21597,133 @@ def compute_decision_pipeline_v2(instrument, mode, live_verdict, live_direction,
         return {"available": False, "reason": str(_exc), "shadow_mode": True}
 
 
+# ── Phase 5B: Decision Trace adapter (DISPLAY/DIAGNOSTICS-ONLY) ──────────────
+# Pure read-only adapter: maps the FINAL assembled result from full_analysis into
+# a compact, human-readable snapshot showing WHAT the system decided and WHY.
+# NEVER recomputes — only reads from the completed result dict.
+# NEVER touches gate / scoring / sizing / dedup / traderspost / money path.
+# Exposed ONLY via the owner-only /decision-trace endpoint when
+# DECISION_TRACE_SHADOW_ENABLED is ON. Flag OFF => cache stays empty and the
+# endpoint returns {enabled: false}. Fail-open (try/except on every access).
+
+def build_legacy_decision_trace(result, instrument, generated_at=None):
+    """Return a compact decision-trace snapshot derived purely from `result`.
+
+    Args:
+        result      : completed full_analysis() return dict (NOT mutated).
+        instrument  : canonical instrument string (e.g. "MGC", "MNQ").
+        generated_at: optional ISO timestamp string; defaults to utcnow().
+
+    Returns a dict with keys:
+        schema_version, generated_at, instrument,
+        domain, state, tier, direction,
+        edge_score, edge_grade, strict_score, strict_label,
+        strict_reason, strict_missing,
+        has_active_trade, has_trade_plan, next_action.
+    """
+    try:
+        import datetime as _dtime
+        ts = generated_at or _dtime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        verdict = result.get("verdict") or ""
+        market_closed = (
+            verdict == "MARKET CLOSED"
+            or not result.get("market_open", True)
+        )
+
+        active_trade = result.get("active_trade")
+        has_active   = bool(active_trade)
+        tp           = result.get("trade_plan") or {}
+        has_plan     = bool(tp.get("trade_plan"))
+
+        # ── Domain ────────────────────────────────────────────────────────────
+        if market_closed:
+            domain = "WAIT"
+        elif has_active:
+            domain = "MANAGEMENT"
+        elif is_actionable(verdict):
+            domain = "ENTRY"
+        else:
+            domain = "WAIT"
+
+        # ── State + Tier ──────────────────────────────────────────────────────
+        if market_closed:
+            state, tier = "MARKET_CLOSED", None
+        elif has_active:
+            state, tier = "MANAGE", None
+        elif verdict in FULL_READY_VERDICTS:
+            state, tier = "READY", "FULL"
+        elif verdict in EARLY_READY_VERDICTS:
+            state, tier = "EARLY", "EARLY"
+        elif result.get("strict_direction"):
+            state, tier = "SETUP_FORMING", None
+        else:
+            state, tier = "MONITOR", None
+
+        # ── Direction ─────────────────────────────────────────────────────────
+        direction = ready_direction(verdict) or result.get("strict_direction")
+
+        # ── Scores ────────────────────────────────────────────────────────────
+        edge_score   = result.get("edge_score")
+        edge_grade   = result.get("edge_grade")
+        strict_score = result.get("strict_score")
+        strict_label = result.get("strict_label")
+
+        # ── Why WAIT ──────────────────────────────────────────────────────────
+        strict_reason  = result.get("strict_reason")
+        strict_missing = result.get("strict_missing")
+
+        # ── Next action from Main Brain (display only, fail-open) ─────────────
+        next_action = None
+        try:
+            next_action = (
+                (result.get("main_brain") or {})
+                .get("decision", {})
+                .get("next_action")
+            )
+        except Exception:
+            pass
+
+        return {
+            "schema_version":   1,
+            "generated_at":     ts,
+            "instrument":       instrument,
+            "domain":           domain,
+            "state":            state,
+            "tier":             tier,
+            "direction":        direction,
+            "edge_score":       edge_score,
+            "edge_grade":       edge_grade,
+            "strict_score":     strict_score,
+            "strict_label":     strict_label,
+            "strict_reason":    strict_reason,
+            "strict_missing":   strict_missing,
+            "has_active_trade": has_active,
+            "has_trade_plan":   has_plan,
+            "next_action":      next_action,
+        }
+    except Exception as _exc:
+        import datetime as _dtime2
+        return {
+            "schema_version":   1,
+            "generated_at":     generated_at or _dtime2.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "instrument":       instrument or "",
+            "domain":           "WAIT",
+            "state":            "INVALID_DATA",
+            "tier":             None,
+            "direction":        None,
+            "edge_score":       None,
+            "edge_grade":       None,
+            "strict_score":     None,
+            "strict_label":     None,
+            "strict_reason":    "Decision trace build failed: %s" % _exc,
+            "strict_missing":   None,
+            "has_active_trade": False,
+            "has_trade_plan":   False,
+            "next_action":      None,
+        }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -23252,6 +23386,18 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             )
     except Exception as _tfa_exc:
         logger.debug("TFA record-ready fail-open: %s", _tfa_exc)
+
+    # ── Phase 5B: Decision Trace cache (DISPLAY/DIAGNOSTICS-ONLY) ─────────────
+    # Cache the trace per instrument ONLY when the flag is ON. Pure read-only —
+    # does NOT mutate result. Flag OFF => block never executes (byte-identical).
+    if DECISION_TRACE_SHADOW_ENABLED:
+        try:
+            _dt_inst = instrument_of(active_ticker) or active_ticker
+            _dt = build_legacy_decision_trace(result, _dt_inst)
+            with _DECISION_TRACE_LOCK:
+                _LAST_DECISION_TRACE[_dt_inst] = _dt
+        except Exception:
+            pass
 
     return result
 
@@ -39323,6 +39469,21 @@ def diagnostics_live():
     Diagnostics page: per-evaluation timing + volatility metrics for the last
     100 scored alerts, auto-refreshing every second from /eval-metrics."""
     return Response(DIAGNOSTICS_LIVE_HTML, mimetype="text/html")
+
+
+@app.route("/decision-trace", methods=["GET"])
+def decision_trace_endpoint():
+    """Owner-only (dashboard auth via Express proxy; NOT in OPEN_PATHS).
+    Returns the latest build_legacy_decision_trace() snapshot per instrument.
+    Only populated when DECISION_TRACE_SHADOW_ENABLED is ON; returns
+    {enabled: false, traces: {}} when the flag is OFF.
+    DISPLAY/DIAGNOSTICS-ONLY: never touches gate / scoring / sizing / dedup /
+    traderspost / money path."""
+    if not DECISION_TRACE_SHADOW_ENABLED:
+        return jsonify({"enabled": False, "traces": {}}), 200
+    with _DECISION_TRACE_LOCK:
+        traces = dict(_LAST_DECISION_TRACE)
+    return jsonify({"enabled": True, "traces": traces}), 200
 
 
 # ── Auto-Trade Settings page (owner-only; served at /auto-trade-settings) ────
