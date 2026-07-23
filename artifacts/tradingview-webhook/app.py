@@ -61286,6 +61286,37 @@ def academy_ask():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+
+    # ── Hard-exit guarantees (zombie-prevention) ─────────────────────────────
+    # Many threading.Timer threads launched below are non-daemon.  If the main
+    # thread exits for any reason — unhandled exception, SIGTERM from
+    # prod-start.sh, or app.run() crash — those threads normally keep the
+    # process alive, so prod-start.sh's `wait -n` never fires and the VM sits
+    # in an eternal 502 zombie state (Flask alive but no HTTP server bound).
+    #
+    # The three guards below ensure the process ALWAYS dies immediately when
+    # the main thread exits, letting prod-start.sh restart cleanly:
+    #   1. SIGTERM handler  — prod-start.sh `kill $FLASK_PID` during redeploy
+    #   2. sys.excepthook   — any unhandled exception before app.run()
+    #   3. app.run() finally — app.run() exits for any reason (see below)
+    import signal as _signal
+    import sys as _sys
+
+    def _sigterm_hard_exit(signum, frame):
+        logger.critical("[prod-boot] SIGTERM received — os._exit(0) for clean restart")
+        os._exit(0)
+    _signal.signal(_signal.SIGTERM, _sigterm_hard_exit)
+
+    _orig_excepthook = _sys.excepthook
+    def _main_fatal_hook(exc_type, exc_value, exc_tb):
+        try:
+            logger.critical("[prod-boot] Fatal unhandled exception: %s: %s", exc_type.__name__, exc_value)
+        except Exception:
+            pass
+        _orig_excepthook(exc_type, exc_value, exc_tb)
+        os._exit(1)
+    _sys.excepthook = _main_fatal_hook
+
     if LEARNING_DB_ENABLED:
         _check_journal_db_ready()                  # probe journal_entries (no DDL; table created via DB tool/publish diff)
         _load_journal_from_db()                    # restore today's journal so EOD survives restarts (BEFORE the worker)
@@ -61390,4 +61421,19 @@ if __name__ == "__main__":
             "weekly Discord schedulers disabled so this instance can't double-post to the "
             "live channel. Set DISCORD_LIVE=1 to enable."
         )
-    app.run(host="0.0.0.0", port=port, debug=False)
+    logger.info("[prod-boot] Flask app.run() starting on port %d", port)
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False)
+    except Exception as _boot_exc:
+        logger.critical("[prod-boot] Flask app.run() raised: %s", _boot_exc, exc_info=True)
+    finally:
+        # os._exit bypasses non-daemon thread cleanup — intentional.
+        # Without it, non-daemon threading.Timer threads (heartbeat, DPv2,
+        # cross-market, etc.) keep the process alive after Flask exits, so
+        # prod-start.sh's `wait -n` never fires and the VM stays in an
+        # eternal zombie 502 state where Flask threads run but no HTTP port
+        # is bound.  os._exit(1) guarantees the process dies immediately,
+        # prod-start.sh detects the exit, kills Express, and the platform
+        # restarts both cleanly.
+        logger.critical("[prod-boot] Flask server exited — calling os._exit(1) for clean restart")
+        os._exit(1)
