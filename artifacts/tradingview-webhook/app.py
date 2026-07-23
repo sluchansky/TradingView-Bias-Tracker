@@ -49475,7 +49475,7 @@ function gaugeColor(v,prob){
 function renderModules(d){
   if (!d) return;
   var bk = getBrain(d);
-  renderMainBrain(d);
+  try{ renderMainBrain(d); }catch(e){}
   try{ renderAiDecisionCenter(d); }catch(e){}
   try{ renderAnalysisGroups(d); }catch(e){}
   try{ renderJournalGroups(d); }catch(e){}
@@ -49483,9 +49483,9 @@ function renderModules(d){
   try{ renderBLPanels(d); }catch(e){}
   window._mscPageData = d;
   var _mscMainInst = bk.instrument ? String(bk.instrument).replace('1!','') : '';
-  renderMscInstPills(_mscMainInst);
-  if (mscInst && mscInst !== _mscMainInst) { refreshMscPanel(); } else { renderMicroScalp(d); }
-  renderMainBrainCognitive(d);
+  try{ renderMscInstPills(_mscMainInst); }catch(e){}
+  try{ if (mscInst && mscInst !== _mscMainInst) { refreshMscPanel(); } else { renderMicroScalp(d); } }catch(e){}
+  try{ renderMainBrainCognitive(d); }catch(e){}
   try{ renderStalkMode(d); }catch(e){}
   try{ renderActiveThinking(d); }catch(e){}
   try{ hvsUpdateFromStatus(d); }catch(e){}
