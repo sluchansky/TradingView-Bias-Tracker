@@ -61410,7 +61410,6 @@ if __name__ == "__main__":
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
-        threading.Timer(0, _heartbeat_loop).start()   # fire immediately, then every HEARTBEAT_INTERVAL
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()  # re-post READY card (mode-aware cadence)
         threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()  # open-position unified-thesis updates → journal channel (DISPLAY/NOTIFY only)
         _schedule_eod()                               # schedule daily EOD summary
