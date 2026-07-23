@@ -54661,14 +54661,16 @@ function renderMarketIntelligence(d){
   const reEl=document.getElementById('mi-state-reason');
   if(reEl) reEl.textContent = stt.reason || '';
 
-  // Directional confidence
+  // Directional confidence — read decay early so we can dim stale values
   const conf=mi.directional_confidence||{};
+  const _earlyDec=mi.confidence_decay||{};
+  const _dcExpired=(_earlyDec.factor!=null && Number(_earlyDec.factor)===0);
   const biEl=document.getElementById('mi-bias');
-  if(biEl){ biEl.textContent = conf.bias || '—'; biEl.style.color=_miSideColor(conf.bias); }
+  if(biEl){ biEl.textContent = _dcExpired ? ((conf.bias||'—')+' \u2014 signal expired') : (conf.bias || '—'); biEl.style.color=_dcExpired?'#6b7280':_miSideColor(conf.bias); }
   const lEl=document.getElementById('mi-long');
-  if(lEl){ lEl.textContent = (conf.long!=null?conf.long+'%':'—'); lEl.style.color=_miConfColor(conf.long); }
+  if(lEl){ lEl.textContent = (conf.long!=null?conf.long+'%':'—')+(conf.long&&_dcExpired?' (stale)':''); lEl.style.color=_dcExpired?'#6b7280':_miConfColor(conf.long); }
   const sEl=document.getElementById('mi-short');
-  if(sEl){ sEl.textContent = (conf.short!=null?conf.short+'%':'—'); sEl.style.color=_miConfColor(conf.short); }
+  if(sEl){ sEl.textContent = (conf.short!=null?conf.short+'%':'—')+(conf.short&&_dcExpired?' (stale)':''); sEl.style.color=_dcExpired?'#6b7280':_miConfColor(conf.short); }
   const lcEl=document.getElementById('mi-long-comps'); if(lcEl) lcEl.innerHTML=_miCompChips(conf.long_components);
   const scEl=document.getElementById('mi-short-comps'); if(scEl) scEl.innerHTML=_miCompChips(conf.short_components);
 
