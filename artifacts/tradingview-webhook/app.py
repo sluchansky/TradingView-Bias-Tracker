@@ -45616,6 +45616,7 @@ def dashboard():
   .mbs-controls{display:flex;gap:8px;margin-top:10px}
   .mbs-ctrl-btn{flex:1;padding:7px 10px;border-radius:8px;border:1px solid rgba(100,120,255,.22);background:rgba(100,120,255,.08);color:#a8b4d0;font-size:11px;font-weight:600;letter-spacing:.4px;cursor:pointer;text-align:center;transition:background .2s,border-color .2s}
   .mbs-ctrl-btn:hover{background:rgba(100,120,255,.18);border-color:rgba(100,120,255,.4);color:#e0e8ff}
+  .mbs-ctrl-btn.speaking{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.45);color:#f87171}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(239,68,68,.16);color:#888888;background:rgba(255,255,255,.03);text-transform:uppercase}
   .blh-pill.ok{border-color:rgba(34,197,94,.4);color:#6ee7b7;background:rgba(34,197,94,.07)}
   .blh-pill.fail{border-color:rgba(239,68,68,.4);color:#fca5a5;background:rgba(239,68,68,.07)}
@@ -46723,7 +46724,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     </div>
     <div class="mbs-controls">
       <button class="mbs-ctrl-btn" data-testid="main-brain-talk" onclick="(function(){var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}})()">Talk to AI</button>
-      <button class="mbs-ctrl-btn" id="mbs-speak-btn" data-testid="main-brain-speak" onclick="(function(){var t=document.getElementById('mbs-narrative');if(!t||!t.textContent.trim()){return;}var u=new SpeechSynthesisUtterance(t.textContent);u.rate=0.95;window.speechSynthesis.speak(u);})()">Speak</button>
+      <button class="mbs-ctrl-btn" id="mbs-speak-btn" data-testid="main-brain-speak" onclick="(function(){var btn=document.getElementById('mbs-speak-btn');if(window.speechSynthesis.speaking){window.speechSynthesis.cancel();if(btn){btn.textContent='Speak';btn.classList.remove('speaking');}return;}var t=document.getElementById('mbs-narrative');if(!t||!t.textContent.trim()){return;}var u=new SpeechSynthesisUtterance(t.textContent);u.rate=0.95;u.onend=function(){if(btn){btn.textContent='Speak';btn.classList.remove('speaking');}};u.onerror=function(){if(btn){btn.textContent='Speak';btn.classList.remove('speaking');}};window.speechSynthesis.speak(u);if(btn){btn.textContent='\\u25a0 Stop';btn.classList.add('speaking');}})()">Speak</button>
     </div>
     <div id="mbs-stale-warn">&#9888; Data may be stale</div>
   </div>
