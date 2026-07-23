@@ -61326,6 +61326,8 @@ if __name__ == "__main__":
                 current_price_ts_by_ticker = CURRENT_PRICE_TS_BY_TICKER,
                 volume_spike_by_ticker     = VOLUME_SPIKE_BY_TICKER,
                 volatility_by_ticker       = VOLATILITY_BY_TICKER,
+                vwap_by_ticker             = VWAP_BY_TICKER,
+                vwap_override_grace_min    = VWAP_OVERRIDE_GRACE_MIN,
                 now_utc_fn                 = now_utc,
             )
             _DATABENTO_BRAIN.start()

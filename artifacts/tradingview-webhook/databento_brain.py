@@ -103,6 +103,8 @@ class DatabentoBrain:
         current_price_ts_by_ticker,
         volume_spike_by_ticker,
         volatility_by_ticker=None,
+        vwap_by_ticker=None,
+        vwap_override_grace_min: int = 10,
         now_utc_fn=None,
     ):
         # Shared state stores from app.py (passed by reference — writes are visible
@@ -114,7 +116,9 @@ class DatabentoBrain:
         self._cp    = current_price_by_ticker
         self._cp_ts = current_price_ts_by_ticker
         self._vs    = volume_spike_by_ticker
-        self._vol   = volatility_by_ticker  # VOLATILITY_BY_TICKER — populated per bar close
+        self._vol   = volatility_by_ticker   # VOLATILITY_BY_TICKER — populated per bar close
+        self._vwap  = vwap_by_ticker         # VWAP_BY_TICKER — gate VWAP, with grace window
+        self._vwap_grace = vwap_override_grace_min
         self._now   = now_utc_fn or (lambda: datetime.now(timezone.utc))
 
         # Reverse map: continuous-contract symbol → bot instrument key
@@ -438,6 +442,32 @@ class DatabentoBrain:
                 "ratio":       ratio,
                 "ts":          now_iso,
             }
+
+        # ── VWAP_BY_TICKER (gate VWAP — replaces Yahoo Finance auto-refresh) ──
+        # get_vwap() reads VWAP_BY_TICKER for all gate decisions. Databento is
+        # now the authoritative source when no recent chart/alert push is present.
+        # Grace window: a TradingView "chart" or "alert" push (source != "databento")
+        # wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that Databento resumes.
+        if vwap is not None and self._vwap is not None:
+            _write_vwap = True
+            existing = self._vwap.get(inst)
+            if existing and existing.get("source") in ("chart", "alert"):
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    age_min = (
+                        _dt.now(_tz.utc) -
+                        _dt.fromisoformat(existing["ts"])
+                    ).total_seconds() / 60.0
+                    if age_min < self._vwap_grace:
+                        _write_vwap = False  # still within grace window
+                except Exception:
+                    pass  # on parse error, let Databento write
+            if _write_vwap:
+                self._vwap[inst] = {
+                    "value":  round(vwap, 4),
+                    "ts":     now_iso,
+                    "source": "databento",
+                }
 
         # ── Telemetry ─────────────────────────────────────────────────────────
         DATABENTO_STATUS["instruments"][inst] = {
