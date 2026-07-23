@@ -1031,15 +1031,15 @@ MODES = {
         # _swing_htf_enabled(); with the flag OFF behavior is byte-identical to
         # legacy SWING.
         "SWING_HTF_ENABLED":                  True,
-        # >=1:3 RR (lowered from 1:4 to lift SWING trade frequency while keeping a
-        # bigger-reward, intraday-or-longer hold; still a real daily-structure target,
-        # never forced 1:1); 15-min thesis-review cadence; 1H/4H alignment +
-        # daily-level entry gates; inbound chart-push grace window; per-TF staleness
-        # (fail-closed when exceeded); valid-pullback tolerance (in ATR multiples).
-        "SWING_MIN_RR":                       3.0,
+        # >=1:2 RR (lowered from 1:3 to lift SWING intraday frequency — a 2:1 target
+        # on a 2.25×-ATR stop is still a real structural move, just one that qualifies
+        # more often intraday); daily-level gate relaxed so 1H/4H structure levels are
+        # also valid targets (not just daily chart levels); 1H/4H bias alignment still
+        # required for directional quality; 15-min thesis-review cadence unchanged.
+        "SWING_MIN_RR":                       2.0,
         "SWING_REVIEW_INTERVAL_MIN":          15,
         "SWING_REQUIRE_1H_4H_ALIGN":          True,
-        "SWING_REQUIRE_DAILY_LEVEL":          True,
+        "SWING_REQUIRE_DAILY_LEVEL":          False,
         "SWING_HTF_GRACE_MIN":                20,
         "SWING_HTF_1H_STALE_MIN":             120,
         "SWING_HTF_4H_STALE_MIN":             360,
