@@ -79,6 +79,7 @@ class DatabentoBrain:
     # ── Indicator parameters ──────────────────────────────────────────────────
     ATR_PERIOD      = 14      # bars for ATR calculation
     SWING_N         = 5       # pivot bars each side (confirmed after n bars)
+    SWEEP_N         = 10      # prior bars scanned for sweep high/low range
     RVOL_LOOKBACK   = 20      # bars used for rolling avg volume baseline
     VOL_SPIKE_MULT  = 2.0     # RVOL ≥ this → volume spike record
     RECONNECT_DELAY = 10      # seconds to wait between reconnect attempts
@@ -137,6 +138,7 @@ class DatabentoBrain:
         self._v_sum:       dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
         self._cvd_acc:     dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
         self._last_bos:    dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        self._last_sweep:  dict[str, Any]         = {i: None for i in DB_SYMBOLS}
         self._trend:       dict[str, str | None]  = {i: None for i in DB_SYMBOLS}
         self._session_day: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
 
@@ -488,6 +490,8 @@ class DatabentoBrain:
 
         # ── Structure detection (BOS / CHOCH → ALERT_HISTORY) ────────────────
         self._detect_structure(inst, bars)
+        # ── Sweep detection (BULLISH/BEARISH SWEEP → ALERT_HISTORY) ──────────
+        self._detect_sweep(inst, bars)
 
     # ── Structure detection ───────────────────────────────────────────────────
 
@@ -550,6 +554,51 @@ class DatabentoBrain:
         }
         self._ah.append(record)
         logger.info("DatabentoBrain ▶ %s  %s @ %.4f", inst, alert_type, price)
+
+    # ── Sweep detection ───────────────────────────────────────────────────────
+
+    def _detect_sweep(self, inst: str, bars: list) -> None:
+        """
+        Liquidity sweep detector — injects "{inst} BULLISH SWEEP" or
+        "{inst} BEARISH SWEEP" into ALERT_HISTORY for the Sweep15 Edge Score
+        component (ticker_scoped=True lookup in _latest_ts).
+
+        BULLISH SWEEP — current bar's low undercuts the prior SWEEP_N-bar low
+                        but the bar CLOSES back above it (lows swept, bulls win).
+
+        BEARISH SWEEP — current bar's high exceeds the prior SWEEP_N-bar high
+                        but the bar CLOSES back below it (highs swept, bears win).
+
+        Deduped per instrument: same direction at the same price level (within
+        0.1 %) is only injected once per episode.
+        """
+        n = self.SWEEP_N
+        if len(bars) < n + 2:
+            return
+
+        cur      = bars[-1]
+        lookback = bars[-(n + 1):-1]      # n bars immediately before current
+
+        prior_high = max(b["high"] for b in lookback)
+        prior_low  = min(b["low"]  for b in lookback)
+
+        last = self._last_sweep[inst] or {}
+
+        # ── Bullish sweep: wick below prior low, close above it ───────────────
+        if cur["low"] < prior_low and cur["close"] > prior_low:
+            if not (last.get("side") == "bull"
+                    and abs(last.get("level", 0) - prior_low) <= prior_low * 0.001):
+                atype = f"{inst} BULLISH SWEEP"
+                self._inject_alert(inst, atype, cur["close"])
+                self._last_sweep[inst] = {"side": "bull", "level": prior_low}
+
+        # ── Bearish sweep: wick above prior high, close below it ──────────────
+        elif cur["high"] > prior_high and cur["close"] < prior_high:
+            if not (last.get("side") == "bear"
+                    and abs(last.get("level", 0) - prior_high) <= prior_high * 0.001):
+                atype = f"{inst} BEARISH SWEEP"
+                self._inject_alert(inst, atype, cur["close"])
+                self._last_sweep[inst] = {"side": "bear", "level": prior_high}
 
     # ── Indicator helpers ─────────────────────────────────────────────────────
 

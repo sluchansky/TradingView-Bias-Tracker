@@ -50,6 +50,29 @@ for record in client:
 ## Candle mapping
 Databento bar `{ts (unix-s), open, high, low, close, volume}` → `Candle {t: ts*1000, o, h, l, c, vol: Math.min(1, volume/5000)}`.
 
+## Phase 1 activation (DONE — now live in prod)
+- `DATABENTO_ENABLED=1` set in shared env; `DATABENTO_API_KEY` secret set; `databento==0.82.0` installed via `uv add`.
+- Startup confirmation: `DatabentoBrain: connected ✓  streaming ['MGC.c.0', 'MNQ.c.0', 'MES.c.0', 'MYM.c.0']` + `subscription_ack`.
+- prod-start.sh uses `.pythonlibs/bin/python3` — databento must be installed via `uv add` (NOT just in requirements.txt) or the prod container won't have it.
+
+## Phase 2A — Sweep detector (DONE)
+- `_detect_sweep(inst, bars)` added to `DatabentoBrain`, called from `_on_bar_close` after `_detect_structure`.
+- Fires `"{inst} BULLISH SWEEP"` when current bar's low < prior SWEEP_N-bar low AND close > that low (lows swept, reclaimed).
+- Fires `"{inst} BEARISH SWEEP"` when current bar's high > prior SWEEP_N-bar high AND close < that high (highs swept, rejected).
+- Alert type is **instrument-prefixed** (`"MGC BULLISH SWEEP"`) to match the `ticker_scoped=True` lookup in `_latest_ts` / `_has`.
+- Deduped via `_last_sweep[inst]` — same direction + same level (within 0.1 %) fires only once per episode.
+- `SWEEP_N = 10` (10 prior bars = 10-minute lookback window).
+- Parity OK, goldens byte-identical.
+
+## What Databento already feeds (no ALERT_HISTORY injection needed)
+- **CVD15 Edge Score component**: reads `CVD_BY_TICKER["state"]` directly — Databento updates this every bar close. ✅
+- **Volume15 Edge Score component**: reads `RVOL_BY_TICKER` + `VOLUME_SPIKE_BY_TICKER` directly — Databento updates both. ✅
+- No CVD_BULLISH/CVD_BEARISH alerts needed in ALERT_HISTORY for gate scoring.
+
+## Remaining Phase 2 items
+- Phase 2B: Confirmation candle detector (`"{inst} BULLISH CONFIRMATION"`, `"{inst} BEARISH CONFIRMATION"`) — needs candle pattern logic (engulfing / strong directional close on above-avg volume). Requires `_after_anchor` — must fire AFTER structure.
+- Phase 2C: FVG detector — 3-candle imbalance gap. Complex, keep TV for now.
+
 ## Bars only close at minute boundaries
 `instruments: {}` and `bars: []` is NORMAL until the first minute boundary after the first trade.  `last_ts` in `/databento-status` being non-null confirms trades are flowing.  `instruments` populates only when `_on_bar_close` fires (when a NEW minute arrives).
 
