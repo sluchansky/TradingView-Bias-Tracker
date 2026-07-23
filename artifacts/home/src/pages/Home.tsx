@@ -2393,6 +2393,16 @@ export default function Home() {
   const hidePanel = (id: string) => setHiddenPanels(prev => { const n = new Set(prev); n.add(id); try { localStorage.setItem('atp_hidden', JSON.stringify([...n])); } catch {} return n; });
   const showPanel = (id: string) => setHiddenPanels(prev => { const n = new Set(prev); n.delete(id); try { localStorage.setItem('atp_hidden', JSON.stringify([...n])); } catch {} return n; });
 
+  const [collapsedPanels, setCollapsedPanels] = useState<Set<string>>(() => {
+    try { const s = localStorage.getItem('atp_collapsed'); return s ? new Set(JSON.parse(s) as string[]) : new Set<string>(); }
+    catch { return new Set<string>(); }
+  });
+  const toggleCollapse = (id: string) => setCollapsedPanels(prev => {
+    const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id);
+    try { localStorage.setItem('atp_collapsed', JSON.stringify([...n])); } catch {}
+    return n;
+  });
+
   const chatRef  = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const candlesRef      = useRef<Candle[]>([]);
@@ -4029,21 +4039,29 @@ export default function Home() {
               <div className="mb-chart" style={{ border:'1px solid rgba(255,255,255,0.042)', borderRadius:10, overflow:'hidden' }}>
                 <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
                   padding:'8px 14px', background:'rgba(255,255,255,0.018)' }}>
+                  <button onClick={() => toggleCollapse('mb-chart')} style={{ background:'none', border:'none', cursor:'pointer', fontSize:10, color:'rgba(255,255,255,0.22)', padding:'0 4px 0 0', lineHeight:1 }}
+                    title={collapsedPanels.has('mb-chart') ? 'Expand' : 'Collapse'}
+                    onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                    onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.22)'}>
+                    {collapsedPanels.has('mb-chart') ? '▸' : '▾'}
+                  </button>
                   <span style={{ fontSize:10.5, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.08em',
-                    color:'rgba(255,255,255,0.40)', textTransform:'uppercase' }}>{ticker} · 1m</span>
+                    color:'rgba(255,255,255,0.40)', textTransform:'uppercase', flex:1 }}>{ticker} · 1m</span>
                   <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                    {data?.vwap_value    && <span style={{ color:'#60a5fa', fontSize:10.5, fontFamily:'monospace' }}>VWAP {fmt(data.vwap_value)}</span>}
-                    {data?.nearest_demand && <span style={{ color:BULL,     fontSize:10.5, fontFamily:'monospace' }}>D {fmt(data.nearest_demand)}</span>}
-                    {data?.nearest_supply && <span style={{ color:BEAR,     fontSize:10.5, fontFamily:'monospace' }}>S {fmt(data.nearest_supply)}</span>}
+                    {!collapsedPanels.has('mb-chart') && data?.vwap_value    && <span style={{ color:'#60a5fa', fontSize:10.5, fontFamily:'monospace' }}>VWAP {fmt(data.vwap_value)}</span>}
+                    {!collapsedPanels.has('mb-chart') && data?.nearest_demand && <span style={{ color:BULL,     fontSize:10.5, fontFamily:'monospace' }}>D {fmt(data.nearest_demand)}</span>}
+                    {!collapsedPanels.has('mb-chart') && data?.nearest_supply && <span style={{ color:BEAR,     fontSize:10.5, fontFamily:'monospace' }}>S {fmt(data.nearest_supply)}</span>}
                     <button onClick={() => hidePanel('mb-chart')} title="Hide chart" style={{ background:'none', border:'none', cursor:'pointer', fontSize:13, lineHeight:1, color:'rgba(255,255,255,0.18)', padding:'0 2px', marginLeft:2 }}
                       onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.60)'}
                       onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.18)'}>×</button>
                   </div>
                 </div>
+                {!collapsedPanels.has('mb-chart') && (
                 <div style={{ height:160, padding:'8px 12px 10px', borderTop:'1px solid rgba(255,255,255,0.035)' }}>
                   <CandleChart candles={chartSnap} vwap={data?.vwap_value}
                     demand={data?.nearest_demand} supply={data?.nearest_supply} ticker={ticker} />
                 </div>
+                )}
               </div>
               )}{/* end mb-chart guard */}
 
@@ -4187,13 +4205,21 @@ export default function Home() {
 
           {/* ── INTELLIGENCE STRIP ──────────────────────────────────────── */}
           {!hiddenPanels.has('intel-strip') && (
-          <div style={{ position:'relative', marginBottom:16 }}>
-            <button onClick={() => hidePanel('intel-strip')} title="Hide panel" style={{ position:'absolute', top:0, right:0, zIndex:2,
-              background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1,
-              color:'rgba(255,255,255,0.13)', padding:'2px 5px' }}
-              onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.55)'}
-              onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.13)'}>×</button>
-            <div className="intel-strip" style={{ display:'flex', gap:8, flexWrap:'nowrap', minWidth:0 }}>
+          <div style={{ marginBottom:16, border:'1px solid rgba(255,255,255,0.038)', borderRadius:10, overflow:'hidden' }}>
+            <div style={{ display:'flex', alignItems:'center', padding:'5px 10px 5px 8px', background:'rgba(255,255,255,0.012)', borderBottom: collapsedPanels.has('intel-strip') ? 'none' : '1px solid rgba(255,255,255,0.030)' }}>
+              <button onClick={() => toggleCollapse('intel-strip')} style={{ background:'none', border:'none', cursor:'pointer', fontSize:10, color:'rgba(255,255,255,0.22)', padding:'0 5px 0 0', lineHeight:1 }}
+                title={collapsedPanels.has('intel-strip') ? 'Expand' : 'Collapse'}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.22)'}>
+                {collapsedPanels.has('intel-strip') ? '▸' : '▾'}
+              </button>
+              <span style={{ fontSize:8, fontFamily:'monospace', letterSpacing:'0.12em', textTransform:'uppercase', color:'rgba(255,255,255,0.25)', flex:1 }}>Intelligence Strip</span>
+              <button onClick={() => hidePanel('intel-strip')} title="Hide panel" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.13)', padding:'0 2px' }}
+                onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.13)'}>×</button>
+            </div>
+            {!collapsedPanels.has('intel-strip') && (
+            <div className="intel-strip" style={{ display:'flex', gap:8, flexWrap:'nowrap', minWidth:0, padding:'8px 0 2px' }}>
 
             {/* TODAY'S OBJECTIVE */}
             <SatPanel label="Today's Objective" style={{ flex:'1.6 1 0', minWidth:0 }}>
@@ -4248,7 +4274,8 @@ export default function Home() {
               );
             })()}
 
-            </div>{/* end intel-strip flex */}
+            </div>
+            )}{/* end intel-strip collapse guard */}
           </div>
           )}{/* end intel-strip hide guard */}
 
@@ -4258,16 +4285,25 @@ export default function Home() {
             border:'1px solid rgba(255,255,255,0.055)', background:'rgba(5,8,18,0.55)' }}>
             {/* Panel header */}
             <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-              padding:'7px 14px', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
-              <span style={{ fontSize:8, fontFamily:'monospace', letterSpacing:'0.13em',
-                color:'rgba(255,255,255,0.28)', textTransform:'uppercase' }}>AI Memory \u00b7 Performance History</span>
+              padding:'7px 14px', borderBottom: collapsedPanels.has('ai-mem') ? 'none' : '1px solid rgba(255,255,255,0.04)' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                <button onClick={() => toggleCollapse('ai-mem')} style={{ background:'none', border:'none', cursor:'pointer', fontSize:10, color:'rgba(255,255,255,0.22)', padding:'0 2px 0 0', lineHeight:1 }}
+                  title={collapsedPanels.has('ai-mem') ? 'Expand' : 'Collapse'}
+                  onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                  onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.22)'}>
+                  {collapsedPanels.has('ai-mem') ? '▸' : '▾'}
+                </button>
+                <span style={{ fontSize:8, fontFamily:'monospace', letterSpacing:'0.13em',
+                  color:'rgba(255,255,255,0.28)', textTransform:'uppercase' }}>AI Memory · Performance History</span>
+              </div>
               <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.16)' }}>7-day</span>
+                {!collapsedPanels.has('ai-mem') && <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.16)' }}>7-day</span>}
                 <button onClick={() => hidePanel('ai-mem')} title="Hide panel" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px' }}
                   onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
                   onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
               </div>
             </div>
+            {!collapsedPanels.has('ai-mem') && (<>
             {/* Stats row: Yesterday | This Week | Win Rate | Avg R:R | Best Setup */}
             <div style={{ display:'flex', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
               {/* Yesterday */}
@@ -4445,6 +4481,7 @@ export default function Home() {
                 </div>
               </div>
             </div>
+            </>)}{/* end ai-mem collapse guard */}
           </div>
           )}{/* end ai-mem guard */}
 
@@ -4590,8 +4627,14 @@ export default function Home() {
           {!hiddenPanels.has('rc-orderflow') && (
           <div className="rc-panel">
             <div className="rc-hdr">
+              <button onClick={() => toggleCollapse('rc-orderflow')} style={{ background:'none', border:'none', cursor:'pointer', fontSize:9, color:'rgba(255,255,255,0.22)', padding:'0 5px 0 0', lineHeight:1 }}
+                title={collapsedPanels.has('rc-orderflow') ? 'Expand' : 'Collapse'}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.22)'}>
+                {collapsedPanels.has('rc-orderflow') ? '▸' : '▾'}
+              </button>
               <span className="rc-title">Order Flow</span>
-              {(() => {
+              {!collapsedPanels.has('rc-orderflow') && (() => {
                 const c = String(sig.cvd || ad.cvd || '').toLowerCase();
                 const col = /bull|pos/.test(c) ? BULL : /bear|neg/.test(c) ? BEAR : MUTED;
                 const lbl = /bull|pos/.test(c) ? 'BULL DELTA' : /bear|neg/.test(c) ? 'BEAR DELTA' : 'NEUTRAL';
@@ -4601,8 +4644,9 @@ export default function Home() {
                 onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
                 onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
             </div>
-            {/* Mini delta bar chart seeded from live edge score */}
-            {(() => {
+            {!collapsedPanels.has('rc-orderflow') && (
+            /* Mini delta bar chart seeded from live edge score */
+            (() => {
               const isBull = /bull|pos/.test(String(sig.cvd || ad.cvd || '').toLowerCase());
               const isBear = /bear|neg/.test(String(sig.cvd || ad.cvd || '').toLowerCase());
               const seed   = Math.floor(edge * 13) + (isBull ? 1 : isBear ? 2 : 0);
@@ -4632,7 +4676,8 @@ export default function Home() {
                   </div>
                 </div>
               );
-            })()}
+            })()
+            )}
           </div>
           )}{/* end rc-orderflow guard */}
 
@@ -4640,11 +4685,18 @@ export default function Home() {
           {!hiddenPanels.has('rc-levels') && (
           <div className="rc-panel">
             <div className="rc-hdr">
+              <button onClick={() => toggleCollapse('rc-levels')} style={{ background:'none', border:'none', cursor:'pointer', fontSize:9, color:'rgba(255,255,255,0.22)', padding:'0 5px 0 0', lineHeight:1 }}
+                title={collapsedPanels.has('rc-levels') ? 'Expand' : 'Collapse'}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.22)'}>
+                {collapsedPanels.has('rc-levels') ? '▸' : '▾'}
+              </button>
               <span className="rc-title">Levels to Watch</span>
               <button onClick={() => hidePanel('rc-levels')} title="Hide" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px', marginLeft:'auto' }}
                 onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
                 onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
             </div>
+            {!collapsedPanels.has('rc-levels') && (
             <div style={{ padding:'8px 12px 10px' }}>
               {(() => {
                 const vwapV = Number(data?.vwap_value  || 0);
@@ -4677,6 +4729,7 @@ export default function Home() {
                 );
               })()}
             </div>
+            )}{/* end rc-levels collapse */}
           </div>
           )}{/* end rc-levels guard */}
 
@@ -4684,11 +4737,18 @@ export default function Home() {
           {!hiddenPanels.has('rc-structure') && (
           <div className="rc-panel">
             <div className="rc-hdr">
+              <button onClick={() => toggleCollapse('rc-structure')} style={{ background:'none', border:'none', cursor:'pointer', fontSize:9, color:'rgba(255,255,255,0.22)', padding:'0 5px 0 0', lineHeight:1 }}
+                title={collapsedPanels.has('rc-structure') ? 'Expand' : 'Collapse'}
+                onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
+                onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.22)'}>
+                {collapsedPanels.has('rc-structure') ? '▸' : '▾'}
+              </button>
               <span className="rc-title">Market Structure</span>
               <button onClick={() => hidePanel('rc-structure')} title="Hide" style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, lineHeight:1, color:'rgba(255,255,255,0.15)', padding:'0 2px', marginLeft:'auto' }}
                 onMouseEnter={e=>e.currentTarget.style.color='rgba(255,255,255,0.55)'}
                 onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,0.15)'}>×</button>
             </div>
+            {!collapsedPanels.has('rc-structure') && (
             <div style={{ padding:'8px 12px 10px' }}>
               {(() => {
                 const sc    = !!gd.structure_confirmed;
@@ -4716,6 +4776,7 @@ export default function Home() {
                 ));
               })()}
             </div>
+            )}{/* end rc-structure collapse */}
           </div>
           )}{/* end rc-structure guard */}
 
