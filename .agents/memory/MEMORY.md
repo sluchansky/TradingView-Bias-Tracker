@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Databento live feed integration](databento-integration.md) — flag-gated (DATABENTO_ENABLED=1 + DATABENTO_API_KEY); DatabentoBrain injects into existing state stores; routes return disabled-JSON not 404; dashboard panel shows OFFLINE safely.
 - [Overnight volatility fetch (ES/NQ bar scarcity)](overnight-volatility-fetch.md) — ES/NQ return only ~12 bars overnight; VOL_MIN_BARS must stay ≤ that or MES/MNQ ATR silently breaks.
 - [Brain Contract JS migration (Phase 3A)](brain-contract-js-migration.md) — getBrain(d)/buildLegacyFallback are the only entry points; supporting_diagnostics=dict(_gov); 10 render fns migrated.
 - [Avatar Intelligence Engine v1](avatar-intelligence-engine.md) — proactive event queue + daily greeting + explain-simply mode + mbMemory placeholder; hook is mbAvatarObserve(d) at end of renderModules.

@@ -494,6 +494,17 @@ CVD_TYPES         = CVD_BULLISH_TYPES | CVD_BEARISH_TYPES
 # no-op) and SCALP-only. The SWING money path is never touched.
 DUAL_TF_ENGINE = os.environ.get("DUAL_TF_ENGINE", "").strip().lower() in ("1", "true", "yes", "on")
 
+# ── Databento real-time feed (default OFF — byte-identical when unset) ────────
+# Set DATABENTO_ENABLED=1 + add DATABENTO_API_KEY secret to activate.
+# When OFF: zero behaviour change, all goldens pass.
+# When ON:  DatabentoBrain streams live trades and injects VWAP / ATR / CVD /
+#           RVOL / structure alerts into the existing state stores.  TV webhook
+#           alerts continue to work normally as supplemental signals.
+DATABENTO_ENABLED = os.environ.get(
+    "DATABENTO_ENABLED", ""
+).strip().lower() in ("1", "true", "yes", "on")
+_DATABENTO_BRAIN  = None   # populated in __main__ when DATABENTO_ENABLED is True
+
 # ── Live-loss-reduction money-path flags (2026-06-29) ─────────────────────────
 # Four reversible, DEFAULT-ON protections added after sustained real-account
 # underperformance (PF 0.54, ~23% win rate). Each has an env kill-switch (set to
@@ -33354,6 +33365,69 @@ def get_thesis_stale():
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABENTO LIVE FEED — display-only market-data endpoints
+# Both routes are safe when DATABENTO_ENABLED=False: they return an explicit
+# "disabled" response rather than 404 so the dashboard chart can distinguish
+# "feed off" from "route missing".  The bars themselves contain no PII or
+# order data.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/databento-bars", methods=["GET"])
+def get_databento_bars():
+    """
+    GET /databento-bars?inst=MNQ&limit=60
+    Returns the most recent 1-minute OHLCV bars built from the Databento
+    live feed.  Each bar: {ts, open, high, low, close, volume, vwap?, atr?}.
+    Display-only — never read by full_analysis or the gate.
+    """
+    if not DATABENTO_ENABLED or _DATABENTO_BRAIN is None:
+        return jsonify({
+            "ok":      False,
+            "enabled": False,
+            "reason":  "Databento feed is not enabled (set DATABENTO_ENABLED=1)",
+            "bars":    [],
+        }), 200
+
+    from databento_brain import DATABENTO_BARS_BY_INST   # noqa: PLC0415
+    inst = request.args.get("inst", "MNQ").upper()
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", 60))))
+    except (TypeError, ValueError):
+        limit = 60
+
+    bars = list(DATABENTO_BARS_BY_INST.get(inst, []))
+    return jsonify({
+        "ok":    True,
+        "enabled": True,
+        "inst":  inst,
+        "bars":  bars[-limit:],
+        "count": len(bars),
+    })
+
+
+@app.route("/databento-status", methods=["GET"])
+def get_databento_status():
+    """
+    GET /databento-status
+    Connection health + per-instrument telemetry (VWAP, ATR, CVD, RVOL,
+    bar count, last price).  Owner-only — contains internal indicator values.
+    """
+    if not DATABENTO_ENABLED or _DATABENTO_BRAIN is None:
+        return jsonify({
+            "ok":      False,
+            "enabled": False,
+            "reason":  "Databento feed not enabled",
+        }), 200
+
+    from databento_brain import DATABENTO_STATUS   # noqa: PLC0415
+    return jsonify({
+        "ok":      True,
+        "enabled": True,
+        "status":  DATABENTO_STATUS,
+    })
+
+
 def _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False):
     """Derive a per-instrument setup lifecycle state AFTER an evaluation. Pure
     display/diagnostics — it is NEVER read by full_analysis or the gate, so it can
@@ -61894,6 +61968,33 @@ if __name__ == "__main__":
         threading.Timer(0, _live_runner_watch_loop).start()  # LIVE 2-contract runner watcher (own timer); only started when the feature is enabled, and itself inert unless armed
     if AUTO_EXIT_ENABLED:
         threading.Timer(0, _auto_exit_watch_loop).start()  # AUTO EARLY-EXIT watcher (own timer); inert unless owner-ARMED via /auto-exit (arm resets OFF each restart); live sends only on the LIVE traderspost instance, paper closes locally
+    # ── Databento Brain — real-time market data feed ──────────────────────────
+    # Set DATABENTO_ENABLED=1 + DATABENTO_API_KEY secret to activate.
+    # Default OFF → byte-identical; TV webhook alerts keep working normally.
+    # When ON: streams live trades → VWAP / ATR / CVD / structure injected
+    # into existing state stores → full_analysis + heartbeat pick up instantly.
+    if DATABENTO_ENABLED:
+        try:
+            from databento_brain import DatabentoBrain   # noqa: PLC0415
+            globals()["_DATABENTO_BRAIN"] = DatabentoBrain(
+                alert_history              = ALERT_HISTORY,
+                cvd_by_ticker              = CVD_BY_TICKER,
+                rvol_by_ticker             = RVOL_BY_TICKER,
+                auto_price_by_ticker       = AUTO_PRICE_BY_TICKER,
+                current_price_by_ticker    = CURRENT_PRICE_BY_TICKER,
+                current_price_ts_by_ticker = CURRENT_PRICE_TS_BY_TICKER,
+                volume_spike_by_ticker     = VOLUME_SPIKE_BY_TICKER,
+                now_utc_fn                 = now_utc,
+            )
+            _DATABENTO_BRAIN.start()
+            logger.info("DatabentoBrain: initialized and started")
+        except Exception as _db_exc:
+            logger.error("DatabentoBrain: failed to start — %s", _db_exc)
+    else:
+        logger.info(
+            "DatabentoBrain: DATABENTO_ENABLED=0 — feed OFF (byte-identical mode); "
+            "set DATABENTO_ENABLED=1 + DATABENTO_API_KEY to activate"
+        )
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     threading.Timer(0, _micro_ghost_watch_loop).start()  # MICRO SCALP ghost watcher — started UNCONDITIONALLY; the loop self-gates on MICRO_GHOST_DB_READY + DISCORD_LIVE_ENABLED inside, so a lazy DB-ready flip (POST /micro-scalp) still gets its ghosts resolved without a restart. Resolves ghost rows only — never the money path.
     if EVAL_HEARTBEAT_ENABLED:

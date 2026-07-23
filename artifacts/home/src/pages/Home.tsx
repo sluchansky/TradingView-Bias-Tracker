@@ -2350,6 +2350,7 @@ function useDemoEngine(
 const PANEL_NAMES: Record<string,string> = {
   'intel-strip':  'Intelligence Strip',
   'mb-chart':     'Live Chart',
+  'db-chart':     'Databento Feed',
   'session-mem':  'Session Memory',
   'quick-chips':  'Quick Chips',
   'evidence':     'Evidence Snapshot',
@@ -2402,6 +2403,10 @@ export default function Home() {
     try { localStorage.setItem('atp_collapsed', JSON.stringify([...n])); } catch {}
     return n;
   });
+
+  // ── Databento live feed state ─────────────────────────────────────────────
+  const [dbBars,   setDbBars]   = useState<any[]>([]);
+  const [dbStatus, setDbStatus] = useState<any>(null);
 
   const chatRef  = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -2479,6 +2484,32 @@ export default function Home() {
 
   // Sync chart snapshot every time candlesV bumps — gives CandleChart a new array reference
   useEffect(() => { setChartSnap([...candlesRef.current]); }, [candlesV]);
+
+  // ── Databento live feed poll (5-second cadence, independent of main poll) ──
+  // Fetches /databento-bars for the selected instrument.  When the feed is OFF
+  // the endpoint returns {ok:false, enabled:false} — not an error — so the panel
+  // simply shows "OFFLINE" rather than hiding.  Display-only; never affects gate.
+  useEffect(() => {
+    if (!authPwd || demoMode) return;
+    const fetchDb = async () => {
+      try {
+        const r = await fetch(`/api/databento-bars?inst=${ticker}&limit=80`,
+          { credentials: 'include', headers: authHeader });
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d.enabled && Array.isArray(d.bars)) {
+          setDbBars(d.bars);
+          setDbStatus({ connected: true, inst: d.inst, count: d.count });
+        } else {
+          setDbBars([]);
+          setDbStatus({ connected: false, reason: d.reason });
+        }
+      } catch { /* feed may be off — silently ignore */ }
+    };
+    fetchDb();
+    const id = setInterval(fetchDb, 5000);
+    return () => clearInterval(id);
+  }, [ticker, authPwd, authHeader, demoMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 30s auto-follow: switch to highest-edge / actionable ticker ────────────
   const autoTickerRef     = useRef<Ticker>('MNQ');
@@ -4064,6 +4095,101 @@ export default function Home() {
                 )}
               </div>
               )}{/* end mb-chart guard */}
+
+              {/* ── DATABENTO LIVE FEED CHART ─────────────────────────────────
+                  Polls /api/databento-bars every 5 s.  Shows "OFFLINE" badge
+                  when DATABENTO_ENABLED=0 (flag default) so the panel is safe
+                  to ship before the API key exists.  Display-only — never
+                  touches the gate or any money-path state.              ── */}
+              {!hiddenPanels.has('db-chart') && (() => {
+                const dbConnected = !!(dbStatus?.connected);
+                const dbCount     = Number(dbStatus?.count ?? dbBars.length);
+                const dbLastPrice = dbBars.length > 0 ? (dbBars[dbBars.length - 1].close || 0) : 0;
+                const dbVwap      = dbBars.length > 0 ? (dbBars[dbBars.length - 1].vwap  || 0) : 0;
+                // Map Databento bars → Candle format used by the existing CandleChart
+                const dbCandles: Candle[] = dbBars.map((b: any) => ({
+                  t:   (b.ts   || 0) * 1000,         // unix-s → unix-ms
+                  o:   b.open  || 0,
+                  h:   b.high  || 0,
+                  l:   b.low   || 0,
+                  c:   b.close || 0,
+                  vol: Math.min(1, (b.volume || 0) / 5000),
+                }));
+                return (
+                  <div className="mod" id="db-chart" style={{
+                    background:'rgba(255,255,255,0.025)', borderRadius:10,
+                    border:'1px solid rgba(255,255,255,0.06)', overflow:'hidden',
+                  }}>
+                    {/* Header row */}
+                    <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                      padding:'7px 12px 6px', gap:8 }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                        <span style={{ fontSize:8.5, fontFamily:'monospace', fontWeight:700,
+                          letterSpacing:'0.12em', textTransform:'uppercase',
+                          color:'rgba(255,255,255,0.30)' }}>Databento Feed</span>
+                        {/* Connection pill */}
+                        <span style={{
+                          fontSize:8, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.06em',
+                          padding:'1px 7px', borderRadius:8,
+                          background: dbConnected ? 'rgba(34,197,94,0.14)' : 'rgba(255,255,255,0.05)',
+                          color:       dbConnected ? '#22c55e' : 'rgba(255,255,255,0.22)',
+                          border:`1px solid ${dbConnected ? '#22c55e44' : 'rgba(255,255,255,0.08)'}`,
+                        }}>
+                          {dbConnected ? `● LIVE · ${dbCount} bars` : '○ OFFLINE'}
+                        </span>
+                      </div>
+                      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                        {/* Inline price / VWAP badges (only when feed is live) */}
+                        {dbConnected && dbLastPrice > 0 && (
+                          <span style={{ fontSize:10.5, fontFamily:'monospace', color:'rgba(255,255,255,0.55)' }}>
+                            {fmt(dbLastPrice)}
+                          </span>
+                        )}
+                        {dbConnected && dbVwap > 0 && (
+                          <span style={{ fontSize:10.5, fontFamily:'monospace', color:'#60a5fa' }}>
+                            VWAP {fmt(dbVwap)}
+                          </span>
+                        )}
+                        {/* Collapse / hide controls */}
+                        <button onClick={() => toggleCollapse('db-chart')}
+                          title={collapsedPanels.has('db-chart') ? 'Expand' : 'Collapse'}
+                          style={{ background:'none', border:'none', color:'rgba(255,255,255,0.22)',
+                            cursor:'pointer', fontSize:12, padding:'0 2px', lineHeight:1 }}>
+                          {collapsedPanels.has('db-chart') ? '▸' : '▾'}
+                        </button>
+                        <button onClick={() => hidePanel('db-chart')}
+                          title="Hide panel"
+                          style={{ background:'none', border:'none', color:'rgba(255,255,255,0.14)',
+                            cursor:'pointer', fontSize:11, padding:'0 2px', lineHeight:1 }}>✕</button>
+                      </div>
+                    </div>
+                    {/* Chart body */}
+                    {!collapsedPanels.has('db-chart') && (
+                      <div style={{ height:160, padding:'8px 12px 10px',
+                        borderTop:'1px solid rgba(255,255,255,0.035)' }}>
+                        {dbConnected && dbCandles.length > 1 ? (
+                          <CandleChart candles={dbCandles} vwap={dbVwap || undefined}
+                            demand={undefined} supply={undefined} ticker={ticker} />
+                        ) : (
+                          <div style={{ height:'100%', display:'flex', flexDirection:'column',
+                            alignItems:'center', justifyContent:'center', gap:6 }}>
+                            <span style={{ fontSize:11, fontFamily:'monospace',
+                              color:'rgba(255,255,255,0.18)', letterSpacing:'0.06em' }}>
+                              {dbConnected ? 'Waiting for bars…' : 'Feed offline — set DATABENTO_ENABLED=1'}
+                            </span>
+                            {!dbConnected && (
+                              <span style={{ fontSize:9, fontFamily:'monospace',
+                                color:'rgba(255,255,255,0.10)', letterSpacing:'0.04em' }}>
+                                TV webhook chart still active above
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* ── SUGGESTED TRADE ─ shown when edge ≥ 65 and a plan exists ── */}
               {edge >= 65 && !isManaging && (() => {

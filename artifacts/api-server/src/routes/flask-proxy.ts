@@ -223,6 +223,13 @@ export const BOT1_ROUTES = [
   "/thesis/stale",
   "/thesis/:instrument",
   "/thesis/:instrument/history",
+  // Databento live feed — display-only market data endpoints.
+  // /databento-bars: 1-minute OHLCV bars for the dashboard live chart.
+  // /databento-status: connection health + per-instrument telemetry.
+  // Both return {"ok":false,"enabled":false} when DATABENTO_ENABLED=0 so the
+  // UI can distinguish "feed off" from "route missing".
+  "/databento-bars",
+  "/databento-status",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.
