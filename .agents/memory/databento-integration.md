@@ -69,14 +69,13 @@ Databento bar `{ts (unix-s), open, high, low, close, volume}` → `Candle {t: ts
 - **Volume15 Edge Score component**: reads `RVOL_BY_TICKER` + `VOLUME_SPIKE_BY_TICKER` directly — Databento updates both. ✅
 - No CVD_BULLISH/CVD_BEARISH alerts needed in ALERT_HISTORY for gate scoring.
 
-## Phase 2B — Confirmation candle detector (DONE)
+## Phase 2B — Confirmation candle detector (DONE + tuned)
 - `_detect_confirmation(inst, bars)` added to `DatabentoBrain`; called from `_on_bar_close` AFTER `_detect_sweep`.
 - Fires `"{inst} BULLISH CONFIRMATION"` / `"{inst} BEARISH CONFIRMATION"` (ticker_scoped=True).
-- Three simultaneous requirements: (1) `_trend[inst]` set by prior BOS/CHOCH; (2) strong close (top/bottom 65% of bar range) OR engulfing vs prior bar; (3) volume >= 1.2× 10-bar rolling avg.
-- Deduped via `_last_confirm[inst]` keyed on `_last_bos[inst]["level"]` — fires once per structure episode; resets automatically when a new BOS/CHOCH fires at a different price level.
-- `_after_anchor` in gate satisfied naturally: `_detect_structure` runs before `_detect_confirmation`, so inject timestamp of confirmation >= inject timestamp of structure alert.
-- Constants: `CONFIRM_N=10`, `CONFIRM_BODY_RATIO=0.65`, `CONFIRM_VOL_MULT=1.2`.
-- Parity OK, goldens byte-identical.
+- Four simultaneous requirements: (1) `_trend[inst]` set by prior BOS/CHOCH; (2) strong close (top/bottom 65% of range) OR engulfing vs prior bar; (3) volume >= 1.5× 10-bar rolling avg; (4) 15-min direction-aware cooldown.
+- **Cooldown (tuning fix):** original level-based dedup fired every bar because BOS dedup tolerance is sub-tick (< 0.01), causing BOS to re-fire on almost every bar with a slightly different pivot level, clearing the confirmation dedup each time. Replaced with `{side, ts}` tracking + `CONFIRM_COOLDOWN_MIN=15` — same-direction confirmation suppressed for 15 min; resets automatically on trend flip.
+- **Volume (tuning fix):** raised from 1.2× to 1.5× — requires meaningfully elevated participation, not just slightly above average.
+- Constants: `CONFIRM_N=10`, `CONFIRM_BODY_RATIO=0.65`, `CONFIRM_VOL_MULT=1.5`, `CONFIRM_COOLDOWN_MIN=15`.
 - Unlocks the confirmation-candle path inside `reaction_long`/`reaction_short` and `zone_valid_long`/`zone_valid_short` from Databento independently of TradingView.
 
 ## Phase 2C — HH/HL/LH/LL swing-structure labels (DONE)
