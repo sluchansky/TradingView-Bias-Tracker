@@ -102,6 +102,7 @@ class DatabentoBrain:
         current_price_by_ticker,
         current_price_ts_by_ticker,
         volume_spike_by_ticker,
+        volatility_by_ticker=None,
         now_utc_fn=None,
     ):
         # Shared state stores from app.py (passed by reference — writes are visible
@@ -113,6 +114,7 @@ class DatabentoBrain:
         self._cp    = current_price_by_ticker
         self._cp_ts = current_price_ts_by_ticker
         self._vs    = volume_spike_by_ticker
+        self._vol   = volatility_by_ticker  # VOLATILITY_BY_TICKER — populated per bar close
         self._now   = now_utc_fn or (lambda: datetime.now(timezone.utc))
 
         # Reverse map: continuous-contract symbol → bot instrument key
@@ -423,6 +425,19 @@ class DatabentoBrain:
         if vwap is not None: pub["vwap"] = vwap
         if atr  is not None: pub["atr"]  = atr
         DATABENTO_BARS_BY_INST[inst].append(pub)
+
+        # ── VOLATILITY_BY_TICKER (replaces Yahoo Finance volatility fetch) ────
+        # Compute ATR ratio = recent_atr / baseline_atr so get_volatility() can
+        # classify the regime. baseline = per-instrument typical ATR from config.
+        if atr is not None and self._vol is not None:
+            baseline = self._ATR_BASELINES.get(inst, atr)
+            ratio    = round(atr / baseline, 4) if baseline > 0 else 1.0
+            self._vol[inst] = {
+                "atr_pts":     round(atr, 4),
+                "baseline_pts": round(baseline, 4),
+                "ratio":       ratio,
+                "ts":          now_iso,
+            }
 
         # ── Telemetry ─────────────────────────────────────────────────────────
         DATABENTO_STATUS["instruments"][inst] = {

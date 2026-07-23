@@ -2,10 +2,10 @@
 
 > **Scope:** `artifacts/tradingview-webhook/app.py` (~5,700 lines), a single-file Flask
 > service fronted by a Node/Express API server (`artifacts/api-server`).
-> **Nature:** **Alert-driven.** The system holds *no OHLC bar history of its own* for
-> decision-making — every market-structure fact arrives as a discrete TradingView alert.
-> Live 1-minute OHLC is pulled from Yahoo Finance only for VWAP and for the trade-management
-> watcher.
+> **Nature:** **Alert-driven + live feed.** Market-structure decisions arrive as discrete
+> TradingView alerts. Live VWAP / ATR / CVD / price are streamed in real time by
+> **DatabentoBrain** (`databento_brain.py`) — set `DATABENTO_ENABLED=1` + `DATABENTO_API_KEY`.
+> Yahoo Finance has been fully removed.
 > **Instruments:** Two — **MGC** (Micro Gold) and **MNQ** (Micro Nasdaq).
 > Line numbers below are approximate (the file changes as features are added).
 
@@ -31,17 +31,20 @@
                               │                │                 │
                               ▼                ▼                 ▼
                         Discord webhooks   JOURNAL (mem)   MANAGED_TRADES_BY_KEY
-                        (per-instrument,   in-memory list   watched by the VWAP
-                         A+, journal)      (max 500)        autofetch loop (yfinance)
+                        (per-instrument,   in-memory list   watched by the managed
+                         A+, journal)      (max 500)        trade watcher (Databento)
 ```
 
 **Background loops (threads):**
-- **VWAP autofetch loop** (`_vwap_autofetch_loop`, ~L2321) — every ~60s pulls 1m bars,
-  refreshes VWAP, and **piggybacks** the managed-trade watcher.
-- **Trade-ready loop / event checker** (`_trade_ready_loop`, `check_trade_events` ~L4595) —
+- **DatabentoBrain** (`databento_brain.py`) — streams live trades → VWAP / ATR / CVD /
+  structure injected into `AUTO_PRICE_BY_TICKER`, `VOLATILITY_BY_TICKER`, `CVD_BY_TICKER`.
+  Replaces all Yahoo Finance fetching. Activate with `DATABENTO_ENABLED=1`.
+- **Managed-trade watcher** (`_managed_watch_loop`) — checks open managed-trade stops/TPs
+  against the latest Databento bar every `MANAGED_WATCH_INTERVAL` seconds.
+- **Trade-ready loop / event checker** (`_trade_ready_loop`, `check_trade_events`) —
   re-posts READY cards on an interval and tracks the manual `ACTIVE_TRADE`.
-- **EOD scheduler** (`_schedule_eod`, ~L530) — daily summary at `EOD_HOUR_UTC` (21:00 UTC).
-- **Weekly scheduler** (`_schedule_weekly_report`, ~L751) — Friday post-close report.
+- **EOD scheduler** (`_schedule_eod`) — daily summary at `EOD_HOUR_UTC` (21:00 UTC).
+- **Weekly scheduler** (`_schedule_weekly_report`) — Friday post-close report.
 
 The central design rule of the recent upgrade is **additive & fail-open**: the webhook
 ingestion path, TradingView alert messages, the READY gate, throttling, the 5-minute repost,
@@ -66,7 +69,7 @@ in scoring, management, or reporting can never stop an existing alert from sendi
   - **Commands:** `ENTER`, `CLOSE` (manual trade lifecycle).
   - **Data:** `… VWAP` (push an exact chart VWAP value).
 - **No new alerts required** by the recent upgrade — every new feature is derived from the
-  existing alert stream and from yfinance OHLC.
+  existing alert stream and from Databento live bars.
 
 ---
 

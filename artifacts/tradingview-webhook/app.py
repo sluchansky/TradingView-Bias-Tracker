@@ -110,7 +110,7 @@ ALERT_HISTORY    = deque(maxlen=1000)
 CURRENT_PRICE    = None
 CURRENT_PRICE_BY_TICKER = {}   # {"MNQ": float, "MGC": float} — latest price per instrument (alert-driven)
 CURRENT_PRICE_TS_BY_TICKER = {}  # {"MNQ": iso8601} — UTC time the alert price above was last set
-# Yahoo-sourced fallback price per instrument, refreshed by the VWAP auto-fetch
+# Auto price per instrument — populated by DatabentoBrain (source: "databento")
 # loop. DISPLAY-ONLY: it keeps the dashboard price readout live after a restart or
 # during quiet markets, and is NEVER read by the gate / scoring (which stay on the
 # authoritative alert-driven price above).
@@ -297,7 +297,7 @@ MITIGATED_PRICES_BY_TICKER = {}   # {inst: [{"price": float, "ts": str}, ...]} c
 MITIGATED_FLAG_BY_TICKER   = {}   # {inst: bool} — mitigation active for this instrument
 VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso}, "MGC": {...}} — latest VWAP per instrument
 VOLATILITY_BY_TICKER = {}     # {"MNQ": {"atr_pts","ratio","ts"}, "MGC": {...}} — latest volatility per instrument
-# SWING higher-timeframe context per instrument (auto-computed from the Yahoo HTF
+# SWING higher-timeframe context per instrument (populated via Pine Script webhooks;
 # feed; optionally overlaid by inbound chart pushes during a grace window — P3).
 # DISPLAY-ONLY until the SWING money gate (P4) reads it fail-CLOSED. Schema per inst:
 # {"1H": {bias,ema_fast,ema_slow,atr,confidence,bars,ts,source},
@@ -3345,8 +3345,6 @@ WEEKLY_REPORT_DAYS      = int(os.environ.get("WEEKLY_REPORT_DAYS", 7))  # lookba
 # Session VWAP is pulled from a public market-data feed so the operator never has
 # to type it. A VWAP pushed from a TradingView chart (source "chart") is exact and
 # wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that the auto value resumes.
-VWAP_FETCH_INTERVAL    = int(os.environ.get("VWAP_FETCH_INTERVAL", 60))   # seconds
-PRICE_FETCH_INTERVAL   = int(os.environ.get("PRICE_FETCH_INTERVAL", 10))  # seconds — DISPLAY-ONLY price refresh (faster than VWAP so the dashboard price stays near-live)
 MANAGED_WATCH_INTERVAL = max(5, int(os.environ.get("MANAGED_WATCH_INTERVAL", 15)))  # seconds — open-trade exit (stop/TP) watcher cadence; own fast timer, decoupled from the slower VWAP/HTF loop. No-op (zero fetches) while flat. Floored at 5s so a stray env value can't hot-loop the timer.
 VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # minutes
 # How long an alert/chart price stays the AUTHORITATIVE dashboard readout after it
@@ -3354,80 +3352,6 @@ VWAP_OVERRIDE_GRACE_MIN = int(os.environ.get("VWAP_OVERRIDE_GRACE_MIN", 10))  # 
 # stale (no alerts) the readout falls back to the auto-fetched market price so it
 # keeps moving. Display-only — never affects the gate.
 PRICE_FRESH_MIN = float(os.environ.get("PRICE_FRESH_MIN", 5))  # minutes
-# MGC (micro gold) ≈ GC=F, MNQ (micro Nasdaq) ≈ NQ=F — same price, so same VWAP.
-# Derived from the registry's per-asset vwap_feed (new assets auto-covered).
-VWAP_FEED_SYMBOL = {inst: a["vwap_feed"] for inst, a in ASSETS.items()}
-
-# ── SWING higher-timeframe (HTF) auto-fetch tuning (display-only infra) ────────
-# HTF context changes slowly (hourly/daily bars), so it refreshes on a much slower
-# cadence than VWAP. The refresh is folded into the VWAP loop but throttled to this
-# interval, and only runs at all when _swing_htf_enabled() (SWING + flag on) — SCALP
-# never fetches HTF. All env-overridable; pure infra (not mode-behaviour knobs).
-HTF_FETCH_INTERVAL = int(os.environ.get("HTF_FETCH_INTERVAL", 300))  # seconds between HTF refreshes
-HTF_1H_INTERVAL    = os.environ.get("HTF_1H_INTERVAL", "60m")        # Yahoo interval for the 1H series
-HTF_1H_RANGE       = os.environ.get("HTF_1H_RANGE", "1mo")           # Yahoo range for the 1H series
-HTF_1D_INTERVAL    = os.environ.get("HTF_1D_INTERVAL", "1d")         # Yahoo interval for the daily series
-HTF_1D_RANGE       = os.environ.get("HTF_1D_RANGE", "6mo")           # Yahoo range for the daily series
-HTF_EMA_FAST       = int(os.environ.get("HTF_EMA_FAST", 8))          # fast EMA period for HTF bias
-HTF_EMA_SLOW       = int(os.environ.get("HTF_EMA_SLOW", 21))         # slow EMA period for HTF bias
-HTF_4H_BUCKET_SEC  = 4 * 3600                                        # resample 60m → 4H buckets (UTC-aligned)
-HTF_SWING_PIVOT_K  = 2                                               # daily pivot half-width for swing H/L detection
-
-
-def _send_heartbeat():
-    """Post an hourly status embed to all configured trade-alert channels."""
-    now = datetime.now(timezone.utc)
-
-    # ── Last alert time ────────────────────────────────────────────────────
-    if LAST_ALERT_AT:
-        delta   = now - LAST_ALERT_AT
-        minutes = int(delta.total_seconds() / 60)
-        if minutes < 60:
-            age = f"{minutes}m ago"
-        else:
-            age = f"{minutes // 60}h {minutes % 60}m ago"
-        last_str = f"{fmt_et(LAST_ALERT_AT, '%H:%M ET')}  ({age})"
-    else:
-        last_str = "No alerts received yet"
-
-    # ── Active trade (aggregate DISPLAY: any open position) ──────────────────
-    _disp_trade = any_active_trade()
-    if _disp_trade:
-        at         = _disp_trade
-        sym        = (at.get("profile") or "").split()[0] or "—"
-        direction  = at.get("direction", "—")
-        entry      = at.get("entry_price", "—")
-        trade_str  = f"{direction} {sym}  |  Entry `{entry}`"
-        status_str = "🟢 Active Trade in Progress"
-    else:
-        trade_str  = "None"
-        status_str = "🔵 Watching — No Active Trade"
-
-    embed = {
-        "color":       0x00BFFF,
-        "author":      {"name": BOT_NAME},
-        "description": "**System heartbeat — all systems operational**",
-        "fields": [
-            {"name": "Last alert received", "value": last_str,   "inline": False},
-            {"name": "Active trade",        "value": trade_str,  "inline": True},
-            {"name": "Status",              "value": status_str, "inline": True},
-        ],
-        "footer": {"text": "Check-in  ·  " + fmt_et(now, "%Y-%m-%d %H:%M ET")},
-    }
-
-    for url in filter(None, [DISCORD_WEBHOOK_URL, DISCORD_MNQ_WEBHOOK_URL]):
-        try:
-            requests.post(url, json={"embeds": [embed]}, timeout=5)
-        except Exception:
-            pass
-    logger.info("Heartbeat sent.")
-
-
-def _heartbeat_loop():
-    """Send heartbeat now then reschedule every HEARTBEAT_INTERVAL seconds."""
-    _send_heartbeat()
-    threading.Timer(HEARTBEAT_INTERVAL, _heartbeat_loop).start()
-
 
 # ── End-of-day summary ────────────────────────────────────────────────────────
 
@@ -5921,316 +5845,10 @@ def get_vwap(ticker, max_age_min=None):
     return float(rec["value"]), "ok"
 
 
-# ── Shared intraday-feed fetch + quiet status logging ────────────────────────
-# Yahoo returns HTTP 200 with an EMPTY quote block when the market is closed (no
-# intraday bars yet). That benign "market closed" case used to raise KeyError
-# 'high' and spam the logs every cycle; we now classify it separately so it is
-# logged once per transition while genuine failures stay visible as warnings.
-MARKET_CLOSED_SENTINEL = "no intraday data (market closed)"
-_FEED_STATUS = {}  # (label, instrument) -> "ok" | "closed" | "error"
-
-# Short-lived cache for _fetch_intraday_quote so that the VWAP loop and the
-# volatility loop (which run back-to-back in the same 60-second tick) reuse the
-# same HTTP response without making a second request.  Yahoo Finance occasionally
-# returns sparse/empty bar arrays for a second same-symbol request within a few
-# seconds (rate-limiting), which caused MNQ/MES volatility to silently fail while
-# VWAP succeeded on the first call.  45 s is long enough to cover the sequential
-# loop; short enough to never serve truly stale data to any caller.
-_INTRADAY_QUOTE_CACHE: dict = {}       # symbol -> (quote, err, monotonic_ts)
-_INTRADAY_QUOTE_CACHE_TTL = 45        # seconds
-
-
-def _fetch_intraday_quote(symbol):
-    """Fetch the 1-min/1d Yahoo chart `quote` block for `symbol`.
-
-    Returns (quote_dict, err). The benign market-closed case (empty quote block)
-    returns (None, MARKET_CLOSED_SENTINEL); a genuine failure returns
-    (None, "<reason>"); success returns (quote_dict, None).
-
-    Results are cached for _INTRADAY_QUOTE_CACHE_TTL seconds so that callers
-    in the same auto-fetch tick (VWAP then volatility) share one HTTP request.
-    """
-    import time as _time
-    cached = _INTRADAY_QUOTE_CACHE.get(symbol)
-    if cached:
-        _q, _e, _ts = cached
-        if _time.monotonic() - _ts < _INTRADAY_QUOTE_CACHE_TTL:
-            return _q, _e
-
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    try:
-        resp = requests.get(
-            url,
-            params={"interval": "1m", "range": "1d"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-        )
-        if resp.status_code != 200:
-            _INTRADAY_QUOTE_CACHE[symbol] = (None, f"HTTP {resp.status_code}", _time.monotonic())
-            return None, f"HTTP {resp.status_code}"
-        result = resp.json()["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-        _INTRADAY_QUOTE_CACHE[symbol] = (None, f"fetch error: {exc}", _time.monotonic())
-        return None, f"fetch error: {exc}"
-    # Market closed / no session yet: Yahoo returns 200 with an empty quote block.
-    if not quote or quote.get("high") is None:
-        _INTRADAY_QUOTE_CACHE[symbol] = (None, MARKET_CLOSED_SENTINEL, _time.monotonic())
-        return None, MARKET_CLOSED_SENTINEL
-    # Populated-but-incomplete payload is a genuine anomaly, not the benign closed
-    # case — surface it as a real error (logged as a warning) rather than letting a
-    # later key access raise. (Open-market payloads always include all OHLCV keys.)
-    if quote.get("low") is None or quote.get("close") is None:
-        _INTRADAY_QUOTE_CACHE[symbol] = (None, "incomplete quote payload", _time.monotonic())
-        return None, "incomplete quote payload"
-    # Expose the per-bar OPEN timestamps (epoch secs, index-aligned with the OHLC
-    # arrays) so callers can tell WHICH minute a bar belongs to — needed to stop a
-    # managed trade from being "filled" on a bar that opened before it entered.
-    # Additive: every existing consumer reads high/low/close/volume by key only.
-    quote["_timestamps"] = result.get("timestamp")
-    # Expose the meta block (regularMarketPrice/Volume/DayHigh/DayLow/chartPreviousClose).
-    # Additive — existing consumers never read "_meta".
-    quote["_meta"] = result.get("meta") or {}
-    _INTRADAY_QUOTE_CACHE[symbol] = (quote, None, _time.monotonic())
-    return quote, None
-
-
-def _fetch_quote_snapshot(symbol):
-    """Fetch a quick quote snapshot (bid/ask, day stats, volume) from Yahoo Finance
-    v7 quote API. Returns a dict of fields or None. DISPLAY-ONLY, fail-open —
-    any failure leaves AUTO_PRICE_BY_TICKER unchanged for those sub-fields."""
-    if not symbol:
-        return None
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    try:
-        resp = requests.get(
-            url,
-            params={"symbols": symbol,
-                    "fields": ("bid,ask,regularMarketPrice,regularMarketVolume,"
-                               "regularMarketDayHigh,regularMarketDayLow,"
-                               "regularMarketOpen,regularMarketPreviousClose")},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-        )
-        if resp.status_code != 200:
-            return None
-        result = resp.json().get("quoteResponse", {}).get("result") or []
-        return result[0] if result else None
-    except Exception:
-        return None
-
-
-def _log_feed_status(label, instrument, err):
-    """Quiet logging for the best-effort market feeds. The benign market-closed
-    case is logged once per transition (INFO); genuine errors stay visible
-    (WARNING every cycle). `err` is None on success."""
-    key = (label, instrument)
-    prev = _FEED_STATUS.get(key)
-    if err is None:
-        if prev in ("closed", "error"):
-            logger.info("%s for %s: feed resumed.", label, instrument)
-        _FEED_STATUS[key] = "ok"
-    elif err == MARKET_CLOSED_SENTINEL:
-        if prev != "closed":
-            logger.info(
-                "%s for %s: no intraday data (market closed) — resumes at the open.",
-                label, instrument)
-        _FEED_STATUS[key] = "closed"
-    else:
-        logger.warning("%s failed for %s: %s", label, instrument, err)
-        _FEED_STATUS[key] = "error"
-
-
-def _fetch_vwap_from_market(instrument):
-    """Compute today's session VWAP for an instrument from a public market feed.
-
-    Returns (value, error). VWAP = Σ(typical_price × volume) / Σ(volume) over the
-    1-minute bars of the current trading day, where typical_price = (H+L+C)/3.
-    MGC/MNQ track GC=F/NQ=F (same price level), so the VWAP is interchangeable.
-    """
-    symbol = VWAP_FEED_SYMBOL.get(instrument)
-    if not symbol:
-        return None, f"no feed symbol for {instrument}"
-    quote, err = _fetch_intraday_quote(symbol)
-    if err:
-        return None, err
-    highs, lows, closes = quote["high"], quote["low"], quote["close"]
-    volumes = quote.get("volume")
-    if volumes is None:
-        return None, "incomplete quote payload (no volume)"
-
-    num = den = 0.0
-    for high, low, close, vol in zip(highs, lows, closes, volumes):
-        if high is None or low is None or close is None or not vol:
-            continue
-        num += ((high + low + close) / 3.0) * vol
-        den += vol
-    if den <= 0:
-        return None, "no volume data"
-    return round(num / den, 4), None
-
-
-def _chart_override_active(instrument):
-    """True if a chart/manual VWAP push for this instrument is still within its
-    grace window — the background fetch must not overwrite it while it is."""
-    rec = VWAP_BY_TICKER.get(instrument)
-    if not rec or rec.get("value") is None or rec.get("source") not in ("chart", "manual"):
-        return False
-    try:
-        age_min = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
-    except (KeyError, ValueError, TypeError):
-        return False
-    return age_min <= VWAP_OVERRIDE_GRACE_MIN
-
-
-def _update_vwap_auto(instrument):
-    """Refresh VWAP for one instrument from the market feed, unless a recent
-    chart/manual push (the exact value) is still within its grace window."""
-    if _chart_override_active(instrument):
-        return  # keep the exact, operator-supplied value
-    value, err = _fetch_vwap_from_market(instrument)
-    if value is None:
-        _log_feed_status("VWAP auto-fetch", instrument, err)
-        return
-    _log_feed_status("VWAP auto-fetch", instrument, None)
-    # Re-check after the (slow) HTTP fetch: a chart/manual push may have landed
-    # while it was in flight — never clobber a fresh operator value.
-    if _chart_override_active(instrument):
-        return
-    VWAP_BY_TICKER[instrument] = {
-        "value": value, "ts": now_utc().isoformat(), "source": "auto",
-    }
-    logger.info("VWAP auto-fetch: %s = %s", instrument, value)
-
-
-def _update_price_auto(instrument):
-    """Refresh the DISPLAY-ONLY market data snapshot for one instrument.
-    Uses a single _fetch_intraday_quote call (same request that VWAP already
-    makes) to extract:
-      - latest 1-minute bar OHLCV
-      - meta block: regularMarketVolume / DayHigh / DayLow / chartPreviousClose
-    Zero extra HTTP calls vs the old price-only fetch.  NEVER feeds the gate /
-    scoring / sizing / broker path."""
-    symbol = VWAP_FEED_SYMBOL.get(instrument)
-    if not symbol:
-        return
-    quote, err = _fetch_intraday_quote(symbol)
-    if err or not quote:
-        _log_feed_status("Price auto-fetch", instrument, err or "empty quote")
-        return
-    _log_feed_status("Price auto-fetch", instrument, None)
-    # ── Latest bar ────────────────────────────────────────────────────────
-    highs, lows, closes = quote["high"], quote["low"], quote["close"]
-    close = None
-    bar_high = bar_low = None
-    for i in range(len(closes) - 1, -1, -1):
-        if closes[i] is not None and highs[i] is not None and lows[i] is not None:
-            close    = round(float(closes[i]), 4)
-            bar_high = round(float(highs[i]),  4)
-            bar_low  = round(float(lows[i]),   4)
-            break
-    if close is None:
-        return
-    # ── Meta block (day stats) ────────────────────────────────────────────
-    meta = quote.get("_meta") or {}
-    def _mf(k):
-        v = meta.get(k)
-        return round(float(v), 4) if v is not None else None
-    volumes = quote.get("volume") or []
-    bar_vol = None
-    for i in range(len(volumes) - 1, -1, -1):
-        if volumes[i] is not None:
-            bar_vol = int(volumes[i])
-            break
-    AUTO_PRICE_BY_TICKER[instrument] = {
-        "value":      close,
-        "ts":         now_utc().isoformat(),
-        "source":     "yfinance",
-        "bar_high":   bar_high,
-        "bar_low":    bar_low,
-        "bar_close":  close,
-        "bar_volume": bar_vol,
-        # Day-level stats from the meta block
-        "volume":     meta.get("regularMarketVolume"),
-        "day_high":   _mf("regularMarketDayHigh"),
-        "day_low":    _mf("regularMarketDayLow"),
-        "prev_close": _mf("chartPreviousClose"),   # most reliably populated
-    }
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Volatility monitor (additive, FAIL-OPEN). A per-instrument 1-minute ATR is
-# compared to the session-typical range to classify the current volatility
-# regime. It surfaces as context on the card + dashboard AND gates the strict
-# setup: a CAUTION regime dents the Edge Score and flags the card, while a BLOCK
-# regime (market too dead or too wild) holds an otherwise-READY setup. Missing
-# or stale data NEVER blocks a trade — it only shows as "unavailable".
-# ───────────────────────────────────────────────────────────────────────────
-VOL_ATR_BARS           = 14   # recent window (1-min bars) for the current ATR
-VOL_MIN_BARS           = 5    # min bars before an ATR estimate is trusted; ES/NQ return only ~12 bars overnight so must be well below that
-VOLATILITY_MAX_AGE_MIN = 60   # a reading older than this is stale -> unavailable (60 min covers overnight fetch gaps)
-
-
-def _median(vals):
-    s = sorted(vals)
-    n = len(s)
-    if n == 0:
-        return 0.0
-    mid = n // 2
-    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
-
-
-def _fetch_volatility_from_market(instrument):
-    """Return (recent_atr_pts, baseline_pts, ratio) for an instrument from the
-    public 1-min feed.
-
-    recent_atr = mean true-range of the last VOL_ATR_BARS bars; baseline = median
-    true-range across all valid session bars; ratio = recent_atr / baseline. The
-    ratio is self-normalising, so one set of thresholds works for both MGC and
-    MNQ despite very different absolute point sizes. (None, None, None) on error.
-    """
-    symbol = VWAP_FEED_SYMBOL.get(instrument)
-    if not symbol:
-        return None, None, None
-    quote, err = _fetch_intraday_quote(symbol)
-    if err:
-        _log_feed_status("Volatility fetch", instrument, err)
-        return None, None, None
-    _log_feed_status("Volatility fetch", instrument, None)
-    highs, lows, closes = quote["high"], quote["low"], quote["close"]
-
-    trs, prev_close = [], None
-    for high, low, close in zip(highs, lows, closes):
-        if high is None or low is None or close is None:
-            continue
-        tr = (high - low) if prev_close is None else max(
-            high - low, abs(high - prev_close), abs(low - prev_close))
-        if tr >= 0:
-            trs.append(tr)
-        prev_close = close
-
-    if len(trs) < VOL_MIN_BARS:
-        return None, None, None
-    recent     = trs[-VOL_ATR_BARS:]
-    recent_atr = sum(recent) / len(recent)
-    baseline   = _median(trs)
-    if baseline <= 0:
-        return None, None, None
-    return round(recent_atr, 4), round(baseline, 4), round(recent_atr / baseline, 3)
-
-
-def _update_volatility_auto(instrument):
-    """Refresh the stored volatility reading for one instrument (best-effort)."""
-    atr_pts, baseline_pts, ratio = _fetch_volatility_from_market(instrument)
-    if atr_pts is None or ratio is None:
-        return
-    VOLATILITY_BY_TICKER[instrument] = {
-        "atr_pts": atr_pts, "baseline_pts": baseline_pts,
-        "ratio": ratio, "ts": now_utc().isoformat(),
-    }
-    logger.info("Volatility auto-fetch: %s ATR=%.4f base=%.4f ratio=%.2f",
-                instrument, atr_pts, baseline_pts or 0.0, ratio)
-
+# ── Volatility monitor ─────────────────────────────────────────────────────
+# VOLATILITY_BY_TICKER is populated by DatabentoBrain on every bar close.
+# get_volatility() reads from this store; fail-open (status=missing) when absent/stale.
+VOLATILITY_MAX_AGE_MIN = 60   # a reading older than this is stale -> unavailable
 
 def _vol_regime_score_adj(regime):
     """Edge-score modifier for a volatility regime when volatility is a SCALP
@@ -6337,230 +5955,14 @@ def get_volatility(ticker):
 _HTF_LAST_REFRESH_TS = [0.0]  # monotonic ts of the last HTF refresh (throttle)
 
 
-def _fetch_htf_series(symbol, interval, range_):
-    """Fetch an OHLCV bar series for `symbol` at a higher timeframe.
-
-    Mirrors _fetch_intraday_quote's HTTP/parse contract but keeps the per-bar
-    `timestamp` array (needed to resample 60m → 4H). Returns (bars, err) where
-    bars is a list of {"t","o","h","l","c","v"} oldest→newest with None rows
-    dropped. Benign empty payload → (None, MARKET_CLOSED_SENTINEL).
-    """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    try:
-        resp = requests.get(
-            url,
-            params={"interval": interval, "range": range_},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return None, f"HTTP {resp.status_code}"
-        result = resp.json()["chart"]["result"][0]
-        ts     = result.get("timestamp") or []
-        quote  = result["indicators"]["quote"][0]
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-        return None, f"fetch error: {exc}"
-    if not quote or not ts or quote.get("close") is None:
-        return None, MARKET_CLOSED_SENTINEL
-    opens  = quote.get("open")  or []
-    highs  = quote.get("high")  or []
-    lows   = quote.get("low")   or []
-    closes = quote.get("close") or []
-    vols   = quote.get("volume") or []
-    bars = []
-    for i, t in enumerate(ts):
-        c = closes[i] if i < len(closes) else None
-        h = highs[i]  if i < len(highs)  else None
-        l = lows[i]   if i < len(lows)   else None
-        if c is None or h is None or l is None:
-            continue
-        o = opens[i] if i < len(opens) and opens[i] is not None else c
-        v = vols[i]  if i < len(vols)  and vols[i]  is not None else 0.0
-        bars.append({"t": int(t), "o": float(o), "h": float(h),
-                     "l": float(l), "c": float(c), "v": float(v)})
-    if not bars:
-        return None, MARKET_CLOSED_SENTINEL
-    return bars, None
-
-
-def _ema(values, period):
-    """Plain EMA over `values` (oldest→newest). None if too few points."""
-    if not values or len(values) < period:
-        return None
-    k = 2.0 / (period + 1.0)
-    e = sum(values[:period]) / period   # seed with the SMA of the first `period`
-    for v in values[period:]:
-        e = v * k + e * (1.0 - k)
-    return e
-
-
-def _atr_from_bars(bars, period=14):
-    """Wilder-style mean true range over the last `period` bars. None if empty."""
-    trs, prev = [], None
-    for b in bars:
-        tr = (b["h"] - b["l"]) if prev is None else max(
-            b["h"] - b["l"], abs(b["h"] - prev), abs(b["l"] - prev))
-        if tr >= 0:
-            trs.append(tr)
-        prev = b["c"]
-    if not trs:
-        return None
-    window = trs[-period:] if len(trs) >= period else trs
-    return sum(window) / len(window)
-
-
-def _resample_bars(bars, bucket_sec):
-    """Resample finer bars into fixed UTC-epoch-aligned buckets of `bucket_sec`.
-    OHLC aggregated per bucket; volume summed; order preserved oldest→newest."""
-    buckets, order = {}, []
-    for b in bars:
-        key = int(b["t"] // bucket_sec)
-        agg = buckets.get(key)
-        if agg is None:
-            buckets[key] = {"t": key * bucket_sec, "o": b["o"], "h": b["h"],
-                            "l": b["l"], "c": b["c"], "v": b["v"]}
-            order.append(key)
-        else:
-            agg["h"] = max(agg["h"], b["h"])
-            agg["l"] = min(agg["l"], b["l"])
-            agg["c"] = b["c"]
-            agg["v"] += b["v"]
-    return [buckets[k] for k in order]
-
-
-def _htf_bias_from_bars(bars):
-    """Trend bias for a bar series via fast/slow EMA separation, neutral-banded by
-    ATR so tiny EMA gaps read as 'neutral'. Returns a stable dict; 'unknown' when
-    there is not enough history. confidence = |ema gap| / ATR, clamped to 1.0."""
-    closes = [b["c"] for b in bars]
-    out = {"bias": "unknown", "ema_fast": None, "ema_slow": None,
-           "atr": None, "confidence": 0.0, "bars": len(closes)}
-    if len(closes) < HTF_EMA_SLOW:
-        return out
-    ef = _ema(closes, HTF_EMA_FAST)
-    es = _ema(closes, HTF_EMA_SLOW)
-    atr = _atr_from_bars(bars) or 0.0
-    if ef is None or es is None:
-        return out
-    sep = ef - es
-    eps = 0.10 * atr  # within 10% of ATR of each other = neutral / no edge
-    if sep > eps:
-        bias = "bull"
-    elif sep < -eps:
-        bias = "bear"
-    else:
-        bias = "neutral"
-    conf = min(1.0, abs(sep) / atr) if atr > 0 else 0.0
-    out.update(bias=bias, ema_fast=round(ef, 4), ema_slow=round(es, 4),
-               atr=round(atr, 4), confidence=round(conf, 3))
-    return out
-
-
-def _daily_key_levels(daily_bars):
-    """Derive daily key levels from the daily series: prior fully-formed day's
-    H/L/C plus recent swing highs/lows (pivots of half-width HTF_SWING_PIVOT_K).
-    The last daily bar is treated as the in-progress session, so 'prior day' is
-    the second-to-last bar. Returns {} when there is not enough history."""
-    levels = {"prior_high": None, "prior_low": None, "prior_close": None,
-              "swing_highs": [], "swing_lows": []}
-    if len(daily_bars) < 3:
-        return levels
-    prior = daily_bars[-2]  # last completed day (final bar = in-progress today)
-    levels["prior_high"]  = round(prior["h"], 4)
-    levels["prior_low"]   = round(prior["l"], 4)
-    levels["prior_close"] = round(prior["c"], 4)
-    k = HTF_SWING_PIVOT_K
-    completed = daily_bars[:-1]  # exclude the in-progress bar from pivots
-    for i in range(k, len(completed) - k):
-        hi = completed[i]["h"]
-        lo = completed[i]["l"]
-        if all(hi >= completed[j]["h"] for j in range(i - k, i + k + 1) if j != i):
-            levels["swing_highs"].append(round(hi, 4))
-        if all(lo <= completed[j]["l"] for j in range(i - k, i + k + 1) if j != i):
-            levels["swing_lows"].append(round(lo, 4))
-    # keep the most recent few of each (dedup, preserve recency newest-first)
-    levels["swing_highs"] = list(dict.fromkeys(reversed(levels["swing_highs"])))[:5]
-    levels["swing_lows"]  = list(dict.fromkeys(reversed(levels["swing_lows"])))[:5]
-    return levels
-
-
-def _htf_chart_override_active(instrument, tf):
-    """True if an inbound chart push for this instrument+timeframe is still within
-    its grace window — the auto refresh must not overwrite it while it is. (No
-    chart pushes exist until P3, so this is always False today; written now so the
-    auto-writer is grace-aware from the start.)"""
-    rec = (HTF_STATE_BY_INST.get(instrument) or {}).get(tf)
-    if not rec or rec.get("source") != "chart":
-        return False
-    try:
-        age_min = (now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() / 60.0
-    except (KeyError, ValueError, TypeError):
-        return False
-    return age_min <= cfg_for("SWING", "SWING_HTF_GRACE_MIN")
-
-
-def _update_htf_auto(instrument):
-    """Refresh 1H / 4H / Daily HTF context for one instrument (best-effort).
-
-    1H comes from the 60m series; 4H is resampled from it; Daily comes from the
-    1d series. Each timeframe is written independently and only when no fresh
-    chart push owns it. Any fetch failure leaves the previous reading untouched.
-    """
-    symbol = VWAP_FEED_SYMBOL.get(instrument)
-    if not symbol:
-        return
-    state = HTF_STATE_BY_INST.setdefault(instrument, {})
-
-    # 1H + 4H from the 60m series
-    bars_60m, err = _fetch_htf_series(symbol, HTF_1H_INTERVAL, HTF_1H_RANGE)
-    if bars_60m:
-        _log_feed_status("HTF 1H fetch", instrument, None)
-        now_iso = now_utc().isoformat()
-        if not _htf_chart_override_active(instrument, "1H"):
-            b1 = _htf_bias_from_bars(bars_60m)
-            b1.update(ts=now_iso, source="auto")
-            state["1H"] = b1
-        if not _htf_chart_override_active(instrument, "4H"):
-            bars_4h = _resample_bars(bars_60m, HTF_4H_BUCKET_SEC)
-            b4 = _htf_bias_from_bars(bars_4h)
-            b4.update(ts=now_iso, source="auto")
-            state["4H"] = b4
-    else:
-        _log_feed_status("HTF 1H fetch", instrument, err)
-
-    # Daily bias + key levels from the 1d series
-    bars_1d, err = _fetch_htf_series(symbol, HTF_1D_INTERVAL, HTF_1D_RANGE)
-    if bars_1d:
-        _log_feed_status("HTF 1D fetch", instrument, None)
-        if not _htf_chart_override_active(instrument, "1D"):
-            bd = _htf_bias_from_bars(bars_1d)
-            bd["levels"] = _daily_key_levels(bars_1d)
-            bd.update(ts=now_utc().isoformat(), source="auto")
-            state["1D"] = bd
-    else:
-        _log_feed_status("HTF 1D fetch", instrument, err)
 
 
 def _refresh_htf_if_due(force=False):
-    """Throttled HTF refresh for all instruments (every HTF_FETCH_INTERVAL). Called
-    from the VWAP loop. Runs when _swing_htf_enabled(), when the Market Intelligence
-    layer is on, OR when the trend brake is armed (TREND_BRAKE_ENABLED) — each needs
-    real 1H/4H/1D context in SCALP too, where SWING HTF is otherwise never fetched.
-    Populating HTF_STATE_BY_INST is INERT for the SCALP money path unless the trend
-    brake is armed (every SWING consumer still gates on _swing_htf_enabled); the
-    display-first MI layer and the brake read it via compute_swing_context. Fail-open."""
-    if not (_swing_htf_enabled() or MARKET_INTELLIGENCE_ENABLED or _trend_brake_enabled()):
-        return
-    nowm = time.monotonic()
-    if not force and (nowm - _HTF_LAST_REFRESH_TS[0]) < HTF_FETCH_INTERVAL:
-        return
-    _HTF_LAST_REFRESH_TS[0] = nowm
-    for instrument in VWAP_FEED_SYMBOL:
-        try:
-            _update_htf_auto(instrument)
-        except Exception as exc:  # one bad instrument must not skip the others
-            logger.warning("HTF auto-fetch error for %s: %s", instrument, exc)
-
+    """No-op: Yahoo Finance removed. HTF data arrives via Pine Script webhooks
+    only (SWING_EMA_UPDATE / htf-overlay). compute_swing_context() fails-open
+    when HTF_STATE_BY_INST is empty.
+    """
+    return
 
 def _tf_staleness_min(tf):
     """Per-timeframe staleness threshold (minutes) from the SWING knobs."""
@@ -7212,44 +6614,6 @@ def _ingest_htf_overlay(data, resolved_inst, normalized):
         logger.warning("HTF overlay ingest error for %s: %s", resolved_inst, exc)
         return None
 
-
-def _vwap_autofetch_loop():
-    """Refresh VWAP / volatility / HTF context for all tracked instruments, then
-    reschedule. Open-trade exit detection now runs on its own faster, dedicated
-    timer (_managed_watch_loop / MANAGED_WATCH_INTERVAL) and is no longer driven
-    from this slower loop."""
-    try:
-        for instrument in VWAP_FEED_SYMBOL:
-            _update_vwap_auto(instrument)
-    except Exception as exc:  # never let the loop die
-        logger.warning("VWAP auto-fetch loop error: %s", exc)
-    try:
-        for instrument in VWAP_FEED_SYMBOL:
-            _update_volatility_auto(instrument)
-    except Exception as exc:  # volatility is best-effort — never disrupt VWAP/watcher
-        logger.warning("Volatility auto-fetch loop error: %s", exc)
-    try:
-        # SWING HTF context (P2): throttled to HTF_FETCH_INTERVAL and a no-op
-        # outside SWING+flag. Fail-open so it can never disrupt VWAP/watcher.
-        _refresh_htf_if_due()
-    except Exception as exc:
-        logger.warning("HTF auto-fetch loop error: %s", exc)
-    finally:
-        threading.Timer(VWAP_FETCH_INTERVAL, _vwap_autofetch_loop).start()
-
-
-def _price_autofetch_loop():
-    """Refresh the DISPLAY-ONLY dashboard price for all instruments on a fast cadence
-    (PRICE_FETCH_INTERVAL), independent of the slower VWAP/volatility loop, so the
-    dashboard price stays near-live even on a quiet market. Best-effort: any failure
-    leaves the previous value in place and it never feeds the gate / scoring."""
-    try:
-        for instrument in VWAP_FEED_SYMBOL:
-            _update_price_auto(instrument)
-    except Exception as exc:  # display fallback only — never let the loop die
-        logger.warning("Price auto-fetch loop error: %s", exc)
-    finally:
-        threading.Timer(PRICE_FETCH_INTERVAL, _price_autofetch_loop).start()
 
 
 def _managed_watch_loop():
@@ -25366,33 +24730,25 @@ def _tag_dynamic_paper_managed_trade(inst, plan, setup_key):
 
 
 def _fetch_latest_bar(instrument):
-    """Return {'high','low','close'} of the most recent 1-minute bar, or None.
-
-    Uses the same public feed as the VWAP fetch (MGC≈GC=F, MNQ≈NQ=F). Best-effort
-    — any error returns None so the watcher simply skips this cycle.
+    """Return the most-recent completed bar for `instrument` from the Databento
+    live-bar store. Used by the managed-trade watcher for stop/TP detection.
+    Returns {"high": float, "low": float, "close": float, "start": int} or None.
+    FAIL-OPEN: returns None when Databento is not running or has no bars yet.
     """
-    symbol = VWAP_FEED_SYMBOL.get(instrument)
-    if not symbol:
+    try:
+        from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+        bars = DATABENTO_BARS_BY_INST.get(instrument)
+        if not bars:
+            return None
+        bar = bars[-1]
+        return {
+            "high":  float(bar["high"]),
+            "low":   float(bar["low"]),
+            "close": float(bar["close"]),
+            "start": int(bar["ts"]),
+        }
+    except Exception:
         return None
-    quote, err = _fetch_intraday_quote(symbol)
-    if err:
-        _log_feed_status("Latest-bar fetch", instrument, err)
-        return None
-    _log_feed_status("Latest-bar fetch", instrument, None)
-    highs, lows, closes = quote["high"], quote["low"], quote["close"]
-    stamps = quote.get("_timestamps") or []
-    for i in range(len(closes) - 1, -1, -1):
-        if highs[i] is not None and lows[i] is not None and closes[i] is not None:
-            start = None
-            try:
-                if i < len(stamps) and stamps[i] is not None:
-                    start = int(stamps[i])
-            except (TypeError, ValueError):
-                start = None
-            return {"high": float(highs[i]), "low": float(lows[i]),
-                    "close": float(closes[i]), "start": start}
-    return None
-
 
 def _watch_managed_trades():
     """Evaluate every open managed trade against the latest bar (one fetch per
@@ -28520,7 +27876,7 @@ def compute_data_feed_status(instrument=None):
                 "prev_close":      auto_d.get("prev_close"),
                 "bar_high":        auto_d.get("bar_high"),
                 "bar_low":         auto_d.get("bar_low"),
-                "source":          auto_d.get("source", "yfinance"),
+                "source":          auto_d.get("source", "databento"),
             }
 
         ages = [v["alert_age_secs"] for v in per_inst.values()
@@ -28531,30 +27887,13 @@ def compute_data_feed_status(instrument=None):
         elif worst < 900:     overall = "STALE"
         else:                 overall = "OFFLINE"
 
-        # Data mode label: upgrade from ALERT-ONLY when yfinance is producing fresh data
-        auto_fresh = any(
-            v.get("auto_age_secs") is not None and v["auto_age_secs"] < 60
-            for v in per_inst.values()
-        )
-        has_quotes = any(
-            v.get("volume") is not None for v in per_inst.values()
-        )
-        if auto_fresh and has_quotes:
-            data_mode = "TV + yfinance · vol/range"
+        # Data mode label based on Databento feed status
+        databento_live = auto_fresh  # AUTO_PRICE_BY_TICKER populated by Databento
+        if databento_live:
+            data_mode = "TV + Databento"
             disclaimer = (
-                "Prices auto-fetched from Yahoo Finance every %ds (yfinance). "
-                "Bid/ask/volume/day stats included. "
-                "TradingView alerts continue to drive gate decisions. "
-                "yfinance data is ~15s delayed — display only, never gates trades."
-                % PRICE_FETCH_INTERVAL
-            )
-        elif auto_fresh:
-            data_mode = "TV + yfinance (%ds)" % PRICE_FETCH_INTERVAL
-            disclaimer = (
-                "Prices auto-fetched from Yahoo Finance every %ds (yfinance). "
-                "TradingView alerts continue to drive gate decisions. "
-                "yfinance data is ~15s delayed — display only, never gates trades."
-                % PRICE_FETCH_INTERVAL
+                "Live prices and VWAP/ATR/CVD streamed from Databento. "
+                "TradingView alerts continue to drive gate decisions."
             )
         else:
             data_mode = "ALERT-ONLY"
@@ -28565,7 +27904,7 @@ def compute_data_feed_status(instrument=None):
             )
         return {
             "data_mode":              data_mode,
-            "provider":               "TradingView + yfinance",
+            "provider":               "TradingView + Databento",
             "overall_freshness":      overall,
             "instruments":            per_inst,
             "total_alerts_1h":        sum(count_1h_by_inst.values()),
@@ -46740,7 +46079,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <button class="btn" id="mo-send" style="width:100%;background:rgba(28,36,70,.85);border:1px solid rgba(100,120,200,.32);color:#b8c0e0;font-weight:700" onclick="sendManualOrder()">🚀 SEND MARKET ORDER</button>
     <div style="margin-top:6px;color:#505878;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
   </div>
-  <!-- ════ Data Feed Status — alert timing + yfinance bid/ask/volume/day stats
+  <!-- ════ Data Feed Status — alert timing + Databento VWAP/ATR/CVD/structure
        (DISPLAY-ONLY; never gates trades unless DATA_STALENESS_GATE_ENABLED=1). ════ -->
   <div class="mod" id="mod-data-feed" data-cat="primary">
     <div class="mod-h">📡 Data Feed
@@ -51896,7 +51235,7 @@ function renderDataFeed(d){
   const badge=document.getElementById('dfs-mode-badge');
   if(badge){
     badge.textContent=df.data_mode||'ALERT-ONLY';
-    const isLive=df.data_mode&&df.data_mode.indexOf('yfinance')>=0;
+    const isLive=df.data_mode&&df.data_mode.indexOf('Databento')>=0;
     badge.style.background=isLive?'#14532d':'#451a03';
     badge.style.color=isLive?'#22c55e':'#f59e0b';
   }
@@ -61963,8 +61302,7 @@ if __name__ == "__main__":
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     if LEARNING_DB_ENABLED:
         threading.Thread(target=_alert_history_snapshot_loop, daemon=True).start()  # snapshot ALERT_HISTORY to market_state_cache every 60s so boot-restore has fresh scoring context
-    threading.Timer(0, _vwap_autofetch_loop).start()  # auto-fetch VWAP now, then every VWAP_FETCH_INTERVAL (no Discord posting)
-    threading.Timer(0, _price_autofetch_loop).start()  # DISPLAY-ONLY price now, then every PRICE_FETCH_INTERVAL (never feeds the gate)
+    # Databento Brain handles live price/VWAP/ATR/CVD streaming (started below)
     threading.Timer(0, _managed_watch_loop).start()  # open-trade exit (stop/TP) watcher on its own fast timer (MANAGED_WATCH_INTERVAL); no-op while flat, never feeds the gate
     if LIVE_RUNNER_ENABLED:
         threading.Timer(0, _live_runner_watch_loop).start()  # LIVE 2-contract runner watcher (own timer); only started when the feature is enabled, and itself inert unless armed
@@ -61986,6 +61324,7 @@ if __name__ == "__main__":
                 current_price_by_ticker    = CURRENT_PRICE_BY_TICKER,
                 current_price_ts_by_ticker = CURRENT_PRICE_TS_BY_TICKER,
                 volume_spike_by_ticker     = VOLUME_SPIKE_BY_TICKER,
+                volatility_by_ticker       = VOLATILITY_BY_TICKER,
                 now_utc_fn                 = now_utc,
             )
             _DATABENTO_BRAIN.start()
