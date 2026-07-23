@@ -80,6 +80,9 @@ class DatabentoBrain:
     ATR_PERIOD      = 14      # bars for ATR calculation
     SWING_N         = 5       # pivot bars each side (confirmed after n bars)
     SWEEP_N         = 10      # prior bars scanned for sweep high/low range
+    CONFIRM_N          = 10   # bars for confirmation volume baseline
+    CONFIRM_BODY_RATIO = 0.65 # close must be in top/bottom 65% of bar range (strong close)
+    CONFIRM_VOL_MULT   = 1.2  # volume must be >= 1.2x rolling avg to qualify
     RVOL_LOOKBACK   = 20      # bars used for rolling avg volume baseline
     VOL_SPIKE_MULT  = 2.0     # RVOL ≥ this → volume spike record
     RECONNECT_DELAY = 10      # seconds to wait between reconnect attempts
@@ -137,9 +140,10 @@ class DatabentoBrain:
         self._pv_sum:      dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
         self._v_sum:       dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
         self._cvd_acc:     dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
-        self._last_bos:    dict[str, Any]         = {i: None for i in DB_SYMBOLS}
-        self._last_sweep:  dict[str, Any]         = {i: None for i in DB_SYMBOLS}
-        self._trend:       dict[str, str | None]  = {i: None for i in DB_SYMBOLS}
+        self._last_bos:     dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        self._last_sweep:   dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        self._last_confirm: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        self._trend:        dict[str, str | None]  = {i: None for i in DB_SYMBOLS}
         self._session_day: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -492,6 +496,8 @@ class DatabentoBrain:
         self._detect_structure(inst, bars)
         # ── Sweep detection (BULLISH/BEARISH SWEEP → ALERT_HISTORY) ──────────
         self._detect_sweep(inst, bars)
+        # ── Confirmation candle (BULLISH/BEARISH CONFIRMATION → ALERT_HISTORY) ─
+        self._detect_confirmation(inst, bars)
 
     # ── Structure detection ───────────────────────────────────────────────────
 
@@ -599,6 +605,91 @@ class DatabentoBrain:
                 atype = f"{inst} BEARISH SWEEP"
                 self._inject_alert(inst, atype, cur["close"])
                 self._last_sweep[inst] = {"side": "bear", "level": prior_high}
+
+    # ── Confirmation candle detection ─────────────────────────────────────────
+
+    def _detect_confirmation(self, inst: str, bars: list) -> None:
+        """
+        Confirmation candle detector — injects "{inst} BULLISH CONFIRMATION" or
+        "{inst} BEARISH CONFIRMATION" into ALERT_HISTORY for the gate's
+        has_bull_confirm / has_bear_confirm flags (ticker_scoped=True lookup).
+
+        A confirmation fires when ALL of the following are true:
+          1. A BOS or CHOCH has already been detected in that direction
+             (_trend[inst] is "bull" or "bear" and _last_bos[inst] is set).
+          2. The current bar shows DIRECTIONAL COMMITMENT:
+               • Strong close: close is in the top 65% of bar range (bull)
+                 or bottom 65% (bear), indicating controlled momentum, OR
+               • Engulfing: the bar's body fully engulfs the prior bar's body
+                 in the opposite direction (classic reversal confirmation).
+          3. Above-average volume: current bar volume >= 1.2x the 10-bar
+             rolling average, confirming real participation.
+
+        Only fires ONCE per structure episode (deduped by structure level via
+        _last_confirm). When a new BOS/CHOCH fires at a different level, the
+        dedup clears automatically.
+
+        Because _detect_structure runs before _detect_confirmation in
+        _on_bar_close, the inject timestamp of the confirmation is always
+        >= the inject timestamp of the structure alert, satisfying the gate's
+        _after_anchor check naturally.
+        """
+        n = self.CONFIRM_N
+        if len(bars) < n + 2:
+            return
+
+        trend    = self._trend[inst]
+        last_bos = self._last_bos[inst]
+        if trend not in ("bull", "bear") or last_bos is None:
+            return
+
+        cur  = bars[-1]
+        prev = bars[-2]
+
+        # ── Above-average volume filter ────────────────────────────────────────
+        avg_vol = sum(b["volume"] for b in bars[-(n + 1):-1]) / n
+        if avg_vol <= 0 or cur["volume"] < avg_vol * self.CONFIRM_VOL_MULT:
+            return
+
+        # ── Directional commitment: strong close OR engulfing ──────────────────
+        bar_range = cur["high"] - cur["low"]
+        if bar_range <= 0:
+            return
+        close_ratio = (cur["close"] - cur["low"]) / bar_range
+
+        # Engulfing: current body completely contains the prior bar's body in
+        # the opposite direction (prior bearish → current bullish engulf; vice versa)
+        bull_engulf = (prev["close"] < prev["open"]         # prior bar bearish
+                       and cur["close"] > prev["open"]      # cur close above prior open
+                       and cur["open"] <= prev["close"])    # cur open at/below prior close
+        bear_engulf = (prev["close"] > prev["open"]         # prior bar bullish
+                       and cur["close"] < prev["open"]      # cur close below prior open
+                       and cur["open"] >= prev["close"])    # cur open at/above prior close
+
+        struct_level = last_bos["level"]
+        last_conf    = self._last_confirm[inst] or {}
+
+        if trend == "bull":
+            strong_close = close_ratio >= self.CONFIRM_BODY_RATIO
+            if not (strong_close or bull_engulf):
+                return
+            if (last_conf.get("side") == "bull"
+                    and abs(last_conf.get("level", 0) - struct_level)
+                    <= struct_level * 0.001):
+                return  # already confirmed this structure episode
+            self._inject_alert(inst, f"{inst} BULLISH CONFIRMATION", cur["close"])
+            self._last_confirm[inst] = {"side": "bull", "level": struct_level}
+
+        else:  # trend == "bear"
+            strong_close = close_ratio <= (1.0 - self.CONFIRM_BODY_RATIO)
+            if not (strong_close or bear_engulf):
+                return
+            if (last_conf.get("side") == "bear"
+                    and abs(last_conf.get("level", 0) - struct_level)
+                    <= struct_level * 0.001):
+                return  # already confirmed this structure episode
+            self._inject_alert(inst, f"{inst} BEARISH CONFIRMATION", cur["close"])
+            self._last_confirm[inst] = {"side": "bear", "level": struct_level}
 
     # ── Indicator helpers ─────────────────────────────────────────────────────
 
