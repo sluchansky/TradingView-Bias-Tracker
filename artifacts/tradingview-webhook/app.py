@@ -992,13 +992,14 @@ MODES = {
         "STOP_ATR_MULT_HIGH":       2.0,
         # Flag-on (LIVE) SWING uses WIDER ATR stops — 2.25x normal / 2.75x elevated —
         # selected in _dynamic_stop_plan via _swing_htf_enabled(). Sized so all four
-        # instruments stay tradeable under the $250 per-trade risk ceiling below.
+        # instruments stay tradeable under the $500 per-trade risk ceiling below.
         "SWING_STOP_ATR_MULT":      2.25,
         "SWING_STOP_ATR_MULT_HIGH": 2.75,
-        # $250 per-trade dollar ceiling (raised from $100; env MAX_RISK_DOLLARS_PER_TRADE
+        # $500 per-trade dollar ceiling (raised from $250; env MAX_RISK_DOLLARS_PER_TRADE
         # still overrides). Caps sizing — an over-cap single-contract setup is SKIPPED,
-        # never forced through past the cap.
-        "MAX_RISK_DOLLARS":         250,
+        # never forced through past the cap. At 3 max losses/day (SAFETY_MAX_LOSSES_PER_DAY)
+        # worst-case daily loss is $1,500 — within the $2,000 total drawdown budget.
+        "MAX_RISK_DOLLARS":         500,
         "TRADE_READY_INTERVAL_SEC": 300,
         "RISK_MULT_EARLY":          1.0,
         # ── SCALP dynamic-exit overhaul knobs — INERT in SWING ────────────────────
