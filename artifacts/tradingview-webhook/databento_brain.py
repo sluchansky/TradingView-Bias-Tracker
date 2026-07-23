@@ -144,6 +144,9 @@ class DatabentoBrain:
         self._last_sweep:   dict[str, Any]         = {i: None for i in DB_SYMBOLS}
         self._last_confirm: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
         self._trend:        dict[str, str | None]  = {i: None for i in DB_SYMBOLS}
+        # HH/HL/LH/LL: last confirmed swing high/low used for label sequencing
+        self._prev_sh:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
+        self._prev_sl:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._session_day: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -503,17 +506,25 @@ class DatabentoBrain:
 
     def _detect_structure(self, inst: str, bars: list) -> None:
         """
-        Swing-pivot BOS / CHOCH detector.
+        Swing-pivot structure detector.
 
         Looks at the bar at index [-SWING_N-1]: it has SWING_N completed bars
         after it, so we can confirm whether it was a swing high or low.
 
-        BOS DEMAND  — close breaks above confirmed swing high (bullish continuation)
-        BOS SUPPLY  — close breaks below confirmed swing low  (bearish continuation)
+        HH / LH — confirmed swing high compared to the prior swing high:
+                   HH (Higher High) if the new pivot high > previous; LH if lower.
+        HL / LL — confirmed swing low compared to the prior swing low:
+                   HL (Higher Low) if the new pivot low > previous; LL if lower.
+
+        BOS DEMAND  — close breaks above a confirmed swing high (bullish continuation)
+        BOS SUPPLY  — close breaks below a confirmed swing low  (bearish continuation)
         CHOCH DEMAND — first bullish BOS after a bearish trend (bullish reversal)
         CHOCH SUPPLY — first bearish BOS after a bullish trend (bearish reversal)
 
-        Each structure level is injected once only (deduped via _last_bos).
+        HH/HL/LH/LL are emitted when a pivot is CONFIRMED (regardless of whether
+        close has broken above/below it). BOS/CHOCH require the additional break.
+        Each label fires once per unique pivot level (deduped via _prev_sh/_prev_sl).
+        Each BOS/CHOCH level is injected once only (deduped via _last_bos).
         """
         n = self.SWING_N
         if len(bars) < n * 2 + 2:
@@ -529,6 +540,25 @@ class DatabentoBrain:
         close    = bars[-1]["close"]
         last_bos = self._last_bos[inst] or {}
 
+        # ── HH / LH — swing-high sequence labels ─────────────────────────────
+        if is_sh:
+            sh = pivot["high"]
+            prev_sh = self._prev_sh[inst]
+            if prev_sh is None or abs(sh - prev_sh) > sh * 0.001:
+                if prev_sh is not None:
+                    self._inject_alert(inst, "HH" if sh > prev_sh else "LH", sh)
+                self._prev_sh[inst] = sh
+
+        # ── HL / LL — swing-low sequence labels ──────────────────────────────
+        if is_sl:
+            sl = pivot["low"]
+            prev_sl = self._prev_sl[inst]
+            if prev_sl is None or abs(sl - prev_sl) > sl * 0.001:
+                if prev_sl is not None:
+                    self._inject_alert(inst, "HL" if sl > prev_sl else "LL", sl)
+                self._prev_sl[inst] = sl
+
+        # ── BOS / CHOCH — close-based structure break ─────────────────────────
         if is_sh and close > pivot["high"]:
             if not (last_bos.get("type") in ("BOS DEMAND", "CHOCH DEMAND")
                     and abs(last_bos.get("level", 0) - pivot["high"]) < 0.01):

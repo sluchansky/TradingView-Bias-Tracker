@@ -79,8 +79,19 @@ Databento bar `{ts (unix-s), open, high, low, close, volume}` → `Candle {t: ts
 - Parity OK, goldens byte-identical.
 - Unlocks the confirmation-candle path inside `reaction_long`/`reaction_short` and `zone_valid_long`/`zone_valid_short` from Databento independently of TradingView.
 
+## Phase 2C — HH/HL/LH/LL swing-structure labels (DONE)
+- Integrated into `_detect_structure` (reuses existing pivot detection — DRY).
+- Fires `"HH"` / `"HL"` / `"LH"` / `"LL"` (bare, un-prefixed — same format as TradingView Pine scripts).
+- Alert record has `instrument` + `ticker` set by `_inject_alert` → `_latest_ts("HH")` filters by `instrument` field → correctly scoped per-instrument in the gate.
+- HH/LH: compare new confirmed swing-high to `_prev_sh[inst]`; emit on first non-None prev. HL/LL: same logic via `_prev_sl[inst]`.
+- Fires when pivot IS confirmed (is_sh/is_sl), BEFORE the BOS/CHOCH break-check — different semantic: label the pivot's position in the sequence, not that price has broken it.
+- Dedup: skip if new pivot within 0.1% of the last one emitted (double-top / noise suppression).
+- State: `_prev_sh`, `_prev_sl` per instrument added to `__init__`.
+- Effect: `structure_long = has_bos_demand or has_choch_demand or hh_ts or hl_ts` now fully Databento-capable; same for `structure_short` via LH/LL.
+- Parity OK, goldens OK, breakout/dual-sim smokes OK.
+
 ## Remaining Phase 2 items
-- Phase 2C: FVG detector — 3-candle imbalance gap. Complex, keep TV for now.
+- Phase 2D: FVG detector — 3-candle imbalance gap. Complex, keep TV for now.
 
 ## Bars only close at minute boundaries
 `instruments: {}` and `bars: []` is NORMAL until the first minute boundary after the first trade.  `last_ts` in `/databento-status` being non-null confirms trades are flowing.  `instruments` populates only when `_on_bar_close` fires (when a NEW minute arrives).
