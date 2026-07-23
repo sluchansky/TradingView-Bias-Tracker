@@ -57657,7 +57657,7 @@ setInterval(function(){
     var grip = document.createElement('span');
     grip.className = 'mod-grip'; grip.textContent = '\u283F'; grip.title = 'Drag to reorder';
     var caret = document.createElement('span');
-    caret.className = 'mod-cl'; caret.title = 'Minimize / expand';
+    caret.className = 'mod-cl'; caret.title = 'Minimize / expand'; caret.textContent = '\u25BE';
     h.insertBefore(grip, h.firstChild);
     h.appendChild(caret);
     var hx = document.createElement('span');
