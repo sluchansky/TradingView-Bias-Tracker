@@ -46225,6 +46225,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
        same analyst/debate/pro/entry-quality/volatility/edge engines the hidden
        panels used — it NEVER recomputes and NEVER touches the money path) ════ -->
   <div class="mod" id="mod-brain" data-cat="primary" data-brain-state="wait">
+  <div class="mod-h">Main Brain</div>
     <!-- Badge (JS-controlled, stays hidden until data arrives) -->
     <span id="mb-badge" class="mb-badge" style="display:none">…</span>
     <!-- mb-av preserved for JS compat -->
