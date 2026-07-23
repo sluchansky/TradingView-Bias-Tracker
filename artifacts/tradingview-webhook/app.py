@@ -324,6 +324,13 @@ RVOL_BY_TICKER      = {}
 # spike is only "fresh" for VOLUME_SPIKE_TTL_MIN minutes after it arrives.
 # {"MNQ": {"ts": iso}, "MGC": {"ts": iso}}
 VOLUME_SPIKE_BY_TICKER = {}
+# Server-side dedup for CONFIRMATION alerts — applies to both TradingView and
+# Databento sources. Mirrors DatabentoBrain.CONFIRM_COOLDOWN_MIN (15 min).
+# Same-direction confirmations are suppressed for CONFIRM_COOLDOWN_MIN minutes
+# per instrument; resets automatically when the opposite direction fires first.
+# {inst: {"bull": datetime, "bear": datetime}}
+CONFIRM_COOLDOWN_MIN  = 15   # minutes between same-direction confirmations (per inst)
+_CONFIRM_COOLDOWN_TS: dict = {}
 # ── Market Environment Layer — Phase 1A in-memory state ───────────────────────
 # Written only by compute_market_environment(); never read by the money path.
 _ME_LOCK          = threading.Lock()
@@ -38790,6 +38797,32 @@ def webhook():
         _resp = _handle_command_alert(normalized, data, parsed_price, resolved_inst)
         if _resp is not None:
             return _resp
+
+    # ── Confirmation cooldown (TV + Databento) ────────────────────────────────
+    #    Suppress same-direction CONFIRMATION re-fires within CONFIRM_COOLDOWN_MIN
+    #    minutes per instrument, regardless of source (TradingView or Databento
+    #    injection). Direction resets the cooldown automatically — a BULLISH
+    #    CONFIRMATION after a BEARISH one is never suppressed.
+    if normalized.endswith(" BULLISH CONFIRMATION") or normalized.endswith(" BEARISH CONFIRMATION"):
+        _conf_side = "bull" if "BULLISH" in normalized else "bear"
+        _conf_now  = datetime.now(timezone.utc)
+        _conf_last = _CONFIRM_COOLDOWN_TS.get(resolved_inst, {}).get(_conf_side)
+        if _conf_last is not None:
+            _conf_age_min = (_conf_now - _conf_last).total_seconds() / 60.0
+            if _conf_age_min < CONFIRM_COOLDOWN_MIN:
+                logger.info(
+                    "Confirm cooldown: %s suppressed (%.1f / %d min)",
+                    normalized, _conf_age_min, CONFIRM_COOLDOWN_MIN,
+                )
+                return jsonify({
+                    "status":       "suppressed",
+                    "reason":       "confirmation cooldown",
+                    "instrument":   resolved_inst,
+                    "side":         _conf_side,
+                    "age_min":      round(_conf_age_min, 1),
+                    "cooldown_min": CONFIRM_COOLDOWN_MIN,
+                }), 200
+        _CONFIRM_COOLDOWN_TS.setdefault(resolved_inst, {})[_conf_side] = _conf_now
 
     record = {
         "alert_type":        normalized,
