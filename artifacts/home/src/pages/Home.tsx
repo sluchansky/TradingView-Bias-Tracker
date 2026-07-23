@@ -1183,7 +1183,10 @@ function useSessionMemory(status: string, edge: number, ticker: string, strictR:
   const active = last7.filter(r => r.en >= 3).length;
   const mcWR   = (() => {
     const agg: Record<string, number> = {};
-    last7.forEach(r => Object.entries(r.wr).forEach(([k, v]) => { agg[k] = (agg[k] || 0) + v; }));
+    last7.forEach(r => Object.entries(r.wr).forEach(([k, v]) => {
+      if (/market.closed|live alerts.paused|next open/i.test(k)) return;
+      agg[k] = (agg[k] || 0) + v;
+    }));
     return Object.entries(agg).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
   })();
 
@@ -4466,7 +4469,7 @@ export default function Home() {
                       {Math.round(mem.yest.pe)}<span style={{ fontSize:8, fontWeight:400 }}>/110</span>
                     </div>
                     <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:3 }}>
-                      {mem.yest.su} setup{mem.yest.su !== 1 ? 's' : ''} \u00b7 {mem.yest.tr} trade{mem.yest.tr !== 1 ? 's' : ''}
+                      {mem.yest.su}{' setup'}{mem.yest.su !== 1 ? 's' : ''}{' · '}{mem.yest.tr}{' trade'}{mem.yest.tr !== 1 ? 's' : ''}
                     </div>
                   </>
                 ) : <div style={{ fontSize:11, fontFamily:'monospace', color:MUTED }}>\u2014</div>}
@@ -4591,7 +4594,7 @@ export default function Home() {
                           {tm.worstSetup.name.replace(/\b\w/g, (c:string) => c.toUpperCase()).slice(0, 22)}
                         </div>
                         <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:2 }}>
-                          {tm.worstSetup.losses} loss{tm.worstSetup.losses !== 1 ? 'es' : ''}  \u00b7  {Math.round(tm.worstSetup.wr * 100)}% WR
+                          {tm.worstSetup.losses} loss{tm.worstSetup.losses !== 1 ? 'es' : ''}{'\u00b7'}{Math.round(tm.worstSetup.wr * 100)}% WR
                         </div>
                       </>
                     ) : mem.mcWR ? (
@@ -4609,7 +4612,7 @@ export default function Home() {
                     {Math.round(mem.live.pe)}<span style={{ fontSize:8, fontWeight:400, opacity:0.55 }}>/110</span>
                   </div>
                   <div style={{ fontSize:9, fontFamily:'monospace', color:MUTED, marginTop:2 }}>
-                    peak \u00b7 {mem.live.su} setup{mem.live.su !== 1 ? 's' : ''} \u00b7 {mem.live.tr} trade{mem.live.tr !== 1 ? 's' : ''}
+                    {'peak · '}{mem.live.su}{' setup'}{mem.live.su !== 1 ? 's' : ''}{' · '}{mem.live.tr}{' trade'}{mem.live.tr !== 1 ? 's' : ''}
                   </div>
                   {tm.today.total > 0 && (
                     <div style={{ fontSize:9, fontFamily:'monospace', marginTop:2,
