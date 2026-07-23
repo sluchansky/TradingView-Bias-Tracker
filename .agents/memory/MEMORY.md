@@ -133,6 +133,7 @@
 - [Micro Scalp Mode](micro-scalp-mode.md) — sweep→trap→trigger engine: ghost ledger always + separate restart-resetting LIVE arm via the shared gateway; SINGLE EXIT target1==target2; smokes must force _EXECUTION_MODE_RAW + stub sends.
 - [Real Learning Rule Engine](learning-rule-engine.md) — GHOST_ONLY/LIVE_ELIGIBLE per-instrument gate in execute_trade_gateway; demote-only FAIL-OPEN; 50-sample threshold; recomputed on every Nth close + boot.
 - [Thesis Tracker system](thesis-tracker.md) — outcome-based analyst memory; snapshot→25-75min resolve→lesson+reflection; pattern memory SQL (≥3 samples); DISPLAY-ONLY/fail-open; _mb_capture_cognitive is the heartbeat hook.
+- [Left Brain / Right Brain dual-engine](right-brain-engine.md) — bar-close scanner + training-mode executor; Right Brain eval runs dev+prod (no DISCORD_LIVE_ENABLED gate); Flask has NO @owner_required; proxy whitelist required.
 - [Market Data Engine phases](market-data-engine.md) — Phase 1 done (ALERT-ONLY status panel + Phase 5 staleness gate default-OFF); Phase 2 = Databento (pip available, needs API key); Phases 3-5 follow.
 - [Brain Conflict Resolver](brain-conflict-resolver.md) — 10-priority display-only conflict engine; BLOCK on hard vetoes, WAIT/ALLOW on soft penalty accumulation; wired at mb_out["conflict_resolver"].
 - [Verdict Board](verdict-board.md) — 4-bucket plain-English classifier (supports/opposes/missing/vetoes); reads observations+BCR+result; mb_out["verdict_board"]; never feeds money path.

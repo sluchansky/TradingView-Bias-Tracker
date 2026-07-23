@@ -8824,6 +8824,20 @@ STRATEGY_WEIGHTS       = {}                         # "{mode}::{strategy_key}" �
 LEARNING_SAMPLE_BY_KEY = {}                         # "{mode}::{strategy_key}" → closed-trade count (int)
 PER_MODE_STATS         = {}                         # mode key → per-mode aggregate stats (win_rate/avg_r/n/top_setup)
 LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total_trades": 0}
+# ── Right Brain — proactive execution engine (training-mode-gated) ────────────
+# Additive alongside the existing webhook/auto-trade path. Training mode (PF <
+# RIGHT_BRAIN_MIN_PF) only logs what it WOULD trade — zero gateway calls. When
+# live-eligible (PF >= threshold) it fires through the SAME audited gateway with
+# ALL existing safety (arm flag, _training_gate stage, daily cap, kill-switch).
+RIGHT_BRAIN_MIN_PF     = float(os.getenv("RIGHT_BRAIN_MIN_PF", "1.0"))
+_RIGHT_BRAIN_STATE: dict = {
+    "mode":          "training",  # "training" | "live_eligible"
+    "profit_factor": 0.0,
+    "last_eval":     {},          # inst -> last decision dict (Left Brain view)
+    "training_log":  [],          # last 10 significant decisions (WOULD_TRADE / EXECUTE)
+}
+_RIGHT_BRAIN_LOG       = deque(maxlen=30)
+_RIGHT_BRAIN_LOCK      = threading.Lock()
 # Learning Engine v2 (display-only) in-memory caches, warmed by _recompute_learning
 # (boot + every Nth close) under LEARNING_LOCK; NEVER read via per-request SQL.
 GOVERNOR_STATS         = {"ready": False, "trade_count": 0, "last_refreshed_at": None}  # historical aggregates for the Confidence Governor
@@ -24189,40 +24203,180 @@ def _databento_bar_scan(inst: str, price: float) -> None:
     built entirely from Databento signals (BOS/CHOCH + sweep + confirmation)
     without waiting for a TradingView webhook to arrive.
 
-    Dedup stack (identical to _trade_ready_loop):
-      • DISCORD_LIVE_ENABLED — never fires on dev or analysis-only instances
-      • active_trade_for(inst) — skip if a position is already open on this inst
-      • LAST_LIVE_CARD_AT throttle — honours the same TRADE_READY_INTERVAL window
-      • is_actionable(verdict) — only genuine READY verdicts continue
-      • send_live_ready_card — mute-aware; stamps LAST_LIVE_CARD_AT on send
-
-    notify=True: first-discovery alert pings @everyone so phones receive it
-    immediately (same as the instant webhook alert). _trade_ready_loop handles
-    follow-up re-posts while the setup stays READY.
+    Discord live card: DISCORD_LIVE_ENABLED-gated, throttled by LAST_LIVE_CARD_AT.
+    Right Brain eval:  runs on every bar close regardless of DISCORD_LIVE_ENABLED
+                       so the training log and PF gate stay current on dev + prod.
 
     Runs in a daemon thread to never block the Databento data-feed thread.
     """
     def _scan() -> None:
         try:
-            if not DISCORD_LIVE_ENABLED:
-                return
             if active_trade_for(inst):
                 return
-            last = LAST_LIVE_CARD_AT.get(inst)
-            if last and (datetime.now(timezone.utc) - last).total_seconds() < trade_ready_interval():
-                return
             a = full_analysis(ticker_override=inst)
-            if not active_trade_for(inst) and is_actionable(a.get("verdict")):
-                entry = _build_card_entry(a, ticker=f"{inst}1!")
-                dispatched = send_live_ready_card(entry, inst, notify=True)
-                if dispatched:
-                    logger.info(
-                        "Databento scan READY: %s @ %.4f — live card sent",
-                        inst, price,
-                    )
+            # Discord live card — prod instance only, throttled by LAST_LIVE_CARD_AT
+            if DISCORD_LIVE_ENABLED:
+                last = LAST_LIVE_CARD_AT.get(inst)
+                if not (last and (datetime.now(timezone.utc) - last).total_seconds() < trade_ready_interval()):
+                    if not active_trade_for(inst) and is_actionable(a.get("verdict")):
+                        entry = _build_card_entry(a, ticker=f"{inst}1!")
+                        dispatched = send_live_ready_card(entry, inst, notify=True)
+                        if dispatched:
+                            logger.info(
+                                "Databento scan READY: %s @ %.4f — live card sent",
+                                inst, price,
+                            )
+            # Right Brain evaluates every bar (READY or not; dev + prod)
+            _right_brain_eval(inst, a, price)
         except Exception as exc:
             logger.debug("Databento bar scan (%s): %s", inst, exc)
     threading.Thread(target=_scan, name=f"db-scan-{inst}", daemon=True).start()
+
+
+def _right_brain_pf() -> float:
+    """Weighted-average profit factor across strategies for the current trading mode.
+    Returns 0.0 when analytics are unavailable — training mode assumed (fail-safe)."""
+    try:
+        mode    = TRADING_MODE
+        entries = [
+            a for a in (LEARNING_ANALYTICS if isinstance(LEARNING_ANALYTICS, list) else [])
+            if a.get("trading_mode") == mode
+            and a.get("profit_factor") is not None
+            and int(a.get("n") or 0) >= 5
+        ]
+        if not entries:
+            return 0.0
+        total_n = sum(int(a["n"]) for a in entries)
+        return round(
+            sum(float(a["profit_factor"]) * int(a["n"]) for a in entries) / total_n, 2
+        ) if total_n else 0.0
+    except Exception:
+        return 0.0
+
+
+def _right_brain_eval(inst: str, a: dict, price: float) -> None:
+    """Right Brain per-bar evaluation: log training decisions or fire the gateway.
+
+    Training mode (PF < RIGHT_BRAIN_MIN_PF): records what it WOULD trade — zero
+    gateway calls.  This is the only mode until the bot demonstrates a profit
+    factor >= 1.0 (configurable via RIGHT_BRAIN_MIN_PF env var).
+
+    Live-eligible (PF >= RIGHT_BRAIN_MIN_PF) AND armed: fires through the SAME
+    audited _maybe_auto_execute / execute_trade_gateway path as the webhook auto-
+    trigger.  ALL existing safety checks apply (arm flag, _training_gate stage,
+    daily cap, per-asset kill-switch, AUTO_FIRED_KEYS duplicate-key guard).
+
+    Always updates _RIGHT_BRAIN_STATE for the dashboard Dual Brain panel.
+    """
+    try:
+        pf        = _right_brain_pf()
+        live      = pf >= RIGHT_BRAIN_MIN_PF
+        ready     = is_actionable(a.get("verdict", ""))
+        direction = ready_direction(a.get("verdict", ""))
+        score     = int(a.get("edge_score") or a.get("edgeScore") or 0)
+        verdict   = str(a.get("verdict") or "WAIT")
+        ts        = datetime.now(timezone.utc).isoformat()
+
+        decision: dict = {
+            "ts":            ts,
+            "inst":          inst,
+            "price":         round(float(price), 4),
+            "verdict":       verdict,
+            "direction":     direction or "",
+            "edge_score":    score,
+            "profit_factor": pf,
+            "mode":          "live_eligible" if live else "training",
+            "action":        "OBSERVE",
+            "reason":        "",
+        }
+
+        if active_trade_for(inst):
+            decision["action"] = "SKIP"
+            decision["reason"] = "Active trade open"
+        elif not ready:
+            decision["action"] = "OBSERVE"
+            decision["reason"] = verdict
+        elif not live:
+            tp = a.get("trade_plan") or {}
+            decision["action"] = "WOULD_TRADE"
+            decision["reason"] = f"PF {pf:.2f} < {RIGHT_BRAIN_MIN_PF:.1f} — training"
+            decision["trade_plan"] = {
+                "entry": tp.get("entry"),
+                "stop":  tp.get("stop"),
+                "tp1":   tp.get("target1"),
+            }
+        elif not auto_trade_enabled(inst):
+            decision["action"] = "WOULD_TRADE"
+            decision["reason"] = f"PF {pf:.2f} >= {RIGHT_BRAIN_MIN_PF:.1f} — arm to execute"
+        else:
+            decision["action"] = "EXECUTE"
+            decision["reason"] = f"PF {pf:.2f} >= {RIGHT_BRAIN_MIN_PF:.1f} — executing"
+            try:
+                _setup_key = _auto_setup_key(a, inst)
+                with AUTO_TRADE_LOCK:
+                    _already = _setup_key in AUTO_FIRED_KEYS
+                if not _already:
+                    fired = _maybe_auto_execute(
+                        inst,
+                        allow_stack=(TRADING_MODE == "SCALP"),
+                        setup_key=_setup_key,
+                        source="right_brain",
+                    )
+                    if fired:
+                        with AUTO_TRADE_LOCK:
+                            AUTO_FIRED_KEYS.add(_setup_key)
+                        _persist_auto_fired_key(_setup_key)
+                        logger.info(
+                            "Right Brain EXECUTE: %s %s @ %.4f (PF %.2f)",
+                            inst, direction, price, pf,
+                        )
+                    else:
+                        decision["action"] = "SKIP"
+                        decision["reason"] = "Gateway suppressed (safety gate)"
+                else:
+                    decision["action"] = "SKIP"
+                    decision["reason"] = "Setup already fired this bar"
+            except Exception as exc:
+                decision["action"] = "ERROR"
+                decision["reason"] = f"Gateway error: {exc}"
+                logger.error("Right Brain execute error (%s): %s", inst, exc)
+
+        with _RIGHT_BRAIN_LOCK:
+            _RIGHT_BRAIN_LOG.append(decision)
+            _RIGHT_BRAIN_STATE["profit_factor"]   = pf
+            _RIGHT_BRAIN_STATE["mode"]            = "live_eligible" if live else "training"
+            _RIGHT_BRAIN_STATE["last_eval"][inst] = decision
+            if decision["action"] in ("WOULD_TRADE", "EXECUTE", "ERROR"):
+                relevant = [d for d in list(_RIGHT_BRAIN_LOG)
+                            if d.get("action") in ("WOULD_TRADE", "EXECUTE", "ERROR")]
+                _RIGHT_BRAIN_STATE["training_log"] = relevant[-10:]
+    except Exception as exc:
+        logger.debug("_right_brain_eval (%s): %s", inst, exc)
+
+
+def _right_brain_loop() -> None:
+    """Periodic 60-second fallback scan across all enabled instruments.
+
+    Catches READY setups that Databento bar-close events may have missed
+    (e.g. after feed reconnects or during low-volume periods with sparse bars).
+    Does NOT gate on DISCORD_LIVE_ENABLED — the training log is useful on dev.
+    Discord card sends remain inside _databento_bar_scan / _trade_ready_loop.
+    Self-reschedules via threading.Timer so it never blocks the Flask worker.
+    """
+    try:
+        for inst in enabled_instruments():
+            try:
+                if active_trade_for(inst):
+                    continue
+                a     = full_analysis(ticker_override=inst)
+                price = float(a.get("current_price") or 0.0)
+                _right_brain_eval(inst, a, price)
+            except Exception as exc:
+                logger.debug("Right brain loop (%s): %s", inst, exc)
+    except Exception as exc:
+        logger.debug("Right brain loop outer: %s", exc)
+    finally:
+        threading.Timer(60, _right_brain_loop).start()
 
 
 # ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
@@ -44902,6 +45056,29 @@ def dashboard():
   .mb-hidden{display:none !important}
   .cp-btn{font-size:11px;padding:4px 10px;border-radius:6px;border:1px solid var(--border,#2a2a2a);background:#1a1a1a;color:#e8e8e8;cursor:pointer;letter-spacing:.5px}
   .cp-btn.active{background:#ef4444;border-color:#ef4444;color:#fff}
+  /* ── Dual Brain panel ───────────────────────────────────────────────────── */
+  #mod-dual-brain .db-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px}
+  @media(max-width:560px){#mod-dual-brain .db-grid{grid-template-columns:1fr}}
+  #mod-dual-brain .db-side{border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel)}
+  #mod-dual-brain .db-side-hd{font-size:10px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:7px}
+  .db-pill{font-size:8px;font-weight:700;letter-spacing:1.6px;padding:2px 9px;border-radius:999px;text-transform:uppercase;flex-shrink:0}
+  .db-pill-scan{color:#34d399;background:rgba(52,211,153,.10);border:1px solid rgba(52,211,153,.25)}
+  .db-pill-train{color:#f59e0b;background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.25)}
+  .db-pill-live{color:#34d399;background:rgba(52,211,153,.10);border:1px solid rgba(52,211,153,.25)}
+  #mod-dual-brain .db-inst-row{display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid var(--border)}
+  #mod-dual-brain .db-inst-row:last-child{border-bottom:none}
+  #mod-dual-brain .db-inst-label{font-size:12px;font-weight:600;color:var(--text);width:36px;flex-shrink:0}
+  #mod-dual-brain .db-verdict{font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;text-transform:uppercase;flex:1}
+  .db-verdict-ready{color:#34d399;background:rgba(52,211,153,.12)}
+  .db-verdict-wait{color:var(--muted)}
+  #mod-dual-brain .db-pf-bar{height:6px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden;margin:8px 0 4px}
+  #mod-dual-brain .db-pf-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#f59e0b,#34d399);transition:width .8s ease}
+  #mod-dual-brain .db-pf-label{font-size:9px;color:var(--muted);display:flex;justify-content:space-between;margin-bottom:8px}
+  #mod-dual-brain .db-log-row{font-size:9px;color:var(--muted);padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #mod-dual-brain .db-log-row:last-child{border-bottom:none}
+  .db-log-would{color:#f59e0b}
+  .db-log-exec{color:#34d399}
+  .db-log-obs{color:rgba(255,255,255,.2)}
   /* Declutter — Advanced-panels gate (DISPLAY-ONLY, per-device via data-adv on <html>).
      Advanced OFF hides every live-view panel except the core few; ON reveals the rest. */
   html:not([data-adv="1"]) #view-live .mod[data-cat="advanced"],
@@ -46194,6 +46371,29 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     </div>
     <!-- Stale warning banner -->
     <div id="dfs-stale-warn" style="display:none;background:#7f1d1d;border:1px solid #ef4444;border-radius:6px;padding:8px;font-size:11px;color:#fca5a5;line-height:1.5">—</div>
+  </div>
+
+  <!-- ════ Dual Brain — Left (Analyzer) + Right (Executor) ════
+       Left Brain: constantly scanning the market at every Databento 1m bar close,
+       running full_analysis and feeding the Right Brain with fresh verdicts.
+       Right Brain: training mode until profit factor >= RIGHT_BRAIN_MIN_PF (default 1.0).
+       In training it logs every trade it WOULD have taken; once live-eligible it
+       auto-executes through the same audited gateway as the webhook auto-trigger.
+       ADDITIVE — never modifies the gate/scoring/webhook path. ════ -->
+  <div class="mod" id="mod-dual-brain" data-cat="primary">
+    <div class="mod-h">Left Brain / Right Brain
+      <span class="mod-cat cat-primary">PRIMARY</span>
+    </div>
+    <div class="db-grid">
+      <div class="db-side" id="lb-side">
+        <div class="db-side-hd">Left Brain &nbsp;<span class="db-pill db-pill-scan" id="lb-pill">Scanning</span></div>
+        <div id="lb-body"><div class="db-log-row db-log-obs">Waiting for bar close&hellip;</div></div>
+      </div>
+      <div class="db-side" id="rb-side">
+        <div class="db-side-hd">Right Brain &nbsp;<span class="db-pill db-pill-train" id="rb-pill">Training</span></div>
+        <div id="rb-body"><div class="db-log-row db-log-obs">Evaluating&hellip;</div></div>
+      </div>
+    </div>
   </div>
 
   <!-- ════ Real Account Results — the ACTUAL broker outcomes imported from your
@@ -54372,10 +54572,77 @@ var UNIFIED_DASH = ('__UNIFIED_DASH__' === '1');
 // DISPLAY-ONLY section map — never touches the money path.
 // Keys are the 5 tab names; values are the panel IDs shown in that tab.
 // Panels not listed here are never hidden (always visible).
+// ── Dual Brain panel JS ───────────────────────────────────────────────────────
+// Left Brain: per-instrument verdict + edge-score from the latest _right_brain_eval.
+// Right Brain: PF progress bar + training log from /api/right-brain.
+function _renderDualBrain(d){
+  if(!d) return;
+  var live   = d.mode === 'live_eligible';
+  var pf     = parseFloat(d.profit_factor || 0);
+  var minPf  = parseFloat(d.min_pf || 1.0);
+  var lastEval = d.last_eval || {};
+  var insts  = (d.instruments || Object.keys(lastEval)).filter(function(i){ return !!i; });
+
+  // Left Brain — per-instrument scanning state
+  var lHtml = '';
+  insts.forEach(function(inst){
+    var ev      = lastEval[inst] || {};
+    var verdict = (ev.verdict || '---').toUpperCase();
+    var score   = ev.edge_score || 0;
+    var ready   = verdict.indexOf('READY') >= 0;
+    var vcls    = ready ? 'db-verdict-ready' : 'db-verdict-wait';
+    var ts      = (ev.ts || '').slice(11,16);
+    lHtml += '<div class="db-inst-row">'
+           + '<span class="db-inst-label">' + aiEsc(inst) + '</span>'
+           + '<span class="db-verdict ' + vcls + '">' + aiEsc(verdict) + '</span>'
+           + '<span style="font-size:9px;color:var(--muted);flex-shrink:0">' + score + (ts ? ' &middot; ' + ts : '') + '</span>'
+           + '</div>';
+  });
+  if(!lHtml) lHtml = '<div class="db-log-row db-log-obs">Scanning &mdash; bar close pending</div>';
+  var lEl = document.getElementById('lb-body');
+  if(lEl) lEl.innerHTML = lHtml;
+
+  // Right Brain — mode pill + PF bar + training log
+  var rbPill = document.getElementById('rb-pill');
+  if(rbPill){
+    rbPill.textContent = live ? 'LIVE' : 'TRAINING';
+    rbPill.className   = 'db-pill ' + (live ? 'db-pill-live' : 'db-pill-train');
+  }
+  var pct   = minPf > 0 ? Math.min(100, Math.max(0, (pf / minPf) * 100)) : 0;
+  var tlog  = (d.training_log || []).slice().reverse().slice(0, 6);
+  var rHtml = '<div class="db-pf-bar"><div class="db-pf-fill" style="width:' + pct.toFixed(1) + '%"></div></div>'
+            + '<div class="db-pf-label"><span>Profit Factor</span><span>' + pf.toFixed(2) + ' / ' + minPf.toFixed(1) + '</span></div>';
+  if(tlog.length){
+    tlog.forEach(function(r){
+      var cls = r.action === 'EXECUTE'     ? 'db-log-exec'
+              : r.action === 'WOULD_TRADE' ? 'db-log-would' : 'db-log-obs';
+      var lbl = r.action === 'EXECUTE'     ? '\u26a1 EXEC'
+              : r.action === 'WOULD_TRADE' ? '\u25ce WOULD' : '\u00b7\u00b7\u00b7';
+      var time = (r.ts || '').slice(11,16);
+      rHtml += '<div class="db-log-row ' + cls + '">'
+             + lbl + ' ' + aiEsc(r.inst || '') + ' ' + aiEsc(r.direction || '')
+             + '<span style="float:right;opacity:.4">' + aiEsc(time) + '</span>'
+             + '</div>';
+    });
+  } else {
+    rHtml += '<div class="db-log-row db-log-obs">Monitoring &mdash; no READY setups yet</div>';
+  }
+  var rEl = document.getElementById('rb-body');
+  if(rEl) rEl.innerHTML = rHtml;
+}
+function _pollDualBrain(){
+  fetch('/api/right-brain').then(function(r){ return r.json(); }).then(function(d){
+    _renderDualBrain(d);
+  }).catch(function(){});
+  setTimeout(_pollDualBrain, 15000);
+}
+setTimeout(_pollDualBrain, 4000);
+
 var _liveNavSections = {
   // Quick status: sensitivity, current verdict, active trade summary, HV windows
   overview: [
     'mod-brain',          // Main Brain compact hub
+    'mod-dual-brain',     // Left Brain (Analyzer) / Right Brain (Executor)
     'mod-real-results',   // Real Account Results
     'mod-hvsessions'      // High-Volume Session Windows
     // mod-data-feed moved to analysis section (Phase 3B: raw alert data is diagnostic)
@@ -60390,6 +60657,23 @@ def learning_controls():
     }), 200
 
 
+@app.route("/right-brain", methods=["GET"])
+def right_brain_status():
+    """Right Brain state: training log, profit factor, mode, last eval per instrument.
+    Left Brain view: last_eval[inst] shows the verdict/edge/ts from the most recent
+    bar-close full_analysis for each instrument. DISPLAY-ONLY — never touches the gate."""
+    with _RIGHT_BRAIN_LOCK:
+        state = {
+            "mode":          _RIGHT_BRAIN_STATE["mode"],
+            "profit_factor": _RIGHT_BRAIN_STATE["profit_factor"],
+            "last_eval":     dict(_RIGHT_BRAIN_STATE["last_eval"]),
+            "training_log":  list(_RIGHT_BRAIN_STATE["training_log"]),
+        }
+    state["min_pf"]      = RIGHT_BRAIN_MIN_PF
+    state["instruments"] = enabled_instruments()
+    return jsonify(state), 200
+
+
 @app.route("/learning-score", methods=["GET", "POST"])
 def learning_score_controls():
     """Read or set the Learning-influences-SCORING master flag (Task #18). OFF by
@@ -61581,6 +61865,7 @@ if __name__ == "__main__":
     # In dev they would double-post to the shared live channel — see DISCORD_LIVE_ENABLED.
     if DISCORD_LIVE_ENABLED:
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()  # re-post READY card (mode-aware cadence)
+        threading.Timer(30, _right_brain_loop).start()  # Right Brain periodic fallback (30s delay so Databento warms up)
         threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()  # open-position unified-thesis updates → journal channel (DISPLAY/NOTIFY only)
         _schedule_eod()                               # schedule daily EOD summary
         _schedule_weekly_report()                     # schedule weekly report (Fri after close)

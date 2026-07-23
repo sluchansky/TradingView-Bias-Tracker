@@ -230,6 +230,9 @@ export const BOT1_ROUTES = [
   // UI can distinguish "feed off" from "route missing".
   "/databento-bars",
   "/databento-status",
+  // Right Brain status — training log, PF, mode, last per-instrument eval.
+  // DISPLAY/READ-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
+  "/right-brain",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.
