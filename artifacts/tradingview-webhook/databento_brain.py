@@ -370,9 +370,16 @@ class DatabentoBrain:
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Session VWAP
-        vwap = (self._pv_sum[inst] / self._v_sum[inst]
-                if self._v_sum[inst] > 0 else None)
+        # Session VWAP — accumulated from live trade ticks (_on_trade).
+        # On boot, historical bars arrive before any live trades, so _v_sum is 0.
+        # Fall back to the bar's typical price so get_vwap() never sees "missing"
+        # from the very first bar; replaced by real accumulation within ~1 minute.
+        if self._v_sum[inst] > 0:
+            vwap = self._pv_sum[inst] / self._v_sum[inst]
+        elif bar.get("volume", 0) > 0:
+            vwap = (bar["high"] + bar["low"] + bar["close"]) / 3.0
+        else:
+            vwap = None
 
         # ATR(14) from completed bars
         atr = self._calc_atr(bars)

@@ -8785,6 +8785,21 @@ except Exception:                                  # pragma: no cover - optional
 
 LEARNING_DB_URL        = os.environ.get("DATABASE_URL")
 LEARNING_DB_ENABLED    = bool(LEARNING_DB_URL and psycopg2)
+
+def get_db_connection():
+    """Return a new psycopg2 connection to the shared DB, or None on failure.
+
+    Callers must check `if not conn` and are responsible for closing it.
+    FAIL-OPEN: any exception returns None so callers degrade gracefully.
+    """
+    if not LEARNING_DB_ENABLED:
+        return None
+    try:
+        return psycopg2.connect(LEARNING_DB_URL, connect_timeout=5)
+    except Exception as exc:
+        logger.debug("get_db_connection failed (fail-open): %s", exc)
+        return None
+
 LEARNING_LOCK          = threading.Lock()          # guards the in-memory caches below
 LEARNING_RECOMPUTE_LOCK = threading.Lock()         # serializes recomputes so a slow run can't overwrite a newer cache
 LEARNING_MIN_SAMPLE    = 20                         # min closed trades before history weights a strategy
@@ -27887,8 +27902,13 @@ def compute_data_feed_status(instrument=None):
         elif worst < 900:     overall = "STALE"
         else:                 overall = "OFFLINE"
 
-        # Data mode label based on Databento feed status
-        databento_live = auto_fresh  # AUTO_PRICE_BY_TICKER populated by Databento
+        # Data mode label: check if Databento has written fresh data recently
+        databento_live = any(
+            (v or {}).get("source") == "databento"
+            and _age_secs((v or {}).get("ts")) is not None
+            and _age_secs((v or {}).get("ts")) < 300
+            for v in AUTO_PRICE_BY_TICKER.values()
+        )
         if databento_live:
             data_mode = "TV + Databento"
             disclaimer = (
