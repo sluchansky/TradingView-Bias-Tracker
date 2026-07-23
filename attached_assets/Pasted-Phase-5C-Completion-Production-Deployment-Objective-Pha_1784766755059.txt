@@ -1,0 +1,121 @@
+Phase 5C Completion & Production Deployment
+
+Objective
+
+Phase 5C has been validated. Do not make any additional code changes.
+
+The goal is to publish the validated build exactly as tested and verify that production matches the validated commit.
+
+⸻
+
+Step 1 — Verify Git State
+
+Confirm:
+
+* Current branch is polish-v1
+* HEAD is:
+
+e4753d545103e38a4f6f967c275b697f6b10d7c3
+
+Confirm:
+
+* No modified tracked files.
+* Ignore the uploaded instruction text file if it is untracked. Do not commit it.
+
+⸻
+
+Step 2 — Push the Validated Commit
+
+Push the validated Phase 5C commit to GitHub.
+
+Do not force-push.
+
+Do not squash.
+
+Do not amend the commit.
+
+⸻
+
+Step 3 — Verify Remote
+
+Confirm the GitHub branch now points to:
+
+e4753d545103e38a4f6f967c275b697f6b10d7c3
+
+Report the remote SHA after the push.
+
+⸻
+
+Step 4 — Publish Production
+
+Deploy the current GitHub revision to production.
+
+Do not make any code changes during deployment.
+
+⸻
+
+Step 5 — Production Verification
+
+After deployment, verify:
+
+1. /status responds successfully.
+2. /decision-trace responds successfully.
+3. Dashboard loads normally.
+4. No startup exceptions.
+5. Existing webhook endpoint remains reachable.
+
+⸻
+
+Step 6 — Verify Phase 5C Diagnostics
+
+Confirm the new diagnostics appear.
+
+Volatility should clearly distinguish configured vs applied adjustment, for example:
+
+* volatility regime
+* configured adjustment
+* applied adjustment
+
+Verify the diagnostics no longer imply that the displayed volatility adjustment reduced the edge score when it did not.
+
+Confirm the decision trace includes:
+
+* raw component score
+* final score
+* score gap
+* optional confirmations
+* zone role
+* structure diagnostics
+
+⸻
+
+Step 7 — Regression Check
+
+Run:
+
+* Phase 5B tests
+* Phase 5C tests
+* Golden tests
+* Parity tests
+* Smoke tests
+
+Report any failures separately.
+
+If the previously known failures (test_brain_home and test_dynamic_stop) still exist and no related files were modified, report them as unrelated existing issues rather than Phase 5C regressions.
+
+⸻
+
+Deliverables
+
+Provide:
+
+* Current branch
+* Current HEAD
+* GitHub HEAD
+* Production revision
+* Deployment status
+* Production health status
+* Test summary
+* Confirmation that Phase 5C was deployed without modifying trading behavior
+
+Do not implement any additional features or fixes in this phase.
