@@ -12249,6 +12249,58 @@ def _learning_engine_view():
     return out
 
 
+# ── Recent trades cache — feeds Performance (7-day) panel in the home UI ──────
+_RECENT_TRADES_CACHE     = {"v": None, "t": 0.0}
+_RECENT_TRADES_CACHE_TTL = 60.0   # seconds; trades don't change that fast
+
+def _recent_trades_view():
+    """Return up to 200 closed strategy_trades from the last 7 days.
+    Cached for 60 s; fail-open → empty list. DISPLAY-ONLY: never gates or sizes.
+    Fields mirror what useTradeMemory() in Home.tsx expects:
+      outcome / result → 'Win' or 'Loss'  (regex: win|target|profit / loss|stop|miss)
+      rr_actual / rr   → r_multiple float
+      opened_at        → ISO string ('2026-07-23T...')
+      strategy / symbol for grouping."""
+    import time as _time
+    _now = _time.time()
+    if _RECENT_TRADES_CACHE["v"] is not None and _now - _RECENT_TRADES_CACHE["t"] < _RECENT_TRADES_CACHE_TTL:
+        return _RECENT_TRADES_CACHE["v"]
+    if not LEARNING_DB_ENABLED:
+        return []
+    try:
+        conn = psycopg2.connect(LEARNING_DB_URL, connect_timeout=4)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT symbol, result, r_multiple, opened_at, active_strategy, trading_mode
+            FROM   strategy_trades
+            WHERE  opened_at >= NOW() - INTERVAL '7 days'
+              AND  result IS NOT NULL
+            ORDER  BY opened_at DESC
+            LIMIT  200
+        """)
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        out = []
+        for r in rows:
+            oa = r["opened_at"]
+            out.append({
+                "symbol":    r["symbol"],
+                "outcome":   r["result"],   # 'Win' / 'Loss' → matches regex
+                "result":    r["result"],
+                "rr_actual": float(r["r_multiple"]) if r["r_multiple"] is not None else None,
+                "rr":        float(r["r_multiple"]) if r["r_multiple"] is not None else None,
+                "opened_at": oa.isoformat() if hasattr(oa, "isoformat") else str(oa),
+                "strategy":  r["active_strategy"],
+                "mode":      r["trading_mode"],
+            })
+        _RECENT_TRADES_CACHE["v"] = out
+        _RECENT_TRADES_CACHE["t"] = _now
+        return out
+    except Exception as exc:
+        logger.debug("_recent_trades_view error: %s", exc)
+        return _RECENT_TRADES_CACHE["v"] or []
+
+
 def _learning_rule_engine_view():
     """Return the per-instrument Rule Engine status from LEARNING_ELIGIBILITY cache
     for the /status endpoint. FAIL-OPEN: returns a disabled stub when DB is off."""
@@ -40653,6 +40705,9 @@ def _build_status_payload(_tk):
         # call.  Display-only; no scoring, gate, execution, or sizing changes.
         # All existing top-level /status keys remain present for backward compat.
         "brain": _build_brain_contract(a, _now_ts),
+        # ── Recent closed trades (last 7 days) — feeds Performance panel ────
+        # 60s cached; fail-open [] when DB absent. DISPLAY-ONLY: never gates.
+        "recent_trades": _recent_trades_view(),
     }
 
 
