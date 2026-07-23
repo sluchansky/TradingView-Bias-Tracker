@@ -3863,19 +3863,55 @@ export default function Home() {
                 <div style={{ width:'100%', padding:'6px 0' }}>
                   <div style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.22)', letterSpacing:'0.12em', textTransform:'uppercase', marginBottom:6 }}>Market Context</div>
                   {(() => {
-                    const vr   = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
-                    const cvd  = String(sig.cvd || ad.cvd || '').toLowerCase();
-                    const bias = String(sig.bias || '').toLowerCase();
-                    const liq  = String(ad.liquidity || '').toLowerCase();
+                    const vr    = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
+                    const bias  = String(sig.bias || '').toLowerCase();
+
+                    // Momentum: CVD direction (gate_debug > alert_diagnostics) →
+                    // dominant_direction → neutral fallback
+                    const cvdDir = String(gd.cvd_direction || ad.cvd_direction || sig.cvd || '').toLowerCase();
+                    const cvdSt  = String(gd.cvd_state || '').toLowerCase();
+                    const domDir = String(ad.dominant_direction || '').toLowerCase();
+                    let momVal: string, momCol: string;
+                    if (/bull|pos|long/.test(cvdDir) || /bull/.test(cvdSt)) {
+                      momVal = gd.cvd_confirmed ? 'CONFIRMED ↑' : 'RISING'; momCol = BULL;
+                    } else if (/bear|neg|short/.test(cvdDir) || /bear/.test(cvdSt)) {
+                      momVal = gd.cvd_confirmed ? 'CONFIRMED ↓' : 'FALLING'; momCol = BEAR;
+                    } else if (/bull/.test(domDir)) {
+                      momVal = 'BUILDING'; momCol = '#86efac';
+                    } else if (/bear/.test(domDir)) {
+                      momVal = 'FADING'; momCol = '#fca5a5';
+                    } else {
+                      momVal = 'NEUTRAL'; momCol = MUTED;
+                    }
+
+                    // Liquidity: sweep → zone → RVOL/volume → default
+                    const hasSweep  = gd.liquidity_sweep === true;
+                    const hasZone   = gd.zone_valid === true;
+                    const nearZone  = gd.zone_present === true && !hasZone;
+                    const rvolVal   = Number(gd.rvol_value || 0);
+                    const volSt     = String(gd.volume_state || ad.volume_state || '').toLowerCase();
+                    let liqVal: string, liqCol: string;
+                    if (hasSweep) {
+                      liqVal = 'SWEPT'; liqCol = BULL;
+                    } else if (hasZone) {
+                      liqVal = 'AT ZONE'; liqCol = BULL;
+                    } else if (nearZone) {
+                      liqVal = 'NEAR ZONE'; liqCol = '#60a5fa';
+                    } else if (rvolVal >= 1.5 || /strong|high/.test(volSt)) {
+                      liqVal = 'HIGH'; liqCol = '#60a5fa';
+                    } else if (/thin|low/.test(volSt)) {
+                      liqVal = 'THIN'; liqCol = MUTED;
+                    } else {
+                      liqVal = 'NORMAL'; liqCol = MUTED;
+                    }
+
                     return ([
                       ['Trend',      /bull/.test(bias) ? 'BULLISH' : /bear/.test(bias) ? 'BEARISH' : 'NEUTRAL',
                         /bull/.test(bias) ? BULL : /bear/.test(bias) ? BEAR : MUTED],
-                      ['Momentum',   /bull|pos/.test(cvd) ? 'BULL DELTA' : /bear|neg/.test(cvd) ? 'BEAR DELTA' : 'NEUTRAL',
-                        /bull|pos/.test(cvd) ? BULL : /bear|neg/.test(cvd) ? BEAR : MUTED],
+                      ['Momentum',   momVal, momCol],
                       ['Volatility', /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'HIGH' : /low|quiet/.test(vr) ? 'QUIET' : 'NORMAL',
                         /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : MUTED],
-                      ['Liquidity',  /thin|low/.test(liq) ? 'THIN' : /high|thick/.test(liq) ? 'HIGH' : 'NORMAL',
-                        /thin|low/.test(liq) ? BEAR : /high|thick/.test(liq) ? BULL : MUTED],
+                      ['Liquidity',  liqVal, liqCol],
                     ] as [string,string,string][]).map(([l, v, c]) => (
                       <div key={l} style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
                         padding:'3px 0', borderBottom:'1px solid rgba(255,255,255,0.022)' }}>
