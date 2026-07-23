@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Overnight volatility fetch (ES/NQ bar scarcity)](overnight-volatility-fetch.md) — ES/NQ return only ~12 bars overnight; VOL_MIN_BARS must stay ≤ that or MES/MNQ ATR silently breaks.
 - [Brain Contract JS migration (Phase 3A)](brain-contract-js-migration.md) — getBrain(d)/buildLegacyFallback are the only entry points; supporting_diagnostics=dict(_gov); 10 render fns migrated.
 - [Avatar Intelligence Engine v1](avatar-intelligence-engine.md) — proactive event queue + daily greeting + explain-simply mode + mbMemory placeholder; hook is mbAvatarObserve(d) at end of renderModules.
 - [Decision Pipeline V2](decision-pipeline-v2.md) — shadow 5-stage OBSERVE→INTERPRET→PRIORITIZE→VALIDATE→DECIDE; all CAN_* flags default-OFF; flag-OFF byte-identical; future phases flip flags one-at-a-time.

@@ -5918,6 +5918,16 @@ def get_vwap(ticker, max_age_min=None):
 MARKET_CLOSED_SENTINEL = "no intraday data (market closed)"
 _FEED_STATUS = {}  # (label, instrument) -> "ok" | "closed" | "error"
 
+# Short-lived cache for _fetch_intraday_quote so that the VWAP loop and the
+# volatility loop (which run back-to-back in the same 60-second tick) reuse the
+# same HTTP response without making a second request.  Yahoo Finance occasionally
+# returns sparse/empty bar arrays for a second same-symbol request within a few
+# seconds (rate-limiting), which caused MNQ/MES volatility to silently fail while
+# VWAP succeeded on the first call.  45 s is long enough to cover the sequential
+# loop; short enough to never serve truly stale data to any caller.
+_INTRADAY_QUOTE_CACHE: dict = {}       # symbol -> (quote, err, monotonic_ts)
+_INTRADAY_QUOTE_CACHE_TTL = 45        # seconds
+
 
 def _fetch_intraday_quote(symbol):
     """Fetch the 1-min/1d Yahoo chart `quote` block for `symbol`.
@@ -5925,7 +5935,17 @@ def _fetch_intraday_quote(symbol):
     Returns (quote_dict, err). The benign market-closed case (empty quote block)
     returns (None, MARKET_CLOSED_SENTINEL); a genuine failure returns
     (None, "<reason>"); success returns (quote_dict, None).
+
+    Results are cached for _INTRADAY_QUOTE_CACHE_TTL seconds so that callers
+    in the same auto-fetch tick (VWAP then volatility) share one HTTP request.
     """
+    import time as _time
+    cached = _INTRADAY_QUOTE_CACHE.get(symbol)
+    if cached:
+        _q, _e, _ts = cached
+        if _time.monotonic() - _ts < _INTRADAY_QUOTE_CACHE_TTL:
+            return _q, _e
+
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
         resp = requests.get(
@@ -5935,18 +5955,22 @@ def _fetch_intraday_quote(symbol):
             timeout=8,
         )
         if resp.status_code != 200:
+            _INTRADAY_QUOTE_CACHE[symbol] = (None, f"HTTP {resp.status_code}", _time.monotonic())
             return None, f"HTTP {resp.status_code}"
         result = resp.json()["chart"]["result"][0]
         quote  = result["indicators"]["quote"][0]
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        _INTRADAY_QUOTE_CACHE[symbol] = (None, f"fetch error: {exc}", _time.monotonic())
         return None, f"fetch error: {exc}"
     # Market closed / no session yet: Yahoo returns 200 with an empty quote block.
     if not quote or quote.get("high") is None:
+        _INTRADAY_QUOTE_CACHE[symbol] = (None, MARKET_CLOSED_SENTINEL, _time.monotonic())
         return None, MARKET_CLOSED_SENTINEL
     # Populated-but-incomplete payload is a genuine anomaly, not the benign closed
     # case — surface it as a real error (logged as a warning) rather than letting a
     # later key access raise. (Open-market payloads always include all OHLCV keys.)
     if quote.get("low") is None or quote.get("close") is None:
+        _INTRADAY_QUOTE_CACHE[symbol] = (None, "incomplete quote payload", _time.monotonic())
         return None, "incomplete quote payload"
     # Expose the per-bar OPEN timestamps (epoch secs, index-aligned with the OHLC
     # arrays) so callers can tell WHICH minute a bar belongs to — needed to stop a
@@ -5956,6 +5980,7 @@ def _fetch_intraday_quote(symbol):
     # Expose the meta block (regularMarketPrice/Volume/DayHigh/DayLow/chartPreviousClose).
     # Additive — existing consumers never read "_meta".
     quote["_meta"] = result.get("meta") or {}
+    _INTRADAY_QUOTE_CACHE[symbol] = (quote, None, _time.monotonic())
     return quote, None
 
 
@@ -6131,8 +6156,8 @@ def _update_price_auto(instrument):
 # or stale data NEVER blocks a trade — it only shows as "unavailable".
 # ───────────────────────────────────────────────────────────────────────────
 VOL_ATR_BARS           = 14   # recent window (1-min bars) for the current ATR
-VOL_MIN_BARS           = 30   # session bars required before a baseline is trusted
-VOLATILITY_MAX_AGE_MIN = 10   # a reading older than this is stale -> unavailable
+VOL_MIN_BARS           = 5    # min bars before an ATR estimate is trusted; ES/NQ return only ~12 bars overnight so must be well below that
+VOLATILITY_MAX_AGE_MIN = 60   # a reading older than this is stale -> unavailable (60 min covers overnight fetch gaps)
 
 
 def _median(vals):
