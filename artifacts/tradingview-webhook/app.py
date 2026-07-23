@@ -24181,6 +24181,50 @@ def _trade_ready_loop():
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()
 
 
+def _databento_bar_scan(inst: str, price: float) -> None:
+    """Proactive scanner: check for a READY setup at every Databento 1m bar close.
+
+    Additive companion to _trade_ready_loop — triggered by Databento bar-close
+    events rather than a fixed 5-min timer. Lets the brain detect READY setups
+    built entirely from Databento signals (BOS/CHOCH + sweep + confirmation)
+    without waiting for a TradingView webhook to arrive.
+
+    Dedup stack (identical to _trade_ready_loop):
+      • DISCORD_LIVE_ENABLED — never fires on dev or analysis-only instances
+      • active_trade_for(inst) — skip if a position is already open on this inst
+      • LAST_LIVE_CARD_AT throttle — honours the same TRADE_READY_INTERVAL window
+      • is_actionable(verdict) — only genuine READY verdicts continue
+      • send_live_ready_card — mute-aware; stamps LAST_LIVE_CARD_AT on send
+
+    notify=True: first-discovery alert pings @everyone so phones receive it
+    immediately (same as the instant webhook alert). _trade_ready_loop handles
+    follow-up re-posts while the setup stays READY.
+
+    Runs in a daemon thread to never block the Databento data-feed thread.
+    """
+    def _scan() -> None:
+        try:
+            if not DISCORD_LIVE_ENABLED:
+                return
+            if active_trade_for(inst):
+                return
+            last = LAST_LIVE_CARD_AT.get(inst)
+            if last and (datetime.now(timezone.utc) - last).total_seconds() < trade_ready_interval():
+                return
+            a = full_analysis(ticker_override=inst)
+            if not active_trade_for(inst) and is_actionable(a.get("verdict")):
+                entry = _build_card_entry(a, ticker=f"{inst}1!")
+                dispatched = send_live_ready_card(entry, inst, notify=True)
+                if dispatched:
+                    logger.info(
+                        "Databento scan READY: %s @ %.4f — live card sent",
+                        inst, price,
+                    )
+        except Exception as exc:
+            logger.debug("Databento bar scan (%s): %s", inst, exc)
+    threading.Thread(target=_scan, name=f"db-scan-{inst}", daemon=True).start()
+
+
 # ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
 # Reads each enabled equity-index micro's AUTHORITATIVE per-tab bias (the same
 # calculate_bias() value the dashboard shows when you switch tabs) and reports
@@ -61507,6 +61551,7 @@ if __name__ == "__main__":
                 now_utc_fn                 = now_utc,
             )
             _DATABENTO_BRAIN.start()
+            _DATABENTO_BRAIN.register_bar_close_callback(_databento_bar_scan)
             logger.info("DatabentoBrain: initialized and started")
         except Exception as _db_exc:
             logger.error("DatabentoBrain: failed to start — %s", _db_exc)

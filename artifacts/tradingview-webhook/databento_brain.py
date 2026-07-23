@@ -149,6 +149,9 @@ class DatabentoBrain:
         self._prev_sh:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._prev_sl:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._session_day: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        # Bar-close callbacks: called after every completed 1m bar per instrument.
+        # Registered by app.py to trigger proactive scanning without polling.
+        self._bar_close_callbacks: list = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -162,6 +165,11 @@ class DatabentoBrain:
         t.start()
         logger.info("DatabentoBrain: started — watching instruments: %s",
                     list(DB_SYMBOLS.keys()))
+
+    def register_bar_close_callback(self, fn) -> None:
+        """Register a callable(inst: str, price: float) invoked after each bar close.
+        Called from the data-feed thread — fn must be fast or dispatch its own thread."""
+        self._bar_close_callbacks.append(fn)
 
     # ── Reconnect loop ────────────────────────────────────────────────────────
 
@@ -502,6 +510,14 @@ class DatabentoBrain:
         self._detect_sweep(inst, bars)
         # ── Confirmation candle (BULLISH/BEARISH CONFIRMATION → ALERT_HISTORY) ─
         self._detect_confirmation(inst, bars)
+        # ── Bar-close callbacks (proactive scanner hook) ───────────────────────
+        # Called AFTER all detectors so every fresh signal is already in
+        # ALERT_HISTORY before the scan evaluates the setup.
+        for _cb in self._bar_close_callbacks:
+            try:
+                _cb(inst, bars[-1]["close"])
+            except Exception:
+                pass
 
     # ── Structure detection ───────────────────────────────────────────────────
 
