@@ -115,8 +115,14 @@ class DatabentoBrain:
         self._vs    = volume_spike_by_ticker
         self._now   = now_utc_fn or (lambda: datetime.now(timezone.utc))
 
-        # Reverse map: Databento symbol string → bot instrument key
+        # Reverse map: continuous-contract symbol → bot instrument key
+        # e.g. "MGC.c.0" → "MGC"
         self._sym_to_inst: dict[str, str] = {v: k for k, v in DB_SYMBOLS.items()}
+
+        # instrument_id → bot instrument key, populated at runtime from the
+        # SymbolMappingMsg records Databento sends before any trades.
+        # e.g. 42002887 → "MGC"  (IDs change each rollover — never hardcode them)
+        self._id_to_inst: dict[int, str] = {}
 
         # Per-instrument working state (all keyed by bot instrument: MGC/MNQ/…)
         self._bars:        dict[str, list]        = {i: [] for i in DB_SYMBOLS}
@@ -180,6 +186,10 @@ class DatabentoBrain:
             time.sleep(self.RECONNECT_DELAY)
             return
 
+        # Reset per-session state so reconnects don't carry stale instrument_ids
+        # (exchange IDs change on contract rollover).
+        self._id_to_inst = {}
+
         logger.info("DatabentoBrain: connecting to %s …", DB_DATASET)
         DATABENTO_STATUS["error"] = None
 
@@ -195,10 +205,52 @@ class DatabentoBrain:
             "DatabentoBrain: connected ✓  streaming %s", list(DB_SYMBOLS.values())
         )
 
+        # ── Background thread: poll client.symbology_map until populated ─────────
+        # The SDK processes SymbolMappingMsg internally (via its own _map_symbol
+        # callback) and populates client.symbology_map within ~1s of start().
+        # add_callback is unreliable for this — we poll from a side thread.
+        DATABENTO_STATUS["_symmap_debug"] = {"polls": 0, "smap": {}, "err": None}
+
+        def _build_id_map() -> None:
+            for i in range(100):          # up to 10s; typically < 1s
+                try:
+                    smap: dict = client.symbology_map
+                    DATABENTO_STATUS["_symmap_debug"]["polls"] = i + 1
+                    DATABENTO_STATUS["_symmap_debug"]["smap"] = dict(smap)
+                    if smap:
+                        for iid, native_sym in smap.items():
+                            native_str = str(native_sym)
+                            for root in DB_SYMBOLS:
+                                if native_str.startswith(root):
+                                    self._id_to_inst[iid] = root
+                                    logger.info(
+                                        "DatabentoBrain: id→inst %s → %s"
+                                        " (native=%s)", iid, root, native_str,
+                                    )
+                                    break
+                        logger.info(
+                            "DatabentoBrain: symbology map ready — %s",
+                            self._id_to_inst,
+                        )
+                        return
+                except Exception as _e:
+                    DATABENTO_STATUS["_symmap_debug"]["err"] = str(_e)
+                    logger.warning("DatabentoBrain: symbology poll error: %s", _e)
+                time.sleep(0.1)
+            logger.warning(
+                "DatabentoBrain: symbology_map empty after 10s — "
+                "will fall back to symbol-prefix matching"
+            )
+
+        threading.Thread(
+            target=_build_id_map, daemon=True, name="db-symmap"
+        ).start()
+
+        # Iterator yields only TradeMsg; id→inst map is built concurrently above
+        # and will be ready long before the first trade is processed.
         for record in client:
             self._on_trade(record)
 
-        # If the iterator exits normally the connection was closed cleanly.
         DATABENTO_STATUS["connected"] = False
         logger.warning("DatabentoBrain: feed closed by server — reconnecting …")
 
@@ -206,8 +258,24 @@ class DatabentoBrain:
 
     def _on_trade(self, rec) -> None:
         try:
-            sym  = getattr(rec, "symbol", None) or ""
-            inst = self._sym_to_inst.get(sym)
+            # ── Instrument resolution ─────────────────────────────────────────
+            # Primary: instrument_id → inst via the map built from SymbolMappingMsg
+            iid  = getattr(rec, "instrument_id", None)
+            inst = self._id_to_inst.get(iid) if iid is not None else None
+
+            # Fallback 1: continuous-contract symbol string ("MGC.c.0" → "MGC")
+            if inst is None:
+                sym  = getattr(rec, "symbol", None) or ""
+                inst = self._sym_to_inst.get(sym)
+
+            # Fallback 2: prefix-match native symbol (e.g. "MGCQ6") → root
+            if inst is None:
+                sym = getattr(rec, "symbol", None) or ""
+                for root in DB_SYMBOLS:
+                    if sym.startswith(root):
+                        inst = root
+                        break
+
             if inst is None:
                 return
 
