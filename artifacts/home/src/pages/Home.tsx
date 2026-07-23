@@ -3615,21 +3615,21 @@ export default function Home() {
                 {/* AVATAR SPOTLIGHT CENTER */}
                 <div className="mc-avtr-outer" style={{ display:'flex', flexDirection:'column', alignItems:'flex-start', justifyContent:'flex-start', flexShrink:0, overflow:'hidden' }}>
                   <div className="mc-avtr-box" style={{ position:'relative', width:420, height:560, flexShrink:0 }}>
-                    {/* Far-field halo — contained within avtr-outer, no bleed into adjacent cards */}
+                    {/* Far-field halo — dimmed for clean transparent look */}
                     <div style={{ position:'absolute', top:0, left:0, right:0, bottom:0,
-                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}24 0%, ${auraColor}09 36%, transparent 66%)`,
+                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}10 0%, ${auraColor}05 36%, transparent 66%)`,
                       pointerEvents:'none', zIndex:0 }} />
                     {/* Breathing mid-field pulse */}
                     <div style={{ position:'absolute', inset:0,
-                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}3e 0%, transparent 58%)`,
+                      background:`radial-gradient(ellipse at 50% 46%, ${auraColor}18 0%, transparent 58%)`,
                       animation:'avrPulse 3s ease-in-out infinite', pointerEvents:'none', zIndex:0 }} />
-                    {/* Always-on close glow — keeps face bright against dim cards */}
+                    {/* Always-on close glow */}
                     <div style={{ position:'absolute', top:'18%', left:'14%', right:'14%', bottom:'22%',
-                      background:`radial-gradient(ellipse at 50% 44%, ${auraColor}1e 0%, transparent 52%)`,
+                      background:`radial-gradient(ellipse at 50% 44%, ${auraColor}0c 0%, transparent 52%)`,
                       pointerEvents:'none', zIndex:0 }} />
                     {/* Floor reflection */}
                     <div style={{ position:'absolute', bottom:-36, left:'5%', right:'5%', height:82,
-                      background:`radial-gradient(ellipse at 50% 100%, ${auraColor}2c 0%, transparent 66%)`,
+                      background:`radial-gradient(ellipse at 50% 100%, ${auraColor}14 0%, transparent 66%)`,
                       pointerEvents:'none', zIndex:0 }} />
                     <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center',
                       justifyContent:'center', zIndex:1 }}>
@@ -3638,6 +3638,15 @@ export default function Home() {
 
                     {/* Orbital particle aura — dots + rings that shift red→yellow→green */}
                     <AvatarAura avState={avState} edge={edge} speaking={speaking} />
+
+                    {/* Red eye + lip outlines — styled overlay in VRM canvas coordinate space (420×560) */}
+                    <svg viewBox="0 0 420 560" style={{ position:'absolute', inset:0, width:'100%', height:'100%',
+                      pointerEvents:'none', zIndex:4, overflow:'visible' }}>
+                      <ellipse cx={185} cy={82} rx={16} ry={10} fill="none" stroke="rgba(239,68,68,0.55)" strokeWidth={1.8} />
+                      <ellipse cx={235} cy={82} rx={16} ry={10} fill="none" stroke="rgba(239,68,68,0.55)" strokeWidth={1.8} />
+                      <path d="M190,120 Q210,132 230,120" fill="none" stroke="rgba(239,68,68,0.50)" strokeWidth={2.0} strokeLinecap="round" />
+                      <path d="M190,120 Q210,114 230,120" fill="none" stroke="rgba(239,68,68,0.38)" strokeWidth={1.4} strokeLinecap="round" />
+                    </svg>
 
                     {/* ── CORNER INTELLIGENCE PANELS ─────────────────────── */}
 
@@ -3868,43 +3877,8 @@ export default function Home() {
 
               </div>
 
-              {/* ── LEFT COLUMN PANELS — Talk to Avatar · Market Context · Objective · Performance ── */}
+              {/* ── LEFT COLUMN PANELS — Market Context · Objective · Performance ── */}
               <div className="mc-bot-row">
-
-                {/* Talk to Avatar */}
-                <div style={{ width:'100%', padding:'6px 0 4px' }}>
-                  <div style={{ display:'flex', gap:6, alignItems:'center' }}>
-                    <button onClick={() => setChatOpen(!chatOpen)} style={{
-                      flex:1, display:'flex', alignItems:'center', justifyContent:'center', gap:7,
-                      padding:'7px 10px', borderRadius:8, cursor:'pointer',
-                      background:'rgba(0,148,255,0.10)', border:'1px solid rgba(0,148,255,0.22)',
-                      color:BLUE, fontFamily:'monospace', fontSize:10.5, fontWeight:700, letterSpacing:'0.06em',
-                    }}>
-                      <span style={{ fontSize:12 }}>💬</span>TALK TO AVATAR
-                    </button>
-                    <button onClick={handleSpeak} title={voiceState === 'listening' ? 'Stop' : 'Speak'} style={{
-                      display:'flex', alignItems:'center', justifyContent:'center',
-                      width:34, height:34, borderRadius:8, cursor:'pointer', flexShrink:0,
-                      background: voiceState === 'listening' ? 'rgba(239,68,68,0.15)' : 'rgba(255,255,255,0.06)',
-                      border: voiceState === 'listening' ? '1px solid rgba(239,68,68,0.40)' : '1px solid rgba(255,255,255,0.10)',
-                      color: voiceState === 'listening' ? '#ef4444' : 'rgba(255,255,255,0.40)',
-                      fontSize:14,
-                    }}>
-                      {voiceState === 'listening' ? '■' : '🎙'}
-                    </button>
-                  </div>
-                  {speaking && (
-                    <div style={{ display:'flex', alignItems:'center', gap:3, justifyContent:'center', marginTop:5 }}>
-                      {[3,5,8,6,10,7,9,5,7].map((h,i) => (
-                        <div key={i} style={{ width:2.5, height:h, borderRadius:2, background:eyeColor,
-                          animation:`wv ${0.5+(i%4)*0.15}s ease-in-out ${i*0.05}s infinite alternate` }} />
-                      ))}
-                      <span style={{ fontSize:9, color:'rgba(255,255,255,0.35)', fontFamily:'monospace', marginLeft:3 }}>Speaking</span>
-                    </div>
-                  )}
-                </div>
-
-                <div style={{ width:'100%', height:1, background:'rgba(255,255,255,0.038)', margin:'4px 0' }} />
 
                 {/* Market Context */}
                 <div style={{ width:'100%', padding:'6px 0' }}>
@@ -4296,14 +4270,6 @@ export default function Home() {
                     Cancel
                   </button>
                 )}
-                {!chatOpen && (
-                  <button className="action-btn chip-btn" onClick={() => setChatOpen(true)} style={{
-                    padding:'10px 16px', borderRadius:8, border:`1px solid ${eyeColor}40`,
-                    background:`${eyeColor}08`, color:eyeColor, fontSize:12, fontFamily:'monospace', cursor:'pointer',
-                    fontWeight:600, letterSpacing:'0.04em' }}>
-                    &#x1F4AC; Chat
-                  </button>
-                )}
                 {/* ── SPEAK BUTTON ─────────────────────────────────────────── */}
                 <button onClick={handleSpeak} disabled={voiceState === 'requesting'}
                   title={voiceState === 'error' ? voiceErrorMsg : voiceState === 'listening' ? 'Tap to stop recording' : speaking ? 'Tap to interrupt' : 'Tap to speak'}
@@ -4676,61 +4642,57 @@ export default function Home() {
           )}{/* end session-mem guard */}
 
           {/* ── CHAT ────────────────────────────────────────────────────── */}
-          {chatOpen && (
-            <div style={{ marginBottom:16, border:`1px solid ${eyeColor}30`, borderRadius:10,
-              background:'rgba(255,255,255,0.022)', overflow:'hidden' }}>
-              {/* Chat header — always visible so user knows this is the reply area */}
-              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-                padding:'9px 14px 7px', borderBottom:'1px solid rgba(255,255,255,0.045)',
-                background:'rgba(255,255,255,0.014)' }}>
-                <div style={{ display:'flex', alignItems:'center', gap:7 }}>
-                  <span style={{ fontSize:12, color:eyeColor, opacity:0.8 }}>&#x1F4AC;</span>
-                  <span style={{ fontSize:11.5, fontFamily:'monospace', color:'rgba(255,255,255,0.55)',
-                    letterSpacing:'0.06em', textTransform:'uppercase', fontWeight:700 }}>Talk to Avatar</span>
-                  <span style={{ fontSize:10, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>— type below or tap the mic</span>
-                </div>
-                <button onClick={() => setChatOpen(false)} style={{ background:'none', border:'none',
-                  color:'rgba(255,255,255,0.22)', fontSize:12, cursor:'pointer', padding:'0 2px' }}>&#x2715;</button>
-              </div>
-              <div ref={chatRef} style={{ maxHeight:220, overflowY:'auto', padding:'14px 14px 6px' }}>
-                {msgs.length === 0 && (
-                  <div style={{ fontSize:12, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', textAlign:'center', padding:'20px 0' }}>Reply to the avatar or ask it anything&hellip;</div>
-                )}
-                {msgs.map(m => <BrainBubble key={m.id} msg={m} />)}
-                {asking && (
-                  <div style={{ display:'flex', gap:5, padding:'6px 0 4px' }}>
-                    {[0,1,2].map(i => <div key={i} style={{ width:6, height:6, borderRadius:'50%', background:eyeColor, animation:`bDot 1.2s ${i*0.2}s infinite` }} />)}
-                  </div>
-                )}
-              </div>
-              {/* Voice transcript preview — shown while listening or processing */}
-              {(voiceState === 'listening' || voiceState === 'processing') && voiceTranscript && (
-                <div style={{ padding:'5px 14px 0', fontSize:12, color:'rgba(255,255,255,0.52)', fontFamily:'monospace',
-                  fontStyle:'italic', borderTop:'1px solid rgba(59,130,246,0.08)', display:'flex', alignItems:'center', gap:6 }}>
-                  <span style={{ color:'rgba(59,130,246,0.55)', fontSize:9 }}>{'\u25CF'}</span>
-                  {voiceTranscript}
-                </div>
-              )}
-              {/* Voice error — with dismiss */}
-              {voiceState === 'error' && voiceErrorMsg && (
-                <div style={{ padding:'5px 14px 0', fontSize:11.5, color:'#f87171', fontFamily:'monospace',
-                  borderTop:'1px solid rgba(239,68,68,0.08)', display:'flex', alignItems:'center', gap:6 }}>
-                  <span style={{ flex:1 }}>{voiceErrorMsg}</span>
-                  <button onClick={clearVoiceError} style={{ background:'none', border:'none',
-                    color:'rgba(255,255,255,0.28)', fontSize:11, cursor:'pointer', padding:'0 2px' }}>{'\u2715'}</button>
-                </div>
-              )}
-              <div className="input-wrap" style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 14px 12px',
-                borderTop:'1px solid rgba(255,255,255,0.045)' }}>
-                <input ref={inputRef} className="brain-input" value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey}
-                  placeholder="Ask the brain\u2026" disabled={asking}
-                  style={{ flex:1, background:'transparent', border:'none', color:'rgba(255,255,255,0.80)', fontSize:13, fontFamily:'inherit' }} />
-                <button onClick={() => ask()} disabled={!input.trim() || asking} style={{
-                  background:'none', border:'none', padding:'2px 4px', cursor: input.trim() && !asking ? 'pointer' : 'default',
-                  color: input.trim() && !asking ? eyeColor : 'rgba(255,255,255,0.18)', fontSize:15 }}>{'\u21B5'}</button>
-              </div>
+          <div style={{ marginBottom:16, border:`1px solid ${eyeColor}30`, borderRadius:10,
+            background:'rgba(255,255,255,0.022)', overflow:'hidden' }}>
+            {/* Chat header */}
+            <div style={{ display:'flex', alignItems:'center',
+              padding:'9px 14px 7px', borderBottom:'1px solid rgba(255,255,255,0.045)',
+              background:'rgba(255,255,255,0.014)' }}>
+              <span style={{ fontSize:12, color:eyeColor, opacity:0.8, marginRight:7 }}>&#x1F4AC;</span>
+              <span style={{ fontSize:11.5, fontFamily:'monospace', color:'rgba(255,255,255,0.55)',
+                letterSpacing:'0.06em', textTransform:'uppercase', fontWeight:700, marginRight:7 }}>Talk to AI</span>
+              <span style={{ fontSize:10, color:'rgba(255,255,255,0.22)', fontFamily:'monospace' }}>— type below or tap the mic</span>
             </div>
-          )}
+            {/* Messages */}
+            <div ref={chatRef} style={{ maxHeight:220, overflowY:'auto', padding:'14px 14px 6px' }}>
+              {msgs.length === 0 && (
+                <div style={{ fontSize:12, color:'rgba(255,255,255,0.22)', fontFamily:'monospace', textAlign:'center', padding:'20px 0' }}>Reply to the avatar or ask it anything&hellip;</div>
+              )}
+              {msgs.map(m => <BrainBubble key={m.id} msg={m} />)}
+              {asking && (
+                <div style={{ display:'flex', gap:5, padding:'6px 0 4px' }}>
+                  {[0,1,2].map(i => <div key={i} style={{ width:6, height:6, borderRadius:'50%', background:eyeColor, animation:`bDot 1.2s ${i*0.2}s infinite` }} />)}
+                </div>
+              )}
+            </div>
+            {/* Voice transcript preview */}
+            {(voiceState === 'listening' || voiceState === 'processing') && voiceTranscript && (
+              <div style={{ padding:'5px 14px 0', fontSize:12, color:'rgba(255,255,255,0.52)', fontFamily:'monospace',
+                fontStyle:'italic', borderTop:'1px solid rgba(59,130,246,0.08)', display:'flex', alignItems:'center', gap:6 }}>
+                <span style={{ color:'rgba(59,130,246,0.55)', fontSize:9 }}>{'\u25CF'}</span>
+                {voiceTranscript}
+              </div>
+            )}
+            {/* Voice error */}
+            {voiceState === 'error' && voiceErrorMsg && (
+              <div style={{ padding:'5px 14px 0', fontSize:11.5, color:'#f87171', fontFamily:'monospace',
+                borderTop:'1px solid rgba(239,68,68,0.08)', display:'flex', alignItems:'center', gap:6 }}>
+                <span style={{ flex:1 }}>{voiceErrorMsg}</span>
+                <button onClick={clearVoiceError} style={{ background:'none', border:'none',
+                  color:'rgba(255,255,255,0.28)', fontSize:11, cursor:'pointer', padding:'0 2px' }}>{'\u2715'}</button>
+              </div>
+            )}
+            {/* Input row */}
+            <div className="input-wrap" style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 14px 12px',
+              borderTop:'1px solid rgba(255,255,255,0.045)' }}>
+              <input ref={inputRef} className="brain-input" value={input} onChange={e => setInput(e.target.value)} onKeyDown={onKey}
+                placeholder="Ask the brain\u2026" disabled={asking}
+                style={{ flex:1, background:'transparent', border:'none', color:'rgba(255,255,255,0.80)', fontSize:13, fontFamily:'inherit' }} />
+              <button onClick={() => ask()} disabled={!input.trim() || asking} style={{
+                background:'none', border:'none', padding:'2px 4px', cursor: input.trim() && !asking ? 'pointer' : 'default',
+                color: input.trim() && !asking ? eyeColor : 'rgba(255,255,255,0.18)', fontSize:15 }}>{'\u21B5'}</button>
+            </div>
+          </div>
 
           {/* ── EVIDENCE ACCORDION ──────────────────────────────────────── */}
           {!hiddenPanels.has('evidence') && (
