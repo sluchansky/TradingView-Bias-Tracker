@@ -20722,7 +20722,7 @@ def _dpv2_stage_observe(instrument):
     market_open = None
     try:
         sess = market_session_status()
-        market_open = sess.get("is_open", False)
+        market_open = sess.get("open", False)
     except Exception: pass
 
     # Daily loss cap
@@ -55386,14 +55386,14 @@ function renderJournalGroups(d) {
 function renderControlsGroups(d) {
   if (!document.getElementById('mod-controls-groups')) return;
   var muted=(d&&d.muted_instruments)||{},muteList=Object.keys(muted).filter(function(k){ return muted[k]; });
-  var ms=(d&&d.market_session)||{},discLive=d&&d.discord_live_enabled;
+  var discLive=d&&d.discord_live_enabled;
   var exMode=(d&&d.execution_mode)||'';
   var autoMap=(d&&d.auto_trade)||(d&&d.auto_trade_enabled)||{};
   var armedList=Object.keys(autoMap).filter(function(k){ return autoMap[k]&&k!=='any'; });
   // Markets
   var inst=(d&&d.active_ticker)||'',h1='';
   if(inst) h1+=_grpRow('Active Instrument',inst.replace('1!',''));
-  if(ms.status) h1+=_grpRow('Session',ms.status,ms.is_open?'#22c55e':'#6b7280');
+  if(d&&d.market_status) h1+=_grpRow('Session',d.market_status,d.market_open?'#22c55e':'#6b7280');
   h1+=_grpRow('Muted',muteList.length?muteList.join(', '):'None',muteList.length?'#f59e0b':null);
   _grpBadge('cg-markets-badge',inst?inst.replace('1!',''):'—',inst?'ok':'neu');
   document.getElementById('cg-markets-body').innerHTML=h1||'<div class="grp-note">No market data.</div>';
@@ -58114,7 +58114,7 @@ function renderBLPanels(d){
   var tpT=document.getElementById('tp-time');
   if(tpT){var nt=new Date();tpT.textContent=nt.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
   var tpSess=document.getElementById('tp-session-badge');
-  if(tpSess){var mkt=d.market_session||{};var isOpen=mkt.market_open===true||mkt.is_open===true;tpSess.textContent=isOpen?'OPEN':'CLOSED';tpSess.className='tp-badge'+(isOpen?'':' closed');}
+  if(tpSess){var isOpen=d.market_open===true;tpSess.textContent=isOpen?'OPEN':'CLOSED';tpSess.className='tp-badge'+(isOpen?'':' closed');}
 
   // ── Main Brain Summary card (replaces blh-hero; Brain Contract) ──
   var isActn=v.indexOf('READY')!==-1||v==='MANAGING';
