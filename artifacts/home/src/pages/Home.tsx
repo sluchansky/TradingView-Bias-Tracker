@@ -2820,6 +2820,7 @@ export default function Home() {
   }, [data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const verdictLabel =
+    !isOpen && data        ? 'MARKET CLOSED' :
     status === 'READY' && /long|bull/i.test(dirn)  ? 'READY — LONG' :
     status === 'READY' && /short|bear/i.test(dirn) ? 'READY — SHORT' :
     status === 'READY' ? 'READY TO TRADE' :
@@ -2827,6 +2828,7 @@ export default function Home() {
     status === 'BUILDING' ? 'BUILDING EDGE' : 'WAIT';
 
   const verdictColor =
+    !isOpen && data        ? MUTED :
     status === 'READY' && /long|bull/i.test(dirn)  ? BULL :
     status === 'READY' && /short|bear/i.test(dirn) ? BEAR :
     status === 'READY' ? BULL :
@@ -2835,6 +2837,7 @@ export default function Home() {
     MUTED;
 
   const chips =
+    !isOpen && data        ? ['Review the plan.', 'What set up last session?', 'Prep for the open.'] :
     status === 'READY'    ? ['Break down the edge.', 'What invalidates this?', 'What does structure say?'] :
     status === 'MANAGING' ? ['Thesis still intact?', 'Where do you partial?', 'Conviction level?'] :
     ['What is missing?', 'Read the tape.', 'What triggers entry?'];
@@ -4039,8 +4042,18 @@ export default function Home() {
               {/* Live thought stream — replaces static narration */}
               <ThoughtStream stream={streamedThoughts} />
 
+              {/* Market closed info */}
+              {!isOpen && data && (
+                <div style={{ padding:'8px 12px', borderRadius:7, background:'rgba(107,114,128,0.07)',
+                  border:'1px solid rgba(107,114,128,0.18)', fontSize:12, color:'#9ca3af', fontFamily:'monospace',
+                  maxWidth:480, display:'flex', flexDirection:'column', gap:3 }}>
+                  {data.market_reason && <span>{data.market_reason}</span>}
+                  {data.next_open && <span style={{ color:'rgba(255,255,255,0.38)' }}>Reopens {data.next_open}</span>}
+                </div>
+              )}
+
               {/* Wait reason */}
-              {strictR && status === 'WAIT' && (
+              {strictR && status === 'WAIT' && isOpen && (
                 <div className="wait-box" style={{ padding:'8px 12px', borderRadius:7, background:'rgba(245,158,11,0.07)',
                   border:'1px solid rgba(245,158,11,0.18)', fontSize:12, color:AMB, fontFamily:'monospace',
                   maxWidth:480 }}>
