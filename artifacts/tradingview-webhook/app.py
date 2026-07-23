@@ -57363,6 +57363,98 @@ setInterval(function(){
     location.reload();
   };
 })();
+// ── Panel collapse + dismiss for non-live views ───────────────────────────
+// Adds the same .mod-min (collapse) / .mod-hidden (dismiss) UX to every
+// .mod panel in Backtest, TradeZella, Research and Academy views.
+// No drag-reorder (not needed there). Panels with an id= persist their
+// collapsed state in localStorage; id-less panels are session-only.
+// A per-view "Restore hidden" button appears whenever ≥1 panel is hidden.
+(function(){
+  var VIEWS = ['view-backtest','view-tradezella','view-research','view-academy'];
+  var CKEY2 = 'dashCollapsed2', HKEY2 = 'dashHidden2';
+  function load2(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
+  function save2(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+  var collapsed2 = load2(CKEY2);
+  var hidden2    = load2(HKEY2);
+
+  function enhanceView(viewId){
+    var view = document.getElementById(viewId);
+    if(!view) return;
+    var panelsMods = Array.prototype.slice.call(view.querySelectorAll('.mod'));
+    if(!panelsMods.length) return;
+
+    // Per-view restore button — shown when ≥1 panel in this view is hidden
+    var restoreBtn = document.createElement('button');
+    restoreBtn.className = 'bt-btn alt';
+    restoreBtn.style.cssText = 'display:none;margin:6px 0 2px;font-size:11px;padding:3px 12px;opacity:.85';
+    restoreBtn.title = 'Restore all hidden panels in this view';
+    view.insertBefore(restoreBtn, view.firstChild);
+
+    function countHidden(){ return view.querySelectorAll('.mod.mod-hidden').length; }
+    function syncRestoreBtn(){
+      var n = countHidden();
+      if(n){ restoreBtn.style.display=''; restoreBtn.textContent='\\u21ba Restore '+n+' hidden panel'+(n>1?'s':''); }
+      else { restoreBtn.style.display='none'; }
+    }
+    restoreBtn.addEventListener('click', function(){
+      Array.prototype.forEach.call(view.querySelectorAll('.mod.mod-hidden'), function(m){
+        m.classList.remove('mod-hidden');
+        var mk = m.id || '';
+        if(mk){ delete hidden2[mk]; save2(HKEY2, hidden2); }
+      });
+      syncRestoreBtn();
+    });
+
+    panelsMods.forEach(function(m){
+      var h = m.querySelector(':scope > .mod-h');
+      if(!h || h.dataset.enh) return;
+      h.dataset.enh = '1';
+      h.style.cursor = 'pointer';
+      h.style.display = 'flex';
+      h.style.alignItems = 'center';
+      h.style.gap = '8px';
+
+      // Collapse caret (reuse existing .mod-cl style)
+      var caret = document.createElement('span');
+      caret.className = 'mod-cl';
+      caret.title = 'Minimize / expand';
+      h.appendChild(caret);
+
+      // Dismiss X button (reuse existing .mod-x style)
+      var hx = document.createElement('span');
+      hx.className = 'mod-x';
+      hx.textContent = '\\u00d7';
+      hx.title = 'Hide this panel (use Restore button to bring it back)';
+      hx.style.marginLeft = 'auto';
+      h.appendChild(hx);
+
+      var mk = m.id || '';
+
+      // Restore saved collapsed state
+      if(mk && collapsed2[mk]){ m.classList.add('mod-min'); caret.textContent = '\\u25b8'; }
+      // Restore saved hidden state
+      if(mk && hidden2[mk]){ m.classList.add('mod-hidden'); }
+
+      hx.addEventListener('click', function(e){
+        e.stopPropagation();
+        m.classList.add('mod-hidden');
+        if(mk){ hidden2[mk]=1; save2(HKEY2, hidden2); }
+        syncRestoreBtn();
+      });
+
+      h.addEventListener('click', function(e){
+        if(e.target === hx) return;
+        var min = m.classList.toggle('mod-min');
+        caret.textContent = min ? '\\u25b8' : '\\u25be';
+        if(mk){ if(min){ collapsed2[mk]=1; } else { delete collapsed2[mk]; } save2(CKEY2, collapsed2); }
+      });
+    });
+
+    syncRestoreBtn();
+  }
+
+  VIEWS.forEach(function(id){ enhanceView(id); });
+})();
 // ── Declutter: Advanced-panels toggle (DISPLAY-ONLY, this device) ──
 // Hides every non-core live-view panel (extra analysis + simulated modules)
 // behind one switch via a data-adv attribute on <html>. Persisted in
