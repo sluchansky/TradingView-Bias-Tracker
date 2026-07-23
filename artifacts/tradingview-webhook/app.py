@@ -57870,7 +57870,7 @@ function renderBLPanels(d){
   var v    = bk.decision.verdict || 'WAIT';
   var edge = Number(bk.score.value);
   var grade= bk.score.grade || '\u2014';
-  var mode = String(d.market_mode || d.mode || '\u2014').toUpperCase();
+  var mode = String(d.trading_mode || d.market_mode || d.mode || '\u2014').toUpperCase();
   var inst = String(bk.instrument || '').replace('1!','');
   var tp   = bk.trade_plan || {};
   var at   = d.active_trade || null;
@@ -58196,6 +58196,7 @@ function renderBLPanels(d){
   if(elZone){elZone.textContent=hzoneOk?'ACTIVE':'NONE';elZone.style.color=hzoneOk?'#eab308':'#6b7280';}
   if(elFlow){elFlow.textContent=hcvdDir?hcvdDir.toUpperCase():'NEUTRAL';elFlow.style.color=hcvdDir?(hcvdDir.toLowerCase().indexOf('bull')!==-1?'#22c55e':'#ef4444'):'#6b7280';}
   var nearDem=d.nearest_demand||null;var nearSup=d.nearest_supply||null;
+  var vwapVal=d.vwap_value||null;
   var blrVwap=document.getElementById('blr-vwap');var blrDemand=document.getElementById('blr-demand');var blrSupply=document.getElementById('blr-supply');
   if(blrVwap)blrVwap.textContent=vwapVal?Number(vwapVal).toFixed(2):'\u2014';
   if(blrDemand){var dv2=nearDem&&nearDem.high?Number(nearDem.high).toFixed(2):(nearDem&&typeof nearDem==='number'?Number(nearDem).toFixed(2):'\u2014');blrDemand.textContent=dv2;}
