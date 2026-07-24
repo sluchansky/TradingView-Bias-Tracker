@@ -46774,7 +46774,35 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     </div><!-- /.brain-surface -->
 
     <!-- ═══════════════════════════════════════════════════════
-         THE FOUR QUESTIONS — What I see / think / wait / plan
+         STORY ZONE — Context / setup conditions / bull & bear
+         Rendered by renderMainBrain() from main_brain fields:
+         market_brain, mission, bull_case, bear_case.
+         DISPLAY-ONLY. All strings via textContent (XSS-safe).
+         ═══════════════════════════════════════════════════════ -->
+    <!-- Market context: 1-2 sentences on what the tape is doing -->
+    <div id="mb-ctx-strip" style="font-size:12px;color:#9ca3af;line-height:1.65;padding:8px 0 4px;display:none"></div>
+
+    <!-- Setup conditions checklist: items the analyst needs to see for READY -->
+    <div class="mb-mission" id="mb-mission-block" style="display:none">
+      <div class="mb-mission-h">
+        <span>Setup conditions</span>
+        <span class="mb-mission-pct" id="mb-mission-pct">0%</span>
+      </div>
+      <ul class="mb-mission-list" id="mb-mission-list"></ul>
+      <div class="mb-mission-track"><div class="mb-mission-fill" id="mb-mission-fill"></div></div>
+    </div>
+
+    <!-- Bull / Bear cases — what each side has going for it right now -->
+    <div class="mb-cases" id="mb-cases-block" style="display:none">
+      <div class="mb-case mb-case-bull">
+        <div class="mb-case-h">Bull case</div>
+        <ul class="mb-list" id="mb-bull-list"></ul>
+      </div>
+      <div class="mb-case mb-case-bear">
+        <div class="mb-case-h">Bear case</div>
+        <ul class="mb-list" id="mb-bear-list"></ul>
+      </div>
+    </div>
 
     <!-- ═══════════════════════════════════════════════════════
          TRADE MANAGEMENT — advisory copilot (display-only)
@@ -51105,6 +51133,75 @@ function renderMainBrain(d){
     var ivEl   = document.getElementById('mb-inval-text');
     if(ivWrap) ivWrap.style.display = inval ? '' : 'none';
     if(ivEl && inval) ivEl.textContent = inval;
+  })();
+  // ── Story zone: context strip + mission checklist + bull/bear cases ──
+  // Populates the HTML inserted between .brain-surface and mb-mt.
+  // All strings rendered with textContent — never innerHTML — (XSS-safe).
+  (function(){
+    // Market context strip (first 2 sentences from market_brain)
+    var ctxEl = document.getElementById('mb-ctx-strip');
+    var ctxSents = (mb && Array.isArray(mb.market_brain) && mb.market_brain.length)
+      ? mb.market_brain.slice(0, 2) : [];
+    if(ctxEl){
+      if(ctxSents.length){ ctxEl.style.display=''; ctxEl.textContent = ctxSents.join('  '); }
+      else { ctxEl.style.display='none'; }
+    }
+
+    // Setup conditions checklist
+    var missBlock = document.getElementById('mb-mission-block');
+    var missList  = document.getElementById('mb-mission-list');
+    var missPct   = document.getElementById('mb-mission-pct');
+    var missFill  = document.getElementById('mb-mission-fill');
+    var mission   = (mb && Array.isArray(mb.mission) && mb.mission.length) ? mb.mission : [];
+    if(missBlock && missList){
+      if(mission.length){
+        missBlock.style.display='';
+        while(missList.firstChild) missList.removeChild(missList.firstChild);
+        mission.forEach(function(m){
+          var li  = document.createElement('li');
+          li.className = 'mb-mission-item' + (m.done ? ' done' : '');
+          var box = document.createElement('span');
+          box.className = 'mb-mission-box';
+          box.textContent = m.done ? '\u2713' : '\u25cb';
+          var lbl = document.createElement('span');
+          lbl.textContent = m.label || '';
+          li.appendChild(box); li.appendChild(lbl);
+          missList.appendChild(li);
+        });
+        var pct = Number(mb.mission_progress) || 0;
+        if(missPct) missPct.textContent = pct + '%';
+        if(missFill) missFill.style.width = pct + '%';
+      } else {
+        missBlock.style.display='none';
+      }
+    }
+
+    // Bull / Bear cases
+    var casesBlock = document.getElementById('mb-cases-block');
+    var bullList   = document.getElementById('mb-bull-list');
+    var bearList   = document.getElementById('mb-bear-list');
+    var bulls = (mb && Array.isArray(mb.bull_case)) ? mb.bull_case.slice(0,3) : [];
+    var bears = (mb && Array.isArray(mb.bear_case)) ? mb.bear_case.slice(0,3) : [];
+    if(casesBlock && bullList && bearList){
+      if(bulls.length || bears.length){
+        casesBlock.style.display='';
+        var _fillCases = function(el, items){
+          while(el.firstChild) el.removeChild(el.firstChild);
+          if(!items.length){
+            var li2 = document.createElement('li');
+            li2.style.cssText = 'color:#6b7280;font-size:11px;font-style:italic';
+            li2.textContent = 'None identified'; el.appendChild(li2); return;
+          }
+          items.forEach(function(txt){
+            var li2 = document.createElement('li'); li2.textContent = txt; el.appendChild(li2);
+          });
+        };
+        _fillCases(bullList, bulls);
+        _fillCases(bearList, bears);
+      } else {
+        casesBlock.style.display='none';
+      }
+    }
   })();
   // Managing position — richer advisory read (display-only) when a trade is open.
   const mr = (mb && mb.management_read) || null;
