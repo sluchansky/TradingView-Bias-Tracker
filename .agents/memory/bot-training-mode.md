@@ -32,6 +32,18 @@ so goldens/dev stay byte-identical.
 - `_TRAINING_STATE_CACHE` has a ~5s TTL. **Promotion/demotion endpoints MUST
   invalidate / force-refresh it** or an emergency demote won't take effect for 5s.
 
+## TRAINING_BOOT_STAGE env var (added to fix "stage resets after republish")
+**Why it resets:** `TRAINING_MODE_ENABLED=1` is production-only, so the training panel
+is hidden in dev. The user cannot set the stage from dev. After each republish they
+would need to manually click "Go LIVE" in the prod dashboard — easy to miss.
+The DB row was seeded at Stage 1 at build time and had never been updated.
+**Fix:** `TRAINING_BOOT_STAGE=4` in the **production** env vars. On every boot, if
+training is enabled, `_check_bot_training_db_ready()` UPSERTs the singleton row to
+that stage. This survives every republish without requiring a manual dashboard click.
+**How to apply:** set `TRAINING_BOOT_STAGE=<1-4>` in production only (never shared —
+sharing would activate it in dev and break goldens since TRAINING_MODE_ENABLED must
+stay prod-only). Current prod value: `TRAINING_BOOT_STAGE=4`.
+
 ## Lazy-probe gotcha (why `_ensure_bot_training_probe` exists)
 **Why:** the boot readiness probe `_check_bot_training_db_ready()` is registered under
 `if __name__ == "__main__"`. Prod launches Flask via a supervisor; if that ever imports

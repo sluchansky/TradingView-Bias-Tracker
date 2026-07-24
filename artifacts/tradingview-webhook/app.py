@@ -42638,7 +42638,12 @@ def training_mode_enabled():
 def _check_bot_training_db_ready():
     """Probe bot_training_state / bot_training_trades (NO DDL). FAIL-OPEN for the
     readiness flag itself; the money-path caller treats 'enabled but not ready' as
-    fail-CLOSED (suppress the send)."""
+    fail-CLOSED (suppress the send).
+
+    TRAINING_BOOT_STAGE env var: when set and training is enabled, the singleton stage
+    is force-applied on every boot so a republish never silently reverts it to Stage 1.
+    Only activates when training_mode_enabled() — dev/goldens are byte-identical because
+    TRAINING_MODE_ENABLED is unset in dev, making this block unreachable in practice."""
     global BOT_TRAINING_DB_READY
     if not LEARNING_DB_ENABLED:
         return
@@ -42653,6 +42658,30 @@ def _check_bot_training_db_ready():
             cur.fetchone()
         BOT_TRAINING_DB_READY = True
         logger.info("bot_training_* tables ready")
+        # ── TRAINING_BOOT_STAGE: persist the desired stage across every republish ──
+        boot_stage_raw = os.environ.get("TRAINING_BOOT_STAGE", "").strip()
+        if boot_stage_raw and training_mode_enabled():
+            try:
+                boot_stage = int(boot_stage_raw)
+                if 1 <= boot_stage <= 4:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO bot_training_state (id, stage, updated_at, notes) "
+                            "VALUES (1, %s, now(), %s) "
+                            "ON CONFLICT (id) DO UPDATE "
+                            "SET stage=%s, updated_at=now(), notes=%s",
+                            (boot_stage,
+                             "Boot Stage %d via TRAINING_BOOT_STAGE" % boot_stage,
+                             boot_stage,
+                             "Boot Stage %d via TRAINING_BOOT_STAGE" % boot_stage))
+                    conn.commit()
+                    logger.warning(
+                        "TRAINING_BOOT_STAGE=%d applied — stage locked to %d on this boot.",
+                        boot_stage, boot_stage)
+            except Exception as exc:
+                logger.warning("TRAINING_BOOT_STAGE upsert failed (non-fatal): %s", exc)
+                try: conn.rollback()
+                except Exception: pass
     except Exception as exc:
         logger.warning("bot_training tables unavailable (training persistence disabled): %s", exc)
     finally:
