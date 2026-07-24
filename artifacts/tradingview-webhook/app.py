@@ -1056,10 +1056,16 @@ TRADING_MODE = os.environ.get("TRADING_MODE", "SCALP").upper()
 if TRADING_MODE not in MODES:
     TRADING_MODE = "SCALP"
 
+# Thread-local mode override — set only during a /status?mode= request so the
+# "Cleanest trade" picker can evaluate SCALP and SWING simultaneously without
+# touching the live TRADING_MODE. DISPLAY-ONLY: webhook/money threads never see it.
+_MODE_TLS = threading.local()
+
 
 def cfg(key):
     """Read a threshold for the currently active trading mode."""
-    return MODES.get(TRADING_MODE, MODES["SCALP"])[key]
+    _ov = getattr(_MODE_TLS, 'override', None)
+    return MODES.get(_ov or TRADING_MODE, MODES["SCALP"])[key]
 
 
 def cfg_for(mode, key):
@@ -40491,10 +40497,20 @@ def status():
     # Registry-driven: recognizes every enabled instrument (MGC/MNQ/MES/MYM);
     # junk/empty/ambiguous → None → full_analysis falls back to the active instrument.
     _tk  = _instrument_from_text(_raw)
+    # Display-only mode override: ?mode=SCALP|SWING lets the "Cleanest trade" picker
+    # evaluate both modes in parallel without changing the live TRADING_MODE.
+    # The override is isolated to this request's thread via _MODE_TLS.
+    _mode_ov = (request.args.get("mode") or "").upper()
+    _mode_ov = _mode_ov if _mode_ov in ("SCALP", "SWING") else None
     if STATUS_CACHE_TTL_SEC <= 0:
         # Cache disabled — legacy inline build, byte-identical behavior.
-        return jsonify(_build_status_payload(_tk)), 200
-    key    = _tk or "__active__"
+        _MODE_TLS.override = _mode_ov
+        try:
+            return jsonify(_build_status_payload(_tk)), 200
+        finally:
+            _MODE_TLS.override = None
+    # Mode-scoped cache key: SCALP and SWING results are stored separately.
+    key    = ((_mode_ov + "_") if _mode_ov else "") + (_tk or "__active__")
     now_ts = time.time()
     with _STATUS_CACHE_LOCK:
         ent = _STATUS_CACHE.get(key)
@@ -40509,11 +40525,13 @@ def status():
             return jsonify({"status": "warming",
                             "detail": "analysis warming up — retry shortly"}), 503
         _STATUS_BUILDING[key] = True                       # this request becomes the builder
+    _MODE_TLS.override = _mode_ov
     try:
         payload = _build_status_payload(_tk)
         with _STATUS_CACHE_LOCK:
             _STATUS_CACHE[key] = (time.time(), payload)
     finally:
+        _MODE_TLS.override = None
         with _STATUS_CACHE_LOCK:
             _STATUS_BUILDING[key] = False
     return jsonify(payload), 200
@@ -46413,6 +46431,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div class="cleanest-row">
     <button type="button" id="btn-cleanest" class="cleanest-btn" onclick="findCleanestTrade(this)">✨ Cleanest trade available</button>
   </div>
+  <div id="cleanest-mode-badge" style="display:none;text-align:center;font-size:11px;color:var(--green);margin:-8px 0 10px;letter-spacing:.6px;font-weight:700"></div>
   <!-- Symbol tabs (pair selector) — directly under the dial so you can switch
        MGC/MNQ and read the dial together. -->
   <div class="tabs">
@@ -57703,27 +57722,33 @@ async function optExport(){
 // scoring, sizing or any money path. Fail-open: any error leaves the MGC / Long
 // default untouched. Hidden (focused-out) instruments are never auto-selected.
 async function pickCleanestSetup(force, actionableOnly){
-  // Shared best-setup scan. force=true (the manual "Cleanest trade" button) bypasses
-  // the userPickedSetup guard; force=false (landing auto-select / 30s auto-follow)
-  // respects a manual pick. actionableOnly=true (30s auto-follow) only switches when
-  // the best candidate is a READY/EARLY setup — never hops between WAITs. Returns the
-  // chosen candidate (or null). DISPLAY-ONLY — only switches the viewed tab/direction;
-  // never touches the gate, scoring, sizing or any money path.
+  // Evaluates ALL instruments in BOTH SCALP and SWING modes simultaneously and meters
+  // to whichever combination has the cleanest setup right now. force=true (manual
+  // "Cleanest trade" button) bypasses the userPickedSetup guard; force=false (landing
+  // auto-select / 30s auto-follow) respects a manual pick. actionableOnly=true (30s
+  // auto-follow) only switches to an actionable (READY/EARLY) setup — never hops
+  // between WAITs. DISPLAY-ONLY — only switches the viewed tab/direction; never
+  // touches the gate, scoring, sizing or any money path.
   try {
     if (!force && userPickedSetup) return null;       // landing mode: manual pick wins
     const num = function(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; };
     let cands = INSTRUMENTS.filter(instrEnabled);   // respect display focus
     if (!cands.length) cands = ['MGC'];
-    const recs = await Promise.all(cands.map(function(s){
-      return api('/status?ticker='+encodeURIComponent(s))
-               .then(function(d){ return { s:s, d:d }; })
-               .catch(function(){ return { s:s, d:null }; });
+    // Fetch both SCALP and SWING for every instrument in parallel — 8 requests for
+    // 4 instruments, all resolved by the server-side mode-scoped cache.
+    const recs = await Promise.all(cands.flatMap(function(s){
+      return ['SCALP','SWING'].map(function(m){
+        return api('/status?ticker='+encodeURIComponent(s)+'&mode='+m)
+                 .then(function(d){ return { s:s, m:m, d:d }; })
+                 .catch(function(){ return { s:s, m:m, d:null }; });
+      });
     }));
     let best = null;
     recs.forEach(function(r){
       if (!r.d) return;
       const cand = {
         s:    r.s,
+        m:    r.m,
         d:    r.d,
         act:  jsIsActionable(getBrain(r.d).decision.verdict) ? 1 : 0,
         edge: getBrain(r.d).score.value
@@ -57745,6 +57770,12 @@ async function pickCleanestSetup(force, actionableOnly){
     if (!force && userPickedSetup) return null;       // re-check after await — manual pick wins
     if (best.s !== sym) setSymbol(best.s);            // setSymbol() re-fetches analysis
     if (bdir && bdir !== dir) setDir(bdir);
+    // Update the mode badge below the "Cleanest trade" button
+    var badge = document.getElementById('cleanest-mode-badge');
+    if (badge){
+      badge.textContent = best.m + ' · ' + best.s + ' · Edge ' + num(best.edge);
+      badge.style.display = '';
+    }
     return best;
   } catch(e){ return null; }                          // fail-open: keep current view
 }
