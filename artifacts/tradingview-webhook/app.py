@@ -45036,6 +45036,9 @@ def dashboard():
   .mod-cat.cat-experimental{background:rgba(239,68,68,.07);color:#f87171;border:1px solid rgba(239,68,68,.16)}
   .mod.mod-min > .mod-h{margin-bottom:0}
   .mod.mod-min > :not(.mod-h){display:none !important}
+  /* bl-right compact cards: same collapse behaviour, no drag-reorder */
+  .bl-card.bl-min > .mod-h{margin-bottom:0}
+  .bl-card.bl-min > :not(.mod-h){display:none !important}
   /* Per-panel HIDE (display-only, this device; restore via the chip row). */
   .mod.mod-hidden{display:none !important}
   .mod-x{flex:0 0 auto;cursor:pointer;color:var(--muted);width:20px;height:20px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:3px;font-size:10px;margin-left:6px;transition:color .12s,border-color .12s}
@@ -57799,6 +57802,44 @@ setInterval(function(){
   }
 
   VIEWS.forEach(function(id){ enhanceView(id); });
+})();
+// ── bl-right compact cards: collapsible (DISPLAY-ONLY, this device) ──
+// The right-column bl-card panels are intentionally NOT .mod (so the main
+// drag-reorder ignores them), but they still deserve a collapse toggle.
+// Uses a separate localStorage key so it never conflicts with the main system.
+(function(){
+  var right = document.getElementById('bl-right');
+  if(!right) return;
+  var RKEY = 'dashCollapsedRight';
+  var collapsed;
+  try{ collapsed = JSON.parse(localStorage.getItem(RKEY)) || {}; }catch(e){ collapsed = {}; }
+
+  Array.prototype.forEach.call(right.querySelectorAll('.bl-card'), function(m){
+    var h = m.querySelector('.mod-h');
+    if(!h || h.dataset.blr) return;
+    h.dataset.blr = '1';
+    h.style.cursor = 'pointer';
+    h.style.display = 'flex';
+    h.style.alignItems = 'center';
+    h.style.gap = '8px';
+
+    var caret = document.createElement('span');
+    caret.className = 'mod-cl';
+    caret.style.marginRight = '2px';
+    h.insertBefore(caret, h.firstChild);
+
+    var id = m.id || '';
+    var isMin = id && !!collapsed[id];
+    if(isMin){ m.classList.add('bl-min'); caret.textContent = '\u25b8'; }
+    else { caret.textContent = '\u25be'; }
+
+    h.addEventListener('click', function(){
+      var min = m.classList.toggle('bl-min');
+      caret.textContent = min ? '\u25b8' : '\u25be';
+      if(id){ if(min){ collapsed[id]=1; } else { delete collapsed[id]; }
+        try{ localStorage.setItem(RKEY, JSON.stringify(collapsed)); }catch(e){} }
+    });
+  });
 })();
 // ── Declutter: Advanced-panels toggle (DISPLAY-ONLY, this device) ──
 // Hides every non-core live-view panel (extra analysis + simulated modules)
