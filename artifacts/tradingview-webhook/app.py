@@ -44988,7 +44988,7 @@ def dashboard():
   html.dark .mod *{--text:#e8ecff;--muted:#9098b8}
   html.dark .brain-orb-halo{opacity:.6}
   html{background:var(--bg)}
-  body{zoom:.80;background:transparent;color:var(--text);font-family:var(--mono);min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  body{zoom:.94;background:transparent;color:var(--text);font-family:var(--mono);font-size:15px;min-height:100vh;padding:22px 18px 40px;position:relative;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
   /* ── Calm deep-space glass backdrop (decorative, behind content) ── */
   .vw-bg{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
     background:
@@ -45392,8 +45392,8 @@ def dashboard():
   .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
   /* ── Brain-first 3-column layout: LEFT (controls) · CENTER (Main Brain) · RIGHT (compact state) ── */
   #view-live{display:flex;flex-direction:column}
-  #live-layout{order:0;display:grid;grid-template-columns:220px 1fr 280px;gap:14px;align-items:start;margin-bottom:12px}
-  #bl-left{min-width:0;display:flex;flex-direction:column;position:sticky;top:8px;align-self:start}
+  #live-layout{order:0;display:grid;grid-template-columns:1fr 300px;gap:14px;align-items:start;margin-bottom:12px}
+  #bl-left{display:none!important}
   #bl-center{min-width:0}
   #bl-right{min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:8px;align-self:start}
   /* Compact cards in bl-right — not .mod so drag-reorder ignores them */
@@ -45452,24 +45452,24 @@ def dashboard():
   /* ── Center verdict hero panel ── */
   /* ── Main Brain Summary card ── */
   #main-brain-summary{padding:18px 20px 16px;border-radius:14px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.14);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:var(--glass-shadow);margin-bottom:12px}
-  #mbs-verdict{font-size:22px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:6px}
-  #mbs-meter-wrap{height:5px;background:rgba(255,255,255,.07);border-radius:3px;margin:0 0 4px;overflow:hidden}
+  #mbs-verdict{font-size:28px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:6px}
+  #mbs-meter-wrap{height:6px;background:rgba(255,255,255,.07);border-radius:3px;margin:0 0 4px;overflow:hidden}
   #mbs-meter-fill{height:100%;border-radius:3px;width:0;transition:width .5s,background .4s}
-  #mbs-meter-label{font-size:9px;color:#4b5563;letter-spacing:.5px;text-align:right;margin-bottom:8px;font-family:var(--mono)}
+  #mbs-meter-label{font-size:11px;color:#4b5563;letter-spacing:.5px;text-align:right;margin-bottom:8px;font-family:var(--mono)}
   #mbs-edge{margin-bottom:10px;display:flex;align-items:baseline;gap:4px}
   #mbs-gates{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-  .mbs-pill{font-size:10px;font-weight:700;letter-spacing:.6px;padding:2px 6px;border-radius:5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
-  #mbs-reason{font-size:11px;color:#9ca3af;line-height:1.45;margin-top:6px;padding:6px 8px;background:rgba(239,68,68,.06);border-radius:6px;border-left:2px solid rgba(239,68,68,.25)}
-  #mbs-stale-warn{font-size:11px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:5px 8px;margin-top:8px;display:none}
-  #mbs-narrative{font-size:12px;color:#a8b4d0;line-height:1.55;margin:8px 0 6px;min-height:18px}
+  .mbs-pill{font-size:12px;font-weight:700;letter-spacing:.6px;padding:3px 8px;border-radius:5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
+  #mbs-reason{font-size:13px;color:#9ca3af;line-height:1.5;margin-top:6px;padding:8px 10px;background:rgba(239,68,68,.06);border-radius:6px;border-left:2px solid rgba(239,68,68,.25)}
+  #mbs-stale-warn{font-size:12px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:5px 8px;margin-top:8px;display:none}
+  #mbs-narrative{font-size:14px;color:#a8b4d0;line-height:1.6;margin:8px 0 6px;min-height:18px}
   #mbs-next-wrap{margin:6px 0;display:none}
-  #mbs-next-lbl{font-size:9px;color:#4b5563;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
-  #mbs-next-action{font-size:11px;color:#c8d0f0;font-weight:600}
+  #mbs-next-lbl{font-size:11px;color:#4b5563;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+  #mbs-next-action{font-size:13px;color:#c8d0f0;font-weight:600}
   #mbs-inv-wrap{margin:6px 0;display:none}
-  #mbs-inv-lbl{font-size:9px;color:rgba(239,68,68,.6);letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
-  #mbs-invalidation{font-size:11px;color:#fca5a5}
+  #mbs-inv-lbl{font-size:11px;color:rgba(239,68,68,.6);letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+  #mbs-invalidation{font-size:13px;color:#fca5a5}
   .mbs-controls{display:flex;gap:8px;margin-top:10px}
-  .mbs-ctrl-btn{flex:1;padding:7px 10px;border-radius:8px;border:1px solid rgba(100,120,255,.22);background:rgba(100,120,255,.08);color:#a8b4d0;font-size:11px;font-weight:600;letter-spacing:.4px;cursor:pointer;text-align:center;transition:background .2s,border-color .2s}
+  .mbs-ctrl-btn{flex:1;padding:9px 12px;border-radius:8px;border:1px solid rgba(100,120,255,.22);background:rgba(100,120,255,.08);color:#a8b4d0;font-size:13px;font-weight:600;letter-spacing:.4px;cursor:pointer;text-align:center;transition:background .2s,border-color .2s}
   .mbs-ctrl-btn:hover{background:rgba(100,120,255,.18);border-color:rgba(100,120,255,.4);color:#e0e8ff}
   .mbs-ctrl-btn.speaking{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.45);color:#f87171}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(239,68,68,.16);color:#888888;background:rgba(255,255,255,.03);text-transform:uppercase}
@@ -47212,8 +47212,12 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
 <!-- ── Phase 3: Journal Groups — primary Journal section view (DISPLAY-ONLY). -->
 <div class="mod" id="mod-journal-groups" data-cat="primary">
   <div class="mod-h">Journal<span class="mod-cat cat-primary">PRIMARY</span></div>
-  <details class="grp-details" id="jg-today-det" open>
-    <summary class="grp-summary"><span class="grp-title">Today</span><span class="grp-badge neu" id="jg-today-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+  <details class="grp-details" id="jg-tz-det" open>
+    <summary class="grp-summary"><span class="grp-title">TradeZella Imports</span><span class="grp-badge neu" id="jg-tz-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
+    <div class="grp-body" id="jg-tz-body"><div class="grp-note">Loading&#8230;</div></div>
+  </details>
+  <details class="grp-details" id="jg-today-det">
+    <summary class="grp-summary"><span class="grp-title">Today (Bot)</span><span class="grp-badge neu" id="jg-today-badge">&#8212;</span><span class="grp-arrow">&#9658;</span></summary>
     <div class="grp-body" id="jg-today-body"><div class="grp-note">Awaiting data&#8230;</div></div>
   </details>
   <details class="grp-details" id="jg-hist-det">
@@ -55369,6 +55373,33 @@ function renderJournalGroups(d) {
   } else { h5='<div class="grp-note">No simulation activity.</div>'; }
   document.getElementById('jg-sim-body').innerHTML=h5;
   document.getElementById('jg-sim-det').style.display=(ds.scalp_verdict||ds.swing_verdict)?'':'none';
+  // TradeZella imports section — fetch async, populate independently
+  var tzBody=document.getElementById('jg-tz-body'),tzBadge=document.getElementById('jg-tz-badge');
+  if(tzBody){
+    api('/tradezella/analysis').then(function(tz){
+      var sb=tz&&tz.scoreboard,sum=tz&&tz.import_summary;
+      var ok=sb&&sb.all_time&&sb.all_time.count>0;
+      if(!ok){
+        if(tzBody) tzBody.innerHTML='<div class="grp-note">No imports yet. Open the TradeZella view from the navigation menu to upload a CSV.</div>';
+        return;
+      }
+      var at=sb.all_time,h='';
+      if(at.net_pnl!=null){ var pc=at.net_pnl>0?'#22c55e':at.net_pnl<0?'#ef4444':'#6b7280'; h+=_grpRow('Net P&L','$'+(at.net_pnl>=0?'+':'')+Number(at.net_pnl).toFixed(2),pc); }
+      if(at.win_rate!=null&&at.decided){ var wr=at.win_rate; h+=_grpRow('Win Rate',Math.round(wr*100)+'%',wr>=0.55?'#22c55e':wr>=0.45?'#f59e0b':'#ef4444'); }
+      if(at.count!=null) h+=_grpRow('Total Trades',at.count);
+      if(at.wins!=null) h+=_grpRow('W / L',at.wins+' / '+at.losses);
+      if(at.profit_factor!=null) h+=_grpRow('Profit Factor',Number(at.profit_factor).toFixed(2));
+      if(sum&&sum.last_import_at) h+=_grpRow('Last Import',(sum.last_import_at||'').split('T')[0]);
+      var insts=(sb.by_instrument||[]);
+      insts.slice(0,5).forEach(function(g){
+        var ic=g.net_pnl>0?'#22c55e':g.net_pnl<0?'#ef4444':'#6b7280';
+        h+=_grpRow(_adcEsc(g.symbol),'$'+(g.net_pnl>=0?'+':'')+Number(g.net_pnl).toFixed(2)+' ('+g.wins+'W/'+g.losses+'L)',ic);
+      });
+      h+='<div style="margin-top:8px;font-size:11px;color:#6b7280">Open the TradeZella view for full details.</div>';
+      if(tzBody) tzBody.innerHTML=h||'<div class="grp-note">No import data available.</div>';
+      if(tzBadge){ tzBadge.className='grp-badge ok'; tzBadge.textContent=at.count+' trades'; }
+    }).catch(function(){ if(tzBody) tzBody.innerHTML='<div class="grp-note">Imports unavailable (owner login required).</div>'; });
+  }
 }
 
 // renderControlsGroups: fills the 6 control status sections in mod-controls-groups.
