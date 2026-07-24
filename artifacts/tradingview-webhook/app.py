@@ -24282,6 +24282,33 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                                 "Databento scan READY: %s @ %.4f — live card sent",
                                 inst, price,
                             )
+            # ── Databento auto-execute ─────────────────────────────────────────
+            # When armed + READY, fire through the SAME audited gateway as the
+            # webhook handler. ALL existing safety checks apply (arm flag,
+            # training gate, daily cap, kill-switch, AUTO_FIRED_KEYS dedup).
+            # source="databento_scan" for a clear audit trail.
+            if auto_trade_enabled(inst) and is_actionable(a.get("verdict")):
+                try:
+                    _setup_key = _auto_setup_key(a, inst)
+                    with AUTO_TRADE_LOCK:
+                        _already = _setup_key in AUTO_FIRED_KEYS
+                    if not _already:
+                        fired = _maybe_auto_execute(
+                            inst,
+                            allow_stack=(TRADING_MODE == "SCALP"),
+                            setup_key=_setup_key,
+                            source="databento_scan",
+                        )
+                        if fired:
+                            with AUTO_TRADE_LOCK:
+                                AUTO_FIRED_KEYS.add(_setup_key)
+                            _persist_auto_fired_key(_setup_key)
+                            logger.info(
+                                "Databento scan AUTO-EXECUTE: %s %s @ %.4f",
+                                inst, ready_direction(a.get("verdict", "")), price,
+                            )
+                except Exception as _ae:
+                    logger.error("Databento auto-execute error (%s): %s", inst, _ae)
             # Right Brain evaluates every bar (READY or not; dev + prod)
             _right_brain_eval(inst, a, price)
         except Exception as exc:
