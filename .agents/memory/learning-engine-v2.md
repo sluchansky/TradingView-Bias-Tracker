@@ -54,3 +54,9 @@ A new learning field must be added in THREE places or it's `None` on the wire / 
 the `full_analysis` result, the `/status` whitelist (it serializes a key allowlist, not the
 whole dict), and the dashboard render. `_build_card_entry` carries the governor/memory blocks
 for journal+card parity.
+
+## Production activation (LEARNING_GATE_ENABLED=1)
+The veto was enabled in production as of July 2026. The neutral block (0 trades, `veto_would_fire=False`)
+means no demotions occur until the governor accumulates ~25–50 graded Stage-4 live trades.
+The runtime toggle (`_LEARNING_GATE_OVERRIDE`) still resets to env seed on restart — so the
+env var is the durable persistence; the dashboard toggle is session-only.

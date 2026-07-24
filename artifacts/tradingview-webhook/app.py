@@ -1081,6 +1081,29 @@ def _scalp_primary_rr(mode=None):
     return None
 
 
+def _scalp_atr_tp_mult(mode=None):
+    """ATR-adaptive SCALP take-profit multiplier. When SCALP_ATR_TP_MULT is set and
+    mode is SCALP, the first target is placed at entry ± (atr_pts × multiplier) so
+    the target scales with real volatility rather than mirroring the stop distance.
+    This decouples R:R from the stop so tight structural stops yield better-than-1:1
+    returns on the same ATR range. Returns None when not applicable — env unset,
+    non-SCALP mode, or SCALP_RR2_ENABLED active (RR2 already owns the target distance)
+    — preserving byte-identical 1:1 legacy behaviour when the flag is off."""
+    m = mode or TRADING_MODE
+    if SCALP_RR2_ENABLED:   # RR2 already owns the target; don't double-adjust.
+        return None
+    if m != "SCALP":
+        return None
+    raw = os.environ.get("SCALP_ATR_TP_MULT", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _scalp_rr_targets(mode=None):
     """Effective (TP1, TP2, runner) R-multiples for the SCALP staged exits. With the
     1:2 upgrade ON they move in lockstep (2.0 / 2.5 / 3.0) so the broker primary, the
@@ -3157,10 +3180,24 @@ def execution_configured(mode=None):
         return bool(EXECUTION_WEBHOOK_URL)
     return True
 
+def _limit_entry_enabled():
+    """Limit-order entry flag. When ON, TradersPost entry signals include
+    orderType=limit + price=intent["entry"] so the entry fills at-or-better
+    vs. a pure market order. OFF by default → byte-identical market behaviour.
+    Designed for SCALP setups that fire when price is already AT the zone — a
+    marketable limit fills immediately at the zone price rather than at best ask.
+    NOTE: TradersPost may hold unfilled limits as GTC; arm only after confirming
+    your broker strategy's limit-order lifetime setting."""
+    return os.environ.get("LIMIT_ENTRY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def adapt_traderspost(intent):
-    """Canonical intent → TradersPost MARKET order + protective-stop/first-target
-    bracket. MUST stay byte-equivalent to the legacy payload when mode=traderspost."""
-    return {
+    """Canonical intent → TradersPost order + protective-stop/first-target bracket.
+    Defaults to a MARKET entry (byte-identical when LIMIT_ENTRY_ENABLED is unset).
+    When LIMIT_ENTRY_ENABLED=1 the entry signal includes orderType=limit + price so
+    the broker places a limit order at the plan entry price rather than filling at
+    market — tighter fills when the setup fires while price is already at structure."""
+    payload = {
         "ticker":     intent["broker_symbol"],
         "action":     intent["action"],
         "quantity":   intent["quantity"],
@@ -3169,6 +3206,10 @@ def adapt_traderspost(intent):
         "stopLoss":   {"type": "stop", "stopPrice": intent["stop"]},
         "takeProfit": {"limitPrice": intent["target1"]},
     }
+    if _limit_entry_enabled() and intent.get("entry") is not None:
+        payload["orderType"] = "limit"
+        payload["price"]     = intent["entry"]
+    return payload
 
 def adapt_pickmytrade(intent):
     """Canonical intent → PickMyTrade webhook payload (add-trade-data): a MARKET
@@ -8020,8 +8061,19 @@ def build_strict_trade_plan(direction, ticker, current_price,
         # R (default 2.0) for SCALP only when SCALP_RR2_ENABLED=1 is set. The ORB 1:4
         # override downstream recomputes its target purely from risk, so a 2R base (when
         # armed) never leaks into it.
-        _rr2_pr = _scalp_primary_rr(mode)
-        if _rr2_pr is None:
+        _rr2_pr      = _scalp_primary_rr(mode)
+        _atr_tp_mult = _scalp_atr_tp_mult(mode)
+        if _rr2_pr is None and _atr_tp_mult is not None and sp.get("atr_pts"):
+            # ATR-adaptive target: place TP at entry ± (ATR × multiplier) so the
+            # target scales with real volatility rather than mirroring the stop.
+            # Snap to the instrument tick grid — ATR is a raw float, not on-grid.
+            _atr_rwd    = float(sp["atr_pts"]) * _atr_tp_mult
+            _tp_raw     = (entry + _atr_rwd) if direction == "Long" else (entry - _atr_rwd)
+            take_profit = round(round(_tp_raw / tick) * tick, 4) if tick else round(_tp_raw, 2)
+            reward      = (take_profit - entry) if direction == "Long" else (entry - take_profit)
+            rr_num_val  = round(reward / risk, 2) if risk > 0 else 1.0
+            rr_str      = f"{rr_num_val:g}:1"
+        elif _rr2_pr is None:
             take_profit = (entry + risk) if direction == "Long" else (entry - risk)
             reward      = risk
             rr_num_val  = 1.0
@@ -8043,6 +8095,9 @@ def build_strict_trade_plan(direction, ticker, current_price,
     elif (not swing_htf_plan) and (_rr2_pr is not None):
         plan_reason = (f"{inst} {direction} — fixed {rr_str} R:R, ATR/structure stop "
                        f"({risk:.1f} pts), {anchor_word}-anchored.")
+    elif (not swing_htf_plan) and (_atr_tp_mult is not None) and sp.get("atr_pts"):
+        plan_reason = (f"{inst} {direction} — ATR\u00d7{_atr_tp_mult:g} target ({rr_str} R:R), "
+                       f"ATR/structure stop ({risk:.1f} pts), {anchor_word}-anchored.")
     else:
         plan_reason = (f"{inst} {direction} — fixed 1:1 R:R, ATR/structure stop "
                        f"({risk:.1f} pts), {anchor_word}-anchored.")
