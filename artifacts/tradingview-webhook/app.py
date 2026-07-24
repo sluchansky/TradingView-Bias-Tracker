@@ -57654,7 +57654,23 @@ setInterval(function(){
   function load(k){ try{ return JSON.parse(localStorage.getItem(k)) || {}; }catch(e){ return {}; } }
   function save(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
   function key(m){ return m.id || ''; }
-  function mods(){ return Array.prototype.slice.call(ROOT.querySelectorAll('.mod')); }
+  function mods(){
+    // Collect all .mod panels inside #view-live first, then add any live-nav
+    // panels that live OUTSIDE #view-live (they are HTML siblings of view-live
+    // so ROOT.querySelectorAll misses them, but _liveNavAllIds knows about them).
+    var seen = {}, list = [];
+    Array.prototype.forEach.call(ROOT.querySelectorAll('.mod'), function(el){
+      var k = el.id || '';
+      if(!seen[k]){ seen[k]=1; list.push(el); }
+    });
+    if(typeof _liveNavAllIds !== 'undefined'){
+      _liveNavAllIds.forEach(function(id){
+        var el = document.getElementById(id);
+        if(el && el.classList.contains('mod') && !seen[id]){ seen[id]=1; list.push(el); }
+      });
+    }
+    return list;
+  }
   function header(m){ return m.querySelector(':scope > .mod-h'); }
 
   // Apply a saved order — only when one exists, so the default layout is untouched
