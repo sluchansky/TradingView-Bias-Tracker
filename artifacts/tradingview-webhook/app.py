@@ -45511,11 +45511,12 @@ def dashboard():
   .orb-defend .char-lid{animation-duration:2s}
   .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:5px;transition:color .5s;text-shadow:0 0 24px currentColor}
   .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
-  /* ── Brain layout: CENTER (Main Brain) · RIGHT (compact state) ── */
+  /* ── Brain layout: LEFT col (compact verdict + detail cards, 300px) · RIGHT col (Main Brain panel, 1fr) ── */
   #view-live{display:flex;flex-direction:column}
-  #live-layout{order:0;display:grid;grid-template-columns:1fr 300px;gap:14px;align-items:start;margin-bottom:12px}
+  #live-layout{order:0;display:grid;grid-template-columns:300px 1fr;gap:14px;align-items:start;margin-bottom:12px}
   #bl-center{min-width:0}
-  #bl-right{min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:8px;align-self:start}
+  #mod-brain{grid-column:2;grid-row:1/span 2;min-width:0}
+  #bl-right{min-width:0;display:flex;flex-direction:column;gap:10px;align-self:start}
   /* Compact cards in bl-right — not .mod so drag-reorder ignores them */
   .bl-card{background:linear-gradient(165deg,rgba(18,18,18,.85),rgba(8,8,8,.75));border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px)}
   .bl-card .mod-h{margin-bottom:8px;font-size:10px}
@@ -45555,25 +45556,25 @@ def dashboard():
   #menu-toggle:hover{color:#b0bce0;border-color:rgba(239,68,68,.40)}
   /* ── Center verdict hero panel ── */
   /* ── Main Brain Summary card ── */
-  #main-brain-summary{padding:18px 20px 16px;border-radius:14px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.14);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:var(--glass-shadow);margin-bottom:12px}
-  #mbs-verdict{font-size:28px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:6px}
-  #mbs-meter-wrap{height:6px;background:rgba(255,255,255,.07);border-radius:3px;margin:0 0 4px;overflow:hidden}
-  #mbs-meter-fill{height:100%;border-radius:3px;width:0;transition:width .5s,background .4s}
-  #mbs-meter-label{font-size:11px;color:#4b5563;letter-spacing:.5px;text-align:right;margin-bottom:8px;font-family:var(--mono)}
-  #mbs-edge{margin-bottom:10px;display:flex;align-items:baseline;gap:4px}
-  #mbs-gates{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-  .mbs-pill{font-size:12px;font-weight:700;letter-spacing:.6px;padding:3px 8px;border-radius:5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
-  #mbs-reason{font-size:13px;color:#9ca3af;line-height:1.5;margin-top:6px;padding:8px 10px;background:rgba(239,68,68,.06);border-radius:6px;border-left:2px solid rgba(239,68,68,.25)}
-  #mbs-stale-warn{font-size:12px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:7px;padding:5px 8px;margin-top:8px;display:none}
-  #mbs-narrative{font-size:14px;color:#a8b4d0;line-height:1.6;margin:8px 0 6px;min-height:18px}
-  #mbs-next-wrap{margin:6px 0;display:none}
-  #mbs-next-lbl{font-size:11px;color:#4b5563;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
-  #mbs-next-action{font-size:13px;color:#c8d0f0;font-weight:600}
-  #mbs-inv-wrap{margin:6px 0;display:none}
-  #mbs-inv-lbl{font-size:11px;color:rgba(239,68,68,.6);letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
-  #mbs-invalidation{font-size:13px;color:#fca5a5}
-  .mbs-controls{display:flex;gap:8px;margin-top:10px}
-  .mbs-ctrl-btn{flex:1;padding:9px 12px;border-radius:8px;border:1px solid rgba(100,120,255,.22);background:rgba(100,120,255,.08);color:#a8b4d0;font-size:13px;font-weight:600;letter-spacing:.4px;cursor:pointer;text-align:center;transition:background .2s,border-color .2s}
+  #main-brain-summary{padding:12px 14px 10px;border-radius:12px;background:linear-gradient(165deg,rgba(10,12,24,.90),rgba(5,7,14,.80));border:1px solid rgba(100,120,255,.14);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:var(--glass-shadow);margin-bottom:0}
+  #mbs-verdict{font-size:20px;font-weight:900;letter-spacing:.5px;line-height:1;margin-bottom:4px}
+  #mbs-meter-wrap{height:4px;background:rgba(255,255,255,.07);border-radius:2px;margin:0 0 3px;overflow:hidden}
+  #mbs-meter-fill{height:100%;border-radius:2px;width:0;transition:width .5s,background .4s}
+  #mbs-meter-label{font-size:10px;color:#4b5563;letter-spacing:.5px;text-align:right;margin-bottom:5px;font-family:var(--mono)}
+  #mbs-edge{margin-bottom:6px;display:flex;align-items:baseline;gap:4px}
+  #mbs-gates{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px}
+  .mbs-pill{font-size:11px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:4px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);cursor:default}
+  #mbs-reason{font-size:12px;color:#9ca3af;line-height:1.45;margin-top:5px;padding:6px 8px;background:rgba(239,68,68,.06);border-radius:5px;border-left:2px solid rgba(239,68,68,.25)}
+  #mbs-stale-warn{font-size:11px;color:#f59e0b;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);border-radius:6px;padding:4px 7px;margin-top:6px;display:none}
+  #mbs-narrative{font-size:12px;color:#a8b4d0;line-height:1.5;margin:5px 0 4px;min-height:14px}
+  #mbs-next-wrap{margin:4px 0;display:none}
+  #mbs-next-lbl{font-size:10px;color:#4b5563;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+  #mbs-next-action{font-size:12px;color:#c8d0f0;font-weight:600}
+  #mbs-inv-wrap{margin:4px 0;display:none}
+  #mbs-inv-lbl{font-size:10px;color:rgba(239,68,68,.6);letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+  #mbs-invalidation{font-size:12px;color:#fca5a5}
+  .mbs-controls{display:flex;gap:6px;margin-top:8px}
+  .mbs-ctrl-btn{flex:1;padding:7px 10px;border-radius:7px;border:1px solid rgba(100,120,255,.22);background:rgba(100,120,255,.08);color:#a8b4d0;font-size:12px;font-weight:600;letter-spacing:.4px;cursor:pointer;text-align:center;transition:background .2s,border-color .2s}
   .mbs-ctrl-btn:hover{background:rgba(100,120,255,.18);border-color:rgba(100,120,255,.4);color:#e0e8ff}
   .mbs-ctrl-btn.speaking{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.45);color:#f87171}
   .blh-pill{font-size:9.5px;font-weight:700;letter-spacing:.6px;padding:3px 9px;border-radius:5px;border:1px solid rgba(239,68,68,.16);color:#888888;background:rgba(255,255,255,.03);text-transform:uppercase}
@@ -45606,7 +45607,7 @@ def dashboard():
   .blr-obs-tbl td:first-child{color:#6b7280;font-size:9.5px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap;width:52%}
   .blr-obs-tbl td:last-child{color:#e8e8e8;text-align:right;font-weight:600}
   /* Responsive: single column on small screens — show drawer inline */
-  @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-right{display:none}#view-live{display:block}#view-live > .mod:not(.ln-hidden),#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}#view-live > .mod.ln-hidden{display:none!important}}
+  @media(max-width:960px){#live-layout{grid-template-columns:1fr!important}#mod-brain{grid-column:1!important;grid-row:auto!important}#bl-right{display:none}#view-live{display:block}#view-live > .mod:not(.ln-hidden),#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}#view-live > .mod.ln-hidden{display:none!important}}
   .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
   .mb-av-sep{color:#2d2d40;font-size:14px}
   .mb-av-foot{font-size:10px;letter-spacing:.5px;margin-top:10px;display:flex;align-items:center;justify-content:center;gap:10px;color:#4b5563}
@@ -46998,7 +46999,6 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     </div>
 
   </div><!-- /#mod-brain -->
-  </div><!-- /#bl-center -->
 
   <!-- RIGHT COLUMN ── compact state panels -->
   <div id="bl-right">
