@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Decision Quality analytics (Phase 5F)](decision-quality-analytics.md) — DB-backed snapshot analytics; dedup pattern; component win-rate computation; outcome hook location.
 - [Databento source attribution audit](source-attribution-audit.md) — _audit_event_duplicates needs now_dt kwarg in tests (1-hour cutoff filters pinned past timestamps).
 - [Flask zombie-prevention guards](flask-zombie-prevention.md) — 3 os._exit guards (SIGTERM handler + sys.excepthook + app.run() finally) stop non-daemon Timer threads from keeping zombie Flask alive after a crash.
 - [Databento live feed integration](databento-integration.md) — flag-gated (DATABENTO_ENABLED=1 + DATABENTO_API_KEY); DatabentoBrain injects into existing state stores; routes return disabled-JSON not 404; dashboard panel shows OFFLINE safely.

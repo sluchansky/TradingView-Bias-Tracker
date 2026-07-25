@@ -131,6 +131,8 @@ TFA_DB_READY        = False              # set by _check_tfa_db_ready at boot
 PENDING_TFA_BY_INST = {}                 # inst → ready_id, links READY verdict → triggered trade
 LAST_TFA_BY_INST    = {}                 # inst → {ready_id, direction, ts}, dedup repeated READY webhooks
 LIVE_TFA_BY_INST    = {}                 # inst → ready_id of the most recently triggered trade
+DQ_DB_READY         = False              # set by _check_dq_db_ready at boot
+_DQ_PENDING_BY_INST: dict = {}          # inst → snapshot_key of most-recent unresolved READY (Phase 5F)
 # Retained (now unused): historical ENTER serialisation lock. Writes now go
 # through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
@@ -23821,6 +23823,20 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     except Exception as _tfa_exc:
         logger.debug("TFA record-ready fail-open: %s", _tfa_exc)
 
+    # ── Decision Quality: capture this READY snapshot (Phase 5F — display-only) ──
+    # Mirrors the TFA hook pattern: one INSERT per new READY setup per instrument;
+    # deduped via _DQ_PENDING_BY_INST so heartbeat re-evaluations don't add rows.
+    try:
+        if DQ_DB_READY and is_actionable(verdict):
+            _capture_decision_snapshot(
+                inst      = instrument_of(active_ticker),
+                direction = strict_direction,
+                mode      = TRADING_MODE,
+                result    = result,
+            )
+    except Exception as _dq_exc:
+        logger.debug("DQ capture fail-open: %s", _dq_exc)
+
     # ── Phase 5B: Decision Trace cache (DISPLAY/DIAGNOSTICS-ONLY) ─────────────
     # Cache the trace per instrument ONLY when the flag is ON. Pure read-only —
     # does NOT mutate result. Flag OFF => block never executes (byte-identical).
@@ -26550,6 +26566,15 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
                 )
     except Exception as _tfa_exc:
         logger.debug("TFA complete fail-open: %s", _tfa_exc)
+
+    # ── Decision Quality: attach outcome to the READY snapshot (Phase 5F — display-only) ─
+    try:
+        if DQ_DB_READY:
+            _dq_inst = mt.get("instrument") or mt.get("symbol")
+            if _dq_inst:
+                _resolve_decision_snapshot(inst=_dq_inst, mt=mt)
+    except Exception as _dq_exc:
+        logger.debug("DQ resolve fail-open: %s", _dq_exc)
 
     # ── SWING (flag-on) multi-day persistence: mark the thesis row closed so a
     # stopped/TP'd SWING trade is NOT resurrected as OPEN on the next boot (the
@@ -30128,6 +30153,378 @@ def _check_tfa_db_ready():
         except Exception:
             pass
         logger.warning("trade_failure_analysis table NOT ready: %s — TFA disabled", exc)
+
+
+def _check_dq_db_ready():
+    """Probe the decision_snapshots table (no DDL) and set DQ_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB silently disables DQ everywhere."""
+    global DQ_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM decision_snapshots LIMIT 0")
+        cur.close()
+        conn.close()
+        DQ_DB_READY = True
+        logger.info("decision_snapshots table ready — Decision Quality enabled")
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        logger.warning("decision_snapshots table NOT ready: %s — Decision Quality disabled", exc)
+
+
+def _capture_decision_snapshot(inst, direction, mode, result):
+    """INSERT a pending decision snapshot when a READY verdict is first detected.
+
+    Deduped via _DQ_PENDING_BY_INST: skips if the same inst+direction is already
+    pending (same setup still READY on heartbeat). Sets _DQ_PENDING_BY_INST[inst]
+    = snapshot_key so _resolve_decision_snapshot can link the outcome at close time.
+    FAIL-OPEN — never touches scoring, gate, or any money-path variable."""
+    if not DQ_DB_READY or not inst or not direction:
+        return
+    try:
+        # Dedup: skip if this inst+direction setup is already pending
+        _existing = _DQ_PENDING_BY_INST.get(inst) or ""
+        if _existing.startswith(f"{inst}::{direction}::"):
+            return
+
+        import json as _json
+        _now   = now_utc()
+        key    = f"{inst}::{direction}::{_now.strftime('%Y%m%dT%H%M%SZ')}"
+        attr   = result.get("source_attribution") or []
+        audit  = result.get("source_audit") or {}
+        plan   = result.get("trade_plan") or {}
+
+        components = [
+            {"component": c.get("component"), "points": c.get("points"),
+             "source": c.get("source", "unknown"), "age_s": c.get("age_seconds")}
+            for c in attr
+        ]
+
+        entry_price = stop_price = None
+        targets     = None
+        try:
+            entry_price = float(plan.get("entry") or 0) or None
+            stop_price  = float(plan.get("stop")  or 0) or None
+            targets     = {k: plan.get(k) for k in ("t1", "t2", "runner") if plan.get(k)}
+        except Exception:
+            pass
+
+        dc_count = len(audit.get("double_counting_warnings") or [])
+
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO decision_snapshots
+               (snapshot_key, created_at, inst, direction, mode, session_name,
+                edge_score, verdict, components, entry_price, stop_price,
+                targets, dc_warnings_count)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (snapshot_key) DO NOTHING""",
+            (key, _now, inst, direction, mode,
+             result.get("session"),
+             result.get("edge_score"),
+             result.get("verdict"),
+             _json.dumps(components),
+             entry_price, stop_price,
+             _json.dumps(targets) if targets else None,
+             dc_count),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        _DQ_PENDING_BY_INST[inst] = key
+        logger.debug("DQ snapshot captured: %s", key)
+    except Exception as exc:
+        logger.debug("_capture_decision_snapshot fail-open: %s", exc)
+
+
+def _resolve_decision_snapshot(inst, mt):
+    """UPDATE the pending decision snapshot for `inst` with trade outcome data.
+
+    Pops _DQ_PENDING_BY_INST[inst] to get the snapshot_key, then UPDATEs the DB
+    row. If no pending snapshot exists for this instrument, this is a no-op.
+    FAIL-OPEN — never touches the money path."""
+    if not DQ_DB_READY or not inst:
+        return
+    try:
+        snap_key = _DQ_PENDING_BY_INST.pop(inst, None)
+        if not snap_key:
+            return
+
+        outcome   = (mt.get("outcome") or "").strip()
+        outcome_r = mt.get("r_multiple")
+        mfe_r     = mt.get("mfe_r")
+        mae_r     = mt.get("mae_r")
+
+        time_min = None
+        try:
+            _op = mt.get("opened_at"); _cl = mt.get("closed_at")
+            if _op and _cl:
+                time_min = round((_cl - _op).total_seconds() / 60.0, 1)
+        except Exception:
+            pass
+
+        is_win  = "Win"       in outcome
+        is_loss = "Loss"      in outcome
+        is_be   = "Breakeven" in outcome or "Break" in outcome
+        exit_reason = ("target_reached" if is_win
+                       else "stop_hit"  if is_loss
+                       else "be"        if is_be
+                       else "manual")
+        manual_exit = bool(mt.get("manual_close") or mt.get("stop_managing"))
+
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE decision_snapshots
+               SET outcome=%s, outcome_r=%s, mfe_r=%s, mae_r=%s,
+                   time_in_trade_min=%s, exit_reason=%s,
+                   target_reached=%s, stop_hit=%s, manual_exit=%s,
+                   resolved_at=%s
+               WHERE snapshot_key=%s AND outcome IS NULL""",
+            (outcome, outcome_r, mfe_r, mae_r, time_min, exit_reason,
+             is_win, is_loss, manual_exit, now_utc(), snap_key),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.debug("DQ snapshot resolved: %s → %s", snap_key, outcome)
+    except Exception as exc:
+        logger.debug("_resolve_decision_snapshot fail-open: %s", exc)
+
+
+def _build_decision_quality_report():
+    """Compute the Phase 5F decision quality & signal calibration report.
+
+    SELECT-only from decision_snapshots. Computes per-component win rates
+    (present vs absent), duplicate-evidence impact, and text recommendations.
+    FAIL-OPEN — returns an error dict on any exception."""
+    import json as _json
+
+    if not DQ_DB_READY:
+        return {"enabled": False,
+                "message": "Decision Quality DB not ready.",
+                "generated_at": now_utc().isoformat()}
+
+    conn = _learning_conn()
+    if conn is None:
+        return {"enabled": True, "error": "db_unavailable",
+                "generated_at": now_utc().isoformat()}
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT inst, direction, edge_score, verdict, components,
+                      dc_warnings_count, outcome, outcome_r, mfe_r, mae_r,
+                      time_in_trade_min, exit_reason, created_at
+               FROM decision_snapshots
+               WHERE outcome IS NOT NULL
+               ORDER BY created_at DESC LIMIT 500"""
+        )
+        rows = cur.fetchall()
+        cur.execute("SELECT COUNT(*) FROM decision_snapshots")
+        total_captured = (cur.fetchone() or [0])[0]
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return {"enabled": True, "error": str(exc),
+                "generated_at": now_utc().isoformat()}
+
+    total_resolved = len(rows)
+    MIN_SAMPLES    = 5
+
+    if total_resolved == 0:
+        return {
+            "enabled":       True,
+            "total_captured": total_captured,
+            "resolved":      0,
+            "message":       ("No resolved trades yet — snapshots populate as "
+                              "READY setups are evaluated, outcomes attach when "
+                              "trades close."),
+            "component_performance": {},
+            "duplicate_impact":      {},
+            "recommendations":       [],
+            "generated_at":          now_utc().isoformat(),
+        }
+
+    # ── Parse rows ────────────────────────────────────────────────────────────
+    COMP_NAMES = ("BOS", "CHOCH", "Sweep", "VWAP", "Volume", "CVD", "Session")
+
+    wins   = 0; losses = 0; r_vals = []
+    comp_stats: dict = {
+        c: {"pw": 0, "pt": 0, "aw": 0, "at": 0, "r_vals": []}
+        for c in COMP_NAMES
+    }
+    rows_dup    = []   # rows with dc_warnings_count > 0
+    rows_no_dup = []   # rows with dc_warnings_count == 0
+
+    for row in rows:
+        # JSONB → Python: psycopg2 may return a string or a parsed object
+        comps_raw = row[4]
+        if isinstance(comps_raw, str):
+            try:
+                comps_raw = _json.loads(comps_raw)
+            except Exception:
+                comps_raw = []
+        comps_raw = comps_raw or []
+
+        outcome  = (row[6] or "").strip()
+        r_val    = row[7]
+        dc_count = row[5] or 0
+
+        is_win  = "Win"  in outcome
+        is_loss = "Loss" in outcome
+        if is_win:
+            wins += 1
+        elif is_loss:
+            losses += 1
+        if r_val is not None:
+            try:
+                r_vals.append(float(r_val))
+            except Exception:
+                pass
+
+        present = set(
+            c.get("component")
+            for c in comps_raw
+            if c.get("component") and (c.get("points") or 0) > 0
+        )
+
+        for comp in COMP_NAMES:
+            if comp in present:
+                comp_stats[comp]["pt"] += 1
+                if is_win:
+                    comp_stats[comp]["pw"] += 1
+                if r_val is not None:
+                    try:
+                        comp_stats[comp]["r_vals"].append(float(r_val))
+                    except Exception:
+                        pass
+            else:
+                comp_stats[comp]["at"] += 1
+                if is_win:
+                    comp_stats[comp]["aw"] += 1
+
+        if dc_count > 0:
+            rows_dup.append(row)
+        else:
+            rows_no_dup.append(row)
+
+    # ── Component performance table ───────────────────────────────────────────
+    def _pct(wins, total):
+        return round(100 * wins / total, 1) if total > 0 else None
+
+    component_performance: dict = {}
+    for comp, s in comp_stats.items():
+        wp = _pct(s["pw"], s["pt"])
+        wa = _pct(s["aw"], s["at"])
+        ar = round(sum(s["r_vals"]) / len(s["r_vals"]), 2) if s["r_vals"] else None
+        delta = round(wp - wa, 1) if (wp is not None and wa is not None) else None
+        component_performance[comp] = {
+            "win_rate_present": wp, "win_rate_absent": wa,
+            "avg_r_present": ar,   "present_count": s["pt"],
+            "absent_count":  s["at"], "predictive_delta": delta,
+        }
+
+    # Sort by predictive_delta (highest first)
+    ranked = sorted(
+        [(c, v) for c, v in component_performance.items()
+         if v["predictive_delta"] is not None and v["present_count"] >= MIN_SAMPLES],
+        key=lambda x: x[1]["predictive_delta"] or 0, reverse=True,
+    )
+    top_components    = [{"component": c, **v} for c, v in ranked[:3]]
+    bottom_components = [{"component": c, **v} for c, v in ranked[-3:]]
+
+    # ── Duplicate impact ──────────────────────────────────────────────────────
+    def _wr(rlist):
+        if not rlist:
+            return None
+        w = sum(1 for r in rlist if "Win" in (r[6] or ""))
+        return round(100 * w / len(rlist), 1)
+
+    duplicate_impact = {
+        "with_warnings":    {"count": len(rows_dup),    "win_rate": _wr(rows_dup)},
+        "without_warnings": {"count": len(rows_no_dup), "win_rate": _wr(rows_no_dup)},
+    }
+    dup_delta = None
+    wd  = duplicate_impact["with_warnings"]["win_rate"]
+    wod = duplicate_impact["without_warnings"]["win_rate"]
+    if wd is not None and wod is not None:
+        dup_delta = round(wd - wod, 1)
+
+    # ── Recommendations ───────────────────────────────────────────────────────
+    recommendations: list = []
+
+    for comp, perf in component_performance.items():
+        d = perf.get("predictive_delta"); pt = perf.get("present_count", 0)
+        if d is None or pt < MIN_SAMPLES:
+            continue
+        if d >= 15:
+            recommendations.append({
+                "priority": "high", "component": comp,
+                "text": (f"{comp}: +{d:.0f}pp win-rate lift when present "
+                         f"(n={pt}). Strong predictor."),
+            })
+        elif d <= -15:
+            recommendations.append({
+                "priority": "review", "component": comp,
+                "text": (f"{comp}: {d:.0f}pp win-rate when present "
+                         f"(n={pt}). Weak/negative — review weighting."),
+            })
+
+    if dup_delta is not None and abs(dup_delta) >= 10:
+        nd = min(len(rows_dup), len(rows_no_dup))
+        if nd >= MIN_SAMPLES:
+            txt = ("higher" if dup_delta > 0 else "lower")
+            recommendations.append({
+                "priority": "info", "component": "duplicate_evidence",
+                "text": (f"Duplicate-evidence warnings correlate with {txt} "
+                         f"win rate ({dup_delta:+.0f}pp). Review double-counting."),
+            })
+
+    if not recommendations:
+        need = max(0, 20 - total_resolved)
+        recommendations.append({
+            "priority": "info",
+            "text": (f"No strong signals yet. "
+                     f"{'Collect more data (' + str(need) + '+ more trades needed).' if need > 0 else 'Model appears calibrated — keep monitoring.'}"),
+        })
+
+    # ── Overall stats ─────────────────────────────────────────────────────────
+    overall_win_rate = _pct(wins, total_resolved)
+    avg_r = round(sum(r_vals) / len(r_vals), 2) if r_vals else None
+
+    return {
+        "enabled":            True,
+        "total_captured":     total_captured,
+        "resolved":           total_resolved,
+        "wins":               wins,
+        "losses":             losses,
+        "overall_win_rate":   overall_win_rate,
+        "avg_r":              avg_r,
+        "component_performance": component_performance,
+        "top_components":     top_components,
+        "bottom_components":  bottom_components,
+        "duplicate_impact":   duplicate_impact,
+        "dup_delta":          dup_delta,
+        "recommendations":    recommendations,
+        "generated_at":       now_utc().isoformat(),
+    }
 
 
 def _make_tfa_ready_id(inst, direction, ts):
@@ -40239,6 +40636,19 @@ def get_source_analytics():
     return jsonify(_build_analytics_report())
 
 
+@app.route("/decision-quality", methods=["GET"])
+def get_decision_quality():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS). Returns the
+    Phase 5F decision quality & signal calibration report from the
+    decision_snapshots DB table. Purely display/analytics — never reads from or
+    writes to scoring, gate, learning, or any production store.
+
+    Report covers: component win-rate-present vs win-rate-absent (Parts 1/3),
+    duplicate-evidence impact on outcome (Part 4), and text recommendations
+    (Part 6) — generated only when supported by statistically meaningful data."""
+    return jsonify(_build_decision_quality_report())
+
+
 @app.route("/eval-metrics", methods=["GET"])
 def get_eval_metrics():
     """Owner-only JSON feed of the last EVAL_METRICS_MAX scored evaluations
@@ -48827,6 +49237,15 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div class="mod-h">📊 Source Attribution Analytics<span class="mod-cat cat-advanced">ADVANCED</span></div>
   <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Read-only evidence audit — which market-data sources (Databento / TradingView / internal) contributed to each scored setup. Never modifies scoring or verdicts. Auto-refreshes every 30&nbsp;s.</div>
   <div id="saa-body"><div style="color:var(--muted);font-size:12px;padding:8px 0">No data yet — results appear after live setups are evaluated.</div></div>
+</div>
+
+<!-- ════ Decision Quality & Signal Calibration (Phase 5F — research/display-only) ════ -->
+<!-- Shows which components actually predict winning trades, based on resolved DB records.
+     Hidden behind Advanced panels toggle. Never modifies scoring or any production state. -->
+<div class="mod" id="mod-decision-quality" data-cat="advanced" style="display:none">
+  <div class="mod-h">🎯 Decision Quality &amp; Signal Calibration<span class="mod-cat cat-advanced">ADVANCED</span></div>
+  <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Which components actually predict winning trades? Populated from live trade outcomes — never modifies scoring, gates, or verdicts. Auto-refreshes every 60&nbsp;s.</div>
+  <div id="dq-body"><div style="color:var(--muted);font-size:12px;padding:8px 0">No resolved trades yet — snapshots populate as READY setups are evaluated and outcomes attached when trades close.</div></div>
 </div>
 
 <!-- VWAP is fetched automatically; manual entry just overrides it temporarily -->
@@ -59885,6 +60304,91 @@ function loadSrcAttr(){
     .catch(function(){});
 }
 (function(){ loadSrcAttr(); setInterval(loadSrcAttr,30000); })();
+
+// ── Decision Quality & Signal Calibration (Phase 5F — display-only) ──────
+// Polls /decision-quality every 60s and renders into #dq-body.
+function _dqEsc(t){
+  return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function renderDQ(d){
+  var el=document.getElementById('dq-body'); if(!el) return;
+  if(!d.enabled){ el.innerHTML='<div style="color:var(--muted);font-size:12px">Decision Quality DB not ready.</div>'; return; }
+  if(!d.resolved){
+    el.innerHTML='<div style="color:var(--muted);font-size:12px;padding:8px 0">'+_dqEsc(d.message||'No resolved trades yet.')+'</div>';
+    return;
+  }
+  // Summary
+  var sumHtml='<div class="se-top">'+
+    '<div class="gstat"><div class="l">Captured</div><div class="v">'+(d.total_captured||0)+'</div></div>'+
+    '<div class="gstat"><div class="l">Resolved</div><div class="v">'+(d.resolved||0)+'</div></div>'+
+    '<div class="gstat"><div class="l">Win Rate</div><div class="v" style="color:var(--green)">'+(d.overall_win_rate!=null?d.overall_win_rate+'%':'—')+'</div></div>'+
+    '<div class="gstat"><div class="l">Avg R</div><div class="v">'+(d.avg_r!=null?d.avg_r+'R':'—')+'</div></div>'+
+    '</div>';
+  // Component performance table
+  var cp=d.component_performance||{}, compKeys=Object.keys(cp), cpRows='';
+  // Sort by predictive_delta desc
+  compKeys.sort(function(a,b){
+    var da=(cp[a].predictive_delta!=null?cp[a].predictive_delta:-999);
+    var db=(cp[b].predictive_delta!=null?cp[b].predictive_delta:-999);
+    return db-da;
+  });
+  for(var i=0;i<compKeys.length;i++){
+    var ck=compKeys[i], cv=cp[ck]||{};
+    var wpStr=cv.win_rate_present!=null?cv.win_rate_present+'%':'—';
+    var waStr=cv.win_rate_absent!=null?cv.win_rate_absent+'%':'—';
+    var dStr=cv.predictive_delta!=null?(cv.predictive_delta>0?'+':'')+cv.predictive_delta+'pp':'—';
+    var dColor=cv.predictive_delta!=null?(cv.predictive_delta>=10?'color:var(--green)':cv.predictive_delta<=-10?'color:var(--red)':''):'';
+    var arStr=cv.avg_r_present!=null?cv.avg_r_present+'R':'—';
+    cpRows+='<tr>'+
+      '<td style="padding:2px 4px">'+ck+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+wpStr+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+waStr+'</td>'+
+      '<td style="text-align:right;padding:2px 4px;'+dColor+'">'+dStr+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+arStr+'</td>'+
+      '<td style="text-align:right;padding:2px 4px;color:#6b7280">'+(cv.present_count||0)+'</td>'+
+      '</tr>';
+  }
+  var cpHtml=cpRows?'<div class="se-bias-h">Component Performance</div>'+
+    '<table style="width:100%;font-size:11px;border-collapse:collapse">'+
+    '<tr>'+
+    '<th style="text-align:left;color:#6b7280;font-weight:normal;padding:2px 4px">Comp</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Win% &amp;#9745;</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Win% &amp;#9744;</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">&Delta;</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Avg R</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">n</th>'+
+    '</tr>'+cpRows+'</table>':'';
+  // Duplicate impact
+  var di=d.duplicate_impact||{}, diWth=di.with_warnings||{}, diWo=di.without_warnings||{};
+  var dupHtml='';
+  if(diWth.count||diWo.count){
+    var dd=d.dup_delta!=null?(d.dup_delta>0?'<span style="color:var(--green)">+'+d.dup_delta+'pp</span>':d.dup_delta<0?'<span style="color:var(--red)">'+d.dup_delta+'pp</span>':'neutral'):'—';
+    dupHtml='<div class="se-bias-h">Duplicate-Evidence Impact</div>'+
+      '<div class="se-top">'+
+      '<div class="gstat"><div class="l">With dup warnings</div><div class="v">'+(diWth.win_rate!=null?diWth.win_rate+'%':'—')+' (n='+diWth.count+')</div></div>'+
+      '<div class="gstat"><div class="l">Without warnings</div><div class="v">'+(diWo.win_rate!=null?diWo.win_rate+'%':'—')+' (n='+diWo.count+')</div></div>'+
+      '<div class="gstat"><div class="l">Delta</div><div class="v">'+dd+'</div></div>'+
+      '</div>';
+  }
+  // Recommendations
+  var recs=d.recommendations||[], recHtml='';
+  if(recs.length){
+    recHtml='<div class="se-bias-h">Recommendations</div>';
+    for(var ri=0;ri<recs.length;ri++){
+      var rc=recs[ri];
+      var rcColor=rc.priority==='high'?'color:#4ade80':rc.priority==='review'?'color:#f87171':'color:#9ca3af';
+      recHtml+='<div class="se-reason" style="font-size:11px;'+rcColor+'">'+_dqEsc(rc.text)+'</div>';
+    }
+  }
+  el.innerHTML=sumHtml+cpHtml+dupHtml+recHtml;
+}
+function loadDQ(){
+  fetch(BASE+'/decision-quality',{cache:'no-store'})
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){if(d)renderDQ(d);})
+    .catch(function(){});
+}
+(function(){ loadDQ(); setInterval(loadDQ,60000); })();
 </script>
 
 </body>
@@ -62828,6 +63332,7 @@ if __name__ == "__main__":
         _load_safety_overrides_from_db()           # load operator safety overrides (FAIL-OPEN: a DB error keeps the tight protective defaults)
         _check_tfa_db_ready()                      # probe trade_failure_analysis (no DDL; created via DB tool/publish diff) — READY decision + failure mode recording (DISPLAY-ONLY)
         _check_market_state_cache_db_ready()       # probe market_state_cache (no DDL; created via DB tool/publish diff) — in-memory market-state persistence (CVD, vol-spike, TP dedup, AUTO_FIRED_KEYS, alert history)
+        _check_dq_db_ready()                       # probe decision_snapshots (no DDL; created via DB tool/publish diff) — decision quality & signal calibration (Phase 5F — DISPLAY-ONLY)
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     if LEARNING_DB_ENABLED:

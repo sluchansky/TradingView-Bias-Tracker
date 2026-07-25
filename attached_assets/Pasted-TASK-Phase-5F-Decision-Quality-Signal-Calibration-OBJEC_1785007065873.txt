@@ -1,0 +1,140 @@
+TASK: Phase 5F — Decision Quality & Signal Calibration
+
+OBJECTIVE
+
+The Source Attribution Analytics panel is now complete.
+
+DO NOT add additional diagnostics unless required for this task.
+
+DO NOT modify Databento ingestion.
+
+DO NOT modify TradingView ingestion.
+
+DO NOT change scoring weights yet.
+
+This phase focuses on determining which score components are actually predictive of successful trades.
+
+----------------------------------------------------
+PART 1 — CAPTURE DECISION SNAPSHOTS
+----------------------------------------------------
+
+Whenever a setup reaches READY or produces an auto-trade candidate, save a read-only snapshot containing:
+
+- timestamp
+- instrument
+- direction
+- session
+- Edge Score
+- Learning delta
+- Final score
+- Verdict
+- Component point breakdown
+- Source attribution
+- Duplicate-evidence diagnostics
+- Evidence age
+- Entry price
+- Stop
+- Target(s)
+
+Store separately from production state.
+
+----------------------------------------------------
+PART 2 — OUTCOME TRACKING
+----------------------------------------------------
+
+When the trade resolves, attach:
+
+- Win
+- Loss
+- Scratch
+- Breakeven
+
+Also record:
+
+- Maximum Favorable Excursion (MFE)
+- Maximum Adverse Excursion (MAE)
+- Time in trade
+- Exit reason
+- Target reached
+- Stop hit
+- Manual exit
+
+----------------------------------------------------
+PART 3 — COMPONENT PERFORMANCE
+----------------------------------------------------
+
+For every scoring component compute:
+
+- Win rate when present
+- Win rate when absent
+- Average R multiple
+- Average MFE
+- Average MAE
+
+Do NOT change component weights.
+
+----------------------------------------------------
+PART 4 — DUPLICATE IMPACT
+----------------------------------------------------
+
+Measure whether duplicate-evidence warnings correlate with:
+
+- Higher win rate
+- Lower win rate
+- No measurable difference
+
+This is analysis only.
+
+----------------------------------------------------
+PART 5 — LEARNING INSIGHTS
+----------------------------------------------------
+
+Create a diagnostics page showing:
+
+Top performing components
+
+Lowest performing components
+
+Most predictive component combinations
+
+Least predictive combinations
+
+Most common duplicate groups
+
+Average evidence age for winning trades
+
+Average evidence age for losing trades
+
+----------------------------------------------------
+PART 6 — RECOMMENDATIONS
+----------------------------------------------------
+
+Generate recommendations only.
+
+Do NOT automatically change:
+
+- scoring
+- gates
+- learning
+- thresholds
+- auto-trading
+
+Recommend changes only when supported by statistically meaningful live data.
+
+----------------------------------------------------
+RULES
+----------------------------------------------------
+
+No production behavior changes.
+
+No scoring changes.
+
+No Databento ingestion changes.
+
+No TradingView ingestion changes.
+
+No auto-trade changes.
+
+No learning changes.
+
+Analytics and recommendations only.

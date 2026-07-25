@@ -239,6 +239,12 @@ export const BOT1_ROUTES = [
   // source distribution, duplicate evidence stats, component correlation,
   // evidence age, and three key research findings. Never modifies any state.
   "/source-analytics",
+  // Phase 5F: Decision quality & signal calibration analytics.
+  // RESEARCH/DISPLAY-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
+  // Reads from decision_snapshots DB table — component win rates, duplicate
+  // evidence impact, evidence age by outcome, and recommendations. Never
+  // modifies scoring, gate, learning, or any production store.
+  "/decision-quality",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.
