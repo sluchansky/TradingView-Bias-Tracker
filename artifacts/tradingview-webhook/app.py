@@ -131,8 +131,11 @@ TFA_DB_READY        = False              # set by _check_tfa_db_ready at boot
 PENDING_TFA_BY_INST = {}                 # inst → ready_id, links READY verdict → triggered trade
 LAST_TFA_BY_INST    = {}                 # inst → {ready_id, direction, ts}, dedup repeated READY webhooks
 LIVE_TFA_BY_INST    = {}                 # inst → ready_id of the most recently triggered trade
-DQ_DB_READY         = False              # set by _check_dq_db_ready at boot
-_DQ_PENDING_BY_INST: dict = {}          # inst → snapshot_key of most-recent unresolved READY (Phase 5F)
+DQ_DB_READY              = False   # set by _check_dq_db_ready at boot
+_DQ_PENDING_BY_SETUP: dict = {}   # fp → {snapshot_key, inst, direction, mode, created_at}  (Phase 5F.1)
+_DQ_SETUP_TTL_MIN        = 240    # expire pending entries older than 4 hours
+_DQ_MAX_PENDING          = 100    # hard cap — prevents unbounded growth
+_DQ_UNMATCHED_CLOSURES   = 0     # closures with no matching pending snapshot (informational)
 # Retained (now unused): historical ENTER serialisation lock. Writes now go
 # through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
@@ -23910,15 +23913,24 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
 
     # ── Decision Quality: capture this READY snapshot (Phase 5F — display-only) ──
     # Mirrors the TFA hook pattern: one INSERT per new READY setup per instrument;
-    # deduped via _DQ_PENDING_BY_INST so heartbeat re-evaluations don't add rows.
+    # deduped via _DQ_PENDING_BY_SETUP fingerprint so heartbeat re-evaluations
+    # don't add rows. WAIT verdict clears the pending entry (Phase 5F.1 fix) so
+    # the next READY on the same instrument+direction is captured fresh.
     try:
+        _dq_inst = instrument_of(active_ticker)
+        _dq_dir  = strict_direction
+        _dq_mode = TRADING_MODE
         if DQ_DB_READY and is_actionable(verdict):
             _capture_decision_snapshot(
-                inst      = instrument_of(active_ticker),
-                direction = strict_direction,
-                mode      = TRADING_MODE,
+                inst      = _dq_inst,
+                direction = _dq_dir,
+                mode      = _dq_mode,
                 result    = result,
             )
+        elif _dq_inst and _dq_dir:
+            # WAIT verdict — clear pending entry so next READY is captured fresh.
+            # Purely in-memory (no DB call). Fail-open via _dq_abandon_setup.
+            _dq_abandon_setup(_dq_fingerprint(_dq_inst, _dq_dir, _dq_mode))
     except Exception as _dq_exc:
         logger.debug("DQ capture fail-open: %s", _dq_exc)
 
@@ -30264,20 +30276,68 @@ def _check_dq_db_ready():
         logger.warning("decision_snapshots table NOT ready: %s — Decision Quality disabled", exc)
 
 
+def _dq_fingerprint(inst, direction, mode):
+    """Build a stable diagnostics fingerprint for setup identity.
+
+    Uses inst + direction + mode so Long/Short and SCALP/SWING are tracked
+    independently. Sequential same-direction setups share the same fingerprint
+    but are distinguished by the WAIT-clearing hook in full_analysis.
+    DIAGNOSTICS-ONLY — never touches the money path."""
+    return f"{inst}::{direction}::{mode}"
+
+
+def _dq_expire_old_entries():
+    """Remove stale entries from _DQ_PENDING_BY_SETUP.
+
+    Evicts entries older than _DQ_SETUP_TTL_MIN and enforces _DQ_MAX_PENDING cap.
+    Called before each INSERT to keep memory bounded. FAIL-OPEN."""
+    global _DQ_PENDING_BY_SETUP
+    try:
+        from datetime import timedelta as _td
+        cutoff  = now_utc() - _td(minutes=_DQ_SETUP_TTL_MIN)
+        expired = [k for k, v in _DQ_PENDING_BY_SETUP.items()
+                   if v.get("created_at", now_utc()) < cutoff]
+        for k in expired:
+            _DQ_PENDING_BY_SETUP.pop(k, None)
+        if len(_DQ_PENDING_BY_SETUP) > _DQ_MAX_PENDING:
+            by_age = sorted(_DQ_PENDING_BY_SETUP.items(),
+                            key=lambda x: x[1].get("created_at", now_utc()))
+            excess = len(_DQ_PENDING_BY_SETUP) - _DQ_MAX_PENDING
+            for k, _ in by_age[:excess]:
+                _DQ_PENDING_BY_SETUP.pop(k, None)
+    except Exception as exc:
+        logger.debug("_dq_expire_old_entries fail-open: %s", exc)
+
+
+def _dq_abandon_setup(fp):
+    """Remove a pending DQ entry when its setup reverts to WAIT.
+
+    Purely in-memory — no DB call. Ensures the next READY setup on the same
+    fingerprint is captured fresh rather than skipped as a heartbeat.
+    FAIL-OPEN — must never block trading."""
+    try:
+        _DQ_PENDING_BY_SETUP.pop(fp, None)
+    except Exception as exc:
+        logger.debug("_dq_abandon_setup fail-open: %s", exc)
+
+
 def _capture_decision_snapshot(inst, direction, mode, result):
     """INSERT a pending decision snapshot when a READY verdict is first detected.
 
-    Deduped via _DQ_PENDING_BY_INST: skips if the same inst+direction is already
-    pending (same setup still READY on heartbeat). Sets _DQ_PENDING_BY_INST[inst]
-    = snapshot_key so _resolve_decision_snapshot can link the outcome at close time.
+    Deduped via _DQ_PENDING_BY_SETUP fingerprint: skips if the same
+    inst+direction+mode setup is already pending (heartbeat re-evaluation).
+    Long/Short and SCALP/SWING are tracked independently. A new READY after WAIT
+    is captured cleanly once _dq_abandon_setup clears the prior entry.
     FAIL-OPEN — never touches scoring, gate, or any money-path variable."""
+    global _DQ_PENDING_BY_SETUP
     if not DQ_DB_READY or not inst or not direction:
         return
     try:
-        # Dedup: skip if this inst+direction setup is already pending
-        _existing = _DQ_PENDING_BY_INST.get(inst) or ""
-        if _existing.startswith(f"{inst}::{direction}::"):
-            return
+        fp = _dq_fingerprint(inst, direction, mode)
+        if fp in _DQ_PENDING_BY_SETUP:
+            return  # heartbeat dedup — same setup still pending
+
+        _dq_expire_old_entries()  # bounded cleanup before inserting
 
         import json as _json
         _now   = now_utc()
@@ -30326,8 +30386,14 @@ def _capture_decision_snapshot(inst, direction, mode, result):
         conn.commit()
         cur.close()
         conn.close()
-        _DQ_PENDING_BY_INST[inst] = key
-        logger.debug("DQ snapshot captured: %s", key)
+        _DQ_PENDING_BY_SETUP[fp] = {
+            "snapshot_key": key,
+            "inst":         inst,
+            "direction":    direction,
+            "mode":         mode,
+            "created_at":   _now,
+        }
+        logger.debug("DQ snapshot captured: %s (fp=%s)", key, fp)
     except Exception as exc:
         logger.debug("_capture_decision_snapshot fail-open: %s", exc)
 
@@ -30335,14 +30401,41 @@ def _capture_decision_snapshot(inst, direction, mode, result):
 def _resolve_decision_snapshot(inst, mt):
     """UPDATE the pending decision snapshot for `inst` with trade outcome data.
 
-    Pops _DQ_PENDING_BY_INST[inst] to get the snapshot_key, then UPDATEs the DB
-    row. If no pending snapshot exists for this instrument, this is a no-op.
+    Looks up _DQ_PENDING_BY_SETUP using inst+direction+mode from mt. The in-memory
+    entry is ALWAYS popped before any DB call, so DQ_DB_READY=False never leaves a
+    blocking pending entry (fixes Phase 5F.1 defect #2).
+    Falls back to inst+direction match when mode is unknown.
     FAIL-OPEN — never touches the money path."""
-    if not DQ_DB_READY or not inst:
+    global _DQ_PENDING_BY_SETUP, _DQ_UNMATCHED_CLOSURES
+    if not inst:
         return
     try:
-        snap_key = _DQ_PENDING_BY_INST.pop(inst, None)
-        if not snap_key:
+        direction = (mt.get("direction") or "").strip()
+        mode      = mt.get("_dq_mode") or TRADING_MODE
+        fp        = _dq_fingerprint(inst, direction, mode)
+
+        # Pop from pending dict FIRST — always, even when DQ_DB_READY=False.
+        entry = _DQ_PENDING_BY_SETUP.pop(fp, None)
+
+        # Fallback: match any pending entry for this inst+direction (mode unknown or
+        # changed). When direction is empty, match any entry for this inst.
+        if entry is None:
+            for k in list(_DQ_PENDING_BY_SETUP.keys()):
+                v = _DQ_PENDING_BY_SETUP[k]
+                if v.get("inst") == inst and (
+                        not direction or v.get("direction") == direction):
+                    entry = _DQ_PENDING_BY_SETUP.pop(k, None)
+                    break
+
+        if entry is None:
+            _DQ_UNMATCHED_CLOSURES += 1
+            return  # no pending snapshot — safe no-op
+
+        snap_key = entry["snapshot_key"]
+
+        if not DQ_DB_READY:
+            logger.debug("DQ resolve: DB unavailable — entry cleared, no DB write for %s",
+                         snap_key)
             return
 
         outcome   = (mt.get("outcome") or "").strip()
@@ -30435,12 +30528,14 @@ def _build_decision_quality_report():
 
     if total_resolved == 0:
         return {
-            "enabled":       True,
-            "total_captured": total_captured,
-            "resolved":      0,
-            "message":       ("No resolved trades yet — snapshots populate as "
-                              "READY setups are evaluated, outcomes attach when "
-                              "trades close."),
+            "enabled":           True,
+            "total_captured":    total_captured,
+            "pending":           len(_DQ_PENDING_BY_SETUP),
+            "unmatched_closures": _DQ_UNMATCHED_CLOSURES,
+            "resolved":          0,
+            "message":           ("No resolved trades yet — snapshots populate as "
+                                  "READY setups are evaluated, outcomes attach when "
+                                  "trades close."),
             "component_performance": {},
             "duplicate_impact":      {},
             "recommendations":       [],
@@ -30597,6 +30692,8 @@ def _build_decision_quality_report():
     return {
         "enabled":            True,
         "total_captured":     total_captured,
+        "pending":            len(_DQ_PENDING_BY_SETUP),
+        "unmatched_closures": _DQ_UNMATCHED_CLOSURES,
         "resolved":           total_resolved,
         "wins":               wins,
         "losses":             losses,
