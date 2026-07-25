@@ -45511,10 +45511,9 @@ def dashboard():
   .orb-defend .char-lid{animation-duration:2s}
   .mb-av-state{font-size:22px;font-weight:800;letter-spacing:2.5px;line-height:1;margin-bottom:5px;transition:color .5s;text-shadow:0 0 24px currentColor}
   .mb-av-ctx{font-size:11px;letter-spacing:.4px;margin-bottom:9px;min-height:14px;transition:color .4s,opacity .3s;text-align:center;font-style:italic;opacity:.9}
-  /* ── Brain-first 3-column layout: LEFT (controls) · CENTER (Main Brain) · RIGHT (compact state) ── */
+  /* ── Brain layout: CENTER (Main Brain) · RIGHT (compact state) ── */
   #view-live{display:flex;flex-direction:column}
   #live-layout{order:0;display:grid;grid-template-columns:1fr 300px;gap:14px;align-items:start;margin-bottom:12px}
-  #bl-left{display:none!important}
   #bl-center{min-width:0}
   #bl-right{min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:8px;align-self:start}
   /* Compact cards in bl-right — not .mod so drag-reorder ignores them */
@@ -45538,23 +45537,7 @@ def dashboard():
   #view-live > .mod{order:61}
   /* Pre-brain non-.mod elements */
   #view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{order:60}
-  /* bl-left compact controls */
-  .bl-sect-h{font-size:9px;text-transform:uppercase;letter-spacing:1.4px;color:#4b5563;font-weight:700;margin:0 0 5px;padding:0 1px}
-  .bl-mode-seg{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
-  .bl-mode-btn{border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:11px;font-weight:700;cursor:pointer;text-align:center;color:var(--muted);transition:all .18s;letter-spacing:.4px;background:rgba(255,255,255,.02)}
-  .bl-mode-btn:hover{border-color:rgba(239,68,68,.30);color:var(--text)}
-  .bl-mode-btn.active{border-color:rgba(239,68,68,.55);color:#dfe4ff;background:var(--amber-deep)}
-  .bl-inst-tabs{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
-  .bl-inst-tab{border:1px solid var(--border);border-radius:7px;padding:7px 9px;font-size:11px;font-weight:700;cursor:pointer;display:flex;justify-content:space-between;align-items:center;color:var(--muted);transition:all .18s;background:rgba(255,255,255,.02);letter-spacing:.3px}
-  .bl-inst-tab:hover{border-color:rgba(239,68,68,.28);color:var(--text)}
-  .bl-inst-tab.active{border-color:rgba(239,68,68,.55);color:#dfe4ff;background:var(--amber-deep)}
-  .bl-inst-sub{font-size:9px;font-weight:400;letter-spacing:.4px;opacity:.6}
-  .bl-inst-tab.active .bl-inst-sub{opacity:.8}
-  .bl-ctrl-row{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
-  .bl-ctrl-pill{border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:10px;cursor:pointer;color:var(--muted);background:rgba(255,255,255,.02);transition:all .16s;display:flex;justify-content:space-between;align-items:center;letter-spacing:.3px;user-select:none}
-  .bl-ctrl-pill:hover{border-color:rgba(239,68,68,.25);color:var(--text)}
-  .bl-ctrl-pill.on{color:#22c55e;border-color:rgba(34,197,94,.3)}
-  .bl-ctrl-pill.muted{color:#ef4444;border-color:rgba(239,68,68,.3)}
+
   /* ── Terminal header nav bar ── */
   #tp-hdr{display:flex;align-items:center;gap:10px;padding:8px 14px;background:rgba(0,0,0,.95);border:1px solid rgba(239,68,68,.18);border-radius:14px;margin-bottom:10px;-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px)}
   .tp-logo{display:flex;align-items:center;gap:9px;flex-shrink:0;min-width:0}
@@ -45615,22 +45598,7 @@ def dashboard():
   .sv2-bd-b{height:100%;border-radius:2px;transition:width .3s}
   .sv2-bd-pts{color:#c8d0f0;font-size:9.5px;font-weight:700;min-width:28px;text-align:right}
   .sv2-rr{font-size:9px;color:#6b7280;margin-left:4px}
-  /* ── Left column avatar + market context ── */
-  .bl-av-wrap{text-align:center;padding:6px 0 8px;border-bottom:1px solid rgba(239,68,68,.10);margin-bottom:10px}
-  .bl-av-img{width:70px;height:70px;margin:0 auto 5px;display:block;border-radius:50%;filter:drop-shadow(0 0 10px rgba(239,68,68,.28))}
-  #bl-av-state-lbl{font-size:7.5px;letter-spacing:2px;text-transform:uppercase;color:#374151;font-weight:700;text-align:center;margin-bottom:6px}
-  .bl-av-chat-btn{width:100%;padding:6px 4px;font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-radius:7px;border:1px solid rgba(239,68,68,.28);color:#ef4444;background:rgba(34,197,94,.05);cursor:pointer;margin-bottom:10px;transition:all .16s;font-family:var(--sans)}
-  .bl-av-chat-btn:hover{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.45)}
 
-  .bl-mc-tbl{width:100%;border-collapse:collapse;font-size:10px;margin-bottom:10px}
-  .bl-mc-tbl td{padding:4px 2px;border-bottom:1px solid rgba(255,255,255,.06)}
-  .bl-mc-tbl tr:last-child td{border-bottom:none}
-  .bl-mc-tbl td:first-child{color:#4b5563;text-transform:uppercase;letter-spacing:.3px;font-size:9px;font-weight:700;width:55%}
-  .bl-mc-tbl td:last-child{color:#cccccc;text-align:right;font-weight:600;font-size:10px}
-  .bl-perf-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:10px}
-  .bl-perf-cell{background:rgba(255,255,255,.02);border:1px solid rgba(239,68,68,.08);border-radius:6px;padding:5px;text-align:center}
-  .bl-perf-label{font-size:7.5px;color:#4b5563;text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px;font-weight:700}
-  .bl-perf-val{font-size:12px;font-weight:800;color:#cccccc;font-family:var(--sans);line-height:1.1}
   /* ── Right column additions ── */
   .blr-obs-tbl{width:100%;border-collapse:collapse;font-size:10.5px}
   .blr-obs-tbl td{padding:4px 4px;border-bottom:1px solid rgba(255,255,255,.07)}
@@ -45638,7 +45606,7 @@ def dashboard():
   .blr-obs-tbl td:first-child{color:#6b7280;font-size:9.5px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap;width:52%}
   .blr-obs-tbl td:last-child{color:#e8e8e8;text-align:right;font-weight:600}
   /* Responsive: single column on small screens — show drawer inline */
-  @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-left,#bl-right{display:none}#view-live{display:block}#view-live > .mod:not(.ln-hidden),#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}#view-live > .mod.ln-hidden{display:none!important}}
+  @media(max-width:960px){#live-layout{grid-template-columns:1fr}#bl-right{display:none}#view-live{display:block}#view-live > .mod:not(.ln-hidden),#view-live > #mode-row,#view-live > #adv-row,#view-live > #status-card,#view-live > #rec-card{display:block !important;order:unset}#view-live > .mod.ln-hidden{display:none!important}}
   .mb-av-meta{font-size:11px;color:#6b7280;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
   .mb-av-sep{color:#2d2d40;font-size:14px}
   .mb-av-foot{font-size:10px;letter-spacing:.5px;margin-top:10px;display:flex;align-items:center;justify-content:center;gap:10px;color:#4b5563}
@@ -46033,7 +46001,7 @@ details[open]>.grp-summary .grp-arrow{transform:rotate(90deg)}
   #live-nav::-webkit-scrollbar{display:none}
   .ln-btn{flex:0 0 auto;padding:5px 10px;font-size:9px;letter-spacing:.4px}
   #live-layout{display:block!important}
-  #bl-left,#bl-right{display:none!important}
+  #bl-right{display:none!important}
   #bl-center{width:100%!important;min-width:0!important}
   #bl-bottom,#bl-drawer-row{display:none!important}
   .mod{padding:12px 10px;margin-bottom:8px}
@@ -46650,60 +46618,6 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
        ═══════════════════════════════════════════════════════════════════════════ -->
 <div id="live-layout">
 
-  <!-- LEFT COLUMN ── avatar + market context + compact controls -->
-  <div id="bl-left">
-
-    <!-- Avatar -->
-    <div class="bl-av-wrap">
-      <img class="bl-av-img" src="https://api.dicebear.com/10.x/lorelei-neutral/svg?seed=pys3xwsp" alt="avatar" crossorigin="anonymous"/>
-      <div id="bl-av-state-lbl">OBSERVING</div>
-      <button class="bl-av-chat-btn" onclick="var c=document.getElementById('mb-chat-input');if(c){c.scrollIntoView({behavior:'smooth'});setTimeout(function(){c.focus();},300);}">TALK TO AI</button>
-    </div>
-
-    <!-- Market Context -->
-    <div class="bl-sect-h">Market Context</div>
-    <table class="bl-mc-tbl">
-      <tr><td>Trend</td><td id="blmc-trend">—</td></tr>
-      <tr><td>Momentum</td><td id="blmc-momentum">—</td></tr>
-      <tr><td>Volatility</td><td id="blmc-volatility">—</td></tr>
-      <tr><td>Liquidity</td><td id="blmc-liquidity">—</td></tr>
-    </table>
-    <!-- Performance -->
-    <div class="bl-sect-h">Performance</div>
-    <div class="bl-perf-grid">
-      <div class="bl-perf-cell"><div class="bl-perf-label">Win Rate</div><div class="bl-perf-val" id="blp-winrate">—</div></div>
-      <div class="bl-perf-cell"><div class="bl-perf-label">Avg R:R</div><div class="bl-perf-val" id="blp-rr">—</div></div>
-    </div>
-    <div class="bl-sect-h">Mode</div>
-    <div class="bl-mode-seg">
-      <div class="bl-mode-btn active" id="bl-mode-scalp" onclick="setMode('SCALP')">SCALP<span style="font-weight:400;opacity:.6;font-size:9px;display:block;letter-spacing:.3px">Sensitive</span></div>
-      <div class="bl-mode-btn" id="bl-mode-swing" onclick="setMode('SWING')">SWING<span style="font-weight:400;opacity:.6;font-size:9px;display:block;letter-spacing:.3px">Strict</span></div>
-    </div>
-
-    <div class="bl-sect-h">Market</div>
-    <div class="bl-inst-tabs">
-      <div class="bl-inst-tab active" data-tk="MGC" onclick="userPickedSetup=true;setSymbol('MGC')">MGC<span class="bl-inst-sub">Gold</span></div>
-      <div class="bl-inst-tab" data-tk="MNQ" onclick="userPickedSetup=true;setSymbol('MNQ')">MNQ<span class="bl-inst-sub">Nasdaq</span></div>
-      <div class="bl-inst-tab" data-tk="MES" onclick="userPickedSetup=true;setSymbol('MES')">MES<span class="bl-inst-sub">S&amp;P</span></div>
-      <div class="bl-inst-tab" data-tk="MYM" onclick="userPickedSetup=true;setSymbol('MYM')">MYM<span class="bl-inst-sub">Dow</span></div>
-    </div>
-
-    <div class="bl-sect-h">Alerts</div>
-    <div class="bl-ctrl-row">
-      <div class="bl-ctrl-pill" id="bl-mute-MGC" role="button" tabindex="0" onclick="toggleMute('MGC')"><span>MGC</span><span id="bl-mute-MGC-lbl">🔔 on</span></div>
-      <div class="bl-ctrl-pill" id="bl-mute-MNQ" role="button" tabindex="0" onclick="toggleMute('MNQ')"><span>MNQ</span><span id="bl-mute-MNQ-lbl">🔔 on</span></div>
-      <div class="bl-ctrl-pill" id="bl-mute-MES" role="button" tabindex="0" onclick="toggleMute('MES')"><span>MES</span><span id="bl-mute-MES-lbl">🔔 on</span></div>
-      <div class="bl-ctrl-pill" id="bl-mute-MYM" role="button" tabindex="0" onclick="toggleMute('MYM')"><span>MYM</span><span id="bl-mute-MYM-lbl">🔔 on</span></div>
-    </div>
-
-    <div class="bl-sect-h">Auto-trade</div>
-    <div class="bl-ctrl-row">
-      <div class="bl-ctrl-pill" id="bl-auto-MGC" role="button" tabindex="0" onclick="toggleAuto('MGC')"><span>MGC</span><span id="bl-auto-MGC-lbl">off</span></div>
-      <div class="bl-ctrl-pill" id="bl-auto-MNQ" role="button" tabindex="0" onclick="toggleAuto('MNQ')"><span>MNQ</span><span id="bl-auto-MNQ-lbl">off</span></div>
-      <div class="bl-ctrl-pill" id="bl-auto-MES" role="button" tabindex="0" onclick="toggleAuto('MES')"><span>MES</span><span id="bl-auto-MES-lbl">off</span></div>
-      <div class="bl-ctrl-pill" id="bl-auto-MYM" role="button" tabindex="0" onclick="toggleAuto('MYM')"><span>MYM</span><span id="bl-auto-MYM-lbl">off</span></div>
-    </div>
-  </div><!-- /#bl-left -->
 
   <!-- ── MAIN BRAIN SUMMARY ── Compact verdict card (DISPLAY-ONLY, Brain Contract) ── -->
   <div id="main-brain-summary" data-testid="main-brain-summary">
@@ -58232,38 +58146,6 @@ function renderBLPanels(d){
   var at   = d.active_trade || null;
   var diag = d.alert_diagnostics || {};
 
-  // Instrument tabs in bl-left
-  if(inst){
-    document.querySelectorAll('.bl-inst-tab').forEach(function(t){
-      t.classList.toggle('active', t.dataset.tk===inst);
-    });
-  }
-
-  // Mode buttons in bl-left (mirror from existing authoritative #mode-scalp/#mode-swing)
-  var mS = document.getElementById('bl-mode-scalp'), mW = document.getElementById('bl-mode-swing');
-  var srcS = document.getElementById('mode-scalp'), srcW = document.getElementById('mode-swing');
-  if(mS && srcS) mS.classList.toggle('active', srcS.classList.contains('active'));
-  if(mW && srcW) mW.classList.toggle('active', srcW.classList.contains('active'));
-
-  // Mirror mute / auto pills from existing authoritative pills
-  ['MGC','MNQ','MES','MYM'].forEach(function(sym){
-    var ms = document.getElementById('mute-'+sym);
-    var ml = document.getElementById('bl-mute-'+sym+'-lbl');
-    var mc = document.getElementById('bl-mute-'+sym);
-    if(ms && ml && mc){
-      var muted = (ms.textContent||'').indexOf('off')!==-1;
-      mc.classList.toggle('muted', muted);
-      ml.textContent = muted ? '\U0001F515 muted' : '\U0001F514 on';
-    }
-    var as = document.getElementById('auto-'+sym);
-    var al = document.getElementById('bl-auto-'+sym+'-lbl');
-    var ac = document.getElementById('bl-auto-'+sym);
-    if(as && al && ac){
-      var aon = (as.textContent||'').indexOf(': on')!==-1;
-      ac.classList.toggle('on', aon);
-      al.textContent = aon ? 'AUTO' : 'off';
-    }
-  });
 
   // Verdict panel
   var vEl  = document.getElementById('blv-verdict');
@@ -58526,21 +58408,6 @@ function renderBLPanels(d){
     }
   })();
 
-  // ── Left column: avatar state + market context + performance ──
-  var blAvSt=document.getElementById('bl-av-state-lbl');
-  if(blAvSt){blAvSt.textContent=isActn?'TRADING':'OBSERVING';}
-  var hbias=String(d.bias||d.trend_bias||d.htf_bias||'');
-  var mcTrend=document.getElementById('blmc-trend');var mcMom=document.getElementById('blmc-momentum');
-  var mcVol=document.getElementById('blmc-volatility');var mcLiq=document.getElementById('blmc-liquidity');
-  if(mcTrend)mcTrend.textContent=hbias?hbias.toUpperCase():'\u2014';
-  if(mcMom)mcMom.textContent=hcvdDir?hcvdDir.toUpperCase():'\u2014';
-  if(mcVol)mcVol.textContent=hvolReg?hvolReg.toUpperCase():'NORMAL';
-  var swpAge=hdiag.sweep_age_min||hdiag.latest_sweep_age;
-  if(mcLiq)mcLiq.textContent=swpAge!=null?(Number(swpAge)<5?'RECENT SWEEP':'Last '+Math.round(Number(swpAge))+'m ago'):'\u2014';
-  var lstats=d.learning_stats||d.strategy_stats||d.daily_stats||{};
-  var winrEl=document.getElementById('blp-winrate');var avgrrEl=document.getElementById('blp-rr');
-  if(winrEl){var wr=lstats.win_rate!=null?Math.round(Number(lstats.win_rate)*100)+'%':(d.win_rate!=null?Math.round(Number(d.win_rate)*100)+'%':'\u2014');winrEl.textContent=wr;}
-  if(avgrrEl){var ar=lstats.avg_rr!=null?Number(lstats.avg_rr).toFixed(1)+'R':(d.avg_rr!=null?Number(d.avg_rr).toFixed(1)+'R':'\u2014');avgrrEl.textContent=ar;}
 
   // ── Right column: market structure + levels ──
   var hgd3=d.gate_debug||{};
