@@ -324,6 +324,12 @@ RVOL_BY_TICKER      = {}
 # spike is only "fresh" for VOLUME_SPIKE_TTL_MIN minutes after it arrives.
 # {"MNQ": {"ts": iso}, "MGC": {"ts": iso}}
 VOLUME_SPIKE_BY_TICKER = {}
+# Parallel diagnostics-only dict: tracks which market-data source last wrote each
+# key input per instrument.  DISPLAY-ONLY — never read by the gate or money path.
+# Shape: {inst: {field: {source: str, updated_at: iso8601}}}
+# Populated as a side-effect of _compute_score_source_attribution (called from
+# full_analysis); reset to {} on server restart.
+MARKET_INPUT_SOURCE_BY_TICKER: dict = {}
 # Server-side dedup for CONFIRMATION alerts — applies to both TradingView and
 # Databento sources. Mirrors DatabentoBrain.CONFIRM_COOLDOWN_MIN (15 min).
 # Same-direction confirmations are suppressed for CONFIRM_COOLDOWN_MIN minutes
@@ -10447,6 +10453,320 @@ def _strategy_weight_for(key, mode=None):
         w = STRATEGY_WEIGHTS.get(ns, STRATEGY_WEIGHTS.get(key, 1.0))
         n = LEARNING_SAMPLE_BY_KEY.get(ns, LEARNING_SAMPLE_BY_KEY.get(key, 0))
     return (w, n)
+
+
+def _compute_score_source_attribution(inst, alert_history_snapshot, now_dt):
+    """Build a 7-component source attribution list for the Edge Score.
+
+    DISPLAY/DIAGNOSTIC ONLY — never alters scores, gate thresholds, or any
+    production path. FAIL-OPEN: any exception returns [].
+
+    For each of the seven Edge Score components (BOS20, CHOCH20, Sweep15,
+    VWAP15, Volume15, CVD15, Session10) this reads the source field from the
+    existing shared state stores and ALERT_HISTORY event records to determine
+    whether that component's evidence last came from Databento, TradingView,
+    internal calculation, or an unknown source.
+
+    As a side-effect, updates MARKET_INPUT_SOURCE_BY_TICKER[inst] so the
+    parallel diagnostics table stays current without any extra caller.
+    """
+    if not inst:
+        return []
+    try:
+        _now = now_dt or datetime.now(timezone.utc)
+
+        def _age(ts_str):
+            if not ts_str:
+                return None
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                return round((_now - ts).total_seconds(), 1)
+            except Exception:
+                return None
+
+        def _normalize_src(raw):
+            """Map raw instrument_source / source strings to canonical labels."""
+            if not raw:
+                return "unknown"
+            if raw in ("databento", "databento_brain"):
+                return "databento"
+            if raw in ("chart", "alert", "tradingview", "ticker", "symbol"):
+                return "tradingview"
+            return "unknown"
+
+        def _alert_source(alert_types, ticker_scoped=False):
+            """(source, iso_ts, age_s) for the most recent matching alert.
+            `ticker_scoped=True` means the inst is embedded in the alert_type
+            string (sweeps, confirmations); otherwise filter by `instrument`."""
+            best_ts  = None
+            best_src = None
+            best_raw = None
+            for a in alert_history_snapshot:
+                at = a.get("alert_type", "")
+                if at not in alert_types:
+                    continue
+                if not ticker_scoped:
+                    a_inst = (a.get("instrument")
+                              or _instrument_from_text(a.get("ticker") or "")
+                              or _instrument_from_text(at))
+                    if a_inst != inst:
+                        continue
+                try:
+                    ts = datetime.fromisoformat(a["timestamp"])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except (KeyError, ValueError):
+                    continue
+                if best_ts is None or ts > best_ts:
+                    best_ts  = ts
+                    best_raw = a["timestamp"]
+                    best_src = _normalize_src(a.get("instrument_source") or "")
+            return best_src or "unknown", best_raw, _age(best_raw)
+
+        def _store_source(store_dict):
+            """(source, iso_ts, age_s) from a shared state-store record."""
+            rec    = store_dict.get(inst) or {}
+            raw    = rec.get("source") or ""
+            ts_str = rec.get("ts")
+            return _normalize_src(raw), ts_str, _age(ts_str)
+
+        bos_src,   bos_ts,   bos_age   = _alert_source({"BOS DEMAND", "BOS SUPPLY"})
+        choch_src, choch_ts, choch_age = _alert_source({"CHOCH DEMAND", "CHOCH SUPPLY"})
+        sweep_src, sweep_ts, sweep_age = _alert_source(
+            {f"{inst} BULLISH SWEEP", f"{inst} BEARISH SWEEP"}, ticker_scoped=True)
+        vwap_src,  vwap_ts,  vwap_age  = _store_source(VWAP_BY_TICKER)
+        rvol_src,  rvol_ts,  _         = _store_source(RVOL_BY_TICKER)
+        vs_src,    vs_ts,    _         = _store_source(VOLUME_SPIKE_BY_TICKER)
+        # Volume15 evidence: pick whichever store has the fresher write.
+        if rvol_ts and vs_ts:
+            vol_src = rvol_src if rvol_ts >= vs_ts else vs_src
+            vol_ts  = rvol_ts  if rvol_ts >= vs_ts else vs_ts
+        else:
+            vol_src = rvol_src or vs_src or "unknown"
+            vol_ts  = rvol_ts  or vs_ts
+        cvd_src, cvd_ts, cvd_age = _store_source(CVD_BY_TICKER)
+
+        components = [
+            {"component": "BOS",     "points": 20, "source": bos_src,
+             "source_timestamp": bos_ts,   "age_seconds": bos_age},
+            {"component": "CHOCH",   "points": 20, "source": choch_src,
+             "source_timestamp": choch_ts, "age_seconds": choch_age},
+            {"component": "Sweep",   "points": 15, "source": sweep_src,
+             "source_timestamp": sweep_ts, "age_seconds": sweep_age},
+            {"component": "VWAP",    "points": 15, "source": vwap_src,
+             "source_timestamp": vwap_ts,  "age_seconds": vwap_age},
+            {"component": "Volume",  "points": 15, "source": vol_src,
+             "source_timestamp": vol_ts,   "age_seconds": _age(vol_ts)},
+            {"component": "CVD",     "points": 15, "source": cvd_src,
+             "source_timestamp": cvd_ts,   "age_seconds": cvd_age},
+            {"component": "Session", "points": 10, "source": "internal",
+             "source_timestamp": None,     "age_seconds": None},
+        ]
+
+        # Side-effect: keep MARKET_INPUT_SOURCE_BY_TICKER current.
+        MARKET_INPUT_SOURCE_BY_TICKER[inst] = {
+            c["component"].lower(): {
+                "source":     c["source"],
+                "updated_at": c["source_timestamp"],
+            }
+            for c in components
+        }
+
+        return components
+    except Exception:
+        return []
+
+
+def _audit_double_counting(inst, source_attribution):
+    """Flag market evidence that appears in multiple Edge Score components.
+
+    Returns a list of diagnostic-only warning dicts describing probable
+    double-counting. Scores and verdicts are NEVER changed. FAIL-OPEN.
+
+    Checks three known overlap patterns:
+      1. CVD + Volume — both derive from the Databento trade-tape aggregator.
+      2. Sweep + Volume/CVD — a liquidity sweep implies a volume burst.
+      3. BOS + CHOCH both from Databento — same structural bar can fire both.
+    """
+    warnings = []
+    if not inst or not source_attribution:
+        return warnings
+    try:
+        def _src(name):
+            for c in source_attribution:
+                if c.get("component") == name:
+                    return c.get("source", "unknown")
+            return "unknown"
+
+        cvd_s   = _src("CVD")
+        vol_s   = _src("Volume")
+        sweep_s = _src("Sweep")
+        bos_s   = _src("BOS")
+        choch_s = _src("CHOCH")
+
+        if cvd_s == "databento" and vol_s == "databento":
+            warnings.append({
+                "possible_duplicate": True,
+                "evidence_group":     "buying_pressure",
+                "components":         ["CVD", "Volume"],
+                "sources":            ["databento"],
+                "score_impact":       30,
+                "reason": (
+                    "CVD (net aggressor delta) and Volume (RVOL/spike) both derive "
+                    "from the same Databento trade-tape feed. A single burst of "
+                    "buy-aggressor prints can score both components simultaneously."
+                ),
+                "action": "diagnostic_only",
+            })
+
+        if sweep_s == "databento" and (vol_s == "databento" or cvd_s == "databento"):
+            overlap = [c for c in ("Volume", "CVD")
+                       if _src(c) == "databento"]
+            warnings.append({
+                "possible_duplicate": True,
+                "evidence_group":     "sweep_volume_overlap",
+                "components":         ["Sweep"] + overlap,
+                "sources":            ["databento"],
+                "score_impact":       15 + 15 * len(overlap),
+                "reason": (
+                    "A Databento sweep event (wick beyond range, close back inside) "
+                    "is typically accompanied by a volume spike. The same 1-min bar "
+                    "may simultaneously score Sweep15 and Volume15/CVD15."
+                ),
+                "action": "diagnostic_only",
+            })
+
+        if bos_s == "databento" and choch_s == "databento":
+            warnings.append({
+                "possible_duplicate": True,
+                "evidence_group":     "structure_overlap",
+                "components":         ["BOS", "CHOCH"],
+                "sources":            ["databento"],
+                "score_impact":       40,
+                "reason": (
+                    "BOS and CHOCH both sourced from Databento. They are "
+                    "semantically distinct (BOS = prior swing broken, CHOCH = "
+                    "first break against prior trend) but a single bar-close pivot "
+                    "can simultaneously trigger both detectors."
+                ),
+                "action": "diagnostic_only",
+            })
+
+    except Exception:
+        pass
+    return warnings
+
+
+def _audit_event_duplicates(inst, alert_history_snapshot, window_seconds=120, now_dt=None):
+    """Scan ALERT_HISTORY for probable TradingView / Databento duplicate events.
+
+    Identifies pairs with the same instrument, same canonical event type, same
+    direction, within `window_seconds`, and different source labels. Returns a
+    diagnostic-only list. Events are NEVER removed, merged, or suppressed.
+    FAIL-OPEN.
+
+    `now_dt` (UTC datetime) defaults to datetime.now(timezone.utc). Pass a
+    fixed value in unit tests so the hour-look-back cutoff is deterministic.
+
+    The canonical type is inferred from the alert_type string:
+      BOS / CHOCH / SWEEP / CONFIRM / HH / HL / LH / LL / VWAP / other.
+    """
+    warnings = []
+    try:
+        now_dt  = now_dt or datetime.now(timezone.utc)
+        cutoff  = now_dt - timedelta(hours=1)   # inspect last hour only
+
+        def _canonical(at):
+            at_up = at.upper()
+            for kw in ("BOS", "CHOCH", "SWEEP", "CONFIRMATION", "VWAP"):
+                if kw in at_up:
+                    return kw
+            for kw in ("HH", "HL", "LH", "LL"):
+                if at_up.strip() == kw:
+                    return kw
+            return at_up.strip()
+
+        def _direction(at):
+            au = at.upper()
+            if any(k in au for k in ("DEMAND", "BULLISH", " HH", " HL")):
+                return "long"
+            if any(k in au for k in ("SUPPLY", "BEARISH", " LH", " LL")):
+                return "short"
+            return "neutral"
+
+        events = []
+        for a in alert_history_snapshot:
+            at = a.get("alert_type", "")
+            a_inst = (a.get("instrument")
+                      or _instrument_from_text(a.get("ticker") or "")
+                      or _instrument_from_text(at))
+            if a_inst != inst:
+                continue
+            try:
+                ts = datetime.fromisoformat(a["timestamp"])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (KeyError, ValueError):
+                continue
+            if ts < cutoff:
+                continue
+            raw_src = a.get("instrument_source") or ""
+            source  = ("databento"   if raw_src == "databento"
+                       else "tradingview" if raw_src else "unknown")
+            events.append({
+                "alert_type": at,
+                "canonical":  _canonical(at),
+                "direction":  _direction(at),
+                "source":     source,
+                "ts":         ts,
+                "ts_iso":     a.get("timestamp"),
+            })
+
+        reported = set()
+        for i, ev in enumerate(events):
+            for j in range(i + 1, len(events)):
+                other = events[j]
+                if ev["canonical"] != other["canonical"]:
+                    continue
+                if ev["direction"] != other["direction"]:
+                    continue
+                if ev["source"] == other["source"]:
+                    continue
+                gap = abs((ev["ts"] - other["ts"]).total_seconds())
+                if gap > window_seconds:
+                    continue
+                pair_key = (
+                    min(ev["canonical"], other["canonical"]),
+                    ev["direction"],
+                    round(gap),
+                )
+                if pair_key in reported:
+                    continue
+                reported.add(pair_key)
+                warnings.append({
+                    "probable_duplicate": True,
+                    "instrument":         inst,
+                    "canonical_type":     ev["canonical"],
+                    "direction":          ev["direction"],
+                    "event_a":  {
+                        "alert_type": ev["alert_type"],
+                        "source":     ev["source"],
+                        "ts":         ev["ts_iso"],
+                    },
+                    "event_b":  {
+                        "alert_type": other["alert_type"],
+                        "source":     other["source"],
+                        "ts":         other["ts_iso"],
+                    },
+                    "gap_seconds":    round(gap, 1),
+                    "window_seconds": window_seconds,
+                    "action":         "diagnostic_only",
+                })
+    except Exception:
+        pass
+    return warnings
 
 
 def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_status, volatility):
@@ -22079,6 +22399,26 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         "Long":      _ls_dir_summary("Long"),
         "Short":     _ls_dir_summary("Short"),
     }
+
+    # ── Source attribution diagnostics (display-only audit; never alters scoring) ──
+    # Identifies which market-data source (Databento / TradingView / internal) last
+    # wrote each of the seven Edge Score component inputs.  Also flags probable
+    # double-counting patterns and TV/Databento duplicate events diagnostically.
+    # FAIL-OPEN: any exception leaves the result keys empty so the gate is unaffected.
+    try:
+        _ah_snap   = list(ALERT_HISTORY)
+        _audit_now = now_utc()
+        _src_attr  = _compute_score_source_attribution(active_ticker, _ah_snap, _audit_now)
+        _src_dupes = _audit_event_duplicates(active_ticker, _ah_snap, now_dt=_audit_now)
+        _src_dbl   = _audit_double_counting(active_ticker, _src_attr)
+        result["source_attribution"] = _src_attr
+        result["source_audit"] = {
+            "double_counting_warnings": _src_dbl,
+            "duplicate_events":         _src_dupes,
+        }
+    except Exception:
+        result["source_attribution"] = []
+        result["source_audit"]       = {}
 
     # ── Tiered alert level (SCALP early-warning ladder) — additive, DISPLAY-ONLY.
     #    Computed independently of the verdict; it NEVER alters verdict / score /
@@ -40376,6 +40716,8 @@ def _build_status_payload(_tk):
         "strict_missing":      a.get("strict_missing"),
         "gate_debug":          a.get("gate_debug"),
         "learning_score_influence": a.get("learning_score_influence"),
+        "source_attribution":  a.get("source_attribution"),
+        "source_audit":        a.get("source_audit"),
         "confluences":         a.get("confluences"),
         "directions":          a.get("directions"),
         "vwap_value":          a.get("vwap_value"),
