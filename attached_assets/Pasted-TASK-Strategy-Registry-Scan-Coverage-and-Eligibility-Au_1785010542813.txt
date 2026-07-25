@@ -1,0 +1,555 @@
+TASK: Strategy Registry, Scan Coverage, and Eligibility Audit
+
+CRITICAL CONTEXT
+
+The system may contain approximately 19 strategies, but it is unclear whether
+all strategies are:
+
+- registered
+- enabled
+- eligible
+- evaluated
+- producing candidates
+- included in final strategy selection
+
+This task is an audit and diagnostics task first.
+
+DO NOT enable additional strategies yet.
+
+DO NOT change strategy logic.
+
+DO NOT change Edge Scores.
+
+DO NOT change strategy weights.
+
+DO NOT change READY / WAIT verdicts.
+
+DO NOT change auto-trade eligibility.
+
+DO NOT change execution behavior.
+
+DO NOT change Databento or TradingView ingestion.
+
+OBJECTIVE
+
+Trace the complete strategy-selection pipeline and prove exactly which strategies
+exist, which are scanned, which are excluded, and why.
+
+The final report must establish whether all intended strategies are being tested
+on every applicable evaluation cycle.
+
+----------------------------------------------------
+PART 1 — PRE-FLIGHT
+----------------------------------------------------
+
+Before modifying code, capture:
+
+git branch --show-current
+git rev-parse HEAD
+git status --short
+git diff --check
+
+Run the existing strategy, scoring, learning, decision-trace, and golden tests.
+
+STOP and report before modifying code if:
+
+- Existing tests fail
+- HEAD changes unexpectedly
+- Strategy registry ownership is unclear
+- Multiple independent strategy registries exist
+- Strategy evaluation directly mutates production state
+- Enabling diagnostics would require changing strategy results
+- Strategies are already being double-evaluated in production
+
+Do not repair a stop-condition finding during this task.
+
+----------------------------------------------------
+PART 2 — INVENTORY EVERY STRATEGY
+----------------------------------------------------
+
+Find every strategy definition in the repository.
+
+Inspect:
+
+- strategy classes
+- strategy functions
+- registry dictionaries
+- strategy lists
+- decorators
+- imports
+- aliases
+- display names
+- strategy keys
+- legacy strategy names
+- scalp strategies
+- swing strategies
+- micro-scalp strategies
+- shared strategies
+- experimental strategies
+- disabled strategies
+
+Produce a canonical inventory table containing:
+
+1. Strategy key
+2. Display name
+3. Defining file
+4. Defining function or class
+5. Registered today?
+6. Enabled today?
+7. Mode eligibility
+8. Instrument eligibility
+9. Session eligibility
+10. Direction eligibility
+11. Minimum-data requirements
+12. Feature-flag requirements
+13. Call site
+14. Can produce a candidate?
+15. Can reach final selection?
+16. Can reach Edge Score?
+17. Can reach auto-trade consideration?
+18. Reason excluded, if excluded
+
+Do not assume there are exactly 19 strategies.
+
+Report the actual number found.
+
+Identify:
+
+- duplicate definitions
+- aliases pointing to the same implementation
+- dead strategies
+- imported but unregistered strategies
+- registered but never called strategies
+- strategies called only in tests
+- strategies hidden behind disabled flags
+- strategies limited to a specific mode or instrument
+
+----------------------------------------------------
+PART 3 — TRACE THE COMPLETE STRATEGY PIPELINE
+----------------------------------------------------
+
+Trace the exact path from market evaluation to final selected strategy.
+
+At minimum inspect functions equivalent to:
+
+- compute_strategy_engine()
+- strategy registry construction
+- active-strategy selection
+- mode filtering
+- instrument filtering
+- session filtering
+- direction filtering
+- minimum-data checks
+- candidate generation
+- candidate ranking
+- tie-breaking
+- best-strategy selection
+- fallback strategy behavior
+- learning-key creation
+- Edge Score integration
+- auto-trade eligibility
+
+Document the call chain in order.
+
+Example format:
+
+full_analysis()
+    → compute_strategy_engine()
+    → resolve_enabled_strategies()
+    → evaluate_strategy(strategy_key)
+    → collect candidates
+    → rank candidates
+    → choose active candidate
+    → score setup
+    → gates
+    → verdict
+
+Use the real function names from the repository.
+
+----------------------------------------------------
+PART 4 — DISTINGUISH SCANNED FROM SELECTED
+----------------------------------------------------
+
+Add diagnostics that distinguish these states:
+
+- registered
+- enabled
+- eligible
+- evaluated
+- skipped
+- no_signal
+- candidate
+- selected
+- rejected_after_selection
+- error
+
+A strategy must not be marked "scanned" merely because it exists in the registry.
+
+A strategy counts as evaluated only if its evaluation function was actually
+called for that instrument, direction, mode, and cycle.
+
+For every evaluation cycle, diagnostics should support an entry like:
+
+{
+    "strategy_key": "liquidity_sweep_reversal",
+    "registered": true,
+    "enabled": true,
+    "eligible": true,
+    "evaluated": true,
+    "result": "no_signal",
+    "selected": false,
+    "skip_reason": null,
+    "evaluation_ms": 1.7
+}
+
+For a skipped strategy:
+
+{
+    "strategy_key": "opening_range_breakout",
+    "registered": true,
+    "enabled": true,
+    "eligible": false,
+    "evaluated": false,
+    "result": "skipped",
+    "selected": false,
+    "skip_reason": "outside_session",
+    "evaluation_ms": 0
+}
+
+Diagnostics only.
+
+Do not change candidate selection.
+
+----------------------------------------------------
+PART 5 — ADD A PARALLEL STRATEGY COVERAGE STRUCTURE
+----------------------------------------------------
+
+Prefer a separate diagnostics structure such as:
+
+STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER = {
+    "MNQ": {
+        "updated_at": "...",
+        "mode": "SCALP",
+        "direction": "Long",
+        "registered_count": 19,
+        "enabled_count": 16,
+        "eligible_count": 11,
+        "evaluated_count": 11,
+        "candidate_count": 2,
+        "selected_strategy": "liquidity_sweep_reversal",
+        "strategies": [...]
+    }
+}
+
+Do not change existing strategy result shapes if that risks production behavior.
+
+Do not add diagnostics fields to production objects when a parallel structure
+is safer.
+
+Bound memory usage.
+
+Do not append unbounded per-heartbeat history to memory.
+
+----------------------------------------------------
+PART 6 — SKIP-REASON TAXONOMY
+----------------------------------------------------
+
+Use explicit skip reasons.
+
+At minimum distinguish:
+
+- disabled
+- wrong_mode
+- unsupported_instrument
+- unsupported_direction
+- outside_session
+- missing_price
+- missing_volume
+- missing_cvd
+- missing_vwap
+- insufficient_bars
+- stale_data
+- volatility_ineligible
+- feature_flag_off
+- dependency_unavailable
+- cooldown
+- already_active
+- strategy_error
+- unknown
+
+Do not combine all exclusions into "not eligible."
+
+The report must show why each strategy was not evaluated.
+
+----------------------------------------------------
+PART 7 — STRATEGY ERRORS
+----------------------------------------------------
+
+Strategy failures must remain isolated.
+
+If one strategy raises an exception:
+
+- record result = "error"
+- record a sanitized error type
+- preserve existing logging behavior
+- continue evaluating other strategies if that is current production behavior
+- do not change verdicts or scoring
+
+Do not silently count a failed strategy as evaluated successfully.
+
+Do not expose sensitive traceback details through the dashboard API.
+
+----------------------------------------------------
+PART 8 — COVERAGE ENDPOINT
+----------------------------------------------------
+
+Add a read-only diagnostics endpoint such as:
+
+GET /strategy-scan-diagnostics
+
+It should return, by instrument and mode:
+
+- total strategies defined
+- total registered
+- total enabled
+- total eligible
+- total evaluated
+- total skipped
+- total candidates
+- selected strategy
+- per-strategy status
+- skip reasons
+- evaluation duration
+- last evaluated time
+
+The endpoint must:
+
+- not trigger a new market evaluation
+- not run strategies
+- not mutate strategy state
+- not mutate scoring state
+- not trigger trade execution
+- return the latest stored diagnostics snapshot only
+- return a safe empty response before the first evaluation
+
+Do not alter existing API responses when this endpoint is not requested.
+
+----------------------------------------------------
+PART 9 — DASHBOARD PANEL
+----------------------------------------------------
+
+Add a diagnostics-only panel titled:
+
+Strategy Scan Coverage
+
+Keep it behind Advanced or Diagnostics mode.
+
+Display:
+
+Summary:
+
+Defined: 19
+Registered: 19
+Enabled: 16
+Eligible now: 11
+Actually evaluated: 11
+Candidates: 2
+Selected: Liquidity Sweep Reversal
+
+Per-strategy table:
+
+Strategy
+Mode
+Enabled
+Eligible
+Evaluated
+Result
+Skip reason
+Last scan
+Evaluation time
+
+Use clear status labels:
+
+- EVALUATED
+- SKIPPED
+- CANDIDATE
+- SELECTED
+- ERROR
+- DISABLED
+
+Include a warning when:
+
+enabled_count != evaluated_count
+
+but only after accounting for legitimate eligibility filters.
+
+More useful warning:
+
+"3 enabled and eligible strategies were not evaluated."
+
+Do not warn merely because a swing-only strategy was not scanned in SCALP mode.
+
+----------------------------------------------------
+PART 10 — CYCLE-LEVEL COVERAGE PROOF
+----------------------------------------------------
+
+Add diagnostics or tests proving that, for a given cycle:
+
+evaluated_count =
+number of eligible strategy evaluation functions actually invoked
+
+Do not derive evaluated_count from registry size.
+
+For each applicable strategy, record an invocation marker only at the real
+strategy call site.
+
+Verify that every eligible strategy is called exactly once per intended cycle,
+unless the architecture intentionally evaluates Long and Short separately.
+
+If direction is evaluated separately, report:
+
+- Long eligible count
+- Long evaluated count
+- Short eligible count
+- Short evaluated count
+
+Prevent diagnostics from double-counting one evaluation across directions.
+
+----------------------------------------------------
+PART 11 — TESTS
+----------------------------------------------------
+
+Add focused tests proving:
+
+1. Every registered and eligible strategy is actually invoked.
+
+2. Disabled strategies are not invoked.
+
+3. Wrong-mode strategies are not invoked.
+
+4. Unsupported-instrument strategies are not invoked.
+
+5. Outside-session strategies are not invoked.
+
+6. Missing-data strategies are skipped with the correct reason.
+
+7. A strategy returning no signal is still counted as evaluated.
+
+8. A strategy producing a candidate is counted as evaluated and candidate.
+
+9. Only the selected strategy is marked selected.
+
+10. A non-selected candidate remains visible diagnostically.
+
+11. One strategy exception does not falsely mark other strategies evaluated.
+
+12. One strategy exception does not stop remaining evaluations if current
+    production behavior is fail-open.
+
+13. Strategy diagnostics do not change selected strategy.
+
+14. Strategy diagnostics do not change component points.
+
+15. Strategy diagnostics do not change Edge Score.
+
+16. Strategy diagnostics do not change Learning delta.
+
+17. Strategy diagnostics do not change READY / WAIT verdicts.
+
+18. Strategy diagnostics do not change auto-trade eligibility.
+
+19. Existing output remains byte-identical when diagnostics are not requested.
+
+20. No Databento network calls occur in unit tests.
+
+21. No strategy is evaluated twice unintentionally in one cycle.
+
+22. Long and Short evaluation counts remain distinct when applicable.
+
+23. The endpoint does not execute strategies.
+
+24. The endpoint does not mutate state.
+
+25. Empty diagnostics return safely before the first scan.
+
+----------------------------------------------------
+PART 12 — REQUIRED REPORT
+----------------------------------------------------
+
+Return:
+
+1. Current branch and HEAD
+
+2. Working-tree status before changes
+
+3. Exact files changed
+
+4. Actual number of strategy definitions found
+
+5. Actual number registered
+
+6. Actual number enabled by mode
+
+7. Actual number eligible in representative SCALP and SWING cycles
+
+8. Actual number evaluated per cycle
+
+9. Complete canonical strategy inventory table
+
+10. Exact strategy-selection call chain
+
+11. Every registry, allowlist, feature flag, or mode filter found
+
+12. Every strategy currently never evaluated
+
+13. Every strategy only conditionally evaluated
+
+14. Every strategy evaluated but never able to become selected
+
+15. Every duplicate or aliased strategy
+
+16. Every skip reason observed
+
+17. Proof that all eligible strategies are invoked exactly once
+
+18. Focused test results
+
+19. Full regression results
+
+20. Confirmation that selected strategy did not change
+
+21. Confirmation that scores and verdicts did not change
+
+22. Confirmation that auto-trade eligibility did not change
+
+23. Confirmation that Databento ingestion was not modified
+
+24. Recommendation for the next phase
+
+----------------------------------------------------
+STOP CONDITIONS
+----------------------------------------------------
+
+Stop and report before repairing or enabling anything if:
+
+- An enabled and eligible strategy is not being evaluated
+- A strategy is evaluated more than once unintentionally
+- Multiple strategy registries disagree
+- A dead strategy is still presented as active
+- A strategy exception prevents unrelated strategies from running
+- Candidate ranking silently ignores valid candidates
+- Strategy selection is hard-coded to a small subset
+- SCALP or SWING mode excludes strategies without an explicit reason
+- Adding diagnostics requires changing strategy results
+- Existing tests fail
+- HEAD changes unexpectedly
+
+If a stop condition is discovered:
+
+- Do not enable the missing strategies
+- Do not repair the selector
+- Do not change allowlists
+- Do not alter ranking
+- Report the exact finding and wait for approval
+
+MAKE ONLY THIS CHANGE.
