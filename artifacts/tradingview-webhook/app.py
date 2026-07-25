@@ -330,6 +330,11 @@ VOLUME_SPIKE_BY_TICKER = {}
 # Populated as a side-effect of _compute_score_source_attribution (called from
 # full_analysis); reset to {} on server restart.
 MARKET_INPUT_SOURCE_BY_TICKER: dict = {}
+# Phase 5E: Source attribution session analytics (RESEARCH/DISPLAY ONLY).
+# Bounded ring-buffer of per-evaluated-setup records. Never fed back into
+# scoring, gate, or any money path. Reset to empty on server restart.
+_SOURCE_ANALYTICS_LOCK    = threading.Lock()
+_SOURCE_ANALYTICS_RECORDS: deque = deque(maxlen=500)
 # Server-side dedup for CONFIRMATION alerts — applies to both TradingView and
 # Databento sources. Mirrors DatabentoBrain.CONFIRM_COOLDOWN_MIN (15 min).
 # Same-direction confirmations are suppressed for CONFIRM_COOLDOWN_MIN minutes
@@ -10767,6 +10772,293 @@ def _audit_event_duplicates(inst, alert_history_snapshot, window_seconds=120, no
     except Exception:
         pass
     return warnings
+
+
+def _record_source_analytics(result, inst):
+    """Append one per-setup source attribution record to the Phase 5E ring buffer.
+
+    FAIL-OPEN — any exception is silently swallowed. NEVER touches scoring state,
+    ALERT_HISTORY, or any money-path variable. Called from full_analysis immediately
+    after source_attribution and source_audit are set on `result`.
+    """
+    if not inst or not isinstance(result, dict):
+        return
+    try:
+        attr  = result.get("source_attribution") or []
+        audit = result.get("source_audit") or {}
+
+        verdict   = result.get("verdict") or ""
+        direction = ("long"  if "LONG"  in verdict else
+                     "short" if "SHORT" in verdict else "neutral")
+        ready     = "READY" in verdict
+
+        lsi           = result.get("learning_score_influence") or {}
+        learning_armed = bool(lsi.get("armed"))
+
+        dc_groups = [
+            {"evidence_group": w.get("evidence_group"),
+             "score_impact":   w.get("score_impact")}
+            for w in (audit.get("double_counting_warnings") or [])
+        ]
+        dup_count = len(audit.get("duplicate_events") or [])
+
+        components = [
+            {
+                "component": c.get("component"),
+                "points":    c.get("points"),
+                "source":    c.get("source", "unknown"),
+                "age_s":     c.get("age_seconds"),
+            }
+            for c in attr
+        ]
+
+        record = {
+            "ts":            now_utc().isoformat(),
+            "inst":          inst,
+            "direction":     direction,
+            "edge_score":    result.get("edge_score") or 0,
+            "ready":         ready,
+            "verdict":       verdict,
+            "learning_armed": learning_armed,
+            "components":    components,
+            "dc_groups":     dc_groups,
+            "dup_count":     dup_count,
+        }
+
+        with _SOURCE_ANALYTICS_LOCK:
+            _SOURCE_ANALYTICS_RECORDS.append(record)
+    except Exception:
+        pass
+
+
+def _build_analytics_report():
+    """Compute and return the Phase 5E source attribution analytics report.
+
+    Reads the _SOURCE_ANALYTICS_RECORDS ring buffer under lock, then computes:
+      Part 1 — Session summary (total / READY / WAIT by instrument & direction)
+      Part 2 — Duplicate evidence statistics (by evidence group)
+      Part 3 — Source distribution (% by source type, component, instrument, direction)
+      Part 4 — Component correlation (pairwise co-occurrence rates)
+      Part 5 — Evidence age statistics (avg / min / max per component)
+      Part 6 — Key findings & recommendation (answers the 3 research questions)
+
+    FAIL-OPEN — returns a minimal error dict on any exception. Purely read-only.
+    """
+    try:
+        with _SOURCE_ANALYTICS_LOCK:
+            records = list(_SOURCE_ANALYTICS_RECORDS)
+
+        n           = len(records)
+        MIN_RECORDS = 20
+
+        # ── Early return when no data ─────────────────────────────────────
+        empty_findings = {
+            "databento_fully_represented": "insufficient_data",
+            "repeated_evidence_scoring":   "insufficient_data",
+            "statistical_justification":   "insufficient_data",
+            "recommendation": f"Collect at least {MIN_RECORDS} evaluated setups.",
+        }
+        if n == 0:
+            return {
+                "record_count":             0,
+                "min_records_for_findings": MIN_RECORDS,
+                "message": ("No data yet — results appear after live setups "
+                            "are evaluated."),
+                "summary":               {"total": 0, "ready": 0, "wait": 0,
+                                          "by_instrument": {}, "by_direction": {}},
+                "source_distribution":   {},
+                "duplicate_stats":       {},
+                "component_correlation": {},
+                "evidence_age":          {},
+                "findings":              empty_findings,
+                "most_recent_attribution": [],
+                "generated_at":          now_utc().isoformat(),
+            }
+
+        # ── Part 1: Session summary ───────────────────────────────────────
+        ready_count = sum(1 for r in records if r["ready"])
+        wait_count  = n - ready_count
+
+        by_inst: dict = {}
+        by_dir:  dict = {}
+        for r in records:
+            bi = by_inst.setdefault(r["inst"],      {"total": 0, "ready": 0, "wait": 0})
+            bd = by_dir.setdefault(r["direction"],  {"total": 0, "ready": 0, "wait": 0})
+            bi["total"] += 1; bi["ready" if r["ready"] else "wait"] += 1
+            bd["total"] += 1; bd["ready" if r["ready"] else "wait"] += 1
+
+        summary = {
+            "total": n, "ready": ready_count, "wait": wait_count,
+            "by_instrument": by_inst, "by_direction": by_dir,
+        }
+
+        # ── Part 3: Source distribution ───────────────────────────────────
+        SOURCES     = ("databento", "tradingview", "internal", "unknown")
+        COMP_NAMES  = ("BOS", "CHOCH", "Sweep", "VWAP", "Volume", "CVD", "Session")
+
+        comp_src:  dict = {c: {s: 0 for s in SOURCES} for c in COMP_NAMES}
+        dir_src:   dict = {}
+        inst_src:  dict = {}
+        total_src: dict = {s: 0 for s in SOURCES}
+
+        for r in records:
+            d    = r["direction"]
+            inst = r["inst"]
+            ds   = dir_src.setdefault(d,    {s: 0 for s in SOURCES})
+            ist  = inst_src.setdefault(inst, {s: 0 for s in SOURCES})
+            for c in r.get("components") or []:
+                cname = c.get("component", "")
+                src   = c.get("source") or "unknown"
+                if src not in SOURCES:
+                    src = "unknown"
+                if cname in comp_src:
+                    comp_src[cname][src] += 1
+                ds[src] += 1; ist[src] += 1; total_src[src] += 1
+
+        tot_obs = sum(total_src.values()) or 1
+
+        def _pct(counts):
+            t = sum(counts.values()) or 1
+            return {s: {"count": counts[s], "pct": round(100 * counts[s] / t, 1)}
+                    for s in SOURCES}
+
+        source_distribution = {
+            "by_source": {
+                s: {"count": total_src[s],
+                    "pct":   round(100 * total_src[s] / tot_obs, 1)}
+                for s in SOURCES
+            },
+            "by_component": {
+                c: {**counts,
+                    "pct_databento": round(100 * counts["databento"]
+                                           / (sum(counts.values()) or 1), 1)}
+                for c, counts in comp_src.items()
+            },
+            "by_instrument": {inst: _pct(counts) for inst, counts in inst_src.items()},
+            "by_direction":  {d:    _pct(counts) for d,    counts in dir_src.items()
+                              if sum(counts.values()) > 0},
+        }
+
+        # ── Part 2: Duplicate evidence statistics ─────────────────────────
+        GROUP_NAMES = ("buying_pressure", "sweep_volume_overlap", "structure_overlap")
+        grp_counts: dict = {g: 0 for g in GROUP_NAMES}
+        for r in records:
+            for dcg in r.get("dc_groups") or []:
+                eg = dcg.get("evidence_group")
+                if eg in grp_counts:
+                    grp_counts[eg] += 1
+
+        tv_db_dup_total = sum(r.get("dup_count", 0) for r in records)
+
+        duplicate_stats = {
+            "by_group": {
+                g: {"count": grp_counts[g],
+                    "pct_of_setups": round(100 * grp_counts[g] / n, 1)}
+                for g in GROUP_NAMES
+            },
+            "tv_databento_dup_events": tv_db_dup_total,
+            "total_warnings":          sum(grp_counts.values()),
+        }
+
+        # ── Part 4: Component correlation ─────────────────────────────────
+        def _present(comps, name):
+            return any(c.get("component") == name and c.get("age_s") is not None
+                       for c in comps)
+
+        PAIRS = [
+            ("BOS",  "CHOCH"), ("BOS",  "Sweep"), ("CHOCH", "Sweep"),
+            ("CVD",  "Volume"), ("Sweep", "Volume"), ("Sweep", "CVD"),
+            ("VWAP", "Volume"), ("VWAP", "CVD"),
+        ]
+        component_correlation: dict = {}
+        for (a, b) in PAIRS:
+            cnt = sum(1 for r in records
+                      if _present(r.get("components") or [], a)
+                      and _present(r.get("components") or [], b))
+            component_correlation[f"{a}+{b}"] = {
+                "count":         cnt,
+                "pct_of_setups": round(100 * cnt / n, 1),
+            }
+
+        # ── Part 5: Evidence age ──────────────────────────────────────────
+        evidence_age: dict = {}
+        for cname in COMP_NAMES:
+            ages = [c["age_s"]
+                    for r in records
+                    for c in (r.get("components") or [])
+                    if c.get("component") == cname and c.get("age_s") is not None]
+            if ages:
+                evidence_age[cname] = {
+                    "avg_s":   round(sum(ages) / len(ages), 1),
+                    "min_s":   round(min(ages), 1),
+                    "max_s":   round(max(ages), 1),
+                    "samples": len(ages),
+                }
+
+        # ── Part 6: Key findings ──────────────────────────────────────────
+        if n >= MIN_RECORDS:
+            db_pct      = source_distribution["by_source"]["databento"]["pct"]
+            max_dup_pct = max((v["pct_of_setups"]
+                               for v in duplicate_stats["by_group"].values()),
+                              default=0.0)
+            # Q1: Is Databento already fully represented by existing score components?
+            q1 = ("yes"     if db_pct > 40
+                  else "partial" if db_pct > 10
+                  else "no")
+
+            # Q2: Are any components repeatedly scoring the same market evidence?
+            q2 = ("yes"      if max_dup_pct > 20
+                  else "possible" if max_dup_pct > 10
+                  else "no")
+
+            # Q3: Statistical justification for a future Databento score delta?
+            # Justified only if Databento evidence is both dominant AND systematically
+            # double-counted by the current 7-component model.
+            q3_justified = (max_dup_pct > 30 and db_pct > 50)
+            q3 = ("yes"     if q3_justified
+                  else "not_yet" if n < 100
+                  else "no")
+
+            rec_text = (
+                f"Duplicate evidence in {max_dup_pct:.0f}% of setups. "
+                f"Review before adding a Databento delta."
+                if q3_justified
+                else ("Insufficient statistical justification. "
+                      "Keep current scoring model unchanged.")
+            )
+
+            findings = {
+                "databento_fully_represented": q1,
+                "repeated_evidence_scoring":   q2,
+                "statistical_justification":   q3,
+                "recommendation":              rec_text,
+                "databento_pct":               db_pct,
+                "max_duplicate_group_pct":     max_dup_pct,
+                "setups_analyzed":             n,
+            }
+        else:
+            findings = {
+                **empty_findings,
+                "recommendation": (f"Collect at least {MIN_RECORDS} evaluated "
+                                   f"setups ({n}/{MIN_RECORDS} so far)."),
+            }
+
+        return {
+            "record_count":             n,
+            "min_records_for_findings": MIN_RECORDS,
+            "summary":                  summary,
+            "source_distribution":      source_distribution,
+            "duplicate_stats":          duplicate_stats,
+            "component_correlation":    component_correlation,
+            "evidence_age":             evidence_age,
+            "findings":                 findings,
+            "most_recent_attribution":  (records[-1].get("components") or [])
+                                        if records else [],
+            "generated_at":             now_utc().isoformat(),
+        }
+    except Exception:
+        return {"record_count": 0, "error": "report_generation_failed",
+                "generated_at": now_utc().isoformat()}
 
 
 def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_status, volatility):
@@ -22416,6 +22708,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "double_counting_warnings": _src_dbl,
             "duplicate_events":         _src_dupes,
         }
+        _record_source_analytics(result, active_ticker)   # Phase 5E ring-buffer
     except Exception:
         result["source_attribution"] = []
         result["source_audit"]       = {}
@@ -39933,6 +40226,19 @@ setInterval(refresh,1000);
 </html>"""
 
 
+@app.route("/source-analytics", methods=["GET"])
+def get_source_analytics():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS). Returns the
+    Phase 5E live source attribution analytics report from the in-memory ring
+    buffer. Purely display/research — never reads from or writes to the money
+    path, scoring state, gate, or any production store.
+
+    Report includes: session summary, source distribution (Parts 1/3), duplicate
+    evidence statistics (Part 2), component correlation (Part 4), evidence age
+    (Part 5), and the three key research findings (Part 6)."""
+    return jsonify(_build_analytics_report())
+
+
 @app.route("/eval-metrics", methods=["GET"])
 def get_eval_metrics():
     """Owner-only JSON feed of the last EVAL_METRICS_MAX scored evaluations
@@ -48511,6 +48817,16 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <div class="gstat"><div class="l">Rel Volume</div><div class="v" id="cvd-rvol">—</div></div>
     <div class="gstat"><div class="l">Volume</div><div class="v" id="cvd-volstate">—</div></div>
   </div>
+</div>
+
+<!-- ════ Source Attribution Analytics (Phase 5E — research/display-only) ════ -->
+<!-- Diagnostics panel: which market-data sources contributed to each scored
+     setup. Hidden behind Advanced panels toggle. Never modifies scoring or
+     verdicts. Polls /source-analytics every 30s independently of main refresh. -->
+<div class="mod" id="mod-src-analytics" data-cat="advanced" style="display:none">
+  <div class="mod-h">📊 Source Attribution Analytics<span class="mod-cat cat-advanced">ADVANCED</span></div>
+  <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Read-only evidence audit — which market-data sources (Databento / TradingView / internal) contributed to each scored setup. Never modifies scoring or verdicts. Auto-refreshes every 30&nbsp;s.</div>
+  <div id="saa-body"><div style="color:var(--muted);font-size:12px;padding:8px 0">No data yet — results appear after live setups are evaluated.</div></div>
 </div>
 
 <!-- VWAP is fetched automatically; manual entry just overrides it temporarily -->
@@ -59473,6 +59789,102 @@ setTimeout(loadThesisStats, 1500);
   window.orbWinPulse  = _orWin;
   window.orbLossPulse = _orLoss;
 })();
+
+// ── Source Attribution Analytics (Phase 5E — display-only) ────────────────
+// Polls /source-analytics every 30s and renders into #saa-body.
+// Completely independent of the main 3s refresh loop. DISPLAY-ONLY.
+function _saaEsc(t){
+  return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function renderSrcAttr(d){
+  var el=document.getElementById('saa-body'); if(!el) return;
+  var n=d.record_count||0;
+  if(!n){
+    el.innerHTML='<div style="color:var(--muted);font-size:12px;padding:8px 0">No data yet &mdash; results appear after live setups are evaluated.</div>';
+    return;
+  }
+  var s=d.summary||{}, sd=d.source_distribution||{}, bsrc=sd.by_source||{},
+      ds=d.duplicate_stats||{}, cc=d.component_correlation||{},
+      ea=d.evidence_age||{}, fi=d.findings||{};
+  // Session summary
+  var sumHtml='<div class="se-top">'+
+    '<div class="gstat"><div class="l">Setups</div><div class="v">'+(s.total||0)+'</div></div>'+
+    '<div class="gstat"><div class="l">READY</div><div class="v" style="color:var(--green)">'+(s.ready||0)+'</div></div>'+
+    '<div class="gstat"><div class="l">WAIT</div><div class="v">'+(s.wait||0)+'</div></div>'+
+    '</div>';
+  // Source distribution
+  var srcs=['databento','tradingview','internal','unknown'], srows='';
+  for(var i=0;i<srcs.length;i++){
+    var sk=srcs[i], sv=bsrc[sk]||{};
+    srows+='<tr><td style="padding:2px 4px">'+sk+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(sv.count||0)+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(sv.pct||0)+'%</td></tr>';
+  }
+  var distHtml='<div class="se-bias-h">Source Distribution</div>'+
+    '<table style="width:100%;font-size:11px;border-collapse:collapse">'+
+    '<tr><th style="text-align:left;color:#6b7280;font-weight:normal;padding:2px 4px">Source</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Count</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">%</th></tr>'+srows+'</table>';
+  // Duplicate evidence groups
+  var byg=ds.by_group||{}, gkeys=['buying_pressure','sweep_volume_overlap','structure_overlap'], drows='';
+  for(var j=0;j<gkeys.length;j++){
+    var gk=gkeys[j], gv=byg[gk]||{};
+    drows+='<tr><td style="padding:2px 4px;font-size:10px">'+gk.replace(/_/g,' ')+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(gv.count||0)+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(gv.pct_of_setups||0)+'%</td></tr>';
+  }
+  var dupHtml='<div class="se-bias-h">Duplicate Evidence Groups</div>'+
+    '<table style="width:100%;font-size:11px;border-collapse:collapse">'+
+    '<tr><th style="text-align:left;color:#6b7280;font-weight:normal;padding:2px 4px">Group</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Count</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">% setups</th></tr>'+drows+'</table>';
+  // Component co-occurrence
+  var ckeys=Object.keys(cc), crows='';
+  for(var ci=0;ci<ckeys.length;ci++){
+    var cv=cc[ckeys[ci]]||{};
+    crows+='<tr><td style="padding:2px 4px;font-size:10px">'+ckeys[ci]+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(cv.count||0)+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(cv.pct_of_setups||0)+'%</td></tr>';
+  }
+  var corrHtml=ckeys.length?'<div class="se-bias-h">Component Co-occurrence</div>'+
+    '<table style="width:100%;font-size:11px;border-collapse:collapse">'+
+    '<tr><th style="text-align:left;color:#6b7280;font-weight:normal;padding:2px 4px">Pair</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Count</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">% setups</th></tr>'+crows+'</table>':'';
+  // Evidence age
+  var ekeys=Object.keys(ea), arows='';
+  for(var ei=0;ei<ekeys.length;ei++){
+    var ev2=ea[ekeys[ei]]||{};
+    arows+='<tr><td style="padding:2px 4px">'+ekeys[ei]+'</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(ev2.avg_s||'&mdash;')+'s</td>'+
+      '<td style="text-align:right;padding:2px 4px">'+(ev2.samples||0)+'</td></tr>';
+  }
+  var ageHtml=arows?'<div class="se-bias-h">Evidence Age</div>'+
+    '<table style="width:100%;font-size:11px;border-collapse:collapse">'+
+    '<tr><th style="text-align:left;color:#6b7280;font-weight:normal;padding:2px 4px">Component</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">Avg</th>'+
+    '<th style="text-align:right;color:#6b7280;font-weight:normal">N</th></tr>'+arows+'</table>':'';
+  // Research findings
+  var fHtml='';
+  if(fi.recommendation){
+    fHtml='<div class="se-bias-h">Research Findings</div>'+
+      '<div class="se-reason" style="font-size:11px">'+_saaEsc(fi.recommendation)+'</div>';
+    if(fi.setups_analyzed){
+      fHtml+='<div style="font-size:10px;color:#6b7280;margin-top:4px">'+
+        'Databento: '+(fi.databento_pct||0)+'% &middot; '+
+        'Max dup group: '+(fi.max_duplicate_group_pct||0)+'% &middot; '+
+        'n='+fi.setups_analyzed+'</div>';
+    }
+  }
+  el.innerHTML=sumHtml+distHtml+dupHtml+corrHtml+ageHtml+fHtml;
+}
+function loadSrcAttr(){
+  fetch(BASE+'/source-analytics',{cache:'no-store'})
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){if(d)renderSrcAttr(d);})
+    .catch(function(){});
+}
+(function(){ loadSrcAttr(); setInterval(loadSrcAttr,30000); })();
 </script>
 
 </body>

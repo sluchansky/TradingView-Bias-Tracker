@@ -233,6 +233,12 @@ export const BOT1_ROUTES = [
   // Right Brain status — training log, PF, mode, last per-instrument eval.
   // DISPLAY/READ-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
   "/right-brain",
+  // Phase 5E: Source attribution session analytics report.
+  // RESEARCH/DISPLAY-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
+  // Returns a read-only analytics report from the in-memory ring buffer —
+  // source distribution, duplicate evidence stats, component correlation,
+  // evidence age, and three key research findings. Never modifies any state.
+  "/source-analytics",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.
