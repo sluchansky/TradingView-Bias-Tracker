@@ -245,6 +245,11 @@ export const BOT1_ROUTES = [
   // evidence impact, evidence age by outcome, and recommendations. Never
   // modifies scoring, gate, learning, or any production store.
   "/decision-quality",
+  // Phase 6: Strategy scan coverage diagnostics.
+  // DIAGNOSTICS/DISPLAY-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
+  // Returns STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER (last-scan snapshot per ticker).
+  // Never triggers strategy evaluation or mutates any scoring/production state.
+  "/strategy-scan-diagnostics",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

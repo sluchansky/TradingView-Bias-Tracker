@@ -8905,6 +8905,7 @@ LEARNING_SNAPSHOT_MAX_AGE = 180                     # secs: entry snapshot consi
 LAST_STRATEGY_SNAPSHOT_BY_INST = {}                 # inst -> entry-context snapshot (for trade tagging)
 STRATEGY_WEIGHTS       = {}                         # "{mode}::{strategy_key}" → weight (float); bare key as warm-up fallback
 LEARNING_SAMPLE_BY_KEY = {}                         # "{mode}::{strategy_key}" → closed-trade count (int)
+STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER: dict = {}      # ticker → last-scan snapshot (display-only, bounded, one entry per ticker)
 PER_MODE_STATS         = {}                         # mode key → per-mode aggregate stats (win_rate/avg_r/n/top_setup)
 LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total_trades": 0}
 # ── Right Brain — proactive execution engine (training-mode-gated) ────────────
@@ -9549,6 +9550,85 @@ def _strategy_grade(fully_met, confidence, max_grade):
     return "Avoid"
 
 
+def _build_strategy_scan_diag(ticker, inst, evals, active_key, engine, scan_t):
+    """Populate STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER with the latest scan results
+    for this ticker.  DISPLAY-ONLY, FAIL-OPEN — never raises, never touches the
+    scoring / gate / money path.  Called from both return points of
+    compute_strategy_engine after the evals dict is fully built.
+
+    Skip-reason taxonomy (main engine):
+      outside_session   — OPENING_DRIVE called but in_opening_window=False.
+      (others reserved for future strategies with explicit skip gates)
+
+    Result states:
+      selected   — this is the active_key.
+      candidate  — fully_met but a higher-priority strategy was selected.
+      no_signal  — eligible and evaluated; no directional trigger.
+      skipped    — eligible=False (cannot reach fully_met / selected).
+    """
+    try:
+        strategies = []
+        for key in STRATEGY_PRIORITY:
+            ev           = evals.get(key, {})
+            eligible     = ev.get("eligible", True)
+            fully_met    = ev.get("fully_met", False)
+            completeness = ev.get("completeness", 0)
+            direction    = ev.get("direction")
+            is_selected  = (key == active_key)
+
+            if not eligible:
+                result_str  = "skipped"
+                skip_reason = "outside_session"
+            elif is_selected and fully_met:
+                result_str  = "selected"
+                skip_reason = None
+            elif fully_met:
+                result_str  = "candidate"
+                skip_reason = None
+            else:
+                result_str  = "no_signal"
+                skip_reason = None
+
+            strategies.append({
+                "strategy_key": key,
+                "label":        STRATEGY_DEFS[key]["label"],
+                "registered":   True,
+                "enabled":      True,
+                "eligible":     eligible,
+                "evaluated":    True,       # scorer is always called (outer try-block)
+                "result":       result_str,
+                "selected":     is_selected,
+                "skip_reason":  skip_reason,
+                "completeness": completeness,
+                "direction":    direction,
+                "evaluation_ms": scan_t.get(key, 0),
+            })
+
+        eligible_count      = sum(1 for s in strategies if s["eligible"])
+        evaluated_count     = sum(1 for s in strategies if s["eligible"] and s["evaluated"])
+        candidate_count     = sum(1 for s in strategies if s["result"] in ("candidate", "selected"))
+        unevaluated_eligible = sum(1 for s in strategies if s["eligible"] and not s["evaluated"])
+
+        STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER[ticker] = {
+            "updated_at":          now_utc().isoformat(),
+            "ticker":              ticker,
+            "inst":                inst,
+            "mode":                TRADING_MODE,
+            "registered_count":    len(STRATEGY_PRIORITY),
+            "enabled_count":       len(STRATEGY_PRIORITY),
+            "eligible_count":      eligible_count,
+            "evaluated_count":     evaluated_count,
+            "candidate_count":     candidate_count,
+            "unevaluated_eligible": unevaluated_eligible,
+            "selected_strategy":   engine.get("active_strategy"),
+            "selected_key":        active_key,
+            "market_regime":       engine.get("market_regime"),
+            "strategies":          strategies,
+        }
+    except Exception as _exc:
+        logger.debug("strategy scan diagnostics build failed: %s", _exc)
+
+
 def _closed_strategy_engine():
     return {
         "mode": STRATEGY_ENGINE_MODE,
@@ -9577,8 +9657,11 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
         bias   = detect_session_bias(inst)
 
         evals = {}
+        _scan_t: dict = {}
         for key in STRATEGY_PRIORITY:
+            _t0 = time.perf_counter()
             ev    = STRATEGY_SCORERS[key](ctx)
+            _scan_t[key] = round((time.perf_counter() - _t0) * 1000, 2)
             conds = ev["conditions"]
             total = len(conds)
             met   = sum(1 for _, m in conds if m)
@@ -9626,6 +9709,7 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
                           missing=[], conditions=[],
                           base_confidence=0, history_weight=1.0,
                           history_sample_size=0, history_adjustment=0)
+            _build_strategy_scan_diag(ticker, inst, evals, None, engine, _scan_t)
             return engine
 
         a    = evals[active_key]
@@ -9659,6 +9743,7 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
             base_confidence=base_confidence, history_weight=round(hist_weight, 3),
             history_sample_size=hist_n, history_adjustment=hist_adj,
         )
+        _build_strategy_scan_diag(ticker, inst, evals, active_key, engine, _scan_t)
         return engine
     except Exception as exc:
         logger.warning("strategy engine error: %s", exc)
@@ -40649,6 +40734,24 @@ def get_decision_quality():
     return jsonify(_build_decision_quality_report())
 
 
+@app.route("/strategy-scan-diagnostics", methods=["GET"])
+def strategy_scan_diagnostics():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Returns the latest strategy scan coverage snapshot per ticker.
+    Phase 6 — display-only audit endpoint.
+
+    Does NOT trigger a new market evaluation.
+    Does NOT run strategies or call STRATEGY_SCORERS.
+    Does NOT mutate STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER or any scoring state.
+    Returns the last snapshot stored by compute_strategy_engine, or an empty
+    tickers dict if no evaluation has run yet."""
+    return jsonify({
+        "tickers":          dict(STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER),
+        "registered_total": len(STRATEGY_DEFS),
+        "priority_order":   list(STRATEGY_PRIORITY),
+    })
+
+
 @app.route("/eval-metrics", methods=["GET"])
 def get_eval_metrics():
     """Owner-only JSON feed of the last EVAL_METRICS_MAX scored evaluations
@@ -49237,6 +49340,15 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div class="mod-h">📊 Source Attribution Analytics<span class="mod-cat cat-advanced">ADVANCED</span></div>
   <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Read-only evidence audit — which market-data sources (Databento / TradingView / internal) contributed to each scored setup. Never modifies scoring or verdicts. Auto-refreshes every 30&nbsp;s.</div>
   <div id="saa-body"><div style="color:var(--muted);font-size:12px;padding:8px 0">No data yet — results appear after live setups are evaluated.</div></div>
+</div>
+
+<!-- ════ Strategy Scan Coverage (Phase 6 — diagnostics/display-only) ════ -->
+<!-- Shows which strategies were evaluated this cycle, which were skipped, and why.
+     Hidden behind Advanced panels toggle. Never modifies scoring or any production state. -->
+<div class="mod" id="mod-strategy-scan" data-cat="advanced" style="display:none">
+  <div class="mod-h">&#128202; Strategy Scan Coverage<span class="mod-cat cat-advanced">ADVANCED</span></div>
+  <div style="font-size:11px;color:#9ca3af;margin-bottom:8px">Which strategies were evaluated this cycle and why others were skipped. Display-only &#8212; never modifies scoring, gate, or verdicts. Auto-refreshes every 60&#160;s.</div>
+  <div id="ss-body"><div style="color:var(--muted);font-size:12px;padding:8px 0">Awaiting first strategy scan &#8212; populates on the next market evaluation.</div></div>
 </div>
 
 <!-- ════ Decision Quality & Signal Calibration (Phase 5F — research/display-only) ════ -->
@@ -60304,6 +60416,85 @@ function loadSrcAttr(){
     .catch(function(){});
 }
 (function(){ loadSrcAttr(); setInterval(loadSrcAttr,30000); })();
+
+// ── Strategy Scan Coverage (Phase 6 — display-only) ─────────────────────
+// Polls /strategy-scan-diagnostics every 60s and renders into #ss-body.
+function _ssEsc(t){
+  return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function _ssResultBadge(r){
+  var colors={selected:'#4ade80',candidate:'#a78bfa',no_signal:'#9ca3af',skipped:'#f59e0b',error:'#f87171',disabled:'#6b7280'};
+  var c=colors[r]||'#9ca3af';
+  return '<span style="font-size:10px;font-weight:600;color:'+c+'">'+ _ssEsc((r||'').toUpperCase())+'</span>';
+}
+function renderStratScan(d){
+  var el=document.getElementById('ss-body'); if(!el) return;
+  var tickers=d.tickers||{};
+  var keys=Object.keys(tickers);
+  if(!keys.length){
+    el.innerHTML='<div style="color:var(--muted);font-size:12px;padding:8px 0">Awaiting first strategy scan.</div>';
+    return;
+  }
+  var html='';
+  for(var i=0;i<keys.length;i++){
+    var tk=keys[i], td=tickers[tk]||{};
+    var strats=td.strategies||[];
+    var uneval=td.unevaluated_eligible||0;
+    var warnHtml='';
+    if(uneval>0){
+      warnHtml='<div style="color:#f59e0b;font-size:11px;margin:4px 0">&#9888; '+uneval+' enabled and eligible strateg'+(uneval>1?'ies were':'y was')+' not evaluated.</div>';
+    }
+    var selStr=td.selected_strategy&&td.selected_strategy!=='None'?
+      ' &#8594; <span style="color:#4ade80">'+_ssEsc(td.selected_strategy)+'</span>':'';
+    html+='<div style="margin-bottom:12px">'+
+      '<div style="font-size:12px;font-weight:600;color:#e2e8f0;margin-bottom:4px">'+
+        _ssEsc(tk)+' <span style="color:#9ca3af;font-weight:400;font-size:11px">'+_ssEsc(td.mode||'')+'</span>'+selStr+
+      '</div>'+
+      '<div class="se-top" style="margin-bottom:6px">'+
+        '<div class="gstat"><div class="l">Registered</div><div class="v">'+_ssEsc(td.registered_count||0)+'</div></div>'+
+        '<div class="gstat"><div class="l">Enabled</div><div class="v">'+_ssEsc(td.enabled_count||0)+'</div></div>'+
+        '<div class="gstat"><div class="l">Eligible</div><div class="v">'+_ssEsc(td.eligible_count||0)+'</div></div>'+
+        '<div class="gstat"><div class="l">Evaluated</div><div class="v">'+_ssEsc(td.evaluated_count||0)+'</div></div>'+
+        '<div class="gstat"><div class="l">Candidates</div><div class="v">'+_ssEsc(td.candidate_count||0)+'</div></div>'+
+      '</div>'+warnHtml;
+    if(strats.length){
+      var rows='';
+      for(var j=0;j<strats.length;j++){
+        var s=strats[j];
+        var skipStr=s.skip_reason?'<span style="color:#f59e0b;font-size:10px">'+_ssEsc(s.skip_reason)+'</span>':'&#8212;';
+        rows+='<tr>'+
+          '<td style="padding:2px 4px">'+_ssEsc(s.label||s.strategy_key)+'</td>'+
+          '<td style="text-align:center;padding:2px 4px">'+_ssResultBadge(s.result)+'</td>'+
+          '<td style="text-align:right;padding:2px 4px;color:#9ca3af">'+_ssEsc(s.completeness||0)+'%</td>'+
+          '<td style="text-align:center;padding:2px 4px">'+skipStr+'</td>'+
+          '<td style="text-align:right;padding:2px 4px;color:#6b7280">'+_ssEsc(s.evaluation_ms||0)+'ms</td>'+
+          '</tr>';
+      }
+      html+='<table style="width:100%;font-size:11px;border-collapse:collapse">'+
+        '<tr>'+
+          '<th style="text-align:left;color:#6b7280;font-weight:normal;padding:2px 4px">Strategy</th>'+
+          '<th style="text-align:center;color:#6b7280;font-weight:normal;padding:2px 4px">Result</th>'+
+          '<th style="text-align:right;color:#6b7280;font-weight:normal;padding:2px 4px">Completeness</th>'+
+          '<th style="text-align:center;color:#6b7280;font-weight:normal;padding:2px 4px">Skip reason</th>'+
+          '<th style="text-align:right;color:#6b7280;font-weight:normal;padding:2px 4px">Eval ms</th>'+
+        '</tr>'+rows+'</table>';
+    }
+    if(td.updated_at){
+      html+='<div style="font-size:10px;color:#4b5563;margin-top:4px">Last scan: '+_ssEsc(td.updated_at.substring(0,19).replace('T',' '))+' UTC</div>';
+    }
+    html+='</div>';
+  }
+  var priStr=(d.priority_order||[]).join(' \u2192 ');
+  if(priStr) html+='<div style="font-size:10px;color:#4b5563;margin-top:4px">Priority order: '+_ssEsc(priStr)+'</div>';
+  el.innerHTML=html;
+}
+function loadStratScan(){
+  fetch(BASE+'/strategy-scan-diagnostics',{cache:'no-store'})
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){if(d)renderStratScan(d);})
+    .catch(function(){});
+}
+(function(){ loadStratScan(); setInterval(loadStratScan,60000); })();
 
 // ── Decision Quality & Signal Calibration (Phase 5F — display-only) ──────
 // Polls /decision-quality every 60s and renders into #dq-body.
