@@ -152,6 +152,9 @@ class DatabentoBrain:
         # Bar-close callbacks: called after every completed 1m bar per instrument.
         # Registered by app.py to trigger proactive scanning without polling.
         self._bar_close_callbacks: list = []
+        # Structure-signal callbacks: called for every BOS/CHOCH/CONFIRMATION alert.
+        # Registered by app.py to enqueue a scored webhook analysis without a TV hit.
+        self._structure_signal_callbacks: list = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -170,6 +173,12 @@ class DatabentoBrain:
         """Register a callable(inst: str, price: float) invoked after each bar close.
         Called from the data-feed thread — fn must be fast or dispatch its own thread."""
         self._bar_close_callbacks.append(fn)
+
+    def register_structure_signal_callback(self, fn) -> None:
+        """Register a callable(inst: str, alert_type: str, price: float) invoked
+        whenever _inject_alert fires a BOS, CHOCH, or CONFIRMATION alert.
+        Called from the data-feed thread — fn must return quickly."""
+        self._structure_signal_callbacks.append(fn)
 
     # ── Reconnect loop ────────────────────────────────────────────────────────
 
@@ -594,6 +603,13 @@ class DatabentoBrain:
                 self._last_bos[inst] = {"type": atype, "level": pivot["low"]}
                 self._trend[inst]    = "bear"
 
+    # Alert types that warrant a full scored analysis pass (registered callbacks).
+    # HH/HL/LH/LL are informational (edge-score only, no hard-gate effect).
+    # Sweeps are already sent by TradingView; triggering here would double-fire.
+    _STRUCTURE_CB_TYPES = frozenset({
+        "BOS DEMAND", "BOS SUPPLY", "CHOCH DEMAND", "CHOCH SUPPLY",
+    })
+
     def _inject_alert(self, inst: str, alert_type: str, price: float) -> None:
         """Append a synthetic structure alert to the shared ALERT_HISTORY deque."""
         record = {
@@ -607,6 +623,17 @@ class DatabentoBrain:
         }
         self._ah.append(record)
         logger.info("DatabentoBrain ▶ %s  %s @ %.4f", inst, alert_type, price)
+        # Notify structure-signal callbacks for BOS/CHOCH and CONFIRMATION events
+        # so app.py can enqueue a scored analysis without waiting for a TV webhook.
+        _is_scoring = alert_type in self._STRUCTURE_CB_TYPES
+        _is_confirm = (alert_type.endswith("BULLISH CONFIRMATION")
+                       or alert_type.endswith("BEARISH CONFIRMATION"))
+        if (_is_scoring or _is_confirm) and self._structure_signal_callbacks:
+            for _cb in self._structure_signal_callbacks:
+                try:
+                    _cb(inst, alert_type, float(price))
+                except Exception as _cbe:
+                    logger.error("structure_signal_callback error: %s", _cbe)
 
     # ── Sweep detection ───────────────────────────────────────────────────────
 

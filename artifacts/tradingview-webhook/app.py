@@ -512,6 +512,14 @@ DATABENTO_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 _DATABENTO_BRAIN  = None   # populated in __main__ when DATABENTO_ENABLED is True
 
+# When DATABENTO_ENABLED, Databento BOS/CHOCH/CONFIRMATION events automatically
+# enqueue a scored webhook analysis (Discord + auto-trade) without needing a TV hit.
+# Set DATABENTO_SIGNALS=0 to disable signal triggering while keeping the feed alive
+# (e.g. to use Databento for price/VWAP/CVD only and rely solely on TV for scoring).
+DATABENTO_SIGNALS_ENABLED = DATABENTO_ENABLED and (
+    os.environ.get("DATABENTO_SIGNALS", "1") != "0"
+)
+
 # ── Live-loss-reduction money-path flags (2026-06-29) ─────────────────────────
 # Four reversible, DEFAULT-ON protections added after sustained real-account
 # underperformance (PF 0.54, ~23% win rate). Each has an env kill-switch (set to
@@ -24255,6 +24263,74 @@ def _trade_ready_loop():
         logger.warning("trade-ready loop error: %s", exc)
     finally:
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()
+
+
+def _databento_structure_trigger(inst: str, alert_type: str, price: float) -> None:
+    """Enqueue a synthetic webhook analysis job when Databento fires a bar-close
+    BOS, CHOCH, or CONFIRMATION signal.  Runs on the Databento feed thread and
+    must return quickly — the heavy work (full_analysis + Discord + auto-trade)
+    happens inside the existing webhook worker.
+
+    Reuses the same SIGNAL_DEDUP / cooldown logic as the TV /webhook route so a
+    Databento signal and a near-simultaneous TV alert never double-score.
+
+    FAIL-OPEN: any exception is logged and dropped — the feed thread must never
+    crash on a bad trigger.
+    """
+    if not DATABENTO_SIGNALS_ENABLED:
+        return
+    try:
+        now = now_utc()
+        # Per-instrument + alert_type cooldown — same dict as TV webhooks.
+        _dedup_inst   = instrument_of(inst)
+        _cooldown_sec = signal_dedup_cooldown_sec(_dedup_inst)
+        sig_key       = (_dedup_inst, alert_type)
+        is_duplicate  = False
+        cooldown_remaining_ms = None
+        try:
+            with DEDUP_LOCK:
+                _prev = SIGNAL_DEDUP.get(sig_key)
+                if _prev is not None:
+                    _el = (now - _prev).total_seconds()
+                    if 0 <= _el < _cooldown_sec:
+                        is_duplicate          = True
+                        cooldown_remaining_ms = round((_cooldown_sec - _el) * 1000.0, 1)
+                SIGNAL_DEDUP[sig_key] = now
+        except Exception as _dd_exc:
+            logger.error("Databento dedup check failed (signal still processed): %s", _dd_exc)
+        record = {
+            "alert_type":        alert_type,
+            "ticker":            inst + "1!",
+            "instrument":        inst,
+            "instrument_source": "databento",
+            "price":             float(price),
+            "timestamp":         now.isoformat(),
+            "raw":               {"source": "databento_brain"},
+        }
+        _prof        = ACCOUNT_PROFILES.get(DEFAULT_PROFILE, {})
+        account_size = _prof.get("account_size", DEFAULT_ACCOUNT_SIZE)
+        risk_pct     = _prof.get("risk_pct",     DEFAULT_RISK_PCT)
+        _ensure_webhook_worker()
+        _WEBHOOK_JOBS.put({
+            "record":                record,
+            "parsed_price":          float(price),
+            "resolved_inst":         inst,
+            "normalized":            alert_type,
+            "account_size":          account_size,
+            "risk_pct":              risk_pct,
+            "profile_name":          DEFAULT_PROFILE,
+            "webhook_received_at":   now,
+            "is_duplicate":          is_duplicate,
+            "cooldown_remaining_ms": cooldown_remaining_ms,
+        })
+        logger.info(
+            "Databento \u2192 webhook queue: %s %s @ %.4f%s",
+            inst, alert_type, price,
+            " (dup \u2014 cooldown %.0fs)" % cooldown_remaining_ms
+            if is_duplicate and cooldown_remaining_ms else "",
+        )
+    except Exception as exc:
+        logger.error("Databento structure trigger failed (%s %s): %s", inst, alert_type, exc)
 
 
 def _databento_bar_scan(inst: str, price: float) -> None:
@@ -62164,6 +62240,7 @@ if __name__ == "__main__":
             )
             _DATABENTO_BRAIN.start()
             _DATABENTO_BRAIN.register_bar_close_callback(_databento_bar_scan)
+            _DATABENTO_BRAIN.register_structure_signal_callback(_databento_structure_trigger)
             logger.info("DatabentoBrain: initialized and started")
         except Exception as _db_exc:
             logger.error("DatabentoBrain: failed to start — %s", _db_exc)
