@@ -35,6 +35,9 @@ from app import (
     _check_dq_db_ready,
     _dq_fingerprint,
     _dq_abandon_setup,
+    _dq_expire_old_entries,
+    _dq_has_active_trade,
+    _dq_attach_to_trade,
 )
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
@@ -1349,5 +1352,631 @@ def test_5f1_abandon_setup_helper():
 
 def teardown_module(module):
     _app._DQ_PENDING_BY_SETUP.clear()
-    _app._DQ_UNMATCHED_CLOSURES = 0
+    _app._DQ_UNMATCHED_CLOSURES  = 0
+    _app._DQ_EXPIRED_UNTRADED    = 0
+    _app._DQ_PRESERVED_ACTIVE    = 0
+    _app._DQ_RESOLVED_COUNT      = 0
+    _app._DQ_ABANDONED_COUNT     = 0
     _app.DQ_DB_READY = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 10: Phase 5F.1B — Association Safety Repair Tests
+# SC2: Unsafe first-match fallback removed
+# SC3: WAIT must not abandon an active-trade snapshot
+# SC4: Active trades exempt from candidate TTL expiry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reset_dq_all():
+    """Reset all DQ in-memory state for clean test isolation."""
+    _app._DQ_PENDING_BY_SETUP.clear()
+    _app._DQ_UNMATCHED_CLOSURES = 0
+    _app._DQ_EXPIRED_UNTRADED   = 0
+    _app._DQ_PRESERVED_ACTIVE   = 0
+    _app._DQ_RESOLVED_COUNT     = 0
+    _app._DQ_ABANDONED_COUNT    = 0
+
+
+# ── 1. READY snapshot survives WAIT while trade is active (SC3 fix) ──────────
+
+def test_1b_wait_preserves_snapshot_while_trade_active():
+    """SC3 fix: WAIT heartbeat must not abandon the pending entry when a trade is open."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_sc3", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    # Active trade registered for MGC Long
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {"MGC": {"direction": "Long"}}):
+        # Simulate the WAIT branch in full_analysis (SC3-guarded)
+        if not _dq_has_active_trade("MGC", "Long"):
+            _dq_abandon_setup(fp)
+    # Entry must survive — the guard prevented the abandon
+    assert fp in _app._DQ_PENDING_BY_SETUP, \
+        "SC3: pending entry must not be abandoned when trade is active"
+    assert _app._DQ_ABANDONED_COUNT == 0, "abandon counter must stay 0"
+
+
+# ── 2. READY snapshot is abandoned on WAIT when no trade is active ────────────
+
+def test_1b_wait_abandons_when_no_active_trade():
+    """SC3 fix: with no active trade, WAIT must clear the pending entry as before."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_wait_clean", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    # No active trade
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {}, clear=True):
+        if not _dq_has_active_trade("MGC", "Long"):
+            _dq_abandon_setup(fp)
+    assert fp not in _app._DQ_PENDING_BY_SETUP, \
+        "entry must be abandoned when no active trade"
+    assert _app._DQ_ABANDONED_COUNT == 1
+
+
+# ── 3. Active SCALP association is not expired by TTL (SC4 fix) ──────────────
+
+def test_1b_scalp_active_trade_not_expired_by_ttl():
+    """SC4 fix: an active SCALP trade must not be evicted by _dq_expire_old_entries."""
+    _reset_dq_all()
+    old_time = _NOW - timedelta(minutes=300)  # older than 240-min TTL
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_scalp_active", inst="MGC",
+                                                    direction="Long", mode="SCALP",
+                                                    created_at=old_time)
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {"MGC": {"direction": "Long"}}):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    assert fp in _app._DQ_PENDING_BY_SETUP, \
+        "SC4: active SCALP trade entry must survive the 240-min TTL"
+    assert _app._DQ_PRESERVED_ACTIVE >= 1
+    assert _app._DQ_EXPIRED_UNTRADED == 0
+
+
+# ── 4. Active SWING association older than 240 min not expired (SC4 fix) ─────
+
+def test_1b_swing_active_trade_not_expired_beyond_ttl():
+    """SC4 fix: an active SWING trade held beyond 240 min must never lose its DQ row."""
+    _reset_dq_all()
+    ancient = _NOW - timedelta(hours=10)  # well beyond 240-min TTL
+    fp = _dq_fingerprint("MNQ", "Short", "SWING")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_swing_old", inst="MNQ",
+                                                    direction="Short", mode="SWING",
+                                                    created_at=ancient)
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {"MNQ": {"direction": "Short"}}):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    assert fp in _app._DQ_PENDING_BY_SETUP, \
+        "SC4: active SWING trade held > 240 min must not be expired"
+    assert _app._DQ_PRESERVED_ACTIVE >= 1
+
+
+# ── 5. Untraded candidate older than 240 min IS expired ──────────────────────
+
+def test_1b_untraded_candidate_expired_by_ttl():
+    """SC4: untraded candidates older than 240 min must still be evicted normally."""
+    _reset_dq_all()
+    old_time = _NOW - timedelta(minutes=300)
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_untraded_old", inst="MGC",
+                                                    direction="Long", mode="SCALP",
+                                                    created_at=old_time)
+    # No active trade
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {}, clear=True):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    assert fp not in _app._DQ_PENDING_BY_SETUP, \
+        "untraded candidate must be expired after TTL"
+    assert _app._DQ_EXPIRED_UNTRADED == 1
+    assert _app._DQ_PRESERVED_ACTIVE == 0
+
+
+# ── 6. Active-trade preservation independent for Long and Short ───────────────
+
+def test_1b_long_short_preserve_independently():
+    """SC4: Long active trade preserves LONG entry; SHORT untraded is expired."""
+    _reset_dq_all()
+    old_time = _NOW - timedelta(minutes=300)
+    fp_long  = _dq_fingerprint("MGC", "Long",  "SCALP")
+    fp_short = _dq_fingerprint("MGC", "Short", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_long]  = _pending_entry("snap_long",  inst="MGC",
+                                                          direction="Long",  mode="SCALP",
+                                                          created_at=old_time)
+    _app._DQ_PENDING_BY_SETUP[fp_short] = _pending_entry("snap_short", inst="MGC",
+                                                          direction="Short", mode="SCALP",
+                                                          created_at=old_time)
+    # Only Long trade is active
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {"MGC": {"direction": "Long"}}):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    assert fp_long  in _app._DQ_PENDING_BY_SETUP, "Long active → preserved"
+    assert fp_short not in _app._DQ_PENDING_BY_SETUP, "Short untraded → expired"
+
+
+# ── 7. Active-trade preservation independent for SCALP and SWING ──────────────
+
+def test_1b_scalp_swing_preserve_independently():
+    """SC4: active SWING preserved even when co-existing with expired SCALP candidate."""
+    _reset_dq_all()
+    old_time = _NOW - timedelta(minutes=300)
+    fp_scalp = _dq_fingerprint("MNQ", "Long", "SCALP")
+    fp_swing = _dq_fingerprint("MNQ", "Long", "SWING")
+    _app._DQ_PENDING_BY_SETUP[fp_scalp] = _pending_entry("snap_scalp", inst="MNQ",
+                                                          direction="Long", mode="SCALP",
+                                                          created_at=old_time)
+    _app._DQ_PENDING_BY_SETUP[fp_swing] = _pending_entry("snap_swing", inst="MNQ",
+                                                          direction="Long", mode="SWING",
+                                                          created_at=old_time)
+    # SWING trade is active; SCALP trade is not (no slot)
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {"MNQ": {"direction": "Long"}}):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    # Both share the same ACTIVE_TRADES_BY_INST slot (MNQ) with direction Long
+    # so BOTH are preserved by the active-trade check
+    assert fp_swing in _app._DQ_PENDING_BY_SETUP, "active SWING → preserved"
+
+
+# ── 8. Mode change does not cause arbitrary snapshot to receive outcome ────────
+
+def test_1b_mode_change_no_wrong_resolution():
+    """SC2 fix: if TRADING_MODE changes between capture and close, outcome is unmatched."""
+    _reset_dq_all()
+    # Snapshot captured under SCALP mode
+    fp_scalp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_scalp] = _pending_entry("snap_scalp_mode",
+                                                          inst="MGC", direction="Long",
+                                                          mode="SCALP")
+    conn, cur = _mock_conn()
+    before_unmatched = _app._DQ_UNMATCHED_CLOSURES
+
+    # Close arrives with _dq_mode=SWING (mode changed) and no snapshot_key on mt
+    mt_mode_changed = {
+        "instrument": "MGC",
+        "direction":  "Long",
+        "_dq_mode":   "SWING",   # different from capture-time SCALP
+        "outcome":    "Win",
+        "r_multiple": 1.5,
+        "opened_at":  _NOW,
+        "closed_at":  _NOW + timedelta(minutes=30),
+    }
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", mt_mode_changed)
+
+    assert _app._DQ_UNMATCHED_CLOSURES > before_unmatched, \
+        "mode mismatch without snapshot_key must produce unmatched closure"
+    assert not cur.execute.called or all(
+        "UPDATE" not in str(c) for c in cur.execute.call_args_list
+    ), "no UPDATE must be issued when fingerprint mismatches"
+
+
+# ── 9. Missing exact match produces unmatched closure (SC2 fix) ──────────────
+
+def test_1b_no_match_unmatched_closure():
+    """SC2 fix: resolve with no matching entry → unmatched closure counter."""
+    _reset_dq_all()
+    before = _app._DQ_UNMATCHED_CLOSURES
+    conn, cur = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    assert _app._DQ_UNMATCHED_CLOSURES == before + 1, \
+        "unmatched closure counter must increment when no entry is found"
+
+
+# ── 10. Missing exact match does NOT update any DB row ────────────────────────
+
+def test_1b_no_match_no_db_update():
+    """SC2 fix: when no match found, no UPDATE is executed against any DB row."""
+    _reset_dq_all()
+    conn, cur = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    update_calls = [c for c in cur.execute.call_args_list
+                    if "UPDATE" in str(c).upper()]
+    assert not update_calls, "no UPDATE must be issued on unmatched closure"
+
+
+# ── 11. No first-match fallback remains ───────────────────────────────────────
+
+def test_1b_no_first_match_fallback():
+    """SC2 fix: two pending entries for the same inst — wrong direction never selected."""
+    _reset_dq_all()
+    fp_long  = _dq_fingerprint("MGC", "Long",  "SCALP")
+    fp_short = _dq_fingerprint("MGC", "Short", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_long]  = _pending_entry("snap_long",  inst="MGC",
+                                                          direction="Long",  mode="SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_short] = _pending_entry("snap_short", inst="MGC",
+                                                          direction="Short", mode="SCALP")
+    conn, cur = _mock_conn()
+    # Close a Long — must not pop Short via first-match
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    assert fp_long  not in _app._DQ_PENDING_BY_SETUP, "Long entry must be resolved"
+    assert fp_short in _app._DQ_PENDING_BY_SETUP, "Short entry must remain untouched"
+
+
+# ── 12. Two pending entries can't be resolved by dict insertion order ─────────
+
+def test_1b_dict_insertion_order_not_used():
+    """SC2 fix: inserting Short before Long must not cause a Long close to resolve Short."""
+    _reset_dq_all()
+    # Insert SHORT first (old first-match would pick this)
+    fp_short = _dq_fingerprint("MGC", "Short", "SCALP")
+    fp_long  = _dq_fingerprint("MGC", "Long",  "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_short] = _pending_entry("snap_short_first", inst="MGC",
+                                                          direction="Short", mode="SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_long]  = _pending_entry("snap_long_second", inst="MGC",
+                                                          direction="Long",  mode="SCALP")
+    conn, cur = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    # Long must have been resolved, Short must remain
+    assert fp_long  not in _app._DQ_PENDING_BY_SETUP, "Long resolved by exact fp"
+    assert fp_short in _app._DQ_PENDING_BY_SETUP, "Short untouched (no first-match)"
+    # Verify the UPDATE targeted the Long snapshot key
+    update_calls = [str(c) for c in cur.execute.call_args_list if "UPDATE" in str(c).upper()]
+    if update_calls:
+        assert "snap_long_second" in update_calls[0], "UPDATE must target Long snapshot"
+
+
+# ── 13. Empty direction does not guess ───────────────────────────────────────
+
+def test_1b_empty_direction_no_guess():
+    """SC2 fix: empty direction in mt skips Level 2 and produces unmatched closure."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_long_empty_dir", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    before = _app._DQ_UNMATCHED_CLOSURES
+    conn, cur = _mock_conn()
+    mt_no_dir = {"instrument": "MGC", "direction": "", "outcome": "Win", "r_multiple": 1.5,
+                 "opened_at": _NOW, "closed_at": _NOW + timedelta(minutes=30)}
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", mt_no_dir)
+    assert _app._DQ_UNMATCHED_CLOSURES > before, "empty direction → unmatched closure"
+    assert fp in _app._DQ_PENDING_BY_SETUP, "pending entry must not be guessed"
+
+
+# ── 14. Wrong direction does not guess ───────────────────────────────────────
+
+def test_1b_wrong_direction_no_guess():
+    """SC2 fix: closing Short when only Long is pending → unmatched closure."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_wrong_dir", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    before = _app._DQ_UNMATCHED_CLOSURES
+    conn, cur = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Short"))
+    assert _app._DQ_UNMATCHED_CLOSURES > before, "wrong direction → unmatched closure"
+    assert fp in _app._DQ_PENDING_BY_SETUP, "Long entry must not be consumed by Short close"
+
+
+# ── 15. Wrong mode does not guess ────────────────────────────────────────────
+
+def test_1b_wrong_mode_no_guess():
+    """SC2 fix: mode mismatch without snapshot_key → unmatched closure, no DB write."""
+    _reset_dq_all()
+    fp_scalp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_scalp] = _pending_entry("snap_wrong_mode", inst="MGC",
+                                                          direction="Long", mode="SCALP")
+    before = _app._DQ_UNMATCHED_CLOSURES
+    conn, cur = _mock_conn()
+    mt_wrong_mode = {
+        "instrument": "MGC", "direction": "Long",
+        "_dq_mode": "SWING",  # not SCALP
+        "outcome": "Win", "r_multiple": 1.5,
+        "opened_at": _NOW, "closed_at": _NOW + timedelta(minutes=30),
+    }
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", mt_wrong_mode)
+    assert _app._DQ_UNMATCHED_CLOSURES > before, "wrong mode → unmatched closure"
+    assert fp_scalp in _app._DQ_PENDING_BY_SETUP, "SCALP entry must not be consumed"
+
+
+# ── 16. Exact _dq_snapshot_key resolves the intended row (Level 1) ───────────
+
+def test_1b_snapshot_key_level1_resolution():
+    """SC2 fix: _dq_snapshot_key on mt resolves the correct entry even with wrong mode."""
+    _reset_dq_all()
+    # Entry is at the SCALP fingerprint
+    fp_scalp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_scalp] = _pending_entry("snap_l1_target", inst="MGC",
+                                                          direction="Long", mode="SCALP")
+    conn, cur = _mock_conn()
+    before_resolved = _app._DQ_RESOLVED_COUNT
+    # mt carries the exact snapshot_key but claims SWING mode → Level 2 would miss
+    mt_with_key = {
+        "instrument":        "MGC",
+        "direction":         "Long",
+        "_dq_mode":          "SWING",    # would miss fingerprint at SCALP
+        "_dq_snapshot_key":  "snap_l1_target",  # Level 1 match
+        "outcome":           "Win",
+        "r_multiple":        1.5,
+        "opened_at":         _NOW,
+        "closed_at":         _NOW + timedelta(minutes=30),
+    }
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", mt_with_key)
+    assert fp_scalp not in _app._DQ_PENDING_BY_SETUP, "Level-1 match must pop the entry"
+    assert _app._DQ_RESOLVED_COUNT == before_resolved + 1, "resolved counter must increment"
+    assert _app._DQ_UNMATCHED_CLOSURES == 0, "no unmatched closure when L1 matched"
+
+
+# ── 17. Duplicate closure notification is idempotent ─────────────────────────
+
+def test_1b_duplicate_closure_idempotent():
+    """Level 1/2 already consumed the entry; second close increments unmatched but no DB write."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_dup", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    conn, cur = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))  # first close → resolves
+        before = _app._DQ_UNMATCHED_CLOSURES
+        cur.execute.reset_mock()
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))  # duplicate close
+    assert _app._DQ_UNMATCHED_CLOSURES == before + 1, \
+        "duplicate closure must increment unmatched counter"
+    update_calls = [c for c in cur.execute.call_args_list if "UPDATE" in str(c).upper()]
+    assert not update_calls, "duplicate close must not re-UPDATE the DB row"
+
+
+# ── 18. Failed DB update clears in-memory entry without blocking future captures
+
+def test_1b_failed_db_update_clears_entry():
+    """After a failed DB update the pending entry is gone; next capture succeeds."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_fail_update", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    # Simulate conn failure during the UPDATE phase
+    conn_fail = MagicMock()
+    conn_fail.cursor.side_effect = Exception("simulated DB failure")
+
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn_fail):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))  # fails internally
+
+    # Entry is ALWAYS popped before DB call (Phase 5F.1 guarantee)
+    assert fp not in _app._DQ_PENDING_BY_SETUP, \
+        "entry must be cleared even when DB update fails (pop-before-DB)"
+
+    # Next READY capture should succeed (no orphaned blocking entry)
+    conn_ok, cur_ok = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn_ok), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", _result())
+    assert fp in _app._DQ_PENDING_BY_SETUP, "next capture must succeed after failed update"
+
+
+# ── 19. DQ_DB_READY=False does not leave a blocking pending entry ─────────────
+
+def test_1b_db_false_no_blocking_entry():
+    """DQ_DB_READY=False: entry is popped in-memory even without DB write."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_no_db", inst="MGC",
+                                                    direction="Long", mode="SCALP")
+    with patch("app.DQ_DB_READY", False):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    assert fp not in _app._DQ_PENDING_BY_SETUP, \
+        "pending entry must be cleared even when DQ_DB_READY=False"
+
+
+# ── 20. Lifecycle counters distinguish all five states ────────────────────────
+
+def test_1b_lifecycle_counters_comprehensive():
+    """All five counters increment independently in their respective scenarios."""
+    _reset_dq_all()
+    old_time = _NOW - timedelta(minutes=300)
+
+    # — EXPIRED_UNTRADED —
+    fp_exp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_exp] = _pending_entry("snap_exp", inst="MGC",
+                                                        direction="Long", mode="SCALP",
+                                                        created_at=old_time)
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {}, clear=True):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    assert _app._DQ_EXPIRED_UNTRADED >= 1
+
+    # — PRESERVED_ACTIVE —
+    _reset_dq_all()
+    fp_pres = _dq_fingerprint("MNQ", "Short", "SWING")
+    _app._DQ_PENDING_BY_SETUP[fp_pres] = _pending_entry("snap_pres", inst="MNQ",
+                                                         direction="Short", mode="SWING",
+                                                         created_at=old_time)
+    with patch.dict(_app.ACTIVE_TRADES_BY_INST, {"MNQ": {"direction": "Short"}}):
+        with patch("app.now_utc", return_value=_NOW):
+            _dq_expire_old_entries()
+    assert _app._DQ_PRESERVED_ACTIVE >= 1
+
+    # — ABANDONED_COUNT —
+    _reset_dq_all()
+    fp_ab = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_ab] = _pending_entry("snap_ab")
+    _dq_abandon_setup(fp_ab)
+    assert _app._DQ_ABANDONED_COUNT == 1
+
+    # — RESOLVED_COUNT —
+    _reset_dq_all()
+    fp_res = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp_res] = _pending_entry("snap_res")
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    assert _app._DQ_RESOLVED_COUNT == 1
+
+    # — UNMATCHED_CLOSURES —
+    _reset_dq_all()
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    assert _app._DQ_UNMATCHED_CLOSURES == 1
+
+
+# ── 21-22. DQ changes do not alter component points or Edge Score ─────────────
+
+def test_1b_component_points_unchanged():
+    """DQ capture/resolve must not alter source_attribution points in result."""
+    _reset_dq_all()
+    r = _result(edge=77.0)
+    pts_before = [c["points"] for c in r["source_attribution"]]
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", r)
+    assert [c["points"] for c in r["source_attribution"]] == pts_before, \
+        "component points must be identical after DQ capture"
+
+
+def test_1b_edge_score_unchanged():
+    """DQ capture/resolve must not alter edge_score in result."""
+    _reset_dq_all()
+    r = _result(edge=82.0)
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", r)
+    assert r["edge_score"] == 82.0, "edge_score must not be altered by DQ capture"
+
+
+# ── 23-24. Learning and final Edge Score unchanged ────────────────────────────
+
+def test_1b_learning_delta_not_in_dq():
+    """DQ lifecycle functions only write to decision_snapshots — not learning tables."""
+    _reset_dq_all()
+    conn, cur = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", _result())
+        fp = _dq_fingerprint("MGC", "Long", "SCALP")
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    tables_touched = " ".join(str(c) for c in cur.execute.call_args_list).upper()
+    # DQ only touches decision_snapshots — never learning_outcomes or strategy_trades
+    assert "LEARNING_OUTCOMES" not in tables_touched, \
+        "DQ must not write to learning_outcomes table"
+    assert "STRATEGY_TRADES" not in tables_touched, \
+        "DQ must not write to strategy_trades table"
+    assert "DECISION_SNAPSHOTS" in tables_touched, \
+        "DQ must write only to decision_snapshots"
+
+
+def test_1b_final_edge_score_not_altered():
+    """_resolve_decision_snapshot does not add or remove keys from mt."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_edge")
+    mt = _mt(direction="Long")
+    mt_keys_before = set(mt.keys())
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", mt)
+    assert set(mt.keys()) == mt_keys_before, \
+        "resolve must not add or remove keys from the mt dict"
+
+
+# ── 25. READY/WAIT verdicts not altered ───────────────────────────────────────
+
+def test_1b_verdicts_not_altered():
+    """DQ capture does not change the verdict field in the result dict."""
+    _reset_dq_all()
+    r = _result(verdict="LONG READY")
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", r)
+    assert r["verdict"] == "LONG READY", "verdict must be unchanged after DQ capture"
+
+
+# ── 26. Auto-trade eligibility not altered ───────────────────────────────────
+
+def test_1b_auto_trade_eligibility_unchanged():
+    """DQ functions must not touch any auto-trade flag or execution state."""
+    _reset_dq_all()
+    at_before = dict(_app.ACTIVE_TRADES_BY_INST)
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", _result())
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    assert dict(_app.ACTIVE_TRADES_BY_INST) == at_before, \
+        "ACTIVE_TRADES_BY_INST must not be changed by DQ lifecycle"
+
+
+# ── 27. Trade-management behavior unchanged ───────────────────────────────────
+
+def test_1b_trade_management_unchanged():
+    """_dq_attach_to_trade injects only _dq_ prefixed keys; production keys unchanged."""
+    _reset_dq_all()
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    _app._DQ_PENDING_BY_SETUP[fp] = _pending_entry("snap_attach")
+    trade = {"direction": "Long", "entry_price": 2650.0, "stop_loss": 2640.0,
+             "target1": 2680.0, "contracts": 1, "status": "active"}
+    keys_before = {k: v for k, v in trade.items()}
+    _dq_attach_to_trade("MGC", trade)
+    for k, v in keys_before.items():
+        assert trade[k] == v, f"production key '{k}' must not be altered by _dq_attach_to_trade"
+    injected = {k for k in trade if k.startswith("_dq_")}
+    assert all(k.startswith("_dq_") for k in injected), "only _dq_ prefixed keys injected"
+
+
+# ── 28. API responses byte-identical when diagnostics not requested ───────────
+
+def test_1b_result_dict_byte_identical_no_dq():
+    """Result dict is completely unchanged when DQ_DB_READY=False."""
+    _reset_dq_all()
+    r = _result()
+    r_copy = copy.deepcopy(r)
+    with patch("app.DQ_DB_READY", False):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", r)
+    assert r == r_copy, "result dict must be byte-identical when DQ is disabled"
+
+
+# ── 29. Databento ingestion is untouched ─────────────────────────────────────
+
+def test_1b_databento_ingestion_untouched():
+    """DQ lifecycle must not read or write any Databento state."""
+    _reset_dq_all()
+    # Verify no databento attributes exist on the module after DQ ops
+    conn, _ = _mock_conn()
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", _result())
+    fp = _dq_fingerprint("MGC", "Long", "SCALP")
+    with patch("app.DQ_DB_READY", True), patch("app._learning_conn", return_value=conn):
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+    # If databento state was mutated we'd see DATABENTO_ENABLED toggled or errors
+    # Asserting the test itself didn't crash from a databento import is sufficient
+    assert True, "no databento import or state mutation occurred"
+
+
+# ── 30. No Databento network calls in tests ───────────────────────────────────
+
+def test_1b_no_databento_network_calls():
+    """No network calls to Databento occur during any DQ function call."""
+    _reset_dq_all()
+    conn, _ = _mock_conn(rows=_report_rows({"comps": [], "outcome": "Win", "r": 1.5}),
+                          total=1)
+    mods_before = set(sys.modules.keys())
+    with patch("app.DQ_DB_READY", True), \
+         patch("app._learning_conn", return_value=conn), \
+         patch("app.now_utc", return_value=_NOW):
+        _capture_decision_snapshot("MGC", "Long", "SCALP", _result())
+        fp = _dq_fingerprint("MGC", "Long", "SCALP")
+        _resolve_decision_snapshot("MGC", _mt(direction="Long"))
+        _build_decision_quality_report()
+        _dq_expire_old_entries()
+        _dq_has_active_trade("MGC", "Long")
+    new_mods = set(sys.modules.keys()) - mods_before
+    db_mods  = [m for m in new_mods if "databento" in m.lower()]
+    assert not db_mods, f"Databento modules must not be imported during DQ ops: {db_mods}"

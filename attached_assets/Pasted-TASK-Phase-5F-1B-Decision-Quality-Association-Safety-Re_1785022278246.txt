@@ -1,0 +1,440 @@
+TASK: Phase 5F.1B — Decision Quality Association Safety Repair
+
+CRITICAL CONTEXT
+
+The Phase 5F.1A audit found four issues:
+
+SC1 — Distinct setups can share the same diagnostics fingerprint.
+
+SC2 — The fallback outcome matcher can select the first pending entry for an
+instrument and attach an outcome to the wrong snapshot.
+
+SC3 — A WAIT heartbeat can abandon the Decision Quality snapshot while the
+trade is still active.
+
+SC4 — The 240-minute TTL can expire the Decision Quality snapshot for an active
+SWING trade.
+
+This task repairs SC2, SC3, and SC4 only.
+
+SC1 must remain documented but must not be redesigned in this task.
+
+DO NOT expand backtesting coverage during this task.
+
+DO NOT change production trading behavior.
+
+DO NOT change:
+
+- Strategy logic
+- Strategy selection
+- Edge Score
+- Component points
+- Learning influence
+- READY / WAIT verdict logic
+- Gate thresholds
+- Auto-trade eligibility
+- Position sizing
+- Entry, stop, or targets
+- Trade management
+- Databento ingestion
+- TradingView ingestion
+- Backtesting behavior
+
+This is a diagnostics-association repair only.
+
+----------------------------------------------------
+PART 1 — PRE-FLIGHT
+----------------------------------------------------
+
+Before modifying code, capture:
+
+git branch --show-current
+git rev-parse HEAD
+git status --short
+git diff --check
+
+Run:
+
+- test_decision_quality.py
+- test_strategy_scan.py
+- all four golden suites
+
+Expected current results:
+
+- Decision Quality: 73/73 pass
+- Strategy Scan: 30/30 pass
+- Golden suites: 4/4 pass
+
+Stop and report if:
+
+- HEAD changed unexpectedly
+- Existing focused tests fail
+- Golden outputs differ before changes
+- The repair requires altering production trade state or execution behavior
+
+----------------------------------------------------
+PART 2 — REPAIR SC3: WAIT MUST NOT ABANDON AN ACTIVE TRADE
+----------------------------------------------------
+
+Current defect:
+
+A READY snapshot is captured.
+
+The trade opens.
+
+A later heartbeat returns WAIT.
+
+The current WAIT cleanup calls `_dq_abandon_setup()` and removes the pending
+analytics association even though the trade is still active.
+
+When the trade later closes, no matching Decision Quality entry remains.
+
+Repair this behavior.
+
+Before abandoning a pending setup because the verdict is WAIT:
+
+1. Inspect the existing active-trade state for the instrument.
+2. Determine whether an active trade corresponds to the pending direction and
+   mode.
+3. If a matching trade is active, preserve the Decision Quality pending entry.
+4. If no matching trade is active, the setup may be abandoned as before.
+
+Do not rely only on instrument presence when the active-trade state includes a
+direction.
+
+Use a small diagnostics-only helper if needed, such as:
+
+_dq_has_active_trade(inst, direction, mode)
+
+The helper must:
+
+- Read production trade state only
+- Never mutate production trade state
+- Fail safely
+- Return False on malformed or unavailable state
+- Never raise into full_analysis()
+
+Expected sequence:
+
+READY
+→ snapshot captured
+→ trade opens
+→ later WAIT heartbeat
+→ snapshot association remains
+→ trade closes
+→ correct snapshot resolves
+
+Expected untraded sequence:
+
+READY
+→ no trade opens
+→ later WAIT
+→ pending setup is abandoned
+→ later READY can be captured fresh
+
+----------------------------------------------------
+PART 3 — REPAIR SC4: ACTIVE TRADES MUST NOT EXPIRE BY TTL
+----------------------------------------------------
+
+Current defect:
+
+`_DQ_SETUP_TTL_MIN = 240` applies equally to:
+
+- untraded READY candidates
+- active SCALP trades
+- active SWING trades
+
+An active SWING held longer than four hours can lose its analytics association.
+
+Repair the TTL logic so active-trade associations are never removed by the
+candidate-expiry process.
+
+During `_dq_expire_old_entries()`:
+
+- Check whether each pending entry corresponds to an active trade.
+- If the trade is active, do not expire the entry.
+- If the entry is an untraded candidate and exceeds the TTL, expire it normally.
+
+Do not increase the global TTL as the primary fix.
+
+Do not make active SWING trades depend on an arbitrary fixed duration.
+
+Record lifecycle counters separately for:
+
+- expired untraded candidates
+- preserved active entries
+- resolved entries
+- abandoned entries
+- unmatched closures
+
+Do not feed these counters into scoring or execution.
+
+----------------------------------------------------
+PART 4 — REPAIR SC2: REMOVE UNSAFE FIRST-MATCH FALLBACK
+----------------------------------------------------
+
+Current defect:
+
+When the expected fingerprint is not found, `_resolve_decision_snapshot()` scans
+the pending dictionary and selects the first entry matching the instrument and
+possibly the direction.
+
+This can attach an outcome to the wrong snapshot.
+
+Remove the arbitrary first-match behavior.
+
+Required outcome matching behavior:
+
+1. Attempt the exact expected fingerprint or exact known snapshot reference.
+2. If an exact match exists, resolve it.
+3. If no exact match exists:
+   - increment the unmatched-closure diagnostic counter
+   - log a sanitized diagnostic message
+   - return without updating any snapshot row
+
+Never guess.
+
+Never attach an outcome using:
+
+- instrument only
+- first dictionary match
+- insertion order
+- current global mode when capture-time mode is unknown
+
+A missed analytics outcome is preferable to an incorrectly attributed outcome.
+
+Do not delete or modify unmatched database rows.
+
+----------------------------------------------------
+PART 5 — CAPTURE-TIME MODE SAFETY
+----------------------------------------------------
+
+The audit found that `_resolve_decision_snapshot()` uses:
+
+mt.get("_dq_mode") or TRADING_MODE
+
+but `_dq_mode` is not currently stored on the managed trade.
+
+Do not alter the production meaning of the managed-trade object.
+
+Where safe, attach a namespaced diagnostics-only reference to the managed trade
+when the trade is registered, such as:
+
+- `_dq_snapshot_key`
+- `_dq_fingerprint`
+- `_dq_mode`
+
+Only do this if:
+
+- It does not affect serialization or broker behavior
+- It does not alter position management
+- It does not change existing API output
+- It is ignored by all production logic
+
+Preferred matching order:
+
+1. `_dq_snapshot_key`
+2. `_dq_fingerprint`
+3. Exact fingerprint reconstructed from immutable capture-time fields
+4. Unmatched closure
+
+Do not use the unsafe first-match fallback.
+
+If safely storing the diagnostics reference on the managed trade is not
+possible, stop and report rather than guessing.
+
+----------------------------------------------------
+PART 6 — SC1 REMAINS DOCUMENTED
+----------------------------------------------------
+
+Do not expand the current fingerprint to include strategy, entry, or stop in
+this task.
+
+Document the remaining limitation:
+
+Two distinct untraded READY setups with the same:
+
+- instrument
+- direction
+- mode
+
+can still be treated as the same heartbeat sequence until a WAIT, abandon,
+expiry, direction change, resolution, or restart occurs.
+
+Do not claim SC1 is fixed.
+
+Return a proposed future fingerprint design using:
+
+instrument
+direction
+mode
+strategy key
+rounded entry
+rounded stop
+
+but do not implement it in this repair.
+
+----------------------------------------------------
+PART 7 — DATABASE BEHAVIOR
+----------------------------------------------------
+
+Do not change the existing performance calculations.
+
+Continue excluding unresolved rows from resolved-trade statistics.
+
+For unmatched closures:
+
+- Do not update an arbitrary row
+- Do not classify any unresolved snapshot as a loss
+- Do not fabricate an outcome
+
+For expired or abandoned untraded candidates:
+
+- Preserve existing diagnostics-only lifecycle behavior
+- Keep them excluded from resolved performance metrics
+
+Database failure must remain fail-open for trading.
+
+----------------------------------------------------
+PART 8 — TESTS
+----------------------------------------------------
+
+Add focused tests proving:
+
+1. READY snapshot survives WAIT while its matching trade is active.
+
+2. READY snapshot is abandoned on WAIT when no trade is active.
+
+3. An active SCALP association is not expired by TTL.
+
+4. An active SWING association older than 240 minutes is not expired.
+
+5. An untraded pending candidate older than 240 minutes is expired.
+
+6. Active-trade preservation works independently for Long and Short.
+
+7. Active-trade preservation works independently for SCALP and SWING.
+
+8. A mode change does not cause an arbitrary pending snapshot to receive the
+   outcome.
+
+9. Missing exact match produces an unmatched closure.
+
+10. Missing exact match does not UPDATE any database row.
+
+11. No first-match fallback remains.
+
+12. Two pending entries for one instrument cannot be resolved by dictionary
+    insertion order.
+
+13. A closure with an empty direction does not guess.
+
+14. A closure with the wrong direction does not guess.
+
+15. A closure with the wrong mode does not guess.
+
+16. Exact `_dq_snapshot_key` resolves the intended row.
+
+17. Duplicate closure notification remains idempotent.
+
+18. Failed database update clears or safely releases the in-memory association
+    without blocking future captures.
+
+19. `DQ_DB_READY=False` does not leave a blocking pending entry.
+
+20. Lifecycle counters distinguish abandoned, expired, preserved-active,
+    resolved, and unmatched.
+
+21. Decision Quality changes do not alter component points.
+
+22. Decision Quality changes do not alter base Edge Score.
+
+23. Decision Quality changes do not alter Learning delta.
+
+24. Decision Quality changes do not alter final Edge Score.
+
+25. Decision Quality changes do not alter READY / WAIT verdicts.
+
+26. Decision Quality changes do not alter auto-trade eligibility.
+
+27. Decision Quality changes do not alter trade-management behavior.
+
+28. Existing API responses remain byte-identical when diagnostics are not
+    requested.
+
+29. Databento ingestion is untouched.
+
+30. No Databento network calls occur in tests.
+
+All existing 73 Decision Quality tests must remain green or be updated only when
+their previous expectation represented the confirmed defect.
+
+----------------------------------------------------
+PART 9 — VALIDATION
+----------------------------------------------------
+
+Run:
+
+- Updated Decision Quality focused suite
+- Strategy Scan suite
+- Source Attribution suite
+- Decision Trace suites
+- Learning influence tests
+- Scoring and gate tests
+- All four golden workflows
+- Full regression suite
+
+Return exact counts.
+
+For regression failures claimed as pre-existing, reproduce them on the parent
+commit using the same command and environment.
+
+----------------------------------------------------
+PART 10 — REQUIRED REPORT
+----------------------------------------------------
+
+Return:
+
+1. Branch and starting HEAD
+2. Ending HEAD
+3. Working-tree status before and after
+4. Exact files changed
+5. SC2 repair details
+6. SC3 repair details
+7. SC4 repair details
+8. Managed-trade diagnostics reference design
+9. Exact outcome matching hierarchy
+10. TTL behavior for untraded candidates
+11. TTL behavior for active SCALP trades
+12. TTL behavior for active SWING trades
+13. WAIT behavior with no active trade
+14. WAIT behavior with an active trade
+15. Unmatched closure behavior
+16. Lifecycle-counter results
+17. Focused test results
+18. Golden test results
+19. Full regression results
+20. Parent-commit proof for pre-existing failures
+21. Confirmation that scoring did not change
+22. Confirmation that verdicts did not change
+23. Confirmation that execution did not change
+24. Confirmation that Databento ingestion was not modified
+25. Remaining SC1 limitation
+26. Recommendation for a future true setup-identity phase
+
+STOP CONDITIONS
+
+Stop and report before committing if:
+
+- Exact snapshot identity cannot be safely carried to the managed trade
+- The repair requires guessing which snapshot belongs to a closure
+- Active-trade detection is unreliable
+- An active trade can still be expired
+- A WAIT heartbeat can still abandon an active trade
+- More than one snapshot can compete for the same outcome
+- Database failure can block trading
+- Golden outputs change
+- HEAD changes unexpectedly
+- New unrelated regression failures appear
+
+MAKE ONLY THIS REPAIR.

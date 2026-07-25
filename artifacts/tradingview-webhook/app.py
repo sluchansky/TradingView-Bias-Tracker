@@ -133,9 +133,13 @@ LAST_TFA_BY_INST    = {}                 # inst → {ready_id, direction, ts}, d
 LIVE_TFA_BY_INST    = {}                 # inst → ready_id of the most recently triggered trade
 DQ_DB_READY              = False   # set by _check_dq_db_ready at boot
 _DQ_PENDING_BY_SETUP: dict = {}   # fp → {snapshot_key, inst, direction, mode, created_at}  (Phase 5F.1)
-_DQ_SETUP_TTL_MIN        = 240    # expire pending entries older than 4 hours
+_DQ_SETUP_TTL_MIN        = 240    # expire *untraded* candidates older than 4 hours; active trades are exempt
 _DQ_MAX_PENDING          = 100    # hard cap — prevents unbounded growth
 _DQ_UNMATCHED_CLOSURES   = 0     # closures with no matching pending snapshot (informational)
+_DQ_EXPIRED_UNTRADED     = 0     # untraded candidates removed by TTL (no active trade)
+_DQ_PRESERVED_ACTIVE     = 0     # pending entries kept because an active trade was found
+_DQ_RESOLVED_COUNT       = 0     # snapshots successfully resolved with a trade outcome
+_DQ_ABANDONED_COUNT      = 0     # pending entries removed by WAIT with no active trade
 # Retained (now unused): historical ENTER serialisation lock. Writes now go
 # through set_active_trade(), which serialises on ACTIVE_TRADES_LOCK.
 _ENTER_LOCK      = threading.Lock()
@@ -175,6 +179,7 @@ def set_active_trade(inst, trade, overwrite=True):
             return False
         ACTIVE_TRADES_BY_INST[inst] = trade
     _persist_active_trade(inst, trade)     # write-through; outside lock; fail-open
+    _dq_attach_to_trade(inst, trade)       # diagnostics-only DQ reference; fail-open
     return True
 
 
@@ -23928,9 +23933,11 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 result    = result,
             )
         elif _dq_inst and _dq_dir:
-            # WAIT verdict — clear pending entry so next READY is captured fresh.
-            # Purely in-memory (no DB call). Fail-open via _dq_abandon_setup.
-            _dq_abandon_setup(_dq_fingerprint(_dq_inst, _dq_dir, _dq_mode))
+            # WAIT verdict — clear pending entry ONLY when no active trade is using it.
+            # If a trade is open, the association must survive so the close can resolve
+            # the correct snapshot row (Phase 5F.1B SC3 fix).
+            if not _dq_has_active_trade(_dq_inst, _dq_dir):
+                _dq_abandon_setup(_dq_fingerprint(_dq_inst, _dq_dir, _dq_mode))
     except Exception as _dq_exc:
         logger.debug("DQ capture fail-open: %s", _dq_exc)
 
@@ -30276,47 +30283,121 @@ def _check_dq_db_ready():
         logger.warning("decision_snapshots table NOT ready: %s — Decision Quality disabled", exc)
 
 
+def _dq_has_active_trade(inst, direction):
+    """Return True if an active trade for `inst` matches `direction`.
+
+    Read-only — never mutates production state. When `direction` is empty the
+    check is inst-only (conservatively returns True when a trade exists so we
+    never drop an association we cannot verify). FAIL-SAFE: returns False on
+    any error. DIAGNOSTICS-ONLY."""
+    try:
+        if not inst:
+            return False
+        with ACTIVE_TRADES_LOCK:
+            at = ACTIVE_TRADES_BY_INST.get(inst)
+        if at is None:
+            return False
+        if not direction:
+            return True  # trade exists; direction unknown — preserve conservatively
+        return (at.get("direction") or "").strip().lower() == direction.strip().lower()
+    except Exception:
+        return False
+
+
+def _dq_attach_to_trade(inst, trade):
+    """Inject diagnostics-only DQ reference keys onto a newly-registered trade dict.
+
+    Called from set_active_trade so that _resolve_decision_snapshot can use
+    Level-1 exact snapshot_key matching instead of fingerprint reconstruction.
+    Keys written: _dq_snapshot_key, _dq_fingerprint, _dq_mode.
+
+    DIAGNOSTICS-ONLY — keys are prefixed `_dq_` and ignored by all production
+    logic (broker payloads, embeds, scoring, execution). FAIL-OPEN."""
+    try:
+        if not isinstance(trade, dict) or not inst:
+            return
+        direction = (trade.get("direction") or "").strip()
+        mode      = TRADING_MODE
+        fp        = _dq_fingerprint(inst, direction, mode)
+        entry     = _DQ_PENDING_BY_SETUP.get(fp)
+        if entry:
+            trade["_dq_snapshot_key"] = entry["snapshot_key"]
+            trade["_dq_fingerprint"]  = fp
+            trade["_dq_mode"]         = mode
+    except Exception:
+        pass  # must never raise into set_active_trade
+
+
 def _dq_fingerprint(inst, direction, mode):
     """Build a stable diagnostics fingerprint for setup identity.
 
     Uses inst + direction + mode so Long/Short and SCALP/SWING are tracked
     independently. Sequential same-direction setups share the same fingerprint
     but are distinguished by the WAIT-clearing hook in full_analysis.
-    DIAGNOSTICS-ONLY — never touches the money path."""
+    DIAGNOSTICS-ONLY — never touches the money path.
+
+    SC1 KNOWN LIMITATION: two distinct untraded setups on the same
+    inst+direction+mode lane (e.g. different strategy, entry, or stop) share
+    this fingerprint until a WAIT, abandon, expiry, or restart separates them.
+    A future phase may extend the fingerprint to include strategy key + rounded
+    entry + rounded stop — see Phase 5F.1A audit for the proposed design."""
     return f"{inst}::{direction}::{mode}"
 
 
 def _dq_expire_old_entries():
-    """Remove stale entries from _DQ_PENDING_BY_SETUP.
+    """Remove stale untraded candidates from _DQ_PENDING_BY_SETUP.
 
-    Evicts entries older than _DQ_SETUP_TTL_MIN and enforces _DQ_MAX_PENDING cap.
+    Evicts entries older than _DQ_SETUP_TTL_MIN, but EXEMPTS any entry whose
+    fingerprint corresponds to an active trade (SC4 fix — active SWING trades
+    must not lose their analytics association because of the candidate TTL).
+    Enforces _DQ_MAX_PENDING cap with the same active-trade exemption.
     Called before each INSERT to keep memory bounded. FAIL-OPEN."""
-    global _DQ_PENDING_BY_SETUP
+    global _DQ_PENDING_BY_SETUP, _DQ_EXPIRED_UNTRADED, _DQ_PRESERVED_ACTIVE
     try:
         from datetime import timedelta as _td
         cutoff  = now_utc() - _td(minutes=_DQ_SETUP_TTL_MIN)
-        expired = [k for k, v in _DQ_PENDING_BY_SETUP.items()
+        stale   = [k for k, v in _DQ_PENDING_BY_SETUP.items()
                    if v.get("created_at", now_utc()) < cutoff]
-        for k in expired:
+        for k in stale:
+            entry = _DQ_PENDING_BY_SETUP.get(k)
+            if not entry:
+                continue
+            if _dq_has_active_trade(entry.get("inst"), entry.get("direction")):
+                _DQ_PRESERVED_ACTIVE += 1  # active trade — do not expire
+                continue
             _DQ_PENDING_BY_SETUP.pop(k, None)
+            _DQ_EXPIRED_UNTRADED += 1
+
         if len(_DQ_PENDING_BY_SETUP) > _DQ_MAX_PENDING:
-            by_age = sorted(_DQ_PENDING_BY_SETUP.items(),
-                            key=lambda x: x[1].get("created_at", now_utc()))
-            excess = len(_DQ_PENDING_BY_SETUP) - _DQ_MAX_PENDING
-            for k, _ in by_age[:excess]:
+            by_age  = sorted(_DQ_PENDING_BY_SETUP.items(),
+                             key=lambda x: x[1].get("created_at", now_utc()))
+            to_trim = []
+            for k, v in by_age:
+                if len(to_trim) >= len(_DQ_PENDING_BY_SETUP) - _DQ_MAX_PENDING:
+                    break
+                if _dq_has_active_trade(v.get("inst"), v.get("direction")):
+                    _DQ_PRESERVED_ACTIVE += 1  # never evict active-trade entries for cap
+                    continue
+                to_trim.append(k)
+            for k in to_trim:
                 _DQ_PENDING_BY_SETUP.pop(k, None)
+                _DQ_EXPIRED_UNTRADED += 1
     except Exception as exc:
         logger.debug("_dq_expire_old_entries fail-open: %s", exc)
 
 
 def _dq_abandon_setup(fp):
-    """Remove a pending DQ entry when its setup reverts to WAIT.
+    """Remove a pending DQ entry when its setup reverts to WAIT and no trade is active.
 
-    Purely in-memory — no DB call. Ensures the next READY setup on the same
-    fingerprint is captured fresh rather than skipped as a heartbeat.
-    FAIL-OPEN — must never block trading."""
+    Only called after _dq_has_active_trade confirms no matching open trade exists
+    (SC3 fix — the WAIT branch in full_analysis guards the call). Purely in-memory
+    — no DB call. Ensures the next READY setup on the same fingerprint is captured
+    fresh rather than skipped as a heartbeat. FAIL-OPEN — must never block trading."""
+    global _DQ_ABANDONED_COUNT
     try:
-        _DQ_PENDING_BY_SETUP.pop(fp, None)
+        popped = _DQ_PENDING_BY_SETUP.pop(fp, None)
+        if popped is not None:
+            _DQ_ABANDONED_COUNT += 1
     except Exception as exc:
         logger.debug("_dq_abandon_setup fail-open: %s", exc)
 
@@ -30401,37 +30482,50 @@ def _capture_decision_snapshot(inst, direction, mode, result):
 def _resolve_decision_snapshot(inst, mt):
     """UPDATE the pending decision snapshot for `inst` with trade outcome data.
 
-    Looks up _DQ_PENDING_BY_SETUP using inst+direction+mode from mt. The in-memory
-    entry is ALWAYS popped before any DB call, so DQ_DB_READY=False never leaves a
-    blocking pending entry (fixes Phase 5F.1 defect #2).
-    Falls back to inst+direction match when mode is unknown.
-    FAIL-OPEN — never touches the money path."""
-    global _DQ_PENDING_BY_SETUP, _DQ_UNMATCHED_CLOSURES
+    Matching hierarchy (Phase 5F.1B SC2 fix — unsafe first-match fallback removed):
+
+    Level 1 — exact snapshot_key stored on the managed trade (_dq_snapshot_key).
+              Populated by _dq_attach_to_trade at trade registration; never guesses.
+    Level 2 — exact fingerprint reconstructed from inst + direction + _dq_mode.
+              Uses capture-time mode when available; falls back to current TRADING_MODE.
+    Level 3 — unmatched closure: increment counter, log, return without any DB write.
+
+    The in-memory entry is ALWAYS popped before any DB call, so DQ_DB_READY=False
+    never leaves a blocking pending entry.  FAIL-OPEN — never touches the money path."""
+    global _DQ_PENDING_BY_SETUP, _DQ_UNMATCHED_CLOSURES, _DQ_RESOLVED_COUNT
     if not inst:
         return
     try:
         direction = (mt.get("direction") or "").strip()
         mode      = mt.get("_dq_mode") or TRADING_MODE
-        fp        = _dq_fingerprint(inst, direction, mode)
 
-        # Pop from pending dict FIRST — always, even when DQ_DB_READY=False.
-        entry = _DQ_PENDING_BY_SETUP.pop(fp, None)
+        entry = None
 
-        # Fallback: match any pending entry for this inst+direction (mode unknown or
-        # changed). When direction is empty, match any entry for this inst.
-        if entry is None:
+        # Level 1: exact snapshot_key stored on the managed trade at registration.
+        snap_ref = (mt.get("_dq_snapshot_key") or "").strip()
+        if snap_ref:
             for k in list(_DQ_PENDING_BY_SETUP.keys()):
-                v = _DQ_PENDING_BY_SETUP[k]
-                if v.get("inst") == inst and (
-                        not direction or v.get("direction") == direction):
+                if _DQ_PENDING_BY_SETUP[k].get("snapshot_key") == snap_ref:
                     entry = _DQ_PENDING_BY_SETUP.pop(k, None)
                     break
 
+        # Level 2: exact fingerprint reconstruction (requires non-empty direction).
+        if entry is None and direction:
+            fp    = _dq_fingerprint(inst, direction, mode)
+            entry = _DQ_PENDING_BY_SETUP.pop(fp, None)
+
+        # Level 3: unmatched closure — never guess.
         if entry is None:
             _DQ_UNMATCHED_CLOSURES += 1
-            return  # no pending snapshot — safe no-op
+            logger.debug(
+                "DQ resolve: no match for inst=%s direction=%s mode=%s snap_ref=%s"
+                " — unmatched closure #%d",
+                inst, direction, mode, snap_ref or "(none)", _DQ_UNMATCHED_CLOSURES,
+            )
+            return
 
         snap_key = entry["snapshot_key"]
+        _DQ_RESOLVED_COUNT += 1
 
         if not DQ_DB_READY:
             logger.debug("DQ resolve: DB unavailable — entry cleared, no DB write for %s",
