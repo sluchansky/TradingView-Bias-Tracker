@@ -770,3 +770,83 @@ class TestFlagDefault(unittest.TestCase):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     unittest.main()
+
+# ===========================================================================
+# TM043–TM047: Orchestrator tests
+# ===========================================================================
+class TestOrchestrator(unittest.TestCase):
+    """Directly covers _right_brain_orchestrate() — 5 minimum scenarios."""
+
+    def setUp(self):
+        _clear_trade(_MGC_INST)
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = False
+
+    def tearDown(self):
+        _clear_trade(_MGC_INST)
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = False
+
+    # ── TM043 ────────────────────────────────────────────────────────────────
+    def test_TM043_flag_off_returns_empty_dict(self):
+        """TM043: orchestrator returns {} when all flags are OFF → right_brain key stays absent."""
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = False
+        result = _fake_result()
+        out = _app._right_brain_orchestrate(result)
+        self.assertEqual(out, {},
+                         "Expected empty dict when all module flags are OFF")
+        # Confirms caller's `if _rb_out:` prevents the key being set
+        self.assertNotIn("right_brain", result,
+                         "Orchestrator must not mutate result")
+
+    # ── TM044 ────────────────────────────────────────────────────────────────
+    def test_TM044_flag_on_produces_trade_management(self):
+        """TM044: orchestrator includes trade_management when flag is ON."""
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = True
+        result = _fake_result()
+        out = _app._right_brain_orchestrate(result)
+        self.assertIn("trade_management", out)
+        tm = out["trade_management"]
+        self.assertFalse(tm["affects_execution"])
+        self.assertTrue(tm["shadow_mode"])
+
+    # ── TM045 ────────────────────────────────────────────────────────────────
+    def test_TM045_module_failure_produces_neutral_fallback(self):
+        """TM045: management function raises → neutral block returned, no exception escapes."""
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = True
+        _inject_trade(_MGC_INST, _fake_trade())
+        orig = _app.compute_right_brain_trade_management
+        _app.compute_right_brain_trade_management = (
+            lambda r: (_ for _ in ()).throw(RuntimeError("tm-injected")))
+        try:
+            result = _fake_result(display_price=2706.0)
+            out = _app._right_brain_orchestrate(result)
+            tm = out.get("trade_management", {})
+            self.assertFalse(tm.get("available"),
+                             "Neutral block should set available=False")
+            self.assertFalse(tm.get("affects_execution"))
+            self.assertIn("tm-injected", tm.get("reason", ""))
+        finally:
+            _app.compute_right_brain_trade_management = orig
+
+    # ── TM046 ────────────────────────────────────────────────────────────────
+    def test_TM046_orchestrator_does_not_mutate_result(self):
+        """TM046: orchestrator never mutates the result dict — existing right_brain data preserved."""
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = True
+        result = _fake_result()
+        import copy
+        result_copy = copy.deepcopy(result)
+        # Orchestrator builds a NEW rb dict and returns it; caller assigns.
+        _app._right_brain_orchestrate(result)
+        for key in result_copy:
+            self.assertEqual(result.get(key), result_copy[key],
+                             f"Orchestrator mutated result[{key!r}]")
+
+    # ── TM047 ────────────────────────────────────────────────────────────────
+    def test_TM047_empty_result_input_no_exception(self):
+        """TM047: orchestrator handles empty result input without raising."""
+        _app.RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = True
+        try:
+            out = _app._right_brain_orchestrate({})
+            self.assertIn("trade_management", out,
+                          "Expected at least FLAT trade_management in empty-result case")
+        except Exception as exc:
+            self.fail(f"_right_brain_orchestrate({{}}) raised: {exc}")

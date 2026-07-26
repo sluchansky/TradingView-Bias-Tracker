@@ -1,0 +1,589 @@
+TASK: Phase 6B.2 Final Closure — Right Brain Trade Management and Market-Open Readiness
+
+OBJECTIVE
+
+Finish and verify the Right Brain Trade Management feature already implemented.
+
+Do not add another Right Brain module.
+
+Do not implement Dynamic Stop Manager.
+
+Do not implement partial-profit automation.
+
+Do not implement scaling.
+
+Do not begin Market Context.
+
+Do not begin Learning.
+
+Do not change trade execution.
+
+The objective is to close Phase 6B.2 cleanly and determine whether the verified
+revision is safe to display during tonight's live market session.
+
+====================================================
+1. STOP DEVELOPMENT AND RECORD THE REPOSITORY STATE
+====================================================
+
+Immediately record:
+
+git branch --show-current
+git rev-parse HEAD
+git log -8 --oneline
+git status --short
+git diff --check
+git show --stat --oneline HEAD
+git show --name-status HEAD
+
+Report:
+
+- branch
+- starting Phase 6B.2 commit
+- architecture-refactor commit
+- current HEAD
+- tracked modifications
+- untracked files
+
+If HEAD changes unexpectedly during this task, stop and report.
+
+====================================================
+2. VERIFY THE ORCHESTRATOR REFACTOR EXACTLY
+====================================================
+
+Show the exact diff for:
+
+- `_right_brain_orchestrate(result)`
+- the `full_analysis()` integration point
+- any feature flag changes
+- any `/status` changes
+- any dashboard changes
+
+Prove that the orchestrator refactor changed only assembly and routing.
+
+Confirm:
+
+- `compute_right_brain_trade_management(result)` behavior is unchanged
+- score logic is unchanged
+- recommendation logic is unchanged
+- output schema is unchanged
+- feature-flag behavior is unchanged
+- fail-open behavior is unchanged
+- no execution field changed
+
+Do not rely only on the fact that tests passed.
+
+Provide a concise code-path comparison:
+
+BEFORE:
+full_analysis → trade management directly
+
+AFTER:
+full_analysis → right-brain orchestrator → trade management
+
+List every function whose body changed.
+
+====================================================
+3. REMOVE ACCIDENTAL TASK ATTACHMENTS
+====================================================
+
+Check for accidentally tracked task files:
+
+git ls-files attached_assets/ | grep -E "Pasted|TASK|Phase-6B" || true
+
+Remove any accidentally committed task instruction attachment from Git.
+
+Do not remove legitimate application assets.
+
+Do not commit the current instruction attachment.
+
+Verify afterward:
+
+git ls-files attached_assets/ | grep -E "Pasted|TASK|Phase-6B" || true
+git status --short
+
+The final tracked-task-file check must return no accidental instruction files.
+
+Use a separate cleanup commit if necessary.
+
+====================================================
+4. FEATURE FLAG VERIFICATION
+====================================================
+
+Identify the exact flag:
+
+RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED
+
+Report:
+
+- source default
+- development value
+- production value
+- whether restart or redeploy is required for a value change
+
+Preferred behavior:
+
+FLAG OFF:
+- no `trade_management` diagnostic block
+- all pre-existing output remains unchanged
+
+FLAG ON:
+- nested diagnostic block appears inside `right_brain`
+- all pre-existing non-diagnostic fields remain unchanged
+- no order behavior changes
+
+Do not change the production value until the validation is complete.
+
+====================================================
+5. VERIFY THE RIGHT BRAIN OUTPUT CONTRACT
+====================================================
+
+Return sanitized examples for:
+
+A. No active trade
+
+B. Active profitable Long trade
+
+C. Active losing Long trade
+
+D. Active profitable Short trade
+
+E. Active losing Short trade
+
+F. Missing-data scenario
+
+G. Internal management exception
+
+For every example show:
+
+- `available`
+- `shadow_mode`
+- `affects_execution`
+- `active_trade`
+- snapshot
+- trade health
+- management confidence
+- thesis status
+- exit pressure
+- recommendation
+
+Confirm the result is nested at:
+
+result["right_brain"]["trade_management"]
+
+Confirm existing Right Brain fields remain present and unchanged.
+
+====================================================
+6. VERIFY ACTIVE-TRADE DATA SOURCES
+====================================================
+
+For every snapshot field, document its exact source:
+
+Field
+Source object/function
+Live or derived
+Can be missing
+Fallback behavior
+
+Include:
+
+- instrument
+- strategy
+- mode
+- direction
+- entry
+- current price
+- stop
+- target
+- quantity
+- start timestamp
+- time in trade
+- unrealized P&L
+- current R
+- MFE/HFE
+- MAE/HAE
+- highest price
+- lowest price
+- VWAP relationship
+- structure
+- momentum
+- volume
+- delta/CVD
+- volatility
+- original thesis
+- invalidation
+
+Do not claim a field is supported when it is currently always unavailable.
+
+Clearly separate:
+
+- fully available
+- conditionally available
+- not currently available.
+
+====================================================
+7. VERIFY ORIGINAL-THESIS INTEGRITY
+====================================================
+
+Prove whether the Right Brain reads an entry-time thesis snapshot or reconstructs
+the thesis from current data.
+
+Report the exact source of:
+
+- original strategy
+- original direction
+- original regime
+- original VWAP state
+- original structure
+- original confidence
+- original edge score
+- original invalidation
+- original stop
+- original target
+
+If any original factor is unavailable, preserve the current honest unavailable
+behavior.
+
+Do not add new persistence during this closure task.
+
+====================================================
+8. EXECUTION-ISOLATION PROOF
+====================================================
+
+Run the same representative scenarios with the feature OFF and ON.
+
+Compare all pre-existing fields including:
+
+- verdict
+- bias
+- direction
+- confidence
+- edge score
+- strategy selection
+- trade plan
+- entry
+- stop
+- target
+- invalidation
+- contracts
+- active-trade state
+- management state
+- prop guard
+- duplicate guard
+- daily-loss guard
+- dispatch decision
+- TradersPost payload
+- learning write intent
+
+Required scenarios:
+
+1. No active trade
+2. Active Long
+3. Active Short
+4. Profitable Long
+5. Losing Long
+6. Profitable Short
+7. Losing Short
+8. SCALP
+9. SWING
+10. Opening Drive
+11. ORB
+12. LSR
+13. VTC
+14. REB
+15. Missing input
+16. Trade-management exception
+
+Return:
+
+- scenario count
+- mismatched pre-existing field count
+- list of mismatches
+- expected diagnostic-only differences
+
+Required conclusion when successful:
+
+“All pre-existing non-diagnostic fields are identical with the Right Brain Trade
+Management feature OFF and ON.”
+
+Do not call the entire response byte-identical because the diagnostic block is
+expected to differ.
+
+====================================================
+9. ORCHESTRATOR FAILURE ISOLATION
+====================================================
+
+Test the orchestrator itself, not only the management function.
+
+Inject failures for:
+
+- management function raises
+- neutral fallback raises
+- malformed management return
+- `right_brain` already contains existing data
+- `right_brain` contains an unexpected but valid dictionary field
+- feature flag disabled
+- no active trade
+- active trade missing required fields
+
+Prove:
+
+- existing Right Brain fields are preserved
+- no exception escapes into `full_analysis`
+- no trade field changes
+- no execution behavior changes
+- one module cannot overwrite another module's namespace
+- no empty `right_brain` block appears when all modules are disabled, unless that
+  is existing expected behavior
+
+====================================================
+10. DASHBOARD VALIDATION
+====================================================
+
+Start the development application and inspect the Right Brain panel.
+
+Verify visually and from browser/runtime logs:
+
+- panel appears inside the existing Right Brain
+- no separate third brain is created
+- no duplicate Trade Management panel
+- no JavaScript exception
+- no undefined-value spam
+- no repeated DOM insertion
+- no layout corruption
+- no mobile-breaking overflow introduced
+- `NO ACTIVE TRADE` renders safely
+- active Long renders
+- active Short renders
+- unavailable inputs render honestly
+- shadow-only warning is visible
+- the dashboard does not calculate business scores
+
+Return a screenshot description or exact observed rendering state.
+
+Do not redesign the dashboard.
+
+Only fix a blocking rendering defect.
+
+====================================================
+11. TEST INVENTORY
+====================================================
+
+List all 42 Right Brain Trade Management tests by test name and category.
+
+Separate:
+
+- unit tests
+- output-contract tests
+- Long/Short tests
+- SCALP/SWING tests
+- strategy-aware tests
+- missing-data tests
+- exception tests
+- isolation tests
+- orchestrator tests
+- dashboard tests, if any
+
+The report says 42/42 passed.
+
+Verify whether the 42 tests include the new orchestrator.
+
+If the orchestrator is not directly covered, add only the minimum focused tests
+needed to cover:
+
+- feature disabled
+- feature enabled
+- existing Right Brain fields preserved
+- module failure handled
+- empty result behavior
+
+Do not expand beyond this scope.
+
+====================================================
+12. TARGETED REGRESSION SUITES
+====================================================
+
+Run and report separately:
+
+A. Right Brain Trade Management tests
+
+B. Existing Right Brain training/evaluation tests
+
+C. Active-trade management tests
+
+D. Full-analysis tests
+
+E. Strategy-engine tests
+
+F. Decision-trace Phase 5B tests
+
+G. Decision-trace Phase 5C tests
+
+H. Confidence-integrity tests
+
+I. Decision-quality tests
+
+J. Learning-score influence tests
+
+K. TradersPost isolation tests
+
+L. Prop-guard tests
+
+M. Duplicate-guard tests
+
+N. Databento-specific tests
+
+O. Golden workflows:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+
+Clearly identify:
+
+- passed
+- failed
+- skipped
+- not found
+- pre-existing failures
+- new failures
+
+Do not fix unrelated failures during this task.
+
+====================================================
+13. LIVE MARKET-DATA SMOKE TEST
+====================================================
+
+Without sending a broker order, verify:
+
+- application boots cleanly
+- Databento initializes
+- no repeated reconnect loop
+- no duplicate subscription
+- timestamps are fresh when the feed is active
+- market-closed state is handled safely
+- Right Brain reports no active trade when flat
+- Right Brain activates only when a legitimate active-trade object exists
+- no replay or synthetic trade is interpreted as live
+- no Right Brain recommendation triggers an outbound send
+
+Use safe development or suppressed-send mode.
+
+Do not create an artificial live order.
+
+====================================================
+14. PRODUCTION REVISION AND DEPLOYMENT DECISION
+====================================================
+
+Identify:
+
+- current source HEAD
+- currently deployed revision
+- whether production contains the Phase 6B.2 implementation
+- whether production contains the orchestrator refactor
+- whether production contains accidental attachments
+- whether environment flags require a restart
+- whether a deployment is required
+
+Return:
+
+Source HEAD:
+Deployed revision:
+Revision match:
+Flag reload required:
+Deployment required:
+Reason:
+
+Do not deploy until all blocking checks above pass.
+
+====================================================
+15. CONTROLLED DEPLOYMENT
+====================================================
+
+Only if deployment is necessary and all blocking checks pass:
+
+1. Commit only intended code, tests, report, and cleanup.
+2. Verify clean Git state.
+3. Deploy the exact tested commit.
+4. Capture the deployed revision.
+5. Capture boot logs.
+6. Confirm Databento initialization.
+7. Confirm the feature-flag state.
+8. Confirm the Right Brain panel renders.
+9. Confirm no unexpected outbound TradersPost request.
+10. Confirm no crash or restart loop.
+
+Do not make additional code changes during deployment.
+
+If platform policy requires manual publish confirmation, stop and state exactly
+what button or action the user must perform.
+
+====================================================
+16. FINAL REPORT
+====================================================
+
+Return the complete Phase 6B.2 closure report:
+
+1. Branch
+2. Starting HEAD
+3. Final HEAD
+4. Commit history created during Phase 6B.2
+5. Exact files changed
+6. Exact functions changed
+7. Orchestrator diff assessment
+8. Feature flag state
+9. Output contract
+10. Active-trade input availability
+11. Original-thesis integrity
+12. Long/Short behavior
+13. SCALP/SWING behavior
+14. Strategy-aware behavior
+15. Missing-data behavior
+16. Failure behavior
+17. Execution-isolation proof
+18. Orchestrator-isolation proof
+19. ON/OFF parity results
+20. Test inventory
+21. Regression results
+22. Golden workflow results
+23. Dashboard validation
+24. Databento smoke-test result
+25. Git status
+26. Accidental attachment cleanup
+27. Source revision
+28. Deployed revision
+29. Deployment result
+30. Known limitations
+31. Blocking issues
+32. Non-blocking warnings
+33. Market-open readiness
+
+Final Phase 6B.2 status must be exactly one:
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_COMPLETE
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_COMPLETE_WITH_WARNINGS
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_BLOCKED
+
+Market status must be exactly one:
+
+MARKET_OPEN_READY
+
+MARKET_OPEN_READY_WITH_WARNINGS
+
+MARKET_OPEN_NOT_READY
+
+After returning the report, stop.
+
+DO NOT ADD ANOTHER RIGHT BRAIN MODULE.
+
+DO NOT AUTOMATE EXITS.
+
+DO NOT AUTOMATE STOP MOVEMENT.
+
+DO NOT BEGIN MARKET CONTEXT.
+
+DO NOT BEGIN LEARNING.
+
+DO NOT OPTIMIZE STRATEGIES.
