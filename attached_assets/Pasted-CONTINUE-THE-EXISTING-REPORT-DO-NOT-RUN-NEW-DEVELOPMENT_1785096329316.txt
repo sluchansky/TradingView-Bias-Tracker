@@ -1,0 +1,135 @@
+CONTINUE THE EXISTING REPORT — DO NOT RUN NEW DEVELOPMENT
+
+You stopped after Section 2.
+
+Return the remainder of the completed Phase 6B.2 Final Closure report from
+Section 3 onward.
+
+Do not summarize or restart the audit.
+
+Do not modify code.
+
+Do not add another commit unless an already-discovered blocking defect requires
+it.
+
+Include the exact results already gathered for:
+
+3. Accidental task-attachment verification
+
+4. Feature flag verification
+   - source default
+   - development value
+   - production value
+   - restart/redeploy requirement
+
+5. Right Brain output-contract examples
+   - no active trade
+   - profitable Long
+   - losing Long
+   - profitable Short
+   - losing Short
+   - missing inputs
+   - internal exception
+
+6. Active-trade data-source audit
+   - fully available fields
+   - conditionally available fields
+   - unavailable fields
+   - exact source and fallback for each
+
+7. Original-thesis integrity
+   - which factors are true entry-time snapshots
+   - which factors are reconstructed
+   - which are unavailable
+
+8. Execution-isolation proof
+   - total scenarios
+   - mismatch count
+   - exact mismatches
+   - expected diagnostic-only differences
+
+9. Orchestrator failure-isolation results
+   - include all five new tests by exact name
+   - confirm existing Right Brain fields are preserved
+   - confirm no exception reaches full_analysis
+
+10. Dashboard validation
+   - exact rendering result
+   - screenshot findings
+   - JavaScript errors
+   - duplicate panel status
+   - flat-state rendering
+   - active-trade rendering
+   - shadow-only label visibility
+
+11. Complete 47-test inventory
+   - grouped by category
+   - identify the five new orchestrator tests
+
+12. All targeted regression suites
+   - passed
+   - failed
+   - skipped
+   - not found
+   - pre-existing failures
+   - new failures
+
+13. Golden workflow results
+   - parity
+   - scalp_golden
+   - dual_sim
+   - breakout_mode
+
+14. Databento/live-feed smoke test
+   - boot status
+   - initialization
+   - subscriptions
+   - reconnect behavior
+   - timestamp freshness
+   - market-closed handling
+   - evidence no recommendation can send an order
+
+15. Production revision and deployment decision
+   - source HEAD
+   - deployed revision
+   - revision match
+   - feature-flag reload requirement
+   - whether deployment was completed
+   - boot-log result
+   - no unintended outbound order result
+
+16. Git final state
+   - git status --short
+   - git diff --check
+   - tracked task-file search
+   - final HEAD
+
+17. Known limitations
+
+18. Blocking issues
+
+19. Non-blocking warnings
+
+20. Final classifications
+
+Use exactly one Phase status:
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_COMPLETE
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_COMPLETE_WITH_WARNINGS
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_BLOCKED
+
+Use exactly one market status:
+
+MARKET_OPEN_READY
+
+MARKET_OPEN_READY_WITH_WARNINGS
+
+MARKET_OPEN_NOT_READY
+
+Do not begin another phase.
+
+Do not add another Right Brain module.
+
+Do not automate exits or stop movement.
