@@ -388,6 +388,37 @@ def test_27_coverage_logic_does_not_invoke_run_backtest():
             "coverage classification mutated engine state")
 
 
+def test_28_coverage_api_would_be_dispatched_not_invoked():
+    """bt_coverage response dict uses 'would_be_dispatched' (not 'invoked').
+
+    The field was renamed so its semantics are unambiguous: 'invoked' implies the
+    strategy was actually called during a backtest run, but coverage is a static
+    read of module-level dicts and never executes any strategy. 'would_be_dispatched'
+    correctly documents the intent: eligible strategies WOULD run if backtest is
+    called with default params.
+
+    Verified two ways:
+      1. The new key appears in app.py's bt_coverage dict literal.
+      2. The old 'invoked' key no longer appears in that dict literal.
+    """
+    _app_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
+    with open(_app_py, encoding="utf-8") as f:
+        src = f.read()
+
+    # New key must be present
+    assert '"would_be_dispatched"' in src, (
+        "bt_coverage response dict must contain 'would_be_dispatched' key")
+
+    # Old key must not appear as a dict entry (the exact stanza that was renamed)
+    assert '"invoked":               eligible' not in src, (
+        "Old 'invoked' dict key still present in bt_coverage — "
+        "should have been renamed to 'would_be_dispatched'")
+
+    # Structural check: 'would_be_dispatched' and 'eligible' are distinct fields
+    # (would_be_dispatched == eligible for now, but the names are separately present)
+    assert '"eligible"' in src, "'eligible' field must still exist alongside 'would_be_dispatched'"
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Self-runner
 # ════════════════════════════════════════════════════════════════════════════

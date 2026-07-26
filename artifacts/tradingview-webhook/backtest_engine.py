@@ -167,11 +167,11 @@ OPT_GRADES = ["All", "B", "A", "A+"]
 OPT_GRADE_FLOOR = {"All": 0, "B": 50, "A": 70, "A+": 85}
 OPT_GRADE_LABELS = {"All": "All grades", "B": "B or better",
                     "A": "A or better", "A+": "A+ only"}
-OPT_MANAGEMENTS = ["target_1r", "target_1_5r", "target_2r",
+OPT_MANAGEMENTS = ["target_1r", "target_1_5r", "target_2r", "target_4r",
                    "partial_1r_runner_2r", "be_after_1r"]
 OPT_MGMT_LABELS = {
     "target_1r": "1.0R target", "target_1_5r": "1.5R target",
-    "target_2r": "2.0R target",
+    "target_2r": "2.0R target", "target_4r": "4.0R target (ORB live parity)",
     "partial_1r_runner_2r": "Partial @1R, runner @2R",
     "be_after_1r": "BE after 1R (2R target)"}
 # Single-run management models = the optimizer's R-based set PLUS the legacy
@@ -184,6 +184,16 @@ BT_RUN_MANAGEMENTS = OPT_MANAGEMENTS + [BT_MGMT_LEGACY]
 BT_DEFAULT_MGMT = "target_1_5r"
 BT_RUN_MGMT_LABELS = {**OPT_MGMT_LABELS,
                       BT_MGMT_LEGACY: "Partial @TP1 → TP3 (legacy, BE)"}
+# Per-strategy management override (mirrors live _apply_orb_target_override):
+# ORB's live stop is ATR-based (identical to all other strategies via
+# _dynamic_stop_plan / bt_stop_plan) but its TARGET is always rewritten to 4R
+# by _apply_orb_target_override before the trade card or broker order fires.
+# Apply the same 4R override here for any fixed-R management model. The legacy
+# partial-spec model (BT_MGMT_LEGACY) is left intact — it uses absolute spec-
+# point targets, not a risk multiple.
+STRATEGY_MGMT_OVERRIDE = {
+    "OPENING_RANGE_BREAKOUT": "target_4r",
+}
 OPT_MIN_TRADES = 10        # min trades for a combo to enter best/worst rankings
 OPT_TABLE_ROWS = 250       # ranked combinations retained for the table + CSV
 
@@ -1083,6 +1093,16 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
         # with a breakeven stop; the R-based models (default) let the position run
         # to a fixed/partial R target so winners are not capped at breakeven. All
         # paths keep worst-case same-bar fills.
+        #
+        # Per-strategy target override (mirrors live _apply_orb_target_override):
+        # ORB always uses a 4R target in production. When the global management is
+        # a fixed-R model (not legacy), override for ORB so BT parity holds. The
+        # global management param is preserved for all other strategies and for the
+        # optimizer sweep, which explicitly passes its management of choice.
+        effective_mgmt = (
+            STRATEGY_MGMT_OVERRIDE.get(strat_key, management)
+            if management != BT_MGMT_LEGACY else BT_MGMT_LEGACY
+        )
         commission = commission_per_side * 2.0
         if management == BT_MGMT_LEGACY:
             (exit_price, exit_bar, exit_reason,
@@ -1096,16 +1116,17 @@ def simulate_strategy(snaps, candles, strat_key, spec, mode,
         else:
             (exit_price, exit_bar, exit_reason,
              r_gross) = _walk_managed(candles, entry_bar, direction, entry,
-                                      stop, risk, slip, management)
+                                      stop, risk, slip, effective_mgmt)
             comm_r = (commission / (risk * pv)) if risk > 0 else 0.0
             r_mult = r_gross - comm_r
             gross_pts = r_gross * risk
             pnl_dollars = r_gross * risk * pv - commission
             # Nominal target levels for the trade log / CSV (R-based, per model).
             _rr = {"target_1r": 1.0, "target_1_5r": 1.5, "target_2r": 2.0,
-                   "partial_1r_runner_2r": 2.0, "be_after_1r": 2.0}.get(management, 1.0)
+                   "partial_1r_runner_2r": 2.0, "be_after_1r": 2.0,
+                   "target_4r": 4.0}.get(effective_mgmt, 1.0)
             _first = {"partial_1r_runner_2r": 1.0,
-                      "be_after_1r": 1.0}.get(management, _rr)
+                      "be_after_1r": 1.0}.get(effective_mgmt, _rr)
             if direction == "Long":
                 disp_tp1, disp_tp3 = entry + _first * risk, entry + _rr * risk
             else:
@@ -1555,8 +1576,8 @@ def _walk_managed(candles, entry_bar, direction, entry, stop, risk, slip, mgmt):
     def tp(rr):
         return entry + rr * R if long else entry - rr * R
 
-    if mgmt in ("target_1r", "target_1_5r", "target_2r"):
-        rr = {"target_1r": 1.0, "target_1_5r": 1.5, "target_2r": 2.0}[mgmt]
+    if mgmt in ("target_1r", "target_1_5r", "target_2r", "target_4r"):
+        rr = {"target_1r": 1.0, "target_1_5r": 1.5, "target_2r": 2.0, "target_4r": 4.0}[mgmt]
         tgt = tp(rr)
         j = entry_bar
         while j < n:
