@@ -58450,7 +58450,7 @@ function blLoadList(){
         +'<td style="padding:4px 6px;text-align:right">'+(r.completed_combinations!=null?r.completed_combinations:'—')+'</td>'
         +'<td style="padding:4px 6px;text-align:right;color:var(--muted)">'+(r.zero_trade_combinations||0)+'</td>'
         +'<td style="padding:4px 6px;text-align:right;font-size:11px;color:var(--muted)">'+dt+'</td>'
-        +'<td style="padding:4px 6px"><button class="bt-btn" onclick="blLoadDetail(\''+r.baseline_id+'\')">View</button></td>'
+        +'<td style="padding:4px 6px"><button class="bt-btn" onclick="blLoadDetail(\\\''+r.baseline_id+'\\\')">View</button></td>'
         +'</tr>';
     });
     html+='</tbody></table>';
