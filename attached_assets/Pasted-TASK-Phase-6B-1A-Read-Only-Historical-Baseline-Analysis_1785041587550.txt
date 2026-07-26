@@ -1,0 +1,822 @@
+TASK: Phase 6B.1A — Read-Only Historical Baseline Analysis Report
+
+OBJECTIVE
+
+Produce a complete human-readable analysis of the first official historical
+baseline.
+
+Baseline ID:
+
+BL-20260726-042830-0cc8364
+
+This task is read-only analysis.
+
+DO NOT modify strategy logic.
+
+DO NOT optimize parameters.
+
+DO NOT regenerate the baseline.
+
+DO NOT add learning.
+
+DO NOT add APIs.
+
+DO NOT add database tables.
+
+DO NOT add dashboard features.
+
+DO NOT modify Databento.
+
+DO NOT modify TradersPost.
+
+DO NOT modify live execution.
+
+DO NOT commit code unless a read-only reporting script is absolutely required.
+
+Prefer direct database queries and existing baseline APIs.
+
+----------------------------------------------------
+PART 1 — PRE-FLIGHT
+----------------------------------------------------
+
+Run:
+
+git branch --show-current
+git rev-parse HEAD
+git log -7 --oneline
+git status --short
+git diff --check
+
+Confirm:
+
+- baseline BL-20260726-042830-0cc8364 exists
+- baseline is complete
+- exactly 40 matrix results exist
+- exactly 7,909 trade records exist
+- breakdown records exist
+- no source files are modified
+- no task attachments are staged
+- no historical data files are tracked by Git
+
+Return:
+
+- branch
+- current HEAD
+- Phase 6B.1 commit
+- baseline ID
+- source commit stored with baseline
+- generation timestamp
+- matrix count
+- trade count
+- breakdown count
+
+If the baseline is missing or incomplete, stop and report:
+
+PHASE_6B_ANALYSIS_BLOCKED
+
+----------------------------------------------------
+PART 2 — DATASET SNAPSHOT
+----------------------------------------------------
+
+For every dataset used by the baseline return:
+
+- dataset ID
+- instrument
+- source dataset
+- source schema
+- source timezone
+- normalized timezone
+- start timestamp
+- end timestamp
+- row count
+- gap count
+- duplicate count
+- skipped row count
+- zero-volume count
+- SHA-256 fingerprint
+- quality classification
+- real-data confirmation
+- synthetic flag
+
+Confirm the baseline uses fixed dataset IDs and fingerprints.
+
+----------------------------------------------------
+PART 3 — COMPLETE 40-COMBINATION TABLE
+----------------------------------------------------
+
+Return all 40 instrument/mode/strategy combinations.
+
+Required columns:
+
+- instrument
+- mode
+- strategy
+- status
+- completed trades
+- wins
+- losses
+- breakevens
+- win rate
+- gross positive R
+- gross negative R
+- net R
+- average R
+- median R
+- expectancy
+- profit factor
+- maximum drawdown in R
+- longest winning streak
+- longest losing streak
+- average holding time
+- median holding time
+- long trade count
+- short trade count
+- long Net R
+- short Net R
+- reliability label
+- warnings
+
+Sort from highest Net R to lowest Net R.
+
+Do not omit zero-trade or failed combinations.
+
+----------------------------------------------------
+PART 4 — STATUS RECONCILIATION
+----------------------------------------------------
+
+Return counts for:
+
+- COMPLETE
+- COMPLETE_ZERO_TRADES
+- FAILED
+- DATA_UNAVAILABLE
+
+These totals must reconcile to exactly 40.
+
+Return every failed or unavailable combination with its error details.
+
+----------------------------------------------------
+PART 5 — TOP COMBINATIONS
+----------------------------------------------------
+
+Using a minimum of 20 completed trades, return the top 10 combinations by:
+
+1. Net R
+2. Expectancy
+3. Profit factor
+4. Win rate
+5. Lowest maximum drawdown
+
+For each result include:
+
+- rank
+- instrument
+- mode
+- strategy
+- trade count
+- selected metric
+- win rate
+- net R
+- expectancy
+- profit factor
+- maximum drawdown
+- reliability label
+- warnings
+
+Do not describe any result as proven edge.
+
+----------------------------------------------------
+PART 6 — WORST COMBINATIONS
+----------------------------------------------------
+
+Return the bottom 10 combinations by:
+
+1. Net R
+2. Expectancy
+3. Profit factor
+
+Include:
+
+- instrument
+- mode
+- strategy
+- trade count
+- win rate
+- net R
+- expectancy
+- profit factor
+- maximum drawdown
+- reliability label
+
+Explain descriptively why each ranked poorly.
+
+Do not recommend parameter changes.
+
+----------------------------------------------------
+PART 7 — ZERO-TRADE COMBINATIONS
+----------------------------------------------------
+
+Return every combination with zero completed trades.
+
+For each return:
+
+- instrument
+- mode
+- strategy
+- detector dispatch count
+- raw candidate count
+- confirmed signal count
+- blocked signal count
+- reason
+- warnings
+
+Classify the likely reason as one of:
+
+- NO_SETUPS
+- FILTERS_TOO_STRICT
+- SESSION_UNAVAILABLE
+- DATA_UNAVAILABLE
+- STRATEGY_DISABLED
+- DETECTOR_NOT_DISPATCHED
+- UNKNOWN
+
+Do not guess when evidence is unavailable.
+
+----------------------------------------------------
+PART 8 — TRADE FREQUENCY
+----------------------------------------------------
+
+For every combination return:
+
+- total trades
+- trading days represented
+- average trades per trading day
+- median trades per day
+- maximum trades in one day
+- days with zero trades
+- days with more than 10 trades
+- days with more than 20 trades
+- days with more than 50 trades
+
+Flag suspicious frequency using descriptive labels:
+
+- NORMAL
+- ELEVATED
+- HIGH
+- EXTREME
+
+Return the exact thresholds used.
+
+Do not assume high frequency is valid.
+
+----------------------------------------------------
+PART 9 — LONG VS SHORT
+----------------------------------------------------
+
+For every combination return:
+
+- long trades
+- short trades
+- long wins
+- short wins
+- long win rate
+- short win rate
+- long Net R
+- short Net R
+- long average R
+- short average R
+- long expectancy
+- short expectancy
+
+Also return aggregate long-versus-short summaries by:
+
+- instrument
+- strategy
+- mode
+
+----------------------------------------------------
+PART 10 — INSTRUMENT COMPARISON
+----------------------------------------------------
+
+Compare:
+
+- MNQ
+- MES
+- MGC
+- MYM
+
+For each instrument return:
+
+- combinations
+- total trades
+- wins
+- losses
+- breakevens
+- win rate
+- gross positive R
+- gross negative R
+- Net R
+- average R
+- expectancy
+- profit factor
+- maximum drawdown method
+- long Net R
+- short Net R
+- reliability distribution
+- warnings
+
+State clearly whether maximum drawdown is:
+
+- summed matrix drawdown
+- maximum individual matrix drawdown
+- concatenated signal-series drawdown
+- portfolio drawdown
+- unavailable
+
+Do not label a non-portfolio calculation as portfolio drawdown.
+
+----------------------------------------------------
+PART 11 — MODE COMPARISON
+----------------------------------------------------
+
+Compare:
+
+- SCALP
+- SWING
+
+For each mode return:
+
+- total trades
+- wins
+- losses
+- breakevens
+- win rate
+- Net R
+- average R
+- expectancy
+- profit factor
+- maximum drawdown method
+- average holding time
+- median holding time
+- long Net R
+- short Net R
+- reliability distribution
+- warnings
+
+----------------------------------------------------
+PART 12 — STRATEGY COMPARISON
+----------------------------------------------------
+
+Compare the five approved strategies:
+
+- OPENING_DRIVE
+- LIQUIDITY_SWEEP_REVERSAL
+- VWAP_TREND_CONTINUATION
+- RANGE_EXPANSION_BREAKOUT
+- OPENING_RANGE_BREAKOUT
+
+For each return:
+
+- instruments covered
+- modes covered
+- total trades
+- wins
+- losses
+- win rate
+- Net R
+- average R
+- expectancy
+- profit factor
+- maximum drawdown method
+- long Net R
+- short Net R
+- best instrument
+- weakest instrument
+- best mode
+- weakest mode
+- reliability distribution
+- warnings
+
+----------------------------------------------------
+PART 13 — MONTHLY PERFORMANCE
+----------------------------------------------------
+
+Break the stored trades down by calendar month.
+
+For every month return:
+
+- trade count
+- wins
+- losses
+- breakevens
+- win rate
+- gross positive R
+- gross negative R
+- Net R
+- average R
+- expectancy
+- profit factor
+- maximum drawdown method
+- best instrument
+- weakest instrument
+- best strategy
+- weakest strategy
+
+Also return monthly results separately by instrument.
+
+----------------------------------------------------
+PART 14 — WEEKDAY PERFORMANCE
+----------------------------------------------------
+
+Return results for:
+
+- Monday
+- Tuesday
+- Wednesday
+- Thursday
+- Friday
+
+For each return:
+
+- trades
+- wins
+- losses
+- win rate
+- Net R
+- average R
+- expectancy
+- profit factor
+- long Net R
+- short Net R
+
+Flag any weekend trades separately.
+
+----------------------------------------------------
+PART 15 — SESSION AND ET-HOUR PERFORMANCE
+----------------------------------------------------
+
+Use the stored session labels where available.
+
+Return results by:
+
+- Asia
+- London
+- New York
+- Overlap
+- Other or null
+
+For each return:
+
+- trades
+- win rate
+- Net R
+- average R
+- expectancy
+- profit factor
+
+Also return performance by ET entry hour:
+
+- hour
+- trades
+- win rate
+- Net R
+- expectancy
+- profit factor
+
+Flag:
+
+- maintenance-window trades
+- weekend trades
+- impossible-market-period trades
+- ORB trades before 08:30 ET
+
+Do not repair findings.
+
+----------------------------------------------------
+PART 16 — HOLD-TIME ANALYSIS
+----------------------------------------------------
+
+Return overall and grouped hold-time statistics:
+
+- minimum
+- average
+- median
+- 75th percentile
+- 90th percentile
+- 95th percentile
+- maximum
+
+Group by:
+
+- instrument
+- mode
+- strategy
+- exit reason
+
+Return the 20 longest-held trades.
+
+----------------------------------------------------
+PART 17 — STOP, TARGET, AND R:R PROFILE
+----------------------------------------------------
+
+For every strategy and mode return:
+
+- average stop distance in points
+- median stop distance
+- minimum stop distance
+- maximum stop distance
+- average target distance in points
+- median target distance
+- average planned R:R
+- median planned R:R
+- average realized R
+- percentage stopped
+- percentage targeted
+- percentage exited by another reason
+
+Confirm descriptively:
+
+- ORB used an ATR-based stop
+- ORB used a 4R target
+- the original four strategies retained their configured management
+- same-bar stop/target conflicts used the stored stop-wins policy
+
+Flag malformed stop or target geometry if present.
+
+----------------------------------------------------
+PART 18 — COST MODEL
+----------------------------------------------------
+
+Document exactly what the stored baseline modeled for:
+
+- commission
+- exchange fees
+- NFA fees
+- routing fees
+- spread
+- slippage
+- contract multiplier
+- tick value
+
+For each item return:
+
+- value
+- unit
+- source
+- modeled yes/no
+
+If commission, fees, spread, or slippage are absent or zero, state:
+
+COSTS_NOT_MODELED
+
+Do not estimate missing values.
+
+Do not alter the stored baseline.
+
+----------------------------------------------------
+PART 19 — DUPLICATE AND OVERLAP SNAPSHOT
+----------------------------------------------------
+
+Without creating a new audit system, run read-only queries for:
+
+Exact duplicates using:
+
+- instrument
+- mode
+- strategy
+- direction
+- signal timestamp
+- entry timestamp
+- entry price
+- stop price
+- target price
+
+Also return:
+
+- same instrument/mode/strategy/direction/entry timestamp
+- same instrument and entry timestamp across strategies
+- same instrument across SCALP and SWING at the same entry timestamp
+
+Return:
+
+- exact duplicate count
+- near-duplicate counts
+- representative examples
+- percentage of trades involved
+
+Audit overlapping trade intervals and return:
+
+- overlapping pair count
+- percentage of trades overlapping another trade
+- maximum simultaneous trades globally
+- maximum simultaneous trades on one instrument
+- overlap by instrument
+- overlap by strategy
+
+State whether the existing baseline is:
+
+- SIGNAL-LEVEL R MODEL
+- PORTFOLIO-LEVEL MODEL
+- UNKNOWN
+
+Do not delete or modify records.
+
+----------------------------------------------------
+PART 20 — DATA QUALITY SUMMARY
+----------------------------------------------------
+
+For each dataset return:
+
+- total bars
+- timeframe
+- median bar spacing
+- missing intervals
+- duplicate timestamps
+- invalid OHLC rows
+- negative-volume rows
+- zero-volume rows
+- largest gap
+- opening-range coverage
+- session coverage
+- roll-transition information
+- timezone behavior
+- DST behavior
+- warnings
+
+Classify each:
+
+- READY
+- READY_WITH_WARNINGS
+- REJECTED
+
+If information is unavailable, state that directly.
+
+----------------------------------------------------
+PART 21 — TOP 20 TRADES
+----------------------------------------------------
+
+Return the top 20 stored trades by realized R.
+
+Include:
+
+- rank
+- instrument
+- mode
+- strategy
+- direction
+- signal timestamp
+- entry timestamp
+- entry price
+- stop price
+- target price
+- exit timestamp
+- exit price
+- exit reason
+- realized R
+- holding time
+- session
+- ET hour
+- weekday
+- month
+
+----------------------------------------------------
+PART 22 — WORST 20 TRADES
+----------------------------------------------------
+
+Return the bottom 20 stored trades by realized R using the same columns.
+
+----------------------------------------------------
+PART 23 — EXTREME-RESULT FLAGS
+----------------------------------------------------
+
+Flag combinations with:
+
+- win rate above 80% and at least 20 trades
+- profit factor above 3.0 and at least 20 trades
+- expectancy above 1R and at least 20 trades
+- no losing trades
+- no winning trades
+- unusually low drawdown relative to trade count
+- unusually high trades per day
+- extreme stop distances
+- extreme hold times
+- one-sided long/short concentration
+
+For each flag return:
+
+- combination
+- sample size
+- metric
+- value
+- reason for concern
+- descriptive audit note
+
+Do not describe positive extremes as proven edge.
+
+----------------------------------------------------
+PART 24 — HUMAN-READABLE ANALYSIS
+----------------------------------------------------
+
+Write a plain-English narrative answering:
+
+- Which combinations had the strongest descriptive results?
+- Which combinations had the weakest results?
+- Which strategies behaved most consistently across instruments?
+- Which strategies were highly instrument-dependent?
+- Which mode performed better descriptively?
+- Which instrument had the strongest combined results?
+- Were long or short signals stronger?
+- Were results stable across months?
+- Were results concentrated in one weekday, session, or ET hour?
+- Were trade counts realistic?
+- Were duplicates present?
+- Were overlapping trades present?
+- Were costs modeled?
+- Were contract-roll effects visible?
+- Which results require skepticism?
+- Is the baseline suitable for learning yet?
+
+Do not recommend parameter changes.
+
+Do not recommend strategy optimization.
+
+Do not change code.
+
+----------------------------------------------------
+PART 25 — READINESS ASSESSMENT
+----------------------------------------------------
+
+Return one descriptive readiness classification:
+
+BASELINE_ANALYSIS_CLEAN
+
+BASELINE_ANALYSIS_USABLE_WITH_WARNINGS
+
+BASELINE_ANALYSIS_REQUIRES_AUDIT
+
+BASELINE_ANALYSIS_INVALID
+
+Use:
+
+BASELINE_ANALYSIS_REQUIRES_AUDIT
+
+when the results reveal material concerns involving duplicates, overlaps,
+unrealistic fills, missing costs, suspicious frequency, metric inconsistencies,
+or data-quality uncertainty.
+
+Do not feed this classification into live logic or learning.
+
+----------------------------------------------------
+PART 26 — FINAL SUMMARY
+----------------------------------------------------
+
+Return:
+
+1. Branch
+2. Current HEAD
+3. Baseline ID
+4. Source commit
+5. Dataset IDs
+6. Dataset date ranges
+7. Dataset fingerprints
+8. Matrix count
+9. Trade count
+10. Breakdown count
+11. Status distribution
+12. Overall wins
+13. Overall losses
+14. Overall breakevens
+15. Overall win rate
+16. Gross positive R
+17. Gross negative R
+18. Overall Net R
+19. Average R
+20. Expectancy
+21. Profit factor
+22. Maximum drawdown method
+23. Best combination
+24. Weakest combination
+25. Best instrument
+26. Weakest instrument
+27. Best strategy
+28. Weakest strategy
+29. Best mode
+30. Long-versus-short result
+31. Duplicate count
+32. Overlap rate
+33. Maximum simultaneous trades
+34. Cost-model status
+35. Data-quality classifications
+36. Biggest surprise
+37. Biggest concern
+38. Most important next investigation
+39. Readiness classification
+40. Confirmation that no code or baseline data was changed
+
+After returning the report, stop.
+
+DO NOT START PHASE 6B.2.
+
+DO NOT START PHASE 6C.
+
+DO NOT OPTIMIZE ANY STRATEGY.
