@@ -1,0 +1,455 @@
+TASK: Global Backtest Strategy Coverage Audit
+
+CRITICAL CONTEXT
+
+Phase 5F.1B is complete and frozen.
+
+Do not modify Decision Quality analytics during this task.
+
+The backtest dashboard currently appears to expose the same four strategies for
+every instrument:
+
+- Liquidity Sweep Reversal
+- Range Expansion Breakout
+- VWAP Trend Continuation
+- Opening Drive
+
+The live strategy engine appears to contain at least one additional strategy,
+including Opening Range Breakout, and may contain more strategy definitions
+elsewhere in the repository.
+
+It is unknown whether the backtester:
+
+- has a hard-coded four-strategy registry,
+- uses a registry separate from the live engine,
+- lacks historical adapters,
+- evaluates more strategies but hides them,
+- suppresses zero-trade strategies,
+- or only returns the top four.
+
+AUDIT FIRST.
+
+DO NOT add strategies in this task.
+
+DO NOT change:
+
+- live strategy selection
+- backtest strategy behavior
+- historical trade results
+- scoring
+- learning
+- gates
+- verdicts
+- auto-trade behavior
+- Databento ingestion
+- TradingView ingestion
+- Decision Quality analytics
+
+OBJECTIVE
+
+Identify the exact reason every asset presents the same four backtest strategies
+and produce a safe implementation plan for expanding coverage.
+
+----------------------------------------------------
+PART 1 — PRE-FLIGHT
+----------------------------------------------------
+
+Capture:
+
+git branch --show-current
+git rev-parse HEAD
+git status --short
+git diff --check
+
+Expected starting HEAD:
+
+52e2b45
+
+Run before making changes:
+
+- existing backtest tests
+- strategy scan tests
+- Decision Quality tests
+- all four golden suites
+
+Expected focused baseline:
+
+- Decision Quality: 103/103
+- Strategy Scan: 30/30
+- Golden suites: 4/4
+
+Stop and report if:
+
+- HEAD differs unexpectedly
+- focused tests fail
+- golden outputs differ
+- backtesting mutates live production state
+- the backtester imports live state in a way that cannot be isolated safely
+
+----------------------------------------------------
+PART 2 — INVENTORY ALL STRATEGIES
+----------------------------------------------------
+
+Search the entire repository for every strategy definition.
+
+Inspect:
+
+- strategy classes
+- strategy functions
+- strategy dictionaries
+- registries
+- decorators
+- aliases
+- mode-specific lists
+- experimental strategies
+- disabled strategies
+- legacy strategies
+- backtest adapters
+- live-only strategies
+- display-only names
+
+Do not assume there are 19.
+
+Return the actual number found.
+
+For every strategy document:
+
+1. Canonical key
+2. Display name
+3. Defining file
+4. Defining function or class
+5. Live registry status
+6. Backtest registry status
+7. SCALP eligibility
+8. SWING eligibility
+9. Instrument eligibility
+10. Session requirements
+11. Timeframe requirements
+12. Required input data
+13. Historical adapter present?
+14. Replayable with current historical data?
+15. Invoked in All Strategies backtest?
+16. Can produce trades?
+17. Displayed in the dashboard?
+18. Exact exclusion reason
+
+Identify:
+
+- aliases
+- duplicate implementations
+- dead definitions
+- imported but unregistered strategies
+- registered but unreachable strategies
+- test-only strategies
+- live-only strategies
+- backtest-only strategies
+
+----------------------------------------------------
+PART 3 — TRACE THE EXACT BACKTEST PATH
+----------------------------------------------------
+
+Trace the real call chain for an All Strategies run:
+
+dashboard control
+→ request payload
+→ proxy route
+→ Flask endpoint
+→ request parsing
+→ historical data loader
+→ strategy registry
+→ mode filter
+→ instrument filter
+→ timeframe filter
+→ strategy invocation loop
+→ simulated trade generation
+→ result aggregation
+→ ranking response
+→ dashboard rendering
+
+Use actual file names, functions, and line numbers.
+
+At each stage report:
+
+- strategy names entering
+- strategy count entering
+- filters applied
+- strategy names leaving
+- strategy count leaving
+- whether narrowing affects evaluation or display only
+
+----------------------------------------------------
+PART 4 — FIND THE GLOBAL FOUR-STRATEGY NARROWING POINT
+----------------------------------------------------
+
+Search for every occurrence of:
+
+- Liquidity Sweep Reversal
+- Range Expansion Breakout
+- VWAP Trend Continuation
+- Opening Drive
+
+Also search for:
+
+- BACKTEST_STRATEGIES
+- STRATEGY_REGISTRY
+- SCALP_STRATEGIES
+- SWING_STRATEGIES
+- enabled_strategies
+- supported_strategies
+- top strategies
+- top 4
+- limit 4
+- [:4]
+- slice(0, 4)
+- rank caps
+- dashboard row limits
+- zero-trade filters
+- minimum-trade filters
+- tradable-only filters
+- hidden strategy filters
+
+Return every location where the strategy set is constructed, filtered, limited,
+ranked, or rendered.
+
+Classify each narrowing point as:
+
+- evaluation filter
+- result filter
+- display filter
+- harmless sorting
+- test fixture only
+
+----------------------------------------------------
+PART 5 — COMPARE LIVE AND BACKTEST REGISTRIES
+----------------------------------------------------
+
+Produce a comparison table:
+
+Strategy
+Defined
+Live registered
+Backtest registered
+Historical adapter
+Required replay inputs
+Eligible for selected run
+Actually invoked
+Trades generated
+Returned by API
+Displayed by dashboard
+Reason excluded
+
+Return exact counts for:
+
+- strategies defined
+- live registered
+- backtest registered
+- backtest adapters implemented
+- eligible in a representative SCALP run
+- invoked in that run
+- strategies producing trades
+- strategies returned by the endpoint
+- strategies displayed by the dashboard
+
+Test representative runs for:
+
+- MES SCALP 5m
+- MES SWING 5m
+- MNQ SCALP 5m
+- MGC SCALP 5m
+- MYM SCALP 5m
+
+Do not compare profitability yet. This task is coverage only.
+
+----------------------------------------------------
+PART 6 — CLASSIFY REPLAY SUPPORT
+----------------------------------------------------
+
+Classify every live strategy into:
+
+CATEGORY A — Fully replayable now
+
+All required inputs already exist in the historical dataset and can be consumed
+without look-ahead.
+
+CATEGORY B — Replayable through deterministic reconstruction
+
+Inputs are not stored directly but can be reconstructed from historical data
+without future leakage.
+
+CATEGORY C — Not honestly replayable with the current dataset
+
+Requires unavailable or live-only data such as:
+
+- tick-sequenced aggressor flow
+- order-book depth
+- historical bid/ask changes
+- exact confirmation-alert arrival timing
+- live learning state
+- future-known labels
+- intrabar ordering unavailable from bar data
+- Databento feeds not stored historically
+
+Do not add Category B or C strategies in this audit.
+
+For each Category B strategy provide a proposed reconstruction design.
+
+For each Category C strategy state the exact missing data.
+
+----------------------------------------------------
+PART 7 — PROVE WHETHER MORE THAN FOUR ARE EVALUATED
+----------------------------------------------------
+
+Do not infer evaluation from dashboard rows.
+
+Instrument the audit at the actual backtest strategy call site or use temporary
+test-only invocation spies.
+
+For each strategy record:
+
+- registered
+- eligible
+- evaluation function called
+- no signal
+- trades generated
+- result returned
+- displayed
+
+A strategy counts as evaluated only if its evaluation function was called.
+
+Answer explicitly:
+
+1. Are only four registered?
+2. Are only four invoked?
+3. Are more than four invoked but only four produce trades?
+4. Are more than four returned but only four displayed?
+5. Are zero-trade strategies hidden?
+6. Is there a top-four result cap?
+
+----------------------------------------------------
+PART 8 — READ-ONLY COVERAGE DIAGNOSTICS
+----------------------------------------------------
+
+Only if minimally invasive and safe, add a read-only diagnostics response such as:
+
+{
+  "defined_count": 19,
+  "live_registered_count": 19,
+  "backtest_registered_count": 4,
+  "eligible_count": 4,
+  "invoked_count": 4,
+  "produced_trades_count": 4,
+  "returned_count": 4,
+  "displayed_count": 4,
+  "global_subset": true,
+  "strategies": [...]
+}
+
+For every strategy include:
+
+{
+  "strategy_key": "...",
+  "defined": true,
+  "live_registered": true,
+  "backtest_registered": false,
+  "eligible": false,
+  "invoked": false,
+  "trades_generated": 0,
+  "returned": false,
+  "displayed": false,
+  "reason": "no_historical_adapter"
+}
+
+The diagnostics must not execute a new backtest.
+
+It may only report data already collected during the requested run or static
+registry information.
+
+Do not change existing backtest results.
+
+----------------------------------------------------
+PART 9 — TESTS
+----------------------------------------------------
+
+Add audit-focused tests proving:
+
+1. The defined strategy count is accurate.
+2. The live registry count is accurate.
+3. The backtest registry count is accurate.
+4. Invocation count is recorded at the actual call site.
+5. A registered strategy returning no trades is still counted as invoked.
+6. Zero-trade strategies are distinguished from unsupported strategies.
+7. Display count is separate from invocation count.
+8. A top-four display limit cannot be mistaken for a four-strategy engine.
+9. All Strategies mode invokes every eligible backtest strategy exactly once.
+10. Individually selected strategy invokes only the requested strategy.
+11. Mode-ineligible strategies are not invoked.
+12. Instrument-ineligible strategies are not invoked.
+13. Timeframe-ineligible strategies are not invoked.
+14. Missing replay inputs produce an explicit reason.
+15. Coverage diagnostics do not change trade count.
+16. Coverage diagnostics do not change win rate.
+17. Coverage diagnostics do not change Net R.
+18. Coverage diagnostics do not change profit factor.
+19. Coverage diagnostics do not change drawdown.
+20. Existing four-strategy outputs remain byte-identical.
+21. Live strategy selection remains unchanged.
+22. Decision Quality analytics remain unchanged.
+23. Databento ingestion remains unchanged.
+24. No Databento network calls occur in tests.
+25. No look-ahead or future-bar data is introduced.
+
+----------------------------------------------------
+PART 10 — REQUIRED REPORT
+----------------------------------------------------
+
+Return:
+
+1. Branch and starting HEAD
+2. Ending HEAD, if diagnostics were added
+3. Working-tree status before and after
+4. Exact files changed
+5. Actual total strategy definitions
+6. Actual live registry count
+7. Actual backtest registry count
+8. Actual historical adapter count
+9. Exact reason all assets show the same four strategies
+10. File and line of the global narrowing point
+11. Complete live-versus-backtest strategy table
+12. Representative invocation counts by asset and mode
+13. Strategies producing trades
+14. Strategies invoked but producing zero trades
+15. Strategies never invoked
+16. Strategies hidden by the API or dashboard
+17. Every hard-coded subset
+18. Every display-only filter
+19. Category A strategies
+20. Category B strategies
+21. Category C strategies
+22. Required historical inputs for every excluded strategy
+23. Focused test results
+24. Golden-suite results
+25. Full regression results
+26. Confirmation that live trading behavior did not change
+27. Confirmation that Decision Quality did not change
+28. Confirmation that Databento ingestion did not change
+29. Safe implementation plan for adding Category A strategies
+
+----------------------------------------------------
+STOP CONDITIONS
+----------------------------------------------------
+
+Stop and report without expanding coverage if:
+
+- A hard-coded four-strategy registry exists
+- The live and backtest registries are separate
+- Eligible strategies are silently omitted
+- More strategies are evaluated but hidden
+- Historical inputs are insufficient
+- Category B reconstruction requires design approval
+- Look-ahead bias cannot be ruled out
+- Existing four-strategy results change
+- Golden outputs change
+- HEAD changes unexpectedly
+- Existing focused tests fail
+
+MAKE ONLY THIS AUDIT.

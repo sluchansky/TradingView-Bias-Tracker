@@ -152,6 +152,7 @@ export const BOT1_ROUTES = [
   "/backtest/optimize",
   "/backtest/runs/:id",
   "/backtest/export",
+  "/backtest/coverage",
   // TradeZella journal import + review (owner-only; NOT in dashboard-auth
   // OPEN_PATHS). The raw body limit for the CSV upload is raised in app.ts.
   "/tradezella/upload",
@@ -287,6 +288,7 @@ export const BOT2_ROUTES = [
   "/backtest/optimize",
   "/backtest/runs/:id",
   "/backtest/export",
+  "/backtest/coverage",
   // Lord Piggington VRM model (static asset; no auth — fetched by Three.js in the dashboard).
   "/vrm",
 ];

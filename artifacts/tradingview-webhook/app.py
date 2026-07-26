@@ -35677,6 +35677,82 @@ def bt_run_status(run_id):
                     "result": run["result"]})
 
 
+@app.route("/backtest/coverage", methods=["GET"])
+def bt_coverage():
+    """Owner-only READ-ONLY registry diagnostics. No backtest is executed.
+    Returns static registry comparison between the live strategy engine and the
+    backtest engine — the authoritative answer to 'why four strategies?'"""
+    guard = _bt_guard()
+    if guard:
+        return guard
+    live_keys   = set(STRATEGY_DEFS)
+    bt_keys     = set(bt.STRATEGY_DEFS)
+    bt_det_keys = set(bt.DETECTORS)
+    bt_order    = list(bt.STRATEGY_ORDER)
+    bt_disabled = set(bt.DISABLED_STRATEGIES)
+    all_keys = sorted(live_keys | bt_keys)
+    strategies = []
+    for key in all_keys:
+        in_live      = key in live_keys and key in STRATEGY_SCORERS
+        in_bt_defs   = key in bt_keys
+        has_adapter  = key in bt_det_keys
+        in_order     = key in bt_order
+        disabled     = key in bt_disabled
+        eligible     = has_adapter and not disabled and in_order
+        label = (STRATEGY_DEFS.get(key) or bt.STRATEGY_DEFS.get(key) or {}).get("label", key)
+        if disabled:
+            reason = "disabled_by_request"
+        elif not in_bt_defs:
+            reason = "no_backtest_definition"
+        elif not has_adapter:
+            reason = "no_historical_adapter"
+        elif not in_order:
+            reason = "excluded_from_strategy_order"
+        else:
+            reason = None
+        strategies.append({
+            "strategy_key":          key,
+            "label":                 label,
+            "defined":               key in live_keys or in_bt_defs,
+            "live_registered":       in_live,
+            "backtest_registered":   in_bt_defs,
+            "has_historical_adapter": has_adapter,
+            "in_strategy_order":     in_order,
+            "disabled":              disabled,
+            "eligible":              eligible,
+            "invoked":               eligible,
+            "reason":                reason,
+        })
+    eligible_count = sum(1 for s in strategies if s["eligible"])
+    live_only  = sorted(live_keys - bt_keys)
+    bt_only    = sorted(bt_keys - live_keys)
+    shared     = sorted(live_keys & bt_keys)
+    return jsonify({
+        "ok": True,
+        "live_engine": {
+            "defined_count":     len(live_keys),
+            "registered_count":  len([k for k in live_keys if k in STRATEGY_SCORERS]),
+            "strategies":        sorted(live_keys),
+        },
+        "backtest_engine": {
+            "defined_count":     len(bt_keys),
+            "detector_count":    len(bt_det_keys),
+            "order_count":       len(bt_order),
+            "disabled_count":    len(bt_disabled),
+            "eligible_count":    eligible_count,
+            "strategy_order":    bt_order,
+            "disabled_strategies": sorted(bt_disabled),
+        },
+        "gaps": {
+            "live_only":         live_only,
+            "backtest_only":     bt_only,
+            "shared_eligible":   [k for k in shared if k not in bt_disabled and k in bt_det_keys and k in bt_order],
+        },
+        "global_subset": eligible_count < len(live_keys),
+        "strategies":    strategies,
+    })
+
+
 @app.route("/backtest/export", methods=["GET"])
 def bt_export():
     guard = _bt_guard()
