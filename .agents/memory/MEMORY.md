@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Phase 6B historical OHLCV datasets](phase6b-datasets.md) — 4 instruments imported; MYM needs chunked download; run_backtest takes (candles, params_dict) not kwargs.
 - [Decision Quality analytics (Phase 5F)](decision-quality-analytics.md) — DB-backed snapshot analytics; dedup pattern; component win-rate computation; outcome hook location.
 - [Databento source attribution audit](source-attribution-audit.md) — _audit_event_duplicates needs now_dt kwarg in tests (1-hour cutoff filters pinned past timestamps).
 - [Flask zombie-prevention guards](flask-zombie-prevention.md) — 3 os._exit guards (SIGTERM handler + sys.excepthook + app.run() finally) stop non-daemon Timer threads from keeping zombie Flask alive after a crash.

@@ -47,3 +47,8 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Historical market data — must not be committed
+market_data/
+*.dbn
+*.dbn.zst
