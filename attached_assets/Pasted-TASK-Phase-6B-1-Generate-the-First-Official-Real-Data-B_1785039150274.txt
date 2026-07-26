@@ -1,0 +1,745 @@
+TASK: Phase 6B.1 — Generate the First Official Real-Data Baseline
+
+OBJECTIVE
+
+Generate the first immutable historical baseline using the four validated real
+datasets imported during Phase 6B.0.
+
+Approved instruments:
+
+- MNQ
+- MES
+- MGC
+- MYM
+
+Approved strategies:
+
+1. OPENING_DRIVE
+2. LIQUIDITY_SWEEP_REVERSAL
+3. VWAP_TREND_CONTINUATION
+4. RANGE_EXPANSION_BREAKOUT
+5. OPENING_RANGE_BREAKOUT
+
+Approved modes:
+
+- SCALP
+- SWING
+
+Expected matrix:
+
+4 instruments × 5 strategies × 2 modes = 40 combinations
+
+This phase is measurement only.
+
+DO NOT optimize parameters.
+
+DO NOT change live strategy logic.
+
+DO NOT change Databento live ingestion.
+
+DO NOT change execution or TradersPost.
+
+DO NOT feed baseline results into learning.
+
+DO NOT promote or demote strategies automatically.
+
+----------------------------------------------------
+PART 1 — PRE-FLIGHT
+----------------------------------------------------
+
+Run:
+
+git branch --show-current
+git rev-parse HEAD
+git log -5 --oneline
+git status --short
+git diff --check
+
+Confirm:
+
+- Phase 6B.0 is complete
+- all four real datasets exist
+- all four datasets are classified READY
+- no market-data files are tracked by Git
+- no application changes are uncommitted
+- current task attachments are not staged
+
+Return:
+
+- branch
+- current HEAD
+- Phase 6B.0 commit
+- dataset IDs
+- dataset fingerprints
+- coverage dates
+- row counts
+
+If any dataset is missing or not READY, stop.
+
+----------------------------------------------------
+PART 2 — VERIFY OFFICIAL DATASETS
+----------------------------------------------------
+
+For each imported dataset return:
+
+- dataset ID
+- symbol
+- raw Databento symbols included
+- parent instrument
+- timeframe
+- source dataset
+- source schema
+- source timezone
+- normalized timezone
+- start timestamp
+- end timestamp
+- bar count
+- trading-day count
+- gap count
+- duplicate count
+- skipped row count
+- zero-volume count
+- SHA-256 fingerprint
+- quality status
+
+Confirm that all official baseline datasets are:
+
+- real Databento data
+- not synthetic
+- immutable
+- stored outside Git
+- compatible with the existing backtest engine
+
+----------------------------------------------------
+PART 3 — FREEZE BASELINE CONFIGURATION
+----------------------------------------------------
+
+Create one immutable baseline configuration snapshot containing:
+
+- source commit hash
+- engine version
+- generation timestamp
+- dataset IDs
+- dataset fingerprints
+- instrument list
+- mode list
+- strategy list
+- strategy registry snapshot
+- detector registry snapshot
+- disabled strategy list
+- management mode
+- commission assumptions
+- slippage assumptions
+- tick sizes
+- ATR settings
+- stop settings
+- target settings
+- news-blackout settings
+- session definitions
+- same-bar conflict policy
+- next-bar-open entry policy
+- timezone policy
+- roll/continuous-symbol policy
+
+The configuration must be stored with the baseline.
+
+Do not infer missing settings silently.
+
+Use null plus a reason if a setting cannot be resolved.
+
+----------------------------------------------------
+PART 4 — BASELINE IDENTIFIER
+----------------------------------------------------
+
+Create a unique immutable baseline ID.
+
+Suggested format:
+
+BL-YYYYMMDD-HHMMSS-<short_commit>
+
+Example:
+
+BL-20260726-163000-714e1c6
+
+The baseline ID must never be reused.
+
+Generating a new baseline must create a new version.
+
+Do not overwrite previous baseline records.
+
+----------------------------------------------------
+PART 5 — RUN THE FULL MATRIX
+----------------------------------------------------
+
+Run all 40 combinations:
+
+For each instrument:
+
+- SCALP × 5 strategies
+- SWING × 5 strategies
+
+Record each combination independently.
+
+Do not skip a strategy because it produces zero trades.
+
+A valid zero-trade result must still be stored.
+
+Each combination must return one status:
+
+- COMPLETE
+- COMPLETE_ZERO_TRADES
+- FAILED
+- DATA_UNAVAILABLE
+
+Do not substitute synthetic data.
+
+----------------------------------------------------
+PART 6 — REQUIRED METRICS
+----------------------------------------------------
+
+For every combination store:
+
+- baseline ID
+- dataset ID
+- dataset fingerprint
+- instrument
+- mode
+- strategy
+- status
+- start date
+- end date
+- bar count
+- session count
+- detector dispatch count
+- raw candidate count
+- confirmed signal count
+- blocked signal count
+- completed trade count
+- incomplete trade count
+- wins
+- losses
+- breakeven trades
+- win rate
+- gross positive R
+- gross negative R
+- net R
+- average R
+- median R
+- expectancy
+- profit factor
+- maximum drawdown in R
+- maximum run-up in R
+- longest winning streak
+- longest losing streak
+- average holding time
+- median holding time
+- minimum holding time
+- maximum holding time
+- long trade count
+- short trade count
+- long wins
+- short wins
+- long Net R
+- short Net R
+- commission impact
+- slippage impact
+- first trade timestamp
+- last trade timestamp
+- warnings
+- error details
+- reliability label
+
+Unsupported metrics must be:
+
+null
+
+with a separate reason.
+
+Do not use zero to represent unavailable data.
+
+----------------------------------------------------
+PART 7 — TRADE-LEVEL RECORDS
+----------------------------------------------------
+
+Store a trade-level record for every completed trade.
+
+Required fields:
+
+- baseline ID
+- matrix-result ID
+- dataset ID
+- instrument
+- mode
+- strategy
+- direction
+- signal timestamp
+- entry timestamp
+- entry price
+- stop price
+- target price
+- exit timestamp
+- exit price
+- exit reason
+- initial risk points
+- initial risk R
+- realized R
+- holding time
+- maximum favorable excursion, if supported
+- maximum adverse excursion, if supported
+- session
+- ET hour
+- weekday
+- month
+- volatility regime
+- trend regime
+- OR high and OR low for ORB trades
+- ATR at signal
+- volume or RVOL at signal
+- warnings
+
+Do not commit raw trade records to Git.
+
+Store them in the research database.
+
+----------------------------------------------------
+PART 8 — RELIABILITY LABELS
+----------------------------------------------------
+
+Use these sample-size labels:
+
+- INSUFFICIENT: 0–19 completed trades
+- LOW_SAMPLE: 20–49
+- DEVELOPING: 50–99
+- MODERATE: 100–199
+- STRONG_SAMPLE: 200+
+
+These labels represent sample size only.
+
+Do not interpret them as profitable, safe, validated, or approved.
+
+Add warnings for:
+
+- short date coverage
+- low trade count
+- high missing-bar concentration
+- one-sided direction sample
+- single-session concentration
+- single-regime concentration
+- no losing trades
+- no winning trades
+- profit factor undefined
+- drawdown undefined
+- zero trades
+
+----------------------------------------------------
+PART 9 — BREAKDOWNS
+----------------------------------------------------
+
+Create read-only breakdowns by:
+
+- instrument
+- strategy
+- mode
+- direction
+- session
+- ET hour
+- weekday
+- month
+- volatility regime
+- trend regime
+- contract
+- sample-size band
+
+For every breakdown return:
+
+- trade count
+- win rate
+- net R
+- average R
+- expectancy
+- profit factor
+- maximum drawdown
+- reliability label
+
+Do not change strategy behavior based on these breakdowns.
+
+----------------------------------------------------
+PART 10 — BASELINE SUMMARY
+----------------------------------------------------
+
+Create a baseline-level summary containing:
+
+- baseline ID
+- generation timestamp
+- source commit
+- total matrix combinations
+- completed combinations
+- zero-trade combinations
+- failed combinations
+- unavailable combinations
+- total bars processed
+- total completed trades
+- total wins
+- total losses
+- aggregate net R
+- aggregate expectancy
+- aggregate profit factor
+- aggregate maximum drawdown
+- dataset coverage
+- warnings
+- failures
+
+Clearly state that aggregate figures combine different instruments, modes, and
+strategies and are descriptive only.
+
+----------------------------------------------------
+PART 11 — RANKINGS
+----------------------------------------------------
+
+Create descriptive rankings only.
+
+Produce rankings for:
+
+- highest net R
+- highest expectancy
+- highest profit factor
+- lowest maximum drawdown
+- largest sample size
+- best long-side net R
+- best short-side net R
+- highest win rate with at least 20 trades
+- highest expectancy with at least 20 trades
+- best strategy by instrument
+- best mode by instrument
+
+Do not create one universal “best strategy” score.
+
+Do not use rankings to influence live trading.
+
+----------------------------------------------------
+PART 12 — API
+----------------------------------------------------
+
+Add or confirm these owner-protected research endpoints:
+
+GET /backtest/baselines
+
+Return all baseline versions with summary metadata.
+
+GET /backtest/baselines/<baseline_id>
+
+Return:
+
+- configuration
+- matrix results
+- summary
+- warnings
+- failures
+
+GET /backtest/baselines/<baseline_id>/trades
+
+Support filters:
+
+- instrument
+- mode
+- strategy
+- direction
+- session
+- weekday
+- month
+- volatility regime
+- trend regime
+
+GET /backtest/baselines/<baseline_id>/breakdowns
+
+Return all grouped breakdowns.
+
+POST /backtest/baselines/generate
+
+Requirements:
+
+- owner-only
+- explicit dataset IDs required
+- no automatic data download
+- no live-state mutation
+- no execution calls
+- no TradersPost calls
+- no Decision Quality updates
+- no learning updates
+- no strategy promotion
+
+----------------------------------------------------
+PART 13 — DASHBOARD
+----------------------------------------------------
+
+Add a read-only dashboard panel:
+
+REAL HISTORICAL BASELINE
+
+Display:
+
+- baseline ID
+- source commit
+- generation timestamp
+- dataset coverage
+- instrument coverage
+- completed matrix count
+- failed matrix count
+- total trades
+- net R
+- expectancy
+- profit factor
+- maximum drawdown
+- reliability labels
+- warnings
+
+Filters:
+
+- baseline version
+- instrument
+- mode
+- strategy
+- direction
+- session
+- weekday
+- month
+- volatility regime
+- trend regime
+
+Views:
+
+1. Matrix table
+2. Strategy comparison
+3. Instrument comparison
+4. Mode comparison
+5. Drawdown comparison
+6. Long vs short comparison
+7. Sample-size view
+8. Trade explorer
+9. Data-quality view
+
+Clearly label all results:
+
+HISTORICAL RESEARCH ONLY
+
+NOT LIVE PERFORMANCE
+
+NOT FINANCIAL ADVICE
+
+----------------------------------------------------
+PART 14 — TESTS
+----------------------------------------------------
+
+Add focused tests covering at least:
+
+1. All four dataset IDs required.
+2. All datasets must be READY.
+3. Synthetic datasets rejected.
+4. Baseline ID is unique.
+5. Previous baseline is immutable.
+6. New run creates a new baseline.
+7. Exactly 40 matrix combinations created.
+8. All five strategies included.
+9. Both modes included.
+10. All four instruments included.
+11. Zero-trade results stored.
+12. Failed combinations stored with errors.
+13. Dataset fingerprints stored.
+14. Source commit stored.
+15. Configuration snapshot stored.
+16. Unsupported metrics use null plus reason.
+17. Reliability labels correct.
+18. Trade-level records linked to matrix result.
+19. Breakdown totals reconcile to matrix totals.
+20. Ranking filters enforce minimum sample.
+21. ORB uses ATR stop.
+22. ORB uses 4R target.
+23. Original four strategies unchanged.
+24. Same-bar stop wins policy preserved.
+25. Next-bar-open entry preserved.
+26. Baseline generation does not alter live state.
+27. Baseline generation does not call TradersPost.
+28. Baseline generation does not call Databento.
+29. Baseline generation does not alter Decision Quality.
+30. Baseline generation does not alter learning.
+31. Baseline generation does not alter execution state.
+32. GET endpoints are read-only.
+33. POST endpoint is owner-protected.
+34. Trade filters work correctly.
+35. Dashboard never labels synthetic data as official.
+36. EXHAUSTION_FADE remains excluded.
+37. Research strategies remain excluded.
+38. Dataset quality warnings remain attached.
+39. Aggregate totals reconcile.
+40. Repeated generation is deterministic when config and data match.
+
+Aim for at least 45 focused Phase 6B.1 tests.
+
+----------------------------------------------------
+PART 15 — VALIDATION
+----------------------------------------------------
+
+Run separately:
+
+- Phase 6B.1 baseline tests
+- Phase 6B.0 acquisition/import tests
+- Phase 6A.1 parity tests
+- historical import tests
+- ORB adapter tests
+- coverage audit tests
+- Stop Parity tests
+- Decision Quality tests
+- Strategy Scan tests
+- all other backtest-related tests
+- all four golden workflows
+
+Report each suite separately.
+
+Do not call this the full repository suite unless the full repository suite is run.
+
+----------------------------------------------------
+PART 16 — FIRST OFFICIAL BASELINE
+----------------------------------------------------
+
+Generate the first official baseline using the four READY real datasets.
+
+Return:
+
+- baseline ID
+- source commit
+- dataset IDs
+- dataset fingerprints
+- configuration snapshot hash
+- completed combinations
+- zero-trade combinations
+- failed combinations
+- total bars processed
+- total trades
+- total wins
+- total losses
+- aggregate net R
+- aggregate expectancy
+- aggregate profit factor
+- aggregate maximum drawdown
+- reliability distribution
+- warnings
+- failures
+
+Do not optimize parameters after seeing the results.
+
+Do not rerun with adjusted settings to improve performance.
+
+The first baseline must remain the untouched control baseline.
+
+----------------------------------------------------
+PART 17 — PROTECTED BOUNDARIES
+----------------------------------------------------
+
+Confirm no changes to:
+
+- live Databento ingestion
+- Databento subscriptions
+- Databento normalization
+- live strategy scorers
+- Edge Score
+- verdicts
+- gates
+- Decision Quality
+- learning
+- sizing
+- trade management
+- execution
+- TradersPost
+- prop controls
+- research strategy registry
+
+Return source-diff and test evidence.
+
+----------------------------------------------------
+PART 18 — COMMIT
+----------------------------------------------------
+
+Commit only:
+
+- baseline infrastructure
+- API code
+- dashboard code
+- tests
+- schema changes
+
+Do not commit:
+
+- historical CSV files
+- raw Databento responses
+- database dumps
+- trade exports
+- baseline result exports
+- secrets
+- API keys
+- task attachments
+
+Suggested commit message:
+
+Add official real-data baseline system
+
+Return:
+
+- starting HEAD
+- ending commit
+- exact files committed
+- final git status
+- untracked files
+- test totals
+
+----------------------------------------------------
+PART 19 — FINAL STATUS
+----------------------------------------------------
+
+Return exactly one:
+
+PHASE_6B_BASELINE_COMPLETE
+
+PHASE_6B_BASELINE_COMPLETE_WITH_WARNINGS
+
+PHASE_6B_BASELINE_BLOCKED
+
+Use COMPLETE_WITH_WARNINGS when the baseline generated successfully but includes
+data-quality, sample-size, or matrix warnings.
+
+----------------------------------------------------
+PART 20 — FINAL REPORT
+----------------------------------------------------
+
+Return:
+
+1. Branch
+2. Starting commit
+3. Ending commit
+4. Files changed
+5. Files committed
+6. Dataset IDs
+7. Dataset fingerprints
+8. Coverage dates
+9. Baseline ID
+10. Configuration snapshot
+11. Matrix completion
+12. Aggregate metrics
+13. Per-strategy summary
+14. Per-instrument summary
+15. Per-mode summary
+16. Reliability distribution
+17. Rankings
+18. Warnings
+19. Failures
+20. Dashboard changes
+21. API changes
+22. Test counts
+23. Golden results
+24. Protected-boundary proof
+25. Final status
+
+After returning the report, stop.
+
+DO NOT START PHASE 6C.
+
+DO NOT OPTIMIZE ANY STRATEGY.

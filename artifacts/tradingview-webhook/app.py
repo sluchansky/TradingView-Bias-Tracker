@@ -35139,6 +35139,14 @@ except Exception as _bt_import_exc:   # pragma: no cover - defensive
     BACKTEST_AVAILABLE = False
     logger.warning("backtest engine import failed (backtest disabled): %s", _bt_import_exc)
 
+try:
+    import bt_baseline as bl
+    BASELINE_AVAILABLE = True
+except Exception as _bl_import_exc:   # pragma: no cover - defensive
+    bl = None
+    BASELINE_AVAILABLE = False
+    logger.warning("bt_baseline import failed (baseline disabled): %s", _bl_import_exc)
+
 
 def _bt_conn(statement_timeout_ms=30000):
     """Short-lived autocommit connection for the backtest tables. None on error."""
@@ -35812,6 +35820,142 @@ def bt_export():
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 6B.1 — Immutable Real-Data Baseline API
+# MEASUREMENT ONLY.  Never mutates live state, never calls execution gateways,
+# never feeds learning, scoring, or strategy promotion.  All endpoints are
+# owner-gated via the Express dashboard auth (NOT in OPEN_PATHS).
+# ════════════════════════════════════════════════════════════════════════════
+
+def _bl_guard():
+    """Fail-closed guard: baseline engine must be available + DB must be on."""
+    if not BASELINE_AVAILABLE:
+        return jsonify({"ok": False, "error": "baseline engine unavailable"}), 503
+    if not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    return None
+
+
+@app.route("/backtest/baselines", methods=["GET"])
+def bt_baselines_list():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    List all committed baseline records, newest first."""
+    guard = _bl_guard()
+    if guard:
+        return guard
+    try:
+        rows = bl.get_baselines()
+        return jsonify({"ok": True, "baselines": rows, "count": len(rows)})
+    except Exception as exc:
+        logger.warning("baselines list error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/backtest/baselines/<baseline_id>", methods=["GET"])
+def bt_baselines_detail(baseline_id):
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Full baseline: config, 40-combo matrix results, summary, rankings."""
+    guard = _bl_guard()
+    if guard:
+        return guard
+    try:
+        detail = bl.get_baseline(baseline_id)
+        if detail is None:
+            return jsonify({"ok": False, "error": "baseline not found"}), 404
+        return jsonify({"ok": True, **detail})
+    except Exception as exc:
+        logger.warning("baseline detail error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/backtest/baselines/<baseline_id>/trades", methods=["GET"])
+def bt_baselines_trades(baseline_id):
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Trade-level records for a baseline, with optional filters.
+    Query params: instrument, mode, strategy, direction, session, weekday, month."""
+    guard = _bl_guard()
+    if guard:
+        return guard
+    try:
+        filters = {
+            k: request.args.get(k) for k in
+            ("instrument", "mode", "strategy", "direction",
+             "session", "weekday", "month", "volatility_regime", "trend_regime")
+            if request.args.get(k)
+        }
+        trades = bl.get_baseline_trades(baseline_id, filters)
+        return jsonify({"ok": True, "baseline_id": baseline_id,
+                        "filters": filters, "trades": trades, "count": len(trades)})
+    except Exception as exc:
+        logger.warning("baseline trades error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/backtest/baselines/<baseline_id>/breakdowns", methods=["GET"])
+def bt_baselines_breakdowns(baseline_id):
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Aggregated breakdowns for a baseline (by instrument, strategy, mode,
+    direction, session, hour, weekday, month, regime)."""
+    guard = _bl_guard()
+    if guard:
+        return guard
+    try:
+        rows = bl.get_baseline_breakdowns(baseline_id)
+        return jsonify({"ok": True, "baseline_id": baseline_id,
+                        "breakdowns": rows, "count": len(rows)})
+    except Exception as exc:
+        logger.warning("baseline breakdowns error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/backtest/baselines/generate", methods=["POST"])
+def bt_baselines_generate():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Generate an immutable baseline record from the official Phase 6B datasets.
+
+    Body (JSON): {"dataset_ids": [8, 9, 10, 11]}
+
+    Safety invariants — this endpoint NEVER:
+      • mutates live global state
+      • reads or writes ACTIVE_TRADES, strategy_trades, learning tables
+      • calls Databento, TradersPost, Discord, or any execution gateway
+      • triggers Decision Quality updates, strategy promotion, or auto-arm changes
+    All writes go to: baseline_configs, baseline_matrix_results,
+    baseline_trades, baseline_breakdowns — INSERT only, immutable.
+    """
+    guard = _bl_guard()
+    if guard:
+        return guard
+    body = request.get_json(silent=True) or {}
+    dataset_ids = body.get("dataset_ids")
+    if not dataset_ids or not isinstance(dataset_ids, list):
+        return jsonify({
+            "ok": False,
+            "error": "dataset_ids (list of integers) is required",
+            "expected": sorted(bl.OFFICIAL_DATASET_IDS.values()),
+        }), 400
+    try:
+        dataset_ids = [int(d) for d in dataset_ids]
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "dataset_ids must be integers"}), 400
+    # Warn on non-standard dataset IDs (still allowed for research runs)
+    official = sorted(bl.OFFICIAL_DATASET_IDS.values())
+    if sorted(dataset_ids) != official:
+        return jsonify({
+            "ok": False,
+            "error": (f"For the official Phase 6B.1 baseline, exactly "
+                      f"{official} are required — got {sorted(dataset_ids)}. "
+                      f"Use the exact official dataset IDs."),
+        }), 400
+    try:
+        result = bl.generate_baseline(dataset_ids)
+        status_code = 200 if result.get("ok") else 500
+        return jsonify(result), status_code
+    except Exception as exc:
+        logger.error("baseline generation failed: %s", exc, exc_info=True)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 # Scalping Strategy Research Engine (RESEARCH / SIMULATION / DISPLAY-ONLY)
 # ────────────────────────────────────────────────────────────────────────────
 # Continuously researches, stores and backtests NEW scalp strategies WITHOUT ever
@@ -49989,6 +50133,48 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <div class="bt-scroll" id="sr-promo"></div>
   </div>
 
+
+  <div class="mod" id="mod-baseline" data-cat="experimental">
+    <div class="mod-h">📊 Real Historical Baseline <span class="bt-mini">Phase 6B.1 — 40-combo immutable matrix</span><span class="mod-cat cat-experimental">RESEARCH ONLY</span></div>
+    <div class="bt-mini" style="margin-bottom:8px">
+      Immutable baseline records generated from <b>real Databento data</b> (MNQ/MES/MGC/MYM × SCALP/SWING × 5 strategies).
+      <b>HISTORICAL RESEARCH ONLY — not live performance — not financial advice — never influences live trading.</b>
+    </div>
+
+    <div id="bl-list-wrap">
+      <button class="bt-btn" onclick="blLoadList()" style="margin-bottom:8px">🔄 Load Baselines</button>
+      <div class="bt-msg" id="bl-list-msg"></div>
+      <div id="bl-list"></div>
+    </div>
+
+    <div id="bl-detail-wrap" style="display:none">
+      <button class="bt-btn" onclick="document.getElementById('bl-detail-wrap').style.display='none';document.getElementById('bl-list-wrap').style.display=''" style="margin-bottom:8px">← Back to list</button>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px" id="bl-detail-id"></div>
+      <div class="bt-mini" id="bl-summary-stats" style="margin-bottom:10px"></div>
+
+      <div style="margin-bottom:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="bl-filter-inst" onchange="blRenderMatrix()" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:3px;font-size:12px">
+          <option value="">All instruments</option>
+          <option>MNQ</option><option>MES</option><option>MGC</option><option>MYM</option>
+        </select>
+        <select id="bl-filter-mode" onchange="blRenderMatrix()" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:3px;font-size:12px">
+          <option value="">All modes</option>
+          <option>SCALP</option><option>SWING</option>
+        </select>
+        <select id="bl-filter-strat" onchange="blRenderMatrix()" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:3px;font-size:12px">
+          <option value="">All strategies</option>
+          <option>OPENING_DRIVE</option>
+          <option>LIQUIDITY_SWEEP_REVERSAL</option>
+          <option>VWAP_TREND_CONTINUATION</option>
+          <option>RANGE_EXPANSION_BREAKOUT</option>
+          <option>OPENING_RANGE_BREAKOUT</option>
+        </select>
+      </div>
+
+      <div class="bt-scroll" id="bl-matrix-table" style="overflow-x:auto"></div>
+    </div>
+  </div>
+
 </div><!-- /#view-research -->
 
 <div id="view-academy" style="display:none">
@@ -58232,6 +58418,118 @@ function acRenderKV(parent, label, val){
   } else {
     const d=document.createElement('div'); d.className='bt-mini'; d.textContent=val; parent.appendChild(d);
   }
+}
+
+// ── Phase 6B.1 Baseline panel ─────────────────────────────────────────────
+var _blMatrix = null;
+
+function blLoadList(){
+  var msg=document.getElementById('bl-list-msg');
+  var el=document.getElementById('bl-list');
+  if(msg){ msg.className='bt-msg'; msg.textContent='Loading…'; }
+  api('/backtest/baselines').then(function(j){
+    if(!j||!j.ok){ if(msg) msg.textContent=(j&&j.error)||'Failed'; return; }
+    if(msg){ msg.className=''; msg.textContent=''; }
+    var rows=j.baselines||[];
+    if(!rows.length){ el.innerHTML='<div class="bt-mini" style="color:var(--muted)">No baselines yet. Click Generate to create the first official baseline.</div>'; return; }
+    var html='<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:1px solid var(--border)">'
+      +'<th style="text-align:left;padding:4px 6px;color:var(--muted)">Baseline ID</th>'
+      +'<th style="text-align:right;padding:4px 6px;color:var(--muted)">Trades</th>'
+      +'<th style="text-align:right;padding:4px 6px;color:var(--muted)">Net R</th>'
+      +'<th style="text-align:right;padding:4px 6px;color:var(--muted)">Combos</th>'
+      +'<th style="text-align:right;padding:4px 6px;color:var(--muted)">Zero</th>'
+      +'<th style="text-align:right;padding:4px 6px;color:var(--muted)">Generated</th>'
+      +'<th style="padding:4px 6px"></th>'
+      +'</tr></thead><tbody>';
+    rows.forEach(function(r){
+      var dt=r.generated_at?(new Date(r.generated_at)).toLocaleString():'';
+      html+='<tr style="border-bottom:1px solid var(--border)">'
+        +'<td style="padding:4px 6px;font-family:var(--mono);font-size:11px;color:var(--text)">'+r.baseline_id+'</td>'
+        +'<td style="padding:4px 6px;text-align:right">'+(r.total_trades!=null?r.total_trades:'—')+'</td>'
+        +'<td style="padding:4px 6px;text-align:right;color:'+(r.aggregate_net_r>=0?'#22c55e':'#ef4444')+'">'+(r.aggregate_net_r!=null?r.aggregate_net_r.toFixed(2)+'R':'—')+'</td>'
+        +'<td style="padding:4px 6px;text-align:right">'+(r.completed_combinations!=null?r.completed_combinations:'—')+'</td>'
+        +'<td style="padding:4px 6px;text-align:right;color:var(--muted)">'+(r.zero_trade_combinations||0)+'</td>'
+        +'<td style="padding:4px 6px;text-align:right;font-size:11px;color:var(--muted)">'+dt+'</td>'
+        +'<td style="padding:4px 6px"><button class="bt-btn" onclick="blLoadDetail(\''+r.baseline_id+'\')">View</button></td>'
+        +'</tr>';
+    });
+    html+='</tbody></table>';
+    el.innerHTML=html;
+  }).catch(function(e){ if(msg) msg.textContent='Error: '+e; });
+}
+
+function blLoadDetail(baselineId){
+  var el=document.getElementById('bl-matrix-table');
+  var sum=document.getElementById('bl-summary-stats');
+  var idEl=document.getElementById('bl-detail-id');
+  if(idEl) idEl.textContent=baselineId;
+  if(sum) sum.textContent='Loading…';
+  if(el) el.innerHTML='';
+  document.getElementById('bl-list-wrap').style.display='none';
+  document.getElementById('bl-detail-wrap').style.display='';
+  api('/backtest/baselines/'+baselineId).then(function(j){
+    if(!j||!j.ok){ if(sum) sum.textContent=(j&&j.error)||'Failed'; return; }
+    _blMatrix=j.matrix_results||[];
+    var s=j.summary||{};
+    if(sum){
+      sum.innerHTML='<b>'+baselineId+'</b> &nbsp;·&nbsp; '
+        +(s.total_trades||0)+' trades &nbsp;·&nbsp; '
+        +'Net R: <span style="color:'+(s.aggregate_net_r>=0?'#22c55e':'#ef4444')+'">'+(s.aggregate_net_r!=null?s.aggregate_net_r.toFixed(2):'—')+'R</span>'
+        +' &nbsp;·&nbsp; Expectancy: '+(s.aggregate_expectancy!=null?s.aggregate_expectancy.toFixed(4):'—')
+        +' &nbsp;·&nbsp; Combos: '+(s.completed_combinations||0)+' ok / '+(s.zero_trade_combinations||0)+' zero / '+(s.failed_combinations||0)+' fail'
+        +'<br><span style="color:var(--muted);font-size:11px">Commit: '+(j.source_commit||'?')+' &nbsp;·&nbsp; Config hash: '+(j.config_hash||'?')+'</span>'
+        +'<br><span style="color:#f59e0b;font-size:11px">HISTORICAL RESEARCH ONLY — not live performance — not financial advice</span>';
+    }
+    blRenderMatrix();
+  }).catch(function(e){ if(sum) sum.textContent='Error: '+e; });
+}
+
+function blRenderMatrix(){
+  var el=document.getElementById('bl-matrix-table');
+  if(!el||!_blMatrix) return;
+  var fi=document.getElementById('bl-filter-inst').value;
+  var fm=document.getElementById('bl-filter-mode').value;
+  var fs=document.getElementById('bl-filter-strat').value;
+  var rows=_blMatrix.filter(function(r){
+    return (!fi||r.instrument===fi)&&(!fm||r.mode===fm)&&(!fs||r.strategy===fs);
+  });
+  if(!rows.length){ el.innerHTML='<div class="bt-mini" style="color:var(--muted)">No combinations match filters.</div>'; return; }
+  var html='<table style="width:100%;border-collapse:collapse;font-size:11px"><thead><tr style="border-bottom:1px solid var(--border);color:var(--muted)">'
+    +'<th style="text-align:left;padding:3px 5px">Inst</th>'
+    +'<th style="text-align:left;padding:3px 5px">Mode</th>'
+    +'<th style="text-align:left;padding:3px 5px">Strategy</th>'
+    +'<th style="text-align:center;padding:3px 5px">Status</th>'
+    +'<th style="text-align:right;padding:3px 5px">Trades</th>'
+    +'<th style="text-align:right;padding:3px 5px">Win%</th>'
+    +'<th style="text-align:right;padding:3px 5px">Net R</th>'
+    +'<th style="text-align:right;padding:3px 5px">Exp</th>'
+    +'<th style="text-align:right;padding:3px 5px">PF</th>'
+    +'<th style="text-align:right;padding:3px 5px">MaxDD</th>'
+    +'<th style="text-align:right;padding:3px 5px">Reliability</th>'
+    +'</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var ok=r.total_trades>0;
+    var netClr=r.net_r>=0?'#22c55e':'#ef4444';
+    var stClr=r.status==='COMPLETE'?'#22c55e':(r.status==='COMPLETE_ZERO_TRADES'?'#6b7280':'#ef4444');
+    html+='<tr style="border-bottom:1px solid #1a2035">'
+      +'<td style="padding:3px 5px;font-weight:600">'+r.instrument+'</td>'
+      +'<td style="padding:3px 5px;color:var(--muted)">'+r.mode+'</td>'
+      +'<td style="padding:3px 5px;font-size:10px">'+r.strategy.replace(/_/g,' ')+'</td>'
+      +'<td style="padding:3px 5px;text-align:center;color:'+stClr+';font-size:10px">'+r.status+'</td>'
+      +'<td style="padding:3px 5px;text-align:right">'+(r.total_trades||0)+'</td>'
+      +'<td style="padding:3px 5px;text-align:right">'+(ok&&r.win_rate!=null?r.win_rate.toFixed(1)+'%':'—')+'</td>'
+      +'<td style="padding:3px 5px;text-align:right;color:'+netClr+'">'+(ok&&r.net_r!=null?r.net_r.toFixed(2):'—')+'</td>'
+      +'<td style="padding:3px 5px;text-align:right">'+(ok&&r.expectancy!=null?r.expectancy.toFixed(4):'—')+'</td>'
+      +'<td style="padding:3px 5px;text-align:right">'+(ok&&r.profit_factor!=null?r.profit_factor.toFixed(2):'—')+'</td>'
+      +'<td style="padding:3px 5px;text-align:right;color:#f59e0b">'+(ok&&r.max_drawdown_r!=null?r.max_drawdown_r.toFixed(2):'—')+'</td>'
+      +'<td style="padding:3px 5px;text-align:right;font-size:10px;color:var(--muted)">'+(r.reliability_label||'—')+'</td>'
+      +'</tr>';
+    if(r.error_detail){
+      html+='<tr><td colspan="11" style="padding:2px 5px;font-size:10px;color:#ef4444">Error: '+String(r.error_detail).substring(0,120)+'</td></tr>';
+    }
+  });
+  html+='</tbody></table>';
+  el.innerHTML=html;
 }
 
 function acLoad(){ acLoadMetrics(); acLoadSources(); acLoadStrategies(); acLoadRules(); }
