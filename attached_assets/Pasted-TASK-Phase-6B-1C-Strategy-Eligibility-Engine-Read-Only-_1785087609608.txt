@@ -1,0 +1,198 @@
+TASK: Phase 6B.1C — Strategy Eligibility Engine (Read-Only Shadow Mode)
+
+OBJECTIVE
+
+Build a Strategy Eligibility Engine that evaluates whether each strategy
+SHOULD be allowed to participate under current market conditions.
+
+This phase is SHADOW MODE ONLY.
+
+DO NOT change trade execution.
+
+DO NOT change scoring.
+
+DO NOT block trades.
+
+DO NOT modify detectors.
+
+DO NOT modify learning.
+
+DO NOT modify TradersPost.
+
+DO NOT modify Databento.
+
+DO NOT regenerate the historical baseline.
+
+The engine will only produce diagnostics.
+
+----------------------------------------------------
+BACKGROUND
+----------------------------------------------------
+
+Phase 6B.1B showed:
+
+- ORB Long strongly positive while ORB Short struggled during this dataset.
+- LSR performed well during volatile conditions and poorly in quiet sessions.
+- Opening Drive performed best in established trends.
+- VWAP Trend Continuation deteriorated during overnight sessions.
+- Range Expansion Breakout varied significantly by regime.
+
+Rather than changing strategies, build a reusable eligibility layer that
+explains whether market conditions favor each strategy.
+
+----------------------------------------------------
+PART 1 — STRATEGY ELIGIBILITY MODEL
+----------------------------------------------------
+
+For every strategy create a diagnostic eligibility object.
+
+Return:
+
+eligible: true/false
+confidence: 0–100
+reasons: []
+warnings: []
+
+The object must never affect execution.
+
+----------------------------------------------------
+PART 2 — INPUTS
+----------------------------------------------------
+
+Evaluate using existing information only.
+
+Include where available:
+
+- session
+- ET hour
+- volatility regime
+- trend regime
+- VWAP relationship
+- opening-range status
+- ATR regime
+- day of week
+- instrument
+- mode
+- higher timeframe bias if already available
+
+Do not create new detectors.
+
+----------------------------------------------------
+PART 3 — STRATEGY PROFILES
+----------------------------------------------------
+
+Create diagnostic profiles for:
+
+Opening Drive
+
+Liquidity Sweep Reversal
+
+VWAP Trend Continuation
+
+Range Expansion Breakout
+
+Opening Range Breakout
+
+Each profile should describe:
+
+- preferred session
+- weak session
+- preferred volatility
+- weak volatility
+- preferred trend
+- weak trend
+- preferred directionality
+- historical confidence
+
+These are diagnostics only.
+
+----------------------------------------------------
+PART 4 — SHADOW OUTPUT
+----------------------------------------------------
+
+Extend decision diagnostics only.
+
+Example:
+
+Eligibility Engine
+
+Opening Drive
+Eligible: YES
+Confidence: 84
+Reason:
+Trending NY session
+
+LSR
+Eligible: LOW
+Confidence: 22
+Reason:
+Balanced Asia session
+
+ORB
+Eligible: MEDIUM
+Confidence: 61
+Reason:
+Opening range complete
+Trend unclear
+
+----------------------------------------------------
+PART 5 — NO EXECUTION CHANGES
+----------------------------------------------------
+
+Verify:
+
+No detector changes
+
+No scoring changes
+
+No trade blocking
+
+No strategy promotion
+
+No strategy demotion
+
+No historical changes
+
+No learning changes
+
+No live changes
+
+----------------------------------------------------
+PART 6 — TESTS
+----------------------------------------------------
+
+Add focused tests proving:
+
+Eligibility is deterministic
+
+Eligibility cannot block trades
+
+Eligibility cannot change scores
+
+Eligibility cannot alter trade plans
+
+Eligibility diagnostics serialize correctly
+
+----------------------------------------------------
+PART 7 — REPORT
+----------------------------------------------------
+
+Return:
+
+Architecture
+
+Data flow
+
+Files changed
+
+Tests
+
+Proof that execution is byte-identical
+
+Sample eligibility output
+
+Future hook points for learning
+
+Final status:
+
+PHASE_6B_1C_SHADOW_ELIGIBILITY_COMPLETE

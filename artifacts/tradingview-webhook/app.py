@@ -658,6 +658,12 @@ _DPV2_CAN_CHANGE_CONFIDENCE         = _env_flag_on("DECISION_PIPELINE_V2_CAN_CHA
 _DPV2_CAN_CHANGE_RISK               = _env_flag_on("DECISION_PIPELINE_V2_CAN_CHANGE_RISK",       default_on=False)
 _DPV2_CAN_PAUSE_ENTRIES             = _env_flag_on("DECISION_PIPELINE_V2_CAN_PAUSE_ENTRIES",     default_on=False)
 _DPV2_CAN_ROUTE_ORDERS              = _env_flag_on("DECISION_PIPELINE_V2_CAN_ROUTE_ORDERS",      default_on=False)
+# ── Strategy Eligibility Engine (Phase 6B.1C) ─────────────────────────────
+# DISPLAY-ONLY / SHADOW MODE. Evaluates per-strategy condition fit (session,
+# ET hour, volatility regime, direction context, opening-range state).  NEVER
+# feeds the gate, scoring, sizing, detectors, learning, or any money-path
+# variable. Default ON — it is pure advisory output with zero risk.
+STRATEGY_ELIGIBILITY_ENABLED = _env_flag_on("STRATEGY_ELIGIBILITY_ENABLED", default_on=True)
 # Only sweeps newer than this (minutes) count — a stale sweep alert must decay to
 # "NO SWEEP" rather than reading as CONFIRMED forever. DISPLAY-ONLY tuning knob.
 LIQ_SWEEP_RECENCY_MIN = _env_float("LIQ_SWEEP_RECENCY_MIN", 20.0)
@@ -9650,6 +9656,386 @@ def _closed_strategy_engine():
         # Adaptive-learning telemetry (key parity with the open-market path).
         "base_confidence": 0, "history_weight": 1.0,
         "history_sample_size": 0, "history_adjustment": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strategy Eligibility Engine — DISPLAY-ONLY, SHADOW MODE (Phase 6B.1C)
+# ---------------------------------------------------------------------------
+# Evaluates per-strategy condition fit from ALREADY-COMPUTED result fields.
+# NEVER touches the gate, scoring, sizing, detectors, learning, TradersPost,
+# Databento, or any money-path variable.  Fail-open throughout.
+# ---------------------------------------------------------------------------
+
+# Strategy condition profiles (derived from Phase 6B.1B H1-2026 diagnostics).
+# These are DIAGNOSTIC METADATA ONLY — never used as gate conditions.
+_ELIGIBILITY_PROFILES = {
+    "OPENING_DRIVE": {
+        "label":                  "Opening Drive",
+        "preferred_session":      "New York (08:00\u201310:00 ET)",
+        "weak_session":           "Asia / Off-hours",
+        "preferred_volatility":   "TRENDING",
+        "weak_volatility":        "BALANCED",
+        "preferred_direction":    "Long",
+        "historical_note": (
+            "H1-2026: profitable in TRENDING NY session; best cells MGC SCALP +12R, "
+            "MNQ SCALP +14R; deteriorates rapidly outside 08:00\u201310:00 window"
+        ),
+    },
+    "LIQUIDITY_SWEEP_REVERSAL": {
+        "label":                  "Liquidity Sweep Reversal",
+        "preferred_session":      "New York (08:00\u201317:00 ET)",
+        "weak_session":           "Asia (18:00\u201302:00 ET)",
+        "preferred_volatility":   "VOLATILE",
+        "weak_volatility":        "BALANCED",
+        "preferred_direction":    "Long",
+        "historical_note": (
+            "H1-2026: NY only profitable session +54R; Asia \u2212107R "
+            "(Asia Short MNQ alone \u221284R); VOLATILE PF 1.10 vs BALANCED PF 0.87"
+        ),
+    },
+    "VWAP_TREND_CONTINUATION": {
+        "label":                  "VWAP Trend Continuation",
+        "preferred_session":      "New York / London",
+        "weak_session":           "Asia (18:00\u201302:00 ET)",
+        "preferred_volatility":   "TRENDING",
+        "weak_volatility":        "BALANCED",
+        "preferred_direction":    "Long",
+        "historical_note": (
+            "H1-2026: Asia \u221257R (Short alone \u221263R); "
+            "best hours 02h +22R, 08h +27R; MES SCALP +23R, MES SWING +10R"
+        ),
+    },
+    "RANGE_EXPANSION_BREAKOUT": {
+        "label":                  "Range Expansion Breakout",
+        "preferred_session":      "New York",
+        "weak_session":           "London (02:00\u201308:00 ET)",
+        "preferred_volatility":   "TRENDING",
+        "weak_volatility":        "BALANCED",
+        "preferred_direction":    "\u2014",
+        "historical_note": (
+            "H1-2026: London \u221259R PF 0.65 (false breakouts); "
+            "NY +6R; only profitable cell MNQ SCALP +16R; "
+            "TRENDING near break-even PF 1.005"
+        ),
+    },
+    "OPENING_RANGE_BREAKOUT": {
+        "label":                  "Opening Range Breakout",
+        "preferred_session":      "New York (post-10:00 ET)",
+        "weak_session":           "New York open 08:00\u201310:00 ET",
+        "preferred_volatility":   "TRENDING / VOLATILE",
+        "weak_volatility":        "BALANCED",
+        "preferred_direction":    "Long",
+        "historical_note": (
+            "H1-2026: Long +56R PF 1.11 vs Short \u2212173R PF 0.68; "
+            "08\u201310h ET cost \u2212144R; best hours 12\u201313h +60R combined; "
+            "monotonic WR decline Jan\u2192Jun"
+        ),
+    },
+}
+
+
+def _eligibility_session(result):
+    """Normalized session string: 'New York' | 'London' | 'Asia' | 'Off-hours'.
+    Uses _bias_session_for() (live clock) as the primary source; falls back to
+    the precomputed session dict stored in result."""
+    try:
+        et = now_utc().astimezone(ET_TZ)
+        name, _ = _bias_session_for(et)
+        if name:
+            return name
+    except Exception:
+        pass
+    raw = (result.get("session") or {}).get("window", "")
+    if "York" in raw or "NY" in raw:
+        return "New York"
+    if "London" in raw or "Europe" in raw:
+        return "London"
+    if "Asia" in raw or "Tokyo" in raw:
+        return "Asia"
+    return "Off-hours"
+
+
+def _eligibility_regime(result):
+    """Market/volatility regime string from strategy_engine, then volatility dict."""
+    se = result.get("strategy_engine") or {}
+    mr = se.get("market_regime")
+    if mr and mr != "CLOSED":
+        return str(mr)
+    vol = result.get("volatility") or {}
+    r   = vol.get("regime")
+    return str(r) if r else "BALANCED"
+
+
+def _elig_score_opening_drive(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    in_window = (8.0 <= et_hour < 10.0)
+    if in_window:
+        score += 30
+        reasons.append("Opening window active (08:00\u201310:00 ET)")
+    else:
+        score -= 15
+        warnings.append(f"Outside 08:00\u201310:00 opening window ({et_hour:.1f}h ET)")
+    if regime == "TRENDING":
+        score += 15
+        reasons.append("Trending regime favors directional opening drive")
+    elif regime == "VOLATILE":
+        score += 5
+        reasons.append("Volatile regime \u2014 drive possible but erratic")
+    else:
+        score -= 10
+        warnings.append(f"{regime} regime \u2014 low conviction opener")
+    if session == "New York":
+        score += 10
+        reasons.append("New York session (primary OD session)")
+    elif session == "Asia":
+        score -= 15
+        warnings.append("Asia session \u2014 Opening Drive not applicable")
+    if direction == "Long":
+        score += 5
+        reasons.append("Long direction aligns with H1-2026 OD edge")
+    return score, reasons, warnings
+
+
+def _elig_score_liquidity_sweep_reversal(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime == "VOLATILE":
+        score += 30
+        reasons.append("Volatile regime \u2014 genuine reversals post-sweep (H1-2026 PF 1.10)")
+    elif regime == "TRENDING":
+        score += 5
+        reasons.append("Trending regime \u2014 sweeps possible at reaction levels")
+    else:
+        score -= 10
+        warnings.append(f"{regime} regime \u2014 H1-2026 PF 0.87; sweeps often continue")
+    if session == "New York":
+        score += 20
+        reasons.append("New York session \u2014 only profitable LSR session (+54R H1-2026)")
+    elif session == "London":
+        score += 5
+        reasons.append("London session \u2014 modest LSR edge")
+    elif session == "Asia":
+        score -= 25
+        warnings.append("Asia session \u2014 H1-2026 LSR Asia: \u2212107R; overnight sweeps continue rather than reverse")
+    else:
+        score -= 5
+        warnings.append(f"Off-hours / unknown session")
+    if direction == "Short":
+        score -= 10
+        warnings.append("Short direction \u2014 H1-2026 LSR Short underperformed Long across all sessions")
+    elif direction == "Long":
+        score += 5
+        reasons.append("Long direction aligns with H1-2026 LSR edge")
+    return score, reasons, warnings
+
+
+def _elig_score_vwap_trend_continuation(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime == "TRENDING":
+        score += 25
+        reasons.append("Trending regime \u2014 VWAP continuation in established direction")
+    elif regime == "VOLATILE":
+        score += 5
+        reasons.append("Volatile regime \u2014 potential continuation but whippy")
+    else:
+        score -= 10
+        warnings.append(f"{regime} regime \u2014 continuation signals fade (H1-2026 Asia loss driver)")
+    if session == "New York":
+        score += 15
+        reasons.append("New York session \u2014 VTC +15R H1-2026")
+    elif session == "London":
+        score += 10
+        reasons.append("London session \u2014 VTC +8R H1-2026")
+    elif session == "Asia":
+        score -= 25
+        warnings.append("Asia session \u2014 H1-2026 VTC Asia: \u221257R; overnight VWAP drift loses")
+    if 2.0 <= et_hour < 8.0:
+        score += 5
+        reasons.append("London hours (02\u201308h ET) \u2014 H1-2026 best VTC ET band")
+    elif 8.0 <= et_hour < 12.0:
+        score += 5
+        reasons.append("NY morning (08\u201312h ET) \u2014 active VTC window")
+    elif et_hour >= 18.0 or et_hour < 2.0:
+        score -= 10
+        warnings.append("Asia open / overnight hours \u2014 worst VTC ET band H1-2026")
+    if direction == "Short":
+        score -= 10
+        warnings.append("Short direction \u2014 H1-2026 VTC Short: \u221263R vs Long: +13R")
+    elif direction == "Long":
+        score += 5
+        reasons.append("Long direction \u2014 H1-2026 VTC Long edge positive")
+    return score, reasons, warnings
+
+
+def _elig_score_range_expansion_breakout(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime == "TRENDING":
+        score += 20
+        reasons.append("Trending regime \u2014 REB at trending-day coils (H1-2026 PF 1.005)")
+    elif regime == "RANGING":
+        score += 10
+        reasons.append("Ranging regime \u2014 tight consolidation precedes expansion")
+    else:
+        score -= 15
+        warnings.append(f"{regime} regime \u2014 H1-2026 balanced REB: \u221254R PF 0.73")
+    if session == "London":
+        score -= 30
+        warnings.append("London session \u2014 H1-2026 REB London: \u221259R PF 0.65; false breakouts dominant")
+    elif session == "New York":
+        score += 15
+        reasons.append("New York session \u2014 only profitable REB session (+6R H1-2026)")
+    elif session == "Asia":
+        score -= 10
+        warnings.append("Asia session \u2014 H1-2026 REB Asia: \u22126R; low activity")
+    if 2.0 <= et_hour < 8.0:
+        score -= 15
+        warnings.append("London hours \u2014 historically weakest REB band")
+    elif 12.0 <= et_hour < 17.0:
+        score += 10
+        reasons.append("Mid-NY session \u2014 volume support for genuine expansions")
+    return score, reasons, warnings
+
+
+def _elig_score_opening_range_breakout(session, et_hour, regime, direction, ctx):
+    score, reasons, warnings = 40, [], []
+    or_complete = bool(ctx.get("or_complete", False))
+    if or_complete:
+        score += 20
+        reasons.append("Opening range formed \u2014 ORB setup available")
+    else:
+        score -= 10
+        warnings.append("Opening range not yet complete \u2014 ORB not available")
+    if direction == "Long":
+        score += 20
+        reasons.append("Long direction \u2014 H1-2026 ORB Long: +56R WR 22.5% PF 1.11")
+    elif direction == "Short":
+        score -= 30
+        warnings.append("Short direction \u2014 H1-2026 ORB Short: \u2212173R WR 15.2% PF 0.68; fights bullish macro")
+    if regime in ("TRENDING", "VOLATILE"):
+        score += 10
+        reasons.append(f"{regime} regime \u2014 ORB extends in directional conditions")
+    else:
+        score -= 5
+        warnings.append(f"{regime} regime \u2014 ORB may fail to reach 4R target")
+    if 8.0 <= et_hour < 10.0:
+        score -= 10
+        warnings.append(f"Opening hour ({et_hour:.1f}h ET) \u2014 H1-2026: 08\u201310h cost \u2212144R on ORB")
+    elif 12.0 <= et_hour < 15.0:
+        score += 10
+        reasons.append(f"Mid-session ({et_hour:.1f}h ET) \u2014 H1-2026 best ORB hours 12\u201313h +60R combined")
+    return score, reasons, warnings
+
+
+_ELIGIBILITY_SCORERS = {
+    "OPENING_DRIVE":            _elig_score_opening_drive,
+    "LIQUIDITY_SWEEP_REVERSAL": _elig_score_liquidity_sweep_reversal,
+    "VWAP_TREND_CONTINUATION":  _elig_score_vwap_trend_continuation,
+    "RANGE_EXPANSION_BREAKOUT": _elig_score_range_expansion_breakout,
+    "OPENING_RANGE_BREAKOUT":   _elig_score_opening_range_breakout,
+}
+
+
+def _strategy_eligibility_neutral(reason="Strategy Eligibility unavailable."):
+    return {
+        "available":         False,
+        "reason":            reason,
+        "instrument":        "\u2014",
+        "mode":              "\u2014",
+        "session":           "\u2014",
+        "et_hour":           None,
+        "vol_regime":        "\u2014",
+        "direction_context": "\u2014",
+        "strategies":        {},
+        "summary":           [],
+        "shadow_mode":       True,
+        "affects_execution": False,
+    }
+
+
+def compute_strategy_eligibility(result):
+    """Per-strategy condition-fit diagnostics.  DISPLAY-ONLY, SHADOW MODE.
+
+    Reads ONLY from the already-assembled result dict (session, volatility
+    regime, alert_diagnostics, strategy_engine, active_ticker).  NEVER mutates
+    result, NEVER touches the gate / scoring / sizing / money path.  FAIL-OPEN:
+    any exception at the caller level returns _strategy_eligibility_neutral().
+    """
+    session   = _eligibility_session(result)
+    regime    = _eligibility_regime(result)
+    ad        = result.get("alert_diagnostics") or {}
+    direction = str(ad.get("dominant_direction") or "\u2014")
+    inst      = instrument_of(result.get("active_ticker") or "")
+    mode      = TRADING_MODE
+
+    try:
+        _et     = now_utc().astimezone(ET_TZ)
+        et_hour = _et.hour + _et.minute / 60.0
+    except Exception:
+        et_hour = 0.0
+
+    try:
+        ctx_extra = {"or_complete": bool((_intraday_or(inst) or {}).get("complete", False))}
+    except Exception:
+        ctx_extra = {"or_complete": False}
+
+    strategies: dict = {}
+    summary:    list = []
+    for key in STRATEGY_PRIORITY:
+        try:
+            scorer  = _ELIGIBILITY_SCORERS[key]
+            profile = _ELIGIBILITY_PROFILES[key]
+            raw, reasons, warnings = scorer(session, et_hour, regime, direction, ctx_extra)
+            confidence = max(0, min(100, int(raw)))
+            if confidence >= 80:
+                conf_label, eligible = "HIGH",   True
+            elif confidence >= 60:
+                conf_label, eligible = "MEDIUM", True
+            elif confidence >= 40:
+                conf_label, eligible = "LOW",    True
+            else:
+                conf_label, eligible = "NONE",   False
+            strategies[key] = {
+                "label":               profile["label"],
+                "eligible":            eligible,
+                "confidence":          confidence,
+                "confidence_label":    conf_label,
+                "reasons":             reasons,
+                "warnings":            warnings,
+                "preferred_session":   profile["preferred_session"],
+                "preferred_volatility": profile["preferred_volatility"],
+                "preferred_direction": profile["preferred_direction"],
+                "historical_note":     profile["historical_note"],
+            }
+            summary.append({
+                "key":              key,
+                "label":            profile["label"],
+                "eligible":         eligible,
+                "confidence":       confidence,
+                "confidence_label": conf_label,
+            })
+        except Exception as _exc:
+            _lbl = (STRATEGY_DEFS.get(key) or {}).get("label", key)
+            strategies[key] = {
+                "label": _lbl, "eligible": True, "confidence": 50,
+                "confidence_label": "LOW", "reasons": [],
+                "warnings": [f"Scorer error: {type(_exc).__name__}"],
+                "error": True,
+            }
+            summary.append({"key": key, "label": _lbl, "eligible": True,
+                             "confidence": 50, "confidence_label": "LOW"})
+
+    return {
+        "available":         True,
+        "instrument":        inst or "\u2014",
+        "mode":              mode,
+        "session":           session,
+        "et_hour":           round(et_hour, 2),
+        "vol_regime":        regime,
+        "direction_context": direction,
+        "strategies":        strategies,
+        "summary":           summary,
+        "shadow_mode":       True,
+        "affects_execution": False,
     }
 
 
@@ -23961,6 +24347,19 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 )
             except Exception:
                 pass  # logging itself failed; analysis result is still returned unchanged
+
+    # ── Strategy Eligibility Engine (DISPLAY-ONLY, SHADOW MODE — Phase 6B.1C) ─
+    # Evaluates per-strategy condition fit (session, ET hour, volatility regime,
+    # direction, OR completion) from the already-assembled result dict.
+    # NEVER touches the gate, scoring, sizing, detectors, learning, TradersPost,
+    # Databento, or any money-path variable.  Default ON (display-only).
+    # Flag OFF → key absent → goldens byte-identical.  FAIL-OPEN.
+    if STRATEGY_ELIGIBILITY_ENABLED:
+        try:
+            result["strategy_eligibility"] = compute_strategy_eligibility(result)
+        except Exception as _elig_exc:
+            result["strategy_eligibility"] = _strategy_eligibility_neutral(
+                "Strategy Eligibility unavailable (%s)." % _elig_exc)
 
     return result
 
@@ -42101,6 +42500,10 @@ def _build_status_payload(_tk):
            if ACTIVE_THINKING_ENABLED else {}),
         # ── BrainState: unified per-instrument snapshot — DISPLAY-ONLY ──
         "brain_state": a.get("brain_state"),
+        # ── Strategy Eligibility Engine — DISPLAY-ONLY, SHADOW MODE ──────────
+        # Per-strategy condition-fit diagnostics (session/regime/direction/OR).
+        # Absent when flag is OFF (byte-identical to today when disabled).
+        "strategy_eligibility": a.get("strategy_eligibility"),
         # ── Persistent thesis + hysteresis (Phase 1) — DISPLAY-ONLY ──────────
         # The thesis was already applied to the verdict above; this exposes the
         # full snapshot (confidence, status, age, evidence, reason codes) for the
