@@ -1,0 +1,212 @@
+TASK: Post-Deployment Verification — Right Brain Trade Management
+
+The production deployment has now been published.
+
+Do not change code.
+
+Do not create commits.
+
+Do not modify environment variables.
+
+Do not start another phase.
+
+Verify the running production deployment only.
+
+====================================================
+1. DEPLOYED REVISION
+====================================================
+
+Confirm:
+
+- production boot revision
+- source HEAD
+- deployed revision
+- whether the deployed application contains:
+  - Phase 6B.2 Trade Management
+  - _right_brain_orchestrate()
+  - TM043–TM047 orchestrator tests in source
+
+Return:
+
+Source HEAD:
+Deployed revision:
+Revision match:
+Phase 6B.2 present:
+Orchestrator present:
+
+====================================================
+2. FEATURE FLAG
+====================================================
+
+Confirm from the running production process:
+
+RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED=True
+
+Do not infer this only from the environment settings page.
+
+Prove the running process loaded the value.
+
+====================================================
+3. BOOT HEALTH
+====================================================
+
+Inspect production boot and runtime logs.
+
+Verify:
+
+- application started without traceback
+- no crash loop
+- no repeated exception loop
+- database initialized normally
+- Databento initialized
+- all four instruments connected:
+  - MGC
+  - MNQ
+  - MES
+  - MYM
+- one subscription acknowledgement
+- no duplicate subscription
+- no reconnect storm
+- no unexpected TradersPost request
+- no broker order created
+
+Return PASS / FAIL / WARNING for each.
+
+====================================================
+4. STATUS OUTPUT
+====================================================
+
+Query the authenticated production status endpoint.
+
+Confirm the response includes the Right Brain Trade Management diagnostic block.
+
+Expected path according to the actual API schema:
+
+right_brain.trade_management
+
+or the established serialized status equivalent.
+
+Confirm:
+
+available=true
+shadow_mode=true
+affects_execution=false
+
+When flat, confirm:
+
+active_trade=false
+state="FLAT"
+recommendation.action="NO_ACTIVE_TRADE"
+
+Do not create an artificial trade.
+
+====================================================
+5. DASHBOARD
+====================================================
+
+Open the production dashboard.
+
+Confirm:
+
+- Trade Management appears inside the existing Right Brain
+- no third brain appears
+- no duplicate panel
+- title is visible
+- shadow-only warning is visible
+- flat state renders correctly
+- no undefined or null rendering corruption
+- no JavaScript console errors
+- no layout corruption
+
+Return the exact visible panel text.
+
+====================================================
+6. POST-ACTIVATION PARITY
+====================================================
+
+Use a safe status or analysis refresh.
+
+Confirm enabling the feature did not change:
+
+- verdict
+- bias
+- direction
+- confidence
+- edge score
+- strategy selection
+- trade plan
+- entry
+- stop
+- target
+- quantity
+- prop guard
+- duplicate guard
+- daily-loss guard
+- TradersPost decision
+- learning intent
+
+Only the Right Brain diagnostic block may be new.
+
+Return:
+
+Fields compared:
+Mismatch count:
+Exact mismatches:
+Expected diagnostic difference:
+Parity conclusion:
+
+====================================================
+7. EXECUTION SAFETY
+====================================================
+
+Confirm from code path and runtime evidence:
+
+- recommendations cannot place orders
+- recommendations cannot close orders
+- recommendations cannot move stops
+- recommendations cannot change targets
+- recommendations cannot change quantity
+- recommendations cannot alter learning
+- ANALYSIS_ONLY remains enabled in production
+- no outbound order occurred during deployment verification
+
+====================================================
+8. FINAL RESULT
+====================================================
+
+Return:
+
+Production revision:
+Feature flag loaded:
+Databento status:
+Right Brain status:
+Dashboard status:
+Console status:
+Execution isolation:
+Outbound orders:
+Blocking issues:
+Warnings:
+
+Final status must be exactly one:
+
+RIGHT_BRAIN_PRODUCTION_VERIFIED
+
+RIGHT_BRAIN_PRODUCTION_VERIFIED_WITH_WARNINGS
+
+RIGHT_BRAIN_PRODUCTION_VERIFICATION_FAILED
+
+Market status must be exactly one:
+
+MARKET_OPEN_READY
+
+MARKET_OPEN_READY_WITH_WARNINGS
+
+MARKET_OPEN_NOT_READY
+
+After reporting, stop.
+
+DO NOT ADD FEATURES.
+
+DO NOT MODIFY THE MONEY PATH.
+
+DO NOT AUTOMATE RIGHT BRAIN RECOMMENDATIONS.
