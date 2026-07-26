@@ -122,9 +122,11 @@ STRATEGY_DEFS = {
                                  "regimes": {"RANGING", "BALANCED"}},
     "EXHAUSTION_FADE":          {"label": "Exhaustion Fade",          "max_grade": "A",
                                  "regimes": {"VOLATILE", "BALANCED"}},
+    "OPENING_RANGE_BREAKOUT":   {"label": "Opening Range Breakout",   "max_grade": "A",
+                                 "regimes": {"TRENDING", "VOLATILE", "BALANCED"}},
 }
 STRATEGY_ORDER = ["OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
-                  "RANGE_EXPANSION_BREAKOUT"]
+                  "RANGE_EXPANSION_BREAKOUT", "OPENING_RANGE_BREAKOUT"]
 
 # Strategies that must never trade in the backtest right now. EXHAUSTION_FADE is a
 # counter-trend fade that audited as the weakest performer — disabled by request.
@@ -792,6 +794,48 @@ def detect_opening_drive(s):
     return None
 
 
+def detect_opening_range_breakout(s):
+    """Price closes beyond the COMPLETED 08:00–08:30 ET opening range on a volume
+    push with a confirming candle.
+
+    Historical reconstruction of live _score_opening_range_breakout (app.py).
+
+    Key differences from detect_opening_drive:
+    - No time-window ceiling: ORB can fire any time AFTER the OR is complete,
+      not just 08:00–10:00 ET.
+    - No VWAP-side alignment required: plain range break with volume + candle.
+    - Confirmation: close-over-OR_high (long) or close-under-OR_low (short)
+      on a bullish/bearish candle with RVOL-confirmed volume.
+
+    Live input mapping:
+    or_complete     → s["or_complete"]       (08:00–08:30 ET, causal)
+    or_high/or_low  → s["or_high"]/s["or_low"] (same window, causal)
+    price > or_high → s["close"] > s["or_high"] (bar-close; no intrabar order)
+    volume_ok       → s["volume_confirmed"]  (RVOL ≥ rvol_confirm; fail-open)
+    has_bull_confirm→ s["confirm_bull"]      (close>open AND close>prev_close)
+    has_bear_confirm→ s["confirm_bear"]      (close<open AND close<prev_close)
+
+    Parity note: live volume_ok also accepts a "volume spike fresh" webhook flag
+    unavailable in historical bars. The BT uses only RVOL (volume_confirmed),
+    which is the stricter, causal-only approximation. This may slightly under-
+    count signals vs live but never introduces look-ahead.
+
+    Same-bar conflict policy (inherited from simulate_strategy): a Long signal
+    on a bar with a simultaneous choch_short is skipped; Short with choch_long
+    likewise. Stop/target conflicts in the walk-forward use the conservative
+    worst-case fill (stop assumed to fill before take-profit on the same bar).
+    """
+    if not s["or_complete"] or s["or_high"] is None or s["or_low"] is None:
+        return None
+    if s["close"] > s["or_high"] and s["volume_confirmed"] and s["confirm_bull"]:
+        return ("Long",
+                f"ORB above {s['or_high']:.2f} — close beyond OR high with volume + bull candle")
+    if s["close"] < s["or_low"] and s["volume_confirmed"] and s["confirm_bear"]:
+        return ("Short",
+                f"ORB below {s['or_low']:.2f} — close beyond OR low with volume + bear candle")
+    return None
+
+
 def detect_liquidity_sweep_reversal(s):
     if s["sweep_bull"] and s["close"] > s["vwap"] - s["atr"]:
         return ("Long", "Bullish liquidity sweep — swept sell-side stops & reclaimed")
@@ -836,11 +880,12 @@ def detect_exhaustion_fade(s):
 
 
 DETECTORS = {
-    "OPENING_DRIVE": detect_opening_drive,
+    "OPENING_DRIVE":            detect_opening_drive,
     "LIQUIDITY_SWEEP_REVERSAL": detect_liquidity_sweep_reversal,
-    "VWAP_TREND_CONTINUATION": detect_vwap_trend_continuation,
+    "VWAP_TREND_CONTINUATION":  detect_vwap_trend_continuation,
     "RANGE_EXPANSION_BREAKOUT": detect_range_expansion_breakout,
-    "EXHAUSTION_FADE": detect_exhaustion_fade,
+    "EXHAUSTION_FADE":          detect_exhaustion_fade,
+    "OPENING_RANGE_BREAKOUT":   detect_opening_range_breakout,
 }
 
 

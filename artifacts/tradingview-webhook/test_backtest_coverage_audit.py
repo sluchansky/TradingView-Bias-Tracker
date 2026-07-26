@@ -35,25 +35,26 @@ def _run(strategies=None, symbol="MGC", mode="SCALP"):
 # ════════════════════════════════════════════════════════════════════════════
 
 def test_1_bt_strategy_defs_count():
-    """Backtest STRATEGY_DEFS has exactly 5 entries."""
-    assert len(bt.STRATEGY_DEFS) == 5, bt.STRATEGY_DEFS.keys()
+    """Backtest STRATEGY_DEFS has exactly 6 entries (5 originals + ORB adapter)."""
+    assert len(bt.STRATEGY_DEFS) == 6, bt.STRATEGY_DEFS.keys()
 
 
 def test_2_bt_strategy_defs_keys():
-    """Backtest STRATEGY_DEFS contains the expected five keys."""
+    """Backtest STRATEGY_DEFS contains the expected six keys."""
     expected = {
         "OPENING_DRIVE",
         "LIQUIDITY_SWEEP_REVERSAL",
         "VWAP_TREND_CONTINUATION",
         "RANGE_EXPANSION_BREAKOUT",
         "EXHAUSTION_FADE",
+        "OPENING_RANGE_BREAKOUT",
     }
     assert set(bt.STRATEGY_DEFS) == expected
 
 
 def test_3_bt_detectors_count():
-    """Backtest DETECTORS has exactly 5 entries — every STRATEGY_DEFS key has one."""
-    assert len(bt.DETECTORS) == 5, bt.DETECTORS.keys()
+    """Backtest DETECTORS has exactly 6 entries — every STRATEGY_DEFS key has one."""
+    assert len(bt.DETECTORS) == 6, bt.DETECTORS.keys()
 
 
 def test_4_bt_detectors_match_strategy_defs():
@@ -62,17 +63,18 @@ def test_4_bt_detectors_match_strategy_defs():
 
 
 def test_5_bt_strategy_order_count():
-    """STRATEGY_ORDER has exactly 4 entries — this is the primary narrowing point."""
-    assert len(bt.STRATEGY_ORDER) == 4, bt.STRATEGY_ORDER
+    """STRATEGY_ORDER has exactly 5 entries (4 originals + ORB adapter)."""
+    assert len(bt.STRATEGY_ORDER) == 5, bt.STRATEGY_ORDER
 
 
 def test_6_bt_strategy_order_contents():
-    """STRATEGY_ORDER contains only the four eligible strategies."""
+    """STRATEGY_ORDER contains the five eligible strategies in the correct order."""
     expected = [
         "OPENING_DRIVE",
         "LIQUIDITY_SWEEP_REVERSAL",
         "VWAP_TREND_CONTINUATION",
         "RANGE_EXPANSION_BREAKOUT",
+        "OPENING_RANGE_BREAKOUT",
     ]
     assert bt.STRATEGY_ORDER == expected
 
@@ -101,10 +103,13 @@ def test_10_exhaustion_fade_has_detector_but_not_in_order():
     assert "EXHAUSTION_FADE" in bt.DISABLED_STRATEGIES
 
 
-def test_11_opening_range_breakout_absent_from_bt():
-    """OPENING_RANGE_BREAKOUT (live-only) has no entry in backtest STRATEGY_DEFS or DETECTORS."""
-    assert "OPENING_RANGE_BREAKOUT" not in bt.STRATEGY_DEFS
-    assert "OPENING_RANGE_BREAKOUT" not in bt.DETECTORS
+def test_11_opening_range_breakout_present_in_bt():
+    """OPENING_RANGE_BREAKOUT historical adapter is registered in STRATEGY_DEFS,
+    DETECTORS, and STRATEGY_ORDER, and is NOT disabled — it is fully eligible."""
+    assert "OPENING_RANGE_BREAKOUT" in bt.STRATEGY_DEFS
+    assert "OPENING_RANGE_BREAKOUT" in bt.DETECTORS
+    assert "OPENING_RANGE_BREAKOUT" in bt.STRATEGY_ORDER
+    assert "OPENING_RANGE_BREAKOUT" not in bt.DISABLED_STRATEGIES
 
 
 def test_12_bt_specs_instruments():
@@ -121,11 +126,11 @@ def test_13_bt_modes():
 # Part 2 — Invocation count: proves exactly four are invoked
 # ════════════════════════════════════════════════════════════════════════════
 
-def test_14_run_backtest_default_returns_exactly_four_strategies():
-    """run_backtest with strategies=None evaluates and returns exactly 4 strategies."""
+def test_14_run_backtest_default_returns_exactly_five_strategies():
+    """run_backtest with strategies=None evaluates and returns exactly 5 strategies."""
     res = _run(strategies=None)
     assert res["ok"], res.get("error")
-    assert len(res["strategies"]) == 4, list(res["strategies"].keys())
+    assert len(res["strategies"]) == 5, list(res["strategies"].keys())
     assert set(res["strategies"]) == set(bt.STRATEGY_ORDER)
 
 
@@ -193,8 +198,8 @@ def test_18_zero_trade_strategy_still_appears_in_result():
     with patch.dict(bt.DETECTORS, silent):
         res = _run(strategies=None)
     assert res["ok"]
-    # All four must still appear with total_trades == 0.
-    assert len(res["strategies"]) == 4
+    # All five must still appear with total_trades == 0.
+    assert len(res["strategies"]) == 5
     for key in bt.STRATEGY_ORDER:
         assert key in res["strategies"], f"{key} missing from result despite being eligible"
         assert res["strategies"][key]["total_trades"] == 0
@@ -228,14 +233,14 @@ def test_21_result_includes_disabled_strategies_in_filters():
     assert "EXHAUSTION_FADE" in fl["disabled_strategies"]
 
 
-def test_22_run_optimization_uses_same_four_strategies():
-    """run_optimization defaults to STRATEGY_ORDER (4), same as run_backtest."""
+def test_22_run_optimization_uses_same_five_strategies():
+    """run_optimization defaults to STRATEGY_ORDER (5), same as run_backtest."""
     candles = _candles(symbol="MGC")
     params = {"symbol": "MGC", "mode": "SCALP"}
     res = bt.run_optimization(candles, params)
     assert res["ok"]
     assert set(res["strategies"]) == set(bt.STRATEGY_ORDER)
-    assert len(res["strategies"]) == 4
+    assert len(res["strategies"]) == 5
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -321,10 +326,10 @@ def test_26_coverage_logic_explicit_reason_for_every_excluded_strategy():
     assert ef["eligible"] is False
     assert ef["reason"] == "disabled_by_request"
 
-    # OPENING_RANGE_BREAKOUT has no backtest definition
+    # OPENING_RANGE_BREAKOUT is now fully registered in the backtest engine
     orb = results["OPENING_RANGE_BREAKOUT"]
-    assert orb["eligible"] is False
-    assert orb["reason"] == "no_backtest_definition"
+    assert orb["eligible"] is True, "OPENING_RANGE_BREAKOUT must be eligible in BT"
+    assert orb["reason"] is None, "Eligible strategies have no exclusion reason"
 
 
 def test_27_coverage_logic_does_not_invoke_run_backtest():

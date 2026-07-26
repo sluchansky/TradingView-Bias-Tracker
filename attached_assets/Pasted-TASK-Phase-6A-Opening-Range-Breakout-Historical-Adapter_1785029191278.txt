@@ -1,0 +1,379 @@
+TASK: Phase 6A — Opening Range Breakout Historical Adapter Pilot
+
+CRITICAL CONTEXT
+
+The Global Backtest Strategy Coverage Audit found:
+
+- Five production live strategies
+- Four currently eligible backtest strategies
+- Opening Range Breakout is the only live production strategy missing from the
+  backtest engine
+- All required historical inputs are available from existing OHLCV bar data
+- No tick sequencing, order-book data, Databento network access, or alert-arrival
+  timing is required
+- EXHAUSTION_FADE remains deliberately disabled
+- The 19 scalp-research strategies are a separate research system and are out
+  of scope
+
+This phase adds only:
+
+OPENING_RANGE_BREAKOUT
+
+to historical replay.
+
+Do not enable EXHAUSTION_FADE.
+Do not add research strategies.
+Do not alter live strategy behavior.
+
+----------------------------------------------------
+PART 1 — VERIFY THE AUDIT CHECKPOINT
+----------------------------------------------------
+
+Before modifying code, run:
+
+git branch --show-current
+git rev-parse HEAD
+git log -1 --oneline
+git status --short
+git diff --check
+
+Confirm that the audit changes are committed:
+
+- GET /backtest/coverage in app.py
+- /backtest/coverage proxy routes
+- test_backtest_coverage_audit.py
+
+Return the actual audit commit hash.
+
+Stop if:
+
+- the audit changes are still uncommitted
+- unrelated files are modified
+- the task attachment is staged
+- HEAD changed unexpectedly
+
+Run the existing baseline:
+
+- test_backtest_coverage_audit.py
+- test_decision_quality.py
+- test_strategy_scan.py
+- test_backtest_stop_parity.py
+- all four golden workflows
+
+Expected:
+
+- Coverage Audit: 27/27
+- Decision Quality: 103/103
+- Strategy Scan: 30/30
+- Stop Parity: 4/4
+- Focused combined: 164/164
+- Golden workflows: 4/4
+
+----------------------------------------------------
+PART 2 — AUDIT THE LIVE ORB IMPLEMENTATION
+----------------------------------------------------
+
+Before writing the adapter, document the exact live implementation of:
+
+OPENING_RANGE_BREAKOUT
+
+Identify:
+
+- scorer function
+- registry entry
+- required state
+- opening-range start and end times
+- timezone
+- long breakout condition
+- short breakout condition
+- VWAP requirements
+- volume requirements
+- ATR requirements
+- confirmation-candle requirements
+- minimum breakout distance
+- entry calculation
+- stop calculation
+- target calculation
+- stated target R
+- invalidation conditions
+- session reset behavior
+- mode restrictions
+- instrument restrictions
+
+Produce a field-by-field mapping:
+
+Live input
+Historical equivalent
+Exact parity
+Deterministic reconstruction
+Unavailable
+
+Stop if any required input is unavailable without look-ahead.
+
+----------------------------------------------------
+PART 3 — DEFINE BAR-CLOSE REPLAY SEMANTICS
+----------------------------------------------------
+
+The backtester must operate only on information available at the current
+historical bar.
+
+At replay index i:
+
+- The detector may read candles[0:i+1]
+- It must not read candles[i+1:] or any precomputed value containing future bars
+- The opening range may use only bars whose timestamps are within the completed
+  range window
+- A breakout cannot trigger before the opening-range window is complete
+- A breakout is recognized at bar close unless the existing backtest engine has
+  an established and tested intrabar convention
+
+Do not fabricate the order in which a bar touched:
+
+- entry
+- stop
+- target
+- opening-range boundary
+
+Use the existing conservative same-bar conflict policy.
+
+Document that policy before implementation.
+
+----------------------------------------------------
+PART 4 — IMPLEMENT THE HISTORICAL ADAPTER
+----------------------------------------------------
+
+Add Opening Range Breakout to backtest_engine.py using the existing architecture.
+
+Required additions may include:
+
+- backtest STRATEGY_DEFS entry
+- detect_opening_range_breakout(snapshot)
+- DETECTORS registration
+- STRATEGY_ORDER registration
+- display label support where needed
+
+Use the same canonical key:
+
+OPENING_RANGE_BREAKOUT
+
+Do not duplicate the live scorer directly if it depends on live mutable state.
+Reconstruct the same observable conditions from the historical snapshot.
+
+The adapter must:
+
+1. Build the opening range from the exact approved ET window.
+2. Reset the range at the correct session boundary.
+3. Refuse signals before the range is complete.
+4. Detect long and short breakouts symmetrically.
+5. Apply the historical equivalents of the live filters.
+6. Use only current and prior bars.
+7. Return the normal detector schema expected by simulate_strategy().
+8. Use existing stop and target simulation mechanics.
+9. Avoid custom execution rules unless required for live parity.
+10. Produce an explicit no-signal result when conditions are incomplete.
+
+Do not change the existing four detectors.
+
+----------------------------------------------------
+PART 5 — REGISTRY AND UI BEHAVIOR
+----------------------------------------------------
+
+After implementation:
+
+- STRATEGY_ORDER should contain five eligible strategies.
+- “All Strategies” should invoke all five.
+- The single-strategy dropdown should include Opening Range Breakout.
+- BT_STRAT_LABELS should include its proper display name.
+- GET /backtest/coverage should report:
+  - in_live: true
+  - in_bt: true
+  - has_detector: true
+  - in_order: true
+  - disabled: false
+  - eligible: true
+  - reason: null
+  - eligible_count: 5
+
+Do not change the endpoint into a runtime invocation endpoint.
+
+It must remain clearly labeled:
+
+source: static_registry
+
+----------------------------------------------------
+PART 6 — TESTS
+----------------------------------------------------
+
+Add focused tests proving:
+
+1. ORB exists in the backtest definition registry.
+2. ORB exists in DETECTORS.
+3. ORB exists in STRATEGY_ORDER.
+4. ORB is not disabled.
+5. Coverage endpoint reports ORB as eligible.
+6. Eligible count changes from four to five.
+7. All Strategies invokes ORB.
+8. Single-strategy ORB mode invokes only ORB.
+9. ORB cannot signal before the opening-range window completes.
+10. Opening-range high and low use only bars within the approved window.
+11. Bars from the previous session do not leak into the new session.
+12. A valid long breakout can signal.
+13. A valid short breakout can signal.
+14. A close still inside the range produces no signal.
+15. A wick outside with a close inside follows the approved live rule.
+16. VWAP misalignment blocks the signal when required by live logic.
+17. Volume failure blocks the signal when required by live logic.
+18. ATR or volatility failure blocks the signal when required.
+19. Long entry, stop, and target geometry match the live specification.
+20. Short entry, stop, and target geometry match the live specification.
+21. The intended R multiple is correct.
+22. ORB uses no future candles.
+23. Altering a future candle cannot change the current detector result.
+24. Same-bar stop/target conflict follows the existing conservative policy.
+25. ORB can produce zero trades and still appear in results.
+26. Existing four strategies remain individually selectable.
+27. Existing four strategy outputs remain byte-identical on pinned fixtures.
+28. EXHAUSTION_FADE remains disabled.
+29. Research strategies remain excluded.
+30. No Databento import or network access is introduced.
+31. Decision Quality behavior remains unchanged.
+32. Live ORB scoring behavior remains unchanged.
+33. Auto-trade eligibility remains unchanged.
+34. Golden workflows remain unchanged.
+35. Coverage endpoint does not execute a backtest.
+
+Fix the earlier audit-test terminology where necessary:
+
+- A detector is called once per eligible replay snapshot, not once per run.
+- “All Strategies invokes every eligible detector” is the correct invariant.
+- Do not claim each detector is called exactly once during a full run.
+
+For metric immutability tests, directly compare:
+
+- total trades
+- wins
+- losses
+- win rate
+- Net R
+- profit factor
+- maximum drawdown
+- ranking
+
+Do not infer metric equality from trade-count equality alone.
+
+----------------------------------------------------
+PART 7 — REPRESENTATIVE REPLAY VALIDATION
+----------------------------------------------------
+
+Run ORB for:
+
+- MES SCALP 5m
+- MES SWING 5m
+- MNQ SCALP 5m
+- MGC SCALP 5m
+- MYM SCALP 5m
+
+For each run report:
+
+- bars loaded
+- sessions represented
+- detector calls
+- candidate signals
+- completed trades
+- wins
+- losses
+- win rate
+- Net R
+- profit factor
+- maximum drawdown
+- skipped signals and reasons
+
+These are validation results, not proof of profitability.
+
+Do not optimize parameters during this phase.
+
+Do not compare or tune ORB against the other strategies.
+
+----------------------------------------------------
+PART 8 — VALIDATION
+----------------------------------------------------
+
+Run:
+
+- new ORB adapter tests
+- updated coverage audit tests
+- Decision Quality tests
+- Strategy Scan tests
+- Stop Parity tests
+- existing backtest suites
+- all four golden workflows
+- full repository test suite, if practical
+
+Report every suite separately.
+
+Only use “full repository regression” if every applicable repository test suite
+was actually run.
+
+For any claimed pre-existing failure:
+
+- reproduce it on the parent commit
+- use the same command and environment
+- provide exact evidence
+
+----------------------------------------------------
+PART 9 — REQUIRED CLOSURE REPORT
+----------------------------------------------------
+
+Return:
+
+1. Branch
+2. Starting HEAD
+3. Audit checkpoint commit hash
+4. Ending HEAD
+5. Working-tree status before and after
+6. Exact files changed
+7. Exact live ORB rules audited
+8. Historical reconstruction mapping
+9. Opening-range session window
+10. Timezone handling
+11. Bar-close signal semantics
+12. Same-bar conflict policy
+13. ORB definition added
+14. Detector added
+15. Registry changes
+16. UI label and dropdown changes
+17. Coverage endpoint result before and after
+18. Look-ahead prevention proof
+19. Representative replay results
+20. Existing four-strategy parity results
+21. Focused test counts
+22. Golden workflow results
+23. Full repository regression result, if run
+24. Confirmation EXHAUSTION_FADE remains disabled
+25. Confirmation research strategies remain excluded
+26. Confirmation live scoring did not change
+27. Confirmation Decision Quality did not change
+28. Confirmation execution did not change
+29. Confirmation Databento ingestion did not change
+30. Any remaining live-versus-historical parity limitation
+
+----------------------------------------------------
+STOP CONDITIONS
+----------------------------------------------------
+
+Stop before committing if:
+
+- the audit checkpoint is not committed
+- ORB requires future-bar information
+- the live rule depends on unavailable intrabar sequencing
+- historical and live session boundaries cannot be matched
+- ORB requires fabricated Databento data
+- existing four-strategy outputs change
+- EXHAUSTION_FADE becomes eligible
+- research strategies enter production registries
+- Golden outputs change
+- live scoring changes
+- execution changes
+- unrelated repository regressions appear
+
+MAKE ONLY THE OPENING RANGE BREAKOUT HISTORICAL ADAPTER PILOT.

@@ -49750,7 +49750,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <div class="bt-grid">
       <div class="bt-f"><label>Sensitivity</label><select id="rn-mode"><option>SCALP</option><option>SWING</option></select></div>
       <div class="bt-f"><label>Session</label><select id="rn-sess"><option value="all" selected>All sessions</option><option value="Asia">Asia (18–02 ET)</option><option value="London">London (02–08 ET)</option><option value="New York">New York (08–16 ET)</option></select></div>
-      <div class="bt-f"><label>Strategy</label><select id="rn-strat"><option value="all" selected>All strategies</option><option value="OPENING_DRIVE">Opening Drive</option><option value="LIQUIDITY_SWEEP_REVERSAL">Liquidity Sweep Reversal</option><option value="VWAP_TREND_CONTINUATION">VWAP Trend Continuation</option><option value="RANGE_EXPANSION_BREAKOUT">Range Expansion Breakout</option></select></div>
+      <div class="bt-f"><label>Strategy</label><select id="rn-strat"><option value="all" selected>All strategies</option><option value="OPENING_DRIVE">Opening Drive</option><option value="LIQUIDITY_SWEEP_REVERSAL">Liquidity Sweep Reversal</option><option value="VWAP_TREND_CONTINUATION">VWAP Trend Continuation</option><option value="RANGE_EXPANSION_BREAKOUT">Range Expansion Breakout</option><option value="OPENING_RANGE_BREAKOUT">Opening Range Breakout</option></select></div>
       <div class="bt-f"><label>Exit management</label><select id="rn-mgmt"><option value="target_1_5r" selected>1.5R target (let winners run)</option><option value="target_2r">2.0R target</option><option value="target_1r">1.0R target</option><option value="partial_1r_runner_2r">Partial @1R, runner @2R</option><option value="be_after_1r">BE after 1R (2R target)</option><option value="partial_tp3">Partial @TP1 → TP3 (legacy, conservative)</option></select></div>
       <div class="bt-f"><label>&nbsp;</label><div class="bt-mini" style="padding:8px 0">Date range is optional — leave blank for the full dataset.</div></div>
       <div class="bt-f"><label>Start date (ET)</label><input id="rn-start" type="date"></div>
@@ -58065,7 +58065,7 @@ let btResult = null, btRunId = null, btPollTimer = null, btSelDataset = null;
 const BT_STRAT_LABELS = {
   OPENING_DRIVE:'Opening Drive', LIQUIDITY_SWEEP_REVERSAL:'Liquidity Sweep Reversal',
   VWAP_TREND_CONTINUATION:'VWAP Trend Continuation', RANGE_EXPANSION_BREAKOUT:'Range Expansion Breakout',
-  EXHAUSTION_FADE:'Exhaustion Fade'
+  EXHAUSTION_FADE:'Exhaustion Fade', OPENING_RANGE_BREAKOUT:'Opening Range Breakout'
 };
 function btEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function btNum(v,d){ d=(d==null?2:d); return (v===null||v===undefined||v==='')?'—':(typeof v==='number'?v.toFixed(d):v); }
