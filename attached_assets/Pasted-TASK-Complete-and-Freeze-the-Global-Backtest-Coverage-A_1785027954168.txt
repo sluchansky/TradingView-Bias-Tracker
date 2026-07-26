@@ -1,0 +1,166 @@
+TASK: Complete and Freeze the Global Backtest Coverage Audit
+
+DO NOT implement another strategy.
+DO NOT modify backtest behavior.
+DO NOT modify live strategy behavior.
+DO NOT begin the Opening Range Breakout adapter.
+
+The previous response was truncated during Required Report item 10.
+
+Complete the audit report using the evidence already gathered.
+
+----------------------------------------------------
+PART 1 — FINISH THE REQUIRED REPORT
+----------------------------------------------------
+
+Continue from item 10 and return all remaining items:
+
+10. File and line of every global narrowing point
+11. Complete live-versus-backtest strategy table
+12. Representative invocation counts by asset and mode
+13. Strategies producing trades
+14. Strategies invoked but producing zero trades
+15. Strategies never invoked
+16. Strategies hidden by the API or dashboard
+17. Every hard-coded subset
+18. Every display-only filter
+19. Category A strategies
+20. Category B strategies
+21. Category C strategies
+22. Historical inputs required for every excluded strategy
+23. Focused test results
+24. Golden-suite results
+25. Full regression results
+26. Confirmation that live trading behavior did not change
+27. Confirmation that Decision Quality did not change
+28. Confirmation that Databento ingestion did not change
+29. Safe implementation plan for adding Category A strategies
+
+Also explicitly answer:
+
+- Is Opening Range Breakout Category A, B, or C?
+- Can Opening Range Breakout be replayed honestly from the existing historical
+  bar dataset?
+- Does its live implementation use intrabar ordering or alert-arrival timing
+  unavailable to the backtester?
+- Is EXHAUSTION_FADE disabled because of poor performance, incomplete logic,
+  missing data, or a deliberate product decision?
+- Are the 19 scalp-research catalog entries executable strategies, research
+  descriptions, or parameter templates?
+- Should those 19 entries be excluded from the production strategy count?
+
+----------------------------------------------------
+PART 2 — CORRECT THE TEST COUNT TERMINOLOGY
+----------------------------------------------------
+
+Report the test runs separately:
+
+- Backtest coverage audit tests: 25/25
+- Decision Quality tests: 103/103
+- Strategy Scan tests: 30/30
+- Combined focused tests: 158/158, if that is the exact combined count
+- Any additional tests that produce the claimed 162/162 total
+- Golden workflows: 4/4
+- Full repository regression: only call it this if every applicable repository
+  test suite was actually run
+
+Explain exactly where 137/137, 158/158, and 162/162 came from.
+
+Do not use “full regression” for a partial selection of test files.
+
+----------------------------------------------------
+PART 3 — VERIFY THE DIAGNOSTICS ENDPOINT
+----------------------------------------------------
+
+For GET /backtest/coverage, return:
+
+- Exact JSON schema
+- Whether it executes a backtest
+- Whether it reads static registries only
+- Whether it includes invocation data from a requested run
+- Whether it reports display count accurately
+- Whether it can distinguish:
+  - defined
+  - registered
+  - eligible
+  - invoked
+  - zero trades
+  - returned
+  - displayed
+  - disabled
+  - unsupported
+- Authentication behavior through the Express proxy
+- Direct Flask-port exposure behavior
+- Proof it does not mutate any backtest or live state
+
+If the endpoint only reports static registry data, state that clearly and do not
+claim it proves runtime invocation.
+
+----------------------------------------------------
+PART 4 — REVIEW THE NEW TESTS
+----------------------------------------------------
+
+Map each of the 25 requested audit requirements to its exact test name.
+
+Identify any requested test that is not actually covered.
+
+Particularly verify that the tests prove:
+
+- invocation at the real strategy call site
+- a zero-trade strategy still counts as invoked
+- API return count is separate from display count
+- existing four-strategy outputs are byte-identical
+- no look-ahead data was introduced
+- no Databento network calls occur
+- coverage diagnostics do not execute another backtest
+
+Do not count source-text grep assertions as runtime proof unless the requirement
+is specifically about static source structure.
+
+----------------------------------------------------
+PART 5 — COMMIT THE AUDIT
+----------------------------------------------------
+
+Only after the complete report is assembled and all claims are verified:
+
+1. Run:
+
+git diff --check
+git status --short
+
+2. Run the complete focused validation again.
+
+3. Commit only:
+
+- artifacts/tradingview-webhook/app.py
+- artifacts/api-server/src/routes/flask-proxy.ts
+- artifacts/tradingview-webhook/test_backtest_coverage_audit.py
+
+Do not commit unrelated untracked task attachments unless they are intentionally
+part of the repository documentation policy.
+
+Suggested commit message:
+
+Audit global backtest strategy coverage
+
+4. Return:
+
+- Commit hash
+- Exact files committed
+- Final git status
+- Final test counts
+
+----------------------------------------------------
+PART 6 — STOP
+----------------------------------------------------
+
+After committing the audit, stop.
+
+Do not add Opening Range Breakout.
+Do not enable EXHAUSTION_FADE.
+Do not alter STRATEGY_ORDER.
+Do not alter historical results.
+Do not alter dashboard strategy choices.
+
+The next implementation phase will be selected only after the Category A/B/C
+classification is complete.
