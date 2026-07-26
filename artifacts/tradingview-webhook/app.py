@@ -24370,19 +24370,13 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             result["strategy_eligibility"] = _strategy_eligibility_neutral(
                 "Strategy Eligibility unavailable (%s)." % _elig_exc)
 
-    # ── Right Brain Trade Management v1 (Phase 6B.2) — SHADOW MODE ───────────
-    # Flag OFF (default) → "right_brain" key absent → result and golden workflows
-    # byte-identical.  Flag ON → result["right_brain"]["trade_management"] added;
-    # it is NEVER read by any gate / sizing / broker / learning / dedupe path.
-    if RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED:
-        try:
-            _rbtm = compute_right_brain_trade_management(result)
-            result.setdefault("right_brain", {})["trade_management"] = _rbtm
-        except Exception as _rbtm_exc:
-            _rbtm_inst = instrument_of(result.get("active_ticker") or "MGC")
-            result.setdefault("right_brain", {})["trade_management"] = _rb_tm_neutral(
-                active_trade=bool(active_trade_for(_rbtm_inst)),
-                reason="Right Brain trade management unavailable (%s)." % _rbtm_exc)
+    # ── Right Brain sub-system (Phase 6B.2+) ─────────────────────────────────
+    # Single seam for all Right Brain modules.  Add future modules to
+    # _right_brain_orchestrate() — never add another if-block here.
+    # Returns {} when all flags are OFF → key absent → goldens byte-identical.
+    _rb_out = _right_brain_orchestrate(result)
+    if _rb_out:
+        result["right_brain"] = _rb_out
 
     return result
 
@@ -26765,6 +26759,67 @@ def compute_right_brain_trade_management(result):
         "recommendation":    recommendation,
         "dimensions":        dimensions,
     }
+
+
+def _right_brain_orchestrate(result: dict) -> dict:
+    """Right Brain sub-system orchestrator — the ONLY hook site in full_analysis.
+
+    Assembles the complete ``result["right_brain"]`` dict from every enabled
+    Right Brain module.  Future modules register here, never directly in
+    full_analysis.
+
+    Contract
+    --------
+    · Returns {} when all module flags are OFF → key stays absent from result
+      → every golden workflow remains byte-identical.
+    · Each module's output is fail-open: an exception produces a neutral block
+      so the other modules are unaffected.
+    · Never mutates ``result`` — that is left to the caller.
+    · affects_execution is always False for every module produced here.
+
+    Adding a new module
+    -------------------
+    1. Add a per-module flag:  RIGHT_BRAIN_<MODULE>_ENABLED (default_on=False)
+    2. Add a per-module function block following the _rb_tm_* naming pattern.
+    3. Add one slot below with the commented template.
+    4. Add the /status whitelist key and JS renderer for display.
+    """
+    rb: dict = {}
+
+    # ── Trade Management v1 (Phase 6B.2) ─────────────────────────────────────
+    if RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED:
+        try:
+            rb["trade_management"] = compute_right_brain_trade_management(result)
+        except Exception as _exc:
+            _inst = instrument_of(result.get("active_ticker") or "MGC")
+            rb["trade_management"] = _rb_tm_neutral(
+                active_trade=bool(active_trade_for(_inst)),
+                reason="Right Brain trade management unavailable (%s)." % _exc)
+
+    # ── Future modules — slot in here, never in full_analysis ────────────────
+    # if RIGHT_BRAIN_DYNAMIC_STOP_ENABLED:
+    #     try:
+    #         rb["dynamic_stop"] = compute_right_brain_dynamic_stop(result)
+    #     except Exception as _exc:
+    #         rb["dynamic_stop"] = {"available": False, "reason": str(_exc),
+    #                               "affects_execution": False}
+    #
+    # if RIGHT_BRAIN_PARTIAL_PROFIT_ENABLED:
+    #     rb["partial_profit"] = compute_right_brain_partial_profit(result)
+    #
+    # if RIGHT_BRAIN_SCALING_ENABLED:
+    #     rb["scaling"] = compute_right_brain_scaling(result)
+    #
+    # if RIGHT_BRAIN_SIZING_ADVISOR_ENABLED:
+    #     rb["sizing_advisor"] = compute_right_brain_sizing_advisor(result)
+    #
+    # if RIGHT_BRAIN_JOURNAL_ENABLED:
+    #     rb["journal"] = compute_right_brain_journal(result)
+    #
+    # if RIGHT_BRAIN_PERFORMANCE_COACH_ENABLED:
+    #     rb["performance_coach"] = compute_right_brain_performance_coach(result)
+
+    return rb
 
 
 # ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
