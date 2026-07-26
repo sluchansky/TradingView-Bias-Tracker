@@ -1,0 +1,181 @@
+STOP. DO NOT START PHASE 6B.
+
+Your closure report contains a contradiction.
+
+You reported this file inside commit 3d02d10:
+
+<task-context attachment>.txt | 486 lines
+
+But you also stated:
+
+Task attachments committed: No.
+
+Based on git show --stat, a task attachment appears to have been committed.
+
+TASK: Remove the committed task attachment and finish the Phase 6A.1 closure.
+
+----------------------------------------------------
+PART 1 — IDENTIFY THE COMMITTED ATTACHMENT
+----------------------------------------------------
+
+Run:
+
+git show --name-status --format=fuller 3d02d10c320e947837d92a5e09605d95f062f60f
+git ls-tree -r --name-only 3d02d10c320e947837d92a5e09605d95f062f60f
+git status --short
+
+Return the exact full path of every:
+
+- attached_assets file
+- pasted task file
+- task-context file
+- instruction attachment
+
+contained in the commit.
+
+Do not summarize the filename as:
+
+<task-context attachment>.txt
+
+Return the exact repository path.
+
+----------------------------------------------------
+PART 2 — REMOVE IT FROM VERSION CONTROL
+----------------------------------------------------
+
+Remove only the committed task/instruction attachment from Git tracking.
+
+Do not delete or modify application source files.
+
+Preferred safe approach:
+
+git rm --cached "<exact-path>"
+
+If the file is not needed locally, it may also be removed from the working tree.
+
+Do not use broad commands.
+
+Do not remove all attached_assets files.
+
+Do not amend or rewrite published history unless explicitly necessary.
+
+Create a small follow-up cleanup commit.
+
+Suggested commit message:
+
+Remove committed task attachment
+
+----------------------------------------------------
+PART 3 — VERIFY THE CLEANUP
+----------------------------------------------------
+
+Run:
+
+git rev-parse HEAD
+git log -3 --oneline
+git status --short
+git diff --check
+git ls-tree -r --name-only HEAD | grep -Ei \
+'attached_assets|pasted-task|task-context|instruction' || true
+
+Return:
+
+- original Phase 6A.1 commit
+- cleanup commit
+- exact removed path
+- remaining untracked attachments
+- confirmation no task attachment is tracked at HEAD
+
+----------------------------------------------------
+PART 4 — VERIFY APPLICATION FILES REMAIN PRESENT
+----------------------------------------------------
+
+Confirm these Phase 6A.1 files remain committed and unchanged by the cleanup:
+
+- artifacts/tradingview-webhook/app.py
+- artifacts/tradingview-webhook/backtest_engine.py
+- artifacts/tradingview-webhook/test_backtest_coverage_audit.py
+- artifacts/tradingview-webhook/test_backtest_import.py
+- artifacts/tradingview-webhook/test_backtest_parity_repair.py
+
+Run:
+
+git diff 3d02d10c320e947837d92a5e09605d95f062f60f..HEAD -- \
+  artifacts/tradingview-webhook/app.py \
+  artifacts/tradingview-webhook/backtest_engine.py \
+  artifacts/tradingview-webhook/test_backtest_coverage_audit.py \
+  artifacts/tradingview-webhook/test_backtest_import.py \
+  artifacts/tradingview-webhook/test_backtest_parity_repair.py
+
+Expected result:
+
+No application or test-code differences.
+
+----------------------------------------------------
+PART 5 — RUN A SMALL POST-CLEANUP VALIDATION
+----------------------------------------------------
+
+Because this cleanup should contain no code changes, rerun:
+
+- Phase 6A.1 parity tests
+- dataset import tests
+- coverage audit tests
+- ORB adapter tests
+- all four golden workflows
+
+Report each suite separately.
+
+----------------------------------------------------
+PART 6 — COMPLETE THE TRUNCATED CLOSURE REPORT
+----------------------------------------------------
+
+Your previous response stopped during Part 2.
+
+Return the complete remaining report, including:
+
+1. Verified live ORB path
+2. Historical ORB path
+3. Coverage response
+4. Historical dataset infrastructure
+5. Real historical datasets currently imported
+6. Exact test counts
+7. Runtime-proof test names
+8. Parent-commit failure verification
+9. Protected-boundary evidence
+10. Remaining limitations
+11. Final readiness decision
+
+The readiness decision must be one of:
+
+PHASE_6B_READY
+
+PHASE_6B_INFRASTRUCTURE_READY_DATA_PENDING
+
+PHASE_6B_BLOCKED
+
+Use:
+
+PHASE_6B_INFRASTRUCTURE_READY_DATA_PENDING
+
+if the import and analytics infrastructure is ready but no real MNQ, MES, MGC,
+or MYM historical dataset has been imported.
+
+----------------------------------------------------
+PART 7 — FINAL STATE
+----------------------------------------------------
+
+Return:
+
+- branch
+- Phase 6A commit
+- Phase 6A.1 implementation commit
+- attachment-cleanup commit
+- exact tracked Phase 6A.1 files
+- exact untracked attachments
+- final git status
+- final test totals
+- final readiness decision
+
+After returning this report, stop.
+
+DO NOT START PHASE 6B.
