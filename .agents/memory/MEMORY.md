@@ -1,5 +1,6 @@
 # Memory Index
 
+- [Right Brain Trade Management v1](rbtm-shadow-mode.md) — Phase 6B.2 shadow advisory; flag default-OFF; RBTM_VALID_RECOMMENDATIONS frozenset; near-stop CRITICAL not HIGH (TM024 uses ELEVATED+); 42 tests.
 - [Phase 6B.1 Baseline Engine](baseline-engine.md) — bt_baseline.py; _jdump must handle frozenset; baseline_trades needed initial_risk_r ALTER; detail returns matrix_results key (not per_combo); first baseline BL-20260726-043053-0cc8364.
 - [Phase 6B historical OHLCV datasets](phase6b-datasets.md) — 4 instruments imported; MYM needs chunked download; run_backtest takes (candles, params_dict) not kwargs.
 - [Decision Quality analytics (Phase 5F)](decision-quality-analytics.md) — DB-backed snapshot analytics; dedup pattern; component win-rate computation; outcome hook location.

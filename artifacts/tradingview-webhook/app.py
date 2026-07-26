@@ -664,6 +664,15 @@ _DPV2_CAN_ROUTE_ORDERS              = _env_flag_on("DECISION_PIPELINE_V2_CAN_ROU
 # feeds the gate, scoring, sizing, detectors, learning, or any money-path
 # variable. Default ON — it is pure advisory output with zero risk.
 STRATEGY_ELIGIBILITY_ENABLED = _env_flag_on("STRATEGY_ELIGIBILITY_ENABLED", default_on=True)
+# ── Right Brain Trade Management v1 (Phase 6B.2) ────────────────────────────
+# SHADOW MODE — display-only advisory monitoring for the active trade.  NEVER
+# modifies verdict, edge_score, bias, direction, trade_plan, entry, stop, target,
+# contracts, active trade state, broker orders, TradersPost, learning, strategy
+# weights, or Databento state.  Default OFF — enable only after parity proof.
+# Flag OFF → "right_brain" key absent from full_analysis result → all golden
+# workflows byte-identical.
+RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED = _env_flag_on(
+    "RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED", default_on=False)
 # Only sweeps newer than this (minutes) count — a stale sweep alert must decay to
 # "NO SWEEP" rather than reading as CONFIRMED forever. DISPLAY-ONLY tuning knob.
 LIQ_SWEEP_RECENCY_MIN = _env_float("LIQ_SWEEP_RECENCY_MIN", 20.0)
@@ -24361,6 +24370,20 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             result["strategy_eligibility"] = _strategy_eligibility_neutral(
                 "Strategy Eligibility unavailable (%s)." % _elig_exc)
 
+    # ── Right Brain Trade Management v1 (Phase 6B.2) — SHADOW MODE ───────────
+    # Flag OFF (default) → "right_brain" key absent → result and golden workflows
+    # byte-identical.  Flag ON → result["right_brain"]["trade_management"] added;
+    # it is NEVER read by any gate / sizing / broker / learning / dedupe path.
+    if RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED:
+        try:
+            _rbtm = compute_right_brain_trade_management(result)
+            result.setdefault("right_brain", {})["trade_management"] = _rbtm
+        except Exception as _rbtm_exc:
+            _rbtm_inst = instrument_of(result.get("active_ticker") or "MGC")
+            result.setdefault("right_brain", {})["trade_management"] = _rb_tm_neutral(
+                active_trade=bool(active_trade_for(_rbtm_inst)),
+                reason="Right Brain trade management unavailable (%s)." % _rbtm_exc)
+
     return result
 
 
@@ -25694,6 +25717,1054 @@ def _right_brain_loop() -> None:
         logger.debug("Right brain loop outer: %s", exc)
     finally:
         threading.Timer(60, _right_brain_loop).start()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B.2 — Right Brain Trade Management v1 (Shadow Mode)
+# ---------------------------------------------------------------------------
+# Monitors an active trade from within the Right Brain.  PURE DISPLAY-ONLY
+# diagnostic output — it NEVER modifies:
+#   · verdict, edge_score, bias, direction, confidence, setup scoring
+#   · trade_plan, entry, stop, target, contracts, sizing
+#   · active trade state (ACTIVE_TRADES_BY_INST), broker orders, TradersPost
+#   · duplicate guard, prop guard, daily-loss guard, kill-switch
+#   · learning database, strategy weights, Databento feed state
+# All sub-components are fail-open: an exception in any one returns a neutral
+# "unavailable" value and the rest of the pipeline continues.
+# compute_right_brain_trade_management() itself never raises — it returns
+# _rb_tm_neutral() on any top-level error.
+# ---------------------------------------------------------------------------
+
+_RBTM_HEALTH_LABELS = [
+    (85, "EXCELLENT"),
+    (70, "STRONG"),
+    (55, "HEALTHY"),
+    (40, "NEUTRAL"),
+    (25, "WEAK"),
+    (10, "DANGER"),
+    (0,  "CRITICAL"),
+]
+
+_RBTM_CONF_LABELS = [
+    (85, "HIGH"),
+    (60, "MEDIUM"),
+    (35, "LOW"),
+    (0,  "INSUFFICIENT_DATA"),
+]
+
+# Exhaustive enum of all recommendation actions.  No other string may appear
+# in result["right_brain"]["trade_management"]["recommendation"]["action"].
+RBTM_VALID_RECOMMENDATIONS = frozenset({
+    "NO_ACTIVE_TRADE",
+    "HOLD",
+    "HOLD_STRONG",
+    "LET_RUN",
+    "WATCH_CLOSELY",
+    "REDUCE_RISK",
+    "MOVE_STOP_SOON",
+    "CONSIDER_BREAK_EVEN",
+    "TAKE_PARTIAL",
+    "PROTECT_PROFIT",
+    "EXIT_IF_CONFIRMATION_FAILS",
+    "THESIS_WEAKENING",
+    "THESIS_BROKEN",
+    "REVIEW_MANUALLY",
+    "INSUFFICIENT_DATA",
+})
+
+
+def _rb_tm_neutral(active_trade=False,
+                   reason="Right Brain trade management unavailable."):
+    """Fail-open neutral block (Part 15).  Returned whenever the engine cannot
+    produce a real assessment.  affects_execution is always False."""
+    return {
+        "available":         False,
+        "active_trade":      active_trade,
+        "shadow_mode":       True,
+        "affects_execution": False,
+        "recommendation": {
+            "action":               "INSUFFICIENT_DATA",
+            "priority":             "LOW",
+            "reasons":              [reason],
+            "confirmation_needed":  [],
+            "what_would_improve":   [],
+            "what_would_worsen":    [],
+            "invalidation_watch":   [],
+        },
+        "reason": reason,
+    }
+
+
+def _rb_tm_label(score, table):
+    """Map a 0-100 integer score to a label using a descending threshold table.
+    The table is a list of (threshold, label) pairs ordered highest-first."""
+    for threshold, label in sorted(table, key=lambda x: -x[0]):
+        if score >= threshold:
+            return label
+    return table[-1][1]
+
+
+def _rb_tm_build_snapshot(trade, result, inst):
+    """Build the active trade snapshot that feeds all downstream evaluators.
+    Reads from the trade dict (entry-time fields) and the current result dict
+    (live market state).  Returns a plain dict — never invents values; missing
+    fields are None or "unavailable".  Does not mutate trade or result."""
+    if trade is None:
+        return {}
+
+    direction  = trade.get("direction", "Long")
+    is_long    = direction == "Long"
+    entry      = trade.get("entry_price")
+    stop_val   = trade.get("stop_loss")
+    target1    = trade.get("target1")
+    target2    = trade.get("target2")
+    contracts  = trade.get("contracts")
+    strategy   = (trade.get("strategy")
+                  or (result.get("strategy_engine") or {}).get("active_strategy"))
+    mode       = trade.get("mode") or TRADING_MODE
+    opened_at  = trade.get("opened_at")
+
+    # Current price — prefer the live result, fall back to price helper
+    price = result.get("display_price")
+    if price is None:
+        try:
+            price, _ = display_price_for(inst)
+        except Exception:
+            price = None
+
+    # Time in trade (seconds)
+    time_in_secs = None
+    if opened_at:
+        try:
+            ts = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+            time_in_secs = int((now_utc() - ts).total_seconds())
+        except Exception:
+            pass
+
+    # P&L and R computations
+    current_r      = None
+    unrealized_pnl = None
+    unrealized_pts = None
+    mfe_r          = trade.get("max_r")   # observed in-memory by advisory loop
+    mae_r          = trade.get("min_r")
+
+    if entry is not None and stop_val is not None and price is not None:
+        risk = abs(entry - stop_val)
+        if risk > 0:
+            try:
+                pnl_t = {"direction": direction, "entry_price": entry,
+                          "contracts": contracts or 1, "symbol": inst}
+                dollar_pnl, pts_pnl = compute_pnl(pnl_t, price)
+                unrealized_pnl = round(dollar_pnl, 2)
+                unrealized_pts = round(pts_pnl, 2)
+            except Exception:
+                pass
+            fav = (price - entry) if is_long else (entry - price)
+            current_r = round(fav / risk, 2)
+            if mfe_r is None:
+                mfe_r = max(current_r, 0.0)
+            if mae_r is None:
+                mae_r = min(current_r, 0.0)
+
+    # Distance to levels (read-only; uses existing helper)
+    dist_stop = None
+    dist_t1   = None
+    if (entry is not None and stop_val is not None
+            and price is not None and target1 is not None):
+        try:
+            dist_t = {"direction": direction,
+                      "target1":   target1,
+                      "target2":   target2 if target2 is not None else target1,
+                      "stop_loss": stop_val}
+            to_t1, _, to_stop = compute_distances(dist_t, price)
+            dist_stop = round(to_stop, 2)
+            dist_t1   = round(to_t1,   2)
+        except Exception:
+            pass
+
+    # Live contextual state from result (all defensive)
+    vol         = result.get("volatility") or {}
+    alert_diag  = result.get("alert_diagnostics") or {}
+    sess_info   = result.get("session") or {}
+    vwap_value  = result.get("vwap_value")
+    vwap_status = result.get("vwap_status")
+    str_class   = str(result.get("structure_class") or "").lower()
+
+    # VWAP relationship — what matters is whether price is ON the favorable side
+    vwap_rel = "unavailable"
+    if vwap_value is not None and price is not None:
+        vwap_rel = (("above_vwap" if price >= vwap_value else "below_vwap")
+                    if is_long
+                    else ("below_vwap" if price <= vwap_value else "above_vwap"))
+
+    # Structure state (simplified from structure_class string)
+    struct_state = "unavailable"
+    if str_class:
+        fav_bull = is_long and "bullish" in str_class
+        fav_bear = (not is_long) and "bearish" in str_class
+        if "trend" in str_class:
+            struct_state = "favorable" if (fav_bull or fav_bear) else "broken"
+        elif "attempt" in str_class:
+            struct_state = "intact" if (fav_bull or fav_bear) else "threatened"
+        else:
+            struct_state = "neutral"
+
+    # Opening range state (fail-open)
+    or_state = "unavailable"
+    try:
+        or_info  = _intraday_or(inst)
+        or_state = "complete" if or_info.get("complete") else "forming"
+    except Exception:
+        pass
+
+    # Volume state from RVOL (approximate)
+    rvol      = alert_diag.get("rvol")
+    vol_state = "unavailable"
+    if rvol is not None:
+        try:
+            r = float(rvol)
+            vol_state = ("expanding" if r >= 2.0 else
+                         "normal"    if r >= 1.0 else
+                         "contracting" if r >= 0.5 else "exhaustion")
+        except Exception:
+            pass
+
+    # CVD / delta state (approximate from alert_diagnostics)
+    cvd_state  = "unavailable"
+    cvd_signal = alert_diag.get("cvd_signal")
+    dominant   = alert_diag.get("dominant_direction")
+    if cvd_signal and dominant:
+        cvd_state = ("confirming" if cvd_signal == dominant
+                     else "diverging")
+
+    return {
+        "instrument":            inst,
+        "strategy":              strategy or "Unavailable",
+        "mode":                  mode,
+        "direction":             direction,
+        "entry_price":           entry,
+        "current_price":         price,
+        "stop":                  stop_val,
+        "target1":               target1,
+        "target2":               target2,
+        "contracts":             contracts,
+        "opened_at":             opened_at,
+        "time_in_trade_seconds": time_in_secs,
+        "unrealized_pnl":        unrealized_pnl,
+        "unrealized_pts":        unrealized_pts,
+        "current_r":             current_r,
+        "mfe_r":                 round(mfe_r, 2) if mfe_r is not None else None,
+        "mae_r":                 round(mae_r, 2) if mae_r is not None else None,
+        "dist_to_stop":          dist_stop,
+        "dist_to_target":        dist_t1,
+        "session":               sess_info.get("window"),
+        "vol_regime":            vol.get("regime"),
+        "trend_state":           struct_state,
+        "vwap_relationship":     vwap_rel,
+        "or_state":              or_state,
+        "momentum_state":        "unavailable",  # no dedicated indicator yet
+        "structure_state":       struct_state,
+        "volume_state":          vol_state,
+        "delta_cvd_state":       cvd_state,
+        "volatility_state":      vol.get("regime"),
+        "original_thesis":       (trade.get("original_thesis")
+                                  or "Original thesis snapshot unavailable."),
+    }
+
+
+def _rb_tm_eval_dimensions(trade, result, snapshot):
+    """Evaluate each trade management dimension from the snapshot.
+    Each dimension independently defaults to "unavailable" if its inputs are
+    missing.  stop_breached and near_stop are boolean helpers for upstream callers.
+    Never mutates trade, result, or snapshot."""
+    direction = snapshot.get("direction", "Long")
+    is_long   = direction == "Long"
+    current_r = snapshot.get("current_r")
+    vwap_rel  = snapshot.get("vwap_relationship", "unavailable")
+    struct    = snapshot.get("structure_state", "unavailable")
+    vol_state = snapshot.get("volume_state", "unavailable")
+    cvd_state = snapshot.get("delta_cvd_state", "unavailable")
+    vol_regime= snapshot.get("vol_regime") or ""
+    dist_stop = snapshot.get("dist_to_stop")
+    dist_t1   = snapshot.get("dist_to_target")
+    entry     = snapshot.get("entry_price")
+    stop_val  = snapshot.get("stop")
+    price     = snapshot.get("current_price")
+    mode      = snapshot.get("mode", "SCALP")
+
+    # Stop proximity booleans
+    stop_breached = False
+    near_stop     = False
+    if entry is not None and stop_val is not None and price is not None:
+        risk = abs(entry - stop_val)
+        if risk > 0:
+            stop_breached = (price <= stop_val) if is_long else (price >= stop_val)
+            near_stop = (not stop_breached
+                         and dist_stop is not None
+                         and dist_stop <= 0.25 * risk)
+
+    # Momentum — approximated from structure + R trajectory
+    momentum = "unavailable"
+    if struct in ("favorable", "intact") and current_r is not None and current_r > 0:
+        momentum = "increasing"
+    elif struct == "threatened" or (current_r is not None and current_r < -0.3):
+        momentum = "weakening"
+    elif struct == "broken" or stop_breached:
+        momentum = "reversing"
+    elif current_r is not None:
+        momentum = "stable"
+
+    # Trend (from structure)
+    trend = "unavailable"
+    if struct == "favorable":
+        trend = "strengthening"
+    elif struct == "intact":
+        trend = "intact"
+    elif struct == "neutral":
+        trend = "intact"
+    elif struct == "threatened":
+        trend = "weakening"
+    elif struct == "broken":
+        trend = "broken"
+
+    # VWAP dimension
+    vwap = "unavailable"
+    if vwap_rel == "above_vwap" and is_long:
+        vwap = "holding_in_direction"
+    elif vwap_rel == "below_vwap" and not is_long:
+        vwap = "holding_in_direction"
+    elif vwap_rel == "below_vwap" and is_long:
+        vwap = "failing"
+    elif vwap_rel == "above_vwap" and not is_long:
+        vwap = "failing"
+    elif vwap_rel not in ("unavailable",):
+        vwap = "neutral"
+
+    # Volatility effect
+    volatility = "unavailable"
+    if vol_regime:
+        if "trending" in vol_regime.lower():
+            volatility = "expanding_favorably"
+        elif "volatile" in vol_regime.lower():
+            volatility = "expanding_adversely"
+        elif "balanced" in vol_regime.lower() or "ranging" in vol_regime.lower():
+            volatility = "stable"
+
+    # Trade progress (mode-aware)
+    progress = "unavailable"
+    if current_r is not None:
+        if stop_breached:
+            progress = "near_stop"
+        elif near_stop:
+            progress = "near_stop"
+        elif dist_t1 is not None and entry is not None and stop_val is not None:
+            risk = abs(entry - stop_val)
+            if risk > 0 and dist_t1 <= 0.15 * risk:
+                progress = "near_target"
+            elif current_r >= 1.0:
+                progress = "progressing_strongly"
+            elif current_r >= 0.3:
+                progress = "progressing_normally"
+            elif current_r >= 0.0:
+                progress = "not_progressing"
+            else:
+                progress = "stalled"
+        elif current_r >= 1.0:
+            progress = "progressing_strongly"
+        elif current_r >= 0.3:
+            progress = "progressing_normally"
+        elif current_r >= 0.0:
+            progress = "not_progressing"
+        else:
+            progress = "stalled"
+
+    return {
+        "momentum":        momentum,
+        "trend":           trend,
+        "vwap":            vwap,
+        "structure":       struct,
+        "volume":          vol_state,
+        "delta_cvd":       cvd_state,
+        "volatility":      volatility,
+        "trade_progress":  progress,
+        "stop_breached":   stop_breached,
+        "near_stop":       near_stop,
+    }
+
+
+def _rb_tm_compute_health(snapshot, dimensions):
+    """Compute trade health score (0-100).
+
+    Base: 50 (NEUTRAL).  Each dimension contributes independently.
+    Missing inputs contribute 0 — never penalise for unknown data.
+    Final score is clamped to [0, 100].
+
+    Weights:
+      Current R progress  : −20 … +15
+      Near stop (penalty) : −15 (additional, boolean)
+      Trend               : −15 … +10
+      VWAP                : −10 … +8
+      Structure           : −15 … +10
+      Volume              : −5  … +5
+      Delta / CVD         : −12 … +8
+      Volatility          : −8  … +5
+      Progress            : −10 … +8 (mode-aware)
+    """
+    base  = 50
+    delta = 0
+    reasons     = []
+    warnings    = []
+    supporting  = []
+    conflicting = []
+
+    current_r = snapshot.get("current_r")
+    direction = snapshot.get("direction", "Long")
+    mode      = snapshot.get("mode", "SCALP")
+
+    # --- Current R ---
+    if current_r is not None:
+        if current_r >= 2.0:
+            delta += 15
+            supporting.append(f"Trade at +{current_r:.1f}R — excellent progress")
+        elif current_r >= 1.0:
+            delta += 10
+            supporting.append(f"Trade at +{current_r:.1f}R — good progress")
+        elif current_r >= 0.3:
+            delta += 5
+            supporting.append(f"Trade at +{current_r:.1f}R — progressing")
+        elif current_r >= 0.0:
+            reasons.append(f"Trade near breakeven ({current_r:.2f}R)")
+        elif current_r >= -0.5:
+            delta -= 10
+            warnings.append(f"Trade at {current_r:.2f}R — in drawdown")
+        else:
+            delta -= 20
+            conflicting.append(f"Trade at {current_r:.2f}R — deep drawdown")
+
+    # --- Stop proximity ---
+    if dimensions.get("stop_breached"):
+        delta -= 20
+        conflicting.append("Stop level breached")
+    elif dimensions.get("near_stop"):
+        delta -= 15
+        warnings.append("Price within 25% of stop distance")
+
+    # --- Trend ---
+    tr = dimensions.get("trend", "unavailable")
+    if tr == "strengthening":
+        delta += 10
+        supporting.append("Trend strengthening in trade direction")
+    elif tr == "intact":
+        delta += 5
+        supporting.append("Trend intact")
+    elif tr == "weakening":
+        delta -= 8
+        warnings.append("Trend weakening")
+        conflicting.append("Trend weakening")
+    elif tr == "broken":
+        delta -= 15
+        conflicting.append("Trend broken against position")
+
+    # --- VWAP ---
+    vw = dimensions.get("vwap", "unavailable")
+    above_below = "above" if direction == "Long" else "below"
+    if vw == "holding_in_direction":
+        delta += 8
+        supporting.append(f"Price holding {above_below} VWAP")
+    elif vw == "failing":
+        delta -= 10
+        warnings.append("VWAP lost — directional support reduced")
+        conflicting.append("VWAP failing")
+
+    # --- Structure ---
+    sc = dimensions.get("structure", "unavailable")
+    if sc == "favorable":
+        delta += 10
+        supporting.append("Structure strengthening in trade direction")
+    elif sc == "intact":
+        delta += 5
+        supporting.append("Structure intact")
+    elif sc == "threatened":
+        delta -= 8
+        warnings.append("Structure threatened")
+        conflicting.append("Structure threatened")
+    elif sc == "broken":
+        delta -= 15
+        conflicting.append("Structure broken opposite to trade")
+
+    # --- Volume ---
+    vo = dimensions.get("volume", "unavailable")
+    if vo == "expanding":
+        delta += 5
+        supporting.append("Volume expanding")
+    elif vo == "contracting":
+        delta -= 3
+        warnings.append("Volume contracting")
+    elif vo == "exhaustion":
+        delta -= 5
+        warnings.append("Volume exhaustion signal")
+
+    # --- Delta / CVD ---
+    dc = dimensions.get("delta_cvd", "unavailable")
+    if dc == "confirming":
+        delta += 8
+        supporting.append("CVD/Delta confirming trade direction")
+    elif dc == "diverging":
+        delta -= 8
+        warnings.append("CVD/Delta diverging from price")
+        conflicting.append("CVD/Delta diverging")
+    elif dc == "reversing":
+        delta -= 12
+        conflicting.append("CVD/Delta reversing sharply")
+
+    # --- Volatility ---
+    vl = dimensions.get("volatility", "unavailable")
+    if vl == "expanding_favorably":
+        delta += 5
+        supporting.append("Volatility expanding favorably")
+    elif vl == "expanding_adversely":
+        delta -= 8
+        warnings.append("Adverse volatility expansion")
+
+    # --- Progress (mode-aware) ---
+    pr = dimensions.get("trade_progress", "unavailable")
+    if pr == "near_target":
+        delta += 8
+        supporting.append("Price near target — strong progress")
+    elif pr == "progressing_strongly":
+        delta += 5
+        supporting.append("Trade progressing strongly toward target")
+    elif pr == "stalled":
+        if mode == "SCALP":
+            delta -= 10
+            warnings.append("Trade stalled (SCALP — time-sensitive)")
+        else:
+            delta -= 5
+            warnings.append("Trade stalled (monitoring)")
+    elif pr == "not_progressing" and mode == "SCALP":
+        delta -= 5
+        warnings.append("Trade not progressing (SCALP)")
+
+    score = max(0, min(100, base + delta))
+    label = _rb_tm_label(score, _RBTM_HEALTH_LABELS)
+
+    return {
+        "score":              score,
+        "label":              label,
+        "reasons":            reasons,
+        "warnings":           warnings,
+        "supporting_signals": supporting,
+        "conflicting_signals": conflicting,
+        "weights_note": ("Base 50. R progress ±15, trend ±15, VWAP ±10, "
+                         "structure ±15, volume ±5, delta/CVD ±12, "
+                         "volatility ±8, progress ±8, near-stop −15."),
+    }
+
+
+def _rb_tm_compute_confidence(snapshot, dimensions):
+    """Management confidence (0-100): how many key inputs are available.
+
+    High when price, R, VWAP, structure, volume, delta/CVD are all known.
+    Drops proportionally as inputs go missing.  Labels: HIGH/MEDIUM/LOW/INSUFFICIENT_DATA.
+    """
+    _key_inputs = [
+        ("current_price",     None),
+        ("current_r",         None),
+        ("vwap_relationship", "unavailable"),
+        ("structure_state",   "unavailable"),
+        ("volume_state",      "unavailable"),
+        ("delta_cvd_state",   "unavailable"),
+        ("trend_state",       "unavailable"),
+        ("momentum_state",    "unavailable"),
+    ]
+    avail   = []
+    missing = []
+    for key, sentinel in _key_inputs:
+        v = snapshot.get(key)
+        if v is None or v == sentinel:
+            missing.append(key)
+        else:
+            avail.append(key)
+
+    total = len(avail) + len(missing)
+    score = int(round(100 * len(avail) / max(1, total)))
+    label = _rb_tm_label(score, _RBTM_CONF_LABELS)
+
+    return {
+        "score":            score,
+        "label":            label,
+        "available_inputs": avail,
+        "missing_inputs":   missing,
+    }
+
+
+def _rb_tm_compute_thesis(trade, result, snapshot, dimensions):
+    """Evaluate thesis drift: compare current conditions to trade entry conditions.
+
+    Returns thesis_status ∈ {IMPROVING, INTACT, STABLE, WEAKENING, BROKEN, UNKNOWN}.
+    Never mutates trade, result, or snapshot.
+    """
+    is_long = snapshot.get("direction", "Long") == "Long"
+
+    # Original thesis factors stored at trade open (best-effort)
+    orig_fields = {
+        "strategy":   trade.get("strategy"),
+        "edge_score": trade.get("entry_edge_score") or trade.get("edge_score"),
+        "session":    trade.get("entry_session") or trade.get("session"),
+        "vol_regime": trade.get("entry_vol_regime") or trade.get("vol_regime"),
+        "structure":  trade.get("entry_structure"),
+        "vwap":       trade.get("entry_vwap_status"),
+        "confidence": trade.get("entry_confidence") or trade.get("confidence"),
+    }
+    orig_factors = [f"{k}={v}" for k, v in orig_fields.items() if v is not None]
+
+    # Current factors from snapshot
+    cur_fields = {
+        "structure": snapshot.get("structure_state"),
+        "vwap":      snapshot.get("vwap_relationship"),
+        "vol_regime": snapshot.get("vol_regime"),
+        "session":   snapshot.get("session"),
+        "current_r": (f"{snapshot['current_r']:.2f}" if snapshot.get("current_r") is not None else None),
+    }
+    cur_factors = [f"{k}={v}" for k, v in cur_fields.items() if v is not None]
+
+    # Evaluate factor validity
+    valid_factors       = []
+    weakened_factors    = []
+    invalidated_factors = []
+
+    stop_breached = dimensions.get("stop_breached", False)
+    struct_dim    = dimensions.get("structure", "unavailable")
+    vwap_dim      = dimensions.get("vwap", "unavailable")
+    trend_dim     = dimensions.get("trend", "unavailable")
+    current_r     = snapshot.get("current_r")
+
+    if stop_breached:
+        invalidated_factors.append("stop level breached")
+    if struct_dim == "broken":
+        invalidated_factors.append("structure broken in opposing direction")
+    elif struct_dim == "threatened":
+        weakened_factors.append("structure threatened")
+    elif struct_dim in ("intact", "favorable"):
+        valid_factors.append(f"structure {struct_dim}")
+
+    if vwap_dim == "holding_in_direction":
+        valid_factors.append("VWAP holding in trade direction")
+    elif vwap_dim == "failing":
+        weakened_factors.append("VWAP lost")
+
+    if trend_dim in ("strengthening", "intact"):
+        valid_factors.append(f"trend {trend_dim}")
+    elif trend_dim == "weakening":
+        weakened_factors.append("trend weakening")
+    elif trend_dim == "broken":
+        invalidated_factors.append("trend broken")
+
+    if current_r is not None and current_r > 0:
+        valid_factors.append(f"trade profitable (+{current_r:.2f}R)")
+    elif current_r is not None and current_r < -0.7:
+        weakened_factors.append(f"significant drawdown ({current_r:.2f}R)")
+
+    n_invalid = len(invalidated_factors)
+    n_weak    = len(weakened_factors)
+    n_valid   = len(valid_factors)
+
+    if not orig_factors and not cur_factors:
+        status      = "UNKNOWN"
+        explanation = "Insufficient data to evaluate thesis drift."
+    elif stop_breached or n_invalid >= 2:
+        status      = "BROKEN"
+        explanation = "Multiple thesis factors invalidated."
+    elif n_invalid >= 1 and struct_dim == "broken":
+        status      = "BROKEN"
+        explanation = "Critical thesis factor invalidated: structure broken."
+    elif n_invalid >= 1:
+        status      = "WEAKENING"
+        explanation = "One or more thesis factors invalidated."
+    elif n_weak >= 2:
+        status      = "WEAKENING"
+        explanation = "Multiple thesis factors weakening."
+    elif n_weak == 1:
+        status      = "STABLE"
+        explanation = "Minor factor weakening; overall thesis intact."
+    elif n_valid >= 3 and current_r is not None and current_r > 1.0:
+        status      = "IMPROVING"
+        explanation = "Multiple factors improving; trade at positive R."
+    elif n_valid >= 2:
+        status      = "INTACT"
+        explanation = "Core thesis factors remain valid."
+    else:
+        status      = "STABLE"
+        explanation = "Thesis stable — insufficient signal for improvement call."
+
+    return {
+        "status":               status,
+        "original_factors":     orig_factors,
+        "current_factors":      cur_factors,
+        "valid_factors":        valid_factors,
+        "weakened_factors":     weakened_factors,
+        "invalidated_factors":  invalidated_factors,
+        "explanation":          explanation,
+    }
+
+
+def _rb_tm_compute_exit_pressure(snapshot, thesis, health, dimensions):
+    """Accumulate exit pressure from multiple warning signals.
+
+    Returns level ∈ {NONE, LOW, MODERATE, ELEVATED, HIGH, CRITICAL}.
+    Purely diagnostic — never sends an exit.
+    """
+    stop_breached  = dimensions.get("stop_breached", False)
+    near_stop      = dimensions.get("near_stop", False)
+    thesis_status  = thesis.get("status", "UNKNOWN")
+    struct_dim     = dimensions.get("structure", "unavailable")
+    vwap_dim       = dimensions.get("vwap", "unavailable")
+    delta_dim      = dimensions.get("delta_cvd", "unavailable")
+    momentum_dim   = dimensions.get("momentum", "unavailable")
+    vol_dim        = dimensions.get("volatility", "unavailable")
+    progress       = dimensions.get("trade_progress", "unavailable")
+    current_r      = snapshot.get("current_r")
+    mode           = snapshot.get("mode", "SCALP")
+    reasons        = []
+    pressure_score = 0
+
+    if stop_breached:
+        pressure_score += 50; reasons.append("Stop level breached")
+    if near_stop:
+        pressure_score += 25; reasons.append("Price within 25% of stop distance")
+    if thesis_status == "BROKEN":
+        pressure_score += 30; reasons.append("Trade thesis broken")
+    if thesis_status == "WEAKENING":
+        pressure_score += 15; reasons.append("Trade thesis weakening")
+    if struct_dim == "broken":
+        pressure_score += 20; reasons.append("Market structure broken against position")
+    elif struct_dim == "threatened":
+        pressure_score += 10; reasons.append("Market structure threatened")
+    if vwap_dim == "failing":
+        pressure_score += 10; reasons.append("VWAP lost in trade direction")
+    if delta_dim == "reversing":
+        pressure_score += 12; reasons.append("CVD/Delta reversing against position")
+    elif delta_dim == "diverging":
+        pressure_score += 6;  reasons.append("CVD/Delta diverging from price action")
+    if momentum_dim == "reversing":
+        pressure_score += 12; reasons.append("Momentum reversing")
+    elif momentum_dim == "weakening":
+        pressure_score += 6;  reasons.append("Momentum weakening")
+    if vol_dim == "expanding_adversely":
+        pressure_score += 8;  reasons.append("Adverse volatility expansion")
+    if progress == "stalled" and mode == "SCALP":
+        pressure_score += 8;  reasons.append("Trade stalled — SCALP time decay")
+    elif progress == "stalled":
+        pressure_score += 4;  reasons.append("Trade stalled — monitoring")
+    # Positive R reduces urgency
+    if current_r is not None and current_r > 1.5:
+        pressure_score -= 10; reasons.append("Positive R reducing exit urgency")
+    if progress == "near_target":
+        pressure_score -= 5;  reasons.append("Near target — consider holding")
+
+    if pressure_score >= 50:
+        level = "CRITICAL"
+    elif pressure_score >= 35:
+        level = "HIGH"
+    elif pressure_score >= 22:
+        level = "ELEVATED"
+    elif pressure_score >= 12:
+        level = "MODERATE"
+    elif pressure_score >= 5:
+        level = "LOW"
+    else:
+        level = "NONE"
+
+    return {
+        "level":   level,
+        "score":   pressure_score,
+        "reasons": reasons,
+    }
+
+
+def _rb_tm_compute_recommendation(snapshot, thesis, health, confidence,
+                                   exit_pressure, dimensions):
+    """Produce a shadow management recommendation.
+
+    DISPLAY-ONLY.  Does not send broker instructions.
+    action ∈ RBTM_VALID_RECOMMENDATIONS (enforced by assertion before return).
+    """
+    health_score   = health.get("score", 50)
+    health_label   = health.get("label", "NEUTRAL")
+    thesis_status  = thesis.get("status", "UNKNOWN")
+    conf_label     = confidence.get("label", "INSUFFICIENT_DATA")
+    pressure_level = exit_pressure.get("level", "NONE")
+    current_r      = snapshot.get("current_r")
+    mode           = snapshot.get("mode", "SCALP")
+    stop_breached  = dimensions.get("stop_breached", False)
+    near_stop      = dimensions.get("near_stop", False)
+    progress       = dimensions.get("trade_progress", "unavailable")
+
+    reasons             = []
+    confirmation_needed = []
+    what_would_improve  = []
+    what_would_worsen   = []
+    invalidation_watch  = []
+
+    if conf_label == "INSUFFICIENT_DATA":
+        action   = "INSUFFICIENT_DATA"
+        priority = "LOW"
+        reasons.append("Insufficient data for confident recommendation")
+        what_would_improve.append("Live price + structure + VWAP data available")
+
+    elif pressure_level == "CRITICAL" or stop_breached:
+        action   = "THESIS_BROKEN"
+        priority = "CRITICAL"
+        reasons.append("Trade at critical risk — thesis invalidated or stop breached")
+        confirmation_needed.append("Confirm price and broker position before acting")
+        invalidation_watch.append("Any further move through stop level")
+
+    elif pressure_level == "HIGH":
+        action   = "EXIT_IF_CONFIRMATION_FAILS"
+        priority = "HIGH"
+        reasons.append("Multiple warning signals active")
+        confirmation_needed.append("Structure or VWAP reclaim needed to hold")
+        what_would_improve.append("Reclaim of VWAP and structure bounce")
+        what_would_worsen.append("Continued momentum failure or delta reversal")
+
+    elif thesis_status == "BROKEN":
+        action   = "THESIS_BROKEN"
+        priority = "HIGH"
+        reasons.append("Original thesis invalidated by current market conditions")
+        confirmation_needed.append("Wait for structure confirmation before re-entering")
+        invalidation_watch.append("Structure break in original direction")
+
+    elif pressure_level == "ELEVATED" and thesis_status in ("WEAKENING", "BROKEN"):
+        action   = "WATCH_CLOSELY"
+        priority = "ELEVATED"
+        reasons.append("Elevated exit pressure with weakening thesis")
+        confirmation_needed.append("Watch for VWAP hold or structure restoration")
+        what_would_worsen.append("Further VWAP or structure deterioration")
+
+    elif thesis_status == "WEAKENING":
+        action   = "THESIS_WEAKENING"
+        priority = "NORMAL"
+        reasons.append("Thesis weakening — monitoring situation")
+        what_would_improve.append("Restoration of structure and VWAP support")
+        what_would_worsen.append("Structure break or further VWAP loss")
+
+    elif near_stop:
+        action   = "MOVE_STOP_SOON"
+        priority = "ELEVATED"
+        reasons.append("Price approaching stop level")
+        confirmation_needed.append("Consider manual review of stop placement")
+
+    elif (current_r is not None and current_r >= 2.0
+          and health_label in ("EXCELLENT", "STRONG")):
+        action   = "LET_RUN"
+        priority = "LOW"
+        reasons.append(f"Trade at +{current_r:.1f}R with strong health — thesis intact")
+        what_would_improve.append("Continued structure and momentum alignment")
+        what_would_worsen.append("Structure break or momentum failure at this level")
+
+    elif (current_r is not None and current_r >= 1.0
+          and thesis_status in ("IMPROVING", "INTACT")):
+        action   = "HOLD_STRONG"
+        priority = "NORMAL"
+        reasons.append(f"Trade at +{current_r:.1f}R — thesis intact")
+        what_would_improve.append("Momentum expansion and volume confirmation")
+
+    elif current_r is not None and current_r >= 1.0:
+        action   = "PROTECT_PROFIT"
+        priority = "NORMAL"
+        reasons.append(f"Trade profitable (+{current_r:.1f}R) — consider protection")
+        confirmation_needed.append("Monitor for structure deterioration")
+        what_would_improve.append("Continued thesis support")
+
+    elif progress == "near_target":
+        action   = "TAKE_PARTIAL"
+        priority = "NORMAL"
+        reasons.append("Price near target — consider partial exit")
+        confirmation_needed.append("Verify target has not already been filled")
+
+    elif pressure_level == "MODERATE":
+        action   = "WATCH_CLOSELY"
+        priority = "NORMAL"
+        reasons.append("Moderate exit pressure developing")
+        what_would_improve.append("VWAP and structure reclaim")
+        what_would_worsen.append("Continued deterioration of supporting signals")
+
+    elif health_label in ("EXCELLENT", "STRONG"):
+        action   = "HOLD_STRONG"
+        priority = "NORMAL"
+        reasons.append("Strong trade health — holding recommended")
+
+    elif health_label == "HEALTHY":
+        action   = "HOLD"
+        priority = "NORMAL"
+        reasons.append("Healthy trade — no immediate action needed")
+
+    elif health_label == "NEUTRAL":
+        action   = "HOLD"
+        priority = "LOW"
+        reasons.append("Trade health neutral — monitoring")
+
+    elif health_label in ("WEAK", "DANGER"):
+        action   = "REVIEW_MANUALLY"
+        priority = "NORMAL"
+        reasons.append("Trade health declining — manual review recommended")
+        what_would_improve.append("Structure reclaim and VWAP restoration")
+
+    else:
+        action   = "REVIEW_MANUALLY"
+        priority = "LOW"
+        reasons.append("Trade health requires manual review")
+
+    # Exhaustive enum guard (programming error if triggered)
+    assert action in RBTM_VALID_RECOMMENDATIONS, \
+        f"_rb_tm_compute_recommendation: invalid action '{action}'"
+
+    return {
+        "action":               action,
+        "priority":             priority,
+        "reasons":              reasons,
+        "confirmation_needed":  confirmation_needed,
+        "what_would_improve":   what_would_improve,
+        "what_would_worsen":    what_would_worsen,
+        "invalidation_watch":   invalidation_watch,
+    }
+
+
+def compute_right_brain_trade_management(result):
+    """Right Brain Trade Management v1 — SHADOW MODE ONLY.
+
+    Produces a read-only diagnostic block for the instrument's active trade
+    (if any).  Two states:
+      State 1 — FLAT:         Returns a minimal flat block (no trade open).
+      State 2 — ACTIVE TRADE: Returns full health/thesis/exit-pressure/
+                               recommendation assessment.
+
+    Contract:
+      · NEVER modifies verdict, edge_score, bias, direction, confidence,
+        trade_plan, entry, stop, target, contracts, active trade state,
+        broker orders, TradersPost, learning, strategy weights, Databento.
+      · Fail-open: any exception in a sub-component returns "unavailable"
+        for that component; a top-level exception returns _rb_tm_neutral().
+      · result is NEVER mutated.
+      · affects_execution is always False in the returned dict.
+    """
+    inst  = instrument_of(result.get("active_ticker") or "MGC")
+    trade = active_trade_for(inst)
+
+    if trade is None:
+        # State 1 — FLAT
+        return {
+            "available":         True,
+            "active_trade":      False,
+            "shadow_mode":       True,
+            "affects_execution": False,
+            "instrument":        inst,
+            "state":             "FLAT",
+            "recommendation": {
+                "action":               "NO_ACTIVE_TRADE",
+                "priority":             "NONE",
+                "reasons":              ["No active trade — Right Brain monitoring"],
+                "confirmation_needed":  [],
+                "what_would_improve":   [],
+                "what_would_worsen":    [],
+                "invalidation_watch":   [],
+            },
+            "snapshot":              {},
+            "trade_health":          {"score": None, "label": None,
+                                      "reasons": [], "warnings": [],
+                                      "supporting_signals": [],
+                                      "conflicting_signals": []},
+            "management_confidence": {"score": None, "label": None,
+                                      "available_inputs": [],
+                                      "missing_inputs":   []},
+            "thesis":           {"status": "UNKNOWN", "original_factors": [],
+                                  "current_factors":    [],
+                                  "valid_factors":      [],
+                                  "weakened_factors":   [],
+                                  "invalidated_factors": [],
+                                  "explanation": "No active trade."},
+            "exit_pressure":    {"level": "NONE", "score": 0, "reasons": []},
+            "dimensions":       {},
+        }
+
+    # State 2 — ACTIVE TRADE: evaluate each component independently
+    try:
+        snapshot = _rb_tm_build_snapshot(trade, result, inst)
+    except Exception as _snap_exc:
+        logger.debug("RB trade-mgmt snapshot error: %s", _snap_exc)
+        snapshot = {}
+
+    _dim_sentinel = {k: "unavailable" for k in
+                     ("momentum", "trend", "vwap", "structure", "volume",
+                      "delta_cvd", "volatility", "trade_progress")}
+    _dim_sentinel.update({"stop_breached": False, "near_stop": False})
+    try:
+        dimensions = _rb_tm_eval_dimensions(trade, result, snapshot)
+    except Exception as _dim_exc:
+        logger.debug("RB trade-mgmt dimensions error: %s", _dim_exc)
+        dimensions = _dim_sentinel
+
+    try:
+        health = _rb_tm_compute_health(snapshot, dimensions)
+    except Exception as _hlt_exc:
+        logger.debug("RB trade-mgmt health error: %s", _hlt_exc)
+        health = {"score": 50, "label": "NEUTRAL", "reasons": [],
+                  "warnings": [], "supporting_signals": [],
+                  "conflicting_signals": []}
+
+    try:
+        mgmt_confidence = _rb_tm_compute_confidence(snapshot, dimensions)
+    except Exception as _cnf_exc:
+        logger.debug("RB trade-mgmt confidence error: %s", _cnf_exc)
+        mgmt_confidence = {"score": 0, "label": "INSUFFICIENT_DATA",
+                           "available_inputs": [], "missing_inputs": []}
+
+    try:
+        thesis = _rb_tm_compute_thesis(trade, result, snapshot, dimensions)
+    except Exception as _th_exc:
+        logger.debug("RB trade-mgmt thesis error: %s", _th_exc)
+        thesis = {"status": "UNKNOWN", "original_factors": [],
+                  "current_factors": [], "valid_factors": [],
+                  "weakened_factors": [], "invalidated_factors": [],
+                  "explanation": "Thesis evaluation unavailable."}
+
+    try:
+        exit_pressure = _rb_tm_compute_exit_pressure(
+            snapshot, thesis, health, dimensions)
+    except Exception as _ep_exc:
+        logger.debug("RB trade-mgmt exit-pressure error: %s", _ep_exc)
+        exit_pressure = {"level": "NONE", "score": 0, "reasons": []}
+
+    try:
+        recommendation = _rb_tm_compute_recommendation(
+            snapshot, thesis, health, mgmt_confidence, exit_pressure, dimensions)
+    except Exception as _rec_exc:
+        logger.debug("RB trade-mgmt recommendation error: %s", _rec_exc)
+        recommendation = {
+            "action":               "REVIEW_MANUALLY",
+            "priority":             "LOW",
+            "reasons":              ["Management engine error — manual review recommended"],
+            "confirmation_needed":  [],
+            "what_would_improve":   [],
+            "what_would_worsen":    [],
+            "invalidation_watch":   [],
+        }
+
+    return {
+        "available":         True,
+        "active_trade":      True,
+        "shadow_mode":       True,
+        "affects_execution": False,
+        "instrument":        inst,
+        "state":             "ACTIVE_TRADE",
+        "snapshot":          snapshot,
+        "trade_health":      health,
+        "management_confidence": mgmt_confidence,
+        "thesis":            thesis,
+        "exit_pressure":     exit_pressure,
+        "recommendation":    recommendation,
+        "dimensions":        dimensions,
+    }
 
 
 # ── Cross-market index alignment (DISPLAY + ALERTS only) ─────────────────────
@@ -42504,6 +43575,9 @@ def _build_status_payload(_tk):
         # Per-strategy condition-fit diagnostics (session/regime/direction/OR).
         # Absent when flag is OFF (byte-identical to today when disabled).
         "strategy_eligibility": a.get("strategy_eligibility"),
+        # ── Right Brain Trade Management v1 (Phase 6B.2) — SHADOW MODE ──────
+        # Absent (None) when RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED is OFF.
+        "right_brain_trade_management": (a.get("right_brain") or {}).get("trade_management"),
         # ── Persistent thesis + hysteresis (Phase 1) — DISPLAY-ONLY ──────────
         # The thesis was already applied to the verdict above; this exposes the
         # full snapshot (confidence, status, age, evidence, reason codes) for the
@@ -48546,6 +49620,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
       <div class="db-side" id="rb-side">
         <div class="db-side-hd">Right Brain &nbsp;<span class="db-pill db-pill-train" id="rb-pill">Training</span></div>
         <div id="rb-body"><div class="db-log-row db-log-obs">Evaluating&hellip;</div></div>
+        <div id="rb-tm-body" style="margin-top:8px"></div>
       </div>
     </div>
   </div>
@@ -51326,6 +52401,7 @@ function renderModules(d){
   try{ renderMainBrainCognitive(d); }catch(e){}
   try{ renderStalkMode(d); }catch(e){}
   try{ renderActiveThinking(d); }catch(e){}
+  try{ renderRBTradeMgmt(d); }catch(e){}
   try{ hvsUpdateFromStatus(d); }catch(e){}
   try{ renderMarketEnv(d); }catch(e){}
   try{ renderDecisionPipeline(d); }catch(e){}
@@ -56907,6 +57983,107 @@ function _pollDualBrain(){
   setTimeout(_pollDualBrain, 15000);
 }
 setTimeout(_pollDualBrain, 4000);
+
+// ── Right Brain Trade Management v1 (Phase 6B.2) — SHADOW MODE display ───────
+// Reads right_brain_trade_management from the /status poll data (d).
+// Writes into #rb-tm-body only.  SHADOW ONLY — no execution.
+function renderRBTradeMgmt(d){
+  var el = document.getElementById('rb-tm-body');
+  if (!el) return;
+  var tm = d && d.right_brain_trade_management;
+  if (!tm || !tm.available) {
+    el.innerHTML = '';
+    return;
+  }
+  var pressColors = {NONE:'#6b7280',LOW:'#6b7280',MODERATE:'#f59e0b',
+                     ELEVATED:'#f97316',HIGH:'#ef4444',CRITICAL:'#dc2626'};
+  var healthColors = {EXCELLENT:'#22c55e',STRONG:'#4ade80',HEALTHY:'#86efac',
+                      NEUTRAL:'#6b7280',WEAK:'#f59e0b',DANGER:'#ef4444',CRITICAL:'#dc2626'};
+  var thesisColors = {IMPROVING:'#22c55e',INTACT:'#4ade80',STABLE:'#6b7280',
+                      WEAKENING:'#f59e0b',BROKEN:'#ef4444',UNKNOWN:'#6b7280'};
+  if (!tm.active_trade) {
+    el.innerHTML = '<div style="font-size:9px;color:var(--muted);text-align:center;padding:4px 0">'
+      + 'RIGHT BRAIN MONITORING &mdash; NO ACTIVE TRADE</div>';
+    return;
+  }
+  var snap  = tm.snapshot || {};
+  var hlth  = tm.trade_health || {};
+  var conf  = tm.management_confidence || {};
+  var thesis= tm.thesis || {};
+  var ep    = tm.exit_pressure || {};
+  var rec   = tm.recommendation || {};
+  var dims  = tm.dimensions || {};
+  var hScore= hlth.score != null ? hlth.score : '--';
+  var hLabel= hlth.label || 'NEUTRAL';
+  var hCol  = healthColors[hLabel] || '#6b7280';
+  var hPct  = hlth.score != null ? Math.min(100, Math.max(0, hlth.score)) : 0;
+  var tStatus = thesis.status || 'UNKNOWN';
+  var tCol    = thesisColors[tStatus] || '#6b7280';
+  var epLvl   = ep.level || 'NONE';
+  var epCol   = pressColors[epLvl] || '#6b7280';
+  var action  = (rec.action || '').replace(/_/g, ' ');
+  var curR    = snap.current_r != null ? (snap.current_r > 0 ? '+' : '') + snap.current_r.toFixed(2) + 'R' : '--';
+  var dir     = (snap.direction || '').toUpperCase();
+  var strategy= snap.strategy || '';
+  var mode    = snap.mode || '';
+  var confLbl = conf.label || 'INSUFFICIENT_DATA';
+  var cScore  = conf.score != null ? conf.score + '%' : '--';
+  var html = '<div style="border-top:1px solid var(--border);padding-top:7px">'
+    + '<div style="font-size:8.5px;font-weight:700;letter-spacing:1px;color:var(--muted);margin-bottom:5px">'
+    + 'TRADE MANAGEMENT &mdash; <span style="color:#f59e0b">SHADOW ONLY</span></div>'
+    + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:5px">'
+    + (dir ? '<span style="font-size:9px;background:var(--panel);border:1px solid var(--border);'
+        + 'border-radius:4px;padding:1px 5px">' + aiEsc(dir) + '</span>' : '')
+    + (strategy ? '<span style="font-size:9px;color:var(--muted)">' + aiEsc(strategy) + '</span>' : '')
+    + (mode ? '<span style="font-size:9px;color:var(--muted)">' + aiEsc(mode) + '</span>' : '')
+    + '<span style="font-size:9px;font-weight:600;margin-left:auto">' + aiEsc(curR) + '</span>'
+    + '</div>'
+    + '<div style="background:var(--panel);border:1px solid var(--border);border-radius:6px;'
+        + 'padding:6px;margin-bottom:5px">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+    + '<span style="font-size:9px;color:var(--muted)">Health</span>'
+    + '<span style="font-size:9px;font-weight:700;color:' + hCol + '">' + aiEsc(String(hScore)) + ' ' + aiEsc(hLabel) + '</span>'
+    + '</div>'
+    + '<div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden">'
+    + '<div style="height:100%;width:' + hPct.toFixed(1) + '%;background:' + hCol + ';transition:width .4s"></div>'
+    + '</div></div>'
+    + '<div style="display:flex;gap:5px;margin-bottom:5px">'
+    + '<div style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:4px 6px;text-align:center">'
+    + '<div style="font-size:8px;color:var(--muted)">Thesis</div>'
+    + '<div style="font-size:9px;font-weight:700;color:' + tCol + '">' + aiEsc(tStatus) + '</div>'
+    + '</div>'
+    + '<div style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:4px 6px;text-align:center">'
+    + '<div style="font-size:8px;color:var(--muted)">Exit Pressure</div>'
+    + '<div style="font-size:9px;font-weight:700;color:' + epCol + '">' + aiEsc(epLvl) + '</div>'
+    + '</div>'
+    + '<div style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:4px 6px;text-align:center">'
+    + '<div style="font-size:8px;color:var(--muted)">Confidence</div>'
+    + '<div style="font-size:9px;font-weight:600">' + aiEsc(confLbl.replace('_',' ')) + '</div>'
+    + '</div>'
+    + '</div>';
+  if (action) {
+    var actCol = (rec.action === 'THESIS_BROKEN' || rec.action === 'EXIT_IF_CONFIRMATION_FAILS')
+      ? '#ef4444'
+      : rec.action === 'LET_RUN' || rec.action === 'HOLD_STRONG' ? '#22c55e' : 'var(--fg)';
+    html += '<div style="font-size:9px;font-weight:700;color:' + actCol + ';margin-bottom:3px">'
+      + '\u25b6 ' + aiEsc(action) + '</div>';
+    var reasons = rec.reasons || [];
+    if (reasons.length) {
+      html += '<div style="font-size:8.5px;color:var(--muted);line-height:1.4">'
+        + aiEsc(reasons[0]) + '</div>';
+    }
+  }
+  var warns = (hlth.warnings || []).slice(0, 2);
+  if (warns.length) {
+    html += '<div style="margin-top:4px">';
+    warns.forEach(function(w){
+      html += '<div style="font-size:8px;color:#f59e0b">\u26a0 ' + aiEsc(w) + '</div>';
+    });
+    html += '</div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
 
 var _liveNavSections = {
   // Quick status: sensitivity, current verdict, active trade summary, HV windows
