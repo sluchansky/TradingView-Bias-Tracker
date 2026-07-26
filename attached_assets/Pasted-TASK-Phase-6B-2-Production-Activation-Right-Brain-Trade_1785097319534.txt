@@ -1,0 +1,397 @@
+TASK: Phase 6B.2 Production Activation — Right Brain Trade Management
+
+OBJECTIVE
+
+Activate the completed Right Brain Trade Management feature in production for
+display-only shadow use.
+
+Do not add features.
+
+Do not change scoring.
+
+Do not change trade-health logic.
+
+Do not change recommendation logic.
+
+Do not change execution.
+
+Do not change stops, targets, quantity, TradersPost, Databento, learning, or
+strategy selection.
+
+Use the exact tested revision already validated.
+
+====================================================
+1. COMPLETE THE REMAINING DATA-SOURCE AUDIT
+====================================================
+
+Continue Section 6 from the existing report.
+
+Return a compact table for every remaining field:
+
+- direction
+- entry price
+- current price
+- stop
+- target
+- quantity
+- start timestamp
+- time in trade
+- unrealized P&L
+- current R
+- maximum favorable excursion
+- maximum adverse excursion
+- highest price since entry
+- lowest price since entry
+- VWAP relationship
+- momentum
+- structure
+- volume
+- delta/CVD
+- volatility
+- original thesis
+- invalidation
+
+For each field provide:
+
+Field
+Exact source
+Live / derived / stored
+Can be missing
+Fallback
+Current support level
+
+Classify every field as exactly one:
+
+FULLY_AVAILABLE
+CONDITIONALLY_AVAILABLE
+NOT_CURRENTLY_AVAILABLE
+
+Do not modify code during this audit.
+
+====================================================
+2. COMPLETE ORIGINAL-THESIS AUDIT
+====================================================
+
+Return:
+
+TRUE ENTRY-TIME SNAPSHOT FIELDS
+
+RECONSTRUCTED FROM CURRENT STATE
+
+UNAVAILABLE
+
+Include:
+
+- strategy
+- direction
+- entry reason
+- regime
+- VWAP state
+- structure state
+- confidence
+- edge score
+- invalidation
+- stop
+- target
+- session
+- volatility
+
+Do not add new persistence today.
+
+====================================================
+3. CONFIRM FINAL ISOLATION RESULT
+====================================================
+
+Return the already-completed ON/OFF parity result in this exact format:
+
+Scenarios tested:
+Pre-existing fields compared:
+Non-diagnostic mismatch count:
+Exact mismatches:
+Expected diagnostic-only differences:
+Parity conclusion:
+
+Required successful conclusion:
+
+All pre-existing non-diagnostic fields are identical with
+RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED OFF and ON.
+
+Also confirm:
+
+- no recommendation can place an order
+- no recommendation can close an order
+- no recommendation can move a stop
+- no recommendation can change a target
+- no recommendation can change quantity
+- no recommendation can write to learning
+
+====================================================
+4. VERIFY THE EXACT TESTED REVISION
+====================================================
+
+Record:
+
+git branch --show-current
+git rev-parse HEAD
+git status --short
+git diff --check
+git log -5 --oneline
+
+Expected tested HEAD from the closure report:
+
+a3b1a88
+
+If HEAD is no longer a3b1a88, stop and report the difference before deploying.
+
+Confirm:
+
+- no tracked task attachments
+- no uncommitted source changes
+- no staged files
+- only acceptable untracked task instruction files outside the repo
+
+====================================================
+5. PRODUCTION REVISION CHECK
+====================================================
+
+Identify the currently deployed revision.
+
+Return:
+
+Source HEAD:
+Deployed revision:
+Revision match:
+Phase 6B.2 code deployed:
+Orchestrator deployed:
+Environment flag present:
+Restart/redeploy required:
+
+Do not assume deployment state from source code.
+
+Use production/deployment evidence.
+
+====================================================
+6. PRE-ACTIVATION PRODUCTION SAFETY CHECK
+====================================================
+
+Before enabling the flag, verify production health:
+
+- application is running
+- no crash loop
+- no repeated exception loop
+- Databento initializes
+- Databento remains the primary data source
+- no duplicate subscriptions
+- no repeated reconnect storm
+- market-closed behavior is normal
+- no unintended active trade
+- no unintended working order
+- duplicate guard is active
+- prop guard is active
+- daily-loss guard is active
+- execution mode is the expected current mode
+- TradersPost mode is the expected current mode
+- no synthetic or replay data can enter live execution
+
+Do not send a live test order.
+
+Return PASS / FAIL / WARNING for every item.
+
+====================================================
+7. ENABLE THE FEATURE
+====================================================
+
+Only if all blocking checks pass:
+
+Set:
+
+RIGHT_BRAIN_TRADE_MANAGEMENT_ENABLED=1
+
+This is a production environment change only.
+
+Do not change the source default.
+
+Do not change any Python or JavaScript.
+
+Do not enable any other dormant feature flag.
+
+If production requires redeployment to load environment values, deploy the exact
+tested revision a3b1a88.
+
+If a manual Replit publish/redeploy action is required, stop before deployment
+and state the exact button or action the user must perform.
+
+====================================================
+8. CONTROLLED RESTART OR DEPLOYMENT
+====================================================
+
+After setting the flag:
+
+1. Restart or redeploy production.
+2. Verify deployed revision is exactly a3b1a88.
+3. Capture sanitized boot logs.
+4. Confirm Databento initialization.
+5. Confirm no crash or restart loop.
+6. Confirm no unintended TradersPost outbound request.
+7. Confirm no broker order is created.
+8. Confirm the production flag resolves True.
+9. Confirm `/status` includes:
+   right_brain.trade_management
+10. Confirm:
+    shadow_mode=true
+    affects_execution=false
+
+Do not make code changes during deployment.
+
+====================================================
+9. PRODUCTION DASHBOARD VERIFICATION
+====================================================
+
+Verify the production dashboard displays the feature inside the existing Right
+Brain.
+
+Confirm:
+
+- panel title:
+  RIGHT BRAIN — TRADE MANAGEMENT
+
+- visible label:
+  SHADOW ONLY — DOES NOT CONTROL ORDERS
+
+- no third brain is created
+- no duplicate Trade Management panel
+- no JavaScript error
+- no console exception
+- no layout corruption
+- flat state displays:
+  RIGHT BRAIN IS MONITORING
+  NO ACTIVE TRADE
+
+If a legitimate active trade exists, verify the panel displays:
+
+- direction
+- strategy
+- current R
+- trade health
+- management confidence
+- thesis status
+- exit pressure
+- recommendation
+
+Do not create an artificial active trade.
+
+====================================================
+10. POST-ACTIVATION PARITY SMOKE TEST
+====================================================
+
+After production activation, run a safe analysis request or status refresh.
+
+Compare the production result against the pre-activation behavior.
+
+Confirm no change to:
+
+- verdict
+- bias
+- direction
+- edge score
+- confidence
+- trade plan
+- entry
+- stop
+- target
+- quantity
+- guard decisions
+- dispatch decision
+- TradersPost payload
+- learning intent
+
+Only the nested Right Brain diagnostic block may be new.
+
+====================================================
+11. MARKET-OPEN OBSERVATION MODE
+====================================================
+
+Do not add or change code after activation.
+
+For the first live session, log and observe:
+
+- active trade detection
+- missing inputs
+- management confidence
+- health score
+- thesis changes
+- exit-pressure changes
+- recommendations
+- exceptions
+- stale-data warnings
+
+Do not allow recommendations to control execution.
+
+Do not tune thresholds during the live session.
+
+Do not optimize from a single trade.
+
+====================================================
+12. FINAL ACTIVATION REPORT
+====================================================
+
+Return:
+
+1. Branch
+2. Source HEAD
+3. Deployed revision
+4. Git status
+5. Data-source availability summary
+6. Original-thesis integrity summary
+7. ON/OFF parity result
+8. Pre-activation production health
+9. Feature flag before
+10. Feature flag after
+11. Restart/deployment action
+12. Boot-log result
+13. Databento result
+14. `/status` result
+15. Dashboard result
+16. Browser console result
+17. Outbound-order verification
+18. Post-activation parity result
+19. Blocking issues
+20. Non-blocking warnings
+21. Exact known limitations
+22. Final market status
+
+Final Phase status must be exactly:
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_ACTIVATED
+
+or:
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_ACTIVATED_WITH_WARNINGS
+
+or:
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_ACTIVATION_BLOCKED
+
+Final market status must be exactly:
+
+MARKET_OPEN_READY
+
+or:
+
+MARKET_OPEN_READY_WITH_WARNINGS
+
+or:
+
+MARKET_OPEN_NOT_READY
+
+After returning the report, stop.
+
+DO NOT START ANOTHER PHASE.
+
+DO NOT ADD DYNAMIC STOP MANAGEMENT.
+
+DO NOT AUTOMATE PARTIALS.
+
+DO NOT AUTOMATE EXITS.
+
+DO NOT CONNECT RIGHT BRAIN RECOMMENDATIONS TO EXECUTION.
