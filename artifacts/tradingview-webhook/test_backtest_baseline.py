@@ -1,4 +1,4 @@
-"""test_backtest_baseline.py — Phase 6B.1 test suite (45+ tests).
+"""test_backtest_baseline.py — Phase 6B.1 test suite (88+ tests).
 
 Tests cover:
   BL001-BL005  Module import + constant contracts
@@ -11,6 +11,8 @@ Tests cover:
   BL041-BL045  Rankings (_compute_rankings)
   BL046-BL050  API guards + route smoke tests (no-DB mode)
   BL051-BL055  Money-path isolation invariants
+  BL056-BL060  Metrics correctness
+  BL061-BL069  Deterministic config-hash invariants (Phase 6B.1B)
 """
 import importlib
 import json
@@ -835,6 +837,110 @@ class TestMetricsCorrectness(unittest.TestCase):
         self.assertIsNotNone(m["first_trade_ts"])
         self.assertIsNotNone(m["last_trade_ts"])
         self.assertLessEqual(m["first_trade_ts"], m["last_trade_ts"])
+
+
+class TestDeterministicConfigHash(unittest.TestCase):
+    """BL061-BL069: _freeze_config determinism invariants (Phase 6B.1B).
+
+    The config hash is the integrity seal for a baseline run.  These tests
+    verify that every field that feeds the hash is deterministically ordered
+    so that the same engine constants always produce the same 16-char hex.
+    """
+
+    def _cfg(self):
+        cfg, h = bl._freeze_config("test_commit")
+        return cfg, h
+
+    def test_BL061_hash_is_16_hex_chars(self):
+        """BL061: config hash is exactly 16 lowercase hex characters."""
+        _, h = self._cfg()
+        self.assertEqual(len(h), 16, f"expected 16 chars, got {len(h)}: {h!r}")
+        self.assertTrue(all(c in "0123456789abcdef" for c in h),
+                        f"non-hex chars in hash: {h!r}")
+
+    def test_BL062_hash_stable_across_calls(self):
+        """BL062: two successive _freeze_config calls return the same hash."""
+        _, h1 = self._cfg()
+        _, h2 = self._cfg()
+        self.assertEqual(h1, h2,
+                         "config hash drifted between consecutive calls")
+
+    def test_BL063_valid_symbols_is_sorted(self):
+        """BL063: valid_symbols in the config dict is sorted (not set-order)."""
+        cfg, _ = self._cfg()
+        syms = cfg["valid_symbols"]
+        self.assertIsInstance(syms, list, "valid_symbols must be a list")
+        self.assertEqual(syms, sorted(syms),
+                         f"valid_symbols not sorted: {syms}")
+
+    def test_BL064_valid_timeframes_is_sorted(self):
+        """BL064: valid_timeframes in the config dict is sorted."""
+        cfg, _ = self._cfg()
+        tfs = cfg["valid_timeframes"]
+        self.assertIsInstance(tfs, list, "valid_timeframes must be a list")
+        self.assertEqual(tfs, sorted(tfs),
+                         f"valid_timeframes not sorted: {tfs}")
+
+    def test_BL065_detector_registry_is_sorted(self):
+        """BL065: detector_registry_snapshot is a sorted list of strings."""
+        cfg, _ = self._cfg()
+        det = cfg["detector_registry_snapshot"]
+        self.assertIsInstance(det, list)
+        self.assertEqual(det, sorted(det),
+                         f"detector_registry_snapshot not sorted: {det}")
+
+    def test_BL066_disabled_strategies_is_sorted(self):
+        """BL066: disabled_strategies is a sorted list."""
+        cfg, _ = self._cfg()
+        ds = cfg["disabled_strategies"]
+        self.assertIsInstance(ds, list)
+        self.assertEqual(ds, sorted(ds),
+                         f"disabled_strategies not sorted: {ds}")
+
+    def test_BL067_news_blackouts_json_serialisable(self):
+        """BL067: news_blackouts_et serialises to stable JSON (list of lists)."""
+        cfg, _ = self._cfg()
+        nb = cfg["news_blackouts_et"]
+        self.assertIsInstance(nb, list,
+                              "news_blackouts_et must be a list")
+        for entry in nb:
+            self.assertIsInstance(entry, list,
+                                  f"each blackout window must be a list, got {type(entry)}")
+        serialised = json.dumps(nb, sort_keys=True)
+        self.assertIsInstance(serialised, str)
+
+    def test_BL068_config_contains_required_keys(self):
+        """BL068: config dict contains all keys that feed the hash."""
+        required = {
+            "engine_version", "management", "commission_per_side",
+            "slippage_ticks", "instruments", "modes", "strategies",
+            "valid_symbols", "valid_timeframes", "bt_specs", "bt_modes",
+            "news_blackouts_et", "max_trades_per_session", "min_target_r",
+            "detector_registry_snapshot", "disabled_strategies",
+        }
+        cfg, _ = self._cfg()
+        missing = required - cfg.keys()
+        self.assertFalse(missing, f"config missing keys: {missing}")
+
+    def test_BL069_hash_changes_on_mutated_symbols_order(self):
+        """BL069: reversing valid_symbols produces a different JSON, confirming
+        that order is load-bearing for the hash (mutation / oracle test)."""
+        import hashlib
+        cfg, _ = self._cfg()
+        original_json = json.dumps(cfg, sort_keys=True, default=str)
+        original_hash = hashlib.md5(original_json.encode()).hexdigest()[:16]
+
+        cfg_mutated = dict(cfg)
+        cfg_mutated["valid_symbols"] = list(reversed(cfg["valid_symbols"]))
+        mutated_json = json.dumps(cfg_mutated, sort_keys=True, default=str)
+        mutated_hash = hashlib.md5(mutated_json.encode()).hexdigest()[:16]
+
+        if len(cfg["valid_symbols"]) > 1:
+            self.assertNotEqual(
+                original_hash, mutated_hash,
+                "reversed valid_symbols should yield a different hash — "
+                "order is not load-bearing, which defeats the determinism fix",
+            )
 
 
 if __name__ == "__main__":

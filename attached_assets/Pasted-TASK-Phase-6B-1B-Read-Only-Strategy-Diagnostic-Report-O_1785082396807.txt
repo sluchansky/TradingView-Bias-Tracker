@@ -1,0 +1,1139 @@
+TASK: Phase 6B.1B — Read-Only Strategy Diagnostic Report
+
+OBJECTIVE
+
+Explain why each strategy produced the results seen in the first official
+real-data baseline.
+
+Actual baseline ID:
+
+BL-20260726-043053-0cc8364
+
+This task is diagnostic and read-only.
+
+DO NOT optimize parameters.
+
+DO NOT change strategy logic.
+
+DO NOT change live trading behavior.
+
+DO NOT regenerate the baseline.
+
+DO NOT create a replacement baseline.
+
+DO NOT update learning.
+
+DO NOT promote or demote strategies.
+
+DO NOT add new live gates.
+
+DO NOT change Databento.
+
+DO NOT change TradersPost.
+
+DO NOT add dashboard features.
+
+DO NOT add API routes.
+
+DO NOT add database tables.
+
+Prefer direct SQL queries, existing stored trade data, existing breakdowns,
+and temporary local analysis scripts that are not committed.
+
+The goal is to identify the conditions associated with wins and losses so the
+next engineering phase can be chosen intelligently.
+
+----------------------------------------------------
+PART 1 — PRE-FLIGHT AND BASELINE CORRECTION
+----------------------------------------------------
+
+Run:
+
+git branch --show-current
+git rev-parse HEAD
+git log -7 --oneline
+git status --short
+git diff --check
+
+Confirm:
+
+- actual baseline BL-20260726-043053-0cc8364 exists
+- baseline status is COMPLETE
+- 40 matrix rows exist
+- 7,909 trade rows exist
+- 64 breakdown rows exist
+- no baseline records are modified
+- no historical data files are tracked by Git
+- no task attachments are staged
+- no live source changes are uncommitted
+
+Return:
+
+- branch
+- current HEAD
+- baseline ID
+- baseline source commit
+- configuration hash
+- dataset IDs
+- matrix count
+- trade count
+- breakdown count
+
+If any of these values do not reconcile, stop and report:
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_BLOCKED
+
+----------------------------------------------------
+PART 2 — FIX ONLY THE OPEN DETERMINISM TOOLING ITEM
+----------------------------------------------------
+
+The previous report identified nondeterministic configuration hashing caused by:
+
+list(bt.VALID_SYMBOLS)
+list(bt.VALID_TIMEFRAMES)
+
+Replace only those set-to-list conversions with deterministic sorting:
+
+sorted(bt.VALID_SYMBOLS)
+sorted(bt.VALID_TIMEFRAMES)
+
+Requirements:
+
+- do not change the values in either set
+- do not change simulation behavior
+- do not change strategy behavior
+- do not regenerate the official baseline
+- do not alter the stored configuration hash
+- do not alter existing baseline data
+- add a focused test proving repeated config snapshots produce the same hash
+  across differently ordered input sets
+
+Then run a diagnostic re-execution of representative combinations using the same
+stored datasets and parameters.
+
+Use the correct function signature and candle-loading path.
+
+Verify determinism for at least:
+
+- MGC / SWING / LIQUIDITY_SWEEP_REVERSAL
+- MES / SWING / OPENING_RANGE_BREAKOUT
+- MNQ / SCALP / OPENING_DRIVE
+- MYM / SCALP / VWAP_TREND_CONTINUATION
+
+Compare:
+
+- trade count
+- signal timestamps
+- entry timestamps
+- direction
+- entry price
+- stop
+- target
+- exit timestamp
+- exit price
+- exit reason
+- realized R
+- aggregate metrics
+
+Do not insert these reruns into baseline tables.
+
+Return:
+
+- hash test result
+- rerun comparison result
+- mismatch count
+- maximum numeric difference
+- determinism status
+
+Allowed statuses:
+
+- PROVED_FOR_REPRESENTATIVE_COMBINATIONS
+- NOT_PROVED
+- FAILED
+
+If simulation results mismatch materially, stop before continuing.
+
+----------------------------------------------------
+PART 3 — RISK-MODEL CLASSIFICATION
+----------------------------------------------------
+
+Trace the historical execution and aggregation path.
+
+Return:
+
+- whether each stored trade is independently normalized to 1R
+- whether account equity is modeled
+- whether balance compounds
+- whether contract sizing is modeled
+- whether margin is modeled
+- whether shared buying power is modeled
+- whether simultaneous positions consume shared risk
+- whether daily loss limits are modeled
+- whether trailing drawdown is modeled
+- whether prop rules are modeled
+- whether correlated exposure is modeled
+- whether SCALP and SWING share one account
+- whether multiple strategies may be active simultaneously
+
+Classify the baseline exactly as one:
+
+SIGNAL_LEVEL_R_MODEL
+
+PORTFOLIO_LEVEL_MODEL
+
+UNKNOWN_RISK_MODEL
+
+The report must state clearly that combined Net R is not an achievable account
+equity curve unless a shared chronological portfolio is modeled.
+
+----------------------------------------------------
+PART 4 — STRATEGIES UNDER REVIEW
+----------------------------------------------------
+
+Analyze these five approved historical strategies:
+
+1. OPENING_DRIVE
+2. LIQUIDITY_SWEEP_REVERSAL
+3. VWAP_TREND_CONTINUATION
+4. RANGE_EXPANSION_BREAKOUT
+5. OPENING_RANGE_BREAKOUT
+
+For every strategy trace:
+
+- detector function
+- signal conditions
+- confirmation conditions
+- session restrictions
+- direction rules
+- stop construction
+- target construction
+- entry policy
+- exit policy
+- maximum trades per session
+- mode-specific differences
+- volatility handling
+- news-blackout handling
+- same-bar conflict handling
+
+Cite exact functions and source locations in the Replit report.
+
+Do not modify any of them.
+
+----------------------------------------------------
+PART 5 — STRATEGY-LEVEL SUMMARY
+----------------------------------------------------
+
+For each strategy aggregate all instruments and both modes.
+
+Return:
+
+- combinations
+- total trades
+- wins
+- losses
+- breakevens
+- win rate
+- gross positive R
+- gross negative R
+- Net R
+- average R
+- median R
+- expectancy
+- profit factor
+- maximum individual-combination drawdown
+- average holding time
+- median holding time
+- long trade count
+- short trade count
+- long Net R
+- short Net R
+- commission impact
+- slippage impact
+- reliability distribution
+
+Do not call the drawdown a portfolio drawdown.
+
+----------------------------------------------------
+PART 6 — FULL STRATEGY × INSTRUMENT × MODE TABLE
+----------------------------------------------------
+
+Return all 40 combinations with:
+
+- instrument
+- mode
+- strategy
+- trades
+- win rate
+- Net R
+- expectancy
+- profit factor
+- maximum drawdown
+- average hold
+- median hold
+- long Net R
+- short Net R
+- reliability
+- descriptive result classification
+
+Use classifications:
+
+- POSITIVE_STRONG_SAMPLE
+- POSITIVE_MODERATE_SAMPLE
+- POSITIVE_LOW_SAMPLE
+- NEAR_FLAT
+- NEGATIVE_MODERATE
+- NEGATIVE_SEVERE
+
+Return the exact thresholds used.
+
+Sort by strategy, then instrument, then mode.
+
+----------------------------------------------------
+PART 7 — LONG/SHORT FAILURE ANALYSIS
+----------------------------------------------------
+
+The prior report found:
+
+Long Net R: approximately +54R
+
+Short Net R: approximately -432R
+
+Investigate this imbalance in depth.
+
+For every strategy return:
+
+- long trades
+- short trades
+- long win rate
+- short win rate
+- long Net R
+- short Net R
+- long expectancy
+- short expectancy
+- long profit factor
+- short profit factor
+- long commission drag
+- short commission drag
+- long slippage drag
+- short slippage drag
+
+Break short results down by:
+
+- instrument
+- mode
+- month
+- weekday
+- session
+- ET entry hour
+- volatility regime
+- exit reason
+
+Identify where short losses are concentrated.
+
+Answer descriptively:
+
+- Are shorts consistently worse across every strategy?
+- Is the problem concentrated in ORB?
+- Is the problem concentrated in equity indices?
+- Is MGC an exception?
+- Are losses clustered in specific months?
+- Are losses clustered in specific sessions or hours?
+- Are short losses caused by lower win rate, larger losses, higher frequency,
+  or cost drag?
+- Are short entries predominantly counter-trend during this period?
+
+Do not introduce a short-side filter.
+
+Do not change logic.
+
+----------------------------------------------------
+PART 8 — HIGHER-TIMEFRAME CONTEXT AVAILABILITY
+----------------------------------------------------
+
+Determine what market-context fields were available to the historical engine at
+signal time.
+
+Check whether stored or reconstructable inputs include:
+
+- higher-timeframe trend
+- moving-average alignment
+- VWAP side
+- opening-price relationship
+- prior-day high/low relationship
+- overnight high/low relationship
+- market structure
+- volatility regime
+- ATR regime
+- volume regime
+- session trend
+- daily directional bias
+- news context
+
+For each field return:
+
+- available at signal time
+- stored per trade
+- reconstructable from historical candles
+- unavailable
+- used by detector yes/no
+
+Do not add these fields to the database during this task.
+
+----------------------------------------------------
+PART 9 — OPENING DRIVE DIAGNOSTIC
+----------------------------------------------------
+
+Analyze OPENING_DRIVE separately.
+
+Return results by:
+
+- instrument
+- mode
+- direction
+- month
+- weekday
+- ET hour
+- volatility regime
+- exit reason
+
+Investigate:
+
+- opening-drive direction relative to the opening range
+- distance from opening price at signal
+- entry timing after the open
+- whether winning signals occurred early or late
+- whether losses cluster near the end of the allowed window
+- long-versus-short performance
+- stop-size distribution
+- holding-time distribution
+- consecutive-loss clusters
+
+Identify the strongest and weakest observable conditions.
+
+Do not recommend changing the opening window.
+
+----------------------------------------------------
+PART 10 — LIQUIDITY SWEEP REVERSAL DIAGNOSTIC
+----------------------------------------------------
+
+Analyze LIQUIDITY_SWEEP_REVERSAL separately.
+
+This strategy was the best on MGC and among the worst on several equity-index
+combinations.
+
+Return results by:
+
+- instrument
+- mode
+- direction
+- month
+- weekday
+- session
+- ET hour
+- volatility regime
+- exit reason
+
+Investigate:
+
+- sweep direction
+- sweep size where reconstructable
+- distance beyond the swept level
+- reclaim behavior
+- time between sweep and entry
+- whether a reversal candle was required
+- whether the signal followed or opposed the session trend
+- whether repeated sweeps occurred near the same level
+- trade frequency by session
+- consecutive signals on the same day
+- stop distance
+- holding time
+- MGC-versus-equity differences
+
+Answer:
+
+- Why did MGC LSR outperform?
+- Why did MES/MNQ/MYM LSR underperform?
+- Is underperformance mostly short-side?
+- Is trade frequency amplifying a small negative expectancy?
+- Are losses concentrated in trending sessions where reversal logic repeatedly
+  fades momentum?
+
+Do not modify the detector.
+
+----------------------------------------------------
+PART 11 — VWAP TREND CONTINUATION DIAGNOSTIC
+----------------------------------------------------
+
+Analyze VWAP_TREND_CONTINUATION separately.
+
+Return results by:
+
+- instrument
+- mode
+- direction
+- month
+- weekday
+- session
+- ET hour
+- volatility regime
+- exit reason
+
+Investigate:
+
+- side of VWAP
+- distance from VWAP at signal
+- pullback depth where reconstructable
+- VWAP slope or proxy where available
+- trend continuation direction
+- time since VWAP reset
+- number of prior VWAP crosses
+- whether entry followed a clean hold or repeated chop
+- long-versus-short asymmetry
+- holding time
+- stop distribution
+
+Compare:
+
+- MES positive combinations
+- MYM negative combinations
+- MNQ thin positive/negative combinations
+- MGC negative combinations
+
+Identify whether VWAP performance appears instrument-specific, mode-specific,
+direction-specific, or regime-specific.
+
+----------------------------------------------------
+PART 12 — RANGE EXPANSION BREAKOUT DIAGNOSTIC
+----------------------------------------------------
+
+Analyze RANGE_EXPANSION_BREAKOUT separately.
+
+Return results by:
+
+- instrument
+- mode
+- direction
+- month
+- weekday
+- session
+- ET hour
+- volatility regime
+- exit reason
+
+Investigate:
+
+- breakout-range size
+- expansion magnitude
+- entry timing
+- follow-through after breakout
+- failed-breakout frequency
+- whether signals occur after volatility is already extended
+- stop distance
+- target distance
+- holding time
+- repeated same-session signals
+- long-versus-short results
+
+Determine why MNQ SCALP was positive while most other combinations were negative.
+
+Do not change expansion thresholds.
+
+----------------------------------------------------
+PART 13 — OPENING RANGE BREAKOUT DIAGNOSTIC
+----------------------------------------------------
+
+Analyze OPENING_RANGE_BREAKOUT separately.
+
+Confirm:
+
+- opening range built from 08:00–08:30 ET
+- no ORB entry before range completion
+- ATR-based stop
+- 4R target
+- next-bar-open entry
+- same-bar stop-wins rule
+
+Return results by:
+
+- instrument
+- mode
+- direction
+- month
+- weekday
+- ET hour
+- volatility regime
+- exit reason
+
+Investigate:
+
+- opening-range width
+- breakout distance
+- next-bar entry gap
+- long-versus-short result
+- time from range completion to signal
+- number of false breakouts
+- same-day repeated entries
+- stop distance
+- holding time
+- target-hit rate
+- stop-hit rate
+- dataset-end exits
+- extreme winners
+- extreme losing streaks
+
+Compare:
+
+- profitable MGC/SWING/ORB
+- profitable MYM/SCALP/ORB
+- severely negative MES/SWING/ORB
+- severely negative MNQ/MES SCALP ORB
+
+Answer whether the observed differences appear driven by:
+
+- sample size
+- direction
+- range width
+- volatility
+- session behavior
+- cost drag
+- target rarity
+- holding-time exposure
+- instrument-specific price behavior
+
+Do not reduce the 4R target.
+
+----------------------------------------------------
+PART 14 — EXIT-REASON ANALYSIS
+----------------------------------------------------
+
+For every strategy and combination return counts and results by exit reason.
+
+Include:
+
+- target
+- stop
+- dataset end
+- timeout, if implemented
+- management exit, if implemented
+- any other stored exit reason
+
+For each exit reason return:
+
+- trades
+- average R
+- total R
+- average holding time
+- median holding time
+- direction split
+- instrument split
+
+Flag:
+
+- excessive dataset-end exits
+- unexpected exit reasons
+- null exit reasons
+- exit reasons inconsistent with the configured strategy management
+
+----------------------------------------------------
+PART 15 — COST-DRAG ANALYSIS
+----------------------------------------------------
+
+The baseline reportedly modeled:
+
+- commission per side: $0.62
+- slippage: 1 tick per side or equivalent stored policy
+
+Verify the exact implementation.
+
+For every strategy return:
+
+- gross R before commission and slippage
+- commission impact
+- slippage impact
+- Net R after modeled costs
+- average total cost in R per trade
+- percentage of gross positive R consumed by costs
+- count of trades whose gross result was positive but became non-positive after
+  costs
+- count of combinations whose gross expectancy was positive but net expectancy
+  became negative after costs
+
+Return the same analysis by instrument and mode.
+
+Do not modify cost settings.
+
+----------------------------------------------------
+PART 16 — TRADE-FREQUENCY DIAGNOSTIC
+----------------------------------------------------
+
+For every strategy return:
+
+- total trades
+- average trades per active trading day
+- median trades per day
+- maximum trades per day
+- sessions traded per day
+- repeated entries on the same instrument/session/day
+- trades after an earlier loss on the same session
+- trades after two earlier losses on the same session
+- trades after three earlier losses on the same day
+
+Determine whether negative strategies lose primarily because of:
+
+- high frequency with mildly negative expectancy
+- low frequency with large losses
+- repeated entries during bad regimes
+- directional concentration
+- cost accumulation
+
+Do not introduce cooldowns or daily limits.
+
+----------------------------------------------------
+PART 17 — LOSS-CLUSTER ANALYSIS
+----------------------------------------------------
+
+For every combination return:
+
+- longest losing streak
+- worst 5-trade sequence
+- worst 10-trade sequence
+- worst trading day
+- worst week
+- worst month
+- maximum consecutive losing days
+- maximum drawdown
+- timestamp of drawdown start
+- timestamp of drawdown bottom
+- timestamp of recovery, if recovered
+
+Identify whether losses cluster by:
+
+- instrument
+- strategy
+- direction
+- session
+- weekday
+- month
+- volatility regime
+
+Return representative clusters for the five worst combinations.
+
+----------------------------------------------------
+PART 18 — WIN-CLUSTER AND TAIL ANALYSIS
+----------------------------------------------------
+
+For every combination return:
+
+- longest winning streak
+- best 5-trade sequence
+- best 10-trade sequence
+- best trading day
+- best week
+- best month
+- top 1 trade contribution to Net R
+- top 5 trade contribution
+- top 10 trade contribution
+- percentage of Net R attributable to the top 10 trades
+
+Flag combinations whose profitability depends heavily on a small number of
+outlier trades.
+
+Pay particular attention to:
+
+- MGC/SWING/ORB
+- MYM/SCALP/ORB
+- MGC/SWING/LSR
+- MGC/SCALP/LSR
+
+Do not remove outliers.
+
+----------------------------------------------------
+PART 19 — MONTHLY STABILITY
+----------------------------------------------------
+
+For every combination return monthly:
+
+- trades
+- win rate
+- Net R
+- expectancy
+- profit factor
+- maximum drawdown
+- long Net R
+- short Net R
+
+Classify stability:
+
+- CONSISTENT_POSITIVE
+- MIXED
+- CONSISTENT_NEGATIVE
+- INSUFFICIENT_MONTHLY_SAMPLE
+
+Return the thresholds used.
+
+Identify:
+
+- combinations positive in at least 4 of 6 months
+- combinations negative in at least 4 of 6 months
+- combinations driven by one profitable month
+- combinations that reversed behavior across the period
+
+Do not treat six months as proof of robustness.
+
+----------------------------------------------------
+PART 20 — SESSION AND TIME DIAGNOSTIC
+----------------------------------------------------
+
+For every strategy return results by:
+
+- Asia
+- London
+- New York
+- overlap
+- other/null
+- ET entry hour
+
+Return:
+
+- trades
+- win rate
+- Net R
+- expectancy
+- profit factor
+- long Net R
+- short Net R
+- average holding time
+
+Identify:
+
+- best and worst session for each strategy
+- best and worst ET hour for each strategy
+- hours with at least 20 trades and strongly negative expectancy
+- hours with at least 20 trades and positive expectancy
+- whether Monday losses concentrate in specific sessions
+- whether Thursday gains concentrate in specific sessions
+
+Do not add time filters.
+
+----------------------------------------------------
+PART 21 — VOLATILITY-REGIME DIAGNOSTIC
+----------------------------------------------------
+
+Use the stored volatility-regime breakdowns and reconstruct additional detail
+where possible.
+
+For every strategy return results by regime:
+
+- LOW
+- NORMAL
+- HIGH
+- EXTREME
+- unknown/null
+
+Return:
+
+- trades
+- win rate
+- Net R
+- expectancy
+- profit factor
+- average stop distance
+- average holding time
+- long Net R
+- short Net R
+
+Identify:
+
+- strategies that only work in one regime
+- strategies that fail in high volatility
+- strategies that fail in low volatility
+- MGC-versus-equity differences
+- ORB target-hit behavior by regime
+- LSR reversal behavior by regime
+
+Do not change volatility thresholds.
+
+----------------------------------------------------
+PART 22 — DATASET AND CONTRACT CONTEXT
+----------------------------------------------------
+
+For each dataset return:
+
+- symbol
+- dataset ID
+- date range
+- bar count
+- gap count
+- largest gap
+- continuous-contract symbol policy
+- known roll transitions
+- whether a contract identifier is stored per bar
+- whether a contract identifier is stored per trade
+- whether trades crossed roll boundaries
+- whether ATR spikes appear near roll transitions
+- whether extreme trades cluster near roll transitions
+
+If contract IDs are not stored, state that clearly.
+
+Do not redownload Databento data.
+
+----------------------------------------------------
+PART 23 — REPRESENTATIVE TRADE CASES
+----------------------------------------------------
+
+For each strategy select:
+
+- 3 representative winners
+- 3 representative losses
+- 2 long examples
+- 2 short examples
+- 1 unusual or extreme example
+
+For each case return:
+
+- instrument
+- mode
+- direction
+- signal timestamp
+- entry timestamp
+- entry price
+- stop
+- target
+- exit timestamp
+- exit price
+- exit reason
+- realized R
+- holding time
+- session
+- ET hour
+- weekday
+- month
+- volatility regime
+- relevant reconstructed setup context
+- why this case is representative
+
+Do not choose examples only from the best instrument.
+
+----------------------------------------------------
+PART 24 — FINDINGS BY STRATEGY
+----------------------------------------------------
+
+For each strategy write a plain-English diagnostic summary with:
+
+1. What the strategy was designed to capture
+2. What it actually captured in this baseline
+3. Where it performed best
+4. Where it performed worst
+5. Long-versus-short behavior
+6. Instrument dependence
+7. Mode dependence
+8. Session dependence
+9. Volatility dependence
+10. Monthly stability
+11. Cost sensitivity
+12. Trade-frequency behavior
+13. Tail dependence
+14. Main reason for positive results
+15. Main reason for negative results
+16. What remains unknown due to missing stored fields
+
+Do not recommend parameter changes.
+
+----------------------------------------------------
+PART 25 — CROSS-STRATEGY FINDINGS
+----------------------------------------------------
+
+Answer:
+
+- Which strategy is most consistent across instruments?
+- Which is most instrument-dependent?
+- Which is most direction-dependent?
+- Which is most regime-dependent?
+- Which is most cost-sensitive?
+- Which generates the highest trade frequency?
+- Which has the worst loss clustering?
+- Which depends most on outlier winners?
+- Which shows the best evidence of repeatable positive expectancy?
+- Which shows the weakest evidence?
+- Are multiple strategies identifying the same market events?
+- Are positive results concentrated in MGC?
+- Are negative results concentrated in equity-index shorts?
+- Is the baseline suitable for learning now?
+
+Use descriptive evidence only.
+
+Do not promote or demote strategies.
+
+----------------------------------------------------
+PART 26 — READINESS CLASSIFICATION
+----------------------------------------------------
+
+Return one:
+
+STRATEGY_DIAGNOSTICS_CLEAN
+
+STRATEGY_DIAGNOSTICS_USABLE_WITH_WARNINGS
+
+STRATEGY_DIAGNOSTICS_REQUIRES_FURTHER_AUDIT
+
+STRATEGY_DIAGNOSTICS_INVALID_BASELINE
+
+Use REQUIRES_FURTHER_AUDIT if any of the following remain unresolved:
+
+- determinism not proved
+- metric mismatch
+- impossible fills
+- duplicate trades
+- material overlap uncertainty
+- contract-roll uncertainty
+- missing causal fields needed to explain results
+- cost-model inconsistency
+- severe outlier dependence
+- data-quality concerns
+
+Do not connect this classification to live logic.
+
+----------------------------------------------------
+PART 27 — TESTS
+----------------------------------------------------
+
+Add only focused tests needed for the deterministic config-hash fix.
+
+At minimum:
+
+1. Config hash stable across repeated runs
+2. Config hash stable across different set insertion orders
+3. Config snapshot values unchanged
+4. Simulation engine source unchanged apart from allowed deterministic snapshot fix
+5. Existing stored baseline remains unchanged
+6. Representative combination determinism — MGC/SWING/LSR
+7. Representative combination determinism — MES/SWING/ORB
+8. Representative combination determinism — MNQ/SCALP/OD
+9. Representative combination determinism — MYM/SCALP/VTC
+
+Do not add a large new test framework for the analysis report.
+
+Do not add database migrations except the already-created
+bt_baseline_migrations.sql.
+
+----------------------------------------------------
+PART 28 — REGRESSION VALIDATION
+----------------------------------------------------
+
+Run separately:
+
+- new deterministic-config tests
+- Phase 6B.1 baseline tests
+- Phase 6B.0 acquisition/import tests
+- Phase 6A.1 parity tests
+- historical import tests
+- ORB adapter tests
+- coverage audit tests
+- Stop Parity tests
+- Decision Quality tests
+- Strategy Scan tests
+- all other backtest-related tests
+- all four golden workflows
+- node --check on served dashboard JavaScript
+
+Report each suite separately.
+
+Do not call this the full repository suite unless the full repository suite is
+actually run.
+
+----------------------------------------------------
+PART 29 — GIT AND COMMIT
+----------------------------------------------------
+
+The only expected source change is the deterministic config snapshot fix and its
+focused tests.
+
+Do not commit:
+
+- analysis exports
+- database dumps
+- raw trades
+- market data
+- task attachments
+- temporary scripts
+- secrets
+
+Suggested commit message:
+
+Make baseline configuration hashing deterministic
+
+Return:
+
+- starting HEAD
+- ending commit
+- exact files committed
+- final git status
+- untracked files
+- task attachment status
+- test totals
+
+If no source change is needed, do not create an empty commit.
+
+----------------------------------------------------
+PART 30 — FINAL REPORT
+----------------------------------------------------
+
+Return:
+
+1. Branch
+2. Starting HEAD
+3. Ending commit
+4. Actual baseline ID
+5. Source commit
+6. Config hash
+7. Determinism status
+8. Matrix count
+9. Trade count
+10. Breakdown count
+11. Risk-model classification
+12. Strategy-level summary table
+13. Full 40-combination table
+14. Long-versus-short diagnosis
+15. Opening Drive diagnosis
+16. Liquidity Sweep Reversal diagnosis
+17. VWAP Trend Continuation diagnosis
+18. Range Expansion Breakout diagnosis
+19. Opening Range Breakout diagnosis
+20. Exit-reason findings
+21. Cost-drag findings
+22. Frequency findings
+23. Loss-cluster findings
+24. Tail-dependence findings
+25. Monthly-stability findings
+26. Session/time findings
+27. Volatility-regime findings
+28. Contract-roll findings
+29. Representative trade cases
+30. Cross-strategy conclusions
+31. Missing-data limitations
+32. Test results
+33. Golden workflow results
+34. Protected-boundary verification
+35. Code-change summary
+36. Baseline-mutation confirmation
+37. Readiness classification
+38. Most important next investigation
+39. Final status
+
+Final status must be exactly one:
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_COMPLETE
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_COMPLETE_WITH_WARNINGS
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_BLOCKED
+
+After returning the report, stop.
+
+DO NOT START PHASE 6B.2.
+
+DO NOT START PHASE 6C.
+
+DO NOT OPTIMIZE ANY STRATEGY.
+
+DO NOT FEED THIS BASELINE INTO LEARNING.

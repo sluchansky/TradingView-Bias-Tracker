@@ -155,8 +155,8 @@ def _freeze_config(commit: str) -> Tuple[Dict, str]:
         "opening_range_build_min": bt.OPENING_RANGE_BUILD_MIN,
         "opening_drive_end_et":    bt.OPENING_DRIVE_END_ET,
         "vwap_reset_et":    bt.VWAP_RESET_ET,
-        "valid_symbols":    list(bt.VALID_SYMBOLS),
-        "valid_timeframes": list(bt.VALID_TIMEFRAMES),
+        "valid_symbols":    sorted(bt.VALID_SYMBOLS),
+        "valid_timeframes": sorted(bt.VALID_TIMEFRAMES),
         "timeframe":        "5m",
         "timezone_policy":  "UTC storage; ET session detection via pytz America/New_York",
         "roll_policy":      ("Databento continuous front contract; stype_in='continuous'; "
