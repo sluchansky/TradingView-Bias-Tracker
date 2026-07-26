@@ -1,0 +1,203 @@
+CONTINUE FROM THE EXACT TRUNCATION POINT IN SECTION 5C
+
+Do not repeat Sections 1–5B.
+
+Do not rerun commands.
+
+Do not change code.
+
+Do not create a commit.
+
+Continue immediately after:
+
+5C — Active Losing Long
+management_...
+
+Finish the complete existing report through Section 20.
+
+Because repeated output truncation is occurring, keep all remaining content
+compact.
+
+Use concise tables and omit explanatory prose that repeats prior sections.
+
+REQUIRED REMAINING CONTENT
+
+5C — finish Losing Long
+
+5D — Profitable Short
+
+5E — Losing Short
+
+5F — Missing Inputs
+
+5G — Internal Exception
+
+6 — Active-Trade Data Sources
+
+For this section, group fields into only three compact tables:
+
+- Fully available
+- Conditionally available
+- Not currently available
+
+Include exact source and fallback.
+
+7 — Original-Thesis Integrity
+
+Clearly state:
+
+- true entry-time snapshot fields
+- reconstructed fields
+- unavailable fields
+
+8 — Execution-Isolation Proof
+
+Return only:
+
+Scenario count:
+Pre-existing fields compared:
+Mismatch count:
+Exact mismatches:
+Expected diagnostic-only differences:
+Final parity conclusion:
+
+9 — Orchestrator Failure Isolation
+
+List the five orchestrator tests by exact name and PASS/FAIL.
+
+State whether:
+
+- existing Right Brain data is preserved
+- exceptions escape full_analysis
+- modules can overwrite each other
+- empty right_brain appears when disabled
+
+10 — Dashboard Validation
+
+Return:
+
+Panel location:
+Duplicate panel:
+Flat-state rendering:
+Active-state rendering:
+Shadow warning:
+Browser console errors:
+Layout issues:
+Screenshot result:
+
+11 — Test Inventory
+
+Do not list all 47 tests individually unless necessary.
+
+Group them by category and show counts.
+
+Separately list the five new orchestrator test names.
+
+12 — Regression Results
+
+Use one compact table:
+
+Suite | Passed | Failed | Skipped | Classification
+
+Identify every new failure and every known pre-existing failure.
+
+13 — Golden Workflows
+
+Return only PASS/FAIL for:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+
+14 — Databento Smoke Test
+
+Return:
+
+Initialization:
+Primary-feed status:
+Subscriptions:
+Duplicate subscriptions:
+Reconnect loop:
+Timestamp freshness:
+Market-closed behavior:
+Replay/live isolation:
+Outbound-order evidence:
+Result:
+
+15 — Production Revision and Deployment Decision
+
+Return exactly:
+
+Source HEAD:
+Deployed revision:
+Revision match:
+Feature present in production:
+Flag currently enabled:
+Environment reload required:
+Deployment required:
+Exact action required:
+Safe to enable tonight:
+Blocker:
+
+16 — Final Git State
+
+Return:
+
+git status --short:
+git diff --check:
+tracked task attachments:
+final HEAD:
+
+17 — Known Limitations
+
+Maximum 8 concise items.
+
+Explicitly address:
+
+- missing live inputs
+- original-thesis completeness
+- score extremes of 0 and 100
+- management confidence behavior
+- feature default OFF
+- shadow-only limitation
+
+18 — Blocking Issues
+
+19 — Non-Blocking Warnings
+
+20 — Final Classifications
+
+Use exactly one Phase status:
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_COMPLETE
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_COMPLETE_WITH_WARNINGS
+
+PHASE_6B2_RIGHT_BRAIN_TRADE_MANAGEMENT_BLOCKED
+
+Use exactly one market status:
+
+MARKET_OPEN_READY
+
+MARKET_OPEN_READY_WITH_WARNINGS
+
+MARKET_OPEN_NOT_READY
+
+FINAL DIRECT ANSWERS
+
+Also answer these six questions with YES/NO and one sentence each:
+
+1. Is the exact tested revision deployed?
+
+2. Can the feature be enabled without another source change?
+
+3. Has ON/OFF parity been proven with zero non-diagnostic mismatches?
+
+4. Can any recommendation currently alter an order, stop, target, or quantity?
+
+5. Is there any blocker to display-only activation tonight?
+
+6. What exact action must be taken to activate it?
+
+After returning the report, stop.
