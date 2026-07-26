@@ -1,0 +1,85 @@
+Before proceeding, return the complete Phase 6B.1B final diagnostic report.
+
+Do not start any new phase.
+
+Do not optimize strategies.
+
+Do not modify learning.
+
+Do not make additional code changes unless required to accurately report the work already completed.
+
+Your response must include:
+
+1. Branch
+2. Starting HEAD
+3. Ending commit
+4. Exact files changed
+5. Actual baseline ID
+6. Stored source commit
+7. Stored configuration hash
+8. Determinism fix made
+9. Determinism test results
+10. Representative rerun comparison results
+11. Matrix count
+12. Trade count
+13. Breakdown count
+14. Risk-model classification
+15. Strategy-level aggregate table
+16. Full 40-combination results or a clearly formatted attached report containing them
+17. Long-versus-short diagnosis
+18. Opening Drive diagnosis
+19. Liquidity Sweep Reversal diagnosis
+20. VWAP Trend Continuation diagnosis
+21. Range Expansion Breakout diagnosis
+22. Opening Range Breakout diagnosis
+23. Exit-reason findings
+24. Cost-drag findings
+25. Trade-frequency findings
+26. Loss-cluster findings
+27. Outlier and tail-dependence findings
+28. Monthly stability findings
+29. Session and ET-hour findings
+30. Volatility-regime findings
+31. Contract-roll findings
+32. Duplicate and overlap findings, if evaluated
+33. Missing-data limitations
+34. Exact test-suite results, listed separately
+35. Exact pre-existing unrelated test failure
+36. Golden workflow results
+37. Protected-boundary verification
+38. Confirmation that the stored baseline was not changed
+39. Final readiness classification
+40. Most important next investigation
+
+Also return:
+
+- git status --short
+- git diff --check
+- git show --stat --oneline HEAD
+- git show --name-only --format="" HEAD
+- confirmation that no task attachments, reports, market data, database dumps,
+  raw trade exports, or temporary scripts were committed
+
+Clearly distinguish:
+
+- tests added in this task
+- backtest-related tests
+- unrelated existing tests
+- the pre-existing dynamic-stop failure
+
+Do not describe 202 passing backtest tests as the full repository suite unless the
+full repository suite was actually run.
+
+End with exactly one:
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_COMPLETE
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_COMPLETE_WITH_WARNINGS
+
+PHASE_6B_STRATEGY_DIAGNOSTICS_BLOCKED
+
+After returning the report, stop.
+
+DO NOT START PHASE 6B.2.
+
+DO NOT START PHASE 6C.
