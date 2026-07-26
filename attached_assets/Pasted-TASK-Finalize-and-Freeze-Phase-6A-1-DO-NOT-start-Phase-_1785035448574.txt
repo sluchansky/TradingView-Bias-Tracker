@@ -1,0 +1,292 @@
+TASK: Finalize and Freeze Phase 6A.1
+
+DO NOT start Phase 6B yet.
+
+The implementation and focused validation appear complete.
+
+Return the final Phase 6A.1 closure report and commit state only.
+
+----------------------------------------------------
+PART 1 — FINAL GIT STATE
+----------------------------------------------------
+
+Run:
+
+git branch --show-current
+git rev-parse HEAD
+git log -5 --oneline
+git status --short
+git diff --check
+git show --stat --oneline HEAD
+
+Return:
+
+- branch
+- starting Phase 6A HEAD
+- Phase 6A.1 ending commit hash
+- exact commit message
+- exact files committed
+- all remaining untracked files
+- confirmation task attachments were not committed
+
+----------------------------------------------------
+PART 2 — VERIFIED LIVE ORB PATH
+----------------------------------------------------
+
+Return the exact executable source path for live ORB:
+
+1. _score_opening_range_breakout()
+2. strategy selection
+3. trade-plan construction
+4. _dynamic_stop_plan()
+5. _apply_orb_target_override()
+6. final execution payload
+
+For each, return:
+
+- file
+- function
+- line number
+- relevant output
+
+Explicitly confirm:
+
+- live ORB stop is ATR-based
+- live ORB stop is not the opposite opening-range boundary
+- live ORB target is 4R
+- the separate Breakout Mode display logic is not the executable ORB stop path
+
+----------------------------------------------------
+PART 3 — HISTORICAL ORB GEOMETRY
+----------------------------------------------------
+
+Return the exact historical ORB path.
+
+Confirm:
+
+- signal occurs under bar-close replay semantics
+- entry uses the existing next-bar-open convention
+- stop uses the same ATR-based planning family as live
+- target is overridden to 4R specifically for ORB
+- the original four strategies retain their existing targets
+- no global default management behavior changed
+
+Return exact functions and line numbers.
+
+----------------------------------------------------
+PART 4 — COVERAGE CORRECTION
+----------------------------------------------------
+
+Return the current ORB object from:
+
+GET /backtest/coverage
+
+Confirm:
+
+- eligible = true
+- in_live = true
+- in_bt = true
+- has_detector = true
+- in_order = true
+- disabled = false
+- reason = null
+
+Also confirm the misleading field:
+
+"invoked": true
+
+was either removed or renamed to:
+
+"would_be_dispatched": true
+
+The endpoint must remain static registry information only.
+
+Return the updated eligible_count.
+
+----------------------------------------------------
+PART 5 — HISTORICAL DATA INFRASTRUCTURE
+----------------------------------------------------
+
+Document the existing and updated historical-data workflow.
+
+Return:
+
+- existing dataset table or storage model
+- existing import endpoint
+- existing dataset inventory endpoint
+- supported schema
+- accepted timezones
+- timestamp normalization behavior
+- duplicate handling
+- missing-interval reporting
+- OHLC validation
+- volume validation
+- instrument validation
+- fingerprinting/versioning
+- overwrite behavior
+- whether imports are owner-protected
+- whether imports affect live state
+- whether imports call Databento
+- whether imports incur any external data cost
+
+State clearly whether real historical data has actually been imported yet.
+
+Do not call synthetic candles real historical data.
+
+----------------------------------------------------
+PART 6 — TEST RESULTS
+----------------------------------------------------
+
+Report each suite separately with exact pass/fail counts:
+
+- Phase 6A.1 parity tests
+- ORB adapter tests
+- coverage audit tests
+- Decision Quality
+- Strategy Scan
+- Stop Parity
+- dataset import tests
+- every other backtest-related test
+- all four golden workflows
+
+Return the exact combined focused total.
+
+Do not call this the full repository regression unless the entire repository was
+actually run.
+
+----------------------------------------------------
+PART 7 — REQUIRED RUNTIME PROOFS
+----------------------------------------------------
+
+Return the exact test names proving:
+
+1. Live ORB stop-path source mapping
+2. Historical ORB ATR stop
+3. Historical ORB 4R target
+4. Original four strategies remain unchanged
+5. Long future-candle isolation
+6. Short future-candle isolation
+7. No-signal future-candle isolation
+8. OR-high future isolation
+9. OR-low future isolation
+10. Volume-label future isolation
+11. Confirmation-label future isolation
+12. Stop future isolation
+13. Target future isolation
+14. Day-1 OR does not leak into Day 2
+15. Day 2 uses its own OR
+16. Same-bar stop/target conflict handling
+17. Complete serialized result immutability
+18. Coverage endpoint does not launch a backtest
+19. Historical import does not alter live state
+20. Historical import does not call execution
+21. Historical import does not call Databento
+
+For each test classify the evidence as:
+
+- runtime
+- structural
+- static source proof
+
+----------------------------------------------------
+PART 8 — PRE-EXISTING FAILURES
+----------------------------------------------------
+
+If any failure is described as pre-existing:
+
+- run the exact same command against the direct parent commit
+- use the same environment
+- show the same failure there
+
+If this was not done, do not classify it as pre-existing.
+
+State instead:
+
+Not verified against parent commit.
+
+----------------------------------------------------
+PART 9 — PROTECTED BOUNDARIES
+----------------------------------------------------
+
+Confirm Phase 6A.1 did not change:
+
+- live ORB scoring conditions
+- other live strategies
+- Edge Score
+- verdicts
+- gates
+- Decision Quality
+- learning weights
+- trade sizing
+- auto-trade eligibility
+- TradersPost
+- live Databento ingestion
+- Databento subscriptions
+- Databento normalization
+- research strategy registries
+
+Return source-diff evidence and relevant runtime-test evidence.
+
+----------------------------------------------------
+PART 10 — READINESS DECISION
+----------------------------------------------------
+
+Return one of:
+
+PHASE_6B_READY
+
+or:
+
+PHASE_6B_BLOCKED
+
+PHASE_6B_READY requires:
+
+- verified historical ORB ATR stop parity
+- verified historical ORB 4R target parity
+- corrected coverage semantics
+- direct look-ahead tests passing
+- direct session-reset tests passing
+- same-bar conflict test passing
+- complete-result immutability test passing
+- usable historical-data import and inventory path
+- clean committed working tree
+
+If real historical data has not yet been imported, state:
+
+PHASE_6B_INFRASTRUCTURE_READY_DATA_PENDING
+
+That means the Phase 6B analytics system may be built, but its first meaningful
+baseline must wait for imported real market data.
+
+----------------------------------------------------
+PART 11 — FINAL REPORT
+----------------------------------------------------
+
+Return:
+
+1. Branch
+2. Starting Phase 6A commit
+3. Ending Phase 6A.1 commit
+4. Exact files changed
+5. Exact files committed
+6. Working-tree state
+7. Verified live stop
+8. Verified live target
+9. Historical stop
+10. Historical target
+11. Geometry parity status
+12. Intrabar parity status
+13. Volume parity status
+14. Coverage correction
+15. Dataset infrastructure
+16. Real datasets currently available
+17. Test counts
+18. Golden results
+19. Parent-commit failure verification
+20. Protected-boundary proof
+21. Remaining limitations
+22. Final readiness decision
+
+After returning the report, stop.
+
+DO NOT START PHASE 6B.
