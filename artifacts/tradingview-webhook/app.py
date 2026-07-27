@@ -9077,6 +9077,9 @@ RIGHT_BRAIN_MIN_PF     = float(os.getenv("RIGHT_BRAIN_MIN_PF", "1.0"))
 LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED = os.getenv(
     "LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED", "0") == "1"
 _LEFT_BRAIN_MI_BY_INST: dict = {}  # inst → latest MI block (set by _databento_bar_scan)
+_LB_MI_PERF_BY_INST:    dict = {}  # inst → timing perf stats (shadow validation Step 2)
+_LB_MI_HISTORY_BY_INST: dict = {}  # inst → deque of classification records (Steps 6/7)
+_LB_MI_WARN_TS:         dict = {}  # inst → last exception-warn epoch (rate limiter, secs)
 _RIGHT_BRAIN_STATE: dict = {
     "mode":          "training",  # "training" | "live_eligible"
     "profit_factor": 0.0,
@@ -25703,6 +25706,21 @@ def _databento_structure_trigger(inst: str, alert_type: str, price: float) -> No
         logger.error("Databento structure trigger failed (%s %s): %s", inst, alert_type, exc)
 
 
+def _dominant_direction(outlook: dict) -> str:
+    """'LONG' | 'SHORT' | 'NEUTRAL' from a directional_outlook dict.
+    Used by _databento_bar_scan to record per-bar dominant outlook in history."""
+    if not outlook:
+        return "NEUTRAL"
+    l_pts = outlook.get("long", 0)
+    s_pts = outlook.get("short", 0)
+    n_pts = outlook.get("neutral", 0)
+    if l_pts > s_pts and l_pts > n_pts:
+        return "LONG"
+    if s_pts > l_pts and s_pts > n_pts:
+        return "SHORT"
+    return "NEUTRAL"
+
+
 def _databento_bar_scan(inst: str, price: float) -> None:
     """Proactive scanner: check for a READY setup at every Databento 1m bar close.
 
@@ -25795,13 +25813,70 @@ def _databento_bar_scan(inst: str, price: float) -> None:
             # ── Left Brain Market Intelligence (Phase 1B) ─────────────────
             # Computed here (bar-close daemon thread) rather than inline in
             # full_analysis so the request thread stays fast. Flag OFF → no-op.
-            # FAIL-OPEN: any error is silently swallowed; MI is display-only.
+            # Diagnostic timing is recorded per-instrument; does NOT affect any
+            # market classification or money-path logic.
             if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+                _lbmi_t0 = time.monotonic()
                 try:
                     from left_brain_market_intelligence import compute_left_brain_mi  # noqa: PLC0415
-                    _LEFT_BRAIN_MI_BY_INST[inst] = compute_left_brain_mi(inst, a)
+                    _lbmi_result = compute_left_brain_mi(inst, a)
+                    _LEFT_BRAIN_MI_BY_INST[inst] = _lbmi_result
+                    _lbmi_rt_ms = (time.monotonic() - _lbmi_t0) * 1000.0
+
+                    # ── Per-instrument timing stats (Step 2) ──────────────
+                    _lbmi_p  = _LB_MI_PERF_BY_INST.get(inst) or {
+                        "run_count": 0, "exception_count": 0,
+                        "last_runtime_ms": None, "average_runtime_ms": None,
+                        "maximum_runtime_ms": None, "last_exception": None,
+                        "last_updated_at": None,
+                    }
+                    _lbmi_n   = _lbmi_p["run_count"] + 1
+                    _lbmi_avg = _lbmi_p.get("average_runtime_ms") or 0.0
+                    _LB_MI_PERF_BY_INST[inst] = {
+                        **_lbmi_p,
+                        "run_count":          _lbmi_n,
+                        "last_runtime_ms":    round(_lbmi_rt_ms, 2),
+                        "average_runtime_ms": round(
+                            _lbmi_avg * (_lbmi_p["run_count"] / _lbmi_n)
+                            + _lbmi_rt_ms / _lbmi_n, 2),
+                        "maximum_runtime_ms": round(
+                            max(_lbmi_p.get("maximum_runtime_ms") or 0.0,
+                                _lbmi_rt_ms), 2),
+                        "last_updated_at":    datetime.now(timezone.utc).isoformat(),
+                    }
+
+                    # ── Stability history deque (Steps 6/7) ───────────────
+                    if inst not in _LB_MI_HISTORY_BY_INST:
+                        _LB_MI_HISTORY_BY_INST[inst] = deque(maxlen=600)
+                    _LB_MI_HISTORY_BY_INST[inst].append({
+                        "ts":              _lbmi_result.get("computed_at"),
+                        "market_state":    _lbmi_result.get("market_state"),
+                        "session_char":    _lbmi_result.get("session_character"),
+                        "session_phase":   _lbmi_result.get("session_phase"),
+                        "auction_control": _lbmi_result.get("auction_control"),
+                        "confidence":      _lbmi_result.get("data_confidence"),
+                        "dominant":        _dominant_direction(
+                            _lbmi_result.get("directional_outlook") or {}),
+                    })
+
                 except Exception as _lbmi_exc:
-                    logger.debug("Left Brain MI (%s): %s", inst, _lbmi_exc)
+                    # Rate-limited exception logging (one WARNING per minute per inst)
+                    _lbmi_ep = time.monotonic()
+                    if _lbmi_ep - _LB_MI_WARN_TS.get(inst, 0.0) > 60.0:
+                        logger.warning("Left Brain MI (%s): %s", inst, _lbmi_exc)
+                        _LB_MI_WARN_TS[inst] = _lbmi_ep
+                    # Update exception counter
+                    _lbmi_p2 = _LB_MI_PERF_BY_INST.get(inst) or {
+                        "run_count": 0, "exception_count": 0,
+                        "last_runtime_ms": None, "average_runtime_ms": None,
+                        "maximum_runtime_ms": None, "last_exception": None,
+                        "last_updated_at": None,
+                    }
+                    _LB_MI_PERF_BY_INST[inst] = {
+                        **_lbmi_p2,
+                        "exception_count": _lbmi_p2["exception_count"] + 1,
+                        "last_exception":  str(_lbmi_exc)[:200],
+                    }
         except Exception as exc:
             logger.debug("Databento bar scan (%s): %s", inst, exc)
     threading.Thread(target=_scan, name=f"db-scan-{inst}", daemon=True).start()
@@ -42973,6 +43048,256 @@ def strategy_scan_diagnostics():
         "registered_total": len(STRATEGY_DEFS),
         "priority_order":   list(STRATEGY_PRIORITY),
     })
+
+
+# ── Left Brain MI shadow-validation helpers ───────────────────────────────────
+
+def _lb_compute_flip_stats(hist_list: list) -> dict:
+    """Compute classification change-frequency statistics (Step 7).
+
+    Analyses the ``market_state`` field across the per-instrument history deque.
+    All durations are in seconds.  Returns a stable dict with None values when
+    there is insufficient history."""
+    if len(hist_list) < 2:
+        return {
+            "total_changes":   0,
+            "flips_per_hour":  None,
+            "avg_duration_sec": None,
+            "min_duration_sec": None,
+            "max_duration_sec": None,
+            "aba_oscillations": 0,
+            "sample_span_bars": len(hist_list),
+        }
+
+    def _pts(ts_str: str | None):
+        if not ts_str:
+            return None
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts
+        except Exception:
+            return None
+
+    changes   = []
+    durations = []
+    run_start = _pts(hist_list[0].get("ts"))
+    prev_state = hist_list[0].get("market_state")
+
+    for rec in hist_list[1:]:
+        cur_state = rec.get("market_state")
+        cur_ts    = _pts(rec.get("ts"))
+        if cur_state != prev_state:
+            changes.append((prev_state, cur_state))
+            if cur_ts and run_start:
+                durations.append((cur_ts - run_start).total_seconds())
+            run_start  = cur_ts
+            prev_state = cur_state
+
+    aba_count = sum(
+        1 for i in range(len(changes) - 1)
+        if changes[i][0] == changes[i + 1][1] and changes[i][1] == changes[i + 1][0]
+    )
+
+    first_ts = _pts(hist_list[0].get("ts"))
+    last_ts  = _pts(hist_list[-1].get("ts"))
+    fph = None
+    if first_ts and last_ts:
+        span_h = max((last_ts - first_ts).total_seconds() / 3600.0, 1.0 / 60)
+        fph = round(len(changes) / span_h, 2)
+
+    return {
+        "total_changes":    len(changes),
+        "flips_per_hour":   fph,
+        "avg_duration_sec": round(sum(durations) / len(durations), 1) if durations else None,
+        "min_duration_sec": round(min(durations), 1) if durations else None,
+        "max_duration_sec": round(max(durations), 1) if durations else None,
+        "aba_oscillations": aba_count,
+        "sample_span_bars": len(hist_list),
+    }
+
+
+def _lb_validate_mi_output(mi: dict | None) -> dict:
+    """Run output validation checks (Step 5) on the current MI block.
+
+    Returns: {available, checks_run, errors:list[str], passed:bool}"""
+    if not mi:
+        return {"available": False, "checks_run": 0, "errors": [], "passed": True}
+
+    import math
+    errors: list[str] = []
+    checks = 0
+
+    # 1. Probability sum
+    checks += 1
+    outlook = mi.get("directional_outlook") or {}
+    total = outlook.get("long", 0) + outlook.get("short", 0) + outlook.get("neutral", 0)
+    if total != 100:
+        errors.append(f"directional_outlook sums to {total}, expected 100")
+
+    # 2. Confidence in range [0, 100]
+    checks += 1
+    conf = mi.get("data_confidence")
+    if conf is None or not isinstance(conf, (int, float)) or not (0 <= conf <= 100):
+        errors.append(f"data_confidence out of range: {conf!r}")
+
+    # 3. No NaN/Inf in outlook
+    checks += 1
+    for k, v in outlook.items():
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            errors.append(f"directional_outlook.{k} is NaN or Inf")
+
+    # 4. Canonical membership — import lazily (only when flag ON)
+    try:
+        from left_brain_market_intelligence import (  # noqa: PLC0415
+            MARKET_STATES, SESSION_CHARACTERS, SESSION_PHASES, PLAYBOOK_FAMILIES,
+        )
+        checks += 1
+        if mi.get("market_state") not in MARKET_STATES:
+            errors.append(f"invalid market_state: {mi.get('market_state')!r}")
+        checks += 1
+        if mi.get("session_character") not in SESSION_CHARACTERS:
+            errors.append(f"invalid session_character: {mi.get('session_character')!r}")
+        checks += 1
+        if mi.get("session_phase") not in SESSION_PHASES:
+            errors.append(f"invalid session_phase: {mi.get('session_phase')!r}")
+        checks += 1
+        pbs = mi.get("suitable_playbooks") or []
+        if len(pbs) != len(set(pbs)):
+            errors.append(f"duplicate playbooks: {pbs}")
+    except ImportError:
+        pass  # should not happen when flag ON
+
+    # 5. Timestamp parseable
+    checks += 1
+    ts = mi.get("computed_at")
+    if ts:
+        try:
+            datetime.fromisoformat(ts)
+        except Exception:
+            errors.append(f"invalid computed_at timestamp: {ts!r}")
+
+    # 6. Instrument present
+    checks += 1
+    if not mi.get("instrument"):
+        errors.append("instrument field missing or empty")
+
+    return {"available": True, "checks_run": checks,
+            "errors": errors, "passed": len(errors) == 0}
+
+
+@app.route("/lb-vwap-authority", methods=["GET"])
+def lb_vwap_authority():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Returns per-instrument VWAP source-authority diagnostics (Step 4 of the
+    Phase 1B shadow validation).  DISPLAY / RESEARCH-ONLY — never reads from
+    or writes to the gate, scoring, or execution path."""
+    result = {}
+    for _inst in ("MGC", "MNQ", "MES", "MYM"):
+        try:
+            diag      = get_vwap_diagnostics(_inst)
+            db_val    = diag.get("databento_vwap_value")
+            ch_val    = diag.get("chart_vwap_value")
+            result[_inst] = {
+                **diag,
+                "price_diff_between_sources": (
+                    round(abs(db_val - ch_val), 4)
+                    if db_val is not None and ch_val is not None else None
+                ),
+            }
+        except Exception as _exc:
+            result[_inst] = {"error": str(_exc)[:120]}
+    return jsonify({
+        "ok":        True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instruments": result,
+    })
+
+
+@app.route("/lb-shadow-report", methods=["GET"])
+def lb_shadow_report():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Full Left Brain Market Intelligence shadow validation report (Steps 4–7 of
+    the Phase 1B validation spec).  Includes per-instrument timing, stability
+    distribution, flip-rate stats, output-validation, and VWAP authority.
+    DISPLAY / RESEARCH-ONLY — never mutates scoring, gate, or execution state.
+    Requires LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1 to have meaningful data."""
+    from collections import Counter  # noqa: PLC0415
+
+    report: dict = {
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "flag_enabled":  LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED,
+        "instruments":   {},
+    }
+
+    for _inst in ("MGC", "MNQ", "MES", "MYM"):
+        perf     = _LB_MI_PERF_BY_INST.get(_inst) or {}
+        hist     = list(_LB_MI_HISTORY_BY_INST.get(_inst, []))
+        cur_mi   = _LEFT_BRAIN_MI_BY_INST.get(_inst)
+
+        # ── Classification distribution (Step 6) ──────────────────────────
+        ms_cnt   = Counter()
+        sc_cnt   = Counter()
+        sp_cnt   = Counter()
+        ac_cnt   = Counter()
+        dd_cnt   = Counter()
+        conf_lt40 = conf_40_69 = conf_ge70 = stale_count = 0
+
+        for rec in hist:
+            ms_cnt[rec.get("market_state")]    += 1
+            sc_cnt[rec.get("session_char")]    += 1
+            sp_cnt[rec.get("session_phase")]   += 1
+            ac_cnt[rec.get("auction_control")] += 1
+            dd_cnt[rec.get("dominant")]        += 1
+            c = rec.get("confidence")
+            if c is not None:
+                if c < 40:
+                    conf_lt40  += 1
+                    stale_count += 1
+                elif c < 70:
+                    conf_40_69 += 1
+                else:
+                    conf_ge70  += 1
+
+        avg_conf = (
+            round(sum(r["confidence"] for r in hist if r.get("confidence") is not None)
+                  / max(1, sum(1 for r in hist if r.get("confidence") is not None)), 1)
+            if hist else None
+        )
+
+        dist = {
+            "market_state":         dict(ms_cnt),
+            "session_character":    dict(sc_cnt),
+            "session_phase":        dict(sp_cnt),
+            "auction_control":      dict(ac_cnt),
+            "dominant_direction":   dict(dd_cnt),
+            "confidence_below_40":  conf_lt40,
+            "confidence_40_to_69":  conf_40_69,
+            "confidence_70_plus":   conf_ge70,
+            "average_confidence":   avg_conf,
+            "stale_data_results":   stale_count,
+            "exceptions":           perf.get("exception_count", 0),
+        }
+
+        # ── VWAP authority (Step 4) ────────────────────────────────────────
+        vwap_auth = None
+        try:
+            vwap_auth = get_vwap_diagnostics(_inst)
+        except Exception:
+            pass
+
+        report["instruments"][_inst] = {
+            "timing":            perf,
+            "sample_count":      len(hist),
+            "current_mi":        cur_mi,
+            "distribution":      dist,
+            "flip_stats":        _lb_compute_flip_stats(hist),
+            "output_validation": _lb_validate_mi_output(cur_mi),
+            "vwap_authority":    vwap_auth,
+        }
+
+    return jsonify(report)
 
 
 @app.route("/eval-metrics", methods=["GET"])

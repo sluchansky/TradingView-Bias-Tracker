@@ -252,6 +252,12 @@ export const BOT1_ROUTES = [
   // Returns STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER (last-scan snapshot per ticker).
   // Never triggers strategy evaluation or mutates any scoring/production state.
   "/strategy-scan-diagnostics",
+  // Phase 1B shadow validation: Left Brain Market Intelligence.
+  // VWAP source-authority diagnostics per instrument (GET only, read-only).
+  "/lb-vwap-authority",
+  // Full Left Brain MI shadow report: timing, classification distribution,
+  // flip-rate stats, output validation, VWAP authority. Display-only.
+  "/lb-shadow-report",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.
