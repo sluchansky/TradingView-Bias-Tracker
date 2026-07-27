@@ -1,0 +1,282 @@
+Your diagnosis is directionally correct, especially regarding:
+
+- sequential full_analysis latency
+- missing session/day classification
+- weak daily context
+- inadequate trade-location reasoning
+- SWING behaving substantially like scalp logic with wider parameters
+
+However, do not implement the proposed gauge change or performance changes yet.
+
+We will begin with Phase 1A and then Phase 1B.
+
+====================================================
+PHASE 1A — DATA FLOW AND DECISION LATENCY AUDIT
+====================================================
+
+OBJECTIVE
+
+Measure why direct Databento data does not feel direct to the user.
+
+Do not optimize yet.
+
+Do not change strategy behavior.
+
+Do not change the dashboard gauge.
+
+Do not deploy.
+
+1. CONFIRM THE ACTUAL DATABENTO INPUT TYPE
+
+For each production subscription report:
+
+- schema
+- dataset
+- event type
+- trades, quotes, MBP, OHLCV or another format
+- event frequency
+- whether updates arrive intrabar
+- whether analysis consumes every event
+- whether analysis only consumes completed one-minute bars
+
+Do not describe completed one-minute bars as tick-level processing.
+
+2. INSTRUMENT THE COMPLETE PATH
+
+Capture monotonic timestamps for:
+
+T0 Databento event received
+T1 symbol normalized
+T2 live state updated
+T3 VWAP updated
+T4 delta/CVD updated
+T5 structure state updated
+T6 strategy evaluation begins
+T7 strategy evaluation completes
+T8 full_analysis begins
+T9 full_analysis completes
+T10 status snapshot published
+T11 dashboard request receives snapshot
+T12 dashboard render completes, where measurable
+
+For each stage return:
+
+- median
+- p95
+- maximum
+- update count
+- stale count
+- dropped or skipped count
+
+Measure separately for MNQ, MGC, MES and MYM.
+
+3. PROFILE FULL_ANALYSIS
+
+List every module called by full_analysis in execution order.
+
+For each module report:
+
+- average runtime
+- p95 runtime
+- whether it performs database I/O
+- whether it recalculates unchanged data
+- whether it is instrument-specific
+- whether it is required for live directional display
+- whether it may safely use cached data
+- whether it is legacy or diagnostics-only
+
+Confirm or refute the claimed 300–500 ms runtime with measurements.
+
+4. IDENTIFY THE NONE-STATE FAILURE
+
+Trace why the system could display:
+
+price=None
+vwap=None
+
+while Databento was connected and subscribed.
+
+Determine whether this resulted from:
+
+- one-minute warm-up
+- insufficient VWAP history
+- symbol mapping
+- stale cache
+- startup ordering
+- separate state objects
+- TradingView-era dependency
+- dashboard serialization
+- another verified cause
+
+Provide code-level evidence.
+
+5. FAST-PATH DESIGN ONLY
+
+After measurement, propose a design separating:
+
+INTRABAR FAST STATE
+
+- latest price
+- VWAP relationship
+- delta/CVD movement
+- momentum
+- sweep activity
+- distance from important levels
+- provisional directional development
+
+CONFIRMED BAR STATE
+
+- candle confirmation
+- completed-bar structure
+- confirmed BOS/CHOCH
+- completed-pattern rules
+- final readiness gates
+
+The fast state may report FORMING only.
+
+It must never produce READY without the existing confirmed gates.
+
+Do not implement until the audit is reviewed.
+
+====================================================
+PHASE 1B — LEFT BRAIN MARKET INTELLIGENCE DESIGN
+====================================================
+
+The Market Thesis belongs inside the existing Left Brain.
+
+Do not create another panel.
+
+Do not create a third brain.
+
+The Left Brain should continuously describe:
+
+- market regime
+- session character
+- price location
+- buyer/seller control
+- data confidence
+- directional outlook
+- suitable playbooks
+- supporting evidence
+- missing evidence
+- what would change the thesis
+
+The Right Brain remains dedicated to active-trade management.
+
+The strategy engine remains downstream.
+
+Target architecture:
+
+Databento
+    ↓
+Live Market State
+    ↓
+LEFT BRAIN MARKET INTELLIGENCE
+    ↓
+Playbook Ranking
+    ↓
+Strategy Evaluation
+    ↓
+Gate
+    ↓
+RIGHT BRAIN TRADE MANAGEMENT
+
+During Phase 1B, Left Brain output remains observational only.
+
+It must not modify:
+
+- strategy scores
+- gate behavior
+- readiness
+- learning
+- stops
+- targets
+- quantity
+- TradersPost
+- execution
+
+====================================================
+GAUGE REQUIREMENT
+====================================================
+
+Do not display the dominant raw edge score as a probability.
+
+Preserve the existing gauge until a properly defined output is approved.
+
+Design separate future metrics:
+
+1. Directional outlook
+   Long / Short / Neutral
+
+2. Setup maturity
+   How complete the best setup is
+
+3. Entry readiness
+   Whether the entry location and confirmation are sufficient
+
+4. Data confidence
+   Whether the evidence is complete and fresh
+
+Raw edge score may remain visible as a diagnostic, but it must not be labeled
+as probability unless it has been calibrated and validated historically.
+
+====================================================
+STRATEGY INVENTORY
+====================================================
+
+Return an exact strategy inventory.
+
+For the claimed:
+
+- approximately 16 scalp research strategies
+- 6 live edge components
+- 3 swing archetypes
+- breakout, dual-timeframe and MI overlays
+
+identify each exact name, file, function and production status.
+
+Classify each as:
+
+ACTIVE_LIVE
+ACTIVE_SHADOW
+REGISTERED_INACTIVE
+OVERLAY
+LEGACY
+DUPLICATE
+DEAD_CODE
+
+Explain how many genuinely independent strategy engines are analyzed during a
+normal production cycle.
+
+====================================================
+FINAL RESPONSE
+====================================================
+
+Return:
+
+1. Databento subscription truth
+2. Intrabar versus bar-close behavior
+3. Complete latency measurements
+4. full_analysis module profile
+5. root cause of price/VWAP None
+6. exact live strategy count
+7. strategy classification
+8. proposed fast-path architecture
+9. Left Brain Phase 1B architecture
+10. expected performance improvements
+11. risks
+12. files that would need modification
+13. tests required
+14. recommended implementation sequence
+
+Do not edit production behavior.
+
+Do not deploy.
+
+Final status must be exactly one:
+
+PHASE_1A_AUDIT_COMPLETE
+
+PHASE_1A_AUDIT_COMPLETE_WITH_FINDINGS
+
+PHASE_1A_AUDIT_BLOCKED
