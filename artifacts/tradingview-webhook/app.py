@@ -7248,6 +7248,13 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
     strong_threshold     = cfg("EDGE_STRONG_THRESHOLD")       # label-only "Strong" upgrade
     setup_building_threshold = cfg("EDGE_SETUP_BUILDING_THRESHOLD")  # informational band floor (None=off)
+    # MYM/MES need stronger confirmation — their Pine scripts fire on smaller moves so
+    # VWAP + volume + session alone can reach the generic 60 floor. Raise to 75 so at
+    # minimum BOS/CHOCH + one more signal is required. Env override still works via the
+    # cfg() system for either instrument if the operator wants to tune further.
+    if inst in ("MYM", "MES"):
+        ready_threshold      = max(int(ready_threshold      or 0), 75)
+        full_ready_threshold = max(int(full_ready_threshold or 0), 75)
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
     require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
     require_zone      = bool(cfg("GATE_REQUIRE_ZONE"))
@@ -7277,12 +7284,19 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "volume_confirmed": volume_confirmed, "cvd_confirmed": cvd_confirmed_short,
                 "preferred_session": session_pref}
 
+    # FVG state for the instrument — computed once here, captured by the closure below.
+    # Fail-open: returns all-False on any error or no alerts so default behaviour is
+    # unchanged when no FVG alerts are present. DISPLAY-ONLY ancestry (analyst layer)
+    # but the soft-modifier penalty below promotes it to an Edge Score adjustment.
+    _fvg_inst = _recent_smc_signals(inst)
+
     def _edge_modifiers(direction):
         """SOFT negative Edge penalties for `direction` (SCALP only; SWING returns []
         because GATE_SOFT_MODIFIERS is False). cooldown_active -5 (a repeat signal
         inside the dedup window), location mismatch -5 (price not near VWAP nor the
         trade-side zone), CVD conflict -10 (delta opposes the trade — ONLY when CVD is
-        not a hard veto). These nudge the Edge Score but NEVER hard-block. The list is
+        not a hard veto), opposing FVG -10 (unfilled gap in the opposing direction acts
+        as a price magnet). These nudge the Edge Score but NEVER hard-block. The list is
         stamped into gate_debug so the display layer reuses the EXACT same modifiers
         (gate score == shown Edge Score)."""
         if not soft_modifiers:
@@ -7296,6 +7310,13 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             mods.append({"label": "CVD conflict", "points": -10})
         if cooldown_active:
             mods.append({"label": "Cooldown (repeat signal)", "points": -5})
+        # Opposing Fair-Value Gap: an unfilled gap in the opposing direction is a magnet
+        # that pulls price back — penalises the same magnitude as CVD conflict (-10).
+        # Fail-open: _fvg_inst is all-False when no FVG alerts → no penalty added.
+        if direction == "Long" and _fvg_inst.get("fvg_short"):
+            mods.append({"label": "Opposing FVG (bearish gap)", "points": -10})
+        elif direction == "Short" and _fvg_inst.get("fvg_long"):
+            mods.append({"label": "Opposing FVG (bullish gap)", "points": -10})
         return mods
 
     def _edge_raw(direction):
@@ -7360,7 +7381,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     long_score           = _edge_for("Long")[0]
     short_score          = _edge_for("Short")[0]
     conflict_gap         = abs(long_score - short_score)
-    dominant_direction   = "Long" if long_score >= short_score else "Short"
+    dominant_direction   = ("Neutral" if long_score == short_score
+                            else ("Long" if long_score > short_score else "Short"))
     score_aware_conflict = bool(cfg("CONFLICT_SCORE_AWARE"))
     conflict_wait_gap    = int(cfg("CONFLICT_WAIT_GAP"))
     if opposing_present and score_aware_conflict:
@@ -7762,7 +7784,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     #    standing aside. SWING never reaches here (true_conflict already returned
     #    WAIT above when opposing_present). ──
     if opposing_present and not true_conflict and score_aware_conflict:
-        candidate = dominant_direction
+        # Only commit to the dominant side when it's a real direction — "Neutral"
+        # (equal scores) means neither side has a real edge advantage, so keep the
+        # cand_key-selected candidate instead of overwriting with "Neutral".
+        if dominant_direction in ("Long", "Short"):
+            candidate = dominant_direction
 
     blk = directions[candidate]
     if blk["ready"]:

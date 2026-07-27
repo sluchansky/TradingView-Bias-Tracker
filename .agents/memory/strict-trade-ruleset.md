@@ -5,6 +5,24 @@ description: Non-obvious constraints behind the MNQ/MGC strict checklist verdict
 
 # Strict trade recommendation ruleset (artifacts/tradingview-webhook/app.py)
 
+## Per-instrument READY floor overrides
+- **MYM/MES**: READY floor raised to **75** (vs generic SCALP 60). Their Pine scripts fire on small moves so VWAP+volume+session alone (score 40) could previously reach 60. At 75 they need BOS/CHOCH + at least one more component. Goldens reblessed 2026-07-27.
+- **Why**: repeated "90% ready" calls on barely-moving MYM market; Pine sensitivity higher on Micro Dow than Nano.
+- **How to apply**: override is in `evaluate_strict_setup` immediately after threshold reads — `max(int(ready_threshold), 75)` when `inst in ("MYM","MES")`.
+
+## dominant_direction can be "Neutral"
+- When `long_score == short_score`, `dominant_direction = "Neutral"` (previously Long won the tie via `>=`).
+- JS side already guarded with `dom!=='Neutral'` at the key `d.directions[dom]` access points.
+- Python side: `candidate = dominant_direction` line is guarded with `if dominant_direction in ("Long","Short")`.
+- **Why**: no real directional signal when both scores are equal (e.g. no live data → both score session-only). Dashboard was showing "Long" as candidate when there was zero directional basis.
+
+## Opposing FVG soft modifier (-10)
+- SCALP only (soft_modifiers=True path). `_fvg_inst = _recent_smc_signals(inst)` computed once before `_edge_modifiers`, captured by closure.
+- `BEARISH FVG` active + Long direction → -10 "Opposing FVG (bearish gap)".
+- `BULLISH FVG` active + Short direction → -10 "Opposing FVG (bullish gap)".
+- Fail-open: `_fvg_inst` returns all-False when no FVG alerts → no penalty. Goldens unaffected (no FVG alerts in golden alert history).
+- **Why**: unfilled gap in opposing direction is a price magnet; penalises same magnitude as CVD conflict.
+
 The strict checklist evaluator is the **authoritative** verdict source inside `full_analysis`
 (`evaluate_strict_setup` → `build_strict_trade_plan`). It replaced the old confidence-gate /
 verdict-mapping block. Any future change to the final LONG/SHORT/WAIT decision must flow through
