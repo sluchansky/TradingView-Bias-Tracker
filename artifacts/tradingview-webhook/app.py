@@ -25498,6 +25498,20 @@ def _databento_structure_trigger(inst: str, alert_type: str, price: float) -> No
             " (dup \u2014 cooldown %.0fs)" % cooldown_remaining_ms
             if is_duplicate and cooldown_remaining_ms else "",
         )
+        # ── Immediate bar scan ─────────────────────────────────────────────────
+        # Also fire a full_analysis scan NOW so a READY setup is caught on this
+        # signal instead of waiting up to 60 s for the next 1m bar close.
+        # Spawned in its own daemon thread so the Databento feed thread stays free.
+        # AUTO_FIRED_KEYS dedup prevents double auto-execute even if the webhook
+        # worker finishes first.  Skipped on duplicates (cooldown still active =
+        # we recently ran a scan for this signal type already).
+        if not is_duplicate:
+            threading.Thread(
+                target=_databento_bar_scan,
+                args=(inst, price),
+                name=f"sig-scan-{inst}",
+                daemon=True,
+            ).start()
     except Exception as exc:
         logger.error("Databento structure trigger failed (%s %s): %s", inst, alert_type, exc)
 
@@ -42864,6 +42878,11 @@ AUTO_TRADE_SETTINGS_HTML = """<!DOCTYPE html>
 <div class="sub">Per-instrument safety limits for AUTO execution &middot; saved limits persist across restarts &amp; republish &middot; <span id="updated" class="muted"></span></div>
 <div class="banner" id="banner"></div>
 <div class="grid" id="cards"><div class="muted" style="font-size:12px">Loading&hellip;</div></div>
+<div style="margin:8px 0 16px;padding:10px 14px;background:#080f14;border:1px solid #1a2e38;border-radius:8px;display:flex;align-items:center;gap:12px">
+  <span style="font-size:11px;color:#7c93a0;font-weight:600;text-transform:uppercase;letter-spacing:.5px">Auto-Fire Dedup</span>
+  <button onclick="clearFiredKeys()" style="font-size:11px;padding:5px 14px;border-radius:6px;border:1px solid #2a4040;background:#0b2833;color:#7fe9f5;cursor:pointer;font-weight:600" title="Clears the same-day fired-key cache so READY setups that already auto-fired can re-fire. Use after a redeploy when setups are being skipped.">&#128465; Clear Fired Keys</button>
+  <span id="cfk-msg" style="font-size:11px;color:#94a3b8"></span>
+</div>
 <div class="chat-card">
   <h2>&#128172; Ask the assistant</h2>
   <div class="chat-sub">Read-only Q&amp;A about these safety limits, arming and the live bot. It explains and suggests &mdash; it never changes settings or places trades. To apply anything, use the forms above.</div>
@@ -42979,6 +42998,10 @@ function toggleKill(i, v){
   if(!v && !confirm('Clear the kill switch for ' + i + '? Auto-trades can fire again once armed.')) return;
   fetch('/api/auto-trade', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({inst:i, emergencyDisabled:v})})
   .then(function(){ loadState(); }).catch(function(){ setMsg(i, 'network error', true); });
+}
+function clearFiredKeys(){
+  if(!confirm('Clear auto-trade fired-key cache? READY setups that already fired today will be allowed to re-fire. Use after a redeploy when setups are being skipped.')) return;
+  fetch('/api/clear-fired-keys',{method:'POST'}).then(function(r){return r.json();}).then(function(j){var m=document.getElementById('cfk-msg');if(m)m.textContent=(j.cleared||0)+' key(s) cleared \u2014 setups can re-fire.';}).catch(function(){var m=document.getElementById('cfk-msg');if(m)m.textContent='request failed';});
 }
 function loadState(){
   fetch('/api/safety-settings').then(function(r){ return r.json(); }).then(function(j){ STATE = j; render(); }).catch(function(){});
@@ -43205,6 +43228,19 @@ def clear_alerts():
         CROSS_MARKET_LAST_ALERT.clear()
     logger.info("Alert history cleared.")
     return jsonify({"status": "cleared", "alerts_remaining": 0}), 200
+
+
+@app.route("/clear-fired-keys", methods=["POST"])
+def clear_fired_keys():
+    """Owner-only: clear the AUTO_FIRED_KEYS same-day dedup cache so READY
+    setups that already fired today can re-fire.  Use after a redeploy to
+    reset dedup without wiping alert history, price state, or zones.
+    (NOT in OPEN_PATHS — Express Basic Auth + CSRF apply.)"""
+    with AUTO_TRADE_LOCK:
+        count = len(AUTO_FIRED_KEYS)
+        AUTO_FIRED_KEYS.clear()
+    logger.info("AUTO_FIRED_KEYS cleared (%d key(s) removed).", count)
+    return jsonify({"status": "cleared", "cleared": count}), 200
 
 
 @app.route("/price", methods=["GET"])
