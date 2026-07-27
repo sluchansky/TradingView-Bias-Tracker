@@ -991,14 +991,20 @@ def _compute_playbook_reasoning(mi: dict) -> list[dict]:
     """Return per-playbook reasoning dicts for the top-3 suitable playbooks.
 
     Each entry: {name, fit_score (0-100), reasons: [str], missing: [str]}.
+
+    Scoring rules:
+    - ALL suitable playbooks are scored (not just the first 3).
+    - Sorted by fit_score descending; ties broken by playbook name ascending
+      for deterministic ordering across repeated calls with identical inputs.
+    - The top-3 highest-scoring playbooks are returned.
     """
     playbooks = mi.get("suitable_playbooks") or []
-    result: list[dict] = []
+    scored: list[dict] = []
 
-    for pb_name in playbooks[:3]:
+    for pb_name in playbooks:                # score ALL, then sort
         criteria = _PLAYBOOK_CRITERIA.get(pb_name)
         if not criteria:
-            result.append({"name": pb_name, "fit_score": 50,
+            scored.append({"name": pb_name, "fit_score": 50,
                            "reasons": [], "missing": []})
             continue
 
@@ -1019,10 +1025,12 @@ def _compute_playbook_reasoning(mi: dict) -> list[dict]:
                 missing.append(label)
 
         fit_score = round(earned * 100 / max_pts) if max_pts > 0 else 0
-        result.append({"name": pb_name, "fit_score": fit_score,
+        scored.append({"name": pb_name, "fit_score": fit_score,
                        "reasons": reasons, "missing": missing})
 
-    return result
+    # Highest fit_score first; equal scores ordered by name (deterministic)
+    scored.sort(key=lambda x: (-x["fit_score"], x["name"]))
+    return scored[:3]
 
 
 # ── Memory event detection ────────────────────────────────────────────────────
@@ -1098,9 +1106,31 @@ def _detect_significant_changes(
     cur_dom  = max(cur_out.get("long",  0), cur_out.get("short",  0))
     if abs(cur_dom - prev_dom) >= 15:
         delta = cur_dom - prev_dom
+        # Build guaranteed non-empty evidence list (never copies stale data).
+        # Priority: 1) current MI supporting evidence, 2) derived from the change.
+        _os_evid: list[str] = [
+            e for e in (mi.get("supporting_evidence") or []) if e and isinstance(e, str)
+        ]
+        if not _os_evid:
+            # Derive from the per-direction probability changes
+            _dir_changes = [
+                ("Bullish",  prev_out.get("long",    0), cur_out.get("long",    0)),
+                ("Bearish",  prev_out.get("short",   0), cur_out.get("short",   0)),
+                ("Neutral",  prev_out.get("neutral", 0), cur_out.get("neutral", 0)),
+            ]
+            for _dn, _prev_pct, _cur_pct in _dir_changes:
+                if abs(_cur_pct - _prev_pct) >= 10:
+                    _os_evid.append(
+                        f"{_dn} directional weight changed from {_prev_pct}% to {_cur_pct}%."
+                    )
+            if not _os_evid:          # ultimate fallback
+                _os_evid.append(
+                    f"Dominant directional weight shifted from {prev_dom}% to {cur_dom}%."
+                )
         events.append(_evt(
             "OUTLOOK_SHIFT", f"{prev_dom}%", f"{cur_dom}%",
             f"Dominant directional weight shifted by {delta:+d} pts",
+            _os_evid,
         ))
 
     # 5. Top playbook change

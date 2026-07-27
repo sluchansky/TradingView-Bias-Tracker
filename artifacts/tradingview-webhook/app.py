@@ -9082,7 +9082,8 @@ _LB_MI_HISTORY_BY_INST:     dict = {}  # inst → deque of classification record
 _LB_MI_WARN_TS:             dict = {}  # inst → last exception-warn epoch (rate limiter, secs)
 _LB_MARKET_MEMORY_BY_INST:  dict = {}  # inst → deque(maxlen=200) of significant transitions
 _LB_THESIS_BY_INST:         dict = {}  # inst → current dynamic thesis dict (Phase 2)
-_LB_THESIS_OBS_BY_INST:     dict = {}  # inst → deque(maxlen=120) per-bar audit snapshots (Step 3)
+_LB_THESIS_OBS_BY_INST:     dict = {}  # inst → deque(maxlen=5000) per-bar audit snapshots
+_LB_THESIS_OBS_LAST_BAR:    dict = {}  # inst → last appended bar-ts (minute precision, dedup guard)
 _RIGHT_BRAIN_STATE: dict = {
     "mode":          "training",  # "training" | "live_eligible"
     "profit_factor": 0.0,
@@ -25886,39 +25887,58 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                         _LB_THESIS_BY_INST[inst] = _lbp2_out["thesis"]
                         for _lbp2_evt in (_lbp2_out.get("new_events") or []):
                             _LB_MARKET_MEMORY_BY_INST[inst].append(_lbp2_evt)
-                        # ── Step 3 observation log (bounded, no DB writes) ─
+                        # ── Observation log (bounded maxlen=5000, no DB writes) ────
                         if inst not in _LB_THESIS_OBS_BY_INST:
-                            _LB_THESIS_OBS_BY_INST[inst] = deque(maxlen=120)
-                        _obs_th   = _lbp2_out["thesis"] or {}
-                        _obs_mi   = _lbmi_result or {}
-                        _obs_do   = _obs_mi.get("directional_outlook") or {}
-                        _obs_pb   = (_obs_th.get("playbooks") or [{}])[0]
-                        _obs_stab = _obs_th.get("stability") or {}
-                        _obs_vwap = (VWAP_BY_TICKER.get(inst) or {})
-                        _LB_THESIS_OBS_BY_INST[inst].append({
-                            "ts":                    datetime.now(timezone.utc).isoformat(),
-                            "instrument":            inst,
-                            "direction":             _obs_th.get("direction"),
-                            "strength":              _obs_th.get("strength"),
-                            "momentum":              _obs_th.get("momentum"),
-                            "established_at":        _obs_th.get("established_at"),
-                            "last_updated_at":       _obs_th.get("last_updated_at"),
-                            "market_state":          _obs_mi.get("market_state"),
-                            "session_character":     _obs_mi.get("session_character"),
-                            "session_phase":         _obs_mi.get("session_phase"),
-                            "auction_control":       _obs_mi.get("auction_control"),
-                            "bullish_pct":           _obs_do.get("long"),
-                            "bearish_pct":           _obs_do.get("short"),
-                            "neutral_pct":           _obs_do.get("neutral"),
-                            "data_confidence":       _obs_mi.get("data_confidence"),
-                            "top_playbook":          _obs_pb.get("name"),
-                            "top_playbook_fit":      _obs_pb.get("fit_score"),
-                            "rapid_flip_warning":    _obs_stab.get("rapid_flip_warning"),
-                            "time_in_thesis_min":    _obs_stab.get("time_in_current_thesis_min"),
-                            "number_of_transitions": _obs_stab.get("number_of_transitions"),
-                            "input_freshness":       _obs_mi.get("data_confidence"),
-                            "vwap_source":           _obs_vwap.get("source"),
-                        })
+                            _LB_THESIS_OBS_BY_INST[inst] = deque(maxlen=5000)
+                        _obs_th     = _lbp2_out["thesis"] or {}
+                        _obs_mi     = _lbmi_result or {}
+                        _obs_do     = _obs_mi.get("directional_outlook") or {}
+                        _obs_pb     = (_obs_th.get("playbooks") or [{}])[0]
+                        _obs_stab   = _obs_th.get("stability") or {}
+                        _obs_vwap   = (VWAP_BY_TICKER.get(inst) or {})
+                        _obs_mi_ts  = (_obs_mi.get("computed_at") or "")
+                        # Dedup: skip if we already have an obs for this bar
+                        _obs_bar_key = _obs_mi_ts[:16]   # minute-precision key
+                        if _LB_THESIS_OBS_LAST_BAR.get(inst) == _obs_bar_key:
+                            pass   # same bar already recorded, skip
+                        else:
+                            _LB_THESIS_OBS_LAST_BAR[inst] = _obs_bar_key
+                            # vwap_age_ms
+                            _obs_vwap_ts = _obs_vwap.get("ts")
+                            _obs_vwap_age: int | None = None
+                            if _obs_vwap_ts:
+                                try:
+                                    _obs_vwap_age = int(
+                                        (datetime.now(timezone.utc) -
+                                         datetime.fromisoformat(_obs_vwap_ts)).total_seconds() * 1000
+                                    )
+                                except Exception:
+                                    pass
+                            _LB_THESIS_OBS_BY_INST[inst].append({
+                                "ts":                       datetime.now(timezone.utc).isoformat(),
+                                "instrument":               inst,
+                                "direction":                _obs_th.get("direction"),
+                                "strength":                 _obs_th.get("strength"),
+                                "momentum":                 _obs_th.get("momentum"),
+                                "established_at":           _obs_th.get("established_at"),
+                                "last_updated_at":          _obs_th.get("last_updated_at"),
+                                "market_state":             _obs_mi.get("market_state"),
+                                "session_character":        _obs_mi.get("session_character"),
+                                "session_phase":            _obs_mi.get("session_phase"),
+                                "auction_control":          _obs_mi.get("auction_control"),
+                                "bullish_pct":              _obs_do.get("long"),
+                                "bearish_pct":              _obs_do.get("short"),
+                                "neutral_pct":              _obs_do.get("neutral"),
+                                "data_confidence":          _obs_mi.get("data_confidence"),
+                                "top_playbook":             _obs_pb.get("name"),
+                                "top_playbook_fit_score":   _obs_pb.get("fit_score"),
+                                "rapid_flip_warning":       _obs_stab.get("rapid_flip_warning"),
+                                "time_in_current_thesis_min": _obs_stab.get("time_in_current_thesis_min"),
+                                "number_of_transitions":    _obs_stab.get("number_of_transitions"),
+                                "vwap_source":              _obs_vwap.get("source"),
+                                "vwap_age_ms":              _obs_vwap_age,
+                                "mi_input_ts":              _obs_mi_ts,
+                            })
                     except Exception as _lbp2_exc:
                         logger.debug("LB Phase 2 thesis (%s): %s", inst, _lbp2_exc)
 
@@ -43391,21 +43411,74 @@ def lb_thesis():
 
 @app.route("/lb-thesis-obs", methods=["GET"])
 def lb_thesis_obs():
-    """Owner-only. Returns bounded per-bar thesis observation log (maxlen=120 per instrument).
-    Used for live stability/timeliness/consistency audit (Steps 3–7). DISPLAY / RESEARCH-ONLY.
+    """Owner-only. Bounded per-bar thesis observation log (maxlen=5000 per instrument).
+    Live stability/timeliness/consistency audit endpoint. DISPLAY / RESEARCH-ONLY.
     Requires LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1.
-    Optional ?inst=MGC to filter to one instrument."""
-    inst_filter = request.args.get("inst")
+
+    Query parameters
+    ----------------
+    inst=MGC          Filter to one instrument (MGC/MNQ/MES/MYM). Unknown → HTTP 400.
+    limit=N           Return at most N newest observations (1–5000, default 5000).
+    summary=1         Omit observation list; return count/timestamps/metrics only.
+    """
+    _VALID_INSTS  = {"MGC", "MNQ", "MES", "MYM"}
+    _MAX_RET      = 5000
+    inst_filter   = request.args.get("inst")
+    summary_only  = request.args.get("summary") == "1"
+
+    if inst_filter and inst_filter not in _VALID_INSTS:
+        return jsonify({"ok": False,
+                        "error": f"Unknown instrument '{inst_filter}'. "
+                                 f"Valid: {sorted(_VALID_INSTS)}"}), 400
+    try:
+        limit = max(1, min(_MAX_RET, int(request.args.get("limit", _MAX_RET))))
+    except (ValueError, TypeError):
+        limit = _MAX_RET
+
     out: dict = {}
     for _inst in ("MGC", "MNQ", "MES", "MYM"):
         if inst_filter and _inst != inst_filter:
             continue
-        obs = list(_LB_THESIS_OBS_BY_INST.get(_inst, []))
-        out[_inst] = {"count": len(obs), "observations": obs}
+        _raw = list(_LB_THESIS_OBS_BY_INST.get(_inst, []))
+        # newest-first
+        obs_newest = list(reversed(_raw))
+        total_cnt  = len(obs_newest)
+        oldest_ts  = _raw[0]["ts"]  if _raw else None
+        newest_ts  = _raw[-1]["ts"] if _raw else None
+        entry: dict = {
+            "count":      total_cnt,
+            "oldest_ts":  oldest_ts,
+            "newest_ts":  newest_ts,
+        }
+        if not summary_only:
+            entry["observations"] = obs_newest[:limit]
+        else:
+            # Summary-only metrics
+            _dirs: dict[str, int] = {}
+            _moms: dict[str, int] = {}
+            _flips = 0
+            for _o in obs_newest:
+                _dirs[_o.get("direction") or "UNKNOWN"] = _dirs.get(_o.get("direction") or "UNKNOWN", 0) + 1
+                _moms[_o.get("momentum") or "UNKNOWN"]  = _moms.get(_o.get("momentum") or "UNKNOWN", 0) + 1
+                if _o.get("rapid_flip_warning"):
+                    _flips += 1
+            entry["summary"] = {
+                "direction_distribution":  _dirs,
+                "momentum_distribution":   _moms,
+                "rapid_flip_observations": _flips,
+            }
+            entry["observations"] = []
+
+        out[_inst] = entry
+
     return jsonify({
         "ok":           True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "flag_enabled": LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED,
+        "retention":    {
+            "max_observations_per_instrument": _MAX_RET,
+            "estimated_minutes":               _MAX_RET,
+        },
         "instruments":  out,
     })
 
@@ -50423,6 +50496,8 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
         <div id="lb-body"><div class="db-log-row db-log-obs">Waiting for bar close&hellip;</div></div>
         <!-- Market Intelligence block — shown only when LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1 -->
         <div id="lb-mi-body" style="margin-top:6px"></div>
+        <!-- Left Brain Dynamic Thesis (Phase 2) — display-only, no trading controls -->
+        <div id="lb-thesis-body" style="margin-top:8px;display:none"></div>
       </div>
       <div class="db-side" id="rb-side">
         <div class="db-side-hd">Right Brain &nbsp;<span class="db-pill db-pill-train" id="rb-pill">Training</span></div>
@@ -53605,6 +53680,9 @@ function renderModules(d){
   // Reads d.left_brain.market_intelligence from the /status poll payload.
   // No-op when absent (flag OFF). Never touches money path.
   try{ renderLBMarketIntelligence(d); }catch(e){ console.warn('[LB-MI]', e && e.message ? e.message.slice(0,40) : String(e).slice(0,30)); }
+  // ── Left Brain Dynamic Thesis (Phase 2 — DISPLAY-ONLY) ───────────────────
+  // Reads d.left_brain.thesis from the same /status poll — no extra request.
+  try{ renderLBThesis(d); }catch(e){ console.warn('[LB-T2]', e && e.message ? e.message.slice(0,40) : String(e).slice(0,30)); }
   // Avatar Intelligence Engine — observe new data every poll tick
   try{ mbAvatarObserve(d); }catch(e){ console.warn('[Avatar] observe error', e && e.message ? e.message.slice(0,60) : String(e).slice(0,40)); }
 }
@@ -58724,6 +58802,149 @@ function _liveAnchoredPotential(pp, dir, inst) {
 // '1' = user collapsed, '0' = user expanded, absent = default (gap>0).
 function _edgeBdPref(){ try{ return localStorage.getItem('edgeBdCollapsed'); }catch(e){ return null; } }
 function onEdgeBdToggle(el){ try{ localStorage.setItem('edgeBdCollapsed', el.open ? '0' : '1'); }catch(e){} }
+
+// ════ Left Brain Phase 1B — Market Intelligence display (DISPLAY-ONLY) ═════
+// Renders d.left_brain.market_intelligence into #lb-mi-body.
+// No-op when flag off (block absent) or element missing. Never touches money path.
+function renderLBMarketIntelligence(d){
+  var el = document.getElementById('lb-mi-body');
+  if(!el) return;
+  var lb = d && d.left_brain;
+  var mi = lb && lb.market_intelligence;
+  if(!mi){ el.style.display='none'; return; }
+  el.style.display='';
+  var ms  = mi.market_state   || {};
+  var dc  = mi.directional_confidence || {};
+  var mom = mi.momentum       || {};
+  var dec = mi.confidence_decay || {};
+  var _dcExp = (dec.factor != null && Number(dec.factor) === 0);
+  var sCol = function(s){ s=String(s||'').toLowerCase();
+    return s.indexOf('up')>=0||s.indexOf('bull')>=0||s==='long' ? '#22c55e'
+         : s.indexOf('down')>=0||s.indexOf('bear')>=0||s==='short' ? '#ef4444'
+         : '#6b7280'; };
+  var html = '<div style="font-size:9px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:1.2px">LB Market Intelligence</div>';
+  // State row
+  html += '<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin-bottom:3px">'
+        + '<span style="font-size:11px;font-weight:600;color:'+sCol(ms.label)+'">'+aiEsc(ms.label||'\u2014')+'</span>'
+        + '<span style="font-size:9px;color:var(--muted)">'+aiEsc(ms.reason||'')+'</span>'
+        + '</div>';
+  // Bias row
+  var biasCol = _dcExp ? '#6b7280' : sCol(dc.bias);
+  html += '<div style="display:flex;gap:10px;font-size:10px;margin-bottom:2px">'
+        + '<span style="color:'+biasCol+'">'+aiEsc(dc.bias||'\u2014')+'</span>'
+        + '<span style="color:'+(_dcExp?'#6b7280':dc.long>=70?'#22c55e':dc.long>=50?'#eab308':'#6b7280')+'">L '+((dc.long!=null)?dc.long+'%':'\u2014')+'</span>'
+        + '<span style="color:'+(_dcExp?'#6b7280':dc.short>=70?'#22c55e':dc.short>=50?'#eab308':'#6b7280')+'">S '+((dc.short!=null)?dc.short+'%':'\u2014')+'</span>'
+        + (_dcExp ? '<span style="color:#6b7280;font-size:9px">expired</span>' : '')
+        + '</div>';
+  // Momentum
+  if(mom.state){
+    var mCol = mom.state==='accelerating'?'#22c55e':mom.state==='fading'?'#ef4444':mom.state==='stable'?'#eab308':'#6b7280';
+    html += '<div style="font-size:9px;color:'+mCol+'">'+aiEsc(mom.state)+'</div>';
+  }
+  el.innerHTML = html;
+}
+
+// ════ Left Brain Phase 2 — Dynamic Thesis display (DISPLAY-ONLY) ════════════
+// Renders d.left_brain.thesis into #lb-thesis-body.
+// No-op when flag off (block absent) or element missing. Never touches money path.
+// All dynamic text is output via aiEsc() to prevent XSS.
+function renderLBThesis(d){
+  var el = document.getElementById('lb-thesis-body');
+  if(!el) return;
+  var lb = d && d.left_brain;
+  // State 1: feature disabled (block absent)
+  if(!lb){ el.style.display='none'; return; }
+  var th = lb.thesis;
+  // State 2: cold start / thesis null
+  if(!th){
+    el.style.display='';
+    el.innerHTML='<div style="font-size:9px;color:var(--muted);text-align:center;padding:4px 0">'
+      +'LB Thesis: cold start \u2014 waiting for first bar close\u2026</div>';
+    return;
+  }
+  el.style.display='';
+  var dirCol = function(s){ s=String(s||'').toLowerCase();
+    return s==='bullish'?'#22c55e':s==='bearish'?'#ef4444':s==='neutral'?'#eab308':'#6b7280'; };
+  var dir    = String(th.direction||'\u2014');
+  var str    = String(th.strength ||'\u2014');
+  var mom    = String(th.momentum ||'\u2014');
+  var narr   = String(th.narrative||'');
+  var stab   = th.stability || {};
+  var tl     = th.timeline  || [];
+  var pbs    = th.playbooks || [];
+  var weakens= th.weakens_if || [];
+  var fails  = th.invalidation_conditions || [];
+  var estAt  = (th.established_at  ||'').slice(11,16);
+  var lastUp  = (th.last_updated_at||'').slice(11,16);
+  var timeMin = stab.time_in_current_thesis_min;
+  var flipWarn= !!stab.rapid_flip_warning;
+  var html = '<div style="font-size:9px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:1.2px">LB Dynamic Thesis</div>';
+  // State 6: rapid-flip warning banner
+  if(flipWarn){
+    html += '<div style="background:#7f1d1d;border:1px solid #ef4444;border-radius:4px;padding:4px 6px;font-size:9px;color:#fca5a5;margin-bottom:5px">'
+          + '\u26a0 Rapid flip warning \u2014 thesis unstable</div>';
+  }
+  // Direction / strength / momentum row
+  html += '<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin-bottom:3px">'
+        + '<span style="font-size:12px;font-weight:700;color:'+dirCol(dir)+'">'+aiEsc(dir)+'</span>'
+        + '<span style="font-size:9px;color:var(--muted)">'+aiEsc(str)+'</span>'
+        + '<span style="font-size:9px;color:var(--muted)">\u00b7</span>'
+        + '<span style="font-size:9px;color:var(--muted)">'+aiEsc(mom)+'</span>'
+        + '</div>';
+  // Timestamps
+  if(estAt || lastUp || timeMin!=null){
+    html += '<div style="font-size:8px;color:var(--muted);margin-bottom:4px">'
+          + (estAt  ? 'Est '+aiEsc(estAt) : '')
+          + (lastUp && lastUp!==estAt ? (estAt?' \u00b7 ':'')+'Upd '+aiEsc(lastUp) : '')
+          + (timeMin!=null ? ' \u00b7 '+Number(timeMin).toFixed(0)+' min in thesis' : '')
+          + '</div>';
+  }
+  // State 3/4: narrative (may be absent — missing optional evidence)
+  if(narr){
+    html += '<div style="font-size:9px;color:var(--text);line-height:1.4;margin-bottom:4px;white-space:pre-wrap;word-break:break-word">'+aiEsc(narr)+'</div>';
+  }
+  // Weakens-if
+  if(weakens.length){
+    html += '<div style="font-size:9px;color:#f59e0b;margin-bottom:2px">\u26a0 Weakens if:</div>';
+    weakens.forEach(function(w){ html += '<div style="font-size:8px;color:var(--muted);padding-left:8px">\u2022 '+aiEsc(String(w))+'</div>'; });
+    html += '<div style="margin-bottom:3px"></div>';
+  }
+  // Fails-if
+  if(fails.length){
+    html += '<div style="font-size:9px;color:#ef4444;margin-bottom:2px">\u274c Fails if:</div>';
+    fails.forEach(function(f){ html += '<div style="font-size:8px;color:var(--muted);padding-left:8px">\u2022 '+aiEsc(String(f))+'</div>'; });
+    html += '<div style="margin-bottom:3px"></div>';
+  }
+  // Playbooks (top 3, ranked by fit score)
+  if(pbs.length){
+    html += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px;text-transform:uppercase;letter-spacing:1px">Playbooks</div>';
+    pbs.forEach(function(pb){
+      var sc = pb.fit_score!=null ? Number(pb.fit_score) : 0;
+      var scCol = sc>=80?'#22c55e':sc>=60?'#eab308':'#6b7280';
+      html += '<div style="display:flex;justify-content:space-between;font-size:9px;padding:1px 0">'
+            + '<span style="color:var(--text)">'+aiEsc(String(pb.name||'\u2014').replace(/_/g,' '))+'</span>'
+            + '<span style="color:'+scCol+'">'+sc+'%</span>'
+            + '</div>';
+    });
+    html += '<div style="margin-bottom:3px"></div>';
+  }
+  // State 5: timeline (empty or populated)
+  html += '<div style="font-size:9px;color:var(--muted);margin-bottom:2px;text-transform:uppercase;letter-spacing:1px">Timeline</div>';
+  var tlShow = tl.slice().reverse().slice(0,4);   // newest-first, cap 4
+  if(!tlShow.length){
+    html += '<div style="font-size:8px;color:var(--muted)">No transitions yet</div>';
+  } else {
+    tlShow.forEach(function(ev){
+      var evTs = (ev.ts||'').slice(11,16);
+      html += '<div style="font-size:8px;color:var(--muted);padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+            + (evTs ? '<span style="opacity:.5">'+aiEsc(evTs)+'</span> ' : '')
+            + aiEsc(String(ev.event_type||''))
+            + (ev.from_val||ev.to_val ? ' '+aiEsc(String(ev.from_val||''))+'\u2192'+aiEsc(String(ev.to_val||'')) : '')
+            + '</div>';
+    });
+  }
+  el.innerHTML = html;
+}
 
 // ── Unified Dashboard: 5-section live-nav ──────────────────────────────────
 // DISPLAY-ONLY feature. Never touches the money path, gate, or execution flow.
