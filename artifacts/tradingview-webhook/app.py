@@ -25560,6 +25560,14 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                             )
                 except Exception as _ae:
                     logger.error("Databento auto-execute error (%s): %s", inst, _ae)
+            # ── Dual-mode shadow simulator observer ───────────────────────────
+            # Mirror every bar-close full_analysis into the shadow simulator so
+            # it accumulates paper trades from Databento bar closes (not just
+            # webhook-sourced events). Fail-open; never touches the money path.
+            try:
+                _maybe_observe_dual_mode_sim(a, source="databento_scan")
+            except Exception as _dse:
+                logger.debug("Dual-sim bar-scan observe (%s): %s", inst, _dse)
             # Right Brain evaluates every bar (READY or not; dev + prod)
             _right_brain_eval(inst, a, price)
         except Exception as exc:
@@ -40260,7 +40268,7 @@ def _maybe_observe_dual_mode_sim(result, source="webhook"):
     live path produces. Writes ONLY dual_sim_trades. NEVER touches the gate / verdict /
     trade_plan / edge_score / strategy_trades / MANAGED_TRADES / broker / auto-execute.
     Default OFF → flag OFF == byte-identical. FAIL-OPEN. Returns trades opened (tests)."""
-    if not DUAL_MODE_SHADOW_SIM_ENABLED or source != "webhook" or not DUAL_SIM_DB_READY:
+    if not DUAL_MODE_SHADOW_SIM_ENABLED or source not in ("webhook", "databento_scan") or not DUAL_SIM_DB_READY:
         return 0
     # Never open shadow trades while the futures session is closed.
     try:
