@@ -9082,6 +9082,7 @@ _LB_MI_HISTORY_BY_INST:     dict = {}  # inst → deque of classification record
 _LB_MI_WARN_TS:             dict = {}  # inst → last exception-warn epoch (rate limiter, secs)
 _LB_MARKET_MEMORY_BY_INST:  dict = {}  # inst → deque(maxlen=200) of significant transitions
 _LB_THESIS_BY_INST:         dict = {}  # inst → current dynamic thesis dict (Phase 2)
+_LB_THESIS_OBS_BY_INST:     dict = {}  # inst → deque(maxlen=120) per-bar audit snapshots (Step 3)
 _RIGHT_BRAIN_STATE: dict = {
     "mode":          "training",  # "training" | "live_eligible"
     "profit_factor": 0.0,
@@ -25885,6 +25886,39 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                         _LB_THESIS_BY_INST[inst] = _lbp2_out["thesis"]
                         for _lbp2_evt in (_lbp2_out.get("new_events") or []):
                             _LB_MARKET_MEMORY_BY_INST[inst].append(_lbp2_evt)
+                        # ── Step 3 observation log (bounded, no DB writes) ─
+                        if inst not in _LB_THESIS_OBS_BY_INST:
+                            _LB_THESIS_OBS_BY_INST[inst] = deque(maxlen=120)
+                        _obs_th   = _lbp2_out["thesis"] or {}
+                        _obs_mi   = _lbmi_result or {}
+                        _obs_do   = _obs_mi.get("directional_outlook") or {}
+                        _obs_pb   = (_obs_th.get("playbooks") or [{}])[0]
+                        _obs_stab = _obs_th.get("stability") or {}
+                        _obs_vwap = (VWAP_BY_TICKER.get(inst) or {})
+                        _LB_THESIS_OBS_BY_INST[inst].append({
+                            "ts":                    datetime.now(timezone.utc).isoformat(),
+                            "instrument":            inst,
+                            "direction":             _obs_th.get("direction"),
+                            "strength":              _obs_th.get("strength"),
+                            "momentum":              _obs_th.get("momentum"),
+                            "established_at":        _obs_th.get("established_at"),
+                            "last_updated_at":       _obs_th.get("last_updated_at"),
+                            "market_state":          _obs_mi.get("market_state"),
+                            "session_character":     _obs_mi.get("session_character"),
+                            "session_phase":         _obs_mi.get("session_phase"),
+                            "auction_control":       _obs_mi.get("auction_control"),
+                            "bullish_pct":           _obs_do.get("long"),
+                            "bearish_pct":           _obs_do.get("short"),
+                            "neutral_pct":           _obs_do.get("neutral"),
+                            "data_confidence":       _obs_mi.get("data_confidence"),
+                            "top_playbook":          _obs_pb.get("name"),
+                            "top_playbook_fit":      _obs_pb.get("fit_score"),
+                            "rapid_flip_warning":    _obs_stab.get("rapid_flip_warning"),
+                            "time_in_thesis_min":    _obs_stab.get("time_in_current_thesis_min"),
+                            "number_of_transitions": _obs_stab.get("number_of_transitions"),
+                            "input_freshness":       _obs_mi.get("data_confidence"),
+                            "vwap_source":           _obs_vwap.get("source"),
+                        })
                     except Exception as _lbp2_exc:
                         logger.debug("LB Phase 2 thesis (%s): %s", inst, _lbp2_exc)
 
@@ -43352,6 +43386,27 @@ def lb_thesis():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "flag_enabled": LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED,
         "instruments":  data,
+    })
+
+
+@app.route("/lb-thesis-obs", methods=["GET"])
+def lb_thesis_obs():
+    """Owner-only. Returns bounded per-bar thesis observation log (maxlen=120 per instrument).
+    Used for live stability/timeliness/consistency audit (Steps 3–7). DISPLAY / RESEARCH-ONLY.
+    Requires LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1.
+    Optional ?inst=MGC to filter to one instrument."""
+    inst_filter = request.args.get("inst")
+    out: dict = {}
+    for _inst in ("MGC", "MNQ", "MES", "MYM"):
+        if inst_filter and _inst != inst_filter:
+            continue
+        obs = list(_LB_THESIS_OBS_BY_INST.get(_inst, []))
+        out[_inst] = {"count": len(obs), "observations": obs}
+    return jsonify({
+        "ok":           True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "flag_enabled": LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED,
+        "instruments":  out,
     })
 
 
