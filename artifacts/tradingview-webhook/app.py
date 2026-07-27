@@ -6249,9 +6249,12 @@ def compute_swing_context(instrument, price):
 
 
 def _trend_brake_enabled():
-    """'Don't fight the trend' brake master flag. DEFAULT OFF so the strict-gate
-    goldens stay byte-identical; env TREND_BRAKE_ENABLED=1 arms it."""
-    return _env_flag_on("TREND_BRAKE_ENABLED", default_on=False)
+    """'Don't fight the trend' brake master flag. DEFAULT ON — a one-sided (all-demand /
+    all-Long) alert feed can otherwise stack enough score to call READY into a falling
+    market without any real counter-signal. env TREND_BRAKE_ENABLED=0 disables it.
+    Strict-gate goldens pin it OFF (TREND_BRAKE_ENABLED=0 in their env) to stay
+    byte-identical; the ON-path is validated by trend_brake_smoke.py."""
+    return _env_flag_on("TREND_BRAKE_ENABLED", default_on=True)
 
 
 def _trend_brake_reason(direction, current_price, vwap_value, vwap_status, swing_ctx):

@@ -12,6 +12,8 @@ goldens; env `TREND_BRAKE_ENABLED=1` arms it. Lives at the full_analysis veto se
 right after the swing_strategy_filter block, alongside the scalp/swing/strategy demote
 blocks (same WAIT + null-plan mutation so is_actionable flips and the gateway can't act).
 
+**Default changed to ON (2026-07-27):** the flag now defaults to ON. Goldens pin it OFF with `TREND_BRAKE_ENABLED=0` in check_scalp_golden.sh so they stay byte-identical. Env `TREND_BRAKE_ENABLED=0` disables it. The trend_brake_smoke.py ON-path guard still validates the veto logic.
+
 **Why:** the inbound TradingView alert feed can be one-sided (all bullish/demand), so
 the bot forms only LONG setups and takes them into falling markets (root cause of "bot
 training mode is doing awful": 23 long / 1 short in a day). Alert-derived bias is
