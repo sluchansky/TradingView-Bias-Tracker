@@ -9076,10 +9076,12 @@ RIGHT_BRAIN_MIN_PF     = float(os.getenv("RIGHT_BRAIN_MIN_PF", "1.0"))
 # Default OFF → key never added → goldens byte-identical.
 LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED = os.getenv(
     "LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED", "0") == "1"
-_LEFT_BRAIN_MI_BY_INST: dict = {}  # inst → latest MI block (set by _databento_bar_scan)
-_LB_MI_PERF_BY_INST:    dict = {}  # inst → timing perf stats (shadow validation Step 2)
-_LB_MI_HISTORY_BY_INST: dict = {}  # inst → deque of classification records (Steps 6/7)
-_LB_MI_WARN_TS:         dict = {}  # inst → last exception-warn epoch (rate limiter, secs)
+_LEFT_BRAIN_MI_BY_INST:     dict = {}  # inst → latest MI block (set by _databento_bar_scan)
+_LB_MI_PERF_BY_INST:        dict = {}  # inst → timing perf stats (shadow validation Step 2)
+_LB_MI_HISTORY_BY_INST:     dict = {}  # inst → deque of classification records (Steps 6/7)
+_LB_MI_WARN_TS:             dict = {}  # inst → last exception-warn epoch (rate limiter, secs)
+_LB_MARKET_MEMORY_BY_INST:  dict = {}  # inst → deque(maxlen=200) of significant transitions
+_LB_THESIS_BY_INST:         dict = {}  # inst → current dynamic thesis dict (Phase 2)
 _RIGHT_BRAIN_STATE: dict = {
     "mode":          "training",  # "training" | "live_eligible"
     "profit_factor": 0.0,
@@ -24566,7 +24568,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
         _lb_inst = instrument_of(active_ticker)
         _lb_mi   = _LEFT_BRAIN_MI_BY_INST.get(_lb_inst)
-        result["left_brain"] = {"market_intelligence": _lb_mi}
+        result["left_brain"] = {
+            "market_intelligence": _lb_mi,
+            "thesis":              _LB_THESIS_BY_INST.get(_lb_inst),
+        }
 
     return result
 
@@ -25819,7 +25824,8 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                 _lbmi_t0 = time.monotonic()
                 try:
                     from left_brain_market_intelligence import compute_left_brain_mi  # noqa: PLC0415
-                    _lbmi_result = compute_left_brain_mi(inst, a)
+                    _lbmi_prev_mi = _LEFT_BRAIN_MI_BY_INST.get(inst)  # Phase 2: capture before overwrite
+                    _lbmi_result  = compute_left_brain_mi(inst, a)
                     _LEFT_BRAIN_MI_BY_INST[inst] = _lbmi_result
                     _lbmi_rt_ms = (time.monotonic() - _lbmi_t0) * 1000.0
 
@@ -25858,6 +25864,29 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                         "dominant":        _dominant_direction(
                             _lbmi_result.get("directional_outlook") or {}),
                     })
+
+                    # ── Phase 2: Dynamic Thesis (DISPLAY-ONLY) ────────────
+                    # Computes thesis direction/strength/momentum, structured
+                    # narrative, invalidation conditions, playbook reasoning,
+                    # and a market memory timeline of significant transitions.
+                    # NEVER modifies gate, scoring, execution, or sizing.
+                    try:
+                        from left_brain_market_intelligence import compute_left_brain_thesis  # noqa: PLC0415
+                        if inst not in _LB_MARKET_MEMORY_BY_INST:
+                            _LB_MARKET_MEMORY_BY_INST[inst] = deque(maxlen=200)
+                        _lbp2_mem = list(_LB_MARKET_MEMORY_BY_INST[inst])
+                        _lbp2_out = compute_left_brain_thesis(
+                            inst,
+                            _lbmi_result,
+                            _lbmi_prev_mi,
+                            _LB_THESIS_BY_INST.get(inst),
+                            _lbp2_mem,
+                        )
+                        _LB_THESIS_BY_INST[inst] = _lbp2_out["thesis"]
+                        for _lbp2_evt in (_lbp2_out.get("new_events") or []):
+                            _LB_MARKET_MEMORY_BY_INST[inst].append(_lbp2_evt)
+                    except Exception as _lbp2_exc:
+                        logger.debug("LB Phase 2 thesis (%s): %s", inst, _lbp2_exc)
 
                 except Exception as _lbmi_exc:
                     # Rate-limited exception logging (one WARNING per minute per inst)
@@ -43298,6 +43327,32 @@ def lb_shadow_report():
         }
 
     return jsonify(report)
+
+
+@app.route("/lb-thesis", methods=["GET"])
+def lb_thesis():
+    """Owner-only (Express dashboard auth; NOT in OPEN_PATHS).
+    Returns per-instrument Left Brain Dynamic Thesis (Phase 2) including
+    direction, strength, momentum, structured narrative, invalidation
+    conditions, playbook reasoning, stability metrics, and market memory
+    timeline.  DISPLAY / RESEARCH-ONLY — never reads from or writes to
+    the gate, scoring, execution, or money-path logic.
+    Requires LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1."""
+    data: dict = {}
+    for _inst in ("MGC", "MNQ", "MES", "MYM"):
+        _thesis  = _LB_THESIS_BY_INST.get(_inst)
+        _mem     = list(_LB_MARKET_MEMORY_BY_INST.get(_inst, []))
+        data[_inst] = {
+            "thesis":        _thesis,
+            "memory_events": _mem,
+            "memory_count":  len(_mem),
+        }
+    return jsonify({
+        "ok":          True,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "flag_enabled": LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED,
+        "instruments":  data,
+    })
 
 
 @app.route("/eval-metrics", methods=["GET"])

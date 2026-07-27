@@ -254,6 +254,7 @@ export const BOT1_ROUTES = [
   "/strategy-scan-diagnostics",
   // Phase 1B shadow validation: Left Brain Market Intelligence.
   // VWAP source-authority diagnostics per instrument (GET only, read-only).
+  "/lb-thesis",
   "/lb-vwap-authority",
   // Full Left Brain MI shadow report: timing, classification distribution,
   // flip-rate stats, output validation, VWAP authority. Display-only.
