@@ -55631,45 +55631,47 @@ function switchMscInst(inst){
   if(mscInst && mscInst !== pageInst){ mscPanelTs = 0; refreshMscPanel(); }
   else if(!mscInst && window._mscPageData) renderMicroScalp(window._mscPageData);
 }
+function _renderMscControls(){
+  // Immediately repaints the ADC Micro Scalp tab controls row so the user
+  // sees feedback at once — without waiting for the next 3-second poll cycle.
+  // The full verdict / steps / plan data is restored on the next poll.
+  var msEl = document.getElementById('adc-ms-content');
+  if(!msEl) return;
+  var h = '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">';
+  h += '<span class="adc-ri" style="flex:0;white-space:nowrap"><span class="k">State</span>';
+  h += '<span class="v" style="color:'+(mscEnabled?'#22c55e':'#6b7280')+'">'+(mscEnabled?'ENABLED':'DISABLED')+'</span></span>';
+  h += '<button onclick="toggleMicroScalp()" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border);background:#1f2430;color:#e8e8f0;cursor:pointer">'+(mscEnabled?'Turn OFF':'Turn ON')+'</button>';
+  if(mscEnabled){
+    h += '<span style="font-size:11px;color:'+(mscLive?'#ef4444':'#f59e0b')+';letter-spacing:1px">'+(mscLive?'LIVE ARMED':'GHOST ONLY')+'</span>';
+    h += '<button onclick="toggleMicroLive()" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#2a1215;color:#fca5a5;cursor:pointer;font-weight:700">'+(mscLive?'DISARM LIVE':'ARM LIVE')+'</button>';
+  }
+  h += '</div>';
+  h += mscEnabled
+    ? '<div class="adc-empty">Micro Scalp enabled \u2014 updating\u2026</div>'
+    : '<div class="adc-empty">Micro Scalp disabled. Use Turn ON to enable.</div>';
+  msEl.innerHTML = h;
+}
 async function toggleMicroScalp(){
   if(mscBusy) return;
   mscBusy = true;
-  const btn = document.getElementById('msc-toggle');
-  if(btn){ btn.disabled = true; btn.textContent = '\u2026'; }
   try {
     const r = await api('/micro-scalp', { enabled: !mscEnabled });
     mscEnabled = !!(r && r.enabled);
   } catch(e) {}
   mscBusy = false;
-  if(btn){ btn.disabled = false; btn.textContent = mscEnabled ? 'Turn OFF' : 'Turn ON'; }
-  if(!mscEnabled){
-    mscLive = false;
-    const lb = document.getElementById('msc-live-btn');
-    if(lb){ lb.style.display = 'none'; }
-  }
+  if(!mscEnabled) mscLive = false;
+  _renderMscControls();
 }
 async function toggleMicroLive(){
   if(mscLiveBusy || !mscEnabled) return;
   if(!mscLive && !window.confirm('Arm LIVE trading? Micro Scalp will place a REAL broker order (with stop + target) every time it fires a TAKE. It stays armed until you disarm it or the app restarts. Ghost logging continues either way.')) return;
   mscLiveBusy = true;
-  const b = document.getElementById('msc-live-btn');
-  if(b){ b.disabled = true; b.textContent = '\u2026'; }
   try {
     const r = await api('/micro-scalp', { live: !mscLive });
     mscLive = !!(r && r.live_armed);
   } catch(e) {}
   mscLiveBusy = false;
-  if(b){
-    b.disabled = false;
-    b.textContent = mscLive ? 'DISARM LIVE' : 'ARM LIVE';
-    b.style.background = mscLive ? '#7f1d1d' : '#2a1215';
-    b.style.color = mscLive ? '#fff' : '#fca5a5';
-  }
-  const go = document.getElementById('msc-ghostonly');
-  if(go){
-    go.textContent = mscLive ? 'LIVE ARMED' : 'GHOST ONLY';
-    go.style.color = mscLive ? '#ef4444' : '#f59e0b';
-  }
+  _renderMscControls();
 }
 
 function renderDualSim(d){
