@@ -210,6 +210,13 @@ def active_trade_snapshot():
 LAST_ALERT_AT    = None   # datetime of most recent recognized/scored webhook alert (UTC)
 LAST_WEBHOOK_AT  = None   # datetime of most recent inbound POST /webhook (UTC), ANY type
 LAST_LIVE_CARD_AT = {}    # instrument ("MGC"/"MNQ") -> datetime of last live card sent (UTC)
+# Databento bar-scan READY sustain: track consecutive bar-close READYs per instrument
+# before firing the live alert card.  A single bursty bar can spike to READY and drop
+# back within seconds; requiring N consecutive bar-close READYs (default 2 = ~2 min)
+# filters those out without delaying a genuine sustained setup by more than one bar.
+# Set READY_SUSTAIN_BARS=1 via env to restore the old instant-on-first-READY behaviour.
+_PENDING_READY: dict = {}  # inst -> {"key": str, "count": int}
+READY_SUSTAIN_BARS = max(1, int(os.getenv("READY_SUSTAIN_BARS", "2")))
 # Per-evaluation performance diagnostics: the last EVAL_METRICS_MAX scored alerts,
 # each with phase timings (indicator/volatility/scoring/notes/screenshot/journal),
 # the webhook->alert delay and the volatility reading. Surfaced as JSON on
@@ -7251,11 +7258,16 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
     strong_threshold     = cfg("EDGE_STRONG_THRESHOLD")       # label-only "Strong" upgrade
     setup_building_threshold = cfg("EDGE_SETUP_BUILDING_THRESHOLD")  # informational band floor (None=off)
-    # MYM/MES need stronger confirmation — their Pine scripts fire on smaller moves so
-    # VWAP + volume + session alone can reach the generic 60 floor. Raise to 75 so at
-    # minimum BOS/CHOCH + one more signal is required. Env override still works via the
-    # cfg() system for either instrument if the operator wants to tune further.
-    if inst in ("MYM", "MES"):
+    # All four SCALP instruments require a floor of 75 so that BOS or CHOCH MUST
+    # contribute to the Edge Score to reach READY.  The maximum non-structure score
+    # is VWAP(15)+Sweep(15)+Vol(15)+CVD(15)+Session(10)=70, which is below this
+    # floor.  This prevents a single Databento burst (sweep+volume+CVD aligning on
+    # one 1m bar) from spiking to READY without real market structure; when the burst
+    # fades or price crosses VWAP the score collapses back near-zero because there is
+    # no BOS/CHOCH base.  With BOS/CHOCH (+20) the stable base keeps the score above
+    # zero even if one or two components fall off after entry.  Env override via the
+    # cfg() system still works for per-instrument tuning if needed.
+    if inst in ("MYM", "MES", "MGC", "MNQ"):
         ready_threshold      = max(int(ready_threshold      or 0), 75)
         full_ready_threshold = max(int(full_ready_threshold or 0), 75)
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
@@ -25576,10 +25588,31 @@ def _databento_bar_scan(inst: str, price: float) -> None:
     def _scan() -> None:
         try:
             if active_trade_for(inst):
+                _PENDING_READY.pop(inst, None)   # reset sustain counter when in a trade
                 return
             a = full_analysis(ticker_override=inst)
-            # Discord live card — prod instance only, throttled by LAST_LIVE_CARD_AT
-            if DISCORD_LIVE_ENABLED:
+
+            # ── Sustain counter: require READY_SUSTAIN_BARS consecutive bar-close
+            #    READYs before firing the live alert card.  A single Databento burst
+            #    (sweep+volume+CVD aligning on one 1m bar) can spike to READY and
+            #    drop back before the next bar; holding off one extra bar catches
+            #    that without adding meaningful latency on a genuine setup.
+            #    Counter is keyed by setup_key (direction+zone+structure) so a
+            #    new setup resets the count even if the instrument stays READY. ──
+            _current_key = _auto_setup_key(a, inst) if is_actionable(a.get("verdict")) else None
+            if _current_key:
+                _prev = _PENDING_READY.get(inst) or {}
+                if _prev.get("key") == _current_key:
+                    _PENDING_READY[inst] = {"key": _current_key, "count": _prev.get("count", 0) + 1}
+                else:
+                    _PENDING_READY[inst] = {"key": _current_key, "count": 1}
+            else:
+                _PENDING_READY.pop(inst, None)
+            _bars_confirmed = (_PENDING_READY.get(inst) or {}).get("count", 0)
+
+            # Discord live card — prod instance only, throttled by LAST_LIVE_CARD_AT,
+            # and gated on READY_SUSTAIN_BARS consecutive confirmations.
+            if DISCORD_LIVE_ENABLED and _bars_confirmed >= READY_SUSTAIN_BARS:
                 last = LAST_LIVE_CARD_AT.get(inst)
                 if not (last and (datetime.now(timezone.utc) - last).total_seconds() < trade_ready_interval()):
                     if not active_trade_for(inst) and is_actionable(a.get("verdict")):
@@ -25587,8 +25620,8 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                         dispatched = send_live_ready_card(entry, inst, notify=True)
                         if dispatched:
                             logger.info(
-                                "Databento scan READY: %s @ %.4f — live card sent",
-                                inst, price,
+                                "Databento scan READY: %s @ %.4f — live card sent (%d bars confirmed)",
+                                inst, price, _bars_confirmed,
                             )
             # ── Databento auto-execute ─────────────────────────────────────────
             # When armed + READY, fire through the SAME audited gateway as the
