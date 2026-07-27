@@ -89,6 +89,20 @@ Databento bar `{ts (unix-s), open, high, low, close, volume}` → `Candle {t: ts
 - Effect: `structure_long = has_bos_demand or has_choch_demand or hh_ts or hl_ts` now fully Databento-capable; same for `structure_short` via LH/LL.
 - Parity OK, goldens OK, breakout/dual-sim smokes OK.
 
+## Phase 2C+ — Sweep-bootstrapped confirmation bridge (DONE)
+**Problem diagnosed**: Phase 2C fires HH/HL/LH/LL from `_detect_structure`, but `_detect_structure` uses SWING_N=5 look-ahead pivot confirmation — a 5-bar lag. If no BOS/CHOCH pivot has been confirmed since bot startup, `_last_bos[inst]` stays None, `_detect_confirmation` exits early (it requires both `_trend[inst]` and `_last_bos[inst]` set), and no structure signal ever reaches ALERT_HISTORY. Production showed sweeps firing for MES but zero HH/HL/BOS/CHOCH logs — explaining persistent `live=WAIT` despite DPv2 seeing READY.
+
+**Fix in `_detect_sweep`**: after injecting BULLISH/BEARISH SWEEP, if `_last_bos[inst]` is None, set provisional `_trend[inst]` + `_last_bos[inst] = {"type": "SWEEP", "level": ...}`. This bootstraps the confirmation path. Guard `if self._last_bos[inst] is None` ensures real BOS/CHOCH always takes precedence.
+
+**Fix in `_detect_confirmation`**: after injecting `"{inst} BULLISH CONFIRMATION"`, also inject `"HL"` into ALERT_HISTORY. After `"{inst} BEARISH CONFIRMATION"`, inject `"LH"`. "HL"/"LH" are NOT in `_STRUCTURE_CB_TYPES` so no scoring callback fires — only the ALERT_HISTORY entry is written.
+
+**Chain**: bullish sweep → provisional trend="bull" + bos set → next strong-close bar (65% body + 1.5× volume + 15-min cooldown) → BULLISH CONFIRMATION injected + HL injected → `_latest_ts("HL")` in evaluate_strict_setup → `structure_gate_long = True` → live gate can reach READY.
+
+**Key invariants**:
+- Guard `if self._last_bos[inst] is None` in `_detect_sweep` → real BOS/CHOCH always wins; no overwrite of established structure
+- "SWEEP" type in provisional `_last_bos` doesn't match dedup strings ("BOS DEMAND", "CHOCH DEMAND") so real `_detect_structure` still fires
+- Goldens byte-identical (DATABENTO_ENABLED=0 → brain off → no injection); dual_sim/parity/scalp_golden smokes all pass
+
 ## Remaining Phase 2 items
 - Phase 2D: FVG detector — 3-candle imbalance gap. Complex, keep TV for now.
 

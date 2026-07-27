@@ -671,6 +671,15 @@ class DatabentoBrain:
                 atype = f"{inst} BULLISH SWEEP"
                 self._inject_alert(inst, atype, cur["close"])
                 self._last_sweep[inst] = {"side": "bull", "level": prior_low}
+                # Bootstrap the confirmation path when no BOS/CHOCH has been
+                # confirmed yet.  Setting trend + a provisional _last_bos lets
+                # _detect_confirmation fire on the NEXT strong-close bar and
+                # inject HL → live gate's _latest_ts("HL") satisfies
+                # structure_gate_long immediately.  A real BOS/CHOCH from
+                # _detect_structure always overwrites this provisional state.
+                if self._last_bos[inst] is None:
+                    self._trend[inst]    = "bull"
+                    self._last_bos[inst] = {"type": "SWEEP", "level": prior_low}
 
         # ── Bearish sweep: wick above prior high, close below it ──────────────
         elif cur["high"] > prior_high and cur["close"] < prior_high:
@@ -679,6 +688,9 @@ class DatabentoBrain:
                 atype = f"{inst} BEARISH SWEEP"
                 self._inject_alert(inst, atype, cur["close"])
                 self._last_sweep[inst] = {"side": "bear", "level": prior_high}
+                if self._last_bos[inst] is None:
+                    self._trend[inst]    = "bear"
+                    self._last_bos[inst] = {"type": "SWEEP", "level": prior_high}
 
     # ── Confirmation candle detection ─────────────────────────────────────────
 
@@ -763,6 +775,14 @@ class DatabentoBrain:
             if not (strong_close or bull_engulf):
                 return
             self._inject_alert(inst, f"{inst} BULLISH CONFIRMATION", cur["close"])
+            # Bridge the SWING_N look-ahead gap: a confirmed strong-close bullish
+            # bar after a detected bullish trend IS a higher-low structure signal.
+            # Satisfies _latest_ts("HL") in evaluate_strict_setup so the live gate
+            # sees real-time Databento confirmation instead of waiting 5 more bars
+            # for the full pivot BOS/CHOCH to be confirmed.  "HL" is NOT in
+            # _STRUCTURE_CB_TYPES so no scoring callback is fired — only the
+            # ALERT_HISTORY deque entry is written.
+            self._inject_alert(inst, "HL", cur["close"])
             self._last_confirm[inst] = {
                 "side": "bull",
                 "ts":   datetime.now(timezone.utc).isoformat(),
@@ -773,6 +793,8 @@ class DatabentoBrain:
             if not (strong_close or bear_engulf):
                 return
             self._inject_alert(inst, f"{inst} BEARISH CONFIRMATION", cur["close"])
+            # Bridge: a confirmed strong-close bearish bar is a lower-high signal.
+            self._inject_alert(inst, "LH", cur["close"])
             self._last_confirm[inst] = {
                 "side": "bear",
                 "ts":   datetime.now(timezone.utc).isoformat(),
