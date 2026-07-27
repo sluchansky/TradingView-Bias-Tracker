@@ -814,6 +814,7 @@ _LAST_DECISION_TRACE = {}   # inst -> latest build_legacy_decision_trace() outpu
 # {inst: {category: {"direction": "Long"/"Short"/None, "ts": iso, ...}}}
 # categories: sweep_reclaim | delta_flip | micro_vwap | micro_choch | bar
 FAST_ENTRY_STATE_BY_TICKER = {}
+_FE_BRIDGE_LAST: dict = {}   # (inst, bridge_type) → last inject datetime (UTC); dedup guard
 
 # Fast Entry seconds micro-event sets (side "fast" — never scored). Un-prefixed
 # forms carried by the seconds Pine script; the payload `ticker` field resolves
@@ -42216,7 +42217,45 @@ def webhook():
     # Fast Entry seconds micro-events ack fast — recorded above (display / state
     # only), kept OUT of the scoring lane (no full_analysis, no money decision here;
     # the optional money path is evaluated in the single-threaded webhook worker).
+    #
+    # ── Structure bridge ─────────────────────────────────────────────────────
+    # MICRO_CHOCH and SWEEP_RECLAIM are genuine structure signals sent from the
+    # TradingView Pine scripts. They were originally walled off from ALERT_HISTORY
+    # (fast-side return-early) so structure_confirmed never saw them. The bridge
+    # below injects an equivalent canonical structure record so the gate works:
+    #   MICRO_CHOCH_SHORT / MICRO CHOCH SHORT  →  "CHOCH SUPPLY"  (bearish CHoCH)
+    #   MICRO_CHOCH_LONG  / MICRO CHOCH LONG   →  "CHOCH DEMAND"  (bullish CHoCH)
+    #   SWEEP_RECLAIM_SHORT / SWEEP RECLAIM SHORT → "LH"           (lower high structure)
+    #   SWEEP_RECLAIM_LONG  / SWEEP RECLAIM LONG  → "HL"           (higher low structure)
+    # DELTA_FLIP and MICRO_VWAP are NOT bridged — order-flow / price-level
+    # context only, not price structure. 5-minute dedup per (inst, bridge_type)
+    # prevents duplicate injections from duplicate TradingView webhook calls.
     if normalized in FAST_ENTRY_TYPES:
+        _fe_bridge = (
+            "CHOCH SUPPLY" if normalized in FAST_MICRO_CHOCH_SHORT_TYPES  else
+            "CHOCH DEMAND" if normalized in FAST_MICRO_CHOCH_LONG_TYPES   else
+            "LH"           if normalized in FAST_SWEEP_RECLAIM_SHORT_TYPES else
+            "HL"           if normalized in FAST_SWEEP_RECLAIM_LONG_TYPES  else
+            None
+        )
+        if _fe_bridge is not None:
+            _now_fe   = now_utc()
+            _fe_dedup = (resolved_inst, _fe_bridge)
+            _fe_last  = _FE_BRIDGE_LAST.get(_fe_dedup)
+            if _fe_last is None or (_now_fe - _fe_last).total_seconds() > 300:
+                _FE_BRIDGE_LAST[_fe_dedup] = _now_fe
+                LAST_ALERT_AT = _now_fe
+                ALERT_HISTORY.append({
+                    "alert_type":  _fe_bridge,
+                    "ticker":      data.get("ticker"),
+                    "instrument":  resolved_inst,
+                    "price":       parsed_price,
+                    "timestamp":   _now_fe.isoformat(),
+                    "source":      "fast_entry_bridge",
+                    "raw":         {"original_type": normalized},
+                })
+                logger.info("Fast-entry bridge: %s → %s (%s)",
+                            normalized, _fe_bridge, resolved_inst)
         return jsonify({"status": "fast_entry_signal", "alert_type": normalized,
                         "ticker": resolved_inst, "price": parsed_price}), 200
 
