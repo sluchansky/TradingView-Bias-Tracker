@@ -1,5 +1,8 @@
 # Memory Index
 
+- [VWAP source authority (Phase 1A)](vwap-source-authority.md) — Grace window was inverted (blocked Databento); now removed. CHART_VWAP_BY_TICKER secondary store + get_vwap_diagnostics(); result["vwap_diagnostics"] always present.
+- [Left Brain Market Intelligence (Phase 1B)](left-brain-mi.md) — Flag-gated DISPLAY-ONLY MI in left_brain_market_intelligence.py; computed at bar-close in _databento_bar_scan → _LEFT_BRAIN_MI_BY_INST[inst]; attached at result["left_brain"]["market_intelligence"]; 31 tests.
+- [compute_scalp_quality does NOT read edge_score](scalp-quality-edge-score.md) — edge_score accepted as param but never consumed; safe to reuse gate-path result at display site when direction unchanged (_lb_sq_no_veto cache).
 - [Databento signal → immediate scan](databento-signal-scan.md) — _databento_structure_trigger spawns _databento_bar_scan on non-dup signals; dual-sim accepts "databento_scan"; /clear-fired-keys endpoint + Auto-Trade Settings button.
 - [Right Brain Trade Management v1](rbtm-shadow-mode.md) — Phase 6B.2 shadow advisory; flag default-OFF (prod env=1 set, pending deploy); _right_brain_orchestrate() is sole full_analysis seam; 47 tests (TM001-TM047); RBTM_VALID_RECOMMENDATIONS frozenset; near-stop CRITICAL not HIGH (TM024 ELEVATED+); 4 accidentally tracked task txt files need cleanup via project task (git rm blocked on main agent).
 - [Phase 6B.1 Baseline Engine](baseline-engine.md) — bt_baseline.py; _jdump must handle frozenset; baseline_trades needed initial_risk_r ALTER; detail returns matrix_results key (not per_combo); first baseline BL-20260726-043053-0cc8364.

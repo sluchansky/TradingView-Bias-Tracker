@@ -312,7 +312,8 @@ ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 # zone stops blocking forever (SCALP=30 min; SWING=None → no expiry, historical).
 MITIGATED_PRICES_BY_TICKER = {}   # {inst: [{"price": float, "ts": str}, ...]} cap 10 each
 MITIGATED_FLAG_BY_TICKER   = {}   # {inst: bool} — mitigation active for this instrument
-VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso}, "MGC": {...}} — latest VWAP per instrument
+VWAP_BY_TICKER      = {}      # {"MNQ": {"value": float, "ts": iso, "source": str, ...}, "MGC": {...}} — authoritative VWAP (Databento primary)
+CHART_VWAP_BY_TICKER = {}     # {"MNQ": {"value": float, "ts": iso}, ...} — last TV/chart-pushed VWAP (secondary, diagnostic only)
 VOLATILITY_BY_TICKER = {}     # {"MNQ": {"atr_pts","ratio","ts"}, "MGC": {...}} — latest volatility per instrument
 # SWING higher-timeframe context per instrument (populated via Pine Script webhooks;
 # feed; optionally overlaid by inbound chart pushes during a grace window — P3).
@@ -5952,6 +5953,96 @@ def get_vwap(ticker, max_age_min=None):
     return float(rec["value"]), "ok"
 
 
+def get_vwap_diagnostics(ticker):
+    """Return a diagnostic snapshot explaining the current VWAP source authority.
+
+    Freshness-aware precedence (Part 1A):
+    • Databento is the PRIMARY source — it writes on every completed 1m bar.
+    • TV/chart pushes land in CHART_VWAP_BY_TICKER (secondary store) AND still
+      update VWAP_BY_TICKER, but Databento overwrites them within ~60 s.
+    • This function exposes which source is currently authoritative so the
+      dashboard and tests can verify correct source selection.
+
+    Returns a dict with keys:
+        vwap_source             — "databento" | "chart" | "alert" | "auto" | "unknown"
+        vwap_age_ms             — milliseconds since the authoritative VWAP was written
+        databento_vwap_available — bool
+        databento_vwap_value    — float | None
+        databento_vwap_age_ms   — int | None
+        chart_vwap_available    — bool
+        chart_vwap_value        — float | None
+        chart_vwap_age_ms       — int | None
+        source_selection_reason — short human-readable explanation
+        selection_correct       — bool: Databento won when it had fresh data (self-audit)
+    """
+    inst = instrument_of(ticker)
+    now  = now_utc()
+
+    def _age_ms(ts_str):
+        if not ts_str:
+            return None
+        try:
+            return int((now - datetime.fromisoformat(ts_str)).total_seconds() * 1000)
+        except Exception:
+            return None
+
+    auth_rec   = VWAP_BY_TICKER.get(inst) or {}
+    chart_rec  = CHART_VWAP_BY_TICKER.get(inst) or {}
+
+    auth_source  = auth_rec.get("source", "unknown")
+    auth_ts      = auth_rec.get("ts")
+    auth_age_ms  = _age_ms(auth_ts)
+
+    # Databento's own ts is written as "db_ts" on its entries; otherwise it IS auth_ts
+    db_ts    = auth_rec.get("db_ts") if auth_source == "databento" else None
+    db_val   = float(auth_rec["value"]) if auth_source == "databento" and auth_rec.get("value") is not None else None
+    db_age   = _age_ms(db_ts)
+
+    chart_val  = float(chart_rec["value"]) if chart_rec.get("value") is not None else None
+    chart_ts   = chart_rec.get("ts")
+    chart_age  = _age_ms(chart_ts)
+
+    db_avail    = db_val is not None
+    chart_avail = chart_val is not None
+
+    # Self-audit: Databento should be authoritative whenever it has a fresh value
+    max_db_age_ms = (cfg("STAGE_WINDOW_MIN") or 30) * 60 * 1000
+    db_fresh = db_avail and db_age is not None and db_age <= max_db_age_ms
+    chart_fresh = chart_avail and chart_age is not None and chart_age <= max_db_age_ms
+
+    if auth_source == "databento" and db_fresh:
+        reason = "Databento authoritative (fresh bar-close VWAP)"
+        correct = True
+    elif auth_source == "databento" and not db_fresh:
+        reason = "Databento written but stale; chart supplement pending next TV push"
+        correct = True  # no better source available
+    elif auth_source in ("chart", "alert") and not db_avail:
+        reason = "Chart/alert supplement active (Databento not yet initialized)"
+        correct = True
+    elif auth_source in ("chart", "alert") and db_avail and db_fresh:
+        reason = "WARNING: chart overrode a fresh Databento value (should not happen with the grace-window fix)"
+        correct = False
+    elif auth_source in ("chart", "alert") and chart_fresh:
+        reason = "Chart/alert supplement active (Databento stale or unavailable)"
+        correct = True
+    else:
+        reason = f"Source '{auth_source}'; no fresh data from either source"
+        correct = True
+
+    return {
+        "vwap_source":              auth_source,
+        "vwap_age_ms":              auth_age_ms,
+        "databento_vwap_available": db_avail,
+        "databento_vwap_value":     db_val,
+        "databento_vwap_age_ms":    db_age,
+        "chart_vwap_available":     chart_avail,
+        "chart_vwap_value":         chart_val,
+        "chart_vwap_age_ms":        chart_age,
+        "source_selection_reason":  reason,
+        "selection_correct":        correct,
+    }
+
+
 # ── Volatility monitor ─────────────────────────────────────────────────────
 # VOLATILITY_BY_TICKER is populated by DatabentoBrain on every bar close.
 # get_volatility() reads from this store; fail-open (status=missing) when absent/stale.
@@ -8979,6 +9070,13 @@ LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total
 # live-eligible (PF >= threshold) it fires through the SAME audited gateway with
 # ALL existing safety (arm flag, _training_gate stage, daily cap, kill-switch).
 RIGHT_BRAIN_MIN_PF     = float(os.getenv("RIGHT_BRAIN_MIN_PF", "1.0"))
+# ── Left Brain Market Intelligence (Phase 1B — DISPLAY-ONLY) ──────────────────
+# Flag-gated deterministic market-state classification computed at every Databento
+# 1m bar close and attached to result["left_brain"]["market_intelligence"].
+# Default OFF → key never added → goldens byte-identical.
+LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED = os.getenv(
+    "LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED", "0") == "1"
+_LEFT_BRAIN_MI_BY_INST: dict = {}  # inst → latest MI block (set by _databento_bar_scan)
 _RIGHT_BRAIN_STATE: dict = {
     "mode":          "training",  # "training" | "live_eligible"
     "profit_factor": 0.0,
@@ -22854,7 +22952,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # from the REAL plan just built and reused for the display block below, so the
     # gate and the dashboard can never drift. FAIL-CLOSED: if the check can't run the
     # setup is vetoed. SWING / flag-off skip this entirely → byte-identical.
-    scalp_quality_block = None
+    scalp_quality_block  = None
+    _lb_sq_no_veto       = None  # cached call-1 result when no veto fired (Part 2 dedup)
     if _scalp_dynamic_enabled() and is_actionable(verdict) and strict_direction:
         try:
             _sq = compute_scalp_quality(
@@ -22885,6 +22984,13 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 # setup's geometry + failing checks (recomputing after the plan is
                 # dropped below would read the nulled plan and lose them).
                 scalp_quality_block = _sq
+        else:
+            # No veto fired — stash the gate-path result for potential reuse at the
+            # display path below (Part 2 safe dedup).  compute_scalp_quality does NOT
+            # consume edge_score, so the only inputs that could differ between call 1
+            # and call 2 are strict_direction (checked at call-2 site) and trade_plan
+            # geometry (unchanged when no veto fired, so the plan reference is stable).
+            _lb_sq_no_veto = _sq
 
     # ── SWING entry MONEY-PATH vetoes (P4) ───────────────────────────────────────
     # SWING-only + master-flag-gated, mirroring the SCALP veto block above. An
@@ -24060,6 +24166,14 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         # computed from the REAL (pre-veto) plan so the dashboard still shows the
         # rejected setup's geometry + failing checks.
         result["scalp_quality"] = scalp_quality_block
+    elif (_lb_sq_no_veto is not None
+          and _sq_dir is not None
+          and _sq_dir == strict_direction):
+        # Part 2 safe dedup: gate-path call already ran with the same direction and
+        # plan, no veto fired, and no subsequent override changed the direction.
+        # compute_scalp_quality is deterministic and does NOT read edge_score, so
+        # the result is byte-identical to what call 2 would produce. Reuse it.
+        result["scalp_quality"] = _lb_sq_no_veto
     else:
         result["scalp_quality"] = compute_scalp_quality(
             _sq_dir, result.get("current_price"), result.get("vwap_value"),
@@ -24432,6 +24546,24 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     _rb_out = _right_brain_orchestrate(result)
     if _rb_out:
         result["right_brain"] = _rb_out
+
+    # ── VWAP Source Diagnostics (Part 1A — DISPLAY-ONLY) ─────────────────────
+    # Always attached (tiny computation; no DB, no network). Exposes which source
+    # is currently authoritative, freshness, and a self-audit flag so the dashboard
+    # and tests can verify correct Databento-primary precedence.
+    try:
+        result["vwap_diagnostics"] = get_vwap_diagnostics(active_ticker)
+    except Exception:
+        result["vwap_diagnostics"] = {"vwap_source": "unknown", "selection_correct": True}
+
+    # ── Left Brain Market Intelligence (Phase 1B — DISPLAY-ONLY) ─────────────
+    # Flag-gated. Reads the latest MI block computed at bar-close by
+    # _databento_bar_scan (never recomputes inline — keeps full_analysis fast).
+    # Default OFF → key absent → goldens byte-identical.
+    if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+        _lb_inst = instrument_of(active_ticker)
+        _lb_mi   = _LEFT_BRAIN_MI_BY_INST.get(_lb_inst)
+        result["left_brain"] = {"market_intelligence": _lb_mi}
 
     return result
 
@@ -25660,6 +25792,16 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                 logger.debug("Dual-sim bar-scan observe (%s): %s", inst, _dse)
             # Right Brain evaluates every bar (READY or not; dev + prod)
             _right_brain_eval(inst, a, price)
+            # ── Left Brain Market Intelligence (Phase 1B) ─────────────────
+            # Computed here (bar-close daemon thread) rather than inline in
+            # full_analysis so the request thread stays fast. Flag OFF → no-op.
+            # FAIL-OPEN: any error is silently swallowed; MI is display-only.
+            if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+                try:
+                    from left_brain_market_intelligence import compute_left_brain_mi  # noqa: PLC0415
+                    _LEFT_BRAIN_MI_BY_INST[inst] = compute_left_brain_mi(inst, a)
+                except Exception as _lbmi_exc:
+                    logger.debug("Left Brain MI (%s): %s", inst, _lbmi_exc)
         except Exception as exc:
             logger.debug("Databento bar scan (%s): %s", inst, exc)
     threading.Thread(target=_scan, name=f"db-scan-{inst}", daemon=True).start()
@@ -42076,7 +42218,16 @@ def webhook():
             vwap_val = None
         if vwap_val is not None:
             vwap_key = resolved_inst
-            VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": now_utc().isoformat(),
+            _chart_ts = now_utc().isoformat()
+            # CHART_VWAP_BY_TICKER: secondary store, always tracks the last TV push.
+            # Used by get_vwap_diagnostics() to compare freshness against Databento.
+            CHART_VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": _chart_ts,
+                                              "source": "chart"}
+            # VWAP_BY_TICKER: authoritative store. TV/chart still writes here for
+            # backward compat, but Databento will overwrite it within the next
+            # completed 1m bar (~60 s). The old 10-min grace window that blocked
+            # Databento was removed — Databento is now always primary.
+            VWAP_BY_TICKER[vwap_key] = {"value": vwap_val, "ts": _chart_ts,
                                         "source": "chart"}
 
     # ── RVOL ingestion (optional `rvol` field on ANY alert) — SOFT Edge modifier ──
@@ -43782,6 +43933,12 @@ def _build_status_payload(_tk):
         **({"stalk_mode": a.get("stalk_mode")} if STALK_MODE_ENABLED else {}),
         **({"active_trade_thinking": a.get("active_trade_thinking")}
            if ACTIVE_THINKING_ENABLED else {}),
+        # ── VWAP Source Diagnostics (Part 1A) — DISPLAY-ONLY ────────────────
+        # Always present; tiny dict; exposes freshness + source authority.
+        "vwap_diagnostics": a.get("vwap_diagnostics"),
+        # ── Left Brain Market Intelligence (Phase 1B) — DISPLAY-ONLY ─────
+        # Present only when LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1.
+        **({"left_brain": a.get("left_brain")} if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED else {}),
         # ── BrainState: unified per-instrument snapshot — DISPLAY-ONLY ──
         "brain_state": a.get("brain_state"),
         # ── Strategy Eligibility Engine — DISPLAY-ONLY, SHADOW MODE ──────────
@@ -49829,6 +49986,8 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
       <div class="db-side" id="lb-side">
         <div class="db-side-hd">Left Brain &nbsp;<span class="db-pill db-pill-scan" id="lb-pill">Scanning</span></div>
         <div id="lb-body"><div class="db-log-row db-log-obs">Waiting for bar close&hellip;</div></div>
+        <!-- Market Intelligence block — shown only when LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1 -->
+        <div id="lb-mi-body" style="margin-top:6px"></div>
       </div>
       <div class="db-side" id="rb-side">
         <div class="db-side-hd">Right Brain &nbsp;<span class="db-pill db-pill-train" id="rb-pill">Training</span></div>
@@ -53007,6 +53166,10 @@ function renderModules(d){
       }
     }
   }
+  // ── Left Brain Market Intelligence (Phase 1B — DISPLAY-ONLY) ─────────────
+  // Reads d.left_brain.market_intelligence from the /status poll payload.
+  // No-op when absent (flag OFF). Never touches money path.
+  try{ renderLBMarketIntelligence(d); }catch(e){ console.warn('[LB-MI]', e && e.message ? e.message.slice(0,40) : String(e).slice(0,30)); }
   // Avatar Intelligence Engine — observe new data every poll tick
   try{ mbAvatarObserve(d); }catch(e){ console.warn('[Avatar] observe error', e && e.message ? e.message.slice(0,60) : String(e).slice(0,40)); }
 }

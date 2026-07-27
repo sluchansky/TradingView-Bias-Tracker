@@ -479,29 +479,24 @@ class DatabentoBrain:
 
         # ── VWAP_BY_TICKER (gate VWAP — replaces Yahoo Finance auto-refresh) ──
         # get_vwap() reads VWAP_BY_TICKER for all gate decisions. Databento is
-        # now the authoritative source when no recent chart/alert push is present.
-        # Grace window: a TradingView "chart" or "alert" push (source != "databento")
-        # wins for VWAP_OVERRIDE_GRACE_MIN minutes; after that Databento resumes.
+        # the PRIMARY source — it always writes at every bar close.
+        #
+        # Freshness-aware precedence rule (Part 1A VWAP fix):
+        #   • Databento ALWAYS writes when it has a value — never blocked by TV.
+        #   • TV/chart pushes land in CHART_VWAP_BY_TICKER (a parallel store
+        #     maintained by app.py) and ALSO still update VWAP_BY_TICKER, but
+        #     Databento will overwrite them within the next completed 1m bar (~60 s).
+        #   • The old 10-minute grace window was inverted: it blocked the fresher
+        #     Databento value in favour of a potentially stale TV push.  Removed.
+        #   • Diagnostic fields (source, db_ts, chart_ts) are written so
+        #     get_vwap_diagnostics() can explain the current authoritative value.
         if vwap is not None and self._vwap is not None:
-            _write_vwap = True
-            existing = self._vwap.get(inst)
-            if existing and existing.get("source") in ("chart", "alert"):
-                try:
-                    from datetime import datetime as _dt, timezone as _tz
-                    age_min = (
-                        _dt.now(_tz.utc) -
-                        _dt.fromisoformat(existing["ts"])
-                    ).total_seconds() / 60.0
-                    if age_min < self._vwap_grace:
-                        _write_vwap = False  # still within grace window
-                except Exception:
-                    pass  # on parse error, let Databento write
-            if _write_vwap:
-                self._vwap[inst] = {
-                    "value":  round(vwap, 4),
-                    "ts":     now_iso,
-                    "source": "databento",
-                }
+            self._vwap[inst] = {
+                "value":   round(vwap, 4),
+                "ts":      now_iso,
+                "source":  "databento",
+                "db_ts":   now_iso,
+            }
 
         # ── Telemetry ─────────────────────────────────────────────────────────
         DATABENTO_STATUS["instruments"][inst] = {
