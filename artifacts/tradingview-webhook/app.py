@@ -23476,14 +23476,27 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         # full READY. The real-order path keys off the actionable verdict + the
         # top-level result["trade_plan"] only, so this nested per-direction preview
         # can never light up the Apply / Copy / Send broker actions. Suppressed on
-        # conflict, a hard blocker (zone broken/consumed), a missing price, a closed
-        # session, or before any structural alert exists — and kept as None in all
-        # those cases for single-return-path reader parity.
+        # conflict, a hard blocker (zone broken/consumed), a missing price, or a
+        # closed session — and kept as None in all those cases for single-return-path
+        # reader parity.
+        #
+        # Signal for generating the preview:
+        #   • structure_confirmed (BOS/CHOCH/HH/HL present) — the full gate, OR
+        #   • liquidity_sweep + vwap_confirmed for this direction — a sweep that
+        #     has already cleared opposing liquidity and whose VWAP side confirms
+        #     the direction is enough to surface a forming plan. The SCALP plan
+        #     builder anchors on VWAP when no zone exists, so this always produces
+        #     a valid entry / stop / TP preview even mid-session when structure
+        #     hasn't fired yet.
         potential_plan = None
         _gd = block.get("gate_debug") or {}
+        _pp_signal = (
+            _gd.get("structure_confirmed")
+            or (_gd.get("liquidity_sweep") and _gd.get("vwap_confirmed"))
+        )
         if (current_price is not None and market["open"]
                 and not block.get("conflict") and not blockers
-                and _gd.get("structure_confirmed")):
+                and _pp_signal):
             _pp = build_strict_trade_plan(
                 _d, active_ticker, current_price, nearest_supply, nearest_demand,
                 volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,

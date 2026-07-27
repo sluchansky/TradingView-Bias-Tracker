@@ -150,3 +150,4 @@
 - [Phase 3 Thesis Enforcement](thesis-phase3-enforcement.md) — shadow gate evaluates READY vs thesis, display-only by default; enforced demotes; confidence_adj is NEVER added to edge_score.
 - [Main Brain UI redesign](main-brain-ui-redesign.md) — Apple×OpenAI: brain-hero/orb-halo/brain-state-pill/brain-intel 2x2/brain-details-toggle; data-brain-state drives CSS; all IDs preserved; goldens byte-identical.
 - [Strategy scan coverage (Phase 6)](strategy-scan-coverage.md) — 3-system audit: 29 total defs; all 5 main-engine scorers always called; OPENING_DRIVE only eligibility gate (outside_session); STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER pattern.
+- [Potential-plan sweep+VWAP gate](potential-plan-sweep-vwap.md) — potential_plan now generates on sweep+vwap_confirmed (not only structure_confirmed); display-only, goldens byte-identical.
