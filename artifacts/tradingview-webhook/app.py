@@ -42294,7 +42294,18 @@ def webhook():
 
     _dormant_sweep = (normalized in DUAL_TF_SWEEP_TYPES
                       and not (DUAL_TF_ENGINE and TRADING_MODE == "SCALP"))
-    if normalized not in ALERT_TYPES or _dormant_sweep:
+    # SWEEP_RECLAIM and MICRO_CHOCH are genuine Pine structure signals — always
+    # pass them through to the structure bridge below regardless of ALERT_TYPES
+    # state or FAST_ENTRY_TRIGGER flag. Without this, "Unrecognized alert type"
+    # fires when the type is absent from ALERT_TYPES (e.g. older prod build),
+    # the bridge never injects LH/HL/CHOCH, and structure_confirmed goes blind.
+    _is_structure_bridge_type = (
+        normalized in FAST_SWEEP_RECLAIM_LONG_TYPES
+        or normalized in FAST_SWEEP_RECLAIM_SHORT_TYPES
+        or normalized in FAST_MICRO_CHOCH_LONG_TYPES
+        or normalized in FAST_MICRO_CHOCH_SHORT_TYPES
+    )
+    if (normalized not in ALERT_TYPES or _dormant_sweep) and not _is_structure_bridge_type:
         logger.warning("Unrecognized alert type: %r", alert_type)
         _record_diagnostic("%s | IGNORED — unrecognized/empty alert: %r" % (
             fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"), alert_type))
