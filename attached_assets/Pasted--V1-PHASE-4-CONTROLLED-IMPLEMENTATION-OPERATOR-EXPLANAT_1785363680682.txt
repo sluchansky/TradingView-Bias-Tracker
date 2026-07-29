@@ -1,0 +1,942 @@
+# V1 PHASE 4 — CONTROLLED IMPLEMENTATION
+# OPERATOR EXPLANATION AND DECISION TIMELINE
+# DO NOT DEPLOY
+# DO NOT PUBLISH
+
+Accepted Phase 4 execution brief:
+
+3fa65d0 — V1-P4 pre-implementation execution brief
+
+Accepted completed foundation:
+
+- Phase 2 complete at 29e1d4d
+- Phase 3 verification complete at aa7ee5f
+- Phase 3 provenance audit complete at ee808db
+- Phase 4 execution brief complete at 3fa65d0
+
+Phase 4 contains:
+
+V1-P4-001 through V1-P4-010
+
+The controlling implementation plan is:
+
+PHASE_4_EXECUTION_BRIEF.md
+
+Read it completely before modifying any file.
+
+=========================================================
+DOCUMENT PRECEDENCE
+=========================================================
+
+Use this precedence:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PHASE_4_EXECUTION_BRIEF.md
+4. PRODUCT_SPEC_V1.md
+5. PLATFORM_BLUEPRINT.md
+6. V1_PHASE_3_VALIDATION.md
+7. V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md
+
+If the roadmap, architecture, and execution brief conflict on required runtime behavior, interface ownership, or task completion criteria:
+
+STOP and report the conflict.
+
+Do not invent a compromise.
+
+=========================================================
+STAGE 0 — BASELINE FREEZE
+=========================================================
+
+Before modifying anything, record:
+
+- branch
+- current HEAD
+- git status
+- tracked modified files
+- untracked files
+- git diff --stat
+- git diff --check
+- recent commit history
+- whether 3fa65d0 is an ancestor of HEAD
+- every commit after 3fa65d0
+- classification of each intervening commit
+
+Classify intervening commits as:
+
+- implementation
+- test-only
+- documentation-only
+- platform checkpoint
+- attached asset
+- memory-only
+- unexplained
+
+For every implementation commit after 3fa65d0:
+
+- inspect the full diff
+- identify changed functions
+- identify roadmap ownership
+- identify whether it overlaps Phase 4
+
+Stop on unexplained code changes.
+
+Do not:
+
+- reset
+- rebase
+- squash
+- amend
+- stash
+- discard
+- overwrite unrelated work
+
+=========================================================
+STAGE 1 — BASELINE VALIDATION
+=========================================================
+
+Run the complete accepted baseline before Phase 4 work.
+
+At minimum:
+
+python3 artifacts/tradingview-webhook/test_phase3_thesis_verdict_pipeline.py
+python3 artifacts/tradingview-webhook/test_v1_interface_versions.py
+python3 artifacts/tradingview-webhook/test_phase2_market_data_reliability.py
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Also run:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- py_compile or equivalent syntax validation
+- git diff --check
+
+Record exact commands and counts.
+
+Expected minimum baseline:
+
+- Phase 3: 60 passing
+- Interface tests: current accepted total or higher
+- Phase 2: 45 passing
+- Phase 2 smoke: 8/8 passing
+- all four primary regressions passing
+
+If any baseline failure is unexplained:
+
+STOP.
+
+Do not modify tests to hide it.
+
+=========================================================
+STAGE 2 — RESOLVE THE FOUR RESEARCH QUESTIONS
+=========================================================
+
+Resolve these questions before implementing or writing final assertions.
+
+Do not guess field paths.
+
+---------------------------------------------------------
+RESEARCH QUESTION 1 — POTENTIAL PLAN
+---------------------------------------------------------
+
+Determine the exact canonical path for potential-plan information in the real `/status` payload.
+
+The execution brief suggests it is nested under directional data rather than exposed as a simple top-level field.
+
+Document:
+
+- payload owner
+- exact field path
+- value type
+- absent behavior
+- malformed behavior
+- whether it is authoritative or derived
+- which Phase 4 explanation consumes it
+
+Use runtime payload evidence.
+
+Do not rely only on source-text search.
+
+---------------------------------------------------------
+RESEARCH QUESTION 2 — ACTIVE TRADE
+---------------------------------------------------------
+
+Determine the exact active-trade indicator available through `/status`.
+
+Investigate:
+
+- active_trade
+- active_trade_mgmt
+- managed_trade
+- any nested interface field
+- any serialized form used by the dashboard
+
+Document:
+
+- canonical owner
+- exact field path
+- active value type
+- inactive value
+- unavailable value
+- whether the dashboard currently consumes it
+
+Do not create a duplicate active-trade field merely to simplify tests.
+
+---------------------------------------------------------
+RESEARCH QUESTION 3 — THESIS INVALIDATION
+---------------------------------------------------------
+
+Determine the exact authoritative representation of a thesis-invalidated event.
+
+Investigate at minimum:
+
+- thesis status
+- thesis event type
+- outlook-shift events
+- invalidating reason
+- transition history
+- observation timeline
+- Left Brain thesis output
+- `/status`
+- `/decision-trace`
+
+Document:
+
+- canonical event owner
+- exact field path
+- event name or status
+- reason field
+- timestamp field
+- unavailable behavior
+- whether invalidation is an event or a current-state label
+
+Do not map unrelated states to `THESIS_INVALIDATED`.
+
+Do not infer invalidation solely because a thesis is no longer actionable.
+
+---------------------------------------------------------
+RESEARCH QUESTION 4 — DECISION TRACE AUTH
+---------------------------------------------------------
+
+Determine the correct validation boundary for `/decision-trace`.
+
+Separate:
+
+- Flask application behavior
+- Express proxy behavior
+- production authentication behavior
+
+If Express authentication cannot be meaningfully validated through the Flask test client:
+
+- do not fake the result
+- test Flask behavior at the Flask boundary
+- document proxy auth as externally owned
+- provide existing evidence for the proxy boundary
+- do not modify auth unless Phase 4 explicitly requires it
+
+Phase 4 must not weaken authentication.
+
+---------------------------------------------------------
+RESEARCH OUTPUT
+---------------------------------------------------------
+
+Add the resolved findings to the Phase 4 working notes before implementation.
+
+For each question provide:
+
+- conclusion
+- evidence
+- source function
+- serialized path
+- test approach
+- implementation impact
+
+If any required source value does not exist:
+
+STOP and report which Phase 4 task is blocked.
+
+=========================================================
+STAGE 3 — FINAL TASK TABLE
+=========================================================
+
+Using the roadmap and execution brief, create the final task table for:
+
+V1-P4-001 through V1-P4-010
+
+For every task include:
+
+- task ID
+- exact requirement
+- existing implementation
+- implementation gap
+- authoritative owner
+- authorized files
+- authorized functions
+- runtime change required
+- test-only verification allowed or not
+- completion evidence
+- dependency
+- risk
+- final status before implementation
+
+Do not start implementation until all ten rows are complete.
+
+=========================================================
+STAGE 4 — IMPLEMENTATION CONTRACT
+=========================================================
+
+Write the implementation contract before editing production code.
+
+It must state:
+
+- exact Phase 4 task IDs being implemented
+- exact files authorized to change
+- exact production functions authorized to change
+- exact dashboard sections authorized to change
+- expected runtime behavior changes
+- behaviors that must remain unchanged
+- tests required for each task
+- stop conditions
+- commit strategy
+
+Expected primary deliverables:
+
+- `artifacts/tradingview-webhook/test_phase4_operator_explanation.py`
+- `V1_PHASE_4_VALIDATION.md`
+
+Conditional production change:
+
+- `artifacts/tradingview-webhook/app.py`
+
+`app.py` may change only if the V1-P4-009 DIAGNOSTIC audit proves the current operator surface is missing required content or displays it incorrectly.
+
+Do not modify `app.py` preemptively.
+
+=========================================================
+PHASE 4 FUNCTIONAL REQUIREMENTS
+=========================================================
+
+Implement and validate the ten roadmap tasks exactly as documented.
+
+The following explanation states must be represented using authoritative runtime data.
+
+---------------------------------------------------------
+A. MARKET_CLOSED
+---------------------------------------------------------
+
+When the market or instrument session is closed, the operator explanation must make that state understandable.
+
+It must distinguish:
+
+- session closed
+- market-data unavailable
+- maintenance or halt state
+- ordinary WAIT conditions
+
+Do not report a market as closed merely because data is stale.
+
+Use the existing CME/session owner.
+
+Do not add a new competing session calculation.
+
+---------------------------------------------------------
+B. WAIT
+---------------------------------------------------------
+
+WAIT explanations must communicate the actual failed conditions.
+
+Use the canonical failed-gate evidence already produced by the decision pipeline.
+
+Do not recompute gate truth independently.
+
+Do not turn a generic absence of readiness into a fabricated failure reason.
+
+Preserve:
+
+- current verdict
+- confidence
+- edge score
+- actionability
+- strategy result
+- direction
+
+---------------------------------------------------------
+C. VETO_ACTIVE
+---------------------------------------------------------
+
+When a veto blocks an otherwise meaningful setup, the explanation must identify:
+
+- that a veto is active
+- the authoritative veto source
+- the blocking reason when available
+- the distinction between veto and ordinary failed confirmation
+
+Do not convert every failed condition into a veto.
+
+Do not change veto logic.
+
+---------------------------------------------------------
+D. READY
+---------------------------------------------------------
+
+READY explanations must communicate why the setup is actionable using existing decision evidence.
+
+Do not manufacture certainty.
+
+Do not change the readiness threshold.
+
+Do not change confidence or edge score.
+
+---------------------------------------------------------
+E. EARLY
+---------------------------------------------------------
+
+EARLY must remain distinct from READY and WAIT.
+
+The explanation must communicate that a potential setup exists but required confirmation or timing is incomplete.
+
+Use the authoritative potential-plan and direction data discovered in Stage 2.
+
+Do not introduce a new trade state merely for UI convenience.
+
+---------------------------------------------------------
+F. ACTIVE TRADE
+---------------------------------------------------------
+
+When a trade is active, the operator explanation must prioritize active-trade management over a new-entry narrative.
+
+Use the canonical Manager or active-trade owner.
+
+Do not recompute stop, target, risk, or trade state.
+
+Do not expose mutable internal objects.
+
+---------------------------------------------------------
+G. THESIS_INVALIDATED
+---------------------------------------------------------
+
+When a true thesis-invalidating event exists, explain:
+
+- that the prior thesis was invalidated
+- the authoritative invalidating event or status
+- the reason when available
+- timing when available
+- current thesis state
+
+Do not fabricate invalidation from missing data.
+
+Do not equate `CONFLICTED`, `WAIT`, or `OUTLOOK_SHIFT` with invalidation unless the architecture explicitly defines that mapping.
+
+---------------------------------------------------------
+H. PARTNER FALLBACK
+---------------------------------------------------------
+
+If Partner explanation generation fails, the surrounding status or decision surface must remain available.
+
+Requirements:
+
+- fail safely
+- preserve the underlying decision result
+- provide a deterministic fallback explanation
+- do not return HTTP 500 solely because the Partner explanation failed
+- do not hide the failure completely
+- do not place orders
+- do not write unexpected database state
+
+This is fault-containment work only.
+
+Do not broaden it into a Partner refactor.
+
+---------------------------------------------------------
+I. OPERATOR MODE DIAGNOSTIC AUDIT
+---------------------------------------------------------
+
+Audit the existing dashboard/operator surface for required diagnostic information.
+
+Verify whether the UI already exposes:
+
+- verdict
+- primary explanation
+- failed conditions
+- active veto
+- thesis state
+- potential plan
+- active-trade priority
+- relevant timestamps or freshness
+- decision-trace access where authorized
+
+Reach one explicit result:
+
+1. COMPLETE — no dashboard changes required
+2. PARTIAL — additive CSS/HTML/JavaScript change required
+3. BLOCKED — required data does not exist
+
+Only modify dashboard HTML/CSS/JavaScript if result 2 is proven.
+
+Any dashboard change must be:
+
+- additive
+- operator-facing only
+- non-behavioral to trading logic
+- backward-compatible
+- free of new polling loops unless explicitly authorized
+- free of direct broker or database calls
+
+Do not redesign the dashboard.
+
+Do not alter the main navigation.
+
+Do not remove legacy panels.
+
+---------------------------------------------------------
+J. DECISION TRACE
+---------------------------------------------------------
+
+Validate the decision-trace output across the required Phase 4 states.
+
+Requirements:
+
+- deterministic serialization
+- no mutable global references
+- no HTTP 500 for expected degraded states
+- strict instrument resolution
+- no default-to-MGC fallback for malformed instruments
+- active-trade priority
+- explanation alignment with actual verdict
+- no broker communication
+- no unexpected persistence
+
+Do not change the canonical decision-trace schema unless explicitly required by the roadmap.
+
+Any extension must be additive and tested.
+
+=========================================================
+CANONICAL INTERFACE PROTECTION
+=========================================================
+
+Preserve all seven canonical contracts:
+
+- Left Brain v2
+- Expert v1
+- Partner v1
+- Manager v1
+- Execution Gateway v1
+- Journal v1
+- Coach v1
+
+Do not:
+
+- rename `_version`
+- change version values
+- remove required fields
+- change field types
+- expose live mutable dictionaries
+- substitute readiness for an actual event
+- add `_version` metadata to broker payloads
+- recompute business logic in read-only interface builders
+
+Partner fault injection in tests is authorized.
+
+Production Partner behavior may be changed only to provide the exact Phase 4 fallback required by the roadmap.
+
+=========================================================
+GLOBAL PROHIBITIONS
+=========================================================
+
+Unless an exact Phase 4 task explicitly requires it, do not modify:
+
+- Databento ingestion
+- TradingView fallback
+- Pine defaults
+- market-data normalization
+- VWAP
+- ATR
+- CVD
+- delta
+- session calculations
+- strategy definitions
+- strategy scanner universe
+- edge-score formulas
+- confidence formulas
+- verdict logic
+- readiness thresholds
+- actionability logic
+- veto criteria
+- risk
+- sizing
+- stops
+- targets
+- prop protections
+- duplicate-order protection
+- correlated cooldowns
+- daily-loss protection
+- broker routing
+- TradersPost payloads
+- live execution authorization
+- journal persistence
+- learning weights
+- database schema
+- environment variables
+- production authentication
+- deployment configuration
+
+Do not publish.
+
+Do not deploy.
+
+Do not restart production.
+
+Do not send live webhooks.
+
+Do not place live or paper orders.
+
+=========================================================
+TEST REQUIREMENTS
+=========================================================
+
+Create:
+
+`artifacts/tradingview-webhook/test_phase4_operator_explanation.py`
+
+Use tracked, runtime-focused tests.
+
+Target approximately 35–45 meaningful tests, but correctness matters more than count.
+
+Every Phase 4 task must have direct evidence.
+
+Test categories should include:
+
+- runtime function tests
+- Flask endpoint tests
+- integration tests across status and decision trace
+- serialization tests
+- controlled dependency-failure tests
+- repeated-call stability tests
+- non-mutation tests
+
+Do not use source inspection as the primary proof.
+
+Do not rely primarily on:
+
+- grep
+- AST inspection
+- `inspect.getsource()`
+- string presence
+- field-name-only assertions
+
+Static checks may supplement runtime evidence.
+
+---------------------------------------------------------
+REQUIRED TEST STATES
+---------------------------------------------------------
+
+Test at minimum:
+
+1. MARKET_CLOSED
+2. market-data unavailable
+3. stale market data
+4. ordinary WAIT
+5. WAIT with multiple failed conditions
+6. VETO_ACTIVE
+7. READY
+8. EARLY
+9. active trade
+10. THESIS_INVALIDATED
+11. Partner exception
+12. missing optional Partner fields
+13. malformed instrument
+14. unknown instrument
+15. missing thesis data
+16. malformed thesis data
+17. repeated calls
+18. serialization
+19. global-state non-mutation
+20. no broker communication
+21. no unexpected database writes
+22. `/status` degraded behavior
+23. `/decision-trace` degraded behavior
+24. DIAGNOSTIC operator-mode content
+
+---------------------------------------------------------
+STRICT TEST ASSERTIONS
+---------------------------------------------------------
+
+Tests must prove that Phase 4 does not unexpectedly change:
+
+- verdict
+- direction
+- confidence
+- edge score
+- actionability
+- risk
+- sizing
+- stop
+- targets
+- strategy selection
+- broker payload
+- execution authorization
+- journal records
+- learning state
+- Databento behavior
+
+Where fault injection is used:
+
+- restore every patched object
+- isolate global state
+- avoid order-sending paths
+- avoid production network calls
+- avoid persistent database writes
+
+=========================================================
+V1-P4-009 DASHBOARD VALIDATION
+=========================================================
+
+If no dashboard change is required:
+
+- provide runtime or rendered-output evidence
+- document every required field and its existing source
+- do not edit `app.py`
+
+If a dashboard change is required:
+
+- limit changes to the exact operator diagnostic surface
+- preserve current layout outside that surface
+- validate JavaScript syntax
+- validate HTML interpolation
+- validate missing-field behavior
+- validate repeated refreshes
+- validate no duplicate DOM insertion
+- validate no new browser errors
+- validate no backend behavior changes
+
+Run:
+
+- Python syntax validation
+- extracted dashboard `<script>` syntax using `node --check`
+- targeted dashboard rendering tests where practical
+
+=========================================================
+VALIDATION DOCUMENT
+=========================================================
+
+Create:
+
+`V1_PHASE_4_VALIDATION.md`
+
+Include:
+
+1. Baseline State
+
+2. Intervening Commit Audit
+
+3. Phase 4 Scope
+
+4. Research Question Resolution
+
+5. Implementation Contract
+
+6. Task-by-Task Results
+
+7. Operator Explanation State Matrix
+
+8. Decision Timeline and Trace Validation
+
+9. Operator Mode DIAGNOSTIC Audit
+
+10. Interface Compatibility
+
+11. Behavioral Comparison
+
+12. Test Evidence
+
+13. File Inventory
+
+14. Deployment Status
+
+15. Honest Final Task Status
+
+For every task V1-P4-001 through V1-P4-010 state:
+
+- COMPLETE
+- PARTIAL
+- BLOCKED
+- NOT STARTED
+
+Do not mark a task complete solely because a test found an existing field.
+
+Completion must prove the roadmap’s operator-facing behavior.
+
+=========================================================
+REGRESSION SUITE
+=========================================================
+
+After each implementation group, run targeted Phase 4 tests.
+
+Before completion, run:
+
+- all Phase 4 tests
+- all Phase 3 tests
+- all interface tests
+- all Phase 2 tests
+- Phase 2 smoke runner from repository root
+- Phase 2 smoke runner from `/tmp`
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- directly affected existing dashboard/status/decision-trace tests
+- Python syntax validation
+- Node syntax validation if dashboard code is touched
+- git diff --check
+
+Record:
+
+- exact command
+- exit code
+- passed
+- failed
+- skipped
+- warnings
+- duration where available
+
+Stop if a golden result changes unexpectedly.
+
+=========================================================
+DIFF CONTROL
+=========================================================
+
+Before committing:
+
+git status
+git diff --stat
+git diff --check
+git diff
+
+Inspect the complete diff.
+
+For every changed file document:
+
+- Phase 4 task authorizing it
+- exact reason
+- runtime effect
+- tests proving it
+
+Do not commit:
+
+- instruction attachments
+- `.local` state
+- temporary files
+- generated caches
+- secrets
+- unrelated task-agent files
+
+All required tests and validation artifacts must be tracked and reproducible from a clean clone.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If all ten tasks are complete and validation is green, create one commit:
+
+`V1-P4 Operator Explanation and Decision Timeline`
+
+If production dashboard code and backend fallback code form independently validated units and the roadmap explicitly supports separate commits, two commits are acceptable:
+
+1. Phase 4 behavior and tests
+2. Phase 4 operator UI diagnostics
+
+Do not create unnecessary commit fragmentation.
+
+Do not amend earlier commits.
+
+Do not squash.
+
+Do not force-push.
+
+Do not deploy.
+
+=========================================================
+STOP CONDITIONS
+=========================================================
+
+Stop immediately if:
+
+- baseline validation fails
+- HEAD changes unexpectedly
+- a roadmap conflict appears
+- a required field has no authoritative owner
+- thesis invalidation cannot be represented honestly
+- Partner fallback requires altering decision logic
+- operator explanation requires recomputing gate logic
+- dashboard requirements need a schema-breaking change
+- `/decision-trace` auth ownership is unclear
+- implementation would weaken authentication
+- implementation would change broker behavior
+- implementation would change Databento behavior
+- a golden regression changes unexpectedly
+- a required test depends on a live broker or feed
+- a required artifact would remain untracked
+- secrets appear in output or diff
+
+Do not silently work around a stop condition.
+
+=========================================================
+FINAL RESPONSE FORMAT
+=========================================================
+
+Report:
+
+1. Phase 4 title
+2. Starting branch and HEAD
+3. Accepted baseline
+4. Intervening commits and classifications
+5. Ending branch and HEAD
+6. Research question 1 result
+7. Research question 2 result
+8. Research question 3 result
+9. Research question 4 result
+10. Phase 4 task IDs
+11. Tasks complete
+12. Tasks partial
+13. Tasks blocked
+14. Files created
+15. Files modified
+16. Files deleted
+17. Production runtime changes
+18. Dashboard changes
+19. Canonical interfaces affected
+20. Tests added
+21. Phase 4 test result
+22. Phase 3 test result
+23. Interface-test result
+24. Phase 2 test result
+25. Phase 2 smoke results from both working directories
+26. Four primary regression results
+27. Python syntax result
+28. Node syntax result if applicable
+29. git diff --check result
+30. Verdict-change confirmation
+31. Confidence and edge-score confirmation
+32. Gate and actionability confirmation
+33. Risk and sizing confirmation
+34. Databento confirmation
+35. Execution and broker confirmation
+36. Journal confirmation
+37. Learning confirmation
+38. Database-schema confirmation
+39. Authentication confirmation
+40. Validation document
+41. Commit or commits created
+42. Honest status of V1-P4-001 through V1-P4-010
+43. Deployment confirmation
+44. Whether Phase 5 may begin
+
+Do not begin Phase 5.
+
+Do not deploy.
+
+Do not publish.
+
+Stop after reporting.
