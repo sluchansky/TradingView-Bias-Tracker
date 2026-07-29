@@ -22792,34 +22792,44 @@ def build_manager_interface(result, instrument=None):
     to the database.  Guaranteed to return the ARCH §7 Manager output contract
     dict (with neutral stubs on partial failure).
 
+    Mutability guarantee: active_trade and managed_trade are shallow-copied so
+    consumers cannot mutate global ACTIVE_TRADES_BY_INST or MANAGED_TRADES_BY_KEY
+    through this interface.
+
     Fields:
       gateway_debug      per-gate PASS/FAIL outcome from Expert result
                          (ARCH field name; code key is "gate_debug")
-      active_trade       current ACTIVE_TRADES_BY_INST entry (None if no trade)
-      managed_trade      first open MANAGED_TRADES_BY_KEY entry for instrument
-                         (None if no paper/managed trade open)
-      training_gate      Bot Training Mode gate status (read-only flag check)
-      auto_trade_enabled per-instrument arm state map
+      active_trade       shallow copy of ACTIVE_TRADES_BY_INST[inst] (None if no trade)
+      managed_trade      shallow copy of first open MANAGED_TRADES_BY_KEY entry for
+                         instrument (None if no paper/managed trade open)
+      training_gate      Bot Training Mode arm status {"enabled": bool}
+      auto_trade_enabled per-instrument arm state map {instrument: bool}
       _version           "v1"
     """
     inst = instrument or (result.get("active_ticker") if result else None) or ""
     try:
         # gateway_debug: per-gate PASS/FAIL outcome carried in Expert result.
+        # Read-only; does not expose secrets or broker payloads.
         gateway_debug = (result.get("gate_debug") or {}) if result else {}
 
-        # active_trade: current ACTIVE_TRADES_BY_INST entry for this instrument.
+        # active_trade: shallow copy of ACTIVE_TRADES_BY_INST entry for instrument.
+        # active_trade_snapshot() shallow-copies the outer dict but inner trade dicts
+        # are shared references; dict() here prevents consumer mutation of global state.
         at_snap      = active_trade_snapshot()
-        active_trade = at_snap.get(inst) if inst else None
+        _at_raw      = at_snap.get(inst) if inst else None
+        active_trade = dict(_at_raw) if _at_raw is not None else None
 
-        # managed_trade: first open MANAGED_TRADES_BY_KEY entry for instrument.
+        # managed_trade: shallow copy of first open MANAGED_TRADES_BY_KEY entry.
         # Lock-free list snapshot (same pattern as display blocks throughout app).
+        # dict() prevents consumer mutation of the live managed-trade object.
         managed_trade = None
         for _mt in list(MANAGED_TRADES_BY_KEY.values()):
             if _mt.get("instrument") == inst and not _mt.get("closed"):
-                managed_trade = _mt
+                managed_trade = dict(_mt)
                 break
 
         # training_gate: Bot Training Mode arm status — pure env-var read.
+        # Represents whether training mode is armed, not the per-call gate verdict.
         training_gate = {"enabled": training_mode_enabled()}
 
         # auto_trade_enabled: per-instrument arm state map (AUTO_TRADE under lock).
@@ -22849,45 +22859,71 @@ def build_coach_interface(result, instrument=None, mode=None):
     """Canonical Coach Interface v1.
 
     Read-only aggregation of learning subsystem status for the given instrument
-    + mode.  Reports whether the learning weight recompute has run, whether
-    thesis resolution is operational, the current ±15 Edge Score modifier, and
-    the Rule Engine eligibility.
-
-    Never triggers a learning update, database write, or scoring change.
+    + mode.  Never triggers a learning update, database write, or scoring change.
     Guaranteed to return the ARCH §7 Coach output contract dict (with neutral
     stubs on partial failure).
 
+    Semantic notes:
+      weight_updated    — True ONLY when _recompute_learning() completed
+                         successfully at least once in this session (authoritative
+                         signal: LEARNING_ANALYTICS["updated_at"] is present and
+                         non-None, set at recompute completion, not at boot or
+                         mere DB availability).  NOT a readiness or enablement flag.
+
+      thesis_resolved   — False during ordinary full_analysis() because no thesis
+                         snapshot resolution event occurs outside of a trade-close.
+                         The ARCH defines False as "resolve did not run"; there is
+                         no global "last resolution ran" flag in the codebase.
+                         This is the architecture-defined unavailable value, not an
+                         invented substitute.
+
+      learning_influence — ±15 Edge Score modifier from result's per-direction
+                          learning_score_influence.  The active direction carries a
+                          non-zero delta; the inactive direction is 0.  Reads
+                          result["learning_score_influence"][dir]["delta"] which is
+                          the actual learning_score_delta applied during scoring
+                          (gd.get("learning_score_delta", 0) from _ls_dir_summary).
+
+      rule_engine_eligibility — pure cache read from LEARNING_ELIGIBILITY via
+                               _check_learning_eligibility(); no writes, no
+                               counters, no DB call, no recompute.
+
     Fields:
-      weight_updated           True when _recompute_learning() has populated
-                               LEARNING_ANALYTICS (ready flag set)
-      thesis_resolved          True when thesis_snapshots DB table is accessible
-                               (Thesis Tracker resolve mechanism is operational)
-      learning_influence       current ±15 modifier from result's per-direction
-                               learning_score_influence; 0.0 when off/uncomputed
-      rule_engine_eligibility  "GHOST_ONLY" | "LIVE_ELIGIBLE" from in-memory
-                               LEARNING_ELIGIBILITY cache
+      weight_updated           True if _recompute_learning() ran in this session
+      thesis_resolved          False (no resolution in full_analysis context)
+      learning_influence       float: active-direction learning_score_delta
+      rule_engine_eligibility  "GHOST_ONLY" | "LIVE_ELIGIBLE"
       _version                 "v1"
     """
     inst  = instrument or (result.get("active_ticker") if result else None) or ""
     _mode = mode or TRADING_MODE
     try:
-        # weight_updated: True when _recompute_learning() ran and set ready=True.
+        # weight_updated: True ONLY when _recompute_learning() has run successfully.
+        # LEARNING_ANALYTICS["updated_at"] is set at line ~12590 inside the
+        # recompute body, NOT at boot and NOT by DB availability probes.  The boot
+        # default is {"enabled":…, "ready": False, "total_trades": 0} — no "updated_at".
+        # This correctly distinguishes "recompute ran" from "system ready/enabled."
         with LEARNING_LOCK:
-            weight_updated = bool(LEARNING_ANALYTICS.get("ready", False))
+            weight_updated = bool(LEARNING_ANALYTICS.get("updated_at"))
 
-        # thesis_resolved: True when the thesis_snapshots table is accessible.
-        # THESIS_TRACKER_DB_READY is set by _check_thesis_tracker_db_ready() on
-        # boot — True means the resolve mechanism is operational.
-        thesis_resolved = bool(THESIS_TRACKER_DB_READY)
+        # thesis_resolved: False — the correct ARCH-defined value during full_analysis().
+        # The ARCH contract is "True if thesis_snapshots resolve ran."  No thesis
+        # resolution event occurs during full_analysis(); no global "last resolve ran"
+        # flag exists in the codebase.  False = "resolve did not run" per bool semantics.
+        thesis_resolved = False
 
         # learning_influence: active direction ±15 delta from result's LSI block.
-        # Only the active direction carries a non-zero delta; the other is 0.
+        # _ls_dir_summary (line ~23454) builds Long/Short from gate_debug per direction:
+        # "delta": gd.get("learning_score_delta", 0) — the actual adjustment applied.
+        # Only the active direction is non-zero; the inactive direction is 0.
         _lsi        = (result.get("learning_score_influence") or {}) if result else {}
         _long_d     = float((_lsi.get("Long")  or {}).get("delta") or 0.0)
         _short_d    = float((_lsi.get("Short") or {}).get("delta") or 0.0)
         learning_influence = _long_d if _long_d != 0.0 else _short_d
 
-        # rule_engine_eligibility: in-memory LEARNING_ELIGIBILITY cache lookup.
+        # rule_engine_eligibility: pure in-memory LEARNING_ELIGIBILITY cache read.
+        # _check_learning_eligibility() acquires LEARNING_ELIGIBILITY_LOCK read-only;
+        # no writes, no counters, no timestamps, no DB, no recompute triggered.
         _elig_status, _ = _check_learning_eligibility(inst, mode=_mode)
         rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE"
 

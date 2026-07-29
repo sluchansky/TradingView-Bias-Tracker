@@ -1,7 +1,8 @@
 """test_v1_interface_versions.py — V1 Phase 1 Interface Version Contract Tests.
 
 Verifies that each proven-canonical component interface output carries the
-correct _version field and that all ARCH §7 required fields remain present.
+correct _version field, that all ARCH §7 required fields remain present, and
+that each field has the correct *semantic meaning* (not just presence).
 
 Interface status (current):
   V1-P1-001  Expert             v1   COMPLETE   full_analysis() result
@@ -12,17 +13,21 @@ Interface status (current):
   V1-P1-006  Journal            v1   COMPLETE   _build_card_entry() entry dict
   V1-P1-007  Coach              v1   COMPLETE   build_coach_interface()
 
-Isolation invariants for Manager and Coach:
-  - _active_trade_mgmt_block() is a display helper — must NOT carry _version
-  - result["learning_score_influence"] is the edge-scoring modifier block — must NOT carry _version
-  Both non-canonical objects remain untouched by this batch.
+Semantic correctness audit (after 4e322c8):
+  weight_updated:   LEARNING_ANALYTICS["updated_at"] (recompute completion timestamp),
+                    NOT LEARNING_ANALYTICS["ready"] (which is total_trades > 0).
+  thesis_resolved:  False during ordinary full_analysis() — no thesis resolution
+                    event occurs outside trade-close; no global "last resolve ran"
+                    flag exists; THESIS_TRACKER_DB_READY is NOT the right source.
+  active_trade:     Shallow-copied before return — consumers cannot mutate global state.
+  managed_trade:    Shallow-copied before return — consumers cannot mutate global state.
 
-No modifications to scoring, gate, execution, or safety logic anywhere in this file.
-Tests are read-only consumers of the existing interfaces.
+Isolation invariants:
+  _active_trade_mgmt_block() must NOT carry _version (display helper, not Manager)
+  result["learning_score_influence"] must NOT carry _version (edge modifier, not Coach)
 """
 import json
 import os
-import re
 import sys
 import importlib
 
@@ -119,7 +124,6 @@ def test_expert_version_type():
 def test_expert_version_serializes():
     """full_analysis() _version must survive JSON serialization."""
     result = app.full_analysis()
-    # Only serialize the version field to avoid any non-serializable objects in full payload
     assert json.dumps({"_version": result.get("_version")}) == '{"_version": "v1"}'
 
 
@@ -162,411 +166,733 @@ def test_partner_version_type():
 
 # ===========================================================================
 # V1-P1-005  EXECUTION GATEWAY  (v1)  — source inspection
-#
-# execute_trade_gateway() requires broker configuration and a full trading
-# context to call live. Source inspection is used as documented in the
-# corrective validation report. It verifies the three normal-path return dicts.
 # ===========================================================================
 
 def _gateway_fn_src():
-    """Extract source text of execute_trade_gateway() from app.py.
-
-    The function is ~900 lines; the three success returns appear well past
-    the first 6 000 characters.  We use 55 000 chars to guarantee coverage.
-    """
     src = _app_src()
     start = src.find("def execute_trade_gateway(")
     assert start >= 0, "execute_trade_gateway not found in app.py"
-    # Locate the next top-level def after the function to bound the extraction
     next_def = src.find("\ndef ", start + 1)
     end = next_def if (0 < next_def - start < 200_000) else start + 55_000
     return src[start:end]
 
 
 def test_gateway_manual_required_version_in_source():
-    """execute_trade_gateway() manual_required return must carry _version == 'v1'."""
     gw = _gateway_fn_src()
-    assert '"status": "manual_required"' in gw, "manual_required path not found in gateway source"
-    # The _version must appear AFTER the manual_required status in the same return block
+    assert '"status": "manual_required"' in gw
     idx = gw.find('"status": "manual_required"')
-    block = gw[idx:idx + 400]
-    assert '"_version": "v1"' in block, (
-        "execute_trade_gateway manual_required path missing _version v1")
+    assert '"_version": "v1"' in gw[idx:idx + 400]
 
 
 def test_gateway_simulated_version_in_source():
-    """execute_trade_gateway() simulated (paper) return must carry _version == 'v1'."""
     gw = _gateway_fn_src()
-    assert '"status": "simulated"' in gw, "simulated path not found in gateway source"
+    assert '"status": "simulated"' in gw
     idx = gw.find('"status": "simulated"')
-    block = gw[idx:idx + 400]
-    assert '"_version": "v1"' in block, (
-        "execute_trade_gateway simulated path missing _version v1")
+    assert '"_version": "v1"' in gw[idx:idx + 400]
 
 
 def test_gateway_sent_version_in_source():
-    """execute_trade_gateway() sent return must carry _version == 'v1'."""
     gw = _gateway_fn_src()
-    assert '"status": "sent"' in gw, "sent path not found in gateway source"
+    assert '"status": "sent"' in gw
     idx = gw.find('"status": "sent"')
-    block = gw[idx:idx + 400]
-    assert '"_version": "v1"' in block, (
-        "execute_trade_gateway sent path missing _version v1")
+    assert '"_version": "v1"' in gw[idx:idx + 400]
 
 
 def test_gateway_version_count():
-    """execute_trade_gateway() must have exactly 3 _version insertions (one per success path)."""
     gw = _gateway_fn_src()
     count = gw.count('"_version": "v1"')
-    assert count == 3, (
-        f"execute_trade_gateway must have 3 '_version' insertions, found {count}")
+    assert count == 3, f"execute_trade_gateway must have 3 _version insertions, found {count}"
 
 
 def test_gateway_version_not_in_broker_payload():
-    """_version must NOT appear in the broker payload builder functions."""
     src = _app_src()
     for fn_name in ("def adapt_traderspost(", "def adapt_pickmytrade("):
         start = src.find(fn_name)
         if start < 0:
             continue
-        fn_src = src[start:start + 2000]
-        assert '"_version"' not in fn_src, (
-            f"{fn_name} must not include _version in broker payload")
+        assert '"_version"' not in src[start:start + 2000]
 
 
 # ===========================================================================
 # V1-P1-006  JOURNAL  (v1)  — source inspection
-#
-# _build_card_entry() requires a full full_analysis() result plus optional
-# webhook record. Source inspection confirms the single versioning seam.
 # ===========================================================================
 
 def _journal_fn_src():
-    """Extract source text of _build_card_entry() from app.py.
-
-    The function is ~160 lines; we locate the next top-level def to bound it.
-    """
     src = _app_src()
     start = src.find("def _build_card_entry(")
-    assert start >= 0, "_build_card_entry not found in app.py"
+    assert start >= 0
     next_def = src.find("\ndef ", start + 1)
     end = next_def if (0 < next_def - start < 50_000) else start + 12_000
     return src[start:end]
 
 
 def test_journal_version_in_source():
-    """_build_card_entry() must assign _version == 'v1' to entry before returning."""
-    fn_src = _journal_fn_src()
-    assert 'entry["_version"] = "v1"' in fn_src, (
-        "_build_card_entry missing entry[\"_version\"] = \"v1\"")
+    assert 'entry["_version"] = "v1"' in _journal_fn_src()
 
 
 def test_journal_version_before_return():
-    """_build_card_entry() _version assignment must precede 'return entry'."""
     fn_src = _journal_fn_src()
-    version_idx = fn_src.find('entry["_version"] = "v1"')
-    return_idx  = fn_src.find("return entry", version_idx)
-    assert version_idx >= 0, "_version assignment not found in _build_card_entry"
-    assert return_idx  >= 0, "'return entry' not found after _version assignment"
-    assert version_idx < return_idx, (
-        "_version assignment must come before 'return entry' in _build_card_entry")
+    vi = fn_src.find('entry["_version"] = "v1"')
+    ri = fn_src.find("return entry", vi)
+    assert vi >= 0 and ri >= 0 and vi < ri
 
 
 def test_journal_version_single_seam():
-    """_build_card_entry() must have exactly one _version assignment (no duplicates)."""
-    fn_src = _journal_fn_src()
-    count = fn_src.count('entry["_version"]')
-    assert count == 1, (
-        f"_build_card_entry has {count} _version assignment(s); expected exactly 1")
+    assert _journal_fn_src().count('entry["_version"]') == 1
 
 
 # ===========================================================================
-# V1-P1-004  MANAGER  (v1)  — COMPLETE
+# V1-P1-004  MANAGER  (v1) — COMPLETE
 #
-# build_manager_interface() is the canonical Manager Interface.
-# ARCH §7 guaranteed fields: gateway_debug, active_trade, managed_trade,
-# training_gate, auto_trade_enabled, _version.
-#
-# Isolation invariant: _active_trade_mgmt_block() is a separate display helper
-# and must NOT carry _version or Manager Interface fields.
+# Structural tests: required fields, types, version.
+# Semantic tests: instrument scoping, mutability isolation, training_gate meaning,
+#                 auto_trade_enabled type, no execution side effects.
 # ===========================================================================
 
 def test_manager_build_returns_dict():
-    """build_manager_interface() must return a dict."""
     result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    assert isinstance(mgr, dict), "build_manager_interface must return a dict"
+    assert isinstance(app.build_manager_interface(result), dict)
 
 
 def test_manager_version():
-    """build_manager_interface() must carry _version == 'v1'."""
     result = app.full_analysis()
     mgr = app.build_manager_interface(result)
-    assert mgr.get("_version") == "v1", (
-        f"build_manager_interface _version {mgr.get('_version')!r} != 'v1'")
+    assert mgr.get("_version") == "v1"
 
 
 def test_manager_version_type():
-    """build_manager_interface() _version must be a str."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    assert isinstance(mgr.get("_version"), str), (
-        f"build_manager_interface _version must be str, got {type(mgr.get('_version'))}")
+    assert isinstance(app.build_manager_interface(app.full_analysis()).get("_version"), str)
 
 
 def test_manager_required_fields():
-    """build_manager_interface() must contain all ARCH §7 Manager guaranteed fields."""
     result = app.full_analysis()
     mgr = app.build_manager_interface(result)
     for field in ("gateway_debug", "active_trade", "managed_trade",
                   "training_gate", "auto_trade_enabled"):
-        assert field in mgr, f"build_manager_interface missing required field: {field!r}"
+        assert field in mgr, f"build_manager_interface missing field: {field!r}"
 
 
 def test_manager_gateway_debug_is_dict():
-    """build_manager_interface() gateway_debug must be a dict."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    assert isinstance(mgr.get("gateway_debug"), dict), (
-        "build_manager_interface gateway_debug must be a dict")
+    assert isinstance(app.build_manager_interface(app.full_analysis()).get("gateway_debug"), dict)
 
 
 def test_manager_active_trade_type():
-    """build_manager_interface() active_trade must be dict or None."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    at = mgr.get("active_trade")
-    assert at is None or isinstance(at, dict), (
-        f"build_manager_interface active_trade must be dict|None, got {type(at)}")
+    at = app.build_manager_interface(app.full_analysis()).get("active_trade")
+    assert at is None or isinstance(at, dict)
 
 
 def test_manager_managed_trade_type():
-    """build_manager_interface() managed_trade must be dict or None."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    mt = mgr.get("managed_trade")
-    assert mt is None or isinstance(mt, dict), (
-        f"build_manager_interface managed_trade must be dict|None, got {type(mt)}")
+    mt = app.build_manager_interface(app.full_analysis()).get("managed_trade")
+    assert mt is None or isinstance(mt, dict)
 
 
 def test_manager_training_gate_has_enabled():
-    """build_manager_interface() training_gate must contain an 'enabled' key."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    tg = mgr.get("training_gate") or {}
-    assert "enabled" in tg, (
-        "build_manager_interface training_gate must contain 'enabled' key")
+    tg = app.build_manager_interface(app.full_analysis()).get("training_gate") or {}
+    assert "enabled" in tg
 
 
 def test_manager_auto_trade_enabled_is_dict():
-    """build_manager_interface() auto_trade_enabled must be a dict."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
-    assert isinstance(mgr.get("auto_trade_enabled"), dict), (
-        "build_manager_interface auto_trade_enabled must be a dict")
+    assert isinstance(app.build_manager_interface(app.full_analysis()).get("auto_trade_enabled"), dict)
 
 
 def test_manager_version_serializes():
-    """build_manager_interface() _version must survive JSON serialization."""
-    result = app.full_analysis()
-    mgr = app.build_manager_interface(result)
+    mgr = app.build_manager_interface(app.full_analysis())
     assert json.dumps({"_version": mgr.get("_version")}) == '{"_version": "v1"}'
 
 
 def test_manager_in_full_analysis():
-    """full_analysis() must include 'manager' key with _version == 'v1'."""
     result = app.full_analysis()
-    assert "manager" in result, "full_analysis result missing 'manager' key"
-    mgr = result["manager"]
-    assert isinstance(mgr, dict), "full_analysis result['manager'] must be a dict"
-    assert mgr.get("_version") == "v1", (
-        f"full_analysis result['manager']._version {mgr.get('_version')!r} != 'v1'")
+    assert "manager" in result
+    assert isinstance(result["manager"], dict)
+    assert result["manager"].get("_version") == "v1"
 
 
-# Isolation invariant: _active_trade_mgmt_block() must NOT carry _version
+# -----------------------------------------------------------------
+# SEMANTIC: instrument scoping is strict (no cross-instrument leak)
+# -----------------------------------------------------------------
+
+def test_manager_active_trade_scoped_to_requested_instrument():
+    """With no active trade for MGC and an injected trade for MNQ,
+    build_manager_interface(result, 'MGC') must return active_trade=None.
+
+    Proves instrument scoping is strict — no fallback to another instrument.
+    """
+    result = app.full_analysis()
+    # Ensure no existing MGC trade interferes
+    with app.ACTIVE_TRADES_LOCK:
+        mgc_saved = app.ACTIVE_TRADES_BY_INST.pop("MGC", None)
+        mnq_saved = app.ACTIVE_TRADES_BY_INST.pop("MNQ", None)
+        # Inject a trade for MNQ only
+        app.ACTIVE_TRADES_BY_INST["MNQ"] = {
+            "instrument": "MNQ", "direction": "Long",
+            "entry_price": 20000.0, "stop_loss": 19980.0,
+        }
+    try:
+        mgr = app.build_manager_interface(result, "MGC")
+        assert mgr["active_trade"] is None, (
+            "active_trade must be None for MGC when only MNQ has a trade; "
+            "no cross-instrument fallback allowed")
+    finally:
+        with app.ACTIVE_TRADES_LOCK:
+            app.ACTIVE_TRADES_BY_INST.pop("MNQ", None)
+            if mgc_saved is not None:
+                app.ACTIVE_TRADES_BY_INST["MGC"] = mgc_saved
+            if mnq_saved is not None:
+                app.ACTIVE_TRADES_BY_INST["MNQ"] = mnq_saved
+
+
+def test_manager_active_trade_no_fallback_to_other_instrument():
+    """build_manager_interface requesting 'MNQ' must not return MGC trade.
+
+    Confirms the None return is instrument-specific, not a global 'no trades' check.
+    """
+    result = app.full_analysis()
+    with app.ACTIVE_TRADES_LOCK:
+        mnq_saved = app.ACTIVE_TRADES_BY_INST.pop("MNQ", None)
+        mgc_saved = app.ACTIVE_TRADES_BY_INST.pop("MGC", None)
+        app.ACTIVE_TRADES_BY_INST["MGC"] = {
+            "instrument": "MGC", "direction": "Short",
+            "entry_price": 2700.0, "stop_loss": 2720.0,
+        }
+    try:
+        mgr = app.build_manager_interface(result, "MNQ")
+        assert mgr["active_trade"] is None, (
+            "build_manager_interface for MNQ must not return MGC trade")
+    finally:
+        with app.ACTIVE_TRADES_LOCK:
+            app.ACTIVE_TRADES_BY_INST.pop("MGC", None)
+            if mgc_saved is not None:
+                app.ACTIVE_TRADES_BY_INST["MGC"] = mgc_saved
+            if mnq_saved is not None:
+                app.ACTIVE_TRADES_BY_INST["MNQ"] = mnq_saved
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: returned trade dicts are copies — cannot mutate globals
+# -----------------------------------------------------------------
+
+def test_manager_active_trade_is_copy_not_live_reference():
+    """Mutating the returned active_trade dict must NOT affect global ACTIVE_TRADES_BY_INST.
+
+    active_trade_snapshot() makes a shallow copy of the outer dict but inner trade
+    dicts are shared references.  build_manager_interface must wrap in dict() so
+    consumers cannot mutate global state.
+    """
+    result = app.full_analysis()
+    original_trade = {"instrument": "MGC", "direction": "Long", "entry_price": 2700.0}
+    with app.ACTIVE_TRADES_LOCK:
+        saved = app.ACTIVE_TRADES_BY_INST.pop("MGC", None)
+        app.ACTIVE_TRADES_BY_INST["MGC"] = original_trade
+    try:
+        mgr = app.build_manager_interface(result, "MGC")
+        at = mgr.get("active_trade")
+        assert at is not None, "Should have returned the injected trade"
+        # Mutate the returned dict
+        at["entry_price"] = 9999.0
+        at["_poisoned"] = True
+        # Verify the global is untouched
+        with app.ACTIVE_TRADES_LOCK:
+            live = app.ACTIVE_TRADES_BY_INST.get("MGC") or {}
+        assert live.get("entry_price") != 9999.0, (
+            "Mutating returned active_trade must not alter global ACTIVE_TRADES_BY_INST")
+        assert "_poisoned" not in live, (
+            "Injected key in returned active_trade must not appear in global state")
+    finally:
+        with app.ACTIVE_TRADES_LOCK:
+            app.ACTIVE_TRADES_BY_INST.pop("MGC", None)
+            if saved is not None:
+                app.ACTIVE_TRADES_BY_INST["MGC"] = saved
+
+
+def test_manager_managed_trade_is_copy_not_live_reference():
+    """Mutating the returned managed_trade dict must NOT affect MANAGED_TRADES_BY_KEY.
+
+    build_manager_interface must shallow-copy managed trades before returning.
+    """
+    result = app.full_analysis()
+    _key = ("MGC", "Long", 2700.0, "2026-07-29")
+    original_mt = {"instrument": "MGC", "direction": "Long",
+                   "entry": 2700.0, "closed": False, "key": _key}
+    saved = app.MANAGED_TRADES_BY_KEY.pop(_key, None)
+    app.MANAGED_TRADES_BY_KEY[_key] = original_mt
+    try:
+        mgr = app.build_manager_interface(result, "MGC")
+        mt = mgr.get("managed_trade")
+        assert mt is not None, "Should have returned the injected managed trade"
+        # Mutate
+        mt["entry"] = 9999.0
+        mt["_poisoned"] = True
+        live = app.MANAGED_TRADES_BY_KEY.get(_key) or {}
+        assert live.get("entry") != 9999.0, (
+            "Mutating returned managed_trade must not alter global MANAGED_TRADES_BY_KEY")
+        assert "_poisoned" not in live, (
+            "Injected key in returned managed_trade must not appear in global state")
+    finally:
+        app.MANAGED_TRADES_BY_KEY.pop(_key, None)
+        if saved is not None:
+            app.MANAGED_TRADES_BY_KEY[_key] = saved
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: auto_trade_enabled type and training_gate meaning
+# -----------------------------------------------------------------
+
+def test_manager_auto_trade_values_are_bools():
+    """Every value in auto_trade_enabled must be a Python bool (not int, not None)."""
+    mgr = app.build_manager_interface(app.full_analysis())
+    auto = mgr.get("auto_trade_enabled", {})
+    assert auto, "auto_trade_enabled must be non-empty (has instruments)"
+    for inst, val in auto.items():
+        assert isinstance(val, bool), (
+            f"auto_trade_enabled[{inst!r}] = {val!r} is {type(val)} not bool")
+
+
+def test_manager_auto_trade_covers_all_assets():
+    """auto_trade_enabled must contain an entry for every registered ASSET."""
+    mgr = app.build_manager_interface(app.full_analysis())
+    auto = mgr.get("auto_trade_enabled", {})
+    for inst in app.ASSETS:
+        assert inst in auto, f"auto_trade_enabled missing instrument {inst!r}"
+
+
+def test_manager_training_gate_meaning_is_arm_status_not_gate_verdict():
+    """training_gate['enabled'] must match training_mode_enabled() — it is the arm
+    status (env-var driven), not the per-call gate verdict from _training_gate().
+
+    In the test environment TRAINING_MODE_ENABLED is unset → enabled = False.
+    """
+    mgr = app.build_manager_interface(app.full_analysis())
+    tg = mgr.get("training_gate") or {}
+    expected = app.training_mode_enabled()
+    assert tg.get("enabled") == expected, (
+        f"training_gate.enabled {tg.get('enabled')!r} != training_mode_enabled() {expected!r}")
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: builder calls do not trigger execution or change state
+# -----------------------------------------------------------------
+
+def test_manager_builder_does_not_change_active_trade_count():
+    """Calling build_manager_interface() must not add or remove active trades."""
+    result = app.full_analysis()
+    with app.ACTIVE_TRADES_LOCK:
+        count_before = len(app.ACTIVE_TRADES_BY_INST)
+    app.build_manager_interface(result)
+    app.build_manager_interface(result)
+    with app.ACTIVE_TRADES_LOCK:
+        count_after = len(app.ACTIVE_TRADES_BY_INST)
+    assert count_before == count_after, (
+        f"Active trade count changed after builder calls: {count_before} → {count_after}")
+
+
+def test_manager_builder_does_not_trigger_execution():
+    """Calling build_manager_interface() must not touch the execution gateway.
+
+    Verifies _TRADERSPOST_LAST (last broker call record) is unchanged before/after.
+    """
+    result = app.full_analysis()
+    before = dict(app._TRADERSPOST_LAST)
+    app.build_manager_interface(result)
+    after = dict(app._TRADERSPOST_LAST)
+    assert before == after, (
+        "build_manager_interface must not alter _TRADERSPOST_LAST (execution gateway record)")
+
+
+# Isolation invariant
 def test_manager_atm_block_no_version():
-    """_active_trade_mgmt_block() must NOT carry _version.
-
-    It is a display helper, not the canonical Manager Interface.
-    The canonical Manager Interface is build_manager_interface() (V1-P1-004).
-    """
-    atm = app._active_trade_mgmt_block()
-    if atm is None:
-        return  # flag OFF → None is the correct return; no _version possible
-    assert "_version" not in atm, (
-        "_active_trade_mgmt_block must not carry _version — "
-        "it is not the canonical Manager Interface")
-
-
-def test_manager_canonical_fields_absent_from_atm_block():
-    """_active_trade_mgmt_block() must not contain Manager Interface required fields.
-
-    Confirms this object is architecturally separate from the Manager contract.
-    """
     atm = app._active_trade_mgmt_block()
     if atm is None:
         return
-    manager_fields = ("gateway_debug", "active_trade", "managed_trade",
-                      "training_gate", "auto_trade_enabled")
-    for field in manager_fields:
-        assert field not in atm, (
-            f"_active_trade_mgmt_block unexpectedly contains Manager field {field!r}")
+    assert "_version" not in atm, "_active_trade_mgmt_block must not carry _version"
+
+
+def test_manager_canonical_fields_absent_from_atm_block():
+    atm = app._active_trade_mgmt_block()
+    if atm is None:
+        return
+    for field in ("gateway_debug", "active_trade", "managed_trade",
+                  "training_gate", "auto_trade_enabled"):
+        assert field not in atm
 
 
 # ===========================================================================
-# V1-P1-007  COACH  (v1)  — COMPLETE
+# V1-P1-007  COACH  (v1) — COMPLETE
 #
-# build_coach_interface() is the canonical Coach Interface.
-# ARCH §7 guaranteed fields: weight_updated, thesis_resolved,
-# learning_influence, rule_engine_eligibility, _version.
-#
-# Isolation invariant: result["learning_score_influence"] is the edge-scoring
-# modifier block and must NOT carry _version or Coach Interface fields.
+# Structural tests: required fields, types, version.
+# Semantic tests: weight_updated meaning, thesis_resolved meaning,
+#                 learning_influence source, rule_engine_eligibility read-only.
 # ===========================================================================
 
 def test_coach_build_returns_dict():
-    """build_coach_interface() must return a dict."""
     result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    assert isinstance(cch, dict), "build_coach_interface must return a dict"
+    assert isinstance(app.build_coach_interface(result), dict)
 
 
 def test_coach_version():
-    """build_coach_interface() must carry _version == 'v1'."""
     result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    assert cch.get("_version") == "v1", (
-        f"build_coach_interface _version {cch.get('_version')!r} != 'v1'")
+    assert app.build_coach_interface(result).get("_version") == "v1"
 
 
 def test_coach_version_type():
-    """build_coach_interface() _version must be a str."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    assert isinstance(cch.get("_version"), str), (
-        f"build_coach_interface _version must be str, got {type(cch.get('_version'))}")
+    assert isinstance(app.build_coach_interface(app.full_analysis()).get("_version"), str)
 
 
 def test_coach_required_fields():
-    """build_coach_interface() must contain all ARCH §7 Coach guaranteed fields."""
     result = app.full_analysis()
     cch = app.build_coach_interface(result)
     for field in ("weight_updated", "thesis_resolved",
                   "learning_influence", "rule_engine_eligibility"):
-        assert field in cch, f"build_coach_interface missing required field: {field!r}"
+        assert field in cch, f"build_coach_interface missing field: {field!r}"
 
 
 def test_coach_weight_updated_is_bool():
-    """build_coach_interface() weight_updated must be a bool."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    assert isinstance(cch.get("weight_updated"), bool), (
-        f"build_coach_interface weight_updated must be bool, "
-        f"got {type(cch.get('weight_updated'))}")
+    cch = app.build_coach_interface(app.full_analysis())
+    assert isinstance(cch.get("weight_updated"), bool)
 
 
 def test_coach_thesis_resolved_is_bool():
-    """build_coach_interface() thesis_resolved must be a bool."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    assert isinstance(cch.get("thesis_resolved"), bool), (
-        f"build_coach_interface thesis_resolved must be bool, "
-        f"got {type(cch.get('thesis_resolved'))}")
+    cch = app.build_coach_interface(app.full_analysis())
+    assert isinstance(cch.get("thesis_resolved"), bool)
 
 
 def test_coach_learning_influence_is_float():
-    """build_coach_interface() learning_influence must be a float."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    li = cch.get("learning_influence")
-    assert isinstance(li, float), (
-        f"build_coach_interface learning_influence must be float, got {type(li)}")
+    li = app.build_coach_interface(app.full_analysis()).get("learning_influence")
+    assert isinstance(li, float), f"learning_influence must be float, got {type(li)}"
 
 
 def test_coach_learning_influence_range():
-    """build_coach_interface() learning_influence must be in [-15.0, 15.0]."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    li = cch.get("learning_influence", 0.0)
-    assert -15.0 <= li <= 15.0, (
-        f"build_coach_interface learning_influence {li} out of [-15, 15] range")
+    li = app.build_coach_interface(app.full_analysis()).get("learning_influence", 0.0)
+    assert -15.0 <= li <= 15.0, f"learning_influence {li} out of [-15, 15]"
 
 
 def test_coach_rule_engine_eligibility_valid():
-    """build_coach_interface() rule_engine_eligibility must be a valid status string."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
-    elig = cch.get("rule_engine_eligibility")
-    valid = {"GHOST_ONLY", "LIVE_ELIGIBLE", "DISABLED"}
-    assert elig in valid, (
-        f"build_coach_interface rule_engine_eligibility {elig!r} not in {valid}")
+    elig = app.build_coach_interface(app.full_analysis()).get("rule_engine_eligibility")
+    assert elig in {"GHOST_ONLY", "LIVE_ELIGIBLE", "DISABLED"}
 
 
 def test_coach_version_serializes():
-    """build_coach_interface() _version must survive JSON serialization."""
-    result = app.full_analysis()
-    cch = app.build_coach_interface(result)
+    cch = app.build_coach_interface(app.full_analysis())
     assert json.dumps({"_version": cch.get("_version")}) == '{"_version": "v1"}'
 
 
 def test_coach_in_full_analysis():
-    """full_analysis() must include 'coach' key with _version == 'v1'."""
     result = app.full_analysis()
-    assert "coach" in result, "full_analysis result missing 'coach' key"
-    cch = result["coach"]
-    assert isinstance(cch, dict), "full_analysis result['coach'] must be a dict"
-    assert cch.get("_version") == "v1", (
-        f"full_analysis result['coach']._version {cch.get('_version')!r} != 'v1'")
+    assert "coach" in result
+    assert isinstance(result["coach"], dict)
+    assert result["coach"].get("_version") == "v1"
 
 
-# Isolation invariant: result["learning_score_influence"] must NOT carry _version
-def test_coach_lsi_no_version():
-    """result['learning_score_influence'] must NOT carry _version.
+# -----------------------------------------------------------------
+# SEMANTIC: weight_updated — learning-ready ≠ weight_updated
+# -----------------------------------------------------------------
 
-    It is the edge-scoring modifier block, not the canonical Coach Interface.
-    The canonical Coach Interface is build_coach_interface() (V1-P1-007).
+def test_coach_learning_ready_does_not_imply_weight_updated():
+    """LEARNING_ANALYTICS["ready"] = True must NOT cause weight_updated = True.
+
+    "ready" means total_trades > 0 — it says nothing about whether the
+    strategy_weights recompute (_recompute_learning) has ever run.
+    The authoritative signal is LEARNING_ANALYTICS["updated_at"]; presence of
+    "ready" = True without "updated_at" must produce weight_updated = False.
+    """
+    result = app.full_analysis()
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        # Set ready=True, total_trades=50 — but NO updated_at
+        app.LEARNING_ANALYTICS.clear()
+        app.LEARNING_ANALYTICS.update({"enabled": True, "ready": True,
+                                        "total_trades": 50})
+    try:
+        cch = app.build_coach_interface(result)
+        assert cch["weight_updated"] is False, (
+            "weight_updated must be False when LEARNING_ANALYTICS has no 'updated_at' "
+            "(ready=True does not prove the recompute ran)")
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS.clear()
+            app.LEARNING_ANALYTICS.update(saved)
+
+
+def test_coach_learning_enabled_does_not_imply_weight_updated():
+    """LEARNING_DB_ENABLED = True must not imply weight_updated = True.
+
+    At boot, LEARNING_ANALYTICS = {"enabled": True, "ready": False, "total_trades": 0}
+    with no "updated_at".  weight_updated must be False until _recompute_learning()
+    completes and sets "updated_at".
+    """
+    result = app.full_analysis()
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        app.LEARNING_ANALYTICS.clear()
+        # Boot state — no updated_at, enabled but not yet run
+        app.LEARNING_ANALYTICS.update({"enabled": True, "ready": False, "total_trades": 0})
+    try:
+        cch = app.build_coach_interface(result)
+        assert cch["weight_updated"] is False, (
+            "weight_updated must be False when LEARNING_ANALYTICS has no 'updated_at' "
+            "(DB-enabled alone does not prove the recompute ran)")
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS.clear()
+            app.LEARNING_ANALYTICS.update(saved)
+
+
+def test_coach_insufficient_samples_do_not_imply_weight_updated():
+    """Zero or insufficient trades must not produce weight_updated = True.
+
+    "ready" is False when total_trades = 0; no "updated_at" → weight_updated = False.
+    Proves sample sufficiency is not the criterion.
+    """
+    result = app.full_analysis()
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        app.LEARNING_ANALYTICS.clear()
+        app.LEARNING_ANALYTICS.update({"enabled": True, "ready": False,
+                                        "total_trades": 0})
+    try:
+        cch = app.build_coach_interface(result)
+        assert cch["weight_updated"] is False, (
+            "weight_updated must be False when no trades and no 'updated_at'")
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS.clear()
+            app.LEARNING_ANALYTICS.update(saved)
+
+
+def test_coach_weight_updated_false_when_recompute_not_run():
+    """In the test environment no _recompute_learning() call has occurred.
+
+    The default LEARNING_ANALYTICS has no 'updated_at' key, so weight_updated must be False.
+    This is the direct, uncontrived test: the test environment has no DB, so no recompute ran.
+    """
+    # Test env: LEARNING_ANALYTICS = {"enabled": True, "ready": False, "total_trades": 0}
+    # No "updated_at" field → weight_updated must be False.
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    with app.LEARNING_LOCK:
+        has_updated_at = "updated_at" in app.LEARNING_ANALYTICS
+    if not has_updated_at:
+        assert cch["weight_updated"] is False, (
+            "weight_updated must be False when LEARNING_ANALYTICS has no 'updated_at'")
+
+
+def test_coach_recompute_event_sets_weight_updated_true():
+    """Simulating a completed _recompute_learning() (setting 'updated_at') must
+    cause weight_updated = True.
+
+    This proves the correct authoritative source: the recompute completion timestamp,
+    not DB readiness or trade count.
+    """
+    result = app.full_analysis()
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        # Simulate a completed recompute: updated_at is the key signal
+        app.LEARNING_ANALYTICS.clear()
+        app.LEARNING_ANALYTICS.update({
+            "enabled": True, "ready": True, "total_trades": 10,
+            "updated_at": "2026-07-29T10:00:00+00:00",
+        })
+    try:
+        cch = app.build_coach_interface(result)
+        assert cch["weight_updated"] is True, (
+            "weight_updated must be True when LEARNING_ANALYTICS contains 'updated_at' "
+            "(the recompute-completion timestamp)")
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS.clear()
+            app.LEARNING_ANALYTICS.update(saved)
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: thesis_resolved — DB readiness ≠ thesis resolved
+# -----------------------------------------------------------------
+
+def test_coach_thesis_db_readiness_does_not_imply_thesis_resolved():
+    """THESIS_TRACKER_DB_READY = True must NOT cause thesis_resolved = True.
+
+    DB readiness means the table exists and is accessible — it says nothing about
+    whether a thesis_snapshots resolve event occurred.
+    thesis_resolved must be False during ordinary full_analysis().
+    """
+    result = app.full_analysis()
+    # Save and temporarily set to True to test isolation
+    saved = app.THESIS_TRACKER_DB_READY
+    try:
+        app.THESIS_TRACKER_DB_READY = True
+        cch = app.build_coach_interface(result)
+        assert cch["thesis_resolved"] is False, (
+            "thesis_resolved must be False even when THESIS_TRACKER_DB_READY = True; "
+            "DB readiness ≠ thesis resolution event")
+    finally:
+        app.THESIS_TRACKER_DB_READY = saved
+
+
+def test_coach_thesis_resolved_false_during_ordinary_analysis():
+    """thesis_resolved must be False during full_analysis() regardless of thesis state.
+
+    No thesis_snapshots resolve event occurs during full_analysis() — it only occurs
+    during trade-close processing.  The ARCH defines False as 'resolve did not run.'
+    No global 'last resolve ran' flag exists in the codebase.
+    """
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert cch["thesis_resolved"] is False, (
+        "thesis_resolved must be False during ordinary full_analysis() — "
+        "no thesis resolution event occurs outside a trade-close")
+
+
+def test_coach_active_thesis_does_not_imply_thesis_resolved():
+    """An active (unresolved) in-memory thesis must NOT set thesis_resolved = True.
+
+    THESIS_BY_INST tracks the CURRENT confidence-based thesis for an instrument;
+    thesis_resolved refers to the thesis_snapshots DB resolution event, which is
+    separate and only triggered at trade close.
+    """
+    result = app.full_analysis()
+    # Inject a fake active thesis for MGC
+    with app.THESIS_LOCK:
+        saved_thesis = app.THESIS_BY_INST.get("MGC")
+        app.THESIS_BY_INST["MGC"] = {
+            "direction": "Long", "confidence": 75, "resolved": False,
+            "narrative": "Bullish structure", "stability": 0.8,
+        }
+    try:
+        cch = app.build_coach_interface(result, instrument="MGC")
+        assert cch["thesis_resolved"] is False, (
+            "thesis_resolved must be False even when an active thesis exists in THESIS_BY_INST; "
+            "thesis_resolved refers to the thesis_snapshots DB resolution event, not in-memory state")
+    finally:
+        with app.THESIS_LOCK:
+            if saved_thesis is not None:
+                app.THESIS_BY_INST["MGC"] = saved_thesis
+            else:
+                app.THESIS_BY_INST.pop("MGC", None)
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: learning_influence source and shape
+# -----------------------------------------------------------------
+
+def test_coach_learning_influence_matches_lsi_delta():
+    """learning_influence must equal the active-direction delta from LSI block.
+
+    _ls_dir_summary populates "delta" from gd.get("learning_score_delta", 0).
+    The Coach must read this same value, not recompute it.
     """
     result = app.full_analysis()
     lsi = result.get("learning_score_influence") or {}
-    assert "_version" not in lsi, (
-        "learning_score_influence must not carry _version — "
-        "it is not the canonical Coach Interface")
+    long_d  = float((lsi.get("Long")  or {}).get("delta") or 0.0)
+    short_d = float((lsi.get("Short") or {}).get("delta") or 0.0)
+    expected = long_d if long_d != 0.0 else short_d
+    cch = app.build_coach_interface(result)
+    assert cch["learning_influence"] == expected, (
+        f"learning_influence {cch['learning_influence']} != expected {expected} "
+        f"(Long.delta={long_d}, Short.delta={short_d})")
+
+
+def test_coach_learning_influence_not_a_nested_object():
+    """learning_influence must be a scalar float, not the full LSI object.
+
+    The ARCH specifies 'float: ±15 modifier for next edge score'.
+    """
+    cch = app.build_coach_interface(app.full_analysis())
+    li = cch.get("learning_influence")
+    assert isinstance(li, (int, float)) and not isinstance(li, bool), (
+        f"learning_influence must be a numeric scalar, got {type(li)}: {li!r}")
+    assert not isinstance(li, dict), "learning_influence must not be a nested object"
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: rule_engine_eligibility is a cache read, not a recompute
+# -----------------------------------------------------------------
+
+def test_coach_rule_engine_eligibility_not_recalculated():
+    """Calling build_coach_interface() twice must return consistent eligibility
+    without changing LEARNING_ELIGIBILITY cache state.
+
+    Proves the builder reads existing state rather than launching a background
+    recompute or modifying the cache.
+    """
+    result = app.full_analysis()
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        cache_before = dict(app.LEARNING_ELIGIBILITY)
+    cch1 = app.build_coach_interface(result)
+    cch2 = app.build_coach_interface(result)
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        cache_after = dict(app.LEARNING_ELIGIBILITY)
+    assert cch1["rule_engine_eligibility"] == cch2["rule_engine_eligibility"], (
+        "Repeated calls must produce consistent rule_engine_eligibility")
+    assert cache_before == cache_after, (
+        "build_coach_interface must not modify LEARNING_ELIGIBILITY cache")
+
+
+# -----------------------------------------------------------------
+# SEMANTIC: repeated reads do not write to learning or thesis storage
+# -----------------------------------------------------------------
+
+def test_coach_repeated_reads_do_not_write():
+    """Calling build_coach_interface() multiple times must not change any
+    learning or thesis global state.
+
+    Verifies: LEARNING_ANALYTICS unchanged, THESIS_BY_INST unchanged,
+    STRATEGY_WEIGHTS unchanged, LEARNING_ELIGIBILITY unchanged.
+    """
+    result = app.full_analysis()
+
+    with app.LEARNING_LOCK:
+        la_before = dict(app.LEARNING_ANALYTICS)
+        sw_before = dict(app.STRATEGY_WEIGHTS)
+
+    with app.THESIS_LOCK:
+        th_before = dict(app.THESIS_BY_INST)
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        le_before = dict(app.LEARNING_ELIGIBILITY)
+
+    for _ in range(3):
+        app.build_coach_interface(result)
+
+    with app.LEARNING_LOCK:
+        assert dict(app.LEARNING_ANALYTICS) == la_before, (
+            "build_coach_interface must not modify LEARNING_ANALYTICS")
+        assert dict(app.STRATEGY_WEIGHTS) == sw_before, (
+            "build_coach_interface must not modify STRATEGY_WEIGHTS")
+
+    with app.THESIS_LOCK:
+        assert dict(app.THESIS_BY_INST) == th_before, (
+            "build_coach_interface must not modify THESIS_BY_INST")
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        assert dict(app.LEARNING_ELIGIBILITY) == le_before, (
+            "build_coach_interface must not modify LEARNING_ELIGIBILITY")
+
+
+# Isolation invariants
+def test_coach_lsi_no_version():
+    lsi = app.full_analysis().get("learning_score_influence") or {}
+    assert "_version" not in lsi, "learning_score_influence must not carry _version"
 
 
 def test_coach_canonical_fields_absent():
-    """Coach Interface required fields must be absent from learning_score_influence.
-
-    Confirms this object is architecturally separate from the Coach contract.
-    """
-    result = app.full_analysis()
-    lsi = result.get("learning_score_influence") or {}
-    coach_fields = ("weight_updated", "thesis_resolved",
-                    "learning_influence", "rule_engine_eligibility")
-    for field in coach_fields:
-        assert field not in lsi, (
-            f"learning_score_influence unexpectedly contains Coach field {field!r}")
+    lsi = app.full_analysis().get("learning_score_influence") or {}
+    for field in ("weight_updated", "thesis_resolved",
+                  "learning_influence", "rule_engine_eligibility"):
+        assert field not in lsi
 
 
 def test_coach_lsi_existing_fields_intact():
-    """learning_score_influence existing fields must remain present (no regression)."""
-    result = app.full_analysis()
-    lsi = result.get("learning_score_influence") or {}
+    lsi = app.full_analysis().get("learning_score_influence") or {}
     for field in ("enabled", "armed", "max_delta"):
-        assert field in lsi, (
-            f"learning_score_influence missing existing field {field!r} after this batch")
+        assert field in lsi
 
 
 # ===========================================================================
-# CROSS-INTERFACE MATRIX
+# CROSS-INTERFACE MATRIX — all 7 interfaces COMPLETE
 # ===========================================================================
 
 def test_cross_interface_version_matrix():
     """Full version matrix for all 7 V1-P1 interfaces — all COMPLETE.
 
-    Manager and Coach are now COMPLETE (build_manager_interface() and
-    build_coach_interface() exist and carry _version == 'v1').
-    Non-canonical objects (_active_trade_mgmt_block, learning_score_influence)
-    must remain free of _version.
+    Also validates semantic isolation: non-canonical objects remain version-free.
     """
     failures = []
 
@@ -588,7 +914,7 @@ def test_cross_interface_version_matrix():
     if mb_compute.get("_version") != "v1":
         failures.append(f"Partner compute: expected v1, got {mb_compute.get('_version')!r}")
 
-    # Manager: v1 (canonical builder) + isolation (display helper has no _version)
+    # Manager: v1 (canonical builder) + isolation
     mgr = app.build_manager_interface(fa)
     if mgr.get("_version") != "v1":
         failures.append(f"Manager: expected v1, got {mgr.get('_version')!r}")
@@ -608,7 +934,7 @@ def test_cross_interface_version_matrix():
     if 'entry["_version"] = "v1"' not in _journal_fn_src():
         failures.append("Journal: _build_card_entry missing _version v1")
 
-    # Coach: v1 (canonical builder) + isolation (LSI block has no _version)
+    # Coach: v1 (canonical builder) + isolation
     cch = app.build_coach_interface(fa)
     if cch.get("_version") != "v1":
         failures.append(f"Coach: expected v1, got {cch.get('_version')!r}")

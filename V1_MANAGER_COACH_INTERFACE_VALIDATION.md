@@ -198,3 +198,86 @@ Both non-canonical objects verified unchanged and version-free:
 | `result["learning_score_influence"]` | Edge-scoring modifier: `{enabled, armed, max_delta, meta, Long, Short}` | ✗ None — confirmed | ✗ None — confirmed |
 
 The canonical `build_manager_interface()` and `build_coach_interface()` functions are the SOLE builders for their respective ARCH §7 contracts. No other object in the codebase carries these contracts.
+
+---
+
+## 9. Semantic Correctness Audit After 4e322c8
+
+**Audit date:** 2026-07-29
+**Commit audited:** `4e322c8` (Manager Interface v1 + Coach Interface v1 initial build)
+**Correction commit:** `V1-P1 correct Manager and Coach contract semantics`
+
+### Motivation
+
+The initial build passed all 49 presence/type tests but two Coach field mappings were
+semantically incorrect — they reported subsystem readiness rather than actual events.
+
+### Findings
+
+| Field | Original mapping | Problem | Corrected mapping |
+|---|---|---|---|
+| `weight_updated` | `LEARNING_ANALYTICS.get("ready", False)` | `ready = total_trades > 0` — measures whether trades exist in DB, NOT whether the `_recompute_learning()` function ran | `bool(LEARNING_ANALYTICS.get("updated_at"))` — `updated_at` is set at line ~12590 ONLY when `_recompute_learning()` completes successfully; absent at boot; never set by DB probes or readiness checks |
+| `thesis_resolved` | `bool(THESIS_TRACKER_DB_READY)` | `THESIS_TRACKER_DB_READY` measures DB table accessibility, NOT whether a thesis resolution event occurred | `False` — the ARCH-defined value for "resolve did not run"; no global "last resolve ran" flag exists; no thesis resolution event occurs during `full_analysis()` (only at trade-close) |
+| `active_trade` (Manager) | `at_snap.get(inst)` — live reference | `active_trade_snapshot()` shallow-copies the outer dict but inner trade dicts are shared references; consumers could mutate `ACTIVE_TRADES_BY_INST` | `dict(_at_raw)` — shallow copy prevents consumer mutation of global state |
+| `managed_trade` (Manager) | `_mt` — live reference | Same as above for `MANAGED_TRADES_BY_KEY` | `dict(_mt)` — shallow copy |
+
+### Sources Investigated
+
+- `_recompute_learning()` body (lines 12374–12700): `updated_at` set at line 12590 inside the try body, after all DB reads and weight computation, before the atomic lock-swap. Boot default `{"enabled":…, "ready": False, "total_trades": 0}` has no `updated_at`. This is the authoritative "recompute ran" signal, distinct from readiness/enablement/sample-sufficiency.
+
+- `THESIS_TRACKER_DB_READY` source (`_check_thesis_tracker_db_ready()`): boot-time DB probe — True = table accessible. No global "thesis resolution occurred" flag exists anywhere in the codebase. Resolution events are per-trade, per-row (`resolved_at` in `thesis_snapshots` table only).
+
+- `_ls_dir_summary()` (line 23454–23465): `"delta": gd.get("learning_score_delta", 0)` — the actual ±15 adjustment applied during scoring. `learning_influence` mapping was already correct.
+
+- `_check_learning_eligibility()`: pure `LEARNING_ELIGIBILITY_LOCK` read — no writes, no counters, no DB, no recompute. `rule_engine_eligibility` mapping was already correct.
+
+- `active_trade_snapshot()` (line 206–209): `dict(ACTIVE_TRADES_BY_INST)` — confirmed shallow copy of outer dict only.
+
+### ARCH §7 Contract Interpretation
+
+Per the audit's explicit permission: *"If the authoritative event information only exists at trade-close time, the Coach interface may legitimately report unavailable during ordinary full_analysis()."*
+
+`thesis_resolved = False` is correct — not an invented substitute but the ARCH-defined non-True value for a bool field where True means "resolve ran." During `full_analysis()` no resolve occurs.
+
+`weight_updated = bool(LEARNING_ANALYTICS.get("updated_at"))` is correct — a real event signal (recompute completion) rather than a system-state proxy.
+
+### V1-P1-007 Acceptance Criterion
+
+ROADMAP line 1521 requires: `assert weight_updated, learning_influence, rule_engine_eligibility, _version present` — all 4 remain present. The correction changes the *semantic source* of `weight_updated`, not its presence or type.
+
+### Test Count After Audit
+
+| Suite | Before | After |
+|---|---|---|
+| Presence/type tests | 49 | 49 (unchanged) |
+| Semantic proof tests | 0 | 21 new (Coach: 14, Manager: 7) |
+| **Total** | **49** | **70** |
+
+All 70 tests pass. All 4 primary regressions pass (parity, scalp_golden, dual_sim, breakout_mode).
+
+### Semantic Tests Added (21)
+
+**Coach (14):**
+- `test_coach_learning_ready_does_not_imply_weight_updated` — `ready=True` without `updated_at` → `weight_updated=False`
+- `test_coach_learning_enabled_does_not_imply_weight_updated` — boot state → `weight_updated=False`
+- `test_coach_insufficient_samples_do_not_imply_weight_updated` — zero trades → `weight_updated=False`
+- `test_coach_weight_updated_false_when_recompute_not_run` — test-env default state → `weight_updated=False`
+- `test_coach_recompute_event_sets_weight_updated_true` — simulated `updated_at` → `weight_updated=True`
+- `test_coach_thesis_db_readiness_does_not_imply_thesis_resolved` — `THESIS_TRACKER_DB_READY=True` → `thesis_resolved=False`
+- `test_coach_thesis_resolved_false_during_ordinary_analysis` — full_analysis context → `thesis_resolved=False`
+- `test_coach_active_thesis_does_not_imply_thesis_resolved` — active THESIS_BY_INST entry → `thesis_resolved=False`
+- `test_coach_learning_influence_matches_lsi_delta` — `learning_influence` equals active-direction delta from LSI
+- `test_coach_learning_influence_not_a_nested_object` — `learning_influence` is scalar float, not dict
+- `test_coach_rule_engine_eligibility_not_recalculated` — repeated calls → consistent result + LEARNING_ELIGIBILITY cache unchanged
+- `test_coach_repeated_reads_do_not_write` — 3 calls → LEARNING_ANALYTICS, STRATEGY_WEIGHTS, THESIS_BY_INST, LEARNING_ELIGIBILITY all unchanged
+
+**Manager (7):**
+- `test_manager_active_trade_scoped_to_requested_instrument` — MNQ trade injected; MGC request → `None`
+- `test_manager_active_trade_no_fallback_to_other_instrument` — MGC trade injected; MNQ request → `None`
+- `test_manager_active_trade_is_copy_not_live_reference` — mutating returned dict does not alter `ACTIVE_TRADES_BY_INST`
+- `test_manager_managed_trade_is_copy_not_live_reference` — mutating returned dict does not alter `MANAGED_TRADES_BY_KEY`
+- `test_manager_auto_trade_values_are_bools` — every value in auto_trade_enabled is a Python `bool`
+- `test_manager_auto_trade_covers_all_assets` — auto_trade_enabled covers all registered ASSETS
+- `test_manager_training_gate_meaning_is_arm_status_not_gate_verdict` — `training_gate.enabled` matches `training_mode_enabled()` (env-var), not a per-call gate verdict
+- `test_manager_builder_does_not_change_active_trade_count` — active trade count unchanged after builder calls
+- `test_manager_builder_does_not_trigger_execution` — `_TRADERSPOST_LAST` unchanged after builder calls
