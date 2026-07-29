@@ -1,0 +1,252 @@
+# AI Trading Partner — Phase 1 Product Blueprint & System Inventory
+# NO CODE CHANGES
+# NO REFACTORING
+# NO IMPLEMENTATION
+# DOCUMENTATION AND ANALYSIS ONLY
+
+You are NOT writing code.
+
+You are acting as the Lead Software Architect for the AI Trading Partner project.
+
+The objective is to produce the master blueprint for the platform so future development follows a single roadmap instead of isolated feature requests.
+
+=========================
+MISSION
+=========================
+
+The AI Trading Partner is no longer just a trading bot.
+
+The vision is to become an intelligent trading workspace that combines:
+
+• Trading Desktop
+• Trading Expert
+• Trading Partner
+• Trading Coach
+• Trading Journal
+• Trading Manager
+
+into one unified dashboard.
+
+Before any additional development, we need a complete inventory of what already exists.
+
+Many features may already be implemented but disconnected, duplicated, hidden, incomplete, or poorly organized.
+
+Do NOT recommend code changes.
+
+Only document the current system.
+
+=========================
+TASK 1 — SYSTEM INVENTORY
+=========================
+
+Identify every major subsystem.
+
+For each subsystem provide:
+
+- Name
+- Purpose
+- Current responsibilities
+- Primary inputs
+- Primary outputs
+- Dependencies
+- Current implementation status
+- Dashboard visibility
+- Production impact
+- Related files
+
+Possible categories include (but are not limited to):
+
+• Databento
+• Market Data
+• Indicator Engine
+• VWAP
+• ATR
+• CVD / Delta
+• Market Structure
+• Left Brain
+• Decision Engine
+• Confidence Engine
+• Strategy Scanner
+• Strategy Library
+• Right Brain
+• Trade Management
+• Learning Systems
+• Training Systems
+• Journal
+• Dashboard
+• API Layer
+• Database
+• Execution Layer
+• TradersPost
+• Diagnostics
+• Logging
+• Startup / Initialization
+
+=========================
+TASK 2 — PRODUCT ROLE MAPPING
+=========================
+
+Map every existing feature into one of these six product roles.
+
+1. Trading Desktop
+2. Trading Expert
+3. Trading Partner
+4. Trading Coach
+5. Trading Journal
+6. Trading Manager
+
+For every role create three sections.
+
+ALREADY EXISTS
+
+List every completed feature.
+
+PARTIALLY IMPLEMENTED
+
+List features that exist but are incomplete.
+
+NOT YET BUILT
+
+List capabilities that belong in the long-term roadmap.
+
+=========================
+TASK 3 — FEATURE MAP
+=========================
+
+Produce a hierarchical feature tree.
+
+Example:
+
+Trading Desktop
+    Dashboard
+    Watchlists
+    Live Quotes
+    Market Health
+    Sessions
+    News
+
+Trading Expert
+    Left Brain
+    Thesis
+    Opportunity Scanner
+    Strategy Detection
+    Market Context
+
+...
+
+The goal is to understand the entire platform at a glance.
+
+=========================
+TASK 4 — DATA FLOW
+=========================
+
+Create a complete logical flow.
+
+Databento
+
+↓
+
+Market Data
+
+↓
+
+Indicators
+
+↓
+
+Market Snapshot
+
+↓
+
+Left Brain
+
+↓
+
+Strategy Scanner
+
+↓
+
+Confidence
+
+↓
+
+Decision Engine
+
+↓
+
+Right Brain
+
+↓
+
+Dashboard
+
+↓
+
+Execution
+
+Document every stage.
+
+=========================
+TASK 5 — GAP ANALYSIS
+=========================
+
+Without proposing code...
+
+Identify:
+
+• duplicated functionality
+• disconnected functionality
+• orphaned modules
+• hidden features
+• dashboard features with no backend
+• backend features with no dashboard
+• learning systems not connected
+• training systems not connected
+
+Only identify.
+
+Do NOT redesign.
+
+=========================
+TASK 6 — PRODUCT ROADMAP
+=========================
+
+Create a high-level roadmap.
+
+Foundation
+
+Intelligence
+
+Operator Experience
+
+Learning
+
+Automation
+
+Production
+
+For each category list:
+
+Completed
+
+In Progress
+
+Future
+
+=========================
+OUTPUT
+=========================
+
+Return ONE comprehensive architectural document.
+
+Do NOT write code.
+
+Do NOT modify files.
+
+Do NOT refactor.
+
+Do NOT optimize.
+
+Do NOT deploy.
+
+The deliverable should become the master blueprint for all future development so every implementation task can reference it instead of rediscovering the architecture.
