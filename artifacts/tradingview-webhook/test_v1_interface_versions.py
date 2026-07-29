@@ -3,24 +3,19 @@
 Verifies that each proven-canonical component interface output carries the
 correct _version field and that all ARCH §7 required fields remain present.
 
-Interface status after corrective validation (2026-07-29):
+Interface status (current):
   V1-P1-001  Expert             v1   COMPLETE   full_analysis() result
   V1-P1-002  Left Brain         v2   COMPLETE   _neutral_thesis() + compute_left_brain_thesis()
   V1-P1-003  Partner            v1   COMPLETE   compute_main_brain() + _main_brain_neutral()
-  V1-P1-004  Manager            v1   INCOMPLETE canonical interface does not yet exist
+  V1-P1-004  Manager            v1   COMPLETE   build_manager_interface()
   V1-P1-005  Execution Gateway  v1   COMPLETE   execute_trade_gateway() success returns
   V1-P1-006  Journal            v1   COMPLETE   _build_card_entry() entry dict
-  V1-P1-007  Coach              v1   INCOMPLETE canonical interface does not yet exist
+  V1-P1-007  Coach              v1   COMPLETE   build_coach_interface()
 
-Manager note: ARCH §7 requires {gateway_debug, active_trade, managed_trade,
-training_gate, auto_trade_enabled} as a single dict. No such object exists in
-the codebase. _active_trade_mgmt_block() is a separate display helper
-({enabled, count, positions, updated_at}) and is NOT the canonical Manager Interface.
-
-Coach note: ARCH §7 requires {weight_updated, thesis_resolved, learning_influence,
-rule_engine_eligibility}. These field names have zero occurrences in the codebase.
-result["learning_score_influence"] is the edge-scoring modifier block
-({enabled, armed, max_delta, meta, Long, Short}) — a different object.
+Isolation invariants for Manager and Coach:
+  - _active_trade_mgmt_block() is a display helper — must NOT carry _version
+  - result["learning_score_influence"] is the edge-scoring modifier block — must NOT carry _version
+  Both non-canonical objects remain untouched by this batch.
 
 No modifications to scoring, gate, execution, or safety logic anywhere in this file.
 Tests are read-only consumers of the existing interfaces.
@@ -286,30 +281,121 @@ def test_journal_version_single_seam():
 
 
 # ===========================================================================
-# V1-P1-004  MANAGER  — OUTCOME C: INCOMPLETE
+# V1-P1-004  MANAGER  (v1)  — COMPLETE
 #
-# The canonical Manager Interface (ARCH §7: gateway_debug, active_trade,
-# managed_trade, training_gate, auto_trade_enabled as a single dict) does not
-# exist in the codebase. _active_trade_mgmt_block() is a separate display
-# helper returning {enabled, count, positions, updated_at}.
+# build_manager_interface() is the canonical Manager Interface.
+# ARCH §7 guaranteed fields: gateway_debug, active_trade, managed_trade,
+# training_gate, auto_trade_enabled, _version.
 #
-# These tests assert the CORRECT post-corrective state: no _version on the
-# non-canonical object. They PASS to prove the corrective was applied.
+# Isolation invariant: _active_trade_mgmt_block() is a separate display helper
+# and must NOT carry _version or Manager Interface fields.
 # ===========================================================================
 
+def test_manager_build_returns_dict():
+    """build_manager_interface() must return a dict."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    assert isinstance(mgr, dict), "build_manager_interface must return a dict"
+
+
+def test_manager_version():
+    """build_manager_interface() must carry _version == 'v1'."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    assert mgr.get("_version") == "v1", (
+        f"build_manager_interface _version {mgr.get('_version')!r} != 'v1'")
+
+
+def test_manager_version_type():
+    """build_manager_interface() _version must be a str."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    assert isinstance(mgr.get("_version"), str), (
+        f"build_manager_interface _version must be str, got {type(mgr.get('_version'))}")
+
+
+def test_manager_required_fields():
+    """build_manager_interface() must contain all ARCH §7 Manager guaranteed fields."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    for field in ("gateway_debug", "active_trade", "managed_trade",
+                  "training_gate", "auto_trade_enabled"):
+        assert field in mgr, f"build_manager_interface missing required field: {field!r}"
+
+
+def test_manager_gateway_debug_is_dict():
+    """build_manager_interface() gateway_debug must be a dict."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    assert isinstance(mgr.get("gateway_debug"), dict), (
+        "build_manager_interface gateway_debug must be a dict")
+
+
+def test_manager_active_trade_type():
+    """build_manager_interface() active_trade must be dict or None."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    at = mgr.get("active_trade")
+    assert at is None or isinstance(at, dict), (
+        f"build_manager_interface active_trade must be dict|None, got {type(at)}")
+
+
+def test_manager_managed_trade_type():
+    """build_manager_interface() managed_trade must be dict or None."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    mt = mgr.get("managed_trade")
+    assert mt is None or isinstance(mt, dict), (
+        f"build_manager_interface managed_trade must be dict|None, got {type(mt)}")
+
+
+def test_manager_training_gate_has_enabled():
+    """build_manager_interface() training_gate must contain an 'enabled' key."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    tg = mgr.get("training_gate") or {}
+    assert "enabled" in tg, (
+        "build_manager_interface training_gate must contain 'enabled' key")
+
+
+def test_manager_auto_trade_enabled_is_dict():
+    """build_manager_interface() auto_trade_enabled must be a dict."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    assert isinstance(mgr.get("auto_trade_enabled"), dict), (
+        "build_manager_interface auto_trade_enabled must be a dict")
+
+
+def test_manager_version_serializes():
+    """build_manager_interface() _version must survive JSON serialization."""
+    result = app.full_analysis()
+    mgr = app.build_manager_interface(result)
+    assert json.dumps({"_version": mgr.get("_version")}) == '{"_version": "v1"}'
+
+
+def test_manager_in_full_analysis():
+    """full_analysis() must include 'manager' key with _version == 'v1'."""
+    result = app.full_analysis()
+    assert "manager" in result, "full_analysis result missing 'manager' key"
+    mgr = result["manager"]
+    assert isinstance(mgr, dict), "full_analysis result['manager'] must be a dict"
+    assert mgr.get("_version") == "v1", (
+        f"full_analysis result['manager']._version {mgr.get('_version')!r} != 'v1'")
+
+
+# Isolation invariant: _active_trade_mgmt_block() must NOT carry _version
 def test_manager_atm_block_no_version():
     """_active_trade_mgmt_block() must NOT carry _version.
 
     It is a display helper, not the canonical Manager Interface.
-    The Manager Interface (V1-P1-004) remains INCOMPLETE.
+    The canonical Manager Interface is build_manager_interface() (V1-P1-004).
     """
-    # Flag is OFF in test env — returns None
     atm = app._active_trade_mgmt_block()
     if atm is None:
         return  # flag OFF → None is the correct return; no _version possible
     assert "_version" not in atm, (
         "_active_trade_mgmt_block must not carry _version — "
-        "it is not the canonical Manager Interface (V1-P1-004 INCOMPLETE)")
+        "it is not the canonical Manager Interface")
 
 
 def test_manager_canonical_fields_absent_from_atm_block():
@@ -328,29 +414,123 @@ def test_manager_canonical_fields_absent_from_atm_block():
 
 
 # ===========================================================================
-# V1-P1-007  COACH  — OUTCOME C: INCOMPLETE
+# V1-P1-007  COACH  (v1)  — COMPLETE
 #
-# The canonical Coach Interface (ARCH §7: weight_updated, thesis_resolved,
-# learning_influence, rule_engine_eligibility) does not exist. These field
-# names have zero occurrences in the codebase.
-# result["learning_score_influence"] is the edge-scoring modifier
-# ({enabled, armed, max_delta, meta, Long, Short}) — a different object.
+# build_coach_interface() is the canonical Coach Interface.
+# ARCH §7 guaranteed fields: weight_updated, thesis_resolved,
+# learning_influence, rule_engine_eligibility, _version.
 #
-# These tests assert the CORRECT post-corrective state: no _version on the
-# non-canonical object, and no Coach fields present in it.
+# Isolation invariant: result["learning_score_influence"] is the edge-scoring
+# modifier block and must NOT carry _version or Coach Interface fields.
 # ===========================================================================
 
+def test_coach_build_returns_dict():
+    """build_coach_interface() must return a dict."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert isinstance(cch, dict), "build_coach_interface must return a dict"
+
+
+def test_coach_version():
+    """build_coach_interface() must carry _version == 'v1'."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert cch.get("_version") == "v1", (
+        f"build_coach_interface _version {cch.get('_version')!r} != 'v1'")
+
+
+def test_coach_version_type():
+    """build_coach_interface() _version must be a str."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert isinstance(cch.get("_version"), str), (
+        f"build_coach_interface _version must be str, got {type(cch.get('_version'))}")
+
+
+def test_coach_required_fields():
+    """build_coach_interface() must contain all ARCH §7 Coach guaranteed fields."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    for field in ("weight_updated", "thesis_resolved",
+                  "learning_influence", "rule_engine_eligibility"):
+        assert field in cch, f"build_coach_interface missing required field: {field!r}"
+
+
+def test_coach_weight_updated_is_bool():
+    """build_coach_interface() weight_updated must be a bool."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert isinstance(cch.get("weight_updated"), bool), (
+        f"build_coach_interface weight_updated must be bool, "
+        f"got {type(cch.get('weight_updated'))}")
+
+
+def test_coach_thesis_resolved_is_bool():
+    """build_coach_interface() thesis_resolved must be a bool."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert isinstance(cch.get("thesis_resolved"), bool), (
+        f"build_coach_interface thesis_resolved must be bool, "
+        f"got {type(cch.get('thesis_resolved'))}")
+
+
+def test_coach_learning_influence_is_float():
+    """build_coach_interface() learning_influence must be a float."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    li = cch.get("learning_influence")
+    assert isinstance(li, float), (
+        f"build_coach_interface learning_influence must be float, got {type(li)}")
+
+
+def test_coach_learning_influence_range():
+    """build_coach_interface() learning_influence must be in [-15.0, 15.0]."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    li = cch.get("learning_influence", 0.0)
+    assert -15.0 <= li <= 15.0, (
+        f"build_coach_interface learning_influence {li} out of [-15, 15] range")
+
+
+def test_coach_rule_engine_eligibility_valid():
+    """build_coach_interface() rule_engine_eligibility must be a valid status string."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    elig = cch.get("rule_engine_eligibility")
+    valid = {"GHOST_ONLY", "LIVE_ELIGIBLE", "DISABLED"}
+    assert elig in valid, (
+        f"build_coach_interface rule_engine_eligibility {elig!r} not in {valid}")
+
+
+def test_coach_version_serializes():
+    """build_coach_interface() _version must survive JSON serialization."""
+    result = app.full_analysis()
+    cch = app.build_coach_interface(result)
+    assert json.dumps({"_version": cch.get("_version")}) == '{"_version": "v1"}'
+
+
+def test_coach_in_full_analysis():
+    """full_analysis() must include 'coach' key with _version == 'v1'."""
+    result = app.full_analysis()
+    assert "coach" in result, "full_analysis result missing 'coach' key"
+    cch = result["coach"]
+    assert isinstance(cch, dict), "full_analysis result['coach'] must be a dict"
+    assert cch.get("_version") == "v1", (
+        f"full_analysis result['coach']._version {cch.get('_version')!r} != 'v1'")
+
+
+# Isolation invariant: result["learning_score_influence"] must NOT carry _version
 def test_coach_lsi_no_version():
     """result['learning_score_influence'] must NOT carry _version.
 
     It is the edge-scoring modifier block, not the canonical Coach Interface.
-    The Coach Interface (V1-P1-007) remains INCOMPLETE.
+    The canonical Coach Interface is build_coach_interface() (V1-P1-007).
     """
     result = app.full_analysis()
     lsi = result.get("learning_score_influence") or {}
     assert "_version" not in lsi, (
         "learning_score_influence must not carry _version — "
-        "it is not the canonical Coach Interface (V1-P1-007 INCOMPLETE)")
+        "it is not the canonical Coach Interface")
 
 
 def test_coach_canonical_fields_absent():
@@ -373,7 +553,7 @@ def test_coach_lsi_existing_fields_intact():
     lsi = result.get("learning_score_influence") or {}
     for field in ("enabled", "armed", "max_delta"):
         assert field in lsi, (
-            f"learning_score_influence missing existing field {field!r} after corrective")
+            f"learning_score_influence missing existing field {field!r} after this batch")
 
 
 # ===========================================================================
@@ -381,11 +561,12 @@ def test_coach_lsi_existing_fields_intact():
 # ===========================================================================
 
 def test_cross_interface_version_matrix():
-    """Full version matrix for all 7 V1-P1 interfaces.
+    """Full version matrix for all 7 V1-P1 interfaces — all COMPLETE.
 
-    Manager (V1-P1-004) and Coach (V1-P1-007) are OUTCOME C — the matrix
-    entries for those two record their ABSENCE from the canonical boundary,
-    which is the correct post-corrective state.
+    Manager and Coach are now COMPLETE (build_manager_interface() and
+    build_coach_interface() exist and carry _version == 'v1').
+    Non-canonical objects (_active_trade_mgmt_block, learning_score_influence)
+    must remain free of _version.
     """
     failures = []
 
@@ -407,10 +588,15 @@ def test_cross_interface_version_matrix():
     if mb_compute.get("_version") != "v1":
         failures.append(f"Partner compute: expected v1, got {mb_compute.get('_version')!r}")
 
-    # Manager: OUTCOME C — _active_trade_mgmt_block must NOT have _version
+    # Manager: v1 (canonical builder) + isolation (display helper has no _version)
+    mgr = app.build_manager_interface(fa)
+    if mgr.get("_version") != "v1":
+        failures.append(f"Manager: expected v1, got {mgr.get('_version')!r}")
+    if fa.get("manager", {}).get("_version") != "v1":
+        failures.append("Manager: full_analysis result['manager']._version != v1")
     atm = app._active_trade_mgmt_block()
     if atm is not None and "_version" in atm:
-        failures.append("Manager: _active_trade_mgmt_block must NOT carry _version (OUTCOME C)")
+        failures.append("Manager isolation: _active_trade_mgmt_block must NOT carry _version")
 
     # Execution Gateway: v1 in all 3 success returns (source)
     gw = _gateway_fn_src()
@@ -422,10 +608,15 @@ def test_cross_interface_version_matrix():
     if 'entry["_version"] = "v1"' not in _journal_fn_src():
         failures.append("Journal: _build_card_entry missing _version v1")
 
-    # Coach: OUTCOME C — learning_score_influence must NOT have _version
+    # Coach: v1 (canonical builder) + isolation (LSI block has no _version)
+    cch = app.build_coach_interface(fa)
+    if cch.get("_version") != "v1":
+        failures.append(f"Coach: expected v1, got {cch.get('_version')!r}")
+    if fa.get("coach", {}).get("_version") != "v1":
+        failures.append("Coach: full_analysis result['coach']._version != v1")
     lsi = fa.get("learning_score_influence") or {}
     if "_version" in lsi:
-        failures.append("Coach: learning_score_influence must NOT carry _version (OUTCOME C)")
+        failures.append("Coach isolation: learning_score_influence must NOT carry _version")
 
     assert not failures, "Cross-interface version matrix failures:\n" + "\n".join(failures)
 

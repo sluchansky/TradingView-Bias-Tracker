@@ -22777,6 +22777,138 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
         }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# V1 Canonical Interface Builders — Manager Interface v1 + Coach Interface v1
+# (ARCH §7; additive read-only aggregators; never call the gateway, never write)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_manager_interface(result, instrument=None):
+    """Canonical Manager Interface v1.
+
+    Read-only aggregation of execution state, active/managed trade snapshots,
+    training gate enabled status, and per-instrument auto-trade arm map.
+
+    Never calls the execution gateway, never triggers a recompute, never writes
+    to the database.  Guaranteed to return the ARCH §7 Manager output contract
+    dict (with neutral stubs on partial failure).
+
+    Fields:
+      gateway_debug      per-gate PASS/FAIL outcome from Expert result
+                         (ARCH field name; code key is "gate_debug")
+      active_trade       current ACTIVE_TRADES_BY_INST entry (None if no trade)
+      managed_trade      first open MANAGED_TRADES_BY_KEY entry for instrument
+                         (None if no paper/managed trade open)
+      training_gate      Bot Training Mode gate status (read-only flag check)
+      auto_trade_enabled per-instrument arm state map
+      _version           "v1"
+    """
+    inst = instrument or (result.get("active_ticker") if result else None) or ""
+    try:
+        # gateway_debug: per-gate PASS/FAIL outcome carried in Expert result.
+        gateway_debug = (result.get("gate_debug") or {}) if result else {}
+
+        # active_trade: current ACTIVE_TRADES_BY_INST entry for this instrument.
+        at_snap      = active_trade_snapshot()
+        active_trade = at_snap.get(inst) if inst else None
+
+        # managed_trade: first open MANAGED_TRADES_BY_KEY entry for instrument.
+        # Lock-free list snapshot (same pattern as display blocks throughout app).
+        managed_trade = None
+        for _mt in list(MANAGED_TRADES_BY_KEY.values()):
+            if _mt.get("instrument") == inst and not _mt.get("closed"):
+                managed_trade = _mt
+                break
+
+        # training_gate: Bot Training Mode arm status — pure env-var read.
+        training_gate = {"enabled": training_mode_enabled()}
+
+        # auto_trade_enabled: per-instrument arm state map (AUTO_TRADE under lock).
+        auto_map = {_a: auto_trade_enabled(_a) for _a in ASSETS}
+
+        return {
+            "gateway_debug":      gateway_debug,
+            "active_trade":       active_trade,
+            "managed_trade":      managed_trade,
+            "training_gate":      training_gate,
+            "auto_trade_enabled": auto_map,
+            "_version":           "v1",
+        }
+    except Exception as _mgr_exc:
+        logger.debug("build_manager_interface fail-open: %s", _mgr_exc)
+        return {
+            "gateway_debug":      {},
+            "active_trade":       None,
+            "managed_trade":      None,
+            "training_gate":      {"enabled": False},
+            "auto_trade_enabled": {},
+            "_version":           "v1",
+        }
+
+
+def build_coach_interface(result, instrument=None, mode=None):
+    """Canonical Coach Interface v1.
+
+    Read-only aggregation of learning subsystem status for the given instrument
+    + mode.  Reports whether the learning weight recompute has run, whether
+    thesis resolution is operational, the current ±15 Edge Score modifier, and
+    the Rule Engine eligibility.
+
+    Never triggers a learning update, database write, or scoring change.
+    Guaranteed to return the ARCH §7 Coach output contract dict (with neutral
+    stubs on partial failure).
+
+    Fields:
+      weight_updated           True when _recompute_learning() has populated
+                               LEARNING_ANALYTICS (ready flag set)
+      thesis_resolved          True when thesis_snapshots DB table is accessible
+                               (Thesis Tracker resolve mechanism is operational)
+      learning_influence       current ±15 modifier from result's per-direction
+                               learning_score_influence; 0.0 when off/uncomputed
+      rule_engine_eligibility  "GHOST_ONLY" | "LIVE_ELIGIBLE" from in-memory
+                               LEARNING_ELIGIBILITY cache
+      _version                 "v1"
+    """
+    inst  = instrument or (result.get("active_ticker") if result else None) or ""
+    _mode = mode or TRADING_MODE
+    try:
+        # weight_updated: True when _recompute_learning() ran and set ready=True.
+        with LEARNING_LOCK:
+            weight_updated = bool(LEARNING_ANALYTICS.get("ready", False))
+
+        # thesis_resolved: True when the thesis_snapshots table is accessible.
+        # THESIS_TRACKER_DB_READY is set by _check_thesis_tracker_db_ready() on
+        # boot — True means the resolve mechanism is operational.
+        thesis_resolved = bool(THESIS_TRACKER_DB_READY)
+
+        # learning_influence: active direction ±15 delta from result's LSI block.
+        # Only the active direction carries a non-zero delta; the other is 0.
+        _lsi        = (result.get("learning_score_influence") or {}) if result else {}
+        _long_d     = float((_lsi.get("Long")  or {}).get("delta") or 0.0)
+        _short_d    = float((_lsi.get("Short") or {}).get("delta") or 0.0)
+        learning_influence = _long_d if _long_d != 0.0 else _short_d
+
+        # rule_engine_eligibility: in-memory LEARNING_ELIGIBILITY cache lookup.
+        _elig_status, _ = _check_learning_eligibility(inst, mode=_mode)
+        rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE"
+
+        return {
+            "weight_updated":          weight_updated,
+            "thesis_resolved":         thesis_resolved,
+            "learning_influence":      learning_influence,
+            "rule_engine_eligibility": rule_engine_eligibility,
+            "_version":                "v1",
+        }
+    except Exception as _cch_exc:
+        logger.debug("build_coach_interface fail-open: %s", _cch_exc)
+        return {
+            "weight_updated":          False,
+            "thesis_resolved":         False,
+            "learning_influence":      0.0,
+            "rule_engine_eligibility": "LIVE_ELIGIBLE",
+            "_version":                "v1",
+        }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -24577,6 +24709,12 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "market_intelligence": _lb_mi,
             "thesis":              _LB_THESIS_BY_INST.get(_lb_inst),
         }
+
+    # V1 Manager and Coach Interface objects — additive, read-only status objects.
+    # Builders read existing runtime state and carry _version = "v1".
+    # No gate, scoring, or execution logic is touched.
+    result["manager"] = build_manager_interface(result, active_ticker)
+    result["coach"]   = build_coach_interface(result, active_ticker, TRADING_MODE)
 
     # V1 Expert Interface version field — additive, no behavior change.
     result["_version"] = "v1"
@@ -44382,6 +44520,8 @@ def _build_status_payload(_tk):
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
         "learning_engine":     _learning_engine_view(),
         "learning_rule_engine": _learning_rule_engine_view(),
+        "manager":             a.get("manager"),
+        "coach":               a.get("coach"),
         "alert_level":         a.get("alert_level"),
         "session_preferred":   (a.get("session") or {}).get("preferred"),
         "session_bonus":       (a.get("session") or {}).get("bonus"),
