@@ -22879,12 +22879,11 @@ def build_coach_interface(result, instrument=None, mode=None):
                          non-None, set at recompute completion, not at boot or
                          mere DB availability).  NOT a readiness or enablement flag.
 
-      thesis_resolved   — False during ordinary full_analysis() because no thesis
-                         snapshot resolution event occurs outside of a trade-close.
-                         The ARCH defines False as "resolve did not run"; there is
-                         no global "last resolution ran" flag in the codebase.
-                         This is the architecture-defined unavailable value, not an
-                         invented substitute.
+      thesis_resolved   — True when _resolve_open_theses() successfully committed at
+                         least one thesis snapshot resolution in this process session
+                         (_THESIS_LAST_RESOLVED_AT is not None).  False at boot and
+                         during any full_analysis() call before a trade-close
+                         resolution runs.  DB readiness alone does NOT imply True.
 
       learning_influence — ±15 Edge Score modifier from result's per-direction
                           learning_score_influence.  The active direction carries a
@@ -22899,7 +22898,7 @@ def build_coach_interface(result, instrument=None, mode=None):
 
     Fields:
       weight_updated           True if _recompute_learning() ran in this session
-      thesis_resolved          False (no resolution in full_analysis context)
+      thesis_resolved          True if _resolve_open_theses() ran in this session
       learning_influence       float: active-direction learning_score_delta
       rule_engine_eligibility  "GHOST_ONLY" | "LIVE_ELIGIBLE"
       _version                 "v1"
@@ -22915,11 +22914,12 @@ def build_coach_interface(result, instrument=None, mode=None):
         with LEARNING_LOCK:
             weight_updated = bool(LEARNING_ANALYTICS.get("updated_at"))
 
-        # thesis_resolved: False — the correct ARCH-defined value during full_analysis().
-        # The ARCH contract is "True if thesis_snapshots resolve ran."  No thesis
-        # resolution event occurs during full_analysis(); no global "last resolve ran"
-        # flag exists in the codebase.  False = "resolve did not run" per bool semantics.
-        thesis_resolved = False
+        # thesis_resolved: True when _resolve_open_theses() committed at least one
+        # thesis snapshot resolution in this session (_THESIS_LAST_RESOLVED_AT set).
+        # False at boot and whenever no trade-close resolution has run yet (no DB,
+        # no eligible rows, or process just started).  THESIS_TRACKER_DB_READY alone
+        # does NOT imply True — DB readiness ≠ a resolution event having occurred.
+        thesis_resolved = _THESIS_LAST_RESOLVED_AT is not None
 
         # learning_influence: active direction ±15 delta from result's LSI block.
         # _ls_dir_summary (line ~23454) builds Long/Short from gate_debug per direction:
@@ -31191,6 +31191,10 @@ def compute_data_feed_status(instrument=None):
 # market fingerprint.  DISPLAY-ONLY; never touches gate / sizing / broker.
 
 THESIS_TRACKER_DB_READY = False
+# Set by _resolve_open_theses() whenever at least one thesis snapshot is successfully
+# resolved in this session.  build_coach_interface() reads this to surface
+# thesis_resolved=True after a real trade-close resolution event.
+_THESIS_LAST_RESOLVED_AT = None   # UTC datetime | None
 
 
 def _check_thesis_tracker_db_ready():
@@ -31368,6 +31372,9 @@ def _resolve_open_theses(result, inst):
                 _thesis_commit_update(conn, row_id, outcome, signals, lesson, reflection)
             conn.commit()
             logger.debug("thesis_resolve: %d rows for %s", len(rows), inst)
+            # Surface to build_coach_interface() that a resolution ran this session.
+            global _THESIS_LAST_RESOLVED_AT
+            _THESIS_LAST_RESOLVED_AT = datetime.now(timezone.utc)
         except Exception as exc:
             logger.debug("_resolve_open_theses fail-open: %s", exc)
             try: conn.rollback()

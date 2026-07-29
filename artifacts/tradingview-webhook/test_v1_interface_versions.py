@@ -769,6 +769,32 @@ def test_coach_active_thesis_does_not_imply_thesis_resolved():
                 app.THESIS_BY_INST.pop("MGC", None)
 
 
+def test_coach_thesis_resolved_true_after_resolution_event():
+    """Injecting _THESIS_LAST_RESOLVED_AT must cause thesis_resolved = True.
+
+    Simulates the event signal set by _resolve_open_theses() after a successful
+    trade-close thesis resolution commit.  build_coach_interface() must read this
+    global and return thesis_resolved = True.
+
+    This is the only legitimate path to thesis_resolved = True — no other flag
+    (DB readiness, active in-memory thesis, LEARNING_ANALYTICS) should trigger it.
+    """
+    result = app.full_analysis()
+    saved_ts = app._THESIS_LAST_RESOLVED_AT
+    try:
+        # Simulate the event: _resolve_open_theses() committed a resolution row.
+        from datetime import datetime, timezone
+        app._THESIS_LAST_RESOLVED_AT = datetime.now(timezone.utc)
+        cch = app.build_coach_interface(result)
+        assert cch["thesis_resolved"] is True, (
+            "thesis_resolved must be True when _THESIS_LAST_RESOLVED_AT is set; "
+            "_resolve_open_theses() sets it after a successful thesis commit")
+        assert isinstance(cch["thesis_resolved"], bool), (
+            "thesis_resolved must be a bool (not a datetime)")
+    finally:
+        app._THESIS_LAST_RESOLVED_AT = saved_ts
+
+
 # -----------------------------------------------------------------
 # SEMANTIC: learning_influence source and shape
 # -----------------------------------------------------------------
