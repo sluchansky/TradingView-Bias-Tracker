@@ -13067,43 +13067,49 @@ def _recent_trades_view():
 
 def _learning_rule_engine_view():
     """Return the per-instrument Rule Engine status from LEARNING_ELIGIBILITY cache
-    for the /status endpoint. FAIL-OPEN: returns a disabled stub when DB is off."""
+    for the /status endpoint. FAIL-OPEN: returns a disabled stub when DB is off or
+    when any unexpected exception occurs (a crash here must never 500 /status)."""
     if not LEARNING_DB_ENABLED:
         return {"enabled": False, "db_connected": False}
-    with LEARNING_ELIGIBILITY_LOCK:
-        snap = dict(LEARNING_ELIGIBILITY)
-    today_labels = snap.pop("__today_labels__", {})
-    instruments  = {}
-    for inst, elig in snap.items():
-        if inst in ASSETS:
-            instruments[inst] = {
-                "status":        elig.get("status", "GHOST_ONLY"),
-                "rule_triggered": elig.get("rule_triggered"),
-                "sample_size":   elig.get("sample_size", 0),
-                "expectancy":    elig.get("expectancy"),
-                "last_20_avg_r": elig.get("last_20_avg_r"),
-                "win_rate":      elig.get("win_rate"),
-                "tp1_hit_rate":  elig.get("tp1_hit_rate"),
-                "disabled_setups": elig.get("disabled_setups", []),
-                "updated_at":    elig.get("updated_at"),
-            }
-    # If no instruments computed yet, populate defaults so the UI has something to show
-    if not instruments:
-        for inst in ASSETS:
-            instruments[inst] = {
-                "status": "GHOST_ONLY",
-                "rule_triggered": "under_%d_samples (0 recorded)" % LEARNING_LIVE_MIN_SAMPLE,
-                "sample_size": 0, "expectancy": None, "last_20_avg_r": None,
-                "win_rate": None, "tp1_hit_rate": None, "disabled_setups": [],
-                "updated_at": None,
-            }
-    return {
-        "enabled":      True,
-        "db_connected": True,
-        "instruments":  instruments,
-        "today_labels": today_labels,
-        "min_sample":   LEARNING_LIVE_MIN_SAMPLE,
-    }
+    try:
+        with LEARNING_ELIGIBILITY_LOCK:
+            snap = dict(LEARNING_ELIGIBILITY)
+        today_labels = snap.pop("__today_labels__", {})
+        instruments  = {}
+        for inst, elig in snap.items():
+            if inst in ASSETS:
+                instruments[inst] = {
+                    "status":        elig.get("status", "GHOST_ONLY"),
+                    "rule_triggered": elig.get("rule_triggered"),
+                    "sample_size":   elig.get("sample_size", 0),
+                    "expectancy":    elig.get("expectancy"),
+                    "last_20_avg_r": elig.get("last_20_avg_r"),
+                    "win_rate":      elig.get("win_rate"),
+                    "tp1_hit_rate":  elig.get("tp1_hit_rate"),
+                    "disabled_setups": elig.get("disabled_setups", []),
+                    "updated_at":    elig.get("updated_at"),
+                }
+        # If no instruments computed yet, populate defaults so the UI has something to show
+        if not instruments:
+            for inst in ASSETS:
+                instruments[inst] = {
+                    "status": "GHOST_ONLY",
+                    "rule_triggered": "under_%d_samples (0 recorded)" % LEARNING_LIVE_MIN_SAMPLE,
+                    "sample_size": 0, "expectancy": None, "last_20_avg_r": None,
+                    "win_rate": None, "tp1_hit_rate": None, "disabled_setups": [],
+                    "updated_at": None,
+                }
+        return {
+            "enabled":      True,
+            "db_connected": True,
+            "instruments":  instruments,
+            "today_labels": today_labels,
+            "min_sample":   LEARNING_LIVE_MIN_SAMPLE,
+        }
+    except Exception as _lrev_exc:
+        logger.warning("_learning_rule_engine_view fail-open: %s", _lrev_exc)
+        return {"enabled": True, "db_connected": False,
+                "reason": "learning rule engine unavailable"}
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -1255,6 +1255,70 @@ def test_v1_p6_006_status_200_when_recompute_patched_to_raise():
         "expected 200")
 
 
+def test_v1_p6_006_status_200_when_last_performance_report_none():
+    """V1-P6-006 — GET /status must return HTTP 200 when LAST_PERFORMANCE_REPORT
+    is None (table missing or never written).
+
+    _learning_engine_view() reads LAST_PERFORMANCE_REPORT under LEARNING_REPORT_LOCK.
+    When the value is None (no report generated yet, or DB missing), it must fall
+    back gracefully and not cause a 500.
+    """
+    saved = app.LAST_PERFORMANCE_REPORT
+    try:
+        with app.LEARNING_REPORT_LOCK:
+            app.LAST_PERFORMANCE_REPORT = None
+        client = app.app.test_client()
+        resp = client.get("/status")
+        assert resp.status_code == 200, (
+            f"/status returned HTTP {resp.status_code} when LAST_PERFORMANCE_REPORT "
+            "is None; expected 200 — a missing report must not kill the status endpoint")
+    finally:
+        with app.LEARNING_REPORT_LOCK:
+            app.LAST_PERFORMANCE_REPORT = saved
+
+
+def test_v1_p6_006_status_200_when_last_performance_report_invalid():
+    """V1-P6-006 — GET /status must return HTTP 200 when LAST_PERFORMANCE_REPORT
+    is set to an invalid (non-dict) value.
+
+    _learning_engine_view() calls dict(LAST_PERFORMANCE_REPORT); if the stored value
+    is a non-mapping type (e.g. a string or integer from a corrupt write), dict()
+    raises TypeError/ValueError.  The surrounding try/except must absorb that and
+    return the fail-open stub, keeping /status at HTTP 200.
+    """
+    saved = app.LAST_PERFORMANCE_REPORT
+    try:
+        with app.LEARNING_REPORT_LOCK:
+            app.LAST_PERFORMANCE_REPORT = "CORRUPT_REPORT_VALUE"  # type: ignore[assignment]
+        client = app.app.test_client()
+        resp = client.get("/status")
+        assert resp.status_code == 200, (
+            f"/status returned HTTP {resp.status_code} when LAST_PERFORMANCE_REPORT "
+            "is a non-dict; expected 200 — corrupt report must not kill the status endpoint")
+    finally:
+        with app.LEARNING_REPORT_LOCK:
+            app.LAST_PERFORMANCE_REPORT = saved
+
+
+def test_v1_p6_006_status_200_when_rule_engine_view_raises():
+    """V1-P6-006 — GET /status must return HTTP 200 even when _learning_rule_engine_view
+    raises an unexpected exception.
+
+    _learning_rule_engine_view() is called inline in the /status route.  Without a
+    fail-open guard any crash there propagates directly to Flask as a 500.  This test
+    verifies that the guard is present and absorbs the exception.
+    """
+    with unittest.mock.patch.object(
+        app, "_learning_rule_engine_view",
+        side_effect=RuntimeError("rule engine crash — V1-P6-006 injection"),
+    ):
+        client = app.app.test_client()
+        resp = client.get("/status")
+    assert resp.status_code == 200, (
+        f"/status returned HTTP {resp.status_code} when _learning_rule_engine_view raises; "
+        "expected 200 — the rule engine crash must not propagate to the status endpoint")
+
+
 # ===========================================================================
 # Runner
 # ===========================================================================
