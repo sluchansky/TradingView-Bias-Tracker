@@ -1320,6 +1320,203 @@ def test_v1_p6_006_status_200_when_rule_engine_view_raises():
 
 
 # ===========================================================================
+# V1-P6-007  EXECUTION GATEWAY — learning engine crash safety
+#
+# Verifies that execute_trade_gateway() cannot fire a hard broker block and
+# cannot raise an unhandled exception when the learning engine is mid-crash:
+#
+#   007a: LEARNING_ELIGIBILITY is None / corrupt (simulates a crash that wipes
+#         the in-memory cache) — gateway must fail OPEN, never hard-block.
+#
+#   007b: _check_learning_eligibility raises an unexpected exception while the
+#         gateway is running — gateway must catch it and return a valid status
+#         dict, never propagate the exception to the caller.
+#
+# In both cases the demote-only semantics are preserved: the worst permitted
+# outcome is a GHOST_ONLY paper-demotion (mode flip to "paper"), never a
+# DISABLED 409.  In the test environment (manual_only mode) even the demotion
+# is a no-op because execution_is_live(manual_only) = False — so both tests
+# receive "manual_required" 200 as the outcome.
+# ===========================================================================
+
+def _ready_short_mock_result():
+    """Minimal full_analysis() result that satisfies every gateway guard before
+    and after the LRE gate without contacting any external service.
+
+    Chosen direction=Short to avoid the Asia-session Long edge floor
+    (which could block in the 18:00-02:00 ET window).
+    stop_dist=5 pts × $10 (MGC) = $50 per contract, well within the $500
+    1%-of-$50k risk cap, so the risk-cap gate always passes.
+    """
+    return {
+        "_version": "v1",
+        "verdict": "SHORT READY",
+        "market_open": True,
+        "trade_plan": {
+            "trade_plan": "Short",
+            "direction": "Short",
+            "entry_zone": "2700.0",
+            "stop_loss": "2705.0",
+            "target1": "2685.0",
+            "target2": "2670.0",
+        },
+        "edge_score": 75,
+        "structure_class": None,
+        # Spare keys that gateway accessors touch via a.get(...)
+        "nearest_supply": None,
+        "nearest_demand": None,
+        "vwap_value": None,
+        "vwap_status": None,
+        "volatility": None,
+        "directions": {},
+        "main_brain": {},
+        "fast_entry": {},
+        "learning_score_influence": {},
+        "strategy_engine": {},
+    }
+
+
+def test_v1_p6_007a_gateway_fails_open_on_null_learning_eligibility():
+    """V1-P6-007a — execute_trade_gateway must not hard-block (no 409 from the
+    Learning Rule Engine) and must not raise when LEARNING_ELIGIBILITY is None,
+    simulating a mid-crash state where the in-memory cache was wiped.
+
+    Crash path:
+        LEARNING_ELIGIBILITY = None
+        _check_learning_eligibility() calls None.get(ns) → AttributeError
+        gateway try/except catches it → fail-open → continues
+        manual_only mode → returns {"status": "manual_required", "_version": "v1"}
+
+    Demote-only invariant: the worst permitted outcome is a paper-demotion
+    (GHOST_ONLY), never a DISABLED 409.  In manual_only mode (test env default)
+    the demotion is a no-op since execution_is_live("manual_only") = False.
+    """
+    saved_elig = app.LEARNING_ELIGIBILITY
+    saved_db_enabled = app.LEARNING_DB_ENABLED
+    # Clear any stale MGC duplicate-send fingerprint so the cooldown guard doesn't
+    # fire instead of the LRE gate under test.
+    with app._TRADERSPOST_LOCK:
+        saved_tp_last = app._TRADERSPOST_LAST.pop("MGC", None)
+    try:
+        # Corrupt the in-memory cache — simulates what a crash mid-recompute
+        # could leave behind when the global is reassigned to None.
+        app.LEARNING_ELIGIBILITY = None   # type: ignore[assignment]
+        app.LEARNING_DB_ENABLED  = True   # ensure _check_learning_eligibility runs (not early-exit)
+
+        with (
+            unittest.mock.patch.object(
+                app, "full_analysis", return_value=_ready_short_mock_result()
+            ),
+            unittest.mock.patch.object(
+                app, "resolve_execution_mode", return_value="manual_only"
+            ),
+        ):
+            result, code = app.execute_trade_gateway("MGC", 1, source="manual")
+
+    finally:
+        app.LEARNING_ELIGIBILITY = saved_elig
+        app.LEARNING_DB_ENABLED  = saved_db_enabled
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop("MGC", None)
+            if saved_tp_last is not None:
+                app._TRADERSPOST_LAST["MGC"] = saved_tp_last
+
+    # Gateway must return a valid result dict — no unhandled exception.
+    assert isinstance(result, dict), (
+        "execute_trade_gateway must return a dict when LEARNING_ELIGIBILITY is None; "
+        f"got {type(result)}")
+
+    # Must NOT be a hard Learning Rule Engine block (409 with "Learning Rule Engine" reason).
+    is_lre_hard_block = (
+        code == 409
+        and "Learning Rule Engine" in str(result.get("reason", ""))
+    )
+    assert not is_lre_hard_block, (
+        "execute_trade_gateway must not produce a hard Learning Rule Engine 409 "
+        "when LEARNING_ELIGIBILITY is None (corrupt/mid-crash); "
+        f"got status={result.get('status')!r} reason={result.get('reason')!r}")
+
+    # Must be a normal gateway outcome (manual_required 200 in manual_only mode).
+    assert code == 200, (
+        f"Expected HTTP 200 (manual_required) in manual_only mode after LRE fail-open; "
+        f"got {code}: {result.get('reason')!r}")
+    assert result.get("status") == "manual_required", (
+        f"Expected status='manual_required', got {result.get('status')!r}")
+
+
+def test_v1_p6_007b_gateway_survives_lre_check_exception():
+    """V1-P6-007b — execute_trade_gateway must return a valid status dict (not
+    propagate an exception) when _check_learning_eligibility raises unexpectedly
+    while the gateway is executing.
+
+    The gateway wraps the LRE check in a bare try/except Exception that logs at
+    DEBUG and continues.  Any exception escaping that guard would crash the auto-
+    execute hook and suppress a live order entirely.  This test verifies the guard
+    is present and effective.
+
+    Verified invariants:
+        • No unhandled exception propagates to the test (gateway catches it)
+        • Returns a well-formed dict with a "status" key
+        • Status is a recognised gateway outcome (not "error" from the LRE path)
+        • HTTP code is 200 (manual_required in test-env manual_only mode)
+        • _version key is present (V1-P1-005 contract preserved through the crash)
+    """
+    # Clear any stale MGC duplicate-send fingerprint so the cooldown guard doesn't
+    # fire before the LRE gate under test (007a may have left a fingerprint).
+    with app._TRADERSPOST_LOCK:
+        saved_tp_last_007b = app._TRADERSPOST_LAST.pop("MGC", None)
+    try:
+        with (
+            unittest.mock.patch.object(
+                app, "full_analysis", return_value=_ready_short_mock_result()
+            ),
+            unittest.mock.patch.object(
+                app, "resolve_execution_mode", return_value="manual_only"
+            ),
+            unittest.mock.patch.object(
+                app, "_check_learning_eligibility",
+                side_effect=RuntimeError("learning engine crash — V1-P6-007b injection"),
+            ),
+        ):
+            result, code = app.execute_trade_gateway("MGC", 1, source="manual")
+    finally:
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop("MGC", None)
+            if saved_tp_last_007b is not None:
+                app._TRADERSPOST_LAST["MGC"] = saved_tp_last_007b
+
+    # Gateway must return a dict — no unhandled exception.
+    assert isinstance(result, dict), (
+        "execute_trade_gateway must return a dict even when _check_learning_eligibility "
+        f"raises; got {type(result)}")
+
+    # Must carry a "status" key (V1-P1-005 contract).
+    assert "status" in result, (
+        "result must contain 'status' key after LRE exception; "
+        f"got keys: {list(result.keys())}")
+
+    # Must not be a Learning Rule Engine hard-block (demote-only veto, not DISABLED 409).
+    assert result.get("status") != "error" or "Learning Rule Engine" not in str(
+        result.get("reason", "")
+    ), (
+        "execute_trade_gateway must not produce a Learning Rule Engine error when the "
+        "check itself raises — a raised check is fail-open, not a hard block; "
+        f"got status={result.get('status')!r} reason={result.get('reason')!r}")
+
+    # In manual_only mode (test env) the result must be manual_required 200.
+    assert code == 200, (
+        f"Expected HTTP 200 (manual_required) in manual_only mode after LRE exception; "
+        f"got {code}: {result.get('reason')!r}")
+    assert result.get("status") == "manual_required", (
+        f"Expected status='manual_required', got {result.get('status')!r}")
+
+    # V1-P1-005 contract preserved through the exception path.
+    assert result.get("_version") == "v1", (
+        f"_version must be 'v1' in gateway result after LRE exception; "
+        f"got {result.get('_version')!r}")
+
+
+# ===========================================================================
 # Runner
 # ===========================================================================
 
