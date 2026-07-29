@@ -23338,7 +23338,6 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         "meta":      (learning_score_influence or {}).get("meta") if learning_score_influence else None,
         "Long":      _ls_dir_summary("Long"),
         "Short":     _ls_dir_summary("Short"),
-        "_version":  "v1",
     }
 
     # ── Source attribution diagnostics (display-only audit; never alters scoring) ──
@@ -24071,7 +24070,6 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "meta":      None,
             "Long":      dict(_ls_neutral_dir),
             "Short":     dict(_ls_neutral_dir),
-            "_version":  "v1",
         }
         # Neutralise the CVD / RVOL / volume stamps too — there is no live tape closed.
         result["cvd_state"]          = None
@@ -34290,7 +34288,6 @@ def _active_trade_mgmt_block(seed_analysis=None, seed_ticker=None):
             "count":      len(rows),
             "positions":  rows,
             "updated_at": now_utc().isoformat(),
-            "_version":   "v1",
         }
     except Exception as exc:
         logger.warning("active-trade-mgmt status block error: %s", exc)
