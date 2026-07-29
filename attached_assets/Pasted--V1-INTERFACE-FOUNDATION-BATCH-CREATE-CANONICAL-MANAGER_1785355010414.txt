@@ -1,0 +1,695 @@
+# V1 INTERFACE FOUNDATION BATCH
+# CREATE CANONICAL MANAGER + COACH CONTRACTS
+# CONTROLLED IMPLEMENTATION — NO DEPLOYMENT
+
+Current validated state:
+
+- Corrective commit: 36bd6e1
+- Expert v1: COMPLETE
+- Left Brain v2: COMPLETE
+- Partner v1: COMPLETE
+- Execution Gateway v1: COMPLETE
+- Journal v1: COMPLETE
+- Manager v1: INCOMPLETE because the canonical contract does not exist
+- Coach v1: INCOMPLETE because the canonical contract does not exist
+
+This batch is authorized only to create the two missing canonical interface contracts:
+
+1. Manager Interface v1
+2. Coach Interface v1
+
+Do not begin any broader roadmap batch.
+
+=========================================================
+PRIMARY OBJECTIVE
+=========================================================
+
+Create two additive, read-only canonical interface objects that expose existing system state without changing any underlying behavior.
+
+The new contracts must:
+
+- assemble existing information
+- have one clear owner
+- have one canonical construction boundary
+- expose the exact fields required by SYSTEM_ARCHITECTURE_V1.md
+- include the documented _version field
+- serialize safely
+- remain isolated from decision, risk, execution, journal, and learning behavior
+
+These interfaces are observation and integration contracts only.
+
+They must not become new decision-makers.
+
+=========================================================
+DOCUMENT PRECEDENCE
+=========================================================
+
+Read these documents completely before modifying application code:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. V1_FIRST_BATCH_BASELINE.md
+6. V1_FIRST_BATCH_VALIDATION.md
+
+Also inspect commit:
+
+36bd6e1
+
+Use the following precedence:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. Validation evidence
+
+If the documents conflict about:
+
+- contract ownership
+- required fields
+- field meanings
+- field types
+- null or unavailable behavior
+- persistence
+- route exposure
+- version metadata
+- test expectations
+
+STOP and report the exact conflict.
+
+Do not invent a compromise.
+
+=========================================================
+MANDATORY BASELINE FREEZE
+=========================================================
+
+Before modifying application code, capture:
+
+- current branch
+- current HEAD
+- git status
+- tracked modified files
+- untracked files
+- diff summary
+- git diff --check
+- upstream or remote revision, when available
+- whether HEAD is a Replit checkpoint
+- parent commit if HEAD is documentation-only or attachment-only
+
+Do not reset, discard, stash, amend, rebase, or overwrite existing work.
+
+Check whether HEAD still contains commit 36bd6e1.
+
+If HEAD changed, inspect the change and report whether it is:
+
+- task-related
+- documentation-only
+- attachment-only
+- Replit-generated
+- an unexplained code change
+
+Stop on unexplained code changes.
+
+=========================================================
+STAGE 1 — CONTRACT SOURCE MAPPING
+=========================================================
+
+Before creating either interface, map every required field to its existing authoritative source.
+
+Do not write code until both maps are complete.
+
+---------------------------------------------------------
+MANAGER INTERFACE V1
+---------------------------------------------------------
+
+The architecture currently describes the Manager contract as containing:
+
+- gateway_debug
+- active_trade
+- managed_trade
+- training_gate
+- auto_trade_enabled
+
+Confirm the exact required field names, types, and meanings from the controlling documents.
+
+For each field document:
+
+- authoritative producer
+- file and function
+- current type and shape
+- whether it already exists in full_analysis(), status output, trade state, or another canonical object
+- whether it can be read without side effects
+- whether it is always available
+- expected unavailable representation
+- whether reading it could trigger execution, mutation, broker communication, or persistence
+
+Do not recompute:
+
+- position sizing
+- risk
+- trade readiness
+- active-trade decisions
+- execution eligibility
+- prop protections
+
+The Manager contract must aggregate existing results only.
+
+---------------------------------------------------------
+COACH INTERFACE V1
+---------------------------------------------------------
+
+The architecture currently describes the Coach contract as containing:
+
+- weight_updated
+- thesis_resolved
+- learning_influence
+- rule_engine_eligibility
+
+Confirm the exact required field names, types, and meanings from the controlling documents.
+
+For each field document:
+
+- authoritative producer
+- file and function
+- current type and shape
+- lifecycle timing
+- whether it exists before or after trade close
+- whether it depends on journal settlement
+- whether it depends on sample thresholds
+- whether it is available during ordinary full_analysis()
+- expected unavailable representation
+- whether reading it causes a learning update or database write
+
+Do not fabricate data.
+
+Do not infer that a learning update occurred simply because learning is enabled.
+
+Do not substitute:
+
+result["learning_score_influence"]
+
+for the full Coach contract unless the architecture explicitly says that field is the authoritative source for learning_influence.
+
+=========================================================
+SOURCE-OF-TRUTH RULE
+=========================================================
+
+Every contract field must come from one of these sources:
+
+1. An existing authoritative runtime value
+2. An existing persisted value read without mutation
+3. A documented explicit unavailable state
+
+Do not:
+
+- duplicate calculation logic
+- derive approximate values
+- guess from logs
+- infer state from unrelated booleans
+- trigger a write to obtain a read result
+- call execution code
+- call broker code
+- close or resolve a trade
+- update learning weights
+- mutate active-trade state
+- insert database rows
+
+If a required field has no authoritative source, stop and report the missing source.
+
+Do not create placeholder semantics that are not authorized by the architecture.
+
+=========================================================
+STAGE 2 — DESIGN THE TWO CANONICAL BOUNDARIES
+=========================================================
+
+Create exactly one canonical constructor or builder for each contract.
+
+Preferred conceptual pattern:
+
+Manager:
+
+build_manager_interface(...)
+
+Coach:
+
+build_coach_interface(...)
+
+Use names required by the architecture if specified.
+
+Do not rename or move existing functions.
+
+Do not refactor surrounding code.
+
+Each builder must:
+
+- have one documented owner
+- return one serializable dictionary or existing project-standard object
+- include _version
+- preserve exact required field names
+- read existing values only
+- have deterministic unavailable behavior
+- contain no business decisions
+- contain no side effects
+- contain no database writes
+- contain no network calls
+- contain no broker calls
+- contain no execution calls
+- contain no logging changes unless required for an existing error path
+
+Do not create multiple competing Manager or Coach contracts.
+
+=========================================================
+VERSION CONTRACTS
+=========================================================
+
+Use the exact architecture-defined field name and representation.
+
+Expected versions:
+
+Manager:
+
+"_version": "v1"
+
+Coach:
+
+"_version": "v1"
+
+Confirm these values from the controlling documents before editing.
+
+The version must be unconditional for every valid canonical interface object, including degraded or unavailable states.
+
+Do not derive the version dynamically.
+
+=========================================================
+UNAVAILABLE AND DEGRADED STATES
+=========================================================
+
+Follow architecture-defined nullability and status rules exactly.
+
+If the documents do not specify unavailable behavior, stop and report rather than inventing one.
+
+Do not silently omit required fields.
+
+Every valid contract object must contain all required fields.
+
+Potential states that must be considered:
+
+Manager:
+
+- no active trade
+- active trade exists
+- active management disabled
+- execution disabled
+- manual-only mode
+- analysis-only mode
+- training gate unavailable
+- gateway debug unavailable
+
+Coach:
+
+- no completed trade
+- thesis unresolved
+- learning disabled
+- insufficient samples
+- no weight update
+- rule engine ineligible
+- learning influence unavailable
+- database read unavailable
+
+The contract should describe state, not force a state transition.
+
+=========================================================
+STRICT SAFETY RULES
+=========================================================
+
+Do not modify:
+
+- Databento ingestion
+- Databento connection management
+- TradingView or Pine fallback ingestion
+- market-data normalization
+- indicators
+- features
+- VWAP
+- ATR
+- CVD or delta
+- market structure
+- strategy scanning
+- strategy selection
+- edge scores
+- confidence
+- verdicts
+- gate thresholds
+- risk
+- sizing
+- prop protections
+- duplicate-order protection
+- cooldowns
+- execution authorization
+- broker routing
+- TradersPost
+- order submission
+- order management
+- active-trade management
+- journal persistence
+- learning calculations
+- learning weights
+- sample thresholds
+- rule-engine eligibility logic
+- database schema
+- environment variables
+- deployment configuration
+- dashboard layout
+- operator wording
+- route names
+- state transitions
+
+Do not publish.
+
+Do not deploy.
+
+Do not restart production.
+
+Do not send a live webhook.
+
+Do not place an order.
+
+=========================================================
+STAGE 3 — INTEGRATION BOUNDARY
+=========================================================
+
+Expose the new contracts only at the architecture-authorized integration point.
+
+Before adding either contract to an existing response, determine:
+
+- which existing caller owns the integration
+- whether the architecture requires inclusion in full_analysis()
+- whether a dedicated internal builder is sufficient for this roadmap task
+- whether a dedicated route is required
+- whether adding the object could affect strict equality tests
+- whether any external caller rejects unknown fields
+
+Do not add new public API routes unless explicitly authorized.
+
+Do not add the contracts to broker payloads.
+
+Do not add them to database records unless explicitly authorized.
+
+Do not add them to dashboard objects unless explicitly authorized.
+
+If the architecture only requires the canonical object to exist and be testable, keep integration minimal.
+
+=========================================================
+STAGE 4 — FOCUSED CONTRACT TESTS
+=========================================================
+
+Extend or add tracked tests in the repository’s established test location.
+
+Do not use .local/state.
+
+Tests must run from a clean clone.
+
+Add runtime tests for the Manager Interface:
+
+1. _version exists.
+2. _version equals "v1".
+3. All required fields exist.
+4. No active-trade state is represented correctly.
+5. Active-trade state uses existing authoritative data.
+6. Disabled/manual-only/analysis-only states do not trigger execution.
+7. Serialization succeeds.
+8. Repeated calls do not mutate state.
+9. Existing source values are unchanged.
+10. No broker adapter is called.
+
+Add runtime tests for the Coach Interface:
+
+1. _version exists.
+2. _version equals "v1".
+3. All required fields exist.
+4. No resolved thesis state is represented correctly.
+5. Learning-disabled state is represented correctly.
+6. Insufficient-sample state is represented correctly.
+7. No weight update is falsely reported.
+8. learning_influence reflects only the authoritative source.
+9. rule_engine_eligibility reflects only the authoritative source.
+10. Serialization succeeds.
+11. Repeated reads do not write to the database.
+12. No learning calculation changes.
+13. No live-gate influence changes.
+
+Update the cross-interface contract matrix only after the two contracts genuinely exist:
+
+- Left Brain v2
+- Expert v1
+- Partner v1
+- Manager v1
+- Execution Gateway v1
+- Journal v1
+- Coach v1
+
+Do not use source grep as the primary proof.
+
+Do not weaken existing assertions.
+
+=========================================================
+STAGE 5 — REGRESSION VALIDATION
+=========================================================
+
+Run the exact repository commands for:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- tracked version-contract tests
+- new Manager tests
+- new Coach tests
+- directly affected existing tests
+- syntax checks
+
+Record:
+
+- exact command
+- exit code
+- passed
+- failed
+- skipped
+- warnings
+- duration, where available
+
+Compare with the existing baseline.
+
+Required result:
+
+- no new failures
+- no changed verdicts
+- no changed confidence
+- no changed edge scores
+- no changed trade direction
+- no changed actionability
+- no changed risk or sizing
+- no changed execution requests
+- no changed broker payloads
+- no changed journal persistence
+- no changed learning calculations
+- no changed learning weights
+- no changed Databento behavior
+
+Run:
+
+- git status
+- git diff --stat
+- git diff --check
+
+Inspect the full diff manually.
+
+=========================================================
+REQUIRED EVIDENCE DOCUMENT
+=========================================================
+
+Create:
+
+V1_MANAGER_COACH_INTERFACE_VALIDATION.md
+
+Include:
+
+1. Repository State
+
+- branch
+- starting HEAD
+- ending HEAD or working-tree state
+- git status
+- diff summary
+- git diff --check
+
+2. Architecture Evidence
+
+For Manager and Coach:
+
+- exact architecture section
+- exact roadmap task
+- required fields
+- field meanings
+- required nullability or unavailable behavior
+- required integration point
+
+3. Source Map
+
+For every required field:
+
+- authoritative source
+- file
+- function
+- type
+- lifecycle
+- side-effect analysis
+- unavailable behavior
+
+4. Canonical Boundary
+
+For both contracts:
+
+- builder or owner
+- file
+- function
+- callers
+- why it is canonical
+- why prior candidate objects were noncanonical
+
+5. Contract Examples
+
+Show sanitized examples for:
+
+- Manager with no active trade
+- Manager with active trade
+- Coach with no resolved thesis
+- Coach with learning unavailable
+- Coach with existing authoritative learning state
+
+Do not include secrets or live account data.
+
+6. Behavioral Parity
+
+Confirm whether any change occurred in:
+
+- verdicts
+- confidence
+- edge scores
+- direction
+- actionability
+- risk
+- sizing
+- execution
+- broker payloads
+- active-trade management
+- journal persistence
+- Coach calculations
+- learning weights
+- Databento
+
+Expected answer: no change for every item.
+
+7. Test Evidence
+
+Include exact commands and results.
+
+8. Scope Confirmation
+
+Confirm:
+
+- no Databento files changed
+- no strategy logic changed
+- no score logic changed
+- no risk logic changed
+- no execution logic changed
+- no broker logic changed
+- no database schema changed
+- no deployment occurred
+
+=========================================================
+STOP CONDITIONS
+=========================================================
+
+Stop and report without continuing if:
+
+- the baseline is not green
+- HEAD changes unexpectedly
+- architecture documents conflict
+- a required field has no authoritative source
+- unavailable behavior is undefined
+- creating the interface requires recomputing business logic
+- creating the interface requires a database migration
+- creating the interface requires a new public route not authorized
+- creating the interface changes strict external payloads
+- a broker-facing object would receive _version
+- any Databento file appears in the task diff
+- any regression fails
+- any verdict, score, direction, risk, sizing, execution, journal, or learning behavior changes
+- production deployment is required for proof
+
+Do not silently work around a stop condition.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If both contracts are created and all validation passes, create one commit.
+
+Suggested commit message:
+
+V1-P1 add canonical Manager and Coach interfaces
+
+Do not amend 36bd6e1.
+
+Do not squash prior commits.
+
+If only one interface can be created safely:
+
+- complete and commit only that interface if independently valid
+- mark the other task incomplete
+- clearly report the stop condition
+
+Do not claim both complete unless both canonical contracts exist and pass tests.
+
+=========================================================
+FINAL RESPONSE FORMAT
+=========================================================
+
+Report:
+
+1. Starting branch and HEAD
+2. Ending branch and HEAD or working-tree state
+3. Files modified
+4. Manager source map
+5. Coach source map
+6. Canonical Manager boundary
+7. Canonical Coach boundary
+8. Manager contract example
+9. Coach contract example
+10. Tests added
+11. Contract-test results
+12. Four primary regression results
+13. Behavioral parity result
+14. Databento-change confirmation
+15. Execution-change confirmation
+16. Broker-payload-change confirmation
+17. Journal-change confirmation
+18. Learning-calculation-change confirmation
+19. Database-schema-change confirmation
+20. Deployment confirmation
+21. Evidence document created
+22. Commit created
+23. Final status of V1-P1-004
+24. Final status of V1-P1-007
+25. Any stop condition or remaining roadmap dependency
+
+Do not begin the next roadmap batch.
+
+Do not publish.
+
+Do not deploy.
+
+Stop after reporting.
