@@ -1,0 +1,205 @@
+# AI Trading Partner
+# Phase 2 — Product Definition
+# NO CODE
+# NO REFACTOR
+# NO IMPLEMENTATION
+
+The platform blueprint is complete.
+
+The objective of this phase is to transform the architectural inventory into a coherent product.
+
+This is a PRODUCT DESIGN exercise.
+
+NOT a software implementation exercise.
+
+=========================================================
+GOAL
+=========================================================
+
+Define Version 1.0 of the AI Trading Partner.
+
+The platform should feel like:
+
+"A professional trading desktop, journal, coach, partner, and market expert all in one application."
+
+We are NOT adding features.
+
+We are deciding how existing capabilities should work together.
+
+=========================================================
+TASK 1 — USER JOURNEY
+=========================================================
+
+Describe the ideal trading day.
+
+Walk through the experience from:
+
+1. Opening the application
+2. Pre-market preparation
+3. Watching the market
+4. Opportunity developing
+5. Trade decision
+6. Active trade
+7. Trade completion
+8. End-of-day review
+
+For every step answer:
+
+• What should the trader see?
+• Which subsystem is responsible?
+• What decisions are being made?
+• What information should be explained?
+
+=========================================================
+TASK 2 — SCREEN DEFINITIONS
+=========================================================
+
+Define the major workspaces.
+
+For each screen include:
+
+Purpose
+
+Primary questions it answers
+
+Required panels
+
+Optional panels
+
+Dependencies
+
+Avoid implementation.
+
+Only define the product.
+
+=========================================================
+TASK 3 — ROLE RESPONSIBILITIES
+=========================================================
+
+Clearly separate responsibilities.
+
+Trading Desktop
+
+Trading Expert
+
+Trading Partner
+
+Trading Coach
+
+Trading Journal
+
+Trading Manager
+
+Nothing should belong to two roles unless necessary.
+
+=========================================================
+TASK 4 — INFORMATION HIERARCHY
+=========================================================
+
+Rank information.
+
+CRITICAL
+
+IMPORTANT
+
+REFERENCE
+
+DIAGNOSTIC
+
+The dashboard should surface critical information first.
+
+Deep diagnostics should remain available without overwhelming the operator.
+
+=========================================================
+TASK 5 — OPERATOR EXPERIENCE
+=========================================================
+
+Design for an intermediate trader.
+
+The platform should teach while trading.
+
+For every major decision define:
+
+What happened
+
+Why
+
+What changed
+
+What is missing
+
+What would invalidate it
+
+Recommended action
+
+Never assume the operator understands advanced terminology.
+
+=========================================================
+TASK 6 — VERSION 1 FEATURE SELECTION
+=========================================================
+
+Review every subsystem from the blueprint.
+
+Assign one label.
+
+KEEP
+
+MERGE
+
+HIDE
+
+REMOVE
+
+Justify each decision.
+
+=========================================================
+TASK 7 — PRIORITY MATRIX
+=========================================================
+
+For every subsystem score:
+
+Business Value (1-10)
+
+Operator Value (1-10)
+
+Technical Maturity (1-10)
+
+Integration Level (1-10)
+
+Version 1 Priority
+
+Sort highest priority first.
+
+=========================================================
+TASK 8 — VERSION 1 DEFINITION
+=========================================================
+
+Produce the final Version 1 product definition.
+
+Describe exactly what a trader experiences.
+
+When someone opens AI Trading Partner they should immediately understand:
+
+What the market is doing
+
+Why
+
+What opportunities exist
+
+What action is recommended
+
+How active trades are performing
+
+What they learned today
+
+=========================================================
+
+Return ONE comprehensive product definition.
+
+Do not write code.
+
+Do not suggest implementation.
+
+Do not modify architecture.
+
+The output should become the official Version 1 Product Specification.
