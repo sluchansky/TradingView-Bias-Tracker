@@ -467,3 +467,216 @@ All required deliverables are tracked (in git), not in `.local/`, not in `attach
 
 ### Next Roadmap Dependency
 Phase 4 — Operator Explanation and Decision Timeline — requires Phase 3 completion. Phase 3 is now complete. Phase 4 work should not begin until explicitly authorized.
+
+---
+
+## 10. Intervening-Commit Provenance Audit
+
+Performed at HEAD `e35f92e`. Authorised by the V1-P3 provenance audit instruction file.
+DO NOT BEGIN PHASE 4. DO NOT DEPLOY.
+
+### Step 1 — Freeze State
+
+| Field | Value |
+|---|---|
+| **Branch** | `polish-v1` |
+| **HEAD at audit** | `e35f92e` |
+| **Phase 3 commit** | `aa7ee5f` — confirmed in history |
+| **`git status`** | Only the instruction file untracked — working tree otherwise CLEAN |
+| **`git diff --check`** | CLEAN |
+
+Note: `e35f92e` and `7f81f38` are task-agent merges (#31, #32) that landed after Phase 3 commit `aa7ee5f`. Their contents are documented in Step 2.
+
+---
+
+### Step 2 — Commits Between 29e1d4d and 5360fea
+
+Four commits in range `29e1d4d..5360fea`:
+
+| SHA | Message | Files changed | Classification |
+|---|---|---|---|
+| `5410179` | Add corrective delivery audit tracking document | `attached_assets/*.txt` (1 file added) | **Documentation only** — no source or test changes |
+| `52a47f3` | Published your App | *(none — platform checkpoint)* | **Platform checkpoint only** |
+| `4d8cb06` | Add higher-fidelity weight_updated test | `test_v1_interface_versions.py` | **Test-only** — no `app.py` changes |
+| `5360fea` | Prevent /status 500 when learning report table is missing | `app.py` + `test_v1_interface_versions.py` | **Code + test** — see detail below |
+
+Post-Phase-3 commits (landed between `aa7ee5f` and `e35f92e`):
+
+| SHA | Message | Files changed | Classification |
+|---|---|---|---|
+| `09fab9a` | Add phase 3 controlled implementation documentation | *(attached_assets)* | **Documentation only** |
+| `7f81f38` | Add V1-P6-007 tests: broker order cannot fire when learning engine mid-crash | `test_v1_interface_versions.py` | **Test-only** (Task #31 merge) |
+| `e35f92e` | Add restart-semantics tests for `_THESIS_LAST_RESOLVED_AT` and `thesis_resolved` | `test_v1_interface_versions.py` | **Test-only** (Task #32 merge) |
+
+---
+
+### Step 3 — Detailed Audit: 4d8cb06
+
+**Files changed:** `artifacts/tradingview-webhook/test_v1_interface_versions.py` — 1 test added
+**Files NOT changed:** `app.py`, `left_brain_market_intelligence.py`, golden files — none
+**Function added:** `test_coach_recompute_via_mocked_db_sets_updated_at_and_weight_updated`
+**What it tests:** Mocks a DB cursor returning one trade row → `_recompute_learning()` → `LEARNING_ANALYTICS["updated_at"]` set → `build_coach_interface()` returns `weight_updated=True`
+**Domain:** Learning Engine / Coach interface — not thesis/verdict
+**Runtime behavior changed:** NONE
+**Tests added:** 1 (Coach/Learning higher-fidelity path)
+**Phase 3 task overlap (V1-P3-001–009):** NONE
+
+---
+
+### Step 4 — Detailed Audit: 5360fea
+
+**Task #30 identity:**
+
+| Field | Value |
+|---|---|
+| **Task title** | Prevent /status 500 when learning report table is missing or crashes |
+| **Task UUID** | `cfeee558-174b-4237-b8bf-e5597bfd570a` |
+| **Category** | Learning engine reliability — fail-open guard |
+| **Roadmap classification** | Learning Engine follow-up (same cluster as learning tasks #34–#38) |
+| **Phase** | NOT Phase 3 — belongs to the learning engine reliability domain |
+
+**app.py change — exact content:**
+
+Function `_learning_rule_engine_view()` (line ~13067). The entire function body moved inside a `try` block. A new `except Exception as _lrev_exc` handler was appended that returns a fail-open stub: `{"enabled": True, "db_connected": False, "reason": "learning rule engine unavailable"}`. No new logic, no new data keys, no behavioral change when the function succeeds — only the crash path was changed.
+
+```
+-    with LEARNING_ELIGIBILITY_LOCK:          # line ~13078 (original)
++    try:                                     # new wrapper
++        with LEARNING_ELIGIBILITY_LOCK:
+         ...
++    except Exception as _lrev_exc:
++        logger.warning("_learning_rule_engine_view fail-open: %s", _lrev_exc)
++        return {"enabled": True, "db_connected": False, "reason": "..."}
+```
+
+**test_v1_interface_versions.py change — exact content:**
+
+Three V1-P6-006 tests added:
+1. `test_v1_p6_006_status_200_when_last_performance_report_none`
+2. `test_v1_p6_006_status_200_when_last_performance_report_invalid`
+3. `test_v1_p6_006_status_200_when_rule_engine_view_raises`
+
+All three assert that `/status` returns HTTP 200 when the learning infrastructure is broken (None report, non-dict report, `_learning_rule_engine_view` exception). Tagged `V1-P6-006` — NOT Phase 3 task IDs.
+
+**Functions changed:** `_learning_rule_engine_view()` only
+**Runtime behavior changed:** YES — but only the CRASH path of `_learning_rule_engine_view()`; success path is byte-identical
+**Phase 3 task overlap (V1-P3-001–009):** NONE — `_learning_rule_engine_view()` is not called or referenced in any of the nine Phase 3 tasks
+
+---
+
+### Step 5 — Map 5360fea to Roadmap (Outcome)
+
+**Outcome: A — NO PHASE 3 OVERLAP**
+
+`5360fea` implemented a reliability guard (`_learning_rule_engine_view` fail-open) in the Learning Rule Engine domain. The nine Phase 3 task areas are:
+
+| Phase 3 area | Function(s) | Touched by 5360fea? |
+|---|---|---|
+| Left Brain guaranteed fields | `compute_left_brain_thesis()` | **NO** |
+| Thesis hysteresis | `_apply_thesis()` / `_apply_thesis_inner()` | **NO** |
+| OUTLOOK_SHIFT detection | `_detect_significant_changes()` | **NO** |
+| Expert guaranteed fields | `full_analysis()` return keys | **NO** |
+| strict_reason non-empty | `full_analysis()` / `_build_status_payload()` | **NO** |
+| /decision-trace contract | `build_legacy_decision_trace()` / `/decision-trace` | **NO** |
+| Gate boundary | `evaluate_strict_setup()` | **NO** |
+| SCALP vs SWING mode | `cfg_for()` / `evaluate_strict_setup(mode=)` | **NO** |
+| Dual-sim agreement | `full_analysis()` / `TRADING_MODE` | **NO** |
+
+`5360fea` exclusively modified `_learning_rule_engine_view()`. This function is not in any Phase 3 task requirement. It is not called by any Phase 3 function under test.
+
+---
+
+### Step 6 — Prove Each Phase 3 Task Implementation Origin
+
+All nine Phase 3 requirements were **present at `29e1d4d`** (the accepted Phase 2 baseline). Phase 3 in `aa7ee5f` was genuinely a verification-and-contract-coverage phase.
+
+Evidence: confirmed via `git show 29e1d4d:artifacts/tradingview-webhook/app.py | grep -n` and `git show 29e1d4d:artifacts/tradingview-webhook/left_brain_market_intelligence.py | grep -n`:
+
+| Task | Requirement | Production function | Line at 29e1d4d | Added/changed after 29e1d4d? | Implementation commit |
+|---|---|---|---|---|---|
+| V1-P3-001 | Left Brain guaranteed fields | `compute_left_brain_thesis()` | `lbmi.py:1288` | NO | Pre-`29e1d4d` |
+| V1-P3-002 | Thesis hysteresis / THESIS_UPDATED | `_apply_thesis()`, `_THESIS_ENABLED` | `app.py:35754`, `3415` | NO | Pre-`29e1d4d` |
+| V1-P3-003 | OUTLOOK_SHIFT detection | `_detect_significant_changes()` | `lbmi.py:1038`, label at `654` | NO | Pre-`29e1d4d` |
+| V1-P3-004 | Expert guaranteed fields in /status | `full_analysis()`, `_build_status_payload()` | All keys pre-existing | NO | Pre-`29e1d4d` |
+| V1-P3-005 | strict_reason non-empty when WAIT | `full_analysis()` | Pre-existing | NO | Pre-`29e1d4d` |
+| V1-P3-006 | /decision-trace contract | `build_legacy_decision_trace()`, `/decision-trace` | `app.py:22453`, `43786` | NO | Pre-`29e1d4d` |
+| V1-P3-007 | Gate boundary tests | `evaluate_strict_setup(mode=)` | `app.py:6929` | NO | Pre-`29e1d4d` |
+| V1-P3-008 | SCALP vs SWING zone gate difference | `cfg_for()`, `evaluate_strict_setup(mode=)` | `app.py:1124` | NO | Pre-`29e1d4d` |
+| V1-P3-009 | Dual-sim verdict agreement | `full_analysis()`, `TRADING_MODE`, `is_actionable()` | `app.py:1408` | NO | Pre-`29e1d4d` |
+
+**Conclusion:** Phase 3 (`aa7ee5f`) added zero production runtime changes. All tested functionality was already live at `29e1d4d`. Phase 3 was a verification-only phase — this is accurate.
+
+---
+
+### Step 7 — Test Classification
+
+All 60 Phase 3 tests call real runtime functions with real arguments and assert on real return values. No test uses `inspect.getsource()`, AST analysis, `grep`, or field-name-only static checks.
+
+| Task | Count | Classification | Runtime assertion? |
+|---|---|---|---|
+| V1-P3-001 | 8 | Runtime behavioral + integration (real `compute_left_brain_thesis()` + `full_analysis()` calls) | YES — asserts field presence and types in returned dicts; asserts `available=True/False` from real computation |
+| V1-P3-002 | 6 | Runtime behavioral (real `_apply_thesis()` calls with flag toggling; fail-open assertion) | YES — asserts `(adj, snap)` return values from `_apply_thesis()` with real inputs |
+| V1-P3-003 | 5 | Isolated unit tests (real `_detect_significant_changes()` with synthetic MI data) | YES — asserts event list contents and schema from real function execution |
+| V1-P3-004 | 8 | Integration (real `full_analysis()` + HTTP `/status` via Flask test client) | YES — asserts HTTP 200 and JSON field presence/types from live endpoint |
+| V1-P3-005 | 4 | Runtime behavioral (real `full_analysis()` + `/status`; asserts non-empty string) | YES — asserts `strict_reason.strip() != ""` from real analysis output |
+| V1-P3-006 | 5 | Integration (real HTTP `/decision-trace` + flag toggling + trace cache state) | YES — asserts HTTP 200, `enabled` bool, `traces` dict, and `_LAST_DECISION_TRACE` population |
+| V1-P3-007 | 9 | Isolated unit tests (real `evaluate_strict_setup()` with explicit boundary inputs) | YES — asserts `gate_debug["zone_valid"]=False`, `"zone_valid" in missing`, `label="WAIT"` from real gate computation |
+| V1-P3-008 | 8 | Runtime behavioral + isolated unit (real `cfg_for()` + `evaluate_strict_setup(mode=)`) | YES — asserts `cfg_for()` return value and `missing` list contents from real mode config |
+| V1-P3-009 | 7 | Runtime behavioral + integration (real `full_analysis()` with `TRADING_MODE` toggling) | YES — asserts verdict determinism, is_actionable, `_version="v1"` across modes |
+
+Every task has at least one meaningful runtime assertion. No task relies solely on static checks.
+
+---
+
+### Step 8 — Post-Audit Regression Results (HEAD: e35f92e)
+
+| Suite | Count | Result |
+|---|---|---|
+| `test_phase3_thesis_verdict_pipeline.py` | 60 | **PASS** |
+| `test_v1_interface_versions.py` | 85 | **PASS** (77 baseline + 8 from task-agent merges #29–#32) |
+| `test_phase2_market_data_reliability.py` | 45 | **PASS** |
+| **All combined** | **190** | **PASS** |
+| Phase 2 smoke | 8/8 | **PASS** |
+| parity | — | **PASS** |
+| scalp_golden | — | **PASS** |
+| dual_sim | — | **PASS** |
+| breakout_mode | — | **PASS** |
+| `py_compile` | — | **PASS** |
+| `git diff --check` | — | **CLEAN** |
+
+---
+
+### Step 9 — Corrected Statements
+
+The original Phase 3 report (Sections 1–9) stated:
+> "Phase 3 changed NONE of the following: verdicts, confidence, edge scores, …"
+> "Files modified: None (no existing files modified)"
+> "Runtime behavior changes: None"
+
+These statements were accurate with respect to Phase 3 commit `aa7ee5f`. They remain accurate after this audit.
+
+The intervening commit `5360fea` DID modify `app.py`, but:
+- It was NOT a Phase 3 commit — it was Task #30 (learning reliability)
+- The Phase 3 report correctly classified it as "task-implementation agent merge"
+- The Phase 3 report correctly noted that `5360fea` was the starting point for Phase 3, not part of it
+- No Phase 3 task scope was pre-implemented by `5360fea`
+
+**Correction required:** None. The original Phase 3 report was accurate.
+
+---
+
+### Step 10 — Honest Final Phase 3 Status
+
+| Task | Status | Implementation origin | Verified by |
+|---|---|---|---|
+| V1-P3-001 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_001_*` (8 tests), all runtime |
+| V1-P3-002 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_002_*` (6 tests), all runtime |
+| V1-P3-003 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_003_*` (5 tests), all runtime |
+| V1-P3-004 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_004_*` (8 tests), all runtime |
+| V1-P3-005 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_005_*` (4 tests), all runtime |
+| V1-P3-006 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_006_*` (5 tests), all runtime |
+| V1-P3-007 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_007_*` (9 tests), all runtime |
+| V1-P3-008 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_008_*` (8 tests), all runtime |
+| V1-P3-009 | ✅ COMPLETE | Pre-`29e1d4d` | `test_p3_009_*` (7 tests), all runtime |
+
+**Phase 3 may honestly be closed.** All nine tasks verified. All 60 tests pass runtime assertions. Phase 3 was a verification-and-contract-coverage phase. No implementation gap was found. Phase 4 authorization remains a separate decision.
