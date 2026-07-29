@@ -2,7 +2,7 @@
 
 **Phase:** V1-P2  
 **Stream:** B — Market Data and Feature Reliability  
-**Date:** 2026-07-29  
+**Date:** 2026-07-29
 **Status:** ✅ COMPLETE — all 8 tasks verified  
 
 ---
@@ -181,3 +181,163 @@ All 7 canonical interfaces remain byte-identical (70/70 interface tests pass):
 | AC-14.1 | TD-014 open conflict documented and resolved | ✅ |
 | AC-14.2 | Pine default to MGC (lenient path) correctly documented | ✅ |
 | AC-14.3 | Clock-skew now_dt kwarg confirmed in source | ✅ |
+
+---
+
+## 11. Corrective Delivery Validation After d7e5183
+
+**Date:** 2026-07-29
+**Trigger:** Smoke scripts placed in `.local/state/` (gitignored); not reproducible from a clean clone.
+
+### 11.1 Why the Original Scripts Were Not Reproducible
+
+At commit `d7e5183`, both smoke scripts were written to `.local/state/` — the directory
+used by Replit for operational workflow state. That path is listed in `.gitignore`:
+
+```
+.local/
+```
+
+As a result, neither script was included in the commit tree. A clean clone of `d7e5183`
+cannot run either check:
+
+```
+$ git ls-tree -r --name-only d7e5183 | grep -E 'check_databento_health|check_stale_vwap'
+(no output — neither script present)
+```
+
+### 11.2 Original Ignored Paths (Not in Git)
+
+```
+.local/state/check_databento_health.sh   ← gitignored, not committed
+.local/state/check_stale_vwap.sh         ← gitignored, not committed
+```
+
+### 11.3 New Tracked Paths
+
+```
+artifacts/tradingview-webhook/checks/check_databento_health.sh
+artifacts/tradingview-webhook/checks/check_stale_vwap.sh
+artifacts/tradingview-webhook/checks/run_phase2_smoke.sh   (runner)
+```
+
+`artifacts/tradingview-webhook/` is the repository's established location for all
+test and verification files. The `checks/` subdirectory follows the convention
+suggested in the corrective audit instruction.
+
+### 11.4 Script Portability Design
+
+Each script resolves its own repository root from its location — independent of the
+caller's current working directory:
+
+```bash
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_DIR=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+```
+
+Python interpreter: `${REPLIT_PYTHON:-$(command -v python3)}` — uses the
+Replit-managed interpreter when available, falls back to PATH `python3`.
+
+No absolute user-specific paths. No secrets. No network calls. No broker communication.
+
+### 11.5 Exact Commands and Results
+
+**From repository root:**
+```
+$ cd /home/runner/workspace
+$ bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+================================================================
+  V1-P2 Phase 2 Smoke Suite
+================================================================
+
+--- V1-P2-001: Databento health smoke ---
+  PASS  T1: /databento-status -> enabled=False, ok=False  (reason='Databento feed not enabled')
+  PASS  T2: full_analysis() runs with Databento OFFLINE  (verdict='MARKET CLOSED')
+  PASS  T3: Expert interface contract intact with Databento OFFLINE
+  PASS  T4: OFFLINE guard correct  (enabled=True, brain_is_none=True)
+
+DATABENTO HEALTH SMOKE OK
+(OFFLINE detection + gate continuity + interface contract confirmed)
+
+--- V1-P2-003: Stale-VWAP gate smoke ---
+  PASS  T1: missing VWAP -> status='missing', vwap_ok=False
+  PASS  T2: stale VWAP (2h old) -> status='stale', vwap_ok=False
+  PASS  T3: fresh VWAP -> status='ok', vwap_ok=True (gate can evaluate)
+  PASS  T4: gate boundary confirmed  (missing->False, stale->False, ok->True)
+
+STALE-VWAP GATE SMOKE OK
+(missing/stale/ok boundary confirmed; gate refuses non-ok VWAP)
+
+================================================================
+  V1-P2 SMOKE SUITE PASSED
+================================================================
+Exit code: 0
+```
+
+**From /tmp (clean-context portability proof):**
+```
+$ cd /tmp
+$ bash /home/runner/workspace/artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+[identical output — all 8 assertions PASS]
+Exit code: 0
+```
+
+### 11.6 Full Validation Suite Results (Post-Corrective)
+
+| Suite | Command | Result |
+|---|---|---|
+| Phase 2 Python tests | `pytest test_phase2_market_data_reliability.py` | **45/45 PASS** |
+| Interface contract tests | `pytest test_v1_interface_versions.py` | **77/77 PASS** (70 baseline + 7 from task merges #27/#28) |
+| Databento smoke | `check_databento_health.sh` | **4/4 PASS** |
+| Stale-VWAP smoke | `check_stale_vwap.sh` | **4/4 PASS** |
+| parity | `check_parity.sh` | **PASS** |
+| scalp_golden | `check_scalp_golden.sh` | **PASS** |
+| dual_sim | `check_dual_sim.sh` | **PASS** |
+| breakout_mode | `check_breakout_mode.sh` | **PASS** |
+| `git diff --check` | `git diff --check HEAD` | **CLEAN** |
+
+### 11.7 What Changed in the Corrective Commit
+
+- **No changes to `app.py`**
+- **No changes to any existing file**
+- **No gate, execution, broker, schema, or Databento logic changes**
+- Only new files added:
+  - `artifacts/tradingview-webhook/checks/check_databento_health.sh`
+  - `artifacts/tradingview-webhook/checks/check_stale_vwap.sh`
+  - `artifacts/tradingview-webhook/checks/run_phase2_smoke.sh`
+  - `V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md` (this update)
+
+### 11.8 .local Scripts No Longer Relied Upon
+
+The `.local/state/` copies of the smoke scripts are ephemeral workspace files.
+They are NOT the canonical copies and are NOT referenced in any test runner.
+The tracked `artifacts/tradingview-webhook/checks/` copies are the sole authoritative
+versions.
+
+### 11.9 Final Committed-File Inventory (After Corrective Commit)
+
+```
+artifacts/tradingview-webhook/checks/check_databento_health.sh   ← in git ✓
+artifacts/tradingview-webhook/checks/check_stale_vwap.sh          ← in git ✓
+artifacts/tradingview-webhook/checks/run_phase2_smoke.sh          ← in git ✓
+artifacts/tradingview-webhook/test_phase2_market_data_reliability.py  ← in git ✓
+V1_P2_PINE_DEFAULT_DOCUMENTATION.md                               ← in git ✓
+V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md                  ← in git ✓
+```
+
+### 11.10 Honest Status of V1-P2-001 Through V1-P2-008
+
+| Task | Was honest at d7e5183? | Now honest? |
+|---|---|---|
+| V1-P2-001 | ❌ Smoke script not in commit | ✅ Tracked and committed |
+| V1-P2-002 | ✅ Python tests committed | ✅ Unchanged |
+| V1-P2-003 | ❌ Smoke script not in commit | ✅ Tracked and committed |
+| V1-P2-004 | ✅ Python tests committed | ✅ Unchanged |
+| V1-P2-005 | ✅ Documentation committed | ✅ Unchanged |
+| V1-P2-006 | ✅ Python tests committed | ✅ Unchanged |
+| V1-P2-007 | ✅ Python tests committed | ✅ Unchanged |
+| V1-P2-008 | ✅ Python tests committed | ✅ Unchanged |
+
+**All 8 tasks are now honestly complete and reproducible from a clean clone.**
