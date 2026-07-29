@@ -1,0 +1,352 @@
+# V1-P2 CORRECTIVE DELIVERY AUDIT
+# TRACK THE REQUIRED SMOKE SCRIPTS
+# DO NOT BEGIN PHASE 3
+# DO NOT DEPLOY OR PUBLISH
+
+Current Phase 2 implementation commit:
+
+d7e5183
+
+The V1-P2 implementation appears behaviorally sound, but the batch cannot yet be accepted as complete because the two required smoke scripts were created under ignored .local/state and were not included in the commit.
+
+Reported local-only scripts:
+
+- .local/state/check_databento_health.sh
+- .local/state/check_stale_vwap.sh
+
+A clean clone of d7e5183 cannot run these scripts.
+
+This task is limited to correcting delivery, reproducibility, and validation evidence.
+
+=========================================================
+OBJECTIVE
+=========================================================
+
+Make both Phase 2 smoke checks:
+
+- tracked
+- committed
+- runnable from a clean clone
+- independent of .local state
+- documented with exact commands and results
+
+Do not modify application behavior.
+
+Do not begin Phase 3.
+
+=========================================================
+STEP 1 — BASELINE FREEZE
+=========================================================
+
+Capture:
+
+- branch
+- current HEAD
+- git status
+- tracked modifications
+- untracked files
+- git diff --stat
+- git diff --check
+
+Confirm d7e5183 is present in the current history.
+
+If HEAD moved past d7e5183, inspect and classify every intervening commit.
+
+Stop on unexplained code changes.
+
+Do not reset, amend, squash, rebase, stash, or discard work.
+
+=========================================================
+STEP 2 — PROVE WHAT d7e5183 ACTUALLY CONTAINS
+=========================================================
+
+Run and record:
+
+git show --stat --oneline d7e5183
+git show --name-status --format=fuller d7e5183
+
+Confirm whether either smoke script exists in the committed tree:
+
+git ls-tree -r --name-only d7e5183 | grep -E \
+'check_databento_health|check_stale_vwap'
+
+Expected current result:
+
+Neither script is present.
+
+Document this honestly in the validation report.
+
+Do not use a clean working tree as proof that a file was committed.
+
+=========================================================
+STEP 3 — MOVE SMOKE SCRIPTS TO A TRACKED LOCATION
+=========================================================
+
+Identify the repository’s established tracked location for:
+
+- smoke tests
+- verification scripts
+- operational checks
+- test helpers
+
+Prefer an existing tracked directory.
+
+Examples only, depending on repository convention:
+
+artifacts/tradingview-webhook/tests/smoke/
+artifacts/tradingview-webhook/smoke/
+artifacts/tradingview-webhook/checks/
+
+Do not keep the canonical copies under:
+
+.local/
+tmp/
+cache/
+attached_assets/
+an ignored development-state directory
+
+Create tracked equivalents with clear names, such as:
+
+check_databento_health.sh
+check_stale_vwap.sh
+
+Preserve the already validated assertions unless a path-only adjustment is needed.
+
+Each script must:
+
+- use a portable shell declaration
+- fail on an unsuccessful assertion
+- return nonzero on failure
+- resolve the repository path without depending on the caller’s current directory
+- avoid user-specific absolute paths
+- avoid secrets
+- avoid production URLs
+- avoid live execution
+- avoid broker communication
+- avoid network calls unless explicitly part of the existing isolated test design
+- run from a clean clone with repository dependencies installed
+
+Use:
+
+set -euo pipefail
+
+unless repository shell conventions require another safe equivalent.
+
+Do not force-add ignored .local files as the final solution.
+
+=========================================================
+STEP 4 — VERIFY SCRIPT CONTENT
+=========================================================
+
+Audit both scripts.
+
+---------------------------------------------------------
+DATABENTO HEALTH SCRIPT
+---------------------------------------------------------
+
+Confirm it tests the intended Phase 2 contract:
+
+- Databento offline or unavailable state is detected
+- application status or health representation remains valid
+- Expert contract remains available
+- no live feed connection is required
+- no environment secret is required
+- no application mutation occurs
+
+Use Flask application context or test client where required.
+
+Do not call a view function outside its required application context.
+
+Do not modify Databento environment flags globally without restoring them.
+
+---------------------------------------------------------
+STALE VWAP SCRIPT
+---------------------------------------------------------
+
+Confirm it tests:
+
+- missing VWAP
+- stale VWAP
+- fresh VWAP
+- expected status values
+- expected gate interpretation
+
+Ensure test state is isolated and restored afterward.
+
+Do not write persistent production data.
+
+Do not change the runtime VWAP implementation.
+
+=========================================================
+STEP 5 — ADD A REPRODUCIBLE RUNNER OR DOCUMENTED COMMAND
+=========================================================
+
+Either:
+
+A. Add a tracked Phase 2 smoke runner that invokes both scripts,
+
+or:
+
+B. Document exact individual commands from the repository root.
+
+A single runner is preferred if consistent with repository conventions.
+
+Example conceptual command:
+
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Do not create the runner under .local.
+
+=========================================================
+STEP 6 — RUN FROM A CLEAN-CONTEXT PATH
+=========================================================
+
+Run the scripts from the repository root.
+
+Also run them from a different working directory to prove that they correctly resolve their own paths, for example:
+
+cd /tmp
+bash /absolute/path/to/repo/<tracked-script-path>
+
+or use an equivalent isolated path test.
+
+Do not depend on the active Replit shell being located inside the application directory.
+
+Capture:
+
+- exact command
+- exit code
+- passed assertions
+- failed assertions
+- warnings
+- duration if available
+
+=========================================================
+STEP 7 — RERUN PHASE 2 VALIDATION
+=========================================================
+
+Run:
+
+- test_phase2_market_data_reliability.py
+- both tracked smoke scripts
+- test_v1_interface_versions.py
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- syntax checks
+- git diff --check
+
+Required:
+
+- 45/45 Phase 2 Python checks pass
+- 70/70 interface checks pass, unless the committed suite has legitimately increased
+- both smoke scripts pass
+- all four primary workflows pass
+- no app.py changes
+- no Databento production logic changes
+- no gate changes
+- no execution changes
+- no broker changes
+- no schema changes
+
+=========================================================
+STEP 8 — UPDATE VALIDATION DOCUMENT
+=========================================================
+
+Update:
+
+V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md
+
+Add:
+
+“Corrective Delivery Validation After d7e5183”
+
+Include:
+
+1. Why the original smoke scripts were not reproducible from the commit
+2. Original ignored paths
+3. New tracked paths
+4. Exact commands
+5. Results
+6. Clean-clone or clean-context reproducibility evidence
+7. git show --stat evidence for the corrective commit
+8. Confirmation that .local scripts are not relied upon
+9. Final committed-file inventory
+10. Whether V1-P2-001 through V1-P2-008 are now honestly complete
+
+Do not remove or conceal the original report.
+
+=========================================================
+STEP 9 — COMMITTED FILE PROOF
+=========================================================
+
+Before committing, record:
+
+git diff --stat
+git diff --check
+
+After committing, record:
+
+git show --stat --oneline HEAD
+git show --name-status --format=fuller HEAD
+git ls-tree -r --name-only HEAD | grep -E \
+'check_databento_health|check_stale_vwap'
+
+Both scripts must appear in the committed tree.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+Create one corrective commit after all checks pass.
+
+Suggested message:
+
+V1-P2 track reproducible market-data smoke checks
+
+Do not amend d7e5183.
+
+Do not squash prior commits.
+
+Do not include uploaded instruction files.
+
+Do not include unrelated changes.
+
+=========================================================
+FINAL RESPONSE
+=========================================================
+
+Report:
+
+1. Starting branch and HEAD
+2. Ending branch and HEAD
+3. Files modified
+4. Original ignored smoke-script paths
+5. New tracked smoke-script paths
+6. Whether both scripts appear in git ls-tree
+7. Exact commands used
+8. Smoke results
+9. Phase 2 Python-test result
+10. Interface-test result
+11. Four primary regression results
+12. Syntax result
+13. git diff --check result
+14. app.py change confirmation
+15. Databento logic change confirmation
+16. Gate change confirmation
+17. Execution and broker change confirmation
+18. Database-schema confirmation
+19. Deployment confirmation
+20. Validation-document update
+21. Corrective commit
+22. Honest final status of V1-P2-001 through V1-P2-008
+23. Any remaining stop condition
+
+Do not begin Phase 3.
+
+Do not publish.
+
+Do not deploy.
+
+Stop after reporting.
