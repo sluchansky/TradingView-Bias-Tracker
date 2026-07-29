@@ -1,0 +1,831 @@
+# V1 PHASE 5 — PRE-IMPLEMENTATION EXECUTION BRIEF
+# DOCUMENTATION ONLY
+# DO NOT MODIFY PRODUCTION CODE
+# DO NOT DEPLOY
+# DO NOT PUBLISH
+
+Current accepted endpoint:
+
+c9f55f9 — V1-P4 Operator Explanation and Decision Timeline
+
+Completed foundation:
+
+- Phase 2 complete at 29e1d4d
+- Phase 3 complete at aa7ee5f
+- Phase 3 provenance audit complete at ee808db
+- Phase 4 execution brief complete at 3fa65d0
+- Phase 4 validation complete at c9f55f9
+
+This task is not Phase 5 implementation.
+
+The only objective is to identify, research, and document the exact Phase 5 implementation scope before any production changes are authorized.
+
+=========================================================
+NON-NEGOTIABLE RULES
+=========================================================
+
+Do not:
+
+- modify app.py
+- modify production Python
+- modify dashboard HTML, CSS, or JavaScript
+- modify tests
+- modify database schema
+- modify environment variables
+- change Databento behavior
+- change strategy behavior
+- change scoring
+- change gates
+- change risk or sizing
+- change execution
+- change broker routing
+- deploy
+- publish
+- restart production
+- place live or paper orders
+
+The only planned deliverable is:
+
+PHASE_5_EXECUTION_BRIEF.md
+
+A documentation-only commit is allowed after the brief is complete and validated.
+
+=========================================================
+DOCUMENT PRECEDENCE
+=========================================================
+
+Read these documents completely:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. V1_PHASE_4_VALIDATION.md
+6. PHASE_4_EXECUTION_BRIEF.md
+7. V1_PHASE_3_VALIDATION.md
+8. V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md
+9. V1_MANAGER_COACH_INTERFACE_VALIDATION.md
+10. V1_FIRST_BATCH_VALIDATION.md
+
+Use this precedence:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. Execution briefs
+6. Validation documents
+
+If the controlling documents disagree about:
+
+- Phase 5 title
+- task ownership
+- required behavior
+- dependencies
+- interface ownership
+- completion requirements
+- deferred scope
+
+STOP and report the conflict.
+
+Do not invent a compromise.
+
+=========================================================
+STAGE 0 — BASELINE FREEZE
+=========================================================
+
+Before performing Phase 5 research, record:
+
+- current branch
+- current HEAD
+- git status
+- tracked modifications
+- untracked files
+- git diff --stat
+- git diff --check
+- recent commit history
+- whether c9f55f9 is an ancestor of HEAD
+- every commit after c9f55f9
+- classification of each intervening commit
+
+Classify every intervening commit as:
+
+- production implementation
+- test-only
+- documentation-only
+- Replit platform checkpoint
+- attached asset
+- memory-only
+- generated artifact
+- unexplained
+
+For every production implementation commit:
+
+- inspect the full diff
+- identify changed functions
+- identify roadmap ownership
+- identify whether it overlaps Phase 5
+- identify whether it changes the accepted Phase 4 baseline
+
+Stop on unexplained code changes.
+
+Do not reset, amend, rebase, squash, stash, discard, or overwrite existing work.
+
+=========================================================
+STAGE 1 — BASELINE VALIDATION
+=========================================================
+
+Before Phase 5 analysis, run the accepted baseline:
+
+python3 artifacts/tradingview-webhook/test_phase4_operator_explanation.py
+
+python3 artifacts/tradingview-webhook/test_phase3_thesis_verdict_pipeline.py
+
+python3 artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+python3 artifacts/tradingview-webhook/test_phase2_market_data_reliability.py
+
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Also run:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- Python syntax validation
+- git diff --check
+
+Record:
+
+- exact command
+- exit code
+- passed count
+- failed count
+- skipped count
+- warnings
+- duration where available
+
+Expected minimum:
+
+- Phase 4: 57 passing
+- Phase 3: 60 passing
+- interface suite: current accepted total or higher
+- Phase 2: 45 passing
+- smoke suite: 8/8 passing
+- four primary regressions passing
+
+If an accepted baseline test fails unexpectedly:
+
+STOP and report.
+
+Do not edit code or tests to force the baseline green.
+
+=========================================================
+STAGE 2 — IDENTIFY THE EXACT PHASE 5 SCOPE
+=========================================================
+
+Locate the authoritative Phase 5 section in IMPLEMENTATION_ROADMAP_V1.md.
+
+Determine:
+
+- exact Phase 5 title
+- every Phase 5 task ID
+- exact task descriptions
+- roadmap ordering
+- dependencies
+- exclusions
+- deferred work
+- expected deliverables
+- required runtime changes
+- required tests
+- documentation requirements
+- stop conditions
+- completion criteria
+
+Do not infer Phase 5 from the phase number or surrounding project discussions.
+
+Quote or accurately transcribe the controlling task language into the brief.
+
+If Phase 5 task-card headings are not obvious:
+
+- search the roadmap task inventory
+- search all task IDs beginning with V1-P5
+- map every matching task back to its phase
+- verify no V1-P5 task is omitted
+
+=========================================================
+STAGE 3 — BUILD THE PHASE 5 TASK INVENTORY
+=========================================================
+
+Create a complete task table.
+
+For every V1-P5 task include:
+
+- task ID
+- exact title
+- exact requirement
+- business purpose
+- architecture owner
+- current implementation status
+- authoritative production functions
+- callers
+- runtime boundaries
+- expected files to change
+- expected interfaces affected
+- authorized behavior changes
+- prohibited behavior changes
+- prerequisites
+- required tests
+- completion criteria
+- implementation risk
+- deployment relevance
+- unresolved questions
+
+Use these current-status classifications:
+
+- COMPLETE
+- PARTIAL
+- MISSING
+- NEEDS VERIFICATION
+- BLOCKED
+- NOT APPLICABLE
+
+Do not mark a feature MISSING merely because it lacks a dashboard surface.
+
+Do not mark a feature COMPLETE merely because a similarly named function exists.
+
+=========================================================
+STAGE 4 — CURRENT IMPLEMENTATION AUDIT
+=========================================================
+
+For every Phase 5 task, inspect the current repository and determine what already exists.
+
+Inspect:
+
+- production implementation
+- runtime callers
+- endpoint exposure
+- dashboard exposure
+- data ownership
+- fallbacks
+- degraded states
+- exception handling
+- persistence
+- tests
+- documentation
+
+For every relevant implementation, document:
+
+- file path
+- function or class
+- line range
+- canonical owner
+- inputs
+- output schema
+- side effects
+- failure behavior
+- mutable-state risks
+- external dependencies
+- database interactions
+- broker interactions
+- network interactions
+
+Distinguish clearly between:
+
+1. Existing production behavior
+2. Existing but unexposed behavior
+3. Partial or approximate behavior
+4. Test-only scaffolding
+5. Documentation-only intent
+6. Truly missing behavior
+
+=========================================================
+STAGE 5 — DEPENDENCY AND OVERLAP ANALYSIS
+=========================================================
+
+For every Phase 5 task identify:
+
+- dependencies on Phases 0–4
+- dependencies on incomplete technical-debt items
+- dependencies on future phases
+- overlap with prior task-agent commits
+- overlap with Manager
+- overlap with Coach
+- overlap with Partner
+- overlap with Journal
+- overlap with Execution Gateway
+- overlap with Left Brain
+- overlap with the dashboard
+- overlap with Databento
+- overlap with learning
+- overlap with active-trade management
+
+Create a dependency graph.
+
+Identify tasks that may be safely implemented independently.
+
+Identify tasks that must be implemented together.
+
+Identify tasks that should be deferred rather than implemented prematurely.
+
+=========================================================
+STAGE 6 — REQUIRED RESEARCH QUESTIONS
+=========================================================
+
+Before recommending implementation, identify every unanswered question that could affect correctness.
+
+At minimum investigate:
+
+- authoritative data owner
+- exact serialized field paths
+- current event versus current-state semantics
+- fallback behavior
+- unavailable behavior
+- stale-data behavior
+- malformed-input behavior
+- strict instrument behavior
+- database ownership
+- route ownership
+- authentication ownership
+- broker boundary
+- dashboard ownership
+- interface ownership
+
+For every research question include:
+
+- question
+- reason it matters
+- likely owner
+- evidence already available
+- evidence still required
+- whether it blocks implementation
+- safest resolution method
+
+Do not treat implementation-time uncertainty as harmless when it could change business logic.
+
+=========================================================
+STAGE 7 — FILE IMPACT MATRIX
+=========================================================
+
+Create a file-by-file impact analysis.
+
+For every file expected to change include:
+
+- file path
+- owning subsystem
+- task IDs authorizing the change
+- expected functions or regions
+- type of change
+- estimated change size
+- runtime behavior effect
+- interface effect
+- persistence effect
+- broker effect
+- regression risk
+- rollback complexity
+
+Separate files into:
+
+1. Production code
+2. Dashboard code
+3. Tests
+4. Validation documentation
+5. Migration or schema files
+6. Configuration
+7. Smoke scripts
+
+Also list important files expected not to change and explain why.
+
+Do not authorize broad app.py edits without naming exact functions or regions.
+
+=========================================================
+STAGE 8 — CANONICAL INTERFACE IMPACT
+=========================================================
+
+Evaluate all seven accepted interfaces:
+
+- Left Brain v2
+- Expert v1
+- Partner v1
+- Manager v1
+- Execution Gateway v1
+- Journal v1
+- Coach v1
+
+For each interface state:
+
+- unchanged
+- additive extension
+- semantic modification
+- version change required
+- prohibited
+
+If Phase 5 requires adding a field, document:
+
+- field name
+- type
+- owner
+- source
+- absent value
+- malformed value
+- mutation protection
+- backward compatibility
+- versioning effect
+
+Do not recommend a version change unless the contract would actually break.
+
+Do not place implementation logic inside read-only interface builders.
+
+=========================================================
+STAGE 9 — BEHAVIORAL CHANGE MATRIX
+=========================================================
+
+Determine explicitly whether Phase 5 is authorized to change:
+
+- verdict
+- direction
+- confidence
+- edge score
+- edge grade
+- actionability
+- readiness thresholds
+- failed conditions
+- veto behavior
+- strategy selection
+- strategy scanner universe
+- session gates
+- risk
+- sizing
+- stops
+- targets
+- active-trade management
+- journal persistence
+- learning weights
+- learning thresholds
+- database schema
+- Databento behavior
+- broker routing
+- TradersPost payloads
+- live execution authorization
+- dashboard display
+- authentication
+- deployment configuration
+
+For each item state:
+
+- must remain unchanged
+- may change
+- must change
+- conditional
+- not applicable
+
+Cite the controlling task requirement.
+
+=========================================================
+STAGE 10 — TEST AND VALIDATION PLAN
+=========================================================
+
+Create a task-by-task validation strategy.
+
+Identify required:
+
+- unit tests
+- integration tests
+- endpoint tests
+- interface tests
+- database tests
+- serialization tests
+- fault-injection tests
+- non-mutation tests
+- repeated-call tests
+- smoke tests
+- dashboard rendering tests
+- JavaScript syntax tests
+- golden tests
+- performance tests
+- clean-clone reproducibility checks
+
+For every Phase 5 task include:
+
+- test name or proposed test group
+- test type
+- runtime boundary
+- normal case
+- degraded case
+- unavailable case
+- malformed-input case
+- repeated-call case
+- side-effect assertions
+- completion evidence
+
+Static source inspection may support validation but cannot be the primary proof of runtime behavior.
+
+All canonical tests must be tracked outside ignored directories.
+
+=========================================================
+STAGE 11 — REGRESSION CONTRACT
+=========================================================
+
+Define the exact regression suite required after implementation.
+
+At minimum preserve:
+
+- Phase 4 tests
+- Phase 3 tests
+- interface tests
+- Phase 2 tests
+- Phase 2 smoke from repository root
+- Phase 2 smoke from /tmp
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- Python syntax
+- Node syntax if dashboard code changes
+- git diff --check
+
+Add every directly affected existing test suite.
+
+Specify which outputs must remain byte-identical.
+
+Specify any outputs that Phase 5 is explicitly authorized to change.
+
+Specify the approval requirement for golden-file changes.
+
+=========================================================
+STAGE 12 — RISK REGISTER
+=========================================================
+
+Create a detailed risk register.
+
+Categories:
+
+- architecture risk
+- semantic risk
+- trading-logic risk
+- market-data risk
+- execution risk
+- broker risk
+- risk-management risk
+- database risk
+- interface risk
+- dashboard risk
+- authentication risk
+- regression risk
+- deployment risk
+- test-quality risk
+- documentation risk
+- scope-creep risk
+
+For every risk include:
+
+- risk ID
+- affected task
+- description
+- likelihood
+- impact
+- detection method
+- mitigation
+- stop condition
+- rollback plan
+
+Highlight the highest-risk Phase 5 task.
+
+=========================================================
+STAGE 13 — IMPLEMENTATION ORDER
+=========================================================
+
+Recommend the safest Phase 5 implementation sequence.
+
+For every implementation step include:
+
+- task IDs
+- objective
+- authorized files
+- prerequisite
+- estimated complexity
+- estimated regression risk
+- expected runtime change
+- targeted tests
+- checkpoint criteria
+- rollback complexity
+
+Identify:
+
+- research-only checkpoint
+- test-first checkpoint
+- first production-change checkpoint
+- interface checkpoint
+- dashboard checkpoint
+- full-regression checkpoint
+- commit checkpoint
+
+Prefer the smallest independently valid batches.
+
+Do not recommend unnecessary commit fragmentation.
+
+=========================================================
+STAGE 14 — PHASE 5 EXECUTION CONTRACT
+=========================================================
+
+Write the exact contract that should govern the eventual Phase 5 implementation.
+
+Include:
+
+- authorized task IDs
+- authorized production files
+- authorized test files
+- authorized documentation files
+- authorized functions
+- authorized runtime changes
+- prohibited runtime changes
+- canonical owners
+- interface restrictions
+- database restrictions
+- broker restrictions
+- market-data restrictions
+- dashboard restrictions
+- authentication restrictions
+- required tests
+- required regressions
+- required evidence
+- diff-control rules
+- commit strategy
+- deployment restrictions
+- stop conditions
+
+Make the contract sufficiently precise that another task agent cannot expand the scope accidentally.
+
+=========================================================
+OUTPUT DOCUMENT
+=========================================================
+
+Create:
+
+PHASE_5_EXECUTION_BRIEF.md
+
+Required sections:
+
+1. Executive Summary
+
+2. Baseline State
+
+3. Intervening Commit Audit
+
+4. Controlling Document Review
+
+5. Exact Phase 5 Title and Scope
+
+6. Complete Task Inventory
+
+7. Existing Implementation Audit
+
+8. Dependency Graph
+
+9. Research Questions
+
+10. File Impact Matrix
+
+11. Canonical Interface Impact Matrix
+
+12. Behavioral Change Matrix
+
+13. Validation Strategy
+
+14. Regression Contract
+
+15. Recommended Implementation Order
+
+16. Risk Register
+
+17. Phase 5 Execution Contract
+
+18. Completion Checklist
+
+19. Blocking Issues
+
+20. Recommendation: Ready or Not Ready to Implement
+
+=========================================================
+DOCUMENT QUALITY REQUIREMENTS
+=========================================================
+
+The brief must be:
+
+- evidence-based
+- repository-specific
+- task-ID specific
+- function-specific
+- honest about uncertainty
+- explicit about prohibited changes
+- reproducible from a clean clone
+- usable as a direct implementation contract
+
+Do not use vague wording such as:
+
+- improve reliability
+- enhance the system
+- clean up logic
+- optimize behavior
+- update as needed
+
+Name the exact behavior, owner, file, and validation evidence.
+
+=========================================================
+PRE-COMMIT VALIDATION
+=========================================================
+
+Before committing the brief:
+
+- confirm no production file changed
+- confirm no test file changed
+- confirm no ignored artifact is required
+- run git status
+- run git diff --stat
+- run git diff --check
+- inspect the complete documentation diff
+- confirm PHASE_5_EXECUTION_BRIEF.md is tracked
+
+Do not include:
+
+- attached instruction files
+- `.local` files
+- generated caches
+- secrets
+- unrelated agent outputs
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If the execution brief is complete and accurate, create one documentation-only commit:
+
+V1-P5 pre-implementation execution brief
+
+Do not amend c9f55f9.
+
+Do not squash.
+
+Do not force-push.
+
+Do not deploy.
+
+If a blocking architecture conflict is found, do not falsely mark the phase ready.
+
+Commit the evidence brief only if it remains useful and clearly records the blocker.
+
+=========================================================
+FINAL RESPONSE FORMAT
+=========================================================
+
+Report:
+
+1. Starting branch and HEAD
+2. Ending branch and HEAD
+3. Accepted Phase 4 baseline
+4. Intervening commits and classifications
+5. Baseline validation results
+6. Exact Phase 5 title
+7. Number of Phase 5 tasks
+8. All Phase 5 task IDs
+9. Current implementation status by task
+10. Dependencies
+11. Hidden dependencies
+12. Research questions
+13. Files expected to change
+14. Files prohibited from changing
+15. Canonical interfaces affected
+16. Authorized runtime changes
+17. Prohibited runtime changes
+18. Highest-risk task
+19. Recommended implementation order
+20. New tests required
+21. Existing regression suites required
+22. Validation artifacts required
+23. Database impact
+24. Databento impact
+25. Strategy and scoring impact
+26. Risk and sizing impact
+27. Execution and broker impact
+28. Journal impact
+29. Learning impact
+30. Dashboard impact
+31. Authentication impact
+32. Deployment impact
+33. Blocking issues
+34. Whether Phase 5 is ready to implement
+35. Execution brief path
+36. Commit created
+37. Confirmation that no production code changed
+38. Confirmation that Phase 5 was not started
+
+Do not implement Phase 5.
+
+Do not begin Phase 6.
+
+Do not deploy.
+
+Do not publish.
+
+Stop after reporting.
