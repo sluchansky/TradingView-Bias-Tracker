@@ -1,0 +1,307 @@
+# V1 FIRST BATCH — CORRECTIVE VALIDATION
+# DO NOT BEGIN THE NEXT ROADMAP BATCH
+# DO NOT DEPLOY OR PUBLISH
+
+The previous V1 first-batch report cannot yet be accepted as complete.
+
+Current commit:
+
+abb6d89
+"V1-P1 first batch: additive _version fields on all 7 canonical interfaces"
+
+Preserve this commit and investigate the identified compliance gaps. Do not reset, force-push, discard user work, or begin unrelated implementation.
+
+=========================================================
+OBJECTIVE
+=========================================================
+
+Correct or formally resolve three issues:
+
+1. The Manager Interface boundary was described as an approximation.
+2. The new contract test exists only under ignored .local/state and was not committed.
+3. The Coach Interface boundary was not sufficiently proven to be canonical.
+
+This is a narrow corrective task.
+
+Do not change trading behavior, calculations, control flow, ingestion, execution, risk, journal semantics, learning behavior, dashboard behavior, database schema, environment configuration, or deployment configuration.
+
+=========================================================
+STEP 1 — RECORD CURRENT STATE
+=========================================================
+
+Capture:
+
+- branch
+- current HEAD
+- git status
+- tracked changes
+- untracked files
+- git diff --stat
+- git diff --check
+
+Confirm whether abb6d89 is the current HEAD.
+
+If HEAD changed unexpectedly, stop and report.
+
+=========================================================
+STEP 2 — RE-READ CONTROLLING DEFINITIONS
+=========================================================
+
+Read the exact full definitions for:
+
+- V1-P1-004 — Manager Interface v1
+- V1-P1-007 — Coach Interface v1
+
+Also read the related interface definitions in:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+
+Use that precedence order.
+
+Quote the relevant requirement text in the validation report using short excerpts or precise section references.
+
+Do not rely on architectural memory or the prior implementation rationale.
+
+=========================================================
+STEP 3 — RESOLVE THE MANAGER BOUNDARY
+=========================================================
+
+Determine whether _active_trade_mgmt_block() is explicitly the canonical Manager Interface.
+
+You must reach one of these outcomes:
+
+OUTCOME A — PROVEN CANONICAL
+
+If the controlling documents clearly establish that _active_trade_mgmt_block() is the Manager contract:
+
+- Leave the implementation unchanged.
+- Document the exact architectural evidence.
+- Remove the word “approximation” from the completion claim.
+- Explain how existing callers consume this contract.
+
+OUTCOME B — DIFFERENT EXISTING CANONICAL BOUNDARY
+
+If another existing object is the documented canonical Manager Interface:
+
+- Move the version field to that boundary.
+- Remove the task-added field from the incorrect boundary unless it is independently required.
+- Preserve all behavior and existing fields.
+- Add focused tests for the correct boundary.
+
+OUTCOME C — CANONICAL MANAGER INTERFACE DOES NOT YET EXIST
+
+If the architecture requires a consolidated Manager object that does not exist:
+
+STOP IMPLEMENTATION.
+
+Do not invent or consolidate it under this corrective task.
+
+Report:
+
+- the required contract
+- the closest existing representations
+- why none is canonical
+- which roadmap task is expected to create it
+- that V1-P1-004 remains incomplete
+
+Do not claim the seven-interface batch complete in this outcome.
+
+=========================================================
+STEP 4 — RESOLVE THE COACH BOUNDARY
+=========================================================
+
+Determine whether result["learning_score_influence"] is explicitly the canonical Coach Interface.
+
+Do not assume every learning-related object is the Coach contract.
+
+Reach one of the same three outcomes:
+
+A. Proven canonical
+B. Different existing canonical boundary
+C. Canonical Coach interface does not yet exist
+
+If it is proven canonical, document:
+
+- producer
+- consumers
+- full payload shape
+- why both construction paths represent the same contract
+- behavior for unavailable, insufficient-sample, disabled, and successful states
+
+If it is not canonical, move or remove the task-created version metadata as required.
+
+If no canonical Coach contract exists, stop and mark V1-P1-007 incomplete rather than creating a new interface.
+
+=========================================================
+STEP 5 — AUDIT ALL TWELVE INSERTIONS
+=========================================================
+
+List every task-added _version insertion from commit abb6d89.
+
+For each insertion record:
+
+- file
+- function
+- output path
+- component
+- normal/degraded/success/failure path
+- whether it is the same canonical contract as another insertion
+- whether it crosses a database, dashboard, broker, or external integration boundary
+
+Confirm that the twelve literals correspond to seven contracts with multiple legitimate construction paths.
+
+If any insertion versions a noncanonical object, remove only that task-created insertion.
+
+Specifically verify:
+
+- Left Brain normal and degraded outputs
+- Partner normal and neutral outputs
+- Execution Gateway success, rejection, duplicate, timeout, disabled, paper, and simulation outcomes
+- Coach all documented states
+- Manager inactive and active-trade states
+
+Do not add metadata to broker or TradersPost request payloads.
+
+=========================================================
+STEP 6 — ADD TRACKED CONTRACT TESTS
+=========================================================
+
+The ignored file:
+
+.local/state/check_v1_version_fields.py
+
+is not sufficient as the repository’s permanent contract test.
+
+Create a tracked test in the repository’s established test location and naming convention.
+
+Requirements:
+
+- It must be committed.
+- It must be runnable from a clean clone.
+- It must not depend on .local state.
+- It must use existing test helpers and fixtures where practical.
+- It must test the actual canonical runtime contracts, not only grep source text.
+- Static source checks may supplement runtime tests but cannot replace them.
+
+Test for each proven canonical interface:
+
+1. _version exists.
+2. Value is exact.
+3. Type is string unless architecture says otherwise.
+4. Existing required fields remain.
+5. Fixed fixture behavior remains unchanged.
+6. Documented degraded/failure paths are covered.
+7. Serialization succeeds.
+8. Existing callers tolerate the additive field.
+
+Add a cross-interface matrix assertion:
+
+- Left Brain: v2
+- Expert: v1
+- Partner: v1
+- Manager: v1
+- Execution Gateway: v1
+- Journal: v1
+- Coach: v1
+
+If Manager or Coach is determined not to have an existing canonical interface, do not create a false passing assertion. Mark that roadmap task incomplete and explain why.
+
+Do not weaken existing tests.
+
+=========================================================
+STEP 7 — RERUN VALIDATION
+=========================================================
+
+Run:
+
+- tracked version-contract test
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- directly affected existing interface tests
+- syntax checks
+- git diff --check
+
+Capture exact commands, exit codes, counts, warnings, and durations where available.
+
+Compare against V1_FIRST_BATCH_BASELINE.md.
+
+=========================================================
+STEP 8 — UPDATE EVIDENCE
+=========================================================
+
+Update:
+
+V1_FIRST_BATCH_VALIDATION.md
+
+Add a section:
+
+“Corrective Validation After abb6d89”
+
+Include:
+
+- Manager boundary outcome
+- Coach boundary outcome
+- audit of all twelve insertion sites
+- tracked test path
+- exact test commands/results
+- any removed or relocated fields
+- whether all seven roadmap tasks are genuinely complete
+
+Do not rewrite history or conceal the earlier approximation.
+
+Clearly distinguish:
+
+- original implementation
+- corrective findings
+- final validated state
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If corrections are needed and all validation passes, create one corrective commit.
+
+Suggested message:
+
+V1-P1 corrective contract validation and tracked tests
+
+Do not amend abb6d89.
+
+Do not squash commits.
+
+If the investigation proves no code movement is required, commit the tracked tests and validation-document update only.
+
+If Manager or Coach lacks an existing canonical interface, do not falsely close the batch. Commit only safe evidence/test corrections if appropriate and report the incomplete task.
+
+=========================================================
+FINAL RESPONSE
+=========================================================
+
+Report:
+
+1. Starting and ending HEAD
+2. Files modified
+3. Manager boundary outcome: A, B, or C
+4. Coach boundary outcome: A, B, or C
+5. All twelve insertion sites and their justification
+6. Tracked contract-test location
+7. Contract-test results
+8. Four primary regression results
+9. Behavioral parity result
+10. Databento-change confirmation
+11. Execution-change confirmation
+12. Database-schema-change confirmation
+13. Deployment confirmation
+14. Corrective commit, if created
+15. Whether V1-P1-001 through V1-P1-007 can now honestly be marked complete
+16. Any remaining stop condition or roadmap dependency
+
+Do not begin the next implementation batch.
+Do not publish.
+Do not deploy.
+Stop after reporting.
