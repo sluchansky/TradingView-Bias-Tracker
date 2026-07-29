@@ -1,0 +1,350 @@
+# V1 PHASE 4 — PRE-IMPLEMENTATION EXECUTION BRIEF
+# DOCUMENTATION ONLY
+# DO NOT MODIFY CODE
+# DO NOT DEPLOY
+# DO NOT PUBLISH
+
+Current accepted baseline:
+
+Phase 3 closed after provenance audit.
+
+Accepted implementation chain includes:
+
+- 64f6d35
+- 29e1d4d
+- aa7ee5f
+- ee808db
+
+This task is NOT Phase 4 implementation.
+
+This task is ONLY to produce the complete Phase 4 execution brief.
+
+No code may be changed.
+
+No tests may be rewritten.
+
+No runtime behavior may change.
+
+No commits should be created unless documentation is intentionally committed as a project artifact.
+
+=========================================================
+OBJECTIVE
+=========================================================
+
+Produce a complete implementation brief for Phase 4 before writing a single line of production code.
+
+The brief will become the implementation contract for the next development batch.
+
+It should eliminate ambiguity before implementation begins.
+
+=========================================================
+STAGE 0 — BASELINE FREEZE
+=========================================================
+
+Record:
+
+- current branch
+- current HEAD
+- git status
+- tracked modifications
+- untracked files
+- git diff --stat
+- git diff --check
+- commits since ee808db
+- classification of each commit
+
+Classify commits as:
+
+- implementation
+- test-only
+- documentation
+- platform checkpoint
+- attached asset
+- memory update
+- unexplained
+
+Stop on unexplained code changes.
+
+Do not reset, amend, squash, rebase, stash, or discard work.
+
+=========================================================
+STAGE 1 — READ THE CONTROLLING DOCUMENTS
+=========================================================
+
+Read completely:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. V1_PHASE_3_VALIDATION.md
+6. V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md
+7. V1_MANAGER_COACH_INTERFACE_VALIDATION.md
+
+Use precedence:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. Validation documents
+
+If the documents disagree on Phase 4:
+
+- scope
+- ownership
+- dependencies
+- interfaces
+- behavior
+- completion criteria
+
+STOP and report the conflict.
+
+Do not reconcile conflicting requirements yourself.
+
+=========================================================
+STAGE 2 — IDENTIFY PHASE 4
+=========================================================
+
+Determine:
+
+- exact Phase 4 title
+- every Phase 4 task ID
+- task descriptions
+- dependencies
+- exclusions
+- deferred work
+- required runtime changes
+- required documentation
+- required tests
+- stop conditions
+
+Produce a complete Phase 4 task inventory.
+
+For every task include:
+
+- task ID
+- title
+- purpose
+- implementation owner
+- expected files
+- expected functions
+- interfaces touched
+- runtime behavior changes
+- prohibited changes
+- required validation
+- completion criteria
+- implementation risk
+
+=========================================================
+STAGE 3 — DEPENDENCY ANALYSIS
+=========================================================
+
+For every Phase 4 task determine:
+
+- prerequisite tasks
+- existing implementation owner
+- current implementation status
+- gaps
+- overlap with future phases
+- overlap with technical debt
+- overlap with previous validation findings
+
+Identify any hidden dependency that would prevent safe implementation.
+
+=========================================================
+STAGE 4 — FILE IMPACT ANALYSIS
+=========================================================
+
+Produce a file-by-file impact list.
+
+For every file expected to change:
+
+- file path
+- reason
+- owning subsystem
+- estimated change size
+- runtime risk
+- interface risk
+- regression risk
+
+For every file expected NOT to change:
+
+state why.
+
+=========================================================
+STAGE 5 — INTERFACE IMPACT
+=========================================================
+
+Determine whether Phase 4 affects:
+
+- Left Brain
+- Expert
+- Partner
+- Manager
+- Coach
+- Journal
+- Execution Gateway
+
+For each interface state:
+
+- unchanged
+- additive
+- modified
+- prohibited
+
+If modified:
+
+describe exactly how.
+
+=========================================================
+STAGE 6 — TEST PLAN
+=========================================================
+
+Create the complete validation strategy.
+
+List:
+
+- new unit tests
+- integration tests
+- smoke tests
+- regression tests
+- interface tests
+- golden tests
+- performance checks
+- documentation validation
+
+For every task identify the evidence required to declare completion.
+
+=========================================================
+STAGE 7 — IMPLEMENTATION ORDER
+=========================================================
+
+Recommend the safest implementation order.
+
+For every implementation step include:
+
+- task IDs
+- estimated difficulty
+- estimated regression risk
+- rollback complexity
+- validation point
+
+Identify natural checkpoints.
+
+=========================================================
+STAGE 8 — RISK REGISTER
+=========================================================
+
+Identify:
+
+High risk
+
+Medium risk
+
+Low risk
+
+Potential architecture conflicts
+
+Potential regression risks
+
+Potential interface risks
+
+Potential deployment risks
+
+Potential testing gaps
+
+Potential documentation gaps
+
+For every risk:
+
+- likelihood
+- impact
+- mitigation
+
+=========================================================
+STAGE 9 — EXECUTION CONTRACT
+=========================================================
+
+Write the implementation contract that will be used for the actual Phase 4 coding batch.
+
+Include:
+
+Authorized runtime changes
+
+Explicitly prohibited changes
+
+Authorized files
+
+Prohibited files
+
+Required regression suite
+
+Required documentation
+
+Required validation evidence
+
+Required commit strategy
+
+Stop conditions
+
+=========================================================
+OUTPUT
+=========================================================
+
+Create:
+
+PHASE_4_EXECUTION_BRIEF.md
+
+The document should include:
+
+1. Executive Summary
+
+2. Baseline State
+
+3. Phase 4 Overview
+
+4. Complete Task Inventory
+
+5. Dependency Graph
+
+6. File Impact Matrix
+
+7. Interface Impact Matrix
+
+8. Validation Strategy
+
+9. Recommended Implementation Order
+
+10. Risk Register
+
+11. Execution Contract
+
+12. Completion Checklist
+
+=========================================================
+FINAL RESPONSE
+=========================================================
+
+Report:
+
+1. Current HEAD
+2. Phase 4 title
+3. Number of Phase 4 tasks
+4. Dependencies found
+5. Files expected to change
+6. Interfaces expected to change
+7. Highest-risk task
+8. Recommended implementation order
+9. Required regression suites
+10. Validation artifacts that will be created
+11. Whether Phase 4 is ready to implement
+12. Any blocking issues
+
+Do not implement Phase 4.
+
+Do not modify code.
+
+Do not create production commits.
+
+Stop after producing the execution brief.
