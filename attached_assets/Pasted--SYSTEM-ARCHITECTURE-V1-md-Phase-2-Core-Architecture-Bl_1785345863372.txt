@@ -1,0 +1,361 @@
+# SYSTEM_ARCHITECTURE_V1.md
+## Phase 2 – Core Architecture Blueprint
+
+OBJECTIVE
+
+Create a new document named:
+
+SYSTEM_ARCHITECTURE_V1.md
+
+This is an architecture specification only.
+
+DO NOT modify application code.
+
+DO NOT modify the UI.
+
+DO NOT rename any files.
+
+DO NOT change any APIs.
+
+This document becomes the engineering blueprint that all future development must follow.
+
+--------------------------------------------------
+SECTION 1 — End-to-End Data Flow
+--------------------------------------------------
+
+Document the complete lifecycle of market data from ingestion through post-trade learning.
+
+Include the following pipeline:
+
+Databento
+↓
+Market Normalization
+↓
+Feature Extraction
+↓
+Left Brain
+(Build Thesis)
+↓
+Expert
+(Evaluate Thesis)
+↓
+Partner
+(Explain Decision)
+↓
+Manager
+(Risk & Execution)
+↓
+Execution Gateway
+↓
+Broker
+↓
+Journal
+↓
+Coach
+(Post-Trade Learning)
+
+For EACH stage define:
+
+• Purpose
+• Inputs
+• Outputs
+• Dependencies
+• Owner
+• Failure behavior
+• Logging requirements
+• Expected latency
+
+Do not invent new processing stages.
+
+Use existing platform terminology.
+
+--------------------------------------------------
+SECTION 2 — Platform State Machine
+--------------------------------------------------
+
+Document every valid system state.
+
+Include at minimum:
+
+BOOTING
+
+MARKET CLOSED
+
+WARMING
+
+OBSERVING
+
+READY
+
+ARMED
+
+ENTRY PENDING
+
+ACTIVE TRADE
+
+MANAGING
+
+EXITED
+
+REVIEWING
+
+For every state document:
+
+• Purpose
+• Entry conditions
+• Exit conditions
+• Allowed transitions
+• Forbidden transitions
+• Operator UI behavior
+• Engineering behavior
+
+This becomes the canonical lifecycle.
+
+--------------------------------------------------
+SECTION 3 — Internal Message Contracts
+--------------------------------------------------
+
+Document standardized internal message types.
+
+Examples:
+
+THESIS_CREATED
+
+THESIS_UPDATED
+
+VERDICT_CHANGED
+
+ENTRY_ARMED
+
+ENTRY_TRIGGERED
+
+TRADE_OPENED
+
+TRADE_UPDATED
+
+TRADE_CLOSED
+
+THESIS_INVALIDATED
+
+SESSION_CHANGED
+
+MARKET_STATUS_CHANGED
+
+For every message define:
+
+• Producer
+• Consumer
+• Required fields
+• Optional fields
+• Delivery expectations
+• Failure behavior
+
+Do NOT redesign messaging.
+
+Document the existing logical architecture.
+
+--------------------------------------------------
+SECTION 4 — Responsibility Matrix
+--------------------------------------------------
+
+Create a responsibility table.
+
+Include every major subsystem.
+
+Minimum roles:
+
+Left Brain
+
+Expert
+
+Partner
+
+Manager
+
+Execution Gateway
+
+Journal
+
+Coach
+
+For every role define:
+
+Primary Responsibilities
+
+Consumes
+
+Produces
+
+Never Responsible For
+
+The ownership boundaries must be explicit.
+
+No overlap.
+
+--------------------------------------------------
+SECTION 5 — Failure Recovery
+--------------------------------------------------
+
+Document platform recovery behavior.
+
+Include:
+
+Databento disconnected
+
+Market feed interruption
+
+Broker rejection
+
+Execution timeout
+
+Duplicate execution attempt
+
+Clock synchronization issue
+
+Database unavailable
+
+Journal write failure
+
+Left Brain unavailable
+
+Partner unavailable
+
+Coach unavailable
+
+For every scenario define:
+
+Detection
+
+Recovery
+
+Operator notification
+
+Logging
+
+Safe fallback
+
+Recovery completion
+
+Do not propose new recovery systems.
+
+Document intended behavior.
+
+--------------------------------------------------
+SECTION 6 — Performance Budgets
+--------------------------------------------------
+
+Define expected performance targets.
+
+Examples include:
+
+Market ingest
+
+Normalization
+
+Feature generation
+
+Thesis creation
+
+Expert evaluation
+
+Explanation generation
+
+Execution routing
+
+Dashboard refresh
+
+Journal write
+
+Complete decision pipeline
+
+Document expected latency goals.
+
+Also document which stages are critical path versus background processing.
+
+--------------------------------------------------
+SECTION 7 — Versioned Interfaces
+--------------------------------------------------
+
+Document public interfaces between major components.
+
+Examples:
+
+Left Brain API
+
+Expert Interface
+
+Partner Interface
+
+Manager Interface
+
+Execution Gateway Interface
+
+Journal Interface
+
+Coach Interface
+
+For each interface define:
+
+Purpose
+
+Input contract
+
+Output contract
+
+Guaranteed fields
+
+Optional fields
+
+Version identifier
+
+Backward compatibility expectations
+
+--------------------------------------------------
+SECTION 8 — Acceptance Criteria
+--------------------------------------------------
+
+Define measurable completion requirements.
+
+Include items such as:
+
+Platform starts correctly
+
+Operator Mode loads successfully
+
+Engineering View functions
+
+All supported markets initialize
+
+Decision pipeline completes
+
+Execution gateway functions
+
+Journal captures completed trades
+
+Decision timeline records events
+
+Recovery works after temporary feed interruption
+
+No duplicate executions
+
+Operator interface remains responsive
+
+Engineering diagnostics remain isolated from Operator Mode
+
+--------------------------------------------------
+DOCUMENT REQUIREMENTS
+--------------------------------------------------
+
+This document is architecture only.
+
+Do not change source code.
+
+Do not modify APIs.
+
+Do not generate implementation code.
+
+Do not remove existing systems.
+
+Use existing terminology wherever possible.
+
+The finished document should read like an engineering architecture handbook suitable for future development, onboarding, validation, and long-term maintenance.
