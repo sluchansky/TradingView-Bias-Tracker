@@ -1,0 +1,437 @@
+# V1 MANAGER + COACH CONTRACT — SEMANTIC CORRECTNESS AUDIT
+# DO NOT BEGIN THE NEXT ROADMAP BATCH
+# DO NOT DEPLOY
+
+Current implementation commit:
+
+4e322c8
+
+The Manager and Coach interfaces now exist and all tests pass, but the Coach contract cannot yet be accepted because field existence and serialization do not prove semantic correctness.
+
+This task is limited to auditing and correcting the meaning of the new Manager and Coach fields.
+
+Do not expand scope.
+
+=========================================================
+PRIMARY CONCERN
+=========================================================
+
+The current Coach mappings reportedly include:
+
+weight_updated:
+    LEARNING_ANALYTICS.get("ready", False)
+
+thesis_resolved:
+    bool(THESIS_TRACKER_DB_READY)
+
+These appear to represent subsystem readiness rather than the events named by the contract fields.
+
+A field named weight_updated must not become true merely because learning analytics are ready.
+
+A field named thesis_resolved must not become true merely because the thesis database is available.
+
+Do not preserve these mappings simply because existing tests pass.
+
+=========================================================
+STEP 1 — FREEZE CURRENT STATE
+=========================================================
+
+Record:
+
+- branch
+- current HEAD
+- git status
+- tracked modifications
+- untracked files
+- git diff --stat
+- git diff --check
+
+Confirm whether 4e322c8 is present in the current history.
+
+If HEAD changed, inspect and classify the change before continuing.
+
+Do not reset, amend, squash, stash, or discard user work.
+
+=========================================================
+STEP 2 — RE-READ THE EXACT CONTRACT SEMANTICS
+=========================================================
+
+Read the controlling definitions for the Coach Interface from:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+
+Extract the precise intended meaning, type, lifecycle, and unavailable behavior of:
+
+- weight_updated
+- thesis_resolved
+- learning_influence
+- rule_engine_eligibility
+
+Do the same for the Manager fields to ensure their types and meanings are also correct:
+
+- gateway_debug
+- active_trade
+- managed_trade
+- training_gate
+- auto_trade_enabled
+
+Do not rely on field names alone.
+
+Document the exact section references.
+
+If the documents do not define a field sufficiently to distinguish event state from subsystem readiness, stop and report the ambiguity.
+
+Do not invent semantics.
+
+=========================================================
+STEP 3 — PROVE AUTHORITATIVE SOURCES
+=========================================================
+
+For every Coach field, identify an authoritative value that represents the actual contract meaning.
+
+---------------------------------------------------------
+weight_updated
+---------------------------------------------------------
+
+Determine whether the codebase has an actual event or result indicating that a strategy weight changed.
+
+Search for:
+
+- the function that writes or changes a learning weight
+- return values from weight-update operations
+- timestamps or update records
+- before/after weight comparisons
+- persisted update events
+- trade-close learning results
+
+The source must distinguish:
+
+- learning system ready
+- learning system enabled
+- update attempted
+- update skipped
+- update failed
+- weight actually changed
+
+Do not map readiness, enablement, DB availability, or sample sufficiency to weight_updated.
+
+If no authoritative actual-update value exists, use only the architecture-defined unavailable representation.
+
+If unavailable behavior is undefined, stop.
+
+---------------------------------------------------------
+thesis_resolved
+---------------------------------------------------------
+
+Determine whether the codebase has an actual thesis resolution event or state.
+
+Search for:
+
+- thesis status transitions
+- resolved_at
+- resolution outcome
+- close or settlement linkage
+- thesis tracker update functions
+- stored resolved thesis records
+- trade-close processing
+
+The source must distinguish:
+
+- thesis database ready
+- thesis exists
+- thesis active
+- thesis expired
+- thesis invalidated
+- thesis actually resolved
+
+Do not map THESIS_TRACKER_DB_READY to thesis_resolved.
+
+If no authoritative resolution value exists, use only the documented unavailable representation.
+
+If unavailable behavior is undefined, stop.
+
+---------------------------------------------------------
+learning_influence
+---------------------------------------------------------
+
+Confirm the exact required type and shape.
+
+Determine whether the canonical value is:
+
+- the complete learning influence object
+- a direction-specific delta
+- a numeric scalar
+- a boolean
+- a structured eligibility and reason object
+
+Do not compress the authoritative object to only Long/Short deltas unless the architecture explicitly requires that representation.
+
+Do not recompute influence.
+
+---------------------------------------------------------
+rule_engine_eligibility
+---------------------------------------------------------
+
+Confirm whether calling:
+
+_check_learning_eligibility(instrument, mode)
+
+is acceptable for a read-only aggregation contract.
+
+Prove:
+
+- the function has no writes
+- no counters are changed
+- no timestamps are changed
+- no logs with stateful throttling are changed
+- no learning update is triggered
+- no live gate is changed
+- no database mutation occurs
+- no expensive or duplicate decision computation is introduced
+
+Also confirm the contract requires the function’s boolean result rather than its complete reason or metadata object.
+
+If calling the function reruns business logic rather than reading existing authoritative state, replace it with an existing result already computed in the normal pipeline.
+
+Do not introduce a second eligibility calculation.
+
+=========================================================
+STEP 4 — VERIFY MANAGER SEMANTICS
+=========================================================
+
+Audit the Manager builder even if no problem has yet been reported.
+
+Confirm:
+
+gateway_debug:
+- is the exact existing gate diagnostic object
+- is not recomputed
+- does not expose secrets or broker payloads
+
+active_trade:
+- is scoped to the requested instrument correctly
+- does not fall back to another instrument
+- is a snapshot rather than a mutable live reference
+
+managed_trade:
+- has the architecture-required singular or plural type
+- is scoped correctly
+- does not expose all instruments when one instrument was requested unless explicitly required
+- does not return mutable global objects by reference
+
+training_gate:
+- represents the architecture-defined gate
+- is not merely training-mode enablement if those concepts differ
+
+auto_trade_enabled:
+- has the architecture-required type
+- is not converted into an all-assets dictionary if the contract expects one instrument-level boolean
+- does not call execution or authorization logic with side effects
+
+Check whether returned nested lists and dictionaries are copied deeply enough that consumers cannot mutate global state through the interface.
+
+=========================================================
+STEP 5 — CORRECT THE CONTRACTS
+=========================================================
+
+Only after semantic sources are proven:
+
+- correct any inaccurate mappings
+- preserve the two canonical builders
+- preserve _version: "v1"
+- preserve all required keys
+- use documented unavailable values where actual event data does not exist
+- do not fabricate event states
+- do not add database writes
+- do not add new learning updates
+- do not change execution or decision behavior
+
+If the authoritative event information only exists at trade-close time, the Coach interface may legitimately report unavailable during ordinary full_analysis().
+
+Do not convert “unavailable” into false unless the architecture explicitly defines false as “not available or did not happen.”
+
+The distinction between false, null, unknown, and unavailable must follow the architecture.
+
+=========================================================
+STEP 6 — REPLACE SHALLOW TESTS WITH SEMANTIC TESTS
+=========================================================
+
+Update the tracked tests so they prove meaning, not just presence.
+
+Coach tests must prove:
+
+1. Learning-ready does not imply weight_updated.
+2. Learning-enabled does not imply weight_updated.
+3. Insufficient samples do not imply weight_updated.
+4. A skipped update reports the documented non-update state.
+5. An actual weight-change event reports the documented update state, if such an event can be safely simulated.
+6. DB readiness does not imply thesis_resolved.
+7. An active thesis does not imply thesis_resolved.
+8. An unresolved thesis reports the documented state.
+9. A genuinely resolved thesis reports the documented state, if safely testable.
+10. learning_influence preserves the required authoritative shape.
+11. rule_engine_eligibility is not calculated twice when an existing pipeline result is available.
+12. Repeated interface reads do not write to learning or thesis storage.
+
+Manager tests must prove:
+
+1. Instrument scoping is strict.
+2. No active trade does not fall back to another instrument.
+3. Returned objects cannot mutate global trade state.
+4. auto_trade_enabled has the exact documented type.
+5. training_gate has the exact documented meaning.
+6. Builder calls do not trigger execution.
+7. Builder calls do not change active-trade management state.
+
+Do not mock the implementation so heavily that the tests only confirm the mocked values.
+
+Use fixed real project fixtures or isolated state objects where possible.
+
+=========================================================
+STEP 7 — REGRESSION VALIDATION
+=========================================================
+
+Run:
+
+- updated tracked interface tests
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- directly affected learning tests
+- directly affected thesis tests
+- active-trade and manager tests
+- syntax checks
+- git diff --check
+
+Capture exact commands and results.
+
+Required:
+
+- no changed verdicts
+- no changed confidence
+- no changed edge scores
+- no changed direction
+- no changed risk
+- no changed sizing
+- no changed execution requests
+- no changed broker payloads
+- no new learning writes
+- no new thesis writes
+- no changed journal persistence
+- no Databento changes
+
+=========================================================
+STEP 8 — UPDATE VALIDATION EVIDENCE
+=========================================================
+
+Update:
+
+V1_MANAGER_COACH_INTERFACE_VALIDATION.md
+
+Add:
+
+“Semantic Correctness Audit After 4e322c8”
+
+For each field show:
+
+- intended meaning
+- prior mapping
+- whether prior mapping was semantically correct
+- final authoritative source
+- final type
+- unavailable representation
+- lifecycle timing
+- read/write behavior
+
+Explicitly document whether:
+
+LEARNING_ANALYTICS.ready
+
+is or is not equivalent to:
+
+weight_updated
+
+and whether:
+
+THESIS_TRACKER_DB_READY
+
+is or is not equivalent to:
+
+thesis_resolved
+
+Do not obscure or rewrite the original mapping.
+
+=========================================================
+STOP CONDITIONS
+=========================================================
+
+Stop if:
+
+- the architecture does not define event semantics or unavailable behavior
+- no authoritative source exists for a required field
+- a field would require a new persistence mechanism
+- an accurate value requires triggering a learning update
+- an accurate value requires resolving a thesis
+- an accurate value requires changing the journal schema
+- the interface would need to recompute decision logic
+- Manager types conflict with the implemented types
+- any primary regression fails
+- Databento files appear in the diff
+- live execution or deployment is required
+
+If no authoritative source exists, report the interface as incomplete rather than inventing a value.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If corrections are required and all validation passes, create one new commit.
+
+Suggested message:
+
+V1-P1 correct Manager and Coach contract semantics
+
+Do not amend 4e322c8.
+
+If the audit proves a required Coach field currently has no authoritative source, do not falsely mark V1-P1-007 complete.
+
+Commit safe test and evidence corrections only if appropriate.
+
+=========================================================
+FINAL RESPONSE
+=========================================================
+
+Report:
+
+1. Starting and ending HEAD
+2. Files modified
+3. Semantic verdict for each of the nine fields
+4. Whether weight_updated had a truthful source
+5. Whether thesis_resolved had a truthful source
+6. Final source and type for learning_influence
+7. Whether rule_engine_eligibility is read or recomputed
+8. Manager instrument-scoping result
+9. Manager mutability result
+10. Tests added or corrected
+11. Contract-test results
+12. Four primary regression results
+13. Learning-write confirmation
+14. Thesis-write confirmation
+15. Execution-change confirmation
+16. Databento-change confirmation
+17. Database-schema confirmation
+18. Deployment confirmation
+19. Validation-document update
+20. Commit created
+21. Honest final status of V1-P1-004
+22. Honest final status of V1-P1-007
+23. Remaining stop conditions or roadmap dependencies
+
+Do not begin the next batch.
+Do not publish.
+Do not deploy.
+Stop after reporting.
