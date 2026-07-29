@@ -892,6 +892,41 @@ def test_coach_thesis_resolved_true_after_resolution_event():
         app._THESIS_LAST_RESOLVED_AT = saved_ts
 
 
+def test_thesis_last_resolved_at_is_none_at_module_load():
+    """_THESIS_LAST_RESOLVED_AT must be None immediately after a fresh module load.
+
+    Guards against any future change that accidentally persists or restores
+    this flag (e.g. via market_state_cache or DB boot restore).  A non-None
+    value at boot would cause thesis_resolved=True before any resolution has
+    run, silently carrying stale session data across restarts.
+    """
+    import importlib as _il
+    import app as _app_mod
+    _il.reload(_app_mod)
+    assert _app_mod._THESIS_LAST_RESOLVED_AT is None, (
+        "_THESIS_LAST_RESOLVED_AT must be None after module reload; "
+        "a non-None value at boot means stale thesis state is being "
+        "persisted or restored across restarts")
+
+
+def test_coach_thesis_resolved_false_at_module_load():
+    """build_coach_interface() must return thesis_resolved=False right after module load.
+
+    Verifies that no boot path (cache restore, DB probe, or flag initialisation)
+    can set thesis_resolved=True before _resolve_open_theses() has actually run
+    in the current session.
+    """
+    import importlib as _il
+    import app as _app_mod
+    _il.reload(_app_mod)
+    # build_coach_interface needs a result dict; use a fresh full_analysis().
+    result = _app_mod.full_analysis()
+    cch = _app_mod.build_coach_interface(result)
+    assert cch.get("thesis_resolved") is False, (
+        "thesis_resolved must be False immediately after module reload; "
+        "no resolution event has run yet so the flag must start False")
+
+
 # -----------------------------------------------------------------
 # SEMANTIC: learning_influence source and shape
 # -----------------------------------------------------------------
