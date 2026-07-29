@@ -703,6 +703,103 @@ def test_coach_recompute_event_sets_weight_updated_true():
             app.LEARNING_ANALYTICS.update(saved)
 
 
+def test_coach_recompute_via_mocked_db_sets_updated_at_and_weight_updated():
+    """Higher-fidelity path: _recompute_learning() with a mocked DB cursor
+    returning one trade row must set LEARNING_ANALYTICS['updated_at'] and cause
+    build_coach_interface() to return weight_updated = True.
+
+    Complements test_coach_recompute_event_sets_weight_updated_true (which
+    directly injects 'updated_at') by exercising the actual _recompute_learning()
+    function body end-to-end:
+        mocked cursor returns one trade row
+        → analytics dict is constructed with 'updated_at' = now_utc().isoformat()
+        → LEARNING_ANALYTICS is swapped under LEARNING_LOCK
+        → build_coach_interface() reads updated_at and returns weight_updated = True
+
+    Regression guard: a break in the 'updated_at' assignment inside the analytics
+    dict construction would leave weight_updated silently False with no other
+    test catching it.
+    """
+    # ── Minimal mock rows ──────────────────────────────────────────────────────
+    one_strat_row = {
+        "trading_mode": "SCALP", "strategy_key": "mock_strat",
+        "strategy": "Mock Strategy", "n": 1,
+        "win_rate": 0.6, "avg_r": 1.2, "avg_hold": 25.0,
+        "gross_win": 1.2, "gross_loss": 0.0,
+    }
+    one_hour_row   = {"hour_et": 10, "n": 1, "win_rate": 0.6, "avg_r": 1.2}
+    one_regime_row = {"regime": "RISK_ON", "n": 1, "win_rate": 0.6, "avg_r": 1.2}
+    # trend_row: total=1 so analytics["ready"] = True (total > 0); recent/prior
+    # both None → trend label stays "Insufficient data" (safe, not required).
+    trend_row_   = {"recent_r": None, "prior_r": None, "total": 1}
+    overall_row_ = {"n": 1, "win_rate": 0.6}
+
+    # ── Main read cursor — execute() called 7 times; fetchall x5, fetchone x2 ──
+    mock_cur = unittest.mock.MagicMock()
+    mock_cur.fetchall.side_effect = [
+        [one_strat_row],   # 1. strat_rows
+        [one_hour_row],    # 2. hour_rows
+        [one_regime_row],  # 3. regime_rows
+        [],                # 4. session_rows
+        [],                # 5. mem_rows (LIMIT query)
+    ]
+    mock_cur.fetchone.side_effect = [
+        trend_row_,        # 4th execute: WITH recent …
+        overall_row_,      # 5th execute: overall win_rate
+    ]
+
+    # Migration cursor (no-op — rowcount=0 so no log line)
+    mock_mig_cur = unittest.mock.MagicMock()
+    mock_mig_cur.rowcount = 0
+
+    # Read connection: first cursor() call → mig_cur, second → main cur
+    mock_conn = unittest.mock.MagicMock()
+    mock_conn.cursor.side_effect = [mock_mig_cur, mock_cur]
+
+    # Write connection (strategy_weights upsert via `with wconn.cursor() as wc`)
+    mock_wconn = unittest.mock.MagicMock()
+
+    with app.LEARNING_LOCK:
+        saved_analytics = app.LEARNING_ANALYTICS
+        app.LEARNING_ANALYTICS = {"enabled": True, "ready": False, "total_trades": 0}
+
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(
+                app, "_learning_conn", side_effect=[mock_conn, mock_wconn]
+            ),
+            unittest.mock.patch.object(app, "_recompute_learning_eligibility"),
+            unittest.mock.patch.object(app, "_tz_memory_records", return_value=[]),
+        ):
+            app._recompute_learning()
+
+        with app.LEARNING_LOCK:
+            has_updated_at = isinstance(app.LEARNING_ANALYTICS, dict) and (
+                "updated_at" in app.LEARNING_ANALYTICS
+            )
+            updated_at_val = (app.LEARNING_ANALYTICS or {}).get("updated_at") if has_updated_at else None
+
+        assert has_updated_at, (
+            "_recompute_learning() must set LEARNING_ANALYTICS['updated_at'] after a "
+            "successful run — regression guard: if this key is ever removed from the "
+            "analytics dict construction, weight_updated silently reverts to False")
+        assert updated_at_val, (
+            "LEARNING_ANALYTICS['updated_at'] must be a non-empty timestamp string "
+            f"after _recompute_learning() completes; got {updated_at_val!r}")
+
+        result = app.full_analysis()
+        cch = app.build_coach_interface(result)
+        assert cch["weight_updated"] is True, (
+            "weight_updated must be True after _recompute_learning() completes and "
+            "LEARNING_ANALYTICS['updated_at'] is set — end-to-end path: "
+            "trade close → recompute runs → updated_at set → weight_updated = True")
+
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS = saved_analytics
+
+
 # -----------------------------------------------------------------
 # SEMANTIC: thesis_resolved — DB readiness ≠ thesis resolved
 # -----------------------------------------------------------------
