@@ -1,0 +1,531 @@
+# V1 NEXT ROADMAP BATCH
+# ROADMAP-DRIVEN SELECTION + CONTROLLED IMPLEMENTATION
+# NO DEPLOYMENT
+
+Current accepted checkpoint:
+
+64f6d35 — "V1-P1 correct Manager and Coach contract semantics"
+
+Current Phase 1 status:
+
+- V1-P1-001 Expert Interface v1 — COMPLETE
+- V1-P1-002 Left Brain Interface v2 — COMPLETE
+- V1-P1-003 Partner Interface v1 — COMPLETE
+- V1-P1-004 Manager Interface v1 — COMPLETE
+- V1-P1-005 Execution Gateway Interface v1 — COMPLETE
+- V1-P1-006 Journal Interface v1 — COMPLETE
+- V1-P1-007 Coach Interface v1 — COMPLETE
+
+The seven canonical interfaces now exist, are versioned, and have tracked semantic contract tests.
+
+Do not guess the next tasks from memory.
+
+Read the roadmap and identify the next incomplete dependency-valid implementation batch after Phase 1.
+
+=========================================================
+PRIMARY OBJECTIVE
+=========================================================
+
+Use IMPLEMENTATION_ROADMAP_V1.md as the authoritative task sequence and complete the next safe, contiguous roadmap batch after V1-P1-007.
+
+The batch must:
+
+- follow documented dependency order
+- remain narrowly scoped
+- preserve all established interface contracts
+- preserve trading behavior unless the roadmap task explicitly authorizes a behavior change
+- include tracked tests
+- include validation evidence
+- stop before deployment or publication
+
+Do not select tasks merely because they are convenient.
+
+Do not skip an earlier incomplete dependency.
+
+=========================================================
+DOCUMENT PRECEDENCE
+=========================================================
+
+Read completely before editing:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. V1_FIRST_BATCH_BASELINE.md
+6. V1_FIRST_BATCH_VALIDATION.md
+7. V1_MANAGER_COACH_INTERFACE_VALIDATION.md
+
+Inspect commits:
+
+- abb6d89
+- 36bd6e1
+- 4e322c8
+- 64f6d35
+
+Use this precedence for conflicts:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PRODUCT_SPEC_V1.md
+4. PLATFORM_BLUEPRINT.md
+5. Validation documents
+6. Existing implementation assumptions
+
+If the controlling documents conflict, stop and report.
+
+=========================================================
+STAGE 0 — BASELINE FREEZE
+=========================================================
+
+Record:
+
+- current branch
+- current HEAD
+- parent commit
+- git status
+- tracked modified files
+- untracked files
+- git diff --stat
+- git diff --check
+- remote or upstream state, when available
+- whether current HEAD is a Replit platform checkpoint
+- whether 64f6d35 is an ancestor of HEAD
+
+Do not reset, rebase, amend, squash, stash, discard, or overwrite work.
+
+If HEAD changed after 64f6d35:
+
+Classify the change as:
+
+- platform attachment commit
+- documentation-only
+- task-related code
+- unrelated code
+- unexplained code
+
+Stop on unrelated or unexplained code changes.
+
+=========================================================
+STAGE 1 — DETERMINE THE NEXT EXACT ROADMAP BATCH
+=========================================================
+
+Read the roadmap task cards immediately following V1-P1-007.
+
+Identify:
+
+- next phase
+- exact task IDs
+- task titles
+- dependency requirements
+- expected files
+- allowed behavior changes
+- prohibited behavior changes
+- required tests
+- required evidence
+- completion criteria
+- stop conditions
+
+Build a task-selection table:
+
+| Task ID | Title | Dependencies | Dependency Status | Safe to Start | Reason |
+|---------|-------|--------------|-------------------|---------------|--------|
+
+Select only the earliest contiguous set of tasks whose dependencies are fully satisfied.
+
+The preferred batch size is:
+
+- one cohesive subsystem, or
+- three to seven tightly related task cards
+
+Do not combine unrelated workstreams.
+
+Do not skip tasks because they appear difficult.
+
+Do not begin later UI, automation, execution, or learning tasks while an earlier required foundation task remains incomplete.
+
+=========================================================
+MANDATORY SELECTION STOP CONDITIONS
+=========================================================
+
+Stop before implementation if:
+
+- the next task IDs cannot be determined confidently
+- the roadmap contains unresolved open conflicts affecting the next batch
+- a required dependency is incomplete
+- the next batch requires production access
+- the next batch requires live trading
+- the next batch requires an undefined database migration
+- the roadmap and architecture disagree about ownership
+- the batch would touch Databento without explicit authorization
+- the batch would alter execution or risk without explicit authorization
+- the batch is too large to validate as one atomic change
+
+If stopped, report the exact next candidate tasks and the blocking issue.
+
+=========================================================
+STAGE 2 — WRITE THE IMPLEMENTATION CONTRACT
+=========================================================
+
+Before editing application code, write a temporary internal task contract containing:
+
+1. Exact task IDs
+2. Objective
+3. Files expected to change
+4. Files prohibited from changing
+5. Existing canonical interfaces involved
+6. Inputs
+7. Outputs
+8. Behavioral changes explicitly authorized
+9. Behaviors that must remain unchanged
+10. Test plan
+11. Rollback boundary
+12. Evidence-document name
+
+Do not implement until this contract is complete.
+
+The final validation document must include this contract.
+
+=========================================================
+GLOBAL SAFETY BOUNDARIES
+=========================================================
+
+Unless the selected roadmap task explicitly authorizes it, do not modify:
+
+- Databento ingestion
+- Databento normalization
+- market-data stores
+- TradingView fallback ingestion
+- VWAP
+- ATR
+- CVD or delta
+- market structure
+- strategy definitions
+- strategy selection
+- edge scores
+- confidence
+- verdicts
+- actionability
+- gate thresholds
+- risk
+- sizing
+- prop protections
+- duplicate-order protection
+- cooldowns
+- live execution
+- broker routing
+- TradersPost
+- active-trade management
+- journal persistence
+- learning weights
+- learning thresholds
+- database schema
+- environment variables
+- deployment configuration
+- authentication
+- production routes
+- dashboard layout
+- operator wording
+
+Preserve all seven canonical interface versions:
+
+- Left Brain: v2
+- Expert: v1
+- Partner: v1
+- Manager: v1
+- Execution Gateway: v1
+- Journal: v1
+- Coach: v1
+
+Do not rename, remove, or silently change required interface fields.
+
+=========================================================
+IMPLEMENTATION PRINCIPLES
+=========================================================
+
+Use the smallest change that satisfies the selected roadmap tasks.
+
+Prefer:
+
+- additive implementation
+- existing authoritative data sources
+- existing helpers
+- existing project conventions
+- one canonical owner per concept
+- read-only integration before behavioral influence
+- explicit unavailable states
+- deterministic outputs
+- tracked tests
+
+Avoid:
+
+- broad refactoring
+- duplicate calculations
+- parallel replacement systems
+- convenience aliases
+- hidden fallbacks
+- silent defaults to MGC or another instrument
+- new global mutable state
+- catch-all exception swallowing
+- source-only grep tests
+- dashboard-first implementation without backend contracts
+- versioning noncanonical nested objects
+
+=========================================================
+INTERFACE CONTRACT PROTECTION
+=========================================================
+
+Run the tracked seven-interface tests before modifying code.
+
+Capture the baseline result.
+
+After implementation, verify:
+
+- all seven interface versions remain exact
+- all required fields remain present
+- unavailable behavior remains truthful
+- Manager returns copied state
+- Coach does not fabricate events
+- no broker payload receives interface metadata
+- no global mutable state is exposed by reference
+- serialization remains valid
+
+Any intentional interface change requires explicit roadmap authorization and a version decision.
+
+Do not make an undocumented interface change.
+
+=========================================================
+TEST REQUIREMENTS
+=========================================================
+
+Before implementation, run:
+
+- test_v1_interface_versions.py
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- directly relevant existing tests for the selected subsystem
+- syntax checks
+
+After implementation, add tracked tests for every selected task.
+
+Tests must prove:
+
+- intended behavior
+- negative behavior
+- degraded or unavailable behavior
+- instrument scoping
+- serialization, where applicable
+- no unexpected mutation
+- no unauthorized execution
+- compatibility with existing callers
+- stable interface versions
+
+Do not rely only on source inspection.
+
+Do not place permanent tests under .local/.
+
+Do not weaken existing assertions.
+
+=========================================================
+BEHAVIORAL PARITY
+=========================================================
+
+Unless explicitly authorized by the selected roadmap task, prove no change to:
+
+- verdict
+- confidence
+- edge score
+- direction
+- actionability
+- trade readiness
+- risk
+- position sizing
+- stops
+- targets
+- execution requests
+- broker payloads
+- active-trade management
+- journal persistence
+- learning calculations
+- learning weights
+- thesis state transitions
+- Databento behavior
+
+If the roadmap explicitly authorizes one of these changes:
+
+- identify the exact task requirement
+- add focused before/after fixtures
+- document the expected change
+- prove all unrelated behavior remains unchanged
+
+=========================================================
+REGRESSION COMMANDS
+=========================================================
+
+Use the exact repository commands for:
+
+- interface contract tests
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- selected-subsystem tests
+- directly affected tests
+- syntax checks
+- git diff --check
+
+Record:
+
+- command
+- exit code
+- pass count
+- failure count
+- skipped count
+- warnings
+- duration, where available
+
+Do not describe tests as passing without recording the command and result.
+
+=========================================================
+DIFF AUDIT
+=========================================================
+
+Before committing:
+
+1. Run git diff --stat.
+2. Run git diff --check.
+3. Inspect every changed file.
+4. List every changed function.
+5. Explain why each changed function was necessary.
+6. Confirm no unrelated formatting churn.
+7. Confirm no generated or temporary files are tracked.
+8. Confirm no secrets or credentials appear.
+9. Confirm no broker-facing payload changed unless authorized.
+10. Confirm no Databento file changed unless authorized.
+
+If the diff exceeds the selected task contract, reduce it before proceeding.
+
+=========================================================
+REQUIRED VALIDATION DOCUMENT
+=========================================================
+
+Create one tracked document named according to the selected roadmap phase:
+
+V1_PHASE_<PHASE_NUMBER>_<BATCH_NAME>_VALIDATION.md
+
+Use a concise uppercase batch name.
+
+Example only:
+
+V1_PHASE_2_OPERATOR_CONTEXT_VALIDATION.md
+
+The document must contain:
+
+1. Repository baseline
+2. Selected task IDs and titles
+3. Why these are the next roadmap tasks
+4. Dependency proof
+5. Implementation contract
+6. Architecture references
+7. Files changed
+8. Functions changed
+9. Before/after behavior
+10. Interface impact
+11. Databento impact
+12. Execution impact
+13. Risk impact
+14. Journal impact
+15. Learning impact
+16. Database impact
+17. Tests added
+18. Exact validation commands and results
+19. Regression comparison
+20. Known limitations
+21. Deferred roadmap items
+22. Completion status for each selected task
+
+Do not mark a task complete unless every documented completion criterion is satisfied.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If all selected tasks are complete and all validation passes, create one commit.
+
+Commit format:
+
+V1-<PHASE>: <concise batch description>
+
+Examples:
+
+V1-P2: expose operator decision context
+V1-P2: connect canonical analysis surfaces
+V1-P3: add journal retrieval contracts
+
+Use the actual selected task content.
+
+Do not amend 64f6d35.
+
+Do not squash prior commits.
+
+Do not publish.
+
+Do not deploy.
+
+Do not restart production.
+
+Do not send live notifications.
+
+Do not place live orders.
+
+If only part of the selected batch can be completed safely:
+
+- commit only independently valid completed work
+- mark remaining tasks incomplete
+- explain the exact dependency or stop condition
+- do not claim the batch complete
+
+=========================================================
+FINAL RESPONSE FORMAT
+=========================================================
+
+Report:
+
+1. Starting branch and HEAD
+2. Ending branch and HEAD or working-tree state
+3. Selected phase
+4. Selected task IDs
+5. Task titles
+6. Dependency proof
+7. Files modified
+8. Functions added or changed
+9. Architecture boundary used
+10. Tests added
+11. Interface-contract test result
+12. Four primary regression results
+13. Selected-subsystem test results
+14. Behavioral changes explicitly authorized
+15. Behavioral parity for everything else
+16. Databento-change confirmation
+17. Risk-change confirmation
+18. Execution-change confirmation
+19. Broker-payload-change confirmation
+20. Journal-change confirmation
+21. Learning-change confirmation
+22. Database-schema confirmation
+23. Deployment confirmation
+24. Validation document created
+25. Commit created
+26. Completion status for each selected task
+27. Next uncompleted roadmap task
+28. Remaining stop conditions or dependencies
+
+Do not automatically begin another batch after this one.
+
+Do not publish.
+
+Do not deploy.
+
+Stop after reporting.
