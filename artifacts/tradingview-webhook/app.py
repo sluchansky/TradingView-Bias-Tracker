@@ -17789,6 +17789,7 @@ def _main_brain_neutral(reason="Main Brain unavailable.", status="WATCHING"):
         "verdict_board":     None,
         "learning_memory":   None,
         "reason":            reason,
+        "_version":          "v1",
     }
 
 
@@ -20137,6 +20138,8 @@ def compute_main_brain(result):
                 mb_out["summary"] = _unified["narrative"]
         except Exception:
             mb_out["unified"] = {"available": False}
+        # V1 Partner Interface version field — additive, no behavior change.
+        mb_out["_version"] = "v1"
         return mb_out
     except Exception as exc:
         try:
@@ -23335,6 +23338,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         "meta":      (learning_score_influence or {}).get("meta") if learning_score_influence else None,
         "Long":      _ls_dir_summary("Long"),
         "Short":     _ls_dir_summary("Short"),
+        "_version":  "v1",
     }
 
     # ── Source attribution diagnostics (display-only audit; never alters scoring) ──
@@ -24067,6 +24071,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "meta":      None,
             "Long":      dict(_ls_neutral_dir),
             "Short":     dict(_ls_neutral_dir),
+            "_version":  "v1",
         }
         # Neutralise the CVD / RVOL / volume stamps too — there is no live tape closed.
         result["cvd_state"]          = None
@@ -24575,6 +24580,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "thesis":              _LB_THESIS_BY_INST.get(_lb_inst),
         }
 
+    # V1 Expert Interface version field — additive, no behavior change.
+    result["_version"] = "v1"
     return result
 
 
@@ -29704,6 +29711,8 @@ def _build_card_entry(a, ticker=None, record=None):
     # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
     if _swing_htf_enabled():
         entry["_swing_context"] = a.get("swing_context")
+    # V1 Journal Interface version field — additive, no behavior change.
+    entry["_version"] = "v1"
     return entry
 
 
@@ -34281,6 +34290,7 @@ def _active_trade_mgmt_block(seed_analysis=None, seed_ticker=None):
             "count":      len(rows),
             "positions":  rows,
             "updated_at": now_utc().isoformat(),
+            "_version":   "v1",
         }
     except Exception as exc:
         logger.warning("active-trade-mgmt status block error: %s", exc)
@@ -48278,6 +48288,7 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
             "message": (f"Place this {instrument} {direction.upper()} order yourself: "
                         f"{contracts} @ market · stop {intent['stop']} · TP {intent['target1']} ({tp.get('rr','1:1')})."),
             "plan": plan_public,
+            "_version": "v1",
         }, 200
 
     # ── paper: simulate/log only. No broker send, no broker dedupe; trade still tracks.
@@ -48298,6 +48309,7 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
             "provider": provider_label, "mode": mode, "broker_verify_required": False,
             "message": f"Paper order simulated ({instrument} {direction.upper()} x{contracts}). No broker contacted.",
             "plan": plan_public,
+            "_version": "v1",
         }, 200
 
     # ── LIVE providers (traderspost / pickmytrade) below ─────────────────────────
@@ -48374,6 +48386,7 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
         "order":  {"ticker": tp_symbol, "action": action, "quantity": contracts,
                    "direction": direction, "type": "market",
                    "stopLoss": stop, "takeProfit": t1, "target2": t2},
+        "_version": "v1",
     }, 200
 
 

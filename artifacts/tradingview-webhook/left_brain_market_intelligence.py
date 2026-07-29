@@ -1279,6 +1279,7 @@ def _neutral_thesis(inst: str) -> dict[str, Any]:
             "stability_note":               "No thesis data.",
         },
         "timeline": [],
+        "_version":  "v2",
     }
 
 
@@ -1352,6 +1353,7 @@ def compute_left_brain_thesis(
             "playbooks":       _compute_playbook_reasoning(mi),
             "stability":       _thesis_stability(all_events, established_at),
             "timeline":        _thesis_timeline(all_events, max_events=20),
+            "_version":        "v2",
         }
 
         return {"thesis": thesis, "new_events": new_events}
