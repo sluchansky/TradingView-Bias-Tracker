@@ -1,4 +1,4 @@
-"""test_v1_interface_versions.py — V1 Phase 1 Interface Version Contract Tests.
+"""test_v1_interface_versions.py — V1 Phase 1 + V1-P6 Interface Version Contract Tests.
 
 Verifies that each proven-canonical component interface output carries the
 correct _version field, that all ARCH §7 required fields remain present, and
@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import importlib
+import unittest.mock
 
 # ---------------------------------------------------------------------------
 # Bootstrap — same pattern as test_brain_contract.py
@@ -945,6 +946,190 @@ def test_cross_interface_version_matrix():
         failures.append("Coach isolation: learning_score_influence must NOT carry _version")
 
     assert not failures, "Cross-interface version matrix failures:\n" + "\n".join(failures)
+
+
+# ===========================================================================
+# V1-P6-006  LEARNING-ENGINE RESILIENCE
+#
+# ROADMAP V1-P6-006: Coach-unavailable resilience.
+#
+# The learning subsystem is fail-open by design.  These tests provide the
+# automated proof that an exception inside the learning block cannot cascade
+# into a broken /status response or a false WAIT verdict.
+#
+# Strategy:
+#   • Patch _recompute_learning to raise — confirms the background recompute is
+#     decoupled from the synchronous evaluation path (full_analysis never calls
+#     _recompute_learning inline; it only schedules it via _maybe_recompute_learning
+#     → Thread, so a crash there cannot affect a live evaluation in progress).
+#   • Corrupt LEARNING_ANALYTICS (set to None) — forces an AttributeError inside
+#     build_coach_interface's internal LEARNING_ANALYTICS.get() call, exercising
+#     the existing fail-open except block end-to-end.
+#   • Both injection paths confirm: full_analysis() returns a valid Expert dict,
+#     the Expert verdict and edge_score are unchanged, and /status returns HTTP 200.
+# ===========================================================================
+
+_V1_P6_006_EXPERT_FIELDS = ("verdict", "edge_score", "strict_reason",
+                             "gate_debug", "trade_plan", "alert_diagnostics")
+
+
+def test_v1_p6_006_recompute_exception_decoupled_from_full_analysis():
+    """V1-P6-006 — _recompute_learning() raising must not affect full_analysis().
+
+    _recompute_learning() is only ever called from a daemon Thread spawned by
+    _maybe_recompute_learning().  A crash there is isolated to that thread;
+    the synchronous full_analysis() eval path does not call it inline and must
+    return a complete, valid Expert dict regardless.
+    """
+    with unittest.mock.patch.object(
+        app, "_recompute_learning",
+        side_effect=RuntimeError("DB unavailable — V1-P6-006 injection"),
+    ):
+        # The patch is on the module-level function; full_analysis does NOT call
+        # _recompute_learning inline, so patching it must have zero effect.
+        result = app.full_analysis()
+
+    assert isinstance(result, dict), "_recompute_learning crash must not prevent a dict return"
+    assert result.get("_version") == "v1", (
+        "_version must still be 'v1' when _recompute_learning raises")
+    for field in _V1_P6_006_EXPERT_FIELDS:
+        assert field in result, (
+            f"Expert field {field!r} missing after _recompute_learning exception")
+
+
+def test_v1_p6_006_learning_analytics_corruption_does_not_break_full_analysis():
+    """V1-P6-006 — corrupting LEARNING_ANALYTICS (→ None) must not crash full_analysis().
+
+    Setting LEARNING_ANALYTICS to None forces an AttributeError on .get() inside
+    build_coach_interface's lock block, exercising the fail-open except path.
+    full_analysis must still return a dict with all Expert fields intact.
+    """
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        # Replace with None — causes AttributeError on LEARNING_ANALYTICS.get(...)
+        app.LEARNING_ANALYTICS = None  # type: ignore[assignment]
+    try:
+        result = app.full_analysis()
+        assert isinstance(result, dict), (
+            "full_analysis must return a dict even when LEARNING_ANALYTICS is None")
+        assert result.get("_version") == "v1", (
+            "_version must still be 'v1' when LEARNING_ANALYTICS is corrupted")
+        for field in _V1_P6_006_EXPERT_FIELDS:
+            assert field in result, (
+                f"Expert field {field!r} missing after LEARNING_ANALYTICS corruption")
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS = saved  # type: ignore[assignment]
+
+
+def test_v1_p6_006_coach_fail_open_when_analytics_raises():
+    """V1-P6-006 — build_coach_interface fail-open returns a valid v1 dict when
+    LEARNING_ANALYTICS.get() raises AttributeError.
+
+    Directly tests the fail-open except branch: the returned dict must carry
+    _version='v1' and all four Coach contract fields with safe types.
+    """
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        app.LEARNING_ANALYTICS = None  # type: ignore[assignment]
+    try:
+        result = app.full_analysis()
+        cch = app.build_coach_interface(result)
+        assert isinstance(cch, dict), "build_coach_interface must return a dict on exception"
+        assert cch.get("_version") == "v1", (
+            "fail-open path must still return _version='v1'")
+        assert isinstance(cch.get("weight_updated"), bool), (
+            "fail-open weight_updated must be bool")
+        assert isinstance(cch.get("thesis_resolved"), bool), (
+            "fail-open thesis_resolved must be bool")
+        assert isinstance(cch.get("learning_influence"), (int, float)), (
+            "fail-open learning_influence must be numeric")
+        assert cch.get("rule_engine_eligibility") in {
+            "GHOST_ONLY", "LIVE_ELIGIBLE", "DISABLED"
+        }, "fail-open rule_engine_eligibility must be a valid sentinel"
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS = saved  # type: ignore[assignment]
+
+
+def test_v1_p6_006_expert_verdict_unchanged_when_learning_crashes():
+    """V1-P6-006 — Expert verdict and edge_score must be identical whether or not
+    the learning engine crashes.
+
+    Baseline: full_analysis() with normal LEARNING_ANALYTICS.
+    Crash path: full_analysis() with LEARNING_ANALYTICS = None.
+
+    The learning subsystem's sole money-path effect is a bounded ±15 Edge Score
+    nudge (LEARNING_SCORE_ENABLED flag, default OFF in tests).  With the flag off
+    the learning nudge is 0 and the verdict must be byte-identical.  With the flag
+    on, a crash falls back to 0 nudge — so the verdict can only be MORE conservative
+    (never READY when baseline is WAIT).  Either way, the gate is not broken.
+
+    We assert byte-identity here because the test environment has no DB and the
+    learning score flag is OFF, so the crash produces zero delta.
+    """
+    # Baseline
+    baseline = app.full_analysis()
+    baseline_verdict    = baseline.get("verdict")
+    baseline_edge_score = baseline.get("edge_score")
+
+    # Corrupt LEARNING_ANALYTICS
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        app.LEARNING_ANALYTICS = None  # type: ignore[assignment]
+    try:
+        crashed = app.full_analysis()
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS = saved  # type: ignore[assignment]
+
+    assert crashed.get("verdict") == baseline_verdict, (
+        f"Expert verdict changed after learning crash: "
+        f"{baseline_verdict!r} → {crashed.get('verdict')!r}; "
+        "the gate must be unaffected by learning engine exceptions")
+    assert crashed.get("edge_score") == baseline_edge_score, (
+        f"edge_score changed after learning crash: "
+        f"{baseline_edge_score!r} → {crashed.get('edge_score')!r}; "
+        "edge scoring must be unaffected by learning engine exceptions")
+
+
+def test_v1_p6_006_status_200_when_learning_analytics_corrupt():
+    """V1-P6-006 — GET /status must return HTTP 200 even when LEARNING_ANALYTICS
+    is corrupted (None).
+
+    _learning_engine_view() is called inside the /status route; it guards its
+    own LEARNING_ANALYTICS read.  If it or any other learning path raises, the
+    response must still be a valid 200 (not a 500).
+    """
+    with app.LEARNING_LOCK:
+        saved = dict(app.LEARNING_ANALYTICS)
+        app.LEARNING_ANALYTICS = None  # type: ignore[assignment]
+    try:
+        client = app.app.test_client()
+        resp = client.get("/status")
+        assert resp.status_code == 200, (
+            f"/status returned HTTP {resp.status_code} when LEARNING_ANALYTICS is None; "
+            "expected 200 — the learning engine crash must not kill the status endpoint")
+    finally:
+        with app.LEARNING_LOCK:
+            app.LEARNING_ANALYTICS = saved  # type: ignore[assignment]
+
+
+def test_v1_p6_006_status_200_when_recompute_patched_to_raise():
+    """V1-P6-006 — GET /status must return HTTP 200 even when _recompute_learning
+    is patched to always raise RuntimeError.
+
+    Confirms that the recompute being broken does not affect the /status response.
+    """
+    with unittest.mock.patch.object(
+        app, "_recompute_learning",
+        side_effect=RuntimeError("DB unavailable — V1-P6-006 injection"),
+    ):
+        client = app.app.test_client()
+        resp = client.get("/status")
+    assert resp.status_code == 200, (
+        f"/status returned HTTP {resp.status_code} when _recompute_learning raises; "
+        "expected 200")
 
 
 # ===========================================================================

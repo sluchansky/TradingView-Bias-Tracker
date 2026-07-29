@@ -12993,15 +12993,24 @@ def _load_last_report():
 
 def _learning_engine_view():
     """Snapshot of the cached analytics for /status + the dashboard (never per-request
-    SQL). Returns a disabled stub when learning is off."""
+    SQL). Returns a disabled stub when learning is off or when the learning engine has
+    crashed (FAIL-OPEN — a learning exception must never cascade to a 500 on /status)."""
     if not LEARNING_DB_ENABLED:
         return {"enabled": False, "ready": False, "total_trades": 0,
                 "reason": "No database configured."}
-    with LEARNING_LOCK:
-        out = dict(LEARNING_ANALYTICS)
-    with LEARNING_REPORT_LOCK:
-        out["report"] = dict(LAST_PERFORMANCE_REPORT) if LAST_PERFORMANCE_REPORT else None
-    return out
+    try:
+        with LEARNING_LOCK:
+            la = LEARNING_ANALYTICS
+            out = dict(la) if isinstance(la, dict) else {"enabled": True, "ready": False,
+                                                          "total_trades": 0,
+                                                          "reason": "learning engine unavailable"}
+        with LEARNING_REPORT_LOCK:
+            out["report"] = dict(LAST_PERFORMANCE_REPORT) if LAST_PERFORMANCE_REPORT else None
+        return out
+    except Exception as _lev_exc:
+        logger.warning("_learning_engine_view fail-open: %s", _lev_exc)
+        return {"enabled": True, "ready": False, "total_trades": 0,
+                "reason": "learning engine unavailable"}
 
 
 # ── Recent trades cache — feeds Performance (7-day) panel in the home UI ──────
