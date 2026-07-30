@@ -1711,6 +1711,85 @@ def test_v1_p6_007b_gateway_survives_lre_check_exception():
 
 
 # ===========================================================================
+# ADDITIVE — thesis_last_resolved_at interface contract
+# (3ccc56f added this field to build_coach_interface; these tests confirm
+#  the V1 contract across the field's presence, type, default, serialization,
+#  and read-only behaviour.)
+# ===========================================================================
+
+def test_coach_thesis_last_resolved_at_present_in_coach_dict():
+    """thesis_last_resolved_at must appear in every build_coach_interface() return."""
+    cch = app.build_coach_interface(app.full_analysis())
+    assert "thesis_last_resolved_at" in cch, (
+        "build_coach_interface must include thesis_last_resolved_at; "
+        "field was added in the 3ccc56f merge and is part of the V1 contract"
+    )
+
+
+def test_coach_thesis_last_resolved_at_type_is_str_or_none():
+    """thesis_last_resolved_at must be a str (ISO-8601) or None — never another type."""
+    cch = app.build_coach_interface(app.full_analysis())
+    val = cch.get("thesis_last_resolved_at")
+    assert val is None or isinstance(val, str), (
+        f"thesis_last_resolved_at must be str or None; got {type(val)}: {val!r}"
+    )
+
+
+def test_coach_thesis_last_resolved_at_none_in_ordinary_analysis():
+    """thesis_last_resolved_at must be None in an ordinary full_analysis() call.
+
+    _THESIS_LAST_RESOLVED_AT starts None (proven by test_thesis_last_resolved_at_is_none_at_module_load).
+    In the normal test-env flow — no trade-close resolution has fired — the field
+    must remain None.
+    """
+    saved = app._THESIS_LAST_RESOLVED_AT
+    try:
+        app._THESIS_LAST_RESOLVED_AT = None
+        cch = app.build_coach_interface(app.full_analysis())
+        assert cch.get("thesis_last_resolved_at") is None, (
+            "thesis_last_resolved_at must be None when _THESIS_LAST_RESOLVED_AT is None"
+        )
+    finally:
+        app._THESIS_LAST_RESOLVED_AT = saved
+
+
+def test_coach_thesis_last_resolved_at_is_iso8601_when_set():
+    """thesis_last_resolved_at must be a valid ISO-8601 string when the timestamp is set."""
+    from datetime import datetime
+    saved = app._THESIS_LAST_RESOLVED_AT
+    test_dt = datetime(2026, 7, 30, 14, 30, 0)
+    try:
+        app._THESIS_LAST_RESOLVED_AT = test_dt
+        cch = app.build_coach_interface(app.full_analysis())
+        val = cch.get("thesis_last_resolved_at")
+        assert isinstance(val, str), f"must be str when timestamp is set; got {type(val)}"
+        # Verify it round-trips through datetime.fromisoformat without error.
+        parsed = datetime.fromisoformat(val)
+        assert parsed == test_dt, (
+            f"thesis_last_resolved_at {val!r} must round-trip to {test_dt!r}"
+        )
+    finally:
+        app._THESIS_LAST_RESOLVED_AT = saved
+
+
+def test_coach_thesis_last_resolved_at_does_not_mutate_canonical_timestamp():
+    """Reading thesis_last_resolved_at via build_coach_interface must not alter
+    _THESIS_LAST_RESOLVED_AT.  Coach reads are guaranteed read-only."""
+    from datetime import datetime
+    saved = app._THESIS_LAST_RESOLVED_AT
+    test_dt = datetime(2026, 7, 30, 14, 30, 0)
+    try:
+        app._THESIS_LAST_RESOLVED_AT = test_dt
+        app.build_coach_interface(app.full_analysis())
+        assert app._THESIS_LAST_RESOLVED_AT == test_dt, (
+            "_THESIS_LAST_RESOLVED_AT must be unchanged after build_coach_interface() "
+            "read — Coach reads must never write"
+        )
+    finally:
+        app._THESIS_LAST_RESOLVED_AT = saved
+
+
+# ===========================================================================
 # Runner
 # ===========================================================================
 
