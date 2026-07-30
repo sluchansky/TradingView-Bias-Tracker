@@ -1,0 +1,194 @@
+Perform Phase 7D.2 as an evidence-only closure pass.
+
+Do not modify production code unless this validation reveals an actual defect.
+
+Starting point:
+
+* Branch: polish-v1
+* Expected HEAD: 4f254cd
+* Confirm both d4c1caf and 4f254cd are present in branch history.
+
+The current implementation and regression suites are green. This pass exists only to close two remaining proof gaps:
+
+1. Authenticated panel-render evidence
+2. Measured runtime polling evidence
+
+A. AUTHENTICATED VISUAL PROOF
+
+Use an authenticated browser session through the same proxy and login flow used by the published operator application.
+
+Do not bypass authentication by weakening or removing auth checks.
+
+Validate these routes:
+
+* /main-brain
+* /main-brain/analysis
+* /main-brain/scanner
+* /main-brain/trades
+* /main-brain/journal
+* /main-brain/coach
+* /main-brain/alerts
+
+For each route, wait until the initial loading state has resolved.
+
+Capture one screenshot that visibly proves:
+
+* The final URL
+* The correct highlighted sidebar item
+* The expected panel headings
+* Loaded content or a legitimate panel-specific empty state
+* No permanent “Connecting” screen
+* No “AUTH REQUIRED” state
+* No blank page
+
+Expected panel contracts:
+
+* /main-brain
+    Full overview grid
+* /main-brain/analysis
+    ThesisPanel + VerdictPanel
+* /main-brain/scanner
+    ScannerPanel + TradePlanPanel
+* /main-brain/trades
+    TradePlanPanel + ActiveTradesPanel + ExecutionPanel
+* /main-brain/journal
+    JournalPanel
+* /main-brain/coach
+    CoachPanel
+* /main-brain/alerts
+    TimelinePanel + AlertsPanel + SystemHealthPanel
+
+If automated browser tooling cannot retain localStorage authentication, use one of these safe approaches:
+
+1. Complete the normal login flow within the browser session before capturing screenshots.
+2. Use an existing authenticated production browser session.
+3. Add authentication state through supported browser-test setup using a valid test credential or session token already intended for testing.
+
+Do not hard-code credentials or commit tokens, passwords, cookies, or localStorage values.
+
+If none of these are possible, report authenticated screenshot proof as outstanding. Do not describe the phase as fully closed.
+
+B. MEASURED POLLING VALIDATION
+
+Measure requests rather than relying only on source inspection.
+
+Observe GET /api/main-brain over a fixed period of at least 30 seconds on each of these routes:
+
+* /main-brain
+* /main-brain/analysis
+* /main-brain/coach
+* /main-brain/alerts
+
+For each route, record:
+
+* Observation duration
+* Number of GET /api/main-brain requests
+* Approximate timestamps or intervals
+* Whether any requests overlapped
+* Whether any request occurred substantially faster than the configured 7-second interval
+
+Then perform this navigation sequence in one browser session:
+
+1. Open /main-brain and observe for at least 15 seconds.
+2. Navigate to /main-brain/analysis and observe for at least 15 seconds.
+3. Navigate to /main-brain/coach and observe for at least 15 seconds.
+4. Navigate to /main-brain/alerts and observe for at least 15 seconds.
+5. Return to /main-brain and observe for at least 30 seconds.
+
+Report the request timestamps after returning to /main-brain.
+
+Pass criteria:
+
+* Only one polling stream is active.
+* No burst of duplicate requests appears after navigation.
+* Requests remain approximately 7 seconds apart.
+* The inFlight guard prevents overlapping requests.
+* Returning to a previously viewed route does not increase the request frequency.
+
+Acceptable evidence:
+
+* Browser Network log
+* Playwright request-event capture
+* Deterministic test instrumentation around fetch and setInterval
+* Server access logs correlated to one unique browser session
+
+Source-code inspection may be included as supporting evidence, but it is not a substitute for measured counts.
+
+Do not assert that Wouter unmounts MainBrain during section changes unless lifecycle instrumentation proves it. The important contract is one active timer and one polling stream, regardless of whether the component remounts or remains mounted.
+
+C. AUTH AND ERROR TRANSITION CHECK
+
+In a separate unauthenticated browser session, confirm:
+
+* Initial loading state resolves.
+* A 401 transitions to the intended AUTH REQUIRED state.
+* The page does not remain permanently on Connecting.
+* Polling does not hammer the endpoint repeatedly after an authentication failure.
+* No uncaught React or console error occurs.
+
+Record the approximate time between initial page load and the final auth-failure state.
+
+D. REFRESH AND HISTORY PROOF
+
+Using the authenticated session:
+
+* Directly load /main-brain/coach and refresh.
+* Confirm Coach remains selected and CoachPanel renders.
+* Navigate Coach → Alerts → Analysis.
+* Use browser Back twice and Forward twice.
+* Confirm URL, highlighted navigation item, and panel content remain synchronized.
+
+Also test:
+
+* /main-brain/not-a-real-section
+
+Confirm it redirects with replace behavior to /main-brain and does not create an extra invalid history entry.
+
+E. REGRESSION SAFETY CHECK
+
+Because this should be evidence-only, do not rerun every historical suite unless production code changes.
+
+At minimum run:
+
+* Phase 7D navigation tests
+* TypeScript typecheck
+* Production build
+* git diff –check
+
+If any production file changes, rerun the complete Phase 7B through Phase 7D suite before committing.
+
+F. FINAL CLASSIFICATION
+
+Use one of these exact closure classifications:
+
+FULLY CLOSED
+
+Only when:
+
+* All seven authenticated screenshots show resolved panel content or legitimate empty states.
+* Measured polling evidence proves one non-accumulating polling stream.
+* Auth-failure transition is verified.
+* Refresh, Back, Forward, and unknown-route behavior pass.
+
+CONDITIONALLY CLOSED
+
+Use when implementation and automated tests pass, but authenticated visual proof or runtime polling measurement remains unavailable due to an explicitly documented environment limitation.
+
+NOT CLOSED
+
+Use when a route, panel, authentication transition, history behavior, or polling contract fails.
+
+Final report must include:
+
+* Starting and final HEAD
+* Whether any files changed
+* Seven authenticated screenshot results
+* Polling observation table with measured counts
+* Navigation-sequence polling evidence
+* Auth-failure timing and behavior
+* Refresh and browser-history results
+* Unknown-route redirect result
+* Console-error status
+* Typecheck, build, and test results
+* Final closure classification
+* Confirmation that Databento, strategy calculations, Edge Score, learning logic, TradersPost, execution, active-trade management, API contracts, and polling intervals were untouched

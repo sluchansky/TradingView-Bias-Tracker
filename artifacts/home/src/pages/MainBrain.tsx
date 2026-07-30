@@ -128,9 +128,17 @@ function useMainBrain(ticker: string): MainBrainState & { refresh: () => void } 
   });
   const inFlight = useRef(false);
   const lastPayload = useRef<Record<string, unknown> | null>(null);
+  // After a 401/403, auto-polling stops until the operator manually refreshes.
+  // Without this guard the poll would reset fetchState to 'loading' every 7 s,
+  // causing the page to oscillate between "Connecting" and "AUTH REQUIRED"
+  // instead of settling on the auth-failure screen.
+  const authFailedRef = useRef(false);
 
   const fetchNow = useCallback(async (reason: 'poll' | 'manual') => {
     if (inFlight.current) return;
+    // Auto-polls do not retry after an auth failure — only an explicit manual
+    // refresh (e.g. clicking the Refresh button) is allowed to retry.
+    if (authFailedRef.current && reason !== 'manual') return;
     inFlight.current = true;
     setState(s => ({
       ...s,
@@ -142,6 +150,7 @@ function useMainBrain(ticker: string): MainBrainState & { refresh: () => void } 
       const url = `/api/main-brain${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`;
       const r = await fetch(url, { credentials: 'include', headers: getAuthHeader() });
       if (r.status === 401 || r.status === 403) {
+        authFailedRef.current = true;
         setState(s => ({ ...s, fetchState: 'auth_fail', isAuthFail: true, error: 'Authentication required' }));
         inFlight.current = false; return;
       }
@@ -160,6 +169,7 @@ function useMainBrain(ticker: string): MainBrainState & { refresh: () => void } 
       }
       const normalized = normalizeMainBrainPayload(data);
       lastPayload.current = normalized;
+      authFailedRef.current = false; // clear on successful auth
       setState({ payload: normalized, fetchState: 'loaded', lastOk: Date.now(), error: null, isAuthFail: false });
     } catch (e) {
       setState(s => ({
