@@ -1,0 +1,989 @@
+# V1 PHASE 6 — CONTROLLED IMPLEMENTATION
+# JOURNAL AND COACH SEPARATION
+# TEST-ONLY
+# DO NOT MODIFY PRODUCTION CODE
+# DO NOT DEPLOY
+# DO NOT PUBLISH
+
+Accepted Phase 6 execution brief:
+
+19b5f26 — V1-P6 pre-implementation execution brief
+
+Accepted Phase 5 endpoint:
+
+91dc5cb — V1-P5 final compatibility audit
+
+Phase 6 title:
+
+Journal and Coach Separation
+
+Phase 6 task IDs:
+
+- V1-P6-001
+- V1-P6-002
+- V1-P6-003
+- V1-P6-004
+- V1-P6-005
+- V1-P6-006
+- V1-P6-007
+
+This phase is expected to be test and validation work only.
+
+Production code is not authorized to change.
+
+=========================================================
+DOCUMENT PRECEDENCE
+=========================================================
+
+Read completely before making any changes:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PHASE_6_EXECUTION_BRIEF.md
+4. PRODUCT_SPEC_V1.md
+5. PLATFORM_BLUEPRINT.md
+6. V1_PHASE_5_VALIDATION.md
+7. V1_PHASE_4_VALIDATION.md
+8. V1_PHASE_3_VALIDATION.md
+9. V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md
+
+Use this precedence:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PHASE_6_EXECUTION_BRIEF.md
+4. PRODUCT_SPEC_V1.md
+5. PLATFORM_BLUEPRINT.md
+6. Validation documents
+
+If these documents conflict about:
+
+- Journal ownership
+- Coach ownership
+- trade-close persistence
+- learning semantics
+- fault isolation
+- Discord journal behavior
+- task completion criteria
+
+STOP and report the conflict.
+
+Do not invent a compromise.
+
+=========================================================
+STAGE 0 — BASELINE FREEZE
+=========================================================
+
+Record:
+
+- current branch
+- current HEAD
+- git status
+- tracked modifications
+- untracked files
+- git diff --stat
+- git diff --check
+- whether 19b5f26 is an ancestor of HEAD
+- every commit after 19b5f26
+- classification of each intervening commit
+
+Classify intervening commits as:
+
+- production implementation
+- test-only
+- documentation-only
+- attached asset
+- platform checkpoint
+- memory-only
+- unexplained
+
+For every production implementation commit:
+
+- inspect the full diff
+- identify changed files and functions
+- identify roadmap ownership
+- determine Phase 6 overlap
+- determine whether it alters the accepted baseline
+
+Stop on unexplained production changes.
+
+Do not:
+
+- reset
+- rebase
+- squash
+- amend
+- stash
+- discard
+- overwrite unrelated work
+
+=========================================================
+STAGE 1 — BASELINE VALIDATION
+=========================================================
+
+Run before writing Phase 6 tests:
+
+python3 artifacts/tradingview-webhook/test_phase5_execution_safety.py
+
+python3 artifacts/tradingview-webhook/test_phase4_operator_explanation.py
+
+python3 artifacts/tradingview-webhook/test_phase3_thesis_verdict_pipeline.py
+
+python3 artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+python3 artifacts/tradingview-webhook/test_phase2_market_data_reliability.py
+
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Also run:
+
+- Phase 2 smoke from /tmp
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- Python syntax validation
+- git diff --check
+
+Expected minimum:
+
+- Phase 5: 109 passing
+- Phase 4: 57 passing
+- Interface: 85 passing or legitimate higher total
+- Phase 3: 60 passing
+- Phase 2: 45 passing
+- Phase 2 smoke: 8/8 from both directories
+- all four primary regressions passing
+
+If an accepted baseline test fails unexpectedly:
+
+STOP.
+
+Do not alter production code or weaken tests to restore green status.
+
+=========================================================
+STAGE 2 — CONFIRM THE FINAL PHASE 6 TASK TABLE
+=========================================================
+
+Before writing tests, create a final task table for all seven tasks.
+
+For every task include:
+
+- task ID
+- exact roadmap requirement
+- canonical owner
+- production function
+- current implementation
+- persistence behavior
+- current interface exposure
+- test gap
+- proposed runtime test
+- state-isolation requirements
+- cleanup requirements
+- completion evidence
+- stop condition
+- pre-implementation status
+
+Confirm these resolved research findings using repository and runtime evidence.
+
+---------------------------------------------------------
+RQ-1 — CLOSED TRADE PERSISTENCE
+---------------------------------------------------------
+
+The roadmap language may describe the closed trade as remaining in `open_trades`,
+but production behavior is:
+
+1. The matching `open_trades` row is deleted at close.
+2. The completed record is written to `strategy_trades`.
+3. `closed_at` and `r_multiple` belong to the completed trade record in
+   `strategy_trades`.
+
+Do not change production to preserve a closed row in `open_trades`.
+
+V1-P6-002 must prove both:
+
+- the corresponding open row is absent after close
+- the strategy_trades row contains the completed result fields
+
+If runtime evidence contradicts this model:
+
+STOP and report.
+
+---------------------------------------------------------
+RQ-2 — UNIFIED LEARNING BLOCK
+---------------------------------------------------------
+
+The roadmap phrase “unified_learning block” maps to the existing Coach interface
+block:
+
+result["coach"]
+
+Do not add a new top-level `unified_learning` key.
+
+Test the existing Coach interface fields and semantics.
+
+---------------------------------------------------------
+RQ-3 — JOURNAL DISCORD GATE
+---------------------------------------------------------
+
+The actual journal notification boundary uses:
+
+DISCORD_JOURNAL_WEBHOOK_URL
+
+Do not add a new DISCORD_LIVE_ENABLED condition merely to match wording in the
+roadmap.
+
+Tests must prove:
+
+- absent or blank journal webhook URL causes no HTTP call
+- a mocked configured URL can exercise the send path without network access
+- failures do not affect Journal persistence or Coach availability
+
+No real Discord request may occur.
+
+=========================================================
+STAGE 3 — IMPLEMENTATION CONTRACT
+=========================================================
+
+Authorized deliverables:
+
+1. New tracked runtime test file:
+
+artifacts/tradingview-webhook/test_phase6_journal_coach.py
+
+2. New validation document:
+
+V1_PHASE_6_VALIDATION.md
+
+Optional existing test modification:
+
+artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+This existing test file may be modified only to add direct, non-weakening
+coverage for the already-existing additive Coach field:
+
+thesis_last_resolved_at
+
+Do not modify existing assertions merely to accommodate Phase 6.
+
+Production files are not authorized to change.
+
+Specifically prohibited:
+
+- app.py
+- left_brain_market_intelligence.py
+- database schema or migrations
+- dashboard HTML/CSS/JavaScript
+- existing golden files
+- broker code
+- gateway code
+- Databento code
+- learning algorithms
+- strategy logic
+- risk or sizing logic
+
+If a required behavior is genuinely missing:
+
+STOP and report the exact gap.
+
+Do not implement the missing production behavior in this batch.
+
+=========================================================
+TEST DATABASE ISOLATION CONTRACT
+=========================================================
+
+Any test that touches:
+
+- open_trades
+- strategy_trades
+- learning-related tables
+- managed trade records
+
+must use isolated test identifiers.
+
+Required strategy:
+
+- create a unique prefix using uuid4
+- include the unique prefix in managed_key, setup identifier, or another
+  canonical test-scoped field
+- capture every inserted primary key or lookup key
+- clean up in finally
+- verify cleanup completed
+- do not rely on test execution order
+- do not delete non-test records
+- do not truncate tables
+- do not alter sequences
+- do not alter schema
+- do not use production trade identifiers
+
+Before each DB test:
+
+- identify the active database connection owner
+- confirm the test database boundary
+- confirm whether transaction rollback is available
+- prefer rollback when practical
+- otherwise use narrow DELETE statements scoped to the unique test key
+
+After each DB test:
+
+- verify no test-key rows remain
+- restore patched functions
+- restore environment values
+- close temporary connections where applicable
+
+If safe test isolation cannot be proven:
+
+STOP.
+
+=========================================================
+PHASE 6 TASK REQUIREMENTS
+=========================================================
+
+Implement direct runtime tests for all seven tasks.
+
+=========================================================
+V1-P6-001 — JOURNAL INSERT
+=========================================================
+
+Validate the canonical closed-trade or strategy-trade insert behavior.
+
+At minimum prove:
+
+- a realistic completed trade reaches the canonical Journal persistence path
+- one expected strategy_trades row is inserted
+- instrument is correct
+- direction is correct
+- strategy or setup key is correct
+- opened timestamp is preserved where applicable
+- closed_at is populated
+- result or outcome field is correct
+- r_multiple is numeric and correctly persisted
+- duplicate invocation does not create an unintended duplicate record unless
+  production explicitly permits it
+- inserted test data is fully cleaned up
+
+Use the real production persistence owner.
+
+Do not recreate SQL in the test as a substitute for exercising production code.
+
+=========================================================
+V1-P6-002 — OPEN-TO-CLOSED TRADE TRANSITION
+=========================================================
+
+Validate the real transition model.
+
+Part A — open_trades:
+
+- create an isolated open trade through the canonical path or the narrowest
+  valid setup supported by production
+- invoke the real close/completion path
+- prove the matching open_trades row no longer exists
+
+Part B — strategy_trades:
+
+- prove exactly one completed record exists
+- prove closed_at is populated
+- prove r_multiple is populated
+- prove relevant trade identity fields match the open record
+- prove the completed record is serializable or interface-readable where
+  applicable
+
+Do not assert that a closed row remains in open_trades.
+
+Document the roadmap-versus-production wording difference in the validation
+report.
+
+=========================================================
+V1-P6-003 — JOURNAL WRITE FAILURE ISOLATION
+=========================================================
+
+Fault-inject a Journal persistence failure at the narrowest write boundary.
+
+Prove:
+
+- the caller remains available
+- the failure does not crash full_analysis or the relevant status path
+- Coach output remains available
+- the decision result remains available
+- execution state is not altered
+- no broker communication occurs
+- no duplicate partial record remains
+- the exception is surfaced or logged according to existing behavior
+- the test restores the original persistence function
+
+Do not broaden this into a Journal refactor.
+
+=========================================================
+V1-P6-004 — JOURNAL AND COACH SEPARATION
+=========================================================
+
+Prove the architecture boundary:
+
+- Journal owns historical trade recording
+- Coach reads learning or event evidence
+- Coach interface construction does not write Journal rows
+- Journal persistence does not mutate Coach fields directly
+- repeated Coach reads do not create database writes
+- repeated Journal reads do not trigger learning updates
+- Coach failures do not erase or mutate Journal data
+- Journal failures do not fabricate Coach events
+
+Include before/after database or mocked write-call counts.
+
+=========================================================
+V1-P6-005 — COACH / UNIFIED LEARNING BLOCK
+=========================================================
+
+Validate the existing:
+
+result["coach"]
+
+block.
+
+At minimum prove the presence and semantics of:
+
+- _version
+- weight_updated
+- thesis_resolved
+- learning_influence
+- rule_engine_eligibility
+- thesis_last_resolved_at, if present in the current accepted baseline
+
+Semantic requirements:
+
+- weight_updated means a real persisted update occurred
+- thesis_resolved means a real thesis-resolution event occurred
+- learning_influence represents actual influence, not mere readiness
+- rule_engine_eligibility represents eligibility only
+- thesis_last_resolved_at is None when no resolution event exists
+- thesis_last_resolved_at is populated only from the canonical resolution owner
+
+Do not map database availability to an event.
+
+Do not equate eligibility with an update.
+
+Do not add a new unified_learning top-level key.
+
+=========================================================
+V1-P6-006 — COACH FAILURE ISOLATION
+=========================================================
+
+Fault-inject:
+
+build_coach_interface
+
+at the actual call site used by:
+
+full_analysis()
+
+Prove:
+
+- full_analysis remains available
+- the primary decision result remains available
+- verdict is unchanged
+- confidence and edge score are unchanged
+- Journal data is unchanged
+- no broker communication occurs
+- no learning write is triggered
+- fallback Coach output is deterministic and serializable
+- repeated calls remain stable
+- original function is restored
+
+Patch the exact symbol resolved by full_analysis.
+
+Do not patch an unused imported alias.
+
+=========================================================
+V1-P6-007 — JOURNAL DISCORD ISOLATION
+=========================================================
+
+Validate journal notification behavior without external network access.
+
+Prove:
+
+1. When DISCORD_JOURNAL_WEBHOOK_URL is absent or blank:
+   - no requests.post call occurs
+   - no exception escapes
+   - Journal persistence remains unaffected
+
+2. When a test URL is configured and requests.post is mocked:
+   - exactly one expected call occurs
+   - payload is serializable
+   - no production credential is used
+   - response failure is contained according to existing behavior
+
+3. When mocked requests.post raises:
+   - Journal persistence result remains intact
+   - Coach remains available
+   - caller does not crash unexpectedly
+   - no retry storm occurs
+
+Always restore:
+
+- environment value
+- module-level cached configuration, if any
+- requests.post
+
+Do not add or test a real webhook.
+
+=========================================================
+COACH SEMANTIC PROTECTION
+=========================================================
+
+Preserve the accepted semantic corrections from commit 64f6d35.
+
+Tests must explicitly reject these incorrect mappings:
+
+- weight_updated = database readiness
+- weight_updated = minimum sample eligibility
+- thesis_resolved = database availability
+- thesis_resolved = any non-null thesis
+- learning_influence = feature enabled
+- rule_engine_eligibility = update actually occurred
+
+Validate mutation protection:
+
+- returned Coach dictionaries are safe copies
+- caller mutation does not alter canonical state
+- repeated calls produce stable values
+- timestamp values are serializable
+
+=========================================================
+THESIS_LAST_RESOLVED_AT COVERAGE
+=========================================================
+
+The intervening commit 3ccc56f already added:
+
+thesis_last_resolved_at
+
+to the Coach interface and dashboard.
+
+Phase 6 may verify it but must not reimplement it.
+
+Test:
+
+- field exists if part of the accepted interface
+- initial value is None when no resolution exists
+- populated value originates from _THESIS_LAST_RESOLVED_AT
+- returned value is serializable
+- reading the field has no side effects
+- reading the Coach interface does not mutate the canonical timestamp
+- no version bump is required because the field is additive
+
+If modifying test_v1_interface_versions.py:
+
+- add new assertions only
+- do not remove or weaken existing assertions
+- document the exact added lines
+- preserve the total strength of the existing suite
+
+=========================================================
+TEST FILE REQUIREMENTS
+=========================================================
+
+Create:
+
+artifacts/tradingview-webhook/test_phase6_journal_coach.py
+
+Use task-prefixed test names:
+
+- test_p6_001_*
+- test_p6_002_*
+- test_p6_003_*
+- test_p6_004_*
+- test_p6_005_*
+- test_p6_006_*
+- test_p6_007_*
+
+One test per task is only the minimum.
+
+Add enough runtime assertions to cover:
+
+- normal paths
+- degraded paths
+- exception paths
+- repeated calls
+- serialization
+- database cleanup
+- mutation isolation
+- no broker calls
+- no unexpected learning writes
+
+Tests must run:
+
+- individually
+- in arbitrary order
+- repeatedly
+- from a clean clone
+- without production credentials
+- without live Databento
+- without a broker
+- without Discord access
+
+=========================================================
+PRIMARY EVIDENCE RULE
+=========================================================
+
+Primary evidence must be runtime behavior.
+
+Do not rely primarily on:
+
+- grep
+- inspect.getsource()
+- AST parsing
+- string presence
+- function-name presence
+- SQL-text presence
+
+Static checks may supplement runtime tests.
+
+Meaningful assertions include:
+
+- database row state
+- write-call counts
+- returned interface values
+- timestamps
+- exception containment
+- HTTP/network call counts
+- before/after state comparison
+- serialization
+- cleanup verification
+
+=========================================================
+NO-SIDE-EFFECT ASSERTIONS
+=========================================================
+
+Phase 6 tests must prove no unexpected changes to:
+
+- verdict
+- direction
+- confidence
+- edge score
+- edge grade
+- actionability
+- strategy selection
+- strategy weights
+- learning weights
+- readiness thresholds
+- risk
+- sizing
+- stops
+- targets
+- active-trade management
+- gateway status
+- gateway outcome
+- broker payloads
+- AUTO_TRADE
+- AUTO_FIRED_KEYS
+- Databento state
+- authentication
+- dashboard behavior
+- database schema
+
+Capture before/after values where practical.
+
+=========================================================
+TARGETED IMPLEMENTATION ORDER
+=========================================================
+
+Implement in this order:
+
+1. Database isolation scaffold
+2. V1-P6-001
+3. V1-P6-002 and V1-P6-003
+4. V1-P6-004 and V1-P6-005
+5. V1-P6-006 and V1-P6-007
+6. Optional additive interface test for thesis_last_resolved_at
+7. Full regression
+8. Validation document
+9. Commit
+
+After each group:
+
+- run the targeted tests
+- verify database cleanup
+- verify patched functions were restored
+- verify no network calls occurred
+- inspect all failures before proceeding
+
+=========================================================
+FULL REGRESSION CONTRACT
+=========================================================
+
+Before completion run:
+
+python3 artifacts/tradingview-webhook/test_phase6_journal_coach.py
+
+python3 artifacts/tradingview-webhook/test_phase5_execution_safety.py
+
+python3 artifacts/tradingview-webhook/test_phase4_operator_explanation.py
+
+python3 artifacts/tradingview-webhook/test_phase3_thesis_verdict_pipeline.py
+
+python3 artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+python3 artifacts/tradingview-webhook/test_phase2_market_data_reliability.py
+
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Also run Phase 2 smoke from /tmp.
+
+Run:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- directly affected Journal tests
+- directly affected Coach tests
+- directly affected database tests
+- Python syntax validation
+- git diff --check
+
+Record:
+
+- exact command
+- exit code
+- pass count
+- failure count
+- skip count
+- warnings
+- duration where available
+
+Required:
+
+- no unexplained failures
+- no changed golden output
+- no database residue
+- no network calls
+- no broker calls
+- no state leakage
+
+=========================================================
+VALIDATION DOCUMENT
+=========================================================
+
+Create:
+
+V1_PHASE_6_VALIDATION.md
+
+Required sections:
+
+1. Baseline State
+
+2. Intervening Commit Audit
+
+3. Phase 6 Scope
+
+4. Final Task Inventory
+
+5. Research Resolution
+
+Include the three resolved research questions.
+
+6. Database Isolation Contract
+
+7. Task-by-Task Results
+
+8. Journal Persistence Matrix
+
+Document:
+
+- insert
+- close transition
+- open row removal
+- completed row creation
+- closed_at
+- r_multiple
+- duplicate behavior
+- cleanup
+
+9. Journal Failure Isolation
+
+10. Coach Semantic Matrix
+
+Document:
+
+- weight_updated
+- thesis_resolved
+- thesis_last_resolved_at
+- learning_influence
+- rule_engine_eligibility
+
+11. Journal/Coach Separation Evidence
+
+12. Coach Failure Isolation
+
+13. Discord Journal Isolation
+
+14. Canonical Interface Compatibility
+
+15. Behavioral Comparison
+
+16. Database Cleanup Evidence
+
+17. Test Evidence
+
+18. File Inventory
+
+19. Deployment Status
+
+20. Honest Final Task Status
+
+For each task state:
+
+- COMPLETE
+- PARTIAL
+- BLOCKED
+- NOT STARTED
+
+Do not mark a task complete solely from source inspection.
+
+=========================================================
+DIFF CONTROL
+=========================================================
+
+Before committing:
+
+git status
+git diff --stat
+git diff --check
+git diff
+
+Expected changed files only:
+
+- artifacts/tradingview-webhook/test_phase6_journal_coach.py
+- V1_PHASE_6_VALIDATION.md
+- optionally artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+No production file is authorized.
+
+For every changed file document:
+
+- task authorizing it
+- exact reason
+- assertion strength
+- runtime effect
+- whether existing behavior changed
+
+Do not commit:
+
+- attached instruction files
+- `.local` state
+- temporary databases
+- logs
+- caches
+- secrets
+- unrelated agent output
+
+=========================================================
+STOP CONDITIONS
+=========================================================
+
+Stop immediately if:
+
+- baseline validation fails
+- HEAD changes unexpectedly
+- a production file appears in the diff
+- safe database isolation cannot be proven
+- test rows cannot be cleaned up reliably
+- close behavior differs from the resolved transition model
+- Coach semantics differ from the accepted corrections
+- Coach construction writes learning or Journal state
+- Journal persistence directly mutates Coach state
+- a test requires live Discord
+- a test requires a broker
+- a test requires production credentials
+- a primary regression changes
+- database schema changes are required
+- a required artifact remains ignored or untracked
+- secrets appear in output
+
+Do not silently work around a stop condition.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If all seven tasks are complete and all regressions pass, create one commit:
+
+V1-P6 Journal and Coach Separation
+
+Do not amend earlier commits.
+
+Do not squash.
+
+Do not force-push.
+
+Do not deploy.
+
+If a genuine production gap is discovered:
+
+- do not modify production code
+- document the exact gap
+- mark the task PARTIAL or BLOCKED
+- commit only independently valid evidence if useful
+
+=========================================================
+FINAL RESPONSE FORMAT
+=========================================================
+
+Report:
+
+1. Phase 6 title
+2. Starting branch and HEAD
+3. Accepted baseline
+4. Intervening commits and classifications
+5. Ending branch and HEAD
+6. Phase 6 task IDs
+7. Tasks complete
+8. Tasks partial
+9. Tasks blocked
+10. Files created
+11. Files modified
+12. Files deleted
+13. Production runtime changes
+14. Canonical interfaces affected
+15. Tests added
+16. Phase 6 test result
+17. Phase 5 test result
+18. Phase 4 test result
+19. Phase 3 test result
+20. Interface-test result
+21. Phase 2 test result
+22. Phase 2 smoke results from both directories
+23. Four primary regression results
+24. Python syntax result
+25. git diff --check result
+26. Journal insert result
+27. Open-to-closed transition result
+28. Journal failure-isolation result
+29. Journal/Coach separation result
+30. Coach block result
+31. Coach failure-isolation result
+32. Discord Journal isolation result
+33. thesis_last_resolved_at result
+34. Database rows created during tests
+35. Database rows remaining after cleanup
+36. Network-call count
+37. Broker-call count
+38. Verdict/scoring confirmation
+39. Risk/sizing confirmation
+40. Learning-weight confirmation
+41. Gateway confirmation
+42. Databento confirmation
+43. Database-schema confirmation
+44. Authentication confirmation
+45. Validation document
+46. Commit created
+47. Honest status of V1-P6-001 through V1-P6-007
+48. Deployment confirmation
+49. Whether Phase 7 may begin
+
+Do not begin Phase 7.
+
+Do not deploy.
+
+Do not publish.
+
+Stop after reporting.
