@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import Home from "@/pages/Home";
 import MobileHome from "@/pages/MobileHome";
 import Cockpit from "@/pages/Cockpit";
+import MainBrain from "@/pages/MainBrain";
 import NotFound from "@/pages/not-found";
 
 const queryClient = new QueryClient();
@@ -30,6 +31,7 @@ function Router() {
       <Route path="/" component={isMobile ? MobileHome : Home} />
       <Route path="/mobile" component={MobileHome} />
       <Route path="/cockpit" component={Cockpit} />
+      <Route path="/main-brain" component={MainBrain} />
       <Route component={NotFound} />
     </Switch>
   );
