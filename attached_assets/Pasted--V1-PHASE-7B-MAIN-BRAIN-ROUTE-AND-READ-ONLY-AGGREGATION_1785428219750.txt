@@ -1,0 +1,922 @@
+# V1 PHASE 7B — MAIN BRAIN ROUTE AND READ-ONLY AGGREGATION
+# IMPLEMENT THE DATA LAYER ONLY
+# DO NOT BUILD OR REDESIGN THE UI
+# DO NOT DEPLOY
+# DO NOT PUBLISH
+
+Accepted Phase 7A endpoint:
+
+d31b320 — V1-P7 Main Brain routing brief
+
+Controlling implementation brief:
+
+artifacts/tradingview-webhook/PHASE_7_MAIN_BRAIN_ROUTING_BRIEF.md
+
+Phase objective:
+
+Create the canonical, authenticated, read-only Main Brain API route that will
+eventually populate the approved dashboard mockup.
+
+This phase is the backend routing layer only.
+
+Do not begin visual UI implementation.
+
+=========================================================
+PRIMARY DELIVERABLE
+=========================================================
+
+Implement a canonical endpoint such as:
+
+GET /main-brain
+
+or the exact route approved in PHASE_7_MAIN_BRAIN_ROUTING_BRIEF.md.
+
+The endpoint must aggregate existing canonical platform interfaces and data
+sources into one stable versioned payload.
+
+The route must:
+
+- remain read-only
+- avoid all trading-side mutations
+- survive optional subsystem failures
+- return explicit availability metadata
+- preserve existing subsystem ownership
+- avoid duplicating business logic
+- avoid calculating new analytics merely for display
+- avoid broker, gateway, learning, Journal, or strategy side effects
+
+=========================================================
+DOCUMENT PRECEDENCE
+=========================================================
+
+Read completely before editing:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PHASE_7_MAIN_BRAIN_ROUTING_BRIEF.md
+4. PRODUCT_SPEC_V1.md
+5. PLATFORM_BLUEPRINT.md
+6. V1_PHASE_6_VALIDATION.md
+7. V1_PHASE_5_VALIDATION.md
+8. V1_PHASE_4_VALIDATION.md
+9. V1_PHASE_3_VALIDATION.md
+10. V1_PHASE_2_MARKET_DATA_RELIABILITY_VALIDATION.md
+
+Use this precedence:
+
+1. SYSTEM_ARCHITECTURE_V1.md
+2. IMPLEMENTATION_ROADMAP_V1.md
+3. PHASE_7_MAIN_BRAIN_ROUTING_BRIEF.md
+4. PRODUCT_SPEC_V1.md
+5. PLATFORM_BLUEPRINT.md
+6. Validation documents
+
+If the documents conflict on:
+
+- route path
+- authentication
+- field ownership
+- versioning
+- timeline behavior
+- Partner ownership
+- scanner strategy universe
+- failure fallbacks
+- authorized missing-field additions
+
+STOP and report the conflict.
+
+Do not invent a compromise.
+
+=========================================================
+STAGE 0 — BASELINE FREEZE
+=========================================================
+
+Record:
+
+- branch
+- HEAD
+- git status
+- tracked changes
+- untracked files
+- git diff --stat
+- git diff --check
+- recent commit history
+- whether d31b320 is an ancestor of HEAD
+- every commit after d31b320
+- classification of each intervening commit
+
+Classify intervening commits as:
+
+- production implementation
+- test-only
+- documentation-only
+- attached asset
+- platform checkpoint
+- memory-only
+- unexplained
+
+Inspect every production commit after d31b320.
+
+Stop on unexplained code changes.
+
+Do not:
+
+- reset
+- rebase
+- amend
+- squash
+- stash
+- discard
+- overwrite unrelated work
+
+=========================================================
+STAGE 1 — BASELINE VALIDATION
+=========================================================
+
+Run all accepted baseline suites before making production changes:
+
+python3 artifacts/tradingview-webhook/test_phase6_journal_coach.py
+
+python3 artifacts/tradingview-webhook/test_phase5_execution_safety.py
+
+python3 artifacts/tradingview-webhook/test_phase4_operator_explanation.py
+
+python3 artifacts/tradingview-webhook/test_phase3_thesis_verdict_pipeline.py
+
+python3 artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+python3 artifacts/tradingview-webhook/test_phase2_market_data_reliability.py
+
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Also run:
+
+- Phase 2 smoke from /tmp
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- Python syntax validation
+- git diff --check
+
+Record exact counts and exit codes.
+
+If an accepted baseline fails unexpectedly:
+
+STOP.
+
+Do not weaken tests or modify unrelated production code.
+
+=========================================================
+AUTHORIZED IMPLEMENTATION SCOPE
+=========================================================
+
+Implement only the Phase 7B backend aggregation layer described in the brief.
+
+Expected authorized work may include:
+
+- one Main Brain payload builder
+- one authenticated GET route
+- narrowly scoped read-only adapters
+- availability/error helpers
+- safe-copy helpers
+- partial derived decision timeline
+- additive fields explicitly approved in the Phase 7 brief
+- a new Phase 7B test file
+- a Phase 7B validation document
+
+Do not assume every item is necessary.
+
+Prefer the smallest implementation that satisfies the approved schema.
+
+=========================================================
+PROHIBITED CHANGES
+=========================================================
+
+Do not change:
+
+- Databento ingestion
+- market-data calculations
+- thesis generation
+- verdict generation
+- direction
+- confidence
+- edge score
+- edge grade
+- readiness
+- strategy selection
+- strategy rankings
+- strategy scanner universe
+- learning weights
+- Coach update behavior
+- Journal write behavior
+- risk
+- sizing
+- entries
+- stops
+- targets
+- active-trade management
+- execution gateway logic
+- gateway status
+- gateway outcome
+- duplicate suppression
+- broker routing
+- broker payloads
+- authentication policy
+- database schema
+- deployment configuration
+- existing dashboard layout
+- existing dashboard JavaScript
+- existing visual styling
+
+Do not add the 16 paper-simulation research strategies to the main scanner.
+
+The canonical main-engine universe remains the five strategies documented in
+the Phase 7A brief unless a controlling document explicitly says otherwise.
+
+=========================================================
+MAIN BRAIN PAYLOAD CONTRACT
+=========================================================
+
+Implement the exact approved schema from:
+
+PHASE_7_MAIN_BRAIN_ROUTING_BRIEF.md
+
+The payload should include the documented sections, expected to resemble:
+
+{
+  "_version": "v1",
+  "generated_at": "...",
+  "market": {},
+  "market_state": {},
+  "left_brain": {},
+  "verdict": {},
+  "strategy_scanner": {},
+  "active_trades": [],
+  "manager": {},
+  "execution_gateway": {},
+  "coach": {},
+  "journal": {},
+  "performance": {},
+  "decision_timeline": [],
+  "alerts": [],
+  "availability": {},
+  "errors": []
+}
+
+Use the exact paths, types, nullability, and failure fallbacks approved in the
+brief.
+
+Do not rename approved fields casually.
+
+Do not omit a field merely because its value is currently unavailable.
+
+Use:
+
+- null
+- empty list
+- empty object
+- explicit availability=false
+- explicit error code
+
+according to the documented contract.
+
+=========================================================
+CANONICAL OWNER RULE
+=========================================================
+
+Every Main Brain field must come from its documented canonical owner.
+
+Reuse the existing interfaces where possible:
+
+- Left Brain v2
+- Expert v1
+- Manager v1
+- Execution Gateway v1
+- Journal v1
+- Coach v1
+
+The Phase 7A brief confirmed that no canonical:
+
+build_partner_interface()
+
+currently exists.
+
+Do not fabricate a Partner interface merely to satisfy the mockup.
+
+Use the approved direct sources from:
+
+- left_brain
+- market_intelligence
+- selected strategy data
+
+only as documented in the brief.
+
+If a Partner adapter is required, it must be:
+
+- read-only
+- narrowly scoped
+- explicitly named as an adapter
+- free of business logic
+- documented as temporary or additive
+- fully tested for non-mutation
+
+=========================================================
+READ-ONLY CONTRACT
+=========================================================
+
+Calling the Main Brain route must not:
+
+- generate a thesis
+- resolve a thesis
+- update a thesis timestamp
+- calculate a new verdict
+- rescore a strategy
+- select a new strategy
+- update learning weights
+- insert Journal records
+- update Journal records
+- create an active trade
+- close an active trade
+- update active-trade management
+- invoke execute_trade_gateway
+- send a broker request
+- send Discord messages
+- mutate Databento caches
+- mutate canonical interface dictionaries
+- update “last viewed” timestamps
+- write to the database
+- change AUTO_FIRED_KEYS
+- change any trading mode
+
+Prove this with before/after runtime assertions.
+
+=========================================================
+SAFE COPY AND SERIALIZATION
+=========================================================
+
+The route must return serialization-safe copies.
+
+Requirements:
+
+- no raw mutable canonical dictionaries returned by reference
+- no database connection objects
+- no locks
+- no sets
+- no enums without serialization handling
+- no NaN or Infinity
+- no unhandled datetime objects
+- no callable objects
+- no internal exception objects
+- no secrets
+- no broker credentials
+- no webhook URLs
+
+Test that caller mutation of a returned payload does not mutate canonical state.
+
+Repeated calls with unchanged source data must remain semantically stable.
+
+=========================================================
+AVAILABILITY AND FAULT ISOLATION
+=========================================================
+
+The endpoint must remain available if an optional subsystem fails.
+
+At minimum isolate:
+
+- Left Brain
+- market intelligence
+- thesis
+- verdict
+- strategy scanner
+- active trades
+- Manager
+- gateway summary
+- Journal
+- Coach
+- database-derived performance
+- alerts
+- decision timeline
+- broker-health summary
+
+A failure in one section must:
+
+- not cause the full route to return HTTP 500
+- produce the documented fallback value
+- mark that section unavailable
+- append a stable error code
+- avoid exposing exception text or secrets
+- leave healthy sections intact
+
+Use deterministic error identifiers such as:
+
+- coach_unavailable
+- journal_unavailable
+- scanner_unavailable
+- active_trade_unavailable
+- timeline_partial
+- broker_status_unavailable
+
+Use the exact codes approved in the brief where specified.
+
+=========================================================
+DECISION TIMELINE
+=========================================================
+
+Phase 7A identified 14 timeline event types:
+
+- seven currently have real underlying stores
+- seven are absent
+
+For Phase 7B, implement only the approved derived partial timeline unless the
+brief explicitly authorizes the new event deque in this batch.
+
+If implementing a derived timeline:
+
+- label derived events clearly
+- use only real timestamps
+- do not manufacture ordering when timestamps are unavailable
+- do not invent missing events
+- do not represent current state as a historical event without a derived marker
+- keep event IDs stable where possible
+- sort safely
+- handle equal timestamps deterministically
+- include availability or completeness metadata
+- expose timeline as partial when appropriate
+
+Do not add:
+
+_DECISION_EVENT_LOG_BY_INST
+
+unless PHASE_7_MAIN_BRAIN_ROUTING_BRIEF.md explicitly assigns that implementation
+to this batch.
+
+If the event log is deferred, document it honestly.
+
+=========================================================
+STRATEGY SCANNER
+=========================================================
+
+The main production strategy universe is:
+
+- OPENING_DRIVE
+- LIQUIDITY_SWEEP_REVERSAL
+- VWAP_TREND_CONTINUATION
+- RANGE_EXPANSION_BREAKOUT
+- OPENING_RANGE_BREAKOUT
+
+The additional 16 scalp research strategies are paper-simulation research only.
+
+Do not expose them as live main-engine candidates unless explicitly labeled as
+research and approved in the brief.
+
+For each returned main-engine strategy include only fields already available or
+safely derived according to the brief, such as:
+
+- strategy key
+- display name
+- direction
+- readiness
+- selected state
+- score or confidence if canonical
+- failed conditions
+- availability
+- mode compatibility
+
+Do not fabricate:
+
+- expectancy
+- win rate
+- sample count
+- ranking score
+- confidence
+- trade plan
+
+when no canonical source exists.
+
+=========================================================
+MISSING FIELDS
+=========================================================
+
+Phase 7A registered 13 missing fields.
+
+Implement only missing fields explicitly authorized as small additive changes in
+the Phase 7 execution contract.
+
+For each implemented field:
+
+- cite the authorizing section
+- identify canonical owner
+- define type
+- define null behavior
+- define malformed behavior
+- define current-state or event semantics
+- prove no money-path effect
+- add targeted tests
+
+For fields not authorized in this batch:
+
+- return the documented placeholder
+- mark availability correctly
+- add no fake value
+- record the deferred owner
+
+=========================================================
+AUTHENTICATION
+=========================================================
+
+Use the exact existing dashboard/API authentication boundary approved in the
+brief.
+
+Do not create a second authentication system.
+
+Prove:
+
+- unauthenticated external access is rejected
+- authenticated access succeeds
+- direct internal Flask exposure does not accidentally bypass the accepted
+  production boundary
+- no sensitive details are returned
+- failure responses remain safe
+
+Do not weaken any existing route protection.
+
+=========================================================
+ROUTE PERFORMANCE
+=========================================================
+
+The route must not become a heavy analysis trigger.
+
+Measure:
+
+- payload size
+- response construction time
+- repeated-call time
+- database query count where practical
+- expensive function-call count
+
+Avoid:
+
+- rerunning full analysis for every panel
+- repeated database queries for the same section
+- broker status network requests on every poll
+- Databento network requests on every poll
+- unbounded Journal history
+- unbounded alerts
+- unbounded timeline events
+
+Use bounded lists exactly as approved in the brief.
+
+=========================================================
+TEST FILE
+=========================================================
+
+Create:
+
+artifacts/tradingview-webhook/test_phase7b_main_brain_route.py
+
+Organize tests by contract area.
+
+Suggested groups:
+
+- TestP7BRouteSchema
+- TestP7BFieldProvenance
+- TestP7BReadOnlyBehavior
+- TestP7BMutationIsolation
+- TestP7BAvailability
+- TestP7BFaultIsolation
+- TestP7BTimeline
+- TestP7BStrategyScanner
+- TestP7BAuthentication
+- TestP7BSerialization
+- TestP7BPerformanceBounds
+- TestP7BRegressionProtection
+
+Use runtime evidence as the primary proof.
+
+Static source inspection may supplement but must not replace runtime tests.
+
+=========================================================
+REQUIRED TEST COVERAGE
+=========================================================
+
+At minimum prove:
+
+1. Route returns the documented HTTP success code.
+2. `_version` exists and is correct.
+3. `generated_at` is serializable.
+4. Every top-level schema key exists.
+5. Every field type matches the contract.
+6. Missing values use the approved fallback.
+7. Healthy subsystem data appears under the correct path.
+8. A failing Coach does not fail the full route.
+9. A failing Journal does not fail the full route.
+10. A failing scanner does not fail the full route.
+11. A failing database summary does not fail the full route.
+12. A failing broker-health source does not fail the full route.
+13. Errors use stable codes.
+14. Errors do not leak exception text or secrets.
+15. Availability metadata matches reality.
+16. No gateway call occurs.
+17. No broker HTTP call occurs.
+18. No Journal write occurs.
+19. No learning write occurs.
+20. No database write occurs.
+21. No thesis mutation occurs.
+22. No strategy rescoring occurs.
+23. No active-trade mutation occurs.
+24. No Databento mutation occurs.
+25. Returned dictionaries are safe copies.
+26. Caller mutation does not affect the next response.
+27. Repeated calls are stable.
+28. Payload is JSON serializable.
+29. No NaN or Infinity exists.
+30. Strategy scanner contains only approved main-engine strategies.
+31. Research strategies are excluded or clearly separated as approved.
+32. Timeline uses only real or explicitly derived timestamps.
+33. Missing timeline events are not fabricated.
+34. Timeline completeness is reported.
+35. Unauthenticated requests are rejected.
+36. Authenticated requests succeed.
+37. Payload lists are bounded.
+38. Payload size remains within the documented target.
+39. Route execution remains within the documented performance target.
+40. Existing status and dashboard routes remain unchanged.
+
+=========================================================
+OPTIONAL SUBSYSTEM FAILURE MATRIX
+=========================================================
+
+Build a matrix that independently fault-injects every optional section.
+
+For each section record:
+
+- injected failure
+- returned fallback
+- availability flag
+- error code
+- HTTP status
+- healthy sections preserved
+- mutation count
+- network-call count
+
+A single optional failure should normally still produce a successful Main Brain
+response unless the brief specifies otherwise.
+
+=========================================================
+EXPECTED PRODUCTION FILES
+=========================================================
+
+Use the exact file-impact matrix from the Phase 7A brief.
+
+Likely production changes may include narrowly scoped edits to:
+
+artifacts/tradingview-webhook/app.py
+
+Potentially:
+
+- one payload-builder function
+- one route
+- a few read-only helpers
+
+Do not edit broad unrelated regions.
+
+If another production file is required:
+
+STOP and explain why before changing it unless that file is explicitly authorized
+by the Phase 7A execution contract.
+
+=========================================================
+VALIDATION DOCUMENT
+=========================================================
+
+Create:
+
+artifacts/tradingview-webhook/V1_PHASE_7B_MAIN_BRAIN_ROUTE_VALIDATION.md
+
+Required sections:
+
+1. Baseline State
+2. Intervening Commit Audit
+3. Phase 7B Scope
+4. Files Changed
+5. Route Contract
+6. Final Payload Schema
+7. Field Provenance Confirmation
+8. Canonical Owner Matrix
+9. Missing-Field Handling
+10. Strategy Scanner Results
+11. Decision Timeline Results
+12. Availability Matrix
+13. Fault-Isolation Results
+14. Read-Only Evidence
+15. Mutation-Isolation Evidence
+16. Database Write Evidence
+17. Learning Write Evidence
+18. Journal Write Evidence
+19. Gateway and Broker Evidence
+20. Databento Evidence
+21. Authentication Evidence
+22. Serialization Evidence
+23. Performance and Payload Bounds
+24. Test Evidence
+25. Regression Evidence
+26. Deferred Items
+27. Honest Final Status
+28. Deployment Status
+
+=========================================================
+FULL REGRESSION CONTRACT
+=========================================================
+
+Run:
+
+python3 artifacts/tradingview-webhook/test_phase7b_main_brain_route.py
+
+python3 artifacts/tradingview-webhook/test_phase6_journal_coach.py
+
+python3 artifacts/tradingview-webhook/test_phase5_execution_safety.py
+
+python3 artifacts/tradingview-webhook/test_phase4_operator_explanation.py
+
+python3 artifacts/tradingview-webhook/test_phase3_thesis_verdict_pipeline.py
+
+python3 artifacts/tradingview-webhook/test_v1_interface_versions.py
+
+python3 artifacts/tradingview-webhook/test_phase2_market_data_reliability.py
+
+bash artifacts/tradingview-webhook/checks/run_phase2_smoke.sh
+
+Also run Phase 2 smoke from /tmp.
+
+Run:
+
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- existing status-route tests
+- existing dashboard-route tests
+- authentication tests
+- Python syntax validation
+- git diff --check
+
+If JavaScript or dashboard files change unexpectedly, STOP.
+
+No dashboard changes are authorized in Phase 7B.
+
+=========================================================
+DIFF CONTROL
+=========================================================
+
+Before committing:
+
+git status
+git diff --stat
+git diff --check
+git diff
+
+Expected changes should be limited to:
+
+- narrowly scoped Main Brain backend route implementation
+- test_phase7b_main_brain_route.py
+- V1_PHASE_7B_MAIN_BRAIN_ROUTE_VALIDATION.md
+
+For every changed production line document:
+
+- task authorization
+- canonical owner
+- behavior before
+- behavior after
+- side effects
+- regression risk
+
+Do not commit:
+
+- mockup images unless already intentionally tracked
+- attached prompt files
+- temporary databases
+- `.local` state
+- caches
+- logs
+- credentials
+- secrets
+- unrelated agent output
+
+=========================================================
+STOP CONDITIONS
+=========================================================
+
+Stop immediately if:
+
+- baseline tests fail
+- HEAD changes unexpectedly
+- field ownership conflicts with the brief
+- Main Brain requires new trading calculations
+- route construction mutates trading state
+- route requires broker access
+- route requires live Databento access
+- authentication cannot be preserved
+- a Partner interface must be invented to proceed
+- scanner ranking would change trading behavior
+- database schema changes are required
+- unbounded payloads are required
+- production UI files appear in the diff
+- a missing field cannot be represented honestly
+- a primary regression changes
+- secrets appear in output
+
+Do not silently broaden scope.
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If the route is complete and all tests pass, create one commit:
+
+V1-P7B Main Brain read-only route
+
+Do not amend d31b320.
+
+Do not squash.
+
+Do not deploy.
+
+Do not publish.
+
+Do not begin Phase 7C UI implementation.
+
+=========================================================
+FINAL RESPONSE FORMAT
+=========================================================
+
+Report:
+
+1. Phase title
+2. Starting branch and HEAD
+3. Ending branch and HEAD
+4. Intervening commits
+5. Baseline test results
+6. Route path
+7. HTTP method
+8. Authentication boundary
+9. Payload version
+10. Top-level payload keys
+11. Total payload fields implemented
+12. Fields directly sourced
+13. Fields adapted
+14. Fields derived
+15. Fields unavailable
+16. Missing-field fallback behavior
+17. Canonical interfaces reused
+18. Partner interface handling
+19. Main-engine strategy count
+20. Research-strategy handling
+21. Timeline event types returned
+22. Real timeline events
+23. Derived timeline events
+24. Missing timeline events
+25. Timeline completeness behavior
+26. Availability sections
+27. Stable error codes
+28. Fault-isolation results
+29. Optional subsystem failures tested
+30. HTTP result during optional failure
+31. Gateway invocation count
+32. Broker-call count
+33. Journal-write count
+34. Learning-write count
+35. Database-write count
+36. Thesis-mutation count
+37. Strategy-rescore count
+38. Active-trade mutation count
+39. Databento mutation count
+40. Safe-copy result
+41. Serialization result
+42. Payload-size result
+43. Route-performance result
+44. Authentication test result
+45. Phase 7B test count
+46. Phase 6 result
+47. Phase 5 result
+48. Phase 4 result
+49. Phase 3 result
+50. Interface result
+51. Phase 2 result
+52. Smoke results
+53. Primary regressions
+54. Files created
+55. Files modified
+56. Files deleted
+57. Validation document
+58. Deferred fields
+59. Blocking issues
+60. Commit created
+61. Confirmation no UI code changed
+62. Confirmation no deployment occurred
+63. Whether Phase 7B is officially complete
+64. Whether Phase 7C may begin
+
+Do not begin Phase 7C.
+
+Stop after reporting.
