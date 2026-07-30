@@ -1,0 +1,127 @@
+TASK: Make the Main Brain the application's default home page.
+
+GOAL
+
+The Main Brain is now the primary user experience. When the application opens, users should land directly on the Main Brain instead of the legacy dashboard.
+
+IMPORTANT
+
+This is a ROUTING/UI change only.
+
+DO NOT modify:
+- Databento integration
+- Databento ingestion
+- Databento normalization
+- Databento cache
+- Market data pipeline
+- Strategy engine
+- Edge Score calculations
+- Left Brain logic
+- Right Brain logic
+- Learning engine
+- TradersPost integration
+- Polling interval
+- API contracts
+- Authentication logic
+- Active trade management
+- Journal logic
+- Scanner logic
+- Coach logic
+- Alerts logic
+
+Only update routing/navigation.
+
+REQUIREMENTS
+
+1. Make "/" load the Main Brain.
+
+2. Preserve all existing Main Brain functionality.
+
+3. The existing Main Brain sections must continue working:
+
+- Analysis
+- Scanner
+- Active Trades
+- Journal
+- Coach
+- Alerts
+
+4. Preserve deep linking.
+
+Examples:
+
+/main-brain/analysis
+/main-brain/scanner
+/main-brain/trades
+/main-brain/journal
+/main-brain/coach
+/main-brain/alerts
+
+must continue functioning exactly as they do now.
+
+5. Keep the existing Main Brain layout unchanged.
+
+Do not redesign.
+
+Do not move panels.
+
+Do not rename pages.
+
+6. The legacy dashboard should remain accessible from a secondary route such as:
+
+/dashboard
+
+or
+
+/legacy
+
+Do not delete legacy code.
+
+Do not remove any routes.
+
+7. Update navigation so that selecting "Home" (or the application logo if applicable) opens the Main Brain.
+
+8. Refreshing the browser from "/" must still load the Main Brain.
+
+9. Browser Back/Forward history must continue working normally.
+
+10. Unknown routes must continue using the existing redirect behavior.
+
+ACCEPTANCE TESTS
+
+✓ Visiting "/" opens the Main Brain.
+
+✓ Refreshing "/" stays on the Main Brain.
+
+✓ All Main Brain side navigation buttons continue working.
+
+✓ All Main Brain panels render correctly.
+
+✓ Legacy dashboard is still reachable from its secondary route.
+
+✓ No API changes.
+
+✓ No Databento changes.
+
+✓ No polling changes.
+
+✓ No authentication changes.
+
+✓ TypeScript passes.
+
+✓ Production build passes.
+
+✓ Existing regression tests remain green.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+- Files changed
+- Routes updated
+- Old home route
+- New home route
+- Test results
+- Build results
+- Confirmation that no Databento or trading logic was modified
+- Git commit hash
