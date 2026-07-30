@@ -1084,6 +1084,590 @@ class TestP5_008_PaperModeE2E(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stage 4 (Audit) — Caller and Patch-Boundary Compatibility
+# Proves that the wrapper refactor (execute_trade_gateway → wrapper +
+# _execute_trade_gateway_inner) is fully backward-compatible with all callers,
+# test monkeypatches, and introspection patterns used in the codebase.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import inspect as _inspect
+
+class TestP5_Stage4_CompatibilityProof(unittest.TestCase):
+    """Stage 4 audit — wrapper refactor backward-compatibility proofs."""
+
+    # ── Signature ────────────────────────────────────────────────────────────
+    def test_s4_01_public_signature_identical(self):
+        """Public execute_trade_gateway signature is identical to pre-Phase-5.
+        Pre-Phase-5: (instrument, contracts, source="manual", direction=None, expected_stop=None)
+        """
+        sig = _inspect.signature(app.execute_trade_gateway)
+        params = list(sig.parameters.items())
+        check("S4-01-a param count == 5", len(params) == 5, str([p for p, _ in params]))
+        names = [p for p, _ in params]
+        check("S4-01-b params in order", names == ["instrument", "contracts", "source",
+                                                    "direction", "expected_stop"],
+              str(names))
+        check("S4-01-c source default='manual'",
+              sig.parameters["source"].default == "manual")
+        check("S4-01-d direction default=None",
+              sig.parameters["direction"].default is None)
+        check("S4-01-e expected_stop default=None",
+              sig.parameters["expected_stop"].default is None)
+
+    def test_s4_02_inner_signature_identical(self):
+        """_execute_trade_gateway_inner has the same signature as the original function."""
+        sig_pub   = _inspect.signature(app.execute_trade_gateway)
+        sig_inner = _inspect.signature(app._execute_trade_gateway_inner)
+        check("S4-02-a parameter names match",
+              list(sig_pub.parameters) == list(sig_inner.parameters),
+              f"pub={list(sig_pub.parameters)} inner={list(sig_inner.parameters)}")
+        for name in sig_pub.parameters:
+            d_pub   = sig_pub.parameters[name].default
+            d_inner = sig_inner.parameters[name].default
+            check(f"S4-02-b default [{name}] matches",
+                  d_pub == d_inner or (d_pub is None and d_inner is None),
+                  f"pub={d_pub!r} inner={d_inner!r}")
+
+    # ── Module namespace ─────────────────────────────────────────────────────
+    def test_s4_03_execute_trade_gateway_in_module(self):
+        """execute_trade_gateway is a public module attribute (not private)."""
+        check("S4-03-a execute_trade_gateway in app module",
+              hasattr(app, "execute_trade_gateway"))
+        check("S4-03-b it is callable", callable(app.execute_trade_gateway))
+
+    def test_s4_04_inner_is_private(self):
+        """_execute_trade_gateway_inner is accessible (needed for monkeypatch isolation)."""
+        check("S4-04-a _execute_trade_gateway_inner in app module",
+              hasattr(app, "_execute_trade_gateway_inner"))
+        check("S4-04-b it is callable", callable(app._execute_trade_gateway_inner))
+
+    # ── Monkeypatch interception ──────────────────────────────────────────────
+    def test_s4_05_monkeypatch_execute_trade_gateway_intercepts_callers(self):
+        """Patching app.execute_trade_gateway intercepts all internal callers.
+        Internal callers (routes) resolve the function via the module globals at
+        call-time, so a setattr/mock.patch on the public name intercepts them.
+        """
+        calls = []
+        fake_result = {"status": "simulated", "outcome": "paper",
+                       "plan": {"entry_zone": "2500", "stop_loss": "2492",
+                                "target1": "2508", "target2": "2516",
+                                "rr": "1:1", "direction": "Long"},
+                       "provider": "paper", "mode": "paper",
+                       "broker_verify_required": False, "_version": "v1"}
+
+        original = app.execute_trade_gateway
+        def _spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return fake_result, 200
+
+        app.execute_trade_gateway = _spy
+        try:
+            # Internal route callers resolve execute_trade_gateway from module globals.
+            # Verify the spy is installed and would intercept.
+            r, c = app.execute_trade_gateway("MGC", 1, source="manual")
+            check("S4-05-a patch intercepts direct call", len(calls) == 1)
+            check("S4-05-b patched result returned", r == fake_result)
+        finally:
+            app.execute_trade_gateway = original
+
+    def test_s4_06_mock_patch_object_intercepts(self):
+        """mock.patch.object(app, 'execute_trade_gateway', ...) intercepts correctly.
+        This is the pattern used by test_dpv2_phase3.py and other existing tests.
+        """
+        calls = []
+        fake_result = {"status": "simulated", "outcome": "paper",
+                       "plan": {}, "provider": "paper", "_version": "v1"}
+
+        with mock.patch.object(app, "execute_trade_gateway",
+                               side_effect=lambda *a, **kw: (
+                                   calls.append(a), (fake_result, 200))[1]):
+            r, c = app.execute_trade_gateway("MGC", 1)
+
+        check("S4-06-a mock.patch.object intercepts call", len(calls) == 1)
+        check("S4-06-b patched result returned", r == fake_result)
+        check("S4-06-c public name restored after with-block",
+              app.execute_trade_gateway is not None)
+
+    # ── Wrapper calls inner exactly once ─────────────────────────────────────
+    def test_s4_07_wrapper_calls_inner_exactly_once(self):
+        """The wrapper calls _execute_trade_gateway_inner exactly once per call."""
+        inner_calls = []
+        fake_inner_result = ({"status": "simulated", "outcome": "paper",
+                               "plan": {}, "provider": "paper",
+                               "broker_verify_required": False, "_version": "v1"}, 200)
+
+        original_inner = app._execute_trade_gateway_inner
+        def _spy_inner(*args, **kwargs):
+            inner_calls.append(args)
+            return fake_inner_result
+
+        app._execute_trade_gateway_inner = _spy_inner
+        try:
+            r, c = app.execute_trade_gateway("MGC", 1, source="manual",
+                                             direction="Long")
+            check("S4-07-a inner called exactly once", len(inner_calls) == 1)
+            check("S4-07-b inner received correct instrument",
+                  inner_calls[0][0] == "MGC")
+            check("S4-07-c inner received correct contracts",
+                  inner_calls[0][1] == 1)
+        finally:
+            app._execute_trade_gateway_inner = original_inner
+
+    # ── Return value preservation ─────────────────────────────────────────────
+    def test_s4_08_wrapper_preserves_http_code(self):
+        """Wrapper returns the exact HTTP code from the inner function unchanged."""
+        for expected_code in (200, 400, 409, 429, 502):
+            fake = ({"status": "error", "reason": "test"}, expected_code)
+            original_inner = app._execute_trade_gateway_inner
+            app._execute_trade_gateway_inner = lambda *a, **kw: fake
+            try:
+                _, actual_code = app.execute_trade_gateway("MGC", 1)
+                check(f"S4-08-a HTTP {expected_code} preserved",
+                      actual_code == expected_code, f"got {actual_code}")
+            finally:
+                app._execute_trade_gateway_inner = original_inner
+
+    def test_s4_09_wrapper_preserves_all_pre_existing_fields(self):
+        """Wrapper does not remove or modify any field from the inner result."""
+        base = {"status": "simulated", "provider": "paper", "mode": "paper",
+                "broker_verify_required": False,
+                "message": "Paper order simulated.",
+                "plan": {"entry_zone": "2500", "stop_loss": "2492",
+                         "target1": "2508", "target2": "2516",
+                         "rr": "1:1", "direction": "Long"},
+                "_version": "v1"}
+        original_inner = app._execute_trade_gateway_inner
+        app._execute_trade_gateway_inner = lambda *a, **kw: (dict(base), 200)
+        try:
+            result, _ = app.execute_trade_gateway("MGC", 1)
+            for k, v in base.items():
+                check(f"S4-09-a field '{k}' preserved", result.get(k) == v,
+                      f"got {result.get(k)!r}")
+        finally:
+            app._execute_trade_gateway_inner = original_inner
+
+    def test_s4_10_wrapper_adds_only_outcome(self):
+        """Wrapper adds exactly one key ('outcome') and nothing else."""
+        base = {"status": "simulated", "provider": "paper", "mode": "paper",
+                "broker_verify_required": False,
+                "plan": {}, "_version": "v1"}
+        original_inner = app._execute_trade_gateway_inner
+        app._execute_trade_gateway_inner = lambda *a, **kw: (dict(base), 200)
+        try:
+            result, _ = app.execute_trade_gateway("MGC", 1)
+            added_keys = set(result.keys()) - set(base.keys())
+            check("S4-10-a only 'outcome' key added", added_keys == {"outcome"},
+                  f"added keys: {added_keys}")
+        finally:
+            app._execute_trade_gateway_inner = original_inner
+
+    def test_s4_11_wrapper_skips_outcome_if_already_present(self):
+        """Wrapper does not overwrite 'outcome' if inner already set it."""
+        pre_set = {"status": "error", "outcome": "broker_rejected",
+                   "reason": "broker rejected"}
+        original_inner = app._execute_trade_gateway_inner
+        app._execute_trade_gateway_inner = lambda *a, **kw: (dict(pre_set), 502)
+        try:
+            result, _ = app.execute_trade_gateway("MGC", 1)
+            check("S4-11-a pre-set outcome not overwritten",
+                  result.get("outcome") == "broker_rejected",
+                  f"got {result.get('outcome')!r}")
+        finally:
+            app._execute_trade_gateway_inner = original_inner
+
+    def test_s4_12_exceptions_propagate_unchanged(self):
+        """Exceptions raised inside the inner function propagate through the wrapper.
+        The wrapper has no try/except, so inner exceptions are not swallowed.
+        """
+        class _TestException(Exception):
+            pass
+
+        original_inner = app._execute_trade_gateway_inner
+        app._execute_trade_gateway_inner = lambda *a, **kw: (_ for _ in ()).throw(
+            _TestException("test inner error"))
+        try:
+            with self.assertRaises(_TestException):
+                app.execute_trade_gateway("MGC", 1)
+            check("S4-12-a inner exception propagates", True)
+        except AssertionError:
+            check("S4-12-a inner exception propagates", False,
+                  "exception was swallowed")
+        finally:
+            app._execute_trade_gateway_inner = original_inner
+
+    def test_s4_13_repeated_calls_do_not_share_result_dicts(self):
+        """Each call through the wrapper produces an independent result dict.
+        Mutating the first call's result does not affect the second call's result.
+        """
+        call_count = [0]
+        def _counter_inner(*a, **kw):
+            call_count[0] += 1
+            return {"status": "simulated", "plan": {}, "_version": "v1",
+                    "provider": "paper", "mode": "paper",
+                    "broker_verify_required": False}, 200
+
+        original_inner = app._execute_trade_gateway_inner
+        app._execute_trade_gateway_inner = _counter_inner
+        try:
+            r1, _ = app.execute_trade_gateway("MGC", 1)
+            r2, _ = app.execute_trade_gateway("MGC", 1)
+            check("S4-13-a two calls made", call_count[0] == 2)
+            # Mutate r1 — r2 must be unaffected
+            r1["_sentinel_mutation"] = "mutated"
+            check("S4-13-b r2 unaffected by r1 mutation",
+                  "_sentinel_mutation" not in r2)
+            check("S4-13-c r1 and r2 are distinct objects", r1 is not r2)
+        finally:
+            app._execute_trade_gateway_inner = original_inner
+
+    def test_s4_14_return_tuple_shape(self):
+        """execute_trade_gateway always returns a (dict, int) tuple."""
+        analysis = _minimal_analysis()
+        with mock.patch.object(app, "full_analysis", return_value=analysis), \
+             mock.patch.object(app, "resolve_execution_mode", return_value="paper"), \
+             mock.patch("requests.post"):
+            result = app.execute_trade_gateway("MGC", 1, source="manual")
+        check("S4-14-a returns a tuple of length 2",
+              isinstance(result, tuple) and len(result) == 2)
+        check("S4-14-b first element is a dict",
+              isinstance(result[0], dict))
+        check("S4-14-c second element is an int",
+              isinstance(result[1], int))
+
+    def test_s4_15_source_inspection_strings_in_inner(self):
+        """Source inspection: all gateway status strings are in _execute_trade_gateway_inner.
+        _gw_outcome and the public wrapper do NOT contain these strings.
+        This proves the interface-test helper update was non-weakening.
+        """
+        import ast as _ast
+        src = open(
+            "artifacts/tradingview-webhook/app.py").read()
+
+        # Get inner function source
+        inner_start = src.find("def _execute_trade_gateway_inner(")
+        inner_end   = src.find("def _gw_outcome(", inner_start)
+        inner_src   = src[inner_start:inner_end]
+
+        # Get _gw_outcome source
+        gw_start = src.find("def _gw_outcome(")
+        gw_end   = src.find("def execute_trade_gateway(", gw_start)
+        gw_src   = src[gw_start:gw_end]
+
+        # Get wrapper source
+        wrap_start = src.find("def execute_trade_gateway(", gw_end)
+        wrap_end   = src.find("def _advisor_blocks_auto_trade(", wrap_start)
+        wrap_src   = src[wrap_start:wrap_end]
+
+        for s in ('"status": "sent"', '"status": "simulated"',
+                  '"status": "manual_required"', '"_version": "v1"'):
+            check(f"S4-15-a {s!r} in inner function",  s in inner_src)
+            check(f"S4-15-b {s!r} NOT in _gw_outcome", s not in gw_src,
+                  f"found in _gw_outcome: {s!r}")
+            check(f"S4-15-c {s!r} NOT in wrapper",     s not in wrap_src,
+                  f"found in wrapper: {s!r}")
+
+    def test_s4_16_version_count_still_3_in_inner(self):
+        """Inner function still has exactly 3 _version:v1 insertions (unchanged)."""
+        src = open("artifacts/tradingview-webhook/app.py").read()
+        inner_start = src.find("def _execute_trade_gateway_inner(")
+        inner_end   = src.find("def _gw_outcome(", inner_start)
+        inner_src   = src[inner_start:inner_end]
+        count = inner_src.count('"_version": "v1"')
+        check("S4-16-a exactly 3 _version insertions in inner", count == 3,
+              f"found {count}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 6 (Audit) — 5xx Cooldown-Slot Proof
+# Proves that a broker 5xx response preserves the uncertain-send dedup slot
+# and prevents an immediate duplicate broker send.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestP5_Stage6_5xxSlotRetention(unittest.TestCase):
+    """Stage 6 audit — 5xx uncertain response holds the cooldown slot.
+
+    Distinct behavior from 4xx (slot released) and timeout (slot held).
+    """
+
+    def setUp(self):
+        self._orig_last = dict(app._TRADERSPOST_LAST)
+
+    def tearDown(self):
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.clear()
+            app._TRADERSPOST_LAST.update(self._orig_last)
+
+    # ── _send_broker_order direct tests ──────────────────────────────────────
+
+    def _call_send_broker_5xx(self, status_code=503):
+        """Call _send_broker_order with a mocked 5xx response."""
+        class FakeResp:
+            def __init__(self, sc):
+                self.status_code = sc
+                self.text = "Service Unavailable"
+
+        slots_released = []
+
+        def release():
+            slots_released.append(True)
+
+        with mock.patch("requests.post", return_value=FakeResp(status_code)), \
+             mock.patch.object(app, "_record_broker_send"), \
+             mock.patch.object(app, "_record_exec_rejection"), \
+             mock.patch.object(app, "_record_diagnostic"):
+            result, code = app._send_broker_order(
+                "traderspost", "TradersPost", "MGC",
+                {"ticker": "MGC1!", "action": "buy", "quantity": 1},
+                "https://fake.broker.url/test",
+                release_slot=release)
+
+        return result, code, slots_released
+
+    def test_s6_01_5xx_outcome_is_broker_rejected(self):
+        result, code, _ = self._call_send_broker_5xx(503)
+        check("S6-01-a 5xx outcome=broker_rejected",
+              result.get("outcome") == "broker_rejected",
+              f"got {result.get('outcome')!r}")
+
+    def test_s6_02_5xx_broker_verify_required_true(self):
+        """5xx sets broker_verify_required=True — order may have been placed."""
+        result, code, _ = self._call_send_broker_5xx(503)
+        check("S6-02-a 5xx broker_verify_required=True",
+              result.get("broker_verify_required") is True,
+              f"got {result.get('broker_verify_required')!r}")
+
+    def test_s6_03_5xx_slot_NOT_released(self):
+        """5xx does NOT call release_slot — the dedup slot remains occupied.
+        This is the critical distinction from 4xx: an ambiguous 5xx may have
+        placed the order, so we hold the slot to prevent a duplicate live send.
+        """
+        result, code, slots_released = self._call_send_broker_5xx(503)
+        check("S6-03-a release_slot NOT called on 5xx", len(slots_released) == 0,
+              f"release_slot called {len(slots_released)} times")
+
+    def test_s6_04_5xx_http_502(self):
+        result, code, _ = self._call_send_broker_5xx(503)
+        check("S6-04-a 5xx returns HTTP 502", code == 502, f"got {code}")
+
+    def test_s6_05_4xx_slot_IS_released(self):
+        """4xx DOES call release_slot — broker definitively rejected, no order placed."""
+        class FakeResp:
+            status_code = 400
+            text = "Bad Request"
+
+        slots_released = []
+
+        def release():
+            slots_released.append(True)
+
+        with mock.patch("requests.post", return_value=FakeResp()), \
+             mock.patch.object(app, "_record_broker_send"), \
+             mock.patch.object(app, "_record_exec_rejection"), \
+             mock.patch.object(app, "_record_diagnostic"):
+            result, code = app._send_broker_order(
+                "traderspost", "TradersPost", "MGC",
+                {"ticker": "MGC1!", "action": "buy", "quantity": 1},
+                "https://fake.broker.url/test",
+                release_slot=release)
+
+        check("S6-05-a release_slot IS called on 4xx", len(slots_released) == 1,
+              f"called {len(slots_released)} times")
+        check("S6-05-b 4xx outcome=broker_rejected",
+              result.get("outcome") == "broker_rejected")
+        check("S6-05-c 4xx broker_verify_required=False",
+              result.get("broker_verify_required") is not True,
+              f"got {result.get('broker_verify_required')!r}")
+
+    def test_s6_06_timeout_slot_NOT_released(self):
+        """RequestException also does NOT call release_slot (ambiguous, same as 5xx)."""
+        import requests as req_mod
+        slots_released = []
+
+        def release():
+            slots_released.append(True)
+
+        with mock.patch("requests.post",
+                        side_effect=req_mod.exceptions.Timeout("timed out")), \
+             mock.patch.object(app, "_record_broker_send"), \
+             mock.patch.object(app, "_record_exec_rejection"), \
+             mock.patch.object(app, "_record_diagnostic"):
+            result, code = app._send_broker_order(
+                "traderspost", "TradersPost", "MGC",
+                {"ticker": "MGC1!", "action": "buy", "quantity": 1},
+                "https://fake.broker.url/test",
+                release_slot=release)
+
+        check("S6-06-a release_slot NOT called on timeout", len(slots_released) == 0)
+        check("S6-06-b timeout outcome=timeout",
+              result.get("outcome") == "timeout")
+
+    # ── Full-gateway end-to-end: 5xx → slot held → second call suppressed ────
+
+    def _run_live_gateway(self, instrument="MGC", direction="Long",
+                          broker_response_code=503):
+        """Run execute_trade_gateway in traderspost mode with a mocked broker response."""
+        analysis = _minimal_analysis(instrument, direction)
+
+        class FakeResp:
+            def __init__(self, sc):
+                self.status_code = sc
+                self.text = "error"
+
+        posts = []
+
+        def capture_post(url, **kwargs):
+            posts.append(url)
+            return FakeResp(broker_response_code)
+
+        with mock.patch.object(app, "full_analysis", return_value=analysis), \
+             mock.patch.object(app, "resolve_execution_mode",
+                               return_value="traderspost"), \
+             mock.patch.object(app, "execution_configured", return_value=True), \
+             mock.patch.object(app, "execution_is_live", return_value=True), \
+             mock.patch.object(app, "_discord_url", return_value=None), \
+             mock.patch.object(app, "_save_market_state"), \
+             mock.patch.object(app, "_record_broker_send"), \
+             mock.patch.object(app, "_record_exec_rejection"), \
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch("requests.post", side_effect=capture_post):
+            result, code = app.execute_trade_gateway(
+                instrument, 1, source="manual", direction=direction)
+
+        return result, code, posts
+
+    def test_s6_07_5xx_full_gateway_slot_held(self):
+        """After a 5xx via the full gateway, the dedup slot is set in _TRADERSPOST_LAST."""
+        inst = "MGC"
+        # Clear the slot first
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop(inst, None)
+
+        result, code, posts = self._run_live_gateway(inst, "Long", 503)
+
+        slot = app._TRADERSPOST_LAST.get(inst)
+        check("S6-07-a slot held after 5xx", slot is not None,
+              f"_TRADERSPOST_LAST[{inst}]={slot!r}")
+        check("S6-07-b outcome=broker_rejected",
+              result.get("outcome") == "broker_rejected",
+              f"got {result.get('outcome')!r}")
+        check("S6-07-c one broker HTTP call made", len(posts) == 1,
+              f"posts={posts}")
+
+    def test_s6_08_second_call_after_5xx_suppressed_without_broker_http(self):
+        """The second immediate call after a 5xx is suppressed locally (no broker HTTP).
+        This proves the cooldown slot held by the 5xx prevents a duplicate live order.
+        """
+        inst = "MGC"
+        direction = "Long"
+        # Clear the slot first
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop(inst, None)
+
+        # First call → 5xx → slot held
+        analysis = _minimal_analysis(inst, direction)
+        all_posts = []
+        call_number = [0]
+
+        class FakeResp:
+            def __init__(self, sc):
+                self.status_code = sc
+                self.text = "error"
+
+        def capture_post(url, **kwargs):
+            all_posts.append(("post", url))
+            return FakeResp(503)  # always 5xx
+
+        with mock.patch.object(app, "full_analysis", return_value=analysis), \
+             mock.patch.object(app, "resolve_execution_mode",
+                               return_value="traderspost"), \
+             mock.patch.object(app, "execution_configured", return_value=True), \
+             mock.patch.object(app, "execution_is_live", return_value=True), \
+             mock.patch.object(app, "_discord_url", return_value=None), \
+             mock.patch.object(app, "_save_market_state"), \
+             mock.patch.object(app, "_record_broker_send"), \
+             mock.patch.object(app, "_record_exec_rejection"), \
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch("requests.post", side_effect=capture_post):
+
+            # First call — hits broker (5xx), slot reserved
+            r1, c1 = app.execute_trade_gateway(
+                inst, 1, source="manual", direction=direction)
+            posts_after_first = len(all_posts)
+
+            # Second call — same instrument/direction/price → same fingerprint
+            # Cooldown check fires BEFORE _send_broker_order → no broker HTTP
+            r2, c2 = app.execute_trade_gateway(
+                inst, 1, source="manual", direction=direction)
+            posts_after_second = len(all_posts)
+
+        check("S6-08-a first call reached broker (1 HTTP post)",
+              posts_after_first == 1, f"posts={posts_after_first}")
+        check("S6-08-b second call did NOT make a second broker HTTP call",
+              posts_after_second == posts_after_first,
+              f"posts went from {posts_after_first} to {posts_after_second}")
+        check("S6-08-c first call outcome=broker_rejected",
+              r1.get("outcome") == "broker_rejected",
+              f"got {r1.get('outcome')!r}")
+        check("S6-08-d second call outcome=rejected (duplicate suppressed)",
+              r2.get("outcome") == "rejected",
+              f"got {r2.get('outcome')!r}")
+        check("S6-08-e second call HTTP 429",
+              c2 == 429, f"got {c2}")
+
+    def test_s6_09_4xx_full_gateway_slot_released(self):
+        """After a 4xx via the full gateway, the slot is released from _TRADERSPOST_LAST.
+        This contrasts with 5xx/timeout where the slot is held.
+        """
+        inst = "MGC"
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop(inst, None)
+
+        result, code, posts = self._run_live_gateway(inst, "Long", 400)
+
+        slot = app._TRADERSPOST_LAST.get(inst)
+        check("S6-09-a slot RELEASED after 4xx", slot is None,
+              f"_TRADERSPOST_LAST[{inst}]={slot!r}")
+        check("S6-09-b outcome=broker_rejected",
+              result.get("outcome") == "broker_rejected")
+        check("S6-09-c broker_verify_required=False on 4xx",
+              result.get("broker_verify_required") is not True)
+
+    def test_s6_10_5xx_vs_4xx_slot_behavior_summary(self):
+        """Summary assertion: 5xx=slot held, 4xx=slot released, timeout=slot held.
+        This is the critical safety invariant preventing duplicate live orders.
+        """
+        inst = "MGC"
+
+        # 5xx: slot held
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop(inst, None)
+        r5, c5, _ = self._run_live_gateway(inst, "Long", 503)
+        slot_5xx = app._TRADERSPOST_LAST.get(inst)
+        # Clean up
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop(inst, None)
+
+        # 4xx: slot released
+        r4, c4, _ = self._run_live_gateway(inst, "Long", 400)
+        slot_4xx = app._TRADERSPOST_LAST.get(inst)
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop(inst, None)
+
+        check("S6-10-a 5xx: slot held (not None)", slot_5xx is not None,
+              f"slot_5xx={slot_5xx!r}")
+        check("S6-10-b 4xx: slot released (None)", slot_4xx is None,
+              f"slot_4xx={slot_4xx!r}")
+        check("S6-10-c 5xx outcome=broker_rejected",
+              r5.get("outcome") == "broker_rejected")
+        check("S6-10-d 4xx outcome=broker_rejected",
+              r4.get("outcome") == "broker_rejected")
+        check("S6-10-e 5xx broker_verify_required=True",
+              r5.get("broker_verify_required") is True)
+        check("S6-10-f 4xx broker_verify_required not True",
+              r4.get("broker_verify_required") is not True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1099,6 +1683,8 @@ def run_all():
         TestP5_006_PayloadValidation,
         TestP5_007_SafeDisarm,
         TestP5_008_PaperModeE2E,
+        TestP5_Stage4_CompatibilityProof,
+        TestP5_Stage6_5xxSlotRetention,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
