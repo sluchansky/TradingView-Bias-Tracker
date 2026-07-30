@@ -294,6 +294,12 @@ THESIS_NOTIF_LAST_BY_INST = {}  # inst -> {"sig": str} last-notified transition
 THESIS_DB_READY           = False  # probed at boot; persist/restore fail-open when False
 STALE_SETUPS_BY_INST      = {}  # inst -> list of stale-setup markers (Phase 3)
 THESIS_EVAL_DB_READY      = False  # probed at boot; thesis_trade_evaluations persist fail-open (Phase 3)
+# ── Main Brain payload cache (Phase 7B) ──────────────────────────────────────
+# Per-key (mode_override, ticker) TTL cache sharing STATUS_CACHE_TTL_SEC.
+# Single-flight guard prevents duplicate rebuilds on concurrent cold-cache hits.
+_MB_CACHE       : dict = {}   # key → (epoch_ts, payload_dict)
+_MB_CACHE_LOCK  = threading.Lock()
+_MB_BUILDING    : dict = {}   # key → bool, single-flight guard
 # Lightweight rolling-window timestamp logs (last hour) for diagnostics that the
 # capped EVAL_METRICS deque can't answer once the heartbeat floods it. Guarded by
 # COUNTERS_LOCK (appended in webhook(), read+trimmed in /eval-metrics).
@@ -22979,6 +22985,738 @@ def build_coach_interface(result, instrument=None, mode=None):
         }
 
 
+# ── Main Brain read-only payload builder (Phase 7B) ──────────────────────────
+# Assembles the versioned Main Brain dashboard payload from existing canonical
+# interfaces and in-memory stores.  Never invokes full_analysis(), the execution
+# gateway, Journal writers, learning updaters, or any DB writes.
+# Each section helper is isolated: a single section failure never propagates.
+
+_MB_MAIN_ENGINE_KEYS = frozenset({
+    "OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
+    "RANGE_EXPANSION_BREAKOUT", "OPENING_RANGE_BREAKOUT",
+})
+_MB_STRATEGY_LABELS = {
+    "OPENING_DRIVE":            "Opening Drive",
+    "LIQUIDITY_SWEEP_REVERSAL": "Liquidity Sweep Reversal",
+    "VWAP_TREND_CONTINUATION":  "VWAP Trend Continuation",
+    "RANGE_EXPANSION_BREAKOUT": "Range Expansion Breakout",
+    "OPENING_RANGE_BREAKOUT":   "Opening Range Breakout",
+}
+
+
+def _mb_safe_num(v):
+    """Return v as float if finite and representable, else None. JSON-safe."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if f != f or f == float("inf") or f == float("-inf"):  # NaN / ±Inf
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _mb_iso(v):
+    """Return ISO-8601 str from a datetime/aware-datetime or pass through str. None-safe."""
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    if isinstance(v, str):
+        return v
+    return None
+
+
+def _mb_err(errors, source, code):
+    """Append a stable, secrets-free error entry to the errors list."""
+    errors.append({"source": source, "code": code,
+                   "recoverable": True, "ts": now_utc().isoformat()})
+
+
+def _mb_has_err(errors, code):
+    return any(e["code"] == code for e in errors)
+
+
+# ── Section helpers ───────────────────────────────────────────────────────────
+
+def _mb_market(result, errors):
+    try:
+        sess = market_session_status()
+        nxt  = sess.get("next_open")
+        return {
+            "session": {
+                "open":         bool(sess.get("open")),
+                "status":       str(sess.get("status", "UNKNOWN")),
+                "reason":       str(sess.get("reason", "")),
+                "next_open_et": str(sess.get("next_open_et", "")),
+                "next_open":    _mb_iso(nxt),
+            },
+            "selected_instrument": str((result or {}).get("active_ticker") or DEFAULT_INSTRUMENT),
+            "trading_mode":    str(TRADING_MODE),
+            "execution_mode":  str(resolve_execution_mode()),
+            "et_time":         datetime.now(ET_TZ).strftime("%Y-%m-%dT%H:%M:%S"),
+            "auto_trade_enabled": {
+                inst: bool(auto_trade_enabled(inst))
+                for inst in enabled_instruments()
+            },
+        }
+    except Exception as _exc:
+        logger.debug("_mb_market: %s", _exc)
+        _mb_err(errors, "market", "market_unavailable")
+        return {
+            "session": {"open": True, "status": "UNKNOWN", "reason": "",
+                        "next_open_et": "", "next_open": None},
+            "selected_instrument": DEFAULT_INSTRUMENT,
+            "trading_mode": TRADING_MODE,
+            "execution_mode": "manual_only",
+            "et_time": None,
+            "auto_trade_enabled": {},
+        }
+
+
+def _mb_market_state(result, errors):
+    try:
+        r   = result or {}
+        mi  = r.get("market_intelligence") or {}
+        vol = r.get("volatility") or {}
+        return {
+            "bias":              r.get("market_direction"),
+            "regime":            mi.get("regime"),
+            "primary_driver":    mi.get("primary_driver"),
+            "risk_state":        mi.get("risk_state"),
+            "conviction":        mi.get("conviction"),
+            "volatility_status": vol.get("status"),
+            "volatility_atr":    _mb_safe_num(vol.get("atr_pts")),
+            "session":           r.get("session"),
+            "news_impact":       mi.get("primary_driver"),
+            "vwap_value":        _mb_safe_num(r.get("vwap_value")),
+            "vwap_status":       r.get("vwap_status"),
+        }
+    except Exception as _exc:
+        logger.debug("_mb_market_state: %s", _exc)
+        _mb_err(errors, "market_state", "market_state_unavailable")
+        return {k: None for k in (
+            "bias", "regime", "primary_driver", "risk_state", "conviction",
+            "volatility_status", "volatility_atr", "session", "news_impact",
+            "vwap_value", "vwap_status",
+        )}
+
+
+def _mb_left_brain(inst, result, errors):
+    available  = True
+    thesis_out = None
+    try:
+        raw_thesis = _LB_THESIS_BY_INST.get(inst)
+        if raw_thesis is not None:
+            lu      = raw_thesis.get("lastUpdatedAt")
+            age_sec = None
+            try:
+                if lu:
+                    lu_dt = datetime.fromisoformat(lu) if isinstance(lu, str) else lu
+                    if lu_dt.tzinfo is None:
+                        lu_dt = lu_dt.replace(tzinfo=timezone.utc)
+                    age_sec = max(0, int((now_utc() - lu_dt).total_seconds()))
+            except Exception:
+                pass
+            coach_block = (result or {}).get("coach") or {}
+            thesis_out = {
+                "direction":      raw_thesis.get("direction"),
+                "status":         raw_thesis.get("status"),
+                "narrative":      raw_thesis.get("narrative"),
+                "key_drivers":    raw_thesis.get("playbook_reasoning"),
+                "invalidation":   raw_thesis.get("invalidation"),
+                "confidence":     raw_thesis.get("confidence"),
+                "strength":       raw_thesis.get("strength"),
+                "age_seconds":    age_sec,
+                "generated_at":   _mb_iso(lu),
+                "last_resolved_at": coach_block.get("thesis_last_resolved_at"),
+                "thesis_id":      raw_thesis.get("thesisId"),
+            }
+    except Exception as _exc:
+        logger.debug("_mb_left_brain thesis: %s", _exc)
+        available = False
+        _mb_err(errors, "left_brain", "left_brain_unavailable")
+
+    mi_out = None
+    try:
+        mi = (result or {}).get("market_intelligence") or {}
+        mi_out = {
+            "regime":                 mi.get("regime"),
+            "primary_driver":         mi.get("primary_driver"),
+            "risk_state":             mi.get("risk_state"),
+            "directional_confidence": mi.get("directional_confidence"),
+            "futures_preference":     mi.get("futures_preference"),
+        }
+    except Exception as _exc:
+        logger.debug("_mb_left_brain mi: %s", _exc)
+
+    obs_count = 0
+    try:
+        obs_count = len(list(_LB_THESIS_OBS_BY_INST.get(inst) or []))
+    except Exception:
+        pass
+
+    return {
+        "thesis":             thesis_out,
+        "intelligence":       mi_out,
+        "observations_count": obs_count,
+        "available":          available,
+    }
+
+
+def _mb_verdict(result, errors):
+    try:
+        r     = result or {}
+        eb    = r.get("edge_breakdown") or {}
+        label = str(r.get("strict_label") or "WAIT")
+        # components may be a list of dicts (live) or a plain dict (tests/fallback)
+        comps_raw = eb.get("components")
+        if isinstance(comps_raw, dict):
+            components = dict(comps_raw)
+        elif isinstance(comps_raw, (list, tuple)):
+            # Normalise list of {"name": str, "score": int, ...} into {name: score}
+            components = {}
+            for c in comps_raw:
+                if isinstance(c, dict):
+                    k = c.get("name") or c.get("key") or c.get("label")
+                    v = c.get("score") if c.get("score") is not None else c.get("value")
+                    if k is not None:
+                        components[str(k)] = _mb_safe_num(v)
+        else:
+            components = {}
+        tp = r.get("trade_plan")
+        if not isinstance(tp, dict):
+            tp = {}
+        return {
+            "direction":         r.get("strict_direction"),
+            "readiness":         label,
+            "edge_score":        r.get("edge_score"),
+            "edge_max":          110,
+            "grade":             eb.get("grade"),
+            "is_actionable":     ("READY" in label),
+            "confidence_score":  r.get("edge_score"),
+            "strict_reason":     r.get("strict_reason"),
+            "failed_conditions": list(r.get("strict_missing") or []),
+            "risk_reward":       tp.get("rr"),
+            "components":        components,
+        }
+    except Exception as _exc:
+        logger.debug("_mb_verdict: %s", _exc)
+        _mb_err(errors, "verdict", "verdict_unavailable")
+        return {
+            "direction": None, "readiness": "WAIT", "edge_score": 0, "edge_max": 110,
+            "grade": None, "is_actionable": False, "confidence_score": 0,
+            "strict_reason": None, "failed_conditions": [], "risk_reward": None,
+            "components": {},
+        }
+
+
+def _mb_strategy_scanner(inst, result, errors):
+    try:
+        snap         = dict(STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER.get(inst) or {})
+        engine       = (result or {}).get("strategy_engine") or {}
+        selected_key = snap.get("selected_key") or engine.get("active_strategy")
+        raw_strats   = list(snap.get("strategies") or [])
+        # Only main-engine strategies; exclude research/paper-sim strategies
+        ranked = []
+        for s in raw_strats:
+            k = s.get("key") or s.get("strategy_key")
+            if k not in _MB_MAIN_ENGINE_KEYS:
+                continue
+            entry = dict(s)
+            entry["label"]    = _MB_STRATEGY_LABELS.get(k, k)
+            entry["selected"] = (k == selected_key)
+            ranked.append(entry)
+        tp = (result or {}).get("trade_plan") or {}
+        return {
+            "selected":          selected_key,
+            "selected_label":    _MB_STRATEGY_LABELS.get(selected_key, selected_key),
+            "entry":             _mb_safe_num(tp.get("entry")),
+            "stop":              _mb_safe_num(tp.get("stop")),
+            "targets":           tp.get("targets") or [tp.get("tp1"), tp.get("tp2")],
+            "risk_reward":       tp.get("rr"),
+            "reason":            engine.get("reasoning") or engine.get("rationale"),
+            "learning_influence": _mb_safe_num(
+                ((result or {}).get("coach") or {}).get("learning_influence")),
+            "ranked_strategies": ranked,
+            "market_regime":     snap.get("market_regime"),
+            "sample_count":      None,           # deferred: no per-strategy win-rate cache yet
+            "historical_expectancy": None,       # deferred: same reason
+        }
+    except Exception as _exc:
+        logger.debug("_mb_strategy_scanner: %s", _exc)
+        _mb_err(errors, "scanner", "scanner_unavailable")
+        return {
+            "selected": None, "selected_label": None, "entry": None, "stop": None,
+            "targets": [], "risk_reward": None, "reason": None,
+            "learning_influence": None, "ranked_strategies": [], "market_regime": None,
+            "sample_count": None, "historical_expectancy": None,
+        }
+
+
+def _mb_active_trades(inst, result, errors):
+    try:
+        at_snap   = active_trade_snapshot()
+        cur_price = _mb_safe_num((result or {}).get("current_price"))
+        out       = []
+        for inst_key, trade in at_snap.items():
+            if trade is None:
+                continue
+            entry     = _mb_safe_num(trade.get("entry") or trade.get("entry_price"))
+            stop_p    = _mb_safe_num(trade.get("stop")  or trade.get("stop_price"))
+            contracts = trade.get("contracts") or trade.get("size") or 1
+            pv        = float(INSTRUMENT_SPECS.get(inst_key, {}).get("point_value", 1.0))
+            direction = str(trade.get("direction") or "")
+            dir_sign  = 1 if direction.lower() in ("long", "buy") else -1
+            # Derived: current R — (price - entry) / |entry - stop| × direction
+            cur_r = None
+            if entry and stop_p and cur_price and entry != stop_p:
+                cur_r = round(
+                    (cur_price - entry) * dir_sign / abs(entry - stop_p), 3)
+            # Derived: unrealized P&L in USD
+            unreal_pnl = None
+            if entry and cur_price:
+                unreal_pnl = round(
+                    (cur_price - entry) * dir_sign * float(contracts) * pv, 2)
+            # Targets as list of safe numbers
+            raw_tgts = trade.get("targets") or []
+            if not raw_tgts:
+                raw_tgts = [t for t in (
+                    trade.get("tp1"), trade.get("tp2")) if t is not None]
+            targets = [_mb_safe_num(t) for t in raw_tgts]
+            out.append({
+                "instrument":      inst_key,
+                "direction":       direction or None,
+                "strategy_key":    trade.get("strategy_key"),
+                "opened_at":       _mb_iso(trade.get("opened_at")),
+                "entry":           entry,
+                "stop":            stop_p,
+                "targets":         targets,
+                "current_price":   cur_price,
+                "contracts":       contracts,
+                "current_r":       cur_r,
+                "unrealized_pnl":  unreal_pnl,
+                "management_state": "OPEN",
+                "order_id":        trade.get("order_id"),
+            })
+        return out
+    except Exception as _exc:
+        logger.debug("_mb_active_trades: %s", _exc)
+        _mb_err(errors, "active_trade", "active_trade_unavailable")
+        return []
+
+
+def _mb_execution_gateway(inst, errors):
+    try:
+        exec_mode    = str(resolve_execution_mode())
+        last_sent_at = None
+        try:
+            tl = _TRADERSPOST_LAST.get(inst)
+            if tl is not None:
+                _fp, epoch_sent = tl
+                if epoch_sent:
+                    last_sent_at = datetime.fromtimestamp(
+                        float(epoch_sent), tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+        return {
+            "mode":          exec_mode,
+            "last_sent_at":  last_sent_at,
+            "last_outcome":  None,   # _LAST_GATEWAY_RESULT_BY_INST deferred — Phase 7C
+            "last_instrument": inst if last_sent_at else None,
+            "last_action":   None,   # deferred — Phase 7C
+            "duplicate_window_active": False,
+            "_deferred":     "last_outcome not persisted — Phase 7C",
+        }
+    except Exception as _exc:
+        logger.debug("_mb_execution_gateway: %s", _exc)
+        _mb_err(errors, "broker_status", "broker_status_unavailable")
+        return {
+            "mode": "manual_only", "last_sent_at": None, "last_outcome": None,
+            "last_instrument": None, "last_action": None,
+            "duplicate_window_active": False,
+            "_deferred": "last_outcome not persisted — Phase 7C",
+        }
+
+
+def _mb_journal(inst, errors):
+    today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    try:
+        entries = [e for e in list(JOURNAL)
+                   if str(e.get("datetime", ""))[:10] == today_str]
+        wins    = sum(1 for e in entries if e.get("result") == "WIN")
+        losses  = sum(1 for e in entries
+                      if e.get("result") in ("LOSS", "LOSS_EXIT"))
+        rs      = [_mb_safe_num(e.get("r_multiple")) for e in entries
+                   if e.get("r_multiple") is not None]
+        rs      = [v for v in rs if v is not None]
+        summary = {
+            "total_trades": len(entries),
+            "wins":         wins,
+            "losses":       losses,
+            "win_rate":     round(wins / len(entries), 3) if entries else None,
+            "avg_r":        round(sum(rs) / len(rs), 3) if rs else None,
+            "total_r":      round(sum(rs), 3) if rs else None,
+        }
+    except Exception as _exc:
+        logger.debug("_mb_journal summary: %s", _exc)
+        summary = {"total_trades": 0, "wins": 0, "losses": 0,
+                   "win_rate": None, "avg_r": None, "total_r": None}
+
+    recent_trades = []
+    available     = True
+    if LEARNING_DB_ENABLED:
+        conn = None
+        try:
+            conn = get_db_connection()
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT symbol, direction, strategy_key, r_multiple, result,"
+                        "       opened_at, closed_at, trading_mode, grade"
+                        " FROM strategy_trades"
+                        " WHERE closed_at IS NOT NULL"
+                        " ORDER BY closed_at DESC LIMIT 10")
+                    for row in cur.fetchall():
+                        (sym, direction, strat, r_mult,
+                         res, opened_at, closed_at, mode, grade) = row
+                        canonical = _instrument_from_text(sym) or (sym or "")
+                        recent_trades.append({
+                            "symbol":    canonical,
+                            "direction": direction,
+                            "strategy":  strat,
+                            "r_multiple": _mb_safe_num(r_mult),
+                            "result":    res,
+                            "opened_at": _mb_iso(opened_at),
+                            "closed_at": _mb_iso(closed_at),
+                            "mode":      mode,
+                            "grade":     grade,
+                        })
+        except Exception as _exc:
+            logger.debug("_mb_journal DB: %s", _exc)
+            available = False
+            _mb_err(errors, "journal", "journal_unavailable")
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    return {"recent_trades": recent_trades, "summary": summary, "available": available}
+
+
+def _mb_performance(errors):
+    try:
+        stats = compute_main_brain_learning_stats()
+        return {
+            "win_rate":         _mb_safe_num(stats.get("win_rate")),
+            "avg_r":            _mb_safe_num(stats.get("avg_r")),
+            "sample":           stats.get("sample") or 0,
+            "best_setup":       stats.get("best_setup"),
+            "best_window":      stats.get("best_window"),
+            "worst_window":     stats.get("worst_window"),
+            "losing_pattern":   stats.get("losing_pattern"),
+            "losing_pattern_n": stats.get("losing_pattern_n"),
+            "skip_pattern":     stats.get("skip_pattern"),
+            "available":        bool(stats.get("available")),
+            "reason":           (stats.get("reason") if not stats.get("available")
+                                 else None),
+        }
+    except Exception as _exc:
+        logger.debug("_mb_performance: %s", _exc)
+        _mb_err(errors, "performance", "performance_unavailable")
+        return {
+            "win_rate": None, "avg_r": None, "sample": 0, "best_setup": None,
+            "best_window": None, "worst_window": None, "losing_pattern": None,
+            "losing_pattern_n": None, "skip_pattern": None,
+            "available": False, "reason": "performance_unavailable",
+        }
+
+
+def _mb_decision_timeline(inst, errors):
+    """Derived partial timeline from available real in-memory stores.
+
+    Real (is_derived=False):    THESIS_TIMELINE_BY_INST transitions.
+    Derived (is_derived=True):  most-recent READY alert from ALERT_HISTORY;
+                                last gateway send epoch from _TRADERSPOST_LAST.
+    Missing / deferred:         VERDICT_GENERATED, TRADE_OPENED, TRADE_CLOSED,
+                                JOURNAL_WRITTEN, STRATEGY_SELECTED, GATEWAY_OUTCOME.
+                                Full event log (_DECISION_EVENT_LOG_BY_INST)
+                                deferred to Phase 7C.
+    """
+    events = []
+
+    # 1. Thesis transition events — real store, maxlen=25/instrument, no lock needed
+    try:
+        for evt in list(THESIS_TIMELINE_BY_INST.get(inst) or [])[:10]:
+            events.append({
+                "event_type": "THESIS_TRANSITION",
+                "ts":         evt.get("ts"),
+                "label":      "Thesis \u2192 {}".format(
+                    evt.get("newStatus", "UNKNOWN")),
+                "details": {
+                    "direction":           evt.get("direction"),
+                    "prev_status":         evt.get("prevStatus"),
+                    "new_status":          evt.get("newStatus"),
+                    "prev_confidence":     evt.get("prevConfidence"),
+                    "new_confidence":      evt.get("newConfidence"),
+                    "primary_reason":      evt.get("primaryReason"),
+                    "invalidation_reason": evt.get("invalidationReason"),
+                },
+                "is_derived": False,
+                "persisted":  False,
+            })
+    except Exception as _exc:
+        logger.debug("_mb_decision_timeline thesis: %s", _exc)
+
+    # 2. Most recent READY alert — derived from ALERT_HISTORY list() snapshot
+    try:
+        for alert in list(ALERT_HISTORY):
+            a_inst = (_instrument_from_text(alert.get("ticker"))
+                      or _instrument_from_text(alert.get("alert_type")))
+            if a_inst != inst:
+                continue
+            if "READY" in str(alert.get("verdict", "")):
+                events.append({
+                    "event_type": "READY_SIGNAL",
+                    "ts":         alert.get("timestamp"),
+                    "label":      "READY signal \u2014 {}".format(
+                        alert.get("direction", "")),
+                    "details": {
+                        "direction":  alert.get("direction"),
+                        "edge_score": alert.get("edge_score"),
+                        "alert_type": alert.get("alert_type"),
+                    },
+                    "is_derived": True,
+                    "persisted":  False,
+                })
+                break  # most recent only
+    except Exception as _exc:
+        logger.debug("_mb_decision_timeline ready_signal: %s", _exc)
+
+    # 3. Last gateway send epoch — derived from _TRADERSPOST_LAST
+    try:
+        tp = _TRADERSPOST_LAST.get(inst)
+        if tp is not None:
+            _fp, epoch_sent = tp
+            if epoch_sent:
+                ts_str = datetime.fromtimestamp(
+                    float(epoch_sent), tz=timezone.utc).isoformat()
+                events.append({
+                    "event_type": "GATEWAY_SEND",
+                    "ts":         ts_str,
+                    "label":      "Order sent to gateway",
+                    "details":    {"epoch_sent": epoch_sent},
+                    "is_derived": True,
+                    "persisted":  False,
+                })
+    except Exception as _exc:
+        logger.debug("_mb_decision_timeline gateway: %s", _exc)
+
+    # Sort descending by ts; None sorts last
+    try:
+        events.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    except Exception:
+        pass
+
+    return {
+        "events":               events[:20],
+        "partial":              True,
+        "completeness":         "PARTIAL",
+        "real_event_types":     ["THESIS_TRANSITION"],
+        "derived_event_types":  ["READY_SIGNAL", "GATEWAY_SEND"],
+        "missing_event_types":  [
+            "VERDICT_GENERATED", "TRADE_OPENED", "TRADE_CLOSED",
+            "JOURNAL_WRITTEN", "STRATEGY_SELECTED", "GATEWAY_OUTCOME",
+        ],
+        "_deferred": "_DECISION_EVENT_LOG_BY_INST deferred to Phase 7C",
+    }
+
+
+def _mb_alerts_section(errors):
+    try:
+        out = []
+        for alert in list(ALERT_HISTORY)[:20]:
+            out.append({
+                "ts":         alert.get("timestamp"),
+                "ticker":     alert.get("ticker"),
+                "alert_type": alert.get("alert_type"),
+                "direction":  alert.get("direction"),
+                "verdict":    alert.get("verdict"),
+                "edge_score": alert.get("edge_score"),
+            })
+        return out
+    except Exception as _exc:
+        logger.debug("_mb_alerts_section: %s", _exc)
+        _mb_err(errors, "alerts", "alerts_unavailable")
+        return []
+
+
+def _mb_system_status(result, errors):
+    try:
+        r        = result or {}
+        db_feed  = r.get("data_feed") or {}
+        databento_on = bool(
+            os.environ.get("DATABENTO_ENABLED", "0").strip()
+            in ("1", "true", "yes", "on"))
+        with LEARNING_LOCK:
+            l_ready   = bool(LEARNING_ANALYTICS.get("ready"))
+            l_enabled = bool(LEARNING_ANALYTICS.get("enabled"))
+        return {
+            "databento_enabled":      databento_on,
+            "databento_connected":    databento_on,
+            "database_ready":         bool(LEARNING_DB_ENABLED),
+            "learning_enabled":       l_enabled,
+            "learning_ready":         l_ready,
+            "active_trades_db_ready": bool(ACTIVE_TRADES_DB_READY),
+            "broker_url_configured":  bool(
+                os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()),
+            "price_fresh": (
+                bool(db_feed.get("price_fresh"))
+                if "price_fresh" in db_feed
+                else bool(r.get("current_price"))
+            ),
+            "price_age_seconds": db_feed.get("price_age_seconds"),
+            "last_analysis_at":  now_utc().isoformat(),
+        }
+    except Exception as _exc:
+        logger.debug("_mb_system_status: %s", _exc)
+        _mb_err(errors, "system_status", "system_status_unavailable")
+        return {
+            "databento_enabled": False, "databento_connected": False,
+            "database_ready": False, "learning_enabled": False, "learning_ready": False,
+            "active_trades_db_ready": False, "broker_url_configured": False,
+            "price_fresh": False, "price_age_seconds": None, "last_analysis_at": None,
+        }
+
+
+# ── Top-level builder ─────────────────────────────────────────────────────────
+
+def build_main_brain_payload(result, instrument=None):
+    """Canonical Main Brain read-only payload builder (Phase 7B).
+
+    Aggregates canonical V1 interfaces and in-memory stores into a single stable,
+    versioned, JSON-serializable dict.  The caller is responsible for calling
+    full_analysis() once and passing the result here.
+
+    Invariants:
+      - Never calls full_analysis()
+      - Never invokes execute_trade_gateway() or any broker HTTP call
+      - Never writes to JOURNAL, ACTIVE_TRADES_BY_INST, or learning state
+      - Never writes to the database (only one SELECT query in the journal section)
+      - All datetimes serialized to ISO-8601 strings
+      - All deque reads via list() snapshots
+      - All returned dicts are copies (shallow) — caller mutation is isolated
+      - Each section is independently fault-isolated; one failure never fails all
+
+    Args:
+        result:     dict returned by full_analysis() (may be None for tests).
+        instrument: canonical instrument key override (e.g. "MGC").
+
+    Returns:
+        dict: versioned Main Brain payload.
+    """
+    errors       = []
+    availability = {}
+    inst = (instrument
+            or (result or {}).get("active_ticker")
+            or DEFAULT_INSTRUMENT)
+
+    # ── sections ──────────────────────────────────────────────────────────────
+    market           = _mb_market(result, errors)
+    market_state     = _mb_market_state(result, errors)
+    left_brain       = _mb_left_brain(inst, result, errors)
+    verdict          = _mb_verdict(result, errors)
+    strategy_scanner = _mb_strategy_scanner(inst, result, errors)
+    active_trades    = _mb_active_trades(inst, result, errors)
+
+    manager = {}
+    try:
+        raw_mgr = (result or {}).get("manager") or {}
+        manager = {
+            "gateway_debug":      dict(raw_mgr.get("gateway_debug") or {}),
+            "training_gate":      dict(raw_mgr.get("training_gate")
+                                       or {"enabled": False}),
+            "auto_trade_enabled": dict(raw_mgr.get("auto_trade_enabled") or {}),
+            "_version":           raw_mgr.get("_version", "v1"),
+        }
+    except Exception as _exc:
+        logger.debug("build_main_brain_payload manager: %s", _exc)
+        _mb_err(errors, "manager", "manager_unavailable")
+
+    execution_gateway = _mb_execution_gateway(inst, errors)
+
+    _coach_default = {
+        "weight_updated": False, "thesis_resolved": False,
+        "thesis_last_resolved_at": None, "learning_influence": 0.0,
+        "rule_engine_eligibility": "LIVE_ELIGIBLE", "_version": "v1",
+    }
+    coach = {}
+    try:
+        raw_coach = (result or {}).get("coach") or {}
+        # If the result has a populated coach block, shallow-copy it.
+        # If it is empty or absent, use the defaults so callers always find the keys.
+        if raw_coach:
+            coach = {**_coach_default, **dict(raw_coach)}
+        else:
+            coach = dict(_coach_default)
+    except Exception as _exc:
+        logger.debug("build_main_brain_payload coach: %s", _exc)
+        _mb_err(errors, "coach", "coach_unavailable")
+        coach = dict(_coach_default)
+
+    journal           = _mb_journal(inst, errors)
+    performance       = _mb_performance(errors)
+    decision_timeline = _mb_decision_timeline(inst, errors)
+    alerts            = _mb_alerts_section(errors)
+    system_status     = _mb_system_status(result, errors)
+
+    # ── availability ──────────────────────────────────────────────────────────
+    error_codes = {e["code"] for e in errors}
+    availability = {
+        "market":           {"available": "market_unavailable"       not in error_codes},
+        "market_state":     {"available": "market_state_unavailable" not in error_codes},
+        "left_brain":       {"available": left_brain.get("available", True)},
+        "verdict":          {"available": "verdict_unavailable"      not in error_codes},
+        "strategy_scanner": {"available": "scanner_unavailable"      not in error_codes},
+        "active_trades":    {"available": "active_trade_unavailable" not in error_codes},
+        "manager":          {"available": "manager_unavailable"      not in error_codes},
+        "execution_gateway":{"available": "broker_status_unavailable" not in error_codes},
+        "coach":            {"available": "coach_unavailable"        not in error_codes},
+        "journal":          {"available": journal.get("available", True),
+                             "error": next(
+                                 (e["code"] for e in errors if e["source"]=="journal"),
+                                 None)},
+        "performance":      {"available": performance.get("available", False)},
+        "timeline":         {"available": True, "partial": True},
+        "alerts":           {"available": "alerts_unavailable"       not in error_codes},
+        "system_status":    {"available": "system_status_unavailable" not in error_codes},
+    }
+
+    return {
+        "_version":          "v1",
+        "generated_at":      now_utc().isoformat(),
+        "market":            market,
+        "market_state":      market_state,
+        "left_brain":        left_brain,
+        "verdict":           verdict,
+        "strategy_scanner":  strategy_scanner,
+        "active_trades":     active_trades,
+        "manager":           manager,
+        "execution_gateway": execution_gateway,
+        "coach":             coach,
+        "journal":           journal,
+        "performance":       performance,
+        "decision_timeline": decision_timeline,
+        "alerts":            alerts,
+        "system_status":     system_status,
+        "availability":      availability,
+        "errors":            errors,
+    }
+
+
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
@@ -43364,6 +44102,63 @@ def strategy_scan_diagnostics():
         "registered_total": len(STRATEGY_DEFS),
         "priority_order":   list(STRATEGY_PRIORITY),
     })
+
+
+@app.route("/main-brain", methods=["GET"])
+def main_brain_route():
+    """Main Brain read-only aggregation endpoint (Phase 7B).
+
+    Assembles the versioned Main Brain dashboard payload from canonical V1
+    interfaces. Read-only — never mutates trading state, gateway, journal,
+    learning, or database.
+
+    Query params:
+      ticker (str): instrument override, e.g. ?ticker=MNQ
+      mode   (str): display-only mode override (SCALP|SWING)
+
+    Authentication: Express Basic Auth proxy (NOT in OPEN_PATHS).
+    Caching: same STATUS_CACHE_TTL_SEC / single-flight pattern as /status.
+    """
+    _raw_tk  = (request.args.get("ticker") or "").upper()
+    tk       = _instrument_from_text(_raw_tk)
+    _mode_ov = (request.args.get("mode") or "").upper()
+    _mode_ov = _mode_ov if _mode_ov in ("SCALP", "SWING") else None
+
+    if STATUS_CACHE_TTL_SEC <= 0:
+        # Cache disabled — build inline (byte-identical to pre-cache path).
+        _MODE_TLS.override = _mode_ov
+        try:
+            result  = full_analysis(ticker_override=tk)
+            payload = build_main_brain_payload(result)
+            return jsonify(payload), 200
+        finally:
+            _MODE_TLS.override = None
+
+    key    = ((_mode_ov + "_") if _mode_ov else "") + (tk or "__active__")
+    now_ts = time.time()
+    with _MB_CACHE_LOCK:
+        ent = _MB_CACHE.get(key)
+        if ent is not None and (now_ts - ent[0]) < STATUS_CACHE_TTL_SEC:
+            return jsonify(ent[1]), 200           # fresh — serve cached
+        if _MB_BUILDING.get(key):
+            if ent is not None:
+                return jsonify(ent[1]), 200       # rebuild in flight — serve stale
+            return jsonify({"status": "warming",
+                            "detail": "main brain warming up — retry shortly"}), 503
+        _MB_BUILDING[key] = True                  # this request becomes the builder
+
+    _MODE_TLS.override = _mode_ov
+    try:
+        result  = full_analysis(ticker_override=tk)
+        payload = build_main_brain_payload(result)
+        with _MB_CACHE_LOCK:
+            _MB_CACHE[key] = (time.time(), payload)
+    finally:
+        _MODE_TLS.override = None
+        with _MB_CACHE_LOCK:
+            _MB_BUILDING[key] = False
+
+    return jsonify(payload), 200
 
 
 # ── Left Brain MI shadow-validation helpers ───────────────────────────────────

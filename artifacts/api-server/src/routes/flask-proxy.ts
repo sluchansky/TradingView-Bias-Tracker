@@ -260,6 +260,10 @@ export const BOT1_ROUTES = [
   // Full Left Brain MI shadow report: timing, classification distribution,
   // flip-rate stats, output validation, VWAP authority. Display-only.
   "/lb-shadow-report",
+  // Main Brain read-only aggregation (Phase 7B — owner-only; DISPLAY/READ-ONLY;
+  // NOT in dashboard-auth OPEN_PATHS). Assembles the versioned Main Brain
+  // payload from canonical V1 interfaces. Never mutates trading state.
+  "/main-brain",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.
