@@ -28,11 +28,15 @@ function Router() {
   const isMobile = useIsTabletOrPhone();
   return (
     <Switch>
-      <Route path="/" component={isMobile ? MobileHome : Home} />
-      <Route path="/mobile" component={MobileHome} />
-      <Route path="/cockpit" component={Cockpit} />
+      {/* Main Brain is the primary home */}
+      <Route path="/" component={MainBrain} />
       <Route path="/main-brain/:section" component={MainBrain} />
       <Route path="/main-brain" component={MainBrain} />
+      {/* Legacy dashboard preserved at /dashboard and /legacy */}
+      <Route path="/dashboard" component={isMobile ? MobileHome : Home} />
+      <Route path="/legacy" component={isMobile ? MobileHome : Home} />
+      <Route path="/mobile" component={MobileHome} />
+      <Route path="/cockpit" component={Cockpit} />
       <Route component={NotFound} />
     </Switch>
   );
