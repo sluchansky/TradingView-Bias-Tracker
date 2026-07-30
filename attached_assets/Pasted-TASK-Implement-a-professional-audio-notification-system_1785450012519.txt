@@ -1,0 +1,268 @@
+TASK: Implement a professional audio notification system for the AI Trading Partner.
+
+GOAL
+
+Replace the current alert sound system with a structured audio notification framework.
+
+IMPORTANT
+
+This is a UI / UX enhancement only.
+
+DO NOT MODIFY:
+
+- Databento
+- Market-data ingestion
+- Strategy engine
+- Edge Score
+- Left Brain logic
+- Right Brain logic
+- Learning engine
+- Coach logic
+- Scanner logic
+- TradersPost
+- Execution logic
+- Active trade management
+- Journal logic
+- Authentication
+- API contracts
+- Polling intervals
+- Trading decisions
+
+No trading behavior should change.
+
+--------------------------------------------------
+
+PHASE 1
+
+Create a centralized Audio Manager.
+
+Do NOT scatter audio calls throughout the application.
+
+All sounds must be played through one reusable service.
+
+Example responsibilities:
+
+- preload sounds
+- cache audio
+- prevent duplicate playback
+- throttle repeated sounds
+- expose play() methods
+- support mute
+- support future volume controls
+
+--------------------------------------------------
+
+Create sound events.
+
+The system should support these events:
+
+SCAN_FOUND
+READY_TO_TRADE
+ORDER_SUBMITTED
+ORDER_FILLED
+WARNING
+ERROR
+SYSTEM_ONLINE
+SYSTEM_OFFLINE
+
+Use event names or equivalent constants.
+
+--------------------------------------------------
+
+Sound behavior
+
+SCAN_FOUND
+
+Purpose:
+Left Brain discovered a new opportunity.
+
+Sound:
+
+Very soft digital tick.
+
+Length:
+
+<250 ms
+
+--------------------------------------------------
+
+READY_TO_TRADE
+
+Purpose:
+
+All required confirmations passed.
+
+This is the primary sound.
+
+Use:
+
+A clean sonar / futuristic AI chime.
+
+Professional.
+
+Calm.
+
+Not loud.
+
+Approximately 300–500 ms.
+
+This should become the signature sound of the platform.
+
+--------------------------------------------------
+
+ORDER_SUBMITTED
+
+Very short click.
+
+--------------------------------------------------
+
+ORDER_FILLED
+
+Short satisfying confirmation tone.
+
+--------------------------------------------------
+
+WARNING
+
+Low two-tone pulse.
+
+Used for:
+
+Data degradation
+
+High latency
+
+Feed issues
+
+System warning
+
+--------------------------------------------------
+
+ERROR
+
+Distinct from WARNING.
+
+Used only for failures.
+
+--------------------------------------------------
+
+SYSTEM_ONLINE
+
+Gentle startup confirmation.
+
+--------------------------------------------------
+
+SYSTEM_OFFLINE
+
+Soft disconnect tone.
+
+--------------------------------------------------
+
+TECHNICAL REQUIREMENTS
+
+Preload all sounds.
+
+Do not create new Audio objects every play.
+
+Prevent overlapping playback.
+
+Throttle duplicate events.
+
+Example:
+
+READY_TO_TRADE should not play repeatedly every poll cycle.
+
+Instead, play only when transitioning from NOT READY -> READY.
+
+--------------------------------------------------
+
+Browser compatibility
+
+Support:
+
+Chrome
+
+Edge
+
+Safari
+
+Firefox
+
+--------------------------------------------------
+
+Mute support
+
+Add one global mute setting.
+
+No UI required yet.
+
+Just implement the capability.
+
+--------------------------------------------------
+
+Future support
+
+Design the Audio Manager to support:
+
+volume
+
+custom sound packs
+
+voice notifications
+
+user preferences
+
+without requiring a rewrite.
+
+--------------------------------------------------
+
+VALIDATION
+
+Verify:
+
+✓ Sounds preload correctly
+
+✓ No console errors
+
+✓ No memory leaks
+
+✓ No duplicate playback
+
+✓ READY_TO_TRADE only plays once per new opportunity
+
+✓ Existing regressions pass
+
+✓ TypeScript passes
+
+✓ Production build passes
+
+--------------------------------------------------
+
+DO NOT
+
+Do not change any trading calculations.
+
+Do not modify strategy selection.
+
+Do not modify Edge Score.
+
+Do not modify Databento.
+
+Do not change polling.
+
+Do not change execution.
+
+--------------------------------------------------
+
+FINAL RESPONSE
+
+Provide:
+
+- Files created
+- Files modified
+- Audio Manager architecture
+- Event mapping
+- Regression results
+- TypeScript results
+- Build results
+- Confirmation that trading logic was completely untouched
