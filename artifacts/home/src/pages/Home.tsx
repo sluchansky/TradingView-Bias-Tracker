@@ -3187,7 +3187,10 @@ export default function Home() {
           </button>
           {/* Page nav */}
           <div style={{ display:'flex', gap:1, borderRadius:6, border:'1px solid rgba(255,255,255,0.07)', padding:'2px 3px', background:'rgba(255,255,255,0.020)' }}>
-            <span style={{ fontSize:9.5, fontFamily:'monospace', fontWeight:700, color:'#93c5fd', padding:'3px 9px', borderRadius:4, background:'rgba(59,130,246,0.14)', letterSpacing:'0.08em' }}>HOME</span>
+            <a href="/" style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em' }}
+              onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.65)'}
+              onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.28)'}>⬡ MAIN BRAIN</a>
+            <span style={{ fontSize:9.5, fontFamily:'monospace', fontWeight:700, color:'#93c5fd', padding:'3px 9px', borderRadius:4, background:'rgba(59,130,246,0.14)', letterSpacing:'0.08em' }}>DASHBOARD</span>
             <a href="/cockpit" style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em' }}
               onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.65)'}
               onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.28)'}>COCKPIT</a>

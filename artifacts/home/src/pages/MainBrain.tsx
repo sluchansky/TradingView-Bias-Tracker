@@ -308,10 +308,31 @@ const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
         );
       })}
 
-      {/* System health dot */}
-      <div style={{ marginTop:'auto', paddingTop:16, display:'flex', flexDirection:'column', alignItems:'center', gap:4 }}>
-        {statusDot(systemOk)}
-        <span style={{ fontSize:7, color:T.txtMuted, letterSpacing:'0.06em' }}>SYS</span>
+      {/* Secondary: legacy dashboard link */}
+      <div style={{ marginTop:'auto', display:'flex', flexDirection:'column', alignItems:'center', gap:4, width:'100%' }}>
+        <div style={{ width:32, height:1, background:T.border, marginBottom:4 }} />
+        <a href="/dashboard" title="System Dashboard (legacy)" style={{ textDecoration:'none' }}>
+          <div style={{
+            display:'flex', flexDirection:'column', alignItems:'center', gap:3,
+            padding:'6px 4px', borderRadius:6, width:46, cursor:'pointer',
+            border:'1px solid transparent', opacity:0.55,
+            transition:'opacity 0.15s',
+          }}
+            onMouseEnter={e => (e.currentTarget as HTMLDivElement).style.opacity='1'}
+            onMouseLeave={e => (e.currentTarget as HTMLDivElement).style.opacity='0.55'}
+          >
+            <span style={{ fontSize:11, lineHeight:1, color:T.txtMuted }}>⚙</span>
+            <span style={{ fontSize:6.5, fontWeight:700, letterSpacing:'0.06em', color:T.txtMuted, textAlign:'center', lineHeight:1.2 }}>
+              SYSTEM{'\n'}DASHBOARD
+            </span>
+          </div>
+        </a>
+
+        {/* System health dot */}
+        <div style={{ paddingTop:8, display:'flex', flexDirection:'column', alignItems:'center', gap:4 }}>
+          {statusDot(systemOk)}
+          <span style={{ fontSize:7, color:T.txtMuted, letterSpacing:'0.06em' }}>SYS</span>
+        </div>
       </div>
     </nav>
   );
