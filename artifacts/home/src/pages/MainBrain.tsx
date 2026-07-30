@@ -8,8 +8,9 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Link, useLocation } from 'wouter';
+import { Link, useLocation, useParams } from 'wouter';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
+import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -253,16 +254,7 @@ const EdgeGauge: React.FC<{ score: number | null; max?: number }> = ({ score, ma
   );
 };
 
-// ── Nav items ─────────────────────────────────────────────────────────────────
-const NAV_ITEMS = [
-  { id: 'main-brain', label: 'Main Brain', path: '/main-brain', icon: '⬡', live: true },
-  { id: 'analysis',   label: 'Analysis',   path: null, href: '/api/dashboard', icon: '⚡', live: true },
-  { id: 'scanner',    label: 'Scanner',    path: null, icon: '◎', live: false },
-  { id: 'trades',     label: 'Active Trades', path: null, icon: '↗', live: false },
-  { id: 'journal',    label: 'Journal',    path: null, icon: '≡', live: false },
-  { id: 'coach',      label: 'Coach',      path: null, icon: '◆', live: false },
-  { id: 'alerts',     label: 'Alerts',     path: null, icon: '◉', live: false },
-];
+// NAV_ITEMS and related constants are imported from ../lib/navItems
 
 // ── Sidenav ───────────────────────────────────────────────────────────────────
 const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
@@ -285,29 +277,25 @@ const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
 
       {NAV_ITEMS.map(item => {
         const isActive = location === item.path;
-        const col = isActive ? T.cyan : item.live ? T.txtSec : T.txtMuted;
-        const content = (
-          <div title={item.label} style={{
-            display:'flex', flexDirection:'column', alignItems:'center', gap:3,
-            padding:'8px 6px', borderRadius:8, width:46, cursor: item.live ? 'pointer' : 'default',
-            background: isActive ? `${T.cyan}14` : 'transparent',
-            border: isActive ? `1px solid ${T.cyan}33` : '1px solid transparent',
-            opacity: item.live ? 1 : 0.35,
-            transition:'all 0.15s',
-          }}>
-            <span style={{ fontSize:15, lineHeight:1, color:col }}>{item.icon}</span>
-            <span style={{ fontSize:7.5, fontWeight:700, letterSpacing:'0.06em', color:col, textAlign:'center', lineHeight:1.2 }}>
-              {item.label.toUpperCase()}
-            </span>
-          </div>
+        const col = isActive ? T.cyan : T.txtSec;
+        return (
+          <Link key={item.id} to={item.path} style={{ textDecoration:'none', marginBottom:4 }}
+            aria-label={item.label} aria-current={isActive ? 'page' : undefined}>
+            <div title={item.label} style={{
+              display:'flex', flexDirection:'column', alignItems:'center', gap:3,
+              padding:'8px 6px', borderRadius:8, width:46, cursor:'pointer',
+              background: isActive ? `${T.cyan}14` : 'transparent',
+              border: isActive ? `1px solid ${T.cyan}33` : '1px solid transparent',
+              opacity: 1,
+              transition:'all 0.15s',
+            }}>
+              <span style={{ fontSize:15, lineHeight:1, color:col }}>{item.icon}</span>
+              <span style={{ fontSize:7.5, fontWeight:700, letterSpacing:'0.06em', color:col, textAlign:'center', lineHeight:1.2 }}>
+                {item.label.toUpperCase()}
+              </span>
+            </div>
+          </Link>
         );
-        if (!item.live) {
-          return <div key={item.id} aria-disabled="true" style={{ marginBottom:4 }}>{content}</div>;
-        }
-        if (item.href) {
-          return <a key={item.id} href={item.href} target="_blank" rel="noreferrer" style={{ textDecoration:'none', marginBottom:4 }} aria-label={item.label}>{content}</a>;
-        }
-        return <Link key={item.id} to={item.path!} style={{ textDecoration:'none', marginBottom:4 }} aria-label={item.label}>{content}</Link>;
       })}
 
       {/* System health dot */}
@@ -1099,6 +1087,10 @@ const ErrorScreen: React.FC<{ msg: string | null; refresh: () => void }> = ({ ms
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function MainBrain() {
+  // Section param — present when route is /main-brain/:section, absent at /main-brain
+  const params = useParams<{ section?: string }>();
+  const section = (params as Record<string, string | undefined>).section ?? '';
+
   const [ticker, setTicker] = useState<string>(() => {
     try { return localStorage.getItem('mb_ticker') || 'MGC'; } catch { return 'MGC'; }
   });
@@ -1113,6 +1105,72 @@ export default function MainBrain() {
   const allOk = !!(sys.db_ready && sys.learning_ready);
   const isLoading = fetchState === 'loading' && !payload;
   const isError   = (fetchState === 'error' || isAuthFail) && !payload;
+
+  // Section-based panel rendering — always reuses existing panel components,
+  // never creates a second polling loop or duplicates business logic.
+  const renderSectionPanels = (): React.ReactNode => {
+    switch (section) {
+      case 'analysis':
+        return (
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
+            <ThesisPanel p={p} />
+            <VerdictPanel p={p} />
+          </div>
+        );
+      case 'scanner':
+        return (
+          <>
+            <div style={{ marginBottom:10 }}><ScannerPanel p={p} /></div>
+            <TradePlanPanel p={p} />
+          </>
+        );
+      case 'trades':
+        return (
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
+            <TradePlanPanel p={p} />
+            <ActiveTradesPanel p={p} />
+            <ExecutionPanel p={p} />
+          </div>
+        );
+      case 'journal':
+        return <JournalPanel p={p} />;
+      case 'coach':
+        return <CoachPanel p={p} />;
+      case 'alerts':
+        return (
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
+            <TimelinePanel p={p} />
+            <AlertsPanel p={p} />
+            <SystemHealthPanel p={p} />
+          </div>
+        );
+      default:
+        // Root overview or unknown section → full 4-row grid
+        return (
+          <>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
+              <ThesisPanel p={p} />
+              <VerdictPanel p={p} />
+              <ScannerPanel p={p} />
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
+              <TradePlanPanel p={p} />
+              <ActiveTradesPanel p={p} />
+              <ExecutionPanel p={p} />
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-2">
+              <CoachPanel p={p} />
+              <JournalPanel p={p} />
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
+              <TimelinePanel p={p} />
+              <AlertsPanel p={p} />
+              <SystemHealthPanel p={p} />
+            </div>
+          </>
+        );
+    }
+  };
 
   return (
     <div style={{ display:'flex', minHeight:'100vh', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif" }}>
@@ -1149,32 +1207,22 @@ export default function MainBrain() {
                 <MarketStrip p={p} />
               </div>
 
-              {/* Row 1: Thesis · Verdict · Scanner */}
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
-                <ThesisPanel p={p} />
-                <VerdictPanel p={p} />
-                <ScannerPanel p={p} />
-              </div>
+              {/* Section breadcrumb — visible on sub-section pages */}
+              {section !== '' && KNOWN_SECTIONS.includes(section) && (
+                <div style={{ marginBottom:12, display:'flex', alignItems:'center', gap:10 }}>
+                  <span style={{ fontSize:11, color:T.cyan, fontWeight:700, letterSpacing:'0.08em' }}>
+                    {(SECTION_LABELS[section] ?? section).toUpperCase()}
+                  </span>
+                  <Link to="/main-brain" style={{ fontSize:10, color:T.txtMuted, textDecoration:'none',
+                    borderRadius:4, padding:'2px 8px', background:`${T.border}60`,
+                    border:`1px solid ${T.border}`, display:'inline-flex', alignItems:'center', gap:4 }}>
+                    ← Overview
+                  </Link>
+                </div>
+              )}
 
-              {/* Row 2: Trade Plan · Active Trades · Execution */}
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
-                <TradePlanPanel p={p} />
-                <ActiveTradesPanel p={p} />
-                <ExecutionPanel p={p} />
-              </div>
-
-              {/* Row 3: Coach · Journal */}
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-2">
-                <CoachPanel p={p} />
-                <JournalPanel p={p} />
-              </div>
-
-              {/* Row 4: Timeline · Alerts · System Health */}
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
-                <TimelinePanel p={p} />
-                <AlertsPanel p={p} />
-                <SystemHealthPanel p={p} />
-              </div>
+              {/* Section panels */}
+              {renderSectionPanels()}
             </>
           )}
         </main>

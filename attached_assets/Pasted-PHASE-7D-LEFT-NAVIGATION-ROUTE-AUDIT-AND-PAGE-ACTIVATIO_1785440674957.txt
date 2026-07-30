@@ -1,0 +1,392 @@
+PHASE 7D — LEFT NAVIGATION ROUTE AUDIT AND PAGE ACTIVATION
+
+OBJECTIVE
+
+Audit every item in the Main Brain left navigation and make each visible navigation item behave honestly.
+
+The current production dashboard shows several left-side items that appear inactive or unreachable, including Coach.
+
+The goal is to determine, for each item, whether:
+
+1. A real page already exists but is not wired correctly
+2. A route exists but the navigation button points to the wrong path
+3. A page exists only as an embedded Main Brain panel
+4. The item is a placeholder with no implemented page
+5. The item should be temporarily disabled or hidden
+
+Do not build large new feature pages until the audit is complete.
+
+NON-NEGOTIABLE CONSTRAINTS
+
+- DO NOT modify Databento ingestion
+- DO NOT modify strategy logic
+- DO NOT modify Edge Score calculations
+- DO NOT modify learning calculations
+- DO NOT modify TradersPost or execution behavior
+- DO NOT modify active trade management
+- DO NOT change API payload contracts unless required to expose an already-existing page
+- DO NOT create fake data to populate unfinished pages
+- DO NOT make an inactive navigation item look functional unless it truly works
+- Preserve the current Main Brain dashboard exactly unless a small navigation fix is required
+
+VISIBLE NAVIGATION ITEMS TO AUDIT
+
+Audit every left-side item currently rendered, including at minimum:
+
+- Main Brain
+- Analysis
+- Scanner
+- Active Trades
+- Journal
+- Coach
+- Alerts
+
+Also inspect any additional visible or conditionally rendered navigation items.
+
+TASK 1 — BASELINE AND INVENTORY
+
+Before editing:
+
+1. Record branch and HEAD
+2. Record working-tree status
+3. Run the current Main Brain frontend tests
+4. Run TypeScript type checking
+5. Run the production build
+6. Record the exact current navigation labels, icons, click handlers, route targets, and disabled states
+
+Create an inventory table:
+
+| Nav item | Current target | Route exists | Page component exists | API exists | Current behavior | Recommended action |
+
+Do not modify code until this inventory is complete.
+
+TASK 2 — TRACE THE ROUTING ARCHITECTURE
+
+Read and document:
+
+- MainBrain.tsx
+- the left-navigation component
+- React router configuration
+- Express route handling
+- Flask routes related to these pages
+- any static HTML legacy dashboards
+- any iframe or external-page navigation behavior
+- any auth or proxy behavior that affects route access
+
+Determine whether the application uses:
+
+- React Router
+- location.href navigation
+- window.open
+- anchors
+- state-based tabs
+- server-rendered routes
+- a mixture of these
+
+Avoid introducing a second routing pattern unless absolutely necessary.
+
+TASK 3 — CLASSIFY EVERY NAV ITEM
+
+Assign each item exactly one classification:
+
+A. FULL PAGE EXISTS
+A functioning page and route already exist.
+
+B. COMPONENT EXISTS, ROUTE MISSING
+A usable component exists but is not reachable directly.
+
+C. EMBEDDED PANEL ONLY
+The feature exists only inside Main Brain and has no dedicated page.
+
+D. LEGACY PAGE EXISTS
+An older page exists outside the new operator console.
+
+E. PLACEHOLDER ONLY
+The item has no real implementation.
+
+F. INTENTIONALLY DISABLED
+The item is deliberately unavailable because its phase is not complete.
+
+Include evidence for each classification with file paths and route names.
+
+TASK 4 — APPLY THE SMALLEST HONEST FIX
+
+For items classified A or B:
+
+- Wire the navigation item to the existing real page
+- Reuse the existing routing architecture
+- Preserve authentication
+- Preserve browser back/forward behavior
+- Preserve direct URL access when supported
+- Ensure refreshing the page does not break the route
+
+For items classified C:
+
+Choose one of these based on the existing architecture:
+
+1. Navigate to Main Brain and scroll/focus the corresponding panel, or
+2. Add a lightweight dedicated view that reuses the existing panel component
+
+Do not duplicate business logic.
+
+For items classified D:
+
+- Do not automatically link to the legacy page
+- Determine whether it is safe and appropriate
+- Clearly label it as legacy if it must remain accessible
+- Prefer the current operator-console implementation
+
+For items classified E or F:
+
+- Disable the item visibly
+- Add a small “Coming Soon” or “Not yet available” indicator
+- Prevent click behavior
+- Do not leave it looking active
+- Do not fabricate a page
+
+TASK 5 — COACH PAGE DECISION
+
+Give Coach special attention.
+
+Audit whether the system already has:
+
+- CoachPanel
+- learning status
+- LRE eligibility
+- weight_updated
+- thesis_resolved
+- last_resolved
+- learning influence
+- sample count
+- strategy weights
+- performance summaries
+- learning audit history
+
+If a complete Coach page already exists:
+- Wire it correctly
+
+If only CoachPanel exists:
+- Create a lightweight dedicated Coach route by reusing the existing CoachPanel and already-available learning data
+- Do not add new learning calculations
+- Do not invent recommendations
+- Do not create fake strategy performance
+
+The dedicated Coach page may contain only existing truthful data:
+
+COACH STATUS
+- Learning enabled
+- LRE eligible
+- Weight updated
+- Thesis resolved
+- Last resolved time
+- Learning influence
+
+LEARNING DATA
+- Available sample count
+- Existing strategy weights
+- Existing performance values
+- Existing recent learning events
+
+If data is unavailable, show UNKNOWN or “No data available.”
+
+TASK 6 — PAGE EXPECTATIONS
+
+MAIN BRAIN
+- Remains the current operator console
+- No redesign
+
+ANALYSIS
+- Should expose the existing Left Brain thesis and reasoning
+- Reuse current analysis data
+- Do not create a second analysis engine
+
+SCANNER
+- Should expose the existing strategy scanner
+- Reuse existing scanner data and transparency components
+- Do not recalculate completeness on a separate code path
+
+ACTIVE TRADES
+- Show current active trades only
+- If no active trades, clearly say so
+- Never create sample trades
+
+JOURNAL
+- Reuse existing journal records and summary data
+- Empty journal must remain empty
+
+COACH
+- Reuse existing Coach and learning data only
+
+ALERTS
+- Reuse the current live alerts feed and timeline data
+- Do not create duplicate polling loops if one already exists
+
+TASK 7 — SHARED DATA AND COMPONENTS
+
+Refactor only where necessary so pages reuse:
+
+- normalizeMainBrainPayload()
+- existing payload polling/fetching
+- existing panel components
+- existing fallback handling
+- existing status components
+
+Avoid:
+
+- multiple independent /main-brain polling loops
+- duplicated normalizers
+- duplicated scoring explanations
+- duplicated scanner selection logic
+- page-specific versions of the same canonical data
+
+There must remain one canonical display normalization path.
+
+TASK 8 — NAVIGATION BEHAVIOR
+
+Verify each active item:
+
+- visibly indicates the selected page
+- is keyboard accessible
+- has operator-readable text
+- does not rely only on icon color
+- routes correctly on click
+- supports browser back
+- supports browser forward
+- survives page refresh
+- does not redirect to the old dashboard unexpectedly
+- does not lose authentication
+- does not open duplicate tabs unless explicitly intended
+
+Verify disabled items:
+
+- are visibly disabled
+- do not navigate
+- have an explanatory tooltip or label
+- are not announced as active by accessibility attributes
+
+TASK 9 — DIRECT URL TESTS
+
+Test the authenticated production-equivalent paths for every active route.
+
+Suggested paths, subject to the existing routing structure:
+
+- /main-brain
+- /main-brain/analysis
+- /main-brain/scanner
+- /main-brain/active-trades
+- /main-brain/journal
+- /main-brain/coach
+- /main-brain/alerts
+
+Do not force these exact paths if the current router already has a cleaner canonical pattern.
+
+Document the final route map.
+
+TASK 10 — TEST COVERAGE
+
+Add tests for:
+
+- every nav label
+- every route target
+- selected-state behavior
+- browser navigation behavior where practical
+- disabled placeholder behavior
+- Coach route rendering
+- no-data Coach state
+- empty active-trades state
+- empty journal state
+- missing alerts state
+- missing analysis state
+- missing scanner state
+- direct route rendering
+- unknown route fallback
+- authentication preservation
+- no duplicated polling caused by route changes
+
+Include a test proving that clicking Coach does not silently do nothing.
+
+TASK 11 — VISUAL VALIDATION
+
+Run the app and capture authenticated screenshots of:
+
+1. Main Brain
+2. Analysis
+3. Scanner
+4. Active Trades
+5. Journal
+6. Coach
+7. Alerts
+
+For unavailable pages, capture the honest disabled navigation state instead.
+
+Verify:
+
+- no blank page
+- no legacy-dashboard surprise
+- no invisible selected state
+- no clipped primary content
+- no broken sidebar
+- no console errors
+- no repeated network-request storm
+
+TASK 12 — REGRESSION VALIDATION
+
+Run:
+
+- new navigation tests
+- existing Main Brain frontend tests
+- Phase 7C tests
+- backend tests
+- Databento tests
+- execution and TradersPost tests
+- TypeScript type checking
+- production build
+- Python compile checks
+- git diff --check
+
+Confirm:
+
+- no trading decision changed
+- no score changed
+- no strategy eligibility changed
+- no learning calculation changed
+- no Databento behavior changed
+- no execution behavior changed
+
+TASK 13 — COMPLETION REPORT
+
+Return:
+
+1. Branch and starting HEAD
+2. Navigation inventory table
+3. Classification for every item
+4. Final route map
+5. Pages wired
+6. Pages created by component reuse
+7. Items disabled or hidden
+8. Files modified
+9. Tests added
+10. Exact pass counts
+11. Type-check result
+12. Build result
+13. Screenshot results
+14. Confirmation Databento was untouched
+15. Confirmation trading logic was untouched
+16. Confirmation execution was untouched
+17. Final commit hash
+
+COMMIT MESSAGE
+
+V1-P7D activate honest Main Brain navigation
+
+STOP CONDITIONS
+
+Stop and report before continuing if:
+
+- a nav item points to a materially different legacy system
+- activating a page requires duplicating trading logic
+- activating Coach requires creating new learning calculations
+- authentication cannot be preserved
+- direct routes expose unauthenticated private data
+- a page requires changing Databento, scoring, strategy, or execution behavior
+- the current production router architecture is materially different from what the Main Brain frontend assumes
