@@ -1054,6 +1054,155 @@ def test_coach_lsi_existing_fields_intact():
         assert field in lsi
 
 
+# -----------------------------------------------------------------
+# SEMANTIC: rule_engine_eligibility — 50-sample boundary classification
+#
+# _recompute_learning_eligibility() decides GHOST_ONLY vs LIVE_ELIGIBLE
+# based on LEARNING_LIVE_MIN_SAMPLE (default 50).  These tests exercise
+# the exact boundary:
+#
+#   n = MIN - 1  (49 with default)  →  GHOST_ONLY  (under threshold)
+#   n = MIN      (50 with default)  →  LIVE_ELIGIBLE (at threshold, positive expectancy)
+#
+# Tests read LEARNING_LIVE_MIN_SAMPLE from the module so they stay
+# correct if the constant is ever adjusted via the environment variable.
+# -----------------------------------------------------------------
+
+def _build_eligibility_mock_conn(inst_rows, last20_rows):
+    """Return a mock psycopg2 connection whose cursor fetchall() responds
+    to the four queries issued by _recompute_learning_eligibility():
+      1. inst_rows  (per-instrument aggregate stats)
+      2. last20     (last-20 avg R per instrument)
+      3. setup_rows (per-setup disabled-strategy candidates)
+      4. today_labels (today's trade labels)
+    """
+    mock_cur = unittest.mock.MagicMock()
+    mock_cur.fetchall.side_effect = [
+        inst_rows,   # query 1: inst_rows
+        last20_rows, # query 2: last20
+        [],          # query 3: setup_rows (none)
+        [],          # query 4: today_label_rows (none)
+    ]
+    mock_conn = unittest.mock.MagicMock()
+    # conn.cursor(cursor_factory=...) → mock_cur regardless of kwargs
+    mock_conn.cursor.return_value = mock_cur
+    return mock_conn, mock_cur
+
+
+def test_coach_rule_engine_eligibility_ghost_only_below_min_sample():
+    """_recompute_learning_eligibility() must classify an instrument as GHOST_ONLY
+    when the DB returns exactly LEARNING_LIVE_MIN_SAMPLE - 1 closed trades.
+
+    The threshold is read from the module (app.LEARNING_LIVE_MIN_SAMPLE) so this
+    test remains correct if the constant is changed via the environment variable.
+    Tests read it from the module — they never hard-code 49 or 50.
+    """
+    psycopg2_mod = getattr(app, "psycopg2", None)
+    if psycopg2_mod is None:
+        # psycopg2 unavailable in this environment — skip gracefully.
+        return
+
+    min_sample = app.LEARNING_LIVE_MIN_SAMPLE        # e.g. 50
+    n_below    = min_sample - 1                      # e.g. 49
+
+    inst_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "n": n_below, "expectancy": 0.5,
+        "win_rate": 0.6, "tp1_hit_rate": 0.7,
+    }
+    mock_conn, _ = _build_eligibility_mock_conn([inst_row], [])
+
+    # Swap write connection to None so no INSERT is attempted.
+    mock_wconn = unittest.mock.MagicMock()
+    mock_wconn.__enter__ = unittest.mock.MagicMock(return_value=mock_wconn)
+    mock_wconn.__exit__ = unittest.mock.MagicMock(return_value=False)
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "_learning_conn", return_value=None),
+        ):
+            app._recompute_learning_eligibility(mock_conn)
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+
+    assert entry, (
+        "LEARNING_ELIGIBILITY must contain a 'MGC::SWING' entry after recompute; "
+        "check that _recompute_learning_eligibility iterates ASSETS correctly")
+    status = entry.get("status")
+    assert status == "GHOST_ONLY", (
+        f"With n={n_below} trades (LEARNING_LIVE_MIN_SAMPLE - 1 = {n_below}), "
+        f"eligibility must be GHOST_ONLY, got {status!r}; "
+        "a bug in the threshold comparison (e.g. <= instead of <) would produce "
+        "LIVE_ELIGIBLE here, silently allowing live orders before sufficient history")
+    # sample_size must match what we gave the cursor
+    assert entry.get("sample_size") == n_below, (
+        f"sample_size mismatch: expected {n_below}, got {entry.get('sample_size')!r}")
+
+
+def test_coach_rule_engine_eligibility_live_eligible_at_min_sample():
+    """_recompute_learning_eligibility() must classify an instrument as LIVE_ELIGIBLE
+    when the DB returns exactly LEARNING_LIVE_MIN_SAMPLE closed trades with positive
+    expectancy and a positive last-20 average R.
+
+    The constant is read from the module — never hard-coded — so the test stays
+    correct if LEARNING_LIVE_MIN_SAMPLE is changed via the environment variable.
+    """
+    psycopg2_mod = getattr(app, "psycopg2", None)
+    if psycopg2_mod is None:
+        return
+
+    min_sample = app.LEARNING_LIVE_MIN_SAMPLE        # e.g. 50
+    n_at       = min_sample                          # exactly at threshold
+
+    inst_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "n": n_at, "expectancy": 0.5,
+        "win_rate": 0.6, "tp1_hit_rate": 0.7,
+    }
+    last20_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "last_20_avg_r": 0.3,           # positive → no last-20 veto
+    }
+    mock_conn, _ = _build_eligibility_mock_conn([inst_row], [last20_row])
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "_learning_conn", return_value=None),
+        ):
+            app._recompute_learning_eligibility(mock_conn)
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+
+    assert entry, (
+        "LEARNING_ELIGIBILITY must contain a 'MGC::SWING' entry after recompute")
+    status = entry.get("status")
+    assert status == "LIVE_ELIGIBLE", (
+        f"With n={n_at} trades (LEARNING_LIVE_MIN_SAMPLE = {min_sample}) and positive "
+        f"expectancy/last-20, eligibility must be LIVE_ELIGIBLE, got {status!r}; "
+        "a bug in the threshold comparison (e.g. > instead of >=) would leave the "
+        "instrument permanently GHOST_ONLY even after enough history is accumulated")
+    assert entry.get("sample_size") == n_at, (
+        f"sample_size mismatch: expected {n_at}, got {entry.get('sample_size')!r}")
+
+
 # ===========================================================================
 # CROSS-INTERFACE MATRIX — all 7 interfaces COMPLETE
 # ===========================================================================
