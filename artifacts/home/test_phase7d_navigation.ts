@@ -273,19 +273,34 @@ for (const s of emptyStateSections) {
     NAV_ITEMS.find(n => n.id === s)?.path.startsWith('/main-brain/') === true);
 }
 
-// ── T17: Unknown-section fallback ─────────────────────────────────────────────
-section('T17: Unknown-section renders full grid (fallback to overview)');
+// ── T17: Unknown-section redirect behavior ────────────────────────────────────
+section('T17: Unknown-section redirects to /main-brain (replace behavior)');
 
-// The switch in renderSectionPanels uses `default` for unknown sections,
-// which renders the full overview grid.  Verify that unknown paths are not
-// in NAV_ITEMS (so the router would render NotFound via App.tsx) but that
-// if somehow a bad section param reaches MainBrain, the default case handles it.
+// MainBrain.tsx fires useEffect: if section !== '' && !KNOWN_SECTIONS.includes(section),
+// navigate('/main-brain', { replace: true }).
+// The replace ensures the invalid URL is removed from browser history.
+//
+// Verify the condition logic used to trigger the redirect:
 
-const unknownSections = ['dashboard', 'backtest', 'settings', 'admin', ''];
-for (const s of unknownSections) {
-  check(`'${s || "(empty)"}' is not a KNOWN_SECTION (would fall through to overview)`,
-    !KNOWN_SECTIONS.includes(s));
+function wouldRedirect(seg: string): boolean {
+  return seg !== '' && !KNOWN_SECTIONS.includes(seg);
 }
+
+const unknownSections = ['dashboard', 'backtest', 'settings', 'admin', 'not-a-real-section'];
+for (const s of unknownSections) {
+  check(`'${s}' is not a KNOWN_SECTION`,       !KNOWN_SECTIONS.includes(s));
+  check(`'${s}' triggers redirect condition`,   wouldRedirect(s));
+}
+
+check("empty string '' does NOT trigger redirect (root overview)", !wouldRedirect(''));
+
+// Known sections must NOT trigger the redirect
+for (const s of KNOWN_SECTIONS) {
+  check(`known section '${s}' does NOT trigger redirect`, !wouldRedirect(s));
+}
+
+// 'main-brain' itself (root) does not trigger redirect
+check("'main-brain' segment does not redirect (no section at root)", !wouldRedirect(''));
 
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n${'='.repeat(64)}`);

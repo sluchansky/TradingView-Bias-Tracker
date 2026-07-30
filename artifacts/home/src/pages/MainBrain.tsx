@@ -1098,6 +1098,15 @@ export default function MainBrain() {
     setTicker(t); try { localStorage.setItem('mb_ticker', t); } catch {}
   };
 
+  // Redirect unknown section segments to the root overview (replace so the invalid
+  // URL is removed from browser history rather than pushed as a new entry).
+  const [, navigate] = useLocation();
+  useEffect(() => {
+    if (section !== '' && !KNOWN_SECTIONS.includes(section)) {
+      navigate('/main-brain', { replace: true });
+    }
+  }, [section]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const { payload, fetchState, lastOk, error, isAuthFail, refresh } = useMainBrain(ticker);
 
   const p = (payload ?? {}) as Record<string, unknown>;

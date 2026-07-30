@@ -1,0 +1,152 @@
+Perform a narrow Phase 7D.1 navigation closure validation.
+
+Do not redesign the dashboard and do not modify Databento ingestion, market-data handling, strategy logic, Edge Score calculations, learning calculations, TradersPost execution, active-trade management, polling intervals, or API payload contracts.
+
+Starting requirements:
+
+1. Confirm the current branch and HEAD.
+2. Confirm commit d4c1caf is present in the current branch history.
+3. Do not make code changes unless an actual validation failure is found.
+
+Validation tasks:
+
+A. AUTHENTICATED ROUTE VALIDATION
+
+Validate every Main Brain route through the same authenticated browser/proxy path used by the published application:
+
+* /main-brain
+* /main-brain/analysis
+* /main-brain/scanner
+* /main-brain/trades
+* /main-brain/journal
+* /main-brain/coach
+* /main-brain/alerts
+
+For every route, confirm:
+
+* The page does not remain stuck on “Connecting.”
+* The expected panels render.
+* The correct sidebar item has aria-current=“page”.
+* No blank page appears.
+* No unexpected redirect to /api/dashboard occurs.
+* Browser refresh preserves the route.
+* Browser back and forward navigation work.
+* No React runtime error appears.
+* No uncaught console error appears.
+* No API request loop or duplicate polling is introduced.
+
+B. COMPLETE SCREENSHOT EVIDENCE
+
+Capture and report screenshots for all seven destinations, not only a subset:
+
+1. Main Brain overview
+2. Analysis
+3. Scanner
+4. Active Trades
+5. Journal
+6. Coach
+7. Alerts
+
+Each screenshot must visibly show:
+
+* The current URL or enough browser context to identify the route
+* The correct highlighted navigation item
+* The expected section content or a legitimate empty state
+* No permanent “Connecting” overlay
+
+C. PANEL CONTRACT
+
+Confirm these exact panel mappings:
+
+* /main-brain
+    Full overview grid
+* /main-brain/analysis
+    ThesisPanel + VerdictPanel
+* /main-brain/scanner
+    ScannerPanel + TradePlanPanel
+* /main-brain/trades
+    TradePlanPanel + ActiveTradesPanel + ExecutionPanel
+* /main-brain/journal
+    JournalPanel
+* /main-brain/coach
+    CoachPanel
+* /main-brain/alerts
+    TimelinePanel + AlertsPanel + SystemHealthPanel
+
+Legitimate zero-data and disconnected states are acceptable, but the section shell and panel headings must still render.
+
+D. UNKNOWN ROUTE REVIEW
+
+Test:
+
+* /main-brain/not-a-real-section
+
+Document the current behavior.
+
+If it silently displays the overview, make one of these narrow fixes:
+
+Preferred:
+
+* Redirect the unknown section to /main-brain using replace behavior so the invalid URL is removed from the browser.
+
+Acceptable:
+
+* Render a clear “Section not found” message with a link back to Main Brain.
+
+Do not leave an invalid URL displaying the overview without explanation.
+
+Add or update tests for the selected behavior.
+
+E. RUNTIME POLLING CHECK
+
+Do not rely only on source-code string checks.
+
+Using browser network inspection or deterministic instrumentation, compare request behavior on:
+
+* /main-brain
+* /main-brain/analysis
+* /main-brain/coach
+* /main-brain/alerts
+
+Confirm that navigating between sections does not create accumulating timers or duplicate recurring requests.
+
+Report:
+
+* Endpoint
+* Expected polling interval
+* Number of requests observed during a fixed observation window
+* Whether requests increased after navigating away and returning
+
+Do not alter polling unless duplication is actually demonstrated.
+
+F. REGRESSION VALIDATION
+
+Run:
+
+* Phase 7D navigation tests
+* TypeScript typecheck
+* Production build
+* Phase 7C.3 Python tests
+* Phase 7C.1 regression tests
+* Phase 7C regression tests
+* Phase 7B regression tests
+
+Also run any new Phase 7D.1 tests added for authenticated routing or unknown-route behavior.
+
+G. FINAL REPORT
+
+Provide:
+
+* Starting branch and HEAD
+* Whether code changes were required
+* Final commit hash, only if changes were made
+* Seven-route validation table
+* Seven screenshot results
+* Unknown-route behavior before and after
+* Runtime polling evidence
+* Exact test counts
+* Build and typecheck results
+* Console-error status
+* Confirmation that protected trading and execution systems were untouched
+
+Do not describe Phase 7D.1 as complete unless all seven routes have authenticated screenshot evidence or clearly state the exact environment limitation preventing that proof.
