@@ -22891,6 +22891,14 @@ def build_coach_interface(result, instrument=None, mode=None):
                          during any full_analysis() call before a trade-close
                          resolution runs.  DB readiness alone does NOT imply True.
 
+      thesis_last_resolved_at — ISO-8601 UTC timestamp string of the most recent
+                         thesis resolution event, or None when no resolution has
+                         run in this session.  Mirrors _THESIS_LAST_RESOLVED_AT;
+                         always None at boot and after a module reload.  The
+                         Coach dashboard panel uses this to show "Last resolved:
+                         HH:MM ET" so the operator can confirm the learning loop
+                         is healthy without inspecting logs.
+
       learning_influence — ±15 Edge Score modifier from result's per-direction
                           learning_score_influence.  The active direction carries a
                           non-zero delta; the inactive direction is 0.  Reads
@@ -22903,11 +22911,12 @@ def build_coach_interface(result, instrument=None, mode=None):
                                counters, no DB call, no recompute.
 
     Fields:
-      weight_updated           True if _recompute_learning() ran in this session
-      thesis_resolved          True if _resolve_open_theses() ran in this session
-      learning_influence       float: active-direction learning_score_delta
-      rule_engine_eligibility  "GHOST_ONLY" | "LIVE_ELIGIBLE"
-      _version                 "v1"
+      weight_updated              True if _recompute_learning() ran in this session
+      thesis_resolved             True if _resolve_open_theses() ran in this session
+      thesis_last_resolved_at     ISO-8601 UTC str | None — timestamp of last resolution
+      learning_influence          float: active-direction learning_score_delta
+      rule_engine_eligibility     "GHOST_ONLY" | "LIVE_ELIGIBLE"
+      _version                    "v1"
     """
     inst  = instrument or (result.get("active_ticker") if result else None) or ""
     _mode = mode or TRADING_MODE
@@ -22926,6 +22935,14 @@ def build_coach_interface(result, instrument=None, mode=None):
         # no eligible rows, or process just started).  THESIS_TRACKER_DB_READY alone
         # does NOT imply True — DB readiness ≠ a resolution event having occurred.
         thesis_resolved = _THESIS_LAST_RESOLVED_AT is not None
+        # thesis_last_resolved_at: ISO-8601 UTC string of the most recent resolution
+        # event, or None.  Mirrors the same _THESIS_LAST_RESOLVED_AT global so the
+        # Coach dashboard panel can show "Last resolved: HH:MM ET" without the
+        # operator needing to inspect logs.
+        thesis_last_resolved_at = (
+            _THESIS_LAST_RESOLVED_AT.isoformat()
+            if _THESIS_LAST_RESOLVED_AT is not None else None
+        )
 
         # learning_influence: active direction ±15 delta from result's LSI block.
         # _ls_dir_summary (line ~23454) builds Long/Short from gate_debug per direction:
@@ -22943,20 +22960,22 @@ def build_coach_interface(result, instrument=None, mode=None):
         rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE"
 
         return {
-            "weight_updated":          weight_updated,
-            "thesis_resolved":         thesis_resolved,
-            "learning_influence":      learning_influence,
-            "rule_engine_eligibility": rule_engine_eligibility,
-            "_version":                "v1",
+            "weight_updated":            weight_updated,
+            "thesis_resolved":           thesis_resolved,
+            "thesis_last_resolved_at":   thesis_last_resolved_at,
+            "learning_influence":        learning_influence,
+            "rule_engine_eligibility":   rule_engine_eligibility,
+            "_version":                  "v1",
         }
     except Exception as _cch_exc:
         logger.debug("build_coach_interface fail-open: %s", _cch_exc)
         return {
-            "weight_updated":          False,
-            "thesis_resolved":         False,
-            "learning_influence":      0.0,
-            "rule_engine_eligibility": "LIVE_ELIGIBLE",
-            "_version":                "v1",
+            "weight_updated":            False,
+            "thesis_resolved":           False,
+            "thesis_last_resolved_at":   None,
+            "learning_influence":        0.0,
+            "rule_engine_eligibility":   "LIVE_ELIGIBLE",
+            "_version":                  "v1",
         }
 
 
@@ -51613,6 +51632,13 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div class="mb-col-h" style="margin-bottom:4px">Thesis History</div>
   <div id="mbt-history" style="display:flex;flex-direction:column;gap:4px"></div>
 
+
+   <!-- Coach Interface: last thesis resolution time ──────────────────────────
+        Populated by renderThesisTracker() from d.coach.thesis_last_resolved_at.
+        Shows "HH:MM ET" when a resolution has run this session, else "None this session". -->
+   <div id="mbt-coach-resolved-row" style="margin-top:8px;font-size:11px;color:#6b7280;padding:5px 0;border-top:1px solid #1e2535">
+     Last thesis resolved: <span id="mbt-coach-resolved-time" style="color:#6b7280">None this session</span>
+   </div>
   <div class="nf-fid">Thesis Tracker is display-only — it learns from what the analyst predicted and what actually happened. It never changes how trades are taken.</div>
 </div>
 
@@ -56317,6 +56343,21 @@ function renderThesisTracker(d){
           histEl.appendChild(lrow);
         }
       });
+    }
+  }
+  // ── Coach Interface: last thesis resolution time ───────────────────────
+  const coachResEl=document.getElementById('mbt-coach-resolved-time');
+  if(coachResEl){
+    const _cch=(d&&d.coach)||null;
+    const _cts=_cch&&_cch.thesis_last_resolved_at;
+    if(_cts){
+      try{
+        coachResEl.textContent=new Date(_cts).toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',hour12:false})+' ET';
+        coachResEl.style.color='#22c55e';
+      }catch(_e){ coachResEl.textContent=_cts; coachResEl.style.color='#cdcde0'; }
+    } else {
+      coachResEl.textContent='None this session';
+      coachResEl.style.color='#6b7280';
     }
   }
 }
