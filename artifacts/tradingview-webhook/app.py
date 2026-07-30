@@ -23320,9 +23320,11 @@ def _mb_execution_gateway(inst, errors):
                         float(epoch_sent), tz=timezone.utc).isoformat()
         except Exception:
             pass
+        gateway_status = "SENT" if last_sent_at else "IDLE"
         return {
             "mode":          exec_mode,
             "last_sent_at":  last_sent_at,
+            "gateway_status": gateway_status,
             "last_outcome":  None,   # _LAST_GATEWAY_RESULT_BY_INST deferred — Phase 7C
             "last_instrument": inst if last_sent_at else None,
             "last_action":   None,   # deferred — Phase 7C
@@ -23333,8 +23335,8 @@ def _mb_execution_gateway(inst, errors):
         logger.debug("_mb_execution_gateway: %s", _exc)
         _mb_err(errors, "broker_status", "broker_status_unavailable")
         return {
-            "mode": "manual_only", "last_sent_at": None, "last_outcome": None,
-            "last_instrument": None, "last_action": None,
+            "mode": "manual_only", "last_sent_at": None, "gateway_status": "IDLE",
+            "last_outcome": None, "last_instrument": None, "last_action": None,
             "duplicate_window_active": False,
             "_deferred": "last_outcome not persisted — Phase 7C",
         }
@@ -23580,6 +23582,12 @@ def _mb_system_status(result, errors):
             ),
             "price_age_seconds": db_feed.get("price_age_seconds"),
             "last_analysis_at":  now_utc().isoformat(),
+            # canonical aliases for frontend
+            "db_ready":         bool(LEARNING_DB_ENABLED),
+            "databento_ready":  databento_on,
+            "broker_ready":     bool(
+                os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()),
+            "learning_ready":   l_ready,
         }
     except Exception as _exc:
         logger.debug("_mb_system_status: %s", _exc)
@@ -23589,6 +23597,7 @@ def _mb_system_status(result, errors):
             "database_ready": False, "learning_enabled": False, "learning_ready": False,
             "active_trades_db_ready": False, "broker_url_configured": False,
             "price_fresh": False, "price_age_seconds": None, "last_analysis_at": None,
+            "db_ready": False, "databento_ready": False, "broker_ready": False,
         }
 
 
@@ -23695,9 +23704,19 @@ def build_main_brain_payload(result, instrument=None):
         "system_status":    {"available": "system_status_unavailable" not in error_codes},
     }
 
+    # ── voice: read-only from result (display-only, fail-open) ─────────────────
+    voice = None
+    try:
+        voice = (result or {}).get("main_brain_voice")
+        if not voice:
+            voice = ((result or {}).get("main_brain") or {}).get("voice")
+    except Exception:
+        pass
+
     return {
         "_version":          "v1",
         "generated_at":      now_utc().isoformat(),
+        "voice":             voice,
         "market":            market,
         "market_state":      market_state,
         "left_brain":        left_brain,
