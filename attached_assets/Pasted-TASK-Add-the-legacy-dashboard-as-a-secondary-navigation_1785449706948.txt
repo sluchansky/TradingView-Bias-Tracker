@@ -1,0 +1,139 @@
+TASK: Add the legacy dashboard as a secondary navigation destination.
+
+CONTEXT
+
+The Main Brain has just been made the application’s default home page.
+
+The previous dashboard must remain available for reference and diagnostics, but it should no longer be the primary landing page.
+
+GOAL
+
+Add a clearly labeled secondary navigation link from the Main Brain to the existing legacy dashboard.
+
+STRICT SCOPE
+
+This is a ROUTING AND NAVIGATION change only.
+
+DO NOT modify:
+
+* Databento ingestion or normalization
+* Market-data processing
+* Strategy calculations
+* Strategy Scanner logic
+* Edge Score
+* Left Brain logic
+* Right Brain logic
+* Learning or Coach logic
+* TradersPost
+* Execution logic
+* Active-trade management
+* Authentication
+* API response contracts
+* Main Brain polling interval
+* Main Brain panel layout
+* Existing legacy dashboard content
+
+REQUIREMENTS
+
+1. Confirm where the previous home dashboard is currently routed after the homepage change.
+
+2. Use `/dashboard` as the preferred route for the legacy dashboard.
+
+3. If `/dashboard` is already being used for another required page, preserve that route and use `/legacy-dashboard`.
+
+4. Do not duplicate the legacy dashboard implementation.
+
+Reuse its existing component and move or remap only the route.
+
+5. Add one secondary link near the bottom of the Main Brain sidebar.
+
+Use this label:
+
+SYSTEM DASHBOARD
+
+6. The new link must visually appear secondary to the primary Main Brain section buttons.
+
+Do not give it the same prominence as:
+
+* Main Brain
+* Analysis
+* Scanner
+* Active Trades
+* Journal
+* Coach
+* Alerts
+
+7. Clicking SYSTEM DASHBOARD must open the legacy dashboard without logging the user out.
+
+8. Add a clear way to return from the legacy dashboard to the Main Brain.
+
+Preferred behavior:
+
+* Existing logo or Home link opens `/`
+* If no suitable link currently exists, add a small `MAIN BRAIN` link
+
+9. Do not redesign either dashboard.
+
+10. Do not delete old dashboard code.
+
+11. Preserve browser Back and Forward behavior.
+
+12. Refreshing the legacy dashboard route must load the legacy dashboard directly.
+
+13. Unknown-route handling must remain unchanged.
+
+ACCEPTANCE TESTS
+
+Verify all of the following:
+
+* `/` opens Main Brain
+* `/main-brain` still works
+* `/dashboard` opens the legacy dashboard
+* Main Brain sidebar includes SYSTEM DASHBOARD
+* SYSTEM DASHBOARD opens the legacy dashboard
+* The legacy dashboard has a working path back to Main Brain
+* Browser Back returns to the previous Main Brain section
+* Hard refresh on `/dashboard` succeeds
+* Main Brain side navigation still works
+* Only one Main Brain polling stream is active
+* Authentication behavior is unchanged
+* Existing navigation tests pass
+* TypeScript typecheck passes
+* Production build passes
+* `git diff --check` passes
+
+REGRESSION SAFETY
+
+Run the existing Phase 7 navigation and Main Brain regression tests.
+
+Do not fix unrelated failures.
+
+If any pre-existing failure appears, report it separately and prove whether it predates this task.
+
+STOP CONDITIONS
+
+Stop and report before proceeding if:
+
+* The legacy dashboard component cannot be identified confidently
+* `/dashboard` is currently required for a separate production workflow
+* The task would require changing API, authentication, Databento, or trading logic
+* The current homepage task has not passed its tests
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit hash
+2. Final commit hash
+3. Files changed
+4. Final Main Brain home route
+5. Final legacy dashboard route
+6. Location and label of the new sidebar link
+7. Navigation test results
+8. TypeScript result
+9. Production build result
+10. Confirmation that Databento and all trading logic were untouched
+11. Screenshot of:
+
+* Main Brain sidebar showing SYSTEM DASHBOARD
+* Legacy dashboard loaded from its final route
