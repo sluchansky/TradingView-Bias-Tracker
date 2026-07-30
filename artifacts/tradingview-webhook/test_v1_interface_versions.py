@@ -170,11 +170,21 @@ def test_partner_version_type():
 # ===========================================================================
 
 def _gateway_fn_src():
+    """Return the combined source of the gateway implementation.
+
+    execute_trade_gateway() was refactored into:
+      _execute_trade_gateway_inner() — all actual logic, status strings, _version fields
+      _gw_outcome()                  — centralized outcome mapping helper
+      execute_trade_gateway()        — thin public wrapper (additive 'outcome' field only)
+
+    All three are part of the gateway surface, so we return the source of the entire
+    block from _execute_trade_gateway_inner through to the start of _advisor_blocks_auto_trade.
+    """
     src = _app_src()
-    start = src.find("def execute_trade_gateway(")
-    assert start >= 0, "execute_trade_gateway not found in app.py"
-    next_def = src.find("\ndef ", start + 1)
-    end = next_def if (0 < next_def - start < 200_000) else start + 55_000
+    start = src.find("def _execute_trade_gateway_inner(")
+    assert start >= 0, "_execute_trade_gateway_inner not found in app.py"
+    end_marker = src.find("def _advisor_blocks_auto_trade(", start)
+    end = end_marker if (0 < end_marker - start < 200_000) else start + 55_000
     return src[start:end]
 
 

@@ -46122,7 +46122,7 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
         _record_diagnostic("%s | EXECUTION blocked — invalid %s payload (%s)"
                            % (instrument, mode, _detail))
         return {"status": "error", "reason": _reason,
-                "blocked_fields": [f for f, _ in _bad_fields]}, 400
+                "blocked_fields": [f for f, _ in _bad_fields], "outcome": "invalid_payload"}, 400
 
     # Opposite-side reversal spacing (TradersPost): if enabled, hold an opposing
     # buy/sell just long enough after the previous opposite send for THIS instrument
@@ -46143,7 +46143,7 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
         logger.warning("%s ambiguous send error — cooldown held: %s", provider_label, exc)
         return {"status": "error", "broker_verify_required": True,
                         "reason": (f"{provider_label} did not confirm ({exc}). The order MAY have been placed — "
-                                   "check your broker before retrying.")}, 502
+                                   "check your broker before retrying."), "outcome": "timeout"}, 502
 
     if 200 <= resp.status_code < 300:
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
@@ -46153,13 +46153,14 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
         logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
         return {"status": "error",
-                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}"}, 502
+                        "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}",
+                        "outcome": "broker_rejected"}, 502
     else:
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
         logger.warning("%s ambiguous response — cooldown held: %s %s", provider_label, resp.status_code, resp.text[:300])
         return {"status": "error", "broker_verify_required": True,
                         "reason": (f"{provider_label} returned {resp.status_code}. The order MAY have been placed — "
-                                   "check your broker before retrying.")}, 502
+                                   "check your broker before retrying."), "outcome": "broker_rejected"}, 502
 
 
 def _live_runner_eligible(mode, instrument, contracts):
@@ -47175,6 +47176,7 @@ def _training_suppressed_result(intent, plan_public, stage, reason):
     (no ACTIVE_TRADE, no broker contact) and the manual route shows the suggestion."""
     return {
         "status":  "manual_required",
+        "outcome": "manual_required",
         "provider": (intent or {}).get("provider"),
         "mode":     (intent or {}).get("mode"),
         "broker_verify_required": False,
@@ -47869,7 +47871,7 @@ def _build_manual_market_plan(instrument, direction, a):
     }
 
 
-def execute_trade_gateway(instrument, contracts, source="manual", direction=None, expected_stop=None):
+def _execute_trade_gateway_inner(instrument, contracts, source="manual", direction=None, expected_stop=None):
     """Shared, server-authoritative execution gate behind /traderspost AND the
     auto-trade hook. Returns (result_dict, http_code): the route jsonifies it; the
     auto path reads result["plan"] to track ACTIVE_TRADE. Server-authoritative on
@@ -48583,6 +48585,61 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
                    "stopLoss": stop, "takeProfit": t1, "target2": t2},
         "_version": "v1",
     }, 200
+
+
+# ── ARCH §9 outcome field — centralized mapping ───────────────────────────────────
+# All execute_trade_gateway return paths carry both 'status' (existing, unchanged)
+# and 'outcome' (additive, ARCH §9 contract). _send_broker_order and
+# _training_suppressed_result add 'outcome' directly because they have broker-side
+# context that cannot be re-derived from the result dict. All other paths in
+# _execute_trade_gateway_inner go through this helper via the public wrapper below.
+#
+# Vocabulary (ARCH §9 line 1671 + §5 lines 419-421 + ROADMAP V1-P5-004/005/006):
+#   "sent"            — broker confirmed the order (2xx)
+#   "paper"           — paper mode; no HTTP call to broker
+#   "manual_required" — manual_only mode or training-gate suppression (stages 1-3)
+#   "rejected"        — local gateway refused: safety gate, risk cap, policy, cooldown
+#   "broker_rejected" — HTTP non-2xx from broker (_send_broker_order sets directly)
+#   "timeout"         — network error / RequestException (_send_broker_order sets directly)
+#   "invalid_payload" — malformed, missing, or unparseable input data
+def _gw_outcome(result):
+    """Derive the ARCH §9 'outcome' string from a gateway result dict.
+
+    Only called when 'outcome' is not already present. Maps status + discriminating
+    fields to the correct outcome value. Never modifies the dict; caller adds the key.
+    """
+    status = result.get("status")
+    if status == "sent":
+        return "sent"
+    if status == "simulated":           # paper execution mode
+        return "paper"
+    if status == "manual_required":
+        return "manual_required"
+    # status == "error" for all remaining execute_trade_gateway early-exit paths.
+    # Distinguish "invalid_payload" (malformed/missing input) from "rejected" (local gate).
+    reason = result.get("reason", "")
+    if (result.get("blocked_fields")                            # broker required-field failure
+            or "Unknown instrument" in reason                   # unsupported/unrecognised symbol
+            or "contracts must be a whole number" in reason     # non-integer contract count
+            or "Could not read trade plan" in reason):          # unparseable entry/stop/target
+        return "invalid_payload"
+    return "rejected"                   # all other local gateway blocks (safety, policy, cooldown)
+
+
+def execute_trade_gateway(instrument, contracts, source="manual", direction=None, expected_stop=None):
+    """Public execution gateway API — backward-compatible wrapper.
+
+    Delegates to _execute_trade_gateway_inner() (unchanged behaviour) and adds the
+    ARCH §9 'outcome' field to every result dict that does not already carry one.
+    Existing callers reading result["status"] are unaffected; 'outcome' is purely
+    additive. _send_broker_order() and _training_suppressed_result() set 'outcome'
+    directly (they have broker-side context _gw_outcome() cannot re-derive from the
+    dict alone), so the wrapper skips them.
+    """
+    result, code = _execute_trade_gateway_inner(instrument, contracts, source, direction, expected_stop)
+    if isinstance(result, dict) and "outcome" not in result:
+        result["outcome"] = _gw_outcome(result)
+    return result, code
 
 
 def _advisor_blocks_auto_trade(inst):
