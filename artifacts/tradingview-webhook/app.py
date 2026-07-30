@@ -23221,6 +23221,9 @@ def _mb_verdict(result, errors):
             "grade": None, "is_actionable": False, "confidence_score": 0,
             "strict_reason": None, "failed_conditions": [], "risk_reward": None,
             "components": {},
+            # Phase 7C.2 transparency fields — must mirror the success path schema
+            "edge_components": [], "score_breakdown": [],
+            "failed_confirmations": [], "risks": [],
         }
 
 
