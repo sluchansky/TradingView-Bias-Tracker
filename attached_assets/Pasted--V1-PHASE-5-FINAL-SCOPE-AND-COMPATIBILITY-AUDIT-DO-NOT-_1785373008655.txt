@@ -1,0 +1,398 @@
+# V1 PHASE 5 — FINAL SCOPE AND COMPATIBILITY AUDIT
+# DO NOT IMPLEMENT NEW FEATURES
+# DO NOT DEPLOY
+# DO NOT PUBLISH
+
+Current candidate Phase 5 commit:
+
+b00988c — V1-P5 Manager and Execution Safety
+
+Do not begin Phase 6.
+
+The Phase 5 test results are green, but two deviations from the approved
+implementation contract require independent review:
+
+1. An existing interface-test file was modified.
+2. execute_trade_gateway() was renamed internally and replaced with a wrapper.
+
+This task is an audit and, only if necessary, a minimal corrective cleanup.
+
+=========================================================
+STAGE 0 — FREEZE AND DIFF
+=========================================================
+
+Record:
+
+- branch
+- HEAD
+- git status
+- git diff --check
+- commits from c20c7ca through b00988c
+- complete diff for every changed file
+
+List every changed file and classify it as:
+
+- production
+- new Phase 5 test
+- existing test modification
+- validation documentation
+- attached asset
+- unrelated
+
+Do not reset, rebase, squash, amend, or deploy.
+
+=========================================================
+STAGE 1 — EXACT FILE INVENTORY
+=========================================================
+
+Report the exact paths changed by b00988c.
+
+The previous final report states that an existing interface helper was modified,
+but the file was not named.
+
+Identify:
+
+- exact existing test file modified
+- exact lines changed
+- old helper behavior
+- new helper behavior
+- assertions that consume the helper
+- whether assertion strength changed
+- whether any test case was removed, relaxed, skipped, or reclassified
+
+Provide the before-and-after diff verbatim in the validation report.
+
+=========================================================
+STAGE 2 — INTERFACE-TEST INTEGRITY AUDIT
+=========================================================
+
+Determine why the existing interface tests failed after the wrapper refactor.
+
+Answer:
+
+1. Were the failures caused only by source-inspection boundaries?
+2. Did runtime interface behavior remain identical?
+3. Does the modified helper still inspect all code it inspected before?
+4. Does it inspect additional code that could create false positives?
+5. Could the updated helper pass if the public wrapper omitted required fields?
+6. Did any source-based assertion become weaker?
+7. Can the original test remain unchanged with a smaller production change?
+
+Run the existing interface suite at:
+
+- c20c7ca behavior, if reproducible without destructive checkout
+- b00988c with the original helper logic
+- b00988c with the modified helper logic
+
+Do not alter the working tree destructively. Use temporary copies, git show,
+or an isolated worktree if necessary.
+
+If the modified helper weakens evidence:
+
+STOP and report Phase 5 as not acceptable.
+
+=========================================================
+STAGE 3 — PUBLIC FUNCTION COMPATIBILITY AUDIT
+=========================================================
+
+Audit the change from:
+
+execute_trade_gateway(...):
+    original full implementation
+
+to:
+
+_execute_trade_gateway_inner(...):
+    full implementation
+
+execute_trade_gateway(...):
+    thin wrapper adding outcome
+
+Prove whether the public function preserved:
+
+- exact call signature
+- positional arguments
+- keyword arguments
+- default values
+- annotations
+- docstring
+- callable identity expectations
+- monkeypatch behavior
+- direct caller behavior
+- exception behavior
+- return tuple shape
+- HTTP status handling
+- stack-sensitive behavior
+- decorators
+- function attributes
+- module exports
+
+Search every repository reference to:
+
+- execute_trade_gateway
+- _execute_trade_gateway_inner
+- monkeypatching or assignment of execute_trade_gateway
+- inspect.getsource(execute_trade_gateway)
+- __name__
+- __doc__
+- __annotations__
+- signature inspection
+
+Classify each reference as:
+
+- runtime call
+- test call
+- monkeypatch target
+- source inspection
+- documentation
+- dead code
+
+=========================================================
+STAGE 4 — CALLER AND PATCH-BOUNDARY TESTS
+=========================================================
+
+Add or run focused compatibility tests proving:
+
+1. Existing callers still invoke the public execute_trade_gateway function.
+2. The public signature is identical to the pre-Phase-5 signature.
+3. A caller monkeypatching execute_trade_gateway still intercepts calls.
+4. A test monkeypatching the broker boundary still works.
+5. The wrapper calls the inner implementation exactly once.
+6. The wrapper preserves the exact returned HTTP code.
+7. The wrapper preserves every pre-existing result field and value.
+8. The wrapper adds only outcome.
+9. Exceptions not previously caught are not newly swallowed.
+10. Outcome assignment does not mutate reused result objects unexpectedly.
+11. Tuple and non-tuple return forms, if both exist, are preserved.
+12. Repeated calls do not share result dictionaries.
+
+Prefer adding these checks to the new Phase 5 test file.
+
+Do not weaken existing tests.
+
+=========================================================
+STAGE 5 — OUTCOME COVERAGE AUDIT
+=========================================================
+
+The report claims every gateway result includes outcome.
+
+Prove this through runtime branch coverage or a complete return-path matrix.
+
+For every return path in:
+
+- execute_trade_gateway
+- _execute_trade_gateway_inner
+- _send_broker_order
+- _training_suppressed_result
+
+record:
+
+- triggering condition
+- old status
+- new outcome
+- HTTP code
+- broker contacted: yes/no
+- duplicate slot held/released
+- test name proving it
+
+Confirm these outcome values only:
+
+- sent
+- paper
+- manual_required
+- rejected
+- broker_rejected
+- timeout
+- invalid_payload
+
+Confirm no branch returns:
+
+- missing outcome
+- outcome=None
+- unknown outcome
+- outcome inconsistent with status/reason
+
+Static source enumeration may support this audit, but runtime evidence is required
+for all materially distinct behavior classes.
+
+=========================================================
+STAGE 6 — 5XX COOLDOWN-SLOT PROOF
+=========================================================
+
+Explicitly validate the suggested high-value task:
+
+A broker 5xx response must preserve the uncertain-send cooldown/dedup slot and
+must not permit an immediate duplicate broker send.
+
+Prove:
+
+- first request reaches mocked broker once
+- mocked broker returns 5xx
+- outcome is broker_rejected
+- broker_verify_required remains true if that is current behavior
+- execution slot remains held
+- identical immediate retry does not create a second broker call
+- distinct request behavior matches production
+- state is restored after the test
+
+Document the distinction between:
+
+- 4xx definitive rejection and slot release
+- 5xx uncertain response and slot retention
+- transport timeout and slot retention
+
+Do not change production semantics during this audit.
+
+=========================================================
+STAGE 7 — DETERMINE THE SMALLEST ACCEPTABLE DESIGN
+=========================================================
+
+Compare these approaches:
+
+A. Current inner-function plus public-wrapper design
+
+B. Keep the original execute_trade_gateway implementation in place and apply
+   outcome through its existing centralized return/finalization path
+
+C. Add a narrowly scoped result decorator/helper without renaming the original
+   function
+
+Evaluate:
+
+- production diff size
+- compatibility risk
+- test modifications required
+- caller impact
+- introspection impact
+- maintainability
+- exhaustive outcome coverage
+
+Prefer the smallest design that:
+
+- preserves the original public function structure
+- adds outcome to every path
+- does not require weakening existing tests
+- avoids duplicating mappings
+- preserves all behavior
+
+If B or C is clearly safer and practical, perform the minimal corrective change.
+
+If retaining A, document why the wrapper is necessary and why no smaller design
+can satisfy exhaustive outcome coverage.
+
+=========================================================
+STAGE 8 — AUTHORIZED CORRECTION
+=========================================================
+
+Only if the audit identifies a real scope or compatibility issue, you may:
+
+- restore the existing interface test to its original form
+- revise the production outcome implementation to the smallest compatible design
+- update the new Phase 5 tests
+- update V1_PHASE_5_VALIDATION.md
+
+Do not:
+
+- change gateway business logic
+- change statuses
+- change HTTP codes
+- change dedup behavior
+- change broker behavior
+- change arm/disarm behavior
+- change risk or sizing
+- add dashboard features
+- begin Phase 6
+
+=========================================================
+STAGE 9 — FULL REGRESSION
+=========================================================
+
+Run:
+
+- Phase 5 tests
+- Phase 4 tests
+- Phase 3 tests
+- interface tests
+- Phase 2 tests
+- Phase 2 smoke from repository root
+- Phase 2 smoke from /tmp
+- parity
+- scalp_golden
+- dual_sim
+- breakout_mode
+- directly affected gateway tests
+- Python syntax validation
+- git diff --check
+
+Report exact counts and commands.
+
+=========================================================
+VALIDATION DOCUMENT UPDATE
+=========================================================
+
+Update V1_PHASE_5_VALIDATION.md with:
+
+- Scope-Deviation Audit
+- Existing-Test Modification Audit
+- Public-Function Compatibility Audit
+- Outcome Return-Path Matrix
+- 4xx versus 5xx versus Timeout Slot Behavior
+- Final Design Decision
+- Exact corrective diff, if any
+- Honest final acceptance status
+
+=========================================================
+COMMIT CONTROL
+=========================================================
+
+If no correction is needed:
+
+- do not create an empty commit
+- report the audit evidence
+
+If correction is needed and all tests pass, create one commit:
+
+V1-P5 final compatibility correction
+
+Do not amend b00988c.
+
+Do not deploy.
+
+=========================================================
+FINAL REPORT
+=========================================================
+
+Report:
+
+1. Starting HEAD
+2. Ending HEAD
+3. Exact changed files in b00988c
+4. Existing test file modified
+5. Exact reason it was modified
+6. Whether assertion strength changed
+7. Whether the original test can be restored
+8. Original and current execute_trade_gateway signatures
+9. Caller compatibility
+10. Monkeypatch compatibility
+11. Return-shape compatibility
+12. Exception compatibility
+13. Outcome coverage
+14. Missing-outcome paths
+15. Unknown-outcome paths
+16. 4xx slot behavior
+17. 5xx slot behavior
+18. Timeout slot behavior
+19. Immediate duplicate call counts
+20. Chosen final implementation design
+21. Corrective files changed
+22. Phase 5 tests
+23. Interface tests
+24. All regressions
+25. Validation document update
+26. Commit created, if any
+27. Whether b00988c is acceptable as-is
+28. Whether Phase 5 is officially complete
+29. Deployment confirmation
+30. Whether Phase 6 may begin
+
+Do not begin Phase 6.
