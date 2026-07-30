@@ -23188,18 +23188,30 @@ def _mb_verdict(result, errors):
         tp = r.get("trade_plan")
         if not isinstance(tp, dict):
             tp = {}
+        # Pass full component list (with present/label/points) for transparency panel
+        raw_comps_list = eb.get("components")
+        edge_components = (
+            [c for c in raw_comps_list if isinstance(c, dict)]
+            if isinstance(raw_comps_list, (list, tuple))
+            else []
+        )
         return {
-            "direction":         r.get("strict_direction"),
-            "readiness":         label,
-            "edge_score":        r.get("edge_score"),
-            "edge_max":          110,
-            "grade":             eb.get("grade"),
-            "is_actionable":     ("READY" in label),
-            "confidence_score":  r.get("edge_score"),
-            "strict_reason":     r.get("strict_reason"),
-            "failed_conditions": list(r.get("strict_missing") or []),
-            "risk_reward":       tp.get("rr"),
-            "components":        components,
+            "direction":           r.get("strict_direction"),
+            "readiness":           label,
+            "edge_score":          r.get("edge_score"),
+            "edge_max":            110,
+            "grade":               eb.get("grade"),
+            "is_actionable":       ("READY" in label),
+            "confidence_score":    r.get("edge_score"),
+            "strict_reason":       r.get("strict_reason"),
+            "failed_conditions":   list(r.get("strict_missing") or []),
+            "risk_reward":         tp.get("rr"),
+            "components":          components,
+            # ── transparency additions (Phase 7C.2) ──────────────────────────
+            "edge_components":     edge_components,
+            "score_breakdown":     list(eb.get("score_breakdown") or []),
+            "failed_confirmations": list(eb.get("failed_confirmations") or []),
+            "risks":               list(eb.get("risks") or []),
         }
     except Exception as _exc:
         logger.debug("_mb_verdict: %s", _exc)

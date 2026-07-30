@@ -156,9 +156,16 @@ function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<string,
     age_seconds:  thesis.age_seconds  ?? null,
   };
 
-  // ── verdict: add edge_grade alias ────────────────────────────────────────────
+  // ── verdict: add edge_grade alias + pass transparency fields ─────────────────
   const vrd = (raw.verdict ?? {}) as Record<string, unknown>;
-  const verdict: Record<string, unknown> = { ...vrd, edge_grade: vrd.grade };
+  const verdict: Record<string, unknown> = {
+    ...vrd,
+    edge_grade:          vrd.grade,
+    edge_components:     Array.isArray(vrd.edge_components) ? vrd.edge_components : [],
+    score_breakdown:     Array.isArray(vrd.score_breakdown) ? vrd.score_breakdown : [],
+    failed_confirmations: Array.isArray(vrd.failed_confirmations) ? vrd.failed_confirmations : [],
+    risks:               Array.isArray(vrd.risks) ? vrd.risks : [],
+  };
 
   // ── strategy_scanner: rename fields, build trade_plan ───────────────────────
   const sc     = (raw.strategy_scanner ?? {}) as Record<string, unknown>;
@@ -599,52 +606,132 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
 // ── Verdict Panel ─────────────────────────────────────────────────────────────
 const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  const v     = (p.verdict ?? {}) as Record<string, unknown>;
-  const avail = v.available !== false;
-  const score = safeNum(v.edge_score);
-  const grade = safeStr(v.edge_grade, '');
-  const ready = safeStr(v.readiness, '');
-  const rCol  = readinessColor(ready);
-  const failed = Array.isArray(v.failed_conditions) ? v.failed_conditions as string[] : [];
-  const comps = v.components as Record<string, number> | null;
+  const v          = (p.verdict ?? {}) as Record<string, unknown>;
+  const avail      = v.available !== false;
+  const score      = safeNum(v.edge_score) ?? 0;
+  const scoreMax   = safeNum(v.edge_max) ?? 110;
+  const grade      = safeStr(v.edge_grade, '');
+  const ready      = safeStr(v.readiness, '');
+  const rCol       = readinessColor(ready);
+  const isReady    = v.is_actionable === true;
+  const direction  = safeStr(v.direction, '');
+
+  // Rich component list {key, label, points, present} — Phase 7C.2
+  const edgeComps  = Array.isArray(v.edge_components)
+    ? v.edge_components as Record<string, unknown>[]
+    : [];
+
+  // Fallback to old dict format if rich list not available
+  const fallbackComps = (edgeComps.length === 0)
+    ? (v.components as Record<string, number> | null)
+    : null;
+
+  const missingComps = edgeComps.filter(c => c.present === false);
+
+  // Verdict explanation from Brain voice (already normalized)
+  const mb          = (p.main_brain ?? {}) as Record<string, unknown>;
+  const explanation = safeStr(mb.voice, '');
 
   return (
     <Panel title="Verdict" badge={<Badge label={ready || 'UNKNOWN'} color={rCol} />}>
       {!avail ? <UnavailableNote msg="Verdict unavailable" /> : (
-        <div style={{ display:'flex', gap:14 }}>
-          <EdgeGauge score={score} />
-          <div style={{ flex:1 }}>
-            <div style={{ display:'flex', gap:8, marginBottom:10, flexWrap:'wrap' }}>
-              {grade && <Pill text={`Grade ${grade}`} color={score != null && score >= 70 ? T.green : T.amber} />}
-              {v.is_actionable != null && <Pill text={v.is_actionable ? 'ACTIONABLE' : 'NOT ACTIONABLE'} color={v.is_actionable ? T.green : T.red} />}
+        <div>
+          {/* Score header */}
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
+            <EdgeGauge score={score} />
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginBottom:6 }}>
+                {direction && <Pill text={direction.toUpperCase()} color={dirColor(direction)} />}
+                {grade && <Pill text={`Grade ${grade}`} color={score >= 70 ? T.green : score >= 50 ? T.amber : T.red} />}
+                <Pill text={isReady ? 'ACTIONABLE' : 'NOT ACTIONABLE'} color={isReady ? T.green : T.red} />
+              </div>
+              <div style={{ fontFamily:T.mono, fontSize:12, color:T.txtSec }}>
+                <span style={{ color:T.cyan, fontWeight:700 }}>{score}</span>
+                <span style={{ color:T.txtMuted }}> / {scoreMax}</span>
+              </div>
             </div>
-
-            {/* Component breakdown */}
-            {comps && Object.keys(comps).length > 0 && (
-              <div>
-                <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em', marginBottom:5 }}>COMPONENTS</div>
-                {Object.entries(comps).slice(0, 7).map(([k, sc]) => (
-                  <div key={k} style={{ display:'flex', alignItems:'center', gap:6, marginBottom:3 }}>
-                    <span style={{ fontSize:9.5, color:T.txtMuted, minWidth:100, textOverflow:'ellipsis', overflow:'hidden', whiteSpace:'nowrap' }}>{k.replace(/_/g,' ')}</span>
-                    <div style={{ flex:1, height:4, background:'rgba(255,255,255,0.06)', borderRadius:2 }}>
-                      <div style={{ height:'100%', width:`${Math.min(Number(sc ?? 0) / 20 * 100, 100)}%`, background:T.cyan, borderRadius:2 }} />
-                    </div>
-                    <span style={{ fontSize:9.5, fontWeight:700, color:T.cyan, fontFamily:T.mono, minWidth:18, textAlign:'right' }}>{sc}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Failed conditions */}
-            {failed.length > 0 && (
-              <div style={{ marginTop:8 }}>
-                <div style={{ fontSize:9, color:T.red, letterSpacing:'0.08em', marginBottom:4 }}>FAILED CONDITIONS</div>
-                {failed.map((f, i) => (
-                  <div key={i} style={{ fontSize:10, color:T.red, opacity:0.85, marginBottom:2 }}>✗ {safeStr(f)}</div>
-                ))}
-              </div>
-            )}
           </div>
+
+          {/* ── Edge Score Breakdown (rich) ──────────────────────────────── */}
+          {edgeComps.length > 0 && (
+            <div style={{ marginBottom:12 }}>
+              <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em', marginBottom:7, display:'flex', justifyContent:'space-between' }}>
+                <span>EDGE SCORE BREAKDOWN</span>
+                <span style={{ fontFamily:T.mono }}>pts / {scoreMax}</span>
+              </div>
+              {edgeComps.map((c, i) => {
+                const lbl    = safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' '));
+                const pts    = safeNum(c.points) ?? 0;
+                const here   = c.present === true;
+                const barPct = here ? Math.round(pts / scoreMax * 100) : 0;
+                return (
+                  <div key={i} style={{ display:'flex', alignItems:'center', gap:6, marginBottom:5 }}>
+                    <span style={{ fontSize:12, width:14, textAlign:'center', flexShrink:0, color: here ? T.green : 'rgba(255,255,255,0.18)', lineHeight:1 }}>
+                      {here ? '✓' : '✗'}
+                    </span>
+                    <span style={{ fontSize:10, color: here ? T.txtSec : 'rgba(255,255,255,0.3)', flex:1, minWidth:0, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                      {lbl}
+                    </span>
+                    <div style={{ width:60, height:4, background:'rgba(255,255,255,0.06)', borderRadius:2, flexShrink:0 }}>
+                      <div style={{ height:'100%', width:`${barPct}%`, background: here ? T.green : 'transparent', borderRadius:2, transition:'width 0.3s ease' }} />
+                    </div>
+                    <span style={{ fontSize:9.5, fontFamily:T.mono, color: here ? T.green : 'rgba(255,255,255,0.2)', width:24, textAlign:'right', flexShrink:0 }}>
+                      {here ? `+${pts}` : '—'}
+                    </span>
+                  </div>
+                );
+              })}
+              <div style={{ display:'flex', justifyContent:'flex-end', borderTop:`1px solid ${T.border}`, paddingTop:5, marginTop:2 }}>
+                <span style={{ fontSize:9, color:T.txtMuted, fontFamily:T.mono }}>
+                  TOTAL&nbsp;&nbsp;<span style={{ color:T.cyan, fontWeight:700 }}>{score}</span>
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* ── Fallback: old dict format ────────────────────────────────── */}
+          {fallbackComps && Object.keys(fallbackComps).length > 0 && (
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em', marginBottom:5 }}>COMPONENTS</div>
+              {Object.entries(fallbackComps).slice(0, 7).map(([k, sc]) => (
+                <div key={k} style={{ display:'flex', alignItems:'center', gap:6, marginBottom:3 }}>
+                  <span style={{ fontSize:9.5, color:T.txtMuted, minWidth:100 }}>{k.replace(/_/g,' ')}</span>
+                  <div style={{ flex:1, height:4, background:'rgba(255,255,255,0.06)', borderRadius:2 }}>
+                    <div style={{ height:'100%', width:`${Math.min(Number(sc ?? 0)/20*100, 100)}%`, background:T.cyan, borderRadius:2 }} />
+                  </div>
+                  <span style={{ fontSize:9.5, fontWeight:700, color:T.cyan, fontFamily:T.mono, minWidth:18, textAlign:'right' }}>{sc}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── Waiting For checklist ────────────────────────────────────── */}
+          {missingComps.length > 0 && (
+            <div style={{ marginBottom:10, padding:'8px 10px', background:'rgba(239,68,68,0.05)', borderRadius:7, border:`1px solid rgba(239,68,68,0.14)` }}>
+              <div style={{ fontSize:9, color:T.red, letterSpacing:'0.08em', marginBottom:6 }}>WAITING FOR</div>
+              {missingComps.map((c, i) => {
+                const lbl = safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' '));
+                const pts = safeNum(c.points) ?? 0;
+                return (
+                  <div key={i} style={{ display:'flex', alignItems:'center', gap:7, marginBottom:3 }}>
+                    <span style={{ fontSize:9, color:T.red, opacity:0.6 }}>•</span>
+                    <span style={{ fontSize:10, color:`${T.txtPri}99`, flex:1 }}>{lbl}</span>
+                    {pts > 0 && <span style={{ fontSize:9, color:T.txtMuted, fontFamily:T.mono, flexShrink:0 }}>+{pts} pts</span>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* ── Brain Reasoning ──────────────────────────────────────────── */}
+          {explanation && (
+            <div style={{ padding:'8px 10px', background:'rgba(56,189,248,0.04)', borderRadius:7, border:`1px solid rgba(56,189,248,0.12)`, borderLeft:`3px solid ${T.cyan}33` }}>
+              <div style={{ fontSize:9, color:T.cyan, letterSpacing:'0.08em', marginBottom:5 }}>BRAIN REASONING</div>
+              <div style={{ fontSize:10.5, color:T.txtSec, lineHeight:1.55, fontStyle:'italic' }}>
+                "{explanation}"
+              </div>
+            </div>
+          )}
         </div>
       )}
     </Panel>
@@ -660,38 +747,102 @@ const STRATEGY_LABELS: Record<string, string> = {
   OPENING_RANGE_BREAKOUT:   'ORB',
 };
 
+function completenessHint(pct: number, skipReason: string): string {
+  if (skipReason) return skipReason.replace(/_/g, ' ');
+  if (pct >= 80)  return 'Very close — watching for final trigger';
+  if (pct >= 60)  return 'Setup building — needs a few more confirms';
+  if (pct >= 40)  return 'Forming — incomplete setup';
+  if (pct >= 20)  return 'Early stage — monitoring';
+  return 'No signal yet';
+}
+
 const ScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  const sc      = (p.strategy_scanner ?? {}) as Record<string, unknown>;
-  const avail   = sc.available !== false;
-  const sel     = safeStr(sc.selected_strategy, '');
-  const strats  = Array.isArray(sc.strategies) ? sc.strategies as Record<string, unknown>[] : [];
+  const sc       = (p.strategy_scanner ?? {}) as Record<string, unknown>;
+  const verdict  = (p.verdict ?? {}) as Record<string, unknown>;
+  const avail    = sc.available !== false;
+  const sel      = safeStr(sc.selected_strategy, '');
+  const strats   = Array.isArray(sc.strategies) ? sc.strategies as Record<string, unknown>[] : [];
+  const isReady  = verdict.is_actionable === true;
+
+  // Best candidate: highest completeness among eligible strategies
+  const eligibles = strats.filter(s => s.eligible !== false);
+  const best = eligibles.reduce<Record<string, unknown> | null>((acc, s) => {
+    const aComp = safeNum(acc?.completeness) ?? 0;
+    const sComp = safeNum(s.completeness) ?? 0;
+    return sComp > aComp ? s : acc;
+  }, null);
+  const bestComp = safeNum(best?.completeness) ?? 0;
+  const bestKey  = safeStr(best?.strategy_key ?? best?.key, '');
+  const bestName = STRATEGY_LABELS[bestKey] ?? safeStr(best?.name, bestKey);
 
   return (
     <Panel title="Strategy Scanner" badge={sel ? <Badge label={STRATEGY_LABELS[sel] ?? sel} color={T.cyan} /> : undefined}>
       {!avail ? <UnavailableNote /> : strats.length === 0 ? <UnavailableNote msg="No strategies available" /> : (
         <div>
+
+          {/* ── Best Opportunity card ─────────────────────────────────── */}
+          {!isReady && best != null && bestComp > 0 && (
+            <div style={{ marginBottom:12, padding:'10px 11px', background:`${T.cyan}08`, borderRadius:8, border:`1px solid ${T.cyan}20` }}>
+              <div style={{ fontSize:9, color:T.cyan, letterSpacing:'0.08em', marginBottom:6 }}>BEST OPPORTUNITY</div>
+              <div style={{ fontWeight:700, fontSize:11.5, color:T.txtPri, marginBottom:6, lineHeight:1.2 }}>
+                {bestName}
+              </div>
+              <div style={{ display:'flex', alignItems:'center', gap:7, marginBottom:5 }}>
+                <div style={{ flex:1, height:5, background:'rgba(255,255,255,0.07)', borderRadius:3 }}>
+                  <div style={{ height:'100%', width:`${bestComp}%`, background:T.cyan, borderRadius:3, transition:'width 0.4s ease' }} />
+                </div>
+                <span style={{ fontSize:10.5, fontFamily:T.mono, color:T.cyan, fontWeight:700, flexShrink:0 }}>
+                  {bestComp}%
+                </span>
+              </div>
+              <div style={{ fontSize:9.5, color:T.txtMuted, lineHeight:1.4 }}>
+                {completenessHint(bestComp, safeStr(best?.skip_reason, ''))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Strategy rows ─────────────────────────────────────────── */}
           {strats.map((s, i) => {
-            const key   = safeStr(s.key, '');
-            const name  = STRATEGY_LABELS[key] ?? safeStr(s.name, key);
-            const rdy   = safeStr(s.readiness, '');
-            const isSel = key === sel;
-            const rCol  = readinessColor(rdy);
-            const dir   = safeStr(s.direction, '');
+            const key    = safeStr(s.key, '');
+            const name   = STRATEGY_LABELS[key] ?? safeStr(s.name, key);
+            const rdy    = safeStr(s.readiness, '');
+            const isSel  = key === sel;
+            const rCol   = readinessColor(rdy);
+            const comp   = safeNum(s.completeness) ?? 0;
+            const isElig = s.eligible !== false;
+            const skipR  = safeStr(s.skip_reason, '');
+            const dir    = safeStr(s.direction, '');
+            const barCol = rdy === 'READY' ? T.green
+              : isSel  ? T.cyan
+              : isElig ? T.amber
+              : 'rgba(255,255,255,0.12)';
+
             return (
               <div key={key || i} style={{
-                display:'flex', alignItems:'center', gap:10, padding:'7px 8px', marginBottom:4,
-                background: isSel ? `${T.cyan}10` : 'rgba(255,255,255,0.02)',
-                borderRadius:7, border:`1px solid ${isSel ? T.cyan + '33' : T.border}`,
+                padding:'8px 10px', marginBottom:5,
+                background: isSel ? `${T.cyan}0e` : 'rgba(255,255,255,0.02)',
+                borderRadius:7, border:`1px solid ${isSel ? T.cyan + '30' : T.border}`,
+                opacity: isElig ? 1 : 0.5,
               }}>
-                <div style={{ flex:1, minWidth:0 }}>
-                  <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                    {isSel && <span style={{ fontSize:9, color:T.cyan }}>▶</span>}
-                    <span style={{ fontSize:11, fontWeight:isSel ? 700 : 500, color:isSel ? T.cyan : T.txtPri, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{name}</span>
-                  </div>
-                  {dir && <span style={{ fontSize:9, color:dirColor(dir), marginLeft:isSel ? 15 : 0 }}>{dir.toUpperCase()}</span>}
+                {/* Name + direction + badge row */}
+                <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:5 }}>
+                  {isSel && <span style={{ fontSize:9, color:T.cyan, flexShrink:0 }}>▶</span>}
+                  <span style={{ fontSize:11, fontWeight:isSel ? 700 : 500, color:isSel ? T.cyan : isElig ? T.txtPri : T.txtMuted, flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                    {name}
+                  </span>
+                  {dir && <span style={{ fontSize:9, color:dirColor(dir), flexShrink:0 }}>{dir.toUpperCase()}</span>}
+                  <Badge label={rdy || '—'} color={rCol} />
+                  {s.mode_compatible === false && <Badge label="MODE" color={T.amber} />}
                 </div>
-                <Badge label={rdy || '—'} color={rCol} />
-                {s.mode_compatible === false && <Badge label="MODE MISMATCH" color={T.amber} />}
+                {/* Progress bar row */}
+                <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+                  <div style={{ flex:1, height:4, background:'rgba(255,255,255,0.06)', borderRadius:2 }}>
+                    <div style={{ height:'100%', width:`${comp}%`, background:barCol, borderRadius:2, transition:'width 0.4s ease' }} />
+                  </div>
+                  <span style={{ fontSize:9, fontFamily:T.mono, color:barCol, fontWeight:700, minWidth:32, textAlign:'right', flexShrink:0 }}>
+                    {isElig ? `${comp}%` : skipR ? skipR.replace(/_/g,' ') : 'SKIP'}
+                  </span>
+                </div>
               </div>
             );
           })}
