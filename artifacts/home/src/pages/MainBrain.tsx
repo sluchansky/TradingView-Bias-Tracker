@@ -11,6 +11,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useLocation, useParams } from 'wouter';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
 import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
+import { audioManager, SoundEvent } from '../lib/audioManager';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -1145,6 +1146,53 @@ export default function MainBrain() {
   const allOk = !!(sys.db_ready && sys.learning_ready);
   const isLoading = fetchState === 'loading' && !payload;
   const isError   = (fetchState === 'error' || isAuthFail) && !payload;
+
+  // ── Audio notification transitions ────────────────────────────────────────
+  // Refs hold the PREVIOUS value so we can detect state changes without
+  // re-running the effect on every render. All audio calls go through
+  // audioManager.play() — no Audio objects created here.
+  const prevActionableRef  = useRef<boolean | null>(null);  // null = not yet known
+  const prevFetchOkRef     = useRef<boolean>(false);        // true once we had a 'loaded' state
+  const prevScannerKeyRef  = useRef<string>('');
+
+  useEffect(() => {
+    // Ignore during initial loading — wait for first real payload.
+    if (!payload) return;
+
+    const verdict = (p.verdict ?? {}) as Record<string, unknown>;
+    const sc      = (p.strategy_scanner ?? {}) as Record<string, unknown>;
+
+    const isActionable  = verdict.is_actionable === true;
+    const isConnected   = fetchState === 'loaded' || fetchState === 'stale' || fetchState === 'refreshing';
+    const isDisconnected = fetchState === 'error';
+
+    // READY_TO_TRADE — fires only on NOT_READY → READY transition.
+    // prevActionableRef starts null so the very first READY payload also fires.
+    if (isActionable && prevActionableRef.current !== true) {
+      audioManager.play(SoundEvent.READY_TO_TRADE);
+    }
+    prevActionableRef.current = isActionable;
+
+    // SYSTEM_ONLINE — fires when we transition from disconnected/initial → connected.
+    if (isConnected && !prevFetchOkRef.current) {
+      audioManager.play(SoundEvent.SYSTEM_ONLINE);
+    }
+    // SYSTEM_OFFLINE — fires when we transition from connected → error.
+    if (isDisconnected && prevFetchOkRef.current) {
+      audioManager.play(SoundEvent.SYSTEM_OFFLINE);
+    }
+    if (isConnected) prevFetchOkRef.current = true;
+    if (isDisconnected) prevFetchOkRef.current = false;
+
+    // SCAN_FOUND — fires when a different (or new) strategy gets selected by
+    // the scanner, signalling a newly discovered opportunity.
+    const scannerKey = String(sc.selected_strategy ?? '');
+    if (scannerKey && scannerKey !== prevScannerKeyRef.current) {
+      audioManager.play(SoundEvent.SCAN_FOUND);
+    }
+    prevScannerKeyRef.current = scannerKey;
+
+  }, [payload, fetchState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Section-based panel rendering — always reuses existing panel components,
   // never creates a second polling loop or duplicates business logic.
