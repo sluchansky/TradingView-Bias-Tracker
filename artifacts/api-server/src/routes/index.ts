@@ -3,6 +3,7 @@ import healthRouter from "./health";
 import { dashboardAuth } from "./dashboard-auth";
 import { createFlaskProxy, BOT1_ROUTES, BOT2_ROUTES } from "./flask-proxy";
 import { mintLinkToken, randomPassword } from "./view-tokens";
+import journalAttachmentsRouter from "./journal-attachments";
 
 // LIVE trading bot — mounted at /api (Flask on port 8000). Behavior unchanged.
 const router: IRouter = Router();
@@ -40,6 +41,10 @@ router.post("/view-link", (req, res) => {
   const url = host ? `${proto}://${host}${path}` : path;
   res.json({ url, path, password, expiresAt: exp });
 });
+
+// Journal attachment routes — Express-native (GCS + DB).  Sit before the Flask
+// proxy so they are handled locally.  dashboardAuth is already applied above.
+router.use(journalAttachmentsRouter);
 
 router.use(createFlaskProxy({ port: 8000, routes: BOT1_ROUTES }));
 

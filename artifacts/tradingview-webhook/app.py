@@ -44929,6 +44929,254 @@ def journal_review_queue():
             pass
 
 
+@app.route("/journal/review-queue-full", methods=["GET"])
+def journal_review_queue_full():
+    """Full review queue — all open-review trades in 5 status buckets.
+
+    Returns per-bucket lists for the Review Queue tab:
+      UNREVIEWED, IN_PROGRESS, NEEDS_DATA, MISSING_STRATEGY, EXCLUDED.
+
+    Supports filters: source, instrument, result, date_from, date_to.
+    Ordering within each bucket: oldest trade first.
+    """
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+
+    flt_src  = (request.args.get("source") or "").strip().lower() or None
+    flt_inst = (request.args.get("instrument") or "").strip().upper() or None
+    flt_res  = (request.args.get("result") or "").strip().lower() or None
+    date_from = (request.args.get("date_from") or "").strip() or None
+    date_to   = (request.args.get("date_to") or "").strip() or None
+
+    try:
+        # Build per-source clauses
+        sys_w, sys_p = ["1=1"], []
+        tz_w,  tz_p  = ["1=1"], []
+
+        if flt_inst:
+            sys_w.append("UPPER(st.symbol) = %s"); sys_p.append(flt_inst)
+            tz_w.append("UPPER(tt.symbol) = %s");  tz_p.append(flt_inst)
+        if flt_res:
+            sys_w.append("LOWER(COALESCE(st.result,'')) = %s");   sys_p.append(flt_res)
+            tz_w.append("LOWER(COALESCE(tt.outcome,'')) = %s");   tz_p.append(flt_res)
+        if date_from:
+            sys_w.append("COALESCE(st.opened_at, st.created_at) >= %s"); sys_p.append(date_from)
+            tz_w.append("tt.entry_time >= %s");  tz_p.append(date_from)
+        if date_to:
+            sys_w.append("COALESCE(st.opened_at, st.created_at) <= %s"); sys_p.append(date_to)
+            tz_w.append("tt.entry_time <= %s");  tz_p.append(date_to)
+
+        # Shared select columns
+        _SYS_SEL = (
+            "SELECT st.id, 'system' AS source,"
+            " COALESCE(st.opened_at, st.created_at) AS date,"
+            " st.symbol AS instrument, st.direction,"
+            " COALESCE(st.strategy, st.strategy_key, '') AS strategy_name,"
+            " COALESCE(st.strategy_key, '') AS strategy_key,"
+            " COALESCE(st.result, '') AS result,"
+            " COALESCE(CAST(st.r_multiple AS double precision), 0) AS r_multiple,"
+            " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
+            " COALESCE(CAST(st.edge_score AS double precision), 0) AS edge_score,"
+            " COALESCE(st.trading_mode, 'SWING') AS trading_mode"
+            " FROM strategy_trades st"
+            " LEFT JOIN journal_reviews jr"
+            "   ON jr.source = 'system' AND jr.trade_id = st.id"
+            " WHERE st.closed_at IS NOT NULL"
+            "   AND st.result IS NOT NULL AND st.result != ''"
+        )
+        _TZ_SEL = (
+            "SELECT tt.id, 'tradzella' AS source,"
+            " tt.entry_time AS date,"
+            " tt.symbol AS instrument, tt.side AS direction,"
+            " COALESCE(tt.setup, '') AS strategy_name,"
+            " '' AS strategy_key,"
+            " COALESCE(tt.outcome, '') AS result,"
+            " COALESCE(tt.r_multiple, 0) AS r_multiple,"
+            " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
+            " 0 AS edge_score,"
+            " COALESCE(tt.mode, 'UNKNOWN') AS trading_mode"
+            " FROM tradezella_trades tt"
+            " LEFT JOIN journal_reviews jr"
+            "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
+            " WHERE tt.exit_time IS NOT NULL AND tt.outcome IS NOT NULL"
+        )
+
+        parts, all_params = [], []
+        if flt_src in (None, "system"):
+            parts.append(f"({_SYS_SEL} AND {' AND '.join(sys_w)})")
+            all_params += sys_p
+        if flt_src in (None, "tradzella"):
+            parts.append(f"({_TZ_SEL} AND {' AND '.join(tz_w)})")
+            all_params += tz_p
+
+        if not parts:
+            return jsonify({"ok": True, "buckets": {}, "counts": {}})
+
+        union = " UNION ALL ".join(parts)
+        full_sql = (
+            f"SELECT * FROM ({union}) AS _t"
+            f" ORDER BY date ASC NULLS LAST"
+        )
+
+        with conn.cursor() as cur:
+            cur.execute(full_sql, all_params)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+
+        # Bucket all rows
+        buckets: dict = {
+            "UNREVIEWED": [], "IN_PROGRESS": [], "NEEDS_DATA": [],
+            "MISSING_STRATEGY": [], "EXCLUDED": [],
+        }
+        for row in rows:
+            d = dict(zip(cols, row))
+            if d.get("date") and hasattr(d["date"], "isoformat"):
+                d["date"] = d["date"].isoformat()
+            for k in ("r_multiple", "edge_score"):
+                try:
+                    d[k] = float(d[k]) if d.get(k) is not None else 0.0
+                except (TypeError, ValueError):
+                    d[k] = 0.0
+
+            # Missing strategy: system trades with no strategy_key (display-only filter)
+            if d["source"] == "system" and not d.get("strategy_key"):
+                buckets["MISSING_STRATEGY"].append(d)
+
+            rs = d.get("review_status", "UNREVIEWED")
+            if rs in buckets:
+                buckets[rs].append(d)
+
+        counts = {k: len(v) for k, v in buckets.items()}
+        return jsonify({"ok": True, "buckets": buckets, "counts": counts})
+
+    except Exception as exc:
+        logger.warning("journal_review_queue_full failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/calendar-summary", methods=["GET"])
+def journal_calendar_summary():
+    """Daily review-progress calendar for the Journal Calendar view.
+
+    Groups closed trades by calendar day (America/New_York) and returns:
+      date, total, wins, losses, reviewed, unreviewed, all_reviewed,
+      total_r (sum of r_multiple), pnl (sum; tradzella only).
+
+    Params:
+      from  — YYYY-MM-DD start date (inclusive, ET)
+      to    — YYYY-MM-DD end date (inclusive, ET)
+      source — 'system' | 'tradzella' | (both)
+    """
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+
+    flt_src   = (request.args.get("source") or "").strip().lower() or None
+    date_from = (request.args.get("from") or "").strip() or None
+    date_to   = (request.args.get("to") or "").strip() or None
+
+    try:
+        sys_dc, sys_dp = "", []
+        tz_dc,  tz_dp  = "", []
+        if date_from:
+            sys_dc += " AND COALESCE(st.opened_at,st.created_at) AT TIME ZONE 'America/New_York' >= %s"
+            sys_dp.append(date_from)
+            tz_dc  += " AND tt.entry_time AT TIME ZONE 'America/New_York' >= %s"
+            tz_dp.append(date_from)
+        if date_to:
+            sys_dc += " AND COALESCE(st.opened_at,st.created_at) AT TIME ZONE 'America/New_York' <= %s"
+            sys_dp.append(date_to + " 23:59:59")
+            tz_dc  += " AND tt.entry_time AT TIME ZONE 'America/New_York' <= %s"
+            tz_dp.append(date_to + " 23:59:59")
+
+        sys_sql = (
+            "SELECT"
+            "  TO_CHAR((COALESCE(st.opened_at,st.created_at)"
+            "           AT TIME ZONE 'America/New_York'),'YYYY-MM-DD') AS day,"
+            "  COUNT(*) AS n,"
+            "  SUM(CASE WHEN LOWER(st.result)='win' THEN 1 ELSE 0 END) AS wins,"
+            "  SUM(CASE WHEN LOWER(st.result)='loss' THEN 1 ELSE 0 END) AS losses,"
+            "  COALESCE(SUM(CAST(st.r_multiple AS double precision)),0) AS total_r,"
+            "  0 AS pnl,"
+            "  SUM(CASE WHEN COALESCE(jr.review_status,'UNREVIEWED') IN ('REVIEWED','EXCLUDED') THEN 1 ELSE 0 END) AS reviewed"
+            " FROM strategy_trades st"
+            " LEFT JOIN journal_reviews jr ON jr.source='system' AND jr.trade_id=st.id"
+            " WHERE st.closed_at IS NOT NULL"
+            "   AND st.result IS NOT NULL AND st.result != ''" + sys_dc +
+            " GROUP BY 1"
+        ) if flt_src in (None, "system") else None
+
+        tz_sql = (
+            "SELECT"
+            "  TO_CHAR((tt.entry_time AT TIME ZONE 'America/New_York'),'YYYY-MM-DD') AS day,"
+            "  COUNT(*) AS n,"
+            "  SUM(CASE WHEN LOWER(tt.outcome)='win' THEN 1 ELSE 0 END) AS wins,"
+            "  SUM(CASE WHEN LOWER(tt.outcome)='loss' THEN 1 ELSE 0 END) AS losses,"
+            "  COALESCE(SUM(tt.r_multiple),0) AS total_r,"
+            "  COALESCE(SUM(tt.pnl),0) AS pnl,"
+            "  SUM(CASE WHEN COALESCE(jr.review_status,'UNREVIEWED') IN ('REVIEWED','EXCLUDED') THEN 1 ELSE 0 END) AS reviewed"
+            " FROM tradezella_trades tt"
+            " LEFT JOIN journal_reviews jr ON jr.source='tradzella' AND jr.trade_id=tt.id"
+            " WHERE tt.exit_time IS NOT NULL AND tt.outcome IS NOT NULL" + tz_dc +
+            " GROUP BY 1"
+        ) if flt_src in (None, "tradzella") else None
+
+        # Merge per-day data
+        day_data: dict = {}  # date_str → aggregated dict
+
+        def _merge(cur_results, cols):
+            for row in cur_results:
+                d = dict(zip(cols, row))
+                day = d["day"]
+                if day not in day_data:
+                    day_data[day] = {
+                        "date": day, "total": 0, "wins": 0, "losses": 0,
+                        "total_r": 0.0, "pnl": 0.0, "reviewed": 0,
+                    }
+                day_data[day]["total"]   += int(d["n"] or 0)
+                day_data[day]["wins"]    += int(d["wins"] or 0)
+                day_data[day]["losses"]  += int(d["losses"] or 0)
+                day_data[day]["total_r"] += float(d["total_r"] or 0)
+                day_data[day]["pnl"]     += float(d["pnl"] or 0)
+                day_data[day]["reviewed"] += int(d["reviewed"] or 0)
+
+        with conn.cursor() as cur:
+            if sys_sql:
+                cur.execute(sys_sql, sys_dp)
+                cols = [d[0] for d in cur.description]
+                _merge(cur.fetchall(), cols)
+            if tz_sql:
+                cur.execute(tz_sql, tz_dp)
+                cols = [d[0] for d in cur.description]
+                _merge(cur.fetchall(), cols)
+
+        # Post-process: compute unreviewed + all_reviewed flag
+        result_days = []
+        for d in sorted(day_data.values(), key=lambda x: x["date"]):
+            d["unreviewed"]   = max(0, d["total"] - d["reviewed"])
+            d["all_reviewed"] = d["total"] > 0 and d["reviewed"] >= d["total"]
+            d["total_r"]      = round(d["total_r"], 3)
+            d["pnl"]          = round(d["pnl"], 2)
+            result_days.append(d)
+
+        return jsonify({"ok": True, "days": result_days, "count": len(result_days)})
+
+    except Exception as exc:
+        logger.warning("journal_calendar_summary failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Phase 7M — Directional Balance (READ-ONLY audit panel, owner-only)
 # ---------------------------------------------------------------------------

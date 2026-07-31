@@ -54,6 +54,21 @@ app.use(
   ],
   express.raw({ type: () => true, limit: "32mb" }),
 );
+// Journal screenshot uploads — up to 5 MB per image, owner-only path.
+// Dynamic path (:source/:id/attachment) cannot be listed literally, so we
+// match with a function predicate instead.
+app.use(
+  (req, _res, next) => {
+    if (
+      req.method === "POST" &&
+      /^\/api\/journal\/trade\/[^/]+\/\d+\/attachment$/.test(req.path)
+    ) {
+      express.raw({ type: () => true, limit: "5mb" })(req, _res, next);
+    } else {
+      next();
+    }
+  },
+);
 app.use(express.raw({ type: () => true, limit: "1mb" }));
 
 app.use("/api", router);

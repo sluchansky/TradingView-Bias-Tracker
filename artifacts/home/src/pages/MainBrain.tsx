@@ -2407,7 +2407,7 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 // Used ONLY for the /main-brain/journal route. The overview-grid card below is the
 // compact version that still reads from the main-brain payload.
 
-type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning' | 'directional';
+type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning' | 'directional' | 'queue';
 
 interface JTrade {
   id: number; source: string; date: string; instrument: string; direction: string;
@@ -2499,6 +2499,188 @@ function jReviewBadge(status: string): React.ReactNode {
     </span>
   );
 }
+
+// ── Phase 7N Batch B: Attachment types ────────────────────────────────────────
+interface JAttachment {
+  id: number;
+  source: string;
+  trade_id: number;
+  stage: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: string;
+  serve_url: string;
+}
+
+const ATTACH_STAGES = [
+  { value: 'before_entry',  label: 'Before Entry' },
+  { value: 'at_entry',      label: 'At Entry' },
+  { value: 'during',        label: 'During Trade' },
+  { value: 'after_exit',    label: 'After Exit' },
+  { value: 'review_markup', label: 'Review Markup' },
+];
+
+// Attachment section embedded inside the review modal
+const JAttachmentSection: React.FC<{
+  source: string; tradeId: number;
+}> = ({ source, tradeId }) => {
+  const [attachments, setAttachments]       = useState<JAttachment[]>([]);
+  const [loading,     setLoading]           = useState(true);
+  const [uploading,   setUploading]         = useState(false);
+  const [uploadStage, setUploadStage]       = useState('review_markup');
+  const [uploadError, setUploadError]       = useState<string | null>(null);
+  const [confirmDel,  setConfirmDel]        = useState<number | null>(null);
+  const [fullImg,     setFullImg]           = useState<string | null>(null);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const r = await fetch(`/api/journal/trade/${source}/${tradeId}/attachments`,
+        { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.ok) setAttachments(d.attachments || []);
+    } catch { /* fail silently */ }
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, [source, tradeId]);
+
+  const handleUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    if (!file.type.startsWith('image/')) {
+      setUploadError('Only image files are accepted (jpeg, png, gif, webp)'); return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setUploadError(`File too large (${(file.size/1048576).toFixed(1)} MB) — max 5 MB`); return;
+    }
+    setUploading(true); setUploadError(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const r = await fetch(
+        `/api/journal/trade/${source}/${tradeId}/attachment?stage=${encodeURIComponent(uploadStage)}&filename=${encodeURIComponent(file.name)}`,
+        { method: 'POST', headers: { ...getAuthHeader(), 'Content-Type': file.type },
+          body: buf }
+      );
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'upload failed');
+      setAttachments(prev => [...prev, d.attachment]);
+      if (fileRef.current) fileRef.current.value = '';
+    } catch (e) { setUploadError(String(e)); }
+    setUploading(false);
+  };
+
+  const handleDelete = async (id: number) => {
+    try {
+      const r = await fetch(`/api/journal/attachment/${id}`,
+        { method: 'DELETE', headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'delete failed');
+      setAttachments(prev => prev.filter(a => a.id !== id));
+    } catch (e) { setUploadError(String(e)); }
+    setConfirmDel(null);
+  };
+
+  const stageLabel = (s: string) =>
+    ATTACH_STAGES.find(x => x.value === s)?.label ?? s;
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 8,
+        letterSpacing: '0.06em', fontWeight: 700 }}>H — SCREENSHOTS</div>
+
+      {/* Thumbnail grid */}
+      {loading ? (
+        <div style={{ color: T.txtMuted, fontSize: 10 }}>Loading…</div>
+      ) : attachments.length === 0 ? (
+        <div style={{ color: T.txtMuted, fontSize: 10, marginBottom: 8 }}>No screenshots yet</div>
+      ) : (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+          {attachments.map(a => (
+            <div key={a.id} style={{ position: 'relative', width: 90, flexShrink: 0 }}>
+              <img
+                src={a.serve_url}
+                alt={a.filename}
+                onClick={() => setFullImg(a.serve_url)}
+                style={{ width: 90, height: 68, objectFit: 'cover', borderRadius: 4,
+                  border: `1px solid ${T.border}`, cursor: 'zoom-in', display: 'block' }}
+              />
+              <div style={{ fontSize: 7, color: T.txtMuted, textAlign: 'center',
+                marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {stageLabel(a.stage)}
+              </div>
+              {confirmDel === a.id ? (
+                <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+                  background: '#000000cc', borderRadius: 4, display: 'flex',
+                  flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+                  <div style={{ fontSize: 8, color: '#fff', textAlign: 'center' }}>Delete?</div>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <button onClick={() => handleDelete(a.id)}
+                      style={{ background: T.red + '99', border: 'none', borderRadius: 3,
+                        color: '#fff', fontSize: 8, padding: '2px 6px', cursor: 'pointer' }}>
+                      Yes
+                    </button>
+                    <button onClick={() => setConfirmDel(null)}
+                      style={{ background: '#ffffff33', border: 'none', borderRadius: 3,
+                        color: '#fff', fontSize: 8, padding: '2px 6px', cursor: 'pointer' }}>
+                      No
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmDel(a.id)}
+                  style={{ position: 'absolute', top: 2, right: 2, background: '#00000066',
+                    border: 'none', borderRadius: 3, color: '#fff', fontSize: 10, width: 18, height: 18,
+                    cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    lineHeight: 1 }}>
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Upload row */}
+      {attachments.length < 10 && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select value={uploadStage} onChange={e => setUploadStage(e.target.value)}
+            style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+              color: T.txtSec, fontSize: 9, padding: '3px 6px' }}>
+            {ATTACH_STAGES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+          </select>
+          <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/gif,image/webp"
+            onChange={e => handleUpload(e.target.files)}
+            style={{ display: 'none' }} />
+          <button onClick={() => fileRef.current?.click()} disabled={uploading}
+            style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`,
+              borderRadius: 4, color: T.cyan, padding: '4px 10px', fontSize: 9,
+              cursor: uploading ? 'default' : 'pointer' }}>
+            {uploading ? 'Uploading…' : '+ Add Screenshot'}
+          </button>
+          <span style={{ fontSize: 8, color: T.txtMuted }}>max 5 MB · {attachments.length}/10</span>
+        </div>
+      )}
+
+      {uploadError && (
+        <div style={{ fontSize: 9, color: T.red, marginTop: 4 }}>{uploadError}</div>
+      )}
+
+      {/* Full-image lightbox */}
+      {fullImg && (
+        <div onClick={() => setFullImg(null)}
+          style={{ position: 'fixed', inset: 0, zIndex: 700, background: '#000000cc',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'zoom-out' }}>
+          <img src={fullImg} alt="screenshot"
+            style={{ maxWidth: '90vw', maxHeight: '90vh', borderRadius: 6,
+              border: `1px solid ${T.border}` }} />
+        </div>
+      )}
+    </div>
+  );
+};
 
 // ── Phase 7N: Review system types ─────────────────────────────────────────────
 interface JReviewVocabulary {
@@ -2891,6 +3073,9 @@ const JReviewModal: React.FC<{
               </div>
             </div>
 
+            {/* Section H: Screenshots */}
+            <JAttachmentSection source={source} tradeId={tradeId} />
+
             {/* Error */}
             {error && (
               <div style={{ background: T.red + '22', border: `1px solid ${T.red}44`,
@@ -2948,25 +3133,261 @@ const JReviewModal: React.FC<{
   );
 };
 
-const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void }> = ({ active, onChange }) => {
-  const tabs: { id: JTab; label: string }[] = [
-    { id: 'trades',   label: 'Trades' },
-    { id: 'import',   label: 'Import' },
-    { id: 'analytics', label: 'Analytics' },
-    { id: 'playbook', label: 'Playbook' },
-    { id: 'learning',     label: 'Learning' },
+// ── Phase 7N Batch B: Review Queue Tab ────────────────────────────────────────
+interface JQueueTrade {
+  id: number; source: string; date: string; instrument: string; direction: string;
+  strategy_name: string; result: string; r_multiple: number; review_status: string; trading_mode: string;
+}
+
+interface JQueueBuckets {
+  UNREVIEWED: JQueueTrade[];
+  IN_PROGRESS: JQueueTrade[];
+  NEEDS_DATA: JQueueTrade[];
+  MISSING_STRATEGY: JQueueTrade[];
+  EXCLUDED: JQueueTrade[];
+}
+
+const QUEUE_BUCKET_CFG = [
+  { key: 'UNREVIEWED',       label: 'Unreviewed',       color: '#6b7280' },
+  { key: 'IN_PROGRESS',      label: 'Draft',            color: '#f59e0b' },
+  { key: 'NEEDS_DATA',       label: 'Missing Data',     color: '#ef4444' },
+  { key: 'MISSING_STRATEGY', label: 'Missing Strategy', color: '#8b5cf6' },
+  { key: 'EXCLUDED',         label: 'Excluded',         color: '#374151' },
+] as const;
+
+type QueueBucketKey = typeof QUEUE_BUCKET_CFG[number]['key'];
+
+const JReviewQueueTab: React.FC<{ onOpenReview?: (source: string, id: number, detail: JTradeDetail) => void }> = ({ onOpenReview }) => {
+  const [buckets,   setBuckets]   = useState<JQueueBuckets | null>(null);
+  const [counts,    setCounts]    = useState<Record<string, number>>({});
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState<string | null>(null);
+  const [activeBucket, setActiveBucket] = useState<QueueBucketKey>('UNREVIEWED');
+
+  // Filters
+  const [fSrc,    setFSrc]    = useState('');
+  const [fInst,   setFInst]   = useState('');
+  const [fRes,    setFRes]    = useState('');
+  const [fFrom,   setFFrom]   = useState('');
+  const [fTo,     setFTo]     = useState('');
+
+  // Review modal state (inline for this tab)
+  const [reviewTrade, setReviewTrade] = useState<{ source: string; id: number; detail: JTradeDetail } | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  const fetchQueue = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const params = new URLSearchParams({
+        ...(fSrc  ? { source: fSrc } : {}),
+        ...(fInst ? { instrument: fInst } : {}),
+        ...(fRes  ? { result: fRes } : {}),
+        ...(fFrom ? { date_from: fFrom } : {}),
+        ...(fTo   ? { date_to: fTo } : {}),
+      });
+      const r = await fetch(`/api/journal/review-queue-full?${params}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'failed');
+      setBuckets(d.buckets);
+      setCounts(d.counts || {});
+    } catch (e) { setError(String(e)); }
+    setLoading(false);
+  }, [fSrc, fInst, fRes, fFrom, fTo]);
+
+  useEffect(() => { fetchQueue(); }, [fetchQueue]);
+
+  const openReview = async (t: JQueueTrade) => {
+    setDetailLoading(true);
+    try {
+      const r = await fetch(`/api/journal/trade/${t.source}/${t.id}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.ok) {
+        if (onOpenReview) onOpenReview(t.source, t.id, d.trade);
+        else setReviewTrade({ source: t.source, id: t.id, detail: d.trade });
+      }
+    } catch { /* ignore */ }
+    setDetailLoading(false);
+  };
+
+  const onReviewSaved = (status: string) => {
+    // Refresh queue after saving
+    fetchQueue();
+    setReviewTrade(null);
+  };
+
+  const activeCfg = QUEUE_BUCKET_CFG.find(b => b.key === activeBucket)!;
+  const activeList = (buckets?.[activeBucket as keyof JQueueBuckets] ?? []) as JQueueTrade[];
+
+  return (
+    <div>
+      {/* Filter bar */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+        <select value={fSrc} onChange={e => setFSrc(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Sources</option>
+          <option value="system">System</option>
+          <option value="tradzella">Tradzella</option>
+        </select>
+        <select value={fInst} onChange={e => setFInst(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Instruments</option>
+          {['MGC','MNQ','MES','MYM'].map(i => <option key={i} value={i}>{i}</option>)}
+        </select>
+        <select value={fRes} onChange={e => setFRes(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Results</option>
+          <option value="win">Win</option>
+          <option value="loss">Loss</option>
+          <option value="be">BE</option>
+        </select>
+        <input type="date" value={fFrom} onChange={e => setFFrom(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
+        <span style={{ color: T.txtMuted, fontSize: 10 }}>to</span>
+        <input type="date" value={fTo} onChange={e => setFTo(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
+        <button onClick={fetchQueue}
+          style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
+            color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>
+          Refresh
+        </button>
+      </div>
+
+      {/* Status bucket sub-tabs */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 12, flexWrap: 'wrap' }}>
+        {QUEUE_BUCKET_CFG.map(cfg => {
+          const cnt = counts[cfg.key] ?? 0;
+          const isActive = activeBucket === cfg.key;
+          return (
+            <button key={cfg.key} onClick={() => setActiveBucket(cfg.key)}
+              style={{ background: isActive ? cfg.color + '22' : T.panelAlt,
+                border: `1px solid ${isActive ? cfg.color + '88' : T.border}`,
+                borderRadius: 6, color: isActive ? cfg.color : T.txtSec,
+                padding: '5px 12px', fontSize: 10, cursor: 'pointer', fontWeight: isActive ? 700 : 400,
+                display: 'flex', alignItems: 'center', gap: 6 }}>
+              {cfg.label}
+              <span style={{ background: isActive ? cfg.color + '33' : T.border + '44',
+                borderRadius: 8, padding: '0 6px', fontSize: 9, fontWeight: 700,
+                color: isActive ? cfg.color : T.txtMuted }}>
+                {cnt}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      {loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
+      {error   && <div style={{ color: T.red,     fontSize: 11 }}>Error: {error}</div>}
+
+      {/* Trade rows */}
+      {!loading && !error && (
+        <div style={{ maxHeight: 480, overflowY: 'auto' }}>
+          {activeList.length === 0 ? (
+            <div style={{ color: T.txtMuted, fontSize: 11, textAlign: 'center', padding: '20px 0' }}>
+              {activeCfg.label} — nothing here
+            </div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead>
+                <tr>
+                  {['Date','Instrument','Dir','Result','R','Strategy','Review',''].map(h => (
+                    <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                      paddingBottom: 6, fontSize: 9, position: 'sticky', top: 0,
+                      background: T.panel, whiteSpace: 'nowrap' }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {activeList.map(t => {
+                  const rCol = t.r_multiple > 0 ? T.green : t.r_multiple < 0 ? T.red : T.txtMuted;
+                  return (
+                    <tr key={`${t.source}:${t.id}`} style={{ borderTop: `1px solid ${T.border}` }}>
+                      <td style={{ padding: '5px 8px 5px 0', color: T.txtSec, whiteSpace: 'nowrap', fontSize: 9 }}>
+                        {jFmtShortDate(t.date)}
+                      </td>
+                      <td style={{ padding: '5px 8px 5px 0', color: T.txtPri, fontWeight: 700 }}>
+                        {t.instrument}
+                      </td>
+                      <td style={{ padding: '5px 8px 5px 0', color: T.txtSec, textTransform: 'capitalize' }}>
+                        {t.direction}
+                      </td>
+                      <td style={{ padding: '5px 8px 5px 0' }}>
+                        {jResultBadge(t.result)}
+                      </td>
+                      <td style={{ padding: '5px 8px 5px 0', fontFamily: T.mono, fontWeight: 700, color: rCol }}>
+                        {t.r_multiple != null ? (t.r_multiple >= 0 ? '+' : '') + t.r_multiple.toFixed(2) + 'R' : '—'}
+                      </td>
+                      <td style={{ padding: '5px 8px 5px 0', color: T.txtSec, maxWidth: 120,
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {t.strategy_name || '—'}
+                      </td>
+                      <td style={{ padding: '5px 8px 5px 0' }}>
+                        {jReviewBadge(t.review_status)}
+                      </td>
+                      <td style={{ padding: '5px 0' }}>
+                        <button onClick={() => openReview(t)} disabled={detailLoading}
+                          style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`,
+                            borderRadius: 4, color: T.cyan, padding: '3px 8px', fontSize: 9,
+                            cursor: detailLoading ? 'default' : 'pointer', whiteSpace: 'nowrap' }}>
+                          Review
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* Review modal (inline) */}
+      {reviewTrade && (
+        <JReviewModal
+          source={reviewTrade.source}
+          tradeId={reviewTrade.id}
+          tradeSummary={reviewTrade.detail}
+          onClose={() => setReviewTrade(null)}
+          onSaved={onReviewSaved}
+        />
+      )}
+    </div>
+  );
+};
+
+const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void; queueBadge?: number | null }> = ({ active, onChange, queueBadge }) => {
+  const tabs: { id: JTab; label: string; badge?: number | null }[] = [
+    { id: 'trades',      label: 'Trades' },
+    { id: 'queue',       label: 'Review Queue', badge: queueBadge },
+    { id: 'import',      label: 'Import' },
+    { id: 'analytics',   label: 'Analytics' },
+    { id: 'playbook',    label: 'Playbook' },
+    { id: 'learning',    label: 'Learning' },
     { id: 'directional', label: 'Direction ↕' },
   ];
   return (
-    <div style={{ display: 'flex', gap: 2, marginBottom: 14, borderBottom: `1px solid ${T.border}`, paddingBottom: 0 }}>
+    <div style={{ display: 'flex', gap: 2, marginBottom: 14, borderBottom: `1px solid ${T.border}`, paddingBottom: 0, overflowX: 'auto' }}>
       {tabs.map(t => (
         <button key={t.id} onClick={() => onChange(t.id)}
           style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px 14px',
             fontSize: 11, fontWeight: active === t.id ? 700 : 400,
             color: active === t.id ? T.cyan : T.txtSec,
             borderBottom: `2px solid ${active === t.id ? T.cyan : 'transparent'}`,
-            marginBottom: -1, letterSpacing: '0.04em', whiteSpace: 'nowrap' }}>
+            marginBottom: -1, letterSpacing: '0.04em', whiteSpace: 'nowrap',
+            display: 'flex', alignItems: 'center', gap: 5 }}>
           {t.label}
+          {t.badge != null && t.badge > 0 && (
+            <span style={{ background: T.amber + '33', color: T.amber, borderRadius: 8,
+              padding: '0 5px', fontSize: 9, fontWeight: 700, lineHeight: '16px' }}>
+              {t.badge}
+            </span>
+          )}
         </button>
       ))}
     </div>
@@ -3665,6 +4086,91 @@ const JImportTab: React.FC = () => {
 };
 
 // ── Analytics tab ─────────────────────────────────────────────────────────────
+interface JCalendarDay {
+  date: string; total: number; wins: number; losses: number;
+  reviewed: number; unreviewed: number; all_reviewed: boolean;
+  total_r: number; pnl: number;
+}
+
+const JCalendarView: React.FC<{ dateFrom: string; dateTo: string }> = ({ dateFrom, dateTo }) => {
+  const [days, setDays] = useState<JCalendarDay[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]   = useState<string | null>(null);
+
+  const fetch_ = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const params = new URLSearchParams({
+        ...(dateFrom ? { from: dateFrom } : {}),
+        ...(dateTo   ? { to: dateTo }   : {}),
+      });
+      const r = await fetch(`/api/journal/calendar-summary?${params}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'failed');
+      setDays(d.days || []);
+    } catch (e) { setError(String(e)); }
+    setLoading(false);
+  }, [dateFrom, dateTo]);
+
+  useEffect(() => { fetch_(); }, [fetch_]);
+
+  if (loading) return <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading calendar…</div>;
+  if (error)   return <div style={{ color: T.red,     fontSize: 11 }}>Error: {error}</div>;
+  if (days.length === 0) return <div style={{ color: T.txtMuted, fontSize: 11 }}>No trade days found</div>;
+
+  return (
+    <div>
+      <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 8 }}>
+        DAILY REVIEW PROGRESS — {days.length} trading days
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {days.map(day => {
+          const rCol = day.total_r > 0 ? T.green : day.total_r < 0 ? T.red : T.txtMuted;
+          const revPct = day.total > 0 ? Math.round(day.reviewed / day.total * 100) : 0;
+          return (
+            <div key={day.date} style={{ display: 'flex', alignItems: 'center', gap: 8,
+              background: T.panelAlt, borderRadius: 4, padding: '5px 10px',
+              border: `1px solid ${day.all_reviewed ? T.green + '44' : T.border}` }}>
+              {/* Date + all-reviewed check */}
+              <div style={{ minWidth: 80, fontSize: 9, color: T.txtSec, fontFamily: T.mono,
+                display: 'flex', alignItems: 'center', gap: 4 }}>
+                {day.all_reviewed && <span style={{ color: T.green }}>✓</span>}
+                {day.date}
+              </div>
+              {/* Trades + W/L */}
+              <div style={{ minWidth: 60, fontSize: 9, color: T.txtSec }}>
+                {day.total}T · {day.wins}W/{day.losses}L
+              </div>
+              {/* R multiple */}
+              <div style={{ minWidth: 52, fontSize: 9, fontFamily: T.mono, fontWeight: 700, color: rCol }}>
+                {day.total_r >= 0 ? '+' : ''}{day.total_r.toFixed(2)}R
+              </div>
+              {/* Review progress bar */}
+              <div style={{ flex: 1, position: 'relative', height: 8, background: T.border, borderRadius: 4, minWidth: 60 }}>
+                <div style={{ position: 'absolute', left: 0, top: 0, height: '100%',
+                  width: `${revPct}%`, background: day.all_reviewed ? T.green : T.cyan,
+                  borderRadius: 4, transition: 'width 0.2s' }} />
+              </div>
+              {/* Reviewed count */}
+              <div style={{ minWidth: 55, fontSize: 9, color: day.all_reviewed ? T.green : T.txtMuted,
+                textAlign: 'right' }}>
+                {day.reviewed}/{day.total} reviewed
+              </div>
+              {/* Unreviewed badge */}
+              {day.unreviewed > 0 && (
+                <span style={{ background: T.amber + '22', color: T.amber, borderRadius: 6,
+                  padding: '1px 5px', fontSize: 8, fontWeight: 700 }}>
+                  {day.unreviewed} left
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 const JAnalyticsTab: React.FC = () => {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(false);
@@ -3674,6 +4180,7 @@ const JAnalyticsTab: React.FC = () => {
   const [dateTo, setDateTo] = useState('');
 
   const fetchAnalytics = useCallback(async () => {
+    if (groupBy === 'calendar') return; // calendar has its own sub-component
     setLoading(true); setError(null);
     try {
       const params = new URLSearchParams({ group_by: groupBy,
@@ -3714,8 +4221,8 @@ const JAnalyticsTab: React.FC = () => {
         <select value={groupBy} onChange={e => setGroupBy(e.target.value)}
           style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
             color: T.txtSec, padding: '4px 8px', fontSize: 11 }}>
-          {['strategy','instrument','session','regime','daily','weekly','monthly'].map(g => (
-            <option key={g} value={g}>{g.charAt(0).toUpperCase() + g.slice(1)}</option>
+          {['strategy','instrument','session','regime','daily','weekly','monthly','calendar'].map(g => (
+            <option key={g} value={g}>{g === 'calendar' ? '📅 Calendar (Review)' : g.charAt(0).toUpperCase() + g.slice(1)}</option>
           ))}
         </select>
         <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
@@ -3724,17 +4231,24 @@ const JAnalyticsTab: React.FC = () => {
         <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
           style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
             color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
-        <button onClick={fetchAnalytics}
-          style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
-            color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>
-          Refresh
-        </button>
+        {groupBy !== 'calendar' && (
+          <button onClick={fetchAnalytics}
+            style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
+              color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>
+            Refresh
+          </button>
+        )}
       </div>
 
-      {loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
-      {error && <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>}
+      {/* Calendar view — fetches /journal/calendar-summary independently */}
+      {groupBy === 'calendar' && (
+        <JCalendarView dateFrom={dateFrom} dateTo={dateTo} />
+      )}
 
-      {data && !loading && (
+      {groupBy !== 'calendar' && loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
+      {groupBy !== 'calendar' && error && <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>}
+
+      {groupBy !== 'calendar' && data && !loading && (
         <>
           {/* Summary cards */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 14 }}>
@@ -4181,7 +4695,26 @@ const JDirectionalTab: React.FC = () => {
 
 // ── Journal Full Page (outer shell) ──────────────────────────────────────────
 const JournalFullPage: React.FC = () => {
-  const [tab, setTab] = useState<JTab>('trades');
+  const [tab,        setTab]        = useState<JTab>('trades');
+  const [queueBadge, setQueueBadge] = useState<number | null>(null);
+
+  // Keep the Review Queue badge count fresh when the page mounts and when
+  // the user switches to the Trades tab (so a just-completed review is reflected).
+  const refreshBadge = useCallback(async () => {
+    try {
+      const r = await fetch('/api/journal/review-queue', { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.ok) setQueueBadge(d.unreviewed_count ?? 0);
+    } catch { /* fail silently — badge is cosmetic */ }
+  }, []);
+
+  useEffect(() => { refreshBadge(); }, [refreshBadge]);
+
+  const handleTabChange = (t: JTab) => {
+    setTab(t);
+    // Refresh badge when leaving the queue tab (reviews may have been completed)
+    if (t === 'trades') refreshBadge();
+  };
 
   return (
     <div style={{ background: T.panel, borderRadius: 10, border: `1px solid ${T.border}`,
@@ -4192,11 +4725,12 @@ const JournalFullPage: React.FC = () => {
         </div>
         <div style={{ fontSize: 9, color: T.txtMuted }}>Phase 7N</div>
       </div>
-      <JTabBar active={tab} onChange={setTab} />
-      {tab === 'trades'    && <JTradesTab />}
-      {tab === 'import'    && <JImportTab />}
-      {tab === 'analytics' && <JAnalyticsTab />}
-      {tab === 'playbook'  && <JPlaybookTab />}
+      <JTabBar active={tab} onChange={handleTabChange} queueBadge={queueBadge} />
+      {tab === 'trades'      && <JTradesTab />}
+      {tab === 'queue'       && <JReviewQueueTab onOpenReview={undefined} />}
+      {tab === 'import'      && <JImportTab />}
+      {tab === 'analytics'   && <JAnalyticsTab />}
+      {tab === 'playbook'    && <JPlaybookTab />}
       {tab === 'learning'    && <JLearningTab />}
       {tab === 'directional' && <JDirectionalTab />}
     </div>

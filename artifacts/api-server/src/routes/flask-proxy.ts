@@ -154,6 +154,10 @@ export const BOT1_ROUTES = [
   "/journal/trade/:source/:id/review",
   "/journal/trade/:source/:id/exclude",
   "/journal/review-queue",
+  // Phase 7N Batch B: full queue (5-bucket view) + calendar summary.
+  // Both are read-only display routes — no money-path or gate involvement.
+  "/journal/review-queue-full",
+  "/journal/calendar-summary",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",

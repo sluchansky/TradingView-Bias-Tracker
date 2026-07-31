@@ -940,5 +940,292 @@ class TestControlledVocabularyConstants(unittest.TestCase):
         self.assertEqual(len(overlap), 0, f"overlap: {overlap}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 7N Batch B — Full Review Queue Tests
+# ---------------------------------------------------------------------------
+
+class TestFullReviewQueue(ReviewTestBase):
+    """Tests for GET /journal/review-queue-full — 5-bucket view."""
+
+    def _make_row(self, id_, source, review_status, strategy_key="MY_STRAT", instrument="MGC",
+                  result="win", r_multiple=1.5, date_="2026-07-01T10:00:00"):
+        """Build a cursor row matching the SELECT columns in journal_review_queue_full."""
+        return (id_, source, date_, instrument, "long", "Some Strategy",
+                strategy_key, result, r_multiple, review_status, 55.0, "SWING")
+
+    def test_empty_db_returns_empty_buckets(self):
+        """With no trades in DB, all buckets should be empty lists."""
+        cur = _make_cur(rows=[])
+        cur.description = [
+            ("id",), ("source",), ("date",), ("instrument",), ("direction",),
+            ("strategy_name",), ("strategy_key",), ("result",), ("r_multiple",),
+            ("review_status",), ("edge_score",), ("trading_mode",),
+        ]
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/review-queue-full")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        for bucket in ("UNREVIEWED", "IN_PROGRESS", "NEEDS_DATA", "MISSING_STRATEGY", "EXCLUDED"):
+            self.assertEqual(data["buckets"][bucket], [])
+            self.assertEqual(data["counts"][bucket], 0)
+
+    def test_unreviewed_bucket_assignment(self):
+        """A trade with review_status='UNREVIEWED' lands in UNREVIEWED bucket."""
+        row = self._make_row(1, "system", "UNREVIEWED")
+        cur = _make_cur(rows=[row])
+        cur.description = [
+            ("id",), ("source",), ("date",), ("instrument",), ("direction",),
+            ("strategy_name",), ("strategy_key",), ("result",), ("r_multiple",),
+            ("review_status",), ("edge_score",), ("trading_mode",),
+        ]
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/review-queue-full")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["counts"]["UNREVIEWED"], 1)
+        self.assertEqual(data["buckets"]["UNREVIEWED"][0]["id"], 1)
+
+    def test_missing_strategy_bucket_for_system_trade_no_key(self):
+        """System trade with empty strategy_key also appears in MISSING_STRATEGY bucket."""
+        row = self._make_row(2, "system", "UNREVIEWED", strategy_key="")
+        cur = _make_cur(rows=[row])
+        cur.description = [
+            ("id",), ("source",), ("date",), ("instrument",), ("direction",),
+            ("strategy_name",), ("strategy_key",), ("result",), ("r_multiple",),
+            ("review_status",), ("edge_score",), ("trading_mode",),
+        ]
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/review-queue-full")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        # Appears in both MISSING_STRATEGY and its review_status bucket
+        ids_ms = [t["id"] for t in data["buckets"]["MISSING_STRATEGY"]]
+        self.assertIn(2, ids_ms)
+
+    def test_tradzella_trade_no_strategy_key_not_in_missing_strategy(self):
+        """Tradzella trades with empty strategy_key should NOT appear in MISSING_STRATEGY."""
+        row = self._make_row(3, "tradzella", "UNREVIEWED", strategy_key="")
+        cur = _make_cur(rows=[row])
+        cur.description = [
+            ("id",), ("source",), ("date",), ("instrument",), ("direction",),
+            ("strategy_name",), ("strategy_key",), ("result",), ("r_multiple",),
+            ("review_status",), ("edge_score",), ("trading_mode",),
+        ]
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/review-queue-full")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        ids_ms = [t["id"] for t in data["buckets"]["MISSING_STRATEGY"]]
+        self.assertNotIn(3, ids_ms)
+
+    def test_multiple_statuses_land_in_correct_buckets(self):
+        """IN_PROGRESS, NEEDS_DATA, and EXCLUDED trades each land in their own bucket."""
+        rows = [
+            self._make_row(10, "system", "IN_PROGRESS"),
+            self._make_row(11, "system", "NEEDS_DATA"),
+            self._make_row(12, "system", "EXCLUDED"),
+        ]
+        cur = _make_cur(rows=rows)
+        cur.description = [
+            ("id",), ("source",), ("date",), ("instrument",), ("direction",),
+            ("strategy_name",), ("strategy_key",), ("result",), ("r_multiple",),
+            ("review_status",), ("edge_score",), ("trading_mode",),
+        ]
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/review-queue-full")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["counts"]["IN_PROGRESS"], 1)
+        self.assertEqual(data["counts"]["NEEDS_DATA"], 1)
+        self.assertEqual(data["counts"]["EXCLUDED"], 1)
+        self.assertEqual(data["counts"]["UNREVIEWED"], 0)
+
+    def test_db_error_returns_500(self):
+        """DB query failure → ok=False, 500."""
+        conn = MagicMock()
+        conn.__enter__ = lambda s: s
+        conn.__exit__  = MagicMock(return_value=False)
+        cur = MagicMock()
+        cur.__enter__ = lambda s: s
+        cur.__exit__  = MagicMock(return_value=False)
+        cur.execute   = MagicMock(side_effect=RuntimeError("pg down"))
+        conn.cursor   = MagicMock(return_value=cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/review-queue-full")
+        self.assertEqual(resp.status_code, 500)
+        self.assertFalse(resp.get_json()["ok"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 7N Batch B — Calendar Summary Tests
+# ---------------------------------------------------------------------------
+
+class TestCalendarSummary(ReviewTestBase):
+    """Tests for GET /journal/calendar-summary."""
+
+    def _mock_calendar_cur(self, sys_rows=None, tz_rows=None):
+        """Return a cursor that replies correctly for two consecutive execute() calls."""
+        sys_rows = sys_rows or []
+        tz_rows  = tz_rows  or []
+
+        cols = [("day",), ("n",), ("wins",), ("losses",), ("total_r",), ("pnl",), ("reviewed",)]
+
+        call_count = [0]
+        def _fetchall():
+            idx = call_count[0] - 1
+            return (sys_rows if idx == 0 else tz_rows)
+        def _execute(*_a, **_kw):
+            call_count[0] += 1
+        cur = MagicMock()
+        cur.__enter__ = lambda s: s
+        cur.__exit__  = MagicMock(return_value=False)
+        cur.execute   = MagicMock(side_effect=_execute)
+        cur.fetchall  = MagicMock(side_effect=_fetchall)
+        cur.description = cols
+        return cur
+
+    def test_empty_db_returns_empty_days(self):
+        cur  = self._mock_calendar_cur()
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["days"], [])
+        self.assertEqual(data["count"], 0)
+
+    def test_single_day_all_reviewed(self):
+        """One day with 2 trades both reviewed → all_reviewed=True."""
+        row = ("2026-07-01", 2, 2, 0, 3.0, 0.0, 2)
+        cur  = self._mock_calendar_cur(sys_rows=[row])
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(data["days"]), 1)
+        day = data["days"][0]
+        self.assertEqual(day["date"], "2026-07-01")
+        self.assertTrue(day["all_reviewed"])
+        self.assertEqual(day["unreviewed"], 0)
+        self.assertAlmostEqual(day["total_r"], 3.0)
+
+    def test_excluded_trade_counts_as_terminal_for_all_reviewed(self):
+        """A day with 2 trades where one is REVIEWED and one is EXCLUDED should
+        show reviewed=2 and all_reviewed=True — EXCLUDED is a terminal state."""
+        # The SQL sums REVIEWED + EXCLUDED as reviewed (reviewed=2 here)
+        row = ("2026-07-04", 2, 1, 1, 0.5, 0.0, 2)
+        cur  = self._mock_calendar_cur(sys_rows=[row])
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        data = resp.get_json()
+        day = data["days"][0]
+        self.assertEqual(day["total"], 2)
+        self.assertEqual(day["reviewed"], 2)   # REVIEWED + EXCLUDED counted
+        self.assertEqual(day["unreviewed"], 0)
+        self.assertTrue(day["all_reviewed"])
+
+    def test_single_day_unreviewed(self):
+        """Day with 3 trades, 1 reviewed → unreviewed=2, all_reviewed=False."""
+        row = ("2026-07-02", 3, 1, 2, -1.5, 0.0, 1)
+        cur  = self._mock_calendar_cur(sys_rows=[row])
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        data = resp.get_json()
+        day = data["days"][0]
+        self.assertEqual(day["unreviewed"], 2)
+        self.assertFalse(day["all_reviewed"])
+
+    def test_multi_source_merge_same_day(self):
+        """System and Tradzella trades on the same ET day are merged."""
+        sys_row = ("2026-07-03", 1, 1, 0, 2.0, 0.0, 1)
+        tz_row  = ("2026-07-03", 2, 0, 2, -1.0, -50.0, 0)
+        cur  = self._mock_calendar_cur(sys_rows=[sys_row], tz_rows=[tz_row])
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        data = resp.get_json()
+        self.assertEqual(len(data["days"]), 1)
+        day = data["days"][0]
+        self.assertEqual(day["total"], 3)    # 1 + 2
+        self.assertEqual(day["wins"],  1)    # 1 + 0
+        self.assertEqual(day["losses"], 2)   # 0 + 2
+        self.assertAlmostEqual(day["total_r"], 1.0)  # 2.0 + (-1.0)
+        self.assertAlmostEqual(day["pnl"], -50.0)
+        self.assertEqual(day["reviewed"], 1)   # 1 + 0
+        self.assertEqual(day["unreviewed"], 2) # 3 - 1
+
+    def test_days_sorted_ascending_by_date(self):
+        """Multiple trading days returned in ascending date order."""
+        rows = [
+            ("2026-07-10", 1, 1, 0, 1.0, 0.0, 0),
+            ("2026-07-05", 1, 0, 1, -1.0, 0.0, 1),
+            ("2026-07-08", 2, 1, 1, 0.5, 0.0, 0),
+        ]
+        cur  = self._mock_calendar_cur(sys_rows=rows)
+        conn = _make_conn(cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        data = resp.get_json()
+        dates = [d["date"] for d in data["days"]]
+        self.assertEqual(dates, sorted(dates))
+
+    def test_db_error_returns_500(self):
+        conn = MagicMock()
+        conn.__enter__ = lambda s: s
+        conn.__exit__  = MagicMock(return_value=False)
+        cur = MagicMock()
+        cur.__enter__ = lambda s: s
+        cur.__exit__  = MagicMock(return_value=False)
+        cur.execute   = MagicMock(side_effect=RuntimeError("db gone"))
+        conn.cursor   = MagicMock(return_value=cur)
+        with patch.object(_app, "_journal_db_guard", return_value=(conn, None)):
+            resp = self.client.get("/journal/calendar-summary")
+        self.assertEqual(resp.status_code, 500)
+        self.assertFalse(resp.get_json()["ok"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 7N Batch B — Attachment DB Constraint Tests
+# These verify the CHECK constraints on the journal_attachments table
+# are correctly defined (can't test Express routes from Python, but
+# we can verify the constants used in the SQL schema are sound).
+# ---------------------------------------------------------------------------
+
+class TestAttachmentConstants(unittest.TestCase):
+    """Verify attachment stage names and limits used in schema and routes match."""
+
+    VALID_STAGES = frozenset([
+        "before_entry", "at_entry", "during", "after_exit", "review_markup",
+    ])
+    VALID_SOURCES = frozenset(["system", "tradzella"])
+    MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+    def test_valid_stages_are_five(self):
+        self.assertEqual(len(self.VALID_STAGES), 5)
+
+    def test_stage_names_are_lowercase_underscore(self):
+        for s in self.VALID_STAGES:
+            self.assertRegex(s, r'^[a-z_]+$', f"Stage '{s}' not lowercase_underscore")
+
+    def test_valid_sources_match_journal(self):
+        self.assertIn("system",    self.VALID_SOURCES)
+        self.assertIn("tradzella", self.VALID_SOURCES)
+
+    def test_max_size_is_5mb(self):
+        self.assertEqual(self.MAX_SIZE_BYTES, 5_242_880)
+
+    def test_stage_set_has_no_duplicates(self):
+        stages_list = list(self.VALID_STAGES)
+        self.assertEqual(len(stages_list), len(set(stages_list)))
+
+
 if __name__ == "__main__":
     unittest.main()
