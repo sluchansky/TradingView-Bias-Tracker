@@ -7,7 +7,7 @@
  * Polling: 7 s (reduced when hidden). Manual refresh control included.
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link, useLocation, useParams } from 'wouter';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
 import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
@@ -89,6 +89,175 @@ function statusDot(ok: boolean | null): React.ReactNode {
 function escTxt(s: string): string {
   // textContent-safe — no innerHTML usage on live data
   return s;
+}
+
+// ── AI response escape (XSS contract) ────────────────────────────────────────
+// React renders JSX text nodes without innerHTML so this is a pass-through that
+// documents the XSS-safe rendering contract.  If dangerouslySetInnerHTML is
+// ever introduced, use a full sanitiser here.
+function aiEsc(s: string): string { return s; }
+
+// ── Streaming reveal hook ─────────────────────────────────────────────────────
+function useStream(text: string, charPerTick = 10): { text: string; live: boolean } {
+  const [shown, setShown] = useState('');
+  const [live,  setLive]  = useState(false);
+  const prevRef = useRef('');
+  useEffect(() => {
+    if (text === prevRef.current) return;
+    prevRef.current = text;
+    if (!text) { setShown(''); setLive(false); return; }
+    setLive(true);
+    let i = shown.length;
+    const id = setInterval(() => {
+      i = Math.min(i + charPerTick, text.length);
+      setShown(text.slice(0, i));
+      if (i >= text.length) { clearInterval(id); setLive(false); }
+    }, 16);
+    return () => clearInterval(id);
+  }, [text]); // eslint-disable-line react-hooks/exhaustive-deps
+  return { text: shown, live };
+}
+
+// ── Ask AI types ──────────────────────────────────────────────────────────────
+type MbMsg     = { id: number; role: 'user' | 'brain'; text: string };
+type MbMemTag   = 'chat' | 'insight';
+type MbMemEntry = { t: number; tag: MbMemTag; text: string };
+
+// ── Conversation memory (shared localStorage key with Home.tsx) ───────────────
+// Same brain_mem_YYYY-MM-DD key keeps both pages in the same session context.
+function _mbMemKey(): string {
+  const d = new Date();
+  return `brain_mem_${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function useMbConvMemory() {
+  const [entries, setEntries] = useState<MbMemEntry[]>(() => {
+    try { const r = localStorage.getItem(_mbMemKey()); return r ? (JSON.parse(r) as MbMemEntry[]) : []; }
+    catch { return []; }
+  });
+
+  const addEntry = useCallback((tag: MbMemTag, text: string) => {
+    const entry: MbMemEntry = { t: Date.now(), tag, text: text.slice(0, 200) };
+    setEntries(prev => {
+      const next = [...prev, entry].slice(-60);
+      try { localStorage.setItem(_mbMemKey(), JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+
+  const context = useMemo((): string => {
+    const PERSONA = [
+      '[ANALYST VOICE — apply strictly]',
+      'You are a senior institutional futures trader narrating the tape live.',
+      'Direct and concise; present tense, active voice.',
+      'For every answer: (1) what you see, (2) why it matters, (3) what changes your read.',
+      'Never use filler or disclaimers. Analysis only — never place or modify trades.',
+      '---',
+    ].join('\n');
+    if (entries.length === 0) return PERSONA + '\n';
+    const TAG: Record<MbMemTag, string> = { chat: 'YOU', insight: 'BRAIN' };
+    const lines = entries.slice(-20).map(e => {
+      const hh = new Date(e.t).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York',
+      });
+      return `${hh} [${TAG[e.tag]}] ${e.text}`;
+    });
+    return PERSONA + '\n[TODAY\'S SESSION]\n' + lines.join('\n') + '\n---\n';
+  }, [entries]);
+
+  return { context, addEntry };
+}
+
+// ── Main Brain context builder ────────────────────────────────────────────────
+// Produces a compact text snapshot of the currently-displayed Main Brain state.
+// Only reads from the already-normalised `p` payload — never computes trading values.
+// This prefix is prepended to the user's question so the AI knows exactly
+// what the operator sees.
+function buildMbContext(p: Record<string, unknown>, ticker: string): string {
+  const mkt     = (p.market     ?? {}) as Record<string, unknown>;
+  const verdict = (p.verdict    ?? {}) as Record<string, unknown>;
+  const thesis  = (p.thesis ?? p.left_brain ?? {}) as Record<string, unknown>;
+  const cp      = (p.candidate_preview ?? {}) as Record<string, unknown>;
+  const eb      = (p.edge_breakdown    ?? {}) as Record<string, unknown>;
+  const scanner = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
+  const mb      = (p.main_brain        ?? {}) as Record<string, unknown>;
+  const mbSig   = (mb.signals          ?? {}) as Record<string, unknown>;
+  const at      = (p.active_trades     ?? {}) as Record<string, unknown>;
+  const coach   = (p.coach             ?? {}) as Record<string, unknown>;
+  const sys     = (p.system_status     ?? {}) as Record<string, unknown>;
+  const risk    = (p.risk_state        ?? {}) as Record<string, unknown>;
+
+  const edgeScore = Math.round(safeNum(eb.score ?? eb.total) ?? 0);
+  const edgeGrade = safeStr(eb.grade ?? eb.label, '');
+
+  const thDir    = safeStr(thesis.direction ?? thesis.thesis_direction, '');
+  const thStr    = safeStr(thesis.strength  ?? thesis.thesis_strength, '');
+  const thAge    = safeStr(thesis.age_display ?? thesis.age, '');
+  const thStatus = safeStr(thesis.status    ?? thesis.thesis_status, '');
+
+  const vReadiness = verdict.is_actionable === true
+    ? 'READY'
+    : safeStr(verdict.readiness_label, 'WAIT');
+  const vDir     = safeStr(verdict.direction ?? verdict.candidate_direction, '');
+  const vCandSt  = safeStr(verdict.candidate_status, '');
+  const vBlock   = Array.isArray(verdict.hard_blockers)
+    ? (verdict.hard_blockers as string[]).filter(Boolean).join(', ')
+    : safeStr(verdict.hard_blockers, '');
+  const vMissing = Array.isArray(verdict.missing_confirmations)
+    ? (verdict.missing_confirmations as string[]).filter(Boolean).join(', ')
+    : safeStr(verdict.missing_confirmations, '');
+
+  const activeSt = safeStr(
+    scanner.active_strategy ?? scanner.selected_strategy ?? mbSig.strategy, '');
+  const trades   = Array.isArray(at.trades) ? (at.trades as Record<string, unknown>[]) : [];
+  const tradeSum = trades.length > 0
+    ? trades.map(t => `${safeStr(t.direction)} ${safeStr(t.instrument)} @ ${safeStr(t.entry_price)}`).join(', ')
+    : 'None';
+  const coachWt  = safeStr(coach.weight_status ?? coach.weight_label, '');
+  const coachN   = safeStr(coach.sample_count  ?? coach.n, '');
+
+  const tsET = new Date().toLocaleTimeString('en-US', {
+    hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York',
+  });
+
+  const lines: string[] = [
+    `[MAIN BRAIN — ${ticker} — ${tsET} ET]`,
+    `Instrument: ${ticker} | Mode: ${safeStr(mkt.trading_mode, '—')} | Session: ${safeStr(mkt.session_status, '—')}`,
+    '',
+    'THESIS',
+    `Direction: ${thDir || '—'} | Strength: ${thStr || '—'} | Status: ${thStatus || '—'} | Age: ${thAge || '—'}`,
+    '',
+    'VERDICT',
+    `Readiness: ${vReadiness} | Edge: ${edgeScore}/110 | Grade: ${edgeGrade || '—'}`,
+    `Candidate Direction: ${vDir || '—'} | Candidate Status: ${vCandSt || '—'}`,
+    '',
+    'STRATEGY',
+    `Active: ${activeSt || '—'}`,
+    '',
+    'BLOCKERS',
+    `Hard Blockers: ${vBlock || 'None'}`,
+    `Missing Confirmations: ${vMissing || 'None'}`,
+    '',
+    'TRADE PREVIEW',
+    cp.entry_zone != null
+      ? `Entry: ${safeStr(cp.entry_zone)} | Stop: ${safeStr(cp.stop_loss)} | TP: ${safeStr(cp.take_profit)} | R:R ${safeStr(cp.risk_reward)}`
+      : 'No candidate developing',
+    '',
+    'RISK',
+    `Daily Losses: ${safeStr(risk.daily_losses_today, '—')}/${safeStr(risk.max_losses_per_day, '—')}`,
+    '',
+    'ACTIVE TRADES',
+    tradeSum,
+    '',
+    'LEARNING',
+    `Weight Status: ${coachWt || '—'} | Samples: ${coachN || '—'}`,
+    '',
+    'SYSTEM',
+    `DB: ${sys.db_ready ? 'OK' : 'ERROR'} | Learning: ${sys.learning_ready ? 'OK' : 'ERROR'}`,
+    '---',
+    '',
+  ];
+  return lines.join('\n');
 }
 
 // ── Clock hook ────────────────────────────────────────────────────────────────
@@ -1890,6 +2059,286 @@ const SystemHealthPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Ask AI message bubble ─────────────────────────────────────────────────────
+function MbBubble({ msg }: { msg: MbMsg }) {
+  const isBrain = msg.role === 'brain';
+  const { text: shown, live } = useStream(isBrain ? msg.text : '');
+  const display = isBrain ? shown : msg.text;
+  return (
+    <div style={{ display: 'flex', justifyContent: isBrain ? 'flex-start' : 'flex-end' }}>
+      <div style={{
+        maxWidth: '85%', padding: '8px 12px',
+        borderRadius: isBrain ? '4px 12px 12px 12px' : '12px 4px 12px 12px',
+        background: isBrain ? `${T.cyan}0a` : 'rgba(255,255,255,0.06)',
+        border: `1px solid ${isBrain ? `${T.cyan}22` : 'rgba(255,255,255,0.08)'}`,
+        fontSize: 12.5, lineHeight: 1.55,
+        color: isBrain ? T.txtSec : 'rgba(255,255,255,0.55)',
+        wordBreak: 'break-word',
+      }}>
+        {/* aiEsc is a pass-through — React renders as text content (XSS-safe by default) */}
+        {aiEsc(display)}
+        {live && <span style={{ opacity: 0.5, animation: 'mbDot 0.8s infinite' }}>▌</span>}
+      </div>
+    </div>
+  );
+}
+
+// ── Ask AI panel ──────────────────────────────────────────────────────────────
+// Slide-up modal that reuses the existing /api/assistant endpoint.
+// SCOPE: display-only — never touches the gate, scoring, or execution.
+// The endpoint is owner-only (Basic Auth + same-origin CSRF) — same credentials
+// as every other call in this file.
+const AskAiPanel: React.FC<{
+  open:    boolean;
+  onClose: () => void;
+  ticker:  string;
+  p:       Record<string, unknown>;
+}> = ({ open, onClose, ticker, p }) => {
+  const { context: mbMemCtx, addEntry: mbAddEntry } = useMbConvMemory();
+  const [msgs,   setMsgs]   = useState<MbMsg[]>([]);
+  const [input,  setInput]  = useState('');
+  const [asking, setAsking] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef  = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to latest message
+  useEffect(() => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [msgs, asking]);
+
+  // Focus input when panel opens
+  useEffect(() => {
+    if (open) setTimeout(() => inputRef.current?.focus(), 80);
+  }, [open]);
+
+  // Close on Escape — no polling side effects
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [open, onClose]);
+
+  // Contextual chips based on current readiness
+  const vdct      = (p.verdict ?? {}) as Record<string, unknown>;
+  const isReady   = vdct.is_actionable === true;
+  const isMgmnt   = /managing/i.test(safeStr(vdct.readiness_label ?? ''));
+  const chips     = isReady
+    ? ['Break down the edge.', 'What invalidates this?', 'Where is the stop?']
+    : isMgmnt
+    ? ['Thesis still intact?', 'Where to take partials?', 'What level flips this?']
+    : ['What is missing?', 'Why is this WAIT?', 'What triggers entry?'];
+
+  const ask = useCallback(async (q?: string) => {
+    const question = (q ?? input).trim();
+    if (!question || asking) return;
+    setInput('');
+    setMsgs(m => [...m, { id: Date.now(), role: 'user', text: question }]);
+    setAsking(true);
+    mbAddEntry('chat', question.slice(0, 150));
+
+    // Prepend persona + session memory + current MB snapshot so the AI
+    // knows exactly what the operator is looking at right now.
+    const ctx  = buildMbContext(p, ticker);
+    const fullQ = (mbMemCtx ? mbMemCtx + ctx : ctx) + question;
+
+    try {
+      const r = await fetch('/api/assistant', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body: JSON.stringify({ question: fullQ, ticker }),
+      });
+      if (r.status === 401 || r.status === 403) {
+        setMsgs(m => [...m, { id: Date.now(), role: 'brain',
+          text: 'Session expired — refresh the page to re-authenticate.' }]);
+      } else {
+        const j = await r.json() as Record<string, unknown>;
+        const answer = String(j.answer || j.error || 'No response.');
+        setMsgs(m => [...m, { id: Date.now(), role: 'brain', text: answer }]);
+        mbAddEntry('insight', answer.slice(0, 140));
+      }
+    } catch {
+      setMsgs(m => [...m, { id: Date.now(), role: 'brain',
+        text: 'Connection error — check the backend connection.' }]);
+    } finally {
+      setAsking(false);
+      setTimeout(() => inputRef.current?.focus(), 60);
+    }
+  }, [input, asking, ticker, p, mbMemCtx, mbAddEntry]);
+
+  if (!open) return null;
+
+  const modeLabel = safeStr(((p.market ?? {}) as Record<string, unknown>).trading_mode, '');
+
+  return (
+    <div
+      role="dialog" aria-modal="true"
+      aria-label="Ask AI about current setup"
+      style={{
+        position: 'fixed', inset: 0, zIndex: 2000,
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end',
+        padding: '20px',
+      }}
+    >
+      {/* Dim backdrop — click to close */}
+      <div
+        onClick={onClose}
+        aria-hidden
+        style={{
+          position: 'fixed', inset: 0,
+          background: 'rgba(0,0,0,0.45)',
+          backdropFilter: 'blur(2px)',
+        }}
+      />
+
+      {/* Panel */}
+      <div style={{
+        position: 'relative',
+        width: 420, maxWidth: 'calc(100vw - 24px)',
+        height: 540, maxHeight: 'calc(100vh - 80px)',
+        display: 'flex', flexDirection: 'column',
+        background: T.panel,
+        border: `1px solid ${T.cyan}44`,
+        borderRadius: 12, overflow: 'hidden',
+        boxShadow: `0 24px 64px rgba(0,0,0,0.60), 0 0 0 1px ${T.cyan}18`,
+        animation: 'mbAskSlideIn 0.18s ease-out',
+      }}>
+
+        {/* ── Panel header ── */}
+        <div style={{
+          display: 'flex', alignItems: 'center',
+          padding: '11px 16px 9px',
+          borderBottom: `1px solid ${T.border}`,
+          background: `${T.cyan}08`, flexShrink: 0,
+        }}>
+          <span style={{ fontSize: 15, marginRight: 8 }}>🧠</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: T.cyan, letterSpacing: '0.06em' }}>
+              ASK AI
+            </div>
+            <div style={{
+              fontSize: 9, color: T.txtMuted, letterSpacing: '0.06em',
+              marginTop: 1, fontFamily: T.mono,
+            }}>
+              {ticker}{modeLabel ? ` · ${modeLabel}` : ''} · read-only analysis only
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close Ask AI panel"
+            style={{
+              background: 'none', border: 'none', color: T.txtMuted,
+              cursor: 'pointer', fontSize: 18, padding: '2px 4px', lineHeight: 1,
+            }}
+          >×</button>
+        </div>
+
+        {/* ── Suggestion chips ── */}
+        <div style={{
+          display: 'flex', gap: 6, flexWrap: 'wrap',
+          padding: '8px 12px 6px',
+          borderBottom: `1px solid ${T.border}`, flexShrink: 0,
+        }}>
+          {chips.map(c => (
+            <button
+              key={c}
+              onClick={() => ask(c)}
+              disabled={asking}
+              style={{
+                padding: '3px 10px', borderRadius: 14,
+                border: `1px solid ${T.border}`, background: 'transparent',
+                color: T.txtMuted, fontSize: 10, fontFamily: T.mono,
+                cursor: asking ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap',
+              }}
+            >{c}</button>
+          ))}
+        </div>
+
+        {/* ── Message list ── */}
+        <div
+          ref={listRef}
+          id="mb-ask-msgs"
+          style={{
+            flex: 1, overflowY: 'auto',
+            padding: '10px 14px',
+            display: 'flex', flexDirection: 'column', gap: 8,
+          }}
+        >
+          {msgs.length === 0 && (
+            <div style={{
+              flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: T.txtMuted, fontSize: 11.5, fontFamily: T.mono,
+              textAlign: 'center', padding: '24px 0', lineHeight: 1.7,
+            }}>
+              Ask about the current {ticker} setup —<br />
+              thesis, blockers, edge score, trade plan, or risk.
+            </div>
+          )}
+          {msgs.map(m => <MbBubble key={m.id} msg={m} />)}
+          {asking && (
+            <div style={{ display: 'flex', gap: 5, padding: '4px 2px 2px' }}>
+              {[0, 1, 2].map(i => (
+                <div key={i} style={{
+                  width: 6, height: 6, borderRadius: '50%', background: T.cyan,
+                  animation: `mbDot 1.2s ${i * 0.2}s infinite ease-in-out`,
+                }} />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── Input row ── */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '10px 12px',
+          borderTop: `1px solid ${T.border}`, flexShrink: 0,
+        }}>
+          <input
+            ref={inputRef}
+            id="mb-ask-input"
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } }}
+            placeholder={`Ask about ${ticker}…`}
+            disabled={asking}
+            style={{
+              flex: 1, background: 'rgba(255,255,255,0.04)',
+              border: `1px solid ${T.border}`, borderRadius: 6,
+              padding: '7px 10px', color: T.txtPri, fontSize: 12,
+              fontFamily: T.mono, outline: 'none', transition: 'border-color 0.15s',
+            }}
+            onFocus={e  => { e.currentTarget.style.borderColor = `${T.cyan}55`; }}
+            onBlur={e   => { e.currentTarget.style.borderColor = T.border; }}
+          />
+          <button
+            onClick={() => ask()}
+            disabled={!input.trim() || asking}
+            aria-label="Send question"
+            style={{
+              background: input.trim() && !asking ? `${T.cyan}20` : 'transparent',
+              border: `1px solid ${input.trim() && !asking ? `${T.cyan}55` : T.border}`,
+              color: input.trim() && !asking ? T.cyan : T.txtMuted,
+              borderRadius: 6, padding: '6px 14px', fontSize: 13, fontWeight: 700,
+              cursor: input.trim() && !asking ? 'pointer' : 'default',
+              transition: 'all 0.15s',
+            }}
+          >↵</button>
+        </div>
+
+        {/* ── Disclaimer ── */}
+        <div style={{
+          padding: '4px 14px 8px', fontSize: 9,
+          color: T.txtMuted, textAlign: 'center', flexShrink: 0,
+        }}>
+          Analysis only — AI cannot place trades or modify positions
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ── Header ────────────────────────────────────────────────────────────────────
 const Header: React.FC<{
   p: Record<string, unknown> | null;
@@ -1898,7 +2347,8 @@ const Header: React.FC<{
   ticker: string;
   setTicker: (t: string) => void;
   refresh: () => void;
-}> = ({ p, fetchState, lastOk, ticker, setTicker, refresh }) => {
+  onAskAi: () => void;
+}> = ({ p, fetchState, lastOk, ticker, setTicker, refresh, onAskAi }) => {
   const clock = useClock();
   const mkt = ((p?.market ?? {}) as Record<string, unknown>);
   const sys = ((p?.system_status ?? {}) as Record<string, unknown>);
@@ -1958,6 +2408,21 @@ const Header: React.FC<{
             {lastOk ? `Updated ${fmtAge(new Date(lastOk).toISOString())}` : 'Connecting…'}
           </span>
         </div>
+        <button
+          onClick={onAskAi}
+          aria-label="Ask AI about current setup"
+          style={{
+            background: `${T.cyan}14`, border: `1px solid ${T.cyan}44`,
+            color: T.cyan, borderRadius: 6, padding: '4px 12px',
+            cursor: 'pointer', fontSize: 10, fontWeight: 700,
+            letterSpacing: '0.06em', transition: 'all 0.2s',
+            whiteSpace: 'nowrap',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = `${T.cyan}28`; }}
+          onMouseLeave={e => { e.currentTarget.style.background = `${T.cyan}14`; }}
+        >
+          💬 ASK AI
+        </button>
         <button onClick={refresh} disabled={loading} aria-label="Refresh data" style={{
           background:'transparent', border:`1px solid ${T.border}`, color:T.txtSec, borderRadius:6,
           padding:'4px 10px', cursor:'pointer', fontSize:10, fontWeight:600,
@@ -2030,6 +2495,11 @@ export default function MainBrain() {
   const allOk = !!(sys.db_ready && sys.learning_ready);
   const isLoading = fetchState === 'loading' && !payload;
   const isError   = (fetchState === 'error' || isAuthFail) && !payload;
+
+  // ── Ask AI state ─────────────────────────────────────────────────────────
+  // Open/close only — all chat state lives inside AskAiPanel so closing the
+  // panel does not reset message history when the operator re-opens it.
+  const [askOpen, setAskOpen] = useState(false);
 
   // ── Cleanest Trade state ──────────────────────────────────────────────────
   // scanGenRef is a generation counter incremented on every scan attempt.
@@ -2237,7 +2707,7 @@ export default function MainBrain() {
 
       {/* Main area */}
       <div style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0, overflowX:'hidden' }}>
-        <Header p={p} fetchState={fetchState} lastOk={lastOk} ticker={ticker} setTicker={handleSetTicker} refresh={refresh} />
+        <Header p={p} fetchState={fetchState} lastOk={lastOk} ticker={ticker} setTicker={handleSetTicker} refresh={refresh} onAskAi={() => setAskOpen(true)} />
 
         <main id="main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
           {isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
@@ -2294,6 +2764,17 @@ export default function MainBrain() {
         </footer>
       </div>
 
+      {/* Ask AI panel — rendered outside the scroll container so it floats
+          over all content. Shares the same /api/assistant endpoint and
+          brain_auth credentials as every other call in this file.
+          Opening/closing does NOT create a second polling stream. */}
+      <AskAiPanel
+        open={askOpen}
+        onClose={() => setAskOpen(false)}
+        ticker={ticker}
+        p={p}
+      />
+
       {/* Cleanest Trade modal — rendered outside the scroll container */}
       <CleanestTradeModal
         open={cleanestOpen}
@@ -2316,6 +2797,14 @@ export default function MainBrain() {
         }
         @media (prefers-reduced-motion: reduce) {
           * { transition: none !important; animation: none !important; }
+        }
+        @keyframes mbAskSlideIn {
+          from { opacity: 0; transform: translateY(14px) scale(0.97); }
+          to   { opacity: 1; transform: translateY(0)    scale(1);    }
+        }
+        @keyframes mbDot {
+          0%, 100% { opacity: 0.25; transform: scale(0.8); }
+          50%       { opacity: 1;   transform: scale(1.1); }
         }
         :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
         ::-webkit-scrollbar { width: 5px; height: 5px; }
