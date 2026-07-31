@@ -1,0 +1,358 @@
+TASK: Audit why the Learning Engine shows zero influence and zero performance samples.
+
+PROBLEM OBSERVED
+
+The Main Brain Coach panel reports:
+
+- LRE Eligible: YES
+- Weight Updated: YES
+- Thesis Resolved: YES
+- Learning Influence: 0
+- Performance Sample: 0
+
+This may indicate that the system is marking learning events as completed without creating valid training samples, updating persistent weights, or applying those weights to live scoring.
+
+Do not assume the UI is wrong or that the engine is wrong.
+
+Trace the complete production learning pipeline and prove exactly where learning stops.
+
+PRIMARY QUESTIONS
+
+1. Are resolved theses being converted into learning samples?
+2. Are samples being persisted?
+3. Are strategy weights actually changing?
+4. Are changed weights being read back by the live strategy engine?
+5. Is learning influence intentionally disabled by a feature flag, mode, minimum sample requirement, or confidence threshold?
+6. Is the Coach panel reading the correct source?
+7. Does “Weight Updated: YES” mean a real numeric change occurred, or only that an update function ran?
+
+STRICT SCOPE
+
+Begin as an AUDIT AND DIAGNOSTICS task.
+
+Do not alter learning formulas, strategy scoring, or live decisions until the current behavior is fully traced.
+
+DO NOT modify:
+
+- Databento
+- Market-data ingestion
+- Strategy definitions
+- Base Edge Score calculations
+- TradersPost
+- Execution logic
+- Risk controls
+- Active-trade management
+- Alert thresholds
+- Polling intervals
+- Authentication
+- Existing API field meanings
+
+PART 1 — TRACE THE FULL LEARNING PIPELINE
+
+Trace:
+
+thesis created
+→ thesis observed
+→ thesis resolved
+→ outcome classified
+→ learning sample created
+→ sample persisted
+→ strategy weight calculated
+→ weight stored
+→ weight loaded
+→ weight applied to live scoring
+→ influence exposed to Main Brain
+→ Coach panel rendered
+
+For every step, provide:
+
+- file path
+- function name
+- input
+- output
+- persistence table or store
+- failure behavior
+- feature flag
+- minimum sample requirement
+- whether the step runs in production
+
+PART 2 — VERIFY THE DATA
+
+Inspect the current production learning data and report:
+
+- total resolved theses
+- total eligible resolved theses
+- total learning samples
+- samples by instrument
+- samples by mode
+- samples by strategy
+- closed-trade samples
+- win/loss counts
+- average R
+- current stored weights
+- previous stored weights, if available
+- last weight-update timestamp
+- last sample-created timestamp
+- last sample-applied timestamp
+
+Do not count journal rows as learning samples unless the code explicitly uses them.
+
+Do not fabricate unavailable history.
+
+PART 3 — EXPLAIN THE CURRENT SCREEN VALUES
+
+For each Coach field, identify the exact source and meaning:
+
+LRE Eligible
+Weight Updated
+Thesis Resolved
+Last Resolved
+Learning Influence
+Performance Sample
+
+Determine whether:
+
+- “Weight Updated: YES” means a row was written
+- a numeric weight actually changed
+- the update was a no-op
+- the result was rejected for insufficient samples
+- the weight was saved under a key the live engine never reads
+- the UI is displaying the wrong sample count
+
+PART 4 — CHECK FEATURE FLAGS AND GATES
+
+Search for all controls involving:
+
+- learning enabled
+- learning influence enabled
+- LRE enabled
+- minimum sample count
+- minimum closed trades
+- confidence requirement
+- paper-only learning
+- shadow mode
+- analysis-only mode
+- production learning
+- weight cap
+- weight floor
+- neutral weight
+- strategy-key mapping
+- instrument-key mapping
+- mode-key mapping
+
+Report the current production value of every relevant setting.
+
+Pay special attention to any requirement similar to:
+
+LEARNING_MIN_SAMPLE
+
+Confirm whether the UI shows zero influence because the minimum sample threshold has not been reached.
+
+PART 5 — CHECK KEY CONSISTENCY
+
+Verify that the same canonical key is used across:
+
+- sample creation
+- persistence
+- weight calculation
+- weight lookup
+- live strategy scoring
+
+Example dimensions:
+
+- strategy name
+- instrument
+- direction
+- mode
+- session
+- regime
+
+Look for mismatches such as:
+
+- `VWAP_CONTINUATION` vs `VWAP_TREND_CONTINUATION`
+- `MGC_SCALP_CHOCH_Long` vs normalized strategy key
+- `Long` vs `LONG`
+- `SCALP` vs `scalp`
+- ticker aliases
+- missing direction dimension
+
+A key mismatch could allow writes to succeed while live reads always return the neutral weight.
+
+PART 6 — ADD READ-ONLY DIAGNOSTICS
+
+Expose a learning diagnostic object through the existing Main Brain API.
+
+Suggested shape:
+
+{
+  "enabled": true,
+  "influence_enabled": true,
+  "mode": "LIVE",
+  "eligible": true,
+  "strategy_key": "VWAP_TREND_CONTINUATION|MGC|LONG|SCALP",
+  "sample_count": 0,
+  "minimum_samples": 20,
+  "closed_trade_count": 0,
+  "current_weight": 1.0,
+  "previous_weight": 1.0,
+  "weight_delta": 0.0,
+  "influence_points": 0,
+  "last_sample_at": null,
+  "last_weight_update_at": "2026-07-30T20:26:23-04:00",
+  "applied_to_live_score": false,
+  "blocked_reason": "INSUFFICIENT_SAMPLES",
+  "source": "learning_db"
+}
+
+Use actual values and established naming conventions.
+
+Do not fabricate data.
+
+PART 7 — IMPROVE THE COACH PANEL
+
+Without changing learning behavior, show:
+
+LEARNING STATUS
+- Enabled
+- Influence Enabled
+- Current Mode
+- Sample Count
+- Minimum Required
+- Current Weight
+- Weight Change
+- Live Influence
+- Last Sample
+- Last Weight Update
+- Applied to Current Decision
+- Blocked Reason
+
+Examples:
+
+LEARNING COLLECTING DATA
+0 / 20 required samples
+Current weight: 1.00
+Live influence: 0 points
+Reason: Minimum sample threshold not reached
+
+or:
+
+LEARNING ACTIVE
+27 samples
+Current weight: 1.08
+Live influence: +4 points
+Applied to: VWAP Trend Continuation / MGC / Long / Scalp
+
+Do not show “Weight Updated: YES” by itself when the numeric weight did not change.
+
+Use one of these more precise states:
+
+- UPDATED
+- NO CHANGE
+- NOT ELIGIBLE
+- INSUFFICIENT SAMPLES
+- WRITE FAILED
+- DISABLED
+- NOT APPLIED
+
+PART 8 — DETERMINISTIC TESTS
+
+Create tests for:
+
+CASE A
+Eligible resolved thesis creates one learning sample.
+
+CASE B
+Ineligible thesis creates no sample and records the reason.
+
+CASE C
+Duplicate resolution does not create duplicate samples.
+
+CASE D
+Sample count below minimum threshold.
+Expected:
+- weight remains neutral
+- influence is zero
+- blocked reason is explicit
+
+CASE E
+Sample count reaches minimum threshold.
+Expected:
+- weight calculation runs
+- stored weight is readable
+- live lookup finds the same key
+
+CASE F
+Weight update function runs but produces no numeric change.
+Expected:
+- status is NO CHANGE, not UPDATED
+
+CASE G
+Strategy-key mismatch.
+Expected:
+- test fails until canonical key mapping is correct
+- diagnostic exposes lookup miss
+
+CASE H
+Persisted weight exists but feature flag is off.
+Expected:
+- influence remains zero
+- reason is DISABLED
+
+CASE I
+Persisted weight exists and influence is enabled.
+Expected:
+- influence is applied exactly once
+- base score remains separately visible
+
+CASE J
+Restart persistence.
+Expected:
+- stored weights and sample counts survive application restart
+
+PART 9 — STOP BEFORE CHANGING LEARNING LOGIC
+
+After completing the audit, diagnostics, and tests, STOP.
+
+Do not tune:
+
+- minimum sample count
+- learning formula
+- weight caps
+- influence points
+- strategy thresholds
+
+Provide a recommended correction only after proving the exact failure point.
+
+VALIDATION
+
+Run:
+
+- focused learning-engine tests
+- thesis-resolution tests
+- strategy-engine regressions
+- Main Brain regressions
+- database/persistence tests
+- TypeScript typecheck
+- production build
+- git diff --check
+
+Do not fix unrelated failures.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Complete learning pipeline trace
+5. Current production feature flags
+6. Current sample counts and stored weights
+7. Exact explanation for Learning Influence = 0
+8. Exact explanation for Performance Sample = 0
+9. Whether “Weight Updated: YES” represented a real numeric change
+10. Diagnostic schema added
+11. Screenshots of the improved Coach panel
+12. Test and build results
+13. Confirmation that live learning behavior was not changed
+14. Recommended Phase 2 correction, but do not implement it

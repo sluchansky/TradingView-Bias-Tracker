@@ -108,6 +108,7 @@
 - [Auto Early-Exit](auto-early-exit.md) — armed watcher flattens bot's OWN position on CONFIRMED-invalid thesis (opposite_confirmed only); fire-once + opened_at recheck + pop-guarded journal; arm resets OFF on restart.
 - [Manual Desk order](manual-desk-order.md) — flag-gated (MANUAL_ORDER_ENABLED default OFF) discretionary override firing REAL order via source=manual_desk gateway; server-built ATR bracket; fail-closed, single-slot, owner-only.
 - [Unified Learning Brain](unified-learning-brain.md) — PER_MODE_STATS global (inst,mode key) feeds compute_playbook_selector + compute_unified_learning; display-only cognitive seam; goldens byte-identical.
+- [Learning Engine Audit (Phase 7I)](learning-engine-audit.md) — 4 confirmed defects; win_rate SQL case mismatch is latent at n<20; key format mismatch may persist even at n≥20; diagnostics layer added.
 - [Coach and Manager Interface v1 semantics](coach-manager-interface-semantics.md) — weight_updated=updated_at (not ready); thesis_resolved=False in full_analysis; active_trade/managed_trade must be dict-copied before return.
 - [Left Brain obs-infra closure](lb-obs-infra.md) — maxlen 5000, dedup guard, renamed fit_score field, endpoint v2 (inst/limit/summary/metadata), playbook sort fix; production needs re-publish.
 - [Structure-reversal demote](structure-reversal-demote.md) — SCALP-only flag-gated: fresh opposite BOS/CHOCH >CONFLICT_WINDOW_MIN newer NULLs stale side's structure credit; default OFF byte-identical; own smoke not goldens.
