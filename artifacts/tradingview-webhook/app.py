@@ -44402,6 +44402,170 @@ def journal_learning():
     return jsonify({"ok": True, "records": records, "total": len(records)})
 
 
+# ---------------------------------------------------------------------------
+# Phase 7M — Directional Balance (READ-ONLY audit panel, owner-only)
+# ---------------------------------------------------------------------------
+# Aggregates Long vs Short signal counts from three in-memory sources:
+#   1. EVAL_METRICS deque   — direction × verdict (last 24 h of scored alerts)
+#   2. ALERT_HISTORY deque  — BOS/CHOCH structure event direction (last 24 h)
+#   3. strategy_trades DB   — closed trade direction counts (last 7 days)
+# NEVER touches the gate, scoring, sizing, or any money-path variable.
+# FAIL-OPEN throughout: any read error yields zeroes, never raises into the caller.
+# ---------------------------------------------------------------------------
+
+@app.route("/directional-balance", methods=["GET"])
+def directional_balance():
+    """Read-only directional audit panel.  Owner-only, display-only."""
+    from collections import Counter as _Counter
+    now      = datetime.now(timezone.utc)
+    cutoff   = now - timedelta(hours=24)
+
+    # ── 1. EVAL_METRICS (last-100 scored alerts, in-memory) ─────────────────
+    long_ready = short_ready = long_wait = short_wait = 0
+    long_blockers:  "dict[str, int]" = {}
+    short_blockers: "dict[str, int]" = {}
+    try:
+        with EVAL_METRICS_LOCK:
+            em_snap = list(EVAL_METRICS)
+        for r in em_snap:
+            try:
+                ts = datetime.fromisoformat(r.get("evaluationFinishedAt") or "")
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            d       = r.get("direction")
+            verdict = str(r.get("verdict") or r.get("decision") or "")
+            blocker = str(r.get("gateBlockers") or r.get("waitReason") or "")
+            if d == "Long":
+                if is_actionable(verdict):
+                    long_ready += 1
+                else:
+                    long_wait += 1
+                    if blocker and blocker not in ("READY", "-"):
+                        long_blockers[blocker[:60]] = long_blockers.get(blocker[:60], 0) + 1
+            elif d == "Short":
+                if is_actionable(verdict):
+                    short_ready += 1
+                else:
+                    short_wait += 1
+                    if blocker and blocker not in ("READY", "-"):
+                        short_blockers[blocker[:60]] = short_blockers.get(blocker[:60], 0) + 1
+    except Exception:
+        pass
+
+    # ── 2. ALERT_HISTORY (last-1000 alerts, in-memory) ──────────────────────
+    _BULLISH_STRUCT = {"BOS DEMAND", "CHOCH DEMAND"}
+    _BEARISH_STRUCT = {"BOS SUPPLY", "CHOCH SUPPLY"}
+    long_structure = short_structure = 0
+    long_ready_alerts = short_ready_alerts = 0
+    try:
+        for a in list(ALERT_HISTORY):
+            try:
+                ts = datetime.fromisoformat(a.get("timestamp") or "")
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            at      = a.get("alert_type") or ""
+            verdict = str(a.get("verdict") or "")
+            if at in _BULLISH_STRUCT:
+                long_structure += 1
+            elif at in _BEARISH_STRUCT:
+                short_structure += 1
+            if "LONG READY" in verdict or "LONG STRONG" in verdict:
+                long_ready_alerts += 1
+            elif "SHORT READY" in verdict or "SHORT STRONG" in verdict:
+                short_ready_alerts += 1
+    except Exception:
+        pass
+
+    # ── 3. strategy_trades DB (last 7 days, read-only) ──────────────────────
+    db_long_total = db_short_total = 0
+    db_long_wins  = db_short_wins  = 0
+    db_long_avg_r  = db_short_avg_r = None
+    try:
+        conn = _learning_conn()
+        if conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT direction,"
+                    " COUNT(*) AS cnt,"
+                    " SUM(CASE WHEN LOWER(result)='win' THEN 1 ELSE 0 END) AS wins,"
+                    " AVG(r_multiple::float) AS avg_r"
+                    " FROM strategy_trades"
+                    " WHERE opened_at >= NOW() - INTERVAL '7 days'"
+                    "   AND direction IS NOT NULL"
+                    " GROUP BY direction"
+                )
+                for row in cur.fetchall():
+                    d, cnt, wins, avg_r = row
+                    if d == "Long":
+                        db_long_total  = int(cnt  or 0)
+                        db_long_wins   = int(wins or 0)
+                        db_long_avg_r  = round(float(avg_r), 3) if avg_r is not None else None
+                    elif d == "Short":
+                        db_short_total = int(cnt  or 0)
+                        db_short_wins  = int(wins or 0)
+                        db_short_avg_r = round(float(avg_r), 3) if avg_r is not None else None
+            conn.close()
+    except Exception:
+        pass
+
+    # ── 4. Candidate direction from strategy scan diagnostics ────────────────
+    cand_long = cand_short = 0
+    try:
+        for _ticker, scan in dict(STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER).items():
+            for s in (scan.get("strategies") or []):
+                if s.get("result") in ("candidate", "selected"):
+                    if s.get("direction") == "Long":
+                        cand_long += 1
+                    elif s.get("direction") == "Short":
+                        cand_short += 1
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok":     True,
+        "window": "last_24h (eval_metrics/alerts) / last_7d (trades)",
+        "eval_metrics": {
+            "long":  {
+                "ready": long_ready, "wait": long_wait,
+                "top_blockers": sorted(long_blockers.items(),  key=lambda x: -x[1])[:5],
+            },
+            "short": {
+                "ready": short_ready, "wait": short_wait,
+                "top_blockers": sorted(short_blockers.items(), key=lambda x: -x[1])[:5],
+            },
+            "note": ("EVAL_METRICS is an in-memory ring of the last %d scored alerts."
+                     % EVAL_METRICS_MAX),
+        },
+        "structure_events": {
+            "long":  long_structure,
+            "short": short_structure,
+            "note":  "BOS DEMAND + CHOCH DEMAND vs BOS SUPPLY + CHOCH SUPPLY from ALERT_HISTORY.",
+        },
+        "ready_alerts": {
+            "long":  long_ready_alerts,
+            "short": short_ready_alerts,
+        },
+        "scan_candidates": {
+            "long":  cand_long,
+            "short": cand_short,
+            "note":  "Live candidate/selected count from STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER.",
+        },
+        "trades_7d": {
+            "long":  {"total": db_long_total,  "wins": db_long_wins,  "avg_r": db_long_avg_r},
+            "short": {"total": db_short_total, "wins": db_short_wins, "avg_r": db_short_avg_r},
+            "note":  "strategy_trades closed in the last 7 days.",
+        },
+    })
+
+
 # ── ANALYSIS-BOT webhook mirror (opt-in; DEFAULT-OFF) ─────────────────────────
 # When ANALYSIS_BOT_FORWARD_URL is set (only on the production VM), every inbound
 # /webhook payload is mirrored verbatim to the separate ANALYSIS-ONLY bot so it

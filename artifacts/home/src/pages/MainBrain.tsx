@@ -2407,7 +2407,7 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 // Used ONLY for the /main-brain/journal route. The overview-grid card below is the
 // compact version that still reads from the main-brain payload.
 
-type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning';
+type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning' | 'directional';
 
 interface JTrade {
   id: number; source: string; date: string; instrument: string; direction: string;
@@ -2487,7 +2487,8 @@ const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void }> = ({ acti
     { id: 'import',   label: 'Import' },
     { id: 'analytics', label: 'Analytics' },
     { id: 'playbook', label: 'Playbook' },
-    { id: 'learning', label: 'Learning' },
+    { id: 'learning',     label: 'Learning' },
+    { id: 'directional', label: 'Direction ↕' },
   ];
   return (
     <div style={{ display: 'flex', gap: 2, marginBottom: 14, borderBottom: `1px solid ${T.border}`, paddingBottom: 0 }}>
@@ -3435,6 +3436,177 @@ const JLearningTab: React.FC = () => {
   );
 };
 
+// ── Directional Balance tab (Phase 7M) ────────────────────────────────────────
+interface DirectionalBalance {
+  enabled: boolean;
+  error?: string;
+  eval_metrics: {
+    long: number; short: number; total: number;
+    long_pct: number; short_pct: number;
+    ratio?: number; skew?: string;
+  };
+  alert_history: {
+    long: number; short: number; total: number;
+    long_pct: number; short_pct: number;
+  };
+  strategy_trades: {
+    long: number; short: number; total: number;
+    long_pct: number; short_pct: number;
+    instruments: Record<string, { long: number; short: number }>;
+    period_days: number;
+  };
+  scan_candidates: {
+    long: number; short: number; total: number;
+    long_pct: number; short_pct: number;
+  };
+  structure_events: {
+    bullish: number; bearish: number; neutral: number; total: number;
+    bullish_pct: number; bearish_pct: number;
+  };
+  known_asymmetries: { description: string; classification: string; note: string }[];
+}
+
+const DirectionalBar: React.FC<{
+  label: string; longV: number; shortV: number; longPct: number; shortPct: number;
+}> = ({ label, longV, shortV, longPct, shortPct }) => {
+  const longClr  = '#22c55e';
+  const shortClr = '#ef4444';
+  const neutClr  = T.txtMuted;
+  const skew = longPct >= 60 ? 'LONG-HEAVY' : shortPct >= 60 ? 'SHORT-HEAVY' : 'BALANCED';
+  const skewClr  = skew === 'BALANCED' ? neutClr : skew === 'LONG-HEAVY' ? longClr : shortClr;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display:'flex', justifyContent:'space-between', marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: T.txtMuted }}>{label}</span>
+        <span style={{ fontSize: 10, color: skewClr, fontWeight: 700 }}>{skew}</span>
+      </div>
+      <div style={{ display:'flex', gap: 4, alignItems:'center' }}>
+        {/* Long bar */}
+        <span style={{ fontSize: 10, color: longClr, width: 28, textAlign:'right' }}>{longPct}%</span>
+        <div style={{ flex: 1, height: 10, background: T.border, borderRadius: 5, overflow:'hidden', display:'flex' }}>
+          <div style={{ width: `${longPct}%`, background: longClr, transition: 'width .4s' }} />
+          <div style={{ width: `${shortPct}%`, background: shortClr, transition: 'width .4s' }} />
+        </div>
+        <span style={{ fontSize: 10, color: shortClr, width: 28 }}>{shortPct}%</span>
+      </div>
+      <div style={{ display:'flex', justifyContent:'space-between', marginTop: 3, fontSize: 10, color: T.txtMuted }}>
+        <span>Long {longV}</span><span>Short {shortV}</span>
+      </div>
+    </div>
+  );
+};
+
+const JDirectionalTab: React.FC = () => {
+  const [data,    setData]    = useState<DirectionalBalance | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    fetch('/api/directional-balance', { headers: { Authorization: `Basic ${btoa(localStorage.getItem('mb_auth') ?? ':')}` } })
+      .then(r => r.json())
+      .then(j => { setData(j); setError(null); })
+      .catch(e => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div style={{ color: T.txtMuted, fontSize: 12, padding: 16 }}>Loading…</div>;
+  if (error)   return <div style={{ color: '#ef4444', fontSize: 12, padding: 8 }}>{error}</div>;
+  if (!data || !data.enabled)
+    return <div style={{ color: T.txtMuted, fontSize: 12, padding: 16 }}>Directional balance audit not available.</div>;
+
+  const em  = data.eval_metrics;
+  const ah  = data.alert_history;
+  const st  = data.strategy_trades;
+  const sc  = data.scan_candidates;
+  const se  = data.structure_events;
+  const asym = data.known_asymmetries ?? [];
+
+  return (
+    <div style={{ padding: 4 }}>
+      <div style={{ fontSize: 11, color: T.txtMuted, marginBottom: 12 }}>
+        Phase 7M — Read-only directional balance audit. Tracks whether the system sends
+        proportionally more Long or Short signals across all layers.
+      </div>
+
+      {/* ── Sections ── */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.txtPri, marginBottom: 8, borderBottom:`1px solid ${T.border}`, paddingBottom: 4 }}>
+          Evaluated Setups (this session)
+        </div>
+        <DirectionalBar label="Eval Events" longV={em.long} shortV={em.short} longPct={em.long_pct} shortPct={em.short_pct} />
+        {em.skew && <div style={{ fontSize: 10, color: T.txtMuted }}>Session skew: {em.skew} · ratio {em.ratio?.toFixed(2) ?? 'n/a'}</div>}
+      </div>
+
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.txtPri, marginBottom: 8, borderBottom:`1px solid ${T.border}`, paddingBottom: 4 }}>
+          Alert History (recent window)
+        </div>
+        <DirectionalBar label="Alert Events" longV={ah.long} shortV={ah.short} longPct={ah.long_pct} shortPct={ah.short_pct} />
+      </div>
+
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.txtPri, marginBottom: 8, borderBottom:`1px solid ${T.border}`, paddingBottom: 4 }}>
+          Scan Candidates
+        </div>
+        <DirectionalBar label="Candidates" longV={sc.long} shortV={sc.short} longPct={sc.long_pct} shortPct={sc.short_pct} />
+      </div>
+
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.txtPri, marginBottom: 8, borderBottom:`1px solid ${T.border}`, paddingBottom: 4 }}>
+          Structure Events (live stream)
+        </div>
+        <div style={{ display:'flex', gap: 16, fontSize: 11 }}>
+          <span style={{ color:'#22c55e' }}>↑ Bullish {se.bullish} ({se.bullish_pct}%)</span>
+          <span style={{ color:'#ef4444' }}>↓ Bearish {se.bearish} ({se.bearish_pct}%)</span>
+          <span style={{ color: T.txtMuted }}>– Neutral {se.neutral}</span>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.txtPri, marginBottom: 8, borderBottom:`1px solid ${T.border}`, paddingBottom: 4 }}>
+          7-Day DB Trades ({st.period_days}d)
+        </div>
+        {st.total === 0
+          ? <div style={{ fontSize: 11, color: T.txtMuted }}>No trades in DB yet.</div>
+          : (
+            <>
+              <DirectionalBar label="DB Trades" longV={st.long} shortV={st.short} longPct={st.long_pct} shortPct={st.short_pct} />
+              {Object.entries(st.instruments).map(([inst, counts]) => (
+                <div key={inst} style={{ fontSize: 10, color: T.txtMuted, marginBottom: 2 }}>
+                  {inst}: Long {counts.long} · Short {counts.short}
+                </div>
+              ))}
+            </>
+          )
+        }
+      </div>
+
+      {asym.length > 0 && (
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: T.txtPri, marginBottom: 8, borderBottom:`1px solid ${T.border}`, paddingBottom: 4 }}>
+            Documented Asymmetries
+          </div>
+          {asym.map((a, i) => (
+            <div key={i} style={{ marginBottom: 8, padding: '6px 8px', background: T.bg, borderRadius: 6, border:`1px solid ${T.border}` }}>
+              <div style={{ fontSize: 11, color: T.txtPri, marginBottom: 2 }}>{a.description}</div>
+              <div style={{ display:'flex', gap: 8, fontSize: 10 }}>
+                <span style={{ color:'#f59e0b' }}>{a.classification}</span>
+                <span style={{ color: T.txtMuted }}>{a.note}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ marginTop: 8, fontSize: 10, color: T.txtMuted }}>
+        Classification: <strong>Market-Driven</strong> — code is symmetric; observed skew follows market conditions.
+        Audit code: test_directional_symmetry_7m.py (23 tests).
+      </div>
+    </div>
+  );
+};
+
 // ── Journal Full Page (outer shell) ──────────────────────────────────────────
 const JournalFullPage: React.FC = () => {
   const [tab, setTab] = useState<JTab>('trades');
@@ -3453,7 +3625,8 @@ const JournalFullPage: React.FC = () => {
       {tab === 'import'    && <JImportTab />}
       {tab === 'analytics' && <JAnalyticsTab />}
       {tab === 'playbook'  && <JPlaybookTab />}
-      {tab === 'learning'  && <JLearningTab />}
+      {tab === 'learning'    && <JLearningTab />}
+      {tab === 'directional' && <JDirectionalTab />}
     </div>
   );
 };

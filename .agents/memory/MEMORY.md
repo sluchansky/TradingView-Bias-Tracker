@@ -97,6 +97,7 @@
 - [Auto Early-Exit](auto-early-exit.md) — armed watcher flattens bot's OWN position on CONFIRMED-invalid thesis (opposite_confirmed only); fire-once + opened_at recheck + pop-guarded journal; arm resets OFF on restart.
 - [Manual Desk order](manual-desk-order.md) — flag-gated (MANUAL_ORDER_ENABLED default OFF) discretionary override firing REAL order via source=manual_desk gateway; server-built ATR bracket; fail-closed, single-slot, owner-only.
 - [Unified Learning Brain](unified-learning-brain.md) — PER_MODE_STATS global (inst,mode key) feeds compute_playbook_selector + compute_unified_learning; display-only cognitive seam; goldens byte-identical.
+- [Directional Symmetry Audit (Phase 7M)](directional-symmetry-audit.md) — Market-Driven verdict; 23 tests; fixture lessons: MITIGATED_FLAG=False for SCALP, INST not TICKER key, stale-VWAP tests gate_debug.vwap_confirmed not score delta.
 - [Candidate Preview Panel](candidate-preview-panel.md) — TradePlanPanel reads p.candidate_preview (not strategy_scanner.trade_plan); 5-state model; _mb_candidate_preview() is the backend source; 18 tests.
 - [Cleanest Trade Available button](cleanest-trade-button.md) — frontend-only scan (8 /api/status calls); rankCandidates() in cleanestTrade.ts is the sole algorithm; 29 tests; button between MarketStrip and panels; modal outside scroll container.
 - [Learning Engine Audit (Phase 7I)](learning-engine-audit.md) — 4 confirmed defects; win_rate SQL case mismatch is latent at n<20; key format mismatch may persist even at n≥20; diagnostics layer added.

@@ -1,0 +1,397 @@
+TASK: Phase 7M — Production Long vs Short Directional Audit.
+
+GOAL
+
+Determine whether the system is disproportionately generating, promoting, alerting, or executing Short trades because of actual market conditions or because of asymmetric code behavior.
+
+This is an AUDIT AND DIAGNOSTICS task.
+
+Do not tune or rebalance trading logic during this phase.
+
+STRICT SCOPE
+
+DO NOT modify:
+
+- Databento ingestion
+- market-data normalization
+- strategy formulas
+- Edge Score weights
+- readiness thresholds
+- conflict-window settings
+- structure-reversal demotion
+- learning weights
+- risk controls
+- TradersPost
+- execution
+- active-trade management
+- polling
+- authentication
+
+PART 1 — DEFINE DATA COVERAGE
+
+Audit the longest reliable recent production period available, preferably:
+
+- last 7 calendar days
+- plus a focused last-24-hours view
+
+State clearly:
+
+- start time
+- end time
+- timezone
+- process restarts
+- database coverage
+- missing periods
+- instruments covered
+- modes covered
+
+Do not present partial data as complete.
+
+PART 2 — BUILD THE DIRECTIONAL FUNNEL
+
+For LONG and SHORT separately, report:
+
+- raw structure opportunities
+- strategy candidates created
+- candidates scored
+- POTENTIAL candidates
+- READY candidates
+- actionable verdicts
+- alerts emitted
+- alerts suppressed
+- TradersPost sends attempted
+- executions accepted
+- executions rejected
+- closed trades
+- wins
+- losses
+- average R
+- net R
+
+Build one funnel per:
+
+- instrument
+- mode
+- strategy
+- session
+
+PART 3 — FIND THE DIVERGENCE POINT
+
+Identify the exact stage where Long and Short counts begin to differ.
+
+Example:
+
+LONG
+Candidates: 84
+Potential: 37
+Ready: 4
+Alerts: 3
+
+SHORT
+Candidates: 79
+Potential: 42
+Ready: 21
+Alerts: 18
+
+In that example, the divergence occurs at READY.
+
+Do not conclude “Short bias” from final alerts alone.
+
+PART 4 — COMPARE SCORE COMPONENTS
+
+For Long and Short candidates, calculate count, average, median, and award rate for:
+
+- BOS
+- CHOCH
+- liquidity sweep
+- VWAP confirmation
+- VWAP rejection or reclaim
+- structure confirmation
+- candle confirmation
+- volume confirmation
+- CVD/delta
+- session bonus
+- volatility modifier
+- zone validity
+- learning influence
+- penalties
+- final Edge Score
+
+Determine whether any component:
+
+- never awards Long
+- awards Short more often due to a coding mismatch
+- reads the wrong directional field
+- defaults bearish when missing
+- uses inconsistent casing
+- is duplicated for one side
+
+PART 5 — AUDIT DIRECTION-SENSITIVE CODE
+
+Search all production paths for:
+
+- LONG / SHORT
+- Long / Short
+- bullish / bearish
+- BULLISH / BEARISH
+- buy / sell
+- 1 / -1
+- demand / supply
+
+Check for:
+
+- sign reversal
+- wrong comparison operator
+- copy/paste error
+- Short field reused in Long branch
+- bearish default
+- casing mismatch
+- missing-data fallback
+- asymmetric threshold
+- asymmetric strategy registration
+- direction omitted from a learning or cache key
+
+Provide exact file and function references for every relevant branch.
+
+PART 6 — STRATEGY SYMMETRY MATRIX
+
+For every enabled strategy, report:
+
+- Long implementation exists
+- Short implementation exists
+- Long scanner path runs
+- Short scanner path runs
+- Long tests exist
+- Short tests exist
+- mirrored parameters
+- recent Long candidates
+- recent Short candidates
+- recent READY outcomes
+
+Flag any one-sided strategy.
+
+PART 7 — BLOCKER ANALYSIS
+
+Group every suppressed candidate by actual blocker.
+
+For Long and Short separately, count:
+
+- missing BOS
+- missing CHOCH
+- missing VWAP confirmation
+- missing volume
+- opposing structure
+- true conflict
+- thesis misalignment
+- score below threshold
+- stale thesis
+- invalid stop
+- session gate
+- risk block
+- duplicate guard
+- active-trade conflict
+- execution unavailable
+- other
+
+Show the top five blockers by direction.
+
+PART 8 — STRUCTURE-CONFLICT IMPACT
+
+Measure the newly enabled structure-reversal demotion behavior.
+
+Report by direction:
+
+- ACTIVE conflicts
+- CHALLENGED conflicts
+- OVERRIDDEN conflicts
+- EXPIRED conflicts
+- candidates blocked before demotion
+- candidates allowed after demotion
+
+Verify mirrored behavior for bullish and bearish reversals.
+
+Do not change the conflict logic.
+
+PART 9 — EVENT DUPLICATION AND RECENCY
+
+Check whether repeated bearish events inflate Short evidence or keep Long blockers alive.
+
+Audit:
+
+- duplicate BOS
+- duplicate CHOCH
+- repeated event IDs
+- repeated timestamps
+- cache reuse
+- duplicate events resetting recency
+- missing bullish structure records
+- direction-specific event loss
+
+Distinguish genuine separate events from duplicate storage.
+
+PART 10 — UI VERSUS ENGINE
+
+For selected timestamps, compare:
+
+- raw engine result
+- score breakdown
+- readiness result
+- alert decision
+- Main Brain API
+- Verdict panel
+- Trade Plan
+- Alerts feed
+- Decision Timeline
+
+Confirm whether Long candidates exist in the engine but disappear or are mislabeled in the UI.
+
+PART 11 — MIRRORED SYMMETRY TESTS
+
+Create deterministic mirrored fixtures.
+
+CASE A
+Bullish BOS + bullish VWAP + bullish CVD.
+Expected:
+Long receives the corresponding points.
+
+CASE B
+Exact bearish mirror.
+Expected:
+Short receives equivalent points.
+
+CASE C
+Bullish CHOCH versus bearish CHOCH.
+Expected:
+equal treatment.
+
+CASE D
+Demand sweep versus supply sweep.
+Expected:
+equal treatment.
+
+CASE E
+Long opposing-structure conflict versus mirrored Short conflict.
+Expected:
+equal timing and classification.
+
+CASE F
+Bullish reversal overrides bearish structure.
+
+CASE G
+Bearish reversal overrides bullish structure.
+
+CASE H
+Missing directional data.
+Expected:
+no bearish or Short default.
+
+CASE I
+Mirrored READY Long and READY Short fixtures.
+Expected:
+both emit alerts under equivalent conditions.
+
+CASE J
+Canonical strategy and learning keys resolve identically by direction.
+
+PART 12 — ADD READ-ONLY MAIN BRAIN DIAGNOSTICS
+
+Add a temporary or operator-facing Directional Balance section.
+
+Show:
+
+LAST 24 HOURS
+
+Long Candidates
+Short Candidates
+
+Long Potential
+Short Potential
+
+Long Ready
+Short Ready
+
+Long Alerts
+Short Alerts
+
+Top Long Blocker
+Top Short Blocker
+
+Conflict Overrides:
+Bullish / Bearish
+
+This must be read-only.
+
+Do not create another polling stream.
+
+PART 13 — CLASSIFICATION
+
+End with one of these classifications:
+
+MARKET-DRIVEN IMBALANCE
+
+The code is symmetric, but recent market evidence favored one direction.
+
+CODE-DRIVEN IMBALANCE
+
+A proven asymmetric branch, mapping, gate, or event defect favors one side.
+
+DATA-DRIVEN IMBALANCE
+
+One direction is missing or receiving poorer market-data evidence.
+
+MIXED
+
+Multiple proven causes.
+
+INSUFFICIENT EVIDENCE
+
+Coverage is too incomplete to conclude safely.
+
+PART 14 — STOP BEFORE FIXING
+
+STOP after the audit and diagnostics.
+
+Do not change:
+
+- weights
+- thresholds
+- readiness
+- conflict behavior
+- strategy eligibility
+
+Provide exact recommended corrections only for proven defects.
+
+VALIDATION
+
+Run:
+
+- focused directional symmetry tests
+- strategy-engine regressions
+- alert regressions
+- conflict/demotion tests
+- learning-key tests
+- Main Brain regressions
+- journal regressions
+- TypeScript typecheck
+- production build
+- git diff --check
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit, if diagnostics/tests are committed
+3. Audited time period and coverage
+4. Long and Short funnels
+5. Counts by instrument, mode, strategy, and session
+6. Score-component comparison
+7. Top blockers by direction
+8. Strategy symmetry matrix
+9. Conflict-demotion impact
+10. UI-versus-engine findings
+11. Mirrored-test results
+12. Final classification
+13. Proven defects
+14. Recommended corrections, not implemented
+15. Confirmation that no trading behavior changed

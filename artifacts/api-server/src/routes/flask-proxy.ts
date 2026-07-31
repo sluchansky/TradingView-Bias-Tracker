@@ -152,6 +152,10 @@ export const BOT1_ROUTES = [
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",
+  // Phase 7M: Directional Balance audit panel (owner-only; DISPLAY/READ-ONLY; NOT in
+  // dashboard-auth OPEN_PATHS). Aggregates Long vs Short signal counts from in-memory
+  // EVAL_METRICS + ALERT_HISTORY + strategy_trades DB. Never modifies any state.
+  "/directional-balance",
   "/eod",
   "/weekly",
   "/why",
