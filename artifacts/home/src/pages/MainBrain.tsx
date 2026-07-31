@@ -2452,6 +2452,14 @@ interface JDrillFilter {
   date_to?:       string;         // ISO date (inclusive upper bound)
   rating_field?:  string;         // setup_quality|execution_quality|discipline_quality|overall_quality
   rating_value?:  number;         // integer 1-5 (requires rating_field)
+  // ── Phase 7O.3: rating range (band drill-down, requires rating_field) ────────
+  rating_min?:    number;         // integer 1-5 inclusive lower bound (e.g. 4 for HIGH band)
+  rating_max?:    number;         // integer 1-5 inclusive upper bound (e.g. 5 for HIGH band)
+  // ── Phase 7O.3: realized R range ─────────────────────────────────────────────
+  realized_r_min?: number;        // r_multiple >= this value (e.g. 0 for wins)
+  realized_r_max?: number;        // r_multiple <= this value (e.g. -0.01 for losses)
+  // ── Phase 7O.3: quality classification shortcut ───────────────────────────────
+  quality_classification?: string; // 'high_quality_loss' | 'low_quality_win'
   result?:        string;         // 'win' | 'loss' | 'scratch'
   // ── Phase 7O.2: intraday 30-min block filter ─────────────────────────────
   entry_block_start?: string;     // "HH:MM" inclusive block start (e.g. "09:30")
@@ -3496,6 +3504,14 @@ function _drillChips(drill: JDrillFilter): { key: keyof JDrillFilter; label: str
   if (drill.date_to)       chips.push({ key: 'date_to',       label: `TO: ${drill.date_to}` });
   if (drill.rating_field && drill.rating_value != null)
     chips.push({ key: 'rating_field', label: `${drill.rating_field.replace(/_quality$/, '').toUpperCase()}: ${drill.rating_value}★` });
+  // Phase 7O.3: rating range chip — clears together with rating_field
+  if (drill.rating_field && drill.rating_min != null && drill.rating_max != null)
+    chips.push({ key: 'rating_min', label: `${drill.rating_field.replace(/_quality$/, '').toUpperCase()}: ${drill.rating_min}–${drill.rating_max}★` });
+  // Phase 7O.3: realized R range chips
+  if (drill.realized_r_min != null) chips.push({ key: 'realized_r_min', label: `R≥${drill.realized_r_min}` });
+  if (drill.realized_r_max != null) chips.push({ key: 'realized_r_max', label: `R≤${drill.realized_r_max}` });
+  // Phase 7O.3: quality classification chip
+  if (drill.quality_classification) chips.push({ key: 'quality_classification', label: drill.quality_classification === 'high_quality_loss' ? 'HIGH-QUALITY LOSS' : 'LOW-QUALITY WIN' });
   if (drill.result)        chips.push({ key: 'result',        label: `RESULT: ${drill.result.toUpperCase()}` });
   // Phase 7O.2: intraday block chip — clearing block_start also clears block_end + timezone
   if (drill.entry_block_start) chips.push({ key: 'entry_block_start', label: `TIME: ${drill.entry_block_start}` });
@@ -3509,6 +3525,8 @@ const _DRILL_SERVER_KEYS: (keyof JDrillFilter)[] = [
   'rating_field','rating_value','result',
   // Phase 7O.2: intraday block filter
   'entry_block_start','entry_block_end','display_timezone',
+  // Phase 7O.3: correlation drill-down
+  'rating_min','rating_max','realized_r_min','realized_r_max','quality_classification',
 ];
 
 // ── Journal Trades Tab ────────────────────────────────────────────────────────
@@ -5316,6 +5334,12 @@ const JCoachingTab: React.FC<{
   const [idSort,    setIdSort]    = useState<string>('net_r');
   const [idSortDir, setIdSortDir] = useState<'asc' | 'desc'>('desc');
 
+  // Phase 7O.3: correlation analytics state
+  const [correlationsData,    setCorrelationsData]    = useState<any | null>(null);
+  const [correlationsLoading, setCorrelationsLoading] = useState(false);
+  // Which rating field to show in the rating × mistake/emotion tables
+  const [corrField, setCorrField] = useState<string>('discipline_quality');
+
   const fetchCoaching = useCallback(async () => {
     setLoading(true); setError(null);
     try {
@@ -5349,6 +5373,24 @@ const JCoachingTab: React.FC<{
       setIntradayData(d);
     } catch (_e) { /* fail silently — intraday is supplementary */ }
     setIntradayLoading(false);
+  }, [dateFrom, dateTo, fSource, fInstrument, fMode]);
+
+  // Phase 7O.3: fetch correlation analytics — shares the same filter state
+  const fetchCorrelations = useCallback(async () => {
+    setCorrelationsLoading(true);
+    try {
+      const p = new URLSearchParams();
+      if (dateFrom)    p.set('date_from',  dateFrom);
+      if (dateTo)      p.set('date_to',    dateTo);
+      if (fSource)     p.set('source',     fSource);
+      if (fInstrument) p.set('instrument', fInstrument);
+      if (fMode)       p.set('mode',       fMode);
+      const r = await fetch(`/api/journal/coaching/correlations?${p}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'failed');
+      setCorrelationsData(d);
+    } catch (_e) { /* fail silently — correlations is supplementary */ }
+    setCorrelationsLoading(false);
   }, [dateFrom, dateTo, fSource, fInstrument, fMode]);
 
   /** Build a JDrillFilter that carries both the current coaching filter context
@@ -5394,7 +5436,7 @@ const JCoachingTab: React.FC<{
         </button>
       : _confBadge(conf);
 
-  useEffect(() => { fetchCoaching(); fetchIntraday(); }, [fetchCoaching, fetchIntraday]);
+  useEffect(() => { fetchCoaching(); fetchIntraday(); fetchCorrelations(); }, [fetchCoaching, fetchIntraday, fetchCorrelations]);
 
   const inp = (label: string, val: string, set: (v: string) => void, type = 'text', placeholder = '') => (
     <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -5473,10 +5515,11 @@ const JCoachingTab: React.FC<{
         {inp('Instrument', fInstrument, setFInstrument, 'text', 'MGC, MNQ…')}
         {sel('Mode', fMode, setFMode, [['', 'All'], ['SCALP', 'SCALP'], ['SWING', 'SWING'], ['MICRO_SCALP', 'MICRO']])}
         <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-          <button onClick={() => { fetchCoaching(); fetchIntraday(); }} disabled={loading || intradayLoading}
+          <button onClick={() => { fetchCoaching(); fetchIntraday(); fetchCorrelations(); }}
+            disabled={loading || intradayLoading || correlationsLoading}
             style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}`, borderRadius: 5,
               color: T.cyan, padding: '5px 12px', fontSize: 11, cursor: 'pointer', fontWeight: 700 }}>
-            {(loading || intradayLoading) ? '…' : 'Apply'}
+            {(loading || intradayLoading || correlationsLoading) ? '…' : 'Apply'}
           </button>
         </div>
       </div>
@@ -6130,6 +6173,595 @@ const JCoachingTab: React.FC<{
         );
       })()}
 
+      {/* ── Phase 7O.3: CORRELATIONS ──────────────────────────────────────── */}
+      {!correlationsLoading && correlationsData && (() => {
+        const cd = correlationsData;
+        // Local helper — mirrors server-side _band()
+        const _bandLocal = (r: number | null): string => {
+          if (r == null) return 'UNKNOWN';
+          if (r <= 2) return 'LOW';
+          if (r === 3) return 'MEDIUM';
+          return 'HIGH';
+        };
+
+        const cov = cd.coverage ?? {};
+        const hql = cd.high_quality_losses ?? {};
+        const lqw = cd.low_quality_wins ?? {};
+        const disc = (cd.discipline_outcomes ?? []) as any[];
+        const matrix = (cd.setup_execution_matrix ?? []) as any[];
+        const rm = ((cd.rating_mistake ?? []) as any[]).filter(
+          (r: any) => r.rating_field === corrField
+        );
+        const re = ((cd.rating_emotion ?? []) as any[]).filter(
+          (r: any) => r.rating_field === corrField
+        );
+        const combos = (cd.expensive_combinations ?? []) as any[];
+        const summary = (cd.correlation_summary ?? []) as string[];
+
+        // Worst expensive combo (most negative net_r)
+        const worstCombo = combos.length > 0 ? combos[0] : null;
+        // Low vs high discipline avg_r for summary card
+        const discLow  = disc.find((d: any) => d.disc_rating <= 2 && (d.n ?? 0) >= 5);
+        const discHigh = disc.find((d: any) => d.disc_rating >= 4 && (d.n ?? 0) >= 5);
+
+        const rFmtC = (v: number | null) =>
+          v != null ? `${v >= 0 ? '+' : ''}${v.toFixed(2)}R` : '—';
+
+        // Label prettify
+        const tagLabel = (t: string) => t.replace(/_/g, ' ').toUpperCase();
+
+        // Rating × mistake/emotion: group by band for display
+        const groupByBand = (rows: any[]) => {
+          const out: Record<string, any[]> = { LOW: [], MEDIUM: [], HIGH: [] };
+          for (const r of rows) { if (r.band && out[r.band]) out[r.band].push(r); }
+          return out;
+        };
+
+        // 5×5 matrix cell lookup
+        const matrixCell = (sq: number, eq: number) =>
+          matrix.find((r: any) => r.setup_q === sq && r.exec_q === eq) ?? null;
+
+        const bandColor: Record<string, string> = {
+          LOW: T.red, MEDIUM: T.txtSec, HIGH: T.green,
+        };
+
+        const corrFieldLabel = corrField.replace(/_quality$/, '').replace(/_/g, ' ').toUpperCase();
+
+        return (
+          <div style={{ marginTop: 18 }}>
+            {/* Section header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              marginBottom: 10 }}>
+              <div style={{ fontSize: 9, fontWeight: 800, letterSpacing: '0.1em',
+                color: T.txtPri, textTransform: 'uppercase' }}>
+                CORRELATIONS
+              </div>
+              <div style={{ fontSize: 8, color: T.txtMuted }}>
+                {cov.reviewed ?? 0} reviewed · {cov.with_mistakes ?? 0} with mistakes ·
+                {' '}{cov.with_emotions ?? 0} with emotions
+              </div>
+            </div>
+
+            {/* TOP ROW: 4 summary cards */}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              {/* High-quality losses */}
+              <div
+                style={{ flex: 1, background: T.green + '0d', borderRadius: 7,
+                  padding: '8px 10px', border: `1px solid ${T.green}33`,
+                  cursor: onDrill && hql.count > 0 ? 'pointer' : 'default' }}
+                onClick={() => {
+                  if (onDrill && hql.count > 0) {
+                    onDrill(_mkDrill('HIGH-QUALITY LOSS', hql.count, {
+                      quality_classification: 'high_quality_loss',
+                    }));
+                  }
+                }}
+              >
+                <div style={{ fontSize: 7, color: T.green, fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 3 }}>
+                  High-Quality Losses
+                </div>
+                <div style={{ fontSize: 18, fontWeight: 800, fontFamily: T.mono,
+                  color: hql.count > 0 ? T.green : T.txtMuted }}>
+                  {hql.count ?? 0}
+                </div>
+                <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>
+                  {hql.avg_r != null ? `avg ${rFmtC(hql.avg_r)}` : 'Plan followed, lost anyway'}
+                </div>
+              </div>
+
+              {/* Low-quality wins */}
+              <div
+                style={{ flex: 1, background: '#f5a62311', borderRadius: 7,
+                  padding: '8px 10px', border: '1px solid #f5a62333',
+                  cursor: onDrill && lqw.count > 0 ? 'pointer' : 'default' }}
+                onClick={() => {
+                  if (onDrill && lqw.count > 0) {
+                    onDrill(_mkDrill('LOW-QUALITY WIN', lqw.count, {
+                      quality_classification: 'low_quality_win',
+                    }));
+                  }
+                }}
+              >
+                <div style={{ fontSize: 7, color: '#f5a623', fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 3 }}>
+                  Low-Quality Wins
+                </div>
+                <div style={{ fontSize: 18, fontWeight: 800, fontFamily: T.mono,
+                  color: lqw.count > 0 ? '#f5a623' : T.txtMuted }}>
+                  {lqw.count ?? 0}
+                </div>
+                <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>
+                  {lqw.top_mistake ? tagLabel(lqw.top_mistake) : 'Profitable poor process'}
+                </div>
+              </div>
+
+              {/* Most expensive combination */}
+              <div style={{ flex: 2, background: T.red + '0d', borderRadius: 7,
+                padding: '8px 10px', border: `1px solid ${T.red}33` }}>
+                <div style={{ fontSize: 7, color: T.red, fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 3 }}>
+                  Costliest Combination
+                </div>
+                {worstCombo ? (
+                  <>
+                    <div style={{ fontSize: 10, fontWeight: 700, fontFamily: T.mono,
+                      color: T.red }}>
+                      {rFmtC(worstCombo.net_r)}
+                    </div>
+                    <div style={{ fontSize: 8, color: T.txtSec, marginTop: 2,
+                      wordBreak: 'break-word' }}>
+                      {worstCombo.combo.replace(/MISTAKE:|EMOTION:|RATING:|PLAN:/g, '').replace(/_/g, ' ')}
+                      {' '}· {worstCombo.n} trades
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 9, color: T.txtMuted }}>—</div>
+                )}
+              </div>
+
+              {/* Discipline impact */}
+              <div style={{ flex: 1, background: T.panelAlt, borderRadius: 7,
+                padding: '8px 10px', border: `1px solid ${T.border}` }}>
+                <div style={{ fontSize: 7, color: T.txtMuted, fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 3 }}>
+                  Discipline Impact
+                </div>
+                {discHigh && discLow ? (
+                  <>
+                    <div style={{ fontSize: 9, fontFamily: T.mono, color: T.green }}>
+                      HIGH: {rFmtC(discHigh.avg_r)}
+                    </div>
+                    <div style={{ fontSize: 9, fontFamily: T.mono, color: T.red }}>
+                      LOW: {rFmtC(discLow.avg_r)}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 9, color: T.txtMuted }}>Need ≥5 per band</div>
+                )}
+              </div>
+            </div>
+
+            {/* MIDDLE: Setup × Execution matrix + Discipline outcomes */}
+            <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
+
+              {/* Setup × Execution 5×5 matrix */}
+              {matrix.length > 0 && (
+                <div style={{ flex: 3, background: T.panelAlt, borderRadius: 8,
+                  padding: '10px 12px', border: `1px solid ${T.border}`, minWidth: 0 }}>
+                  <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700,
+                    textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+                    Setup × Execution Matrix
+                  </div>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ borderCollapse: 'collapse', fontSize: 8, width: '100%' }}>
+                      <thead>
+                        <tr>
+                          <th style={{ color: T.txtMuted, padding: '2px 5px', textAlign: 'left',
+                            fontWeight: 600, whiteSpace: 'nowrap' }}>Setup ↓ / Exec →</th>
+                          {[1,2,3,4,5].map(eq => (
+                            <th key={eq} style={{ color: bandColor[_bandLocal(eq)], padding: '2px 5px',
+                              textAlign: 'center', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                              EXEC {eq}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[1,2,3,4,5].map(sq => (
+                          <tr key={sq}>
+                            <td style={{ color: bandColor[_bandLocal(sq)], padding: '3px 5px',
+                              fontWeight: 700, whiteSpace: 'nowrap' }}>
+                              SETUP {sq}
+                            </td>
+                            {[1,2,3,4,5].map(eq => {
+                              const cell = matrixCell(sq, eq);
+                              const n = cell?.n ?? 0;
+                              const avgR = cell?.avg_r;
+                              const conf = cell?.confidence ?? 'INSUFFICIENT_DATA';
+                              const isEmpty = n === 0;
+                              return (
+                                <td key={eq}
+                                  onClick={() => {
+                                    if (!isEmpty && onDrill) {
+                                      onDrill(_mkDrill(
+                                        `Setup ${sq} × Exec ${eq}`, n,
+                                        { rating_field: 'setup_quality', rating_min: sq, rating_max: sq,
+                                          realized_r_min: undefined, realized_r_max: undefined }
+                                      ));
+                                    }
+                                  }}
+                                  style={{ padding: '4px 5px', textAlign: 'center',
+                                    background: isEmpty ? 'transparent'
+                                      : avgR != null && avgR >= 0 ? T.green + '18' : T.red + '18',
+                                    cursor: !isEmpty && onDrill ? 'pointer' : 'default',
+                                    borderTop: `1px solid ${T.border}`,
+                                    opacity: conf === 'INSUFFICIENT_DATA' ? 0.5 : 1 }}>
+                                  {isEmpty ? (
+                                    <span style={{ color: T.txtMuted }}>—</span>
+                                  ) : (
+                                    <>
+                                      <div style={{ fontFamily: T.mono, fontWeight: 700,
+                                        color: avgR != null && avgR >= 0 ? T.green : T.red }}>
+                                        {avgR != null ? rFmtC(avgR) : '—'}
+                                      </div>
+                                      <div style={{ color: T.txtMuted }}>{n}t</div>
+                                    </>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Discipline outcomes table */}
+              {disc.length > 0 && (
+                <div style={{ flex: 2, background: T.panelAlt, borderRadius: 8,
+                  padding: '10px 12px', border: `1px solid ${T.border}`, minWidth: 0 }}>
+                  <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700,
+                    textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+                    Discipline × Outcome
+                  </div>
+                  <table style={{ borderCollapse: 'collapse', fontSize: 8, width: '100%' }}>
+                    <thead>
+                      <tr>
+                        {['Disc','n','Win%','Avg R','Plan%','Mistakes'].map(h => (
+                          <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                            paddingBottom: 5, paddingRight: 8, whiteSpace: 'nowrap' }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {disc.map((d: any, i: number) => {
+                        const b = _bandLocal(d.disc_rating);
+                        const col = b === 'LOW' ? T.red : b === 'HIGH' ? T.green : T.txtSec;
+                        return (
+                          <tr key={i}
+                            style={{ borderTop: `1px solid ${T.border}`,
+                              cursor: onDrill ? 'pointer' : 'default' }}
+                            onClick={() => {
+                              if (onDrill) {
+                                onDrill(_mkDrill(
+                                  `Discipline ${d.disc_rating}★`, d.n,
+                                  { rating_field: 'discipline_quality',
+                                    rating_min: d.disc_rating, rating_max: d.disc_rating }
+                                ));
+                              }
+                            }}>
+                            <td style={{ padding: '3px 8px 3px 0', color: col, fontWeight: 700 }}>
+                              {d.disc_rating}★
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec }}>{d.n}</td>
+                            <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                              color: (d.win_rate ?? 0) >= 50 ? T.green : T.red }}>
+                              {d.win_rate != null ? `${d.win_rate}%` : '—'}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                              color: (d.avg_r ?? 0) >= 0 ? T.green : T.red }}>
+                              {rFmtC(d.avg_r)}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec }}>
+                              {d.followed_plan_pct != null ? `${d.followed_plan_pct}%` : '—'}
+                            </td>
+                            <td style={{ padding: '3px 0', color: T.txtMuted }}>
+                              {d.avg_mistake_count != null ? d.avg_mistake_count.toFixed(1) : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {cd.discipline_summary && (
+                    <div style={{ fontSize: 9, color: T.txtSec, marginTop: 8,
+                      fontStyle: 'italic' }}>
+                      {cd.discipline_summary}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* BOTTOM: Rating × Mistake, Rating × Emotion, Combinations */}
+
+            {/* Rating field selector */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <span style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700,
+                textTransform: 'uppercase', letterSpacing: '0.06em' }}>Rating field:</span>
+              {['discipline_quality','execution_quality','setup_quality','overall_quality'].map(f => (
+                <button key={f} onClick={() => setCorrField(f)}
+                  style={{ fontSize: 8, padding: '2px 7px', borderRadius: 4, cursor: 'pointer',
+                    fontWeight: f === corrField ? 700 : 400,
+                    background: f === corrField ? T.cyan + '22' : T.panelAlt,
+                    border: `1px solid ${f === corrField ? T.cyan : T.border}`,
+                    color: f === corrField ? T.cyan : T.txtMuted }}>
+                  {f.replace(/_quality$/, '').replace(/_/g, ' ').toUpperCase()}
+                </button>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
+
+              {/* Rating × Mistake table */}
+              <div style={{ flex: 1, background: T.panelAlt, borderRadius: 8,
+                padding: '10px 12px', border: `1px solid ${T.border}`, minWidth: 0 }}>
+                <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+                  {corrFieldLabel} × Mistake
+                </div>
+                {rm.length === 0 ? (
+                  <div style={{ fontSize: 9, color: T.txtMuted }}>
+                    No reviewed trades with both {corrFieldLabel.toLowerCase()} rating and mistakes.
+                  </div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ borderCollapse: 'collapse', fontSize: 8, width: '100%' }}>
+                      <thead>
+                        <tr>
+                          {['Band','Mistake','n','Band%','Win%','Net R','Plan%',''].map(h => (
+                            <th key={h} style={{ textAlign: 'left', color: T.txtMuted,
+                              fontWeight: 600, paddingBottom: 5, paddingRight: 8,
+                              whiteSpace: 'nowrap' }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rm.slice(0, 20).map((row: any, i: number) => (
+                          <tr key={i}
+                            style={{ borderTop: `1px solid ${T.border}`,
+                              cursor: onDrill ? 'pointer' : 'default' }}
+                            onMouseEnter={() => { setHovSec('rm'); setHovIdx(i); }}
+                            onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                            onClick={() => {
+                              if (onDrill) {
+                                onDrill(_mkDrill(
+                                  `${corrFieldLabel} ${row.band} × ${tagLabel(row.tag)}`,
+                                  row.n,
+                                  { rating_field: corrField,
+                                    rating_min: row.band === 'LOW' ? 1 : row.band === 'MEDIUM' ? 3 : 4,
+                                    rating_max: row.band === 'LOW' ? 2 : row.band === 'MEDIUM' ? 3 : 5,
+                                    mistake_tag: row.tag }
+                                ));
+                              }
+                            }}>
+                            <td style={{ padding: '3px 8px 3px 0', fontWeight: 700,
+                              color: bandColor[row.band] ?? T.txtSec }}>
+                              {row.band}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec,
+                              maxWidth: 110, overflow: 'hidden', textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap' }}>
+                              {tagLabel(row.tag)}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec }}>{row.n}</td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtMuted }}>
+                              {row.band_pct != null ? `${row.band_pct}%` : '—'}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                              color: (row.win_rate ?? 0) >= 50 ? T.green : T.red }}>
+                              {row.win_rate != null ? `${row.win_rate}%` : '—'}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                              color: (row.net_r ?? 0) >= 0 ? T.green : T.red }}>
+                              {rFmtC(row.net_r)}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec }}>
+                              {row.followed_plan_pct != null ? `${row.followed_plan_pct}%` : '—'}
+                            </td>
+                            <td>{_lastCell('rm', i, row.n, row.confidence,
+                              () => {
+                                if (onDrill) onDrill(_mkDrill(
+                                  `${corrFieldLabel} ${row.band} × ${tagLabel(row.tag)}`,
+                                  row.n,
+                                  { rating_field: corrField,
+                                    rating_min: row.band === 'LOW' ? 1 : row.band === 'MEDIUM' ? 3 : 4,
+                                    rating_max: row.band === 'LOW' ? 2 : row.band === 'MEDIUM' ? 3 : 5,
+                                    mistake_tag: row.tag }
+                                ));
+                              }
+                            )}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Rating × Emotion table */}
+              <div style={{ flex: 1, background: T.panelAlt, borderRadius: 8,
+                padding: '10px 12px', border: `1px solid ${T.border}`, minWidth: 0 }}>
+                <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+                  {corrFieldLabel} × Emotion
+                </div>
+                {re.length === 0 ? (
+                  <div style={{ fontSize: 9, color: T.txtMuted }}>
+                    No reviewed trades with both {corrFieldLabel.toLowerCase()} rating and emotions.
+                  </div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ borderCollapse: 'collapse', fontSize: 8, width: '100%' }}>
+                      <thead>
+                        <tr>
+                          {['Band','Emotion','n','Intensity','Win%','Net R','Top Mistake',''].map(h => (
+                            <th key={h} style={{ textAlign: 'left', color: T.txtMuted,
+                              fontWeight: 600, paddingBottom: 5, paddingRight: 8,
+                              whiteSpace: 'nowrap' }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {re.slice(0, 20).map((row: any, i: number) => (
+                          <tr key={i}
+                            style={{ borderTop: `1px solid ${T.border}`,
+                              cursor: onDrill ? 'pointer' : 'default' }}
+                            onMouseEnter={() => { setHovSec('re'); setHovIdx(i); }}
+                            onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                            onClick={() => {
+                              if (onDrill) {
+                                onDrill(_mkDrill(
+                                  `${corrFieldLabel} ${row.band} × ${tagLabel(row.emotion)}`,
+                                  row.n,
+                                  { rating_field: corrField,
+                                    rating_min: row.band === 'LOW' ? 1 : row.band === 'MEDIUM' ? 3 : 4,
+                                    rating_max: row.band === 'LOW' ? 2 : row.band === 'MEDIUM' ? 3 : 5,
+                                    emotion_tag: row.emotion }
+                                ));
+                              }
+                            }}>
+                            <td style={{ padding: '3px 8px 3px 0', fontWeight: 700,
+                              color: bandColor[row.band] ?? T.txtSec }}>
+                              {row.band}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec,
+                              maxWidth: 90, overflow: 'hidden', textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap' }}>
+                              {tagLabel(row.emotion)}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtSec }}>{row.n}</td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtMuted }}>
+                              {row.avg_intensity != null ? row.avg_intensity.toFixed(1) : '—'}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                              color: (row.win_rate ?? 0) >= 50 ? T.green : T.red }}>
+                              {row.win_rate != null ? `${row.win_rate}%` : '—'}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                              color: (row.net_r ?? 0) >= 0 ? T.green : T.red }}>
+                              {rFmtC(row.net_r)}
+                            </td>
+                            <td style={{ padding: '3px 8px 3px 0', color: T.txtMuted,
+                              maxWidth: 90, overflow: 'hidden', textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap' }}>
+                              {row.top_mistake
+                                ? `${tagLabel(row.top_mistake)} (${row.top_mistake_pct ?? '?'}%)`
+                                : '—'}
+                            </td>
+                            <td>{_lastCell('re', i, row.n, row.confidence,
+                              () => {
+                                if (onDrill) onDrill(_mkDrill(
+                                  `${corrFieldLabel} ${row.band} × ${tagLabel(row.emotion)}`,
+                                  row.n,
+                                  { rating_field: corrField,
+                                    rating_min: row.band === 'LOW' ? 1 : row.band === 'MEDIUM' ? 3 : 4,
+                                    rating_max: row.band === 'LOW' ? 2 : row.band === 'MEDIUM' ? 3 : 5,
+                                    emotion_tag: row.emotion }
+                                ));
+                              }
+                            )}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Expensive combinations */}
+            {combos.length > 0 && (
+              <div style={{ background: T.panelAlt, borderRadius: 8,
+                padding: '10px 12px', border: `1px solid ${T.border}`, marginBottom: 12 }}>
+                <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700,
+                  textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>
+                  Expensive Combinations
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ borderCollapse: 'collapse', fontSize: 8, width: '100%' }}>
+                    <thead>
+                      <tr>
+                        {['Combination','n','Net R','Avg R','Win%','Recent',''].map(h => (
+                          <th key={h} style={{ textAlign: 'left', color: T.txtMuted,
+                            fontWeight: 600, paddingBottom: 5, paddingRight: 10,
+                            whiteSpace: 'nowrap' }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {combos.slice(0, 10).map((c: any, i: number) => (
+                        <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                          <td style={{ padding: '3px 10px 3px 0', color: T.txtSec,
+                            maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap' }}>
+                            {c.combo.replace(/MISTAKE:|EMOTION:|RATING:|PLAN:NO/g, (m: string) =>
+                              m === 'PLAN:NO' ? 'NO-PLAN ' : '').replace(/_/g, ' ')}
+                          </td>
+                          <td style={{ padding: '3px 10px 3px 0', color: T.txtSec }}>{c.n}</td>
+                          <td style={{ padding: '3px 10px 3px 0', fontFamily: T.mono,
+                            color: (c.net_r ?? 0) >= 0 ? T.green : T.red }}>
+                            {rFmtC(c.net_r)}
+                          </td>
+                          <td style={{ padding: '3px 10px 3px 0', fontFamily: T.mono,
+                            color: (c.avg_r ?? 0) >= 0 ? T.green : T.red }}>
+                            {rFmtC(c.avg_r)}
+                          </td>
+                          <td style={{ padding: '3px 10px 3px 0', fontFamily: T.mono,
+                            color: (c.win_rate ?? 0) >= 50 ? T.green : T.red }}>
+                            {c.win_rate != null ? `${c.win_rate}%` : '—'}
+                          </td>
+                          <td style={{ padding: '3px 10px 3px 0', color: T.txtMuted }}>
+                            {(c.recent ?? []).slice(0, 2).join(', ') || '—'}
+                          </td>
+                          <td>{_confBadge(c.confidence)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Coaching summary sentences */}
+            {summary.length > 0 && (
+              <div style={{ background: T.cyan + '0d', borderRadius: 7,
+                padding: '10px 14px', border: `1px solid ${T.cyan}33` }}>
+                <div style={{ fontSize: 8, color: T.cyan, fontWeight: 700,
+                  letterSpacing: '0.06em', marginBottom: 6 }}>
+                  CORRELATION INSIGHTS
+                </div>
+                {summary.map((s: string, i: number) => (
+                  <div key={i} style={{ fontSize: 10, color: T.txtSec,
+                    marginBottom: i < summary.length - 1 ? 5 : 0 }}>
+                    {s}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {(cd.coverage?.reviewed ?? 0) === 0 && (
+              <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 6 }}>
+                No reviewed trades in the selected range. Review trades to unlock correlation analytics.
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {!data && !loading && !error && (
         <div style={{ color: T.txtMuted, fontSize: 11 }}>No coaching data loaded.</div>
       )}
@@ -6193,6 +6825,10 @@ const JournalFullPage: React.FC = () => {
       // Phase 7O.2: clearing any block key removes all three together
       else if (key === 'entry_block_start' || key === 'entry_block_end' || key === 'display_timezone') {
         delete next.entry_block_start; delete next.entry_block_end; delete next.display_timezone;
+      }
+      // Phase 7O.3: clearing rating_min/max removes both + rating_field (band drill-down)
+      else if (key === 'rating_min' || key === 'rating_max') {
+        delete next.rating_min; delete next.rating_max; delete next.rating_field;
       }
       else { (next as unknown as Record<string, unknown>)[key as string] = undefined; }
       // If no server-side filter keys remain, clear the whole drill

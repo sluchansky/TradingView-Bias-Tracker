@@ -43803,6 +43803,28 @@ def journal_trades_list():
         except (TypeError, ValueError):
             rating_value = None
 
+        # Phase 7O.3: rating range, realized-R range, and quality classification filters
+        try:
+            rating_min = int(request.args.get("rating_min", "")) if rating_field else None
+        except (TypeError, ValueError):
+            rating_min = None
+        try:
+            rating_max = int(request.args.get("rating_max", "")) if rating_field else None
+        except (TypeError, ValueError):
+            rating_max = None
+        try:
+            _rrmin = request.args.get("realized_r_min", "")
+            realized_r_min: float | None = float(_rrmin) if _rrmin.strip() else None
+        except (TypeError, ValueError):
+            realized_r_min = None
+        try:
+            _rrmax = request.args.get("realized_r_max", "")
+            realized_r_max: float | None = float(_rrmax) if _rrmax.strip() else None
+        except (TypeError, ValueError):
+            realized_r_max = None
+        _qc = (request.args.get("quality_classification") or "").strip().lower()
+        quality_classification = _qc if _qc in ("high_quality_loss", "low_quality_win") else None
+
         # ── Per-source inner WHERE builders ───────────────────────────────────
         sys_w, sys_p = ["1=1"], []
         tz_w,  tz_p  = ["1=1"], []
@@ -43951,6 +43973,41 @@ def journal_trades_list():
             # rating_field already validated against _RATING_FIELDS — safe to interpolate
             outer_w.append(f"{rating_field} = %s")
             outer_p.append(rating_value)
+
+        # Phase 7O.3: rating range (rating_min / rating_max with rating_field)
+        if rating_field and rating_min is not None:
+            outer_w.append(f"{rating_field} >= %s")
+            outer_p.append(rating_min)
+        if rating_field and rating_max is not None:
+            outer_w.append(f"{rating_field} <= %s")
+            outer_p.append(rating_max)
+        # Phase 7O.3: realized R range filter
+        if realized_r_min is not None:
+            outer_w.append("r_multiple >= %s")
+            outer_p.append(realized_r_min)
+        if realized_r_max is not None:
+            outer_w.append("r_multiple <= %s")
+            outer_p.append(realized_r_max)
+        # Phase 7O.3: quality classification shortcuts (composite filters)
+        if quality_classification == "high_quality_loss":
+            outer_w += [
+                "setup_quality     BETWEEN 4 AND 5",
+                "execution_quality BETWEEN 4 AND 5",
+                "discipline_quality BETWEEN 4 AND 5",
+                "followed_plan = 'YES'",
+                "r_multiple < 0",
+            ]
+        elif quality_classification == "low_quality_win":
+            outer_w.append("r_multiple > 0")
+            outer_w.append(
+                "("
+                " (discipline_quality IS NOT NULL AND discipline_quality BETWEEN 1 AND 2)"
+                " OR (execution_quality IS NOT NULL AND execution_quality BETWEEN 1 AND 2)"
+                " OR followed_plan = 'NO'"
+                " OR (mistake_tags IS NOT NULL AND jsonb_typeof(mistake_tags)='array'"
+                "     AND jsonb_array_length(mistake_tags) > 0)"
+                ")"
+            )
 
         # ── Phase 7O.2: intraday block filter ────────────────────────────────
         # Validated against _HHMM_RE before any SQL use; timezone validated via ZoneInfo.
@@ -46558,6 +46615,652 @@ def journal_coaching_intraday():
         "display_timezone": display_tz,
         "intraday_summary": summary[:3],
     })
+
+
+# ---------------------------------------------------------------------------
+# Phase 7O.3 — Rating × Mistake/Emotion Correlation Analytics (display-only)
+# ---------------------------------------------------------------------------
+# STRICT SCOPE: pure SELECT only. No learning, gate, scoring, execution, or
+# TradersPost paths reachable. All SQL parameterised; rating_field validated
+# against _RATING_FIELDS allowlist before interpolation.
+# ---------------------------------------------------------------------------
+
+@app.route("/journal/coaching/correlations", methods=["GET"])
+def journal_coaching_correlations():
+    """Journal Coaching — Rating × Mistake/Emotion Correlation Analytics.
+
+    DISPLAY-ONLY. Pure SELECT. Never touches learning, gate, scoring, or
+    execution. Inherits the same filter contract as /journal/coaching.
+
+    Query params:
+      date_from, date_to  YYYY-MM-DD (inclusive, America/New_York dates)
+      instrument           partial match (ILIKE)
+      mode                 exact (SCALP | SWING | MICRO_SCALP)
+      source               system | tradzella | '' = all
+
+    Response sections:
+      coverage, rating_mistake, rating_emotion, setup_execution_matrix,
+      discipline_outcomes, discipline_summary, high_quality_losses,
+      low_quality_wins, expensive_combinations, correlation_summary
+    """
+    import itertools as _itools
+    import json as _json
+
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+
+    date_from    = (request.args.get("date_from") or "").strip()
+    date_to      = (request.args.get("date_to")   or "").strip()
+    f_instrument = (request.args.get("instrument") or "").strip()
+    f_mode       = (request.args.get("mode")       or "").strip().upper()
+    f_source     = (request.args.get("source")     or "").strip().lower()
+
+    # Build filter clauses — same contract as /journal/coaching
+    f_clauses: list = []
+    f_params:  list = []
+    if date_from:
+        f_clauses.append("trade_date::date >= %s")
+        f_params.append(date_from)
+    if date_to:
+        f_clauses.append("trade_date::date <= %s")
+        f_params.append(date_to)
+    if f_instrument:
+        f_clauses.append("instrument ILIKE %s")
+        f_params.append(f"%{f_instrument}%")
+    if f_mode:
+        f_clauses.append("UPPER(mode) = %s")
+        f_params.append(f_mode)
+    if f_source in ("system", "tradzella"):
+        f_clauses.append("source = %s")
+        f_params.append(f_source)
+
+    fa  = (" AND " + " AND ".join(f_clauses)) if f_clauses else ""
+    CTE = _COACHING_BASE_CTE
+    WIN_SQL = _COACHING_WIN_RESULTS_SQL
+
+    def _run(cur, sql, extra_params=()):
+        p = list(f_params) + list(extra_params)
+        cur.execute(sql, p)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def _band(r) -> str | None:
+        """Rating integer 1–5 → 'LOW' | 'MEDIUM' | 'HIGH'."""
+        if r is None:
+            return None
+        if r <= 2:
+            return "LOW"
+        if r == 3:
+            return "MEDIUM"
+        return "HIGH"
+
+    _CORR_RATING_FIELDS = ("setup_quality", "execution_quality",
+                           "discipline_quality", "overall_quality")
+
+    try:
+        with conn.cursor() as cur:
+
+            # ── 1. Coverage ──────────────────────────────────────────────────
+            cov_rows = _run(cur, CTE + f"""
+                SELECT
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED')
+                    AS reviewed,
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED'
+                    AND setup_quality IS NOT NULL)
+                    AS with_setup,
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED'
+                    AND execution_quality IS NOT NULL)
+                    AS with_execution,
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED'
+                    AND discipline_quality IS NOT NULL)
+                    AS with_discipline,
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED'
+                    AND overall_quality IS NOT NULL)
+                    AS with_overall,
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED'
+                    AND mistake_tags IS NOT NULL
+                    AND jsonb_typeof(mistake_tags)='array'
+                    AND jsonb_array_length(mistake_tags)>0)
+                    AS with_mistakes,
+                  COUNT(*) FILTER (WHERE review_status='REVIEWED'
+                    AND emotion_tags IS NOT NULL
+                    AND jsonb_typeof(emotion_tags)='array'
+                    AND jsonb_array_length(emotion_tags)>0)
+                    AS with_emotions,
+                  COUNT(*) FILTER (WHERE review_status<>'REVIEWED')
+                    AS excluded
+                FROM base WHERE 1=1{fa}
+            """)
+            cov = cov_rows[0] if cov_rows else {}
+            coverage = {
+                "reviewed":        int(cov.get("reviewed")        or 0),
+                "with_setup":      int(cov.get("with_setup")      or 0),
+                "with_execution":  int(cov.get("with_execution")  or 0),
+                "with_discipline": int(cov.get("with_discipline") or 0),
+                "with_overall":    int(cov.get("with_overall")    or 0),
+                "with_mistakes":   int(cov.get("with_mistakes")   or 0),
+                "with_emotions":   int(cov.get("with_emotions")   or 0),
+                "excluded":        int(cov.get("excluded")        or 0),
+            }
+
+            # ── 2. Rating × Mistake Matrix ───────────────────────────────────
+            # For each rating field: aggregate (rating_value, mistake_tag) cells.
+            # Percentage is relative to all trades in that band (not just those
+            # with mistakes) to preserve the "x% of LOW-discipline trades" meaning.
+            rating_mistake: list = []
+            for field in _CORR_RATING_FIELDS:
+                # Band totals — denominator for band_pct
+                bt_rows = _run(cur, CTE + f"""
+                    SELECT {field}::int AS rating, COUNT(*) AS n
+                    FROM base
+                    WHERE review_status='REVIEWED'
+                      AND {field} IS NOT NULL{fa}
+                    GROUP BY {field}::int
+                """)
+                band_totals = {row["rating"]: int(row["n"]) for row in bt_rows}
+
+                mx_rows = _run(cur, CTE + f"""
+                    SELECT {field}::int AS rating,
+                      tag,
+                      COUNT(*)::int                                              AS n,
+                      SUM(CASE WHEN result IN {WIN_SQL}
+                               THEN 1 ELSE 0 END)::int                          AS wins,
+                      ROUND(SUM(COALESCE(r_multiple,0))::numeric,3)::float      AS net_r,
+                      ROUND(AVG(r_multiple)::numeric,3)::float                  AS avg_r,
+                      ROUND(100.0*SUM(CASE WHEN followed_plan='YES'
+                               THEN 1 ELSE 0 END)::numeric
+                            /NULLIF(COUNT(*),0),1)::float                        AS followed_plan_pct
+                    FROM base,
+                         jsonb_array_elements_text(mistake_tags) AS tag
+                    WHERE review_status='REVIEWED'
+                      AND {field} IS NOT NULL
+                      AND mistake_tags IS NOT NULL
+                      AND jsonb_typeof(mistake_tags)='array'{fa}
+                    GROUP BY {field}::int, tag
+                    ORDER BY {field}::int, net_r ASC
+                """)
+                for row in mx_rows:
+                    rating = int(row["rating"])
+                    n      = int(row["n"] or 0)
+                    wins   = int(row["wins"] or 0)
+                    bt     = band_totals.get(rating, 0)
+                    row["rating_field"]    = field
+                    row["band"]            = _band(rating)
+                    row["band_pct"]        = round(n / bt * 100, 1) if bt else None
+                    row["win_rate"]        = round(wins / n * 100, 1) if n else None
+                    row["confidence"]      = _coaching_confidence(n)
+                    rating_mistake.append(row)
+
+            # ── 3. Rating × Emotion Matrix ───────────────────────────────────
+            rating_emotion: list = []
+            for field in _CORR_RATING_FIELDS:
+                bt_rows = _run(cur, CTE + f"""
+                    SELECT {field}::int AS rating, COUNT(*) AS n
+                    FROM base
+                    WHERE review_status='REVIEWED'
+                      AND {field} IS NOT NULL{fa}
+                    GROUP BY {field}::int
+                """)
+                band_totals = {row["rating"]: int(row["n"]) for row in bt_rows}
+
+                em_rows = _run(cur, CTE + f"""
+                    SELECT {field}::int AS rating,
+                      elem->>'tag'                                                AS emotion,
+                      COUNT(*)::int                                              AS n,
+                      ROUND(AVG((elem->>'intensity')::float)::numeric,2)::float  AS avg_intensity,
+                      SUM(CASE WHEN result IN {WIN_SQL}
+                               THEN 1 ELSE 0 END)::int                          AS wins,
+                      ROUND(SUM(COALESCE(r_multiple,0))::numeric,3)::float      AS net_r,
+                      ROUND(AVG(r_multiple)::numeric,3)::float                  AS avg_r,
+                      ROUND(100.0*SUM(CASE WHEN followed_plan='YES'
+                               THEN 1 ELSE 0 END)::numeric
+                            /NULLIF(COUNT(*),0),1)::float                        AS followed_plan_pct
+                    FROM base,
+                         jsonb_array_elements(emotion_tags) AS elem
+                    WHERE review_status='REVIEWED'
+                      AND {field} IS NOT NULL
+                      AND emotion_tags IS NOT NULL
+                      AND jsonb_typeof(emotion_tags)='array'{fa}
+                    GROUP BY {field}::int, elem->>'tag'
+                    ORDER BY {field}::int, net_r ASC
+                """)
+
+                # Mistake overlap: top mistake co-occurring with each (rating, emotion)
+                ov_rows = _run(cur, CTE + f"""
+                    SELECT {field}::int AS rating,
+                      elem->>'tag' AS emotion, tag AS mistake,
+                      COUNT(*)::int AS cnt
+                    FROM base,
+                         jsonb_array_elements(emotion_tags) AS elem,
+                         jsonb_array_elements_text(mistake_tags) AS tag
+                    WHERE review_status='REVIEWED'
+                      AND {field} IS NOT NULL
+                      AND emotion_tags IS NOT NULL
+                      AND jsonb_typeof(emotion_tags)='array'
+                      AND mistake_tags IS NOT NULL
+                      AND jsonb_typeof(mistake_tags)='array'{fa}
+                    GROUP BY {field}::int, elem->>'tag', tag
+                """)
+                # overlap_map: {(rating, emotion): sorted [(mistake, cnt), ...]}
+                overlap_map: dict = {}
+                for ov in ov_rows:
+                    k = (int(ov["rating"]), ov["emotion"])
+                    overlap_map.setdefault(k, []).append(
+                        (ov["mistake"], int(ov["cnt"]))
+                    )
+                for k in overlap_map:
+                    overlap_map[k].sort(key=lambda x: (-x[1], x[0]))
+
+                for row in em_rows:
+                    rating  = int(row["rating"])
+                    n       = int(row["n"] or 0)
+                    wins    = int(row["wins"] or 0)
+                    bt      = band_totals.get(rating, 0)
+                    top     = overlap_map.get((rating, row["emotion"]), [])
+                    row["rating_field"]     = field
+                    row["band"]             = _band(rating)
+                    row["band_pct"]         = round(n / bt * 100, 1) if bt else None
+                    row["win_rate"]         = round(wins / n * 100, 1) if n else None
+                    row["confidence"]       = _coaching_confidence(n)
+                    row["top_mistake"]      = top[0][0] if top else None
+                    row["top_mistake_pct"]  = (
+                        round(top[0][1] / n * 100, 1) if top and n else None
+                    )
+                    rating_emotion.append(row)
+
+            # ── 4. Setup × Execution Matrix (5×5) ───────────────────────────
+            matrix_rows = _run(cur, CTE + f"""
+                SELECT setup_quality::int AS setup_q,
+                  execution_quality::int  AS exec_q,
+                  COUNT(*)::int                                              AS n,
+                  ROUND(AVG(r_multiple)::numeric,3)::float                  AS avg_r,
+                  SUM(CASE WHEN result IN {WIN_SQL}
+                           THEN 1 ELSE 0 END)::int                          AS wins,
+                  ROUND(100.0*SUM(CASE WHEN followed_plan='YES'
+                           THEN 1 ELSE 0 END)::numeric
+                        /NULLIF(COUNT(*),0),1)::float                        AS followed_plan_pct
+                FROM base
+                WHERE review_status='REVIEWED'
+                  AND setup_quality IS NOT NULL
+                  AND execution_quality IS NOT NULL{fa}
+                GROUP BY setup_q, exec_q ORDER BY setup_q, exec_q
+            """)
+
+            # Top mistake per (setup_q, exec_q) cell — deterministic alphabetical tie-break
+            cell_mx_rows = _run(cur, CTE + f"""
+                SELECT setup_quality::int AS setup_q,
+                  execution_quality::int  AS exec_q,
+                  tag, COUNT(*)::int AS cnt
+                FROM base,
+                     jsonb_array_elements_text(mistake_tags) AS tag
+                WHERE review_status='REVIEWED'
+                  AND setup_quality IS NOT NULL
+                  AND execution_quality IS NOT NULL
+                  AND mistake_tags IS NOT NULL
+                  AND jsonb_typeof(mistake_tags)='array'{fa}
+                GROUP BY 1, 2, 3
+            """)
+            cell_mx_map: dict = {}  # {(sq, eq): (top_tag, cnt)}
+            for r in cell_mx_rows:
+                k = (int(r["setup_q"]), int(r["exec_q"]))
+                existing = cell_mx_map.get(k)
+                cnt = int(r["cnt"])
+                if (existing is None
+                        or cnt > existing[1]
+                        or (cnt == existing[1] and r["tag"] < existing[0])):
+                    cell_mx_map[k] = (r["tag"], cnt)
+
+            setup_execution_matrix = []
+            for row in matrix_rows:
+                n    = int(row["n"] or 0)
+                wins = int(row["wins"] or 0)
+                k    = (int(row["setup_q"]), int(row["exec_q"]))
+                top  = cell_mx_map.get(k)
+                row["win_rate"]    = round(wins / n * 100, 1) if n else None
+                row["confidence"]  = _coaching_confidence(n)
+                row["top_mistake"] = top[0] if top else None
+                setup_execution_matrix.append(row)
+
+            # ── 5. Discipline Outcomes ───────────────────────────────────────
+            disc_rows = _run(cur, CTE + f"""
+                SELECT discipline_quality::int AS disc_rating,
+                  COUNT(*)::int                                              AS n,
+                  SUM(CASE WHEN result IN {WIN_SQL}
+                           THEN 1 ELSE 0 END)::int                          AS wins,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric,3)::float      AS net_r,
+                  ROUND(AVG(r_multiple)::numeric,3)::float                  AS avg_r,
+                  ROUND(SUM(CASE WHEN r_multiple>0
+                           THEN r_multiple ELSE 0 END)::numeric,3)::float   AS sum_pos_r,
+                  ROUND(ABS(SUM(CASE WHEN r_multiple<0
+                           THEN r_multiple ELSE 0 END))::numeric,3)::float  AS sum_neg_r,
+                  ROUND(100.0*SUM(CASE WHEN followed_plan='YES'
+                           THEN 1 ELSE 0 END)::numeric
+                        /NULLIF(COUNT(*),0),1)::float                        AS followed_plan_pct,
+                  ROUND(AVG(CASE
+                    WHEN mistake_tags IS NOT NULL
+                     AND jsonb_typeof(mistake_tags)='array'
+                    THEN jsonb_array_length(mistake_tags) ELSE 0
+                  END)::numeric,2)::float                                    AS avg_mistake_count,
+                  ROUND(AVG(
+                    CASE WHEN emotion_tags IS NOT NULL
+                          AND jsonb_typeof(emotion_tags)='array'
+                          AND jsonb_array_length(emotion_tags)>0
+                    THEN (SELECT AVG((e->>'intensity')::float)
+                          FROM jsonb_array_elements(emotion_tags) AS e)
+                    END
+                  )::numeric,2)::float                                       AS avg_emotion_intensity
+                FROM base
+                WHERE review_status='REVIEWED'
+                  AND discipline_quality IS NOT NULL{fa}
+                GROUP BY disc_rating ORDER BY disc_rating
+            """)
+            discipline_outcomes = []
+            low_avg_r: float | None  = None
+            high_avg_r: float | None = None
+            for row in disc_rows:
+                n    = int(row["n"] or 0)
+                wins = int(row["wins"] or 0)
+                row["win_rate"]     = round(wins / n * 100, 1) if n else None
+                row["confidence"]   = _coaching_confidence(n)
+                row["profit_factor"] = _coaching_pf(row.get("sum_pos_r") or 0,
+                                                    row.get("sum_neg_r") or 0)
+                disc = int(row.get("disc_rating") or 0)
+                if disc <= 2 and n >= 5:
+                    low_avg_r  = row.get("avg_r")
+                if disc >= 4 and n >= 5:
+                    high_avg_r = row.get("avg_r")
+                discipline_outcomes.append(row)
+
+            # Deterministic discipline summary sentence (only when ≥5 trades in each band)
+            disc_summary: str | None = None
+            if low_avg_r is not None and high_avg_r is not None:
+                s_hi = "+" if (high_avg_r or 0) >= 0 else ""
+                s_lo = "+" if (low_avg_r  or 0) >= 0 else ""
+                disc_summary = (
+                    f"Trades rated discipline 4–5 averaged {s_hi}{high_avg_r:.2f}R. "
+                    f"Trades rated discipline 1–2 averaged {s_lo}{low_avg_r:.2f}R."
+                )
+
+            # ── 6. High-Quality Losses ───────────────────────────────────────
+            # setup 4–5, execution 4–5, discipline 4–5, followed_plan=YES, R < 0
+            hql_rows = _run(cur, CTE + f"""
+                SELECT trade_id, source, instrument, strategy_name, session,
+                  r_multiple, result,
+                  setup_quality::int      AS setup_quality,
+                  execution_quality::int  AS execution_quality,
+                  discipline_quality::int AS discipline_quality,
+                  overall_quality::int    AS overall_quality,
+                  followed_plan,
+                  reviewed_at::text AS reviewed_at
+                FROM base
+                WHERE review_status='REVIEWED'
+                  AND setup_quality      BETWEEN 4 AND 5
+                  AND execution_quality  BETWEEN 4 AND 5
+                  AND discipline_quality BETWEEN 4 AND 5
+                  AND followed_plan='YES'
+                  AND r_multiple < 0{fa}
+                ORDER BY r_multiple ASC
+            """)
+            hql_strats: list = []
+            hql_insts:  list = []
+            hql_total_r = 0.0
+            for row in hql_rows:
+                hql_total_r += float(row.get("r_multiple") or 0)
+                s = row.get("strategy_name")
+                if s and s not in hql_strats:
+                    hql_strats.append(s)
+                i = row.get("instrument")
+                if i and i not in hql_insts:
+                    hql_insts.append(i)
+            hql_avg_r = round(hql_total_r / len(hql_rows), 3) if hql_rows else None
+
+            high_quality_losses = {
+                "count":       len(hql_rows),
+                "avg_r":       hql_avg_r,
+                "strategies":  hql_strats,
+                "instruments": hql_insts,
+                "trades":      hql_rows[:20],
+                "confidence":  _coaching_confidence(len(hql_rows)),
+            }
+
+            # ── 7. Low-Quality Wins ──────────────────────────────────────────
+            # R > 0 AND (disc 1–2 OR exec 1–2 OR followed_plan=NO OR any mistake)
+            lqw_rows = _run(cur, CTE + f"""
+                SELECT trade_id, source, instrument, strategy_name, session,
+                  r_multiple, result,
+                  setup_quality::int      AS setup_quality,
+                  execution_quality::int  AS execution_quality,
+                  discipline_quality::int AS discipline_quality,
+                  followed_plan,
+                  reviewed_at::text AS reviewed_at
+                FROM base
+                WHERE review_status='REVIEWED'
+                  AND r_multiple > 0
+                  AND (
+                    (discipline_quality IS NOT NULL
+                     AND discipline_quality BETWEEN 1 AND 2)
+                    OR (execution_quality IS NOT NULL
+                        AND execution_quality BETWEEN 1 AND 2)
+                    OR followed_plan='NO'
+                    OR (mistake_tags IS NOT NULL
+                        AND jsonb_typeof(mistake_tags)='array'
+                        AND jsonb_array_length(mistake_tags) > 0)
+                  ){fa}
+                ORDER BY r_multiple DESC
+            """)
+            # Aggregate mistake + emotion frequency for LQW
+            lqw_mistake_counts: dict = {}
+            lqw_emotion_counts: dict = {}
+            lqw_total_r = 0.0
+            for row in lqw_rows:
+                lqw_total_r += float(row.get("r_multiple") or 0)
+            # Fetch tag breakdowns for LQW trades separately (avoid JSONB in outer query)
+            if lqw_rows:
+                lqw_ids = [row["trade_id"] for row in lqw_rows]
+                lqw_ids_placeholder = ",".join(["%s"] * len(lqw_ids))
+                lqw_mt_rows = _run(cur, CTE + f"""
+                    SELECT trade_id, mistake_tags, emotion_tags
+                    FROM base
+                    WHERE trade_id IN ({lqw_ids_placeholder})
+                      AND review_status='REVIEWED'
+                """, tuple(lqw_ids))
+                for row in lqw_mt_rows:
+                    mt = row.get("mistake_tags")
+                    if mt:
+                        try:
+                            tags = _json.loads(mt) if isinstance(mt, str) else mt
+                            if isinstance(tags, list):
+                                for t in tags:
+                                    lqw_mistake_counts[t] = (
+                                        lqw_mistake_counts.get(t, 0) + 1
+                                    )
+                        except Exception:
+                            pass
+                    et = row.get("emotion_tags")
+                    if et:
+                        try:
+                            elems = _json.loads(et) if isinstance(et, str) else et
+                            if isinstance(elems, list):
+                                for e in elems:
+                                    tag = (e.get("tag") if isinstance(e, dict)
+                                           else None)
+                                    if tag:
+                                        lqw_emotion_counts[tag] = (
+                                            lqw_emotion_counts.get(tag, 0) + 1
+                                        )
+                        except Exception:
+                            pass
+
+            top_lqw_mistake = (
+                max(lqw_mistake_counts, key=lambda k: (lqw_mistake_counts[k], k))
+                if lqw_mistake_counts else None
+            )
+            top_lqw_emotion = (
+                max(lqw_emotion_counts, key=lambda k: (lqw_emotion_counts[k], k))
+                if lqw_emotion_counts else None
+            )
+            low_quality_wins = {
+                "count":       len(lqw_rows),
+                "net_r":       round(lqw_total_r, 3) if lqw_rows else None,
+                "top_mistake": top_lqw_mistake,
+                "top_emotion": top_lqw_emotion,
+                "trades":      lqw_rows[:20],
+                "confidence":  _coaching_confidence(len(lqw_rows)),
+            }
+
+            # ── 8. Expensive Combinations ────────────────────────────────────
+            # Fetch all reviewed trades with tag/rating data for Python-side pairing
+            combo_src = _run(cur, CTE + f"""
+                SELECT r_multiple, result, followed_plan,
+                  mistake_tags, emotion_tags,
+                  discipline_quality::int AS discipline_quality,
+                  execution_quality::int  AS execution_quality,
+                  reviewed_at::text AS reviewed_at
+                FROM base
+                WHERE review_status='REVIEWED'
+                  AND r_multiple IS NOT NULL{fa}
+            """)
+
+            from collections import defaultdict as _ddict
+            combo_map: dict = _ddict(lambda: {
+                "n": 0, "net_r": 0.0, "wins": 0, "dates": []
+            })
+
+            def _parse_tokens(row):
+                """Extract all combination tokens from a reviewed trade row."""
+                tokens: list = []
+                mt = row.get("mistake_tags")
+                if mt:
+                    try:
+                        tags = _json.loads(mt) if isinstance(mt, str) else mt
+                        if isinstance(tags, list):
+                            tokens += [f"MISTAKE:{t}" for t in tags]
+                    except Exception:
+                        pass
+                et = row.get("emotion_tags")
+                if et:
+                    try:
+                        elems = _json.loads(et) if isinstance(et, str) else et
+                        if isinstance(elems, list):
+                            tokens += [
+                                f"EMOTION:{e['tag']}"
+                                for e in elems
+                                if isinstance(e, dict) and e.get("tag")
+                            ]
+                    except Exception:
+                        pass
+                disc = row.get("discipline_quality")
+                exc  = row.get("execution_quality")
+                if disc is not None and disc <= 2:
+                    tokens.append("RATING:LOW_DISCIPLINE")
+                if exc is not None and exc <= 2:
+                    tokens.append("RATING:LOW_EXECUTION")
+                if (row.get("followed_plan") or "") == "NO":
+                    tokens.append("PLAN:NO")
+                return list(dict.fromkeys(tokens))  # deduplicate, preserve order
+
+            for row in combo_src:
+                r_val   = float(row.get("r_multiple") or 0)
+                is_win  = (row.get("result") or "") in {
+                    "win", "scratch", "be", "breakeven", "b/e"
+                }
+                rev_date = str(row.get("reviewed_at") or "")[:10]
+                tokens  = _parse_tokens(row)
+                if len(tokens) < 2:
+                    continue
+                seen_pairs: set = set()
+                for a, b in _itools.combinations(sorted(set(tokens)), 2):
+                    pair_key = f"{a} + {b}"
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    c = combo_map[pair_key]
+                    c["n"]      += 1
+                    c["net_r"]  += r_val
+                    c["wins"]   += int(is_win)
+                    if rev_date:
+                        c["dates"].append(rev_date)
+
+            expensive_combinations = []
+            for key, d in combo_map.items():
+                n    = d["n"]
+                if n < 2:
+                    continue
+                net_r = round(d["net_r"], 3)
+                wins  = d["wins"]
+                recent = sorted(set(d["dates"]), reverse=True)[:5]
+                expensive_combinations.append({
+                    "combo":      key,
+                    "n":          n,
+                    "net_r":      net_r,
+                    "avg_r":      round(d["net_r"] / n, 3) if n else None,
+                    "win_rate":   round(wins / n * 100, 1) if n else None,
+                    "recent":     recent,
+                    "confidence": _coaching_confidence(n),
+                })
+            # Sort by net_r ascending (most expensive / most negative first)
+            expensive_combinations.sort(key=lambda x: (x["net_r"] or 0))
+            expensive_combinations = expensive_combinations[:15]
+
+            # ── 9. Coaching Summary (Part 14) ────────────────────────────────
+            correlation_summary: list = []
+            hql_n = high_quality_losses["count"]
+            if hql_n >= 5:
+                avg_r_str = (f" Average: {hql_avg_r:.2f}R."
+                             if hql_avg_r is not None else "")
+                correlation_summary.append(
+                    f"PROCESS WIN: {hql_n} high-quality losses followed the "
+                    f"plan despite negative outcomes.{avg_r_str}"
+                )
+            lqw_n = low_quality_wins["count"]
+            if lqw_n >= 5:
+                extra = (
+                    f" Most often involved "
+                    f"{top_lqw_emotion.replace('_',' ').title()}."
+                    if top_lqw_emotion else ""
+                )
+                correlation_summary.append(
+                    f"DANGEROUS WIN: {lqw_n} profitable trades showed "
+                    f"low-quality process.{extra}"
+                )
+            if expensive_combinations and expensive_combinations[0]["n"] >= 5:
+                c      = expensive_combinations[0]
+                pretty = (
+                    c["combo"]
+                    .replace("MISTAKE:", "")
+                    .replace("EMOTION:", "")
+                    .replace("RATING:", "")
+                    .replace("PLAN:NO", "NO PLAN")
+                    .replace("_", " ")
+                )
+                correlation_summary.append(
+                    f"BIGGEST COMBINATION LEAK: {pretty} was associated with "
+                    f"{c['net_r']:.1f}R across {c['n']} trades."
+                )
+
+            return jsonify({
+                "ok":                      True,
+                "coverage":                coverage,
+                "rating_mistake":          rating_mistake,
+                "rating_emotion":          rating_emotion,
+                "setup_execution_matrix":  setup_execution_matrix,
+                "discipline_outcomes":     discipline_outcomes,
+                "discipline_summary":      disc_summary,
+                "high_quality_losses":     high_quality_losses,
+                "low_quality_wins":        low_quality_wins,
+                "expensive_combinations":  expensive_combinations,
+                "correlation_summary":     correlation_summary,
+            })
+
+    except Exception as exc:
+        logger.warning("journal_coaching_correlations failed: %s", exc)
+        return jsonify({"ok": False, "error": "correlations query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

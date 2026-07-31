@@ -166,6 +166,8 @@ export const BOT1_ROUTES = [
   "/journal/coaching",
   // Phase 7O.2: Intraday 30-min block coaching analytics (display-only, SELECT only).
   "/journal/coaching/intraday",
+  // Phase 7O.3: Rating × Mistake/Emotion correlation analytics (display-only, SELECT only).
+  "/journal/coaching/correlations",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",

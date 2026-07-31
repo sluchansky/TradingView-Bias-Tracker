@@ -1,0 +1,456 @@
+TASK: Phase 7O.3 — Add Rating × Mistake and Emotion Correlation Analytics to Journal Coaching.
+
+CONTEXT
+
+Journal Coaching now includes:
+
+- costliest mistakes
+- best behaviors
+- followed-plan analysis
+- emotions
+- quality ratings
+- strategy/session coaching
+- drill-down evidence
+- 30-minute intraday analysis
+
+The next goal is to determine how operator ratings relate to repeated mistakes, emotions, and trade outcomes.
+
+PRIMARY QUESTIONS
+
+The system should answer:
+
+- Which mistakes most often occur on low-discipline trades?
+- Which emotions overlap with poor execution?
+- Are high-quality setups being ruined by poor execution?
+- Do low setup ratings predict poor results?
+- Are losing trades still high-quality when the plan was followed?
+- Which behavioral combinations are most expensive?
+
+This is read-only analytics and display.
+
+STRICT SCOPE
+
+DO NOT modify:
+
+- journal trade truth
+- review data
+- coaching formulas already in production
+- learning formulas
+- learning thresholds
+- strategy scoring
+- readiness
+- risk
+- alerts
+- TradersPost
+- execution
+- Databento
+- Main Brain polling
+- authentication
+
+PART 1 — DEFINE ANALYSIS POPULATION
+
+Use only closed reviewed trades with valid review ratings.
+
+Track coverage separately for:
+
+- total reviewed trades
+- trades with setup rating
+- trades with execution rating
+- trades with discipline rating
+- trades with overall rating
+- trades with mistake tags
+- trades with emotion tags
+- trades excluded from analysis
+
+Do not treat missing ratings as zero.
+
+PART 2 — RATING BANDS
+
+Group each rating dimension into:
+
+LOW
+1–2
+
+MEDIUM
+3
+
+HIGH
+4–5
+
+Apply to:
+
+- setup quality
+- execution quality
+- discipline quality
+- overall quality
+
+Also retain exact 1–5 values for detailed tables.
+
+PART 3 — RATING × MISTAKE MATRIX
+
+For every rating dimension and mistake tag, calculate:
+
+- occurrence count
+- percentage of trades in that rating band
+- win rate
+- net P&L
+- net R
+- average R
+- followed-plan rate
+- confidence state
+
+Example:
+
+DISCIPLINE LOW × CHASED ENTRY
+9 trades
+64% of low-discipline trades
+-4.8R
+22% followed-plan rate
+
+Do not imply causation.
+
+Label results as associations.
+
+PART 4 — RATING × EMOTION MATRIX
+
+For every rating dimension and emotion tag, calculate:
+
+- occurrence count
+- percentage of rating-band trades
+- average emotion intensity
+- win rate
+- net R
+- average R
+- mistake overlap
+- followed-plan rate
+
+Example:
+
+EXECUTION LOW × FOMO
+7 trades
+Average intensity: 4.1
+-3.2R
+71% also tagged ENTERED EARLY
+
+PART 5 — SETUP QUALITY VERSUS EXECUTION QUALITY
+
+Create a 5×5 matrix:
+
+Rows:
+Setup Quality 1–5
+
+Columns:
+Execution Quality 1–5
+
+Each cell should show:
+
+- trade count
+- average R
+- win rate
+- followed-plan rate
+- top mistake
+- confidence
+
+This should expose situations such as:
+
+HIGH SETUP / LOW EXECUTION
+Good opportunity, poor execution
+
+LOW SETUP / HIGH EXECUTION
+Well-executed trade that should perhaps not have been taken
+
+HIGH SETUP / HIGH EXECUTION
+Ideal playbook trade
+
+LOW SETUP / LOW EXECUTION
+Lowest-quality behavior
+
+PART 6 — DISCIPLINE VERSUS OUTCOME
+
+For discipline rating 1–5, report:
+
+- trade count
+- win rate
+- net R
+- average R
+- profit factor
+- followed-plan rate
+- average mistake count
+- average emotion intensity
+
+Add a deterministic summary such as:
+
+Trades rated discipline 4–5 averaged +0.54R.
+Trades rated discipline 1–2 averaged -0.72R.
+
+Only display when sample size is sufficient.
+
+PART 7 — HIGH-QUALITY LOSSES
+
+Identify trades meeting:
+
+- setup quality 4–5
+- execution quality 4–5
+- discipline quality 4–5
+- followed plan YES
+- realized R < 0
+
+Label:
+
+HIGH-QUALITY LOSS
+
+These trades should not be presented as mistakes merely because they lost.
+
+Show:
+
+- count
+- average R
+- strategies
+- instruments
+- screenshots/reviews available
+- learning eligibility
+
+PART 8 — LOW-QUALITY WINS
+
+Identify trades meeting one or more of:
+
+- discipline quality 1–2
+- execution quality 1–2
+- followed plan NO
+- serious mistake tag present
+- realized R > 0
+
+Label:
+
+LOW-QUALITY WIN
+
+Show:
+
+- count
+- net R
+- most common mistake
+- most common emotion
+- strategy/session concentration
+
+Explain clearly:
+
+Profitable outcome does not validate poor process.
+
+PART 9 — EXPENSIVE COMBINATIONS
+
+Rank combinations such as:
+
+- FOMO + ENTERED EARLY
+- REVENGE + OVERSIZED
+- CHASED ENTRY + LOW DISCIPLINE
+- HIGH SETUP + LOW EXECUTION
+- FOLLOWED PLAN NO + MOVED STOP
+
+For each combination show:
+
+- count
+- net R
+- average R
+- win rate
+- recent occurrences
+- confidence
+
+Use combinations that actually exist in the stored data.
+
+Do not invent a fixed list if other combinations are more common.
+
+PART 10 — CONFIDENCE
+
+Use existing Journal Coaching thresholds:
+
+- fewer than 5: INSUFFICIENT
+- 5–19: EARLY
+- 20–49: MODERATE
+- 50+: STRONG
+
+Every matrix cell and association must show its sample count or confidence.
+
+Do not strongly color low-sample cells.
+
+PART 11 — BACKEND ENDPOINT
+
+Add a read-only endpoint such as:
+
+GET /journal/coaching/correlations
+
+Support current filters:
+
+- date range
+- instrument
+- strategy
+- mode
+- session
+- source
+- account
+- review status
+
+Suggested response sections:
+
+{
+  "coverage": {},
+  "rating_mistake": [],
+  "rating_emotion": [],
+  "setup_execution_matrix": [],
+  "discipline_outcomes": [],
+  "high_quality_losses": [],
+  "low_quality_wins": [],
+  "expensive_combinations": []
+}
+
+Use parameterized SQL.
+
+Do not dynamically interpolate unvalidated field names.
+
+PART 12 — UI
+
+Add a CORRELATIONS section inside Journal Coaching.
+
+Recommended layout:
+
+TOP ROW
+- High-Quality Losses
+- Low-Quality Wins
+- Most Expensive Combination
+- Discipline Impact
+
+MIDDLE
+- Setup × Execution matrix
+- Discipline × Outcome chart
+
+BOTTOM
+- Rating × Mistake table
+- Rating × Emotion table
+- Expensive combinations ranking
+
+PART 13 — DRILL-DOWN
+
+Every cell, row, and insight must open the exact supporting trades.
+
+Extend the existing drill-down contract where necessary with:
+
+- rating_field
+- rating_min
+- rating_max
+- mistake_tag
+- emotion_tag
+- followed_plan
+- realized_r_min
+- realized_r_max
+- quality_classification
+
+Examples:
+
+Click HIGH-QUALITY LOSSES
+→ reviewed trades matching the quality criteria and realized R below zero.
+
+Click DISCIPLINE LOW × CHASED ENTRY
+→ trades with discipline rating 1–2 and mistake tag CHASED ENTRY.
+
+Count parity is required.
+
+PART 14 — COACHING SUMMARY
+
+Add deterministic summaries such as:
+
+PROCESS WIN
+8 high-quality losses followed the plan despite negative outcomes.
+
+DANGEROUS WIN
+6 profitable trades were rated low discipline and most often involved FOMO.
+
+BIGGEST COMBINATION LEAK
+FOMO + EARLY ENTRY was associated with -4.3R across 9 trades.
+
+Only include statements supported by sufficient samples.
+
+PART 15 — TESTS
+
+COVERAGE
+- missing ratings excluded
+- missing tags excluded correctly
+- reviewed-only population
+- excluded trades omitted
+
+RATING BANDS
+- 1–2 low
+- 3 medium
+- 4–5 high
+
+MATRICES
+- correct cell assignment
+- count parity
+- empty cells
+- low-sample confidence
+
+HIGH-QUALITY LOSSES
+- losing outcome
+- high ratings
+- followed plan yes
+- profitable trade excluded
+
+LOW-QUALITY WINS
+- profitable outcome
+- low discipline/execution
+- followed plan no
+- clean win excluded
+
+COMBINATIONS
+- duplicate tags do not double-count
+- overlap calculation correct
+- sorting by net R impact
+- recent occurrence count
+
+DRILL-DOWN
+- matrix cell count equals filtered log
+- high-quality loss count equals filtered log
+- low-quality win count equals filtered log
+
+SAFETY
+- no learning update
+- no coaching formula mutation
+- no trading or execution path reachable
+- no new polling loop
+
+PART 16 — VALIDATION
+
+Run:
+
+- correlation analytics tests
+- coaching tests
+- intraday tests
+- drill-down tests
+- review workflow tests
+- journal regression tests
+- Main Brain navigation tests
+- TypeScript typecheck
+- production build
+- parity
+- scalp golden
+- git diff --check
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Coverage
+5. Rating bands
+6. Rating × mistake findings
+7. Rating × emotion findings
+8. Setup × execution matrix
+9. Discipline outcome results
+10. High-quality losses
+11. Low-quality wins
+12. Expensive combinations
+13. Drill-down behavior
+14. Tests
+15. TypeScript/build results
+16. Screenshots
+17. Confirmation that no trading, scoring, readiness, risk, alerts, TradersPost, execution, Databento, or learning behavior changed
