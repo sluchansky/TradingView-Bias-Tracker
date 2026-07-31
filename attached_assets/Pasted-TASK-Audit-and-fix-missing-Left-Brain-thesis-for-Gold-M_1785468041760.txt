@@ -1,0 +1,376 @@
+TASK: Audit and fix missing Left Brain thesis for Gold / MGC.
+
+PROBLEM
+
+The Main Brain is not consistently receiving a Left Brain thesis for Gold / MGC.
+
+The operator can see market data and trade-plan information for MGC, but the Left Brain thesis is missing, blank, stale, neutral by fallback, or unavailable.
+
+Do not assume this is a UI-only issue.
+
+Trace the complete MGC thesis pipeline from Databento through the Left Brain store and Main Brain API.
+
+PRIORITY
+
+This task takes priority over further UI polish.
+
+A missing thesis can make alignment, trade direction, readiness explanations, and alert decisions misleading.
+
+STRICT INITIAL SCOPE
+
+Begin as an AUDIT AND DIAGNOSTICS task.
+
+Do not change thesis calculations until the failure point is proven.
+
+DO NOT modify:
+
+- Databento subscription definitions
+- Databento normalization semantics
+- strategy formulas
+- Edge Score
+- readiness thresholds
+- alert thresholds
+- opposing-structure behavior
+- learning weights
+- risk calculations
+- TradersPost
+- execution
+- active-trade management
+- polling intervals
+- authentication
+
+PART 1 — DEFINE THE FAILURE PRECISELY
+
+Determine which condition is occurring for MGC:
+
+- no thesis object exists
+- thesis endpoint returns 404
+- thesis endpoint returns 200 with null fields
+- thesis exists but is stale
+- thesis is stored under a different ticker alias
+- thesis computation throws and falls back
+- Main Brain adapter drops the thesis
+- frontend normalizer drops the thesis
+- UI displays a fallback such as NEUTRAL
+- MGC thesis exists in one mode but not another
+- production and development differ
+
+Capture the exact live API response for MGC.
+
+Inspect at minimum:
+
+- `/lb-thesis`
+- `/lb-thesis-obs`
+- `/api/main-brain`
+- any instrument-specific thesis endpoint
+- current Left Brain store/cache contents
+
+Use authenticated production-equivalent requests where required.
+
+PART 2 — TRACE THE COMPLETE PIPELINE
+
+Trace:
+
+Databento MGC records
+→ symbol normalization
+→ instrument mapping
+→ observation buffer
+→ thesis calculation
+→ thesis persistence/cache
+→ thesis endpoint
+→ Main Brain adapter
+→ frontend normalizer
+→ Left Brain Thesis panel
+
+For every step, provide:
+
+- file path
+- function name
+- expected input
+- actual MGC input
+- output
+- timestamp
+- failure/fallback behavior
+
+PART 3 — VERIFY SYMBOL IDENTITY
+
+Gold may appear under several identifiers.
+
+Search for and compare all usage of:
+
+- MGC
+- MGC.c.0
+- MGC front-month contract
+- active contract symbol
+- continuous symbol
+- GC
+- GOLD
+- instrument aliases
+- Databento parent/root symbol
+- raw_symbol
+- canonical_symbol
+- display_symbol
+
+Prove the canonical identifier used at each stage.
+
+Look specifically for a mismatch where:
+
+- Databento writes observations under an active contract symbol
+- thesis lookup requests `MGC`
+- cache key uses a different symbol
+- Main Brain only asks for the display ticker
+
+Do not use fuzzy ticker matching.
+
+PART 4 — VERIFY DATA COVERAGE
+
+For MGC, report:
+
+- last Databento event timestamp
+- last normalized bar/tick timestamp
+- observation count
+- observation window start/end
+- required minimum observations
+- most recent VWAP
+- most recent structure event
+- most recent volume/delta evidence
+- session classification
+- data confidence
+- last thesis calculation attempt
+- last successful thesis calculation
+- thesis age
+
+Compare with one working instrument such as MNQ using the same fields.
+
+This comparison should reveal where MGC diverges.
+
+PART 5 — CHECK SESSION AND MAINTENANCE LOGIC
+
+Gold trades across overnight sessions and may be affected by session boundaries or the CME maintenance period.
+
+Verify whether the thesis is suppressed because of:
+
+- market closed logic
+- maintenance halt
+- session transition
+- insufficient bars after reopen
+- timezone conversion
+- date rollover
+- stale-data threshold
+- Close Approach phase
+- overnight session classification
+- weekend guard
+
+Report exact current behavior.
+
+A maintenance-state thesis should be explicit, not silently absent.
+
+PART 6 — CHECK EXCEPTION AND FALLBACK PATHS
+
+Search production logs for MGC thesis errors.
+
+Look for:
+
+- KeyError
+- missing field
+- divide by zero
+- empty observation buffer
+- timestamp parsing
+- symbol lookup failure
+- stale cache
+- database write failure
+- serialization failure
+- unsupported instrument
+- mode mismatch
+
+Do not swallow new exceptions.
+
+If a failure is currently silently ignored, add rate-limited diagnostics without changing the thesis formula.
+
+PART 7 — ADD READ-ONLY THESIS DIAGNOSTICS
+
+Expose a diagnostic object for each instrument.
+
+Suggested shape:
+
+{
+  "instrument": "MGC",
+  "status": "UNAVAILABLE",
+  "canonical_symbol": "MGC",
+  "source_symbol": "MGC.c.0",
+  "observation_count": 0,
+  "minimum_observations": 20,
+  "last_market_data_at": null,
+  "last_calculation_attempt_at": "2026-07-30T23:18:00-04:00",
+  "last_success_at": null,
+  "thesis_age_seconds": null,
+  "data_confidence": 0,
+  "blocked_reason": "NO_MATCHING_OBSERVATIONS",
+  "error_code": null,
+  "source": "left_brain_store"
+}
+
+Use actual values and existing naming conventions.
+
+Do not fabricate values.
+
+PART 8 — MAIN BRAIN DISPLAY
+
+The Left Brain panel must distinguish these states:
+
+AVAILABLE
+
+Show the thesis normally.
+
+COLLECTING DATA
+
+Example:
+
+LEFT BRAIN COLLECTING DATA
+12 / 20 observations
+Last MGC update: 8 seconds ago
+
+MARKET CLOSED / MAINTENANCE
+
+Example:
+
+MGC DATA PAUSED
+CME maintenance window
+Last valid thesis: Bearish
+Age: 23 minutes
+
+STALE
+
+Example:
+
+MGC THESIS STALE
+Last successful calculation: 14 minutes ago
+
+ERROR
+
+Example:
+
+MGC THESIS UNAVAILABLE
+Reason: Symbol mapping failure
+
+Do not display `NEUTRAL` as a generic fallback when no thesis was actually calculated.
+
+PART 9 — REQUIRED TESTS
+
+Create deterministic tests for:
+
+CASE A
+MGC observations under canonical `MGC` produce a thesis.
+
+CASE B
+MGC observations under the Databento source symbol map to canonical `MGC`.
+
+CASE C
+Active-contract symbol resolves deterministically to MGC.
+
+CASE D
+No observations.
+Expected:
+COLLECTING DATA or UNAVAILABLE with explicit reason.
+
+CASE E
+Insufficient observations.
+Expected:
+sample progress shown.
+
+CASE F
+Maintenance window.
+Expected:
+explicit paused state, not blank.
+
+CASE G
+Stale MGC data.
+Expected:
+STALE state.
+
+CASE H
+Calculation exception.
+Expected:
+diagnostic error and safe UI state.
+
+CASE I
+MGC thesis exists but Main Brain adapter receives it.
+Expected:
+fields preserved.
+
+CASE J
+Frontend normalizer preserves MGC thesis.
+
+CASE K
+MNQ remains unchanged.
+
+CASE L
+No cross-instrument fallback.
+Expected:
+MNQ thesis must never appear as MGC thesis.
+
+PART 10 — IMPLEMENT ONLY THE PROVEN DEFECT
+
+After the audit identifies the exact failure:
+
+- implement the narrowest correction
+- preserve all thesis formulas
+- preserve thresholds
+- preserve Databento semantics
+- preserve other instruments
+- add a regression test proving the defect is fixed
+
+Examples of acceptable narrow fixes:
+
+- canonical symbol-key mapping
+- missing adapter field
+- frontend normalizer pass-through
+- observation-store lookup correction
+- explicit stale/maintenance state
+
+Do not redesign the Left Brain engine.
+
+STOP CONDITIONS
+
+Stop and report before implementation if:
+
+- MGC market data is not reaching the application
+- Databento subscription coverage is missing
+- fixing the issue requires changing thesis methodology
+- multiple incompatible symbol mappings exist
+- production data is insufficient to prove the cause
+
+VALIDATION
+
+Run:
+
+- focused MGC thesis tests
+- Left Brain regression tests
+- thesis observation tests
+- Main Brain regression tests
+- symbol normalization tests
+- Databento integration tests that do not require changing ingestion
+- TypeScript typecheck
+- production build
+- git diff --check
+
+Do not fix unrelated failures.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Exact live failure observed
+4. Root cause
+5. Files changed
+6. Canonical MGC symbol path
+7. Observation counts and timestamps
+8. Comparison with MNQ
+9. Fix implemented
+10. Diagnostic object added
+11. Test results
+12. TypeScript and build results
+13. Screenshot of the repaired MGC Left Brain panel
+14. Confirmation that Databento ingestion, thesis formulas, scoring, readiness, alerts, risk, execution, and polling were not changed

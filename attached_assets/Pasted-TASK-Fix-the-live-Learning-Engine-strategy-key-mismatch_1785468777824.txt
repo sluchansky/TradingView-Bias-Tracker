@@ -1,0 +1,357 @@
+TASK: Fix the live Learning Engine strategy-key mismatch shown in Main Brain Coach.
+
+CURRENT PRODUCTION SYMPTOM
+
+Main Brain Coach shows:
+
+LEARNING KEY MISMATCH
+Current weight: 1.000
+Live influence: 0 pts
+Score Gate: ON
+
+Blocked Reason:
+Strategy key not found in weight store (key mismatch)
+
+LRE Status:
+LIVE_ELIGIBLE
+
+This means the learning system is eligible and enabled, but the live strategy-weight lookup cannot resolve the current strategy to its persisted weight key.
+
+GOAL
+
+Make the strategy key written by the learning pipeline and the strategy key used by live scoring resolve through one deterministic canonical identity.
+
+Do not hide the warning in the UI.
+
+Fix the underlying key-resolution defect.
+
+STRICT SCOPE
+
+Allowed changes:
+
+- canonical learning-key construction
+- canonical learning-key normalization
+- deterministic legacy-key compatibility
+- learning weight lookup
+- related diagnostics and tests
+
+DO NOT modify:
+
+- LEARNING_MIN_SAMPLE
+- learning formula
+- weight caps or floors
+- base Edge Score
+- readiness thresholds
+- strategy selection
+- Databento
+- alert logic
+- opposing-structure logic
+- risk calculations
+- TradersPost
+- execution
+- active-trade management
+- polling
+- authentication
+
+PART 1 — CAPTURE THE EXACT MISMATCH
+
+Using the current live Main Brain scenario, report:
+
+- instrument
+- mode
+- direction
+- active strategy name
+- active_key returned by compute_strategy_engine()
+- strategy_key written into strategy_trades
+- key stored in strategy_weights
+- exact key passed into _strategy_weight_for()
+- all lookup candidates attempted
+- final lookup result
+
+Provide the literal values.
+
+Do not proceed based only on assumed examples.
+
+PART 2 — TRACE EVERY KEY PRODUCER AND CONSUMER
+
+Trace:
+
+trade setup selected
+→ entry snapshot
+→ _record_strategy_trade
+→ strategy_trades.strategy_key
+→ learning aggregation
+→ strategy_weights persistence
+→ compute_strategy_engine active strategy
+→ _strategy_weight_for
+→ _resolve_learning_score_influence
+→ Main Brain learning diagnostics
+
+For each step provide:
+
+- file
+- function
+- input key
+- output key
+- normalization applied
+- dimensions included
+
+PART 3 — DEFINE ONE CANONICAL LEARNING IDENTITY
+
+Determine the dimensions required by the current learning model.
+
+Explicitly decide whether the canonical identity includes:
+
+- instrument
+- mode
+- strategy
+- direction
+
+Preferred canonical structured representation:
+
+{
+  "instrument": "MGC",
+  "mode": "SCALP",
+  "strategy": "CHOCH",
+  "direction": "LONG"
+}
+
+Preferred serialized key, if a string is required:
+
+MGC|SCALP|CHOCH|LONG
+
+Use the project’s existing canonical strategy identifier where one already exists.
+
+Do not normalize distinct strategies into the same key.
+
+PART 4 — CREATE ONE SHARED HELPER
+
+Create one shared canonical key helper used by all relevant write and read paths.
+
+Example responsibilities:
+
+- normalize instrument casing
+- normalize mode casing
+- normalize direction casing
+- map known strategy aliases deterministically
+- serialize the canonical key
+- parse known legacy formats
+
+Do not leave independent string concatenation scattered across the codebase.
+
+PART 5 — LEGACY COMPATIBILITY
+
+Existing rows may contain keys such as:
+
+MGC_SCALP_CHOCH_Long
+
+The new lookup must preserve existing data.
+
+Use deterministic compatibility only.
+
+Required lookup order:
+
+1. canonical exact key
+2. exact known legacy format
+3. explicit alias mapping
+4. NOT_FOUND
+
+Do not use:
+
+- fuzzy matching
+- contains()
+- startsWith() matching
+- partial strategy-name matching
+- cross-instrument fallback
+- cross-direction fallback
+- cross-mode fallback
+
+PART 6 — HANDLE CURRENT NEUTRAL WEIGHTS CORRECTLY
+
+The current sample count may still be below LEARNING_MIN_SAMPLE = 20.
+
+After the key mismatch is fixed, the expected state may become:
+
+COLLECTING DATA
+6 / 20 samples
+Current weight: 1.000
+Live influence: 0 pts
+Reason: Insufficient samples
+
+That is correct.
+
+Do not make the UI claim learning influence is active merely because the key lookup succeeds.
+
+The Coach panel must distinguish:
+
+- KEY_NOT_FOUND
+- INSUFFICIENT_SAMPLES
+- WEIGHT_NEUTRAL
+- WEIGHT_APPLIED
+- FEATURE_DISABLED
+- WRITE_FAILED
+
+PART 7 — FIX RESULT AGGREGATION IF STILL OUTSTANDING
+
+Verify whether the earlier result-case defect has already been corrected:
+
+strategy_trades.result contains values such as `WIN`
+
+Learning aggregation must use:
+
+lower(trim(result)) = 'win'
+
+If that correction is not present, include it in this task because an incorrect 0% win rate would make the repaired key lookup unsafe when the threshold is reached.
+
+If already fixed, prove it and do not modify it again.
+
+PART 8 — REQUIRED TESTS
+
+Create deterministic tests for:
+
+CASE A
+Live strategy and stored canonical key match exactly.
+
+CASE B
+Live strategy resolves a known legacy key.
+
+CASE C
+MGC key cannot resolve an MNQ weight.
+
+CASE D
+LONG cannot resolve SHORT.
+
+CASE E
+SCALP cannot resolve SWING.
+
+CASE F
+CHOCH cannot resolve a similarly named but distinct strategy.
+
+CASE G
+Canonical and legacy representations do not double-count samples.
+
+CASE H
+Below 20 samples:
+Expected:
+lookup succeeds, weight remains 1.000, influence 0, status INSUFFICIENT_SAMPLES.
+
+CASE I
+At least 20 valid samples:
+Expected:
+lookup succeeds and calculated weight can be applied.
+
+CASE J
+Feature flag off:
+Expected:
+lookup may succeed but influence is not applied.
+
+CASE K
+Unknown legacy key:
+Expected:
+KEY_NOT_FOUND with diagnostic evidence.
+
+CASE L
+Restart:
+Expected:
+persisted canonical or compatible weight resolves after restart.
+
+CASE M
+Uppercase `WIN` results:
+Expected:
+wins aggregate correctly.
+
+PART 9 — MAIN BRAIN DIAGNOSTICS
+
+The Coach panel should show:
+
+LEARNING STATUS
+
+Lookup Status:
+CANONICAL / LEGACY_COMPAT / NOT_FOUND
+
+Canonical Key:
+MGC|SCALP|CHOCH|LONG
+
+Stored Key:
+MGC_SCALP_CHOCH_Long
+
+Samples:
+6 / 20
+
+Current Weight:
+1.000
+
+Live Influence:
+0 pts
+
+Blocked Reason:
+INSUFFICIENT SAMPLES
+
+Once the mismatch is fixed, do not continue showing:
+
+LEARNING KEY MISMATCH
+
+unless the current lookup genuinely still fails.
+
+PART 10 — PRODUCTION DATA SAFETY
+
+Do not delete or rewrite historical strategy_trades rows destructively.
+
+If migration is used:
+
+- make it idempotent
+- preserve the original rows
+- prevent duplicate weights
+- prevent duplicate sample counts
+- provide before/after row counts
+
+A compatibility lookup is preferred over a risky destructive migration for this weekly checkpoint.
+
+PART 11 — VALIDATION
+
+Run:
+
+- focused learning-key tests
+- existing test_learning_engine.py
+- strategy trade persistence tests
+- learning aggregation tests
+- strategy-engine regressions
+- Main Brain regressions
+- production build
+- TypeScript typecheck
+- git diff --check
+
+Report full TypeScript status honestly.
+
+Do not say TypeScript passed if pre-existing errors remain.
+
+PART 12 — LIVE VERIFICATION
+
+After implementation, capture an authenticated Main Brain screenshot showing one of these correct states:
+
+A. COLLECTING DATA / INSUFFICIENT SAMPLES
+or
+B. LEARNING ACTIVE / WEIGHT APPLIED
+
+The screenshot must no longer show LEARNING KEY MISMATCH for a strategy whose persisted legacy key is deterministically compatible.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Exact mismatched keys before the fix
+4. Canonical key format
+5. Legacy compatibility behavior
+6. Files changed
+7. Whether result-case aggregation was already fixed
+8. Production row counts before and after
+9. Current sample count
+10. Current weight
+11. Current live influence
+12. Lookup status after the fix
+13. Tests
+14. TypeScript and build results
+15. Screenshot location
+16. Confirmation that learning threshold, formula, scoring, Databento, alerts, risk, and execution were untouched

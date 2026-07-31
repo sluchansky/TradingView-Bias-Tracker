@@ -377,18 +377,122 @@ const MarketStrip: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 };
 
 // ── Thesis Panel ──────────────────────────────────────────────────────────────
+// Displays the Left Brain Dynamic Thesis with explicit states:
+//   AVAILABLE     — fresh, computed thesis (direction may legitimately be NEUTRAL)
+//   STALE         — thesis exists but older than 10 min; shows last-known direction
+//   COLLECTING_DATA — fewer than 5 bar-close observations; shows progress
+//   NO_DATA       — thesis never computed (no Databento bar-close yet)
+//   ERROR         — adapter exception; shows unavailable
+//
+// NEVER shows "NEUTRAL" as a silent fallback — NEUTRAL is only shown when the
+// diagnosis.status is AVAILABLE and the market is genuinely contested.
 const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  const lb = (p.left_brain ?? {}) as Record<string, unknown>;
-  const avail = lb.available !== false;
-  const dir   = safeStr(lb.direction, '');
-  const conf  = safeNum(lb.confidence);
-  const narr  = safeStr(lb.narrative, '');
-  const age   = fmtAge(lb.generated_at);
-  const dCol  = dirColor(dir);
+  const lb    = (p.left_brain ?? {}) as Record<string, unknown>;
+  const diag  = (lb.diagnosis ?? {}) as Record<string, unknown>;
+
+  // ── Diagnosis-driven state ─────────────────────────────────────────────────
+  const diagStatus  = safeStr(diag.status, 'NO_DATA');
+  const isAvailable = diagStatus === 'AVAILABLE';
+  const isStale     = diagStatus === 'STALE';
+  const isCollect   = diagStatus === 'COLLECTING_DATA';
+  const isNoData    = diagStatus === 'NO_DATA';
+  const isError     = diagStatus === 'ERROR';
+
+  const dir     = safeStr(lb.direction, '');
+  const conf    = safeNum(lb.confidence);
+  const narr    = safeStr(lb.narrative, '');
+  const age     = fmtAge(lb.generated_at);
+  const dCol    = dirColor(dir);
+
+  const obsCount    = safeNum(diag.observation_count) ?? 0;
+  const dbBars      = safeNum(diag.databento_bars) ?? 0;
+  const ageSec      = safeNum(diag.thesis_age_seconds);
+  const ageMin      = ageSec != null ? Math.round(ageSec / 60) : null;
+  const calcAt      = fmtTs(diag.last_calculation_at);
+  const sourceSym   = safeStr(diag.source_symbol, '');
+
+  // Badge shown in the panel header
+  const badge = isAvailable
+    ? <Badge label={dir || 'NEUTRAL'} color={dCol} />
+    : isStale
+      ? <Badge label="STALE" color={T.amber} />
+      : isCollect
+        ? <Badge label="COLLECTING DATA" color={T.txtSec} />
+        : <Badge label="UNAVAILABLE" color={T.txtMuted} />;
 
   return (
-    <Panel title="Left Brain Thesis" badge={avail ? <Badge label={dir || 'UNKNOWN'} color={dCol} /> : <Badge label="UNAVAILABLE" color={T.txtMuted} />}>
-      {!avail ? <UnavailableNote msg="Thesis unavailable" /> : (
+    <Panel title="Left Brain Thesis" badge={badge}>
+
+      {/* ── NO_DATA — thesis never computed ─── */}
+      {(isNoData || isError) && (
+        <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+          <UnavailableNote msg={isError
+            ? 'Thesis engine error — check diagnostics'
+            : 'No thesis yet — awaiting first Databento bar-close scan'} />
+          {sourceSym && (
+            <div style={{ fontSize:9, color:T.txtMuted }}>
+              Source: {sourceSym} → Databento bars received: {dbBars}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── COLLECTING DATA — fewer than 5 observations ─── */}
+      {isCollect && (
+        <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+          <div style={{ fontSize:11, color:T.txtSec }}>
+            LEFT BRAIN COLLECTING DATA
+          </div>
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            <div style={{ flex:1, height:5, background:'rgba(255,255,255,0.07)', borderRadius:3, overflow:'hidden' }}>
+              <div style={{ height:'100%', width:`${Math.min((obsCount / 5) * 100, 100)}%`,
+                background:T.cyan, borderRadius:3, transition:'width 0.5s ease' }} />
+            </div>
+            <span style={{ fontSize:10, color:T.cyan, fontFamily:T.mono, whiteSpace:'nowrap' }}>
+              {obsCount} / 5 observations
+            </span>
+          </div>
+          {dbBars > 0 && (
+            <div style={{ fontSize:9.5, color:T.txtMuted }}>
+              Databento bars: {dbBars} · Source: {sourceSym}
+            </div>
+          )}
+          {calcAt !== '—' && (
+            <div style={{ fontSize:9.5, color:T.txtMuted }}>Last scan: {calcAt}</div>
+          )}
+        </div>
+      )}
+
+      {/* ── STALE — thesis older than 10 minutes ─── */}
+      {isStale && (
+        <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+          <div style={{ background:`${T.amber}12`, border:`1px solid ${T.amber}44`, borderRadius:8, padding:'10px 14px' }}>
+            <div style={{ fontSize:10, fontWeight:700, color:T.amber, letterSpacing:'0.08em', marginBottom:4 }}>
+              THESIS STALE
+            </div>
+            <div style={{ fontSize:11, color:T.txtSec }}>
+              Last successful calculation:{' '}
+              {ageMin != null ? `${ageMin} min ago` : age}
+            </div>
+            {dir && dir !== 'NEUTRAL' && (
+              <div style={{ fontSize:10, color:T.txtMuted, marginTop:4 }}>
+                Direction when last calculated:{' '}
+                <span style={{ color:dCol, fontWeight:700 }}>{dir}</span>
+              </div>
+            )}
+          </div>
+          <div style={{ fontSize:9, color:T.txtMuted }}>
+            Databento bars: {dbBars} · Source: {sourceSym}
+          </div>
+          <div style={{ fontSize:9, color:T.txtMuted }}>
+            Low-volume overnight periods (e.g. 12 AM–6 AM ET on Micro Gold)
+            may reduce bar-close frequency and delay thesis updates.
+          </div>
+        </div>
+      )}
+
+      {/* ── AVAILABLE — fresh, real thesis ─── */}
+      {isAvailable && (
         <>
           {/* Direction + confidence bar */}
           <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
@@ -403,18 +507,24 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                   <span style={{ fontSize:11, fontWeight:700, color:dCol, fontFamily:T.mono }}>{conf} / 100</span>
                 </div>
                 <div style={{ height:5, background:'rgba(255,255,255,0.07)', borderRadius:3, overflow:'hidden' }}>
-                  <div style={{ height:'100%', width:`${Math.min(conf, 100)}%`, background:dCol, borderRadius:3, transition:'width 0.5s ease' }} role="progressbar" aria-valuenow={conf} aria-valuemin={0} aria-valuemax={100} aria-label="Thesis confidence" />
+                  <div style={{ height:'100%', width:`${Math.min(conf ?? 0, 100)}%`, background:dCol,
+                    borderRadius:3, transition:'width 0.5s ease' }} role="progressbar"
+                    aria-valuenow={conf ?? 0} aria-valuemin={0} aria-valuemax={100}
+                    aria-label="Thesis confidence" />
                 </div>
               </div>
             )}
           </div>
 
           {/* Narrative */}
-          {narr && <div style={{ fontSize:11, color:T.txtSec, lineHeight:1.55, marginBottom:10, borderLeft:`2px solid ${dCol}55`, paddingLeft:8 }}>{narr}</div>}
+          {narr && (
+            <div style={{ fontSize:11, color:T.txtSec, lineHeight:1.55, marginBottom:10,
+              borderLeft:`2px solid ${dCol}55`, paddingLeft:8 }}>{narr}</div>
+          )}
 
           {/* Meta */}
           <div style={{ display:'flex', gap:6, flexWrap:'wrap', marginTop:4 }}>
-            {lb.status != null && <Badge label={String(lb.status)} color={T.txtSec} />}
+            {lb.status  != null && <Badge label={String(lb.status)}  color={T.txtSec} />}
             {lb.momentum != null && <Badge label={String(lb.momentum)} color={T.amber} />}
           </div>
         </>

@@ -23434,7 +23434,10 @@ def _mb_left_brain(inst, result, errors):
     try:
         raw_thesis = _LB_THESIS_BY_INST.get(inst)
         if raw_thesis is not None:
-            lu      = raw_thesis.get("lastUpdatedAt")
+            # Fix: thesis is stored with snake_case key "last_updated_at"
+            # (from compute_left_brain_thesis); camelCase "lastUpdatedAt" was a
+            # field-name mismatch that kept age_seconds and generated_at always None.
+            lu = raw_thesis.get("last_updated_at") or raw_thesis.get("lastUpdatedAt")
             age_sec = None
             try:
                 if lu:
@@ -23482,11 +23485,71 @@ def _mb_left_brain(inst, result, errors):
     except Exception:
         pass
 
+    # ── Thesis diagnosis block (Part 7) ─────────────────────────────────────────
+    # Produces a machine-readable status so the operator panel can distinguish
+    # AVAILABLE / STALE / COLLECTING_DATA / NO_DATA without reading a NEUTRAL
+    # direction that might be a silent fallback rather than a real market read.
+    # Thresholds:
+    #   STALE_THESIS_SEC  = 600  (10 min; 2× the 5-min VWAP freshness window)
+    #   MIN_OBS_FOR_READY = 5   (5 bar-close observations for directional reliability)
+    # NEVER raises — fail-open always produces a diagnosis dict.
+    _STALE_THESIS_SEC   = 600
+    _MIN_OBS_FOR_READY  = 5
+    diagnosis: dict = {}
+    try:
+        _source_sym = inst + ".c.0"
+        _db_bars    = 0
+        try:
+            from databento_brain import DB_SYMBOLS as _DBS, DATABENTO_STATUS as _DBS_STATUS  # noqa: PLC0415
+            _source_sym = _DBS.get(inst, _source_sym)
+            _db_bars    = int(((_DBS_STATUS.get("instruments") or {}).get(inst) or {}).get("bars") or 0)
+        except Exception:
+            pass
+
+        _thesis_age  = (thesis_out or {}).get("age_seconds") if thesis_out else None
+        _calc_at     = (thesis_out or {}).get("generated_at")
+
+        if thesis_out is None:
+            _diag_status = "NO_DATA"
+            _blocked     = "NO_OBSERVATIONS"
+        elif _thesis_age is not None and _thesis_age > _STALE_THESIS_SEC:
+            _diag_status = "STALE"
+            _blocked     = f"STALE_THESIS_{int(_thesis_age)}s"
+        elif obs_count < _MIN_OBS_FOR_READY:
+            _diag_status = "COLLECTING_DATA"
+            _blocked     = f"INSUFFICIENT_OBSERVATIONS_{obs_count}_of_{_MIN_OBS_FOR_READY}"
+        else:
+            _diag_status = "AVAILABLE"
+            _blocked     = None
+
+        diagnosis = {
+            "instrument":          inst,
+            "status":              _diag_status,
+            "canonical_symbol":    inst,
+            "source_symbol":       _source_sym,
+            "observation_count":   obs_count,
+            "databento_bars":      _db_bars,
+            "last_calculation_at": _calc_at,
+            "thesis_age_seconds":  _thesis_age,
+            "blocked_reason":      _blocked,
+            "error_code":          None if available else "LEFT_BRAIN_EXCEPTION",
+            "source":              "left_brain_store",
+        }
+    except Exception as _de:
+        logger.debug("_mb_left_brain diagnosis: %s", _de)
+        diagnosis = {
+            "instrument":  inst,
+            "status":      "ERROR",
+            "error_code":  "DIAGNOSIS_FAILED",
+            "source":      "left_brain_store",
+        }
+
     return {
         "thesis":             thesis_out,
         "intelligence":       mi_out,
         "observations_count": obs_count,
         "available":          available,
+        "diagnosis":          diagnosis,
     }
 
 

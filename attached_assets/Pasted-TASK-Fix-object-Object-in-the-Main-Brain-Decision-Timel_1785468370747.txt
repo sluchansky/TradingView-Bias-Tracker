@@ -1,0 +1,217 @@
+TASK: Fix `[object Object]` in the Main Brain Decision Timeline.
+
+PROBLEM
+
+The Decision Timeline is rendering:
+
+[object Object]
+
+under repeated thesis transition events.
+
+This means a timeline detail, reason, payload, or metadata field is an object and is being interpolated directly into JSX/text.
+
+GOAL
+
+Render a useful human-readable event description instead of `[object Object]`.
+
+This is a DISPLAY/NORMALIZATION fix only.
+
+DO NOT modify:
+
+- Databento
+- thesis calculations
+- event creation logic
+- alert logic
+- strategy logic
+- scoring
+- readiness
+- execution
+- polling
+- database semantics
+
+PART 1 — TRACE THE EXACT FIELD
+
+Locate the Main Brain Decision Timeline component and the backend timeline event builder.
+
+Identify which field currently renders as `[object Object]`.
+
+Check likely fields such as:
+
+- detail
+- message
+- reason
+- description
+- metadata
+- payload
+- transition
+- context
+
+Provide the exact JSON shape for one affected `THESIS_TRANSITION` event.
+
+PART 2 — ADD A SHARED DISPLAY FORMATTER
+
+Create a small reusable formatter for timeline event details.
+
+Required behavior:
+
+1. String:
+   return the string.
+
+2. Number or boolean:
+   return a readable string.
+
+3. Null or undefined:
+   return an empty string or explicit unavailable fallback.
+
+4. Array:
+   format readable scalar values and objects safely.
+
+5. Object:
+   extract meaningful known fields first.
+
+Preferred field priority:
+
+- summary
+- message
+- reason
+- description
+- label
+- from / to
+- previous_state / new_state
+- direction
+- status
+- event_type
+
+For a thesis transition object, render something like:
+
+FORMING_LONG → READY_LONG
+
+or:
+
+Previous: FORMING_LONG · Current: READY_LONG
+
+If no known fields exist, use a compact safe JSON representation rather than `[object Object]`.
+
+Do not dump huge raw payloads into the UI.
+
+PART 3 — THESIS TRANSITION DISPLAY
+
+For `THESIS_TRANSITION` events, show structured information explicitly.
+
+Suggested layout:
+
+Thesis → FORMING_LONG
+Previous: NEUTRAL
+Direction: LONG
+Reason: Bullish structure developing
+
+Only show fields that actually exist.
+
+Do not fabricate a previous state or reason.
+
+PART 4 — SAFE FALLBACK
+
+Add a compact fallback serializer that:
+
+- catches circular references
+- limits depth
+- limits output length
+- avoids exposing secrets or authentication data
+- excludes large raw market-data arrays
+- never returns `[object Object]`
+
+Example fallback:
+
+{"state":"FORMING_LONG","direction":"LONG"}
+
+PART 5 — FIX DUPLICATE VISUAL NOISE IF PRESENT
+
+The screenshot also shows repeated identical `FORMING_LONG` events seconds apart.
+
+Do not change event generation in this task.
+
+But in the UI, determine whether these are exact duplicate event IDs or separate valid events.
+
+If they are exact duplicates from the same API payload, deduplicate by stable event ID.
+
+If they are genuinely separate stored events, leave them visible and report that event-generation deduplication is a separate backend issue.
+
+Do not silently collapse real timeline history.
+
+PART 6 — TESTS
+
+Add tests for:
+
+CASE A
+detail is a string.
+Expected:
+string renders unchanged.
+
+CASE B
+detail is `{ from: "NEUTRAL", to: "FORMING_LONG" }`.
+Expected:
+readable transition text.
+
+CASE C
+detail is `{ state: "FORMING_LONG", direction: "LONG" }`.
+Expected:
+readable state and direction.
+
+CASE D
+detail contains `message`.
+Expected:
+message is preferred.
+
+CASE E
+detail is an array.
+Expected:
+safe readable formatting.
+
+CASE F
+detail is null.
+Expected:
+no `[object Object]`.
+
+CASE G
+unknown object shape.
+Expected:
+compact JSON fallback.
+
+CASE H
+circular object.
+Expected:
+safe fallback without crashing.
+
+CASE I
+large nested payload.
+Expected:
+output is truncated safely.
+
+CASE J
+timeline renders an affected THESIS_TRANSITION fixture.
+Expected:
+the page contains no `[object Object]`.
+
+PART 7 — VALIDATION
+
+Run:
+
+- focused timeline formatter tests
+- Main Brain timeline tests
+- Main Brain regression tests
+- TypeScript typecheck
+- production build
+- git diff --check
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Root cause
+2. Exact field that contained the object
+3. Example before/after rendering
+4. Files changed
+5. Tests added
+6. TypeScript result
+7. Build result
+8. Confirmation that event creation and trading logic were untouched
