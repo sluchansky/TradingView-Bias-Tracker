@@ -11178,12 +11178,31 @@ def _make_learning_ns(symbol, mode, setup_type, direction, session,
 def _ns_learning_key(base_key, mode):
     """Namespace a cache key as '{mode}::{base_key}'.
     Returns bare key when mode is absent/unrecognised so warm-up lookups
-    still hit the pre-namespace weights during the first recompute cycle."""
+    still hit the pre-namespace weights during the first recompute cycle.
+    4-part canonical keys (containing '|') are returned unchanged — they are
+    already self-contained and must not be double-wrapped."""
     if not base_key:
+        return base_key
+    if "|" in str(base_key):   # canonical 4-part key — no wrapping needed
         return base_key
     if mode and mode in _VALID_LEARNING_MODES:
         return "%s::%s" % (mode, base_key)
     return base_key
+
+
+def _build_canonical_learning_key(inst, mode, strategy, direction):
+    """Canonical 4-dimensional learning key: '{INST}|{MODE}|{STRATEGY}|{DIRECTION}'.
+
+    All fields upper-cased; None/blank → UNKNOWN. Pipe separator avoids
+    confusion with the legacy underscore format.
+
+    Example:  'MGC|SCALP|LIQUIDITY_SWEEP_REVERSAL|LONG'
+
+    This is the SINGLE authoritative key builder for all write and read paths.
+    No independent string concatenation should exist outside this helper.
+    """
+    def _n(v): return str(v or "UNKNOWN").strip().upper().replace(" ", "_")
+    return "%s|%s|%s|%s" % (_n(inst), _n(mode), _n(strategy), _n(direction))
 
 
 # ── Canonical learning-key helpers (Phase 7I.1) ──────────────────────────────
@@ -11212,8 +11231,12 @@ _KNOWN_DIRECTIONS_LS  = frozenset({"Long", "Short", "LONG", "SHORT"})
 # None = no safe deterministic equivalent (must NOT be applied).
 # Only add an entry here when the semantic equivalence is unambiguous.
 _LEGACY_STRATEGY_KEY_MAP: dict = {
-    "CHOCH": None,   # older breakout label — no current equivalent
-    "BOS":   None,   # older breakout label — no current equivalent
+    # CHOCH (Change of Character): structural reversal after a liquidity sweep.
+    # Semantically equivalent to LIQUIDITY_SWEEP_REVERSAL in the current engine —
+    # both trigger on a price reversal following a sweep of nearby liquidity/structure.
+    # Mapping is deterministic and per-instrument-guarded (MGC data never applies to MNQ).
+    "CHOCH": "LIQUIDITY_SWEEP_REVERSAL",
+    "BOS":   None,   # structure break — no safe deterministic current equivalent
     # Potential future entries (uncomment only when verified equivalent):
     # "SWEEP": "LIQUIDITY_SWEEP_REVERSAL",
     # "VWAP":  "VWAP_TREND_CONTINUATION",
@@ -11223,19 +11246,31 @@ _LEGACY_STRATEGY_KEY_MAP: dict = {
 def _canonical_learning_key(raw_key):
     """(canonical_key, lookup_status) for any stored or live strategy key.
 
-    canonical_key: a STRATEGY_PRIORITY identifier string, or None.
+    canonical_key: a STRATEGY_PRIORITY identifier string (or the full 4-part
+                   canonical key), or None.
     lookup_status: "CANONICAL" | "LEGACY_COMPAT" | "NOT_FOUND"
 
-    - Already a STRATEGY_PRIORITY key → ("key", "CANONICAL").
-    - Parses as legacy "{inst}_{mode}_{type(s)}_{direction}" and strategy-type
-      maps to a non-None canonical key → ("canonical", "LEGACY_COMPAT").
-    - Anything else, including unmappable types (CHOCH, BOS) → (None, "NOT_FOUND").
+    Recognition order:
+      1. 4-part pipe format '{INST}|{MODE}|{STRATEGY}|{DIR}'
+         — STRATEGY dimension must be a known STRATEGY_PRIORITY key → CANONICAL.
+      2. Bare STRATEGY_PRIORITY key → CANONICAL.
+      3. Legacy '{inst}_{mode}_{type(s)}_{direction}' with a mapped strategy_type
+         → ("mapped_canonical", "LEGACY_COMPAT").
+      4. Anything else → (None, "NOT_FOUND").
     """
-    if not raw_key:
+    if not raw_key or not str(raw_key).strip():
         return (None, "NOT_FOUND")
+    raw_key = str(raw_key).strip()
+    # 1. 4-part canonical key: {INST}|{MODE}|{STRATEGY}|{DIRECTION}
+    if "|" in raw_key:
+        pipe_parts = raw_key.split("|")
+        if len(pipe_parts) == 4 and pipe_parts[2] in STRATEGY_DEFS:
+            return (raw_key, "CANONICAL")
+        return (None, "NOT_FOUND")
+    # 2. Bare STRATEGY_PRIORITY key
     if raw_key in STRATEGY_DEFS:
         return (raw_key, "CANONICAL")
-    # Attempt legacy-format parse: {inst}_{mode}_{type(s)}_{direction}
+    # 3. Legacy format: {inst}_{mode}_{type(s)}_{direction}
     parts = raw_key.split("_")
     if len(parts) < 4:
         return (None, "NOT_FOUND")
@@ -11253,32 +11288,50 @@ def _canonical_learning_key(raw_key):
     return (None, "NOT_FOUND")
 
 
-def _strategy_weight_for(key, mode=None, instrument=None):
+def _strategy_weight_for(key, mode=None, instrument=None, direction=None):
     """(weight, sample_size, lookup_status) for a strategy key.
 
-    Lookup order:
-      1. CANONICAL  — "{mode}::{key}" then bare key (key must already be a
-                      STRATEGY_PRIORITY identifier or an exact cache match).
-      2. LEGACY_COMPAT — scan STRATEGY_WEIGHTS for stored legacy-format keys
-                      that map deterministically to this canonical key.
-                      Instrument guard: when `instrument` is provided, a legacy
-                      key whose stored instrument differs is skipped so a MGC
-                      weight is never applied to MNQ.
-      3. NOT_FOUND  — returns neutral (1.0, 0, "NOT_FOUND").
+    Lookup order — no fuzzy matching, no cross-instrument or cross-direction
+    fallback, no partial strategy-name matching:
+
+      1. CANONICAL 4-part key: '{INST}|{MODE}|{STRATEGY}|{DIR}'
+         — exact match in STRATEGY_WEIGHTS when all 4 dimensions are provided.
+      2. Mode-prefixed key: '{mode}::{key}' or bare key — backward compat with
+         existing recomputed weights (STRATEGY_PRIORITY keys or legacy keys that
+         were namespaced before the 4-part format was introduced).
+      3. LEGACY_COMPAT scan — scans stored '{mode}::{legacy_key}' entries whose
+         legacy strategy_type maps deterministically to the same canonical key.
+         Instrument guard: when `instrument` is provided, a legacy key whose
+         stored instrument differs is skipped so MGC data never applies to MNQ.
+      4. Valid STRATEGY_PRIORITY key with no data yet — returns (1.0, 0, "CANONICAL")
+         instead of NOT_FOUND. The key FORMAT is correct; there are simply no closed
+         trades for this strategy yet. Callers distinguish "no data" from "format
+         error" via the CANONICAL status + sample_count == 0.
+      5. NOT_FOUND — key format is genuinely unknown or unresolvable.
 
     Callers that only need (weight, sample) can unpack with:
         w, n, _ = _strategy_weight_for(key, mode)
     """
     if not key:
         return (1.0, 0, "NOT_FOUND")
-    ns = _ns_learning_key(key, mode)
     with LEARNING_LOCK:
+        # Step 1: 4-part canonical key lookup (new format, requires all 4 dims)
+        if instrument and direction and mode:
+            k4 = _build_canonical_learning_key(instrument, mode, key, direction)
+            if k4 in STRATEGY_WEIGHTS:
+                w = STRATEGY_WEIGHTS[k4]
+                n = LEARNING_SAMPLE_BY_KEY.get(k4, 0)
+                return (float(w), int(n), "CANONICAL")
+
+        # Step 2: mode-prefixed or bare key (backward compat with existing data)
+        ns = _ns_learning_key(key, mode)
         if ns in STRATEGY_WEIGHTS or key in STRATEGY_WEIGHTS:
             w = STRATEGY_WEIGHTS.get(ns, STRATEGY_WEIGHTS.get(key, 1.0))
             n = LEARNING_SAMPLE_BY_KEY.get(ns, LEARNING_SAMPLE_BY_KEY.get(key, 0))
             return (float(w), int(n), "CANONICAL")
-        # Legacy-compat scan: find a stored namespaced key whose legacy
-        # strategy_type maps to the same canonical key as `key`.
+
+        # Step 3: LEGACY_COMPAT scan — legacy '{mode}::{inst}_{mode}_{type}_{dir}'
+        # keys whose strategy_type maps deterministically to the active canonical key.
         if mode:
             mode_prefix = "%s::" % mode
             for stored_ns, stored_w in list(STRATEGY_WEIGHTS.items()):
@@ -11286,15 +11339,28 @@ def _strategy_weight_for(key, mode=None, instrument=None):
                     continue
                 raw = stored_ns[len(mode_prefix):]
                 canon, status = _canonical_learning_key(raw)
-                if status != "LEGACY_COMPAT" or canon != key:
+                if status != "LEGACY_COMPAT":
                     continue
-                # Instrument guard: legacy key has inst as first underscore token.
+                # canon is the STRATEGY_PRIORITY key the legacy type maps to.
+                # For 4-part stored keys the canon IS the full 4-part key — skip.
+                if isinstance(canon, str) and "|" in canon:
+                    continue
+                if canon != key:
+                    continue
+                # Instrument guard: never apply a MGC weight to MNQ (or vice versa).
                 if instrument:
                     legacy_parts = raw.split("_")
                     if legacy_parts and legacy_parts[0] != str(instrument).upper():
                         continue
                 n = LEARNING_SAMPLE_BY_KEY.get(stored_ns, 0)
                 return (float(stored_w), int(n), "LEGACY_COMPAT")
+
+        # Step 4: Valid STRATEGY_PRIORITY key, format correct, no data yet.
+        # Return CANONICAL (not NOT_FOUND) so callers can show INSUFFICIENT_SAMPLES
+        # rather than KEY_NOT_FOUND when the strategy simply has no closed trades yet.
+        if key in STRATEGY_DEFS:
+            return (1.0, 0, "CANONICAL")
+
     return (1.0, 0, "NOT_FOUND")
 
 
@@ -11925,7 +11991,8 @@ def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_st
         if not key or direction not in ("Long", "Short"):
             return None
         _inst = instrument_of(ticker) if ticker else None
-        weight, sample, _wlookup = _strategy_weight_for(key, mode=TRADING_MODE, instrument=_inst)
+        weight, sample, _wlookup = _strategy_weight_for(
+            key, mode=TRADING_MODE, instrument=_inst, direction=direction)
         if sample < LEARNING_MIN_SAMPLE:
             return None
         infl = {"Long":  {"weight": None, "strategy_key": None, "sample": 0},
@@ -11968,14 +12035,24 @@ def _update_learning_snapshot(result, ticker_override=None):
         _entry_reason = (" · ".join(_ereasons) if _ereasons
                          else ("%s %s" % (se.get("active_strategy") or "Setup",
                                           se.get("direction") or "")).strip())
+        _snap_active_key = se.get("active_key")      # STRATEGY_PRIORITY key
+        _snap_direction  = se.get("direction")        # "Long" or "Short"
+        # Build canonical 4-part key when all dimensions are known.
+        # Falls back to bare active_key so old callers that read strategy_key
+        # still get a usable value even when inst/direction are absent.
+        _snap_strategy_key = (
+            _build_canonical_learning_key(inst, TRADING_MODE, _snap_active_key, _snap_direction)
+            if inst and _snap_active_key and _snap_direction
+            else _snap_active_key
+        )
         snap = {
             "ts": now_utc().isoformat(),
             "price": result.get("current_price"),
             "strategy": se.get("active_strategy"),
-            "strategy_key": se.get("active_key"),
+            "strategy_key": _snap_strategy_key,   # canonical 4-part key (or bare fallback)
             "regime": se.get("market_regime"),
             "session": _learning_session_name(),
-            "direction": se.get("direction"),
+            "direction": _snap_direction,
             "confidence": se.get("base_confidence", se.get("confidence")),
             "quality": se.get("quality"),
             "edge_score": result.get("edge_score"),
@@ -12190,11 +12267,20 @@ def _record_strategy_trade(mt):
             trade_label = None
         # ── 8-field learning namespace key (enforces SWING/SCALP/MICRO_SCALP isolation) ──
         try:
-            _ctx_sk      = ctx.get("strategy_key") or ""
-            _sk_parts    = [p for p in _ctx_sk.split("_") if p]
-            # strip symbol prefix + direction (first 2 parts) → setup pattern remains
-            _setup_type  = "_".join(_sk_parts[2:]) if len(_sk_parts) > 2 else (_ctx_sk or "UNKNOWN")
-            _trigger_type = _sk_parts[-1] if _sk_parts else "UNKNOWN"
+            _ctx_sk = ctx.get("strategy_key") or ""
+            # 4-part canonical key (new format): extract strategy dimension for parsing.
+            # Legacy format strips inst+mode prefix; canonical format uses strategy directly.
+            if "|" in _ctx_sk:
+                _pipe_parts  = _ctx_sk.split("|")
+                _bare_sk     = _pipe_parts[2] if len(_pipe_parts) >= 3 else _ctx_sk
+                _sk_parts    = [p for p in _bare_sk.split("_") if p]
+                _setup_type  = _bare_sk or "UNKNOWN"
+                _trigger_type = _sk_parts[-1] if _sk_parts else "UNKNOWN"
+            else:
+                _sk_parts    = [p for p in _ctx_sk.split("_") if p]
+                # strip symbol prefix + direction (first 2 parts) → setup pattern remains
+                _setup_type  = "_".join(_sk_parts[2:]) if len(_sk_parts) > 2 else (_ctx_sk or "UNKNOWN")
+                _trigger_type = _sk_parts[-1] if _sk_parts else "UNKNOWN"
             _sym          = (mt.get("symbol") or mt.get("instrument") or "").upper()
             _sess_ns      = ctx.get("session") or _learning_session_name(opened_dt) or "UNKNOWN"
             _vol_ns       = ctx.get("volatility_type") or "UNKNOWN"
@@ -12722,6 +12808,8 @@ def _recompute_learning():
         for r in strat_rows:
             _r_mode = r.get("trading_mode") or "UNKNOWN"
             key     = r["strategy_key"]
+            # 4-part canonical keys (containing '|') are self-contained — do not
+            # wrap them with a mode prefix; _ns_learning_key handles this guard.
             ns_key  = _ns_learning_key(key, _r_mode)
             n   = int(r["n"] or 0)
             wr  = _f(r["win_rate"])
@@ -23179,7 +23267,8 @@ def build_coach_interface(result, instrument=None, mode=None):
             # No LEARNING_LOCK held here — _strategy_weight_for acquires it internally.
             if _active_key:
                 _dw, _dn, _lookup_status = _strategy_weight_for(
-                    _active_key, mode=_mode, instrument=inst)
+                    _active_key, mode=_mode, instrument=inst,
+                    direction=_se.get("direction"))
             else:
                 # No active strategy: find the highest-sample key for this mode
                 with LEARNING_LOCK:

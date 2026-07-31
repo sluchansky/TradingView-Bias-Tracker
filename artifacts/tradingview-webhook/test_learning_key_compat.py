@@ -104,13 +104,19 @@ finally:
     _app._LEGACY_STRATEGY_KEY_MAP.update(_orig_map)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Case C — legacy key with unmapped type (CHOCH) → NOT_FOUND
+# Case C — legacy keys: CHOCH now maps to LIQUIDITY_SWEEP_REVERSAL; BOS stays None
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n── Case C: _canonical_learning_key — CHOCH (unmapped) → NOT_FOUND ──")
-for _lkey in ["MGC_SCALP_CHOCH_Long", "MNQ_SCALP_CHOCH_Short",
-              "MES_SWING_BOS_Short", "MYM_SCALP_BOS_Long"]:
+print("\n── Case C: _canonical_learning_key — CHOCH → LEGACY_COMPAT; BOS → NOT_FOUND ──")
+# CHOCH is semantically equivalent to LIQUIDITY_SWEEP_REVERSAL — mapping is deterministic
+for _lkey in ["MGC_SCALP_CHOCH_Long", "MNQ_SCALP_CHOCH_Short"]:
     _c, _s = _app._canonical_learning_key(_lkey)
-    check(f"Case C: '{_lkey}' → NOT_FOUND",
+    check(f"Case C: '{_lkey}' → LEGACY_COMPAT (CHOCH mapped)",
+          _s == "LEGACY_COMPAT" and _c == "LIQUIDITY_SWEEP_REVERSAL",
+          f"status={_s}, canon={_c}")
+# BOS has no safe deterministic equivalent — must remain NOT_FOUND
+for _lkey in ["MES_SWING_BOS_Short", "MYM_SCALP_BOS_Long"]:
+    _c, _s = _app._canonical_learning_key(_lkey)
+    check(f"Case C: '{_lkey}' → NOT_FOUND (BOS still unmapped)",
           _s == "NOT_FOUND" and _c is None,
           f"status={_s}, canon={_c}")
 
@@ -149,15 +155,16 @@ check("Case F: lookup_status = CANONICAL",
 # ═══════════════════════════════════════════════════════════════════════════════
 # Case G — key absent from cache → NOT_FOUND + neutral
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n── Case G: _strategy_weight_for — key not in cache → NOT_FOUND, neutral ──")
+print("\n── Case G: _strategy_weight_for — valid STRATEGY_PRIORITY key, no data yet → CANONICAL ──")
 _reset_weights()   # empty cache
 _w, _n, _st = _app._strategy_weight_for("LIQUIDITY_SWEEP_REVERSAL", mode="SCALP")
-check("Case G: weight = 1.0 (neutral) when cache is empty",
+check("Case G: weight = 1.0 (neutral) when no data yet",
       _w == 1.0)
-check("Case G: sample_count = 0 when cache is empty",
+check("Case G: sample_count = 0 when no data yet",
       _n == 0)
-check("Case G: lookup_status = NOT_FOUND",
-      _st == "NOT_FOUND")
+check("Case G: lookup_status = CANONICAL (format valid; 0 trades, not a format error)",
+      _st == "CANONICAL",
+      f"status={_st}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Case H — legacy stored key with mapped type; lookup by canonical → LEGACY_COMPAT
@@ -191,8 +198,9 @@ try:
     check("Case I: different canonical key → weight stays neutral 1.0 (no cross-strategy)",
           _w == 1.0,
           f"weight={_w}, n={_n}, status={_st}")
-    check("Case I: lookup_status = NOT_FOUND (SWEEP weight not applied to VWAP strategy)",
-          _st == "NOT_FOUND")
+    check("Case I: lookup_status = CANONICAL (format valid; SWEEP data does not apply to VWAP)",
+          _st == "CANONICAL",
+          f"status={_st}")
 finally:
     _app._LEGACY_STRATEGY_KEY_MAP.pop("SWEEP", None)
 
@@ -209,8 +217,9 @@ try:
     check("Case J: MNQ lookup → MGC legacy weight NOT applied",
           _w == 1.0,
           f"weight={_w}, instrument=MNQ vs stored=MGC")
-    check("Case J: lookup_status = NOT_FOUND when instrument mismatches",
-          _st == "NOT_FOUND")
+    check("Case J: lookup_status = CANONICAL (format valid; MGC data does not apply to MNQ)",
+          _st == "CANONICAL",
+          f"status={_st}")
 finally:
     _app._LEGACY_STRATEGY_KEY_MAP.pop("SWEEP", None)
 
@@ -336,17 +345,18 @@ check("Case O-2: stored_strategy_key = 'LIQUIDITY_SWEEP_REVERSAL'",
       f"actual={_ld_o2.get('stored_strategy_key')!r}")
 
 # O-3: production legacy scenario — active_key = canonical, stored = legacy (CHOCH)
-#       → lookup_status = NOT_FOUND (CHOCH is unmapped, weight not applied)
+#       → CHOCH now maps to LIQUIDITY_SWEEP_REVERSAL → LEGACY_COMPAT, weight IS applied.
+#       n=25 >= 20 and weight=1.22 != 1.0 → weight_status = UPDATED.
 _reset_weights(("SCALP::MGC_SCALP_CHOCH_Long", 1.22, 25))
 _fake_result3 = {"strategy_engine": {"active_key": "LIQUIDITY_SWEEP_REVERSAL",
                                      "direction": "Long"}}
 _coach_o3 = _app.build_coach_interface(_fake_result3, instrument="MGC", mode="SCALP")
 _ld_o3 = _coach_o3.get("learning_diagnostics") or {}
-check("Case O-3: prod legacy CHOCH weight → NOT applied to LIQUIDITY_SWEEP_REVERSAL",
-      _ld_o3.get("lookup_status") == "NOT_FOUND",
+check("Case O-3: CHOCH LEGACY_COMPAT weight IS applied to LIQUIDITY_SWEEP_REVERSAL",
+      _ld_o3.get("lookup_status") == "LEGACY_COMPAT",
       f"actual={_ld_o3.get('lookup_status')!r}")
-check("Case O-3: weight_status = KEY_NOT_FOUND (sample exists but key can't be used)",
-      _ld_o3.get("weight_status") == "KEY_NOT_FOUND",
+check("Case O-3: weight_status = UPDATED (n=25 >= 20, weight=1.22 != 1.0 → adjustment active)",
+      _ld_o3.get("weight_status") == "UPDATED",
       f"actual={_ld_o3.get('weight_status')!r}")
 
 # ── Summary ───────────────────────────────────────────────────────────────────
