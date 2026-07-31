@@ -9177,6 +9177,21 @@ RIGHT_BRAIN_MIN_PF     = float(os.getenv("RIGHT_BRAIN_MIN_PF", "1.0"))
 # Default OFF → key never added → goldens byte-identical.
 LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED = os.getenv(
     "LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED", "0") == "1"
+# ── Left Brain stale-fallback constants ──────────────────────────────────────
+# Thesis is considered stale after this many seconds without a bar-close update.
+# 600 s = 10 min; must match _STALE_THESIS_SEC in _mb_left_brain (they are the
+# same concept; the module-level name is referenced by both the scheduler and the
+# diagnosis block so they never drift apart).
+LB_STALE_THESIS_SEC            = int(os.environ.get("LB_STALE_THESIS_SEC",            "600"))
+# Minimum seconds between fallback attempts for the same instrument (rate limit).
+# 5 min is half the stale window — long enough to avoid thrashing, short enough
+# to get a refresh within two scheduler cycles once MGC goes stale overnight.
+LB_STALE_FALLBACK_INTERVAL_SEC = int(os.environ.get("LB_STALE_FALLBACK_INTERVAL_SEC", "300"))
+# Minimum cached bar-close observations needed before a fallback attempt is worthwhile.
+# Fewer observations → unreliable thesis → explicit COLLECTING_DATA instead.
+LB_MIN_OBS_FOR_FALLBACK        = int(os.environ.get("LB_MIN_OBS_FOR_FALLBACK",        "5"))
+# Self-rescheduling period for the fallback scheduler loop (seconds).
+LB_FALLBACK_SCAN_PERIOD_SEC    = int(os.environ.get("LB_FALLBACK_SCAN_PERIOD_SEC",    "120"))
 _LEFT_BRAIN_MI_BY_INST:     dict = {}  # inst → latest MI block (set by _databento_bar_scan)
 _LB_MI_PERF_BY_INST:        dict = {}  # inst → timing perf stats (shadow validation Step 2)
 _LB_MI_HISTORY_BY_INST:     dict = {}  # inst → deque of classification records (Steps 6/7)
@@ -9185,6 +9200,13 @@ _LB_MARKET_MEMORY_BY_INST:  dict = {}  # inst → deque(maxlen=200) of significa
 _LB_THESIS_BY_INST:         dict = {}  # inst → current dynamic thesis dict (Phase 2)
 _LB_THESIS_OBS_BY_INST:     dict = {}  # inst → deque(maxlen=5000) per-bar audit snapshots
 _LB_THESIS_OBS_LAST_BAR:    dict = {}  # inst → last appended bar-ts (minute precision, dedup guard)
+# ── Left Brain stale-fallback runtime state ───────────────────────────────────
+_LB_CALC_TRIGGER:            dict = {}  # inst → "BAR_CLOSE" | "STALE_FALLBACK" | "NONE"
+_LB_CALC_LAST_ATTEMPT_AT:    dict = {}  # inst → ISO string of most-recent thesis calc attempt
+_LB_CALC_LAST_SUCCESS_AT:    dict = {}  # inst → ISO string of last successful thesis calc
+_LB_FALLBACK_EPOCH:          dict = {}  # inst → monotonic epoch of last fallback attempt (rate limit)
+_LB_FALLBACK_IN_FLIGHT: set       = set()   # instruments currently computing a fallback
+_LB_FALLBACK_LOCK             = threading.Lock()  # protects _LB_FALLBACK_IN_FLIGHT + rate-limit reads
 _RIGHT_BRAIN_STATE: dict = {
     "mode":          "training",  # "training" | "live_eligible"
     "profit_factor": 0.0,
@@ -23582,8 +23604,8 @@ def _mb_left_brain(inst, result, errors):
     #   STALE_THESIS_SEC  = 600  (10 min; 2× the 5-min VWAP freshness window)
     #   MIN_OBS_FOR_READY = 5   (5 bar-close observations for directional reliability)
     # NEVER raises — fail-open always produces a diagnosis dict.
-    _STALE_THESIS_SEC   = 600
-    _MIN_OBS_FOR_READY  = 5
+    # Use module-level constants so the scheduler and diagnosis always agree
+    # on what "stale" and "sufficient observations" mean — no divergence risk.
     diagnosis: dict = {}
     try:
         _source_sym = inst + ".c.0"
@@ -23601,28 +23623,64 @@ def _mb_left_brain(inst, result, errors):
         if thesis_out is None:
             _diag_status = "NO_DATA"
             _blocked     = "NO_OBSERVATIONS"
-        elif _thesis_age is not None and _thesis_age > _STALE_THESIS_SEC:
+        elif _thesis_age is not None and _thesis_age > LB_STALE_THESIS_SEC:
             _diag_status = "STALE"
             _blocked     = f"STALE_THESIS_{int(_thesis_age)}s"
-        elif obs_count < _MIN_OBS_FOR_READY:
+        elif obs_count < LB_MIN_OBS_FOR_FALLBACK:
             _diag_status = "COLLECTING_DATA"
-            _blocked     = f"INSUFFICIENT_OBSERVATIONS_{obs_count}_of_{_MIN_OBS_FOR_READY}"
+            _blocked     = f"INSUFFICIENT_OBSERVATIONS_{obs_count}_of_{LB_MIN_OBS_FOR_FALLBACK}"
         else:
             _diag_status = "AVAILABLE"
             _blocked     = None
 
+        # ── Fallback eligibility (display-only, no side effects) ─────────────────
+        _fb_eligible  = False
+        _fb_blocked_r = None
+        try:
+            if not LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+                _fb_blocked_r = "FEATURE_DISABLED"
+            elif not market_session_status().get("open", True):
+                _fb_blocked_r = "MARKET_CLOSED"
+            else:
+                with _LB_FALLBACK_LOCK:
+                    _fb_inflight = inst in _LB_FALLBACK_IN_FLIGHT
+                if _fb_inflight:
+                    _fb_blocked_r = "IN_FLIGHT"
+                elif obs_count < LB_MIN_OBS_FOR_FALLBACK:
+                    _fb_blocked_r = "COLLECTING_DATA"
+                elif _diag_status not in ("STALE", "NO_DATA"):
+                    _fb_blocked_r = "THESIS_FRESH"
+                else:
+                    _last_fb_ep  = _LB_FALLBACK_EPOCH.get(inst, 0.0)
+                    _fb_elapsed  = time.monotonic() - _last_fb_ep
+                    if _fb_elapsed < LB_STALE_FALLBACK_INTERVAL_SEC:
+                        _fb_blocked_r = (
+                            f"RATE_LIMITED_{int(LB_STALE_FALLBACK_INTERVAL_SEC - _fb_elapsed)}s")
+                    else:
+                        _fb_eligible = True
+        except Exception:
+            _fb_blocked_r = "UNKNOWN"
+
         diagnosis = {
-            "instrument":          inst,
-            "status":              _diag_status,
-            "canonical_symbol":    inst,
-            "source_symbol":       _source_sym,
-            "observation_count":   obs_count,
-            "databento_bars":      _db_bars,
-            "last_calculation_at": _calc_at,
-            "thesis_age_seconds":  _thesis_age,
-            "blocked_reason":      _blocked,
-            "error_code":          None if available else "LEFT_BRAIN_EXCEPTION",
-            "source":              "left_brain_store",
+            "instrument":              inst,
+            "status":                  _diag_status,
+            "canonical_symbol":        inst,
+            "source_symbol":           _source_sym,
+            "observation_count":       obs_count,
+            "databento_bars":          _db_bars,
+            "last_calculation_at":     _calc_at,
+            "thesis_age_seconds":      _thesis_age,
+            "blocked_reason":          _blocked,
+            "error_code":              None if available else "LEFT_BRAIN_EXCEPTION",
+            "source":                  "left_brain_store",
+            # ── Part 7 diagnostics: calculation audit trail + fallback eligibility
+            "calculation_trigger":     _LB_CALC_TRIGGER.get(inst, "NONE"),
+            "last_attempt_at":         _LB_CALC_LAST_ATTEMPT_AT.get(inst),
+            "last_success_at":         _LB_CALC_LAST_SUCCESS_AT.get(inst),
+            "fallback_eligible":       _fb_eligible,
+            "fallback_blocked_reason": _fb_blocked_r,
+            "observations_available":  obs_count,
+            "observations_required":   LB_MIN_OBS_FOR_FALLBACK,
         }
     except Exception as _de:
         logger.debug("_mb_left_brain diagnosis: %s", _de)
@@ -27495,6 +27553,11 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                         _LB_THESIS_BY_INST[inst] = _lbp2_out["thesis"]
                         for _lbp2_evt in (_lbp2_out.get("new_events") or []):
                             _LB_MARKET_MEMORY_BY_INST[inst].append(_lbp2_evt)
+                        # Record BAR_CLOSE trigger + timestamps for fallback diagnostics.
+                        _ts_bar_str = datetime.now(timezone.utc).isoformat()
+                        _LB_CALC_TRIGGER[inst]         = "BAR_CLOSE"
+                        _LB_CALC_LAST_ATTEMPT_AT[inst] = _ts_bar_str
+                        _LB_CALC_LAST_SUCCESS_AT[inst] = _ts_bar_str
                         # ── Observation log (bounded maxlen=5000, no DB writes) ────
                         if inst not in _LB_THESIS_OBS_BY_INST:
                             _LB_THESIS_OBS_BY_INST[inst] = deque(maxlen=5000)
@@ -27571,6 +27634,234 @@ def _databento_bar_scan(inst: str, price: float) -> None:
         except Exception as exc:
             logger.debug("Databento bar scan (%s): %s", inst, exc)
     threading.Thread(target=_scan, name=f"db-scan-{inst}", daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Left Brain stale-fallback scanner (Parts 2–5 of spec: Task 55)
+# ---------------------------------------------------------------------------
+# Triggered by a self-rescheduling timer when the normal bar-close path has not
+# produced a fresh LB thesis for a long time (e.g. MGC overnight with ~1 bar).
+#
+# STRICT SCOPE — this function:
+#   ✓ reuses existing cached observations (no synthetic ticks or bars)
+#   ✓ calls the same MI + thesis pipeline as the bar-close path
+#   ✓ honours the observation dedup guard (_LB_THESIS_OBS_LAST_BAR)
+#   ✗ does NOT modify Databento subscriptions or bar construction
+#   ✗ does NOT change thesis formulas, thresholds, scoring, or execution
+#   ✗ does NOT create synthetic bars or fabricate market data
+# ---------------------------------------------------------------------------
+
+def _lb_stale_fallback_scan(inst: str) -> None:
+    """Run one MI + thesis recompute for `inst` using existing cached observations.
+
+    Called in a daemon thread by `_lb_stale_fallback_loop` when:
+      · thesis is stale (age > LB_STALE_THESIS_SEC)
+      · enough cached observations exist (≥ LB_MIN_OBS_FOR_FALLBACK)
+      · market session is open
+      · rate limit has elapsed (≥ LB_STALE_FALLBACK_INTERVAL_SEC since last attempt)
+      · no calculation is already in-flight for this instrument
+
+    The in-flight guard is released in the `finally` block — always.
+    Timestamps and trigger are recorded whether the calculation succeeds or not.
+    """
+    _attempt_ts = datetime.now(timezone.utc).isoformat()
+    _LB_CALC_LAST_ATTEMPT_AT[inst] = _attempt_ts
+    _LB_CALC_TRIGGER[inst]         = "STALE_FALLBACK"
+    try:
+        if not LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+            return   # flag was toggled off mid-flight
+        from left_brain_market_intelligence import (   # noqa: PLC0415
+            compute_left_brain_mi, compute_left_brain_thesis,
+        )
+        # Use full_analysis to get the current cached market state.
+        # This is identical to what the bar-close path does and does not
+        # fabricate any market data — it reads whatever is already in cache.
+        a = full_analysis(ticker_override=inst)
+
+        _lbmi_prev_mi = _LEFT_BRAIN_MI_BY_INST.get(inst)
+        _lbmi_result  = compute_left_brain_mi(inst, a)
+        _LEFT_BRAIN_MI_BY_INST[inst] = _lbmi_result
+
+        if inst not in _LB_MARKET_MEMORY_BY_INST:
+            _LB_MARKET_MEMORY_BY_INST[inst] = deque(maxlen=200)
+        _lbp2_mem = list(_LB_MARKET_MEMORY_BY_INST[inst])
+        _lbp2_out = compute_left_brain_thesis(
+            inst,
+            _lbmi_result,
+            _lbmi_prev_mi,
+            _LB_THESIS_BY_INST.get(inst),
+            _lbp2_mem,
+        )
+        _LB_THESIS_BY_INST[inst] = _lbp2_out["thesis"]
+        for _evt in (_lbp2_out.get("new_events") or []):
+            _LB_MARKET_MEMORY_BY_INST[inst].append(_evt)
+
+        # Observation log — identical dedup guard as the bar-close path (minute precision).
+        # If the MI computed_at timestamp falls in the same minute as the last recorded
+        # bar, we skip the write so we never duplicate an observation row.
+        if inst not in _LB_THESIS_OBS_BY_INST:
+            _LB_THESIS_OBS_BY_INST[inst] = deque(maxlen=5000)
+        _obs_mi_ts   = (_lbmi_result or {}).get("computed_at") or ""
+        _obs_bar_key = _obs_mi_ts[:16]   # minute-precision dedup key
+        if _obs_bar_key and _LB_THESIS_OBS_LAST_BAR.get(inst) != _obs_bar_key:
+            _LB_THESIS_OBS_LAST_BAR[inst] = _obs_bar_key
+            _obs_th   = _lbp2_out["thesis"] or {}
+            _obs_do   = _lbmi_result.get("directional_outlook") or {}
+            _obs_pb   = (_obs_th.get("playbooks") or [{}])[0]
+            _obs_stab = _obs_th.get("stability") or {}
+            _LB_THESIS_OBS_BY_INST[inst].append({
+                "ts":                         datetime.now(timezone.utc).isoformat(),
+                "instrument":                 inst,
+                "direction":                  _obs_th.get("direction"),
+                "strength":                   _obs_th.get("strength"),
+                "momentum":                   _obs_th.get("momentum"),
+                "established_at":             _obs_th.get("established_at"),
+                "last_updated_at":            _obs_th.get("last_updated_at"),
+                "market_state":               _lbmi_result.get("market_state"),
+                "session_character":          _lbmi_result.get("session_character"),
+                "session_phase":              _lbmi_result.get("session_phase"),
+                "auction_control":            _lbmi_result.get("auction_control"),
+                "bullish_pct":                _obs_do.get("long"),
+                "bearish_pct":                _obs_do.get("short"),
+                "neutral_pct":                _obs_do.get("neutral"),
+                "data_confidence":            _lbmi_result.get("data_confidence"),
+                "top_playbook":               _obs_pb.get("name"),
+                "top_playbook_fit_score":     _obs_pb.get("fit_score"),
+                "rapid_flip_warning":         _obs_stab.get("rapid_flip_warning"),
+                "time_in_current_thesis_min": _obs_stab.get("time_in_current_thesis_min"),
+                "number_of_transitions":      _obs_stab.get("number_of_transitions"),
+                # VWAP fields: not re-fetched in the fallback path; bar-close path
+                # always has fresher VWAP data so no info loss.
+                "vwap_source":                None,
+                "vwap_age_ms":                None,
+                "mi_input_ts":                _obs_mi_ts,
+                "trigger":                    "STALE_FALLBACK",   # audit trail
+            })
+
+        _LB_CALC_LAST_SUCCESS_AT[inst] = datetime.now(timezone.utc).isoformat()
+        logger.info(
+            "LB stale fallback (%s): thesis refreshed — dir=%s strength=%s",
+            inst,
+            (_lbp2_out.get("thesis") or {}).get("direction"),
+            (_lbp2_out.get("thesis") or {}).get("strength"),
+        )
+    except Exception as _fb_exc:
+        logger.debug("LB stale fallback scan (%s): %s", inst, _fb_exc)
+    finally:
+        with _LB_FALLBACK_LOCK:
+            _LB_FALLBACK_IN_FLIGHT.discard(inst)
+
+
+def _lb_stale_fallback_loop() -> None:
+    """Scheduler: check all enabled instruments and trigger a fallback thesis
+    recompute for any whose thesis is stale and conditions are met.
+
+    Runs every LB_FALLBACK_SCAN_PERIOD_SEC seconds (default 120 s) via a
+    self-rescheduling threading.Timer — never blocks the Flask worker.
+
+    The timer always reschedules in the `finally` block so a crash in one
+    cycle does not silence all future cycles (same pattern as other loops).
+
+    Conditions required to trigger a fallback for an instrument:
+      1. LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED=1
+      2. Market session is open (respects CME maintenance, weekends, holidays)
+      3. No calculation already in-flight for this instrument
+      4. LB_STALE_FALLBACK_INTERVAL_SEC elapsed since last fallback attempt
+      5. Thesis is stale (age > LB_STALE_THESIS_SEC) or absent
+      6. Enough cached observations (≥ LB_MIN_OBS_FOR_FALLBACK)
+
+    When observations are insufficient the loop logs COLLECTING_DATA and
+    continues — the bar-close path must accumulate observations first.
+    The rate-limit epoch is NOT advanced in that case so the next cycle
+    can re-check once more observations arrive.
+    """
+    try:
+        if not LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+            return   # whole subsystem off — still reschedules below
+
+        sess = market_session_status()
+        if not sess.get("open", True):
+            # Market is in maintenance, closed, or weekend — skip this cycle
+            # completely to avoid recomputing from unchanged overnight data.
+            logger.debug(
+                "LB stale fallback loop: market %s (%s) — skipping cycle",
+                sess.get("status"), sess.get("reason", ""))
+            return
+
+        _now_epoch = time.monotonic()
+
+        for inst in enabled_instruments():
+            try:
+                # --- Guard 1: in-flight (no overlapping calculation per inst) ---
+                with _LB_FALLBACK_LOCK:
+                    if inst in _LB_FALLBACK_IN_FLIGHT:
+                        continue
+
+                # --- Guard 2: rate limit ---
+                _last_epoch = _LB_FALLBACK_EPOCH.get(inst, 0.0)
+                if _now_epoch - _last_epoch < LB_STALE_FALLBACK_INTERVAL_SEC:
+                    continue
+
+                # --- Guard 3: thesis freshness ---
+                _raw_thesis    = _LB_THESIS_BY_INST.get(inst)
+                _lu            = ((_raw_thesis or {}).get("last_updated_at")
+                                  or (_raw_thesis or {}).get("lastUpdatedAt"))
+                _thesis_age_s  = None
+                if _lu:
+                    try:
+                        _lu_dt = datetime.fromisoformat(_lu) if isinstance(_lu, str) else _lu
+                        if _lu_dt.tzinfo is None:
+                            _lu_dt = _lu_dt.replace(tzinfo=timezone.utc)
+                        _thesis_age_s = (datetime.now(timezone.utc) - _lu_dt).total_seconds()
+                    except Exception:
+                        pass
+
+                _stale = (_raw_thesis is None) or (
+                    _thesis_age_s is not None and _thesis_age_s > LB_STALE_THESIS_SEC)
+                if not _stale:
+                    continue   # thesis is fresh — bar-close path is keeping up
+
+                # --- Guard 4: observation count ---
+                _obs_count = len(list(_LB_THESIS_OBS_BY_INST.get(inst) or []))
+                if _obs_count < LB_MIN_OBS_FOR_FALLBACK:
+                    # Explicit COLLECTING_DATA: not enough history for a reliable
+                    # thesis.  Do NOT advance the rate-limit epoch so the next
+                    # cycle can retry once more observations arrive.
+                    logger.debug(
+                        "LB stale fallback (%s): COLLECTING_DATA (%d/%d obs) — waiting "
+                        "for more bar-close data before attempting fallback",
+                        inst, _obs_count, LB_MIN_OBS_FOR_FALLBACK)
+                    continue
+
+                # --- All conditions met — arm in-flight, advance rate limit, dispatch ---
+                with _LB_FALLBACK_LOCK:
+                    _LB_FALLBACK_IN_FLIGHT.add(inst)
+                _LB_FALLBACK_EPOCH[inst] = _now_epoch
+
+                logger.info(
+                    "LB stale fallback (%s): triggering recompute "
+                    "(age=%.0fs obs=%d rate_limit=%ds)",
+                    inst,
+                    _thesis_age_s if _thesis_age_s is not None else -1,
+                    _obs_count,
+                    LB_STALE_FALLBACK_INTERVAL_SEC,
+                )
+                threading.Thread(
+                    target=_lb_stale_fallback_scan,
+                    args=(inst,),
+                    name=f"lb-fallback-{inst}",
+                    daemon=True,
+                ).start()
+
+            except Exception as _inst_exc:
+                logger.debug("LB stale fallback loop (%s): %s", inst, _inst_exc)
+
+    except Exception as _outer_exc:
+        logger.debug("LB stale fallback loop outer: %s", _outer_exc)
+
+    finally:
+        # Always reschedule — a crash in one cycle must not silence future ones.
+        threading.Timer(LB_FALLBACK_SCAN_PERIOD_SEC, _lb_stale_fallback_loop).start()
 
 
 def _right_brain_pf() -> float:
@@ -68537,6 +68828,13 @@ if __name__ == "__main__":
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()  # re-post READY card (mode-aware cadence)
         threading.Timer(30, _right_brain_loop).start()  # Right Brain periodic fallback (30s delay so Databento warms up)
         threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()  # open-position unified-thesis updates → journal channel (DISPLAY/NOTIFY only)
+    if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
+        # Stale-fallback scanner: refreshes LB thesis during low-tick periods
+        # (e.g. MGC overnight).  First cycle delayed by one full period so the
+        # server can warm up before triggering any recomputes.  Inert when the
+        # MI flag is OFF — but the loop reschedules itself only when the flag is
+        # ON so there is no timer accumulation in flag-OFF mode.
+        threading.Timer(LB_FALLBACK_SCAN_PERIOD_SEC, _lb_stale_fallback_loop).start()
         _schedule_eod()                               # schedule daily EOD summary
         _schedule_weekly_report()                     # schedule weekly report (Fri after close)
     else:
