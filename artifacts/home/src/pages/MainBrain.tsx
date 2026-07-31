@@ -749,10 +749,16 @@ const ScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 // ── Cleanest Trade Available ──────────────────────────────────────────────────
 
 type CleanestScanResult = {
-  candidate: CleanestCandidate | null;
-  error:     string | null;
-  allInputs: RankInput[];
-  scannedAt: number;
+  candidate:     CleanestCandidate | null;
+  error:         string | null;
+  allInputs:     RankInput[];
+  scannedAt:     number;       // ms since epoch when scan completed
+  scanStartedAt: number;       // ms since epoch when scan was initiated
+  /** True when one or more of the 8 status requests failed. */
+  isPartial: boolean;
+  succeeded: number;           // how many of total responded OK
+  total:     number;           // total attempted (normally 8)
+  failed:    Array<{ instrument: string; mode: string }>;
 };
 
 // ── Cleanest Trade Modal ──────────────────────────────────────────────────────
@@ -988,12 +994,60 @@ const CleanestTradeModal: React.FC<{
             </>
           )}
 
-          {/* ─ Scan metadata ─ */}
-          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
-            fontSize:9, color:T.txtMuted, paddingTop:4, borderTop:`1px solid ${T.border}` }}>
-            <span>Scanned {age}</span>
-            {freshness && <span>Data as of: {freshness}</span>}
-          </div>
+          {/* ─ Partial scan banner ─ */}
+          {scanResult?.isPartial && (
+            <div style={{ background:`${T.amber}12`, border:`1px solid ${T.amber}44`, borderRadius:8,
+              padding:'10px 14px', fontSize:11 }}>
+              <div style={{ fontWeight:700, color:T.amber, letterSpacing:'0.06em', marginBottom:4 }}>
+                ⚠ PARTIAL SCAN — {scanResult.succeeded} of {scanResult.total} markets evaluated
+              </div>
+              <div style={{ color:T.txtSec, fontSize:10 }}>
+                {scanResult.failed.map(f => `${f.instrument} ${f.mode}`).join(' · ')} unavailable
+              </div>
+              <div style={{ color:T.txtMuted, fontSize:9.5, marginTop:4 }}>
+                Ranking is based on the {scanResult.succeeded} responding candidates only.
+                Re-scan when connectivity improves to evaluate the full universe.
+              </div>
+            </div>
+          )}
+
+          {/* ─ Scan metadata / freshness ─ */}
+          {(() => {
+            const nowMs = Date.now();
+            const candidateAge = (cand?.record?.generated_at)
+              ? Math.round((nowMs - new Date(cand.record.generated_at).getTime()) / 1000)
+              : null;
+            const isStale  = candidateAge != null && candidateAge > 30;
+            const scanComplete = scanResult?.isPartial === false ? 'COMPLETE' : scanResult?.isPartial ? 'PARTIAL' : '—';
+            const scanDuration = scanResult
+              ? `${Math.round(scanResult.scannedAt - scanResult.scanStartedAt)}ms`
+              : '—';
+            return (
+              <div style={{ borderTop:`1px solid ${T.border}`, paddingTop:10, display:'flex', flexDirection:'column', gap:4 }}>
+                <div style={{ display:'flex', justifyContent:'space-between', fontSize:9, color:T.txtMuted }}>
+                  <span>Scan: <strong style={{ color:T.txtSec }}>{scanComplete}</strong></span>
+                  <span>Duration: {scanDuration}</span>
+                  <span>Completed {age}</span>
+                </div>
+                {cand && (
+                  <div style={{ display:'flex', justifyContent:'space-between', fontSize:9 }}>
+                    <span style={{ color:T.txtMuted }}>
+                      Data snapshot:{' '}
+                      {freshness
+                        ? <span style={{ color: isStale ? T.amber : T.txtSec }}>{freshness}</span>
+                        : <span style={{ color:T.txtMuted }}>—</span>
+                      }
+                    </span>
+                    {candidateAge != null && (
+                      <span style={{ color: isStale ? T.amber : T.txtMuted, fontWeight: isStale ? 700 : 400 }}>
+                        {isStale ? '⚠ STALE' : `${candidateAge}s old`}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       </div>
     </div>
@@ -1061,6 +1115,11 @@ const CleanestTradeButton: React.FC<{
         ✓ {cand.instrument} {cand.direction}
         {stratLabel ? ` · ${stratLabel}` : ''}
         {' · '}{Math.round(cand.edge)}/110
+        {scanResult.isPartial && (
+          <span style={{ color:T.amber, marginLeft:4 }}>
+            · PARTIAL ({scanResult.succeeded}/{scanResult.total} evaluated)
+          </span>
+        )}
       </span>
     );
   } else {
@@ -1071,6 +1130,11 @@ const CleanestTradeButton: React.FC<{
     supportEl = (
       <span style={{ fontSize:9.5, color:T.amber, letterSpacing:'0.04em' }}>
         ⏳ POTENTIAL — {cand.instrument} {cand.direction} · {Math.round(cand.edge)}/110
+        {scanResult.isPartial && (
+          <span style={{ marginLeft:4 }}>
+            · PARTIAL ({scanResult.succeeded}/{scanResult.total} evaluated)
+          </span>
+        )}
       </span>
     );
   }
@@ -1752,37 +1816,79 @@ export default function MainBrain() {
   const isError   = (fetchState === 'error' || isAuthFail) && !payload;
 
   // ── Cleanest Trade state ──────────────────────────────────────────────────
+  // scanGenRef is a generation counter incremented on every scan attempt.
+  // After each async Promise.all() completes, the handler checks whether its
+  // captured generation still matches the current value — if a newer scan was
+  // started (e.g. a second click before the first settled), the stale result
+  // is silently discarded instead of overwriting the newer one.
+  const scanGenRef = useRef(0);
   const [cleanestOpen,     setCleanestOpen]     = useState(false);
   const [cleanestScanning, setCleanestScanning] = useState(false);
   const [cleanestScan,     setCleanestScan]     = useState<CleanestScanResult | null>(null);
 
   const handleScanCleanest = useCallback(async () => {
+    // Guard: while a scan is already in flight, ignore additional clicks.
     if (cleanestScanning) return;
+    // Increment the generation counter and capture this scan's generation id.
+    const thisGen = ++scanGenRef.current;
     setCleanestScanning(true);
+    const scanStartedAt = Date.now();
     try {
       const requests = SCAN_INSTRUMENTS.flatMap(inst =>
         SCAN_MODES.map(mode => ({ instrument: inst, mode }))
       );
       const resolved = await Promise.all(
-        requests.map(async ({ instrument, mode }) => {
+        requests.map(async ({ instrument, mode }): Promise<RankInput> => {
           try {
             const r = await fetch(
               `/api/status?ticker=${encodeURIComponent(instrument)}&mode=${encodeURIComponent(mode)}`,
               { credentials: 'include', headers: getAuthHeader() }
             );
-            if (!r.ok) return { instrument, mode, record: null };
-            const data = await r.json();
-            return { instrument, mode, record: data as StatusRecord };
+            const respondedAt = Date.now();
+            if (!r.ok) return {
+              instrument, mode, record: null,
+              meta: { instrument, mode, ok: false, respondedAt,
+                      responseAgeMs: respondedAt - scanStartedAt, generated_at: null },
+            };
+            const data = await r.json() as StatusRecord;
+            return {
+              instrument, mode, record: data,
+              meta: { instrument, mode, ok: true, respondedAt,
+                      responseAgeMs: respondedAt - scanStartedAt,
+                      generated_at: (data as Record<string, unknown>).generated_at as string ?? null },
+            };
           } catch {
-            return { instrument, mode, record: null };
+            const respondedAt = Date.now();
+            return {
+              instrument, mode, record: null,
+              meta: { instrument, mode, ok: false, respondedAt,
+                      responseAgeMs: respondedAt - scanStartedAt, generated_at: null },
+            };
           }
         })
-      ) as RankInput[];
+      );
+      // Generation guard: if a newer scan was initiated while this one was
+      // in flight, discard this result rather than overwriting the newer one.
+      if (thisGen !== scanGenRef.current) return;
+
+      const failed    = resolved.filter(r => r.record === null)
+                                .map(r => ({ instrument: r.instrument as string, mode: r.mode as string }));
+      const succeeded = resolved.filter(r => r.record !== null).length;
       const candidate = rankCandidates(resolved);
-      setCleanestScan({ candidate, error: null, allInputs: resolved, scannedAt: Date.now() });
+
+      setCleanestScan({
+        candidate, error: null, allInputs: resolved,
+        scannedAt: Date.now(), scanStartedAt,
+        isPartial: failed.length > 0, succeeded, total: resolved.length, failed,
+      });
       setCleanestOpen(true);
     } catch {
-      setCleanestScan({ candidate: null, error: 'Scan failed — check connection', allInputs: [], scannedAt: Date.now() });
+      if (thisGen !== scanGenRef.current) return;
+      setCleanestScan({
+        candidate: null, error: 'Scan failed — check connection', allInputs: [],
+        scannedAt: Date.now(), scanStartedAt,
+        isPartial: false, succeeded: 0, total: 8, failed: [],
+      });
       setCleanestOpen(true);
     } finally {
       setCleanestScanning(false);

@@ -60,10 +60,22 @@ export interface StatusRecord {
   strict_missing?:     string[];
 }
 
+/** Per-response metadata captured during a live scan (Part 3 — mixed-time evidence). */
+export interface ScanResponseMeta {
+  instrument:    ScanInstrument;
+  mode:          ScanMode;
+  ok:            boolean;             // true = HTTP 200 + valid JSON
+  respondedAt:   number;              // ms since epoch when the response completed
+  responseAgeMs: number;              // ms from scan start to this response
+  generated_at:  string | null;       // server-side snapshot timestamp (if present)
+}
+
 export interface RankInput {
   instrument: ScanInstrument;
   mode:       ScanMode;
   record:     StatusRecord | null;
+  /** Optional metadata from a live fetch — absent in pure unit-test fixtures. */
+  meta?:      ScanResponseMeta;
 }
 
 export interface CleanestCandidate {
