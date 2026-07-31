@@ -609,7 +609,7 @@ DATA_STALE_THRESHOLD_MINS   = int(os.environ.get("DATA_STALE_THRESHOLD_MINS", "1
 # opposite side's structure credit is nulled so the dominant direction flips on the
 # reversal instead of clinging to stale +20 credit. Default OFF => byte-identical to
 # today (goldens green); SCALP-only (SWING never affected). Env kill switch =0.
-STRUCTURE_REVERSAL_DEMOTE_ENABLED = _env_flag_on("STRUCTURE_REVERSAL_DEMOTE_ENABLED", default_on=False)
+STRUCTURE_REVERSAL_DEMOTE_ENABLED = _env_flag_on("STRUCTURE_REVERSAL_DEMOTE_ENABLED", default_on=True)
 # Phase 5B — Decision Trace shadow (DISPLAY/DIAGNOSTICS-ONLY, default OFF).
 # Pure read-only adapter: maps the FINAL assembled full_analysis() result into a
 # compact structured snapshot showing WHAT the system decided and WHY. Exposed
@@ -7072,7 +7072,17 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     #    gate_debug all consistently read the reversal. This ONLY removes eligibility
     #    from the stale side (fail-safe: never adds to the fresh side, never creates a
     #    trade). SCALP-only (not VOL_HARD_GATE) so SWING is byte-identical; env kill
-    #    switch STRUCTURE_REVERSAL_DEMOTE_ENABLED=0 (default OFF) => block skipped.
+    #    switch STRUCTURE_REVERSAL_DEMOTE_ENABLED=0 (default ON) => block skipped.
+    #
+    #    Pre-demote snapshot: capture both sides' latest structure timestamps BEFORE
+    #    the demote may null them. Used ONLY by _build_opp_struct to produce the
+    #    OVERRIDDEN / EXPIRED diagnostic states. Never used for scoring or gating.
+    _raw_dem_struct_ts = max(
+        [t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None
+    )
+    _raw_sup_struct_ts = max(
+        [t for t in (bos_sup_ts, choch_sup_ts, lh_ts, ll_ts) if t], default=None
+    )
     structure_demoted = None
     if STRUCTURE_REVERSAL_DEMOTE_ENABLED and not bool(cfg("VOL_HARD_GATE")):
         _dem_struct_ts = max([t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None)
@@ -7507,9 +7517,110 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     # true_conflict. The UI reads this to show exactly WHY the system is blocked.
     # No trading decision, score, or gate value is touched here.
     def _build_opp_struct():
+        """Return a 4-state structure-conflict diagnostic dict.
+
+        States (status field):
+          ACTIVE      — opposing structure within the conflict window AND blocking
+                        (true_conflict=True).
+          CHALLENGED  — opposing structure within the window but score gap is too
+                        large to block (score-aware conflict, true_conflict=False).
+          OVERRIDDEN  — structure-reversal demote fired: the stale side's timestamps
+                        were cleared by a clearly-newer dominant reversal.
+          EXPIRED     — both sides had structure, but the older one aged beyond the
+                        conflict window without being overridden (demote was OFF or
+                        only one side had structure so demote condition was not met).
+          None        — no opposing structure detected at all.
+
+        This is READ-ONLY / display-only — no gate, score, or trade decision touches
+        this dict.  All 4 states use closure variables captured earlier in
+        evaluate_strict_setup.
+        """
         try:
             _now_dt = datetime.now(timezone.utc)
+
+            # ── OVERRIDDEN ─────────────────────────────────────────────────────
+            # The demote fired this analysis cycle: the stale side's timestamps
+            # were nulled, so opposing_present is now False — but the event is
+            # significant and should be visible as OVERRIDDEN.
+            if structure_demoted is not None:
+                _stale_ts  = _raw_dem_struct_ts if structure_demoted == "demand" else _raw_sup_struct_ts
+                _fresh_ts  = _raw_sup_struct_ts if structure_demoted == "demand" else _raw_dem_struct_ts
+                _stale_dir = "BULLISH" if structure_demoted == "demand" else "BEARISH"
+                _fresh_dir = "BEARISH" if structure_demoted == "demand" else "BULLISH"
+                _stale_age = None
+                if _stale_ts is not None:
+                    _sts = _stale_ts if _stale_ts.tzinfo else _stale_ts.replace(tzinfo=timezone.utc)
+                    _stale_age = max(0, int((_now_dt - _sts).total_seconds()))
+                _age_label = (
+                    f"{_stale_age // 60}m {_stale_age % 60:02d}s ago"
+                    if _stale_age is not None else "unknown age"
+                )
+                return {
+                    "detected":                   True,
+                    "direction":                  _stale_dir,
+                    "candidate_direction":         _fresh_dir,
+                    "event_type":                 None,
+                    "instrument":                 inst,
+                    "event_time":                 (_stale_ts.isoformat() if _stale_ts else None),
+                    "age_seconds":                _stale_age,
+                    "remaining_seconds":          0,
+                    "window_seconds":             CONFLICT_WINDOW_MIN * 60,
+                    "status":                     "OVERRIDDEN",
+                    "effect":                     "OVERRIDDEN",
+                    "source":                     "alert_history",
+                    "reason":                    (f"{_stale_dir.title()} structure ({_age_label}) "
+                                                  f"overridden by fresh {_fresh_dir.lower()} reversal"),
+                    "superseded":                 True,
+                    "invalidated":                False,
+                    "overridden_side":            structure_demoted,
+                    "overridden_event_time":      (_stale_ts.isoformat() if _stale_ts else None),
+                    "overridden_fresh_event_time": (_fresh_ts.isoformat() if _fresh_ts else None),
+                    "same_direction_ts":          (_fresh_ts.isoformat() if _fresh_ts else None),
+                    "score_aware":                score_aware_conflict,
+                    "conflict_gap":               conflict_gap,
+                    "conflict_wait_gap":          conflict_wait_gap,
+                }
+
+            # ── No opposing structure within the conflict window ───────────────
             if not opposing_present:
+                # EXPIRED: both sides had structure timestamps but one is older
+                # than the conflict window (aged beyond CONFLICT_WINDOW_MIN).
+                # Demote was OFF, disabled, or only one side had structure, so
+                # the stale event was never cleared — it just aged out naturally.
+                if _raw_dem_struct_ts and _raw_sup_struct_ts:
+                    _raw_gap_s = abs(
+                        (_raw_dem_struct_ts - _raw_sup_struct_ts).total_seconds()
+                    )
+                    if _raw_gap_s > CONFLICT_WINDOW_MIN * 60:
+                        _older_ts  = min(_raw_dem_struct_ts, _raw_sup_struct_ts)
+                        _newer_ts  = max(_raw_dem_struct_ts, _raw_sup_struct_ts)
+                        _stale_dir = "BULLISH" if _older_ts == _raw_dem_struct_ts else "BEARISH"
+                        _ots = _older_ts if _older_ts.tzinfo else _older_ts.replace(tzinfo=timezone.utc)
+                        _exp_age = max(0, int((_now_dt - _ots).total_seconds()))
+                        return {
+                            "detected":              True,
+                            "direction":             _stale_dir,
+                            "candidate_direction":   ("BEARISH" if _stale_dir == "BULLISH" else "BULLISH"),
+                            "event_type":            None,
+                            "instrument":            inst,
+                            "event_time":            _older_ts.isoformat(),
+                            "age_seconds":           _exp_age,
+                            "remaining_seconds":     0,
+                            "window_seconds":        CONFLICT_WINDOW_MIN * 60,
+                            "status":                "EXPIRED",
+                            "effect":                "EXPIRED",
+                            "source":                "alert_history",
+                            "reason":               (f"{_stale_dir.title()} structure "
+                                                     f"({_exp_age // 60}m {_exp_age % 60:02d}s old) "
+                                                     f"aged beyond {CONFLICT_WINDOW_MIN}-min window"),
+                            "superseded":            False,
+                            "invalidated":           True,
+                            "same_direction_ts":     _newer_ts.isoformat(),
+                            "score_aware":           score_aware_conflict,
+                            "conflict_gap":          conflict_gap,
+                            "conflict_wait_gap":     conflict_wait_gap,
+                        }
+                # Truly no opposing structure.
                 return {
                     "detected": False, "direction": None, "candidate_direction": None,
                     "event_type": None, "instrument": inst,
@@ -7518,7 +7629,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                     "status": None, "effect": "NONE", "source": "alert_history",
                     "reason": None, "superseded": False, "invalidated": False,
                 }
-            # candidate = dominant (higher-Edge) side; "opposing" = the conflicting side.
+
+            # ── ACTIVE / CHALLENGED: opposing structure within the window ──────
+            # candidate = dominant (higher-Edge) side; "opposing" = conflicting side.
             cand = dominant_direction if dominant_direction != "Neutral" else "Long"
             if cand == "Long":
                 opp_ts  = short_struct_ts
@@ -7556,17 +7669,22 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 _ots = opp_ts if opp_ts.tzinfo else opp_ts.replace(tzinfo=timezone.utc)
                 age_s = max(0, int((_now_dt - _ots).total_seconds()))
                 remaining_s = max(0, CONFLICT_WINDOW_MIN * 60 - age_s)
-            # Effect classification
+            # Status and effect
             if true_conflict:
+                status = "ACTIVE"   # within window AND blocking
                 effect = "SCORE_AWARE_BLOCK" if score_aware_conflict else "HARD_BLOCK"
             else:
-                effect = "OBSERVED"   # detected but not blocking (dominant SCALP side clear)
+                status = "CHALLENGED"   # within window but score gap too wide to block
+                effect = "OBSERVED"
             # Human-readable reason
             opp_type_short = (opp_type or "structure").split()[0]
             if age_s is not None:
                 age_label = f"{age_s // 60}m {age_s % 60:02d}s"
             else:
                 age_label = "unknown"
+            reason = f"{opp_dir.title()} {opp_type_short} occurred {age_label} ago"
+            if status == "CHALLENGED":
+                reason += f" — score gap ({conflict_gap} pts) exceeds threshold ({conflict_wait_gap} pts), not blocking"
             return {
                 "detected":            True,
                 "direction":           opp_dir,
@@ -7577,12 +7695,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "age_seconds":         age_s,
                 "remaining_seconds":   remaining_s,
                 "window_seconds":      CONFLICT_WINDOW_MIN * 60,
-                "status":              "ACTIVE",
+                "status":              status,
                 "effect":              effect,
                 "source":              "alert_history",
-                "reason":              f"{opp_dir.title()} {opp_type_short} occurred {age_label} ago",
-                "superseded":          False,   # no supersession tracking exists currently
-                "invalidated":         False,   # no invalidation tracking exists currently
+                "reason":              reason,
+                "superseded":          False,
+                "invalidated":         False,
                 # Additional context for the UI panel
                 "same_direction_ts":   (same_ts.isoformat() if same_ts is not None else None),
                 "score_aware":         score_aware_conflict,
