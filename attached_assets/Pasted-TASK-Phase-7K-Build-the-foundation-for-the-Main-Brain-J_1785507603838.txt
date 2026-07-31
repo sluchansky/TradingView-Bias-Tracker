@@ -1,0 +1,238 @@
+TASK: Phase 7K — Build the foundation for the Main Brain Journal with Tradzella import.
+
+GOAL
+
+Transform the Journal into the system's permanent trade-review and performance center.
+
+The Journal should become the canonical source for:
+
+- imported trades
+- TradersPost trades
+- manual trades
+- trade reviews
+- strategy statistics
+- learning eligibility
+
+The workflow should feel similar to the useful workflow in Tradzella without copying proprietary UI or code.
+
+--------------------------------------------------
+STRICT SCOPE
+--------------------------------------------------
+
+Do NOT modify:
+
+- Databento
+- strategy calculations
+- Edge Score
+- readiness
+- alerts
+- learning formulas
+- TradersPost execution
+- polling
+- authentication
+
+--------------------------------------------------
+PHASE 1
+--------------------------------------------------
+
+Implement:
+
+✓ IMPORT TRADES button
+✓ Tradzella CSV preview
+✓ duplicate detection
+✓ canonical trade record
+✓ import preview
+✓ confirm import
+✓ import history
+✓ rollback support
+
+--------------------------------------------------
+PHASE 2
+--------------------------------------------------
+
+Trade Log
+
+Columns
+
+Date
+Instrument
+Direction
+Strategy
+Entry
+Exit
+Result
+R
+P&L
+Source
+Review Status
+
+Sortable
+
+Filterable
+
+Searchable
+
+--------------------------------------------------
+PHASE 3
+--------------------------------------------------
+
+Trade Detail
+
+Entry
+
+Exit
+
+Duration
+
+Chart
+
+Screenshots
+
+Edge Score at Entry
+
+Left Brain Thesis
+
+Right Brain Verdict
+
+Risk State
+
+Strategy
+
+Notes
+
+Emotion Tags
+
+Mistakes
+
+Lessons Learned
+
+MAE
+
+MFE
+
+--------------------------------------------------
+PHASE 4
+--------------------------------------------------
+
+Analytics
+
+Win %
+
+Average Win
+
+Average Loss
+
+Average R
+
+Profit Factor
+
+Expectancy
+
+Daily
+
+Weekly
+
+Monthly
+
+Strategy
+
+Instrument
+
+Session
+
+Market Regime
+
+--------------------------------------------------
+PHASE 5
+--------------------------------------------------
+
+Playbook
+
+Performance by strategy
+
+Minimum sample warnings
+
+Best setup
+
+Worst setup
+
+Most common mistake
+
+Most common blocker
+
+--------------------------------------------------
+PHASE 6
+--------------------------------------------------
+
+Learning
+
+Reviewed
+
+Eligible
+
+Excluded
+
+Reason
+
+Do NOT modify learning calculations.
+
+Only expose the information.
+
+--------------------------------------------------
+IMPORT SAFETY
+--------------------------------------------------
+
+Preview first.
+
+Never immediately save.
+
+Duplicate detection required.
+
+Support rollback.
+
+--------------------------------------------------
+TESTS
+
+Import
+
+Duplicate
+
+Rollback
+
+Analytics
+
+Manual trade
+
+TradersPost trade
+
+CSV parser
+
+Timezone
+
+Large file
+
+Journal UI
+
+TypeScript
+
+Production build
+
+git diff --check
+
+FINAL REPORT
+
+Current architecture
+
+Files changed
+
+Schema
+
+Import workflow
+
+Analytics
+
+Tests
+
+Screenshots
+
+Confirmation no trading logic changed
