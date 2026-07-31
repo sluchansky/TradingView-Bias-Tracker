@@ -45178,6 +45178,299 @@ def journal_calendar_summary():
 
 
 # ---------------------------------------------------------------------------
+# Phase 7N Batch C — Learning Eligibility & Review Analytics (DISPLAY-ONLY)
+# ---------------------------------------------------------------------------
+# Two read-only routes that surface per-trade learning eligibility and
+# aggregate review-field analytics from journal_reviews.
+#
+# INVARIANT: Neither route reads LEARNING_ELIGIBILITY, calls any learning
+# formula, modifies any weight, or writes to any table.  Both are pure
+# SELECT aggregations from journal_reviews + strategy_trades +
+# tradezella_trades.  The learning engine is never invoked.
+# ---------------------------------------------------------------------------
+
+# Valid outcome tokens (case-insensitive comparison used in route)
+_ELIG_VALID_OUTCOMES = frozenset({
+    "win", "loss", "be", "scratch", "breakeven", "b/e",
+})
+
+
+@app.route("/journal/learning-eligibility", methods=["GET"])
+def journal_learning_eligibility():
+    """Per-trade learning eligibility — DISPLAY-ONLY.
+
+    Computes one of:
+      ELIGIBLE             — all criteria met + REVIEWED
+      REVIEW_REQUIRED      — trade not yet reviewed
+      MISSING_RISK         — planned stop (risk) not recorded (system only)
+      MISSING_STRATEGY     — strategy_key not resolved (system only)
+      INVALID_OUTCOME      — result/outcome is null or unrecognised
+      EXCLUDED_BY_OPERATOR — review_status = EXCLUDED
+    for every closed trade in strategy_trades and tradezella_trades.
+
+    Never writes to the learning engine or modifies any weight/threshold.
+    """
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        with conn.cursor() as cur:
+            # ── System trades ─────────────────────────────────────────────
+            cur.execute(
+                "SELECT st.id,"
+                " st.result,"
+                " st.strategy_key,"
+                " st.stop,"
+                " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status"
+                " FROM strategy_trades st"
+                " LEFT JOIN journal_reviews jr"
+                "   ON jr.source = 'system' AND jr.trade_id = st.id"
+                " WHERE st.closed_at IS NOT NULL"
+            )
+            sys_cols = [d[0] for d in cur.description]
+            sys_rows = cur.fetchall()
+
+            # ── Tradezella trades ─────────────────────────────────────────
+            cur.execute(
+                "SELECT tt.id,"
+                " tt.outcome AS result,"
+                " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status"
+                " FROM tradezella_trades tt"
+                " LEFT JOIN journal_reviews jr"
+                "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
+                " WHERE tt.exit_time IS NOT NULL"
+            )
+            tz_cols = [d[0] for d in cur.description]
+            tz_rows = cur.fetchall()
+
+        records = []
+
+        for row in sys_rows:
+            d = dict(zip(sys_cols, row))
+            result        = (d.get("result") or "").strip().lower()
+            strategy_key  = d.get("strategy_key")
+            stop          = d.get("stop")
+            review_status = d.get("review_status", "UNREVIEWED")
+
+            if review_status == "EXCLUDED":
+                status = "EXCLUDED_BY_OPERATOR"
+                reason = "Manually excluded by operator"
+            elif result not in _ELIG_VALID_OUTCOMES:
+                status = "INVALID_OUTCOME"
+                reason = "Outcome not recorded or unrecognised"
+            elif not strategy_key:
+                status = "MISSING_STRATEGY"
+                reason = "Strategy key not resolved for this trade"
+            elif stop is None:
+                status = "MISSING_RISK"
+                reason = "Planned stop (risk) not recorded"
+            elif review_status != "REVIEWED":
+                status = "REVIEW_REQUIRED"
+                reason = f"Review not complete (status: {review_status})"
+            else:
+                status = "ELIGIBLE"
+                reason = ""
+
+            records.append({
+                "source":   "system",
+                "trade_id": int(d["id"]),
+                "status":   status,
+                "reason":   reason,
+            })
+
+        for row in tz_rows:
+            d = dict(zip(tz_cols, row))
+            result        = (d.get("result") or "").strip().lower()
+            review_status = d.get("review_status", "UNREVIEWED")
+
+            if review_status == "EXCLUDED":
+                status = "EXCLUDED_BY_OPERATOR"
+                reason = "Manually excluded by operator"
+            elif result not in _ELIG_VALID_OUTCOMES:
+                status = "INVALID_OUTCOME"
+                reason = "Outcome not recorded or unrecognised"
+            elif review_status != "REVIEWED":
+                status = "REVIEW_REQUIRED"
+                reason = f"Review not complete (status: {review_status})"
+            else:
+                status = "ELIGIBLE"
+                reason = ""
+
+            records.append({
+                "source":   "tradzella",
+                "trade_id": int(d["id"]),
+                "status":   status,
+                "reason":   reason,
+            })
+
+        counts: dict = {}
+        for r in records:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+        return jsonify({
+            "ok":      True,
+            "records": records,
+            "total":   len(records),
+            "counts":  counts,
+        })
+    except Exception as exc:
+        logger.warning("journal_learning_eligibility failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/review-analytics", methods=["GET"])
+def journal_review_analytics():
+    """Aggregate review-field analytics from journal_reviews — DISPLAY-ONLY.
+
+    Returns:
+      mistake_tag_counts         — [{tag, count}] sorted desc (REVIEWED only)
+      positive_tag_counts        — [{tag, count}] sorted desc (REVIEWED only)
+      followed_plan_distribution — {YES: n, PARTIALLY: n, NO: n, ...}
+      rating_distributions       — {setup_quality: {1: n, ...}, ...}
+      emotion_by_day             — [{day, emotion, count}]
+      win_rate_by_discipline_quality — {1: pct, ..., 5: pct} (system only)
+      coaching_summary           — top-3 mistakes, top-3 positives, reviewed_count
+
+    Never writes to the learning engine or modifies any weight/threshold.
+    """
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        with conn.cursor() as cur:
+
+            # ── Mistake tag frequency ──────────────────────────────────────
+            cur.execute(
+                "SELECT tag, COUNT(*) AS n"
+                " FROM journal_reviews,"
+                "      jsonb_array_elements_text(mistake_tags) AS tag"
+                " WHERE review_status = 'REVIEWED'"
+                "   AND mistake_tags IS NOT NULL"
+                " GROUP BY tag ORDER BY n DESC"
+            )
+            mistake_tag_counts = [
+                {"tag": r[0], "count": int(r[1])} for r in cur.fetchall()
+            ]
+
+            # ── Positive tag frequency ─────────────────────────────────────
+            cur.execute(
+                "SELECT tag, COUNT(*) AS n"
+                " FROM journal_reviews,"
+                "      jsonb_array_elements_text(positive_tags) AS tag"
+                " WHERE review_status = 'REVIEWED'"
+                "   AND positive_tags IS NOT NULL"
+                " GROUP BY tag ORDER BY n DESC"
+            )
+            positive_tag_counts = [
+                {"tag": r[0], "count": int(r[1])} for r in cur.fetchall()
+            ]
+
+            # ── Followed-plan distribution ─────────────────────────────────
+            cur.execute(
+                "SELECT followed_plan, COUNT(*) AS n"
+                " FROM journal_reviews"
+                " WHERE review_status = 'REVIEWED'"
+                "   AND followed_plan IS NOT NULL"
+                " GROUP BY followed_plan"
+            )
+            followed_plan_distribution: dict = {}
+            for r in cur.fetchall():
+                followed_plan_distribution[r[0]] = int(r[1])
+
+            # ── Rating distributions ───────────────────────────────────────
+            rating_distributions: dict = {}
+            for field in ("setup_quality", "execution_quality",
+                          "discipline_quality", "overall_quality"):
+                cur.execute(
+                    f"SELECT {field}, COUNT(*) AS n"
+                    f" FROM journal_reviews"
+                    f" WHERE review_status = 'REVIEWED'"
+                    f"   AND {field} IS NOT NULL"
+                    f" GROUP BY {field} ORDER BY {field}"
+                )
+                rating_distributions[field] = {
+                    int(r[0]): int(r[1]) for r in cur.fetchall()
+                }
+
+            # ── Emotion by day ─────────────────────────────────────────────
+            cur.execute(
+                "SELECT"
+                "  TO_CHAR(COALESCE(reviewed_at, updated_at)"
+                "          AT TIME ZONE 'America/New_York', 'YYYY-MM-DD') AS day,"
+                "  elem->>'tag' AS emotion,"
+                "  COUNT(*) AS n"
+                " FROM journal_reviews,"
+                "      jsonb_array_elements(emotion_tags) AS elem"
+                " WHERE review_status = 'REVIEWED'"
+                "   AND emotion_tags IS NOT NULL"
+                "   AND jsonb_typeof(emotion_tags) = 'array'"
+                " GROUP BY 1, 2"
+                " ORDER BY 1, n DESC"
+            )
+            emotion_by_day = [
+                {"day": r[0], "emotion": r[1], "count": int(r[2])}
+                for r in cur.fetchall()
+            ]
+
+            # ── Win-rate by discipline quality (system trades only) ────────
+            cur.execute(
+                "SELECT jr.discipline_quality,"
+                "  COUNT(*) AS n,"
+                "  SUM(CASE WHEN LOWER(st.result)='win' THEN 1 ELSE 0 END) AS wins"
+                " FROM journal_reviews jr"
+                " JOIN strategy_trades st"
+                "   ON jr.source = 'system' AND st.id = jr.trade_id"
+                " WHERE jr.review_status = 'REVIEWED'"
+                "   AND jr.discipline_quality IS NOT NULL"
+                "   AND st.result IS NOT NULL"
+                " GROUP BY jr.discipline_quality"
+                " ORDER BY jr.discipline_quality"
+            )
+            win_rate_by_discipline_quality: dict = {}
+            for r in cur.fetchall():
+                q, n, wins = int(r[0]), int(r[1]), int(r[2])
+                win_rate_by_discipline_quality[q] = (
+                    round(wins / n * 100, 1) if n else None
+                )
+
+            # ── REVIEWED count ─────────────────────────────────────────────
+            cur.execute(
+                "SELECT COUNT(*) FROM journal_reviews WHERE review_status = 'REVIEWED'"
+            )
+            reviewed_count = int((cur.fetchone() or (0,))[0])
+
+        coaching_summary = {
+            "top_mistakes":   mistake_tag_counts[:3],
+            "top_positives":  positive_tag_counts[:3],
+            "reviewed_count": reviewed_count,
+        }
+
+        return jsonify({
+            "ok":                           True,
+            "mistake_tag_counts":           mistake_tag_counts,
+            "positive_tag_counts":          positive_tag_counts,
+            "followed_plan_distribution":   followed_plan_distribution,
+            "rating_distributions":         rating_distributions,
+            "emotion_by_day":               emotion_by_day,
+            "win_rate_by_discipline_quality": win_rate_by_discipline_quality,
+            "coaching_summary":             coaching_summary,
+        })
+    except Exception as exc:
+        logger.warning("journal_review_analytics failed: %s", exc)
+        return jsonify({"ok": False, "error": "analytics query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Phase 7M — Directional Balance (READ-ONLY audit panel, owner-only)
 # ---------------------------------------------------------------------------
 # Aggregates Long vs Short signal counts from three in-memory sources:

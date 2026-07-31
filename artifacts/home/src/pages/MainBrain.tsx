@@ -2500,6 +2500,30 @@ function jReviewBadge(status: string): React.ReactNode {
   );
 }
 
+// Phase 7N Batch C: per-trade learning eligibility badge (display-only)
+function jEligibilityBadge(status: string, reason: string): React.ReactNode {
+  const s = (status || 'UNKNOWN').toUpperCase();
+  const cfg: Record<string, { col: string; label: string }> = {
+    ELIGIBLE:             { col: T.green,    label: '✓ Eligible' },
+    REVIEW_REQUIRED:      { col: T.amber,    label: '○ Review' },
+    MISSING_RISK:         { col: T.red,      label: '⚠ Risk' },
+    MISSING_STRATEGY:     { col: T.red,      label: '⚠ Strategy' },
+    INVALID_OUTCOME:      { col: T.txtMuted, label: '⊘ Outcome' },
+    EXCLUDED_BY_OPERATOR: { col: T.txtMuted, label: '— Excluded' },
+    DUPLICATE:            { col: T.txtMuted, label: '⊘ Duplicate' },
+  };
+  const { col, label } = cfg[s] ?? { col: T.txtMuted, label: s };
+  return (
+    <span
+      title={reason || undefined}
+      style={{ background: col + '22', color: col, borderRadius: 3,
+        padding: '1px 5px', fontSize: 8, fontWeight: 700, letterSpacing: '0.04em',
+        whiteSpace: 'nowrap', cursor: reason ? 'help' : 'default' }}>
+      {label}
+    </span>
+  );
+}
+
 // ── Phase 7N Batch B: Attachment types ────────────────────────────────────────
 interface JAttachment {
   id: number;
@@ -3423,6 +3447,9 @@ const JTradesTab: React.FC = () => {
   const [queueCount,  setQueueCount]    = useState<number | null>(null);
   const [queueLoading, setQueueLoading] = useState(false);
 
+  // Phase 7N Batch C: per-trade learning eligibility (display-only cache)
+  const [eligibilityMap, setEligibilityMap] = useState<Record<string, { status: string; reason: string }>>({});
+
   const fetchTrades = useCallback(async (pg = 1) => {
     setLoading(true); setError(null);
     try {
@@ -3451,6 +3478,23 @@ const JTradesTab: React.FC = () => {
   }, [search, fInst, fDir, fSrc, fRes, sortCol, sortOrd]);
 
   useEffect(() => { fetchTrades(1); }, [fetchTrades]);
+
+  // Phase 7N Batch C: load eligibility map once on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch('/api/journal/learning-eligibility', { headers: getAuthHeader() });
+        const d = await r.json();
+        if (d.ok && d.records) {
+          const m: Record<string, { status: string; reason: string }> = {};
+          for (const rec of d.records as { source: string; trade_id: number; status: string; reason: string }[]) {
+            m[`${rec.source}-${rec.trade_id}`] = { status: rec.status, reason: rec.reason };
+          }
+          setEligibilityMap(m);
+        }
+      } catch { /* fail silently — badge is display-only */ }
+    })();
+  }, []);
 
   const handleSort = (col: string) => {
     if (col === sortCol) {
@@ -3632,11 +3676,16 @@ const JTradesTab: React.FC = () => {
                   <Th col="duration_min" label="Dur" />
                   <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
                     paddingBottom: 6, fontSize: 9 }}>Review</th>
+                  <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                    paddingBottom: 6, fontSize: 9 }}>Eligibility</th>
                 </tr>
               </thead>
               <tbody>
-                {trades.map(t => (
-                  <tr key={`${t.source}-${t.id}`}
+                {trades.map(t => {
+                  const eligKey = `${t.source}-${t.id}`;
+                  const elig = eligibilityMap[eligKey];
+                  return (
+                  <tr key={eligKey}
                     onClick={() => openDetail(t)}
                     style={{ borderTop: `1px solid ${T.border}`, cursor: 'pointer' }}
                     onMouseEnter={e => (e.currentTarget.style.background = T.panelAlt)}
@@ -3669,13 +3718,20 @@ const JTradesTab: React.FC = () => {
                     <td style={{ padding: '4px 8px 4px 0', color: T.txtMuted, fontFamily: T.mono, fontSize: 9 }}>
                       {t.duration_min != null ? t.duration_min.toFixed(0) + 'm' : '—'}
                     </td>
-                    <td style={{ padding: '4px 0' }}>
+                    <td style={{ padding: '4px 8px 4px 0' }}>
                       {jReviewBadge(t.review_status || 'UNREVIEWED')}
                     </td>
+                    <td style={{ padding: '4px 0' }}>
+                      {elig
+                        ? jEligibilityBadge(elig.status, elig.reason)
+                        : <span style={{ fontSize: 8, color: T.txtMuted }}>—</span>
+                      }
+                    </td>
                   </tr>
-                ))}
+                  );
+                })}
                 {trades.length === 0 && (
-                  <tr><td colSpan={10} style={{ textAlign: 'center', color: T.txtMuted,
+                  <tr><td colSpan={11} style={{ textAlign: 'center', color: T.txtMuted,
                     padding: '16px 0', fontSize: 11 }}>No trades</td></tr>
                 )}
               </tbody>
@@ -4171,6 +4227,232 @@ const JCalendarView: React.FC<{ dateFrom: string; dateTo: string }> = ({ dateFro
   );
 };
 
+// ── Phase 7N Batch C: Review Stats component ──────────────────────────────────
+interface JReviewAnalytics {
+  mistake_tag_counts:           { tag: string; count: number }[];
+  positive_tag_counts:          { tag: string; count: number }[];
+  followed_plan_distribution:   Record<string, number>;
+  rating_distributions:         Record<string, Record<number, number>>;
+  win_rate_by_discipline_quality: Record<number, number | null>;
+  coaching_summary: {
+    top_mistakes:   { tag: string; count: number }[];
+    top_positives:  { tag: string; count: number }[];
+    reviewed_count: number;
+  };
+}
+
+const JReviewStatsView: React.FC = () => {
+  const [data,    setData]    = useState<JReviewAnalytics | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true); setError(null);
+      try {
+        const r = await fetch('/api/journal/review-analytics', { headers: getAuthHeader() });
+        const d = await r.json();
+        if (!d.ok) throw new Error(d.error || 'failed');
+        setData(d as JReviewAnalytics);
+      } catch (e) { setError(String(e)); }
+      setLoading(false);
+    })();
+  }, []);
+
+  if (loading) return <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading review stats…</div>;
+  if (error)   return <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>;
+  if (!data)   return null;
+
+  const totalMistakes = data.mistake_tag_counts.reduce((s, x) => s + x.count, 0);
+  const totalPositives = data.positive_tag_counts.reduce((s, x) => s + x.count, 0);
+
+  const TagBar: React.FC<{ tag: string; count: number; total: number; col: string }> = ({ tag, count, total, col }) => {
+    const pct = total > 0 ? Math.round(count / total * 100) : 0;
+    return (
+      <div style={{ marginBottom: 5 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2, fontSize: 9 }}>
+          <span style={{ color: T.txtSec }}>{tag.replace(/_/g, ' ')}</span>
+          <span style={{ color: col, fontWeight: 700, fontFamily: T.mono }}>{count}×</span>
+        </div>
+        <div style={{ height: 5, background: T.border, borderRadius: 3, overflow: 'hidden' }}>
+          <div style={{ width: `${pct}%`, height: '100%', background: col, borderRadius: 3 }} />
+        </div>
+      </div>
+    );
+  };
+
+  const ratingFields = ['setup_quality', 'execution_quality', 'discipline_quality', 'overall_quality'];
+  const ratingLabels: Record<string, string> = {
+    setup_quality:      'Setup',
+    execution_quality:  'Execution',
+    discipline_quality: 'Discipline',
+    overall_quality:    'Overall',
+  };
+
+  const planColors: Record<string, string> = {
+    YES:             T.green,
+    PARTIALLY:       T.amber,
+    NO:              T.red,
+    NOT_APPLICABLE:  T.txtMuted,
+  };
+
+  return (
+    <div>
+      {/* Coaching summary */}
+      <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+        border: `1px solid ${T.border}`, marginBottom: 14 }}>
+        <div style={{ fontSize: 10, color: T.txtMuted, marginBottom: 8, letterSpacing: '0.06em', fontWeight: 700 }}>
+          COACHING SUMMARY — {data.coaching_summary.reviewed_count} REVIEWED TRADES
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 9, color: T.red, marginBottom: 6, fontWeight: 700 }}>TOP RECURRING MISTAKES</div>
+            {data.coaching_summary.top_mistakes.length === 0
+              ? <div style={{ fontSize: 9, color: T.txtMuted }}>No mistakes tagged yet</div>
+              : data.coaching_summary.top_mistakes.map((m, i) => (
+                <div key={i} style={{ fontSize: 10, color: T.txtSec, marginBottom: 3, display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <span style={{ fontSize: 8, color: T.red, fontWeight: 700, minWidth: 16 }}>{i + 1}.</span>
+                  <span style={{ flex: 1 }}>{m.tag.replace(/_/g, ' ')}</span>
+                  <span style={{ fontSize: 9, color: T.red, fontFamily: T.mono, fontWeight: 700 }}>{m.count}×</span>
+                </div>
+              ))}
+          </div>
+          <div>
+            <div style={{ fontSize: 9, color: T.green, marginBottom: 6, fontWeight: 700 }}>TOP POSITIVE PATTERNS</div>
+            {data.coaching_summary.top_positives.length === 0
+              ? <div style={{ fontSize: 9, color: T.txtMuted }}>No positive tags yet</div>
+              : data.coaching_summary.top_positives.map((p, i) => (
+                <div key={i} style={{ fontSize: 10, color: T.txtSec, marginBottom: 3, display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <span style={{ fontSize: 8, color: T.green, fontWeight: 700, minWidth: 16 }}>{i + 1}.</span>
+                  <span style={{ flex: 1 }}>{p.tag.replace(/_/g, ' ')}</span>
+                  <span style={{ fontSize: 9, color: T.green, fontFamily: T.mono, fontWeight: 700 }}>{p.count}×</span>
+                </div>
+              ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        {/* Mistake tag frequency */}
+        <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px', border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10, letterSpacing: '0.06em', fontWeight: 700 }}>
+            MISTAKE TAGS ({data.mistake_tag_counts.length})
+          </div>
+          {data.mistake_tag_counts.length === 0
+            ? <div style={{ fontSize: 9, color: T.txtMuted }}>No reviewed trades with mistakes tagged</div>
+            : data.mistake_tag_counts.slice(0, 10).map((m, i) => (
+              <TagBar key={i} tag={m.tag} count={m.count} total={totalMistakes} col={T.red} />
+            ))}
+        </div>
+
+        {/* Positive tag frequency */}
+        <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px', border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10, letterSpacing: '0.06em', fontWeight: 700 }}>
+            POSITIVE TAGS ({data.positive_tag_counts.length})
+          </div>
+          {data.positive_tag_counts.length === 0
+            ? <div style={{ fontSize: 9, color: T.txtMuted }}>No reviewed trades with positive tags</div>
+            : data.positive_tag_counts.slice(0, 10).map((p, i) => (
+              <TagBar key={i} tag={p.tag} count={p.count} total={totalPositives} col={T.green} />
+            ))}
+        </div>
+
+        {/* Followed-plan distribution */}
+        <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px', border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10, letterSpacing: '0.06em', fontWeight: 700 }}>
+            FOLLOWED PLAN
+          </div>
+          {Object.keys(data.followed_plan_distribution).length === 0
+            ? <div style={{ fontSize: 9, color: T.txtMuted }}>No data yet</div>
+            : (['YES', 'PARTIALLY', 'NO', 'NOT_APPLICABLE'] as const).map(opt => {
+              const n = data.followed_plan_distribution[opt] ?? 0;
+              if (n === 0) return null;
+              const total = Object.values(data.followed_plan_distribution).reduce((s, x) => s + x, 0);
+              const pct = total > 0 ? Math.round(n / total * 100) : 0;
+              return (
+                <div key={opt} style={{ marginBottom: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, marginBottom: 2 }}>
+                    <span style={{ color: planColors[opt] || T.txtSec }}>{opt.replace(/_/g, ' ')}</span>
+                    <span style={{ color: T.txtSec, fontFamily: T.mono }}>{n} ({pct}%)</span>
+                  </div>
+                  <div style={{ height: 5, background: T.border, borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ width: `${pct}%`, height: '100%', background: planColors[opt] || T.txtSec, borderRadius: 3 }} />
+                  </div>
+                </div>
+              );
+            })}
+        </div>
+
+        {/* Rating distributions */}
+        <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px', border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10, letterSpacing: '0.06em', fontWeight: 700 }}>
+            QUALITY RATINGS (1–5)
+          </div>
+          {ratingFields.map(field => {
+            const dist = data.rating_distributions[field] ?? {};
+            const total = Object.values(dist).reduce((s, x) => s + x, 0);
+            if (total === 0) return null;
+            const avg = total > 0
+              ? Object.entries(dist).reduce((s, [k, v]) => s + Number(k) * v, 0) / total
+              : 0;
+            return (
+              <div key={field} style={{ marginBottom: 8 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, marginBottom: 3 }}>
+                  <span style={{ color: T.txtSec }}>{ratingLabels[field]}</span>
+                  <span style={{ color: T.amber, fontFamily: T.mono, fontWeight: 700 }}>{avg.toFixed(1)} avg</span>
+                </div>
+                <div style={{ display: 'flex', gap: 2 }}>
+                  {[1,2,3,4,5].map(n => {
+                    const count = dist[n] ?? 0;
+                    const pct = total > 0 ? count / total * 100 : 0;
+                    return (
+                      <div key={n} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
+                        <div style={{ width: '100%', background: T.border, borderRadius: 2, overflow: 'hidden', height: 24 }}>
+                          <div style={{ width: '100%', height: `${pct}%`, background: T.amber + '88', borderRadius: 2,
+                            marginTop: `${100 - pct}%`, transition: 'height 0.3s' }} />
+                        </div>
+                        <span style={{ fontSize: 7, color: T.txtMuted }}>{n}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+          {ratingFields.every(f => Object.keys(data.rating_distributions[f] ?? {}).length === 0) && (
+            <div style={{ fontSize: 9, color: T.txtMuted }}>No rating data yet</div>
+          )}
+        </div>
+
+        {/* Win-rate by discipline quality */}
+        <div style={{ gridColumn: '1/-1', background: T.panelAlt, borderRadius: 8, padding: '12px 14px', border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10, letterSpacing: '0.06em', fontWeight: 700 }}>
+            WIN RATE BY DISCIPLINE QUALITY (SYSTEM TRADES)
+          </div>
+          {Object.keys(data.win_rate_by_discipline_quality).length === 0
+            ? <div style={{ fontSize: 9, color: T.txtMuted }}>Not enough reviewed system trades yet</div>
+            : (
+              <div style={{ display: 'flex', gap: 10 }}>
+                {[1,2,3,4,5].map(n => {
+                  const pct = data.win_rate_by_discipline_quality[n];
+                  return (
+                    <div key={n} style={{ flex: 1, textAlign: 'center' }}>
+                      <div style={{ fontSize: 14, fontWeight: 800, fontFamily: T.mono,
+                        color: pct != null ? (pct >= 50 ? T.green : T.red) : T.txtMuted }}>
+                        {pct != null ? pct.toFixed(0) + '%' : '—'}
+                      </div>
+                      <div style={{ fontSize: 8, color: T.txtMuted }}>Disc {n}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const JAnalyticsTab: React.FC = () => {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(false);
@@ -4180,7 +4462,7 @@ const JAnalyticsTab: React.FC = () => {
   const [dateTo, setDateTo] = useState('');
 
   const fetchAnalytics = useCallback(async () => {
-    if (groupBy === 'calendar') return; // calendar has its own sub-component
+    if (groupBy === 'calendar' || groupBy === 'review-stats') return; // own sub-components
     setLoading(true); setError(null);
     try {
       const params = new URLSearchParams({ group_by: groupBy,
@@ -4221,8 +4503,12 @@ const JAnalyticsTab: React.FC = () => {
         <select value={groupBy} onChange={e => setGroupBy(e.target.value)}
           style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
             color: T.txtSec, padding: '4px 8px', fontSize: 11 }}>
-          {['strategy','instrument','session','regime','daily','weekly','monthly','calendar'].map(g => (
-            <option key={g} value={g}>{g === 'calendar' ? '📅 Calendar (Review)' : g.charAt(0).toUpperCase() + g.slice(1)}</option>
+          {['strategy','instrument','session','regime','daily','weekly','monthly','calendar','review-stats'].map(g => (
+            <option key={g} value={g}>
+              {g === 'calendar' ? '📅 Calendar (Review)'
+               : g === 'review-stats' ? '📊 Review Stats'
+               : g.charAt(0).toUpperCase() + g.slice(1)}
+            </option>
           ))}
         </select>
         <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
@@ -4245,10 +4531,13 @@ const JAnalyticsTab: React.FC = () => {
         <JCalendarView dateFrom={dateFrom} dateTo={dateTo} />
       )}
 
-      {groupBy !== 'calendar' && loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
-      {groupBy !== 'calendar' && error && <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>}
+      {/* Review Stats — fetches /journal/review-analytics independently */}
+      {groupBy === 'review-stats' && <JReviewStatsView />}
 
-      {groupBy !== 'calendar' && data && !loading && (
+      {groupBy !== 'calendar' && groupBy !== 'review-stats' && loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
+      {groupBy !== 'calendar' && groupBy !== 'review-stats' && error && <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>}
+
+      {groupBy !== 'calendar' && groupBy !== 'review-stats' && data && !loading && (
         <>
           {/* Summary cards */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 14 }}>

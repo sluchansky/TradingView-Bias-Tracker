@@ -158,6 +158,10 @@ export const BOT1_ROUTES = [
   // Both are read-only display routes — no money-path or gate involvement.
   "/journal/review-queue-full",
   "/journal/calendar-summary",
+  // Phase 7N Batch C: per-trade learning eligibility + review analytics.
+  // Both are pure SELECT aggregations — never touch learning weights or gate.
+  "/journal/learning-eligibility",
+  "/journal/review-analytics",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",
