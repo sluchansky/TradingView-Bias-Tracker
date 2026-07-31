@@ -417,6 +417,28 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Learning status helpers ────────────────────────────────────────────────────
+const WEIGHT_STATUS_LABEL: Record<string, string> = {
+  UPDATED:              'UPDATED',
+  NO_CHANGE:            'NO CHANGE',
+  INSUFFICIENT_SAMPLES: 'COLLECTING DATA',
+  NOT_ELIGIBLE:         'NOT ELIGIBLE',
+  KEY_NOT_FOUND:        'KEY MISMATCH',
+  DISABLED:             'DISABLED',
+  DB_DISABLED:          'DISABLED',
+  DIAGNOSTIC_BUILD_FAILED: 'UNAVAILABLE',
+  COACH_BUILD_FAILED:   'UNAVAILABLE',
+};
+const WEIGHT_STATUS_COLOR: Record<string, string> = {
+  UPDATED:              '#22c55e',
+  NO_CHANGE:            '#94a3b8',
+  INSUFFICIENT_SAMPLES: '#f59e0b',
+  NOT_ELIGIBLE:         '#64748b',
+  KEY_NOT_FOUND:        '#ef4444',
+  DISABLED:             '#64748b',
+  DB_DISABLED:          '#64748b',
+};
+
 // ── Verdict Panel ─────────────────────────────────────────────────────────────
 const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const v          = (p.verdict ?? {}) as Record<string, unknown>;
@@ -831,35 +853,111 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const perf  = (p.performance ?? {}) as Record<string, unknown>;
   const avail = coach.available !== false;
 
+  // ── learning_diagnostics from Phase 7I audit ───────────────────────────────
+  const ld = (coach.learning_diagnostics ?? {}) as Record<string, unknown>;
+  const weightStatus   = safeStr(ld.weight_status, '');
+  const wsLabel        = WEIGHT_STATUS_LABEL[weightStatus] ?? weightStatus;
+  const wsColor        = WEIGHT_STATUS_COLOR[weightStatus] ?? T.txtMuted;
+  const sampleCount    = safeNum(ld.sample_count) ?? 0;
+  const minSamples     = safeNum(ld.minimum_samples) ?? 20;
+  const currentWeight  = safeNum(ld.current_weight) ?? 1.0;
+  const weightDelta    = safeNum(ld.weight_delta) ?? 0.0;
+  const influencePts   = safeNum(ld.influence_points) ?? 0;
+  const blockedReason  = safeStr(ld.blocked_reason, '');
+  const stratKey       = safeStr(ld.strategy_key, '');
+  const lastUpdate     = safeStr(ld.last_weight_update_at, '');
+  const scoreEnabled   = ld.influence_enabled === true;
+  const isApplied      = ld.applied_to_live_score === true;
+  const samplePct      = Math.min(100, Math.round(sampleCount / minSamples * 100));
+  const isCollecting   = weightStatus === 'INSUFFICIENT_SAMPLES' || weightStatus === 'NOT_ELIGIBLE';
+  const isActive       = weightStatus === 'UPDATED' || weightStatus === 'NO_CHANGE';
+
   return (
     <Panel title="Coach" badge={<Badge label="LEARNING" color={T.purple} />}>
       {!avail ? <UnavailableNote /> : (
         <>
-          {/* Eligibility / weight status */}
-          <div style={{ display:'flex', gap:6, marginBottom:10, flexWrap:'wrap' }}>
-            {coach.rule_engine_eligibility != null && (
-              <Pill text={coach.rule_engine_eligibility ? 'LRE ELIGIBLE' : 'LRE INELIGIBLE'} color={coach.rule_engine_eligibility ? T.green : T.txtMuted} />
+          {/* ── Status header ────────────────────────────────────────────── */}
+          <div style={{ padding:'8px 10px', borderRadius:7, marginBottom:10,
+            background: isActive ? 'rgba(34,197,94,0.06)' : isCollecting ? 'rgba(245,158,11,0.06)' : 'rgba(100,116,139,0.06)',
+            border: `1px solid ${isActive ? 'rgba(34,197,94,0.18)' : isCollecting ? 'rgba(245,158,11,0.18)' : 'rgba(100,116,139,0.18)'}`,
+            borderLeft: `3px solid ${wsColor}` }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom: isCollecting || isActive ? 8 : 0 }}>
+              <div style={{ fontSize:9, letterSpacing:'0.1em', fontWeight:700, color:wsColor }}>
+                LEARNING {wsLabel}
+              </div>
+              {scoreEnabled
+                ? <span style={{ fontSize:8.5, color:T.green }}>SCORE GATE ON</span>
+                : <span style={{ fontSize:8.5, color:T.txtMuted }}>SCORE GATE OFF</span>}
+            </div>
+
+            {/* Sample progress bar */}
+            {(isCollecting || isActive) && (
+              <div style={{ marginBottom:8 }}>
+                <div style={{ display:'flex', justifyContent:'space-between', fontSize:9, color:T.txtMuted, marginBottom:3 }}>
+                  <span>{sampleCount} / {minSamples} required samples</span>
+                  <span style={{ color: sampleCount >= minSamples ? T.green : T.amber }}>{samplePct}%</span>
+                </div>
+                <div style={{ height:4, background:'rgba(255,255,255,0.07)', borderRadius:2 }}>
+                  <div style={{ height:'100%', width:`${samplePct}%`, background: sampleCount >= minSamples ? T.green : T.amber, borderRadius:2, transition:'width 0.4s ease' }} />
+                </div>
+              </div>
             )}
+
+            {/* Weight and delta */}
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'3px 10px', fontSize:9.5 }}>
+              <><span style={{ color:T.txtMuted }}>Current weight</span>
+                <span style={{ fontFamily:T.mono, color: Math.abs(weightDelta) > 0.01 ? T.cyan : T.txtSec }}>
+                  {currentWeight.toFixed(3)}{Math.abs(weightDelta) > 0.001 ? ` (${weightDelta >= 0 ? '+' : ''}${weightDelta.toFixed(3)})` : ''}
+                </span></>
+              <><span style={{ color:T.txtMuted }}>Live influence</span>
+                <span style={{ fontFamily:T.mono, color: influencePts !== 0 ? T.cyan : T.txtMuted }}>
+                  {influencePts !== 0 ? `${influencePts >= 0 ? '+' : ''}${influencePts} pts` : '0 pts'}
+                </span></>
+            </div>
           </div>
 
-          <KV label="Weight Updated" value={
-            <span style={{ display:'flex', alignItems:'center', gap:5 }}>
-              {statusDot(coach.weight_updated === true ? true : coach.weight_updated === false ? false : null)}
-              <span>{coach.weight_updated === true ? 'YES' : coach.weight_updated === false ? 'NO' : '—'}</span>
-            </span>
-          } />
+          {/* ── Detail rows ──────────────────────────────────────────────── */}
+          {blockedReason && !isApplied && (
+            <div style={{ marginBottom:8, padding:'6px 10px', background:'rgba(245,158,11,0.05)', borderRadius:6, border:`1px solid rgba(245,158,11,0.15)` }}>
+              <div style={{ fontSize:9, color:T.amber, letterSpacing:'0.07em', fontWeight:700 }}>BLOCKED REASON</div>
+              <div style={{ fontSize:9.5, color:T.txtSec, marginTop:3 }}>
+                {blockedReason === 'INSUFFICIENT_SAMPLES'
+                  ? `Minimum sample threshold not reached (${sampleCount}/${minSamples})`
+                  : blockedReason === 'DISABLED'
+                  ? 'Learning score influence is disabled'
+                  : blockedReason === 'KEY_NOT_FOUND'
+                  ? 'Strategy key not found in weight store (key mismatch)'
+                  : blockedReason === 'NOT_ELIGIBLE'
+                  ? 'Weight recompute has not run yet this session'
+                  : blockedReason}
+              </div>
+            </div>
+          )}
+
+          {isApplied && stratKey && (
+            <div style={{ marginBottom:8, padding:'5px 10px', background:'rgba(34,197,94,0.05)', borderRadius:6, border:`1px solid rgba(34,197,94,0.15)` }}>
+              <div style={{ fontSize:9, color:T.green, letterSpacing:'0.07em', fontWeight:700 }}>APPLIED TO</div>
+              <div style={{ fontSize:9, color:T.txtSec, marginTop:2, fontFamily:T.mono, wordBreak:'break-all' }}>{stratKey}</div>
+            </div>
+          )}
+
           <KV label="Thesis Resolved" value={
-            <span title="Whether the last thesis was resolved — not a measure of learning readiness">
+            <span title="Whether a thesis was resolved in this session — not a measure of learning readiness">
               {coach.thesis_resolved ? 'YES' : 'NO'}
             </span>
           } />
-          <KV label="Last Resolved" value={fmtTs(coach.thesis_last_resolved_at)} />
-          {coach.learning_influence != null && <KV label="Learning Influence" value={String(coach.learning_influence)} />}
+          <KV label="Last Resolved" value={fmtTs(safeStr(coach.thesis_last_resolved_at, ''))} />
+          {lastUpdate && <KV label="Last Weight Update" value={fmtTs(lastUpdate)} />}
+          <KV label="LRE Status" value={
+            <span style={{ color: coach.rule_engine_eligibility === 'LIVE_ELIGIBLE' ? T.green : T.amber }}>
+              {safeStr(coach.rule_engine_eligibility, '—')}
+            </span>
+          } />
 
-          {/* Performance summary */}
-          {Object.keys(perf).length > 0 && (
-            <div style={{ marginTop:12, borderTop:`1px solid ${T.border}`, paddingTop:10 }}>
-              <div style={{ fontSize:9, color:T.purple, letterSpacing:'0.1em', marginBottom:6 }}>PERFORMANCE</div>
+          {/* ── Performance summary ───────────────────────────────────────── */}
+          {Object.keys(perf).length > 0 && perf.available === true && (
+            <div style={{ marginTop:10, borderTop:`1px solid ${T.border}`, paddingTop:10 }}>
+              <div style={{ fontSize:9, color:T.purple, letterSpacing:'0.1em', marginBottom:6 }}>PERFORMANCE REVIEW</div>
               {perf.win_rate  != null && <KV label="Win Rate"   value={`${fmtNum(perf.win_rate, 0)}%`} mono />}
               {perf.avg_r     != null && <KV label="Avg R"      value={fmtNum(perf.avg_r)}              mono />}
               {perf.trade_count != null && <KV label="Sample"   value={String(perf.trade_count)}        mono />}
@@ -867,8 +965,9 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             </div>
           )}
 
-          <div style={{ marginTop:8, fontSize:9.5, color:T.txtMuted, lineHeight:1.5 }}>
-            <span style={{ color:T.amber }}>ℹ</span> Eligibility ≠ update occurred. Weight updated ≠ readiness. DB available ≠ thesis resolved.
+          <div style={{ marginTop:8, fontSize:8.5, color:T.txtMuted, lineHeight:1.5 }}>
+            <span style={{ color:T.amber }}>ℹ</span>{' '}
+            Influence = 0 until {minSamples} samples. "Weight Updated" = recompute ran, not that weight changed.
           </div>
         </>
       )}

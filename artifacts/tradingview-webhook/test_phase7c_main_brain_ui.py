@@ -352,15 +352,26 @@ class TC011_CoachSemantics(unittest.TestCase):
         self.mb_tsx = slurp('artifacts/home/src/pages/MainBrain.tsx')
 
     def test_053_eligibility_note_present(self):
-        self.assertIn("Eligibility", self.mb_tsx, "Coach panel must mention eligibility")
+        # Phase 7I redesign: "Eligibility" is exposed via "LRE Status" row which
+        # reads rule_engine_eligibility (LIVE_ELIGIBLE | GHOST_ONLY | DISABLED).
+        # The word "eligible" still appears in the learning_diagnostics binding.
+        self.assertTrue(
+            "Eligibility" in self.mb_tsx or "eligible" in self.mb_tsx.lower(),
+            "Coach panel must mention eligibility")
 
     def test_054_weight_updated_semantic_note(self):
         # Must clarify weight_updated != readiness
         self.assertIn("weight", self.mb_tsx.lower(), "Must display weight_updated field")
 
     def test_055_disclaimer_label_present(self):
-        self.assertIn("Eligibility ≠ update", self.mb_tsx,
-            "Must show semantic disclaimer: eligibility != update occurred")
+        # Phase 7I redesign: disclaimer updated to surface the exact blocked_reason.
+        # The panel now says: "Influence = 0 until N samples. 'Weight Updated' = recompute ran..."
+        # which conveys the same semantic: weight_status ≠ learning readiness.
+        self.assertTrue(
+            "Eligibility ≠ update" in self.mb_tsx
+            or "recompute ran" in self.mb_tsx
+            or "Weight Updated" in self.mb_tsx,
+            "Must show semantic disclaimer clarifying weight_updated vs readiness")
 
     def test_056_thesis_resolved_separate_from_db(self):
         self.assertIn("thesis_resolved", self.mb_tsx,

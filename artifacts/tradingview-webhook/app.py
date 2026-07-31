@@ -23060,12 +23060,110 @@ def build_coach_interface(result, instrument=None, mode=None):
         _elig_status, _ = _check_learning_eligibility(inst, mode=_mode)
         rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE"
 
+        # ── Learning diagnostics (Part 6 of learning-engine audit) — READ-ONLY ────
+        # Exposes the full pipeline state so the Coach panel can show a precise
+        # status (COLLECTING_DATA / ACTIVE / INSUFFICIENT_SAMPLES / DISABLED) instead
+        # of the ambiguous "Weight Updated: YES/NO".  No DB call, no recompute, no
+        # write.  Reads the same in-memory caches that the live scoring engine uses so
+        # the diagnostic always reflects the exact evidence available at gate time.
+        try:
+            # active_key: the key the live scoring engine would look up RIGHT NOW.
+            # Source is result["strategy_engine"]["active_key"] which is already
+            # computed; calling compute_strategy_engine again would be redundant.
+            _se         = (result.get("strategy_engine") or {}) if result else {}
+            _active_key = _se.get("active_key")   # e.g. "CHOCH_LONG", may be None
+            _ns_key     = _ns_learning_key(_active_key, _mode) if _active_key else None
+
+            with LEARNING_LOCK:
+                _la      = dict(LEARNING_ANALYTICS)
+                if _active_key:
+                    _dw, _dn = (STRATEGY_WEIGHTS.get(_ns_key,
+                                    STRATEGY_WEIGHTS.get(_active_key, 1.0)),
+                                LEARNING_SAMPLE_BY_KEY.get(_ns_key,
+                                    LEARNING_SAMPLE_BY_KEY.get(_active_key, 0)))
+                else:
+                    # No active strategy — report the highest-sample key for this mode
+                    _prefix  = "%s::" % _mode
+                    _keys    = {k: v for k, v in LEARNING_SAMPLE_BY_KEY.items()
+                                if k.startswith(_prefix)}
+                    _best_k  = max(_keys, key=lambda k: _keys[k]) if _keys else None
+                    _dn      = _keys.get(_best_k, 0)
+                    _dw      = STRATEGY_WEIGHTS.get(_best_k, 1.0) if _best_k else 1.0
+                    _ns_key  = _best_k
+
+            _score_enabled  = _learning_score_gate_enabled()
+            _recompute_ran  = bool(_la.get("updated_at"))
+            _total_trades   = int(_la.get("total_trades") or 0)
+
+            # Precise weight_status that replaces the ambiguous boolean
+            if not _score_enabled:
+                _weight_status = "DISABLED"
+                _blocked       = "DISABLED"
+                _applied       = False
+            elif not LEARNING_DB_ENABLED:
+                _weight_status = "DISABLED"
+                _blocked       = "DB_DISABLED"
+                _applied       = False
+            elif not _recompute_ran:
+                _weight_status = "NOT_ELIGIBLE"
+                _blocked       = "NOT_ELIGIBLE"
+                _applied       = False
+            elif _dn < LEARNING_MIN_SAMPLE:
+                _weight_status = "INSUFFICIENT_SAMPLES"
+                _blocked       = "INSUFFICIENT_SAMPLES"
+                _applied       = False
+            elif _active_key and _ns_key not in STRATEGY_WEIGHTS and _active_key not in STRATEGY_WEIGHTS:
+                _weight_status = "KEY_NOT_FOUND"
+                _blocked       = "KEY_NOT_FOUND"
+                _applied       = False
+            else:
+                _applied       = learning_influence != 0.0
+                if abs(float(_dw) - 1.0) < 0.001:
+                    _weight_status = "NO_CHANGE"
+                    _blocked       = None
+                else:
+                    _weight_status = "UPDATED"
+                    _blocked       = None
+
+            learning_diagnostics = {
+                "enabled":               LEARNING_DB_ENABLED,
+                "influence_enabled":     _score_enabled,
+                "mode":                  _mode,
+                "eligible":              rule_engine_eligibility not in ("DISABLED",),
+                "strategy_key":          _ns_key,
+                "sample_count":          int(_dn),
+                "minimum_samples":       LEARNING_MIN_SAMPLE,
+                "closed_trade_count":    _total_trades,
+                "current_weight":        round(float(_dw), 4),
+                "previous_weight":       None,   # no previous-weight tracking exists yet
+                "weight_delta":          round(float(_dw) - 1.0, 4),
+                "influence_points":      float(learning_influence),
+                "last_sample_at":        None,   # no per-sample timestamp cache yet
+                "last_weight_update_at": _la.get("updated_at"),
+                "applied_to_live_score": _applied,
+                "blocked_reason":        _blocked,
+                "weight_status":         _weight_status,
+                "source":                "learning_db",
+            }
+        except Exception as _ld_exc:
+            logger.debug("build_coach_interface diagnostics fail-open: %s", _ld_exc)
+            learning_diagnostics = {
+                "enabled":           LEARNING_DB_ENABLED,
+                "influence_enabled": False,
+                "sample_count":      0,
+                "minimum_samples":   LEARNING_MIN_SAMPLE,
+                "blocked_reason":    "DIAGNOSTIC_BUILD_FAILED",
+                "weight_status":     "DISABLED",
+                "source":            "learning_db",
+            }
+
         return {
             "weight_updated":            weight_updated,
             "thesis_resolved":           thesis_resolved,
             "thesis_last_resolved_at":   thesis_last_resolved_at,
             "learning_influence":        learning_influence,
             "rule_engine_eligibility":   rule_engine_eligibility,
+            "learning_diagnostics":      learning_diagnostics,
             "_version":                  "v1",
         }
     except Exception as _cch_exc:
@@ -23076,6 +23174,12 @@ def build_coach_interface(result, instrument=None, mode=None):
             "thesis_last_resolved_at":   None,
             "learning_influence":        0.0,
             "rule_engine_eligibility":   "LIVE_ELIGIBLE",
+            "learning_diagnostics":      {
+                "enabled": LEARNING_DB_ENABLED, "influence_enabled": False,
+                "sample_count": 0, "minimum_samples": LEARNING_MIN_SAMPLE,
+                "blocked_reason": "COACH_BUILD_FAILED", "weight_status": "DISABLED",
+                "source": "learning_db",
+            },
             "_version":                  "v1",
         }
 
