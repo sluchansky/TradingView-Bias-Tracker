@@ -43241,8 +43241,26 @@ def _persist_tradezella_trades(trades, filename=None):
                     "ON CONFLICT (dedupe_key) DO NOTHING RETURNING id",
                     row,
                 )
-                if cur.fetchone() is not None:
+                row_result = cur.fetchone()
+                if row_result is not None:
                     imported += 1
+                    # Phase 7N: create a journal_reviews stub for each newly-inserted
+                    # trade, mapping any Tradzella notes → pre_trade_notes on first
+                    # import.  ON CONFLICT DO NOTHING preserves existing review work
+                    # on re-import (the review row stays untouched).
+                    new_trade_id = row_result[0]
+                    trz_notes    = (t.get("notes") or "").strip() or None
+                    try:
+                        cur.execute(
+                            "INSERT INTO journal_reviews"
+                            " (source, trade_id, review_status, pre_trade_notes,"
+                            "  reviewed_by, updated_at)"
+                            " VALUES ('tradzella',%s,'UNREVIEWED',%s,'operator',NOW())"
+                            " ON CONFLICT (source, trade_id) DO NOTHING",
+                            (new_trade_id, trz_notes),
+                        )
+                    except Exception:
+                        pass  # fail-open: review row is not critical
             skipped_dupes = len(trades) - imported
             cur.execute(
                 "INSERT INTO tradezella_import_batches "
@@ -43723,13 +43741,17 @@ def journal_trades_list():
             " COALESCE(st.result, '') AS result,"
             " COALESCE(CAST(st.r_multiple AS double precision), 0) AS r_multiple,"
             " NULL::double precision AS pnl,"
-            " 'system' AS review_status,"
+            # Phase 7N: real review status from journal_reviews (not a hardcoded label)
+            " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
             " COALESCE(CAST(st.edge_score AS double precision), 0) AS edge_score,"
             " CASE WHEN st.opened_at IS NOT NULL AND st.closed_at IS NOT NULL"
             "      THEN EXTRACT(EPOCH FROM (st.closed_at - st.opened_at))/60.0"
             "      ELSE NULL END AS duration_min,"
             " COALESCE(st.trading_mode, 'SWING') AS trading_mode"
-            " FROM strategy_trades st WHERE " + " AND ".join(sys_w)
+            " FROM strategy_trades st"
+            " LEFT JOIN journal_reviews jr"
+            "   ON jr.source = 'system' AND jr.trade_id = st.id"
+            " WHERE " + " AND ".join(sys_w)
         ) if flt_src in (None, "system") else None
 
         tz_sql = (
@@ -43741,13 +43763,17 @@ def journal_trades_list():
             " COALESCE(tt.outcome, '') AS result,"
             " COALESCE(tt.r_multiple, 0) AS r_multiple,"
             " COALESCE(tt.pnl, 0) AS pnl,"
-            " 'imported' AS review_status,"
+            # Phase 7N: real review status from journal_reviews
+            " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
             " NULL::double precision AS edge_score,"
             " CASE WHEN tt.entry_time IS NOT NULL AND tt.exit_time IS NOT NULL"
             "      THEN EXTRACT(EPOCH FROM (tt.exit_time - tt.entry_time))/60.0"
             "      ELSE NULL END AS duration_min,"
             " COALESCE(tt.mode, 'UNKNOWN') AS trading_mode"
-            " FROM tradezella_trades tt WHERE " + " AND ".join(tz_w)
+            " FROM tradezella_trades tt"
+            " LEFT JOIN journal_reviews jr"
+            "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
+            " WHERE " + " AND ".join(tz_w)
         ) if flt_src in (None, "tradzella") else None
 
         if sys_sql and tz_sql:
@@ -44400,6 +44426,507 @@ def journal_learning():
             "disabled_setups": entry.get("disabled_setups", []),
         })
     return jsonify({"ok": True, "records": records, "total": len(records)})
+
+
+# ---------------------------------------------------------------------------
+# Phase 7N — Journal Review System  (Batch A — owner-only, DISPLAY/EDIT ONLY)
+# ---------------------------------------------------------------------------
+# Stores review-authored fields in journal_reviews (separate from execution
+# truth in strategy_trades / tradezella_trades).  Never touches gate, scoring,
+# sizing, alerts, learning formulas, or any broker path.
+# ---------------------------------------------------------------------------
+
+REVIEW_MISTAKE_TAGS = frozenset({
+    # ENTRY
+    "chased_entry", "entered_early", "entered_late", "ignored_confirmation",
+    "wrong_direction", "poor_location",
+    # RISK
+    "oversized", "stop_too_tight", "stop_too_wide", "moved_stop",
+    "no_stop", "exceeded_daily_risk",
+    # MANAGEMENT
+    "exited_early", "held_too_long", "missed_target", "added_to_loser",
+    "overmanaged", "ignored_active_trade_plan",
+    # PSYCHOLOGY
+    "fear", "greed", "revenge_trade", "fomo", "impatience", "hesitation",
+    "overconfidence", "boredom_trade",
+    # PROCESS
+    "traded_outside_session", "ignored_thesis", "ignored_risk_state",
+    "ignored_blocker", "duplicate_setup", "manual_override",
+})
+
+REVIEW_POSITIVE_TAGS = frozenset({
+    "patient_entry", "respected_stop", "respected_size",
+    "waited_for_confirmation", "followed_thesis", "followed_trade_plan",
+    "managed_calmly", "took_planned_profit", "avoided_overtrading",
+    "good_risk_reward", "good_execution", "correct_no_trade_decision",
+})
+
+REVIEW_EMOTION_TAGS = frozenset({
+    "calm", "confident", "anxious", "fearful", "greedy", "frustrated",
+    "revenge", "fomo", "impatient", "hesitant", "overconfident",
+    "tired", "distracted",
+})
+
+REVIEW_FOLLOWED_PLAN_VALUES = frozenset({"YES", "PARTIALLY", "NO", "NOT_APPLICABLE"})
+REVIEW_STATUS_VALUES = frozenset({
+    "UNREVIEWED", "IN_PROGRESS", "REVIEWED", "NEEDS_DATA", "EXCLUDED",
+})
+
+REVIEW_PLAN_CHECKLIST_ITEMS = [
+    "entered_inside_planned_zone", "used_planned_stop", "respected_position_size",
+    "did_not_chase", "did_not_move_stop_wider", "followed_target_plan",
+    "avoided_premature_exit", "waited_for_confirmation",
+    "respected_session_rules", "respected_daily_risk_rules",
+]
+
+
+def _review_is_complete(row):
+    """True when minimum required fields are set for REVIEWED status."""
+    if not row.get("followed_plan"):
+        return False
+    if not row.get("overall_quality"):
+        return False
+    if not (row.get("post_trade_review") or "").strip():
+        return False
+    lesson   = (row.get("lesson_learned") or "").strip()
+    pos_tags = row.get("positive_tags") or []
+    mis_tags = row.get("mistake_tags") or []
+    return bool(lesson or pos_tags or mis_tags)
+
+
+def _review_needs_data(source, trade_id, conn):
+    """True if trade is missing execution truth required before learning."""
+    try:
+        with conn.cursor() as cur:
+            if source == "system":
+                cur.execute(
+                    "SELECT entry, strategy_key, result"
+                    " FROM strategy_trades WHERE id = %s",
+                    (trade_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return True
+                entry, sk, result = row
+                return not entry or not sk or not result
+            elif source == "tradzella":
+                cur.execute(
+                    "SELECT entry_price, outcome"
+                    " FROM tradezella_trades WHERE id = %s",
+                    (trade_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return True
+                entry_price, outcome = row
+                return not entry_price or not outcome
+    except Exception:
+        pass  # fail-open
+    return False
+
+
+def _get_or_default_review(conn, source, trade_id):
+    """Return the existing journal_reviews row or UNREVIEWED defaults dict."""
+    _KEYS = (
+        "review_status", "followed_plan", "plan_checklist", "mistake_tags",
+        "positive_tags", "emotion_tags", "pre_trade_notes", "in_trade_notes",
+        "post_trade_review", "lesson_learned", "what_differently", "what_repeat",
+        "setup_quality", "execution_quality", "discipline_quality",
+        "overall_quality", "exclude_reason", "reviewed_at", "reviewed_by",
+        "updated_at",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT review_status, followed_plan, plan_checklist, mistake_tags,"
+                " positive_tags, emotion_tags, pre_trade_notes, in_trade_notes,"
+                " post_trade_review, lesson_learned, what_differently, what_repeat,"
+                " setup_quality, execution_quality, discipline_quality, overall_quality,"
+                " exclude_reason, reviewed_at, reviewed_by, updated_at"
+                " FROM journal_reviews WHERE source = %s AND trade_id = %s",
+                (source, trade_id),
+            )
+            row = cur.fetchone()
+    except Exception:
+        row = None
+    if row is None:
+        return {k: None for k in _KEYS} | {
+            "review_status": "UNREVIEWED", "reviewed_by": "operator",
+        }
+    d = dict(zip(_KEYS, row))
+    for k in ("reviewed_at", "updated_at"):
+        if d.get(k) and hasattr(d[k], "isoformat"):
+            d[k] = d[k].isoformat()
+    return d
+
+
+@app.route("/journal/trade/<source>/<int:trade_id>/review", methods=["GET"])
+def journal_trade_review_get(source, trade_id):
+    """Fetch the review row for a trade, or return UNREVIEWED defaults."""
+    if source not in ("system", "tradzella"):
+        return jsonify({"ok": False, "error": f"unknown source '{source}'"}), 400
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        review = _get_or_default_review(conn, source, trade_id)
+        return jsonify({
+            "ok": True,
+            "review": review,
+            "vocabulary": {
+                "mistake_tags":   sorted(REVIEW_MISTAKE_TAGS),
+                "positive_tags":  sorted(REVIEW_POSITIVE_TAGS),
+                "emotion_tags":   sorted(REVIEW_EMOTION_TAGS),
+                "followed_plan":  sorted(REVIEW_FOLLOWED_PLAN_VALUES),
+                "plan_checklist": REVIEW_PLAN_CHECKLIST_ITEMS,
+            },
+        })
+    except Exception as exc:
+        logger.warning("journal_trade_review_get failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/trade/<source>/<int:trade_id>/review", methods=["PATCH"])
+def journal_trade_review_patch(source, trade_id):
+    """Upsert review fields. Validates controlled vocabulary. Auto-computes status."""
+    if source not in ("system", "tradzella"):
+        return jsonify({"ok": False, "error": f"unknown source '{source}'"}), 400
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+
+    # ── Validate followed_plan ───────────────────────────────────────────────
+    followed_plan = data.get("followed_plan")
+    if followed_plan is not None and followed_plan not in REVIEW_FOLLOWED_PLAN_VALUES:
+        return jsonify({"ok": False,
+                        "error": f"invalid followed_plan '{followed_plan}'"}), 400
+
+    # ── Validate tag arrays ──────────────────────────────────────────────────
+    def _validate_tags(field, vocab):
+        raw = data.get(field)
+        if raw is None:
+            return None, None
+        if not isinstance(raw, list):
+            return None, f"'{field}' must be a list"
+        deduped = list(dict.fromkeys(raw))        # preserve order, remove dupes
+        known   = [t for t in deduped if t in vocab]
+        custom  = [t for t in deduped if t not in vocab and str(t).startswith("custom:")]
+        unknown = [t for t in deduped if t not in vocab and not str(t).startswith("custom:")]
+        if unknown:
+            return None, f"unknown {field}: {unknown[:3]}"
+        return known + custom, None
+
+    mistake_tags,  err_mt = _validate_tags("mistake_tags",  REVIEW_MISTAKE_TAGS)
+    if err_mt:
+        return jsonify({"ok": False, "error": err_mt}), 400
+    positive_tags, err_pt = _validate_tags("positive_tags", REVIEW_POSITIVE_TAGS)
+    if err_pt:
+        return jsonify({"ok": False, "error": err_pt}), 400
+
+    # Emotion tags: list of str or {tag, intensity}
+    emotion_tags_raw = data.get("emotion_tags")
+    emotion_tags = None
+    if emotion_tags_raw is not None:
+        if not isinstance(emotion_tags_raw, list):
+            return jsonify({"ok": False, "error": "'emotion_tags' must be a list"}), 400
+        seen_tags: set = set()
+        valid_et = []
+        for et in emotion_tags_raw:
+            tag = et if isinstance(et, str) else (et.get("tag") if isinstance(et, dict) else None)
+            if not tag or tag not in REVIEW_EMOTION_TAGS:
+                return jsonify({"ok": False,
+                                "error": f"unknown emotion_tag '{tag}'"}), 400
+            if tag in seen_tags:
+                continue  # dedupe
+            seen_tags.add(tag)
+            intensity = None
+            if isinstance(et, dict):
+                intensity = et.get("intensity")
+                if intensity is not None:
+                    try:
+                        intensity = int(intensity)
+                        if not 1 <= intensity <= 5:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        return jsonify({"ok": False,
+                                        "error": "emotion intensity must be 1–5"}), 400
+            valid_et.append({"tag": tag, "intensity": intensity})
+        emotion_tags = valid_et
+
+    # ── Validate ratings 1–5 ────────────────────────────────────────────────
+    rating_vals = {}
+    for field in ("setup_quality", "execution_quality",
+                  "discipline_quality", "overall_quality"):
+        v = data.get(field)
+        if v is not None:
+            try:
+                v = int(v)
+                if not 1 <= v <= 5:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return jsonify({"ok": False,
+                                "error": f"'{field}' must be 1–5"}), 400
+            rating_vals[field] = v
+
+    # ── Validate plan_checklist ──────────────────────────────────────────────
+    plan_checklist = data.get("plan_checklist")
+    if plan_checklist is not None:
+        if not isinstance(plan_checklist, dict):
+            return jsonify({"ok": False, "error": "'plan_checklist' must be a dict"}), 400
+        bad = [k for k in plan_checklist if k not in REVIEW_PLAN_CHECKLIST_ITEMS]
+        if bad:
+            return jsonify({"ok": False,
+                            "error": f"unknown checklist items: {bad[:3]}"}), 400
+
+    # ── Fetch current row; guard EXCLUDED ───────────────────────────────────
+    existing = _get_or_default_review(conn, source, trade_id)
+    if existing.get("review_status") == "EXCLUDED":
+        return jsonify({"ok": False,
+                        "error": "trade is EXCLUDED — use /exclude to change status"}), 409
+
+    # ── Merge with existing ──────────────────────────────────────────────────
+    def _merge(field, new_val, old_val):
+        return new_val if new_val is not None else old_val
+
+    def _merge_text(field):
+        v = (data.get(field) or "").strip()
+        return v if v else existing.get(field)
+
+    merged = {
+        "followed_plan":     followed_plan  if followed_plan  is not None else existing.get("followed_plan"),
+        "plan_checklist":    plan_checklist if plan_checklist is not None else existing.get("plan_checklist"),
+        "mistake_tags":      mistake_tags   if mistake_tags   is not None else existing.get("mistake_tags"),
+        "positive_tags":     positive_tags  if positive_tags  is not None else existing.get("positive_tags"),
+        "emotion_tags":      emotion_tags   if emotion_tags   is not None else existing.get("emotion_tags"),
+        "pre_trade_notes":   _merge_text("pre_trade_notes"),
+        "in_trade_notes":    _merge_text("in_trade_notes"),
+        "post_trade_review": _merge_text("post_trade_review"),
+        "lesson_learned":    _merge_text("lesson_learned"),
+        "what_differently":  _merge_text("what_differently"),
+        "what_repeat":       _merge_text("what_repeat"),
+        "setup_quality":     rating_vals.get("setup_quality",     existing.get("setup_quality")),
+        "execution_quality": rating_vals.get("execution_quality", existing.get("execution_quality")),
+        "discipline_quality":rating_vals.get("discipline_quality",existing.get("discipline_quality")),
+        "overall_quality":   rating_vals.get("overall_quality",   existing.get("overall_quality")),
+    }
+
+    # ── Auto-compute review_status ───────────────────────────────────────────
+    explicit_status = data.get("review_status")
+    if explicit_status == "REVIEWED":
+        if not _review_is_complete(merged):
+            return jsonify({"ok": False,
+                            "error": "Cannot mark REVIEWED — set followed_plan, "
+                                     "overall_quality, post_trade_review and at least "
+                                     "one tag or lesson."}), 400
+        new_status = "REVIEWED"
+    elif explicit_status in REVIEW_STATUS_VALUES and explicit_status != "EXCLUDED":
+        new_status = explicit_status
+    elif _review_is_complete(merged):
+        new_status = "REVIEWED"
+    elif any(
+        v is not None and v != [] and v != ""
+        for v in merged.values()
+    ):
+        new_status = "IN_PROGRESS"
+    else:
+        new_status = "UNREVIEWED"
+
+    # NEEDS_DATA overrides IN_PROGRESS/REVIEWED when execution truth is missing
+    if new_status in ("IN_PROGRESS", "REVIEWED") and _review_needs_data(source, trade_id, conn):
+        new_status = "NEEDS_DATA"
+
+    now_ts      = datetime.now(timezone.utc)
+    reviewed_at = now_ts.isoformat() if new_status == "REVIEWED" else (
+        existing.get("reviewed_at") if existing.get("review_status") == "REVIEWED" else None
+    )
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO journal_reviews"
+                " (source, trade_id, review_status, followed_plan, plan_checklist,"
+                "  mistake_tags, positive_tags, emotion_tags, pre_trade_notes,"
+                "  in_trade_notes, post_trade_review, lesson_learned, what_differently,"
+                "  what_repeat, setup_quality, execution_quality, discipline_quality,"
+                "  overall_quality, reviewed_at, reviewed_by, updated_at)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " ON CONFLICT (source, trade_id) DO UPDATE SET"
+                "  review_status    = EXCLUDED.review_status,"
+                "  followed_plan    = EXCLUDED.followed_plan,"
+                "  plan_checklist   = EXCLUDED.plan_checklist,"
+                "  mistake_tags     = EXCLUDED.mistake_tags,"
+                "  positive_tags    = EXCLUDED.positive_tags,"
+                "  emotion_tags     = EXCLUDED.emotion_tags,"
+                "  pre_trade_notes  = EXCLUDED.pre_trade_notes,"
+                "  in_trade_notes   = EXCLUDED.in_trade_notes,"
+                "  post_trade_review= EXCLUDED.post_trade_review,"
+                "  lesson_learned   = EXCLUDED.lesson_learned,"
+                "  what_differently = EXCLUDED.what_differently,"
+                "  what_repeat      = EXCLUDED.what_repeat,"
+                "  setup_quality    = EXCLUDED.setup_quality,"
+                "  execution_quality= EXCLUDED.execution_quality,"
+                "  discipline_quality=EXCLUDED.discipline_quality,"
+                "  overall_quality  = EXCLUDED.overall_quality,"
+                "  reviewed_at      = EXCLUDED.reviewed_at,"
+                "  reviewed_by      = EXCLUDED.reviewed_by,"
+                "  updated_at       = EXCLUDED.updated_at"
+                " RETURNING id",
+                (
+                    source, trade_id, new_status,
+                    merged["followed_plan"],
+                    psycopg2.extras.Json(merged["plan_checklist"]),
+                    psycopg2.extras.Json(merged["mistake_tags"]),
+                    psycopg2.extras.Json(merged["positive_tags"]),
+                    psycopg2.extras.Json(merged["emotion_tags"]),
+                    merged["pre_trade_notes"], merged["in_trade_notes"],
+                    merged["post_trade_review"], merged["lesson_learned"],
+                    merged["what_differently"], merged["what_repeat"],
+                    merged["setup_quality"], merged["execution_quality"],
+                    merged["discipline_quality"], merged["overall_quality"],
+                    reviewed_at, "operator", now_ts,
+                ),
+            )
+        return jsonify({
+            "ok": True, "review_status": new_status, "reviewed_at": reviewed_at,
+        })
+    except Exception as exc:
+        logger.warning("journal_trade_review_patch failed: %s", exc)
+        return jsonify({"ok": False, "error": "update failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/trade/<source>/<int:trade_id>/exclude", methods=["POST"])
+def journal_trade_exclude(source, trade_id):
+    """Set a trade to EXCLUDED status with a mandatory reason."""
+    if source not in ("system", "tradzella"):
+        return jsonify({"ok": False, "error": f"unknown source '{source}'"}), 400
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    data   = request.get_json(force=True, silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify({"ok": False, "error": "reason required"}), 400
+    now_ts = datetime.now(timezone.utc)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO journal_reviews"
+                " (source, trade_id, review_status, exclude_reason, reviewed_by, updated_at)"
+                " VALUES (%s,%s,'EXCLUDED',%s,'operator',%s)"
+                " ON CONFLICT (source, trade_id) DO UPDATE SET"
+                "  review_status  = 'EXCLUDED',"
+                "  exclude_reason = EXCLUDED.exclude_reason,"
+                "  reviewed_by    = 'operator',"
+                "  updated_at     = EXCLUDED.updated_at"
+                " RETURNING id",
+                (source, trade_id, reason[:500], now_ts),
+            )
+        return jsonify({"ok": True, "review_status": "EXCLUDED"})
+    except Exception as exc:
+        logger.warning("journal_trade_exclude failed: %s", exc)
+        return jsonify({"ok": False, "error": "update failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/review-queue", methods=["GET"])
+def journal_review_queue():
+    """Unreviewed closed-trade count + oldest for 'Review Next Trade'."""
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM strategy_trades st"
+                " LEFT JOIN journal_reviews jr ON jr.source='system' AND jr.trade_id=st.id"
+                " WHERE st.closed_at IS NOT NULL"
+                "   AND st.result IS NOT NULL AND st.result != ''"
+                "   AND COALESCE(jr.review_status,'UNREVIEWED')"
+                "       NOT IN ('EXCLUDED','REVIEWED')"
+            )
+            sys_count = int((cur.fetchone() or (0,))[0])
+            cur.execute(
+                "SELECT COUNT(*) FROM tradezella_trades tt"
+                " LEFT JOIN journal_reviews jr ON jr.source='tradzella' AND jr.trade_id=tt.id"
+                " WHERE tt.exit_time IS NOT NULL AND tt.outcome IS NOT NULL"
+                "   AND COALESCE(jr.review_status,'UNREVIEWED')"
+                "       NOT IN ('EXCLUDED','REVIEWED')"
+            )
+            tz_count  = int((cur.fetchone() or (0,))[0])
+            total     = sys_count + tz_count
+
+            # Oldest unreviewed system trade
+            cur.execute(
+                "SELECT st.id, 'system' AS source,"
+                " COALESCE(st.opened_at, st.created_at) AS date"
+                " FROM strategy_trades st"
+                " LEFT JOIN journal_reviews jr ON jr.source='system' AND jr.trade_id=st.id"
+                " WHERE st.closed_at IS NOT NULL"
+                "   AND st.result IS NOT NULL AND st.result != ''"
+                "   AND COALESCE(jr.review_status,'UNREVIEWED')"
+                "       NOT IN ('EXCLUDED','REVIEWED')"
+                " ORDER BY COALESCE(st.opened_at,st.created_at) ASC NULLS LAST LIMIT 1"
+            )
+            sys_oldest = cur.fetchone()
+            cur.execute(
+                "SELECT tt.id, 'tradzella' AS source, tt.entry_time AS date"
+                " FROM tradezella_trades tt"
+                " LEFT JOIN journal_reviews jr ON jr.source='tradzella' AND jr.trade_id=tt.id"
+                " WHERE tt.exit_time IS NOT NULL AND tt.outcome IS NOT NULL"
+                "   AND COALESCE(jr.review_status,'UNREVIEWED')"
+                "       NOT IN ('EXCLUDED','REVIEWED')"
+                " ORDER BY tt.entry_time ASC NULLS LAST LIMIT 1"
+            )
+            tz_oldest = cur.fetchone()
+
+        candidates = []
+        if sys_oldest:
+            candidates.append({
+                "id": sys_oldest[0], "source": "system", "date": sys_oldest[2],
+            })
+        if tz_oldest:
+            candidates.append({
+                "id": tz_oldest[0], "source": "tradzella", "date": tz_oldest[2],
+            })
+        if candidates:
+            candidates.sort(
+                key=lambda x: (x["date"] or datetime.min.replace(tzinfo=timezone.utc))
+            )
+            nxt = candidates[0]
+            if nxt.get("date") and hasattr(nxt["date"], "isoformat"):
+                nxt["date"] = nxt["date"].isoformat()
+        else:
+            nxt = None
+
+        return jsonify({
+            "ok": True,
+            "unreviewed_count": total,
+            "next_trade": nxt,
+            "all_reviewed": total == 0,
+        })
+    except Exception as exc:
+        logger.warning("journal_review_queue failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

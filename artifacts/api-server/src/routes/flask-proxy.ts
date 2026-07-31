@@ -149,6 +149,11 @@ export const BOT1_ROUTES = [
   "/journal/import/batches",
   "/journal/trade/:source/:id",
   "/journal/trade/:source/:id/notes",
+  // Phase 7N: Review workflow — PATCH updates review fields, POST marks excluded.
+  // All write to journal_reviews only (never execution-truth tables).
+  "/journal/trade/:source/:id/review",
+  "/journal/trade/:source/:id/exclude",
+  "/journal/review-queue",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",

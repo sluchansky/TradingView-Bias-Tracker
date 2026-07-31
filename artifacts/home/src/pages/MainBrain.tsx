@@ -2481,6 +2481,473 @@ function jResultBadge(result: string): React.ReactNode {
   );
 }
 
+function jReviewBadge(status: string): React.ReactNode {
+  const s = (status || 'UNREVIEWED').toUpperCase();
+  const cfg: Record<string, { col: string; label: string }> = {
+    REVIEWED:    { col: T.green,    label: '✓ Reviewed' },
+    IN_PROGRESS: { col: T.amber,    label: '… Draft' },
+    NEEDS_DATA:  { col: T.red,      label: '⚠ Needs Data' },
+    EXCLUDED:    { col: T.txtMuted, label: '— Excluded' },
+    UNREVIEWED:  { col: T.txtMuted, label: '○ Unreviewed' },
+  };
+  const { col, label } = cfg[s] ?? { col: T.txtMuted, label: s };
+  return (
+    <span style={{ background: col + '22', color: col, borderRadius: 3,
+      padding: '1px 5px', fontSize: 8, fontWeight: 700, letterSpacing: '0.04em',
+      whiteSpace: 'nowrap' }}>
+      {label}
+    </span>
+  );
+}
+
+// ── Phase 7N: Review system types ─────────────────────────────────────────────
+interface JReviewVocabulary {
+  mistake_tags: string[];
+  positive_tags: string[];
+  emotion_tags: string[];
+  followed_plan: string[];
+  plan_checklist: string[];
+}
+
+interface JReviewData {
+  review_status: string;
+  followed_plan: string | null;
+  plan_checklist: Record<string, boolean> | null;
+  mistake_tags: string[] | null;
+  positive_tags: string[] | null;
+  emotion_tags: Array<{ tag: string; intensity: number | null }> | null;
+  pre_trade_notes: string | null;
+  in_trade_notes: string | null;
+  post_trade_review: string | null;
+  lesson_learned: string | null;
+  what_differently: string | null;
+  what_repeat: string | null;
+  setup_quality: number | null;
+  execution_quality: number | null;
+  discipline_quality: number | null;
+  overall_quality: number | null;
+  exclude_reason: string | null;
+  reviewed_at: string | null;
+}
+
+// ── Phase 7N: Review Modal ─────────────────────────────────────────────────────
+
+const TagChips: React.FC<{
+  tags: string[];
+  selected: string[];
+  onToggle: (tag: string) => void;
+  activeColor?: string;
+}> = ({ tags, selected, onToggle, activeColor = T.cyan }) => (
+  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+    {tags.map(tag => {
+      const on = selected.includes(tag);
+      return (
+        <button key={tag} onClick={() => onToggle(tag)}
+          style={{ background: on ? activeColor + '33' : T.panelAlt,
+            border: `1px solid ${on ? activeColor + '88' : T.border}`,
+            borderRadius: 10, color: on ? activeColor : T.txtMuted,
+            padding: '3px 8px', fontSize: 9, cursor: 'pointer',
+            fontWeight: on ? 700 : 400, transition: 'all 0.1s' }}>
+          {tag.replace(/_/g, ' ')}
+        </button>
+      );
+    })}
+  </div>
+);
+
+const RatingPicker: React.FC<{
+  label: string; value: number | null; onChange: (v: number | null) => void;
+}> = ({ label, value, onChange }) => (
+  <div>
+    <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 4 }}>{label}</div>
+    <div style={{ display: 'flex', gap: 4 }}>
+      {[1,2,3,4,5].map(n => {
+        const on = (value ?? 0) >= n;
+        return (
+          <button key={n} onClick={() => onChange(value === n ? null : n)}
+            title={['','Poor','Fair','Avg','Good','Excellent'][n]}
+            style={{ background: on ? T.amber + '33' : T.panelAlt,
+              border: `1px solid ${on ? T.amber : T.border}`,
+              borderRadius: 4, color: on ? T.amber : T.txtMuted,
+              width: 32, height: 28, fontSize: 12, cursor: 'pointer', fontWeight: 700 }}>
+            {n}
+          </button>
+        );
+      })}
+      {value !== null && (
+        <button onClick={() => onChange(null)}
+          style={{ background: 'none', border: 'none', color: T.txtMuted,
+            fontSize: 10, cursor: 'pointer', padding: '0 4px' }}>
+          ✕
+        </button>
+      )}
+    </div>
+  </div>
+);
+
+const JReviewModal: React.FC<{
+  source: string; tradeId: number; tradeSummary: JTradeDetail;
+  onClose: () => void; onSaved: (status: string) => void;
+}> = ({ source, tradeId, tradeSummary, onClose, onSaved }) => {
+  const [loading,   setLoading]   = useState(true);
+  const [vocab,     setVocab]     = useState<JReviewVocabulary | null>(null);
+  const [saving,    setSaving]    = useState(false);
+  const [error,     setError]     = useState<string | null>(null);
+  const [curStatus, setCurStatus] = useState('UNREVIEWED');
+
+  // Edit state
+  const [followedPlan,      setFollowedPlan]      = useState('');
+  const [checklist,         setChecklist]          = useState<Record<string, boolean>>({});
+  const [mistakeTags,       setMistakeTags]        = useState<string[]>([]);
+  const [positiveTags,      setPositiveTags]       = useState<string[]>([]);
+  const [emotionTags,       setEmotionTags]        = useState<{tag:string;intensity:number|null}[]>([]);
+  const [preTradeNotes,     setPreTradeNotes]      = useState('');
+  const [inTradeNotes,      setInTradeNotes]       = useState('');
+  const [postTradeReview,   setPostTradeReview]    = useState('');
+  const [lessonLearned,     setLessonLearned]      = useState('');
+  const [whatDifferently,   setWhatDifferently]    = useState('');
+  const [whatRepeat,        setWhatRepeat]         = useState('');
+  const [setupQ,            setSetupQ]             = useState<number|null>(null);
+  const [execQ,             setExecQ]              = useState<number|null>(null);
+  const [discQ,             setDiscQ]              = useState<number|null>(null);
+  const [overallQ,          setOverallQ]           = useState<number|null>(null);
+  const [excludeReason,     setExcludeReason]      = useState('');
+  const [showExclude,       setShowExclude]        = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const r = await fetch(`/api/journal/trade/${source}/${tradeId}/review`,
+          { headers: getAuthHeader() });
+        const d = await r.json();
+        if (d.ok) {
+          const rv: JReviewData = d.review;
+          setVocab(d.vocabulary);
+          setCurStatus(rv.review_status || 'UNREVIEWED');
+          setFollowedPlan(rv.followed_plan || '');
+          setChecklist(rv.plan_checklist || {});
+          setMistakeTags(rv.mistake_tags || []);
+          setPositiveTags(rv.positive_tags || []);
+          setEmotionTags(rv.emotion_tags || []);
+          setPreTradeNotes(rv.pre_trade_notes || '');
+          setInTradeNotes(rv.in_trade_notes || '');
+          setPostTradeReview(rv.post_trade_review || '');
+          setLessonLearned(rv.lesson_learned || '');
+          setWhatDifferently(rv.what_differently || '');
+          setWhatRepeat(rv.what_repeat || '');
+          setSetupQ(rv.setup_quality ?? null);
+          setExecQ(rv.execution_quality ?? null);
+          setDiscQ(rv.discipline_quality ?? null);
+          setOverallQ(rv.overall_quality ?? null);
+        }
+      } catch { /* fail silently — still show form */ }
+      setLoading(false);
+    })();
+  }, [source, tradeId]);
+
+  const buildPayload = () => ({
+    followed_plan:      followedPlan || null,
+    plan_checklist:     Object.keys(checklist).length ? checklist : null,
+    mistake_tags:       mistakeTags,
+    positive_tags:      positiveTags,
+    emotion_tags:       emotionTags,
+    pre_trade_notes:    preTradeNotes,
+    in_trade_notes:     inTradeNotes,
+    post_trade_review:  postTradeReview,
+    lesson_learned:     lessonLearned,
+    what_differently:   whatDifferently,
+    what_repeat:        whatRepeat,
+    setup_quality:      setupQ,
+    execution_quality:  execQ,
+    discipline_quality: discQ,
+    overall_quality:    overallQ,
+  });
+
+  const doSave = async (explicitStatus?: string) => {
+    setSaving(true); setError(null);
+    try {
+      const body = { ...buildPayload(), ...(explicitStatus ? { review_status: explicitStatus } : {}) };
+      const r = await fetch(`/api/journal/trade/${source}/${tradeId}/review`, {
+        method: 'PATCH',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'save failed');
+      setCurStatus(d.review_status);
+      onSaved(d.review_status);
+      if (explicitStatus === 'REVIEWED') onClose();
+    } catch (e) { setError(String(e)); }
+    setSaving(false);
+  };
+
+  const doExclude = async () => {
+    if (!excludeReason.trim()) { setError('Reason required'); return; }
+    setSaving(true); setError(null);
+    try {
+      const r = await fetch(`/api/journal/trade/${source}/${tradeId}/exclude`, {
+        method: 'POST',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: excludeReason }),
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'exclude failed');
+      onSaved('EXCLUDED');
+      onClose();
+    } catch (e) { setError(String(e)); }
+    setSaving(false);
+  };
+
+  const toggleTag = (arr: string[], tag: string): string[] =>
+    arr.includes(tag) ? arr.filter(t => t !== tag) : [...arr, tag];
+  const toggleEmotionTag = (tag: string) =>
+    setEmotionTags(prev => {
+      const exists = prev.find(e => e.tag === tag);
+      return exists ? prev.filter(e => e.tag !== tag) : [...prev, { tag, intensity: null }];
+    });
+
+  const sym = tradeSummary.symbol || tradeSummary.instrument || '—';
+  const S = { label: { fontSize: 9, color: T.txtMuted, marginBottom: 4, letterSpacing: '0.06em', fontWeight: 700 } as React.CSSProperties };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 600, display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-end' }}>
+      {/* backdrop */}
+      <div onClick={onClose} style={{ position: 'absolute', inset: 0, background: '#00000077' }} />
+      {/* panel */}
+      <div style={{ position: 'relative', width: 520, maxWidth: '100vw', height: '100vh',
+        background: T.panel, borderLeft: `1px solid ${T.borderMid}`,
+        overflowY: 'auto', padding: '20px 22px', boxShadow: '-12px 0 40px #00000066',
+        display: 'flex', flexDirection: 'column', gap: 0 }}>
+
+        {/* Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 800, color: T.txtPri }}>
+              Trade Review — {sym}
+            </div>
+            <div style={{ display: 'flex', gap: 6, marginTop: 4, alignItems: 'center' }}>
+              {jReviewBadge(curStatus)}
+              <span style={{ fontSize: 9, color: T.txtMuted }}>
+                {source === 'system' ? 'System Trade' : 'Tradzella Import'} · #{tradeId}
+              </span>
+            </div>
+          </div>
+          <button onClick={onClose}
+            style={{ background: 'none', border: 'none', color: T.txtMuted,
+              fontSize: 20, cursor: 'pointer', lineHeight: 1 }}>×</button>
+        </div>
+
+        {loading ? (
+          <div style={{ color: T.txtMuted, textAlign: 'center', paddingTop: 40 }}>Loading review…</div>
+        ) : (
+          <>
+            {/* Section A: Trade Summary (read-only) */}
+            <div style={{ background: T.panelAlt, borderRadius: 6, padding: '10px 12px', marginBottom: 14,
+              border: `1px solid ${T.border}` }}>
+              <div style={S.label}>A — TRADE SUMMARY</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+                {([
+                  ['Instrument', sym],
+                  ['Direction', (tradeSummary.direction || '').toUpperCase()],
+                  ['Result', tradeSummary.result],
+                  ['Entry', tradeSummary.entry != null ? tradeSummary.entry.toFixed(4) : '—'],
+                  ['R-Multiple', tradeSummary.r_multiple != null ? (tradeSummary.r_multiple >= 0 ? '+' : '') + tradeSummary.r_multiple.toFixed(2) + 'R' : '—'],
+                  ['Mode', tradeSummary.trading_mode || '—'],
+                ] as [string, string][]).map(([lbl, val]) => (
+                  <div key={lbl} style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: T.txtSec }}>{val}</div>
+                    <div style={{ fontSize: 8, color: T.txtMuted }}>{lbl}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Section B: Plan Adherence */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={S.label}>B — DID YOU FOLLOW THE PLAN?</div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+                {(vocab?.followed_plan ?? ['YES','PARTIALLY','NO','NOT_APPLICABLE']).map(opt => {
+                  const on = followedPlan === opt;
+                  const col = opt === 'YES' ? T.green : opt === 'PARTIALLY' ? T.amber : opt === 'NO' ? T.red : T.txtMuted;
+                  return (
+                    <button key={opt} onClick={() => setFollowedPlan(on ? '' : opt)}
+                      style={{ background: on ? col + '33' : T.panelAlt,
+                        border: `1px solid ${on ? col : T.border}`,
+                        borderRadius: 6, color: on ? col : T.txtMuted,
+                        padding: '5px 12px', fontSize: 10, cursor: 'pointer', fontWeight: on ? 700 : 400 }}>
+                      {opt.replace(/_/g, ' ')}
+                    </button>
+                  );
+                })}
+              </div>
+              {(vocab?.plan_checklist ?? []).length > 0 && (
+                <div>
+                  <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 4 }}>CHECKLIST</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 3 }}>
+                    {(vocab?.plan_checklist ?? []).map(item => (
+                      <label key={item} style={{ display: 'flex', alignItems: 'center', gap: 5,
+                        cursor: 'pointer', fontSize: 9, color: checklist[item] ? T.green : T.txtMuted }}>
+                        <input type="checkbox" checked={!!checklist[item]}
+                          onChange={e => setChecklist(c => ({ ...c, [item]: e.target.checked }))}
+                          style={{ accentColor: T.green, margin: 0 }} />
+                        {item.replace(/_/g, ' ')}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Section C: Mistake Tags */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={S.label}>C — MISTAKES MADE</div>
+              <TagChips
+                tags={vocab?.mistake_tags ?? []}
+                selected={mistakeTags}
+                onToggle={tag => setMistakeTags(t => toggleTag(t, tag))}
+                activeColor={T.red}
+              />
+            </div>
+
+            {/* Section D: Positive Tags */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={S.label}>D — WHAT WENT RIGHT</div>
+              <TagChips
+                tags={vocab?.positive_tags ?? []}
+                selected={positiveTags}
+                onToggle={tag => setPositiveTags(t => toggleTag(t, tag))}
+                activeColor={T.green}
+              />
+            </div>
+
+            {/* Section E: Emotion Tags */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={S.label}>E — EMOTIONS DURING TRADE</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                {(vocab?.emotion_tags ?? []).map(tag => {
+                  const et = emotionTags.find(e => e.tag === tag);
+                  const on = !!et;
+                  return (
+                    <button key={tag} onClick={() => toggleEmotionTag(tag)}
+                      style={{ background: on ? T.amber + '33' : T.panelAlt,
+                        border: `1px solid ${on ? T.amber + '88' : T.border}`,
+                        borderRadius: 10, color: on ? T.amber : T.txtMuted,
+                        padding: '3px 8px', fontSize: 9, cursor: 'pointer', fontWeight: on ? 700 : 400 }}>
+                      {tag}
+                    </button>
+                  );
+                })}
+              </div>
+              {emotionTags.length > 0 && (
+                <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {emotionTags.map(et => (
+                    <div key={et.tag} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ fontSize: 9, color: T.amber }}>{et.tag}</span>
+                      <select value={et.intensity ?? ''} onChange={e => {
+                        const v = e.target.value ? parseInt(e.target.value) : null;
+                        setEmotionTags(prev => prev.map(x => x.tag === et.tag ? { ...x, intensity: v } : x));
+                      }} style={{ background: T.panelAlt, border: `1px solid ${T.border}`,
+                        borderRadius: 3, color: T.txtSec, fontSize: 9, padding: '1px 3px' }}>
+                        <option value="">—</option>
+                        {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Section F: Notes */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={S.label}>F — NOTES</div>
+              {([
+                ['Pre-Trade Context', preTradeNotes,    setPreTradeNotes],
+                ['During Trade',     inTradeNotes,     setInTradeNotes],
+                ['Post-Trade Review (required for ✓)', postTradeReview, setPostTradeReview],
+                ['Lesson Learned (required for ✓)',    lessonLearned,   setLessonLearned],
+                ['What Would I Do Differently',        whatDifferently, setWhatDifferently],
+                ['What Would I Repeat',                whatRepeat,      setWhatRepeat],
+              ] as [string, string, React.Dispatch<React.SetStateAction<string>>][]).map(([lbl, val, set]) => (
+                <div key={lbl} style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 2 }}>{lbl}</div>
+                  <textarea value={val} onChange={e => set(e.target.value)}
+                    rows={2} style={{ width: '100%', background: T.panelAlt,
+                      border: `1px solid ${T.border}`, borderRadius: 4,
+                      color: T.txtPri, fontSize: 10, padding: '5px 7px',
+                      resize: 'vertical', boxSizing: 'border-box', lineHeight: 1.5 }} />
+                </div>
+              ))}
+            </div>
+
+            {/* Section G: Ratings */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={S.label}>G — RATINGS (1–5)</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <RatingPicker label="Setup Quality"      value={setupQ}    onChange={setSetupQ} />
+                <RatingPicker label="Execution Quality"  value={execQ}     onChange={setExecQ} />
+                <RatingPicker label="Discipline Quality" value={discQ}     onChange={setDiscQ} />
+                <RatingPicker label="Overall Quality (required for ✓)" value={overallQ} onChange={setOverallQ} />
+              </div>
+            </div>
+
+            {/* Error */}
+            {error && (
+              <div style={{ background: T.red + '22', border: `1px solid ${T.red}44`,
+                borderRadius: 4, padding: '6px 10px', fontSize: 10, color: T.red, marginBottom: 10 }}>
+                {error}
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+              <button onClick={() => doSave('IN_PROGRESS')} disabled={saving}
+                style={{ background: T.amber + '22', border: `1px solid ${T.amber}44`,
+                  borderRadius: 5, color: T.amber, padding: '7px 16px', fontSize: 10,
+                  cursor: saving ? 'default' : 'pointer', fontWeight: 600 }}>
+                {saving ? 'Saving…' : 'Save Draft'}
+              </button>
+              <button onClick={() => doSave('REVIEWED')} disabled={saving}
+                style={{ background: T.green + '22', border: `1px solid ${T.green}55`,
+                  borderRadius: 5, color: T.green, padding: '7px 16px', fontSize: 10,
+                  cursor: saving ? 'default' : 'pointer', fontWeight: 700 }}>
+                {saving ? 'Saving…' : '✓ Mark Reviewed'}
+              </button>
+              <button onClick={() => setShowExclude(x => !x)}
+                style={{ background: 'none', border: `1px solid ${T.border}`,
+                  borderRadius: 5, color: T.txtMuted, padding: '7px 12px', fontSize: 10,
+                  cursor: 'pointer', marginLeft: 'auto' }}>
+                Exclude Trade
+              </button>
+            </div>
+
+            {/* Exclude panel */}
+            {showExclude && (
+              <div style={{ background: T.red + '11', border: `1px solid ${T.red}33`,
+                borderRadius: 6, padding: '10px 12px', marginBottom: 10 }}>
+                <div style={{ fontSize: 9, color: T.red, marginBottom: 6, fontWeight: 700 }}>
+                  EXCLUDE TRADE — this hides it from the review queue
+                </div>
+                <input value={excludeReason} onChange={e => setExcludeReason(e.target.value)}
+                  placeholder="Reason (e.g. 'Data corruption', 'Platform glitch')"
+                  style={{ width: '100%', background: T.panelAlt, border: `1px solid ${T.border}`,
+                    borderRadius: 4, color: T.txtPri, padding: '5px 8px', fontSize: 10,
+                    boxSizing: 'border-box', marginBottom: 6 }} />
+                <button onClick={doExclude} disabled={saving}
+                  style={{ background: T.red + '33', border: `1px solid ${T.red}55`,
+                    borderRadius: 4, color: T.red, padding: '4px 12px', fontSize: 10,
+                    cursor: saving ? 'default' : 'pointer', fontWeight: 700 }}>
+                  Confirm Exclude
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void }> = ({ active, onChange }) => {
   const tabs: { id: JTab; label: string }[] = [
     { id: 'trades',   label: 'Trades' },
@@ -2530,6 +2997,11 @@ const JTradesTab: React.FC = () => {
   const [noteEdit, setNoteEdit] = useState('');
   const [noteSaving, setNoteSaving] = useState(false);
 
+  // Phase 7N: review state
+  const [reviewTrade, setReviewTrade]   = useState<{ source: string; id: number; detail: JTradeDetail } | null>(null);
+  const [queueCount,  setQueueCount]    = useState<number | null>(null);
+  const [queueLoading, setQueueLoading] = useState(false);
+
   const fetchTrades = useCallback(async (pg = 1) => {
     setLoading(true); setError(null);
     try {
@@ -2577,6 +3049,53 @@ const JTradesTab: React.FC = () => {
     setDetailLoading(false);
   };
 
+  // Phase 7N helpers
+  const fetchQueueCount = useCallback(async () => {
+    setQueueLoading(true);
+    try {
+      const r = await fetch('/api/journal/review-queue', { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.ok) setQueueCount(d.unreviewed_count ?? 0);
+    } catch { /* ignore */ }
+    setQueueLoading(false);
+  }, []);
+
+  useEffect(() => { fetchQueueCount(); }, [fetchQueueCount]);
+
+  const openReviewNext = async () => {
+    setQueueLoading(true);
+    try {
+      const r = await fetch('/api/journal/review-queue', { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.ok && d.next_trade) {
+        const { id, source: src } = d.next_trade;
+        setQueueCount(d.unreviewed_count);
+        // fetch the detail for that trade
+        const rd = await fetch(`/api/journal/trade/${src}/${id}`, { headers: getAuthHeader() });
+        const dd = await rd.json();
+        if (dd.ok) {
+          setReviewTrade({ source: src, id, detail: dd.trade });
+        }
+      }
+    } catch { /* ignore */ }
+    setQueueLoading(false);
+  };
+
+  const openReviewForTrade = (d: JTradeDetail) =>
+    setReviewTrade({ source: d.source, id: d.id, detail: d });
+
+  const onReviewSaved = (newStatus: string) => {
+    // Update the review_status in the local trades list without re-fetching
+    if (reviewTrade) {
+      setTrades(prev => prev.map(t =>
+        t.source === reviewTrade.source && t.id === reviewTrade.id
+          ? { ...t, review_status: newStatus }
+          : t
+      ));
+    }
+    fetchQueueCount();
+  };
+
   const saveNote = async () => {
     if (!detail || detail.source !== 'tradzella') return;
     setNoteSaving(true);
@@ -2606,6 +3125,28 @@ const JTradesTab: React.FC = () => {
 
   return (
     <div>
+      {/* Phase 7N: Review Next Trade bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10,
+        background: T.panelAlt, borderRadius: 6, padding: '8px 12px',
+        border: `1px solid ${T.border}` }}>
+        <button onClick={openReviewNext} disabled={queueLoading || queueCount === 0}
+          style={{ background: queueCount ? T.cyan + '22' : T.panelAlt,
+            border: `1px solid ${queueCount ? T.cyan + '55' : T.border}`,
+            borderRadius: 5, color: queueCount ? T.cyan : T.txtMuted,
+            padding: '5px 14px', fontSize: 10, cursor: (queueLoading || queueCount === 0) ? 'default' : 'pointer',
+            fontWeight: 700, whiteSpace: 'nowrap' }}>
+          {queueLoading ? 'Loading…' : queueCount === 0 ? '✓ All Reviewed' : `▶ Review Next Trade`}
+        </button>
+        {queueCount !== null && queueCount > 0 && (
+          <span style={{ fontSize: 9, color: T.amber, fontWeight: 700 }}>
+            {queueCount} unreviewed
+          </span>
+        )}
+        {queueCount === 0 && (
+          <span style={{ fontSize: 9, color: T.green }}>All closed trades reviewed</span>
+        )}
+      </div>
+
       {/* Filter bar */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap', alignItems: 'center' }}>
         <input placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)}
@@ -2668,6 +3209,8 @@ const JTradesTab: React.FC = () => {
                   <Th col="r_multiple" label="R" />
                   <Th col="pnl"        label="P&L" />
                   <Th col="duration_min" label="Dur" />
+                  <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                    paddingBottom: 6, fontSize: 9 }}>Review</th>
                 </tr>
               </thead>
               <tbody>
@@ -2702,13 +3245,16 @@ const JTradesTab: React.FC = () => {
                     <td style={{ padding: '4px 8px 4px 0', color: t.pnl != null ? (t.pnl >= 0 ? T.green : T.red) : T.txtMuted, fontFamily: T.mono }}>
                       {t.pnl != null ? (t.pnl >= 0 ? '+$' : '-$') + Math.abs(t.pnl).toFixed(0) : '—'}
                     </td>
-                    <td style={{ padding: '4px 0', color: T.txtMuted, fontFamily: T.mono, fontSize: 9 }}>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtMuted, fontFamily: T.mono, fontSize: 9 }}>
                       {t.duration_min != null ? t.duration_min.toFixed(0) + 'm' : '—'}
+                    </td>
+                    <td style={{ padding: '4px 0' }}>
+                      {jReviewBadge(t.review_status || 'UNREVIEWED')}
                     </td>
                   </tr>
                 ))}
                 {trades.length === 0 && (
-                  <tr><td colSpan={9} style={{ textAlign: 'center', color: T.txtMuted,
+                  <tr><td colSpan={10} style={{ textAlign: 'center', color: T.txtMuted,
                     padding: '16px 0', fontSize: 11 }}>No trades</td></tr>
                 )}
               </tbody>
@@ -2842,9 +3388,35 @@ const JTradesTab: React.FC = () => {
                   <div style={{ fontSize: 10, color: T.txtSec, lineHeight: 1.5 }}>{String(detail.notes)}</div>
                 </div>
               )}
+
+              {/* Phase 7N: Review This Trade */}
+              <div style={{ marginTop: 16, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  {jReviewBadge((trades.find(t => t.source === detail.source && t.id === detail.id)?.review_status) || 'UNREVIEWED')}
+                  <span style={{ fontSize: 9, color: T.txtMuted }}>Review Status</span>
+                </div>
+                <button onClick={() => openReviewForTrade(detail)}
+                  style={{ width: '100%', background: T.cyan + '22',
+                    border: `1px solid ${T.cyan}44`, borderRadius: 5,
+                    color: T.cyan, padding: '7px 0', fontSize: 10,
+                    cursor: 'pointer', fontWeight: 700 }}>
+                  ✎ Review This Trade
+                </button>
+              </div>
             </>
           )}
         </div>
+      )}
+
+      {/* Phase 7N: Review modal */}
+      {reviewTrade && (
+        <JReviewModal
+          source={reviewTrade.source}
+          tradeId={reviewTrade.id}
+          tradeSummary={reviewTrade.detail}
+          onClose={() => setReviewTrade(null)}
+          onSaved={onReviewSaved}
+        />
       )}
     </div>
   );
@@ -3618,7 +4190,7 @@ const JournalFullPage: React.FC = () => {
         <div style={{ fontSize: 13, fontWeight: 700, color: T.txtPri, letterSpacing: '0.04em' }}>
           Journal
         </div>
-        <div style={{ fontSize: 9, color: T.txtMuted }}>Phase 7K</div>
+        <div style={{ fontSize: 9, color: T.txtMuted }}>Phase 7N</div>
       </div>
       <JTabBar active={tab} onChange={setTab} />
       {tab === 'trades'    && <JTradesTab />}
