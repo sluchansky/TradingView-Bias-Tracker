@@ -138,6 +138,10 @@ class DatabentoBrain:
         # Per-instrument working state (all keyed by bot instrument: MGC/MNQ/…)
         self._bars:        dict[str, list]        = {i: [] for i in DB_SYMBOLS}
         self._partial:     dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        # Lock protecting _partial read-modify-close sequences so the periodic
+        # stale-bar flush thread and the trade feed thread cannot double-close
+        # the same partial bar (or race on its assignment).
+        self._partial_lock: threading.Lock        = threading.Lock()
         self._pv_sum:      dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
         self._v_sum:       dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
         self._cvd_acc:     dict[str, float]       = {i: 0.0 for i in DB_SYMBOLS}
@@ -279,10 +283,20 @@ class DatabentoBrain:
             target=_build_id_map, daemon=True, name="db-symmap"
         ).start()
 
+        # ── Periodic stale-partial flush (low-volume bar-close fix) ─────────
+        # Closes bars that accumulated real trades but whose minute has already
+        # elapsed without a subsequent trade arriving (e.g. MGC overnight).
+        _flush_stop = threading.Event()
+        self._start_partial_flush_timer(_flush_stop)
+
         # Iterator yields only TradeMsg; id→inst map is built concurrently above
         # and will be ready long before the first trade is processed.
-        for record in client:
-            self._on_trade(record)
+        try:
+            for record in client:
+                self._on_trade(record)
+        finally:
+            # Stop the flush timer whether the feed exits cleanly or on error.
+            _flush_stop.set()
 
         DATABENTO_STATUS["connected"] = False
         logger.warning("DatabentoBrain: feed closed by server — reconnecting …")
@@ -369,23 +383,94 @@ class DatabentoBrain:
     # ── Bar builder ───────────────────────────────────────────────────────────
 
     def _tick_bar(self, inst: str, bar_minute: int, price: float, size: int) -> None:
-        p = self._partial[inst]
-        if p is None or p["ts"] != bar_minute:
-            if p is not None:
+        # Hold the lock only for the read-modify of _partial so the periodic
+        # flush thread cannot read a stale pointer or double-close the same bar.
+        with self._partial_lock:
+            p = self._partial[inst]
+            if p is None or p["ts"] != bar_minute:
+                to_close = p           # capture old partial (may be None)
+                self._partial[inst] = {
+                    "ts":     bar_minute,
+                    "open":   price,
+                    "high":   price,
+                    "low":    price,
+                    "close":  price,
+                    "volume": size,
+                }
+            else:
+                to_close = None        # same minute — just update in place
+                if price > p["high"]: p["high"] = price
+                if price < p["low"]:  p["low"]  = price
+                p["close"]   = price
+                p["volume"] += size
+        # Call _on_bar_close OUTSIDE the lock — it runs detectors and callbacks
+        # that take meaningful time and must not block the flush thread.
+        if to_close is not None:
+            self._on_bar_close(inst, to_close)
+
+    # ── Stale partial-bar flush (low-volume bar-close fix) ───────────────────
+    # Problem: _tick_bar only closes a bar when the NEXT trade arrives in a
+    # different minute.  Low-volume instruments (MGC overnight / early session)
+    # can go several minutes between trades.  The partial bar from minute N
+    # accumulates real trades but never calls _on_bar_close until minute N+k,
+    # so the Left Brain bar count stays at zero even though real data exists.
+    #
+    # Fix: a background timer thread wakes every PARTIAL_FLUSH_INTERVAL_S seconds
+    # and promotes any partial bar whose minute is already ≥ PARTIAL_STALE_S
+    # seconds in the past.  Bars are only closed — never synthesised.
+    # Thread-safety: the same _partial_lock used by _tick_bar prevents a race
+    # between the flush thread and the trade feed thread.
+
+    PARTIAL_FLUSH_INTERVAL_S: int = 30   # how often the flush thread wakes
+    PARTIAL_STALE_S:          int = 70   # seconds past the bar-minute → flush
+    #   70s = 60s (full minute elapsed) + 10s clock-skew / late-arriving records
+
+    def _flush_stale_partials(self) -> None:
+        """Close any partial bars whose minute has already passed.
+
+        Called from the flush timer thread every PARTIAL_FLUSH_INTERVAL_S seconds.
+        No bar is synthesised — only real accumulated ticks are finalised.
+        """
+        now_unix = time.time()
+        to_flush: list[tuple[str, dict]] = []
+        with self._partial_lock:
+            for inst in list(DB_SYMBOLS):
+                p = self._partial[inst]
+                if p is not None and (now_unix - p["ts"]) > self.PARTIAL_STALE_S:
+                    # Clear inside the lock so _tick_bar won't double-close it.
+                    self._partial[inst] = None
+                    to_flush.append((inst, p))
+        # Fire _on_bar_close outside the lock (runs detectors + callbacks).
+        for inst, p in to_flush:
+            try:
                 self._on_bar_close(inst, p)
-            self._partial[inst] = {
-                "ts":     bar_minute,
-                "open":   price,
-                "high":   price,
-                "low":    price,
-                "close":  price,
-                "volume": size,
-            }
-        else:
-            if price > p["high"]: p["high"] = price
-            if price < p["low"]:  p["low"]  = price
-            p["close"]   = price
-            p["volume"] += size
+                logger.info(
+                    "DatabentoBrain: flushed stale partial bar for %s "
+                    "(bar_ts=%s, age=%.0fs)",
+                    inst,
+                    datetime.utcfromtimestamp(p["ts"]).strftime("%H:%M"),
+                    now_unix - p["ts"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "DatabentoBrain: partial-flush error for %s: %s", inst, exc
+                )
+
+    def _start_partial_flush_timer(self, stop_event: threading.Event) -> None:
+        """Start a daemon thread that calls _flush_stale_partials periodically.
+
+        The thread exits cleanly when stop_event is set (i.e., when _run_feed
+        returns or raises).
+        """
+        def _loop() -> None:
+            while not stop_event.wait(self.PARTIAL_FLUSH_INTERVAL_S):
+                try:
+                    self._flush_stale_partials()
+                except Exception as exc:
+                    logger.debug("DatabentoBrain flush-loop error: %s", exc)
+
+        t = threading.Thread(target=_loop, daemon=True, name="db-partial-flush")
+        t.start()
 
     # ── Bar close — compute indicators and inject into shared state ───────────
 
