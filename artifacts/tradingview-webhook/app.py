@@ -43634,6 +43634,774 @@ def tradezella_reset():
     return jsonify(result)
 
 
+# ── Journal Phase 7K: unified trade-review endpoints ──────────────────────────
+# All routes are owner-only (dashboard password via Express proxy).
+# DISPLAY/READ-ONLY except import/rollback, which mutate ONLY the private journal
+# tables — never the gate, scoring, learning formulas, or broker path.
+
+def _journal_db_guard():
+    """Return (conn, None) or (None, error_response).
+
+    Probes tradezella_trades readiness (lazy-init, no DDL) before every
+    journal request, exactly like /tradezella/upload does.  Without this
+    probe the TRADEZELLA_DB_READY flag starts False on every bot restart
+    and confirm/preview would always 503 even when tables are available.
+    """
+    guard = _tz_guard()
+    if guard:
+        return None, guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return None, (jsonify({"ok": False,
+                               "error": "Journal database not ready — "
+                                        "tables may not be provisioned yet."}), 503)
+    conn = _learning_conn()
+    if conn is None:
+        return None, (jsonify({"ok": False, "error": "database unavailable"}), 503)
+    return conn, None
+
+
+@app.route("/journal/trades", methods=["GET"])
+def journal_trades_list():
+    """Unified paginated trade list from strategy_trades + tradezella_trades.
+    Params: page, limit, instrument, direction, source, result, search, sort, order."""
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        try:
+            page  = max(1, int(request.args.get("page", 1)))
+            limit = max(1, min(int(request.args.get("limit", 50)), 500))
+        except (TypeError, ValueError):
+            page, limit = 1, 50
+        offset = (page - 1) * limit
+
+        flt_inst  = (request.args.get("instrument") or "").strip().upper() or None
+        flt_dir   = (request.args.get("direction") or "").strip().lower() or None
+        flt_src   = (request.args.get("source") or "").strip().lower() or None
+        flt_res   = (request.args.get("result") or "").strip().lower() or None
+        search    = (request.args.get("search") or "").strip() or None
+        sort_col  = (request.args.get("sort") or "date").strip()
+        sort_ord  = "ASC" if (request.args.get("order", "desc") or "desc").lower() == "asc" else "DESC"
+
+        _SORT = {
+            "date": "date", "instrument": "instrument", "direction": "direction",
+            "result": "result", "r_multiple": "r_multiple", "pnl": "pnl",
+            "duration_min": "duration_min", "source": "source",
+        }
+        sort_col = _SORT.get(sort_col, "date")
+
+        sys_w, sys_p = ["1=1"], []
+        tz_w,  tz_p  = ["1=1"], []
+
+        if flt_inst:
+            sys_w.append("UPPER(st.symbol) = %s"); sys_p.append(flt_inst)
+            tz_w.append("UPPER(tt.symbol) = %s");  tz_p.append(flt_inst)
+        if flt_dir:
+            sys_w.append("LOWER(st.direction) = %s"); sys_p.append(flt_dir)
+            tz_w.append("LOWER(tt.side) = %s");       tz_p.append(flt_dir)
+        if flt_res:
+            sys_w.append("LOWER(st.result) = %s");  sys_p.append(flt_res)
+            tz_w.append("LOWER(tt.outcome) = %s");  tz_p.append(flt_res)
+        if search:
+            like = "%" + search.lower() + "%"
+            sys_w.append("(LOWER(st.symbol) LIKE %s OR LOWER(st.strategy) LIKE %s OR LOWER(st.direction) LIKE %s)")
+            sys_p += [like, like, like]
+            tz_w.append("(LOWER(tt.symbol) LIKE %s OR LOWER(tt.setup) LIKE %s OR LOWER(COALESCE(tt.notes,'')) LIKE %s)")
+            tz_p += [like, like, like]
+
+        sys_sql = (
+            "SELECT st.id, 'system' AS source,"
+            " COALESCE(st.opened_at, st.created_at) AS date,"
+            " st.symbol AS instrument, st.direction,"
+            " COALESCE(st.strategy, st.strategy_key, '') AS strategy_name,"
+            " CAST(st.entry AS double precision) AS entry,"
+            # Use actual fill price for closed trades; fall back to target for open ones
+            " COALESCE(CAST(st.exit_price AS double precision),"
+            "          CAST(st.target    AS double precision)) AS exit,"
+            " COALESCE(st.result, '') AS result,"
+            " COALESCE(CAST(st.r_multiple AS double precision), 0) AS r_multiple,"
+            " NULL::double precision AS pnl,"
+            " 'system' AS review_status,"
+            " COALESCE(CAST(st.edge_score AS double precision), 0) AS edge_score,"
+            " CASE WHEN st.opened_at IS NOT NULL AND st.closed_at IS NOT NULL"
+            "      THEN EXTRACT(EPOCH FROM (st.closed_at - st.opened_at))/60.0"
+            "      ELSE NULL END AS duration_min,"
+            " COALESCE(st.trading_mode, 'SWING') AS trading_mode"
+            " FROM strategy_trades st WHERE " + " AND ".join(sys_w)
+        ) if flt_src in (None, "system") else None
+
+        tz_sql = (
+            "SELECT tt.id, 'tradzella' AS source,"
+            " tt.entry_time AS date,"
+            " tt.symbol AS instrument, tt.side AS direction,"
+            " COALESCE(tt.setup, '') AS strategy_name,"
+            " tt.entry_price AS entry, tt.exit_price AS exit,"
+            " COALESCE(tt.outcome, '') AS result,"
+            " COALESCE(tt.r_multiple, 0) AS r_multiple,"
+            " COALESCE(tt.pnl, 0) AS pnl,"
+            " 'imported' AS review_status,"
+            " NULL::double precision AS edge_score,"
+            " CASE WHEN tt.entry_time IS NOT NULL AND tt.exit_time IS NOT NULL"
+            "      THEN EXTRACT(EPOCH FROM (tt.exit_time - tt.entry_time))/60.0"
+            "      ELSE NULL END AS duration_min,"
+            " COALESCE(tt.mode, 'UNKNOWN') AS trading_mode"
+            " FROM tradezella_trades tt WHERE " + " AND ".join(tz_w)
+        ) if flt_src in (None, "tradzella") else None
+
+        if sys_sql and tz_sql:
+            union_sql, all_p = f"({sys_sql}) UNION ALL ({tz_sql})", sys_p + tz_p
+        elif sys_sql:
+            union_sql, all_p = sys_sql, sys_p
+        elif tz_sql:
+            union_sql, all_p = tz_sql, tz_p
+        else:
+            return jsonify({"ok": True, "trades": [], "total": 0, "page": 1, "limit": limit, "pages": 1})
+
+        count_sql = f"SELECT COUNT(*) FROM ({union_sql}) AS _t"
+        page_sql  = (
+            f"SELECT * FROM ({union_sql}) AS _t"
+            f" ORDER BY {sort_col} {sort_ord} NULLS LAST"
+            f" LIMIT %s OFFSET %s"
+        )
+
+        with conn.cursor() as cur:
+            cur.execute(count_sql, all_p)
+            total = int((cur.fetchone() or (0,))[0])
+            cur.execute(page_sql, all_p + [limit, offset])
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+
+        trades = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            if d.get("date") and hasattr(d["date"], "isoformat"):
+                d["date"] = d["date"].isoformat()
+            for k in ("r_multiple", "pnl", "edge_score", "entry", "exit", "duration_min"):
+                if d.get(k) is not None:
+                    try:
+                        d[k] = float(d[k])
+                    except (TypeError, ValueError):
+                        d[k] = None
+            trades.append(d)
+
+        return jsonify({
+            "ok": True, "trades": trades, "total": total,
+            "page": page, "limit": limit,
+            "pages": max(1, (total + limit - 1) // limit),
+        })
+    except Exception as exc:
+        logger.warning("journal_trades_list failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Server-side preview cache ─────────────────────────────────────────────────
+# Keyed by a random UUID token returned to the browser.  Confirm receives ONLY
+# the token; it never trusts client-supplied trade fields.  TTL = 30 minutes.
+_JOURNAL_PREVIEW_CACHE: dict = {}      # token → {trades, filename, created_at}
+_JOURNAL_PREVIEW_TTL   = 1800          # seconds
+
+
+def _journal_preview_gc():
+    """Remove expired preview tokens (best-effort, called inline)."""
+    now = time.time()
+    stale = [k for k, v in _JOURNAL_PREVIEW_CACHE.items()
+             if now - v.get("created_at", 0) > _JOURNAL_PREVIEW_TTL]
+    for k in stale:
+        _JOURNAL_PREVIEW_CACHE.pop(k, None)
+
+
+@app.route("/journal/import/preview", methods=["POST"])
+def journal_import_preview():
+    """Parse a Tradzella CSV server-side, mark duplicates, store result in a
+    server-side preview cache, and return a short-lived preview_token.
+
+    The browser receives the parsed trade list for display but MUST NOT send
+    it back to confirm — only the token is accepted there.  This prevents any
+    client-side tampering with prices, P&L, timestamps, or dedupe flags.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    source_tz_str = request.args.get("tz") or "America/New_York"
+    filename_hint = request.args.get("filename") or None
+    try:
+        source_zone = ZoneInfo(source_tz_str)
+    except Exception:
+        return jsonify({"ok": False, "error": f"unknown timezone '{source_tz_str}'"}), 400
+    raw = request.get_data(cache=False, as_text=True)
+    if not raw or not raw.strip():
+        return jsonify({"ok": False, "error": "empty upload body"}), 400
+    try:
+        parsed = tz.parse_tradezella_csv(raw, source_tz=source_zone)
+    except Exception as exc:
+        logger.warning("journal import preview parse failed: %s", exc)
+        return jsonify({"ok": False, "error": "could not parse CSV"}), 400
+    if not parsed.get("ok"):
+        return jsonify({"ok": False, "error": parsed.get("error", "parse error")}), 400
+
+    trades = parsed.get("trades") or []
+
+    # Server-side duplicate detection against the live DB (optional — skipped
+    # gracefully when the DB is unavailable; duplicates are also caught at confirm).
+    if trades and LEARNING_DB_ENABLED:
+        conn = _learning_conn()
+        if conn is not None:
+            try:
+                existing_keys: set = set()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT dedupe_key FROM tradezella_trades")
+                    for row in cur.fetchall():
+                        existing_keys.add(row[0])
+                for t in trades:
+                    t["duplicate"] = t.get("dedupe_key") in existing_keys
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # Store parsed trades server-side; return an opaque token to the browser.
+    import uuid as _uuid
+    token = _uuid.uuid4().hex
+    _journal_preview_gc()
+    _JOURNAL_PREVIEW_CACHE[token] = {
+        "trades":     trades,
+        "filename":   filename_hint,
+        "created_at": time.time(),
+    }
+
+    return jsonify({
+        "ok": True,
+        "preview_token": token,
+        "trades": trades,                            # display-only; never trusted on confirm
+        "row_count": parsed["row_count"],
+        "skipped": parsed["skipped"],
+        "fields_present": parsed["fields_present"],
+        "columns": parsed.get("columns", []),
+        "warnings": parsed.get("warnings", []),
+        "duplicate_count": sum(1 for t in trades if t.get("duplicate")),
+    })
+
+
+@app.route("/journal/import/confirm", methods=["POST"])
+def journal_import_confirm():
+    """Persist the server-previewed trades using the preview_token.
+
+    SECURITY: only `preview_token` (and optional `filename`) are accepted from
+    the client.  All trade data — prices, P&L, timestamps, dedupe flags — is
+    taken exclusively from the server-side preview cache.  The browser can never
+    inject or alter what gets written to the database.
+
+    Duplicate detection is re-run server-side at confirm time against the live
+    DB, so trades imported by a concurrent session between preview and confirm
+    are also excluded.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False,
+                        "error": "Journal database not ready — "
+                                 "tables may not be provisioned yet."}), 503
+    data     = request.get_json(force=True, silent=True) or {}
+    token    = (data.get("preview_token") or "").strip()
+    filename = data.get("filename") or None
+
+    if not token:
+        return jsonify({"ok": False,
+                        "error": "preview_token required — call /preview first"}), 400
+
+    cached = _JOURNAL_PREVIEW_CACHE.get(token)
+    if cached is None:
+        return jsonify({"ok": False,
+                        "error": "preview token not found or expired — "
+                                 "please re-upload the CSV"}), 404
+
+    # Evict the token immediately (one-shot confirm; prevents replay).
+    _JOURNAL_PREVIEW_CACHE.pop(token, None)
+
+    trades = cached.get("trades") or []
+    filename = filename or cached.get("filename")
+
+    if not trades:
+        return jsonify({"ok": False,
+                        "error": "preview contained no rows — nothing to import"}), 400
+
+    # Pass the FULL parsed trade list to the persistence helper.
+    #
+    # The helper inserts every row with ON CONFLICT (dedupe_key) DO NOTHING,
+    # so concurrent imports that snuck in between preview and confirm are
+    # also excluded correctly.  Crucially it records:
+    #   row_count  = len(all_trades)      ← matches what the preview showed
+    #   imported   = actual DB inserts
+    #   skipped    = row_count – imported  ← includes preview-time + race duplicates
+    #
+    # Pre-filtering non_dupes here would make the batch metadata wrong
+    # (row_count would exclude known duplicates, skipped would be 0).
+    result = _persist_tradezella_trades(trades, filename=filename)
+    if not result.get("ok"):
+        return jsonify(result), 500
+    if result["imported"] == 0:
+        return jsonify({"ok": False,
+                        "error": "all rows are duplicates — nothing was imported",
+                        "batch_id":      result["import_batch_id"],
+                        "skipped_dupes": result["skipped_dupes"],
+                        "submitted":     result["submitted"]}), 400
+    return jsonify({
+        "ok": True,
+        "batch_id":      result["import_batch_id"],
+        "imported":      result["imported"],
+        "skipped_dupes": result["skipped_dupes"],
+        "submitted":     result["submitted"],
+    })
+
+
+@app.route("/journal/import/rollback", methods=["POST"])
+def journal_import_rollback():
+    """Delete all trades belonging to a batch (reversing the import).
+
+    Both deletes (tradezella_trades + tradezella_import_batches) run inside
+    an explicit transaction.  _learning_conn() returns an autocommit=True
+    connection; we flip it OFF here so that a failure after the first delete
+    automatically rolls back, preventing orphaned batch records.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    data     = request.get_json(force=True, silent=True) or {}
+    batch_id = (data.get("batch_id") or "").strip()
+    if not batch_id:
+        return jsonify({"ok": False, "error": "batch_id required"}), 400
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        conn.autocommit = False           # wrap both deletes in one transaction
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT row_count FROM tradezella_import_batches"
+                " WHERE import_batch_id = %s", (batch_id,)
+            )
+            if cur.fetchone() is None:
+                conn.rollback()
+                return jsonify({"ok": False, "error": "batch not found"}), 404
+            cur.execute(
+                "DELETE FROM tradezella_trades WHERE import_batch_id = %s", (batch_id,)
+            )
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur.execute(
+                "DELETE FROM tradezella_import_batches WHERE import_batch_id = %s",
+                (batch_id,)
+            )
+        conn.commit()
+        return jsonify({"ok": True, "batch_id": batch_id, "deleted": deleted})
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("journal import rollback failed: %s", exc)
+        return jsonify({"ok": False, "error": "rollback failed"}), 500
+    finally:
+        try:
+            conn.autocommit = True        # restore for any reuse
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/import/batches", methods=["GET"])
+def journal_import_batches_list():
+    """List all import batches (newest first)."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT import_batch_id, filename, source, row_count, imported_count,"
+                " skipped_count, created_at"
+                " FROM tradezella_import_batches"
+                " ORDER BY created_at DESC NULLS LAST LIMIT 100"
+            )
+            cols = ("batch_id", "filename", "source", "row_count", "imported_count",
+                    "skipped_count", "created_at")
+            rows = cur.fetchall()
+        batches = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
+                d["created_at"] = d["created_at"].isoformat()
+            batches.append(d)
+        return jsonify({"ok": True, "batches": batches})
+    except Exception as exc:
+        logger.warning("journal_import_batches_list failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/trade/<source>/<int:trade_id>", methods=["GET"])
+def journal_trade_detail(source, trade_id):
+    """Rich detail for a single trade by source ('system' or 'tradzella') and id."""
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        if source == "system":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, opened_at, closed_at, symbol, direction, strategy,"
+                    " strategy_key, CAST(entry AS double precision),"
+                    " CAST(stop AS double precision),"
+                    # Actual fill price for closed trades; plan target for open trades.
+                    " COALESCE(CAST(exit_price AS double precision),"
+                    "          CAST(target     AS double precision)) AS exit,"
+                    # Also expose planned target separately so UI can show both.
+                    " CAST(target AS double precision),"
+                    " result, CAST(r_multiple AS double precision),"
+                    " CAST(hold_minutes AS double precision), confidence, grade,"
+                    " CAST(edge_score AS double precision), trading_mode, session,"
+                    " market_regime, CAST(mfe_r AS double precision),"
+                    " CAST(mae_r AS double precision),"
+                    " entry_reason, outcome_reason, outcome_tag, trade_label"
+                    " FROM strategy_trades WHERE id = %s",
+                    (trade_id,)
+                )
+                row = cur.fetchone()
+            if row is None:
+                return jsonify({"ok": False, "error": "trade not found"}), 404
+            keys = ("id", "opened_at", "closed_at", "symbol", "direction", "strategy",
+                    "strategy_key", "entry", "stop", "exit", "target", "result",
+                    "r_multiple", "hold_minutes", "confidence", "grade", "edge_score",
+                    "trading_mode", "session", "market_regime", "mfe_r", "mae_r",
+                    "entry_reason", "outcome_reason", "outcome_tag", "trade_label")
+            d = dict(zip(keys, row))
+            for k in ("opened_at", "closed_at"):
+                if d.get(k) and hasattr(d[k], "isoformat"):
+                    d[k] = d[k].isoformat()
+            d["source"] = "system"
+
+        elif source == "tradzella":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, entry_time, exit_time, symbol, side, setup,"
+                    " entry_price, exit_price, outcome, r_multiple, pnl, fees,"
+                    " mfe, mae, notes, mistake, screenshots, mode, session_bucket"
+                    " FROM tradezella_trades WHERE id = %s",
+                    (trade_id,)
+                )
+                row = cur.fetchone()
+            if row is None:
+                return jsonify({"ok": False, "error": "trade not found"}), 404
+            keys = ("id", "entry_time", "exit_time", "symbol", "direction",
+                    "strategy_name", "entry", "exit", "result", "r_multiple", "pnl",
+                    "fees", "mfe_r", "mae_r", "notes", "mistakes", "screenshots",
+                    "trading_mode", "session")
+            d = dict(zip(keys, row))
+            for k in ("entry_time", "exit_time"):
+                if d.get(k) and hasattr(d[k], "isoformat"):
+                    d[k] = d[k].isoformat()
+            d["source"] = "tradzella"
+
+        else:
+            return jsonify({"ok": False, "error": f"unknown source '{source}'"}), 400
+
+        return jsonify({"ok": True, "trade": d})
+    except Exception as exc:
+        logger.warning("journal_trade_detail failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/trade/<source>/<int:trade_id>/notes", methods=["PATCH"])
+def journal_trade_notes(source, trade_id):
+    """Update notes field on a tradzella trade (system trades are immutable)."""
+    if source != "tradzella":
+        return jsonify({"ok": False,
+                        "error": "only tradzella trades support note editing"}), 400
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    data  = request.get_json(force=True, silent=True) or {}
+    notes = data.get("notes")
+    if notes is None:
+        return jsonify({"ok": False, "error": "notes field required"}), 400
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tradezella_trades SET notes = %s WHERE id = %s RETURNING id",
+                (str(notes)[:2000], trade_id)
+            )
+            if cur.fetchone() is None:
+                return jsonify({"ok": False, "error": "trade not found"}), 404
+        return jsonify({"ok": True, "id": trade_id})
+    except Exception as exc:
+        logger.warning("journal_trade_notes failed: %s", exc)
+        return jsonify({"ok": False, "error": "update failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/analytics", methods=["GET"])
+def journal_analytics():
+    """Win%, avg_r, profit factor, expectancy — optionally grouped.
+    Params: group_by (strategy|instrument|session|regime|daily|weekly|monthly), from, to."""
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    group_by = (request.args.get("group_by") or "strategy").strip()
+    _VALID = {"daily", "weekly", "monthly", "strategy", "instrument", "session", "regime"}
+    if group_by not in _VALID:
+        group_by = "strategy"
+    date_from = (request.args.get("from") or "").strip() or None
+    date_to   = (request.args.get("to") or "").strip() or None
+
+    try:
+        sys_dc, sys_dp = "", []
+        tz_dc,  tz_dp  = "", []
+        if date_from:
+            sys_dc += " AND st.opened_at >= %s"; sys_dp.append(date_from)
+            tz_dc  += " AND tt.entry_time >= %s"; tz_dp.append(date_from)
+        if date_to:
+            sys_dc += " AND st.opened_at <= %s"; sys_dp.append(date_to)
+            tz_dc  += " AND tt.entry_time <= %s"; tz_dp.append(date_to)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n,"
+                " SUM(CASE WHEN LOWER(result)='win' THEN 1 ELSE 0 END) AS wins,"
+                " SUM(CASE WHEN LOWER(result)='loss' THEN 1 ELSE 0 END) AS losses,"
+                " AVG(r_multiple::float) AS avg_r,"
+                " SUM(CASE WHEN LOWER(result)='win' THEN r_multiple::float ELSE 0 END) AS gw,"
+                " SUM(CASE WHEN LOWER(result)='loss' THEN ABS(r_multiple::float) ELSE 0 END) AS gl"
+                " FROM strategy_trades st"
+                " WHERE result IS NOT NULL AND result != ''" + sys_dc,
+                sys_dp
+            )
+            sys_agg = cur.fetchone() or (0, 0, 0, None, 0, 0)
+
+            cur.execute(
+                "SELECT COUNT(*) AS n,"
+                " SUM(CASE WHEN LOWER(outcome)='win' THEN 1 ELSE 0 END) AS wins,"
+                " SUM(CASE WHEN LOWER(outcome)='loss' THEN 1 ELSE 0 END) AS losses,"
+                " AVG(r_multiple::float) AS avg_r,"
+                " SUM(CASE WHEN LOWER(outcome)='win' THEN COALESCE(pnl::float,0) ELSE 0 END) AS gw,"
+                " SUM(CASE WHEN LOWER(outcome)='loss' THEN ABS(COALESCE(pnl::float,0)) ELSE 0 END) AS gl"
+                " FROM tradezella_trades tt"
+                " WHERE outcome IS NOT NULL" + tz_dc,
+                tz_dp
+            )
+            tz_agg = cur.fetchone() or (0, 0, 0, None, 0, 0)
+
+        def _agg(row):
+            n, wins, losses, avg_r, gw, gl = row
+            n, wins, losses = int(n or 0), int(wins or 0), int(losses or 0)
+            ar = float(avg_r) if avg_r is not None else None
+            gw, gl = float(gw or 0), float(gl or 0)
+            return {
+                "n": n, "wins": wins, "losses": losses,
+                "win_pct": round(wins / n * 100, 1) if n else None,
+                "avg_r": round(ar, 3) if ar is not None else None,
+                "gross_win": round(gw, 2), "gross_loss": round(gl, 2),
+                "profit_factor": round(gw / gl, 3) if gl > 0 else None,
+            }
+
+        sys_s, tz_s = _agg(sys_agg), _agg(tz_agg)
+        tot_n, tot_w = sys_s["n"] + tz_s["n"], sys_s["wins"] + tz_s["wins"]
+        combined = {
+            "n": tot_n, "wins": tot_w,
+            "losses": sys_s["losses"] + tz_s["losses"],
+            "win_pct": round(tot_w / tot_n * 100, 1) if tot_n else None,
+        }
+
+        _GRP = {
+            "strategy":   ("COALESCE(st.strategy, st.strategy_key, 'Unknown')",
+                           "COALESCE(tt.setup, 'Unknown')"),
+            "instrument": ("UPPER(st.symbol)", "UPPER(tt.symbol)"),
+            "session":    ("COALESCE(st.session, 'Unknown')",
+                           "COALESCE(tt.session_bucket, 'Unknown')"),
+            "regime":     ("COALESCE(st.market_regime, 'Unknown')", "'N/A'"),
+            "daily":      (
+                "TO_CHAR(st.opened_at AT TIME ZONE 'America/New_York','YYYY-MM-DD')",
+                "TO_CHAR(tt.entry_time AT TIME ZONE 'America/New_York','YYYY-MM-DD')",
+            ),
+            "weekly":     (
+                "TO_CHAR(DATE_TRUNC('week',st.opened_at AT TIME ZONE 'America/New_York'),'YYYY-MM-DD')",
+                "TO_CHAR(DATE_TRUNC('week',tt.entry_time AT TIME ZONE 'America/New_York'),'YYYY-MM-DD')",
+            ),
+            "monthly":    (
+                "TO_CHAR(st.opened_at AT TIME ZONE 'America/New_York','YYYY-MM')",
+                "TO_CHAR(tt.entry_time AT TIME ZONE 'America/New_York','YYYY-MM')",
+            ),
+        }
+        sg_e, tg_e = _GRP.get(group_by, _GRP["strategy"])
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {sg_e} AS grp, COUNT(*) AS n,"
+                " SUM(CASE WHEN LOWER(result)='win' THEN 1 ELSE 0 END) AS wins,"
+                " AVG(r_multiple::float) AS avg_r"
+                " FROM strategy_trades st"
+                " WHERE result IS NOT NULL AND result != ''" + sys_dc +
+                f" GROUP BY {sg_e} ORDER BY grp",
+                sys_dp
+            )
+            sg = {r[0]: {"n": int(r[1] or 0), "wins": int(r[2] or 0),
+                         "avg_r": float(r[3]) if r[3] else None}
+                  for r in (cur.fetchall() or []) if r[0]}
+
+            cur.execute(
+                f"SELECT {tg_e} AS grp, COUNT(*) AS n,"
+                " SUM(CASE WHEN LOWER(outcome)='win' THEN 1 ELSE 0 END) AS wins,"
+                " AVG(r_multiple::float) AS avg_r"
+                " FROM tradezella_trades tt"
+                " WHERE outcome IS NOT NULL" + tz_dc +
+                f" GROUP BY {tg_e} ORDER BY grp",
+                tz_dp
+            )
+            tg = {r[0]: {"n": int(r[1] or 0), "wins": int(r[2] or 0),
+                         "avg_r": float(r[3]) if r[3] else None}
+                  for r in (cur.fetchall() or []) if r[0]}
+
+        breakdown = []
+        for k in sorted(set(list(sg.keys()) + list(tg.keys()))):
+            if not k:
+                continue
+            a = sg.get(k) or {"n": 0, "wins": 0, "avg_r": None}
+            b = tg.get(k) or {"n": 0, "wins": 0, "avg_r": None}
+            n, wins = a["n"] + b["n"], a["wins"] + b["wins"]
+            wp = [(g["avg_r"], g["n"]) for g in (a, b) if g["avg_r"] is not None and g["n"] > 0]
+            avg_r = (sum(v * w for v, w in wp) / sum(w for _, w in wp)) if wp else None
+            breakdown.append({
+                "group": k, "n": n, "wins": wins,
+                "win_pct": round(wins / n * 100, 1) if n else None,
+                "avg_r": round(avg_r, 3) if avg_r is not None else None,
+            })
+
+        return jsonify({
+            "ok": True, "group_by": group_by,
+            "summary": combined, "system": sys_s, "tradzella": tz_s,
+            "breakdown": breakdown,
+        })
+    except Exception as exc:
+        logger.warning("journal_analytics failed: %s", exc)
+        return jsonify({"ok": False, "error": "analytics failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/playbook", methods=["GET"])
+def journal_playbook():
+    """Per-strategy performance stats from strategy_trades (authoritative system source)."""
+    _MIN_N = 20
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(strategy, strategy_key, 'Unknown') AS strat,"
+                " COUNT(*) AS n,"
+                " SUM(CASE WHEN LOWER(result)='win' THEN 1 ELSE 0 END) AS wins,"
+                " AVG(r_multiple::float) AS avg_r,"
+                " MIN(opened_at) AS first_trade, MAX(opened_at) AS last_trade,"
+                " trading_mode"
+                " FROM strategy_trades"
+                " WHERE result IS NOT NULL AND result != ''"
+                " GROUP BY COALESCE(strategy, strategy_key, 'Unknown'), trading_mode"
+                " ORDER BY n DESC"
+            )
+            rows = cur.fetchall() or []
+
+        strategies = []
+        for r in rows:
+            strat, n, wins, avg_r, first, last, mode = r
+            n, wins = int(n or 0), int(wins or 0)
+            ar = float(avg_r) if avg_r is not None else None
+            strategies.append({
+                "strategy": strat, "trading_mode": mode,
+                "n": n, "wins": wins, "losses": n - wins,
+                "win_pct": round(wins / n * 100, 1) if n else None,
+                "avg_r": round(ar, 3) if ar is not None else None,
+                "sample_warning": n < _MIN_N,
+                "first_trade": first.isoformat() if first and hasattr(first, "isoformat") else None,
+                "last_trade":  last.isoformat()  if last  and hasattr(last,  "isoformat") else None,
+            })
+        return jsonify({"ok": True, "strategies": strategies, "min_n": _MIN_N})
+    except Exception as exc:
+        logger.warning("journal_playbook failed: %s", exc)
+        return jsonify({"ok": False, "error": "playbook failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/learning", methods=["GET"])
+def journal_learning():
+    """Display-only view of learning eligibility. Never touches learning formulas."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "learning database not configured"}), 503
+    with LEARNING_ELIGIBILITY_LOCK:
+        cache_copy = {k: dict(v) for k, v in LEARNING_ELIGIBILITY.items()
+                      if k != "__today_labels__" and isinstance(v, dict)}
+    records = []
+    for ns_key, entry in sorted(cache_copy.items()):
+        parts      = ns_key.split("::", 1)
+        instrument = parts[0] if parts else ns_key
+        mode       = parts[1] if len(parts) > 1 else "UNKNOWN"
+        status     = entry.get("status", "UNKNOWN")
+        records.append({
+            "instrument":      instrument,
+            "mode":            mode,
+            "status":          status,
+            "eligible":        status == "LIVE_ELIGIBLE",
+            "excluded":        status == "DISABLED",
+            "ghost":           status == "GHOST_ONLY",
+            "rule":            entry.get("rule_triggered"),
+            "n":               entry.get("sample_size"),
+            "win_rate":        entry.get("win_rate"),
+            "avg_r":           entry.get("expectancy"),
+            "last_20_avg_r":   entry.get("last_20_avg_r"),
+            "tp1_hit_rate":    entry.get("tp1_hit_rate"),
+            "updated_at":      entry.get("updated_at"),
+            "disabled_setups": entry.get("disabled_setups", []),
+        })
+    return jsonify({"ok": True, "records": records, "total": len(records)})
+
+
 # ── ANALYSIS-BOT webhook mirror (opt-in; DEFAULT-OFF) ─────────────────────────
 # When ANALYSIS_BOT_FORWARD_URL is set (only on the production VM), every inbound
 # /webhook payload is mirrored verbatim to the separate ANALYSIS-ONLY bot so it

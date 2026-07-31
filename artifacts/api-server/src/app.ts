@@ -43,7 +43,15 @@ app.use(cors());
 // consumed, so the tight global parser below is a no-op on the upload paths (no
 // double read). Webhook payloads remain tiny.
 app.use(
-  ["/api/backtest/upload", "/api/tradezella/upload", "/api2/backtest/upload"],
+  [
+    "/api/backtest/upload",
+    "/api/tradezella/upload",
+    "/api2/backtest/upload",
+    // Journal CSV import — broker exports can exceed the 1 MB global limit.
+    // Preview parses the raw CSV server-side and issues a tamper-proof token;
+    // the body never reaches Flask's confirm route, so scoping here is safe.
+    "/api/journal/import/preview",
+  ],
   express.raw({ type: () => true, limit: "32mb" }),
 );
 app.use(express.raw({ type: () => true, limit: "1mb" }));

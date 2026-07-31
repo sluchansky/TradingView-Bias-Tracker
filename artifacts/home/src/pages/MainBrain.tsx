@@ -2402,6 +2402,1062 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Journal Full Page (Phase 7K) ──────────────────────────────────────────────
+// Self-contained tabbed journal — makes its own API calls to /journal/* endpoints.
+// Used ONLY for the /main-brain/journal route. The overview-grid card below is the
+// compact version that still reads from the main-brain payload.
+
+type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning';
+
+interface JTrade {
+  id: number; source: string; date: string; instrument: string; direction: string;
+  strategy_name: string; entry: number | null; exit: number | null; result: string;
+  r_multiple: number | null; pnl: number | null; review_status: string;
+  edge_score: number | null; duration_min: number | null; trading_mode: string;
+}
+
+interface JTradeDetail extends JTrade {
+  symbol?: string;
+  stop?: number | null; target?: number | null;
+  hold_minutes?: number | null; confidence?: number | null; grade?: string;
+  session?: string; market_regime?: string;
+  mfe_r?: number | null; mae_r?: number | null;
+  entry_reason?: string; outcome_reason?: string; outcome_tag?: string;
+  trade_label?: string; opened_at?: string; closed_at?: string;
+  strategy?: string; strategy_key?: string;
+  entry_time?: string; exit_time?: string; fees?: number | null;
+  mistakes?: string; notes?: string; screenshots?: string;
+}
+
+interface JBatch {
+  batch_id: string; filename: string | null; source: string;
+  row_count: number; imported_count: number; skipped_count: number;
+  created_at: string;
+}
+
+interface JPreviewTrade {
+  symbol: string | null; side: string | null; entry_time: string | null;
+  exit_time: string | null; entry_price: number | null; exit_price: number | null;
+  pnl: number | null; r_multiple: number | null;
+  outcome: string; dedupe_key: string; duplicate?: boolean;
+  setup?: string | null;
+}
+
+function jFmtDate(v: unknown): string {
+  if (!v) return '—';
+  try {
+    const d = new Date(String(v));
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit',
+      timeZone: 'America/New_York' }) + ' ' +
+      d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true,
+        timeZone: 'America/New_York' });
+  } catch { return '—'; }
+}
+
+function jFmtShortDate(v: unknown): string {
+  if (!v) return '—';
+  try {
+    const d = new Date(String(v));
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric',
+      timeZone: 'America/New_York' });
+  } catch { return '—'; }
+}
+
+function jRCol(r: number | null | undefined): string {
+  if (r == null) return T.txtSec;
+  return r > 0 ? T.green : r < 0 ? T.red : T.txtMuted;
+}
+
+function jResultBadge(result: string): React.ReactNode {
+  const r = (result || '').toLowerCase();
+  const col = r === 'win' ? T.green : r === 'loss' ? T.red : T.amber;
+  return (
+    <span style={{ background: col + '22', color: col, borderRadius: 3,
+      padding: '1px 5px', fontSize: 9, fontWeight: 700, letterSpacing: '0.05em' }}>
+      {result.toUpperCase() || '—'}
+    </span>
+  );
+}
+
+const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void }> = ({ active, onChange }) => {
+  const tabs: { id: JTab; label: string }[] = [
+    { id: 'trades',   label: 'Trades' },
+    { id: 'import',   label: 'Import' },
+    { id: 'analytics', label: 'Analytics' },
+    { id: 'playbook', label: 'Playbook' },
+    { id: 'learning', label: 'Learning' },
+  ];
+  return (
+    <div style={{ display: 'flex', gap: 2, marginBottom: 14, borderBottom: `1px solid ${T.border}`, paddingBottom: 0 }}>
+      {tabs.map(t => (
+        <button key={t.id} onClick={() => onChange(t.id)}
+          style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px 14px',
+            fontSize: 11, fontWeight: active === t.id ? 700 : 400,
+            color: active === t.id ? T.cyan : T.txtSec,
+            borderBottom: `2px solid ${active === t.id ? T.cyan : 'transparent'}`,
+            marginBottom: -1, letterSpacing: '0.04em', whiteSpace: 'nowrap' }}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+};
+
+// ── Trades tab ────────────────────────────────────────────────────────────────
+const JTradesTab: React.FC = () => {
+  const [trades, setTrades] = useState<JTrade[]>([]);
+  const [total, setTotal] = useState(0);
+  const [pages, setPages] = useState(1);
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Filters
+  const [search, setSearch] = useState('');
+  const [fInst, setFInst] = useState('');
+  const [fDir, setFDir] = useState('');
+  const [fSrc, setFSrc] = useState('');
+  const [fRes, setFRes] = useState('');
+  const [sortCol, setSortCol] = useState('date');
+  const [sortOrd, setSortOrd] = useState<'asc' | 'desc'>('desc');
+
+  // Detail
+  const [detail, setDetail] = useState<JTradeDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [noteEdit, setNoteEdit] = useState('');
+  const [noteSaving, setNoteSaving] = useState(false);
+
+  const fetchTrades = useCallback(async (pg = 1) => {
+    setLoading(true); setError(null);
+    try {
+      const params = new URLSearchParams({
+        page: String(pg), limit: '50',
+        sort: sortCol, order: sortOrd,
+        ...(search    ? { search }     : {}),
+        ...(fInst     ? { instrument: fInst } : {}),
+        ...(fDir      ? { direction: fDir }  : {}),
+        ...(fSrc      ? { source: fSrc }     : {}),
+        ...(fRes      ? { result: fRes }     : {}),
+      });
+      const r = await fetch(`/api/journal/trades?${params}`, { headers: getAuthHeader() });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'fetch failed');
+      setTrades(data.trades || []);
+      setTotal(data.total || 0);
+      setPages(data.pages || 1);
+      setPage(pg);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [search, fInst, fDir, fSrc, fRes, sortCol, sortOrd]);
+
+  useEffect(() => { fetchTrades(1); }, [fetchTrades]);
+
+  const handleSort = (col: string) => {
+    if (col === sortCol) {
+      setSortOrd(o => o === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortCol(col); setSortOrd('desc');
+    }
+  };
+
+  const openDetail = async (t: JTrade) => {
+    setDetail(null); setDetailLoading(true);
+    try {
+      const r = await fetch(`/api/journal/trade/${t.source}/${t.id}`, { headers: getAuthHeader() });
+      const data = await r.json();
+      if (data.ok) { setDetail(data.trade); setNoteEdit(data.trade.notes || ''); }
+    } catch { /* ignore */ }
+    setDetailLoading(false);
+  };
+
+  const saveNote = async () => {
+    if (!detail || detail.source !== 'tradzella') return;
+    setNoteSaving(true);
+    try {
+      await fetch(`/api/journal/trade/${detail.source}/${detail.id}/notes`, {
+        method: 'PATCH',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: noteEdit }),
+      });
+      setDetail(d => d ? { ...d, notes: noteEdit } : d);
+    } catch { /* ignore */ }
+    setNoteSaving(false);
+  };
+
+  const sortIcon = (col: string) =>
+    sortCol === col ? (sortOrd === 'asc' ? ' ↑' : ' ↓') : '';
+
+  const Th: React.FC<{ col: string; label: string; style?: React.CSSProperties }> = ({ col, label, style }) => (
+    <th onClick={() => handleSort(col)} style={{
+      textAlign: 'left', color: sortCol === col ? T.cyan : T.txtMuted,
+      fontWeight: 600, paddingBottom: 6, fontSize: 9, letterSpacing: '0.07em',
+      cursor: 'pointer', whiteSpace: 'nowrap', userSelect: 'none', ...style,
+    }}>
+      {label}{sortIcon(col)}
+    </th>
+  );
+
+  return (
+    <div>
+      {/* Filter bar */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+        <input placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtPri, padding: '4px 8px', fontSize: 11, width: 130 }} />
+        <select value={fInst} onChange={e => setFInst(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Instruments</option>
+          {['MGC','MNQ','MES','MYM'].map(i => <option key={i} value={i}>{i}</option>)}
+        </select>
+        <select value={fDir} onChange={e => setFDir(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Directions</option>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+        </select>
+        <select value={fSrc} onChange={e => setFSrc(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Sources</option>
+          <option value="system">System</option>
+          <option value="tradzella">Tradzella</option>
+        </select>
+        <select value={fRes} onChange={e => setFRes(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Results</option>
+          <option value="win">Win</option>
+          <option value="loss">Loss</option>
+          <option value="scratch">Scratch</option>
+        </select>
+        <button onClick={() => fetchTrades(1)} style={{
+          background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
+          color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>
+          Search
+        </button>
+      </div>
+
+      {loading && <div style={{ color: T.txtMuted, fontSize: 11, padding: '8px 0' }}>Loading…</div>}
+      {error && <div style={{ color: T.red, fontSize: 11, padding: '8px 0' }}>Error: {error}</div>}
+
+      {!loading && !error && (
+        <>
+          <div style={{ fontSize: 10, color: T.txtMuted, marginBottom: 6 }}>
+            {total} trade{total !== 1 ? 's' : ''} · page {page}/{pages}
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead>
+                <tr>
+                  <Th col="date"       label="Date" />
+                  <Th col="instrument" label="Inst" />
+                  <Th col="direction"  label="Dir" />
+                  <Th col="source"     label="Src"  style={{ fontSize: 8 }} />
+                  <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                    paddingBottom: 6, fontSize: 9 }}>Strategy</th>
+                  <Th col="result"     label="Result" />
+                  <Th col="r_multiple" label="R" />
+                  <Th col="pnl"        label="P&L" />
+                  <Th col="duration_min" label="Dur" />
+                </tr>
+              </thead>
+              <tbody>
+                {trades.map(t => (
+                  <tr key={`${t.source}-${t.id}`}
+                    onClick={() => openDetail(t)}
+                    style={{ borderTop: `1px solid ${T.border}`, cursor: 'pointer' }}
+                    onMouseEnter={e => (e.currentTarget.style.background = T.panelAlt)}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtMuted, whiteSpace: 'nowrap', fontSize: 9 }}>
+                      {jFmtDate(t.date)}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.cyan, fontFamily: T.mono, fontWeight: 700 }}>
+                      {t.instrument || '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: dirColor(t.direction) }}>
+                      {(t.direction || '—').slice(0,5).toUpperCase()}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', fontSize: 8, color: T.txtMuted }}>
+                      {t.source === 'system' ? 'SYS' : 'TZ'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, maxWidth: 100,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {t.strategy_name || '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0' }}>
+                      {jResultBadge(t.result)}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: jRCol(t.r_multiple), fontFamily: T.mono, fontWeight: 700 }}>
+                      {t.r_multiple != null ? (t.r_multiple >= 0 ? '+' : '') + t.r_multiple.toFixed(2) : '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: t.pnl != null ? (t.pnl >= 0 ? T.green : T.red) : T.txtMuted, fontFamily: T.mono }}>
+                      {t.pnl != null ? (t.pnl >= 0 ? '+$' : '-$') + Math.abs(t.pnl).toFixed(0) : '—'}
+                    </td>
+                    <td style={{ padding: '4px 0', color: T.txtMuted, fontFamily: T.mono, fontSize: 9 }}>
+                      {t.duration_min != null ? t.duration_min.toFixed(0) + 'm' : '—'}
+                    </td>
+                  </tr>
+                ))}
+                {trades.length === 0 && (
+                  <tr><td colSpan={9} style={{ textAlign: 'center', color: T.txtMuted,
+                    padding: '16px 0', fontSize: 11 }}>No trades</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination */}
+          {pages > 1 && (
+            <div style={{ display: 'flex', gap: 4, marginTop: 10, justifyContent: 'center' }}>
+              <button onClick={() => fetchTrades(Math.max(1, page - 1))} disabled={page <= 1}
+                style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 3,
+                  color: page <= 1 ? T.txtMuted : T.txtSec, padding: '3px 8px', fontSize: 10,
+                  cursor: page <= 1 ? 'default' : 'pointer' }}>‹</button>
+              {Array.from({ length: Math.min(pages, 7) }, (_, i) => {
+                const p = Math.max(1, Math.min(pages - 6, page - 3)) + i;
+                return (
+                  <button key={p} onClick={() => fetchTrades(p)}
+                    style={{ background: p === page ? T.cyan + '33' : T.panelAlt,
+                      border: `1px solid ${p === page ? T.cyan + '66' : T.border}`,
+                      borderRadius: 3, color: p === page ? T.cyan : T.txtSec,
+                      padding: '3px 7px', fontSize: 10, cursor: 'pointer' }}>
+                    {p}
+                  </button>
+                );
+              })}
+              <button onClick={() => fetchTrades(Math.min(pages, page + 1))} disabled={page >= pages}
+                style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 3,
+                  color: page >= pages ? T.txtMuted : T.txtSec, padding: '3px 8px', fontSize: 10,
+                  cursor: page >= pages ? 'default' : 'pointer' }}>›</button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Detail slide-in */}
+      {(detail || detailLoading) && (
+        <div style={{ position: 'fixed', right: 0, top: 0, bottom: 0, width: 340,
+          background: T.panel, borderLeft: `1px solid ${T.borderMid}`,
+          zIndex: 200, overflowY: 'auto', padding: 20, boxShadow: '-8px 0 24px #00000055' }}>
+          <button onClick={() => setDetail(null)}
+            style={{ position: 'absolute', top: 12, right: 16, background: 'none',
+              border: 'none', color: T.txtMuted, fontSize: 18, cursor: 'pointer', lineHeight: 1 }}>
+            ×
+          </button>
+          {detailLoading && <div style={{ color: T.txtMuted, paddingTop: 40, textAlign: 'center' }}>Loading…</div>}
+          {detail && (
+            <>
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 4 }}>
+                  {detail.source === 'system' ? 'SYSTEM TRADE' : 'TRADZELLA IMPORT'}
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 16, fontWeight: 800, color: T.cyan, fontFamily: T.mono }}>
+                    {detail.symbol || detail.instrument || '—'}
+                  </span>
+                  <span style={{ color: dirColor(detail.direction), fontWeight: 700, fontSize: 12 }}>
+                    {(detail.direction || '').toUpperCase()}
+                  </span>
+                  {jResultBadge(detail.result || '')}
+                </div>
+              </div>
+
+              {/* Entry / Exit / R */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 14 }}>
+                {([
+                  ['Entry', detail.entry],
+                  ['Exit/Target', detail.exit ?? detail.target],
+                  ['R', detail.r_multiple],
+                ] as [string, number | null | undefined][]).map(([lbl, val]) => (
+                  <div key={lbl} style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 13, fontWeight: 800, fontFamily: T.mono,
+                      color: lbl === 'R' ? jRCol(val ?? null) : T.txtPri }}>
+                      {val != null ? (lbl === 'R' ? (val >= 0 ? '+' : '') + val.toFixed(2) + 'R' : val.toFixed(4)) : '—'}
+                    </div>
+                    <div style={{ fontSize: 8, color: T.txtMuted }}>{lbl}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Details grid */}
+              <div style={{ fontSize: 10, borderTop: `1px solid ${T.border}`, paddingTop: 10 }}>
+                {([
+                  ['Session', detail.session],
+                  ['Mode', detail.trading_mode],
+                  ['Strategy', detail.strategy || detail.strategy_name],
+                  ['Strategy Key', detail.strategy_key],
+                  ['Grade', detail.grade],
+                  ['Edge Score', detail.edge_score != null ? detail.edge_score + '/110' : null],
+                  ['Duration', detail.hold_minutes != null ? detail.hold_minutes.toFixed(0) + 'm' :
+                    detail.duration_min != null ? detail.duration_min.toFixed(0) + 'm' : null],
+                  ['MFE', detail.mfe_r != null ? '+' + detail.mfe_r.toFixed(2) + 'R' : null],
+                  ['MAE', detail.mae_r != null ? detail.mae_r.toFixed(2) + 'R' : null],
+                  ['Opened', jFmtDate(detail.opened_at ?? detail.entry_time)],
+                  ['Closed', jFmtDate(detail.closed_at ?? detail.exit_time)],
+                  ['Market Regime', detail.market_regime],
+                  ['Trade Label', detail.trade_label],
+                  ['Entry Reason', detail.entry_reason],
+                  ['Outcome', detail.outcome_reason ?? detail.outcome_tag],
+                  ['Mistakes', detail.mistakes],
+                ] as [string, string | number | null | undefined][]).map(([lbl, val]) => val != null && val !== '' && (
+                  <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between',
+                    padding: '3px 0', borderBottom: `1px solid ${T.border}33` }}>
+                    <span style={{ color: T.txtMuted }}>{lbl}</span>
+                    <span style={{ color: T.txtSec, textAlign: 'right', maxWidth: 180,
+                      overflow: 'hidden', textOverflow: 'ellipsis' }}>{String(val)}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Notes editor (tradzella only) */}
+              {detail.source === 'tradzella' && (
+                <div style={{ marginTop: 14 }}>
+                  <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 4 }}>NOTES</div>
+                  <textarea value={noteEdit} onChange={e => setNoteEdit(e.target.value)}
+                    rows={4} style={{ width: '100%', background: T.panelAlt,
+                      border: `1px solid ${T.border}`, borderRadius: 4,
+                      color: T.txtPri, fontSize: 11, padding: '6px 8px',
+                      resize: 'vertical', boxSizing: 'border-box' }} />
+                  <button onClick={saveNote} disabled={noteSaving}
+                    style={{ marginTop: 6, background: T.blue + '33',
+                      border: `1px solid ${T.blue}66`, borderRadius: 4,
+                      color: T.blue, padding: '4px 12px', fontSize: 10,
+                      cursor: noteSaving ? 'default' : 'pointer' }}>
+                    {noteSaving ? 'Saving…' : 'Save Notes'}
+                  </button>
+                </div>
+              )}
+              {detail.source === 'system' && detail.notes && (
+                <div style={{ marginTop: 14 }}>
+                  <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 4 }}>NOTES</div>
+                  <div style={{ fontSize: 10, color: T.txtSec, lineHeight: 1.5 }}>{String(detail.notes)}</div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── Import tab ────────────────────────────────────────────────────────────────
+const JImportTab: React.FC = () => {
+  const [stage, setStage] = useState<'pick' | 'preview' | 'done'>('pick');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<JPreviewTrade[]>([]);
+  const [previewMeta, setPreviewMeta] = useState<{ duplicate_count: number; row_count: number; warnings: string[] } | null>(null);
+  const [previewToken, setPreviewToken] = useState<string | null>(null);
+  const [filename, setFilename] = useState('');
+  const [rawCsv, setRawCsv] = useState('');
+  const [doneResult, setDoneResult] = useState<{ batch_id: string; imported: number; skipped_dupes: number } | null>(null);
+  const [batches, setBatches] = useState<JBatch[]>([]);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [rollbackMsg, setRollbackMsg] = useState<string | null>(null);
+
+  const fetchBatches = useCallback(async () => {
+    setBatchLoading(true);
+    try {
+      const r = await fetch('/api/journal/import/batches', { headers: getAuthHeader() });
+      const data = await r.json();
+      if (data.ok) setBatches(data.batches || []);
+    } catch { /* ignore */ }
+    setBatchLoading(false);
+  }, []);
+
+  useEffect(() => { fetchBatches(); }, [fetchBatches]);
+
+  const handleFile = async (file: File) => {
+    setFilename(file.name); setLoading(true); setError(null);
+    try {
+      const raw = await file.text();
+      setRawCsv(raw);
+      const r = await fetch('/api/journal/import/preview', {
+        method: 'POST',
+        headers: { ...getAuthHeader(), 'Content-Type': 'text/plain' },
+        body: raw,
+      });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'preview failed');
+      setPreview(data.trades || []);
+      setPreviewToken(data.preview_token || null);
+      setPreviewMeta({ duplicate_count: data.duplicate_count, row_count: data.row_count, warnings: data.warnings || [] });
+      setStage('preview');
+    } catch (e) { setError(String(e)); }
+    setLoading(false);
+  };
+
+  const handleConfirm = async () => {
+    setLoading(true); setError(null);
+    try {
+      if (!previewToken) throw new Error('No preview session — please re-upload the CSV');
+      const r = await fetch('/api/journal/import/confirm', {
+        method: 'POST',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        // Only send the server-issued token — never the trade payload.
+        // The server holds all trade data; the browser cannot tamper with it.
+        body: JSON.stringify({ preview_token: previewToken, filename }),
+      });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'confirm failed');
+      setDoneResult({ batch_id: data.batch_id, imported: data.imported, skipped_dupes: data.skipped_dupes });
+      setStage('done');
+      fetchBatches();
+    } catch (e) { setError(String(e)); }
+    setLoading(false);
+  };
+
+  const handleRollback = async (batchId: string) => {
+    if (!confirm(`Roll back batch ${batchId.slice(0, 8)}…? This deletes all imported trades from that batch.`)) return;
+    setRollbackMsg(null);
+    try {
+      const r = await fetch('/api/journal/import/rollback', {
+        method: 'POST',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_id: batchId }),
+      });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'rollback failed');
+      setRollbackMsg(`Rolled back ${data.deleted} trade${data.deleted !== 1 ? 's' : ''}.`);
+      fetchBatches();
+    } catch (e) { setRollbackMsg('Error: ' + String(e)); }
+  };
+
+  return (
+    <div>
+      {stage === 'pick' && (
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ border: `2px dashed ${T.border}`, borderRadius: 8,
+            padding: '24px', textAlign: 'center', marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: T.txtSec, marginBottom: 8 }}>
+              Drop a Tradzella CSV export here, or click to browse
+            </div>
+            <input type="file" accept=".csv,text/plain" onChange={e => e.target.files?.[0] && handleFile(e.target.files[0])}
+              style={{ display: 'none' }} id="jrnl-csv-input" />
+            <label htmlFor="jrnl-csv-input" style={{ background: T.blue + '33',
+              border: `1px solid ${T.blue}66`, borderRadius: 6,
+              color: T.blue, padding: '6px 16px', fontSize: 11,
+              cursor: 'pointer', display: 'inline-block' }}>
+              Choose CSV File
+            </label>
+          </div>
+          {loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Parsing…</div>}
+          {error && <div style={{ color: T.red, fontSize: 11 }}>{error}</div>}
+        </div>
+      )}
+
+      {stage === 'preview' && previewMeta && (
+        <div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+            <div style={{ fontSize: 11, color: T.txtSec }}>
+              {previewMeta.row_count} rows parsed · {' '}
+              <span style={{ color: T.amber }}>{previewMeta.duplicate_count} duplicates</span>
+              {' · '}{previewMeta.row_count - previewMeta.duplicate_count} new
+            </div>
+            {previewMeta.warnings.map((w, i) => (
+              <div key={i} style={{ fontSize: 10, color: T.amber }}>⚠ {w}</div>
+            ))}
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+              <button onClick={() => setStage('pick')}
+                style={{ background: 'none', border: `1px solid ${T.border}`, borderRadius: 4,
+                  color: T.txtSec, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>
+                Cancel
+              </button>
+              <button onClick={handleConfirm} disabled={loading || previewMeta.row_count - previewMeta.duplicate_count === 0}
+                style={{ background: T.green + '33', border: `1px solid ${T.green}66`,
+                  borderRadius: 4, color: T.green, padding: '4px 12px', fontSize: 11,
+                  cursor: loading ? 'default' : 'pointer' }}>
+                {loading ? 'Importing…' : `Import ${previewMeta.row_count - previewMeta.duplicate_count} trades`}
+              </button>
+            </div>
+          </div>
+          {error && <div style={{ color: T.red, fontSize: 11, marginBottom: 8 }}>{error}</div>}
+          <div style={{ overflowX: 'auto', maxHeight: 320, overflowY: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead>
+                <tr>
+                  {['Symbol','Dir','Entry Time','Entry','Exit','P&L','R','Dup'].map(h => (
+                    <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                      paddingBottom: 6, fontSize: 9, letterSpacing: '0.07em',
+                      position: 'sticky', top: 0, background: T.panel }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {preview.map((t, i) => (
+                  <tr key={i} style={{ borderTop: `1px solid ${T.border}`,
+                    background: t.duplicate ? T.amber + '11' : 'transparent' }}>
+                    <td style={{ padding: '3px 8px 3px 0', color: T.cyan, fontFamily: T.mono, fontWeight: 700 }}>
+                      {t.symbol || '—'}
+                    </td>
+                    <td style={{ padding: '3px 8px 3px 0', color: dirColor(t.side) }}>
+                      {(t.side || '—').slice(0,5).toUpperCase()}
+                    </td>
+                    <td style={{ padding: '3px 8px 3px 0', color: T.txtMuted, whiteSpace: 'nowrap', fontSize: 9 }}>
+                      {jFmtShortDate(t.entry_time)}
+                    </td>
+                    <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono, color: T.txtSec, fontSize: 9 }}>
+                      {t.entry_price != null ? t.entry_price.toFixed(2) : '—'}
+                    </td>
+                    <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono, color: T.txtSec, fontSize: 9 }}>
+                      {t.exit_price != null ? t.exit_price.toFixed(2) : '—'}
+                    </td>
+                    <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono,
+                      color: t.pnl != null ? (t.pnl >= 0 ? T.green : T.red) : T.txtMuted }}>
+                      {t.pnl != null ? (t.pnl >= 0 ? '+$' : '-$') + Math.abs(t.pnl).toFixed(0) : '—'}
+                    </td>
+                    <td style={{ padding: '3px 8px 3px 0', fontFamily: T.mono, color: jRCol(t.r_multiple ?? null) }}>
+                      {t.r_multiple != null ? (t.r_multiple >= 0 ? '+' : '') + t.r_multiple.toFixed(2) : '—'}
+                    </td>
+                    <td style={{ padding: '3px 0' }}>
+                      {t.duplicate
+                        ? <span style={{ color: T.amber, fontSize: 9, fontWeight: 700 }}>DUP</span>
+                        : <span style={{ color: T.green, fontSize: 9 }}>NEW</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {stage === 'done' && doneResult && (
+        <div style={{ textAlign: 'center', padding: '24px 0' }}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>✓</div>
+          <div style={{ fontSize: 14, color: T.green, fontWeight: 700, marginBottom: 4 }}>
+            Import Complete
+          </div>
+          <div style={{ fontSize: 11, color: T.txtSec, marginBottom: 2 }}>
+            {doneResult.imported} trade{doneResult.imported !== 1 ? 's' : ''} imported
+            {doneResult.skipped_dupes > 0 ? ` · ${doneResult.skipped_dupes} duplicates skipped` : ''}
+          </div>
+          <div style={{ fontSize: 9, color: T.txtMuted, fontFamily: T.mono, marginBottom: 16 }}>
+            Batch ID: {doneResult.batch_id.slice(0, 12)}…
+          </div>
+          <button onClick={() => { setStage('pick'); setPreview([]); setPreviewMeta(null); }}
+            style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 6,
+              color: T.txtSec, padding: '6px 16px', fontSize: 11, cursor: 'pointer' }}>
+            Import Another File
+          </button>
+        </div>
+      )}
+
+      {/* Batch history */}
+      <div style={{ marginTop: 24, borderTop: `1px solid ${T.border}`, paddingTop: 14 }}>
+        <div style={{ fontSize: 9, color: T.txtMuted, letterSpacing: '0.07em', marginBottom: 8 }}>
+          IMPORT HISTORY
+        </div>
+        {rollbackMsg && (
+          <div style={{ fontSize: 10, color: T.amber, marginBottom: 8 }}>{rollbackMsg}</div>
+        )}
+        {batchLoading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
+        {!batchLoading && batches.length === 0 && (
+          <div style={{ color: T.txtMuted, fontSize: 11 }}>No imports yet.</div>
+        )}
+        {batches.map(b => (
+          <div key={b.batch_id} style={{ display: 'flex', alignItems: 'center', gap: 8,
+            padding: '6px 0', borderBottom: `1px solid ${T.border}33` }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 10, color: T.txtSec, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {b.filename || 'untitled.csv'}
+              </div>
+              <div style={{ fontSize: 9, color: T.txtMuted }}>
+                {jFmtDate(b.created_at)} · {b.imported_count} imported · {b.skipped_count} dupes
+              </div>
+            </div>
+            <div style={{ fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>
+              {b.batch_id.slice(0, 8)}…
+            </div>
+            <button onClick={() => handleRollback(b.batch_id)}
+              style={{ background: T.red + '22', border: `1px solid ${T.red}44`,
+                borderRadius: 3, color: T.red, padding: '2px 8px', fontSize: 9,
+                cursor: 'pointer', flexShrink: 0 }}>
+              Rollback
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ── Analytics tab ─────────────────────────────────────────────────────────────
+const JAnalyticsTab: React.FC = () => {
+  const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [groupBy, setGroupBy] = useState('strategy');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  const fetchAnalytics = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const params = new URLSearchParams({ group_by: groupBy,
+        ...(dateFrom ? { from: dateFrom } : {}),
+        ...(dateTo   ? { to:   dateTo   } : {}),
+      });
+      const r = await fetch(`/api/journal/analytics?${params}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'failed');
+      setData(d);
+    } catch (e) { setError(String(e)); }
+    setLoading(false);
+  }, [groupBy, dateFrom, dateTo]);
+
+  useEffect(() => { fetchAnalytics(); }, [fetchAnalytics]);
+
+  const sum = (data?.summary ?? {}) as Record<string, unknown>;
+  const sys = (data?.system  ?? {}) as Record<string, unknown>;
+  const tz  = (data?.tradzella ?? {}) as Record<string, unknown>;
+  const bd  = Array.isArray(data?.breakdown) ? data!.breakdown as Record<string, unknown>[] : [];
+
+  const StatCard: React.FC<{ label: string; value: unknown; color?: string; sub?: string }> = ({ label, value, color, sub }) => (
+    <div style={{ background: T.panelAlt, borderRadius: 6, padding: '10px 12px',
+      border: `1px solid ${T.border}` }}>
+      <div style={{ fontSize: 18, fontWeight: 800, fontFamily: T.mono,
+        color: color || T.txtPri }}>
+        {value != null && value !== '' ? String(value) : '—'}
+      </div>
+      <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>{label}</div>
+      {sub && <div style={{ fontSize: 9, color: T.txtSec, marginTop: 1 }}>{sub}</div>}
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Controls */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+        <select value={groupBy} onChange={e => setGroupBy(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 8px', fontSize: 11 }}>
+          {['strategy','instrument','session','regime','daily','weekly','monthly'].map(g => (
+            <option key={g} value={g}>{g.charAt(0).toUpperCase() + g.slice(1)}</option>
+          ))}
+        </select>
+        <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
+        <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
+        <button onClick={fetchAnalytics}
+          style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
+            color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>
+          Refresh
+        </button>
+      </div>
+
+      {loading && <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>}
+      {error && <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>}
+
+      {data && !loading && (
+        <>
+          {/* Summary cards */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 14 }}>
+            <StatCard label="TOTAL TRADES" value={sum.n} />
+            <StatCard label="WIN RATE" value={sum.win_pct != null ? sum.win_pct + '%' : '—'} color={T.green} />
+            <StatCard label="AVG R (SYSTEM)" value={sys.avg_r != null ? (Number(sys.avg_r) >= 0 ? '+' : '') + Number(sys.avg_r).toFixed(2) + 'R' : '—'}
+              color={sys.avg_r != null ? (Number(sys.avg_r) >= 0 ? T.green : T.red) : T.txtSec}
+              sub={`${sys.n} trades`} />
+            <StatCard label="PROFIT FACTOR" value={sys.profit_factor != null ? Number(sys.profit_factor).toFixed(2) : '—'}
+              color={sys.profit_factor != null && Number(sys.profit_factor) >= 1.5 ? T.green : T.amber} />
+          </div>
+
+          {/* Source comparison */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 14 }}>
+            {([['System Trades', sys], ['Tradzella Imports', tz]] as [string, Record<string, unknown>][]).map(([lbl, s]) => (
+              <div key={lbl} style={{ background: T.panelAlt, borderRadius: 6,
+                padding: '10px 12px', border: `1px solid ${T.border}` }}>
+                <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 6 }}>{lbl.toUpperCase()}</div>
+                <div style={{ display: 'flex', gap: 12 }}>
+                  {([
+                    ['n', 'Trades', ''],
+                    ['win_pct', 'Win%', '%'],
+                    ['avg_r', 'Avg R', 'R'],
+                    ['profit_factor', 'PF', ''],
+                  ] as [string, string, string][]).map(([k, l, sfx]) => {
+                    const v = s[k];
+                    const num = v != null ? Number(v) : null;
+                    return (
+                      <div key={k}>
+                        <div style={{ fontSize: 13, fontWeight: 700, fontFamily: T.mono,
+                          color: k === 'avg_r' && num != null ? (num >= 0 ? T.green : T.red) : T.txtPri }}>
+                          {num != null ? (k === 'avg_r' && num >= 0 ? '+' : '') + num.toFixed(k === 'n' ? 0 : 2) + sfx : '—'}
+                        </div>
+                        <div style={{ fontSize: 8, color: T.txtMuted }}>{l}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Breakdown table */}
+          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 6 }}>
+            BY {groupBy.toUpperCase()}
+          </div>
+          <div style={{ overflowX: 'auto', maxHeight: 280, overflowY: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead>
+                <tr>
+                  {['Group','Trades','Wins','Win%','Avg R'].map(h => (
+                    <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                      paddingBottom: 6, fontSize: 9, position: 'sticky', top: 0, background: T.panel }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {bd.map((row, i) => {
+                  const avgR = row.avg_r != null ? Number(row.avg_r) : null;
+                  return (
+                    <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                      <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, maxWidth: 140,
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {String(row.group || '—')}
+                      </td>
+                      <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, fontFamily: T.mono }}>{String(row.n ?? '—')}</td>
+                      <td style={{ padding: '4px 8px 4px 0', color: T.green, fontFamily: T.mono }}>{String(row.wins ?? '—')}</td>
+                      <td style={{ padding: '4px 8px 4px 0', color: T.txtPri, fontFamily: T.mono }}>
+                        {row.win_pct != null ? Number(row.win_pct).toFixed(1) + '%' : '—'}
+                      </td>
+                      <td style={{ padding: '4px 0', fontFamily: T.mono,
+                        color: avgR != null ? (avgR >= 0 ? T.green : T.red) : T.txtMuted, fontWeight: 700 }}>
+                        {avgR != null ? (avgR >= 0 ? '+' : '') + avgR.toFixed(2) + 'R' : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {bd.length === 0 && (
+                  <tr><td colSpan={5} style={{ textAlign: 'center', color: T.txtMuted,
+                    padding: '12px 0', fontSize: 11 }}>No data</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ── Playbook tab ──────────────────────────────────────────────────────────────
+const JPlaybookTab: React.FC = () => {
+  const [data, setData] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [minN, setMinN] = useState(20);
+
+  useEffect(() => {
+    setLoading(true);
+    fetch('/api/journal/playbook', { headers: getAuthHeader() })
+      .then(r => r.json())
+      .then(d => { if (d.ok) { setData(d.strategies || []); setMinN(d.min_n || 20); } else setError(d.error || 'failed'); })
+      .catch(e => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>;
+  if (error)   return <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>;
+
+  return (
+    <div>
+      <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10 }}>
+        ⚠ Strategies with fewer than {minN} trades are flagged as low-sample.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        {data.map((s, i) => {
+          const avgR = s.avg_r != null ? Number(s.avg_r) : null;
+          const winPct = s.win_pct != null ? Number(s.win_pct) : null;
+          const isFlagged = s.sample_warning === true;
+          return (
+            <div key={i} style={{ background: T.panelAlt, borderRadius: 8,
+              padding: '12px 14px', border: `1px solid ${isFlagged ? T.amber + '55' : T.border}` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ fontSize: 10, color: T.txtSec, fontWeight: 700,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '65%' }}>
+                  {String(s.strategy || '—')}
+                </div>
+                {isFlagged && (
+                  <span style={{ fontSize: 8, color: T.amber, background: T.amber + '22',
+                    borderRadius: 3, padding: '1px 5px', flexShrink: 0 }}>
+                    LOW SAMPLE
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 12 }}>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800, fontFamily: T.mono,
+                    color: winPct != null && winPct >= 50 ? T.green : T.amber }}>
+                    {winPct != null ? winPct.toFixed(0) + '%' : '—'}
+                  </div>
+                  <div style={{ fontSize: 8, color: T.txtMuted }}>WIN RATE</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800, fontFamily: T.mono,
+                    color: avgR != null ? (avgR >= 0 ? T.green : T.red) : T.txtSec }}>
+                    {avgR != null ? (avgR >= 0 ? '+' : '') + avgR.toFixed(2) + 'R' : '—'}
+                  </div>
+                  <div style={{ fontSize: 8, color: T.txtMuted }}>AVG R</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800, fontFamily: T.mono, color: T.txtSec }}>
+                    {String(s.n ?? '—')}
+                  </div>
+                  <div style={{ fontSize: 8, color: T.txtMuted }}>TRADES</div>
+                </div>
+              </div>
+              {Boolean(s.trading_mode) && (
+                <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 6 }}>
+                  {String(s.trading_mode)} · Last: {jFmtShortDate(s.last_trade)}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {data.length === 0 && (
+          <div style={{ gridColumn: '1/-1', color: T.txtMuted, fontSize: 11, padding: '16px 0', textAlign: 'center' }}>
+            No strategy data. System trades appear here after they close.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ── Learning tab ──────────────────────────────────────────────────────────────
+const JLearningTab: React.FC = () => {
+  const [records, setRecords] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    fetch('/api/journal/learning', { headers: getAuthHeader() })
+      .then(r => r.json())
+      .then(d => { if (d.ok) setRecords(d.records || []); else setError(d.error || 'failed'); })
+      .catch(e => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div style={{ color: T.txtMuted, fontSize: 11 }}>Loading…</div>;
+  if (error)   return <div style={{ color: T.red, fontSize: 11 }}>Error: {error}</div>;
+
+  const statusColor = (status: unknown): string => {
+    const s = String(status || '');
+    if (s === 'LIVE_ELIGIBLE') return T.green;
+    if (s === 'GHOST_ONLY') return T.amber;
+    if (s === 'DISABLED') return T.red;
+    return T.txtMuted;
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 10 }}>
+        Display-only · These eligibility decisions are computed automatically — no controls here affect the gate.
+      </div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+          <thead>
+            <tr>
+              {['Instrument','Mode','Status','n','Win%','Avg R','Last 20R','Rule'].map(h => (
+                <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                  paddingBottom: 6, fontSize: 9, letterSpacing: '0.07em', whiteSpace: 'nowrap' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {records.map((r, i) => {
+              const status = String(r.status || '');
+              const sc = statusColor(status);
+              const wr = r.win_rate != null ? Number(r.win_rate) : null;
+              const ar = r.avg_r != null ? Number(r.avg_r) : null;
+              const l20 = r.last_20_avg_r != null ? Number(r.last_20_avg_r) : null;
+              return (
+                <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                  <td style={{ padding: '4px 8px 4px 0', color: T.cyan, fontFamily: T.mono, fontWeight: 700 }}>
+                    {String(r.instrument || '—')}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, fontSize: 9 }}>
+                    {String(r.mode || '—')}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0' }}>
+                    <span style={{ background: sc + '22', color: sc, borderRadius: 3,
+                      padding: '1px 5px', fontSize: 8, fontWeight: 700 }}>
+                      {status || '—'}
+                    </span>
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', fontFamily: T.mono, color: T.txtSec }}>
+                    {r.n != null ? String(r.n) : '—'}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', fontFamily: T.mono,
+                    color: wr != null ? (wr >= 0.5 ? T.green : T.amber) : T.txtMuted }}>
+                    {wr != null ? (wr * 100).toFixed(0) + '%' : '—'}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', fontFamily: T.mono,
+                    color: ar != null ? (ar >= 0 ? T.green : T.red) : T.txtMuted }}>
+                    {ar != null ? (ar >= 0 ? '+' : '') + ar.toFixed(2) + 'R' : '—'}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', fontFamily: T.mono,
+                    color: l20 != null ? (l20 >= 0 ? T.green : T.red) : T.txtMuted }}>
+                    {l20 != null ? (l20 >= 0 ? '+' : '') + l20.toFixed(2) + 'R' : '—'}
+                  </td>
+                  <td style={{ padding: '4px 0', color: T.txtMuted, fontSize: 9,
+                    maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {String(r.rule || '—')}
+                  </td>
+                </tr>
+              );
+            })}
+            {records.length === 0 && (
+              <tr><td colSpan={8} style={{ textAlign: 'center', color: T.txtMuted,
+                padding: '16px 0', fontSize: 11 }}>
+                Learning eligibility not yet computed. It runs after a trade closes.
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+// ── Journal Full Page (outer shell) ──────────────────────────────────────────
+const JournalFullPage: React.FC = () => {
+  const [tab, setTab] = useState<JTab>('trades');
+
+  return (
+    <div style={{ background: T.panel, borderRadius: 10, border: `1px solid ${T.border}`,
+      padding: 16, minHeight: 400 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: T.txtPri, letterSpacing: '0.04em' }}>
+          Journal
+        </div>
+        <div style={{ fontSize: 9, color: T.txtMuted }}>Phase 7K</div>
+      </div>
+      <JTabBar active={tab} onChange={setTab} />
+      {tab === 'trades'    && <JTradesTab />}
+      {tab === 'import'    && <JImportTab />}
+      {tab === 'analytics' && <JAnalyticsTab />}
+      {tab === 'playbook'  && <JPlaybookTab />}
+      {tab === 'learning'  && <JLearningTab />}
+    </div>
+  );
+};
+
 // ── Journal Panel ─────────────────────────────────────────────────────────────
 const JournalPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const jnl   = (p.journal ?? {}) as Record<string, unknown>;
@@ -3235,7 +4291,7 @@ export default function MainBrain() {
           </div>
         );
       case 'journal':
-        return <JournalPanel p={p} />;
+        return <JournalFullPage />;
       case 'coach':
         return <CoachPanel p={p} />;
       case 'alerts':
