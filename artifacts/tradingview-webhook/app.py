@@ -3917,6 +3917,52 @@ def now_utc():
 # EST/EDT daylight-saving switch automatically (e.g. EDT in summer, EST in winter).
 ET_TZ = ZoneInfo("America/New_York")
 
+# Regex for validating HH:MM time strings (intraday block filter, Phase 7O.2).
+# Strict: hours 00-23, minutes 00-59.
+_HHMM_RE = re.compile(r'^([01][0-9]|2[0-3]):[0-5][0-9]$')
+
+
+def _intraday_bucket(ts, tz: str = "America/New_York"):
+    """Convert a timestamp to a 30-minute block descriptor.
+
+    Returns (block_start_str, block_end_str, label) or None on failure.
+      block_start_str  "HH:MM"  — inclusive start (e.g. "09:30")
+      block_end_str    "HH:MM"  — exclusive end   (e.g. "10:00");
+                                  "00:00" when the block is 23:30–23:59
+      label            "HH:MM–HH:MM"  — display label with inclusive end
+
+    Naive timestamps are treated as UTC (existing strategy_trades importer contract).
+    Malformed timestamps return None and are silently excluded from analytics.
+    ZoneInfo handles DST automatically (EDT/EST, spring-forward/fall-back).
+    """
+    if ts is None:
+        return None
+    try:
+        try:
+            tz_obj = ZoneInfo(tz)
+        except Exception:
+            tz_obj = ZoneInfo("America/New_York")
+        if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
+            local_dt = ts.astimezone(tz_obj)
+        else:
+            # Naive → assume UTC (matching the strategy_trades importer contract)
+            local_dt = ts.replace(tzinfo=timezone.utc).astimezone(tz_obj)
+        h         = local_dt.hour
+        m         = local_dt.minute
+        block_m   = (m // 30) * 30          # floor to 30-min boundary
+        start_min = h * 60 + block_m        # minutes-since-midnight for block start
+        end_min   = start_min + 30          # exclusive end (may reach 1440 for 23:30 block)
+        s_h, s_m  = divmod(start_min, 60)
+        e_h, e_m  = divmod(end_min % 1440, 60)
+        start_str = f"{s_h:02d}:{s_m:02d}"
+        end_str   = f"{e_h:02d}:{e_m:02d}"
+        # Inclusive display end = 29 minutes after start
+        d_h, d_m  = divmod(start_min + 29, 60)
+        label     = f"{start_str}\u2013{d_h:02d}:{d_m:02d}"
+        return (start_str, end_str, label)
+    except Exception:
+        return None
+
 
 def fmt_et(value, fmt="%Y-%m-%d %H:%M ET"):
     """Format a UTC datetime or ISO-8601 string in US Eastern time for display.
@@ -43906,6 +43952,30 @@ def journal_trades_list():
             outer_w.append(f"{rating_field} = %s")
             outer_p.append(rating_value)
 
+        # ── Phase 7O.2: intraday block filter ────────────────────────────────
+        # Validated against _HHMM_RE before any SQL use; timezone validated via ZoneInfo.
+        # `date` in the UNION ALL is a naive UTC timestamp (importer contract):
+        #   AT TIME ZONE 'UTC' normalises it to timestamptz, then AT TIME ZONE tz
+        #   converts to local time. This is the same pattern used by _COACHING_BASE_CTE.
+        # For the 23:30 block, entry_block_end is "00:00" — upper bound is omitted.
+        raw_ebs = (request.args.get("entry_block_start") or "").strip()
+        raw_ebe = (request.args.get("entry_block_end")   or "").strip()
+        raw_dtz = (request.args.get("display_timezone")  or "").strip() or "America/New_York"
+        if raw_ebs and _HHMM_RE.match(raw_ebs):
+            try:
+                ZoneInfo(raw_dtz)
+            except Exception:
+                raw_dtz = "America/New_York"
+            outer_w.append(
+                "(date AT TIME ZONE 'UTC' AT TIME ZONE %s)::time >= %s::time"
+            )
+            outer_p += [raw_dtz, raw_ebs]
+            if raw_ebe and _HHMM_RE.match(raw_ebe) and raw_ebe != "00:00":
+                outer_w.append(
+                    "(date AT TIME ZONE 'UTC' AT TIME ZONE %s)::time < %s::time"
+                )
+                outer_p += [raw_dtz, raw_ebe]
+
         outer_clause = (" WHERE " + " AND ".join(outer_w)) if outer_w else ""
         all_outer_p  = all_p + outer_p
 
@@ -46118,6 +46188,376 @@ def journal_coaching():
             conn.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 7O.2 — Intraday 30-Minute Block Coaching (display-only, SELECT only)
+# ---------------------------------------------------------------------------
+
+# Canonical entry timestamp per source (used by both this endpoint and
+# journal_trades_list block filter — never changes the money path).
+_WIN_SET      = {'win'}
+_SCRATCH_SET  = {'scratch', 'be', 'breakeven', 'b/e'}
+_LOSS_SET     = {'loss', 'stopped', 'stopped out', 'stop', 'sl', 'stop loss', 'stopped-out'}
+
+# Base LEFT JOIN CTE for intraday analytics (includes unreviewed trades in counts).
+_INTRADAY_BASE_CTE = """\
+WITH base AS (
+  SELECT 'system'::text AS source, st.id AS trade_id,
+    COALESCE(st.opened_at, st.created_at)     AS entry_ts,
+    COALESCE(st.symbol,'')                     AS instrument,
+    LOWER(COALESCE(st.direction,''))           AS direction,
+    LOWER(COALESCE(st.result,''))              AS result,
+    st.r_multiple,
+    NULL::float                                AS pnl,
+    COALESCE(st.strategy_key, st.strategy,'') AS strategy_name,
+    COALESCE(st.trading_mode,'')               AS mode,
+    COALESCE(jr.review_status,'UNREVIEWED')    AS review_status,
+    jr.followed_plan,
+    jr.mistake_tags, jr.positive_tags, jr.emotion_tags,
+    jr.setup_quality, jr.execution_quality,
+    jr.discipline_quality, jr.overall_quality
+  FROM strategy_trades   st
+  LEFT JOIN journal_reviews jr ON jr.source = 'system'    AND jr.trade_id = st.id
+  WHERE st.closed_at IS NOT NULL
+  UNION ALL
+  SELECT 'tradzella'::text, tt.id,
+    tt.entry_time,
+    COALESCE(tt.symbol,''),   LOWER(COALESCE(tt.side,'')),
+    LOWER(COALESCE(tt.outcome,'')),
+    tt.r_multiple, tt.pnl::float,
+    COALESCE(tt.setup,''),    COALESCE(tt.mode,''),
+    COALESCE(jr.review_status,'UNREVIEWED'),
+    jr.followed_plan,
+    jr.mistake_tags, jr.positive_tags, jr.emotion_tags,
+    jr.setup_quality, jr.execution_quality,
+    jr.discipline_quality, jr.overall_quality
+  FROM tradezella_trades tt
+  LEFT JOIN journal_reviews jr ON jr.source = 'tradzella' AND jr.trade_id = tt.id
+  WHERE tt.exit_time IS NOT NULL
+)"""
+
+
+def _top_tag_from_jsonb_list(rows, field: str, *, is_emotion: bool = False) -> str | None:
+    """Return the most-common tag from JSONB tag list across rows.
+
+    Ties broken by alphabetical order for determinism.
+    For emotion tags (JSONB array of objects with "tag" key), set is_emotion=True.
+    """
+    from collections import Counter
+    counts: Counter = Counter()
+    for r in rows:
+        raw = r.get(field)
+        if not raw:
+            continue
+        if isinstance(raw, list):
+            items = raw
+        else:
+            try:
+                import json as _json
+                items = _json.loads(raw)
+            except Exception:
+                continue
+        for item in items:
+            if is_emotion:
+                tag = (item.get("tag") or "") if isinstance(item, dict) else ""
+            else:
+                tag = str(item) if isinstance(item, str) else ""
+            tag = tag.strip().lower()
+            if tag:
+                counts[tag] += 1
+    if not counts:
+        return None
+    max_v = max(counts.values())
+    # Deterministic tie-break: alphabetical
+    return sorted(k for k, v in counts.items() if v == max_v)[0]
+
+
+def _intraday_confidence(reviewed_count: int) -> str:
+    """Return confidence label for an intraday block."""
+    if reviewed_count < 5:
+        return "INSUFFICIENT"
+    if reviewed_count < 20:
+        return "EARLY"
+    if reviewed_count < 50:
+        return "MODERATE"
+    return "STRONG"
+
+
+@app.route("/journal/coaching/intraday", methods=["GET"])
+def journal_coaching_intraday():
+    """Intraday 30-minute block coaching analytics — DISPLAY-ONLY (Phase 7O.2).
+
+    Returns one block per 30-minute window that has at least one matching trade.
+    Blocks with zero trades are omitted from the response.
+
+    Query params (same subset as /journal/coaching):
+      date_from, date_to, instrument, strategy, mode, session, source, review_status
+    Additional:
+      display_timezone  (IANA timezone string; default America/New_York)
+    """
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+
+    date_from     = (request.args.get("date_from")      or "").strip()
+    date_to       = (request.args.get("date_to")        or "").strip()
+    f_instrument  = (request.args.get("instrument")     or "").strip()
+    f_mode        = (request.args.get("mode")           or "").strip().upper()
+    f_source      = (request.args.get("source")         or "").strip().lower()
+    f_strategy    = (request.args.get("strategy")       or "").strip()
+    f_session     = (request.args.get("session")        or "").strip().lower()
+    f_review      = (request.args.get("review_status")  or "").strip().upper()
+    raw_tz        = (request.args.get("display_timezone") or "").strip() or "America/New_York"
+    try:
+        ZoneInfo(raw_tz)
+        display_tz = raw_tz
+    except Exception:
+        display_tz = "America/New_York"
+
+    # Build filter clauses applied after the CTE.
+    # Date bounds compare the LOCAL calendar date in display_tz (not the UTC wall clock),
+    # matching the convention in _COACHING_BASE_CTE where trade_date is pre-converted
+    # to the display timezone before filtering.  entry_ts is a naive UTC timestamp
+    # (importer contract), so AT TIME ZONE 'UTC' normalises it to timestamptz, then
+    # AT TIME ZONE display_tz converts to the local day before the ::date cast.
+    f_clauses: list = []
+    f_params:  list = []
+    if date_from:
+        f_clauses.append(
+            "(entry_ts AT TIME ZONE 'UTC' AT TIME ZONE %s)::date >= %s::date"
+        )
+        f_params += [display_tz, date_from]
+    if date_to:
+        # inclusive: local date in display_tz must be on or before date_to
+        f_clauses.append(
+            "(entry_ts AT TIME ZONE 'UTC' AT TIME ZONE %s)::date <= %s::date"
+        )
+        f_params += [display_tz, date_to]
+    if f_instrument:
+        f_clauses.append("instrument ILIKE %s")
+        f_params.append(f"%{f_instrument}%")
+    if f_mode:
+        f_clauses.append("UPPER(mode) = %s")
+        f_params.append(f_mode)
+    if f_source in ("system", "tradzella"):
+        f_clauses.append("source = %s")
+        f_params.append(f_source)
+    if f_strategy:
+        f_clauses.append("strategy_name ILIKE %s")
+        f_params.append(f"%{f_strategy}%")
+    if f_review:
+        f_clauses.append("review_status = %s")
+        f_params.append(f_review)
+
+    fa = (" WHERE " + " AND ".join(f_clauses)) if f_clauses else ""
+
+    sql = f"{_INTRADAY_BASE_CTE} SELECT * FROM base{fa} ORDER BY entry_ts"
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, f_params)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("journal_coaching_intraday query failed: %s", exc)
+        return jsonify({"ok": False, "error": "intraday query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # ── Bucket rows in Python via _intraday_bucket() ──────────────────────
+    from collections import defaultdict
+    blocks: dict = defaultdict(list)
+    for row in rows:
+        ts  = row.get("entry_ts")
+        bkt = _intraday_bucket(ts, display_tz)
+        if bkt is None:
+            continue
+        block_start, block_end, label = bkt
+        key = block_start  # HH:MM as dict key
+        row["_block_start"] = block_start
+        row["_block_end"]   = block_end
+        row["_label"]       = label
+        blocks[key].append(row)
+
+    # ── Aggregate per block ────────────────────────────────────────────────
+    result_blocks = []
+    for block_start in sorted(blocks.keys()):
+        brows = blocks[block_start]
+        sample = brows[0]
+
+        trade_count    = len(brows)
+        reviewed_rows  = [r for r in brows if (r.get("review_status") or "") == "REVIEWED"]
+        reviewed_count = len(reviewed_rows)
+        confidence     = _intraday_confidence(reviewed_count)
+
+        # P&L / R metrics (closed trades — i.e. all rows here, since CTE filters closed_at IS NOT NULL)
+        wins      = sum(1 for r in brows if (r.get("result") or "") in _WIN_SET)
+        losses    = sum(1 for r in brows if (r.get("result") or "") in _LOSS_SET)
+        breakeven = sum(1 for r in brows if (r.get("result") or "") in _SCRATCH_SET)
+
+        all_r     = [float(r["r_multiple"]) for r in brows if r.get("r_multiple") is not None]
+        win_r     = [float(r["r_multiple"]) for r in brows
+                     if (r.get("result") or "") in _WIN_SET and r.get("r_multiple") is not None]
+        loss_r    = [abs(float(r["r_multiple"])) for r in brows
+                     if (r.get("result") or "") in _LOSS_SET and r.get("r_multiple") is not None]
+
+        net_r     = round(sum(all_r), 2)            if all_r    else 0.0
+        avg_r     = round(sum(all_r) / len(all_r), 2) if all_r  else 0.0
+        avg_win_r = round(sum(win_r) / len(win_r), 2) if win_r  else 0.0
+        avg_loss_r= round(sum(loss_r) / len(loss_r), 2) if loss_r else 0.0
+        win_rate  = round(wins / (wins + losses + breakeven), 3) if (wins + losses + breakeven) > 0 else 0.0
+        pf        = _coaching_pf(sum(win_r), sum(loss_r))
+        expectancy= round(avg_r, 3)
+
+        # Discipline metrics (reviewed rows only)
+        fp_yes    = sum(1 for r in reviewed_rows if (r.get("followed_plan") or "") == "YES")
+        fp_partial= sum(1 for r in reviewed_rows if (r.get("followed_plan") or "") == "PARTIALLY")
+        fp_no     = sum(1 for r in reviewed_rows if (r.get("followed_plan") or "") == "NO")
+        fp_rate   = round(fp_yes / reviewed_count, 3) if reviewed_count else 0.0
+
+        def _safe_avg(field):
+            vals = [float(r[field]) for r in reviewed_rows if r.get(field) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        avg_setup    = _safe_avg("setup_quality")
+        avg_exec     = _safe_avg("execution_quality")
+        avg_disc     = _safe_avg("discipline_quality")
+        avg_overall  = _safe_avg("overall_quality")
+
+        # Per-mistake/emotion/positive tag counts across reviewed rows
+        n_tags = reviewed_count or 1
+        top_mistake  = _top_tag_from_jsonb_list(reviewed_rows, "mistake_tags",  is_emotion=False)
+        top_emotion  = _top_tag_from_jsonb_list(reviewed_rows, "emotion_tags",   is_emotion=True)
+        top_positive = _top_tag_from_jsonb_list(reviewed_rows, "positive_tags",  is_emotion=False)
+
+        # Mistake + positive concentration per trade (reviewed only)
+        from collections import Counter as _Counter
+        m_counts: _Counter = _Counter()
+        e_counts: _Counter = _Counter()
+        for r in reviewed_rows:
+            for raw_f, is_em in [("mistake_tags", False), ("emotion_tags", True)]:
+                raw = r.get(raw_f)
+                if not raw:
+                    continue
+                items = raw if isinstance(raw, list) else []
+                if not items:
+                    try:
+                        import json as _jj; items = _jj.loads(raw)
+                    except Exception:
+                        items = []
+                for item in items:
+                    tag = (item.get("tag") if isinstance(item, dict) and is_em else str(item) if isinstance(item, str) else "")
+                    if tag:
+                        m_counts[tag.lower()] += 1 if not is_em else 0
+                        e_counts[tag.lower()] += 1 if is_em else 0
+        mistake_per_trade = round(sum(m_counts.values()) / reviewed_count, 2) if reviewed_count else 0.0
+
+        # Strategy breakdown: top by net R within block
+        strat_r: dict = {}
+        for r in brows:
+            s = (r.get("strategy_name") or "UNKNOWN").strip() or "UNKNOWN"
+            strat_r.setdefault(s, 0.0)
+            strat_r[s] += float(r.get("r_multiple") or 0.0)
+        top_strategy_by_r  = max(strat_r, key=strat_r.get, default=None) if strat_r else None
+        worst_strategy_by_r= min(strat_r, key=strat_r.get, default=None) if strat_r else None
+
+        # Instrument breakdown
+        inst_r: dict = {}
+        for r in brows:
+            i = (r.get("instrument") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            inst_r.setdefault(i, 0.0)
+            inst_r[i] += float(r.get("r_multiple") or 0.0)
+        top_instrument    = max(inst_r, key=inst_r.get, default=None) if inst_r else None
+        worst_instrument  = min(inst_r, key=inst_r.get, default=None) if inst_r else None
+
+        # Long/Short split
+        long_rows  = [r for r in brows if (r.get("direction") or "").lower() in ("long", "buy")]
+        short_rows = [r for r in brows if (r.get("direction") or "").lower() in ("short", "sell")]
+        long_net_r = round(sum(float(r.get("r_multiple") or 0) for r in long_rows), 2)
+        short_net_r= round(sum(float(r.get("r_multiple") or 0) for r in short_rows), 2)
+
+        result_blocks.append({
+            "block_start":         block_start,
+            "block_end":           sample["_block_end"],
+            "label":               sample["_label"],
+            "display_timezone":    display_tz,
+            "trade_count":         trade_count,
+            "reviewed_count":      reviewed_count,
+            "confidence":          confidence,
+            "wins":                wins,
+            "losses":              losses,
+            "breakeven":           breakeven,
+            "win_rate":            win_rate,
+            "net_r":               net_r,
+            "avg_r":               avg_r,
+            "avg_win_r":           avg_win_r,
+            "avg_loss_r":          avg_loss_r,
+            "expectancy":          expectancy,
+            "profit_factor":       pf,
+            "followed_plan_yes":   fp_yes,
+            "followed_plan_partial": fp_partial,
+            "followed_plan_no":    fp_no,
+            "followed_plan_rate":  fp_rate,
+            "avg_setup_quality":   avg_setup,
+            "avg_exec_quality":    avg_exec,
+            "avg_disc_quality":    avg_disc,
+            "avg_overall_quality": avg_overall,
+            "mistake_per_trade":   mistake_per_trade,
+            "top_mistake":         top_mistake,
+            "top_emotion":         top_emotion,
+            "top_positive":        top_positive,
+            "top_strategy_by_r":   top_strategy_by_r,
+            "worst_strategy_by_r": worst_strategy_by_r,
+            "top_instrument":      top_instrument,
+            "worst_instrument":    worst_instrument,
+            "long_count":          len(long_rows),
+            "short_count":         len(short_rows),
+            "long_net_r":          long_net_r,
+            "short_net_r":         short_net_r,
+        })
+
+    # ── Deterministic coaching summary sentences ────────────────────────────
+    moderate_plus = [b for b in result_blocks
+                     if b["confidence"] in ("MODERATE", "STRONG") and b["reviewed_count"] >= 20]
+    summary: list[str] = []
+    if moderate_plus:
+        # Best window: highest win_rate (tie-break: most reviewed trades)
+        best_w = max(moderate_plus,
+                     key=lambda b: (b["win_rate"], b["reviewed_count"]), default=None)
+        if best_w and best_w["win_rate"] > 0:
+            summary.append(
+                f"Best window: {best_w['label']} produces a {best_w['win_rate']*100:.0f}% "
+                f"win rate across {best_w['reviewed_count']} reviewed trades."
+            )
+        # Biggest time leak: most negative net_r (tie-break: most reviewed trades)
+        neg_blocks = [b for b in moderate_plus if b["net_r"] < 0]
+        if neg_blocks:
+            leak = min(neg_blocks, key=lambda b: (b["net_r"], -b["reviewed_count"]))
+            summary.append(
+                f"Biggest time leak: {leak['label']} drains {abs(leak['net_r']):.1f}R "
+                f"on average — consider sitting it out."
+            )
+        # Discipline peak: highest followed_plan_rate (tie-break: most reviewed)
+        disc_blocks = [b for b in moderate_plus if b["reviewed_count"] > 0]
+        if disc_blocks:
+            disc = max(disc_blocks,
+                       key=lambda b: (b["followed_plan_rate"], b["reviewed_count"]))
+            if disc["followed_plan_rate"] > 0.5:
+                summary.append(
+                    f"Discipline peak: {disc['label']} is your most disciplined window "
+                    f"({disc['followed_plan_rate']*100:.0f}% plan adherence)."
+                )
+
+    return jsonify({
+        "ok":             True,
+        "blocks":         result_blocks,
+        "display_timezone": display_tz,
+        "intraday_summary": summary[:3],
+    })
 
 
 # ---------------------------------------------------------------------------

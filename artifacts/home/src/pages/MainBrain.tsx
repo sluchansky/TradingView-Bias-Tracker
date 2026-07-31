@@ -2453,6 +2453,10 @@ interface JDrillFilter {
   rating_field?:  string;         // setup_quality|execution_quality|discipline_quality|overall_quality
   rating_value?:  number;         // integer 1-5 (requires rating_field)
   result?:        string;         // 'win' | 'loss' | 'scratch'
+  // ── Phase 7O.2: intraday 30-min block filter ─────────────────────────────
+  entry_block_start?: string;     // "HH:MM" inclusive block start (e.g. "09:30")
+  entry_block_end?:   string;     // "HH:MM" exclusive block end   (e.g. "10:00"); "00:00" for 23:30 block
+  display_timezone?:  string;     // IANA timezone (default "America/New_York")
 }
 
 interface JBatch {
@@ -3493,6 +3497,8 @@ function _drillChips(drill: JDrillFilter): { key: keyof JDrillFilter; label: str
   if (drill.rating_field && drill.rating_value != null)
     chips.push({ key: 'rating_field', label: `${drill.rating_field.replace(/_quality$/, '').toUpperCase()}: ${drill.rating_value}★` });
   if (drill.result)        chips.push({ key: 'result',        label: `RESULT: ${drill.result.toUpperCase()}` });
+  // Phase 7O.2: intraday block chip — clearing block_start also clears block_end + timezone
+  if (drill.entry_block_start) chips.push({ key: 'entry_block_start', label: `TIME: ${drill.entry_block_start}` });
   return chips;
 }
 
@@ -3501,6 +3507,8 @@ const _DRILL_SERVER_KEYS: (keyof JDrillFilter)[] = [
   'review_status','mistake_tag','positive_tag','emotion_tag','followed_plan',
   'strategy','session','instrument','mode','source','date_from','date_to',
   'rating_field','rating_value','result',
+  // Phase 7O.2: intraday block filter
+  'entry_block_start','entry_block_end','display_timezone',
 ];
 
 // ── Journal Trades Tab ────────────────────────────────────────────────────────
@@ -3570,6 +3578,10 @@ const JTradesTab: React.FC<{
         if (df.rating_field)  params.set('rating_field',  df.rating_field);
         if (df.rating_value != null) params.set('rating_value', String(df.rating_value));
         if (df.result && !fRes)      params.set('result',      df.result);
+        // Phase 7O.2: intraday block filter
+        if (df.entry_block_start) params.set('entry_block_start', df.entry_block_start);
+        if (df.entry_block_end)   params.set('entry_block_end',   df.entry_block_end);
+        if (df.display_timezone)  params.set('display_timezone',  df.display_timezone);
       }
       const r = await fetch(`/api/journal/trades?${params}`, { headers: getAuthHeader() });
       if (!r.ok) throw new Error(await r.text());
@@ -5297,6 +5309,13 @@ const JCoachingTab: React.FC<{
   const [fInstrument, setFInstrument] = useState('');
   const [fMode,       setFMode]       = useState('');
 
+  // Phase 7O.2: intraday block coaching state
+  const [intradayData,    setIntradayData]    = useState<{ blocks: any[]; intraday_summary: string[]; display_timezone: string } | null>(null);
+  const [intradayLoading, setIntradayLoading] = useState(false);
+  // Sortable detail table
+  const [idSort,    setIdSort]    = useState<string>('net_r');
+  const [idSortDir, setIdSortDir] = useState<'asc' | 'desc'>('desc');
+
   const fetchCoaching = useCallback(async () => {
     setLoading(true); setError(null);
     try {
@@ -5312,6 +5331,24 @@ const JCoachingTab: React.FC<{
       setData(d as JCoachData);
     } catch (e) { setError(String(e)); }
     setLoading(false);
+  }, [dateFrom, dateTo, fSource, fInstrument, fMode]);
+
+  // Phase 7O.2: fetch intraday block analytics — shares the same filter state
+  const fetchIntraday = useCallback(async () => {
+    setIntradayLoading(true);
+    try {
+      const p = new URLSearchParams();
+      if (dateFrom)    p.set('date_from',  dateFrom);
+      if (dateTo)      p.set('date_to',    dateTo);
+      if (fSource)     p.set('source',     fSource);
+      if (fInstrument) p.set('instrument', fInstrument);
+      if (fMode)       p.set('mode',       fMode);
+      const r = await fetch(`/api/journal/coaching/intraday?${p}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'failed');
+      setIntradayData(d);
+    } catch (_e) { /* fail silently — intraday is supplementary */ }
+    setIntradayLoading(false);
   }, [dateFrom, dateTo, fSource, fInstrument, fMode]);
 
   /** Build a JDrillFilter that carries both the current coaching filter context
@@ -5357,7 +5394,7 @@ const JCoachingTab: React.FC<{
         </button>
       : _confBadge(conf);
 
-  useEffect(() => { fetchCoaching(); }, [fetchCoaching]);
+  useEffect(() => { fetchCoaching(); fetchIntraday(); }, [fetchCoaching, fetchIntraday]);
 
   const inp = (label: string, val: string, set: (v: string) => void, type = 'text', placeholder = '') => (
     <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -5436,10 +5473,10 @@ const JCoachingTab: React.FC<{
         {inp('Instrument', fInstrument, setFInstrument, 'text', 'MGC, MNQ…')}
         {sel('Mode', fMode, setFMode, [['', 'All'], ['SCALP', 'SCALP'], ['SWING', 'SWING'], ['MICRO_SCALP', 'MICRO']])}
         <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-          <button onClick={fetchCoaching} disabled={loading}
+          <button onClick={() => { fetchCoaching(); fetchIntraday(); }} disabled={loading || intradayLoading}
             style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}`, borderRadius: 5,
               color: T.cyan, padding: '5px 12px', fontSize: 11, cursor: 'pointer', fontWeight: 700 }}>
-            {loading ? '…' : 'Apply'}
+            {(loading || intradayLoading) ? '…' : 'Apply'}
           </button>
         </div>
       </div>
@@ -5836,6 +5873,263 @@ const JCoachingTab: React.FC<{
         </>
       )}
 
+      {/* ── Phase 7O.2: INTRADAY BLOCK ANALYSIS ─────────────────────────── */}
+      {intradayLoading && (
+        <div style={{ color: T.txtMuted, fontSize: 10, padding: '8px 0', marginTop: 12 }}>
+          Loading intraday analysis…
+        </div>
+      )}
+      {!intradayLoading && intradayData && intradayData.blocks.length > 0 && (() => {
+        const blocks = intradayData.blocks as any[];
+        // Sort for detail table
+        const sorted = [...blocks].sort((a, b) => {
+          const va = a[idSort] ?? 0, vb = b[idSort] ?? 0;
+          return idSortDir === 'desc' ? (vb - va) : (va - vb);
+        });
+
+        // Heatmap rows: 5 metrics × blocks
+        const hmMetrics: { key: string; label: string; fmt: (v: any) => string; pos: (v: any) => boolean | null }[] = [
+          { key: 'win_rate',           label: 'Win %',        fmt: v => v != null ? `${(v*100).toFixed(0)}%` : '—', pos: v => v > 0.55 ? true : v < 0.4 ? false : null },
+          { key: 'net_r',              label: 'Net R',         fmt: v => v != null ? `${v >= 0 ? '+' : ''}${v.toFixed(1)}` : '—', pos: v => v > 0 ? true : v < 0 ? false : null },
+          { key: 'followed_plan_rate', label: 'Plan %',        fmt: v => v != null ? `${(v*100).toFixed(0)}%` : '—', pos: v => v > 0.7 ? true : v < 0.5 ? false : null },
+          { key: 'avg_disc_quality',   label: 'Discipline',    fmt: v => v != null ? v.toFixed(1) : '—', pos: v => v != null ? v > 3.5 ? true : v < 2.5 ? false : null : null },
+          { key: 'mistake_per_trade',  label: 'Mistakes/Trd',  fmt: v => v != null ? v.toFixed(1) : '—', pos: v => v != null ? v < 0.5 ? true : v > 1.0 ? false : null : null },
+        ];
+
+        const muted = (b: any) => b.confidence === 'INSUFFICIENT' || b.confidence === 'EARLY';
+        const cellBg = (b: any, metric: typeof hmMetrics[0]) => {
+          if (muted(b)) return T.panelAlt + 'aa';
+          const v = b[metric.key];
+          const p = metric.pos(v);
+          if (p === true)  return T.green + '33';
+          if (p === false) return T.red + '33';
+          return 'transparent';
+        };
+
+        // Best/Worst highlights (from MODERATE+ blocks)
+        const modBlocks = blocks.filter(b => b.confidence === 'MODERATE' || b.confidence === 'STRONG');
+        const bestPerf  = modBlocks.length ? modBlocks.reduce((a, b) => b.win_rate > a.win_rate ? b : a) : null;
+        const worstPerf = modBlocks.length ? modBlocks.reduce((a, b) => b.net_r < a.net_r ? b : a) : null;
+        const bestDisc  = modBlocks.length ? modBlocks.reduce((a, b) => b.followed_plan_rate > a.followed_plan_rate ? b : a) : null;
+        const highMist  = modBlocks.length ? modBlocks.reduce((a, b) => b.mistake_per_trade > a.mistake_per_trade ? b : a) : null;
+
+        const thSort = (col: string) => ({
+          cursor: 'pointer' as const,
+          color: idSort === col ? T.cyan : T.txtMuted,
+          fontWeight: idSort === col ? 800 : 600,
+          whiteSpace: 'nowrap' as const,
+          fontSize: 8, paddingBottom: 5, paddingRight: 8,
+          userSelect: 'none' as const,
+        });
+        const onSort = (col: string) => {
+          if (idSort === col) setIdSortDir(d => d === 'desc' ? 'asc' : 'desc');
+          else { setIdSort(col); setIdSortDir('desc'); }
+        };
+
+        const blockDrill = (b: any): JDrillFilter => _mkDrill(
+          `Time Block ${b.label}`, b.trade_count,
+          { entry_block_start: b.block_start, entry_block_end: b.block_end, display_timezone: intradayData.display_timezone }
+        );
+
+        return (
+          <div style={{ marginTop: 20, borderTop: `1px solid ${T.border}55`, paddingTop: 14 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: T.cyan, letterSpacing: '0.08em', marginBottom: 12 }}>
+              INTRADAY BLOCK ANALYSIS
+              <span style={{ fontSize: 8, color: T.txtMuted, fontWeight: 400, marginLeft: 8 }}>
+                {blocks.length} active window{blocks.length !== 1 ? 's' : ''} · {intradayData.display_timezone}
+              </span>
+            </div>
+
+            {/* (A) Heatmap grid */}
+            <div style={{ overflowX: 'auto', marginBottom: 14 }}>
+              <table style={{ borderCollapse: 'collapse', fontSize: 8, minWidth: blocks.length * 56 }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600, paddingRight: 8,
+                      fontSize: 8, whiteSpace: 'nowrap', paddingBottom: 4, minWidth: 68 }}>Metric</th>
+                    {blocks.map(b => (
+                      <th key={b.block_start} style={{ textAlign: 'center', color: muted(b) ? T.txtMuted + '88' : T.txtMuted,
+                        fontWeight: 600, paddingBottom: 4, fontSize: 7, minWidth: 48 }}>
+                        {b.block_start}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {hmMetrics.map(m => (
+                    <tr key={m.key}>
+                      <td style={{ color: T.txtMuted, fontSize: 8, paddingRight: 10, paddingTop: 2,
+                        paddingBottom: 2, whiteSpace: 'nowrap', fontWeight: 600 }}>{m.label}</td>
+                      {blocks.map(b => (
+                        <td key={b.block_start}
+                          onClick={onDrill ? () => onDrill(blockDrill(b)) : undefined}
+                          title={`${b.label} · ${b.trade_count} trades · ${b.confidence}`}
+                          style={{ background: cellBg(b, m), textAlign: 'center',
+                            padding: '3px 4px', borderRadius: 3, cursor: onDrill ? 'pointer' : 'default',
+                            color: muted(b) ? T.txtMuted + '77' : T.txtSec, fontSize: 8, fontFamily: T.mono }}>
+                          {m.fmt(b[m.key])}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                  {/* Trade count row */}
+                  <tr>
+                    <td style={{ color: T.txtMuted, fontSize: 8, paddingRight: 10, paddingTop: 2,
+                      paddingBottom: 2, whiteSpace: 'nowrap', fontWeight: 600 }}>Trades</td>
+                    {blocks.map(b => (
+                      <td key={b.block_start}
+                        onClick={onDrill ? () => onDrill(blockDrill(b)) : undefined}
+                        style={{ textAlign: 'center', padding: '3px 4px', cursor: onDrill ? 'pointer' : 'default',
+                          color: muted(b) ? T.txtMuted + '77' : T.txtSec, fontSize: 8, fontFamily: T.mono }}>
+                        {b.trade_count}
+                      </td>
+                    ))}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            {/* (B) Best/Worst highlight cards */}
+            {modBlocks.length > 0 && (
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
+                {bestPerf && (
+                  <div onClick={onDrill ? () => onDrill(blockDrill(bestPerf)) : undefined}
+                    style={{ flex: '1 1 120px', background: T.green + '18', borderRadius: 7, padding: '8px 12px',
+                      border: `1px solid ${T.green}44`, cursor: onDrill ? 'pointer' : 'default', minWidth: 120 }}>
+                    <div style={{ fontSize: 7, color: T.green, fontWeight: 700, letterSpacing: '0.06em',
+                      marginBottom: 3 }}>BEST PERFORMANCE</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, fontFamily: T.mono, color: T.green }}>
+                      {bestPerf.label}
+                    </div>
+                    <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>
+                      {(bestPerf.win_rate*100).toFixed(0)}% win · {rFmt(bestPerf.net_r)}
+                    </div>
+                  </div>
+                )}
+                {bestDisc && (
+                  <div onClick={onDrill ? () => onDrill(blockDrill(bestDisc)) : undefined}
+                    style={{ flex: '1 1 120px', background: T.cyan + '14', borderRadius: 7, padding: '8px 12px',
+                      border: `1px solid ${T.cyan}44`, cursor: onDrill ? 'pointer' : 'default', minWidth: 120 }}>
+                    <div style={{ fontSize: 7, color: T.cyan, fontWeight: 700, letterSpacing: '0.06em',
+                      marginBottom: 3 }}>BEST DISCIPLINE</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, fontFamily: T.mono, color: T.cyan }}>
+                      {bestDisc.label}
+                    </div>
+                    <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>
+                      {(bestDisc.followed_plan_rate*100).toFixed(0)}% plan adherence
+                    </div>
+                  </div>
+                )}
+                {worstPerf && worstPerf.net_r < 0 && (
+                  <div onClick={onDrill ? () => onDrill(blockDrill(worstPerf)) : undefined}
+                    style={{ flex: '1 1 120px', background: T.red + '14', borderRadius: 7, padding: '8px 12px',
+                      border: `1px solid ${T.red}44`, cursor: onDrill ? 'pointer' : 'default', minWidth: 120 }}>
+                    <div style={{ fontSize: 7, color: T.red, fontWeight: 700, letterSpacing: '0.06em',
+                      marginBottom: 3 }}>WORST PERFORMANCE</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, fontFamily: T.mono, color: T.red }}>
+                      {worstPerf.label}
+                    </div>
+                    <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>
+                      {rFmt(worstPerf.net_r)} · {(worstPerf.win_rate*100).toFixed(0)}% win
+                    </div>
+                  </div>
+                )}
+                {highMist && highMist.mistake_per_trade > 0 && (
+                  <div onClick={onDrill ? () => onDrill(blockDrill(highMist)) : undefined}
+                    style={{ flex: '1 1 120px', background: '#f59e0b14', borderRadius: 7, padding: '8px 12px',
+                      border: '1px solid #f59e0b44', cursor: onDrill ? 'pointer' : 'default', minWidth: 120 }}>
+                    <div style={{ fontSize: 7, color: '#f59e0b', fontWeight: 700, letterSpacing: '0.06em',
+                      marginBottom: 3 }}>HIGHEST MISTAKES</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, fontFamily: T.mono, color: '#f59e0b' }}>
+                      {highMist.label}
+                    </div>
+                    <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2 }}>
+                      {highMist.mistake_per_trade.toFixed(1)} mistakes/trade
+                      {highMist.top_mistake ? ` · ${highMist.top_mistake.replace(/_/g,' ').toUpperCase()}` : ''}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* (C) Sortable detail table */}
+            <div style={{ overflowX: 'auto', marginBottom: 12 }}>
+              <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 8 }}>
+                <thead>
+                  <tr>
+                    {[
+                      ['label','Time Block'], ['trade_count','Trades'], ['reviewed_count','Rev.'],
+                      ['win_rate','Win %'], ['net_r','Net R'], ['avg_r','Avg R'],
+                      ['profit_factor','PF'], ['followed_plan_rate','Plan %'],
+                      ['avg_disc_quality','Disc.'], ['top_mistake','Top Mistake'], ['confidence','Conf.'],
+                    ].map(([col, hdr]) => (
+                      <th key={col} style={thSort(col)} onClick={() => onSort(col)}>
+                        {hdr}{idSort === col ? (idSortDir === 'desc' ? ' ↓' : ' ↑') : ''}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sorted.map((b, i) => (
+                    <tr key={b.block_start}
+                      onClick={onDrill ? () => onDrill(blockDrill(b)) : undefined}
+                      onMouseEnter={() => { setHovSec('intra'); setHovIdx(i); }}
+                      onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                      style={{ borderTop: `1px solid ${T.border}`,
+                        background: hovSec === 'intra' && hovIdx === i ? T.panelAlt : 'transparent',
+                        cursor: onDrill ? 'pointer' : 'default' }}>
+                      <td style={{ paddingTop: 4, paddingBottom: 4, paddingRight: 8, fontFamily: T.mono,
+                        color: muted(b) ? T.txtMuted + '99' : T.txtSec, fontWeight: 700 }}>{b.label}</td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono, color: T.txtSec }}>{b.trade_count}</td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono, color: T.txtMuted }}>{b.reviewed_count}</td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono,
+                        color: b.win_rate > 0.55 ? T.green : b.win_rate < 0.4 ? T.red : T.txtSec }}>
+                        {(b.win_rate * 100).toFixed(0)}%
+                      </td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono, color: rC(b.net_r) }}>
+                        {rFmt(b.net_r)}
+                      </td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono, color: rC(b.avg_r) }}>
+                        {rFmt(b.avg_r)}
+                      </td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono, color: T.txtSec }}>
+                        {b.profit_factor != null ? b.profit_factor.toFixed(2) : '—'}
+                      </td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono,
+                        color: b.followed_plan_rate > 0.7 ? T.green : b.followed_plan_rate < 0.5 ? T.red : T.txtSec }}>
+                        {(b.followed_plan_rate * 100).toFixed(0)}%
+                      </td>
+                      <td style={{ textAlign: 'right', paddingRight: 8, fontFamily: T.mono, color: T.txtSec }}>
+                        {b.avg_disc_quality != null ? b.avg_disc_quality.toFixed(1) : '—'}
+                      </td>
+                      <td style={{ paddingRight: 8, color: T.txtMuted, maxWidth: 90, overflow: 'hidden',
+                        textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {b.top_mistake ? b.top_mistake.replace(/_/g,' ').toUpperCase() : '—'}
+                      </td>
+                      <td>{_confBadge(b.confidence)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* (D) Coaching summary sentences */}
+            {intradayData.intraday_summary.length > 0 && (
+              <div style={{ background: T.cyan + '0d', borderRadius: 7, padding: '10px 14px',
+                border: `1px solid ${T.cyan}33`, marginTop: 4 }}>
+                <div style={{ fontSize: 8, color: T.cyan, fontWeight: 700, letterSpacing: '0.06em',
+                  marginBottom: 6 }}>INTRADAY COACHING INSIGHTS</div>
+                {intradayData.intraday_summary.map((s: string, i: number) => (
+                  <div key={i} style={{ fontSize: 10, color: T.txtSec, marginBottom: i < intradayData.intraday_summary.length - 1 ? 5 : 0 }}>
+                    {s}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {!data && !loading && !error && (
         <div style={{ color: T.txtMuted, fontSize: 11 }}>No coaching data loaded.</div>
       )}
@@ -5896,6 +6190,10 @@ const JournalFullPage: React.FC = () => {
       const next = { ...prev } as JDrillFilter;
       // Remove rating_value together with rating_field
       if (key === 'rating_field') { delete next.rating_field; delete next.rating_value; }
+      // Phase 7O.2: clearing any block key removes all three together
+      else if (key === 'entry_block_start' || key === 'entry_block_end' || key === 'display_timezone') {
+        delete next.entry_block_start; delete next.entry_block_end; delete next.display_timezone;
+      }
       else { (next as unknown as Record<string, unknown>)[key as string] = undefined; }
       // If no server-side filter keys remain, clear the whole drill
       if (_DRILL_SERVER_KEYS.every(k => !next[k])) return null;
