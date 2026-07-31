@@ -376,6 +376,57 @@ const MarketStrip: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Timeline event detail formatter (Part 2) ─────────────────────────────────
+// Converts any timeline `details` value to a human-readable string.
+// Priority: known semantic fields → transition pattern → safe JSON fallback.
+// NEVER returns `[object Object]`.
+export function fmtEventDetail(v: unknown): string {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) {
+    const parts = (v as unknown[])
+      .filter(x => x != null)
+      .map(x => typeof x === 'object' ? fmtEventDetail(x) : String(x))
+      .filter(Boolean);
+    return parts.join(' · ') || '';
+  }
+  if (typeof v === 'object' && v !== null) {
+    const o = v as Record<string, unknown>;
+    // Preferred semantic fields — highest priority first
+    if (typeof o.summary     === 'string' && o.summary)     return o.summary;
+    if (typeof o.message     === 'string' && o.message)     return o.message;
+    if (typeof o.reason      === 'string' && o.reason)      return o.reason;
+    if (typeof o.description === 'string' && o.description) return o.description;
+    if (typeof o.label       === 'string' && o.label)       return o.label;
+    // Transition-style: from/to or prev/new
+    if (o.from        != null && o.to         != null) return `${o.from} → ${o.to}`;
+    if (o.prev_status != null && o.new_status != null) return `${o.prev_status} → ${o.new_status}`;
+    if (o.previous_state != null && o.new_state != null) return `${o.previous_state} → ${o.new_state}`;
+    // Single-field scalar extractions
+    if (typeof o.direction  === 'string' && o.direction)  return o.direction;
+    if (typeof o.status     === 'string' && o.status)     return o.status;
+    if (typeof o.event_type === 'string' && o.event_type) return o.event_type;
+    // Safe compact JSON fallback — scalars only, max 6 keys, truncated to 120 chars
+    try {
+      const keys = Object.keys(o)
+        .filter(k => {
+          const val = o[k];
+          return val != null && typeof val !== 'object' && !Array.isArray(val);
+        })
+        .slice(0, 6);
+      if (keys.length === 0) return '';
+      const subset: Record<string, unknown> = {};
+      for (const k of keys) subset[k] = o[k];
+      const json = JSON.stringify(subset);
+      return json.length > 120 ? json.slice(0, 120) + '…' : json;
+    } catch {
+      return '[complex object]';
+    }
+  }
+  return String(v);
+}
+
 // ── Thesis Panel ──────────────────────────────────────────────────────────────
 // Displays the Left Brain Dynamic Thesis with explicit states:
 //   AVAILABLE     — fresh, computed thesis (direction may legitimately be NEUTRAL)
@@ -1671,10 +1722,45 @@ const JournalPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 };
 
 // ── Decision Timeline Panel ───────────────────────────────────────────────────
+// ── THESIS_TRANSITION structured detail renderer (Part 3) ────────────────────
+const ThesisTransitionDetail: React.FC<{ d: Record<string, unknown> }> = ({ d }) => {
+  const fields: { label: string; value: string | null }[] = [
+    { label: 'Previous', value: d.prev_status != null ? String(d.prev_status) : null },
+    { label: 'Direction', value: d.direction != null ? String(d.direction) : null },
+    { label: 'Reason',    value: d.primary_reason != null ? String(d.primary_reason) : null },
+    { label: 'Confidence', value: d.new_confidence != null
+        ? (d.prev_confidence != null ? `${d.prev_confidence} → ${d.new_confidence}` : String(d.new_confidence))
+        : null },
+  ].filter(f => f.value != null && f.value !== '');
+
+  if (fields.length === 0) return null;
+
+  return (
+    <div style={{ display:'flex', flexWrap:'wrap', gap:'4px 12px', marginTop:4 }}>
+      {fields.map(f => (
+        <span key={f.label} style={{ fontSize:9.5, color:T.txtSec }}>
+          <span style={{ color:T.txtMuted }}>{f.label}: </span>{f.value}
+        </span>
+      ))}
+    </div>
+  );
+};
+
 const TimelinePanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const tl    = (p.decision_timeline ?? {}) as Record<string, unknown>;
   const avail = tl.available !== false;
-  const events = Array.isArray(tl.events) ? tl.events as Record<string, unknown>[] : [];
+  const rawEvents = Array.isArray(tl.events) ? tl.events as Record<string, unknown>[] : [];
+
+  // Part 5 — deduplicate by stable fingerprint: exact duplicates from the same
+  // API payload share event_type + timestamp + event_label and should not be
+  // shown twice. Genuinely separate events at different timestamps are kept.
+  const seen = new Set<string>();
+  const events = rawEvents.filter(e => {
+    const fp = `${e.event_type}::${e.timestamp}::${e.event_label}`;
+    if (seen.has(fp)) return false;
+    seen.add(fp);
+    return true;
+  });
 
   return (
     <Panel title="Decision Timeline" badge={<Badge label="PARTIAL" color={T.amber} />}>
@@ -1687,22 +1773,42 @@ const TimelinePanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             <UnavailableNote msg="No events recorded this session" />
           ) : (
             <div>
-              {events.map((e, i) => (
-                <div key={i} style={{ display:'flex', gap:10, paddingBottom:10, position:'relative' }}>
-                  <div style={{ display:'flex', flexDirection:'column', alignItems:'center', flexShrink:0 }}>
-                    <div style={{ width:8, height:8, borderRadius:'50%', background:T.cyan, marginTop:2 }} />
-                    {i < events.length - 1 && <div style={{ width:1, flex:1, background:T.border, marginTop:3 }} />}
-                  </div>
-                  <div style={{ flex:1, minWidth:0, paddingBottom:4 }}>
-                    <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:2 }}>
-                      <span style={{ fontSize:10, fontWeight:700, color:T.txtPri }}>{safeStr(e.event_label, safeStr(e.event_type, '—'))}</span>
-                      {e.is_derived != null && e.is_derived && <Badge label="derived" color={T.txtMuted} />}
+              {events.map((e, i) => {
+                const isThesisTransition = e.event_type === 'THESIS_TRANSITION';
+                const details = e.details as Record<string, unknown> | null | undefined;
+
+                return (
+                  <div key={i} style={{ display:'flex', gap:10, paddingBottom:10, position:'relative' }}>
+                    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', flexShrink:0 }}>
+                      <div style={{ width:8, height:8, borderRadius:'50%', background:T.cyan, marginTop:2 }} />
+                      {i < events.length - 1 && <div style={{ width:1, flex:1, background:T.border, marginTop:3 }} />}
                     </div>
-                    <div style={{ fontSize:9.5, color:T.txtMuted }}>{fmtTs(e.timestamp)} · {safeStr(e.source, '—')}</div>
-                    {e.details != null && <div style={{ fontSize:10, color:T.txtSec, marginTop:2 }}>{safeStr(e.details)}</div>}
+                    <div style={{ flex:1, minWidth:0, paddingBottom:4 }}>
+                      <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:2 }}>
+                        <span style={{ fontSize:10, fontWeight:700, color:T.txtPri }}>
+                          {safeStr(e.event_label, safeStr(e.event_type, '—'))}
+                        </span>
+                        {e.is_derived != null && e.is_derived && <Badge label="derived" color={T.txtMuted} />}
+                      </div>
+                      <div style={{ fontSize:9.5, color:T.txtMuted }}>
+                        {fmtTs(e.timestamp)} · {safeStr(e.source, '—')}
+                      </div>
+
+                      {/* Part 3 — structured THESIS_TRANSITION layout */}
+                      {isThesisTransition && details != null
+                        ? <ThesisTransitionDetail d={details} />
+                        /* Part 2 — generic formatter for all other event types */
+                        : details != null && (() => {
+                            const txt = fmtEventDetail(details);
+                            return txt
+                              ? <div style={{ fontSize:10, color:T.txtSec, marginTop:2 }}>{txt}</div>
+                              : null;
+                          })()
+                      }
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </>

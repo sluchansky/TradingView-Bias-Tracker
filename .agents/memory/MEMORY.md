@@ -1,24 +1,13 @@
 # Memory Index
 
-- [Opposing-structure conflict rule audit (Phase 7H)](opposing-structure-audit.md) — 10-min gap is between the TWO sides' timestamps (not absolute age); no invalidation/supersession; duplicates refresh timer; server ingestion timestamps only.
-
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
-- [Main Brain Operator Console (Phase 7C)](main-brain-ui-p7c.md) — React page at /main-brain; read-only, 7s poll, Basic Auth from localStorage brain_auth; unknown && JSX needs != null &&; Sentinel/MobileHome pre-existing TS errors not regressions.
 - [Main Brain population wiring](main-brain-population-wiring.md) — normalizeMainBrainPayload() is the single bridge; 29 schema mismatches; voice=dict extract narration; active_trades/alerts are bare lists; coach.weight_updated is boolean.
 - [VWAP source authority (Phase 1A)](vwap-source-authority.md) — Grace window removed. CHART_VWAP_BY_TICKER secondary store + get_vwap_diagnostics(); result["vwap_diagnostics"] always present.
 - [Left Brain Market Intelligence (Phase 1B + 2)](left-brain-mi.md) — Flag-gated DISPLAY-ONLY MI + Dynamic Thesis; compute_left_brain_thesis() direction/strength/momentum/narrative/playbook; _LB_THESIS_BY_INST + _LB_MARKET_MEMORY_BY_INST(maxlen=200); 128 tests.
-- [Databento signal → immediate scan](databento-signal-scan.md) — _databento_structure_trigger spawns _databento_bar_scan on non-dup signals; dual-sim accepts "databento_scan"; /clear-fired-keys endpoint.
+- [Left Brain thesis staleness & key mismatch](lb-thesis-staleness.md) — MGC gets ~1 bar/overnight (vs 127 MNQ); key bug lastUpdatedAt vs last_updated_at; diagnosis block added; ThesisPanel shows 4 states.
 - [Right Brain Trade Management v1](rbtm-shadow-mode.md) — Phase 6B.2 shadow advisory; flag default-OFF; _right_brain_orchestrate() is sole full_analysis seam; 47 tests; RBTM_VALID_RECOMMENDATIONS frozenset; near-stop CRITICAL not HIGH.
-- [Phase 6B.1 Baseline Engine](baseline-engine.md) — bt_baseline.py; _jdump must handle frozenset; baseline_trades needed initial_risk_r ALTER; detail returns matrix_results key (not per_combo).
 - [Flask zombie-prevention guards](flask-zombie-prevention.md) — 3 os._exit guards (SIGTERM + sys.excepthook + app.run() finally) stop non-daemon Timer threads from keeping zombie Flask alive.
 - [Databento live feed integration](databento-integration.md) — flag-gated (DATABENTO_ENABLED=1 + DATABENTO_API_KEY); routes return disabled-JSON not 404; dashboard panel shows OFFLINE safely.
-- [Brain Contract JS migration (Phase 3A)](brain-contract-js-migration.md) — getBrain(d)/buildLegacyFallback are the only entry points; supporting_diagnostics=dict(_gov); 10 render fns migrated.
-- [Avatar Intelligence Engine v1](avatar-intelligence-engine.md) — proactive event queue + daily greeting + explain-simply mode; hook is mbAvatarObserve(d) at end of renderModules.
-- [Decision Pipeline V2](decision-pipeline-v2.md) — shadow 5-stage OBSERVE→INTERPRET→PRIORITIZE→VALIDATE→DECIDE; all CAN_* flags default-OFF; flag-OFF byte-identical.
-- [ME regime vs primary_driver split](me-regime-driver-split.md) — regime=market condition; primary_driver=news cause; risk_state derived from both (SHOCK=RISK_OFF+GEO); _risk_off_like boolean in futures_preference.
-- [Trade Failure Analyzer](trade-failure-analyzer.md) — TFA_DB_READY-gated READY→trigger→outcome recorder; 8 functions + /failure-analysis route; goldens byte-identical when DB absent.
-- [/status poll cache](status-poll-cache.md) — prod froze from 3s polls × 16s inline full_analysis; /status now single-flight TTL cache + client tick guard; money path NEVER reads the cache.
-- [BOT TRAINING MODE](bot-training-mode.md) — flag-gated 4-stage fail-closed gate; stages 1-3 suggest-only, >=4 passthrough; boot probe is __main__-only; flag-OFF byte-identical.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.
@@ -33,7 +22,6 @@
 - [Market State Cache persistence](market-state-cache-persistence.md) — market_state_cache table persists CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY; freshness windows guard restores; READY intentionally NOT restored.
 - [Edge Score, grades & session bonus](edge-score-card-block.md) — EDGE_COMPONENTS BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10 = max110; grade ≥85A+/≥70A/≥50B/<50 WAIT; zone scores 0 so CHOCH-absent edge caps ~50.
 - [CVD hard filter + RVOL→Volume component](cvd-rvol-filter.md) — CVD = HARD fail-open directional veto; RVOL feeds Volume +15 (≥~1.5), NOT a standalone modifier; ceiling 110; display via alert_diagnostics.
-- [Backtest optimization study](optimization-study.md) — BT score MUST mirror live EDGE_COMPONENTS (max110) or score/grade rankings diverge; best_overall falls back when no combo meets min_trades.
 - [No-signals = structure gate](no-signals-alert-config-gap.md) — "0 signals" usually = no structure alert; structure = ANY-ONE of CHOCH/BOS/HH/HL/LH/LL (shared, needs a `ticker`); diagnose via gate_debug/strict_reason.
 - [Dashboard auth edge & open paths](dashboard-auth-edge.md) — auth lives in Express; never lock /, /ping, /webhook, /healthz; webhook ENTER/CLOSE intentionally OPEN (TradingView can't send a password).
 - [Volatility monitor gate](volatility-monitor-gate.md) — per-instrument ATR-ratio FAIL-OPEN; SWING hard-gates BLOCK→WAIT; SCALP DISPLAY-ONLY + fail-open extreme-ratio>3.0 DEMOTE brake; single get_volatility feeds gate+brake+display.
@@ -154,6 +142,4 @@
 - [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.
 - [Observability / eval-metrics heartbeat](observability-eval-metrics.md) — diagnostic heartbeat re-eval + counters; must stay full_analysis+_record_eval_metrics only; COUNTERS_LOCK never inside EVAL_METRICS_LOCK; WAIT reason is strict_reason not reason.
 - [EARLY intrabar pre-READY alert](early-pre-ready-alert.md) — display-only ⚡EARLY fires on sweep+structure before candle-close; never touches gate; fire-once dedupe; READY owns the signal.
-- [Databento source attribution audit](source-attribution-audit.md) — _audit_event_duplicates needs now_dt kwarg in tests (1-hour cutoff filters pinned past timestamps).
 - [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter; diagnose by replaying real webhooks + rebasing timestamps.
-- [AI assistant chat panel](ai-assistant-chat.md) — read-only /assistant grounded on full_analysis snapshot; never money path, stay out of OPEN_PATHS, keep model output aiEsc()-escaped (XSS).
